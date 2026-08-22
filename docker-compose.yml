@@ -2,6 +2,8 @@
 # Dev-only credentials below are intentionally obvious placeholders and must
 # never be reused anywhere outside a local developer machine.
 # Services bind to 127.0.0.1 only.
+# Host ports are overridable (PMB_POSTGRES_PORT / PMB_REDIS_PORT) for machines
+# where the defaults collide with other local services.
 name: polymarket-bot-dev
 
 services:
@@ -13,7 +15,7 @@ services:
       POSTGRES_PASSWORD: devlocal-only-not-a-secret
       POSTGRES_DB: polymarket_bot_dev
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${PMB_POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -27,7 +29,7 @@ services:
     container_name: polymarket-bot-redis-dev
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${PMB_REDIS_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     healthcheck:

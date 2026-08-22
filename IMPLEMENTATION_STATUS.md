@@ -51,8 +51,11 @@ None.
 
 ## Pending external evidence
 
-- `docker-compose.yml` (pinned PostgreSQL/Redis, localhost-only): YAML-validated only — Docker unavailable in the build environment; container bring-up pending.
 - `.github/workflows/ci.yml`: YAML-validated only — a real GitHub Actions run is pending.
+
+## Resolved evidence items
+
+- `docker-compose.yml` runtime validation (2026-08-22): Docker 29.1.2 / Compose v2.40.3 became available; `docker compose config` valid, `docker compose up -d --wait` brought both services to healthy (`pg_isready` accepting connections, `redis-cli ping` → PONG), both ports confirmed bound to 127.0.0.1 only. Host ports made overridable (`PMB_POSTGRES_PORT`, `PMB_REDIS_PORT`, defaults 5432/6379 unchanged) because this machine has a native PostgreSQL on 5432; validated with `PMB_POSTGRES_PORT=15432`. Stack torn down after verification.
 
 ## Human and operational gates
 
