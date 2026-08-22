@@ -1,0 +1,17 @@
+{
+  "name": "@polymarket-bot/domain",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Placeholder library scaffold created by WP-010. Contract content is owned by WP-020; this scaffold intentionally contains no contracts.",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}

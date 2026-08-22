@@ -1,0 +1,6 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "packages/strategies/*"
+allowBuilds:
+  esbuild: true
