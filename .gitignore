@@ -1,0 +1,38 @@
+# JavaScript / TypeScript
+node_modules/
+.pnpm-store/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+secrets/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data
+data/
+wal/
+parquet/
+tmp/
+*.log
+
+# Claude local-only settings
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Editors and OS
+.idea/
+.DS_Store
+Thumbs.db

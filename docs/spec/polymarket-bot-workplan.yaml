@@ -1,0 +1,943 @@
+version: "2.0.0"
+project: polymarket-crypto-trading-platform
+status: implementation-baseline
+generated_at: "2026-08-18"
+primary_spec: polymarket-bot-orchestrator-handoff.md
+
+defaults:
+  maximum_run_mode: PAPER
+  allow_real_orders: false
+  orchestrator_max_parallel_agents: 4
+  require_clean_worktree: true
+  require_tests_before_handoff: true
+  time_based_gates_may_be_simulated: false
+
+protected_paths:
+  - packages/domain/**
+  - packages/decimal/**
+  - db/migrations/**
+  - docs/adr/**
+  - pnpm-lock.yaml
+  - package.json
+  - tsconfig.base.json
+  - docker-compose.yml
+
+required_handoff_fields:
+  - summary
+  - files_changed
+  - tests_run
+  - assumptions
+  - deviations
+  - known_risks
+  - follow_up
+
+phases:
+  - id: phase-0
+    name: repository-and-venue-verification
+    maximum_run_mode: PAPER
+  - id: phase-1
+    name: recording-ready
+    maximum_run_mode: PAPER
+  - id: phase-2
+    name: paper-ready-core
+    maximum_run_mode: PAPER
+  - id: phase-3
+    name: live-micro-ready-infrastructure
+    maximum_run_mode: PAPER
+  - id: phase-4
+    name: execution-probes
+    maximum_run_mode: EXECUTION_PROBE
+  - id: phase-5
+    name: live-micro
+    maximum_run_mode: LIVE_MICRO
+
+work_packages:
+  - id: WP-000
+    phase: phase-0
+    title: Venue verification and sanitized fixtures
+    goal: Verify current official Polymarket integration behavior and freeze sanitized fixtures without placing real orders.
+    depends_on: []
+    allowed_paths:
+      - docs/venue/**
+      - test/fixtures/venue/**
+      - apps/ops-cli/src/verify-venue/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/polymarket-secure/**
+      - db/migrations/**
+    deliverables:
+      - docs/venue/verified-2026-08-18.md
+      - sanitized public market and WebSocket fixtures
+      - sanitized order/user-stream schema fixtures
+      - verification CLI skeleton
+    acceptance:
+      - All venue statements cite official sources.
+      - Archived SDKs are explicitly rejected.
+      - No production signer or real order is used.
+      - Fixtures cover market events, user events, delayed orders, heartbeat, fees, limits, geoblock, and position operations.
+    gate: automated
+
+  - id: WP-010
+    phase: phase-0
+    title: Monorepo, CI, compose, and quality gates
+    goal: Create a reproducible pnpm/TypeScript workspace and local infrastructure baseline.
+    depends_on: []
+    allowed_paths:
+      - apps/**
+      - packages/**
+      - python/**
+      - infra/**
+      - test/**
+      - package.json
+      - pnpm-workspace.yaml
+      - pnpm-lock.yaml
+      - tsconfig.base.json
+      - docker-compose.yml
+      - .github/**
+      - AGENTS.md
+      - IMPLEMENTATION_STATUS.md
+    forbidden_paths:
+      - docs/venue/verified-*.md
+    deliverables:
+      - installable monorepo
+      - strict TypeScript configuration
+      - lint, typecheck, test, and integration commands
+      - PostgreSQL and Redis local compose
+      - Python uv workspace
+    acceptance:
+      - pnpm install --frozen-lockfile succeeds.
+      - pnpm typecheck succeeds.
+      - pnpm lint succeeds.
+      - pnpm test succeeds.
+      - No live credentials are required.
+    gate: automated
+
+  - id: WP-020
+    phase: phase-0
+    title: Domain contracts and exact decimal types
+    goal: Freeze versioned event, identifier, decimal, strategy, intent, and run-mode contracts.
+    depends_on: [WP-010]
+    allowed_paths:
+      - packages/domain/**
+      - packages/decimal/**
+      - test/unit/domain/**
+      - test/unit/decimal/**
+      - docs/contracts/domain.md
+    forbidden_paths:
+      - apps/**
+      - packages/polymarket-secure/**
+      - db/migrations/**
+    deliverables:
+      - Zod schemas and inferred TypeScript types
+      - exact decimal wrapper and canonicalization
+      - schema versioning utilities
+      - unit and property tests
+    acceptance:
+      - No economic schema accepts JavaScript number.
+      - Scientific notation is rejected.
+      - Canonical decimal hashing is deterministic.
+      - Event envelopes include gateway epoch and ingest sequence.
+      - DecisionResult persists zero or more intents.
+    gate: automated
+
+  - id: WP-030
+    phase: phase-0
+    title: Initial ADR and contract documentation
+    goal: Record the locked architecture decisions and integration boundaries.
+    depends_on: [WP-000, WP-020]
+    allowed_paths:
+      - docs/adr/**
+      - docs/contracts/**
+      - IMPLEMENTATION_STATUS.md
+    forbidden_paths:
+      - apps/**
+      - packages/**
+      - db/migrations/**
+    deliverables:
+      - ADR-001 through ADR-012
+      - dependency-direction documentation
+      - protected-contract policy
+    acceptance:
+      - ADRs match the primary specification.
+      - Venue facts defer to the current verification report.
+      - No ADR silently weakens live safety defaults.
+    gate: review
+
+  - id: WP-040
+    phase: phase-1
+    title: PostgreSQL schemas and migrations
+    goal: Implement the catalog, data, strategy, execution, accounting, and ops schemas with required constraints.
+    depends_on: [WP-020, WP-030]
+    allowed_paths:
+      - db/migrations/**
+      - packages/storage-postgres/**
+      - test/integration/postgres/**
+    forbidden_paths:
+      - packages/domain/**
+      - apps/trader/**
+    deliverables:
+      - forward and rollback migrations
+      - typed repositories for shared records
+      - append-only enforcement for event and ledger tables
+    acceptance:
+      - Migrations apply from empty database.
+      - Fill allocation cannot exceed fill quantity.
+      - Ledger transaction must balance per asset.
+      - One active live owner per market is constrained.
+      - Live orders require a fencing token reference.
+    gate: automated
+
+  - id: WP-050
+    phase: phase-1
+    title: WAL, segment manifests, and crash recovery
+    goal: Implement bounded raw-frame ingestion, append-only segment writing, rotation, checksums, and recovery.
+    depends_on: [WP-020, WP-030]
+    allowed_paths:
+      - packages/storage-wal/**
+      - test/unit/storage-wal/**
+      - test/fault-injection/wal/**
+      - docs/contracts/wal-format.md
+    forbidden_paths:
+      - apps/trader/**
+      - packages/domain/**
+    deliverables:
+      - WAL writer and reader
+      - segment rotation
+      - checksum sidecars
+      - incomplete-record recovery
+    acceptance:
+      - Crash recovery truncates only an incomplete final record.
+      - Full segments validate by record count and SHA-256.
+      - Queue overflow is observable and never silently drops frames.
+    gate: automated
+
+  - id: WP-060
+    phase: phase-1
+    title: Redis Streams event transport
+    goal: Implement a bounded transport interface and Redis Streams adapter for normalized market events.
+    depends_on: [WP-010, WP-020, WP-030]
+    allowed_paths:
+      - packages/event-bus/**
+      - test/integration/event-bus/**
+    forbidden_paths:
+      - packages/domain/**
+      - apps/data-gateway/**
+      - apps/trader/**
+    deliverables:
+      - transport interface
+      - Redis Streams publisher and consumer
+      - consumer checkpointing
+      - lag and retention metrics
+    acceptance:
+      - Ordered events remain ordered per gateway epoch.
+      - Reconnect resumes from checkpoint within retention.
+      - Lag beyond retention returns a hard resync condition.
+    gate: automated
+
+  - id: WP-070
+    phase: phase-1
+    title: Polymarket public market-data adapter
+    goal: Normalize current market WebSocket and REST book data into domain events.
+    depends_on: [WP-000, WP-020, WP-030]
+    allowed_paths:
+      - packages/polymarket-public/**
+      - test/contract/polymarket-public/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/polymarket-secure/**
+    deliverables:
+      - public client wrapper
+      - market-channel subscription manager
+      - normalized book/trade/tick/lifecycle events
+      - snapshot fetcher
+    acceptance:
+      - All sanitized official fixtures parse.
+      - Absolute-size zero removes a price level.
+      - Tick-size changes are emitted exactly.
+      - No invented venue sequence number is exposed.
+    gate: automated
+
+  - id: WP-080
+    phase: phase-1
+    title: Binance reference adapter
+    goal: Normalize required Binance trades and top-of-book streams.
+    depends_on: [WP-020, WP-030]
+    allowed_paths:
+      - packages/binance-adapter/**
+      - test/contract/binance/**
+    forbidden_paths:
+      - packages/domain/**
+    deliverables:
+      - connection and reconnect manager
+      - normalized trade/top events
+      - staleness metrics
+    acceptance:
+      - Duplicate and reconnect fixtures are handled.
+      - Venue and receipt timestamps are preserved.
+      - Adapter never reads strategy configuration directly.
+    gate: automated
+
+  - id: WP-090
+    phase: phase-1
+    title: Coinbase reference adapter
+    goal: Normalize required Coinbase trades and top-of-book streams.
+    depends_on: [WP-020, WP-030]
+    allowed_paths:
+      - packages/coinbase-adapter/**
+      - test/contract/coinbase/**
+    forbidden_paths:
+      - packages/domain/**
+    deliverables:
+      - connection and reconnect manager
+      - normalized trade/top events
+      - staleness metrics
+    acceptance:
+      - Duplicate and reconnect fixtures are handled.
+      - Venue and receipt timestamps are preserved.
+      - Adapter never reads strategy configuration directly.
+    gate: automated
+
+  - id: WP-100
+    phase: phase-1
+    title: Polymarket RTDS Chainlink TWAP adapter
+    goal: Normalize current 30-second and 60-second Chainlink TWAP events from RTDS.
+    depends_on: [WP-000, WP-020, WP-030]
+    allowed_paths:
+      - packages/polymarket-public/src/rtds/**
+      - test/contract/rtds/**
+    forbidden_paths:
+      - packages/domain/**
+    deliverables:
+      - RTDS subscription wrapper
+      - normalized TWAP events
+      - stream-gap and first-update behavior tests
+    acceptance:
+      - Symbol and window are explicit.
+      - No missing history is fabricated after reconnect.
+      - Staleness is surfaced as data quality.
+    gate: automated
+
+  - id: WP-110
+    phase: phase-1
+    title: Universe and settlement specifications
+    goal: Discover markets, group rolling series, version parameters, and require reviewed settlement specs.
+    depends_on: [WP-000, WP-040]
+    allowed_paths:
+      - packages/universe/**
+      - packages/settlement/**
+      - test/unit/universe/**
+      - test/unit/settlement/**
+      - db/seeds/settlement-specs/**
+    forbidden_paths:
+      - packages/domain/**
+      - apps/trader/**
+    deliverables:
+      - market and series registry
+      - SettlementSpec validation
+      - payoff model registry
+      - market lifecycle projection
+    acceptance:
+      - TWAP market cannot use terminal-spot payoff model.
+      - 50/50 resolution is supported.
+      - Unverified settlement spec blocks model-dependent activation.
+      - Parameter changes create immutable history.
+    gate: automated
+
+  - id: WP-120
+    phase: phase-1
+    title: Data gateway integration
+    goal: Assemble adapters, WAL, normalization, transport, and staleness/resync behavior in the independent gateway process.
+    depends_on: [WP-050, WP-060, WP-070, WP-080, WP-090, WP-100, WP-110]
+    allowed_paths:
+      - apps/data-gateway/**
+      - test/integration/data-gateway/**
+      - infra/compose/data-gateway/**
+    forbidden_paths:
+      - packages/domain/**
+      - apps/trader/**
+    deliverables:
+      - runnable data-gateway process
+      - subscription planning
+      - bounded queues
+      - data-quality incident emission
+    acceptance:
+      - Raw frame is enqueued before normalized publication.
+      - Silent socket stall fixture opens an incident.
+      - Gap recovery requires an authoritative snapshot.
+      - Redis outage stops publication but not WAL recording.
+    gate: automated
+
+  - id: WP-130
+    phase: phase-1
+    title: Parquet compactor and dataset manifests
+    goal: Compact verified WAL segments into replayable Parquet and immutable dataset manifests.
+    depends_on: [WP-040, WP-050]
+    allowed_paths:
+      - packages/storage-parquet/**
+      - apps/research-worker/**
+      - python/research/compaction/**
+      - test/integration/parquet/**
+    forbidden_paths:
+      - apps/trader/**
+      - packages/domain/**
+    deliverables:
+      - compactor
+      - object upload/checksum verification
+      - dataset manifest generator
+      - DuckDB validation query
+    acceptance:
+      - WAL is not deleted before verified upload.
+      - Record counts and hashes reconcile.
+      - Manifest pins incident exclusions and schema versions.
+    gate: automated
+
+  - id: WP-140
+    phase: phase-1
+    title: Recorder observability and soak harness
+    goal: Provide metrics, dashboards, validation jobs, and operational evidence collection for the recorder.
+    depends_on: [WP-120, WP-130]
+    allowed_paths:
+      - packages/observability/src/recorder/**
+      - infra/grafana/recorder/**
+      - infra/prometheus/**
+      - test/soak/recorder/**
+      - docs/runbooks/recorder.md
+    forbidden_paths:
+      - packages/domain/**
+    deliverables:
+      - recorder dashboard
+      - soak harness
+      - snapshot comparison job
+      - recorder runbook
+    acceptance:
+      - Dashboard exposes queue depth, lag, gaps, fsync, compaction, and upload status.
+      - Time-based soak remains pending until real elapsed evidence exists.
+    gate: external-evidence
+
+  - id: WP-150
+    phase: phase-2
+    title: Local exact-decimal order books
+    goal: Reconstruct and query both outcome-token books with staleness and snapshot validation.
+    depends_on: [WP-020, WP-070]
+    allowed_paths:
+      - packages/order-book/**
+      - test/unit/order-book/**
+      - test/replay-golden/order-book/**
+    forbidden_paths:
+      - packages/domain/**
+    deliverables:
+      - book state machine
+      - executable-price queries
+      - snapshot/hash checks
+    acceptance:
+      - Fixture replay reconstructs expected book byte-for-byte.
+      - Stale subscription generations are rejected.
+      - Tick changes invalidate nonconforming price helpers.
+    gate: automated
+
+  - id: WP-160
+    phase: phase-2
+    title: Versioned feature engine
+    goal: Compute the minimum v1 Polymarket, reference, lifecycle, and quality features once per event.
+    depends_on: [WP-080, WP-090, WP-100, WP-150]
+    allowed_paths:
+      - packages/features/**
+      - test/unit/features/**
+      - docs/contracts/features-v1.md
+    forbidden_paths:
+      - packages/domain/**
+      - packages/strategies/**
+    deliverables:
+      - feature registry
+      - feature set v1
+      - content-addressed snapshots
+    acceptance:
+      - Feature calculation is deterministic.
+      - Input staleness is included.
+      - No feature reads current wall clock directly.
+    gate: automated
+
+  - id: WP-170
+    phase: phase-2
+    title: Strategy SDK and deterministic runtime
+    goal: Load immutable configs, invoke pure strategies, persist one DecisionResult, and checkpoint state.
+    depends_on: [WP-020, WP-040]
+    allowed_paths:
+      - packages/strategy-sdk/**
+      - packages/strategy-runtime/**
+      - test/unit/strategy-runtime/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/strategies/static-bracket/**
+    deliverables:
+      - strategy interface
+      - context implementation
+      - runtime and watchdog
+      - state checkpointing
+    acceptance:
+      - Runtime persists exactly one decision per callback.
+      - Strategies cannot import venue/storage adapters through package boundaries.
+      - Same event/config/seed yields identical state and decisions.
+    gate: automated
+
+  - id: WP-180
+    phase: phase-2
+    title: Capital allocator and scenario risk
+    goal: Enforce commitments, contractual loss, exposure, scenario, freshness, and economic checks.
+    depends_on: [WP-020, WP-040, WP-110]
+    allowed_paths:
+      - packages/capital-allocator/**
+      - packages/risk/**
+      - test/unit/risk/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/oms/**
+    deliverables:
+      - allocator
+      - risk-policy engine
+      - structured reason codes
+      - incident action recommendations
+    acceptance:
+      - Open orders and positions both consume limits.
+      - Worst-case contractual loss is primary.
+      - Stale data blocks entries.
+      - Risk resize creates a new approved-intent record.
+    gate: automated
+
+  - id: WP-190
+    phase: phase-2
+    title: Execution planner contracts and paper implementation
+    goal: Convert approved intents into immutable plans with pricing, slicing, partial-fill, and reservation requirements.
+    depends_on: [WP-020, WP-180]
+    allowed_paths:
+      - packages/execution-planner/**
+      - test/unit/execution-planner/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/polymarket-secure/**
+      - packages/oms/**
+    deliverables:
+      - execution plan builder
+      - economic-leg selector
+      - exact price/tick logic
+      - basket leg-risk policy
+    acceptance:
+      - Leg selection respects actual inventory.
+      - Plan contains deadline and price protection.
+      - Coordinated basket is never labeled atomic.
+    gate: automated
+
+  - id: WP-200
+    phase: phase-2
+    title: Append-only ledger, allocations, positions, and PnL
+    goal: Implement balanced per-asset ledger transactions and rebuildable actual/virtual projections.
+    depends_on: [WP-020, WP-040]
+    allowed_paths:
+      - packages/ledger/**
+      - packages/pnl/**
+      - test/unit/ledger/**
+      - test/integration/ledger/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/oms/**
+    deliverables:
+      - ledger service
+      - fill allocation service
+      - position and balance projections
+      - PnL projections
+    acceptance:
+      - Every transaction balances per asset.
+      - Projections rebuild from zero and match incremental state.
+      - Reward estimate is not realized PnL.
+      - Unattributed activity creates an explicit scope.
+    gate: automated
+
+  - id: WP-210
+    phase: phase-2
+    title: Replay clock, event source, simulated venue, and fill models
+    goal: Execute the same core logic against historical/live data with deterministic Tier 0 and queue-estimated Tier 1 simulation.
+    depends_on: [WP-130, WP-150, WP-190, WP-200]
+    allowed_paths:
+      - packages/simulation/**
+      - apps/backtest-cli/**
+      - test/replay-golden/**
+      - test/unit/simulation/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/polymarket-secure/**
+    deliverables:
+      - replay clock
+      - dataset event source
+      - simulated venue
+      - optimistic/base/conservative queue scenarios
+    acceptance:
+      - Replay follows dispatch order, not sorted venue time.
+      - Same manifest/config/seed is byte-identical.
+      - Markout is not double-counted.
+      - Paper fills are not labeled real evidence.
+    gate: automated
+
+  - id: WP-220
+    phase: phase-2
+    title: Static Bracket strategy
+    goal: Implement the first strategy and its complete state machine without venue dependencies.
+    depends_on: [WP-160, WP-170, WP-210]
+    allowed_paths:
+      - packages/strategies/static-bracket/**
+      - test/unit/strategies/static-bracket/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/polymarket-secure/**
+      - packages/oms/**
+    deliverables:
+      - strategy implementation
+      - parameter schema
+      - fixtures and state-machine tests
+    acceptance:
+      - Partial entry creates only proportional exit intent.
+      - Stale data never produces blind flatten.
+      - Entry/exit/stop/timeout/close policies are explicit.
+      - Replay is deterministic.
+    gate: automated
+
+  - id: WP-230
+    phase: phase-2
+    title: Paper trader integration
+    goal: Assemble books, features, strategy runtime, risk, planner, simulation, and ledger in the trader process.
+    depends_on: [WP-120, WP-160, WP-170, WP-180, WP-190, WP-200, WP-210, WP-220]
+    allowed_paths:
+      - apps/trader/**
+      - test/integration/paper-trader/**
+      - infra/compose/trader/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/polymarket-secure/**
+    deliverables:
+      - paper trader process
+      - deterministic core event loop
+      - bounded queues and health state
+    acceptance:
+      - MAX_RUN_MODE=PAPER is enforced.
+      - Production secret names are rejected.
+      - End-to-end paper fixture emits traceable fill and ledger chain.
+      - Redis/PostgreSQL failures halt safely.
+    gate: automated
+
+  - id: WP-240
+    phase: phase-2
+    title: Control API and paper dashboards
+    goal: Provide authenticated read/control APIs, audit logs, and Grafana dashboards without signer access.
+    depends_on: [WP-040, WP-230]
+    allowed_paths:
+      - apps/control-api/**
+      - packages/observability/**
+      - infra/grafana/**
+      - test/integration/control-api/**
+    forbidden_paths:
+      - packages/polymarket-secure/**
+      - packages/domain/**
+    deliverables:
+      - strategy/run controls
+      - kill-switch controls
+      - operations/trading/fidelity dashboards
+    acceptance:
+      - Control API cannot raise mode above process maximum.
+      - Every mutation is audited.
+      - No signer is loaded.
+    gate: automated
+
+  - id: WP-250
+    phase: phase-2
+    title: Determinism and paper end-to-end verification
+    goal: Adversarially verify the paper-ready core and freeze the Phase 2 evidence report.
+    depends_on: [WP-230, WP-240]
+    allowed_paths:
+      - test/e2e/**
+      - test/replay-golden/**
+      - docs/experiments/phase-2-verification.md
+      - IMPLEMENTATION_STATUS.md
+    forbidden_paths:
+      - packages/**
+      - apps/**
+    deliverables:
+      - full paper E2E suite
+      - deterministic golden output
+      - Phase 2 verification report
+    acceptance:
+      - Traceability chain is complete.
+      - Zero unexplained projection difference in fixtures.
+      - Time-based paper evidence remains explicitly pending until observed.
+    gate: review
+
+  - id: WP-260
+    phase: phase-3
+    title: Secure unified-SDK adapter and signer boundary
+    goal: Wrap the official secure client behind a narrow interface with strict secret isolation.
+    depends_on: [WP-000, WP-020, WP-030]
+    allowed_paths:
+      - packages/polymarket-secure/**
+      - test/contract/polymarket-secure/**
+      - docs/runbooks/signer.md
+    forbidden_paths:
+      - packages/domain/**
+      - apps/trader/**
+    deliverables:
+      - secure client factory
+      - redacted error mapping
+      - signer boundary
+      - mockable internal interface
+    acceptance:
+      - Only this package imports the secure SDK entry points.
+      - Secrets and signatures are redacted.
+      - Ordinary tests use mocks/fixtures, not real orders.
+    gate: security-review
+
+  - id: WP-270
+    phase: phase-3
+    title: OMS and signed-order persistence
+    goal: Implement live order lifecycle, many-to-many attribution, reservations, and unknown-submission recovery.
+    depends_on: [WP-190, WP-200, WP-260]
+    allowed_paths:
+      - packages/oms/**
+      - test/unit/oms/**
+      - test/fault-injection/oms/**
+    forbidden_paths:
+      - packages/domain/**
+      - apps/trader/**
+    deliverables:
+      - OMS state machine
+      - signed payload persistence
+      - submission-attempt protocol
+      - cancel/replace flow
+    acceptance:
+      - Lost response becomes SUBMISSION_UNKNOWN.
+      - New salt is not created before authoritative reconciliation.
+      - Partial fills release only unused reservations.
+    gate: automated
+
+  - id: WP-280
+    phase: phase-3
+    title: Authenticated user-stream adapter
+    goal: Normalize order and trade lifecycle events and expose reconnect state.
+    depends_on: [WP-000, WP-260, WP-270]
+    allowed_paths:
+      - packages/polymarket-secure/src/user-stream/**
+      - test/contract/user-stream/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/oms/**
+    deliverables:
+      - user-stream subscription manager
+      - normalized order/trade events
+      - reconnect/gap signals
+    acceptance:
+      - MATCHED/MINED/CONFIRMED/RETRYING/FAILED fixtures parse.
+      - Reconnect always requests reconciliation.
+      - No claim of replaying missed events is made.
+    gate: automated
+
+  - id: WP-290
+    phase: phase-3
+    title: Account reconciliation
+    goal: Rebuild authoritative account state after startup, reconnect, unknown submissions, and discrepancies.
+    depends_on: [WP-200, WP-270, WP-280]
+    allowed_paths:
+      - packages/oms/src/reconciliation/**
+      - packages/ledger/src/reconciliation/**
+      - test/fault-injection/reconciliation/**
+      - docs/runbooks/reconciliation.md
+    forbidden_paths:
+      - packages/domain/**
+    deliverables:
+      - reconciliation coordinator
+      - break taxonomy
+      - quarantine/resume policy
+    acceptance:
+      - Ambiguous state never resumes trading.
+      - Unmatched actual activity becomes UNATTRIBUTED.
+      - Startup recovery works after mid-order crash fixture.
+    gate: automated
+
+  - id: WP-300
+    phase: phase-3
+    title: Collateral inventory and wallet operations
+    goal: Track/reserve pUSD and outcome tokens and manage split, merge, redeem, and approval workflows.
+    depends_on: [WP-000, WP-200, WP-260]
+    allowed_paths:
+      - packages/inventory/**
+      - test/unit/inventory/**
+      - test/contract/wallet-operations/**
+    forbidden_paths:
+      - packages/domain/**
+      - apps/trader/**
+    deliverables:
+      - inventory manager
+      - reservation service
+      - wallet operation state machine
+    acceptance:
+      - Double reservation is impossible.
+      - Sell plan requires available outcome-token inventory.
+      - Unknown wallet operation triggers reconciliation.
+      - No autonomous bridge/withdrawal is implemented.
+    gate: automated
+
+  - id: WP-310
+    phase: phase-3
+    title: Rate-limit budgets and matching-engine modes
+    goal: Enforce endpoint/signer budgets and mode-aware retry behavior.
+    depends_on: [WP-000, WP-260, WP-270]
+    allowed_paths:
+      - packages/polymarket-secure/src/rate-limit/**
+      - packages/oms/src/restricted-mode/**
+      - test/contract/rate-limits/**
+    forbidden_paths:
+      - packages/domain/**
+    deliverables:
+      - local token budgets
+      - response-header feedback
+      - 425/cancel-only/post-only state handling
+    acceptance:
+      - Safety cancels outrank new orders.
+      - Non-post-only order is not blindly retried in post-only mode.
+      - Limits are configuration snapshots, not constants.
+    gate: automated
+
+  - id: WP-320
+    phase: phase-3
+    title: Heartbeat health lease, fencing, geoblock, and kill controls
+    goal: Ensure only one healthy eligible process can submit/heartbeat live orders.
+    depends_on: [WP-260, WP-290, WP-310]
+    allowed_paths:
+      - apps/trader/src/live-safety/**
+      - packages/polymarket-secure/src/heartbeat/**
+      - packages/storage-postgres/src/fencing/**
+      - test/fault-injection/live-safety/**
+    forbidden_paths:
+      - packages/domain/**
+    deliverables:
+      - PostgreSQL fencing lease
+      - heartbeat health lease
+      - geoblock check
+      - kill-switch enforcement
+    acceptance:
+      - Two live writers cannot both hold authority.
+      - Unhealthy-but-running process stops heartbeat.
+      - Ambiguous geoblock result blocks new live entries.
+      - Paper mode cannot acquire live fencing.
+    gate: security-review
+
+  - id: WP-330
+    phase: phase-3
+    title: Independent emergency operations CLI
+    goal: Provide venue-truth account snapshot, reconciliation, and cancellation commands independent of trader memory.
+    depends_on: [WP-260, WP-290, WP-320]
+    allowed_paths:
+      - apps/ops-cli/**
+      - test/integration/ops-cli/**
+      - docs/runbooks/emergency.md
+    forbidden_paths:
+      - packages/domain/**
+      - apps/trader/**
+    deliverables:
+      - cancel-order
+      - cancel-market
+      - cancel-all
+      - account-snapshot
+      - reconcile
+      - stop-heartbeat guidance
+    acceptance:
+      - cancel-all does not require trader state.
+      - Output is explicit and audited.
+      - Destructive actions require confirmation or explicit noninteractive flag.
+    gate: security-review
+
+  - id: WP-340
+    phase: phase-3
+    title: Live-micro fault-injection verification
+    goal: Adversarially test all live-micro infrastructure without enabling real orders by default.
+    depends_on: [WP-270, WP-280, WP-290, WP-300, WP-310, WP-320, WP-330]
+    allowed_paths:
+      - test/fault-injection/live/**
+      - test/e2e/live-mock/**
+      - docs/experiments/phase-3-verification.md
+      - IMPLEMENTATION_STATUS.md
+    forbidden_paths:
+      - packages/**
+      - apps/**
+    deliverables:
+      - mock-venue chaos suite
+      - security and recovery report
+    acceptance:
+      - Mid-order crashes recover without duplicate exposure.
+      - Lost user-stream events reconcile.
+      - Heartbeat failure cancels mock open orders.
+      - Live maximum defaults remain zero.
+    gate: review
+
+  - id: WP-350
+    phase: phase-4
+    title: Execution-probe planner and hard caps
+    goal: Support tiny real calibration orders with non-bypassable caps and no strategy-size escalation.
+    depends_on: [WP-340]
+    allowed_paths:
+      - packages/execution-planner/src/probes/**
+      - apps/trader/src/execution-probe/**
+      - test/e2e/execution-probe-mock/**
+      - docs/runbooks/execution-probes.md
+    forbidden_paths:
+      - packages/domain/**
+    deliverables:
+      - maker/taker probe plans
+      - cap enforcement
+      - probe tagging and allocation
+    acceptance:
+      - Probe notional and account exposure are hard capped.
+      - Probe mode cannot start a normal live strategy.
+      - Human gate is required to set caps above zero.
+    gate: human-approval
+
+  - id: WP-360
+    phase: phase-4
+    title: Fill, slippage, cancel, and markout calibration pipeline
+    goal: Compare simulated predictions with actual probe/live-micro observations without double counting.
+    depends_on: [WP-210, WP-350]
+    allowed_paths:
+      - python/calibration/**
+      - python/reports/**
+      - packages/simulation/src/calibration/**
+      - docs/experiments/execution-calibration/**
+    forbidden_paths:
+      - packages/domain/**
+      - packages/polymarket-secure/**
+    deliverables:
+      - calibration datasets
+      - conditional fill models
+      - divergence reports
+    acceptance:
+      - Paper fills are not treated as actual fills.
+      - Markout remains a diagnostic unless used in a separate stress model.
+      - Calibration artifact is versioned and reproducible.
+    gate: external-evidence
+
+  - id: WP-370
+    phase: phase-5
+    title: Live-micro promotion report and gate
+    goal: Assemble the evidence needed for a human decision on one strategy and one reviewed series.
+    depends_on: [WP-360]
+    allowed_paths:
+      - docs/experiments/live-micro-promotion/**
+      - IMPLEMENTATION_STATUS.md
+    forbidden_paths:
+      - packages/**
+      - apps/**
+      - db/migrations/**
+    deliverables:
+      - promotion report
+      - explicit caps
+      - rollback and emergency runbook references
+    acceptance:
+      - Effective sample size and regime coverage are reported.
+      - Core and all-in PnL are separate.
+      - Zero unresolved account discrepancies.
+      - Human approval is recorded before maximum mode changes.
+    gate: human-approval
