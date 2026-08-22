@@ -1,0 +1,17 @@
+{
+  "name": "@polymarket-bot/execution-planner",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}

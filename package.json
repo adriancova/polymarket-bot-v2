@@ -1,0 +1,34 @@
+{
+  "name": "polymarket-bot",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Polymarket crypto trading platform monorepo (paper-only defaults; no live credentials required).",
+  "packageManager": "pnpm@11.17.0",
+  "engines": {
+    "node": ">=24",
+    "pnpm": ">=11"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r run typecheck && tsc -p test/tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run --config test/vitest.config.ts",
+    "test:integration": "node -e \"console.log('SKIP: integration tests are not implemented until WP-040+ (PostgreSQL/Redis integration work packages). Exiting 0 with no tests executed.')\"",
+    "test:replay": "node -e \"console.error('NOT IMPLEMENTED: replay tests arrive with WP-120+ (replay/simulation work packages).'); process.exit(1)\"",
+    "db:migrate": "node -e \"console.error('NOT IMPLEMENTED: database migrations arrive with WP-040.'); process.exit(1)\"",
+    "dev:infra": "docker compose up -d",
+    "dev:gateway": "node -e \"console.error('NOT IMPLEMENTED: the data gateway arrives with its owning work package.'); process.exit(1)\"",
+    "dev:paper": "node -e \"console.error('NOT IMPLEMENTED: the paper trader arrives with its owning work package.'); process.exit(1)\"",
+    "ops:verify-venue": "node -e \"console.error('NOT IMPLEMENTED: venue verification tooling arrives with its owning work package.'); process.exit(1)\"",
+    "ops:validate-dataset": "node -e \"console.error('NOT IMPLEMENTED: dataset validation arrives with its owning work package.'); process.exit(1)\""
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.33.0",
+    "@polymarket-bot/testkit": "workspace:*",
+    "@types/node": "^24.13.3",
+    "eslint": "^9.33.0",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.39.1",
+    "vitest": "^3.2.4"
+  }
+}
