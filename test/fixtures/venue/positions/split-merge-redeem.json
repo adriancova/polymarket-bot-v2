@@ -1,0 +1,80 @@
+{
+  "fixture": "positions/split-merge-redeem",
+  "source": "https://docs.polymarket.com/trading/ctf/overview",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "CTF position-operation workflow descriptors (split pUSD -> YES+NO pair; merge pair -> pUSD; redeem resolved tokens -> payout) and the documented position-id derivation chain. Contract addresses were not enumerated on the retrieved page (UNVERIFIED U-5); address fields use zero placeholders and MUST be sourced from official docs/SDK constants in WP-300. Amounts use six-decimal integer collateral units as in the order API. Additional source: https://docs.polymarket.com/trading/positions/manage.",
+  "examples": [
+    {
+      "name": "split",
+      "payload": {
+        "operation": "split",
+        "description": "Convert pUSD into a YES and NO token pair; every pair is backed by exactly $1 of locked collateral.",
+        "condition_id": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "collateral_token": "0x0000000000000000000000000000000000000000",
+        "amount_collateral_6dp": "25000000",
+        "outcome_slot_count": 2,
+        "index_sets": [1, 2],
+        "resulting_tokens": [
+          { "outcome": "Yes", "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417", "size": "25" },
+          { "outcome": "No", "asset_id": "7305630249804085635496399869905769372294302716159034447326228509068694952392", "size": "25" }
+        ],
+        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000000501"
+      }
+    },
+    {
+      "name": "merge",
+      "payload": {
+        "operation": "merge",
+        "description": "Convert a YES and NO token pair back into pUSD.",
+        "condition_id": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "collateral_token": "0x0000000000000000000000000000000000000000",
+        "amount_collateral_6dp": "10000000",
+        "outcome_slot_count": 2,
+        "index_sets": [1, 2],
+        "consumed_tokens": [
+          { "outcome": "Yes", "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417", "size": "10" },
+          { "outcome": "No", "asset_id": "7305630249804085635496399869905769372294302716159034447326228509068694952392", "size": "10" }
+        ],
+        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000000502"
+      }
+    },
+    {
+      "name": "redeem",
+      "payload": {
+        "operation": "redeem",
+        "description": "Exchange resolved outcome tokens for their payout.",
+        "condition_id": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "collateral_token": "0x0000000000000000000000000000000000000000",
+        "winning_outcome": "Yes",
+        "redeemed_tokens": [
+          { "outcome": "Yes", "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417", "size": "25" }
+        ],
+        "payout_collateral_6dp": "25000000",
+        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000000503"
+      }
+    },
+    {
+      "name": "position-id-derivation",
+      "payload": {
+        "operation": "derive-position-id",
+        "description": "conditionId = getConditionId(oracle, questionId, outcomeSlotCount=2); collectionId = getCollectionId(parentCollectionId, conditionId, indexSet in {1,2}); positionId = getPositionId(collateralToken, collectionId).",
+        "oracle": "0x0000000000000000000000000000000000000000",
+        "question_id": "0x000000000000000000000000000000000000000000000000000000000000000a01",
+        "outcome_slot_count": 2,
+        "parent_collection_id": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "index_set": 1,
+        "collateral_token": "0x0000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "neg-risk-conversion-note",
+      "payload": {
+        "operation": "neg-risk-convert",
+        "description": "Negative-risk markets use the separate Negative Risk CTF Exchange; a conversion can exchange one NO token for YES tokens in the event's other outcomes.",
+        "neg_risk": true,
+        "event_flags": { "enableNegRisk": true, "negRiskAugmented": false }
+      }
+    }
+  ]
+}

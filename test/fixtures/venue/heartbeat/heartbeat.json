@@ -1,0 +1,24 @@
+{
+  "fixture": "heartbeat/heartbeat",
+  "source": "https://docs.polymarket.com/trading/manage-orders",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "POST /v1/heartbeats protocol. Cadence: send every 5 seconds; server cancels all open orders owned by the CLOB API credentials after a 10-second window without a valid heartbeat, with a cancellation sweep every 5 seconds. Heartbeat ids are synthetic placeholders.",
+  "examples": [
+    {
+      "name": "request",
+      "payload": { "heartbeat_id": "sanitized-heartbeat-id-0001" }
+    },
+    {
+      "name": "response-ok",
+      "payload": { "heartbeat_id": "sanitized-heartbeat-id-0001" }
+    },
+    {
+      "name": "response-400-invalid-id",
+      "payload": {
+        "error_msg": "Invalid Heartbeat ID",
+        "heartbeat_id": "sanitized-heartbeat-id-0002"
+      }
+    }
+  ]
+}

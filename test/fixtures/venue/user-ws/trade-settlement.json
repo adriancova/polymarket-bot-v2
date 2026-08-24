@@ -1,0 +1,124 @@
+{
+  "fixture": "user-ws/trade-settlement",
+  "source": "https://docs.polymarket.com/trading/realtime-order-updates",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "User-channel 'trade' events walking one trade through the documented asynchronous settlement states MATCHED -> MINED -> CONFIRMED plus RETRYING and FAILED variants. Maker order ids and trade id are synthetic; identifiers otherwise follow doc examples.",
+  "examples": [
+    {
+      "name": "matched",
+      "payload": {
+        "event_type": "trade",
+        "id": "00000000-0000-0000-0000-00000000t001",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0004",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "40",
+        "price": "0.08",
+        "status": "MATCHED",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0005",
+            "matched_amount": "40",
+            "price": "0.08"
+          }
+        ],
+        "trader_side": "TAKER",
+        "timestamp": "1782753360000"
+      }
+    },
+    {
+      "name": "mined",
+      "payload": {
+        "event_type": "trade",
+        "id": "00000000-0000-0000-0000-00000000t001",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0004",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "40",
+        "price": "0.08",
+        "status": "MINED",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0005",
+            "matched_amount": "40",
+            "price": "0.08"
+          }
+        ],
+        "trader_side": "TAKER",
+        "timestamp": "1782753362000"
+      }
+    },
+    {
+      "name": "confirmed-terminal",
+      "payload": {
+        "event_type": "trade",
+        "id": "00000000-0000-0000-0000-00000000t001",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0004",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "40",
+        "price": "0.08",
+        "status": "CONFIRMED",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0005",
+            "matched_amount": "40",
+            "price": "0.08"
+          }
+        ],
+        "trader_side": "TAKER",
+        "timestamp": "1782753370000"
+      }
+    },
+    {
+      "name": "retrying",
+      "payload": {
+        "event_type": "trade",
+        "id": "00000000-0000-0000-0000-00000000t002",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0006",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "SELL",
+        "size": "10",
+        "price": "0.09",
+        "status": "RETRYING",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0007",
+            "matched_amount": "10",
+            "price": "0.09"
+          }
+        ],
+        "trader_side": "MAKER",
+        "timestamp": "1782753380000"
+      }
+    },
+    {
+      "name": "failed-terminal",
+      "payload": {
+        "event_type": "trade",
+        "id": "00000000-0000-0000-0000-00000000t002",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0006",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "SELL",
+        "size": "10",
+        "price": "0.09",
+        "status": "FAILED",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0007",
+            "matched_amount": "10",
+            "price": "0.09"
+          }
+        ],
+        "trader_side": "MAKER",
+        "timestamp": "1782753395000"
+      }
+    }
+  ]
+}

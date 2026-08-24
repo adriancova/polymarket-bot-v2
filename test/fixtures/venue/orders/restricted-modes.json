@@ -1,0 +1,38 @@
+{
+  "fixture": "orders/restricted-modes",
+  "source": "https://docs.polymarket.com/trading/matching-engine",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "Matching-engine restricted-mode responses: HTTP 425 during restart (post-only for 2 minutes after restart), HTTP 503 cancel-only, HTTP 503 post-only with retry_after_seconds. Quoted messages are from the official documentation.",
+  "examples": [
+    {
+      "name": "http-425-engine-restarting",
+      "payload": {
+        "http_status": 425,
+        "body": {
+          "error_msg": "matching engine is restarting",
+          "retry_after_seconds": 79
+        }
+      }
+    },
+    {
+      "name": "http-503-cancel-only",
+      "payload": {
+        "http_status": 503,
+        "body": {
+          "error_msg": "Trading is currently cancel-only. New orders are not accepted, but cancels are allowed."
+        }
+      }
+    },
+    {
+      "name": "http-503-post-only",
+      "payload": {
+        "http_status": 503,
+        "body": {
+          "error_msg": "post-only mode: only post-only orders and cancels are allowed",
+          "retry_after_seconds": 42
+        }
+      }
+    }
+  ]
+}

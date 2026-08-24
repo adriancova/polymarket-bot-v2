@@ -1,0 +1,99 @@
+{
+  "fixture": "user-ws/order-lifecycle",
+  "source": "https://docs.polymarket.com/trading/realtime-order-updates",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "Authenticated user-channel 'order' events with type PLACEMENT/UPDATE/CANCELLATION and statuses LIVE/MATCHED/DELAYED/UNMATCHED/CANCELED. Owner is a sanitized zero-UUID API-key placeholder; order id is synthetic. No real credential was used to capture these; they are reconstructed from the official documentation.",
+  "examples": [
+    {
+      "name": "placement-live",
+      "payload": {
+        "event_type": "order",
+        "type": "PLACEMENT",
+        "id": "0x00000000000000000000000000000000000000000000000000000000feed0001",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "original_size": "100",
+        "size_matched": "0",
+        "price": "0.08",
+        "outcome": "Yes",
+        "status": "LIVE",
+        "timestamp": "1782753357257"
+      }
+    },
+    {
+      "name": "update-partially-matched",
+      "payload": {
+        "event_type": "order",
+        "type": "UPDATE",
+        "id": "0x00000000000000000000000000000000000000000000000000000000feed0001",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "original_size": "100",
+        "size_matched": "40",
+        "price": "0.08",
+        "outcome": "Yes",
+        "status": "MATCHED",
+        "timestamp": "1782753360000"
+      }
+    },
+    {
+      "name": "placement-delayed",
+      "payload": {
+        "event_type": "order",
+        "type": "PLACEMENT",
+        "id": "0x00000000000000000000000000000000000000000000000000000000feed0002",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "SELL",
+        "original_size": "50",
+        "size_matched": "0",
+        "price": "0.09",
+        "outcome": "Yes",
+        "status": "DELAYED",
+        "timestamp": "1782753361000"
+      }
+    },
+    {
+      "name": "placement-unmatched",
+      "payload": {
+        "event_type": "order",
+        "type": "PLACEMENT",
+        "id": "0x00000000000000000000000000000000000000000000000000000000feed0003",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "SELL",
+        "original_size": "50",
+        "size_matched": "0",
+        "price": "0.09",
+        "outcome": "Yes",
+        "status": "UNMATCHED",
+        "timestamp": "1782753362000"
+      }
+    },
+    {
+      "name": "cancellation",
+      "payload": {
+        "event_type": "order",
+        "type": "CANCELLATION",
+        "id": "0x00000000000000000000000000000000000000000000000000000000feed0001",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "original_size": "100",
+        "size_matched": "40",
+        "price": "0.08",
+        "outcome": "Yes",
+        "status": "CANCELED",
+        "timestamp": "1782753365000"
+      }
+    }
+  ]
+}

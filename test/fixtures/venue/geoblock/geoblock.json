@@ -1,0 +1,36 @@
+{
+  "fixture": "geoblock/geoblock",
+  "source": "https://docs.polymarket.com/api-reference/geoblock",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "GET https://polymarket.com/api/geoblock responses. IP addresses are RFC 5737 documentation addresses (no real client data). Country/region codes are ISO 3166 examples of the documented restriction tiers.",
+  "examples": [
+    {
+      "name": "not-blocked",
+      "payload": {
+        "blocked": false,
+        "ip": "192.0.2.10",
+        "country": "AR",
+        "region": ""
+      }
+    },
+    {
+      "name": "blocked-regulatory-close-only",
+      "payload": {
+        "blocked": true,
+        "ip": "198.51.100.20",
+        "country": "US",
+        "region": "NY"
+      }
+    },
+    {
+      "name": "blocked-ofac",
+      "payload": {
+        "blocked": true,
+        "ip": "203.0.113.30",
+        "country": "KP",
+        "region": ""
+      }
+    }
+  ]
+}
