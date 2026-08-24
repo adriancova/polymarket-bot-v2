@@ -1,0 +1,64 @@
+{
+  "fixture": "orders/rest-trades",
+  "source": "https://github.com/Polymarket/ts-sdk/blob/main/packages/bindings/src/shared.ts",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "Trades read via REST (GET /data/trades, https://docs.polymarket.com/trading/manage-orders). Per the official SDK shared.ts at reference commit 7fdbed42484b5d279c71aa36d3757d18968260da, REST endpoints serialize the raw prefixed TRADE_STATUS_* constants (the user websocket channel serializes plain values), and 'MatchedNotBroadcasted currently appears only on trades read via REST, not on user stream trade events' — hence TRADE_STATUS_MATCHED_NOT_BROADCASTED is modeled here in the REST layer only (conflict C-3 in docs/venue/verified-2026-08-24.md records the docs' contrary normalized-event claim). Owner fields are sanitized zero-UUID placeholders; ids/hashes synthetic.",
+  "examples": [
+    {
+      "name": "rest-trade-matched-not-broadcasted",
+      "payload": {
+        "id": "00000000-0000-0000-0000-00000000t003",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0008",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "15",
+        "price": "0.08",
+        "status": "TRADE_STATUS_MATCHED_NOT_BROADCASTED",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0009",
+            "owner": "00000000-0000-0000-0000-000000000000",
+            "matched_amount": "15",
+            "price": "0.08",
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "side": "SELL"
+          }
+        ],
+        "trader_side": "TAKER"
+      }
+    },
+    {
+      "name": "rest-trade-matched",
+      "payload": {
+        "id": "00000000-0000-0000-0000-00000000t003",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0008",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "15",
+        "price": "0.08",
+        "status": "TRADE_STATUS_MATCHED",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "trader_side": "TAKER"
+      }
+    },
+    {
+      "name": "rest-trade-confirmed-terminal",
+      "payload": {
+        "id": "00000000-0000-0000-0000-00000000t003",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "15",
+        "price": "0.08",
+        "status": "TRADE_STATUS_CONFIRMED",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000c0ffee",
+        "trader_side": "TAKER"
+      }
+    }
+  ]
+}

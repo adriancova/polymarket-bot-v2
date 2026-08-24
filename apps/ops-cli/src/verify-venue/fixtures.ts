@@ -2,9 +2,10 @@
  * WP-000 venue-fixture loading and structural validation.
  *
  * Loads the sanitized venue fixtures frozen under `test/fixtures/venue/` and
- * validates their envelope and payload shapes against source-specific
- * schemas (types, enums, optionality). Structural validation only:
- * `packages/domain` does not exist yet, so no domain schemas are imported.
+ * validates their envelope and payload shapes against source-specific,
+ * recursively nested schemas (types, enums, optionality, canonical decimal
+ * form). Structural validation only: `packages/domain` does not exist yet,
+ * so no domain schemas are imported.
  *
  * This module never touches the network, never places orders, and never
  * requires credentials. It reads local fixture files only.
@@ -33,6 +34,7 @@ export const VENUE_FIXTURE_ROOT: string = join(
 export type FieldType =
   | "string"
   | "decimal-string"
+  | "price-string"
   | "number"
   | "boolean"
   | "object"
@@ -42,6 +44,10 @@ export interface FieldSpec {
   readonly type: FieldType;
   readonly enum?: readonly string[];
   readonly optional?: boolean;
+  /** Nested schema for `type: "object"` values. */
+  readonly fields?: PayloadSchema;
+  /** Element spec for `type: "array"` values (validated recursively). */
+  readonly items?: FieldSpec;
 }
 
 /** Source-specific payload schema. Unknown extra keys are permitted. */
@@ -75,35 +81,44 @@ const OFFICIAL_SOURCE_PREFIXES = [
 
 /**
  * Credential/secret-shaped keys that must only ever carry sanitized
- * placeholders. Covers API keys/secrets/passphrases, private keys, signature
- * and signed-payload material, mnemonic/seed phrases, authorization headers,
- * and the user-stream `owner` field (which carries the CLOB API key).
+ * placeholders. Matching is case-insensitive and separator-insensitive
+ * (keys are normalized to lowercase alphanumerics), so `POLY_API_KEY`,
+ * `Poly-Api-Key`, and `polyApiKey` all match `polyapikey`. Covers generic
+ * secret shapes plus the documented Polymarket credential/auth-header names
+ * (POLY_API_KEY, POLY_PASSPHRASE, POLY_SIGNATURE, POLY_ADDRESS,
+ * POLY_TIMESTAMP, POLY_NONCE, SIGNER_PRIVATE_KEY) and the user-stream
+ * owner/order-owner/trade-owner API-key fields.
  */
-const CREDENTIAL_KEYS: readonly string[] = [
-  "apiKey",
-  "api_key",
-  "apiSecret",
-  "api_secret",
+const CREDENTIAL_KEYS_NORMALIZED: readonly string[] = [
+  "apikey",
+  "apisecret",
   "secret",
-  "clientSecret",
-  "client_secret",
+  "clientsecret",
   "passphrase",
-  "privateKey",
-  "private_key",
+  "privatekey",
   "signature",
   "signatures",
-  "signedOrder",
-  "signed_order",
-  "signedPayload",
-  "signed_payload",
+  "signedorder",
+  "signedpayload",
   "mnemonic",
   "seed",
-  "seedPhrase",
-  "seed_phrase",
+  "seedphrase",
   "authorization",
-  "Authorization",
   "owner",
+  "orderowner",
+  "tradeowner",
+  "polyapikey",
+  "polypassphrase",
+  "polysignature",
+  "polyaddress",
+  "polytimestamp",
+  "polynonce",
+  "signerprivatekey",
 ];
+
+export function normalizeCredentialKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
 
 const ZERO_UUID_RE = /^0{8}-0{4}-0{4}-0{4}-0{8}[0-9a-z]{0,4}$/i;
 
@@ -138,7 +153,10 @@ function scanForCredentials(
     return;
   }
   for (const [key, entry] of Object.entries(value)) {
-    if (CREDENTIAL_KEYS.includes(key) && !isSanitizedPlaceholder(entry)) {
+    if (
+      CREDENTIAL_KEYS_NORMALIZED.includes(normalizeCredentialKey(key)) &&
+      !isSanitizedPlaceholder(entry)
+    ) {
       errors.push(
         `${path}.${key}: credential/secret-shaped field must be a sanitized placeholder`,
       );
@@ -147,7 +165,32 @@ function scanForCredentials(
   }
 }
 
-const DECIMAL_STRING_RE = /^-?\d+(\.\d+)?$/;
+/**
+ * Canonical decimal string per handoff SS7.3: optional leading minus (never
+ * on zero), no leading zeros, no trailing fractional zeros, no trailing
+ * decimal point, no scientific notation, no leading plus. Canonical zero is
+ * exactly "0".
+ */
+const CANONICAL_DECIMAL_RE = /^-?(0|[1-9]\d*)(\.\d*[1-9])?$/;
+
+export function isCanonicalDecimalString(value: unknown): value is string {
+  if (typeof value !== "string") {
+    return false;
+  }
+  if (value === "-0") {
+    return false;
+  }
+  return CANONICAL_DECIMAL_RE.test(value);
+}
+
+/** Canonical decimal constrained to the price/probability range [0, 1]. */
+export function isCanonicalPriceString(value: unknown): value is string {
+  if (!isCanonicalDecimalString(value)) {
+    return false;
+  }
+  const numeric = Number(value);
+  return numeric >= 0 && numeric <= 1;
+}
 
 function validateField(
   value: unknown,
@@ -163,8 +206,16 @@ function validateField(
       }
       break;
     case "decimal-string":
-      if (typeof value !== "string" || !DECIMAL_STRING_RE.test(value)) {
+      if (!isCanonicalDecimalString(value)) {
         errors.push(`${path}: expected canonical decimal string`);
+        return;
+      }
+      break;
+    case "price-string":
+      if (!isCanonicalPriceString(value)) {
+        errors.push(
+          `${path}: expected canonical decimal string within [0, 1]`,
+        );
         return;
       }
       break;
@@ -180,18 +231,28 @@ function validateField(
         return;
       }
       break;
-    case "object":
+    case "object": {
       if (!isRecord(value)) {
         errors.push(`${path}: expected object`);
         return;
       }
-      break;
-    case "array":
+      if (spec.fields !== undefined) {
+        validateObject(value, spec.fields, path, errors);
+      }
+      return;
+    }
+    case "array": {
       if (!Array.isArray(value)) {
         errors.push(`${path}: expected array`);
         return;
       }
-      break;
+      if (spec.items !== undefined) {
+        value.forEach((entry, index) => {
+          validateField(entry, spec.items as FieldSpec, `${path}[${index}]`, errors);
+        });
+      }
+      return;
+    }
   }
   if (spec.enum !== undefined && typeof value === "string") {
     if (!spec.enum.includes(value)) {
@@ -202,9 +263,28 @@ function validateField(
   }
 }
 
+function validateObject(
+  value: Record<string, unknown>,
+  schema: PayloadSchema,
+  path: string,
+  errors: string[],
+): void {
+  for (const [key, spec] of Object.entries(schema)) {
+    const fieldPath = `${path}.${key}`;
+    if (!(key in value) || value[key] === null || value[key] === undefined) {
+      if (spec.optional !== true) {
+        errors.push(`${fieldPath}: missing required key`);
+      }
+      continue;
+    }
+    validateField(value[key], spec, fieldPath, errors);
+  }
+}
+
 /**
  * Validates the common fixture envelope and each example payload against a
- * source-specific schema (types, enums, optionality).
+ * source-specific schema (recursively: types, enums, optionality, canonical
+ * decimal/price form).
  */
 export function validateFixtureDocument(
   raw: unknown,
@@ -254,16 +334,7 @@ export function validateFixtureDocument(
         errors.push(`examples[${index}].payload must be an object`);
         return;
       }
-      for (const [key, spec] of Object.entries(schema)) {
-        const path = `examples[${index}].payload.${key}`;
-        if (!(key in payload)) {
-          if (spec.optional !== true) {
-            errors.push(`${path}: missing required key`);
-          }
-          continue;
-        }
-        validateField(payload[key], spec, path, errors);
-      }
+      validateObject(payload, schema, `examples[${index}].payload`, errors);
     });
   }
   scanForCredentials(raw, "$", errors);

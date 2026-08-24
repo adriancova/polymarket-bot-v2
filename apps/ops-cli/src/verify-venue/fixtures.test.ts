@@ -1,20 +1,23 @@
 /**
  * WP-000: validates that every sanitized venue fixture parses and matches its
- * source-specific schema, that the frozen verification report validates, and
- * that the skeleton's failure modes behave. Local files only — no network,
- * no credentials, no orders.
+ * source-specific recursive schema, that the frozen verification report
+ * validates (sections + official evidence), and that the skeleton's failure
+ * modes behave. Local files only — no network, no credentials, no orders.
  */
 import { readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { VENUE_CHECKS } from "./checks.js";
+import type { VenueCheck } from "./checks.js";
 import {
   VENUE_FIXTURE_ROOT,
+  isCanonicalDecimalString,
+  isCanonicalPriceString,
   loadFixture,
   validateFixtureDocument,
 } from "./fixtures.js";
-import type { FixtureExample } from "./fixtures.js";
+import type { FixtureExample, PayloadSchema } from "./fixtures.js";
 import {
   formatVenueVerificationReport,
   loadAndValidateReport,
@@ -36,6 +39,12 @@ function listJsonFiles(dir: string): string[] {
   return files.sort();
 }
 
+function checkById(id: string): VenueCheck {
+  const check = VENUE_CHECKS.find((candidate) => candidate.id === id);
+  expect(check, id).toBeDefined();
+  return check as VenueCheck;
+}
+
 function examplesOf(relativePath: string): readonly FixtureExample[] {
   const result = loadFixture(relativePath, {});
   expect(result.fixture, result.errors.join("; ")).not.toBeNull();
@@ -51,6 +60,17 @@ function envelope(examples: unknown): Record<string, unknown> {
     notes: "n",
     examples,
   };
+}
+
+function errorsFor(
+  payload: Record<string, unknown>,
+  schema: PayloadSchema,
+): string[] {
+  return validateFixtureDocument(
+    envelope([{ name: "case", payload }]),
+    "x/y",
+    schema,
+  ).errors;
 }
 
 const fixtureChecks = VENUE_CHECKS.filter((check) => check.kind === "fixture");
@@ -70,6 +90,7 @@ describe("venue fixture catalog", () => {
       "market-ws-lifecycle",
       "user-ws-order-lifecycle",
       "user-ws-trade-settlement",
+      "rest-trade-settlement",
       "heartbeat",
       "fees-and-rewards",
       "per-market-parameters",
@@ -106,6 +127,65 @@ describe("venue fixture structural validation", () => {
       });
     }
   }
+});
+
+describe("canonical decimal and price validation", () => {
+  it("accepts canonical forms", () => {
+    for (const value of ["0", "1", "0.5", "0.05", "-1.5", "33343.4", "120"]) {
+      expect(isCanonicalDecimalString(value), value).toBe(true);
+    }
+  });
+
+  for (const bad of [
+    "-0",
+    "01.23",
+    "1.50",
+    "1.",
+    "+1",
+    "1e5",
+    "1E5",
+    ".5",
+    "0.50",
+    "00",
+    "1,5",
+    "",
+  ]) {
+    it(`rejects non-canonical decimal ${JSON.stringify(bad)}`, () => {
+      expect(isCanonicalDecimalString(bad)).toBe(false);
+    });
+  }
+
+  it("bounds prices to [0, 1]", () => {
+    expect(isCanonicalPriceString("0")).toBe(true);
+    expect(isCanonicalPriceString("1")).toBe(true);
+    expect(isCanonicalPriceString("0.08")).toBe(true);
+    expect(isCanonicalPriceString("1.5")).toBe(false);
+    expect(isCanonicalPriceString("2")).toBe(false);
+    expect(isCanonicalPriceString("-0.5")).toBe(false);
+    expect(isCanonicalPriceString("0.50")).toBe(false);
+  });
+
+  it("rejects out-of-range and non-canonical prices inside schemas", () => {
+    const schema = checkById("market-ws-last-trade").payloadSchema;
+    const errors = errorsFor(
+      {
+        event_type: "last_trade_price",
+        market: "m",
+        asset_id: "a",
+        price: "1.5",
+        size: "-0",
+        side: "SELL",
+        timestamp: "1",
+      },
+      schema,
+    );
+    expect(
+      errors.some((error) => error.includes("within [0, 1]")),
+    ).toBe(true);
+    expect(
+      errors.some((error) => error.includes("canonical decimal string")),
+    ).toBe(true);
+  });
 });
 
 describe("heartbeat protocol shapes", () => {
@@ -184,15 +264,26 @@ describe("restricted-mode shapes", () => {
     const headers = example?.payload["headers"] as Record<string, unknown>;
     expect(headers).toHaveProperty("Retry-After");
   });
+
+  it("rejects a restricted-mode body missing the documented 'error' field", () => {
+    const schema = checkById("restricted-modes").payloadSchema;
+    const errors = errorsFor(
+      { http_status: 503, body: { error_msg: "wrong field name" } },
+      schema,
+    );
+    expect(
+      errors.some((error) => error.includes("body.error: missing required key")),
+    ).toBe(true);
+  });
 });
 
-describe("user-stream events", () => {
-  it("trade settlement covers all six documented settlement states", () => {
-    const statuses = examplesOf("user-ws/trade-settlement.json").map(
-      (example) => example.payload["status"],
-    );
+describe("raw user-stream trade events (official SDK UserTradeEventSchema)", () => {
+  const check = checkById("user-ws-trade-settlement");
+  const examples = examplesOf("user-ws/trade-settlement.json");
+
+  it("covers the five plain user-channel wire statuses", () => {
+    const statuses = examples.map((example) => example.payload["status"]);
     for (const status of [
-      "MATCHED_NOT_BROADCASTED",
       "MATCHED",
       "MINED",
       "CONFIRMED",
@@ -201,16 +292,92 @@ describe("user-stream events", () => {
     ]) {
       expect(statuses).toContain(status);
     }
+    expect(statuses).not.toContain("MATCHED_NOT_BROADCASTED");
   });
 
-  it("the MATCHED_NOT_BROADCASTED wire string is flagged UNVERIFIED", () => {
-    const example = examplesOf("user-ws/trade-settlement.json").find(
-      (candidate) => candidate.payload["status"] === "MATCHED_NOT_BROADCASTED",
+  it("every trade event carries the SDK-required type and owner", () => {
+    for (const example of examples) {
+      expect(example.payload["type"]).toBe("TRADE");
+      expect(typeof example.payload["owner"]).toBe("string");
+    }
+  });
+
+  const validTrade = (): Record<string, unknown> =>
+    structuredClone(examples[0]?.payload as Record<string, unknown>);
+
+  it("fails when top-level type is missing", () => {
+    const payload = validTrade();
+    delete payload["type"];
+    expect(
+      errorsFor(payload, check.payloadSchema).some((error) =>
+        error.includes(".type: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("fails when top-level owner is missing", () => {
+    const payload = validTrade();
+    delete payload["owner"];
+    expect(
+      errorsFor(payload, check.payloadSchema).some((error) =>
+        error.includes(".owner: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  for (const field of ["owner", "asset_id", "side"]) {
+    it(`fails when a maker order omits required ${field}`, () => {
+      const payload = validTrade();
+      const makers = payload["maker_orders"] as Array<
+        Record<string, unknown>
+      >;
+      delete makers[0]?.[field];
+      expect(
+        errorsFor(payload, check.payloadSchema).some((error) =>
+          error.includes(`maker_orders[0].${field}: missing required key`),
+        ),
+      ).toBe(true);
+    });
+  }
+
+  it("rejects the REST-only MATCHED_NOT_BROADCASTED status on the user stream", () => {
+    const payload = validTrade();
+    payload["status"] = "MATCHED_NOT_BROADCASTED";
+    expect(
+      errorsFor(payload, check.payloadSchema).some((error) =>
+        error.includes("not in enum"),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("REST trade reads (prefixed TRADE_STATUS_* constants)", () => {
+  const check = checkById("rest-trade-settlement");
+  const examples = examplesOf("orders/rest-trades.json");
+
+  it("models MATCHED_NOT_BROADCASTED in the REST layer only (C-3)", () => {
+    const statuses = examples.map((example) => example.payload["status"]);
+    expect(statuses).toContain("TRADE_STATUS_MATCHED_NOT_BROADCASTED");
+    for (const status of statuses) {
+      expect(String(status).startsWith("TRADE_STATUS_")).toBe(true);
+    }
+  });
+
+  it("rejects plain (user-channel) status values in the REST layer", () => {
+    const payload = structuredClone(
+      examples[0]?.payload as Record<string, unknown>,
     );
-    expect(example?.name).toContain("UNVERIFIED");
+    payload["status"] = "MATCHED";
+    expect(
+      errorsFor(payload, check.payloadSchema).some((error) =>
+        error.includes("not in enum"),
+      ),
+    ).toBe(true);
   });
+});
 
-  it("every order event carries the full documented wire field set", () => {
+describe("user order events", () => {
+  it("every order event carries the full raw wire field set", () => {
     for (const example of examplesOf("user-ws/order-lifecycle.json")) {
       for (const field of [
         "event_type",
@@ -223,13 +390,13 @@ describe("user-stream events", () => {
         "original_size",
         "size_matched",
         "price",
-        "outcome",
         "status",
         "timestamp",
       ]) {
-        expect(example.payload, `${example.name} missing ${field}`).toHaveProperty(
-          field,
-        );
+        expect(
+          example.payload,
+          `${example.name} missing ${field}`,
+        ).toHaveProperty(field);
       }
     }
   });
@@ -277,6 +444,141 @@ describe("order placement responses", () => {
       expect(failure.payload).not.toHaveProperty("transactionsHashes");
       expect(failure.payload).not.toHaveProperty("tradeIDs");
     }
+  });
+});
+
+describe("nested contract validation (negative cases)", () => {
+  it("rejects malformed book levels", () => {
+    const schema = checkById("market-ws-book").payloadSchema;
+    const errors = errorsFor(
+      {
+        event_type: "book",
+        market: "m",
+        asset_id: "a",
+        timestamp: "1",
+        bids: [{ price: "1.50", size: "10" }],
+        asks: [{ price: "0.09" }],
+      },
+      schema,
+    );
+    expect(
+      errors.some((error) => error.includes("bids[0].price")),
+    ).toBe(true);
+    expect(
+      errors.some((error) =>
+        error.includes("asks[0].size: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects malformed price changes", () => {
+    const schema = checkById("market-ws-price-change").payloadSchema;
+    const errors = errorsFor(
+      {
+        event_type: "price_change",
+        market: "m",
+        timestamp: "1",
+        price_changes: [
+          { asset_id: "a", price: "0.08", size: "10", side: "HOLD" },
+          { asset_id: "a", price: "2", size: "10", side: "BUY" },
+        ],
+      },
+      schema,
+    );
+    expect(
+      errors.some((error) => error.includes("price_changes[0].side")),
+    ).toBe(true);
+    expect(
+      errors.some((error) => error.includes("price_changes[1].price")),
+    ).toBe(true);
+  });
+
+  it("rejects malformed rate-limit tier entries", () => {
+    const schema = checkById("rate-limits").payloadSchema;
+    const errors = errorsFor(
+      {
+        effective_date: "2026-08-24",
+        tiers: [
+          {
+            tier: "Standard",
+            volume_30d_usd: "0",
+            order_tokens_per_s: "forty",
+            order_burst: 60,
+            cancel_tokens_per_s: 80,
+          },
+        ],
+      },
+      schema,
+    );
+    expect(
+      errors.some((error) =>
+        error.includes("tiers[0].order_tokens_per_s"),
+      ),
+    ).toBe(true);
+    expect(
+      errors.some((error) =>
+        error.includes("tiers[0].cancel_burst: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects malformed position transaction outcomes and requests", () => {
+    const schema = checkById("position-operations").payloadSchema;
+    const errors = errorsFor(
+      {
+        operation: "split",
+        description: "d",
+        request: {
+          collateralToken: "0x0000000000000000000000000000000000000000",
+          conditionId: "c",
+          amount: "01.5",
+        },
+        transaction_outcome: { transactionHash: "0x00" },
+      },
+      schema,
+    );
+    expect(
+      errors.some((error) =>
+        error.includes("request.parentCollectionId: missing required key"),
+      ),
+    ).toBe(true);
+    expect(
+      errors.some((error) => error.includes("request.amount")),
+    ).toBe(true);
+    expect(
+      errors.some((error) =>
+        error.includes(
+          "transaction_outcome.transactionId: missing required key",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects malformed RTDS payloads", () => {
+    const schema = checkById("chainlink-twap-rtds").payloadSchema;
+    const errors = errorsFor(
+      {
+        topic: "crypto_prices_twap_thirty",
+        type: "update",
+        payload: {
+          symbol: "btc/usd",
+          value: 65000.5,
+          full_accuracy_value: 65000,
+          timestamp: 1,
+        },
+      },
+      schema,
+    );
+    expect(
+      errors.some((error) =>
+        error.includes("payload.full_accuracy_value"),
+      ),
+    ).toBe(true);
+    expect(
+      errors.some((error) =>
+        error.includes("payload.window_s: missing required key"),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -408,15 +710,15 @@ describe("validation failure modes", () => {
   });
 
   it("rejects wrong field types and enum violations", () => {
-    const doc = envelope([
-      { name: "bad", payload: { side: "HOLD", price: 0.5, live: "yes" } },
-    ]);
-    const { errors } = validateFixtureDocument(doc, "x/y", {
-      side: { type: "string", enum: ["BUY", "SELL"] },
-      price: { type: "decimal-string" },
-      live: { type: "boolean" },
-      missing: { type: "string" },
-    });
+    const errors = errorsFor(
+      { side: "HOLD", price: 0.5, live: "yes" },
+      {
+        side: { type: "string", enum: ["BUY", "SELL"] },
+        price: { type: "decimal-string" },
+        live: { type: "boolean" },
+        missing: { type: "string" },
+      },
+    );
     expect(errors.some((error) => error.includes("not in enum"))).toBe(true);
     expect(
       errors.some((error) => error.includes("canonical decimal string")),
@@ -433,12 +735,8 @@ describe("validation failure modes", () => {
     const schema = {
       hash: { type: "string", optional: true },
     } as const;
-    const okDoc = envelope([{ name: "a", payload: {} }]);
-    expect(validateFixtureDocument(okDoc, "x/y", schema).errors).toEqual([]);
-    const badDoc = envelope([{ name: "a", payload: { hash: 5 } }]);
-    expect(
-      validateFixtureDocument(badDoc, "x/y", schema).errors.length,
-    ).toBeGreaterThan(0);
+    expect(errorsFor({}, schema)).toEqual([]);
+    expect(errorsFor({ hash: 5 }, schema).length).toBeGreaterThan(0);
   });
 
   for (const secretKey of [
@@ -462,15 +760,27 @@ describe("validation failure modes", () => {
     "authorization",
     "Authorization",
     "owner",
+    "order_owner",
+    "trade_owner",
+    "POLY_API_KEY",
+    "POLY-API-KEY",
+    "poly_api_key",
+    "POLY_PASSPHRASE",
+    "Poly-Passphrase",
+    "POLY_SIGNATURE",
+    "poly-signature",
+    "POLY_ADDRESS",
+    "Poly-Address",
+    "POLY_TIMESTAMP",
+    "POLY_NONCE",
+    "SIGNER_PRIVATE_KEY",
+    "signerPrivateKey",
   ]) {
     it(`fails validation when a fixture contains a non-placeholder "${secretKey}"`, () => {
-      const doc = envelope([
-        {
-          name: "leaky",
-          payload: { nested: { [secretKey]: "realistic-secret-value-123" } },
-        },
-      ]);
-      const { errors } = validateFixtureDocument(doc, "x/y", {});
+      const errors = errorsFor(
+        { nested: { [secretKey]: "realistic-secret-value-123" } },
+        {},
+      );
       expect(
         errors.some((error) =>
           error.includes("must be a sanitized placeholder"),
@@ -480,17 +790,16 @@ describe("validation failure modes", () => {
   }
 
   it("allows sanitized placeholders in credential-shaped fields", () => {
-    const doc = envelope([
+    const errors = errorsFor(
       {
-        name: "clean",
-        payload: {
-          owner: "00000000-0000-0000-0000-000000000000",
-          apiKey: "sanitized-api-key",
-          signature: "",
-        },
+        owner: "00000000-0000-0000-0000-000000000000",
+        apiKey: "sanitized-api-key",
+        POLY_SIGNATURE: "",
+        POLY_ADDRESS: "0x0000000000000000000000000000000000000000",
       },
-    ]);
-    expect(validateFixtureDocument(doc, "x/y", {}).errors).toEqual([]);
+      {},
+    );
+    expect(errors).toEqual([]);
   });
 });
 
@@ -512,11 +821,57 @@ describe("verification report validation", () => {
 
   it("fails when a required section is missing", () => {
     const validation = validateVerificationReport(
-      "## 1. Something\nUNVERIFIED\n",
+      "## 1. Something\nhttps://docs.polymarket.com/x\nUNVERIFIED\n",
     );
     expect(validation.ok).toBe(false);
     expect(
-      validation.errors.some((error) => error.includes("missing required section")),
+      validation.errors.some((error) =>
+        error.includes("missing required section"),
+      ),
+    ).toBe(true);
+  });
+
+  it("fails a report with headings but no citations at all", () => {
+    const headings = [
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+      "9",
+      "10.1",
+      "10.2",
+      "10.3",
+      "11",
+      "12",
+      "13",
+    ]
+      .map((section) => `## ${section}. Heading\nUNVERIFIED text\n`)
+      .join("\n");
+    const validation = validateVerificationReport(headings);
+    expect(validation.ok).toBe(false);
+    expect(
+      validation.errors.some((error) =>
+        error.includes("no citations"),
+      ),
+    ).toBe(true);
+  });
+
+  it("fails when a required section lacks official evidence", () => {
+    const content = [
+      "## 1. SDK\nhttps://docs.polymarket.com/getting-started\n",
+      "## 2. Orders\nno citation here, no marker\n",
+    ].join("\n");
+    const validation = validateVerificationReport(content);
+    expect(
+      validation.errors.some((error) =>
+        error.includes(
+          "section 2 has no official citation or UNVERIFIED marker",
+        ),
+      ),
     ).toBe(true);
   });
 
@@ -541,13 +896,14 @@ describe("runVenueVerification", () => {
     expect(report.results.length).toBe(VENUE_CHECKS.length);
   });
 
-  it("documented-only checks report DOCUMENTED, never a vacuous PASS", () => {
+  it("documented-only checks report DOCUMENTED backed by section evidence", () => {
     const documented = report.results.filter(
       (result) => result.check.kind === "documented",
     );
     expect(documented.length).toBeGreaterThan(0);
     for (const result of documented) {
       expect(result.status).toBe("DOCUMENTED");
+      expect(result.errors).toEqual([]);
     }
   });
 

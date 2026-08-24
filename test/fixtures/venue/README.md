@@ -45,11 +45,14 @@ placeholders are substituted so parsers see realistic shapes.
   (including the level-removal example, see caveat below), tick-size change,
   last trade, best bid/ask, market lifecycle (`new_market`,
   `market_resolved`).
-- `user-ws/` — authenticated user channel: order lifecycle
-  (PLACEMENT/UPDATE/CANCELLATION) and the six trade settlement states
-  (MATCHED_NOT_BROADCASTED/MATCHED/MINED/CONFIRMED/RETRYING/FAILED).
-- `orders/` — order placement responses: `live`, `matched`, `delayed`,
-  `unmatched`, and error-taxonomy examples.
+- `user-ws/` — authenticated user channel RAW wire events per the official
+  SDK bindings: order lifecycle (PLACEMENT/UPDATE/CANCELLATION) and trade
+  settlement with the plain user-channel wire statuses
+  (MATCHED/MINED/CONFIRMED/RETRYING/FAILED).
+- `orders/` — order placement responses (`live`, `matched`, `delayed`,
+  `unmatched`, error-taxonomy examples) and REST trade reads with prefixed
+  `TRADE_STATUS_*` constants including the REST-only
+  `TRADE_STATUS_MATCHED_NOT_BROADCASTED` (conflict C-3).
 - `heartbeat/` — `POST /v1/heartbeats` empty-ID bootstrap, ID rotation,
   and the documented 400 invalid-ID recovery.
 - `fees/` — fee formula parameters, category fee rates, rebate and
@@ -62,6 +65,19 @@ placeholders are substituted so parsers see realistic shapes.
   and position-ID derivation.
 - `rtds/` — Chainlink TWAP subscribe/update messages (30 s and 60 s
   windows) over RTDS.
+
+## Raw vs normalized layers and SDK reference commit
+
+Raw wire fixtures (`user-ws/*`, `orders/rest-trades.json`) follow the raw
+Zod schemas in the official unified SDK bindings
+(`Polymarket/ts-sdk`, `packages/bindings/src/subscriptions/clob.ts` and
+`packages/bindings/src/shared.ts`) at reference commit
+`7fdbed42484b5d279c71aa36d3757d18968260da` (retrieved 2026-08-24). The
+docs' normalized events are camelCase SDK models layered on those raw
+schemas and are NOT what these fixtures represent. Per the SDK, the user
+websocket channel serializes plain trade statuses while REST serializes
+prefixed `TRADE_STATUS_*` constants, and `MatchedNotBroadcasted` appears
+only on REST trades (conflict C-3 in the verification report).
 
 ## Caveats
 

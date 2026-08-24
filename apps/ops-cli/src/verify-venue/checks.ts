@@ -4,16 +4,25 @@
  * Enumerates the venue facts that handoff SS1.2 requires re-verifying at the
  * start of every implementation phase, maps each to its section in the frozen
  * verification report and to the sanitized fixture files that cover it, and
- * declares a source-specific payload schema per fixture.
+ * declares a source-specific, recursively nested payload schema per fixture.
+ *
+ * Raw wire schemas follow the official unified SDK bindings
+ * (github.com/Polymarket/ts-sdk, packages/bindings/src, reference commit
+ * 7fdbed42484b5d279c71aa36d3757d18968260da, retrieved 2026-08-24).
  *
  * `kind: "fixture"` checks are structurally validated against local fixture
  * files. `kind: "documented"` checks have no meaningful local fixture (for
  * example the SDK ruling); they are validated against the frozen report file
- * (section presence) and are reported as DOCUMENTED, never as vacuous PASS.
+ * (section presence WITH official evidence) and are reported as DOCUMENTED,
+ * never as vacuous PASS.
  */
-import type { PayloadSchema } from "./fixtures.js";
+import type { FieldSpec, PayloadSchema } from "./fixtures.js";
 
 export const VERIFICATION_REPORT_PATH = "docs/venue/verified-2026-08-24.md";
+
+/** Official SDK reference commit the raw schemas were verified against. */
+export const SDK_REFERENCE_COMMIT =
+  "7fdbed42484b5d279c71aa36d3757d18968260da";
 
 export interface VenueCheck {
   readonly id: string;
@@ -27,6 +36,64 @@ export interface VenueCheck {
 }
 
 const SIDE = ["BUY", "SELL"] as const;
+
+/** Book level: {price, size} with canonical decimal strings, price in [0,1]. */
+const BOOK_LEVEL: FieldSpec = {
+  type: "array",
+  items: {
+    type: "object",
+    fields: {
+      price: { type: "price-string" },
+      size: { type: "decimal-string" },
+    },
+  },
+};
+
+/**
+ * Raw user-channel trade maker order, per the official SDK
+ * TradeMakerOrderSchema (packages/bindings/src/subscriptions/clob.ts at the
+ * reference commit): order_id, owner, matched_amount, price, asset_id, side
+ * required; maker_address, fee_rate_bps, outcome, outcome_index nullish.
+ */
+const TRADE_MAKER_ORDER: FieldSpec = {
+  type: "object",
+  fields: {
+    order_id: { type: "string" },
+    owner: { type: "string" },
+    maker_address: { type: "string", optional: true },
+    matched_amount: { type: "decimal-string" },
+    price: { type: "price-string" },
+    fee_rate_bps: { type: "decimal-string", optional: true },
+    asset_id: { type: "string" },
+    outcome: { type: "string", optional: true },
+    outcome_index: { type: "number", optional: true },
+    side: { type: "string", enum: SIDE },
+  },
+};
+
+/**
+ * User-channel wire statuses serialize as plain values (SDK shared.ts:
+ * REST endpoints serialize the prefixed constants while the user websocket
+ * channel serializes plain values). MatchedNotBroadcasted appears only on
+ * REST trades, not on user-stream events (SDK TradeStatus note; conflict
+ * C-3 in the report).
+ */
+const USER_STREAM_TRADE_STATUS = [
+  "MATCHED",
+  "MINED",
+  "CONFIRMED",
+  "RETRYING",
+  "FAILED",
+] as const;
+
+const REST_TRADE_STATUS = [
+  "TRADE_STATUS_MATCHED_NOT_BROADCASTED",
+  "TRADE_STATUS_MATCHED",
+  "TRADE_STATUS_MINED",
+  "TRADE_STATUS_CONFIRMED",
+  "TRADE_STATUS_RETRYING",
+  "TRADE_STATUS_FAILED",
+] as const;
 
 export const VENUE_CHECKS: readonly VenueCheck[] = [
   {
@@ -55,8 +122,12 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
       },
       makingAmount: { type: "string" },
       takingAmount: { type: "string" },
-      transactionsHashes: { type: "array", optional: true },
-      tradeIDs: { type: "array", optional: true },
+      transactionsHashes: {
+        type: "array",
+        optional: true,
+        items: { type: "string" },
+      },
+      tradeIDs: { type: "array", optional: true, items: { type: "string" } },
     },
   },
   {
@@ -71,8 +142,8 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
       asset_id: { type: "string" },
       timestamp: { type: "string" },
       hash: { type: "string", optional: true },
-      bids: { type: "array" },
-      asks: { type: "array" },
+      bids: BOOK_LEVEL,
+      asks: BOOK_LEVEL,
     },
   },
   {
@@ -85,7 +156,21 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     payloadSchema: {
       event_type: { type: "string", enum: ["price_change"] },
       market: { type: "string" },
-      price_changes: { type: "array" },
+      price_changes: {
+        type: "array",
+        items: {
+          type: "object",
+          fields: {
+            asset_id: { type: "string" },
+            price: { type: "price-string" },
+            size: { type: "decimal-string" },
+            side: { type: "string", enum: SIDE },
+            hash: { type: "string", optional: true },
+            best_bid: { type: "price-string", optional: true },
+            best_ask: { type: "price-string", optional: true },
+          },
+        },
+      },
       timestamp: { type: "string" },
     },
   },
@@ -99,8 +184,8 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
       event_type: { type: "string", enum: ["tick_size_change"] },
       market: { type: "string" },
       asset_id: { type: "string" },
-      old_tick_size: { type: "decimal-string" },
-      new_tick_size: { type: "decimal-string" },
+      old_tick_size: { type: "price-string" },
+      new_tick_size: { type: "price-string" },
       timestamp: { type: "string" },
     },
   },
@@ -114,7 +199,7 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
       event_type: { type: "string", enum: ["last_trade_price"] },
       market: { type: "string" },
       asset_id: { type: "string" },
-      price: { type: "decimal-string" },
+      price: { type: "price-string" },
       size: { type: "decimal-string" },
       fee_rate_bps: { type: "decimal-string", optional: true },
       side: { type: "string", enum: SIDE },
@@ -132,9 +217,9 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
       event_type: { type: "string", enum: ["best_bid_ask"] },
       market: { type: "string" },
       asset_id: { type: "string" },
-      best_bid: { type: "decimal-string" },
-      best_ask: { type: "decimal-string" },
-      spread: { type: "decimal-string", optional: true },
+      best_bid: { type: "price-string" },
+      best_ask: { type: "price-string" },
+      spread: { type: "price-string", optional: true },
       timestamp: { type: "string" },
     },
   },
@@ -147,7 +232,7 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     payloadSchema: {
       event_type: { type: "string", enum: ["new_market", "market_resolved"] },
       market: { type: "string" },
-      assets_ids: { type: "array" },
+      assets_ids: { type: "array", items: { type: "string" } },
       timestamp: { type: "string" },
     },
   },
@@ -168,11 +253,12 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
       side: { type: "string", enum: SIDE },
       original_size: { type: "decimal-string" },
       size_matched: { type: "decimal-string" },
-      price: { type: "decimal-string" },
-      outcome: { type: "string" },
+      price: { type: "price-string" },
+      outcome: { type: "string", optional: true },
       status: {
         type: "string",
         enum: ["LIVE", "MATCHED", "DELAYED", "UNMATCHED", "CANCELED"],
+        optional: true,
       },
       timestamp: { type: "string" },
     },
@@ -180,33 +266,55 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
   {
     id: "user-ws-trade-settlement",
     title:
-      "User channel trade settlement states (MATCHED_NOT_BROADCASTED/MATCHED/MINED/CONFIRMED/RETRYING/FAILED)",
+      "User channel RAW trade events per official SDK UserTradeEventSchema (plain wire statuses; MATCHED_NOT_BROADCASTED is REST-only, C-3)",
     reportSection: "4",
     kind: "fixture",
     fixtures: ["user-ws/trade-settlement.json"],
     payloadSchema: {
       event_type: { type: "string", enum: ["trade"] },
+      type: { type: "string", enum: ["TRADE"] },
       id: { type: "string" },
       taker_order_id: { type: "string" },
       market: { type: "string" },
       asset_id: { type: "string" },
       side: { type: "string", enum: SIDE },
       size: { type: "decimal-string" },
-      price: { type: "decimal-string" },
-      status: {
-        type: "string",
-        enum: [
-          "MATCHED_NOT_BROADCASTED",
-          "MATCHED",
-          "MINED",
-          "CONFIRMED",
-          "RETRYING",
-          "FAILED",
-        ],
-      },
-      maker_orders: { type: "array" },
-      trader_side: { type: "string", enum: ["TAKER", "MAKER"] },
+      fee_rate_bps: { type: "decimal-string", optional: true },
+      price: { type: "price-string" },
+      status: { type: "string", enum: USER_STREAM_TRADE_STATUS },
+      match_time: { type: "string", optional: true },
+      last_update: { type: "string", optional: true },
+      outcome: { type: "string", optional: true },
+      owner: { type: "string" },
+      trade_owner: { type: "string", optional: true },
+      maker_address: { type: "string", optional: true },
+      transaction_hash: { type: "string", optional: true },
+      bucket_index: { type: "number", optional: true },
+      maker_orders: { type: "array", optional: true, items: TRADE_MAKER_ORDER },
+      trader_side: { type: "string", enum: ["TAKER", "MAKER"], optional: true },
       timestamp: { type: "string" },
+    },
+  },
+  {
+    id: "rest-trade-settlement",
+    title:
+      "REST trade reads with prefixed TRADE_STATUS_* constants incl. MATCHED_NOT_BROADCASTED (REST-only per SDK, C-3)",
+    reportSection: "4",
+    kind: "fixture",
+    fixtures: ["orders/rest-trades.json"],
+    payloadSchema: {
+      id: { type: "string" },
+      taker_order_id: { type: "string", optional: true },
+      market: { type: "string" },
+      asset_id: { type: "string" },
+      side: { type: "string", enum: SIDE },
+      size: { type: "decimal-string" },
+      price: { type: "price-string" },
+      status: { type: "string", enum: REST_TRADE_STATUS },
+      owner: { type: "string" },
+      maker_orders: { type: "array", optional: true, items: TRADE_MAKER_ORDER },
+      trader_side: { type: "string", enum: ["TAKER", "MAKER"], optional: true },
+      transaction_hash: { type: "string", optional: true },
     },
   },
   {
@@ -250,7 +358,23 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     payloadSchema: {
       headers: { type: "object", optional: true },
       effective_date: { type: "string", optional: true },
-      tiers: { type: "array", optional: true },
+      tiers: {
+        type: "array",
+        optional: true,
+        items: {
+          type: "object",
+          fields: {
+            tier: { type: "string" },
+            volume_30d_usd: { type: "decimal-string" },
+            order_tokens_per_s: { type: "number" },
+            order_burst: { type: "number" },
+            cancel_tokens_per_s: { type: "number" },
+            cancel_burst: { type: "number" },
+          },
+        },
+      },
+      limits_per_10s: { type: "object", optional: true },
+      trading_dual_limits: { type: "object", optional: true },
     },
   },
   {
@@ -263,7 +387,15 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     payloadSchema: {
       http_status: { type: "number" },
       headers: { type: "object", optional: true },
-      body: { type: "object", optional: true },
+      body: {
+        type: "object",
+        optional: true,
+        fields: {
+          error: { type: "string" },
+          code: { type: "string", optional: true },
+          retry_after_seconds: { type: "number", optional: true },
+        },
+      },
     },
   },
   {
@@ -299,6 +431,27 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
         ],
       },
       description: { type: "string" },
+      contracts: { type: "object", optional: true },
+      request: {
+        type: "object",
+        optional: true,
+        fields: {
+          collateralToken: { type: "string" },
+          parentCollectionId: { type: "string" },
+          conditionId: { type: "string" },
+          partition: { type: "array", optional: true, items: { type: "number" } },
+          indexSets: { type: "array", optional: true, items: { type: "number" } },
+          amount: { type: "decimal-string", optional: true },
+        },
+      },
+      transaction_outcome: {
+        type: "object",
+        optional: true,
+        fields: {
+          transactionHash: { type: "string" },
+          transactionId: { type: "string" },
+        },
+      },
     },
   },
   {
@@ -316,7 +469,17 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
         optional: true,
       },
       type: { type: "string", enum: ["update"], optional: true },
-      payload: { type: "object", optional: true },
+      payload: {
+        type: "object",
+        optional: true,
+        fields: {
+          symbol: { type: "string" },
+          value: { type: "number" },
+          full_accuracy_value: { type: "decimal-string" },
+          timestamp: { type: "number" },
+          window_s: { type: "number" },
+        },
+      },
     },
   },
 ] as const;

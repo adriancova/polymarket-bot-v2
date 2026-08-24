@@ -71,9 +71,50 @@ export function reportHasSection(content: string, section: string): boolean {
   return sectionHeadingRegExp(section).test(content);
 }
 
+/** Extracts a section's text: from its heading to the next ##/### heading. */
+export function reportSectionText(
+  content: string,
+  section: string,
+): string | null {
+  const match = sectionHeadingRegExp(section).exec(content);
+  if (match === null) {
+    return null;
+  }
+  const start = match.index;
+  const rest = content.slice(start + match[0].length);
+  const next = /^#{2,3} /m.exec(rest);
+  return next === null
+    ? content.slice(start)
+    : content.slice(start, start + match[0].length + next.index);
+}
+
 /**
- * Validates the report content: required sections present, an UNVERIFIED
- * section exists, and every http(s) citation targets an official domain.
+ * A section carries evidence when it contains at least one official-domain
+ * citation or an explicit UNVERIFIED marker.
+ */
+export function reportSectionHasEvidence(
+  content: string,
+  section: string,
+): boolean {
+  const text = reportSectionText(content, section);
+  if (text === null) {
+    return false;
+  }
+  return (
+    OFFICIAL_CITATION_PREFIXES.some((prefix) => text.includes(prefix)) ||
+    text.includes("UNVERIFIED")
+  );
+}
+
+/** Sections exempt from the citation requirement (safety attestation). */
+const EVIDENCE_EXEMPT_SECTIONS: readonly string[] = ["13"];
+
+/**
+ * Validates the report content: required sections present, each required
+ * section carries official evidence (a citation to an official domain or an
+ * explicit UNVERIFIED marker), an UNVERIFIED inventory exists, at least one
+ * official citation exists overall, and every http(s) citation targets an
+ * official domain.
  */
 export function validateVerificationReport(
   content: string,
@@ -82,12 +123,24 @@ export function validateVerificationReport(
   for (const section of REQUIRED_REPORT_SECTIONS) {
     if (!reportHasSection(content, section)) {
       errors.push(`report missing required section ${section}`);
+      continue;
+    }
+    if (
+      !EVIDENCE_EXEMPT_SECTIONS.includes(section) &&
+      !reportSectionHasEvidence(content, section)
+    ) {
+      errors.push(
+        `report section ${section} has no official citation or UNVERIFIED marker`,
+      );
     }
   }
   if (!content.includes("UNVERIFIED")) {
     errors.push("report must carry an explicit UNVERIFIED inventory");
   }
   const urls = content.match(/https?:\/\/[^\s)\]>`"']+/g) ?? [];
+  if (urls.length === 0) {
+    errors.push("report contains headings but no citations");
+  }
   for (const url of urls) {
     if (
       !OFFICIAL_CITATION_PREFIXES.some((prefix) => url.startsWith(prefix))
@@ -124,14 +177,15 @@ export function runVenueVerification(): VenueVerificationReport {
   const results: CheckResult[] = VENUE_CHECKS.map((check) => {
     if (check.kind === "documented") {
       const documented =
-        content !== null && reportHasSection(content, check.reportSection);
+        content !== null &&
+        reportSectionHasEvidence(content, check.reportSection);
       return {
         check,
         status: documented ? ("DOCUMENTED" as const) : ("FAIL" as const),
         errors: documented
           ? []
           : [
-              `documented-only check has no evidence: report section ${check.reportSection} not found`,
+              `documented-only check has no evidence: report section ${check.reportSection} missing or lacks an official citation/UNVERIFIED marker`,
             ],
         fixtureResults: [],
       };
