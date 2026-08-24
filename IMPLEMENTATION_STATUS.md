@@ -35,10 +35,15 @@ Maximum permitted run mode: `PAPER`
 
 ## Active branches and worktrees
 
-- `worktree-agent-a373c7ba6650bf1a9` (WP-000): base `7faf30f`, first candidate `8d16849`.
-  Independent adversarial review 2026-08-24: **CHANGES REQUIRED** (1 blocker: fixture
-  fidelity vs official contracts; highs: rate-limit tiers, position schemas, vacuous
-  verification PASS). Remediation packet issued to the implementer same day. Not merged.
+- `worktree-agent-a373c7ba6650bf1a9` (WP-000): base `7faf30f`, first candidate `8d16849`,
+  second candidate `f79aa96`. Independent adversarial review round 1 (2026-08-24):
+  **CHANGES REQUIRED** (fixture fidelity, rate-limit tiers, position schemas, vacuous
+  verification PASS) — remediated in `f79aa96`. Review round 2 (2026-08-24):
+  **CHANGES REQUIRED** (raw user-trade schema fidelity vs official SDK, recursive
+  nested validation, report-evidence enforcement, canonical-decimal rules, credential
+  header names, clob-client-v2 doc conflict, in-repo handoff). Remediation round 2
+  dispatched. `docs/handoffs/WP-000.md` ratified into WP-000 allowed paths (M4).
+  Not merged.
 
 ### WP-000 in-flight record (2026-08-24)
 

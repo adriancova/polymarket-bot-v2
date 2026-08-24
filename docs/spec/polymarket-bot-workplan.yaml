@@ -64,6 +64,10 @@ work_packages:
       - docs/venue/**
       - test/fixtures/venue/**
       - apps/ops-cli/src/verify-venue/**
+      # Ratified 2026-08-24 after adversarial review (round 2, M4): the complete
+      # structured implementer handoff must be committed in-repo so independent
+      # review can verify it pre-merge (WP-010 precedent: docs/handoffs/WP-010.md).
+      - docs/handoffs/WP-000.md
     forbidden_paths:
       - packages/domain/**
       - packages/polymarket-secure/**
