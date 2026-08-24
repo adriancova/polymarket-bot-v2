@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-08-22  
+Last updated: 2026-08-24  
 Specification version: 2.0.0  
 Current phase: `phase-0` — repository and venue verification  
 Maximum permitted run mode: `PAPER`
@@ -19,7 +19,7 @@ Maximum permitted run mode: `PAPER`
 
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
-| `WP-000`               | Ready    | None               | Unassigned |
+| `WP-000`               | In remediation | None         | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Ready    | `WP-010` ✓         | Unassigned |
 | `WP-030`               | Blocked  | `WP-000`, `WP-020` | —          |
@@ -35,7 +35,17 @@ Maximum permitted run mode: `PAPER`
 
 ## Active branches and worktrees
 
-None.
+- `worktree-agent-a373c7ba6650bf1a9` (WP-000): base `7faf30f`, first candidate `8d16849`.
+  Independent adversarial review 2026-08-24: **CHANGES REQUIRED** (1 blocker: fixture
+  fidelity vs official contracts; highs: rate-limit tiers, position schemas, vacuous
+  verification PASS). Remediation packet issued to the implementer same day. Not merged.
+
+### WP-000 in-flight record (2026-08-24)
+
+- Path compliance, protected paths, safety defaults: verified clean by orchestrator and reviewer.
+- Automated gates (install/typecheck/lint/test) pass on candidate `8d16849`, but the
+  review found the fixture content itself does not faithfully match official venue
+  contracts; acceptance is therefore not met and the package remains open.
 
 ## Accepted evidence
 
@@ -49,6 +59,7 @@ None.
 
 - Root `eslint.config.mjs` was outside WP-010's literal `allowed_paths`; ratified into WP-010 ownership (see completion record).
 - Node 24 pin is `engines: ">=24"` + CI `node-version: 24` + runtime smoke assertion, not an exact `.nvmrc` pin; acceptable for WP-010, tighten later if needed.
+- WP-000 verification report filename: workplan literally names `docs/venue/verified-2026-08-18.md` (plan-generation date), but handoff §1.2 requires `verified-YYYY-MM-DD.md` dated to the actual verification. **Ratified by orchestrator 2026-08-24**: the report is `docs/venue/verified-2026-08-24.md`; the workplan literal is treated as a template dated at plan generation. Flagged by independent review (M2) as requiring explicit ratification — recorded here.
 
 ## Pending external evidence
 
