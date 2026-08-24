@@ -39,8 +39,25 @@ jobs:
       - name: Unit tests
         run: pnpm test
 
+      - name: Dependency vulnerability scan (pnpm lockfile)
+        run: pnpm audit --audit-level high
+
       - name: Integration tests (explicit skip placeholder until WP-040+)
         run: pnpm test:integration
+
+  compose:
+    name: Local infrastructure compose health
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose config, up --wait, health probes, down
+        run: |
+          docker compose config --quiet
+          docker compose up -d --wait
+          docker compose exec -T postgres pg_isready -U devlocal -d polymarket_bot_dev
+          docker compose exec -T redis redis-cli ping
+          docker compose down
 
   python:
     name: Python research workspace
@@ -61,3 +78,8 @@ jobs:
 
       - name: Pytest
         run: uv run pytest
+
+      - name: Dependency vulnerability scan (uv lockfile)
+        run: |
+          uv export --frozen --no-emit-project --format requirements-txt > /tmp/requirements-audit.txt
+          uvx pip-audit --strict -r /tmp/requirements-audit.txt

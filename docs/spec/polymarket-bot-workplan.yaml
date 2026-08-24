@@ -21,6 +21,9 @@ protected_paths:
   - package.json
   - tsconfig.base.json
   - docker-compose.yml
+  # Ratified 2026-08-23: root ESLint flat config gates every package's lint;
+  # created under WP-010 ownership (see docs/handoffs/WP-010.md).
+  - eslint.config.mjs
 
 required_handoff_fields:
   - summary
@@ -93,6 +96,9 @@ work_packages:
       - pnpm-lock.yaml
       - tsconfig.base.json
       - docker-compose.yml
+      # Ratified 2026-08-23 after adversarial review: ESLint flat config must
+      # sit at the repo root to serve the WP-010 lint-gate deliverable.
+      - eslint.config.mjs
       - .github/**
       - AGENTS.md
       - IMPLEMENTATION_STATUS.md
