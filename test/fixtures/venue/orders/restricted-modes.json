@@ -3,16 +3,12 @@
   "source": "https://docs.polymarket.com/trading/matching-engine",
   "retrieved": "2026-08-24",
   "sanitized": true,
-  "notes": "Matching-engine restricted-mode responses: HTTP 425 during restart (post-only for 2 minutes after restart), HTTP 503 cancel-only, HTTP 503 post-only with retry_after_seconds. Quoted messages are from the official documentation.",
+  "notes": "Matching-engine restricted-mode responses using the documented schemas exactly. HTTP 425 (Too Early) is documented as the status during restarts but NO response body is shown in the docs, so the 425 example carries no body (UNVERIFIED U-9). 503 bodies use the documented field 'error' (not 'error_msg'); post-only additionally carries the documented 'code': 'post_only_mode' and 'retry_after_seconds', and the docs state a Retry-After HTTP header is included (its exact value format is not shown; the header value here is illustrative). Engine enters post-only mode for 2 minutes after every restart.",
   "examples": [
     {
-      "name": "http-425-engine-restarting",
+      "name": "http-425-engine-restarting-body-undocumented",
       "payload": {
-        "http_status": 425,
-        "body": {
-          "error_msg": "matching engine is restarting",
-          "retry_after_seconds": 79
-        }
+        "http_status": 425
       }
     },
     {
@@ -20,7 +16,7 @@
       "payload": {
         "http_status": 503,
         "body": {
-          "error_msg": "Trading is currently cancel-only. New orders are not accepted, but cancels are allowed."
+          "error": "Trading is currently cancel-only. New orders are not accepted, but cancels are allowed."
         }
       }
     },
@@ -28,9 +24,13 @@
       "name": "http-503-post-only",
       "payload": {
         "http_status": 503,
+        "headers": {
+          "Retry-After": "79"
+        },
         "body": {
-          "error_msg": "post-only mode: only post-only orders and cancels are allowed",
-          "retry_after_seconds": 42
+          "error": "post-only mode: only post-only orders and cancels are allowed",
+          "code": "post_only_mode",
+          "retry_after_seconds": 79
         }
       }
     }

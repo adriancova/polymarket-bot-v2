@@ -3,32 +3,38 @@
   "source": "https://docs.polymarket.com/api-reference/trading-rate-limits",
   "retrieved": "2026-08-24",
   "sanitized": true,
-  "notes": "Configuration snapshots effective 2026-08-24 (handoff SS9.13: limits are configuration with source and effective time, never constants). Additional source: https://docs.polymarket.com/api-reference/rate-limits. Header values are illustrative synthetic examples of the documented header names.",
+  "notes": "Configuration snapshots effective 2026-08-24 (handoff SS9.13: limits are configuration with source and effective time, never constants). Additional source: https://docs.polymarket.com/api-reference/rate-limits. All eight documented signer tiers are recorded. Endpoint IP limits are kept exact and separate per method (POST /orders sustains 21,000/10min while DELETE /orders sustains 15,000/10min). Header values are illustrative synthetic examples of the documented header names.",
   "examples": [
     {
       "name": "response-headers-success",
       "payload": {
-        "Poly-RateLimit-Remaining": "57",
-        "Poly-RateLimit-Reset": "1782753360",
-        "Poly-RateLimit-Tier": "standard"
+        "headers": {
+          "Poly-RateLimit-Remaining": "57",
+          "Poly-RateLimit-Reset": "1782753360",
+          "Poly-RateLimit-Tier": "standard"
+        }
       }
     },
     {
       "name": "response-headers-429",
       "payload": {
-        "Retry-After": "2",
-        "Poly-RateLimit-Remaining": "0",
-        "Poly-RateLimit-Reset": "1782753362",
-        "Poly-RateLimit-Tier": "standard"
+        "headers": {
+          "Retry-After": "2",
+          "Poly-RateLimit-Remaining": "0",
+          "Poly-RateLimit-Reset": "1782753362",
+          "Poly-RateLimit-Tier": "standard"
+        }
       }
     },
     {
       "name": "response-headers-warning-mode",
       "payload": {
-        "Poly-RateLimit-Warning": "true",
-        "Poly-RateLimit-Remaining": "0",
-        "Poly-RateLimit-Reset": "1782753365",
-        "Poly-RateLimit-Tier": "standard"
+        "headers": {
+          "Poly-RateLimit-Warning": "true",
+          "Poly-RateLimit-Remaining": "0",
+          "Poly-RateLimit-Reset": "1782753365",
+          "Poly-RateLimit-Tier": "standard"
+        }
       }
     },
     {
@@ -46,6 +52,10 @@
         "batch_admission": "all-or-nothing; rejected entirely if bucket lacks tokens for every entry",
         "tiers": [
           { "tier": "Standard", "volume_30d_usd": "0", "order_tokens_per_s": 40, "order_burst": 60, "cancel_tokens_per_s": 80, "cancel_burst": 120 },
+          { "tier": "Copper", "volume_30d_usd": "30000", "order_tokens_per_s": 60, "order_burst": 90, "cancel_tokens_per_s": 120, "cancel_burst": 180 },
+          { "tier": "Bronze", "volume_30d_usd": "50000", "order_tokens_per_s": 80, "order_burst": 120, "cancel_tokens_per_s": 160, "cancel_burst": 240 },
+          { "tier": "Silver", "volume_30d_usd": "100000", "order_tokens_per_s": 200, "order_burst": 300, "cancel_tokens_per_s": 400, "cancel_burst": 600 },
+          { "tier": "Gold", "volume_30d_usd": "500000", "order_tokens_per_s": 400, "order_burst": 600, "cancel_tokens_per_s": 800, "cancel_burst": 1200 },
           { "tier": "Platinum", "volume_30d_usd": "2500000", "order_tokens_per_s": 450, "order_burst": 675, "cancel_tokens_per_s": 900, "cancel_burst": 1350 },
           { "tier": "Diamond", "volume_30d_usd": "5000000", "order_tokens_per_s": 525, "order_burst": 787, "cancel_tokens_per_s": 1050, "cancel_burst": 1575 },
           { "tier": "Elite", "volume_30d_usd": "10000000", "order_tokens_per_s": 600, "order_burst": 900, "cancel_tokens_per_s": 1200, "cancel_burst": 1800 }
@@ -68,10 +78,12 @@
           "auth": 100
         },
         "trading_dual_limits": {
-          "order_single": { "burst_per_10s": 5000, "sustained_per_10min": 120000 },
-          "orders_batch": { "burst_per_10s": 2000, "sustained_per_10min_range": [15000, 21000] },
-          "cancel_all": { "burst_per_10s": 250, "sustained_per_10min": 6000 },
-          "cancel_market_orders": { "burst_per_10s": 1500, "sustained_per_10min": 21000 }
+          "POST /order": { "burst_per_10s": 5000, "sustained_per_10min": 120000 },
+          "DELETE /order": { "burst_per_10s": 5000, "sustained_per_10min": 120000 },
+          "POST /orders": { "burst_per_10s": 2000, "sustained_per_10min": 21000 },
+          "DELETE /orders": { "burst_per_10s": 2000, "sustained_per_10min": 15000 },
+          "DELETE /cancel-all": { "burst_per_10s": 250, "sustained_per_10min": 6000 },
+          "DELETE /cancel-market-orders": { "burst_per_10s": 1500, "sustained_per_10min": 21000 }
         }
       }
     }

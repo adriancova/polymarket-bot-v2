@@ -3,7 +3,7 @@
   "source": "https://docs.polymarket.com/trading/place-orders",
   "retrieved": "2026-08-24",
   "sanitized": true,
-  "notes": "API-level order placement responses covering live/matched/delayed/unmatched statuses and documented error taxonomy examples. Per the docs, a 'delayed' response has zero making/taking amounts and empty trade/transaction arrays and must be treated as pending, not filled. Order/trade ids and hashes are synthetic. The 'not enough balance / allowance' message is quoted from the docs; the other error messages are representative paraphrases of documented rejection causes (tick-size violation, below min_order_size, GTD expiration under 3 minutes) whose exact server strings are UNVERIFIED (U-4 in the verification report) -- consumers must match on failure status, not message text.",
+  "notes": "API-level order placement responses covering live/matched/delayed/unmatched statuses and documented error taxonomy examples. Per the docs, a 'delayed' response has zero making/taking amounts and empty trade/transaction arrays and must be treated as pending, not filled. Order/trade ids and hashes are synthetic. The 'not enough balance / allowance' message is quoted from the docs; the other error messages are representative paraphrases of documented rejection causes (tick-size violation, below min_order_size, GTD expiration under 3 minutes) whose exact server strings are UNVERIFIED (U-4 in the verification report) -- consumers must match on failure status, not message text. Failure responses follow the documented failure shape (success, errorMsg, orderID, status, makingAmount, takingAmount) and do NOT carry transactionsHashes/tradeIDs; those properties are optional in validation, matching official optionality.",
   "examples": [
     {
       "name": "limit-live",
@@ -30,7 +30,9 @@
         "transactionsHashes": [
           "0x0000000000000000000000000000000000000000000000000000000000c0ffee"
         ],
-        "tradeIDs": ["00000000-0000-0000-0000-00000000t001"]
+        "tradeIDs": [
+          "00000000-0000-0000-0000-00000000t001"
+        ]
       }
     },
     {
@@ -67,9 +69,7 @@
         "orderID": "",
         "status": "",
         "makingAmount": "",
-        "takingAmount": "",
-        "transactionsHashes": [],
-        "tradeIDs": []
+        "takingAmount": ""
       }
     },
     {
@@ -80,9 +80,7 @@
         "orderID": "",
         "status": "",
         "makingAmount": "",
-        "takingAmount": "",
-        "transactionsHashes": [],
-        "tradeIDs": []
+        "takingAmount": ""
       }
     },
     {
@@ -93,9 +91,7 @@
         "orderID": "",
         "status": "",
         "makingAmount": "",
-        "takingAmount": "",
-        "transactionsHashes": [],
-        "tradeIDs": []
+        "takingAmount": ""
       }
     },
     {
@@ -106,9 +102,7 @@
         "orderID": "",
         "status": "",
         "makingAmount": "",
-        "takingAmount": "",
-        "transactionsHashes": [],
-        "tradeIDs": []
+        "takingAmount": ""
       }
     }
   ]

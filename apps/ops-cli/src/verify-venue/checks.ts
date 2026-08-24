@@ -3,13 +3,15 @@
  *
  * Enumerates the venue facts that handoff SS1.2 requires re-verifying at the
  * start of every implementation phase, maps each to its section in the frozen
- * verification report and to the sanitized fixture files that cover it.
+ * verification report and to the sanitized fixture files that cover it, and
+ * declares a source-specific payload schema per fixture.
  *
  * `kind: "fixture"` checks are structurally validated against local fixture
- * files. `kind: "documented"` checks are facts recorded in the report that
- * have no meaningful local fixture (for example the SDK ruling); they are
- * never validated over the network by this tool.
+ * files. `kind: "documented"` checks have no meaningful local fixture (for
+ * example the SDK ruling); they are validated against the frozen report file
+ * (section presence) and are reported as DOCUMENTED, never as vacuous PASS.
  */
+import type { PayloadSchema } from "./fixtures.js";
 
 export const VERIFICATION_REPORT_PATH = "docs/venue/verified-2026-08-24.md";
 
@@ -20,9 +22,11 @@ export interface VenueCheck {
   readonly kind: "fixture" | "documented";
   /** Fixture paths relative to test/fixtures/venue. */
   readonly fixtures: readonly string[];
-  /** Payload keys every example in each fixture must carry. */
-  readonly requiredPayloadKeys: readonly string[];
+  /** Source-specific payload schema every example in each fixture must meet. */
+  readonly payloadSchema: PayloadSchema;
 }
+
+const SIDE = ["BUY", "SELL"] as const;
 
 export const VENUE_CHECKS: readonly VenueCheck[] = [
   {
@@ -32,7 +36,7 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "1",
     kind: "documented",
     fixtures: [],
-    requiredPayloadKeys: [],
+    payloadSchema: {},
   },
   {
     id: "order-schemas-and-types",
@@ -41,16 +45,19 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "2",
     kind: "fixture",
     fixtures: ["orders/order-responses.json"],
-    requiredPayloadKeys: [
-      "success",
-      "errorMsg",
-      "orderID",
-      "status",
-      "makingAmount",
-      "takingAmount",
-      "transactionsHashes",
-      "tradeIDs",
-    ],
+    payloadSchema: {
+      success: { type: "boolean" },
+      errorMsg: { type: "string" },
+      orderID: { type: "string" },
+      status: {
+        type: "string",
+        enum: ["live", "matched", "delayed", "unmatched", ""],
+      },
+      makingAmount: { type: "string" },
+      takingAmount: { type: "string" },
+      transactionsHashes: { type: "array", optional: true },
+      tradeIDs: { type: "array", optional: true },
+    },
   },
   {
     id: "market-ws-book",
@@ -58,14 +65,15 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "3",
     kind: "fixture",
     fixtures: ["market-ws/book-snapshot.json"],
-    requiredPayloadKeys: [
-      "event_type",
-      "market",
-      "asset_id",
-      "timestamp",
-      "bids",
-      "asks",
-    ],
+    payloadSchema: {
+      event_type: { type: "string", enum: ["book"] },
+      market: { type: "string" },
+      asset_id: { type: "string" },
+      timestamp: { type: "string" },
+      hash: { type: "string", optional: true },
+      bids: { type: "array" },
+      asks: { type: "array" },
+    },
   },
   {
     id: "market-ws-price-change",
@@ -74,7 +82,12 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "3",
     kind: "fixture",
     fixtures: ["market-ws/price-change.json"],
-    requiredPayloadKeys: ["event_type", "market", "price_changes", "timestamp"],
+    payloadSchema: {
+      event_type: { type: "string", enum: ["price_change"] },
+      market: { type: "string" },
+      price_changes: { type: "array" },
+      timestamp: { type: "string" },
+    },
   },
   {
     id: "market-ws-tick-size",
@@ -82,14 +95,14 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "3",
     kind: "fixture",
     fixtures: ["market-ws/tick-size-change.json"],
-    requiredPayloadKeys: [
-      "event_type",
-      "market",
-      "asset_id",
-      "old_tick_size",
-      "new_tick_size",
-      "timestamp",
-    ],
+    payloadSchema: {
+      event_type: { type: "string", enum: ["tick_size_change"] },
+      market: { type: "string" },
+      asset_id: { type: "string" },
+      old_tick_size: { type: "decimal-string" },
+      new_tick_size: { type: "decimal-string" },
+      timestamp: { type: "string" },
+    },
   },
   {
     id: "market-ws-last-trade",
@@ -97,15 +110,17 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "3",
     kind: "fixture",
     fixtures: ["market-ws/last-trade-price.json"],
-    requiredPayloadKeys: [
-      "event_type",
-      "market",
-      "asset_id",
-      "price",
-      "size",
-      "side",
-      "timestamp",
-    ],
+    payloadSchema: {
+      event_type: { type: "string", enum: ["last_trade_price"] },
+      market: { type: "string" },
+      asset_id: { type: "string" },
+      price: { type: "decimal-string" },
+      size: { type: "decimal-string" },
+      fee_rate_bps: { type: "decimal-string", optional: true },
+      side: { type: "string", enum: SIDE },
+      timestamp: { type: "string" },
+      transaction_hash: { type: "string", optional: true },
+    },
   },
   {
     id: "market-ws-best-bid-ask",
@@ -113,14 +128,15 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "3",
     kind: "fixture",
     fixtures: ["market-ws/best-bid-ask.json"],
-    requiredPayloadKeys: [
-      "event_type",
-      "market",
-      "asset_id",
-      "best_bid",
-      "best_ask",
-      "timestamp",
-    ],
+    payloadSchema: {
+      event_type: { type: "string", enum: ["best_bid_ask"] },
+      market: { type: "string" },
+      asset_id: { type: "string" },
+      best_bid: { type: "decimal-string" },
+      best_ask: { type: "decimal-string" },
+      spread: { type: "decimal-string", optional: true },
+      timestamp: { type: "string" },
+    },
   },
   {
     id: "market-ws-lifecycle",
@@ -128,7 +144,12 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "3",
     kind: "fixture",
     fixtures: ["market-ws/lifecycle.json"],
-    requiredPayloadKeys: ["event_type", "market", "assets_ids", "timestamp"],
+    payloadSchema: {
+      event_type: { type: "string", enum: ["new_market", "market_resolved"] },
+      market: { type: "string" },
+      assets_ids: { type: "array" },
+      timestamp: { type: "string" },
+    },
   },
   {
     id: "user-ws-order-lifecycle",
@@ -137,58 +158,79 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "4",
     kind: "fixture",
     fixtures: ["user-ws/order-lifecycle.json"],
-    requiredPayloadKeys: [
-      "event_type",
-      "type",
-      "id",
-      "owner",
-      "market",
-      "asset_id",
-      "side",
-      "original_size",
-      "size_matched",
-      "price",
-      "status",
-      "timestamp",
-    ],
+    payloadSchema: {
+      event_type: { type: "string", enum: ["order"] },
+      type: { type: "string", enum: ["PLACEMENT", "UPDATE", "CANCELLATION"] },
+      id: { type: "string" },
+      owner: { type: "string" },
+      market: { type: "string" },
+      asset_id: { type: "string" },
+      side: { type: "string", enum: SIDE },
+      original_size: { type: "decimal-string" },
+      size_matched: { type: "decimal-string" },
+      price: { type: "decimal-string" },
+      outcome: { type: "string" },
+      status: {
+        type: "string",
+        enum: ["LIVE", "MATCHED", "DELAYED", "UNMATCHED", "CANCELED"],
+      },
+      timestamp: { type: "string" },
+    },
   },
   {
     id: "user-ws-trade-settlement",
     title:
-      "User channel trade settlement states (MATCHED/MINED/CONFIRMED/RETRYING/FAILED)",
+      "User channel trade settlement states (MATCHED_NOT_BROADCASTED/MATCHED/MINED/CONFIRMED/RETRYING/FAILED)",
     reportSection: "4",
     kind: "fixture",
     fixtures: ["user-ws/trade-settlement.json"],
-    requiredPayloadKeys: [
-      "event_type",
-      "id",
-      "taker_order_id",
-      "market",
-      "asset_id",
-      "side",
-      "size",
-      "price",
-      "status",
-      "maker_orders",
-      "trader_side",
-      "timestamp",
-    ],
+    payloadSchema: {
+      event_type: { type: "string", enum: ["trade"] },
+      id: { type: "string" },
+      taker_order_id: { type: "string" },
+      market: { type: "string" },
+      asset_id: { type: "string" },
+      side: { type: "string", enum: SIDE },
+      size: { type: "decimal-string" },
+      price: { type: "decimal-string" },
+      status: {
+        type: "string",
+        enum: [
+          "MATCHED_NOT_BROADCASTED",
+          "MATCHED",
+          "MINED",
+          "CONFIRMED",
+          "RETRYING",
+          "FAILED",
+        ],
+      },
+      maker_orders: { type: "array" },
+      trader_side: { type: "string", enum: ["TAKER", "MAKER"] },
+      timestamp: { type: "string" },
+    },
   },
   {
     id: "heartbeat",
-    title: "Order heartbeat protocol (POST /v1/heartbeats, 5s cadence, 10s timeout)",
+    title:
+      "Order heartbeat protocol (POST /v1/heartbeats; empty-ID bootstrap; ID rotation; 5s cadence, 10s timeout)",
     reportSection: "5",
     kind: "fixture",
     fixtures: ["heartbeat/heartbeat.json"],
-    requiredPayloadKeys: ["heartbeat_id"],
+    payloadSchema: {
+      heartbeat_id: { type: "string" },
+      error_msg: { type: "string", optional: true },
+    },
   },
   {
     id: "fees-and-rewards",
-    title: "Fee and reward parameter snapshots (taker fees, maker/taker rebates, liquidity rewards)",
+    title:
+      "Fee and reward parameter snapshots (taker fees, maker/taker rebates, liquidity rewards)",
     reportSection: "6",
     kind: "fixture",
     fixtures: ["fees/fee-reward-parameters.json"],
-    requiredPayloadKeys: ["effective_date"],
+    payloadSchema: {
+      effective_date: { type: "string" },
+    },
   },
   {
     id: "per-market-parameters",
@@ -197,7 +239,7 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "7",
     kind: "documented",
     fixtures: [],
-    requiredPayloadKeys: [],
+    payloadSchema: {},
   },
   {
     id: "rate-limits",
@@ -205,15 +247,24 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "8",
     kind: "fixture",
     fixtures: ["rate-limits/rate-limits.json"],
-    requiredPayloadKeys: [],
+    payloadSchema: {
+      headers: { type: "object", optional: true },
+      effective_date: { type: "string", optional: true },
+      tiers: { type: "array", optional: true },
+    },
   },
   {
     id: "restricted-modes",
-    title: "Matching-engine restricted modes (HTTP 425 restart, cancel-only, post-only)",
+    title:
+      "Matching-engine restricted modes (HTTP 425 restart, cancel-only, post-only)",
     reportSection: "9",
     kind: "fixture",
     fixtures: ["orders/restricted-modes.json"],
-    requiredPayloadKeys: ["http_status", "body"],
+    payloadSchema: {
+      http_status: { type: "number" },
+      headers: { type: "object", optional: true },
+      body: { type: "object", optional: true },
+    },
   },
   {
     id: "geoblock",
@@ -221,22 +272,51 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "10.1",
     kind: "fixture",
     fixtures: ["geoblock/geoblock.json"],
-    requiredPayloadKeys: ["blocked", "ip", "country", "region"],
+    payloadSchema: {
+      blocked: { type: "boolean" },
+      ip: { type: "string" },
+      country: { type: "string" },
+      region: { type: "string" },
+    },
   },
   {
     id: "position-operations",
-    title: "CTF split/merge/redeem workflows and position-id derivation",
+    title:
+      "CTF split/merge/redeem workflows, contract addresses, and position-id derivation",
     reportSection: "10.2",
     kind: "fixture",
     fixtures: ["positions/split-merge-redeem.json"],
-    requiredPayloadKeys: ["operation", "description"],
+    payloadSchema: {
+      operation: {
+        type: "string",
+        enum: [
+          "contract-addresses",
+          "split",
+          "merge",
+          "redeem",
+          "derive-position-id",
+          "neg-risk-convert",
+        ],
+      },
+      description: { type: "string" },
+    },
   },
   {
     id: "chainlink-twap-rtds",
-    title: "Chainlink TWAP over RTDS (30s/60s windows, no replay after disconnect)",
+    title:
+      "Chainlink TWAP over RTDS (30s/60s windows, no replay after disconnect)",
     reportSection: "10.3",
     kind: "fixture",
     fixtures: ["rtds/twap-update.json"],
-    requiredPayloadKeys: [],
+    payloadSchema: {
+      action: { type: "string", enum: ["subscribe"], optional: true },
+      topic: {
+        type: "string",
+        enum: ["crypto_prices_twap_thirty", "crypto_prices_twap_sixty"],
+        optional: true,
+      },
+      type: { type: "string", enum: ["update"], optional: true },
+      payload: { type: "object", optional: true },
+    },
   },
 ] as const;

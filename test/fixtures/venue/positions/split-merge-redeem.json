@@ -1,57 +1,78 @@
 {
   "fixture": "positions/split-merge-redeem",
-  "source": "https://docs.polymarket.com/trading/ctf/overview",
+  "source": "https://docs.polymarket.com/trading/positions/manage",
   "retrieved": "2026-08-24",
   "sanitized": true,
-  "notes": "CTF position-operation workflow descriptors (split pUSD -> YES+NO pair; merge pair -> pUSD; redeem resolved tokens -> payout) and the documented position-id derivation chain. Contract addresses were not enumerated on the retrieved page (UNVERIFIED U-5); address fields use zero placeholders and MUST be sourced from official docs/SDK constants in WP-300. Amounts use six-decimal integer collateral units as in the order API. Additional source: https://docs.polymarket.com/trading/positions/manage.",
+  "notes": "CTF position operations per the official positions-management page: split (pUSD -> complete outcome-token set), merge (balanced set -> pUSD), redeem (winning tokens -> pUSD after resolution). Contract addresses are the PUBLIC Polygon addresses published on the source page (public on-chain addresses, not credentials). On-chain functions splitPosition/mergePositions/redeemPositions share the parameter pattern (collateralToken, parentCollectionId, conditionId, partition|indexSets, amount). SDK methods splitPosition()/mergePositions()/redeemPositions() return a TransactionOutcome with transactionHash and transactionId. Transaction hashes/ids in examples are synthetic. Additional source: https://docs.polymarket.com/trading/ctf/overview (position-id derivation, neg-risk conversion).",
   "examples": [
     {
-      "name": "split",
+      "name": "contract-addresses-polygon-snapshot",
+      "payload": {
+        "operation": "contract-addresses",
+        "description": "Public Polygon contract addresses published by the official docs on 2026-08-24; re-verify at WP-300 implementation time.",
+        "effective_date": "2026-08-24",
+        "contracts": {
+          "pUSD": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+          "ConditionalTokens": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
+          "CtfCollateralAdapter": "0xAdA100Db00Ca00073811820692005400218FcE1f",
+          "NegRiskCtfCollateralAdapter": "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
+        }
+      }
+    },
+    {
+      "name": "split-request-and-outcome",
       "payload": {
         "operation": "split",
-        "description": "Convert pUSD into a YES and NO token pair; every pair is backed by exactly $1 of locked collateral.",
-        "condition_id": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
-        "collateral_token": "0x0000000000000000000000000000000000000000",
-        "amount_collateral_6dp": "25000000",
-        "outcome_slot_count": 2,
-        "index_sets": [1, 2],
-        "resulting_tokens": [
-          { "outcome": "Yes", "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417", "size": "25" },
-          { "outcome": "No", "asset_id": "7305630249804085635496399869905769372294302716159034447326228509068694952392", "size": "25" }
-        ],
-        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000000501"
+        "description": "Convert pUSD into a complete YES/NO outcome-token set; every pair is backed by exactly $1 of locked collateral.",
+        "onchain_function": "splitPosition(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount)",
+        "request": {
+          "collateralToken": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+          "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "conditionId": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+          "partition": [1, 2],
+          "amount": "25000000"
+        },
+        "transaction_outcome": {
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000501",
+          "transactionId": "sanitized-transaction-id-0501"
+        }
       }
     },
     {
-      "name": "merge",
+      "name": "merge-request-and-outcome",
       "payload": {
         "operation": "merge",
-        "description": "Convert a YES and NO token pair back into pUSD.",
-        "condition_id": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
-        "collateral_token": "0x0000000000000000000000000000000000000000",
-        "amount_collateral_6dp": "10000000",
-        "outcome_slot_count": 2,
-        "index_sets": [1, 2],
-        "consumed_tokens": [
-          { "outcome": "Yes", "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417", "size": "10" },
-          { "outcome": "No", "asset_id": "7305630249804085635496399869905769372294302716159034447326228509068694952392", "size": "10" }
-        ],
-        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000000502"
+        "description": "Convert a balanced YES/NO outcome-token set back into pUSD.",
+        "onchain_function": "mergePositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount)",
+        "request": {
+          "collateralToken": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+          "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "conditionId": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+          "partition": [1, 2],
+          "amount": "10000000"
+        },
+        "transaction_outcome": {
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000502",
+          "transactionId": "sanitized-transaction-id-0502"
+        }
       }
     },
     {
-      "name": "redeem",
+      "name": "redeem-request-and-outcome",
       "payload": {
         "operation": "redeem",
-        "description": "Exchange resolved outcome tokens for their payout.",
-        "condition_id": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
-        "collateral_token": "0x0000000000000000000000000000000000000000",
-        "winning_outcome": "Yes",
-        "redeemed_tokens": [
-          { "outcome": "Yes", "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417", "size": "25" }
-        ],
-        "payout_collateral_6dp": "25000000",
-        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000000503"
+        "description": "Claim pUSD for winning outcome tokens after market resolution.",
+        "onchain_function": "redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)",
+        "request": {
+          "collateralToken": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+          "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "conditionId": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+          "indexSets": [1]
+        },
+        "transaction_outcome": {
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000503",
+          "transactionId": "sanitized-transaction-id-0503"
+        }
       }
     },
     {
@@ -60,19 +81,20 @@
         "operation": "derive-position-id",
         "description": "conditionId = getConditionId(oracle, questionId, outcomeSlotCount=2); collectionId = getCollectionId(parentCollectionId, conditionId, indexSet in {1,2}); positionId = getPositionId(collateralToken, collectionId).",
         "oracle": "0x0000000000000000000000000000000000000000",
-        "question_id": "0x000000000000000000000000000000000000000000000000000000000000000a01",
+        "question_id": "0x0000000000000000000000000000000000000000000000000000000000000a01",
         "outcome_slot_count": 2,
         "parent_collection_id": "0x0000000000000000000000000000000000000000000000000000000000000000",
         "index_set": 1,
-        "collateral_token": "0x0000000000000000000000000000000000000000"
+        "collateral_token": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
       }
     },
     {
       "name": "neg-risk-conversion-note",
       "payload": {
         "operation": "neg-risk-convert",
-        "description": "Negative-risk markets use the separate Negative Risk CTF Exchange; a conversion can exchange one NO token for YES tokens in the event's other outcomes.",
+        "description": "Negative-risk markets use the separate Negative Risk CTF Exchange and the NegRiskCtfCollateralAdapter; a conversion can exchange one NO token for YES tokens in the event's other outcomes.",
         "neg_risk": true,
+        "adapter": "0xadA2005600Dec949baf300f4C6120000bDB6eAab",
         "event_flags": { "enableNegRisk": true, "negRiskAugmented": false }
       }
     }

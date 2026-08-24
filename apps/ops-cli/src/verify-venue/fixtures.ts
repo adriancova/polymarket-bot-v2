@@ -2,14 +2,15 @@
  * WP-000 venue-fixture loading and structural validation.
  *
  * Loads the sanitized venue fixtures frozen under `test/fixtures/venue/` and
- * validates their envelope and payload shapes. Structural validation only:
+ * validates their envelope and payload shapes against source-specific
+ * schemas (types, enums, optionality). Structural validation only:
  * `packages/domain` does not exist yet, so no domain schemas are imported.
  *
  * This module never touches the network, never places orders, and never
  * requires credentials. It reads local fixture files only.
  */
 import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Absolute path to the repository root (four levels above this file). */
@@ -28,6 +29,23 @@ export const VENUE_FIXTURE_ROOT: string = join(
   "fixtures",
   "venue",
 );
+
+export type FieldType =
+  | "string"
+  | "decimal-string"
+  | "number"
+  | "boolean"
+  | "object"
+  | "array";
+
+export interface FieldSpec {
+  readonly type: FieldType;
+  readonly enum?: readonly string[];
+  readonly optional?: boolean;
+}
+
+/** Source-specific payload schema. Unknown extra keys are permitted. */
+export type PayloadSchema = Readonly<Record<string, FieldSpec>>;
 
 export interface FixtureExample {
   readonly name: string;
@@ -55,25 +73,54 @@ const OFFICIAL_SOURCE_PREFIXES = [
   "https://github.com/Polymarket/",
 ] as const;
 
-/** Credential-shaped keys that must only ever carry sanitized placeholders. */
-const CREDENTIAL_KEYS = ["apiKey", "secret", "passphrase", "api_key"] as const;
+/**
+ * Credential/secret-shaped keys that must only ever carry sanitized
+ * placeholders. Covers API keys/secrets/passphrases, private keys, signature
+ * and signed-payload material, mnemonic/seed phrases, authorization headers,
+ * and the user-stream `owner` field (which carries the CLOB API key).
+ */
+const CREDENTIAL_KEYS: readonly string[] = [
+  "apiKey",
+  "api_key",
+  "apiSecret",
+  "api_secret",
+  "secret",
+  "clientSecret",
+  "client_secret",
+  "passphrase",
+  "privateKey",
+  "private_key",
+  "signature",
+  "signatures",
+  "signedOrder",
+  "signed_order",
+  "signedPayload",
+  "signed_payload",
+  "mnemonic",
+  "seed",
+  "seedPhrase",
+  "seed_phrase",
+  "authorization",
+  "Authorization",
+  "owner",
+];
 
-const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
+const ZERO_UUID_RE = /^0{8}-0{4}-0{4}-0{4}-0{8}[0-9a-z]{0,4}$/i;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isSanitizedPlaceholder(value: unknown): boolean {
+export function isSanitizedPlaceholder(value: unknown): boolean {
   if (typeof value !== "string") {
     return false;
   }
   return (
     value === "" ||
-    value === ZERO_UUID ||
+    ZERO_UUID_RE.test(value) ||
     value.startsWith("sanitized-") ||
     /^0x0+[0-9a-z]{0,8}$/i.test(value)
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function scanForCredentials(
@@ -91,26 +138,78 @@ function scanForCredentials(
     return;
   }
   for (const [key, entry] of Object.entries(value)) {
-    if (
-      (CREDENTIAL_KEYS as readonly string[]).includes(key) &&
-      !isSanitizedPlaceholder(entry)
-    ) {
+    if (CREDENTIAL_KEYS.includes(key) && !isSanitizedPlaceholder(entry)) {
       errors.push(
-        `${path}.${key}: credential-shaped field must be a sanitized placeholder`,
+        `${path}.${key}: credential/secret-shaped field must be a sanitized placeholder`,
       );
     }
     scanForCredentials(entry, `${path}.${key}`, errors);
   }
 }
 
+const DECIMAL_STRING_RE = /^-?\d+(\.\d+)?$/;
+
+function validateField(
+  value: unknown,
+  spec: FieldSpec,
+  path: string,
+  errors: string[],
+): void {
+  switch (spec.type) {
+    case "string":
+      if (typeof value !== "string") {
+        errors.push(`${path}: expected string, got ${typeof value}`);
+        return;
+      }
+      break;
+    case "decimal-string":
+      if (typeof value !== "string" || !DECIMAL_STRING_RE.test(value)) {
+        errors.push(`${path}: expected canonical decimal string`);
+        return;
+      }
+      break;
+    case "number":
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        errors.push(`${path}: expected finite number, got ${typeof value}`);
+        return;
+      }
+      break;
+    case "boolean":
+      if (typeof value !== "boolean") {
+        errors.push(`${path}: expected boolean, got ${typeof value}`);
+        return;
+      }
+      break;
+    case "object":
+      if (!isRecord(value)) {
+        errors.push(`${path}: expected object`);
+        return;
+      }
+      break;
+    case "array":
+      if (!Array.isArray(value)) {
+        errors.push(`${path}: expected array`);
+        return;
+      }
+      break;
+  }
+  if (spec.enum !== undefined && typeof value === "string") {
+    if (!spec.enum.includes(value)) {
+      errors.push(
+        `${path}: value ${JSON.stringify(value)} not in enum [${spec.enum.join(", ")}]`,
+      );
+    }
+  }
+}
+
 /**
- * Validates the common fixture envelope and, when provided, the payload keys
- * every example in the file must carry.
+ * Validates the common fixture envelope and each example payload against a
+ * source-specific schema (types, enums, optionality).
  */
 export function validateFixtureDocument(
   raw: unknown,
   expectedFixtureName: string,
-  requiredPayloadKeys: readonly string[],
+  schema: PayloadSchema,
 ): { fixture: FixtureFile | null; errors: string[] } {
   const errors: string[] = [];
   if (!isRecord(raw)) {
@@ -155,12 +254,15 @@ export function validateFixtureDocument(
         errors.push(`examples[${index}].payload must be an object`);
         return;
       }
-      for (const key of requiredPayloadKeys) {
+      for (const [key, spec] of Object.entries(schema)) {
+        const path = `examples[${index}].payload.${key}`;
         if (!(key in payload)) {
-          errors.push(
-            `examples[${index}].payload missing required key "${key}"`,
-          );
+          if (spec.optional !== true) {
+            errors.push(`${path}: missing required key`);
+          }
+          continue;
         }
+        validateField(payload[key], spec, path, errors);
       }
     });
   }
@@ -171,12 +273,24 @@ export function validateFixtureDocument(
   return { fixture: raw as unknown as FixtureFile, errors };
 }
 
-/** Loads and validates a single fixture file relative to the fixture root. */
+/**
+ * Loads and validates a single fixture file relative to the fixture root.
+ * Rejects any path that escapes the fixture tree (path traversal).
+ */
 export function loadFixture(
   relativePath: string,
-  requiredPayloadKeys: readonly string[],
+  schema: PayloadSchema,
 ): FixtureValidationResult {
-  const absolutePath = join(VENUE_FIXTURE_ROOT, relativePath);
+  const absolutePath = resolve(VENUE_FIXTURE_ROOT, relativePath);
+  const rel = relative(VENUE_FIXTURE_ROOT, absolutePath);
+  if (rel.startsWith("..") || rel.includes("..")) {
+    return {
+      relativePath,
+      ok: false,
+      errors: ["path escapes the venue fixture root (traversal rejected)"],
+      fixture: null,
+    };
+  }
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(absolutePath, "utf8"));
@@ -193,7 +307,7 @@ export function loadFixture(
   const { fixture, errors } = validateFixtureDocument(
     raw,
     expectedName,
-    requiredPayloadKeys,
+    schema,
   );
   return { relativePath, ok: errors.length === 0, errors, fixture };
 }

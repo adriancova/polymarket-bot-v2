@@ -3,21 +3,29 @@
   "source": "https://docs.polymarket.com/trading/manage-orders",
   "retrieved": "2026-08-24",
   "sanitized": true,
-  "notes": "POST /v1/heartbeats protocol. Cadence: send every 5 seconds; server cancels all open orders owned by the CLOB API credentials after a 10-second window without a valid heartbeat, with a cancellation sweep every 5 seconds. Heartbeat ids are synthetic placeholders.",
+  "notes": "POST /v1/heartbeats protocol with ID rotation. Bootstrap: send an EMPTY heartbeat_id; the response returns a new ID. Each successful response returns a new ID to use for the following heartbeat. Cadence: every 5 seconds; if a valid heartbeat is not received within 10 seconds all open orders owned by those CLOB API credentials are canceled; the cancellation check runs every 5 seconds. On 400 Invalid Heartbeat ID the response supplies the expected ID and the client must send a fresh request using it. Heartbeat ids are synthetic placeholders.",
   "examples": [
     {
-      "name": "request",
+      "name": "bootstrap-request-empty-id",
+      "payload": { "heartbeat_id": "" }
+    },
+    {
+      "name": "bootstrap-response-new-id",
       "payload": { "heartbeat_id": "sanitized-heartbeat-id-0001" }
     },
     {
-      "name": "response-ok",
+      "name": "continuation-request",
       "payload": { "heartbeat_id": "sanitized-heartbeat-id-0001" }
     },
     {
-      "name": "response-400-invalid-id",
+      "name": "continuation-response-rotated-id",
+      "payload": { "heartbeat_id": "sanitized-heartbeat-id-0002" }
+    },
+    {
+      "name": "response-400-invalid-id-recovery",
       "payload": {
         "error_msg": "Invalid Heartbeat ID",
-        "heartbeat_id": "sanitized-heartbeat-id-0002"
+        "heartbeat_id": "sanitized-heartbeat-id-0003"
       }
     }
   ]

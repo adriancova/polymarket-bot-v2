@@ -46,19 +46,20 @@ placeholders are substituted so parsers see realistic shapes.
   last trade, best bid/ask, market lifecycle (`new_market`,
   `market_resolved`).
 - `user-ws/` — authenticated user channel: order lifecycle
-  (PLACEMENT/UPDATE/CANCELLATION) and trade settlement states
-  (MATCHED/MINED/CONFIRMED/RETRYING/FAILED).
+  (PLACEMENT/UPDATE/CANCELLATION) and the six trade settlement states
+  (MATCHED_NOT_BROADCASTED/MATCHED/MINED/CONFIRMED/RETRYING/FAILED).
 - `orders/` — order placement responses: `live`, `matched`, `delayed`,
   `unmatched`, and error-taxonomy examples.
-- `heartbeat/` — `POST /v1/heartbeats` request/response and the documented
-  400 failure.
+- `heartbeat/` — `POST /v1/heartbeats` empty-ID bootstrap, ID rotation,
+  and the documented 400 invalid-ID recovery.
 - `fees/` — fee formula parameters, category fee rates, rebate and
   liquidity-reward program parameter snapshots.
 - `rate-limits/` — IP and per-signer limit snapshots plus documented
   response headers. Snapshots, not truths (handoff §9.13).
 - `geoblock/` — `GET https://polymarket.com/api/geoblock` response examples.
-- `positions/` — split/merge/redeem (CTF) workflow descriptors and
-  position-ID derivation example.
+- `positions/` — split/merge/redeem (CTF) request/TransactionOutcome
+  examples, published Polygon contract addresses (public on-chain data),
+  and position-ID derivation.
 - `rtds/` — Chainlink TWAP subscribe/update messages (30 s and 60 s
   windows) over RTDS.
 

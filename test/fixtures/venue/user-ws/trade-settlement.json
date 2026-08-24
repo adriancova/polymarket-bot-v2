@@ -3,8 +3,31 @@
   "source": "https://docs.polymarket.com/trading/realtime-order-updates",
   "retrieved": "2026-08-24",
   "sanitized": true,
-  "notes": "User-channel 'trade' events walking one trade through the documented asynchronous settlement states MATCHED -> MINED -> CONFIRMED plus RETRYING and FAILED variants. Maker order ids and trade id are synthetic; identifiers otherwise follow doc examples.",
+  "notes": "User-channel 'trade' events walking one trade through the SIX documented asynchronous settlement states: MATCHED_NOT_BROADCASTED -> MATCHED -> MINED -> CONFIRMED, plus RETRYING and FAILED variants. The docs' SDK enum names carry a TRADE_STATUS_ prefix (e.g. TRADE_STATUS_MATCHED_NOT_BROADCASTED) while the wire JSON example shows the unprefixed value 'MATCHED'; the unprefixed wire string for the not-broadcasted state is inferred from that pattern and is UNVERIFIED (U-8). Wire field names are snake_case; the SDK exposes camelCase models with additional fields (see report section 4). Maker order ids and trade id are synthetic; identifiers otherwise follow doc examples.",
   "examples": [
+    {
+      "name": "matched-not-broadcasted-wire-string-UNVERIFIED",
+      "payload": {
+        "event_type": "trade",
+        "id": "00000000-0000-0000-0000-00000000t001",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0004",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "40",
+        "price": "0.08",
+        "status": "MATCHED_NOT_BROADCASTED",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0005",
+            "matched_amount": "40",
+            "price": "0.08"
+          }
+        ],
+        "trader_side": "TAKER",
+        "timestamp": "1782753359000"
+      }
+    },
     {
       "name": "matched",
       "payload": {
