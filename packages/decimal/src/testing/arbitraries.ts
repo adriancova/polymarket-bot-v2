@@ -51,14 +51,31 @@ export function unitIntervalDecimalArbitrary(
   );
 }
 
+export interface EquivalentSpellingOptions {
+  /**
+   * Whether a leading `+` may be generated. Defaults to `true`.
+   *
+   * The hash-input grammar forbids a leading `+` (§7.3), so hashing property
+   * tests pass `false` and cover `+` spellings with a dedicated rejection
+   * property instead.
+   */
+  readonly allowLeadingPlus?: boolean;
+}
+
 /**
  * Given a canonical decimal string, generates other spellings of the *same*
  * number: extra leading zeros, extra trailing fractional zeros, an explicit
- * `+`, and `-0` spellings of zero.
+ * `+` (unless suppressed), and `-0` spellings of zero.
  *
- * Every generated spelling must normalize back to the input.
+ * Every generated spelling must normalize back to the input under
+ * `normalizeDecimalString`. With `allowLeadingPlus: false`, every generated
+ * spelling is additionally a legal hash input.
  */
-export function equivalentSpellingArbitrary(canonical: DecimalString): fc.Arbitrary<string> {
+export function equivalentSpellingArbitrary(
+  canonical: DecimalString,
+  options: EquivalentSpellingOptions = {},
+): fc.Arbitrary<string> {
+  const allowLeadingPlus = options.allowLeadingPlus ?? true;
   const negative = canonical.startsWith("-");
   const body = negative ? canonical.slice(1) : canonical;
   const pointIndex = body.indexOf(".");
@@ -69,7 +86,8 @@ export function equivalentSpellingArbitrary(canonical: DecimalString): fc.Arbitr
   return fc
     .tuple(fc.nat({ max: 3 }), fc.nat({ max: 3 }), fc.boolean(), fc.boolean())
     .map(([leadingZeros, trailingZeros, explicitPlus, signedZero]) => {
-      const sign = negative || (isZero && signedZero) ? "-" : explicitPlus ? "+" : "";
+      const plus = allowLeadingPlus && explicitPlus;
+      const sign = negative || (isZero && signedZero) ? "-" : plus ? "+" : "";
       const integerPart = "0".repeat(leadingZeros) + integer;
       const fractionPart = fraction + "0".repeat(trailingZeros);
       return fractionPart.length === 0

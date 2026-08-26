@@ -14,8 +14,11 @@ export {
   assertCanonicalDecimalString,
   decimalPlaces,
   explainCanonicalDecimalString,
+  explainHashableDecimalString,
   isCanonicalDecimalString,
+  isHashableDecimalString,
   normalizeDecimalString,
+  normalizeHashableDecimalString,
   significantDigits,
   tryNormalizeDecimalString,
 } from "./canonical.js";

@@ -32,13 +32,27 @@ export const SAMPLE_ENVELOPE_BASE = {
   ingestSeq: "42",
 } as const;
 
-/** Builds a valid envelope object for a contract. */
+/** Envelope fields a sample may override — in practice its provenance. */
+export interface SampleEnvelopeOverrides {
+  readonly source?: string;
+  readonly sourceChannel?: string;
+}
+
+/**
+ * Builds a valid envelope object for a contract.
+ *
+ * `overrides` exists so a sample's envelope `source` can match the provenance
+ * its payload restates: a `ReferenceTradeObserved` from Binance must not be
+ * wrapped in an envelope claiming `source: "polymarket"` (§7.1 — the envelope
+ * is authoritative).
+ */
 export function sampleEnvelope(
   eventType: string,
   schemaVersion: number,
   payload: unknown,
+  overrides: SampleEnvelopeOverrides = {},
 ): Record<string, unknown> {
-  return { ...SAMPLE_ENVELOPE_BASE, eventType, schemaVersion, payload };
+  return { ...SAMPLE_ENVELOPE_BASE, ...overrides, eventType, schemaVersion, payload };
 }
 
 export interface EventSample {
@@ -48,6 +62,24 @@ export interface EventSample {
   readonly economicFields: readonly string[];
   /** Keys present in the sample that the schema declares optional. */
   readonly optionalFields: readonly string[];
+  /**
+   * Envelope provenance for this sample. Present only where the default
+   * `source: "polymarket"` would contradict the payload.
+   */
+  readonly envelopeOverrides?: SampleEnvelopeOverrides;
+}
+
+/** The envelope a sample's payload belongs in. */
+export function envelopeForSample(
+  sample: EventSample,
+  schemaVersion: number,
+): Record<string, unknown> {
+  return sampleEnvelope(
+    sample.eventType,
+    schemaVersion,
+    sample.payload,
+    sample.envelopeOverrides ?? {},
+  );
 }
 
 const marketReference = {
@@ -119,11 +151,13 @@ export const EVENT_SAMPLES: readonly EventSample[] = [
     payload: {
       ...marketReference,
       parametersVersion: 3,
+      parameterVersionRef: "market-params/018f3a5c-1111-7000-8000-000000000001/3",
+      changedParameters: ["tick_size", "fee_schedule"],
       tickSize: "0.01",
       minimumOrderSize: "5",
     },
     economicFields: ["tickSize", "minimumOrderSize"],
-    optionalFields: [],
+    optionalFields: ["tickSize", "minimumOrderSize"],
   },
   {
     eventType: "BookSnapshot",
@@ -179,6 +213,7 @@ export const EVENT_SAMPLES: readonly EventSample[] = [
     payload: { venue: "binance", symbol: "BTCUSDT", price: "64250.15", size: "0.005" },
     economicFields: ["price", "size"],
     optionalFields: [],
+    envelopeOverrides: { source: "binance", sourceChannel: "trade" },
   },
   {
     eventType: "ReferenceTopOfBookChanged",
@@ -192,6 +227,7 @@ export const EVENT_SAMPLES: readonly EventSample[] = [
     },
     economicFields: ["bidPrice", "bidSize", "askPrice", "askSize"],
     optionalFields: ["bidPrice", "bidSize", "askPrice", "askSize"],
+    envelopeOverrides: { source: "coinbase", sourceChannel: "ticker" },
   },
   {
     eventType: "ReferenceTwapObserved",
@@ -206,6 +242,7 @@ export const EVENT_SAMPLES: readonly EventSample[] = [
     },
     economicFields: ["value"],
     optionalFields: [],
+    envelopeOverrides: { source: "rtds", sourceChannel: "twap" },
   },
   {
     eventType: "FeedConnected",

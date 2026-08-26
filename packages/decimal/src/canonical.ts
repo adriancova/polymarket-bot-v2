@@ -33,6 +33,20 @@
  * wire format, before a domain contract ever sees them. This keeps exactly one
  * representation of a value inside the system, so equality, map keys, database
  * uniqueness, and canonical hashes all agree.
+ *
+ * THREE GRAMMARS, DELIBERATELY DISTINCT:
+ *
+ * | Grammar | Entry point | Accepts |
+ * | --- | --- | --- |
+ * | canonical | {@link assertCanonicalDecimalString} | the canonical form only |
+ * | hash input | {@link normalizeHashableDecimalString} | canonical + redundant leading/trailing zeros + signed zero |
+ * | venue input | {@link normalizeDecimalString} | the above plus `"+1.5"`, `"1."`, `".5"` |
+ *
+ * The hash-input grammar exists because §7.3 sanctions exactly one relaxation
+ * before hashing ("normalize redundant leading/trailing zeros"); the leading-`+`
+ * and trailing-decimal-point prohibitions are unconditional and must therefore
+ * hold on the hashing path too. Only `normalizeDecimalString`, which is scoped
+ * to adapter wire formats, may be more permissive.
  */
 
 import {
@@ -79,6 +93,29 @@ const CANONICAL_PATTERN = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$/;
  * plain decimal numeral.
  */
 const LENIENT_PATTERN = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)$/;
+
+/**
+ * Hash-input form — the ONLY spellings {@link normalizeHashableDecimalString}
+ * (and therefore the canonical hash) accepts.
+ *
+ * §7.3 permits exactly one relaxation before hashing: "normalize redundant
+ * leading/trailing zeros before hashing". Every other §7.3 prohibition is
+ * unconditional and applies to hash input as much as to a boundary value, so
+ * this grammar allows redundant leading zeros (`"01.5"`), trailing fractional
+ * zeros (`"1.50"`), and signed zero (`"-0.000"`), and REJECTS:
+ *
+ * - a leading `+` (`"+1.5"`) — §7.3 "no leading `+`";
+ * - a trailing decimal point (`"1."`) — §7.3 "no trailing decimal point";
+ * - an omitted integer part (`".5"`) — not a §7.3 form at all;
+ * - scientific notation (`"1e5"`) — §7.3 "no scientific notation";
+ * - anything that is not a string.
+ *
+ * This is deliberately NARROWER than {@link normalizeDecimalString}, which is
+ * the venue-input normalizer and may accept spellings a venue actually emits.
+ * A hash is a persisted, load-bearing identity; silently accepting a spelling
+ * §7.3 forbids would make the forbidden form reachable through the hashing path.
+ */
+const HASH_INPUT_PATTERN = /^-?[0-9]+(?:\.[0-9]+)?$/u;
 
 interface DecimalProblem {
   readonly code: DecimalErrorCode;
@@ -315,6 +352,102 @@ export function tryNormalizeDecimalString(
   return "canonical" in outcome
     ? { ok: true, value: outcome.canonical }
     : { ok: false, code: outcome.code, message: outcome.message };
+}
+
+function describeHashInput(
+  value: unknown,
+  constraints: DecimalStringConstraints | undefined,
+): { canonical: string } | DecimalProblem {
+  const shape = describeShape(value);
+  if (shape !== null) {
+    return shape;
+  }
+  const text = value as string;
+  if (text.startsWith("+")) {
+    return problem(
+      "DECIMAL_LEADING_PLUS",
+      `a leading "+" is not accepted as hash input: "${text}"`,
+    );
+  }
+  if (text.endsWith(".")) {
+    return problem(
+      "DECIMAL_TRAILING_POINT",
+      `a trailing decimal point is not accepted as hash input: "${text}"`,
+    );
+  }
+  if (/^-?\./u.test(text)) {
+    return problem(
+      "DECIMAL_MISSING_INTEGER_PART",
+      `the integer part may not be omitted in hash input: "${text}"`,
+    );
+  }
+  if (!HASH_INPUT_PATTERN.test(text)) {
+    return problem(
+      "DECIMAL_MALFORMED",
+      `"${text}" is not a hashable decimal numeral (only redundant leading/trailing zeros and a signed zero may be normalized before hashing)`,
+    );
+  }
+  const { sign, integer, fraction } = split(text);
+  const canonical = canonicalizeParts(sign, integer, fraction);
+  if (canonical.length > MAX_DECIMAL_STRING_LENGTH) {
+    return problem(
+      "DECIMAL_TOO_LONG",
+      `normalized decimal string exceeds the maximum accepted length of ${String(MAX_DECIMAL_STRING_LENGTH)} characters`,
+    );
+  }
+  const range = describeRange(canonical, constraints);
+  return range ?? { canonical };
+}
+
+/**
+ * Returns `null` when `value` is a legal hash input, otherwise an explanation.
+ *
+ * See {@link normalizeHashableDecimalString} for the grammar.
+ */
+export function explainHashableDecimalString(
+  value: unknown,
+  constraints?: DecimalStringConstraints,
+): string | null {
+  const outcome = describeHashInput(value, constraints);
+  return "canonical" in outcome ? null : outcome.message;
+}
+
+/** Predicate form of {@link explainHashableDecimalString}. */
+export function isHashableDecimalString(
+  value: unknown,
+  constraints?: DecimalStringConstraints,
+): value is DecimalString {
+  return explainHashableDecimalString(value, constraints) === null;
+}
+
+/**
+ * Normalizes a decimal string for *hashing*, under the §7.3 hash-input grammar.
+ *
+ * Accepts the canonical form plus the one relaxation §7.3 sanctions before
+ * hashing — redundant leading zeros, trailing fractional zeros, and signed zero
+ * — and rejects every form §7.3 forbids: a leading `+`, a trailing decimal
+ * point, an omitted integer part, scientific notation, and non-strings.
+ *
+ * This is intentionally stricter than {@link normalizeDecimalString}. Use the
+ * latter to canonicalize venue wire values; use this one for anything whose
+ * digest is persisted.
+ *
+ * @throws {InvalidDecimalStringError} when the input is not a legal hash input.
+ * @throws {DecimalRangeError} when the normalized value is out of range.
+ */
+export function normalizeHashableDecimalString(
+  value: unknown,
+  constraints?: DecimalStringConstraints,
+  label = "value",
+): DecimalString {
+  const outcome = describeHashInput(value, constraints);
+  if ("canonical" in outcome) {
+    return outcome.canonical;
+  }
+  const message = `${label}: ${outcome.message}`;
+  throw outcome.code === "DECIMAL_OUT_OF_RANGE"
+    ? new DecimalRangeError(outcome.code, message)
+    : new InvalidDecimalStringError(outcome.code, message);
 }
 
 /** Number of fractional digits of a canonical decimal string (`"1.25"` → 2). */

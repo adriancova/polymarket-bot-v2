@@ -25,6 +25,7 @@ export * from "./events/index.js";
 export * from "./identifiers.js";
 export * from "./intents.js";
 export * from "./primitives.js";
+export * from "./provenance.js";
 export * from "./registry.js";
 export * from "./run-mode.js";
 export * from "./schema-version.js";

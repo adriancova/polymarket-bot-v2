@@ -6,6 +6,11 @@
  * and a detected gap "requires a new authoritative snapshot before affected
  * markets resume" (§7.1).
  *
+ * That gap invariant is UNCONDITIONAL, so the two fields that express it are
+ * pinned to the literal `true` rather than typed as booleans: these contracts
+ * cannot represent a gap that waives the snapshot requirement, or a
+ * resynchronization that never applied one. See the field comments below.
+ *
  * `severity` uses the §14.4 alert vocabulary (`LOG`, `NOTIFY`, `PAGE`) so an
  * incident routes to the right channel without a second mapping table.
  */
@@ -62,10 +67,19 @@ export const FeedGapDetectedPayloadSchema = z.strictObject({
   reasonCode: CodeStringSchema,
   detail: DetailStringSchema.optional(),
   /**
-   * A gap requires a new authoritative snapshot before affected markets resume
-   * (§7.1). Recorded explicitly so a consumer cannot forget the requirement.
+   * Pinned to the literal `true`.
+   *
+   * §7.1 and §9.1 state the requirement unconditionally: "a restart or detected
+   * gap requires a new authoritative snapshot before affected markets resume",
+   * and the gateway must "resubscribe and obtain authoritative snapshots after
+   * gaps". There is no such thing as a detected gap that does not require a
+   * snapshot, so `z.boolean()` would have made the contract able to express a
+   * document that violates the invariant — and a consumer branching on the flag
+   * would then skip the snapshot. The field is kept (rather than dropped)
+   * because it makes the obligation explicit in every recorded frame; it is
+   * pinned so it can only ever record the obligation, never waive it.
    */
-  requiresAuthoritativeSnapshot: z.boolean(),
+  requiresAuthoritativeSnapshot: z.literal(true),
   affectedMarketIds: z.array(InternalMarketIdSchema).readonly().optional(),
 });
 
@@ -73,7 +87,18 @@ export const FeedResynchronizedPayloadSchema = z.strictObject({
   ...feedShape,
   resynchronizedAt: IsoTimestampSchema,
   subscriptionGeneration: NonNegativeIntegerSchema,
-  authoritativeSnapshotApplied: z.boolean(),
+  /**
+   * Pinned to the literal `true`.
+   *
+   * A resynchronization that did not apply an authoritative snapshot is not a
+   * `FeedResynchronized` event: the feed reconnected, but the affected markets
+   * are not safe to resume (§7.1, §9.1). That situation is a reconnection that
+   * is still in the gap state, and it is recorded as `FeedConnected` (plus the
+   * still-open `FeedGapDetected`/`DataQualityIncidentOpened`), not as a
+   * resynchronization. Accepting `false` here would let the stream assert
+   * recovery that did not happen.
+   */
+  authoritativeSnapshotApplied: z.literal(true),
 });
 
 export const DataQualityIncidentOpenedPayloadSchema = z.strictObject({

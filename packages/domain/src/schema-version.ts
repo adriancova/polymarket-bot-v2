@@ -18,27 +18,67 @@
  *
  * ## When to increment
  *
- * Increment the `schemaVersion` of a contract when a change is not backward
- * compatible for an existing consumer or for recorded historical data:
+ * **Every change to the emitted field set increments `schemaVersion`.** There
+ * is no "additive optional field reuses the current version" exemption.
  *
+ * This follows directly from the strict-object decision: every contract in this
+ * package rejects unknown keys (`z.strictObject`), because silently stripping a
+ * field on the recording path would violate §8.3. Under strict rejection an
+ * "additive" change is *not* backward compatible in the direction that matters:
+ * a consumer still running the old build of v1 would reject a document that a
+ * newer producer emitted as v1 with the extra field. It would also break the
+ * registry's core promise, that `(eventType, schemaVersion)` identifies exactly
+ * one historical schema — two different field sets sharing one key makes
+ * recorded data ambiguous on replay (§8.4, §12.5).
+ *
+ * So a new version is required for all of:
+ *
+ * - adding a field, optional or required;
  * - removing or renaming a field;
- * - narrowing a type, enum, or constraint;
- * - making an optional field required;
+ * - widening or narrowing a type, enum, or constraint;
+ * - making an optional field required, or a required field optional;
  * - changing the meaning or unit of an existing field.
  *
- * Adding a new *optional* field with no meaning change may reuse the current
- * version. Anything else requires a new version, with the previous version's
- * schema retained in the registry so recorded data stays replayable (§8.4,
- * §12.5). Contract changes after WP-020 acceptance additionally require an ADR
- * (see `docs/contracts/domain.md`).
+ * Changes that do NOT alter what a producer may emit or a consumer must accept
+ * — documentation, error-message wording, internal refactoring — do not.
+ *
+ * When a version is added, the previous version's contract **stays registered**
+ * so recorded data remains replayable against the schema it was recorded with.
+ * Contract changes after WP-020 acceptance additionally require an ADR (see
+ * `docs/contracts/domain.md`).
  */
 
 import { z } from "zod";
+
+import { InvalidSchemaVersionError } from "./errors.js";
 
 /** Schema versions are positive integers starting at 1. */
 export const SchemaVersionSchema = z.int().positive();
 
 export type SchemaVersion = z.infer<typeof SchemaVersionSchema>;
+
+/**
+ * Runtime guard for a schema version.
+ *
+ * `SchemaVersion` is statically just `number`, so nothing in the type system
+ * stops `0`, `-1`, `1.5`, `NaN`, or `Infinity` from reaching a contract
+ * definition or a registry key. Contract construction and registry insertion
+ * both call this so an invalid version fails at startup, where it is a loud
+ * typed error, rather than becoming an unreachable registry key at runtime.
+ *
+ * @throws {InvalidSchemaVersionError} when `value` is not a positive integer.
+ */
+export function assertSchemaVersion(value: unknown, label = "schemaVersion"): SchemaVersion {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new InvalidSchemaVersionError(value, label);
+  }
+  return value;
+}
+
+/** Predicate form of {@link assertSchemaVersion}. */
+export function isSchemaVersion(value: unknown): value is SchemaVersion {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1;
+}
 
 /** The version every contract frozen by WP-020 starts at. */
 export const INITIAL_SCHEMA_VERSION = 1;

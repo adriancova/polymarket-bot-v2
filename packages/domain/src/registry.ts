@@ -18,7 +18,7 @@ import {
 } from "./errors.js";
 import { DOMAIN_EVENT_CONTRACTS } from "./events/index.js";
 import type { EventContractLike } from "./events/event-contract.js";
-import type { SchemaVersion } from "./schema-version.js";
+import { assertSchemaVersion, type SchemaVersion } from "./schema-version.js";
 
 function registryKey(eventType: string, schemaVersion: number): string {
   return `${eventType}@${String(schemaVersion)}`;
@@ -82,6 +82,13 @@ export interface EventSchemaRegistry {
 /**
  * Builds a registry from a list of contracts.
  *
+ * Every contract's `schemaVersion` is re-validated here, not only in
+ * {@link defineEventContract}: `EventContractLike` is a structural type, so a
+ * caller can hand-assemble a contract object and bypass the constructor. A
+ * registry keyed on `0`, `-1`, `1.5`, or `NaN` would hold entries no envelope
+ * could route to.
+ *
+ * @throws {InvalidSchemaVersionError} when a contract's version is not a positive integer.
  * @throws {DuplicateEventContractError} when two contracts share a key.
  */
 export function createEventSchemaRegistry(
@@ -91,6 +98,7 @@ export function createEventSchemaRegistry(
   const versionsByType = new Map<string, SchemaVersion[]>();
 
   for (const contract of contracts) {
+    assertSchemaVersion(contract.schemaVersion, `${contract.eventType}.schemaVersion`);
     const key = registryKey(contract.eventType, contract.schemaVersion);
     if (byKey.has(key)) {
       throw new DuplicateEventContractError(contract.eventType, contract.schemaVersion);

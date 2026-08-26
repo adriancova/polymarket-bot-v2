@@ -5,8 +5,11 @@ import {
   assertCanonicalDecimalString,
   decimalPlaces,
   explainCanonicalDecimalString,
+  explainHashableDecimalString,
   isCanonicalDecimalString,
+  isHashableDecimalString,
   normalizeDecimalString,
+  normalizeHashableDecimalString,
   significantDigits,
   tryNormalizeDecimalString,
 } from "./canonical.js";
@@ -204,6 +207,66 @@ describe("normalizeDecimalString (venue input → canonical)", () => {
       expect(failure.code).toBe("DECIMAL_SCIENTIFIC_NOTATION");
       expect(failure.message).toContain("scientific notation");
     }
+  });
+});
+
+describe("normalizeHashableDecimalString (§7.3 hash-input grammar)", () => {
+  const permitted: ReadonlyArray<readonly [string, string]> = [
+    ["0", "0"],
+    ["-0", "0"],
+    ["0.0", "0"],
+    ["-0.000", "0"],
+    ["00", "0"],
+    ["00.00", "0"],
+    ["1.5", "1.5"],
+    ["1.50", "1.5"],
+    ["01.5", "1.5"],
+    ["0001.5000", "1.5"],
+    ["-01.230", "-1.23"],
+    ["000123", "123"],
+  ];
+
+  it.each(permitted)("normalizes the permitted spelling %j to %j", (input, expected) => {
+    expect(normalizeHashableDecimalString(input)).toBe(expected);
+    expect(isHashableDecimalString(input)).toBe(true);
+    expect(explainHashableDecimalString(input)).toBeNull();
+    expect(isCanonicalDecimalString(normalizeHashableDecimalString(input))).toBe(true);
+  });
+
+  // §7.3 sanctions exactly one relaxation before hashing (redundant
+  // leading/trailing zeros). Everything else it forbids stays forbidden.
+  const forbidden = ["+1.5", "+0", "+1", "1.", "0.", "-1.", ".5", "-.5", ".", "1e5", "1E-5", ""];
+
+  it.each(forbidden)("rejects the §7.3-forbidden hash input %j", (input) => {
+    expect(() => normalizeHashableDecimalString(input)).toThrow(InvalidDecimalStringError);
+    expect(isHashableDecimalString(input)).toBe(false);
+    expect(explainHashableDecimalString(input)).not.toBeNull();
+  });
+
+  it("is strictly narrower than the venue-input normalizer", () => {
+    for (const input of ["+1.5", "1.", ".5", "+0"]) {
+      expect(() => normalizeDecimalString(input)).not.toThrow();
+      expect(() => normalizeHashableDecimalString(input)).toThrow(InvalidDecimalStringError);
+    }
+  });
+
+  it("is strictly wider than the canonical boundary", () => {
+    for (const input of ["1.50", "01.5", "-0", "00"]) {
+      expect(isCanonicalDecimalString(input)).toBe(false);
+      expect(isHashableDecimalString(input)).toBe(true);
+    }
+  });
+
+  it("applies range constraints after normalization", () => {
+    expect(normalizeHashableDecimalString("1.000", { range: "UNIT_INTERVAL" })).toBe("1");
+    expect(() => normalizeHashableDecimalString("1.0001", { range: "UNIT_INTERVAL" })).toThrow(
+      DecimalRangeError,
+    );
+  });
+
+  it("is idempotent", () => {
+    const once = normalizeHashableDecimalString("0001.5000");
+    expect(normalizeHashableDecimalString(once)).toBe(once);
   });
 });
 

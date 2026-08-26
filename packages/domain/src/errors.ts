@@ -10,7 +10,23 @@ export type DomainErrorCode =
   | "UNKNOWN_EVENT_CONTRACT"
   | "DUPLICATE_EVENT_CONTRACT"
   | "EVENT_VALIDATION_FAILED"
+  | "INVALID_SCHEMA_VERSION"
+  | "EVENT_PROVENANCE_MISMATCH"
   | "RUN_MODE_EXCEEDS_MAXIMUM";
+
+/** Renders an arbitrary value for an error message without throwing on it. */
+function describeValue(value: unknown): string {
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number" || typeof value === "boolean" || value === null) {
+    return String(value);
+  }
+  if (typeof value === "bigint") {
+    return `${String(value)}n`;
+  }
+  return typeof value;
+}
 
 /** Base class for every error raised by `@polymarket-bot/domain`. */
 export class DomainError extends Error {
@@ -62,6 +78,45 @@ export class EventValidationError extends DomainError {
     this.eventType = eventType;
     this.schemaVersion = schemaVersion;
     this.issues = issues;
+  }
+}
+
+/**
+ * A schema version was not a positive integer.
+ *
+ * Raised at contract construction and at registry insertion, so an invalid
+ * version fails at startup instead of becoming an unreachable registry key.
+ */
+export class InvalidSchemaVersionError extends DomainError {
+  public readonly received: unknown;
+
+  public constructor(received: unknown, label = "schemaVersion") {
+    super(
+      "INVALID_SCHEMA_VERSION",
+      `${label} must be a positive integer, received ${describeValue(received)}`,
+    );
+    this.received = received;
+  }
+}
+
+/**
+ * A payload's declared provenance contradicts its envelope `source` (§7.1).
+ *
+ * The envelope is authoritative; a payload that claims a different venue is a
+ * normalization bug in the gateway and must not be recorded as if it were
+ * consistent.
+ */
+export class EventProvenanceMismatchError extends DomainError {
+  public readonly envelopeSource: string;
+  public readonly payloadVenue: string;
+
+  public constructor(envelopeSource: string, payloadVenue: string, label = "event") {
+    super(
+      "EVENT_PROVENANCE_MISMATCH",
+      `${label}: payload venue "${payloadVenue}" contradicts envelope source "${envelopeSource}"; the envelope source is authoritative (§7.1)`,
+    );
+    this.envelopeSource = envelopeSource;
+    this.payloadVenue = payloadVenue;
   }
 }
 

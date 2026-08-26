@@ -1,13 +1,67 @@
 import { describe, expect, it } from "vitest";
 
-import { EVENT_SAMPLES, sampleEnvelope } from "../testing/samples.js";
+import { EventProvenanceMismatchError } from "../errors.js";
+import { assertEnvelopePayloadProvenance, checkEnvelopePayloadProvenance } from "../provenance.js";
+import { EventSourceSchema } from "../envelope.js";
+import { EVENT_SAMPLES, envelopeForSample, sampleEnvelope } from "../testing/samples.js";
 import { BookSnapshotPayloadSchema, BookLevelSchema } from "./book.js";
+import {
+  FeedGapDetectedPayloadSchema,
+  FeedResynchronizedPayloadSchema,
+} from "./feed.js";
 import { DOMAIN_EVENT_CONTRACTS, DOMAIN_EVENT_TYPES } from "./index.js";
-import { MarketOutcomeStateSchema } from "./market-lifecycle.js";
+import {
+  MarketOutcomeStateSchema,
+  MarketResolvedPayloadSchema,
+  NON_TERMINAL_MARKET_OUTCOME_STATES,
+  TerminalMarketOutcomeStateSchema,
+  TradingParameterKindSchema,
+  TradingParametersChangedPayloadSchema,
+  isTerminalMarketOutcomeState,
+} from "./market-lifecycle.js";
+import { REFERENCE_VENUES, ReferenceVenueSchema } from "./reference.js";
 
 const contractsByType = new Map(
   DOMAIN_EVENT_CONTRACTS.map((contract) => [contract.eventType, contract]),
 );
+
+type SamplePath = readonly (string | number)[];
+
+/** Every path in `value` that addresses a string, including inside nested objects and arrays. */
+function stringPaths(value: unknown, prefix: SamplePath = []): SamplePath[] {
+  if (typeof value === "string") {
+    return [prefix];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((entry, index) => stringPaths(entry, [...prefix, index]));
+  }
+  if (typeof value === "object" && value !== null) {
+    return Object.entries(value).flatMap(([key, entry]) => stringPaths(entry, [...prefix, key]));
+  }
+  return [];
+}
+
+/** Immutable set-at-path over nested objects and arrays. */
+function setAtPath(root: unknown, path: SamplePath, next: unknown): unknown {
+  if (path.length === 0) {
+    return next;
+  }
+  const [head, ...rest] = path;
+  if (Array.isArray(root)) {
+    const copy = [...root];
+    const index = head as number;
+    copy[index] = setAtPath(copy[index], rest, next);
+    return copy;
+  }
+  const copy = { ...(root as Record<string, unknown>) };
+  const key = head as string;
+  copy[key] = setAtPath(copy[key], rest, next);
+  return copy;
+}
+
+function renderPath(path: SamplePath): string {
+  return path.map((segment) => String(segment)).join(".");
+}
 
 describe("the §7.4 minimum event list is complete", () => {
   it("declares exactly the specified 22 event types", () => {
@@ -33,6 +87,42 @@ describe("the §7.4 minimum event list is complete", () => {
   });
 });
 
+describe("the recursive string-field walk used by the number-rejection test", () => {
+  // The walk is what makes "every string field of every sample" a true claim
+  // rather than "every top-level string field". If it regressed to a shallow
+  // scan these assertions would fail and the number-rejection test would start
+  // passing vacuously on nested payloads.
+  it("descends into arrays of objects", () => {
+    const snapshot = EVENT_SAMPLES.find((entry) => entry.eventType === "BookSnapshot");
+    expect(snapshot).toBeDefined();
+    const paths = stringPaths(snapshot?.payload).map(renderPath);
+    expect(paths).toContain("bids.0.price");
+    expect(paths).toContain("bids.0.size");
+    expect(paths).toContain("asks.0.price");
+    expect(paths).toContain("internalMarketId");
+  });
+
+  it("descends into arrays of strings", () => {
+    const gap = EVENT_SAMPLES.find((entry) => entry.eventType === "FeedGapDetected");
+    expect(gap).toBeDefined();
+    expect(stringPaths(gap?.payload).map(renderPath)).toContain("affectedMarketIds.0");
+  });
+
+  it("rebuilds the payload immutably at any depth", () => {
+    const original = { a: "x", b: [{ c: "y" }] };
+    const mutated = setAtPath(original, ["b", 0, "c"], 1.5);
+    expect(mutated).toEqual({ a: "x", b: [{ c: 1.5 }] });
+    expect(original).toEqual({ a: "x", b: [{ c: "y" }] });
+  });
+
+  it("finds at least one nested string across the sample set", () => {
+    const nested = EVENT_SAMPLES.flatMap((entry) =>
+      stringPaths(entry.payload).filter((path) => path.length > 1),
+    );
+    expect(nested.length).toBeGreaterThan(0);
+  });
+});
+
 describe.each(EVENT_SAMPLES)("$eventType", (sample) => {
   const contract = contractsByType.get(sample.eventType);
 
@@ -46,7 +136,7 @@ describe.each(EVENT_SAMPLES)("$eventType", (sample) => {
   });
 
   it("accepts its valid sample envelope", () => {
-    const envelope = sampleEnvelope(sample.eventType, contract?.schemaVersion ?? 1, sample.payload);
+    const envelope = envelopeForSample(sample, contract?.schemaVersion ?? 1);
     const result = contract?.envelopeSchema.safeParse(envelope);
     if (result !== undefined && !result.success) {
       throw new Error(
@@ -69,18 +159,23 @@ describe.each(EVENT_SAMPLES)("$eventType", (sample) => {
     expect(contract?.envelopeSchema.safeParse(envelope).success).toBe(false);
   });
 
-  it("rejects a JavaScript number in place of any string field", () => {
-    for (const [key, value] of Object.entries(sample.payload)) {
-      if (typeof value !== "string") {
-        continue;
+  it("rejects a JavaScript number in place of any string field, at any depth", () => {
+    const paths = stringPaths(sample.payload);
+    // The claim is "every string field of every sample", so the walk must
+    // actually reach something — an empty path list would pass vacuously.
+    expect(paths.length, `${sample.eventType} has no string fields to mutate`).toBeGreaterThan(0);
+
+    for (const path of paths) {
+      for (const numeric of [1.5, 0, -1, 1e21]) {
+        const mutated = setAtPath(sample.payload, path, numeric);
+        expect(
+          contract?.payloadSchema.safeParse(mutated).success,
+          `${sample.eventType}.${renderPath(path)} accepted the number ${String(numeric)}`,
+        ).toBe(false);
       }
-      const mutated = { ...sample.payload, [key]: 1.5 };
-      expect(
-        contract?.payloadSchema.safeParse(mutated).success,
-        `${sample.eventType}.${key} accepted a number`,
-      ).toBe(false);
     }
   });
+
 
   it("rejects non-canonical decimals on every economic field", () => {
     for (const field of sample.economicFields) {
@@ -150,5 +245,236 @@ describe("settlement outcome states (§9.3)", () => {
       "PENDING_CLARIFICATION",
     ]);
     expect(MarketOutcomeStateSchema.safeParse("RESOLVED").success).toBe(false);
+  });
+
+  it("splits the vocabulary into terminal and non-terminal states", () => {
+    expect(TerminalMarketOutcomeStateSchema.options).toEqual([
+      "YES_WIN",
+      "NO_WIN",
+      "SPLIT_50_50",
+      "CANCELLED",
+    ]);
+    expect([...TerminalMarketOutcomeStateSchema.options, ...NON_TERMINAL_MARKET_OUTCOME_STATES]
+      .slice()
+      .sort()).toEqual([...MarketOutcomeStateSchema.options].sort());
+    for (const state of TerminalMarketOutcomeStateSchema.options) {
+      expect(isTerminalMarketOutcomeState(state)).toBe(true);
+    }
+    for (const state of NON_TERMINAL_MARKET_OUTCOME_STATES) {
+      expect(isTerminalMarketOutcomeState(state)).toBe(false);
+    }
+  });
+});
+
+describe("MarketResolved accepts terminal outcomes only", () => {
+  const base = {
+    internalMarketId: "018f3a5c-1111-7000-8000-000000000001",
+    conditionId: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    resolvedAt: "2026-08-26T12:00:00.000Z",
+  };
+
+  it.each(["YES_WIN", "NO_WIN", "SPLIT_50_50", "CANCELLED"])("accepts %s", (outcome) => {
+    expect(MarketResolvedPayloadSchema.safeParse({ ...base, outcome }).success).toBe(true);
+  });
+
+  // A resolution event must assert a determined payoff. `DISPUTED` is an
+  // in-flight process, `PENDING*` are explicitly unresolved — see the ruling on
+  // `TerminalMarketOutcomeStateSchema`.
+  it.each(["PENDING", "PENDING_CLARIFICATION", "DISPUTED"])("rejects %s", (outcome) => {
+    expect(MarketResolvedPayloadSchema.safeParse({ ...base, outcome }).success).toBe(false);
+    // ...while the state itself remains part of the settlement vocabulary.
+    expect(MarketOutcomeStateSchema.safeParse(outcome).success).toBe(true);
+  });
+});
+
+describe("the gap-recovery invariant is unconditional (§7.1, §9.1)", () => {
+  const gap = {
+    feedId: "polymarket-market",
+    detectedAt: "2026-08-26T12:00:00.000Z",
+    reasonCode: "SEQUENCE_GAP",
+    requiresAuthoritativeSnapshot: true,
+  };
+  const resync = {
+    feedId: "polymarket-market",
+    resynchronizedAt: "2026-08-26T12:00:00.000Z",
+    subscriptionGeneration: 1,
+    authoritativeSnapshotApplied: true,
+  };
+
+  it("accepts a gap that requires a snapshot", () => {
+    expect(FeedGapDetectedPayloadSchema.safeParse(gap).success).toBe(true);
+  });
+
+  it("rejects a gap that claims no snapshot is required", () => {
+    expect(
+      FeedGapDetectedPayloadSchema.safeParse({ ...gap, requiresAuthoritativeSnapshot: false })
+        .success,
+    ).toBe(false);
+  });
+
+  it("rejects a non-boolean or missing snapshot requirement", () => {
+    for (const value of ["true", 1, null, undefined]) {
+      expect(
+        FeedGapDetectedPayloadSchema.safeParse({
+          ...gap,
+          requiresAuthoritativeSnapshot: value,
+        }).success,
+      ).toBe(false);
+    }
+    const { requiresAuthoritativeSnapshot, ...withoutFlag } = gap;
+    expect(requiresAuthoritativeSnapshot).toBe(true);
+    expect(FeedGapDetectedPayloadSchema.safeParse(withoutFlag).success).toBe(false);
+  });
+
+  it("accepts a resynchronization that applied a snapshot", () => {
+    expect(FeedResynchronizedPayloadSchema.safeParse(resync).success).toBe(true);
+  });
+
+  it("rejects a resynchronization that applied no snapshot", () => {
+    expect(
+      FeedResynchronizedPayloadSchema.safeParse({ ...resync, authoritativeSnapshotApplied: false })
+        .success,
+    ).toBe(false);
+  });
+});
+
+describe("TradingParametersChanged addresses the whole versioned parameter set", () => {
+  const base = {
+    internalMarketId: "018f3a5c-1111-7000-8000-000000000001",
+    conditionId: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+    parametersVersion: 3,
+    parameterVersionRef: "market-params/018f3a5c-1111-7000-8000-000000000001/3",
+    changedParameters: ["fee_schedule"],
+  };
+
+  it("covers every versioned parameter category from §9.2", () => {
+    expect(TradingParameterKindSchema.options).toEqual([
+      "tick_size",
+      "minimum_order_size",
+      "fee_schedule",
+      "trading_delay",
+      "neg_risk",
+      "status",
+    ]);
+    for (const kind of TradingParameterKindSchema.options) {
+      expect(
+        TradingParametersChangedPayloadSchema.safeParse({ ...base, changedParameters: [kind] })
+          .success,
+      ).toBe(true);
+    }
+  });
+
+  it("expresses a fee-schedule change with no tick or size detail", () => {
+    expect(TradingParametersChangedPayloadSchema.safeParse(base).success).toBe(true);
+  });
+
+  it("still carries tick size and minimum size when they are known", () => {
+    expect(
+      TradingParametersChangedPayloadSchema.safeParse({
+        ...base,
+        changedParameters: ["tick_size", "minimum_order_size"],
+        tickSize: "0.01",
+        minimumOrderSize: "5",
+      }).success,
+    ).toBe(true);
+  });
+
+  it("requires an authoritative snapshot reference", () => {
+    const { parameterVersionRef, ...withoutRef } = base;
+    expect(parameterVersionRef).toContain("market-params/");
+    expect(TradingParametersChangedPayloadSchema.safeParse(withoutRef).success).toBe(false);
+  });
+
+  it("rejects an empty or unknown change list", () => {
+    expect(
+      TradingParametersChangedPayloadSchema.safeParse({ ...base, changedParameters: [] }).success,
+    ).toBe(false);
+    expect(
+      TradingParametersChangedPayloadSchema.safeParse({
+        ...base,
+        changedParameters: ["liquidity_mining"],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps economic detail fields as exact decimal strings", () => {
+    expect(
+      TradingParametersChangedPayloadSchema.safeParse({ ...base, tickSize: 0.01 }).success,
+    ).toBe(false);
+    expect(
+      TradingParametersChangedPayloadSchema.safeParse({ ...base, tickSize: "0.010" }).success,
+    ).toBe(false);
+  });
+});
+
+describe("reference-event provenance agrees with the envelope (§7.1)", () => {
+  it("draws payload venues from the envelope source vocabulary", () => {
+    for (const venue of REFERENCE_VENUES) {
+      expect(EventSourceSchema.safeParse(venue).success).toBe(true);
+      expect(ReferenceVenueSchema.safeParse(venue).success).toBe(true);
+    }
+    expect(ReferenceVenueSchema.safeParse("polymarket").success).toBe(false);
+    expect(ReferenceVenueSchema.safeParse("internal").success).toBe(false);
+  });
+
+  it("ships reference samples whose envelope source matches the payload venue", () => {
+    const referenceSamples = EVENT_SAMPLES.filter((entry) =>
+      entry.eventType.startsWith("Reference"),
+    );
+    expect(referenceSamples).toHaveLength(3);
+    for (const entry of referenceSamples) {
+      const envelope = envelopeForSample(entry, 1);
+      expect(envelope["source"]).toBe(entry.payload["venue"]);
+      expect(() =>
+        assertEnvelopePayloadProvenance(
+          envelope as unknown as { source: string; eventType?: string },
+          entry.payload,
+        ),
+      ).not.toThrow();
+    }
+  });
+
+  it("rejects a payload venue that contradicts the envelope source", () => {
+    const trade = EVENT_SAMPLES.find((entry) => entry.eventType === "ReferenceTradeObserved");
+    expect(trade).toBeDefined();
+    const mismatched = sampleEnvelope("ReferenceTradeObserved", 1, trade?.payload, {
+      source: "coinbase",
+      sourceChannel: "ticker",
+    });
+
+    // The schema still accepts it — a payload alone cannot know its envelope —
+    // which is exactly why the pairing needs an explicit check.
+    expect(
+      contractsByType.get("ReferenceTradeObserved")?.payloadSchema.safeParse(trade?.payload)
+        .success,
+    ).toBe(true);
+
+    const outcome = checkEnvelopePayloadProvenance(
+      mismatched as unknown as { source: string },
+      trade?.payload,
+    );
+    expect(outcome.ok).toBe(false);
+    expect(() =>
+      assertEnvelopePayloadProvenance(
+        mismatched as unknown as { source: string; eventType?: string },
+        trade?.payload,
+      ),
+    ).toThrow(EventProvenanceMismatchError);
+  });
+
+  it("passes payloads that do not restate their provenance", () => {
+    const opened = EVENT_SAMPLES.find((entry) => entry.eventType === "MarketOpened");
+    expect(opened).toBeDefined();
+    expect(checkEnvelopePayloadProvenance({ source: "polymarket" }, opened?.payload).ok).toBe(true);
+    expect(checkEnvelopePayloadProvenance({ source: "polymarket" }, undefined).ok).toBe(true);
+    expect(checkEnvelopePayloadProvenance({ source: "polymarket" }, null).ok).toBe(true);
+  });
+
+  it("treats a non-string payload venue as a mismatch", () => {
+    const outcome = checkEnvelopePayloadProvenance({ source: "binance" }, { venue: 7 });
+    expect(outcome.ok).toBe(false);
+    expect(() =>
+      assertEnvelopePayloadProvenance({ source: "binance" }, { venue: 7 }),
+    ).toThrow(EventProvenanceMismatchError);
   });
 });

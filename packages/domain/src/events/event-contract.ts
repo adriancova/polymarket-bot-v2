@@ -10,7 +10,7 @@
 import type { z } from "zod";
 
 import { pinnedEventEnvelopeSchema } from "../envelope.js";
-import type { SchemaVersion } from "../schema-version.js";
+import { assertSchemaVersion, type SchemaVersion } from "../schema-version.js";
 
 /**
  * Structural shape every event contract satisfies.
@@ -26,12 +26,24 @@ export interface EventContractLike {
   readonly envelopeSchema: z.ZodType;
 }
 
-/** Defines one versioned event contract. */
+/**
+ * Defines one versioned event contract.
+ *
+ * `schemaVersion` is validated at construction: `SchemaVersion` is statically
+ * just `number`, so without this check a contract could be registered under
+ * `0`, `-1`, `1.5`, `NaN`, or `Infinity` — keys that no envelope could ever
+ * route to, and that would silently shadow a real version in `versionsOf` /
+ * `latestVersionOf`. Failing here means the process cannot start with a
+ * malformed contract table.
+ *
+ * @throws {InvalidSchemaVersionError} when `schemaVersion` is not a positive integer.
+ */
 export function defineEventContract<TType extends string, TPayloadSchema extends z.ZodType>(
   eventType: TType,
   schemaVersion: SchemaVersion,
   payloadSchema: TPayloadSchema,
 ) {
+  assertSchemaVersion(schemaVersion, `${eventType}.schemaVersion`);
   return {
     eventType,
     schemaVersion,

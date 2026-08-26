@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 
-import { normalizeDecimalString } from "./canonical.js";
+import { normalizeDecimalString, normalizeHashableDecimalString } from "./canonical.js";
 import { DecimalRangeError, InvalidDecimalStringError } from "./errors.js";
 import {
   CANONICAL_DECIMAL_HASH_DOMAIN,
@@ -43,13 +43,14 @@ describe("canonical decimal hashing (handoff §7.3)", () => {
   });
 
   it("collapses every equivalent spelling to one hash", () => {
-    const spellings = ["1.5", "1.50", "01.5", "+1.5", "0001.500000", "1.5000"];
+    // Only §7.3-permitted spellings: redundant leading/trailing zeros.
+    const spellings = ["1.5", "1.50", "01.5", "0001.500000", "1.5000"];
     const hashes = new Set(spellings.map((value) => canonicalDecimalHash(value)));
     expect(hashes.size).toBe(1);
   });
 
-  it("collapses every spelling of zero to one hash", () => {
-    const spellings = ["0", "-0", "+0", "0.0", "-0.000", "00", "+00.00"];
+  it("collapses every permitted spelling of zero to one hash", () => {
+    const spellings = ["0", "-0", "0.0", "-0.000", "00", "00.00"];
     const hashes = new Set(spellings.map((value) => canonicalDecimalHash(value)));
     expect(hashes.size).toBe(1);
     expect(canonicalDecimalPreimage("-0.000")).toBe(`${CANONICAL_DECIMAL_HASH_DOMAIN}:0`);
@@ -64,12 +65,6 @@ describe("canonical decimal hashing (handoff §7.3)", () => {
     expect(hashes.size).toBe(6);
   });
 
-  it("rejects inputs that are not decimal numerals", () => {
-    expect(() => canonicalDecimalHash("1e5")).toThrow(InvalidDecimalStringError);
-    expect(() => canonicalDecimalHash(1.5)).toThrow(InvalidDecimalStringError);
-    expect(() => canonicalDecimalHash("")).toThrow(InvalidDecimalStringError);
-  });
-
   it("applies range constraints when supplied", () => {
     expect(() => canonicalDecimalHash("1.5", { range: "UNIT_INTERVAL" })).toThrow(
       DecimalRangeError,
@@ -77,15 +72,92 @@ describe("canonical decimal hashing (handoff §7.3)", () => {
   });
 });
 
+describe("the hash-input grammar rejects every §7.3-forbidden form", () => {
+  const forbidden: ReadonlyArray<readonly [string, string, string]> = [
+    ["a leading +", "+1.5", "DECIMAL_LEADING_PLUS"],
+    ["a leading + on zero", "+0", "DECIMAL_LEADING_PLUS"],
+    ["a leading + with padding", "+00.00", "DECIMAL_LEADING_PLUS"],
+    ["a leading + on an integer", "+1", "DECIMAL_LEADING_PLUS"],
+    ["a trailing decimal point", "1.", "DECIMAL_TRAILING_POINT"],
+    ["a trailing decimal point on zero", "0.", "DECIMAL_TRAILING_POINT"],
+    ["a negative trailing decimal point", "-1.", "DECIMAL_TRAILING_POINT"],
+    ["an omitted integer part", ".5", "DECIMAL_MISSING_INTEGER_PART"],
+    ["a negative omitted integer part", "-.5", "DECIMAL_MISSING_INTEGER_PART"],
+    ["scientific notation", "1e5", "DECIMAL_SCIENTIFIC_NOTATION"],
+    ["upper-case scientific notation", "1E5", "DECIMAL_SCIENTIFIC_NOTATION"],
+    ["negative-exponent scientific notation", "1.5e-3", "DECIMAL_SCIENTIFIC_NOTATION"],
+    ["an empty string", "", "DECIMAL_EMPTY"],
+    ["a bare decimal point", ".", "DECIMAL_TRAILING_POINT"],
+    ["leading whitespace", " 1", "DECIMAL_MALFORMED"],
+    ["trailing whitespace", "1 ", "DECIMAL_MALFORMED"],
+    ["a thousands separator", "1,5", "DECIMAL_MALFORMED"],
+    ["two decimal points", "1.2.3", "DECIMAL_MALFORMED"],
+    ["a double sign", "--1", "DECIMAL_MALFORMED"],
+    ["NaN", "NaN", "DECIMAL_MALFORMED"],
+    ["Infinity", "Infinity", "DECIMAL_MALFORMED"],
+    ["hexadecimal", "0x1f", "DECIMAL_MALFORMED"],
+  ];
+
+  it.each(forbidden)("rejects %s (%j) with code %s", (_description, input, code) => {
+    expect(() => canonicalDecimalHash(input)).toThrow(InvalidDecimalStringError);
+    expect(() => canonicalDecimalPreimage(input)).toThrow(InvalidDecimalStringError);
+    expect(() => normalizeHashableDecimalString(input)).toThrow(InvalidDecimalStringError);
+    try {
+      canonicalDecimalHash(input);
+      expect.unreachable("hashing a forbidden form must throw");
+    } catch (error: unknown) {
+      expect(error).toBeInstanceOf(InvalidDecimalStringError);
+      expect((error as InvalidDecimalStringError).code).toBe(code);
+    }
+  });
+
+  const nonStrings: ReadonlyArray<readonly [string, unknown]> = [
+    ["the JavaScript number 1.5", 1.5],
+    ["the JavaScript number 0", 0],
+    ["NaN the number", Number.NaN],
+    ["Infinity the number", Number.POSITIVE_INFINITY],
+    ["a bigint", 15n],
+    ["null", null],
+    ["undefined", undefined],
+    ["a boolean", true],
+    ["an array", []],
+    ["an object with toString", { toString: () => "1.5" }],
+  ];
+
+  it.each(nonStrings)("refuses to hash %s", (_description, input) => {
+    expect(() => canonicalDecimalHash(input)).toThrow(InvalidDecimalStringError);
+  });
+
+  it("keeps the forbidden forms reachable only through the venue-input normalizer", () => {
+    // `normalizeDecimalString` remains available for adapters that must accept a
+    // venue spelling. Hashing the *result* is fine; hashing the raw form is not.
+    for (const [input, canonical] of [
+      ["+1.5", "1.5"],
+      ["1.", "1"],
+      [".5", "0.5"],
+      ["+0", "0"],
+    ] as const) {
+      expect(normalizeDecimalString(input)).toBe(canonical);
+      expect(() => canonicalDecimalHash(input)).toThrow(InvalidDecimalStringError);
+      expect(canonicalDecimalHash(normalizeDecimalString(input))).toBe(
+        canonicalDecimalHash(canonical),
+      );
+    }
+  });
+});
+
 describe("canonical decimal hashing properties", () => {
-  it("hashes every equivalent representation identically", () => {
+  it("hashes every permitted equivalent representation identically", () => {
     fc.assert(
       fc.property(
         canonicalDecimalArbitrary().chain((canonical) =>
-          fc.tuple(fc.constant(canonical), equivalentSpellingArbitrary(canonical)),
+          fc.tuple(
+            fc.constant(canonical),
+            equivalentSpellingArbitrary(canonical, { allowLeadingPlus: false }),
+          ),
         ),
         ([canonical, spelling]) => {
-          expect(normalizeDecimalString(spelling)).toBe(canonical);
+          expect(normalizeHashableDecimalString(spelling)).toBe(canonical);
           expect(canonicalDecimalHash(spelling)).toBe(canonicalDecimalHash(canonical));
         },
       ),
@@ -93,7 +165,26 @@ describe("canonical decimal hashing properties", () => {
     );
   });
 
-  it("never collides for different values", () => {
+  it("rejects every leading-+ spelling that the venue normalizer would accept", () => {
+    fc.assert(
+      fc.property(
+        canonicalDecimalArbitrary({ allowNegative: false }).chain((canonical) =>
+          fc.tuple(fc.constant(canonical), equivalentSpellingArbitrary(canonical)),
+        ),
+        ([canonical, spelling]) => {
+          fc.pre(spelling.startsWith("+"));
+          expect(normalizeDecimalString(spelling)).toBe(canonical);
+          expect(() => canonicalDecimalHash(spelling)).toThrow(InvalidDecimalStringError);
+        },
+      ),
+      { numRuns: 300 },
+    );
+  });
+
+  it("shows no sampled collisions (SHA-256 is collision-resistant, not collision-free)", () => {
+    // This is sampled evidence, not a proof: no finite test can establish that a
+    // 256-bit digest never collides. It fails loudly if the preimage ever stops
+    // distinguishing two distinct canonical values.
     fc.assert(
       fc.property(canonicalDecimalArbitrary(), canonicalDecimalArbitrary(), (a, b) => {
         if (a === b) {
@@ -109,7 +200,7 @@ describe("canonical decimal hashing properties", () => {
   it("is a pure function of the canonical form", () => {
     fc.assert(
       fc.property(canonicalDecimalArbitrary(), (value) => {
-        const canonical = normalizeDecimalString(value);
+        const canonical = normalizeHashableDecimalString(value);
         expect(canonicalDecimalHash(value)).toBe(canonicalDecimalHash(canonical));
         expect(canonicalDecimalHash(value)).toBe(canonicalDecimalHash(value));
       }),
