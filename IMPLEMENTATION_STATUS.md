@@ -19,9 +19,9 @@ Maximum permitted run mode: `PAPER`
 
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
-| `WP-000`               | In remediation (round 4) | None | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
+| `WP-000`               | In review (round 5) | None    | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
-| `WP-020`               | In remediation (round 2) | `WP-010` ✓ | `wp-implementer` on branch `worktree-agent-a45b4929f044830ca` |
+| `WP-020`               | In review (round 3) | `WP-010` ✓ | `wp-implementer` on branch `worktree-agent-a45b4929f044830ca` |
 | `WP-030`               | Blocked  | `WP-000`, `WP-020` | —          |
 | All remaining packages | Blocked  | See work plan      | —          |
 
@@ -71,7 +71,15 @@ Maximum permitted run mode: `PAPER`
   (golden digests, DISPUTED non-terminal, unbranded SchemaVersion,
   `parameterVersionRef`, staying at v1) all judged sound. Review also flagged a
   stale duplicate WP-020 table row in this file — fixed by orchestrator.
-  Remediation round 2 dispatched 2026-08-26. Not merged.
+  Remediation round 2 completed 2026-08-26 in `8d9596e` (provenance enforced in the
+  envelope schema itself via superRefine plus a parseEnvelope structural-bypass
+  assert, 12 mismatch combinations tested through the registry;
+  `Number.isSafeInteger` with `SchemaVersionSchema` as the single shared range;
+  `open_time`/`close_time` added and `status` cited to §10.1 with a per-category
+  citation table in domain.md §6.4; handoff precision fixes; 797/797 tests; no
+  decimal-package, golden-digest, or lockfile change). Orchestrator fast-forwarded
+  the branch to `8d9596e` and reproduced gates. Review round 3 (candidate `8d9596e`
+  vs `4c1d96f`) dispatched 2026-08-26 — verdict pending. Not merged.
 
 - `worktree-agent-a373c7ba6650bf1a9` (WP-000): base `7faf30f`, first candidate `8d16849`,
   second candidate `f79aa96`. Independent adversarial review round 1 (2026-08-24):
@@ -131,8 +139,14 @@ Maximum permitted run mode: `PAPER`
   guard; 257/257 tests; per-finding mutation checks). Orchestrator fast-forwarded
   the branch and reproduced gates. Repair session disclosed one NEW out-of-scope
   divergence: `clobRewards[].rewardsAmount`/`rewardsDailyRate` modeled as JSON
-  number vs official DecimalString — follow-up repair round 4b dispatched
-  2026-08-26 before review round 5. Not merged.
+  number vs official DecimalString — fixed in follow-up `ac85ab6` (round 4b):
+  SDK-parsed-layer modeling per the pinned SDK's DecimalishSchema, with the
+  market-details page's three-tab type disagreement recorded verbatim in report
+  §7.1; deliberate scope extension (`rewardsMinSize` → decimal-string) and
+  deliberate relaxation (`assetAddress` narrowing removed per page + SDK) flagged
+  for review; `conditionId` narrowing kept and marked. 279/279 tests; orchestrator
+  fast-forwarded and reproduced gates. Review round 5 (candidate `ac85ab6` vs
+  `7faf30f`) dispatched 2026-08-26 — verdict pending. Not merged.
 
 ### WP-000 in-flight record (2026-08-24)
 
