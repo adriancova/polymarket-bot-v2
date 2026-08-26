@@ -20,7 +20,7 @@ Maximum permitted run mode: `PAPER`
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
 | `WP-000`               | In remediation (round 3) | None | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
-| `WP-020`               | In progress | `WP-010` ✓      | `wp-implementer` (isolated worktree from `4c1d96f`) |
+| `WP-020`               | In remediation (round 1) | `WP-010` ✓ | `wp-implementer` on branch `worktree-agent-a45b4929f044830ca` |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Ready    | `WP-010` ✓         | Unassigned |
 | `WP-030`               | Blocked  | `WP-000`, `WP-020` | —          |
@@ -35,6 +35,22 @@ Maximum permitted run mode: `PAPER`
 - External post-merge review (Codex, 2026-08-23): CHANGES REQUIRED with two medium findings — both remediated same day: (1) CI now runs dependency vulnerability scans over both lockfiles (`pnpm audit --audit-level high`; `uv export --frozen` + `pip-audit --strict`), both passing locally; (2) the complete auditable WP-010 handoff with all required fields is recorded at `docs/handoffs/WP-010.md`. Additionally, a compose health gate (`pnpm test:compose` + CI `compose` job) now supplements the exit-0 `test:integration` placeholder, and it passes locally.
 
 ## Active branches and worktrees
+
+- `worktree-agent-a45b4929f044830ca` (WP-020): base `4c1d96f`, first candidate `815b6cb`
+  (chain `e7844c9`→`815b6cb`). Implementer handoff `docs/handoffs/WP-020.md` (in worktree);
+  gates reproduced by orchestrator — 642/642 tests, lockfile purely additive, all 43 files
+  in allowed paths. Independent adversarial review round 1 (Codex session
+  `01a03d1d-1510-77a0-b6c5-2d8fed838715`, 2026-08-26): **CHANGES REQUIRED** — 0 blocker,
+  3 high (hash preimage uses lenient normalizer accepting `+1.5`/`1.`/`.5` contra §7.3;
+  same-version optional-field policy incompatible with strict unknown-key schemas —
+  must increment per emitted field-set change; `FeedGapDetected.requiresAuthoritativeSnapshot`
+  and `FeedResynchronized.authoritativeSnapshotApplied` accept `false` contra the
+  gap→snapshot invariant), 4 medium (reference payload `venue` vs envelope `source`
+  provenance conflict; `MarketResolved` accepts pending outcomes; contract/registry
+  skip runtime schemaVersion validation; `TradingParametersChanged` too narrow for
+  fee/delay/negRisk changes), 2 low (overstated recursive-mutation test claim;
+  "never collide" wording). Acceptance 1/2/4/5 verified; 3 failed as reviewed.
+  Remediation round 1 dispatched 2026-08-26. Not merged.
 
 - `worktree-agent-a373c7ba6650bf1a9` (WP-000): base `7faf30f`, first candidate `8d16849`,
   second candidate `f79aa96`. Independent adversarial review round 1 (2026-08-24):
