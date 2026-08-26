@@ -133,6 +133,15 @@ work_packages:
       - test/unit/domain/**
       - test/unit/decimal/**
       - docs/contracts/domain.md
+      # Ratified 2026-08-26 by the orchestrator: adding WP-020's declared
+      # dependencies (zod, decimal.js, fast-check) to its two owned packages
+      # mechanically updates the root lockfile; WP-020 may modify
+      # pnpm-lock.yaml for that purpose only (WP-010 eslint.config.mjs
+      # precedent for a protected path serving a package's deliverable).
+      - pnpm-lock.yaml
+      # Ratified 2026-08-26: complete structured implementer handoff committed
+      # in-repo for pre-merge independent review (WP-000 M4 precedent).
+      - docs/handoffs/WP-020.md
     forbidden_paths:
       - apps/**
       - packages/polymarket-secure/**
