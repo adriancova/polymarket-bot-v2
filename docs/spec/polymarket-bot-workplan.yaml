@@ -168,6 +168,9 @@ work_packages:
       - docs/adr/**
       - docs/contracts/**
       - IMPLEMENTATION_STATUS.md
+      # Ratified 2026-08-26: complete structured implementer handoff committed
+      # in-repo for pre-merge independent review (WP-000/WP-010/WP-020 precedent).
+      - docs/handoffs/WP-030.md
     forbidden_paths:
       - apps/**
       - packages/**

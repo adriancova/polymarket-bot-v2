@@ -19,11 +19,37 @@ Maximum permitted run mode: `PAPER`
 
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
-| `WP-000`               | In review (round 6) | None    | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
+| `WP-000`               | Complete | None               | Merged `d427f00` (impl chain `8d16849`→…→`ddc56ff`, 6 review rounds) |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
-| `WP-030`               | Blocked  | `WP-000` ✗, `WP-020` ✓ | —      |
+| `WP-030`               | Ready    | `WP-000` ✓, `WP-020` ✓ | Unassigned |
 | All remaining packages | Blocked  | See work plan      | —          |
+
+### WP-000 completion record (2026-08-26)
+
+- Implemented by `venue-verifier` (rounds 3+ on Opus subagents) on branch
+  `worktree-agent-a373c7ba6650bf1a9`, base `7faf30f`; commit chain `8d16849` →
+  `f79aa96` (r1) → `f8ecdbb` (r2) → `30e6f47` (handoff) → `5b98b5e` (r3) →
+  `4505aaf` (r4) → `ac85ab6` (r4b) → `ddc56ff` (r5); merged to `main` as
+  `d427f00` under the release manager's standing delegation (2026-08-26).
+- Independent adversarial reviews (fresh Codex session per round): rounds 1–5
+  CHANGES REQUIRED, round 6 **ACCEPT** (session `01a03d73-8ad1-7b23-929d-9f93703b67ef`;
+  0 blocker/high/medium; residual LOW: `conditionId` 31/32-byte fixture narrowing —
+  runtime parsers must NOT inherit it; NOTE: report §17 wording, self-corrected).
+- Post-merge integration on `main` at `d427f00`: install/typecheck/lint/test
+  (1102/1102), `uv` + pytest, and `pnpm audit` all pass.
+- Deliverables: `docs/venue/verified-2026-08-24.md` (29 gated sections, 120
+  official-source citations, 26 SDK links pinned to commit `7fdbed4…`), 16
+  sanitized fixture files across market-ws/user-ws/orders/heartbeat/fees/
+  rate-limits/geoblock/positions/rtds, and the `verify-venue` CLI skeleton with
+  305 offline tests (per-section citation gate, recursive schema validation,
+  credential scanner with 57+ vectors). No credential, signer, order, or
+  authenticated call anywhere.
+- Open venue conflicts/unverified items carried to WP-030/later packages:
+  C-1/U-1 (price_change zero-removal semantics → WP-070), C-2 (USDC vs pUSD
+  denomination → ledger/fee packages), C-3 (MATCHED_NOT_BROADCASTED layering →
+  WP-280), U-7 (npm version pin → WP-260), plus fixture-only narrowings that
+  runtime adapters must not inherit (SDK `.nullish()` fields, conditionId length).
 
 ### WP-020 completion record (2026-08-26)
 
@@ -196,7 +222,8 @@ Maximum permitted run mode: `PAPER`
   sections with §10/§15 as enumerated exemptions and the test's private section
   list deleted; 307/307 tests; per-finding mutation checks). Orchestrator
   fast-forwarded and reproduced gates. Review round 6 (candidate `ddc56ff` vs
-  `7faf30f`) dispatched 2026-08-26 — verdict pending. Not merged.
+  `7faf30f`): **ACCEPT**. Merged to `main` as `d427f00` and post-merge verified
+  (see WP-000 completion record); worktrees and branches cleaned up.
 
 ### WP-000 in-flight record (2026-08-24)
 
