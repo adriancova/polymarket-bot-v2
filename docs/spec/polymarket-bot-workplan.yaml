@@ -240,6 +240,11 @@ work_packages:
       - db/migrations/**
       - packages/storage-postgres/**
       - test/integration/postgres/**
+      # Ratified 2026-08-26 (WP-020 precedent): mechanical lockfile update from
+      # this package's declared dependencies only; and the in-repo structured
+      # handoff for pre-merge review.
+      - pnpm-lock.yaml
+      - docs/handoffs/WP-040.md
     forbidden_paths:
       - packages/domain/**
       - apps/trader/**
@@ -265,6 +270,11 @@ work_packages:
       - test/unit/storage-wal/**
       - test/fault-injection/wal/**
       - docs/contracts/wal-format.md
+      # Ratified 2026-08-26 (WP-020 precedent): mechanical lockfile update from
+      # this package's declared dependencies only; and the in-repo structured
+      # handoff for pre-merge review.
+      - pnpm-lock.yaml
+      - docs/handoffs/WP-050.md
     forbidden_paths:
       - apps/trader/**
       - packages/domain/**
