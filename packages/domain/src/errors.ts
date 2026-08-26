@@ -82,10 +82,12 @@ export class EventValidationError extends DomainError {
 }
 
 /**
- * A schema version was not a positive integer.
+ * A schema version was not a positive safe integer.
  *
  * Raised at contract construction and at registry insertion, so an invalid
  * version fails at startup instead of becoming an unreachable registry key.
+ * "Safe" is part of the rule: the envelope routing schema accepts only the
+ * safe-integer range, so a larger value could never be routed to.
  */
 export class InvalidSchemaVersionError extends DomainError {
   public readonly received: unknown;
@@ -93,7 +95,7 @@ export class InvalidSchemaVersionError extends DomainError {
   public constructor(received: unknown, label = "schemaVersion") {
     super(
       "INVALID_SCHEMA_VERSION",
-      `${label} must be a positive integer, received ${describeValue(received)}`,
+      `${label} must be a positive safe integer (1..${String(Number.MAX_SAFE_INTEGER)}), received ${describeValue(received)}`,
     );
     this.received = received;
   }

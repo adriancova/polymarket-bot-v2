@@ -149,9 +149,25 @@ export const MarketClarificationObservedPayloadSchema = z.strictObject({
 });
 
 /**
- * The categories of versioned trading parameter §9.2 requires the catalog to
- * store and version: "tick size, minimum size, `negRisk`, fee schedule, trading
- * delay, open/close timestamps".
+ * The categories of versioned trading parameter, each taken from a named
+ * handoff source. Every member is cited; nothing here is invented.
+ *
+ * - §9.2 (Universe Service) requires the catalog to "store both outcome tokens,
+ *   condition ID, event ID, tick size, minimum size, `negRisk`, fee schedule,
+ *   trading delay, open/close timestamps, and raw metadata" and to "version
+ *   market parameters on every change". That yields `tick_size`,
+ *   `minimum_order_size`, `fee_schedule`, `trading_delay`, `neg_risk`,
+ *   `open_time`, and `close_time`.
+ * - §10.1 defines the `market_parameter_history` table as "Tick, minimum size,
+ *   delay, `negRisk`, fees, status". `status` appears there and nowhere in
+ *   §9.2's list, so it is kept and cited to §10.1: the table that records the
+ *   parameter history versions it, and an event that could not name it would
+ *   leave a versioned column with no change notification.
+ *
+ * `open_time` and `close_time` are the scheduled open/close *parameters* of the
+ * market, which are versioned and can be rescheduled. They are not duplicates
+ * of `MarketOpened` / `MarketClosing`, which record that the transition has
+ * actually been observed.
  *
  * This is a *vocabulary of what changed*, not a copy of the values. The full
  * parameter snapshot lives in the catalog layer and is addressed by
@@ -160,11 +176,15 @@ export const MarketClarificationObservedPayloadSchema = z.strictObject({
  * evidence for it.
  */
 export const TradingParameterKindSchema = z.enum([
+  // §9.2
   "tick_size",
   "minimum_order_size",
   "fee_schedule",
   "trading_delay",
   "neg_risk",
+  "open_time",
+  "close_time",
+  // §10.1 `market_parameter_history`
   "status",
 ]);
 export type TradingParameterKind = z.infer<typeof TradingParameterKindSchema>;
@@ -178,7 +198,8 @@ export const TradingParametersChangedPayloadSchema = z.strictObject({
    * Opaque handle to the full versioned parameter snapshot held by the catalog.
    *
    * The architecture versions more than tick size and minimum size — fees,
-   * trading delay, and `negRisk` are versioned too (§9.2) — but their exact
+   * trading delay, `negRisk`, and the open/close timestamps are versioned too
+   * (§9.2), as is `status` (§10.1 `market_parameter_history`) — but their exact
    * shapes are volatile venue facts (§1.2) that WP-020 must not invent. This
    * event therefore names *which* categories changed and points at the
    * authoritative snapshot; a consumer that needs a value resolves the ref.

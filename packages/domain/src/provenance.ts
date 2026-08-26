@@ -17,6 +17,20 @@
  * These helpers are pure declarations, like everything else in this package:
  * no I/O, no clock, no logging. A caller turns a mismatch into a
  * `DataQualityIncidentOpened` event and a metric.
+ *
+ * ## Where the rule is enforced
+ *
+ * The rule is NOT optional and NOT only available to callers that remember to
+ * invoke it. `eventEnvelopeSchema` / `pinnedEventEnvelopeSchema` (`./envelope.ts`)
+ * attach it as a schema-level refinement, so every registered contract's
+ * envelope schema — and therefore the canonical
+ * `DOMAIN_EVENT_REGISTRY.parseEnvelope` path — rejects a document whose two
+ * provenance fields contradict each other. `parseEnvelope` re-checks the pair
+ * itself, because `EventContractLike` is structural and a hand-assembled
+ * contract can carry an envelope schema that was not built by those helpers.
+ * These exported helpers remain for boundaries that hold an envelope and a
+ * payload that were never validated together (a projection joined to a
+ * persisted row, a gateway assembling a frame before it emits one).
  */
 
 import { EventProvenanceMismatchError } from "./errors.js";
@@ -48,12 +62,17 @@ export type ProvenanceCheckResult =
  * or when its `venue` equals the envelope `source`. A payload `venue` that is
  * present but not a string is reported as a mismatch: it cannot agree with the
  * envelope, and silently ignoring it would defeat the point of the check.
+ *
+ * A payload that is not an object cannot restate anything, so it passes. This
+ * is checked with `typeof` rather than assumed, because the transport-level
+ * envelope schema validates an unknown payload and `"venue" in payload` throws
+ * on a primitive.
  */
 export function checkEnvelopePayloadProvenance(
   envelope: ProvenanceEnvelope,
   payload: ProvenancePayload | null | undefined,
 ): ProvenanceCheckResult {
-  if (payload === null || payload === undefined) {
+  if (typeof payload !== "object" || payload === null) {
     return { ok: true };
   }
   if (!("venue" in payload) || payload.venue === undefined) {

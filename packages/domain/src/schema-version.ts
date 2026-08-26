@@ -52,7 +52,14 @@ import { z } from "zod";
 
 import { InvalidSchemaVersionError } from "./errors.js";
 
-/** Schema versions are positive integers starting at 1. */
+/**
+ * Schema versions are positive **safe** integers starting at 1.
+ *
+ * `z.int()` accepts only the safe-integer range, which is what makes this the
+ * single definition of the version range: `EventEnvelopeRoutingSchema` parses
+ * an incoming `schemaVersion` through this schema, so any value it rejects can
+ * never route to a contract.
+ */
 export const SchemaVersionSchema = z.int().positive();
 
 export type SchemaVersion = z.infer<typeof SchemaVersionSchema>;
@@ -66,10 +73,19 @@ export type SchemaVersion = z.infer<typeof SchemaVersionSchema>;
  * both call this so an invalid version fails at startup, where it is a loud
  * typed error, rather than becoming an unreachable registry key at runtime.
  *
- * @throws {InvalidSchemaVersionError} when `value` is not a positive integer.
+ * The bound is `Number.isSafeInteger`, not `Number.isInteger`, so that
+ * construction and routing agree exactly. `Number.isInteger(9007199254740992)`
+ * is `true` while {@link SchemaVersionSchema} (and therefore
+ * `EventEnvelopeRoutingSchema`) rejects it: accepting such a version at
+ * construction would register a contract under a key no envelope could ever
+ * route to. Above `Number.MAX_SAFE_INTEGER` a version is not even a distinct
+ * value — `9007199254740992 + 1 === 9007199254740992` — so two "different"
+ * versions would collide on one registry key.
+ *
+ * @throws {InvalidSchemaVersionError} when `value` is not a positive safe integer.
  */
 export function assertSchemaVersion(value: unknown, label = "schemaVersion"): SchemaVersion {
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+  if (!isSchemaVersion(value)) {
     throw new InvalidSchemaVersionError(value, label);
   }
   return value;
@@ -77,7 +93,7 @@ export function assertSchemaVersion(value: unknown, label = "schemaVersion"): Sc
 
 /** Predicate form of {@link assertSchemaVersion}. */
 export function isSchemaVersion(value: unknown): value is SchemaVersion {
-  return typeof value === "number" && Number.isInteger(value) && value >= 1;
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
 }
 
 /** The version every contract frozen by WP-020 starts at. */

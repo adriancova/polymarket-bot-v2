@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { EventProvenanceMismatchError } from "../errors.js";
+import { EventProvenanceMismatchError, EventValidationError } from "../errors.js";
 import { assertEnvelopePayloadProvenance, checkEnvelopePayloadProvenance } from "../provenance.js";
 import { EventSourceSchema } from "../envelope.js";
+import { DOMAIN_EVENT_REGISTRY } from "../registry.js";
 import { EVENT_SAMPLES, envelopeForSample, sampleEnvelope } from "../testing/samples.js";
 import { BookSnapshotPayloadSchema, BookLevelSchema } from "./book.js";
 import {
@@ -336,6 +337,44 @@ describe("the gap-recovery invariant is unconditional (§7.1, §9.1)", () => {
         .success,
     ).toBe(false);
   });
+
+  // The same negative matrix the gap flag gets. Both fields are pinned to
+  // `z.literal(true)`, so both must reject `false`, every truthy stand-in for
+  // `true`, `null`, `undefined`, and omission.
+  it.each([
+    ["false", false],
+    ["the string \"true\"", "true"],
+    ["the string \"false\"", "false"],
+    ["the number 1", 1],
+    ["the number 0", 0],
+    ["null", null],
+    ["undefined", undefined],
+  ])("rejects a resynchronization whose snapshot flag is %s", (_description, value) => {
+    expect(
+      FeedResynchronizedPayloadSchema.safeParse({
+        ...resync,
+        authoritativeSnapshotApplied: value,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects a resynchronization that omits the snapshot flag", () => {
+    const { authoritativeSnapshotApplied, ...withoutFlag } = resync;
+    expect(authoritativeSnapshotApplied).toBe(true);
+    expect(FeedResynchronizedPayloadSchema.safeParse(withoutFlag).success).toBe(false);
+  });
+
+  it("rejects the same stand-ins on the gap flag", () => {
+    // Kept explicit so the two matrices cannot drift apart.
+    for (const value of [false, "true", "false", 1, 0, null, undefined]) {
+      expect(
+        FeedGapDetectedPayloadSchema.safeParse({
+          ...gap,
+          requiresAuthoritativeSnapshot: value,
+        }).success,
+      ).toBe(false);
+    }
+  });
 });
 
 describe("TradingParametersChanged addresses the whole versioned parameter set", () => {
@@ -347,21 +386,50 @@ describe("TradingParametersChanged addresses the whole versioned parameter set",
     changedParameters: ["fee_schedule"],
   };
 
-  it("covers every versioned parameter category from §9.2", () => {
+  it("covers every versioned parameter category the handoff names", () => {
+    // §9.2 names tick size, minimum size, `negRisk`, fee schedule, trading
+    // delay, and open/close timestamps. §10.1 `market_parameter_history` adds
+    // status ("Tick, minimum size, delay, `negRisk`, fees, status"). The
+    // vocabulary is exactly the union, with nothing invented.
     expect(TradingParameterKindSchema.options).toEqual([
       "tick_size",
       "minimum_order_size",
       "fee_schedule",
       "trading_delay",
       "neg_risk",
+      "open_time",
+      "close_time",
       "status",
     ]);
     for (const kind of TradingParameterKindSchema.options) {
       expect(
         TradingParametersChangedPayloadSchema.safeParse({ ...base, changedParameters: [kind] })
           .success,
+        `${kind} was rejected`,
       ).toBe(true);
     }
+  });
+
+  it("expresses a rescheduled open or close as a parameter change (§9.2)", () => {
+    // The open/close *timestamps* are versioned parameters and can be
+    // rescheduled before the transition is observed; `MarketOpened` /
+    // `MarketClosing` record the observed transition, not the schedule.
+    for (const kinds of [["open_time"], ["close_time"], ["open_time", "close_time"]]) {
+      expect(
+        TradingParametersChangedPayloadSchema.safeParse({ ...base, changedParameters: kinds })
+          .success,
+        `${kinds.join("+")} was rejected`,
+      ).toBe(true);
+    }
+  });
+
+  it("accepts the whole vocabulary in one change list", () => {
+    expect(
+      TradingParametersChangedPayloadSchema.safeParse({
+        ...base,
+        changedParameters: [...TradingParameterKindSchema.options],
+      }).success,
+    ).toBe(true);
   });
 
   it("expresses a fee-schedule change with no tick or size detail", () => {
@@ -386,15 +454,43 @@ describe("TradingParametersChanged addresses the whole versioned parameter set",
   });
 
   it("rejects an empty or unknown change list", () => {
+    // Non-empty: an event that changed nothing is not a change event.
+    const empty = TradingParametersChangedPayloadSchema.safeParse({
+      ...base,
+      changedParameters: [],
+    });
+    expect(empty.success).toBe(false);
     expect(
-      TradingParametersChangedPayloadSchema.safeParse({ ...base, changedParameters: [] }).success,
-    ).toBe(false);
+      empty.success === false &&
+        empty.error.issues.some((issue) => issue.path.map(String).join(".") === "changedParameters"),
+    ).toBe(true);
+
+    for (const unknownKind of ["liquidity_mining", "open_close", "openTime", "TICK_SIZE", ""]) {
+      expect(
+        TradingParametersChangedPayloadSchema.safeParse({
+          ...base,
+          changedParameters: [unknownKind],
+        }).success,
+        `${JSON.stringify(unknownKind)} was accepted as a parameter category`,
+      ).toBe(false);
+    }
+
+    // A single unknown entry poisons an otherwise valid list.
     expect(
       TradingParametersChangedPayloadSchema.safeParse({
         ...base,
-        changedParameters: ["liquidity_mining"],
+        changedParameters: ["open_time", "liquidity_mining"],
       }).success,
     ).toBe(false);
+
+    // ...and the field itself must be an array of strings.
+    for (const bad of ["open_time", 1, null, undefined, [1], [null]]) {
+      expect(
+        TradingParametersChangedPayloadSchema.safeParse({ ...base, changedParameters: bad })
+          .success,
+        `${JSON.stringify(bad)} was accepted as a change list`,
+      ).toBe(false);
+    }
   });
 
   it("keeps economic detail fields as exact decimal strings", () => {
@@ -442,8 +538,9 @@ describe("reference-event provenance agrees with the envelope (§7.1)", () => {
       sourceChannel: "ticker",
     });
 
-    // The schema still accepts it — a payload alone cannot know its envelope —
-    // which is exactly why the pairing needs an explicit check.
+    // The *payload* schema still accepts the payload on its own — a payload
+    // cannot know its envelope — which is why the pairing is checked by the
+    // envelope schema and by the registry, not only by this helper.
     expect(
       contractsByType.get("ReferenceTradeObserved")?.payloadSchema.safeParse(trade?.payload)
         .success,
@@ -460,6 +557,86 @@ describe("reference-event provenance agrees with the envelope (§7.1)", () => {
         trade?.payload,
       ),
     ).toThrow(EventProvenanceMismatchError);
+  });
+
+  // The helper above is only as good as the callers that remember it. These
+  // assertions pin the enforcement to the CANONICAL validation path: the
+  // registered envelope schema and `DOMAIN_EVENT_REGISTRY.parseEnvelope`.
+  const referenceEventTypes = ["ReferenceTradeObserved", "ReferenceTopOfBookChanged",
+    "ReferenceTwapObserved"] as const;
+
+  const mismatchCases = referenceEventTypes.flatMap((eventType) => {
+    const sample = EVENT_SAMPLES.find((entry) => entry.eventType === eventType);
+    const payloadVenue = String(sample?.payload["venue"]);
+    return EventSourceSchema.options
+      .filter((source) => source !== payloadVenue)
+      .map((source) => ({ eventType, payloadVenue, source }));
+  });
+
+  it("builds a mismatch case for every reference event and every other source", () => {
+    // 3 reference events × (5 §7.1 sources − its own) = 12 cases; a change to
+    // either vocabulary must not silently shrink the matrix below.
+    expect(mismatchCases).toHaveLength(12);
+    for (const eventType of referenceEventTypes) {
+      expect(mismatchCases.filter((entry) => entry.eventType === eventType)).toHaveLength(4);
+    }
+  });
+
+  it.each(mismatchCases)(
+    "the registry rejects $eventType (payload venue $payloadVenue) under envelope source $source",
+    ({ eventType, source }) => {
+      const sample = EVENT_SAMPLES.find((entry) => entry.eventType === eventType);
+      expect(sample).toBeDefined();
+      const mismatched = sampleEnvelope(eventType, 1, sample?.payload, {
+        source,
+        sourceChannel: "trade",
+      });
+
+      const contract = contractsByType.get(eventType);
+      const parsed = contract?.envelopeSchema.safeParse(mismatched);
+      expect(parsed?.success, `${eventType}/${source} passed the pinned envelope schema`).toBe(
+        false,
+      );
+      expect(
+        parsed?.success === false &&
+          parsed.error.issues.some(
+            (issue) => issue.path.map(String).join(".") === "payload.venue",
+          ),
+      ).toBe(true);
+
+      expect(() => DOMAIN_EVENT_REGISTRY.parseEnvelope(mismatched)).toThrow(EventValidationError);
+
+      const result = DOMAIN_EVENT_REGISTRY.safeParseEnvelope(mismatched);
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain("venue");
+      }
+    },
+  );
+
+  it.each(referenceEventTypes)("the registry accepts a matching %s pair", (eventType) => {
+    const sample = EVENT_SAMPLES.find((entry) => entry.eventType === eventType);
+    expect(sample).toBeDefined();
+    if (sample === undefined) {
+      return;
+    }
+    const envelope = envelopeForSample(sample, 1);
+    expect(envelope["source"]).toBe(sample.payload["venue"]);
+    const parsed = DOMAIN_EVENT_REGISTRY.parseEnvelope(envelope);
+    expect(parsed.eventType).toBe(eventType);
+    expect(DOMAIN_EVENT_REGISTRY.safeParseEnvelope(envelope).ok).toBe(true);
+  });
+
+  it("leaves events that do not restate their provenance routable from any source", () => {
+    const opened = EVENT_SAMPLES.find((entry) => entry.eventType === "MarketOpened");
+    expect(opened).toBeDefined();
+    for (const source of EventSourceSchema.options) {
+      const envelope = sampleEnvelope("MarketOpened", 1, opened?.payload, {
+        source,
+        sourceChannel: "market",
+      });
+      expect(DOMAIN_EVENT_REGISTRY.safeParseEnvelope(envelope).ok).toBe(true);
+    }
   });
 
   it("passes payloads that do not restate their provenance", () => {

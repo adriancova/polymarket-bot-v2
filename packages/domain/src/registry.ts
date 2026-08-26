@@ -13,11 +13,13 @@ import type { z } from "zod";
 import { EventEnvelopeRoutingSchema, type EventEnvelope } from "./envelope.js";
 import {
   DuplicateEventContractError,
+  EventProvenanceMismatchError,
   EventValidationError,
   UnknownEventContractError,
 } from "./errors.js";
 import { DOMAIN_EVENT_CONTRACTS } from "./events/index.js";
 import type { EventContractLike } from "./events/event-contract.js";
+import { assertEnvelopePayloadProvenance, type ProvenancePayload } from "./provenance.js";
 import { assertSchemaVersion, type SchemaVersion } from "./schema-version.js";
 
 function registryKey(eventType: string, schemaVersion: number): string {
@@ -41,9 +43,14 @@ function readEventType(value: unknown): string {
   return "(missing)";
 }
 
+export type EnvelopeParseFailure =
+  | UnknownEventContractError
+  | EventValidationError
+  | EventProvenanceMismatchError;
+
 export type EnvelopeParseResult =
   | { readonly ok: true; readonly envelope: EventEnvelope<unknown> }
-  | { readonly ok: false; readonly error: UnknownEventContractError | EventValidationError };
+  | { readonly ok: false; readonly error: EnvelopeParseFailure };
 
 export interface EventSchemaRegistry {
   /** Every registered contract, in registration order. */
@@ -62,10 +69,14 @@ export interface EventSchemaRegistry {
 
   /**
    * Routes an unparsed value by `(eventType, schemaVersion)` and validates it
-   * against the pinned envelope schema for that contract.
+   * against the pinned envelope schema for that contract, including the §7.1
+   * agreement between the envelope `source` and a payload that restates it.
    *
    * @throws {UnknownEventContractError} when no contract is registered.
    * @throws {EventValidationError} when the value fails the contract schema.
+   * @throws {EventProvenanceMismatchError} when a contract's envelope schema was
+   * not built by `pinnedEventEnvelopeSchema` and therefore did not itself check
+   * the payload's restated provenance.
    */
   parseEnvelope(value: unknown): EventEnvelope<unknown>;
   /** Non-throwing variant of {@link EventSchemaRegistry.parseEnvelope}. */
@@ -85,10 +96,10 @@ export interface EventSchemaRegistry {
  * Every contract's `schemaVersion` is re-validated here, not only in
  * {@link defineEventContract}: `EventContractLike` is a structural type, so a
  * caller can hand-assemble a contract object and bypass the constructor. A
- * registry keyed on `0`, `-1`, `1.5`, or `NaN` would hold entries no envelope
- * could route to.
+ * registry keyed on `0`, `-1`, `1.5`, `NaN`, or an unsafe integer such as
+ * `9007199254740992` would hold entries no envelope could route to.
  *
- * @throws {InvalidSchemaVersionError} when a contract's version is not a positive integer.
+ * @throws {InvalidSchemaVersionError} when a contract's version is not a positive safe integer.
  * @throws {DuplicateEventContractError} when two contracts share a key.
  */
 export function createEventSchemaRegistry(
@@ -156,14 +167,30 @@ export function createEventSchemaRegistry(
       // The pinned envelope schema is built from the shared §7.1 shape, so a
       // value that satisfies it satisfies `EventEnvelope`. The assertion only
       // recovers the static type that the widened `z.ZodType` storage erases.
-      return parsed.data as EventEnvelope<unknown>;
+      const envelope = parsed.data as EventEnvelope<unknown>;
+      // Provenance is enforced by the envelope schema itself (§7.1, see
+      // `envelopeProvenanceRefinement`), so for a contract built by
+      // `defineEventContract` this check is already satisfied. It is repeated
+      // here for the same reason `assertSchemaVersion` is: `EventContractLike`
+      // is structural, so a hand-assembled contract can carry an envelope schema
+      // that never applied the refinement, and the canonical routing path must
+      // not be the weakest one.
+      assertEnvelopePayloadProvenance(
+        { source: envelope.source, eventType: envelope.eventType },
+        envelope.payload as ProvenancePayload,
+      );
+      return envelope;
     },
 
     safeParseEnvelope(value) {
       try {
         return { ok: true, envelope: registry.parseEnvelope(value) };
       } catch (error: unknown) {
-        if (error instanceof UnknownEventContractError || error instanceof EventValidationError) {
+        if (
+          error instanceof UnknownEventContractError ||
+          error instanceof EventValidationError ||
+          error instanceof EventProvenanceMismatchError
+        ) {
           return { ok: false, error };
         }
         throw error;

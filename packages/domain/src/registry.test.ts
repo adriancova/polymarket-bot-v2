@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DuplicateEventContractError,
+  EventProvenanceMismatchError,
   EventValidationError,
   InvalidSchemaVersionError,
   UnknownEventContractError,
@@ -10,6 +11,7 @@ import {
 import { defineEventContract, type EventContractLike } from "./events/event-contract.js";
 import { DOMAIN_EVENT_CONTRACTS, DOMAIN_EVENT_TYPES } from "./events/index.js";
 import { DOMAIN_EVENT_REGISTRY, createEventSchemaRegistry } from "./registry.js";
+import { SchemaVersionSchema, assertSchemaVersion, isSchemaVersion } from "./schema-version.js";
 import { EVENT_SAMPLES, envelopeForSample, sampleEnvelope } from "./testing/samples.js";
 
 describe("the frozen domain event registry", () => {
@@ -144,6 +146,14 @@ describe("registry construction", () => {
     ["NaN", Number.NaN],
     ["Infinity", Number.POSITIVE_INFINITY],
     ["-Infinity", Number.NEGATIVE_INFINITY],
+    // `Number.isInteger` is true for all four of these, but the envelope
+    // routing schema (`z.int()`) accepts only the safe-integer range, so a
+    // contract registered under one of them could never be routed to — and
+    // above 2^53 the values are not even distinct (2^53 + 1 === 2^53).
+    ["2^53 (the first unsafe integer)", 9_007_199_254_740_992],
+    ["2^53 + 2", 9_007_199_254_740_994],
+    ["1e21", 1e21],
+    ["Number.MAX_VALUE", Number.MAX_VALUE],
     ["a numeric string", "1"],
     ["a bigint", 1n],
     ["null", null],
@@ -168,10 +178,93 @@ describe("registry construction", () => {
     expect(() => createEventSchemaRegistry([smuggled])).toThrow(InvalidSchemaVersionError);
   });
 
-  it("accepts any positive integer version", () => {
-    for (const version of [1, 2, 7, 1000]) {
+  it("accepts any positive safe integer version", () => {
+    for (const version of [1, 2, 7, 1000, Number.MAX_SAFE_INTEGER]) {
       expect(defineEventContract("SampleEvent", version, payloadV1).schemaVersion).toBe(version);
     }
+  });
+
+  it("agrees with envelope routing on exactly which versions are valid", () => {
+    // The bug this pins: construction used `Number.isInteger` while routing
+    // used `z.int()` (safe integers only), so a contract could be registered
+    // under a key no envelope could ever reach.
+    const boundary: readonly number[] = [
+      1,
+      2,
+      Number.MAX_SAFE_INTEGER - 1,
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER + 1,
+      9_007_199_254_740_994,
+      1e21,
+      0,
+      -1,
+      1.5,
+    ];
+    for (const version of boundary) {
+      const routable = SchemaVersionSchema.safeParse(version).success;
+      expect(isSchemaVersion(version), `isSchemaVersion(${String(version)})`).toBe(routable);
+      if (routable) {
+        expect(assertSchemaVersion(version)).toBe(version);
+      } else {
+        expect(() => assertSchemaVersion(version)).toThrow(InvalidSchemaVersionError);
+      }
+    }
+  });
+
+  it("cannot route an envelope declaring an unsafe integer version", () => {
+    // Belt and braces: even if a contract slipped through, the routing
+    // projection would refuse the value before any lookup happened.
+    expect(SchemaVersionSchema.safeParse(9_007_199_254_740_992).success).toBe(false);
+    expect(() =>
+      DOMAIN_EVENT_REGISTRY.parseEnvelope(
+        sampleEnvelope("MarketOpened", 9_007_199_254_740_992, {}),
+      ),
+    ).toThrow(UnknownEventContractError);
+  });
+});
+
+describe("the canonical routing path enforces §7.1 provenance", () => {
+  // The contract-level enforcement lives in the envelope schema and is covered
+  // in `events/events.test.ts`. What is pinned here is the registry's own
+  // re-check, which matters because `EventContractLike` is structural: a
+  // hand-assembled contract can carry an envelope schema that never applied the
+  // refinement, and the canonical path must not be the weakest one.
+  const smuggled = {
+    eventType: "SmuggledReference",
+    schemaVersion: 1,
+    payloadSchema: z.strictObject({ venue: z.string() }),
+    // Deliberately NOT built by `pinnedEventEnvelopeSchema`.
+    envelopeSchema: z.looseObject({
+      eventType: z.literal("SmuggledReference"),
+      schemaVersion: z.literal(1),
+      source: z.string(),
+      payload: z.strictObject({ venue: z.string() }),
+    }),
+  } satisfies EventContractLike;
+
+  const registry = createEventSchemaRegistry([smuggled]);
+
+  it("rejects a mismatched pair even without the schema refinement", () => {
+    const envelope = sampleEnvelope("SmuggledReference", 1, { venue: "binance" }, {
+      source: "coinbase",
+    });
+    expect(smuggled.envelopeSchema.safeParse(envelope).success).toBe(true);
+    expect(() => registry.parseEnvelope(envelope)).toThrow(EventProvenanceMismatchError);
+
+    const result = registry.safeParseEnvelope(envelope);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(EventProvenanceMismatchError);
+      expect(result.error.code).toBe("EVENT_PROVENANCE_MISMATCH");
+    }
+  });
+
+  it("accepts a matching pair", () => {
+    const envelope = sampleEnvelope("SmuggledReference", 1, { venue: "binance" }, {
+      source: "binance",
+    });
+    expect(registry.parseEnvelope(envelope).source).toBe("binance");
+    expect(registry.safeParseEnvelope(envelope).ok).toBe(true);
   });
 });
 

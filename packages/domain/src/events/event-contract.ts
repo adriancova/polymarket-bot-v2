@@ -31,12 +31,13 @@ export interface EventContractLike {
  *
  * `schemaVersion` is validated at construction: `SchemaVersion` is statically
  * just `number`, so without this check a contract could be registered under
- * `0`, `-1`, `1.5`, `NaN`, or `Infinity` — keys that no envelope could ever
- * route to, and that would silently shadow a real version in `versionsOf` /
- * `latestVersionOf`. Failing here means the process cannot start with a
- * malformed contract table.
+ * `0`, `-1`, `1.5`, `NaN`, `Infinity`, or an unsafe integer such as
+ * `9007199254740992` — keys that no envelope could ever route to (the routing
+ * schema accepts only the safe-integer range), and that would silently shadow a
+ * real version in `versionsOf` / `latestVersionOf`. Failing here means the
+ * process cannot start with a malformed contract table.
  *
- * @throws {InvalidSchemaVersionError} when `schemaVersion` is not a positive integer.
+ * @throws {InvalidSchemaVersionError} when `schemaVersion` is not a positive safe integer.
  */
 export function defineEventContract<TType extends string, TPayloadSchema extends z.ZodType>(
   eventType: TType,

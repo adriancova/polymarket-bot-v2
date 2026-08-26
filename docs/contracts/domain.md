@@ -309,10 +309,21 @@ from the registry.
 allow `0`, `-1`, `1.5`, `NaN`, or `Infinity` into a contract definition — keys
 no envelope could ever route to, which would also shadow real versions in
 `versionsOf` / `latestVersionOf`. `assertSchemaVersion` enforces "positive
-integer" and is called both by `defineEventContract` and by
+**safe** integer" and is called both by `defineEventContract` and by
 `createEventSchemaRegistry` (because `EventContractLike` is structural, a caller
 can hand-assemble a contract and bypass the constructor). A violation throws
 `InvalidSchemaVersionError` at startup.
+
+**Safe, not merely integral.** `Number.isInteger(9007199254740992)` is `true`,
+but `SchemaVersionSchema` is `z.int()`, which accepts only the safe-integer
+range — and `EventEnvelopeRoutingSchema` parses an incoming `schemaVersion`
+through that same schema. Had construction used `Number.isInteger`, a contract
+could be registered under a key no envelope could ever route to; above
+`Number.MAX_SAFE_INTEGER` two "different" versions are not even distinct
+(`2**53 + 1 === 2**53`), so they would collide on one registry key. Construction
+and routing therefore use one definition of the valid range, pinned by a test
+that walks the boundary (`Number.MAX_SAFE_INTEGER`, `+1`, `1e21`) through
+`assertSchemaVersion`, `isSchemaVersion`, and `SchemaVersionSchema` together.
 
 ### 5.3 Registry usage
 
@@ -326,10 +337,17 @@ const result = DOMAIN_EVENT_REGISTRY.safeParseEnvelope(frame); // non-throwing
 - `lookup` / `require` / `has` resolve `(eventType, schemaVersion)`.
 - `versionsOf` / `latestVersionOf` expose the registered versions of a type.
 - `parseEnvelope` routes on the envelope's own `eventType` and `schemaVersion`,
-  then validates against that contract's pinned envelope schema. An unregistered
-  pair raises `UnknownEventContractError`; a schema failure raises
-  `EventValidationError` with the formatted issue list.
-- `parsePayload` validates a payload independently of an envelope.
+  then validates against that contract's pinned envelope schema — including the
+  §6.3 provenance agreement, which that schema carries. An unregistered pair
+  raises `UnknownEventContractError`; a schema failure raises
+  `EventValidationError` with the formatted issue list. `parseEnvelope`
+  additionally re-checks provenance itself and raises
+  `EventProvenanceMismatchError` for a contract whose envelope schema was
+  hand-assembled rather than built by `pinnedEventEnvelopeSchema`;
+  `safeParseEnvelope` returns all three failures as typed values.
+- `parsePayload` validates a payload independently of an envelope. A payload
+  alone cannot know its envelope, so this path cannot check provenance — that is
+  what makes the envelope-level enforcement necessary.
 
 **Old versions stay registered.** Replay consumes historical envelopes in
 recorded order (§8.4) and must validate them against the schema they were
@@ -367,6 +385,10 @@ the obligation, never waive it. A feed that reconnected but has *not* yet
 applied a snapshot is still in the gap state: that is recorded as
 `FeedConnected` alongside the still-open `FeedGapDetected` /
 `DataQualityIncidentOpened`, not as a `FeedResynchronized`.
+
+Both fields carry the same negative matrix in `events/events.test.ts` —
+`false`, `"true"`, `"false"`, `1`, `0`, `null`, `undefined`, and omission — so
+neither can be quietly relaxed to `z.boolean()` without a failing test.
 
 ### 6.2 `MarketResolved` carries a terminal outcome only
 
@@ -408,8 +430,21 @@ authority:
   `checkEnvelopePayloadProvenance` (`provenance.ts`) are pure declarations that
   reject a payload `venue` differing from the envelope `source`, raising
   `EventProvenanceMismatchError`. A payload that does not restate its origin
-  passes. A caller turns a mismatch into a `DataQualityIncidentOpened` event and
-  a metric; this package performs no I/O.
+  passes, as does a payload that is not an object. A caller turns a mismatch
+  into a `DataQualityIncidentOpened` event and a metric; this package performs
+  no I/O.
+- **The rule is enforced by the contract, not only by those helpers.**
+  `eventEnvelopeSchema` and `pinnedEventEnvelopeSchema` attach
+  `envelopeProvenanceRefinement` (`envelope.ts`), so every registered contract's
+  envelope schema rejects a contradicting pair with an issue on `payload.venue`,
+  and so does the canonical `DOMAIN_EVENT_REGISTRY.parseEnvelope` /
+  `safeParseEnvelope` path built on it. A helper a caller must remember to
+  invoke is not an invariant; a contract that cannot express the violating
+  document is. `parseEnvelope` repeats the check for the same reason it repeats
+  `assertSchemaVersion` — `EventContractLike` is structural, so a hand-assembled
+  contract can carry an envelope schema that never applied the refinement.
+  Tests pin all twelve mismatched combinations (three reference events × the
+  four other §7.1 sources) through the registry, plus the matching pairs.
 
 ### 6.4 `TradingParametersChanged` addresses the whole versioned parameter set
 
@@ -421,8 +456,23 @@ therefore carries:
 | --- | --- |
 | `parametersVersion` (+ optional `previousParametersVersion`) | monotonic ordinal, for ordering and comparison (§6 invariant 9) |
 | `parameterVersionRef` | opaque handle to the authoritative versioned parameter snapshot held by the catalog |
-| `changedParameters` | non-empty array over `tick_size`, `minimum_order_size`, `fee_schedule`, `trading_delay`, `neg_risk`, `status` |
+| `changedParameters` | non-empty array over the vocabulary below |
 | `tickSize?`, `minimumOrderSize?` | optional convenience detail for the two values nearly every consumer needs without a catalog round trip |
+
+`TradingParameterKindSchema` is exactly the union of two cited handoff lists,
+with nothing invented and nothing dropped:
+
+| Category | Source |
+| --- | --- |
+| `tick_size`, `minimum_order_size`, `fee_schedule`, `trading_delay`, `neg_risk`, `open_time`, `close_time` | §9.2 — the Universe Service stores "tick size, minimum size, `negRisk`, fee schedule, trading delay, open/close timestamps" and versions them on every change |
+| `status` | §10.1 — `market_parameter_history` is "Tick, minimum size, delay, `negRisk`, fees, status" |
+
+`status` is kept although §9.2 does not name it: §10.1 versions it in the
+parameter-history table, and an event that could not name it would leave a
+versioned column with no change notification. `open_time` / `close_time` are the
+scheduled open/close *parameters*, which can be rescheduled; they are not
+duplicates of `MarketOpened` / `MarketClosing`, which record that the transition
+was actually observed.
 
 The detailed snapshot deliberately belongs to the catalog layer. Encoding a fee
 schedule or a `negRisk` shape in a frozen contract would freeze a volatile venue

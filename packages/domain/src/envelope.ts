@@ -14,6 +14,10 @@
  * something to silently strip. Dropping data on the recording path would
  * violate §8.3 ("dropping trading or raw market events silently is forbidden"),
  * and a new field is a schema-version change (see `./schema-version.ts`).
+ *
+ * `source` is the authoritative provenance. Every envelope schema built here
+ * carries the refinement that enforces it against a payload that restates its
+ * origin — see {@link envelopeProvenanceRefinement}.
  */
 
 import { z } from "zod";
@@ -26,6 +30,7 @@ import {
   NonNegativeIntegerSchema,
   UnsignedBigIntStringSchema,
 } from "./primitives.js";
+import { checkEnvelopePayloadProvenance, type ProvenancePayload } from "./provenance.js";
 import { SchemaVersionSchema } from "./schema-version.js";
 
 /** Event origin (§7.1). */
@@ -93,14 +98,57 @@ export type EventEnvelope<TPayload> = {
   payload: TPayload;
 };
 
+/**
+ * Enforces the §7.1 provenance agreement inside the envelope contract itself.
+ *
+ * The envelope `source` is authoritative; a payload that restates its origin
+ * (the reference-feed `venue`) must agree with it. Leaving this to a helper the
+ * caller has to remember would mean the canonical validation path — every
+ * contract's `envelopeSchema`, and `DOMAIN_EVENT_REGISTRY.parseEnvelope` on top
+ * of it — accepts a document in which the two provenance fields contradict each
+ * other, and two readers of the same event would attribute it to different
+ * venues. The contract therefore makes that document unrepresentable, exactly
+ * as the unconditional gap-recovery invariant is made unrepresentable in
+ * `events/feed.ts`.
+ *
+ * The refinement is silent when `source` is not a string or the payload is not
+ * an object: those failures belong to the field schemas, and reporting them
+ * twice would only add noise.
+ */
+export function envelopeProvenanceRefinement(value: unknown, ctx: z.RefinementCtx): void {
+  if (typeof value !== "object" || value === null) {
+    return;
+  }
+  const envelope = value as { source?: unknown; eventType?: unknown; payload?: unknown };
+  if (typeof envelope.source !== "string") {
+    return;
+  }
+  const outcome = checkEnvelopePayloadProvenance(
+    typeof envelope.eventType === "string"
+      ? { source: envelope.source, eventType: envelope.eventType }
+      : { source: envelope.source },
+    envelope.payload as ProvenancePayload,
+  );
+  if (!outcome.ok) {
+    ctx.addIssue({
+      code: "custom",
+      message: `${outcome.message}; the envelope source is authoritative (§7.1)`,
+      path: ["payload", "venue"],
+      input: outcome.payloadVenue,
+    });
+  }
+}
+
 /** Builds a strict envelope schema around a payload schema. */
 export function eventEnvelopeSchema<TPayload extends z.ZodType>(payloadSchema: TPayload) {
-  return z.strictObject({
-    ...envelopeCommonShape,
-    eventType: CodeStringSchema,
-    schemaVersion: SchemaVersionSchema,
-    payload: payloadSchema,
-  });
+  return z
+    .strictObject({
+      ...envelopeCommonShape,
+      eventType: CodeStringSchema,
+      schemaVersion: SchemaVersionSchema,
+      payload: payloadSchema,
+    })
+    .superRefine(envelopeProvenanceRefinement);
 }
 
 /**
@@ -113,12 +161,14 @@ export function pinnedEventEnvelopeSchema<TType extends string, TPayload extends
   schemaVersion: number,
   payloadSchema: TPayload,
 ) {
-  return z.strictObject({
-    ...envelopeCommonShape,
-    eventType: z.literal(eventType),
-    schemaVersion: z.literal(schemaVersion),
-    payload: payloadSchema,
-  });
+  return z
+    .strictObject({
+      ...envelopeCommonShape,
+      eventType: z.literal(eventType),
+      schemaVersion: z.literal(schemaVersion),
+      payload: payloadSchema,
+    })
+    .superRefine(envelopeProvenanceRefinement);
 }
 
 /** Envelope schema with an unvalidated payload, for transport-level checks. */
