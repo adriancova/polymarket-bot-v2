@@ -19,7 +19,8 @@ Maximum permitted run mode: `PAPER`
 
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
-| `WP-000`               | In review (round 3) | None    | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
+| `WP-000`               | In remediation (round 3) | None | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
+| `WP-020`               | In progress | `WP-010` ✓      | `wp-implementer` (isolated worktree from `4c1d96f`) |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Ready    | `WP-010` ✓         | Unassigned |
 | `WP-030`               | Blocked  | `WP-000`, `WP-020` | —          |
@@ -47,8 +48,19 @@ Maximum permitted run mode: `PAPER`
   paths (M4). Orchestrator re-verification (2026-08-26): all 24 changed files vs
   base `7faf30f` inside allowed paths; install/typecheck/lint/test reproduced in
   the worktree at `30e6f47` — 124/124 tests pass; handoff record complete.
-  Independent adversarial review round 3 (fresh Codex session, candidate `30e6f47`
-  vs base `7faf30f`) dispatched 2026-08-26 — verdict pending. Not merged.
+  Independent adversarial review round 3 (fresh Codex session `01a03d03-0087-7132-bfaa-644e090779d1`,
+  candidate `30e6f47` vs base `7faf30f`, 2026-08-26): **CHANGES REQUIRED** — 0 blocker,
+  3 high (per-section report-evidence gate still bypassable by `UNVERIFIED`; several
+  contract-bearing nested structures unchecked: fee tables, rate-limit headers/limits,
+  position contracts, RTDS subscriptions/optional update fields; stand-in validators
+  diverge from frozen SDK schema: empty-string optional decimals, non-integer
+  `outcome_index`/`bucket_index`, non-digit epochs, omitted SDK fields), 1 medium
+  (price-bound check via `Number()` accepts negative price on float underflow),
+  2 low (mutable `blob/main` source URLs untied to pinned SHA; credential scanner
+  misses `POLYMARKET_PRIVATE_KEY`/`POLYMARKET_BUILDER_API_KEY`). Round-2 findings
+  M2/M3/M4 confirmed resolved; B1/H1/H2/M1 partial or unresolved. Path ownership,
+  safety defaults, fixture coverage, and no-credential criteria PASS. Remediation
+  round 3 dispatched 2026-08-26. Not merged.
 
 ### WP-000 in-flight record (2026-08-24)
 
