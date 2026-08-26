@@ -1181,6 +1181,221 @@ describe("dependency-direction check — round-2 review regressions", () => {
   });
 });
 
+/**
+ * WP-015 review round 3. The round-2 rebuild recognised a require-load only
+ * when the CallExpression callee was the bare identifier `require`, so a
+ * purity-restricted package could still reach forbidden modules through
+ * `require` aliases and wrappers. Every probe below produced *no* finding on
+ * `7de62d0` (exit 0) and must now be caught. `require` is treated as a
+ * capability, like the impure-globals detection already treats `Date`/`process`.
+ * See `docs/handoffs/WP-015.md` → "Review round 3".
+ */
+describe("dependency-direction check — round-3 require-family regressions", () => {
+  const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
+  const simulationFile = "packages/simulation/src/probe.ts";
+
+  describe("the require callee is unwrapped and resolved, not matched literally", () => {
+    it("catches a parenthesized require callee `(require)(...)`", () => {
+      const run = runChecker(
+        buildFixture({ files: { [strategyFile]: 'export const fs = (require)("node:fs");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+      expect(run.output).toContain("src/probe.ts:1");
+    });
+
+    it("catches a require callee behind `as`/non-null wrappers", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: 'export const fs = (require as (m: string) => unknown)!("node:fs");\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+
+    it("catches a require alias `const r = require; r(...)`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: 'const r = require;\nexport const fs = r("node:fs");\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("catches a chained alias `const a = require; const b = a; b(...)`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: ["const a = require;", "const b = a;", 'export const fs = b("node:fs");'].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+
+    it("catches property-access require `module.require(...)`", () => {
+      const run = runChecker(
+        buildFixture({ files: { [strategyFile]: 'export const fs = module.require("node:fs");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+
+    it("catches a `const { require: r } = module` destructure", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: "const { require: r } = module;\nexport const fs = r(\"node:fs\");\n" },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+  });
+
+  describe("reflection over the require capability", () => {
+    it("catches `require.call(thisArg, spec)` with the specifier at index 1", () => {
+      const run = runChecker(
+        buildFixture({ files: { [strategyFile]: 'export const fs = require.call(null, "node:fs");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+
+    it("fails closed on `require.apply(thisArg, [...])`, whose specifier is not statically readable", () => {
+      const run = runChecker(
+        buildFixture({ files: { [strategyFile]: 'export const fs = require.apply(null, ["node:fs"]);\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("calls `require()` whose specifier is a non-literal expression");
+    });
+  });
+
+  describe("ambient `declare const require` does not suppress the finding", () => {
+    it("catches a call to an ambient-declared require", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "declare const require: (m: string) => unknown;",
+              'export const fs = require("node:fs");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+  });
+
+  describe("node:module / createRequire route", () => {
+    it("flags importing `node:module` into a strategy", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: 'import { createRequire } from "node:module";\nexport const make = createRequire;\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:module` (process/environment built-in)");
+    });
+
+    it("catches a directly-invoked `createRequire(...)(spec)`", () => {
+      // `createRequire` is ambient here so the probe isolates the direct-invoke
+      // route (importing it from node:module is its own F3, tested above).
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "declare const createRequire: (p: string) => (m: string) => unknown;",
+              'export const fs = createRequire("/tmp/x.js")("node:fs");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+  });
+
+  describe("the require family reaches a live signer in simulation (F5)", () => {
+    it("catches `require(\"ethers\")` through an alias in packages/simulation", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [simulationFile]: 'const r = require;\nexport const signer = r("ethers");\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+  });
+
+  describe("genuine locals and property methods stay clean", () => {
+    it("does not flag `registry.require(eventType, version)` on a non-require object", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const registry = { require: (eventType: string, version: number) => `${eventType}@${version}` };",
+              'export const pinned = registry.require("MarketDiscovered", 1);',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("does not flag a parameter named `require` that is not the global", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "export function f(require: (key: string) => string) {",
+              '  return require("contract");',
+              "}",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("does not flag `module` when it is a genuine non-CommonJS local", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const module = { require: (name: string) => name.toUpperCase() };",
+              'export const shouted = module.require("node:fs");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+});
+
 describe("dependency-direction check CLI", () => {
   it("prints usage and exits 0 for --help", () => {
     const result = spawnSync(process.execPath, [checkerPath, "--help"], { encoding: "utf8", cwd: repoRoot });

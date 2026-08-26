@@ -42,9 +42,11 @@
  * Two non-contract rule ids appear in output alongside F1–F13:
  *   - `F-CLOSED` — the §6 fail-closed bullets (classification/mirror).
  *   - `F-OPAQUE` — a construct that makes F1–F8/F11 unevaluable inside a
- *     purity-restricted package: a dynamic `import()` or a global `require()`
- *     whose specifier is not a static literal (an interpolated template, a
- *     variable, a concatenation), or a reference to `eval`/`Function`. Each
+ *     purity-restricted package: a dynamic `import()` or a `require`-capability
+ *     call (bare, aliased, `module.require`, or reflected) whose specifier is
+ *     not a static literal (an interpolated template, a variable, a
+ *     concatenation, an array passed to `.apply`), or a reference to
+ *     `eval`/`Function`. Each
  *     defeats static checking entirely, so inside `packages/domain`,
  *     `packages/strategies/**`, `packages/ledger`, and `packages/simulation`
  *     it is itself a finding rather than a silent pass. Elsewhere it is
@@ -65,14 +67,31 @@
  *   - **Module specifiers** (exact, position-independent): `ImportDeclaration`
  *     and `ExportDeclaration` module specifiers (so `export * from "x"` counts),
  *     `import x = require("x")` external module references, `import("x")` type
- *     nodes, dynamic `import(...)`, and `require(...)` where the callee is the
- *     identifier `require` and that identifier is *not* declared in an
- *     enclosing scope of the file. A string literal or a
- *     no-substitution template literal is a specifier; anything else is
- *     `F-OPAQUE` in a purity-restricted package. A locally declared `require`
- *     (a function, a parameter, an import) is not a module load; a *method*
- *     call such as `registry.require(eventType, version)` is not one either,
- *     because its callee is a property access rather than the bare identifier.
+ *     nodes, dynamic `import(...)`, and any call that resolves to the CommonJS
+ *     `require` *capability* (see below). A string literal or a no-substitution
+ *     template literal is a specifier; anything else is `F-OPAQUE` in a
+ *     purity-restricted package.
+ *   - **The `require` capability, tracked like an impure global** (WP-015 review
+ *     round 3). Recognising `require` only as the bare identifier callee let a
+ *     restricted package reach forbidden modules through aliases and wrappers,
+ *     so a call is a require-load when its callee (after stripping parentheses
+ *     and `as`/`satisfies`/`!` wrappers) resolves to the capability:
+ *       - the ambient/global `require` — even when it is only ever named through
+ *         an ambient `declare const require`, which is a type assertion over the
+ *         global, not a real local implementation, and so does *not* shadow it;
+ *       - an alias bound to it: `const r = require` / `= module.require` /
+ *         `= createRequire(...)`, or `const { require } = module`, makes a later
+ *         `r(...)` a require-load;
+ *       - `module.require(...)` / `module["require"](...)`, where `module` is the
+ *         CommonJS module global (not a genuine local of that name);
+ *       - `require.call(thisArg, spec)` / `require.apply(...)` reflection, whose
+ *         specifier is the argument at index 1 (a non-literal there, e.g. the
+ *         array `.apply` takes, is `F-OPAQUE`);
+ *       - a directly-invoked `createRequire(...)(spec)`.
+ *     A *genuinely* local `require` (a real function, a parameter, an import, a
+ *     destructured non-module binding) still shadows, and a *method* call such
+ *     as `registry.require(eventType, version)` is not a module load because its
+ *     callee is a property access on an object that is not the module global.
  *   - **Impure globals** in `packages/domain` (F1) and `packages/strategies/**`
  *     (F3/F11), detected by *identifier reference* rather than by call
  *     spelling. See `GLOBAL_ROOTS` below for the exact semantics.
@@ -287,6 +306,11 @@ const IMPURE_BUILTINS = new Map([
   ["inspector", "process/environment"],
   ["repl", "process/environment"],
   ["readline", "process/environment"],
+  // `node:module` exposes `createRequire`, which manufactures a CommonJS
+  // `require` capable of loading any of the above by name. Importing it into a
+  // restricted package is itself the finding that closes the createRequire
+  // route (WP-015 review round 3).
+  ["module", "process/environment"],
   ["net", "network"],
   ["tls", "network"],
   ["http", "network"],
@@ -926,6 +950,21 @@ function scanSourceFile(ts, rootDir, fileRel) {
   const globals = [];
   /** Stack of names declared by each enclosing scope; see the header's KNOWN LIMIT. */
   const scopes = [];
+  /**
+   * Names bound by a **non-ambient** declaration in each enclosing scope. A
+   * `declare const require`/`declare function require` is a type assertion over
+   * the ambient global, not a real local implementation, so it is present in
+   * `scopes` (it is a name) but absent here — which is what lets the ambient
+   * `require` capability still be caught through it (WP-015 review round 3).
+   */
+  const genuineScopes = [];
+  /**
+   * Names bound to the CommonJS `require` **capability** in each enclosing scope
+   * (an alias to `require`/`module.require`/`createRequire(...)`, or a
+   * `const { require } = module` destructure). A later call to such a name is a
+   * require-load.
+   */
+  const requireAliasScopes = [];
 
   /**
    * Wrappers that do not change which value an expression denotes. Skipping
@@ -944,6 +983,14 @@ function scanSourceFile(ts, rootDir, fileRel) {
     ts.getLineAndCharacterOfPosition(sourceFile, node.getStart(sourceFile, false)).line + 1;
 
   const isDeclaredLocally = (name) => scopes.some((scope) => scope.has(name));
+  const isGenuinelyDeclared = (name) => genuineScopes.some((scope) => scope.has(name));
+  const isRequireAlias = (name) => requireAliasScopes.some((scope) => scope.has(name));
+
+  /** True when a scope-creating node carries the ambient `declare` modifier. */
+  const hasDeclareModifier = (node) => {
+    const modifiers = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined;
+    return Boolean(modifiers && modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword));
+  };
 
   const addBindingName = (name, into) => {
     if (!name) return;
@@ -963,8 +1010,11 @@ function scanSourceFile(ts, rootDir, fileRel) {
    * deliberately absent: `interface Date {}` merges with the global type and
    * binds no value, so treating it as a shadow would hide a real reference.
    */
-  const addStatementDeclarations = (statements, into) => {
+  const addStatementDeclarations = (statements, into, genuineOnly = false) => {
     for (const statement of statements) {
+      // In `genuineOnly` mode an ambient declaration binds no runtime value, so
+      // it is not a real local shadow (WP-015 review round 3).
+      if (genuineOnly && hasDeclareModifier(statement)) continue;
       if (ts.isVariableStatement(statement)) {
         for (const declaration of statement.declarationList.declarations) {
           addBindingName(declaration.name, into);
@@ -982,7 +1032,7 @@ function scanSourceFile(ts, rootDir, fileRel) {
         continue;
       }
       if (ts.isLabeledStatement(statement)) {
-        addStatementDeclarations([statement.statement], into);
+        addStatementDeclarations([statement.statement], into, genuineOnly);
         continue;
       }
       if (
@@ -1020,27 +1070,35 @@ function scanSourceFile(ts, rootDir, fileRel) {
    */
   const scopeNames = (node) => {
     if (ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node)) {
-      const into = new Set();
-      addStatementDeclarations(node.statements, into);
-      return into;
+      const all = new Set();
+      const genuine = new Set();
+      addStatementDeclarations(node.statements, all, false);
+      addStatementDeclarations(node.statements, genuine, true);
+      return { all, genuine };
     }
     if (ts.isCaseBlock(node)) {
-      const into = new Set();
-      for (const clause of node.clauses) addStatementDeclarations(clause.statements, into);
-      return into;
+      const all = new Set();
+      const genuine = new Set();
+      for (const clause of node.clauses) {
+        addStatementDeclarations(clause.statements, all, false);
+        addStatementDeclarations(clause.statements, genuine, true);
+      }
+      return { all, genuine };
     }
+    // Parameters, class names, `for`/`catch` binders are always real runtime
+    // bindings, so `all` and `genuine` coincide for these scopes.
     if (isFunctionLike(node)) {
       const into = new Set();
       if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name && ts.isIdentifier(node.name)) {
         into.add(node.name.text);
       }
       for (const parameter of node.parameters ?? []) addBindingName(parameter.name, into);
-      return into;
+      return { all: into, genuine: into };
     }
     if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
       const into = new Set();
       if (node.name) into.add(node.name.text);
-      return into;
+      return { all: into, genuine: into };
     }
     if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
       const into = new Set();
@@ -1048,14 +1106,130 @@ function scanSourceFile(ts, rootDir, fileRel) {
       if (initializer && ts.isVariableDeclarationList(initializer)) {
         for (const declaration of initializer.declarations) addBindingName(declaration.name, into);
       }
-      return into;
+      return { all: into, genuine: into };
     }
     if (ts.isCatchClause(node)) {
       const into = new Set();
       if (node.variableDeclaration) addBindingName(node.variableDeclaration.name, into);
-      return into;
+      return { all: into, genuine: into };
     }
     return null;
+  };
+
+  /** Strip transparent wrappers (parens, `as`, `satisfies`, `!`) off an expression. */
+  const unwrapExpression = (node) => {
+    let current = node;
+    while (current && TRANSPARENT_KINDS.has(current.kind) && current.expression) {
+      current = current.expression;
+    }
+    return current;
+  };
+
+  /** True when `expr` denotes the CommonJS `module` global (not a genuine local). */
+  const isModuleGlobal = (expr) => {
+    const inner = unwrapExpression(expr);
+    return ts.isIdentifier(inner) && inner.text === "module" && !isGenuinelyDeclared("module");
+  };
+
+  /** True when calling `expr` yields a `require` capability (i.e. `expr` is `createRequire`). */
+  const isCreateRequireCallee = (expr) => {
+    const inner = unwrapExpression(expr);
+    if (ts.isIdentifier(inner)) return inner.text === "createRequire";
+    // `mod.createRequire` / `mod["createRequire"]` — the node:module import that
+    // binds `mod` is already an F-row finding; this covers the directly-invoked
+    // namespace form as well.
+    if (ts.isPropertyAccessExpression(inner) && ts.isIdentifier(inner.name)) return inner.name.text === "createRequire";
+    if (
+      ts.isElementAccessExpression(inner) &&
+      inner.argumentExpression &&
+      ts.isStringLiteralLike(inner.argumentExpression)
+    ) {
+      return inner.argumentExpression.text === "createRequire";
+    }
+    return false;
+  };
+
+  /**
+   * True when `expr` resolves to the CommonJS `require` capability: the ambient
+   * `require`, an alias bound to it, `module.require`, or `createRequire(...)`.
+   * `extraAliases` lets alias hoisting see earlier same-scope aliases.
+   */
+  const resolvesToRequire = (expr, extraAliases) => {
+    const inner = unwrapExpression(expr);
+    if (ts.isIdentifier(inner)) {
+      const name = inner.text;
+      if (extraAliases && extraAliases.has(name)) return true;
+      if (isRequireAlias(name)) return true;
+      // The ambient/global `require`, unless a genuine local of that name shadows it.
+      return name === "require" && !isGenuinelyDeclared("require");
+    }
+    if (ts.isPropertyAccessExpression(inner) && ts.isIdentifier(inner.name) && inner.name.text === "require") {
+      return isModuleGlobal(inner.expression);
+    }
+    if (
+      ts.isElementAccessExpression(inner) &&
+      inner.argumentExpression &&
+      ts.isStringLiteralLike(inner.argumentExpression) &&
+      inner.argumentExpression.text === "require"
+    ) {
+      return isModuleGlobal(inner.expression);
+    }
+    if (ts.isCallExpression(inner) && isCreateRequireCallee(inner.expression)) return true;
+    return false;
+  };
+
+  /** `require.call(...)` / `require.apply(...)` — reflection over the capability. */
+  const isRequireReflection = (callee) => {
+    if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.name)) return false;
+    if (callee.name.text !== "call" && callee.name.text !== "apply") return false;
+    return resolvesToRequire(callee.expression);
+  };
+
+  /**
+   * Names a scope binds to the `require` capability, hoisted on scope entry
+   * *after* the scope's own `scopes`/`genuineScopes` frames are pushed, so a
+   * genuine local `require`/`module` in the same scope correctly shadows.
+   * Declarations are processed in source order and fed back through
+   * `extraAliases`, so a chain (`const a = require; const b = a;`) resolves.
+   */
+  const collectAliasDecls = (statements, into) => {
+    for (const statement of statements) {
+      if (ts.isLabeledStatement(statement)) {
+        collectAliasDecls([statement.statement], into);
+        continue;
+      }
+      if (!ts.isVariableStatement(statement) || hasDeclareModifier(statement)) continue;
+      for (const declaration of statement.declarationList.declarations) {
+        if (!declaration.initializer) continue;
+        if (ts.isIdentifier(declaration.name)) {
+          if (resolvesToRequire(declaration.initializer, into)) into.add(declaration.name.text);
+          continue;
+        }
+        // `const { require: r } = module` binds `r` to `module.require`.
+        if (ts.isObjectBindingPattern(declaration.name) && isModuleGlobal(declaration.initializer)) {
+          for (const element of declaration.name.elements) {
+            if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+            const property = element.propertyName ?? element.name;
+            const propertyName = ts.isIdentifier(property)
+              ? property.text
+              : ts.isStringLiteralLike(property)
+                ? property.text
+                : null;
+            if (propertyName === "require") into.add(element.name.text);
+          }
+        }
+      }
+    }
+  };
+
+  const requireAliasNames = (node) => {
+    const into = new Set();
+    if (ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node)) {
+      collectAliasDecls(node.statements, into);
+    } else if (ts.isCaseBlock(node)) {
+      for (const clause of node.clauses) collectAliasDecls(clause.statements, into);
+    }
+    return into;
   };
 
   /** The outermost expression denoting the same value as `node`. */
@@ -1192,12 +1366,14 @@ function scanSourceFile(ts, rootDir, fileRel) {
   };
 
   /**
-   * `import(...)` or `require(...)`. A string or no-substitution template
-   * literal is an exact specifier; anything else is opaque. This is what closes
-   * the round-2 computed-`require` bypass.
+   * `import(...)` or a `require`-capability call. A string or no-substitution
+   * template literal at `argIndex` is an exact specifier; anything else is
+   * opaque. `argIndex` is 1 for `require.call`/`require.apply` reflection, where
+   * the specifier follows the `thisArg` (WP-015 review round 3), and 0
+   * otherwise. This is what closes the computed-`require` bypasses.
    */
-  const recordModuleCall = (call, kind) => {
-    const argument = call.arguments[0];
+  const recordModuleCall = (call, kind, argIndex) => {
+    const argument = call.arguments[argIndex];
     if (!argument) return;
     if (ts.isStringLiteralLike(argument)) {
       recordSpecifier(argument);
@@ -1237,14 +1413,14 @@ function scanSourceFile(ts, rootDir, fileRel) {
       if (expression && ts.isStringLiteralLike(expression)) recordSpecifier(expression);
       else recordOpaque(node, "import", expression);
     } else if (ts.isCallExpression(node)) {
-      if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
-        recordModuleCall(node, "import");
-      } else if (
-        ts.isIdentifier(node.expression) &&
-        node.expression.text === "require" &&
-        !isDeclaredLocally("require")
-      ) {
-        recordModuleCall(node, "require");
+      const callee = unwrapExpression(node.expression);
+      if (node.expression.kind === ts.SyntaxKind.ImportKeyword || callee.kind === ts.SyntaxKind.ImportKeyword) {
+        recordModuleCall(node, "import", 0);
+      } else if (isRequireReflection(callee)) {
+        // `require.call(thisArg, spec)` / `require.apply(thisArg, [spec])`.
+        recordModuleCall(node, "require", 1);
+      } else if (resolvesToRequire(callee)) {
+        recordModuleCall(node, "require", 0);
       }
     } else if (ts.isMetaProperty(node) && node.keywordToken === ts.SyntaxKind.ImportKeyword) {
       globals.push({ family: ENVIRONMENT, what: "module environment (`import.meta`)", line: lineOf(node) });
@@ -1278,8 +1454,14 @@ function scanSourceFile(ts, rootDir, fileRel) {
       ts.forEachChild(node, visit);
       return;
     }
-    scopes.push(names);
+    scopes.push(names.all);
+    genuineScopes.push(names.genuine);
+    // Alias hoisting runs after this scope's shadow frames are pushed, so a
+    // genuine local `require`/`module` here correctly suppresses the capability.
+    requireAliasScopes.push(requireAliasNames(node));
     ts.forEachChild(node, visit);
+    requireAliasScopes.pop();
+    genuineScopes.pop();
     scopes.pop();
   };
 
