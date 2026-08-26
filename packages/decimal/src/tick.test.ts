@@ -54,6 +54,25 @@ describe("exact tick conformance (handoff §7.3, §16.2)", () => {
     expect(() => isTickConformant("0.5", "-0.01")).toThrow(InvalidTickSizeError);
   });
 
+  it("reports every tick failure with the matching code", () => {
+    // Wave 0 closeout L9: one throw site carried `DECIMAL_INEXACT` while the
+    // class was `InvalidTickSizeError`. Class and code now agree everywhere in
+    // this module; `errors.test.ts` holds the package-wide taxonomy test.
+    for (const operation of [
+      () => isTickConformant("0.5", "0"),
+      () => isTickConformant("0.5", "-0.01"),
+      () => assertTickConformant("0.075", "0.01", "price"),
+    ]) {
+      try {
+        operation();
+        throw new Error("expected InvalidTickSizeError");
+      } catch (error: unknown) {
+        expect(error).toBeInstanceOf(InvalidTickSizeError);
+        expect((error as InvalidTickSizeError).code).toBe("DECIMAL_INVALID_TICK");
+      }
+    }
+  });
+
   it("requires canonical inputs", () => {
     expect(() => isTickConformant("0.50", "0.01")).toThrow(InvalidDecimalStringError);
     expect(() => isTickConformant("0.5", "0.010")).toThrow(InvalidDecimalStringError);

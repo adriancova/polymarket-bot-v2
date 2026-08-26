@@ -38,8 +38,16 @@ function scaleToInteger(value: DecimalString, scale: number): Decimal {
   if (!scaled.isInteger()) {
     // Unreachable for canonical inputs scaled by max(decimalPlaces); kept as a
     // hard invariant so a future change cannot silently introduce rounding.
+    //
+    // The code is `DECIMAL_INVALID_TICK`, matching the class. It carried
+    // `DECIMAL_INEXACT` until the Wave 0 closeout L9 fix, which broke the one
+    // property a stable `code` exists for: a caller branching on the class and
+    // a metric labelling on the code must classify the same failure the same
+    // way. Every `InvalidTickSizeError` in this package now carries
+    // `DECIMAL_INVALID_TICK` (see `errors.ts` and `errors.test.ts`); the
+    // specific cause stays in the message.
     throw new InvalidTickSizeError(
-      "DECIMAL_INEXACT",
+      "DECIMAL_INVALID_TICK",
       `tick conformance scaling did not produce an integer for "${value}"`,
     );
   }

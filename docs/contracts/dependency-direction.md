@@ -233,11 +233,16 @@ runs three rules over it.
 `dependencies`/`devDependencies` of each (`workspace:` specifiers), directed from
 dependent to dependency. The **workspace root** `package.json` is not a layered
 node: it owns root tooling, and its `@polymarket-bot/testkit` devDependency is a
-root-gate wiring detail, not an inter-package edge. As of this document the
-repository declares exactly two `workspace:*` dependencies — that root
-devDependency, and **S0** (`packages/domain` → `packages/decimal`) — so the graph
-has exactly one edge and a check written today would pass. That is the point of
-writing the spec before the graph gets interesting.
+root-gate wiring detail, not an inter-package edge. As of 2026-08-26 the
+repository declares three `workspace:*` dependencies — that root devDependency,
+**S0** (`packages/domain` → `packages/decimal`), and `apps/ops-cli` →
+`packages/decimal` (a `devDependency`, added by the Wave 0 closeout remediation
+so the venue-fixture canonical-decimal grammar is tested against the frozen one;
+finding M5) — so the layered graph has exactly two edges and a check written
+today would pass: S0 is the §2.1-listed same-layer edge, and `apps/ops-cli`
+(layer 3) → `packages/decimal` (layer 0) is an ordinary downward edge needing no
+§2.1 row. That is the point of writing the spec before the graph gets
+interesting.
 
 1. **Cycle detection.** Fail on any cycle in that graph. Non-zero exit, named
    cycle in the output. This is the rule §5.2 states literally, and it is what
@@ -267,11 +272,30 @@ Requirements on the check itself:
   workspace but absent from §2 is an error, not a pass. Otherwise the check
   silently stops covering new code, which is the failure mode the `WP-000` review
   found in a different gate (`docs/handoffs/WP-000.md`, round-5 finding on the
-  ungated report sections). The mirror also holds: a §2 entry naming a workspace
-  package that has no manifest is an error, so the table cannot rot unnoticed —
-  with one exemption, `packages/strategies/*`, which is a **class** matching zero
-  or more strategy packages (`packages/strategies/static-bracket` is a directory
-  with no `package.json` today and arrives with `WP-220`).
+  ungated report sections). The mirror also holds, so the table cannot rot
+  unnoticed, and it is stated as two rules because §2 contains two kinds of
+  entry:
+  - **A named entry** (every `packages/*` and `apps/*` row) must resolve to a
+    workspace package with a `package.json`. If it does not, that is an error:
+    the table is describing a package that does not exist.
+  - **A class entry** — `packages/strategies/*` — matches zero or more concrete
+    strategy packages, and **each match is classified layer 1** (rule 2 above).
+    A class matching zero packages is not an error; a package it matches is
+    **not** exempt from classification. As of 2026-08-26 it matches exactly one
+    live workspace member, `packages/strategies/static-bracket`, whose
+    `package.json` is the `WP-010` scaffold (`pnpm-workspace.yaml` includes
+    `packages/strategies/*`, and `pnpm install` reports 35 workspace projects).
+    Its *implementation* arrives with `WP-220`; its *manifest* is already in the
+    graph, so the check evaluates it today — it declares no `workspace:*`
+    dependency yet, so it contributes a node and no edge, and the S2 row in §2.1
+    is what will permit its `packages/strategy-sdk` edge when `WP-220` adds it.
+
+  (Corrected 2026-08-26, Wave 0 closeout finding M6: this bullet previously
+  exempted `packages/strategies/*` from the mirror rule on the stated basis that
+  `packages/strategies/static-bracket` "is a directory with no `package.json`
+  today". That was false when written — `WP-010` scaffolded the manifest — and an
+  exemption resting on a false fact would have let a real workspace member sit
+  permanently outside the layer check.)
 - It fails **closed** on same-layer edges, per rule 2. §2.1 is exhaustive by
   construction; widening it is a documented, cited edit reviewed like any other
   contract change.

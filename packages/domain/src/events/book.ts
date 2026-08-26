@@ -10,6 +10,34 @@
  * Level changes carry ABSOLUTE sizes, matching §9.4 ("apply snapshots and
  * absolute-size price changes exactly as documented by the venue"). A size of
  * `"0"` removes the level.
+ *
+ * ## UNVERIFIED — conflict C-1 / unverified item U-1
+ *
+ * The sentence above is the handoff §23 architectural ASSUMPTION, retained
+ * provisionally under handoff §1.1's conflict procedure. It is NOT a verified
+ * venue fact: the official market-channel documentation types
+ * `price_change.size` as a `DecimalString` and states neither
+ * absolute-versus-delta semantics nor that `size: "0"` removes a level
+ * (`docs/venue/verified-2026-08-24.md` §3, conflict C-1 in §11, unverified item
+ * U-1 in §12; ADR-002 §8).
+ *
+ * Consequences, so no reader mistakes provisional wording for settled behavior:
+ *
+ * - `WP-070` MUST confirm the semantics against the official SDK's
+ *   book-maintenance code and/or live observation BEFORE `WP-150` treats them as
+ *   truth. Until then no component may claim they are verified, and the
+ *   simulator inherits the same uncertainty (ADR-012).
+ * - If confirmation shows DELTA semantics instead, the fix is a NEW
+ *   `schemaVersion` for the affected book contracts under ADR-002 §8.4 — never a
+ *   reinterpretation of recorded v1 data, and never an in-place redefinition of
+ *   these payloads.
+ * - Anything reconstructing depth from these events is building on a
+ *   provisional reading of the venue (ADR-002 Consequences).
+ *
+ * This block is a COMMENT ONLY. It records status that already binds via
+ * ADR-002 §8 and `docs/contracts/protected-contracts.md` §8; it changes no
+ * schema, type, or runtime behavior, so `schemaVersion` is unchanged (ADR-002
+ * §3 ties a version bump to a change in the EMITTED FIELD SET).
  */
 
 import { z } from "zod";
@@ -55,7 +83,14 @@ export const BookLevelChangedPayloadSchema = z.strictObject({
   ...bookReferenceShape,
   side: BookSideSchema,
   price: PriceStringSchema,
-  /** Absolute resulting size at this price; `"0"` removes the level. */
+  /**
+   * Absolute resulting size at this price; `"0"` removes the level.
+   *
+   * UNVERIFIED (C-1 / U-1): this is the handoff §23 assumption, not a
+   * documented venue fact. `WP-070` must confirm it; delta semantics would be
+   * corrected by a new `schemaVersion` under ADR-002 §8.4. See the module
+   * header.
+   */
   size: NonNegativeSharesStringSchema,
   venueBookHash: NonEmptyStringSchema.optional(),
 });

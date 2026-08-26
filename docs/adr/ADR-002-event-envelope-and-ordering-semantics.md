@@ -201,12 +201,48 @@ strictness is correct for a frozen snapshot, where an undocumented value would b
 an invention. It is **wrong for a runtime parser**, which would reject valid
 venue traffic. This ADR makes the boundary explicit and binding:
 
+**Where the relaxation lives is part of the rule.** "A runtime parser must
+accept `null`" means the **adapter** — the component that owns the venue wire
+format — accepts it and maps it to *absent* before anything crosses the domain
+boundary. It does **not** mean `packages/domain` accepts `null`. ADR-001 §8.1
+already fixes that division for the sibling case (`""` for an absent optional
+decimal: "An adapter must map `""` to *absent* before the boundary"), and the
+frozen implementation matches — every optional field in `packages/domain` is
+`.optional()` on a `z.strictObject`, so `null` fails to parse and no schema
+uses `.nullable()`. (The single `z.null()` in the package is inside
+`ModelOutputValueSchema`, where handoff §7.5 specifies `null` as a legal model
+output *value*; it is not a venue field and not an encoding of absence.) The
+boundary never coerces (ADR-001 §3), so a schema that
+accepted `null` would have to decide what it means, which is exactly the
+decision the adapter owns.
+
+This is a correction of the table's earlier wording, which said "a runtime
+parser **and `packages/domain`**". `docs/venue/verified-2026-08-24.md` §17 uses
+the same phrasing ("the live adapter and `packages/domain` (WP-020) must accept
+`null`"). That report is a **frozen dated snapshot** and is not edited; on this
+point it is **superseded by ADR-001 §8.1 and this ADR** under the handoff §1.1
+authority order, which gives the venue report authority over *venue facts* and
+the handoff/ADRs authority over *internal architecture*. The venue fact — the
+SDK declares these fields `.nullish()` and real traffic may carry `null` — is
+unchanged and binding; only the claim about which internal component absorbs it
+is corrected. `docs/contracts/protected-contracts.md` §9 carries the same
+correction.
+
 | Narrowing in the `WP-000` fixture catalog | Runtime rule |
 | --- | --- |
-| SDK `.nullish()` fields rejected when `null` — e.g. `MarketBookEventSchema.hash`, `timestamp`, `neg_risk`, and every `OptionalDecimalStringSchema` field (venue report §17) | A runtime parser and `packages/domain` **must accept `null`** wherever the SDK declares `.nullish()`, and map it to absent. |
-| `conditionId` narrowed to 31/32 bytes, while the SDK's `ConditionIdResponseSchema` "validates hex syntax without constraining the condition ID byte length" (venue report §7.1) | A runtime parser **must accept any hex condition id the SDK accepts**. Rejecting a valid one at runtime drops real venue data rather than failing a fixture test. |
-| Reward decimals modeled only at the SDK-parsed layer (venue report §7.1) | An adapter **must accept both** the raw JSON-number form and the decimal-string form and normalize to canonical decimal (ADR-001 §8.2). |
-| `clobRewards`, `rewardsMinSize`, `rewardsMaxSpread` required and non-null, `clobRewards[].endDate` key-required, while the SDK marks all four `.nullish()` (venue report §7, §7.1) | A runtime model **must treat all four as optional**; a real market may omit the whole rewards block. |
+| SDK `.nullish()` fields rejected when `null` — e.g. `MarketBookEventSchema.hash`, `timestamp`, `neg_risk`, and every `OptionalDecimalStringSchema` field (venue report §17; `checks.ts:829-833`, `842-847`) | The **adapter** **must accept `null`** wherever the SDK declares `.nullish()` and **map it to absent before the domain boundary**. `packages/domain` stays strict per ADR-001 §8.1 and never sees `null`. |
+| `conditionId` narrowed to 31/32 bytes, while the SDK's `ConditionIdResponseSchema` "validates hex syntax without constraining the condition ID byte length" (venue report §7.1; `checks.ts:143`, `419-425`) | A runtime parser **must accept any hex condition id the SDK accepts**. Rejecting a valid one at runtime drops real venue data rather than failing a fixture test. |
+| Reward decimals modeled only at the SDK-parsed layer (venue report §7.1; `checks.ts:381-384`) | An adapter **must accept both** the raw JSON-number form and the decimal-string form and normalize to canonical decimal (ADR-001 §8.2). |
+| `clobRewards`, `rewardsMinSize`, `rewardsMaxSpread` required and non-null, `clobRewards[].endDate` key-required, while the SDK marks all four `.nullish()` (venue report §7, §7.1; `checks.ts:377-451`) | A runtime model **must treat all four as optional**; a real market may omit the whole rewards block. |
+| **Trade-status spelling pinned per layer**: the user-stream fixtures accept only the plain values (`MATCHED`…`FAILED`) and the REST fixtures only the prefixed `TRADE_STATUS_*` constants, while the SDK's `TradeStatusSchema` normalizes **both** spellings on **either** layer (`checks.ts:107-131`, used at `1063` and `1110`) | An adapter **must accept either spelling on either layer** and normalize once, on its own side of the boundary. The per-layer pinning is documentation fidelity for a frozen snapshot, not a wire guarantee — and C-3 (`MATCHED_NOT_BROADCASTED` scope) is still **open**, so neither spelling set may be treated as exhaustive. |
+| **Epoch-like timestamps pinned to epoch forms**: `EPOCH_LIKE` accepts a digit string or an integer only, while the SDK's `EpochLikeToIsoDateTimeStringSchema` also accepts a **date-like string** (`checks.ts:133-140`, used at `980`, `1100`, `1104`) | An adapter **must accept every form the SDK accepts**, including the date-like string, and convert to the repository's canonical time representation itself. Rejecting a documented form drops real venue data. |
+| **Prices canonicalized and bounded to `[0, 1]`**, while the SDK types them as unbounded `DecimalString` (`checks.ts:42-46`, `148-159`; `price-string` / `empty-or-price-string` throughout) | The bound is a **domain** constraint that stays (ADR-001 §2, and ADR-001's Consequences: "If the venue ever publishes a price outside the unit interval, the adapter fails loudly rather than clamping"). What must **not** be inherited is the *canonical spelling* requirement: the wire is not canonical, so the adapter normalizes venue spellings with `normalizeDecimalString` (ADR-001 §3) and never hands a raw wire string to a domain schema. An out-of-range price is a typed adapter failure plus a `DataQualityIncidentOpened`, never a clamp and never a silent drop (§8.3). |
+| **`side` / `status` enumerated where the catalog records the SDK as typing a free string** — its header states "the SDK types some side/status fields as free strings where the documentation enumerates the values" (`checks.ts:42-46`); the marked instance is the order response's `status` (`checks.ts:796-807`, `z.string()` in the SDK, enumerated here as `live`/`matched`/`delayed`/`unmatched`/`""`), and the uncited `SIDE`/`TRADER_SIDE` enumerations ride on the same header note (`checks.ts:89-90`, used at `180`, `203`, `873`, `921`, `1024`, `1059`, `1078`, `1108`, `1112`) | A runtime parser **must treat an unrecognized value as first-class UNKNOWN** — routed to `DataQualityIncidentOpened` and preserved raw — rather than assuming the enumeration is exhaustive. The venue's error-code enumeration is explicitly **not** exhaustive in the sources (register item **U-4**), and the same caution applies to any free-string field the fixtures enumerate. A domain contract may still enumerate its own normalized vocabulary; the *adapter* is where an unknown wire value is detected and reported. (`ORDER_TYPE`, `USER_ORDER_STATUS`, and `USER_ORDER_EVENT_TYPE` at `checks.ts:92-105` are **not** narrowings — each cites a real SDK enum.) |
+
+The list above is now the complete set of deliberate narrowings marked in
+`apps/ops-cli/src/verify-venue/checks.ts` (every `NARROWING` marker in that file,
+re-read line by line for this ADR at the Wave 0 closeout). If a later fixture
+adds one, it adds a row here in the same change.
 
 Two non-narrowings, recorded so they are not "relaxed" by mistake:
 
@@ -220,8 +256,10 @@ Two non-narrowings, recorded so they are not "relaxed" by mistake:
 The general rule: **absence and `null` are different facts, and this repository
 does not conflate them** (venue report §17). A contract that accepts `null` where
 no source documents one is inventing venue behavior, which `AGENTS.md` forbids;
-a contract that rejects `null` where the SDK declares `.nullish()` drops real
-data.
+an **adapter** that rejects `null` where the SDK declares `.nullish()` drops real
+data. The domain boundary sees neither problem, because by the time a value
+reaches it the adapter has already decided between *absent* and *present*
+(ADR-001 §8.1).
 
 ### 8. Book-update semantics remain provisional (UNVERIFIED)
 

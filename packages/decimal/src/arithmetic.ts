@@ -26,6 +26,14 @@
  * - Money rounding rules (fees, payouts, tick rounding) are deliberately NOT
  *   defined here. They belong to the components that own those rules, which
  *   must pass an explicit rounding mode.
+ *
+ * ## Inexactness versus a bad argument
+ *
+ * {@link DecimalInexactError} means a RESULT could not be represented exactly.
+ * A caller argument that is out of range — the only one is {@link divDecimal}'s
+ * `precision` option — raises {@link DecimalRangeError} with code
+ * `DECIMAL_INVALID_PRECISION` instead. The two were conflated until the Wave 0
+ * closeout L9 fix; no arithmetic result changed.
  */
 
 // Named import: `decimal.js` ships one `.d.ts` that TypeScript resolves as
@@ -40,7 +48,11 @@ import {
   normalizeDecimalString,
   type DecimalString,
 } from "./canonical.js";
-import { DecimalDivisionByZeroError, DecimalInexactError } from "./errors.js";
+import {
+  DecimalDivisionByZeroError,
+  DecimalInexactError,
+  DecimalRangeError,
+} from "./errors.js";
 
 /**
  * Working precision for exact operations (`decimal.js` maximum).
@@ -146,6 +158,8 @@ export interface DivisionOptions {
  * Division with an explicit, documented rounding contract.
  *
  * @throws {DecimalDivisionByZeroError} when the divisor is exactly zero.
+ * @throws {DecimalRangeError} (`DECIMAL_INVALID_PRECISION`) when the requested
+ *   `precision` is not an integer in `[1, EXACT_PRECISION]`.
  */
 export function divDecimal(
   a: DecimalString,
@@ -167,8 +181,13 @@ export function divDecimal(
       requestedPrecision < 1 ||
       requestedPrecision > EXACT_PRECISION)
   ) {
-    throw new DecimalInexactError(
-      "DECIMAL_INEXACT",
+    // ARGUMENT validation, not an inexactness: the caller asked for a
+    // precision this package cannot honour. Raising `DecimalInexactError` here
+    // (as this did until the Wave 0 closeout L9 fix) told a caller that a
+    // RESULT could not be represented exactly, which is a different fact and
+    // would be metered under the wrong label.
+    throw new DecimalRangeError(
+      "DECIMAL_INVALID_PRECISION",
       `divDecimal: precision must be an integer in [1, ${String(EXACT_PRECISION)}], received ${String(requestedPrecision)}`,
     );
   }

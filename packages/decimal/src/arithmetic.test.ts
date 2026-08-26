@@ -19,6 +19,7 @@ import { isCanonicalDecimalString } from "./canonical.js";
 import {
   DecimalDivisionByZeroError,
   DecimalInexactError,
+  DecimalRangeError,
   InvalidDecimalStringError,
 } from "./errors.js";
 import { canonicalDecimalArbitrary } from "./testing/arbitraries.js";
@@ -149,9 +150,14 @@ describe("division has an explicit rounding contract", () => {
     expect(() => divDecimalExact("1", "0")).toThrow(DecimalDivisionByZeroError);
   });
 
-  it("rejects an unusable requested precision with a typed error", () => {
+  it("rejects an unusable requested precision with an argument error", () => {
+    // Wave 0 closeout L9: an out-of-range `precision` ARGUMENT is not an
+    // inexactness. It raises `DecimalRangeError` with `DECIMAL_INVALID_PRECISION`;
+    // `DecimalInexactError` stays reserved for results that cannot be
+    // represented exactly. Full taxonomy coverage lives in `errors.test.ts`.
     for (const precision of [0, -1, 1.5, Number.NaN, 1e10]) {
-      expect(() => divDecimal("1", "3", { precision })).toThrow(DecimalInexactError);
+      expect(() => divDecimal("1", "3", { precision })).toThrow(DecimalRangeError);
+      expect(() => divDecimal("1", "3", { precision })).not.toThrow(DecimalInexactError);
     }
   });
 });

@@ -159,6 +159,28 @@ value
   is boundary hygiene for a process that parses untrusted venue frames, not a
   venue fact; it is far above any real economic value.
 
+**Typed errors: class and code agree, and a bad argument is not an inexactness**
+(added 2026-08-26 by the Wave 0 closeout remediation, finding L9; defect fixes
+under this ADR, additive to the error union — no arithmetic result, canonical
+grammar, hash preimage, or golden digest changes):
+
+- `DecimalInexactError` / `DECIMAL_INEXACT` means a **result** could not be
+  represented exactly: a non-terminating quotient, a result past
+  `EXACT_PRECISION`, or a result longer than `MAX_DECIMAL_STRING_LENGTH`.
+- An out-of-range **argument** is reported separately. `divDecimal`'s `precision`
+  option must be an integer in `[1, EXACT_PRECISION]`; a violation raises
+  `DecimalRangeError` with the new code `DECIMAL_INVALID_PRECISION`. It
+  previously raised `DecimalInexactError`, which told the caller a false story
+  about what failed. `DecimalRangeError` therefore carries two codes and callers
+  branch on the code: `DECIMAL_OUT_OF_RANGE` is a fact about an economic value,
+  `DECIMAL_INVALID_PRECISION` is a caller-argument defect.
+- Every `InvalidTickSizeError` carries `DECIMAL_INVALID_TICK`. One internal
+  invariant guard in `tick.ts` carried `DECIMAL_INEXACT`, so a class-based and a
+  code-based observer would have disagreed about the same failure.
+- The class ↔ code pairing is written down in `packages/decimal/src/errors.ts`
+  and asserted for every reachable throw site in
+  `packages/decimal/src/errors.test.ts`.
+
 ### 6. Money rounding is *not* owned by `packages/decimal`
 
 Fee rounding, payout rounding, and tick-rounding **direction** are deliberately
@@ -198,6 +220,14 @@ Each cites the venue report; none is asserted on this ADR's own authority.
    adapter must map `""` to *absent* before the boundary. It must not pass `""`
    to the canonical parser and must not invent `"0"` in its place — an absent
    best bid is not a zero best bid.
+
+   The same division applies to `null`: where the SDK declares a field
+   `.nullish()`, the **adapter** accepts `null` and maps it to *absent* before
+   the boundary, and `packages/domain` stays strict — it never accepts `null`
+   for a venue-derived field
+   ([ADR-002](./ADR-002-event-envelope-and-ordering-semantics.md) §7 carries the
+   binding list). Absence and `null` are different facts on the wire; past the
+   boundary they are one fact — *absent*.
 2. **JSON-number decimals on Gamma.** Some Gamma reward fields legitimately
    arrive as JSON numbers on the raw wire while the SDK-parsed value a
    `@polymarket/client` consumer observes is always a decimal string; the SDK
