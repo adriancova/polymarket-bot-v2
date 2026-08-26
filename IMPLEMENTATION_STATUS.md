@@ -23,8 +23,10 @@ Maximum permitted run mode: `PAPER`
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
 | `WP-030`               | Complete | `WP-000` ✓, `WP-020` ✓ | Merged `59cf254` (impl chain `051bb62`→`1e30ff1`→`66d29a9`→`21a3370`) |
-| `WP-015`               | Ready (authorized) | `WP-030` ✓ | Unassigned — dependency-direction CI check (added at closeout) |
-| `WP-040`, `WP-050`, `WP-060` | Ready (authorized, Wave 1 batch 1A) | All ✓ | Unassigned |
+| `WP-015`               | In progress | `WP-030` ✓      | `wp-implementer` (worktree from `ff0c01e`) — dependency-direction CI check |
+| `WP-040`               | In progress | All ✓            | `wp-implementer` (worktree from `b1431e4`) |
+| `WP-050`               | In review (round 1) | All ✓    | `wp-implementer` on branch `worktree-agent-a8f55b87222d2953c` |
+| `WP-060`               | Ready (authorized, Wave 1 batch 1A) | All ✓ | Unassigned — start after a 1A merge slot frees |
 | `WP-070`, `WP-080`, `WP-090` | Ready (Wave 1 batch 1B — after 1A per runbook) | All ✓ | Unassigned |
 | `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
