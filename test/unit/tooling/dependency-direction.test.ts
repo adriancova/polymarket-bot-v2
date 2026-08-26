@@ -94,6 +94,8 @@ function runCheckerJson(root: string): CheckerJson {
 interface Mutations {
   /** Extra workspace dependencies: package directory → dependency name → specifier. */
   readonly addDependencies?: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  /** Extra `optionalDependencies`: package directory → dependency name → specifier. */
+  readonly addOptionalDependencies?: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /** Package directories whose manifest is removed from the fixture workspace. */
   readonly removePackages?: readonly string[];
   /** Brand-new workspace members: package directory → package name. */
@@ -171,6 +173,7 @@ function buildFixture(mutations: Mutations = {}): string {
       }
       return kept;
     };
+    const optional = mutations.addOptionalDependencies?.[posixDir];
     const manifest: Record<string, unknown> = {
       name: real.name,
       version: "0.0.0",
@@ -178,6 +181,7 @@ function buildFixture(mutations: Mutations = {}): string {
       type: "module",
       dependencies: { ...workspaceOnly(real.dependencies), ...(mutations.addDependencies?.[posixDir] ?? {}) },
       devDependencies: workspaceOnly(real.devDependencies),
+      ...(optional ? { optionalDependencies: optional } : {}),
     };
     writeFixtureFile(root, path.join(relative, "package.json"), `${JSON.stringify(manifest, null, 2)}\n`);
   }
@@ -455,6 +459,339 @@ describe("dependency-direction check on fixture graphs", () => {
     );
     expect(run.output).toContain("PASS");
     expect(run.status).toBe(0);
+  });
+});
+
+/**
+ * Round-1 review regressions. Each `it` here reproduces a probe the reviewer ran
+ * against commit `c668493` and records the behaviour that replaced it. See
+ * `docs/handoffs/WP-015.md` → "Review round 1".
+ */
+describe("dependency-direction check — round-1 review regressions", () => {
+  describe("HIGH: rule-3 scanner bypasses", () => {
+    it("catches a template-literal dynamic import specifier (HIGH a)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/leak.ts":
+              "export const f = async () => import(`node:fs`);\n",
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+      expect(run.output).toContain("packages/strategies/static-bracket/src/leak.ts:1");
+    });
+
+    it("catches a bare `Date()` clock read (HIGH b)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { "packages/strategies/static-bracket/src/leak.ts": "export const t = () => Date();\n" },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F11]");
+      expect(run.output).toContain("clock (`Date()`)");
+    });
+
+    it("does not report `new Date(<argument>)`, which is deterministic", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/ok.ts":
+              "export const at = (ms: number) => new Date(ms).toISOString();\n",
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("applies environment and network globals to a strategy (HIGH c)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/leak.ts": [
+              "export const mode = process.env.RUN_MODE;",
+              "export const go = async () => fetch('https://example.invalid');",
+              "export const t = () => Date();",
+              "export const g = globalThis;",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("process global (`process.*`)");
+      expect(run.output).toContain("network (`fetch()`)");
+      expect(run.output).toContain("process global (`globalThis`)");
+      expect(run.output).toContain("clock (`Date()`)");
+      // Environment and network are F3 (ADR-005 §1 I/O), the clock is F11.
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("FAIL [F11]");
+      expect(run.output).toContain("a strategy performs no I/O and reads no environment");
+    });
+
+    it("catches a filesystem library that never names `node:fs` (HIGH d)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/leak.ts":
+              'import fse from "fs-extra";\nexport const x = fse;\n',
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `fs-extra` (filesystem library)");
+    });
+
+    it("reports a dynamic import whose specifier is not statically readable", () => {
+      const interpolated = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/leak.ts":
+              "export const f = async (n: string) => import(`node:${n}`);\n",
+          },
+        }),
+      );
+      expect(interpolated.status).toBe(1);
+      expect(interpolated.output).toContain("FAIL [F-OPAQUE]");
+      expect(interpolated.output).toContain("an interpolated template literal");
+
+      const variable = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/leak.ts":
+              "export const f = async (n: string) => import(n);\n",
+          },
+        }),
+      );
+      expect(variable.status).toBe(1);
+      expect(variable.output).toContain("FAIL [F-OPAQUE]");
+      expect(variable.output).toContain("a non-literal expression");
+    });
+
+    it("permits an opaque dynamic import in a composition root, which is not purity-restricted", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { "apps/trader/src/plugin.ts": "export const f = async (n: string) => import(n);\n" },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+
+  describe("MEDIUM-1: graph completeness", () => {
+    it("treats `optionalDependencies` as a workspace edge", () => {
+      const run = runChecker(
+        buildFixture({
+          addOptionalDependencies: {
+            "packages/domain": { "@polymarket-bot/storage-postgres": "workspace:*" },
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F12]");
+      expect(run.output).toContain(
+        "upward edge `packages/domain` (layer 0) -> `packages/storage-postgres` (layer 2) via optionalDependencies",
+      );
+    });
+
+    it("reports a package that declares itself as a cycle (F9)", () => {
+      const run = runChecker(
+        buildFixture({ addDependencies: { "packages/oms": { "@polymarket-bot/oms": "workspace:*" } } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F9]");
+      expect(run.output).toContain("`packages/oms` declares itself as a dependency");
+      // Reported once, as a cycle — not additionally as an unlisted same-layer edge.
+      expect(run.output).not.toContain("FAIL [F13]");
+    });
+  });
+
+  describe("MEDIUM-2: literal contents are data, not code", () => {
+    it("does not report forbidden-looking text in strings, templates, or comments", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/data.ts": [
+              'export const a = `example from "node:fs"`;',
+              "export const b = `Math.random()`;",
+              'export const c = "Date.now()";',
+              "export const d = 'require(\"ioredis\")';",
+              'export const e = "@polymarket/clob-client";',
+              "// import { readFileSync } from \"node:fs\";",
+              '/* process.env.SECRET and import("node:child_process") */',
+              "export const f = /Math\\.random\\(/;",
+              "export const g = /[\"']/g;",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("still reports genuine imports in the same file as harmless look-alike text", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/mixed.ts": [
+              'const note = "this mentions node:fs and Math.random() harmlessly";',
+              'import { readFileSync } from "node:fs";',
+              'export { createClient } from "ioredis";',
+              "export const x = readFileSync.length + note.length;",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("packages/strategies/static-bracket/src/mixed.ts:2");
+      expect(run.output).toContain("FAIL [F8]");
+      expect(run.output).toContain("packages/strategies/static-bracket/src/mixed.ts:3");
+      // The look-alike text on line 1 is not a finding.
+      expect(run.output).not.toContain("src/mixed.ts:1");
+    });
+
+    it("still scans code inside a template literal's `${...}` interpolation", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/interp.ts":
+              "export const s = `seed=${Math.random()}`;\n",
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F11]");
+      expect(run.output).toContain("unseeded randomness (`Math.random()`)");
+    });
+
+    it("is not confused by a regular-expression literal containing quotes", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/regex.ts": [
+              "const quoteRe = /[\"']/g;",
+              "export const strip = (s: string) => s.replace(quoteRe, '');",
+              'import { readFileSync } from "node:fs";',
+              "export const r = readFileSync;",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("packages/strategies/static-bracket/src/regex.ts:3");
+    });
+  });
+
+  describe("LOW: the parsed contract is validated eagerly", () => {
+    it("fails on a §2.1 row whose edge cannot be parsed", () => {
+      const run = runChecker(
+        buildFixture({
+          patchContract: (contract) =>
+            contract.replace(
+              "| S2 | `packages/strategies/*` → `packages/strategy-sdk`",
+              "| S2 | `packages/strategies/*` PLUS `packages/strategy-sdk`",
+            ),
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [CHK]");
+      expect(run.output).toContain("does not state an edge as `from` → `to`");
+      expect(run.output).toContain("not silently skipped");
+    });
+
+    it("fails on a §2.1 row whose stated layer contradicts §2", () => {
+      const run = runChecker(
+        buildFixture({
+          patchContract: (contract) =>
+            contract.replace(
+              "| S1 | `packages/strategy-runtime` → `packages/strategy-sdk` | 1 |",
+              "| S1 | `packages/strategy-runtime` → `packages/strategy-sdk` | 2 |",
+            ),
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [CHK]");
+      expect(run.output).toContain('row "S1"');
+      expect(run.output).toContain("states layer 2, but §2 classifies its `from` endpoint");
+    });
+
+    it("fails on a §2.1 row naming a package §2 does not classify", () => {
+      const run = runChecker(
+        buildFixture({
+          patchContract: (contract) =>
+            contract.replace(
+              "| S1 | `packages/strategy-runtime` → `packages/strategy-sdk` | 1 |",
+              "| S1 | `packages/strategy-runtime` → `packages/nope-not-real` | 1 |",
+            ),
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [CHK]");
+      expect(run.output).toContain("`packages/nope-not-real`");
+      expect(run.output).toContain("§2 classifies no package or class matching it");
+    });
+
+    it("fails on a non-numeric §2.1 layer cell", () => {
+      const run = runChecker(
+        buildFixture({
+          patchContract: (contract) =>
+            contract.replace(
+              "| S0 | `packages/domain` → `packages/decimal` | 0 |",
+              "| S0 | `packages/domain` → `packages/decimal` | zero |",
+            ),
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [CHK]");
+      expect(run.output).toContain('has a non-numeric layer cell "zero"');
+      // The row is dropped rather than half-applied, so S0's edge now fails too.
+      expect(run.output).toContain("FAIL [F13]");
+    });
+
+    it("fails when §2 assigns the same package twice, even within one layer", () => {
+      const run = runChecker(
+        buildFixture({
+          patchContract: (contract) =>
+            contract.replace(
+              "packages/oms              packages/inventory",
+              "packages/oms              packages/inventory\npackages/oms",
+            ),
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [CHK]");
+      expect(run.output).toContain("lists `packages/oms` twice");
+      expect(run.output).toContain("no package appear twice");
+    });
+
+    it("still fails when §2 assigns the same package to two different layers", () => {
+      const run = runChecker(
+        buildFixture({
+          patchContract: (contract) =>
+            contract.replace(
+              "packages/storage-parquet     packages/event-bus",
+              "packages/storage-parquet     packages/event-bus\npackages/oms",
+            ),
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [CHK]");
+      expect(run.output).toContain("exactly one layer per package");
+    });
+
+    it("keeps the shipping contract valid under all of the above", () => {
+      const report = runCheckerJson(repoRoot);
+      expect(report.ok).toBe(true);
+      expect(report.allowlist.map((row) => row.id)).toEqual(["S0", "S1", "S2"]);
+      for (const row of report.allowlist) expect(row.layer).not.toBeNull();
+    });
   });
 });
 

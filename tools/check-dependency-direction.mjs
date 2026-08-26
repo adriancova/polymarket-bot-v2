@@ -21,12 +21,16 @@
  *   - §2.1 rows are Markdown table rows whose second cell contains
  *     "`<from>` → `<to>`"; the third cell is the layer.
  *
- * If a contract edit breaks that shape the check fails closed (packages become
- * unclassified, or the allowlist comes back empty), which is the intended
- * direction of failure: it never silently stops covering code.
+ * The parsed contract is validated **eagerly**, before any edge is evaluated:
+ * every §2.1 data row must parse into an edge, must carry a numeric layer, and
+ * must name packages/classes that §2 classifies at that same layer; no §2
+ * pattern may be assigned twice. A contract edit that breaks any of those is a
+ * `CHK` error, not a skipped row. That is what makes the parse fail *closed*
+ * rather than quietly shrinking coverage.
  *
  * Rules implemented (see `docs/contracts/dependency-direction.md` §3, §6):
- *   1. F9  — no cycle in the workspace dependency graph.
+ *   1. F9  — no cycle in the workspace dependency graph, including the
+ *      degenerate self-cycle of a package that declares itself.
  *   2. F12 — no edge from a lower-numbered layer to a higher-numbered one.
  *      F13 — a same-layer edge must be listed in §2.1.
  *      Fail closed on an unclassified workspace package, and on a named §2
@@ -34,6 +38,45 @@
  *   3. F1–F8, F11 — forbidden import specifiers and non-deterministic globals,
  *      scanned in package source (a bare `node:` import appears in no
  *      dependency list, so `package.json` cannot see it).
+ *
+ * Two non-contract rule ids appear in output alongside F1–F13:
+ *   - `F-CLOSED` — the §6 fail-closed bullets (classification/mirror).
+ *   - `F-OPAQUE` — a dynamic `import()` in a purity-restricted package whose
+ *     specifier is not a static literal (an interpolated template, a variable,
+ *     a concatenation). Such a specifier defeats static checking entirely, so
+ *     inside `packages/domain`, `packages/strategies/**`, `packages/ledger`,
+ *     and `packages/simulation` it is itself a finding rather than a silent
+ *     pass. Elsewhere it is allowed (composition roots legitimately load
+ *     modules by name); see `docs/handoffs/WP-015.md` for that trade-off.
+ *
+ * How source is read (this matters for both false negatives and false
+ * positives). `lexSource` runs one pass that tracks code / line comment /
+ * block comment / single- and double-quoted string / template literal /
+ * regular-expression literal, with `${...}` re-entering code so that
+ * `` `${Math.random()}` `` is still real code. It returns:
+ *   - `code`: the file with the *contents* of comments, strings, templates and
+ *     regex literals replaced by spaces, offsets and newlines preserved, so
+ *     reported line numbers match the original file. Global/identifier
+ *     patterns are matched against this, so prose or data that merely mentions
+ *     `node:fs` or `Math.random()` cannot trip the check.
+ *   - `literals`: every string/template literal with its span, its static
+ *     value (or `null` when interpolated), and whether it interpolates.
+ * Import specifiers are then taken from `literals` whose *preceding code*
+ * places them in specifier position (`from`, bare `import`, `import(`,
+ * `require(`). A specifier is therefore recognised in a template literal —
+ * `` import(`node:fs`) `` is caught — while the same text in an ordinary
+ * string is not a specifier and is not scanned.
+ *
+ * KNOWN LIMIT — the library catalogues below (`REDIS_CLIENTS`,
+ * `DATABASE_CLIENTS`, `VENUE_SDKS`, `SIGNER_LIBRARIES`, `NETWORK_LIBRARIES`,
+ * `FILESYSTEM_LIBRARIES`) are **enumerations, not classifications**. They name
+ * the packages known today; a filesystem, database, network or signing library
+ * that is not listed is not caught by rule 3. There is no mechanical way to
+ * decide "is this npm package a filesystem wrapper" from its name, so this is a
+ * floor, not a ceiling. The compensating controls are that adding any
+ * dependency to an owned package is a reviewed, lockfile-touching event
+ * (contract §7) and that a workspace edge to an adapter package is still caught
+ * by rule 2. Extend these lists when a new library enters the repository.
  *
  * No network, no credentials, no installed dependency: Node built-ins only.
  */
@@ -69,10 +112,17 @@ const SOURCE_EXTENSIONS = new Set([
   ".cjs",
 ]);
 
+/**
+ * Every manifest field that can declare a workspace edge. `optionalDependencies`
+ * is included because pnpm links it exactly like `dependencies`: an optional
+ * workspace dependency is a real edge and omitting the field let an upward edge
+ * through (WP-015 review round 1, MEDIUM-1).
+ */
 const DEPENDENCY_FIELDS = [
   "dependencies",
   "devDependencies",
   "peerDependencies",
+  "optionalDependencies",
 ];
 
 // ---------------------------------------------------------------------------
@@ -95,8 +145,13 @@ const ARCHIVED_CLIENTS = [
 /** F8: Redis clients. */
 const REDIS_CLIENTS = ["redis", "ioredis", "@redis/*", "redis-om", "node-redis"];
 
-/** F1/F3: PostgreSQL clients. */
-const POSTGRES_CLIENTS = [
+/**
+ * F1/F3: database clients. F1/F3 name PostgreSQL specifically; ADR-005 §1 says
+ * "database", so the wider set is used and any of them is a finding in a
+ * restricted package. Enumeration, not a classification — see the header's
+ * KNOWN LIMIT note.
+ */
+const DATABASE_CLIENTS = [
   "pg",
   "pg-native",
   "pg-promise",
@@ -104,6 +159,44 @@ const POSTGRES_CLIENTS = [
   "slonik",
   "@databases/pg",
   "@vercel/postgres",
+  "knex",
+  "sequelize",
+  "typeorm",
+  "drizzle-orm",
+  "@prisma/client",
+  "better-sqlite3",
+  "sqlite3",
+  "mysql",
+  "mysql2",
+  "mongodb",
+  "mongoose",
+];
+
+/**
+ * F3: filesystem access through a library rather than `node:fs`. ADR-005 §1
+ * forbids filesystem I/O, and `fs-extra`/`graceful-fs`/`chokidar` reach the
+ * filesystem without ever naming a `node:` builtin (WP-015 review round 1,
+ * HIGH(d)). Enumeration, not a classification — see the header's KNOWN LIMIT
+ * note.
+ */
+const FILESYSTEM_LIBRARIES = [
+  "fs-extra",
+  "graceful-fs",
+  "chokidar",
+  "memfs",
+  "glob",
+  "fast-glob",
+  "globby",
+  "rimraf",
+  "mkdirp",
+  "del",
+  "tmp",
+  "write-file-atomic",
+  "find-up",
+  "load-json-file",
+  "read-pkg",
+  "cpy",
+  "trash",
 ];
 
 /** F1/F3: venue/exchange SDKs reachable from npm. */
@@ -165,10 +258,21 @@ const IMPURE_BUILTINS = new Map([
   ["crypto", "randomness"],
 ]);
 
-/** F1 (process globals) / F11 (clock and unseeded randomness). */
+/**
+ * F1 (clock/randomness in `packages/domain`) / F11 (clock and unseeded
+ * randomness in a strategy). Matched against lexed code, so the same text in a
+ * comment or a string literal is not a hit.
+ *
+ * `Date` is read three ways and all three are here: `Date.now()`, `new Date()`
+ * with no argument, and a **bare `Date(...)` call**, which returns the current
+ * time as a string regardless of its arguments and was the gap the round-1
+ * review found (HIGH(b)). `new Date(<argument>)` is deliberately *not* matched:
+ * constructing a date from a value the caller already has is deterministic.
+ */
 const IMPURE_GLOBALS = [
   { pattern: /\bDate\s*\.\s*now\s*\(/g, what: "clock (`Date.now()`)" },
   { pattern: /new\s+Date\s*\(\s*\)/g, what: "clock (`new Date()`)" },
+  { pattern: /(?<![.$\w])(?<!\bnew\s{1,64})Date\s*\(/g, what: "clock (`Date()`)" },
   { pattern: /\bperformance\s*\.\s*now\s*\(/g, what: "clock (`performance.now()`)" },
   { pattern: /\bprocess\s*\.\s*hrtime\b/g, what: "clock (`process.hrtime`)" },
   { pattern: /\bMath\s*\.\s*random\s*\(/g, what: "unseeded randomness (`Math.random()`)" },
@@ -178,9 +282,26 @@ const IMPURE_GLOBALS = [
   },
 ];
 
+/** F1/F3: process and environment globals (ADR-005 §1 "environment"). */
 const PROCESS_GLOBALS = [
   { pattern: /\bprocess\s*\.\s*[A-Za-z_$]/g, what: "process global (`process.*`)" },
   { pattern: /\bglobalThis\b/g, what: "process global (`globalThis`)" },
+  { pattern: /\bimport\s*\.\s*meta\b/g, what: "module environment (`import.meta`)" },
+];
+
+/**
+ * F1/F3: network reachable through a global, with no import to catch
+ * (WP-015 review round 1, HIGH(c)). `node:http`, `node:https`, `node:net`,
+ * `node:tls`, `node:dgram` and `node:dns` have no global form — they can only
+ * be imported — so they are covered by `IMPURE_BUILTINS` above and are not
+ * repeated here.
+ */
+const NETWORK_GLOBALS = [
+  { pattern: /(?<![.$\w])fetch\s*\(/g, what: "network (`fetch()`)" },
+  { pattern: /(?<![.$\w])WebSocket\s*\(/g, what: "network (`WebSocket`)" },
+  { pattern: /(?<![.$\w])XMLHttpRequest\s*\(/g, what: "network (`XMLHttpRequest`)" },
+  { pattern: /(?<![.$\w])EventSource\s*\(/g, what: "network (`EventSource`)" },
+  { pattern: /\bnavigator\s*\.\s*sendBeacon\s*\(/g, what: "network (`navigator.sendBeacon()`)" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -355,13 +476,22 @@ function discoverPackages(rootDir, globs) {
 
 const PATH_TOKEN = /^(?:packages|apps)\/[A-Za-z0-9._*-]+(?:\/[A-Za-z0-9._*-]+)*$/;
 
-function splitTableRow(line) {
+function isTableSeparatorRow(line) {
   const trimmed = line.trim();
-  if (!trimmed.startsWith("|")) return null;
+  if (!trimmed.startsWith("|")) return false;
   const cells = trimmed.split("|").map((cell) => cell.trim());
   cells.shift();
   if (cells.length > 0 && cells[cells.length - 1] === "") cells.pop();
-  if (cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return null; // separator
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function splitTableRow(line) {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("|")) return null;
+  if (isTableSeparatorRow(line)) return null;
+  const cells = trimmed.split("|").map((cell) => cell.trim());
+  cells.shift();
+  if (cells.length > 0 && cells[cells.length - 1] === "") cells.pop();
   return cells;
 }
 
@@ -373,6 +503,7 @@ function parseContract(text) {
 
   let currentLayer = null;
   let inFence = false;
+  let pastAllowlistHeader = false;
 
   const sectionOf = (line) => {
     const layerHeading = line.match(/^###\s+Layer\s+(\d+)\b/);
@@ -391,6 +522,7 @@ function parseContract(text) {
       section = heading;
       currentLayer = heading.kind === "layer" ? heading.layer : null;
       inFence = false;
+      pastAllowlistHeader = false;
       continue;
     }
 
@@ -435,17 +567,38 @@ function parseContract(text) {
     }
 
     if (section.kind === "same-layer") {
+      // Every row after the header separator is a data row and MUST parse. A
+      // silently skipped row is a silently dropped allowlist entry, which is a
+      // fail-open hole (WP-015 review round 1, LOW).
+      if (isTableSeparatorRow(line)) {
+        pastAllowlistHeader = true;
+        continue;
+      }
       const cells = splitTableRow(line);
-      if (!cells || cells.length < 3) continue;
+      if (!cells) continue; // prose between/after the table
+      if (!pastAllowlistHeader) continue; // the header row itself
+      const rowLabel = `${CONTRACT_REL} §2.1 row at line ${index + 1}`;
+      if (cells.length < 3) {
+        problems.push(`${rowLabel} has ${cells.length} cell(s); an allowlist row needs "# | Edge | Layer | Basis".`);
+        continue;
+      }
       const [id, edgeCell, layerCell] = cells;
       const edge = edgeCell.match(/`([^`]+)`\s*(?:→|->)\s*`([^`]+)`/);
-      if (!edge) continue;
-      const layer = /^\d+$/.test(layerCell) ? Number(layerCell) : null;
+      if (!edge) {
+        problems.push(
+          `${rowLabel} ("${id.replace(/`/g, "")}") does not state an edge as \`from\` → \`to\`; the row cannot be applied and is not silently skipped.`,
+        );
+        continue;
+      }
+      if (!/^\d+$/.test(layerCell)) {
+        problems.push(`${rowLabel} ("${id.replace(/`/g, "")}") has a non-numeric layer cell "${layerCell}".`);
+        continue;
+      }
       sameLayerEdges.push({
         id: id.replace(/`/g, ""),
         from: edge[1],
         to: edge[2],
-        layer,
+        layer: Number(layerCell),
         line: index + 1,
       });
     }
@@ -458,16 +611,22 @@ function parseContract(text) {
     problems.push(`${CONTRACT_REL} §2.1: no permitted same-layer edge rows parsed.`);
   }
 
+  // §2: "Every workspace package belongs to exactly one layer. No package
+  // appears twice." A repeat is an error even when both rows agree on the
+  // layer, because a duplicate row is how the table drifts out of being a
+  // total, single-valued function (WP-015 review round 1, LOW).
   const byPattern = new Map();
   for (const assignment of assignments) {
     const existing = byPattern.get(assignment.pattern);
-    if (existing && existing.layer !== assignment.layer) {
+    if (existing) {
       problems.push(
-        `${CONTRACT_REL} §2 assigns \`${assignment.pattern}\` to layer ${existing.layer} (line ${existing.line}) and layer ${assignment.layer} (line ${assignment.line}); §2 requires exactly one layer per package.`,
+        existing.layer === assignment.layer
+          ? `${CONTRACT_REL} §2 lists \`${assignment.pattern}\` twice (lines ${existing.line} and ${assignment.line}), both in layer ${assignment.layer}; §2 requires that no package appear twice.`
+          : `${CONTRACT_REL} §2 assigns \`${assignment.pattern}\` to layer ${existing.layer} (line ${existing.line}) and layer ${assignment.layer} (line ${assignment.line}); §2 requires exactly one layer per package.`,
       );
       continue;
     }
-    if (!existing) byPattern.set(assignment.pattern, assignment);
+    byPattern.set(assignment.pattern, assignment);
   }
 
   const seenIds = new Set();
@@ -478,11 +637,60 @@ function parseContract(text) {
     seenIds.add(edge.id);
   }
 
+  // Cross-validate §2.1 against §2 now, not only when a live edge happens to
+  // match a row. A row naming an unclassified package, or stating a layer §2
+  // disagrees with, is a broken contract whether or not the repository
+  // currently declares that edge (WP-015 review round 1, LOW).
+  const resolved = [...byPattern.values()];
+  for (const edge of sameLayerEdges) {
+    for (const [role, token] of [
+      ["`from` endpoint", edge.from],
+      ["`to` endpoint", edge.to],
+    ]) {
+      const layers = layersForContractToken(token, resolved);
+      if (layers.length === 0) {
+        problems.push(
+          `${CONTRACT_REL} §2.1 row "${edge.id}" (line ${edge.line}) names \`${token}\` as its ${role}, but §2 classifies no package or class matching it.`,
+        );
+      } else if (layers.length > 1) {
+        problems.push(
+          `${CONTRACT_REL} §2.1 row "${edge.id}" (line ${edge.line}) names \`${token}\` as its ${role}, which §2 classifies in more than one layer (${layers.join(", ")}).`,
+        );
+      } else if (layers[0] !== edge.layer) {
+        problems.push(
+          `${CONTRACT_REL} §2.1 row "${edge.id}" (line ${edge.line}) states layer ${edge.layer}, but §2 classifies its ${role} \`${token}\` in layer ${layers[0]}.`,
+        );
+      }
+    }
+  }
+
   return {
-    assignments: [...byPattern.values()],
+    assignments: resolved,
     sameLayerEdges,
     problems,
   };
+}
+
+/**
+ * Resolves a §2.1 token — which may be a concrete path or a class glob such as
+ * `packages/strategies/*` — to the §2 layer(s) it denotes. A class token and a
+ * §2 class entry need not be written identically (§2 states the strategy class
+ * as `packages/strategies/**`, §2.1 as `packages/strategies/*`), so each is
+ * tested for coverage of the other.
+ */
+function layersForContractToken(token, assignments) {
+  const exact = assignments.filter((entry) => entry.pattern === token);
+  if (exact.length > 0) return [...new Set(exact.map((entry) => entry.layer))];
+  if (!isGlob(token)) {
+    const found = classify(token, assignments);
+    if (found === null) return [];
+    if (found.ambiguous) return [...new Set(found.ambiguous.map((entry) => entry.layer))];
+    return [found.layer];
+  }
+  const related = assignments.filter(
+    (entry) => matchesGlob(entry.pattern, token) || matchesGlob(token, entry.pattern),
+  );
+  return [...new Set(related.map((entry) => entry.layer))];
 }
 
 function classify(dir, assignments) {
@@ -500,61 +708,224 @@ function classify(dir, assignments) {
 // ---------------------------------------------------------------------------
 
 /**
- * Replaces comment bodies with spaces, preserving offsets and newlines, so that
- * prose such as "never import node:fs here" cannot trip the specifier scan and
- * reported line numbers still match the original file.
+ * Keywords after which a `/` starts a regular-expression literal rather than a
+ * division. Used with the previous significant character to disambiguate.
  */
-function stripComments(source) {
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  "return",
+  "typeof",
+  "instanceof",
+  "in",
+  "of",
+  "new",
+  "delete",
+  "void",
+  "throw",
+  "case",
+  "do",
+  "else",
+  "yield",
+  "await",
+]);
+
+function regexCanStartHere(previousChar, previousWord) {
+  if (previousChar === "") return true; // start of file
+  if (previousWord !== "" && REGEX_PRECEDING_KEYWORDS.has(previousWord)) return true;
+  if (/[\w$)\]]/.test(previousChar)) return false; // value ended -> division
+  return true;
+}
+
+/** Minimal unescaping, enough for module specifiers. */
+function unescapeLiteral(raw) {
+  return raw.replace(/\\(u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[\s\S])/g, (_all, code) => {
+    if (code.startsWith("u{")) return String.fromCodePoint(Number.parseInt(code.slice(2, -1), 16));
+    if (code.startsWith("u")) return String.fromCharCode(Number.parseInt(code.slice(1), 16));
+    if (code.startsWith("x")) return String.fromCharCode(Number.parseInt(code.slice(1), 16));
+    const simple = { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", "0": "\0" };
+    return Object.prototype.hasOwnProperty.call(simple, code) ? simple[code] : code;
+  });
+}
+
+/**
+ * Single-pass lexer over a source file.
+ *
+ * Returns `{ code, literals }` where `code` is the file with the *contents* of
+ * comments, string literals, template literals and regular-expression literals
+ * replaced by spaces — offsets and newlines preserved, so a match's line number
+ * in `code` is its line number in the original file — and `literals` is every
+ * string/template literal with its span and static value.
+ *
+ * Blanking literal contents is what stops `` const a = `from "node:fs"` `` and
+ * `` `Math.random()` `` from being reported as F3/F11 findings (WP-015 review
+ * round 1, MEDIUM-2). Import specifiers are not lost by this, because they are
+ * recovered from `literals` rather than from `code` (see `specifiersFrom`).
+ *
+ * A template's `${...}` sections re-enter code state, so interpolated
+ * expressions are still scanned: `` `${Math.random()}` `` is a real clock/RNG
+ * read and is still caught.
+ */
+function lexSource(source) {
   const out = source.split("");
-  let state = "code";
-  for (let i = 0; i < source.length; i += 1) {
+  const literals = [];
+  /** Context stack; `${` inside a template pushes a fresh code context. */
+  const stack = [{ kind: "code", brace: 0 }];
+  let previousChar = "";
+  let previousWord = "";
+  let wordOpen = false;
+
+  const blank = (index) => {
+    if (source[index] !== "\n") out[index] = " ";
+  };
+
+  let i = 0;
+  while (i < source.length) {
+    const context = stack[stack.length - 1];
     const char = source[i];
     const next = source[i + 1];
-    switch (state) {
-      case "code":
-        if (char === "/" && next === "/") {
-          out[i] = " ";
-          out[i + 1] = " ";
-          i += 1;
-          state = "line-comment";
-        } else if (char === "/" && next === "*") {
-          out[i] = " ";
-          out[i + 1] = " ";
-          i += 1;
-          state = "block-comment";
-        } else if (char === '"') state = "double";
-        else if (char === "'") state = "single";
-        else if (char === "`") state = "template";
-        break;
-      case "line-comment":
-        if (char === "\n") state = "code";
-        else out[i] = " ";
-        break;
-      case "block-comment":
-        if (char === "*" && next === "/") {
-          out[i] = " ";
-          out[i + 1] = " ";
-          i += 1;
-          state = "code";
-        } else if (char !== "\n") out[i] = " ";
-        break;
-      case "double":
-      case "single":
-      case "template": {
-        if (char === "\\") {
-          i += 1;
+
+    if (context.kind === "template") {
+      if (char === "\\") {
+        blank(i);
+        if (i + 1 < source.length) blank(i + 1);
+        i += 2;
+        continue;
+      }
+      if (char === "$" && next === "{") {
+        context.interpolated = true;
+        stack.push({ kind: "code", brace: 0 });
+        i += 2;
+        continue;
+      }
+      if (char === "`") {
+        stack.pop();
+        literals.push({
+          start: context.start,
+          end: i,
+          kind: "template",
+          interpolated: context.interpolated,
+          value: context.interpolated ? null : unescapeLiteral(source.slice(context.start + 1, i)),
+        });
+        previousChar = "`";
+        previousWord = "";
+        wordOpen = false;
+        i += 1;
+        continue;
+      }
+      blank(i);
+      i += 1;
+      continue;
+    }
+
+    // context.kind === "code"
+    if (char === "/" && next === "/") {
+      while (i < source.length && source[i] !== "\n") {
+        out[i] = " ";
+        i += 1;
+      }
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      out[i] = " ";
+      out[i + 1] = " ";
+      i += 2;
+      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) {
+        blank(i);
+        i += 1;
+      }
+      if (i < source.length) {
+        out[i] = " ";
+        out[i + 1] = " ";
+        i += 2;
+      }
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      const start = i;
+      i += 1;
+      while (i < source.length) {
+        if (source[i] === "\\") {
+          blank(i);
+          if (i + 1 < source.length) blank(i + 1);
+          i += 2;
+          continue;
+        }
+        if (source[i] === char || source[i] === "\n") break;
+        blank(i);
+        i += 1;
+      }
+      const closed = i < source.length && source[i] === char;
+      literals.push({
+        start,
+        end: closed ? i : i - 1,
+        kind: "string",
+        interpolated: false,
+        value: unescapeLiteral(source.slice(start + 1, i)),
+      });
+      if (closed) i += 1;
+      previousChar = char;
+      previousWord = "";
+      wordOpen = false;
+      continue;
+    }
+    if (char === "`") {
+      stack.push({ kind: "template", start: i, interpolated: false });
+      i += 1;
+      continue;
+    }
+    if (char === "/" && regexCanStartHere(previousChar, previousWord)) {
+      // Regex literals cannot span a line. If no unescaped `/` closes on this
+      // line, treat the character as division and blank nothing: that keeps a
+      // misjudged `/` from swallowing code (which would fail open).
+      let j = i + 1;
+      let inClass = false;
+      let closedAt = -1;
+      while (j < source.length && source[j] !== "\n") {
+        if (source[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (source[j] === "[") inClass = true;
+        else if (source[j] === "]") inClass = false;
+        else if (source[j] === "/" && !inClass) {
+          closedAt = j;
           break;
         }
-        if (state === "double" && char === '"') state = "code";
-        else if (state === "single" && char === "'") state = "code";
-        else if (state === "template" && char === "`") state = "code";
-        break;
+        j += 1;
       }
-      default:
-        break;
+      if (closedAt > 0) {
+        for (let k = i + 1; k < closedAt; k += 1) blank(k);
+        i = closedAt + 1;
+        while (i < source.length && /[dgimsuvy]/.test(source[i])) i += 1; // flags
+        previousChar = "/";
+        previousWord = "";
+        wordOpen = false;
+        continue;
+      }
     }
+    if (char === "{") context.brace += 1;
+    else if (char === "}") {
+      if (context.brace === 0 && stack.length > 1) {
+        stack.pop(); // close a template's `${ ... }` and resume the template
+        i += 1;
+        continue;
+      }
+      context.brace -= 1;
+    }
+    if (/\s/.test(char)) {
+      wordOpen = false; // the identifier ended but is still the previous word
+    } else if (/[\w$]/.test(char)) {
+      previousWord = wordOpen ? previousWord + char : char;
+      wordOpen = true;
+      previousChar = char;
+    } else {
+      previousWord = "";
+      wordOpen = false;
+      previousChar = char;
+    }
+    i += 1;
   }
-  return out.join("");
+
+  return { code: out.join(""), literals };
 }
 
 function lineStarts(source) {
@@ -576,12 +947,34 @@ function lineNumberAt(starts, offset) {
   return low + 1;
 }
 
-const SPECIFIER_PATTERNS = [
-  /\bfrom\s*["']([^"'\n]+)["']/g,
-  /\bimport\s*\(\s*["']([^"'\n]+)["']\s*\)/g,
-  /\brequire\s*\(\s*["']([^"'\n]+)["']\s*\)/g,
-  /(?:^|[;{}])\s*import\s+["']([^"'\n]+)["']/g,
+/**
+ * A literal is a module specifier when the code immediately before it is one of
+ * these forms. Matching on the *preceding* code (rather than on the literal's
+ * own text) is what lets a template literal be a specifier —
+ * `` import(`node:fs`) `` is caught (WP-015 review round 1, HIGH(a)) — while an
+ * identical-looking template elsewhere in the file is left alone (MEDIUM-2).
+ *
+ * `from` covers `import … from`, `import type … from` and `export … from`;
+ * `require` covers both CommonJS and TypeScript's `import x = require(…)`.
+ */
+const SPECIFIER_CONTEXTS = [
+  /\bfrom\s*$/,
+  /(?<![.$\w])import\s*\(\s*$/,
+  /(?<![.$\w])require\s*\(\s*$/,
+  /(?<![.$\w])import\s*$/,
 ];
+
+/** How far back to look for the specifier context. */
+const SPECIFIER_LOOKBEHIND = 96;
+
+/**
+ * A dynamic `import(` whose argument is not a static literal. `import` is a
+ * reserved word, so `import(` is unambiguously a dynamic import — unlike
+ * `require(`, which may be any function (`packages/domain`'s schema registry
+ * has a `require(eventType, schemaVersion)` method), and which is therefore
+ * deliberately not matched here.
+ */
+const DYNAMIC_IMPORT_CALL = /(?<![.$\w])import\s*\(\s*/g;
 
 function collectSourceFiles(rootDir, packageDir) {
   const files = [];
@@ -601,28 +994,42 @@ function collectSourceFiles(rootDir, packageDir) {
   return files.sort();
 }
 
+function isSpecifierPosition(code, literalStart) {
+  const prefix = code.slice(Math.max(0, literalStart - SPECIFIER_LOOKBEHIND), literalStart);
+  return SPECIFIER_CONTEXTS.some((pattern) => pattern.test(prefix));
+}
+
 function scanSourceFile(rootDir, fileRel) {
   const raw = readFileSync(path.join(rootDir, fileRel), "utf8");
-  const code = stripComments(raw);
+  const { code, literals } = lexSource(raw);
   const starts = lineStarts(raw);
+
   const specifiers = [];
-  const seen = new Set();
-  for (const pattern of SPECIFIER_PATTERNS) {
-    pattern.lastIndex = 0;
-    let match = pattern.exec(code);
-    while (match !== null) {
-      const key = `${match.index}:${match[1]}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        specifiers.push({
-          specifier: match[1],
-          line: lineNumberAt(starts, match.index),
-        });
-      }
-      match = pattern.exec(code);
-    }
+  const literalStarts = new Map();
+  for (const literal of literals) {
+    literalStarts.set(literal.start, literal);
+    if (!isSpecifierPosition(code, literal.start)) continue;
+    if (literal.interpolated || literal.value === null) continue; // reported below
+    specifiers.push({ specifier: literal.value, line: lineNumberAt(starts, literal.start) });
   }
-  return { code, starts, specifiers };
+
+  // Dynamic imports whose specifier is not statically knowable.
+  const opaqueImports = [];
+  DYNAMIC_IMPORT_CALL.lastIndex = 0;
+  let call = DYNAMIC_IMPORT_CALL.exec(code);
+  while (call !== null) {
+    const argumentStart = call.index + call[0].length;
+    const literal = literalStarts.get(argumentStart);
+    if (!literal || literal.interpolated || literal.value === null) {
+      opaqueImports.push({
+        line: lineNumberAt(starts, call.index),
+        form: literal?.interpolated ? "an interpolated template literal" : "a non-literal expression",
+      });
+    }
+    call = DYNAMIC_IMPORT_CALL.exec(code);
+  }
+
+  return { code, starts, specifiers, opaqueImports };
 }
 
 function findGlobals(scan, catalogue) {
@@ -795,7 +1202,10 @@ function runCheck(rootDir) {
         }
         continue;
       }
-      if (target.dir === pkg.dir) continue;
+      // A package that declares itself is a self-cycle. It used to be
+      // discarded here; §5.2 says "Circular package dependencies fail CI" and a
+      // one-node cycle is a cycle, so the edge is kept and rule 1 reports it
+      // (WP-015 review round 1, MEDIUM-1).
       edges.push({
         from: pkg.dir,
         to: target.dir,
@@ -809,18 +1219,24 @@ function runCheck(rootDir) {
 
   // ---- rule 1: cycles (F9) ------------------------------------------------
   for (const cycle of findCycles([...dirs], edges)) {
+    const isSelf = cycle.length === 2 && cycle[0] === cycle[1];
     push({
       rule: "F9",
       subject: cycle[0],
-      message: `circular package dependency: ${cycle.join(" -> ")}`,
+      message: isSelf
+        ? `circular package dependency: \`${cycle[0]}\` declares itself as a dependency`
+        : `circular package dependency: ${cycle.join(" -> ")}`,
       doc: `${CONTRACT_REL} §3 (F9), §6 rule 1; handoff §5.2 ("Circular package dependencies fail CI")`,
-      fix: "break the cycle by extracting the shared code into a lower layer",
+      fix: isSelf
+        ? "remove the self-referential dependency entry from the package manifest"
+        : "break the cycle by extracting the shared code into a lower layer",
     });
   }
 
   // ---- rule 2: layer conformance (F12, F13) -------------------------------
   const allowlist = contract.sameLayerEdges;
   for (const edge of edges) {
+    if (edge.from === edge.to) continue; // reported as a self-cycle by rule 1
     const fromLayer = layerOf.get(edge.from);
     const toLayer = layerOf.get(edge.to);
     if (fromLayer === undefined || toLayer === undefined) continue; // already reported
@@ -878,6 +1294,8 @@ function runCheck(rootDir) {
     const isSimulation = pkg.dir === "packages/simulation";
     const isSecureAdapter = pkg.dir === "packages/polymarket-secure";
     const isEventBus = pkg.dir === "packages/event-bus";
+    /** Packages carrying a package-scoped purity rule (F1/F2, F3/F11, F4, F5). */
+    const isPurityRestricted = isDomain || isStrategy || isLedger || isSimulation;
 
     for (const fileRel of collectSourceFiles(rootDir, pkg.dir)) {
       const scan = scanSourceFile(rootDir, fileRel);
@@ -968,9 +1386,10 @@ function runCheck(rootDir) {
           } else {
             const forbidden =
               specifierMatchesAny(specifier, VENUE_SDKS) ??
-              specifierMatchesAny(specifier, POSTGRES_CLIENTS) ??
+              specifierMatchesAny(specifier, DATABASE_CLIENTS) ??
               specifierMatchesAny(specifier, REDIS_CLIENTS) ??
-              specifierMatchesAny(specifier, NETWORK_LIBRARIES);
+              specifierMatchesAny(specifier, NETWORK_LIBRARIES) ??
+              specifierMatchesAny(specifier, FILESYSTEM_LIBRARIES);
             if (forbidden) {
               push({
                 rule: "F1",
@@ -992,8 +1411,10 @@ function runCheck(rootDir) {
             if (impure) reason = `${impure} built-in`;
           } else if (specifierMatchesAny(specifier, VENUE_SDKS)) reason = "venue client";
           else if (specifierMatchesAny(specifier, REDIS_CLIENTS)) reason = "Redis client";
-          else if (specifierMatchesAny(specifier, POSTGRES_CLIENTS)) reason = "PostgreSQL client";
+          else if (specifierMatchesAny(specifier, DATABASE_CLIENTS)) reason = "database client";
           else if (specifierMatchesAny(specifier, NETWORK_LIBRARIES)) reason = "network client";
+          else if (specifierMatchesAny(specifier, FILESYSTEM_LIBRARIES)) reason = "filesystem library";
+          else if (specifierMatchesAny(specifier, SIGNER_LIBRARIES)) reason = "signing library";
           else if (targetLayer !== undefined && targetLayer >= 2) reason = "adapter/infrastructure package";
           if (reason) {
             push({
@@ -1049,11 +1470,26 @@ function runCheck(rootDir) {
             fix: "take the value from StrategyContext so replay stays deterministic",
           });
         }
+        // F3 — ADR-005 §1's list is "network, database, filesystem,
+        // environment, global clock, or unseeded randomness". The clock and
+        // randomness halves are F11 above; environment and network are reachable
+        // through globals with no import to catch, so they are scanned here
+        // (WP-015 review round 1, HIGH(c)).
+        for (const hit of findGlobals(scan, [...PROCESS_GLOBALS, ...NETWORK_GLOBALS])) {
+          push({
+            rule: "F3",
+            subject: pkg.dir,
+            location: `${fileRel}:${hit.line}`,
+            message: `reads ${hit.what}; a strategy performs no I/O and reads no environment`,
+            doc: `${CONTRACT_REL} §3 (F3); handoff §5.2, §6 invariant 2; ADR-005 §1`,
+            fix: "receive the fact through a feature (§9.5) or a StrategyContext view (§7.6)",
+          });
+        }
       }
 
       // F1 — packages/domain may not touch a process global, clock, or randomness.
       if (isDomain) {
-        for (const hit of findGlobals(scan, [...PROCESS_GLOBALS, ...IMPURE_GLOBALS])) {
+        for (const hit of findGlobals(scan, [...PROCESS_GLOBALS, ...IMPURE_GLOBALS, ...NETWORK_GLOBALS])) {
           push({
             rule: "F1",
             subject: pkg.dir,
@@ -1061,6 +1497,22 @@ function runCheck(rootDir) {
             message: `reads ${hit.what}; \`packages/domain\` is pure contract code`,
             doc: `${CONTRACT_REL} §3 (F1); docs/contracts/domain.md §2`,
             fix: "pass the value in as a boundary-typed argument",
+          });
+        }
+      }
+
+      // F-OPAQUE — a dynamic import a static check cannot read. Restricted to
+      // the packages whose whole point is a purity constraint; elsewhere a
+      // composition root may legitimately load a module by computed name.
+      if (isPurityRestricted) {
+        for (const hit of scan.opaqueImports) {
+          push({
+            rule: "F-OPAQUE",
+            subject: pkg.dir,
+            location: `${fileRel}:${hit.line}`,
+            message: `uses a dynamic \`import()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the imported module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
+            doc: `${CONTRACT_REL} §6 rule 3; ADR-005 §1`,
+            fix: "import the module statically, or receive the capability through StrategyContext/a constructor argument",
           });
         }
       }
@@ -1112,7 +1564,8 @@ function formatReport(result, rootDir) {
 
   if (result.violations.length === 0) {
     lines.push("PASS: no cycle (F9), no upward edge (F12), no unlisted same-layer edge (F13),");
-    lines.push("      no forbidden import specifier (F1-F8, F11), every workspace package classified.");
+    lines.push("      no forbidden import specifier or impure global (F1-F8, F11), no opaque");
+    lines.push("      dynamic import in a restricted package, every workspace package classified.");
     return `${lines.join("\n")}\n`;
   }
 
@@ -1152,11 +1605,15 @@ function parseArgs(argv) {
 const USAGE = `Usage: node tools/check-dependency-direction.mjs [--root <dir>] [--json]
 
 Enforces docs/contracts/dependency-direction.md §6:
-  F9        no circular workspace dependency
+  F9        no circular workspace dependency (including a self-cycle)
   F12/F13   no upward edge; same-layer edges only when listed in §2.1
   F1-F8,F11 no forbidden import specifier or non-deterministic global
-Fails closed on an unclassified workspace package and on a §2 entry with no
-manifest. Exits 0 when clean, 1 on any violation, 2 on a usage error.
+  F-CLOSED  §6 fail-closed: unclassified package, or §2 entry with no manifest
+  F-OPAQUE  no dynamic import() with a non-static specifier in a package whose
+            purity is constrained (domain, strategies, ledger, simulation)
+The §2 layer table and the §2.1 allowlist are parsed from the contract and
+validated eagerly; an unparseable or inconsistent row is a CHK error, not a
+skipped row. Exits 0 when clean, 1 on any violation, 2 on a usage error.
 `;
 
 function main() {
