@@ -19,7 +19,7 @@ Maximum permitted run mode: `PAPER`
 
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
-| `WP-000`               | In review (round 5) | None    | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
+| `WP-000`               | In remediation (round 5) | None | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
 | `WP-030`               | Blocked  | `WP-000` ✗, `WP-020` ✓ | —      |
@@ -176,8 +176,18 @@ Maximum permitted run mode: `PAPER`
   §7.1; deliberate scope extension (`rewardsMinSize` → decimal-string) and
   deliberate relaxation (`assetAddress` narrowing removed per page + SDK) flagged
   for review; `conditionId` narrowing kept and marked. 279/279 tests; orchestrator
-  fast-forwarded and reproduced gates. Review round 5 (candidate `ac85ab6` vs
-  `7faf30f`) dispatched 2026-08-26 — verdict pending. Not merged.
+  fast-forwarded and reproduced gates. Review round 5 (Codex session
+  `01a03d55-0eb7-7780-9ccf-96959244dd25`, candidate `ac85ab6` vs `7faf30f`):
+  **CHANGES REQUIRED** — 0 blocker, 1 high (`validateObjectSpec` treats `optional`
+  as implying nullable, so `filters: null`, `transactionsHashes: null`,
+  `tradeIDs: null`, book `hash: null` all pass undocumented), 2 medium (strict
+  reward schema omits official `holdingRewardsEnabled?: boolean|null`; report
+  §7.1/§16 outside the per-section citation gate), 1 low (conditionId narrowing —
+  accepted as residual for the frozen snapshot). All round-4 items otherwise
+  RESOLVED; all round-4b judgment calls ACCEPTED (filters test replacement,
+  SDK-parsed reward layer, rewardsMinSize extension, assetAddress relaxation,
+  key-required snapshot strictness). Remediation round 5 dispatched 2026-08-26.
+  Not merged.
 
 ### WP-000 in-flight record (2026-08-24)
 
