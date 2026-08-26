@@ -3,7 +3,7 @@
   "source": "https://docs.polymarket.com/trading/positions/manage",
   "retrieved": "2026-08-24",
   "sanitized": true,
-  "notes": "CTF position operations per the official positions-management page: split (pUSD -> complete outcome-token set), merge (balanced set -> pUSD), redeem (winning tokens -> pUSD after resolution). Contract addresses are the PUBLIC Polygon addresses published on the source page (public on-chain addresses, not credentials). On-chain functions splitPosition/mergePositions/redeemPositions share the parameter pattern (collateralToken, parentCollectionId, conditionId, partition|indexSets, amount). SDK methods splitPosition()/mergePositions()/redeemPositions() return a TransactionOutcome with transactionHash and transactionId. Transaction hashes/ids in examples are synthetic. Additional source: https://docs.polymarket.com/trading/ctf/overview (position-id derivation, neg-risk conversion).",
+  "notes": "CTF position operations per the official positions-management page: split (pUSD -> complete outcome-token set), merge (balanced set -> pUSD), redeem (winning tokens -> pUSD after resolution). Contract addresses are the PUBLIC Polygon addresses published on the source page (public on-chain addresses, not credentials). On-chain functions splitPosition/mergePositions/redeemPositions share the parameter pattern (collateralToken, parentCollectionId, conditionId, partition|indexSets, amount). SDK methods splitPosition()/mergePositions()/redeemPositions() return a TransactionOutcome awaited via transaction.wait(); the official page types it as outcome.transactionHash: TxHash and outcome.transactionId: TransactionId | null (Python: outcome.transaction_id: str | None), so transactionId MAY BE NULL and a consumer must not assume a relayer id exists (re-verified 2026-08-26; the 'redeem-outcome-null-transaction-id' example freezes the null form). Transaction hashes/ids in examples are synthetic. Additional source: https://docs.polymarket.com/trading/ctf/overview (position-id derivation, neg-risk conversion).",
   "examples": [
     {
       "name": "contract-addresses-polygon-snapshot",
@@ -72,6 +72,24 @@
         "transaction_outcome": {
           "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000503",
           "transactionId": "sanitized-transaction-id-0503"
+        }
+      }
+    },
+    {
+      "name": "redeem-outcome-null-transaction-id",
+      "payload": {
+        "operation": "redeem",
+        "description": "Redeem whose TransactionOutcome carries a null transactionId; the official page types it as TransactionId | null, so a consumer must not assume a relayer id exists.",
+        "onchain_function": "redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)",
+        "request": {
+          "collateralToken": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+          "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "conditionId": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+          "indexSets": [1]
+        },
+        "transaction_outcome": {
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000504",
+          "transactionId": null
         }
       }
     },

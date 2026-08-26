@@ -150,24 +150,51 @@ const OFFICIAL_SOURCE_PREFIXES = [
 ] as const;
 
 /**
- * Credential/secret-shaped key names matched exactly after normalization
- * (lowercase alphanumerics only), so `POLY_API_KEY`, `Poly-Api-Key`, and
- * `polyApiKey` all normalize to `polyapikey`.
+ * Documented Polymarket credential, auth-header, and builder-attribution
+ * names, each with the official page that documents it and the access date.
  *
- * Covers the credential and auth-header names documented by Polymarket
- * (retrieved 2026-08-26):
- * - `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`
- *   (https://docs.polymarket.com/quickstart)
- * - `POLY_ADDRESS`, `POLY_API_KEY`, `POLY_PASSPHRASE`, `POLY_SIGNATURE`,
- *   `POLY_TIMESTAMP`, `POLY_BUILDER_API_KEY`, `POLY_BUILDER_PASSPHRASE`,
- *   `POLY_BUILDER_SIGNATURE`, `POLY_BUILDER_TIMESTAMP`,
- *   `POLYMARKET_BUILDER_CODE` (https://docs.polymarket.com/builders/api-keys)
+ * SECRET MATERIAL — never permitted in a fixture except as a sanitized
+ * placeholder, and never loaded by this repository:
+ * - `POLYMARKET_PRIVATE_KEY` (signer private key)
+ *   https://docs.polymarket.com/trading/quickstart and
+ *   https://docs.polymarket.com/getting-started/migrate-from-previous-sdks
+ *   (both accessed 2026-08-26)
+ * - `SIGNER_PRIVATE_KEY` (signer private key, raw-API examples)
+ *   https://docs.polymarket.com/trading/place-orders (accessed 2026-08-26)
+ * - `POLYMARKET_BUILDER_API_KEY`, `POLYMARKET_BUILDER_SECRET`,
+ *   `POLYMARKET_BUILDER_PASSPHRASE` (builder API key triple, passed to
+ *   `builderApiKey({ key, secret, passphrase })`)
+ *   https://docs.polymarket.com/getting-started/migrate-from-previous-sdks
+ *   (accessed 2026-08-26)
+ * - `POLY_API_KEY`, `POLY_PASSPHRASE`, `POLY_SIGNATURE` (CLOB L2 auth headers)
+ *   https://docs.polymarket.com/trading/place-orders (accessed 2026-08-26)
+ * - `POLY_BUILDER_API_KEY`, `POLY_BUILDER_PASSPHRASE`,
+ *   `POLY_BUILDER_SIGNATURE`, `POLY_BUILDER_TIMESTAMP` (builder auth headers)
+ *   https://docs.polymarket.com/api-reference/relayer/submit-a-transaction
+ *   (accessed 2026-08-26)
  *
- * plus generic secret shapes and the user-stream owner/API-key fields.
+ * ACCOUNT-IDENTIFYING but not secret — still scanned, because a fixture must
+ * not carry a real account identity:
+ * - `POLYMARKET_WALLET_ADDRESS`
+ *   https://docs.polymarket.com/trading/quickstart and the migration page
+ *   (accessed 2026-08-26)
+ * - `POLY_ADDRESS`, `POLY_TIMESTAMP` (L2 header components)
+ *   https://docs.polymarket.com/trading/place-orders (accessed 2026-08-26)
+ *
+ * PUBLIC BUILDER ATTRIBUTION — not secret material; it is a public builder
+ * profile identifier sent alongside an order as `builderCode`. It is scanned
+ * anyway so that a fixture cannot embed a real builder's attribution value:
+ * - `POLYMARKET_BUILDER_CODE`
+ *   https://docs.polymarket.com/trading/place-orders (accessed 2026-08-26;
+ *   the same page is currently also served at
+ *   https://docs.polymarket.com/builders/api-keys, which does NOT document
+ *   the `POLY_BUILDER_*` headers — see report §16).
+ *
+ * Exact matches below are compared after normalization (lowercase
+ * alphanumerics only), so `POLY_API_KEY`, `Poly-Api-Key`, and `polyApiKey`
+ * all normalize to `polyapikey`.
  */
 const CREDENTIAL_KEYS_NORMALIZED: readonly string[] = [
-  "secret",
-  "clientsecret",
   "signedorder",
   "signedpayload",
   "seed",
@@ -188,15 +215,15 @@ const CREDENTIAL_KEYS_NORMALIZED: readonly string[] = [
  * enumerating every spelling: `POLYMARKET_PRIVATE_KEY`, `SIGNER_PRIVATE_KEY`,
  * and any other `*_PRIVATE_KEY` all contain `privatekey`;
  * `POLY_BUILDER_API_KEY`, `POLYMARKET_BUILDER_API_KEY`, and `builderApiKey`
- * all contain `apikey`.
+ * all contain `apikey`; `POLYMARKET_BUILDER_SECRET`, `POLYMARKET_API_SECRET`,
+ * `clientSecret`, and `secretKey` all contain `secret`.
  */
 const CREDENTIAL_KEY_PATTERNS: readonly string[] = [
   "apikey",
-  "apisecret",
+  "secret",
   "privatekey",
   "privkey",
   "passphrase",
-  "secretkey",
   "signature",
   "buildercode",
   "mnemonic",
@@ -482,10 +509,30 @@ function validateObjectSpec(
     }
     const entry = value[key];
     if (spec.values !== undefined) {
-      if (entry === null || entry === undefined) {
+      const valueSpec = spec.values;
+      const entryPath = `${path}.${key}`;
+      // Every map entry is validated against the declared value spec,
+      // including `null`/`undefined`. Skipping them (as an earlier revision
+      // did) let a map declared as decimals, integers, dual-limit objects, or
+      // EVM addresses silently accept `null`. A map value may be `null` only
+      // where its spec explicitly says so.
+      if (entry === null) {
+        if (valueSpec.nullable !== true) {
+          errors.push(
+            `${entryPath}: null is not an accepted value (map value spec does not declare nullable)`,
+          );
+        }
         continue;
       }
-      validateField(entry, spec.values, `${path}.${key}`, errors);
+      if (entry === undefined) {
+        if (valueSpec.optional !== true) {
+          errors.push(
+            `${entryPath}: undefined is not an accepted value (map value spec does not declare optional)`,
+          );
+        }
+        continue;
+      }
+      validateField(entry, valueSpec, entryPath, errors);
       continue;
     }
     if (spec.strict === true) {

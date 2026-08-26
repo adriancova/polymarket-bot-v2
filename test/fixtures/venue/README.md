@@ -98,8 +98,28 @@ Wire-type conventions preserved by these fixtures and enforced by
 - `orders/rest-trades.json` follows `ClobTradeSchema`/`MakerOrderSchema`
   (every field required; no `outcome_index` on REST maker orders), which is
   a different contract from the websocket trade event.
+
+  **These examples are SYNTHETIC COMPLETED PLACEHOLDERS, not captured
+  official responses.** The documentation does not publish a full REST trade
+  body, so the examples were *completed* field-by-field to satisfy every
+  field `ClobTradeSchema` marks required. The added values (all-zero
+  transaction hashes, the all-zero maker address, `bucket_index: 0`, the
+  epoch-second `match_time`/`last_update`) are placeholders chosen only to
+  satisfy the SDK's declared types. They assert nothing about what the venue
+  really returns — in particular nothing about a not-yet-broadcast trade —
+  and must never be cited as an observed venue response.
 - All decimal strings are canonical per handoff §7.3 (no trailing
   fractional zeros): a documented 20% is recorded as `"0.2"`.
+
+  **Canonicalized decimals are normalized data, not raw wire capture.** The
+  fee and reward strings in `fees/fee-reward-parameters.json` were rewritten
+  into canonical form from the values printed in the documentation, so they
+  are evidence of the *numeric values* only. They CANNOT prove which raw
+  lexeme the venue actually emits (for example `"0.20"` versus `"0.2"`, or a
+  JSON number versus a string). No consumer may cite these fixtures as
+  wire-format evidence. A future raw-wire capture must preserve the venue's
+  original strings verbatim, in a separate fixture that is explicitly marked
+  as un-normalized, before any wire-lexeme claim is made.
 
 ## Caveats
 

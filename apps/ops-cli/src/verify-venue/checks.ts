@@ -312,7 +312,13 @@ const FEES_SPEC: PayloadSpec = {
                   rewardsAmount: { type: "number" },
                   rewardsDailyRate: { type: "number" },
                   startDate: { type: "string" },
-                  endDate: { type: "string" },
+                  // Official market-details definition types this as
+                  // `IsoCalendarDateString | null` ("`endDate` [can be] `null`
+                  // when it has no end date"):
+                  // https://docs.polymarket.com/market-data/market-details
+                  // (accessed 2026-08-26). `.nullable()`, not `.nullish()`:
+                  // the key must be present.
+                  endDate: { type: "string", nullable: true },
                 },
               },
             },
@@ -465,12 +471,22 @@ const CTF_REQUEST_FIELDS = (
   },
 });
 
+/**
+ * `TransactionOutcome` handle returned by `transaction.wait()` for CTF
+ * split/merge/redeem. The official page shows
+ * `outcome.transactionHash: TxHash` and
+ * `outcome.transactionId: TransactionId | null` (Python:
+ * `outcome.transaction_id: str | None`):
+ * https://docs.polymarket.com/trading/positions/manage (accessed 2026-08-26).
+ * `transactionId` is therefore `.nullable()` — the key is present but its
+ * value may be `null` — and a consumer must not assume a relayer id exists.
+ */
 const TRANSACTION_OUTCOME: FieldSpec = {
   type: "object",
   strict: true,
   fields: {
     transactionHash: { type: "hex-string", hexLengths: [66] },
-    transactionId: { type: "string" },
+    transactionId: { type: "string", nullable: true },
   },
 };
 
@@ -562,27 +578,38 @@ const RTDS_UPDATE_VARIANT: ObjectSpec = {
   },
 };
 
-const RTDS_SPEC: PayloadSpec = {
-  discriminant: "example-name",
-  variants: {
-    "subscribe-request": {
-      strict: true,
-      fields: {
-        action: { type: "string", enum: ["subscribe"] },
-        subscriptions: {
-          type: "array",
-          items: {
-            type: "object",
-            strict: true,
-            fields: {
-              topic: { type: "string", enum: RTDS_TWAP_TOPIC },
-              type: { type: "string", enum: ["update"] },
-              filters: { type: "string" },
-            },
-          },
+/**
+ * RTDS subscribe frame. `filters` is OPTIONAL: the official Chainlink TWAP
+ * page states "Omit it to receive every available symbol" (and then filter on
+ * `payload.symbol` client-side):
+ * https://docs.polymarket.com/market-data/chainlink-twap (accessed
+ * 2026-08-26). When present it must be the exact compact JSON form with one
+ * lowercase symbol and no spaces.
+ */
+const RTDS_SUBSCRIBE_VARIANT: ObjectSpec = {
+  strict: true,
+  fields: {
+    action: { type: "string", enum: ["subscribe"] },
+    subscriptions: {
+      type: "array",
+      items: {
+        type: "object",
+        strict: true,
+        fields: {
+          topic: { type: "string", enum: RTDS_TWAP_TOPIC },
+          type: { type: "string", enum: ["update"] },
+          filters: { type: "string", optional: true },
         },
       },
     },
+  },
+};
+
+const RTDS_SPEC: PayloadSpec = {
+  discriminant: "example-name",
+  variants: {
+    "subscribe-request": RTDS_SUBSCRIBE_VARIANT,
+    "subscribe-request-all-symbols-no-filters": RTDS_SUBSCRIBE_VARIANT,
     "twap-update-30s": RTDS_UPDATE_VARIANT,
     "twap-update-60s": RTDS_UPDATE_VARIANT,
   },

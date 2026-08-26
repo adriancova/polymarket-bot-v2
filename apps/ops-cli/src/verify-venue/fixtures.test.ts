@@ -24,6 +24,7 @@ import {
   validateFixtureDocument,
 } from "./fixtures.js";
 import type {
+  FieldSpec,
   FixtureExample,
   ObjectSpec,
   PayloadSpec,
@@ -107,8 +108,68 @@ function errorsFor(
 
 const fixtureChecks = VENUE_CHECKS.filter((check) => check.kind === "fixture");
 
-function objectSpecsOf(spec: PayloadSpec): readonly ObjectSpec[] {
+/** Top-level object specs of a payload spec (one per declared variant). */
+function topLevelObjectSpecsOf(spec: PayloadSpec): readonly ObjectSpec[] {
   return "variants" in spec ? Object.values(spec.variants) : [spec];
+}
+
+interface ReachableObjectSpec {
+  readonly path: string;
+  readonly spec: ObjectSpec;
+}
+
+/**
+ * Recursively collects EVERY object-shaped spec reachable from a payload spec,
+ * descending through variants, nested `fields`, array `items`, `union`
+ * alternatives, and map `values`.
+ *
+ * A non-recursive collector (which the round-3 revision used) only saw the
+ * top-level variant objects, so a permissive NESTED schema — one that is
+ * neither `strict` nor map-typed, or one whose fields are all optional —
+ * would have escaped the catalog guards entirely.
+ */
+function reachableObjectSpecs(spec: PayloadSpec): readonly ReachableObjectSpec[] {
+  const found: ReachableObjectSpec[] = [];
+  const seen = new Set<unknown>();
+
+  const visitField = (field: FieldSpec, path: string): void => {
+    if (seen.has(field)) {
+      return;
+    }
+    seen.add(field);
+    if (field.type === "object") {
+      visitObject(field, path);
+      return;
+    }
+    if (field.type === "array" && field.items !== undefined) {
+      visitField(field.items, `${path}[]`);
+      return;
+    }
+    if (field.type === "union") {
+      (field.oneOf ?? []).forEach((alternative, index) => {
+        visitField(alternative, `${path}|${index}`);
+      });
+    }
+  };
+
+  const visitObject = (objectSpec: ObjectSpec, path: string): void => {
+    found.push({ path, spec: objectSpec });
+    for (const [key, field] of Object.entries(objectSpec.fields ?? {})) {
+      visitField(field, `${path}.${key}`);
+    }
+    if (objectSpec.values !== undefined) {
+      visitField(objectSpec.values, `${path}.*`);
+    }
+  };
+
+  if ("variants" in spec) {
+    for (const [name, variant] of Object.entries(spec.variants)) {
+      visitObject(variant, `<${name}>`);
+    }
+  } else {
+    visitObject(spec, "<root>");
+  }
+  return found;
 }
 
 describe("venue fixture catalog", () => {
@@ -149,35 +210,103 @@ describe("venue fixture catalog", () => {
     expect(onDisk).toEqual(claimed);
   });
 
-  it("no fixture check declares a permissive (non-strict, non-mapped) schema", () => {
+  it("no reachable object schema is permissive (non-strict, non-mapped) at ANY nesting level", () => {
     for (const check of fixtureChecks) {
-      for (const objectSpec of objectSpecsOf(check.payloadSpec)) {
+      for (const { path, spec } of reachableObjectSpecs(check.payloadSpec)) {
         expect(
-          objectSpec.strict === true || objectSpec.values !== undefined,
-          `${check.id} declares a schema that silently accepts unknown keys`,
+          spec.strict === true || spec.values !== undefined,
+          `${check.id} ${path} silently accepts unknown keys`,
         ).toBe(true);
         expect(
-          Object.keys(objectSpec.fields ?? {}).length,
-          `${check.id} declares a schema with no fields`,
+          Object.keys(spec.fields ?? {}).length > 0 ||
+            spec.values !== undefined,
+          `${check.id} ${path} declares neither fields nor a map value spec`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it("every reachable object schema with fields has a required field at ANY nesting level", () => {
+    // Guards against the "everything optional" vacuity mode at every depth: an
+    // object (top-level variant, nested object, array element, union
+    // alternative, or map value) whose fields are all optional would accept an
+    // empty object. Map-only schemas (`values`, no `fields`) are exempt: an
+    // empty map is a legitimate value, and their entries are typed instead.
+    for (const check of fixtureChecks) {
+      for (const { path, spec } of reachableObjectSpecs(check.payloadSpec)) {
+        const fields = Object.values(spec.fields ?? {});
+        if (fields.length === 0) {
+          continue;
+        }
+        const required = fields.filter((field) => field.optional !== true);
+        expect(
+          required.length,
+          `${check.id} ${path} has no required field`,
         ).toBeGreaterThan(0);
       }
     }
   });
 
-  it("every fixture check declares at least one non-optional field per variant", () => {
-    // Guards against the "everything optional" vacuity mode: a variant whose
-    // fields are all optional would accept an empty payload.
+  it("every reachable map value spec is typed, never `unknown`", () => {
+    // An `unknown` map value spec would re-open the hole that typing the
+    // nested structures closed: every entry would validate vacuously.
     for (const check of fixtureChecks) {
-      for (const objectSpec of objectSpecsOf(check.payloadSpec)) {
-        const required = Object.values(objectSpec.fields ?? {}).filter(
-          (field) => field.optional !== true,
-        );
+      for (const { path, spec } of reachableObjectSpecs(check.payloadSpec)) {
+        if (spec.values === undefined) {
+          continue;
+        }
         expect(
-          required.length,
-          `${check.id} has a variant with no required fields`,
-        ).toBeGreaterThan(0);
+          spec.values.type,
+          `${check.id} ${path} declares an untyped map value spec`,
+        ).not.toBe("unknown");
       }
     }
+  });
+
+  it("the recursive walker reaches strictly deeper than the top-level variants", () => {
+    // Regression guard for the walker itself: if it silently degenerated to
+    // the old top-level-only collector, the guards above would pass vacuously.
+    const feesSpec = specOf("fees-and-rewards");
+    const reachablePaths = reachableObjectSpecs(feesSpec).map(
+      (entry) => entry.path,
+    );
+    expect(reachablePaths.length).toBeGreaterThan(
+      topLevelObjectSpecsOf(feesSpec).length,
+    );
+    // Nested object, array element, and map value specs must all be reached.
+    expect(reachablePaths).toContain(
+      "<liquidity-rewards-market-settings>.single_sided_midpoint_band",
+    );
+    expect(reachablePaths).toContain(
+      "<liquidity-rewards-market-settings>.market_settings_example.clobRewards[]",
+    );
+    expect(
+      reachableObjectSpecs(specOf("rate-limits")).map((entry) => entry.path),
+    ).toContain("<ip-limits-snapshot>.trading_dual_limits.*");
+  });
+
+  it("the permissive-schema guard actually fails on a permissive nested schema", () => {
+    // Mutation probe: a nested object that is neither strict nor map-typed,
+    // and an all-optional nested object, must both be reported by the walker.
+    const permissive: PayloadSpec = {
+      strict: true,
+      fields: {
+        outer: {
+          type: "object",
+          fields: { inner: { type: "string", optional: true } },
+        },
+      },
+    };
+    const specs = reachableObjectSpecs(permissive);
+    const nested = specs.find((entry) => entry.path === "<root>.outer");
+    expect(nested).toBeDefined();
+    expect(
+      nested?.spec.strict === true || nested?.spec.values !== undefined,
+    ).toBe(false);
+    const requiredFields = Object.values(nested?.spec.fields ?? {}).filter(
+      (field) => field.optional !== true,
+    );
+    expect(requiredFields.length).toBe(0);
   });
 });
 
@@ -1159,6 +1288,115 @@ describe("nested contract validation (negative cases)", () => {
     ).toBe(true);
   });
 
+  // Round-4 HIGH(c): the official positions page types the outcome handle as
+  // `outcome.transactionId: TransactionId | null` (Python `str | None`)
+  // (https://docs.polymarket.com/trading/positions/manage, accessed
+  // 2026-08-26), so a null relayer id is VALID.
+  it("accepts a null TransactionOutcome.transactionId and still accepts a string", () => {
+    const payload = exampleNamed(
+      "positions/split-merge-redeem.json",
+      "redeem-request-and-outcome",
+    );
+    const outcome = payload["transaction_outcome"] as Record<string, unknown>;
+    expect(errorsFor(payload, specOf("position-operations"))).toEqual([]);
+    outcome["transactionId"] = null;
+    expect(errorsFor(payload, specOf("position-operations"))).toEqual([]);
+  });
+
+  it("still rejects a non-string, non-null TransactionOutcome.transactionId", () => {
+    const payload = exampleNamed(
+      "positions/split-merge-redeem.json",
+      "redeem-request-and-outcome",
+    );
+    (payload["transaction_outcome"] as Record<string, unknown>)[
+      "transactionId"
+    ] = 42;
+    expect(
+      errorsFor(payload, specOf("position-operations")).some((error) =>
+        error.includes("transaction_outcome.transactionId: expected string"),
+      ),
+    ).toBe(true);
+  });
+
+  it("freezes a null-transactionId outcome example in the positions fixture", () => {
+    const example = examplesOf("positions/split-merge-redeem.json").find(
+      (candidate) => candidate.name === "redeem-outcome-null-transaction-id",
+    );
+    expect(example).toBeDefined();
+    const outcome = example?.payload["transaction_outcome"] as Record<
+      string,
+      unknown
+    >;
+    expect(Object.hasOwn(outcome, "transactionId")).toBe(true);
+    expect(outcome["transactionId"]).toBeNull();
+  });
+
+  // Round-4 HIGH(d): the official market-details definition types
+  // `endDate: IsoCalendarDateString | null`
+  // (https://docs.polymarket.com/market-data/market-details, accessed
+  // 2026-08-26) — null when the program has no end date.
+  it("accepts a null clobRewards[].endDate and still accepts a date string", () => {
+    const payload = exampleNamed(
+      "fees/fee-reward-parameters.json",
+      "liquidity-rewards-market-settings",
+    );
+    const settings = payload["market_settings_example"] as Record<
+      string,
+      unknown
+    >;
+    const rewards = settings["clobRewards"] as Array<Record<string, unknown>>;
+    expect(
+      errorsFor(
+        payload,
+        specOf("fees-and-rewards"),
+        "liquidity-rewards-market-settings",
+      ),
+    ).toEqual([]);
+    rewards[0]!["endDate"] = null;
+    expect(
+      errorsFor(
+        payload,
+        specOf("fees-and-rewards"),
+        "liquidity-rewards-market-settings",
+      ),
+    ).toEqual([]);
+  });
+
+  it("still rejects a non-string, non-null clobRewards[].endDate", () => {
+    const payload = exampleNamed(
+      "fees/fee-reward-parameters.json",
+      "liquidity-rewards-market-settings",
+    );
+    const settings = payload["market_settings_example"] as Record<
+      string,
+      unknown
+    >;
+    (settings["clobRewards"] as Array<Record<string, unknown>>)[0]!["endDate"] =
+      20260731;
+    expect(
+      errorsFor(
+        payload,
+        specOf("fees-and-rewards"),
+        "liquidity-rewards-market-settings",
+      ).some((error) =>
+        error.includes("clobRewards[0].endDate: expected string"),
+      ),
+    ).toBe(true);
+  });
+
+  it("freezes a null-endDate clobRewards entry in the fees fixture", () => {
+    const payload = exampleNamed(
+      "fees/fee-reward-parameters.json",
+      "liquidity-rewards-market-settings",
+    );
+    const rewards = (
+      payload["market_settings_example"] as Record<string, unknown>
+    )["clobRewards"] as Array<Record<string, unknown>>;
+    const openEnded = rewards.find((reward) => reward["endDate"] === null);
+    expect(openEnded).toBeDefined();
+    expect(Object.hasOwn(openEnded ?? {}, "endDate")).toBe(true);
+  });
+
   it("rejects a non-address value in the published contract map", () => {
     const payload = exampleNamed(
       "positions/split-merge-redeem.json",
@@ -1181,6 +1419,106 @@ describe("nested contract validation (negative cases)", () => {
     expect(
       errorsFor(payload, specOf("position-operations")).some((error) =>
         error.includes("contracts.pUSD"),
+      ),
+    ).toBe(true);
+  });
+
+  // Round-4 HIGH(a): map entries were previously skipped when null/undefined,
+  // so a map declared as decimals, integers, dual-limit objects, or EVM
+  // addresses silently accepted `null`. Every entry is now validated against
+  // the declared value spec.
+  it("rejects a null value in the decimal-typed fee table", () => {
+    const payload = exampleNamed(
+      "fees/fee-reward-parameters.json",
+      "fee-model-snapshot",
+    );
+    (payload["taker_fee_rate_by_category"] as Record<string, unknown>)[
+      "crypto"
+    ] = null;
+    expect(
+      errorsFor(payload, specOf("fees-and-rewards"), "fee-model-snapshot").some(
+        (error) =>
+          error.includes("taker_fee_rate_by_category.crypto") &&
+          error.includes("null is not an accepted value"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a null value in the integer-typed IP limit map", () => {
+    const payload = exampleNamed(
+      "rate-limits/rate-limits.json",
+      "ip-limits-snapshot",
+    );
+    (payload["limits_per_10s"] as Record<string, unknown>)["general"] = null;
+    expect(
+      errorsFor(payload, specOf("rate-limits"), "ip-limits-snapshot").some(
+        (error) =>
+          error.includes("limits_per_10s.general") &&
+          error.includes("null is not an accepted value"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a null dual-limit object in the trading limit map", () => {
+    const payload = exampleNamed(
+      "rate-limits/rate-limits.json",
+      "ip-limits-snapshot",
+    );
+    const dual = payload["trading_dual_limits"] as Record<string, unknown>;
+    const firstKey = Object.keys(dual)[0] as string;
+    dual[firstKey] = null;
+    expect(
+      errorsFor(payload, specOf("rate-limits"), "ip-limits-snapshot").some(
+        (error) =>
+          error.includes(`trading_dual_limits.${firstKey}`) &&
+          error.includes("null is not an accepted value"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a null contract address in the published contract map", () => {
+    const payload = exampleNamed(
+      "positions/split-merge-redeem.json",
+      "contract-addresses-polygon-snapshot",
+    );
+    (payload["contracts"] as Record<string, unknown>)["pUSD"] = null;
+    expect(
+      errorsFor(payload, specOf("position-operations")).some(
+        (error) =>
+          error.includes("contracts.pUSD") &&
+          error.includes("null is not an accepted value"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects an undefined map entry", () => {
+    const payload = exampleNamed(
+      "positions/split-merge-redeem.json",
+      "contract-addresses-polygon-snapshot",
+    );
+    (payload["contracts"] as Record<string, unknown>)["pUSD"] = undefined;
+    expect(
+      errorsFor(payload, specOf("position-operations")).some(
+        (error) =>
+          error.includes("contracts.pUSD") &&
+          error.includes("undefined is not an accepted value"),
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts a null map entry only where the value spec declares nullable", () => {
+    const nullableMap: PayloadSpec = {
+      fields: { tag: { type: "string" } },
+      values: { type: "decimal-string", nullable: true },
+    };
+    expect(errorsFor({ tag: "t", a: "1.5", b: null }, nullableMap)).toEqual([]);
+    const strictMap: PayloadSpec = {
+      fields: { tag: { type: "string" } },
+      values: { type: "decimal-string" },
+    };
+    expect(
+      errorsFor({ tag: "t", a: "1.5", b: null }, strictMap).some((error) =>
+        error.includes("null is not an accepted value"),
       ),
     ).toBe(true);
   });
@@ -1250,7 +1588,7 @@ describe("nested contract validation (negative cases)", () => {
         subscriptions: [
           { topic: 12345, type: "update", filters: "{}" },
           { topic: "crypto_prices_twap_thirty", type: "snapshot", filters: "{}" },
-          { topic: "crypto_prices_twap_sixty", type: "update" },
+          { topic: "crypto_prices_twap_sixty", type: "update", filters: 7 },
         ],
       },
       specOf("chainlink-twap-rtds"),
@@ -1262,11 +1600,52 @@ describe("nested contract validation (negative cases)", () => {
     expect(
       errors.some((error) => error.includes("subscriptions[1].type")),
     ).toBe(true);
+    // `filters` is optional, but a PRESENT `filters` is still type-checked.
     expect(
       errors.some((error) =>
-        error.includes("subscriptions[2].filters: missing required key"),
+        error.includes("subscriptions[2].filters: expected string"),
       ),
     ).toBe(true);
+  });
+
+  // Round-4 HIGH(b): `filters` was wrongly mandatory and the previous negative
+  // test enforced that wrong behavior. The official Chainlink TWAP page states
+  // "Omit it to receive every available symbol"
+  // (https://docs.polymarket.com/market-data/chainlink-twap, accessed
+  // 2026-08-26), so the omitted form is VALID and is asserted positively here.
+  it("accepts an RTDS subscription that omits filters (all symbols)", () => {
+    for (const exampleName of [
+      "subscribe-request",
+      "subscribe-request-all-symbols-no-filters",
+    ]) {
+      expect(
+        errorsFor(
+          {
+            action: "subscribe",
+            subscriptions: [
+              { topic: "crypto_prices_twap_sixty", type: "update" },
+            ],
+          },
+          specOf("chainlink-twap-rtds"),
+          exampleName,
+        ),
+        exampleName,
+      ).toEqual([]);
+    }
+  });
+
+  it("freezes an omitted-filters subscribe example in the RTDS fixture", () => {
+    const example = examplesOf("rtds/twap-update.json").find(
+      (candidate) => candidate.name === "subscribe-request-all-symbols-no-filters",
+    );
+    expect(example).toBeDefined();
+    const subscriptions = example?.payload["subscriptions"] as Array<
+      Record<string, unknown>
+    >;
+    expect(subscriptions.length).toBeGreaterThan(0);
+    for (const subscription of subscriptions) {
+      expect(Object.hasOwn(subscription, "filters")).toBe(false);
+    }
   });
 
   it("rejects an RTDS subscribe frame with no subscriptions key", () => {
@@ -1575,8 +1954,12 @@ describe("validation failure modes", () => {
     "POLY_BUILDER_SIGNATURE",
     "POLY_BUILDER_TIMESTAMP",
     "POLYMARKET_BUILDER_CODE",
-    // Obvious variants that must not slip through an exact-match list.
+    // Documented on the official SDK migration page (accessed 2026-08-26):
+    // builderApiKey({ key, secret, passphrase }) reads these three names.
     "POLYMARKET_BUILDER_API_KEY",
+    "POLYMARKET_BUILDER_SECRET",
+    "POLYMARKET_BUILDER_PASSPHRASE",
+    // Obvious variants that must not slip through an exact-match list.
     "builderApiKey",
     "builder_code",
     "WALLET_PRIVATE_KEY",
@@ -1599,16 +1982,146 @@ describe("validation failure modes", () => {
     });
   }
 
-  it("classifies documented credential names as credential-shaped", () => {
-    for (const key of [
-      "POLYMARKET_PRIVATE_KEY",
-      "POLYMARKET_BUILDER_API_KEY",
-      "POLY_BUILDER_API_KEY",
-      "POLYMARKET_WALLET_ADDRESS",
-      "POLYMARKET_BUILDER_CODE",
-    ]) {
-      expect(isCredentialShapedKey(key), key).toBe(true);
+  /**
+   * Every name below is documented on an official Polymarket page, re-verified
+   * 2026-08-26. The round-3 record wrongly stated that
+   * `POLYMARKET_BUILDER_API_KEY` was NOT in current official documentation; it
+   * is, on the SDK migration page, together with `POLYMARKET_BUILDER_SECRET`
+   * and `POLYMARKET_BUILDER_PASSPHRASE`. See report §16 for per-name sources.
+   */
+  const DOCUMENTED_CREDENTIAL_NAMES: readonly {
+    readonly name: string;
+    readonly kind: "secret" | "account-identifying" | "public-attribution";
+    readonly source: string;
+  }[] = [
+    {
+      name: "POLYMARKET_PRIVATE_KEY",
+      kind: "secret",
+      source: "https://docs.polymarket.com/trading/quickstart",
+    },
+    {
+      name: "SIGNER_PRIVATE_KEY",
+      kind: "secret",
+      source: "https://docs.polymarket.com/trading/place-orders",
+    },
+    {
+      name: "POLYMARKET_BUILDER_API_KEY",
+      kind: "secret",
+      source:
+        "https://docs.polymarket.com/getting-started/migrate-from-previous-sdks",
+    },
+    {
+      name: "POLYMARKET_BUILDER_SECRET",
+      kind: "secret",
+      source:
+        "https://docs.polymarket.com/getting-started/migrate-from-previous-sdks",
+    },
+    {
+      name: "POLYMARKET_BUILDER_PASSPHRASE",
+      kind: "secret",
+      source:
+        "https://docs.polymarket.com/getting-started/migrate-from-previous-sdks",
+    },
+    {
+      name: "POLY_API_KEY",
+      kind: "secret",
+      source: "https://docs.polymarket.com/trading/place-orders",
+    },
+    {
+      name: "POLY_PASSPHRASE",
+      kind: "secret",
+      source: "https://docs.polymarket.com/trading/place-orders",
+    },
+    {
+      name: "POLY_SIGNATURE",
+      kind: "secret",
+      source: "https://docs.polymarket.com/trading/place-orders",
+    },
+    {
+      name: "POLY_BUILDER_API_KEY",
+      kind: "secret",
+      source:
+        "https://docs.polymarket.com/api-reference/relayer/submit-a-transaction",
+    },
+    {
+      name: "POLY_BUILDER_PASSPHRASE",
+      kind: "secret",
+      source:
+        "https://docs.polymarket.com/api-reference/relayer/submit-a-transaction",
+    },
+    {
+      name: "POLY_BUILDER_SIGNATURE",
+      kind: "secret",
+      source:
+        "https://docs.polymarket.com/api-reference/relayer/submit-a-transaction",
+    },
+    {
+      name: "POLY_BUILDER_TIMESTAMP",
+      kind: "secret",
+      source:
+        "https://docs.polymarket.com/api-reference/relayer/submit-a-transaction",
+    },
+    {
+      name: "POLYMARKET_WALLET_ADDRESS",
+      kind: "account-identifying",
+      source: "https://docs.polymarket.com/trading/quickstart",
+    },
+    {
+      name: "POLY_ADDRESS",
+      kind: "account-identifying",
+      source: "https://docs.polymarket.com/trading/place-orders",
+    },
+    {
+      name: "POLY_TIMESTAMP",
+      kind: "account-identifying",
+      source: "https://docs.polymarket.com/trading/place-orders",
+    },
+    {
+      name: "POLYMARKET_BUILDER_CODE",
+      kind: "public-attribution",
+      source: "https://docs.polymarket.com/trading/place-orders",
+    },
+  ];
+
+  it("classifies every documented credential/attribution name as credential-shaped", () => {
+    for (const { name } of DOCUMENTED_CREDENTIAL_NAMES) {
+      expect(isCredentialShapedKey(name), name).toBe(true);
     }
+  });
+
+  it("classifies documented names case- and separator-insensitively", () => {
+    for (const { name } of DOCUMENTED_CREDENTIAL_NAMES) {
+      const camel = name
+        .toLowerCase()
+        .replace(/_(.)/g, (_match, char: string) => char.toUpperCase());
+      const dashed = name.replace(/_/g, "-");
+      expect(isCredentialShapedKey(camel), camel).toBe(true);
+      expect(isCredentialShapedKey(dashed), dashed).toBe(true);
+    }
+  });
+
+  it("the frozen report documents every credential name with its own source", () => {
+    const { content } = loadAndValidateReport();
+    expect(content).not.toBeNull();
+    const report = content ?? "";
+    for (const { name, source } of DOCUMENTED_CREDENTIAL_NAMES) {
+      expect(report, name).toContain(name);
+      expect(report, `${name} source ${source}`).toContain(source);
+    }
+  });
+
+  it("the frozen report separates secret material from public builder attribution", () => {
+    const { content } = loadAndValidateReport();
+    const report = content ?? "";
+    // POLYMARKET_BUILDER_CODE is a public builder-profile identifier sent as
+    // `builderCode` alongside an order; it is scanned so no real builder's
+    // value is embedded, but it is not secret material and the report must
+    // say so rather than lumping it in with keys and passphrases.
+    expect(report).toContain("public builder attribution");
+    const attribution = DOCUMENTED_CREDENTIAL_NAMES.filter(
+      (entry) => entry.kind === "public-attribution",
+    ).map((entry) => entry.name);
+    expect(attribution).toEqual(["POLYMARKET_BUILDER_CODE"]);
   });
 
   it("does not classify ordinary venue field names as credentials", () => {
