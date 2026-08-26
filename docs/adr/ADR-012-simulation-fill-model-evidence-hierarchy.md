@@ -239,8 +239,9 @@ snapshot, re-verify each phase per handoff §1.2):
 - §3 — market-channel events, and the fact that `price_change.size`
   absolute-versus-delta semantics are **not** stated.
 - §6 — the fee formula, 5-decimal rounding, `0.00001` minimum, taker-only fees and
-  per-category rates; maker/taker rebates and liquidity rewards paid daily at
-  midnight UTC in pUSD with a $1 minimum accrual. **Volatile snapshot.**
+  per-category rates; maker rebates and liquidity rewards paid daily at midnight
+  UTC, taker rebates tiered by 30-day weighted volume with a daily payout and no
+  stated time — each in pUSD with a $1 minimum accrual. **Volatile snapshot.**
 - §7 — dynamic tick size, `minimumOrderSize`, and `secondsDelay`.
 - §8 — IP and per-signer rate limits, token costs, all-or-nothing batches, and
   volume tiers. **Snapshot with effective date 2026-08-24.**

@@ -260,9 +260,10 @@ snapshot, re-verify each phase per handoff §1.2):
   but has not matched yet … Treat it as a pending order rather than a fill."
 - §4 — six SDK `TradeStatus` settlement states; asynchronous on-chain settlement.
 - §6 — fee formula, 5-decimal rounding, `0.00001` minimum charged fee, taker-only
-  fees, per-category taker rates; maker rebates, taker rebates, and liquidity
-  rewards paid daily at midnight UTC in pUSD with a $1 minimum accrual. **All
-  volatile program parameters, snapshot 2026-08-24.**
+  fees, per-category taker rates; maker rebates (pool-shared, daily at midnight
+  UTC), taker rebates (tiered by 30-day weighted volume, daily payout, no stated
+  time), and liquidity rewards (daily at midnight UTC) — each in pUSD with a $1
+  minimum accrual. **All volatile program parameters, snapshot 2026-08-24.**
 - §10.2 — split/merge/redeem semantics; "Every YES and NO pair is backed by
   exactly $1 of collateral locked through the CTF contracts"; buying consumes
   pUSD and selling requires outcome-token inventory; published Polygon contract
