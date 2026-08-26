@@ -1,0 +1,109 @@
+{
+  "fixture": "orders/order-responses",
+  "source": "https://docs.polymarket.com/trading/place-orders",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "API-level order placement responses covering live/matched/delayed/unmatched statuses and documented error taxonomy examples. Per the docs, a 'delayed' response has zero making/taking amounts and empty trade/transaction arrays and must be treated as pending, not filled. Order/trade ids and hashes are synthetic. The 'not enough balance / allowance' message is quoted from the docs; the other error messages are representative paraphrases of documented rejection causes (tick-size violation, below min_order_size, GTD expiration under 3 minutes) whose exact server strings are UNVERIFIED (U-4 in the verification report) -- consumers must match on failure status, not message text. Failure responses follow the documented failure shape (success, errorMsg, orderID, status, makingAmount, takingAmount) and do NOT carry transactionsHashes/tradeIDs; those properties are optional in validation, matching official optionality.",
+  "examples": [
+    {
+      "name": "limit-live",
+      "payload": {
+        "success": true,
+        "errorMsg": "",
+        "orderID": "0x00000000000000000000000000000000000000000000000000000000feed0001",
+        "status": "live",
+        "makingAmount": "0",
+        "takingAmount": "0",
+        "transactionsHashes": [],
+        "tradeIDs": []
+      }
+    },
+    {
+      "name": "limit-matched",
+      "payload": {
+        "success": true,
+        "errorMsg": "",
+        "orderID": "0x00000000000000000000000000000000000000000000000000000000feed0004",
+        "status": "matched",
+        "makingAmount": "3200000",
+        "takingAmount": "40000000",
+        "transactionsHashes": [
+          "0x0000000000000000000000000000000000000000000000000000000000c0ffee"
+        ],
+        "tradeIDs": [
+          "00000000-0000-0000-0000-00000000t001"
+        ]
+      }
+    },
+    {
+      "name": "market-delayed-pending-not-filled",
+      "payload": {
+        "success": true,
+        "errorMsg": "",
+        "orderID": "0x00000000000000000000000000000000000000000000000000000000feed0002",
+        "status": "delayed",
+        "makingAmount": "0",
+        "takingAmount": "0",
+        "transactionsHashes": [],
+        "tradeIDs": []
+      }
+    },
+    {
+      "name": "market-unmatched-placement-succeeded",
+      "payload": {
+        "success": true,
+        "errorMsg": "",
+        "orderID": "0x00000000000000000000000000000000000000000000000000000000feed0003",
+        "status": "unmatched",
+        "makingAmount": "0",
+        "takingAmount": "0",
+        "transactionsHashes": [],
+        "tradeIDs": []
+      }
+    },
+    {
+      "name": "error-insufficient-balance-or-allowance",
+      "payload": {
+        "success": false,
+        "errorMsg": "not enough balance / allowance",
+        "orderID": "",
+        "status": "",
+        "makingAmount": "",
+        "takingAmount": ""
+      }
+    },
+    {
+      "name": "error-tick-size-violation",
+      "payload": {
+        "success": false,
+        "errorMsg": "invalid order: price does not conform to market tick size",
+        "orderID": "",
+        "status": "",
+        "makingAmount": "",
+        "takingAmount": ""
+      }
+    },
+    {
+      "name": "error-below-min-order-size",
+      "payload": {
+        "success": false,
+        "errorMsg": "invalid order: size lower than the minimum",
+        "orderID": "",
+        "status": "",
+        "makingAmount": "",
+        "takingAmount": ""
+      }
+    },
+    {
+      "name": "error-gtd-expiration-too-soon",
+      "payload": {
+        "success": false,
+        "errorMsg": "invalid order: GTD expiration must be at least 3 minutes in the future",
+        "orderID": "",
+        "status": "",
+        "makingAmount": "",
+        "takingAmount": ""
+      }
+    }
+  ]
+}

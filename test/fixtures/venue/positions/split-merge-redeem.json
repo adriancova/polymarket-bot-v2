@@ -1,0 +1,120 @@
+{
+  "fixture": "positions/split-merge-redeem",
+  "source": "https://docs.polymarket.com/trading/positions/manage",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "CTF position operations per the official positions-management page: split (pUSD -> complete outcome-token set), merge (balanced set -> pUSD), redeem (winning tokens -> pUSD after resolution). Contract addresses are the PUBLIC Polygon addresses published on the source page (public on-chain addresses, not credentials). On-chain functions splitPosition/mergePositions/redeemPositions share the parameter pattern (collateralToken, parentCollectionId, conditionId, partition|indexSets, amount). SDK methods splitPosition()/mergePositions()/redeemPositions() return a TransactionOutcome awaited via transaction.wait(); the official page types it as outcome.transactionHash: TxHash and outcome.transactionId: TransactionId | null (Python: outcome.transaction_id: str | None), so transactionId MAY BE NULL and a consumer must not assume a relayer id exists (re-verified 2026-08-26; the 'redeem-outcome-null-transaction-id' example freezes the null form). Transaction hashes/ids in examples are synthetic. Additional source: https://docs.polymarket.com/trading/ctf/overview (position-id derivation, neg-risk conversion).",
+  "examples": [
+    {
+      "name": "contract-addresses-polygon-snapshot",
+      "payload": {
+        "operation": "contract-addresses",
+        "description": "Public Polygon contract addresses published by the official docs on 2026-08-24; re-verify at WP-300 implementation time.",
+        "effective_date": "2026-08-24",
+        "contracts": {
+          "pUSD": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+          "ConditionalTokens": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
+          "CtfCollateralAdapter": "0xAdA100Db00Ca00073811820692005400218FcE1f",
+          "NegRiskCtfCollateralAdapter": "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
+        }
+      }
+    },
+    {
+      "name": "split-request-and-outcome",
+      "payload": {
+        "operation": "split",
+        "description": "Convert pUSD into a complete YES/NO outcome-token set; every pair is backed by exactly $1 of locked collateral.",
+        "onchain_function": "splitPosition(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount)",
+        "request": {
+          "collateralToken": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+          "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "conditionId": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+          "partition": [1, 2],
+          "amount": "25000000"
+        },
+        "transaction_outcome": {
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000501",
+          "transactionId": "sanitized-transaction-id-0501"
+        }
+      }
+    },
+    {
+      "name": "merge-request-and-outcome",
+      "payload": {
+        "operation": "merge",
+        "description": "Convert a balanced YES/NO outcome-token set back into pUSD.",
+        "onchain_function": "mergePositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount)",
+        "request": {
+          "collateralToken": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+          "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "conditionId": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+          "partition": [1, 2],
+          "amount": "10000000"
+        },
+        "transaction_outcome": {
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000502",
+          "transactionId": "sanitized-transaction-id-0502"
+        }
+      }
+    },
+    {
+      "name": "redeem-request-and-outcome",
+      "payload": {
+        "operation": "redeem",
+        "description": "Claim pUSD for winning outcome tokens after market resolution.",
+        "onchain_function": "redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)",
+        "request": {
+          "collateralToken": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+          "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "conditionId": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+          "indexSets": [1]
+        },
+        "transaction_outcome": {
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000503",
+          "transactionId": "sanitized-transaction-id-0503"
+        }
+      }
+    },
+    {
+      "name": "redeem-outcome-null-transaction-id",
+      "payload": {
+        "operation": "redeem",
+        "description": "Redeem whose TransactionOutcome carries a null transactionId; the official page types it as TransactionId | null, so a consumer must not assume a relayer id exists.",
+        "onchain_function": "redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)",
+        "request": {
+          "collateralToken": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+          "parentCollectionId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "conditionId": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+          "indexSets": [1]
+        },
+        "transaction_outcome": {
+          "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000504",
+          "transactionId": null
+        }
+      }
+    },
+    {
+      "name": "position-id-derivation",
+      "payload": {
+        "operation": "derive-position-id",
+        "description": "conditionId = getConditionId(oracle, questionId, outcomeSlotCount=2); collectionId = getCollectionId(parentCollectionId, conditionId, indexSet in {1,2}); positionId = getPositionId(collateralToken, collectionId).",
+        "oracle": "0x0000000000000000000000000000000000000000",
+        "question_id": "0x0000000000000000000000000000000000000000000000000000000000000a01",
+        "outcome_slot_count": 2,
+        "parent_collection_id": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "index_set": 1,
+        "collateral_token": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+      }
+    },
+    {
+      "name": "neg-risk-conversion-note",
+      "payload": {
+        "operation": "neg-risk-convert",
+        "description": "Negative-risk markets use the separate Negative Risk CTF Exchange and the NegRiskCtfCollateralAdapter; a conversion can exchange one NO token for YES tokens in the event's other outcomes.",
+        "neg_risk": true,
+        "adapter": "0xadA2005600Dec949baf300f4C6120000bDB6eAab",
+        "event_flags": { "enableNegRisk": true, "negRiskAugmented": false }
+      }
+    }
+  ]
+}

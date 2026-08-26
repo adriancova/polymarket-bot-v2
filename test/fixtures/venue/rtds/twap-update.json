@@ -1,0 +1,64 @@
+{
+  "fixture": "rtds/twap-update",
+  "source": "https://docs.polymarket.com/market-data/chainlink-twap",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "Chainlink TWAP updates over RTDS (wss://ws-live-data.polymarket.com), topics crypto_prices_twap_thirty (30s) and crypto_prices_twap_sixty (60s). Values follow the documentation example. Exact-decimal consumers must use full_accuracy_value, never the floating 'value'. Subscriptions start with the next update; no snapshot, history, or replay after disconnect. RTDS heartbeat: client sends PING every 5 seconds. The 'filters' field of a subscription entry is OPTIONAL -- the official page states 'Omit it to receive every available symbol', and advises filtering on payload.symbol client-side when one window needs several symbols; when present it must be the exact compact JSON form with one lowercase symbol and no spaces (re-verified 2026-08-26). The 'subscribe-request-all-symbols-no-filters' example freezes the omitted-filters form.",
+  "examples": [
+    {
+      "name": "subscribe-request",
+      "payload": {
+        "action": "subscribe",
+        "subscriptions": [
+          {
+            "topic": "crypto_prices_twap_thirty",
+            "type": "update",
+            "filters": "{\"symbol\":\"btc/usd\"}"
+          }
+        ]
+      }
+    },
+    {
+      "name": "subscribe-request-all-symbols-no-filters",
+      "payload": {
+        "action": "subscribe",
+        "subscriptions": [
+          {
+            "topic": "crypto_prices_twap_sixty",
+            "type": "update"
+          }
+        ]
+      }
+    },
+    {
+      "name": "twap-update-30s",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65000.5,
+          "full_accuracy_value": "65000500000000000000000",
+          "timestamp": 1785178800000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "twap-update-60s",
+      "payload": {
+        "topic": "crypto_prices_twap_sixty",
+        "type": "update",
+        "timestamp": 1785178860123,
+        "payload": {
+          "symbol": "eth/usd",
+          "value": 3200.25,
+          "full_accuracy_value": "3200250000000000000000",
+          "timestamp": 1785178860000,
+          "window_s": 60
+        }
+      }
+    }
+  ]
+}

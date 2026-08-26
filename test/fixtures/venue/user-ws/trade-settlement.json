@@ -1,0 +1,162 @@
+{
+  "fixture": "user-ws/trade-settlement",
+  "source": "https://github.com/Polymarket/ts-sdk/blob/7fdbed42484b5d279c71aa36d3757d18968260da/packages/bindings/src/subscriptions/clob.ts",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "RAW user-channel 'trade' wire events per the official SDK UserTradeEventSchema at reference commit 7fdbed42484b5d279c71aa36d3757d18968260da (raw source re-verified 2026-08-26): required event_type='trade', type='TRADE', id, taker_order_id, market, asset_id, side, size, price, status, owner, timestamp; nullish fee_rate_bps, match_time, matchtime (an accepted alias of match_time; the SDK reads `match_time ?? matchtime`), last_update, outcome, trade_owner, maker_address, transaction_hash, bucket_index, maker_orders, trader_side. fee_rate_bps is OptionalDecimalStringSchema, so the wire empty string is an accepted value; bucket_index and maker-order outcome_index are z.number().int(); timestamp is z.string().regex(/^\\d+$/) and match_time/matchtime/last_update are epoch-second digit strings. Maker orders require order_id, owner, matched_amount, price, asset_id, side. Per SDK shared.ts, the user websocket channel serializes PLAIN status values (MATCHED/MINED/CONFIRMED/RETRYING/FAILED) while REST serializes prefixed TRADE_STATUS_* constants, and MatchedNotBroadcasted currently appears only on trades read via REST, not on user-stream trade events (conflict C-3 with the normalized docs event list; see docs/venue/verified-2026-08-24.md and orders/rest-trades.json). The docs' normalized event (https://docs.polymarket.com/trading/realtime-order-updates) is a distinct camelCase SDK model layered on this raw schema. All owner fields are sanitized zero-UUID API-key placeholders; ids and hashes are synthetic.",
+  "examples": [
+    {
+      "name": "matched",
+      "payload": {
+        "event_type": "trade",
+        "type": "TRADE",
+        "id": "00000000-0000-0000-0000-00000000t001",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0004",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "40",
+        "fee_rate_bps": "0",
+        "price": "0.08",
+        "status": "MATCHED",
+        "match_time": "1782753360",
+        "last_update": "1782753360",
+        "outcome": "Yes",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "trade_owner": "00000000-0000-0000-0000-000000000000",
+        "maker_address": "0x0000000000000000000000000000000000000000",
+        "bucket_index": 0,
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0005",
+            "owner": "00000000-0000-0000-0000-000000000000",
+            "maker_address": "0x0000000000000000000000000000000000000000",
+            "matched_amount": "40",
+            "price": "0.08",
+            "fee_rate_bps": "0",
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "outcome": "Yes",
+            "outcome_index": 0,
+            "side": "SELL"
+          }
+        ],
+        "trader_side": "TAKER",
+        "timestamp": "1782753360000"
+      }
+    },
+    {
+      "name": "mined",
+      "payload": {
+        "event_type": "trade",
+        "type": "TRADE",
+        "id": "00000000-0000-0000-0000-00000000t001",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0004",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "40",
+        "price": "0.08",
+        "status": "MINED",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000c0ffee",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0005",
+            "owner": "00000000-0000-0000-0000-000000000000",
+            "matched_amount": "40",
+            "price": "0.08",
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "side": "SELL"
+          }
+        ],
+        "trader_side": "TAKER",
+        "timestamp": "1782753362000"
+      }
+    },
+    {
+      "name": "confirmed-terminal",
+      "payload": {
+        "event_type": "trade",
+        "type": "TRADE",
+        "id": "00000000-0000-0000-0000-00000000t001",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0004",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "40",
+        "price": "0.08",
+        "status": "CONFIRMED",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000c0ffee",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0005",
+            "owner": "00000000-0000-0000-0000-000000000000",
+            "matched_amount": "40",
+            "price": "0.08",
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "side": "SELL"
+          }
+        ],
+        "trader_side": "TAKER",
+        "timestamp": "1782753370000"
+      }
+    },
+    {
+      "name": "retrying",
+      "payload": {
+        "event_type": "trade",
+        "type": "TRADE",
+        "id": "00000000-0000-0000-0000-00000000t002",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0006",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "SELL",
+        "size": "10",
+        "price": "0.09",
+        "status": "RETRYING",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0007",
+            "owner": "00000000-0000-0000-0000-000000000000",
+            "matched_amount": "10",
+            "price": "0.09",
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "side": "BUY"
+          }
+        ],
+        "trader_side": "MAKER",
+        "timestamp": "1782753380000"
+      }
+    },
+    {
+      "name": "failed-terminal",
+      "payload": {
+        "event_type": "trade",
+        "type": "TRADE",
+        "id": "00000000-0000-0000-0000-00000000t002",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0006",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "SELL",
+        "size": "10",
+        "price": "0.09",
+        "status": "FAILED",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0007",
+            "owner": "00000000-0000-0000-0000-000000000000",
+            "matched_amount": "10",
+            "price": "0.09",
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "side": "BUY"
+          }
+        ],
+        "trader_side": "MAKER",
+        "timestamp": "1782753395000"
+      }
+    }
+  ]
+}

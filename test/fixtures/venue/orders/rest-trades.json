@@ -1,0 +1,114 @@
+{
+  "fixture": "orders/rest-trades",
+  "source": "https://github.com/Polymarket/ts-sdk/blob/7fdbed42484b5d279c71aa36d3757d18968260da/packages/bindings/src/clob/account.ts",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "Trades read via REST (https://docs.polymarket.com/trading/manage-orders), modeled on the official SDK ClobTradeSchema in packages/bindings/src/clob/account.ts at reference commit 7fdbed42484b5d279c71aa36d3757d18968260da (raw source re-verified 2026-08-26). Unlike the websocket UserTradeEventSchema, EVERY ClobTradeSchema field is required (asset_id, bucket_index, fee_rate_bps, id, last_update, maker_address, maker_orders, market, match_time, outcome, owner, price, side, size, status, taker_order_id, trader_side, transaction_hash) and bucket_index is z.number(), not z.number().int(). REST maker orders follow the SDK MakerOrderSchema in the same file: asset_id, fee_rate_bps (nullable; the API serializes a missing maker fee rate as an empty string), maker_address, matched_amount, order_id, outcome, owner, price, side -- note there is no outcome_index on the REST maker order. Per the official SDK shared.ts, REST endpoints serialize the raw prefixed TRADE_STATUS_* constants (the user websocket channel serializes plain values), and 'MatchedNotBroadcasted currently appears only on trades read via REST, not on user stream trade events' -- hence TRADE_STATUS_MATCHED_NOT_BROADCASTED is modeled here in the REST layer only (conflict C-3 in docs/venue/verified-2026-08-24.md records the docs' contrary normalized-event claim). PROVENANCE: these examples are SYNTHETIC COMPLETED PLACEHOLDERS, never captured official responses. The documentation publishes no full REST trade body, so each example was completed field-by-field to satisfy every field ClobTradeSchema marks required; the completed values (all-zero transaction hashes, the all-zero maker address, bucket_index 0, epoch-second match_time/last_update) were chosen only to satisfy the SDK's declared types and assert nothing about the venue's real values -- in particular nothing about a not-yet-broadcast trade. Owner fields are sanitized zero-UUID placeholders; ids, addresses, and transaction hashes are synthetic zero-values. Additional source: https://github.com/Polymarket/ts-sdk/blob/7fdbed42484b5d279c71aa36d3757d18968260da/packages/bindings/src/shared.ts",
+  "examples": [
+    {
+      "name": "rest-trade-matched-not-broadcasted",
+      "payload": {
+        "id": "00000000-0000-0000-0000-00000000t003",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0008",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "15",
+        "price": "0.08",
+        "status": "TRADE_STATUS_MATCHED_NOT_BROADCASTED",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "maker_address": "0x0000000000000000000000000000000000000000",
+        "outcome": "Yes",
+        "fee_rate_bps": "0",
+        "bucket_index": 0,
+        "match_time": "1782753360",
+        "last_update": "1782753360",
+        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0009",
+            "owner": "00000000-0000-0000-0000-000000000000",
+            "maker_address": "0x0000000000000000000000000000000000000000",
+            "matched_amount": "15",
+            "price": "0.08",
+            "fee_rate_bps": "",
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "outcome": "Yes",
+            "side": "SELL"
+          }
+        ],
+        "trader_side": "TAKER"
+      }
+    },
+    {
+      "name": "rest-trade-matched",
+      "payload": {
+        "id": "00000000-0000-0000-0000-00000000t003",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0008",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "15",
+        "price": "0.08",
+        "status": "TRADE_STATUS_MATCHED",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "maker_address": "0x0000000000000000000000000000000000000000",
+        "outcome": "Yes",
+        "fee_rate_bps": "0",
+        "bucket_index": 0,
+        "match_time": "1782753360",
+        "last_update": "1782753361",
+        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0009",
+            "owner": "00000000-0000-0000-0000-000000000000",
+            "maker_address": "0x0000000000000000000000000000000000000000",
+            "matched_amount": "15",
+            "price": "0.08",
+            "fee_rate_bps": "0",
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "outcome": "Yes",
+            "side": "SELL"
+          }
+        ],
+        "trader_side": "TAKER"
+      }
+    },
+    {
+      "name": "rest-trade-confirmed-terminal",
+      "payload": {
+        "id": "00000000-0000-0000-0000-00000000t003",
+        "taker_order_id": "0x00000000000000000000000000000000000000000000000000000000feed0008",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BUY",
+        "size": "15",
+        "price": "0.08",
+        "status": "TRADE_STATUS_CONFIRMED",
+        "owner": "00000000-0000-0000-0000-000000000000",
+        "maker_address": "0x0000000000000000000000000000000000000000",
+        "outcome": "Yes",
+        "fee_rate_bps": "0",
+        "bucket_index": 0,
+        "match_time": "1782753360",
+        "last_update": "1782753370",
+        "transaction_hash": "0x0000000000000000000000000000000000000000000000000000000000c0ffee",
+        "maker_orders": [
+          {
+            "order_id": "0x00000000000000000000000000000000000000000000000000000000feed0009",
+            "owner": "00000000-0000-0000-0000-000000000000",
+            "maker_address": "0x0000000000000000000000000000000000000000",
+            "matched_amount": "15",
+            "price": "0.08",
+            "fee_rate_bps": "0",
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "outcome": "Yes",
+            "side": "SELL"
+          }
+        ],
+        "trader_side": "TAKER"
+      }
+    }
+  ]
+}

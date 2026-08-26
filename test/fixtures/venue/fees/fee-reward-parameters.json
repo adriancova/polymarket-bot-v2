@@ -1,0 +1,106 @@
+{
+  "fixture": "fees/fee-reward-parameters",
+  "source": "https://docs.polymarket.com/trading/fees",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "Configuration snapshot effective 2026-08-24; volatile program parameters, never hardcoded truths. Additional sources: https://docs.polymarket.com/programs/maker-rebates, https://docs.polymarket.com/programs/taker-rebates, https://docs.polymarket.com/programs/liquidity-rewards, https://docs.polymarket.com/market-data/market-details. market_settings_example models the SDK-PARSED market.rewards layer (what a @polymarket/client consumer sees), NOT the raw Gamma HTTP body; re-verified 2026-08-26. The market-details page publishes both layers and they differ: its TypeScript tab types rewardsMinSize as DecimalString | null and rewardsAmount/rewardsDailyRate as DecimalString and prints them QUOTED (\"rewardsMinSize\": \"100\", \"rewardsAmount\": \"10000\", \"rewardsDailyRate\": \"100\"); its Python tab types them Decimal; its API (Gamma) tab types the same fields as number and prints them UNQUOTED. These agree once the SDK is taken into account: ClobRewardsSchema uses DecimalishSchema = z.union([DecimalStringSchema, z.number().transform(...)]), which accepts a JSON number on input and always outputs a decimal string (https://github.com/Polymarket/ts-sdk/blob/7fdbed42484b5d279c71aa36d3757d18968260da/packages/bindings/src/gamma/common.ts and .../shared.ts, retrieved 2026-08-26). rewardsMaxSpread stays a JSON number: it is number/float in every published representation. endDate is IsoCalendarDateString | null (Python date | None) -- null when the reward program has no end date -- so the second clobRewards entry freezes the null form. assetAddress is documented and implemented as a plain string (z.string()), not an EVM address. holdingRewardsEnabled completes the published MarketRewards field list (clobRewards, rewardsMinSize, rewardsMaxSpread, holdingRewardsEnabled) and is typed holdingRewardsEnabled?: boolean | null (Python holding_rewards_enabled: bool | None; Gamma field table 'boolean -- Indicates if holding rewards are active'; SDK z.boolean().nullish() in gamma/market.ts), so it is both optional and nullable; re-fetched read-only 2026-08-26. ITS VALUE HERE IS ILLUSTRATIVE: the page's Gamma JSON example omits the key entirely, so the frozen `true` demonstrates the documented boolean shape and asserts nothing about any real market's holding-reward status. All rates and shares are recorded as CANONICAL decimal strings per handoff SS7.3 (no trailing fractional zeros): the documented 20% pool share is recorded as \"0.2\", 50% as \"0.5\", the 1.0x-2.3x weight range as \"1\"-\"2.3\", the scaling factor 3.0 as \"3\", and the 0.10/0.90 single-sided band as \"0.1\"/\"0.9\". Canonicalization changes representation only, never the documented value; for the reward decimals the doc's own lexemes (\"100\", \"10000\") are already canonical, so no rewriting was applied to the first clobRewards entry. IMPORTANT PROVENANCE LIMIT: because these decimal strings are canonicalized (normalized) data, they CANNOT be used as evidence of the raw lexemes the venue puts on the wire -- for example whether the API serializes \"0.20\" or \"0.2\", or a JSON number rather than a string. Any future raw-wire capture must retain the venue's original strings verbatim in a separate fixture before wire-lexeme claims are made.",
+  "examples": [
+    {
+      "name": "fee-model-snapshot",
+      "payload": {
+        "effective_date": "2026-08-24",
+        "formula": "fee = C * feeRate * p * (1 - p)",
+        "maker_fee_rate": "0",
+        "fee_currency": "USDC",
+        "rounding_decimal_places": 5,
+        "minimum_charged_fee": "0.00001",
+        "taker_fee_rate_by_category": {
+          "crypto": "0.07",
+          "sports": "0.05",
+          "finance": "0.04",
+          "politics": "0.04",
+          "mentions": "0.04",
+          "tech": "0.04",
+          "economics": "0.05",
+          "culture": "0.05",
+          "weather": "0.05",
+          "other": "0.05",
+          "geopolitics": "0"
+        }
+      }
+    },
+    {
+      "name": "maker-rebate-snapshot",
+      "payload": {
+        "effective_date": "2026-08-24",
+        "payout_currency": "pUSD",
+        "payout_schedule": "daily 00:00 UTC",
+        "minimum_payout": "1",
+        "pool_share_by_category": {
+          "crypto": "0.2",
+          "sports": "0.15",
+          "default": "0.25",
+          "geopolitics": "0"
+        },
+        "weighting": "fee_equivalent = C * feeRate * p * (1 - p)",
+        "payout_formula": "(your_fee_equivalent / total_fee_equivalent) * rebate_pool per market"
+      }
+    },
+    {
+      "name": "taker-rebate-snapshot",
+      "payload": {
+        "effective_date": "2026-08-24",
+        "program_launch": "2026-05-28",
+        "weighted_volume_formula": "wV = size * (1 - entry_price) * category_weight * bonuses",
+        "category_weight_range": { "min": "1", "max": "2.3", "geopolitics": "0" },
+        "tiers": [
+          { "tier": "Bronze", "threshold_usd": "2000", "rebate_rate": "0.03" },
+          { "tier": "Silver", "threshold_usd": "20000", "rebate_rate": "0.08" },
+          { "tier": "Gold", "threshold_usd": "200000", "rebate_rate": "0.18" },
+          { "tier": "Platinum", "threshold_usd": "1000000", "rebate_rate": "0.32" },
+          { "tier": "Diamond", "threshold_usd": "4000000", "rebate_rate": "0.44" },
+          { "tier": "Obsidian", "threshold_usd": "10000000", "rebate_rate": "0.5" }
+        ],
+        "payout_currency": "pUSD",
+        "payout_schedule": "daily 00:00 UTC",
+        "minimum_payout": "1"
+      }
+    },
+    {
+      "name": "liquidity-rewards-market-settings",
+      "payload": {
+        "effective_date": "2026-08-24",
+        "sampling_interval_seconds": 60,
+        "samples_per_epoch": 10080,
+        "scaling_factor_c": "3",
+        "score_function": "S(v,s) = ((v - s) / v)^2 * b",
+        "single_sided_midpoint_band": { "low": "0.1", "high": "0.9" },
+        "market_settings_example": {
+          "rewardsMinSize": "100",
+          "rewardsMaxSpread": 3,
+          "holdingRewardsEnabled": true,
+          "clobRewards": [
+            {
+              "id": "sanitized-reward-id-0001",
+              "conditionId": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+              "assetAddress": "0x0000000000000000000000000000000000000000",
+              "rewardsAmount": "10000",
+              "rewardsDailyRate": "100",
+              "startDate": "2026-07-01",
+              "endDate": "2026-07-31"
+            },
+            {
+              "id": "sanitized-reward-id-0002",
+              "conditionId": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+              "assetAddress": "0x0000000000000000000000000000000000000000",
+              "rewardsAmount": "5000",
+              "rewardsDailyRate": "50",
+              "startDate": "2026-08-01",
+              "endDate": null
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

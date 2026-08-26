@@ -1,0 +1,47 @@
+{
+  "fixture": "market-ws/price-change",
+  "source": "https://docs.polymarket.com/market-data/websocket/market-channel",
+  "retrieved": "2026-08-24",
+  "sanitized": true,
+  "notes": "Batched 'price_change' events. The 'level-removed' example uses size '0' per handoff SS23 absolute-size semantics; the current official page does not explicitly document absolute-vs-delta semantics, so this specific example is UNVERIFIED (conflict C-1 in docs/venue/verified-2026-08-24.md) pending WP-070 confirmation.",
+  "examples": [
+    {
+      "name": "level-updated",
+      "payload": {
+        "event_type": "price_change",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "price_changes": [
+          {
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "price": "0.08",
+            "size": "33343.4",
+            "side": "BUY",
+            "hash": "56621a121a47ed9333273e21c83b660cff37ae50",
+            "best_bid": "0.08",
+            "best_ask": "0.09"
+          }
+        ],
+        "timestamp": "1782753357257"
+      }
+    },
+    {
+      "name": "level-removed-absolute-zero-UNVERIFIED",
+      "payload": {
+        "event_type": "price_change",
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "price_changes": [
+          {
+            "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+            "price": "0.08",
+            "size": "0",
+            "side": "BUY",
+            "hash": "0000000000000000000000000000000000000001",
+            "best_bid": "0.07",
+            "best_ask": "0.09"
+          }
+        ],
+        "timestamp": "1782753358000"
+      }
+    }
+  ]
+}
