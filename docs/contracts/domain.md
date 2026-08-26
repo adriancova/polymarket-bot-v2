@@ -549,3 +549,26 @@ Strictly additive work — registering a contract for a genuinely new event type
 adding a new optional field under a new schema version, adding tests — still
 requires orchestrator approval and path ownership, but does not by itself
 reopen an accepted ADR.
+
+---
+
+## 10. ADR cross-reference
+
+Added by `WP-030` (additive only; no decision in §1–§9 is changed). The
+decisions this document records were ratified on 2026-08-26 by the following
+accepted ADRs, which are now the change-control gate referenced in §9:
+
+| This document | Ratifying ADR |
+| --- | --- |
+| §3.1–§3.5 decimal grammar, three-grammar split, precision/rounding, hashing, tick conformance | [ADR-001](../adr/ADR-001-exact-decimal-representation.md) |
+| §4 economic fields never accept `number` | [ADR-001](../adr/ADR-001-exact-decimal-representation.md) §7 |
+| §5.1–§5.3 versioning policy and registry; §6.1 gap/resync literals; §6.3 provenance authority and the reserved payload key `venue`; §6.4 `TradingParametersChanged` vocabulary; §7 strict objects | [ADR-002](../adr/ADR-002-event-envelope-and-ordering-semantics.md) |
+| §6.2 `MarketResolved` terminal-outcome subset and the `DISPUTED` ruling | [ADR-009](../adr/ADR-009-settlement-spec-and-payoff-model-selection.md) §3–§4 |
+| §8 inferred `QuoteLevel` / `BasketLeg` shapes, intent `marketId`, non-negative caps, unformatted identifiers | [ADR-005](../adr/ADR-005-strategy-purity-and-decision-result.md) §7 |
+| §1 `StrategyContext` and the §7.6 views deliberately absent (owned by `WP-170`) | [ADR-005](../adr/ADR-005-strategy-purity-and-decision-result.md) §6 |
+| §2 dependency direction | [`dependency-direction.md`](./dependency-direction.md) |
+| §9 contract freeze | [`protected-contracts.md`](./protected-contracts.md) §3 |
+
+Runtime parsers built on these contracts must not inherit the `WP-000`
+fixture-only narrowings; the binding list is
+[ADR-002](../adr/ADR-002-event-envelope-and-ordering-semantics.md) §7.
