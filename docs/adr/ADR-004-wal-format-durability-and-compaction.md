@@ -61,12 +61,31 @@ export type RawFrameRecord = {
 re-serialized form, and `payloadSha256` is computed over those bytes. Normalizing
 before recording would destroy the evidence the recording exists to preserve.
 
-**Binary frames are out of scope of this format.** Every feed currently in scope
-delivers JSON text frames over WebSocket — the Polymarket market and user
-channels (venue report §3, §4) and the RTDS TWAP stream (venue report §10.3). If
-a future feed delivers binary payloads, `payloadUtf8` cannot hold them and this
-ADR must be amended (a base64 field, or a separate binary segment format) rather
-than silently reinterpreted.
+**Binary frames are out of scope of this format**, because `payloadUtf8` is a
+UTF-8 string. What the frozen report actually establishes about framing, and what
+it does not:
+
+- **Verified as JSON text: the two Polymarket CLOB WebSocket channels and RTDS.**
+  The market channel and the authenticated user channel deliver JSON event frames
+  (venue report §3, §4), and the RTDS TWAP stream delivers JSON update payloads
+  (venue report §10.3).
+- **Not every frame is JSON.** The same report records the application-level
+  heartbeat as the bare **text** frames `PING` and `PONG` — every 10 seconds on
+  the CLOB channels (venue report §3, §4) and every 5 seconds on RTDS (venue
+  report §10.3). These are text but not JSON, and §6 requires the WAL to store
+  them **verbatim** in `payloadUtf8` like any other frame. A reader of a WAL
+  segment must therefore not assume every `payloadUtf8` parses as JSON.
+- **Not covered by the report: the reference feeds.** The Binance and Coinbase
+  reference streams are in scope for the system (handoff §4, §9.1: "Maintain
+  Binance and Coinbase reference subscriptions"), but
+  `docs/venue/verified-2026-08-24.md` verifies **no** Binance or Coinbase fact at
+  all, framing included. Their frame encoding is **to verify** in `WP-080` and
+  `WP-090`. Nothing here asserts that they are text.
+
+If any feed — a reference feed at `WP-080`/`WP-090`, or a future one — delivers
+binary payloads, `payloadUtf8` cannot hold them and this ADR must be amended (a
+base64 field, or a separate binary segment format) rather than silently
+reinterpreted.
 
 ### 2. Segment structure
 
@@ -208,7 +227,9 @@ and hashes reconcile", "Manifest pins incident exclusions and schema versions").
 
 **Venue facts** (`docs/venue/verified-2026-08-24.md`, verified 2026-08-24;
 snapshot, re-verify each phase per handoff §1.2) — used only to establish that
-recorded frames are JSON text and that protocol frames exist:
+the **Polymarket** feeds carry JSON event frames and that non-JSON protocol
+frames exist on them. The report covers no Binance or Coinbase framing fact
+(§1 above):
 
 - §3 — market channel over `wss://ws-subscriptions-clob.polymarket.com/ws/market`;
   JSON event frames; client sends the text frame `PING` every 10 seconds and the

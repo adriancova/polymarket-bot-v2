@@ -57,14 +57,16 @@ owner's real position in any projection.
 ### 3. Why this is a venue-level constraint
 
 The venue nets at the **account and signer** level. Every mechanism a second live
-owner would touch is shared, and each is a verified venue fact:
+owner would touch is shared. Each row below cites the verified report for the
+shared resource itself; where the report is **silent** about the venue's behavior
+under contention, the row says so rather than inferring an outcome:
 
-| Shared resource | Verified fact |
+| Shared resource | What the report establishes — and where it is silent |
 | --- | --- |
 | Collateral and inventory | Buying consumes pUSD; selling requires outcome-token inventory; every YES/NO pair is backed by exactly $1 of collateral through the CTF contracts (venue report §10.2). Two owners spend the same balance and the same tokens. |
-| Rate-limit budgets | Per-signer **order and cancel token buckets**, with documented token costs and all-or-nothing batches — "A batch is admitted only when the bucket contains enough tokens for every entry" (venue report §8). Two owners contend for one bucket, and the loser's *safety cancel* is the one that fails. |
+| Rate-limit budgets | Per-signer **order and cancel token buckets**, with documented token costs and all-or-nothing batch admission — "A batch is admitted only when the bucket contains enough tokens for every entry. Otherwise, the entire request is rejected" (venue report §8). Two owners draw on the *same* buckets, so either one's traffic can consume the budget the other needs. The report does not describe any arbitration between competing callers on one signer, so a **safety cancel may be delayed or denied** because of the other owner's activity. That is a contention risk, not a determinate outcome: nothing in the report says which request loses. With one live owner the §6 invariant 13 priority (safety cancellation outranks new placement) is schedulable in a single place; with two, nothing arbitrates the shared bucket. |
 | Order heartbeat | `POST /v1/heartbeats` uses a **rotating ID**, and venue-side cancellation is scoped to the **CLOB API credentials**, not to a process (venue report §5). Two owners on one credential set cannot be told apart by the venue. |
-| Self-trade exposure | Two owners quoting the same market on opposite sides trade against each other at the account level, paying taker fees for the privilege — fees are taker-only, `fee = C × feeRate × p × (1 − p)` (venue report §6). |
+| Offsetting quotes and fee cost | Two owners quoting opposite sides of one market can **economically offset** each other: the account ends up holding both sides, so the positions net while each execution still pays the documented fee — takers only, `fee = C × feeRate × p × (1 − p)`, makers pay nothing (venue report §6). **Whether the venue's matching engine will match two orders from the same account or signer is NOT DOCUMENTED in the frozen report** — no self-trade prevention, and no self-trade permission, is asserted here. It is a gap (see `docs/handoffs/WP-030.md` `follow_up`), and the offsetting risk stands whether the two orders meet each other or meet the book separately. |
 
 The venue therefore cannot enforce the separation for us, and it cannot even
 report it: an order response, a trade event, and a position read all describe the
@@ -158,10 +160,15 @@ snapshot, re-verify each phase per handoff §1.2):
 
 - §5 — the order-heartbeat protocol with ID rotation, and venue-side cancellation
   scoped to "all open orders owned by those CLOB API credentials".
-- §6 — taker-only fees and the fee formula (the cost of an account-level
-  self-trade). Snapshot of volatile program parameters.
+- §6 — taker-only fees and the fee formula `fee = C × feeRate × p × (1 − p)`,
+  which is the documented cost offsetting quotes still incur. Snapshot of
+  volatile program parameters. The report documents **no** account-level or
+  signer-level matching behavior, so nothing about same-account matching is
+  claimed from it.
 - §8 — per-signer order and cancel token buckets, token costs, and all-or-nothing
-  batch admission. Snapshot with effective date 2026-08-24.
+  batch admission. Snapshot with effective date 2026-08-24. The report documents
+  **no** arbitration between competing callers sharing one signer's buckets, so
+  contention is stated as a risk, not as a determined loser.
 - §10.2 — buying consumes pUSD, selling requires outcome-token inventory, and
   every YES/NO pair is backed by exactly $1 of collateral through the CTF
   contracts.

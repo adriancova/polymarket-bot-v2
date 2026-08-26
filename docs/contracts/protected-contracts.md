@@ -215,6 +215,8 @@ verification could not confirm. **None may be asserted as settled behavior.**
 | **U-7** Published `@polymarket/client` npm version | Not observable; everything is pinned to SDK commit `7fdbed4…` instead | §1, §12 | `WP-260` pins with a fresh check | ADR-007 §12; ADR-010 §4 |
 | **U-9** HTTP 425 response body during a matching-engine restart | No body documented; key on the status code alone | §9, §12 | `WP-260`/`WP-310` | ADR-007 §7 |
 | **No dedicated dispute event** | `DISPUTED` is non-terminal and has no venue-observed transition event | — (design gap, not a venue claim) | `WP-110`; add `MarketDisputed` under a new schema version if evidence appears | ADR-009 §4 |
+| **Same-account / same-signer matching behavior** (added review round 1) | Undocumented. The report gives the fee formula and per-signer rate limits but says nothing about whether the matching engine matches two orders from one account, nor whether any self-trade prevention exists | — (the report is silent; §6 covers fees only) | `WP-260`/`WP-310`; ADR-011 §6 requires the answer before any multi-live-owner design is discussable | ADR-011 §3 |
+| **Arbitration between callers sharing one signer's token buckets** (added review round 1) | Undocumented. §8 documents the buckets, token costs, and all-or-nothing batch admission, but no ordering or priority rule between competing callers | §8 (silent on arbitration) | `WP-310` rate-limit scheduling, which must implement §6 invariant 13's priority itself | ADR-011 §3 |
 
 Rule for all of these: **an ADR, a schema, or a code comment may state the item
 and its unverified status; none may state the underlying behavior as fact.** If a

@@ -206,8 +206,9 @@ Each cites the venue report; none is asserted on this ADR's own authority.
    (venue report §7.1). An adapter must accept both input forms and normalize to
    a canonical decimal string before the boundary. It must **not** copy the
    `WP-000` fixture catalog's parsed-layer-only strictness into a runtime parser
-   — see ADR-002 §"Fixture-only narrowings" and `docs/venue/verified-2026-08-24.md`
-   §7.1.
+   — see [ADR-002](./ADR-002-event-envelope-and-ordering-semantics.md) §7
+   ("Fixture-only narrowings must not be inherited by runtime parsers") and
+   `docs/venue/verified-2026-08-24.md` §7.1.
 3. **Full-accuracy TWAP.** RTDS TWAP updates carry both `value` (a JSON number)
    and `full_accuracy_value` (a string integer) (venue report §10.3). The
    exact-decimal ingestion path must use `full_accuracy_value` and must never

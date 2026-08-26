@@ -120,11 +120,26 @@ Venue grounding, all as of the verification date and all volatile:
 - Fees are **taker-only**: `fee = C × feeRate × p × (1 − p)`, symmetric around
   `p = 0.5`, rounded to 5 decimal places, minimum charged fee `0.00001`; makers
   pay no fees; taker `feeRate` for Crypto was `0.07` (venue report §6).
-- Maker rebates, taker rebates, and liquidity rewards are **pool-shared, paid
-  daily at midnight UTC, with a $1 minimum accrual** (venue report §6). They are
-  therefore *not* attributable to a single fill at fill time — which is exactly
-  why an estimate may not be booked as realized, and why a simulator may not
-  credit a rebate per simulated fill (ADR-012).
+- The three incentive programs are **not** one mechanism, and each is stated here
+  only as far as the report supports it (venue report §6):
+  - **Maker rebates** are **pool-shared**: funded from taker fees, with payout
+    `(your_fee_equivalent / total_fee_equivalent) × rebate_pool` per market,
+    distributed **daily at midnight UTC** in pUSD, minimum `$1` pUSD accrual.
+  - **Taker rebates** are **tiered**, not pool-shared: the rebate percentage
+    follows a tier of 30-day weighted volume `wV` (Bronze `$2k`/3% through
+    Obsidian `$10M+`/50%), with a **daily** pUSD payout, `$1` minimum, and no
+    backfill. The report states the payout is daily; it does **not** state a
+    midnight-UTC settlement time for this program, and none is assumed here.
+  - **Liquidity rewards** are **daily midnight-UTC** payouts to maker addresses,
+    `$1` minimum, scored from one-minute samples (10,080 per weekly epoch) by the
+    quadratic score `S(v,s) = ((v − s)/v)² · b` — a score accumulated over a
+    period, not a credit attached to a fill.
+
+  The property this ADR depends on is the one all three share: each is computed
+  over a **period** from **aggregate** activity and paid on a **daily cycle**, so
+  none is attributable to a single fill at fill time. That is exactly why an
+  estimate may not be booked as realized, and why a simulator may not credit a
+  rebate per simulated fill (ADR-012).
 
 ### 7. The USDC / pUSD denomination question is UNRESOLVED
 

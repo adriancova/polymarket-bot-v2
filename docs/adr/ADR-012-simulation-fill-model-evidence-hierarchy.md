@@ -104,11 +104,19 @@ verification report rather than assuming venue behavior.
    `0.07` as of 2026-08-24 (venue report §6). These are volatile program
    parameters; §12.5 requires the fee snapshot **version** to be pinned per run,
    and §9.13 forbids hardcoding them.
-5. **Rebates and rewards are not per-fill.** Maker rebates, taker rebates, and
-   liquidity rewards are **pool-shared, paid daily at midnight UTC, with a $1
-   minimum accrual** (venue report §6). A simulator therefore **may not credit a
-   rebate to a simulated fill**; reward modeling is a separate, clearly labeled
-   estimate (§9.16, ADR-006 §6), and core PnL excludes discretionary rewards (§6
+5. **Rebates and rewards are not per-fill credits**, and the three programs work
+   differently (venue report §6; see ADR-006 §6 for the same breakdown):
+   **maker rebates** are pool-shared out of taker fees
+   (`(your_fee_equivalent / total_fee_equivalent) × rebate_pool` per market),
+   paid daily at midnight UTC, `$1` minimum; **taker rebates** are tiered by
+   30-day weighted volume with a **daily** pUSD payout, `$1` minimum, and no
+   backfill (the report states no midnight-UTC time for this program);
+   **liquidity rewards** are scored from one-minute samples over a weekly epoch
+   and paid daily at midnight UTC, `$1` minimum. What matters for a fill model is
+   the shared property: each is computed over a period from aggregate activity and
+   paid on a daily cycle. A simulator therefore **may not credit a rebate to a
+   simulated fill**; reward modeling is a separate, clearly labeled estimate
+   (§9.16, ADR-006 §6), and core PnL excludes discretionary rewards (§6
    invariant 14).
 6. **Rate-limit budgets bound achievable action rates.** Per-signer order and
    cancel token buckets, with all-or-nothing batch admission, plus IP-level
