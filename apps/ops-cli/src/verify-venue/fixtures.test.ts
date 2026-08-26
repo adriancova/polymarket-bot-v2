@@ -31,9 +31,12 @@ import type {
 } from "./fixtures.js";
 import {
   CITATION_EXEMPT_SECTIONS,
+  REQUIRED_REPORT_SECTIONS,
   formatVenueVerificationReport,
   loadAndValidateReport,
+  reportHeadings,
   reportSectionHasOfficialCitation,
+  reportSectionText,
   runVenueVerification,
   validateVerificationReport,
   venueVerificationExitCode,
@@ -154,6 +157,64 @@ function reachableObjectSpecs(spec: PayloadSpec): readonly ReachableObjectSpec[]
 
   const visitObject = (objectSpec: ObjectSpec, path: string): void => {
     found.push({ path, spec: objectSpec });
+    for (const [key, field] of Object.entries(objectSpec.fields ?? {})) {
+      visitField(field, `${path}.${key}`);
+    }
+    if (objectSpec.values !== undefined) {
+      visitField(objectSpec.values, `${path}.*`);
+    }
+  };
+
+  if ("variants" in spec) {
+    for (const [name, variant] of Object.entries(spec.variants)) {
+      visitObject(variant, `<${name}>`);
+    }
+  } else {
+    visitObject(spec, "<root>");
+  }
+  return found;
+}
+
+interface ReachableFieldSpec {
+  readonly path: string;
+  readonly spec: FieldSpec;
+}
+
+/**
+ * Recursively collects EVERY field spec reachable from a payload spec, through
+ * the same edges as `reachableObjectSpecs` (variants, nested `fields`, array
+ * `items`, `union` alternatives, map `values`).
+ *
+ * Used by the round-5 nullability guard: `optional` and `nullable` are
+ * separate axes, and every `nullable` in the catalog has to be a documented
+ * venue nullable rather than a convenient way to make a test go green.
+ */
+function reachableFieldSpecs(spec: PayloadSpec): readonly ReachableFieldSpec[] {
+  const found: ReachableFieldSpec[] = [];
+  const seen = new Set<unknown>();
+
+  const visitField = (field: FieldSpec, path: string): void => {
+    if (seen.has(field)) {
+      return;
+    }
+    seen.add(field);
+    found.push({ path, spec: field });
+    if (field.type === "object") {
+      visitObject(field, path);
+      return;
+    }
+    if (field.type === "array" && field.items !== undefined) {
+      visitField(field.items, `${path}[]`);
+      return;
+    }
+    if (field.type === "union") {
+      (field.oneOf ?? []).forEach((alternative, index) => {
+        visitField(alternative, `${path}|${index}`);
+      });
+    }
+  };
+
+  const visitObject = (objectSpec: ObjectSpec, path: string): void => {
     for (const [key, field] of Object.entries(objectSpec.fields ?? {})) {
       visitField(field, `${path}.${key}`);
     }
@@ -1847,6 +1908,272 @@ describe("nested contract validation (negative cases)", () => {
   });
 });
 
+// --- Round-5 HIGH: `optional` governs key absence only ---------------------
+//
+// An earlier revision accepted `null` whenever EITHER `nullable` or `optional`
+// was true (`fixtures.ts` `validateObjectSpec`), so four fields accepted a
+// `null` that no official source documents. Two of them (`transactionsHashes`,
+// `tradeIDs`) are `z.array(z.string()).default([])` in the SDK, which
+// substitutes the default for an ABSENT key and rejects an explicit `null`, so
+// accepting it was a defect measured against the SDK itself. See report §17.
+describe("optional versus nullable (round-5 HIGH)", () => {
+  it("rejects an explicit null for an optional-but-not-nullable field", () => {
+    const spec = {
+      fields: {
+        required: { type: "string" },
+        optionalOnly: { type: "string", optional: true },
+      },
+    } as const satisfies PayloadSpec;
+    // Absent: fine. Explicit null: not fine.
+    expect(errorsFor({ required: "x" }, spec)).toEqual([]);
+    expect(
+      errorsFor({ required: "x", optionalOnly: null }, spec).some((error) =>
+        error.includes(
+          "optionalOnly: null is not an accepted value (the spec must declare nullable; optional governs key absence only)",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts an explicit null only when the spec declares BOTH optional and nullable", () => {
+    const spec = {
+      fields: {
+        required: { type: "string" },
+        documentedNullish: {
+          type: "boolean",
+          optional: true,
+          nullable: true,
+        },
+      },
+    } as const satisfies PayloadSpec;
+    expect(errorsFor({ required: "x" }, spec)).toEqual([]);
+    expect(errorsFor({ required: "x", documentedNullish: null }, spec)).toEqual(
+      [],
+    );
+    expect(errorsFor({ required: "x", documentedNullish: true }, spec)).toEqual(
+      [],
+    );
+    expect(
+      errorsFor({ required: "x", documentedNullish: "yes" }, spec).length,
+    ).toBeGreaterThan(0);
+  });
+
+  // The Chainlink TWAP page documents exactly two forms for `filters`:
+  // omission ("Omit it to receive every available symbol") and the compact
+  // JSON string. `null` is not among them.
+  // https://docs.polymarket.com/market-data/chainlink-twap (accessed 2026-08-26)
+  it("rejects a null RTDS subscriptions[].filters", () => {
+    const payload = exampleNamed("rtds/twap-update.json", "subscribe-request");
+    const subscriptions = payload["subscriptions"] as Array<
+      Record<string, unknown>
+    >;
+    subscriptions[0]!["filters"] = null;
+    expect(
+      errorsFor(
+        payload,
+        specOf("chainlink-twap-rtds"),
+        "subscribe-request",
+      ).some(
+        (error) =>
+          error.includes("subscriptions[0].filters") &&
+          error.includes("null is not an accepted value"),
+      ),
+    ).toBe(true);
+  });
+
+  it("still accepts an RTDS subscription that OMITS filters", () => {
+    const payload = exampleNamed(
+      "rtds/twap-update.json",
+      "subscribe-request-all-symbols-no-filters",
+    );
+    expect(
+      errorsFor(
+        payload,
+        specOf("chainlink-twap-rtds"),
+        "subscribe-request-all-symbols-no-filters",
+      ),
+    ).toEqual([]);
+  });
+
+  // SDK `OrderResponsePayloadSchema` (re-read verbatim at the pinned commit
+  // 2026-08-26): `tradeIDs: z.array(z.string()).default([])` and
+  // `transactionsHashes: z.array(z.string()).default([])`. `.default()` fills
+  // an ABSENT key; an explicit null fails to parse.
+  for (const arrayField of ["transactionsHashes", "tradeIDs"]) {
+    it(`rejects a null ${arrayField} on an order response (SDK .default([]))`, () => {
+      const payload = exampleNamed("orders/order-responses.json", "limit-live");
+      payload[arrayField] = null;
+      expect(
+        errorsFor(payload, specOf("order-schemas-and-types")).some(
+          (error) =>
+            error.includes(arrayField) &&
+            error.includes("null is not an accepted value"),
+        ),
+      ).toBe(true);
+    });
+
+    it(`still accepts an order response that OMITS ${arrayField}`, () => {
+      const payload = exampleNamed("orders/order-responses.json", "limit-live");
+      delete payload[arrayField];
+      expect(errorsFor(payload, specOf("order-schemas-and-types"))).toEqual([]);
+    });
+  }
+
+  it("rejects a null market-book hash", () => {
+    const payload = exampleNamed("market-ws/book-snapshot.json", "book-snapshot");
+    payload["hash"] = null;
+    expect(
+      errorsFor(payload, specOf("market-ws-book")).some(
+        (error) =>
+          error.includes("hash") &&
+          error.includes("null is not an accepted value"),
+      ),
+    ).toBe(true);
+  });
+
+  it("still accepts a market-book snapshot that OMITS hash", () => {
+    const payload = exampleNamed("market-ws/book-snapshot.json", "book-snapshot");
+    delete payload["hash"];
+    expect(errorsFor(payload, specOf("market-ws-book"))).toEqual([]);
+  });
+
+  // Catalog guard: `nullable` may not be blanket-added to keep tests green.
+  // Every entry below is a field whose OFFICIAL published type documents the
+  // null, cited in report §17. Adding a nullable anywhere else fails here.
+  it("every nullable field in the catalog is a documented venue nullable", () => {
+    const nullablePaths = fixtureChecks
+      .flatMap((check) =>
+        reachableFieldSpecs(check.payloadSpec)
+          .filter((entry) => entry.spec.nullable === true)
+          .map((entry) => `${check.id} ${entry.path}`),
+      )
+      .sort();
+    expect(nullablePaths).toEqual([
+      // `holdingRewardsEnabled?: boolean | null` and
+      // `endDate: IsoCalendarDateString | null`
+      // (https://docs.polymarket.com/market-data/market-details, 2026-08-26)
+      "fees-and-rewards <liquidity-rewards-market-settings>.market_settings_example.clobRewards[].endDate",
+      "fees-and-rewards <liquidity-rewards-market-settings>.market_settings_example.holdingRewardsEnabled",
+      // `outcome.transactionId: TransactionId | null`
+      // (https://docs.polymarket.com/trading/positions/manage, 2026-08-26)
+      "position-operations <split>.transaction_outcome.transactionId",
+      // SDK `MakerOrderSchema.fee_rate_bps` is `.nullable()` (clob/account.ts)
+      "rest-trade-settlement <root>.maker_orders[].fee_rate_bps",
+    ]);
+  });
+
+  it("the nullability guard sees a nullable added anywhere in a nested spec", () => {
+    // Mutation probe for the guard itself: a nullable buried three levels deep
+    // must be reported, otherwise the guard above could pass vacuously.
+    const nested: PayloadSpec = {
+      strict: true,
+      fields: {
+        outer: {
+          type: "object",
+          strict: true,
+          fields: {
+            items: {
+              type: "array",
+              items: {
+                type: "object",
+                strict: true,
+                fields: { leaf: { type: "string", nullable: true } },
+              },
+            },
+          },
+        },
+      },
+    };
+    expect(
+      reachableFieldSpecs(nested)
+        .filter((entry) => entry.spec.nullable === true)
+        .map((entry) => entry.path),
+    ).toEqual(["<root>.outer.items[].leaf"]);
+  });
+});
+
+// --- Round-5 MEDIUM-1: MarketRewards.holdingRewardsEnabled -----------------
+//
+// The strict `market_settings_example` spec enumerated only `rewardsMinSize`,
+// `rewardsMaxSpread`, and `clobRewards`, so a valid parsed `MarketRewards`
+// object carrying `holdingRewardsEnabled` was rejected as an unexpected key.
+// Published type: `holdingRewardsEnabled?: boolean | null` (Python
+// `bool | None`; Gamma field table `boolean`; SDK `z.boolean().nullish()`).
+// https://docs.polymarket.com/market-data/market-details and
+// https://github.com/Polymarket/ts-sdk/blob/7fdbed42484b5d279c71aa36d3757d18968260da/packages/bindings/src/gamma/market.ts
+// (both re-fetched read-only 2026-08-26).
+describe("MarketRewards.holdingRewardsEnabled (round-5 MEDIUM-1)", () => {
+  function rewardSettings(): {
+    payload: Record<string, unknown>;
+    settings: Record<string, unknown>;
+  } {
+    const payload = exampleNamed(
+      "fees/fee-reward-parameters.json",
+      "liquidity-rewards-market-settings",
+    );
+    return {
+      payload,
+      settings: payload["market_settings_example"] as Record<string, unknown>,
+    };
+  }
+
+  function rewardErrors(payload: Record<string, unknown>): string[] {
+    return errorsFor(
+      payload,
+      specOf("fees-and-rewards"),
+      "liquidity-rewards-market-settings",
+    );
+  }
+
+  for (const accepted of [true, false, null]) {
+    it(`accepts holdingRewardsEnabled: ${JSON.stringify(accepted)}`, () => {
+      const { payload, settings } = rewardSettings();
+      settings["holdingRewardsEnabled"] = accepted;
+      expect(rewardErrors(payload)).toEqual([]);
+    });
+  }
+
+  it("accepts an omitted holdingRewardsEnabled (the Gamma example omits it)", () => {
+    const { payload, settings } = rewardSettings();
+    delete settings["holdingRewardsEnabled"];
+    expect(rewardErrors(payload)).toEqual([]);
+  });
+
+  it("rejects a string holdingRewardsEnabled (published type is boolean)", () => {
+    const { payload, settings } = rewardSettings();
+    settings["holdingRewardsEnabled"] = "true";
+    expect(
+      rewardErrors(payload).some((error) =>
+        error.includes("holdingRewardsEnabled: expected boolean"),
+      ),
+    ).toBe(true);
+  });
+
+  it("freezes the boolean form in the fees fixture", () => {
+    const { settings } = rewardSettings();
+    expect(Object.hasOwn(settings, "holdingRewardsEnabled")).toBe(true);
+    expect(typeof settings["holdingRewardsEnabled"]).toBe("boolean");
+  });
+
+  it("enumerates the COMPLETE published MarketRewards field list", () => {
+    // `MarketRewards = { clobRewards?, rewardsMinSize?, rewardsMaxSpread?,
+    // holdingRewardsEnabled? }`. A strict spec that omits one of them rejects
+    // a valid parsed object, which is how MEDIUM-1 manifested.
+    const marketSettings = reachableObjectSpecs(specOf("fees-and-rewards")).find(
+      (entry) =>
+        entry.path ===
+        "<liquidity-rewards-market-settings>.market_settings_example",
+    );
+    expect(marketSettings).toBeDefined();
+    expect(Object.keys(marketSettings?.spec.fields ?? {}).sort()).toEqual([
+      "clobRewards",
+      "holdingRewardsEnabled",
+      "rewardsMaxSpread",
+      "rewardsMinSize",
+    ]);
+  });
+});
+
 describe("market data details", () => {
   it("price-change fixture includes the (UNVERIFIED) zero-size level-removal example", () => {
     const removal = examplesOf("market-ws/price-change.json").find((example) =>
@@ -2332,23 +2659,15 @@ describe("validation failure modes", () => {
   });
 });
 
-const REQUIRED_REPORT_SECTIONS = [
-  "1",
-  "2",
-  "3",
-  "4",
-  "5",
-  "6",
-  "7",
-  "8",
-  "9",
-  "10.1",
-  "10.2",
-  "10.3",
-  "11",
-  "12",
-  "13",
-] as const;
+/**
+ * The synthetic baseline uses the REAL required-section list imported from
+ * `index.ts`. Round-5 review finding MEDIUM-2: this file previously carried
+ * its OWN hardcoded copy, so the two lists could (and did) drift — §7.1 and
+ * §16 were ungated in the implementation and the tests could not notice.
+ */
+const EXEMPT_SECTIONS: readonly string[] = CITATION_EXEMPT_SECTIONS.map(
+  (entry) => entry.section,
+);
 
 function syntheticReport(
   overrides: Readonly<Record<string, string>> = {},
@@ -2356,12 +2675,31 @@ function syntheticReport(
   const body = REQUIRED_REPORT_SECTIONS.map((section) => {
     const text =
       overrides[section] ??
-      (section === "13"
-        ? "PAPER-only attestation about this repository.\n"
+      (EXEMPT_SECTIONS.includes(section)
+        ? "Prose about this repository, carrying no venue fact.\n"
         : "Source: https://docs.polymarket.com/x\n");
     return `## ${section}. Heading\n${text}`;
   }).join("\n");
   return `${body}\nUNVERIFIED inventory placeholder\n`;
+}
+
+/**
+ * Returns the frozen report with every official URL inside ONE section's own
+ * text replaced, leaving the rest of the document untouched. This is the
+ * reviewer's round-5 probe: strip §7.1's or §16's citations and the validator
+ * must fail.
+ */
+function reportWithSectionCitationsStripped(
+  content: string,
+  section: string,
+): string {
+  const text = reportSectionText(content, section);
+  expect(text, `section ${section} must exist`).not.toBeNull();
+  const stripped = (text ?? "").replace(
+    /https?:\/\/[^\s)\]>`"']+/g,
+    "<citation-redacted>",
+  );
+  return content.replace(text ?? "", stripped);
 }
 
 describe("verification report validation", () => {
@@ -2470,12 +2808,99 @@ describe("verification report validation", () => {
 
   it("citation exemptions are explicitly enumerated with a rationale", () => {
     expect(CITATION_EXEMPT_SECTIONS.length).toBeGreaterThan(0);
+    // §10 is a bare container heading; §13 is the safety attestation; §15 is
+    // the in-repo integration plan. Nothing else may be exempt: every venue
+    // fact must carry its own citation.
     expect(CITATION_EXEMPT_SECTIONS.map((entry) => entry.section)).toEqual([
+      "10",
       "13",
+      "15",
     ]);
     for (const entry of CITATION_EXEMPT_SECTIONS) {
       expect(entry.rationale.length).toBeGreaterThan(20);
     }
+  });
+
+  // --- Round-5 MEDIUM-2: §7.1 and §16 were outside the gate ---------------
+  //
+  // `REQUIRED_REPORT_SECTIONS` previously held only the check sections plus
+  // §11–§13, so the reviewer could strip every URL from §7.1 (parsed/raw
+  // reward-layer decision) or §16 (credential and authentication facts) and
+  // validation still passed. Neither is citation-exempt administrative prose.
+  for (const section of ["7.1", "16", "16.1", "2.1", "14"]) {
+    it(`FAILS when section ${section} loses its own citations`, () => {
+      const { content } = loadAndValidateReport();
+      expect(content).not.toBeNull();
+      const stripped = reportWithSectionCitationsStripped(
+        content ?? "",
+        section,
+      );
+      const validation = validateVerificationReport(stripped);
+      expect(validation.ok).toBe(false);
+      expect(
+        validation.errors.some((error) =>
+          error.includes(
+            `report section ${section} has no official citation of its own`,
+          ),
+        ),
+        validation.errors.join("; "),
+      ).toBe(true);
+    });
+  }
+
+  it("gates a parent and its subsections independently (7 does not cover 7.1)", () => {
+    const { content } = loadAndValidateReport();
+    const stripped = reportWithSectionCitationsStripped(content ?? "", "7.1");
+    // §7 keeps its own citation; only §7.1 is reported.
+    expect(reportSectionHasOfficialCitation(stripped, "7")).toBe(true);
+    expect(reportSectionHasOfficialCitation(stripped, "7.1")).toBe(false);
+    // ...and the reverse: a subsection's citation never rescues its parent.
+    const parentStripped = reportWithSectionCitationsStripped(
+      content ?? "",
+      "7",
+    );
+    expect(reportSectionHasOfficialCitation(parentStripped, "7")).toBe(false);
+    expect(reportSectionHasOfficialCitation(parentStripped, "7.1")).toBe(true);
+  });
+
+  it("every ##/### heading in the frozen report is covered by the gate", () => {
+    const { content } = loadAndValidateReport();
+    const headings = reportHeadings(content ?? "");
+    expect(headings.length).toBeGreaterThan(20);
+    for (const heading of headings) {
+      expect(heading.section, `"${heading.title}" is unnumbered`).not.toBeNull();
+      expect(
+        REQUIRED_REPORT_SECTIONS.includes(heading.section ?? "") ||
+          EXEMPT_SECTIONS.includes(heading.section ?? ""),
+        `section ${heading.section ?? "?"} escapes the evidence gate`,
+      ).toBe(true);
+    }
+  });
+
+  it("FAILS when a new section is appended without classifying it", () => {
+    const { content } = loadAndValidateReport();
+    const validation = validateVerificationReport(
+      `${content ?? ""}\n## 99. Newly added venue facts\n\nNo citation here.\n`,
+    );
+    expect(validation.ok).toBe(false);
+    expect(
+      validation.errors.some((error) =>
+        error.includes("report section 99 is not covered by the evidence gate"),
+      ),
+    ).toBe(true);
+  });
+
+  it("FAILS on an unnumbered heading, which has no stable gate anchor", () => {
+    const validation = validateVerificationReport(
+      `${syntheticReport()}\n## Appendix of assorted claims\n\nno number\n`,
+    );
+    expect(
+      validation.errors.some((error) =>
+        error.includes(
+          'report heading "Appendix of assorted claims" has no section number',
+        ),
+      ),
+    ).toBe(true);
   });
 
   it("fails when a required section lacks its own official citation", () => {

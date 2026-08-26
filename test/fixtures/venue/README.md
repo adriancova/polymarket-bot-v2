@@ -132,7 +132,19 @@ Wire-type conventions preserved by these fixtures and enforced by
   `verify-venue` rejects a JSON number for those three fields; a number would
   mean an un-parsed raw body had leaked in. `rewardsMaxSpread` stays a JSON
   number — it is `number`/`float` in every published representation. See
-  report §7.1 for the verbatim quotes and the SDK permalinks.
+  report §7.1 for the verbatim quotes and the SDK permalinks. The same object
+  carries `holdingRewardsEnabled` (`?: boolean | null`), which completes the
+  published `MarketRewards` field list; the frozen `true` is illustrative of
+  the documented shape, since the page's own JSON example omits the key.
+- **An absent key and a `null` value are different facts.** A fixture may omit
+  an optional key, but it may carry an explicit `null` only where an official
+  published type documents the null — currently
+  `TransactionOutcome.transactionId`, `clobRewards[].endDate`,
+  `holdingRewardsEnabled`, and the REST maker order's `fee_rate_bps`. Any
+  other `null` is rejected by `verify-venue`, including for fields the SDK
+  marks `.nullish()`. That is a deliberate narrowing for a frozen fixture set
+  and it must not be copied into a runtime parser; report §17 states the rule
+  and its limits.
 
 ## Caveats
 

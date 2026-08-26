@@ -24,11 +24,39 @@
  * discriminated variants (`event_type`, `operation`, or the example name) so
  * that no example can pass by making every field optional.
  *
+ * FIELD-LIST RE-AUDIT (2026-08-26, round 5). Round-5 review finding MEDIUM-1
+ * found the claim above false for one schema: the strict per-market reward
+ * spec omitted `MarketRewards.holdingRewardsEnabled`, so a valid parsed object
+ * was rejected as carrying an unexpected key. Every other source field list was
+ * then re-read verbatim at the pinned commit and compared key-by-key —
+ * `MarketPriceChangeEventSchema`, `PriceChangeSchema`,
+ * `MarketTickSizeChangeEventSchema`, `MarketLastTradePriceEventSchema`,
+ * `MarketBestBidAskEventSchema`, `NewMarketEventSchema` (22 keys),
+ * `MarketResolvedEventSchema`, `MarketEventMessageSchema`,
+ * `MarketBookEventSchema`, `OrderBookLevelSchema`, `UserOrderEventSchema`
+ * (19 keys), `UserTradeEventSchema` (23 keys), `TradeMakerOrderSchema`,
+ * `ClobTradeSchema` (18 keys), `MakerOrderSchema`,
+ * `OrderResponsePayloadSchema`, `ClobRewardsSchema`, and `MarketRewards` —
+ * and no other gap was found.
+ *
  * Deliberate narrowings beyond the SDK (each stricter, never looser) are
  * marked NARROWING in comments: the SDK types prices as unbounded
  * `DecimalString`, while handoff SS7.3 requires canonical decimals with prices
  * in [0, 1]; the SDK types some side/status fields as free strings where the
  * documentation enumerates the values.
+ *
+ * OPTIONALITY vs NULLABILITY (round-5 review finding HIGH). `optional: true`
+ * means only that the key may be ABSENT. An explicit `null` is accepted ONLY
+ * where the spec also declares `nullable: true`, and every `nullable` in this
+ * catalog cites an official published type that documents `| null`. The four
+ * documented nullables are `REST_MAKER_ORDER.fee_rate_bps` (SDK
+ * `.nullable()`), `TransactionOutcome.transactionId`
+ * (`TransactionId | null`), `clobRewards[].endDate`
+ * (`IsoCalendarDateString | null`), and `holdingRewardsEnabled`
+ * (`boolean | null`). Several SDK schemas use `.nullish()`, so rejecting an
+ * explicit `null` for the remaining optional fields is a deliberate
+ * NARROWING appropriate to a frozen documentation snapshot; report §17
+ * records it, and a runtime adapter must not inherit it.
  *
  * `kind: "fixture"` checks are structurally validated against local fixture
  * files. `kind: "documented"` checks have no meaningful local fixture (for
@@ -332,6 +360,20 @@ const FEES_SPEC: PayloadSpec = {
         //   https://github.com/Polymarket/ts-sdk/blob/7fdbed42484b5d279c71aa36d3757d18968260da/packages/bindings/src/shared.ts
         //     (`DecimalishSchema`, `ClobRewardIdSchema`,
         //     `ConditionIdResponseSchema`, `IsoCalendarDateStringSchema`)
+        //
+        // COMPLETE FIELD LIST. The official `MarketRewards` type is
+        // `{ clobRewards?: ClobRewards[] | null; rewardsMinSize?:
+        // DecimalString | null; rewardsMaxSpread?: number | null;
+        // holdingRewardsEnabled?: boolean | null }`
+        // (https://docs.polymarket.com/market-data/market-details, re-fetched
+        // read-only 2026-08-26) and the SDK schema is
+        // `clobRewards: z.array(ClobRewardsSchema).nullish(), rewardsMinSize:
+        // DecimalishSchema.nullish(), rewardsMaxSpread: z.number().nullish(),
+        // holdingRewardsEnabled: z.boolean().nullish()`
+        // (gamma/market.ts at the pinned commit, retrieved 2026-08-26). All
+        // four are enumerated below; round-5 review finding MEDIUM-1 found
+        // `holdingRewardsEnabled` missing, which made the strict spec reject a
+        // valid parsed object.
         market_settings_example: {
           type: "object",
           strict: true,
@@ -346,6 +388,24 @@ const FEES_SPEC: PayloadSpec = {
             // string: it is a spread in cents, not a monetary amount.
             // NARROWING: kept present and non-null.
             rewardsMaxSpread: { type: "number" },
+            // `holdingRewardsEnabled?: boolean | null` (Python
+            // `holding_rewards_enabled: bool | None`; Gamma field table
+            // "holdingRewardsEnabled | boolean | Indicates if holding rewards
+            // are active"; SDK `z.boolean().nullish()`). Optional AND nullable
+            // exactly as published — the one field in this object whose
+            // documented `| null` is honoured rather than narrowed, because
+            // unlike its siblings it is not part of the frozen liquidity
+            // snapshot's asserted shape. The Gamma JSON example on the page
+            // omits it, so absence is documented too.
+            //   https://docs.polymarket.com/market-data/market-details
+            //     (re-fetched read-only 2026-08-26)
+            //   https://github.com/Polymarket/ts-sdk/blob/7fdbed42484b5d279c71aa36d3757d18968260da/packages/bindings/src/gamma/market.ts
+            //     (retrieved 2026-08-26)
+            holdingRewardsEnabled: {
+              type: "boolean",
+              optional: true,
+              nullable: true,
+            },
             clobRewards: {
               type: "array",
               items: {
@@ -654,7 +714,9 @@ const RTDS_UPDATE_VARIANT: ObjectSpec = {
  * `payload.symbol` client-side):
  * https://docs.polymarket.com/market-data/chainlink-twap (accessed
  * 2026-08-26). When present it must be the exact compact JSON form with one
- * lowercase symbol and no spaces.
+ * lowercase symbol and no spaces. The page documents exactly two forms —
+ * omission or the compact JSON string — and never `filters: null`, so the
+ * spec is deliberately NOT `nullable` (round-5 review finding HIGH).
  */
 const RTDS_SUBSCRIBE_VARIANT: ObjectSpec = {
   strict: true,
@@ -727,6 +789,10 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     // SDK OrderResponsePayloadSchema (clob/order-response.ts): every field
     // required except tradeIDs/transactionsHashes, which carry `.default([])`.
     // makingAmount/takingAmount are preprocessed from '' to '0'.
+    // `.default([])` supplies the array when the key is ABSENT and rejects an
+    // explicit `null`, so neither array is `nullable` here — matching the SDK
+    // exactly, not narrowing it (round-5 review finding HIGH; schema
+    // re-verified verbatim at the pinned commit 2026-08-26).
     // NARROWING: `status` is `z.string()` in the SDK; the documented placement
     // statuses plus the empty failure value are enumerated here.
     payloadSpec: {
@@ -756,7 +822,15 @@ export const VENUE_CHECKS: readonly VenueCheck[] = [
     reportSection: "3",
     kind: "fixture",
     fixtures: ["market-ws/book-snapshot.json"],
-    // SDK MarketBookEventSchema (subscriptions/clob.ts).
+    // SDK MarketBookEventSchema (subscriptions/clob.ts), re-verified verbatim
+    // at the pinned commit 2026-08-26: event_type, market, asset_id, bids,
+    // asks, hash, timestamp, min_order_size, tick_size, neg_risk,
+    // last_trade_price — the complete field list.
+    // NARROWING: the SDK marks `hash`, `timestamp` and `neg_risk`
+    // `.nullish()`, so it would accept an explicit `null`; the documented book
+    // event always carries a string `hash`, so this frozen snapshot accepts
+    // ABSENCE but rejects `hash: null` (round-5 review finding HIGH). Report
+    // §17 records the narrowing; a runtime adapter must not inherit it.
     payloadSpec: {
       strict: true,
       fields: {

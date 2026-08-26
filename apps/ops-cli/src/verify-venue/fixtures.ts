@@ -8,6 +8,13 @@
  * Heterogeneous fixtures are validated through discriminated variants so that
  * no example can pass by making every field optional.
  *
+ * Optionality and nullability are SEPARATE axes and are never conflated:
+ * `optional` means the key may be ABSENT, `nullable` means the value may be
+ * `null`. An `optional` field that receives an explicit `null` is an error
+ * unless the same spec also declares `nullable`, and every `nullable` in the
+ * catalog must cite an official published type that documents `| null`
+ * (report §17).
+ *
  * Structural validation only: `packages/domain` does not exist yet, so no
  * domain schemas are imported. The schemas here are contract-shaped stand-ins
  * frozen against the official SDK raw schemas at the pinned reference commit
@@ -67,12 +74,25 @@ export interface FieldSpec {
   readonly type: FieldType;
   readonly enum?: readonly string[];
   /**
-   * SDK `.nullish()`: the key may be absent, `null`, or `undefined`.
-   * An absent optional key is not an error; a present one is still validated.
+   * KEY ABSENCE ONLY: the key may be missing (or explicitly `undefined`).
+   * A present key is still validated.
+   *
+   * `optional` does NOT permit an explicit `null`. Round-5 review finding
+   * HIGH: an earlier revision accepted `null` whenever EITHER `nullable` or
+   * `optional` was true, which silently admitted `filters: null`,
+   * `transactionsHashes: null`, `tradeIDs: null`, and `hash: null` — none of
+   * which any official source documents, and two of which the SDK's own
+   * `.default([])` rejects. Null is now accepted only where `nullable: true`
+   * is declared, and every such declaration must cite an official published
+   * type that says `| null` (see report §17).
    */
   readonly optional?: boolean;
   /**
-   * SDK `.nullable()`: the key must be present but its value may be `null`.
+   * The value may be `null`. Declare it ONLY for a field whose official
+   * published type documents `null` (for example
+   * `endDate: IsoCalendarDateString | null`). Combine with `optional` to model
+   * a documented `?: T | null` (SDK `.nullish()`); use alone for
+   * SDK `.nullable()`, where the key must be present but may be null.
    */
   readonly nullable?: boolean;
   /** Accepted total string lengths for `type: "hex-string"` (incl. `0x`). */
@@ -490,8 +510,13 @@ function validateObjectSpec(
     const present = Object.hasOwn(value, key);
     const entry = present ? value[key] : undefined;
     if (present && entry === null) {
-      if (fieldSpec.nullable !== true && fieldSpec.optional !== true) {
-        errors.push(`${fieldPath}: null is not an accepted value`);
+      // `optional` governs KEY ABSENCE only and never admits an explicit
+      // `null` (round-5 review finding HIGH). Only an explicit `nullable`,
+      // backed by an official published type, accepts null.
+      if (fieldSpec.nullable !== true) {
+        errors.push(
+          `${fieldPath}: null is not an accepted value (the spec must declare nullable; optional governs key absence only)`,
+        );
       }
       continue;
     }
