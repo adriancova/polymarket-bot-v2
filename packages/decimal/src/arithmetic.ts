@@ -160,12 +160,24 @@ export function divDecimal(
       `divDecimal: division by zero (${dividend} / ${divisor})`,
     );
   }
+  const requestedPrecision = options?.precision;
+  if (
+    requestedPrecision !== undefined &&
+    (!Number.isInteger(requestedPrecision) ||
+      requestedPrecision < 1 ||
+      requestedPrecision > EXACT_PRECISION)
+  ) {
+    throw new DecimalInexactError(
+      "DECIMAL_INEXACT",
+      `divDecimal: precision must be an integer in [1, ${String(EXACT_PRECISION)}], received ${String(requestedPrecision)}`,
+    );
+  }
   const Ctor =
     options === undefined || (options.precision === undefined && options.rounding === undefined)
       ? DivisionDecimal
       : Decimal.clone({
           ...BASE_CONFIG,
-          precision: options.precision ?? DIVISION_PRECISION,
+          precision: requestedPrecision ?? DIVISION_PRECISION,
           rounding: options.rounding ?? DIVISION_ROUNDING,
         });
   return render(new Ctor(dividend).div(divisor), "divDecimal");

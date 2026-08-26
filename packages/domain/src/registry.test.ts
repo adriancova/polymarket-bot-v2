@@ -59,8 +59,10 @@ describe("the frozen domain event registry", () => {
   });
 
   it("returns structured failures from the non-throwing variant", () => {
+    const marketOpened = EVENT_SAMPLES.find((entry) => entry.eventType === "MarketOpened");
+    expect(marketOpened).toBeDefined();
     const ok = DOMAIN_EVENT_REGISTRY.safeParseEnvelope(
-      sampleEnvelope("MarketOpened", 1, EVENT_SAMPLES[3]?.payload),
+      sampleEnvelope("MarketOpened", 1, marketOpened?.payload),
     );
     expect(ok.ok).toBe(true);
 

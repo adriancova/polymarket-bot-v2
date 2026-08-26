@@ -148,6 +148,12 @@ describe("division has an explicit rounding contract", () => {
     expect(() => divDecimal("1", "0")).toThrow(DecimalDivisionByZeroError);
     expect(() => divDecimalExact("1", "0")).toThrow(DecimalDivisionByZeroError);
   });
+
+  it("rejects an unusable requested precision with a typed error", () => {
+    for (const precision of [0, -1, 1.5, Number.NaN, 1e10]) {
+      expect(() => divDecimal("1", "3", { precision })).toThrow(DecimalInexactError);
+    }
+  });
 });
 
 describe("arithmetic properties", () => {
