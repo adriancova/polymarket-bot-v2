@@ -2,7 +2,7 @@
 
 Last updated: 2026-08-26  
 Specification version: 2.0.0  
-Current phase: `phase-0` — repository and venue verification  
+Current phase: `phase-1` — recording-ready (Wave 0 closed 2026-08-26)  
 Maximum permitted run mode: `PAPER`
 
 ## Safety state
@@ -161,9 +161,18 @@ table says otherwise.
   list completion; M5 grammar-duplication register + dropped follow-up; M6
   dependency-direction false fact; L9 decimal error-code defect; L11
   ops:verify-venue wiring; L12 ops-cli undeclared devDeps; N13 unratified
-  inferred shapes register) → dispatched 2026-08-26 as a single bounded
-  **Wave 0 closeout remediation package** (paths ratified in the dispatch
-  packet, review-gated). Wave 0 is recorded COMPLETE only when it merges.
+  inferred shapes register) → fixed in the bounded **Wave 0 closeout
+  remediation package**: candidate `42fbf2b` (impl `2d41c97`, base `b1431e4`),
+  independent review **ACCEPT** (0 blocker/high/medium; 1 low: handoff
+  evidence-scope wording on the errors test; book.ts comment-only proven by
+  identical stripped-transpile hash), merged `b8e5eab`, post-merge gates green
+  (1203/1203 tests; `pnpm ops:verify-venue` exit 0; audit + compose verified
+  earlier this closeout).
+
+**WAVE 0: COMPLETE (2026-08-26).** All four packages plus the closeout
+remediation merged and post-merge verified; both closeout audits' actionable
+items resolved or ownership-assigned; domain contracts frozen; run mode PAPER;
+no signer or credentials. Wave 1 authorized per the package table.
 
 ## Wave 0 review history (archived; all branches merged and worktrees removed)
 
