@@ -41,31 +41,72 @@
  *
  * Two non-contract rule ids appear in output alongside F1–F13:
  *   - `F-CLOSED` — the §6 fail-closed bullets (classification/mirror).
- *   - `F-OPAQUE` — a dynamic `import()` in a purity-restricted package whose
- *     specifier is not a static literal (an interpolated template, a variable,
- *     a concatenation). Such a specifier defeats static checking entirely, so
- *     inside `packages/domain`, `packages/strategies/**`, `packages/ledger`,
- *     and `packages/simulation` it is itself a finding rather than a silent
- *     pass. Elsewhere it is allowed (composition roots legitimately load
- *     modules by name); see `docs/handoffs/WP-015.md` for that trade-off.
+ *   - `F-OPAQUE` — a construct that makes F1–F8/F11 unevaluable inside a
+ *     purity-restricted package: a dynamic `import()` or a global `require()`
+ *     whose specifier is not a static literal (an interpolated template, a
+ *     variable, a concatenation), or a reference to `eval`/`Function`. Each
+ *     defeats static checking entirely, so inside `packages/domain`,
+ *     `packages/strategies/**`, `packages/ledger`, and `packages/simulation`
+ *     it is itself a finding rather than a silent pass. Elsewhere it is
+ *     allowed (composition roots legitimately load modules by name); see
+ *     `docs/handoffs/WP-015.md` for that trade-off.
  *
- * How source is read (this matters for both false negatives and false
- * positives). `lexSource` runs one pass that tracks code / line comment /
- * block comment / single- and double-quoted string / template literal /
- * regular-expression literal, with `${...}` re-entering code so that
- * `` `${Math.random()}` `` is still real code. It returns:
- *   - `code`: the file with the *contents* of comments, strings, templates and
- *     regex literals replaced by spaces, offsets and newlines preserved, so
- *     reported line numbers match the original file. Global/identifier
- *     patterns are matched against this, so prose or data that merely mentions
- *     `node:fs` or `Math.random()` cannot trip the check.
- *   - `literals`: every string/template literal with its span, its static
- *     value (or `null` when interpolated), and whether it interpolates.
- * Import specifiers are then taken from `literals` whose *preceding code*
- * places them in specifier position (`from`, bare `import`, `import(`,
- * `require(`). A specifier is therefore recognised in a template literal —
- * `` import(`node:fs`) `` is caught — while the same text in an ordinary
- * string is not a specifier and is not scanned.
+ * How source is read. Rule 3 uses the **TypeScript compiler API**
+ * (`ts.createSourceFile` + a full AST walk); there is no regular expression
+ * over source text anywhere in it. `typescript` is already a root
+ * devDependency and this tool runs after `pnpm install` in dev and CI, so this
+ * adds no dependency and does not touch the lockfile; if it cannot be resolved
+ * the check emits a `CHK` error and exits non-zero rather than scanning
+ * nothing. Comments and string data are inert in an AST, so text that merely
+ * *mentions* `node:fs` or `Math.random()` is structurally incapable of
+ * producing a finding, and a specifier is recognised wherever the grammar puts
+ * one regardless of intervening trivia. What the walk collects:
+ *
+ *   - **Module specifiers** (exact, position-independent): `ImportDeclaration`
+ *     and `ExportDeclaration` module specifiers (so `export * from "x"` counts),
+ *     `import x = require("x")` external module references, `import("x")` type
+ *     nodes, dynamic `import(...)`, and `require(...)` where the callee is the
+ *     identifier `require` and that identifier is *not* declared in an
+ *     enclosing scope of the file. A string literal or a
+ *     no-substitution template literal is a specifier; anything else is
+ *     `F-OPAQUE` in a purity-restricted package. A locally declared `require`
+ *     (a function, a parameter, an import) is not a module load; a *method*
+ *     call such as `registry.require(eventType, version)` is not one either,
+ *     because its callee is a property access rather than the bare identifier.
+ *   - **Impure globals** in `packages/domain` (F1) and `packages/strategies/**`
+ *     (F3/F11), detected by *identifier reference* rather than by call
+ *     spelling. See `GLOBAL_ROOTS` below for the exact semantics.
+ *   - **Syntax errors**, reported as `CHK`. The parser recovers from a broken
+ *     file and returns a partial tree; scanning that tree and reporting nothing
+ *     would be a silent coverage hole, so an unparseable file fails the run.
+ *
+ * KNOWN LIMIT — AST semantics, stated precisely so the boundaries are testable:
+ *   - **"Global" means "not declared in this file."** The walk maintains a
+ *     scope stack (source file, block, module block, `case` block, every
+ *     function-like node with its parameters and type parameters, class
+ *     declarations/expressions, `for`/`for-in`/`for-of` initialisers, and
+ *     `catch` clauses) whose names are hoisted on scope entry from that scope's
+ *     statement-level declarations. If an enclosing scope declares the name,
+ *     the reference is shadowed and is **not** a finding —
+ *     `function f(Date: string) { return Date; }` is clean. There is no type
+ *     checker and no cross-file resolution, so a `var` declared inside a nested
+ *     block and used in an outer scope is *not* seen as a shadow: that direction
+ *     produces a spurious finding naming an exact `file:line`, never a silent
+ *     pass.
+ *   - **Type positions are not value references.** The walk does not descend
+ *     into type nodes, so `const d: Date = ...` and `typeof process` are not
+ *     findings; `import("node:fs")` *type* nodes are still collected as
+ *     specifiers, and a heritage clause's expression (`class X extends Date`)
+ *     is still walked as a value.
+ *   - **`new Date(arg, ...)` with at least one argument is deliberately
+ *     allowed**: constructing a date from a value the caller already holds is
+ *     deterministic. Every other reference to `Date` is a finding, including a
+ *     bare one used as a value (`const D = Date`), because ADR-005 §1's
+ *     prohibition is absolute and an alias defeats any call-shape check.
+ *   - `globalThis.X`, `window.X`, `self.X` and `global.X` (dotted or with a
+ *     string index) are resolved to a reference to global `X`, so
+ *     `window.Date()` is the same finding as `Date()`; the environment root
+ *     itself is additionally reported.
  *
  * KNOWN LIMIT — the library catalogues below (`REDIS_CLIENTS`,
  * `DATABASE_CLIENTS`, `VENUE_SDKS`, `SIGNER_LIBRARIES`, `NETWORK_LIBRARIES`,
@@ -78,14 +119,15 @@
  * (contract §7) and that a workspace edge to an adapter package is still caught
  * by rule 2. Extend these lists when a new library enters the repository.
  *
- * No network, no credentials, no installed dependency: Node built-ins only.
+ * No network and no credentials. The only module loaded outside Node's
+ * built-ins is `typescript`, which the repository already installs.
  */
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { builtinModules } from "node:module";
+import { builtinModules, createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const CONTRACT_REL = "docs/contracts/dependency-direction.md";
 const WORKSPACE_REL = "pnpm-workspace.yaml";
@@ -259,50 +301,134 @@ const IMPURE_BUILTINS = new Map([
 ]);
 
 /**
- * F1 (clock/randomness in `packages/domain`) / F11 (clock and unseeded
- * randomness in a strategy). Matched against lexed code, so the same text in a
- * comment or a string literal is not a hit.
- *
- * `Date` is read three ways and all three are here: `Date.now()`, `new Date()`
- * with no argument, and a **bare `Date(...)` call**, which returns the current
- * time as a string regardless of its arguments and was the gap the round-1
- * review found (HIGH(b)). `new Date(<argument>)` is deliberately *not* matched:
- * constructing a date from a value the caller already has is deterministic.
+ * Families of impure global. The family selects the rule id: clock and
+ * randomness are F11 in a strategy (contract §3), environment and network are
+ * F3 (ADR-005 §1's I/O list); inside `packages/domain` all four are F1.
  */
-const IMPURE_GLOBALS = [
-  { pattern: /\bDate\s*\.\s*now\s*\(/g, what: "clock (`Date.now()`)" },
-  { pattern: /new\s+Date\s*\(\s*\)/g, what: "clock (`new Date()`)" },
-  { pattern: /(?<![.$\w])(?<!\bnew\s{1,64})Date\s*\(/g, what: "clock (`Date()`)" },
-  { pattern: /\bperformance\s*\.\s*now\s*\(/g, what: "clock (`performance.now()`)" },
-  { pattern: /\bprocess\s*\.\s*hrtime\b/g, what: "clock (`process.hrtime`)" },
-  { pattern: /\bMath\s*\.\s*random\s*\(/g, what: "unseeded randomness (`Math.random()`)" },
-  {
-    pattern: /\bcrypto\s*\.\s*(?:randomUUID|getRandomValues|randomBytes)\s*\(/g,
-    what: "unseeded randomness (`crypto` random)",
-  },
-];
-
-/** F1/F3: process and environment globals (ADR-005 §1 "environment"). */
-const PROCESS_GLOBALS = [
-  { pattern: /\bprocess\s*\.\s*[A-Za-z_$]/g, what: "process global (`process.*`)" },
-  { pattern: /\bglobalThis\b/g, what: "process global (`globalThis`)" },
-  { pattern: /\bimport\s*\.\s*meta\b/g, what: "module environment (`import.meta`)" },
-];
+const CLOCK = "clock";
+const RANDOMNESS = "randomness";
+const ENVIRONMENT = "environment";
+const NETWORK = "network";
 
 /**
- * F1/F3: network reachable through a global, with no import to catch
- * (WP-015 review round 1, HIGH(c)). `node:http`, `node:https`, `node:net`,
- * `node:tls`, `node:dgram` and `node:dns` have no global form — they can only
- * be imported — so they are covered by `IMPURE_BUILTINS` above and are not
- * repeated here.
+ * Roots whose property access is unwrapped: `globalThis.Date`, `window.Date`,
+ * `self.Date` and `global.Date` are references to the global `Date`. Round 2
+ * found `window.Date()` passing because the old catalogue matched call
+ * spellings rather than references.
  */
-const NETWORK_GLOBALS = [
-  { pattern: /(?<![.$\w])fetch\s*\(/g, what: "network (`fetch()`)" },
-  { pattern: /(?<![.$\w])WebSocket\s*\(/g, what: "network (`WebSocket`)" },
-  { pattern: /(?<![.$\w])XMLHttpRequest\s*\(/g, what: "network (`XMLHttpRequest`)" },
-  { pattern: /(?<![.$\w])EventSource\s*\(/g, what: "network (`EventSource`)" },
-  { pattern: /\bnavigator\s*\.\s*sendBeacon\s*\(/g, what: "network (`navigator.sendBeacon()`)" },
-];
+const ENVIRONMENT_ROOTS = new Set(["globalThis", "window", "self", "global"]);
+
+/** `crypto` members that are unseeded randomness by name. */
+const CRYPTO_RANDOM_MEMBERS = new Set([
+  "randomUUID",
+  "getRandomValues",
+  "randomBytes",
+  "randomInt",
+  "randomFill",
+  "randomFillSync",
+]);
+
+/**
+ * Globals that evaluate code the checker cannot read. A reference to one of
+ * them inside a purity-restricted package is `F-OPAQUE` for the same reason a
+ * computed `import()` specifier is: whatever they evaluate is unevaluable by
+ * F1-F8/F11.
+ */
+const EVALUATORS = new Set(["eval", "Function"]);
+
+/**
+ * The global identifiers rule 3 rejects inside a purity-restricted package,
+ * and every global root the scanner knows about. `classifyGlobalUse` below is
+ * the single place that decides what a *reference* to one of them means.
+ */
+const GLOBAL_ROOTS = new Set([
+  "Date",
+  "Math",
+  "performance",
+  "crypto",
+  "process",
+  "navigator",
+  "fetch",
+  "WebSocket",
+  "XMLHttpRequest",
+  "EventSource",
+  "setTimeout",
+  "setInterval",
+  "setImmediate",
+  ...ENVIRONMENT_ROOTS,
+]);
+
+/**
+ * F1 (`packages/domain`) / F3 and F11 (`packages/strategies/**`): what a
+ * reference to a global name means.
+ *
+ * `use` describes the *reference*, not a text pattern: `member` is the property
+ * read off it (`Date.now` → `"now"`), `isCalled`/`isNew` say whether the
+ * resulting value is immediately called or constructed, and `argumentCount` is
+ * that call's arity.
+ *
+ * Detecting by reference is what closes the round-2 aliasing bypasses: a bare
+ * `Date` (`const D = Date; D()`) is a finding because ADR-005 §1's prohibition
+ * is absolute and no call-shape check survives an alias. The single deliberate
+ * exception is `new Date(argument, ...)`, which is deterministic.
+ *
+ * `Math` is the one root with a pure majority, so only `Math.random` and a bare
+ * `Math` reference (which can reach `random` through an alias or a destructure)
+ * are findings; `Math.max(a, b)` is not.
+ */
+function classifyGlobalUse(name, use) {
+  switch (name) {
+    case "Date":
+      if (use.member === "now") return { family: CLOCK, what: "clock (`Date.now()`)" };
+      if (use.isNew) {
+        return use.argumentCount >= 1 ? null : { family: CLOCK, what: "clock (`new Date()`)" };
+      }
+      if (use.isCalled && use.member === null) return { family: CLOCK, what: "clock (`Date()`)" };
+      if (use.member !== null) return { family: CLOCK, what: `clock (\`Date.${use.member}\`)` };
+      return { family: CLOCK, what: "clock (`Date` reference, which can be aliased and called later)" };
+    case "Math":
+      if (use.member === "random") return { family: RANDOMNESS, what: "unseeded randomness (`Math.random()`)" };
+      if (use.member === null) {
+        return {
+          family: RANDOMNESS,
+          what: "unseeded randomness (`Math` reference, from which `Math.random` is reachable)",
+        };
+      }
+      return null;
+    case "performance":
+      if (use.member === "now") return { family: CLOCK, what: "clock (`performance.now()`)" };
+      if (use.member === null) return { family: CLOCK, what: "clock (`performance` reference)" };
+      return { family: CLOCK, what: `clock (\`performance.${use.member}\`)` };
+    case "crypto":
+      if (use.member !== null && CRYPTO_RANDOM_MEMBERS.has(use.member)) {
+        return { family: RANDOMNESS, what: "unseeded randomness (`crypto` random)" };
+      }
+      if (use.member === null) return { family: RANDOMNESS, what: "unseeded randomness (`crypto` reference)" };
+      return { family: RANDOMNESS, what: `unseeded randomness (\`crypto.${use.member}\`)` };
+    case "process":
+      if (use.member === "hrtime") return { family: CLOCK, what: "clock (`process.hrtime`)" };
+      return { family: ENVIRONMENT, what: "process global (`process.*`)" };
+    case "navigator":
+      if (use.member === "sendBeacon") return { family: NETWORK, what: "network (`navigator.sendBeacon()`)" };
+      return { family: ENVIRONMENT, what: "process global (`navigator`)" };
+    case "fetch":
+      return {
+        family: NETWORK,
+        what: use.isCalled || use.isNew ? "network (`fetch()`)" : "network (`fetch` reference)",
+      };
+    case "WebSocket":
+    case "XMLHttpRequest":
+    case "EventSource":
+      return { family: NETWORK, what: `network (\`${name}\`)` };
+    case "setTimeout":
+    case "setInterval":
+    case "setImmediate":
+      return { family: CLOCK, what: `clock/scheduling (\`${name}\`)` };
+    default:
+      if (ENVIRONMENT_ROOTS.has(name)) return { family: ENVIRONMENT, what: `process global (\`${name}\`)` };
+      return null;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Small utilities
@@ -704,277 +830,36 @@ function classify(dir, assignments) {
 }
 
 // ---------------------------------------------------------------------------
-// Source scanning
+// Source scanning (TypeScript compiler API)
 // ---------------------------------------------------------------------------
 
 /**
- * Keywords after which a `/` starts a regular-expression literal rather than a
- * division. Used with the previous significant character to disambiguate.
+ * Resolves and loads `typescript`. It is a root devDependency and this tool
+ * runs after `pnpm install` in dev and in CI, so it is not a new dependency and
+ * the lockfile is untouched. Resolution is attempted from this file first (the
+ * repository's own `node_modules`), then from the scanned root, so a checker
+ * invoked with `--root <elsewhere>` still finds the compiler it was installed
+ * beside. Failure is a `CHK` error and a non-zero exit — never a run that
+ * quietly scans nothing.
  */
-const REGEX_PRECEDING_KEYWORDS = new Set([
-  "return",
-  "typeof",
-  "instanceof",
-  "in",
-  "of",
-  "new",
-  "delete",
-  "void",
-  "throw",
-  "case",
-  "do",
-  "else",
-  "yield",
-  "await",
-]);
-
-function regexCanStartHere(previousChar, previousWord) {
-  if (previousChar === "") return true; // start of file
-  if (previousWord !== "" && REGEX_PRECEDING_KEYWORDS.has(previousWord)) return true;
-  if (/[\w$)\]]/.test(previousChar)) return false; // value ended -> division
-  return true;
-}
-
-/** Minimal unescaping, enough for module specifiers. */
-function unescapeLiteral(raw) {
-  return raw.replace(/\\(u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[\s\S])/g, (_all, code) => {
-    if (code.startsWith("u{")) return String.fromCodePoint(Number.parseInt(code.slice(2, -1), 16));
-    if (code.startsWith("u")) return String.fromCharCode(Number.parseInt(code.slice(1), 16));
-    if (code.startsWith("x")) return String.fromCharCode(Number.parseInt(code.slice(1), 16));
-    const simple = { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", "0": "\0" };
-    return Object.prototype.hasOwnProperty.call(simple, code) ? simple[code] : code;
-  });
-}
-
-/**
- * Single-pass lexer over a source file.
- *
- * Returns `{ code, literals }` where `code` is the file with the *contents* of
- * comments, string literals, template literals and regular-expression literals
- * replaced by spaces — offsets and newlines preserved, so a match's line number
- * in `code` is its line number in the original file — and `literals` is every
- * string/template literal with its span and static value.
- *
- * Blanking literal contents is what stops `` const a = `from "node:fs"` `` and
- * `` `Math.random()` `` from being reported as F3/F11 findings (WP-015 review
- * round 1, MEDIUM-2). Import specifiers are not lost by this, because they are
- * recovered from `literals` rather than from `code` (see `specifiersFrom`).
- *
- * A template's `${...}` sections re-enter code state, so interpolated
- * expressions are still scanned: `` `${Math.random()}` `` is a real clock/RNG
- * read and is still caught.
- */
-function lexSource(source) {
-  const out = source.split("");
-  const literals = [];
-  /** Context stack; `${` inside a template pushes a fresh code context. */
-  const stack = [{ kind: "code", brace: 0 }];
-  let previousChar = "";
-  let previousWord = "";
-  let wordOpen = false;
-
-  const blank = (index) => {
-    if (source[index] !== "\n") out[index] = " ";
-  };
-
-  let i = 0;
-  while (i < source.length) {
-    const context = stack[stack.length - 1];
-    const char = source[i];
-    const next = source[i + 1];
-
-    if (context.kind === "template") {
-      if (char === "\\") {
-        blank(i);
-        if (i + 1 < source.length) blank(i + 1);
-        i += 2;
-        continue;
-      }
-      if (char === "$" && next === "{") {
-        context.interpolated = true;
-        stack.push({ kind: "code", brace: 0 });
-        i += 2;
-        continue;
-      }
-      if (char === "`") {
-        stack.pop();
-        literals.push({
-          start: context.start,
-          end: i,
-          kind: "template",
-          interpolated: context.interpolated,
-          value: context.interpolated ? null : unescapeLiteral(source.slice(context.start + 1, i)),
-        });
-        previousChar = "`";
-        previousWord = "";
-        wordOpen = false;
-        i += 1;
-        continue;
-      }
-      blank(i);
-      i += 1;
-      continue;
+function loadTypeScript(rootDir) {
+  const attempts = [];
+  const candidates = [
+    { label: "this checker's own location", from: import.meta.url },
+    { label: `the scanned root (${rootDir})`, from: pathToFileURL(path.join(rootDir, "package.json")).href },
+  ];
+  for (const candidate of candidates) {
+    try {
+      const loaded = createRequire(candidate.from)("typescript");
+      if (loaded && typeof loaded.createSourceFile === "function") return { ts: loaded, error: null };
+      attempts.push(`${candidate.label}: resolved a module with no createSourceFile export`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message.split("\n")[0] : String(error);
+      attempts.push(`${candidate.label}: ${detail}`);
     }
-
-    // context.kind === "code"
-    if (char === "/" && next === "/") {
-      while (i < source.length && source[i] !== "\n") {
-        out[i] = " ";
-        i += 1;
-      }
-      continue;
-    }
-    if (char === "/" && next === "*") {
-      out[i] = " ";
-      out[i + 1] = " ";
-      i += 2;
-      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) {
-        blank(i);
-        i += 1;
-      }
-      if (i < source.length) {
-        out[i] = " ";
-        out[i + 1] = " ";
-        i += 2;
-      }
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      const start = i;
-      i += 1;
-      while (i < source.length) {
-        if (source[i] === "\\") {
-          blank(i);
-          if (i + 1 < source.length) blank(i + 1);
-          i += 2;
-          continue;
-        }
-        if (source[i] === char || source[i] === "\n") break;
-        blank(i);
-        i += 1;
-      }
-      const closed = i < source.length && source[i] === char;
-      literals.push({
-        start,
-        end: closed ? i : i - 1,
-        kind: "string",
-        interpolated: false,
-        value: unescapeLiteral(source.slice(start + 1, i)),
-      });
-      if (closed) i += 1;
-      previousChar = char;
-      previousWord = "";
-      wordOpen = false;
-      continue;
-    }
-    if (char === "`") {
-      stack.push({ kind: "template", start: i, interpolated: false });
-      i += 1;
-      continue;
-    }
-    if (char === "/" && regexCanStartHere(previousChar, previousWord)) {
-      // Regex literals cannot span a line. If no unescaped `/` closes on this
-      // line, treat the character as division and blank nothing: that keeps a
-      // misjudged `/` from swallowing code (which would fail open).
-      let j = i + 1;
-      let inClass = false;
-      let closedAt = -1;
-      while (j < source.length && source[j] !== "\n") {
-        if (source[j] === "\\") {
-          j += 2;
-          continue;
-        }
-        if (source[j] === "[") inClass = true;
-        else if (source[j] === "]") inClass = false;
-        else if (source[j] === "/" && !inClass) {
-          closedAt = j;
-          break;
-        }
-        j += 1;
-      }
-      if (closedAt > 0) {
-        for (let k = i + 1; k < closedAt; k += 1) blank(k);
-        i = closedAt + 1;
-        while (i < source.length && /[dgimsuvy]/.test(source[i])) i += 1; // flags
-        previousChar = "/";
-        previousWord = "";
-        wordOpen = false;
-        continue;
-      }
-    }
-    if (char === "{") context.brace += 1;
-    else if (char === "}") {
-      if (context.brace === 0 && stack.length > 1) {
-        stack.pop(); // close a template's `${ ... }` and resume the template
-        i += 1;
-        continue;
-      }
-      context.brace -= 1;
-    }
-    if (/\s/.test(char)) {
-      wordOpen = false; // the identifier ended but is still the previous word
-    } else if (/[\w$]/.test(char)) {
-      previousWord = wordOpen ? previousWord + char : char;
-      wordOpen = true;
-      previousChar = char;
-    } else {
-      previousWord = "";
-      wordOpen = false;
-      previousChar = char;
-    }
-    i += 1;
   }
-
-  return { code: out.join(""), literals };
+  return { ts: null, error: attempts.join("; ") };
 }
-
-function lineStarts(source) {
-  const starts = [0];
-  for (let i = 0; i < source.length; i += 1) {
-    if (source[i] === "\n") starts.push(i + 1);
-  }
-  return starts;
-}
-
-function lineNumberAt(starts, offset) {
-  let low = 0;
-  let high = starts.length - 1;
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2);
-    if (starts[mid] <= offset) low = mid;
-    else high = mid - 1;
-  }
-  return low + 1;
-}
-
-/**
- * A literal is a module specifier when the code immediately before it is one of
- * these forms. Matching on the *preceding* code (rather than on the literal's
- * own text) is what lets a template literal be a specifier —
- * `` import(`node:fs`) `` is caught (WP-015 review round 1, HIGH(a)) — while an
- * identical-looking template elsewhere in the file is left alone (MEDIUM-2).
- *
- * `from` covers `import … from`, `import type … from` and `export … from`;
- * `require` covers both CommonJS and TypeScript's `import x = require(…)`.
- */
-const SPECIFIER_CONTEXTS = [
-  /\bfrom\s*$/,
-  /(?<![.$\w])import\s*\(\s*$/,
-  /(?<![.$\w])require\s*\(\s*$/,
-  /(?<![.$\w])import\s*$/,
-];
-
-/** How far back to look for the specifier context. */
-const SPECIFIER_LOOKBEHIND = 96;
-
-/**
- * A dynamic `import(` whose argument is not a static literal. `import` is a
- * reserved word, so `import(` is unambiguously a dynamic import — unlike
- * `require(`, which may be any function (`packages/domain`'s schema registry
- * has a `require(eventType, schemaVersion)` method), and which is therefore
- * deliberately not matched here.
- */
-const DYNAMIC_IMPORT_CALL = /(?<![.$\w])import\s*\(\s*/g;
 
 function collectSourceFiles(rootDir, packageDir) {
   const files = [];
@@ -994,55 +879,425 @@ function collectSourceFiles(rootDir, packageDir) {
   return files.sort();
 }
 
-function isSpecifierPosition(code, literalStart) {
-  const prefix = code.slice(Math.max(0, literalStart - SPECIFIER_LOOKBEHIND), literalStart);
-  return SPECIFIER_CONTEXTS.some((pattern) => pattern.test(prefix));
+/** Parse each file under the dialect its extension declares. */
+function scriptKindFor(ts, fileRel) {
+  switch (path.extname(fileRel)) {
+    case ".tsx":
+      return ts.ScriptKind.TSX;
+    case ".jsx":
+      return ts.ScriptKind.JSX;
+    case ".js":
+    case ".mjs":
+    case ".cjs":
+      return ts.ScriptKind.JS;
+    default:
+      return ts.ScriptKind.TS;
+  }
 }
 
-function scanSourceFile(rootDir, fileRel) {
-  const raw = readFileSync(path.join(rootDir, fileRel), "utf8");
-  const { code, literals } = lexSource(raw);
-  const starts = lineStarts(raw);
+/**
+ * One AST walk per file, producing everything rule 3 needs:
+ *
+ *   - `specifiers`: `{ specifier, line }` for every module specifier the
+ *     grammar contains (static import/export, `import x = require(...)`,
+ *     `import("...")` type node, dynamic `import(...)`, global `require(...)`).
+ *   - `opaque`: `{ call, form, line }` for a dynamic `import()`/`require()`
+ *     whose specifier is not a static literal — `F-OPAQUE` in a
+ *     purity-restricted package.
+ *   - `globals`: `{ family, what, line }` for every reference to an impure
+ *     global that is not shadowed by a declaration in the file.
+ *
+ * The walk never descends into type nodes (a type annotation is not a value
+ * reference) except to collect `import("...")` type specifiers and to follow a
+ * heritage clause's expression.
+ */
+function scanSourceFile(ts, rootDir, fileRel) {
+  const text = readFileSync(path.join(rootDir, fileRel), "utf8");
+  const sourceFile = ts.createSourceFile(
+    fileRel,
+    text,
+    ts.ScriptTarget.Latest,
+    /* setParentNodes */ true,
+    scriptKindFor(ts, fileRel),
+  );
 
   const specifiers = [];
-  const literalStarts = new Map();
-  for (const literal of literals) {
-    literalStarts.set(literal.start, literal);
-    if (!isSpecifierPosition(code, literal.start)) continue;
-    if (literal.interpolated || literal.value === null) continue; // reported below
-    specifiers.push({ specifier: literal.value, line: lineNumberAt(starts, literal.start) });
-  }
+  const opaque = [];
+  const globals = [];
+  /** Stack of names declared by each enclosing scope; see the header's KNOWN LIMIT. */
+  const scopes = [];
 
-  // Dynamic imports whose specifier is not statically knowable.
-  const opaqueImports = [];
-  DYNAMIC_IMPORT_CALL.lastIndex = 0;
-  let call = DYNAMIC_IMPORT_CALL.exec(code);
-  while (call !== null) {
-    const argumentStart = call.index + call[0].length;
-    const literal = literalStarts.get(argumentStart);
-    if (!literal || literal.interpolated || literal.value === null) {
-      opaqueImports.push({
-        line: lineNumberAt(starts, call.index),
-        form: literal?.interpolated ? "an interpolated template literal" : "a non-literal expression",
-      });
+  /**
+   * Wrappers that do not change which value an expression denotes. Skipping
+   * them is what makes `(window as any).Date()` and `value! / Math.random()`
+   * read the same as their unwrapped forms.
+   */
+  const TRANSPARENT_KINDS = new Set([
+    ts.SyntaxKind.ParenthesizedExpression,
+    ts.SyntaxKind.AsExpression,
+    ts.SyntaxKind.SatisfiesExpression,
+    ts.SyntaxKind.NonNullExpression,
+    ts.SyntaxKind.TypeAssertionExpression,
+  ]);
+
+  const lineOf = (node) =>
+    ts.getLineAndCharacterOfPosition(sourceFile, node.getStart(sourceFile, false)).line + 1;
+
+  const isDeclaredLocally = (name) => scopes.some((scope) => scope.has(name));
+
+  const addBindingName = (name, into) => {
+    if (!name) return;
+    if (ts.isIdentifier(name)) {
+      into.add(name.text);
+      return;
     }
-    call = DYNAMIC_IMPORT_CALL.exec(code);
-  }
-
-  return { code, starts, specifiers, opaqueImports };
-}
-
-function findGlobals(scan, catalogue) {
-  const hits = [];
-  for (const { pattern, what } of catalogue) {
-    pattern.lastIndex = 0;
-    let match = pattern.exec(scan.code);
-    while (match !== null) {
-      hits.push({ what, line: lineNumberAt(scan.starts, match.index) });
-      match = pattern.exec(scan.code);
+    if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+      for (const element of name.elements) {
+        if (ts.isBindingElement(element)) addBindingName(element.name, into);
+      }
     }
-  }
-  return hits;
+  };
+
+  /**
+   * Names a statement list binds as *values*. Interfaces and type aliases are
+   * deliberately absent: `interface Date {}` merges with the global type and
+   * binds no value, so treating it as a shadow would hide a real reference.
+   */
+  const addStatementDeclarations = (statements, into) => {
+    for (const statement of statements) {
+      if (ts.isVariableStatement(statement)) {
+        for (const declaration of statement.declarationList.declarations) {
+          addBindingName(declaration.name, into);
+        }
+        continue;
+      }
+      if (ts.isImportDeclaration(statement) && statement.importClause) {
+        const clause = statement.importClause;
+        if (clause.name) into.add(clause.name.text);
+        const bindings = clause.namedBindings;
+        if (bindings && ts.isNamespaceImport(bindings)) into.add(bindings.name.text);
+        else if (bindings && ts.isNamedImports(bindings)) {
+          for (const element of bindings.elements) into.add(element.name.text);
+        }
+        continue;
+      }
+      if (ts.isLabeledStatement(statement)) {
+        addStatementDeclarations([statement.statement], into);
+        continue;
+      }
+      if (
+        (ts.isFunctionDeclaration(statement) ||
+          ts.isClassDeclaration(statement) ||
+          ts.isEnumDeclaration(statement) ||
+          ts.isModuleDeclaration(statement) ||
+          ts.isImportEqualsDeclaration(statement)) &&
+        statement.name &&
+        ts.isIdentifier(statement.name)
+      ) {
+        into.add(statement.name.text);
+      }
+    }
+  };
+
+  const isFunctionLike = (node) =>
+    ts.isFunctionDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isConstructorDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node);
+
+  /**
+   * The value names a scope-creating node introduces, or `null` when the node
+   * creates no scope. Type parameters are not included: they bind types, and
+   * the walk never resolves an identifier in a type position, so counting them
+   * could only hide a value reference.
+   *
+   * A method's own name is not included either — `class C { Date() { … } }`
+   * does not shadow the global `Date` inside its body — while a function
+   * expression's name does bind inside itself.
+   */
+  const scopeNames = (node) => {
+    if (ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node)) {
+      const into = new Set();
+      addStatementDeclarations(node.statements, into);
+      return into;
+    }
+    if (ts.isCaseBlock(node)) {
+      const into = new Set();
+      for (const clause of node.clauses) addStatementDeclarations(clause.statements, into);
+      return into;
+    }
+    if (isFunctionLike(node)) {
+      const into = new Set();
+      if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name && ts.isIdentifier(node.name)) {
+        into.add(node.name.text);
+      }
+      for (const parameter of node.parameters ?? []) addBindingName(parameter.name, into);
+      return into;
+    }
+    if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+      const into = new Set();
+      if (node.name) into.add(node.name.text);
+      return into;
+    }
+    if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+      const into = new Set();
+      const initializer = node.initializer;
+      if (initializer && ts.isVariableDeclarationList(initializer)) {
+        for (const declaration of initializer.declarations) addBindingName(declaration.name, into);
+      }
+      return into;
+    }
+    if (ts.isCatchClause(node)) {
+      const into = new Set();
+      if (node.variableDeclaration) addBindingName(node.variableDeclaration.name, into);
+      return into;
+    }
+    return null;
+  };
+
+  /** The outermost expression denoting the same value as `node`. */
+  const outerOf = (node) => {
+    let current = node;
+    while (
+      current.parent &&
+      TRANSPARENT_KINDS.has(current.parent.kind) &&
+      current.parent.expression === current
+    ) {
+      current = current.parent;
+    }
+    return current;
+  };
+
+  /** `obj.name` / `obj["name"]` read off a reference, or `null`. */
+  const memberAccessOf = (node) => {
+    const outer = outerOf(node);
+    const parent = outer.parent;
+    if (!parent) return null;
+    if (ts.isPropertyAccessExpression(parent) && parent.expression === outer && ts.isIdentifier(parent.name)) {
+      return { node: parent, name: parent.name.text };
+    }
+    if (
+      ts.isElementAccessExpression(parent) &&
+      parent.expression === outer &&
+      parent.argumentExpression &&
+      ts.isStringLiteralLike(parent.argumentExpression)
+    ) {
+      return { node: parent, name: parent.argumentExpression.text };
+    }
+    return null;
+  };
+
+  /** What is done with a reference: member read, call, construction, arity. */
+  const useContext = (node) => {
+    const access = memberAccessOf(node);
+    const outer = outerOf(access ? access.node : node);
+    const parent = outer.parent;
+    let isCalled = false;
+    let isNew = false;
+    let argumentCount = 0;
+    if (parent && ts.isCallExpression(parent) && parent.expression === outer) {
+      isCalled = true;
+      argumentCount = parent.arguments.length;
+    } else if (parent && ts.isNewExpression(parent) && parent.expression === outer) {
+      isNew = true;
+      argumentCount = parent.arguments ? parent.arguments.length : 0;
+    }
+    return { member: access ? access.name : null, isCalled, isNew, argumentCount };
+  };
+
+  /**
+   * True when this identifier *reads* a binding. Property names, declaration
+   * names, import/export clause names, labels and object-literal keys are not
+   * reads; a shorthand property (`{ Date }`) is.
+   */
+  const isValueReference = (node) => {
+    const parent = node.parent;
+    if (!parent) return false;
+    if (ts.isPropertyAccessExpression(parent) && parent.name === node) return false;
+    if (ts.isQualifiedName(parent) || ts.isMetaProperty(parent)) return false;
+    if (ts.isPropertyAssignment(parent) && parent.name === node) return false;
+    if (ts.isBindingElement(parent) && parent.propertyName === node) return false;
+    if (ts.isImportSpecifier(parent) || ts.isExportSpecifier(parent)) return false;
+    if (ts.isImportClause(parent) || ts.isNamespaceImport(parent) || ts.isNamespaceExport(parent)) return false;
+    if (ts.isLabeledStatement(parent) || ts.isBreakStatement(parent) || ts.isContinueStatement(parent)) return false;
+    if (
+      (ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isBindingElement(parent)) &&
+      parent.name === node
+    ) {
+      return false;
+    }
+    if (
+      (ts.isFunctionDeclaration(parent) ||
+        ts.isFunctionExpression(parent) ||
+        ts.isClassDeclaration(parent) ||
+        ts.isClassExpression(parent) ||
+        ts.isEnumDeclaration(parent) ||
+        ts.isEnumMember(parent) ||
+        ts.isModuleDeclaration(parent) ||
+        ts.isTypeAliasDeclaration(parent) ||
+        ts.isInterfaceDeclaration(parent) ||
+        ts.isTypeParameterDeclaration(parent) ||
+        ts.isImportEqualsDeclaration(parent) ||
+        ts.isMethodDeclaration(parent) ||
+        ts.isMethodSignature(parent) ||
+        ts.isPropertyDeclaration(parent) ||
+        ts.isPropertySignature(parent) ||
+        ts.isGetAccessorDeclaration(parent) ||
+        ts.isSetAccessorDeclaration(parent)) &&
+      parent.name === node
+    ) {
+      return false;
+    }
+    return true;
+  };
+
+  const recordSpecifier = (literal) => {
+    specifiers.push({ specifier: literal.text, line: lineOf(literal) });
+  };
+
+  const recordOpaque = (node, call, argument) => {
+    opaque.push({
+      call,
+      form:
+        argument && ts.isTemplateExpression(argument)
+          ? "an interpolated template literal"
+          : "a non-literal expression",
+      line: lineOf(node),
+    });
+  };
+
+  /**
+   * `eval(...)` and `Function(...)`/`new Function(...)` evaluate code this
+   * checker cannot read, which makes F1-F8/F11 unevaluable for whatever they
+   * evaluate — the same fault `F-OPAQUE` already names for a computed
+   * specifier. `x instanceof Function` is a type test, not code evaluation, and
+   * is excluded.
+   */
+  const recordEvaluator = (node) => {
+    const outer = outerOf(node);
+    const parent = outer.parent;
+    if (
+      node.text === "Function" &&
+      parent &&
+      ts.isBinaryExpression(parent) &&
+      parent.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword &&
+      parent.right === outer
+    ) {
+      return;
+    }
+    opaque.push({ call: "evaluator", form: `\`${node.text}\``, line: lineOf(node) });
+  };
+
+  /**
+   * `import(...)` or `require(...)`. A string or no-substitution template
+   * literal is an exact specifier; anything else is opaque. This is what closes
+   * the round-2 computed-`require` bypass.
+   */
+  const recordModuleCall = (call, kind) => {
+    const argument = call.arguments[0];
+    if (!argument) return;
+    if (ts.isStringLiteralLike(argument)) {
+      recordSpecifier(argument);
+      return;
+    }
+    recordOpaque(call, kind, argument);
+  };
+
+  /** Type nodes contribute `import("...")` specifiers and nothing else. */
+  const walkTypeNode = (node) => {
+    if (ts.isImportTypeNode(node)) {
+      const argument = node.argument;
+      if (argument && ts.isLiteralTypeNode(argument) && ts.isStringLiteralLike(argument.literal)) {
+        recordSpecifier(argument.literal);
+      } else {
+        recordOpaque(node, "import", argument);
+      }
+    }
+    ts.forEachChild(node, walkTypeNode);
+  };
+
+  const visit = (node) => {
+    // A type annotation is not a value reference; only its `import("...")`
+    // specifiers matter. `ExpressionWithTypeArguments` (a heritage clause) is
+    // in the type-node kind range but carries a real expression, so it is
+    // walked normally.
+    if (ts.isTypeNode(node) && !ts.isExpressionWithTypeArguments(node)) {
+      walkTypeNode(node);
+      return;
+    }
+
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      const moduleSpecifier = node.moduleSpecifier;
+      if (moduleSpecifier && ts.isStringLiteralLike(moduleSpecifier)) recordSpecifier(moduleSpecifier);
+    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
+      const expression = node.moduleReference.expression;
+      if (expression && ts.isStringLiteralLike(expression)) recordSpecifier(expression);
+      else recordOpaque(node, "import", expression);
+    } else if (ts.isCallExpression(node)) {
+      if (node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        recordModuleCall(node, "import");
+      } else if (
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === "require" &&
+        !isDeclaredLocally("require")
+      ) {
+        recordModuleCall(node, "require");
+      }
+    } else if (ts.isMetaProperty(node) && node.keywordToken === ts.SyntaxKind.ImportKeyword) {
+      globals.push({ family: ENVIRONMENT, what: "module environment (`import.meta`)", line: lineOf(node) });
+    } else if (
+      ts.isIdentifier(node) &&
+      EVALUATORS.has(node.text) &&
+      isValueReference(node) &&
+      !isDeclaredLocally(node.text)
+    ) {
+      recordEvaluator(node);
+    } else if (
+      ts.isIdentifier(node) &&
+      GLOBAL_ROOTS.has(node.text) &&
+      isValueReference(node) &&
+      !isDeclaredLocally(node.text)
+    ) {
+      const finding = classifyGlobalUse(node.text, useContext(node));
+      if (finding) globals.push({ ...finding, line: lineOf(node) });
+      if (ENVIRONMENT_ROOTS.has(node.text)) {
+        // `globalThis.Date` / `window["Date"]` is a reference to global `Date`.
+        const access = memberAccessOf(node);
+        if (access && GLOBAL_ROOTS.has(access.name)) {
+          const unwrapped = classifyGlobalUse(access.name, useContext(access.node));
+          if (unwrapped) globals.push({ ...unwrapped, line: lineOf(node) });
+        }
+      }
+    }
+
+    const names = scopeNames(node);
+    if (names === null) {
+      ts.forEachChild(node, visit);
+      return;
+    }
+    scopes.push(names);
+    ts.forEachChild(node, visit);
+    scopes.pop();
+  };
+
+  visit(sourceFile);
+
+  // A file the parser could not read is a coverage hole, not a clean file: the
+  // recovered tree may be missing the very import or global the scan is looking
+  // for. Report the first syntax error per file as a `CHK` so the run fails
+  // rather than passing on a partial parse. (`parseDiagnostics` is not part of
+  // the documented API surface; if a future compiler build stops exposing it
+  // the scan degrades to its pre-existing behaviour rather than crashing.)
+  const parseDiagnostics = Array.isArray(sourceFile.parseDiagnostics) ? sourceFile.parseDiagnostics : [];
+  const syntaxErrors = parseDiagnostics.slice(0, 1).map((diagnostic) => ({
+    line: ts.getLineAndCharacterOfPosition(sourceFile, diagnostic.start ?? 0).line + 1,
+    message: ts.flattenDiagnosticMessageText(diagnostic.messageText, " "),
+  }));
+
+  return { specifiers, opaque, globals, syntaxErrors };
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1355,22 @@ function findCycles(nodes, edges) {
 function runCheck(rootDir) {
   const violations = [];
   const push = (entry) => violations.push(violation(entry));
+
+  // Rule 3 parses source with the TypeScript compiler API. If the compiler
+  // cannot be resolved the check stops here: a run that skipped the source scan
+  // and still exited 0 would be exactly the silent acceptance this package
+  // exists to prevent.
+  const { ts, error: typescriptError } = loadTypeScript(rootDir);
+  if (ts === null) {
+    push({
+      rule: "CHK",
+      subject: "typescript",
+      message: `the TypeScript compiler API could not be loaded, so the rule-3 source scan cannot run (${typescriptError})`,
+      doc: `${CONTRACT_REL} §6 rule 3`,
+      fix: "run `pnpm install --frozen-lockfile` first; `typescript` is a root devDependency of this repository",
+    });
+    return { ok: false, violations, packages: [], edges: [], allowlist: [] };
+  }
 
   let contractText;
   try {
@@ -1298,7 +1569,18 @@ function runCheck(rootDir) {
     const isPurityRestricted = isDomain || isStrategy || isLedger || isSimulation;
 
     for (const fileRel of collectSourceFiles(rootDir, pkg.dir)) {
-      const scan = scanSourceFile(rootDir, fileRel);
+      const scan = scanSourceFile(ts, rootDir, fileRel);
+
+      for (const problem of scan.syntaxErrors) {
+        push({
+          rule: "CHK",
+          subject: pkg.dir,
+          location: `${fileRel}:${problem.line}`,
+          message: `could not be parsed (${problem.message}); rule 3 cannot evaluate a file it cannot parse, so this is an error rather than a silently skipped file`,
+          doc: `${CONTRACT_REL} §6 rule 3`,
+          fix: "fix the syntax error — `pnpm typecheck` reports the same file",
+        });
+      }
 
       for (const { specifier, line } of scan.specifiers) {
         const at = `${fileRel}:${line}`;
@@ -1458,38 +1740,40 @@ function runCheck(rootDir) {
         }
       }
 
-      // F11 — a strategy may not read a clock or unseeded randomness.
+      // F11 / F3 — a strategy may not read a clock, unseeded randomness, the
+      // environment, or the network. ADR-005 §1's list is "network, database,
+      // filesystem, environment, global clock, or unseeded randomness": the
+      // clock and randomness halves are F11 (contract §3), the environment and
+      // network halves are F3, and both are reachable through a global with no
+      // import to catch (WP-015 review round 1, HIGH(c)).
       if (isStrategy) {
-        for (const hit of findGlobals(scan, IMPURE_GLOBALS)) {
-          push({
-            rule: "F11",
-            subject: pkg.dir,
-            location: `${fileRel}:${hit.line}`,
-            message: `reads ${hit.what}; time comes from \`ctx.now()\` and randomness from \`ctx.rng()\``,
-            doc: `${CONTRACT_REL} §3 (F11); handoff §6 invariant 2, §7.6; ADR-005 §1`,
-            fix: "take the value from StrategyContext so replay stays deterministic",
-          });
-        }
-        // F3 — ADR-005 §1's list is "network, database, filesystem,
-        // environment, global clock, or unseeded randomness". The clock and
-        // randomness halves are F11 above; environment and network are reachable
-        // through globals with no import to catch, so they are scanned here
-        // (WP-015 review round 1, HIGH(c)).
-        for (const hit of findGlobals(scan, [...PROCESS_GLOBALS, ...NETWORK_GLOBALS])) {
-          push({
-            rule: "F3",
-            subject: pkg.dir,
-            location: `${fileRel}:${hit.line}`,
-            message: `reads ${hit.what}; a strategy performs no I/O and reads no environment`,
-            doc: `${CONTRACT_REL} §3 (F3); handoff §5.2, §6 invariant 2; ADR-005 §1`,
-            fix: "receive the fact through a feature (§9.5) or a StrategyContext view (§7.6)",
-          });
+        for (const hit of scan.globals) {
+          const isDeterminismRule = hit.family === CLOCK || hit.family === RANDOMNESS;
+          push(
+            isDeterminismRule
+              ? {
+                  rule: "F11",
+                  subject: pkg.dir,
+                  location: `${fileRel}:${hit.line}`,
+                  message: `reads ${hit.what}; time comes from \`ctx.now()\` and randomness from \`ctx.rng()\``,
+                  doc: `${CONTRACT_REL} §3 (F11); handoff §6 invariant 2, §7.6; ADR-005 §1`,
+                  fix: "take the value from StrategyContext so replay stays deterministic",
+                }
+              : {
+                  rule: "F3",
+                  subject: pkg.dir,
+                  location: `${fileRel}:${hit.line}`,
+                  message: `reads ${hit.what}; a strategy performs no I/O and reads no environment`,
+                  doc: `${CONTRACT_REL} §3 (F3); handoff §5.2, §6 invariant 2; ADR-005 §1`,
+                  fix: "receive the fact through a feature (§9.5) or a StrategyContext view (§7.6)",
+                },
+          );
         }
       }
 
       // F1 — packages/domain may not touch a process global, clock, or randomness.
       if (isDomain) {
-        for (const hit of findGlobals(scan, [...PROCESS_GLOBALS, ...IMPURE_GLOBALS, ...NETWORK_GLOBALS])) {
+        for (const hit of scan.globals) {
           push({
             rule: "F1",
             subject: pkg.dir,
@@ -1501,16 +1785,21 @@ function runCheck(rootDir) {
         }
       }
 
-      // F-OPAQUE — a dynamic import a static check cannot read. Restricted to
-      // the packages whose whole point is a purity constraint; elsewhere a
+      // F-OPAQUE — a module load a static check cannot read. Restricted to the
+      // packages whose whole point is a purity constraint; elsewhere a
       // composition root may legitimately load a module by computed name.
       if (isPurityRestricted) {
-        for (const hit of scan.opaqueImports) {
+        for (const hit of scan.opaque) {
           push({
             rule: "F-OPAQUE",
             subject: pkg.dir,
             location: `${fileRel}:${hit.line}`,
-            message: `uses a dynamic \`import()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the imported module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
+            message:
+              hit.call === "evaluator"
+                ? `references ${hit.form}, which evaluates code no static check can read; in \`${pkg.dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it evaluates`
+                : hit.call === "require"
+                  ? `calls \`require()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the required module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`
+                  : `uses a dynamic \`import()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the imported module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
             doc: `${CONTRACT_REL} §6 rule 3; ADR-005 §1`,
             fix: "import the module statically, or receive the capability through StrategyContext/a constructor argument",
           });
@@ -1565,7 +1854,7 @@ function formatReport(result, rootDir) {
   if (result.violations.length === 0) {
     lines.push("PASS: no cycle (F9), no upward edge (F12), no unlisted same-layer edge (F13),");
     lines.push("      no forbidden import specifier or impure global (F1-F8, F11), no opaque");
-    lines.push("      dynamic import in a restricted package, every workspace package classified.");
+    lines.push("      import()/require() in a restricted package, every workspace package classified.");
     return `${lines.join("\n")}\n`;
   }
 
@@ -1609,11 +1898,14 @@ Enforces docs/contracts/dependency-direction.md §6:
   F12/F13   no upward edge; same-layer edges only when listed in §2.1
   F1-F8,F11 no forbidden import specifier or non-deterministic global
   F-CLOSED  §6 fail-closed: unclassified package, or §2 entry with no manifest
-  F-OPAQUE  no dynamic import() with a non-static specifier in a package whose
-            purity is constrained (domain, strategies, ledger, simulation)
+  F-OPAQUE  no dynamic import()/require() with a non-static specifier in a
+            package whose purity is constrained (domain, strategies, ledger,
+            simulation)
 The §2 layer table and the §2.1 allowlist are parsed from the contract and
 validated eagerly; an unparseable or inconsistent row is a CHK error, not a
-skipped row. Exits 0 when clean, 1 on any violation, 2 on a usage error.
+skipped row. Source is parsed with the TypeScript compiler API (a root
+devDependency); if it cannot be loaded the check fails closed. Exits 0 when
+clean, 1 on any violation, 2 on a usage error.
 `;
 
 function main() {

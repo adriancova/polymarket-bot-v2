@@ -795,6 +795,392 @@ describe("dependency-direction check — round-1 review regressions", () => {
   });
 });
 
+/**
+ * Round-2 review regressions. The reviewer's round-2 probes showed the
+ * hand-rolled lexer was structurally fail-open in three ways: a `/` misread as
+ * a regular-expression literal blanked real code, the fixed 96-character
+ * lookbehind lost a specifier separated from its keyword by a long comment, and
+ * a global read through an alias or through `window.` escaped the call-shape
+ * patterns entirely. The orchestrator's binding direction was to rebuild rule
+ * 3's scanner on the TypeScript compiler API; every probe below was reproduced
+ * on `c9b59b2` (exit 0) before the rebuild. See `docs/handoffs/WP-015.md` →
+ * "Review round 2".
+ */
+describe("dependency-direction check — round-2 review regressions", () => {
+  /** Long enough that the old scanner's 96-character lookbehind could not span it. */
+  const longComment = `/* ${"pad ".repeat(40)} */`;
+  const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
+
+  describe("HIGH-1: the regex/division heuristic blanked executable code", () => {
+    it("reports `Math.random()` between two division operators", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: "export const x = (value: number | null) => value! / Math.random() / 2;\n",
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F11]");
+      expect(run.output).toContain("unseeded randomness (`Math.random()`)");
+      expect(run.output).toContain("src/probe.ts:1");
+    });
+
+    it("still ignores an actual regular-expression literal that looks like a violation", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const re = /Math\\.random\\(\\)|process\\.env|node:fs/g;",
+              "export const hit = (s: string) => re.test(s);",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+
+  describe("HIGH-2: specifier recognition is positional, not proximity-based", () => {
+    it("catches a dynamic import whose specifier follows a long comment", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: `export const f = async () => import(${longComment} "node:fs");\n` },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+      expect(run.output).toContain("src/probe.ts:1");
+    });
+
+    it("catches `export * from` whose specifier follows a long comment", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: `export * from ${longComment} "node:fs";\n` },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+
+    it("catches a static `require()` specifier in a `.cjs` file", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/probe.cjs": 'module.exports = require("node:fs");\n',
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+      expect(run.output).toContain("src/probe.cjs:1");
+    });
+
+    it("reports a computed `require()` in a restricted package instead of accepting it", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/probe.cjs":
+              'const target = "node:fs";\nmodule.exports = require(target);\n',
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("calls `require()` whose specifier is a non-literal expression");
+      expect(run.output).toContain("src/probe.cjs:2");
+    });
+
+    it("does not treat a locally declared `require` as a module load", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const require = (key: string, version: number): string => `${key}@${version}`;",
+              'export const pinned = require("contract", 1);',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("catches `import x = require(...)` and a type-only import", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/strategies/static-bracket/src/equals.ts":
+              'import fs = require("node:fs");\nexport const r = fs;\n',
+            "packages/strategies/static-bracket/src/typeonly.ts":
+              'import type { Stats } from "node:fs";\nexport type S = Stats;\n',
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("src/equals.ts:1");
+      expect(run.output).toContain("src/typeonly.ts:1");
+    });
+  });
+
+  describe("HIGH-3: impure globals are detected by reference, not by call spelling", () => {
+    it("catches `window.Date()`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: "export const t = () => window.Date();\n" },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F11]");
+      expect(run.output).toContain("clock (`Date()`)");
+      // The environment root itself is reported as well.
+      expect(run.output).toContain("process global (`window`)");
+    });
+
+    it("catches a `Date` alias created as a value", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: "const D = Date;\nexport const t = () => D();\n" },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F11]");
+      expect(run.output).toContain("clock (`Date` reference");
+      expect(run.output).toContain("src/probe.ts:1");
+    });
+
+    it("catches a global reached through `globalThis[\"...\"]`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: 'export const r = () => globalThis["Math"].random();\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("unseeded randomness (`Math.random()`)");
+    });
+
+    it("sees through parentheses, `as` assertions, and non-null assertions", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "export const r = () => (Math as typeof Math).random();",
+              "export const t = () => (Date!)();",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("unseeded randomness (`Math.random()`)");
+      expect(run.output).toContain("clock (`Date()`)");
+    });
+
+    it("catches a scheduled timer, which is neither deterministic nor synchronous", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: "export const later = (f: () => void) => setTimeout(f, 10);\n" },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F11]");
+      expect(run.output).toContain("clock/scheduling (`setTimeout`)");
+    });
+  });
+
+  describe("AST semantics: shadowing, type positions, and the `new Date(argument)` allowance", () => {
+    it("does not report a parameter that shadows a global", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "export function f(Date: string) { return Date; }",
+              "export function g(process: { id: string }) { return process.id; }",
+              "export const h = (fetch: () => string) => fetch();",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("does not report an imported or locally declared binding that shadows a global", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const Math = { random: () => 0.5 } as const;",
+              "export const r = () => Math.random();",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("does not report a global name used only in a type position", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "export const iso = (d: Date): string => d.toISOString();",
+              "export type Env = typeof process;",
+              "export interface Holder { readonly at: Date }",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("does not report a method or property merely named like a global", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const registry = { require: (k: string, v: number) => `${k}${v}` };",
+              'export const pinned = registry.require("contract", 1);',
+              "export const shape = { Date: 1, process: 2 };",
+              "export class Holder { Date(): number { return 0; } }",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("allows `new Date(argument)` and reports `new Date()`", () => {
+      const allowed = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: "export const at = (ms: number) => new Date(ms).toISOString();\n",
+          },
+        }),
+      );
+      expect(allowed.output).toContain("PASS");
+      expect(allowed.status).toBe(0);
+
+      const flagged = runChecker(
+        buildFixture({ files: { [strategyFile]: "export const now = () => new Date();\n" } }),
+      );
+      expect(flagged.status).toBe(1);
+      expect(flagged.output).toContain("FAIL [F11]");
+      expect(flagged.output).toContain("clock (`new Date()`)");
+    });
+
+    it("allows pure `Math` members but reports a bare `Math` value reference", () => {
+      const pure = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: "export const clamp = (a: number, b: number) => Math.min(Math.max(a, 0), b);\n",
+          },
+        }),
+      );
+      expect(pure.output).toContain("PASS");
+      expect(pure.status).toBe(0);
+
+      const aliased = runChecker(
+        buildFixture({ files: { [strategyFile]: "const M = Math;\nexport const r = () => M.random();\n" } }),
+      );
+      expect(aliased.status).toBe(1);
+      expect(aliased.output).toContain("FAIL [F11]");
+      expect(aliased.output).toContain("`Math` reference");
+    });
+
+    it("applies the same reference semantics to packages/domain (F1)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/domain/src/probe.ts": [
+              "const D = Date;",
+              "export const stamp = () => D().length;",
+              "export const iso = (d: Date): string => d.toISOString();",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F1]");
+      expect(run.output).toContain("clock (`Date` reference");
+      expect(run.output).toContain("packages/domain/src/probe.ts:1");
+      expect(run.output).not.toContain("packages/domain/src/probe.ts:3");
+    });
+  });
+
+  describe("constructs that make the rules unevaluable are findings, not passes", () => {
+    it("reports `eval` and `new Function(...)` in a restricted package", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "export const a = (src: string) => eval(src);",
+              "export const b = (src: string) => new Function(src);",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("references `eval`");
+      expect(run.output).toContain("references `Function`");
+      expect(run.output).toContain("evaluates code no static check can read");
+    });
+
+    it("does not report `instanceof Function`, which evaluates nothing", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: "export const isFn = (v: unknown) => v instanceof Function;\n" },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+
+  describe("the scanner fails closed on input it cannot read", () => {
+    it("reports an unparseable source file instead of scanning a partial tree", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: 'export const broken = ;\nimport { readFileSync } from "node:fs";\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [CHK]");
+      expect(run.output).toContain("could not be parsed");
+      expect(run.output).toContain("silently skipped file");
+      expect(run.output).toContain("src/probe.ts:1");
+    });
+  });
+
+  describe("the scanner fails closed when the compiler API is unavailable", () => {
+    it("reports a CHK error instead of scanning nothing", () => {
+      const root = buildFixture();
+      // A stub `typescript` that resolves but exports no compiler API. Both
+      // resolution candidates (the checker's own location and the scanned root)
+      // find it, so the outcome does not depend on the ambient environment.
+      writeFixtureFile(root, path.join("node_modules", "typescript", "package.json"), '{"name":"typescript","version":"0.0.0","main":"index.js"}\n');
+      writeFixtureFile(root, path.join("node_modules", "typescript", "index.js"), "module.exports = {};\n");
+      writeFixtureFile(root, path.join("tools", "check-dependency-direction.mjs"), readFileSync(checkerPath, "utf8"));
+
+      const copied = path.join(root, "tools", "check-dependency-direction.mjs");
+      const result = spawnSync(process.execPath, [copied, "--root", root], { encoding: "utf8", cwd: root });
+      const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+      expect(result.status).toBe(1);
+      expect(output).toContain("FAIL [CHK]");
+      expect(output).toContain("TypeScript compiler API could not be loaded");
+      expect(output).toContain("rule-3 source scan cannot run");
+      expect(output).not.toContain("PASS");
+    });
+  });
+});
+
 describe("dependency-direction check CLI", () => {
   it("prints usage and exits 0 for --help", () => {
     const result = spawnSync(process.execPath, [checkerPath, "--help"], { encoding: "utf8", cwd: repoRoot });
