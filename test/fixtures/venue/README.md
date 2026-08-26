@@ -120,6 +120,19 @@ Wire-type conventions preserved by these fixtures and enforced by
   wire-format evidence. A future raw-wire capture must preserve the venue's
   original strings verbatim, in a separate fixture that is explicitly marked
   as un-normalized, before any wire-lexeme claim is made.
+- The `market_settings_example` inside `fees/fee-reward-parameters.json`
+  declares the **SDK-parsed** `market.rewards` layer, not the raw Gamma HTTP
+  body. The official market-details page publishes both and they differ:
+  its TypeScript/Python tabs type `rewardsAmount`, `rewardsDailyRate`, and
+  `rewardsMinSize` as `DecimalString`/`Decimal` and print them quoted, while
+  its API (Gamma) tab types them `number` and prints them unquoted. Both are
+  real, because the SDK's `ClobRewardsSchema` parses them through
+  `DecimalishSchema` (a `string | number` input union that always OUTPUTS a
+  decimal string). This fixture therefore carries decimal STRINGS and
+  `verify-venue` rejects a JSON number for those three fields; a number would
+  mean an un-parsed raw body had leaked in. `rewardsMaxSpread` stays a JSON
+  number — it is `number`/`float` in every published representation. See
+  report §7.1 for the verbatim quotes and the SDK permalinks.
 
 ## Caveats
 

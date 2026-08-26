@@ -13,6 +13,10 @@
  * `packages/bindings/src/clob/account.ts`,
  * `packages/bindings/src/clob/order-response.ts`; raw sources retrieved
  * 2026-08-24, re-verified verbatim against the pinned commit 2026-08-26).
+ * The per-market reward settings additionally follow
+ * `packages/bindings/src/gamma/common.ts` (`ClobRewardsSchema`) and
+ * `packages/bindings/src/gamma/market.ts` (retrieved 2026-08-26 at the same
+ * pinned commit).
  *
  * Every SDK-derived spec is `strict`: it enumerates the full field list of its
  * source schema and rejects unexpected keys, so an omitted SDK field cannot
@@ -294,11 +298,53 @@ const FEES_SPEC: PayloadSpec = {
             high: { type: "price-string" },
           },
         },
+        // Per-market liquidity-reward settings.
+        //
+        // LAYER: this example models the SDK-PARSED representation
+        // (`market.rewards`), which is what a `@polymarket/client` consumer
+        // sees, NOT the raw Gamma HTTP body. The official market-details page
+        // publishes both and they differ for the reward decimals:
+        //
+        //   - TypeScript tab: `rewardsMinSize?: DecimalString | null`,
+        //     `rewardsAmount: DecimalString`, `rewardsDailyRate:
+        //     DecimalString`, and its `ClobRewards Example` prints them
+        //     QUOTED: `"rewardsMinSize": "100"`, `"rewardsAmount": "10000"`,
+        //     `"rewardsDailyRate": "100"`.
+        //   - Python tab: `rewards_min_size: Decimal | None`,
+        //     `rewards_amount: Decimal`, `rewards_daily_rate: Decimal`.
+        //   - API (Gamma) tab: the same fields are typed `number` in the field
+        //     table and printed UNQUOTED in the JSON example.
+        //
+        // These are not contradictory: the SDK bridges them with
+        // `DecimalishSchema = z.union([DecimalStringSchema, z.number()
+        // .transform(...)])`, which ACCEPTS a JSON number on input and always
+        // OUTPUTS a decimal string. This schema therefore rejects the JSON
+        // number deliberately — a number here would mean an un-parsed raw
+        // Gamma body had leaked into a fixture that claims the parsed layer.
+        //
+        // Sources (all accessed 2026-08-26):
+        //   https://docs.polymarket.com/market-data/market-details
+        //   https://github.com/Polymarket/ts-sdk/blob/7fdbed42484b5d279c71aa36d3757d18968260da/packages/bindings/src/gamma/common.ts
+        //     (`ClobRewardsSchema`)
+        //   https://github.com/Polymarket/ts-sdk/blob/7fdbed42484b5d279c71aa36d3757d18968260da/packages/bindings/src/gamma/market.ts
+        //     (`clobRewards`/`rewardsMinSize`/`rewardsMaxSpread` on the market
+        //     schema)
+        //   https://github.com/Polymarket/ts-sdk/blob/7fdbed42484b5d279c71aa36d3757d18968260da/packages/bindings/src/shared.ts
+        //     (`DecimalishSchema`, `ClobRewardIdSchema`,
+        //     `ConditionIdResponseSchema`, `IsoCalendarDateStringSchema`)
         market_settings_example: {
           type: "object",
           strict: true,
           fields: {
-            rewardsMinSize: { type: "integer" },
+            // NARROWING: the SDK schema is `DecimalishSchema.nullish()` and
+            // the published type is `DecimalString | null`; this frozen
+            // snapshot keeps the key present and non-null.
+            rewardsMinSize: { type: "decimal-string" },
+            // A NUMBER in every published representation — TypeScript
+            // `number | null`, Python `float | None`, Gamma field table
+            // `number`, SDK `z.number().nullish()`. Deliberately NOT a decimal
+            // string: it is a spread in cents, not a monetary amount.
+            // NARROWING: kept present and non-null.
             rewardsMaxSpread: { type: "number" },
             clobRewards: {
               type: "array",
@@ -306,18 +352,42 @@ const FEES_SPEC: PayloadSpec = {
                 type: "object",
                 strict: true,
                 fields: {
+                  // `ClobRewardIdSchema = z.string().transform(toClobRewardId)`
+                  // (shared.ts): a branded STRING. All three published
+                  // examples quote it.
                   id: { type: "string" },
+                  // NARROWING: `ClobRewardsSchema.conditionId` is
+                  // `ConditionIdResponseSchema`, which the SDK comments as
+                  // validating "hex syntax without constraining the condition
+                  // ID byte length" — unlike `ConditionIdSchema`. The 31/32
+                  // byte bound below is this repository's narrowing, kept for
+                  // consistency with every other condition id in this catalog.
                   conditionId: CONDITION_ID,
-                  assetAddress: EVM_ADDRESS,
-                  rewardsAmount: { type: "number" },
-                  rewardsDailyRate: { type: "number" },
+                  // Plain `string`, NOT an EVM address. Both sources agree and
+                  // the contrast is deliberate: the sibling `conditionId` gets
+                  // the branded `CtfConditionId`/`ConditionIdResponseSchema`
+                  // while `assetAddress` is documented as `assetAddress:
+                  // string` (Python `asset_address: str`) and implemented as a
+                  // bare `z.string()` even though the SDK has an
+                  // `EvmAddressSchema` available. An earlier revision narrowed
+                  // this to a 20-byte EVM address; that constraint is not
+                  // documented anywhere and has been removed.
+                  assetAddress: { type: "string" },
+                  rewardsAmount: { type: "decimal-string" },
+                  rewardsDailyRate: { type: "decimal-string" },
+                  // `IsoCalendarDateString` (Python `date`); the Gamma field
+                  // table types it `string`. The SDK's
+                  // `IsoCalendarDateStringSchema` is a branding transform over
+                  // `z.string()` and does NOT enforce `YYYY-MM-DD`, so no
+                  // calendar-date syntax is asserted here.
                   startDate: { type: "string" },
-                  // Official market-details definition types this as
-                  // `IsoCalendarDateString | null` ("`endDate` [can be] `null`
-                  // when it has no end date"):
-                  // https://docs.polymarket.com/market-data/market-details
-                  // (accessed 2026-08-26). `.nullable()`, not `.nullish()`:
-                  // the key must be present.
+                  // Published type `endDate: IsoCalendarDateString | null`
+                  // (Python `end_date: date | None`): "Date when the
+                  // allocation ends, or `null` when it has no end date."
+                  // NARROWING: the SDK schema is
+                  // `IsoCalendarDateStringSchema.nullish()` (the key may also
+                  // be ABSENT); this catalog follows the published type and
+                  // requires the key while allowing `null`.
                   endDate: { type: "string", nullable: true },
                 },
               },

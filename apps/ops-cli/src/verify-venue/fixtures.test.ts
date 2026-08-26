@@ -1231,8 +1231,8 @@ describe("nested contract validation (negative cases)", () => {
       id: "sanitized-reward-id-0001",
       conditionId: "0xnothex",
       assetAddress: "0x0000000000000000000000000000000000000000",
-      rewardsAmount: 10000,
-      rewardsDailyRate: 100,
+      rewardsAmount: "10000",
+      rewardsDailyRate: "100",
       startDate: "2026-07-01",
     };
     const errors = errorsFor(
@@ -1395,6 +1395,184 @@ describe("nested contract validation (negative cases)", () => {
     const openEnded = rewards.find((reward) => reward["endDate"] === null);
     expect(openEnded).toBeDefined();
     expect(Object.hasOwn(openEnded ?? {}, "endDate")).toBe(true);
+  });
+
+  // --- Round-4b: clobRewards decimal layer -------------------------------
+  //
+  // The official market-details page publishes two layers for the reward
+  // amounts (https://docs.polymarket.com/market-data/market-details, accessed
+  // 2026-08-26): the SDK-parsed model types `rewardsAmount` /
+  // `rewardsDailyRate` / `rewardsMinSize` as `DecimalString` (Python
+  // `Decimal`) and prints them QUOTED, while the raw Gamma tab types them
+  // `number` and prints them UNQUOTED. `ClobRewardsSchema` uses
+  // `DecimalishSchema` (a `string | number` input union that always OUTPUTS a
+  // decimal string), so both are real. This fixture claims the PARSED layer,
+  // so an un-parsed JSON number must fail here.
+
+  const rewardSettings = (): {
+    payload: Record<string, unknown>;
+    settings: Record<string, unknown>;
+    rewards: Array<Record<string, unknown>>;
+  } => {
+    const payload = exampleNamed(
+      "fees/fee-reward-parameters.json",
+      "liquidity-rewards-market-settings",
+    );
+    const settings = payload["market_settings_example"] as Record<
+      string,
+      unknown
+    >;
+    return {
+      payload,
+      settings,
+      rewards: settings["clobRewards"] as Array<Record<string, unknown>>,
+    };
+  };
+
+  const rewardErrors = (payload: Record<string, unknown>): string[] =>
+    errorsFor(
+      payload,
+      specOf("fees-and-rewards"),
+      "liquidity-rewards-market-settings",
+    );
+
+  it("freezes the reward decimals as STRINGS, never JSON numbers", () => {
+    const { settings, rewards } = rewardSettings();
+    expect(typeof settings["rewardsMinSize"]).toBe("string");
+    expect(rewards.length).toBeGreaterThan(0);
+    for (const reward of rewards) {
+      expect(typeof reward["rewardsAmount"]).toBe("string");
+      expect(typeof reward["rewardsDailyRate"]).toBe("string");
+    }
+    // The documented example lexemes are already canonical per handoff §7.3,
+    // so the frozen values are the page's own strings, not rewritten ones.
+    expect(rewards[0]?.["rewardsAmount"]).toBe("10000");
+    expect(rewards[0]?.["rewardsDailyRate"]).toBe("100");
+    expect(settings["rewardsMinSize"]).toBe("100");
+  });
+
+  for (const field of ["rewardsAmount", "rewardsDailyRate"]) {
+    it(`rejects a JSON number for clobRewards[].${field} (parsed layer is DecimalString)`, () => {
+      const { payload, rewards } = rewardSettings();
+      expect(rewardErrors(payload)).toEqual([]);
+      rewards[0]![field] = 10000;
+      expect(
+        rewardErrors(payload).some(
+          (error) =>
+            error.includes(`clobRewards[0].${field}`) &&
+            error.includes("expected canonical decimal string"),
+        ),
+      ).toBe(true);
+    });
+
+    for (const malformed of ["10000.00", "1e4", "+100", "", "01"]) {
+      it(`rejects malformed decimal ${JSON.stringify(malformed)} for clobRewards[].${field}`, () => {
+        const { payload, rewards } = rewardSettings();
+        rewards[0]![field] = malformed;
+        expect(
+          rewardErrors(payload).some(
+            (error) =>
+              error.includes(`clobRewards[0].${field}`) &&
+              error.includes("expected canonical decimal string"),
+          ),
+        ).toBe(true);
+      });
+    }
+
+    it(`rejects null for clobRewards[].${field} (required, non-nullable)`, () => {
+      const { payload, rewards } = rewardSettings();
+      rewards[0]![field] = null;
+      expect(
+        rewardErrors(payload).some(
+          (error) =>
+            error.includes(`clobRewards[0].${field}`) &&
+            error.includes("null is not an accepted value"),
+        ),
+      ).toBe(true);
+    });
+  }
+
+  it("rejects a JSON number for rewardsMinSize (DecimalString | null)", () => {
+    const { payload, settings } = rewardSettings();
+    settings["rewardsMinSize"] = 100;
+    expect(
+      rewardErrors(payload).some(
+        (error) =>
+          error.includes("rewardsMinSize") &&
+          error.includes("expected canonical decimal string"),
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps rewardsMaxSpread a NUMBER (number/float in every representation)", () => {
+    const { payload, settings } = rewardSettings();
+    settings["rewardsMaxSpread"] = "3";
+    expect(
+      rewardErrors(payload).some(
+        (error) =>
+          error.includes("rewardsMaxSpread") &&
+          error.includes("expected finite number"),
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts a non-EVM-address clobRewards[].assetAddress (documented plain string)", () => {
+    // Both the page (`assetAddress: string`, Python `asset_address: str`) and
+    // `ClobRewardsSchema` (`assetAddress: z.string()`) type this as a bare
+    // string, in deliberate contrast to the branded sibling `conditionId`. An
+    // earlier revision narrowed it to a 20-byte EVM address, which the venue
+    // never documented.
+    const { payload, rewards } = rewardSettings();
+    rewards[0]!["assetAddress"] = "sanitized-non-address-asset";
+    expect(rewardErrors(payload)).toEqual([]);
+  });
+
+  it("still rejects a non-string clobRewards[].assetAddress", () => {
+    const { payload, rewards } = rewardSettings();
+    rewards[0]!["assetAddress"] = 42;
+    expect(
+      rewardErrors(payload).some((error) =>
+        error.includes("clobRewards[0].assetAddress: expected string"),
+      ),
+    ).toBe(true);
+  });
+
+  it("requires a string clobRewards[].id (branded ClobRewardIdSchema)", () => {
+    const { payload, rewards } = rewardSettings();
+    rewards[0]!["id"] = 1;
+    expect(
+      rewardErrors(payload).some((error) =>
+        error.includes("clobRewards[0].id: expected string"),
+      ),
+    ).toBe(true);
+  });
+
+  it("requires clobRewards[].startDate to be present and a string", () => {
+    const { payload, rewards } = rewardSettings();
+    rewards[0]!["startDate"] = 20260701;
+    expect(
+      rewardErrors(payload).some((error) =>
+        error.includes("clobRewards[0].startDate: expected string"),
+      ),
+    ).toBe(true);
+    delete rewards[0]!["startDate"];
+    expect(
+      rewardErrors(payload).some((error) =>
+        error.includes("clobRewards[0].startDate: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a null clobRewards[].startDate (only endDate is nullable)", () => {
+    const { payload, rewards } = rewardSettings();
+    rewards[0]!["startDate"] = null;
+    expect(
+      rewardErrors(payload).some(
+        (error) =>
+          error.includes("clobRewards[0].startDate") &&
+          error.includes("null is not an accepted value"),
+      ),
+    ).toBe(true);
   });
 
   it("rejects a non-address value in the published contract map", () => {
