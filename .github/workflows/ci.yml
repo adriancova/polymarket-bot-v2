@@ -36,6 +36,12 @@ jobs:
       - name: Lint
         run: pnpm lint
 
+      # WP-015: enforces docs/contracts/dependency-direction.md §6 (cycles F9,
+      # layer conformance F12/F13, forbidden specifiers F1-F8/F11). No secrets,
+      # no network.
+      - name: Dependency direction and package boundaries
+        run: pnpm check:deps
+
       - name: Unit tests
         run: pnpm test
 
