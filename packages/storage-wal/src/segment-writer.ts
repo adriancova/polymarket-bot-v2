@@ -35,6 +35,7 @@ export class ActiveSegment {
   readonly #hash: Hash;
 
   #recordCount = 0;
+  #durableRecordCount = 0;
   #byteLength = 0;
   #checksummedByteLength = 0;
   #unsyncedBytes = 0;
@@ -45,6 +46,8 @@ export class ActiveSegment {
   #firstReceivedAt: string | null = null;
   #lastReceivedAt: string | null = null;
   #closed = false;
+  #faultSyncAttempted = false;
+  #faultSyncSucceeded = false;
 
   private constructor(input: {
     readonly fileSystem: WalFileSystem;
@@ -116,6 +119,18 @@ export class ActiveSegment {
     return this.#recordCount;
   }
 
+  /**
+   * Records whose durability has been **proven** by a successful `fsync`.
+   *
+   * The writer's fault reconciliation partitions the frames it accepted using
+   * this number: records beyond it may be on disk, but nothing has proven they
+   * survive a power loss, so they are not reported as durable and they are not
+   * removed from the caller's pending list until a later `fsync` proves them.
+   */
+  get durableRecordCount(): number {
+    return this.#durableRecordCount;
+  }
+
   get byteLength(): number {
     return this.#byteLength;
   }
@@ -180,8 +195,46 @@ export class ActiveSegment {
     await this.#handle.sync();
     this.#unsyncedBytes = 0;
     this.#unsyncedRecords = 0;
+    this.#durableRecordCount = this.#recordCount;
     this.#lastSyncMonotonicMs = clock.monotonicMs();
     return { bytes, records };
+  }
+
+  /**
+   * Last chance to prove the file durable, on the fault path.
+   *
+   * Always issues an `fsync` when the handle is still open, even when the
+   * in-memory counters believe nothing is unsynced: after a torn append the
+   * counters describe the last known-good prefix, while the file may hold more
+   * bytes than that. Returns `true` when everything currently in the file is
+   * known to have reached durable storage.
+   *
+   * A released handle implies `true`, because {@link ActiveSegment.finalize}
+   * releases the handle only after a successful `fsync`.
+   *
+   * Never throws: the caller is already handling a fault, and the answer it
+   * needs is a verdict, not another exception. The result is remembered so a
+   * retried close cannot turn a failed sync into an apparent success.
+   */
+  async syncForFaultClose(): Promise<boolean> {
+    if (this.#faultSyncAttempted) {
+      return this.#faultSyncSucceeded;
+    }
+    this.#faultSyncAttempted = true;
+    if (this.#closed) {
+      this.#faultSyncSucceeded = true;
+      return true;
+    }
+    try {
+      await this.#handle.sync();
+      this.#unsyncedBytes = 0;
+      this.#unsyncedRecords = 0;
+      this.#durableRecordCount = this.#recordCount;
+      this.#faultSyncSucceeded = true;
+    } catch {
+      this.#faultSyncSucceeded = false;
+    }
+    return this.#faultSyncSucceeded;
   }
 
   /**
@@ -210,18 +263,20 @@ export class ActiveSegment {
       closeReason: reason,
     };
     const footerBytes = encodeFooterLine(footer);
-    try {
-      await this.#handle.append(footerBytes);
-      this.#byteLength += footerBytes.length;
-      this.#unsyncedBytes += footerBytes.length;
-      await this.#handle.sync();
-      this.#unsyncedBytes = 0;
-      this.#unsyncedRecords = 0;
-      this.#lastSyncMonotonicMs = clock.monotonicMs();
-    } finally {
-      this.#closed = true;
-      await this.#handle.close().catch(() => undefined);
-    }
+    // The handle is deliberately **not** released when the footer append or its
+    // fsync fails: the writer's fault path still needs it to prove what reached
+    // the disk. Releasing it here would leave the segment unsyncable and force
+    // the manifest to describe bytes nobody had fsynced.
+    await this.#handle.append(footerBytes);
+    this.#byteLength += footerBytes.length;
+    this.#unsyncedBytes += footerBytes.length;
+    await this.#handle.sync();
+    this.#unsyncedBytes = 0;
+    this.#unsyncedRecords = 0;
+    this.#durableRecordCount = this.#recordCount;
+    this.#lastSyncMonotonicMs = clock.monotonicMs();
+    this.#closed = true;
+    await this.#handle.close().catch(() => undefined);
 
     const manifest: WalSegmentManifest = {
       manifestVersion: WAL_MANIFEST_VERSION,

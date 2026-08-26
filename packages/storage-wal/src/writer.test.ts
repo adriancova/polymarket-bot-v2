@@ -369,7 +369,11 @@ describe("backpressure and refusals", () => {
   });
 
   it("refuses when the hard capacity threshold is reached, without deleting anything", async () => {
-    const { fileSystem, writer } = await openHarness({ maxTotalBytes: 800 });
+    // 800 bytes would be refused outright: a segment costs a header line and a
+    // footer line beyond its records, and 800 does not fit even one frame with
+    // its framing. The threshold covers those bytes, so it is a real bound on
+    // what lands on disk rather than on frame lines alone.
+    const { fileSystem, writer } = await openHarness({ maxTotalBytes: 2_500 });
     let refusals = 0;
     let accepted = 0;
     for (const frame of createTestFrames(20)) {
@@ -388,6 +392,31 @@ describe("backpressure and refusals", () => {
     await writer.close();
     const manifests = await listSegmentManifests(fileSystem, DIRECTORY);
     expect(manifests.reduce((total, m) => total + m.recordCount, 0)).toBe(accepted);
+
+    let onDisk = 0;
+    for (const [path, bytes] of fileSystem.files) {
+      if (path.endsWith(".wal.jsonl")) {
+        onDisk += bytes.length;
+      }
+    }
+    expect(onDisk).toBeLessThanOrEqual(2_500);
+  });
+
+  it("refuses everything when the threshold cannot cover one segment's framing", async () => {
+    const { fileSystem, writer } = await openHarness({ maxTotalBytes: 800 });
+    for (const frame of createTestFrames(5)) {
+      const result = writer.enqueue(frame);
+      expect(result.accepted).toBe(false);
+      if (!result.accepted) {
+        expect(result.reason).toBe("capacity-exceeded");
+      }
+    }
+    await writer.close();
+    // Refusing everything is the honest outcome, and it costs no bytes and no
+    // dropped frames.
+    expect(fileSystem.files.size).toBe(0);
+    expect(writer.metrics().queue.messagesDropped).toBe(0);
+    expect(writer.metrics().capacityRemainingBytes).toBeGreaterThanOrEqual(0);
   });
 
   it("refuses everything once closed", async () => {

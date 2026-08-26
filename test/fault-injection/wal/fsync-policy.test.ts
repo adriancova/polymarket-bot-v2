@@ -80,6 +80,48 @@ describe("periodic fsync", () => {
     await writer.close();
   });
 
+  it("keeps unsynced bytes within the threshold plus one record", async () => {
+    // The byte trigger is a high-water mark, not a hard cap: the batch stops at
+    // the threshold, so the overshoot is bounded by the single record that
+    // crosses it and never by "however much happened to be queued"
+    // (`wal-format.md` §9).
+    const harness = createFaultHarness();
+    const threshold = 1_500;
+    const writer = await harness.open({
+      fsyncIntervalMs: 1_000_000,
+      fsyncByteThreshold: threshold,
+    });
+    let largestRecordBytes = 0;
+    let highWater = 0;
+    for (const frame of createTestFrames(60)) {
+      writer.enqueue(frame);
+      largestRecordBytes = Math.max(largestRecordBytes, frame.payloadUtf8.length + 400);
+      await writer.drain();
+      highWater = Math.max(highWater, writer.metrics().bytesUnsynced);
+    }
+    expect(highWater).toBeGreaterThan(0);
+    expect(highWater).toBeLessThanOrEqual(threshold + largestRecordBytes);
+    await writer.close();
+  });
+
+  it("does not let a queued burst push unsynced bytes far past the threshold", async () => {
+    const harness = createFaultHarness();
+    const threshold = 2_000;
+    const writer = await harness.open({
+      fsyncIntervalMs: 1_000_000,
+      fsyncByteThreshold: threshold,
+    });
+    // 200 frames arrive before a single drain — the case that used to append
+    // them all in one batch and only then consider the threshold.
+    for (const frame of createTestFrames(200)) {
+      writer.enqueue(frame);
+    }
+    await writer.drain();
+    expect(writer.metrics().bytesUnsynced).toBeLessThanOrEqual(threshold * 2);
+    expect(harness.fileSystem.syncCalls()).toBeGreaterThan(10);
+    await writer.close();
+  });
+
   it("reports the interval as the data-loss bound and measures fsync latency", async () => {
     const harness = createFaultHarness();
     const writer = await harness.open({ fsyncIntervalMs: 750 });

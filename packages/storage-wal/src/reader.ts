@@ -50,7 +50,13 @@ export type SegmentIssueCode =
   | "GATEWAY_EPOCH_MISMATCH"
   | "BYTE_SIZE_MISMATCH"
   | "MANIFEST_MISSING"
-  | "FOOTER_MANIFEST_DISAGREE";
+  | "FOOTER_MANIFEST_DISAGREE"
+  /** The manifest contradicts the segment's own header. */
+  | "MANIFEST_HEADER_DISAGREE"
+  /** The manifest contradicts the records on disk. */
+  | "MANIFEST_CONTENT_DISAGREE"
+  /** The manifest contradicts itself. */
+  | "MANIFEST_INCONSISTENT";
 
 export type SegmentIssue = {
   readonly code: SegmentIssueCode;
@@ -487,8 +493,52 @@ export type SegmentValidationReport = {
   readonly issues: readonly SegmentIssue[];
 };
 
+/** Ordinal encoded in a default-factory segment id (`<epoch>-<000000>`), or `null`. */
+function encodedSegmentOrdinal(segmentId: string, gatewayEpoch: string): number | null {
+  const prefix = `${gatewayEpoch}-`;
+  if (!segmentId.startsWith(prefix)) {
+    return null;
+  }
+  const suffix = segmentId.slice(prefix.length);
+  if (!/^[0-9]{6,}$/u.test(suffix)) {
+    return null;
+  }
+  const ordinal = Number.parseInt(suffix, 10);
+  return Number.isSafeInteger(ordinal) ? ordinal : null;
+}
+
+/**
+ * Cross-check every field two artifacts both carry.
+ *
+ * A checksum proves the *frame bytes* were not altered. It proves nothing about
+ * the metadata around them: an edited `gatewayEpoch` or `firstIngestSeq` changes
+ * which range a compactor believes it holds while every digest still matches.
+ * So each pair of values that must agree is compared by name, and a
+ * disagreement is an issue with both sides in its details.
+ */
+function compareFields(
+  issues: SegmentIssue[],
+  code: SegmentIssueCode,
+  subject: string,
+  pairs: readonly (readonly [field: string, declared: unknown, actual: unknown])[],
+): void {
+  for (const [field, declared, actual] of pairs) {
+    if (declared !== actual) {
+      issues.push({
+        code,
+        message: `manifest ${field} does not match ${subject}`,
+        details: { field, manifest: declared, [subject]: actual },
+      });
+    }
+  }
+}
+
 /**
  * Validate one segment by record count and SHA-256 (`WP-050` acceptance 2).
+ *
+ * Also cross-checks every field the manifest shares with the segment header, the
+ * footer, or the records themselves — see {@link compareFields} for why a
+ * checksum alone is not enough — and checks the manifest against itself.
  *
  * Never throws for a defective segment: it reports. A caller that wants an
  * exception uses {@link readSegmentRecords}.
@@ -565,6 +615,121 @@ export async function validateSegment(
         code: "FOOTER_MANIFEST_DISAGREE",
         message: "segment footer and sidecar manifest declare different record counts",
         details: { footer: scan.footer.recordCount, manifest: manifest.recordCount },
+      });
+    }
+
+    // The manifest against the segment's own header: identity and provenance.
+    if (scan.header !== null) {
+      compareFields(issues, "MANIFEST_HEADER_DISAGREE", "header", [
+        ["formatId", manifest.formatId, scan.header.formatId],
+        ["walSchemaVersion", manifest.walSchemaVersion, scan.header.walSchemaVersion],
+        ["segmentId", manifest.segmentId, scan.header.segmentId],
+        ["gatewayEpoch", manifest.gatewayEpoch, scan.header.gatewayEpoch],
+        ["segmentIndex", manifest.segmentIndex, scan.header.segmentIndex],
+        ["createdAt", manifest.createdAt, scan.header.createdAt],
+      ]);
+    }
+
+    // The manifest against the footer: every field they both carry, not only
+    // the two the earlier checks covered.
+    if (scan.footer !== null) {
+      compareFields(issues, "FOOTER_MANIFEST_DISAGREE", "footer", [
+        ["formatId", manifest.formatId, scan.footer.formatId],
+        ["walSchemaVersion", manifest.walSchemaVersion, scan.footer.walSchemaVersion],
+        ["segmentId", manifest.segmentId, scan.footer.segmentId],
+        ["gatewayEpoch", manifest.gatewayEpoch, scan.footer.gatewayEpoch],
+        [
+          "checksummedByteLength",
+          manifest.checksummedByteLength,
+          scan.footer.checksummedByteLength,
+        ],
+        ["closedAt", manifest.closedAt, scan.footer.closedAt],
+        ["closeReason", manifest.closeReason, scan.footer.closeReason],
+      ]);
+    }
+
+    // The manifest against the records themselves. Skipped when the scan
+    // stopped on corruption, because then it describes a prefix and every
+    // comparison would fire for the same underlying defect.
+    const scanIsComplete = scan.issues.every(
+      (issue) => issue.code === "INCOMPLETE_FINAL_RECORD",
+    );
+    if (scanIsComplete) {
+      compareFields(issues, "MANIFEST_CONTENT_DISAGREE", "records", [
+        ["firstIngestSeq", manifest.firstIngestSeq, scan.firstIngestSeq],
+        ["lastIngestSeq", manifest.lastIngestSeq, scan.lastIngestSeq],
+        ["firstReceivedAt", manifest.firstReceivedAt, scan.firstReceivedAt],
+        ["lastReceivedAt", manifest.lastReceivedAt, scan.lastReceivedAt],
+        ["footerPresent", manifest.footerPresent, scan.footer !== null],
+      ]);
+    }
+
+    // The manifest against itself: combinations no writer or recovery pass can
+    // produce, and which therefore mean the document was edited.
+    const expectedFileName = segmentFileName(manifest.segmentId);
+    if (manifest.segmentFileName !== expectedFileName) {
+      issues.push({
+        code: "MANIFEST_INCONSISTENT",
+        message: "manifest segmentFileName does not follow from its segmentId",
+        details: { declared: manifest.segmentFileName, expected: expectedFileName },
+      });
+    }
+    if (manifest.footerPresent && manifest.truncatedTailBytes !== 0) {
+      issues.push({
+        code: "MANIFEST_INCONSISTENT",
+        message: "a segment with a footer cannot also have had a tail truncated",
+        details: { truncatedTailBytes: manifest.truncatedTailBytes },
+      });
+    }
+    if (
+      manifest.truncatedTailBytes > 0 &&
+      manifest.closeReason !== "recovery" &&
+      manifest.closeReason !== "write-fault"
+    ) {
+      issues.push({
+        code: "MANIFEST_INCONSISTENT",
+        message: "only recovery or a write fault truncates a tail",
+        details: {
+          truncatedTailBytes: manifest.truncatedTailBytes,
+          closeReason: manifest.closeReason,
+        },
+      });
+    }
+    if (manifest.checksummedByteLength > manifest.byteSize) {
+      issues.push({
+        code: "MANIFEST_INCONSISTENT",
+        message: "manifest checksummed byte length exceeds its declared file size",
+        details: {
+          checksummedByteLength: manifest.checksummedByteLength,
+          byteSize: manifest.byteSize,
+        },
+      });
+    }
+    const emptyRange =
+      manifest.firstIngestSeq === null &&
+      manifest.lastIngestSeq === null &&
+      manifest.firstReceivedAt === null &&
+      manifest.lastReceivedAt === null;
+    if ((manifest.recordCount === 0) !== emptyRange) {
+      issues.push({
+        code: "MANIFEST_INCONSISTENT",
+        message: "manifest record count and record range disagree about emptiness",
+        details: {
+          recordCount: manifest.recordCount,
+          firstIngestSeq: manifest.firstIngestSeq,
+          lastIngestSeq: manifest.lastIngestSeq,
+        },
+      });
+    }
+    // Only when the id actually encodes an ordinal: a deployment may inject a
+    // factory whose ids say nothing about ordering, and identity is what the
+    // header says, never what the name implies (`wal-format.md` §2).
+    const encodedOrdinal = encodedSegmentOrdinal(manifest.segmentId, manifest.gatewayEpoch);
+    if (encodedOrdinal !== null && encodedOrdinal !== manifest.segmentIndex) {
+      issues.push({
+        code: "MANIFEST_INCONSISTENT",
+        message: "manifest segmentIndex does not match the ordinal encoded in the segment id",
+        details: { segmentId: manifest.segmentId, segmentIndex: manifest.segmentIndex },
       });
     }
   }

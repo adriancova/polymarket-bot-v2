@@ -56,7 +56,9 @@ describe("the configured capacity threshold", () => {
     const harness = createFaultHarness();
     const writer = await harness.open({ maxTotalBytes: 100_000 });
     expect(writer.metrics().capacityBytes).toBe(100_000);
+    // No segment is open yet, so no framing overhead is reserved.
     expect(writer.metrics().capacityRemainingBytes).toBe(100_000);
+    expect(writer.metrics().capacityReservedBytes).toBe(0);
 
     for (const frame of createTestFrames(10)) {
       writer.enqueue(frame);
@@ -64,8 +66,61 @@ describe("the configured capacity threshold", () => {
     await writer.drain();
     const metrics = writer.metrics();
     expect(metrics.totalSegmentBytes).toBeGreaterThan(0);
-    expect(metrics.capacityRemainingBytes).toBe(100_000 - metrics.totalSegmentBytes);
+    // Headroom is for *frame bytes*: what is on disk, plus what is queued, plus
+    // the footer the open segment still owes (`wal-format.md` §11.1).
+    expect(metrics.capacityReservedBytes).toBeGreaterThan(0);
+    expect(metrics.capacityRemainingBytes).toBe(
+      100_000 -
+        metrics.totalSegmentBytes -
+        metrics.queue.currentByteDepth -
+        (metrics.capacityReservedBytes ?? 0),
+    );
     await writer.close();
+  });
+
+  it("never reports negative remaining capacity, however tight the threshold", async () => {
+    for (const cap of [1, 200, 700, 1_100, 1_477, 5_000]) {
+      const harness = createFaultHarness();
+      const writer = await harness.open({ maxTotalBytes: cap });
+      for (const frame of createTestFrames(30)) {
+        writer.enqueue(frame);
+        expect(writer.metrics().capacityRemainingBytes).toBeGreaterThanOrEqual(0);
+        await writer.drain();
+        expect(writer.metrics().capacityRemainingBytes).toBeGreaterThanOrEqual(0);
+      }
+      await writer.close();
+      expect(writer.metrics().capacityRemainingBytes).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("keeps total WAL bytes at or under the threshold, framing included", async () => {
+    // The pre-fix projection charged only frame lines, so a threshold could be
+    // overshot by a header plus a footer per segment. These thresholds bracket
+    // the interesting cases: below one segment's overhead, exactly one closed
+    // one-frame segment, and enough for several rotations.
+    for (const cap of [700, 1_050, 1_100, 2_000, 4_000]) {
+      const harness = createFaultHarness();
+      const writer = await harness.open({ maxTotalBytes: cap, maxSegmentBytes: 900 });
+      const accepted: string[] = [];
+      for (const frame of createTestFrames(40)) {
+        if (writer.enqueue(frame).accepted) {
+          accepted.push(frame.ingestSeq);
+        }
+        await writer.drain();
+      }
+      await writer.close();
+
+      let onDisk = 0;
+      for (const [path, bytes] of harness.base.files) {
+        if (path.endsWith(".wal.jsonl")) {
+          onDisk += bytes.length;
+        }
+      }
+      expect(onDisk, `threshold ${cap} was exceeded`).toBeLessThanOrEqual(cap);
+      // Refusing is not the same as losing: everything admitted is on disk.
+      expect(await recordedIngestSeqs(harness.fileSystem)).toEqual(accepted);
+      expect(writer.metrics().queue.messagesDropped).toBe(0);
+    }
   });
 
   it("counts pre-existing segments toward the threshold after a restart", async () => {

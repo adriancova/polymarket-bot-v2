@@ -212,8 +212,43 @@ segment look invalid.
 | `footerPresent` | whether the segment also carries an in-file footer |
 | `truncatedTailBytes` | bytes removed by recovery as an incomplete final record; `0` for a clean close |
 
-When both exist they must agree; `validateSegment` reports
-`FOOTER_MANIFEST_DISAGREE` if they do not.
+### 6.3 Agreement is field by field
+
+When both a footer and a manifest exist they must agree, and "agree" means
+**every field they both carry**, not only the count and the digest. The same
+applies to the header, and to the records themselves.
+
+A checksum protects the bytes. It protects nothing about the claims made *about*
+those bytes: `gatewayEpoch`, `segmentIndex`, `firstIngestSeq`, `lastReceivedAt`,
+`closeReason`, `footerPresent`, and `truncatedTailBytes` can all be edited in the
+sidecar while every digest still verifies. Those fields are what `WP-130` carries
+into dataset manifests (§12.5), so an edited `ingestSeq` range silently
+mislabels which data a dataset contains. `validateSegment` therefore cross-checks:
+
+| Manifest field | Checked against | Issue on disagreement |
+| --- | --- | --- |
+| `formatId`, `walSchemaVersion`, `segmentId`, `gatewayEpoch`, `segmentIndex`, `createdAt` | the segment header | `MANIFEST_HEADER_DISAGREE` |
+| `formatId`, `walSchemaVersion`, `segmentId`, `gatewayEpoch`, `checksummedByteLength`, `closedAt`, `closeReason` | the footer, when present | `FOOTER_MANIFEST_DISAGREE` |
+| `recordCount`, `segmentSha256` | the footer, when present | `FOOTER_MANIFEST_DISAGREE` |
+| `recordCount`, `checksummedByteLength`, `segmentSha256`, `byteSize` | the bytes on disk | `RECORD_COUNT_MISMATCH`, `CHECKSUM_LENGTH_MISMATCH`, `CHECKSUM_MISMATCH`, `BYTE_SIZE_MISMATCH` |
+| `firstIngestSeq`, `lastIngestSeq`, `firstReceivedAt`, `lastReceivedAt`, `footerPresent` | the records on disk | `MANIFEST_CONTENT_DISAGREE` |
+
+and checks the manifest against itself (`MANIFEST_INCONSISTENT`):
+
+- `segmentFileName` must follow from `segmentId`;
+- a segment with a footer cannot also have had a tail truncated
+  (`footerPresent` implies `truncatedTailBytes === 0`);
+- only `recovery` or `write-fault` truncates a tail;
+- `checksummedByteLength` cannot exceed `byteSize`;
+- `recordCount === 0` exactly when the whole record range is `null`;
+- when the segment id encodes an ordinal — the default factory's
+  `<gatewayEpoch>-<000000>` shape — it must equal `segmentIndex`. An injected
+  factory whose ids encode nothing is not second-guessed: identity is what the
+  header says, never what the name implies (§2).
+
+The content comparisons are skipped when the scan stopped on corruption, because
+then it describes only a prefix and every field would disagree for the same
+underlying reason.
 
 ---
 
@@ -244,7 +279,8 @@ A segment is **valid** only when all of the following hold (this is exactly what
 4. A manifest exists.
 5. The manifest's `recordCount`, `checksummedByteLength`, `byteSize`, and
    `segmentSha256` all match the bytes on disk.
-6. A footer, if present, agrees with the manifest.
+6. Every other field the manifest shares with the header, the footer, or the
+   records agrees with them, and the manifest does not contradict itself (§6.3).
 
 ---
 
@@ -280,7 +316,15 @@ first wins:
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `fsyncIntervalMs` | 1000 | maximum time unsynced data may sit in the page cache |
-| `fsyncByteThreshold` | 1 MiB | maximum unsynced bytes |
+| `fsyncByteThreshold` | 1 MiB | **high-water mark** for unsynced bytes, not a hard cap |
+
+`fsyncByteThreshold` is a high-water mark and the document says so rather than
+implying a guarantee the implementation does not make. A drain stops building a
+batch once appending the next record would take the segment past the threshold,
+so the trigger fires at the crossing record instead of after an arbitrarily
+large batch — but the record that crosses it is written whole, and a single
+record may exceed the threshold on its own. **Unsynced bytes are therefore
+bounded by `fsyncByteThreshold` plus one record, never by the queue depth.**
 
 **`fsyncIntervalMs` is a published bound on data loss** (ADR-004 §3): a host
 power loss can lose at most the frames appended since the last successful
@@ -302,6 +346,22 @@ What is guaranteed when:
 A failing `fsync` is a fault, not a warning: the writer stops accepting frames
 and the caller must reopen, at which point recovery reads what actually reached
 the disk.
+
+### 9.1 A manifest never describes unsynced bytes
+
+**A manifest is written only after an `fsync` has covered every byte it
+describes.** A clean close appends the footer, fsyncs, and only then writes the
+sidecar; §10.1 makes the fault path do the same. The rule exists because a
+manifest is a durability claim, and a claim about bytes that are still only in
+the page cache is one a power loss can falsify: the segment comes back short
+while its sidecar still says how many records it "has".
+
+The consequence a consumer can rely on: **a manifest never overcounts.** If a
+segment carries a manifest, the file holds at least the records the manifest
+declares — after a crash, after a power loss, after a failed `fsync`. A segment
+whose durability could not be proven carries no manifest at all, which makes it
+unverified and therefore invisible to a compactor (§2), and the recorder reports
+it through `unmanifestedFaultedSegments`.
 
 Not guaranteed: directory-entry durability. The implementation does not fsync the
 containing directory after creating a file, so a power loss immediately after a
@@ -343,17 +403,48 @@ Two distinctions that are easy to get wrong, and are tested:
 finds a manifest and does nothing. `truncatedTailBytes` in the manifest preserves
 what the first pass removed.
 
-### 10.1 After a write fault
+### 10.1 After a write fault, and the accepted-frame invariant
 
-If an append or `fsync` fails, the writer transitions to `faulted`, refuses
-further frames, and keeps every frame it cannot prove durable in
-`pendingFrames()`. Closing a faulted writer reconciles the segment against the
-disk: it truncates an incomplete final record, writes the manifest for the
-verified prefix, and removes from `pendingFrames()` exactly those frames that
-turned out to be durable — so the caller re-enqueues neither a lost frame nor a
-duplicate. If the manifest cannot be written either (a genuinely full disk),
-`close()` fails and may be retried once space exists; if the process dies first,
-the next recovery finalizes the segment.
+The invariant the recorder is built around, and the one worth stating before the
+mechanism:
+
+> A frame that `enqueue` accepted leaves the writer's accountability only by
+> appearing in a segment manifest, or by being handed back through
+> `pendingFrames()`. Never by both, and never by neither.
+
+It holds for **every** way a write can fail, not only a failed append: creating
+the segment (the header write), rotating it (the footer write), finalizing it,
+and `fsync`. That distinction is load-bearing, because `drain()` empties the
+queue before it opens, rotates, or syncs anything — so any failure in between
+would otherwise leave the frames it had taken accounted for nowhere.
+
+On a fault the writer transitions to `faulted`, refuses further frames, and moves
+into `pendingFrames()` both the frames it never appended and the frames it
+appended but no `fsync` has covered (`unprovenFrameCount` in the metrics is the
+second group while the writer is still healthy).
+
+Closing a faulted writer reconciles the segment against the disk:
+
+1. **One last `fsync`**, to establish whether anything can be asserted at all.
+   It is issued even when the counters believe nothing is unsynced, because after
+   a torn append the counters describe the last known-good prefix while the file
+   may hold more.
+2. **If that `fsync` succeeds**, the writer reads back what actually reached the
+   disk, truncates an incomplete final record, writes the manifest for the
+   verified prefix, and removes from `pendingFrames()` exactly those frames that
+   turned out to be durable — so the caller re-enqueues neither a lost frame nor
+   a duplicate.
+3. **If it fails**, the segment is left exactly as found and **unmanifested**.
+   Nothing about the file can be asserted, so no manifest is written (§9.1), the
+   segment stays unverified and out of a compactor's reach, and *every* frame it
+   might hold stays with the caller. Recovery finalizes it on the next open,
+   describing whatever actually survived.
+
+A fault raised by `close()` itself is reconciled and then re-thrown: a close that
+hit a write fault must not look like a clean shutdown, and `pendingFrames()` is
+settled and readable in the caller's catch block. If the manifest cannot be
+written either (a genuinely full disk), `close()` fails and may be retried once
+space exists; if the process dies first, the next recovery finalizes the segment.
 
 ---
 
@@ -385,10 +476,60 @@ age (`activeSegmentAgeMs`), plus `dataLossBoundMs`, capacity accounting, and
 refusal/fault counters. Compaction lag and object-upload status belong to
 `WP-130`.
 
+### 11.1 The hard capacity threshold
+
 The hard capacity threshold (§4.2) is `maxTotalBytes`: when the directory reaches
 it, frames are refused with `capacity-exceeded`. Nothing is deleted and nothing
 is overwritten — filling the disk is the intended failure direction (ADR-004,
 Consequences), and reaching the threshold is an incident.
+
+**What the threshold bounds.** `maxTotalBytes` bounds the total bytes of every
+segment file in the directory, **framing included** — not the frame lines alone.
+A segment costs a header line and a footer line beyond its records, so admitting
+frames against the frame bytes alone would let a 427-byte threshold end up with
+1,049 bytes on disk, which is what the pre-remediation implementation did.
+
+The admission test at `enqueue` is therefore:
+
+```text
+segmentBytesOnDisk + queuedFrameBytes + candidateFrameBytes + B  ≤  maxTotalBytes
+```
+
+where **B**, the reserved framing overhead, is:
+
+```text
+B = (footer of the open segment, if one is open)
+  + N × (header + footer of a segment)
+  N = number of further segments the unwritten frame bytes require
+    = ceil(max(unwrittenBytes − roomLeftInTheOpenSegment, 0) / maxSegmentBytes)
+```
+
+Header and footer lengths are computed from the real gateway epoch and the real
+segment ids, with every numeric field taken at `Number.MAX_SAFE_INTEGER`, the
+timestamp at 24 characters, the longest `closeReason`, and 64 bytes of slack per
+segment. B is deliberately an over-estimate: over-reserving only refuses sooner,
+which is the safe direction, while under-reserving breaks the bound.
+
+`capacityRemainingBytes` is the headroom for *frame bytes* under exactly this
+definition — `maxTotalBytes − onDisk − queued − B`, clamped at zero. It is never
+negative.
+
+Two consequences worth stating plainly:
+
+- **A threshold smaller than one segment's framing refuses everything.** With a
+  427-byte frame, roughly 1,050 bytes are needed before a single frame can be
+  admitted. Refusing is the honest answer; silently exceeding the threshold is
+  not.
+- **One case is not pre-accounted: a *time*-driven rotation that fires while
+  previously accepted frames are still queued.** Its new segment's header and
+  footer were not in B, so the total can transiently exceed `maxTotalBytes` by at
+  most one segment's framing overhead per such rotation. The next admission
+  decision sees the real bytes and refuses accordingly. Size-driven rotation is
+  fully pre-accounted.
+
+`maxTotalBytes` counts what the writer knows about — recovery's tally plus what
+it has written. It is not a `statvfs` reading, so it bounds the WAL, not the
+disk.
 
 ---
 
@@ -431,6 +572,9 @@ Rules:
 | Compaction, upload, deletion, dataset manifests | `WP-130`. This package writes and verifies; it never deletes. |
 | Per-record digest verification on read | Available via `assertPayloadDigest`, not performed by the reader by default; the segment checksum already covers the bytes. |
 | At-least-once at a fault boundary | If a caller re-enqueues `pendingFrames()` without the reconciliation `close()` performs, duplicate raw records are possible. Duplicates are detectable by `(gatewayEpoch, ingestSeq)`; losing a frame is not. |
+| Unmanifested faulted segments | A segment whose durability could not be proven (§10.1 case 3) keeps its bytes but gets no manifest until recovery runs. Its records are also in `pendingFrames()`, so re-recording them and then recovering the old segment produces duplicates — detectable, and preferred to loss. |
+| Capacity vs. time-driven rotation | `maxTotalBytes` is pre-accounted for size-driven rotation only; see §11.1 for the bounded residual. |
+| Byte-threshold fsync | A high-water mark bounded by the threshold plus one record, not a hard cap (§9). |
 
 ---
 
@@ -479,4 +623,16 @@ Implementation: `packages/storage-wal/src/`
 
 Tests: `packages/storage-wal/src/**/*.test.ts` (unit, run by the root gate) and
 `test/fault-injection/wal/**` (fault injection, run by
-`pnpm --filter @polymarket-bot/storage-wal test:fault`).
+`pnpm --filter @polymarket-bot/storage-wal test:fault`; root `test:fault` and the
+CI step are orchestrator-wired at merge).
+
+The three sections above that state guarantees rather than layout each have a
+suite whose job is to try to break them:
+
+| Guarantee | Suite |
+| --- | --- |
+| §10.1 accepted-frame invariant, on every failing write path | `accepted-frame-invariant.test.ts` |
+| §9.1 a manifest never overcounts, including after a power loss | `accepted-frame-invariant.test.ts` |
+| §6.3 field-by-field agreement | `manifest-agreement.test.ts`, `checksum-validation.test.ts` |
+| §11.1 the capacity bound, framing included | `wal-capacity.test.ts` |
+| §9 the fsync bound and the byte high-water mark | `fsync-policy.test.ts` |
