@@ -21,9 +21,39 @@ Maximum permitted run mode: `PAPER`
 | ---------------------- | -------- | ------------------ | ---------- |
 | `WP-000`               | In review (round 5) | None    | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
-| `WP-020`               | In review (round 3) | `WP-010` ✓ | `wp-implementer` on branch `worktree-agent-a45b4929f044830ca` |
-| `WP-030`               | Blocked  | `WP-000`, `WP-020` | —          |
+| `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
+| `WP-030`               | Blocked  | `WP-000` ✗, `WP-020` ✓ | —      |
 | All remaining packages | Blocked  | See work plan      | —          |
+
+### WP-020 completion record (2026-08-26)
+
+- Implemented by `wp-implementer` (Opus subagent) on isolated worktree branch
+  `worktree-agent-a45b4929f044830ca`, base `4c1d96f`; commit chain `815b6cb`
+  (initial) → `9790e0a` (review round 1 remediation) → `8d9596e` (review round 2
+  remediation); merged to `main` as `25bc451` under the release manager's standing
+  delegation for this run (2026-08-26).
+- Independent adversarial reviews (fresh Codex session per round): round 1
+  CHANGES REQUIRED (3 high, 4 medium, 2 low), round 2 CHANGES REQUIRED (3 medium,
+  1 low), round 3 **ACCEPT** (Codex session `01a03d55-078f-7283-ba28-9bb01535e0d1`;
+  0 blocker/high/medium; residual LOW doc shorthand fixed post-merge; NOTE —
+  WP-030 ADR should reserve top-level payload key `venue` for provenance).
+- Post-merge integration on `main` at `25bc451`: `pnpm install --frozen-lockfile`,
+  `typecheck`, `lint`, `test` (797/797), `uv sync --frozen` + `pytest`, and
+  `pnpm audit --audit-level high` all pass.
+- Deliverables: `@polymarket-bot/decimal` (canonical §7.3 grammar, exact
+  arithmetic, deterministic domain-tagged SHA-256 hashing with strict hash-input
+  grammar, exact tick modulo) and `@polymarket-bot/domain` (event envelope with
+  required `gatewayEpoch`/`ingestSeq` and provenance refinement, 22 versioned
+  event contracts, DecisionResult with zero-or-more intents, five intent types,
+  run modes with PAPER-safe maximum assertion, versioned schema registry), plus
+  `docs/contracts/domain.md` and handoff `docs/handoffs/WP-020.md`.
+- Items deferred to WP-030 ADRs: decimal library + canonicalization + hash
+  preimage; strict-boundary/normalize split; version-per-field-set policy;
+  inferred `QuoteLevel`/`BasketLeg`; `DISPUTED` non-terminal ruling;
+  `TradingParametersChanged` vocabulary (`status` per §10.1, `open_time`/
+  `close_time` per §9.2); reserve payload key `venue` for provenance.
+- Domain contracts are now FROZEN: changes require an ADR (workplan
+  `protected_paths` already covers `packages/domain/**`, `packages/decimal/**`).
 
 ### WP-010 completion record (2026-08-22)
 
@@ -79,7 +109,8 @@ Maximum permitted run mode: `PAPER`
   citation table in domain.md §6.4; handoff precision fixes; 797/797 tests; no
   decimal-package, golden-digest, or lockfile change). Orchestrator fast-forwarded
   the branch to `8d9596e` and reproduced gates. Review round 3 (candidate `8d9596e`
-  vs `4c1d96f`) dispatched 2026-08-26 — verdict pending. Not merged.
+  vs `4c1d96f`): **ACCEPT**. Merged to `main` as `25bc451` and post-merge verified
+  (see WP-020 completion record); worktrees and branches cleaned up.
 
 - `worktree-agent-a373c7ba6650bf1a9` (WP-000): base `7faf30f`, first candidate `8d16849`,
   second candidate `f79aa96`. Independent adversarial review round 1 (2026-08-24):

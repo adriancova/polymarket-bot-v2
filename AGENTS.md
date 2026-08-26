@@ -17,7 +17,7 @@ Before planning, editing, or delegating:
 ## Execution rules
 
 - Execute only work packages explicitly authorized for the current run.
-- Begin with `WP-000` and `WP-010`; do not begin `WP-020` yet.
+- Current per-package authorization and state are recorded in `IMPLEMENTATION_STATUS.md`; do not begin a package it does not mark authorized/ready for this run.
 - Use at most four agents, and fewer when tasks are not genuinely independent.
 - One write-enabled work package per Git branch/worktree.
 - Never allow two agents to edit the same paths concurrently.

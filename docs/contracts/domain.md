@@ -525,7 +525,7 @@ handoff; each fills a gap the handoff leaves open.
 | Feed gap/resync flags | `z.literal(true)`, not `z.boolean()` | §6.1 — the §7.1/§9.1 invariant is unconditional |
 | `ReferenceVenue` | derived from the §7.1 `source` enum | §6.3 — a payload restatement must be comparable to the authority |
 | `parameterVersionRef` | opaque bounded string, catalog-owned addressing | §6.4 — the snapshot shape is a volatile venue fact (§1.2) pending WP-000 |
-| `changedParameters` | non-empty enum array over the §9.2 categories | §6.4 — names *what* changed without freezing fee/`negRisk` shapes |
+| `changedParameters` | non-empty enum array over the §9.2/§10.1 vocabulary | §6.4 — names *what* changed without freezing fee/`negRisk` shapes |
 | Incident `severity` | `LOG` / `NOTIFY` / `PAGE` | reuses the §14.4 alert vocabulary |
 | Book events | no synthetic sequence number | §9.4 forbids inventing a venue sequence number; ordering comes from `gatewayEpoch + ingestSeq` |
 
