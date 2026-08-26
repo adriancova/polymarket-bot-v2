@@ -123,6 +123,107 @@ describe("the configured capacity threshold", () => {
     }
   });
 
+  /**
+   * Enqueue a burst with **no drain between the offers**, then write it in one
+   * go. Returns how many frames were admitted and how many segment bytes that
+   * produced.
+   */
+  async function runQueuedBurst(
+    burst: number,
+    maxTotalBytes: number,
+    maxSegmentBytes: number,
+  ): Promise<{ readonly admitted: number; readonly onDisk: number }> {
+    const harness = createFaultHarness();
+    const writer = await harness.open({
+      maxTotalBytes,
+      maxSegmentBytes,
+      // No time rotation: §11.1 pre-accounts size-driven rotation only, and the
+      // one-segment residual it does not cover is a *time* rotation.
+      maxSegmentAgeMs: 1_000_000_000,
+      fsyncIntervalMs: 1_000_000,
+      fsyncByteThreshold: 10_000_000,
+    });
+    let admitted = 0;
+    for (const frame of createTestFrames(burst)) {
+      if (writer.enqueue(frame).accepted) {
+        admitted += 1;
+      }
+      expect(writer.metrics().capacityRemainingBytes).toBeGreaterThanOrEqual(0);
+    }
+    await writer.drain();
+    await writer.close();
+    let onDisk = 0;
+    for (const [path, bytes] of harness.base.files) {
+      if (path.endsWith(".wal.jsonl")) {
+        onDisk += bytes.length;
+      }
+    }
+    expect(await recordedIngestSeqs(harness.fileSystem)).toHaveLength(admitted);
+    expect(writer.metrics().queue.messagesDropped).toBe(0);
+    return { admitted, onDisk };
+  }
+
+  it("keeps a queued burst under the threshold, at the exact cap and one byte below", async () => {
+    // Round-2 review, MEDIUM. `#overheadReserve` divided the unwritten frame
+    // bytes by `maxSegmentBytes` to decide how many segments they needed, which
+    // ignores two things: each segment spends part of that budget on its own
+    // header line, and a segment holds **whole records**. With the reviewer's
+    // 900-byte segments a 415-byte frame packs one per segment, so a 10-frame
+    // burst needs ten segments where the division predicted five — and the
+    // 3-, 10- and 20-frame bursts overshot the cap by 306, 2340 and 4695 bytes.
+    //
+    // Only a queued burst exposes it: draining between offers keeps exactly one
+    // frame unwritten, and one frame never needs more than one segment.
+    const maxSegmentBytes = 900;
+    for (const burst of [1, 2, 3, 10, 20]) {
+      // The smallest threshold that admits the whole burst — a cap-exact vector,
+      // found rather than hard-coded so it tracks the format. Admission is
+      // monotone in the threshold, so a binary search finds the boundary.
+      let low = 1_000;
+      let high = 60_000;
+      expect((await runQueuedBurst(burst, high, maxSegmentBytes)).admitted).toBe(burst);
+      while (low < high) {
+        const middle = Math.floor((low + high) / 2);
+        if ((await runQueuedBurst(burst, middle, maxSegmentBytes)).admitted >= burst) {
+          high = middle;
+        } else {
+          low = middle + 1;
+        }
+      }
+      const cap = low;
+
+      // At the exact cap: everything is admitted, and the bytes it produces are
+      // at or under the threshold. This is the assertion the old projection
+      // failed.
+      const atCap = await runQueuedBurst(burst, cap, maxSegmentBytes);
+      expect(atCap.admitted, `burst ${burst}: cap ${cap} should admit all`).toBe(burst);
+      expect(atCap.onDisk, `burst ${burst}: cap ${cap} was exceeded`).toBeLessThanOrEqual(cap);
+
+      // One byte below it the last frame is refused — refusing sooner is the
+      // safe direction, but the reservation must not be *arbitrarily* pessimistic
+      // either, or the threshold would stop meaning anything.
+      const belowCap = await runQueuedBurst(burst, cap - 1, maxSegmentBytes);
+      expect(belowCap.admitted, `burst ${burst}: cap ${cap - 1} should refuse one`).toBe(
+        burst - 1,
+      );
+      expect(belowCap.onDisk).toBeLessThanOrEqual(cap - 1);
+    }
+  });
+
+  it("holds the bound for queued bursts across segment sizes and thresholds", async () => {
+    for (const maxSegmentBytes of [900, 1_500, 4_096]) {
+      for (const burst of [3, 10, 20]) {
+        for (const cap of [1_100, 2_000, 4_000, 6_000, 10_000, 20_000]) {
+          const { onDisk } = await runQueuedBurst(burst, cap, maxSegmentBytes);
+          expect(
+            onDisk,
+            `burst ${burst}, segment ${maxSegmentBytes}, threshold ${cap} was exceeded`,
+          ).toBeLessThanOrEqual(cap);
+        }
+      }
+    }
+  });
+
   it("counts pre-existing segments toward the threshold after a restart", async () => {
     const harness = createFaultHarness();
     const first = await harness.open();
@@ -147,12 +248,13 @@ describe("the configured capacity threshold", () => {
 });
 
 describe("a genuinely full disk", () => {
-  it("faults the writer and keeps the recorded prefix recoverable", async () => {
+  it("faults the writer, claims nothing, and keeps every frame recoverable", async () => {
     const harness = createFaultHarness({ diskCapacityBytes: 1_400 });
     const writer = await harness.open({
       fsyncIntervalMs: 1_000_000,
       fsyncByteThreshold: 10_000_000,
     });
+    const accepted = createTestFrames(20).map((frame) => frame.ingestSeq);
     for (const frame of createTestFrames(20)) {
       writer.enqueue(frame);
     }
@@ -162,26 +264,63 @@ describe("a genuinely full disk", () => {
     expect(writer.metrics().queue.messagesDropped).toBe(0);
     expect(writer.pendingFrames().length).toBeGreaterThan(0);
 
-    // Closing cannot write the sidecar manifest either — the disk really is
-    // full — so close() fails and the writer stays faulted rather than
-    // pretending the segment was finalized.
-    await expect(writer.close()).rejects.toThrow(/ENOSPC/u);
-    expect(writer.state).toBe("faulted");
-
-    // The operator frees space. Closing again finalizes the verified prefix.
-    harness.fileSystem.setDiskCapacityBytes(1_000_000);
-    const manifest = await writer.close();
+    // The `ENOSPC` tore an append on this segment's handle, so its durability
+    // watermark froze at the header — the last fsync that succeeded before the
+    // failure. No manifest may be written for what the tear left behind, and
+    // the close says so by returning null rather than by claiming a prefix
+    // (round-2 HIGH-2). The bytes stay on disk, unverified.
+    expect(await writer.close()).toBeNull();
     expect(writer.state).toBe("closed");
-    expect(manifest?.closeReason).toBe("write-fault");
-    const persisted = await recordedIngestSeqs(harness.fileSystem);
-    const pending = writer.pendingFrames().map((frame) => frame.ingestSeq);
-    expect(persisted.length).toBe(manifest?.recordCount ?? 0);
-    expect([...persisted, ...pending]).toEqual(
-      createTestFrames(20).map((frame) => frame.ingestSeq),
-    );
+    expect(writer.metrics().unmanifestedFaultedSegments).toBe(1);
+    expect(await listSegmentManifests(harness.fileSystem, WAL_DIRECTORY)).toEqual([]);
+
+    // Nothing was recorded, and nothing was lost: all twenty are the caller's.
+    expect(await recordedIngestSeqs(harness.fileSystem, { skipInvalid: true })).toEqual([]);
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(accepted);
+
+    // The operator frees space. Recovery finalizes the abandoned segment on the
+    // next open, describing exactly what survived — the disclosed at-least-once
+    // boundary, since those records are also still pending.
+    harness.fileSystem.setDiskCapacityBytes(1_000_000);
+    const reopened = await harness.open();
+    expect(reopened.recovery.hasIntegrityFailures).toBe(false);
+    const recovered = await recordedIngestSeqs(harness.fileSystem);
+    expect(recovered.length).toBeGreaterThan(0);
+    expect(accepted.slice(0, recovered.length)).toEqual(recovered);
+    await reopened.close();
 
     const reports = await validateWalDirectory(harness.fileSystem, WAL_DIRECTORY);
     expect(reports.every((report) => report.valid)).toBe(true);
+  });
+
+  it("still fails a close that cannot write a sidecar it is entitled to write", async () => {
+    // The retryable branch survives the round-2 change: when the watermark is
+    // clean, the only thing standing between the segment and its manifest is
+    // disk space, and `close()` must fail loudly rather than silently drop the
+    // claim it is entitled to make.
+    // Three failed sidecar writes: the clean close consumes two of them (its own
+    // and the fault close's), the first retry the third, and only the second
+    // retry lands.
+    const harness = createFaultHarness({
+      onWriteWholeFile: (call) => (call <= 3 ? new Error("ENOSPC: no space for sidecar") : undefined),
+    });
+    const writer = await harness.open();
+    for (const frame of createTestFrames(4)) {
+      expect(writer.enqueue(frame).accepted).toBe(true);
+    }
+
+    await expect(writer.close()).rejects.toThrow(/ENOSPC/u);
+    expect(writer.state).toBe("faulted");
+    await expect(writer.close()).rejects.toThrow(/ENOSPC/u);
+    expect(writer.pendingFrames()).toHaveLength(4);
+    expect(await listSegmentManifests(harness.fileSystem, WAL_DIRECTORY)).toEqual([]);
+
+    const manifest = await writer.close();
+    expect(writer.state).toBe("closed");
+    expect(manifest?.recordCount).toBe(4);
+    // Accountability moved exactly once, with the manifest write.
+    expect(writer.pendingFrames()).toEqual([]);
+    expect(await recordedIngestSeqs(harness.fileSystem)).toEqual(["1", "2", "3", "4"]);
   });
 
   it("never overwrites an existing segment to make room", async () => {

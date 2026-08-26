@@ -195,15 +195,19 @@ describe("a failure finalizing a segment", () => {
     // writer's debt at this point, alongside the two frames never written.
     expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(["1", "2", "3"]);
 
-    const manifest = await writer.close();
-    expect(manifest?.recordCount).toBe(1);
+    // Round 2 tightened this: the failed footer append froze the segment's
+    // durability watermark, so the fault-close fsync cannot promote frame 1 and
+    // no manifest is written at all. Frame 1's bytes stay on disk, unverified
+    // and invisible to a compactor, and the frame stays with the caller.
+    expect(await writer.close()).toBeNull();
     const { manifested, pending } = await expectExactPartition(
       writer,
       harness.fileSystem,
       accepted,
     );
-    expect(manifested).toEqual(["1"]);
-    expect(pending).toEqual(["2", "3"]);
+    expect(manifested).toEqual([]);
+    expect(pending).toEqual(["1", "2", "3"]);
+    expect(writer.metrics().unmanifestedFaultedSegments).toBe(1);
     await expectNoManifestOvercounts(harness.fileSystem);
   });
 
@@ -265,19 +269,221 @@ describe("a failing fsync", () => {
     expect(writer.pendingFrames()).toHaveLength(3);
   });
 
-  it("keeps the manifest honest when a later fsync does prove the bytes", async () => {
+  // Round-2 review, HIGH-2 ("fsyncgate"). This case used to assert the opposite:
+  // that a *later* successful fsync proved the bytes an earlier failed one had
+  // left unproven, and that `close()` could therefore write a manifest. It
+  // cannot. Linux reports a writeback error once and then clears it from the
+  // file description's error cursor, so the next `fsync` can return success
+  // while the failed writeback never reached the disk (kernel VFS error-handling
+  // documentation; POSIX leaves the file's state after a failed `fsync`
+  // unspecified). The reviewer's power-loss probe turned that assumption into a
+  // manifest claiming one record over a file holding none.
+  it("never lets a post-failure fsync success extend a durability claim", async () => {
     const harness = createFaultHarness({
+      // 1 = the header fsync (succeeds), 2 = the frame fsync (EIO), 3 = the
+      // fault-close fsync, which the kernel reports as success and which the
+      // fault filesystem models faithfully: it makes nothing durable.
       onSync: (call) => (call === 2 ? new Error("EIO: fsync failed") : undefined),
     });
     const writer = await harness.open({ fsyncByteThreshold: 1 });
     const accepted = await enqueueAll(writer, createTestFrames(3));
 
     await expect(writer.drain()).rejects.toBeInstanceOf(WalWriteFaultError);
-    const manifest = await writer.close();
-    // close() proved the file durable with one more fsync, so what it recorded
-    // it may honestly claim.
-    expect(manifest).not.toBeNull();
+    expect(await writer.close()).toBeNull();
+    expect(harness.fileSystem.syncCalls()).toBeGreaterThanOrEqual(3);
+    expect(writer.metrics().framesDurable).toBe(0);
+    expect(writer.metrics().unmanifestedFaultedSegments).toBe(1);
+
     await expectExactPartition(writer, harness.fileSystem, accepted);
+    expect(writer.pendingFrames()).toHaveLength(3);
+
+    // The power loss the reviewer's probe used: the manifest that used to exist
+    // here would now be describing a file with nothing in it.
+    harness.fileSystem.simulatePowerLoss();
+    expect(await listSegmentManifests(harness.fileSystem, WAL_DIRECTORY)).toEqual([]);
+    await expectNoManifestOvercounts(harness.fileSystem);
+    expect(await recordedIngestSeqs(harness.fileSystem, { skipInvalid: true })).toEqual([]);
+  });
+
+});
+
+/**
+ * Round-2 review, HIGH-1b. `finalize()` marked its records durable and *then*
+ * wrote the sidecar, and the fault reconciliation used that same flag as its
+ * pivot. Two sidecar failures in one `close()` therefore returned all three
+ * frames to `pendingFrames()` while a later, successful retry still wrote a
+ * manifest declaring them: the reviewer's probe observed `['1','2','3']` in both
+ * places at once, which is precisely the "never by both" half of the invariant.
+ *
+ * The fix makes the manifest write the *only* moment accountability moves.
+ */
+describe("a sidecar that fails and is retried", () => {
+  it("hands the records over exactly once, on the write that succeeds", async () => {
+    // Writes 1 (the clean close) and 2 (the fault close) fail; write 3 lands.
+    const harness = createFaultHarness({
+      onWriteWholeFile: (call) => (call <= 2 ? new Error("ENOSPC: sidecar") : undefined),
+    });
+    const writer = await harness.open();
+    const accepted = await enqueueAll(writer, createTestFrames(3));
+
+    // The footer and its fsync both succeeded and only the sidecar failed, so
+    // the segment's watermark is clean and covers the whole file: this segment
+    // *is* entitled to a manifest. It just cannot have one yet.
+    await expect(writer.close()).rejects.toThrow(/ENOSPC/u);
+    expect(writer.state).toBe("faulted");
+    expect(await listSegmentManifests(harness.fileSystem, WAL_DIRECTORY)).toEqual([]);
+    let partition = await expectExactPartition(writer, harness.fileSystem, accepted);
+    expect(partition.pending).toEqual(["1", "2", "3"]);
+
+    // The operator frees space and retries. The manifest lands and the same
+    // three frames leave the pending list in that step — not before it.
+    const manifest = await writer.close();
+    expect(manifest?.recordCount).toBe(3);
+    expect(manifest?.footerPresent).toBe(true);
+    partition = await expectExactPartition(writer, harness.fileSystem, accepted);
+    expect(partition.manifested).toEqual(["1", "2", "3"]);
+    expect(partition.pending).toEqual([]);
+
+    harness.fileSystem.simulatePowerLoss();
+    await expectNoManifestOvercounts(harness.fileSystem);
+  });
+
+  it("keeps every frame with the caller when the sidecar never lands", async () => {
+    // The same segment, with the disk never coming back. Three failed attempts,
+    // no manifest, and the frames stay exactly where a caller can re-record
+    // them. Nothing is claimed on the strength of an intention.
+    const harness = createFaultHarness({
+      onWriteWholeFile: () => new Error("ENOSPC: sidecar"),
+    });
+    const writer = await harness.open();
+    const accepted = await enqueueAll(writer, createTestFrames(3));
+
+    await expect(writer.close()).rejects.toThrow(/ENOSPC/u);
+    await expect(writer.close()).rejects.toThrow(/ENOSPC/u);
+    await expect(writer.close()).rejects.toThrow(/ENOSPC/u);
+    expect(writer.state).toBe("faulted");
+
+    const { manifested, pending } = await expectExactPartition(
+      writer,
+      harness.fileSystem,
+      accepted,
+    );
+    expect(manifested).toEqual([]);
+    expect(pending).toEqual(["1", "2", "3"]);
+    expect(writer.metrics().framesDurable).toBe(0);
+    await expectNoManifestOvercounts(harness.fileSystem);
+  });
+});
+
+/**
+ * Round-2 review, HIGH-1a. `drain()` hands the frames it took from the queue to
+ * `#enterFault()`, but `tick()` takes none — it rotates and fsyncs on its own
+ * cadence — so a frame sitting in the queue when `tick()` faulted was handed to
+ * nobody. The faulted `close()` that followed reconciled only the segment, and
+ * the reviewer's probe found the writer closed with queue depth 1 and that frame
+ * neither manifested nor in `pendingFrames()`.
+ *
+ * A faulted writer will never drain its queue — `enqueue` refuses and `drain()`
+ * refuses to run — so the queue is emptied into the pending list at the fault.
+ */
+describe("a fault raised by tick(), with frames still queued", () => {
+  /** One frame written, a second still queued, and the segment due to rotate. */
+  async function agedSegmentWithAQueuedFrame(
+    harness: ReturnType<typeof createFaultHarness>,
+  ): Promise<{ readonly writer: WalWriter; readonly accepted: readonly RawFrameRecord[] }> {
+    const writer = await harness.open({
+      maxSegmentAgeMs: 1_000,
+      fsyncIntervalMs: 1_000_000,
+      fsyncByteThreshold: 10_000_000,
+    });
+    const frames = createTestFrames(2);
+    const accepted: RawFrameRecord[] = [];
+    const first = frames[0];
+    const second = frames[1];
+    if (first === undefined || second === undefined) {
+      throw new Error("expected two generated frames");
+    }
+    expect(writer.enqueue(first).accepted).toBe(true);
+    accepted.push(first);
+    await writer.drain();
+    expect(writer.enqueue(second).accepted).toBe(true);
+    accepted.push(second);
+    // Old enough for `tick()` to rotate it, with frame 2 still in the queue.
+    harness.clock.advance(1_000);
+    return { writer, accepted };
+  }
+
+  it("keeps the queued frame when the fault-close fsync succeeds", async () => {
+    const harness = createFaultHarness({
+      // Appends: 1 = header, 2 = frame 1, 3 = the time-rotation footer.
+      onAppend: (call) =>
+        call === 3 ? { writeBytes: 0, error: new Error("EIO: footer write failed") } : undefined,
+    });
+    const { writer, accepted } = await agedSegmentWithAQueuedFrame(harness);
+
+    await expect(writer.tick()).rejects.toBeInstanceOf(WalWriteFaultError);
+    expect(writer.state).toBe("faulted");
+    // Immediately, not only after close(): the queue is empty and both frames
+    // are the caller's again.
+    expect(writer.metrics().queue.currentDepth).toBe(0);
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(["1", "2"]);
+
+    await writer.close();
+    const { manifested, pending } = await expectExactPartition(
+      writer,
+      harness.fileSystem,
+      accepted,
+    );
+    expect(manifested).toEqual([]);
+    expect(pending).toEqual(["1", "2"]);
+    await expectNoManifestOvercounts(harness.fileSystem);
+  });
+
+  it("keeps the queued frame when the fault-close fsync fails too", async () => {
+    const harness = createFaultHarness({
+      onAppend: (call) =>
+        call === 3 ? { writeBytes: 0, error: new Error("EIO: footer write failed") } : undefined,
+      onSync: (call) => (call >= 2 ? new Error("EIO: fsync failed") : undefined),
+    });
+    const { writer, accepted } = await agedSegmentWithAQueuedFrame(harness);
+
+    await expect(writer.tick()).rejects.toBeInstanceOf(WalWriteFaultError);
+    expect(await writer.close()).toBeNull();
+    const { manifested, pending } = await expectExactPartition(
+      writer,
+      harness.fileSystem,
+      accepted,
+    );
+    expect(manifested).toEqual([]);
+    expect(pending).toEqual(["1", "2"]);
+    await expectNoManifestOvercounts(harness.fileSystem);
+  });
+
+  it("keeps the queued frame even when the rotation itself is manifestable", async () => {
+    // The sharpest form of the finding: the rotation's footer and fsync both
+    // succeed and only its sidecar fails, so the segment *is* entitled to a
+    // manifest naming frame 1. Frame 2 was in the queue and is named by nothing
+    // — it has to come back through `pendingFrames()`, and the partition has to
+    // be exact with both halves non-empty.
+    const harness = createFaultHarness({
+      onWriteWholeFile: (call) => (call === 1 ? new Error("ENOSPC: sidecar") : undefined),
+    });
+    const { writer, accepted } = await agedSegmentWithAQueuedFrame(harness);
+
+    await expect(writer.tick()).rejects.toBeInstanceOf(WalWriteFaultError);
+    expect(writer.metrics().queue.currentDepth).toBe(0);
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(["1", "2"]);
+
+    const manifest = await writer.close();
+    expect(manifest?.recordCount).toBe(1);
+    const { manifested, pending } = await expectExactPartition(
+      writer,
+      harness.fileSystem,
+      accepted,
+    );
+    expect(manifested).toEqual(["1"]);
+    expect(pending).toEqual(["2"]);
+    harness.fileSystem.simulatePowerLoss();
     await expectNoManifestOvercounts(harness.fileSystem);
   });
 });

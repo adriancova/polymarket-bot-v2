@@ -148,6 +148,25 @@ export class BoundedRawFrameQueue {
     return { accepted: true, depth: this.depth };
   }
 
+  /**
+   * Encoded byte length of every queued frame, oldest first.
+   *
+   * The writer's capacity projection needs the individual sizes, not the total:
+   * a segment holds whole records only, so the number of segments a backlog will
+   * occupy depends on how the records pack, not on how many bytes they sum to
+   * (`docs/contracts/wal-format.md` §11.1).
+   */
+  queuedByteLengths(): readonly number[] {
+    const lengths: number[] = [];
+    for (let index = this.#head; index < this.#items.length; index += 1) {
+      const item = this.#items[index];
+      if (item !== undefined) {
+        lengths.push(item.bytes.length);
+      }
+    }
+    return lengths;
+  }
+
   /** Remove and return every queued frame, oldest first. */
   takeAll(): readonly QueuedFrame[] {
     const taken = this.#items.slice(this.#head).filter((item): item is QueuedFrame => item !== undefined);

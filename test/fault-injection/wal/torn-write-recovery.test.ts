@@ -9,7 +9,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  validateSegment,
+  listSegmentManifests,
+  scanSegment,
   validateWalDirectory,
   WalWriteFaultError,
 } from "@polymarket-bot/storage-wal";
@@ -51,7 +52,13 @@ describe("a process killed mid-append", () => {
     }
   });
 
-  it("closes by truncating only the partial record and accounting for every frame", async () => {
+  it("truncates only the partial record and claims nothing the watermark cannot prove", async () => {
+    // Round-2 review, HIGH-2: the torn append is a **write failure on this
+    // handle**, so the segment's durability watermark freezes at the last fsync
+    // that succeeded before it — here, the header's. No later fsync may extend
+    // it, so `close()` writes no manifest and every frame stays with the caller.
+    // Before the fix, the fault-close fsync was read as proof and a manifest
+    // claimed the two records the tear had left behind.
     const harness = tearTheFrameBatch();
     const writer = await harness.open();
     for (const frame of createTestFrames(5)) {
@@ -59,32 +66,33 @@ describe("a process killed mid-append", () => {
     }
     await expect(writer.drain()).rejects.toBeInstanceOf(WalWriteFaultError);
 
-    const manifest = await writer.close();
-    expect(manifest).not.toBeNull();
-    expect(manifest?.closeReason).toBe("write-fault");
-    expect(manifest?.truncatedTailBytes).toBeGreaterThan(0);
-    expect(manifest?.footerPresent).toBe(false);
+    expect(await writer.close()).toBeNull();
+    expect(writer.metrics().unmanifestedFaultedSegments).toBe(1);
+    expect(await listSegmentManifests(harness.fileSystem, WAL_DIRECTORY)).toEqual([]);
 
-    const persisted = await recordedIngestSeqs(harness.fileSystem);
+    // Nothing recorded, nothing lost: all five are the caller's again.
+    const persisted = await recordedIngestSeqs(harness.fileSystem, { skipInvalid: true });
     const pending = writer.pendingFrames().map((frame) => frame.ingestSeq);
-
-    expect(persisted.length).toBe(manifest?.recordCount);
-    expect(persisted.length).toBeGreaterThan(0);
-    expect(pending.length).toBeGreaterThan(0);
-    // Nothing lost, nothing duplicated: the persisted prefix and the frames the
-    // caller still holds partition the five frames exactly.
+    expect(persisted).toEqual([]);
     expect([...persisted, ...pending]).toEqual(["1", "2", "3", "4", "5"]);
 
-    const validation = await validateSegment(
-      harness.fileSystem,
-      WAL_DIRECTORY,
-      manifest?.segmentId ?? "",
+    // The partial record is still gone — that part is file hygiene, not a
+    // durability claim, and ADR-004 §3 allows exactly it.
+    const [segmentPath] = [...harness.base.files.keys()].filter((path) =>
+      path.endsWith(".wal.jsonl"),
     );
-    expect(validation.valid).toBe(true);
-    expect(validation.issues).toEqual([]);
+    const scan = await scanSegment(harness.fileSystem, segmentPath ?? "", {
+      onIssue: "collect",
+    });
+    expect(scan.incompleteFinalRecord).toBeNull();
   });
 
-  it("lets the caller re-enqueue the pending frames against a fresh writer", async () => {
+  it("re-records the pending frames against a fresh writer, at least once", async () => {
+    // The unmanifested segment keeps the bytes the tear left on disk, and its
+    // frames are also in `pendingFrames()`. Re-recording them and then letting
+    // recovery finalize the old segment therefore duplicates them — detectable
+    // by `(gatewayEpoch, ingestSeq)`, and the deliberate trade against loss
+    // (`wal-format.md` §12, "Unmanifested faulted segments").
     const harness = tearTheFrameBatch();
     const first = await harness.open();
     for (const frame of createTestFrames(5)) {
@@ -93,6 +101,7 @@ describe("a process killed mid-append", () => {
     await expect(first.drain()).rejects.toBeInstanceOf(WalWriteFaultError);
     await first.close();
     const pending = first.pendingFrames();
+    expect(pending.map((frame) => frame.ingestSeq)).toEqual(["1", "2", "3", "4", "5"]);
 
     const second = await harness.open();
     for (const frame of pending) {
@@ -100,7 +109,12 @@ describe("a process killed mid-append", () => {
     }
     await second.close();
 
-    expect(await recordedIngestSeqs(harness.fileSystem)).toEqual(["1", "2", "3", "4", "5"]);
+    const recorded = await recordedIngestSeqs(harness.fileSystem);
+    // Every accepted frame survives...
+    expect([...new Set(recorded)].sort()).toEqual(["1", "2", "3", "4", "5"]);
+    // ...and the duplicates are exactly the records the abandoned segment held,
+    // which recovery finalized on the second open. Never a *missing* frame.
+    expect(recorded).toEqual(["1", "2", "1", "2", "3", "4", "5"]);
     const reports = await validateWalDirectory(harness.fileSystem, WAL_DIRECTORY);
     expect(reports).toHaveLength(2);
     expect(reports.every((report) => report.valid)).toBe(true);

@@ -9,6 +9,23 @@
  * Counters advance only **after** a successful append, so a torn write leaves
  * the in-memory state describing the last known-good prefix rather than a
  * fiction. The writer's fault path relies on that.
+ *
+ * ## The durability watermark
+ *
+ * The segment carries a **watermark**: the byte length and record count covered
+ * by the last `fsync` that succeeded with **no earlier `fsync` or write failure
+ * on this handle**. It is the only durability claim this class makes, and it is
+ * monotonic: after any failure the watermark **freezes**, and no later `fsync`
+ * success can move it again.
+ *
+ * That is deliberately stricter than "the last `fsync` returned 0". On Linux a
+ * writeback error is reported once and then cleared from the file description's
+ * error cursor, so an `fsync` issued *after* a failed one can return success
+ * while the bytes the failed writeback was carrying never reached the disk (the
+ * kernel VFS error-handling documentation; POSIX leaves the file's state after a
+ * failed `fsync` unspecified). Treating that second call as proof is how a
+ * manifest comes to name a record a power loss then takes away — which
+ * `docs/contracts/wal-format.md` §9.1 forbids outright.
  */
 
 import { createHash } from "node:crypto";
@@ -23,6 +40,19 @@ import type { QueuedFrame } from "./queue.js";
 import { encodeFooterLine, encodeHeaderLine } from "./segment-format.js";
 import type { WalSegmentFooter, WalSegmentHeader } from "./segment-format.js";
 
+/**
+ * What a segment can prove reached durable storage.
+ *
+ * `byteLength` and `recordCount` are covered by the last `fsync` that succeeded
+ * with no earlier failure on the handle. `frozen` says that a failure has since
+ * occurred, so neither number can grow again for this segment.
+ */
+export type SegmentDurabilityWatermark = {
+  readonly byteLength: number;
+  readonly recordCount: number;
+  readonly frozen: boolean;
+};
+
 export class ActiveSegment {
   readonly header: WalSegmentHeader;
   readonly path: string;
@@ -36,6 +66,9 @@ export class ActiveSegment {
 
   #recordCount = 0;
   #durableRecordCount = 0;
+  #durableByteLength = 0;
+  /** Set by any failed append or failed `fsync`; never cleared. */
+  #durabilityFrozen = false;
   #byteLength = 0;
   #checksummedByteLength = 0;
   #unsyncedBytes = 0;
@@ -47,7 +80,6 @@ export class ActiveSegment {
   #lastReceivedAt: string | null = null;
   #closed = false;
   #faultSyncAttempted = false;
-  #faultSyncSucceeded = false;
 
   private constructor(input: {
     readonly fileSystem: WalFileSystem;
@@ -103,6 +135,8 @@ export class ActiveSegment {
       segment.#byteLength += headerBytes.length;
       segment.#checksummedByteLength += headerBytes.length;
       await handle.sync();
+      // The first — and, until a frame is appended, only — watermark.
+      segment.#durableByteLength = segment.#byteLength;
       segment.#lastSyncMonotonicMs = input.clock.monotonicMs();
     } catch (error) {
       await handle.close().catch(() => undefined);
@@ -120,15 +154,38 @@ export class ActiveSegment {
   }
 
   /**
-   * Records whose durability has been **proven** by a successful `fsync`.
+   * Records whose durability has been **proven** — the record half of the
+   * watermark described at the top of this file.
    *
    * The writer's fault reconciliation partitions the frames it accepted using
    * this number: records beyond it may be on disk, but nothing has proven they
    * survive a power loss, so they are not reported as durable and they are not
-   * removed from the caller's pending list until a later `fsync` proves them.
+   * removed from the caller's pending list.
    */
   get durableRecordCount(): number {
     return this.#durableRecordCount;
+  }
+
+  /** Bytes whose durability has been proven; the byte half of the watermark. */
+  get durableByteLength(): number {
+    return this.#durableByteLength;
+  }
+
+  /**
+   * Whether a failed append or `fsync` has frozen the watermark. Once `true`,
+   * no later `fsync` success can extend what this segment claims.
+   */
+  get durabilityFrozen(): boolean {
+    return this.#durabilityFrozen;
+  }
+
+  /** The whole watermark, as the writer's fault path consumes it. */
+  get durability(): SegmentDurabilityWatermark {
+    return {
+      byteLength: this.#durableByteLength,
+      recordCount: this.#durableRecordCount,
+      frozen: this.#durabilityFrozen,
+    };
   }
 
   get byteLength(): number {
@@ -168,7 +225,15 @@ export class ActiveSegment {
         ? Buffer.from(frames[0]?.bytes ?? new Uint8Array())
         : Buffer.concat(frames.map((frame) => Buffer.from(frame.bytes)));
 
-    await this.#handle.append(payload);
+    try {
+      await this.#handle.append(payload);
+    } catch (error) {
+      // A failed write is a failure on this handle, so the watermark freezes:
+      // whatever the kernel does with the partially written bytes, no later
+      // `fsync` on this description may be read as proof about them.
+      this.#durabilityFrozen = true;
+      throw error;
+    }
 
     // Only now, after the append resolved, does in-memory state advance.
     this.#hash.update(payload);
@@ -188,53 +253,75 @@ export class ActiveSegment {
     return payload.length;
   }
 
-  /** fsync the segment. Returns the bytes and records made durable. */
-  async sync(clock: WalClock): Promise<{ readonly bytes: number; readonly records: number }> {
+  /**
+   * fsync the segment.
+   *
+   * Returns what the call actually **proved**. `proven: false` means the
+   * watermark was already frozen by an earlier failure, so the call moved
+   * nothing however cheerfully the kernel answered it, and the caller must keep
+   * treating those bytes as unproven.
+   */
+  async sync(
+    clock: WalClock,
+  ): Promise<{ readonly bytes: number; readonly records: number; readonly proven: boolean }> {
     const bytes = this.#unsyncedBytes;
     const records = this.#unsyncedRecords;
-    await this.#handle.sync();
+    try {
+      await this.#handle.sync();
+    } catch (error) {
+      this.#durabilityFrozen = true;
+      throw error;
+    }
+    this.#lastSyncMonotonicMs = clock.monotonicMs();
+    if (this.#durabilityFrozen) {
+      return { bytes: 0, records: 0, proven: false };
+    }
     this.#unsyncedBytes = 0;
     this.#unsyncedRecords = 0;
     this.#durableRecordCount = this.#recordCount;
-    this.#lastSyncMonotonicMs = clock.monotonicMs();
-    return { bytes, records };
+    this.#durableByteLength = this.#byteLength;
+    return { bytes, records, proven: true };
   }
 
   /**
-   * Last chance to prove the file durable, on the fault path.
+   * Best-effort last `fsync` on the fault path. Returns the watermark.
    *
-   * Always issues an `fsync` when the handle is still open, even when the
-   * in-memory counters believe nothing is unsynced: after a torn append the
-   * counters describe the last known-good prefix, while the file may hold more
-   * bytes than that. Returns `true` when everything currently in the file is
-   * known to have reached durable storage.
+   * It is still issued when the handle is open and the watermark is clean, even
+   * when the in-memory counters believe nothing is unsynced: after a torn append
+   * the counters describe the last known-good prefix while the file may hold
+   * more bytes than that, and a successful `fsync` on a handle with no failure
+   * history does prove those extra bytes.
    *
-   * A released handle implies `true`, because {@link ActiveSegment.finalize}
-   * releases the handle only after a successful `fsync`.
+   * It is **attempted but never believed** once the watermark is frozen. That is
+   * the whole point of the freeze: a `fsync` issued after a failed one can
+   * report success without the failed writeback ever having landed, so its
+   * success may not extend a durability claim. The caller gets the frozen
+   * watermark back and must leave everything past it with the frame's owner.
    *
-   * Never throws: the caller is already handling a fault, and the answer it
-   * needs is a verdict, not another exception. The result is remembered so a
-   * retried close cannot turn a failed sync into an apparent success.
+   * Never throws — the caller is already handling a fault and needs a verdict,
+   * not another exception — and runs its `fsync` at most once, so a retried
+   * close cannot turn a failed sync into an apparent success.
    */
-  async syncForFaultClose(): Promise<boolean> {
-    if (this.#faultSyncAttempted) {
-      return this.#faultSyncSucceeded;
+  async syncForFaultClose(): Promise<SegmentDurabilityWatermark> {
+    if (this.#faultSyncAttempted || this.#closed) {
+      // A released handle cannot be synced again; `finalize()` releases it only
+      // after its own `fsync`, so the watermark already says what is provable.
+      this.#faultSyncAttempted = true;
+      return this.durability;
     }
     this.#faultSyncAttempted = true;
-    if (this.#closed) {
-      this.#faultSyncSucceeded = true;
-      return true;
-    }
     try {
       await this.#handle.sync();
-      this.#unsyncedBytes = 0;
-      this.#unsyncedRecords = 0;
-      this.#durableRecordCount = this.#recordCount;
-      this.#faultSyncSucceeded = true;
+      if (!this.#durabilityFrozen) {
+        this.#unsyncedBytes = 0;
+        this.#unsyncedRecords = 0;
+        this.#durableRecordCount = this.#recordCount;
+        this.#durableByteLength = this.#byteLength;
+      }
     } catch {
-      this.#faultSyncSucceeded = false;
+      this.#durabilityFrozen = true;
     }
-    return this.#faultSyncSucceeded;
+    return this.durability;
   }
 
   /**
@@ -267,14 +354,33 @@ export class ActiveSegment {
     // fsync fails: the writer's fault path still needs it to prove what reached
     // the disk. Releasing it here would leave the segment unsyncable and force
     // the manifest to describe bytes nobody had fsynced.
-    await this.#handle.append(footerBytes);
+    try {
+      await this.#handle.append(footerBytes);
+    } catch (error) {
+      this.#durabilityFrozen = true;
+      throw error;
+    }
     this.#byteLength += footerBytes.length;
     this.#unsyncedBytes += footerBytes.length;
-    await this.#handle.sync();
+    try {
+      await this.#handle.sync();
+    } catch (error) {
+      this.#durabilityFrozen = true;
+      throw error;
+    }
+    this.#lastSyncMonotonicMs = clock.monotonicMs();
+    if (this.#durabilityFrozen) {
+      // Unreachable from a healthy writer — a frozen watermark has already
+      // faulted it — but stated as code rather than as a comment, because this
+      // is the one place a manifest is written without the fault path's checks.
+      throw new Error(
+        `refusing to finalize segment ${this.segmentId}: its durability watermark is frozen`,
+      );
+    }
     this.#unsyncedBytes = 0;
     this.#unsyncedRecords = 0;
     this.#durableRecordCount = this.#recordCount;
-    this.#lastSyncMonotonicMs = clock.monotonicMs();
+    this.#durableByteLength = this.#byteLength;
     this.#closed = true;
     await this.#handle.close().catch(() => undefined);
 

@@ -342,19 +342,38 @@ What is guaranteed when:
 | `drain()` resolves | the frame's bytes were written to the file; durable only if an fsync was triggered |
 | `flush()` resolves | every accepted frame is fsynced |
 | `close()` resolves with a manifest | footer and manifest are fsynced; the segment is complete and verifiable |
+| `close()` resolves with `null` after a fault | the segment carries **no** manifest, and every accepted frame is in `pendingFrames()` |
 
 A failing `fsync` is a fault, not a warning: the writer stops accepting frames
 and the caller must reopen, at which point recovery reads what actually reached
 the disk.
 
-### 9.1 A manifest never describes unsynced bytes
+### 9.1 The durability watermark, and what a manifest may claim
 
-**A manifest is written only after an `fsync` has covered every byte it
+**Durability is proven by a watermark, not by whichever call returned last.**
+Every segment carries one: the byte length and record count covered by the last
+`fsync` that succeeded **with no earlier `fsync` or write failure on that
+segment's handle**. After any such failure the watermark **freezes**, and no
+later `fsync` success can move it again.
+
+The freeze is the point, and it is not defensive decoration. On Linux a
+writeback error is reported once and then cleared from the file description's
+error cursor, so an `fsync` issued *after* a failed one can return success while
+the bytes the failed writeback was carrying never reached the disk; POSIX
+likewise leaves the state of a file unspecified after a failed `fsync`. A
+success that follows a failure is therefore not evidence. Round-2 review
+reproduced the consequence of treating it as evidence: a header fsync that
+succeeded, a frame fsync that returned `EIO`, a fault-close fsync that returned
+success, and then a power loss — leaving a manifest claiming one record over a
+file holding none.
+
+**A manifest is written only when the watermark covers every byte it
 describes.** A clean close appends the footer, fsyncs, and only then writes the
-sidecar; §10.1 makes the fault path do the same. The rule exists because a
-manifest is a durability claim, and a claim about bytes that are still only in
-the page cache is one a power loss can falsify: the segment comes back short
-while its sidecar still says how many records it "has".
+sidecar. The fault path (§10.1) compares the watermark against the verified
+prefix and, when the watermark falls short, writes **no manifest at all** —
+partially describing a segment is not something this format can do, and a
+manifest that named the uncovered records would be exactly the claim a power
+loss falsifies.
 
 The consequence a consumer can rely on: **a manifest never overcounts.** If a
 segment carries a manifest, the file holds at least the records the manifest
@@ -362,6 +381,21 @@ declares — after a crash, after a power loss, after a failed `fsync`. A segmen
 whose durability could not be proven carries no manifest at all, which makes it
 unverified and therefore invisible to a compactor (§2), and the recorder reports
 it through `unmanifestedFaultedSegments`.
+
+Two costs of the rule, stated rather than hidden:
+
+- **It under-claims on purpose.** Any write or `fsync` failure on a segment's
+  handle makes every record past the watermark unmanifestable, even when those
+  bytes did in fact reach the disk. A torn append, an `ENOSPC`, or a failed
+  periodic `fsync` therefore usually leaves the whole segment unmanifested. The
+  records go back to the caller through `pendingFrames()`, so nothing is lost —
+  but re-recording them and then letting recovery finalize the abandoned segment
+  produces duplicates (§12). Under-claiming costs duplicates; over-claiming
+  costs data, and duplicates are detectable while a lost frame is not.
+- **The fault-close `fsync` is still issued**, because on a handle with no
+  failure history it genuinely proves the bytes a torn append left behind — that
+  is the one case where the watermark still advances at close. Its success
+  extends nothing once the watermark is frozen.
 
 Not guaranteed: directory-entry durability. The implementation does not fsync the
 containing directory after creating a file, so a power loss immediately after a
@@ -419,26 +453,42 @@ queue before it opens, rotates, or syncs anything — so any failure in between
 would otherwise leave the frames it had taken accounted for nowhere.
 
 On a fault the writer transitions to `faulted`, refuses further frames, and moves
-into `pendingFrames()` both the frames it never appended and the frames it
-appended but no `fsync` has covered (`unprovenFrameCount` in the metrics is the
-second group while the writer is still healthy).
+into `pendingFrames()`, in accept order, **all three** groups of frames it is
+still holding:
+
+1. the frames it appended but no `fsync` has proven (`unprovenFrameCount` in the
+   metrics is this group while the writer is still healthy);
+2. the frames `drain()` had taken from the queue and not yet appended;
+3. **the frames still in the queue.** A faulted writer will never write them —
+   `enqueue` refuses from now on and `drain()` refuses to run — so leaving them
+   in a queue that looks "still to be written" hides them from the caller. This
+   is the case a fault raised by `tick()` produces, since `tick()` takes nothing
+   from the queue; round-2 review found such a frame accounted for nowhere.
+
+The queue depth is therefore `0` immediately after a fault, and
+`pendingFrameCount` accounts for every frame the writer ever accepted and has
+not manifested.
 
 Closing a faulted writer reconciles the segment against the disk:
 
-1. **One last `fsync`**, to establish whether anything can be asserted at all.
-   It is issued even when the counters believe nothing is unsynced, because after
-   a torn append the counters describe the last known-good prefix while the file
-   may hold more.
-2. **If that `fsync` succeeds**, the writer reads back what actually reached the
-   disk, truncates an incomplete final record, writes the manifest for the
-   verified prefix, and removes from `pendingFrames()` exactly those frames that
-   turned out to be durable — so the caller re-enqueues neither a lost frame nor
-   a duplicate.
-3. **If it fails**, the segment is left exactly as found and **unmanifested**.
-   Nothing about the file can be asserted, so no manifest is written (§9.1), the
-   segment stays unverified and out of a compactor's reach, and *every* frame it
-   might hold stays with the caller. Recovery finalizes it on the next open,
-   describing whatever actually survived.
+1. **One last `fsync`, best effort.** It is issued even when the counters believe
+   nothing is unsynced, because after a torn append the counters describe the
+   last known-good prefix while the file may hold more. On a handle with no
+   failure history its success advances the watermark; on a frozen watermark it
+   proves nothing and advances nothing (§9.1).
+2. **An incomplete final record is truncated** — file hygiene, allowed by
+   ADR-004 §3, and independent of any durability claim.
+3. **If the watermark covers the whole verified prefix**, the writer writes the
+   manifest for it, and **in the same step** removes from `pendingFrames()`
+   exactly the records that manifest names. Accountability transfers there and
+   nowhere else, which is what makes "never by both" true even across a retry:
+   a failed sidecar write leaves every frame with the caller and the segment
+   unmanifested, and a later successful attempt moves them exactly once.
+4. **Otherwise** — the prefix cannot be verified, or the watermark does not cover
+   it — the segment is left **unmanifested**. It stays unverified and out of a
+   compactor's reach, and *every* frame it might hold stays with the caller.
+   Recovery finalizes it on the next open, describing whatever actually
+   survived, which is a disclosed duplicate source (§12).
 
 A fault raised by `close()` itself is reconciled and then re-thrown: a close that
 hit a write fault must not look like a clean shutdown, and `pendingFrames()` is
@@ -499,33 +549,58 @@ where **B**, the reserved framing overhead, is:
 
 ```text
 B = (footer of the open segment, if one is open)
-  + N × (header + footer of a segment)
-  N = number of further segments the unwritten frame bytes require
-    = ceil(max(unwrittenBytes − roomLeftInTheOpenSegment, 0) / maxSegmentBytes)
+  + Σ over the further segments the queued frames will need,
+      of (header + footer of that segment)
 ```
+
+**"Will need" is a packing question, not a division.** A segment holds whole
+records, so the number of segments a backlog occupies depends on how the records
+pack, not on how many bytes they sum to. The writer therefore places the queued
+frames one at a time, exactly as `drain()` will, against the rotation rule of §8:
+
+```text
+roomLeft ← maxSegmentBytes − (bytes already in the open segment)
+for each queued frame, in order:
+    if it fits in roomLeft (or the segment holds no record yet):  roomLeft −= its bytes
+    else: start a further segment; roomLeft ← maxSegmentBytes − header − its bytes
+```
+
+Dividing instead — `ceil(unwrittenBytes / maxSegmentBytes)` — under-reserves
+twice over: it ignores the header each new segment spends out of the same
+budget, and it assumes records subdivide. With 900-byte segments and 415-byte
+frames, ten frames need ten segments while the division predicts five, and
+round-2 review measured queued bursts of 3, 10 and 20 frames overshooting the
+threshold by 306, 2,340 and 4,695 bytes. Only a *queued* burst exposes it:
+draining between offers leaves one frame unwritten, and one frame never needs
+more than one segment.
 
 Header and footer lengths are computed from the real gateway epoch and the real
 segment ids, with every numeric field taken at `Number.MAX_SAFE_INTEGER`, the
 timestamp at 24 characters, the longest `closeReason`, and 64 bytes of slack per
-segment. B is deliberately an over-estimate: over-reserving only refuses sooner,
-which is the safe direction, while under-reserving breaks the bound.
+segment; the same widened header is what the packing subtracts from each new
+segment's usable space. B is deliberately an over-estimate: over-reserving only
+refuses sooner, which is the safe direction, while under-reserving breaks the
+bound.
 
 `capacityRemainingBytes` is the headroom for *frame bytes* under exactly this
 definition — `maxTotalBytes − onDisk − queued − B`, clamped at zero. It is never
 negative.
 
-Two consequences worth stating plainly:
+Three consequences worth stating plainly:
 
 - **A threshold smaller than one segment's framing refuses everything.** With a
   427-byte frame, roughly 1,050 bytes are needed before a single frame can be
   admitted. Refusing is the honest answer; silently exceeding the threshold is
   not.
+- **A `maxSegmentBytes` smaller than a header's worst-case width refuses
+  everything too**, because no segment then has usable space to project into.
+  That configuration cannot record anything under a threshold anyway.
 - **One case is not pre-accounted: a *time*-driven rotation that fires while
   previously accepted frames are still queued.** Its new segment's header and
   footer were not in B, so the total can transiently exceed `maxTotalBytes` by at
   most one segment's framing overhead per such rotation. The next admission
   decision sees the real bytes and refuses accordingly. Size-driven rotation is
-  fully pre-accounted.
+  fully pre-accounted, including for a queued burst.
 
 `maxTotalBytes` counts what the writer knows about — recovery's tally plus what
 it has written. It is not a `statvfs` reading, so it bounds the WAL, not the
@@ -572,8 +647,9 @@ Rules:
 | Compaction, upload, deletion, dataset manifests | `WP-130`. This package writes and verifies; it never deletes. |
 | Per-record digest verification on read | Available via `assertPayloadDigest`, not performed by the reader by default; the segment checksum already covers the bytes. |
 | At-least-once at a fault boundary | If a caller re-enqueues `pendingFrames()` without the reconciliation `close()` performs, duplicate raw records are possible. Duplicates are detectable by `(gatewayEpoch, ingestSeq)`; losing a frame is not. |
-| Unmanifested faulted segments | A segment whose durability could not be proven (§10.1 case 3) keeps its bytes but gets no manifest until recovery runs. Its records are also in `pendingFrames()`, so re-recording them and then recovering the old segment produces duplicates — detectable, and preferred to loss. |
-| Capacity vs. time-driven rotation | `maxTotalBytes` is pre-accounted for size-driven rotation only; see §11.1 for the bounded residual. |
+| Unmanifested faulted segments | A segment whose durability could not be proven (§10.1 case 4) keeps its bytes but gets no manifest until recovery runs. Its records are also in `pendingFrames()`, so re-recording them and then recovering the old segment produces duplicates — detectable, and preferred to loss. The watermark rule of §9.1 makes this the **usual** outcome of a write or `fsync` failure, not a rare one: expect duplicates at a fault boundary, and reconcile on `(gatewayEpoch, ingestSeq)`. |
+| Durability under-claiming | The watermark freezes on any failure on a segment's handle, so records that did reach the disk can still be reported as unproven. That is deliberate (§9.1) and it costs duplicates, not data. Relaxing it — for instance to freeze only on `fsync` failure — is a durability-semantics change and needs an ADR, not a patch. |
+| Capacity vs. time-driven rotation | `maxTotalBytes` is pre-accounted for size-driven rotation only, including for a queued burst; see §11.1 for the bounded residual. |
 | Byte-threshold fsync | A high-water mark bounded by the threshold plus one record, not a hard cap (§9). |
 
 ---
@@ -615,8 +691,8 @@ Implementation: `packages/storage-wal/src/`
 | `segment-format.ts` | line encoding and classification |
 | `manifest.ts` | sidecar manifests and file naming |
 | `queue.ts` | the bounded §8.3 queue |
-| `segment-writer.ts` | one open segment: appends, running digest, fsync accounting |
-| `writer.ts` | rotation, durability policy, refusals, fault handling |
+| `segment-writer.ts` | one open segment: appends, running digest, and the §9.1 durability watermark |
+| `writer.ts` | rotation, durability policy, refusals, fault handling, the §11.1 capacity projection |
 | `reader.ts` | sequential reads and validation |
 | `recovery.ts` | the §10 decision table |
 | `node-file-system.ts`, `clock.ts` | the only modules that touch a real disk or clock |
@@ -631,8 +707,13 @@ suite whose job is to try to break them:
 
 | Guarantee | Suite |
 | --- | --- |
-| §10.1 accepted-frame invariant, on every failing write path | `accepted-frame-invariant.test.ts` |
-| §9.1 a manifest never overcounts, including after a power loss | `accepted-frame-invariant.test.ts` |
+| §10.1 accepted-frame invariant, on every failing write path, including a fault raised by `tick()` with frames still queued | `accepted-frame-invariant.test.ts` |
+| §9.1 a manifest never overcounts, including after a power loss, and a post-failure `fsync` success extends no claim | `accepted-frame-invariant.test.ts`, `torn-write-recovery.test.ts`, `fsync-policy.test.ts` |
+| §10.1 accountability transfers at the manifest write and nowhere else, across sidecar retries | `accepted-frame-invariant.test.ts`, `wal-capacity.test.ts` |
 | §6.3 field-by-field agreement | `manifest-agreement.test.ts`, `checksum-validation.test.ts` |
-| §11.1 the capacity bound, framing included | `wal-capacity.test.ts` |
+| §11.1 the capacity bound, framing included, for a **queued burst** at cap-exact thresholds | `wal-capacity.test.ts` |
 | §9 the fsync bound and the byte high-water mark | `fsync-policy.test.ts` |
+
+The four defects round-2 review found are also covered at unit level, in
+`packages/storage-wal/src/writer.test.ts`, because the fault tree is not yet in
+the root gate or in CI.

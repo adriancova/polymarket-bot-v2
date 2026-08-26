@@ -560,3 +560,190 @@ describe("observability", () => {
     );
   });
 });
+
+/**
+ * Round-2 review regressions.
+ *
+ * They are duplicated here, at unit level, on purpose: the fault-injection tree
+ * that covers them in depth is not wired into the root gate or into CI yet (see
+ * the `WP-050` handoff, `follow_up` 2), and these three defects are the ones
+ * that would silently lose or double-count a recorded frame.
+ */
+describe("durability accounting under faults", () => {
+  /**
+   * The in-memory filesystem with a failure schedule, and with the Linux
+   * writeback error cursor: after an `fsync` on a handle has failed, a later one
+   * may return success while nothing new became durable.
+   */
+  function failingFileSystem(schedule: {
+    readonly failAppendOn?: number;
+    readonly failSyncOn?: number;
+    readonly failWholeFileWriteUntil?: number;
+  }): MemoryFileSystem & { durableBytes(path: string): number } {
+    const base = createMemoryFileSystem();
+    let appends = 0;
+    let syncs = 0;
+    let writes = 0;
+    const durable = new Map<string, number>();
+    const wrapped: MemoryFileSystem & { durableBytes(path: string): number } = {
+      ...base,
+      durableBytes: (path: string): number => durable.get(path) ?? 0,
+      async openAppend(path: string) {
+        const inner = await base.openAppend(path);
+        let syncFailed = false;
+        return {
+          async append(bytes: Uint8Array): Promise<void> {
+            appends += 1;
+            if (appends === schedule.failAppendOn) {
+              throw new Error("EIO: append failed");
+            }
+            await inner.append(bytes);
+          },
+          async sync(): Promise<void> {
+            syncs += 1;
+            if (syncs === schedule.failSyncOn) {
+              syncFailed = true;
+              throw new Error("EIO: fsync failed");
+            }
+            await inner.sync();
+            if (!syncFailed) {
+              durable.set(path, (await base.fileByteLength(path)) ?? 0);
+            }
+          },
+          async close(): Promise<void> {
+            await inner.close();
+          },
+        };
+      },
+      async writeWholeFile(path: string, bytes: Uint8Array): Promise<void> {
+        writes += 1;
+        if (writes <= (schedule.failWholeFileWriteUntil ?? 0)) {
+          throw new Error("ENOSPC: no space for the sidecar");
+        }
+        await base.writeWholeFile(path, bytes);
+      },
+    };
+    return wrapped;
+  }
+
+  async function open(
+    fileSystem: MemoryFileSystem,
+    clock: ManualClock,
+    overrides: Partial<WalWriterOptions> = {},
+  ): Promise<WalWriter> {
+    return openWalWriter({
+      directoryPath: DIRECTORY,
+      gatewayEpoch: TEST_GATEWAY_EPOCH,
+      fileSystem,
+      clock,
+      ...overrides,
+    });
+  }
+
+  it("hands back the frames still queued when tick() faults", async () => {
+    // HIGH-1a: `tick()` takes nothing from the queue, so a frame waiting in it
+    // was accounted for nowhere once the rotation it triggered failed.
+    const fileSystem = failingFileSystem({ failAppendOn: 3 });
+    const clock = createManualClock();
+    const writer = await open(fileSystem, clock, {
+      maxSegmentAgeMs: 1_000,
+      fsyncIntervalMs: 1_000_000,
+      fsyncByteThreshold: 10_000_000,
+    });
+    expect(writer.enqueue(createTestFrame({ ingestSeq: 1 })).accepted).toBe(true);
+    await writer.drain();
+    expect(writer.enqueue(createTestFrame({ ingestSeq: 2 })).accepted).toBe(true);
+    clock.advance(1_000);
+
+    await expect(writer.tick()).rejects.toThrow();
+    expect(writer.state).toBe("faulted");
+    expect(writer.metrics().queue.currentDepth).toBe(0);
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(["1", "2"]);
+
+    await writer.close();
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(["1", "2"]);
+    expect(await listSegmentManifests(fileSystem, DIRECTORY)).toEqual([]);
+  });
+
+  it("never lets an fsync that follows a failed one extend a durability claim", async () => {
+    // HIGH-2: on Linux a writeback error is reported once and then cleared, so
+    // the next `fsync` can return success without the failed writeback ever
+    // having landed. The fault close may attempt it, but may not believe it.
+    const fileSystem = failingFileSystem({ failSyncOn: 2 });
+    const clock = createManualClock();
+    const writer = await open(fileSystem, clock, { fsyncByteThreshold: 1 });
+    for (const frame of createTestFrames(3)) {
+      expect(writer.enqueue(frame).accepted).toBe(true);
+    }
+    await expect(writer.drain()).rejects.toThrow();
+
+    expect(await writer.close()).toBeNull();
+    expect(writer.metrics().framesDurable).toBe(0);
+    expect(writer.metrics().unmanifestedFaultedSegments).toBe(1);
+    expect(await listSegmentManifests(fileSystem, DIRECTORY)).toEqual([]);
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(["1", "2", "3"]);
+    // Only the header ever reached durable storage, which is exactly what the
+    // absent manifest declines to contradict.
+    const path = `${DIRECTORY}/${segmentFileName(writer.metrics().activeSegmentId ?? "")}`;
+    expect(fileSystem.durableBytes(path)).toBe(0);
+  });
+
+  it("moves records out of pendingFrames only when the manifest write succeeds", async () => {
+    // HIGH-1b: `finalize()` marked its records durable before writing the
+    // sidecar, so two failed sidecar writes returned the frames to the caller
+    // while a later, successful one still wrote a manifest naming them.
+    const fileSystem = failingFileSystem({ failWholeFileWriteUntil: 2 });
+    const clock = createManualClock();
+    const writer = await open(fileSystem, clock);
+    for (const frame of createTestFrames(3)) {
+      expect(writer.enqueue(frame).accepted).toBe(true);
+    }
+
+    await expect(writer.close()).rejects.toThrow(/ENOSPC/u);
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(["1", "2", "3"]);
+    expect(await listSegmentManifests(fileSystem, DIRECTORY)).toEqual([]);
+
+    const manifest = await writer.close();
+    expect(manifest?.recordCount).toBe(3);
+    // Named by the manifest, therefore no longer the caller's: never by both.
+    expect(writer.pendingFrames()).toEqual([]);
+    const manifests = await listSegmentManifests(fileSystem, DIRECTORY);
+    expect(await readAllIngestSeqs(fileSystem, manifests)).toEqual(["1", "2", "3"]);
+  });
+
+  it("reserves enough framing for a queued burst to stay under maxTotalBytes", async () => {
+    // MEDIUM: the reservation divided the queued bytes by `maxSegmentBytes`,
+    // which ignores both the per-segment header and the fact that a segment
+    // holds whole records. Only a burst with no drain between offers exposes it.
+    for (const burst of [3, 10, 20]) {
+      for (const cap of [2_000, 4_000, 10_000]) {
+        const fileSystem = createMemoryFileSystem();
+        const clock = createManualClock();
+        const writer = await open(fileSystem, clock, {
+          maxTotalBytes: cap,
+          maxSegmentBytes: 900,
+          maxSegmentAgeMs: 1_000_000_000,
+        });
+        let accepted = 0;
+        for (const frame of createTestFrames(burst)) {
+          if (writer.enqueue(frame).accepted) {
+            accepted += 1;
+          }
+        }
+        await writer.drain();
+        await writer.close();
+
+        let onDisk = 0;
+        for (const [path, bytes] of fileSystem.files) {
+          if (path.endsWith(".wal.jsonl")) {
+            onDisk += bytes.length;
+          }
+        }
+        expect(onDisk, `burst ${burst} at threshold ${cap}`).toBeLessThanOrEqual(cap);
+        const manifests = await listSegmentManifests(fileSystem, DIRECTORY);
+        expect(manifests.reduce((total, m) => total + m.recordCount, 0)).toBe(accepted);
+        expect(writer.metrics().queue.messagesDropped).toBe(0);
+      }
+    }
+  });
+});

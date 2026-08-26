@@ -187,6 +187,30 @@ const WIDEST_TIMESTAMP = "2026-01-01T00:00:00.000Z";
 /** Every close reason, at its longest — a footer carries exactly one. */
 const WIDEST_CLOSE_REASON: WalCloseReason = "manual-rotation";
 
+/**
+ * How the frames that are accepted but not yet written will pack into segments.
+ *
+ * `newSegments` is how many further segments they need beyond the open one, and
+ * `roomLeft` is the frame bytes that still fit in the last of them. `overhead`
+ * is the header-plus-footer reservation those new segments cost.
+ *
+ * The projection exists because segment count is a *packing* question, not a
+ * division: a segment holds whole records, so 10 records of 415 bytes need ten
+ * 900-byte segments, not the `ceil(4150 / 900) = 5` a byte-count division
+ * predicts. Getting that wrong is what let a queued burst overshoot
+ * `maxTotalBytes` (`docs/contracts/wal-format.md` §11.1).
+ */
+type CapacityProjection = {
+  readonly newSegments: number;
+  readonly roomLeft: number;
+  readonly overhead: number;
+  /**
+   * The next frame lands in a segment that holds no record yet, so it is
+   * admitted however large it is — §8's "a record is never split" exception.
+   */
+  readonly nextRecordAlwaysFits: boolean;
+};
+
 /** Bytes of the header line for a segment, at its widest. */
 function headerReserveBytes(
   segmentId: string,
@@ -341,8 +365,13 @@ export class WalWriter {
    * append-shaped.
    */
   #unproven: QueuedFrame[] = [];
-  #durableRecordCountAtFault = 0;
-  #faultReconciled = false;
+  /**
+   * Records of the faulted segment that are accounted for as durable — the ones
+   * that are *not* in {@link #pending}. The fault reconciliation uses it as the
+   * pivot between "already accounted" and "the leading entries of the pending
+   * list".
+   */
+  #segmentRecordsAccountedDurable = 0;
   #faultTruncatedTailBytes = 0;
   #unmanifestedFaultedSegments = 0;
 
@@ -367,7 +396,14 @@ export class WalWriter {
   #nonMonotonicIngestSeqCount = 0;
   #lastIngestSeq: string | null = null;
   readonly #overheadReserveCache = new Map<number, number>();
+  readonly #headerReserveCache = new Map<number, number>();
   #activeFooterReserveBytes = 0;
+  /**
+   * How the queued frames will pack into segments, for the `maxTotalBytes`
+   * projection. `null` means "rebuild it": the queue or the active segment
+   * changed under it.
+   */
+  #projection: CapacityProjection | null = null;
 
   /**
    * Internal. `ResolvedWriterOptions` is deliberately not exported, so the only
@@ -446,14 +482,22 @@ export class WalWriter {
     const bytes = encodeFrameLine(parsed);
 
     const capacity = this.#options.maxTotalBytes;
+    // Packing this frame on top of the queued ones, without committing: the
+    // projection charges the framing this frame will *cause*, not only the frame
+    // line itself. A segment costs a header line and a footer line beyond its
+    // records, and admitting bytes without reserving those turns the documented
+    // hard threshold into a suggestion (`docs/contracts/wal-format.md` §11.1).
+    // Only computed when a threshold exists; with none there is nothing to
+    // reserve against and no reason to pay for the arithmetic per frame.
+    let withCandidate: CapacityProjection | null = null;
     if (capacity !== null) {
-      // The projection charges the framing this frame will *cause*, not only
-      // the frame line itself: a segment costs a header line and a footer line
-      // beyond its records, and admitting bytes without reserving those turns
-      // the documented hard threshold into a suggestion (see
-      // `docs/contracts/wal-format.md` §11.1).
+      withCandidate = this.#packFrames([bytes.length], this.#currentProjection());
       const unwrittenBytes = this.#queue.byteDepth + bytes.length;
-      const projected = this.#totalSegmentBytes + unwrittenBytes + this.#overheadReserve(unwrittenBytes);
+      const projected =
+        this.#totalSegmentBytes +
+        unwrittenBytes +
+        (this.#active === null ? 0 : this.#activeFooterReserveBytes) +
+        withCandidate.overhead;
       if (projected > capacity) {
         this.#capacityRefusals += 1;
         return this.#refuse(
@@ -469,6 +513,10 @@ export class WalWriter {
     if (!offered.accepted) {
       this.#overflowSignals += 1;
       return this.#refuse(parsed, "queue-overflow", offered.detail, nowMs);
+    }
+    // Committed only now: a refused frame changes no reservation.
+    if (withCandidate !== null) {
+      this.#projection = withCandidate;
     }
 
     if (this.#lastIngestSeq !== null && compareIngestSeq(parsed.ingestSeq, this.#lastIngestSeq) <= 0) {
@@ -527,6 +575,7 @@ export class WalWriter {
     try {
       for (;;) {
         const items = this.#queue.takeAll();
+        this.#invalidateProjection();
         if (items.length === 0) {
           break;
         }
@@ -756,7 +805,7 @@ export class WalWriter {
     const active = this.#active;
     const capacity = this.#options.maxTotalBytes;
     const queueBytes = this.#queue.byteDepth;
-    const reserved = capacity === null ? 0 : this.#overheadReserve(queueBytes);
+    const reserved = capacity === null ? 0 : this.#reservedOverheadBytes();
     return {
       capacityReservedBytes: capacity === null ? null : reserved,
       unprovenFrameCount: this.#unproven.length,
@@ -815,29 +864,64 @@ export class WalWriter {
   /**
    * Take responsibility for every frame the failure put at risk.
    *
-   * The single place the writer becomes `faulted`. It runs once per fault, and
-   * it is what makes the accepted-frame invariant total: `#unproven` (appended,
-   * never proven durable) plus `extraFrames` (taken from the queue, never
-   * appended) become the caller's again through `pendingFrames()`, in the order
-   * they were accepted.
+   * The single place the writer becomes `faulted`, and what makes the
+   * accepted-frame invariant total. Three groups become the caller's again
+   * through `pendingFrames()`, in the order they were accepted:
+   *
+   * 1. `#unproven` — appended to the active segment, never proven durable;
+   * 2. `extraFrames` — taken from the queue by `drain()` and never appended;
+   * 3. **whatever is still queued** — the frames `enqueue` accepted and no drain
+   *    ever reached.
+   *
+   * Group 3 was the round-2 gap: a fault raised by `tick()` takes nothing from
+   * the queue, so a frame sitting in it was neither manifested nor pending, and
+   * the faulted `close()` that followed reconciled only the segment. The queue
+   * is emptied here rather than left to look "still to be written", because a
+   * faulted writer will never write it: `enqueue` refuses from now on and
+   * `drain()` refuses to run.
    */
   #enterFault(error: unknown, extraFrames: readonly QueuedFrame[] = []): void {
     const active = this.#active;
     if (this.#state !== "faulted") {
       this.#state = "faulted";
       this.#writeFaults += 1;
-      this.#durableRecordCountAtFault = active?.durableRecordCount ?? 0;
+      // How many of the active segment's records are already accounted for as
+      // durable — that is, are *not* in the pending list about to be built.
+      // Read before `#unproven` is drained, and deliberately not taken from
+      // `durableRecordCount`: `finalize()` advances that on its footer fsync
+      // while those same frames are still in `#unproven`, and using it there
+      // made the pending list and a retried manifest both claim them.
+      this.#segmentRecordsAccountedDurable = Math.max(
+        (active?.recordCount ?? 0) - this.#unproven.length,
+        0,
+      );
     }
     if (this.#unproven.length > 0 || extraFrames.length > 0) {
       this.#pending.push(...this.#unproven, ...extraFrames);
       this.#unproven = [];
     }
+    this.#absorbQueueIntoPending();
     this.#options.observer.onWriteFault?.({
       segmentId: active?.segmentId ?? null,
       pendingFrames: this.#pending.length,
       error,
       atMs: this.#options.clock.nowMs(),
     });
+  }
+
+  /**
+   * Move every still-queued frame into `pendingFrames()`.
+   *
+   * Order is preserved because nothing can be enqueued once the writer is
+   * faulted, so the queue's contents are strictly the youngest accepted frames.
+   * Idempotent: an empty queue makes it a no-op.
+   */
+  #absorbQueueIntoPending(): void {
+    const remaining = this.#queue.takeAll();
+    this.#invalidateProjection();
+    if (remaining.length > 0) {
+      this.#pending.push(...remaining);
+    }
   }
 
   #writeFault(
@@ -854,37 +938,86 @@ export class WalWriter {
   }
 
   /**
-   * Framing overhead to reserve against `maxTotalBytes` for `unwrittenBytes` of
-   * accepted-but-unwritten frame bytes.
+   * Framing overhead currently reserved against `maxTotalBytes`.
    *
    * A segment costs a header line and a footer line beyond its records, and
    * neither exists yet when the frames are admitted. The reservation is the
    * active segment's footer plus one header-and-footer for each further segment
-   * the unwritten bytes require. Header and footer lengths are computed from the
-   * real gateway epoch and the real segment ids, with numeric fields taken at
-   * their widest (`Number.MAX_SAFE_INTEGER`) and a small fixed slack, so the
+   * the queued frames will need, where "will need" is decided by packing the
+   * real frame sizes with the real rotation rule rather than by dividing bytes
+   * by `maxSegmentBytes`. Header and footer lengths are computed from the real
+   * gateway epoch and the real segment ids, with numeric fields taken at their
+   * widest (`Number.MAX_SAFE_INTEGER`) and a small fixed slack, so the
    * reservation is an over-estimate and never an under-estimate.
    *
    * `docs/contracts/wal-format.md` §11.1 states the bound this enforces and the
    * one case it does not cover.
    */
-  #overheadReserve(unwrittenBytes: number): number {
+  #reservedOverheadBytes(): number {
     const active = this.#active;
+    return (
+      (active === null ? 0 : this.#activeFooterReserveBytes) + this.#currentProjection().overhead
+    );
+  }
+
+  /** The committed projection for the frames currently queued. */
+  #currentProjection(): CapacityProjection {
+    if (this.#projection === null) {
+      this.#projection = this.#packFrames(this.#queue.queuedByteLengths());
+    }
+    return this.#projection;
+  }
+
+  /**
+   * Drop the projection because the ground it stood on moved — a segment opened,
+   * rotated, or grew, or the queue was emptied. The next admission decision
+   * rebuilds it from the frames actually queued.
+   */
+  #invalidateProjection(): void {
+    this.#projection = null;
+  }
+
+  /**
+   * Pack `frameByteLengths` into segments the way `drain()` will, starting from
+   * the active segment's remaining room.
+   *
+   * Mirrors `#rotationReason`: a frame goes into the current segment when it
+   * still fits, otherwise it starts a new one — and a record larger than
+   * `maxSegmentBytes` is never split, so it occupies a segment of its own.
+   */
+  #packFrames(
+    frameByteLengths: readonly number[],
+    from: CapacityProjection = this.#emptyProjection(),
+  ): CapacityProjection {
     const maxSegmentBytes = this.#options.maxSegmentBytes;
-    let reserve = active === null ? 0 : this.#activeFooterReserveBytes;
-    let newSegments: number;
-    if (active === null) {
-      newSegments = unwrittenBytes === 0 ? 0 : Math.ceil(unwrittenBytes / maxSegmentBytes);
-    } else {
-      const roomInActive = Math.max(maxSegmentBytes - active.byteLength, 0);
-      newSegments = Math.ceil(Math.max(unwrittenBytes - roomInActive, 0) / maxSegmentBytes);
+    let { newSegments, roomLeft, overhead, nextRecordAlwaysFits } = from;
+    for (const length of frameByteLengths) {
+      if (nextRecordAlwaysFits || length <= roomLeft) {
+        roomLeft = Math.max(roomLeft - length, 0);
+      } else {
+        newSegments += 1;
+        const segmentIndex = this.#nextSegmentIndex + newSegments - 1;
+        overhead += this.#segmentOverheadReserve(segmentIndex);
+        roomLeft = Math.max(
+          maxSegmentBytes - this.#segmentHeaderReserve(segmentIndex) - length,
+          0,
+        );
+      }
+      nextRecordAlwaysFits = false;
     }
-    if (newSegments > 0) {
-      // Segment ids grow with the ordinal, so the last index we could need
-      // bounds the length of every id in between.
-      reserve += newSegments * this.#segmentOverheadReserve(this.#nextSegmentIndex + newSegments - 1);
-    }
-    return reserve;
+    return { newSegments, roomLeft, overhead, nextRecordAlwaysFits };
+  }
+
+  /** The projection for an empty backlog: whatever room the active segment has. */
+  #emptyProjection(): CapacityProjection {
+    const active = this.#active;
+    return {
+      newSegments: 0,
+      roomLeft:
+        active === null ? 0 : Math.max(this.#options.maxSegmentBytes - active.byteLength, 0),
+      overhead: 0,
+      nextRecordAlwaysFits: active !== null && active.recordCount === 0,
+    };
   }
 
   /** Worst-case header + footer bytes for the segment at `segmentIndex`. */
@@ -893,16 +1026,34 @@ export class WalWriter {
     if (cached !== undefined) {
       return cached;
     }
-    const segmentId = this.#options.segmentIdFactory({
+    const reserve =
+      this.#segmentHeaderReserve(segmentIndex) +
+      footerReserveBytes(this.#reserveSegmentId(segmentIndex), this.#options.gatewayEpoch);
+    this.#overheadReserveCache.set(segmentIndex, reserve);
+    return reserve;
+  }
+
+  /** Worst-case header bytes for the segment at `segmentIndex`. */
+  #segmentHeaderReserve(segmentIndex: number): number {
+    const cached = this.#headerReserveCache.get(segmentIndex);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const reserve = headerReserveBytes(
+      this.#reserveSegmentId(segmentIndex),
+      this.#options.gatewayEpoch,
+      segmentIndex,
+    );
+    this.#headerReserveCache.set(segmentIndex, reserve);
+    return reserve;
+  }
+
+  #reserveSegmentId(segmentIndex: number): string {
+    return this.#options.segmentIdFactory({
       gatewayEpoch: this.#options.gatewayEpoch,
       segmentIndex,
       createdAtMs: this.#options.clock.nowMs(),
     });
-    const reserve =
-      headerReserveBytes(segmentId, this.#options.gatewayEpoch, segmentIndex) +
-      footerReserveBytes(segmentId, this.#options.gatewayEpoch);
-    this.#overheadReserveCache.set(segmentIndex, reserve);
-    return reserve;
   }
 
   #assertWritable(operation: string): void {
@@ -947,7 +1098,7 @@ export class WalWriter {
     trigger: "byte-threshold" | "interval" | "explicit" | "finalize",
   ): Promise<void> {
     const startedMs = this.#options.clock.monotonicMs();
-    let synced: { readonly bytes: number; readonly records: number };
+    let synced: { readonly bytes: number; readonly records: number; readonly proven: boolean };
     try {
       synced = await active.sync(this.#options.clock);
     } catch (error) {
@@ -959,9 +1110,14 @@ export class WalWriter {
     }
     const durationMs = this.#options.clock.monotonicMs() - startedMs;
     this.#fsyncCount += 1;
-    // The fsync returned: these frames are durable and stop being the writer's
-    // debt. This is the only place durability is ever asserted.
-    this.#unproven = [];
+    if (synced.proven) {
+      // The fsync returned *and* the segment's watermark advanced: these frames
+      // are durable and stop being the writer's debt. This is the only place
+      // durability is ever asserted while the writer is healthy. A call that
+      // returned success on a frozen watermark proves nothing and is ignored
+      // here on purpose (`segment-writer.ts`, "The durability watermark").
+      this.#unproven = [];
+    }
     this.#framesDurable += synced.records;
     this.#totalFsyncDurationMs += durationMs;
     this.#lastFsyncDurationMs = durationMs;
@@ -1024,6 +1180,7 @@ export class WalWriter {
     }
     this.#active = active;
     this.#activeFooterReserveBytes = footerReserveBytes(segmentId, this.#options.gatewayEpoch);
+    this.#invalidateProjection();
     this.#nextSegmentIndex += 1;
     this.#segmentsOpened += 1;
     this.#bytesWritten += active.byteLength;
@@ -1053,6 +1210,8 @@ export class WalWriter {
     this.#framesWritten += batch.length;
     this.#bytesWritten += appended;
     this.#totalSegmentBytes += appended;
+    // The active segment grew, so the room the projection assumed is stale.
+    this.#invalidateProjection();
     // Written, but not yet proven durable: still the writer's responsibility
     // until an fsync says otherwise.
     this.#unproven.push(...batch);
@@ -1082,6 +1241,7 @@ export class WalWriter {
     }
     this.#active = null;
     this.#activeFooterReserveBytes = 0;
+    this.#invalidateProjection();
     // finalize() fsynced the footer, so every frame in this segment is durable.
     this.#unproven = [];
     this.#segmentsFinalized += 1;
@@ -1101,40 +1261,45 @@ export class WalWriter {
   /**
    * Close a segment whose in-memory state can no longer be trusted.
    *
-   * The rule this method enforces, and the reason it exists:
-   * **a manifest never describes bytes that no `fsync` has covered.** A clean
-   * close writes the footer, fsyncs, and only then writes the sidecar; the fault
-   * path must do the same or the manifest becomes a claim about data a power
-   * loss can still take away.
+   * Two rules govern it, and between them they make the accepted-frame
+   * invariant hold across a fault:
    *
-   * So it first tries one last `fsync` to prove the file durable. If that
-   * succeeds it reads back what actually reached the disk, truncates an
-   * incomplete final record, writes the sidecar for the verified prefix, and
-   * removes from `pendingFrames` exactly those frames that turned out to be
-   * durable — so the caller re-enqueues neither a lost frame nor a duplicate.
-   * If it fails, the segment is left exactly as found and **unmanifested**: it
-   * is unverified, invisible to a compactor, and every frame it might hold stays
-   * with the caller. Recovery finalizes it on the next open, describing whatever
-   * actually survived.
+   * 1. **A manifest never names a record whose durability is unproven.** The
+   *    segment's durability watermark — the last `fsync` that succeeded with no
+   *    earlier failure on its handle — is the only evidence there is. A last
+   *    `fsync` is still attempted, because on a handle with no failure history
+   *    it genuinely proves the bytes a torn append left behind; but on a frozen
+   *    watermark its success proves nothing and is not believed
+   *    (`segment-writer.ts`, "The durability watermark"). If the watermark does
+   *    not cover the whole verified prefix, **no manifest is written at all**:
+   *    the format has no way to describe a segment partially, and a manifest
+   *    that named the uncovered records would be exactly the claim a power loss
+   *    falsifies.
+   * 2. **Accountability transfers at the manifest write and nowhere else.**
+   *    Frames leave `pendingFrames()` only in the same step in which a manifest
+   *    that names them lands on disk. A failed sidecar write therefore leaves
+   *    every frame with the caller and the segment unmanifested — retryable, and
+   *    never counted twice. Before round 2 the two halves were separate, so two
+   *    sidecar failures returned the frames to the caller while a third,
+   *    successful attempt still wrote a manifest declaring them: "never by both"
+   *    violated.
+   *
+   * An unmanifested segment keeps its bytes, stays unverified and invisible to a
+   * compactor (§2), and is finalized by recovery on the next open — which is a
+   * disclosed duplicate source (`wal-format.md` §12), and the deliberate trade
+   * against losing a frame.
    */
   async #finalizeFaultedSegment(): Promise<WalSegmentManifest | null> {
+    // A fault raised where no frame was in flight — `tick()` is the one that
+    // bites — leaves the queue full of accepted frames nobody will ever write.
+    this.#absorbQueueIntoPending();
     const active = this.#active;
     if (active === null) {
       return null;
     }
 
-    const durable = await active.syncForFaultClose();
+    const watermark = await active.syncForFaultClose();
     await active.abandon();
-    if (!durable) {
-      // Nothing about this file can be asserted. Writing a manifest here would
-      // report frames as durable that were never proven to be, which is exactly
-      // how a manifest comes to overcount after a power loss.
-      this.#active = null;
-      this.#activeFooterReserveBytes = 0;
-      this.#unmanifestedFaultedSegments += 1;
-      this.#faultReconciled = true;
-      return null;
-    }
 
     const scan = await scanSegment(this.#options.fileSystem, active.path, {
       onIssue: "collect",
@@ -1153,37 +1318,16 @@ export class WalWriter {
 
     const fatal = scan.issues.filter((issue) => issue.code !== "INCOMPLETE_FINAL_RECORD");
     const verifiable = fatal.length === 0 && scan.header !== null;
+    // Everything the manifest would claim must sit at or below the watermark.
+    const provenDurable =
+      watermark.recordCount >= scan.recordCount && watermark.byteLength >= byteSize;
 
-    if (!this.#faultReconciled) {
-      // The records on disk beyond the last proven-durable one are exactly the
-      // leading entries of the pending list, in order. They leave that list only
-      // now, because only now has an fsync proven them. If the segment is not
-      // verifiable it gets no manifest, so nothing on it counts as recorded and
-      // every frame stays with the caller. Done once, so a retried close cannot
-      // drop frames.
-      const provenFromPending = verifiable
-        ? Math.min(
-            Math.max(scan.recordCount - this.#durableRecordCountAtFault, 0),
-            this.#pending.length,
-          )
-        : 0;
-      this.#pending = this.#pending.slice(provenFromPending);
-      this.#framesDurable += provenFromPending;
-      this.#faultReconciled = true;
-    }
-
-    if (!verifiable) {
-      // Leave the segment unmanifested: an unverifiable segment must not be
-      // offered to a compactor (ADR-004 §3, §5).
-      this.#active = null;
-      this.#activeFooterReserveBytes = 0;
-      this.#unmanifestedFaultedSegments += 1;
-      return null;
-    }
-    if (scan.header === null) {
-      this.#active = null;
-      this.#activeFooterReserveBytes = 0;
-      this.#unmanifestedFaultedSegments += 1;
+    if (!verifiable || !provenDurable || scan.header === null) {
+      // Either the bytes cannot be verified — an unverifiable segment must not
+      // be offered to a compactor (ADR-004 §3, §5) — or their durability cannot
+      // be proven. Either way no manifest is written, so nothing on this segment
+      // counts as recorded and every frame stays with the caller.
+      this.#abandonFaultedSegment();
       return null;
     }
 
@@ -1213,16 +1357,39 @@ export class WalWriter {
     };
     // If this throws — a full disk usually — the segment stays active-but-
     // faulted so that another close() can retry once space exists, and recovery
-    // finalizes it if the process dies first.
+    // finalizes it if the process dies first. Nothing above has changed the
+    // pending list, so a failed attempt costs the caller nothing.
     await writeSegmentManifest(
       this.#options.fileSystem,
       this.#options.directoryPath,
       manifest,
     );
+    // The manifest is on disk. *Now* the records it names leave the caller's
+    // hands, in the same step, so no observer can ever see them in both places.
+    // They are the leading entries of the pending list: the segment's records
+    // beyond the ones already accounted for as durable, in accept order.
+    const manifested = Math.min(
+      Math.max(scan.recordCount - this.#segmentRecordsAccountedDurable, 0),
+      this.#pending.length,
+    );
+    this.#pending = this.#pending.slice(manifested);
+    this.#framesDurable += manifested;
     this.#active = null;
     this.#activeFooterReserveBytes = 0;
+    this.#invalidateProjection();
     this.#segmentsFinalized += 1;
     this.#options.observer.onSegmentFinalized?.(manifest);
     return manifest;
+  }
+
+  /**
+   * Give up on the faulted segment without a manifest: it keeps its bytes, gets
+   * no durability claim, and every frame it might hold stays with the caller.
+   */
+  #abandonFaultedSegment(): void {
+    this.#active = null;
+    this.#activeFooterReserveBytes = 0;
+    this.#invalidateProjection();
+    this.#unmanifestedFaultedSegments += 1;
   }
 }

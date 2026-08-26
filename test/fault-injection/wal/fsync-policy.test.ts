@@ -198,10 +198,15 @@ describe("a failing fsync", () => {
     const refused = writer.enqueue(createTestFrames(1, {}, 4)[0] ?? fail());
     expect(refused.accepted).toBe(false);
 
-    // Closing still reconciles what did reach the file.
-    const manifest = await writer.close();
-    expect(manifest?.recordCount).toBe(3);
-    expect(await recordedIngestSeqs(harness.fileSystem)).toEqual(["1", "2", "3"]);
+    // Closing reconciles, and reconciling means telling the truth: the failed
+    // fsync froze the segment's durability watermark at the header, so no
+    // manifest can be written and all three frames go back to the caller. A
+    // later fsync returning success does not change that — on Linux it can do
+    // so without the failed writeback ever having landed (round-2 HIGH-2).
+    expect(await writer.close()).toBeNull();
+    expect(writer.metrics().unmanifestedFaultedSegments).toBe(1);
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(["1", "2", "3"]);
+    expect(await recordedIngestSeqs(harness.fileSystem, { skipInvalid: true })).toEqual([]);
   });
 });
 
