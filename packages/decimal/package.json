@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Contract content is owned by WP-020; this scaffold intentionally contains no contracts.",
+  "description": "Exact decimal string canonicalization, arithmetic, hashing, and tick conformance (WP-020). No JavaScript number is ever used for an economic value.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
@@ -11,7 +11,13 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "decimal.js": "^10.6.0"
+  },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "fast-check": "^4.9.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }
