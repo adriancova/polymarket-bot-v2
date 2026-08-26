@@ -34,8 +34,6 @@ beforeAll(async () => {
     executionGroupId: chain.executionGroupId,
     marketId: chain.marketId,
     tokenId: chain.tokenId,
-    environment: "PAPER",
-    accountRef: ACCOUNT,
     side: "BUY",
     limitPrice: "0.42",
     originalShares: "10",
@@ -164,6 +162,10 @@ describe("available balance after reservations", () => {
   });
 
   it("REJECTS a rebuild that would lower actual below what is reserved", async () => {
+    // The rebuild is an upsert, and `reserved_amount` is not one of the columns
+    // it writes: the reservation rows own that value. What the rebuild can do
+    // is lower `actual_amount` under it, and that is what the CHECK on the
+    // generated availability rejects.
     const error = await captureRejection(async () =>
       context.repositories.balances.setActualBalance(
         { accountRef: ACCOUNT, environment: "PAPER", assetId: "pUSD" },

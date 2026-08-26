@@ -10,7 +10,14 @@
  *     takes no allocations: the fact and its attribution are one write.
  *   * "fills(venue_trade_id, venue_order_id, allocation discriminator) unique" —
  *     recording the same venue trade twice is rejected, which is what makes
- *     "deduplicated fill facts" true rather than aspirational.
+ *     "deduplicated fill facts" true rather than aspirational. The key is
+ *     `NULLS NOT DISTINCT`, so a fill whose account is not yet known cannot be
+ *     recorded twice either.
+ *
+ * `environment` and `account_ref` are read from the order in the statement that
+ * writes the fill, and bound to it by composite foreign key. A fill is a fact
+ * about one order and cannot claim a different environment or account than the
+ * order it fills.
  *
  * §6 invariant 7 is what makes the equality always satisfiable: an unattributable
  * share is allocated to `UNATTRIBUTED` (and halts the market), never left
@@ -18,6 +25,7 @@
  */
 
 import type { DecimalString, IsoTimestamp, TokenId } from "@polymarket-bot/domain";
+import { sql } from "kysely";
 
 import type { PolymarketBotDatabase } from "../database.js";
 import { inTransaction } from "../database.js";
@@ -46,8 +54,6 @@ export type RecordFillInput = {
   readonly orderId: UuidV7Column;
   readonly marketId: UuidV7Column;
   readonly tokenId: TokenId;
-  readonly environment: RunModeValue;
-  readonly accountRef?: Identifier | null;
   readonly venueTradeId: Identifier;
   readonly venueOrderId: Identifier;
   readonly allocationDiscriminator?: Identifier;
@@ -87,8 +93,17 @@ export function createFillRepository(db: PolymarketBotDatabase) {
             order_id: input.orderId,
             market_id: input.marketId,
             token_id: input.tokenId,
-            environment: input.environment,
-            account_ref: input.accountRef ?? null,
+            // Read from the order in the same statement, and bound to it by
+            // composite foreign key: a fill of a LIVE order that claimed PAPER
+            // would drop out of every live exposure and reconciliation query.
+            environment: sql<RunModeValue>`(
+              select o.environment from execution.orders as o
+              where o.order_id = ${input.orderId}
+            )`,
+            account_ref: sql<Identifier | null>`(
+              select o.account_ref from execution.orders as o
+              where o.order_id = ${input.orderId}
+            )`,
             venue_trade_id: input.venueTradeId,
             venue_order_id: input.venueOrderId,
             allocation_discriminator: input.allocationDiscriminator ?? "0",

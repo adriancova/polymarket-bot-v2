@@ -15,8 +15,9 @@ import type {
   DecimalString,
   Detail,
   Identifier,
-  JsonColumn,
+  DecimalSafeJsonColumn,
   JsonColumnWithDefault,
+  NullableDecimalSafeJsonColumn,
   NullableJsonColumn,
   Sha256Hex,
   TimestampColumn,
@@ -97,7 +98,11 @@ export type ExecutionSubmissionAttemptsTable = {
   /** ADR-008: persisted with every live submission. */
   fencing_lease_id: UuidV7Column | null;
   fencing_token: BigIntColumn | null;
-  signed_payload: JsonColumn;
+  /**
+   * The signed order as sent. Its price and size are canonical decimal strings:
+   * a `number` here would be a different order than the one that was signed.
+   */
+  signed_payload: DecimalSafeJsonColumn;
   salt: Identifier;
   /** §10.7: unique where known. NULL is "not yet known", never "rejected". */
   expected_order_hash: Identifier | null;
@@ -156,7 +161,8 @@ export type ExecutionOrderEventsTable = AppendOnlyTable<{
   remaining_shares: DecimalString | null;
   reason_code: Code | null;
   detail: Detail | null;
-  payload: NullableJsonColumn;
+  /** Venue lifecycle detail; fill quantities inside it are decimal strings. */
+  payload: NullableDecimalSafeJsonColumn;
   source: EventSourceValue;
   occurred_at: TimestampColumn;
   recorded_at: TimestampColumnWithDefault;

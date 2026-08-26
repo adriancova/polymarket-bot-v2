@@ -82,6 +82,12 @@ create table strategy.instances (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint instances_name_environment_unique unique (environment, instance_name),
+  -- Redundant as a key (`instance_id` is already the primary key) and required
+  -- as a foreign-key target: it is what lets every environment-scoped record
+  -- downstream — ownership, runs, plans — bind its own `environment` to the
+  -- instance's instead of carrying an independent copy a caller could mislabel.
+  constraint instances_id_environment_unique unique (instance_id, environment),
+  constraint instances_id_account_unique unique (instance_id, account_ref),
   -- §11: BACKTEST, PAPER, and SHADOW require no signer, so they carry no
   -- account reference; a real-order mode always names the account it trades.
   constraint instances_real_mode_has_account check (
@@ -95,10 +101,15 @@ create trigger instances_set_updated_at
   before update on strategy.instances
   for each row execute function internal.set_updated_at();
 
+-- `account_ref` is immutable for the same reason `environment` is: both are the
+-- authority an instance trades under. Re-pointing a live instance at another
+-- account would move its fencing lease, its exposure, and its ownership claims
+-- without a single new record to audit. A different account is a different
+-- instance.
 create trigger instances_immutable_environment
   before update on strategy.instances
   for each row execute function internal.forbid_column_change(
-    'instance_id', 'definition_id', 'environment'
+    'instance_id', 'definition_id', 'environment', 'account_ref'
   );
 
 -- ---------------------------------------------------------------------------
@@ -112,10 +123,16 @@ create trigger instances_immutable_environment
 -- append-and-release table so the constraint can exist as a database
 -- constraint (ADR-011 §1 enforcement layer 1) rather than as prose.
 
+-- `environment` is NOT an independent property of an ownership claim. It is the
+-- environment of the instance making the claim, bound by a composite foreign
+-- key: without that binding, two LIVE instances could each own one market by
+-- labelling one of the two rows `PAPER`, and the partial unique index below —
+-- which is keyed by execution realm — would never see a collision. The claim
+-- and the claimant now cannot disagree, for any writer.
 create table strategy.market_ownership (
   market_ownership_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
   market_id internal.uuid_v7 not null references catalog.markets (market_id),
-  instance_id internal.uuid_v7 not null references strategy.instances (instance_id),
+  instance_id internal.uuid_v7 not null,
   environment internal.run_mode not null,
   ownership_mode internal.ownership_mode not null,
   status internal.ownership_status not null default 'ACTIVE',
@@ -124,6 +141,9 @@ create table strategy.market_ownership (
   released_reason internal.detail,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  constraint market_ownership_instance_environment_fk
+    foreign key (instance_id, environment)
+    references strategy.instances (instance_id, environment),
   constraint market_ownership_release_consistent check (
     (status = 'RELEASED') = (released_at is not null)
   )
@@ -158,7 +178,7 @@ create trigger market_ownership_immutable_identity
 
 create table strategy.runs (
   run_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
-  instance_id internal.uuid_v7 not null references strategy.instances (instance_id),
+  instance_id internal.uuid_v7 not null,
   definition_id internal.uuid_v7 not null references strategy.definitions (definition_id),
   config_id internal.uuid_v7 not null references strategy.configs (config_id),
   environment internal.run_mode not null,
@@ -176,6 +196,14 @@ create table strategy.runs (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint runs_end_consistent check ((status = 'RUNNING') = (ended_at is null)),
+  -- A run executes an instance, so its environment is the instance's. The
+  -- composite key is the foreign-key target for `execution.plans`, which binds
+  -- the same way — the environment discriminator is one value, carried down the
+  -- chain, not re-declared at each level where a caller could mislabel it.
+  constraint runs_instance_environment_fk
+    foreign key (instance_id, environment)
+    references strategy.instances (instance_id, environment),
+  constraint runs_id_environment_unique unique (run_id, environment),
   -- §11: a BACKTEST run replays a pinned dataset; a live-data run does not.
   constraint runs_backtest_has_manifest check (
     environment <> 'BACKTEST' or dataset_manifest_id is not null

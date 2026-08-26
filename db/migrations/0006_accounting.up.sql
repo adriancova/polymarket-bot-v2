@@ -243,6 +243,15 @@ create constraint trigger ledger_entries_balanced
 -- §10.7: "No negative available balance after reservations." The available
 -- amount is a stored generated column, so the invariant is a CHECK on a value
 -- the database computes rather than one a writer supplies.
+--
+-- `reserved_amount` is NOT an ordinary writable column. It is a projection of
+-- the reservation facts in `accounting.inventory_reservations`, maintained by
+-- the trigger below and validated on every write by
+-- `accounting.assert_reserved_amount_matches_reservations()`. Before that
+-- guard existed the CHECK compared `actual_amount` against a value any writer
+-- could lower: reserve 100 of 100, set `reserved_amount` to '0', reserve
+-- another 100, and the projection reported 200 reserved against 100 held. The
+-- facts are now authoritative for every writer, not only for the repository.
 
 create table accounting.balance_projection (
   account_ref internal.identifier not null,
@@ -268,6 +277,9 @@ create table accounting.balance_projection (
 create trigger balance_projection_set_updated_at
   before update on accounting.balance_projection
   for each row execute function internal.set_updated_at();
+
+comment on column accounting.balance_projection.reserved_amount is
+  'Maintained from accounting.inventory_reservations by trigger. Not directly writable: any write that disagrees with the active reservations raises PMB08.';
 
 -- ---------------------------------------------------------------------------
 -- inventory_reservations — funds/tokens reserved for plans/orders (§9.14)
@@ -315,46 +327,88 @@ create trigger inventory_reservations_immutable_identity
     'asset_kind', 'amount', 'reserved_at'
   );
 
+-- Sums the reservations that currently constrain one balance.
+--
+-- One definition, used by both the maintaining trigger and the guard that
+-- validates every write to `balance_projection`, so the projection and its
+-- validation can never drift apart. STABLE (not IMMUTABLE): it reads a table.
+create function accounting.active_reserved_amount(
+  target_account_ref text,
+  target_environment internal.run_mode,
+  target_asset_id text
+) returns numeric
+language sql
+stable
+parallel safe
+as $$
+  select coalesce(sum(r.amount::numeric), 0)
+  from accounting.inventory_reservations as r
+  where r.account_ref = target_account_ref
+    and r.environment = target_environment
+    and r.asset_id = target_asset_id
+    and r.status = 'ACTIVE';
+$$;
+
+comment on function accounting.active_reserved_amount(text, internal.run_mode, text) is
+  'Exact sum of the ACTIVE reservations constraining one balance (§9.14, §10.7).';
+
 -- A reservation constrains availability the moment it exists, and stops
--- constraining only when it is released or consumed. Maintaining
--- `reserved_amount` here rather than in a repository means the §10.7 invariant
--- holds for every writer, not only for the one that remembers to update both
--- tables. The CHECK on balance_projection is what actually rejects an
--- over-reservation.
+-- constraining only when it is released or consumed. `reserved_amount` is
+-- recomputed here from the reservation rows rather than incremented by a
+-- delta, so the projection is a function of the facts and cannot drift from
+-- them — an incremented counter is only ever as correct as every write that
+-- ever touched it.
+--
+-- The row lock is taken *before* the sum is read: a concurrent reserver's own
+-- maintenance has to take the same lock, so it cannot commit between this
+-- session's read and its write. That is what makes two simultaneous
+-- reservations of one balance serialize instead of both reading a stale total.
 create function accounting.apply_inventory_reservation() returns trigger
 language plpgsql
 as $$
 declare
-  reserved_delta numeric;
+  target_account_ref text;
+  target_environment internal.run_mode;
+  target_asset_id text;
+  reserved_total numeric;
   affected integer;
 begin
-  if tg_op = 'INSERT' then
-    reserved_delta := case when new.status = 'ACTIVE' then new.amount::numeric else 0 end;
+  if tg_op = 'DELETE' then
+    target_account_ref := old.account_ref;
+    target_environment := old.environment;
+    target_asset_id := old.asset_id;
   else
-    reserved_delta :=
-      (case when new.status = 'ACTIVE' then new.amount::numeric else 0 end)
-      - (case when old.status = 'ACTIVE' then old.amount::numeric else 0 end);
+    target_account_ref := new.account_ref;
+    target_environment := new.environment;
+    target_asset_id := new.asset_id;
   end if;
 
-  if reserved_delta = 0 then
-    return null;
-  end if;
+  perform 1
+  from accounting.balance_projection as b
+  where b.account_ref = target_account_ref
+    and b.environment = target_environment
+    and b.asset_id = target_asset_id
+  for update;
+
+  reserved_total := accounting.active_reserved_amount(
+    target_account_ref, target_environment, target_asset_id
+  );
 
   update accounting.balance_projection as b
-  set reserved_amount = internal.decimal_text(b.reserved_amount::numeric + reserved_delta),
+  set reserved_amount = internal.decimal_text(reserved_total),
       updated_at = now()
-  where b.account_ref = new.account_ref
-    and b.environment = new.environment
-    and b.asset_id = new.asset_id;
+  where b.account_ref = target_account_ref
+    and b.environment = target_environment
+    and b.asset_id = target_asset_id;
 
   get diagnostics affected = row_count;
 
-  if affected = 0 then
+  if affected = 0 and tg_op <> 'DELETE' then
     raise exception
       using errcode = 'PMB09',
         message = format(
           'no balance projection row for account %s, environment %s, asset %s',
-          new.account_ref, new.environment, new.asset_id
+          target_account_ref, target_environment, target_asset_id
         ),
         hint = 'A reservation constrains a known balance; create the balance row first (§9.14).';
   end if;
@@ -363,9 +417,90 @@ begin
 end;
 $$;
 
+-- DELETE is covered too: a deleted reservation stops constraining, and leaving
+-- the projection behind would both overstate the reservation and deadlock every
+-- later write against the guard below.
 create trigger inventory_reservations_apply
-  after insert or update of status, amount on accounting.inventory_reservations
+  after insert or update or delete on accounting.inventory_reservations
   for each row execute function accounting.apply_inventory_reservation();
+
+-- The guard that makes the reservation facts authoritative for ANY writer.
+--
+-- Every write to `balance_projection` must leave `reserved_amount` equal to the
+-- sum of the ACTIVE reservations for that key: an UPDATE that disagrees is
+-- rejected, an INSERT is corrected to the facts, and a balance row that
+-- reservations still depend on cannot be deleted (delete-then-reinsert was the
+-- other half of the bypass). PostgreSQL takes the row lock before firing a
+-- BEFORE ROW trigger on UPDATE and DELETE, so the sum below is read under that
+-- lock.
+create function accounting.assert_reserved_amount_matches_reservations() returns trigger
+language plpgsql
+as $$
+declare
+  reserved_total numeric;
+begin
+  if tg_op = 'DELETE' then
+    reserved_total := accounting.active_reserved_amount(
+      old.account_ref, old.environment, old.asset_id
+    );
+    if reserved_total <> 0 then
+      raise exception
+        using errcode = 'PMB08',
+          message = format(
+            'balance for account %s, environment %s, asset %s still has %s reserved',
+            old.account_ref, old.environment, old.asset_id, reserved_total
+          ),
+          hint = 'Release the reservations before removing the balance they constrain (§9.14).';
+    end if;
+    return old;
+  end if;
+
+  reserved_total := accounting.active_reserved_amount(
+    new.account_ref, new.environment, new.asset_id
+  );
+
+  if tg_op = 'INSERT' then
+    -- An INSERT establishes the row, so there is no prior value to contradict:
+    -- the facts are simply written in. This also keeps the ordinary
+    -- `insert ... on conflict do update` rebuild working, because PostgreSQL
+    -- fires BEFORE INSERT on the speculative row before it discovers the
+    -- conflict — rejecting there would break every upsert on a balance that has
+    -- reservations, while correcting is exactly as authoritative.
+    new.reserved_amount := internal.decimal_text(reserved_total);
+    return new;
+  end if;
+
+  if new.reserved_amount::numeric <> reserved_total then
+    raise exception
+      using errcode = 'PMB08',
+        message = format(
+          'reserved_amount %s for account %s, environment %s, asset %s does not match the %s actually reserved',
+          new.reserved_amount, new.account_ref, new.environment, new.asset_id, reserved_total
+        ),
+        hint = 'reserved_amount is maintained from accounting.inventory_reservations; write a reservation, not the projection (§10.7).';
+  end if;
+
+  return new;
+end;
+$$;
+
+comment on function accounting.assert_reserved_amount_matches_reservations() is
+  'Rejects any write that would make balance_projection.reserved_amount disagree with the active reservations (§10.7). SQLSTATE PMB08.';
+
+create trigger balance_projection_reserved_amount_authoritative
+  before insert or update or delete on accounting.balance_projection
+  for each row execute function accounting.assert_reserved_amount_matches_reservations();
+
+-- Neither table may be truncated: TRUNCATE fires no row-level trigger, so it
+-- would be the one statement that could empty the reservation facts, or the
+-- balances they constrain, without either guard above ever running.
+create trigger balance_projection_no_truncate
+  before truncate on accounting.balance_projection
+  for each statement execute function internal.forbid_truncate();
+
+create trigger inventory_reservations_no_truncate
+  before truncate on accounting.inventory_reservations
+  for each statement execute function internal.forbid_truncate();
 
 -- ---------------------------------------------------------------------------
 -- Position projections (§6 invariant 8: rebuildable, never the source of truth)

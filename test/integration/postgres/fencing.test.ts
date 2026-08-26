@@ -17,6 +17,7 @@ import {
   ConstraintViolationError,
   FencingReferenceInvalidError,
   ForeignKeyViolationError,
+  NonRealModeFencingLeaseError,
   UniqueViolationError,
   uuidV7,
 } from "@polymarket-bot/storage-postgres";
@@ -105,8 +106,6 @@ describe("live orders require a valid fencing token", () => {
       executionGroupId: liveChain.executionGroupId,
       marketId: liveChain.marketId,
       tokenId: liveChain.tokenId,
-      environment: "LIVE_MICRO",
-      accountRef: LIVE_ACCOUNT,
       side: "BUY",
       limitPrice: "0.42",
       originalShares: "1",
@@ -129,8 +128,6 @@ describe("live orders require a valid fencing token", () => {
         executionGroupId: liveChain.executionGroupId,
         marketId: liveChain.marketId,
         tokenId: liveChain.tokenId,
-        environment: "LIVE_MICRO",
-        accountRef: LIVE_ACCOUNT,
         side: "BUY",
         limitPrice: "0.42",
         originalShares: "1",
@@ -155,8 +152,6 @@ describe("live orders require a valid fencing token", () => {
         executionGroupId: liveChain.executionGroupId,
         marketId: liveChain.marketId,
         tokenId: liveChain.tokenId,
-        environment: "LIVE_MICRO",
-        accountRef: LIVE_ACCOUNT,
         side: "BUY",
         limitPrice: "0.42",
         originalShares: "1",
@@ -181,8 +176,6 @@ describe("live orders require a valid fencing token", () => {
           executionGroupId: liveChain.executionGroupId,
           marketId: liveChain.marketId,
           tokenId: liveChain.tokenId,
-          environment: "LIVE_MICRO",
-          accountRef: LIVE_ACCOUNT,
           side: "BUY",
           limitPrice: "0.42",
           originalShares: "1",
@@ -206,8 +199,6 @@ describe("live orders require a valid fencing token", () => {
         executionGroupId: liveChain.executionGroupId,
         marketId: liveChain.marketId,
         tokenId: liveChain.tokenId,
-        environment: "LIVE_MICRO",
-        accountRef: LIVE_ACCOUNT,
         side: "BUY",
         limitPrice: "0.42",
         originalShares: "1",
@@ -221,10 +212,15 @@ describe("live orders require a valid fencing token", () => {
   });
 
   it("REJECTS a live order fenced by a lease for another environment (ADR-010)", async () => {
-    const paperLease = await context.repositories.fencing.acquireLease({
-      accountRef: LIVE_ACCOUNT,
-      environment: "PAPER",
-      holderId: "paper-trader",
+    // A LIVE lease on a different account: a simulated lease cannot be used for
+    // this any more, because a simulated run mode may not hold a live fencing
+    // lease at all (ADR-008 §2), and a LIVE lease on *this* account would
+    // collide with the LIVE_MICRO lease it already holds — one real writer per
+    // account. Both of those are the point.
+    const otherEnvironmentLease = await context.repositories.fencing.acquireLease({
+      accountRef: "other-live-account",
+      environment: "LIVE",
+      holderId: "other-trader",
       expiresAt: inSeconds(300),
     });
 
@@ -234,21 +230,32 @@ describe("live orders require a valid fencing token", () => {
         executionGroupId: liveChain.executionGroupId,
         marketId: liveChain.marketId,
         tokenId: liveChain.tokenId,
-        environment: "LIVE_MICRO",
-        accountRef: LIVE_ACCOUNT,
         side: "BUY",
         limitPrice: "0.42",
         originalShares: "1",
         state: "LIVE",
         fencing: {
-          fencingLeaseId: paperLease.fencingLeaseId,
-          fencingToken: paperLease.fencingToken,
+          fencingLeaseId: otherEnvironmentLease.fencingLeaseId,
+          fencingToken: otherEnvironmentLease.fencingToken,
         },
       }),
     );
 
     expect(error).toBeInstanceOf(FencingReferenceInvalidError);
-    expect((error as FencingReferenceInvalidError).message).toMatch(/fences environment PAPER/u);
+    expect((error as FencingReferenceInvalidError).message).toMatch(/fences environment LIVE,/u);
+  });
+
+  it("REJECTS acquiring a live fencing lease in a simulated run mode (ADR-008 §2)", async () => {
+    const error = await captureRejection(async () =>
+      context.repositories.fencing.acquireLease({
+        accountRef: LIVE_ACCOUNT,
+        environment: "PAPER",
+        holderId: "paper-trader",
+        expiresAt: inSeconds(300),
+      }),
+    );
+
+    expect(error).toBeInstanceOf(NonRealModeFencingLeaseError);
   });
 
   it("REJECTS a live order fenced by a released lease", async () => {
@@ -264,8 +271,6 @@ describe("live orders require a valid fencing token", () => {
         executionGroupId: liveChain.executionGroupId,
         marketId: liveChain.marketId,
         tokenId: liveChain.tokenId,
-        environment: "LIVE_MICRO",
-        accountRef: LIVE_ACCOUNT,
         side: "BUY",
         limitPrice: "0.42",
         originalShares: "1",
@@ -302,8 +307,6 @@ describe("live orders require a valid fencing token", () => {
         executionGroupId: liveChain.executionGroupId,
         marketId: liveChain.marketId,
         tokenId: liveChain.tokenId,
-        environment: "LIVE_MICRO",
-        accountRef: LIVE_ACCOUNT,
         side: "BUY",
         limitPrice: "0.42",
         originalShares: "1",
@@ -334,8 +337,6 @@ describe("live orders require a valid fencing token", () => {
     const attemptId = await context.repositories.orders.recordSubmissionAttempt({
       executionGroupId: liveChain.executionGroupId,
       planId: liveChain.planId,
-      environment: "LIVE_MICRO",
-      accountRef: LIVE_ACCOUNT,
       signedPayload: { salt: "abc", maker: "0x0" },
       salt: "abc",
       expectedOrderHash: "0xexpected",
@@ -360,8 +361,6 @@ describe("live orders require a valid fencing token", () => {
       context.repositories.orders.recordSubmissionAttempt({
         executionGroupId: liveChain.executionGroupId,
         planId: liveChain.planId,
-        environment: "LIVE_MICRO",
-        accountRef: LIVE_ACCOUNT,
         attemptOrdinal: 2,
         signedPayload: { salt: "def" },
         salt: "def",
@@ -381,8 +380,6 @@ describe("live orders require a valid fencing token", () => {
       context.repositories.orders.recordSubmissionAttempt({
         executionGroupId: liveChain.executionGroupId,
         planId: liveChain.planId,
-        environment: "LIVE_MICRO",
-        accountRef: LIVE_ACCOUNT,
         attemptOrdinal: 3,
         signedPayload: { salt: "ghi" },
         salt: "ghi",
@@ -411,8 +408,6 @@ describe("live orders require a valid fencing token", () => {
       const attemptId = await context.repositories.orders.recordSubmissionAttempt({
         executionGroupId: liveChain.executionGroupId,
         planId: liveChain.planId,
-        environment: "LIVE_MICRO",
-        accountRef: LIVE_ACCOUNT,
         attemptOrdinal: ordinal,
         signedPayload: { salt: `salt-${ordinal}` },
         salt: `salt-${ordinal}`,
@@ -428,8 +423,6 @@ describe("live orders require a valid fencing token", () => {
       executionGroupId: paperChain.executionGroupId,
       marketId: paperChain.marketId,
       tokenId: paperChain.tokenId,
-      environment: "PAPER",
-      accountRef: "test-account",
       side: "BUY",
       limitPrice: "0.42",
       originalShares: "1",

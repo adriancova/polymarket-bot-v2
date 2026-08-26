@@ -24,6 +24,16 @@ export type WithDefault<T> = ColumnType<T, T | undefined, T>;
 /** A column the database computes and no writer may set (`GENERATED ALWAYS`). */
 export type DatabaseGenerated<T> = ColumnType<T, never, never>;
 
+/**
+ * A column maintained by a database trigger from facts held elsewhere.
+ *
+ * Readable, never writable through this API — and, unlike a naming convention,
+ * the database rejects a write from any other client too
+ * (`accounting.balance_projection.reserved_amount` is a projection of
+ * `accounting.inventory_reservations`, guarded by a trigger raising `PMB08`).
+ */
+export type TriggerMaintained<T> = ColumnType<T, never, never>;
+
 /** A column fixed at insert time by a `forbid_column_change` trigger. */
 export type InsertOnly<T> = ColumnType<T, T, never>;
 
@@ -53,9 +63,9 @@ export type AppendOnlyTable<TColumns> = {
  * A `jsonb` column.
  *
  * `pg` parses `jsonb` into JavaScript values on read and serializes an object on
- * write. A payload that carries economic values (an intent, a signed order) must
- * already hold them as canonical decimal strings — the domain contracts reject a
- * `number` there, and this boundary does not re-check the document's interior.
+ * write. `JsonValue` is the *read* shape and admits `number`, because a `jsonb`
+ * document may contain one and pretending otherwise would be a lie about what
+ * comes back.
  *
  * Write a JSON array as a pre-serialized string: `pg` renders a JavaScript array
  * as a PostgreSQL array literal, not as JSON.
@@ -82,6 +92,43 @@ export type NullableJsonColumn = ColumnType<
   JsonValue | null,
   JsonInput | null,
   JsonInput | null
+>;
+
+/**
+ * A JSON document that may carry economic values (§6 invariant 1).
+ *
+ * `number` is excluded at every depth. A signed order, an intent, an order
+ * event, or a strategy parameter set holds prices and sizes *inside* the
+ * document, and `{ price: 0.42 }` is not the value `0.42` — it is the nearest
+ * binary double, which is how a rounding error becomes a persisted fact
+ * (`docs/contracts/domain.md` §3.2, §4). Economic values are canonical decimal
+ * strings there exactly as they are in a column.
+ *
+ * The type is the compile-time half; `assertDecimalSafeJson()` in `src/json.ts`
+ * is the runtime half, because a `jsonb` document reaches this boundary from
+ * places TypeScript did not check (`JSON.parse`, a venue response, a test).
+ */
+export type DecimalSafeJsonValue =
+  | string
+  | boolean
+  | null
+  | readonly DecimalSafeJsonValue[]
+  | { readonly [key: string]: DecimalSafeJsonValue };
+
+export type DecimalSafeJsonInput = string | { readonly [key: string]: DecimalSafeJsonValue };
+
+/** A `jsonb` column whose document may carry economic values. */
+export type DecimalSafeJsonColumn = ColumnType<
+  JsonValue,
+  DecimalSafeJsonInput,
+  DecimalSafeJsonInput
+>;
+
+/** A nullable `jsonb` column whose document may carry economic values. */
+export type NullableDecimalSafeJsonColumn = ColumnType<
+  JsonValue | null,
+  DecimalSafeJsonInput | null,
+  DecimalSafeJsonInput | null
 >;
 
 /** A `text[]` column over the enum-like `internal.code` domain. */

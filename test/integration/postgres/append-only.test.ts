@@ -45,8 +45,6 @@ beforeAll(async () => {
     executionGroupId: chain.executionGroupId,
     marketId: chain.marketId,
     tokenId: chain.tokenId,
-    environment: "PAPER",
-    accountRef: "test-account",
     side: "BUY",
     limitPrice: "0.42",
     originalShares: "10",

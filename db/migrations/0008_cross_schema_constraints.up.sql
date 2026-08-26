@@ -50,27 +50,34 @@ language plpgsql
 as $$
 declare
   lease record;
-  -- One function serves two tables whose timestamp columns differ
-  -- (`orders.submitted_at`, `submission_attempts.signed_at`), so the instant is
-  -- read structurally rather than by a field reference that would not compile
-  -- against both row types.
-  new_row jsonb := to_jsonb(new);
-  effective_at timestamptz := coalesce(
-    (new_row ->> 'submitted_at')::timestamptz,
-    (new_row ->> 'signed_at')::timestamptz,
-    now()
-  );
+  -- Authorization time is the DATABASE's, never the caller's.
+  --
+  -- This used to read `submitted_at`/`signed_at` off the row being written, so
+  -- an expired-but-ACTIVE lease authorized any write that claimed to have
+  -- happened before the expiry — backdating a column was enough to submit under
+  -- a lease that had lapsed. The persisted timestamps remain as data (they are
+  -- what the venue and the operator care about); they are not evidence of
+  -- authority. `clock_timestamp()` rather than `now()`, so a long-running
+  -- transaction that began while the lease was valid cannot keep writing under
+  -- it after it lapses.
+  effective_at timestamptz := clock_timestamp();
 begin
   if new.fencing_lease_id is null then
     -- The CHECK constraint already rejects this for a real-order environment.
     return new;
   end if;
 
+  -- FOR SHARE, not a bare read: release and revocation both UPDATE this row, so
+  -- without the lock a write could be authorized by the pre-release version of
+  -- a lease that was being released in a concurrent transaction. The share lock
+  -- lets simultaneous live writes under one valid lease proceed together, while
+  -- serializing them against anything that ends the lease.
   select l.status, l.environment, l.account_ref, l.expires_at, l.released_at
   into lease
   from ops.fencing_leases as l
   where l.fencing_lease_id = new.fencing_lease_id
-    and l.fencing_token = new.fencing_token;
+    and l.fencing_token = new.fencing_token
+  for share;
 
   if not found then
     raise exception
@@ -116,7 +123,8 @@ begin
         message = format(
           'fencing lease %s expired at %s, before %s',
           new.fencing_lease_id, lease.expires_at, effective_at
-        );
+        ),
+        hint = 'Lease validity is judged by the database clock; a persisted timestamp is data, not authority (ADR-008).';
   end if;
 
   return new;
@@ -124,7 +132,7 @@ end;
 $$;
 
 comment on function internal.assert_valid_fencing_reference() is
-  'Rejects a write that names a fencing lease which was not valid for that account, environment, and instant (§10.7, ADR-008).';
+  'Rejects a write that names a fencing lease which is not valid for that account and environment at the database''s own clock (§10.7, ADR-008).';
 
 create trigger orders_valid_fencing_reference
   before insert on execution.orders

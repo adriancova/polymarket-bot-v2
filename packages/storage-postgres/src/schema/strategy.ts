@@ -11,6 +11,7 @@ import type {
   DecimalString,
   Detail,
   Identifier,
+  DecimalSafeJsonColumn,
   JsonColumn,
   NullableJsonColumn,
   Sha256Hex,
@@ -51,7 +52,8 @@ export type StrategyConfigsTable = AppendOnlyTable<{
   config_id: WithDefault<UuidV7Column>;
   definition_id: UuidV7Column;
   config_version: number;
-  parameters: JsonColumn;
+  /** Strategy parameters may be economic; decimal strings only (§6 invariant 1). */
+  parameters: DecimalSafeJsonColumn;
   parameters_hash: Sha256Hex;
   validated_at: TimestampColumn;
   created_by: Identifier;
@@ -168,7 +170,8 @@ export type StrategyIntentsTable = AppendOnlyTable<{
   intent_ordinal: number;
   intent_type: IntentTypeValue;
   contract_version: number;
-  payload: JsonColumn;
+  /** The §7.7 intent document; its economic fields are decimal strings. */
+  payload: DecimalSafeJsonColumn;
   recorded_at: TimestampColumnWithDefault;
 }>;
 
@@ -178,7 +181,8 @@ export type StrategyApprovedIntentsTable = AppendOnlyTable<{
   intent_id: UuidV7Column;
   revision: WithDefault<number>;
   risk_outcome: RiskOutcomeValue;
-  approved_payload: JsonColumn;
+  /** The risk-approved intent document; economic fields are decimal strings. */
+  approved_payload: DecimalSafeJsonColumn;
   resize_reason: Detail | null;
   approved_shares: DecimalString | null;
   approved_at: TimestampColumnWithDefault;

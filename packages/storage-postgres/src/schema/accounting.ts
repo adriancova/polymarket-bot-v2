@@ -21,6 +21,7 @@ import type {
   TimestampColumn,
   TimestampColumnWithDefault,
   TokenId,
+  TriggerMaintained,
   UuidV7Column,
   WithDefault,
 } from "./columns.js";
@@ -120,7 +121,13 @@ export type AccountingBalanceProjectionTable = {
   asset_id: Identifier;
   asset_kind: AssetKindValue;
   actual_amount: WithDefault<DecimalString>;
-  reserved_amount: WithDefault<DecimalString>;
+  /**
+   * Maintained by trigger from `accounting.inventory_reservations`, and not
+   * writable: reserve or release a reservation instead. A direct write that
+   * disagreed with the reservations is rejected with `PMB08`
+   * ({@link ReservedAmountMismatchError}) for every client, not only this one.
+   */
+  reserved_amount: TriggerMaintained<DecimalString>;
   /** `GENERATED ALWAYS`: actual minus reserved, checked to be non-negative. */
   available_amount: DatabaseGenerated<DecimalString>;
   last_ledger_transaction_id: UuidV7Column | null;

@@ -14,8 +14,10 @@ import type { PolymarketBotDatabase } from "../database.js";
 import { inTransaction } from "../database.js";
 import { withMappedErrors } from "../errors.js";
 import { uuidV7 } from "../ids.js";
+import { assertDecimalSafeJson } from "../json.js";
 import type {
   Code,
+  DecimalSafeJsonInput,
   Detail,
   Identifier,
   JsonInput,
@@ -27,6 +29,10 @@ import type { OwnershipModeValue, RunModeValue } from "../schema/enums.js";
 export type CreateDefinitionInput = {
   readonly strategyName: Code;
   readonly codeVersion: Identifier;
+  /**
+   * A JSON Schema. Numbers are legitimate here (`maximum`, `minItems`) and are
+   * schema keywords, not economics — the parameters it validates are guarded.
+   */
   readonly paramsSchema: JsonInput;
   readonly stateSchemaVersion: number;
   readonly decisionContractVersion: number;
@@ -35,7 +41,8 @@ export type CreateDefinitionInput = {
 
 export type CreateConfigInput = {
   readonly definitionId: UuidV7Column;
-  readonly parameters: JsonInput;
+  /** Strategy parameters. Economic values are decimal strings, never numbers. */
+  readonly parameters: DecimalSafeJsonInput;
   readonly parametersHash: Sha256Hex;
   readonly validatedAt: IsoTimestamp;
   readonly createdBy: Identifier;
@@ -100,6 +107,8 @@ export function createStrategyRepository(db: PolymarketBotDatabase) {
       readonly configId: UuidV7Column;
       readonly configVersion: number;
     }> {
+      assertDecimalSafeJson(input.parameters, "configs.parameters");
+
       return inTransaction(db, async (trx) => {
         const previous = await trx
           .selectFrom("strategy.configs")

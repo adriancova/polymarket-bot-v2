@@ -31,8 +31,8 @@ create table execution.plans (
   plan_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
   approved_intent_id internal.uuid_v7 not null
     references strategy.approved_intents (approved_intent_id),
-  run_id internal.uuid_v7 not null references strategy.runs (run_id),
-  instance_id internal.uuid_v7 not null references strategy.instances (instance_id),
+  run_id internal.uuid_v7 not null,
+  instance_id internal.uuid_v7 not null,
   market_id internal.uuid_v7 not null references catalog.markets (market_id),
   environment internal.run_mode not null,
   account_ref internal.identifier,
@@ -66,9 +66,27 @@ create table execution.plans (
   constraint plans_parameters_version_fk
     foreign key (market_id, parameters_version)
     references catalog.market_parameter_history (market_id, parameters_version),
+  -- The environment and the account of a plan are the run's and the instance's,
+  -- not independent values. A plan that claimed PAPER while executing a LIVE
+  -- run would carry that lie to every order beneath it, and the live-order
+  -- fencing CHECK reads exactly this discriminator.
+  constraint plans_run_environment_fk
+    foreign key (run_id, environment)
+    references strategy.runs (run_id, environment),
+  constraint plans_instance_environment_fk
+    foreign key (instance_id, environment)
+    references strategy.instances (instance_id, environment),
+  constraint plans_instance_account_fk
+    foreign key (instance_id, account_ref)
+    references strategy.instances (instance_id, account_ref),
   constraint plans_real_mode_has_account check (
     not internal.is_real_order_mode(environment) or account_ref is not null
-  )
+  ),
+  -- Foreign-key targets for the orders and submission attempts below, so their
+  -- own discriminators cannot disagree with the plan that authorized them.
+  constraint plans_id_environment_unique unique (plan_id, environment),
+  constraint plans_id_account_unique unique (plan_id, account_ref),
+  constraint plans_id_market_unique unique (plan_id, market_id)
 );
 
 create index plans_market_idx on execution.plans (market_id, planned_at desc);
@@ -94,7 +112,10 @@ create table execution.groups (
   leg_risk_limit internal.non_negative_decimal_string,
   recorded_at timestamptz not null default now(),
   constraint groups_ordinal_unique unique (plan_id, group_ordinal),
-  constraint groups_ordinal_non_negative check (group_ordinal >= 0)
+  constraint groups_ordinal_non_negative check (group_ordinal >= 0),
+  -- Foreign-key target: an order or a submission attempt names both a plan and
+  -- a group, and the group must belong to that plan.
+  constraint groups_id_plan_unique unique (execution_group_id, plan_id)
 );
 
 call internal.enforce_append_only('execution', 'groups');
@@ -109,9 +130,8 @@ call internal.enforce_append_only('execution', 'groups');
 
 create table execution.submission_attempts (
   submission_attempt_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
-  execution_group_id internal.uuid_v7 not null
-    references execution.groups (execution_group_id),
-  plan_id internal.uuid_v7 not null references execution.plans (plan_id),
+  execution_group_id internal.uuid_v7 not null,
+  plan_id internal.uuid_v7 not null,
   environment internal.run_mode not null,
   account_ref internal.identifier,
   attempt_ordinal integer not null default 1,
@@ -139,9 +159,26 @@ create table execution.submission_attempts (
   constraint submission_attempts_ordinal_unique
     unique (execution_group_id, attempt_ordinal),
   constraint submission_attempts_ordinal_positive check (attempt_ordinal >= 1),
+  -- ADR-008 §1/§2: the fencing CHECK below reads this row's own `environment`,
+  -- so that discriminator must be the plan's. Otherwise a LIVE submission could
+  -- claim PAPER and sign without holding the account's fencing token.
+  constraint submission_attempts_plan_environment_fk
+    foreign key (plan_id, environment)
+    references execution.plans (plan_id, environment),
+  constraint submission_attempts_plan_account_fk
+    foreign key (plan_id, account_ref)
+    references execution.plans (plan_id, account_ref),
+  constraint submission_attempts_group_plan_fk
+    foreign key (execution_group_id, plan_id)
+    references execution.groups (execution_group_id, plan_id),
   constraint submission_attempts_real_mode_has_account check (
     not internal.is_real_order_mode(environment) or account_ref is not null
-  )
+  ),
+  -- Foreign-key targets for `execution.orders`: an order names the attempt that
+  -- signed it, and may not re-declare either the plan or the fencing authority.
+  constraint submission_attempts_id_plan_unique unique (submission_attempt_id, plan_id),
+  constraint submission_attempts_id_fencing_unique
+    unique (submission_attempt_id, fencing_lease_id, fencing_token)
 );
 
 -- §10.7: `submission_attempts(expected_order_hash)` unique where known.
@@ -174,10 +211,9 @@ create trigger submission_attempts_immutable_signature
 
 create table execution.orders (
   order_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
-  submission_attempt_id internal.uuid_v7
-    references execution.submission_attempts (submission_attempt_id),
-  plan_id internal.uuid_v7 not null references execution.plans (plan_id),
-  execution_group_id internal.uuid_v7 references execution.groups (execution_group_id),
+  submission_attempt_id internal.uuid_v7,
+  plan_id internal.uuid_v7 not null,
+  execution_group_id internal.uuid_v7,
   market_id internal.uuid_v7 not null references catalog.markets (market_id),
   token_id internal.token_id not null,
   environment internal.run_mode not null,
@@ -210,13 +246,55 @@ create table execution.orders (
   ),
   constraint orders_real_mode_has_account check (
     not internal.is_real_order_mode(environment) or account_ref is not null
-  )
+  ),
+  -- §10.7 / ADR-008 §1. The live-order fencing CHECK is written against this
+  -- row's own `environment`, so that column must be the plan's: an order that
+  -- named a LIVE plan and claimed PAPER used to be a fully-formed order,
+  -- accepted with no fencing token at all. Both columns are NOT NULL on both
+  -- sides, so this composite key is enforced for every order without exception.
+  constraint orders_plan_environment_fk
+    foreign key (plan_id, environment)
+    references execution.plans (plan_id, environment),
+  -- MATCH SIMPLE: enforced whenever the order names an account. An order that
+  -- names none cannot be a real-order-mode order, because
+  -- `orders_real_mode_has_account` and the environment binding above together
+  -- forbid it.
+  constraint orders_plan_account_fk
+    foreign key (plan_id, account_ref)
+    references execution.plans (plan_id, account_ref),
+  constraint orders_plan_market_fk
+    foreign key (plan_id, market_id)
+    references execution.plans (plan_id, market_id),
+  constraint orders_group_plan_fk
+    foreign key (execution_group_id, plan_id)
+    references execution.groups (execution_group_id, plan_id),
+  constraint orders_submission_attempt_plan_fk
+    foreign key (submission_attempt_id, plan_id)
+    references execution.submission_attempts (submission_attempt_id, plan_id),
+  -- An order and the attempt that signed it are fenced by the same lease and
+  -- token, or the order is not the one that was signed.
+  constraint orders_submission_attempt_fencing_fk
+    foreign key (submission_attempt_id, fencing_lease_id, fencing_token)
+    references execution.submission_attempts
+      (submission_attempt_id, fencing_lease_id, fencing_token),
+  -- Foreign-key targets for `execution.fills`, which carries the same
+  -- discriminators and must not be able to disagree with the order it fills.
+  constraint orders_id_environment_unique unique (order_id, environment),
+  constraint orders_id_account_unique unique (order_id, account_ref),
+  constraint orders_id_market_token_unique unique (order_id, market_id, token_id)
 );
 
 -- §10.7: `orders(venue_order_id)` unique where not null, scoped by
 -- environment/account.
+--
+-- NULLS NOT DISTINCT (PostgreSQL 15+; this stack targets 16) because the scope
+-- is nullable: under ordinary NULL semantics two rows with no account and the
+-- same venue order id are "distinct", so the deduplication the venue identity
+-- exists to provide would lapse exactly where the account is unknown — which is
+-- the reconciliation path, where duplicates are most likely.
 create unique index orders_venue_order_id_unique
   on execution.orders (environment, account_ref, venue_order_id)
+  nulls not distinct
   where venue_order_id is not null;
 
 create index orders_market_state_idx on execution.orders (market_id, state);
@@ -291,7 +369,7 @@ call internal.enforce_append_only('execution', 'intent_order_links');
 
 create table execution.fills (
   fill_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
-  order_id internal.uuid_v7 not null references execution.orders (order_id),
+  order_id internal.uuid_v7 not null,
   market_id internal.uuid_v7 not null references catalog.markets (market_id),
   token_id internal.token_id not null,
   environment internal.run_mode not null,
@@ -315,10 +393,28 @@ create table execution.fills (
   -- §10.7: fills(venue_trade_id, venue_order_id, allocation discriminator)
   -- unique. Scoped by environment/account for the same §10.8 reason orders are:
   -- a replayed or simulated fill must never collide with a live one.
-  constraint fills_venue_identity_unique unique (
+  --
+  -- NULLS NOT DISTINCT: `account_ref` is nullable, and ordinary NULL semantics
+  -- would let one venue trade be recorded twice whenever the account is not
+  -- known — double-counting a real fill, which §6 invariant 4 and the ledger
+  -- both depend on not happening.
+  constraint fills_venue_identity_unique unique nulls not distinct (
     environment, account_ref, venue_trade_id, venue_order_id, allocation_discriminator
   ),
-  constraint fills_fee_asset_present check (fee_amount = '0' or fee_asset is not null)
+  constraint fills_fee_asset_present check (fee_amount = '0' or fee_asset is not null),
+  -- A fill is a fact about one order: its environment, account, market, and
+  -- token are that order's. Without these, a fill of a LIVE order could be
+  -- recorded as PAPER and disappear from every live exposure, reconciliation,
+  -- and ledger query that filters by environment.
+  constraint fills_order_environment_fk
+    foreign key (order_id, environment)
+    references execution.orders (order_id, environment),
+  constraint fills_order_account_fk
+    foreign key (order_id, account_ref)
+    references execution.orders (order_id, account_ref),
+  constraint fills_order_market_token_fk
+    foreign key (order_id, market_id, token_id)
+    references execution.orders (order_id, market_id, token_id)
 );
 
 create index fills_order_idx on execution.fills (order_id, matched_at);

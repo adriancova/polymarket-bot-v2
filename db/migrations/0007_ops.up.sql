@@ -46,12 +46,18 @@ create table ops.fencing_leases (
   revoked_reason internal.detail,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  constraint fencing_leases_token_unique unique (account_ref, environment, fencing_token),
   -- Required by the composite foreign key that binds a live order to the exact
   -- lease *and* token that authorized it (migration 0008).
   constraint fencing_leases_id_token_unique unique (fencing_lease_id, fencing_token),
   constraint fencing_leases_token_positive check (fencing_token >= 1),
   constraint fencing_leases_expiry_after_acquisition check (expires_at > acquired_at),
+  -- ADR-008 §2 and ADR-010: "paper mode cannot acquire a live fencing lease at
+  -- all". The fence exists to arbitrate real order authority; a simulated mode
+  -- holding one would either block the live writer or teach an operator that a
+  -- simulated process holds live authority. Both are worse than having no row.
+  constraint fencing_leases_real_modes_only check (
+    internal.is_real_order_mode(environment)
+  ),
   -- Any lease that is no longer ACTIVE records when it stopped being ACTIVE,
   -- whether it was released by its holder, revoked, or found expired by the
   -- process that took it over.
@@ -61,12 +67,25 @@ create table ops.fencing_leases (
 );
 
 -- §2: "Exactly one fenced live order writer per account/signer."
+--
+-- Keyed by execution realm, not by run mode. `EXECUTION_PROBE`, `LIVE_MICRO`,
+-- and `LIVE` all submit real orders with the same CLOB credentials, and the
+-- venue cannot tell two of our processes apart (ADR-008 §4) — so an index keyed
+-- by `environment` permitted three simultaneous real writers per account, which
+-- is exactly the state the fence exists to prevent. The
+-- `fencing_leases_real_modes_only` CHECK means every row here is in the REAL
+-- realm, so no predicate on the realm is needed.
 create unique index fencing_leases_one_active_holder
-  on ops.fencing_leases (account_ref, environment)
+  on ops.fencing_leases (account_ref, internal.execution_realm(environment))
   where status = 'ACTIVE';
 
+-- Tokens are monotonic per account across the whole real realm (see the trigger
+-- below), so the token key and the lookup index are realm-scoped too.
+create unique index fencing_leases_token_unique
+  on ops.fencing_leases (account_ref, internal.execution_realm(environment), fencing_token);
+
 create index fencing_leases_account_token_idx
-  on ops.fencing_leases (account_ref, environment, fencing_token desc);
+  on ops.fencing_leases (account_ref, internal.execution_realm(environment), fencing_token desc);
 
 create trigger fencing_leases_set_updated_at
   before update on ops.fencing_leases
@@ -81,6 +100,11 @@ create trigger fencing_leases_immutable_grant
     'holder_id', 'acquired_at'
   );
 
+-- ADR-008 §1: "A token is never reused, never decremented." Scoped by execution
+-- realm rather than by run mode, so a LIVE_MICRO takeover of an account a LIVE
+-- process was fencing continues the same sequence instead of restarting at 1 —
+-- a restarted sequence would make a stale write from the previous holder
+-- indistinguishable from a current one, which is the whole point of the token.
 create function ops.assert_fencing_token_monotonic() returns trigger
 language plpgsql
 as $$
@@ -90,7 +114,7 @@ begin
   select max(l.fencing_token) into highest_token
   from ops.fencing_leases as l
   where l.account_ref = new.account_ref
-    and l.environment = new.environment
+    and internal.execution_realm(l.environment) = internal.execution_realm(new.environment)
     and l.fencing_lease_id <> new.fencing_lease_id;
 
   if highest_token is not null and new.fencing_token <= highest_token then
@@ -110,6 +134,37 @@ $$;
 create trigger fencing_leases_monotonic_token
   before insert on ops.fencing_leases
   for each row execute function ops.assert_fencing_token_monotonic();
+
+-- Moves lapsed leases into the EXPIRED state.
+--
+-- Authorization never depends on this having run: the live-write trigger in
+-- migration 0008 compares against the database's own clock, so an ACTIVE row
+-- whose expiry has passed authorizes nothing whether or not anyone has
+-- relabelled it. This exists so the recorded state machine matches reality for
+-- the operator reading the table and for the takeover path, which must see the
+-- lapse as a transition rather than as a silent overwrite.
+create function ops.expire_stale_fencing_leases(target_account_ref text default null)
+returns integer
+language plpgsql
+as $$
+declare
+  expired_count integer;
+begin
+  update ops.fencing_leases as l
+  set status = 'EXPIRED',
+      released_at = now(),
+      revoked_reason = coalesce(l.revoked_reason, 'lease expired')
+  where l.status = 'ACTIVE'
+    and l.expires_at <= now()
+    and (target_account_ref is null or l.account_ref = target_account_ref);
+
+  get diagnostics expired_count = row_count;
+  return expired_count;
+end;
+$$;
+
+comment on function ops.expire_stale_fencing_leases(text) is
+  'Marks ACTIVE leases whose expiry has passed as EXPIRED (ADR-008). Never a precondition for authorization.';
 
 -- ---------------------------------------------------------------------------
 -- risk_events — vetoes, breakers, exposure violations (§9.8)

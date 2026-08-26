@@ -64,7 +64,6 @@ describe("one active live owner per market", () => {
     const ownershipId = await context.repositories.ownership.acquireOwnership({
       marketId: chain.marketId,
       instanceId: chain.instanceId,
-      environment: "PAPER",
       ownershipMode: "LIVE_OWNER",
     });
     expect(ownershipId).toMatch(/^[0-9a-f]{8}-/u);
@@ -78,7 +77,6 @@ describe("one active live owner per market", () => {
       context.repositories.ownership.acquireOwnership({
         marketId: chain.marketId,
         instanceId: secondInstanceId,
-        environment: "PAPER",
         ownershipMode: "LIVE_OWNER",
       }),
     );
@@ -94,7 +92,6 @@ describe("one active live owner per market", () => {
       context.repositories.ownership.acquireOwnership({
         marketId: chain.marketId,
         instanceId: chain.instanceId,
-        environment: "PAPER",
         ownershipMode: "LIVE_OWNER",
       }),
     );
@@ -105,7 +102,6 @@ describe("one active live owner per market", () => {
     const ownershipId = await context.repositories.ownership.acquireOwnership({
       marketId: chain.marketId,
       instanceId: secondInstanceId,
-      environment: "PAPER",
       ownershipMode: "SHADOW",
     });
     expect(ownershipId).toMatch(/^[0-9a-f]{8}-/u);
@@ -115,7 +111,6 @@ describe("one active live owner per market", () => {
     const ownershipId = await context.repositories.ownership.acquireOwnership({
       marketId: chain.marketId,
       instanceId: secondInstanceId,
-      environment: "PAPER",
       ownershipMode: "OBSERVER",
     });
     expect(ownershipId).toMatch(/^[0-9a-f]{8}-/u);
@@ -135,7 +130,6 @@ describe("one active live owner per market", () => {
     const ownershipId = await context.repositories.ownership.acquireOwnership({
       marketId: chain.marketId,
       instanceId: shadowInstance,
-      environment: "SHADOW",
       ownershipMode: "LIVE_OWNER",
     });
     expect(ownershipId).toMatch(/^[0-9a-f]{8}-/u);
@@ -145,7 +139,6 @@ describe("one active live owner per market", () => {
     await context.repositories.ownership.acquireOwnership({
       marketId: chain.marketId,
       instanceId: liveInstanceId,
-      environment: "LIVE",
       ownershipMode: "LIVE_OWNER",
     });
 
@@ -153,7 +146,6 @@ describe("one active live owner per market", () => {
       context.repositories.ownership.acquireOwnership({
         marketId: chain.marketId,
         instanceId: liveMicroInstanceId,
-        environment: "LIVE_MICRO",
         ownershipMode: "LIVE_OWNER",
       }),
     );
@@ -177,7 +169,6 @@ describe("one active live owner per market", () => {
     const ownershipId = await context.repositories.ownership.acquireOwnership({
       marketId: chain.marketId,
       instanceId: secondInstanceId,
-      environment: "PAPER",
       ownershipMode: "LIVE_OWNER",
     });
     expect(ownershipId).toMatch(/^[0-9a-f]{8}-/u);

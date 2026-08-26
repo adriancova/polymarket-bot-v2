@@ -22,7 +22,6 @@ import type { OwnershipModeValue, RunModeValue } from "../schema/enums.js";
 export type AcquireOwnershipInput = {
   readonly marketId: UuidV7Column;
   readonly instanceId: UuidV7Column;
-  readonly environment: RunModeValue;
   readonly ownershipMode: OwnershipModeValue;
 };
 
@@ -31,12 +30,22 @@ export type MarketOwnershipRepository = ReturnType<typeof createMarketOwnershipR
 export function createMarketOwnershipRepository(db: PolymarketBotDatabase) {
   return {
     /**
-     * Claims ownership of a market.
+     * Claims ownership of a market, in the environment of the claiming instance.
+     *
+     * The environment is **not** a parameter. It is read from
+     * `strategy.instances` in the same statement that writes the claim, and a
+     * composite foreign key rejects any row whose environment is not the
+     * instance's — because a caller-supplied environment was a way around the
+     * whole constraint: two LIVE instances could own one market by labelling one
+     * claim `PAPER`, and the realm-keyed unique index would never see them
+     * collide (ADR-011 §1).
      *
      * @throws {UniqueViolationError} when a live owner already holds the market
      *   in the same execution realm. The caller must treat this as a rejection,
      *   never as a reason to retry with a different instance (§9.7: conflicting
      *   live ownership is rejected, not merged).
+     * @throws {ConstraintViolationError} when the instance does not exist, so
+     *   there is no environment to derive.
      */
     async acquireOwnership(input: AcquireOwnershipInput): Promise<UuidV7Column> {
       const marketOwnershipId = uuidV7();
@@ -48,7 +57,10 @@ export function createMarketOwnershipRepository(db: PolymarketBotDatabase) {
             market_ownership_id: marketOwnershipId,
             market_id: input.marketId,
             instance_id: input.instanceId,
-            environment: input.environment,
+            environment: sql<RunModeValue>`(
+              select i.environment from strategy.instances as i
+              where i.instance_id = ${input.instanceId}
+            )`,
             ownership_mode: input.ownershipMode,
             status: "ACTIVE",
           })

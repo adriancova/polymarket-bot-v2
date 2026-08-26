@@ -194,6 +194,12 @@ export async function migrateDown(
     await ensureMigrationBookkeeping(pool);
     const applied = await getAppliedMigrations(pool);
     assertAppliedChecksumsMatch(applied, migrations);
+    // The rollback about to run must be the rollback that was recorded when the
+    // forward migration was applied. Checking only the forward checksum would
+    // leave the destructive direction unverified: an edited `.down.sql` drops
+    // objects the applied `.up.sql` never created, or leaves behind objects it
+    // did — which is exactly how a "clean" rollback stops being clean.
+    assertAppliedRollbackChecksumsMatch(applied, migrations);
 
     const steps = options.steps ?? 1;
     const targets = [...applied].reverse().slice(0, steps === "all" ? applied.length : steps);
@@ -242,6 +248,27 @@ function assertAppliedChecksumsMatch(
     }
     if (migration.upChecksum !== entry.checksum) {
       throw new MigrationChecksumMismatchError(entry.version, entry.checksum, migration.upChecksum);
+    }
+  }
+}
+
+function assertAppliedRollbackChecksumsMatch(
+  applied: readonly AppliedMigration[],
+  migrations: readonly MigrationFile[],
+): void {
+  const byVersion = new Map(migrations.map((migration) => [migration.version, migration]));
+  for (const entry of applied) {
+    const migration = byVersion.get(entry.version);
+    if (migration === undefined) {
+      continue;
+    }
+    if (migration.downChecksum !== entry.rollbackChecksum) {
+      throw new MigrationChecksumMismatchError(
+        entry.version,
+        entry.rollbackChecksum,
+        migration.downChecksum,
+        "down",
+      );
     }
   }
 }

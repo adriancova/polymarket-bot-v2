@@ -3,11 +3,14 @@
  *
  * §10.7: "No negative available balance after reservations."
  *
- * The invariant is a CHECK on a `GENERATED ALWAYS` column, and
- * `reserved_amount` is maintained by a trigger on `inventory_reservations` — so
- * the invariant holds for any writer, not only for one that remembers to update
- * both tables. This repository never computes a balance in JavaScript: it sends
- * canonical decimal strings and lets PostgreSQL do exact `numeric` arithmetic.
+ * The invariant is a CHECK on a `GENERATED ALWAYS` column, and `reserved_amount`
+ * is a projection of `accounting.inventory_reservations` that a trigger
+ * recomputes from those rows — so the invariant holds for any writer, not only
+ * for one that remembers to update both tables, and a writer that tries to
+ * restate the projection directly is rejected with `PMB08`
+ * ({@link ReservedAmountMismatchError}). This repository never computes a
+ * balance in JavaScript: it sends canonical decimal strings and lets PostgreSQL
+ * do exact `numeric` arithmetic.
  *
  * ADR-006 §9: "Reservations constrain availability but are not spends." A
  * reservation is released on every terminal order path; the release is what
@@ -77,7 +80,8 @@ export function createBalanceRepository(db: PolymarketBotDatabase) {
             asset_id: key.assetId,
             asset_kind: assetKind,
             actual_amount: actualAmount,
-            reserved_amount: "0",
+            // `reserved_amount` is deliberately absent: it is trigger-maintained
+            // from the reservation rows and is not writable through this API.
             last_ledger_transaction_id: lastLedgerTransactionId ?? null,
           })
           .onConflict((conflict) =>

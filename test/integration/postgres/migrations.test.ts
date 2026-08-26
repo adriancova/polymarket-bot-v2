@@ -5,7 +5,12 @@
  * which is only meaningful if a full rollback leaves nothing behind.
  */
 
+import { cp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import {
+  DEFAULT_MIGRATIONS_DIRECTORY,
   MigrationChecksumMismatchError,
   createPostgresPool,
   getAppliedMigrations,
@@ -20,6 +25,7 @@ import { captureRejection, useEmptyDatabase } from "./context.js";
 const SEMANTIC_SCHEMAS = ["catalog", "data", "strategy", "execution", "accounting", "ops"] as const;
 
 const getConnectionString = useEmptyDatabase("migrations");
+const getRollbackConnectionString = useEmptyDatabase("migrations_rollback");
 
 const pools: { end: () => Promise<void> }[] = [];
 
@@ -103,8 +109,13 @@ describe("migrations", () => {
     expect(byName.get("market_ownership_one_active_live_owner")).toMatch(/UNIQUE/iu);
     expect(byName.get("market_ownership_one_active_live_owner")).toMatch(/LIVE_OWNER/u);
 
-    // §2 "Exactly one fenced live order writer per account/signer"
+    // §2 "Exactly one fenced live order writer per account/signer", keyed by
+    // execution realm so LIVE, LIVE_MICRO, and EXECUTION_PROBE cannot coexist.
     expect(byName.get("fencing_leases_one_active_holder")).toMatch(/UNIQUE/iu);
+    expect(byName.get("fencing_leases_one_active_holder")).toMatch(/execution_realm/u);
+
+    // Venue identity deduplicates even where the account is not yet known.
+    expect(byName.get("orders_venue_order_id_unique")).toMatch(/NULLS NOT DISTINCT/iu);
 
     const constraints = await pool.query<{ conname: string }>(
       `select conname from pg_constraint
@@ -113,16 +124,53 @@ describe("migrations", () => {
          'orders_live_requires_fencing_token',
          'orders_fencing_lease_fk',
          'balance_projection_no_negative_available',
-         'settlement_specs_model_matches_observation'
+         'settlement_specs_model_matches_observation',
+         'fencing_leases_real_modes_only',
+         'market_ownership_instance_environment_fk',
+         'orders_plan_environment_fk',
+         'orders_plan_account_fk',
+         'submission_attempts_plan_environment_fk',
+         'plans_run_environment_fk',
+         'runs_instance_environment_fk',
+         'fills_order_environment_fk'
        )`,
     );
     expect(constraints.rows.map((row) => row.conname).sort((a, b) => a.localeCompare(b))).toEqual([
       "balance_projection_no_negative_available",
+      "fencing_leases_real_modes_only",
+      "fills_order_environment_fk",
       "fills_venue_identity_unique",
+      "market_ownership_instance_environment_fk",
       "orders_fencing_lease_fk",
       "orders_live_requires_fencing_token",
+      "orders_plan_account_fk",
+      "orders_plan_environment_fk",
+      "plans_run_environment_fk",
+      "runs_instance_environment_fk",
       "settlement_specs_model_matches_observation",
+      "submission_attempts_plan_environment_fk",
     ]);
+
+    // The fill venue identity is a constraint, not an index, so its NULL
+    // handling is read from the constraint's own index.
+    const fillsIdentity = await pool.query<{ indexdef: string }>(
+      `select pg_get_indexdef(conindid) as indexdef from pg_constraint
+       where conname = 'fills_venue_identity_unique'`,
+    );
+    expect(fillsIdentity.rows[0]?.indexdef).toMatch(/NULLS NOT DISTINCT/iu);
+  });
+
+  it("keep the reservation facts authoritative for every writer (§10.7)", async () => {
+    const pool = poolFor(getConnectionString());
+
+    const triggers = await pool.query<{ tgname: string }>(
+      `select tgname from pg_trigger
+       where not tgisinternal
+         and tgrelid = 'accounting.balance_projection'::regclass`,
+    );
+    expect(triggers.rows.map((row) => row.tgname)).toContain(
+      "balance_projection_reserved_amount_authoritative",
+    );
   });
 
   it("declare every internal primary key with the sortable UUIDv7 domain (§10.7)", async () => {
@@ -175,6 +223,37 @@ describe("migrations", () => {
     await pool.query(`update migrations.schema_migrations set checksum = $1 where version = '0001'`, [
       onDisk[0]?.upChecksum,
     ]);
+  });
+
+  it("refuse to roll back with a rollback script that has been edited", async () => {
+    // The forward checksum protects what a fresh database gets. The rollback
+    // checksum protects what a *rolled-back* database keeps: an edited
+    // `.down.sql` either drops objects the applied `.up.sql` never created or
+    // leaves behind objects it did, and the failure surfaces later, on the
+    // re-apply, as an error about an object that "already exists".
+    const directory = join(tmpdir(), `wp040-rollback-${String(Date.now())}`);
+    await cp(DEFAULT_MIGRATIONS_DIRECTORY, directory, { recursive: true });
+
+    const pool = poolFor(getRollbackConnectionString());
+    await migrateUp(pool, { directory, appliedBy: "wp040-rollback-test" });
+
+    const downPath = join(directory, "0008_cross_schema_constraints.down.sql");
+    const original = await readFile(downPath, "utf8");
+    await writeFile(downPath, `${original}\n-- edited after the migration was applied\n`, "utf8");
+
+    const error = await captureRejection(async () => migrateDown(pool, { directory, steps: 1 }));
+    expect(error).toBeInstanceOf(MigrationChecksumMismatchError);
+    expect((error as MigrationChecksumMismatchError).direction).toBe("down");
+    expect((error as MigrationChecksumMismatchError).version).toBe("0008");
+
+    // Nothing was rolled back: the refusal happens before any rollback runs.
+    const applied = await getAppliedMigrations(pool);
+    expect(applied.at(-1)?.version).toBe("0008");
+
+    // Restored, so the rollback is verified to work once the file matches again.
+    await writeFile(downPath, original, "utf8");
+    const rolledBack = await migrateDown(pool, { directory, steps: 1 });
+    expect(rolledBack.applied[0]?.version).toBe("0008");
   });
 
   it("roll back cleanly, leaving no semantic schema behind", async () => {

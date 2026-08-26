@@ -24,6 +24,11 @@ export const STORAGE_SQL_STATES = {
   fencingReferenceInvalid: "PMB06",
   /** A fencing token was not above every previously issued token (ADR-008 §1). */
   fencingTokenNotMonotonic: "PMB07",
+  /**
+   * A write to `balance_projection` disagreed with the reservation facts, or
+   * would have removed a balance that active reservations depend on (§10.7).
+   */
+  reservedAmountMismatch: "PMB08",
   /** A reservation named an account/asset with no balance projection row. */
   unknownBalance: "PMB09",
 } as const;
@@ -99,6 +104,51 @@ export class FencingTokenNotMonotonicError extends StoragePostgresError {}
 /** A reservation would drive the available balance below zero (§10.7). */
 export class NegativeAvailableBalanceError extends StoragePostgresError {}
 
+/**
+ * A write tried to make `balance_projection.reserved_amount` disagree with the
+ * reservations that back it, or to delete a balance that active reservations
+ * depend on. The reservation rows are the fact; the projection follows them.
+ */
+export class ReservedAmountMismatchError extends StoragePostgresError {}
+
+/**
+ * A simulated run mode tried to acquire a live fencing lease.
+ *
+ * ADR-008 §2 and ADR-010: "paper mode cannot acquire a live fencing lease at
+ * all". Raised before the statement is sent; the database CHECK
+ * `fencing_leases_real_modes_only` is the enforcement.
+ */
+export class NonRealModeFencingLeaseError extends StoragePostgresError {
+  public constructor(
+    public readonly environment: string,
+    public readonly accountRef: string,
+  ) {
+    super(
+      "FENCING_LEASE_NOT_REAL_MODE",
+      `Run mode ${environment} cannot acquire a live fencing lease for ${accountRef}. ` +
+        "The fence arbitrates real order authority only (ADR-008 §2, ADR-010).",
+    );
+  }
+}
+
+/**
+ * A `jsonb` document bound for an economic column carried a JavaScript
+ * `number`, or was pre-serialized text that does not parse.
+ */
+export class DecimalSafeJsonError extends StoragePostgresError {
+  public constructor(
+    code: "ECONOMIC_JSON_NUMBER" | "ECONOMIC_JSON_MALFORMED",
+    message: string,
+    /** The column the document was bound for. */
+    public readonly field: string,
+    /** Path to the offending value inside the document, e.g. `.order.price`. */
+    public readonly path: string,
+    options?: { readonly cause?: unknown },
+  ) {
+    super(code, message, options);
+  }
+}
+
 /** A reservation named an account/environment/asset with no balance row. */
 export class UnknownBalanceError extends StoragePostgresError {}
 
@@ -128,11 +178,13 @@ export class MigrationChecksumMismatchError extends StoragePostgresError {
     public readonly version: string,
     public readonly recordedChecksum: string,
     public readonly actualChecksum: string,
+    /** Which half of the pair drifted. Both are verified before either runs. */
+    public readonly direction: "up" | "down" = "up",
   ) {
     super(
       "MIGRATION_CHECKSUM_MISMATCH",
-      `Migration ${version} was applied with checksum ${recordedChecksum} but now hashes to ${actualChecksum}. ` +
-        "An applied migration is immutable; add a new migration instead.",
+      `Migration ${version} was applied with ${direction} checksum ${recordedChecksum} but now hashes to ${actualChecksum}. ` +
+        "An applied migration and its rollback are immutable; add a new migration instead.",
     );
   }
 }
@@ -232,6 +284,12 @@ export function mapPostgresError(error: unknown): unknown {
     case STORAGE_SQL_STATES.fencingTokenNotMonotonic:
       return new FencingTokenNotMonotonicError(
         "FENCING_TOKEN_NOT_MONOTONIC",
+        pgError.message,
+        options,
+      );
+    case STORAGE_SQL_STATES.reservedAmountMismatch:
+      return new ReservedAmountMismatchError(
+        "RESERVED_AMOUNT_MISMATCH",
         pgError.message,
         options,
       );

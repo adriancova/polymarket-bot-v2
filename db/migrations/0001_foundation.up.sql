@@ -54,11 +54,20 @@ comment on function internal.uuid_generate_v7() is
 
 -- Every internal primary key is declared with this domain, so a non-sortable
 -- identifier cannot be inserted even by a caller that supplies its own id.
+--
+-- Both nibbles RFC 9562 pins are checked. The version nibble (character 15)
+-- must be 7, and the variant nibble (character 19+1 = 20, the first character
+-- of the fourth group) must be one of 8, 9, a, b — that is the two-bit RFC 4122
+-- variant prefix `10`. Checking only the version would accept
+-- `00000000-0000-7000-0000-000000000000`, which `isUuidV7()` in
+-- `packages/storage-postgres/src/ids.ts` rejects; a value the client calls
+-- invalid must not be storable.
 create domain internal.uuid_v7 as uuid
-  constraint uuid_v7_version check (substring(value::text from 15 for 1) = '7');
+  constraint uuid_v7_version check (substring(value::text from 15 for 1) = '7')
+  constraint uuid_v7_variant check (substring(value::text from 20 for 1) ~ '^[89ab]$');
 
 comment on domain internal.uuid_v7 is
-  'A UUID whose version nibble is 7 (time-ordered, sortable). §7.2, §10.7.';
+  'A UUID whose version nibble is 7 and whose variant nibble is 8/9/a/b (time-ordered, sortable). §7.2, §10.7.';
 
 -- ---------------------------------------------------------------------------
 -- Exact decimal boundary types (§7.3, §6 invariant 1)
@@ -452,11 +461,29 @@ as $$
 declare
   target_column text := tg_argv[0];
   element_type text := tg_argv[1];
+  column_value jsonb := to_jsonb(new) -> tg_argv[0];
   element text;
 begin
-  for element in
-    select jsonb_array_elements_text(to_jsonb(new) -> target_column)
+  if column_value is null or jsonb_typeof(column_value) = 'null' then
+    return new;
+  end if;
+
+  for element in select jsonb_array_elements_text(column_value)
   loop
+    -- A NULL element is not a member of the vocabulary: `null::internal.code`
+    -- casts without error, so the cast below cannot be trusted to reject it.
+    -- An unlabelled reason code or parameter kind would silently widen the
+    -- vocabulary the enum exists to close.
+    if element is null then
+      raise exception
+        using errcode = '23514',
+          message = format(
+            'column %I.%I.%I must not contain a NULL element',
+            tg_table_schema, tg_table_name, target_column
+          ),
+          hint = 'Every element names a value of the controlled vocabulary; omit the element instead.';
+    end if;
+
     -- `element_type` comes from the migration, never from data.
     execute format('select %L::%s', element, element_type);
   end loop;
@@ -465,7 +492,25 @@ end;
 $$;
 
 comment on function internal.assert_text_array_elements() is
-  'Checks each element of a text[] column against a type or domain named in the trigger arguments.';
+  'Checks each element of a text[] column against a type or domain named in the trigger arguments, and rejects NULL elements.';
+
+-- TRUNCATE is not an UPDATE or a DELETE, so no row-level guard sees it. A
+-- mutable table whose rows are still *facts* — a reservation, the projection a
+-- reservation constrains — therefore needs a statement-level guard of its own,
+-- or the row-level invariant can be emptied out from under itself.
+create function internal.forbid_truncate() returns trigger
+language plpgsql
+as $$
+begin
+  raise exception
+    using errcode = 'PMB01',
+      message = format('%I.%I may not be truncated', tg_table_schema, tg_table_name),
+      hint = 'Release or delete the rows individually, so the guards that depend on them run.';
+end;
+$$;
+
+comment on function internal.forbid_truncate() is
+  'Statement-level TRUNCATE guard for mutable tables whose rows other invariants depend on.';
 
 create function internal.set_updated_at() returns trigger
 language plpgsql

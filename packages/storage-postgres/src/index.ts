@@ -27,6 +27,7 @@
 export * from "./database.js";
 export * from "./errors.js";
 export * from "./ids.js";
+export * from "./json.js";
 export * from "./migrations/index.js";
 export * from "./pool.js";
 export * from "./repositories/index.js";

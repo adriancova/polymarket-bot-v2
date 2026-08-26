@@ -4,14 +4,20 @@
  * "Redis is not sufficient as the only fence. Use a PostgreSQL advisory lock or
  * lease with a monotonic fencing token persisted with every live submission."
  *
- * Three database facts do the work, and this repository only sequences them:
+ * Four database facts do the work, and this repository only sequences them:
  *
  *   * a partial unique index permits one ACTIVE lease per account and
- *     environment, so two live writers cannot both hold authority;
+ *     **execution realm**, so `LIVE`, `LIVE_MICRO`, and `EXECUTION_PROBE`
+ *     cannot each hold authority over one account at the same time — they all
+ *     submit real orders with the same venue credentials, and the venue cannot
+ *     tell two of our processes apart (ADR-008 §4);
+ *   * a CHECK rejects a lease in any simulated run mode outright: "paper mode
+ *     cannot acquire a live fencing lease at all" (ADR-008 §2, ADR-010);
  *   * a BEFORE INSERT trigger rejects a token that is not above every token ever
- *     issued for that account, so a token is never reused;
+ *     issued for that account and realm, so a token is never reused;
  *   * `execution.orders` and `execution.submission_attempts` carry a composite
- *     foreign key to `(lease, token)` plus a validity trigger.
+ *     foreign key to `(lease, token)` plus a validity trigger that judges expiry
+ *     by the database's own clock, under a row lock.
  *
  * A takeover is deliberately not free: it requires the incumbent lease to have
  * expired. ADR-008 — "Failover is not instant and must not be."
@@ -22,9 +28,14 @@ import { sql } from "kysely";
 
 import type { PolymarketBotDatabase } from "../database.js";
 import { inTransaction } from "../database.js";
-import { StoragePostgresError, withMappedErrors } from "../errors.js";
+import {
+  NonRealModeFencingLeaseError,
+  StoragePostgresError,
+  withMappedErrors,
+} from "../errors.js";
 import { uuidV7 } from "../ids.js";
 import type { Detail, Identifier, UuidV7Column } from "../schema/columns.js";
+import { executionRealm, isRealOrderRunMode } from "../schema/enums.js";
 import type { LeaseStatusValue, RunModeValue } from "../schema/enums.js";
 
 export type AcquireLeaseInput = {
@@ -78,14 +89,31 @@ export function createFencingRepository(db: PolymarketBotDatabase) {
     /**
      * Acquires the lease, allocating the next monotonic token.
      *
-     * A transaction-scoped advisory lock serializes acquisitions for one
-     * account, so two simultaneous callers cannot both read the same "highest
+     * A transaction-scoped advisory lock serializes acquisitions for one account
+     * and realm, so two simultaneous callers cannot both read the same "highest
      * token". The trigger would reject the loser anyway; the lock turns a
      * constraint violation into an ordinary wait.
+     *
+     * Everything here is scoped by **execution realm**, not by run mode: a
+     * `LIVE_MICRO` process taking over an account a `LIVE` process was fencing
+     * is a failover of the same real authority, so it must see the incumbent and
+     * continue the same token sequence rather than start a parallel one.
+     *
+     * @throws {NonRealModeFencingLeaseError} for any simulated run mode.
+     * @throws {LeaseHeldByAnotherHolderError} when an unexpired lease is held.
      */
     async acquireLease(input: AcquireLeaseInput): Promise<FencingLease> {
+      if (!isRealOrderRunMode(input.environment)) {
+        // ADR-008 §2 / ADR-010. The CHECK constraint enforces this; failing
+        // here as well means the caller gets a typed error naming the rule
+        // rather than a SQLSTATE it has to interpret.
+        throw new NonRealModeFencingLeaseError(input.environment, input.accountRef);
+      }
+
+      const realm = executionRealm(input.environment);
+
       return inTransaction(db, async (trx) => {
-        await sql`select pg_advisory_xact_lock(hashtext(${`fencing:${input.accountRef}:${input.environment}`}))`.execute(
+        await sql`select pg_advisory_xact_lock(hashtext(${`fencing:${input.accountRef}:${realm}`}))`.execute(
           trx,
         );
 
@@ -93,7 +121,7 @@ export function createFencingRepository(db: PolymarketBotDatabase) {
           .selectFrom("ops.fencing_leases")
           .select(["fencing_lease_id", "holder_id", "expires_at"])
           .where("account_ref", "=", input.accountRef)
-          .where("environment", "=", input.environment)
+          .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
           .where("status", "=", "ACTIVE")
           .executeTakeFirst();
 
@@ -106,6 +134,7 @@ export function createFencingRepository(db: PolymarketBotDatabase) {
               incumbent.expires_at,
             );
           }
+          // The lapse is recorded as a transition, not overwritten silently.
           await trx
             .updateTable("ops.fencing_leases")
             .set({
@@ -121,7 +150,7 @@ export function createFencingRepository(db: PolymarketBotDatabase) {
           .selectFrom("ops.fencing_leases")
           .select((eb) => eb.fn.max("fencing_token").as("highest_token"))
           .where("account_ref", "=", input.accountRef)
-          .where("environment", "=", input.environment)
+          .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
           .executeTakeFirst();
 
         const nextToken = (BigInt(highest?.highest_token ?? "0") + 1n).toString();
@@ -153,6 +182,11 @@ export function createFencingRepository(db: PolymarketBotDatabase) {
      * ADR-008 §4: the venue's heartbeat id rotates on every successful
      * response, so the current id is lease state — a failover either resumes
      * with it or bootstraps from empty.
+     *
+     * A lease whose expiry has already passed cannot be extended: ADR-008 §2
+     * says a process that lost the lease must stop heartbeating immediately, and
+     * an expired lease is lost whether or not anyone has relabelled the row.
+     * Reacquisition is the path back, and it allocates a new token.
      */
     async recordHeartbeat(input: {
       readonly fencingLeaseId: UuidV7Column;
@@ -171,10 +205,30 @@ export function createFencingRepository(db: PolymarketBotDatabase) {
           .where("fencing_lease_id", "=", input.fencingLeaseId)
           .where("holder_id", "=", input.holderId)
           .where("status", "=", "ACTIVE")
+          .where("expires_at", ">", sql<string>`now()`)
           .executeTakeFirst(),
       );
 
       return (result.numUpdatedRows ?? 0n) > 0n;
+    },
+
+    /**
+     * Moves lapsed ACTIVE leases into the EXPIRED state.
+     *
+     * Housekeeping, never a precondition for safety: the live-write trigger
+     * judges expiry by the database clock, so a lapsed lease authorizes nothing
+     * whether or not this has run. It exists so the recorded state machine
+     * matches reality for whoever reads the table.
+     *
+     * @returns how many leases were expired.
+     */
+    async expireStaleLeases(accountRef?: Identifier): Promise<number> {
+      const result = await withMappedErrors(async () =>
+        sql<{ expired: number }>`select ops.expire_stale_fencing_leases(${accountRef ?? null}) as expired`.execute(
+          db,
+        ),
+      );
+      return Number(result.rows[0]?.expired ?? 0);
     },
 
     /** Releases the lease. A released lease can never authorize a new order. */
@@ -196,7 +250,13 @@ export function createFencingRepository(db: PolymarketBotDatabase) {
       );
     },
 
-    /** The current ACTIVE lease for an account and environment, if any. */
+    /**
+     * The current *valid* lease for an account and environment, if any.
+     *
+     * ACTIVE and unexpired, judged by the database clock — an ACTIVE row whose
+     * expiry has passed authorizes nothing, so returning it would invite a
+     * caller to submit under it and be rejected by the trigger.
+     */
     async findActiveLease(
       accountRef: Identifier,
       environment: RunModeValue,
@@ -208,6 +268,7 @@ export function createFencingRepository(db: PolymarketBotDatabase) {
           .where("account_ref", "=", accountRef)
           .where("environment", "=", environment)
           .where("status", "=", "ACTIVE")
+          .where("expires_at", ">", sql<string>`now()`)
           .executeTakeFirst(),
       );
 

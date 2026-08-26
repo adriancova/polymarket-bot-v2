@@ -11,6 +11,14 @@
  * database (CHECK + composite foreign key + validity trigger), so this
  * repository simply passes the lease through; it cannot be bypassed by writing
  * around this code.
+ *
+ * `environment` and `account_ref` are **not** parameters of either write. The
+ * live-order fencing CHECK reads the row's own environment, so an order that
+ * named a LIVE plan while claiming `PAPER` used to be accepted with no fencing
+ * token at all. Both values are now read from the plan in the same statement
+ * that writes the row, and composite foreign keys reject any row whose
+ * discriminators disagree with the plan that authorized it — for every writer,
+ * not only for this one.
  */
 
 import type { DecimalString, IsoTimestamp, TokenId } from "@polymarket-bot/domain";
@@ -20,7 +28,15 @@ import type { PolymarketBotDatabase } from "../database.js";
 import { inTransaction } from "../database.js";
 import { withMappedErrors } from "../errors.js";
 import { uuidV7 } from "../ids.js";
-import type { Code, Detail, Identifier, JsonInput, UuidV7Column } from "../schema/columns.js";
+import { assertDecimalSafeJson } from "../json.js";
+import type {
+  Code,
+  DecimalSafeJsonInput,
+  Detail,
+  Identifier,
+  JsonInput,
+  UuidV7Column,
+} from "../schema/columns.js";
 import type {
   EventSourceValue,
   OrderSideValue,
@@ -39,10 +55,9 @@ export type FencingReference = {
 export type RecordSubmissionAttemptInput = {
   readonly executionGroupId: UuidV7Column;
   readonly planId: UuidV7Column;
-  readonly environment: RunModeValue;
-  readonly accountRef?: Identifier | null;
   readonly attemptOrdinal?: number;
-  readonly signedPayload: JsonInput;
+  /** The signed order document. Economic fields are decimal strings, never numbers. */
+  readonly signedPayload: DecimalSafeJsonInput;
   readonly salt: Identifier;
   readonly expectedOrderHash?: Identifier | null;
   readonly fencing?: FencingReference | null;
@@ -55,8 +70,6 @@ export type InsertOrderInput = {
   readonly submissionAttemptId?: UuidV7Column | null;
   readonly marketId: UuidV7Column;
   readonly tokenId: TokenId;
-  readonly environment: RunModeValue;
-  readonly accountRef?: Identifier | null;
   readonly side: OrderSideValue;
   readonly limitPrice: DecimalString;
   readonly originalShares: DecimalString;
@@ -67,6 +80,15 @@ export type InsertOrderInput = {
   readonly fencing?: FencingReference | null;
   readonly submittedAt?: IsoTimestamp | null;
 };
+
+/**
+ * Reads a column of the authorizing plan, inside the statement that writes the
+ * row. No round trip, so nothing can change between the read and the write, and
+ * no caller can supply a value that disagrees with the plan.
+ */
+function fromPlan<T>(planId: UuidV7Column, column: "environment" | "account_ref") {
+  return sql<T>`(select p.${sql.ref(column)} from execution.plans as p where p.plan_id = ${planId})`;
+}
 
 export type AppendOrderEventInput = {
   readonly orderId: UuidV7Column;
@@ -81,7 +103,8 @@ export type AppendOrderEventInput = {
   readonly remainingShares?: DecimalString | null;
   readonly reasonCode?: Code | null;
   readonly detail?: Detail | null;
-  readonly payload?: JsonInput | null;
+  /** Venue lifecycle detail; economic fields are decimal strings, never numbers. */
+  readonly payload?: DecimalSafeJsonInput | null;
   /** Set when the new state is terminal, so open-order queries stay cheap. */
   readonly terminal?: boolean;
 };
@@ -100,6 +123,7 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
      */
     async recordSubmissionAttempt(input: RecordSubmissionAttemptInput): Promise<UuidV7Column> {
       const submissionAttemptId = uuidV7();
+      assertDecimalSafeJson(input.signedPayload, "submission_attempts.signed_payload");
 
       await withMappedErrors(async () =>
         db
@@ -108,8 +132,8 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
             submission_attempt_id: submissionAttemptId,
             execution_group_id: input.executionGroupId,
             plan_id: input.planId,
-            environment: input.environment,
-            account_ref: input.accountRef ?? null,
+            environment: fromPlan<RunModeValue>(input.planId, "environment"),
+            account_ref: fromPlan<Identifier | null>(input.planId, "account_ref"),
             attempt_ordinal: input.attemptOrdinal ?? 1,
             fencing_lease_id: input.fencing?.fencingLeaseId ?? null,
             fencing_token: input.fencing?.fencingToken ?? null,
@@ -124,7 +148,15 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
       return submissionAttemptId;
     },
 
-    /** Marks an attempt's response, including the `SUBMISSION_UNKNOWN` case. */
+    /**
+     * Marks an attempt's response, including the `SUBMISSION_UNKNOWN` case.
+     *
+     * `responsePayload` is deliberately *not* decimal-guarded: it is the venue's
+     * own response, recorded as evidence for reconciliation (§6 invariant 6),
+     * and re-encoding it would make the record no longer what the venue sent.
+     * Nothing reads an economic value out of it — economics come from the fill
+     * and ledger tables, whose columns are canonical decimal text.
+     */
     async recordSubmissionResponse(input: {
       readonly submissionAttemptId: UuidV7Column;
       readonly state: SubmissionStateValue;
@@ -172,8 +204,8 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
             execution_group_id: input.executionGroupId ?? null,
             market_id: input.marketId,
             token_id: input.tokenId,
-            environment: input.environment,
-            account_ref: input.accountRef ?? null,
+            environment: fromPlan<RunModeValue>(input.planId, "environment"),
+            account_ref: fromPlan<Identifier | null>(input.planId, "account_ref"),
             side: input.side,
             limit_price: input.limitPrice,
             original_shares: input.originalShares,
@@ -199,6 +231,7 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
      */
     async appendOrderEvent(input: AppendOrderEventInput): Promise<UuidV7Column> {
       const orderEventId = uuidV7();
+      assertDecimalSafeJson(input.payload, "order_events.payload");
 
       await inTransaction(db, async (trx) => {
         const current = await trx
