@@ -21,7 +21,7 @@
     "dev:infra": "docker compose up -d",
     "dev:gateway": "node -e \"console.error('NOT IMPLEMENTED: the data gateway arrives with its owning work package.'); process.exit(1)\"",
     "dev:paper": "node -e \"console.error('NOT IMPLEMENTED: the paper trader arrives with its owning work package.'); process.exit(1)\"",
-    "ops:verify-venue": "node -e \"console.error('NOT IMPLEMENTED: venue verification tooling arrives with its owning work package.'); process.exit(1)\"",
+    "ops:verify-venue": "pnpm --filter @polymarket-bot/ops-cli run verify-venue",
     "ops:validate-dataset": "node -e \"console.error('NOT IMPLEMENTED: dataset validation arrives with its owning work package.'); process.exit(1)\""
   },
   "devDependencies": {

@@ -9,9 +9,14 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "verify-venue": "tsc && node ./dist/verify-venue/main.js"
   },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@polymarket-bot/decimal": "workspace:*",
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }

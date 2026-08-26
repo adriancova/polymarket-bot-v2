@@ -83,6 +83,42 @@ type, adding a new optional field under a new schema version, adding tests —
 still requires orchestrator approval and path ownership, but does not by itself
 reopen an accepted ADR ([`domain.md`](./domain.md) §9).
 
+### 3.1 Who owns a frozen package after its authoring package closes
+
+`WP-020` froze `packages/domain` and `packages/decimal` and then completed, so no
+standing work package owns those paths. That is deliberate, not an oversight, and
+it is **not** an answer of "nobody may touch them" — a defect in a frozen
+contract still has to be fixable.
+
+The answer, recorded here because Wave 0's architectural audit found it
+unwritten (finding M2, 2026-08-26): **a post-freeze change to a protected package
+is executed as an orchestrator-authorized bounded repair package.** Its shape is
+fixed:
+
+1. **A named, bounded scope.** The dispatch packet enumerates the findings to fix
+   and the allowed paths, and ratifies them per §5. No adjacent redesign, no
+   "while I was in there".
+2. **The §3 gate in full.** An accepted ADR covering the change (an existing one
+   if it already decides the point, a new one if it does not), orchestrator
+   approval, and an explicit statement of the **schema-version consequence for
+   recorded data** — including the statement "no emitted field set changed,
+   therefore `schemaVersion` is unchanged" when that is the case (ADR-002 §3).
+3. **An independent review gate.** The implementing agent may not review its own
+   repair (§6; `AGENTS.md`), and the handoff record lands before merge.
+4. **A handoff record** under `docs/handoffs/`, finding by finding.
+
+The `docs/handoffs/wave-0-closeout-remediation.md` package is the first instance
+and is the precedent to cite. It also fixes the boundaries of the mechanism: a
+comment-only clarification inside a frozen file (the C-1/U-1 markers in
+`packages/domain/src/events/book.ts`) is inside it — the change is verified
+comment-only by diff and bumps no version — while any change to a schema, a type,
+an emitted field set, or an arithmetic result is a contract change that needs its
+own ADR statement even inside such a package.
+
+A work package that *inherits* a protected path in its own `allowed_paths`
+(`WP-070` and later packets that extend the contracts) uses the ordinary route in
+§3 instead; this section is for the case where **no** package owns the path.
+
 ## 4. ADRs are themselves protected
 
 `docs/adr/**` is a protected path, so:
@@ -130,6 +166,7 @@ shape of conflict cites the earlier ratification rather than re-litigating it.
 | 2026-08-26 | `pnpm-lock.yaml` | `WP-020` | Adding the package's own declared dependencies mechanically updates the root lockfile; permitted **for that purpose only** (explicitly citing the `eslint.config.mjs` precedent) | future packages adding declared dependencies |
 | 2026-08-26 | `docs/handoffs/WP-020.md` | `WP-020` | In-repo handoff for pre-merge review (`WP-000` M4 precedent) | `WP-030` |
 | 2026-08-26 | `docs/handoffs/WP-030.md` | `WP-030` | Same (`WP-000`/`WP-010`/`WP-020` precedent) | future packages |
+| 2026-08-26 | An enumerated bounded set: `docs/adr/ADR-001*`, `docs/adr/ADR-002*`, both files in `docs/contracts/` named in §8.1, `packages/domain/src/events/book.ts` (**comment-only**), `packages/decimal/src/{tick,arithmetic,errors}.ts` + their tests, the single root `package.json` `ops:verify-venue` script line, `apps/ops-cli/package.json`, `apps/ops-cli/src/verify-venue/**`, `pnpm-lock.yaml` (mechanical only), `docs/handoffs/wave-0-closeout-remediation.md` | Wave 0 closeout remediation | The findings to repair sit in four protected surfaces that **no open work package owns** (`WP-020` and `WP-030` are both closed). Ratified in the dispatch packet, per §3.1, with the per-path narrowings stated in the packet itself | future bounded repair packages |
 
 Two lessons the precedents encode:
 
@@ -203,7 +240,7 @@ verification could not confirm. **None may be asserted as settled behavior.**
 
 | Item | Status | Report section | Owned by | Recorded in |
 | --- | --- | --- | --- | --- |
-| **C-1 / U-1** `price_change` absolute-size and zero-removal semantics | Documentation gap; handoff §23 assumption retained **provisionally** | §3, §11, §12 | `WP-070` must confirm before `WP-150` treats it as truth | ADR-002 §8; ADR-012 §5.8 |
+| **C-1 / U-1** `price_change` absolute-size and zero-removal semantics | Documentation gap; handoff §23 assumption retained **provisionally** | §3, §11, §12 | `WP-070` must confirm before `WP-150` treats it as truth | ADR-002 §8; ADR-012 §5.8; and — since 2026-08-26, closeout finding M2 — comment-only UNVERIFIED markers on the module header and the `size` field of `packages/domain/src/events/book.ts`, where an implementer actually reads the contract |
 | **C-2** USDC (fees page) vs pUSD (rebate/reward pages) denomination | **Unresolved** official-source inconsistency; report records both verbatim and picks neither | §6, §11 | `WP-200` and the fee/reward accounting work | ADR-006 §7 |
 | **C-3** `MATCHED_NOT_BROADCASTED` scope: docs list it on the user stream, SDK says REST-only | Modeled REST-only per §1.1 source precedence; **docs claim unresolved** | §4, §11 | `WP-280` must re-check | ADR-007 §12 |
 | **C-4** Review-claimed archived-SDK references on quickstart/overview | **Not reproduced** on re-check; recorded so the discrepancy is auditable | §11 | Re-check both pages at the next phase gate | — |
@@ -224,6 +261,26 @@ future work package needs a venue fact this register does not contain, it record
 a gap for the next verification round — it does not fetch and improvise
 (`AGENTS.md`).
 
+### 8.1 Open repository-internal items (not venue facts)
+
+Added 2026-08-26 by the Wave 0 closeout remediation. These are **our** open
+items, not the venue's: a duplication, an unratified inference, a dropped
+follow-up. They are registered here for the same reason as §8's venue items — an
+item nobody wrote down is an item nobody owns — but they are kept in a separate
+table so the venue-fact register stays a venue-fact register.
+
+| # | Item | Status | Owned by | Recorded in |
+| --- | --- | --- | --- | --- |
+| **R-1** | **The canonical-decimal grammar exists twice.** `apps/ops-cli/src/verify-venue/fixtures.ts` (`CANONICAL_DECIMAL_RE`, plus its own `[0, 1]` price predicate) and `packages/decimal/src/canonical.ts` (`CANONICAL_PATTERN`) independently implement handoff §7.3 / ADR-001 §2. The fixture catalog deliberately does not depend on the contract packages, so the duplication is not simply removable | **Open**, and now **pinned**: `apps/ops-cli/src/verify-venue/canonical-grammar.test.ts` asserts the two agree over a pinned vector table plus a systematic sweep, and asserts the single documented divergence (`packages/decimal` also enforces `MAX_DECIMAL_STRING_LENGTH`). Drift now fails a gate instead of surfacing as a wrong fixture verdict | Whichever package resolves **R-2**; until then, any change to either grammar updates both and keeps the test passing | ADR-001 §2; the test's module header |
+| **R-2** | **Hand-transcribed stand-in schemas are load-bearing.** `WP-000`'s `checks.ts` transcribes official SDK schemas by hand; a transcription error is a silent verification error. `WP-000` recorded the follow-up ("replace the contract-shaped stand-in schemas with generated or canonical domain schemas so hand transcription of the SDK is no longer load-bearing") against `WP-020`/`packages/domain`, where it lapsed when `WP-020` shipped without it | **Open**; revived here so it stops depending on a closed package's follow-up list | The **`WP-070`** packet, for the venue-adjacent schemas it owns; the orchestrator carries it into that packet's acceptance criteria | `docs/handoffs/WP-000.md` → `follow_up`; ADR-002 §7 |
+| **R-3** | **Inferred shapes recorded but never ratified.** `domain.md` §8 records the inferences behind the frozen contracts; §10 names which ADR ratified which. Four §8 rows appear in no ratifying ADR: `TokenId` = canonical unsigned integer string with no leading zeros; **UUIDs lowercase only**; incident `severity` = `LOG`/`NOTIFY`/`PAGE`; and event **payload field sets beyond §7.4's event-type names** (§7.4 lists types only, so the payload shapes are this repository's design) | **Open ratification items.** They are implemented and frozen, so this is a governance gap, not a code gap: each needs an ADR to accept it as decided, amend it, or record it as provisional | The next **ADR-modifying package**, or an orchestrator governance round, whichever comes first. `domain.md` is not edited for this: it already states the inferences "so review can challenge them" | `domain.md` §8, §10 |
+| **R-4** | **`verify-venue` wiring (report §15).** The frozen verification report's §15 recorded the wiring of `runVenueVerification()` into a CLI entry point and the root `ops:verify-venue` script as owed follow-up, in three numbered items | **DONE for items 2 and 3, and for item 1 in substance** (2026-08-26, closeout finding L11): `apps/ops-cli/src/verify-venue/main.ts` is the entry point, `apps/ops-cli` gains a `verify-venue` script, the root script runs it, and the command stays offline-only. `pnpm ops:verify-venue` runs offline and exits 0. **Residue:** §15 item 1 asks for the subcommand in `apps/ops-cli/src/index.ts`, which was outside the repair package's allowed paths; a dedicated entry module was used instead. Wiring a subcommand *router* in `index.ts` — once `ops-cli` has more than one command — is left to the owning package. Recorded **here** because the merged report is a frozen dated snapshot (§2) and is not edited to say so | Residue: the owning package for `apps/ops-cli/**` (`WP-330`, or an earlier authorized packet). The phase-gate re-verification (handoff §1.2) writes a **new** dated report and states its own §15 | `main.ts` module header; `docs/handoffs/wave-0-closeout-remediation.md` |
+
+Rule for this table: an entry leaves it only by being **done** (with the evidence
+named, as R-4 does) or by being **ratified** in an ADR — never by being quietly
+dropped when the package that raised it closes, which is exactly how R-2 was
+lost.
+
 ## 9. Fixture-only narrowings must not become runtime behavior
 
 The `WP-000` fixture catalog is deliberately stricter than the official SDK in
@@ -232,9 +289,12 @@ snapshot would be an invention. **A runtime parser that inherits that strictness
 rejects valid venue traffic.**
 
 The binding list lives in ADR-002 §7 and the underlying evidence in
-`docs/venue/verified-2026-08-24.md` §17 and §7.1. Summary of the rule:
+`docs/venue/verified-2026-08-24.md` §17 and §7.1. Summary of the rule — every
+item below is an obligation of the **adapter**, the component that owns the
+venue wire format:
 
-- Accept `null` wherever the SDK declares `.nullish()`.
+- Accept `null` wherever the SDK declares `.nullish()`, **and map it to absent
+  before the domain boundary**.
 - Accept any hex condition id `ConditionIdResponseSchema` accepts (no 31/32-byte
   bound at runtime).
 - Accept both the JSON-number and decimal-string forms for Gamma decimal fields
@@ -242,12 +302,38 @@ The binding list lives in ADR-002 §7 and the underlying evidence in
 - Treat `.default([])` arrays as absent-or-array — and note this is **not** a
   narrowing: an explicit `null` genuinely fails to parse there.
 - Treat the whole rewards block and its keys as optional.
+- Accept either trade-status spelling on either layer, every epoch-like form the
+  SDK accepts, and an unrecognized free-string `side`/`status` value as
+  first-class UNKNOWN (ADR-002 §7 states each with its `checks.ts` citation).
+
+**`packages/domain` is not the place any of this happens.** The frozen contracts
+are strict by decision (`domain.md` §3.2, §7): optional means the key may be
+absent, no venue-derived field is nullable (no schema uses `.nullable()`), and
+the boundary never coerces. The one place `null` is an accepted *value* is
+`ModelOutputValueSchema` (`DecimalString | string | boolean | null`), which the
+handoff §7.5 specifies literally — a strategy's own model output, not a venue
+wire value, and not an encoding of absence. An
+adapter that forwards a raw `null` — or a raw non-canonical decimal spelling —
+into a domain schema has skipped its own job; the typed parse failure is the
+intended outcome, not a contract defect.
+
+Wording correction (Wave 0 closeout finding H1, 2026-08-26): ADR-002 §7 and this
+section previously said a runtime parser **"and `packages/domain`"** must accept
+`null`, which contradicted ADR-001 §8.1 and the frozen code. Both are corrected
+in place per §4 ("Corrections of fact … are made in place and noted").
+`docs/venue/verified-2026-08-24.md` §17 carries the same phrasing and is **not**
+edited — a merged report is a frozen dated snapshot (§2). On this architectural
+point the report is **superseded by ADR-001 §8.1 and ADR-002 §7** under the
+handoff §1.1 authority order: the report governs venue facts (these fields are
+`.nullish()` and real traffic may carry `null` — unchanged and binding), the
+handoff and its ADRs govern which internal component absorbs them.
 
 ## 10. Quick reference: who may change what
 
 | Change | Needs |
 | --- | --- |
 | A contract in `packages/domain` or `packages/decimal` | Accepted ADR + orchestrator approval + schema-version consequence stated |
+| Anything in a frozen package when **no** work package owns the path | The bounded repair package of §3.1 (enumerated scope + the §3 gate + independent review + handoff) |
 | A new migration in `db/migrations/**` | Owning work package (`WP-040`+) + orchestrator approval; forward-only |
 | An accepted ADR's decision | A **new** ADR that supersedes it |
 | An accepted ADR's factual error | In-place correction, noted, with orchestrator approval |

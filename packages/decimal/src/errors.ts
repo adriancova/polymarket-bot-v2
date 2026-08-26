@@ -17,9 +17,29 @@ export type DecimalErrorCode =
   | "DECIMAL_MALFORMED"
   | "DECIMAL_NOT_CANONICAL"
   | "DECIMAL_OUT_OF_RANGE"
+  | "DECIMAL_INVALID_PRECISION"
   | "DECIMAL_DIVISION_BY_ZERO"
   | "DECIMAL_INEXACT"
   | "DECIMAL_INVALID_TICK";
+
+/**
+ * Which code each subclass may carry.
+ *
+ * Wave 0 closeout finding L9 found one site where a class and its code
+ * disagreed (`InvalidTickSizeError` thrown with `"DECIMAL_INEXACT"`), which
+ * defeats the whole point of a stable `code`: a caller that branches on the
+ * class and a metric that labels on the code would classify the same failure
+ * two different ways. The pairing is now stated here and asserted in
+ * `errors.test.ts`.
+ *
+ * | Class | Codes |
+ * | --- | --- |
+ * | `InvalidDecimalStringError` | every shape/grammar code (`DECIMAL_NOT_A_STRING` … `DECIMAL_NOT_CANONICAL`) |
+ * | `DecimalRangeError` | `DECIMAL_OUT_OF_RANGE`, `DECIMAL_INVALID_PRECISION` |
+ * | `DecimalDivisionByZeroError` | `DECIMAL_DIVISION_BY_ZERO` |
+ * | `DecimalInexactError` | `DECIMAL_INEXACT` |
+ * | `InvalidTickSizeError` | `DECIMAL_INVALID_TICK` |
+ */
 
 /** Base class for every error raised by `@polymarket-bot/decimal`. */
 export class DecimalError extends Error {
@@ -40,14 +60,44 @@ export class DecimalError extends Error {
  */
 export class InvalidDecimalStringError extends DecimalError {}
 
-/** The value parsed but violated a contextual range constraint (for example price in `[0, 1]`). */
+/**
+ * A numeric input violated a declared range.
+ *
+ * Two distinct codes ride on this class and callers should branch on the code,
+ * not only on the class:
+ *
+ * - `DECIMAL_OUT_OF_RANGE` — an *economic value* parsed as a canonical decimal
+ *   but breached a contextual constraint (for example a price outside `[0, 1]`).
+ *   This is a data fact about a venue value.
+ * - `DECIMAL_INVALID_PRECISION` — a *caller argument* was outside its permitted
+ *   range: `divDecimal`'s `precision` option must be an integer in
+ *   `[1, EXACT_PRECISION]`. This is a programming error in the caller, not a
+ *   statement about any decimal value, and in particular it is NOT an
+ *   inexactness (Wave 0 closeout finding L9: it previously raised
+ *   {@link DecimalInexactError}, which is documented to mean a result could not
+ *   be represented exactly and would have mislabeled a bad argument as a
+ *   precision loss).
+ */
 export class DecimalRangeError extends DecimalError {}
 
 /** Division by an exact zero divisor. */
 export class DecimalDivisionByZeroError extends DecimalError {}
 
-/** An operation could not be represented exactly (for example a non-terminating quotient). */
+/**
+ * An operation's RESULT could not be represented exactly — a non-terminating
+ * quotient, a result beyond the exact working precision, or a result longer
+ * than `MAX_DECIMAL_STRING_LENGTH` characters. Always carries
+ * `DECIMAL_INEXACT`.
+ *
+ * It never reports a malformed argument; those raise
+ * {@link InvalidDecimalStringError} or {@link DecimalRangeError}.
+ */
 export class DecimalInexactError extends DecimalError {}
 
-/** A tick size was zero, negative, or otherwise unusable for modulo conformance. */
+/**
+ * A tick size was zero, negative, or otherwise unusable for modulo conformance,
+ * or a value was not on the tick grid. Always carries `DECIMAL_INVALID_TICK`
+ * (Wave 0 closeout finding L9 fixed the one site that carried
+ * `DECIMAL_INEXACT`).
+ */
 export class InvalidTickSizeError extends DecimalError {}
