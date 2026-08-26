@@ -1,0 +1,177 @@
+# `@polymarket-bot/storage-postgres`
+
+Owner: `WP-040`
+Authority: `docs/spec/polymarket-bot-orchestrator-handoff.md` §10 (database
+model), §10.7 (required constraints), §10.8 (environment separation), §2 (`pg`
+plus a SQL-first typed query layer), §5.2 (dependency direction)
+Related ADRs: [ADR-006](../../docs/adr/ADR-006-actual-ledger-versus-virtual-allocation.md),
+[ADR-007](../../docs/adr/ADR-007-signed-order-idempotency-and-unknown-submissions.md),
+[ADR-008](../../docs/adr/ADR-008-live-writer-fencing-and-heartbeat-health-lease.md),
+[ADR-011](../../docs/adr/ADR-011-one-live-owner-per-market-policy.md)
+
+---
+
+## 1. What lives where
+
+| Path | Contents |
+| --- | --- |
+| `db/migrations/**` | Plain SQL, one forward and one rollback file per version |
+| `src/migrations` | The migration loader and runner |
+| `src/schema` | Kysely typed table definitions for every table |
+| `src/repositories` | Typed repositories for the shared records |
+| `src/testing` | Testcontainers helpers and fixtures (dev-only) |
+| `test/integration/postgres` | The integration suite (owned by this package's work) |
+
+## 2. Commands
+
+Root scripts are wired by the orchestrator at merge. Until then:
+
+```bash
+# Apply every pending migration (reads DATABASE_URL)
+pnpm --filter @polymarket-bot/storage-postgres db:migrate
+
+# Show applied/pending state
+pnpm --filter @polymarket-bot/storage-postgres db:migrate -- --status
+
+# Roll back (default one step)
+pnpm --filter @polymarket-bot/storage-postgres db:migrate -- --down --steps=1
+pnpm --filter @polymarket-bot/storage-postgres db:migrate -- --down --all
+
+# Integration suite (requires Docker; starts one throwaway PostgreSQL)
+pnpm --filter @polymarket-bot/storage-postgres test:integration
+```
+
+`db:migrate` compiles to `dist/` first: Node's type stripping cannot resolve the
+`.js` specifiers that `NodeNext` requires, so the CLI is built rather than run
+from source.
+
+## 3. The migration mechanism, and why it is plain SQL
+
+Every §10.7 constraint is DDL — domains, partial unique indexes, constraint
+triggers, deferred constraint triggers. A migration DSL would either fail to
+express them or would carry them as embedded SQL strings, adding a dependency
+that buys nothing and making the constraints harder to review. Kysely ships a
+migrator, but its migrations are TypeScript modules that must be compiled before
+they run, which would make `db:migrate` depend on a build of the very package
+that owns the schema.
+
+Runner properties:
+
+- **One writer.** A session advisory lock serializes concurrent runners.
+- **Atomic per migration.** Each migration and its bookkeeping row share one
+  transaction.
+- **Applied migrations are immutable.** The SHA-256 of the applied SQL is
+  recorded and re-checked; editing an applied migration is an error, not
+  something to reconcile.
+- **Rollback is symmetric.** `migrateDown` runs the recorded rollbacks newest
+  first. A full rollback leaves only `migrations.schema_migrations`.
+
+## 4. Schemas
+
+The six semantic schemas of §10 (`catalog`, `data`, `strategy`, `execution`,
+`accounting`, `ops`), plus two infrastructure schemas that hold no business
+records:
+
+- `internal` — shared domains, enumerations, and trigger functions.
+- `migrations` — the runner's bookkeeping table.
+
+## 5. Economic values are text, not `numeric`
+
+Prices, sizes, fees, balances, and PnL are stored as TEXT in the canonical
+decimal grammar of §7.3, behind PostgreSQL domains that reject every other
+spelling (`internal.decimal_string`, `internal.non_negative_decimal_string`,
+`internal.positive_decimal_string`, `internal.price_string`).
+
+`numeric` was rejected for storage because it accepts `1.50` and `1.5` as two
+spellings of one value and returns whichever scale it stored — which would break
+the "one value has exactly one representation" property that equality, unique
+constraints, and canonical hashes depend on (`docs/contracts/domain.md` §3.2).
+
+Constraint triggers still aggregate in `numeric` (`amount::numeric`), which is
+arbitrary-precision decimal. No value passes through a floating-point type
+anywhere in this package, and no repository signature accepts or returns a
+JavaScript `number` for an economic field.
+
+Timestamps cross the boundary as ISO-8601 strings, never as `Date`: connections
+run with `TimeZone=UTC` and `DateStyle=ISO`, and `src/timestamps.ts` converts
+exactly, throwing rather than guessing if a session was configured otherwise.
+
+## 6. How each §10.7 constraint is enforced
+
+| §10.7 requirement | Mechanism |
+| --- | --- |
+| UUIDv7 or equivalent sortable ids | `internal.uuid_v7` domain on every internal primary key; `internal.uuid_generate_v7()` server-side default; `uuidV7()` client-side |
+| `orders(venue_order_id)` unique where not null, scoped by environment/account | partial unique index `orders_venue_order_id_unique (environment, account_ref, venue_order_id)` |
+| fills unique on `(venue_trade_id, venue_order_id, allocation discriminator)` | `fills_venue_identity_unique`, additionally scoped by environment/account (§10.8) |
+| `submission_attempts(expected_order_hash)` unique where known | partial unique index `submission_attempts_expected_order_hash_unique` |
+| Immutable strategy configs and market rule versions | append-only triggers on `strategy.configs` and `catalog.market_rule_versions` |
+| Append-only event and ledger tables | `internal.forbid_update_delete()` on UPDATE, DELETE, and TRUNCATE |
+| Every live order references a valid fencing token | CHECK + composite foreign key to `(lease, token)` + `internal.assert_valid_fencing_reference()` |
+| Fill allocation sum equals fill quantity | immediate trigger (never exceed) + deferred constraint trigger (equal at COMMIT) |
+| Ledger transaction balances to zero per asset | deferred constraint trigger on both `ledger_transactions` and `ledger_entries` |
+| No negative available balance | `GENERATED ALWAYS` `available_amount` + `balance_projection_no_negative_available` CHECK, with `reserved_amount` maintained by a trigger on `inventory_reservations` |
+| One active live owner per market | partial unique index `market_ownership_one_active_live_owner` keyed by `(market_id, internal.execution_realm(environment))` |
+
+### 6.1 Append-only: triggers, not privileges
+
+Enforcement is by trigger because a privilege grant binds only non-owner roles.
+Migrations run as the table owner, and a superuser is unconstrained either way, so
+`REVOKE UPDATE, DELETE` would leave the exact writer that matters unconstrained.
+A `BEFORE UPDATE OR DELETE` trigger rejects the statement for every role.
+
+Revoking write privileges from a least-privilege application role is a
+complementary deployment control and is recommended:
+
+```sql
+-- Deployment-time hardening, not a substitute for the triggers.
+revoke update, delete on all tables in schema execution, accounting, ops from <app_role>;
+grant insert, select on all tables in schema execution, accounting, ops to <app_role>;
+grant update on
+  execution.orders, execution.submission_attempts,
+  accounting.balance_projection, accounting.inventory_reservations,
+  accounting.actual_position_projection, accounting.virtual_position_projection,
+  accounting.pnl_snapshots, accounting.wallet_operations,
+  catalog.markets, catalog.series, catalog.settlement_specs,
+  catalog.reference_instruments, data.raw_segments, data.data_quality_incidents,
+  strategy.instances, strategy.runs, strategy.market_ownership,
+  ops.fencing_leases, ops.incidents, ops.reconciliation_runs,
+  ops.reconciliation_breaks
+to <app_role>;
+```
+
+Role creation is a deployment concern and is deliberately not in a migration:
+roles are cluster-global, so creating them here would make one database's
+migration mutate state shared with every other database on the server.
+
+### 6.2 Enforced in the repository layer, not in the database
+
+One §10.7-adjacent property could not be expressed as a database constraint:
+
+- **A monotonic fencing token is allocated without a gap-free sequence.** The
+  monotonicity itself *is* a database constraint (`ops.assert_fencing_token_monotonic`
+  rejects any token that is not above every token ever issued for the account).
+  What the database cannot do alone is *choose* the next token; `acquireLease`
+  reads the maximum under a transaction-scoped advisory lock. Without the lock
+  two acquirers would read the same maximum and one would be rejected by the
+  trigger — correct, but as a constraint violation rather than a wait.
+
+Everything else in §10.7 is a database constraint.
+
+## 7. Environment separation (§10.8)
+
+One semantic model. Every environment-scoped row carries an `environment`
+discriminator over the six §11 run modes, and `internal.execution_realm()`
+groups them: `EXECUTION_PROBE`, `LIVE_MICRO`, and `LIVE` share the `REAL` realm,
+while `BACKTEST`, `PAPER`, and `SHADOW` each get their own. That is what lets a
+shadow instance own a market the live instance also owns without either blocking
+the other, while a `LIVE` and a `LIVE_MICRO` owner of one market still collide.
+
+Separating live operational storage from large backtest output is a deployment
+decision (a different connection or database), never a different model.
+
+## 8. Safety
+
+This package holds no credential, contacts no venue, and enables no run mode.
+`internal.run_mode` is a discriminator column, not an enablement mechanism
+(ADR-010). The integration suite's only credentials are the throwaway ones
+Testcontainers generates for a container that lives for the duration of the run.

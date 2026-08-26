@@ -1,0 +1,521 @@
+-- WP-040 / migration 0005 — `execution` schema (handoff §10.4).
+--
+-- | Table | Purpose |
+-- |---|---|
+-- | plans               | Immutable execution plans |
+-- | groups              | Slices or coordinated legs |
+-- | submission_attempts | Persisted signed payloads and uncertainty state |
+-- | orders              | Current order projection |
+-- | order_events        | Append-only order lifecycle |
+-- | intent_order_links  | Many-to-many attribution |
+-- | fills               | Deduplicated fill facts |
+-- | fill_allocations    | Actual fill ownership by virtual strategy |
+-- | trade_settlements   | Match-to-confirmation lifecycle |
+-- | rate_limit_snapshots| Observed budgets and headers |
+--
+-- The §9.10 execution hierarchy is a chain of foreign keys, so §6 invariant 4
+-- ("every fill is traceable") is structural:
+--   decision → intent → approved intent → plan → group → submission attempt
+--   → order → order event → fill → fill allocation → settlement event.
+
+create schema execution;
+
+comment on schema execution is
+  'Handoff §10.4: execution plans, submission attempts, orders and their append-only lifecycle, fills and allocations.';
+
+-- ---------------------------------------------------------------------------
+-- plans — immutable execution plans (§9.10)
+-- ---------------------------------------------------------------------------
+
+create table execution.plans (
+  plan_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
+  approved_intent_id internal.uuid_v7 not null
+    references strategy.approved_intents (approved_intent_id),
+  run_id internal.uuid_v7 not null references strategy.runs (run_id),
+  instance_id internal.uuid_v7 not null references strategy.instances (instance_id),
+  market_id internal.uuid_v7 not null references catalog.markets (market_id),
+  environment internal.run_mode not null,
+  account_ref internal.identifier,
+  token_id internal.token_id not null,
+  side internal.order_side not null,
+  liquidity_preference internal.liquidity_preference not null,
+  partial_fill_policy internal.partial_fill_policy not null,
+  planned_price internal.price_string,
+  planned_shares internal.positive_decimal_string not null,
+  minimum_fill_shares internal.non_negative_decimal_string,
+  slice_count integer not null default 1,
+  cancel_replace_threshold_ticks integer,
+  deadline_at timestamptz,
+  escalation_policy internal.detail,
+  -- §9.10 estimates, all canonical decimal strings.
+  estimated_fee internal.non_negative_decimal_string,
+  estimated_slippage internal.non_negative_decimal_string,
+  estimated_proceeds internal.decimal_string,
+  -- §6 invariant 9: a plan is priced against the parameters that were current.
+  parameters_version integer not null,
+  tick_size internal.positive_decimal_string not null,
+  fee_schedule_id internal.uuid_v7
+    references catalog.fee_schedule_snapshots (fee_schedule_id),
+  plan_hash internal.sha256_hex not null,
+  planned_at timestamptz not null default now(),
+  recorded_at timestamptz not null default now(),
+  constraint plans_slice_count_positive check (slice_count >= 1),
+  constraint plans_threshold_non_negative check (
+    cancel_replace_threshold_ticks is null or cancel_replace_threshold_ticks >= 0
+  ),
+  constraint plans_parameters_version_fk
+    foreign key (market_id, parameters_version)
+    references catalog.market_parameter_history (market_id, parameters_version),
+  constraint plans_real_mode_has_account check (
+    not internal.is_real_order_mode(environment) or account_ref is not null
+  )
+);
+
+create index plans_market_idx on execution.plans (market_id, planned_at desc);
+create index plans_run_idx on execution.plans (run_id, planned_at desc);
+
+-- §10.4: "Immutable execution plans."
+call internal.enforce_append_only('execution', 'plans');
+
+-- ---------------------------------------------------------------------------
+-- groups — slices or coordinated legs
+-- ---------------------------------------------------------------------------
+
+create table execution.groups (
+  execution_group_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
+  plan_id internal.uuid_v7 not null references execution.plans (plan_id),
+  group_ordinal integer not null,
+  group_kind internal.execution_group_kind not null,
+  token_id internal.token_id not null,
+  side internal.order_side not null,
+  limit_price internal.price_string not null,
+  shares internal.positive_decimal_string not null,
+  release_after_group_id internal.uuid_v7 references execution.groups (execution_group_id),
+  leg_risk_limit internal.non_negative_decimal_string,
+  recorded_at timestamptz not null default now(),
+  constraint groups_ordinal_unique unique (plan_id, group_ordinal),
+  constraint groups_ordinal_non_negative check (group_ordinal >= 0)
+);
+
+call internal.enforce_append_only('execution', 'groups');
+
+-- ---------------------------------------------------------------------------
+-- submission_attempts — persisted signed payloads and uncertainty state
+-- ---------------------------------------------------------------------------
+--
+-- §9.11 idempotent submission protocol; §6 invariant 6: "Unknown submission
+-- state is never treated as rejection. Reconcile using the persisted signed
+-- order/order hash before any retry with a new salt."
+
+create table execution.submission_attempts (
+  submission_attempt_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
+  execution_group_id internal.uuid_v7 not null
+    references execution.groups (execution_group_id),
+  plan_id internal.uuid_v7 not null references execution.plans (plan_id),
+  environment internal.run_mode not null,
+  account_ref internal.identifier,
+  attempt_ordinal integer not null default 1,
+  -- ADR-008: a live submission is persisted with the fencing token that
+  -- authorized it. The referential constraint is added in migration 0008,
+  -- once ops.fencing_leases exists.
+  fencing_lease_id internal.uuid_v7,
+  fencing_token bigint,
+  signed_payload jsonb not null,
+  salt internal.identifier not null,
+  -- §10.7: unique where known. NULL means "the venue identity is not yet known",
+  -- which is exactly the state §6 invariant 6 forbids treating as a rejection.
+  expected_order_hash internal.identifier,
+  state internal.submission_state not null default 'SIGNED',
+  request_sent_at timestamptz,
+  response_received_at timestamptz,
+  response_status internal.code,
+  response_payload jsonb,
+  venue_order_id internal.identifier,
+  error_code internal.code,
+  error_detail internal.detail,
+  signed_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint submission_attempts_ordinal_unique
+    unique (execution_group_id, attempt_ordinal),
+  constraint submission_attempts_ordinal_positive check (attempt_ordinal >= 1),
+  constraint submission_attempts_real_mode_has_account check (
+    not internal.is_real_order_mode(environment) or account_ref is not null
+  )
+);
+
+-- §10.7: `submission_attempts(expected_order_hash)` unique where known.
+create unique index submission_attempts_expected_order_hash_unique
+  on execution.submission_attempts (expected_order_hash)
+  where expected_order_hash is not null;
+
+create index submission_attempts_unknown_idx
+  on execution.submission_attempts (state, signed_at)
+  where state in ('SUBMISSION_UNKNOWN', 'RECONCILING');
+
+create trigger submission_attempts_set_updated_at
+  before update on execution.submission_attempts
+  for each row execute function internal.set_updated_at();
+
+-- §9.11 step 10: "Never create a new salt until the prior attempt is
+-- authoritatively absent, canceled, or terminal." The signed identity of an
+-- attempt is therefore immutable; a new salt means a new attempt row.
+create trigger submission_attempts_immutable_signature
+  before update on execution.submission_attempts
+  for each row execute function internal.forbid_column_change(
+    'submission_attempt_id', 'execution_group_id', 'plan_id', 'environment',
+    'account_ref', 'attempt_ordinal', 'signed_payload', 'salt',
+    'fencing_lease_id', 'fencing_token'
+  );
+
+-- ---------------------------------------------------------------------------
+-- orders — current order projection (mutable; the history is order_events)
+-- ---------------------------------------------------------------------------
+
+create table execution.orders (
+  order_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
+  submission_attempt_id internal.uuid_v7
+    references execution.submission_attempts (submission_attempt_id),
+  plan_id internal.uuid_v7 not null references execution.plans (plan_id),
+  execution_group_id internal.uuid_v7 references execution.groups (execution_group_id),
+  market_id internal.uuid_v7 not null references catalog.markets (market_id),
+  token_id internal.token_id not null,
+  environment internal.run_mode not null,
+  account_ref internal.identifier,
+  side internal.order_side not null,
+  limit_price internal.price_string not null,
+  original_shares internal.positive_decimal_string not null,
+  filled_shares internal.non_negative_decimal_string not null default '0',
+  state internal.order_state not null default 'PLANNED',
+  venue_order_id internal.identifier,
+  venue_order_hash internal.identifier,
+  -- §10.7 / ADR-008 §1: "Every live order references a valid fencing token."
+  -- The composite foreign key and the validity trigger are added in migration
+  -- 0008, once ops.fencing_leases exists.
+  fencing_lease_id internal.uuid_v7,
+  fencing_token bigint,
+  submitted_at timestamptz,
+  last_event_at timestamptz,
+  terminal_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  -- §6 invariant 10: partial fills are first-class, and a fill can never exceed
+  -- the order. The comparison is exact: `numeric` is arbitrary-precision
+  -- decimal, never binary floating point.
+  constraint orders_filled_within_original check (
+    filled_shares::numeric <= original_shares::numeric
+  ),
+  constraint orders_fencing_pair_complete check (
+    (fencing_lease_id is null) = (fencing_token is null)
+  ),
+  constraint orders_real_mode_has_account check (
+    not internal.is_real_order_mode(environment) or account_ref is not null
+  )
+);
+
+-- §10.7: `orders(venue_order_id)` unique where not null, scoped by
+-- environment/account.
+create unique index orders_venue_order_id_unique
+  on execution.orders (environment, account_ref, venue_order_id)
+  where venue_order_id is not null;
+
+create index orders_market_state_idx on execution.orders (market_id, state);
+create index orders_open_idx
+  on execution.orders (environment, account_ref, state)
+  where terminal_at is null;
+
+create trigger orders_set_updated_at
+  before update on execution.orders
+  for each row execute function internal.set_updated_at();
+
+-- The order's identity, economics, and fencing authority are fixed at creation;
+-- only lifecycle state, venue identifiers, and fill progress move.
+create trigger orders_immutable_identity
+  before update on execution.orders
+  for each row execute function internal.forbid_column_change(
+    'order_id', 'plan_id', 'market_id', 'token_id', 'environment', 'account_ref',
+    'side', 'limit_price', 'original_shares', 'fencing_lease_id', 'fencing_token'
+  );
+
+-- ---------------------------------------------------------------------------
+-- order_events — append-only order lifecycle (§10.7)
+-- ---------------------------------------------------------------------------
+
+create table execution.order_events (
+  order_event_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
+  order_id internal.uuid_v7 not null references execution.orders (order_id),
+  event_ordinal bigint not null,
+  event_type internal.code not null,
+  previous_state internal.order_state,
+  new_state internal.order_state not null,
+  venue_order_id internal.identifier,
+  venue_event_id internal.identifier,
+  shares_delta internal.decimal_string,
+  filled_shares internal.non_negative_decimal_string,
+  remaining_shares internal.non_negative_decimal_string,
+  reason_code internal.code,
+  detail internal.detail,
+  payload jsonb,
+  source internal.event_source not null,
+  occurred_at timestamptz not null,
+  recorded_at timestamptz not null default now(),
+  constraint order_events_ordinal_unique unique (order_id, event_ordinal),
+  constraint order_events_ordinal_non_negative check (event_ordinal >= 0)
+);
+
+create index order_events_order_idx on execution.order_events (order_id, event_ordinal);
+
+call internal.enforce_append_only('execution', 'order_events');
+
+-- ---------------------------------------------------------------------------
+-- intent_order_links — many-to-many attribution (§9.10, ADR-006 §4)
+-- ---------------------------------------------------------------------------
+
+create table execution.intent_order_links (
+  intent_order_link_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
+  intent_id internal.uuid_v7 not null references strategy.intents (intent_id),
+  approved_intent_id internal.uuid_v7 references strategy.approved_intents (approved_intent_id),
+  order_id internal.uuid_v7 not null references execution.orders (order_id),
+  attributed_shares internal.positive_decimal_string,
+  recorded_at timestamptz not null default now(),
+  constraint intent_order_links_unique unique (intent_id, order_id)
+);
+
+create index intent_order_links_order_idx on execution.intent_order_links (order_id);
+
+call internal.enforce_append_only('execution', 'intent_order_links');
+
+-- ---------------------------------------------------------------------------
+-- fills — deduplicated fill facts (§10.7 uniqueness)
+-- ---------------------------------------------------------------------------
+
+create table execution.fills (
+  fill_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
+  order_id internal.uuid_v7 not null references execution.orders (order_id),
+  market_id internal.uuid_v7 not null references catalog.markets (market_id),
+  token_id internal.token_id not null,
+  environment internal.run_mode not null,
+  account_ref internal.identifier,
+  venue_trade_id internal.identifier not null,
+  venue_order_id internal.identifier not null,
+  -- §10.7 names an "allocation discriminator" in the fill uniqueness key: one
+  -- venue trade can be reported as several distinct fill facts against one
+  -- order. Its default is '0' so a venue that reports one fact per trade needs
+  -- no synthetic value.
+  allocation_discriminator internal.identifier not null default '0',
+  side internal.order_side not null,
+  shares internal.positive_decimal_string not null,
+  price internal.price_string not null,
+  notional internal.non_negative_decimal_string not null,
+  fee_amount internal.non_negative_decimal_string not null default '0',
+  fee_asset internal.identifier,
+  liquidity_role internal.liquidity_role not null,
+  matched_at timestamptz not null,
+  recorded_at timestamptz not null default now(),
+  -- §10.7: fills(venue_trade_id, venue_order_id, allocation discriminator)
+  -- unique. Scoped by environment/account for the same §10.8 reason orders are:
+  -- a replayed or simulated fill must never collide with a live one.
+  constraint fills_venue_identity_unique unique (
+    environment, account_ref, venue_trade_id, venue_order_id, allocation_discriminator
+  ),
+  constraint fills_fee_asset_present check (fee_amount = '0' or fee_asset is not null)
+);
+
+create index fills_order_idx on execution.fills (order_id, matched_at);
+create index fills_market_idx on execution.fills (market_id, matched_at desc);
+
+call internal.enforce_append_only('execution', 'fills');
+
+-- ---------------------------------------------------------------------------
+-- fill_allocations — actual fill ownership by virtual strategy (ADR-006 §4)
+-- ---------------------------------------------------------------------------
+--
+-- §10.7: "Every fill allocation sum equals the actual fill quantity."
+-- §6 invariant 7: activity with no attribution goes to UNATTRIBUTED — so the
+-- sum can always be closed, and a missing attribution is recorded rather than
+-- silently dropped.
+
+create table execution.fill_allocations (
+  fill_allocation_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
+  fill_id internal.uuid_v7 not null references execution.fills (fill_id),
+  scope internal.ledger_scope not null,
+  instance_id internal.uuid_v7 references strategy.instances (instance_id),
+  run_id internal.uuid_v7 references strategy.runs (run_id),
+  allocated_shares internal.positive_decimal_string not null,
+  allocated_notional internal.non_negative_decimal_string,
+  allocated_fee internal.non_negative_decimal_string,
+  recorded_at timestamptz not null default now(),
+  -- ADR-006 §2: attribution is a partition of a real fill, so only the two
+  -- attribution scopes may own one.
+  constraint fill_allocations_scope_is_attribution check (
+    scope in ('VIRTUAL_STRATEGY', 'UNATTRIBUTED')
+  ),
+  constraint fill_allocations_instance_matches_scope check (
+    (scope = 'VIRTUAL_STRATEGY') = (instance_id is not null)
+  ),
+  constraint fill_allocations_owner_unique unique nulls not distinct (fill_id, scope, instance_id)
+);
+
+create index fill_allocations_fill_idx on execution.fill_allocations (fill_id);
+create index fill_allocations_instance_idx on execution.fill_allocations (instance_id);
+
+call internal.enforce_append_only('execution', 'fill_allocations');
+
+-- ---------------------------------------------------------------------------
+-- trade_settlements — match-to-confirmation lifecycle (§6 invariant 5)
+-- ---------------------------------------------------------------------------
+--
+-- "Order state and settlement state are separate. A match is not the same as
+-- confirmed on-chain settlement." This is an append-only lifecycle log, so the
+-- current settlement state of a fill is its highest ordinal, and a FAILED
+-- settlement is a recorded transition rather than an erased one.
+
+create table execution.trade_settlements (
+  trade_settlement_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
+  fill_id internal.uuid_v7 not null references execution.fills (fill_id),
+  state_ordinal integer not null,
+  previous_state internal.trade_settlement_state,
+  state internal.trade_settlement_state not null,
+  venue_trade_id internal.identifier not null,
+  transaction_hash internal.identifier,
+  block_number bigint,
+  detail internal.detail,
+  observed_at timestamptz not null,
+  recorded_at timestamptz not null default now(),
+  constraint trade_settlements_ordinal_unique unique (fill_id, state_ordinal),
+  constraint trade_settlements_ordinal_non_negative check (state_ordinal >= 0)
+);
+
+create index trade_settlements_fill_idx on execution.trade_settlements (fill_id, state_ordinal);
+
+call internal.enforce_append_only('execution', 'trade_settlements');
+
+-- ---------------------------------------------------------------------------
+-- rate_limit_snapshots — observed budgets and headers (§9.13)
+-- ---------------------------------------------------------------------------
+
+create table execution.rate_limit_snapshots (
+  rate_limit_snapshot_id internal.uuid_v7 primary key default internal.uuid_generate_v7(),
+  bucket_kind internal.rate_limit_bucket_kind not null,
+  bucket_key internal.identifier not null,
+  endpoint_class internal.code,
+  environment internal.run_mode not null,
+  account_ref internal.identifier,
+  observed_limit integer,
+  observed_remaining integer,
+  observed_cost integer,
+  reset_at timestamptz,
+  warning_header internal.detail,
+  headers jsonb not null default '{}'::jsonb,
+  source internal.event_source not null,
+  observed_at timestamptz not null,
+  recorded_at timestamptz not null default now(),
+  constraint rate_limit_snapshots_non_negative check (
+    (observed_limit is null or observed_limit >= 0)
+    and (observed_remaining is null or observed_remaining >= 0)
+    and (observed_cost is null or observed_cost >= 0)
+  )
+);
+
+create index rate_limit_snapshots_bucket_idx
+  on execution.rate_limit_snapshots (bucket_kind, bucket_key, observed_at desc);
+
+call internal.enforce_append_only('execution', 'rate_limit_snapshots');
+
+-- ---------------------------------------------------------------------------
+-- §10.7: "Every fill allocation sum equals the actual fill quantity."
+-- ---------------------------------------------------------------------------
+--
+-- Two checks, because they answer two different questions:
+--
+--   1. IMMEDIATE — an allocation may never push the allocated total above the
+--      fill quantity. This fires on the offending statement, so the caller
+--      learns which insert was wrong.
+--   2. DEFERRED — at COMMIT the total must equal the fill quantity exactly, so
+--      a fill cannot be recorded with a partial or missing attribution. §6
+--      invariant 7 makes this always satisfiable: an unattributable share is
+--      allocated to UNATTRIBUTED (and halts the market), never left unassigned.
+
+create function execution.assert_fill_allocation_within_fill() returns trigger
+language plpgsql
+as $$
+declare
+  fill_shares numeric;
+  allocated numeric;
+begin
+  -- FOR UPDATE serializes concurrent allocators of one fill. Without it two
+  -- transactions could each read a stale total and both pass the check.
+  select f.shares::numeric into fill_shares
+  from execution.fills as f
+  where f.fill_id = new.fill_id
+  for update;
+
+  select coalesce(sum(a.allocated_shares::numeric), 0) into allocated
+  from execution.fill_allocations as a
+  where a.fill_id = new.fill_id;
+
+  if allocated > fill_shares then
+    raise exception
+      using errcode = 'PMB03',
+        message = format(
+          'fill allocation total %s exceeds fill quantity %s for fill %s',
+          allocated, fill_shares, new.fill_id
+        ),
+        hint = 'A fill allocation is a partition of the actual fill (§10.7, ADR-006 §4).';
+  end if;
+
+  return null;
+end;
+$$;
+
+create trigger fill_allocations_within_fill
+  after insert on execution.fill_allocations
+  for each row execute function execution.assert_fill_allocation_within_fill();
+
+create function execution.assert_fill_fully_allocated() returns trigger
+language plpgsql
+as $$
+declare
+  -- Both trigger tables carry `fill_id`, so one function serves both.
+  target_fill_id uuid := new.fill_id;
+  fill_shares numeric;
+  allocated numeric;
+begin
+  select f.shares::numeric into fill_shares
+  from execution.fills as f
+  where f.fill_id = target_fill_id
+  for update;
+
+  if fill_shares is null then
+    return null;
+  end if;
+
+  select coalesce(sum(a.allocated_shares::numeric), 0) into allocated
+  from execution.fill_allocations as a
+  where a.fill_id = target_fill_id;
+
+  if allocated <> fill_shares then
+    raise exception
+      using errcode = 'PMB04',
+        message = format(
+          'fill %s is allocated %s of %s shares',
+          target_fill_id, allocated, fill_shares
+        ),
+        hint = 'Allocate the remainder, to UNATTRIBUTED if the owner is unknown (§6 invariant 7).';
+  end if;
+
+  return null;
+end;
+$$;
+
+-- Deferred to COMMIT so a fill and its allocations may be written in any order
+-- inside one transaction — but not across transactions.
+create constraint trigger fills_fully_allocated
+  after insert on execution.fills
+  deferrable initially deferred
+  for each row execute function execution.assert_fill_fully_allocated();
+
+create constraint trigger fill_allocations_close_fill
+  after insert on execution.fill_allocations
+  deferrable initially deferred
+  for each row execute function execution.assert_fill_fully_allocated();
