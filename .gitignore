@@ -30,6 +30,7 @@ tmp/
 
 # Claude local-only settings
 .claude/settings.local.json
+.claude/worktrees/
 CLAUDE.local.md
 
 # Editors and OS

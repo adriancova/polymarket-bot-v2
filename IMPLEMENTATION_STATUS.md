@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-08-24  
+Last updated: 2026-08-26  
 Specification version: 2.0.0  
 Current phase: `phase-0` — repository and venue verification  
 Maximum permitted run mode: `PAPER`
@@ -19,7 +19,7 @@ Maximum permitted run mode: `PAPER`
 
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
-| `WP-000`               | In remediation | None         | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
+| `WP-000`               | In review (round 3) | None    | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Ready    | `WP-010` ✓         | Unassigned |
 | `WP-030`               | Blocked  | `WP-000`, `WP-020` | —          |
@@ -42,8 +42,13 @@ Maximum permitted run mode: `PAPER`
   **CHANGES REQUIRED** (raw user-trade schema fidelity vs official SDK, recursive
   nested validation, report-evidence enforcement, canonical-decimal rules, credential
   header names, clob-client-v2 doc conflict, in-repo handoff). Remediation round 2
-  dispatched. `docs/handoffs/WP-000.md` ratified into WP-000 allowed paths (M4).
-  Not merged.
+  completed in `f8ecdbb`; structured handoff record committed as `30e6f47` (branch
+  HEAD, third candidate). `docs/handoffs/WP-000.md` ratified into WP-000 allowed
+  paths (M4). Orchestrator re-verification (2026-08-26): all 24 changed files vs
+  base `7faf30f` inside allowed paths; install/typecheck/lint/test reproduced in
+  the worktree at `30e6f47` — 124/124 tests pass; handoff record complete.
+  Independent adversarial review round 3 (fresh Codex session, candidate `30e6f47`
+  vs base `7faf30f`) dispatched 2026-08-26 — verdict pending. Not merged.
 
 ### WP-000 in-flight record (2026-08-24)
 
