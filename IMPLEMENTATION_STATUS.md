@@ -22,7 +22,7 @@ Maximum permitted run mode: `PAPER`
 | `WP-000`               | Complete | None               | Merged `d427f00` (impl chain `8d16849`→…→`ddc56ff`, 6 review rounds) |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
-| `WP-030`               | In review (round 1) | `WP-000` ✓, `WP-020` ✓ | `wp-implementer` on branch `worktree-agent-a919f38ed969c8ffc` |
+| `WP-030`               | In remediation (round 1) | `WP-000` ✓, `WP-020` ✓ | `wp-implementer` on branch `worktree-agent-a919f38ed969c8ffc` |
 | All remaining packages | Blocked  | See work plan      | —          |
 
 ### WP-000 completion record (2026-08-26)
@@ -97,9 +97,20 @@ Maximum permitted run mode: `PAPER`
   domain.md §10 cross-reference, docs/handoffs/WP-030.md. Implementer session was
   interrupted once by an API session limit and resumed with context intact.
   Orchestrator verified: 17 files all in allowed paths, domain.md diff purely
-  additive, gates reproduced (1102/1102). Review round 1 (candidate `1e30ff1` vs
-  `f7ccb8e`) dispatched 2026-08-26 with citation-accuracy sampling mandated —
-  verdict pending. Not merged.
+  additive, gates reproduced (1102/1102). Review round 1 (Codex session
+  `01a03eb9-6992-76a2-9f02-ca351bf7cbc8`, candidate `1e30ff1` vs `f7ccb8e`):
+  **CHANGES REQUIRED** — 0 blocker/high, 2 medium (citation-accuracy sample 26
+  checked / 5 failed: taker-rebate "pool-shared, midnight UTC" generalization in
+  ADR-006+ADR-012; ADR-011 deterministic loser-cancel-fails and account-level
+  self-trade assertions beyond report evidence; ADR-004 "every feed JSON"
+  overreach vs Binance/Coinbase + PING/PONG; dependency-layer contract
+  internally inconsistent: event-bus in layers 1 and 2, same-layer ban would
+  forbid strategy-runtime→strategy-sdk, layer CI unimplementable as written),
+  1 low (handoff file-count 16 vs actual 17), notes (normalize one ADR
+  cross-reference). All four flagged inferences RATIFIED; README/domain.md §10
+  deviations ACCEPTED; three-part CI concept sound pending layer-model fix;
+  deferred backlog fully covered; safety defaults PASS. Remediation round 1
+  dispatched 2026-08-26. Not merged.
 
 - `worktree-agent-a45b4929f044830ca` (WP-020): base `4c1d96f`, first candidate `815b6cb`
   (chain `e7844c9`→`815b6cb`). Implementer handoff `docs/handoffs/WP-020.md` (in worktree);
