@@ -19,7 +19,7 @@ Maximum permitted run mode: `PAPER`
 
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
-| `WP-000`               | In review (round 4) | None    | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
+| `WP-000`               | In remediation (round 4) | None | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
 | `WP-020`               | In remediation (round 1) | `WP-010` ✓ | `wp-implementer` on branch `worktree-agent-a45b4929f044830ca` |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Ready    | `WP-010` ✓         | Unassigned |
@@ -87,8 +87,19 @@ Maximum permitted run mode: `PAPER`
   `worktree-agent-a373c7ba6650bf1a9` onto it; gates reproduced by orchestrator.
   Venue-fact conflict recorded: review's `POLYMARKET_BUILDER_API_KEY` not found on
   2026-08-26 official pages; verified names are `POLY_BUILDER_API_KEY` and
-  `POLYMARKET_BUILDER_CODE`. Review round 4 dispatched 2026-08-26 — verdict
-  pending. Not merged.
+  `POLYMARKET_BUILDER_CODE`. Review round 4 (Codex session
+  `01a03d29-c533-7fc3-a180-d6995aa359c8`, candidate `5b98b5e` vs `7faf30f`):
+  **CHANGES REQUIRED** — 0 blocker, 1 high (HIGH-2 continuation: `validateObjectSpec`
+  skips null/undefined map entries; RTDS `filters` wrongly mandatory vs official TWAP
+  docs; `TransactionOutcome.transactionId` and `clobRewards[].endDate` wrongly
+  non-nullable vs official docs), 1 medium (round-3 credential reconciliation itself
+  wrong: `POLYMARKET_BUILDER_API_KEY` IS on the official migration page; source
+  attributions to /builders/api-keys incorrect), 1 low (catalog guard not recursive).
+  Round-3 items HIGH-1/HIGH-3/MEDIUM-1/LOW-1/LOW-2 confirmed resolved. Deviation
+  judgments: canonicalized fee strings acceptable as normalized data (raw-wire caveat
+  required); added SDK sources beneficial; synthetic-completed fixtures must stay
+  labeled; mutation-check claim not comprehensive. Remediation round 4 dispatched
+  2026-08-26. Not merged.
 
 ### WP-000 in-flight record (2026-08-24)
 
