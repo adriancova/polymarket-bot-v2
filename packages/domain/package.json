@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Contract content is owned by WP-020; this scaffold intentionally contains no contracts.",
+  "description": "Frozen versioned domain contracts: event envelopes, identifiers, decimal boundary types, normalized market events, decisions, intents, and run modes (WP-020).",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
@@ -11,7 +11,13 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "zod": "^4.4.3"
+  },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "fast-check": "^4.9.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }
