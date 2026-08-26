@@ -20,9 +20,8 @@ Maximum permitted run mode: `PAPER`
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
 | `WP-000`               | In remediation (round 4) | None | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
-| `WP-020`               | In review (round 2) | `WP-010` ✓ | `wp-implementer` on branch `worktree-agent-a45b4929f044830ca` |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
-| `WP-020`               | Ready    | `WP-010` ✓         | Unassigned |
+| `WP-020`               | In remediation (round 2) | `WP-010` ✓ | `wp-implementer` on branch `worktree-agent-a45b4929f044830ca` |
 | `WP-030`               | Blocked  | `WP-000`, `WP-020` | —          |
 | All remaining packages | Blocked  | See work plan      | —          |
 
@@ -60,7 +59,19 @@ Maximum permitted run mode: `PAPER`
   Repair agent was git-isolated from the original worktree (same as WP-000 r3);
   committed on its own branch and the orchestrator fast-forwarded
   `worktree-agent-a45b4929f044830ca` to `9790e0a`; gates reproduced by orchestrator.
-  Review round 2 dispatched 2026-08-26 — verdict pending. Not merged.
+  Review round 2 (Codex session `01a03d3b-c5ee-75a3-82ca-92fee192b2b7`, candidate
+  `9790e0a` vs `4c1d96f`): **CHANGES REQUIRED** — 0 blocker, 0 high, 3 medium
+  (registry `parseEnvelope` never invokes provenance check, so contradictory
+  reference envelopes still parse; `assertSchemaVersion` uses `Number.isInteger`,
+  admitting unsafe integers that envelope routing rejects; `TradingParameterKindSchema`
+  omits open/close-time categories and carries `status` without citation), 1 low
+  (handoff evidence overstatements: 12-vs-20 file count, incomplete resync-flag
+  negative matrix, imprecise removed-tests claim). All five acceptance criteria
+  PASS; round-1 items HIGH-1/2/3, MEDIUM-2, LOW-1/2 resolved; design rulings
+  (golden digests, DISPUTED non-terminal, unbranded SchemaVersion,
+  `parameterVersionRef`, staying at v1) all judged sound. Review also flagged a
+  stale duplicate WP-020 table row in this file — fixed by orchestrator.
+  Remediation round 2 dispatched 2026-08-26. Not merged.
 
 - `worktree-agent-a373c7ba6650bf1a9` (WP-000): base `7faf30f`, first candidate `8d16849`,
   second candidate `f79aa96`. Independent adversarial review round 1 (2026-08-24):
