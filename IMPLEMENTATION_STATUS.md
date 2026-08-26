@@ -19,7 +19,7 @@ Maximum permitted run mode: `PAPER`
 
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
-| `WP-000`               | In remediation (round 5) | None | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
+| `WP-000`               | In review (round 6) | None    | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
 | `WP-030`               | Blocked  | `WP-000` ✗, `WP-020` ✓ | —      |
@@ -186,8 +186,17 @@ Maximum permitted run mode: `PAPER`
   accepted as residual for the frozen snapshot). All round-4 items otherwise
   RESOLVED; all round-4b judgment calls ACCEPTED (filters test replacement,
   SDK-parsed reward layer, rewardsMinSize extension, assetAddress relaxation,
-  key-required snapshot strictness). Remediation round 5 dispatched 2026-08-26.
-  Not merged.
+  key-required snapshot strictness). Remediation round 5 completed 2026-08-26 in
+  `ddc56ff` (null accepted only under explicit `nullable: true` — exactly four
+  cited nullable fields enforced by a recursive walker guard; `tradeIDs`/
+  `transactionsHashes` null-acceptance reclassified as defects vs the SDK's
+  `.default([])`; book-`hash` null rejection recorded as fixture-only narrowing in
+  new report §17; `holdingRewardsEnabled` modeled per official type with full
+  MarketRewards key-by-key re-audit; citation gate completed across ALL report
+  sections with §10/§15 as enumerated exemptions and the test's private section
+  list deleted; 307/307 tests; per-finding mutation checks). Orchestrator
+  fast-forwarded and reproduced gates. Review round 6 (candidate `ddc56ff` vs
+  `7faf30f`) dispatched 2026-08-26 — verdict pending. Not merged.
 
 ### WP-000 in-flight record (2026-08-24)
 
