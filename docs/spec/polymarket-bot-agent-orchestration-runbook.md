@@ -344,6 +344,8 @@ After contracts are frozen:
 
 These are good candidates for parallel implementation because they are adapter-focused and should consume stable contracts rather than edit them.
 
+**Correction (2026-08-26, Wave 0 closeout audit M8):** `WP-100`'s allowed paths (`packages/polymarket-public/src/rtds/**`) are a strict subset of `WP-070`'s (`packages/polymarket-public/**`), so running them concurrently violates the AGENTS.md path-exclusivity rule. Run `WP-100` only after `WP-070` is merged. The parallel candidates within this batch are `WP-070`, `WP-080`, and `WP-090`.
+
 Do not run four merely because four are allowed. Two or three concurrent agents are easier to supervise.
 
 ### 1C — Universe and settlement semantics

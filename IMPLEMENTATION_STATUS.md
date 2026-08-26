@@ -23,7 +23,16 @@ Maximum permitted run mode: `PAPER`
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
 | `WP-030`               | Complete | `WP-000` ✓, `WP-020` ✓ | Merged `59cf254` (impl chain `051bb62`→`1e30ff1`→`66d29a9`→`21a3370`) |
-| All remaining packages | Blocked  | See work plan      | —          |
+| `WP-015`               | Ready (authorized) | `WP-030` ✓ | Unassigned — dependency-direction CI check (added at closeout) |
+| `WP-040`, `WP-050`, `WP-060` | Ready (authorized, Wave 1 batch 1A) | All ✓ | Unassigned |
+| `WP-070`, `WP-080`, `WP-090` | Ready (Wave 1 batch 1B — after 1A per runbook) | All ✓ | Unassigned |
+| `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
+| `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
+| All other packages     | Blocked  | See work plan      | —          |
+
+Authorization vocabulary: "Ready (authorized)" rows are the only packages agents
+may begin in the current run; "Dependency-ready" rows must not start until this
+table says otherwise.
 
 ### WP-030 completion record (2026-08-26)
 
@@ -69,8 +78,8 @@ Maximum permitted run mode: `PAPER`
 - Post-merge integration on `main` at `d427f00`: install/typecheck/lint/test
   (1102/1102), `uv` + pytest, and `pnpm audit` all pass.
 - Deliverables: `docs/venue/verified-2026-08-24.md` (29 gated sections, 120
-  official-source citations, 26 SDK links pinned to commit `7fdbed4…`), 16
-  sanitized fixture files across market-ws/user-ws/orders/heartbeat/fees/
+  official-source citations, 26 SDK links pinned to commit `7fdbed4…`), 17
+  sanitized fixture JSON files across market-ws/user-ws/orders/heartbeat/fees/
   rate-limits/geoblock/positions/rtds, and the `verify-venue` CLI skeleton with
   305 offline tests (per-section citation gate, recursive schema validation,
   credential scanner with 57+ vectors). No credential, signer, order, or
@@ -119,7 +128,44 @@ Maximum permitted run mode: `PAPER`
 - Path ownership ratification: root `eslint.config.mjs` is canonically recorded in `docs/spec/polymarket-bot-workplan.yaml` under WP-010 `allowed_paths` and global `protected_paths` (2026-08-23).
 - External post-merge review (Codex, 2026-08-23): CHANGES REQUIRED with two medium findings — both remediated same day: (1) CI now runs dependency vulnerability scans over both lockfiles (`pnpm audit --audit-level high`; `uv export --frozen` + `pip-audit --strict`), both passing locally; (2) the complete auditable WP-010 handoff with all required fields is recorded at `docs/handoffs/WP-010.md`. Additionally, a compose health gate (`pnpm test:compose` + CI `compose` job) now supplements the exit-0 `test:integration` placeholder, and it passes locally.
 
-## Active branches and worktrees
+## Wave 0 closeout (2026-08-26)
+
+- Closeout audits (runbook §10, both fresh read-only contexts): Codex mechanical
+  audit (session `01a03ee5-ddd6-7683-918b-02840e9c0ff6`) — initial verdict
+  **WAVE INCOMPLETE** solely on (a) two gates unrunnable in its sandbox and
+  (b) status-file bookkeeping, with merges/acceptance/safety/register all PASS;
+  Claude architectural consistency pass — **INCONSISTENCIES FOUND** (1 high,
+  7 medium, 4 low, no blocker; ADR-vs-code, git-facts, and safety checks all
+  verified clean), plus a 10-item Wave 1 gap list.
+- Orchestrator gate reruns on `main@c9e9a72` (2026-08-26): `pnpm audit
+  --audit-level high` → no known vulnerabilities; `pnpm test:compose` → healthy
+  (with the documented `PMB_POSTGRES_PORT=15432`/`PMB_REDIS_PORT=16379`
+  overrides; native PostgreSQL occupies 5432 on this host), stack torn down.
+- Bookkeeping corrected in this commit: WP-000 fixture count (17 JSON files);
+  authorization vocabulary + accurate dependency-ready states in the package
+  table; stale worktree entries archived below.
+- Governance fixes in this commit: WP-070 acceptance criterion reworded to stop
+  asserting C-1/U-1 as settled (workplan, audit M3); WP-100 sequenced after
+  WP-070 with a scoped package.json ratification (M8, runbook corrected);
+  test-tree registration ratification for unexecuted test roots (M7); WP-015
+  (dependency-direction CI enforcement) added to the workplan with ratified
+  paths — resolves the unassigned-owner item; runbook added to AGENTS.md
+  reading list (N15); venue-report filename ratification comment added to the
+  workplan (L10).
+- **C-4 ownership assigned**: the quickstart/overview archived-SDK-reference
+  re-check is owned by the orchestrator-run phase-start venue re-verification
+  (handoff §1.2), to be executed and recorded before Wave 1 batch 1B (WP-070+)
+  dispatch.
+- Remaining architecture findings (H1 null-handling doc contradiction; M2
+  UNVERIFIED marker on book.ts + domain-successor policy; M4 binding-narrowing
+  list completion; M5 grammar-duplication register + dropped follow-up; M6
+  dependency-direction false fact; L9 decimal error-code defect; L11
+  ops:verify-venue wiring; L12 ops-cli undeclared devDeps; N13 unratified
+  inferred shapes register) → dispatched 2026-08-26 as a single bounded
+  **Wave 0 closeout remediation package** (paths ratified in the dispatch
+  packet, review-gated). Wave 0 is recorded COMPLETE only when it merges.
+
+## Wave 0 review history (archived; all branches merged and worktrees removed)
 
 - `worktree-agent-a919f38ed969c8ffc` (WP-030): base `f7ccb8e`, candidate `1e30ff1`
   (impl `051bb62` + handoff). ADR-001..012, docs/adr/README.md,

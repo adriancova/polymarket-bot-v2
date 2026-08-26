@@ -6,6 +6,9 @@ Before planning, editing, or delegating:
 2. Read `docs/spec/polymarket-bot-workplan.yaml`.
 3. Read `IMPLEMENTATION_STATUS.md`.
 4. Inspect the current Git status and recent commits.
+5. When orchestrating multi-package execution, also read
+   `docs/spec/polymarket-bot-agent-orchestration-runbook.md` (process authority
+   for the per-package lifecycle and wave gates).
 
 ## Authority
 

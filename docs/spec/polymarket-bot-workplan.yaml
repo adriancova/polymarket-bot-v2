@@ -25,6 +25,14 @@ protected_paths:
   # created under WP-010 ownership (see docs/handoffs/WP-010.md).
   - eslint.config.mjs
 
+# Ratified 2026-08-26 (Wave 0 closeout, architecture audit M7): the root test
+# runner (test/vitest.config.ts, WP-010-owned) does not yet execute
+# test/contract/**, test/fault-injection/**, test/replay-golden/**, test/e2e/**,
+# or test/soak/**. A package whose allowed_paths include such a tree may extend
+# test/vitest.config.ts (or add an equivalently wired config plus root script)
+# with the minimal registration needed to run its own declared test tree; the
+# registration diff is part of that package's reviewed candidate.
+
 required_handoff_fields:
   - summary
   - files_changed
@@ -73,6 +81,11 @@ work_packages:
       - packages/polymarket-secure/**
       - db/migrations/**
     deliverables:
+      # Ratified 2026-08-24 (recorded in IMPLEMENTATION_STATUS.md deviations;
+      # workplan comment added 2026-08-26 at Wave 0 closeout per the
+      # protected-contracts §5 mechanism): the literal below is a template dated
+      # at plan generation; the actual report is docs/venue/verified-2026-08-24.md,
+      # dated to the real verification per handoff §1.2.
       - docs/venue/verified-2026-08-18.md
       - sanitized public market and WebSocket fixtures
       - sanitized order/user-stream schema fixtures
@@ -119,6 +132,39 @@ work_packages:
       - pnpm typecheck succeeds.
       - pnpm lint succeeds.
       - pnpm test succeeds.
+      - No live credentials are required.
+    gate: automated
+
+  # Added 2026-08-26 by the orchestrator at Wave 0 closeout: the
+  # dependency-direction contract (docs/contracts/dependency-direction.md §6)
+  # specifies a mechanically implementable check whose owner was unassigned —
+  # flagged by both closeout audits as required before Wave 1 adds package
+  # edges. package.json and .github/** edits are confined to wiring the check
+  # (WP-010 eslint.config.mjs precedent for protected paths serving a
+  # deliverable).
+  - id: WP-015
+    phase: phase-1
+    title: Dependency-direction CI enforcement
+    goal: Implement the docs/contracts/dependency-direction.md §6 check (cycles, layer conformance, same-layer allowlist, forbidden specifiers) and wire it into the root scripts and CI.
+    depends_on: [WP-030]
+    allowed_paths:
+      - tools/check-dependency-direction.mjs
+      - test/unit/tooling/**
+      - package.json
+      - .github/workflows/ci.yml
+      - docs/handoffs/WP-015.md
+    forbidden_paths:
+      - packages/**
+      - apps/**
+      - db/migrations/**
+      - docs/contracts/**
+    deliverables:
+      - dependency-direction check script
+      - root script and CI wiring
+      - unit tests over fixture graphs
+    acceptance:
+      - The check passes on the current repository (S0 edge permitted).
+      - Seeded violations of each rule class (cycle, upward edge, unlisted same-layer edge, forbidden specifier, unclassified package) fail with actionable output.
       - No live credentials are required.
     gate: automated
 
@@ -274,7 +320,15 @@ work_packages:
       - snapshot fetcher
     acceptance:
       - All sanitized official fixtures parse.
-      - Absolute-size zero removes a price level.
+      # Reworded 2026-08-26 at Wave 0 closeout (architecture audit M3): the
+      # original literal ("Absolute-size zero removes a price level") asserted
+      # C-1/U-1 as settled fact, contradicting the open-item register
+      # (docs/contracts/protected-contracts.md §8) and ADR-002 §8.
+      - Book price-change semantics (C-1/U-1 absolute-size zero-removal) are
+        confirmed against current official sources or recorded observation;
+        on confirmation the provisional rule is ratified, otherwise the affected
+        contracts are flagged for an ADR-governed revision. The provisional
+        behavior is never asserted as settled without this evidence.
       - Tick-size changes are emitted exactly.
       - No invented venue sequence number is exposed.
     gate: automated
@@ -324,6 +378,12 @@ work_packages:
     title: Polymarket RTDS Chainlink TWAP adapter
     goal: Normalize current 30-second and 60-second Chainlink TWAP events from RTDS.
     depends_on: [WP-000, WP-020, WP-030]
+    # Ordering note (2026-08-26, architecture audit M8): these allowed paths are
+    # a strict subset of WP-070's packages/polymarket-public/**. WP-100 must run
+    # only after WP-070 is merged — never concurrently — per the AGENTS.md
+    # path-exclusivity rule. WP-100 may add the dependency declarations its RTDS
+    # subtree mechanically requires to packages/polymarket-public/package.json
+    # (and the resulting pnpm-lock.yaml update), nothing else in WP-070's tree.
     allowed_paths:
       - packages/polymarket-public/src/rtds/**
       - test/contract/rtds/**
