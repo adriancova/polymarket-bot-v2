@@ -21,11 +21,12 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Runtime data
-data/
-wal/
-parquet/
-tmp/
+# Runtime data (anchored to repo root: test/fault-injection/wal/ and similar
+# workplan-assigned test trees must remain trackable — WP-050 finding 2026-08-26)
+/data/
+/wal/
+/parquet/
+/tmp/
 *.log
 
 # Claude local-only settings
