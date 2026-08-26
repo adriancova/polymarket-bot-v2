@@ -22,7 +22,7 @@ Maximum permitted run mode: `PAPER`
 | `WP-000`               | Complete | None               | Merged `d427f00` (impl chain `8d16849`→…→`ddc56ff`, 6 review rounds) |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
-| `WP-030`               | Ready    | `WP-000` ✓, `WP-020` ✓ | Unassigned |
+| `WP-030`               | In review (round 1) | `WP-000` ✓, `WP-020` ✓ | `wp-implementer` on branch `worktree-agent-a919f38ed969c8ffc` |
 | All remaining packages | Blocked  | See work plan      | —          |
 
 ### WP-000 completion record (2026-08-26)
@@ -90,6 +90,16 @@ Maximum permitted run mode: `PAPER`
 - External post-merge review (Codex, 2026-08-23): CHANGES REQUIRED with two medium findings — both remediated same day: (1) CI now runs dependency vulnerability scans over both lockfiles (`pnpm audit --audit-level high`; `uv export --frozen` + `pip-audit --strict`), both passing locally; (2) the complete auditable WP-010 handoff with all required fields is recorded at `docs/handoffs/WP-010.md`. Additionally, a compose health gate (`pnpm test:compose` + CI `compose` job) now supplements the exit-0 `test:integration` placeholder, and it passes locally.
 
 ## Active branches and worktrees
+
+- `worktree-agent-a919f38ed969c8ffc` (WP-030): base `f7ccb8e`, candidate `1e30ff1`
+  (impl `051bb62` + handoff). ADR-001..012, docs/adr/README.md,
+  docs/contracts/{dependency-direction,protected-contracts}.md, additive
+  domain.md §10 cross-reference, docs/handoffs/WP-030.md. Implementer session was
+  interrupted once by an API session limit and resumed with context intact.
+  Orchestrator verified: 17 files all in allowed paths, domain.md diff purely
+  additive, gates reproduced (1102/1102). Review round 1 (candidate `1e30ff1` vs
+  `f7ccb8e`) dispatched 2026-08-26 with citation-accuracy sampling mandated —
+  verdict pending. Not merged.
 
 - `worktree-agent-a45b4929f044830ca` (WP-020): base `4c1d96f`, first candidate `815b6cb`
   (chain `e7844c9`→`815b6cb`). Implementer handoff `docs/handoffs/WP-020.md` (in worktree);
