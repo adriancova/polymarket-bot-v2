@@ -3,9 +3,15 @@
  *
  * Loads the sanitized venue fixtures frozen under `test/fixtures/venue/` and
  * validates their envelope and payload shapes against source-specific,
- * recursively nested schemas (types, enums, optionality, canonical decimal
- * form). Structural validation only: `packages/domain` does not exist yet,
- * so no domain schemas are imported.
+ * recursively nested schemas (types, enums, optionality, nullability,
+ * canonical decimal form, map-valued objects, unions, and strict key sets).
+ * Heterogeneous fixtures are validated through discriminated variants so that
+ * no example can pass by making every field optional.
+ *
+ * Structural validation only: `packages/domain` does not exist yet, so no
+ * domain schemas are imported. The schemas here are contract-shaped stand-ins
+ * frozen against the official SDK raw schemas at the pinned reference commit
+ * (see `checks.ts`).
  *
  * This module never touches the network, never places orders, and never
  * requires credentials. It reads local fixture files only.
@@ -31,27 +37,91 @@ export const VENUE_FIXTURE_ROOT: string = join(
   "venue",
 );
 
+/**
+ * Field kinds.
+ *
+ * The kinds whose names start with `empty-or-` model the official SDK's
+ * `OptionalDecimalStringSchema`
+ * (`z.preprocess(emptyStringToNull, DecimalStringSchema.nullish())`), which
+ * accepts the wire empty string for absent optional decimals. `digit-string`
+ * models the SDK's epoch schemas (`z.string().regex(/^\d+$/)`). `integer`
+ * models `z.number().int()`. See `checks.ts` for the pinned source commit.
+ */
 export type FieldType =
   | "string"
   | "decimal-string"
   | "price-string"
+  | "empty-or-decimal-string"
+  | "empty-or-price-string"
+  | "digit-string"
+  | "hex-string"
   | "number"
+  | "integer"
   | "boolean"
   | "object"
-  | "array";
+  | "array"
+  | "union"
+  | "unknown";
 
 export interface FieldSpec {
   readonly type: FieldType;
   readonly enum?: readonly string[];
+  /**
+   * SDK `.nullish()`: the key may be absent, `null`, or `undefined`.
+   * An absent optional key is not an error; a present one is still validated.
+   */
   readonly optional?: boolean;
-  /** Nested schema for `type: "object"` values. */
+  /**
+   * SDK `.nullable()`: the key must be present but its value may be `null`.
+   */
+  readonly nullable?: boolean;
+  /** Accepted total string lengths for `type: "hex-string"` (incl. `0x`). */
+  readonly hexLengths?: readonly number[];
+  /** Nested field map for `type: "object"` values. */
   readonly fields?: PayloadSchema;
+  /**
+   * Spec applied to every key of a map-shaped object that is not named in
+   * `fields`. Use for heterogeneous maps (fee tables, header bags, endpoint
+   * limit maps, contract-address maps).
+   */
+  readonly values?: FieldSpec;
+  /**
+   * Reject keys that are not named in `fields`. Used for schemas frozen
+   * against an official SDK definition so that an omitted SDK field cannot
+   * hide behind permissive unknown-key acceptance.
+   */
+  readonly strict?: boolean;
   /** Element spec for `type: "array"` values (validated recursively). */
   readonly items?: FieldSpec;
+  /** Alternatives for `type: "union"`; the value must satisfy at least one. */
+  readonly oneOf?: readonly FieldSpec[];
 }
 
-/** Source-specific payload schema. Unknown extra keys are permitted. */
+/** Source-specific payload field map. */
 export type PayloadSchema = Readonly<Record<string, FieldSpec>>;
+
+/** Schema for a single object shape. */
+export interface ObjectSpec {
+  readonly fields?: PayloadSchema;
+  readonly values?: FieldSpec;
+  readonly strict?: boolean;
+}
+
+/**
+ * Discriminated schema for fixtures whose examples are heterogeneous.
+ *
+ * `discriminant: "example-name"` keys variants on `examples[].name` (used for
+ * configuration snapshots that share no wire discriminator field);
+ * `{ field }` keys variants on a payload field (used for wire events such as
+ * `event_type` or `operation`). An example whose discriminant value has no
+ * declared variant is an error, so adding an example without a schema fails.
+ */
+export interface VariantSpec {
+  readonly discriminant: "example-name" | { readonly field: string };
+  readonly variants: Readonly<Record<string, ObjectSpec>>;
+}
+
+export type PayloadSpec = ObjectSpec | VariantSpec;
 
 export interface FixtureExample {
   readonly name: string;
@@ -80,44 +150,70 @@ const OFFICIAL_SOURCE_PREFIXES = [
 ] as const;
 
 /**
- * Credential/secret-shaped keys that must only ever carry sanitized
- * placeholders. Matching is case-insensitive and separator-insensitive
- * (keys are normalized to lowercase alphanumerics), so `POLY_API_KEY`,
- * `Poly-Api-Key`, and `polyApiKey` all match `polyapikey`. Covers generic
- * secret shapes plus the documented Polymarket credential/auth-header names
- * (POLY_API_KEY, POLY_PASSPHRASE, POLY_SIGNATURE, POLY_ADDRESS,
- * POLY_TIMESTAMP, POLY_NONCE, SIGNER_PRIVATE_KEY) and the user-stream
- * owner/order-owner/trade-owner API-key fields.
+ * Credential/secret-shaped key names matched exactly after normalization
+ * (lowercase alphanumerics only), so `POLY_API_KEY`, `Poly-Api-Key`, and
+ * `polyApiKey` all normalize to `polyapikey`.
+ *
+ * Covers the credential and auth-header names documented by Polymarket
+ * (retrieved 2026-08-26):
+ * - `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_WALLET_ADDRESS`
+ *   (https://docs.polymarket.com/quickstart)
+ * - `POLY_ADDRESS`, `POLY_API_KEY`, `POLY_PASSPHRASE`, `POLY_SIGNATURE`,
+ *   `POLY_TIMESTAMP`, `POLY_BUILDER_API_KEY`, `POLY_BUILDER_PASSPHRASE`,
+ *   `POLY_BUILDER_SIGNATURE`, `POLY_BUILDER_TIMESTAMP`,
+ *   `POLYMARKET_BUILDER_CODE` (https://docs.polymarket.com/builders/api-keys)
+ *
+ * plus generic secret shapes and the user-stream owner/API-key fields.
  */
 const CREDENTIAL_KEYS_NORMALIZED: readonly string[] = [
-  "apikey",
-  "apisecret",
   "secret",
   "clientsecret",
-  "passphrase",
-  "privatekey",
-  "signature",
-  "signatures",
   "signedorder",
   "signedpayload",
-  "mnemonic",
   "seed",
-  "seedphrase",
   "authorization",
-  "owner",
-  "orderowner",
-  "tradeowner",
-  "polyapikey",
-  "polypassphrase",
-  "polysignature",
+  "pk",
+  // Documented Polymarket CLOB L2 auth headers / env names.
   "polyaddress",
   "polytimestamp",
   "polynonce",
-  "signerprivatekey",
+  "polybuildertimestamp",
+  "polymarketwalletaddress",
+  "walletaddress",
+];
+
+/**
+ * Credential/secret-shaped key patterns matched as substrings of the
+ * normalized key, so that documented and obvious variants are covered without
+ * enumerating every spelling: `POLYMARKET_PRIVATE_KEY`, `SIGNER_PRIVATE_KEY`,
+ * and any other `*_PRIVATE_KEY` all contain `privatekey`;
+ * `POLY_BUILDER_API_KEY`, `POLYMARKET_BUILDER_API_KEY`, and `builderApiKey`
+ * all contain `apikey`.
+ */
+const CREDENTIAL_KEY_PATTERNS: readonly string[] = [
+  "apikey",
+  "apisecret",
+  "privatekey",
+  "privkey",
+  "passphrase",
+  "secretkey",
+  "signature",
+  "buildercode",
+  "mnemonic",
+  "seedphrase",
+  "owner",
 ];
 
 export function normalizeCredentialKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+export function isCredentialShapedKey(key: string): boolean {
+  const normalized = normalizeCredentialKey(key);
+  return (
+    CREDENTIAL_KEYS_NORMALIZED.includes(normalized) ||
+    CREDENTIAL_KEY_PATTERNS.some((pattern) => normalized.includes(pattern))
+  );
 }
 
 const ZERO_UUID_RE = /^0{8}-0{4}-0{4}-0{4}-0{8}[0-9a-z]{0,4}$/i;
@@ -153,10 +249,7 @@ function scanForCredentials(
     return;
   }
   for (const [key, entry] of Object.entries(value)) {
-    if (
-      CREDENTIAL_KEYS_NORMALIZED.includes(normalizeCredentialKey(key)) &&
-      !isSanitizedPlaceholder(entry)
-    ) {
+    if (isCredentialShapedKey(key) && !isSanitizedPlaceholder(entry)) {
       errors.push(
         `${path}.${key}: credential/secret-shaped field must be a sanitized placeholder`,
       );
@@ -183,14 +276,41 @@ export function isCanonicalDecimalString(value: unknown): value is string {
   return CANONICAL_DECIMAL_RE.test(value);
 }
 
-/** Canonical decimal constrained to the price/probability range [0, 1]. */
+/**
+ * Canonical decimal constrained to the price/probability range [0, 1].
+ *
+ * The bound is decided lexically on the canonical string, never through
+ * binary floating point: `Number()` underflows values such as
+ * `"-0.000…001"` to `-0` and rounds `"1.000…001"` to `1`, which would admit
+ * out-of-range prices. Because the input is already canonical (no leading
+ * zeros, no leading `+`, no exponent, no trailing fractional zeros), the
+ * range test reduces to inspecting the sign and the integer part.
+ */
 export function isCanonicalPriceString(value: unknown): value is string {
   if (!isCanonicalDecimalString(value)) {
     return false;
   }
-  const numeric = Number(value);
-  return numeric >= 0 && numeric <= 1;
+  // Any canonical negative is strictly below 0 ("-0" is already rejected).
+  if (value.startsWith("-")) {
+    return false;
+  }
+  const separator = value.indexOf(".");
+  const integerPart = separator === -1 ? value : value.slice(0, separator);
+  const hasFraction = separator !== -1;
+  if (integerPart === "0") {
+    // "0" and "0.<canonical fraction>" are always within [0, 1).
+    return true;
+  }
+  if (integerPart === "1") {
+    // Exactly "1" is in range; any fraction on top of 1 is strictly above 1
+    // (a canonical fraction always ends in a non-zero digit).
+    return !hasFraction;
+  }
+  return false;
 }
+
+const DIGIT_STRING_RE = /^\d+$/;
+const HEX_STRING_RE = /^0x[0-9a-fA-F]*$/;
 
 function validateField(
   value: unknown,
@@ -198,7 +318,25 @@ function validateField(
   path: string,
   errors: string[],
 ): void {
+  if (spec.type === "union") {
+    const alternatives = spec.oneOf ?? [];
+    const matched = alternatives.some((alternative) => {
+      const attempt: string[] = [];
+      validateField(value, alternative, path, attempt);
+      return attempt.length === 0;
+    });
+    if (!matched) {
+      errors.push(
+        `${path}: value matches none of the accepted alternatives [${alternatives
+          .map((alternative) => alternative.type)
+          .join(", ")}]`,
+      );
+    }
+    return;
+  }
   switch (spec.type) {
+    case "unknown":
+      return;
     case "string":
       if (typeof value !== "string") {
         errors.push(`${path}: expected string, got ${typeof value}`);
@@ -211,6 +349,14 @@ function validateField(
         return;
       }
       break;
+    case "empty-or-decimal-string":
+      if (value !== "" && !isCanonicalDecimalString(value)) {
+        errors.push(
+          `${path}: expected canonical decimal string or the empty string (SDK OptionalDecimalStringSchema)`,
+        );
+        return;
+      }
+      break;
     case "price-string":
       if (!isCanonicalPriceString(value)) {
         errors.push(
@@ -219,9 +365,49 @@ function validateField(
         return;
       }
       break;
+    case "empty-or-price-string":
+      if (value !== "" && !isCanonicalPriceString(value)) {
+        errors.push(
+          `${path}: expected canonical decimal string within [0, 1] or the empty string (SDK OptionalDecimalStringSchema)`,
+        );
+        return;
+      }
+      break;
+    case "digit-string":
+      if (typeof value !== "string" || !DIGIT_STRING_RE.test(value)) {
+        errors.push(
+          `${path}: expected a digit string matching /^\\d+$/ (SDK epoch schema)`,
+        );
+        return;
+      }
+      break;
+    case "hex-string": {
+      if (typeof value !== "string" || !HEX_STRING_RE.test(value)) {
+        errors.push(`${path}: expected a 0x-prefixed hex string`);
+        return;
+      }
+      if (
+        spec.hexLengths !== undefined &&
+        !spec.hexLengths.includes(value.length)
+      ) {
+        errors.push(
+          `${path}: expected a 0x-prefixed hex string of length [${spec.hexLengths.join(", ")}], got ${value.length}`,
+        );
+        return;
+      }
+      break;
+    }
     case "number":
       if (typeof value !== "number" || !Number.isFinite(value)) {
         errors.push(`${path}: expected finite number, got ${typeof value}`);
+        return;
+      }
+      break;
+    case "integer":
+      if (typeof value !== "number" || !Number.isInteger(value)) {
+        errors.push(
+          `${path}: expected integer, got ${typeof value === "number" ? String(value) : typeof value}`,
+        );
         return;
       }
       break;
@@ -236,9 +422,10 @@ function validateField(
         errors.push(`${path}: expected object`);
         return;
       }
-      if (spec.fields !== undefined) {
-        validateObject(value, spec.fields, path, errors);
-      }
+      // `FieldSpec` structurally satisfies `ObjectSpec` (same optional
+      // `fields`/`values`/`strict` members), so the nested object rules are
+      // applied directly without rebuilding the spec.
+      validateObjectSpec(value, spec, path, errors);
       return;
     }
     case "array": {
@@ -247,8 +434,9 @@ function validateField(
         return;
       }
       if (spec.items !== undefined) {
+        const items = spec.items;
         value.forEach((entry, index) => {
-          validateField(entry, spec.items as FieldSpec, `${path}[${index}]`, errors);
+          validateField(entry, items, `${path}[${index}]`, errors);
         });
       }
       return;
@@ -263,33 +451,107 @@ function validateField(
   }
 }
 
-function validateObject(
+function validateObjectSpec(
   value: Record<string, unknown>,
-  schema: PayloadSchema,
+  spec: ObjectSpec,
   path: string,
   errors: string[],
 ): void {
-  for (const [key, spec] of Object.entries(schema)) {
+  const fields = spec.fields ?? {};
+  for (const [key, fieldSpec] of Object.entries(fields)) {
     const fieldPath = `${path}.${key}`;
-    if (!(key in value) || value[key] === null || value[key] === undefined) {
-      if (spec.optional !== true) {
+    const present = Object.hasOwn(value, key);
+    const entry = present ? value[key] : undefined;
+    if (present && entry === null) {
+      if (fieldSpec.nullable !== true && fieldSpec.optional !== true) {
+        errors.push(`${fieldPath}: null is not an accepted value`);
+      }
+      continue;
+    }
+    if (!present || entry === undefined) {
+      if (fieldSpec.optional !== true) {
         errors.push(`${fieldPath}: missing required key`);
       }
       continue;
     }
-    validateField(value[key], spec, fieldPath, errors);
+    validateField(entry, fieldSpec, fieldPath, errors);
   }
+  for (const key of Object.keys(value)) {
+    if (Object.hasOwn(fields, key)) {
+      continue;
+    }
+    const entry = value[key];
+    if (spec.values !== undefined) {
+      if (entry === null || entry === undefined) {
+        continue;
+      }
+      validateField(entry, spec.values, `${path}.${key}`, errors);
+      continue;
+    }
+    if (spec.strict === true) {
+      errors.push(
+        `${path}.${key}: unexpected key (schema is frozen against its official source)`,
+      );
+    }
+  }
+}
+
+function isVariantSpec(spec: PayloadSpec): spec is VariantSpec {
+  return Object.hasOwn(spec, "variants");
+}
+
+function discriminantLabel(
+  discriminant: VariantSpec["discriminant"],
+): string {
+  return discriminant === "example-name"
+    ? "example name"
+    : `payload field "${discriminant.field}"`;
+}
+
+/**
+ * Validates one example payload against a (possibly discriminated) spec.
+ * Exported for direct unit testing of individual variants.
+ */
+export function validatePayload(
+  payload: Record<string, unknown>,
+  spec: PayloadSpec,
+  exampleName: string,
+  path: string,
+  errors: string[],
+): void {
+  if (!isVariantSpec(spec)) {
+    validateObjectSpec(payload, spec, path, errors);
+    return;
+  }
+  const key =
+    spec.discriminant === "example-name"
+      ? exampleName
+      : payload[spec.discriminant.field];
+  if (typeof key !== "string") {
+    errors.push(
+      `${path}: discriminant (${discriminantLabel(spec.discriminant)}) is missing or not a string`,
+    );
+    return;
+  }
+  if (!Object.hasOwn(spec.variants, key)) {
+    errors.push(
+      `${path}: no schema variant declared for ${discriminantLabel(spec.discriminant)} ${JSON.stringify(key)} (declared: ${Object.keys(spec.variants).join(", ")})`,
+    );
+    return;
+  }
+  validateObjectSpec(payload, spec.variants[key] as ObjectSpec, path, errors);
 }
 
 /**
  * Validates the common fixture envelope and each example payload against a
- * source-specific schema (recursively: types, enums, optionality, canonical
- * decimal/price form).
+ * source-specific spec (recursively: types, enums, optionality, nullability,
+ * canonical decimal/price form, map values, unions, strict key sets, and
+ * discriminated variants).
  */
 export function validateFixtureDocument(
   raw: unknown,
   expectedFixtureName: string,
-  schema: PayloadSchema,
+  spec: PayloadSpec,
 ): { fixture: FixtureFile | null; errors: string[] } {
   const errors: string[] = [];
   if (!isRecord(raw)) {
@@ -326,7 +588,8 @@ export function validateFixtureDocument(
         errors.push(`examples[${index}] is not an object`);
         return;
       }
-      if (typeof example["name"] !== "string" || example["name"].length === 0) {
+      const name = example["name"];
+      if (typeof name !== "string" || name.length === 0) {
         errors.push(`examples[${index}].name must be a non-empty string`);
       }
       const payload = example["payload"];
@@ -334,7 +597,13 @@ export function validateFixtureDocument(
         errors.push(`examples[${index}].payload must be an object`);
         return;
       }
-      validateObject(payload, schema, `examples[${index}].payload`, errors);
+      validatePayload(
+        payload,
+        spec,
+        typeof name === "string" ? name : "",
+        `examples[${index}].payload`,
+        errors,
+      );
     });
   }
   scanForCredentials(raw, "$", errors);
@@ -350,7 +619,7 @@ export function validateFixtureDocument(
  */
 export function loadFixture(
   relativePath: string,
-  schema: PayloadSchema,
+  spec: PayloadSpec,
 ): FixtureValidationResult {
   const absolutePath = resolve(VENUE_FIXTURE_ROOT, relativePath);
   const rel = relative(VENUE_FIXTURE_ROOT, absolutePath);
@@ -375,10 +644,6 @@ export function loadFixture(
     };
   }
   const expectedName = relativePath.replace(/\.json$/, "");
-  const { fixture, errors } = validateFixtureDocument(
-    raw,
-    expectedName,
-    schema,
-  );
+  const { fixture, errors } = validateFixtureDocument(raw, expectedName, spec);
   return { relativePath, ok: errors.length === 0, errors, fixture };
 }

@@ -1,26 +1,38 @@
 /**
  * WP-000: validates that every sanitized venue fixture parses and matches its
  * source-specific recursive schema, that the frozen verification report
- * validates (sections + official evidence), and that the skeleton's failure
- * modes behave. Local files only — no network, no credentials, no orders.
+ * validates (sections + per-section official citations + pinned SDK links),
+ * and that the skeleton's failure modes behave. Local files only — no network,
+ * no credentials, no orders.
  */
 import { readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { VENUE_CHECKS } from "./checks.js";
+import {
+  SDK_PERMALINK_PREFIX,
+  SDK_REFERENCE_COMMIT,
+  VENUE_CHECKS,
+} from "./checks.js";
 import type { VenueCheck } from "./checks.js";
 import {
   VENUE_FIXTURE_ROOT,
   isCanonicalDecimalString,
   isCanonicalPriceString,
+  isCredentialShapedKey,
   loadFixture,
   validateFixtureDocument,
 } from "./fixtures.js";
-import type { FixtureExample, PayloadSchema } from "./fixtures.js";
+import type {
+  FixtureExample,
+  ObjectSpec,
+  PayloadSpec,
+} from "./fixtures.js";
 import {
+  CITATION_EXEMPT_SECTIONS,
   formatVenueVerificationReport,
   loadAndValidateReport,
+  reportSectionHasOfficialCitation,
   runVenueVerification,
   validateVerificationReport,
   venueVerificationExitCode,
@@ -45,10 +57,25 @@ function checkById(id: string): VenueCheck {
   return check as VenueCheck;
 }
 
+function specOf(id: string): PayloadSpec {
+  return checkById(id).payloadSpec;
+}
+
 function examplesOf(relativePath: string): readonly FixtureExample[] {
   const result = loadFixture(relativePath, {});
   expect(result.fixture, result.errors.join("; ")).not.toBeNull();
   return result.fixture?.examples ?? [];
+}
+
+function exampleNamed(
+  relativePath: string,
+  name: string,
+): Record<string, unknown> {
+  const example = examplesOf(relativePath).find(
+    (candidate) => candidate.name === name,
+  );
+  expect(example, `${relativePath}#${name}`).toBeDefined();
+  return structuredClone(example?.payload as Record<string, unknown>);
 }
 
 function envelope(examples: unknown): Record<string, unknown> {
@@ -62,18 +89,27 @@ function envelope(examples: unknown): Record<string, unknown> {
   };
 }
 
+/**
+ * Validates a single payload against a spec. `exampleName` selects the
+ * variant for example-name-discriminated specs.
+ */
 function errorsFor(
   payload: Record<string, unknown>,
-  schema: PayloadSchema,
+  spec: PayloadSpec,
+  exampleName = "case",
 ): string[] {
   return validateFixtureDocument(
-    envelope([{ name: "case", payload }]),
+    envelope([{ name: exampleName, payload }]),
     "x/y",
-    schema,
+    spec,
   ).errors;
 }
 
 const fixtureChecks = VENUE_CHECKS.filter((check) => check.kind === "fixture");
+
+function objectSpecsOf(spec: PayloadSpec): readonly ObjectSpec[] {
+  return "variants" in spec ? Object.values(spec.variants) : [spec];
+}
 
 describe("venue fixture catalog", () => {
   it("covers every required verification category", () => {
@@ -112,13 +148,44 @@ describe("venue fixture catalog", () => {
     expect(claimed).toEqual([...new Set(claimed)]);
     expect(onDisk).toEqual(claimed);
   });
+
+  it("no fixture check declares a permissive (non-strict, non-mapped) schema", () => {
+    for (const check of fixtureChecks) {
+      for (const objectSpec of objectSpecsOf(check.payloadSpec)) {
+        expect(
+          objectSpec.strict === true || objectSpec.values !== undefined,
+          `${check.id} declares a schema that silently accepts unknown keys`,
+        ).toBe(true);
+        expect(
+          Object.keys(objectSpec.fields ?? {}).length,
+          `${check.id} declares a schema with no fields`,
+        ).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("every fixture check declares at least one non-optional field per variant", () => {
+    // Guards against the "everything optional" vacuity mode: a variant whose
+    // fields are all optional would accept an empty payload.
+    for (const check of fixtureChecks) {
+      for (const objectSpec of objectSpecsOf(check.payloadSpec)) {
+        const required = Object.values(objectSpec.fields ?? {}).filter(
+          (field) => field.optional !== true,
+        );
+        expect(
+          required.length,
+          `${check.id} has a variant with no required fields`,
+        ).toBeGreaterThan(0);
+      }
+    }
+  });
 });
 
 describe("venue fixture structural validation", () => {
   for (const check of fixtureChecks) {
     for (const fixturePath of check.fixtures) {
       it(`${fixturePath} parses and matches its schema (${check.id})`, () => {
-        const result = loadFixture(fixturePath, check.payloadSchema);
+        const result = loadFixture(fixturePath, check.payloadSpec);
         expect(result.errors).toEqual([]);
         expect(result.ok).toBe(true);
         expect(result.fixture?.sanitized).toBe(true);
@@ -165,8 +232,52 @@ describe("canonical decimal and price validation", () => {
     expect(isCanonicalPriceString("0.50")).toBe(false);
   });
 
+  // The price bound must be decided lexically on the canonical string. A
+  // `Number()`-based bound underflows "-0.000…001" to -0 (accepting a negative
+  // price) and rounds "1.000…001" to 1 (accepting a price above 1).
+  it("rejects negative prices that underflow binary floating point", () => {
+    const underflow = `-0.${"0".repeat(400)}1`;
+    expect(Number(underflow)).toBe(-0);
+    expect(isCanonicalDecimalString(underflow)).toBe(true);
+    expect(isCanonicalPriceString(underflow)).toBe(false);
+  });
+
+  it("rejects prices above 1 that round down to 1 in binary floating point", () => {
+    const overflow = `1.${"0".repeat(400)}1`;
+    expect(Number(overflow)).toBe(1);
+    expect(isCanonicalDecimalString(overflow)).toBe(true);
+    expect(isCanonicalPriceString(overflow)).toBe(false);
+  });
+
+  for (const boundary of ["0", "1", "0.0000000000000000000000001", "0.9999999"]) {
+    it(`accepts in-range price boundary ${JSON.stringify(boundary)}`, () => {
+      expect(isCanonicalPriceString(boundary)).toBe(true);
+    });
+  }
+
+  for (const outOfRange of [
+    "1.0000000000000000000000001",
+    "-0.0000000000000000000000001",
+    "2",
+    "10",
+    "-1",
+  ]) {
+    it(`rejects out-of-range price ${JSON.stringify(outOfRange)}`, () => {
+      expect(isCanonicalPriceString(outOfRange)).toBe(false);
+    });
+  }
+
+  it("rejects underflowing prices inside a schema, not just in isolation", () => {
+    const payload = exampleNamed("market-ws/best-bid-ask.json", "best-bid-ask");
+    payload["best_bid"] = `-0.${"0".repeat(400)}1`;
+    expect(
+      errorsFor(payload, specOf("market-ws-best-bid-ask")).some((error) =>
+        error.includes("best_bid"),
+      ),
+    ).toBe(true);
+  });
+
   it("rejects out-of-range and non-canonical prices inside schemas", () => {
-    const schema = checkById("market-ws-last-trade").payloadSchema;
     const errors = errorsFor(
       {
         event_type: "last_trade_price",
@@ -177,11 +288,9 @@ describe("canonical decimal and price validation", () => {
         side: "SELL",
         timestamp: "1",
       },
-      schema,
+      specOf("market-ws-last-trade"),
     );
-    expect(
-      errors.some((error) => error.includes("within [0, 1]")),
-    ).toBe(true);
+    expect(errors.some((error) => error.includes("within [0, 1]"))).toBe(true);
     expect(
       errors.some((error) => error.includes("canonical decimal string")),
     ).toBe(true);
@@ -229,6 +338,16 @@ describe("heartbeat protocol shapes", () => {
     expect(result.fixture?.notes).toContain("10 seconds");
     expect(result.fixture?.notes).toContain("5 seconds");
   });
+
+  it("rejects an error_msg on a heartbeat variant that has no error field", () => {
+    expect(
+      errorsFor(
+        { heartbeat_id: "sanitized-heartbeat-id-0001", error_msg: "boom" },
+        specOf("heartbeat"),
+        "continuation-request",
+      ).some((error) => error.includes("unexpected key")),
+    ).toBe(true);
+  });
 });
 
 describe("restricted-mode shapes", () => {
@@ -241,6 +360,19 @@ describe("restricted-mode shapes", () => {
     );
     expect(example?.payload["http_status"]).toBe(425);
     expect(example?.payload).not.toHaveProperty("body");
+  });
+
+  it("the 425 documented-absence variant rejects an invented body", () => {
+    // The undocumented 425 body (report item U-9) is modeled as an explicit
+    // strict variant with no body, so a fabricated body fails validation
+    // rather than passing through an all-optional schema.
+    expect(
+      errorsFor(
+        { http_status: 425, body: { error: "invented" } },
+        specOf("restricted-modes"),
+        "http-425-engine-restarting-body-undocumented",
+      ).some((error) => error.includes("body: unexpected key")),
+    ).toBe(true);
   });
 
   it("503 cancel-only body uses the documented 'error' field", () => {
@@ -266,19 +398,32 @@ describe("restricted-mode shapes", () => {
   });
 
   it("rejects a restricted-mode body missing the documented 'error' field", () => {
-    const schema = checkById("restricted-modes").payloadSchema;
     const errors = errorsFor(
       { http_status: 503, body: { error_msg: "wrong field name" } },
-      schema,
+      specOf("restricted-modes"),
+      "http-503-cancel-only",
     );
     expect(
       errors.some((error) => error.includes("body.error: missing required key")),
     ).toBe(true);
   });
+
+  it("rejects a non-numeric Retry-After header value", () => {
+    const payload = exampleNamed(
+      "orders/restricted-modes.json",
+      "http-503-post-only",
+    );
+    (payload["headers"] as Record<string, unknown>)["Retry-After"] = "soon";
+    expect(
+      errorsFor(payload, specOf("restricted-modes"), "http-503-post-only").some(
+        (error) => error.includes("headers.Retry-After"),
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("raw user-stream trade events (official SDK UserTradeEventSchema)", () => {
-  const check = checkById("user-ws-trade-settlement");
+  const spec = specOf("user-ws-trade-settlement");
   const examples = examplesOf("user-ws/trade-settlement.json");
 
   it("covers the five plain user-channel wire statuses", () => {
@@ -309,7 +454,7 @@ describe("raw user-stream trade events (official SDK UserTradeEventSchema)", () 
     const payload = validTrade();
     delete payload["type"];
     expect(
-      errorsFor(payload, check.payloadSchema).some((error) =>
+      errorsFor(payload, spec).some((error) =>
         error.includes(".type: missing required key"),
       ),
     ).toBe(true);
@@ -319,7 +464,7 @@ describe("raw user-stream trade events (official SDK UserTradeEventSchema)", () 
     const payload = validTrade();
     delete payload["owner"];
     expect(
-      errorsFor(payload, check.payloadSchema).some((error) =>
+      errorsFor(payload, spec).some((error) =>
         error.includes(".owner: missing required key"),
       ),
     ).toBe(true);
@@ -333,7 +478,7 @@ describe("raw user-stream trade events (official SDK UserTradeEventSchema)", () 
       >;
       delete makers[0]?.[field];
       expect(
-        errorsFor(payload, check.payloadSchema).some((error) =>
+        errorsFor(payload, spec).some((error) =>
           error.includes(`maker_orders[0].${field}: missing required key`),
         ),
       ).toBe(true);
@@ -344,15 +489,104 @@ describe("raw user-stream trade events (official SDK UserTradeEventSchema)", () 
     const payload = validTrade();
     payload["status"] = "MATCHED_NOT_BROADCASTED";
     expect(
-      errorsFor(payload, check.payloadSchema).some((error) =>
-        error.includes("not in enum"),
+      errorsFor(payload, spec).some((error) => error.includes("not in enum")),
+    ).toBe(true);
+  });
+
+  // --- SDK wire-type fidelity (pinned reference commit) -------------------
+
+  it("accepts the wire EMPTY STRING for optional decimals (OptionalDecimalStringSchema)", () => {
+    const payload = validTrade();
+    payload["fee_rate_bps"] = "";
+    expect(errorsFor(payload, spec)).toEqual([]);
+  });
+
+  it("accepts an empty maker-order fee_rate_bps", () => {
+    const payload = validTrade();
+    const makers = payload["maker_orders"] as Array<Record<string, unknown>>;
+    (makers[0] as Record<string, unknown>)["fee_rate_bps"] = "";
+    expect(errorsFor(payload, spec)).toEqual([]);
+  });
+
+  it("still rejects a malformed non-empty optional decimal", () => {
+    const payload = validTrade();
+    payload["fee_rate_bps"] = "0.50";
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("fee_rate_bps"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a fractional bucket_index (SDK z.number().int())", () => {
+    const payload = validTrade();
+    payload["bucket_index"] = 0.5;
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("bucket_index: expected integer"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a fractional maker-order outcome_index (SDK z.number().int())", () => {
+    const payload = validTrade();
+    const makers = payload["maker_orders"] as Array<Record<string, unknown>>;
+    (makers[0] as Record<string, unknown>)["outcome_index"] = 1.25;
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("outcome_index: expected integer"),
+      ),
+    ).toBe(true);
+  });
+
+  for (const epochField of ["timestamp", "match_time", "last_update"]) {
+    it(`rejects a non-digit ${epochField} (SDK /^\\d+$/ epoch schema)`, () => {
+      const payload = validTrade();
+      payload[epochField] = "2026-08-24T00:00:00Z";
+      expect(
+        errorsFor(payload, spec).some((error) =>
+          error.includes(`${epochField}: expected a digit string`),
+        ),
+      ).toBe(true);
+    });
+  }
+
+  it("accepts the SDK `matchtime` alias and validates it as an epoch digit string", () => {
+    const payload = validTrade();
+    payload["matchtime"] = "1782753360";
+    expect(errorsFor(payload, spec)).toEqual([]);
+    payload["matchtime"] = "not-an-epoch";
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("matchtime: expected a digit string"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a field that is not in the frozen SDK schema", () => {
+    const payload = validTrade();
+    payload["totally_made_up_field"] = 1;
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("totally_made_up_field: unexpected key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects an unknown key inside a maker order", () => {
+    const payload = validTrade();
+    const makers = payload["maker_orders"] as Array<Record<string, unknown>>;
+    (makers[0] as Record<string, unknown>)["invented"] = true;
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("maker_orders[0].invented: unexpected key"),
       ),
     ).toBe(true);
   });
 });
 
-describe("REST trade reads (prefixed TRADE_STATUS_* constants)", () => {
-  const check = checkById("rest-trade-settlement");
+describe("REST trade reads (official SDK ClobTradeSchema)", () => {
+  const spec = specOf("rest-trade-settlement");
   const examples = examplesOf("orders/rest-trades.json");
 
   it("models MATCHED_NOT_BROADCASTED in the REST layer only (C-3)", () => {
@@ -369,14 +603,95 @@ describe("REST trade reads (prefixed TRADE_STATUS_* constants)", () => {
     );
     payload["status"] = "MATCHED";
     expect(
-      errorsFor(payload, check.payloadSchema).some((error) =>
-        error.includes("not in enum"),
+      errorsFor(payload, spec).some((error) => error.includes("not in enum")),
+    ).toBe(true);
+  });
+
+  // ClobTradeSchema requires every field; the websocket event does not.
+  for (const required of [
+    "asset_id",
+    "bucket_index",
+    "fee_rate_bps",
+    "id",
+    "last_update",
+    "maker_address",
+    "maker_orders",
+    "market",
+    "match_time",
+    "outcome",
+    "owner",
+    "price",
+    "side",
+    "size",
+    "status",
+    "taker_order_id",
+    "trader_side",
+    "transaction_hash",
+  ]) {
+    it(`requires ${required} on every REST trade`, () => {
+      const payload = structuredClone(
+        examples[0]?.payload as Record<string, unknown>,
+      );
+      delete payload[required];
+      expect(
+        errorsFor(payload, spec).some((error) =>
+          error.includes(`${required}: missing required key`),
+        ),
+      ).toBe(true);
+    });
+  }
+
+  it("rejects an outcome_index on a REST maker order (websocket-only field)", () => {
+    const payload = structuredClone(
+      examples[0]?.payload as Record<string, unknown>,
+    );
+    const makers = payload["maker_orders"] as Array<Record<string, unknown>>;
+    (makers[0] as Record<string, unknown>)["outcome_index"] = 0;
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("maker_orders[0].outcome_index: unexpected key"),
       ),
+    ).toBe(true);
+  });
+
+  for (const required of ["maker_address", "outcome"]) {
+    it(`requires ${required} on a REST maker order (SDK MakerOrderSchema)`, () => {
+      const payload = structuredClone(
+        examples[0]?.payload as Record<string, unknown>,
+      );
+      const makers = payload["maker_orders"] as Array<Record<string, unknown>>;
+      delete (makers[0] as Record<string, unknown>)[required];
+      expect(
+        errorsFor(payload, spec).some((error) =>
+          error.includes(`maker_orders[0].${required}: missing required key`),
+        ),
+      ).toBe(true);
+    });
+  }
+
+  it("accepts a REST bucket_index that is not an integer (SDK z.number())", () => {
+    // Deliberate divergence from the websocket schema, which uses .int().
+    const payload = structuredClone(
+      examples[0]?.payload as Record<string, unknown>,
+    );
+    payload["bucket_index"] = 0.5;
+    expect(errorsFor(payload, spec)).toEqual([]);
+  });
+
+  it("rejects a market id that is not a 31/32-byte hex string", () => {
+    const payload = structuredClone(
+      examples[0]?.payload as Record<string, unknown>,
+    );
+    payload["market"] = "0xdeadbeef";
+    expect(
+      errorsFor(payload, spec).some((error) => error.includes("market")),
     ).toBe(true);
   });
 });
 
-describe("user order events", () => {
+describe("user order events (official SDK UserOrderEventSchema)", () => {
+  const spec = specOf("user-ws-order-lifecycle");
+
   it("every order event carries the full raw wire field set", () => {
     for (const example of examplesOf("user-ws/order-lifecycle.json")) {
       for (const field of [
@@ -409,9 +724,112 @@ describe("user order events", () => {
       expect(types).toContain(type);
     }
   });
+
+  it("validates the SDK-optional fields omitted by the frozen examples", () => {
+    const payload = exampleNamed(
+      "user-ws/order-lifecycle.json",
+      "placement-live",
+    );
+    payload["order_type"] = "GTX";
+    payload["associate_trades"] = [1];
+    payload["created_at"] = "yesterday";
+    const errors = errorsFor(payload, spec);
+    expect(errors.some((error) => error.includes("order_type"))).toBe(true);
+    expect(
+      errors.some((error) => error.includes("associate_trades[0]")),
+    ).toBe(true);
+    expect(errors.some((error) => error.includes("created_at"))).toBe(true);
+  });
+
+  it("accepts the SDK-optional fields when well formed", () => {
+    const payload = exampleNamed(
+      "user-ws/order-lifecycle.json",
+      "placement-live",
+    );
+    payload["order_type"] = "GTD";
+    payload["order_owner"] = "00000000-0000-0000-0000-000000000000";
+    payload["associate_trades"] = ["00000000-0000-0000-0000-00000000t001"];
+    payload["created_at"] = "1782753357";
+    payload["expiration"] = "1782753957";
+    payload["maker_address"] = "0x0000000000000000000000000000000000000000";
+    expect(errorsFor(payload, spec)).toEqual([]);
+  });
+
+  it("rejects a field that is not in the frozen SDK order schema", () => {
+    const payload = exampleNamed(
+      "user-ws/order-lifecycle.json",
+      "placement-live",
+    );
+    payload["fee_rate_bps"] = "0";
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("fee_rate_bps: unexpected key"),
+      ),
+    ).toBe(true);
+  });
 });
 
-describe("order placement responses", () => {
+describe("market lifecycle events (discriminated SDK schemas)", () => {
+  const spec = specOf("market-ws-lifecycle");
+
+  it("requires the SDK-required id on new_market", () => {
+    const payload = exampleNamed("market-ws/lifecycle.json", "new-market");
+    delete payload["id"];
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("id: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("requires the SDK-required id on market_resolved", () => {
+    const payload = exampleNamed("market-ws/lifecycle.json", "market-resolved");
+    delete payload["id"];
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("id: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects new_market-only fields on a market_resolved event", () => {
+    const payload = exampleNamed("market-ws/lifecycle.json", "market-resolved");
+    payload["outcomes"] = ["Yes", "No"];
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("outcomes: unexpected key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects an undeclared event_type variant", () => {
+    const payload = exampleNamed("market-ws/lifecycle.json", "new-market");
+    payload["event_type"] = "market_paused";
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("no schema variant declared"),
+      ),
+    ).toBe(true);
+  });
+
+  it("validates nested event_message and typed optional fields", () => {
+    const payload = exampleNamed("market-ws/lifecycle.json", "new-market");
+    payload["event_message"] = { ticker: "abc" };
+    payload["active"] = "yes";
+    payload["condition_id"] = "0xzz";
+    const errors = errorsFor(payload, spec);
+    expect(
+      errors.some((error) =>
+        error.includes("event_message.id: missing required key"),
+      ),
+    ).toBe(true);
+    expect(errors.some((error) => error.includes("active"))).toBe(true);
+    expect(errors.some((error) => error.includes("condition_id"))).toBe(true);
+  });
+});
+
+describe("order placement responses (official SDK OrderResponsePayloadSchema)", () => {
+  const spec = specOf("order-schemas-and-types");
   const examples = examplesOf("orders/order-responses.json");
 
   it("covers live, matched, delayed, and unmatched statuses plus failures", () => {
@@ -445,11 +863,39 @@ describe("order placement responses", () => {
       expect(failure.payload).not.toHaveProperty("tradeIDs");
     }
   });
+
+  it("accepts the empty-string making/taking amounts the API serializes", () => {
+    const payload = exampleNamed(
+      "orders/order-responses.json",
+      "error-insufficient-balance-or-allowance",
+    );
+    expect(payload["makingAmount"]).toBe("");
+    expect(errorsFor(payload, spec)).toEqual([]);
+  });
+
+  it("rejects a non-canonical, non-empty amount", () => {
+    const payload = exampleNamed("orders/order-responses.json", "limit-live");
+    payload["makingAmount"] = "0.50";
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("makingAmount"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a field outside the frozen SDK response payload", () => {
+    const payload = exampleNamed("orders/order-responses.json", "limit-live");
+    payload["code"] = "unknown";
+    expect(
+      errorsFor(payload, spec).some((error) =>
+        error.includes("code: unexpected key"),
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("nested contract validation (negative cases)", () => {
   it("rejects malformed book levels", () => {
-    const schema = checkById("market-ws-book").payloadSchema;
     const errors = errorsFor(
       {
         event_type: "book",
@@ -459,11 +905,9 @@ describe("nested contract validation (negative cases)", () => {
         bids: [{ price: "1.50", size: "10" }],
         asks: [{ price: "0.09" }],
       },
-      schema,
+      specOf("market-ws-book"),
     );
-    expect(
-      errors.some((error) => error.includes("bids[0].price")),
-    ).toBe(true);
+    expect(errors.some((error) => error.includes("bids[0].price"))).toBe(true);
     expect(
       errors.some((error) =>
         error.includes("asks[0].size: missing required key"),
@@ -471,8 +915,21 @@ describe("nested contract validation (negative cases)", () => {
     ).toBe(true);
   });
 
+  it("rejects an unknown key inside a book level", () => {
+    const payload = exampleNamed("market-ws/book-snapshot.json", "book-snapshot");
+    (payload["bids"] as Array<Record<string, unknown>>)[0] = {
+      price: "0.07",
+      size: "5000",
+      depth: 3,
+    };
+    expect(
+      errorsFor(payload, specOf("market-ws-book")).some((error) =>
+        error.includes("bids[0].depth: unexpected key"),
+      ),
+    ).toBe(true);
+  });
+
   it("rejects malformed price changes", () => {
-    const schema = checkById("market-ws-price-change").payloadSchema;
     const errors = errorsFor(
       {
         event_type: "price_change",
@@ -483,7 +940,7 @@ describe("nested contract validation (negative cases)", () => {
           { asset_id: "a", price: "2", size: "10", side: "BUY" },
         ],
       },
-      schema,
+      specOf("market-ws-price-change"),
     );
     expect(
       errors.some((error) => error.includes("price_changes[0].side")),
@@ -494,10 +951,11 @@ describe("nested contract validation (negative cases)", () => {
   });
 
   it("rejects malformed rate-limit tier entries", () => {
-    const schema = checkById("rate-limits").payloadSchema;
     const errors = errorsFor(
       {
         effective_date: "2026-08-24",
+        token_costs: {},
+        batch_admission: "x",
         tiers: [
           {
             tier: "Standard",
@@ -508,12 +966,11 @@ describe("nested contract validation (negative cases)", () => {
           },
         ],
       },
-      schema,
+      specOf("rate-limits"),
+      "per-signer-token-buckets-snapshot",
     );
     expect(
-      errors.some((error) =>
-        error.includes("tiers[0].order_tokens_per_s"),
-      ),
+      errors.some((error) => error.includes("tiers[0].order_tokens_per_s")),
     ).toBe(true);
     expect(
       errors.some((error) =>
@@ -522,12 +979,162 @@ describe("nested contract validation (negative cases)", () => {
     ).toBe(true);
   });
 
+  it("rejects a fractional rate-limit token rate", () => {
+    const payload = exampleNamed(
+      "rate-limits/rate-limits.json",
+      "per-signer-token-buckets-snapshot",
+    );
+    (payload["tiers"] as Array<Record<string, unknown>>)[0] = {
+      tier: "Standard",
+      volume_30d_usd: "0",
+      order_tokens_per_s: 40.5,
+      order_burst: 60,
+      cancel_tokens_per_s: 80,
+      cancel_burst: 120,
+    };
+    expect(
+      errorsFor(
+        payload,
+        specOf("rate-limits"),
+        "per-signer-token-buckets-snapshot",
+      ).some((error) => error.includes("order_tokens_per_s: expected integer")),
+    ).toBe(true);
+  });
+
+  // The review probe: a boolean header value produced ZERO errors before the
+  // header bag was typed.
+  it("rejects a BOOLEAN rate-limit header value", () => {
+    const errors = errorsFor(
+      {
+        headers: {
+          "Poly-RateLimit-Remaining": true,
+          "Poly-RateLimit-Reset": "1782753360",
+          "Poly-RateLimit-Tier": "standard",
+        },
+      },
+      specOf("rate-limits"),
+      "response-headers-success",
+    );
+    expect(
+      errors.some((error) =>
+        error.includes("headers.Poly-RateLimit-Remaining"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a non-numeric rate-limit reset header and an undocumented header name", () => {
+    const errors = errorsFor(
+      {
+        headers: {
+          "Poly-RateLimit-Remaining": "57",
+          "Poly-RateLimit-Reset": "soon",
+          "Poly-RateLimit-Tier": "standard",
+          "X-Invented-Header": "1",
+        },
+      },
+      specOf("rate-limits"),
+      "response-headers-success",
+    );
+    expect(
+      errors.some((error) => error.includes("headers.Poly-RateLimit-Reset")),
+    ).toBe(true);
+    expect(
+      errors.some((error) =>
+        error.includes("headers.X-Invented-Header: unexpected key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects non-integer IP limits and malformed dual-limit entries", () => {
+    const errors = errorsFor(
+      {
+        effective_date: "2026-08-24",
+        enforcement: "x",
+        limits_per_10s: { general: "lots" },
+        trading_dual_limits: {
+          "POST /order": true,
+          "DELETE /order": { burst_per_10s: 5000 },
+        },
+      },
+      specOf("rate-limits"),
+      "ip-limits-snapshot",
+    );
+    expect(
+      errors.some((error) => error.includes("limits_per_10s.general")),
+    ).toBe(true);
+    expect(
+      errors.some((error) =>
+        error.includes('trading_dual_limits.POST /order: expected object'),
+      ),
+    ).toBe(true);
+    expect(
+      errors.some((error) =>
+        error.includes("sustained_per_10min: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a non-decimal fee-table value", () => {
+    const payload = exampleNamed(
+      "fees/fee-reward-parameters.json",
+      "fee-model-snapshot",
+    );
+    (payload["taker_fee_rate_by_category"] as Record<string, unknown>)[
+      "crypto"
+    ] = false;
+    expect(
+      errorsFor(payload, specOf("fees-and-rewards"), "fee-model-snapshot").some(
+        (error) => error.includes("taker_fee_rate_by_category.crypto"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects non-canonical rebate tier rates and malformed nested reward settings", () => {
+    const payload = exampleNamed(
+      "fees/fee-reward-parameters.json",
+      "liquidity-rewards-market-settings",
+    );
+    const settings = payload["market_settings_example"] as Record<
+      string,
+      unknown
+    >;
+    (settings["clobRewards"] as Array<Record<string, unknown>>)[0] = {
+      id: "sanitized-reward-id-0001",
+      conditionId: "0xnothex",
+      assetAddress: "0x0000000000000000000000000000000000000000",
+      rewardsAmount: 10000,
+      rewardsDailyRate: 100,
+      startDate: "2026-07-01",
+    };
+    const errors = errorsFor(
+      payload,
+      specOf("fees-and-rewards"),
+      "liquidity-rewards-market-settings",
+    );
+    expect(
+      errors.some((error) => error.includes("clobRewards[0].conditionId")),
+    ).toBe(true);
+    expect(
+      errors.some((error) =>
+        error.includes("clobRewards[0].endDate: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects an example whose name has no declared schema variant", () => {
+    expect(
+      errorsFor({}, specOf("fees-and-rewards"), "brand-new-snapshot").some(
+        (error) => error.includes("no schema variant declared"),
+      ),
+    ).toBe(true);
+  });
+
   it("rejects malformed position transaction outcomes and requests", () => {
-    const schema = checkById("position-operations").payloadSchema;
     const errors = errorsFor(
       {
         operation: "split",
         description: "d",
+        onchain_function: "splitPosition(...)",
         request: {
           collateralToken: "0x0000000000000000000000000000000000000000",
           conditionId: "c",
@@ -535,16 +1142,14 @@ describe("nested contract validation (negative cases)", () => {
         },
         transaction_outcome: { transactionHash: "0x00" },
       },
-      schema,
+      specOf("position-operations"),
     );
     expect(
       errors.some((error) =>
         error.includes("request.parentCollectionId: missing required key"),
       ),
     ).toBe(true);
-    expect(
-      errors.some((error) => error.includes("request.amount")),
-    ).toBe(true);
+    expect(errors.some((error) => error.includes("request.amount"))).toBe(true);
     expect(
       errors.some((error) =>
         error.includes(
@@ -554,12 +1159,70 @@ describe("nested contract validation (negative cases)", () => {
     ).toBe(true);
   });
 
+  it("rejects a non-address value in the published contract map", () => {
+    const payload = exampleNamed(
+      "positions/split-merge-redeem.json",
+      "contract-addresses-polygon-snapshot",
+    );
+    (payload["contracts"] as Record<string, unknown>)["pUSD"] = 42;
+    expect(
+      errorsFor(payload, specOf("position-operations")).some((error) =>
+        error.includes("contracts.pUSD"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a truncated contract address", () => {
+    const payload = exampleNamed(
+      "positions/split-merge-redeem.json",
+      "contract-addresses-polygon-snapshot",
+    );
+    (payload["contracts"] as Record<string, unknown>)["pUSD"] = "0xC011a7";
+    expect(
+      errorsFor(payload, specOf("position-operations")).some((error) =>
+        error.includes("contracts.pUSD"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects malformed negative-risk event flags", () => {
+    const payload = exampleNamed(
+      "positions/split-merge-redeem.json",
+      "neg-risk-conversion-note",
+    );
+    payload["event_flags"] = { enableNegRisk: "true" };
+    const errors = errorsFor(payload, specOf("position-operations"));
+    expect(
+      errors.some((error) =>
+        error.includes("event_flags.enableNegRisk: expected boolean"),
+      ),
+    ).toBe(true);
+    expect(
+      errors.some((error) =>
+        error.includes("event_flags.negRiskAugmented: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects an amount on the redeem request (indexSets-only shape)", () => {
+    const payload = exampleNamed(
+      "positions/split-merge-redeem.json",
+      "redeem-request-and-outcome",
+    );
+    (payload["request"] as Record<string, unknown>)["amount"] = "1";
+    expect(
+      errorsFor(payload, specOf("position-operations")).some((error) =>
+        error.includes("request.amount: unexpected key"),
+      ),
+    ).toBe(true);
+  });
+
   it("rejects malformed RTDS payloads", () => {
-    const schema = checkById("chainlink-twap-rtds").payloadSchema;
     const errors = errorsFor(
       {
         topic: "crypto_prices_twap_thirty",
         type: "update",
+        timestamp: 1785178800123,
         payload: {
           symbol: "btc/usd",
           value: 65000.5,
@@ -567,18 +1230,63 @@ describe("nested contract validation (negative cases)", () => {
           timestamp: 1,
         },
       },
-      schema,
+      specOf("chainlink-twap-rtds"),
+      "twap-update-30s",
     );
     expect(
-      errors.some((error) =>
-        error.includes("payload.full_accuracy_value"),
-      ),
+      errors.some((error) => error.includes("payload.full_accuracy_value")),
     ).toBe(true);
     expect(
       errors.some((error) =>
         error.includes("payload.window_s: missing required key"),
       ),
     ).toBe(true);
+  });
+
+  it("validates RTDS subscribe subscriptions[] entries", () => {
+    const errors = errorsFor(
+      {
+        action: "subscribe",
+        subscriptions: [
+          { topic: 12345, type: "update", filters: "{}" },
+          { topic: "crypto_prices_twap_thirty", type: "snapshot", filters: "{}" },
+          { topic: "crypto_prices_twap_sixty", type: "update" },
+        ],
+      },
+      specOf("chainlink-twap-rtds"),
+      "subscribe-request",
+    );
+    expect(
+      errors.some((error) => error.includes("subscriptions[0].topic")),
+    ).toBe(true);
+    expect(
+      errors.some((error) => error.includes("subscriptions[1].type")),
+    ).toBe(true);
+    expect(
+      errors.some((error) =>
+        error.includes("subscriptions[2].filters: missing required key"),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects an RTDS subscribe frame with no subscriptions key", () => {
+    expect(
+      errorsFor(
+        { action: "subscribe" },
+        specOf("chainlink-twap-rtds"),
+        "subscribe-request",
+      ).some((error) => error.includes("subscriptions: missing required key")),
+    ).toBe(true);
+  });
+
+  it("rejects an empty RTDS payload (no all-optional pass)", () => {
+    expect(
+      errorsFor({}, specOf("chainlink-twap-rtds"), "twap-update-30s").length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("rejects an empty geoblock payload", () => {
+    expect(errorsFor({}, specOf("geoblock")).length).toBeGreaterThan(0);
   });
 });
 
@@ -605,6 +1313,14 @@ describe("market data details", () => {
       expect(inner["full_accuracy_value"]).toMatch(/^\d+$/);
       expect([30, 60]).toContain(inner["window_s"]);
     }
+  });
+
+  it("the frozen best-bid-ask example still carries non-empty quotes", () => {
+    // The SDK types these as optional empty-able decimals; the frozen fixture
+    // must still demonstrate the populated form.
+    const payload = exampleNamed("market-ws/best-bid-ask.json", "best-bid-ask");
+    expect(payload["best_bid"]).not.toBe("");
+    expect(payload["best_ask"]).not.toBe("");
   });
 });
 
@@ -682,6 +1398,38 @@ describe("position operations", () => {
   });
 });
 
+describe("SDK source pinning", () => {
+  it("every SDK-sourced fixture cites the pinned reference commit", () => {
+    const sdkFixtures = listJsonFiles(VENUE_FIXTURE_ROOT).filter(
+      (relativePath) => {
+        const result = loadFixture(relativePath, {});
+        return (
+          result.fixture?.source.startsWith(
+            "https://github.com/Polymarket/ts-sdk/",
+          ) === true
+        );
+      },
+    );
+    expect(sdkFixtures.length).toBeGreaterThan(0);
+    for (const relativePath of sdkFixtures) {
+      const source = loadFixture(relativePath, {}).fixture?.source ?? "";
+      expect(source, relativePath).toContain(SDK_REFERENCE_COMMIT);
+      expect(
+        source.startsWith(SDK_PERMALINK_PREFIX),
+        `${relativePath} source must start with ${SDK_PERMALINK_PREFIX}`,
+      ).toBe(true);
+    }
+  });
+
+  it("no fixture cites a mutable SDK branch link", () => {
+    for (const relativePath of listJsonFiles(VENUE_FIXTURE_ROOT)) {
+      const fixture = loadFixture(relativePath, {}).fixture;
+      expect(fixture?.source, relativePath).not.toContain("ts-sdk/blob/main/");
+      expect(fixture?.notes, relativePath).not.toContain("ts-sdk/blob/main/");
+    }
+  });
+});
+
 describe("validation failure modes", () => {
   it("rejects a non-object document (malformed JSON shape)", () => {
     const { errors } = validateFixtureDocument("not-json-object", "x/y", {});
@@ -713,10 +1461,12 @@ describe("validation failure modes", () => {
     const errors = errorsFor(
       { side: "HOLD", price: 0.5, live: "yes" },
       {
-        side: { type: "string", enum: ["BUY", "SELL"] },
-        price: { type: "decimal-string" },
-        live: { type: "boolean" },
-        missing: { type: "string" },
+        fields: {
+          side: { type: "string", enum: ["BUY", "SELL"] },
+          price: { type: "decimal-string" },
+          live: { type: "boolean" },
+          missing: { type: "string" },
+        },
       },
     );
     expect(errors.some((error) => error.includes("not in enum"))).toBe(true);
@@ -732,11 +1482,52 @@ describe("validation failure modes", () => {
   });
 
   it("accepts absent optional fields but validates them when present", () => {
-    const schema = {
-      hash: { type: "string", optional: true },
+    const spec = {
+      fields: { hash: { type: "string", optional: true } },
+    } as const satisfies PayloadSpec;
+    expect(errorsFor({}, spec)).toEqual([]);
+    expect(errorsFor({ hash: 5 }, spec).length).toBeGreaterThan(0);
+  });
+
+  it("distinguishes nullable (present, may be null) from optional (may be absent)", () => {
+    const spec = {
+      fields: {
+        nullableField: { type: "string", nullable: true },
+        optionalField: { type: "string", optional: true },
+        requiredField: { type: "string" },
+      },
+    } as const satisfies PayloadSpec;
+    expect(
+      errorsFor(
+        { nullableField: null, requiredField: "x" },
+        spec,
+      ),
+    ).toEqual([]);
+    expect(
+      errorsFor({ requiredField: "x" }, spec).some((error) =>
+        error.includes("nullableField: missing required key"),
+      ),
+    ).toBe(true);
+    expect(
+      errorsFor(
+        { nullableField: "a", requiredField: null },
+        spec,
+      ).some((error) => error.includes("requiredField: null is not an accepted value")),
+    ).toBe(true);
+  });
+
+  it("rejects unknown keys only when the schema is strict", () => {
+    const lenient = { fields: { a: { type: "string" } } } as const;
+    const strict = {
+      fields: { a: { type: "string" } },
+      strict: true,
     } as const;
-    expect(errorsFor({}, schema)).toEqual([]);
-    expect(errorsFor({ hash: 5 }, schema).length).toBeGreaterThan(0);
+    expect(errorsFor({ a: "x", b: 1 }, lenient)).toEqual([]);
+    expect(
+      errorsFor({ a: "x", b: 1 }, strict).some((error) =>
+        error.includes("b: unexpected key"),
+      ),
+    ).toBe(true);
   });
 
   for (const secretKey of [
@@ -775,6 +1566,25 @@ describe("validation failure modes", () => {
     "POLY_NONCE",
     "SIGNER_PRIVATE_KEY",
     "signerPrivateKey",
+    // Documented Polymarket names added in round 3.
+    "POLYMARKET_PRIVATE_KEY",
+    "polymarket_private_key",
+    "POLYMARKET_WALLET_ADDRESS",
+    "POLY_BUILDER_API_KEY",
+    "POLY_BUILDER_PASSPHRASE",
+    "POLY_BUILDER_SIGNATURE",
+    "POLY_BUILDER_TIMESTAMP",
+    "POLYMARKET_BUILDER_CODE",
+    // Obvious variants that must not slip through an exact-match list.
+    "POLYMARKET_BUILDER_API_KEY",
+    "builderApiKey",
+    "builder_code",
+    "WALLET_PRIVATE_KEY",
+    "deployer_private_key",
+    "POLYMARKET_API_SECRET",
+    "secretKey",
+    "privKey",
+    "pk",
   ]) {
     it(`fails validation when a fixture contains a non-placeholder "${secretKey}"`, () => {
       const errors = errorsFor(
@@ -789,6 +1599,33 @@ describe("validation failure modes", () => {
     });
   }
 
+  it("classifies documented credential names as credential-shaped", () => {
+    for (const key of [
+      "POLYMARKET_PRIVATE_KEY",
+      "POLYMARKET_BUILDER_API_KEY",
+      "POLY_BUILDER_API_KEY",
+      "POLYMARKET_WALLET_ADDRESS",
+      "POLYMARKET_BUILDER_CODE",
+    ]) {
+      expect(isCredentialShapedKey(key), key).toBe(true);
+    }
+  });
+
+  it("does not classify ordinary venue field names as credentials", () => {
+    for (const key of [
+      "asset_id",
+      "maker_address",
+      "auth",
+      "transaction_hash",
+      "best_bid",
+      "conditionId",
+      "assetAddress",
+      "collateralToken",
+    ]) {
+      expect(isCredentialShapedKey(key), key).toBe(false);
+    }
+  });
+
   it("allows sanitized placeholders in credential-shaped fields", () => {
     const errors = errorsFor(
       {
@@ -796,6 +1633,7 @@ describe("validation failure modes", () => {
         apiKey: "sanitized-api-key",
         POLY_SIGNATURE: "",
         POLY_ADDRESS: "0x0000000000000000000000000000000000000000",
+        POLYMARKET_PRIVATE_KEY: "",
       },
       {},
     );
@@ -803,12 +1641,68 @@ describe("validation failure modes", () => {
   });
 });
 
+const REQUIRED_REPORT_SECTIONS = [
+  "1",
+  "2",
+  "3",
+  "4",
+  "5",
+  "6",
+  "7",
+  "8",
+  "9",
+  "10.1",
+  "10.2",
+  "10.3",
+  "11",
+  "12",
+  "13",
+] as const;
+
+function syntheticReport(
+  overrides: Readonly<Record<string, string>> = {},
+): string {
+  const body = REQUIRED_REPORT_SECTIONS.map((section) => {
+    const text =
+      overrides[section] ??
+      (section === "13"
+        ? "PAPER-only attestation about this repository.\n"
+        : "Source: https://docs.polymarket.com/x\n");
+    return `## ${section}. Heading\n${text}`;
+  }).join("\n");
+  return `${body}\nUNVERIFIED inventory placeholder\n`;
+}
+
 describe("verification report validation", () => {
   it("the frozen report exists and validates", () => {
     const { content, validation } = loadAndValidateReport();
     expect(content).not.toBeNull();
     expect(validation.errors).toEqual([]);
     expect(validation.ok).toBe(true);
+  });
+
+  it("the frozen report cites no mutable SDK branch link", () => {
+    const { content } = loadAndValidateReport();
+    expect(content).not.toBeNull();
+    expect(content ?? "").not.toContain("ts-sdk/blob/main/");
+  });
+
+  it("every required section of the frozen report carries its own citation", () => {
+    const { content } = loadAndValidateReport();
+    const exempt = CITATION_EXEMPT_SECTIONS.map((entry) => entry.section);
+    for (const section of REQUIRED_REPORT_SECTIONS) {
+      if (exempt.includes(section)) {
+        continue;
+      }
+      expect(
+        reportSectionHasOfficialCitation(content ?? "", section),
+        `section ${section}`,
+      ).toBe(true);
+    }
+  });
+
+  it("the synthetic baseline report validates", () => {
+    expect(validateVerificationReport(syntheticReport()).errors).toEqual([]);
   });
 
   it("fails when the report file is missing", () => {
@@ -832,35 +1726,68 @@ describe("verification report validation", () => {
   });
 
   it("fails a report with headings but no citations at all", () => {
-    const headings = [
-      "1",
-      "2",
-      "3",
-      "4",
-      "5",
-      "6",
-      "7",
-      "8",
-      "9",
-      "10.1",
-      "10.2",
-      "10.3",
-      "11",
-      "12",
-      "13",
-    ]
-      .map((section) => `## ${section}. Heading\nUNVERIFIED text\n`)
-      .join("\n");
-    const validation = validateVerificationReport(headings);
+    const validation = validateVerificationReport(
+      syntheticReport(
+        Object.fromEntries(
+          REQUIRED_REPORT_SECTIONS.map((section) => [section, "UNVERIFIED\n"]),
+        ),
+      ),
+    );
     expect(validation.ok).toBe(false);
     expect(
+      validation.errors.some((error) => error.includes("no citations")),
+    ).toBe(true);
+  });
+
+  // Review finding HIGH-1: UNVERIFIED must never substitute for evidence.
+  it("FAILS a report where every section is UNVERIFIED and a single section carries the only URL", () => {
+    const overrides: Record<string, string> = Object.fromEntries(
+      REQUIRED_REPORT_SECTIONS.map((section) => [section, "UNVERIFIED\n"]),
+    );
+    overrides["1"] = "UNVERIFIED https://docs.polymarket.com/x\n";
+    const validation = validateVerificationReport(syntheticReport(overrides));
+    expect(validation.ok).toBe(false);
+    const exempt = CITATION_EXEMPT_SECTIONS.map((entry) => entry.section);
+    for (const section of REQUIRED_REPORT_SECTIONS) {
+      if (section === "1" || exempt.includes(section)) {
+        continue;
+      }
+      expect(
+        validation.errors.some((error) =>
+          error.includes(`report section ${section} has no official citation`),
+        ),
+        `section ${section} must be reported as uncited`,
+      ).toBe(true);
+    }
+  });
+
+  it("an UNVERIFIED marker alone does not satisfy a single section", () => {
+    const validation = validateVerificationReport(
+      syntheticReport({ "2": "UNVERIFIED: no official source exists.\n" }),
+    );
+    expect(
       validation.errors.some((error) =>
-        error.includes("no citations"),
+        error.includes("report section 2 has no official citation"),
       ),
     ).toBe(true);
   });
 
-  it("fails when a required section lacks official evidence", () => {
+  it("reportSectionHasOfficialCitation ignores UNVERIFIED markers", () => {
+    const content = "## 2. Orders\nUNVERIFIED, nothing else here\n";
+    expect(reportSectionHasOfficialCitation(content, "2")).toBe(false);
+  });
+
+  it("citation exemptions are explicitly enumerated with a rationale", () => {
+    expect(CITATION_EXEMPT_SECTIONS.length).toBeGreaterThan(0);
+    expect(CITATION_EXEMPT_SECTIONS.map((entry) => entry.section)).toEqual([
+      "13",
+    ]);
+    for (const entry of CITATION_EXEMPT_SECTIONS) {
+      expect(entry.rationale.length).toBeGreaterThan(20);
+    }
+  });
+
+  it("fails when a required section lacks its own official citation", () => {
     const content = [
       "## 1. SDK\nhttps://docs.polymarket.com/getting-started\n",
       "## 2. Orders\nno citation here, no marker\n",
@@ -868,9 +1795,7 @@ describe("verification report validation", () => {
     const validation = validateVerificationReport(content);
     expect(
       validation.errors.some((error) =>
-        error.includes(
-          "section 2 has no official citation or UNVERIFIED marker",
-        ),
+        error.includes("section 2 has no official citation of its own"),
       ),
     ).toBe(true);
   });
@@ -884,6 +1809,30 @@ describe("verification report validation", () => {
         error.includes("non-official citation"),
       ),
     ).toBe(true);
+  });
+
+  it("fails on an SDK citation that is not pinned to the reference commit", () => {
+    const validation = validateVerificationReport(
+      syntheticReport({
+        "1":
+          "Source: https://github.com/Polymarket/ts-sdk/blob/main/packages/bindings/src/shared.ts\n",
+      }),
+    );
+    expect(validation.ok).toBe(false);
+    expect(
+      validation.errors.some((error) =>
+        error.includes("not pinned to reference commit"),
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts an SDK citation pinned to the reference commit", () => {
+    const validation = validateVerificationReport(
+      syntheticReport({
+        "1": `Source: ${SDK_PERMALINK_PREFIX}packages/bindings/src/shared.ts\n`,
+      }),
+    );
+    expect(validation.errors).toEqual([]);
   });
 });
 

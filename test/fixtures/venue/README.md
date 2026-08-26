@@ -68,16 +68,38 @@ placeholders are substituted so parsers see realistic shapes.
 
 ## Raw vs normalized layers and SDK reference commit
 
-Raw wire fixtures (`user-ws/*`, `orders/rest-trades.json`) follow the raw
+Raw wire fixtures (`market-ws/*`, `user-ws/*`, `orders/*`) follow the raw
 Zod schemas in the official unified SDK bindings
-(`Polymarket/ts-sdk`, `packages/bindings/src/subscriptions/clob.ts` and
-`packages/bindings/src/shared.ts`) at reference commit
-`7fdbed42484b5d279c71aa36d3757d18968260da` (retrieved 2026-08-24). The
+(`Polymarket/ts-sdk`, `packages/bindings/src/subscriptions/clob.ts`,
+`packages/bindings/src/shared.ts`, `packages/bindings/src/clob/account.ts`,
+`packages/bindings/src/clob/order-response.ts`) at reference commit
+`7fdbed42484b5d279c71aa36d3757d18968260da` (retrieved 2026-08-24; raw
+sources re-verified verbatim 2026-08-26). Every SDK citation is a commit
+permalink — mutable `blob/main` links are rejected by the verifier — and
+each `source` field of an SDK-derived fixture must embed that commit. The
 docs' normalized events are camelCase SDK models layered on those raw
 schemas and are NOT what these fixtures represent. Per the SDK, the user
 websocket channel serializes plain trade statuses while REST serializes
 prefixed `TRADE_STATUS_*` constants, and `MatchedNotBroadcasted` appears
 only on REST trades (conflict C-3 in the verification report).
+
+Wire-type conventions preserved by these fixtures and enforced by
+`apps/ops-cli/src/verify-venue`:
+
+- Optional decimal fields use the SDK `OptionalDecimalStringSchema`, so the
+  **wire empty string `""` is a valid value** (`fee_rate_bps`, `best_bid`,
+  `best_ask`, `spread`, `tick_size`, `old_tick_size`, `min_order_size`,
+  `last_trade_price`, `last_trade_price.size`, `makingAmount`,
+  `takingAmount`).
+- `outcome_index`/`bucket_index` on the user websocket channel are
+  **integers** (`z.number().int()`); REST `bucket_index` is `z.number()`.
+- `timestamp`, `match_time`, `matchtime`, `last_update`, `created_at`, and
+  `expiration` are **digit strings** (`/^\d+$/`).
+- `orders/rest-trades.json` follows `ClobTradeSchema`/`MakerOrderSchema`
+  (every field required; no `outcome_index` on REST maker orders), which is
+  a different contract from the websocket trade event.
+- All decimal strings are canonical per handoff §7.3 (no trailing
+  fractional zeros): a documented 20% is recorded as `"0.2"`.
 
 ## Caveats
 
