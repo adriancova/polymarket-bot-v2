@@ -108,7 +108,10 @@ Maximum permitted run mode: `PAPER`
   `worktree-agent-a373c7ba6650bf1a9` onto it; gates reproduced by orchestrator.
   Venue-fact conflict recorded: review's `POLYMARKET_BUILDER_API_KEY` not found on
   2026-08-26 official pages; verified names are `POLY_BUILDER_API_KEY` and
-  `POLYMARKET_BUILDER_CODE`. Review round 4 (Codex session
+  `POLYMARKET_BUILDER_CODE` — later corrected in round 4: the migration page DOES
+  document `POLYMARKET_BUILDER_API_KEY`/`_SECRET`/`_PASSPHRASE`; `/builders/api-keys`
+  currently serves the Place Orders page; `POLY_BUILDER_*` headers live on the relayer
+  submit-a-transaction reference. Review round 4 (Codex session
   `01a03d29-c533-7fc3-a180-d6995aa359c8`, candidate `5b98b5e` vs `7faf30f`):
   **CHANGES REQUIRED** — 0 blocker, 1 high (HIGH-2 continuation: `validateObjectSpec`
   skips null/undefined map entries; RTDS `filters` wrongly mandatory vs official TWAP
@@ -119,8 +122,17 @@ Maximum permitted run mode: `PAPER`
   Round-3 items HIGH-1/HIGH-3/MEDIUM-1/LOW-1/LOW-2 confirmed resolved. Deviation
   judgments: canonicalized fee strings acceptable as normalized data (raw-wire caveat
   required); added SDK sources beneficial; synthetic-completed fixtures must stay
-  labeled; mutation-check claim not comprehensive. Remediation round 4 dispatched
-  2026-08-26. Not merged.
+  labeled; mutation-check claim not comprehensive. Remediation round 4 completed
+  2026-08-26 in `4505aaf` (whole-map validation with declared nullability; RTDS
+  `filters` optional with the wrong negative test replaced; nullable `transactionId`
+  and rewards `endDate` per re-fetched official docs; credential citations corrected
+  per-name — all four venue facts re-verified independently agreed with the review;
+  new scanner gap `POLYMARKET_BUILDER_SECRET` found and fixed; recursive catalog
+  guard; 257/257 tests; per-finding mutation checks). Orchestrator fast-forwarded
+  the branch and reproduced gates. Repair session disclosed one NEW out-of-scope
+  divergence: `clobRewards[].rewardsAmount`/`rewardsDailyRate` modeled as JSON
+  number vs official DecimalString — follow-up repair round 4b dispatched
+  2026-08-26 before review round 5. Not merged.
 
 ### WP-000 in-flight record (2026-08-24)
 
