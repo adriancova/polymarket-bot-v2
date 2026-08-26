@@ -3,7 +3,7 @@
 Owner: `WP-020`
 Packages: `packages/domain` (`@polymarket-bot/domain`), `packages/decimal` (`@polymarket-bot/decimal`)
 Authority: `docs/spec/polymarket-bot-orchestrator-handoff.md` §5.2, §6, §7, §11, §16
-Status: frozen on WP-020 acceptance — see [Contract freeze](#contract-freeze)
+Status: frozen on WP-020 acceptance — see [Contract freeze](#9-contract-freeze)
 
 ---
 

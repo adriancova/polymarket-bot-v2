@@ -22,8 +22,38 @@ Maximum permitted run mode: `PAPER`
 | `WP-000`               | Complete | None               | Merged `d427f00` (impl chain `8d16849`→…→`ddc56ff`, 6 review rounds) |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
-| `WP-030`               | In review (round 3) | `WP-000` ✓, `WP-020` ✓ | `wp-implementer` on branch `worktree-agent-a919f38ed969c8ffc` |
+| `WP-030`               | Complete | `WP-000` ✓, `WP-020` ✓ | Merged `59cf254` (impl chain `051bb62`→`1e30ff1`→`66d29a9`→`21a3370`) |
 | All remaining packages | Blocked  | See work plan      | —          |
+
+### WP-030 completion record (2026-08-26)
+
+- Implemented by `wp-implementer` (Opus subagent; session interrupted once by an
+  API limit and resumed) on branch `worktree-agent-a919f38ed969c8ffc`, base
+  `f7ccb8e`; chain `051bb62` (ADRs + contract docs) → `1e30ff1` (handoff) →
+  `66d29a9` (review round 1 remediation) → `21a3370` (round-2 residual fix,
+  applied directly by the orchestrator with disclosure in the handoff); merged to
+  `main` as `59cf254` under the release manager's standing delegation.
+- Independent adversarial reviews (fresh Codex session per round): round 1
+  CHANGES REQUIRED (2 medium: 5/26 citation-sample failures, dependency-layer
+  inconsistency), round 2 CHANGES REQUIRED (1 medium residue; fresh 15-site
+  citation sample over the unaudited surface passed in full), round 3 **ACCEPT**
+  (0 findings above NOTE; residual-fix scope and orchestrator disclosure
+  verified).
+- Post-merge integration on `main` at `59cf254`: all gates pass (1102/1102,
+  pytest, audit). The one inherited NOTE (broken `#contract-freeze` anchor in
+  `docs/contracts/domain.md`, present since WP-020) fixed in this governance
+  commit as promised in the WP-030 handoff.
+- Deliverables: ADR-001..ADR-012 (all Status: Accepted, evidence-cited),
+  `docs/adr/README.md` (ADR policy/template), `docs/contracts/
+  dependency-direction.md` (single-layer-per-package model, enumerated
+  same-layer edges S0–S2, mechanically implementable three-part CI check spec —
+  NOT yet enforced, owner unassigned), `docs/contracts/protected-contracts.md`
+  (protected-path policy + open venue-fact register), additive `domain.md` §10
+  ADR cross-reference, handoff `docs/handoffs/WP-030.md`.
+- Open items registered for later packages: dependency-check CI owner; venue-fact
+  gaps (same-account matching, shared-bucket arbitration, Binance/Coinbase
+  framing → WP-080/WP-090, U-6 50/50 mechanics → WP-110, U-7 SDK pin → WP-260,
+  C-1/U-1 → WP-070, C-2 → ledger/fees, C-3 → WP-280).
 
 ### WP-000 completion record (2026-08-26)
 
@@ -127,8 +157,9 @@ Maximum permitted run mode: `PAPER`
   the previously unaudited surface passed in full. Residual fix `21a3370`
   applied directly by the orchestrator (four-line wording + count + round-2
   history entry; disclosed in the handoff) — gates re-verified 1102/1102.
-  Review round 3 (focused, candidate `21a3370`) dispatched 2026-08-26 —
-  verdict pending. Not merged.
+  Review round 3 (focused, candidate `21a3370`): **ACCEPT**. Merged to `main` as
+  `59cf254` and post-merge verified (see WP-030 completion record); worktrees and
+  branches cleaned up. Wave 0 closeout audit pending.
 
 - `worktree-agent-a45b4929f044830ca` (WP-020): base `4c1d96f`, first candidate `815b6cb`
   (chain `e7844c9`→`815b6cb`). Implementer handoff `docs/handoffs/WP-020.md` (in worktree);
