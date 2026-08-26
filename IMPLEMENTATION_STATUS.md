@@ -19,7 +19,7 @@ Maximum permitted run mode: `PAPER`
 
 | Work package           | State    | Dependencies       | Assignment |
 | ---------------------- | -------- | ------------------ | ---------- |
-| `WP-000`               | In remediation (round 3) | None | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
+| `WP-000`               | In review (round 4) | None    | `venue-verifier` on branch `worktree-agent-a373c7ba6650bf1a9` |
 | `WP-020`               | In remediation (round 1) | `WP-010` ✓ | `wp-implementer` on branch `worktree-agent-a45b4929f044830ca` |
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Ready    | `WP-010` ✓         | Unassigned |
@@ -76,7 +76,19 @@ Maximum permitted run mode: `PAPER`
   misses `POLYMARKET_PRIVATE_KEY`/`POLYMARKET_BUILDER_API_KEY`). Round-2 findings
   M2/M3/M4 confirmed resolved; B1/H1/H2/M1 partial or unresolved. Path ownership,
   safety defaults, fixture coverage, and no-credential criteria PASS. Remediation
-  round 3 dispatched 2026-08-26. Not merged.
+  round 3 completed 2026-08-26 in `5b98b5e` (per-section citation gate with
+  enumerated exemptions; fully typed nested schemas with catalog guards; strict
+  SDK-fidelity validators verified verbatim against the pinned commit, adding
+  clob/account.ts and clob/order-response.ts sources; lexical price bounds;
+  pinned permalinks enforced by validator; credential scanner 57 vectors with
+  substring patterns; handoff claims corrected; 235/235 tests, mutation check
+  performed). Repair agent was git-isolated from the original worktree, so the
+  commit landed on `wp-000-remediation-round3` and the orchestrator fast-forwarded
+  `worktree-agent-a373c7ba6650bf1a9` onto it; gates reproduced by orchestrator.
+  Venue-fact conflict recorded: review's `POLYMARKET_BUILDER_API_KEY` not found on
+  2026-08-26 official pages; verified names are `POLY_BUILDER_API_KEY` and
+  `POLYMARKET_BUILDER_CODE`. Review round 4 dispatched 2026-08-26 — verdict
+  pending. Not merged.
 
 ### WP-000 in-flight record (2026-08-24)
 
