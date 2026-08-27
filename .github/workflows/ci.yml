@@ -39,6 +39,9 @@ jobs:
       - name: Unit tests
         run: pnpm test
 
+      - name: WAL fault-injection tests
+        run: pnpm test:fault
+
       - name: Dependency vulnerability scan (pnpm lockfile)
         run: pnpm audit --audit-level high
 

@@ -25,7 +25,7 @@ Maximum permitted run mode: `PAPER`
 | `WP-030`               | Complete | `WP-000` ✓, `WP-020` ✓ | Merged `59cf254` (impl chain `051bb62`→`1e30ff1`→`66d29a9`→`21a3370`) |
 | `WP-015`               | In remediation (round 4) | `WP-030` ✓ | `wp-implementer` on branch `worktree-agent-a2a6f707d957e8153`. Chain: `c668493` (r1: scanner bypasses) → `c9b59b2` (lexer hardening) → `7de62d0` (r2: TS-compiler-API rebuild) → `6658026` (r3: require-capability tracking — all 12 r3 bypasses closed, verified). Round 4 (`6658026`): **CHANGES REQUIRED** — 1 high remaining: an unconsumed REFERENCE to the ambient require capability escapes silently through object/array literals, `exports.load = require`, `Reflect.apply`, `.bind`, and plain assignment (7 working silent loads probed); everything else verified (globalThis/process routes caught, byte-identical manifests, all 82 tests, repo PASS). Round-4 remediation dispatched 2026-08-26 with binding direction: any reference to a require capability outside handled positions is itself a finding (noisy-never-silent), mirroring the Date/process reference rule. |
 | `WP-040`               | In remediation (round 3) | All ✓ | `wp-implementer` on branch `worktree-agent-aa6e4c6fd7701b054`. Chain: `0a73ffe` → r1 `f439e55` → r2 `65d9622`/`8be5e5c` (all round-2 bypasses reproduced-then-rejected; immutable balance identity; `account_key` sentinel; forward-only leases + un-lowerable token high-water; ledger discriminator FKs; 178 integration tests). Round 3 (`8be5e5c`): **CHANGES REQUIRED** — 1 high (F10 residual: `market_id = NULL` skips the market binding on order/fill-linked ledger transactions via MATCH SIMPLE; needs conditional NOT NULL when order/fill referenced), 1 medium (`SIGNED` exempt from attempt lineage contradicts §9.11 step order — attempt precedes signing, so SIGNED requires an attempt; R16 wording inaccurate). All other round-2 items RESOLVED; sentinel/ledger-entries-unbinding/R15/D14 judgments ACCEPTED. Remediation round 3 dispatched 2026-08-26. |
-| `WP-050`               | In remediation (round 3) | All ✓ | `wp-implementer` on branch `worktree-agent-a8f55b87222d2953c`. Rounds 1-2 → `3f35a0c` (durability watermark). Round 3 (`3f35a0c`): **CHANGES REQUIRED** — 1 high (at-least-once incomplete: when a fault leaves the whole segment unmanifested, records fsynced EARLIER in it were dropped from `#unproven` on fsync success and are then neither manifested nor returned to pending — silent gap; three fresh reproductions incl. mid-batch torn append), 1 medium (variable-length custom segmentIdFactory measured at projection but re-called with a later clock at open — cap defeated by 7964 bytes in a probe; default/stable-length factories unaffected), 2 low (ordinal inference rejects a valid custom-factory id with MANIFEST_INCONSISTENT; handoff 43-vs-45 file count). **Durability-freeze design ENDORSED by review** (under-claim + detectable duplicates + WP-130 dedup is the right recorder trade; narrowing to fsync-only would need an ADR); the blocker is that the impl doesn't deliver the at-least-once side for earlier-fsynced records. HIGH-1b/HIGH-2/burst-for-default-ids RESOLVED. Remediation round 3 dispatched 2026-08-26. |
+| `WP-050`               | Complete | All ✓             | Merged `8a607ec` (impl chain `32cb0a8`→`3c2228a`→`a972e96`→`3f35a0c`→`b3a906f`→`22db770`, 4 review rounds) |
 | `WP-060`               | Ready (authorized, Wave 1 batch 1A) | All ✓ | Unassigned — start after a 1A merge slot frees |
 | `WP-070`, `WP-080`, `WP-090` | Ready (Wave 1 batch 1B — after 1A per runbook) | All ✓ | Unassigned |
 | `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
@@ -35,6 +35,34 @@ Maximum permitted run mode: `PAPER`
 Authorization vocabulary: "Ready (authorized)" rows are the only packages agents
 may begin in the current run; "Dependency-ready" rows must not start until this
 table says otherwise.
+
+### WP-050 completion record (2026-08-26)
+
+- Implemented by `wp-implementer` (Opus) on branch `worktree-agent-a8f55b87222d2953c`,
+  base `b1431e4`; chain `32cb0a8` (initial) → `3c2228a` (handoff) → `a972e96` (r1)
+  → `3f35a0c` (r2) → `b3a906f` (r3) → `22db770` (orchestrator LOW wording fixes,
+  disclosed); merged `8a607ec` under the standing delegation.
+- Reviews (fresh Codex per round): r1 CHANGES REQUIRED (frame loss on non-append
+  faults; doctored-metadata validation; soft cap), r2 CHANGES REQUIRED
+  (fsyncgate; queue stranding; sidecar double-count; burst cap), r3 CHANGES
+  REQUIRED (earlier-fsynced accountability; factory width; ordinal false
+  positive) — each round's fixes probe-reproduced first — r4 **ACCEPT**
+  (mutation walk verified no release-without-manifest path; recovery table,
+  checksum boundary, older-manifest compatibility, §13 worked example all
+  verified; 2 LOW doc wordings fixed pre-merge).
+- Core guarantees as merged: durability watermark (any fsync-or-write failure
+  freezes durability claims permanently; manifests never overcount);
+  accountability released ONLY by a written manifest (an unmanifested segment
+  returns every accepted record to `pendingFrames()` — at-least-once);
+  `maxTotalBytes` holds for default/stable factories with an enforced
+  1024-byte factory-id bound; provenance-scoped manifest validation.
+- **Binding obligations on consumers** (carry into WP-120/WP-130 packets):
+  dedup on `(gatewayEpoch, ingestSeq)` is MANDATORY (duplicates are the normal
+  fault-boundary outcome by design); the gateway drives `drain()`/`tick()` and
+  routes refusals/faults to incidents; retention memory (one segment's records,
+  64 MiB default bound) is reasoned-not-profiled — profile in WP-140 soak.
+- Post-merge: 1387 root + 89 fault tests green; root `test:fault` script and a
+  CI step wired by the orchestrator in the completion commit (recorded plan).
 
 ### WP-030 completion record (2026-08-26)
 

@@ -13,6 +13,7 @@
     "typecheck": "pnpm -r run typecheck && tsc -p test/tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run --config test/vitest.config.ts",
+    "test:fault": "pnpm --filter @polymarket-bot/storage-wal test:fault",
     "test:integration": "node -e \"console.log('SKIP: integration tests are not implemented until WP-040+ (PostgreSQL/Redis integration work packages). Exiting 0 with no tests executed. Compose infrastructure health is validated separately by test:compose.')\"",
     "test:compose": "docker compose config --quiet && docker compose up -d --wait && docker compose exec -T postgres pg_isready -U devlocal -d polymarket_bot_dev && docker compose exec -T redis redis-cli ping && docker compose down",
     "audit": "pnpm audit --audit-level high",
