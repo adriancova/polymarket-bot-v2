@@ -2615,6 +2615,381 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
   });
 });
 
+/**
+ * Round 8. `collectAliasDecls` tracked DEFAULT and NAMESPACE imports of
+ * `node:module` but not NAMED (or renamed) ones, so in `packages/simulation`
+ * (where importing `node:module` is not itself a finding — only F5 applies)
+ * every named-import spelling reached a working synchronous loader in silence:
+ *
+ *   import { createRequire as cr, Module as M } from "node:module";
+ *   cr(import.meta.url)("ethers");                              // silent — loads
+ *   M._load("ethers", new M(import.meta.url), false);          // silent — loads
+ *   new M(import.meta.url).require("ethers");                  // silent — loads
+ *   M.prototype.require.call(new M(import.meta.url), "ethers"); // silent — loads
+ *
+ * `capabilityOf` treated the renamed bindings as unrelated locals, so F5 never
+ * fired. The fix binds each NAMED/renamed `node:module` export that is a loader
+ * surface — `createRequire` (→ createRequire-factory), `Module` (→ the Module
+ * class, whose `._load`, `.prototype.require`, and instances' `.require` are
+ * loaders, mirroring `module.constructor`), and `register` (→ a dynamic import of
+ * its arg-0 specifier) — to the capability its call yields. `builtinModules`,
+ * `isBuiltin`, `SourceMap`, `syncBuiltinESMExports`, and `_resolveFilename` load
+ * nothing and stay clean. Default and namespace imports already flagged; these
+ * probes assert the named forms now do too, with no regression.
+ *
+ * This closes the last ORDINARY-CODE (non-reflective, single-file, statically
+ * named) synchronous-load route. The residuals are inherent to a name-enumeration
+ * scanner (reflective acquisition, cross-file injection) — see
+ * `docs/handoffs/WP-015.md`.
+ */
+describe("dependency-direction check — round-8 named-node:module-import regressions", () => {
+  const simulationFile = "packages/simulation/src/probe.ts";
+  const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
+
+  describe("the four review probe spellings load a signer in simulation (F5)", () => {
+    it("catches a renamed `createRequire as cr`: `cr(import.meta.url)(\"ethers\")`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { createRequire as cr, Module as M } from "node:module";',
+              'export const signer = cr(import.meta.url)("ethers");',
+              "void M;",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("catches `M._load(\"ethers\", new M(import.meta.url), false)`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              'export const signer = M._load("ethers", new M(import.meta.url), false);',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("catches `new M(import.meta.url).require(\"ethers\")`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              'export const signer = new M(import.meta.url).require("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("catches `M.prototype.require.call(new M(import.meta.url), \"ethers\")`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              'export const signer = M.prototype.require.call(new M(import.meta.url), "ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+  });
+
+  describe("the unrenamed named forms and the CJS destructure mirror", () => {
+    it("catches an unrenamed `import { Module }` then `Module._load(\"ethers\", ...)`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module } from "node:module";',
+              'export const signer = Module._load("ethers", null, false);',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("catches the default-style `import { createRequire }` then `createRequire(...)(\"ethers\")`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { createRequire } from "node:module";',
+              'export const signer = createRequire(import.meta.url)("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+    });
+
+    it("catches the `.cjs` destructure `const { Module } = require(\"node:module\")`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/simulation/src/probe.cjs": [
+              'const { Module } = require("node:module");',
+              'exports.signer = new Module(__filename).require("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.cjs:2");
+    });
+
+    it("catches the renamed CJS destructure `const { createRequire: cr } = require(\"node:module\")`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/simulation/src/probe.cjs": [
+              'const { createRequire: cr } = require("node:module");',
+              'exports.signer = cr(__filename)("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.cjs:2");
+    });
+  });
+
+  describe("the named `register` export is a dynamic-import loader", () => {
+    it("classifies `register(\"ethers\")` in simulation as an F5 load", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { register } from "node:module";',
+              'export const done = register("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("reports a computed `register(spec)` specifier as F-OPAQUE", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { register } from "node:module";',
+              "declare const spec: string;",
+              "export const done = register(spec);",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("calls `module.register()` whose specifier is a non-literal expression");
+    });
+  });
+
+  describe("computed and escaping forms of a named `Module` import fail closed", () => {
+    it("reports a computed `M[\"_lo\"+\"ad\"](\"ethers\")` as fail-closed", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              'export const signer = M["_lo" + "ad"]("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("is read with a computed member expression");
+      expect(run.output).toContain("the `node:module` `Module` class");
+    });
+
+    it("reports a computed `M._load(x)` specifier as F-OPAQUE", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              "declare const x: string;",
+              "export const mod = M._load(x);",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("calls `Module._load()` whose specifier is a non-literal expression");
+    });
+
+    it("reports a bare `Module` escaping into a call argument as F-OPAQUE", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              "declare function wire(klass: unknown): void;",
+              "export const done = wire(M);",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("the `node:module` `Module` class");
+      expect(run.output).toContain("escapes into a call argument");
+    });
+  });
+
+  describe("named imports classify in a strategy (F3), and namespace/default forms do not regress", () => {
+    it("classifies a named `Module._load(\"node:fs\")` in a strategy as F3, plus the F3 on the import", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              'import { Module } from "node:module";',
+              'export const fs = Module._load("node:fs");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:module` (process/environment built-in)");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("keeps a namespace `mod.Module._load(\"ethers\")` flagging (no regression)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import * as mod from "node:module";',
+              'export const signer = mod.Module._load("ethers", null, false);',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+    });
+
+    it("keeps a namespace `mod.createRequire(...)(\"ethers\")` flagging (no regression)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import * as mod from "node:module";',
+              'export const signer = mod.createRequire(import.meta.url)("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+    });
+  });
+
+  describe("negatives: inert exports and unrestricted packages add no noise", () => {
+    it("leaves inert `import { builtinModules, isBuiltin }` used inertly clean in simulation", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { builtinModules, isBuiltin } from "node:module";',
+              "export const count = builtinModules.length;",
+              'export const yes = isBuiltin("node:fs");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("leaves the named loader imports alone in an unrestricted package (apps/ops-cli)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "apps/ops-cli/src/probe.ts": [
+              'import { createRequire as cr, Module as M, register } from "node:module";',
+              'export const signer = cr(import.meta.url)("ethers");',
+              'export const loaded = M._load("ethers", new M(import.meta.url), false);',
+              'export const inst = new M(import.meta.url).require("ethers");',
+              'export const done = register("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("leaves a genuine local `Module` unrelated to node:module clean", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "class Module {",
+              "  public static _load(_m: string): unknown {",
+              "    return undefined;",
+              "  }",
+              "}",
+              'export const value = Module._load("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("keeps this repository passing", () => {
+      const run = runChecker(buildFixture());
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+});
+
 describe("dependency-direction check CLI", () => {
   it("prints usage and exits 0 for --help", () => {
     const result = spawnSync(process.execPath, [checkerPath, "--help"], { encoding: "utf8", cwd: repoRoot });

@@ -168,8 +168,12 @@
  *     A "loader capability" is the ambient `require`, a CommonJS `Module` object
  *     (the `module` global, and `process.mainModule`/`require.main` — round 7),
  *     `createRequire` (which manufactures a `require`), the result of calling it,
- *     `process.getBuiltinModule`, the `node:module` namespace (round 5), and
- *     any alias this check tracks to one of those. The positions that do
+ *     `process.getBuiltinModule`, the `node:module` namespace (round 5), the
+ *     `node:module` `Module` class and its loader members (`Module._load`,
+ *     `Module.prototype.require`, `new Module(...).require`) and `module.register`
+ *     when reached through a NAMED `node:module` import (round 8 — default and
+ *     namespace imports already resolved), and any alias this check tracks to one
+ *     of those. The positions that do
  *     *not* additionally flag — because the check follows the value through them
  *     — are exactly: the callee of an analyzed call (which yields a specifier or
  *     an `F-OPAQUE`), the `.call`/`.apply` reflection callee, the initializer of
@@ -266,16 +270,25 @@
  * KNOWN LIMIT — **every catalogue in this file is a list, not a proof.** The
  * loader family (`LOADER_CAPABILITIES`), the evaluator surface (`EVALUATORS` +
  * `EVALUATOR_PROPERTY`) and the library catalogues below all enumerate what this
- * check *recognises*. Review rounds 3, 4, 5, 6 and 7 each found exactly one
+ * check *recognises*. Review rounds 3, 4, 5, 6, 7 and 8 each closed exactly one
  * missing member — the `require` family, unconsumed capability references,
- * `process.getBuiltinModule`, `.constructor`, and `process.mainModule`/
- * `require.main` — and the honest reading is that the list is still assumed
- * incomplete: this is now five consecutive rounds of "add the one member the last
- * round missed". Rules stated over a recognised list are total only over what
- * they recognise. See `docs/handoffs/WP-015.md` follow_up 8 for the positive form
- * (a checker total over "no call whose callee resolves to a declared import") that
- * would end the pattern; it needs `docs/contracts/**` and so is the contract
- * owner's, not this package's.
+ * `process.getBuiltinModule`, `.constructor`, `process.mainModule`/`require.main`,
+ * and NAMED/renamed `node:module` imports (`createRequire`/`Module`/`register`).
+ * With the named-import gap closed, no ORDINARY-CODE route — non-reflective,
+ * single-file, statically named — is known to reach a synchronous forbidden load
+ * silently. The residuals are inherent to a name-enumeration scanner, not one more
+ * spelling to add: (i) REFLECTIVE property acquisition of a loader/evaluator
+ * (`Reflect.get(process, "mainModule").require(...)`,
+ * `Reflect.get(fn, "constructor")(...)`), which names no member the walk can read;
+ * (ii) CROSS-FILE capability injection (a loader handed in from another package is
+ * invisible — see the AST KNOWN LIMITs); and (iii) any not-yet-enumerated
+ * recognised-list member. Rules stated over a recognised list are total only over
+ * what they recognise. The DURABLE fix that subsumes all three is the positive rule
+ * in `docs/handoffs/WP-015.md` follow_up 8 (a checker total over "a call whose
+ * callee does not statically resolve to a declared import binding or a known-pure
+ * local is a finding"); it needs a numbered `docs/contracts/**` §3 rule and carries
+ * a real noise trade-off, so it is the WP-030 contract owner's to authorize, not
+ * this package's.
  *
  * KNOWN LIMIT — the library catalogues below (`REDIS_CLIENTS`,
  * `DATABASE_CLIENTS`, `VENUE_SDKS`, `SIGNER_LIBRARIES`, `NETWORK_LIBRARIES`,
@@ -566,6 +579,24 @@ const CAP_FACTORY = "createRequire-factory";
 const CAP_BUILTIN_LOADER = "getBuiltinModule-loader";
 const CAP_MODULE_NS = "module-namespace";
 const CAP_PROCESS = "process-global";
+// The `Module` class itself, held by a NAMED `node:module` import
+// (`import { Module } from "node:module"` / `import { Module as M }`) — the same
+// class `module.constructor` yields (round 6) and `require("node:module").Module`
+// names. It is an evaluator-or-loader capability whose members are loaders:
+// `Module._load` (a loader call — CAP_MODULE_LOAD below), `Module.prototype`
+// (a `Module`-shaped object — CAP_MODULE), and `new Module(...)` (a `Module`
+// instance — CAP_MODULE), each reaching a synchronous `.require`. A bare
+// `Module` reference is an `F-OPAQUE` escape (WP-015 review round 8).
+const CAP_MODULE_CLASS = "module-class";
+// `Module._load(request, parent, isMain)` — the synchronous primitive `require`
+// itself calls. Arg 0 is the specifier, so it is a loader *call*, classified
+// exactly like `require(...)` (round 8).
+const CAP_MODULE_LOAD = "module-load";
+// `module.register(specifier[, parentURL][, options])` — the named `node:module`
+// export that dynamically imports its arg-0 specifier as an ESM customization
+// hook. It loads a module by name, so it is a loader call too (round 8 judgement;
+// see the export-by-export audit in `docs/handoffs/WP-015.md`).
+const CAP_REGISTER = "register-loader";
 
 /** How each capability is named in an escape finding. */
 const CAPABILITY_LABELS = new Map([
@@ -578,6 +609,12 @@ const CAPABILITY_LABELS = new Map([
   [CAP_BUILTIN_LOADER, "`process.getBuiltinModule`, which loads any Node built-in by name"],
   [CAP_MODULE_NS, "the `node:module` namespace (from which `createRequire` is reachable)"],
   [CAP_PROCESS, "the `process` global (from which `process.getBuiltinModule` is reachable)"],
+  [
+    CAP_MODULE_CLASS,
+    "the `node:module` `Module` class (`Module._load`, `Module.prototype.require`, and `new Module(...).require` are loaders)",
+  ],
+  [CAP_MODULE_LOAD, "`Module._load`, the synchronous primitive `require` itself calls"],
+  [CAP_REGISTER, "`module.register`, which dynamically imports a module by name"],
 ]);
 
 /**
@@ -590,6 +627,9 @@ const LOADER_CAPABILITIES = new Set([
   CAP_FACTORY,
   CAP_BUILTIN_LOADER,
   CAP_MODULE_NS,
+  CAP_MODULE_CLASS,
+  CAP_MODULE_LOAD,
+  CAP_REGISTER,
 ]);
 
 /**
@@ -601,13 +641,44 @@ const LOADER_CAPABILITIES = new Set([
 const LOADER_CALL_LABELS = new Map([
   [CAP_REQUIRE, "require"],
   [CAP_BUILTIN_LOADER, "getBuiltinModule"],
+  [CAP_MODULE_LOAD, "Module._load"],
+  [CAP_REGISTER, "register"],
+]);
+
+/**
+ * NAMED (and renamed) `node:module` exports that are loader/eval surfaces, and
+ * the capability each binds its local name to (WP-015 review round 8). A default
+ * or namespace import of `node:module` is `CAP_MODULE_NS` (handled separately);
+ * these are the members reachable by *naming* the export directly — the same set
+ * a destructure of the namespace (`const { Module } = require("node:module")`)
+ * reaches, so `DESTRUCTURED_CAPABILITY_MEMBERS[CAP_MODULE_NS]` reuses this map:
+ *
+ *   `createRequire` — its call result is a CommonJS `require` (CAP_FACTORY, the
+ *     same capability the member `m.createRequire` yields today);
+ *   `Module`        — the class whose `._load`, `.prototype.require`, and
+ *     instances' `.require` are loaders (CAP_MODULE_CLASS);
+ *   `register`      — dynamically imports its arg-0 specifier (CAP_REGISTER).
+ *
+ * Every other export is inert and deliberately unbound: `builtinModules` (a
+ * frozen name array), `isBuiltin` (a name→boolean predicate), `SourceMap` (a
+ * source-map class), `syncBuiltinESMExports` (takes no specifier and loads
+ * nothing), and the compile-cache / `stripTypeScriptTypes` / `findPackageJSON`
+ * helpers (no specifier-loading or code-evaluation surface). `_resolveFilename`
+ * resolves a path but executes nothing, so it is not a load either. See the
+ * export-by-export audit in `docs/handoffs/WP-015.md`.
+ */
+const NODE_MODULE_NAMED_CAPABILITIES = new Map([
+  ["createRequire", CAP_FACTORY],
+  ["Module", CAP_MODULE_CLASS],
+  ["register", CAP_REGISTER],
 ]);
 
 /**
  * Which member of a capability-bearing object is itself a capability, for
  * destructuring (`const { require: r } = module`,
- * `const { getBuiltinModule } = process`, `const { mainModule } = process`).
- * Member access spells the same thing and is resolved by `capabilityOf`.
+ * `const { getBuiltinModule } = process`, `const { mainModule } = process`,
+ * `const { Module } = require("node:module")`). Member access spells the same
+ * thing and is resolved by `capabilityOf`.
  */
 const DESTRUCTURED_CAPABILITY_MEMBERS = new Map([
   [CAP_MODULE, new Map([["require", CAP_REQUIRE]])],
@@ -623,7 +694,14 @@ const DESTRUCTURED_CAPABILITY_MEMBERS = new Map([
       ["mainModule", CAP_MODULE],
     ]),
   ],
-  [CAP_MODULE_NS, new Map([["createRequire", CAP_FACTORY]])],
+  // Destructuring the `node:module` namespace reaches exactly the named exports
+  // — `const { createRequire, Module, register } = require("node:module")` — the
+  // CJS mirror of `import { ... } from "node:module"` (round 8).
+  [CAP_MODULE_NS, NODE_MODULE_NAMED_CAPABILITIES],
+  // `const { _load } = Module` / `const { prototype } = Module` reach the same
+  // loaders as the member reads (`Module._load`, `Module.prototype`), so a
+  // named `Module` import stays caught after being taken apart (round 8).
+  [CAP_MODULE_CLASS, new Map([["_load", CAP_MODULE_LOAD], ["prototype", CAP_MODULE]])],
 ]);
 
 /**
@@ -1559,6 +1637,28 @@ function scanSourceFile(ts, rootDir, fileRel) {
       const isEnvironmentRoot = Boolean(
         root && ts.isIdentifier(root) && ENVIRONMENT_ROOTS.has(root.text) && !isGenuinelyDeclared(root.text),
       );
+      // The `node:module` namespace members that are themselves capabilities:
+      // `mod.createRequire` is matched above (root-agnostic, like the member
+      // `m.createRequire` has always been); `mod.Module` is the class and
+      // `mod.register` the dynamic-import loader. Gated on the namespace root
+      // because `Module`/`register` are common member names elsewhere (round 8).
+      if (rootKind === CAP_MODULE_NS) {
+        if (member === "Module") return CAP_MODULE_CLASS;
+        if (member === "register") return CAP_REGISTER;
+      }
+      // The `Module` class held by a named `node:module` import (round 8). Its
+      // members are loaders: `Module._load(spec, parent, isMain)` is the
+      // synchronous primitive `require` calls (a loader call — CAP_MODULE_LOAD),
+      // and `Module.prototype` is a `Module`-shaped object whose `.require` is
+      // the loader (the CAP_MODULE branch below resolves it exactly like
+      // `module.require`). `Module._resolveFilename` only resolves a path and
+      // executes nothing, so it is not a load surface; every other member falls
+      // through to `null`.
+      if (rootKind === CAP_MODULE_CLASS) {
+        if (member === "_load") return CAP_MODULE_LOAD;
+        if (member === "prototype") return CAP_MODULE;
+        return null;
+      }
       // `globalThis.process` / `window["process"]` is the same carrier as a bare
       // `process`, and a tracked alias (`const p = process`) already resolves.
       if (member === "process" && isEnvironmentRoot) return CAP_PROCESS;
@@ -1609,6 +1709,12 @@ function scanSourceFile(ts, rootDir, fileRel) {
       }
       return null;
     }
+    // `new Module(...)` — a `Module` instance whose `.require` is the loader
+    // (round 8). Only the `node:module` `Module` class yields a capability here;
+    // any other `new X(...)` is an ordinary object.
+    if (ts.isNewExpression(inner)) {
+      return capabilityOf(inner.expression, extraAliases) === CAP_MODULE_CLASS ? CAP_MODULE : null;
+    }
     // `await import("node:module")` / `(await import("node:module"))`.
     if (ts.isAwaitExpression(inner)) return capabilityOf(inner.expression, extraAliases);
     return null;
@@ -1654,12 +1760,25 @@ function scanSourceFile(ts, rootDir, fileRel) {
       // `import * as m from "node:module"` / `import m = require("node:module")`
       // bind the namespace whose `createRequire` member is the factory. Naming
       // it makes a *computed* member read on it fail closed (review round 5).
+      // A NAMED import (`import { createRequire as cr, Module as M } from
+      // "node:module"`) binds each local name (its alias, if renamed) to the
+      // capability its export yields — the last ordinary-code loader gap the
+      // default/namespace forms already closed (review round 8).
       if (ts.isImportDeclaration(statement) && statement.importClause) {
         if (!isModuleNamespaceSpecifier(statement.moduleSpecifier)) continue;
         const clause = statement.importClause;
         if (clause.name) into.set(clause.name.text, CAP_MODULE_NS);
         const bindings = clause.namedBindings;
         if (bindings && ts.isNamespaceImport(bindings)) into.set(bindings.name.text, CAP_MODULE_NS);
+        if (bindings && ts.isNamedImports(bindings)) {
+          for (const element of bindings.elements) {
+            // `propertyName` is the exported name when the binding is renamed
+            // (`Module as M`); otherwise the local `name` is the exported name.
+            const exportName = (element.propertyName ?? element.name).text;
+            const capability = NODE_MODULE_NAMED_CAPABILITIES.get(exportName);
+            if (capability !== undefined) into.set(element.name.text, capability);
+          }
+        }
         continue;
       }
       if (ts.isImportEqualsDeclaration(statement) && ts.isExternalModuleReference(statement.moduleReference)) {
@@ -1836,7 +1955,9 @@ function scanSourceFile(ts, rootDir, fileRel) {
    * expression — not this one — is the one whose position decides the escape.
    * `module` in `module.require`, and `createRequire` in `createRequire(...)`,
    * are absorbed this way; `require` in `require("x")` is not, because
-   * `require("x")` denotes the loaded module, not a capability.
+   * `require("x")` denotes the loaded module, not a capability. `Module` in
+   * `new Module(...)` is absorbed too — the `new` expression is the `Module`
+   * instance capability (round 8).
    */
   const isAbsorbedCapability = (node) => {
     const outer = outerOf(node);
@@ -1845,7 +1966,8 @@ function scanSourceFile(ts, rootDir, fileRel) {
     if (
       (ts.isPropertyAccessExpression(parent) ||
         ts.isElementAccessExpression(parent) ||
-        ts.isCallExpression(parent)) &&
+        ts.isCallExpression(parent) ||
+        ts.isNewExpression(parent)) &&
       parent.expression === outer
     ) {
       return capabilityOf(parent) !== null;
@@ -2217,6 +2339,16 @@ const OPAQUE_MESSAGES = new Map([
     "getBuiltinModule",
     (hit, dir) =>
       `calls \`process.getBuiltinModule()\` whose specifier is ${hit.form}; it loads a Node built-in by name, so in \`${dir}\` that name must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
+  ],
+  [
+    "Module._load",
+    (hit, dir) =>
+      `calls \`Module._load()\` whose specifier is ${hit.form}; \`_load\` is the synchronous primitive \`require\` itself calls, so in \`${dir}\` that name must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
+  ],
+  [
+    "register",
+    (hit, dir) =>
+      `calls \`module.register()\` whose specifier is ${hit.form}; it dynamically imports a module by name, so in \`${dir}\` that name must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
   ],
 ]);
 
