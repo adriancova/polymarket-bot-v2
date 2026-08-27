@@ -11,13 +11,27 @@ operational recipes that were proven this session, and the queued next actions.
 - **Wave 0: COMPLETE** (all four packages + closeout remediation merged and
   post-merge verified; two independent closeout audits recorded; see the
   "Wave 0 closeout (2026-08-26)" section of the status file).
-- **Wave 1 batch 1A + WP-015 in flight** at the time of writing; the status
-  table's rows for WP-015/WP-040/WP-050 name the exact candidate branches,
-  review rounds, and open findings. WP-060 is authorized but deliberately not
-  started (slot discipline). The outgoing session intends to drive the three
-  in-flight packages through merge and then stop; if any row still says "In
-  remediation/review" when you read this, that loop is yours to finish using
-  the recipes below.
+- **Wave 1 batch 1A: WP-040 and WP-050 COMPLETE and merged** (`d23bb67`,
+  `8a607ec`), post-merge verified, with root/CI wiring landed: `test:fault`
+  (WP-050), `test:integration` + `db:migrate` (WP-040, `db:migrate` proven
+  end-to-end against the compose dev DB). See their completion records.
+- **WP-015 (dependency-direction CI check): on its terminal round** at the time
+  of writing. This turned into an unusually deep hardening exercise — 8 review
+  rounds, each closing one more class of module-load escape a restricted package
+  could use to reach a forbidden module (regex→lexer→TS-AST→require-capability→
+  `getBuiltinModule`→`.constructor`-eval→`process.mainModule`→named-`node:module`
+  imports), every bypass runtime-verified by the reviewer. The honest closing
+  position (recorded in the WP-015 handoff): a name-enumeration scanner cannot be
+  total — reflective (`Reflect.get`) and cross-file routes remain accepted
+  documented residuals — and the **durable fix is the positive rule** ("a call
+  whose callee does not statically resolve to a declared import or a known-pure
+  local is a finding"), which needs `docs/contracts/**` and so is the WP-030
+  contract owner's to authorize (WP-015 follow_up 8). If WP-015's row still says
+  "In remediation/review", finish that ONE loop (recipes below), merge it, then
+  STOP and hand off — do NOT open WP-060 or batch 1B; that is the successor's
+  call with fresh context. The lint is defense-in-depth, not a security boundary;
+  do not let it consume more rounds chasing exotic reflective spellings past the
+  "no ordinary-code silent route" bar.
 
 ## 2. The lifecycle as actually practiced (runbook §3, with mechanics)
 
@@ -62,8 +76,24 @@ manufacture findings; do not soften genuine ones" — without it the loop never
 terminates; with it Codex has issued clean ACCEPTs.
 
 **Session limits.** Subagents die mid-task on API session limits. Resume the
-SAME agent (context intact) rather than respawning; it picks up exactly where
-it stopped. Its last text tells you where that was.
+SAME agent via SendMessage (context intact) rather than respawning; it picks up
+exactly where it stopped, and its last text tells you where that was. This
+happened ~5 times this session and resume always worked; on resume it often
+reports the work was already finished before your message arrived.
+
+**A merged branch's lockfile needs regenerating.** When two Wave-1 branches that
+both touched `pnpm-lock.yaml` merge, the textual merge leaves a lockfile the
+frozen install rejects ("badly resolved merge conflict"). Fix on `main`:
+`pnpm install --no-frozen-lockfile`, then confirm the diff is only benign
+peer-key rewrites at identical versions (WP-040/050 produced exactly two vitest
+`(yaml@2.9.0)` peer additions), then `pnpm install --frozen-lockfile` to verify.
+This is expected, not a defect.
+
+**Don't merge a candidate with a KNOWN silent defect** even when it's "the last
+round." WP-015 round 6's own handoff disclosed an open `process.mainModule`
+route; the right move was to close it in a follow-up round before review, not
+ship it with the hole documented. A self-disclosed working bypass is a reason to
+do one more round, not to accept.
 
 **Commit mechanics.** The permission classifier intermittently blocks
 `git commit -m` with multiline messages; write the message to a scratch file
