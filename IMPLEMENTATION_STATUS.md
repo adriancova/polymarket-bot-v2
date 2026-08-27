@@ -103,6 +103,26 @@ table says otherwise.
   (foreign-entry disclosure required), NR2/NR3 ACCEPT, empty-stream residue
   ruled LOW/NOTE-acceptable. Reviewer sandbox again had no Docker; integration
   evidence remains the orchestrator's independent 73/73 reproduction.
+- Remediation round 2 completed 2026-08-27 in `9c43b52` (+ handoff `954e764`),
+  fresh repair session, probes reproduced first, per-finding mutation checks:
+  R2-H1 → `KeyedSerialQueue` bounds admission (`maxQueuedPublishes`, default
+  1024) with typed `EventBusPublishQueueFullError` (subclass of
+  `EventBusUnavailableError`), exposes pending count/max/oldest-pending age,
+  and `publish` now times submission→completion so queue wait is counted in
+  `producerBlockedTimeMs`; R2-H2 → durable checkpoint store happens FIRST,
+  every in-memory resync transition after it in statements that cannot fail
+  (probed: positions-key occupied, marker rewritten, transport unreachable);
+  R2-M1 → `XADD` no longer trims — entry, then counter `SET`, then `XTRIM`
+  last; a post-commit trim failure is counted (`retentionTrimFailures`), not
+  raised; R2-L1 → stored positions judged with the same server-side script
+  `subscribe` uses; R2-L2/L3 → foreign-entry step-over documented; exact-entry
+  lookup moved before the clock guard (future id naming no entry still
+  refused). New disclosed deviations: per-stream (not per-epoch) admission
+  bound; new `retentionTrimFailures` metric field; defaulted fourth
+  `EventBusUnavailableError` constructor parameter. Orchestrator
+  fast-forwarded the canonical branch to `954e764` and reproduced all gates:
+  root 1727/1727, integration 81/81, check:deps PASS, lockfile untouched.
+  Review round 3 dispatched.
 
 ### WP-040 completion record (2026-08-26)
 
