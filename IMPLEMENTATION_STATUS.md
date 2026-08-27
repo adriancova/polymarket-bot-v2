@@ -36,6 +36,34 @@ Authorization vocabulary: "Ready (authorized)" rows are the only packages agents
 may begin in the current run; "Dependency-ready" rows must not start until this
 table says otherwise.
 
+### WP-060 in-flight record (2026-08-27)
+
+- Implemented by `wp-implementer` (Opus) on branch `worktree-agent-ab4ebe3e28c3ce141`,
+  base `4126f29`; chain `d7bbb0f` (implementation) → `794347a` (handoff record).
+  41 files, all in allowed paths (lockfile ratified 2026-08-27, additive-only +71/−0).
+  Orchestrator reproduced all gates in the candidate worktree: frozen install,
+  typecheck, lint, `check:deps` PASS, root 1703/1703, event-bus integration 57/57
+  (real Testcontainers Redis).
+- Review round 1 (fresh Codex session `01a04418-b394-7542-b762-25ffad67452a`,
+  candidate `794347a` vs base `4126f29`): **CHANGES REQUIRED** — 0 blocker,
+  2 high (H1 concurrent publishes can reorder one gateway epoch: check-then-act
+  cursor advances after append, probe delivered `["2","1"]`; H2 forged or
+  cross-instance checkpoint tokens are syntax-validated only and silently skip
+  retained events — future entry ID yields `idle` with no gap), 2 medium (M1
+  publish Lua script INCRs the ordinal before XADD, so an append failure burns
+  an ordinal → false hard resync and phantom `messagesDropped`; M2 handoff
+  instructs WP-120 to dedup on `eventId` instead of the required
+  `(gatewayEpoch, ingestSeq)`), 1 low (L1 handoff's "no default start position"
+  claim false — a safe stored-checkpoint/oldest-retained default exists), notes
+  (reviewer sandbox had no Docker — integration suite verified by orchestrator
+  instead; fresh consumer ID with explicit `start: newest` can proceed past
+  another consumer's pending resync — explicit, WP-120 must keep its durable
+  consumer ID stable; testing helpers not exported from the main entry).
+  Deviation judgments: D1 REJECT as stated (prose), D2/D3/D4/D5 ACCEPT.
+  Assumption judgments: A5 REJECT (§8.1 does not establish sequential gateway
+  publication), A1-A4/A6/A7 ACCEPT. Interface neutrality, path ownership,
+  dependency direction, and safety criteria PASS as reviewed.
+
 ### WP-040 completion record (2026-08-26)
 
 - Implemented by `wp-implementer` (Opus) on branch `worktree-agent-aa6e4c6fd7701b054`,
