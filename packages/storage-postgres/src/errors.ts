@@ -1,0 +1,392 @@
+/**
+ * Typed, observable storage errors (handoff §21: "Errors are typed and
+ * observable").
+ *
+ * Every database-enforced invariant in `db/migrations` raises a stable SQLSTATE,
+ * and every one of those codes maps to exactly one error class here. A caller
+ * therefore branches on a type, never on a message substring: the wording of a
+ * PostgreSQL diagnostic is not a contract, but its SQLSTATE is.
+ */
+
+/** SQLSTATE codes raised by this schema's constraint triggers. */
+export const STORAGE_SQL_STATES = {
+  /** Append-only table received an UPDATE, DELETE, or TRUNCATE (§10.7). */
+  appendOnlyViolation: "PMB01",
+  /** An immutable column of a mutable row was changed. */
+  immutableColumn: "PMB02",
+  /** Fill allocations would exceed the fill quantity (§10.7). */
+  fillAllocationExceedsFill: "PMB03",
+  /** Fill allocations do not sum to the fill quantity at COMMIT (§10.7). */
+  fillAllocationIncomplete: "PMB04",
+  /** A ledger transaction does not balance to zero per asset (§10.7). */
+  ledgerImbalance: "PMB05",
+  /** A live write named a fencing lease that was not valid (§10.7, ADR-008). */
+  fencingReferenceInvalid: "PMB06",
+  /** A fencing token was not above every previously issued token (ADR-008 §1). */
+  fencingTokenNotMonotonic: "PMB07",
+  /**
+   * A write to `balance_projection` disagreed with the reservation facts, or
+   * would have removed a balance that active reservations depend on (§10.7).
+   */
+  reservedAmountMismatch: "PMB08",
+  /** A reservation named an account/asset with no balance projection row. */
+  unknownBalance: "PMB09",
+  /**
+   * A fencing lease that had ended was changed or reactivated. The lease state
+   * machine is forward-only, so authority that lapsed stays lapsed and its token
+   * stays spent (ADR-008 §1).
+   */
+  fencingLeaseNotForwardOnly: "PMB10",
+  /**
+   * A fill was recorded against an order that carries no submission attempt, so
+   * the §9.11 decision → plan → attempt → order → fill chain would have a hole
+   * where the signed payload should be.
+   */
+  missingSubmissionAttempt: "PMB11",
+  /**
+   * A ledger transaction booked a wallet operation that has a market, while
+   * naming a different market or none at all (§9.14, §9.15).
+   */
+  walletOperationMarketMismatch: "PMB12",
+} as const;
+
+/** Standard SQLSTATE codes this package translates. */
+const PG_UNIQUE_VIOLATION = "23505";
+const PG_FOREIGN_KEY_VIOLATION = "23503";
+const PG_CHECK_VIOLATION = "23514";
+const PG_NOT_NULL_VIOLATION = "23502";
+const PG_EXCLUSION_VIOLATION = "23P01";
+
+/** Name of the CHECK that implements §10.7 "no negative available balance". */
+const NEGATIVE_AVAILABLE_BALANCE_CONSTRAINT = "balance_projection_no_negative_available";
+
+/** The subset of a `pg` error this package reads. */
+export type PostgresErrorShape = {
+  readonly code?: string | undefined;
+  readonly constraint?: string | undefined;
+  readonly table?: string | undefined;
+  readonly schema?: string | undefined;
+  readonly detail?: string | undefined;
+  readonly hint?: string | undefined;
+  readonly message: string;
+};
+
+/** Base class for every error this package raises. */
+export class StoragePostgresError extends Error {
+  /** Stable machine-readable code, safe as a metric label. */
+  public readonly code: string;
+
+  public readonly sqlState: string | undefined;
+
+  public readonly constraintName: string | undefined;
+
+  public constructor(
+    code: string,
+    message: string,
+    options?: {
+      readonly cause?: unknown;
+      readonly sqlState?: string | undefined;
+      readonly constraintName?: string | undefined;
+    },
+  ) {
+    super(message, options?.cause === undefined ? undefined : { cause: options.cause });
+    this.name = new.target.name;
+    this.code = code;
+    this.sqlState = options?.sqlState;
+    this.constraintName = options?.constraintName;
+  }
+}
+
+/** An append-only table (§10.7) rejected an UPDATE, DELETE, or TRUNCATE. */
+export class AppendOnlyViolationError extends StoragePostgresError {}
+
+/** An immutable column of an otherwise-mutable row was changed. */
+export class ImmutableColumnError extends StoragePostgresError {}
+
+/** Fill allocations would exceed the actual fill quantity (§10.7). */
+export class FillAllocationExceedsFillError extends StoragePostgresError {}
+
+/** Fill allocations did not sum to the fill quantity at COMMIT (§10.7). */
+export class FillAllocationIncompleteError extends StoragePostgresError {}
+
+/** A ledger transaction did not balance to zero per asset (§10.7). */
+export class LedgerImbalanceError extends StoragePostgresError {}
+
+/** A live write named a fencing lease that was not valid (§10.7, ADR-008). */
+export class FencingReferenceInvalidError extends StoragePostgresError {}
+
+/** A fencing token was not strictly above every previously issued token. */
+export class FencingTokenNotMonotonicError extends StoragePostgresError {}
+
+/**
+ * A lease that had ended was changed or reactivated.
+ *
+ * ADR-008 §1: a released, revoked, or expired lease is history. Holding the
+ * fence again means acquiring a new lease, which allocates a new token — a
+ * resurrected lease would make an old holder and an already-spent token valid
+ * again.
+ */
+export class FencingLeaseNotForwardOnlyError extends StoragePostgresError {}
+
+/**
+ * A fill was recorded against an order with no submission attempt.
+ *
+ * §9.11 / §6 invariant 6: the signed payload and order hash are persisted before
+ * transmission, and are what an unknown submission is reconciled against. A fill
+ * whose order has none has no signed origin to reconcile against.
+ */
+export class MissingSubmissionAttemptError extends StoragePostgresError {}
+
+/**
+ * A ledger transaction named a market other than the market of the wallet
+ * operation it books, or named none while the operation has one.
+ *
+ * The ledger is append-only (ADR-006 §1), so a transaction filed under the wrong
+ * market — or under no market, which is worse, because it is then invisible to
+ * every market-scoped query — cannot be corrected afterwards. An operation that
+ * genuinely has no market (an approval, a collateral transfer) does not raise
+ * this: the rule is equality when there is something to equal.
+ */
+export class WalletOperationMarketMismatchError extends StoragePostgresError {}
+
+/** A reservation would drive the available balance below zero (§10.7). */
+export class NegativeAvailableBalanceError extends StoragePostgresError {}
+
+/**
+ * A write tried to make `balance_projection.reserved_amount` disagree with the
+ * reservations that back it, or to delete a balance that active reservations
+ * depend on. The reservation rows are the fact; the projection follows them.
+ */
+export class ReservedAmountMismatchError extends StoragePostgresError {}
+
+/**
+ * A simulated run mode tried to acquire a live fencing lease.
+ *
+ * ADR-008 §2 and ADR-010: "paper mode cannot acquire a live fencing lease at
+ * all". Raised before the statement is sent; the database CHECK
+ * `fencing_leases_real_modes_only` is the enforcement.
+ */
+export class NonRealModeFencingLeaseError extends StoragePostgresError {
+  public constructor(
+    public readonly environment: string,
+    public readonly accountRef: string,
+  ) {
+    super(
+      "FENCING_LEASE_NOT_REAL_MODE",
+      `Run mode ${environment} cannot acquire a live fencing lease for ${accountRef}. ` +
+        "The fence arbitrates real order authority only (ADR-008 §2, ADR-010).",
+    );
+  }
+}
+
+/**
+ * A `jsonb` document bound for an economic column carried a JavaScript
+ * `number`, or was pre-serialized text that does not parse.
+ */
+export class DecimalSafeJsonError extends StoragePostgresError {
+  public constructor(
+    code: "ECONOMIC_JSON_NUMBER" | "ECONOMIC_JSON_MALFORMED",
+    message: string,
+    /** The column the document was bound for. */
+    public readonly field: string,
+    /** Path to the offending value inside the document, e.g. `.order.price`. */
+    public readonly path: string,
+    options?: { readonly cause?: unknown },
+  ) {
+    super(code, message, options);
+  }
+}
+
+/** A reservation named an account/environment/asset with no balance row. */
+export class UnknownBalanceError extends StoragePostgresError {}
+
+/** A unique constraint rejected the write. */
+export class UniqueViolationError extends StoragePostgresError {}
+
+/** A foreign key constraint rejected the write. */
+export class ForeignKeyViolationError extends StoragePostgresError {}
+
+/** A CHECK, NOT NULL, or domain constraint rejected the write. */
+export class ConstraintViolationError extends StoragePostgresError {}
+
+/** A migration file set was malformed or incomplete. */
+export class MigrationDefinitionError extends StoragePostgresError {
+  public constructor(message: string, options?: { readonly cause?: unknown }) {
+    super("MIGRATION_DEFINITION_INVALID", message, options);
+  }
+}
+
+/**
+ * An applied migration's file no longer hashes to the value recorded when it
+ * ran. Editing an applied migration silently changes what a fresh database
+ * gets, so it is rejected rather than reconciled.
+ */
+export class MigrationChecksumMismatchError extends StoragePostgresError {
+  public constructor(
+    public readonly version: string,
+    public readonly recordedChecksum: string,
+    public readonly actualChecksum: string,
+    /** Which half of the pair drifted. Both are verified before either runs. */
+    public readonly direction: "up" | "down" = "up",
+  ) {
+    super(
+      "MIGRATION_CHECKSUM_MISMATCH",
+      `Migration ${version} was applied with ${direction} checksum ${recordedChecksum} but now hashes to ${actualChecksum}. ` +
+        "An applied migration and its rollback are immutable; add a new migration instead.",
+    );
+  }
+}
+
+/** A migration failed to apply or roll back. */
+export class MigrationFailedError extends StoragePostgresError {
+  public constructor(
+    public readonly version: string,
+    public readonly direction: "up" | "down",
+    cause: unknown,
+  ) {
+    super(
+      "MIGRATION_FAILED",
+      `Migration ${version} failed to run ${direction}: ${describeCause(cause)}`,
+      { cause },
+    );
+  }
+}
+
+/** A PostgreSQL timestamp could not be read as an ISO-8601 instant. */
+export class InvalidTimestampError extends StoragePostgresError {
+  public constructor(value: string) {
+    super(
+      "INVALID_TIMESTAMP",
+      `Cannot read ${JSON.stringify(value)} as an ISO-8601 UTC instant. ` +
+        "Connections must run with TimeZone=UTC and DateStyle=ISO.",
+    );
+  }
+}
+
+function describeCause(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}
+
+function readPostgresError(error: unknown): PostgresErrorShape | undefined {
+  if (typeof error !== "object" || error === null) {
+    return undefined;
+  }
+  const candidate = error as Record<string, unknown>;
+  if (typeof candidate["code"] !== "string" || typeof candidate["message"] !== "string") {
+    return undefined;
+  }
+  return {
+    code: candidate["code"],
+    message: candidate["message"],
+    constraint: typeof candidate["constraint"] === "string" ? candidate["constraint"] : undefined,
+    table: typeof candidate["table"] === "string" ? candidate["table"] : undefined,
+    schema: typeof candidate["schema"] === "string" ? candidate["schema"] : undefined,
+    detail: typeof candidate["detail"] === "string" ? candidate["detail"] : undefined,
+    hint: typeof candidate["hint"] === "string" ? candidate["hint"] : undefined,
+  };
+}
+
+/**
+ * Translates a `pg` error into a typed storage error.
+ *
+ * An error this package does not model is returned unchanged: inventing a type
+ * for an unrecognized SQLSTATE would hide the diagnostic the operator needs.
+ */
+export function mapPostgresError(error: unknown): unknown {
+  const pgError = readPostgresError(error);
+  if (pgError === undefined || pgError.code === undefined) {
+    return error;
+  }
+
+  const options = {
+    cause: error,
+    sqlState: pgError.code,
+    constraintName: pgError.constraint,
+  };
+
+  switch (pgError.code) {
+    case STORAGE_SQL_STATES.appendOnlyViolation:
+      return new AppendOnlyViolationError("APPEND_ONLY_VIOLATION", pgError.message, options);
+    case STORAGE_SQL_STATES.immutableColumn:
+      return new ImmutableColumnError("IMMUTABLE_COLUMN", pgError.message, options);
+    case STORAGE_SQL_STATES.fillAllocationExceedsFill:
+      return new FillAllocationExceedsFillError(
+        "FILL_ALLOCATION_EXCEEDS_FILL",
+        pgError.message,
+        options,
+      );
+    case STORAGE_SQL_STATES.fillAllocationIncomplete:
+      return new FillAllocationIncompleteError(
+        "FILL_ALLOCATION_INCOMPLETE",
+        pgError.message,
+        options,
+      );
+    case STORAGE_SQL_STATES.ledgerImbalance:
+      return new LedgerImbalanceError("LEDGER_IMBALANCE", pgError.message, options);
+    case STORAGE_SQL_STATES.fencingReferenceInvalid:
+      return new FencingReferenceInvalidError(
+        "FENCING_REFERENCE_INVALID",
+        pgError.message,
+        options,
+      );
+    case STORAGE_SQL_STATES.fencingTokenNotMonotonic:
+      return new FencingTokenNotMonotonicError(
+        "FENCING_TOKEN_NOT_MONOTONIC",
+        pgError.message,
+        options,
+      );
+    case STORAGE_SQL_STATES.reservedAmountMismatch:
+      return new ReservedAmountMismatchError(
+        "RESERVED_AMOUNT_MISMATCH",
+        pgError.message,
+        options,
+      );
+    case STORAGE_SQL_STATES.unknownBalance:
+      return new UnknownBalanceError("UNKNOWN_BALANCE", pgError.message, options);
+    case STORAGE_SQL_STATES.fencingLeaseNotForwardOnly:
+      return new FencingLeaseNotForwardOnlyError(
+        "FENCING_LEASE_NOT_FORWARD_ONLY",
+        pgError.message,
+        options,
+      );
+    case STORAGE_SQL_STATES.missingSubmissionAttempt:
+      return new MissingSubmissionAttemptError(
+        "MISSING_SUBMISSION_ATTEMPT",
+        pgError.message,
+        options,
+      );
+    case STORAGE_SQL_STATES.walletOperationMarketMismatch:
+      return new WalletOperationMarketMismatchError(
+        "WALLET_OPERATION_MARKET_MISMATCH",
+        pgError.message,
+        options,
+      );
+    case PG_UNIQUE_VIOLATION:
+    case PG_EXCLUSION_VIOLATION:
+      return new UniqueViolationError("UNIQUE_VIOLATION", pgError.message, options);
+    case PG_FOREIGN_KEY_VIOLATION:
+      return new ForeignKeyViolationError("FOREIGN_KEY_VIOLATION", pgError.message, options);
+    case PG_CHECK_VIOLATION:
+      if (pgError.constraint === NEGATIVE_AVAILABLE_BALANCE_CONSTRAINT) {
+        return new NegativeAvailableBalanceError(
+          "NEGATIVE_AVAILABLE_BALANCE",
+          pgError.message,
+          options,
+        );
+      }
+      return new ConstraintViolationError("CHECK_VIOLATION", pgError.message, options);
+    case PG_NOT_NULL_VIOLATION:
+      return new ConstraintViolationError("NOT_NULL_VIOLATION", pgError.message, options);
+    default:
+      return error;
+  }
+}
+
+/** Runs `operation`, translating any PostgreSQL error into a typed one. */
+export async function withMappedErrors<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    throw mapPostgresError(error);
+  }
+}

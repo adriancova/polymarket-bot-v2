@@ -3,15 +3,28 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "PostgreSQL adapter (WP-040): SQL-first migrations for the six semantic schemas, Kysely typed table definitions, and typed repositories. Economic values cross this boundary only as canonical decimal strings.",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./testing": "./src/testing/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p ../../test/integration/postgres/tsconfig.json",
+    "build": "tsc",
+    "db:migrate": "pnpm run build && node dist/cli/migrate.js",
+    "test:integration": "vitest run --config ../../test/integration/postgres/vitest.config.ts"
+  },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*",
+    "kysely": "^0.29.5",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
+    "@testcontainers/postgresql": "^12.1.0",
+    "@types/node": "^24.13.3",
+    "@types/pg": "^8.15.6",
     "typescript": "^5.9.2"
   }
 }

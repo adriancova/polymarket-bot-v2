@@ -4,3 +4,10 @@ packages:
   - "packages/strategies/*"
 allowBuilds:
   esbuild: true
+  # Denied 2026-08-26 (orchestrator, WP-040 D1): transitive native/install
+  # scripts from @testcontainers/postgresql. Testcontainers talks to the Docker
+  # socket over HTTP; ssh2's native binding and these builds are not needed and
+  # must not run.
+  cpu-features: false
+  protobufjs: false
+  ssh2: false
