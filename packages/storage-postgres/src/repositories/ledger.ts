@@ -32,7 +32,15 @@ import type {
   TradeSettlementStateValue,
 } from "../schema/enums.js";
 
-/** One side of a balanced transaction. */
+/**
+ * One side of a balanced transaction.
+ *
+ * The entry's `accountRef` is the account the value actually moved in, and it
+ * need not be the transaction's. A transfer between two accounts is one
+ * transaction whose header names the initiating account and whose two legs name
+ * one account each; anything computing a position or a net movement therefore
+ * reads the entry accounts (see `netByAsset`).
+ */
 export type LedgerEntryInput = {
   readonly scope: LedgerScopeValue;
   readonly accountRef: Identifier;
@@ -54,7 +62,30 @@ type LedgerTransactionFields = {
   readonly source: EventSourceValue;
   readonly occurredAt: IsoTimestamp;
   readonly entries: readonly LedgerEntryInput[];
+  /**
+   * The wallet operation this transaction books (§9.14).
+   *
+   * **Contract:** if that operation has a market, this transaction must name the
+   * *same* market. The requirement cannot be stated in the type, because whether
+   * the operation has a market is a fact about a row in the database, not about
+   * the call — so it is enforced by
+   * `accounting.assert_ledger_wallet_operation_market()` (SQLSTATE `PMB12` →
+   * {@link WalletOperationMarketMismatchError}) for every writer, including this
+   * one. A caller holding a market-bearing operation holds its market; passing
+   * the operation without it is rejected rather than silently stored, because
+   * the ledger is append-only and a mis-filed transaction is permanent.
+   *
+   * An operation that genuinely has no market — `APPROVE_ERC20`,
+   * `APPROVE_ERC1155`, a collateral `TRANSFER` — constrains nothing here.
+   */
   readonly walletOperationId?: UuidV7Column | null;
+  /**
+   * The reconciliation run whose correction this transaction is (§9.17).
+   *
+   * A run has no market of its own — it examines an account in an environment —
+   * so there is no market to agree with, only the environment and account the
+   * composite keys already bind.
+   */
   readonly reconciliationRunId?: UuidV7Column | null;
   readonly settlementState?: TradeSettlementStateValue | null;
   /** ADR-006 §5.2: a failure is a compensating reversal, never an edit. */
@@ -108,10 +139,14 @@ export function createLedgerRepository(db: PolymarketBotDatabase) {
      * A transaction that names an `orderId` or a `fillId` must name that row's
      * `marketId` too — the input type requires it, and
      * `ledger_transactions_execution_link_has_market` requires it of every other
-     * writer as well.
+     * writer as well. A transaction that names a `walletOperationId` must name
+     * that operation's market when the operation has one; that one is a runtime
+     * fact and is enforced by the database (`PMB12`), not by the type.
      *
      * @throws {LedgerImbalanceError} at COMMIT when the entries do not sum to
      *   zero for some asset, or when there are no entries at all.
+     * @throws {WalletOperationMarketMismatchError} when the transaction books a
+     *   market-bearing wallet operation under another market, or under none.
      */
     async postTransaction(input: PostLedgerTransactionInput): Promise<UuidV7Column> {
       const ledgerTransactionId = uuidV7();
@@ -191,6 +226,19 @@ export function createLedgerRepository(db: PolymarketBotDatabase) {
     /**
      * Net movement per asset for an account, computed in the database.
      *
+     * Sums the **entry legs whose own account is `accountRef`**, not the legs of
+     * every transaction whose header names it. The two differ exactly where the
+     * model says they should: a transfer is one transaction with a header
+     * account (who initiated it) and two legs in two different accounts (where
+     * the value went). Filtering on the header returned every leg of A's
+     * transfer — so `A -10, B +10` netted to **zero for A** and returned
+     * **nothing at all for B**, which is the opposite of what happened.
+     * Filtering on the leg returns `-10` and `+10`, which is what happened.
+     *
+     * `environment` still comes from the transaction, because it is a property
+     * of the event and `ledger_entries` does not carry one; the join stays for
+     * that reason alone.
+     *
      * Returned as canonical decimal strings: `numeric` sums exactly, and `pg`
      * hands the result back as text, so no economic value passes through a
      * JavaScript number.
@@ -209,7 +257,7 @@ export function createLedgerRepository(db: PolymarketBotDatabase) {
             // `numeric` is arbitrary-precision decimal; `pg` returns it as text.
             sql<string>`sum(entries.amount::numeric)`.as("net_amount"),
           ])
-          .where("transactions.account_ref", "=", accountRef)
+          .where("entries.account_ref", "=", accountRef)
           .where("transactions.environment", "=", environment)
           .groupBy("entries.asset_id")
           .execute(),

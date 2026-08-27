@@ -349,10 +349,92 @@ describe("ledger balance per asset", () => {
     const net = await context.repositories.ledger.netByAsset(ACCOUNT, "PAPER");
     const byAsset = new Map(net.map((row) => [row.asset_id, row.net_amount]));
 
-    // Every posted transaction balanced, so every per-asset net is zero.
+    // Every transaction posted above balanced *and* put both of its legs in this
+    // one account, so every per-asset net is zero. That is a fact about these
+    // fixtures, not a property of the ledger: a transaction balances per asset
+    // across all of its legs, which for a transfer means across two accounts.
+    // The transfer suite below is the case where the two readings differ.
     for (const [asset, amount] of byAsset) {
       expect(Number(amount), `asset ${asset}`).toBe(0);
       expect(typeof amount).toBe("string");
     }
+  });
+});
+
+/**
+ * Round-4 MEDIUM: `netByAsset` must read the account of the **entry**, not the
+ * account on the transaction header.
+ *
+ * A transfer is one transaction with a header account (who initiated it) and two
+ * legs in two different accounts (where the value went) — assumption 9 of the
+ * handoff, and the reason `ledger_entries.account_ref` is deliberately unbound
+ * to the header. Summing every leg of the transactions whose *header* names A
+ * therefore answered a question nobody asked: it netted A's own transfer to zero
+ * and reported nothing whatsoever for B.
+ *
+ * Reproduced on the reviewed schema before it was changed: header-filtered,
+ * `A -10 / B +10` returned `pUSD = 0` for A and an empty result for B.
+ */
+describe("net movement follows the entry account, not the header (a transfer)", () => {
+  const SENDER = "transfer-sender";
+  const RECEIVER = "transfer-receiver";
+
+  it("reports -10 for the sender and +10 for the receiver", async () => {
+    // The header names the initiating account only. Both legs are the money.
+    await context.repositories.ledger.postTransaction({
+      eventType: "MANUAL_ADJUSTMENT",
+      environment: "PAPER",
+      accountRef: SENDER,
+      source: "internal",
+      occurredAt: fixtureTimestamp(),
+      entries: [
+        {
+          scope: "ACTUAL_ACCOUNT",
+          accountRef: SENDER,
+          assetId: "pUSD",
+          assetKind: "COLLATERAL",
+          amount: "-10",
+        },
+        {
+          scope: "ACTUAL_ACCOUNT",
+          accountRef: RECEIVER,
+          assetId: "pUSD",
+          assetKind: "COLLATERAL",
+          amount: "10",
+        },
+      ],
+    });
+
+    const sender = await context.repositories.ledger.netByAsset(SENDER, "PAPER");
+    expect(sender).toEqual([{ asset_id: "pUSD", net_amount: "-10" }]);
+
+    // The receiver initiated nothing, so a header-filtered query saw nothing of
+    // this at all — which is the half of the defect that loses money rather than
+    // merely mis-stating it.
+    const receiver = await context.repositories.ledger.netByAsset(RECEIVER, "PAPER");
+    expect(receiver).toEqual([{ asset_id: "pUSD", net_amount: "10" }]);
+  });
+
+  it("keeps the transaction balanced per asset across the two accounts", async () => {
+    // The §10.7 invariant is per transaction and per asset, deliberately not per
+    // account: this transfer balances across the pair, and that is what makes it
+    // a transfer rather than two unexplained movements.
+    const legs = await context.pool.query<{ net: string }>(
+      `select sum(e.amount::numeric)::text as net
+         from accounting.ledger_entries e
+         join accounting.ledger_transactions t
+           on t.ledger_transaction_id = e.ledger_transaction_id
+        where t.account_ref = $1 and e.asset_id = 'pUSD'`,
+      [SENDER],
+    );
+    expect(legs.rows[0]?.net).toBe("0");
+  });
+
+  it("still scopes by environment, which only the transaction carries", async () => {
+    // `ledger_entries` has no environment column — the environment is a property
+    // of the event — so the join stays for that reason alone, and a query in
+    // another run mode still sees nothing (§10.8).
+    const otherEnvironment = await context.repositories.ledger.netByAsset(SENDER, "BACKTEST");
+    expect(otherEnvironment).toEqual([]);
   });
 });

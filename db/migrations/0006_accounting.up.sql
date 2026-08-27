@@ -51,7 +51,9 @@ create table accounting.wallet_operations (
   ),
   -- Foreign-key targets for `accounting.ledger_transactions`: a transaction that
   -- books a wallet operation may not label itself with another environment or
-  -- account than the operation it books.
+  -- account than the operation it books. The *market* is bound by
+  -- `accounting.assert_ledger_wallet_operation_market()` below rather than by a
+  -- composite key; the comment there explains why a key cannot do it.
   constraint wallet_operations_id_environment_unique unique (wallet_operation_id, environment),
   constraint wallet_operations_id_account_unique unique (wallet_operation_id, account_ref)
 );
@@ -64,10 +66,25 @@ create trigger wallet_operations_set_updated_at
   before update on accounting.wallet_operations
   for each row execute function internal.set_updated_at();
 
+-- `market_id` is part of the operation's identity, not a field to be revised.
+--
+-- Round 4: the market was omitted from this list, so an operation could be
+-- created against market M1, have its ledger transactions bound to M1, and then
+-- be repointed at M2 — leaving append-only, permanent transactions bound to a
+-- market their operation no longer claims. A binding that a later UPDATE can
+-- invalidate is not a binding, and `ledger_transactions` cannot be corrected
+-- afterwards because it is append-only (ADR-006 §1, §5.2).
+--
+-- Consequence, deliberately accepted: a wallet operation states its market when
+-- it is created, including "none". An operation discovered on-chain whose market
+-- is not yet resolved is recorded once the mapping is known, or reported as a
+-- reconciliation break (§9.17) — it is not inserted marketless and enriched
+-- later.
 create trigger wallet_operations_immutable_identity
   before update on accounting.wallet_operations
   for each row execute function internal.forbid_column_change(
-    'wallet_operation_id', 'environment', 'account_ref', 'operation_type', 'requested_at'
+    'wallet_operation_id', 'environment', 'account_ref', 'operation_type', 'market_id',
+    'requested_at'
   );
 
 -- ---------------------------------------------------------------------------
@@ -142,8 +159,12 @@ create table accounting.ledger_transactions (
   -- so external clearing, manual adjustments, and resolutions still stand alone
   -- with discriminators of their own (§9.15).
   --
-  -- The market binding is the one case where MATCH SIMPLE needed a companion
-  -- CHECK, because `market_id` is itself nullable: an order- or fill-linked
+  -- The market binding is where MATCH SIMPLE needed help, because `market_id` is
+  -- itself nullable. For the *execution* links a CHECK is enough (below); for the
+  -- *wallet-operation* link it is not, because the parent column is nullable too
+  -- — see `accounting.assert_ledger_wallet_operation_market()`.
+  --
+  -- The execution half: an order- or fill-linked
   -- transaction that simply omitted the market skipped
   -- `ledger_transactions_order_market_fk` / `..._fill_market_fk` altogether and
   -- was stored with no market at all — disappearing from every market-scoped
@@ -194,6 +215,112 @@ create index ledger_transactions_market_idx on accounting.ledger_transactions (m
 call internal.enforce_append_only('accounting', 'ledger_transactions');
 
 -- ---------------------------------------------------------------------------
+-- A transaction that books a market-bearing wallet operation books its market
+-- ---------------------------------------------------------------------------
+--
+-- The round-3 fix bound `market_id` for the order and fill links, and left the
+-- wallet-operation link where it was: bound on environment and account only. So
+-- a REDEEM of market M1 could be booked by a transaction with `market_id` NULL
+-- (invisible to every market-scoped ledger query) or with market M2 (filed under
+-- a market it has nothing to do with), while naming the right operation, the
+-- right account, the right environment, and balancing. Both were reproduced on
+-- the reviewed schema; the ledger is append-only, so both are permanent.
+--
+-- WHY NOT A COMPOSITE FOREIGN KEY, which is how every other discriminator here
+-- is bound:
+--
+--   * MATCH SIMPLE skips the key whenever any child column is NULL, so a
+--     transaction that simply omits the market skips it — the round-3 defect,
+--     one column across. The round-3 remedy (a CHECK requiring the market) does
+--     not transfer, because it would force a market onto a transaction that
+--     books an approval or a collateral transfer, which genuinely has none.
+--   * MATCH FULL would demand all-or-nothing across `(wallet_operation_id,
+--     market_id)`, so a marketless operation could never be booked at all.
+--   * A non-null child market against a marketless operation would be rejected
+--     by any such key, turning "the operation did not record a market" into "the
+--     transaction may not name one" — a stronger rule than the facts support,
+--     and one that contradicts `ledger_transactions_execution_link_has_market`
+--     for a transaction that books an execution fact *and* an approval.
+--
+-- So the rule is CONDITIONAL EQUALITY, and it needs a trigger to say it:
+--
+--     the operation has a market  →  the transaction names the SAME market
+--     the operation has none      →  the transaction's market is its own affair
+--                                    (exactly as for a transaction that books no
+--                                    operation at all)
+--
+-- Two related questions, answered rather than left open:
+--
+--   * `ops.reconciliation_runs` has no market column at all (§9.17: a run
+--     examines an account in an environment, not a market), so the
+--     reconciliation link has no market to bind and needs no analogue here.
+--   * `market_id` on `accounting.wallet_operations` is immutable (see the
+--     trigger on that table), which is what keeps this check true after the
+--     fact: without it the operation could be repointed at another market once
+--     the transaction was committed and beyond correction.
+
+create function accounting.assert_ledger_wallet_operation_market() returns trigger
+language plpgsql
+as $$
+declare
+  operation_market uuid;
+begin
+  if new.wallet_operation_id is null then
+    return null;
+  end if;
+
+  -- FOR SHARE, not a bare read: the operation's market is immutable by trigger,
+  -- and a trigger is a thing a privileged role can disable, so this does not
+  -- rely on immutability for correctness. The share lock serializes this check
+  -- against anything that changes or removes the operation row for the duration
+  -- of the booking transaction.
+  select w.market_id
+  into operation_market
+  from accounting.wallet_operations as w
+  where w.wallet_operation_id = new.wallet_operation_id
+  for share;
+
+  if not found then
+    -- `ledger_transactions_wallet_operation_*_fk` is the authority on existence
+    -- and has already rejected this row; there is nothing to compare against.
+    return null;
+  end if;
+
+  if operation_market is null then
+    -- A genuinely marketless operation (APPROVE_ERC20, APPROVE_ERC1155, and a
+    -- collateral TRANSFER) constrains nothing here.
+    return null;
+  end if;
+
+  if new.market_id is distinct from operation_market then
+    raise exception
+      using errcode = 'PMB12',
+        message = format(
+          'ledger transaction %s books wallet operation %s of market %s, but names market %s',
+          new.ledger_transaction_id, new.wallet_operation_id, operation_market,
+          coalesce(new.market_id::text, 'none')
+        ),
+        hint = 'A transaction that books a market-bearing wallet operation names that operation''s own market (§9.14, §9.15, ADR-006 §1).';
+  end if;
+
+  return null;
+end;
+$$;
+
+comment on function accounting.assert_ledger_wallet_operation_market() is
+  'Rejects a ledger transaction whose market is not the market of the wallet operation it books (§9.14, §9.15). Conditional: an operation with no market constrains nothing.';
+
+-- AFTER INSERT OR UPDATE, and NOT DEFERRABLE, so the check cannot be postponed
+-- past the statement by a session that sets constraints deferred. The UPDATE
+-- event is redundant today — `ledger_transactions` is append-only — and is
+-- present because the append-only guard is itself a trigger (see the README's
+-- privilege note): two independent triggers have to be disabled to get around
+-- this, not one.
+create constraint trigger ledger_transactions_wallet_operation_market
+  after insert or update on accounting.ledger_transactions
+  for each row execute function accounting.assert_ledger_wallet_operation_market();
+
+-- ---------------------------------------------------------------------------
 -- ledger_entries — per-asset balanced entries (§10.7)
 -- ---------------------------------------------------------------------------
 
@@ -203,6 +330,14 @@ create table accounting.ledger_entries (
     references accounting.ledger_transactions (ledger_transaction_id),
   entry_ordinal integer not null,
   scope internal.ledger_scope not null,
+  -- Deliberately NOT bound to `ledger_transactions.account_ref`, and this is the
+  -- column that says where value went. The header account is the initiating
+  -- scope — whose action this was — while the entry accounts are the legs, and a
+  -- transfer between two accounts is one transaction with legs in two of them.
+  -- Binding the legs to the header would make that unrepresentable. Anything
+  -- reading a position, a net movement, or a per-account balance therefore reads
+  -- *this* column and never the header's — `netByAsset()` in this package's
+  -- ledger repository is the worked example.
   account_ref internal.identifier not null,
   instance_id internal.uuid_v7 references strategy.instances (instance_id),
   run_id internal.uuid_v7 references strategy.runs (run_id),

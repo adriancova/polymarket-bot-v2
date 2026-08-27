@@ -43,6 +43,11 @@ export const STORAGE_SQL_STATES = {
    * where the signed payload should be.
    */
   missingSubmissionAttempt: "PMB11",
+  /**
+   * A ledger transaction booked a wallet operation that has a market, while
+   * naming a different market or none at all (§9.14, §9.15).
+   */
+  walletOperationMarketMismatch: "PMB12",
 } as const;
 
 /** Standard SQLSTATE codes this package translates. */
@@ -131,6 +136,18 @@ export class FencingLeaseNotForwardOnlyError extends StoragePostgresError {}
  * whose order has none has no signed origin to reconcile against.
  */
 export class MissingSubmissionAttemptError extends StoragePostgresError {}
+
+/**
+ * A ledger transaction named a market other than the market of the wallet
+ * operation it books, or named none while the operation has one.
+ *
+ * The ledger is append-only (ADR-006 §1), so a transaction filed under the wrong
+ * market — or under no market, which is worse, because it is then invisible to
+ * every market-scoped query — cannot be corrected afterwards. An operation that
+ * genuinely has no market (an approval, a collateral transfer) does not raise
+ * this: the rule is equality when there is something to equal.
+ */
+export class WalletOperationMarketMismatchError extends StoragePostgresError {}
 
 /** A reservation would drive the available balance below zero (§10.7). */
 export class NegativeAvailableBalanceError extends StoragePostgresError {}
@@ -335,6 +352,12 @@ export function mapPostgresError(error: unknown): unknown {
     case STORAGE_SQL_STATES.missingSubmissionAttempt:
       return new MissingSubmissionAttemptError(
         "MISSING_SUBMISSION_ATTEMPT",
+        pgError.message,
+        options,
+      );
+    case STORAGE_SQL_STATES.walletOperationMarketMismatch:
+      return new WalletOperationMarketMismatchError(
+        "WALLET_OPERATION_MARKET_MISMATCH",
         pgError.message,
         options,
       );

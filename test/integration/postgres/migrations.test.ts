@@ -267,6 +267,56 @@ describe("migrations", () => {
     expect(byName.get("orders_submission_requires_attempt")).toMatch(/'PLANNED'/u);
   });
 
+  it("create the round-4 wallet-operation market binding as database objects too", async () => {
+    const pool = poolFor(getConnectionString());
+
+    // The market of a wallet-operation-linked transaction is enforced by a
+    // trigger rather than by a composite key, because the rule is conditional:
+    // a key would either skip a NULL child market (MATCH SIMPLE — the round-3
+    // defect one column across) or forbid booking a marketless operation at all
+    // (MATCH FULL).
+    const triggers = await pool.query<{ tgname: string; deferrable: boolean }>(
+      `select t.tgname, t.tgdeferrable as deferrable
+         from pg_trigger t
+        where not t.tgisinternal
+          and t.tgrelid = 'accounting.ledger_transactions'::regclass
+          and t.tgname = 'ledger_transactions_wallet_operation_market'`,
+    );
+    expect(triggers.rows).toHaveLength(1);
+    // NOT DEFERRABLE, so no session can postpone the check past its statement.
+    expect(triggers.rows[0]?.deferrable).toBe(false);
+
+    const definition = await pool.query<{ source: string }>(
+      `select p.prosrc as source from pg_proc p
+         join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'accounting'
+          and p.proname = 'assert_ledger_wallet_operation_market'`,
+    );
+    expect(definition.rows).toHaveLength(1);
+    // The operation is read under a row lock, so a concurrent change to it
+    // serializes against the booking rather than racing it.
+    expect(definition.rows[0]?.source).toMatch(/for share/iu);
+    expect(definition.rows[0]?.source).toMatch(/PMB12/u);
+
+    // The other half: the operation's market is part of its identity, so the
+    // binding cannot be invalidated by a later UPDATE.
+    const immutable = await pool.query<{ arguments: string }>(
+      `select pg_get_triggerdef(t.oid) as arguments from pg_trigger t
+        where not t.tgisinternal
+          and t.tgrelid = 'accounting.wallet_operations'::regclass
+          and t.tgname = 'wallet_operations_immutable_identity'`,
+    );
+    expect(immutable.rows[0]?.arguments).toMatch(/'market_id'/u);
+
+    // A reconciliation run has no market, so that link needs no analogue.
+    const runMarket = await pool.query<{ count: string }>(
+      `select count(*)::text as count from information_schema.columns
+        where table_schema = 'ops' and table_name = 'reconciliation_runs'
+          and column_name = 'market_id'`,
+    );
+    expect(runMarket.rows[0]?.count).toBe("0");
+  });
+
   it("keep the reservation facts authoritative for every writer (§10.7)", async () => {
     const pool = poolFor(getConnectionString());
 

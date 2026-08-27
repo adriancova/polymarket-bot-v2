@@ -134,8 +134,9 @@ exactly, throwing rather than guessing if a session was configured otherwise.
 | Exactly one fenced live writer per account (§2, ADR-008) | partial unique index `fencing_leases_one_active_holder (account_ref, internal.execution_realm(environment))`, plus `fencing_leases_real_modes_only` so no simulated run mode can hold a live lease at all |
 | A fencing token is never reused (ADR-008 §1) | monotonicity is checked against `ops.fencing_token_high_water`, which only ever increases per `(account_ref, execution_realm)` and may not be lowered, deleted, or truncated — so erasing lease rows cannot re-open a token; the lease state machine is forward-only (`fencing_leases_forward_only`, `PMB10`), so a released, revoked, or expired lease cannot be reactivated with its old token; and `ops.fencing_leases` rejects DELETE and TRUNCATE outright |
 | A fill belongs to the account of the order it fills | composite foreign key on a **never-NULL** generated `account_key` (`coalesce(account_ref, '')`) on both sides, so a NULL child account cannot skip the binding the way MATCH SIMPLE allowed |
-| A ledger transaction agrees with what it books | composite foreign keys binding `environment`, `account_ref`, and `market_id` to the referenced order, fill, wallet operation, and reconciliation run, plus `(fill_id, order_id)`; scoped to rows that reference one, so external clearing, manual adjustments, and resolutions still stand alone |
+| A ledger transaction agrees with what it books | composite foreign keys binding `environment` and `account_ref` to the referenced order, fill, wallet operation, and reconciliation run, `market_id` to the referenced order and fill, plus `(fill_id, order_id)`; scoped to rows that reference one, so external clearing, manual adjustments, and resolutions still stand alone |
 | A ledger transaction that books an order or a fill names its market | `ledger_transactions_execution_link_has_market` CHECK, which is what makes the MATCH SIMPLE market keys above unskippable: `market_id` is nullable, so an execution-linked transaction could otherwise omit it, skip the binding, and disappear from every market-scoped ledger query while still balancing and still being append-only. Orders and fills both carry a NOT NULL `market_id`, so the value is never unknown; the repository input type requires it at compile time for the same shapes |
+| A ledger transaction that books a market-bearing wallet operation names *that* market | `accounting.assert_ledger_wallet_operation_market()` (`PMB12`), a NOT DEFERRABLE constraint trigger that reads the operation **under a row lock** and requires `market_id` to equal the operation's whenever the operation has one. A composite key cannot express this: MATCH SIMPLE skips a NULL child market (the round-3 defect, one column across), MATCH FULL would forbid booking a marketless operation at all, and any key would additionally forbid a transaction from naming a market the operation merely did not record. The operation's own `market_id` is immutable, which is what keeps the check true after the append-only transaction is committed. An operation that genuinely has no market (`APPROVE_ERC20`, `APPROVE_ERC1155`, a collateral `TRANSFER`) constrains nothing; `ops.reconciliation_runs` has no market column at all, so that link needs no analogue |
 | Decision → plan → attempt → order → fill (§9.11) | `orders_submission_requires_attempt` (an order that reaches a submitted state, carries a venue identity, a submission timestamp, or any fill names the attempt that signed it). The exempt states are `PLANNED` and the three terminal states an order reaches by being abandoned before transmission — **not** `SIGNED`: §9.11 creates the attempt at step 1, signs at step 2, persists the signed payload at step 3, and commits `SIGNED` only at step 4, so the attempt necessarily exists first. Supported by `execution.assert_fill_order_has_submission_attempt()` (`PMB11`) on the fill side, and `orders_submission_attempt_attach_only` (`PMB02`), which lets an attempt be attached once and never detached |
 
 ### 6.0 The environment discriminator is derived, never declared
@@ -216,8 +217,30 @@ Two §10.7-adjacent properties could not be expressed as a database constraint:
 Everything else in §10.7 is a database constraint, and each is tested against a
 writer that does **not** go through this package's repositories
 (`test/integration/postgres/authority-bypass.test.ts` for the round-1 findings,
-`authority-bypass-round2.test.ts` for the round-2 ones — every sequence in both
-was reproduced against the reviewed schema before it was closed).
+`authority-bypass-round2.test.ts`, `-round3`, and `-round4` for the later ones —
+every sequence in all four was reproduced against the reviewed schema before it
+was closed).
+
+### 6.3 Which account column is the position, and which is the label
+
+`accounting.ledger_transactions.account_ref` and
+`accounting.ledger_entries.account_ref` are different facts and are not bound to
+each other:
+
+- the **header** account is the initiating scope — whose action produced this
+  event — and is what the composite keys bind to the order, fill, wallet
+  operation, or reconciliation run it books;
+- the **entry** account is where value actually moved, one per leg. A transfer
+  between two accounts is one transaction with legs in two of them, which is why
+  the legs are deliberately unbound to the header.
+
+So anything reading a position, a balance, or a net movement reads the *entry*
+account. `netByAsset()` does; it used to filter the header, which returned every
+leg of a transfer the queried account initiated — netting `A -10, B +10` to zero
+for `A` and returning nothing for `B`. The per-asset balance check
+(`accounting.assert_ledger_transaction_balanced()`) is per transaction and per
+asset, deliberately not per account: a transfer balances across the two accounts,
+not within either.
 
 ## 7. Environment separation (§10.8)
 
