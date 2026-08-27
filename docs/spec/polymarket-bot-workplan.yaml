@@ -325,6 +325,11 @@ work_packages:
     allowed_paths:
       - packages/polymarket-public/**
       - test/contract/polymarket-public/**
+      # Ratified 2026-08-27 (WP-020/WP-040/WP-050/WP-060 precedent): mechanical
+      # lockfile update from this package's declared dependencies only; and the
+      # in-repo structured handoff for pre-merge review.
+      - pnpm-lock.yaml
+      - docs/handoffs/WP-070.md
     forbidden_paths:
       - packages/domain/**
       - packages/polymarket-secure/**
@@ -356,6 +361,11 @@ work_packages:
     allowed_paths:
       - packages/binance-adapter/**
       - test/contract/binance/**
+      # Ratified 2026-08-27 (WP-020/WP-040/WP-050/WP-060 precedent): mechanical
+      # lockfile update from this package's declared dependencies only; and the
+      # in-repo structured handoff for pre-merge review.
+      - pnpm-lock.yaml
+      - docs/handoffs/WP-080.md
     forbidden_paths:
       - packages/domain/**
     deliverables:
@@ -376,6 +386,11 @@ work_packages:
     allowed_paths:
       - packages/coinbase-adapter/**
       - test/contract/coinbase/**
+      # Ratified 2026-08-27 (WP-020/WP-040/WP-050/WP-060 precedent): mechanical
+      # lockfile update from this package's declared dependencies only; and the
+      # in-repo structured handoff for pre-merge review.
+      - pnpm-lock.yaml
+      - docs/handoffs/WP-090.md
     forbidden_paths:
       - packages/domain/**
     deliverables:

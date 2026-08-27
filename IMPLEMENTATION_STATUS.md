@@ -27,7 +27,7 @@ Maximum permitted run mode: `PAPER`
 | `WP-040`               | Complete | All ✓             | Merged `d23bb67` (impl chain `0a73ffe`→…→`f8982bf`, 5 review rounds) |
 | `WP-050`               | Complete | All ✓             | Merged `8a607ec` (impl chain `32cb0a8`→`3c2228a`→`a972e96`→`3f35a0c`→`b3a906f`→`22db770`, 4 review rounds) |
 | `WP-060`               | Complete | All ✓ | Merged `af29b08` (impl chain `d7bbb0f`→…→`954e764`, 3 review rounds) |
-| `WP-070`, `WP-080`, `WP-090` | Ready (Wave 1 batch 1B — after 1A per runbook) | All ✓ | Unassigned |
+| `WP-070`, `WP-080`, `WP-090` | IN_PROGRESS (Wave 1 batch 1B; C-4 phase gate satisfied 2026-08-27) | All ✓ | Packets dispatched 2026-08-27 to three parallel `wp-implementer` (Opus) sessions; workplan lockfile/handoff ratifications added 2026-08-27 |
 | `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
@@ -35,6 +35,31 @@ Maximum permitted run mode: `PAPER`
 Authorization vocabulary: "Ready (authorized)" rows are the only packages agents
 may begin in the current run; "Dependency-ready" rows must not start until this
 table says otherwise.
+
+### Wave 1 batch 1B phase-gate record (2026-08-27)
+
+- **C-4 phase-start venue re-check executed by the orchestrator** (owner per the
+  Wave 0 closeout record) before batch 1B dispatch: both pages re-fetched
+  2026-08-27. `https://docs.polymarket.com/trading/quickstart` ("Place Your
+  First Order") demonstrates only the unified `@polymarket/client`
+  (`createSecureClient`, `@polymarket/client/viem`; Python `polymarket`
+  package); `https://docs.polymarket.com/trading/overview` names no SDK
+  package. The review-claimed archived-SDK references remain NOT REPRODUCED.
+  Register row C-4 annotated in `docs/contracts/protected-contracts.md`
+  (dated orchestrator governance edit); next re-check at the phase-2 start
+  gate.
+- `pnpm ops:verify-venue` (offline validation of the frozen report): exit 0,
+  all sections PASS.
+- Batch 1B dispatch: WP-070/WP-080/WP-090 in parallel (three worktree-isolated
+  implementers — within the AGENTS.md four-agent ceiling and the runbook's
+  two-to-three adapter recommendation; paths disjoint; `pnpm-lock.yaml`
+  mechanically shared, reconciled at merge per the recorded WP-040/WP-050
+  lockfile-regeneration procedure). WP-100 remains sequenced strictly after
+  WP-070 merges (path subset). WP-070 packet carries the accumulated
+  obligations: reworded C-1/U-1 acceptance criterion, register R-2 (venue
+  schemas not hand-transcription-load-bearing within its paths), ADR-002 §7
+  `.nullish()`-to-absent adapter rule, and the §9 fixture-only-narrowings
+  binding list.
 
 ### WP-060 completion record (2026-08-27)
 
