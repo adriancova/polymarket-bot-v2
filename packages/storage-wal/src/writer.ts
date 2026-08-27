@@ -873,7 +873,11 @@ export class WalWriter {
   }
 
   /**
-   * Frames the writer accepted but cannot prove are durable.
+   * Frames the writer accepted whose accountability was never released by a
+   * written manifest. This deliberately includes records an earlier successful
+   * `fsync` covered when their segment ended unmanifested — durability proof
+   * (the watermark) and accountability release (the manifest write) are
+   * separate; only the latter removes a frame from this list.
    *
    * Non-empty only after a write fault. They are handed back rather than
    * discarded so the caller can re-enqueue them against a fresh writer or record

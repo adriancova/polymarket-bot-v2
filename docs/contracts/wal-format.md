@@ -486,7 +486,10 @@ On a fault the writer transitions to `faulted`, refuses further frames, and move
 into `pendingFrames()`, in accept order, **all three** groups of frames it is
 still holding:
 
-1. the frames it appended but no `fsync` has proven (`unprovenFrameCount` in the
+1. every record appended to the still-unmanifested active segment — including
+   records an earlier successful `fsync` covered, because accountability is
+   released only by a written manifest, never by `fsync` (`unprovenFrameCount`
+   still reports the narrower watermark-uncovered subset in the
    metrics is this group while the writer is still healthy);
 2. the frames `drain()` had taken from the queue and not yet appended;
 3. **the frames still in the queue.** A faulted writer will never write them —
