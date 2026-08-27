@@ -45,13 +45,14 @@
  *     purity-restricted package: a dynamic `import()` or a `require`-capability
  *     call (bare, aliased, `module.require`, or reflected) whose specifier is
  *     not a static literal (an interpolated template, a variable, a
- *     concatenation, an array passed to `.apply`), or a reference to
- *     `eval`/`Function`. Each
- *     defeats static checking entirely, so inside `packages/domain`,
- *     `packages/strategies/**`, `packages/ledger`, and `packages/simulation`
- *     it is itself a finding rather than a silent pass. Elsewhere it is
- *     allowed (composition roots legitimately load modules by name); see
- *     `docs/handoffs/WP-015.md` for that trade-off.
+ *     concatenation, an array passed to `.apply`), a reference to
+ *     `eval`/`Function`, or a **require capability that escapes** into a value
+ *     this check cannot follow (WP-015 review round 4; see "the capability
+ *     escape rule" below). Each defeats static checking entirely, so inside
+ *     `packages/domain`, `packages/strategies/**`, `packages/ledger`, and
+ *     `packages/simulation` it is itself a finding rather than a silent pass.
+ *     Elsewhere it is allowed (composition roots legitimately load modules by
+ *     name); see `docs/handoffs/WP-015.md` for that trade-off.
  *
  * How source is read. Rule 3 uses the **TypeScript compiler API**
  * (`ts.createSourceFile` + a full AST walk); there is no regular expression
@@ -80,8 +81,8 @@
  *         an ambient `declare const require`, which is a type assertion over the
  *         global, not a real local implementation, and so does *not* shadow it;
  *       - an alias bound to it: `const r = require` / `= module.require` /
- *         `= createRequire(...)`, or `const { require } = module`, makes a later
- *         `r(...)` a require-load;
+ *         `= createRequire(...)` / `= module`, or `const { require } = module`,
+ *         makes a later `r(...)` (or `m.require(...)`) a require-load;
  *       - `module.require(...)` / `module["require"](...)`, where `module` is the
  *         CommonJS module global (not a genuine local of that name);
  *       - `require.call(thisArg, spec)` / `require.apply(...)` reflection, whose
@@ -92,6 +93,42 @@
  *     destructured non-module binding) still shadows, and a *method* call such
  *     as `registry.require(eventType, version)` is not a module load because its
  *     callee is a property access on an object that is not the module global.
+ *   - **The capability escape rule** (WP-015 review round 4). The list above
+ *     enumerates the positions in which this check can *read* what a capability
+ *     loads. Enumerating positions is not a total rule, and round 4 found seven
+ *     legal spellings that reached a module while naming none of them:
+ *     `({ r: require }).r("node:fs")`, `[require][0](...)`,
+ *     `exports.load = require` plus a later call through the wrapper,
+ *     `Reflect.apply(require, null, [...])`, `const { r } = { r: require }`,
+ *     `require.bind(null)(...)`, and `let r; r = require;` (an assignment, which
+ *     the declaration-only alias tracker never saw). So the rule is inverted and
+ *     made total by construction, in the same identifier-reference layer that
+ *     already detects `Date`/`process`:
+ *
+ *       In a purity-restricted package, ANY reference to a require capability
+ *       that is not in a position this check analyses is ITSELF a finding.
+ *
+ *     A "require capability" is the ambient `require`, the CommonJS `module`
+ *     global, `createRequire` (which manufactures one), the result of calling
+ *     it, and any alias this check tracks to one of those. The positions that do
+ *     *not* additionally flag — because the check follows the value through them
+ *     — are exactly: the callee of an analyzed call (which yields a specifier or
+ *     an `F-OPAQUE`), the `.call`/`.apply` reflection callee, the initializer of
+ *     a declaration whose binding the alias tracker follows (the alias is then
+ *     tracked, and an *alias* reference that escapes is caught by this same
+ *     rule), the base of a larger capability expression (`module` in
+ *     `module.require`, `createRequire` in `createRequire(...)`), a `typeof`
+ *     operand, and a type position (never walked as a value). Everything else —
+ *     object/array literal element, assignment right-hand side, call argument,
+ *     `.bind`/any other property read, return value, export value — is an
+ *     escape, reported as `F-OPAQUE` with the escape shape named.
+ *
+ *     This is deliberately noisy for contrived-but-legal wrapping: an escape
+ *     finding does not prove a forbidden module was loaded, only that the check
+ *     can no longer prove one was not. That is the accepted trade
+ *     (noisy-never-silent), and it costs nothing in practice because a
+ *     purity-restricted package has no legitimate use of `require` at all —
+ *     ADR-005 §1 and contract §3 (F1/F2/F3) forbid the I/O it exists to reach.
  *   - **Impure globals** in `packages/domain` (F1) and `packages/strategies/**`
  *     (F3/F11), detected by *identifier reference* rather than by call
  *     spelling. See `GLOBAL_ROOTS` below for the exact semantics.
@@ -359,6 +396,24 @@ const CRYPTO_RANDOM_MEMBERS = new Set([
  * F1-F8/F11.
  */
 const EVALUATORS = new Set(["eval", "Function"]);
+
+/**
+ * The three shapes in which a package can hold the CommonJS module-loading
+ * capability. `capabilityOf` (below) maps an expression to one of these or to
+ * `null`; the escape rule described in this file's header treats a reference to
+ * any of them as a finding unless the reference sits in a position the check
+ * analyses.
+ */
+const CAP_REQUIRE = "require-loader";
+const CAP_MODULE = "module-global";
+const CAP_FACTORY = "createRequire-factory";
+
+/** How each capability is named in an escape finding. */
+const CAPABILITY_LABELS = new Map([
+  [CAP_REQUIRE, "the CommonJS `require` capability"],
+  [CAP_MODULE, "the CommonJS `module` global (from which `module.require` is reachable)"],
+  [CAP_FACTORY, "`createRequire`, which manufactures a CommonJS `require`"],
+]);
 
 /**
  * The global identifiers rule 3 rejects inside a purity-restricted package,
@@ -959,10 +1014,11 @@ function scanSourceFile(ts, rootDir, fileRel) {
    */
   const genuineScopes = [];
   /**
-   * Names bound to the CommonJS `require` **capability** in each enclosing scope
-   * (an alias to `require`/`module.require`/`createRequire(...)`, or a
-   * `const { require } = module` destructure). A later call to such a name is a
-   * require-load.
+   * Names bound to a require **capability** in each enclosing scope, as a
+   * `Map<name, capability kind>`: an alias to `require`/`module.require`/
+   * `createRequire(...)`/`module`/`createRequire`, or a `const { require } =
+   * module` destructure. A later call to a `CAP_REQUIRE` name is a require-load,
+   * and a reference to any tracked name obeys the escape rule.
    */
   const requireAliasScopes = [];
 
@@ -984,7 +1040,24 @@ function scanSourceFile(ts, rootDir, fileRel) {
 
   const isDeclaredLocally = (name) => scopes.some((scope) => scope.has(name));
   const isGenuinelyDeclared = (name) => genuineScopes.some((scope) => scope.has(name));
-  const isRequireAlias = (name) => requireAliasScopes.some((scope) => scope.has(name));
+
+  /**
+   * The capability an alias name is bound to, or `null`. Frames are searched
+   * innermost-first and a genuine binding in a *nearer* scope shadows an outer
+   * alias, so `const r = require; function f(r) { r(x); }` resolves the inner
+   * `r` to the parameter. `requireAliasScopes` and `genuineScopes` are pushed
+   * together, so index `i` names the same scope in both (during hoisting the
+   * alias frame for the scope being entered is not yet pushed, which is exactly
+   * right: it is the frame being computed).
+   */
+  const trackedAliasKind = (name) => {
+    for (let index = requireAliasScopes.length - 1; index >= 0; index -= 1) {
+      const kind = requireAliasScopes[index].get(name);
+      if (kind !== undefined) return kind;
+      if (genuineScopes[index].has(name)) return null;
+    }
+    return null;
+  };
 
   /** True when a scope-creating node carries the ambient `declare` modifier. */
   const hasDeclareModifier = (node) => {
@@ -1125,63 +1198,81 @@ function scanSourceFile(ts, rootDir, fileRel) {
     return current;
   };
 
-  /** True when `expr` denotes the CommonJS `module` global (not a genuine local). */
-  const isModuleGlobal = (expr) => {
-    const inner = unwrapExpression(expr);
-    return ts.isIdentifier(inner) && inner.text === "module" && !isGenuinelyDeclared("module");
-  };
-
-  /** True when calling `expr` yields a `require` capability (i.e. `expr` is `createRequire`). */
-  const isCreateRequireCallee = (expr) => {
-    const inner = unwrapExpression(expr);
-    if (ts.isIdentifier(inner)) return inner.text === "createRequire";
-    // `mod.createRequire` / `mod["createRequire"]` — the node:module import that
-    // binds `mod` is already an F-row finding; this covers the directly-invoked
-    // namespace form as well.
-    if (ts.isPropertyAccessExpression(inner) && ts.isIdentifier(inner.name)) return inner.name.text === "createRequire";
+  /** `obj.name` / `obj["name"]` — the statically known member name, or `null`. */
+  const staticMemberName = (node) => {
+    if (ts.isPropertyAccessExpression(node)) return ts.isIdentifier(node.name) ? node.name.text : null;
     if (
-      ts.isElementAccessExpression(inner) &&
-      inner.argumentExpression &&
-      ts.isStringLiteralLike(inner.argumentExpression)
+      ts.isElementAccessExpression(node) &&
+      node.argumentExpression &&
+      ts.isStringLiteralLike(node.argumentExpression)
     ) {
-      return inner.argumentExpression.text === "createRequire";
+      return node.argumentExpression.text;
     }
-    return false;
+    return null;
   };
 
   /**
-   * True when `expr` resolves to the CommonJS `require` capability: the ambient
-   * `require`, an alias bound to it, `module.require`, or `createRequire(...)`.
-   * `extraAliases` lets alias hoisting see earlier same-scope aliases.
+   * Which require capability, if any, an expression denotes (see this file's
+   * header). `extraAliases` lets alias hoisting see earlier same-scope aliases,
+   * so a chain (`const a = require; const b = a;`) resolves.
+   *
+   * `createRequire` is matched by name **without** the genuine-shadow test,
+   * because the ordinary way to hold the factory is to import it — and an import
+   * binding is a genuine declaration. Importing `node:module` is already an
+   * F1/F3 finding, so the only cost of the wider match is a possible escape
+   * finding on an unrelated local named `createRequire`, which is the accepted
+   * noisy-never-silent direction.
    */
-  const resolvesToRequire = (expr, extraAliases) => {
+  const capabilityOf = (expr, extraAliases) => {
+    if (!expr) return null;
     const inner = unwrapExpression(expr);
+    if (!inner) return null;
     if (ts.isIdentifier(inner)) {
       const name = inner.text;
-      if (extraAliases && extraAliases.has(name)) return true;
-      if (isRequireAlias(name)) return true;
-      // The ambient/global `require`, unless a genuine local of that name shadows it.
-      return name === "require" && !isGenuinelyDeclared("require");
+      const pending = extraAliases ? extraAliases.get(name) : undefined;
+      if (pending !== undefined) return pending;
+      const tracked = trackedAliasKind(name);
+      if (tracked !== null) return tracked;
+      if (name === "createRequire") return CAP_FACTORY;
+      // A genuine local of that name is a real implementation, not the global.
+      if (isGenuinelyDeclared(name)) return null;
+      if (name === "require") return CAP_REQUIRE;
+      if (name === "module") return CAP_MODULE;
+      return null;
     }
-    if (ts.isPropertyAccessExpression(inner) && ts.isIdentifier(inner.name) && inner.name.text === "require") {
-      return isModuleGlobal(inner.expression);
+    if (ts.isPropertyAccessExpression(inner) || ts.isElementAccessExpression(inner)) {
+      const member = staticMemberName(inner);
+      if (member === null) return null;
+      // `mod.createRequire` / `mod["createRequire"]` — the namespace form.
+      if (member === "createRequire") return CAP_FACTORY;
+      if (member !== "require") return null;
+      if (capabilityOf(inner.expression, extraAliases) === CAP_MODULE) return CAP_REQUIRE;
+      // `globalThis.require` / `window["require"]` reaches the same ambient
+      // capability. The root is separately an impure-global finding, but only
+      // in `packages/domain` and `packages/strategies/**`; without this branch
+      // the identical construct is silent in `packages/ledger` and
+      // `packages/simulation`, which run no globals rule.
+      const root = unwrapExpression(inner.expression);
+      if (root && ts.isIdentifier(root) && ENVIRONMENT_ROOTS.has(root.text) && !isGenuinelyDeclared(root.text)) {
+        return CAP_REQUIRE;
+      }
+      return null;
     }
-    if (
-      ts.isElementAccessExpression(inner) &&
-      inner.argumentExpression &&
-      ts.isStringLiteralLike(inner.argumentExpression) &&
-      inner.argumentExpression.text === "require"
-    ) {
-      return isModuleGlobal(inner.expression);
+    // Calling the factory yields the loader: `createRequire(import.meta.url)`.
+    if (ts.isCallExpression(inner)) {
+      return capabilityOf(inner.expression, extraAliases) === CAP_FACTORY ? CAP_REQUIRE : null;
     }
-    if (ts.isCallExpression(inner) && isCreateRequireCallee(inner.expression)) return true;
-    return false;
+    return null;
   };
+
+  /** True when `expr` resolves to the `require` loader itself. */
+  const resolvesToRequire = (expr, extraAliases) => capabilityOf(expr, extraAliases) === CAP_REQUIRE;
 
   /** `require.call(...)` / `require.apply(...)` — reflection over the capability. */
   const isRequireReflection = (callee) => {
-    if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.name)) return false;
-    if (callee.name.text !== "call" && callee.name.text !== "apply") return false;
+    if (!ts.isPropertyAccessExpression(callee) && !ts.isElementAccessExpression(callee)) return false;
+    const member = staticMemberName(callee);
+    if (member !== "call" && member !== "apply") return false;
     return resolvesToRequire(callee.expression);
   };
 
@@ -1201,12 +1292,13 @@ function scanSourceFile(ts, rootDir, fileRel) {
       if (!ts.isVariableStatement(statement) || hasDeclareModifier(statement)) continue;
       for (const declaration of statement.declarationList.declarations) {
         if (!declaration.initializer) continue;
+        const kind = capabilityOf(declaration.initializer, into);
         if (ts.isIdentifier(declaration.name)) {
-          if (resolvesToRequire(declaration.initializer, into)) into.add(declaration.name.text);
+          if (kind !== null) into.set(declaration.name.text, kind);
           continue;
         }
         // `const { require: r } = module` binds `r` to `module.require`.
-        if (ts.isObjectBindingPattern(declaration.name) && isModuleGlobal(declaration.initializer)) {
+        if (ts.isObjectBindingPattern(declaration.name) && kind === CAP_MODULE) {
           for (const element of declaration.name.elements) {
             if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
             const property = element.propertyName ?? element.name;
@@ -1215,7 +1307,7 @@ function scanSourceFile(ts, rootDir, fileRel) {
               : ts.isStringLiteralLike(property)
                 ? property.text
                 : null;
-            if (propertyName === "require") into.add(element.name.text);
+            if (propertyName === "require") into.set(element.name.text, CAP_REQUIRE);
           }
         }
       }
@@ -1223,13 +1315,31 @@ function scanSourceFile(ts, rootDir, fileRel) {
   };
 
   const requireAliasNames = (node) => {
-    const into = new Set();
+    const into = new Map();
     if (ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node)) {
       collectAliasDecls(node.statements, into);
     } else if (ts.isCaseBlock(node)) {
       for (const clause of node.clauses) collectAliasDecls(clause.statements, into);
     }
     return into;
+  };
+
+  /**
+   * True when a declaration's binding consumed the capability its initializer
+   * denotes — i.e. the alias tracker followed it, so the value has not escaped
+   * and the alias's own references are subject to the same escape rule.
+   */
+  const declarationTracksCapability = (declaration) => {
+    if (ts.isIdentifier(declaration.name)) return trackedAliasKind(declaration.name.text) !== null;
+    if (ts.isObjectBindingPattern(declaration.name)) {
+      return declaration.name.elements.some(
+        (element) =>
+          ts.isBindingElement(element) &&
+          ts.isIdentifier(element.name) &&
+          trackedAliasKind(element.name.text) !== null,
+      );
+    }
+    return false;
   };
 
   /** The outermost expression denoting the same value as `node`. */
@@ -1344,6 +1454,106 @@ function scanSourceFile(ts, rootDir, fileRel) {
   };
 
   /**
+   * True when a *larger* enclosing expression is itself a capability, so that
+   * expression — not this one — is the one whose position decides the escape.
+   * `module` in `module.require`, and `createRequire` in `createRequire(...)`,
+   * are absorbed this way; `require` in `require("x")` is not, because
+   * `require("x")` denotes the loaded module, not a capability.
+   */
+  const isAbsorbedCapability = (node) => {
+    const outer = outerOf(node);
+    const parent = outer.parent;
+    if (!parent) return false;
+    if (
+      (ts.isPropertyAccessExpression(parent) ||
+        ts.isElementAccessExpression(parent) ||
+        ts.isCallExpression(parent)) &&
+      parent.expression === outer
+    ) {
+      return capabilityOf(parent) !== null;
+    }
+    return false;
+  };
+
+  /**
+   * True when the capability sits in a position this check analyses, so it needs
+   * no escape finding. See the header's "capability escape rule" for why this
+   * list is closed and everything outside it is a finding.
+   */
+  const capabilityIsConsumed = (node, kind) => {
+    const outer = outerOf(node);
+    const parent = outer.parent;
+    if (!parent) return false;
+    // `typeof require` is a shadow-safe existence test that loads nothing.
+    if (ts.isTypeOfExpression(parent)) return true;
+    if (kind === CAP_REQUIRE) {
+      // The callee of a call the module-call visitor reads.
+      if (ts.isCallExpression(parent) && parent.expression === outer) return true;
+      // `require.call(thisArg, spec)` / `require.apply(thisArg, [spec])`.
+      if (
+        (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) &&
+        parent.expression === outer
+      ) {
+        const member = staticMemberName(parent);
+        if (member === "call" || member === "apply") {
+          const access = outerOf(parent);
+          return Boolean(access.parent && ts.isCallExpression(access.parent) && access.parent.expression === access);
+        }
+      }
+    }
+    // The initializer of a declaration whose binding the alias tracker follows.
+    if (ts.isVariableDeclaration(parent) && parent.initializer === outer) {
+      return declarationTracksCapability(parent);
+    }
+    return false;
+  };
+
+  /** Names the shape of the escape, so the finding says what to look at. */
+  const escapeShapeOf = (node) => {
+    const outer = outerOf(node);
+    const parent = outer.parent;
+    if (!parent) return "an unattached expression";
+    if (ts.isPropertyAssignment(parent) && parent.initializer === outer) return "an object-literal property value";
+    if (ts.isShorthandPropertyAssignment(parent)) return "an object-literal shorthand property";
+    if (ts.isSpreadElement(parent) || ts.isSpreadAssignment(parent)) return "a spread element";
+    if (ts.isArrayLiteralExpression(parent)) return "an array-literal element";
+    if (
+      ts.isBinaryExpression(parent) &&
+      parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      parent.right === outer
+    ) {
+      return "the right-hand side of an assignment (which binds no declaration for the alias tracker to follow)";
+    }
+    if ((ts.isCallExpression(parent) || ts.isNewExpression(parent)) && parent.expression !== outer) {
+      return "a call argument";
+    }
+    if (ts.isCallExpression(parent) || ts.isNewExpression(parent)) {
+      return "a callee this check cannot resolve to a module load";
+    }
+    if (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) {
+      const member = staticMemberName(parent);
+      return member === null ? "a computed property read" : `a property read (\`.${member}\`)`;
+    }
+    if (ts.isReturnStatement(parent)) return "a return value";
+    if (ts.isArrowFunction(parent) && parent.body === outer) return "a concise arrow-function body";
+    if (ts.isExportAssignment(parent)) return "an export value";
+    if (ts.isVariableDeclaration(parent) && parent.initializer === outer) {
+      return "a declaration initializer whose binding this check cannot follow";
+    }
+    if (ts.isTemplateSpan(parent)) return "a template-literal interpolation";
+    if (ts.isConditionalExpression(parent) || ts.isBinaryExpression(parent)) return "an operand of an expression";
+    return "a position this check cannot follow";
+  };
+
+  const recordCapabilityEscape = (node, kind) => {
+    opaque.push({
+      call: "capability",
+      form: `${CAPABILITY_LABELS.get(kind)} escapes into ${escapeShapeOf(node)}`,
+      line: lineOf(node),
+    });
+  };
+
+  /**
    * `eval(...)` and `Function(...)`/`new Function(...)` evaluate code this
    * checker cannot read, which makes F1-F8/F11 unevaluable for whatever they
    * evaluate — the same fault `F-OPAQUE` already names for a computed
@@ -1403,6 +1613,23 @@ function scanSourceFile(ts, rootDir, fileRel) {
     if (ts.isTypeNode(node) && !ts.isExpressionWithTypeArguments(node)) {
       walkTypeNode(node);
       return;
+    }
+
+    // WP-015 review round 4 — the capability escape rule. Every expression that
+    // denotes a require capability is checked here, in the same reference layer
+    // that detects `Date`/`process`, so a capability which leaves the positions
+    // this check analyses is a finding rather than a silent module load. The
+    // finding is emitted only inside a purity-restricted package (see the
+    // `F-OPAQUE` block in `runCheck`).
+    if (
+      ts.isIdentifier(node)
+        ? isValueReference(node)
+        : ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isCallExpression(node)
+    ) {
+      const capability = capabilityOf(node);
+      if (capability !== null && !isAbsorbedCapability(node) && !capabilityIsConsumed(node, capability)) {
+        recordCapabilityEscape(node, capability);
+      }
     }
 
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
@@ -1979,11 +2206,16 @@ function runCheck(rootDir) {
             message:
               hit.call === "evaluator"
                 ? `references ${hit.form}, which evaluates code no static check can read; in \`${pkg.dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it evaluates`
-                : hit.call === "require"
-                  ? `calls \`require()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the required module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`
-                  : `uses a dynamic \`import()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the imported module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
+                : hit.call === "capability"
+                  ? `${hit.form}; from there it can load any module by name, so in \`${pkg.dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it loads — and a purity-restricted package has no legitimate use of \`require\``
+                  : hit.call === "require"
+                    ? `calls \`require()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the required module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`
+                    : `uses a dynamic \`import()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the imported module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
             doc: `${CONTRACT_REL} §6 rule 3; ADR-005 §1`,
-            fix: "import the module statically, or receive the capability through StrategyContext/a constructor argument",
+            fix:
+              hit.call === "capability"
+                ? "delete the reference; a package under F1/F2/F3 loads no module at run time, and receives every capability it needs as a constructor/StrategyContext argument"
+                : "import the module statically, or receive the capability through StrategyContext/a constructor argument",
           });
         }
       }
@@ -2080,8 +2312,9 @@ Enforces docs/contracts/dependency-direction.md §6:
   F12/F13   no upward edge; same-layer edges only when listed in §2.1
   F1-F8,F11 no forbidden import specifier or non-deterministic global
   F-CLOSED  §6 fail-closed: unclassified package, or §2 entry with no manifest
-  F-OPAQUE  no dynamic import()/require() with a non-static specifier in a
-            package whose purity is constrained (domain, strategies, ledger,
+  F-OPAQUE  no dynamic import()/require() with a non-static specifier, and no
+            require capability escaping into a value the check cannot follow, in
+            a package whose purity is constrained (domain, strategies, ledger,
             simulation)
 The §2 layer table and the §2.1 allowlist are parsed from the contract and
 validated eagerly; an unparseable or inconsistent row is a CHK error, not a

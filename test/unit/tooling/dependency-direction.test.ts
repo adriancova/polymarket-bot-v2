@@ -1396,6 +1396,165 @@ describe("dependency-direction check — round-3 require-family regressions", ()
   });
 });
 
+/**
+ * Round 3 enumerated the positions in which a require capability can be *read*.
+ * Round 4 showed that enumerating positions is not a total rule: seven legal
+ * spellings reached a module while naming none of the handled positions, and
+ * each passed silently. The rule is now inverted — any reference to a require
+ * capability outside the positions this check analyses is itself a finding —
+ * so these probes assert the escape is named, not that the specifier is read.
+ */
+describe("dependency-direction check — round-4 capability-escape regressions", () => {
+  const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
+
+  const escapes: ReadonlyArray<{ readonly label: string; readonly source: string; readonly shape: string }> = [
+    {
+      label: "an object-literal property value: `({ r: require }).r(...)`",
+      source: 'export const fs = ({ r: require }).r("node:fs");\n',
+      shape: "escapes into an object-literal property value",
+    },
+    {
+      label: "an array-literal element: `[require][0](...)`",
+      source: 'export const fs = [require][0]("node:fs");\n',
+      shape: "escapes into an array-literal element",
+    },
+    {
+      label: "a property assignment: `exports.load = require` plus a later call",
+      source: 'exports.load = require;\nexport const fs = exports.load("node:fs");\n',
+      shape: "escapes into the right-hand side of an assignment",
+    },
+    {
+      label: "a reflection argument: `Reflect.apply(require, null, [...])`",
+      source: 'export const fs = Reflect.apply(require, null, ["node:fs"]);\n',
+      shape: "escapes into a call argument",
+    },
+    {
+      label: "a destructure of an object literal: `const { r } = { r: require }`",
+      source: 'const { r } = { r: require };\nexport const fs = r("node:fs");\n',
+      shape: "escapes into an object-literal property value",
+    },
+    {
+      label: "a bound wrapper: `require.bind(null)(...)`",
+      source: 'export const fs = require.bind(null)("node:fs");\n',
+      shape: "escapes into a property read (`.bind`)",
+    },
+    {
+      label: "an assignment to an existing binding: `let r; r = require; r(...)`",
+      source: 'let r: unknown;\nr = require;\nexport const fs = (r as (m: string) => unknown)("node:fs");\n',
+      shape: "escapes into the right-hand side of an assignment",
+    },
+  ];
+
+  describe("an unconsumed reference to the require capability is itself a finding", () => {
+    for (const probe of escapes) {
+      it(`reports the capability escaping into ${probe.label}`, () => {
+        const run = runChecker(buildFixture({ files: { [strategyFile]: probe.source } }));
+        expect(run.status).toBe(1);
+        expect(run.output).toContain("FAIL [F-OPAQUE]");
+        expect(run.output).toContain("the CommonJS `require` capability");
+        expect(run.output).toContain(probe.shape);
+        expect(run.output).toContain("src/probe.ts:");
+      });
+    }
+
+    it("propagates the rule to an alias reference that itself escapes", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: "const r = require;\nexport const holder = { r };\n" },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("escapes into an object-literal shorthand property");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("resolves `globalThis.require(...)` in a package that runs no globals rule", () => {
+      // The globals rule (which reports the `globalThis` reference itself) runs
+      // only for packages/domain and packages/strategies/**, so in
+      // packages/simulation this construct was silent until round 4.
+      const run = runChecker(
+        buildFixture({
+          files: { "packages/simulation/src/probe.ts": 'export const signer = globalThis.require("ethers");\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+    });
+
+    it("follows a `const m = module` alias, so `m.require(...)` is still read as a load", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: 'const m = module;\nexport const fs = m.require("node:fs");\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+  });
+
+  describe("the analysed positions do not additionally flag", () => {
+    it("reads the specifier of a tracked alias call without reporting an escape", () => {
+      const run = runChecker(
+        buildFixture({ files: { [strategyFile]: 'const r = require;\nexport const fs = r("node:fs");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+      expect(run.output).not.toContain("F-OPAQUE");
+    });
+
+    it("does not report `typeof require`, a shadow-safe test that loads nothing", () => {
+      const run = runChecker(
+        buildFixture({ files: { [strategyFile]: 'export const isCjs = typeof require === "function";\n' } }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+
+  describe("a genuine local binding is not a reference to the ambient capability", () => {
+    it("does not flag a genuine local function named `require`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const require = (m: string) => ({ stub: m });",
+              'export const stub = require("x");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("keeps the round-3 negatives clean under the escape rule", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const registry = { require: (eventType: string, version: number) => `${eventType}@${version}` };",
+              'export const pinned = registry.require("MarketDiscovered", 1);',
+              "export function load(require: (key: string) => string) {",
+              '  return require("contract");',
+              "}",
+            ].join("\n"),
+            "packages/strategies/static-bracket/src/local-module.ts": [
+              "const module = { require: (name: string) => name.toUpperCase() };",
+              'export const shouted = module.require("node:fs");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+});
+
 describe("dependency-direction check CLI", () => {
   it("prints usage and exits 0 for --help", () => {
     const result = spawnSync(process.execPath, [checkerPath, "--help"], { encoding: "utf8", cwd: repoRoot });
