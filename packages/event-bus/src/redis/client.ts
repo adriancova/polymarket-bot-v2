@@ -17,7 +17,13 @@
 import { Redis } from "ioredis";
 
 import { EventBusConfigurationError, EventBusUnavailableError } from "../errors.js";
-import { PUBLISH_SCRIPT, STREAM_STATE_SCRIPT } from "./scripts.js";
+import {
+  ENSURE_ORIGIN_SCRIPT,
+  PUBLISH_SCRIPT,
+  RESOLVE_POSITION_SCRIPT,
+  STORE_CHECKPOINT_SCRIPT,
+  STREAM_STATE_SCRIPT,
+} from "./scripts.js";
 
 export type RedisConnectionOptions = {
   /** Connection URL, for example `redis://127.0.0.1:6379`. */
@@ -35,15 +41,35 @@ export type RedisConnectionOptions = {
   readonly maxRetriesPerRequest?: number;
 };
 
-/** The two server-side scripts, as methods `defineCommand` installs. */
+/** The server-side scripts, as methods `defineCommand` installs. */
 export type RedisScriptCommands = {
   ebPublish(
     streamKey: string,
     counterKey: string,
     retention: string,
     envelope: string,
-  ): Promise<[string, string]>;
-  ebStreamState(streamKey: string, counterKey: string): Promise<string[]>;
+  ): Promise<string[]>;
+  ebStreamState(streamKey: string, counterKey: string, originKey: string): Promise<string[]>;
+  ebEnsureOrigin(originKey: string, candidate: string): Promise<string[]>;
+  ebResolvePosition(
+    streamKey: string,
+    counterKey: string,
+    originKey: string,
+    origin: string,
+    entryId: string,
+    sequence: string,
+  ): Promise<string[]>;
+  ebStoreCheckpoint(
+    streamKey: string,
+    counterKey: string,
+    originKey: string,
+    checkpointsKey: string,
+    origin: string,
+    entryId: string,
+    sequence: string,
+    consumerId: string,
+    token: string,
+  ): Promise<string[]>;
 };
 
 export type EventBusRedisClient = Redis & RedisScriptCommands;
@@ -79,7 +105,10 @@ export async function createRedisClient(
   client.on("error", () => {});
 
   client.defineCommand("ebPublish", { numberOfKeys: 2, lua: PUBLISH_SCRIPT });
-  client.defineCommand("ebStreamState", { numberOfKeys: 2, lua: STREAM_STATE_SCRIPT });
+  client.defineCommand("ebStreamState", { numberOfKeys: 3, lua: STREAM_STATE_SCRIPT });
+  client.defineCommand("ebEnsureOrigin", { numberOfKeys: 1, lua: ENSURE_ORIGIN_SCRIPT });
+  client.defineCommand("ebResolvePosition", { numberOfKeys: 3, lua: RESOLVE_POSITION_SCRIPT });
+  client.defineCommand("ebStoreCheckpoint", { numberOfKeys: 4, lua: STORE_CHECKPOINT_SCRIPT });
 
   try {
     await client.connect();

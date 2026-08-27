@@ -25,6 +25,14 @@ export type StreamState = {
   readonly serverTimeMs: number;
   /** Publication time of the oldest retained entry, in server milliseconds. */
   readonly oldestEntryAtMs: number | undefined;
+  /**
+   * This stream instance's marker, absent when none has been minted.
+   *
+   * Read rather than minted here: a metrics query must be able to say "these
+   * stored positions were taken somewhere else" without creating the very
+   * marker it is checking against (`./checkpoint.ts`).
+   */
+  readonly origin: string | undefined;
 };
 
 /** Runs the state script and parses its reply. */
@@ -34,7 +42,7 @@ export async function readStreamState(
 ): Promise<StreamState> {
   let reply: string[];
   try {
-    reply = await client.ebStreamState(keys.events, keys.published);
+    reply = await client.ebStreamState(keys.events, keys.published, keys.origin);
   } catch (cause) {
     throw new EventBusUnavailableError(
       "could not read transport stream state",
@@ -54,8 +62,10 @@ export function parseStreamState(reply: readonly string[]): StreamState {
   const lastEntryId = readOptionalString(reply[4]);
   const seconds = readCount(reply[5], "serverSeconds");
   const microseconds = readCount(reply[6], "serverMicroseconds");
+  const origin = readOptionalString(reply[7]);
 
   return {
+    origin,
     publishedTotal,
     depth,
     firstEntryId,

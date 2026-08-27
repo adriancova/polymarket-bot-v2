@@ -13,6 +13,7 @@ const base = {
   producerBlockedTimeMs: 12,
   publishFailures: 0,
   consumerLag: [],
+  unreadableCheckpoints: 0,
 } as const;
 
 describe("computeStreamQueueMetrics", () => {
@@ -79,5 +80,18 @@ describe("computeStreamQueueMetrics", () => {
     expect(() => computeStreamQueueMetrics({ ...base, publishedTotal: 1.5 })).toThrow(
       EventBusConfigurationError,
     );
+    expect(() => computeStreamQueueMetrics({ ...base, unreadableCheckpoints: -1 })).toThrow(
+      EventBusConfigurationError,
+    );
+  });
+
+  it("reports stored positions that could not be read, rather than dropping them", () => {
+    // A consumer whose stored position cannot be read must not simply vanish
+    // from the metric set: nothing about its lag is known, and silence would
+    // read as "no such consumer".
+    const metrics = computeStreamQueueMetrics({ ...base, unreadableCheckpoints: 2 });
+
+    expect(metrics.unreadableCheckpoints).toBe(2);
+    expect(metrics.consumerLag).toStrictEqual([]);
   });
 });

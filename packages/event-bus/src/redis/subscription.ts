@@ -78,7 +78,14 @@ export const MAX_WAIT_MS = 600_000;
 /** Services the subscription borrows from the transport's command connection. */
 export type SubscriptionServices = {
   readStreamState(): Promise<StreamState>;
-  storeCheckpoint(consumerId: ConsumerId, token: string): Promise<void>;
+  /**
+   * Records a position durably, and only one the stream really holds.
+   *
+   * Takes the position rather than a token because the server judges the
+   * position and writes it in one step (`./position.ts`); the token it stored is
+   * returned so the subscription reports exactly what is durable.
+   */
+  storeCheckpoint(consumerId: ConsumerId, position: StreamPosition): Promise<string>;
   queueMetrics(): Promise<StreamQueueMetrics>;
 };
 
@@ -87,6 +94,8 @@ export type RedisStreamSubscriptionOptions = {
   readonly stream: EventStreamName;
   readonly consumerId: ConsumerId;
   readonly streamKey: string;
+  /** The marker of the stream instance this subscription reads. */
+  readonly origin: string;
   readonly client: EventBusRedisClient;
   readonly services: SubscriptionServices;
   readonly startPosition: StreamPosition;
@@ -119,6 +128,7 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
 
   readonly #transportId: TransportId;
   readonly #streamKey: string;
+  readonly #origin: string;
   readonly #client: EventBusRedisClient;
   readonly #services: SubscriptionServices;
   readonly #onClosed: () => void;
@@ -145,6 +155,7 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
     this.consumerId = options.consumerId;
     this.#transportId = options.transportId;
     this.#streamKey = options.streamKey;
+    this.#origin = options.origin;
     this.#client = options.client;
     this.#services = options.services;
     this.#onClosed = options.onClosed;
@@ -244,6 +255,14 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
     }
 
     const parsed = readCheckpoint(this.#transportId, this.stream, position);
+    if (parsed.origin !== this.#origin) {
+      // Recorded under this consumer's id, a position from another stream
+      // instance would be resumed on the next restart as though it were ours.
+      throw new EventBusCheckpointError(
+        "checkpoint was taken in a different stream instance, so it names no position here",
+        { stream: this.stream, consumerId: this.consumerId },
+      );
+    }
     if (parsed.sequence < this.#checkpointedSequence) {
       throw new EventBusCheckpointError(
         "checkpoint would move backwards; a consumer that has consumed further cannot un-consume",
@@ -257,9 +276,14 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
       );
     }
 
-    const canonical = createCheckpoint(this.#transportId, this.stream, parsed);
-    await this.#services.storeCheckpoint(this.consumerId, canonical.token);
-    this.#lastCheckpoint = canonical;
+    // The server judges the position and records it in one step: a position it
+    // does not hold is refused rather than stored for a later restart to
+    // resume from.
+    const token = await this.#services.storeCheckpoint(this.consumerId, {
+      entryId: parsed.entryId,
+      sequence: parsed.sequence,
+    });
+    this.#lastCheckpoint = { transport: this.#transportId, stream: this.stream, token };
     this.#checkpointedSequence = parsed.sequence;
   }
 
@@ -310,9 +334,8 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
     // The skip is recorded durably, so a crash immediately after the
     // acknowledgement does not replay the gap and demand a second snapshot for
     // the same loss.
-    const canonical = createCheckpoint(this.#transportId, this.stream, resumed);
-    await this.#services.storeCheckpoint(this.consumerId, canonical.token);
-    this.#lastCheckpoint = canonical;
+    const token = await this.#services.storeCheckpoint(this.consumerId, resumed);
+    this.#lastCheckpoint = { transport: this.#transportId, stream: this.stream, token };
     this.#checkpointedSequence = resumed.sequence;
   }
 
@@ -472,7 +495,7 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
         stream: this.stream,
         consumerId: this.consumerId,
         entryId: entry.entryId,
-        checkpoint: createCheckpoint(this.#transportId, this.stream, {
+        checkpoint: createCheckpoint(this.#transportId, this.stream, this.#origin, {
           entryId: entry.entryId,
           sequence: this.#position.sequence,
         }),
@@ -526,7 +549,7 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
             stream: this.stream,
             consumerId: this.consumerId,
             entryId: entry.entryId,
-            checkpoint: createCheckpoint(this.#transportId, this.stream, {
+            checkpoint: createCheckpoint(this.#transportId, this.stream, this.#origin, {
               entryId: entry.entryId,
               sequence: entry.sequence,
             }),
@@ -545,7 +568,7 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
       this.#deliveredTotal += 1;
       delivered.push({
         envelope: envelope as EventEnvelope<TPayload>,
-        checkpoint: createCheckpoint(this.#transportId, this.stream, this.#position),
+        checkpoint: createCheckpoint(this.#transportId, this.stream, this.#origin, this.#position),
       });
     }
 

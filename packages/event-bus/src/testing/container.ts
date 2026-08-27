@@ -83,6 +83,93 @@ export async function injectForeignEntry(options: FaultInjectionOptions): Promis
 }
 
 /**
+ * Puts a value of the wrong type where one of a stream's keys belongs.
+ *
+ * The fault a publish must survive without cost: the append or the counter
+ * write fails, and the test it enables asserts that no publication ordinal was
+ * consumed for the event that never landed.
+ */
+export async function occupyKeyWithWrongType(
+  options: FaultInjectionOptions & { readonly which: "events" | "published" },
+): Promise<void> {
+  const keys = streamKeys(options.keyPrefix ?? DEFAULT_KEY_PREFIX, options.stream);
+  const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
+  try {
+    if (options.which === "events") {
+      await client.set(keys.events, "this is not a stream");
+    } else {
+      await client.lpush(keys.published, "this is not a counter");
+    }
+  } finally {
+    await closeRedisClient(client);
+  }
+}
+
+/** Removes whichever of a stream's keys a test names, leaving the rest. */
+export async function removeStreamKeys(
+  options: FaultInjectionOptions & {
+    readonly which: readonly ("events" | "published" | "checkpoints" | "origin")[];
+  },
+): Promise<void> {
+  const keys = streamKeys(options.keyPrefix ?? DEFAULT_KEY_PREFIX, options.stream);
+  const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
+  try {
+    await client.del(...options.which.map((key) => keys[key]));
+  } finally {
+    await closeRedisClient(client);
+  }
+}
+
+/** Sets the publication counter directly, for the safe-integer ceiling case. */
+export async function setPublicationCounter(
+  options: FaultInjectionOptions & { readonly value: string },
+): Promise<void> {
+  const keys = streamKeys(options.keyPrefix ?? DEFAULT_KEY_PREFIX, options.stream);
+  const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
+  try {
+    await client.set(keys.published, options.value);
+  } finally {
+    await closeRedisClient(client);
+  }
+}
+
+/**
+ * Reads the raw publication counter and retained depth, bypassing the transport.
+ *
+ * Both are `undefined` when the key does not hold what it should, so a test can
+ * assert "nothing was written" against a key a fault deliberately occupied.
+ */
+export async function readRawStreamState(
+  options: FaultInjectionOptions,
+): Promise<{ readonly published: string | undefined; readonly depth: number | undefined }> {
+  const keys = streamKeys(options.keyPrefix ?? DEFAULT_KEY_PREFIX, options.stream);
+  const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
+  try {
+    const counterType = await client.type(keys.published);
+    const published =
+      counterType === "string" ? ((await client.get(keys.published)) ?? undefined) : undefined;
+    const streamType = await client.type(keys.events);
+    const depth = streamType === "stream" ? await client.xlen(keys.events) : undefined;
+    return { published, depth };
+  } finally {
+    await closeRedisClient(client);
+  }
+}
+
+/** Writes a raw value into a consumer's stored position. */
+export async function writeStoredCheckpoint(
+  options: FaultInjectionOptions & { readonly consumerId: string; readonly token: string },
+): Promise<void> {
+  const keys = streamKeys(options.keyPrefix ?? DEFAULT_KEY_PREFIX, options.stream);
+  const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
+  try {
+    await client.hset(keys.checkpoints, options.consumerId, options.token);
+  } finally {
+    await closeRedisClient(client);
+  }
+}
+
+/**
  * Appends an entry that looks like ours but whose body is not a §7.1 envelope.
  *
  * The publication counter is advanced with it, so the ordinals stay contiguous

@@ -4,19 +4,26 @@ import { EventBusConfigurationError } from "../errors.js";
 import { assertConsumerId, assertStreamName, DEFAULT_KEY_PREFIX, streamKeys } from "./keys.js";
 
 describe("streamKeys", () => {
-  it("puts all three keys of one logical stream in one hash slot", () => {
+  it("puts all four keys of one logical stream in one hash slot", () => {
     const keys = streamKeys(DEFAULT_KEY_PREFIX, "market");
 
     expect(keys).toStrictEqual({
       events: "pmb:events:{market}:events",
       published: "pmb:events:{market}:published",
       checkpoints: "pmb:events:{market}:checkpoints",
+      origin: "pmb:events:{market}:origin",
     });
     const tag = /\{([^}]+)\}/u;
-    const tags = [keys.events, keys.published, keys.checkpoints].map(
+    const tags = [keys.events, keys.published, keys.checkpoints, keys.origin].map(
       (key) => tag.exec(key)?.[1],
     );
     expect(new Set(tags).size).toBe(1);
+  });
+
+  it("keeps two namespaces' instance markers apart, so a token cannot cross them", () => {
+    expect(streamKeys("alt.ns", "market").origin).not.toBe(
+      streamKeys(DEFAULT_KEY_PREFIX, "market").origin,
+    );
   });
 
   it("keeps two logical streams apart", () => {

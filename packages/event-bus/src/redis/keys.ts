@@ -1,17 +1,24 @@
 /**
  * Key layout for the Redis Streams implementation.
  *
- * Three keys per logical stream:
+ * Four keys per logical stream:
  *
  * | Key | Holds |
  * | --- | --- |
  * | `…{name}:events` | the bounded stream of published envelopes |
  * | `…{name}:published` | the contiguous publication counter (see `../resync.ts`) |
  * | `…{name}:checkpoints` | one durable position per consumer id |
+ * | `…{name}:origin` | this stream instance's marker (see `./checkpoint.ts`) |
  *
- * The `{name}` braces are a Redis Cluster hash tag: they force all three keys of
- * one logical stream into the same slot, which is what lets the publish and
- * state scripts touch them together. They cost nothing on a standalone server.
+ * The `{name}` braces are a Redis Cluster hash tag: they force all four keys of
+ * one logical stream into the same slot, which is what lets the publish, state,
+ * and checkpoint scripts touch them together. They cost nothing on a standalone
+ * server.
+ *
+ * The four are **one unit** for backup, restore, and deletion. A key space that
+ * holds three of them and not the fourth is not a stream this implementation
+ * can serve: it refuses the affected operation rather than resuming from a
+ * position it cannot vouch for.
  *
  * None of this is visible through `../transport.ts` — a caller names a logical
  * stream and never sees a key.
@@ -33,6 +40,7 @@ export type StreamKeys = {
   readonly events: string;
   readonly published: string;
   readonly checkpoints: string;
+  readonly origin: string;
 };
 
 /**
@@ -73,7 +81,7 @@ export function assertKeyPrefix(prefix: string): void {
   }
 }
 
-/** Builds the three keys for one logical stream. */
+/** Builds the four keys for one logical stream. */
 export function streamKeys(prefix: string, stream: EventStreamName): StreamKeys {
   assertKeyPrefix(prefix);
   assertStreamName(stream);
@@ -82,6 +90,7 @@ export function streamKeys(prefix: string, stream: EventStreamName): StreamKeys 
     events: `${base}:events`,
     published: `${base}:published`,
     checkpoints: `${base}:checkpoints`,
+    origin: `${base}:origin`,
   };
 }
 

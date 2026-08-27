@@ -133,6 +133,83 @@ describe("per-epoch ordering", () => {
     expect(receipt.sequence).toBe(2);
   });
 
+  it("refuses the out-of-order one of two overlapping publishes rather than reordering", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("ordering-concurrent-reverse");
+    const epoch = randomUUID();
+    const two = createTestEnvelope({ gatewayEpoch: epoch, ingestSeq: 2n });
+    const one = createTestEnvelope({ gatewayEpoch: epoch, ingestSeq: 1n });
+
+    // Neither call is awaited before the other is made, so both would read the
+    // same ordering cursor if the check and the append were not one step. The
+    // publisher must not be able to put `1` after `2` in the stream and call
+    // both a success: the epoch's order would then be the producer's
+    // concurrency rather than its intent (ADR-003 §2).
+    const outcomes = await Promise.allSettled([
+      transport.publish(stream, two),
+      transport.publish(stream, one),
+    ]);
+
+    expect(outcomes.map((outcome) => outcome.status)).toStrictEqual(["fulfilled", "rejected"]);
+    const refusal = outcomes[1];
+    if (refusal?.status !== "rejected") {
+      throw new Error("expected the second publish to be refused");
+    }
+    expect(refusal.reason).toBeInstanceOf(EventBusOrderingError);
+
+    const subscription = await transport.subscribe({ stream, consumerId: "trader" });
+    const { envelopes } = await drain(subscription);
+    // The refused event never entered the stream, so there is no anomaly for a
+    // consumer to count after the fact.
+    expect(envelopes.map((e) => e.ingestSeq)).toStrictEqual(["2"]);
+    expect((await subscription.metrics()).nonMonotonicDeliveries).toBe(0);
+    expect((await transport.streamMetrics(stream)).publishFailures).toBe(1);
+  });
+
+  it("keeps overlapping publishes of one epoch in the order they were submitted", async () => {
+    const transport = await connectTransport({ maxEvents: 200 });
+    const stream = testStream("ordering-concurrent-burst");
+    const published = createTestEnvelopeSequence({ count: 40 });
+
+    // Submitted in order, none awaited: the transport, not the caller, is what
+    // keeps them in order once they are in flight together.
+    const receipts = await Promise.all(
+      published.map(async (envelope) => await transport.publish(stream, envelope)),
+    );
+
+    expect(receipts.map((receipt) => receipt.sequence)).toStrictEqual(
+      published.map((_, index) => index + 1),
+    );
+    const subscription = await transport.subscribe({ stream, consumerId: "trader" });
+    const { envelopes } = await drain(subscription);
+    expect(envelopes.map((e) => e.eventId)).toStrictEqual(published.map((e) => e.eventId));
+    expect((await subscription.metrics()).nonMonotonicDeliveries).toBe(0);
+  });
+
+  it("does not make one epoch wait behind another", async () => {
+    const transport = await connectTransport({ maxEvents: 200 });
+    const stream = testStream("ordering-concurrent-epochs");
+    const a = createTestEnvelopeSequence({ count: 15, label: "a" });
+    const b = createTestEnvelopeSequence({ count: 15, label: "b" });
+
+    // Two epochs are two sequences (ADR-003 §2), so they are serialized
+    // separately: each one's own order survives, and the interleaving between
+    // them is not something either epoch's consumer can depend on.
+    await Promise.all([
+      ...a.map(async (envelope) => await transport.publish(stream, envelope)),
+      ...b.map(async (envelope) => await transport.publish(stream, envelope)),
+    ]);
+
+    const subscription = await transport.subscribe({ stream, consumerId: "trader" });
+    const { envelopes } = await drain(subscription);
+    expect(envelopes).toHaveLength(30);
+    const epochA = a[0]?.gatewayEpoch ?? "";
+    const epochB = b[0]?.gatewayEpoch ?? "";
+    expect(ingestSeqsOf(envelopes, epochA)).toStrictEqual(ingestSeqsOf(a, epochA));
+    expect(ingestSeqsOf(envelopes, epochB)).toStrictEqual(ingestSeqsOf(b, epochB));
+    expect((await subscription.metrics()).nonMonotonicDeliveries).toBe(0);
+  });
+
   it("accepts a retry of a publish that failed, with the same ingestSeq", async () => {
     const transport = await connectTransport({ maxEvents: 100 });
     const stream = testStream("ordering-retry");

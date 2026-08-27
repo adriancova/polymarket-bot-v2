@@ -21,6 +21,10 @@ import {
   createTestEnvelopeSequence,
   injectForeignEntry,
   injectUnreadableEntry,
+  occupyKeyWithWrongType,
+  readRawStreamState,
+  removeStreamKeys,
+  setPublicationCounter,
 } from "@polymarket-bot/event-bus/testing";
 import { describe, expect, inject, it } from "vitest";
 
@@ -209,6 +213,83 @@ describe("nothing is dropped silently", () => {
     expect(batch.events.map((e) => e.envelope.eventId)).toStrictEqual(
       published.map((e) => e.eventId),
     );
+  });
+
+  it("consumes no publication ordinal for an append that failed", async () => {
+    // A script is isolated, not transactional: a counter moved before a failing
+    // append would leave an ordinal with no entry behind it, and the next
+    // consumer to read across the hole would be told that retention removed an
+    // event that was never published — a hard resync and a phantom drop for
+    // nothing.
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-burned-ordinal");
+    const url = inject("redisUrl");
+    await occupyKeyWithWrongType({ url, stream, which: "events" });
+
+    const error = await captureRejection(async () =>
+      transport.publish(stream, createTestEnvelope({ ingestSeq: 1n })),
+    );
+    expect(error).toBeInstanceOf(EventBusUnavailableError);
+    expect((await readRawStreamState({ url, stream })).published).toBeUndefined();
+
+    await removeStreamKeys({ url, stream, which: ["events"] });
+    const receipt = await transport.publish(stream, createTestEnvelope({ ingestSeq: 2n }));
+    expect(receipt.sequence).toBe(1);
+
+    const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+    const { envelopes } = await drain(subscription);
+    expect(envelopes).toHaveLength(1);
+    expect(subscription.pendingResync()).toBeUndefined();
+    const metrics = await transport.streamMetrics(stream);
+    expect(metrics.messagesDropped).toBe(0);
+    expect(metrics.publishedTotal).toBe(1);
+  });
+
+  it("refuses at the publication-ordinal ceiling without appending anything", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-ordinal-ceiling");
+    const url = inject("redisUrl");
+    await publishAll(transport, stream, createTestEnvelopeSequence({ count: 1 }));
+    // `Number.MAX_SAFE_INTEGER`: the next ordinal would be a value this process
+    // cannot represent exactly, so the refusal must come before the append and
+    // not after it.
+    await setPublicationCounter({ url, stream, value: "9007199254740991" });
+
+    const error = await captureRejection(async () =>
+      transport.publish(stream, createTestEnvelope({ ingestSeq: 900n })),
+    );
+
+    expect(error).toBeInstanceOf(EventBusUnavailableError);
+    expect(await readRawStreamState({ url, stream })).toStrictEqual({
+      published: "9007199254740991",
+      depth: 1,
+    });
+  });
+
+  it("refuses to publish against a counter it did not write", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-counter-unreadable");
+    const url = inject("redisUrl");
+    await publishAll(transport, stream, createTestEnvelopeSequence({ count: 2 }));
+
+    for (const arrange of [
+      async () => {
+        await setPublicationCounter({ url, stream, value: "not a number" });
+      },
+      async () => {
+        await removeStreamKeys({ url, stream, which: ["published"] });
+        await occupyKeyWithWrongType({ url, stream, which: "published" });
+      },
+    ]) {
+      await arrange();
+      const error = await captureRejection(async () =>
+        transport.publish(stream, createTestEnvelope({ ingestSeq: 900n })),
+      );
+
+      expect(error).toBeInstanceOf(EventBusUnavailableError);
+      // Nothing was appended for the refused event.
+      expect((await readRawStreamState({ url, stream })).depth).toBe(2);
+    }
   });
 
   it("never accepts an event it cannot encode", async () => {

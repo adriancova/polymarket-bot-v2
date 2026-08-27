@@ -78,6 +78,15 @@ export type TransportId = string;
  * but do not parse it, do not order two tokens by inspecting them, and do not
  * construct one. `stream` and `transport` are not opaque: they exist so a
  * token cannot be replayed into the wrong stream or the wrong implementation.
+ *
+ * A token is bound to the transport instance that issued it, and the position
+ * it names is checked against that instance before delivery resumes from it.
+ * A token from another deployment, or one describing a position that does not
+ * exist, is refused rather than resumed from — because resuming from a
+ * position the transport cannot vouch for would skip whatever lay between it
+ * and the consumer's real one, which is the silent catch-up ADR-003 §3.3
+ * forbids. Refusal is an {@link EventSubscription} or `subscribe` error, never
+ * a quiet reposition.
  */
 export type StreamCheckpoint = {
   readonly transport: TransportId;
@@ -178,10 +187,12 @@ export type SubscriptionStart =
        * Resume the durable checkpoint stored for this consumer (ADR-003 §3.4).
        *
        * `whenMissing` applies only on a consumer's very first subscription,
-       * when no checkpoint exists yet. There is deliberately no default: a
-       * consumer that silently started at `newest` after losing its checkpoint
-       * would be resuming from "now", which is exactly what ADR-003 §3.4
-       * rules out.
+       * when no checkpoint exists yet, and has deliberately no default of its
+       * own: naming this variant means saying what happens when there is
+       * nothing to resume. `newest` is therefore never reached by omission,
+       * which is what ADR-003 §3.4 rules out — a consumer that silently
+       * started at `newest` after losing its checkpoint would be resuming from
+       * "now".
        */
       readonly at: "stored-checkpoint";
       readonly whenMissing: "oldest-retained" | "newest" | "fail";
@@ -196,7 +207,15 @@ export type SubscriptionStart =
 export type SubscribeOptions = {
   readonly stream: EventStreamName;
   readonly consumerId: ConsumerId;
-  /** Defaults to `{ at: "stored-checkpoint", whenMissing: "oldest-retained" }`. */
+  /**
+   * Where this subscription starts reading.
+   *
+   * Defaults to `{ at: "stored-checkpoint", whenMissing: "oldest-retained" }` —
+   * resume what this consumer stored, and otherwise replay everything retention
+   * still holds. The default is a real one, and it is the conservative one: it
+   * can never start from "now" (ADR-003 §3.4), because reaching `newest`
+   * requires asking for it.
+   */
   readonly start?: SubscriptionStart;
 };
 

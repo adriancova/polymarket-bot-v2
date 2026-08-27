@@ -7,5 +7,6 @@
  * is imported by a production code path.
  */
 
+export * from "./checkpoints.js";
 export * from "./container.js";
 export * from "./envelopes.js";

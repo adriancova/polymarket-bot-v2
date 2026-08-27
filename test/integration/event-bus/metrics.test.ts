@@ -8,7 +8,8 @@
  */
 
 import type { StreamQueueMetrics } from "@polymarket-bot/event-bus";
-import { createTestEnvelopeSequence } from "@polymarket-bot/event-bus/testing";
+import { createTestEnvelope, createTestEnvelopeSequence } from "@polymarket-bot/event-bus/testing";
+import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { describe, expect, it } from "vitest";
 
@@ -172,6 +173,34 @@ describe("queue metrics", () => {
     expect(metrics.unreadableEntriesTotal).toBe(0);
     expect(metrics.resyncPending).toBe(false);
     expect(metrics.receiveWaitTimeMs).toBeGreaterThan(0);
+  });
+
+  it("reports a repeated ordering identity, which no eventId comparison would catch", async () => {
+    // Two publishers, one `gatewayEpoch`: each has its own in-memory cursor, so
+    // the second accepts an ordering identity the first already used. ADR-002
+    // §2 makes `(gatewayEpoch, ingestSeq)` the identity that matters — the two
+    // envelopes below have *different* `eventId`s, so a consumer deduplicating
+    // on `eventId` would treat them as two distinct events and act on both.
+    const stream = testStream("metrics-duplicate-identity");
+    const first = await connectTransport({ maxEvents: 100 });
+    const second = await connectTransport({ maxEvents: 100 });
+    const epoch = randomUUID();
+    const original = createTestEnvelope({ gatewayEpoch: epoch, ingestSeq: 1n });
+    const republished = createTestEnvelope({ gatewayEpoch: epoch, ingestSeq: 1n });
+
+    await first.publish(stream, original);
+    await second.publish(stream, republished);
+
+    const subscription = await first.subscribe(resumeStored(stream, "trader"));
+    const { envelopes } = await drain(subscription);
+    const metrics = await subscription.metrics();
+
+    expect(original.eventId).not.toBe(republished.eventId);
+    expect(envelopes.map((e) => e.ingestSeq)).toStrictEqual(["1", "1"]);
+    // Both are delivered — stopping a trader on a legitimate at-least-once
+    // duplicate would be worse — and the repeat is counted rather than hidden.
+    expect(metrics.deliveredTotal).toBe(2);
+    expect(metrics.nonMonotonicDeliveries).toBe(1);
   });
 
   it("keeps two streams' metrics apart", async () => {

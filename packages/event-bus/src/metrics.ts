@@ -71,6 +71,16 @@ export type StreamQueueMetrics = {
   readonly publishedTotal: number;
   /** Publish attempts this process refused or could not complete. */
   readonly publishFailures: number;
+  /**
+   * Stored consumer positions this transport could not read.
+   *
+   * A position taken against a different instance of this stream — another
+   * server, another key namespace, or a stream that was destroyed and
+   * recreated — is not a lag number here, and reporting one for it would be an
+   * invented measurement. It is counted instead, because leaving it out
+   * entirely would make a consumer disappear from `consumerLag` without a word.
+   */
+  readonly unreadableCheckpoints: number;
 };
 
 /** Per-subscription counters, alongside the stream's §8.3 queue metrics. */
@@ -119,6 +129,8 @@ export type StreamQueueMetricsInput = {
   readonly producerBlockedTimeMs: number;
   readonly publishFailures: number;
   readonly consumerLag: readonly ConsumerLagEntry[];
+  /** Stored consumer positions the caller could not read. */
+  readonly unreadableCheckpoints: number;
 };
 
 /**
@@ -134,6 +146,7 @@ export function computeStreamQueueMetrics(input: StreamQueueMetricsInput): Strea
   assertNonNegativeInteger(input.publishedTotal, "publishedTotal");
   assertNonNegativeInteger(input.currentDepth, "currentDepth");
   assertNonNegativeInteger(input.maximumDepth, "maximumDepth");
+  assertNonNegativeInteger(input.unreadableCheckpoints, "unreadableCheckpoints");
 
   const oldestMessageAgeMs =
     input.oldestEntryAtMs === undefined ? 0 : Math.max(0, input.nowMs - input.oldestEntryAtMs);
@@ -148,6 +161,7 @@ export function computeStreamQueueMetrics(input: StreamQueueMetricsInput): Strea
     consumerLag: input.consumerLag,
     publishedTotal: input.publishedTotal,
     publishFailures: input.publishFailures,
+    unreadableCheckpoints: input.unreadableCheckpoints,
   };
 }
 
