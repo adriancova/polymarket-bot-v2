@@ -173,18 +173,26 @@
  *     `Module.prototype.require`, `new Module(...).require`) and `module.register`
  *     when reached through a NAMED `node:module` import (round 8 — default and
  *     namespace imports already resolved), and any alias this check tracks to one
- *     of those. The positions that do
+ *     of those. The rule covers every value-producing expression form — an
+ *     identifier read, a property/element access, a call result, and (round 9) a
+ *     `new` result (`new Module(...)`, a `Module` instance whose `.require` is
+ *     the loader). The positions that do
  *     *not* additionally flag — because the check follows the value through them
  *     — are exactly: the callee of an analyzed call (which yields a specifier or
- *     an `F-OPAQUE`), the `.call`/`.apply` reflection callee, the initializer of
+ *     an `F-OPAQUE`), the `.call`/`.apply` reflection callee, an argument the
+ *     module-call visitor already reads (the `thisArg`/parent of an analyzed
+ *     loader call or `.call`/`.apply` reflection — `M._load("x", new M(u), 0)`,
+ *     `require.call(new M(u), "x")`), the initializer of
  *     a declaration whose binding the alias tracker follows (the alias is then
  *     tracked, and an *alias* reference that escapes is caught by this same
  *     rule), the base of a larger capability expression (`module` in
- *     `module.require`, `createRequire` in `createRequire(...)`), the base of a
+ *     `module.require`, `createRequire` in `createRequire(...)`, `new M(u)` in
+ *     `new M(u).require(...)`), the base of a
  *     computed member read (which the computed-access rule reports at the access
  *     itself, so the construct yields one finding rather than two), a `typeof`
  *     operand, and a type position (never walked as a value). Everything else —
- *     object/array literal element, assignment right-hand side, call argument,
+ *     object/array literal element, assignment right-hand side, an argument to a
+ *     callee this check cannot resolve to a loader (`load(new M(u))`),
  *     `.bind`/any other property read, return value, export value — is an
  *     escape, reported as `F-OPAQUE` with the escape shape named.
  *
@@ -2015,6 +2023,18 @@ function scanSourceFile(ts, rootDir, fileRel) {
     if (ts.isVariableDeclaration(parent) && parent.initializer === outer) {
       return declarationTracksCapability(parent);
     }
+    // An argument to a call the module-call visitor fully analyses as a loader
+    // call or a `.call`/`.apply` loader reflection: `new M(url)` as the `parent`
+    // of `M._load("ethers", new M(url), false)`, or as the `thisArg` of
+    // `M.prototype.require.call(new M(url), "ethers")`. The loader's specifier is
+    // classified independently, so the receiver/parent capability is part of
+    // that one analyzed load, not a leak to a position this check cannot follow
+    // (WP-015 review round 9). A NON-loader callee (`load(new M(url))`,
+    // `pass(new M(url))`) is not consumed, so the escape still fires there.
+    if (ts.isCallExpression(parent) && parent.expression !== outer && parent.arguments.includes(outer)) {
+      const callee = unwrapExpression(parent.expression);
+      if (isLoaderReflection(callee) || LOADER_CALL_LABELS.has(capabilityOf(callee))) return true;
+    }
     return false;
   };
 
@@ -2177,10 +2197,25 @@ function scanSourceFile(ts, rootDir, fileRel) {
     // this check analyses is a finding rather than a silent module load. The
     // finding is emitted only inside a purity-restricted package (see the
     // `F-OPAQUE` block in `runCheck`).
+    //
+    // WP-015 review round 9 — a `NewExpression` is included because a
+    // capability-bearing `new` result (`new M(url)`, whose value is a `Module`
+    // whose `.require` is the loader) is subject to the SAME rule: consumed only
+    // when it is the direct base of an analyzed loader member/call
+    // (`new M(url).require(...)`, absorbed below) or an argument the module-call
+    // visitor already reads (`M.prototype.require.call(new M(url), ...)`,
+    // `M._load("x", new M(url), false)` — consumed by `capabilityIsConsumed`),
+    // and an escape everywhere else (`load(new M(url))`, `[new M(url)]`,
+    // `return new M(url)`). A `require`-capability CALL result that escapes
+    // (`pass(createRequire(url))`) is already covered by the `CallExpression`
+    // arm; `new` was the one omitted value-producing arm.
     if (
       ts.isIdentifier(node)
         ? isValueReference(node)
-        : ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isCallExpression(node)
+        : ts.isPropertyAccessExpression(node) ||
+          ts.isElementAccessExpression(node) ||
+          ts.isCallExpression(node) ||
+          ts.isNewExpression(node)
     ) {
       // WP-015 review round 5 — a computed member read on a capability-bearing
       // object fails closed rather than resolving to `null`. A key that folds to

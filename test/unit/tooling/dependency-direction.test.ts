@@ -2990,6 +2990,286 @@ describe("dependency-direction check — round-8 named-node:module-import regres
   });
 });
 
+/**
+ * Round 9. Rounds 4-8 made the escape rule total over the identifier,
+ * property/element-access and CALL forms of a loader capability, but the escape
+ * visitor never included `NewExpression` even though `capabilityOf` recognises
+ * `new Module(...)` as a `Module` instance whose `.require` is the loader (round
+ * 8). So a capability-bearing `new` result that flowed anywhere other than a
+ * directly analysed loader member/call was silent — the review probe:
+ *
+ *   const { Module: M } = require("node:module");
+ *   function load(mod) { return mod.require("ethers"); } // param — untracked
+ *   load(new M(__filename));                             // new M(...) escapes — silent
+ *
+ * `mod` is a plain parameter the check does not track (interprocedural dataflow
+ * is the WP-030 positive-rule / contract-owner fix, follow_up 8), so the only
+ * statically visible loader reference is the `new M(...)` result — and it left
+ * as a call argument without a finding. The fix adds `NewExpression` to the
+ * escape visitor and consumes a `new M(...)` result only where the module-call
+ * visitor already reads it: the direct base of `.require(...)` (absorbed), or an
+ * argument of an analysed loader call / `.call`/`.apply` reflection
+ * (`M._load("x", new M(u), false)`, `M.prototype.require.call(new M(u), "x")`).
+ * Everywhere else it is an F-OPAQUE escape that names the shape.
+ *
+ * Symmetry: a `require`-capability CALL result that escapes
+ * (`pass(createRequire(url))`) was ALREADY caught by the round-4 `CallExpression`
+ * arm — a probe confirmed it is not silent — so no code change was needed there;
+ * the two tests at the end of this block pin that coverage.
+ */
+describe("dependency-direction check — round-9 new-result-escape regressions", () => {
+  const simulationFile = "packages/simulation/src/probe.ts";
+  const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
+
+  describe("a capability-bearing `new` result that escapes is a finding", () => {
+    it("closes the review probe `load(new M(__filename))` (the helper param is untracked)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'const { Module: M } = require("node:module");',
+              'function load(mod) { return mod.require("ethers"); }',
+              "export const signer = load(new M(__filename));",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("a CommonJS `Module` object");
+      expect(run.output).toContain("escapes into a call argument");
+      // The escape is the `new M(...)` argument on line 3, not the untracked
+      // `mod.require("ethers")` on line 2 (which stays invisible until the
+      // positive rule lands) nor the `const { Module: M }` binding on line 1.
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'const { Module: M } = require("node:module");',
+              'function load(mod) { return mod.require("ethers"); }',
+              "export const signer = load(new M(__filename));",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(locationsMatching(report, "escapes into")).toEqual(["packages/simulation/src/probe.ts:3"]);
+    });
+
+    it("flags the same escape in a strategy, beside the F3 on the `node:module` import", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              'import { Module as M } from "node:module";',
+              "declare function load(mod: unknown): unknown;",
+              'export const signer = load(new M("/x"));',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:module`");
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("escapes into a call argument");
+      expect(run.output).toContain("src/probe.ts:3");
+    });
+
+    it("reports `[new M(url)]` as an array-literal-element escape", () => {
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              'export const arr = [new M("/x")];',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(report.ok).toBe(false);
+      const escapes = report.violations.filter((entry) => entry.message.includes("escapes into"));
+      expect(escapes.map((entry) => entry.rule)).toEqual(["F-OPAQUE"]);
+      expect(escapes.map((entry) => entry.location)).toEqual(["packages/simulation/src/probe.ts:2"]);
+      expect(escapes.every((entry) => entry.message.includes("a CommonJS `Module` object"))).toBe(true);
+      expect(escapes.every((entry) => entry.message.includes("escapes into an array-literal element"))).toBe(true);
+    });
+
+    it("reports `return new M(url)` as a return-value escape", () => {
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              'export const f = () => { return new M("/x"); };',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(report.ok).toBe(false);
+      const escapes = report.violations.filter((entry) => entry.message.includes("escapes into"));
+      expect(escapes.map((entry) => entry.rule)).toEqual(["F-OPAQUE"]);
+      expect(escapes.map((entry) => entry.location)).toEqual(["packages/simulation/src/probe.ts:2"]);
+      expect(escapes.every((entry) => entry.message.includes("escapes into a return value"))).toBe(true);
+    });
+
+    it("consumes the `new M(url)` initializer but flags the tracked alias that escapes (round-4)", () => {
+      // `const x = new M(url)` binds a tracked `CAP_MODULE` alias: the
+      // initializer is consumed (no escape on line 3), and it is the alias
+      // reference `x` leaving as a call argument on line 4 that is the finding.
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              "declare function pass(v: unknown): void;",
+              'const x = new M("/x");',
+              "export const done = pass(x);",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(report.ok).toBe(false);
+      const escapes = report.violations.filter((entry) => entry.message.includes("escapes into"));
+      expect(escapes.map((entry) => entry.rule)).toEqual(["F-OPAQUE"]);
+      expect(escapes.map((entry) => entry.location)).toEqual(["packages/simulation/src/probe.ts:4"]);
+      expect(escapes.every((entry) => entry.message.includes("escapes into a call argument"))).toBe(true);
+    });
+  });
+
+  describe("the analysed `new`-result positions stay the precise F5 and are not double-reported", () => {
+    it("keeps the direct chain `new M(url).require(\"ethers\")` a single F5 (the `new` result is absorbed)", () => {
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              'export const signer = new M("/x").require("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(report.ok).toBe(false);
+      expect(report.violations.map((entry) => entry.rule)).toEqual(["F5"]);
+      expect(locationsMatching(report, "escapes into")).toEqual([]);
+    });
+
+    it("keeps `M.prototype.require.call(new M(url), \"ethers\")` a single F5 (the `new` result is the analysed thisArg)", () => {
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              'export const signer = M.prototype.require.call(new M("/x"), "ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(report.ok).toBe(false);
+      expect(report.violations.map((entry) => entry.rule)).toEqual(["F5"]);
+      expect(locationsMatching(report, "escapes into")).toEqual([]);
+    });
+
+    it("keeps `M._load(\"ethers\", new M(url), false)` a single F5 (the `new` result is the analysed parent arg)", () => {
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import { Module as M } from "node:module";',
+              'export const signer = M._load("ethers", new M("/x"), false);',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(report.ok).toBe(false);
+      expect(report.violations.map((entry) => entry.rule)).toEqual(["F5"]);
+      expect(locationsMatching(report, "escapes into")).toEqual([]);
+    });
+  });
+
+  describe("negatives: the `new`-escape rule stays inside its boundary", () => {
+    it("leaves a `new Module(...)` that escapes alone in an unrestricted package (apps/ops-cli)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "apps/ops-cli/src/probe.ts": [
+              'import { Module as M } from "node:module";',
+              "declare function pass(v: unknown): void;",
+              'export const arr = [new M(import.meta.url)];',
+              "export const done = pass(new M(import.meta.url));",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("leaves a genuine local `class Module {}` instance clean — the capability must come from `node:module`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "class Module {",
+              "  public constructor(_path: string) {}",
+              "  public require(name: string): unknown {",
+              "    return name;",
+              "  }",
+              "}",
+              "declare function pass(v: unknown): void;",
+              'export const escaped = pass(new Module("/x"));',
+              'export const loaded = new Module("/x").require("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+
+  describe("symmetry: a `require`-capability CALL result that escapes was already a finding", () => {
+    it("pins that `pass(createRequire(url))` (no intervening binding) is an F-OPAQUE call-result escape", () => {
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              'import { createRequire } from "node:module";',
+              "declare function pass(v: unknown): void;",
+              'export const done = pass(createRequire("/x"));',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(report.ok).toBe(false);
+      const escapes = report.violations.filter((entry) => entry.message.includes("escapes into"));
+      expect(escapes.map((entry) => entry.rule)).toEqual(["F-OPAQUE"]);
+      expect(escapes.map((entry) => entry.location)).toEqual(["packages/strategies/static-bracket/src/probe.ts:3"]);
+      expect(escapes.every((entry) => entry.message.includes("the CommonJS `require` capability"))).toBe(true);
+      expect(escapes.every((entry) => entry.message.includes("escapes into a call argument"))).toBe(true);
+    });
+
+    it("pins that a `const r = createRequire(url)` alias escaping is an F-OPAQUE finding (round-4)", () => {
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              'import { createRequire } from "node:module";',
+              "declare function pass(v: unknown): void;",
+              'const r = createRequire("/x");',
+              "export const done = pass(r);",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(report.ok).toBe(false);
+      const escapes = report.violations.filter((entry) => entry.message.includes("escapes into"));
+      expect(escapes.map((entry) => entry.rule)).toEqual(["F-OPAQUE"]);
+      expect(escapes.map((entry) => entry.location)).toEqual(["packages/strategies/static-bracket/src/probe.ts:4"]);
+      expect(escapes.every((entry) => entry.message.includes("the CommonJS `require` capability"))).toBe(true);
+    });
+  });
+});
+
 describe("dependency-direction check CLI", () => {
   it("prints usage and exits 0 for --help", () => {
     const result = spawnSync(process.execPath, [checkerPath, "--help"], { encoding: "utf8", cwd: repoRoot });
