@@ -11,27 +11,22 @@ operational recipes that were proven this session, and the queued next actions.
 - **Wave 0: COMPLETE** (all four packages + closeout remediation merged and
   post-merge verified; two independent closeout audits recorded; see the
   "Wave 0 closeout (2026-08-26)" section of the status file).
-- **Wave 1 batch 1A: WP-040 and WP-050 COMPLETE and merged** (`d23bb67`,
-  `8a607ec`), post-merge verified, with root/CI wiring landed: `test:fault`
-  (WP-050), `test:integration` + `db:migrate` (WP-040, `db:migrate` proven
-  end-to-end against the compose dev DB). See their completion records.
-- **WP-015 (dependency-direction CI check): on its terminal round** at the time
-  of writing. This turned into an unusually deep hardening exercise — 8 review
-  rounds, each closing one more class of module-load escape a restricted package
-  could use to reach a forbidden module (regex→lexer→TS-AST→require-capability→
-  `getBuiltinModule`→`.constructor`-eval→`process.mainModule`→named-`node:module`
-  imports), every bypass runtime-verified by the reviewer. The honest closing
-  position (recorded in the WP-015 handoff): a name-enumeration scanner cannot be
-  total — reflective (`Reflect.get`) and cross-file routes remain accepted
-  documented residuals — and the **durable fix is the positive rule** ("a call
-  whose callee does not statically resolve to a declared import or a known-pure
-  local is a finding"), which needs `docs/contracts/**` and so is the WP-030
-  contract owner's to authorize (WP-015 follow_up 8). If WP-015's row still says
-  "In remediation/review", finish that ONE loop (recipes below), merge it, then
-  STOP and hand off — do NOT open WP-060 or batch 1B; that is the successor's
-  call with fresh context. The lint is defense-in-depth, not a security boundary;
-  do not let it consume more rounds chasing exotic reflective spellings past the
-  "no ordinary-code silent route" bar.
+- **Wave 1 batch 1A: COMPLETE and merged** — WP-040 (`d23bb67`), WP-050
+  (`8a607ec`), and WP-015 (`d77b2ba`), all post-merge verified, with root/CI
+  wiring landed: `check:deps` (WP-015), `test:fault` (WP-050), `test:integration`
+  + `db:migrate` (WP-040, `db:migrate` proven end-to-end against the compose dev
+  DB). Merged `main` tip at session close: `d77b2ba` + the completion governance
+  commit. Full suite on `main`: 1628 root + 89 fault + 208 integration green.
+- **This session STOPPED here by design** (context-window hygiene; the user
+  asked for a clean-context handoff once in-flight work landed). The next actions
+  are **not started** — they are the successor's to pick up with fresh context.
+- Round counts, for calibration of what "deep" looked like: WP-000 6 rounds,
+  WP-020 3, WP-030 3, WP-040 5, WP-050 4, WP-015 **10**. WP-015 (a CI lint) drew
+  the most rounds because each review runtime-verified one more module-load
+  escape class; its handoff records the honest terminal position (name-
+  enumeration is non-total; reflective/cross-file residuals accepted; the
+  positive callee-resolution rule is the durable fix, deferred to the WP-030
+  contract owner as follow_up 8). Do not reopen it to chase exotic spellings.
 
 ## 2. The lifecycle as actually practiced (runbook §3, with mechanics)
 
@@ -122,24 +117,21 @@ is orchestrator-owned at merge** (see §4).
 no credentials, no live gates requested. Nothing this session touched weakens
 any of it; every review verified it. Keep it that way.
 
-## 4. Queued orchestrator actions (do these at/after the in-flight merges)
+## 4. Queued orchestrator actions — START HERE (batch 1A is done)
 
-1. **Merge order if several land together:** WP-015 first (smallest, no
-   lockfile), then WP-050, then WP-040; after each, run full gates on main
-   (`install --frozen-lockfile, typecheck, lint, test`, plus the package's own
-   suite) — lockfile merges across WP-040/WP-050 should be clean (disjoint
-   importer blocks) but verify.
-2. **Root wiring at merge (orchestrator-owned, ratify with workplan comments):**
-   - root `test:fault` script + CI step (WP-050's 78-test fault suite is
-     currently executed by nothing in CI);
-   - root `test:integration` replacement for the WP-010 placeholder + a CI job
-     with Postgres (WP-040's 140-test suite; needs Docker);
-   - root `db:migrate` wiring to the storage-postgres runner;
-   - keep `pnpm check:deps` green (WP-015's CI step already wired by the package).
-3. **WP-060** (Redis Streams transport): authorized, packet not yet written.
-   After a 1A slot frees. Remember Docker/redis for integration tests; same
-   lockfile/handoff ratification pattern (add the workplan comments first —
-   WP-060 does NOT have them yet).
+1. **DONE this session:** batch 1A merged (WP-040/050/015) and all root/CI
+   wiring landed (`check:deps`, `test:fault`, `test:integration`, `db:migrate`).
+   The lockfile DID need regenerating on the WP-040 merge (two benign vitest
+   peer-key rewrites — see §2). Nothing here is pending.
+2. **NEXT — WP-060** (Redis Streams transport): authorized-ready, packet not yet
+   written. This is the remaining batch-1A package (runbook 1A = WP-040/050/060).
+   Same lockfile/handoff ratification pattern — **add the workplan comments
+   FIRST** (`pnpm-lock.yaml` + `docs/handoffs/WP-060.md` in WP-060's
+   allowed_paths; WP-060 does NOT have them yet). Redis integration tests need
+   Docker (`PMB_REDIS_PORT=16379` override on this host, native Redis may hold
+   6379 — same pattern as Postgres on 5432/15432; see the compose runtime note
+   in the status file). Its acceptance (ordered-per-epoch, checkpoint resume,
+   hard resync beyond retention) maps to handoff §8/§9.1.
 4. **Batch 1B** (WP-070/WP-080/WP-090 parallel; **WP-100 strictly after WP-070
    merges** — path subset, runbook corrected accordingly): before dispatching
    1B, run the **C-4 phase-start venue re-check** (quickstart/overview archived-

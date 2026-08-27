@@ -23,10 +23,10 @@ Maximum permitted run mode: `PAPER`
 | `WP-010`               | Complete | None               | Merged `12ce0ab` (impl `1bca7cf`) |
 | `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
 | `WP-030`               | Complete | `WP-000` ✓, `WP-020` ✓ | Merged `59cf254` (impl chain `051bb62`→`1e30ff1`→`66d29a9`→`21a3370`) |
-| `WP-015`               | In review (round 10) | `WP-030` ✓ | `wp-implementer` on branch `worktree-agent-a2a6f707d957e8153`. Rounds 1-9 closed successive escape classes (`c668493`→…→`b2b3b9b`); round 9 generalized the capability-escape rule to `new`-results (the last omitted value-producing arm; `createRequire`-call/identifier results already covered). Escape rule now: any capability-bearing value (identifier/property/call-result/new-result) reaching a non-consumed position is a finding. 1390 tests, repo PASS. Review round 10 dispatched 2026-08-26 at the calibrated bar (no ordinary-code silent load + honest residual disclosure; reflective/computed/cross-file accepted). |
+| `WP-015`               | Complete | `WP-030` ✓         | Merged `d77b2ba` (impl chain `bb441dc`→…→`b2b3b9b`, 10 review rounds) |
 | `WP-040`               | Complete | All ✓             | Merged `d23bb67` (impl chain `0a73ffe`→…→`f8982bf`, 5 review rounds) |
 | `WP-050`               | Complete | All ✓             | Merged `8a607ec` (impl chain `32cb0a8`→`3c2228a`→`a972e96`→`3f35a0c`→`b3a906f`→`22db770`, 4 review rounds) |
-| `WP-060`               | Ready (authorized, Wave 1 batch 1A) | All ✓ | Unassigned — start after a 1A merge slot frees |
+| `WP-060`               | Ready (authorized, next — last of batch 1A) | All ✓ | Unassigned — packet not yet written; add workplan lockfile/handoff comments first |
 | `WP-070`, `WP-080`, `WP-090` | Ready (Wave 1 batch 1B — after 1A per runbook) | All ✓ | Unassigned |
 | `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
@@ -66,6 +66,49 @@ table says otherwise.
   and `db:migrate` wired to the package (WP-010 placeholders replaced) and the
   CI step renamed to the real suite; `db:migrate` proven end-to-end against the
   compose dev DB (all 8 migrations applied then status-verified; torn down).
+
+### WP-015 completion record (2026-08-26)
+
+- Implemented by `wp-implementer` (Opus) on branch `worktree-agent-a2a6f707d957e8153`,
+  base `ff0c01e`; chain `bb441dc` (initial) → `c668493` (handoff) → nine
+  remediation commits (`c9b59b2` `7de62d0` `6658026` `a87f26c` `a187ccf`
+  `900b299` `fdf9c02` `9a89040` `b2b3b9b`); merged `d77b2ba`.
+- **Ten independent adversarial review rounds** — an unusually deep hardening
+  arc for a CI lint, each round closing exactly one more class of module-load
+  escape a purity-restricted package could use to reach a forbidden module,
+  every bypass runtime-verified by the reviewer: regex scanner (r1) → hand lexer
+  (r2 fail-open) → TypeScript compiler-API AST (r2 rebuild) → require-capability
+  tracking (r3) → total unconsumed-reference rule (r4) → `getBuiltinModule`
+  (r5) → `.constructor` evaluator acquisition (r6) → `process.mainModule`/
+  `require.main` (r7) → `.constructor`+ambient audit (r8, superseded) →
+  named/renamed `node:module` imports (r8 fix) → `new`-result escape (r9) →
+  ACCEPT (r10) at the calibrated ordinary-code bar.
+- **Deliverable & scope**: `tools/check-dependency-direction.mjs` implements
+  `docs/contracts/dependency-direction.md` §6 — it PARSES the contract's §2 layer
+  table and §2.1 same-layer allowlist at runtime (no mirrored copy), builds the
+  workspace dependency graph, and enforces cycles (F9), upward-edge (F12) and
+  unlisted-same-layer-edge (F13) prohibitions, plus per-package forbidden
+  specifiers / impure globals / evaluator+loader capability escapes (F1-F8/F11)
+  for the four purity-restricted packages. Wired into CI as `pnpm check:deps`
+  and the root `check:deps` script; repo verdict PASS (34 packages / 2 edges,
+  only the S0 `domain→decimal` edge).
+- **Honest terminal position** (WP-015 handoff, re-affirmed at merge): a
+  name-enumeration static scanner is provably non-total. After ten rounds no
+  ORDINARY-CODE (non-reflective, single-file, statically-named, plausibly-
+  accidental) silent synchronous forbidden-load route is known; the remaining
+  residuals — reflective acquisition (`Reflect.get`), runtime-computed member
+  names, and cross-file capability injection — are inherent to the architecture
+  and documented, not one-more-spelling gaps.
+- **Durable follow-up (WP-030 contract owner)**: follow_up 8 — replace the
+  growing negative capability list with a POSITIVE rule ("a call in a restricted
+  package whose callee does not statically resolve to a declared import or a
+  known-pure local is a finding"), total by construction. It needs a numbered
+  `docs/contracts/**` §3 rule (outside WP-015's paths) and carries a
+  contract-level noise trade-off, so it is deliberately deferred to the contract
+  owner rather than rammed in. The CI check is defense-in-depth; the real purity
+  guarantee remains package structure + review + tests + runtime.
+- Post-merge on `main` at `d77b2ba`: 1628 root + 89 fault + 208 integration
+  tests green; `check:deps` PASS; lockfile unchanged.
 
 ### WP-050 completion record (2026-08-26)
 
