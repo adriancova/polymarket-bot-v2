@@ -12,10 +12,15 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { createConnection, createServer } from "node:net";
+import type { Socket } from "node:net";
 
 import { RedisContainer } from "@testcontainers/redis";
 import type { StartedRedisContainer } from "@testcontainers/redis";
 
+import type { EventEnvelope } from "@polymarket-bot/domain";
+
+import { encodeEnvelope } from "../envelope-codec.js";
 import { closeRedisClient, createRedisClient } from "../redis/client.js";
 import { DEFAULT_KEY_PREFIX, streamKeys } from "../redis/keys.js";
 import { FIELD_ENVELOPE, FIELD_SEQUENCE } from "../redis/scripts.js";
@@ -90,16 +95,39 @@ export async function injectForeignEntry(options: FaultInjectionOptions): Promis
  * consumed for the event that never landed.
  */
 export async function occupyKeyWithWrongType(
-  options: FaultInjectionOptions & { readonly which: "events" | "published" },
+  options: FaultInjectionOptions & { readonly which: "events" | "published" | "checkpoints" },
 ): Promise<void> {
   const keys = streamKeys(options.keyPrefix ?? DEFAULT_KEY_PREFIX, options.stream);
   const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
   try {
     if (options.which === "events") {
       await client.set(keys.events, "this is not a stream");
+    } else if (options.which === "checkpoints") {
+      await client.set(keys.checkpoints, "this is not a position hash");
     } else {
       await client.lpush(keys.published, "this is not a counter");
     }
+  } finally {
+    await closeRedisClient(client);
+  }
+}
+
+/**
+ * Replaces this stream instance's marker with another well-formed one.
+ *
+ * What an operator restoring a namespace from elsewhere leaves behind: the
+ * stream and its counter are intact, but every position taken before now
+ * belongs to an instance that is no longer the one here.
+ */
+export async function overwriteStreamOrigin(
+  options: FaultInjectionOptions & { readonly origin?: string },
+): Promise<string> {
+  const keys = streamKeys(options.keyPrefix ?? DEFAULT_KEY_PREFIX, options.stream);
+  const replacement = options.origin ?? randomBytes(16).toString("hex");
+  const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
+  try {
+    await client.set(keys.origin, replacement);
+    return replacement;
   } finally {
     await closeRedisClient(client);
   }
@@ -194,4 +222,199 @@ export async function injectUnreadableEntry(
   } finally {
     await closeRedisClient(client);
   }
+}
+
+/**
+ * Appends a well-formed entry at an id the test chooses.
+ *
+ * What it exists for: an entry whose id is ahead of the server's clock is what a
+ * server clock stepping *backwards* leaves behind — a genuine, retained,
+ * correctly numbered entry that a naive future-id guard would refuse. Injecting
+ * the id directly reproduces that state without touching any clock.
+ */
+export async function injectEntryWithId(
+  options: FaultInjectionOptions & {
+    readonly entryId: string;
+    readonly envelope: EventEnvelope<unknown>;
+  },
+): Promise<{ readonly entryId: string; readonly sequence: number }> {
+  const keys = streamKeys(options.keyPrefix ?? DEFAULT_KEY_PREFIX, options.stream);
+  const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
+  try {
+    const sequence = await client.incr(keys.published);
+    await client.call(
+      "XADD",
+      keys.events,
+      options.entryId,
+      FIELD_SEQUENCE,
+      String(sequence),
+      FIELD_ENVELOPE,
+      encodeEnvelope(options.envelope),
+    );
+    return { entryId: options.entryId, sequence };
+  } finally {
+    await closeRedisClient(client);
+  }
+}
+
+/** One retained entry, exactly as the server holds it. */
+export type RawStreamEntry = {
+  readonly id: string;
+  readonly fields: readonly string[];
+};
+
+/**
+ * Reads every retained entry verbatim.
+ *
+ * A test that must prove a failed publish left the stream "exactly as found"
+ * cannot do it with a length: a bounded stream at its retention bound stays the
+ * same length while losing its oldest entry. Comparing contents is the only
+ * comparison that catches that.
+ */
+export async function readRawStreamEntries(
+  options: FaultInjectionOptions,
+): Promise<readonly RawStreamEntry[]> {
+  const keys = streamKeys(options.keyPrefix ?? DEFAULT_KEY_PREFIX, options.stream);
+  const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
+  try {
+    const reply = (await client.call("XRANGE", keys.events, "-", "+")) as [string, string[]][];
+    return reply.map(([id, fields]) => ({ id, fields: [...fields] }));
+  } finally {
+    await closeRedisClient(client);
+  }
+}
+
+/**
+ * Stops the server from serving writes for a while, then lets them through.
+ *
+ * The fault a bounded producer queue has to be tested against: the connection
+ * is alive, the publish that owns it never returns, and everything submitted
+ * behind it waits. Nothing is killed, so the stall ends cleanly.
+ */
+export async function pauseServerWrites(
+  options: { readonly url: string; readonly ms: number },
+): Promise<void> {
+  const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
+  try {
+    await client.call("CLIENT", "PAUSE", String(options.ms), "WRITE");
+  } finally {
+    await closeRedisClient(client);
+  }
+}
+
+/** Ends a pause early, so a finished test cannot leak a stall into the next one. */
+export async function resumeServerWrites(url: string): Promise<void> {
+  const client = await createRedisClient({ url }, "pmb-event-bus-fault");
+  try {
+    await client.call("CLIENT", "UNPAUSE");
+  } finally {
+    await closeRedisClient(client);
+  }
+}
+
+/** A local hop in front of the test server that a test can take away. */
+export type RedisProxy = {
+  /** Connect through this instead of the container's own URL. */
+  readonly url: string;
+  /** Destroys every connection and stops accepting new ones. */
+  close(): Promise<void>;
+};
+
+/**
+ * Puts a local TCP hop in front of the test server.
+ *
+ * Severing connections is not the same fault as losing the server: `ioredis`
+ * reconnects, and a command in flight when a connection dies usually succeeds
+ * on the next one — which is exactly what `reconnect.test.ts` asserts. A test
+ * that needs a command to *fail* needs somewhere for the reconnection to fail
+ * too, and closing this hop provides it without stopping the shared container
+ * that every other test in the run depends on.
+ */
+export async function startRedisProxy(targetUrl: string): Promise<RedisProxy> {
+  const target = new URL(targetUrl);
+  const targetHost = target.hostname;
+  const targetPort = Number(target.port);
+  const open = new Set<Socket>();
+
+  const server = createServer((incoming: Socket) => {
+    const upstream = createConnection({ host: targetHost, port: targetPort });
+    open.add(incoming);
+    open.add(upstream);
+    const drop = (): void => {
+      open.delete(incoming);
+      open.delete(upstream);
+      incoming.destroy();
+      upstream.destroy();
+    };
+    // A destroyed socket emits `error`; without a listener that becomes an
+    // unhandled emitter error and takes the test run down.
+    incoming.on("error", drop);
+    upstream.on("error", drop);
+    incoming.on("close", drop);
+    upstream.on("close", drop);
+    incoming.pipe(upstream);
+    upstream.pipe(incoming);
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("the proxy did not bind to a port");
+  }
+
+  return {
+    url: `redis://127.0.0.1:${String(address.port)}`,
+    close: async () => {
+      for (const socket of [...open]) {
+        socket.destroy();
+      }
+      open.clear();
+      await new Promise<void>((resolve) => {
+        server.close(() => {
+          resolve();
+        });
+      });
+    },
+  };
+}
+
+/**
+ * A connection URL for a throwaway account that may not run some commands.
+ *
+ * CREDENTIALS: the account exists only inside the throwaway test container, its
+ * secret is generated here and never leaves this process, and it grants nothing
+ * anywhere else. It is test scaffolding, not a credential (§0.2, ADR-010).
+ *
+ * It exists because a command-specific denial is the reachable way to make one
+ * step of a server-side script fail while the steps around it succeed — which is
+ * the only way to test what a partially applied publish leaves behind.
+ */
+export async function createCommandDeniedUrl(options: {
+  readonly url: string;
+  readonly deny: readonly string[];
+}): Promise<string> {
+  const username = `pmb-fault-${randomBytes(6).toString("hex")}`;
+  const secret = randomBytes(24).toString("hex");
+  const client = await createRedisClient({ url: options.url }, "pmb-event-bus-fault");
+  try {
+    await client.call(
+      "ACL",
+      "SETUSER",
+      username,
+      "on",
+      `>${secret}`,
+      "~*",
+      "&*",
+      "+@all",
+      ...options.deny.map((command) => `-${command}`),
+    );
+  } finally {
+    await closeRedisClient(client);
+  }
+  const parsed = new URL(options.url);
+  parsed.username = username;
+  parsed.password = secret;
+  return parsed.toString();
 }

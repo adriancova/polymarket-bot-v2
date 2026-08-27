@@ -18,7 +18,9 @@
 import { EventBusCheckpointError } from "@polymarket-bot/event-bus";
 import type { StreamCheckpoint } from "@polymarket-bot/event-bus";
 import {
+  createTestEnvelope,
   createTestEnvelopeSequence,
+  injectEntryWithId,
   readCheckpointPosition,
   removeStreamKeys,
   tamperCheckpoint,
@@ -31,6 +33,7 @@ import {
   connectTransport,
   drain,
   publishAll,
+  resumeStored,
   testStream,
 } from "./context.js";
 
@@ -278,6 +281,100 @@ describe("a checkpoint the stream cannot vouch for", () => {
 
     expect(metrics.consumerLag).toStrictEqual([]);
     expect(metrics.unreadableCheckpoints).toBe(1);
+  });
+
+  it("counts a stored position the server refuses, instead of reporting lag for it", async () => {
+    // Round-2 review, L1: the metric decoded the token and compared its marker,
+    // which a position from *this* instance passes even when the position
+    // itself names an entry that cannot exist. The candidate reported
+    // `lag: 2` and `unreadableCheckpoints: 0` for a stored position `subscribe`
+    // refuses outright — a number for a consumer that cannot start.
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("forge-metrics-judged");
+    await publishAll(transport, stream, createTestEnvelopeSequence({ count: 3 }));
+    const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+    const batch = await subscription.receive({ maxEvents: 1 });
+    if (batch.status !== "events") {
+      throw new Error(`expected events, received ${batch.status}`);
+    }
+    const first = batch.events[0];
+    if (first === undefined) {
+      throw new Error("expected one event");
+    }
+    await subscription.checkpoint(first.checkpoint);
+    expect((await transport.streamMetrics(stream)).consumerLag).toStrictEqual([
+      { consumerId: "trader", lag: 2 },
+    ]);
+
+    // This stream instance's own marker, an id it will never hold.
+    const forged = tamperCheckpoint(first.checkpoint, { entryId: "9999999999999-0" });
+    await writeStoredCheckpoint({
+      url: inject("redisUrl"),
+      stream,
+      consumerId: "trader",
+      token: forged.token,
+    });
+
+    const metrics = await transport.streamMetrics(stream);
+    expect(metrics.consumerLag).toStrictEqual([]);
+    expect(metrics.unreadableCheckpoints).toBe(1);
+    // The metric and the refusal agree, which is the whole point: what the
+    // metric calls unusable is exactly what a restart cannot resume from.
+    expect(
+      await captureRejection(async () => transport.subscribe(resumeStored(stream, "trader"))),
+    ).toBeInstanceOf(EventBusCheckpointError);
+  });
+
+  it("still resumes a retained entry whose id is ahead of the server's clock", async () => {
+    // Round-2 review, L3: the future-clock guard ran before the entry lookup,
+    // so a server clock that stepped backwards below a real entry's id turned
+    // a genuine, retained, correctly numbered checkpoint into a refusal — and
+    // took resumption away for as long as the regression lasted. An entry
+    // appended at a future id reproduces that state exactly.
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("forge-clock-regression");
+    const genuine = await firstCheckpoint(transport, stream, 2);
+    const injected = await injectEntryWithId({
+      url: inject("redisUrl"),
+      stream,
+      entryId: `${String(Date.now() + 600_000)}-0`,
+      envelope: createTestEnvelope({ ingestSeq: 5n }),
+    });
+    const ahead = tamperCheckpoint(genuine, {
+      entryId: injected.entryId,
+      sequence: injected.sequence,
+    });
+
+    const resumed = await transport.subscribe({
+      stream,
+      consumerId: "trader",
+      start: { at: "checkpoint", checkpoint: ahead },
+    });
+
+    const accepted = resumed.lastCheckpoint();
+    if (accepted === undefined) {
+      throw new Error("expected the resumed position to be known");
+    }
+    expect(readCheckpointPosition(accepted)).toStrictEqual({
+      origin: readCheckpointPosition(genuine).origin,
+      entryId: injected.entryId,
+      sequence: injected.sequence,
+    });
+    expect((await resumed.receive()).status).toBe("idle");
+    // The guard still does its real job: an id in the future that names no
+    // entry is refused, so this is not a hole opened by the reordering.
+    expect(
+      await captureRejection(async () =>
+        transport.subscribe({
+          stream,
+          consumerId: "other",
+          start: {
+            at: "checkpoint",
+            checkpoint: tamperCheckpoint(genuine, { entryId: "9999999999999-0" }),
+          },
+        }),
+      ),
+    ).toBeInstanceOf(EventBusCheckpointError);
   });
 
   it("still resumes a genuine checkpoint, so the guard is not a blanket refusal", async () => {

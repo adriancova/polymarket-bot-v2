@@ -12,6 +12,10 @@ const base = {
   nowMs: 1_750,
   producerBlockedTimeMs: 12,
   publishFailures: 0,
+  publishQueueDepth: 0,
+  publishQueueMaxDepth: 1_024,
+  oldestQueuedPublishAgeMs: 0,
+  retentionTrimFailures: 0,
   consumerLag: [],
   unreadableCheckpoints: 0,
 } as const;
@@ -30,6 +34,31 @@ describe("computeStreamQueueMetrics", () => {
         "consumerLag",
       ]),
     );
+  });
+
+  it("exposes the same three names for the bounded producer queue", () => {
+    // §8.3 asks for depth, maximum depth, and oldest message age of *every*
+    // queue. The producer queue is one, and a bound nobody can see is not a
+    // bound anyone can act on (round-2 review, H1).
+    const metrics = computeStreamQueueMetrics({
+      ...base,
+      publishQueueDepth: 7,
+      publishQueueMaxDepth: 8,
+      oldestQueuedPublishAgeMs: 42.5,
+    });
+
+    expect(metrics.publishQueueDepth).toBe(7);
+    expect(metrics.publishQueueMaxDepth).toBe(8);
+    expect(metrics.oldestQueuedPublishAgeMs).toBe(42.5);
+  });
+
+  it("reports a retention bound that could not be applied", () => {
+    // The publish landed and its ordinal is consistent, so it is not a failure —
+    // but the stream is over its bound until something trims it, and an
+    // unreported bound that stopped being applied is not a bound.
+    const metrics = computeStreamQueueMetrics({ ...base, retentionTrimFailures: 3 });
+
+    expect(metrics.retentionTrimFailures).toBe(3);
   });
 
   it("derives messages dropped from what left the stream", () => {
@@ -81,6 +110,12 @@ describe("computeStreamQueueMetrics", () => {
       EventBusConfigurationError,
     );
     expect(() => computeStreamQueueMetrics({ ...base, unreadableCheckpoints: -1 })).toThrow(
+      EventBusConfigurationError,
+    );
+    expect(() => computeStreamQueueMetrics({ ...base, publishQueueDepth: -1 })).toThrow(
+      EventBusConfigurationError,
+    );
+    expect(() => computeStreamQueueMetrics({ ...base, retentionTrimFailures: 0.5 })).toThrow(
       EventBusConfigurationError,
     );
   });

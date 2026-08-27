@@ -19,7 +19,11 @@
  * - **No silent drop.** Publication either lands in the stream or throws a
  *   typed error (§8.3). The stream never refuses an event for being full;
  *   retention removes the oldest instead, and every consumer that had not read
- *   those events is told so as a hard-resync condition (ADR-003 §3.3).
+ *   those events is told so as a hard-resync condition (ADR-003 §3.3). The
+ *   *producer* queue is a different matter and is bounded: when it is full the
+ *   publish is refused with {@link EventBusPublishQueueFullError}, which §8.3
+ *   requires — a queue that cannot accept an event halts affected trading
+ *   rather than accepting it into unbounded memory.
  * - **A position is judged, not believed.** Every start position and every
  *   stored checkpoint is checked against the server's own state before delivery
  *   begins (`./position.ts`), because a token that merely parses can still name
@@ -53,7 +57,7 @@ import {
 } from "../errors.js";
 import { computeStreamQueueMetrics } from "../metrics.js";
 import type { ConsumerLagEntry, StreamQueueMetrics } from "../metrics.js";
-import { KeyedSerialQueue } from "../serial-queue.js";
+import { assertMaxPending, KeyedSerialQueue } from "../serial-queue.js";
 import type {
   EventStreamName,
   EventSubscription,
@@ -71,7 +75,13 @@ import { closeRedisClient, createRedisClient } from "./client.js";
 import type { EventBusRedisClient, RedisConnectionOptions } from "./client.js";
 import { assertConsumerId, DEFAULT_KEY_PREFIX, streamKeys } from "./keys.js";
 import type { StreamKeys } from "./keys.js";
-import { ensureStreamOrigin, judgePosition, storeConsumerCheckpoint } from "./position.js";
+import {
+  ensureStreamOrigin,
+  isAcceptedPosition,
+  judgePosition,
+  resolvePositionJudgement,
+  storeConsumerCheckpoint,
+} from "./position.js";
 import { RedisStreamSubscription } from "./subscription.js";
 import type { SubscriptionServices } from "./subscription.js";
 import { readStreamState } from "./stream-state.js";
@@ -90,17 +100,30 @@ export type RedisStreamsTransportOptions = {
   readonly keyPrefix?: string;
   /** Cap on epochs each ordering cursor tracks. See `../epoch-order.ts`. */
   readonly maxTrackedEpochs?: number;
+  /**
+   * Publishes one stream may have queued or in flight at once. Defaults to
+   * 1024.
+   *
+   * §8.3 requires every queue to be bounded; this is that bound for the
+   * producer side. Reaching it refuses the publish rather than accepting an
+   * event the transport cannot move (`../serial-queue.ts`).
+   */
+  readonly maxQueuedPublishes?: number;
 };
 
 type StreamContext = {
   readonly keys: StreamKeys;
   readonly order: EpochOrderTracker;
-  /** Serializes each epoch's check-plus-append. See `../serial-queue.ts`. */
+  /**
+   * Serializes each epoch's check-plus-append, and bounds how much may wait.
+   * See `../serial-queue.ts`.
+   */
   readonly publishQueue: KeyedSerialQueue;
   /** This stream instance's marker, resolved once and then reused. */
   origin: string | undefined;
   producerBlockedTimeMs: number;
   publishFailures: number;
+  retentionTrimFailures: number;
 };
 
 export class RedisStreamsEventTransport implements MarketEventTransport {
@@ -111,6 +134,7 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
   readonly #connection: RedisConnectionOptions;
   readonly #keyPrefix: string;
   readonly #maxTrackedEpochs: number | undefined;
+  readonly #maxQueuedPublishes: number | undefined;
   readonly #streams = new Map<EventStreamName, StreamContext>();
   readonly #subscriptions = new Map<number, { close(): Promise<void> }>();
   #nextSubscriptionKey = 0;
@@ -125,6 +149,7 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
     this.#connection = options.connection;
     this.#keyPrefix = keyPrefix;
     this.#maxTrackedEpochs = options.maxTrackedEpochs;
+    this.#maxQueuedPublishes = options.maxQueuedPublishes;
     this.retention = { maxEvents: options.retention.maxEvents };
   }
 
@@ -137,6 +162,9 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
       // Validated at connect time rather than on the first publish.
       assertMaxTrackedEpochs(options.maxTrackedEpochs);
     }
+    if (options.maxQueuedPublishes !== undefined) {
+      assertMaxPending(options.maxQueuedPublishes);
+    }
     const keyPrefix = options.keyPrefix ?? DEFAULT_KEY_PREFIX;
     const client = await createRedisClient(options.connection, "pmb-event-bus");
     return new RedisStreamsEventTransport(client, options, keyPrefix);
@@ -148,6 +176,13 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
    * The envelope is validated first, so a caller that hands over something
    * unpublishable learns immediately rather than behind a queue. Everything
    * that touches the epoch's cursor happens inside the serialized section.
+   *
+   * §8.3's "producer blocked time" is measured around the **whole** of that
+   * wait — the queue and the round trip — because a producer sitting behind a
+   * stalled publish is blocked in exactly the sense the metric exists to
+   * report. Timing only the round trip would show a transport answering in
+   * milliseconds while every caller behind it waited for seconds (round-2
+   * review, H1).
    */
   async publish(
     stream: EventStreamName,
@@ -156,8 +191,20 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
     this.#assertOpen();
     const context = this.#context(stream);
 
+    let encoded: string;
     try {
-      const encoded = encodeEnvelope(envelope);
+      encoded = encodeEnvelope(envelope);
+    } catch (error) {
+      // A refused envelope is still a publish that did not happen, so it is
+      // counted — but it is not producer *blocked* time: nothing was waiting on
+      // the transport, and folding validation cost into that metric would
+      // report a slow transport for a caller error.
+      context.publishFailures += 1;
+      throw error;
+    }
+
+    const startedAt = performance.now();
+    try {
       return await context.publishQueue.run(
         envelope.gatewayEpoch,
         async () => await this.#publishInEpochOrder(context, stream, envelope, encoded),
@@ -165,6 +212,8 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
     } catch (error) {
       context.publishFailures += 1;
       throw error;
+    } finally {
+      context.producerBlockedTimeMs += performance.now() - startedAt;
     }
   }
 
@@ -179,7 +228,6 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
     this.#assertOpen();
     this.#assertOrderAdvances(context, envelope);
 
-    const startedAt = performance.now();
     let reply: string[];
     try {
       reply = await this.#client.ebPublish(
@@ -194,11 +242,15 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
         { stream, eventId: envelope.eventId },
         cause,
       );
-    } finally {
-      context.producerBlockedTimeMs += performance.now() - startedAt;
     }
 
-    const sequence = readPublishReply(reply, stream, envelope.eventId);
+    const { sequence, trimFailed } = readPublishReply(reply, stream, envelope.eventId);
+    if (trimFailed) {
+      // The event is published and its ordinal is consistent; only the bound
+      // was not applied. Counted rather than raised, because telling the caller
+      // this publish failed would invite a duplicate of an event that landed.
+      context.retentionTrimFailures += 1;
+    }
     // Recorded only after the event is in the stream, so a caller that
     // retries a failed publish with the same `ingestSeq` is not refused for
     // an event that never landed. Nothing else can interleave here: this whole
@@ -282,12 +334,22 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
   /**
    * Reports the §8.3 metric set for one stream.
    *
-   * A stored position this transport cannot read — one taken in a different
-   * stream instance, or a value something else wrote into the hash — is counted
-   * rather than either skipped or turned into a lag number that means nothing.
+   * A stored position that cannot be turned into a usable one — taken in a
+   * different stream instance, written by something else, or refused by the
+   * server's own judgement — is counted rather than either skipped or turned
+   * into a lag number that means nothing.
+   *
+   * The publish-queue numbers are taken **before** the server round trips
+   * below, so they describe the moment the caller asked rather than the moment
+   * the server answered; on a slow transport those are not the same moment, and
+   * the depth at the slow moment is the one worth reporting.
    */
   async #queueMetrics(keys: StreamKeys, stream: EventStreamName): Promise<StreamQueueMetrics> {
     const context = this.#context(stream);
+    const publishQueueDepth = context.publishQueue.pendingCount;
+    const publishQueueMaxDepth = context.publishQueue.maxPending;
+    const oldestQueuedPublishAgeMs = context.publishQueue.oldestPendingAgeMs();
+
     const state = await readStreamState(this.#client, keys);
     let stored: Record<string, string>;
     try {
@@ -304,7 +366,23 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
     let unreadableCheckpoints = 0;
     for (const [consumerId, token] of Object.entries(stored)) {
       const position = readStoredPosition(token, state.origin);
-      if (position === undefined) {
+      if (position === undefined || state.origin === undefined) {
+        unreadableCheckpoints += 1;
+        continue;
+      }
+      // Judged by the server, with the same script `subscribe` uses. Decoding
+      // the token and matching the marker proves only that the value came from
+      // this stream instance — a position naming an entry that never existed,
+      // or one paired with the wrong ordinal, passes both and is still a
+      // position no consumer can resume from (round-2 review, L1).
+      const judgement = await resolvePositionJudgement(
+        this.#client,
+        keys,
+        stream,
+        state.origin,
+        position,
+      );
+      if (!isAcceptedPosition(judgement.verdict)) {
         unreadableCheckpoints += 1;
         continue;
       }
@@ -324,6 +402,10 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
       nowMs: state.serverTimeMs,
       producerBlockedTimeMs: context.producerBlockedTimeMs,
       publishFailures: context.publishFailures,
+      publishQueueDepth,
+      publishQueueMaxDepth,
+      oldestQueuedPublishAgeMs,
+      retentionTrimFailures: context.retentionTrimFailures,
       consumerLag,
       unreadableCheckpoints,
     });
@@ -467,10 +549,13 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
       order: new EpochOrderTracker(
         this.#maxTrackedEpochs === undefined ? {} : { maxTrackedEpochs: this.#maxTrackedEpochs },
       ),
-      publishQueue: new KeyedSerialQueue(),
+      publishQueue: new KeyedSerialQueue(
+        this.#maxQueuedPublishes === undefined ? {} : { maxPending: this.#maxQueuedPublishes },
+      ),
       origin: undefined,
       producerBlockedTimeMs: 0,
       publishFailures: 0,
+      retentionTrimFailures: 0,
     };
     this.#streams.set(stream, created);
     return created;
@@ -519,6 +604,16 @@ function readStoredPosition(
   }
 }
 
+/** What the publish script reported about one accepted publish. */
+export type PublishOutcome = {
+  readonly sequence: number;
+  /**
+   * True when the event landed but the retention bound could not be applied
+   * afterwards. The publish still succeeded (`./scripts.ts`).
+   */
+  readonly trimFailed: boolean;
+};
+
 /**
  * Reads the publish script's reply.
  *
@@ -530,8 +625,8 @@ export function readPublishReply(
   reply: readonly string[],
   stream: EventStreamName,
   eventId: string,
-): number {
-  const [status, first, second] = reply;
+): PublishOutcome {
+  const [status, first, second, third] = reply;
   if (status === "err") {
     throw publishRefusal(first ?? "unknown", second ?? "", stream, eventId);
   }
@@ -548,7 +643,7 @@ export function readPublishReply(
       { stream, sequence: second },
     );
   }
-  return sequence;
+  return { sequence, trimFailed: third !== undefined && third !== "" };
 }
 
 function publishRefusal(

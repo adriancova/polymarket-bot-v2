@@ -11,19 +11,24 @@
 import {
   EventBusEntryError,
   EventBusEnvelopeError,
+  EventBusPublishQueueFullError,
   EventBusStateError,
   EventBusUnavailableError,
   RedisStreamsEventTransport,
 } from "@polymarket-bot/event-bus";
 import type { StreamCheckpoint } from "@polymarket-bot/event-bus";
 import {
+  createCommandDeniedUrl,
   createTestEnvelope,
   createTestEnvelopeSequence,
   injectForeignEntry,
   injectUnreadableEntry,
   occupyKeyWithWrongType,
+  pauseServerWrites,
+  readRawStreamEntries,
   readRawStreamState,
   removeStreamKeys,
+  resumeServerWrites,
   setPublicationCounter,
 } from "@polymarket-bot/event-bus/testing";
 import { describe, expect, inject, it } from "vitest";
@@ -290,6 +295,105 @@ describe("nothing is dropped silently", () => {
       // Nothing was appended for the refused event.
       expect((await readRawStreamState({ url, stream })).depth).toBe(2);
     }
+  });
+
+  it("refuses what a stalled transport's bounded queue cannot accept", async () => {
+    // Round-2 review, H1: against the unmodified candidate, 200 publishes were
+    // all admitted behind one stalled round trip — an unbounded chain of
+    // promises holding every unacknowledged event, with no depth, no bound and
+    // no waiting time to look at. §8.3 requires the opposite: a bounded queue,
+    // and a refusal that halts affected trading when it cannot accept an event.
+    const url = inject("redisUrl");
+    const transport = await connectTransport(
+      { maxEvents: 100 },
+      { maxQueuedPublishes: 4 },
+    );
+    const stream = testStream("drop-queue-saturation");
+    const envelopes = createTestEnvelopeSequence({ count: 10 });
+
+    await pauseServerWrites({ url, ms: 500 });
+    try {
+      const admitted = envelopes
+        .slice(0, 4)
+        .map(async (envelope) => transport.publish(stream, envelope));
+      // Taken while the four above are stalled; the snapshot is read before the
+      // metric call's own round trip, so it describes the stalled moment.
+      const duringStall = transport.streamMetrics(stream);
+
+      const refusals = await Promise.all(
+        envelopes
+          .slice(4)
+          .map(async (envelope) => captureRejection(async () => transport.publish(stream, envelope))),
+      );
+      for (const refusal of refusals) {
+        expect(refusal).toBeInstanceOf(EventBusPublishQueueFullError);
+        // The halt path is the same one an unreachable transport takes.
+        expect(refusal).toBeInstanceOf(EventBusUnavailableError);
+      }
+
+      const snapshot = await duringStall;
+      expect(snapshot.publishQueueDepth).toBe(4);
+      expect(snapshot.publishQueueMaxDepth).toBe(4);
+      expect(snapshot.oldestQueuedPublishAgeMs).toBeGreaterThan(0);
+
+      // The admitted four are not lost to the stall: they land, in order.
+      await Promise.all(admitted);
+      const settled = await transport.streamMetrics(stream);
+      expect(settled.publishedTotal).toBe(4);
+      expect(settled.publishQueueDepth).toBe(0);
+      expect(settled.oldestQueuedPublishAgeMs).toBe(0);
+      expect(settled.publishFailures).toBe(6);
+
+      const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+      const { envelopes: delivered } = await drain(subscription);
+      expect(delivered.map((e) => e.eventId)).toStrictEqual(
+        envelopes.slice(0, 4).map((e) => e.eventId),
+      );
+    } finally {
+      await resumeServerWrites(url);
+    }
+  });
+
+  it("leaves a bounded stream exactly as it found it when the counter write fails", async () => {
+    // Round-2 review, M1: the publish appended and trimmed in one command, so a
+    // stream at its retention bound lost its oldest entry before the counter
+    // write was attempted — and the compensation, which can only delete the
+    // entry it just added, could not put that one back. Reproduced against the
+    // candidate with a command-specific denial of the counter write: the stream
+    // went from three entries to two, and the missing one was a real, unread
+    // event.
+    const url = inject("redisUrl");
+    const stream = testStream("drop-trim-compensation");
+    const transport = await connectTransport({ maxEvents: 3 });
+    await publishAll(transport, stream, createTestEnvelopeSequence({ count: 3 }));
+    const before = await readRawStreamEntries({ url, stream });
+    expect(before).toHaveLength(3);
+
+    // An account that may do everything the publish needs except write the
+    // counter: the append succeeds, the counter write fails, and what the
+    // script does next is the whole question.
+    const denied = await createCommandDeniedUrl({ url, deny: ["set"] });
+    const restricted = await RedisStreamsEventTransport.connect({
+      connection: { url: denied },
+      retention: { maxEvents: 3 },
+    });
+    try {
+      const error = await captureRejection(async () =>
+        restricted.publish(stream, createTestEnvelope({ ingestSeq: 99n })),
+      );
+      expect(error).toBeInstanceOf(EventBusUnavailableError);
+    } finally {
+      await restricted.close();
+    }
+
+    // Contents, not length: a stream at its bound stays the same length while
+    // losing its oldest entry, so only an exact comparison catches the loss.
+    expect(await readRawStreamEntries({ url, stream })).toStrictEqual(before);
+    expect((await readRawStreamState({ url, stream })).published).toBe("3");
+    const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+    const { envelopes } = await drain(subscription);
+    expect(envelopes).toHaveLength(3);
+    expect(subscription.pendingResync()).toBeUndefined();
   });
 
   it("never accepts an event it cannot encode", async () => {

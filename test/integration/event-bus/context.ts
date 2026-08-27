@@ -31,12 +31,15 @@ afterEach(async () => {
 /** Connects a transport that the suite closes after the current test. */
 export async function connectTransport(
   retention: RetentionPolicy,
-  options: { readonly keyPrefix?: string } = {},
+  options: { readonly keyPrefix?: string; readonly maxQueuedPublishes?: number } = {},
 ): Promise<MarketEventTransport> {
   const transport = await RedisStreamsEventTransport.connect({
     connection: { url: inject("redisUrl") },
     retention,
     ...(options.keyPrefix === undefined ? {} : { keyPrefix: options.keyPrefix }),
+    ...(options.maxQueuedPublishes === undefined
+      ? {}
+      : { maxQueuedPublishes: options.maxQueuedPublishes }),
   });
   openTransports.push(transport);
   return transport;

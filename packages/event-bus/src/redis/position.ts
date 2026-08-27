@@ -150,14 +150,22 @@ export async function ensureStreamOrigin(
   return value;
 }
 
-/** Asks the server whether a position exists, refusing it when it does not. */
-export async function judgePosition(
+/**
+ * Asks the server what it thinks of a position, without deciding anything.
+ *
+ * Separate from {@link judgePosition} so that a caller which must *count*
+ * unusable positions rather than refuse one — the §8.3 metric set — applies the
+ * identical judgement instead of a cheaper local approximation. A metric that
+ * called a position readable while `subscribe` would refuse it would be
+ * reporting lag for a consumer that cannot start (round-2 review, L1).
+ */
+export async function resolvePositionJudgement(
   client: EventBusRedisClient,
   keys: StreamKeys,
   stream: EventStreamName,
   origin: string,
   position: StreamPosition,
-): Promise<void> {
+): Promise<PositionJudgement> {
   let reply: string[];
   try {
     reply = await client.ebResolvePosition(
@@ -175,7 +183,19 @@ export async function judgePosition(
       cause,
     );
   }
-  assertPositionAccepted(parsePositionJudgement(reply), { stream });
+  return parsePositionJudgement(reply);
+}
+
+/** Asks the server whether a position exists, refusing it when it does not. */
+export async function judgePosition(
+  client: EventBusRedisClient,
+  keys: StreamKeys,
+  stream: EventStreamName,
+  origin: string,
+  position: StreamPosition,
+): Promise<void> {
+  const judgement = await resolvePositionJudgement(client, keys, stream, origin, position);
+  assertPositionAccepted(judgement, { stream });
 }
 
 /**

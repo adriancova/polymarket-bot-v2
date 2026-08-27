@@ -12,9 +12,22 @@
  * the caller states that it applied an authoritative snapshot (§7.1).
  */
 
-import { EventBusResyncRequiredError, EventBusStateError } from "@polymarket-bot/event-bus";
-import { createTestEnvelopeSequence } from "@polymarket-bot/event-bus/testing";
-import { describe, expect, it } from "vitest";
+import {
+  EventBusCheckpointError,
+  EventBusResyncRequiredError,
+  EventBusStateError,
+  EventBusUnavailableError,
+  RedisStreamsEventTransport,
+} from "@polymarket-bot/event-bus";
+import type { EventSubscription } from "@polymarket-bot/event-bus";
+import {
+  createTestEnvelopeSequence,
+  occupyKeyWithWrongType,
+  overwriteStreamOrigin,
+  startRedisProxy,
+} from "@polymarket-bot/event-bus/testing";
+import { randomBytes } from "node:crypto";
+import { describe, expect, inject, it } from "vitest";
 
 import {
   captureRejection,
@@ -55,6 +68,25 @@ async function overrunRetention(label: string): Promise<{
   );
 
   return { transport, stream };
+}
+
+/**
+ * Asserts the sticky hard-resync state survived a failed acknowledgement.
+ *
+ * All three checks matter separately: the condition is still readable, the next
+ * `receive` still refuses to deliver, and `checkpoint` is still refused. An
+ * acknowledgement that failed must leave the subscription exactly as blocked as
+ * it found it (ADR-003 §3.3).
+ */
+async function assertStillBlocked(subscription: EventSubscription): Promise<void> {
+  expect(subscription.pendingResync()?.reason).toBe("retention-exceeded");
+  expect((await subscription.receive()).status).toBe("resync-required");
+  const last = subscription.lastCheckpoint();
+  if (last !== undefined) {
+    expect(await captureRejection(async () => subscription.checkpoint(last))).toBeInstanceOf(
+      EventBusResyncRequiredError,
+    );
+  }
 }
 
 describe("lag beyond retention", () => {
@@ -202,6 +234,111 @@ describe("lag beyond retention", () => {
 
     expect(error).toBeInstanceOf(EventBusStateError);
     expect(subscription.pendingResync()).toBeDefined();
+  });
+
+  it("stays blocked when the acknowledged position cannot be recorded", async () => {
+    // Round-2 review, H2: the candidate moved the read position, reset the
+    // ordering cursor and cleared the sticky state *before* awaiting the
+    // durable write. A failure there threw while delivery was already
+    // unlocked — the probe saw `pendingResync()` become undefined and the very
+    // next `receive` deliver events across the gap.
+    const { transport, stream } = await overrunRetention("resync-store-refused");
+    const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+    const before = await subscription.receive();
+    expect(before.status).toBe("resync-required");
+
+    // The positions key is occupied by something the durable write cannot be
+    // applied to, so recording the acknowledged position fails.
+    await occupyKeyWithWrongType({ url: inject("redisUrl"), stream, which: "checkpoints" });
+
+    const error = await captureRejection(async () =>
+      subscription.acknowledgeHardResync({
+        authoritativeSnapshotApplied: true,
+        resumeFrom: "oldest-retained",
+      }),
+    );
+
+    expect(error).toBeInstanceOf(EventBusUnavailableError);
+    await assertStillBlocked(subscription);
+  });
+
+  it("stays blocked when the stream instance is re-marked mid-subscription", async () => {
+    const { transport, stream } = await overrunRetention("resync-marker-rewritten");
+    const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+    expect((await subscription.receive()).status).toBe("resync-required");
+
+    // The marker every position of this subscription was minted against is
+    // replaced, so the position the acknowledgement would record no longer
+    // belongs to this stream instance and the server refuses to store it.
+    await overwriteStreamOrigin({
+      url: inject("redisUrl"),
+      stream,
+      origin: randomBytes(16).toString("hex"),
+    });
+
+    const error = await captureRejection(async () =>
+      subscription.acknowledgeHardResync({
+        authoritativeSnapshotApplied: true,
+        resumeFrom: "newest",
+      }),
+    );
+
+    expect(error).toBeInstanceOf(EventBusCheckpointError);
+    await assertStillBlocked(subscription);
+  });
+
+  it("stays blocked when the transport is unreachable during the acknowledgement", async () => {
+    // The same window, reached the way it is actually reached in production:
+    // the server goes away between raising the condition and recording the
+    // recovery from it.
+    const url = inject("redisUrl");
+    const stream = testStream("resync-unreachable-ack");
+    const direct = await connectTransport({ maxEvents: 3 });
+    const proxy = await startRedisProxy(url);
+    const through = await RedisStreamsEventTransport.connect({
+      connection: { url: proxy.url, maxRetriesPerRequest: 1, connectTimeoutMs: 2_000 },
+      retention: { maxEvents: 3 },
+    });
+
+    try {
+      await publishAll(direct, stream, createTestEnvelopeSequence({ count: 1 }));
+      const opening = await through.subscribe(resumeStored(stream, "trader"));
+      const first = await opening.receive({ maxEvents: 1 });
+      if (first.status !== "events") {
+        throw new Error(`expected events, received ${first.status}`);
+      }
+      const event = first.events[0];
+      if (event === undefined) {
+        throw new Error("expected one event");
+      }
+      await opening.checkpoint(event.checkpoint);
+      await opening.close();
+      await publishAll(
+        direct,
+        stream,
+        createTestEnvelopeSequence({ count: 12, startIngestSeq: 500n }),
+      );
+
+      const subscription = await through.subscribe(resumeStored(stream, "trader"));
+      expect((await subscription.receive()).status).toBe("resync-required");
+
+      await proxy.close();
+      const error = await captureRejection(async () =>
+        subscription.acknowledgeHardResync({
+          authoritativeSnapshotApplied: true,
+          resumeFrom: "oldest-retained",
+        }),
+      );
+
+      expect(error).toBeInstanceOf(EventBusUnavailableError);
+      // The sticky state is answered from memory, so it is still readable with
+      // the transport gone — which is the point: nothing about the halt depends
+      // on the server that just disappeared.
+      await assertStillBlocked(subscription);
+    } finally {
+      await through.close();
+      await proxy.close();
+    }
   });
 
   it("raises the condition mid-stream when retention overtakes a stalled consumer", async () => {

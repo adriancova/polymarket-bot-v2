@@ -8,10 +8,15 @@
  */
 
 import type { StreamQueueMetrics } from "@polymarket-bot/event-bus";
-import { createTestEnvelope, createTestEnvelopeSequence } from "@polymarket-bot/event-bus/testing";
+import {
+  createTestEnvelope,
+  createTestEnvelopeSequence,
+  pauseServerWrites,
+  resumeServerWrites,
+} from "@polymarket-bot/event-bus/testing";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, inject, it } from "vitest";
 
 import { connectTransport, drain, publishAll, resumeStored, testStream } from "./context.js";
 
@@ -105,6 +110,41 @@ describe("queue metrics", () => {
     expect(later.producerBlockedTimeMs).toBeGreaterThan(after.producerBlockedTimeMs);
   });
 
+  it("counts the wait behind a stalled publish, not only the round trip", async () => {
+    // Round-2 review, H1: the candidate started the clock when a queued publish
+    // *began*, so the four calls below would have reported roughly one stall
+    // between them — the transport would look fast while every caller behind
+    // the first one waited. §8.3's producer blocked time is the caller's wait.
+    const url = inject("redisUrl");
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("metrics-queue-wait");
+    const stallMs = 400;
+    const envelopes = createTestEnvelopeSequence({ count: 4 });
+
+    await pauseServerWrites({ url, ms: stallMs });
+    try {
+      const inFlight = envelopes.map(async (envelope) => transport.publish(stream, envelope));
+      // Snapshotted at call time, so it describes the stalled moment rather
+      // than whatever is true when the server answers.
+      const duringStall = transport.streamMetrics(stream);
+      await Promise.all(inFlight);
+      const stalled = await duringStall;
+      const after = await transport.streamMetrics(stream);
+
+      expect(stalled.publishQueueDepth).toBe(4);
+      expect(stalled.publishQueueMaxDepth).toBeGreaterThanOrEqual(4);
+      expect(stalled.oldestQueuedPublishAgeMs).toBeGreaterThan(0);
+      // Every one of the four waited out the stall, so the cumulative wait is a
+      // multiple of it; timing only the round trip would report about one.
+      expect(after.producerBlockedTimeMs).toBeGreaterThan(2 * stallMs);
+      expect(after.publishQueueDepth).toBe(0);
+      expect(after.oldestQueuedPublishAgeMs).toBe(0);
+      expect(after.publishedTotal).toBe(4);
+    } finally {
+      await resumeServerWrites(url);
+    }
+  });
+
   it("tracks consumer lag per consumer as each one advances", async () => {
     const transport = await connectTransport({ maxEvents: 100 });
     const stream = testStream("metrics-lag");
@@ -153,6 +193,10 @@ describe("queue metrics", () => {
         "messagesDropped",
         "producerBlockedTimeMs",
         "consumerLag",
+        // The producer queue is a queue too, and §8.3 bounds every queue.
+        "publishQueueDepth",
+        "publishQueueMaxDepth",
+        "oldestQueuedPublishAgeMs",
       ]),
     );
   });

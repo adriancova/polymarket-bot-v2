@@ -27,7 +27,16 @@ export type EventBusErrorCode =
   /** The transport or subscription was used in a state that forbids the operation. */
   | "EVENT_BUS_STATE"
   /** The underlying transport could not be reached; publication stops (ADR-003 §4). */
-  | "EVENT_BUS_UNAVAILABLE";
+  | "EVENT_BUS_UNAVAILABLE"
+  /**
+   * The bounded publish queue is full, so this event was not accepted (§8.3).
+   *
+   * A distinct code from `EVENT_BUS_UNAVAILABLE` because the two need different
+   * operator responses — a saturated producer is not an unreachable server —
+   * but the class hierarchy keeps it an {@link EventBusUnavailableError}, so a
+   * caller branching on "publication stopped, halt trading" catches both.
+   */
+  | "EVENT_BUS_PUBLISH_QUEUE_FULL";
 
 export type EventBusErrorDetails = Readonly<Record<string, unknown>>;
 
@@ -133,7 +142,35 @@ export class EventBusStateError extends EventBusError {
  * fall back to another data path, and must not continue on stale state.
  */
 export class EventBusUnavailableError extends EventBusError {
-  constructor(message: string, details: EventBusErrorDetails = {}, cause?: unknown) {
-    super("EVENT_BUS_UNAVAILABLE", message, details, cause === undefined ? {} : { cause });
+  constructor(
+    message: string,
+    details: EventBusErrorDetails = {},
+    cause?: unknown,
+    // A parameter only so {@link EventBusPublishQueueFullError} can carry its
+    // own code while staying an `EventBusUnavailableError`. Nothing else passes
+    // it, and no caller of the three-argument form is affected.
+    code: EventBusErrorCode = "EVENT_BUS_UNAVAILABLE",
+  ) {
+    super(code, message, details, cause === undefined ? {} : { cause });
+  }
+}
+
+/**
+ * The bounded publish queue refused an event because it is full.
+ *
+ * §8.3: every queue is bounded, and "if a critical queue cannot accept an
+ * event, affected trading halts and a data-quality incident opens". Refusing is
+ * therefore the required behaviour — an unbounded queue would accept the event
+ * and then hold it in memory with nothing to say about how long it has been
+ * waiting, which is neither bounded nor observable.
+ *
+ * It is an {@link EventBusUnavailableError} on purpose: the caller's response is
+ * the ADR-003 §4 halt, the same as for an unreachable server. The distinct
+ * `code` and class exist so an operator can tell a saturated producer from a
+ * dead one.
+ */
+export class EventBusPublishQueueFullError extends EventBusUnavailableError {
+  constructor(message: string, details: EventBusErrorDetails = {}) {
+    super(message, details, undefined, "EVENT_BUS_PUBLISH_QUEUE_FULL");
   }
 }

@@ -21,7 +21,9 @@
  *    not read. `receive` returns `resync-required` and keeps returning it, and
  *    `checkpoint` is refused, until the caller acknowledges with an applied
  *    authoritative snapshot (ADR-003 §3.3, §7.1). There is no path from here
- *    back to delivering that does not go through that acknowledgement.
+ *    back to delivering that does not go through that acknowledgement — and an
+ *    acknowledgement whose new position could not be recorded durably is not
+ *    one: it leaves the subscription exactly as blocked as it found it.
  *
  * A dedicated connection carries the blocking reads, because a blocked socket
  * would otherwise stall every unrelated command queued behind it. Checkpoint
@@ -326,15 +328,23 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
     const state = await this.#services.readStreamState();
     const resumed = resolveResumePosition(state, acknowledgement.resumeFrom);
 
+    // Durable first, in-memory second, and in that order for a reason. The
+    // resync state is sticky: `receive` returns `resync-required` and
+    // `checkpoint` is refused until an acknowledgement is *recorded*
+    // (ADR-003 §3.3). If the position were adopted first, a failure here —
+    // the marker rewritten or removed mid-subscription, the positions key
+    // occupied, the server unreachable — would throw while delivery had
+    // already been unlocked, and the caller would be told the acknowledgement
+    // failed by a subscription that had stopped enforcing it (round-2 review,
+    // H2). Storing first also means a crash immediately afterwards does not
+    // replay the gap and demand a second snapshot for the same loss.
+    const token = await this.#services.storeCheckpoint(this.consumerId, resumed);
+
+    // Nothing below can fail, so the state transition is all-or-nothing.
     this.#position = resumed;
     this.#orderTracker.reset();
     this.#resync = undefined;
     this.#pendingContinuity = undefined;
-
-    // The skip is recorded durably, so a crash immediately after the
-    // acknowledgement does not replay the gap and demand a second snapshot for
-    // the same loss.
-    const token = await this.#services.storeCheckpoint(this.consumerId, resumed);
     this.#lastCheckpoint = { transport: this.#transportId, stream: this.stream, token };
     this.#checkpointedSequence = resumed.sequence;
   }

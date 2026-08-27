@@ -1,5 +1,8 @@
+import { setTimeout as delay } from "node:timers/promises";
+
 import { describe, expect, it } from "vitest";
 
+import { EventBusConfigurationError, EventBusPublishQueueFullError } from "./errors.js";
 import { KeyedSerialQueue } from "./serial-queue.js";
 
 function deferred<T>(): {
@@ -108,5 +111,101 @@ describe("KeyedSerialQueue", () => {
     await queue.run("epoch", async () => undefined);
 
     expect(queue.activeKeyCount).toBe(0);
+  });
+
+  it("refuses admission past its bound instead of queuing without limit", async () => {
+    // Round-2 review, H1: the unbounded version admitted 10 000 operations
+    // behind one stalled operation, and the only observable number was how many
+    // keys were active.
+    const queue = new KeyedSerialQueue({ maxPending: 3 });
+    const stall = deferred<void>();
+    const admitted = [
+      queue.run("epoch", async () => await stall.promise),
+      queue.run("epoch", async () => undefined),
+      queue.run("epoch", async () => undefined),
+    ];
+
+    let refusal: unknown;
+    try {
+      await queue.run("epoch", async () => undefined);
+    } catch (error) {
+      refusal = error;
+    }
+
+    expect(refusal).toBeInstanceOf(EventBusPublishQueueFullError);
+    expect((refusal as EventBusPublishQueueFullError).details).toStrictEqual({
+      key: "epoch",
+      pending: 3,
+      maxPending: 3,
+    });
+    expect(queue.pendingCount).toBe(3);
+    expect(queue.maxPending).toBe(3);
+
+    stall.resolve();
+    await Promise.all(admitted);
+    expect(queue.pendingCount).toBe(0);
+  });
+
+  it("frees the slot of a refused or failed operation", async () => {
+    // A bound that only forgot successes would fill permanently on a stream of
+    // failures, which would turn one transient fault into a dead publisher.
+    const queue = new KeyedSerialQueue({ maxPending: 1 });
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(
+        queue.run("epoch", async () => {
+          throw new Error("refused");
+        }),
+      ).rejects.toThrow("refused");
+      expect(queue.pendingCount).toBe(0);
+    }
+
+    await expect(queue.run("epoch", async () => "delivered")).resolves.toBe("delivered");
+  });
+
+  it("reports how long the longest-waiting operation has been waiting", async () => {
+    const queue = new KeyedSerialQueue({ maxPending: 8 });
+    expect(queue.oldestPendingAgeMs()).toBe(0);
+
+    const stall = deferred<void>();
+    const held = queue.run("epoch", async () => await stall.promise);
+    const behind = queue.run("epoch", async () => undefined);
+    await delay(30);
+
+    // The waiter behind the stall is the one whose time would otherwise be
+    // invisible; the oldest wait covers both.
+    expect(queue.pendingCount).toBe(2);
+    expect(queue.oldestPendingAgeMs()).toBeGreaterThanOrEqual(25);
+
+    stall.resolve();
+    await Promise.all([held, behind]);
+    expect(queue.oldestPendingAgeMs()).toBe(0);
+  });
+
+  it("does not let one key's saturation stop another key from running", async () => {
+    const queue = new KeyedSerialQueue({ maxPending: 2 });
+    const stall = deferred<void>();
+    const held = queue.run("epoch-a", async () => await stall.promise);
+    const other = queue.run("epoch-b", async () => "ran");
+    // Submitted while both of the above are still pending, so this is the one
+    // past the shared bound.
+    const beyondTheBound = queue.run("epoch-c", async () => undefined);
+
+    // `epoch-b` was admitted and ran to completion while `epoch-a` was stalled:
+    // the bound limits admission, it does not couple one epoch's execution to
+    // another's.
+    await expect(beyondTheBound).rejects.toBeInstanceOf(EventBusPublishQueueFullError);
+    await expect(other).resolves.toBe("ran");
+
+    // With `epoch-b` finished there is room again, and `epoch-a` is still stalled.
+    await expect(queue.run("epoch-c", async () => "later")).resolves.toBe("later");
+
+    stall.resolve();
+    await held;
+  });
+
+  it("refuses a bound that is not a positive integer", () => {
+    expect(() => new KeyedSerialQueue({ maxPending: 0 })).toThrow(EventBusConfigurationError);
+    expect(() => new KeyedSerialQueue({ maxPending: 1.5 })).toThrow(EventBusConfigurationError);
   });
 });

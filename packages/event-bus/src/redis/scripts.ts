@@ -23,7 +23,10 @@
  *    instead of failing mid-way, and
  * 2. **guards each mutation with `redis.pcall`** and compensates the one that
  *    already landed if the second cannot, so a failed publish leaves both the
- *    counter and the stream exactly as it found them.
+ *    counter and the stream exactly as it found them — which also means that
+ *    **no irreversible mutation may run before the reversible ones have
+ *    succeeded**. Retention trimming is irreversible (a trimmed entry cannot be
+ *    put back), so it is the last step rather than a side effect of the append.
  */
 
 /** Field name carrying an entry's publication ordinal. */
@@ -51,7 +54,18 @@ export const MAX_PUBLICATION_ORDINAL = "9007199254740991";
 export const ACCEPTED_POSITION_VERDICTS = [
   /** The entry exists and carries exactly this publication ordinal. */
   "exact",
-  /** The entry exists but is not one of ours; the ordinal is unconsumed by it. */
+  /**
+   * The entry exists but is not one of ours; the ordinal is unconsumed by it.
+   *
+   * Accepted so that a caller who has been handed
+   * {@link EventBusEntryError}'s checkpoint can step over exactly the entry
+   * something else wrote (§8.3 — reported, never skipped silently). It is the
+   * one accepted verdict where the entry id names an entry that is **not** this
+   * transport's, so it is also the one whose precondition is an external write
+   * into the stream key: without one, no position can reach it. The ordinal is
+   * still judged — it must not exceed what the stream has published — so the
+   * step-over moves past an id, never past an event.
+   */
   "foreign-entry",
   /** The position before the oldest retained entry. */
   "stream-origin",
@@ -165,11 +179,14 @@ local function validatePosition(streamKey, counterKey, originKey, tokenOrigin, e
   if entryId == '0-0' then
     return { 'stream-origin', publishedRaw }
   end
-  local now = redis.call('TIME')
-  local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-  if entryMs > nowMs then
-    return { 'ahead-of-clock', string.format('%d', nowMs) }
-  end
+  -- The entry itself is asked about before the server's clock is consulted. An
+  -- entry that is present, retained, and carrying exactly this ordinal is the
+  -- strongest evidence a position can have, and it stays true whatever the
+  -- clock says: a clock that has stepped backwards below a real entry's id
+  -- would otherwise refuse a genuine checkpoint and take resumption away for as
+  -- long as the regression lasts (round-2 review, L3). The clock guard below
+  -- keeps its real job — an id that names no entry, on a stream with no newest
+  -- entry to compare it against.
   local found = redis.call('XRANGE', streamKey, entryId, entryId, 'COUNT', 1)
   if found[1] then
     local fields = found[1][2]
@@ -180,6 +197,11 @@ local function validatePosition(streamKey, counterKey, originKey, tokenOrigin, e
     if stored == nil then return { 'foreign-entry', '' } end
     if stored == sequence then return { 'exact', '' } end
     return { 'ordinal-mismatch', stored }
+  end
+  local now = redis.call('TIME')
+  local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+  if entryMs > nowMs then
+    return { 'ahead-of-clock', string.format('%d', nowMs) }
   end
   local last = redis.call('XREVRANGE', streamKey, '+', '-', 'COUNT', 1)
   if last[1] and idGreater(entryId, last[1][1]) then
@@ -208,15 +230,34 @@ local ACCEPTED = { ${ACCEPTED_POSITION_VERDICTS.map((verdict) => `['${verdict}']
  * mutated, so a stream key holding the wrong type, or a counter at the
  * safe-integer bound, refuses the publish without consuming an ordinal.
  *
- * Trimming is exact (`MAXLEN` with no `~`) so the configured retention is a
+ * ## Why the trim is its own step, after the counter
+ *
+ * Appending *and* trimming in one command is atomic but not reversible. At full
+ * retention it removes the oldest entry as a side effect of the append, and the
+ * compensation this script can perform — deleting the entry it just added —
+ * cannot put that removed entry back. A publish whose counter write then failed
+ * would leave the stream one real, unread event lighter than it found it, which
+ * is a silent loss of a retained event: exactly what §8.3 forbids and what
+ * "leaves both keys as it found them" must actually mean. (Round-2 review, M1;
+ * reproduced with a command-specific denial of the counter write, which removed
+ * the stream's oldest entry irrecoverably.)
+ *
+ * So the append does not trim, the counter is written, and only once the entry
+ * and the ordinal agree does the bound get applied. Everything the failure path
+ * has to undo is then something this script itself created.
+ *
+ * Trimming stays exact (`MAXLEN` with no `~`) so the configured retention is a
  * bound rather than an approximation. ADR-003 calls retention "a safety
  * parameter, not a tuning knob", and a bound that is only approximately
  * enforced cannot be reasoned about when sizing it against the worst tolerated
- * trader restart.
+ * trader restart. A trim that fails after the publish is already consistent is
+ * reported in the reply rather than turned into a failure: the event *is*
+ * published, and telling the caller otherwise would invite a duplicate.
  *
  * KEYS: `[1]` stream, `[2]` publication counter.
  * ARGV: `[1]` retention bound, `[2]` encoded envelope.
- * Returns: `{ 'ok', entryId, sequence }` or `{ 'err', code, detail }`.
+ * Returns: `{ 'ok', entryId, sequence, trimError }` or `{ 'err', code, detail }`,
+ * where `trimError` is empty unless the retention bound could not be applied.
  */
 export const PUBLISH_SCRIPT = `
 ${LUA_FAILED}
@@ -238,7 +279,7 @@ if tonumber(currentRaw) >= ${MAX_PUBLICATION_ORDINAL} then
 end
 local sequence = string.format('%d', tonumber(currentRaw) + 1)
 local appended = redis.pcall(
-  'XADD', KEYS[1], 'MAXLEN', ARGV[1], '*',
+  'XADD', KEYS[1], '*',
   '${FIELD_SEQUENCE}', sequence,
   '${FIELD_ENVELOPE}', ARGV[2]
 )
@@ -253,7 +294,10 @@ if failed(stored) then
   end
   return { 'err', 'counter-write-failed', tostring(stored['err']) }
 end
-return { 'ok', appended, sequence }
+local trimmed = redis.pcall('XTRIM', KEYS[1], 'MAXLEN', ARGV[1])
+local trimError = ''
+if failed(trimmed) then trimError = tostring(trimmed['err']) end
+return { 'ok', appended, sequence, trimError }
 `;
 
 /**

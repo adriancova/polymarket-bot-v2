@@ -60,11 +60,38 @@ export type StreamQueueMetrics = {
    * §8.3 "producer blocked time", in milliseconds.
    *
    * Cumulative wall-clock time producers **in this process** spent inside
-   * `publish` waiting for the transport to accept an event. A process that
-   * only consumes reports `0` because it published nothing, not because the
-   * metric is missing.
+   * `publish` waiting for the transport to accept an event — measured from the
+   * moment `publish` submitted the event, so time spent waiting behind an
+   * earlier publish of the same stream is included. Measuring only the round
+   * trip would report a fast transport while every producer behind a stalled
+   * one waited invisibly. A process that only consumes reports `0` because it
+   * published nothing, not because the metric is missing.
    */
   readonly producerBlockedTimeMs: number;
+  /**
+   * Publishes queued or in flight in this process for this stream, right now.
+   *
+   * §8.3's "current depth" for the *producer* side. The retained-events depth
+   * above describes what the transport holds; this describes what has been
+   * handed to `publish` and has not come back yet.
+   */
+  readonly publishQueueDepth: number;
+  /**
+   * The bound on {@link publishQueueDepth} — a configured limit, not a peak.
+   *
+   * §8.3 requires every queue to be bounded. Reaching this bound refuses the
+   * publish with a typed error rather than accepting an event the transport has
+   * no way to move.
+   */
+  readonly publishQueueMaxDepth: number;
+  /**
+   * How long the longest-waiting queued publish has been waiting, in
+   * milliseconds. `0` when nothing is queued.
+   *
+   * §8.3's "oldest message age" for the producer side, and the number that makes
+   * a stalled transport visible before the queue fills.
+   */
+  readonly oldestQueuedPublishAgeMs: number;
   /** §8.3 "consumer lag", per durable consumer with a stored checkpoint. */
   readonly consumerLag: readonly ConsumerLagEntry[];
   /** Total events ever published to this stream, including those retention removed. */
@@ -72,13 +99,28 @@ export type StreamQueueMetrics = {
   /** Publish attempts this process refused or could not complete. */
   readonly publishFailures: number;
   /**
-   * Stored consumer positions this transport could not read.
+   * Publishes that landed but whose retention bound could not then be applied.
    *
-   * A position taken against a different instance of this stream — another
-   * server, another key namespace, or a stream that was destroyed and
-   * recreated — is not a lag number here, and reporting one for it would be an
-   * invented measurement. It is counted instead, because leaving it out
-   * entirely would make a consumer disappear from `consumerLag` without a word.
+   * The event and its publication ordinal are consistent — the publish
+   * succeeded and is reported as such — but the stream is temporarily holding
+   * more than `maximumDepth`, which is visible as `currentDepth` exceeding it
+   * until a later publish trims. Counted rather than ignored because retention
+   * is "a safety parameter, not a tuning knob" (ADR-003 Consequences), and a
+   * bound that silently stopped being applied would be exactly the kind of
+   * quiet drift that sizing decisions rest on.
+   */
+  readonly retentionTrimFailures: number;
+  /**
+   * Stored consumer positions this transport could not turn into a position.
+   *
+   * Three things end up here, and none of them is a lag number: a value this
+   * transport did not write, a position taken against a different instance of
+   * this stream (another server, another key namespace, or a stream that was
+   * destroyed and recreated), and a position the server itself refuses — judged
+   * with the **same** judgement `subscribe` applies, so this counter and the
+   * refusal a restart would hit cannot disagree. Reporting lag for any of them
+   * would be an invented measurement; leaving them out entirely would make a
+   * consumer disappear from `consumerLag` without a word.
    */
   readonly unreadableCheckpoints: number;
 };
@@ -128,8 +170,16 @@ export type StreamQueueMetricsInput = {
   readonly nowMs: number;
   readonly producerBlockedTimeMs: number;
   readonly publishFailures: number;
+  /** Publishes queued or in flight in the reporting process. */
+  readonly publishQueueDepth: number;
+  /** The bound on that queue. */
+  readonly publishQueueMaxDepth: number;
+  /** Wait of the longest-waiting queued publish, in milliseconds. */
+  readonly oldestQueuedPublishAgeMs: number;
+  /** Publishes after which the retention bound could not be applied. */
+  readonly retentionTrimFailures: number;
   readonly consumerLag: readonly ConsumerLagEntry[];
-  /** Stored consumer positions the caller could not read. */
+  /** Stored consumer positions the caller could not turn into a position. */
   readonly unreadableCheckpoints: number;
 };
 
@@ -147,6 +197,9 @@ export function computeStreamQueueMetrics(input: StreamQueueMetricsInput): Strea
   assertNonNegativeInteger(input.currentDepth, "currentDepth");
   assertNonNegativeInteger(input.maximumDepth, "maximumDepth");
   assertNonNegativeInteger(input.unreadableCheckpoints, "unreadableCheckpoints");
+  assertNonNegativeInteger(input.publishQueueDepth, "publishQueueDepth");
+  assertNonNegativeInteger(input.publishQueueMaxDepth, "publishQueueMaxDepth");
+  assertNonNegativeInteger(input.retentionTrimFailures, "retentionTrimFailures");
 
   const oldestMessageAgeMs =
     input.oldestEntryAtMs === undefined ? 0 : Math.max(0, input.nowMs - input.oldestEntryAtMs);
@@ -158,9 +211,13 @@ export function computeStreamQueueMetrics(input: StreamQueueMetricsInput): Strea
     oldestMessageAgeMs,
     messagesDropped: Math.max(0, input.publishedTotal - input.currentDepth),
     producerBlockedTimeMs: input.producerBlockedTimeMs,
+    publishQueueDepth: input.publishQueueDepth,
+    publishQueueMaxDepth: input.publishQueueMaxDepth,
+    oldestQueuedPublishAgeMs: Math.max(0, input.oldestQueuedPublishAgeMs),
     consumerLag: input.consumerLag,
     publishedTotal: input.publishedTotal,
     publishFailures: input.publishFailures,
+    retentionTrimFailures: input.retentionTrimFailures,
     unreadableCheckpoints: input.unreadableCheckpoints,
   };
 }
