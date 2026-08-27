@@ -138,7 +138,15 @@ export type WalOverflowEvent = {
   readonly atMs: number;
 };
 
-/** Emitted on every successful fsync. */
+/**
+ * Emitted on every successful fsync.
+ *
+ * Every event this writer emits describes an fsync that genuinely advanced the
+ * segment's durability watermark: a call that proved nothing can only happen on
+ * a frozen watermark, and a frozen watermark means the writer is already faulted
+ * and issues no further periodic fsync (`docs/contracts/wal-format.md` §9.1).
+ * `syncedRecords` is therefore always records that reached durable storage.
+ */
 export type WalFsyncEvent = {
   readonly segmentId: string;
   readonly syncedBytes: number;

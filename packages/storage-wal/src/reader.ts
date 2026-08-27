@@ -24,6 +24,7 @@ import {
 } from "./constants.js";
 import { WalSegmentIntegrityError } from "./errors.js";
 import {
+  defaultSegmentIdFactory,
   isSegmentFileName,
   readSegmentManifest,
   segmentFileName,
@@ -493,20 +494,6 @@ export type SegmentValidationReport = {
   readonly issues: readonly SegmentIssue[];
 };
 
-/** Ordinal encoded in a default-factory segment id (`<epoch>-<000000>`), or `null`. */
-function encodedSegmentOrdinal(segmentId: string, gatewayEpoch: string): number | null {
-  const prefix = `${gatewayEpoch}-`;
-  if (!segmentId.startsWith(prefix)) {
-    return null;
-  }
-  const suffix = segmentId.slice(prefix.length);
-  if (!/^[0-9]{6,}$/u.test(suffix)) {
-    return null;
-  }
-  const ordinal = Number.parseInt(suffix, 10);
-  return Number.isSafeInteger(ordinal) ? ordinal : null;
-}
-
 /**
  * Cross-check every field two artifacts both carry.
  *
@@ -721,16 +708,32 @@ export async function validateSegment(
         },
       });
     }
-    // Only when the id actually encodes an ordinal: a deployment may inject a
-    // factory whose ids say nothing about ordering, and identity is what the
-    // header says, never what the name implies (`wal-format.md` §2).
-    const encodedOrdinal = encodedSegmentOrdinal(manifest.segmentId, manifest.gatewayEpoch);
-    if (encodedOrdinal !== null && encodedOrdinal !== manifest.segmentIndex) {
-      issues.push({
-        code: "MANIFEST_INCONSISTENT",
-        message: "manifest segmentIndex does not match the ordinal encoded in the segment id",
-        details: { segmentId: manifest.segmentId, segmentIndex: manifest.segmentIndex },
+    // Only for a manifest that *records* default-factory provenance. The id of
+    // a segment written by an injected factory is opaque — identity is what the
+    // header says, never what the name implies (`wal-format.md` §2) — and
+    // round-3 review found the previous shape-based inference rejecting a
+    // perfectly good `<epoch>-999999` at `segmentIndex` 0. Absent provenance
+    // means "written before this field existed": skipped, because
+    // `MANIFEST_HEADER_DISAGREE` already compares `segmentIndex` against the
+    // checksummed header and a false positive here costs more than the overlap.
+    if (manifest.segmentIdKind === "default") {
+      const expectedId = defaultSegmentIdFactory({
+        gatewayEpoch: manifest.gatewayEpoch,
+        segmentIndex: manifest.segmentIndex,
+        createdAtMs: 0,
       });
+      if (manifest.segmentId !== expectedId) {
+        issues.push({
+          code: "MANIFEST_INCONSISTENT",
+          message:
+            "manifest claims a default-factory segment id that does not follow from its segmentIndex",
+          details: {
+            segmentId: manifest.segmentId,
+            segmentIndex: manifest.segmentIndex,
+            expected: expectedId,
+          },
+        });
+      }
     }
   }
 

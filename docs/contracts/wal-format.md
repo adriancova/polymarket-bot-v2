@@ -47,8 +47,10 @@ package writes:
 - `segmentId` is opaque to readers. The default factory
   (`defaultSegmentIdFactory`) produces `${gatewayEpoch}-${index padded to 6}`,
   which is unique across restarts because the epoch changes (§7.1) and sorts in
-  creation order inside one epoch. A deployment may inject a different factory;
-  identity is whatever the header says, never what the file name implies.
+  creation order inside one epoch. A deployment may inject a different factory,
+  subject to the width contract in §11.2; identity is whatever the header says,
+  never what the file name implies, and a manifest records which of the two
+  produced its id (§6.2 `segmentIdKind`).
   Validation and recovery both check that a segment's header id matches the file
   name it was found under, and report `SEGMENT_ID_MISMATCH` if it does not.
 - **A segment with no manifest is unverified**, and a compactor must not consume
@@ -201,6 +203,7 @@ segment look invalid.
 | --- | --- |
 | `manifestVersion`, `formatId`, `walSchemaVersion` | document and format identity |
 | `segmentId`, `gatewayEpoch`, `segmentIndex`, `segmentFileName` | segment identity |
+| `segmentIdKind` | provenance of the id: `"default"` or `"opaque"`. Optional; see below |
 | `recordCount` | frame records on disk |
 | `firstIngestSeq`, `lastIngestSeq` | record range, bigint-as-string; `null` for an empty segment |
 | `firstReceivedAt`, `lastReceivedAt` | wall-clock range; `null` for an empty segment |
@@ -211,6 +214,20 @@ segment look invalid.
 | `closedAt`, `closeReason` | preserved from the footer when one exists |
 | `footerPresent` | whether the segment also carries an in-file footer |
 | `truncatedTailBytes` | bytes removed by recovery as an incomplete final record; `0` for a clean close |
+
+**`segmentIdKind` records where the id came from, and nothing more.** It is
+`"default"` exactly when the id is the string `defaultSegmentIdFactory` would
+have produced for this manifest's own `gatewayEpoch` and `segmentIndex`, and
+`"opaque"` otherwise. Every producer derives it the same way — the segment
+writer, the writer's fault path, and recovery, which cannot know which factory a
+dead process injected and therefore records only what it can verify from the
+bytes.
+
+The field exists because the ordinal cross-check below needs to know when an id
+means anything. It is **optional**, under the §12 rule that manifest metadata may
+grow: a manifest written before it existed carries no provenance, and the
+cross-check is then skipped rather than guessed at. A *present* value must be one
+this build understands, because the validator acts on it.
 
 ### 6.3 Agreement is field by field
 
@@ -241,10 +258,19 @@ and checks the manifest against itself (`MANIFEST_INCONSISTENT`):
 - only `recovery` or `write-fault` truncates a tail;
 - `checksummedByteLength` cannot exceed `byteSize`;
 - `recordCount === 0` exactly when the whole record range is `null`;
-- when the segment id encodes an ordinal — the default factory's
-  `<gatewayEpoch>-<000000>` shape — it must equal `segmentIndex`. An injected
-  factory whose ids encode nothing is not second-guessed: identity is what the
-  header says, never what the name implies (§2).
+- when the manifest records `segmentIdKind: "default"`, the id must be exactly
+  what the default factory produces for its `gatewayEpoch` and `segmentIndex`.
+
+That last check runs **only** on recorded default-factory provenance. It used to
+run on *shape* — any `<gatewayEpoch>-<digits>` id was read as an encoded ordinal
+— and round-3 review reproduced the consequence: a deployment injecting its own
+factory produced a valid segment with the id `<epoch>-999999` at `segmentIndex`
+0, which `validateSegment` then rejected as `MANIFEST_INCONSISTENT`. §2 says an
+id is opaque and identity is what the header says, never what the name implies,
+and a shape-based inference contradicts that. Skipping the check where
+provenance is unknown costs almost nothing: `MANIFEST_HEADER_DISAGREE` already
+compares `segmentIndex` against the header, and the header sits inside the
+checksummed bytes, so editing it instead is a `CHECKSUM_MISMATCH`.
 
 The content comparisons are skipped when the scan stopped on corruption, because
 then it describes only a prefix and every field would disagree for the same
@@ -392,6 +418,10 @@ Two costs of the rule, stated rather than hidden:
   but re-recording them and then letting recovery finalize the abandoned segment
   produces duplicates (§12). Under-claiming costs duplicates; over-claiming
   costs data, and duplicates are detectable while a lost frame is not.
+
+  **This is exactly why a successful `fsync` may not release a record from the
+  writer's accountability**, and getting that backwards was the round-3 defect.
+  See §10.2.
 - **The fault-close `fsync` is still issued**, because on a handle with no
   failure history it genuinely proves the bytes a torn append left behind — that
   is the one case where the watermark still advances at close. Its success
@@ -496,6 +526,49 @@ settled and readable in the caller's catch block. If the manifest cannot be
 written either (a genuinely full disk), `close()` fails and may be retried once
 space exists; if the process dies first, the next recovery finalizes the segment.
 
+### 10.2 Accountability is not durability
+
+Two questions look alike and are not, and the recorder keeps a separate answer
+for each. Conflating them is how §10.1's "every frame it might hold" was true of
+the document and false of the code until round 3.
+
+| Question | Answer | Advanced by | Released by |
+| --- | --- | --- | --- |
+| **Durable-for-manifest** — what may a manifest claim? | the segment's durability watermark (§9.1) | a successful `fsync` on a handle with no failure history | never; a failure freezes it |
+| **Retained-for-accountability** — which accepted records is the writer still answerable for? | every record appended to the active segment that no *written* manifest names | every append | a manifest write, and nothing else |
+
+The second is never smaller than the first, and the writer exposes both:
+`unprovenFrameCount` is the durability number — the frames a power loss would
+cost right now — and `retainedRecordCount` is the accountability one, which is
+what a fault hands back.
+
+**Why an `fsync` may not release a record.** It is tempting to reason that a
+record the disk has confirmed will end up in a manifest, so the writer can stop
+holding it. Under the watermark rule it usually will not: a *later* failure
+freezes the watermark short of the file, and §10.1 case 4 then writes **no
+manifest for the segment at all** — including for the records an earlier `fsync`
+did prove. A writer that released on `fsync` therefore left those records named
+by no manifest and absent from `pendingFrames()`, which is the silent gap the
+invariant exists to forbid. Round-3 review reproduced it three ways: a `tick()`
+rotation whose footer write failed, one whose `fsync` failed, and a mid-batch
+torn append — in each case with one frame flushed beforehand, and in each case
+that frame accounted for nowhere.
+
+**Why a manifest write must release it.** The symmetric error is to retain
+forever, which would hand back records a manifest already names and break "never
+by both" on every clean close. So the release happens in the same step the
+manifest lands, for exactly the records it names — the round-2 rule, unchanged.
+A segment that is manifested is finished with; a segment that is not returns
+everything.
+
+**What it costs.** The writer holds the raw records of the *active* segment in
+memory until that segment is manifested, so its retention is bounded by
+`maxSegmentBytes` rather than by the fsync interval. For a healthy writer the
+list empties at every rotation. A deployment that wants a smaller resident set
+buys it with smaller segments or more frequent rotation; the encoded copies are
+not retained, only the records themselves. Paying memory bounded by
+configuration is the deliberate trade against an unaccountable frame.
+
 ---
 
 ## 11. Ingestion contract (§8.3)
@@ -574,13 +647,13 @@ threshold by 306, 2,340 and 4,695 bytes. Only a *queued* burst exposes it:
 draining between offers leaves one frame unwritten, and one frame never needs
 more than one segment.
 
-Header and footer lengths are computed from the real gateway epoch and the real
-segment ids, with every numeric field taken at `Number.MAX_SAFE_INTEGER`, the
-timestamp at 24 characters, the longest `closeReason`, and 64 bytes of slack per
-segment; the same widened header is what the packing subtracts from each new
-segment's usable space. B is deliberately an over-estimate: over-reserving only
-refuses sooner, which is the safe direction, while under-reserving breaks the
-bound.
+Header and footer lengths are computed from the real gateway epoch and a
+**bounded** segment-id width (§11.2), with every numeric field taken at
+`Number.MAX_SAFE_INTEGER`, the timestamp at 24 characters, the longest
+`closeReason`, and 64 bytes of slack per segment; the same widened header is what
+the packing subtracts from each new segment's usable space. B is deliberately an
+over-estimate: over-reserving only refuses sooner, which is the safe direction,
+while under-reserving breaks the bound.
 
 `capacityRemainingBytes` is the headroom for *frame bytes* under exactly this
 definition — `maxTotalBytes − onDisk − queued − B`, clamped at zero. It is never
@@ -605,6 +678,49 @@ Three consequences worth stating plainly:
 `maxTotalBytes` counts what the writer knows about — recovery's tally plus what
 it has written. It is not a `statvfs` reading, so it bounds the WAL, not the
 disk.
+
+### 11.2 The `SegmentIdFactory` contract, and why the bound needs one
+
+A segment id is written into the header line **and** into the footer line, so
+its width is part of the framing §11.1 must charge for — before either line
+exists. That makes the id's width a capacity input, and an input a bound depends
+on has to be bounded itself.
+
+> **The contract.** A `SegmentIdFactory` returns a non-empty string whose JSON
+> encoding — `JSON.stringify(segmentId)` — is at most **1024 UTF-8 bytes**
+> (`MAX_SEGMENT_ID_ENCODED_BYTES`). A plain-ASCII id may therefore be up to 1022
+> characters; an id built from characters JSON must escape is proportionally
+> shorter.
+
+The bound is **enforced, not assumed**, at two points, and both refuse rather
+than record:
+
+- when the writer is opened, against the factory's first id, so a plainly wrong
+  factory costs a `WalConfigurationError` and not a half-started recorder;
+- at every segment open, **before the file is created**, so an id that leaves
+  the bound later faults the writer loudly with every accepted frame in
+  `pendingFrames()`, and never becomes bytes nothing reserved for.
+
+**What the reservation charges.** The default factory is a pure function of the
+epoch and the ordinal — it ignores `createdAtMs` — so its id is computed exactly,
+and the numbers above are unchanged. **Any injected factory is charged the full
+1024-byte bound**, because `SegmentIdContext` carries `createdAtMs` and a factory
+is entitled to use it: the id measured when a frame is admitted then has no
+relation to the id written when the segment opens. Round-3 review measured
+exactly that — a projection taken against a short id, a much longer id at open,
+and `maxTotalBytes` exceeded by 7,964 bytes; a second probe, with ids growing
+from 27 to 546 encoded bytes, finished 756 bytes past a 6,000-byte threshold.
+Sixty-four bytes of slack cannot cover an input that is free to change by
+kilobytes, and no measurement can bound a function of the clock.
+
+Two consequences, in the safe direction:
+
+- An injected factory costs roughly **1 KB more reservation per segment** than
+  the default one, so it reaches `capacity-exceeded` sooner. Over-reserving only
+  refuses earlier.
+- A `maxSegmentBytes` below the widened header refuses everything for an injected
+  factory, for the same reason §11.1 already gives. A deployment that wants tight
+  segments should use the default factory or accept the reservation.
 
 ---
 
@@ -651,6 +767,8 @@ Rules:
 | Durability under-claiming | The watermark freezes on any failure on a segment's handle, so records that did reach the disk can still be reported as unproven. That is deliberate (§9.1) and it costs duplicates, not data. Relaxing it — for instance to freeze only on `fsync` failure — is a durability-semantics change and needs an ADR, not a patch. |
 | Capacity vs. time-driven rotation | `maxTotalBytes` is pre-accounted for size-driven rotation only, including for a queued burst; see §11.1 for the bounded residual. |
 | Byte-threshold fsync | A high-water mark bounded by the threshold plus one record, not a hard cap (§9). |
+| Accountability retention | The writer holds the active segment's records in memory until that segment is manifested (§10.2), so its resident set is bounded by `maxSegmentBytes` rather than by the fsync interval. Smaller segments buy a smaller one. |
+| Segment id width | Bounded by contract and enforced at open (§11.2). An injected factory is charged the full bound, so it refuses sooner than the default one would. |
 
 ---
 
@@ -692,7 +810,7 @@ Implementation: `packages/storage-wal/src/`
 | `manifest.ts` | sidecar manifests and file naming |
 | `queue.ts` | the bounded §8.3 queue |
 | `segment-writer.ts` | one open segment: appends, running digest, and the §9.1 durability watermark |
-| `writer.ts` | rotation, durability policy, refusals, fault handling, the §11.1 capacity projection |
+| `writer.ts` | rotation, durability policy, refusals, fault handling, the §10.2 accountability retention, the §11.1 capacity projection and the §11.2 id bound |
 | `reader.ts` | sequential reads and validation |
 | `recovery.ts` | the §10 decision table |
 | `node-file-system.ts`, `clock.ts` | the only modules that touch a real disk or clock |
@@ -710,10 +828,13 @@ suite whose job is to try to break them:
 | §10.1 accepted-frame invariant, on every failing write path, including a fault raised by `tick()` with frames still queued | `accepted-frame-invariant.test.ts` |
 | §9.1 a manifest never overcounts, including after a power loss, and a post-failure `fsync` success extends no claim | `accepted-frame-invariant.test.ts`, `torn-write-recovery.test.ts`, `fsync-policy.test.ts` |
 | §10.1 accountability transfers at the manifest write and nowhere else, across sidecar retries | `accepted-frame-invariant.test.ts`, `wal-capacity.test.ts` |
-| §6.3 field-by-field agreement | `manifest-agreement.test.ts`, `checksum-validation.test.ts` |
+| §10.2 an unmanifested segment returns **every** record it might hold, including ones an earlier `fsync` proved — and returns no record a manifest names | `at-least-once-accountability.test.ts` |
+| §6.3 field-by-field agreement, and the ordinal cross-check only on recorded default provenance | `manifest-agreement.test.ts`, `checksum-validation.test.ts` |
 | §11.1 the capacity bound, framing included, for a **queued burst** at cap-exact thresholds | `wal-capacity.test.ts` |
+| §11.2 the bound holds against an injected `segmentIdFactory`, and an over-long id is refused rather than charged | `wal-capacity.test.ts` |
 | §9 the fsync bound and the byte high-water mark | `fsync-policy.test.ts` |
 
-The four defects round-2 review found are also covered at unit level, in
-`packages/storage-wal/src/writer.test.ts`, because the fault tree is not yet in
+The defects rounds 2 and 3 found are also covered at unit level, in
+`packages/storage-wal/src/writer.test.ts` and
+`packages/storage-wal/src/manifest.test.ts`, because the fault tree is not yet in
 the root gate or in CI.

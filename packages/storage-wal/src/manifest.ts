@@ -23,6 +23,14 @@ import { WalManifestError } from "./errors.js";
 import type { SegmentIdContext, WalCloseReason, WalFileSystem } from "./ports.js";
 
 /**
+ * Provenance of a segment id: produced by the default factory, or opaque.
+ *
+ * Only the default factory's ids encode anything a reader may interpret. See
+ * {@link WalSegmentManifest.segmentIdKind}.
+ */
+export type SegmentIdKind = "default" | "opaque";
+
+/**
  * Everything a compactor needs about one segment without opening it: identity,
  * epoch, record range, byte size, checksum, and lifecycle timestamps.
  */
@@ -34,6 +42,22 @@ export type WalSegmentManifest = {
   readonly gatewayEpoch: string;
   readonly segmentIndex: number;
   readonly segmentFileName: string;
+  /**
+   * Where the segment id came from, recorded at write time.
+   *
+   * `"default"` means the id is exactly what {@link defaultSegmentIdFactory}
+   * produces for this `gatewayEpoch` and `segmentIndex`, so the ordinal it
+   * encodes is meaningful and `validateSegment` cross-checks it. `"opaque"`
+   * means an injected factory produced it, and §2's rule applies without
+   * exception: identity is what the header says, never what the name implies.
+   *
+   * Optional, and additive under the §12 rule that manifest metadata may grow.
+   * A manifest written before this field existed carries no provenance, and the
+   * cross-check is then skipped rather than guessed at — a false
+   * `MANIFEST_INCONSISTENT` on a good segment costs more than a missed check
+   * that `MANIFEST_HEADER_DISAGREE` already covers.
+   */
+  readonly segmentIdKind?: SegmentIdKind;
   /** Number of frame records, excluding the header and footer lines. */
   readonly recordCount: number;
   /** First/last `ingestSeq` in the segment; `null` for an empty segment. */
@@ -92,6 +116,32 @@ export function segmentIdFromFileName(fileName: string): string | null {
  */
 export const defaultSegmentIdFactory = (context: SegmentIdContext): string =>
   `${context.gatewayEpoch}-${String(context.segmentIndex).padStart(6, "0")}`;
+
+/**
+ * Decide a segment id's provenance from the id itself.
+ *
+ * An id is `"default"` exactly when it is the string the default factory would
+ * have produced for this epoch and ordinal; anything else is `"opaque"`. Every
+ * producer of a manifest — the segment writer, the writer's fault path, and
+ * recovery — derives it the same way, so the field says what was true of the
+ * bytes when the manifest was written and nothing more. In particular recovery,
+ * which cannot know which factory a dead process used, never guesses: it
+ * records what it can verify.
+ *
+ * Round-3 review found the alternative — inferring an ordinal from any
+ * `<epoch>-<digits>` id — rejecting a valid injected-factory segment
+ * (`<epoch>-999999` at `segmentIndex` 0) as `MANIFEST_INCONSISTENT`.
+ */
+export function segmentIdKindFor(
+  segmentId: string,
+  gatewayEpoch: string,
+  segmentIndex: number,
+): SegmentIdKind {
+  const asDefault = defaultSegmentIdFactory({ gatewayEpoch, segmentIndex, createdAtMs: 0 });
+  return segmentId === asDefault ? "default" : "opaque";
+}
+
+const SEGMENT_ID_KINDS: readonly SegmentIdKind[] = ["default", "opaque"];
 
 const LOWERCASE_SHA256_HEX = /^[0-9a-f]{64}$/u;
 
@@ -173,6 +223,9 @@ export function encodeSegmentManifest(manifest: WalSegmentManifest): Uint8Array 
     gatewayEpoch: manifest.gatewayEpoch,
     segmentIndex: manifest.segmentIndex,
     segmentFileName: manifest.segmentFileName,
+    // Omitted rather than written as `null` when unknown, so a manifest this
+    // build writes and one an older build wrote remain distinguishable.
+    ...(manifest.segmentIdKind === undefined ? {} : { segmentIdKind: manifest.segmentIdKind }),
     recordCount: manifest.recordCount,
     firstIngestSeq: manifest.firstIngestSeq,
     lastIngestSeq: manifest.lastIngestSeq,
@@ -230,8 +283,19 @@ export function parseSegmentManifest(
   if (typeof closeReason !== "string" || !CLOSE_REASONS.includes(closeReason as WalCloseReason)) {
     fail("manifest declares an unknown close reason", { ...details, closeReason });
   }
+  // Optional and additive (§12): absent means "provenance unknown", which is
+  // what a manifest written before the field existed says. A *present* value
+  // must still be one this build understands, because the validator acts on it.
+  const segmentIdKind = candidate["segmentIdKind"];
+  if (
+    segmentIdKind !== undefined &&
+    (typeof segmentIdKind !== "string" || !SEGMENT_ID_KINDS.includes(segmentIdKind as SegmentIdKind))
+  ) {
+    fail("manifest declares an unknown segment id kind", { ...details, segmentIdKind });
+  }
 
   return {
+    ...(segmentIdKind === undefined ? {} : { segmentIdKind: segmentIdKind as SegmentIdKind }),
     manifestVersion,
     formatId,
     walSchemaVersion,

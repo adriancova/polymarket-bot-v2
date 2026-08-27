@@ -33,7 +33,7 @@ import type { Hash } from "node:crypto";
 
 import { isoFromEpochMs } from "./clock.js";
 import { WAL_FORMAT_ID, WAL_MANIFEST_VERSION, WAL_SCHEMA_VERSION } from "./constants.js";
-import { segmentFileName, writeSegmentManifest } from "./manifest.js";
+import { segmentFileName, segmentIdKindFor, writeSegmentManifest } from "./manifest.js";
 import type { WalSegmentManifest } from "./manifest.js";
 import type { WalAppendHandle, WalClock, WalCloseReason, WalFileSystem } from "./ports.js";
 import type { QueuedFrame } from "./queue.js";
@@ -392,6 +392,11 @@ export class ActiveSegment {
       gatewayEpoch: this.header.gatewayEpoch,
       segmentIndex: this.header.segmentIndex,
       segmentFileName: segmentFileName(this.header.segmentId),
+      segmentIdKind: segmentIdKindFor(
+        this.header.segmentId,
+        this.header.gatewayEpoch,
+        this.header.segmentIndex,
+      ),
       recordCount: this.#recordCount,
       firstIngestSeq: this.#firstIngestSeq,
       lastIngestSeq: this.#lastIngestSeq,

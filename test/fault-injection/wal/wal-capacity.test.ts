@@ -14,9 +14,11 @@ import { describe, expect, it } from "vitest";
 import {
   listSegmentManifests,
   validateWalDirectory,
+  WalConfigurationError,
   WalWriteFaultError,
 } from "@polymarket-bot/storage-wal";
-import { createTestFrames } from "@polymarket-bot/storage-wal/testing";
+import type { SegmentIdContext } from "@polymarket-bot/storage-wal";
+import { createTestFrames, DEFAULT_TEST_EPOCH_MS } from "@polymarket-bot/storage-wal/testing";
 
 import { createFaultHarness, recordedIngestSeqs, WAL_DIRECTORY } from "./support/harness.js";
 
@@ -355,6 +357,129 @@ describe("a genuinely full disk", () => {
       const path = `${WAL_DIRECTORY}/${manifest.segmentFileName}`;
       expect(harness.base.snapshot()[path]).toBe(snapshotBefore[path]);
     }
+  });
+});
+
+/**
+ * Round-3 review, MEDIUM. `maxTotalBytes` is documented as a **hard** threshold,
+ * so it has to hold against an injected `segmentIdFactory` too — the id is
+ * written into both the header and the footer, so its width is part of the
+ * framing the reservation charges for.
+ *
+ * The projection used to measure the factory's id by calling it once and cache
+ * the result with 64 bytes of slack. But `SegmentIdContext` carries
+ * `createdAtMs`, and the factory is called **again** when the segment actually
+ * opens — by then the clock has moved, and a time-dependent factory answers with
+ * a completely different width. The reviewer's probe measured a short id at
+ * admission, got a 5,000-byte one at open, and finished 7,964 bytes over the cap.
+ *
+ * The fix (`wal-format.md` §11.2) states the factory contract and enforces it:
+ * an id is at most `MAX_SEGMENT_ID_BYTES` UTF-8 bytes, an injected factory is
+ * charged that worst case rather than a measurement that can go stale, and an
+ * over-long id is refused loudly instead of quietly overrunning the threshold.
+ */
+describe("the capacity threshold against an injected segmentIdFactory", () => {
+  /**
+   * Ids that grow with the clock and stay inside the documented bound: 25
+   * characters per simulated second, up to 500. Nothing here is pathological —
+   * this is a factory that folds the creation time into the id, which
+   * `SegmentIdContext` exists to permit.
+   */
+  const timeDependentFactory = (context: SegmentIdContext): string =>
+    `${context.gatewayEpoch}-${String(context.segmentIndex).padStart(6, "0")}-${"a".repeat(
+      Math.min(Math.floor((context.createdAtMs - DEFAULT_TEST_EPOCH_MS) / 40), 500),
+    )}`;
+
+  async function onDiskBytes(harness: ReturnType<typeof createFaultHarness>): Promise<number> {
+    let total = 0;
+    for (const [path, bytes] of harness.base.files.entries()) {
+      if (path.endsWith(".wal.jsonl")) {
+        total += bytes.length;
+      }
+    }
+    return total;
+  }
+
+  it("never exceeds maxTotalBytes when the factory's id grows between admission and open", async () => {
+    // Reproduced against the pre-fix writer: 12 frames admitted against a
+    // 27-byte id measured at the first offer, 6,756 bytes on disk behind a
+    // 546-byte id at open — 756 bytes past a threshold documented as hard.
+    const harness = createFaultHarness();
+    const cap = 6_000;
+    const writer = await harness.open({
+      maxTotalBytes: cap,
+      maxSegmentBytes: 100_000,
+      segmentIdFactory: timeDependentFactory,
+    });
+
+    const accepted: string[] = [];
+    for (const frame of createTestFrames(20)) {
+      // Time passes between offers, exactly as it does in a real recorder: the
+      // id the projection measured is not the id the segment will be opened
+      // with.
+      harness.clock.advance(1_000);
+      if (writer.enqueue(frame).accepted) {
+        accepted.push(frame.ingestSeq);
+      }
+    }
+    await writer.drain().catch(() => undefined);
+    await writer.close().catch(() => undefined);
+
+    // The threshold still admits real work — a bound that refuses everything
+    // proves nothing — and the bytes on disk stayed inside it.
+    expect(accepted.length).toBeGreaterThan(0);
+    expect(await onDiskBytes(harness)).toBeLessThanOrEqual(cap);
+    expect(writer.metrics().capacityRemainingBytes).toBeGreaterThanOrEqual(0);
+    // And nothing was lost on the way: every accepted frame is recorded or
+    // pending, never neither.
+    const recorded = await recordedIngestSeqs(harness.fileSystem, { skipInvalid: true });
+    const pending = writer.pendingFrames().map((frame) => frame.ingestSeq);
+    expect([...recorded, ...pending]).toEqual(accepted);
+    expect(writer.metrics().queue.messagesDropped).toBe(0);
+  });
+
+  it("refuses an over-long factory id loudly instead of overrunning the threshold", async () => {
+    // The reviewer's 5,000-byte id is past the documented bound, so it is not
+    // silently charged to the archive: the factory is rejected. Being refused at
+    // admission is the honest answer — a bound nobody can enforce is not a bound.
+    const overLong = (context: SegmentIdContext): string =>
+      `${context.gatewayEpoch}-${"z".repeat(5_000)}-${context.segmentIndex}`;
+    const harness = createFaultHarness();
+    await expect(
+      harness.open({ maxTotalBytes: 20_000, segmentIdFactory: overLong }),
+    ).rejects.toBeInstanceOf(WalConfigurationError);
+    // Nothing was created before the refusal.
+    expect([...harness.base.files.keys()].filter((path) => path.endsWith(".wal.jsonl"))).toEqual(
+      [],
+    );
+  });
+
+  it("faults loudly rather than over-capping when a factory grows past the bound later", async () => {
+    // A factory that starts inside the bound and later leaves it cannot be
+    // caught at construction. It is caught at open, before the file exists, so
+    // the cap still holds and every accepted frame comes back to the caller.
+    const grows = (context: SegmentIdContext): string =>
+      `${context.gatewayEpoch}-${String(context.segmentIndex).padStart(6, "0")}-${"a".repeat(
+        context.createdAtMs === DEFAULT_TEST_EPOCH_MS ? 8 : 4_000,
+      )}`;
+    const harness = createFaultHarness();
+    const cap = 20_000;
+    const writer = await harness.open({ maxTotalBytes: cap, segmentIdFactory: grows });
+
+    const accepted: string[] = [];
+    for (const frame of createTestFrames(3)) {
+      if (writer.enqueue(frame).accepted) {
+        accepted.push(frame.ingestSeq);
+      }
+    }
+    harness.clock.advance(1_000);
+    await expect(writer.drain()).rejects.toThrow(/segment id/u);
+    expect(writer.state).toBe("faulted");
+
+    await writer.close().catch(() => undefined);
+    expect(await onDiskBytes(harness)).toBeLessThanOrEqual(cap);
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(accepted);
+    expect(writer.metrics().queue.messagesDropped).toBe(0);
   });
 });
 

@@ -12,6 +12,7 @@ import {
   readSegmentManifest,
   segmentFileName,
   segmentIdFromFileName,
+  segmentIdKindFor,
   writeSegmentManifest,
 } from "./manifest.js";
 import type { WalSegmentManifest } from "./manifest.js";
@@ -86,6 +87,36 @@ describe("manifest encoding", () => {
 
   it.each(rejections)("rejects %s", (_label, value) => {
     expect(() => parseSegmentManifest(value)).toThrow(WalManifestError);
+  });
+});
+
+describe("segment id provenance", () => {
+  it("calls an id default only when the default factory would have produced it", () => {
+    expect(segmentIdKindFor("epoch-000003", "epoch", 3)).toBe("default");
+    // Default-*shaped* but not this index's id: opaque, so nothing infers an
+    // ordinal from it (round-3 LOW-1).
+    expect(segmentIdKindFor("epoch-999999", "epoch", 0)).toBe("opaque");
+    expect(segmentIdKindFor("segment-a1b2c3", "epoch", 0)).toBe("opaque");
+    // Six digits are part of the default shape; a shorter ordinal is not it.
+    expect(segmentIdKindFor("epoch-3", "epoch", 3)).toBe("opaque");
+  });
+
+  it("round-trips the field and keeps it optional", () => {
+    const withKind: WalSegmentManifest = { ...manifest, segmentIdKind: "opaque" };
+    expect(parseSegmentManifest(decode(encodeSegmentManifest(withKind)))).toEqual(withKind);
+    // Absent is a legal document — that is what a manifest written before the
+    // field existed looks like — and it must not become `null` on the way out.
+    const encoded = decode(encodeSegmentManifest(manifest)) as Record<string, unknown>;
+    expect("segmentIdKind" in encoded).toBe(false);
+    expect(parseSegmentManifest(encoded).segmentIdKind).toBeUndefined();
+  });
+
+  it("rejects a value it does not understand rather than ignoring it", () => {
+    // The validator acts on this field, so an unknown value is a defect, not a
+    // nicety to skip past.
+    expect(() => parseSegmentManifest({ ...manifest, segmentIdKind: "guessed" })).toThrow(
+      WalManifestError,
+    );
   });
 });
 

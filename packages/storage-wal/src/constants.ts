@@ -71,5 +71,24 @@ export const MAX_IDENTIFIER_LENGTH = 256;
 /** Largest accepted length for `endpoint` (URLs with query strings). */
 export const MAX_ENDPOINT_LENGTH = 2048;
 
+/**
+ * Largest **JSON-encoded** segment id, in UTF-8 bytes — the contract every
+ * `SegmentIdFactory` must satisfy.
+ *
+ * The bound is stated on `JSON.stringify(segmentId)` rather than on the id
+ * itself because that is exactly what a segment pays for its identity: the id
+ * is written into the header line and into the footer line, escaped, and the
+ * `maxTotalBytes` reservation has to charge for both before either exists
+ * (`docs/contracts/wal-format.md` §11.2). A plain-ASCII id may therefore be up
+ * to 1022 characters; an id built from characters JSON must escape is
+ * proportionally shorter.
+ *
+ * The writer refuses an id past this bound rather than silently overrunning the
+ * capacity threshold, and it charges an injected factory this full width,
+ * because a factory may fold `createdAtMs` into its id and so answer a later
+ * call with a different width than the one the reservation measured.
+ */
+export const MAX_SEGMENT_ID_ENCODED_BYTES = 1024;
+
 /** Line terminator. The format is JSON Lines: exactly one record per line. */
 export const LINE_FEED = 0x0a;

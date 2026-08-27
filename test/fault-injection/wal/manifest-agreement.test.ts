@@ -140,6 +140,82 @@ describe("a doctored manifest field", () => {
   });
 });
 
+/**
+ * Round-3 review, LOW-1. The ordinal cross-check read *any*
+ * `<gatewayEpoch>-<digits>` id as a default-factory ordinal, so a deployment
+ * that injects its own factory could produce a perfectly good segment that
+ * `validateSegment` then rejected with `MANIFEST_INCONSISTENT` — the reviewer's
+ * probe used `<epoch>-999999` at `segmentIndex` 0.
+ *
+ * `wal-format.md` §2 is explicit that an id is opaque and that identity is what
+ * the header says, never what the name implies, so the check now runs only for
+ * ids the manifest itself records as default-factory provenance
+ * (`segmentIdKind`, §6.2).
+ */
+describe("a segment written by an injected segmentIdFactory", () => {
+  it("validates cleanly even when its id looks like a default-factory ordinal", async () => {
+    const harness = createFaultHarness();
+    const writer = await harness.open({
+      // Default-*shaped* and deliberately misleading: six digits that are not
+      // this segment's index.
+      segmentIdFactory: (context) => `${context.gatewayEpoch}-${999_999 - context.segmentIndex}`,
+    });
+    for (const frame of createTestFrames(3)) {
+      expect(writer.enqueue(frame).accepted).toBe(true);
+    }
+    const manifest = await writer.close();
+    expect(manifest?.segmentIndex).toBe(0);
+    expect(manifest?.segmentId).toMatch(/-999999$/u);
+    expect(manifest?.segmentIdKind).toBe("opaque");
+
+    const report = await validateSegment(
+      harness.fileSystem,
+      WAL_DIRECTORY,
+      manifest?.segmentId ?? "",
+    );
+    expect(report.issues).toEqual([]);
+    expect(report.valid).toBe(true);
+  });
+
+  it("still catches a doctored segmentIndex on a default-factory segment", async () => {
+    // The check the fix must not throw away: provenance is recorded at write
+    // time, so editing `segmentIndex` afterwards leaves a manifest that claims
+    // default provenance while its id no longer follows from the index.
+    const built = await buildClosedSegment();
+    expect(built.manifest.segmentIdKind).toBe("default");
+    const codes = await validateWithField(built, "segmentIndex", 7);
+    expect(codes).toContain("MANIFEST_INCONSISTENT");
+  });
+
+  it("recovers an injected-factory segment without inventing an inconsistency", async () => {
+    // Recovery cannot know which factory wrote a segment, so it derives the
+    // provenance from the bytes: an id that is *not* what the default factory
+    // would produce for the declared index is recorded as opaque and the check
+    // is skipped rather than guessed at.
+    const harness = createFaultHarness();
+    const writer = await harness.open({
+      segmentIdFactory: (context) => `${context.gatewayEpoch}-${999_999 - context.segmentIndex}`,
+    });
+    for (const frame of createTestFrames(4)) {
+      expect(writer.enqueue(frame).accepted).toBe(true);
+    }
+    await writer.flush(); // crash: bytes on disk, no footer, no manifest
+
+    const reopened = await harness.open();
+    const manifests = await reopened.listManifests();
+    expect(manifests).toHaveLength(1);
+    expect(manifests[0]?.segmentIdKind).toBe("opaque");
+    const report = await validateSegment(
+      harness.fileSystem,
+      WAL_DIRECTORY,
+      manifests[0]?.segmentId ?? "",
+    );
+    expect(report.issues).toEqual([]);
+    expect(report.valid).toBe(true);
+    await reopened.close();
+  });
+});
+
 describe("a recovery-written manifest", () => {
   it("agrees with the segment it describes", async () => {
     // Crash after the frames but before any close: recovery writes the sidecar,

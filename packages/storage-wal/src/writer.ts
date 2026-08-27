@@ -22,6 +22,7 @@ import {
   DEFAULT_MAX_SEGMENT_BYTES,
   DEFAULT_QUEUE_CAPACITY,
   DEFAULT_QUEUE_MAX_BYTES,
+  MAX_SEGMENT_ID_ENCODED_BYTES,
   WAL_FORMAT_ID,
   WAL_MANIFEST_VERSION,
   WAL_SCHEMA_VERSION,
@@ -36,10 +37,12 @@ import {
   defaultSegmentIdFactory,
   listSegmentManifests,
   segmentFileName,
+  segmentIdKindFor,
   writeSegmentManifest,
 } from "./manifest.js";
 import type { WalSegmentManifest } from "./manifest.js";
 import type {
+  SegmentIdContext,
   SegmentIdFactory,
   WalClock,
   WalCloseReason,
@@ -144,10 +147,24 @@ export type WalWriterMetrics = {
   readonly capacityReservedBytes: number | null;
   /**
    * Frames appended to the active segment whose durability no `fsync` has
-   * proven yet. They are the frames a power loss would cost right now, and the
-   * ones a fault hands back through `pendingFrames()`.
+   * proven yet: the frames a power loss would cost right now.
+   *
+   * This is the *durability* number. It is **not** the number a fault hands
+   * back — see {@link WalWriterMetrics.retainedRecordCount}, which is the
+   * accountability one and is never smaller.
    */
   readonly unprovenFrameCount: number;
+  /**
+   * Records of the active segment the writer is still answerable for, because
+   * no manifest names them yet.
+   *
+   * A fault hands **all** of these back through `pendingFrames()`, whether or
+   * not an `fsync` proved them, because a segment that ends unmanifested is a
+   * segment nothing on disk claims (`wal-format.md` §10.1, §10.2). It falls to
+   * zero every time a segment is manifested, so it is also the writer's
+   * retention high-water mark within one segment.
+   */
+  readonly retainedRecordCount: number;
   /**
    * Segments this writer faulted on and could not prove durable, so it wrote no
    * manifest. Each one is unverified until recovery finalizes it, and each is a
@@ -174,12 +191,60 @@ function requirePositiveInteger(value: number, name: string): number {
 /**
  * Slack added to every per-segment overhead reservation.
  *
- * Absorbs the difference between a segment id measured now and the one actually
- * produced later (a custom `segmentIdFactory` may fold the creation time into
- * the id). Over-reserving only refuses sooner, which is the safe direction; the
- * bound in `docs/contracts/wal-format.md` §11.1 is stated in terms of it.
+ * Pure margin now that the id width is bounded rather than measured
+ * (`#reserveSegmentId`). Over-reserving only refuses sooner, which is the safe
+ * direction; the bound in `docs/contracts/wal-format.md` §11.1 is stated in
+ * terms of it.
  */
 const SEGMENT_OVERHEAD_SLACK_BYTES = 64;
+
+/**
+ * The id the reservation charges for a segment an **injected** factory will
+ * name: as wide as `MAX_SEGMENT_ID_ENCODED_BYTES` allows, in characters JSON
+ * does not escape, so `JSON.stringify` of it is exactly that bound.
+ *
+ * Measuring the factory instead is what broke the threshold. `SegmentIdContext`
+ * carries `createdAtMs`, so a factory may answer the reservation and the open
+ * with ids of completely different widths — round-3 review measured a
+ * projection taken against a short id and a 5,000-byte id at open, finishing
+ * 7,964 bytes over `maxTotalBytes`. A bound cannot be enforced from a
+ * measurement that goes stale, so the writer charges the bound and enforces it
+ * (`docs/contracts/wal-format.md` §11.2).
+ */
+const WIDEST_INJECTED_SEGMENT_ID = "a".repeat(MAX_SEGMENT_ID_ENCODED_BYTES - 2);
+
+/** Bytes `JSON.stringify` produces for a segment id — what a line pays for it. */
+function encodedSegmentIdBytes(segmentId: string): number {
+  return Buffer.byteLength(JSON.stringify(segmentId), "utf8");
+}
+
+/**
+ * Enforce the `SegmentIdFactory` contract.
+ *
+ * Loud on violation, and always **before** the segment file is created, so a
+ * factory that would overrun `maxTotalBytes` costs a refused open rather than
+ * bytes on disk nobody reserved for.
+ */
+function assertSegmentIdWithinBound(segmentId: unknown, context: SegmentIdContext): string {
+  if (typeof segmentId !== "string" || segmentId.length === 0) {
+    throw new WalConfigurationError("segmentIdFactory must return a non-empty string", {
+      segmentIndex: context.segmentIndex,
+      returned: typeof segmentId,
+    });
+  }
+  const encoded = encodedSegmentIdBytes(segmentId);
+  if (encoded > MAX_SEGMENT_ID_ENCODED_BYTES) {
+    throw new WalConfigurationError(
+      `segmentIdFactory returned a segment id of ${encoded} encoded bytes, past the ${MAX_SEGMENT_ID_ENCODED_BYTES}-byte bound`,
+      {
+        segmentIndex: context.segmentIndex,
+        encodedBytes: encoded,
+        maxEncodedBytes: MAX_SEGMENT_ID_ENCODED_BYTES,
+      },
+    );
+  }
+  return segmentId;
+}
 
 /** A timestamp of the widest shape `isoFromEpochMs` produces. */
 const WIDEST_TIMESTAMP = "2026-01-01T00:00:00.000Z";
@@ -293,6 +358,19 @@ export async function openWalWriter(options: WalWriterOptions): Promise<WalWrite
   if (maxTotalBytes !== null) {
     requirePositiveInteger(maxTotalBytes, "maxTotalBytes");
   }
+  const segmentIdFactory = options.segmentIdFactory ?? defaultSegmentIdFactory;
+  // Fail fast on a factory that already violates its contract, before recovery
+  // touches the directory. A factory that only *later* leaves the bound cannot
+  // be caught here — `#openSegment` catches that one — but a plainly wrong one
+  // should not cost a partially opened recorder to discover.
+  assertSegmentIdWithinBound(
+    segmentIdFactory({
+      gatewayEpoch: options.gatewayEpoch,
+      segmentIndex: 0,
+      createdAtMs: options.clock.nowMs(),
+    }),
+    { gatewayEpoch: options.gatewayEpoch, segmentIndex: 0, createdAtMs: 0 },
+  );
 
   const recovery = await recoverWalDirectory(options.fileSystem, options.directoryPath, {
     clock: options.clock,
@@ -317,7 +395,7 @@ export async function openWalWriter(options: WalWriterOptions): Promise<WalWrite
     fsyncIntervalMs,
     fsyncByteThreshold,
     maxTotalBytes,
-    segmentIdFactory: options.segmentIdFactory ?? defaultSegmentIdFactory,
+    segmentIdFactory,
     observer: options.observer ?? {},
     verifyPayloadDigest: options.verifyPayloadDigest ?? true,
     recovery,
@@ -354,22 +432,36 @@ export class WalWriter {
   /**
    * Frames the caller must take back. See {@link WalWriter.pendingFrames}.
    */
-  #pending: QueuedFrame[] = [];
+  #pending: RawFrameRecord[] = [];
   /**
-   * Frames appended to the active segment since its last successful `fsync`.
+   * **Retained for accountability**: every record appended to the *active*
+   * segment that no written manifest names yet, in accept order.
    *
-   * They are on disk but nothing has proven they survive a power loss, so the
-   * writer keeps hold of them: on a fault they move to {@link #pending}, and a
-   * successful `fsync` — the only proof of durability there is — clears them.
-   * This list is what makes the accepted-frame invariant total rather than
-   * append-shaped.
+   * This is deliberately not the same thing as the segment's durability
+   * watermark, and round-3 review found the package conflating them. The
+   * watermark (`segment-writer.ts`) answers "what may a manifest claim?" and a
+   * successful `fsync` advances it. This list answers "which accepted records is
+   * the writer still answerable for?", and **only a manifest write releases
+   * it** — because under the watermark rule a later failure can freeze the
+   * watermark short of the file, leaving the segment unmanifested *after*
+   * earlier records were fsynced. Releasing on `fsync`, as the writer used to,
+   * put those records in neither the manifest nor `pendingFrames()`, which is
+   * the silent gap `wal-format.md` §10.1 forbids.
+   *
+   * The retention is bounded by `maxSegmentBytes`: it is emptied every time a
+   * segment is manifested, which for a healthy writer is every rotation.
    */
-  #unproven: QueuedFrame[] = [];
+  #segmentRecords: RawFrameRecord[] = [];
   /**
    * Records of the faulted segment that are accounted for as durable — the ones
    * that are *not* in {@link #pending}. The fault reconciliation uses it as the
    * pivot between "already accounted" and "the leading entries of the pending
    * list".
+   *
+   * It is structurally `0` now that {@link #segmentRecords} retains the whole
+   * active segment, and it is still computed rather than assumed: if the two
+   * ever drifted, a pivot derived from the real counts fails safe (fewer records
+   * leave the pending list) where a hard-coded one would not.
    */
   #segmentRecordsAccountedDurable = 0;
   #faultTruncatedTailBytes = 0;
@@ -791,7 +883,7 @@ export class WalWriter {
    * a compactor can see and loses nothing.
    */
   pendingFrames(): readonly RawFrameRecord[] {
-    return this.#pending.map((frame) => frame.record);
+    return [...this.#pending];
   }
 
   /** Every manifest in this writer's directory, including recovered segments. */
@@ -808,7 +900,14 @@ export class WalWriter {
     const reserved = capacity === null ? 0 : this.#reservedOverheadBytes();
     return {
       capacityReservedBytes: capacity === null ? null : reserved,
-      unprovenFrameCount: this.#unproven.length,
+      // Derived from the watermark rather than from a second list, so the
+      // durability metric and the durability claim cannot drift apart: the
+      // retained records past what the last clean fsync covered.
+      unprovenFrameCount: Math.max(
+        this.#segmentRecords.length - (active?.durableRecordCount ?? 0),
+        0,
+      ),
+      retainedRecordCount: this.#segmentRecords.length,
       unmanifestedFaultedSegments: this.#unmanifestedFaultedSegments,
       state: this.#state,
       queue: this.#queue.metrics(nowMs),
@@ -868,7 +967,8 @@ export class WalWriter {
    * accepted-frame invariant total. Three groups become the caller's again
    * through `pendingFrames()`, in the order they were accepted:
    *
-   * 1. `#unproven` — appended to the active segment, never proven durable;
+   * 1. `#segmentRecords` — **every** record appended to the active segment that
+   *    no manifest names, including ones an earlier `fsync` did prove durable;
    * 2. `extraFrames` — taken from the queue by `drain()` and never appended;
    * 3. **whatever is still queued** — the frames `enqueue` accepted and no drain
    *    ever reached.
@@ -879,26 +979,37 @@ export class WalWriter {
    * is emptied here rather than left to look "still to be written", because a
    * faulted writer will never write it: `enqueue` refuses from now on and
    * `drain()` refuses to run.
+   *
+   * Group 1 was the round-3 gap. It used to be "the frames since the last
+   * successful `fsync`", which is the *durability* question, not the
+   * *accountability* one. A segment that ends unmanifested — the usual outcome
+   * of a write or `fsync` failure, under §9.1's watermark rule — holds records
+   * no manifest will ever name, and the earlier-fsynced ones among them were
+   * being handed to nobody.
    */
   #enterFault(error: unknown, extraFrames: readonly QueuedFrame[] = []): void {
     const active = this.#active;
     if (this.#state !== "faulted") {
       this.#state = "faulted";
       this.#writeFaults += 1;
-      // How many of the active segment's records are already accounted for as
-      // durable — that is, are *not* in the pending list about to be built.
-      // Read before `#unproven` is drained, and deliberately not taken from
-      // `durableRecordCount`: `finalize()` advances that on its footer fsync
-      // while those same frames are still in `#unproven`, and using it there
-      // made the pending list and a retried manifest both claim them.
+      // How many of the active segment's records are already accounted for
+      // elsewhere — that is, are *not* in the pending list about to be built.
+      // Read before `#segmentRecords` is drained, and deliberately not taken
+      // from `durableRecordCount`: `finalize()` advances that on its footer
+      // fsync while those same records are still retained here, and using it as
+      // the pivot made the pending list and a retried manifest both claim them
+      // (round-2 HIGH-1b).
       this.#segmentRecordsAccountedDurable = Math.max(
-        (active?.recordCount ?? 0) - this.#unproven.length,
+        (active?.recordCount ?? 0) - this.#segmentRecords.length,
         0,
       );
     }
-    if (this.#unproven.length > 0 || extraFrames.length > 0) {
-      this.#pending.push(...this.#unproven, ...extraFrames);
-      this.#unproven = [];
+    if (this.#segmentRecords.length > 0 || extraFrames.length > 0) {
+      this.#pending.push(
+        ...this.#segmentRecords,
+        ...extraFrames.map((frame) => frame.record),
+      );
+      this.#segmentRecords = [];
     }
     this.#absorbQueueIntoPending();
     this.#options.observer.onWriteFault?.({
@@ -920,7 +1031,7 @@ export class WalWriter {
     const remaining = this.#queue.takeAll();
     this.#invalidateProjection();
     if (remaining.length > 0) {
-      this.#pending.push(...remaining);
+      this.#pending.push(...remaining.map((frame) => frame.record));
     }
   }
 
@@ -1048,11 +1159,30 @@ export class WalWriter {
     return reserve;
   }
 
+  /**
+   * The id width the capacity reservation charges for a future segment.
+   *
+   * The default factory is a **pure function of the epoch and the ordinal** — it
+   * ignores `createdAtMs` — so its id can be computed now and will be identical
+   * at open, and the reservation is exact. Any injected factory is charged the
+   * documented maximum instead: it may fold the creation time into its id, and a
+   * width measured at admission then bears no relation to the width written at
+   * open. `#openSegment` enforces the same bound on the id it actually gets, so
+   * the reservation is an upper bound for *every* factory, not only for
+   * well-behaved ones (`docs/contracts/wal-format.md` §11.2).
+   *
+   * This is also why the reservation no longer reads the clock: for the default
+   * factory there is nothing to read, and for an injected one the answer would
+   * be worthless.
+   */
   #reserveSegmentId(segmentIndex: number): string {
-    return this.#options.segmentIdFactory({
+    if (this.#options.segmentIdFactory !== defaultSegmentIdFactory) {
+      return WIDEST_INJECTED_SEGMENT_ID;
+    }
+    return defaultSegmentIdFactory({
       gatewayEpoch: this.#options.gatewayEpoch,
       segmentIndex,
-      createdAtMs: this.#options.clock.nowMs(),
+      createdAtMs: 0,
     });
   }
 
@@ -1110,14 +1240,19 @@ export class WalWriter {
     }
     const durationMs = this.#options.clock.monotonicMs() - startedMs;
     this.#fsyncCount += 1;
-    if (synced.proven) {
-      // The fsync returned *and* the segment's watermark advanced: these frames
-      // are durable and stop being the writer's debt. This is the only place
-      // durability is ever asserted while the writer is healthy. A call that
-      // returned success on a frozen watermark proves nothing and is ignored
-      // here on purpose (`segment-writer.ts`, "The durability watermark").
-      this.#unproven = [];
-    }
+    // A successful fsync advances the segment's durability watermark and
+    // nothing else. It does **not** release the records from `#segmentRecords`:
+    // durability decides what a manifest may claim, accountability ends only
+    // when a manifest actually claims it. Releasing here is what left an
+    // earlier-fsynced record in neither the manifest nor `pendingFrames()` when
+    // a later failure froze the watermark short of the file (round-3 HIGH).
+    //
+    // `synced.proven` is not branched on because it cannot be `false` here: a
+    // watermark freezes only on a failure, every failure faults the writer, and
+    // a faulted writer runs no further `drain`, `tick`, `flush`, or `rotate` —
+    // the fault path uses `syncForFaultClose()` instead, which is where an
+    // unproven result is expected and handled. `synced.records` is `0` on a
+    // frozen watermark in any case, so the counter stays honest either way.
     this.#framesDurable += synced.records;
     this.#totalFsyncDurationMs += durationMs;
     this.#lastFsyncDurationMs = durationMs;
@@ -1135,11 +1270,34 @@ export class WalWriter {
   async #openSegment(): Promise<void> {
     const createdAtMs = this.#options.clock.nowMs();
     const segmentIndex = this.#nextSegmentIndex;
-    const segmentId = this.#options.segmentIdFactory({
+    const context: SegmentIdContext = {
       gatewayEpoch: this.#options.gatewayEpoch,
       segmentIndex,
       createdAtMs,
-    });
+    };
+    // Checked before anything is created. An id past the bound is a factory
+    // contract violation, and the honest answer is to refuse loudly: the
+    // alternative is a header and a footer the capacity reservation never
+    // charged for, which turns the documented hard threshold into a suggestion.
+    const segmentId = assertSegmentIdWithinBound(
+      this.#options.segmentIdFactory(context),
+      context,
+    );
+    const reservedIdBytes = encodedSegmentIdBytes(this.#reserveSegmentId(segmentIndex));
+    if (encodedSegmentIdBytes(segmentId) > reservedIdBytes) {
+      // Only reachable if `segmentIdFactory` is the default one and answered
+      // differently than its own pure definition — impossible today, and
+      // asserted rather than assumed, because it is the single premise the
+      // capacity bound rests on for the default path.
+      throw new WalConfigurationError(
+        "segmentIdFactory returned a wider segment id than the capacity reservation charged",
+        {
+          segmentIndex,
+          encodedBytes: encodedSegmentIdBytes(segmentId),
+          reservedBytes: reservedIdBytes,
+        },
+      );
+    }
     const path = this.#options.fileSystem.joinPath(
       this.#options.directoryPath,
       segmentFileName(segmentId),
@@ -1212,9 +1370,9 @@ export class WalWriter {
     this.#totalSegmentBytes += appended;
     // The active segment grew, so the room the projection assumed is stale.
     this.#invalidateProjection();
-    // Written, but not yet proven durable: still the writer's responsibility
-    // until an fsync says otherwise.
-    this.#unproven.push(...batch);
+    // On disk, and still the writer's responsibility — until a manifest names
+    // it. Not until an fsync proves it: see `#segmentRecords`.
+    this.#segmentRecords.push(...batch.map((frame) => frame.record));
     return appended;
   }
 
@@ -1242,8 +1400,11 @@ export class WalWriter {
     this.#active = null;
     this.#activeFooterReserveBytes = 0;
     this.#invalidateProjection();
-    // finalize() fsynced the footer, so every frame in this segment is durable.
-    this.#unproven = [];
+    // The manifest is on disk and names every record in this segment, so
+    // accountability for them transfers here — the one place it may, and the
+    // same rule the fault path follows (round-2 HIGH-1b). `finalize()` writes
+    // the sidecar last, so reaching this line means the claim actually landed.
+    this.#segmentRecords = [];
     this.#segmentsFinalized += 1;
     if (reason !== "shutdown") {
       this.#rotations += 1;
@@ -1288,6 +1449,13 @@ export class WalWriter {
    * compactor (§2), and is finalized by recovery on the next open — which is a
    * disclosed duplicate source (`wal-format.md` §12), and the deliberate trade
    * against losing a frame.
+   *
+   * The two rules only add up to the invariant because `#enterFault()` has
+   * already handed back **every** record of this segment, not only the ones no
+   * `fsync` covered. Rule 1 makes an unmanifested segment the normal outcome of
+   * a failure, so anything released before the manifest write is released to
+   * nobody — which is the round-3 finding, and why `#segmentRecords` is keyed to
+   * the manifest rather than to the watermark (`wal-format.md` §10.2).
    */
   async #finalizeFaultedSegment(): Promise<WalSegmentManifest | null> {
     // A fault raised where no frame was in flight — `tick()` is the one that
@@ -1339,6 +1507,11 @@ export class WalWriter {
       gatewayEpoch: scan.header.gatewayEpoch,
       segmentIndex: scan.header.segmentIndex,
       segmentFileName: segmentFileName(active.segmentId),
+      segmentIdKind: segmentIdKindFor(
+        active.segmentId,
+        scan.header.gatewayEpoch,
+        scan.header.segmentIndex,
+      ),
       recordCount: scan.recordCount,
       firstIngestSeq: scan.firstIngestSeq,
       lastIngestSeq: scan.lastIngestSeq,

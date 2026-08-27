@@ -51,6 +51,7 @@ export {
   DEFAULT_READ_CHUNK_BYTES,
   MANIFEST_FILE_SUFFIX,
   MAX_PAYLOAD_BYTES,
+  MAX_SEGMENT_ID_ENCODED_BYTES,
   SEGMENT_FILE_SUFFIX,
   WAL_FORMAT_ID,
   WAL_MANIFEST_VERSION,
@@ -92,7 +93,9 @@ export {
   readSegmentManifest,
   segmentFileName,
   segmentIdFromFileName,
+  segmentIdKindFor,
   writeSegmentManifest,
+  type SegmentIdKind,
   type WalSegmentManifest,
 } from "./manifest.js";
 

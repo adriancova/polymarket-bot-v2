@@ -11,7 +11,7 @@ import type {
 } from "./ports.js";
 import { readSegmentRecords, validateSegment, validateWalDirectory } from "./reader.js";
 import { classifySegmentLine } from "./segment-format.js";
-import { createManualClock } from "./testing/manual-clock.js";
+import { createManualClock, DEFAULT_TEST_EPOCH_MS } from "./testing/manual-clock.js";
 import type { ManualClock } from "./testing/manual-clock.js";
 import { createMemoryFileSystem } from "./testing/memory-file-system.js";
 import type { MemoryFileSystem } from "./testing/memory-file-system.js";
@@ -520,6 +520,7 @@ describe("observability", () => {
     expect(opened[0]?.gatewayEpoch).toBe(TEST_GATEWAY_EPOCH);
   });
 
+
   it("exposes the §8.3 and §14.3 metric families", async () => {
     const { writer } = await openHarness();
     for (const frame of createTestFrames(4)) {
@@ -745,5 +746,164 @@ describe("durability accounting under faults", () => {
         expect(writer.metrics().queue.messagesDropped).toBe(0);
       }
     }
+  });
+
+  /**
+   * Round-3 review regressions, at unit level for the same reason as the
+   * round-2 ones above: the fault tree that covers them in depth is still not in
+   * CI, and these are the defects that lose a recorded frame.
+   */
+
+  it("returns a frame an earlier fsync proved when the segment ends unmanifested", async () => {
+    // HIGH: a successful `fsync` used to release the frame from the writer's
+    // accountability, on the assumption that a durable frame ends up in a
+    // manifest. Under the §9.1 watermark rule it usually does not: a later
+    // failure freezes the watermark short of the file and *no* manifest is
+    // written, so the earlier-fsynced frame was in neither half of the
+    // partition. Appends: 1 = header, 2 = frame 1, 3 = frame 2, 4 = the
+    // time-rotation footer, which fails.
+    const fileSystem = failingFileSystem({ failAppendOn: 4 });
+    const clock = createManualClock();
+    const writer = await open(fileSystem, clock, {
+      maxSegmentAgeMs: 1_000,
+      fsyncIntervalMs: 1_000_000,
+      fsyncByteThreshold: 10_000_000,
+    });
+
+    expect(writer.enqueue(createTestFrame({ ingestSeq: 1 })).accepted).toBe(true);
+    await writer.flush(); // frame 1 is now covered by a successful fsync
+    expect(writer.metrics().framesDurable).toBe(1);
+    expect(writer.metrics().unprovenFrameCount).toBe(0);
+    // Durability released nothing: the record is still the writer's to answer for.
+    expect(writer.metrics().retainedRecordCount).toBe(1);
+
+    expect(writer.enqueue(createTestFrame({ ingestSeq: 2 })).accepted).toBe(true);
+    await writer.drain();
+    expect(writer.enqueue(createTestFrame({ ingestSeq: 3 })).accepted).toBe(true);
+    clock.advance(1_000);
+
+    await expect(writer.tick()).rejects.toThrow();
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(["1", "2", "3"]);
+
+    expect(await writer.close()).toBeNull();
+    expect(await listSegmentManifests(fileSystem, DIRECTORY)).toEqual([]);
+    expect(writer.pendingFrames().map((frame) => frame.ingestSeq)).toEqual(["1", "2", "3"]);
+  });
+
+  it("does not hand back records a manifest already names", async () => {
+    // The other half of the same rule: retaining records for accountability
+    // must release them exactly when a manifest claims them, or every clean
+    // close would duplicate.
+    const fileSystem = createMemoryFileSystem();
+    const clock = createManualClock();
+    const writer = await open(fileSystem, clock);
+    for (const frame of createTestFrames(4)) {
+      expect(writer.enqueue(frame).accepted).toBe(true);
+    }
+    await writer.flush();
+    expect(writer.metrics().retainedRecordCount).toBe(4);
+
+    const manifest = await writer.close();
+    expect(manifest?.recordCount).toBe(4);
+    expect(writer.pendingFrames()).toEqual([]);
+    expect(writer.metrics().retainedRecordCount).toBe(0);
+  });
+
+  it("holds maxTotalBytes against a segmentIdFactory that folds in the clock", async () => {
+    // MEDIUM: the reservation measured the factory's id once and cached it with
+    // 64 bytes of slack, but `SegmentIdContext` carries `createdAtMs` and the
+    // factory is called again at open. A time-dependent factory therefore wrote
+    // a much wider header and footer than anything was reserved for.
+    const fileSystem = createMemoryFileSystem();
+    const clock = createManualClock();
+    const cap = 6_000;
+    const writer = await open(fileSystem, clock, {
+      maxTotalBytes: cap,
+      maxSegmentBytes: 100_000,
+      segmentIdFactory: (context) =>
+        `${context.gatewayEpoch}-${String(context.segmentIndex).padStart(6, "0")}-${"a".repeat(
+          Math.min(Math.floor((context.createdAtMs - DEFAULT_TEST_EPOCH_MS) / 40), 500),
+        )}`,
+    });
+
+    let accepted = 0;
+    for (const frame of createTestFrames(20)) {
+      clock.advance(1_000);
+      if (writer.enqueue(frame).accepted) {
+        accepted += 1;
+      }
+    }
+    await writer.drain();
+    await writer.close();
+
+    let onDisk = 0;
+    for (const [path, bytes] of fileSystem.files) {
+      if (path.endsWith(".wal.jsonl")) {
+        onDisk += bytes.length;
+      }
+    }
+    expect(accepted).toBeGreaterThan(0);
+    expect(onDisk).toBeLessThanOrEqual(cap);
+    expect(writer.metrics().capacityRemainingBytes).toBeGreaterThanOrEqual(0);
+  });
+
+  it("refuses a segmentIdFactory whose id is past the documented bound", async () => {
+    // The bound is enforced, not assumed: an id nobody can reserve for is a
+    // configuration error, surfaced rather than charged to the archive.
+    const fileSystem = createMemoryFileSystem();
+    const clock = createManualClock();
+    await expect(
+      open(fileSystem, clock, {
+        segmentIdFactory: (context) => `${context.gatewayEpoch}-${"z".repeat(5_000)}`,
+      }),
+    ).rejects.toBeInstanceOf(WalConfigurationError);
+    expect([...fileSystem.files.keys()].filter((path) => path.endsWith(".wal.jsonl"))).toEqual([]);
+  });
+
+  it("emits no fsync event once a failure has frozen the watermark", async () => {
+    // The premise behind `WalFsyncEvent`: every event describes an fsync that
+    // genuinely advanced the watermark. A frozen watermark means the writer is
+    // already faulted, so no further periodic fsync runs at all — the fault path
+    // uses `syncForFaultClose()`, which reports through `onWriteFault` instead.
+    const fileSystem = failingFileSystem({ failSyncOn: 2 });
+    const clock = createManualClock();
+    const fsyncs: WalFsyncEvent[] = [];
+    const writer = await open(fileSystem, clock, {
+      fsyncByteThreshold: 1,
+      observer: { onFsync: (event) => fsyncs.push(event) },
+    });
+    for (const frame of createTestFrames(2)) {
+      expect(writer.enqueue(frame).accepted).toBe(true);
+    }
+    await expect(writer.drain()).rejects.toThrow();
+    await writer.close();
+
+    // Nothing was ever reported as synced, because nothing ever was: the
+    // header's fsync is issued inside `ActiveSegment.open()` and the only frame
+    // fsync failed.
+    expect(fsyncs.every((event) => event.syncedRecords > 0)).toBe(true);
+    expect(writer.metrics().framesDurable).toBe(0);
+    expect(await listSegmentManifests(fileSystem, DIRECTORY)).toEqual([]);
+  });
+
+  it("validates an injected-factory segment whose id looks like a default ordinal", async () => {
+    // LOW-1: any `<epoch>-<digits>` id was read as a default-factory ordinal, so
+    // an opaque `<epoch>-999999` at `segmentIndex` 0 was rejected as
+    // `MANIFEST_INCONSISTENT`. Provenance is recorded now, and §2's rule holds:
+    // identity is what the header says, never what the name implies.
+    const fileSystem = createMemoryFileSystem();
+    const clock = createManualClock();
+    const writer = await open(fileSystem, clock, {
+      segmentIdFactory: (context) => `${context.gatewayEpoch}-${999_999 - context.segmentIndex}`,
+    });
+    for (const frame of createTestFrames(3)) {
+      expect(writer.enqueue(frame).accepted).toBe(true);
+    }
+    const manifest = await writer.close();
+    expect(manifest?.segmentIdKind).toBe("opaque");
+
+    const report = await validateSegment(fileSystem, DIRECTORY, manifest?.segmentId ?? "");
+    expect(report.issues).toEqual([]);
+    expect(report.valid).toBe(true);
   });
 });

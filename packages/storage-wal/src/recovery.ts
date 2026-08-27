@@ -21,6 +21,7 @@ import {
   readSegmentManifest,
   segmentFileName,
   segmentIdFromFileName,
+  segmentIdKindFor,
   writeSegmentManifest,
 } from "./manifest.js";
 import type { WalSegmentManifest } from "./manifest.js";
@@ -167,6 +168,14 @@ export async function recoverSegment(
     gatewayEpoch: scan.header.gatewayEpoch,
     segmentIndex: scan.header.segmentIndex,
     segmentFileName: segmentFileName(segmentId),
+    // Derived from the bytes, never guessed: recovery cannot know which factory
+    // the dead process injected, so it records "default" only when the id is
+    // literally what the default factory would have produced.
+    segmentIdKind: segmentIdKindFor(
+      segmentId,
+      scan.header.gatewayEpoch,
+      scan.header.segmentIndex,
+    ),
     recordCount: scan.recordCount,
     firstIngestSeq: scan.firstIngestSeq,
     lastIngestSeq: scan.lastIngestSeq,
