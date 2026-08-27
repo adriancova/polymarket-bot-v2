@@ -12,6 +12,7 @@
   "scripts": {
     "typecheck": "pnpm -r run typecheck && tsc -p test/tsconfig.json --noEmit",
     "lint": "eslint .",
+    "check:deps": "node tools/check-dependency-direction.mjs",
     "test": "vitest run --config test/vitest.config.ts",
     "test:fault": "pnpm --filter @polymarket-bot/storage-wal test:fault",
     "test:integration": "pnpm --filter @polymarket-bot/storage-postgres test:integration",
