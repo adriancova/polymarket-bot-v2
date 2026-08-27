@@ -2315,6 +2315,306 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
   });
 });
 
+/**
+ * Round 7. `process.mainModule` is a live CommonJS `Module` object when the
+ * process entry point is CommonJS (runtime-verified on Node v24.13.0), and
+ * `require.main` is the *same* object (`require.main === process.mainModule`).
+ * The round-6 handoff disclosed this as follow_up 10 and deliberately left it
+ * open: `capabilityOf` recognised `process` as a carrier (CAP_PROCESS) but did
+ * not recognise its `.mainModule` member as yielding a `Module` capability whose
+ * `.require` is the loader. So `process.mainModule.require("ethers")` scanned
+ * clean in `packages/simulation` — a silent working synchronous module load.
+ *
+ * The fix binds `process.mainModule` and `require.main` into the same
+ * MODULE-object capability the CommonJS `module` global already is, so `.require`
+ * on either is classified exactly like `require(...)`/`module.require(...)`
+ * (round 3): a string/no-substitution-template argument is that specifier fed
+ * through F1-F8/F11, and a computed argument is `F-OPAQUE`. A computed member on
+ * the module object fails closed (round 5), and a bare escape is `F-OPAQUE`
+ * (round 4).
+ *
+ * `process` is a carrier that no escape rule catches, so `process.mainModule`
+ * HAD to be recognised or the load stays silent; `require` is itself a loader
+ * capability, so an *unresolved* `require.main` was already an escape finding and
+ * resolving it only makes the finding the precise specifier classification.
+ *
+ * Base behaviour on `900b299` was measured per probe. Seven spellings exited 0
+ * (silent) in packages that run no impure-global rule (`packages/simulation`,
+ * `packages/ledger`). In `packages/domain`/a strategy the incidental `process`
+ * read was already flagged, but the module LOAD itself (the signer/built-in the
+ * follow_up is about) was unclassified; the fix classifies it as a *second*
+ * finding. `require.main.require(...)` was an `F-OPAQUE` escape and is now the
+ * precise F-row.
+ *
+ * THE LEDGER NUANCE, stated so a reviewer is not surprised: `packages/ledger`'s
+ * only forbidden-specifier rule is F4 (importing a strategy). It is *permitted*
+ * to import a signer such as `ethers`, so `process.mainModule.require("ethers")`
+ * in the ledger is clean — exactly as plain `require("ethers")` is. The ledger
+ * regression therefore exercises the routes the ledger *does* forbid: the F4
+ * strategy-import route and the `F-OPAQUE` computed/escape routes.
+ */
+describe("dependency-direction check — round-7 mainModule-loader regressions", () => {
+  const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
+  const simulationFile = "packages/simulation/src/probe.ts";
+  const ledgerFile = "packages/ledger/src/probe.ts";
+  const domainFile = "packages/domain/src/probe.ts";
+  const strategyPackageName = "@polymarket-bot/strategy-static-bracket";
+
+  describe("`process.mainModule.require(...)` is a require-load, closing follow_up 10", () => {
+    it("closes the review's `process.mainModule.require(\"ethers\")` in simulation (.cjs)", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { "packages/simulation/src/probe.cjs": 'exports.signer = process.mainModule.require("ethers");\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.cjs:1");
+    });
+
+    it("closes the same load in a `.ts` compiled to CommonJS", () => {
+      const run = runChecker(
+        buildFixture({ files: { [simulationFile]: 'export const signer = process.mainModule.require("ethers");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+      expect(run.output).toContain("src/probe.ts:1");
+    });
+
+    it("classifies the signer load in a strategy as F3 (beside the incidental `process` read)", () => {
+      const run = runChecker(
+        buildFixture({ files: { [strategyFile]: 'export const signer = process.mainModule.require("ethers");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      // The `ethers` signing-library load is now named — it was unclassified on
+      // `900b299`, where only the incidental `process`-global read flagged.
+      expect(run.output).toContain("imports `ethers` (signing library)");
+      expect(run.output).toContain("process global (`process.*`)");
+    });
+
+    it("classifies the built-in load in packages/domain as F2 (beside the F1 `process` read)", () => {
+      const run = runChecker(
+        buildFixture({ files: { [domainFile]: 'export const fs = process.mainModule.require("node:fs");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("imports Node built-in `node:fs`");
+      expect(run.output).toContain("FAIL [F2]");
+    });
+  });
+
+  describe("`require.main` is the same `Module` object", () => {
+    it("reads `require.main.require(\"node:fs\")` in a strategy as the precise F3 (was an escape)", () => {
+      const run = runChecker(
+        buildFixture({ files: { [strategyFile]: 'export const fs = require.main.require("node:fs");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+  });
+
+  describe("the whole carrier chain resolves", () => {
+    it("resolves `globalThis.process.mainModule.require(\"ethers\")` in simulation", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [simulationFile]: 'export const signer = globalThis.process.mainModule.require("ethers");\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+    });
+
+    it("follows a tracked `const p = process; p.mainModule.require(\"ethers\")`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: ["const p = process;", 'export const signer = p.mainModule.require("ethers");'].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("follows a `const { mainModule } = process` destructure", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: ["const { mainModule } = process;", 'export const signer = mainModule.require("ethers");'].join(
+              "\n",
+            ),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("follows an aliased `const m = process.mainModule; m.require(\"ethers\")`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: ["const m = process.mainModule;", 'export const signer = m.require("ethers");'].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+  });
+
+  describe("computed forms fail closed", () => {
+    it("reports a computed `process.mainModule.require(x)` specifier as F-OPAQUE", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: ["declare const x: string;", "export const mod = process.mainModule.require(x);"].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("calls `require()` whose specifier is a non-literal expression");
+    });
+
+    it("reports a computed member `process.mainModule[\"req\"+\"uire\"](\"node:fs\")` as fail-closed", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [simulationFile]: 'export const fs = process.mainModule["req" + "uire"]("node:fs");\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("is read with a computed member expression");
+      expect(run.output).toContain("a CommonJS `Module` object");
+    });
+
+    it("reports `process.mainModule` escaping into a call argument as F-OPAQUE", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: ["declare function wire(mod: unknown): void;", "export const done = wire(process.mainModule);"].join(
+              "\n",
+            ),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("a CommonJS `Module` object");
+      expect(run.output).toContain("escapes into a call argument");
+    });
+  });
+
+  describe("the ledger forbids the routes it forbids, and no more", () => {
+    it("closes the F4 strategy-import route through `process.mainModule.require(...)`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [ledgerFile]: `export const strat = process.mainModule.require("${strategyPackageName}");\n` },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F4]");
+      expect(run.output).toContain("imports strategy implementation `packages/strategies/static-bracket`");
+    });
+
+    it("closes the same F4 route through `require.main.require(...)`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [ledgerFile]: `export const strat = require.main.require("${strategyPackageName}");\n` },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F4]");
+    });
+
+    it("reports a computed `process.mainModule.require(x)` in the ledger as F-OPAQUE", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [ledgerFile]: ["declare const x: string;", "export const mod = process.mainModule.require(x);"].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("packages/ledger");
+    });
+
+    it("leaves `process.mainModule.require(\"ethers\")` in the ledger clean — the ledger may import a signer (F4 is its only specifier rule)", () => {
+      const run = runChecker(
+        buildFixture({ files: { [ledgerFile]: 'export const signer = process.mainModule.require("ethers");\n' } }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+
+  describe("self-audit: the other ambient module-graph routes remain findings", () => {
+    it("keeps `module.parent.require(...)` an F-OPAQUE escape (bare `module` is a loader capability)", () => {
+      const run = runChecker(
+        buildFixture({ files: { [simulationFile]: 'export const signer = module.parent.require("ethers");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("a CommonJS `Module` object");
+    });
+
+    it("keeps `module.children[0].require(...)` an F-OPAQUE escape", () => {
+      const run = runChecker(
+        buildFixture({ files: { [simulationFile]: 'export const signer = module.children[0].require("ethers");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+    });
+  });
+
+  describe("negatives: the new branch adds no noise outside its scope", () => {
+    it("leaves `process.mainModule` alone in an unrestricted package", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "apps/ops-cli/src/probe.ts": [
+              'export const signer = process.mainModule.require("ethers");',
+              "export const mod = process.mainModule;",
+              "export const main = require.main;",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("leaves a legitimately-named local `mainModule` that is not process's alone", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "const mainModule = { require: (_m: string): unknown => undefined };",
+              'export const value = mainModule.require("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("keeps this repository passing", () => {
+      const run = runChecker(buildFixture());
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+});
+
 describe("dependency-direction check CLI", () => {
   it("prints usage and exits 0 for --help", () => {
     const result = spawnSync(process.execPath, [checkerPath, "--help"], { encoding: "utf8", cwd: repoRoot });

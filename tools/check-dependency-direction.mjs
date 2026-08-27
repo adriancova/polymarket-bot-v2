@@ -43,8 +43,9 @@
  *   - `F-CLOSED` — the §6 fail-closed bullets (classification/mirror).
  *   - `F-OPAQUE` — a construct that makes F1–F8/F11 unevaluable inside a
  *     purity-restricted package: a dynamic `import()`, a `require`-capability
- *     call (bare, aliased, `module.require`, or reflected) or a
- *     `process.getBuiltinModule(...)` call whose specifier is not a static
+ *     call (bare, aliased, `module.require`, `process.mainModule.require`,
+ *     `require.main.require`, or reflected) or a `process.getBuiltinModule(...)`
+ *     call whose specifier is not a static
  *     literal (an interpolated template, a variable, a concatenation, an array
  *     passed to `.apply`), a reference to `eval`/`Function`, a read of the
  *     `constructor` property (round 6 — see "the evaluator surface" below), a
@@ -112,6 +113,34 @@
  *     escape (`packages/ledger` and `packages/simulation` legitimately read the
  *     environment; only `packages/domain` and `packages/strategies/**` are under
  *     the impure-global rules).
+ *   - **`process.mainModule` and `require.main` are `Module`-object loaders**
+ *     (WP-015 review round 7). Under a CommonJS entry point (runtime-verified on
+ *     Node v24.13.0) `process.mainModule` is a live `Module` and
+ *     `require.main === process.mainModule`, so `.require(...)` on either loads a
+ *     module and its specifier is classified exactly like an import's
+ *     (`process.mainModule.require("ethers")` in `packages/simulation` is F5); a
+ *     computed argument is `F-OPAQUE`. Each is bound to the same `CAP_MODULE`
+ *     capability the CommonJS `module` global is, so the existing `.require`
+ *     resolution (round 3) and the computed-member (round 5) and escape (round 4)
+ *     rules follow. Recognised through `process.mainModule`,
+ *     `globalThis.process.mainModule`, a tracked `process` alias `.mainModule`, a
+ *     `const { mainModule } = process` destructure, `require.main`, and aliases
+ *     of any of those. `process` is a carrier no escape rule catches, so
+ *     `process.mainModule` HAD to be recognised or the load stayed silent (it did
+ *     on `900b299`); `require` is itself a loader capability, so an *unresolved*
+ *     `require.main` was already an escape finding and resolving it only makes the
+ *     finding the precise F-row. The neighbouring module-graph reads
+ *     `module.parent` and `module.children[i]` are **not** resolved into
+ *     capabilities: `module` is itself a loader capability, so `module.parent.require(...)`
+ *     is already caught by the escape rule below (the bare `module` escapes into a
+ *     `.parent`/`.children` read), and resolving them would extend the recognised
+ *     set further for no safety gain. `import.meta` is ESM and offers no
+ *     synchronous require — `import.meta.resolve` resolves a specifier to a URL
+ *     without loading it, and `import.meta` is already an environment-global
+ *     finding in `packages/domain`/`packages/strategies/**`; any actual load needs
+ *     a dynamic `import(<computed>)`, which is `F-OPAQUE`. `process.binding`/
+ *     `process._linkedBinding` are live but internal/deprecated Node APIs, out of
+ *     scope as internal APIs (the round-6 NOTE stands; see the KNOWN LIMIT below).
  *   - **A computed member read on a capability fails closed** (round 5). When
  *     the object of an element access resolves to a capability and the member is
  *     not a literal — `getBuiltinModule("node:module")["create" + "Require"]`,
@@ -136,9 +165,10 @@
  *       In a purity-restricted package, ANY reference to a loader capability
  *       that is not in a position this check analyses is ITSELF a finding.
  *
- *     A "loader capability" is the ambient `require`, the CommonJS `module`
- *     global, `createRequire` (which manufactures one), the result of calling
- *     it, `process.getBuiltinModule`, the `node:module` namespace (round 5), and
+ *     A "loader capability" is the ambient `require`, a CommonJS `Module` object
+ *     (the `module` global, and `process.mainModule`/`require.main` — round 7),
+ *     `createRequire` (which manufactures a `require`), the result of calling it,
+ *     `process.getBuiltinModule`, the `node:module` namespace (round 5), and
  *     any alias this check tracks to one of those. The positions that do
  *     *not* additionally flag — because the check follows the value through them
  *     — are exactly: the callee of an analyzed call (which yields a specifier or
@@ -236,13 +266,16 @@
  * KNOWN LIMIT — **every catalogue in this file is a list, not a proof.** The
  * loader family (`LOADER_CAPABILITIES`), the evaluator surface (`EVALUATORS` +
  * `EVALUATOR_PROPERTY`) and the library catalogues below all enumerate what this
- * check *recognises*. Review rounds 3, 4, 5 and 6 each found exactly one missing
- * member — the `require` family, unconsumed capability references,
- * `process.getBuiltinModule`, and `.constructor` — and the honest reading is that
- * the list is still assumed incomplete. Rules stated over a recognised list are
- * total only over what they recognise. See `docs/handoffs/WP-015.md` follow_up 8
- * for the positive form (a checker total over "no call whose callee resolves to a
- * declared import") that would end the pattern.
+ * check *recognises*. Review rounds 3, 4, 5, 6 and 7 each found exactly one
+ * missing member — the `require` family, unconsumed capability references,
+ * `process.getBuiltinModule`, `.constructor`, and `process.mainModule`/
+ * `require.main` — and the honest reading is that the list is still assumed
+ * incomplete: this is now five consecutive rounds of "add the one member the last
+ * round missed". Rules stated over a recognised list are total only over what
+ * they recognise. See `docs/handoffs/WP-015.md` follow_up 8 for the positive form
+ * (a checker total over "no call whose callee resolves to a declared import") that
+ * would end the pattern; it needs `docs/contracts/**` and so is the contract
+ * owner's, not this package's.
  *
  * KNOWN LIMIT — the library catalogues below (`REDIS_CLIENTS`,
  * `DATABASE_CLIENTS`, `VENUE_SDKS`, `SIGNER_LIBRARIES`, `NETWORK_LIBRARIES`,
@@ -525,6 +558,9 @@ const EVALUATOR_PROPERTY = "constructor";
  * the contract's F-rows reach).
  */
 const CAP_REQUIRE = "require-loader";
+// A CommonJS `Module` object, whose `.require` is the loader: the `module`
+// global, and (round 7) `process.mainModule` / `require.main`, which are the
+// same live `Module` under a CommonJS entry point.
 const CAP_MODULE = "module-global";
 const CAP_FACTORY = "createRequire-factory";
 const CAP_BUILTIN_LOADER = "getBuiltinModule-loader";
@@ -534,7 +570,10 @@ const CAP_PROCESS = "process-global";
 /** How each capability is named in an escape finding. */
 const CAPABILITY_LABELS = new Map([
   [CAP_REQUIRE, "the CommonJS `require` capability"],
-  [CAP_MODULE, "the CommonJS `module` global (from which `module.require` is reachable)"],
+  [
+    CAP_MODULE,
+    "a CommonJS `Module` object (`module`, `process.mainModule`, or `require.main` — from which `.require` is reachable)",
+  ],
   [CAP_FACTORY, "`createRequire`, which manufactures a CommonJS `require`"],
   [CAP_BUILTIN_LOADER, "`process.getBuiltinModule`, which loads any Node built-in by name"],
   [CAP_MODULE_NS, "the `node:module` namespace (from which `createRequire` is reachable)"],
@@ -567,12 +606,23 @@ const LOADER_CALL_LABELS = new Map([
 /**
  * Which member of a capability-bearing object is itself a capability, for
  * destructuring (`const { require: r } = module`,
- * `const { getBuiltinModule } = process`). Member access spells the same thing
- * and is resolved by `capabilityOf`.
+ * `const { getBuiltinModule } = process`, `const { mainModule } = process`).
+ * Member access spells the same thing and is resolved by `capabilityOf`.
  */
 const DESTRUCTURED_CAPABILITY_MEMBERS = new Map([
   [CAP_MODULE, new Map([["require", CAP_REQUIRE]])],
-  [CAP_PROCESS, new Map([["getBuiltinModule", CAP_BUILTIN_LOADER]])],
+  [
+    CAP_PROCESS,
+    new Map([
+      ["getBuiltinModule", CAP_BUILTIN_LOADER],
+      // `process.mainModule` is the live CommonJS `Module` object under a CJS
+      // entry point, so `const { mainModule } = process` binds that module,
+      // whose `.require` is the loader (WP-015 review round 7). Without this,
+      // the destructure binds a *genuine* local `mainModule` that shadows the
+      // carrier, and `mainModule.require(...)` resolves to `null` in silence.
+      ["mainModule", CAP_MODULE],
+    ]),
+  ],
   [CAP_MODULE_NS, new Map([["createRequire", CAP_FACTORY]])],
 ]);
 
@@ -1512,6 +1562,19 @@ function scanSourceFile(ts, rootDir, fileRel) {
       // `globalThis.process` / `window["process"]` is the same carrier as a bare
       // `process`, and a tracked alias (`const p = process`) already resolves.
       if (member === "process" && isEnvironmentRoot) return CAP_PROCESS;
+      // `process.mainModule` is the live CommonJS `Module` object under a CJS
+      // entry point (runtime-verified on Node v24.13.0), and `require.main` is
+      // the *same* object (`require.main === process.mainModule`). Either yields
+      // a MODULE-object capability whose `.require` is the loader (WP-015 review
+      // round 7); the `rootKind === CAP_MODULE` branch below then resolves that
+      // `.require` exactly like `module.require` (round 3). `process` is a
+      // carrier that no escape rule catches, so `process.mainModule` MUST be
+      // recognised here or `process.mainModule.require("ethers")` scans clean;
+      // `require` is itself a loader capability, so an *unresolved* `require.main`
+      // is already an escape finding — resolving it only makes the finding the
+      // precise specifier classification the contract's F-rows use.
+      if (member === "mainModule" && rootKind === CAP_PROCESS) return CAP_MODULE;
+      if (member === "main" && rootKind === CAP_REQUIRE) return CAP_MODULE;
       if (member !== "require") return null;
       if (rootKind === CAP_MODULE) return CAP_REQUIRE;
       // `globalThis.require` / `window["require"]` reaches the same ambient
