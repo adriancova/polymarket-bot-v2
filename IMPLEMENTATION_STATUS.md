@@ -26,7 +26,7 @@ Maximum permitted run mode: `PAPER`
 | `WP-015`               | Complete | `WP-030` ✓         | Merged `d77b2ba` (impl chain `bb441dc`→…→`b2b3b9b`, 10 review rounds) |
 | `WP-040`               | Complete | All ✓             | Merged `d23bb67` (impl chain `0a73ffe`→…→`f8982bf`, 5 review rounds) |
 | `WP-050`               | Complete | All ✓             | Merged `8a607ec` (impl chain `32cb0a8`→`3c2228a`→`a972e96`→`3f35a0c`→`b3a906f`→`22db770`, 4 review rounds) |
-| `WP-060`               | Ready (authorized, next — last of batch 1A) | All ✓ | Unassigned — packet not yet written; add workplan lockfile/handoff comments first |
+| `WP-060`               | IN_PROGRESS (authorized — last of batch 1A) | All ✓ | Packet dispatched 2026-08-27 to `wp-implementer` (Opus); workplan lockfile/handoff ratification comments added 2026-08-27 |
 | `WP-070`, `WP-080`, `WP-090` | Ready (Wave 1 batch 1B — after 1A per runbook) | All ✓ | Unassigned |
 | `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |

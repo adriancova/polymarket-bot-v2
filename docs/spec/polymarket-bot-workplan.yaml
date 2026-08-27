@@ -297,6 +297,11 @@ work_packages:
     allowed_paths:
       - packages/event-bus/**
       - test/integration/event-bus/**
+      # Ratified 2026-08-27 (WP-020/WP-040/WP-050 precedent): mechanical lockfile
+      # update from this package's declared dependencies only; and the in-repo
+      # structured handoff for pre-merge review.
+      - pnpm-lock.yaml
+      - docs/handoffs/WP-060.md
     forbidden_paths:
       - packages/domain/**
       - apps/data-gateway/**
