@@ -24,7 +24,7 @@ Maximum permitted run mode: `PAPER`
 | `WP-020`               | Complete | `WP-010` ✓         | Merged `25bc451` (impl chain `815b6cb`→`9790e0a`→`8d9596e`) |
 | `WP-030`               | Complete | `WP-000` ✓, `WP-020` ✓ | Merged `59cf254` (impl chain `051bb62`→`1e30ff1`→`66d29a9`→`21a3370`) |
 | `WP-015`               | In remediation (round 5) | `WP-030` ✓ | `wp-implementer` on branch `worktree-agent-a2a6f707d957e8153`. Chain: `c668493`→`c9b59b2`→`7de62d0`→`6658026`→`a87f26c` (r4: total reference rule — all seven r4 escapes + globalThis.require closed, verified). Round 5 (`a87f26c`): **CHANGES REQUIRED** — 1 high: `process.getBuiltinModule("node:module")["create"+"Require"](__filename)` in simulation is a runtime-verified silent F5 bypass (getBuiltinModule never entered the loader family; computed member access returns null capability). All other probes/negatives/totality checks RESOLVED (9 fresh probes flagged correctly). Round-5 remediation dispatched 2026-08-26: getBuiltinModule joins the loader-capability family; computed access on capability-bearing objects fails closed. |
-| `WP-040`               | In remediation (round 5) | All ✓ | `wp-implementer` on branch `worktree-agent-aa6e4c6fd7701b054`. Chain: `0a73ffe`→r1 `f439e55`→r2 `65d9622`/`8be5e5c`→r3 `964c6e4`/`43dbe04` (market CHECK for order/fill-linked ledger rows; SIGNED requires its attempt — both r3 items verified closed in round 4). Round 4 (`43dbe04`): **CHANGES REQUIRED** — 1 high (wallet-operation ledger links market-unbound: NULL/wrong market commits against a market-bearing wallet op; `wallet_operations_immutable_identity` omits market_id so it is later mutable; R19 wallet position ruled unsound — conditional equality required), 1 medium (`netByAsset` filters the header account but sums all entry legs — returns 0/nothing for a valid A→B transfer; must aggregate on entry account), 1 note (D17 numbering skip). R18 sound; R19 otherwise complete; F16/F17 accurate. Remediation round 5 dispatched 2026-08-26. |
+| `WP-040`               | Complete | All ✓             | Merged `d23bb67` (impl chain `0a73ffe`→…→`f8982bf`, 5 review rounds) |
 | `WP-050`               | Complete | All ✓             | Merged `8a607ec` (impl chain `32cb0a8`→`3c2228a`→`a972e96`→`3f35a0c`→`b3a906f`→`22db770`, 4 review rounds) |
 | `WP-060`               | Ready (authorized, Wave 1 batch 1A) | All ✓ | Unassigned — start after a 1A merge slot frees |
 | `WP-070`, `WP-080`, `WP-090` | Ready (Wave 1 batch 1B — after 1A per runbook) | All ✓ | Unassigned |
@@ -35,6 +35,37 @@ Maximum permitted run mode: `PAPER`
 Authorization vocabulary: "Ready (authorized)" rows are the only packages agents
 may begin in the current run; "Dependency-ready" rows must not start until this
 table says otherwise.
+
+### WP-040 completion record (2026-08-26)
+
+- Implemented by `wp-implementer` (Opus) on branch `worktree-agent-aa6e4c6fd7701b054`,
+  base `b1431e4`; chain `0a73ffe` (initial) → `7d8e94d` (handoff) → `49d065c`
+  (orchestrator D1: testcontainers build-script denial in pnpm-workspace.yaml,
+  disclosed) → r1 `f439e55`/`c287413` → r2 `65d9622`/`8be5e5c` → r3
+  `964c6e4`/`43dbe04` → r4 `ca5d603`/`f8982bf`; merged `d23bb67` under the
+  standing delegation.
+- Reviews (fresh Codex per round): r1 4H/4M/2L, r2 4H/2M, r3 1H/1M, r4 1H/1M/1N
+  — every bypass reproduced on the reviewed schema before fixing — r5 **ACCEPT**
+  (zero findings above NOTE; binding-class sweep run twice and closed).
+- As merged: 57 tables across six schemas + internal/migrations; §10.7
+  constraints database-enforced and adversarially probed (immutable balance
+  identity keyed to reservation facts; forward-only fencing leases with an
+  un-lowerable per-realm token high-water; account_key sentinel binding fills to
+  orders; ledger discriminators bound to order/fill/wallet-operation facts incl.
+  conditional wallet-market equality via PMB12; SIGNED requires its attempt per
+  §9.11; decimal-safe JSON incl. model_outputs; NULLS NOT DISTINCT venue
+  identity; uuid_v7 variant check); Kysely typed repositories; advisory-locked
+  checksum-verified migration runner (up+down verified).
+- Obligations recorded for consumers: F13/F16-F20 (WP-200: carry the market on
+  ledger postings; resolve wallet-operation market before insert; net positions
+  from ledger_entries.account_ref; attempt row before SIGNED order — WP-320
+  same); R9-R21 risk register accurate and owned.
+- Post-merge on `main` at `d23bb67`: lockfile regenerated (two benign vitest
+  peer-key rewrites from the WP-050/WP-040 merge union; frozen install verified);
+  1441 root + 89 fault + 208 integration tests green; root `test:integration`
+  and `db:migrate` wired to the package (WP-010 placeholders replaced) and the
+  CI step renamed to the real suite; `db:migrate` proven end-to-end against the
+  compose dev DB (all 8 migrations applied then status-verified; torn down).
 
 ### WP-050 completion record (2026-08-26)
 

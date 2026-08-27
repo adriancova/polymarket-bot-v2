@@ -45,7 +45,7 @@ jobs:
       - name: Dependency vulnerability scan (pnpm lockfile)
         run: pnpm audit --audit-level high
 
-      - name: Integration tests (explicit skip placeholder until WP-040+)
+      - name: PostgreSQL integration tests (Testcontainers)
         run: pnpm test:integration
 
   compose:
