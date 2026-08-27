@@ -46,11 +46,12 @@
  *     call (bare, aliased, `module.require`, or reflected) or a
  *     `process.getBuiltinModule(...)` call whose specifier is not a static
  *     literal (an interpolated template, a variable, a concatenation, an array
- *     passed to `.apply`), a reference to `eval`/`Function`, a **loader
- *     capability that escapes** into a value this check cannot follow (WP-015
- *     review round 4; see "the capability escape rule" below), or a **computed
- *     member read on a capability** (round 5). Each defeats static checking
- *     entirely, so inside `packages/domain`, `packages/strategies/**`,
+ *     passed to `.apply`), a reference to `eval`/`Function`, a read of the
+ *     `constructor` property (round 6 — see "the evaluator surface" below), a
+ *     **loader capability that escapes** into a value this check cannot follow
+ *     (WP-015 review round 4; see "the capability escape rule" below), or a
+ *     **computed member read on a capability** (round 5). Each defeats static
+ *     checking entirely, so inside `packages/domain`, `packages/strategies/**`,
  *     `packages/ledger`, and `packages/simulation` it is itself a finding rather
  *     than a silent pass. Elsewhere it is allowed (composition roots
  *     legitimately load modules by name); see `docs/handoffs/WP-015.md` for that
@@ -164,6 +165,31 @@
  *     capability handed in from another package is invisible), which is why
  *     round 5's `process.getBuiltinModule` gap mattered — an unrecognised loader
  *     is not a reference the rule can be total over.
+ *   - **The evaluator surface** (WP-015 review round 6). Until round 6 this was
+ *     an identifier list — `eval` and `Function` — which meant the *indirect*
+ *     acquisition of the same capability was silent and ran:
+ *
+ *       (function () {}).constructor('return process.getBuiltinModule("node:fs")')()
+ *       queueMicrotask.constructor('…createRequire…')()
+ *
+ *     both exit 0 in `packages/simulation`, `packages/ledger`, `packages/domain`
+ *     and a strategy, and both are arbitrary code evaluation (runtime-verified
+ *     on Node 24). For every function `f`, `f.constructor === Function`; whether
+ *     an arbitrary expression is function-valued is not statically decidable, so
+ *     the rule fails **closed** and takes no non-function exemption:
+ *
+ *       In a purity-restricted package, a member read whose property resolves to
+ *       `constructor` is ITSELF an evaluator-acquisition finding.
+ *
+ *     "Resolves to" folds the computed spellings — `f["constructor"]`,
+ *     `f["constr" + "uctor"]`, ``f[`constr${"uctor"}`]``, and
+ *     `const k = "constructor"; f[k]` — and the destructures
+ *     `const { constructor } = f` / `const { constructor: F } = f` /
+ *     `const { ["constructor"]: F } = f`. `[].constructor` is `Array`, not
+ *     `Function`, and is flagged anyway: see `EVALUATOR_PROPERTY` for why the
+ *     exemption is refused. *Declaring* a `constructor` member
+ *     (`class C { constructor() {} }`, `{ constructor: f }`) is not a read and is
+ *     untouched; the rule does not run in unrestricted packages (`apps/**`).
  *   - **Impure globals** in `packages/domain` (F1) and `packages/strategies/**`
  *     (F3/F11), detected by *identifier reference* rather than by call
  *     spelling. See `GLOBAL_ROOTS` below for the exact semantics.
@@ -198,6 +224,25 @@
  *     string index) are resolved to a reference to global `X`, so
  *     `window.Date()` is the same finding as `Date()`; the environment root
  *     itself is additionally reported.
+ *   - **A property name computed at run time is not resolved.** The round-6
+ *     evaluator rule folds literals, `+` concatenations, template literals and
+ *     file-level string constants, but nothing more: `f[parts.join("")]` reaches
+ *     `constructor` and this check cannot see it. Fixing that by flagging *every*
+ *     dynamic-key read would contradict the accepted round-5 ruling that
+ *     `table[key]` on a non-capability object adds no noise, so it is disclosed
+ *     rather than closed. The durable fix is the positive rule in
+ *     `docs/handoffs/WP-015.md` follow_up 8, not another recognised spelling.
+ *
+ * KNOWN LIMIT — **every catalogue in this file is a list, not a proof.** The
+ * loader family (`LOADER_CAPABILITIES`), the evaluator surface (`EVALUATORS` +
+ * `EVALUATOR_PROPERTY`) and the library catalogues below all enumerate what this
+ * check *recognises*. Review rounds 3, 4, 5 and 6 each found exactly one missing
+ * member — the `require` family, unconsumed capability references,
+ * `process.getBuiltinModule`, and `.constructor` — and the honest reading is that
+ * the list is still assumed incomplete. Rules stated over a recognised list are
+ * total only over what they recognise. See `docs/handoffs/WP-015.md` follow_up 8
+ * for the positive form (a checker total over "no call whose callee resolves to a
+ * declared import") that would end the pattern.
  *
  * KNOWN LIMIT — the library catalogues below (`REDIS_CLIENTS`,
  * `DATABASE_CLIENTS`, `VENUE_SDKS`, `SIGNER_LIBRARIES`, `NETWORK_LIBRARIES`,
@@ -429,8 +474,41 @@ const CRYPTO_RANDOM_MEMBERS = new Set([
  * them inside a purity-restricted package is `F-OPAQUE` for the same reason a
  * computed `import()` specifier is: whatever they evaluate is unevaluable by
  * F1-F8/F11.
+ *
+ * This is an identifier list, and until round 6 it was the *whole* evaluator
+ * surface — which is why `EVALUATOR_PROPERTY` exists below.
  */
 const EVALUATORS = new Set(["eval", "Function"]);
+
+/**
+ * The property that hands out the `Function` constructor without ever naming
+ * it (WP-015 review round 6). For **any** function-valued expression `f`,
+ * `f.constructor === Function`, so
+ *
+ *   (function () {}).constructor('return process.getBuiltinModule("node:fs")')()
+ *   queueMicrotask.constructor('return process.getBuiltinModule("node:module")' +
+ *                              '.createRequire(process.argv[1])')()
+ *
+ * are arbitrary code evaluation and a reconstituted `require` respectively —
+ * both runtime-verified on Node 24, and both silent (exit 0) in every
+ * purity-restricted package before this rule existed, because `EVALUATORS`
+ * matched only identifiers literally spelled `eval`/`Function`.
+ *
+ * Deciding "is this expression function-valued" is undecidable without a type
+ * checker (and would still be undecidable with one, across `any`/`unknown`), so
+ * the rule fails **closed** and takes no non-function exemption: a member read
+ * whose property resolves to `constructor`, anywhere in a purity-restricted
+ * package, is an `F-OPAQUE` evaluator-acquisition finding. `[].constructor` is
+ * `Array` and not an evaluator, and it is still flagged — deliberately, because
+ * the exemption that would clear it is exactly the kind of recognised-shape list
+ * that rounds 3–6 each found a hole in, and because `[].constructor.constructor`
+ * *is* `Function` anyway. See `docs/handoffs/WP-015.md` for the boundary.
+ *
+ * What the boundary intentionally leaves clean: *declaring* a member named
+ * `constructor` (`class C { constructor() {} }`, `{ constructor: f }` as an
+ * object-literal key) is a declaration, not a read, and is untouched.
+ */
+const EVALUATOR_PROPERTY = "constructor";
 
 /**
  * The shapes in which a package can hold, or reach, a module-loading
@@ -1294,6 +1372,88 @@ function scanSourceFile(ts, rootDir, fileRel) {
     return null;
   };
 
+  /**
+   * Names this file binds to a statically foldable string, filled by a pre-pass
+   * in document order (so `const a = "constr"; const k = a + "uctor";` resolves)
+   * and used only by the round-6 evaluator-acquisition rule. Scoping is
+   * deliberately ignored: the map is file-wide, so a shadowed name can only make
+   * the rule *more* eager, never silent — and a restricted package that declares
+   * a constant whose value is `"constructor"` is the smell the rule is looking
+   * for.
+   */
+  const constantStrings = new Map();
+
+  /**
+   * The string an expression statically denotes, or `null`. Folds string and
+   * no-substitution-template literals, `+` concatenation, template literals
+   * whose every span folds, and identifiers in `constantStrings`. This is what
+   * stops `f["constr" + "uctor"]` and `const k = "constructor"; f[k]` from
+   * walking around the rule; a key computed at run time still cannot be folded
+   * and is a disclosed limit (see the header's KNOWN LIMIT on the evaluator
+   * surface).
+   */
+  const foldString = (expr, depth = 0) => {
+    if (!expr || depth > 8) return null;
+    const inner = unwrapExpression(expr);
+    if (!inner) return null;
+    if (ts.isStringLiteralLike(inner)) return inner.text;
+    if (ts.isIdentifier(inner)) {
+      const value = constantStrings.get(inner.text);
+      return value === undefined ? null : value;
+    }
+    if (ts.isBinaryExpression(inner) && inner.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = foldString(inner.left, depth + 1);
+      if (left === null) return null;
+      const right = foldString(inner.right, depth + 1);
+      return right === null ? null : left + right;
+    }
+    if (ts.isTemplateExpression(inner)) {
+      let folded = inner.head.text;
+      for (const span of inner.templateSpans) {
+        const value = foldString(span.expression, depth + 1);
+        if (value === null) return null;
+        folded += value + span.literal.text;
+      }
+      return folded;
+    }
+    return null;
+  };
+
+  const collectConstantStrings = (node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      const value = foldString(node.initializer);
+      if (value !== null) constantStrings.set(node.name.text, value);
+    }
+    ts.forEachChild(node, collectConstantStrings);
+  };
+
+  /**
+   * The property name a member access reads, folding the computed forms
+   * `staticMemberName` deliberately does not (it must keep returning `null` for
+   * a computed access so the round-5 fail-closed rule still fires on
+   * `capability["create" + "Require"]`).
+   */
+  const resolvedMemberName = (node) => {
+    const direct = staticMemberName(node);
+    if (direct !== null) return direct;
+    if (ts.isElementAccessExpression(node)) return foldString(node.argumentExpression);
+    return null;
+  };
+
+  /**
+   * The property a binding element reads off its object, including the computed
+   * form `const { ["constructor"]: F } = fn`. Kept separate from
+   * `bindingPropertyName` so the capability-destructure logic is untouched.
+   */
+  const destructuredPropertyName = (element) => {
+    const property = element.propertyName;
+    if (property === undefined) return ts.isIdentifier(element.name) ? element.name.text : null;
+    if (ts.isIdentifier(property)) return property.text;
+    if (ts.isStringLiteralLike(property)) return property.text;
+    if (ts.isComputedPropertyName(property)) return foldString(property.expression);
+    return null;
+  };
+
   /** True when a specifier names Node's `module` built-in, whose namespace holds `createRequire`. */
   const isModuleNamespaceSpecifier = (argument) =>
     Boolean(argument) && ts.isStringLiteralLike(argument) && normalizeBuiltin(argument.text) === "module";
@@ -1736,6 +1896,16 @@ function scanSourceFile(ts, rootDir, fileRel) {
   };
 
   /**
+   * `f.constructor` / `f["constructor"]` / `const { constructor } = f` — the
+   * `Function` constructor acquired without naming it (WP-015 review round 6).
+   * See `EVALUATOR_PROPERTY` for why this fails closed on every object rather
+   * than trying to prove the object is not a function.
+   */
+  const recordEvaluatorAcquisition = (node, shape) => {
+    opaque.push({ call: "evaluator-acquisition", form: shape, line: lineOf(node) });
+  };
+
+  /**
    * `eval(...)` and `Function(...)`/`new Function(...)` evaluate code this
    * checker cannot read, which makes F1-F8/F11 unevaluable for whatever they
    * evaluate — the same fault `F-OPAQUE` already names for a computed
@@ -1797,6 +1967,25 @@ function scanSourceFile(ts, rootDir, fileRel) {
       return;
     }
 
+    // WP-015 review round 6 — indirect acquisition of the `Function`
+    // constructor. Reading `constructor` off any function-valued expression
+    // yields `Function`, so this is evaluator acquisition and is reported
+    // wherever the property name resolves, fail-closed on the object's type.
+    // The finding is emitted only inside a purity-restricted package (see the
+    // `F-OPAQUE` block in `runCheck`).
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      if (resolvedMemberName(node) === EVALUATOR_PROPERTY) {
+        recordEvaluatorAcquisition(
+          node,
+          ts.isPropertyAccessExpression(node)
+            ? "the `constructor` property (`.constructor`)"
+            : "the `constructor` property (a `[...]` member read that resolves to `constructor`)",
+        );
+      }
+    } else if (ts.isBindingElement(node) && destructuredPropertyName(node) === EVALUATOR_PROPERTY) {
+      recordEvaluatorAcquisition(node, "the `constructor` property (a `{ constructor }` destructure)");
+    }
+
     // WP-015 review round 4 — the capability escape rule. Every expression that
     // denotes a require capability is checked here, in the same reference layer
     // that detects `Date`/`process`, so a capability which leaves the positions
@@ -1809,8 +1998,14 @@ function scanSourceFile(ts, rootDir, fileRel) {
         : ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isCallExpression(node)
     ) {
       // WP-015 review round 5 — a computed member read on a capability-bearing
-      // object fails closed rather than resolving to `null`.
-      if (ts.isElementAccessExpression(node) && staticMemberName(node) === null) {
+      // object fails closed rather than resolving to `null`. A key that folds to
+      // `constructor` is reported by the round-6 rule just above instead, so the
+      // construct still yields exactly one finding.
+      if (
+        ts.isElementAccessExpression(node) &&
+        staticMemberName(node) === null &&
+        resolvedMemberName(node) !== EVALUATOR_PROPERTY
+      ) {
         const objectKind = capabilityOf(node.expression);
         if (objectKind !== null) recordComputedCapabilityAccess(node, objectKind);
       }
@@ -1890,6 +2085,9 @@ function scanSourceFile(ts, rootDir, fileRel) {
     scopes.pop();
   };
 
+  // Document-order pre-pass, so the round-6 rule can fold a computed member key
+  // that is spelled through a constant (`const k = "constructor"; f[k](...)`).
+  collectConstantStrings(sourceFile);
   visit(sourceFile);
 
   // A file the parser could not read is a coverage hole, not a clean file: the
@@ -1920,6 +2118,72 @@ function violation(entry) {
     fix: entry.fix ?? null,
     location: entry.location ?? null,
   };
+}
+
+/**
+ * The `F-OPAQUE` sentence for one scanner hit. A lookup rather than a ternary
+ * chain: round 6 added the sixth kind, and the chain had stopped being readable.
+ */
+const OPAQUE_MESSAGES = new Map([
+  [
+    "evaluator",
+    (hit, dir) =>
+      `references ${hit.form}, which evaluates code no static check can read; in \`${dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it evaluates`,
+  ],
+  [
+    "evaluator-acquisition",
+    (hit, dir) =>
+      `reads ${hit.form}; on any function-valued expression that property IS the \`Function\` constructor, so \`x.constructor("…")()\` evaluates arbitrary code and can reconstitute \`require\` — whether the object is a function is not statically decidable, so this fails closed and in \`${dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it evaluates`,
+  ],
+  [
+    "capability",
+    (hit, dir) =>
+      `${hit.form}; from there it can load any module by name, so in \`${dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it loads — and a purity-restricted package has no legitimate use of a module loader`,
+  ],
+  [
+    "capability-computed",
+    (hit, dir) =>
+      `${hit.form}; a computed member on a module-loading capability is exactly how \`createRequire\` is reached without ever naming it, so in \`${dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it loads`,
+  ],
+  [
+    "require",
+    (hit, dir) =>
+      `calls \`require()\` whose specifier is ${hit.form}; in \`${dir}\` the required module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
+  ],
+  [
+    "getBuiltinModule",
+    (hit, dir) =>
+      `calls \`process.getBuiltinModule()\` whose specifier is ${hit.form}; it loads a Node built-in by name, so in \`${dir}\` that name must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
+  ],
+]);
+
+const OPAQUE_FIXES = new Map([
+  [
+    "capability",
+    "delete the reference; a package under F1/F2/F3 loads no module at run time, and receives every capability it needs as a constructor/StrategyContext argument",
+  ],
+  [
+    "capability-computed",
+    "name the member statically — or, better, delete the reference: a package under F1/F2/F3 loads no module at run time",
+  ],
+  [
+    "evaluator-acquisition",
+    "delete the reference; a purity-restricted package has no reason to read `.constructor` (declaring a `constructor` member on a class or object literal is untouched by this rule)",
+  ],
+]);
+
+function opaqueMessage(hit, packageDir) {
+  const render = OPAQUE_MESSAGES.get(hit.call);
+  return render
+    ? render(hit, packageDir)
+    : `uses a dynamic \`import()\` whose specifier is ${hit.form}; in \`${packageDir}\` the imported module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`;
+}
+
+function opaqueFix(hit) {
+  return (
+    OPAQUE_FIXES.get(hit.call) ??
+    "import the module statically, or receive the capability through StrategyContext/a constructor argument"
+  );
 }
 
 function findCycles(nodes, edges) {
@@ -2401,25 +2665,9 @@ function runCheck(rootDir) {
             rule: "F-OPAQUE",
             subject: pkg.dir,
             location: `${fileRel}:${hit.line}`,
-            message:
-              hit.call === "evaluator"
-                ? `references ${hit.form}, which evaluates code no static check can read; in \`${pkg.dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it evaluates`
-                : hit.call === "capability"
-                  ? `${hit.form}; from there it can load any module by name, so in \`${pkg.dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it loads — and a purity-restricted package has no legitimate use of a module loader`
-                  : hit.call === "capability-computed"
-                    ? `${hit.form}; a computed member on a module-loading capability is exactly how \`createRequire\` is reached without ever naming it, so in \`${pkg.dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it loads`
-                    : hit.call === "require"
-                      ? `calls \`require()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the required module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`
-                      : hit.call === "getBuiltinModule"
-                        ? `calls \`process.getBuiltinModule()\` whose specifier is ${hit.form}; it loads a Node built-in by name, so in \`${pkg.dir}\` that name must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`
-                        : `uses a dynamic \`import()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the imported module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
+            message: opaqueMessage(hit, pkg.dir),
             doc: `${CONTRACT_REL} §6 rule 3; ADR-005 §1`,
-            fix:
-              hit.call === "capability"
-                ? "delete the reference; a package under F1/F2/F3 loads no module at run time, and receives every capability it needs as a constructor/StrategyContext argument"
-                : hit.call === "capability-computed"
-                  ? "name the member statically — or, better, delete the reference: a package under F1/F2/F3 loads no module at run time"
-                  : "import the module statically, or receive the capability through StrategyContext/a constructor argument",
+            fix: opaqueFix(hit),
           });
         }
       }
@@ -2472,7 +2720,8 @@ function formatReport(result, rootDir) {
   if (result.violations.length === 0) {
     lines.push("PASS: no cycle (F9), no upward edge (F12), no unlisted same-layer edge (F13),");
     lines.push("      no forbidden import specifier or impure global (F1-F8, F11), no opaque");
-    lines.push("      import()/require() in a restricted package, every workspace package classified.");
+    lines.push("      import()/require() and no evaluator (eval/Function/.constructor) in a");
+    lines.push("      restricted package, every workspace package classified.");
     return `${lines.join("\n")}\n`;
   }
 
@@ -2516,10 +2765,11 @@ Enforces docs/contracts/dependency-direction.md §6:
   F12/F13   no upward edge; same-layer edges only when listed in §2.1
   F1-F8,F11 no forbidden import specifier or non-deterministic global
   F-CLOSED  §6 fail-closed: unclassified package, or §2 entry with no manifest
-  F-OPAQUE  no dynamic import()/require() with a non-static specifier, and no
-            require capability escaping into a value the check cannot follow, in
-            a package whose purity is constrained (domain, strategies, ledger,
-            simulation)
+  F-OPAQUE  no dynamic import()/require() with a non-static specifier, no
+            require capability escaping into a value the check cannot follow, and
+            no evaluator — eval/Function, or the .constructor property that hands
+            out the Function constructor — in a package whose purity is
+            constrained (domain, strategies, ledger, simulation)
 The §2 layer table and the §2.1 allowlist are parsed from the contract and
 validated eagerly; an unparseable or inconsistent row is a CHK error, not a
 skipped row. Source is parsed with the TypeScript compiler API (a root

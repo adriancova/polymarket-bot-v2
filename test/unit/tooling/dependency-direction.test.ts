@@ -91,6 +91,15 @@ function runCheckerJson(root: string): CheckerJson {
   return JSON.parse(run.stdout) as CheckerJson;
 }
 
+/**
+ * `file:line` for every violation whose message contains `needle`. Used where a
+ * test needs to assert the exact *set* of findings a construct produces, not
+ * just that one of them appeared.
+ */
+function locationsMatching(report: CheckerJson, needle: string): (string | null)[] {
+  return report.violations.filter((entry) => entry.message.includes(needle)).map((entry) => entry.location);
+}
+
 interface Mutations {
   /** Extra workspace dependencies: package directory → dependency name → specifier. */
   readonly addDependencies?: Readonly<Record<string, Readonly<Record<string, string>>>>;
@@ -1896,6 +1905,412 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.status).toBe(1);
       expect(run.output).toContain("FAIL [F3]");
       expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+  });
+});
+
+/**
+ * Round 6. The evaluator surface was an identifier list — `eval` and `Function`
+ * — so acquiring the very same capability through the `constructor` property was
+ * silent AND ran. Both of these exit 0 on `a187ccf` in every purity-restricted
+ * package, and both are arbitrary code evaluation (runtime-verified on Node 24,
+ * v24.13.0):
+ *
+ *   (function () {}).constructor('return process.getBuiltinModule("node:fs")')()
+ *   queueMicrotask.constructor('return process.getBuiltinModule("node:module")' +
+ *                              '.createRequire(process.argv[1])')()
+ *
+ * The fix treats a member read whose property resolves to `constructor` as
+ * evaluator acquisition inside a purity-restricted package, failing CLOSED on
+ * the object's type because "is this expression function-valued" is not
+ * statically decidable.
+ *
+ * THE BOUNDARY, stated so a reviewer can disagree with it deliberately:
+ *   - Every read is flagged, with no non-function exemption. `[].constructor` is
+ *     `Array` and is flagged anyway — the exemption that would clear it is the
+ *     same recognised-shape list that rounds 3-6 each found a hole in, and
+ *     `[].constructor.constructor` is `Function` regardless.
+ *   - *Declaring* a `constructor` member (`class C { constructor() {} }`,
+ *     `{ constructor: f }` as an object-literal key) is not a read and stays
+ *     clean; this is what keeps `packages/domain/src/errors.ts` passing.
+ *   - The rule does not run in unrestricted packages (`apps/**`).
+ *   - A property name computed at run time (`f[parts.join("")]`) is not folded
+ *     and is a disclosed limit, not a closed one — see the checker header.
+ *
+ * Every probe below was reproduced as a silent pass (exit 0) on `a187ccf` before
+ * the fix, except the ones labelled as pre-existing behaviour or as negatives.
+ */
+describe("dependency-direction check — round-6 evaluator-acquisition regressions", () => {
+  const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
+  const simulationFile = "packages/simulation/src/probe.ts";
+  const ledgerFile = "packages/ledger/src/probe.ts";
+  const domainFile = "packages/domain/src/probe.ts";
+
+  const acquisitionMessage = "on any function-valued expression that property IS the `Function` constructor";
+
+  describe("acquiring the `Function` constructor through `.constructor` fails closed", () => {
+    it("closes the review's `(function(){}).constructor(...)()` in simulation", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]:
+              'export const fs = (function () {}).constructor(\'return process.getBuiltinModule("node:fs")\')();\n',
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("packages/simulation");
+      expect(run.output).toContain("reads the `constructor` property (`.constructor`)");
+      expect(run.output).toContain(acquisitionMessage);
+      expect(run.output).toContain("src/probe.ts:1");
+    });
+
+    it("closes `queueMicrotask.constructor(...)()`, which reconstitutes `require`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "declare const queueMicrotask: { constructor: (src: string) => () => (m: string) => unknown };",
+              "export const signer = queueMicrotask.constructor(",
+              "  'return process.getBuiltinModule(\"node:module\").createRequire(process.argv[1])',",
+              ")()('ethers');",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("reads the `constructor` property");
+      expect(run.output).toContain("can reconstitute `require`");
+    });
+
+    it("closes `constructor(\"return require\")()` in a strategy", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const noop = (): void => {};",
+              "const F = (noop as never as { constructor: (src: string) => () => (m: string) => unknown }).constructor;",
+              "export const signer = F('return require')()('ethers');",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("packages/strategies/static-bracket");
+      expect(run.output).toContain("reads the `constructor` property");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("closes the computed `x[\"constructor\"](...)()` spelling in the ledger", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [ledgerFile]: [
+              "declare const x: Record<string, (src: string) => () => unknown>;",
+              "export const out = x['constructor']('return process.getBuiltinModule(\"node:fs\")')();",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("packages/ledger");
+      expect(run.output).toContain("a `[...]` member read that resolves to `constructor`");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("closes a bare acquisition (no call) in packages/domain", () => {
+      const run = runChecker(
+        buildFixture({ files: { [domainFile]: "export const F = (function () {}).constructor;\n" } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("packages/domain");
+      expect(run.output).toContain("reads the `constructor` property");
+    });
+
+    it("flags `[].constructor` too — the boundary refuses a non-function exemption", () => {
+      // `[].constructor` is `Array`, not `Function`. It is flagged anyway: this
+      // pins the deliberate fail-closed choice so a reviewer can argue with it
+      // rather than discover it. `(() => {}).constructor` IS `Function`.
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: ["export const A = [].constructor;", "export const F = (() => {}).constructor;"].join(
+              "\n",
+            ),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [simulationFile]: ["export const A = [].constructor;", "export const F = (() => {}).constructor;"].join(
+              "\n",
+            ),
+          },
+        }),
+      );
+      const acquisitions = report.violations.filter((entry) => entry.message.includes(acquisitionMessage));
+      expect(acquisitions).toHaveLength(2);
+      expect(acquisitions.map((entry) => entry.location)).toEqual([
+        `${simulationFile}:1`,
+        `${simulationFile}:2`,
+      ]);
+    });
+  });
+
+  describe("the property name is resolved, not matched literally", () => {
+    it("folds a literal concatenation: `f['constr' + 'uctor']`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "declare const f: Record<string, (src: string) => () => unknown>;",
+              "export const out = f['constr' + 'uctor']('return 1')();",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("a `[...]` member read that resolves to `constructor`");
+    });
+
+    it("folds a file-level string constant: `const k = 'constructor'; f[k]`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const k = 'constructor';",
+              "declare const f: Record<string, (src: string) => () => unknown>;",
+              "export const out = f[k]('return 1')();",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("a `[...]` member read that resolves to `constructor`");
+      expect(run.output).toContain("src/probe.ts:3");
+    });
+
+    it("folds a template literal whose every span is constant", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [domainFile]: ["declare const f: Record<string, unknown>;", "export const out = f[`constr${'uctor'}`];"].join("\n") },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("a `[...]` member read that resolves to `constructor`");
+    });
+
+    it("reads the destructured spellings", () => {
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [ledgerFile]: [
+              "declare const fn: { constructor: (src: string) => () => unknown };",
+              "const { constructor: A } = fn;",
+              "const { ['constructor']: B } = fn;",
+              "export const out = [A, B];",
+            ].join("\n"),
+            [simulationFile]: [
+              "declare const fn: { constructor: (src: string) => () => unknown };",
+              "const { constructor } = fn;",
+              "export const out = constructor;",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(locationsMatching(report, acquisitionMessage)).toEqual([
+        `${ledgerFile}:2`,
+        `${ledgerFile}:3`,
+        `${simulationFile}:2`,
+      ]);
+    });
+
+    it("reports the construct exactly once when it is also a computed capability read", () => {
+      // `const k = "constructor"; require[k]` would fire the round-5
+      // computed-capability rule as well; the round-6 finding is the more
+      // specific one, so the round-5 rule stands down and there is one finding.
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [strategyFile]: ["const k = 'constructor';", "export const F = (require as never)[k];"].join("\n"),
+          },
+        }),
+      );
+      const opaque = report.violations.filter((entry) => entry.rule === "F-OPAQUE");
+      expect(opaque).toHaveLength(1);
+      expect(opaque[0]?.message).toContain(acquisitionMessage);
+      expect(opaque[0]?.message).not.toContain("is read with a computed member expression");
+    });
+  });
+
+  describe("the direct evaluator identifiers still flag (pre-existing behaviour)", () => {
+    it("keeps `eval(...)`, `Function(...)` and `new Function(...)` findings", () => {
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "export const a = (src: string) => eval(src);",
+              "export const b = (src: string) => new Function(src);",
+              "export const c = (src: string) => Function(src);",
+            ].join("\n"),
+          },
+        }),
+      );
+      const evaluators = report.violations.filter((entry) =>
+        entry.message.includes("evaluates code no static check can read"),
+      );
+      expect(evaluators.map((entry) => entry.location)).toEqual([
+        `${simulationFile}:1`,
+        `${simulationFile}:2`,
+        `${simulationFile}:3`,
+      ]);
+    });
+  });
+
+  describe("negatives: the rule stays inside its boundary", () => {
+    it("leaves every `.constructor` spelling alone in an unrestricted package", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "apps/ops-cli/src/probe.ts": [
+              "const k = 'constructor';",
+              "declare const f: Record<string, unknown>;",
+              "export const a = (function () {}).constructor;",
+              "export const b = [].constructor;",
+              "export const c = f['constructor'];",
+              "export const d = f[k];",
+              "const { constructor: E } = f as never as { constructor: unknown };",
+              "export const e = E;",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("leaves `constructor` DECLARATIONS alone in restricted packages", () => {
+      // This is what keeps the shipping `packages/domain/src/errors.ts` clean:
+      // it declares seven class constructors and reads none.
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [domainFile]: [
+              "export class Boom extends Error {",
+              "  public constructor(message: string) {",
+              "    super(message);",
+              "  }",
+              "}",
+              "export const shape = { constructor: 1 };",
+            ].join("\n"),
+            [ledgerFile]: [
+              "export class Entry {",
+              "  public constructor(public readonly id: string) {}",
+              "}",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("keeps the round-5 computed-access negatives clean", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const table: Record<string, number> = { a: 1 };",
+              "export function pick(key: string): number | undefined {",
+              "  return table[key];",
+              "}",
+            ].join("\n"),
+            [simulationFile]: [
+              "const rows: Record<string, string> = {};",
+              "export const first = [1, 2, 3][Number('0')];",
+              "export function row(key: string): string | undefined {",
+              "  return rows[key];",
+              "}",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("does not read a type position as a value", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [domainFile]: [
+              "interface Shape {",
+              "  readonly id: string;",
+              "}",
+              "export type Id = Shape['id'];",
+              "export type Ctor = Record<string, unknown>['constructor'];",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("keeps this repository passing", () => {
+      const run = runChecker(repoRoot);
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+
+  describe("the noise the refused exemption lands on future package owners", () => {
+    it("flags ordinary reflective idioms, and pins that the trade is visible", () => {
+      // `this.constructor.name` and `v.constructor === Object` load nothing and
+      // evaluate nothing. They fail the gate anyway, because the object's type
+      // is exactly what this rule refuses to guess. Pinned here so `WP-220` and
+      // later owners meet the trade in a test rather than in CI, and so a
+      // reviewer who thinks it is the wrong call has something concrete to
+      // point at (`docs/handoffs/WP-015.md` known_risks 10).
+      const report = runCheckerJson(
+        buildFixture({
+          files: {
+            [ledgerFile]: [
+              "export class Entry {",
+              "  public label(): string {",
+              "    return this.constructor.name;",
+              "  }",
+              "}",
+              "export const isPlain = (v: object): boolean => v.constructor === Object;",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(locationsMatching(report, acquisitionMessage)).toEqual([`${ledgerFile}:3`, `${ledgerFile}:6`]);
+    });
+
+    it("keeps the documented replacements clean", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [ledgerFile]: [
+              "export class Foo {}",
+              "export const tag = (v: unknown): string => Object.prototype.toString.call(v);",
+              "export const isFoo = (v: unknown): boolean => v instanceof Foo;",
+              "export const kind = (v: { kind: string }): string => v.kind;",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
     });
   });
 });
