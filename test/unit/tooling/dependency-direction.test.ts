@@ -1555,6 +1555,351 @@ describe("dependency-direction check — round-4 capability-escape regressions",
   });
 });
 
+/**
+ * Round 5. `process.getBuiltinModule` is a module loader that never entered the
+ * require-family machinery, and `capabilityOf` resolved a *computed* member read
+ * to `null`. Composed, the two let a purity-restricted package acquire a working
+ * `require` in silence:
+ *
+ *   const cr = process.getBuiltinModule("node:module")["create" + "Require"](__filename);
+ *   cr("ethers");
+ *
+ * The fix binds `getBuiltinModule` into the same specifier machinery as an
+ * import, and makes a computed member read on any capability-bearing expression
+ * fail closed. Every probe here was reproduced on `a87f26c` (exit 0) first,
+ * except where noted as a pre-existing behaviour re-asserted as a regression.
+ */
+describe("dependency-direction check — round-5 builtin-loader regressions", () => {
+  const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
+  const simulationFile = "packages/simulation/src/probe.ts";
+
+  describe("a computed member read on a capability fails closed", () => {
+    it("closes the review's `getBuiltinModule(...)[\"create\"+\"Require\"]` acquisition", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/simulation/src/probe.cjs": [
+              'const cr = process.getBuiltinModule("node:module")["create" + "Require"](__filename);',
+              'exports.signer = cr("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("the `node:module` namespace");
+      expect(run.output).toContain("is read with a computed member expression");
+      expect(run.output).toContain("src/probe.cjs:1");
+    });
+
+    it("closes the same acquisition through `require(\"node:module\")`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/simulation/src/probe.cjs": [
+              'const cr = require("node:module")["create" + "Require"](__filename);',
+              'exports.signer = cr("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("is read with a computed member expression");
+    });
+
+    it("closes it through a namespace import of `node:module`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'import * as m from "node:module";',
+              'const cr = m["create" + "Require"](__filename);',
+              'export const signer = cr("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("the `node:module` namespace");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("closes it through `await import(\"node:module\")`", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "export async function load(): Promise<unknown> {",
+              '  const m = await import("node:module");',
+              '  return m["create" + "Require"](__filename)("ethers");',
+              "}",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("is read with a computed member expression");
+    });
+
+    it("closes a computed member on the `process` carrier itself", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'const key = "getBuiltin" + "Module";',
+              "export const loader = (process as never)[key];",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("the `process` global");
+      expect(run.output).toContain("src/probe.ts:2");
+    });
+
+    it("reports a computed member on `require` itself", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: ["declare const k: string;", "export const anything = (require as never)[k];"].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("the CommonJS `require` capability");
+      expect(run.output).toContain("is read with a computed member expression");
+    });
+  });
+
+  describe("`process.getBuiltinModule` is classified exactly like an import", () => {
+    it("reports `process.getBuiltinModule(\"node:fs\")` in a strategy as F3", () => {
+      const run = runChecker(
+        buildFixture({ files: { [strategyFile]: 'export const fs = process.getBuiltinModule("node:fs");\n' } }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+      expect(run.output).toContain("src/probe.ts:1");
+    });
+
+    it("reports a computed `getBuiltinModule` specifier as F-OPAQUE", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: ["declare const target: string;", "export const mod = process.getBuiltinModule(target);"].join(
+              "\n",
+            ),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("calls `process.getBuiltinModule()` whose specifier is a non-literal expression");
+    });
+
+    it("reads the whole static `getBuiltinModule(...).createRequire(...)` chain", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]:
+              'export const signer = process.getBuiltinModule("node:module").createRequire(__filename)("ethers");\n',
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).toContain("live signer surface");
+    });
+
+    it("follows a `const g = process.getBuiltinModule` alias without reporting an escape", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "const g = process.getBuiltinModule;",
+              'export const signer = g("node:module").createRequire(__filename)("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+      expect(run.output).not.toContain("F-OPAQUE");
+    });
+
+    it("follows a `const { getBuiltinModule } = process` destructure", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "const { getBuiltinModule } = process;",
+              'export const signer = getBuiltinModule("node:module").createRequire(__filename)("ethers");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F5]");
+    });
+
+    it("resolves `globalThis.process.getBuiltinModule` in a package that runs no globals rule", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "packages/ledger/src/probe.ts": [
+              'const cr = globalThis.process.getBuiltinModule("node:module")["create" + "Require"](__filename);',
+              'export const anything = cr("node:fs");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("packages/ledger");
+    });
+
+    it("reads `process.getBuiltinModule.call(thisArg, specifier)` reflection", () => {
+      const run = runChecker(
+        buildFixture({
+          files: { [strategyFile]: 'export const fs = process.getBuiltinModule.call(null, "node:fs");\n' },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+
+    it("reports the builtin loader escaping into a call argument", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "declare function wire(load: unknown): void;",
+              "export const done = wire(process.getBuiltinModule);",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F-OPAQUE]");
+      expect(run.output).toContain("`process.getBuiltinModule`, which loads any Node built-in by name");
+      expect(run.output).toContain("escapes into a call argument");
+    });
+  });
+
+  describe("negatives: the new rules add no noise outside their scope", () => {
+    it("leaves `process.getBuiltinModule` alone in an unrestricted package", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            "apps/ops-cli/src/probe.ts": [
+              'export const fs = process.getBuiltinModule("node:fs");',
+              "export const loader = process.getBuiltinModule;",
+              "declare const k: string;",
+              "export const anything = (process as never)[k];",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("leaves computed access on ordinary objects alone", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const table: Record<string, number> = { a: 1 };",
+              "export function pick(key: string): number | undefined {",
+              "  return table[key];",
+              "}",
+            ].join("\n"),
+            [simulationFile]: [
+              "const rows: Record<string, string> = {};",
+              "export const first = [1, 2, 3][Number(\"0\")];",
+              "export function row(key: string): string | undefined {",
+              "  return rows[key];",
+              "}",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("keeps `process` itself a carrier, not a loader, where no globals rule runs", () => {
+      // packages/simulation and packages/ledger are not fully purity-restricted:
+      // the contract's F5/F4 rows constrain what they *load*, not whether they
+      // may read the environment. Making `process` a capability must therefore
+      // not turn an ordinary `process.env` read into a finding.
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              'export const mode = process.env.RUN_MODE ?? "PAPER";',
+              "export const argv = process.argv.slice(2);",
+              "export function stop(code: number): void {",
+              "  process.exit(code);",
+              "}",
+            ].join("\n"),
+            "packages/ledger/src/probe.ts": [
+              "const p = process;",
+              'export const mode = p.env.RUN_MODE ?? "PAPER";',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("lets a genuine local named `process` shadow the carrier", () => {
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [simulationFile]: [
+              "export function run(process: { table: Record<string, string> }, key: string): string | undefined {",
+              "  return process.table[key];",
+              "}",
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+
+    it("is deliberately noisy for an unrelated member named `getBuiltinModule`", () => {
+      // The same disclosure round 3 made for `createRequire`: the member is
+      // matched by name without the shadow test, because the ordinary ways to
+      // hold the loader (`const { getBuiltinModule } = process`, an imported
+      // `node:process`) all bind genuine declarations. The cost is a finding on
+      // an unrelated member of that name — noisy, never silent — and this test
+      // pins it so the trade is visible rather than discovered later.
+      const run = runChecker(
+        buildFixture({
+          files: {
+            [strategyFile]: [
+              "const api = { getBuiltinModule: (name: string) => name };",
+              'export const named = api.getBuiltinModule("node:fs");',
+            ].join("\n"),
+          },
+        }),
+      );
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F3]");
+      expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
+    });
+  });
+});
+
 describe("dependency-direction check CLI", () => {
   it("prints usage and exits 0 for --help", () => {
     const result = spawnSync(process.execPath, [checkerPath, "--help"], { encoding: "utf8", cwd: repoRoot });

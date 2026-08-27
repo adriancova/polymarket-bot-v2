@@ -42,17 +42,19 @@
  * Two non-contract rule ids appear in output alongside F1–F13:
  *   - `F-CLOSED` — the §6 fail-closed bullets (classification/mirror).
  *   - `F-OPAQUE` — a construct that makes F1–F8/F11 unevaluable inside a
- *     purity-restricted package: a dynamic `import()` or a `require`-capability
- *     call (bare, aliased, `module.require`, or reflected) whose specifier is
- *     not a static literal (an interpolated template, a variable, a
- *     concatenation, an array passed to `.apply`), a reference to
- *     `eval`/`Function`, or a **require capability that escapes** into a value
- *     this check cannot follow (WP-015 review round 4; see "the capability
- *     escape rule" below). Each defeats static checking entirely, so inside
- *     `packages/domain`, `packages/strategies/**`, `packages/ledger`, and
- *     `packages/simulation` it is itself a finding rather than a silent pass.
- *     Elsewhere it is allowed (composition roots legitimately load modules by
- *     name); see `docs/handoffs/WP-015.md` for that trade-off.
+ *     purity-restricted package: a dynamic `import()`, a `require`-capability
+ *     call (bare, aliased, `module.require`, or reflected) or a
+ *     `process.getBuiltinModule(...)` call whose specifier is not a static
+ *     literal (an interpolated template, a variable, a concatenation, an array
+ *     passed to `.apply`), a reference to `eval`/`Function`, a **loader
+ *     capability that escapes** into a value this check cannot follow (WP-015
+ *     review round 4; see "the capability escape rule" below), or a **computed
+ *     member read on a capability** (round 5). Each defeats static checking
+ *     entirely, so inside `packages/domain`, `packages/strategies/**`,
+ *     `packages/ledger`, and `packages/simulation` it is itself a finding rather
+ *     than a silent pass. Elsewhere it is allowed (composition roots
+ *     legitimately load modules by name); see `docs/handoffs/WP-015.md` for that
+ *     trade-off.
  *
  * How source is read. Rule 3 uses the **TypeScript compiler API**
  * (`ts.createSourceFile` + a full AST walk); there is no regular expression
@@ -68,10 +70,10 @@
  *   - **Module specifiers** (exact, position-independent): `ImportDeclaration`
  *     and `ExportDeclaration` module specifiers (so `export * from "x"` counts),
  *     `import x = require("x")` external module references, `import("x")` type
- *     nodes, dynamic `import(...)`, and any call that resolves to the CommonJS
- *     `require` *capability* (see below). A string literal or a no-substitution
- *     template literal is a specifier; anything else is `F-OPAQUE` in a
- *     purity-restricted package.
+ *     nodes, dynamic `import(...)`, and any call that resolves to a module
+ *     *loader capability* — the CommonJS `require` or `process.getBuiltinModule`
+ *     (see below). A string literal or a no-substitution template literal is a
+ *     specifier; anything else is `F-OPAQUE` in a purity-restricted package.
  *   - **The `require` capability, tracked like an impure global** (WP-015 review
  *     round 3). Recognising `require` only as the bare identifier callee let a
  *     restricted package reach forbidden modules through aliases and wrappers,
@@ -93,8 +95,33 @@
  *     destructured non-module binding) still shadows, and a *method* call such
  *     as `registry.require(eventType, version)` is not a module load because its
  *     callee is a property access on an object that is not the module global.
- *   - **The capability escape rule** (WP-015 review round 4). The list above
- *     enumerates the positions in which this check can *read* what a capability
+ *   - **`process.getBuiltinModule` is a loader too** (WP-015 review round 5).
+ *     It returns a Node built-in namespace by name, so a call to it is a module
+ *     load and its specifier is classified exactly like an import's
+ *     (`getBuiltinModule("node:fs")` in a strategy is F3); a computed argument is
+ *     `F-OPAQUE`. It is recognised through `process.getBuiltinModule`,
+ *     `globalThis.process.getBuiltinModule`, a tracked `process` alias, a
+ *     `const { getBuiltinModule } = process` destructure, and `.call`/`.apply`
+ *     reflection. `getBuiltinModule("node:module")` — like `require("node:module")`,
+ *     a namespace import of it, or `await import("node:module")` — yields the
+ *     module namespace whose `.createRequire` member is the factory, so the whole
+ *     chain back to a working `require` is one capability expression.
+ *     `process` itself is a **carrier**, not a loader: it is resolved so the
+ *     loader can be found through it, but a bare `process` reference is not an
+ *     escape (`packages/ledger` and `packages/simulation` legitimately read the
+ *     environment; only `packages/domain` and `packages/strategies/**` are under
+ *     the impure-global rules).
+ *   - **A computed member read on a capability fails closed** (round 5). When
+ *     the object of an element access resolves to a capability and the member is
+ *     not a literal — `getBuiltinModule("node:module")["create" + "Require"]`,
+ *     `process[key]`, `require[k]` — the member cannot be classified, so the
+ *     access itself is `F-OPAQUE` rather than `null`. That composition (an
+ *     unrecognised loader plus a computed member) is what silently produced a
+ *     working `require` in `packages/simulation` before round 5. A computed
+ *     member on a NON-capability object is out of scope and adds no noise.
+ *   - **The capability escape rule** (WP-015 review round 4, widened in round 5
+ *     to every loader capability above). The list of analysed positions
+ *     enumerates the places in which this check can *read* what a capability
  *     loads. Enumerating positions is not a total rule, and round 4 found seven
  *     legal spellings that reached a module while naming none of them:
  *     `({ r: require }).r("node:fs")`, `[require][0](...)`,
@@ -105,19 +132,22 @@
  *     made total by construction, in the same identifier-reference layer that
  *     already detects `Date`/`process`:
  *
- *       In a purity-restricted package, ANY reference to a require capability
+ *       In a purity-restricted package, ANY reference to a loader capability
  *       that is not in a position this check analyses is ITSELF a finding.
  *
- *     A "require capability" is the ambient `require`, the CommonJS `module`
+ *     A "loader capability" is the ambient `require`, the CommonJS `module`
  *     global, `createRequire` (which manufactures one), the result of calling
- *     it, and any alias this check tracks to one of those. The positions that do
+ *     it, `process.getBuiltinModule`, the `node:module` namespace (round 5), and
+ *     any alias this check tracks to one of those. The positions that do
  *     *not* additionally flag — because the check follows the value through them
  *     — are exactly: the callee of an analyzed call (which yields a specifier or
  *     an `F-OPAQUE`), the `.call`/`.apply` reflection callee, the initializer of
  *     a declaration whose binding the alias tracker follows (the alias is then
  *     tracked, and an *alias* reference that escapes is caught by this same
  *     rule), the base of a larger capability expression (`module` in
- *     `module.require`, `createRequire` in `createRequire(...)`), a `typeof`
+ *     `module.require`, `createRequire` in `createRequire(...)`), the base of a
+ *     computed member read (which the computed-access rule reports at the access
+ *     itself, so the construct yields one finding rather than two), a `typeof`
  *     operand, and a type position (never walked as a value). Everything else —
  *     object/array literal element, assignment right-hand side, call argument,
  *     `.bind`/any other property read, return value, export value — is an
@@ -127,8 +157,13 @@
  *     finding does not prove a forbidden module was loaded, only that the check
  *     can no longer prove one was not. That is the accepted trade
  *     (noisy-never-silent), and it costs nothing in practice because a
- *     purity-restricted package has no legitimate use of `require` at all —
+ *     purity-restricted package has no legitimate use of a module loader at all —
  *     ADR-005 §1 and contract §3 (F1/F2/F3) forbid the I/O it exists to reach.
+ *     The rule is total over the loader references the walk *sees*: it inherits
+ *     the KNOWN LIMITs below (no cross-file resolution, no reachability, a
+ *     capability handed in from another package is invisible), which is why
+ *     round 5's `process.getBuiltinModule` gap mattered — an unrecognised loader
+ *     is not a reference the rule can be total over.
  *   - **Impure globals** in `packages/domain` (F1) and `packages/strategies/**`
  *     (F3/F11), detected by *identifier reference* rather than by call
  *     spelling. See `GLOBAL_ROOTS` below for the exact semantics.
@@ -398,21 +433,69 @@ const CRYPTO_RANDOM_MEMBERS = new Set([
 const EVALUATORS = new Set(["eval", "Function"]);
 
 /**
- * The three shapes in which a package can hold the CommonJS module-loading
+ * The shapes in which a package can hold, or reach, a module-loading
  * capability. `capabilityOf` (below) maps an expression to one of these or to
  * `null`; the escape rule described in this file's header treats a reference to
- * any of them as a finding unless the reference sits in a position the check
- * analyses.
+ * any *loader* capability as a finding unless the reference sits in a position
+ * the check analyses.
+ *
+ * `CAP_PROCESS` is a **carrier**, not a loader: `process` is where
+ * `process.getBuiltinModule` lives, so the check must resolve it, but a bare
+ * `process` reference is not itself a module-loading escape (WP-015 review
+ * round 5 — `packages/ledger` and `packages/simulation` are not fully
+ * purity-restricted and legitimately read `process`; the *loader* member is what
+ * the contract's F-rows reach).
  */
 const CAP_REQUIRE = "require-loader";
 const CAP_MODULE = "module-global";
 const CAP_FACTORY = "createRequire-factory";
+const CAP_BUILTIN_LOADER = "getBuiltinModule-loader";
+const CAP_MODULE_NS = "module-namespace";
+const CAP_PROCESS = "process-global";
 
 /** How each capability is named in an escape finding. */
 const CAPABILITY_LABELS = new Map([
   [CAP_REQUIRE, "the CommonJS `require` capability"],
   [CAP_MODULE, "the CommonJS `module` global (from which `module.require` is reachable)"],
   [CAP_FACTORY, "`createRequire`, which manufactures a CommonJS `require`"],
+  [CAP_BUILTIN_LOADER, "`process.getBuiltinModule`, which loads any Node built-in by name"],
+  [CAP_MODULE_NS, "the `node:module` namespace (from which `createRequire` is reachable)"],
+  [CAP_PROCESS, "the `process` global (from which `process.getBuiltinModule` is reachable)"],
+]);
+
+/**
+ * Capabilities whose *reference* is subject to the escape rule (WP-015 review
+ * round 4, widened in round 5). `CAP_PROCESS` is deliberately absent: see above.
+ */
+const LOADER_CAPABILITIES = new Set([
+  CAP_REQUIRE,
+  CAP_MODULE,
+  CAP_FACTORY,
+  CAP_BUILTIN_LOADER,
+  CAP_MODULE_NS,
+]);
+
+/**
+ * Capabilities that are *called* with a specifier, and the label the finding
+ * uses for that call. Both are classified exactly like an import: a string or
+ * no-substitution template literal argument is an exact specifier fed through
+ * F1–F8/F11, and anything else is `F-OPAQUE` in a purity-restricted package.
+ */
+const LOADER_CALL_LABELS = new Map([
+  [CAP_REQUIRE, "require"],
+  [CAP_BUILTIN_LOADER, "getBuiltinModule"],
+]);
+
+/**
+ * Which member of a capability-bearing object is itself a capability, for
+ * destructuring (`const { require: r } = module`,
+ * `const { getBuiltinModule } = process`). Member access spells the same thing
+ * and is resolved by `capabilityOf`.
+ */
+const DESTRUCTURED_CAPABILITY_MEMBERS = new Map([
+  [CAP_MODULE, new Map([["require", CAP_REQUIRE]])],
+  [CAP_PROCESS, new Map([["getBuiltinModule", CAP_BUILTIN_LOADER]])],
+  [CAP_MODULE_NS, new Map([["createRequire", CAP_FACTORY]])],
 ]);
 
 /**
@@ -1211,17 +1294,23 @@ function scanSourceFile(ts, rootDir, fileRel) {
     return null;
   };
 
+  /** True when a specifier names Node's `module` built-in, whose namespace holds `createRequire`. */
+  const isModuleNamespaceSpecifier = (argument) =>
+    Boolean(argument) && ts.isStringLiteralLike(argument) && normalizeBuiltin(argument.text) === "module";
+
   /**
-   * Which require capability, if any, an expression denotes (see this file's
-   * header). `extraAliases` lets alias hoisting see earlier same-scope aliases,
-   * so a chain (`const a = require; const b = a;`) resolves.
+   * Which capability, if any, an expression denotes (see this file's header).
+   * `extraAliases` lets alias hoisting see earlier same-scope aliases, so a
+   * chain (`const a = require; const b = a;`) resolves.
    *
-   * `createRequire` is matched by name **without** the genuine-shadow test,
-   * because the ordinary way to hold the factory is to import it — and an import
-   * binding is a genuine declaration. Importing `node:module` is already an
-   * F1/F3 finding, so the only cost of the wider match is a possible escape
-   * finding on an unrelated local named `createRequire`, which is the accepted
-   * noisy-never-silent direction.
+   * `createRequire` and `getBuiltinModule` are matched by name **without** the
+   * genuine-shadow test, because the ordinary way to hold either is to import or
+   * destructure it — and both bind genuine declarations
+   * (`import { createRequire } from "node:module"`,
+   * `const { getBuiltinModule } = process`). Importing `node:module` is already
+   * an F1/F3 finding, so the only cost of the wider match is a possible escape
+   * finding on an unrelated local of one of those two names, which is the
+   * accepted noisy-never-silent direction.
    */
   const capabilityOf = (expr, extraAliases) => {
     if (!expr) return null;
@@ -1234,50 +1323,100 @@ function scanSourceFile(ts, rootDir, fileRel) {
       const tracked = trackedAliasKind(name);
       if (tracked !== null) return tracked;
       if (name === "createRequire") return CAP_FACTORY;
+      if (name === "getBuiltinModule") return CAP_BUILTIN_LOADER;
       // A genuine local of that name is a real implementation, not the global.
       if (isGenuinelyDeclared(name)) return null;
       if (name === "require") return CAP_REQUIRE;
       if (name === "module") return CAP_MODULE;
+      // Not a loader; `process.getBuiltinModule` is reached through it.
+      if (name === "process") return CAP_PROCESS;
       return null;
     }
     if (ts.isPropertyAccessExpression(inner) || ts.isElementAccessExpression(inner)) {
       const member = staticMemberName(inner);
+      // A computed member is handled by the caller (`computedCapabilityAccess`),
+      // which fails closed rather than resolving to `null` (review round 5).
       if (member === null) return null;
       // `mod.createRequire` / `mod["createRequire"]` — the namespace form.
       if (member === "createRequire") return CAP_FACTORY;
+      // `process.getBuiltinModule` is a module loader in exactly the sense
+      // `require` is: it returns a Node built-in namespace by name, and
+      // `getBuiltinModule("node:module").createRequire` reconstitutes `require`
+      // itself (review round 5).
+      if (member === "getBuiltinModule") return CAP_BUILTIN_LOADER;
+      const rootKind = capabilityOf(inner.expression, extraAliases);
+      const root = unwrapExpression(inner.expression);
+      const isEnvironmentRoot = Boolean(
+        root && ts.isIdentifier(root) && ENVIRONMENT_ROOTS.has(root.text) && !isGenuinelyDeclared(root.text),
+      );
+      // `globalThis.process` / `window["process"]` is the same carrier as a bare
+      // `process`, and a tracked alias (`const p = process`) already resolves.
+      if (member === "process" && isEnvironmentRoot) return CAP_PROCESS;
       if (member !== "require") return null;
-      if (capabilityOf(inner.expression, extraAliases) === CAP_MODULE) return CAP_REQUIRE;
+      if (rootKind === CAP_MODULE) return CAP_REQUIRE;
       // `globalThis.require` / `window["require"]` reaches the same ambient
       // capability. The root is separately an impure-global finding, but only
       // in `packages/domain` and `packages/strategies/**`; without this branch
       // the identical construct is silent in `packages/ledger` and
       // `packages/simulation`, which run no globals rule.
-      const root = unwrapExpression(inner.expression);
-      if (root && ts.isIdentifier(root) && ENVIRONMENT_ROOTS.has(root.text) && !isGenuinelyDeclared(root.text)) {
-        return CAP_REQUIRE;
+      if (isEnvironmentRoot) return CAP_REQUIRE;
+      return null;
+    }
+    if (ts.isCallExpression(inner)) {
+      // Calling the factory yields the loader: `createRequire(import.meta.url)`.
+      const calleeKind = capabilityOf(inner.expression, extraAliases);
+      if (calleeKind === CAP_FACTORY) return CAP_REQUIRE;
+      // A module load of `node:module` — by `require`, by
+      // `process.getBuiltinModule`, or by dynamic `import()` — yields the
+      // namespace whose `createRequire` member is the factory. Naming it as a
+      // capability is what makes a *computed* member read on it fail closed.
+      const loadsModuleNamespace =
+        (calleeKind === CAP_REQUIRE || calleeKind === CAP_BUILTIN_LOADER) &&
+        isModuleNamespaceSpecifier(inner.arguments[0]);
+      if (loadsModuleNamespace) return CAP_MODULE_NS;
+      // `require.call(thisArg, "node:module")` / `.apply(thisArg, [...])`.
+      if (isLoaderReflection(inner.expression) && isModuleNamespaceSpecifier(inner.arguments[1])) {
+        return CAP_MODULE_NS;
+      }
+      if (
+        inner.expression.kind === ts.SyntaxKind.ImportKeyword &&
+        isModuleNamespaceSpecifier(inner.arguments[0])
+      ) {
+        return CAP_MODULE_NS;
       }
       return null;
     }
-    // Calling the factory yields the loader: `createRequire(import.meta.url)`.
-    if (ts.isCallExpression(inner)) {
-      return capabilityOf(inner.expression, extraAliases) === CAP_FACTORY ? CAP_REQUIRE : null;
-    }
+    // `await import("node:module")` / `(await import("node:module"))`.
+    if (ts.isAwaitExpression(inner)) return capabilityOf(inner.expression, extraAliases);
     return null;
   };
 
-  /** True when `expr` resolves to the `require` loader itself. */
-  const resolvesToRequire = (expr, extraAliases) => capabilityOf(expr, extraAliases) === CAP_REQUIRE;
-
-  /** `require.call(...)` / `require.apply(...)` — reflection over the capability. */
-  const isRequireReflection = (callee) => {
-    if (!ts.isPropertyAccessExpression(callee) && !ts.isElementAccessExpression(callee)) return false;
+  /**
+   * `require.call(...)` / `require.apply(...)` — reflection over a loader
+   * capability. Returns the loader kind being reflected, or `null`.
+   * `process.getBuiltinModule.call(null, "node:fs")` is the same shape and is
+   * read the same way (review round 5).
+   */
+  const reflectedLoaderKind = (callee) => {
+    if (!callee) return null;
+    if (!ts.isPropertyAccessExpression(callee) && !ts.isElementAccessExpression(callee)) return null;
     const member = staticMemberName(callee);
-    if (member !== "call" && member !== "apply") return false;
-    return resolvesToRequire(callee.expression);
+    if (member !== "call" && member !== "apply") return null;
+    const kind = capabilityOf(callee.expression);
+    return LOADER_CALL_LABELS.has(kind) ? kind : null;
+  };
+
+  const isLoaderReflection = (callee) => reflectedLoaderKind(callee) !== null;
+
+  /** The member a binding element reads off its object, or `null`. */
+  const bindingPropertyName = (element) => {
+    const property = element.propertyName ?? element.name;
+    if (ts.isIdentifier(property)) return property.text;
+    return ts.isStringLiteralLike(property) ? property.text : null;
   };
 
   /**
-   * Names a scope binds to the `require` capability, hoisted on scope entry
+   * Names a scope binds to a module-loading capability, hoisted on scope entry
    * *after* the scope's own `scopes`/`genuineScopes` frames are pushed, so a
    * genuine local `require`/`module` in the same scope correctly shadows.
    * Declarations are processed in source order and fed back through
@@ -1289,6 +1428,23 @@ function scanSourceFile(ts, rootDir, fileRel) {
         collectAliasDecls([statement.statement], into);
         continue;
       }
+      // `import * as m from "node:module"` / `import m = require("node:module")`
+      // bind the namespace whose `createRequire` member is the factory. Naming
+      // it makes a *computed* member read on it fail closed (review round 5).
+      if (ts.isImportDeclaration(statement) && statement.importClause) {
+        if (!isModuleNamespaceSpecifier(statement.moduleSpecifier)) continue;
+        const clause = statement.importClause;
+        if (clause.name) into.set(clause.name.text, CAP_MODULE_NS);
+        const bindings = clause.namedBindings;
+        if (bindings && ts.isNamespaceImport(bindings)) into.set(bindings.name.text, CAP_MODULE_NS);
+        continue;
+      }
+      if (ts.isImportEqualsDeclaration(statement) && ts.isExternalModuleReference(statement.moduleReference)) {
+        if (isModuleNamespaceSpecifier(statement.moduleReference.expression) && ts.isIdentifier(statement.name)) {
+          into.set(statement.name.text, CAP_MODULE_NS);
+        }
+        continue;
+      }
       if (!ts.isVariableStatement(statement) || hasDeclareModifier(statement)) continue;
       for (const declaration of statement.declarationList.declarations) {
         if (!declaration.initializer) continue;
@@ -1297,18 +1453,17 @@ function scanSourceFile(ts, rootDir, fileRel) {
           if (kind !== null) into.set(declaration.name.text, kind);
           continue;
         }
-        // `const { require: r } = module` binds `r` to `module.require`.
-        if (ts.isObjectBindingPattern(declaration.name) && kind === CAP_MODULE) {
-          for (const element of declaration.name.elements) {
-            if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
-            const property = element.propertyName ?? element.name;
-            const propertyName = ts.isIdentifier(property)
-              ? property.text
-              : ts.isStringLiteralLike(property)
-                ? property.text
-                : null;
-            if (propertyName === "require") into.set(element.name.text, CAP_REQUIRE);
-          }
+        if (!ts.isObjectBindingPattern(declaration.name)) continue;
+        // `const { require: r } = module` binds `r` to `module.require`;
+        // `const { getBuiltinModule: g } = process` binds `g` to the builtin
+        // loader; `const { createRequire } = m` is matched by name anyway.
+        const members = DESTRUCTURED_CAPABILITY_MEMBERS.get(kind);
+        if (!members) continue;
+        for (const element of declaration.name.elements) {
+          if (!ts.isBindingElement(element) || !ts.isIdentifier(element.name)) continue;
+          const propertyName = bindingPropertyName(element);
+          const bound = propertyName === null ? undefined : members.get(propertyName);
+          if (bound !== undefined) into.set(element.name.text, bound);
         }
       }
     }
@@ -1486,7 +1641,17 @@ function scanSourceFile(ts, rootDir, fileRel) {
     if (!parent) return false;
     // `typeof require` is a shadow-safe existence test that loads nothing.
     if (ts.isTypeOfExpression(parent)) return true;
-    if (kind === CAP_REQUIRE) {
+    // A computed member read on this capability is reported by
+    // `computedCapabilityAccess` at the access itself, so the base is consumed
+    // and the construct yields exactly one finding (review round 5).
+    if (
+      ts.isElementAccessExpression(parent) &&
+      parent.expression === outer &&
+      staticMemberName(parent) === null
+    ) {
+      return true;
+    }
+    if (LOADER_CALL_LABELS.has(kind)) {
       // The callee of a call the module-call visitor reads.
       if (ts.isCallExpression(parent) && parent.expression === outer) return true;
       // `require.call(thisArg, spec)` / `require.apply(thisArg, [spec])`.
@@ -1549,6 +1714,23 @@ function scanSourceFile(ts, rootDir, fileRel) {
     opaque.push({
       call: "capability",
       form: `${CAPABILITY_LABELS.get(kind)} escapes into ${escapeShapeOf(node)}`,
+      line: lineOf(node),
+    });
+  };
+
+  /**
+   * `capability[<not a literal>]` — a computed member read on a
+   * capability-bearing expression. `capabilityOf` cannot say which member is
+   * read, and returning `null` there is what let
+   * `getBuiltinModule("node:module")["create" + "Require"](__filename)` acquire a
+   * working `require` in silence (WP-015 review round 5). The rule fails closed
+   * instead: the access itself is the finding, and the base is treated as
+   * consumed so the construct is reported once.
+   */
+  const recordComputedCapabilityAccess = (node, kind) => {
+    opaque.push({
+      call: "capability-computed",
+      form: `${CAPABILITY_LABELS.get(kind)} is read with a computed member expression (\`[...]\`), so the member this check would have to classify is not statically known`,
       line: lineOf(node),
     });
   };
@@ -1626,8 +1808,19 @@ function scanSourceFile(ts, rootDir, fileRel) {
         ? isValueReference(node)
         : ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isCallExpression(node)
     ) {
+      // WP-015 review round 5 — a computed member read on a capability-bearing
+      // object fails closed rather than resolving to `null`.
+      if (ts.isElementAccessExpression(node) && staticMemberName(node) === null) {
+        const objectKind = capabilityOf(node.expression);
+        if (objectKind !== null) recordComputedCapabilityAccess(node, objectKind);
+      }
       const capability = capabilityOf(node);
-      if (capability !== null && !isAbsorbedCapability(node) && !capabilityIsConsumed(node, capability)) {
+      if (
+        capability !== null &&
+        LOADER_CAPABILITIES.has(capability) &&
+        !isAbsorbedCapability(node) &&
+        !capabilityIsConsumed(node, capability)
+      ) {
         recordCapabilityEscape(node, capability);
       }
     }
@@ -1641,13 +1834,18 @@ function scanSourceFile(ts, rootDir, fileRel) {
       else recordOpaque(node, "import", expression);
     } else if (ts.isCallExpression(node)) {
       const callee = unwrapExpression(node.expression);
+      const reflected = reflectedLoaderKind(callee);
+      const direct = reflected === null ? capabilityOf(callee) : null;
       if (node.expression.kind === ts.SyntaxKind.ImportKeyword || callee.kind === ts.SyntaxKind.ImportKeyword) {
         recordModuleCall(node, "import", 0);
-      } else if (isRequireReflection(callee)) {
-        // `require.call(thisArg, spec)` / `require.apply(thisArg, [spec])`.
-        recordModuleCall(node, "require", 1);
-      } else if (resolvesToRequire(callee)) {
-        recordModuleCall(node, "require", 0);
+      } else if (reflected !== null) {
+        // `require.call(thisArg, spec)` / `require.apply(thisArg, [spec])`, and
+        // the same reflection over `process.getBuiltinModule`.
+        recordModuleCall(node, LOADER_CALL_LABELS.get(reflected), 1);
+      } else if (LOADER_CALL_LABELS.has(direct)) {
+        // `require(spec)` and `process.getBuiltinModule(spec)` — both name a
+        // module, and both are classified exactly like an import.
+        recordModuleCall(node, LOADER_CALL_LABELS.get(direct), 0);
       }
     } else if (ts.isMetaProperty(node) && node.keywordToken === ts.SyntaxKind.ImportKeyword) {
       globals.push({ family: ENVIRONMENT, what: "module environment (`import.meta`)", line: lineOf(node) });
@@ -2207,15 +2405,21 @@ function runCheck(rootDir) {
               hit.call === "evaluator"
                 ? `references ${hit.form}, which evaluates code no static check can read; in \`${pkg.dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it evaluates`
                 : hit.call === "capability"
-                  ? `${hit.form}; from there it can load any module by name, so in \`${pkg.dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it loads — and a purity-restricted package has no legitimate use of \`require\``
-                  : hit.call === "require"
-                    ? `calls \`require()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the required module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`
-                    : `uses a dynamic \`import()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the imported module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
+                  ? `${hit.form}; from there it can load any module by name, so in \`${pkg.dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it loads — and a purity-restricted package has no legitimate use of a module loader`
+                  : hit.call === "capability-computed"
+                    ? `${hit.form}; a computed member on a module-loading capability is exactly how \`createRequire\` is reached without ever naming it, so in \`${pkg.dir}\` rules F1-F8/F11 cannot be evaluated at all for whatever it loads`
+                    : hit.call === "require"
+                      ? `calls \`require()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the required module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`
+                      : hit.call === "getBuiltinModule"
+                        ? `calls \`process.getBuiltinModule()\` whose specifier is ${hit.form}; it loads a Node built-in by name, so in \`${pkg.dir}\` that name must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`
+                        : `uses a dynamic \`import()\` whose specifier is ${hit.form}; in \`${pkg.dir}\` the imported module must be statically readable, or rules F1-F8/F11 cannot be evaluated at all`,
             doc: `${CONTRACT_REL} §6 rule 3; ADR-005 §1`,
             fix:
               hit.call === "capability"
                 ? "delete the reference; a package under F1/F2/F3 loads no module at run time, and receives every capability it needs as a constructor/StrategyContext argument"
-                : "import the module statically, or receive the capability through StrategyContext/a constructor argument",
+                : hit.call === "capability-computed"
+                  ? "name the member statically — or, better, delete the reference: a package under F1/F2/F3 loads no module at run time"
+                  : "import the module statically, or receive the capability through StrategyContext/a constructor argument",
           });
         }
       }
