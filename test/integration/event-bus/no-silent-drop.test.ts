@@ -1,0 +1,225 @@
+/**
+ * §8.3: "Dropping trading or raw market events silently is forbidden."
+ *
+ * Every way this transport can fail to move an event must be observable. These
+ * tests walk each one and assert that it is a typed, inspectable failure — and,
+ * where an event was already in the stream, that a caller is given exactly the
+ * position it needs to step over the problem deliberately rather than by
+ * accident.
+ */
+
+import {
+  EventBusEntryError,
+  EventBusEnvelopeError,
+  EventBusStateError,
+  EventBusUnavailableError,
+  RedisStreamsEventTransport,
+} from "@polymarket-bot/event-bus";
+import type { StreamCheckpoint } from "@polymarket-bot/event-bus";
+import {
+  createTestEnvelope,
+  createTestEnvelopeSequence,
+  injectForeignEntry,
+  injectUnreadableEntry,
+} from "@polymarket-bot/event-bus/testing";
+import { describe, expect, inject, it } from "vitest";
+
+import {
+  captureRejection,
+  connectTransport,
+  drain,
+  publishAll,
+  resumeStored,
+  testStream,
+} from "./context.js";
+
+function checkpointFrom(error: unknown): StreamCheckpoint {
+  if (!(error instanceof EventBusEntryError)) {
+    throw new Error(`expected an entry error, received ${String(error)}`);
+  }
+  const checkpoint = error.details["checkpoint"];
+  if (checkpoint === undefined) {
+    throw new Error("the entry error did not name the offending position");
+  }
+  return checkpoint as StreamCheckpoint;
+}
+
+describe("nothing is dropped silently", () => {
+  it("refuses an invalid envelope without publishing anything", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-invalid");
+    const valid = createTestEnvelope();
+
+    const error = await captureRejection(async () =>
+      transport.publish(stream, { ...valid, ingestSeq: "not-a-number" }),
+    );
+
+    expect(error).toBeInstanceOf(EventBusEnvelopeError);
+    const metrics = await transport.streamMetrics(stream);
+    expect(metrics.publishedTotal).toBe(0);
+    expect(metrics.currentDepth).toBe(0);
+    expect(metrics.publishFailures).toBe(1);
+  });
+
+  it("refuses an envelope with an unknown field rather than stripping it", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-unknown-field");
+
+    const error = await captureRejection(async () =>
+      transport.publish(stream, {
+        ...createTestEnvelope(),
+        surprise: "a field a newer producer added",
+      } as never),
+    );
+
+    expect(error).toBeInstanceOf(EventBusEnvelopeError);
+    expect((await transport.streamMetrics(stream)).publishedTotal).toBe(0);
+  });
+
+  it("reports an unreadable entry instead of stepping over it", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-unreadable");
+    const before = createTestEnvelopeSequence({ count: 3 });
+    await publishAll(transport, stream, before);
+    await injectUnreadableEntry({ url: inject("redisUrl"), stream });
+    const after = createTestEnvelopeSequence({ count: 2, startIngestSeq: 100n });
+    await publishAll(transport, stream, after);
+
+    const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+    const batch = await subscription.receive({ maxEvents: 10 });
+    if (batch.status !== "events") {
+      throw new Error(`expected events, received ${batch.status}`);
+    }
+    // Everything readable before the bad entry is delivered first, so the
+    // report costs no valid event.
+    expect(batch.events.map((e) => e.envelope.eventId)).toStrictEqual(
+      before.map((e) => e.eventId),
+    );
+
+    const error = await captureRejection(async () => subscription.receive());
+    expect(error).toBeInstanceOf(EventBusEntryError);
+    expect((await subscription.metrics()).unreadableEntriesTotal).toBe(1);
+
+    // The error names the offending entry, so stepping over exactly that one is
+    // a deliberate act rather than a side effect.
+    const resumed = await transport.subscribe({
+      stream,
+      consumerId: "trader",
+      start: { at: "checkpoint", checkpoint: checkpointFrom(error) },
+    });
+    const { envelopes } = await drain(resumed);
+    expect(envelopes.map((e) => e.eventId)).toStrictEqual(after.map((e) => e.eventId));
+  });
+
+  it("reports an entry written by something else instead of ignoring it", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-foreign");
+    const before = createTestEnvelopeSequence({ count: 2 });
+    await publishAll(transport, stream, before);
+    await injectForeignEntry({ url: inject("redisUrl"), stream });
+    const after = createTestEnvelopeSequence({ count: 2, startIngestSeq: 100n });
+    await publishAll(transport, stream, after);
+
+    const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+    const batch = await subscription.receive({ maxEvents: 10 });
+    if (batch.status !== "events") {
+      throw new Error(`expected events, received ${batch.status}`);
+    }
+    expect(batch.events).toHaveLength(2);
+
+    const error = await captureRejection(async () => subscription.receive());
+    expect(error).toBeInstanceOf(EventBusEntryError);
+
+    // A foreign entry consumed no publication ordinal, so stepping over it must
+    // not make the next real event look like a gap.
+    const resumed = await transport.subscribe({
+      stream,
+      consumerId: "trader",
+      start: { at: "checkpoint", checkpoint: checkpointFrom(error) },
+    });
+    const { envelopes } = await drain(resumed);
+    expect(resumed.pendingResync()).toBeUndefined();
+    expect(envelopes.map((e) => e.eventId)).toStrictEqual(after.map((e) => e.eventId));
+  });
+
+  it("stops publishing when the transport cannot be reached", async () => {
+    const error = await captureRejection(async () =>
+      RedisStreamsEventTransport.connect({
+        // Port 1 is reserved and never listening; this is a local socket
+        // failure, not a network call to anything.
+        connection: { url: "redis://127.0.0.1:1", connectTimeoutMs: 1_000 },
+        retention: { maxEvents: 10 },
+      }),
+    );
+
+    expect(error).toBeInstanceOf(EventBusUnavailableError);
+  });
+
+  it("refuses to publish through a closed transport", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-closed");
+    await transport.close();
+
+    const error = await captureRejection(async () =>
+      transport.publish(stream, createTestEnvelope()),
+    );
+
+    expect(error).toBeInstanceOf(EventBusStateError);
+  });
+
+  it("refuses to read through a closed subscription", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-closed-subscription");
+    await publishAll(transport, stream, createTestEnvelopeSequence({ count: 1 }));
+    const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+    await subscription.close();
+
+    const error = await captureRejection(async () => subscription.receive());
+
+    expect(error).toBeInstanceOf(EventBusStateError);
+  });
+
+  it("closes every subscription with the transport", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-close-cascade");
+    await publishAll(transport, stream, createTestEnvelopeSequence({ count: 1 }));
+    const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+
+    await transport.close();
+
+    const error = await captureRejection(async () => subscription.receive());
+    expect(error).toBeInstanceOf(EventBusStateError);
+  });
+
+  it("refuses two interleaved reads rather than advancing past events neither returned", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-interleaved-reads");
+    const published = createTestEnvelopeSequence({ count: 4 });
+    await publishAll(transport, stream, published);
+    const subscription = await transport.subscribe(resumeStored(stream, "trader"));
+
+    const firstRead = subscription.receive({ waitMs: 200, maxEvents: 4 });
+    const secondRead = captureRejection(async () => subscription.receive());
+    const [batch, error] = await Promise.all([firstRead, secondRead]);
+
+    expect(error).toBeInstanceOf(EventBusStateError);
+    if (batch.status !== "events") {
+      throw new Error(`expected events, received ${batch.status}`);
+    }
+    expect(batch.events.map((e) => e.envelope.eventId)).toStrictEqual(
+      published.map((e) => e.eventId),
+    );
+  });
+
+  it("never accepts an event it cannot encode", async () => {
+    const transport = await connectTransport({ maxEvents: 100 });
+    const stream = testStream("drop-unencodable");
+
+    const error = await captureRejection(async () =>
+      transport.publish(stream, createTestEnvelope({ payload: { amount: 10n } })),
+    );
+
+    expect(error).toBeInstanceOf(EventBusEnvelopeError);
+    expect((await transport.streamMetrics(stream)).publishedTotal).toBe(0);
+  });
+});
