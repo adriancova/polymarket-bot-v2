@@ -63,6 +63,24 @@ table says otherwise.
   Assumption judgments: A5 REJECT (§8.1 does not establish sequential gateway
   publication), A1-A4/A6/A7 ACCEPT. Interface neutrality, path ownership,
   dependency direction, and safety criteria PASS as reviewed.
+- Remediation round 1 completed 2026-08-27 in `3bc247c` (+ handoff `eee4b54`),
+  fresh repair session, every probe reproduced on the unmodified candidate
+  before fixing, per-finding mutation checks: H1 → `KeyedSerialQueue` makes
+  check+append+cursor one serialized step per gatewayEpoch (concurrent
+  reverse-order publish now refused before append); H2 → per-stream instance
+  marker key + versioned `ebc2` tokens, `RESOLVE_POSITION`/`STORE_CHECKPOINT`
+  Lua scripts judge marker/ordinal/clock/exact-entry server-side before
+  delivery, unreadable stored positions refused and counted
+  (`unreadableCheckpoints`); M1/P6 → `PUBLISH_SCRIPT` prevalidates key types +
+  safe-integer ceiling before any mutation, pcall-guarded append with
+  compensation (failed counter write removes the appended entry); M2 → handoff
+  corrected to `(gatewayEpoch, ingestSeq)` dedup with positive duplicate test;
+  L1/NOTE → prose corrected, WP-120 obligations now explicit (stable durable
+  consumer id per role). Two new disclosed deviations: fourth per-stream key
+  (instance marker), new `unreadableCheckpoints` metric field. Orchestrator
+  fast-forwarded the canonical branch to `eee4b54` and reproduced all gates:
+  root 1719/1719, integration 73/73, check:deps PASS, lockfile untouched this
+  round. Review round 2 dispatched.
 
 ### WP-040 completion record (2026-08-26)
 
