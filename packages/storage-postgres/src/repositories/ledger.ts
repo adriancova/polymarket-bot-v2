@@ -46,16 +46,14 @@ export type LedgerEntryInput = {
   readonly detail?: Detail | null;
 };
 
-export type PostLedgerTransactionInput = {
+/** Everything a ledger transaction carries regardless of what it books. */
+type LedgerTransactionFields = {
   readonly eventType: LedgerEventTypeValue;
   readonly environment: RunModeValue;
   readonly accountRef: Identifier;
   readonly source: EventSourceValue;
   readonly occurredAt: IsoTimestamp;
   readonly entries: readonly LedgerEntryInput[];
-  readonly marketId?: UuidV7Column | null;
-  readonly orderId?: UuidV7Column | null;
-  readonly fillId?: UuidV7Column | null;
   readonly walletOperationId?: UuidV7Column | null;
   readonly reconciliationRunId?: UuidV7Column | null;
   readonly settlementState?: TradeSettlementStateValue | null;
@@ -65,12 +63,52 @@ export type PostLedgerTransactionInput = {
   readonly detail?: Detail | null;
 };
 
+/**
+ * A transaction that may book an order or a fill, and therefore **must** name
+ * the market.
+ *
+ * `execution.orders.market_id` and `execution.fills.market_id` are both NOT
+ * NULL, so a caller that has an order or a fill always has its market: there is
+ * no such thing as an execution fact whose market is unknown. Omitting it is not
+ * a missing value, it is a transaction that has left market-scoped accounting —
+ * and because the market foreign keys are MATCH SIMPLE, omitting it also skips
+ * the check that the market is the *right* one. The database says the same thing
+ * (`ledger_transactions_execution_link_has_market`); this type says it at
+ * compile time, so the mistake is not reachable from here at all.
+ */
+type MarketBoundLedgerTransactionInput = LedgerTransactionFields & {
+  readonly marketId: UuidV7Column;
+  readonly orderId?: UuidV7Column | null;
+  readonly fillId?: UuidV7Column | null;
+};
+
+/**
+ * A transaction that books no execution fact: external clearing, a deposit or
+ * withdrawal, a manual adjustment, a resolution (§9.15).
+ *
+ * The market stays optional here, because these genuinely may have none.
+ */
+type StandaloneLedgerTransactionInput = LedgerTransactionFields & {
+  readonly marketId?: UuidV7Column | null;
+  readonly orderId?: null;
+  readonly fillId?: null;
+};
+
+export type PostLedgerTransactionInput =
+  | MarketBoundLedgerTransactionInput
+  | StandaloneLedgerTransactionInput;
+
 export type LedgerRepository = ReturnType<typeof createLedgerRepository>;
 
 export function createLedgerRepository(db: PolymarketBotDatabase) {
   return {
     /**
      * Posts one balanced ledger transaction.
+     *
+     * A transaction that names an `orderId` or a `fillId` must name that row's
+     * `marketId` too — the input type requires it, and
+     * `ledger_transactions_execution_link_has_market` requires it of every other
+     * writer as well.
      *
      * @throws {LedgerImbalanceError} at COMMIT when the entries do not sum to
      *   zero for some asset, or when there are no entries at all.

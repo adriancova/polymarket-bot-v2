@@ -232,6 +232,41 @@ describe("migrations", () => {
     expect(highWater.rows[0]?.count).toBe("1");
   });
 
+  it("create the round-3 authority constraints as database objects too", async () => {
+    const pool = poolFor(getConnectionString());
+
+    const constraints = await pool.query<{ conname: string; definition: string }>(
+      `select conname, pg_get_constraintdef(oid) as definition from pg_constraint
+        where conname in (
+          'ledger_transactions_execution_link_has_market',
+          'ledger_transactions_order_market_fk',
+          'ledger_transactions_fill_market_fk',
+          'orders_submission_requires_attempt'
+        )`,
+    );
+    const byName = new Map(constraints.rows.map((row) => [row.conname, row.definition]));
+
+    expect([...byName.keys()].sort((a, b) => a.localeCompare(b))).toEqual([
+      "ledger_transactions_execution_link_has_market",
+      "ledger_transactions_fill_market_fk",
+      "ledger_transactions_order_market_fk",
+      "orders_submission_requires_attempt",
+    ]);
+
+    // The market foreign keys are MATCH SIMPLE and `market_id` is nullable, so
+    // the CHECK is what makes them unskippable: without it an order- or
+    // fill-linked transaction could omit the market and drop out of every
+    // market-scoped ledger query (round-3 F10 residual).
+    expect(byName.get("ledger_transactions_execution_link_has_market")).toMatch(
+      /market_id IS NOT NULL/iu,
+    );
+
+    // §9.11 creates the submission attempt at step 1 and commits `SIGNED` at
+    // step 4, so `SIGNED` is not a pre-attempt state and must not be exempt.
+    expect(byName.get("orders_submission_requires_attempt")).not.toMatch(/'SIGNED'/u);
+    expect(byName.get("orders_submission_requires_attempt")).toMatch(/'PLANNED'/u);
+  });
+
   it("keep the reservation facts authoritative for every writer (§10.7)", async () => {
     const pool = poolFor(getConnectionString());
 

@@ -261,17 +261,31 @@ create table execution.orders (
   -- and §6 invariant 6 ("reconcile using the persisted signed order/order hash")
   -- would have nothing to reconcile against.
   --
-  -- The boundary is the state that first requires venue submission. `PLANNED`
-  -- and `SIGNED` legitimately precede an attempt, and so do the three terminal
-  -- states an order can reach without ever being sent (abandoned before
-  -- transmission) — but only while the row carries *no evidence of venue
-  -- contact*: no venue identity, no submission timestamp, and no fills. A
-  -- terminal state is not an exemption from lineage; not having been submitted
-  -- is.
+  -- The boundary is the state that first requires a *persisted signed payload*,
+  -- and §9.11's own step order fixes where that is:
+  --
+  --   1. create `submission_attempt_id`
+  --   2. create and sign the complete venue order locally
+  --   3. persist signed payload, salt, expected order hash, and the plan link
+  --   4. commit state `SIGNED`
+  --
+  -- The attempt row is created at step 1, *before* signing, and the durable
+  -- signed payload it carries is written at step 3 — so by the time an order may
+  -- be called `SIGNED` at step 4 the attempt necessarily exists. An attemptless
+  -- `SIGNED` order is therefore a contradiction of the protocol, not a stage of
+  -- it: it claims a signature with no signature on record, which is exactly what
+  -- §6 invariant 6 needs to reconcile a lost response against. `SIGNED` is not
+  -- exempt.
+  --
+  -- What remains exempt is `PLANNED` — the state before step 1 — and the three
+  -- terminal states an order can reach by being abandoned before transmission,
+  -- and those only while the row carries *no evidence of venue contact*: no
+  -- venue identity, no submission timestamp, and no fills. A terminal state is
+  -- not an exemption from lineage; not having been submitted is.
   constraint orders_submission_requires_attempt check (
     submission_attempt_id is not null
     or (
-      state in ('PLANNED', 'SIGNED', 'CANCELED', 'REJECTED', 'EXPIRED')
+      state in ('PLANNED', 'CANCELED', 'REJECTED', 'EXPIRED')
       and filled_shares = '0'
       and venue_order_id is null
       and venue_order_hash is null

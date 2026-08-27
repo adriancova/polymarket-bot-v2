@@ -141,6 +141,21 @@ create table accounting.ledger_transactions (
   -- that *does* reference the row in question and skipped for one that does not,
   -- so external clearing, manual adjustments, and resolutions still stand alone
   -- with discriminators of their own (§9.15).
+  --
+  -- The market binding is the one case where MATCH SIMPLE needed a companion
+  -- CHECK, because `market_id` is itself nullable: an order- or fill-linked
+  -- transaction that simply omitted the market skipped
+  -- `ledger_transactions_order_market_fk` / `..._fill_market_fk` altogether and
+  -- was stored with no market at all — disappearing from every market-scoped
+  -- ledger query while still balancing, still naming the right account, and
+  -- still being append-only. An order and a fill both carry a NOT NULL
+  -- `market_id`, so the value is never unknown to the writer; a transaction that
+  -- books one has no reason to omit it, and a standalone transaction (a
+  -- deposit, a manual adjustment, a resolution) is still free to have no market.
+  constraint ledger_transactions_execution_link_has_market check (
+    market_id is not null
+    or (order_id is null and fill_id is null)
+  ),
   constraint ledger_transactions_order_environment_fk
     foreign key (order_id, environment)
     references execution.orders (order_id, environment),

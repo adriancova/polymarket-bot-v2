@@ -648,13 +648,26 @@ describe("round-2 F10: a ledger transaction cannot mislabel the order or fill it
     );
   }
 
+  // Each bypass below names the *correct* market, so the environment or the
+  // account is the only thing wrong with the row and is therefore what reports.
+  // Round 3 added `ledger_transactions_execution_link_has_market`, which rejects
+  // an execution-linked transaction that omits the market at all; without the
+  // market these rows would now fail that CHECK first and stop being tests of
+  // the discriminator binding. Nothing was weakened — the row is strictly more
+  // truthful and still rejected.
+
   it("REJECTS a PAPER-labelled transaction that books a LIVE fill", async () => {
     // The bypass: `environment`, `account_ref`, and `market_id` were independent
     // labels beside a scalar `fill_id`. The ledger is the monetary source of
     // truth (ADR-006 §1) and it is append-only, so a mislabelled transaction is
     // a permanent corruption of what every projection is rebuilt from.
     const error = await captureRejection(async () =>
-      postHeader({ environment: "PAPER", accountRef: LIVE_ACCOUNT, fillId: liveFillId }),
+      postHeader({
+        environment: "PAPER",
+        accountRef: LIVE_ACCOUNT,
+        marketId: liveChain.marketId,
+        fillId: liveFillId,
+      }),
     );
 
     expect(errorCode(error)).toBe("23503");
@@ -663,7 +676,12 @@ describe("round-2 F10: a ledger transaction cannot mislabel the order or fill it
 
   it("REJECTS a PAPER-labelled transaction that books a LIVE order", async () => {
     const error = await captureRejection(async () =>
-      postHeader({ environment: "PAPER", accountRef: LIVE_ACCOUNT, orderId: liveOrderId }),
+      postHeader({
+        environment: "PAPER",
+        accountRef: LIVE_ACCOUNT,
+        marketId: liveChain.marketId,
+        orderId: liveOrderId,
+      }),
     );
 
     expect(errorCode(error)).toBe("23503");
@@ -672,7 +690,12 @@ describe("round-2 F10: a ledger transaction cannot mislabel the order or fill it
 
   it("REJECTS a transaction that books another account's fill", async () => {
     const error = await captureRejection(async () =>
-      postHeader({ environment: "LIVE", accountRef: "round2-not-the-owner", fillId: liveFillId }),
+      postHeader({
+        environment: "LIVE",
+        accountRef: "round2-not-the-owner",
+        marketId: liveChain.marketId,
+        fillId: liveFillId,
+      }),
     );
 
     expect(errorCode(error)).toBe("23503");
@@ -830,7 +853,13 @@ describe("round-2 MEDIUM: a submitted order carries the attempt that signed it",
   });
 
   it("still allows the pre-submission states", async () => {
-    for (const state of ["PLANNED", "SIGNED", "CANCELED", "EXPIRED"]) {
+    // `SIGNED` was in this list when round 2 wrote it, and that was a bug the
+    // test encoded rather than caught: §9.11 creates the submission attempt at
+    // step 1 and commits `SIGNED` at step 4, so an attemptless `SIGNED` order is
+    // a signed order with no signed payload on record. Round 3 removed it from
+    // the exemption; the rejection is asserted in
+    // `authority-bypass-round3.test.ts`.
+    for (const state of ["PLANNED", "CANCELED", "EXPIRED"]) {
       const inserted = await insertOrderInState(state);
       expect((inserted as { rowCount: number }).rowCount, state).toBe(1);
     }
