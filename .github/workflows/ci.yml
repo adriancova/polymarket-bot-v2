@@ -51,7 +51,7 @@ jobs:
       - name: Dependency vulnerability scan (pnpm lockfile)
         run: pnpm audit --audit-level high
 
-      - name: PostgreSQL integration tests (Testcontainers)
+      - name: Integration tests (Testcontainers - PostgreSQL and Redis)
         run: pnpm test:integration
 
   compose:

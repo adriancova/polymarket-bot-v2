@@ -26,7 +26,7 @@ Maximum permitted run mode: `PAPER`
 | `WP-015`               | Complete | `WP-030` ✓         | Merged `d77b2ba` (impl chain `bb441dc`→…→`b2b3b9b`, 10 review rounds) |
 | `WP-040`               | Complete | All ✓             | Merged `d23bb67` (impl chain `0a73ffe`→…→`f8982bf`, 5 review rounds) |
 | `WP-050`               | Complete | All ✓             | Merged `8a607ec` (impl chain `32cb0a8`→`3c2228a`→`a972e96`→`3f35a0c`→`b3a906f`→`22db770`, 4 review rounds) |
-| `WP-060`               | IN_PROGRESS (authorized — last of batch 1A) | All ✓ | Packet dispatched 2026-08-27 to `wp-implementer` (Opus); workplan lockfile/handoff ratification comments added 2026-08-27 |
+| `WP-060`               | Complete | All ✓ | Merged `af29b08` (impl chain `d7bbb0f`→…→`954e764`, 3 review rounds) |
 | `WP-070`, `WP-080`, `WP-090` | Ready (Wave 1 batch 1B — after 1A per runbook) | All ✓ | Unassigned |
 | `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
@@ -36,7 +36,48 @@ Authorization vocabulary: "Ready (authorized)" rows are the only packages agents
 may begin in the current run; "Dependency-ready" rows must not start until this
 table says otherwise.
 
-### WP-060 in-flight record (2026-08-27)
+### WP-060 completion record (2026-08-27)
+
+- Review round 3 (fresh Codex session `01a0447d-5890-7a72-8808-810b0e473f2d`,
+  candidate `954e764` vs base `4126f29`): **ACCEPT** — 0 findings above NOTE
+  (sole NOTE: reviewer sandbox lacked Docker for the integration gate; covered
+  by the orchestrator's independent 81/81 reproduction at the exact commit).
+  All round-2 fixes verified FIXED with direct probes (typed queue-full refusal
+  before any Redis mutation with no capacity leak; durable-first resync
+  acknowledgement with failure-path stickiness and recovery; publish sequence
+  validation→XADD→SET→XTRIM with exact-contents compensation; metrics judged
+  server-side; foreign-entry disclosure accurate; clock-guard reorder).
+  ND3/ND4/ND5 and NR5-NR8 all ACCEPT; two mutation-check claims independently
+  spot-verified; full regression sweep clean.
+- Merged to `main` as `af29b08` under the release manager's standing delegation
+  (2026-08-27). Post-merge on `main`: root 1727/1727, fault 89/89, integration
+  208/208 (postgres) + 81/81 (event-bus), `check:deps` PASS, audit clean,
+  frozen install verified. Root `test:integration` wired by the orchestrator in
+  the completion commit to run both integration suites; CI step renamed
+  accordingly (WP-040/WP-050 precedent for orchestrator-owned root wiring).
+- As merged: transport-neutral interface (publish / subscribe / consumer
+  checkpoint / bounded retention) carrying frozen-domain `EventEnvelope`s;
+  Redis Streams v1 implementation (ioredis@6) with serialized per-epoch
+  publication (bounded admission queue, typed halt-class refusal), atomic
+  publication ordinals making retention loss exactly detectable
+  (`missedEventCount`), server-judged instance-bound `ebc2` checkpoint tokens,
+  sticky hard-resync blocking delivery and checkpointing until an
+  authoritative-snapshot acknowledgement is durably recorded, §8.3 metric set
+  plus `unreadableCheckpoints`/`retentionTrimFailures`, BigInt-exact per-epoch
+  ordering, opaque payloads. Vocabulary test mechanically enforces that no
+  Redis term appears in consumer-facing types (ADR-003 Consequences).
+- Binding obligations recorded for consumers (WP-060 handoff follow_up):
+  WP-120 must dedup on `(gatewayEpoch, ingestSeq)` (NOT `eventId`), keep one
+  stable durable consumer id per role, publish each epoch from one process
+  sequentially, route `resync-required` to the halt path with a
+  `DataQualityIncidentOpened` + authoritative snapshot, treat
+  `EVENT_BUS_PUBLISH_QUEUE_FULL`/`EventBusUnavailableError` as
+  halt-plus-incident signals, and size `maxQueuedPublishes`/retention
+  deliberately (retention sizing belongs in the operational runbook). WP-140
+  exports queue depth/max/oldest-age pairs from process memory. The 5 ms p99
+  gateway-to-trader target remains an unmeasured target (ADR-003 §5).
+
+### WP-060 review history (2026-08-27, archived)
 
 - Implemented by `wp-implementer` (Opus) on branch `worktree-agent-ab4ebe3e28c3ce141`,
   base `4126f29`; chain `d7bbb0f` (implementation) → `794347a` (handoff record).
