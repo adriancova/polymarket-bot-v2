@@ -81,6 +81,28 @@ table says otherwise.
   fast-forwarded the canonical branch to `eee4b54` and reproduced all gates:
   root 1719/1719, integration 73/73, check:deps PASS, lockfile untouched this
   round. Review round 2 dispatched.
+- Review round 2 (fresh Codex session `01a0444d-a524-70b3-bfe8-c5f3cd0525eb`,
+  candidate `eee4b54` vs base `4126f29`): **CHANGES REQUIRED** — 0 blocker,
+  2 high (R2-H1 the new publish serialization queue is unbounded and queue-wait
+  time invisible — 10,000 operations admitted behind a stalled publish with
+  only active-key count observable, and `producerBlockedTimeMs` starts after
+  dequeue, contra §8.3; R2-H2 a failed durable hard-resync acknowledgement
+  clears the sticky resync state before the checkpoint write — injected
+  write failure left delivery unlocked with `pendingAfterFailure: null`),
+  1 medium (R2-M1 publish compensation cannot restore an entry trimmed by
+  `XADD MAXLEN` when the subsequent counter `SET` fails at full retention;
+  NR4 characterization REJECTED as incomplete), 3 low (L1 `unreadableCheckpoints`
+  undercounts — marker-only check, a same-marker future token reports as
+  ordinary lag; L2 handoff omits the accepted foreign-entry step-over
+  exception; L3 clock regression refuses genuine retained checkpoints —
+  fail-closed availability issue). Round-1 fixes otherwise verified: H1 core
+  reorder fixed (queue does not poison/deadlock, epochs independent), H2 core
+  forgery closed (future/cross-prefix/ebc1/mismatched tokens refused), P6/M2/
+  L1/NOTE fixed; ND1/ND2 ACCEPT (ND2 contingent on L1), new ADR-002 §2
+  serialization-boundary assumption ACCEPT, NR1 ACCEPT in principle
+  (foreign-entry disclosure required), NR2/NR3 ACCEPT, empty-stream residue
+  ruled LOW/NOTE-acceptable. Reviewer sandbox again had no Docker; integration
+  evidence remains the orchestrator's independent 73/73 reproduction.
 
 ### WP-040 completion record (2026-08-26)
 
