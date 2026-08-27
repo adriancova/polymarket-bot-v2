@@ -23,7 +23,17 @@
  *     `execution.rate_limit_snapshots.headers` — verbatim venue evidence. They
  *     are recorded as observed and are never read as economic truth; forcing a
  *     re-encoding would make the record no longer what the venue sent.
- *   * `strategy.decisions.model_outputs` — model scores, not money.
+ *
+ * `strategy.decisions.model_outputs` used to be on that list as "model scores,
+ * not money". That was wrong twice over: the frozen contract
+ * (`packages/domain/src/decision.ts`, ADR-005, handoff §7.5) types a model
+ * output as `DecimalString | string | boolean | null` and rejects a JavaScript
+ * number outright; and an edge, a probability, or a fair value is precisely what
+ * sizing and the risk thresholds are computed from, so a double there becomes a
+ * rounding error in an order. It is guarded here like every other
+ * economics-bearing document, and `internal.jsonb_contains_number()` rejects it
+ * in the database as well (migration 0004), for writers that never pass through
+ * this package.
  *
  * Everything else that can hold a price, a size, a fee, or a balance goes
  * through `assertDecimalSafeJson()`.

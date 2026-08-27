@@ -32,6 +32,9 @@ beforeAll(async () => {
   orderId = await context.repositories.orders.insertOrder({
     planId: chain.planId,
     executionGroupId: chain.executionGroupId,
+    // §9.11 lineage: an order that reaches a submitted state names the attempt
+    // that signed it (`orders_submission_requires_attempt`).
+    submissionAttemptId: chain.submissionAttemptId,
     marketId: chain.marketId,
     tokenId: chain.tokenId,
     side: "BUY",

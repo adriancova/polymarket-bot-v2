@@ -5,6 +5,10 @@ drop trigger orders_valid_fencing_reference on execution.orders;
 drop function internal.assert_valid_fencing_reference();
 
 alter table accounting.ledger_transactions
+  drop constraint ledger_transactions_reconciliation_run_account_fk;
+alter table accounting.ledger_transactions
+  drop constraint ledger_transactions_reconciliation_run_environment_fk;
+alter table accounting.ledger_transactions
   drop constraint ledger_transactions_reconciliation_run_fk;
 
 alter table execution.submission_attempts

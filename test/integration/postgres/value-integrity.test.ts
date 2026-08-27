@@ -26,7 +26,10 @@ const getContext = useMigratedDatabase("value_integrity");
 
 let context: TestContext;
 let chain: Awaited<ReturnType<typeof createTradingChain>>;
+/** A chain whose instance, plan, and order genuinely name no account. */
+let accountlessChain: Awaited<ReturnType<typeof createTradingChain>>;
 let orderId: string;
+let accountlessOrderId: string;
 
 function errorCode(error: unknown): string | undefined {
   return (error as { code?: string }).code;
@@ -35,11 +38,29 @@ function errorCode(error: unknown): string | undefined {
 beforeAll(async () => {
   context = getContext();
   chain = await createTradingChain(context, { label: "value_integrity" });
+  accountlessChain = await createTradingChain(context, {
+    label: "value_integrity_accountless",
+    accountRef: null,
+  });
+
   orderId = await context.repositories.orders.insertOrder({
     planId: chain.planId,
     executionGroupId: chain.executionGroupId,
+    submissionAttemptId: chain.submissionAttemptId,
     marketId: chain.marketId,
     tokenId: chain.tokenId,
+    side: "BUY",
+    limitPrice: "0.42",
+    originalShares: "100",
+    state: "LIVE",
+  });
+
+  accountlessOrderId = await context.repositories.orders.insertOrder({
+    planId: accountlessChain.planId,
+    executionGroupId: accountlessChain.executionGroupId,
+    submissionAttemptId: accountlessChain.submissionAttemptId,
+    marketId: accountlessChain.marketId,
+    tokenId: accountlessChain.tokenId,
     side: "BUY",
     limitPrice: "0.42",
     originalShares: "100",
@@ -51,10 +72,17 @@ describe("MEDIUM-2: venue identity deduplicates with an unknown account", () => 
   async function insertOrderWithVenueId(venueOrderId: string): Promise<unknown> {
     return context.pool.query(
       `insert into execution.orders
-         (order_id, plan_id, market_id, token_id, environment, account_ref,
-          side, limit_price, original_shares, state, venue_order_id)
-       values ($1, $2, $3, $4, 'PAPER', null, 'BUY', '0.42', '1', 'LIVE', $5)`,
-      [uuidV7(), chain.planId, chain.marketId, chain.tokenId, venueOrderId],
+         (order_id, submission_attempt_id, plan_id, market_id, token_id, environment,
+          account_ref, side, limit_price, original_shares, state, venue_order_id)
+       values ($1, $2, $3, $4, $5, 'PAPER', null, 'BUY', '0.42', '1', 'LIVE', $6)`,
+      [
+        uuidV7(),
+        chain.submissionAttemptId,
+        chain.planId,
+        chain.marketId,
+        chain.tokenId,
+        venueOrderId,
+      ],
     );
   }
 
@@ -69,64 +97,90 @@ describe("MEDIUM-2: venue identity deduplicates with an unknown account", () => 
     expect((error as { constraint?: string }).constraint).toBe("orders_venue_order_id_unique");
   });
 
-  it("REJECTS a second NULL-account fill with the same venue identity", async () => {
-    const fill = {
-      orderId,
-      marketId: chain.marketId,
-      tokenId: chain.tokenId,
-      venueTradeId: "venue-trade-null-account",
-      venueOrderId: "venue-order-1",
-      side: "BUY" as const,
-      shares: "1",
-      price: "0.42",
-      notional: "0.42",
-      liquidityRole: "TAKER" as const,
-      matchedAt: fixtureTimestamp(),
-      allocations: [
-        {
-          scope: "VIRTUAL_STRATEGY" as const,
-          instanceId: chain.instanceId,
-          runId: chain.runId,
-          allocatedShares: "1",
-        },
-      ],
-    };
-
-    // The order carries an account, so write both fills directly with none: the
-    // point is the NULL, not the repository path.
-    async function insertFillWithoutAccount(): Promise<unknown> {
-      const fillId = uuidV7();
-      const client = await context.pool.connect();
-      try {
-        await client.query("begin");
-        await client.query(
-          `insert into execution.fills
-             (fill_id, order_id, market_id, token_id, environment, account_ref,
-              venue_trade_id, venue_order_id, side, shares, price, notional,
-              liquidity_role, matched_at)
-           values ($1, $2, $3, $4, 'PAPER', null, $5, $6, 'BUY', '1', '0.42', '0.42',
-                   'TAKER', now())`,
-          [fillId, orderId, chain.marketId, chain.tokenId, fill.venueTradeId, fill.venueOrderId],
-        );
-        await client.query(
-          `insert into execution.fill_allocations
-             (fill_allocation_id, fill_id, scope, instance_id, run_id, allocated_shares)
-           values ($1, $2, 'VIRTUAL_STRATEGY', $3, $4, '1')`,
-          [uuidV7(), fillId, chain.instanceId, chain.runId],
-        );
-        await client.query("commit");
-      } catch (error) {
-        await client.query("rollback");
-        throw error;
-      } finally {
-        client.release();
-      }
-      return fillId;
+  /**
+   * Records a fill directly, with whatever account the caller names.
+   *
+   * The repository reads the account from the order, so a NULL has to be
+   * written by hand — which is the point: the constraint has to hold for the
+   * writer that does not go through this package.
+   */
+  async function insertFillWithoutAccount(
+    targetOrderId: string,
+    marketId: string,
+    tokenId: string,
+    venueTradeId: string,
+  ): Promise<string> {
+    const fillId = uuidV7();
+    const client = await context.pool.connect();
+    try {
+      await client.query("begin");
+      await client.query(
+        `insert into execution.fills
+           (fill_id, order_id, market_id, token_id, environment, account_ref,
+            venue_trade_id, venue_order_id, side, shares, price, notional,
+            liquidity_role, matched_at)
+         values ($1, $2, $3, $4, 'PAPER', null, $5, 'venue-order-1', 'BUY', '1', '0.42',
+                 '0.42', 'TAKER', now())`,
+        [fillId, targetOrderId, marketId, tokenId, venueTradeId],
+      );
+      await client.query(
+        `insert into execution.fill_allocations
+           (fill_allocation_id, fill_id, scope, allocated_shares)
+         values ($1, $2, 'UNATTRIBUTED', '1')`,
+        [uuidV7(), fillId],
+      );
+      await client.query("commit");
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
     }
+    return fillId;
+  }
 
-    await insertFillWithoutAccount();
+  it("REJECTS a NULL-account fill of an order that HAS an account", async () => {
+    // CORRECTED EXPECTATION (round-2 HIGH-3). This test previously asserted that
+    // such a fill is *accepted* — it was written to demonstrate that the venue
+    // identity still deduplicates when the account is NULL, and in doing so it
+    // encoded the defect: `fills_order_account_fk` was MATCH SIMPLE, so a NULL
+    // child account skipped the binding to the order's account entirely, and the
+    // fill left account-scoped exposure and reconciliation while remaining a fill
+    // of that order. The deduplication property it was really about is asserted
+    // below, on an order that genuinely has no account.
+    const error = await captureRejection(async () =>
+      insertFillWithoutAccount(
+        orderId,
+        chain.marketId,
+        chain.tokenId,
+        "venue-trade-null-account",
+      ),
+    );
 
-    const error = await captureRejection(insertFillWithoutAccount);
+    expect(errorCode(error)).toBe("23503");
+    expect((error as { constraint?: string }).constraint).toBe("fills_order_account_fk");
+  });
+
+  it("REJECTS a second NULL-account fill with the same venue identity", async () => {
+    // The accountless chain: the instance, the plan, and the order name no
+    // account, so neither does the fill — and two of them with one venue
+    // identity must still be one fill, which is what NULLS NOT DISTINCT buys.
+    await insertFillWithoutAccount(
+      accountlessOrderId,
+      accountlessChain.marketId,
+      accountlessChain.tokenId,
+      "venue-trade-null-account",
+    );
+
+    const error = await captureRejection(async () =>
+      insertFillWithoutAccount(
+        accountlessOrderId,
+        accountlessChain.marketId,
+        accountlessChain.tokenId,
+        "venue-trade-null-account",
+      ),
+    );
+
     expect(errorCode(error)).toBe("23505");
     expect((error as { constraint?: string }).constraint).toBe("fills_venue_identity_unique");
   });
@@ -289,6 +343,78 @@ describe("MEDIUM-4: economics-bearing JSON admits no number", () => {
       legs: [{ size: "10" }],
       negRisk: false,
     });
+  });
+
+  it("REJECTS a number in a decision's model outputs (round-2 correction)", async () => {
+    // `model_outputs` used to be on the documented allowlist as "model scores,
+    // not money". The frozen contract disagrees: §7.5 and ADR-005 type a model
+    // output as `DecimalString | string | boolean | null`, and an edge or a
+    // probability is what sizing and the risk thresholds are computed from — a
+    // double there is a rounding error with an order attached.
+    const error = await captureRejection(async () =>
+      context.pool.query(
+        `insert into strategy.decisions
+           (decision_id, run_id, instance_id, market_id, evaluation_seq, callback,
+            decision_type, decision_contract_version, reason_codes, feature_snapshot_ref,
+            model_outputs, intent_count, evaluated_at)
+         values ($1, $2, $3, $4, 9101, 'onFeatures', 'enter', 1,
+                 array['edge']::text[], 'snap', $5::jsonb, 0, now())`,
+        [
+          uuidV7(),
+          chain.runId,
+          chain.instanceId,
+          chain.marketId,
+          JSON.stringify({ edge: 0.012, probability: 0.5 }),
+        ],
+      ),
+    );
+
+    expect(errorCode(error)).toBe("23514");
+    expect((error as { constraint?: string }).constraint).toBe(
+      "decisions_model_outputs_decimal_safe",
+    );
+  });
+
+  it("REJECTS a number nested deep inside model outputs", async () => {
+    const error = await captureRejection(async () =>
+      context.pool.query(
+        `insert into strategy.decisions
+           (decision_id, run_id, instance_id, market_id, evaluation_seq, callback,
+            decision_type, decision_contract_version, reason_codes, feature_snapshot_ref,
+            model_outputs, intent_count, evaluated_at)
+         values ($1, $2, $3, $4, 9102, 'onFeatures', 'enter', 1,
+                 array['edge']::text[], 'snap', $5::jsonb, 0, now())`,
+        [
+          uuidV7(),
+          chain.runId,
+          chain.instanceId,
+          chain.marketId,
+          JSON.stringify({ features: { ladder: [{ fair: 0.51 }] } }),
+        ],
+      ),
+    );
+
+    expect(errorCode(error)).toBe("23514");
+  });
+
+  it("accepts model outputs written as canonical decimal strings", async () => {
+    const inserted = await context.pool.query(
+      `insert into strategy.decisions
+         (decision_id, run_id, instance_id, market_id, evaluation_seq, callback,
+          decision_type, decision_contract_version, reason_codes, feature_snapshot_ref,
+          model_outputs, intent_count, evaluated_at)
+       values ($1, $2, $3, $4, 9103, 'onFeatures', 'enter', 1,
+               array['edge']::text[], 'snap', $5::jsonb, 0, now())`,
+      [
+        uuidV7(),
+        chain.runId,
+        chain.instanceId,
+        chain.marketId,
+        JSON.stringify({ edge: "0.012", stale: false, note: null }),
+      ],
+    );
+
+    expect(inserted.rowCount).toBe(1);
   });
 
   it("still allows numbers where they are schema keywords, not economics", async () => {

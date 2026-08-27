@@ -87,6 +87,31 @@ describe("assertDecimalSafeJson", () => {
     expect(() => assertDecimalSafeJson(undefined, "payload")).not.toThrow();
   });
 
+  it("rejects a number in a decision's model outputs (round-2 correction)", () => {
+    // `strategy.decisions.model_outputs` was exempted as "model scores, not
+    // money". §7.5 / ADR-005 type a model output as
+    // `DecimalString | string | boolean | null`, and `packages/domain` rejects a
+    // number for it, so the exemption contradicted the frozen contract — and an
+    // edge or a probability is exactly what sizing is computed from. It is
+    // guarded like every other economics-bearing document now.
+    try {
+      assertDecimalSafeJson({ edge: 0.012 }, "decisions.model_outputs");
+      throw new Error("unreachable");
+    } catch (error) {
+      expect((error as DecimalSafeJsonError).code).toBe("ECONOMIC_JSON_NUMBER");
+      expect((error as DecimalSafeJsonError).message).toMatch(/decisions\.model_outputs\.edge/u);
+    }
+  });
+
+  it("accepts model outputs written as canonical strings", () => {
+    expect(() =>
+      assertDecimalSafeJson(
+        { edge: "0.012", stale: false, note: null },
+        "decisions.model_outputs",
+      ),
+    ).not.toThrow();
+  });
+
   it("names the field it was given, so an operator knows which payload failed", () => {
     try {
       assertDecimalSafeJson({ price: 1 }, "order_events.payload");

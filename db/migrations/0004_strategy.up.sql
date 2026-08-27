@@ -285,6 +285,16 @@ create table strategy.decisions (
   constraint decisions_intent_count_non_negative check (intent_count >= 0),
   constraint decisions_duration_non_negative check (
     evaluation_duration_us is null or evaluation_duration_us >= 0
+  ),
+  -- §7.5 / ADR-005: `modelOutputs` is
+  -- `Record<string, DecimalString | string | boolean | null>`, and
+  -- `packages/domain/src/decision.ts` rejects a JavaScript number for exactly the
+  -- §6 invariant 1 reason. A model score is not "not money": an edge, a
+  -- probability, or a fair value is what the sizing and the veto thresholds are
+  -- computed from, so a double here becomes a rounding error in an order. The
+  -- rule is the domain contract's; this CHECK makes it hold for every writer.
+  constraint decisions_model_outputs_decimal_safe check (
+    not internal.jsonb_contains_number(model_outputs)
   )
 );
 

@@ -494,6 +494,55 @@ $$;
 comment on function internal.assert_text_array_elements() is
   'Checks each element of a text[] column against a type or domain named in the trigger arguments, and rejects NULL elements.';
 
+-- Is there a JSON *number* anywhere inside this document?
+--
+-- §6 invariant 1 and docs/contracts/domain.md §3.2/§4: an economic value has
+-- exactly one representation and a JSON number is not it — `0.012` is stored as
+-- the nearest binary double by every producer that writes it, so a model's edge
+-- or probability written as a number is already a rounding error by the time it
+-- reaches the database. `packages/storage-postgres/src/json.ts` enforces this at
+-- the repository boundary; this function is the same rule as a database fact, so
+-- it holds for a writer that never goes through that package.
+--
+-- IMMUTABLE, so it can be used in a CHECK: it reads only its argument.
+create function internal.jsonb_contains_number(document jsonb) returns boolean
+language plpgsql
+immutable
+parallel safe
+as $$
+declare
+  child jsonb;
+begin
+  if document is null then
+    return false;
+  end if;
+
+  case jsonb_typeof(document)
+    when 'number' then
+      return true;
+    when 'array' then
+      for child in select jsonb_array_elements(document) loop
+        if internal.jsonb_contains_number(child) then
+          return true;
+        end if;
+      end loop;
+    when 'object' then
+      for child in select value from jsonb_each(document) loop
+        if internal.jsonb_contains_number(child) then
+          return true;
+        end if;
+      end loop;
+    else
+      return false;
+  end case;
+
+  return false;
+end;
+$$;
+
+comment on function internal.jsonb_contains_number(jsonb) is
+  'True when a jsonb document holds a JSON number at any depth. Economic documents hold canonical decimal strings instead (§6 invariant 1, §7.3).';
+
 -- TRUNCATE is not an UPDATE or a DELETE, so no row-level guard sees it. A
 -- mutable table whose rows are still *facts* — a reservation, the projection a
 -- reservation constrains — therefore needs a statement-level guard of its own,

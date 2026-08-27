@@ -21,6 +21,7 @@ import { createPostgresPool } from "../pool.js";
 import type { PostgresPool } from "../pool.js";
 import type { Repositories } from "../repositories/index.js";
 import { createRepositories } from "../repositories/index.js";
+import { isRealOrderRunMode } from "../schema/enums.js";
 import type { RunModeValue } from "../schema/enums.js";
 
 /** A migrated database plus its handles. */
@@ -97,6 +98,18 @@ export type TradingChain = {
   readonly approvedIntentId: string;
   readonly planId: string;
   readonly executionGroupId: string;
+  /**
+   * The signed submission attempt for this chain, or `null` in a real-order run
+   * mode.
+   *
+   * `orders_submission_requires_attempt` requires an order that reaches a
+   * submitted state to name the attempt that signed it, so most fixtures need
+   * one. A real-order-mode attempt additionally requires a valid fencing lease
+   * (`submission_attempts_live_requires_fencing_token`), and acquiring one here
+   * would take the account's fence out from under the tests that are about the
+   * fence — so a live chain signs its own attempt, under its own lease.
+   */
+  readonly submissionAttemptId: string | null;
 };
 
 export type TradingChainOptions = {
@@ -114,7 +127,9 @@ export async function createTradingChain(
   options: TradingChainOptions = {},
 ): Promise<TradingChain> {
   const environment: RunModeValue = options.environment ?? "PAPER";
-  const accountRef = options.accountRef ?? "test-account";
+  // `null` is a *choice* — a simulated chain that names no account — and must not
+  // be defaulted away; only an omitted option takes the default.
+  const accountRef = options.accountRef === undefined ? "test-account" : options.accountRef;
   const label = options.label ?? uuidV7().slice(0, 8);
   const tokenId = String(1_000_000 + Math.floor(Math.random() * 1_000_000));
 
@@ -192,6 +207,7 @@ export async function createTradingChain(
   const approvedIntentId = uuidV7();
   const planId = uuidV7();
   const executionGroupId = uuidV7();
+  const submissionAttemptId = isRealOrderRunMode(environment) ? null : uuidV7();
 
   await inTransaction(context.db, async (trx) => {
     await trx
@@ -275,6 +291,24 @@ export async function createTradingChain(
         shares: "10",
       })
       .execute();
+
+    if (submissionAttemptId !== null) {
+      await trx
+        .insertInto("execution.submission_attempts")
+        .values({
+          submission_attempt_id: submissionAttemptId,
+          execution_group_id: executionGroupId,
+          plan_id: planId,
+          environment,
+          account_ref: accountRef,
+          attempt_ordinal: 1,
+          // Economic fields inside a signed payload are decimal strings.
+          signed_payload: { price: "0.42", size: "10" },
+          salt: `salt-${label}`,
+          state: "SIGNED",
+        })
+        .execute();
+    }
   });
 
   return {
@@ -290,5 +324,6 @@ export async function createTradingChain(
     approvedIntentId,
     planId,
     executionGroupId,
+    submissionAttemptId,
   };
 }

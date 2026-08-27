@@ -100,10 +100,17 @@ document rather than in a column, so those inputs are typed
 `DecimalSafeJsonInput` (no `number` at any depth) and are deep-checked at the
 repository boundary by `assertDecimalSafeJson()` — including when the document
 arrives pre-serialized, because `JSON.stringify` must not be a way around the
-rule. Three payloads are deliberately exempt and say why in
-`src/json.ts`: `params_schema` (a JSON Schema, where `maximum` is a keyword),
-`response_payload` and `rate_limit_snapshots.headers` (verbatim venue evidence,
-never read as economic truth), and `decisions.model_outputs` (model scores).
+rule. Two kinds of payload are deliberately exempt and say why in `src/json.ts`:
+`params_schema` (a JSON Schema, where `maximum` is a keyword), and
+`response_payload` / `rate_limit_snapshots.headers` (verbatim venue evidence,
+never read as economic truth).
+
+`decisions.model_outputs` used to be exempt as "model scores, not money"; it is
+not. §7.5 and ADR-005 type a model output as
+`DecimalString | string | boolean | null`, an edge or a probability is what
+sizing and the risk thresholds are computed from, and the database rejects a
+JSON number there as well (`decisions_model_outputs_decimal_safe`, built on
+`internal.jsonb_contains_number()`).
 
 Timestamps cross the boundary as ISO-8601 strings, never as `Date`: connections
 run with `TimeZone=UTC` and `DateStyle=ISO`, and `src/timestamps.ts` converts
@@ -122,9 +129,13 @@ exactly, throwing rather than guessing if a session was configured otherwise.
 | Every live order references a valid fencing token | CHECK + composite foreign key to `(lease, token)` + `internal.assert_valid_fencing_reference()`, which reads the lease **under a row lock** and judges expiry by the **database clock** — plus composite foreign keys binding the order's `environment`/`account_ref` to its plan, so the discriminator the CHECK reads cannot disagree with the authorizing chain |
 | Fill allocation sum equals fill quantity | immediate trigger (never exceed) + deferred constraint trigger (equal at COMMIT) |
 | Ledger transaction balances to zero per asset | deferred constraint trigger on both `ledger_transactions` and `ledger_entries` |
-| No negative available balance | `GENERATED ALWAYS` `available_amount` + `balance_projection_no_negative_available` CHECK, with `reserved_amount` recomputed from `inventory_reservations` by trigger and **validated on every write** by `accounting.assert_reserved_amount_matches_reservations()` (`PMB08`) |
+| No negative available balance | `GENERATED ALWAYS` `available_amount` + `balance_projection_no_negative_available` CHECK, with `reserved_amount` recomputed from `inventory_reservations` by trigger and **validated on every write** by `accounting.assert_reserved_amount_matches_reservations()` (`PMB08`); the row's key (`account_ref`, `environment`, `asset_id`) is immutable (`balance_projection_immutable_key`, `PMB02`), so a balance cannot be moved to a key with no reservations instead of being rewritten |
 | One active live owner per market | partial unique index `market_ownership_one_active_live_owner` keyed by `(market_id, internal.execution_realm(environment))`, with `environment` bound to the owning instance by composite foreign key |
 | Exactly one fenced live writer per account (§2, ADR-008) | partial unique index `fencing_leases_one_active_holder (account_ref, internal.execution_realm(environment))`, plus `fencing_leases_real_modes_only` so no simulated run mode can hold a live lease at all |
+| A fencing token is never reused (ADR-008 §1) | monotonicity is checked against `ops.fencing_token_high_water`, which only ever increases per `(account_ref, execution_realm)` and may not be lowered, deleted, or truncated — so erasing lease rows cannot re-open a token; the lease state machine is forward-only (`fencing_leases_forward_only`, `PMB10`), so a released, revoked, or expired lease cannot be reactivated with its old token; and `ops.fencing_leases` rejects DELETE and TRUNCATE outright |
+| A fill belongs to the account of the order it fills | composite foreign key on a **never-NULL** generated `account_key` (`coalesce(account_ref, '')`) on both sides, so a NULL child account cannot skip the binding the way MATCH SIMPLE allowed |
+| A ledger transaction agrees with what it books | composite foreign keys binding `environment`, `account_ref`, and `market_id` to the referenced order, fill, wallet operation, and reconciliation run, plus `(fill_id, order_id)`; scoped to rows that reference one, so external clearing, manual adjustments, and resolutions still stand alone |
+| Decision → plan → attempt → order → fill (§9.11) | `orders_submission_requires_attempt` (an order that reaches a submitted state, carries a venue identity, a submission timestamp, or any fill names the attempt that signed it), `execution.assert_fill_order_has_submission_attempt()` (`PMB11`) on the fill side, and `orders_submission_attempt_attach_only` (`PMB02`), which lets an attempt be attached once and never detached |
 
 ### 6.0 The environment discriminator is derived, never declared
 
@@ -188,19 +199,24 @@ Two §10.7-adjacent properties could not be expressed as a database constraint:
   monotonicity itself *is* a database constraint (`ops.assert_fencing_token_monotonic`
   rejects any token that is not above every token ever issued for the account and
   execution realm). What the database cannot do alone is *choose* the next token;
-  `acquireLease` reads the maximum under a transaction-scoped advisory lock.
-  Without the lock two acquirers would read the same maximum and one would be
+  `acquireLease` reads the high-water mark under a transaction-scoped advisory
+  lock. Without the lock two acquirers would read the same mark and one would be
   rejected by the trigger — correct, but as a constraint violation rather than a
   wait.
-- **A `jsonb` document's interior.** PostgreSQL would accept a deep check as a
-  constraint, but the document is already a JavaScript value by the time it
-  reaches this boundary, so `{"price": 0.42}` has been a double since before the
-  statement existed. `assertDecimalSafeJson()` rejects it where it can still be
-  attributed to the caller that produced it.
+- **A `jsonb` document's interior.** The document is already a JavaScript value
+  by the time it reaches this boundary, so `{"price": 0.42}` has been a double
+  since before the statement existed, and `assertDecimalSafeJson()` rejects it
+  where it can still be attributed to the caller that produced it. That is why
+  the guard is here and not only in the database — but where the vocabulary is
+  narrow enough to state in SQL, it is *also* a constraint:
+  `internal.jsonb_contains_number()` rejects a JSON number anywhere inside
+  `strategy.decisions.model_outputs` for every writer.
 
 Everything else in §10.7 is a database constraint, and each is tested against a
 writer that does **not** go through this package's repositories
-(`test/integration/postgres/authority-bypass.test.ts`).
+(`test/integration/postgres/authority-bypass.test.ts` for the round-1 findings,
+`authority-bypass-round2.test.ts` for the round-2 ones — every sequence in both
+was reproduced against the reviewed schema before it was closed).
 
 ## 7. Environment separation (§10.8)
 

@@ -328,12 +328,16 @@ describe("HIGH-3: fencing cannot be bypassed by discriminator or clock", () => {
   it("REJECTS an order that claims a simulated environment on a LIVE plan", async () => {
     // The bypass: the CHECK reads the order's own discriminator, so an order
     // that named a LIVE plan but claimed PAPER skipped fencing entirely.
+    //
+    // `PLANNED`, so the mislabelled discriminator is the only thing wrong with
+    // the row: a submitted state would additionally need the attempt that signed
+    // it (round 2), and the CHECK would report before the foreign key does.
     const error = await captureRejection(async () =>
       context.pool.query(
         `insert into execution.orders
            (order_id, plan_id, market_id, token_id, environment, account_ref,
             side, limit_price, original_shares, state)
-         values ($1, $2, $3, $4, 'PAPER', $5, 'BUY', '0.42', '1', 'LIVE')`,
+         values ($1, $2, $3, $4, 'PAPER', $5, 'BUY', '0.42', '1', 'PLANNED')`,
         [uuidV7(), liveChain.planId, liveChain.marketId, liveChain.tokenId, ORDER_ACCOUNT],
       ),
     );
@@ -364,7 +368,7 @@ describe("HIGH-3: fencing cannot be bypassed by discriminator or clock", () => {
         `insert into execution.orders
            (order_id, plan_id, market_id, token_id, environment, account_ref,
             side, limit_price, original_shares, state)
-         values ($1, $2, $3, $4, 'PAPER', 'some-other-account', 'BUY', '0.42', '1', 'LIVE')`,
+         values ($1, $2, $3, $4, 'PAPER', 'some-other-account', 'BUY', '0.42', '1', 'PLANNED')`,
         [uuidV7(), paperChain.planId, paperChain.marketId, paperChain.tokenId],
       ),
     );
@@ -466,17 +470,30 @@ describe("HIGH-3: fencing cannot be bypassed by discriminator or clock", () => {
       holderId: "legitimate-holder",
       expiresAt: new Date(Date.now() + 300_000).toISOString(),
     });
+    const fencing = {
+      fencingLeaseId: lease.fencingLeaseId,
+      fencingToken: lease.fencingToken,
+    };
+
+    const submissionAttemptId = await context.repositories.orders.recordSubmissionAttempt({
+      executionGroupId: liveChain.executionGroupId,
+      planId: liveChain.planId,
+      signedPayload: { price: "0.42", size: "1" },
+      salt: "legitimate-salt",
+      fencing,
+    });
 
     const orderId = await context.repositories.orders.insertOrder({
       planId: liveChain.planId,
       executionGroupId: liveChain.executionGroupId,
+      submissionAttemptId,
       marketId: liveChain.marketId,
       tokenId: liveChain.tokenId,
       side: "BUY",
       limitPrice: "0.42",
       originalShares: "1",
       state: "LIVE",
-      fencing: { fencingLeaseId: lease.fencingLeaseId, fencingToken: lease.fencingToken },
+      fencing,
     });
 
     const order = await context.repositories.orders.findOrder(orderId);
@@ -488,6 +505,7 @@ describe("HIGH-3: fencing cannot be bypassed by discriminator or clock", () => {
     const orderId = await context.repositories.orders.insertOrder({
       planId: paperChain.planId,
       executionGroupId: paperChain.executionGroupId,
+      submissionAttemptId: paperChain.submissionAttemptId,
       marketId: paperChain.marketId,
       tokenId: paperChain.tokenId,
       side: "BUY",

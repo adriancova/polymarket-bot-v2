@@ -160,6 +160,78 @@ describe("migrations", () => {
     expect(fillsIdentity.rows[0]?.indexdef).toMatch(/NULLS NOT DISTINCT/iu);
   });
 
+  it("create the round-2 authority constraints as database objects too", async () => {
+    const pool = poolFor(getConnectionString());
+
+    const constraints = await pool.query<{ conname: string; definition: string }>(
+      `select conname, pg_get_constraintdef(oid) as definition from pg_constraint
+        where conname in (
+          'fills_order_account_fk',
+          'orders_submission_requires_attempt',
+          'decisions_model_outputs_decimal_safe',
+          'ledger_transactions_order_environment_fk',
+          'ledger_transactions_order_account_fk',
+          'ledger_transactions_fill_environment_fk',
+          'ledger_transactions_fill_account_fk',
+          'ledger_transactions_fill_order_fk',
+          'ledger_transactions_wallet_operation_environment_fk',
+          'ledger_transactions_reconciliation_run_environment_fk'
+        )`,
+    );
+    const byName = new Map(constraints.rows.map((row) => [row.conname, row.definition]));
+
+    expect([...byName.keys()].sort((a, b) => a.localeCompare(b))).toEqual([
+      "decisions_model_outputs_decimal_safe",
+      "fills_order_account_fk",
+      "ledger_transactions_fill_account_fk",
+      "ledger_transactions_fill_environment_fk",
+      "ledger_transactions_fill_order_fk",
+      "ledger_transactions_order_account_fk",
+      "ledger_transactions_order_environment_fk",
+      "ledger_transactions_reconciliation_run_environment_fk",
+      "ledger_transactions_wallet_operation_environment_fk",
+      "orders_submission_requires_attempt",
+    ]);
+
+    // The account binding is keyed on the never-NULL `account_key`, which is
+    // what makes it unskippable: MATCH SIMPLE over a nullable `account_ref` was
+    // the round-2 HIGH-3 bypass.
+    expect(byName.get("fills_order_account_fk")).toMatch(/account_key/u);
+
+    const triggers = await pool.query<{ tgname: string; table_name: string }>(
+      `select t.tgname, c.relname as table_name
+         from pg_trigger t join pg_class c on c.oid = t.tgrelid
+        where not t.tgisinternal
+          and t.tgname in (
+            'balance_projection_immutable_key',
+            'fencing_leases_forward_only',
+            'fencing_leases_no_delete',
+            'fencing_leases_no_truncate',
+            'fencing_token_high_water_monotonic',
+            'fills_order_has_submission_attempt',
+            'orders_submission_attempt_attach_only'
+          )`,
+    );
+    expect(triggers.rows.map((row) => row.tgname).sort((a, b) => a.localeCompare(b))).toEqual([
+      "balance_projection_immutable_key",
+      "fencing_leases_forward_only",
+      "fencing_leases_no_delete",
+      "fencing_leases_no_truncate",
+      "fencing_token_high_water_monotonic",
+      "fills_order_has_submission_attempt",
+      "orders_submission_attempt_attach_only",
+    ]);
+
+    // The token sequence lives in a table of its own, so deleting lease rows
+    // cannot lower it (ADR-008 §1).
+    const highWater = await pool.query<{ count: string }>(
+      `select count(*)::text as count from pg_class c
+         join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'ops' and c.relname = 'fencing_token_high_water'`,
+    );
+    expect(highWater.rows[0]?.count).toBe("1");
+  });
+
   it("keep the reservation facts authoritative for every writer (§10.7)", async () => {
     const pool = poolFor(getConnectionString());
 

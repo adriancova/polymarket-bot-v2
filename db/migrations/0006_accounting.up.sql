@@ -48,7 +48,12 @@ create table accounting.wallet_operations (
   updated_at timestamptz not null default now(),
   constraint wallet_operations_confirmed_consistent check (
     (state = 'CONFIRMED') = (confirmed_at is not null)
-  )
+  ),
+  -- Foreign-key targets for `accounting.ledger_transactions`: a transaction that
+  -- books a wallet operation may not label itself with another environment or
+  -- account than the operation it books.
+  constraint wallet_operations_id_environment_unique unique (wallet_operation_id, environment),
+  constraint wallet_operations_id_account_unique unique (wallet_operation_id, account_ref)
 );
 
 create index wallet_operations_open_idx
@@ -121,7 +126,49 @@ create table accounting.ledger_transactions (
   constraint ledger_transactions_not_self_reversing check (
     reverses_ledger_transaction_id is null
     or reverses_ledger_transaction_id <> ledger_transaction_id
-  )
+  ),
+  -- The discriminators of a transaction that names an execution or wallet fact
+  -- are that fact's, not independent labels.
+  --
+  -- `environment`, `account_ref`, and `market_id` were plain columns beside
+  -- scalar `order_id`/`fill_id`/`wallet_operation_id` references, so a balanced,
+  -- append-only transaction could book a LIVE fill while calling itself PAPER,
+  -- or book one account's fill under another account's name — and the ledger is
+  -- the monetary source of truth (ADR-006 §1), so that is a corruption of the
+  -- thing every projection is rebuilt from. Append-only makes it permanent.
+  --
+  -- MATCH SIMPLE is exactly right here: each key is enforced for a transaction
+  -- that *does* reference the row in question and skipped for one that does not,
+  -- so external clearing, manual adjustments, and resolutions still stand alone
+  -- with discriminators of their own (§9.15).
+  constraint ledger_transactions_order_environment_fk
+    foreign key (order_id, environment)
+    references execution.orders (order_id, environment),
+  constraint ledger_transactions_order_account_fk
+    foreign key (order_id, account_ref)
+    references execution.orders (order_id, account_ref),
+  constraint ledger_transactions_order_market_fk
+    foreign key (order_id, market_id)
+    references execution.orders (order_id, market_id),
+  constraint ledger_transactions_fill_environment_fk
+    foreign key (fill_id, environment)
+    references execution.fills (fill_id, environment),
+  constraint ledger_transactions_fill_account_fk
+    foreign key (fill_id, account_ref)
+    references execution.fills (fill_id, account_ref),
+  constraint ledger_transactions_fill_market_fk
+    foreign key (fill_id, market_id)
+    references execution.fills (fill_id, market_id),
+  -- A transaction that names both must name a fill *of that order*.
+  constraint ledger_transactions_fill_order_fk
+    foreign key (fill_id, order_id)
+    references execution.fills (fill_id, order_id),
+  constraint ledger_transactions_wallet_operation_environment_fk
+    foreign key (wallet_operation_id, environment)
+    references accounting.wallet_operations (wallet_operation_id, environment),
+  constraint ledger_transactions_wallet_operation_account_fk
+    foreign key (wallet_operation_id, account_ref)
+    references accounting.wallet_operations (wallet_operation_id, account_ref)
 );
 
 create index ledger_transactions_account_idx
@@ -273,6 +320,28 @@ create table accounting.balance_projection (
     available_amount::numeric >= 0
   )
 );
+
+-- The identity of a balance is not a mutable field.
+--
+-- `(account_ref, environment, asset_id)` is the primary key, and PostgreSQL lets
+-- an UPDATE change a primary key. The reservation guard below judges a write by
+-- the key the row will have, so
+--
+--   update accounting.balance_projection
+--      set account_ref = 'other', reserved_amount = '0'
+--    where account_ref = 'original' ...
+--
+-- passed whenever the destination key had no reservations (expected total 0,
+-- supplied 0), and left the original account's reservations pointing at a
+-- balance row that no longer existed — the same oversubscription the round-1
+-- guard closed, reached by moving the balance instead of by rewriting it. A
+-- projection row is *identified* by the account, environment, and asset it
+-- projects; a different key is a different row, written as such.
+create trigger balance_projection_immutable_key
+  before update on accounting.balance_projection
+  for each row execute function internal.forbid_column_change(
+    'account_ref', 'environment', 'asset_id'
+  );
 
 create trigger balance_projection_set_updated_at
   before update on accounting.balance_projection

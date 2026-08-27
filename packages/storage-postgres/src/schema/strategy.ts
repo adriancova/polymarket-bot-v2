@@ -13,6 +13,7 @@ import type {
   Identifier,
   DecimalSafeJsonColumn,
   JsonColumn,
+  NullableDecimalSafeJsonColumn,
   NullableJsonColumn,
   Sha256Hex,
   TextArrayColumnWithDefault,
@@ -148,7 +149,14 @@ export type StrategyDecisionsTable = AppendOnlyTable<{
   reason_codes: TextArrayColumnWithDefault<Code>;
   feature_snapshot_ref: Identifier;
   feature_snapshot_id: UuidV7Column | null;
-  model_outputs: NullableJsonColumn;
+  /**
+   * §7.5 / ADR-005: `Record<string, DecimalString | string | boolean | null>`.
+   * A model output is an edge, a probability, or a fair value — the inputs to
+   * sizing and to the risk thresholds — so a JavaScript number here is a
+   * rounding error with a downstream order attached. The database rejects one
+   * too (`decisions_model_outputs_decimal_safe`).
+   */
+  model_outputs: NullableDecimalSafeJsonColumn;
   state_patch: NullableJsonColumn;
   next_wakeup_at: TimestampColumn | null;
   source_event_id: Uuid | null;

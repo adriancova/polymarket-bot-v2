@@ -100,31 +100,176 @@ create trigger fencing_leases_immutable_grant
     'holder_id', 'acquired_at'
   );
 
+-- The lease state machine is forward-only: ACTIVE → (EXPIRED | RELEASED |
+-- REVOKED), and nothing else.
+--
+-- The immutability trigger above protects the *grant* — token, account,
+-- environment, holder, acquisition — but `status`, `released_at`, and
+-- `expires_at` were freely writable, so
+--
+--   update ops.fencing_leases
+--      set status = 'ACTIVE', released_at = null,
+--          expires_at = clock_timestamp() + interval '5 minutes'
+--    where fencing_lease_id = <a released lease>
+--
+-- resurrected a lease that had already been handed over: the old holder and the
+-- old token become valid again, and ADR-008 §1's "a token is never reused" is
+-- violated by an UPDATE rather than by an INSERT. Authority that has ended has
+-- ended; the only way to hold the fence again is a fresh grant, which allocates
+-- a fresh token. A terminal lease is frozen outright — it is history, and the
+-- takeover path only ever touches ACTIVE rows.
+create function ops.assert_fencing_lease_forward_only() returns trigger
+language plpgsql
+as $$
+begin
+  if old.status <> 'ACTIVE' then
+    raise exception
+      using errcode = 'PMB10',
+        message = format(
+          'fencing lease %s is %s: a lease that has ended cannot be changed or reactivated',
+          old.fencing_lease_id, old.status
+        ),
+        hint = 'Acquire a new lease; it allocates a new token (ADR-008 §1, §9.18).';
+  end if;
+
+  return new;
+end;
+$$;
+
+comment on function ops.assert_fencing_lease_forward_only() is
+  'Rejects any change to a lease that is no longer ACTIVE, including resurrection (ADR-008 §1). SQLSTATE PMB10.';
+
+create trigger fencing_leases_forward_only
+  before update on ops.fencing_leases
+  for each row execute function ops.assert_fencing_lease_forward_only();
+
+-- A lease row is history, so it is never deleted either: `max(fencing_token)`
+-- over a table someone can delete from is not a monotonic sequence, and the
+-- high-water mark below exists precisely because the lease rows can be missing.
+-- Both guards are here because they fail differently — this one keeps the audit
+-- trail, that one keeps the token.
+create trigger fencing_leases_no_delete
+  before delete on ops.fencing_leases
+  for each row execute function internal.forbid_update_delete();
+
+create trigger fencing_leases_no_truncate
+  before truncate on ops.fencing_leases
+  for each statement execute function internal.forbid_truncate();
+
+-- ---------------------------------------------------------------------------
+-- fencing_token_high_water — the token sequence, independent of lease history
+-- ---------------------------------------------------------------------------
+--
+-- ADR-008 §1: "A token is never reused, never decremented." Deriving the next
+-- token from `max(fencing_token)` over `ops.fencing_leases` made that claim only
+-- as durable as the lease rows: delete the released history for an account and
+-- the maximum drops, so the *next* acquisition re-issues a token a previous
+-- holder already used — and a late write from that holder becomes
+-- indistinguishable from a current one, which is the entire purpose of the
+-- token. This table only ever increases, per account and execution realm, and
+-- may not be deleted from or truncated, so erasing lease rows cannot reopen a
+-- token.
+create table ops.fencing_token_high_water (
+  account_ref internal.identifier not null,
+  -- The realm string from internal.execution_realm(), not a run mode: the token
+  -- sequence is per real authority, and all three real-order modes share it.
+  execution_realm text not null,
+  highest_token bigint not null,
+  first_issued_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (account_ref, execution_realm),
+  constraint fencing_token_high_water_positive check (highest_token >= 1)
+);
+
+comment on table ops.fencing_token_high_water is
+  'Highest fencing token ever issued per account and execution realm. Monotonic and non-erasable, so deleting lease rows cannot re-issue a token (ADR-008 §1).';
+
+-- The high-water mark itself moves in one direction and never disappears.
+create function ops.assert_fencing_high_water_monotonic() returns trigger
+language plpgsql
+as $$
+begin
+  if tg_op = 'DELETE' then
+    raise exception
+      using errcode = 'PMB07',
+        message = format(
+          'the fencing token high-water mark for account %s in realm %s may not be deleted',
+          old.account_ref, old.execution_realm
+        ),
+        hint = 'Deleting it would re-issue tokens that were already used (ADR-008 §1).';
+  end if;
+
+  if new.account_ref <> old.account_ref or new.execution_realm <> old.execution_realm then
+    raise exception
+      using errcode = 'PMB07',
+        message = 'the identity of a fencing token high-water mark is immutable';
+  end if;
+
+  if new.highest_token < old.highest_token then
+    raise exception
+      using errcode = 'PMB07',
+        message = format(
+          'fencing token high-water mark for account %s would fall from %s to %s',
+          old.account_ref, old.highest_token, new.highest_token
+        ),
+        hint = 'Fencing tokens are monotonic and never reused (§9.18, ADR-008 §1).';
+  end if;
+
+  return new;
+end;
+$$;
+
+create trigger fencing_token_high_water_monotonic
+  before update or delete on ops.fencing_token_high_water
+  for each row execute function ops.assert_fencing_high_water_monotonic();
+
+create trigger fencing_token_high_water_no_truncate
+  before truncate on ops.fencing_token_high_water
+  for each statement execute function internal.forbid_truncate();
+
 -- ADR-008 §1: "A token is never reused, never decremented." Scoped by execution
 -- realm rather than by run mode, so a LIVE_MICRO takeover of an account a LIVE
 -- process was fencing continues the same sequence instead of restarting at 1 —
 -- a restarted sequence would make a stale write from the previous holder
 -- indistinguishable from a current one, which is the whole point of the token.
+--
+-- The comparison is against the high-water mark rather than against the lease
+-- rows, so it does not depend on any lease row still being there. The advance is
+-- the same statement as the comparison: `on conflict ... where` updates only
+-- when the new token really is higher, and `row_count = 0` means it was not —
+-- which also serializes two concurrent acquisitions on the same row rather than
+-- letting both read the same "highest".
 create function ops.assert_fencing_token_monotonic() returns trigger
 language plpgsql
 as $$
 declare
+  realm text := internal.execution_realm(new.environment);
+  advanced integer;
   highest_token bigint;
 begin
-  select max(l.fencing_token) into highest_token
-  from ops.fencing_leases as l
-  where l.account_ref = new.account_ref
-    and internal.execution_realm(l.environment) = internal.execution_realm(new.environment)
-    and l.fencing_lease_id <> new.fencing_lease_id;
+  insert into ops.fencing_token_high_water as h
+    (account_ref, execution_realm, highest_token)
+  values (new.account_ref, realm, new.fencing_token)
+  on conflict (account_ref, execution_realm) do update
+    set highest_token = excluded.highest_token,
+        updated_at = now()
+    where h.highest_token < excluded.highest_token;
 
-  if highest_token is not null and new.fencing_token <= highest_token then
+  get diagnostics advanced = row_count;
+
+  if advanced = 0 then
+    select h.highest_token into highest_token
+    from ops.fencing_token_high_water as h
+    where h.account_ref = new.account_ref
+      and h.execution_realm = realm;
+
     raise exception
       using errcode = 'PMB07',
         message = format(
           'fencing token %s for account %s is not above the highest issued token %s',
           new.fencing_token, new.account_ref, highest_token
         ),
-        hint = 'Fencing tokens are monotonic and never reused (§9.18, ADR-008 §1).';
+        hint = 'Fencing tokens are monotonic and never reused, and deleting lease history does not release one (§9.18, ADR-008 §1).';
   end if;
 
   return new;
@@ -257,7 +402,14 @@ create table ops.reconciliation_runs (
   constraint reconciliation_runs_counts_non_negative check (
     orders_checked >= 0 and fills_checked >= 0
     and wallet_operations_checked >= 0 and breaks_found >= 0
-  )
+  ),
+  -- Foreign-key targets for `accounting.ledger_transactions` (migration 0008): a
+  -- reconciliation correction is booked in the environment and against the
+  -- account the reconciliation run actually examined (§9.17, ADR-006 §5.2).
+  constraint reconciliation_runs_id_environment_unique
+    unique (reconciliation_run_id, environment),
+  constraint reconciliation_runs_id_account_unique
+    unique (reconciliation_run_id, account_ref)
 );
 
 create index reconciliation_runs_account_idx

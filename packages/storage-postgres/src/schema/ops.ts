@@ -59,6 +59,24 @@ export type OpsFencingLeasesTable = {
   updated_at: TimestampColumnWithDefault;
 };
 
+/**
+ * The fencing token sequence per account and execution realm (ADR-008 §1).
+ *
+ * Not one of the §10.6 tables: it holds no operational record, only the highest
+ * token ever issued, so that "a token is never reused" survives the deletion of
+ * the lease rows that used it. It only ever increases and may not be deleted
+ * from or truncated; the acquisition trigger advances it in the same statement
+ * that checks it.
+ */
+export type OpsFencingTokenHighWaterTable = {
+  account_ref: Identifier;
+  /** The `internal.execution_realm()` string, not a run mode. */
+  execution_realm: string;
+  highest_token: BigIntColumn;
+  first_issued_at: TimestampColumnWithDefault;
+  updated_at: TimestampColumnWithDefault;
+};
+
 /** §10.6 `risk_events` — vetoes, breakers, exposure violations (§9.8). */
 export type OpsRiskEventsTable = AppendOnlyTable<{
   risk_event_id: WithDefault<UuidV7Column>;
@@ -191,6 +209,7 @@ export type OpsHealthSnapshotsTable = AppendOnlyTable<{
 /** Every `ops` table, keyed by its qualified name. */
 export type OpsSchema = {
   "ops.fencing_leases": OpsFencingLeasesTable;
+  "ops.fencing_token_high_water": OpsFencingTokenHighWaterTable;
   "ops.risk_events": OpsRiskEventsTable;
   "ops.incidents": OpsIncidentsTable;
   "ops.reconciliation_runs": OpsReconciliationRunsTable;

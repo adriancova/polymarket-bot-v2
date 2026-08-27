@@ -145,8 +145,22 @@ create trigger submission_attempts_valid_fencing_reference
 -- ---------------------------------------------------------------------------
 -- §9.17: a reconciliation correction is a ledger transaction (ADR-006 §5.2)
 -- ---------------------------------------------------------------------------
+--
+-- Bound the same way as the order, fill, and wallet-operation references in
+-- migration 0006: a correction is booked in the environment and against the
+-- account the reconciliation run examined, not under labels of its own.
 
 alter table accounting.ledger_transactions
   add constraint ledger_transactions_reconciliation_run_fk
   foreign key (reconciliation_run_id)
   references ops.reconciliation_runs (reconciliation_run_id);
+
+alter table accounting.ledger_transactions
+  add constraint ledger_transactions_reconciliation_run_environment_fk
+  foreign key (reconciliation_run_id, environment)
+  references ops.reconciliation_runs (reconciliation_run_id, environment);
+
+alter table accounting.ledger_transactions
+  add constraint ledger_transactions_reconciliation_run_account_fk
+  foreign key (reconciliation_run_id, account_ref)
+  references ops.reconciliation_runs (reconciliation_run_id, account_ref);

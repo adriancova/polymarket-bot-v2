@@ -14,7 +14,11 @@
  *   * a CHECK rejects a lease in any simulated run mode outright: "paper mode
  *     cannot acquire a live fencing lease at all" (ADR-008 §2, ADR-010);
  *   * a BEFORE INSERT trigger rejects a token that is not above every token ever
- *     issued for that account and realm, so a token is never reused;
+ *     issued for that account and realm — judged against an append-only
+ *     high-water mark rather than against the surviving lease rows, so deleting
+ *     lease history cannot release a token — and the lease state machine is
+ *     forward-only, so a released lease cannot be reactivated to bring its token
+ *     back;
  *   * `execution.orders` and `execution.submission_attempts` carry a composite
  *     foreign key to `(lease, token)` plus a validity trigger that judges expiry
  *     by the database's own clock, under a row lock.
@@ -146,11 +150,17 @@ export function createFencingRepository(db: PolymarketBotDatabase) {
             .execute();
         }
 
+        // The next token comes from the high-water mark, not from
+        // `max(fencing_token)` over the lease rows: a maximum over rows that can
+        // be deleted is not a monotonic sequence, and re-issuing a spent token
+        // is exactly what ADR-008 §1 forbids. The insert trigger advances and
+        // re-checks the same mark, so a concurrent acquirer cannot slip between
+        // this read and the write.
         const highest = await trx
-          .selectFrom("ops.fencing_leases")
-          .select((eb) => eb.fn.max("fencing_token").as("highest_token"))
+          .selectFrom("ops.fencing_token_high_water")
+          .select(["highest_token"])
           .where("account_ref", "=", input.accountRef)
-          .where(sql<string>`internal.execution_realm(environment)`, "=", realm)
+          .where("execution_realm", "=", realm)
           .executeTakeFirst();
 
         const nextToken = (BigInt(highest?.highest_token ?? "0") + 1n).toString();

@@ -12,6 +12,7 @@ import type {
   AppendOnlyTable,
   BigIntColumn,
   Code,
+  DatabaseGenerated,
   DecimalString,
   Detail,
   Identifier,
@@ -129,6 +130,13 @@ export type ExecutionOrdersTable = {
   token_id: TokenId;
   environment: RunModeValue;
   account_ref: Identifier | null;
+  /**
+   * `coalesce(account_ref, '')`, computed by the database.
+   *
+   * The never-NULL form of the account binding, so the composite foreign key
+   * from `execution.fills` cannot be skipped by writing NULL (round-2 HIGH-3).
+   */
+  account_key: DatabaseGenerated<Identifier>;
   side: OrderSideValue;
   limit_price: DecimalString;
   original_shares: DecimalString;
@@ -186,6 +194,8 @@ export type ExecutionFillsTable = AppendOnlyTable<{
   token_id: TokenId;
   environment: RunModeValue;
   account_ref: Identifier | null;
+  /** `coalesce(account_ref, '')`; the fill's account binding to its order. */
+  account_key: DatabaseGenerated<Identifier>;
   venue_trade_id: Identifier;
   venue_order_id: Identifier;
   allocation_discriminator: WithDefault<Identifier>;

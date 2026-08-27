@@ -31,6 +31,18 @@ export const STORAGE_SQL_STATES = {
   reservedAmountMismatch: "PMB08",
   /** A reservation named an account/asset with no balance projection row. */
   unknownBalance: "PMB09",
+  /**
+   * A fencing lease that had ended was changed or reactivated. The lease state
+   * machine is forward-only, so authority that lapsed stays lapsed and its token
+   * stays spent (ADR-008 §1).
+   */
+  fencingLeaseNotForwardOnly: "PMB10",
+  /**
+   * A fill was recorded against an order that carries no submission attempt, so
+   * the §9.11 decision → plan → attempt → order → fill chain would have a hole
+   * where the signed payload should be.
+   */
+  missingSubmissionAttempt: "PMB11",
 } as const;
 
 /** Standard SQLSTATE codes this package translates. */
@@ -100,6 +112,25 @@ export class FencingReferenceInvalidError extends StoragePostgresError {}
 
 /** A fencing token was not strictly above every previously issued token. */
 export class FencingTokenNotMonotonicError extends StoragePostgresError {}
+
+/**
+ * A lease that had ended was changed or reactivated.
+ *
+ * ADR-008 §1: a released, revoked, or expired lease is history. Holding the
+ * fence again means acquiring a new lease, which allocates a new token — a
+ * resurrected lease would make an old holder and an already-spent token valid
+ * again.
+ */
+export class FencingLeaseNotForwardOnlyError extends StoragePostgresError {}
+
+/**
+ * A fill was recorded against an order with no submission attempt.
+ *
+ * §9.11 / §6 invariant 6: the signed payload and order hash are persisted before
+ * transmission, and are what an unknown submission is reconciled against. A fill
+ * whose order has none has no signed origin to reconcile against.
+ */
+export class MissingSubmissionAttemptError extends StoragePostgresError {}
 
 /** A reservation would drive the available balance below zero (§10.7). */
 export class NegativeAvailableBalanceError extends StoragePostgresError {}
@@ -295,6 +326,18 @@ export function mapPostgresError(error: unknown): unknown {
       );
     case STORAGE_SQL_STATES.unknownBalance:
       return new UnknownBalanceError("UNKNOWN_BALANCE", pgError.message, options);
+    case STORAGE_SQL_STATES.fencingLeaseNotForwardOnly:
+      return new FencingLeaseNotForwardOnlyError(
+        "FENCING_LEASE_NOT_FORWARD_ONLY",
+        pgError.message,
+        options,
+      );
+    case STORAGE_SQL_STATES.missingSubmissionAttempt:
+      return new MissingSubmissionAttemptError(
+        "MISSING_SUBMISSION_ATTEMPT",
+        pgError.message,
+        options,
+      );
     case PG_UNIQUE_VIOLATION:
     case PG_EXCLUSION_VIOLATION:
       return new UniqueViolationError("UNIQUE_VIOLATION", pgError.message, options);

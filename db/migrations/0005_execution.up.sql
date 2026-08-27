@@ -218,6 +218,14 @@ create table execution.orders (
   token_id internal.token_id not null,
   environment internal.run_mode not null,
   account_ref internal.identifier,
+  -- The account binding as a NEVER-NULL key, so a composite foreign key to it
+  -- cannot be skipped by writing NULL. `internal.identifier` is 1..200
+  -- characters, so the empty string is not a spelling of any account: it means
+  -- "this row names no account", and it means that on both sides of the key.
+  -- MATCH SIMPLE skips a composite foreign key whenever any of its columns is
+  -- NULL, which is exactly how a child row drops out of account-scoped exposure
+  -- and reconciliation while still passing every constraint (round-2 HIGH-3).
+  account_key text generated always as (coalesce(account_ref::text, '')) stored,
   side internal.order_side not null,
   limit_price internal.price_string not null,
   original_shares internal.positive_decimal_string not null,
@@ -246,6 +254,29 @@ create table execution.orders (
   ),
   constraint orders_real_mode_has_account check (
     not internal.is_real_order_mode(environment) or account_ref is not null
+  ),
+  -- §9.11 lineage: decision → intent → approved intent → plan → group →
+  -- submission attempt → order → fill. Without this, an order could reach a
+  -- submitted, live, or filled state with no persisted signed payload at all,
+  -- and §6 invariant 6 ("reconcile using the persisted signed order/order hash")
+  -- would have nothing to reconcile against.
+  --
+  -- The boundary is the state that first requires venue submission. `PLANNED`
+  -- and `SIGNED` legitimately precede an attempt, and so do the three terminal
+  -- states an order can reach without ever being sent (abandoned before
+  -- transmission) — but only while the row carries *no evidence of venue
+  -- contact*: no venue identity, no submission timestamp, and no fills. A
+  -- terminal state is not an exemption from lineage; not having been submitted
+  -- is.
+  constraint orders_submission_requires_attempt check (
+    submission_attempt_id is not null
+    or (
+      state in ('PLANNED', 'SIGNED', 'CANCELED', 'REJECTED', 'EXPIRED')
+      and filled_shares = '0'
+      and venue_order_id is null
+      and venue_order_hash is null
+      and submitted_at is null
+    )
   ),
   -- §10.7 / ADR-008 §1. The live-order fencing CHECK is written against this
   -- row's own `environment`, so that column must be the plan's: an order that
@@ -278,9 +309,14 @@ create table execution.orders (
     references execution.submission_attempts
       (submission_attempt_id, fencing_lease_id, fencing_token),
   -- Foreign-key targets for `execution.fills`, which carries the same
-  -- discriminators and must not be able to disagree with the order it fills.
+  -- discriminators and must not be able to disagree with the order it fills,
+  -- and for `accounting.ledger_transactions`, whose own discriminators must not
+  -- be able to disagree with the order it books.
   constraint orders_id_environment_unique unique (order_id, environment),
   constraint orders_id_account_unique unique (order_id, account_ref),
+  -- The unskippable form of the same key (see `account_key` above).
+  constraint orders_id_account_key_unique unique (order_id, account_key),
+  constraint orders_id_market_unique unique (order_id, market_id),
   constraint orders_id_market_token_unique unique (order_id, market_id, token_id)
 );
 
@@ -314,6 +350,34 @@ create trigger orders_immutable_identity
     'order_id', 'plan_id', 'market_id', 'token_id', 'environment', 'account_ref',
     'side', 'limit_price', 'original_shares', 'fencing_lease_id', 'fencing_token'
   );
+
+-- `submission_attempt_id` may be attached to an order that did not have one
+-- (PLANNED → SIGNED → SENDING), and may never be detached or re-pointed
+-- afterwards. Detaching would be the way around
+-- `orders_submission_requires_attempt` and around the fill lineage trigger
+-- below: attach an attempt, record the fills, then set the column back to NULL
+-- and the §9.11 chain is gone while every row it explains is still there.
+create function execution.forbid_submission_attempt_unlink() returns trigger
+language plpgsql
+as $$
+begin
+  if old.submission_attempt_id is not null
+     and new.submission_attempt_id is distinct from old.submission_attempt_id then
+    raise exception
+      using errcode = 'PMB02',
+        message = format(
+          'order %s is already signed by submission attempt %s',
+          old.order_id, old.submission_attempt_id
+        ),
+        hint = 'A new salt is a new attempt and a new order, never a re-pointed one (§9.11 step 10).';
+  end if;
+  return new;
+end;
+$$;
+
+create trigger orders_submission_attempt_attach_only
+  before update on execution.orders
+  for each row execute function execution.forbid_submission_attempt_unlink();
 
 -- ---------------------------------------------------------------------------
 -- order_events — append-only order lifecycle (§10.7)
@@ -374,6 +438,12 @@ create table execution.fills (
   token_id internal.token_id not null,
   environment internal.run_mode not null,
   account_ref internal.identifier,
+  -- Never NULL, so the account binding below is enforced for every fill. See
+  -- `execution.orders.account_key`: a fill of an account-bearing order that
+  -- named no account used to satisfy `fills_order_account_fk` vacuously, and a
+  -- fill that carries no account is a fill that has left account-scoped
+  -- exposure, reconciliation, and the ledger (round-2 HIGH-3).
+  account_key text generated always as (coalesce(account_ref::text, '')) stored,
   venue_trade_id internal.identifier not null,
   venue_order_id internal.identifier not null,
   -- §10.7 names an "allocation discriminator" in the fill uniqueness key: one
@@ -409,18 +479,70 @@ create table execution.fills (
   constraint fills_order_environment_fk
     foreign key (order_id, environment)
     references execution.orders (order_id, environment),
+  -- Keyed on the never-NULL account key, not on `account_ref`: under MATCH
+  -- SIMPLE a NULL child account skipped this key entirely, so a fill of a LIVE,
+  -- account-bearing order could be recorded with no account and disappear from
+  -- every account-scoped query while remaining a fill of that order. Both sides
+  -- spell "no account" as the empty string, so a fill of an accountless
+  -- simulated order is still representable — and is the *only* case in which a
+  -- fill has no account.
   constraint fills_order_account_fk
-    foreign key (order_id, account_ref)
-    references execution.orders (order_id, account_ref),
+    foreign key (order_id, account_key)
+    references execution.orders (order_id, account_key),
   constraint fills_order_market_token_fk
     foreign key (order_id, market_id, token_id)
-    references execution.orders (order_id, market_id, token_id)
+    references execution.orders (order_id, market_id, token_id),
+  -- Foreign-key targets for `accounting.ledger_transactions`: a transaction that
+  -- books a fill may not label itself with another environment, account, market,
+  -- or order than the fill it books.
+  constraint fills_id_environment_unique unique (fill_id, environment),
+  constraint fills_id_account_unique unique (fill_id, account_ref),
+  constraint fills_id_market_unique unique (fill_id, market_id),
+  constraint fills_id_order_unique unique (fill_id, order_id)
 );
 
 create index fills_order_idx on execution.fills (order_id, matched_at);
 create index fills_market_idx on execution.fills (market_id, matched_at desc);
 
 call internal.enforce_append_only('execution', 'fills');
+
+-- §9.11 lineage, from the other end: a fill is a fact about an order that was
+-- submitted, so the order it fills must carry the attempt that signed it.
+-- `orders_submission_requires_attempt` states the same rule as a property of the
+-- order, but `filled_shares` is a projection a writer maintains, so a fill can
+-- exist against an order whose projection still says '0'. This closes that gap
+-- at the point the fill is written.
+create function execution.assert_fill_order_has_submission_attempt() returns trigger
+language plpgsql
+as $$
+declare
+  attempt_id uuid;
+begin
+  select o.submission_attempt_id into attempt_id
+  from execution.orders as o
+  where o.order_id = new.order_id
+  for share;
+
+  if attempt_id is null then
+    raise exception
+      using errcode = 'PMB11',
+        message = format(
+          'order %s has no submission attempt, so fill %s has no signed origin',
+          new.order_id, new.fill_id
+        ),
+        hint = 'Persist the signed submission attempt before recording its fills (§9.11, §6 invariant 6).';
+  end if;
+
+  return new;
+end;
+$$;
+
+comment on function execution.assert_fill_order_has_submission_attempt() is
+  'Rejects a fill whose order carries no submission attempt (§9.11 lineage). SQLSTATE PMB11.';
+
+create trigger fills_order_has_submission_attempt
+  before insert on execution.fills
+  for each row execute function execution.assert_fill_order_has_submission_attempt();
 
 -- ---------------------------------------------------------------------------
 -- fill_allocations — actual fill ownership by virtual strategy (ADR-006 §4)

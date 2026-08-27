@@ -101,19 +101,33 @@ describe("live orders require a valid fencing token", () => {
     const lease = await context.repositories.fencing.findActiveLease(LIVE_ACCOUNT, "LIVE_MICRO");
     expect(lease).toBeDefined();
 
+    const fencing = {
+      fencingLeaseId: lease?.fencingLeaseId ?? "",
+      fencingToken: lease?.fencingToken ?? "",
+    };
+
+    // §9.11: sign, then submit. The order names the attempt that signed it, and
+    // both are fenced by the same lease and token.
+    const submissionAttemptId = await context.repositories.orders.recordSubmissionAttempt({
+      executionGroupId: liveChain.executionGroupId,
+      planId: liveChain.planId,
+      attemptOrdinal: 10,
+      signedPayload: { price: "0.42", size: "1" },
+      salt: "current-lease-salt",
+      fencing,
+    });
+
     const orderId = await context.repositories.orders.insertOrder({
       planId: liveChain.planId,
       executionGroupId: liveChain.executionGroupId,
+      submissionAttemptId,
       marketId: liveChain.marketId,
       tokenId: liveChain.tokenId,
       side: "BUY",
       limitPrice: "0.42",
       originalShares: "1",
       state: "LIVE",
-      fencing: {
-        fencingLeaseId: lease?.fencingLeaseId ?? "",
-        fencingToken: lease?.fencingToken ?? "",
-      },
+      fencing,
       submittedAt: fixtureTimestamp(),
     });
 
@@ -168,6 +182,11 @@ describe("live orders require a valid fencing token", () => {
     // Written with the trigger disabled to prove the foreign key is not
     // decorative: without it, a deleted or fabricated lease reference would
     // survive any path that bypassed the trigger.
+    //
+    // `PLANNED`, so the fabricated fencing pair is the *only* thing wrong with
+    // the row: a real-order-mode order requires a valid fencing pair in every
+    // state, while a submission attempt is required only from the state that
+    // first goes to the venue (`orders_submission_requires_attempt`).
     await context.pool.query(`alter table execution.orders disable trigger orders_valid_fencing_reference`);
     try {
       const error = await captureRejection(async () =>
@@ -179,7 +198,7 @@ describe("live orders require a valid fencing token", () => {
           side: "BUY",
           limitPrice: "0.42",
           originalShares: "1",
-          state: "LIVE",
+          state: "PLANNED",
           fencing: { fencingLeaseId: uuidV7(), fencingToken: "1" },
         }),
       );
@@ -421,6 +440,7 @@ describe("live orders require a valid fencing token", () => {
     const orderId = await context.repositories.orders.insertOrder({
       planId: paperChain.planId,
       executionGroupId: paperChain.executionGroupId,
+      submissionAttemptId: paperChain.submissionAttemptId,
       marketId: paperChain.marketId,
       tokenId: paperChain.tokenId,
       side: "BUY",

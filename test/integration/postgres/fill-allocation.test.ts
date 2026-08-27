@@ -37,6 +37,8 @@ beforeAll(async () => {
   orderId = await context.repositories.orders.insertOrder({
     planId: chain.planId,
     executionGroupId: chain.executionGroupId,
+    // A fill requires its order to carry the attempt that signed it (§9.11).
+    submissionAttemptId: chain.submissionAttemptId,
     marketId: chain.marketId,
     tokenId: chain.tokenId,
     side: "BUY",
