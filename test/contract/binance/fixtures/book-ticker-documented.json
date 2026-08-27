@@ -1,0 +1,48 @@
+{
+  "fixtureId": "book-ticker-documented",
+  "kind": "frames",
+  "provenance": "OFFICIAL_EXAMPLE",
+  "source": {
+    "document": "WebSocket Streams for Binance — \"Individual Symbol Book Ticker Streams\"",
+    "url": "https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md#individual-symbol-book-ticker-streams",
+    "accessedAt": "2026-08-27"
+  },
+  "notes": [
+    "The documented payload is exactly `u`, `s`, `b`, `B`, `a`, `A`. It carries NO event-type field and NO timestamp, which is why a normalized top-of-book event has no `venueTimestamp`.",
+    "`combined-wrapper` adds only the documented combined-stream envelope; no field of the payload is changed."
+  ],
+  "sequential": false,
+  "frames": [
+    {
+      "label": "raw-payload",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "BOOK_TICKER",
+      "expectedClassification": "NORMALIZED",
+      "json": {
+        "u": 400900217,
+        "s": "BNBUSDT",
+        "b": "25.35190000",
+        "B": "31.21000000",
+        "a": "25.36520000",
+        "A": "40.66000000"
+      }
+    },
+    {
+      "label": "combined-wrapper",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "BOOK_TICKER",
+      "expectedClassification": "NORMALIZED",
+      "json": {
+        "stream": "bnbusdt@bookTicker",
+        "data": {
+          "u": 400900217,
+          "s": "BNBUSDT",
+          "b": "25.35190000",
+          "B": "31.21000000",
+          "a": "25.36520000",
+          "A": "40.66000000"
+        }
+      }
+    }
+  ]
+}

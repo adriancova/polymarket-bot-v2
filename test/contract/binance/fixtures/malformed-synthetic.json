@@ -1,0 +1,205 @@
+{
+  "fixtureId": "malformed-synthetic",
+  "kind": "frames",
+  "provenance": "SYNTHETIC_DERIVED",
+  "source": {
+    "document": "WebSocket Streams for Binance — the documented payload blocks these frames deviate from; Binance Spot REST API — trade id typed LONG",
+    "url": "https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md",
+    "accessedAt": "2026-08-27"
+  },
+  "notes": [
+    "SYNTHETIC. The venue publishes no example of malformed traffic, so each frame here is a deliberate, single-property deviation from a documented shape. Nothing here claims Binance sends any of it.",
+    "The point of the fixture is the ADR-002 §7 rule: an unrecognized value is first-class UNKNOWN, routed to a data-quality incident with the raw frame preserved — never a silent drop.",
+    "`trade-unsafe-integer-id` is the BNC-U6 case: `9007199254740993` cannot be represented exactly by `JSON.parse`, so it is refused rather than carried as a rounded `venueTradeId`."
+  ],
+  "sequential": true,
+  "frames": [
+    {
+      "label": "not-json",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "text": "PONG"
+    },
+    {
+      "label": "empty-frame",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "text": ""
+    },
+    {
+      "label": "truncated-json",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "text": "{\"e\":\"trade\",\"E\":1672515782136,"
+    },
+    {
+      "label": "json-array",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "text": "[{\"e\":\"trade\"}]"
+    },
+    {
+      "label": "json-scalar",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "text": "42"
+    },
+    {
+      "label": "combined-wrapper-with-scalar-data",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "json": {
+        "stream": "bnbbtc@trade",
+        "data": "not-an-object"
+      }
+    },
+    {
+      "label": "trade-missing-quantity",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "json": {
+        "e": "trade",
+        "E": 1672515782136,
+        "s": "BNBBTC",
+        "t": 12345,
+        "p": "0.001",
+        "T": 1672515782136,
+        "m": true
+      }
+    },
+    {
+      "label": "trade-numeric-price",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "json": {
+        "e": "trade",
+        "E": 1672515782136,
+        "s": "BNBBTC",
+        "t": 12345,
+        "p": 0.001,
+        "q": "100",
+        "T": 1672515782136,
+        "m": true
+      }
+    },
+    {
+      "label": "trade-unsafe-integer-id",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "text": "{\"e\":\"trade\",\"E\":1672515782136,\"s\":\"BNBBTC\",\"t\":9007199254740993,\"p\":\"0.001\",\"q\":\"100\",\"T\":1672515782136,\"m\":true}"
+    },
+    {
+      "label": "book-ticker-missing-ask-quantity",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "UNKNOWN",
+      "expectedClassification": "UNKNOWN",
+      "json": {
+        "u": 400900217,
+        "s": "BNBUSDT",
+        "b": "25.35190000",
+        "B": "31.21000000",
+        "a": "25.36520000"
+      }
+    },
+    {
+      "label": "undocumented-event-type",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "UNKNOWN",
+      "expectedClassification": "UNKNOWN",
+      "json": {
+        "stream": "bnbbtc@kline_1m",
+        "data": {
+          "e": "kline",
+          "E": 1672515782136,
+          "s": "BNBBTC"
+        }
+      }
+    },
+    {
+      "label": "object-matching-nothing-documented",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "UNKNOWN",
+      "expectedClassification": "UNKNOWN",
+      "json": {
+        "hello": "world"
+      }
+    },
+    {
+      "label": "trade-non-positive-price",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "TRADE",
+      "expectedClassification": "UNREPRESENTABLE",
+      "json": {
+        "e": "trade",
+        "E": 1672515782136,
+        "s": "BNBBTC",
+        "t": 777001,
+        "p": "0.00000000",
+        "q": "100",
+        "T": 1672515782136,
+        "m": true
+      }
+    },
+    {
+      "label": "book-ticker-empty-bid-side",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "BOOK_TICKER",
+      "expectedClassification": "NORMALIZED",
+      "json": {
+        "stream": "bnbusdt@bookTicker",
+        "data": {
+          "u": 777002,
+          "s": "BNBUSDT",
+          "b": "0.00000000",
+          "B": "0.00000000",
+          "a": "25.36520000",
+          "A": "40.66000000"
+        }
+      }
+    },
+    {
+      "label": "book-ticker-both-sides-empty",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "BOOK_TICKER",
+      "expectedClassification": "UNREPRESENTABLE",
+      "json": {
+        "stream": "bnbusdt@bookTicker",
+        "data": {
+          "u": 777003,
+          "s": "BNBUSDT",
+          "b": "0.00000000",
+          "B": "0.00000000",
+          "a": "0.00000000",
+          "A": "0.00000000"
+        }
+      }
+    },
+    {
+      "label": "book-ticker-with-added-venue-fields",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "BOOK_TICKER",
+      "expectedClassification": "NORMALIZED",
+      "json": {
+        "stream": "bnbusdt@bookTicker",
+        "data": {
+          "u": 777004,
+          "s": "BNBUSDT",
+          "b": "25.35190000",
+          "B": "31.21000000",
+          "a": "25.36520000",
+          "A": "40.66000000",
+          "someFutureField": 1
+        }
+      }
+    }
+  ]
+}
