@@ -1,0 +1,32 @@
+{
+  "id": "market-trades-snapshot",
+  "provenance": {
+    "kind": "DOCUMENTED_EXAMPLE",
+    "source": "https://docs.cdp.coinbase.com/coinbase-business/advanced-trade-apis/websocket/websocket-channels",
+    "section": "Market Trades Channel — \"Market Trades Message\"",
+    "accessedAt": "2026-08-27",
+    "modifications": []
+  },
+  "classification": "MARKET_TRADES",
+  "expectation": "Parses. Produces one ReferenceTradeObserved for ETH-USD at price 1260.01, size 0.3, with takerSide ASK (the documented side is the MAKER's, and it is BUY). venueTimestamp is the trade's own time 2019-08-14T20:42:27.265Z, not the message timestamp. Records a market_trades snapshot for the current subscription generation.",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09T20:19:35.39625135Z",
+    "sequence_num": 0,
+    "events": [
+      {
+        "type": "snapshot",
+        "trades": [
+          {
+            "trade_id": "000000000",
+            "product_id": "ETH-USD",
+            "price": "1260.01",
+            "size": "0.3",
+            "side": "BUY",
+            "time": "2019-08-14T20:42:27.265Z"
+          }
+        ]
+      }
+    ]
+  }
+}

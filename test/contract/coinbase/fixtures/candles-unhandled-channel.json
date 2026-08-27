@@ -1,0 +1,33 @@
+{
+  "id": "candles-unhandled-channel",
+  "provenance": {
+    "kind": "DOCUMENTED_EXAMPLE",
+    "source": "https://docs.cdp.coinbase.com/coinbase-business/advanced-trade-apis/websocket/websocket-channels",
+    "section": "Candles Channel — \"Candles Message\"",
+    "accessedAt": "2026-08-27",
+    "modifications": []
+  },
+  "classification": "UNKNOWN_CHANNEL",
+  "expectation": "A real, documented Coinbase frame on a channel this adapter does not handle. Classified UNKNOWN_CHANNEL, reported as a COINBASE_UNKNOWN_CHANNEL anomaly with the raw frame preserved, and counted for sequence continuity. Never silently ignored, and never treated as corruption: the venue documents that new message types appear at any time.",
+  "frame": {
+    "channel": "candles",
+    "timestamp": "2023-06-09T20:19:35.39625135Z",
+    "sequence_num": 0,
+    "events": [
+      {
+        "type": "snapshot",
+        "candles": [
+          {
+            "start": "1688998200",
+            "high": "1867.72",
+            "low": "1865.63",
+            "open": "1867.38",
+            "close": "1866.81",
+            "volume": "0.20269406",
+            "product_id": "ETH-USD"
+          }
+        ]
+      }
+    ]
+  }
+}

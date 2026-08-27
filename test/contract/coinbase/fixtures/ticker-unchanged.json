@@ -1,0 +1,45 @@
+{
+  "id": "ticker-unchanged",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "ticker-snapshot",
+    "source": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/ticker",
+    "section": "Ticker — \"Real-time price updates every time a match happens.\"",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 4.",
+      "events[0].type changed from \"snapshot\" to \"update\".",
+      "price changed from \"21932.98\" to \"21932.99\" and volume_24_h advanced, modelling a match that moved the last price.",
+      "The four best_* fields are UNCHANGED from the documented example. That is the whole point of the fixture: the channel emits on every match, and a match need not move the top of book."
+    ]
+  },
+  "classification": "TICKER",
+  "expectation": "Parses. Produces NO ReferenceTopOfBookChanged when it follows ticker-snapshot on the same subscription generation, because the top of book did not change and the event means a change. Emits a COINBASE_TOP_OF_BOOK_UNCHANGED anomaly and increments topOfBookUnchangedSuppressed.",
+  "frame": {
+    "channel": "ticker",
+    "timestamp": "2023-02-09T20:30:38.000000000Z",
+    "sequence_num": 4,
+    "events": [
+      {
+        "type": "update",
+        "tickers": [
+          {
+            "type": "ticker",
+            "product_id": "BTC-USD",
+            "price": "21932.99",
+            "volume_24_h": "16038.29770938",
+            "low_24_h": "21835.29",
+            "high_24_h": "23011.18",
+            "low_52_w": "15460",
+            "high_52_w": "48240",
+            "price_percent_chg_24_h": "-4.15775596190603",
+            "best_bid": "21931.98",
+            "best_bid_quantity": "8000.21",
+            "best_ask": "21933.98",
+            "best_ask_quantity": "8038.07770938"
+          }
+        ]
+      }
+    ]
+  }
+}

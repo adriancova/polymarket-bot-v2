@@ -1,0 +1,21 @@
+{
+  "id": "subscriptions-ack",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": null,
+    "source": "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+    "section": "Unsubscribing — \"You receive a subscriptions message as a response to an unsubscribe message.\"",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "The Advanced Trade documentation states that a subscriptions message is sent but shows no example of it, and the AsyncAPI document defines no such message (unverified item U-CB-5). This fixture therefore carries ONLY the common envelope fields the AsyncAPI does define, with no events payload, because inventing that payload is exactly what is forbidden.",
+      "sequence_num set to 1, so the frame fits a scenario."
+    ]
+  },
+  "classification": "CONTROL",
+  "expectation": "Classified CONTROL. Produces no reference event and no anomaly, but IS counted for sequence continuity — a control frame that was silently skipped would make the very next market-data frame look like a gap.",
+  "frame": {
+    "channel": "subscriptions",
+    "timestamp": "2023-02-09T20:19:34.000000000Z",
+    "sequence_num": 1
+  }
+}

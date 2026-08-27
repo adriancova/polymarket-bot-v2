@@ -1,0 +1,38 @@
+{
+  "id": "market-trades-unknown-side",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "market-trades-snapshot",
+    "source": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/market-trades",
+    "section": "MarketTrade.side — enum BUY, SELL",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 7.",
+      "events[0].type changed from \"snapshot\" to \"update\".",
+      "trades[0].trade_id changed to \"000000004\".",
+      "trades[0].side changed to \"UNSPECIFIED\", a value the documentation does not list. This is deliberately NOT a claim that Coinbase sends it; it is the ADR-002 §7 rule under test — a runtime parser must treat an unrecognized value as a first-class UNKNOWN rather than assume the documented enumeration is closed."
+    ]
+  },
+  "classification": "MARKET_TRADES",
+  "expectation": "Parses. Produces one ReferenceTradeObserved with price and size intact and takerSide OMITTED — no side is guessed. Emits a COINBASE_UNKNOWN_TRADE_SIDE anomaly, and the raw venue value survives on the normalized event's venueDetail.venueSide.",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09T20:19:41.000000000Z",
+    "sequence_num": 7,
+    "events": [
+      {
+        "type": "update",
+        "trades": [
+          {
+            "trade_id": "000000004",
+            "product_id": "ETH-USD",
+            "price": "1260.05",
+            "size": "0.7",
+            "side": "UNSPECIFIED",
+            "time": "2019-08-14T20:42:30.000Z"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "id": "malformed-empty-best-bid",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "ticker-snapshot",
+    "source": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/ticker",
+    "section": "Ticker.best_bid — type: string (no empty-string or null convention is documented)",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 10.",
+      "events[0].type changed from \"snapshot\" to \"update\".",
+      "product_id changed to SOL-USD so this fixture owns its own top-of-book state.",
+      "best_bid changed to the empty string \"\". Coinbase documents no such convention; this is unverified item U-CB-1. Polymarket's CLOB does serialize an absent optional decimal as \"\" (ADR-001 §8.1), which is exactly why the question had to be asked here — and why the answer may not be copied across venues."
+    ]
+  },
+  "classification": "REJECTED",
+  "expectation": "Classified REJECTED/SHAPE with a typed anomaly. The empty string is NOT mapped to absent and NOT mapped to \"0\": absence and emptiness are different facts, Coinbase documents neither, and choosing one would be inventing venue behaviour. The frame is surfaced with its raw text so an operator can see the real traffic and the handling can be settled with evidence.",
+  "frame": {
+    "channel": "ticker",
+    "timestamp": "2023-02-09T20:30:41.000000000Z",
+    "sequence_num": 10,
+    "events": [
+      {
+        "type": "update",
+        "tickers": [
+          {
+            "type": "ticker",
+            "product_id": "SOL-USD",
+            "price": "21.5",
+            "best_bid": "",
+            "best_bid_quantity": "0",
+            "best_ask": "21.6",
+            "best_ask_quantity": "10"
+          }
+        ]
+      }
+    ]
+  }
+}

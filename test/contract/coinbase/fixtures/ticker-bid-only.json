@@ -1,0 +1,38 @@
+{
+  "id": "ticker-bid-only",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "ticker-snapshot",
+    "source": "https://docs.cdp.coinbase.com/coinbase-business/advanced-trade-apis/websocket/websocket-channels",
+    "section": "Ticker Batch Channel — \"it currently doesn't provide best bid or best ask fields\"",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 6.",
+      "events[0].type changed from \"snapshot\" to \"update\".",
+      "product_id changed to ETH-USD so this fixture has its own top-of-book state and does not interact with the BTC-USD fixtures.",
+      "best_ask and best_ask_quantity keys are OMITTED. The documentation states that ticker_batch does not provide best bid or ask, and the AsyncAPI marks no ticker property required, so an absent top-of-book key is a shape the venue's own specification permits. Modelling it on the ticker channel keeps the fixture inside one channel's parser; no claim is made that the ticker channel is observed to omit them."
+    ]
+  },
+  "classification": "TICKER",
+  "expectation": "Parses. Produces one ReferenceTopOfBookChanged carrying bidPrice and bidSize only. An ABSENT key stays absent — it is never turned into \"0\" and never turned into an error. This is the documented-absence case; the empty-string case is a different fact and is rejected (see malformed-empty-best-bid).",
+  "frame": {
+    "channel": "ticker",
+    "timestamp": "2023-02-09T20:30:40.000000000Z",
+    "sequence_num": 6,
+    "events": [
+      {
+        "type": "update",
+        "tickers": [
+          {
+            "type": "ticker",
+            "product_id": "ETH-USD",
+            "price": "1260.02",
+            "volume_24_h": "16038.30770938",
+            "best_bid": "1259.98",
+            "best_bid_quantity": "12.5"
+          }
+        ]
+      }
+    ]
+  }
+}
