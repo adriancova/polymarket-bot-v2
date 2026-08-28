@@ -457,6 +457,27 @@ resumed via SendMessage per the recorded resume pattern (context intact).
   disclosure (whole-open deferral covers the only no-handle path);
   empty-reconnect gap semantics ruled CORRECT per ADR-002 (no affected
   markets) and recorded loudly enough. Remediation round 3 dispatched.
+- Remediation round 3 completed 2026-08-27 in `076b44c` (+ doc `97ddcf1`),
+  probes reproduced byte-for-byte first: R3-H1 → three-layer fix
+  (`#connect()` cancels the armed reconnect; the timer stands down unless
+  status is idle AND no session exists; new `#displaceLiveSession()`
+  retires/stops/closes via `#withSocket` and publishes FeedDisconnected
+  with a package-local `CONNECTION_SUPERSEDED` reason) — honest mutation
+  matrix disclosed: no layer dies alone (each is covered by another), but
+  A+B kills 3 tests via layer 3's disclosure and A+B+C reproduces the
+  reviewed leak verbatim; R3-M1 → `FeedSocketSession.subscribed` set after
+  subscription frames are written and the generation advanced; `#onMessage`
+  refuses earlier frames with a new `PRE_SUBSCRIPTION_FRAME` problem
+  carrying the payload, placed after the stale check (ordering pinned by
+  test); raw record still written first. One round-2 test deviation
+  disclosed (expects the new code; property unchanged, test strengthened).
+  New risks: `CONNECTION_SUPERSEDED` is unreachable-by-construction public
+  surface (defense in depth); pre-subscription frames are not parsed (a
+  pre-return PONG is reported, not consumed — unreachable before a PING).
+  WP-120 note: treat PRE_SUBSCRIPTION_FRAME as a transport observation.
+  Orchestrator fast-forwarded the canonical branch to `97ddcf1` and
+  reproduced gates: root 1903/1903, contract 583/583, paths clean,
+  lockfile untouched. Review round 4 dispatched.
 - **Contract-owner items accumulated from batch 1B round 1** (for the next
   ADR-modifying package or an orchestrator governance round): (1) ratify
   C-1/U-1 across the four provisional-marked paths (WP-070 documentary
