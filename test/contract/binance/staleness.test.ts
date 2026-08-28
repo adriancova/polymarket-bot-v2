@@ -20,7 +20,7 @@ import { FeedStaleContract } from "@polymarket-bot/domain";
 import { describe, expect, it } from "vitest";
 
 import { framesFixture, frameText } from "./fixtures.js";
-import { createHarness, eventTypesOf, open } from "./support.js";
+import { createHarness, deliver, eventTypesOf, open } from "./support.js";
 
 const TRADE = framesFixture("trade-documented");
 
@@ -48,7 +48,7 @@ describe("staleness as queryable data", () => {
   it("measures silence from the last frame, against the caller's stamp", () => {
     const harness = createHarness({ stalenessThresholdMs: 10_000 });
     open(harness, "conn-stale");
-    harness.feed.onFrame(tradeText(), harness.clock.advance(1_000));
+    deliver(harness, tradeText(), harness.clock.advance(1_000));
 
     expect(harness.feed.metrics(harness.clock.advance(2_500)).stalenessMs).toBe(2_500);
     expect(harness.feed.metrics(harness.clock.advance(2_500)).stalenessMs).toBe(5_000);
@@ -83,7 +83,7 @@ describe("staleness as an event", () => {
   it("emits FeedStale once per silence episode and re-arms on the next frame", () => {
     const harness = createHarness({ stalenessThresholdMs: 10_000 });
     open(harness, "conn-stale");
-    harness.feed.onFrame(tradeText(), harness.clock.advance(1_000));
+    deliver(harness, tradeText(), harness.clock.advance(1_000));
 
     const first = harness.feed.checkStaleness(harness.clock.advance(10_000));
     expect(eventTypesOf(first.emissions)).toEqual(["FeedStale"]);
@@ -95,7 +95,8 @@ describe("staleness as an event", () => {
     expect(harness.feed.checkStaleness(harness.clock.advance(30_000)).emissions).toEqual([]);
 
     // A frame ends the episode; the next silence is a new one.
-    harness.feed.onFrame(
+    deliver(
+      harness,
       JSON.stringify({
         e: "trade",
         E: 1672515790000,
@@ -120,7 +121,7 @@ describe("staleness as an event", () => {
       { startAt: "2026-08-27T09:00:00.000Z" },
     );
     open(harness, "conn-stale");
-    harness.feed.onFrame(tradeText(), harness.clock.advance(2_000));
+    deliver(harness, tradeText(), harness.clock.advance(2_000));
     const outcome = harness.feed.checkStaleness(harness.clock.advance(7_500));
 
     const payload = outcome.emissions[0]?.payload as {
@@ -141,11 +142,11 @@ describe("staleness as an event", () => {
   it("treats any frame as proof of life, including one it cannot use", () => {
     const harness = createHarness({ stalenessThresholdMs: 10_000 });
     open(harness, "conn-stale");
-    harness.feed.onFrame(tradeText(), harness.clock.advance(1_000));
+    deliver(harness, tradeText(), harness.clock.advance(1_000));
     harness.feed.checkStaleness(harness.clock.advance(10_000));
 
     // A control response carries no market data, but the socket is alive.
-    harness.feed.onFrame('{"result":null,"id":1}', harness.clock.advance(1));
+    deliver(harness, '{"result":null,"id":1}', harness.clock.advance(1));
     expect(harness.feed.metrics(harness.clock.peek()).stalenessMs).toBe(0);
   });
 });

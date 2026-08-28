@@ -39,8 +39,67 @@ import {
   BINANCE_TRADE_STREAM_SUFFIX,
 } from "./venue.js";
 
-/** Bound on any single frame this package will attempt to decode. */
+/**
+ * Bound on any single frame this package will attempt to decode, in **UTF-8
+ * bytes on the wire**.
+ *
+ * MEASURED IN BYTES, NOT IN CHARACTERS. `String#length` counts UTF-16 code
+ * units, and the venue explicitly contemplates non-ASCII symbol names ("the
+ * stream events may contain non-ASCII characters encoded in UTF-8"), so a frame
+ * of non-ASCII text can be two or three times its `length` in bytes. Checking
+ * `length` against a byte bound would therefore let a frame materially larger
+ * than this limit through — the limit exists to bound the work a single
+ * venue-controlled input can cause, so it has to be measured in the units the
+ * venue actually sends (round-1 review, L2).
+ */
 export const MAX_FRAME_BYTES = 1_048_576;
+
+/**
+ * UTF-8 byte length of a string, without allocating an encoded copy.
+ *
+ * A lone surrogate is counted as 3 bytes because that is what an encoder
+ * produces for it: `TextEncoder` substitutes U+FFFD, which is 3 bytes.
+ */
+export function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit < 0x80) {
+      bytes += 1;
+    } else if (unit < 0x800) {
+      bytes += 2;
+    } else if (unit >= 0xd800 && unit <= 0xdbff && index + 1 < value.length) {
+      const next = value.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+/**
+ * Whether a frame is over the byte bound, computing the exact length only when
+ * the cheap bounds cannot decide.
+ *
+ * Every UTF-16 code unit contributes at least one byte and at most three
+ * (a surrogate pair is 2 units for 4 bytes), so `length > MAX` proves the frame
+ * is too large and `length * 3 <= MAX` proves it is not.
+ */
+function exceedsFrameByteBound(raw: string): boolean {
+  if (raw.length > MAX_FRAME_BYTES) {
+    return true;
+  }
+  if (raw.length * 3 <= MAX_FRAME_BYTES) {
+    return false;
+  }
+  return utf8ByteLength(raw) > MAX_FRAME_BYTES;
+}
 
 /** Bound on a raw excerpt carried into an incident `detail` field. */
 export const MAX_RAW_EXCERPT_LENGTH = 512;
@@ -179,7 +238,18 @@ export type MalformedFrameReason =
   | "FRAME_TOO_LARGE"
   | "NOT_JSON"
   | "NOT_AN_OBJECT"
-  | "SCHEMA_MISMATCH";
+  | "SCHEMA_MISMATCH"
+  /**
+   * The combined-stream wrapper named a channel the payload contradicts.
+   *
+   * The wrapper is the venue's statement of provenance and the payload is the
+   * venue's statement of content; when they disagree, neither can be trusted to
+   * route the event, so the frame is preserved and reported rather than
+   * published under a channel it may not belong to (round-1 review, M1).
+   */
+  | "CHANNEL_MISMATCH"
+  /** The frame's channel is not one of the channels this feed subscribed to. */
+  | "CHANNEL_NOT_SUBSCRIBED";
 
 /** Common fields on every decoded frame. */
 type DecodedBase = {
@@ -193,7 +263,22 @@ type DecodedBase = {
    * reconstruction is recorded in {@link DecodedFrame.channelSource}.
    */
   readonly streamName: string | undefined;
-  readonly channelSource: "WRAPPER" | "RECONSTRUCTED" | "NONE";
+  /**
+   * Where the stream name came from, and whether it was checked.
+   *
+   * - `WRAPPER` — stated by the combined-stream wrapper **and** verified against
+   *   the payload's own symbol and decoded kind (and, when the caller supplied
+   *   a subscription set, against that set).
+   * - `RECONSTRUCTED` — derived from the documented `s` field and the payload's
+   *   shape, because the frame arrived unwrapped.
+   * - `UNVERIFIED_WRAPPER` — stated by the wrapper for a payload that derives no
+   *   channel of its own, so nothing could check it. The documented
+   *   `!serverShutdown` wrapper is exactly this case: it is not a
+   *   `<symbol>@<suffix>` name at all. Such a name is preserved as data but is
+   *   never used as an event's `sourceChannel`.
+   * - `NONE` — the frame carried no channel information.
+   */
+  readonly channelSource: "WRAPPER" | "RECONSTRUCTED" | "UNVERIFIED_WRAPPER" | "NONE";
   /**
    * Keys present on the wire that the venue's documentation does not describe.
    *
@@ -281,16 +366,33 @@ export function rawExcerpt(raw: string): string {
 }
 
 /**
+ * Options for {@link decodeFrame}.
+ *
+ * `expectedStreams` is the resolved subscription set of the connection the frame
+ * arrived on. Supplying it turns "the venue named a channel" into "the venue
+ * named a channel this connection actually asked for": a combined connection
+ * delivers only the streams in its `?streams=` query, so a frame claiming any
+ * other channel is either drift or misrouting, and publishing it under that
+ * channel would record provenance that no subscription supports. It is optional
+ * because the decoder is also used to inspect a single frame in isolation (the
+ * fixture suites do exactly that), where there is no subscription set to check
+ * against.
+ */
+export type DecodeFrameOptions = {
+  readonly expectedStreams?: ReadonlySet<string>;
+};
+
+/**
  * Decodes one received frame.
  *
  * Total by construction: every input maps to a `DecodedFrame`, and no input
  * throws. A caller therefore cannot accidentally write a `catch` that discards
  * venue traffic.
  */
-export function decodeFrame(raw: string): DecodedFrame {
-  if (raw.length > MAX_FRAME_BYTES) {
+export function decodeFrame(raw: string, options: DecodeFrameOptions = {}): DecodedFrame {
+  if (exceedsFrameByteBound(raw)) {
     return malformed(raw, undefined, "NONE", "FRAME_TOO_LARGE", {
-      detail: `frame is ${String(raw.length)} characters, above the ${String(MAX_FRAME_BYTES)} bound`,
+      detail: `frame is ${String(utf8ByteLength(raw))} UTF-8 bytes, above the ${String(MAX_FRAME_BYTES)}-byte bound`,
     });
   }
 
@@ -309,27 +411,32 @@ export function decodeFrame(raw: string): DecodedFrame {
     });
   }
 
-  // The combined-stream wrapper states the originating stream.
+  // The combined-stream wrapper states the originating stream. It is a CLAIM
+  // until the payload agrees with it — see `resolveChannel`.
   const wrapper = BinanceCombinedEnvelopeSchema.safeParse(parsed);
   if (wrapper.success && "data" in parsed) {
     const inner: unknown = wrapper.data.data;
     if (!isPlainObject(inner)) {
-      return malformed(raw, wrapper.data.stream, "WRAPPER", "NOT_AN_OBJECT", {
+      return malformed(raw, wrapper.data.stream, "UNVERIFIED_WRAPPER", "NOT_AN_OBJECT", {
         detail: `combined-stream \`data\` is ${describeJsonType(inner)}; a wrapped payload is a JSON object`,
       });
     }
-    return decodePayload(raw, inner, wrapper.data.stream, "WRAPPER");
+    return decodePayload(raw, inner, wrapper.data.stream, options);
   }
 
-  return decodePayload(raw, parsed, undefined, "NONE");
+  return decodePayload(raw, parsed, undefined, options);
 }
 
 function decodePayload(
   raw: string,
   payload: Record<string, unknown>,
   streamName: string | undefined,
-  channelSource: DecodedBase["channelSource"],
+  options: DecodeFrameOptions,
 ): DecodedFrame {
+  // A wrapper name that no payload-derived channel can be checked against is
+  // recorded, never trusted.
+  const channelSource: DecodedBase["channelSource"] =
+    streamName === undefined ? "NONE" : "UNVERIFIED_WRAPPER";
   const declaredEventType = typeof payload["e"] === "string" ? payload["e"] : undefined;
 
   if (declaredEventType === BINANCE_TRADE_EVENT_TYPE) {
@@ -340,12 +447,10 @@ function decodePayload(
       });
     }
     const trade = result.data;
-    const channel = resolveChannel(
-      streamName,
-      channelSource,
-      trade.s,
-      BINANCE_TRADE_STREAM_SUFFIX,
-    );
+    const channel = resolveChannel(streamName, trade.s, BINANCE_TRADE_STREAM_SUFFIX, options);
+    if (!channel.ok) {
+      return malformed(raw, streamName, channelSource, channel.reason, { detail: channel.detail });
+    }
     return {
       kind: "TRADE",
       raw,
@@ -403,10 +508,13 @@ function decodePayload(
     const ticker = result.data;
     const channel = resolveChannel(
       streamName,
-      channelSource,
       ticker.s,
       BINANCE_BOOK_TICKER_STREAM_SUFFIX,
+      options,
     );
+    if (!channel.ok) {
+      return malformed(raw, streamName, channelSource, channel.reason, { detail: channel.detail });
+    }
     return {
       kind: "BOOK_TICKER",
       raw,
@@ -477,16 +585,61 @@ function looksLikeBookTicker(payload: Record<string, unknown>): boolean {
   return true;
 }
 
+type ResolvedChannel =
+  | {
+      readonly ok: true;
+      readonly streamName: string;
+      readonly channelSource: DecodedBase["channelSource"];
+    }
+  | { readonly ok: false; readonly reason: MalformedFrameReason; readonly detail: string };
+
+/**
+ * Establishes the channel a normalizable payload belongs to, and CHECKS it.
+ *
+ * The venue documents the combined wrapper as `{"stream":"<streamName>","data":
+ * <rawPayload>}` and stream names as `"<lowercase symbol>@<suffix>"`, so for the
+ * two payloads that carry their own symbol the wrapper is fully derivable — and
+ * therefore fully checkable. Before this check the wrapper was believed
+ * unconditionally, which meant a frame could be published with a
+ * `sourceChannel` naming a different symbol, a different stream type, or a
+ * string that is not a stream name at all, while its payload said something
+ * else (round-1 review, M1). `sourceChannel` is provenance recorded in the WAL;
+ * provenance that contradicts its own payload is worse than no provenance,
+ * because a reader cannot tell it is wrong.
+ *
+ * Both failure modes are MALFORMED rather than silently corrected: the venue
+ * documents no case in which the two disagree, so a disagreement is an
+ * unrecognized condition, and ADR-002 §7 requires an unrecognized condition to
+ * be preserved raw and reported rather than resolved by guessing which half to
+ * believe.
+ */
 function resolveChannel(
   streamName: string | undefined,
-  channelSource: DecodedBase["channelSource"],
   symbol: string,
   suffix: string,
-): { streamName: string; channelSource: DecodedBase["channelSource"] } {
-  if (streamName !== undefined) {
-    return { streamName, channelSource };
+  options: DecodeFrameOptions,
+): ResolvedChannel {
+  const derived = `${symbol.toLowerCase()}@${suffix}`;
+  if (streamName !== undefined && streamName !== derived) {
+    return {
+      ok: false,
+      reason: "CHANNEL_MISMATCH",
+      detail: `combined-stream wrapper names ${JSON.stringify(streamName)} but the payload decodes as ${JSON.stringify(derived)} (symbol ${JSON.stringify(symbol)}); the venue documents stream names as "<lowercase symbol>@<suffix>", so the wrapper and the payload disagree about where this frame came from`,
+    };
   }
-  return { streamName: `${symbol.toLowerCase()}@${suffix}`, channelSource: "RECONSTRUCTED" };
+  const expected = options.expectedStreams;
+  if (expected !== undefined && !expected.has(derived)) {
+    return {
+      ok: false,
+      reason: "CHANNEL_NOT_SUBSCRIBED",
+      detail: `frame decodes as channel ${JSON.stringify(derived)}, which is not one of the subscribed streams (${[...expected].slice(0, 8).join(", ")}${expected.size > 8 ? ", …" : ""})`,
+    };
+  }
+  return {
+    ok: true,
+    streamName: derived,
+    channelSource: streamName === undefined ? "RECONSTRUCTED" : "WRAPPER",
+  };
 }
 
 function malformed(

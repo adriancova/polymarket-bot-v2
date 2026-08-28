@@ -36,6 +36,14 @@ export type BinanceStreamMetrics = {
   /** Last `t` (trade) or `u` (bookTicker) observed on this stream. */
   readonly lastVenueSequenceId: number;
   readonly observations: number;
+  /**
+   * Ids currently inside this stream's duplicate window.
+   *
+   * The window is bounded, so this is the real reach of duplicate detection: an
+   * id that has fallen out of it can no longer be recognised as a repeat. Making
+   * it a metric is what keeps that limit visible instead of assumed away.
+   */
+  readonly recentIdsTracked: number;
 };
 
 /** Counters accumulated by one feed; every field is a plain count. */
@@ -65,6 +73,15 @@ export type BinanceFrameCounters = {
   readonly controlResponses: number;
   readonly controlErrors: number;
   readonly serverShutdownNotices: number;
+  /**
+   * Frames refused because they did not come from the live socket, or arrived
+   * when no socket was live at all.
+   *
+   * Counted separately from `framesReceived` (which counts everything the
+   * transport delivered) so that a socket still talking after it was retired is
+   * a number an operator can see rather than an invisible correction.
+   */
+  readonly framesNotFromLiveConnection: number;
 };
 
 /** Connection lifecycle counters. */
@@ -75,6 +92,13 @@ export type BinanceConnectionCounters = {
   readonly socketErrors: number;
   readonly staleEpisodes: number;
   readonly incidentsOpened: number;
+  /**
+   * OPEN/ERROR/CLOSE events refused on socket identity.
+   *
+   * Covers a retired socket still talking, a foreign socket while one is live,
+   * a malformed identity, and an open on a feed the caller has closed.
+   */
+  readonly lifecycleEventsNotFromLiveConnection: number;
 };
 
 /** The whole queryable metric surface for one feed. */
@@ -116,6 +140,8 @@ export type BinanceFeedMetrics = {
   readonly streams: readonly BinanceStreamMetrics[];
   readonly trackedStreams: number;
   readonly maxTrackedStreams: number;
+  /** Bound on each stream's duplicate window; ids beyond it are forgotten. */
+  readonly maxRecentIdsPerStream: number;
   readonly untrackedSequenceObservations: number;
 };
 
@@ -142,6 +168,7 @@ export type FeedMetricsInput = {
   readonly sequences: readonly SequenceState[];
   readonly trackedStreams: number;
   readonly maxTrackedStreams: number;
+  readonly maxRecentIdsPerStream: number;
   readonly untrackedSequenceObservations: number;
 };
 
@@ -185,9 +212,11 @@ export function computeFeedMetrics(input: FeedMetricsInput): BinanceFeedMetrics 
       streamName: entry.key,
       lastVenueSequenceId: entry.lastId,
       observations: entry.observations,
+      recentIdsTracked: entry.recentIdsTracked,
     })),
     trackedStreams: input.trackedStreams,
     maxTrackedStreams: input.maxTrackedStreams,
+    maxRecentIdsPerStream: input.maxRecentIdsPerStream,
     untrackedSequenceObservations: input.untrackedSequenceObservations,
   };
 }

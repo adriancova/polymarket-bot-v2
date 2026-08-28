@@ -76,20 +76,58 @@ describe("createWebSocketFactory", () => {
   it("delivers a text payload unchanged", () => {
     const { events, socket } = drive();
     socket.fire("message", { data: '{"e":"trade"}' });
-    expect(events).toEqual([{ type: "MESSAGE", data: '{"e":"trade"}' }]);
+    expect(events).toEqual([
+      { type: "MESSAGE", connectionId: "conn-1", data: '{"e":"trade"}' },
+    ]);
   });
 
   it("decodes a binary payload as UTF-8", () => {
     const { events, socket } = drive();
     const bytes = new TextEncoder().encode('{"u":1}');
     socket.fire("message", { data: bytes.buffer });
-    expect(events).toEqual([{ type: "MESSAGE", data: '{"u":1}' }]);
+    expect(events).toEqual([{ type: "MESSAGE", connectionId: "conn-1", data: '{"u":1}' }]);
+  });
+
+  it("stamps EVERY event with this socket's own identity (round-1 review, H1)", () => {
+    // A socket that has been superseded still fires; without its own identity
+    // on the event, the feed cannot tell its traffic from the live socket's.
+    const { events, socket } = drive();
+    socket.fire("open", {});
+    socket.fire("message", { data: '{"e":"trade"}' });
+    socket.fire("error", { message: "boom" });
+    socket.fire("close", { code: 1006 });
+    expect(events.map((event) => event.connectionId)).toEqual([
+      "conn-1",
+      "conn-1",
+      "conn-1",
+      "conn-1",
+    ]);
+  });
+
+  it("keeps two overlapping sockets' events distinguishable", () => {
+    const events: BinanceSocketEvent[] = [];
+    const factory = createWebSocketFactory(FakeConstructor);
+    factory({ url: "wss://x/stream", connectionId: "conn-a", onEvent: (e) => events.push(e) });
+    const socketA = FakeWebSocket.last;
+    factory({ url: "wss://x/stream", connectionId: "conn-b", onEvent: (e) => events.push(e) });
+    const socketB = FakeWebSocket.last;
+    if (socketA === undefined || socketB === undefined || socketA === socketB) {
+      throw new Error("expected two distinct sockets");
+    }
+
+    socketB.fire("open", {});
+    socketA.fire("close", { code: 1006 });
+    expect(events).toEqual([
+      { type: "OPEN", connectionId: "conn-b" },
+      { type: "CLOSE", connectionId: "conn-a", code: 1006 },
+    ]);
   });
 
   it("reports an undecodable binary payload rather than delivering a mangled frame", () => {
     const { events, socket } = drive();
     socket.fire("message", { data: new Uint8Array([0xff, 0xfe, 0xfd]).buffer });
     expect(events[0]?.type).toBe("ERROR");
+    expect(events[0]?.connectionId).toBe("conn-1");
     const event = events[0];
     if (event?.type !== "ERROR") {
       throw new Error("unreachable");
@@ -101,19 +139,23 @@ describe("createWebSocketFactory", () => {
   it("maps close events, carrying the code and reason when present", () => {
     const { events, socket } = drive();
     socket.fire("close", { code: 1006, reason: "abnormal closure" });
-    expect(events).toEqual([{ type: "CLOSE", code: 1006, reason: "abnormal closure" }]);
+    expect(events).toEqual([
+      { type: "CLOSE", connectionId: "conn-1", code: 1006, reason: "abnormal closure" },
+    ]);
   });
 
   it("omits an empty close reason rather than sending an empty string", () => {
     const { events, socket } = drive();
     socket.fire("close", { code: 1000, reason: "" });
-    expect(events).toEqual([{ type: "CLOSE", code: 1000 }]);
+    expect(events).toEqual([{ type: "CLOSE", connectionId: "conn-1", code: 1000 }]);
   });
 
   it("forwards a socket error", () => {
     const { events, socket } = drive();
     socket.fire("error", { message: "connect ECONNREFUSED" });
-    expect(events).toEqual([{ type: "ERROR", detail: "connect ECONNREFUSED" }]);
+    expect(events).toEqual([
+      { type: "ERROR", connectionId: "conn-1", detail: "connect ECONNREFUSED" },
+    ]);
   });
 
   it("forwards a close() call to the underlying socket", () => {

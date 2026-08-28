@@ -10,7 +10,8 @@
   "notes": [
     "SYNTHETIC. The venue publishes no example of malformed traffic, so each frame here is a deliberate, single-property deviation from a documented shape. Nothing here claims Binance sends any of it.",
     "The point of the fixture is the ADR-002 §7 rule: an unrecognized value is first-class UNKNOWN, routed to a data-quality incident with the raw frame preserved — never a silent drop.",
-    "`trade-unsafe-integer-id` is the BNC-U6 case: `9007199254740993` cannot be represented exactly by `JSON.parse`, so it is refused rather than carried as a rounded `venueTradeId`."
+    "`trade-unsafe-integer-id` is the BNC-U6 case: `9007199254740993` cannot be represented exactly by `JSON.parse`, so it is refused rather than carried as a rounded `venueTradeId`.",
+    "The two `combined-wrapper-contradicts-*` frames are the round-1 review's M1 case. The venue documents combined events as `{\"stream\":\"<streamName>\",\"data\":<rawPayload>}` and stream names as lowercase `<symbol>@<suffix>`, so the wrapper is fully derivable from the payload and these two frames are impossible under the documentation. They are here because the wrapper is what an emission's `sourceChannel` records: a wrapper that contradicts its own payload would put provenance in the WAL that no later reader could tell was wrong."
   ],
   "sequential": true,
   "frames": [
@@ -57,6 +58,46 @@
       "json": {
         "stream": "bnbbtc@trade",
         "data": "not-an-object"
+      }
+    },
+    {
+      "label": "combined-wrapper-contradicts-payload-symbol",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "json": {
+        "stream": "ethusdt@trade",
+        "data": {
+          "e": "trade",
+          "E": 1672515782136,
+          "s": "BNBBTC",
+          "t": 12345,
+          "p": "0.001",
+          "q": "100",
+          "T": 1672515782136,
+          "m": true,
+          "M": true
+        }
+      }
+    },
+    {
+      "label": "combined-wrapper-contradicts-payload-kind",
+      "provenance": "SYNTHETIC_DERIVED",
+      "expectedKind": "MALFORMED",
+      "expectedClassification": "MALFORMED",
+      "json": {
+        "stream": "bnbbtc@bookTicker",
+        "data": {
+          "e": "trade",
+          "E": 1672515782136,
+          "s": "BNBBTC",
+          "t": 12345,
+          "p": "0.001",
+          "q": "100",
+          "T": 1672515782136,
+          "m": true,
+          "M": true
+        }
       }
     },
     {

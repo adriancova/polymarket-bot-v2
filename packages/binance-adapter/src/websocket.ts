@@ -75,18 +75,27 @@ export function createWebSocketFactory(
     const socket = new Constructor(request.url);
     socket.binaryType = "arraybuffer";
 
+    // Captured once, per socket. Every event this binding reports carries the
+    // identity of THIS socket, not of whatever connection happens to be current
+    // when the callback runs: a socket that has been superseded can still fire a
+    // buffered message or a late close, and stripping its identity is what would
+    // let that traffic be recorded as the live connection's or let a dead
+    // socket's close tear the live one down (round-1 review, H1).
+    const connectionId = request.connectionId;
+
     socket.addEventListener("open", () => {
-      request.onEvent({ type: "OPEN", connectionId: request.connectionId });
+      request.onEvent({ type: "OPEN", connectionId });
     });
 
     socket.addEventListener("message", (event: unknown) => {
       const decoded = decodeMessageData(readProperty(event, "data"));
       if (decoded.ok) {
-        request.onEvent({ type: "MESSAGE", data: decoded.text });
+        request.onEvent({ type: "MESSAGE", connectionId, data: decoded.text });
         return;
       }
       request.onEvent({
         type: "ERROR",
+        connectionId,
         reasonCode: "BINANCE_FRAME_UNDECODABLE",
         detail: decoded.detail,
       });
@@ -96,6 +105,7 @@ export function createWebSocketFactory(
       const message = readProperty(event, "message");
       request.onEvent({
         type: "ERROR",
+        connectionId,
         ...(typeof message === "string" && message.length > 0 ? { detail: message } : {}),
       });
     });
@@ -105,6 +115,7 @@ export function createWebSocketFactory(
       const reason = readProperty(event, "reason");
       request.onEvent({
         type: "CLOSE",
+        connectionId,
         ...(typeof code === "number" ? { code } : {}),
         ...(typeof reason === "string" && reason.length > 0 ? { reason } : {}),
       });

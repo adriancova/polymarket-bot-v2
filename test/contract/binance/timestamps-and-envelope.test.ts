@@ -19,7 +19,7 @@ import {
 import { describe, expect, it } from "vitest";
 
 import { frameText, framesFixture } from "./fixtures.js";
-import { createHarness, open } from "./support.js";
+import { createHarness, deliver, open } from "./support.js";
 
 const TRADE = framesFixture("trade-documented");
 const BOOK_TICKER = framesFixture("book-ticker-documented");
@@ -45,7 +45,7 @@ describe("venue and receipt timestamps", () => {
       throw new Error("fixture frame missing");
     }
     const receipt = harness.clock.advance(250);
-    const outcome = harness.feed.onFrame(frameText(frame), receipt);
+    const outcome = deliver(harness, frameText(frame), receipt);
     const emission = outcome.emissions.find(
       (entry) => entry.eventType === "ReferenceTradeObserved",
     );
@@ -67,7 +67,7 @@ describe("venue and receipt timestamps", () => {
     if (frame === undefined) {
       throw new Error("fixture frame missing");
     }
-    const outcome = harness.feed.onFrame(frameText(frame), harness.clock.advance(1));
+    const outcome = deliver(harness, frameText(frame), harness.clock.advance(1));
     const emission = outcome.emissions.find(
       (entry) => entry.eventType === "ReferenceTopOfBookChanged",
     );
@@ -88,15 +88,19 @@ describe("venue and receipt timestamps", () => {
 
     const millis = createHarness();
     open(millis, "conn-ms");
-    const msEmission = millis.feed
-      .onFrame(frameText(frame), millis.clock.advance(1))
-      .emissions.find((entry) => entry.eventType === "ReferenceTradeObserved");
+    const msEmission = deliver(
+      millis,
+      frameText(frame),
+      millis.clock.advance(1),
+    ).emissions.find((entry) => entry.eventType === "ReferenceTradeObserved");
 
     const micros = createHarness({ timeUnit: "MICROSECOND" });
     open(micros, "conn-us");
-    const usEmission = micros.feed
-      .onFrame(frameText(frame), micros.clock.advance(1))
-      .emissions.find((entry) => entry.eventType === "ReferenceTradeObserved");
+    const usEmission = deliver(
+      micros,
+      frameText(frame),
+      micros.clock.advance(1),
+    ).emissions.find((entry) => entry.eventType === "ReferenceTradeObserved");
 
     expect(msEmission?.venueTimestamp).toBe("2022-12-31T19:43:02.136Z");
     expect(usEmission?.venueTimestamp).toBe("1970-01-20T08:35:15.782136Z");
@@ -109,7 +113,7 @@ describe("venue and receipt timestamps", () => {
     if (frame === undefined) {
       throw new Error("fixture frame missing");
     }
-    harness.feed.onFrame(frameText(frame), harness.clock.advance(500));
+    deliver(harness, frameText(frame), harness.clock.advance(500));
 
     const metrics = harness.feed.metrics(harness.clock.peek());
     expect(metrics.lastVenueTimestamp).toBe("2022-12-31T19:43:02.136Z");
@@ -122,7 +126,7 @@ describe("emissions are envelope-ready", () => {
     const harness = createHarness();
     open(harness, "conn-envelope");
     for (const frame of [...TRADE.frames, ...BOOK_TICKER.frames]) {
-      const outcome = harness.feed.onFrame(frameText(frame), harness.clock.advance(1));
+      const outcome = deliver(harness, frameText(frame), harness.clock.advance(1));
       harness.emissions.push(...outcome.emissions);
     }
 
@@ -147,7 +151,7 @@ describe("emissions are envelope-ready", () => {
     if (frame === undefined) {
       throw new Error("fixture frame missing");
     }
-    const outcome = harness.feed.onFrame(frameText(frame), harness.clock.advance(1));
+    const outcome = deliver(harness, frameText(frame), harness.clock.advance(1));
     for (const emission of [...outcome.emissions, ...harness.emissions]) {
       expect("gatewayEpoch" in emission).toBe(false);
       expect("ingestSeq" in emission).toBe(false);
@@ -159,7 +163,7 @@ describe("emissions are envelope-ready", () => {
     const harness = createHarness();
     open(harness, "conn-provenance");
     for (const frame of [...TRADE.frames, ...BOOK_TICKER.frames]) {
-      const outcome = harness.feed.onFrame(frameText(frame), harness.clock.advance(1));
+      const outcome = deliver(harness, frameText(frame), harness.clock.advance(1));
       for (const emission of outcome.emissions) {
         expect(emission.source).toBe("binance");
         const payload = emission.payload as { venue?: unknown };

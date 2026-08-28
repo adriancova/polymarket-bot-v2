@@ -40,8 +40,10 @@
 
 export {
   assertReconnectPolicy,
+  isWellFormedConnectionId,
   nextReconnectDelayMs,
   DEFAULT_RECONNECT_POLICY,
+  MAX_CONNECTION_ID_LENGTH,
   MIN_AVERAGE_RECONNECT_SPACING_MS,
   NO_DIRECTIVE,
 } from "./connection.js";
@@ -51,6 +53,7 @@ export type {
   BinanceSocketFactory,
   BinanceSocketRequest,
   ConnectionDirective,
+  ConnectionIdentityRelation,
   FeedConnectionState,
   ReconnectPolicy,
 } from "./connection.js";
@@ -77,6 +80,7 @@ export type {
   FeedOutcome,
   FrameClassification,
   FrameOutcome,
+  RejectedSocketEvent,
 } from "./feed.js";
 
 export {
@@ -88,11 +92,13 @@ export {
   BinanceTradePayloadSchema,
   decodeFrame,
   rawExcerpt,
+  utf8ByteLength,
   MAX_FRAME_BYTES,
   MAX_RAW_EXCERPT_LENGTH,
   NORMALIZABLE_FRAME_KINDS,
 } from "./frames.js";
 export type {
+  DecodeFrameOptions,
   DecodedBookTickerFrame,
   DecodedControlErrorFrame,
   DecodedControlResponseFrame,
@@ -140,6 +146,7 @@ export type {
 
 export {
   bookTickerIdentity,
+  DEFAULT_MAX_RECENT_IDS_PER_KEY,
   SequenceTracker,
   tradeIdentity,
 } from "./sequence.js";

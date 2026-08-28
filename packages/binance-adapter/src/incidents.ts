@@ -86,6 +86,26 @@ export const BINANCE_REASON_CODES = {
   bookSideUnrepresentable: "BINANCE_BOOK_SIDE_UNREPRESENTABLE",
   /** The venue answered a control message with the documented error shape. */
   controlError: "BINANCE_CONTROL_ERROR",
+  /**
+   * A socket that is no longer the live one delivered an event.
+   *
+   * A superseded or already-closed socket can still fire a buffered message, an
+   * error, or its close event. Applying any of them to the live connection would
+   * label another socket's traffic with this connection's identity and
+   * generation, or let a dead socket's close tear down a healthy feed, so they
+   * are refused — and refusing without recording would be the silent drop §8.3
+   * forbids (round-1 review, H1).
+   */
+  retiredConnectionEvent: "BINANCE_RETIRED_CONNECTION_EVENT",
+  /**
+   * A frame arrived while no socket was live.
+   *
+   * A transport delivers messages only between OPEN and CLOSE, so this is a
+   * transport contract violation. It is classified rather than thrown: a throw
+   * inside a socket callback is an unhandled rejection in the driver, and it
+   * would destroy the frame instead of recording it.
+   */
+  frameWithoutConnection: "BINANCE_FRAME_WITHOUT_CONNECTION",
 } as const;
 
 export type BinanceReasonCode =

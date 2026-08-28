@@ -12,22 +12,19 @@ import { decodeFrame } from "@polymarket-bot/binance-adapter";
 import { describe, expect, it } from "vitest";
 
 import { framesFixture, frameText } from "./fixtures.js";
-import { createHarness, eventTypesOf, open } from "./support.js";
+import { createHarness, deliver, eventTypesOf, open } from "./support.js";
 
 const FIXTURE = framesFixture("malformed-synthetic");
 
 function drive(): {
   readonly harness: ReturnType<typeof createHarness>;
-  readonly byLabel: Map<string, ReturnType<ReturnType<typeof createHarness>["feed"]["onFrame"]>>;
+  readonly byLabel: Map<string, ReturnType<typeof deliver>>;
 } {
   const harness = createHarness();
   open(harness, "conn-malformed");
-  const byLabel = new Map<
-    string,
-    ReturnType<ReturnType<typeof createHarness>["feed"]["onFrame"]>
-  >();
+  const byLabel = new Map<string, ReturnType<typeof deliver>>();
   for (const frame of FIXTURE.frames) {
-    const outcome = harness.feed.onFrame(frameText(frame), harness.clock.advance(1));
+    const outcome = deliver(harness, frameText(frame), harness.clock.advance(1));
     harness.emissions.push(...outcome.emissions);
     byLabel.set(frame.label, outcome);
   }
@@ -140,6 +137,33 @@ describe("malformed and unknown frames", () => {
     const outcome = byLabel.get("book-ticker-both-sides-empty");
     expect(outcome?.classification).toBe("UNREPRESENTABLE");
     expect(eventTypesOf(outcome?.emissions ?? [])).not.toContain("ReferenceTopOfBookChanged");
+  });
+
+  it("refuses a wrapper that contradicts the payload it wraps (round-1 review, M1)", () => {
+    const { byLabel } = drive();
+    for (const label of [
+      "combined-wrapper-contradicts-payload-symbol",
+      "combined-wrapper-contradicts-payload-kind",
+    ]) {
+      const outcome = byLabel.get(label);
+      expect(outcome?.classification, label).toBe("MALFORMED");
+      expect(eventTypesOf(outcome?.emissions ?? []), label).not.toContain(
+        "ReferenceTradeObserved",
+      );
+      // The mismatch is preserved and reported, not resolved by picking a side.
+      if (outcome?.decoded.kind !== "MALFORMED") {
+        throw new Error(`${label} should decode as MALFORMED`);
+      }
+      expect(outcome.decoded.reason, label).toBe("CHANNEL_MISMATCH");
+    }
+  });
+
+  it("never lets an unverified wrapper name become an emission's sourceChannel", () => {
+    const { harness } = drive();
+    const subscribed = new Set([...harness.feed.streamNames, "binance:stream-connection"]);
+    for (const emission of harness.emissions) {
+      expect(subscribed.has(emission.sourceChannel), emission.sourceChannel).toBe(true);
+    }
   });
 
   it("accepts a frame carrying an added venue field and reports the drift", () => {

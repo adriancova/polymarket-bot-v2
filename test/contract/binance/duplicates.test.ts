@@ -13,22 +13,19 @@
 import { describe, expect, it } from "vitest";
 
 import { framesFixture, frameText } from "./fixtures.js";
-import { createHarness, eventTypesOf, open } from "./support.js";
+import { createHarness, deliver, eventTypesOf, open } from "./support.js";
 
 const FIXTURE = framesFixture("duplicates-synthetic");
 
 function driveFixture(): {
   readonly harness: ReturnType<typeof createHarness>;
-  readonly byLabel: Map<string, ReturnType<ReturnType<typeof createHarness>["feed"]["onFrame"]>>;
+  readonly byLabel: Map<string, ReturnType<typeof deliver>>;
 } {
   const harness = createHarness();
   open(harness, "conn-duplicates");
-  const byLabel = new Map<
-    string,
-    ReturnType<ReturnType<typeof createHarness>["feed"]["onFrame"]>
-  >();
+  const byLabel = new Map<string, ReturnType<typeof deliver>>();
   for (const frame of FIXTURE.frames) {
-    const outcome = harness.feed.onFrame(frameText(frame), harness.clock.advance(1));
+    const outcome = deliver(harness, frameText(frame), harness.clock.advance(1));
     harness.emissions.push(...outcome.emissions);
     byLabel.set(frame.label, outcome);
   }

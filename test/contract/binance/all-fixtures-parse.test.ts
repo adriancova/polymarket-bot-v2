@@ -10,7 +10,7 @@ import { BINANCE_FACTS_VERIFIED_AT, decodeFrame } from "@polymarket-bot/binance-
 import { describe, expect, it } from "vitest";
 
 import { frameText, loadAllFixtures } from "./fixtures.js";
-import { createHarness, open } from "./support.js";
+import { createHarness, deliver, open } from "./support.js";
 
 const FIXTURES = loadAllFixtures();
 
@@ -112,7 +112,7 @@ describe("every fixture frame is classified as it claims when driven through the
           harness = createHarness();
           open(harness, "conn-fixture");
         }
-        const outcome = harness.feed.onFrame(frameText(frame), harness.clock.advance(1));
+        const outcome = deliver(harness, frameText(frame), harness.clock.advance(1));
         expect(
           { label: frame.label, classification: outcome.classification },
           `fixture frame ${frame.label}`,

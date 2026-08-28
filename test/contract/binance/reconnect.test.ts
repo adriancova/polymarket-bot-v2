@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 
 import { frameText, sessionFixture } from "./fixtures.js";
-import { createHarness, eventTypesOf } from "./support.js";
+import { closeSocket, createHarness, deliver, eventTypesOf, open } from "./support.js";
 
 const SESSION = sessionFixture("reconnect-synthetic");
 
@@ -39,7 +39,10 @@ function driveSession(): {
     const stamp = harness.clock.advance(step.advanceMs);
     switch (step.step) {
       case "OPEN": {
+        // The harness records which socket is open, because every socket event
+        // now carries the identity of the socket that produced it.
         harness.feed.connecting();
+        harness.connectionId = step.connectionId;
         const outcome = harness.feed.onOpen(step.connectionId, stamp);
         harness.emissions.push(...outcome.emissions);
         recorded.push({
@@ -51,7 +54,7 @@ function driveSession(): {
         break;
       }
       case "CLOSE": {
-        const outcome = harness.feed.onClose(stamp, {
+        const outcome = closeSocket(harness, stamp, {
           ...(step.code === undefined ? {} : { code: step.code }),
           ...(step.reason === undefined ? {} : { reason: step.reason }),
         });
@@ -65,7 +68,7 @@ function driveSession(): {
         break;
       }
       case "FRAME": {
-        const outcome = harness.feed.onFrame(frameText(step), stamp);
+        const outcome = deliver(harness, frameText(step), stamp);
         harness.emissions.push(...outcome.emissions);
         recorded.push({
           step: "FRAME",
@@ -196,5 +199,94 @@ describe("reconnect session", () => {
     expect(metrics.connections.disconnects).toBe(2);
     expect(metrics.subscriptionGeneration).toBe(2);
     expect(metrics.state).toBe("OPEN");
+  });
+});
+
+/**
+ * The reconnect path's hardest case: two sockets alive at once.
+ *
+ * A socket does not stop existing because a newer one replaced it. It can
+ * deliver a buffered frame, an error, or its own close AFTER the replacement is
+ * live, and every one of those callbacks used to be applied to whatever
+ * connection was current at the time (round-1 review, finding H1). The venue
+ * makes this concrete rather than theoretical: it documents both a 24-hour
+ * connection lifetime and a `serverShutdown` notice instructing a client to
+ * "establish a new connection as soon as possible", which is a make-before-break
+ * reconnect with two live sockets by construction.
+ */
+describe("overlapping sockets", () => {
+  const TRADE = (id: number): string =>
+    JSON.stringify({
+      stream: "bnbbtc@trade",
+      data: {
+        e: "trade",
+        E: 1672515782136,
+        s: "BNBBTC",
+        t: id,
+        p: "0.001",
+        q: "100",
+        T: 1672515782136,
+        m: true,
+      },
+    });
+
+  it("records a frame under the socket that delivered it, never under another", () => {
+    const harness = createHarness();
+    open(harness, "conn-a");
+    harness.emissions.push(
+      ...harness.feed.onFrame("conn-a", TRADE(1), harness.clock.advance(1)).emissions,
+    );
+
+    // conn-b opens while conn-a is still alive (make-before-break).
+    open(harness, "conn-b");
+    const late = harness.feed.onFrame("conn-a", TRADE(2), harness.clock.advance(1));
+
+    expect(late.classification).toBe("STALE_CONNECTION");
+    expect(eventTypesOf(late.emissions)).not.toContain("ReferenceTradeObserved");
+    const trades = harness.emissions.filter(
+      (emission) => emission.eventType === "ReferenceTradeObserved",
+    );
+    expect(trades.map((emission) => emission.connectionId)).toEqual(["conn-a"]);
+    expect(trades.map((emission) => emission.subscriptionGeneration)).toEqual([0]);
+  });
+
+  it("ignores a delayed callback from a socket that has already been replaced", () => {
+    const harness = createHarness();
+    open(harness, "conn-a");
+    closeSocket(harness, harness.clock.advance(1), { code: 1006 });
+    open(harness, "conn-b");
+
+    const before = harness.feed.metrics(harness.clock.peek());
+    const staleClose = harness.feed.onClose("conn-a", harness.clock.advance(1), { code: 1006 });
+    const staleError = harness.feed.onSocketError("conn-a", harness.clock.advance(1), {
+      detail: "delayed",
+    });
+    const after = harness.feed.metrics(harness.clock.peek());
+
+    expect(eventTypesOf(staleClose.emissions)).not.toContain("FeedDisconnected");
+    expect(staleClose.directive.kind).toBe("NONE");
+    expect(staleError.rejected?.relation).toBe("RETIRED");
+    expect(after.state).toBe("OPEN");
+    expect(after.connectionId).toBe("conn-b");
+    expect(after.connections.disconnects).toBe(before.connections.disconnects);
+    expect(after.connections.socketErrors).toBe(before.connections.socketErrors);
+    expect(after.connections.lifecycleEventsNotFromLiveConnection).toBe(2);
+  });
+
+  it("still recognises a trade replayed after the reconnect, even out of order", () => {
+    // The reconnect fixture's replay arrives immediately; here a NEWER trade
+    // arrives first, which is the schedule that used to defeat duplicate
+    // detection entirely (round-1 review, finding M2).
+    const harness = createHarness();
+    open(harness, "conn-a");
+    harness.feed.onFrame("conn-a", TRADE(12_345), harness.clock.advance(1));
+    closeSocket(harness, harness.clock.advance(1), { code: 1006 });
+    open(harness, "conn-b");
+    harness.feed.onFrame("conn-b", TRADE(12_999), harness.clock.advance(1));
+
+    const replay = harness.feed.onFrame("conn-b", TRADE(12_345), harness.clock.advance(1));
+    expect(replay.classification).toBe("DUPLICATE_SUPPRESSED");
+    expect(replay.emissions).toEqual([]);
+    expect(harness.feed.metrics(harness.clock.peek()).frames.lateTradesEmitted).toBe(0);
   });
 });

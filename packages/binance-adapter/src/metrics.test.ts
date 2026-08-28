@@ -34,6 +34,7 @@ const BASE: FeedMetricsInput = {
     controlResponses: 0,
     controlErrors: 0,
     serverShutdownNotices: 0,
+    framesNotFromLiveConnection: 0,
   },
   connections: {
     connectionAttempts: 1,
@@ -42,11 +43,13 @@ const BASE: FeedMetricsInput = {
     socketErrors: 0,
     staleEpisodes: 0,
     incidentsOpened: 0,
+    lifecycleEventsNotFromLiveConnection: 0,
   },
   openIncidentReasonCodes: [],
   sequences: [],
   trackedStreams: 0,
   maxTrackedStreams: 4096,
+  maxRecentIdsPerStream: 64,
   untrackedSequenceObservations: 0,
 };
 
@@ -82,14 +85,22 @@ describe("computeFeedMetrics", () => {
     expect(metrics.lastVenueToReceiptLagMs).toBe(-120);
   });
 
-  it("projects per-stream sequence state", () => {
+  it("projects per-stream sequence state, including the duplicate window's reach", () => {
     const metrics = computeFeedMetrics({
       ...BASE,
-      sequences: [{ key: "btcusdt@trade", lastId: 99, observations: 4 }],
+      sequences: [
+        { key: "btcusdt@trade", lastId: 99, observations: 4, recentIdsTracked: 4 },
+      ],
       trackedStreams: 1,
     });
     expect(metrics.streams).toEqual([
-      { streamName: "btcusdt@trade", lastVenueSequenceId: 99, observations: 4 },
+      {
+        streamName: "btcusdt@trade",
+        lastVenueSequenceId: 99,
+        observations: 4,
+        recentIdsTracked: 4,
+      },
     ]);
+    expect(metrics.maxRecentIdsPerStream).toBe(64);
   });
 });

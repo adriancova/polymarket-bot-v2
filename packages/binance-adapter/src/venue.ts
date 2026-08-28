@@ -254,7 +254,7 @@ export const BINANCE_UNVERIFIED = [
     subject: "How `<symbol>@bookTicker` represents an empty book side",
     documented: "The documentation shows only populated best bid/ask examples.",
     conservativeBehavior:
-      "A non-positive best price is not representable as the domain's positive `bidPrice`/`askPrice`, and mapping it to 'absent' would be an invention of the ADR-001 §8.1 kind ('an absent best bid is not a zero best bid'). The frame is classified `UNREPRESENTABLE`, a data-quality incident is opened, and no event is emitted.",
+      "A non-positive best price is not representable as the domain's positive `bidPrice`/`askPrice`, and mapping it to 'absent' would be an invention of the ADR-001 §8.1 kind ('an absent best bid is not a zero best bid'). The two cases are kept apart. ONE unusable side: that side is OMITTED from the event with its raw value recorded and a data-quality incident opened, and the other side is still published — the frame is `NORMALIZED` and counted as a partial top of book, because suppressing a real best ask on account of an unrepresentable best bid would discard an observation the venue did make. BOTH sides unusable: the frame is classified `UNREPRESENTABLE`, an incident is opened, and no event is emitted, because there would be nothing left to say.",
   },
   {
     id: "BNC-U5",

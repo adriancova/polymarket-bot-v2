@@ -26,6 +26,11 @@
  *   automatically and application code never sees them. That is the *difference*
  *   from the Polymarket CLOB channels, whose `PING`/`PONG` are application text
  *   frames the WAL stores verbatim (ADR-004 §1).
+ * - **Stamp every event with the identity of the socket that produced it**, taken
+ *   from the {@link BinanceSocketRequest} that created that socket and never
+ *   from any later state. A transport that reports a retired socket's close
+ *   without its identity makes that close indistinguishable from the live
+ *   socket's, and the feed would then tear down a healthy connection.
  * - **Deliver each message as one string.** The frame opcode on the JSON stream
  *   endpoint is not documented (`BNC-U1`), so a transport that receives a binary
  *   frame must decode it as UTF-8 and deliver the string; if it cannot decode
@@ -49,12 +54,68 @@ export type FeedConnectionState =
   /** Deliberately closed by the caller; no further reconnect is directed. */
   | "CLOSED";
 
-/** Events the transport reports to the feed. */
+/** Maximum accepted length of a caller-supplied connection id. */
+export const MAX_CONNECTION_ID_LENGTH = 100;
+
+/**
+ * Whether a value can serve as a socket identity.
+ *
+ * Bounded because the identity is copied onto `FeedConnected.connectionId` and
+ * into derived incident ids, both of which the frozen domain contract bounds.
+ */
+export function isWellFormedConnectionId(value: string): boolean {
+  return value.length > 0 && value.length <= MAX_CONNECTION_ID_LENGTH;
+}
+
+/**
+ * Events the transport reports to the feed.
+ *
+ * EVERY EVENT CARRIES THE IDENTITY OF THE SOCKET THAT PRODUCED IT, and the
+ * identity is the one fixed when that socket was requested — never "whichever
+ * connection is current now". A socket that has been superseded or closed can
+ * still deliver a buffered message, an error, or its close event *after* its
+ * replacement is live; without an immutable identity on the event itself, the
+ * feed would relabel that traffic as the new connection's (recording a trade
+ * under a generation it never belonged to) and would let a dead socket's close
+ * tear down the live one. Identity therefore travels with the event, and
+ * `BinanceReferenceFeed` rejects anything that did not come from the socket it
+ * is currently listening to (WP-080 round-1 review, finding H1).
+ */
 export type BinanceSocketEvent =
   | { readonly type: "OPEN"; readonly connectionId: string }
-  | { readonly type: "MESSAGE"; readonly data: string }
-  | { readonly type: "ERROR"; readonly reasonCode?: string; readonly detail?: string }
-  | { readonly type: "CLOSE"; readonly code?: number; readonly reason?: string };
+  | { readonly type: "MESSAGE"; readonly connectionId: string; readonly data: string }
+  | {
+      readonly type: "ERROR";
+      readonly connectionId: string;
+      readonly reasonCode?: string;
+      readonly detail?: string;
+    }
+  | {
+      readonly type: "CLOSE";
+      readonly connectionId: string;
+      readonly code?: number;
+      readonly reason?: string;
+    };
+
+/**
+ * How a socket identity relates to what the feed is currently listening to.
+ *
+ * Deliberately a statement about KNOWLEDGE rather than about intent: the feed
+ * knows which socket is live and which identities it has retired, and nothing
+ * else. `UNKNOWN` is not an error by itself — a connection attempt that fails
+ * before it ever opens reports its error and close under an identity the feed
+ * has never seen live — so the acceptance rule combines the relation with the
+ * event type (see `BinanceReferenceFeed`).
+ */
+export type ConnectionIdentityRelation =
+  /** The identity of the socket the feed is currently listening to. */
+  | "LIVE"
+  /** An identity that was live and has since been superseded or closed. */
+  | "RETIRED"
+  /** An identity the feed has never seen live: a pending or foreign socket. */
+  | "UNKNOWN"
+  /** Not a well-formed connection id at all. */
+  | "INVALID";
 
 /** The minimal handle the feed needs on a live socket. */
 export type BinanceSocket = {
