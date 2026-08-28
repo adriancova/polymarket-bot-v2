@@ -11,30 +11,41 @@
  * absolute-size price changes exactly as documented by the venue"). A size of
  * `"0"` removes the level.
  *
- * ## UNVERIFIED — conflict C-1 / unverified item U-1
+ * ## CONFIRMED — conflict C-1 / unverified item U-1 are CLOSED (2026-08-28)
  *
- * The sentence above is the handoff §23 architectural ASSUMPTION, retained
- * provisionally under handoff §1.1's conflict procedure. It is NOT a verified
- * venue fact: the official market-channel documentation types
- * `price_change.size` as a `DecimalString` and states neither
- * absolute-versus-delta semantics nor that `size: "0"` removes a level
- * (`docs/venue/verified-2026-08-24.md` §3, conflict C-1 in §11, unverified item
- * U-1 in §12; ADR-002 §8).
+ * The sentence above began as the handoff §23 architectural ASSUMPTION, retained
+ * provisionally under handoff §1.1's conflict procedure while
+ * `docs/venue/verified-2026-08-24.md` §3 recorded the documentation gap
+ * (conflict C-1 in §11, unverified item U-1 in §12). It is now a CONFIRMED venue
+ * fact, ratified by ADR-013:
  *
- * Consequences, so no reader mistakes provisional wording for settled behavior:
+ * - Current official Polymarket documentation
+ *   (`https://docs.polymarket.com/api-reference/wss/market`, retrieved
+ *   2026-08-27 by `WP-070` and re-verified 2026-08-28 by the contract-owner
+ *   round) defines `price_change.size` as "New aggregate size (0 means level
+ *   removed)", the operation as "Delta update to orderbook price levels when an
+ *   order is placed or cancelled", and `book` as a "Full orderbook snapshot sent
+ *   on subscribe or after a trade" whose level `size` is the "Total size at this
+ *   price level".
+ * - "Delta" names WHICH LEVELS are reported, not the arithmetic: a consumer
+ *   REPLACES the size at the named level and never adds to or subtracts from a
+ *   previous size. `"0"` deletes the level.
+ * - `WP-150` may treat these semantics as truth (ADR-002 §8, as amended
+ *   2026-08-28), and ADR-012 §5.8's inherited uncertainty is discharged.
  *
- * - `WP-070` MUST confirm the semantics against the official SDK's
- *   book-maintenance code and/or live observation BEFORE `WP-150` treats them as
- *   truth. Until then no component may claim they are verified, and the
- *   simulator inherits the same uncertainty (ADR-012).
- * - If confirmation shows DELTA semantics instead, the fix is a NEW
+ * Three obligations survive the confirmation:
+ *
+ * - It is DOCUMENTARY, not observational. No live observation was made, and
+ *   nothing here may be cited as observed venue behavior (ADR-013 §5).
+ * - If evidence ever shows DELTA arithmetic instead, the fix is a NEW
  *   `schemaVersion` for the affected book contracts under ADR-002 §8.4 — never a
  *   reinterpretation of recorded v1 data, and never an in-place redefinition of
  *   these payloads.
- * - Anything reconstructing depth from these events is building on a
- *   provisional reading of the venue (ADR-002 Consequences).
+ * - The fact stays volatile (handoff §1.2). The next dated verification report
+ *   re-verifies it and must add the citing page to its source index, which the
+ *   frozen 2026-08-24 report does not contain (ADR-013 §6).
  *
- * This block is a COMMENT ONLY. It records status that already binds via
+ * This block is a COMMENT ONLY. It records status that binds via ADR-013,
  * ADR-002 §8 and `docs/contracts/protected-contracts.md` §8; it changes no
  * schema, type, or runtime behavior, so `schemaVersion` is unchanged (ADR-002
  * §3 ties a version bump to a change in the EMITTED FIELD SET).
@@ -86,9 +97,11 @@ export const BookLevelChangedPayloadSchema = z.strictObject({
   /**
    * Absolute resulting size at this price; `"0"` removes the level.
    *
-   * UNVERIFIED (C-1 / U-1): this is the handoff §23 assumption, not a
-   * documented venue fact. `WP-070` must confirm it; delta semantics would be
-   * corrected by a new `schemaVersion` under ADR-002 §8.4. See the module
+   * CONFIRMED (C-1 / U-1 closed, 2026-08-28, ADR-013): current official
+   * documentation defines `price_change.size` as "New aggregate size (0 means
+   * level removed)". REPLACE the level's size with this value; never add or
+   * subtract. Contrary evidence would be corrected by a new `schemaVersion`
+   * under ADR-002 §8.4, never by reinterpreting recorded data. See the module
    * header.
    */
   size: NonNegativeSharesStringSchema,

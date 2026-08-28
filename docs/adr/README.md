@@ -39,6 +39,27 @@ Consequences for every ADR in this directory:
   gap for the next verification round. It does not fetch venue documentation
   and it does not guess.
 
+**One narrow exception, added 2026-08-28 by `GOV-1B` and stated so it is not
+re-derived case by case.** A **ratifying** ADR may record a venue fact that a
+work package's own **mandated** verification obtained from *current official*
+documentation — the case ADR-002 §8.3 created when it required `WP-070` to
+confirm C-1/U-1 before `WP-150` could rely on it. This is not a weakening of the
+rule above, and it is bounded by all four of:
+
+1. **Handoff §1.1 already ranks current official documentation above the in-repo
+   report**, so the ADR still asserts nothing on its own authority.
+2. The record carries the **URL, the retrieval date, and verbatim quotes**, and
+   distinguishes documentary confirmation from observation. An observational
+   claim still requires real evidence (`AGENTS.md`).
+3. The frozen report is **still cited** for the item's origin and prior status,
+   and is **not edited** (`docs/contracts/protected-contracts.md` §2).
+4. The **gap is still recorded** for the next verification round: a source the
+   frozen report's index does not contain must enter the next dated report.
+
+An ADR that merely *wants* a venue fact still does not fetch one.
+[ADR-013](./ADR-013-book-price-change-absolute-size-confirmed.md) §7 is the
+first and, so far, only use.
+
 ---
 
 ## Index
@@ -57,6 +78,10 @@ Consequences for every ADR in this directory:
 | [ADR-010](./ADR-010-run-mode-enablement-and-production-key-boundary.md) | Run-mode enablement and production key boundary | Accepted | §0.2, §11, §6.16–6.18, §15 | every package; gated by `WP-350`/`WP-370` |
 | [ADR-011](./ADR-011-one-live-owner-per-market-policy.md) | One-live-owner-per-market policy | Accepted | §2, §6.11, §9.7 | `WP-040`, `WP-180` |
 | [ADR-012](./ADR-012-simulation-fill-model-evidence-hierarchy.md) | Simulation fill-model evidence hierarchy | Accepted | §12.2–12.5, §17 | `WP-210`, `WP-360` |
+| [ADR-013](./ADR-013-book-price-change-absolute-size-confirmed.md) | Book `price_change` carries absolute aggregate size, with zero removal (C-1/U-1 ratified) | Accepted | §9.4, §23, §1.1–1.2 | `WP-020` (done, unchanged), `WP-070` (done), `WP-150` |
+| [ADR-014](./ADR-014-taker-side-names-the-aggressor-order-side.md) | `takerSide` names the aggressor order's own side | Accepted | §7.4 | `WP-020` (done, unchanged), `WP-070`/`WP-090` (conform), `WP-080` (follow-up owed) |
+| [ADR-015](./ADR-015-repository-identifier-bound.md) | The repository identifier bound is boundary hardening, not a venue narrowing | Accepted | §7.2, §7.3, §8.3 | `WP-020` (done, unchanged), `WP-070` (done), every adapter |
+| [ADR-016](./ADR-016-ratified-inferred-domain-shapes.md) | Ratification of the four unratified `domain.md` §8 inferences (R-3) | Accepted | §7.2, §7.4, §14.4 | `WP-020` (done, unchanged) |
 
 Companion contract documentation (not ADRs, same authority chain):
 

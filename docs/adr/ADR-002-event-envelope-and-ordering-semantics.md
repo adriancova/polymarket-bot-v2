@@ -6,6 +6,13 @@
 - **Implemented by:** `WP-020` (envelope, contracts, registry — done and frozen);
   `WP-060`, `WP-070`–`WP-100`, `WP-120` (producers); `WP-210` (replay)
 - **Supersedes / Superseded by:** none
+- **Amendments (change log):** 2026-08-28, `GOV-1B` — (a) §7's condition-id row
+  is reworded to name the repository identifier bound
+  ([ADR-015](./ADR-015-repository-identifier-bound.md)); (b) §8 gains a dated
+  amendment recording that its own `WP-070` confirmation condition is discharged
+  ([ADR-013](./ADR-013-book-price-change-absolute-size-confirmed.md)); (c) the
+  matching Consequences bullet is marked discharged. No decision text is
+  rewritten; each amendment is marked in place.
 
 ## Context
 
@@ -231,7 +238,7 @@ correction.
 | Narrowing in the `WP-000` fixture catalog | Runtime rule |
 | --- | --- |
 | SDK `.nullish()` fields rejected when `null` — e.g. `MarketBookEventSchema.hash`, `timestamp`, `neg_risk`, and every `OptionalDecimalStringSchema` field (venue report §17; `checks.ts:829-833`, `842-847`) | The **adapter** **must accept `null`** wherever the SDK declares `.nullish()` and **map it to absent before the domain boundary**. `packages/domain` stays strict per ADR-001 §8.1 and never sees `null`. |
-| `conditionId` narrowed to 31/32 bytes, while the SDK's `ConditionIdResponseSchema` "validates hex syntax without constraining the condition ID byte length" (venue report §7.1; `checks.ts:143`, `419-425`) | A runtime parser **must accept any hex condition id the SDK accepts**. Rejecting a valid one at runtime drops real venue data rather than failing a fixture test. |
+| `conditionId` narrowed to 31/32 bytes, while the SDK's `ConditionIdResponseSchema` "validates hex syntax without constraining the condition ID byte length" (venue report §7.1; `checks.ts:143`, `419-425`) | **No 31/32-byte narrowing.** An adapter **must accept any SDK-accepted hex condition id up to the repository identifier bound** (`MAX_IDENTIFIER_LENGTH` = 200, [ADR-015](./ADR-015-repository-identifier-bound.md)); **beyond the bound a typed refusal is the correct adapter behavior** — a problem carrying the raw frame, never a truncation, a silent drop, or a frame-losing throw. Rejecting a valid *in-bound* id at runtime drops real venue data rather than failing a fixture test. *(Wording amended 2026-08-28 by `GOV-1B`; the row previously read "must accept any hex condition id the SDK accepts", which the frozen `ConditionIdSchema` makes unsatisfiable — `WP-070` review round 1, finding M2. The narrowing being rejected is unchanged; only the unbounded phrasing is corrected. See ADR-015 for the ruling and its evidence.)* |
 | Reward decimals modeled only at the SDK-parsed layer (venue report §7.1; `checks.ts:381-384`) | An adapter **must accept both** the raw JSON-number form and the decimal-string form and normalize to canonical decimal (ADR-001 §8.2). |
 | `clobRewards`, `rewardsMinSize`, `rewardsMaxSpread` required and non-null, `clobRewards[].endDate` key-required, while the SDK marks all four `.nullish()` (venue report §7, §7.1; `checks.ts:377-451`) | A runtime model **must treat all four as optional**; a real market may omit the whole rewards block. |
 | **Trade-status spelling pinned per layer**: the user-stream fixtures accept only the plain values (`MATCHED`…`FAILED`) and the REST fixtures only the prefixed `TRADE_STATUS_*` constants, while the SDK's `TradeStatusSchema` normalizes **both** spellings on **either** layer (`checks.ts:107-131`, used at `1063` and `1110`) | An adapter **must accept either spelling on either layer** and normalize once, on its own side of the boundary. The per-layer pinning is documentation fidelity for a frozen snapshot, not a wire guarantee — and C-3 (`MATCHED_NOT_BROADCASTED` scope) is still **open**, so neither spelling set may be treated as exhaustive. |
@@ -287,6 +294,27 @@ Decision:
    `schemaVersion` for the affected book contracts under §3 of this ADR — not a
    reinterpretation of recorded v1 data.
 
+#### Amendment, 2026-08-28 (`GOV-1B`): the §8.3 condition is DISCHARGED
+
+The text of §8.1–§8.4 above is left **exactly as written**, because it is the
+record of what was known on 2026-08-26 and an accepted ADR is not rewritten to
+match a later fact (`docs/adr/README.md`, Status vocabulary). What follows is the
+outcome of the procedure §8.3 required, not a change to the decision:
+
+- **`WP-070` performed the confirmation** on 2026-08-27 and the contract-owner
+  round re-verified it independently on 2026-08-28. Current official
+  documentation states the semantics in words: `price_change.size` is the "New
+  aggregate size (0 means level removed)".
+- **C-1 / U-1 are closed and the semantics are no longer provisional.** The
+  ratification, its verbatim quotes, retrieval dates, scope, and limits are
+  [ADR-013](./ADR-013-book-price-change-absolute-size-confirmed.md).
+- Consequently the sentence "**The venue documentation does not currently state
+  this**" in this section is true **as of 2026-08-26 only**, and the
+  Consequences bullet "the book contract is not yet trustworthy for order-book
+  reconstruction" is discharged. `WP-150` may treat the semantics as truth.
+- §8.4's remedy is unchanged and still binds: contrary evidence produces a **new
+  `schemaVersion`**, never a reinterpretation of recorded v1 data.
+
 ### 9. Where the terminal-outcome ruling lives
 
 `MarketResolved` carries a **terminal outcome only** (`YES_WIN`, `NO_WIN`,
@@ -317,7 +345,10 @@ about the absent dedicated dispute event, are owned by
   existed.
 - **The book contract is not yet trustworthy for order-book reconstruction.**
   Until `WP-070` resolves C-1/U-1, any component that reconstructs depth is
-  building on a provisional reading of the venue.
+  building on a provisional reading of the venue. *(Discharged 2026-08-28: see
+  the §8 amendment and
+  [ADR-013](./ADR-013-book-price-change-absolute-size-confirmed.md). The bullet
+  is kept as written because it was true when written.)*
 - **The ordering key is gateway-assigned, so gateway identity matters.** Two
   gateways publishing into one stream must use distinct `gatewayEpoch` values and
   a consumer must not interleave epochs as though they were one sequence.

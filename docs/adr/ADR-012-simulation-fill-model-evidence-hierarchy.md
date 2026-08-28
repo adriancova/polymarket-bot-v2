@@ -7,6 +7,10 @@
   Tier 0 and Tier 1 fill models), `WP-360` (calibration pipeline), `WP-350`
   (execution probes, human-gated) — **not yet implemented**
 - **Supersedes / Superseded by:** none
+- **Amendments (change log):** 2026-08-28, `GOV-1B` — §5.8's UNVERIFIED status is
+  marked discharged in place (C-1/U-1 confirmed;
+  [ADR-013](./ADR-013-book-price-change-absolute-size-confirmed.md)). No decision
+  text is rewritten and no other §5 item's status changes.
 
 ## Context
 
@@ -135,6 +139,18 @@ verification report rather than assuming venue behavior.
    and therefore every fill decision that consumes depth — inherits that
    uncertainty until `WP-070` confirms it (ADR-002 §8). Simulation results
    produced before that confirmation carry the same unverified marker.
+
+   **Amended 2026-08-28 (`GOV-1B`): CONFIRMED, and this item is discharged.**
+   `WP-070` performed the §8 confirmation on 2026-08-27 and the contract-owner
+   round re-verified it on 2026-08-28: current official documentation states that
+   `price_change.size` is the "New aggregate size (0 means level removed)". See
+   [ADR-013](./ADR-013-book-price-change-absolute-size-confirmed.md). The
+   paragraph above is kept as written because it was true when written; what it
+   said would happen has happened. Two obligations survive unchanged: a
+   simulation result produced **before** 2026-08-28 keeps the unverified marker
+   it was produced under (§7 — evidence is not back-dated), and the confirmation
+   is **documentary, not observational**, so nothing here may be cited as
+   observed venue behavior. No other §5 item's status changes.
 9. **No invented venue sequence number.** Queue-position estimates must be built
    from ingest order, venue timestamps, and venue-provided hashes only (§9.4,
    ADR-002 §2).
