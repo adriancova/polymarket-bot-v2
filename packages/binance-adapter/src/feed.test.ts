@@ -794,24 +794,201 @@ describe("make-before-break replacement (round-3 review, R3-M1/R3-L1)", () => {
     expect(feed.metrics(clock.peek()).frames.tradesNormalized).toBe(0);
   });
 
-  it("leaves the refused attempt registered — the disclosed residual, with the feed still flowing", () => {
+  it("retires the refused attempt — its socket closed — while the feed keeps flowing", () => {
     const { feed, clock } = replacementRegistered();
-    feed.onClose("conn-replacement", clock.advance(1), { code: 1006 });
+    const refused = feed.onClose("conn-replacement", clock.advance(1), { code: 1006 });
 
-    // A refusal mutates nothing, so the caller's own registration survives it.
-    expect(feed.pendingConnectionId).toBe("conn-replacement");
+    // The refusal withholds every EFFECT of the close: no FeedDisconnected, no
+    // directive, no disconnect counted, and the live socket carries on.
+    expect(typesOf(refused.emissions)).not.toContain("FeedDisconnected");
+    expect(refused.directive).toEqual({ kind: "NONE" });
     expect(feed.state).toBe("OPEN");
     expect(feed.liveConnectionId).toBe("conn-live");
+    expect(feed.metrics(clock.peek()).connections.disconnects).toBe(0);
     expect(feed.onFrame("conn-live", tradeFrame({ t: 9 }), clock.advance(1)).classification).toBe(
       "NORMALIZED",
     );
 
-    // If that identity's socket does open after all, it is believed: the caller
-    // authorized it. That is the residual, and it costs the live socket nothing
-    // until the moment it is superseded.
+    // What it does NOT withhold is the fact that the socket is gone. Until the
+    // round-5 fix the registration survived, and `pendingConnectionId` went on
+    // naming a closed socket as an attempt in flight (round-5 review, R5-M1).
+    expect(feed.pendingConnectionId).toBeUndefined();
+    // The refusal still reports the attempt it refused: that is why the event
+    // was inadmissible, and the driver reads its own identity back.
+    expect(refused.rejected?.relation).toBe("PENDING");
+    expect(refused.rejected?.pendingConnectionId).toBe("conn-replacement");
+
+    // A late OPEN under that identity is now an ordinary retired-socket refusal
+    // rather than an adoption: a socket that closed is never revived, and the
+    // caller must register a new identity to try again.
+    const opened = feed.onOpen("conn-replacement", clock.advance(1));
+    expect(opened.rejected?.relation).toBe("RETIRED");
+    expect((opened.emissions[0]?.payload as { reasonCode: string }).reasonCode).toBe(
+      BINANCE_REASON_CODES.retiredConnectionEvent,
+    );
+    expect(feed.liveConnectionId).toBe("conn-live");
+    expect(feed.subscriptionGeneration).toBe(0);
+    expect(() => feed.connecting("conn-replacement")).toThrow(BinanceStateError);
+  });
+
+  it("does not retire the attempt on a refused ERROR — only its close says the socket is gone", () => {
+    const { feed, clock } = replacementRegistered();
+
+    // A transport reports an error and then closes. The error alone is no proof
+    // the attempt is over, so the registration survives it…
+    const error = feed.onSocketError("conn-replacement", clock.advance(1), {
+      detail: "connect ECONNREFUSED",
+    });
+    expect(error.rejected?.relation).toBe("PENDING");
+    expect(feed.pendingConnectionId).toBe("conn-replacement");
+    expect(feed.metrics(clock.peek()).connections.socketErrors).toBe(0);
+
+    // …and the socket that error came from can still open, which is exactly the
+    // make-before-break adoption this feed must not foreclose.
     const opened = feed.onOpen("conn-replacement", clock.advance(1));
     expect(opened.rejected).toBeUndefined();
     expect(feed.liveConnectionId).toBe("conn-replacement");
+  });
+});
+
+/**
+ * The pending socket loses the race: it closes FIRST, then the live one (R5-M1).
+ *
+ * The composition of two accepted behaviors produced a stall. A refused close
+ * from the registered replacement deliberately changes nothing about the live
+ * connection (R3-M1), and a live close with an attempt in flight deliberately
+ * directs nothing and waits (R4-M1). Put in this order they left the feed
+ * `CONNECTING` on a socket that had already closed, with `NONE` returned to a
+ * driver that had nothing left to wait for and no attempt charged — an
+ * indefinite stall. Refusing an event's EFFECTS is not disbelieving that it
+ * happened: the pending attempt's own close now retires it, so this ordering
+ * takes the ordinary reconnect path.
+ */
+describe("pending close before the live close (round-5 review, R5-M1)", () => {
+  /** Opens `conn-live`, registers `conn-replacement`, and closes the replacement. */
+  function replacementClosedFirst(): {
+    feed: BinanceReferenceFeed;
+    clock: ReturnType<typeof createManualClock>;
+    refused: ReturnType<BinanceReferenceFeed["onClose"]>;
+  } {
+    const clock = createManualClock();
+    const feed = newFeed({ stalenessThresholdMs: 10_000 });
+    feed.connecting("conn-live");
+    feed.onOpen("conn-live", clock.advance(1));
+    feed.connecting("conn-replacement");
+    const refused = feed.onClose("conn-replacement", clock.advance(1), { code: 1006 });
+    return { feed, clock, refused };
+  }
+
+  it("reconnects normally when the live socket then closes, with nothing left in flight", () => {
+    const { feed, clock, refused } = replacementClosedFirst();
+
+    // Step 1: the replacement's close is refused, exactly as before…
+    expect(refused.rejected?.relation).toBe("PENDING");
+    expect(refused.directive).toEqual({ kind: "NONE" });
+    expect(feed.state).toBe("OPEN");
+    // …but it resolved the attempt it came from.
+    expect(feed.pendingConnectionId).toBeUndefined();
+
+    // Step 2: the live socket closes. Nothing is in flight, so this is an
+    // ordinary disconnect: IDLE, and one reconnect directed at attempt 1.
+    const close = feed.onClose("conn-live", clock.advance(1), { code: 1006 });
+    expect(typesOf(close.emissions)).toEqual(["FeedDisconnected"]);
+    expect(close.emissions[0]?.connectionId).toBe("conn-live");
+    expect(close.rejected).toBeUndefined();
+    expect(close.directive).toEqual({ kind: "RECONNECT_AFTER", delayMs: 1_000, attempt: 1 });
+    expect(feed.state).toBe("IDLE");
+    expect(feed.liveConnectionId).toBeUndefined();
+    expect(feed.pendingConnectionId).toBeUndefined();
+
+    const metrics = feed.metrics(clock.peek());
+    expect(metrics.state).toBe("IDLE");
+    expect(metrics.pendingConnectionId).toBeUndefined();
+    expect(metrics.connections.disconnects).toBe(1);
+  });
+
+  it("charges that outage exactly one attempt, so the budget still reaches exhaustion", () => {
+    const clock = createManualClock();
+    const feed = newFeed({
+      reconnect: { initialDelayMs: 10, maxDelayMs: 40, multiplier: 2, maxAttempts: 2 },
+    });
+    feed.connecting("conn-live");
+    feed.onOpen("conn-live", clock.advance(1));
+    feed.connecting("conn-replacement");
+
+    // The replacement dies first (refused, charges nothing), then the live one.
+    expect(feed.onClose("conn-replacement", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "NONE",
+    });
+    expect(feed.onClose("conn-live", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "RECONNECT_AFTER",
+      delayMs: 10,
+      attempt: 1,
+    });
+
+    // One outage, one slot: the second of the caller's two attempts follows…
+    feed.connecting("conn-third");
+    expect(feed.onClose("conn-third", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "RECONNECT_AFTER",
+      delayMs: 20,
+      attempt: 2,
+    });
+    // …and the budget then really does run out. Before the fix the live close
+    // returned NONE and this feed never charged, directed, or exhausted anything.
+    feed.connecting("conn-fourth");
+    expect(feed.onClose("conn-fourth", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "STOP",
+      reason: "RECONNECT_ATTEMPTS_EXHAUSTED",
+    });
+  });
+
+  it("keeps the live socket fully heard between the two closes", () => {
+    const { feed, clock } = replacementClosedFirst();
+
+    // Retiring the dead attempt does not touch the connection that is alive:
+    // frames still normalize and the staleness clock still runs (R3-M1).
+    const frame = feed.onFrame("conn-live", tradeFrame({ t: 21 }), clock.advance(1));
+    expect(frame.classification).toBe("NORMALIZED");
+    expect(frame.emissions[0]?.connectionId).toBe("conn-live");
+    expect(typesOf(feed.checkStaleness(clock.advance(10_000)).emissions)).toEqual(["FeedStale"]);
+    expect(feed.state).toBe("OPEN");
+    expect(feed.metrics(clock.peek()).connections.disconnects).toBe(0);
+  });
+
+  it("survives the fatal ERROR-then-CLOSE spelling of the same failure", () => {
+    const clock = createManualClock();
+    const feed = newFeed({ stalenessThresholdMs: 10_000 });
+    feed.connecting("conn-live");
+    feed.onOpen("conn-live", clock.advance(1));
+    feed.connecting("conn-replacement");
+
+    // The transport's usual shape: an error, then the close that ends it.
+    feed.onSocketError("conn-replacement", clock.advance(1), { detail: "connect ETIMEDOUT" });
+    expect(feed.pendingConnectionId).toBe("conn-replacement");
+    feed.onClose("conn-replacement", clock.advance(1), { code: 1006 });
+    expect(feed.pendingConnectionId).toBeUndefined();
+
+    expect(feed.onClose("conn-live", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "RECONNECT_AFTER",
+      delayMs: 1_000,
+      attempt: 1,
+    });
+    expect(feed.state).toBe("IDLE");
+  });
+
+  it("still waits when the attempt is genuinely unresolved — the R4-M1 control", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    feed.connecting("conn-live");
+    feed.onOpen("conn-live", clock.advance(1));
+    feed.connecting("conn-replacement");
+
+    // No close from the replacement: it is in flight, so the live close still
+    // parks the feed in CONNECTING and directs nothing.
+    const close = feed.onClose("conn-live", clock.advance(1), { code: 1006 });
+    expect(close.directive).toEqual({ kind: "NONE" });
+    expect(feed.state).toBe("CONNECTING");
+    expect(feed.pendingConnectionId).toBe("conn-replacement");
   });
 });
 

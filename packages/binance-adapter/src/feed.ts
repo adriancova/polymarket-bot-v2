@@ -58,6 +58,11 @@
  * becomes `CONNECTING`, and directs NOTHING — a driver told to reconnect there
  * would register a third identity, retire the replacement it had already opened,
  * and spend a second reconnect attempt on one outage (round-4 review, R4-M1).
+ * "In flight" means UNRESOLVED, though, not just "registered once": a
+ * replacement whose own close has already been seen is over, even though that
+ * close was refused, so it is retired at the refusal and a later live close
+ * reconnects normally instead of waiting for a socket that is already gone
+ * (round-5 review, R5-M1).
  *
  * AN IDENTITY IS AUTHORIZED BEFORE IT IS BELIEVED. Being unrecognised is not a
  * licence: an identity the feed never authorized may not open a connection,
@@ -236,7 +241,11 @@ export type RejectedSocketEvent = {
    *
    * Reported beside `liveConnectionId` because together they are the whole
    * authorization state: a refusal is explained by what the feed was listening
-   * to and what it had authorized, not by what the event claimed.
+   * to and what it had authorized, not by what the event claimed. Both are the
+   * state AS THE EVENT WAS REFUSED — a refused `CLOSE` from the pending attempt
+   * names that attempt here and retires it, so
+   * {@link BinanceReferenceFeed.pendingConnectionId} already reads `undefined`
+   * by the time the caller inspects it (round-5 review, R5-M1).
    */
   readonly pendingConnectionId: string | undefined;
   readonly detail: string;
@@ -339,12 +348,19 @@ export class BinanceReferenceFeed {
    * Identity the caller registered for the connection attempt in flight.
    *
    * The authorization for the next `OPEN`, and — while nothing is live — for a
-   * pre-open `ERROR`/`CLOSE`. Cleared when the ATTEMPT resolves (it opened, its
-   * own close was applied, the caller registered another attempt, or the caller
-   * shut the feed down), so an attempt authorizes exactly one connection.
-   * ANOTHER socket's close does not resolve it: when the live socket closes
-   * mid-handover the attempt is still in flight and stays authorized, and the
-   * feed becomes `CONNECTING` around it (round-4 review, R4-M1).
+   * pre-open `ERROR`/`CLOSE`. Cleared when the ATTEMPT resolves, so an attempt
+   * authorizes exactly one connection. It resolves when it opens, when its OWN
+   * close is observed (whether that close was applied, or refused because
+   * another socket was still live — either way the socket is gone: round-5
+   * review, R5-M1), when the caller registers another attempt, or when the
+   * caller shuts the feed down. ANOTHER socket's close does not resolve it: when
+   * the live socket closes mid-handover the attempt is still in flight and stays
+   * authorized, and the feed becomes `CONNECTING` around it (round-4 review,
+   * R4-M1).
+   *
+   * So `#pendingConnectionId !== undefined` means an UNRESOLVED attempt —
+   * something the driver may still be waiting on — and not merely one that was
+   * registered at some point. That is the property {@link onClose} relies on.
    */
   #pendingConnectionId: string | undefined;
   /** Identities that were live or pending and no longer are; bounded, FIFO. */
@@ -499,7 +515,9 @@ export class BinanceReferenceFeed {
    * That is what make-before-break means, and it holds for the whole interval —
    * through the replacement's own pre-open failure, which is refused as data
    * (R2-M1 assumption 3) and leaves the live connection untouched (round-3
-   * review, R3-M1).
+   * review, R3-M1). A refused pre-open CLOSE does end that attempt, though:
+   * the socket is gone, so the registration is retired and the caller must
+   * register a new identity to try again (round-5 review, R5-M1).
    *
    * THROWS, unlike the socket-event paths. Registering an attempt is a direct
    * caller action, not a transport callback, so a mistake here is a programming
@@ -681,6 +699,12 @@ export class BinanceReferenceFeed {
    * any other identity is refused: it is another socket's, or nobody's, and
    * counting it as this feed's would report a connection problem the feed's own
    * sockets never had (round-2 review, R2-M1, probes 1 and 3).
+   *
+   * AN ERROR NEVER RESOLVES THE ATTEMPT, applied or refused. A transport reports
+   * an error and then closes; only the `CLOSE` states that the socket is gone,
+   * and inferring death from an error would retire an attempt that may still
+   * open. So a fatal failure of a pending replacement resolves on the close that
+   * follows its error, on both the accepted and the refused path.
    */
   public onSocketError(
     connectionId: string,
@@ -720,17 +744,24 @@ export class BinanceReferenceFeed {
    * as an end of data unless the caller asked for one with {@link close}.
    *
    * A RECONNECT IS DIRECTED ONLY WHEN NO ATTEMPT IS ALREADY IN FLIGHT. If the
-   * live socket closes while the caller's registered replacement is still
-   * pending, that authorization survives the close: the feed becomes
-   * `CONNECTING` (nothing live, one attempt outstanding — exactly what the state
-   * means), keeps the pending identity, and returns `NONE`, because the caller
-   * has already opened that socket. Directing a `RECONNECT_AFTER` here made the
-   * driver register a third identity, which retires the replacement it had
-   * authorized and opens a redundant socket, while `state` reported `IDLE` for a
-   * feed that was connecting; it also charged the caller's `maxAttempts` budget
-   * for an attempt that had not failed (round-4 review, R4-M1). The
-   * `FeedDisconnected` for the socket that actually closed is emitted either
-   * way: the handover is a real interruption, whatever happens next.
+   * live socket closes while the caller's registered replacement is STILL
+   * UNRESOLVED — no `OPEN`, no `CLOSE` of its own has been observed — that
+   * authorization survives the close: the feed becomes `CONNECTING` (nothing
+   * live, one attempt outstanding — exactly what the state means), keeps the
+   * pending identity, and returns `NONE`, because the caller has already opened
+   * that socket. Directing a `RECONNECT_AFTER` here made the driver register a
+   * third identity, which retires the replacement it had authorized and opens a
+   * redundant socket, while `state` reported `IDLE` for a feed that was
+   * connecting; it also charged the caller's `maxAttempts` budget for an attempt
+   * that had not failed (round-4 review, R4-M1). If instead the replacement
+   * already reported its OWN close — refused at the time, because a socket was
+   * still live — then it is not in flight, it was retired by that refusal, and
+   * this close takes the ordinary path: `IDLE`, one charged attempt, one
+   * `RECONNECT_AFTER`. Reading a closed socket's stale registration as an
+   * attempt in flight parked the feed in `CONNECTING` with no directive and
+   * nothing left to arrive (round-5 review, R5-M1). The `FeedDisconnected` for
+   * the socket that actually closed is emitted either way: the handover is a
+   * real interruption, whatever happens next.
    *
    * A close is accepted from the live socket, or — when none is live — from the
    * REGISTERED pending attempt, so a connection attempt that failed before it
@@ -742,6 +773,11 @@ export class BinanceReferenceFeed {
    * string that arrives — on a fresh `IDLE` feed, or during a replacement's
    * connecting interval, that forged close used to emit `FeedDisconnected` and
    * spend a reconnect attempt (round-2 review, R2-M1, probes 1 and 2).
+   *
+   * A REFUSED CLOSE STILL RESOLVES THE ATTEMPT IT CAME FROM. Refusal governs
+   * what an event may CHANGE, not whether it happened: the pending attempt's own
+   * close emits nothing, disconnects nothing, and charges nothing, but it does
+   * retire that attempt, because the socket behind it is gone.
    */
   public onClose(
     connectionId: string,
@@ -765,13 +801,31 @@ export class BinanceReferenceFeed {
       });
     }
     if (!this.#acceptsLifecycleEvent(relation)) {
-      return this.#reject("CLOSE", connectionId, receipt, {
+      const refusal = this.#reject("CLOSE", connectionId, receipt, {
         relation,
         detail:
           relation === "PENDING"
-            ? "this registered attempt failed before it opened while another socket is still live; it disconnects nothing and directs no reconnect, and the live connection carries on"
+            ? "this registered attempt failed before it opened while another socket is still live; it disconnects nothing, directs no reconnect, and leaves the live connection carrying on — but the attempt is retired, because a socket that has closed will never open"
             : "a close from a socket this feed is neither listening to nor authorized disconnects nothing and directs no reconnect",
       });
+      // A SOCKET THAT HAS CLOSED IS NOT AN ATTEMPT IN FLIGHT. Refusing the
+      // event is about what it may CHANGE — it may not disconnect a feed that
+      // is not disconnected, and it may not spend a reconnect attempt — not
+      // about whether it happened. It happened: that socket is gone, and it can
+      // never deliver the `OPEN` this registration authorizes. Keeping the
+      // registration left a corpse in `#pendingConnectionId`, and the branch
+      // below reads that field as "an attempt is in flight": a later close of
+      // the live socket then parked the feed in `CONNECTING` and directed
+      // `NONE`, telling an obedient driver to wait for a socket that had
+      // already closed — an indefinite stall with no directive and no attempt
+      // charged (round-5 review, R5-M1). Retiring it here is the same
+      // resolution the accepted path performs, minus the effects the refusal
+      // withholds: the typed refusal above is unchanged, and a late `OPEN`
+      // under this identity is now an ordinary `RETIRED` refusal.
+      if (relation === "PENDING") {
+        this.#abandonPendingAttempt();
+      }
+      return refusal;
     }
     // The attempt resolved by failing; it authorizes nothing further.
     if (relation === "PENDING") {
@@ -811,6 +865,13 @@ export class BinanceReferenceFeed {
     // slots of the caller's `maxAttempts` budget (round-4 review, R4-M1). The
     // attempt is charged when the attempt itself fails — the branch below, on
     // the pending socket's own close.
+    //
+    // THE TEST IS "UNRESOLVED", NOT MERELY "REGISTERED". Every way an attempt
+    // can end now clears this field, including its own close arriving while
+    // another socket was still live (refused, and retired above). Otherwise a
+    // socket that had already closed still read as one to wait for, and this
+    // branch answered `NONE` to a driver with nothing left in flight (round-5
+    // review, R5-M1).
     if (this.#pendingConnectionId !== undefined) {
       this.#state = "CONNECTING";
       return { emissions, directive: NO_DIRECTIVE };
@@ -1285,7 +1346,9 @@ export class BinanceReferenceFeed {
    * replacement attempt failing must not emit `FeedDisconnected` for a feed that
    * is not disconnected, so its close is refused as data and the driver, which
    * holds the identity it registered, sees its own attempt fail in the returned
-   * {@link RejectedSocketEvent}.
+   * {@link RejectedSocketEvent}. Refusing the EFFECTS of that close is not
+   * disbelieving it: {@link onClose} retires the attempt anyway, because the
+   * socket it named is gone (round-5 review, R5-M1).
    *
    * Every other identity is refused unconditionally. Before the round-2 fix this
    * returned `true` for any `UNKNOWN` identity whenever nothing was live, which
@@ -1299,7 +1362,16 @@ export class BinanceReferenceFeed {
     return relation === "PENDING" && this.#liveConnectionId === undefined;
   }
 
-  /** Retires the registered attempt, if any, so it authorizes nothing further. */
+  /**
+   * Retires the registered attempt, if any, so it authorizes nothing further.
+   *
+   * Three callers, one meaning — "this attempt is over": the caller replaced it
+   * with another, the caller shut the feed down, or the socket behind it closed
+   * without ever opening (including when that close had to be refused because
+   * another socket was live — round-5 review, R5-M1). Afterwards the identity is
+   * `RETIRED`, so anything else arriving under it is refused as a retired
+   * socket's traffic rather than believed.
+   */
   #abandonPendingAttempt(): void {
     const pending = this.#pendingConnectionId;
     this.#pendingConnectionId = undefined;

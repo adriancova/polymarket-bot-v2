@@ -603,4 +603,110 @@ describe("make-before-break replacement", () => {
       expect(harness.feed.metrics(harness.clock.peek()).state).toBe("IDLE");
     });
   });
+
+  /**
+   * The replacement dies BEFORE the socket it was replacing (round-5, R5-M1).
+   *
+   * Both halves of the handover were settled — a refused replacement failure
+   * leaves the live socket alone, and a live close with an attempt in flight
+   * waits instead of racing a third socket — but composed in this order they
+   * produced a feed parked in `CONNECTING` around a socket that had already
+   * closed, returning `NONE` forever to a driver whose whole contract is to obey
+   * the directive. Nothing further could arrive: the `OPEN` that state waits for
+   * belongs to a socket the transport had already reported closed.
+   */
+  describe("the replacement closes before the live socket does", () => {
+    it("reconnects normally on the live close, charging exactly one attempt", () => {
+      const harness = createHarness({ stalenessThresholdMs: 10_000 });
+      open(harness, "conn-a");
+      harness.feed.connecting("conn-b");
+
+      // The replacement fails first. Refused, as R3-M1 requires…
+      const refused = harness.feed.onClose("conn-b", harness.clock.advance(1), { code: 1006 });
+      expect(refused.rejected?.relation).toBe("PENDING");
+      expect(refused.directive).toEqual({ kind: "NONE" });
+      expect(eventTypesOf(refused.emissions)).not.toContain("FeedDisconnected");
+      // …but the attempt it named is over, so nothing is in flight any more.
+      expect(harness.feed.metrics(harness.clock.peek()).pendingConnectionId).toBeUndefined();
+      expect(harness.feed.metrics(harness.clock.peek()).state).toBe("OPEN");
+
+      // The live socket keeps working in the meantime.
+      const during = harness.feed.onFrame("conn-a", TRADE(31), harness.clock.advance(1));
+      expect(during.classification).toBe("NORMALIZED");
+      harness.emissions.push(...during.emissions);
+
+      // Then it closes: an ordinary disconnect, with an ordinary directive.
+      const close = harness.feed.onClose("conn-a", harness.clock.advance(1), { code: 1006 });
+      harness.emissions.push(...close.emissions);
+      expect(eventTypesOf(close.emissions)).toEqual(["FeedDisconnected"]);
+      expect(close.emissions[0]?.connectionId).toBe("conn-a");
+      expect(close.directive).toEqual({ kind: "RECONNECT_AFTER", delayMs: 1_000, attempt: 1 });
+
+      const metrics = harness.feed.metrics(harness.clock.peek());
+      expect(metrics.state).toBe("IDLE");
+      expect(metrics.connectionId).toBeUndefined();
+      expect(metrics.pendingConnectionId).toBeUndefined();
+      expect(metrics.connections.disconnects).toBe(1);
+    });
+
+    it("lets the driver reconnect from there, resuming the ordinary backoff", () => {
+      const harness = createHarness({
+        reconnect: { initialDelayMs: 10, maxDelayMs: 40, multiplier: 2, maxAttempts: 2 },
+      });
+      open(harness, "conn-a");
+      harness.feed.connecting("conn-b");
+      harness.feed.onClose("conn-b", harness.clock.advance(1), { code: 1006 });
+      expect(harness.feed.onClose("conn-a", harness.clock.advance(1), { code: 1006 }).directive)
+        .toEqual({ kind: "RECONNECT_AFTER", delayMs: 10, attempt: 1 });
+
+      // A directed reconnect the driver can actually perform: a fresh identity
+      // opens, publishes, and the outage is over.
+      harness.feed.connecting("conn-c");
+      const opened = harness.feed.onOpen("conn-c", harness.clock.advance(10));
+      harness.emissions.push(...opened.emissions);
+      expect(eventTypesOf(opened.emissions)).toEqual([
+        "FeedConnected",
+        "FeedGapDetected",
+        "DataQualityIncidentOpened",
+      ]);
+      const frame = harness.feed.onFrame("conn-c", TRADE(32), harness.clock.advance(1));
+      expect(frame.classification).toBe("NORMALIZED");
+      expect(frame.emissions[0]?.connectionId).toBe("conn-c");
+      expect(harness.feed.metrics(harness.clock.peek()).state).toBe("OPEN");
+
+      // The budget was really charged and is really spendable: a successful open
+      // re-arms it (`#reconnectAttempt` resets), and the two failures the caller
+      // allowed then exhaust it. Before the fix the live close returned `NONE`,
+      // so this outage charged nothing and directed nothing at all.
+      expect(harness.feed.onClose("conn-c", harness.clock.advance(1), { code: 1006 }).directive)
+        .toEqual({ kind: "RECONNECT_AFTER", delayMs: 10, attempt: 1 });
+      harness.feed.connecting("conn-d");
+      expect(harness.feed.onClose("conn-d", harness.clock.advance(1), { code: 1006 }).directive)
+        .toEqual({ kind: "RECONNECT_AFTER", delayMs: 20, attempt: 2 });
+      harness.feed.connecting("conn-e");
+      expect(harness.feed.onClose("conn-e", harness.clock.advance(1), { code: 1006 }).directive)
+        .toEqual({ kind: "STOP", reason: "RECONNECT_ATTEMPTS_EXHAUSTED" });
+    });
+
+    it("refuses the dead replacement's late OPEN as a retired socket", () => {
+      const harness = createHarness();
+      open(harness, "conn-a");
+      harness.feed.connecting("conn-b");
+      harness.feed.onClose("conn-b", harness.clock.advance(1), { code: 1006 });
+
+      // The registration is gone, so a late OPEN under that identity is refused
+      // with the retired-socket code — visible telemetry, not a silent no-op —
+      // and it neither supersedes the live socket nor opens a generation.
+      const late = harness.feed.onOpen("conn-b", harness.clock.advance(1));
+      expect(late.rejected?.relation).toBe("RETIRED");
+      expect((late.emissions[0]?.payload as { reasonCode: string }).reasonCode).toBe(
+        "BINANCE_RETIRED_CONNECTION_EVENT",
+      );
+      const metrics = harness.feed.metrics(harness.clock.peek());
+      expect(metrics.connectionId).toBe("conn-a");
+      expect(metrics.subscriptionGeneration).toBe(0);
+      expect(metrics.connections.connectionsOpened).toBe(1);
+      expect(metrics.connections.lifecycleEventsNotFromLiveConnection).toBe(2);
+    });
+  });
 });
