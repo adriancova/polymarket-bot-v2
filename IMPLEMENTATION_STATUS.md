@@ -29,8 +29,11 @@ Maximum permitted run mode: `PAPER`
 | `WP-060`               | Complete | All ✓ | Merged `af29b08` (impl chain `d7bbb0f`→…→`954e764`, 3 review rounds) |
 | `WP-090`               | Complete | All ✓ | Merged `335b1b0` (impl chain `aa74419`→…→`fa518e7`, 3 review rounds) |
 | `WP-070`               | Complete | All ✓ | Merged `f2f0258` (impl chain `f4d374d`→…→`97ddcf1`, 4 review rounds) |
-| `WP-080`               | IN_PROGRESS (Wave 1 batch 1B) | All ✓ | In remediation round 5 (single narrowing finding per round since r2); implementer session resumed after a second API session limit |
-| `WP-100`               | Ready (authorized — unblocked by the WP-070 merge; path subset now exclusive) | All ✓ | Unassigned — packet not yet written; needs workplan lockfile/handoff ratification comments first (WP-100 may also add RTDS dependency declarations to packages/polymarket-public/package.json per the 2026-08-26 ordering note) |
+| `WP-080`               | Complete | All ✓ | Merged `d0d66bf` (impl chain `cff20ba`→…→`a77c8f0`, 6 review rounds) |
+| `WP-100`               | IN_PROGRESS (authorized; ratifications added 2026-08-28) | All ✓ | Packet dispatched 2026-08-28 to `wp-implementer` (Opus), base `75c6521`; session resumed once after a server error |
+| `WP-110`               | IN_PROGRESS (authorized per runbook 1C — WP-000 ✓, WP-040 ✓) | All ✓ | Packet dispatched 2026-08-28 |
+| `GOV-1B` (contract-owner governance round) | IN_PROGRESS (orchestrator-authorized bounded package) | Batch 1B ✓ | Ratify C-1/U-1; rule `takerSide` vocabulary; reconcile `ConditionIdSchema` cap vs §9 — dispatched 2026-08-28, independent review required before merge |
+| `WP-130`               | Ready (authorized per runbook 1D — WP-040 ✓, WP-050 ✓; queued for a free agent slot) | All ✓ | Unassigned — dispatch after an active loop closes |
 | `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
@@ -351,6 +354,29 @@ table says otherwise.
   Orchestrator fast-forwarded the canonical branch to `a77c8f0` and
   reproduced gates: root 1974/1974, contract 131/131, paths clean, lockfile
   untouched. Review round 6 dispatched.
+- Review round 6 (fresh Codex `01a0496d-8f4a-7e71-b053-52f437b35cd5`,
+  candidate `a77c8f0` vs base `145fc32`): **ACCEPT** — 0 findings above NOTE
+  (sole NOTE: the sandbox-blocked root-suite subprocess tests, covered by
+  the orchestrator's exact-commit reproduction). R5-M1/R5-L1 verified FIXED
+  with direct probes (refusal-before-retirement telemetry identical;
+  ERROR-retains/CLOSE-retires spelling; forged-close immunity; P5
+  preserved; late OPEN observably RETIRED; four-ending-events list matches
+  code exactly); the WP-120 failed-attempt accounting note judged correct
+  division of labor; full regression sweep clean (unit 247/247, contract
+  131/131).
+- Merged to `main` as `d0d66bf` under the release manager's standing
+  delegation (2026-08-28). Third lockfile union auto-merged and
+  frozen-install verified. Post-merge on `main`: root 2250/2250 (72 files),
+  fault 89/89, integration 208/208 + 81/81, contract 583/583 + 131/131 +
+  94/94 via the root `test:contract` script extended to all three adapters,
+  audit clean. **Wave 1 batch 1B (WP-070/WP-080/WP-090) is COMPLETE** —
+  three adapters, thirteen independent review rounds total, every round's
+  findings strictly narrower. Binding WP-120 obligations accumulated across
+  the three handoffs (identity registration contract; NONE-after-
+  FeedDisconnected semantics; rejected-PENDING-CLOSE failed-attempt
+  accounting; dedup identities; resync/gap routing; consumer-id stability)
+  are recorded in the respective completion/in-flight records and the
+  handoff files.
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
