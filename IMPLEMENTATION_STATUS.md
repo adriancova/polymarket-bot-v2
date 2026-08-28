@@ -245,6 +245,23 @@ table says otherwise.
   Orchestrator fast-forwarded the canonical branch to `352380f` and
   reproduced gates: root 1953/1953, contract 119/119, paths clean,
   lockfile untouched. Review round 3 dispatched.
+- Review round 3 (fresh Codex `01a04671-5d7a-7132-bb76-c224a465747f`): **CHANGES
+  REQUIRED** — R2-M1 FIXED (all four authorization attacks refused without
+  mutation; legitimate failed-connect path preserved; 44/45 reconciliation
+  verified accurate), but the mandated make-before-break probes exposed
+  1 medium (R3-M1, pre-existing at `73b70bc`: `connecting()` unconditionally
+  flips the feed to CONNECTING even while `#liveConnectionId` is populated,
+  so the still-live socket's frames are refused as STALE_CONNECTION —
+  mislabeled "frame without connection" — and staleness checks stop
+  emitting; during a slow/failed replacement valid market data is discarded
+  indefinitely) and 1 low (R3-L1: a PENDING-identity refusal maps to
+  `BINANCE_UNAUTHORIZED_CONNECTION_EVENT`, whose documentation means an
+  identity the feed never authorized — conflates an authorized-but-
+  inadmissible event with a forged identity). P6 shutdown semantics
+  ACCEPTED; risks 2/3/4 ACCEPTED; risk 1's characterization incomplete
+  until R3-M1 is fixed (afterwards a NOTE-level residual); WP-120
+  four-part identity contract judged sound and clearly documented.
+  Remediation round 3 dispatched.
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
