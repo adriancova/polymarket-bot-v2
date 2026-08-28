@@ -262,6 +262,27 @@ table says otherwise.
   until R3-M1 is fixed (afterwards a NOTE-level residual); WP-120
   four-part identity contract judged sound and clearly documented.
   Remediation round 3 dispatched.
+- Remediation round 3 completed 2026-08-27 in `38a6bb2`, probes reproduced
+  first: R3-M1 → `connecting()` sets CONNECTING only when nothing is live
+  (pending-attempt state orthogonal to the active socket); the live
+  socket's frames stay NORMALIZED and staleness keeps emitting throughout
+  replacement registration and after a refused pending failure;
+  `FeedConnectionState` redocumented as a statement about the socket;
+  `metrics()` gains `pendingConnectionId` so the in-flight attempt stays
+  observable; R3-L1 → new `BINANCE_PENDING_ATTEMPT_EVENT_INADMISSIBLE`
+  reason code (three-way refusal vocabulary: retired / pending-inadmissible
+  / unauthorized), inherited by the frame path; risk-1 text rewritten as
+  the NOTE-level residual (late OPEN under the caller-authorized identity
+  is adopted as the make-before-break replacement it always was).
+  Mutation checks: unconditional-state restore → 6 unit + 3 contract
+  failures. New disclosed risks: the handover interval genuinely runs two
+  transport sockets with one live in the books (shared sequence tracker
+  keeps replayed ids duplicates); `state` alone no longer signals an
+  in-flight reconnect (dashboards read `pendingConnectionId`). New WP-120
+  item: decide how long a registered attempt may stay unresolved (adapter
+  owns no timer). Orchestrator fast-forwarded the canonical branch to
+  `38a6bb2` and reproduced gates: root 1961/1961, contract 123/123, paths
+  clean, lockfile untouched. Review round 4 dispatched.
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
