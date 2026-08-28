@@ -96,6 +96,23 @@ table says otherwise.
   answered (JSON endpoints carry JSON; the binary SBE path is a different,
   key-required host, refused by construction); UNVERIFIED register BNC-U1..U6.
   Review round 1 dispatched.
+- Review round 1 (fresh Codex `01a0461f-aa31-7a93-98dd-1cd768972403`): **CHANGES
+  REQUIRED** — 0 blocker, 1 high (H1 retired-socket callbacks carry no immutable
+  connection identity on MESSAGE/ERROR/CLOSE, so a stale socket's trade is
+  relabeled as the current connection/generation and a stale close tears down
+  the active feed — same defect class as WP-090's H2), 2 medium (M1 the
+  combined-wrapper `stream` label is trusted unvalidated: a wrapper/payload
+  symbol-or-kind mismatch is normalized instead of classified; M2 only the
+  latest trade id is remembered, so a delayed non-adjacent duplicate is
+  published twice as a "late observation"), 2 low (L1 BNC-U4 register text
+  contradicts actual partial-book behavior; L2 MAX_FRAME_BYTES enforced as
+  UTF-16 chars, not bytes). Venue judgments: V1 PASS (reviewer re-fetched all
+  official sources), V2 ACCEPT (ADR-004 settlement complete), V4 **ACCEPT
+  omission of `takerSide`** (frozen artifacts do not resolve the vocabulary;
+  domain owner must rule; do NOT add a mapping from the current sample),
+  V3/V5 FAIL only via H1/M1/M2/L1. All five deviations and all assumptions
+  ACCEPTED (incident-per-generation contingent on H1). Remediation round 1
+  dispatched.
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
