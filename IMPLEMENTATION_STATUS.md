@@ -332,6 +332,25 @@ table says otherwise.
   dispatched: an already-closed pending socket must not count as in
   flight — the P6 live close must reconnect normally (IDLE, pending
   cleared/retired, exactly one RECONNECT_AFTER at attempt 1).
+- Remediation round 5 completed 2026-08-28 in `a77c8f0` (implementer session
+  interrupted once by an API session limit and resumed; probes reproduced
+  first): design shape (a) — a refused PENDING `CLOSE` retires that attempt
+  at refusal time, so `#pendingConnectionId` means UNRESOLVED ATTEMPT, not
+  registered identity. Deliberate edges: the refusal is built first
+  (telemetry unchanged); only CLOSE retires, never ERROR (error-then-close
+  transports keep their adoption); only relation PENDING retires (round-2
+  forged-close immunity preserved). The P6 ordering now reconnects normally
+  (IDLE, pending cleared, one RECONNECT_AFTER at attempt 1). Disclosed
+  design consequence: the rounds-2/3 "late OPEN adopted" residual is GONE —
+  now an observable RETIRED refusal (packet-authorized). Risk text rewritten
+  at all three locations (three orderings; four ending events; no-timer
+  disclosure narrowed to genuinely unresolved attempts). New WP-120 note:
+  count a rejected PENDING CLOSE as a failed attempt (the feed emits no
+  FeedDisconnected for it). 9 new tests + 1 strengthened; three mutations
+  pinned incl. the ERROR-retirement and PENDING-guard inversions.
+  Orchestrator fast-forwarded the canonical branch to `a77c8f0` and
+  reproduced gates: root 1974/1974, contract 131/131, paths clean, lockfile
+  untouched. Review round 6 dispatched.
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
