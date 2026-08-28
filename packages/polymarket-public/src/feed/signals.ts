@@ -61,6 +61,18 @@ export const FEED_DISCONNECT_REASONS = {
   clientStopped: "CLIENT_STOPPED",
   /** The staleness watchdog closed a connection that stopped answering. */
   staleConnection: "STALE_CONNECTION",
+  /**
+   * A new connection attempt began while this session was still live.
+   *
+   * A guard, not a transition the public API can reach today: `start()`
+   * connects only from `idle`, and the reconnect timer stands down unless the
+   * feed is still `idle` with no session, so nothing displaces a live one. It
+   * exists because the alternative — overwriting `#session` — left the replaced
+   * connection open, subscribed, and never named by a `FeedDisconnected` again
+   * (round-3 finding H1). If either guard is ever weakened, the consumer is
+   * told the connection ended instead of the provenance chain simply stopping.
+   */
+  connectionSuperseded: "CONNECTION_SUPERSEDED",
 } as const;
 
 /** Why a gap was declared. */

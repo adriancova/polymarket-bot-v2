@@ -683,6 +683,14 @@ describe("a transport that is already connected when the factory returns (round-
   it("closes the socket when stop() runs inside a synchronous callback", () => {
     // The callback fires before the factory returns, so `stop()` has no handle
     // to close. A socket nobody closes outlives the feed that opened it.
+    //
+    // The problem this stops on is `PRE_SUBSCRIPTION_FRAME` rather than
+    // `UNRECOGNIZED_FRAME` since round-3 M1: a frame delivered inside the
+    // factory call arrives before any subscription was written, so it is
+    // refused at the gate and never reaches the parser. The property under
+    // test — a `stop()` issued from inside a synchronous transport callback
+    // still closes the socket it cannot yet see — is unchanged, and so is the
+    // fact that a problem is reported for the frame at all.
     const held: { feed?: PublicMarketFeed } = {};
     const subject = harness(
       {},
@@ -701,7 +709,8 @@ describe("a transport that is already connected when the factory returns (round-
     subject.feed.subscribe([MARKET.yesTokenId]);
     subject.feed.start();
 
-    expect(subject.problems.map((problem) => problem.code)).toEqual(["UNRECOGNIZED_FRAME"]);
+    expect(subject.problems.map((problem) => problem.code)).toEqual(["PRE_SUBSCRIPTION_FRAME"]);
+    expect(subject.problems[0]?.raw).toBe("{not json");
     expect(subject.sockets.latest().closedByClient).toBe(true);
     expect(subject.eventTypes()).toEqual(["FeedDisconnected"]);
     expect(subject.sockets.latest().sent).toEqual([]);
@@ -831,6 +840,256 @@ describe("a reconnect with nothing subscribed (round-2 H2)", () => {
       subscriptionGeneration: 3,
     });
     expect(subject.feed.subscriptionGeneration).toBe(3);
+  });
+});
+
+describe("a manual start() during the reconnect backoff (round-3 H1)", () => {
+  /**
+   * Drop a live connection, then reconnect MANUALLY while the backoff timer
+   * for that drop is still armed.
+   *
+   * The probe: the timer survived `start()`, fired at its original deadline,
+   * and called `#connect()` unconditionally — overwriting `#session` with a
+   * third socket while conn-2 stayed physically open and subscribed, its
+   * callbacks silently demoted to stale, and no `FeedDisconnected` ever naming
+   * it.
+   */
+  function reconnectedManuallyDuringBackoff(): Harness {
+    const subject = harness();
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+    // conn-1 drops: the feed returns to `idle` and arms a 250 ms backoff.
+    subject.sockets.latest().emitClose({ code: 1006, reason: "abnormal" });
+    // ...and the caller reconnects itself, inside that window.
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+    return subject;
+  }
+
+  it("opens no third socket when the armed timer's deadline passes", () => {
+    const subject = reconnectedManuallyDuringBackoff();
+    const conn2 = subject.sockets.latest();
+    const eventsBefore = subject.eventTypes().length;
+
+    // Past the 250 ms backoff deadline, and short of conn-2's own 5 s
+    // staleness check, so the ONLY thing that could fire is the stale timer.
+    subject.scheduler.advance(1_000);
+
+    expect(subject.sockets.sockets).toHaveLength(2);
+    expect(subject.feed.connectionId).toBe("conn-2");
+    expect(subject.eventTypes()).toHaveLength(eventsBefore);
+    // conn-2 is neither closed nor replaced: it is still THE connection.
+    expect(conn2.closedByClient).toBe(false);
+    expect(conn2.isOpen).toBe(true);
+    expect(subject.sockets.latest()).toBe(conn2);
+  });
+
+  it("leaves no connection live but unnamed, and no gap naming a replaced one", () => {
+    const subject = reconnectedManuallyDuringBackoff();
+    subject.scheduler.advance(1_000);
+
+    // Every FeedConnected is either still current or has a FeedDisconnected.
+    const connected = subject.events
+      .filter((event) => event.eventType === "FeedConnected")
+      .map((event) => (event.payload as { connectionId: string }).connectionId);
+    const disconnected = subject.events
+      .filter((event) => event.eventType === "FeedDisconnected")
+      .map((event) => (event.payload as { connectionId: string }).connectionId);
+    expect(connected).toEqual(["conn-1", "conn-2"]);
+    expect(disconnected).toEqual(["conn-1"]);
+    expect(connected.filter((id) => !disconnected.includes(id))).toEqual([
+      subject.feed.connectionId,
+    ]);
+    // The open gap names the connection that is actually current, which is the
+    // other half of the same defect: the gap said conn-2 while the feed said
+    // conn-3.
+    expect(subject.feed.openGap?.connectionId).toBe(subject.feed.connectionId);
+    expect(subject.feed.openGap?.subscriptionGeneration).toBe(
+      subject.feed.subscriptionGeneration,
+    );
+  });
+
+  it("keeps the manually started connection authoritative past the deadline", () => {
+    const subject = reconnectedManuallyDuringBackoff();
+    subject.scheduler.advance(1_000);
+    const conn2 = subject.sockets.latest();
+
+    conn2.emitJson({
+      event_type: "book",
+      market: MARKET.conditionId,
+      asset_id: MARKET.yesTokenId,
+      timestamp: "1782753357257",
+      bids: [{ price: "0.08", size: "1" }],
+      asks: [{ price: "0.09", size: "2" }],
+    });
+
+    // Published as current data on conn-2 — not refused as stale, which is what
+    // an overwritten identity would have made it.
+    const snapshot = subject.events.find((event) => event.eventType === "BookSnapshot");
+    expect(snapshot?.provenance).toMatchObject({
+      connectionId: "conn-2",
+      subscriptionGeneration: 3,
+    });
+    expect(subject.problems).toEqual([]);
+    // And its heartbeat still runs on the socket the feed is holding.
+    subject.scheduler.advance(10_000);
+    expect(conn2.sent.filter((frame) => frame === "PING")).toHaveLength(1);
+  });
+
+  it("still reconnects after the NEXT drop: standing a timer down is not disarming", () => {
+    const subject = reconnectedManuallyDuringBackoff();
+    subject.sockets.latest().emitClose({ code: 1006, reason: "again" });
+    subject.scheduler.advance(1_000);
+
+    expect(subject.sockets.sockets).toHaveLength(3);
+    subject.sockets.latest().emitOpen();
+    expect(subject.feed.connectionId).toBe("conn-3");
+    expect(subject.eventTypes()).toEqual([
+      "FeedConnected",
+      "FeedDisconnected",
+      "FeedConnected",
+      "FeedGapDetected",
+      "FeedDisconnected",
+      "FeedConnected",
+      "FeedGapDetected",
+    ]);
+  });
+});
+
+describe("a frame delivered before the subscription was written (round-3 M1)", () => {
+  const BOOK = {
+    event_type: "book",
+    market: MARKET.conditionId,
+    asset_id: MARKET.yesTokenId,
+    timestamp: "1782753357257",
+    bids: [{ price: "0.08", size: "1" }],
+    asks: [{ price: "0.09", size: "2" }],
+  };
+  const BOOK_FRAME = JSON.stringify(BOOK);
+
+  /** A transport that opens AND delivers a frame inside the factory call. */
+  function preReturnFrame(socket: FakeWebSocket): void {
+    socket.emitOpen();
+    socket.emitJson(BOOK);
+  }
+
+  it("is refused as pre-subscription data on the FIRST connection", () => {
+    // The probe: this became a BookSnapshot stamped `conn-1` generation 1 —
+    // the session's PRE-full-subscription generation, under which no
+    // subscription was ever written — and it reached the caller BEFORE
+    // FeedConnected, with no problem and no gap saying so.
+    const subject = harness({}, { onCreate: preReturnFrame });
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+
+    expect(subject.eventTypes()).toEqual(["FeedConnected"]);
+    expect(subject.problems).toHaveLength(1);
+    expect(subject.problems[0]).toMatchObject({
+      code: "PRE_SUBSCRIPTION_FRAME",
+      raw: BOOK_FRAME,
+      sourceChannel: "polymarket:market-ws",
+    });
+    expect(subject.problems[0]?.detail).toContain("conn-1");
+    expect(subject.problems[0]?.detail).toContain("generation 1");
+    // The open still completed normally: the subscription was written and the
+    // connection announced under the generation it was written at.
+    expect(subject.sockets.latest().sentFrames).toEqual([
+      {
+        assets_ids: [MARKET.yesTokenId],
+        type: "market",
+        custom_feature_enabled: false,
+        initial_dump: true,
+      },
+    ]);
+    expect(subject.events[0]?.payload).toMatchObject({ subscriptionGeneration: 2 });
+  });
+
+  it("preserves the raw frame, labelled with the generation it truly arrived under", () => {
+    // §9.1: refusing it is not dropping it. The raw record keeps the session's
+    // own pre-subscription generation rather than borrowing the one the open
+    // went on to establish.
+    const subject = harness({}, { onCreate: preReturnFrame });
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+
+    expect(subject.frames).toHaveLength(1);
+    expect(subject.frames[0]).toMatchObject({
+      connectionId: "conn-1",
+      subscriptionGeneration: 1,
+      payload: BOOK_FRAME,
+    });
+    expect(subject.feed.subscriptionGeneration).toBe(2);
+  });
+
+  it("is refused on a RECONNECT's pre-opened transport too", () => {
+    let created = 0;
+    const subject = harness(
+      {},
+      {
+        onCreate: (socket) => {
+          created += 1;
+          // Only the reconnect's transport is pre-opened and pre-delivering.
+          if (created === 2) preReturnFrame(socket);
+        },
+      },
+    );
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+    subject.sockets.latest().emitClose({ code: 1006 });
+    subject.scheduler.advance(1_000);
+
+    expect(subject.eventTypes()).toEqual([
+      "FeedConnected",
+      "FeedDisconnected",
+      "FeedConnected",
+      "FeedGapDetected",
+    ]);
+    expect(subject.problems.map((problem) => problem.code)).toEqual(["PRE_SUBSCRIPTION_FRAME"]);
+    // Generation 2 is what conn-2 held before it resubscribed; the gap it then
+    // opened, and everything published on it, is generation 3.
+    expect(subject.problems[0]?.detail).toContain("conn-2");
+    expect(subject.problems[0]?.detail).toContain("generation 2");
+    expect(subject.frames.at(-1)).toMatchObject({
+      connectionId: "conn-2",
+      subscriptionGeneration: 2,
+    });
+    expect(subject.feed.openGap?.subscriptionGeneration).toBe(3);
+  });
+
+  it("refuses a WINDOW, not the connection: the next frame is data as usual", () => {
+    const subject = harness({}, { onCreate: preReturnFrame });
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+
+    // The same socket, now that the open has been processed.
+    subject.sockets.latest().emitJson(BOOK);
+
+    expect(subject.problems).toHaveLength(1);
+    const snapshot = subject.events.find((event) => event.eventType === "BookSnapshot");
+    expect(snapshot?.provenance).toMatchObject({
+      connectionId: "conn-1",
+      subscriptionGeneration: 2,
+    });
+  });
+
+  it("refuses it before it can be parsed, so a stale socket still reports STALE", () => {
+    // The two refusals are siblings at the two ends of a connection's life, and
+    // the stale one wins where both apply: the frame arrived on a connection
+    // the feed no longer holds at all.
+    const subject = harness({}, { onCreate: preReturnFrame });
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    const socket = subject.sockets.latest();
+    subject.feed.stop();
+
+    socket.handlers.onMessage(BOOK_FRAME);
+
+    expect(subject.problems.map((problem) => problem.code)).toEqual([
+      "PRE_SUBSCRIPTION_FRAME",
+      "STALE_CONNECTION_FRAME",
+    ]);
   });
 });
 

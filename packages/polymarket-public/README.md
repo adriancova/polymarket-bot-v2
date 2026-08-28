@@ -242,11 +242,11 @@ the SDK do. Only `timestamp` and `last_trade_price` tolerate absence, because
 the SDK declares those two `.nullish()`, and both divergences from the OpenAPI
 are recorded with that evidence.
 
-## 6. The feed's four safety invariants
+## 6. The feed's six safety invariants
 
-All four were added by review findings — H1 and H2 in each of rounds 1 and 2 —
-and all four are about the same thing: an event must say what actually happened,
-on the connection it actually happened on.
+All six were added by review findings — H1 and H2 in each of rounds 1 and 2, H1
+and M1 in round 3 — and all six are about the same thing: an event must say what
+actually happened, on the connection it actually happened on.
 
 **1. Every socket callback is bound to the session that installed it.** A
 transport may deliver a frame, an open, an error or a close for a socket the
@@ -302,6 +302,33 @@ it used to open a gap at the unchanged generation, which the previous gap's
 acknowledgement then closed). The converse is not claimed: the generation also
 advances where nothing was missed and no gap is owed — the first connection, and
 any change made while disconnected.
+
+**5. At most one session is ever live, and starting a connection stands the
+pending reconnect down.** A disconnect arms a backoff timer and returns the feed
+to `idle`. If the caller calls `start()` during that window, the timer used to
+survive and fire at its original deadline, connecting a THIRD socket over the
+manually started second one — which stayed physically open and subscribed, had
+every frame on it refused as stale purely because its identity had been
+overwritten, and was never named by a `FeedDisconnected` again (round-3 finding
+H1). Three things hold the invariant now, outermost first: a connect attempt
+cancels any armed reconnect; the timer stands down unless the feed is still
+`idle` with no session; and a connect attempt that somehow finds a live session
+retires it, closes it and publishes `FeedDisconnected` with
+`CONNECTION_SUPERSEDED` rather than overwriting it. The first two make the third
+unreachable, which is the point of having it.
+
+**6. A frame is subscription data only once that session's subscription has been
+written.** The other end of the window invariant 3 opened: a transport that
+opens *and delivers a frame* from inside the factory call does so before the
+deferred open has planned the subscription, sent it, or advanced the session's
+generation. Such a frame used to be normalized and published as current data,
+stamped with the session's **pre-subscription** generation — under which no
+subscription was ever written — and it reached the consumer before
+`FeedConnected` announced the connection (round-3 finding M1). It is now refused
+at the gate as a `PRE_SUBSCRIPTION_FRAME` problem carrying the payload, the same
+refusal shape a stale frame gets, and it is still preserved raw (§9.1). The
+refusal is a window and not a verdict on the connection: the frame after the
+open is ordinary data.
 
 ## 7. Ports
 

@@ -29,7 +29,7 @@
  * adapter never emits `FeedResynchronized` on its own — reopening a socket is
  * not a recovery, and only the caller knows whether it applied a snapshot.
  *
- * ## Four invariants the reviews added, and what they mean here
+ * ## Six invariants the reviews added, and what they mean here
  *
  * 1. **Every callback is bound to the socket session that installed it.** A
  *    transport can deliver a frame, an open, an error or a close for a socket
@@ -70,6 +70,30 @@
  *    The converse is deliberately not claimed: the generation may advance with
  *    no gap — on the first connection, and on a change made while disconnected
  *    — because in those cases nothing was missed.
+ * 5. **At most one session is ever live, and a connection attempt stands the
+ *    pending reconnect down.** A disconnect arms a backoff timer and returns the
+ *    feed to `idle`. If the caller then calls `start()` during that window, the
+ *    timer used to survive and fire anyway: it called `#connect()`
+ *    unconditionally, which overwrote `#session` with a THIRD connection while
+ *    the manually started second one stayed physically open and subscribed —
+ *    non-authoritative purely because its identity had been overwritten, never
+ *    closed, and never reported as disconnected (round-3 finding H1). Three
+ *    things now hold the invariant, outermost first: `#connect()` cancels any
+ *    armed reconnect, the timer stands down unless the feed is still `idle` with
+ *    no session, and `#connect()` retires, closes and reports any session that
+ *    is somehow still live rather than overwriting it.
+ * 6. **A frame is subscription data only once that session's subscription has
+ *    been written.** A transport may deliver a frame from inside the factory
+ *    call — after a synchronous `onOpen`, before the handle is returned — which
+ *    is before the deferred `#handleOpen` has planned the subscription, sent it,
+ *    or advanced the session's generation. Such a frame used to be normalized
+ *    and published as current data, stamped with the session's
+ *    PRE-subscription generation and reaching the consumer BEFORE
+ *    `FeedConnected` (round-3 finding M1). No subscription was ever written
+ *    under that generation, so it is not subscription provenance. The frame is
+ *    still recorded raw (§9.1) and still reported — as a typed
+ *    `PRE_SUBSCRIPTION_FRAME` problem carrying the payload, the same refusal
+ *    shape a stale frame gets — but it cannot become a domain event.
  *
  * ## Credentials
  *
@@ -220,8 +244,31 @@ interface FeedSocketSession {
    * Updated only while the session is live, and frozen at its last value the
    * moment the session is retired, so a late callback reports the generation it
    * actually arrived under rather than the one that replaced it.
+   *
+   * Before the open is processed this is the generation the feed held when the
+   * attempt began, and NO subscription was written under it. That makes it
+   * honest as a raw record's label and useless as event provenance, which is
+   * why {@link FeedSocketSession.subscribed} — not this field — decides whether
+   * a frame may be published (round-3 finding M1).
    */
   generation: number;
+  /**
+   * Whether `#handleOpen` has written this session's subscription.
+   *
+   * False for the whole window between the socket existing and the open being
+   * processed — a window a synchronous transport can deliver a frame in, since
+   * the open is deferred until the factory returns the handle. Nothing that
+   * arrives while this is false is subscription data: no subscription had been
+   * sent, and the session's generation is still the pre-subscription one
+   * (round-3 finding M1). It is set once, immediately after the subscription
+   * frames are written and the session's generation is advanced to the one they
+   * were written under, and only for a session that was still live at that
+   * point. An EMPTY desired set writes no frame and advances no generation, but
+   * the handshake still completed and the session is still the one the feed
+   * announced, so it counts as written: what the session holds is a
+   * subscription to nothing.
+   */
+  subscribed: boolean;
   /** Set when the feed stops treating this session as the live one. */
   retired: boolean;
 }
@@ -495,7 +542,20 @@ export class PublicMarketFeed {
   // ---- connection lifecycle ------------------------------------------------
 
   #connect(): void {
+    // An armed reconnect belongs to the disconnect that armed it, and this
+    // attempt supersedes it. A timer left running fires during or after this
+    // connection and calls `#connect()` again, which is how a manually started
+    // connection got overwritten by a third socket while staying open and
+    // subscribed (round-3 finding H1).
+    this.#cancelReconnect?.();
+    this.#cancelReconnect = undefined;
+    // Set before anything below can call back into the caller, so a `start()`
+    // re-entered from a handler sees an attempt already in flight.
     this.#status = "connecting";
+    this.#displaceLiveSession();
+    // Displacing publishes a `FeedDisconnected`, which is caller code: if that
+    // caller stopped the feed in response, this attempt is off.
+    if (this.#status !== "connecting") return;
     const connectionId = this.#deps.connectionId();
     if (typeof connectionId !== "string" || connectionId === "") {
       // `FeedConnected.connectionId` is required and non-empty, and it is the
@@ -517,6 +577,7 @@ export class PublicMarketFeed {
       socket: undefined,
       deferred: [],
       generation: this.#subscriptions.generation,
+      subscribed: false,
       retired: false,
     };
     this.#session = session;
@@ -586,6 +647,38 @@ export class PublicMarketFeed {
   }
 
   /**
+   * Refuses to let a new attempt overwrite a session that is still live.
+   *
+   * Assigning `#session` over a live one made that connection
+   * non-authoritative purely because its identity had been replaced: the socket
+   * stayed open and subscribed, its callbacks were then ignored as stale, and
+   * no `FeedDisconnected` ever named it — a connection the consumer was told
+   * about and never told about again (round-3 finding H1). A displaced session
+   * is therefore retired, closed, and reported, in that order.
+   *
+   * The two guards above this one — `#connect()` cancelling the armed
+   * reconnect, and the reconnect timer standing down unless the feed is still
+   * `idle` with no session — mean nothing reaches here today: every caller of
+   * `#connect()` runs from a state with no live session. That is the point. It
+   * is the assertion that keeps the leak impossible rather than merely absent,
+   * and if either guard is ever weakened the connection is closed and published
+   * instead of leaking.
+   */
+  #displaceLiveSession(): void {
+    const displaced = this.#retireSession();
+    if (displaced === undefined) return;
+    this.#stopTimers();
+    this.#withSocket(displaced, (socket) => {
+      socket.close();
+    });
+    this.#emitDisconnected(
+      displaced,
+      FEED_DISCONNECT_REASONS.connectionSuperseded,
+      `connection ${displaced.connectionId} was still live when a new connection attempt began`,
+    );
+  }
+
+  /**
    * The socket opened — possibly before `#connect()` holds the handle.
    *
    * The whole open is deferred as one unit rather than only the send, so the
@@ -619,6 +712,10 @@ export class PublicMarketFeed {
     const subscription = this.#subscriptions.planFullSubscription();
     session.generation = subscription.generation;
     this.#sendFrames(session, subscription.frames);
+    // From here the session holds a subscription, so a frame arriving on it is
+    // subscription data. Before here it was not, whatever the transport chose
+    // to deliver (round-3 finding M1).
+    session.subscribed = true;
 
     this.#handlers.onEvent(
       feedConnected({
@@ -677,6 +774,26 @@ export class PublicMarketFeed {
               ? "disconnected"
               : `on connection ${this.#session.connectionId} (generation ${String(this.#subscriptions.generation)})`
           }`,
+        ),
+        sourceChannel: MARKET_WEBSOCKET_CHANNEL,
+        observedIndex: 0,
+        raw: data,
+      });
+      return;
+    }
+    if (!session.subscribed) {
+      // The socket is this feed's, and it is live — but its subscription has
+      // not been written yet, so nothing has been asked for and the session's
+      // generation is the one it held BEFORE the full subscription. Publishing
+      // this as current data stamped with that generation would attach
+      // subscription provenance no subscription ever produced, and it would
+      // reach the consumer before `FeedConnected` announced the connection at
+      // all (round-3 finding M1). Reported rather than dropped (§8.3), in the
+      // same shape a stale frame is reported: the payload rides on the problem.
+      this.#handlers.onProblem({
+        code: "PRE_SUBSCRIPTION_FRAME",
+        detail: boundDetail(
+          `frame arrived on connection ${session.connectionId} before its subscription was written (the session still holds generation ${String(session.generation)}); nothing had been subscribed, so this is not subscription data`,
         ),
         sourceChannel: MARKET_WEBSOCKET_CHANNEL,
         observedIndex: 0,
@@ -777,7 +894,13 @@ export class PublicMarketFeed {
     this.#reconnectAttempt += 1;
     this.#cancelReconnect = this.#deps.timers.setTimeout(() => {
       this.#cancelReconnect = undefined;
-      if (this.#status === "stopped") return;
+      // A reconnect is owed only while the feed is still disconnected. A
+      // `start()` during the backoff window, or any other attempt, already
+      // replaced it — and connecting anyway would open a second socket over a
+      // live one (round-3 finding H1). `idle` covers `stopped`, `connecting`
+      // and `open`; the session check covers the transitional instant when a
+      // status has not caught up with the connection it belongs to.
+      if (this.#status !== "idle" || this.#session !== undefined) return;
       this.#connect();
     }, delayMs);
   }

@@ -176,7 +176,21 @@ export type PublicMarketProblemCode =
    * not dropped either (§8.3): the raw frame rides on the problem, labelled
    * with the connection it actually arrived on.
    */
-  | "STALE_CONNECTION_FRAME";
+  | "STALE_CONNECTION_FRAME"
+  /**
+   * A frame arrived on a live connection BEFORE its subscription was written.
+   *
+   * The sibling of `STALE_CONNECTION_FRAME` at the other end of a connection's
+   * life. A transport may deliver a frame from inside the socket factory call,
+   * after a synchronous `onOpen` and before the handle is returned, which is
+   * before the feed has planned the subscription, sent it, or advanced the
+   * session's generation. Nothing was subscribed under that generation, so the
+   * frame carries no subscription provenance and cannot be published as current
+   * data — and it reaches the caller before `FeedConnected` announced the
+   * connection at all. Reported with the payload attached rather than dropped
+   * (§8.3), and still preserved raw (§9.1).
+   */
+  | "PRE_SUBSCRIPTION_FRAME";
 
 /** One inbound value that did not become an event, with the evidence. */
 export interface PublicMarketProblem {

@@ -403,6 +403,94 @@ describe("transports and subscriptions the round-2 review found unhandled", () =
   });
 });
 
+describe("session lifetimes the round-3 review found unhandled", () => {
+  it("keeps the connection a manual start() opened during the backoff", async () => {
+    // Round-3 finding H1. A drop arms a backoff timer; the caller reconnects
+    // itself inside that window; the timer used to fire anyway and connect a
+    // THIRD socket over the second one, which stayed open and subscribed while
+    // every frame on it was refused as stale — a connection the consumer was
+    // told about and never told about again.
+    const subject = harness();
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+    subject.sockets.latest().emitClose({ code: 1006, reason: "abnormal closure" });
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+
+    const manual = subject.sockets.latest();
+    // Well past the 250 ms backoff deadline the drop armed.
+    subject.scheduler.advance(1_000);
+
+    expect(subject.sockets.sockets).toHaveLength(2);
+    expect(subject.sockets.latest()).toBe(manual);
+    expect(manual.isOpen).toBe(true);
+    expect(manual.closedByClient).toBe(false);
+
+    // The fixture stream still arrives as current data on that connection...
+    manual.emitJson(fixtureExample("book-snapshot", "book-snapshot"));
+    expect(subject.problems).toEqual([]);
+    expect(subject.types()).toEqual([
+      "FeedConnected",
+      "FeedDisconnected",
+      "FeedConnected",
+      "FeedGapDetected",
+      "BookSnapshot",
+    ]);
+    expect(subject.events.at(-1)?.provenance).toMatchObject({
+      connectionId: subject.feed.connectionId,
+      subscriptionGeneration: subject.feed.subscriptionGeneration,
+    });
+
+    // ...and the gap it opened is still the gap the gateway can close, because
+    // the connection that opened it is still the connection that is live.
+    const gap = subject.feed.openGap;
+    expect(gap?.connectionId).toBe(subject.feed.connectionId);
+    const snapshot = await subject.snapshots.fetchSnapshot(MARKET.yesTokenId, {
+      subscriptionGeneration: gap?.subscriptionGeneration ?? 0,
+    });
+    expect(snapshot.problems).toEqual([]);
+    expect(
+      subject.feed.markResynchronized({
+        subscriptionGeneration: gap?.subscriptionGeneration ?? 0,
+      }).status,
+    ).toBe("accepted");
+  });
+
+  it("refuses a fixture frame delivered before the subscription was written", () => {
+    // Round-3 finding M1. The transport opens AND delivers a real book frame
+    // from inside the factory call, before the handle exists — so before the
+    // deferred open planned the subscription, sent it, or advanced the
+    // session's generation. That frame used to be published as a BookSnapshot
+    // stamped with the pre-subscription generation, ahead of `FeedConnected`.
+    const book = fixtureExample("book-snapshot", "book-snapshot");
+    const subject = harness({
+      onCreate: (socket) => {
+        socket.emitOpen();
+        socket.emitJson(book);
+      },
+    });
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+
+    expect(subject.types()).toEqual(["FeedConnected"]);
+    expect(subject.problems.map((problem) => problem.code)).toEqual(["PRE_SUBSCRIPTION_FRAME"]);
+    // Refused, never dropped: the payload rides on the problem and the raw
+    // record keeps it under the generation it truly arrived at.
+    expect(subject.problems[0]?.raw).toBe(JSON.stringify(book));
+    expect(subject.frames).toHaveLength(1);
+    expect(subject.frames[0]?.subscriptionGeneration).toBeLessThan(
+      subject.feed.subscriptionGeneration,
+    );
+    // The connection itself is healthy: subscribed, announced, and the very
+    // next frame is ordinary data.
+    expect(subject.sockets.latest().sentFrames).toHaveLength(1);
+    subject.sockets.latest().emitJson(book);
+    expect(subject.problems).toHaveLength(1);
+    expect(subject.types()).toEqual(["FeedConnected", "BookSnapshot"]);
+  });
+});
+
 describe("lifecycle events carry no credential and no secret", () => {
   it("names only the public endpoint", () => {
     const subject = harness();
