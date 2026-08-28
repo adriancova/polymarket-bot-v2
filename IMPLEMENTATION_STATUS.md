@@ -173,6 +173,24 @@ table says otherwise.
   `connectionId` per attempt. Orchestrator fast-forwarded the canonical
   branch to `73b70bc` and reproduced gates: root 1943/1943, contract
   115/115, paths clean, lockfile untouched. Review round 2 dispatched.
+- Review round 2 (fresh Codex `01a0464c-3130-7980-bef1-e020109d42ae`): **CHANGES
+  REQUIRED**, strictly narrower — 0 blocker/high, 1 medium (lifecycle events
+  are not correlated to an authorized PENDING attempt: `connecting()`
+  records no expected id, so any well-formed UNKNOWN identity is accepted
+  whenever no socket is live — four demonstrated holes: forged close on
+  fresh IDLE directs reconnect attempt 1; forged close during the
+  replacement's connecting interval exhausts maxAttempts; unknown ERROR
+  accepted after caller shutdown; after 257 retirements an evicted
+  historical id's OPEN is accepted, replaces the live socket, and advances
+  the generation), 0 low, notes (mutation count 45 not 44; root suite
+  sandbox-limited as before). M1/M2/L1/L2 confirmed FIXED (wrapper
+  validation, bounded duplicate window incl. eviction disclosure, register
+  text, UTF-8 bytes); the retired-identity connecting-interval case IS
+  refused (the WP-090-style residue does not exist here); never-live
+  acceptance rule REJECTED as designed; 256-FIFO risk characterization
+  REJECTED (false for OPEN); ND1/ND2 ACCEPT; WP-120 unique-id obligation
+  sound but insufficient alone — the adapter must register pending ids.
+  Remediation round 2 dispatched.
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
