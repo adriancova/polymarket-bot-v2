@@ -106,6 +106,22 @@ table says otherwise.
   review: a channel whose snapshot persistently fails to apply never
   resynchronizes — loud reconnect loop, not silent. Review round 2
   dispatched.
+- Review round 2 (fresh Codex `01a0463c-8177-7601-b578-5d83e7009c28`): **CHANGES
+  REQUIRED**, strictly narrower — 0 blocker, 1 high (H1 residue: a refused
+  LATER snapshot does not revoke the channel's earlier satisfied mark —
+  valid→refused→other-channel ordering still falsely emits
+  FeedResynchronized), 2 medium (H2 residues: a retired socket's frame is
+  accepted during the replacement's CONNECTING interval because the
+  processor's connection id updates only on open; a synchronous `onOpen`
+  loses subscriptions — `#socket` is assigned only after `connect()` returns,
+  so `#sendSubscriptions` sees undefined — the exact timing invoked to
+  justify ordinal binding), 2 low (handoff says five new counters, actual
+  four; omitted-`from` origin parameter is a disclosed public-API risk — the
+  bundled manager always supplies it). M1/M2/L1 confirmed FIXED;
+  suppressed-counts-as-applied ACCEPTED (M1 prevents identity poisoning);
+  U+0000 fix verified; post-open retired callbacks all correctly refused
+  with observable counters; reconnect-loop risk accepted as loud fail-closed
+  with WP-120 owning escalation. Remediation round 2 dispatched.
 
 **WP-080 (Binance adapter):**
 - Implemented by `wp-implementer` (Opus) on branch `worktree-agent-a24ead9170631b1c6`,
