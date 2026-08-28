@@ -567,7 +567,7 @@ describe("connection authorization (round-2 review, R2-M1)", () => {
 
   it("does not let a replacement attempt's failure disconnect the live socket", () => {
     const clock = createManualClock();
-    const feed = newFeed();
+    const feed = newFeed({ stalenessThresholdMs: 10_000 });
     feed.connecting("conn-a");
     feed.onOpen("conn-a", clock.advance(1));
     // A make-before-break replacement is registered and fails before it opens.
@@ -579,6 +579,16 @@ describe("connection authorization (round-2 review, R2-M1)", () => {
     expect(outcome.directive).toEqual({ kind: "NONE" });
     expect(feed.liveConnectionId).toBe("conn-a");
     expect(feed.metrics(clock.peek()).connections.disconnects).toBe(0);
+
+    // …and the socket that IS live is unaffected in every respect: the feed is
+    // still OPEN, its frames are still normalized, and its silence is still
+    // reported (round-3 review, R3-M1 — this test previously checked only the
+    // live id and the disconnect counter).
+    expect(feed.state).toBe("OPEN");
+    const frame = feed.onFrame("conn-a", tradeFrame({ t: 4_242 }), clock.advance(1));
+    expect(frame.classification).toBe("NORMALIZED");
+    expect(typesOf(frame.emissions)).toEqual(["ReferenceTradeObserved"]);
+    expect(typesOf(feed.checkStaleness(clock.advance(10_000)).emissions)).toEqual(["FeedStale"]);
   });
 
   it("registers an attempt only under an identity this feed has never seen", () => {
@@ -616,6 +626,192 @@ describe("connection authorization (round-2 review, R2-M1)", () => {
     expect(registered.rejected).toBeUndefined();
     expect(feed.liveConnectionId).toBe("conn-b");
     expect(feed.pendingConnectionId).toBeUndefined();
+  });
+});
+
+/**
+ * A replacement attempt is not a disconnect (round-3 review, findings R3-M1/R3-L1).
+ *
+ * `connecting()` used to set the feed to `CONNECTING` even while a socket was
+ * live, and both the frame gate and `checkStaleness()` require `OPEN`. The whole
+ * make-before-break interval therefore threw away the live socket's market data
+ * — reporting it, wrongly, as "a frame arrived with no live socket" — and
+ * silenced staleness for that connection, indefinitely if the replacement never
+ * resolved. The attempt in flight is now tracked only in `pendingConnectionId`,
+ * orthogonally to the socket the feed is listening to.
+ *
+ * R3-L1 is the same episode's telemetry: the replacement's own refused events
+ * were reported under `BINANCE_UNAUTHORIZED_CONNECTION_EVENT`, whose documented
+ * meaning is an identity the feed "never authorized" — the opposite of an
+ * identity the caller had just registered.
+ */
+describe("make-before-break replacement (round-3 review, R3-M1/R3-L1)", () => {
+  /** Opens `conn-live` and registers a replacement without opening it. */
+  function replacementRegistered(): {
+    feed: BinanceReferenceFeed;
+    clock: ReturnType<typeof createManualClock>;
+  } {
+    const clock = createManualClock();
+    const feed = newFeed({ stalenessThresholdMs: 10_000 });
+    feed.connecting("conn-live");
+    feed.onOpen("conn-live", clock.advance(1));
+    feed.connecting("conn-replacement");
+    return { feed, clock };
+  }
+
+  it("keeps the feed OPEN and the live socket's frames flowing while a replacement is registered", () => {
+    const { feed, clock } = replacementRegistered();
+
+    // The state describes the SOCKET, and that socket is open.
+    expect(feed.state).toBe("OPEN");
+    expect(feed.liveConnectionId).toBe("conn-live");
+    expect(feed.pendingConnectionId).toBe("conn-replacement");
+
+    const during = feed.onFrame("conn-live", tradeFrame({ t: 1 }), clock.advance(1));
+    expect(during.classification).toBe("NORMALIZED");
+    expect(during.rejected).toBeUndefined();
+    expect(typesOf(during.emissions)).toEqual(["ReferenceTradeObserved"]);
+
+    // The replacement fails before it opens; the refusal disconnects nothing…
+    const refused = feed.onClose("conn-replacement", clock.advance(1), { code: 1006 });
+    expect(refused.rejected?.relation).toBe("PENDING");
+    expect(refused.directive).toEqual({ kind: "NONE" });
+
+    // …and the live socket is still heard AFTER that refusal, which is where the
+    // old behavior discarded market data indefinitely.
+    const after = feed.onFrame("conn-live", tradeFrame({ t: 2 }), clock.advance(1));
+    expect(after.classification).toBe("NORMALIZED");
+    expect(typesOf(after.emissions)).toEqual(["ReferenceTradeObserved"]);
+
+    const metrics = feed.metrics(clock.peek());
+    expect(metrics.state).toBe("OPEN");
+    expect(metrics.frames.tradesNormalized).toBe(2);
+    expect(metrics.frames.framesNotFromLiveConnection).toBe(0);
+  });
+
+  it("keeps the live socket's staleness clock running and re-armed across the registration", () => {
+    const { feed, clock } = replacementRegistered();
+
+    // A frame from the live socket re-arms staleness, exactly as before.
+    feed.onFrame("conn-live", tradeFrame({ t: 1 }), clock.advance(5_000));
+    expect(feed.checkStaleness(clock.advance(9_999)).emissions).toEqual([]);
+    expect(typesOf(feed.checkStaleness(clock.advance(1)).emissions)).toEqual(["FeedStale"]);
+
+    // The refused pre-open failure of the replacement does not stop the clock.
+    feed.onClose("conn-replacement", clock.advance(1), { code: 1006 });
+    feed.onFrame("conn-live", tradeFrame({ t: 2 }), clock.advance(1));
+    expect(typesOf(feed.checkStaleness(clock.advance(10_000)).emissions)).toEqual(["FeedStale"]);
+    expect(feed.metrics(clock.peek()).connections.staleEpisodes).toBe(2);
+  });
+
+  it("reports the attempt in flight BESIDE the live socket, not instead of it", () => {
+    const { feed, clock } = replacementRegistered();
+    const metrics = feed.metrics(clock.peek());
+
+    expect(metrics.state).toBe("OPEN");
+    expect(metrics.connectionId).toBe("conn-live");
+    expect(metrics.pendingConnectionId).toBe("conn-replacement");
+    // The attempt was still counted; only the state stopped lying about it.
+    expect(metrics.connections.connectionAttempts).toBe(2);
+  });
+
+  it("still becomes CONNECTING when the attempt really is the only connection", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    feed.connecting("conn-1");
+    expect(feed.state).toBe("CONNECTING");
+
+    feed.onOpen("conn-1", clock.advance(1));
+    feed.onClose("conn-1", clock.advance(1), { code: 1006 });
+    expect(feed.state).toBe("IDLE");
+
+    feed.connecting("conn-2");
+    expect(feed.state).toBe("CONNECTING");
+    expect(feed.liveConnectionId).toBeUndefined();
+    // With nothing live, a frame is still refused and still reported as a frame
+    // that arrived with no live socket.
+    const orphan = feed.onFrame("conn-2", tradeFrame({ t: 3 }), clock.advance(1));
+    expect(orphan.classification).toBe("STALE_CONNECTION");
+    expect((orphan.emissions[0]?.payload as { reasonCode: string }).reasonCode).toBe(
+      BINANCE_REASON_CODES.frameWithoutConnection,
+    );
+  });
+
+  it("adopts the replacement when it finally opens, retiring the socket it replaces", () => {
+    const { feed, clock } = replacementRegistered();
+    feed.onFrame("conn-live", tradeFrame({ t: 1 }), clock.advance(1));
+
+    const opened = feed.onOpen("conn-replacement", clock.advance(1));
+    expect(opened.rejected).toBeUndefined();
+    expect(typesOf(opened.emissions)).toContain("FeedConnected");
+    expect(feed.liveConnectionId).toBe("conn-replacement");
+    expect(feed.pendingConnectionId).toBeUndefined();
+    expect(feed.subscriptionGeneration).toBe(1);
+
+    // The superseded socket is retired the moment the replacement opens, and not
+    // one event earlier.
+    const late = feed.onFrame("conn-live", tradeFrame({ t: 2 }), clock.advance(1));
+    expect(late.classification).toBe("STALE_CONNECTION");
+    expect(late.rejected?.relation).toBe("RETIRED");
+  });
+
+  it("reports an authorized attempt's inadmissible event under its own reason code (R3-L1)", () => {
+    const { feed, clock } = replacementRegistered();
+
+    const close = feed.onClose("conn-replacement", clock.advance(1), { code: 1006 });
+    const incident = close.emissions[0]?.payload as { reasonCode: string; detail: string };
+    expect(incident.reasonCode).toBe(BINANCE_REASON_CODES.pendingAttemptEventInadmissible);
+    // The identity was registered by the caller; saying otherwise was the bug.
+    expect(incident.detail).not.toContain("nor authorized");
+    expect(incident.detail).toContain("registered attempt");
+    expect(close.rejected?.relation).toBe("PENDING");
+    expect(close.rejected?.pendingConnectionId).toBe("conn-replacement");
+
+    // A genuinely unknown identity on the SAME feed keeps the unauthorized code,
+    // so the two conditions stay distinguishable in the telemetry.
+    const forged = feed.onClose("forged-identity", clock.advance(1), { code: 1006 });
+    expect(forged.rejected?.relation).toBe("UNKNOWN");
+    expect((forged.emissions[0]?.payload as { reasonCode: string }).reasonCode).toBe(
+      BINANCE_REASON_CODES.unauthorizedConnectionEvent,
+    );
+    expect(feed.metrics(clock.peek()).openIncidentReasonCodes).toEqual(
+      expect.arrayContaining([
+        BINANCE_REASON_CODES.pendingAttemptEventInadmissible,
+        BINANCE_REASON_CODES.unauthorizedConnectionEvent,
+      ]),
+    );
+  });
+
+  it("uses the same code for a frame from an attempt that has not announced its OPEN", () => {
+    const { feed, clock } = replacementRegistered();
+    const early = feed.onFrame("conn-replacement", tradeFrame({ t: 5 }), clock.advance(1));
+
+    expect(early.classification).toBe("STALE_CONNECTION");
+    expect(early.rejected?.relation).toBe("PENDING");
+    const incident = early.emissions[0]?.payload as { reasonCode: string };
+    // Not `frameWithoutConnection`: a socket IS live, and it is not this one.
+    expect(incident.reasonCode).toBe(BINANCE_REASON_CODES.pendingAttemptEventInadmissible);
+    expect(feed.metrics(clock.peek()).frames.tradesNormalized).toBe(0);
+  });
+
+  it("leaves the refused attempt registered — the disclosed residual, with the feed still flowing", () => {
+    const { feed, clock } = replacementRegistered();
+    feed.onClose("conn-replacement", clock.advance(1), { code: 1006 });
+
+    // A refusal mutates nothing, so the caller's own registration survives it.
+    expect(feed.pendingConnectionId).toBe("conn-replacement");
+    expect(feed.state).toBe("OPEN");
+    expect(feed.liveConnectionId).toBe("conn-live");
+    expect(feed.onFrame("conn-live", tradeFrame({ t: 9 }), clock.advance(1)).classification).toBe(
+      "NORMALIZED",
+    );
+
+    // If that identity's socket does open after all, it is believed: the caller
+    // authorized it. That is the residual, and it costs the live socket nothing
+    // until the moment it is superseded.
+    const opened = feed.onOpen("conn-replacement", clock.advance(1));
+    expect(opened.rejected).toBeUndefined();
+    expect(feed.liveConnectionId).toBe("conn-replacement");
   });
 });
 

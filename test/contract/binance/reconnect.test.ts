@@ -378,3 +378,100 @@ describe("unauthorized lifecycle events", () => {
     expect(harness.feed.metrics(harness.clock.peek()).connections.socketErrors).toBe(0);
   });
 });
+
+/**
+ * Make-before-break means the OLD socket keeps working (round-3 review, R3-M1).
+ *
+ * The venue's own `serverShutdown` notice asks a client to "establish a new
+ * connection as soon as possible to prevent interruption", which is precisely a
+ * second socket opened while the first still carries data. Registering that
+ * second attempt used to move the feed to `CONNECTING`, and the frame gate and
+ * the staleness check both require `OPEN` — so during the replacement interval
+ * the live socket's own market data was refused as "a frame with no live socket"
+ * and its silence went unreported. A slow or failed replacement therefore
+ * discarded good data indefinitely.
+ */
+describe("make-before-break replacement", () => {
+  const TRADE = (id: number): string =>
+    JSON.stringify({
+      stream: "bnbbtc@trade",
+      data: {
+        e: "trade",
+        E: 1672515782136,
+        s: "BNBBTC",
+        t: id,
+        p: "0.001",
+        q: "100",
+        T: 1672515782136,
+        m: true,
+      },
+    });
+
+  it("keeps publishing the live socket's frames before and after the replacement's refused close", () => {
+    const harness = createHarness({ stalenessThresholdMs: 10_000 });
+    open(harness, "conn-a");
+
+    // The driver registers the replacement attempt; its socket has not opened.
+    harness.feed.connecting("conn-b");
+    const metrics = harness.feed.metrics(harness.clock.peek());
+    expect(metrics.state).toBe("OPEN");
+    expect(metrics.connectionId).toBe("conn-a");
+    expect(metrics.pendingConnectionId).toBe("conn-b");
+
+    const during = harness.feed.onFrame("conn-a", TRADE(1), harness.clock.advance(1));
+    expect(during.classification).toBe("NORMALIZED");
+    expect(eventTypesOf(during.emissions)).toEqual(["ReferenceTradeObserved"]);
+
+    // The replacement fails before it opens: refused, and the live feed carries on.
+    const refused = harness.feed.onClose("conn-b", harness.clock.advance(1), { code: 1006 });
+    expect(eventTypesOf(refused.emissions)).not.toContain("FeedDisconnected");
+    expect(refused.directive.kind).toBe("NONE");
+
+    const after = harness.feed.onFrame("conn-a", TRADE(2), harness.clock.advance(1));
+    expect(after.classification).toBe("NORMALIZED");
+    const trades = [...during.emissions, ...after.emissions].filter(
+      (emission) => emission.eventType === "ReferenceTradeObserved",
+    );
+    expect(trades.map((emission) => emission.connectionId)).toEqual(["conn-a", "conn-a"]);
+    expect(trades.map((emission) => emission.subscriptionGeneration)).toEqual([0, 0]);
+
+    const final = harness.feed.metrics(harness.clock.peek());
+    expect(final.frames.tradesNormalized).toBe(2);
+    expect(final.frames.framesNotFromLiveConnection).toBe(0);
+    expect(final.connections.disconnects).toBe(0);
+  });
+
+  it("still reports the live socket's silence during the replacement interval", () => {
+    const harness = createHarness({ stalenessThresholdMs: 10_000 });
+    open(harness, "conn-a");
+    harness.feed.onFrame("conn-a", TRADE(1), harness.clock.advance(1_000));
+    harness.feed.connecting("conn-b");
+    harness.feed.onClose("conn-b", harness.clock.advance(1), { code: 1006 });
+
+    const stale = harness.feed.checkStaleness(harness.clock.advance(10_000));
+    expect(eventTypesOf(stale.emissions)).toEqual(["FeedStale"]);
+    expect(harness.feed.metrics(harness.clock.peek()).connections.staleEpisodes).toBe(1);
+  });
+
+  it("records the replacement's own failure as an attempt, not as an intruder", () => {
+    const harness = createHarness();
+    open(harness, "conn-a");
+    harness.feed.connecting("conn-b");
+    const refused = harness.feed.onClose("conn-b", harness.clock.advance(1), { code: 1006 });
+
+    expect(refused.rejected?.relation).toBe("PENDING");
+    const incident = refused.emissions[0]?.payload as { reasonCode: string };
+    expect(incident.reasonCode).toBe("BINANCE_PENDING_ATTEMPT_EVENT_INADMISSIBLE");
+
+    // The unauthorized code keeps its meaning: an identity nobody registered.
+    const forged = harness.feed.onClose("forged-identity", harness.clock.advance(1), {
+      code: 1006,
+    });
+    expect((forged.emissions[0]?.payload as { reasonCode: string }).reasonCode).toBe(
+      "BINANCE_UNAUTHORIZED_CONNECTION_EVENT",
+    );
+    expect(harness.feed.metrics(harness.clock.peek()).openIncidentReasonCodes).toContain(
+      "BINANCE_PENDING_ATTEMPT_EVENT_INADMISSIBLE",
+    );
+  });
+});

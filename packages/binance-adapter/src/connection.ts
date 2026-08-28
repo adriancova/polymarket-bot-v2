@@ -48,13 +48,26 @@
 import { BinanceConfigurationError } from "./errors.js";
 import { BINANCE_LIMITS } from "./venue.js";
 
-/** Lifecycle of one feed. */
+/**
+ * Lifecycle of one feed's SOCKET.
+ *
+ * A statement about the socket the feed is listening to, not about what the
+ * caller is attempting. The attempt in flight is a separate fact, reported
+ * separately as `BinanceReferenceFeed.pendingConnectionId`, because the two are
+ * independent: a make-before-break replacement is registered *while* the current
+ * socket is still open and still delivering data (WP-080 round-3 review, R3-M1).
+ */
 export type FeedConnectionState =
   /** Constructed; no connection attempted yet. */
   | "IDLE"
-  /** A connection attempt is in flight. */
+  /** A connection attempt is in flight AND no socket is live. */
   | "CONNECTING"
-  /** The socket is open and frames may arrive. */
+  /**
+   * The socket is open and frames may arrive.
+   *
+   * Including while a replacement attempt is registered: that attempt does not
+   * disconnect, silence, or supersede this socket until it opens.
+   */
   | "OPEN"
   /** Deliberately closed by the caller; no further reconnect is directed. */
   | "CLOSED";

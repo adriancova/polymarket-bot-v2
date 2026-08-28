@@ -41,6 +41,19 @@
  * reported as a data-quality incident — it changes no connection state
  * (round-1 review, finding H1).
  *
+ * A REPLACEMENT ATTEMPT DOES NOT SILENCE THE SOCKET THAT IS STILL LIVE. The
+ * attempt in flight and the socket being listened to are two different facts, so
+ * they are two different fields: {@link BinanceReferenceFeed.pendingConnectionId}
+ * and {@link BinanceReferenceFeed.liveConnectionId}. `CONNECTING` therefore means
+ * "an attempt is in flight AND no socket is live"; registering a replacement
+ * while a socket is still delivering data leaves the feed `OPEN`, so that
+ * socket's frames are still normalized and its staleness clock still runs for the
+ * whole make-before-break interval — including after a refused pre-open failure
+ * of the replacement. Before this fix {@link BinanceReferenceFeed.connecting}
+ * moved the feed to `CONNECTING` unconditionally, and the live socket's own
+ * market data was then refused as "a frame with no live socket" and its silence
+ * went unreported (round-3 review, finding R3-M1).
+ *
  * AN IDENTITY IS AUTHORIZED BEFORE IT IS BELIEVED. Being unrecognised is not a
  * licence: an identity the feed never authorized may not open a connection,
  * disconnect one, or record an error against one. {@link
@@ -298,6 +311,14 @@ export class BinanceReferenceFeed {
   /** The channels this connection subscribed to; a frame claiming another is refused. */
   readonly #expectedStreams: ReadonlySet<string>;
 
+  /**
+   * What the feed's OWN socket is doing — never what an attempt is doing.
+   *
+   * `CONNECTING` means "no socket is live and an attempt is in flight". A
+   * replacement attempt registered while a socket is still live leaves this
+   * `OPEN`, because the live socket is still open: the attempt is tracked by
+   * {@link BinanceReferenceFeed.pendingConnectionId} instead (R3-M1).
+   */
   #state: FeedConnectionState = "IDLE";
   /**
    * Identity of the socket the feed is listening to, or `undefined` when none
@@ -464,6 +485,14 @@ export class BinanceReferenceFeed {
    * cannot accidentally connect to a different endpoint than the one recorded on
    * `FeedConnected`.
    *
+   * REGISTERING AN ATTEMPT CHANGES NOTHING ABOUT A LIVE SOCKET. If one is live,
+   * the feed stays `OPEN` and keeps normalizing that socket's frames and running
+   * its staleness clock; only a feed with no live socket becomes `CONNECTING`.
+   * That is what make-before-break means, and it holds for the whole interval —
+   * through the replacement's own pre-open failure, which is refused as data
+   * (R2-M1 assumption 3) and leaves the live connection untouched (round-3
+   * review, R3-M1).
+   *
    * THROWS, unlike the socket-event paths. Registering an attempt is a direct
    * caller action, not a transport callback, so a mistake here is a programming
    * error and a silent value would hide it: a closed feed opens nothing, an
@@ -500,7 +529,21 @@ export class BinanceReferenceFeed {
     // identities rather than staying authorized.
     this.#abandonPendingAttempt();
 
-    this.#state = "CONNECTING";
+    // REGISTERING AN ATTEMPT NEVER DISABLES A SOCKET THAT IS STILL LIVE.
+    // `CONNECTING` describes the feed's own socket — "none is live, and one is
+    // being opened" — so only a feed with nothing live enters it. A replacement
+    // registered while a socket is still delivering data is a make-before-break
+    // reconnect: the feed stays `OPEN`, that socket's frames stay this
+    // connection's data, and its staleness clock keeps running until the
+    // replacement actually opens (or the live socket closes). Setting
+    // `CONNECTING` here unconditionally is what made the live socket's own
+    // frames `STALE_CONNECTION` — reported, wrongly, as arriving with no live
+    // socket — and disabled `checkStaleness` for the entire replacement
+    // interval, including after a refused pre-open failure (round-3 review,
+    // R3-M1).
+    if (this.#liveConnectionId === undefined) {
+      this.#state = "CONNECTING";
+    }
     this.#pendingConnectionId = connectionId;
     this.#connections.connectionAttempts += 1;
     return {
@@ -641,7 +684,9 @@ export class BinanceReferenceFeed {
       return this.#reject("ERROR", connectionId, receipt, {
         relation,
         detail:
-          "an error from a socket this feed is neither listening to nor authorized changes nothing here",
+          relation === "PENDING"
+            ? "this is the registered attempt's own error, but another socket is live and only that socket describes this feed's connection; it is reported to the driver rather than recorded against the live connection"
+            : "an error from a socket this feed is neither listening to nor authorized changes nothing here",
         ...(this.#state === "CLOSED"
           ? { directive: { kind: "STOP", reason: "CLOSED_BY_CALLER" } as const }
           : {}),
@@ -702,7 +747,9 @@ export class BinanceReferenceFeed {
       return this.#reject("CLOSE", connectionId, receipt, {
         relation,
         detail:
-          "a close from a socket this feed is neither listening to nor authorized disconnects nothing and directs no reconnect",
+          relation === "PENDING"
+            ? "this registered attempt failed before it opened while another socket is still live; it disconnects nothing and directs no reconnect, and the live connection carries on"
+            : "a close from a socket this feed is neither listening to nor authorized disconnects nothing and directs no reconnect",
       });
     }
     // The attempt resolved by failing; it authorizes nothing further.
@@ -939,6 +986,7 @@ export class BinanceReferenceFeed {
       endpoint: this.#built.endpointIdentifier,
       state: this.#state,
       connectionId: this.#liveConnectionId,
+      pendingConnectionId: this.#pendingConnectionId,
       subscriptionGeneration: this.#subscriptionGeneration,
       subscribedStreams: this.streamNames,
       stalenessMs: baseline === undefined ? 0 : elapsedMsBetween(baseline, now),
@@ -1427,18 +1475,28 @@ function channelOf(decoded: DecodedFrame): string {
 /**
  * Which incident a refusal opens, by what the identity actually was.
  *
- * The two cases need different operator responses, so they are not one bucket. A
- * `LIVE` or `RETIRED` identity is a socket that IS or WAS this feed's: a
- * duplicate open, or a superseded socket still talking — a transport-lifecycle
- * problem. Anything else — an identity the feed never authorized, or a pending
- * attempt claiming an effect it may not have — is traffic from a socket this
- * feed has no relationship with, which is a different question entirely: who
- * opened it, and why is it calling back into this feed?
+ * Three cases, because they are three different operator questions and one
+ * bucket would answer none of them:
+ *
+ * - `LIVE` or `RETIRED` — a socket that IS or WAS this feed's: a duplicate open,
+ *   or a superseded socket still talking. A transport-lifecycle problem.
+ * - `PENDING` — the attempt the caller registered, reporting something the feed
+ *   may not act on yet (its pre-open failure, or a frame before its `OPEN`,
+ *   while another socket is live). The identity is authorized; the event is
+ *   inadmissible in this state. Reporting it as unauthorized said the feed had
+ *   "never authorized" an identity the caller had just registered (round-3
+ *   review, R3-L1).
+ * - anything else (`UNKNOWN`, `INVALID`) — traffic from a socket this feed has
+ *   no relationship with: who opened it, and why is it calling back in here?
  */
 function refusalReasonCode(relation: ConnectionIdentityRelation): string {
-  return relation === "LIVE" || relation === "RETIRED"
-    ? BINANCE_REASON_CODES.retiredConnectionEvent
-    : BINANCE_REASON_CODES.unauthorizedConnectionEvent;
+  if (relation === "LIVE" || relation === "RETIRED") {
+    return BINANCE_REASON_CODES.retiredConnectionEvent;
+  }
+  if (relation === "PENDING") {
+    return BINANCE_REASON_CODES.pendingAttemptEventInadmissible;
+  }
+  return BINANCE_REASON_CODES.unauthorizedConnectionEvent;
 }
 
 /** A bounded rendering of a connection id for an incident `detail`. */

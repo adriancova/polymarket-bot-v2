@@ -107,6 +107,17 @@ export type BinanceFeedMetrics = {
   readonly endpoint: string;
   readonly state: FeedConnectionState;
   readonly connectionId: string | undefined;
+  /**
+   * Identity registered for the connection attempt in flight, if any.
+   *
+   * Reported beside `state` and `connectionId` because the attempt is a separate
+   * fact from the socket: during a make-before-break replacement the state is
+   * `OPEN` (the current socket is still delivering data) and this field is the
+   * only sign that a new connection is being opened. Before the round-3 fix the
+   * feed reported `CONNECTING` for that interval, which was visible but false —
+   * it claimed no socket was live while one was (R3-M1).
+   */
+  readonly pendingConnectionId: string | undefined;
   /** §7.1: a resubscription creates a new generation. */
   readonly subscriptionGeneration: number;
   readonly subscribedStreams: readonly string[];
@@ -151,6 +162,7 @@ export type FeedMetricsInput = {
   readonly endpoint: string;
   readonly state: FeedConnectionState;
   readonly connectionId: string | undefined;
+  readonly pendingConnectionId: string | undefined;
   readonly subscriptionGeneration: number;
   readonly subscribedStreams: readonly string[];
   /** Elapsed milliseconds since the last frame (or since connect when none). */
@@ -186,6 +198,7 @@ export function computeFeedMetrics(input: FeedMetricsInput): BinanceFeedMetrics 
     endpoint: input.endpoint,
     state: input.state,
     connectionId: input.connectionId,
+    pendingConnectionId: input.pendingConnectionId,
     subscriptionGeneration: input.subscriptionGeneration,
     subscribedStreams: input.subscribedStreams,
 

@@ -139,6 +139,21 @@ describe("staleness as an event", () => {
     expect(harness.feed.checkStaleness(harness.clock.advance(1_000_000)).emissions).toEqual([]);
   });
 
+  it("keeps watching a live socket while a replacement connection is being opened", () => {
+    // A registered replacement is not a disconnect: until it opens, the socket
+    // the feed is listening to is still the one whose silence matters
+    // (round-3 review, R3-M1 — this interval used to report nothing at all).
+    const harness = createHarness({ stalenessThresholdMs: 10_000 });
+    open(harness, "conn-stale");
+    deliver(harness, tradeText(), harness.clock.advance(1_000));
+    harness.feed.connecting("conn-replacement");
+
+    expect(harness.feed.metrics(harness.clock.advance(10_000)).stale).toBe(true);
+    expect(
+      eventTypesOf(harness.feed.checkStaleness(harness.clock.peek()).emissions),
+    ).toEqual(["FeedStale"]);
+  });
+
   it("treats any frame as proof of life, including one it cannot use", () => {
     const harness = createHarness({ stalenessThresholdMs: 10_000 });
     open(harness, "conn-stale");

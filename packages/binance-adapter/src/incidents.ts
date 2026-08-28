@@ -111,6 +111,26 @@ export const BINANCE_REASON_CODES = {
    */
   unauthorizedConnectionEvent: "BINANCE_UNAUTHORIZED_CONNECTION_EVENT",
   /**
+   * An AUTHORIZED attempt produced an event that cannot be applied yet.
+   *
+   * The identity is the one the caller registered with `connecting()`, so this
+   * is neither a forged nor a foreign socket: it is the feed's own next
+   * connection, reporting something at a moment when the feed may not act on it.
+   * Two cases reach it, both while another socket is still live: the
+   * replacement's pre-open `ERROR`/`CLOSE` (which must not disconnect a
+   * connection it never replaced) and a frame from a socket that has not yet
+   * announced its `OPEN`.
+   *
+   * It is a DISTINCT code from `unauthorizedConnectionEvent` because the
+   * operator questions are opposites. "An identity we never authorized is
+   * calling into this feed" asks who opened it; "our own replacement attempt
+   * failed" asks why the reconnect is not completing — and reporting the second
+   * under the first would make a routine make-before-break failure look like an
+   * intrusion, and would dilute the intrusion signal with ordinary reconnect
+   * noise (round-3 review, finding R3-L1).
+   */
+  pendingAttemptEventInadmissible: "BINANCE_PENDING_ATTEMPT_EVENT_INADMISSIBLE",
+  /**
    * A frame arrived while no socket was live.
    *
    * A transport delivers messages only between OPEN and CLOSE, so this is a

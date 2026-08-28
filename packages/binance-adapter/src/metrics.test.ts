@@ -7,6 +7,7 @@ const BASE: FeedMetricsInput = {
   endpoint: "wss://data-stream.binance.vision/stream",
   state: "OPEN",
   connectionId: "conn-1",
+  pendingConnectionId: undefined,
   subscriptionGeneration: 0,
   subscribedStreams: ["btcusdt@trade"],
   stalenessMs: 0,
