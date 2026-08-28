@@ -16,9 +16,22 @@
  * (ADR-002 §2.1, handoff §9.1); minting them here would be inventing a position
  * in a total order this package cannot see.
  *
- * NOTHING IS EVER DROPPED IN SILENCE. Every frame produces either normalized
- * events, or anomalies, or both. The one thing that never happens is a frame
- * going in and nothing coming out (§8.3, ADR-002 §2.5).
+ * NOTHING IS EVER DROPPED IN SILENCE. Every frame is accounted for: it is
+ * counted, and — unless it was refused before any state could be touched — it
+ * advances the sequence and per-channel state that the metrics expose. Every
+ * non-conforming or suppressed market-data path additionally yields a typed
+ * anomaly carrying the frame. A frame can legitimately produce neither a
+ * normalized event nor an anomaly — a heartbeat and a `subscriptions`
+ * acknowledgement carry no market data and both are conforming — but no frame
+ * ever passes through without being accounted for (§8.3, ADR-002 §2.5).
+ *
+ * OLD-CONNECTION DATA IS NEVER RELABELLED AS CURRENT. A frame carries the
+ * `connectionId` and `subscriptionGeneration` it was received under, which is
+ * exactly the provenance ADR-002 §2.4 makes the generation carry. A caller that
+ * can tell which socket delivered a frame passes that identity to
+ * {@link CoinbaseStreamProcessor.ingestFrame}; a frame from a socket that is no
+ * longer current is refused and reported rather than drafted onto the current
+ * connection's generation.
  *
  * NO CONFIGURATION, NO ENVIRONMENT, NO CLOCK OF ITS OWN. Every parameter arrives
  * as a constructor argument and every impure capability arrives as a port. This
@@ -29,6 +42,7 @@
 
 import {
   CodeStringSchema,
+  IsoTimestampSchema,
   type DataQualityIncidentOpenedPayload,
   type FeedConnectedPayload,
   type FeedDisconnectedPayload,
@@ -67,6 +81,7 @@ import {
   COINBASE_PUBLIC_MARKET_DATA_ENDPOINT,
   type CoinbaseChannel,
 } from "./venue-facts.js";
+import type { CoinbaseMarketTrade, CoinbaseTicker } from "./wire.js";
 
 /**
  * `sourceChannel` for an event about the connection rather than about a channel.
@@ -113,6 +128,58 @@ export type CoinbaseIngestResult = CoinbaseProcessorOutput & {
   readonly classification: CoinbaseClassifiedFrame["kind"];
 };
 
+/**
+ * Which connection a frame or a callback came from, as the transport owner saw
+ * it.
+ *
+ * Keyed on `connectionId` alone, not on the generation: a `connectionId` is
+ * minted once per connection attempt and never reused, while a generation can
+ * advance on a live socket (`resubscribed`), so frames that arrive after a
+ * resubscription on the same socket are legitimately current.
+ *
+ * OPTIONAL, AND THAT IS DELIBERATE. A caller driving the processor by hand — a
+ * replay, a test — has exactly one connection in view and can omit it; when it
+ * is omitted the processor cannot check, and says so by not checking rather than
+ * by guessing. The bundled {@link CoinbaseConnectionManager} always supplies it.
+ */
+export type CoinbaseFrameOrigin = {
+  readonly connectionId: string;
+};
+
+/** What a socket callback that arrived from a superseded connection was. */
+export type CoinbaseStaleCallback = "onOpen" | "onClose" | "onError";
+
+/**
+ * Whether a `snapshot` event arrived on a channel, and whether it was applied.
+ *
+ * `FeedResynchronized.authoritativeSnapshotApplied` is pinned to the literal
+ * `true` by the frozen contract (ADR-002 §2.4), so a channel may only be
+ * recorded as resynchronized once the venue's snapshot for it was applied in
+ * full. "Applied" means every entry either crossed the domain boundary or was
+ * knowingly suppressed as state the consumer already holds — a duplicate trade,
+ * or a top of book identical to the one already emitted. An entry the adapter
+ * REFUSED is not applied, and one refused entry is enough: the snapshot is the
+ * venue's statement of current state, and a partial statement does not establish
+ * it.
+ */
+type CoinbaseSnapshotApplication = {
+  /** A `snapshot`-typed event for this channel arrived in this frame. */
+  seen: boolean;
+  /** Every entry inside those snapshot events was applied. */
+  fullyApplied: boolean;
+};
+
+/** Everything an individual entry's ingestion needs beyond the entry itself. */
+type CoinbaseEntryContext = {
+  readonly context: CoinbaseNormalizationContext;
+  readonly receivedAt: string;
+  readonly sequenceNum: number;
+  readonly rawFrame: string;
+};
+
+/** The documented `events[].type` that states current state (`market-trades-shape`). */
+const COINBASE_SNAPSHOT_EVENT_TYPE = "snapshot";
+
 export type CoinbaseStreamProcessorOptions = {
   /** Stable feed identifier, supplied by the caller. Must be a `CodeString`. */
   readonly feedId: string;
@@ -135,7 +202,13 @@ export type CoinbaseStreamProcessorOptions = {
 type ChannelState = {
   framesReceived: number;
   lastMessageAt?: string;
-  lastVenueTimestamp?: string;
+  /**
+   * The venue `timestamp` on the last frame, or `undefined` when that frame's
+   * timestamp did not validate. Explicitly `| undefined` rather than optional,
+   * because clearing it is a meaningful assignment: "the last frame carried no
+   * usable venue time".
+   */
+  lastVenueTimestamp: string | undefined;
   lastFrameNs?: bigint;
 };
 
@@ -143,6 +216,8 @@ type MutableCounters = {
   framesReceived: number;
   framesRejected: number;
   framesUnknownChannel: number;
+  framesFromStaleConnection: number;
+  staleConnectionCallbacks: number;
   tradesNormalized: number;
   tradesDuplicateSuppressed: number;
   topOfBookNormalized: number;
@@ -151,6 +226,8 @@ type MutableCounters = {
   sequenceGaps: number;
   sequenceRegressions: number;
   heartbeatGaps: number;
+  heartbeatRegressions: number;
+  snapshotsNotApplied: number;
   connectionsOpened: number;
   disconnections: number;
   resynchronizations: number;
@@ -188,6 +265,8 @@ export class CoinbaseStreamProcessor {
     framesReceived: 0,
     framesRejected: 0,
     framesUnknownChannel: 0,
+    framesFromStaleConnection: 0,
+    staleConnectionCallbacks: 0,
     tradesNormalized: 0,
     tradesDuplicateSuppressed: 0,
     topOfBookNormalized: 0,
@@ -196,6 +275,8 @@ export class CoinbaseStreamProcessor {
     sequenceGaps: 0,
     sequenceRegressions: 0,
     heartbeatGaps: 0,
+    heartbeatRegressions: 0,
+    snapshotsNotApplied: 0,
     connectionsOpened: 0,
     disconnections: 0,
     resynchronizations: 0,
@@ -370,19 +451,53 @@ export class CoinbaseStreamProcessor {
    *
    * Never throws for anything the venue can send; a frame this adapter cannot
    * read becomes anomalies carrying the frame itself.
+   *
+   * @param from which connection delivered the frame, when the caller knows. A
+   * frame from a connection that is no longer current is REFUSED — see
+   * {@link CoinbaseFrameOrigin}. Refusing it is the conservative choice: the
+   * alternative is to draft it onto the current `connectionId` and
+   * `subscriptionGeneration`, which would state that old-generation data was
+   * observed on the new subscription, and could let a pre-reconnect snapshot
+   * close the very gap the reconnect opened.
    */
-  ingestFrame(raw: CoinbaseRawFrame): CoinbaseIngestResult {
+  ingestFrame(raw: CoinbaseRawFrame, from?: CoinbaseFrameOrigin): CoinbaseIngestResult {
     const receivedAt = this.#wallClock.nowIso();
     const receivedNs = this.#monotonicClock.nowNs();
     this.#counters.framesReceived += 1;
-    this.#lastFrameNs = receivedNs;
-    this.#lastFrameAt = receivedAt;
-    this.#staleReported = false;
 
     const classified = classifyFrame(raw);
     const normalized: CoinbaseNormalizedEvent[] = [];
     const feedEvents: CoinbaseFeedEvent[] = [];
     const anomalies: CoinbaseAnomaly[] = [];
+
+    if (from !== undefined && from.connectionId !== this.#connectionId) {
+      this.#counters.framesFromStaleConnection += 1;
+      anomalies.push(
+        this.#anomaly(
+          "COINBASE_STALE_CONNECTION_ACTIVITY",
+          `a frame was delivered by connection "${from.connectionId.slice(0, 64)}", which is not the current connection "${this.#connectionId === "" ? "<none>" : this.#connectionId.slice(0, 64)}" at subscription generation ${String(this.#generation)}; it is refused rather than relabelled with the current generation, and its raw bytes are preserved here`,
+          {
+            receivedAt,
+            ...(classified.kind === "REJECTED"
+              ? {}
+              : { channel: classified.frame.channel, sequenceNum: classified.frame.sequence_num }),
+            ...(classified.text === undefined ? {} : { rawFrame: classified.text }),
+            ...(classified.kind === "REJECTED" && classified.byteLength !== undefined
+              ? { rawFrameByteLength: classified.byteLength }
+              : {}),
+          },
+        ),
+      );
+      // Deliberately NOT recorded as evidence of liveness: a frame from a dead
+      // socket says nothing about whether the current one is alive, and letting
+      // it reset the staleness clock would hide exactly the stall the staleness
+      // bound exists to catch.
+      return this.#finish(classified.kind, normalized, feedEvents, anomalies);
+    }
+
+    this.#lastFrameNs = receivedNs;
+    this.#lastFrameAt = receivedAt;
+    this.#staleReported = false;
 
     if (classified.kind === "REJECTED") {
       this.#counters.framesRejected += 1;
@@ -397,7 +512,25 @@ export class CoinbaseStreamProcessor {
     }
 
     const { channel, timestamp, sequence_num: sequenceNum } = classified.frame;
-    this.#recordChannel(channel, receivedAt, timestamp, receivedNs);
+    // §7.1 types every venue time as an ISO-8601 timestamp and the venue
+    // documents this one as RFC 3339 (`envelope-base`). The wire schema requires
+    // only a non-empty string, on purpose — rejecting the whole frame would
+    // discard market data over a misspelled publication time — so the check
+    // happens here, BEFORE the value is recorded as this channel's venue time.
+    // An unvalidated string in `lastVenueTimestamp` is a claim the adapter
+    // cannot support: the field is typed as the venue's own time, and metrics
+    // built on it would be built on something that is not a timestamp.
+    const venueTimestamp = IsoTimestampSchema.safeParse(timestamp).success ? timestamp : undefined;
+    if (venueTimestamp === undefined) {
+      anomalies.push(
+        this.#anomaly(
+          "COINBASE_TIMESTAMP_INVALID",
+          `the ${channel.slice(0, 64)} envelope timestamp "${timestamp.slice(0, 64)}" is not the documented RFC 3339 form; it is NOT recorded as this channel's venue time, and the frame is otherwise processed so its market data is not lost`,
+          { receivedAt, channel, sequenceNum, rawFrame: classified.text },
+        ),
+      );
+    }
+    this.#recordChannel(channel, receivedAt, venueTimestamp, receivedNs);
     this.#observeSequence(sequenceNum, channel, classified.text, receivedAt, feedEvents, anomalies);
 
     switch (classified.kind) {
@@ -421,15 +554,59 @@ export class CoinbaseStreamProcessor {
         this.#ingestHeartbeats(classified, receivedAt, feedEvents, anomalies);
         break;
       case "MARKET_TRADES":
-        this.#ingestTrades(classified, receivedAt, receivedNs, normalized, anomalies);
+        this.#noteSnapshot(
+          COINBASE_CHANNELS.marketTrades,
+          this.#ingestTrades(classified, receivedAt, receivedNs, normalized, anomalies),
+          { receivedAt, sequenceNum, rawFrame: classified.text },
+          anomalies,
+        );
         break;
       case "TICKER":
-        this.#ingestTicker(classified, receivedAt, receivedNs, normalized, anomalies);
+        this.#noteSnapshot(
+          COINBASE_CHANNELS.ticker,
+          this.#ingestTicker(classified, receivedAt, receivedNs, normalized, anomalies),
+          { receivedAt, sequenceNum, rawFrame: classified.text },
+          anomalies,
+        );
         break;
     }
 
     this.#maybeResynchronize(receivedAt, feedEvents);
     return this.#finish(classified.kind, normalized, feedEvents, anomalies);
+  }
+
+  /**
+   * Records a socket callback that arrived from a connection the manager has
+   * already replaced.
+   *
+   * A transport can call back on a socket after that socket has been abandoned —
+   * a close that races a reconnect, an error delivered after the replacement
+   * opened. Acting on such a callback as though it belonged to the current
+   * connection would emit a `FeedDisconnected` for a connection that is still
+   * open, or restart a reconnect that is already in flight. Ignoring it silently
+   * is not an option either (§8.3), so it becomes a typed anomaly and nothing
+   * else: no feed event, no state change.
+   */
+  staleConnectionActivity(activity: {
+    readonly connectionId: string;
+    readonly callback: CoinbaseStaleCallback;
+    readonly detail?: string;
+  }): CoinbaseProcessorOutput {
+    const receivedAt = this.#wallClock.nowIso();
+    this.#counters.staleConnectionCallbacks += 1;
+    const suffix = activity.detail === undefined ? "" : `; ${activity.detail.slice(0, 200)}`;
+    return {
+      normalized: [],
+      feedEvents: [],
+      anomalies: [
+        this.#anomaly(
+          "COINBASE_STALE_CONNECTION_ACTIVITY",
+          `${activity.callback} arrived from connection "${activity.connectionId.slice(0, 64)}", which is not the current connection "${this.#connectionId === "" ? "<none>" : this.#connectionId.slice(0, 64)}"; it is recorded and otherwise ignored, because acting on it would describe the current connection with a superseded one's event${suffix}`,
+          { receivedAt },
+        ),
+      ],
+      requiresResubscription: this.#gapOpen,
+    };
   }
 
   /**
@@ -522,13 +699,64 @@ export class CoinbaseStreamProcessor {
     this.#topOfBook.newGeneration();
   }
 
-  #recordChannel(channel: string, receivedAt: string, venueTimestamp: string, ns: bigint): void {
-    const state = this.#channelState.get(channel) ?? { framesReceived: 0 };
+  /**
+   * Records that a frame arrived on a channel.
+   *
+   * `venueTimestamp` is `undefined` when the frame's own timestamp failed
+   * validation. It is then cleared rather than left at the previous frame's
+   * value: `lastVenueTimestamp` describes the LAST frame on the channel, and
+   * carrying an older frame's time forward would answer a question about this
+   * frame with an answer about a different one. The receipt time and the frame
+   * count still advance, so the frame remains accounted for.
+   */
+  #recordChannel(
+    channel: string,
+    receivedAt: string,
+    venueTimestamp: string | undefined,
+    ns: bigint,
+  ): void {
+    const state: ChannelState = this.#channelState.get(channel) ?? {
+      framesReceived: 0,
+      lastVenueTimestamp: undefined,
+    };
     state.framesReceived += 1;
     state.lastMessageAt = receivedAt;
     state.lastVenueTimestamp = venueTimestamp;
     state.lastFrameNs = ns;
     this.#channelState.set(channel, state);
+  }
+
+  /**
+   * Decides whether a channel's snapshot may count towards closing a gap.
+   *
+   * The whole point of the check: a channel is marked satisfied only after its
+   * snapshot has been applied in full. Before this existed, receipt of a
+   * `snapshot`-typed event was enough, so a snapshot whose every entry the
+   * adapter refused still satisfied its channel and could produce a
+   * `FeedResynchronized` carrying `authoritativeSnapshotApplied: true` when no
+   * authoritative state had been applied at all.
+   */
+  #noteSnapshot(
+    channel: CoinbaseChannel,
+    application: CoinbaseSnapshotApplication,
+    where: { readonly receivedAt: string; readonly sequenceNum: number; readonly rawFrame: string },
+    anomalies: CoinbaseAnomaly[],
+  ): void {
+    if (!application.seen) {
+      return;
+    }
+    if (application.fullyApplied) {
+      this.#snapshotSeen.add(channel);
+      return;
+    }
+    this.#counters.snapshotsNotApplied += 1;
+    anomalies.push(
+      this.#anomaly(
+        "COINBASE_SNAPSHOT_NOT_APPLIED",
+        `the ${channel} snapshot carried at least one entry this adapter had to refuse, so it is not an authoritative statement of current state: ${channel} is NOT recorded as resynchronized on subscription generation ${String(this.#generation)}, and any open gap stays open until a snapshot arrives that applies in full`,
+        { receivedAt: where.receivedAt, channel, sequenceNum: where.sequenceNum, rawFrame: where.rawFrame },
+      ),
+    );
   }
 
   #observeSequence(
@@ -575,28 +803,47 @@ export class CoinbaseStreamProcessor {
   ): void {
     for (const event of classified.frame.events) {
       const observation = this.#heartbeat.observe(event.heartbeat_counter);
-      if (observation.kind !== "GAP") {
-        continue;
-      }
-      this.#counters.heartbeatGaps += 1;
-      anomalies.push(
-        this.#anomaly(
-          "COINBASE_HEARTBEAT_GAP",
-          `heartbeat_counter jumped from ${String(observation.expected - 1)} to ${String(observation.received)}; the venue publishes this counter precisely so ${String(observation.missing)} missed message(s) are detectable`,
-          {
-            receivedAt,
-            channel: COINBASE_CHANNELS.heartbeats,
-            sequenceNum: classified.frame.sequence_num,
-            rawFrame: classified.text,
-          },
-        ),
-      );
-      this.#openGap(
+      const where = {
         receivedAt,
-        "COINBASE_HEARTBEAT_GAP",
-        `heartbeat_counter skipped ${String(observation.missing)} heartbeat(s)`,
-        feedEvents,
-      );
+        channel: COINBASE_CHANNELS.heartbeats,
+        sequenceNum: classified.frame.sequence_num,
+        rawFrame: classified.text,
+      };
+      // Every arm is decided explicitly. `FIRST` and `IN_ORDER` are the
+      // documented once-a-second increment and need no report; the other two do,
+      // and a `continue` for "anything that is not a gap" is how a repeated or
+      // regressed counter used to pass without one.
+      switch (observation.kind) {
+        case "FIRST":
+        case "IN_ORDER":
+          break;
+        case "REGRESSED":
+          this.#counters.heartbeatRegressions += 1;
+          anomalies.push(
+            this.#anomaly(
+              "COINBASE_HEARTBEAT_REGRESSED",
+              `heartbeat_counter ${String(observation.received)} did not advance past ${String(observation.previous)}; the venue documents this counter as increasing once a second, so a repeat or a step backwards is a redelivered or out-of-order heartbeat. Nothing is provably missing, so no gap is claimed, and the baseline is left where it was so a later in-order heartbeat resumes cleanly`,
+              where,
+            ),
+          );
+          break;
+        case "GAP":
+          this.#counters.heartbeatGaps += 1;
+          anomalies.push(
+            this.#anomaly(
+              "COINBASE_HEARTBEAT_GAP",
+              `heartbeat_counter jumped from ${String(observation.expected - 1)} to ${String(observation.received)}; the venue publishes this counter precisely so ${String(observation.missing)} missed message(s) are detectable`,
+              where,
+            ),
+          );
+          this.#openGap(
+            receivedAt,
+            "COINBASE_HEARTBEAT_GAP",
+            `heartbeat_counter skipped ${String(observation.missing)} heartbeat(s)`,
+            feedEvents,
+          );
+          break;
+      }
     }
   }
 
@@ -606,7 +853,8 @@ export class CoinbaseStreamProcessor {
     receivedNs: bigint,
     normalized: CoinbaseNormalizedEvent[],
     anomalies: CoinbaseAnomaly[],
-  ): void {
+  ): CoinbaseSnapshotApplication {
+    const application: CoinbaseSnapshotApplication = { seen: false, fullyApplied: true };
     for (const event of classified.frame.events) {
       const unknownType = noteUnknownEventType(event.type, undefined);
       if (unknownType !== undefined) {
@@ -619,58 +867,91 @@ export class CoinbaseStreamProcessor {
           }),
         );
       }
-      if (event.type === "snapshot") {
-        this.#snapshotSeen.add(COINBASE_CHANNELS.marketTrades);
+      const isSnapshot = event.type === COINBASE_SNAPSHOT_EVENT_TYPE;
+      if (isSnapshot) {
+        application.seen = true;
       }
 
-      const context = this.#context(classified.frame.timestamp, event.type, classified.frame.sequence_num, receivedAt, receivedNs);
+      const where: CoinbaseEntryContext = {
+        context: this.#context(classified.frame.timestamp, event.type, classified.frame.sequence_num, receivedAt, receivedNs),
+        receivedAt,
+        sequenceNum: classified.frame.sequence_num,
+        rawFrame: classified.text,
+      };
       for (const trade of event.trades) {
-        if (!this.#trades.observe(trade.product_id, trade.trade_id)) {
-          this.#counters.tradesDuplicateSuppressed += 1;
-          anomalies.push(
-            this.#anomaly(
-              "COINBASE_DUPLICATE_TRADE",
-              `trade ${trade.trade_id} on ${trade.product_id} was already normalized on this feed; it is suppressed rather than emitted twice, and counted here`,
-              {
-                receivedAt,
-                channel: COINBASE_CHANNELS.marketTrades,
-                symbol: trade.product_id,
-                sequenceNum: classified.frame.sequence_num,
-                rawFrame: classified.text,
-              },
-            ),
-          );
-          continue;
+        const applied = this.#ingestOneTrade(trade, where, normalized, anomalies);
+        if (isSnapshot && !applied) {
+          application.fullyApplied = false;
         }
-
-        const outcome = normalizeTrade(trade, context);
-        for (const note of outcome.notes) {
-          anomalies.push(
-            this.#anomaly(note.code, note.detail, {
-              receivedAt,
-              channel: COINBASE_CHANNELS.marketTrades,
-              ...(note.symbol === undefined ? {} : { symbol: note.symbol }),
-              sequenceNum: classified.frame.sequence_num,
-              rawFrame: classified.text,
-            }),
-          );
-        }
-        if (!outcome.ok) {
-          anomalies.push(
-            this.#anomaly(outcome.code, outcome.detail, {
-              receivedAt,
-              channel: COINBASE_CHANNELS.marketTrades,
-              ...(outcome.symbol === undefined ? {} : { symbol: outcome.symbol }),
-              sequenceNum: classified.frame.sequence_num,
-              rawFrame: classified.text,
-            }),
-          );
-          continue;
-        }
-        this.#counters.tradesNormalized += 1;
-        normalized.push(outcome.value);
       }
     }
+    return application;
+  }
+
+  /**
+   * Ingests one trade.
+   *
+   * @returns whether the trade was APPLIED — normalized and emitted, or
+   * knowingly suppressed as one this feed already emitted. A trade the adapter
+   * refused is not applied.
+   */
+  #ingestOneTrade(
+    trade: CoinbaseMarketTrade,
+    where: CoinbaseEntryContext,
+    normalized: CoinbaseNormalizedEvent[],
+    anomalies: CoinbaseAnomaly[],
+  ): boolean {
+    if (this.#trades.isKnown(trade.product_id, trade.trade_id)) {
+      this.#counters.tradesDuplicateSuppressed += 1;
+      anomalies.push(
+        this.#anomaly(
+          "COINBASE_DUPLICATE_TRADE",
+          `trade ${trade.trade_id} on ${trade.product_id} was already normalized on this feed; it is suppressed rather than emitted twice, and counted here`,
+          {
+            receivedAt: where.receivedAt,
+            channel: COINBASE_CHANNELS.marketTrades,
+            symbol: trade.product_id,
+            sequenceNum: where.sequenceNum,
+            rawFrame: where.rawFrame,
+          },
+        ),
+      );
+      // Applied: the consumer already holds this trade, so a snapshot that
+      // restates it still establishes the state the snapshot describes.
+      return true;
+    }
+
+    const outcome = normalizeTrade(trade, where.context);
+    for (const note of outcome.notes) {
+      anomalies.push(
+        this.#anomaly(note.code, note.detail, {
+          receivedAt: where.receivedAt,
+          channel: COINBASE_CHANNELS.marketTrades,
+          ...(note.symbol === undefined ? {} : { symbol: note.symbol }),
+          sequenceNum: where.sequenceNum,
+          rawFrame: where.rawFrame,
+        }),
+      );
+    }
+    if (!outcome.ok) {
+      anomalies.push(
+        this.#anomaly(outcome.code, outcome.detail, {
+          receivedAt: where.receivedAt,
+          channel: COINBASE_CHANNELS.marketTrades,
+          ...(outcome.symbol === undefined ? {} : { symbol: outcome.symbol }),
+          sequenceNum: where.sequenceNum,
+          rawFrame: where.rawFrame,
+        }),
+      );
+      // The identity is NOT recorded. A refused trade was never emitted, so
+      // reserving its identity would make the venue's corrected copy of it look
+      // like a duplicate and suppress a trade nobody ever saw.
+      return false;
+    }
+    this.#trades.remember(trade.product_id, trade.trade_id);
+    this.#counters.tradesNormalized += 1;
+    normalized.push(outcome.value);
+    return true;
   }
 
   #ingestTicker(
@@ -679,7 +960,8 @@ export class CoinbaseStreamProcessor {
     receivedNs: bigint,
     normalized: CoinbaseNormalizedEvent[],
     anomalies: CoinbaseAnomaly[],
-  ): void {
+  ): CoinbaseSnapshotApplication {
+    const application: CoinbaseSnapshotApplication = { seen: false, fullyApplied: true };
     for (const event of classified.frame.events) {
       const unknownType = noteUnknownEventType(event.type, undefined);
       if (unknownType !== undefined) {
@@ -692,45 +974,73 @@ export class CoinbaseStreamProcessor {
           }),
         );
       }
-      if (event.type === "snapshot") {
-        this.#snapshotSeen.add(COINBASE_CHANNELS.ticker);
+      const isSnapshot = event.type === COINBASE_SNAPSHOT_EVENT_TYPE;
+      if (isSnapshot) {
+        application.seen = true;
       }
 
-      const context = this.#context(classified.frame.timestamp, event.type, classified.frame.sequence_num, receivedAt, receivedNs);
+      const where: CoinbaseEntryContext = {
+        context: this.#context(classified.frame.timestamp, event.type, classified.frame.sequence_num, receivedAt, receivedNs),
+        receivedAt,
+        sequenceNum: classified.frame.sequence_num,
+        rawFrame: classified.text,
+      };
       for (const ticker of event.tickers) {
-        const outcome = normalizeTopOfBook(ticker, context);
-        if (!outcome.ok) {
-          anomalies.push(
-            this.#anomaly(outcome.code, outcome.detail, {
-              receivedAt,
-              channel: COINBASE_CHANNELS.ticker,
-              ...(outcome.symbol === undefined ? {} : { symbol: outcome.symbol }),
-              sequenceNum: classified.frame.sequence_num,
-              rawFrame: classified.text,
-            }),
-          );
-          continue;
+        const applied = this.#ingestOneTicker(ticker, where, normalized, anomalies);
+        if (isSnapshot && !applied) {
+          application.fullyApplied = false;
         }
-        if (this.#topOfBook.observe(ticker.product_id, outcome.value.payload) === "UNCHANGED") {
-          this.#counters.topOfBookUnchangedSuppressed += 1;
-          anomalies.push(
-            this.#anomaly(
-              "COINBASE_TOP_OF_BOOK_UNCHANGED",
-              `ticker for ${ticker.product_id} restated the same best bid and ask; no ReferenceTopOfBookChanged is emitted because nothing changed, and the suppression is counted here`,
-              {
-                receivedAt,
-                channel: COINBASE_CHANNELS.ticker,
-                symbol: ticker.product_id,
-                sequenceNum: classified.frame.sequence_num,
-              },
-            ),
-          );
-          continue;
-        }
-        this.#counters.topOfBookNormalized += 1;
-        normalized.push(outcome.value);
       }
     }
+    return application;
+  }
+
+  /**
+   * Ingests one ticker entry.
+   *
+   * @returns whether the entry was APPLIED — emitted as a change, or knowingly
+   * suppressed because it restated the top of book already emitted.
+   */
+  #ingestOneTicker(
+    ticker: CoinbaseTicker,
+    where: CoinbaseEntryContext,
+    normalized: CoinbaseNormalizedEvent[],
+    anomalies: CoinbaseAnomaly[],
+  ): boolean {
+    const outcome = normalizeTopOfBook(ticker, where.context);
+    if (!outcome.ok) {
+      anomalies.push(
+        this.#anomaly(outcome.code, outcome.detail, {
+          receivedAt: where.receivedAt,
+          channel: COINBASE_CHANNELS.ticker,
+          ...(outcome.symbol === undefined ? {} : { symbol: outcome.symbol }),
+          sequenceNum: where.sequenceNum,
+          rawFrame: where.rawFrame,
+        }),
+      );
+      return false;
+    }
+    if (this.#topOfBook.observe(ticker.product_id, outcome.value.payload) === "UNCHANGED") {
+      this.#counters.topOfBookUnchangedSuppressed += 1;
+      anomalies.push(
+        this.#anomaly(
+          "COINBASE_TOP_OF_BOOK_UNCHANGED",
+          `ticker for ${ticker.product_id} restated the same best bid and ask; no ReferenceTopOfBookChanged is emitted because nothing changed, and the suppression is counted here`,
+          {
+            receivedAt: where.receivedAt,
+            channel: COINBASE_CHANNELS.ticker,
+            symbol: ticker.product_id,
+            sequenceNum: where.sequenceNum,
+          },
+        ),
+      );
+      // Applied: the consumer's top of book for this symbol already equals what
+      // the snapshot states.
+      return true;
+    }
+    this.#counters.topOfBookNormalized += 1;
+    normalized.push(outcome.value);
+    return true;
   }
 
   #context(
@@ -805,13 +1115,17 @@ export class CoinbaseStreamProcessor {
   }
 
   /**
-   * Closes an open gap once every declared channel has delivered a snapshot on
-   * the current generation.
+   * Closes an open gap once every declared channel has delivered a snapshot
+   * that was APPLIED IN FULL on the current generation.
    *
    * `FeedResynchronized.authoritativeSnapshotApplied` is pinned to `true` by the
    * contract precisely so this event cannot assert a recovery that did not
    * happen (ADR-002 §2.4). It is therefore emitted only when the venue's own
-   * `snapshot` events have arrived — never merely because a socket reopened.
+   * `snapshot` events have arrived AND every entry in them was applied — never
+   * merely because a socket reopened, and never because a snapshot-typed frame
+   * was seen. `#noteSnapshot` is what decides "applied"; a snapshot the adapter
+   * could not apply reports `COINBASE_SNAPSHOT_NOT_APPLIED` and leaves the gap
+   * open for the next one.
    *
    * What it does NOT claim: that missed trades were recovered. They were not,
    * and cannot be (U-CB-2). That fact has its own open incident.

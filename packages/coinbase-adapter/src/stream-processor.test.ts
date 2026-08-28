@@ -119,6 +119,33 @@ describe("lifecycle", () => {
     expect(build()).toEqual(build());
   });
 
+  it("records a superseded connection's callback without changing any state", () => {
+    const processor = new CoinbaseStreamProcessor(options());
+    processor.connectionOpened("c1");
+    processor.connectionClosed({ reasonCode: "COINBASE_SOCKET_CLOSED" });
+    processor.connectionOpened("c2");
+    const before = processor.metrics();
+
+    const output = processor.staleConnectionActivity({
+      connectionId: "c1",
+      callback: "onClose",
+      detail: "close code 1006",
+    });
+
+    expect(output.anomalies.map((anomaly) => anomaly.code)).toEqual([
+      "COINBASE_STALE_CONNECTION_ACTIVITY",
+    ]);
+    expect(output.anomalies[0]?.detail).toContain("c1");
+    expect(output.feedEvents).toHaveLength(0);
+    expect(output.normalized).toHaveLength(0);
+    const after = processor.metrics();
+    expect(after.connectionId).toBe(before.connectionId);
+    expect(after.subscriptionGeneration).toBe(before.subscriptionGeneration);
+    expect(after.connected).toBe(before.connected);
+    expect(after.counters.disconnections).toBe(before.counters.disconnections);
+    expect(after.counters.staleConnectionCallbacks).toBe(1);
+  });
+
   it("counts frames received even when they cannot be read", () => {
     const processor = new CoinbaseStreamProcessor(options());
     processor.connectionOpened("c1");

@@ -11,7 +11,12 @@ import { describe, expect, it } from "vitest";
 
 import { classifyFrame } from "@polymarket-bot/coinbase-adapter";
 
-import { FIXTURES, frameText } from "./fixtures.js";
+import {
+  FIXTURES,
+  frameText,
+  frameTextWithSequence,
+  frameTextWithTimestamp,
+} from "./fixtures.js";
 import { anomalyCodes, createHarness, tops, trades } from "./harness.js";
 
 describe("frames the adapter cannot read", () => {
@@ -121,6 +126,126 @@ describe("values outside a documented enumeration", () => {
     // true because the control frame advanced the baseline.
     const next = harness.processor.ingestFrame(frameText("market-trades-update"));
     expect(anomalyCodes(next)).not.toContain("COINBASE_SEQUENCE_GAP");
+  });
+});
+
+describe("envelope timestamps outside the documented RFC 3339 form", () => {
+  it("reports a market_trades envelope time, keeps the trade, and refuses it as venue time", () => {
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    const output = harness.processor.ingestFrame(frameText("malformed-envelope-timestamp"));
+
+    expect(anomalyCodes(output)).toEqual(["COINBASE_TIMESTAMP_INVALID"]);
+    expect(output.anomalies[0]?.channel).toBe("market_trades");
+    expect(output.anomalies[0]?.rawFrame).toBe(frameText("malformed-envelope-timestamp"));
+
+    // The trade survives: discarding real market data over a misspelled
+    // publication time would be the worse failure.
+    const [trade] = trades(output);
+    expect(trade?.payload.venueTradeId).toBe("000000001");
+    // `venueTimestamp` is the trade's own time, which IS valid.
+    expect(trade?.envelope.venueTimestamp).toBe("2019-08-14T20:42:28.265Z");
+    // The bad value is preserved verbatim as raw venue detail — that is a
+    // record of what arrived, not a claim that it is a timestamp.
+    expect(trade?.venueDetail.venueMessageTime).toBe(
+      "2023-02-09 20:19:36.100000000 +0000 UTC m=+91717.525857105",
+    );
+
+    // It is NOT recorded as the channel's venue time, which would be such a
+    // claim: `lastVenueTimestamp` is typed as the venue's own time.
+    const channel = harness.processor.metrics().perChannel[0];
+    expect(channel?.channel).toBe("market_trades");
+    expect(channel?.lastVenueTimestamp).toBeUndefined();
+    // The frame is still fully accounted for.
+    expect(channel?.lastMessageAt).toBe("2026-08-27T12:00:00.000Z");
+    expect(channel?.framesReceived).toBe(1);
+  });
+
+  it("reports it on a heartbeat frame", () => {
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    const output = harness.processor.ingestFrame(
+      frameTextWithTimestamp("heartbeats", "2023-06-23 20:31:26 +0000 UTC"),
+    );
+
+    expect(anomalyCodes(output)).toEqual(["COINBASE_TIMESTAMP_INVALID"]);
+    expect(harness.processor.metrics().perChannel[0]?.lastVenueTimestamp).toBeUndefined();
+    expect(harness.processor.metrics().counters.heartbeatsReceived).toBe(1);
+  });
+
+  it("reports it on a subscriptions control frame", () => {
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    const output = harness.processor.ingestFrame(
+      frameTextWithTimestamp("subscriptions-ack", "2026-13-45"),
+    );
+
+    // A control frame carries no market data, so before this check it was the
+    // quietest way an unvalidated string could reach the metrics.
+    expect(output.classification).toBe("CONTROL");
+    expect(anomalyCodes(output)).toEqual(["COINBASE_TIMESTAMP_INVALID"]);
+    expect(harness.processor.metrics().perChannel[0]?.lastVenueTimestamp).toBeUndefined();
+  });
+
+  it("records a valid envelope time unchanged", () => {
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    const output = harness.processor.ingestFrame(frameText("market-trades-snapshot"));
+
+    expect(anomalyCodes(output)).not.toContain("COINBASE_TIMESTAMP_INVALID");
+    expect(harness.processor.metrics().perChannel[0]?.lastVenueTimestamp).toBe(
+      "2023-02-09T20:19:35.39625135Z",
+    );
+  });
+});
+
+describe("a heartbeat_counter that does not advance", () => {
+  it("reports a repeated counter without claiming a gap", () => {
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    harness.processor.ingestFrame(frameText("heartbeats"));
+
+    // The same heartbeat_counter, on the next sequence_num: a redelivered or
+    // duplicated heartbeat.
+    const repeat = harness.processor.ingestFrame(frameTextWithSequence("heartbeats", 1));
+
+    expect(anomalyCodes(repeat)).toEqual(["COINBASE_HEARTBEAT_REGRESSED"]);
+    // Nothing is provably missing, so no gap is claimed and no resubscription
+    // is forced — but the venue's documented once-a-second increment did not
+    // happen, and that is not silently acceptable either.
+    expect(repeat.feedEvents).toHaveLength(0);
+    expect(repeat.requiresResubscription).toBe(false);
+    const counters = harness.processor.metrics().counters;
+    expect(counters.heartbeatGaps).toBe(0);
+    expect(counters.heartbeatRegressions).toBe(1);
+    expect(counters.heartbeatsReceived).toBe(2);
+  });
+
+  it("reports a counter that moved backwards", () => {
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    // `heartbeats-gap` carries sequence_num 1 and heartbeat_counter 3051; as the
+    // first frame it establishes both baselines. The next frame advances
+    // sequence_num to 2 — so the connection counter is in order — while its
+    // heartbeat_counter of 3049 steps backwards. The two counters are
+    // independent facts and only one of them is wrong here.
+    harness.processor.ingestFrame(frameText("heartbeats-gap"));
+    const backwards = harness.processor.ingestFrame(frameTextWithSequence("heartbeats", 2));
+
+    expect(anomalyCodes(backwards)).toEqual(["COINBASE_HEARTBEAT_REGRESSED"]);
+    expect(backwards.anomalies[0]?.channel).toBe("heartbeats");
+    expect(backwards.anomalies[0]?.rawFrame).toBe(frameTextWithSequence("heartbeats", 2));
+    expect(harness.processor.metrics().counters.heartbeatGaps).toBe(0);
+  });
+
+  it("still reports a forward jump as a gap", () => {
+    // The guard above must not have turned heartbeat gap detection off.
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    harness.processor.ingestFrame(frameText("heartbeats"));
+    const gapped = harness.processor.ingestFrame(frameText("heartbeats-gap"));
+    expect(anomalyCodes(gapped)).toEqual(["COINBASE_HEARTBEAT_GAP"]);
+    expect(harness.processor.metrics().counters.heartbeatRegressions).toBe(0);
   });
 });
 

@@ -86,6 +86,55 @@ describe("duplicate trades", () => {
     expect(anomalyCodes(output)).not.toContain("COINBASE_DUPLICATE_TRADE");
   });
 
+  it("does not let a REFUSED trade reserve its identity", () => {
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+
+    // The venue's first copy of trade 000000042 carries an empty price, which
+    // the decimal boundary refuses (U-CB-1). Nothing was emitted for it.
+    const refused = harness.processor.ingestFrame(frameText("malformed-snapshot-empty-price"));
+    expect(anomalyCodes(refused)).toContain("COINBASE_ECONOMIC_FIELD_INVALID");
+    expect(trades(refused)).toHaveLength(0);
+
+    // The venue redelivers the same trade with a usable price. Calling this a
+    // duplicate would suppress a real trade that no version of was ever emitted
+    // — a silent drop wearing a duplicate's label.
+    const corrected = harness.processor.ingestFrame(frameText("market-trades-corrected-price"));
+    expect(anomalyCodes(corrected)).not.toContain("COINBASE_DUPLICATE_TRADE");
+    expect(trades(corrected)).toHaveLength(1);
+    expect(trades(corrected)[0]?.payload.venueTradeId).toBe("000000042");
+    expect(trades(corrected)[0]?.payload.price).toBe("1260.09");
+
+    const metrics = harness.processor.metrics();
+    expect(metrics.counters.tradesNormalized).toBe(1);
+    expect(metrics.counters.tradesDuplicateSuppressed).toBe(0);
+  });
+
+  it("reports a refused trade again rather than calling the second copy a duplicate", () => {
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    harness.processor.ingestFrame(frameText("malformed-snapshot-empty-price"));
+
+    const again = harness.processor.ingestFrame(
+      frameTextWithSequence("malformed-snapshot-empty-price", 1),
+    );
+    // Two refused copies are two refusals. Reporting the second as a duplicate
+    // would claim the trade had been normalized once, which it never was.
+    expect(anomalyCodes(again)).toContain("COINBASE_ECONOMIC_FIELD_INVALID");
+    expect(anomalyCodes(again)).not.toContain("COINBASE_DUPLICATE_TRADE");
+    expect(harness.processor.metrics().counters.tradesDuplicateSuppressed).toBe(0);
+  });
+
+  it("still suppresses the second copy of a trade that WAS normalized", () => {
+    // The guard above must not have turned duplicate suppression off.
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    harness.processor.ingestFrame(frameText("market-trades-snapshot"));
+    const repeat = harness.processor.ingestFrame(frameText("market-trades-duplicate"));
+    expect(anomalyCodes(repeat)).toContain("COINBASE_DUPLICATE_TRADE");
+    expect(trades(repeat)).toHaveLength(0);
+  });
+
   it("bounds the dedupe window, and re-emits rather than suppressing beyond it", () => {
     const harness = createHarness({ tradeDedupeCapacity: 1 });
     harness.processor.connectionOpened("c1");

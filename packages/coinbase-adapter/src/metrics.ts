@@ -45,6 +45,13 @@ export type CoinbaseFeedCounters = {
   readonly framesRejected: number;
   /** Well-formed frames on a channel this adapter does not handle. */
   readonly framesUnknownChannel: number;
+  /**
+   * Frames delivered by a connection that is no longer current, and therefore
+   * refused rather than relabelled with the current generation.
+   */
+  readonly framesFromStaleConnection: number;
+  /** `onOpen` / `onClose` / `onError` callbacks from a superseded connection. */
+  readonly staleConnectionCallbacks: number;
   readonly tradesNormalized: number;
   /** Trades recognized as already-seen and therefore not re-emitted. */
   readonly tradesDuplicateSuppressed: number;
@@ -58,6 +65,13 @@ export type CoinbaseFeedCounters = {
   readonly sequenceRegressions: number;
   /** `heartbeat_counter` forward jumps. */
   readonly heartbeatGaps: number;
+  /** `heartbeat_counter` repeats or backward steps. Not a gap; still reported. */
+  readonly heartbeatRegressions: number;
+  /**
+   * `snapshot` events that could not be applied in full, and therefore did not
+   * mark their channel resynchronized.
+   */
+  readonly snapshotsNotApplied: number;
   readonly connectionsOpened: number;
   readonly disconnections: number;
   /** Resubscriptions; equals the highest `subscriptionGeneration` reached. */

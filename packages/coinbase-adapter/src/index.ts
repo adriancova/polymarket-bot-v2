@@ -121,8 +121,10 @@ export {
   CoinbaseStreamProcessor,
   DEFAULT_STALENESS_THRESHOLD_MS,
   type CoinbaseFeedEvent,
+  type CoinbaseFrameOrigin,
   type CoinbaseIngestResult,
   type CoinbaseProcessorOutput,
+  type CoinbaseStaleCallback,
   type CoinbaseStreamProcessorOptions,
 } from "./stream-processor.js";
 

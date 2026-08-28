@@ -11,36 +11,62 @@ import {
 describe("CoinbaseTradeDeduplicator", () => {
   it("accepts a trade once", () => {
     const dedupe = new CoinbaseTradeDeduplicator();
-    expect(dedupe.observe("ETH-USD", "t1")).toBe(true);
-    expect(dedupe.observe("ETH-USD", "t1")).toBe(false);
+    expect(dedupe.isKnown("ETH-USD", "t1")).toBe(false);
+    dedupe.remember("ETH-USD", "t1");
+    expect(dedupe.isKnown("ETH-USD", "t1")).toBe(true);
     expect(dedupe.size).toBe(1);
+  });
+
+  it("does not reserve an identity merely by asking about it", () => {
+    // The whole reason the question and the record are separate calls: a caller
+    // that asks and then FAILS to normalize the trade must leave the window
+    // untouched, so the venue's corrected copy is still emitted.
+    const dedupe = new CoinbaseTradeDeduplicator();
+    expect(dedupe.isKnown("ETH-USD", "t1")).toBe(false);
+    expect(dedupe.isKnown("ETH-USD", "t1")).toBe(false);
+    expect(dedupe.size).toBe(0);
   });
 
   it("keys on the product as well as the trade id", () => {
     const dedupe = new CoinbaseTradeDeduplicator();
-    expect(dedupe.observe("ETH-USD", "t1")).toBe(true);
+    dedupe.remember("ETH-USD", "t1");
     // Nothing documents that trade ids are unique across products, so assuming
     // it would silently discard a real trade on another market.
-    expect(dedupe.observe("BTC-USD", "t1")).toBe(true);
+    expect(dedupe.isKnown("BTC-USD", "t1")).toBe(false);
   });
 
   it("cannot be confused by a key that spans the separator", () => {
     const dedupe = new CoinbaseTradeDeduplicator();
-    expect(dedupe.observe("A B", "C")).toBe(true);
-    expect(dedupe.observe("A", "B C")).toBe(true);
+    dedupe.remember("A B", "C");
+    expect(dedupe.isKnown("A", "B C")).toBe(false);
+    expect(dedupe.isKnown("A B", "C")).toBe(true);
   });
 
   it("is bounded, evicting oldest first", () => {
     const dedupe = new CoinbaseTradeDeduplicator(2);
-    dedupe.observe("P", "1");
-    dedupe.observe("P", "2");
+    dedupe.remember("P", "1");
+    dedupe.remember("P", "2");
     expect(dedupe.size).toBe(2);
-    dedupe.observe("P", "3");
+    dedupe.remember("P", "3");
     expect(dedupe.size).toBe(2);
     // "1" was evicted, so it is emitted again rather than suppressed. Emitting a
     // duplicate is visible downstream; suppressing a real trade is not.
-    expect(dedupe.observe("P", "1")).toBe(true);
-    expect(dedupe.observe("P", "3")).toBe(false);
+    expect(dedupe.isKnown("P", "1")).toBe(false);
+    expect(dedupe.isKnown("P", "3")).toBe(true);
+  });
+
+  it("does not move a known identity in the eviction order when remembered again", () => {
+    const dedupe = new CoinbaseTradeDeduplicator(2);
+    dedupe.remember("P", "1");
+    dedupe.remember("P", "2");
+    // A redelivered snapshot re-remembers "1"; that must not evict "2" or push
+    // "1" to the back, or the window would stop being first-seen FIFO.
+    dedupe.remember("P", "1");
+    expect(dedupe.size).toBe(2);
+    dedupe.remember("P", "3");
+    expect(dedupe.isKnown("P", "1")).toBe(false);
+    expect(dedupe.isKnown("P", "2")).toBe(true);
+    expect(dedupe.isKnown("P", "3")).toBe(true);
   });
 
   it("refuses a capacity that is not a positive safe integer", () => {

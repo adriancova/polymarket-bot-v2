@@ -17,10 +17,29 @@ import {
   ManualMonotonicClock,
   ManualTimer,
   ManualWallClock,
+  type FakeCoinbaseSocket,
 } from "@polymarket-bot/coinbase-adapter/testing";
 
 import { frameText, frameTextWithSequence } from "./fixtures.js";
 import { anomalyCodes, createHarness, feedEvent, feedEventTypes, tops, trades } from "./harness.js";
+
+/**
+ * The socket at a given position, failing loudly rather than silently no-opping.
+ *
+ * `factory.current` is the newest socket; these tests deliberately reach back to
+ * an OLDER one, because that is the case under test.
+ */
+function socketAt(factory: FakeCoinbaseSocketFactory, index: number): FakeCoinbaseSocket {
+  const socket = factory.sockets[index];
+  if (socket === undefined) {
+    throw new Error(`expected a socket at index ${String(index)}; ${String(factory.sockets.length)} were opened`);
+  }
+  return socket;
+}
+
+function anomalyCodesOf(outputs: readonly CoinbaseFeedOutput[]): string[] {
+  return outputs.flatMap((output) => output.anomalies.map((anomaly) => anomaly.code));
+}
 
 describe("reconnect, at the processor", () => {
   it("does not claim a gap on the first connection", () => {
@@ -77,6 +96,130 @@ describe("reconnect, at the processor", () => {
     expect(resync.payload.authoritativeSnapshotApplied).toBe(true);
     expect(resync.payload.subscriptionGeneration).toBe(1);
     expect(harness.processor.gapOpen).toBe(false);
+  });
+
+  it("does not accept a snapshot it could not apply as an authoritative snapshot", () => {
+    const harness = createHarness({ channels: ["market_trades"] });
+    harness.processor.connectionOpened("c1");
+    harness.processor.connectionClosed({ reasonCode: "COINBASE_SOCKET_CLOSED" });
+    harness.processor.connectionOpened("c2");
+
+    // Its one trade carries an empty price, which the decimal boundary refuses.
+    // Receipt of a `snapshot`-typed frame is therefore NOT enough: nothing
+    // authoritative was applied, so claiming
+    // `authoritativeSnapshotApplied: true` would be a false statement about
+    // recovery (ADR-002 §2.4).
+    const refused = harness.processor.ingestFrame(frameText("malformed-snapshot-empty-price"));
+    expect(anomalyCodes(refused)).toEqual([
+      "COINBASE_ECONOMIC_FIELD_INVALID",
+      "COINBASE_SNAPSHOT_NOT_APPLIED",
+    ]);
+    expect(trades(refused)).toHaveLength(0);
+    expect(feedEventTypes(refused)).not.toContain("FeedResynchronized");
+    expect(harness.processor.gapOpen).toBe(true);
+    expect(harness.processor.metrics().counters.resynchronizations).toBe(0);
+
+    // Recovery must still be possible: the next snapshot that DOES apply closes
+    // the gap, so the refusal delays resynchronization rather than blocking it.
+    const applied = harness.processor.ingestFrame(
+      frameTextWithSequence("market-trades-snapshot", 1),
+    );
+    expect(feedEvent(applied, "FeedResynchronized").payload.authoritativeSnapshotApplied).toBe(true);
+    expect(harness.processor.gapOpen).toBe(false);
+  });
+
+  it("does not let one channel's valid snapshot close a gap the other channel has not closed", () => {
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    harness.processor.connectionClosed({ reasonCode: "COINBASE_SOCKET_CLOSED" });
+    harness.processor.connectionOpened("c2");
+
+    const refusedTrades = harness.processor.ingestFrame(
+      frameText("malformed-snapshot-empty-price"),
+    );
+    expect(anomalyCodes(refusedTrades)).toContain("COINBASE_SNAPSHOT_NOT_APPLIED");
+
+    const ticker = harness.processor.ingestFrame(frameTextWithSequence("ticker-snapshot", 1));
+    expect(tops(ticker)).toHaveLength(1);
+    // The ticker snapshot is authoritative for the ticker channel and for
+    // nothing else. The gap covers both channels, so it stays open.
+    expect(feedEventTypes(ticker)).not.toContain("FeedResynchronized");
+    expect(harness.processor.gapOpen).toBe(true);
+
+    const closed = harness.processor.ingestFrame(
+      frameTextWithSequence("market-trades-snapshot", 2),
+    );
+    expect(feedEvent(closed, "FeedResynchronized").payload.subscriptionGeneration).toBe(1);
+  });
+
+  it("counts a snapshot of trades it has already emitted as applied", () => {
+    // The opposite failure, guarded: on a reconnect the venue replays trades
+    // that are already in the dedupe window, so every entry is suppressed as a
+    // duplicate. If suppression counted as "not applied", the gap could never
+    // close, the processor would demand a resubscription for ever, and the
+    // manager would reconnect in a loop.
+    const harness = createHarness({ channels: ["market_trades"] });
+    harness.processor.connectionOpened("c1");
+    harness.processor.ingestFrame(frameText("market-trades-snapshot"));
+    harness.processor.connectionClosed({ reasonCode: "COINBASE_SOCKET_CLOSED" });
+    harness.processor.connectionOpened("c2");
+
+    const replay = harness.processor.ingestFrame(frameText("market-trades-snapshot"));
+    expect(anomalyCodes(replay)).toContain("COINBASE_DUPLICATE_TRADE");
+    expect(anomalyCodes(replay)).not.toContain("COINBASE_SNAPSHOT_NOT_APPLIED");
+    expect(feedEvent(replay, "FeedResynchronized").payload.authoritativeSnapshotApplied).toBe(true);
+    expect(harness.processor.gapOpen).toBe(false);
+  });
+
+  it("refuses a frame delivered by a connection it has already replaced", () => {
+    const harness = createHarness({ channels: ["market_trades"] });
+    harness.processor.connectionOpened("c1");
+    harness.processor.connectionClosed({ reasonCode: "COINBASE_SOCKET_CLOSED" });
+    harness.processor.connectionOpened("c2");
+
+    const stale = harness.processor.ingestFrame(frameText("market-trades-snapshot"), {
+      connectionId: "c1",
+    });
+
+    expect(anomalyCodes(stale)).toEqual(["COINBASE_STALE_CONNECTION_ACTIVITY"]);
+    expect(stale.anomalies[0]?.rawFrame).toBe(frameText("market-trades-snapshot"));
+    expect(trades(stale)).toHaveLength(0);
+    // The frame is a `snapshot`, so before the origin check existed it would
+    // also have closed the very gap the reconnect opened.
+    expect(feedEventTypes(stale)).not.toContain("FeedResynchronized");
+    expect(harness.processor.gapOpen).toBe(true);
+    expect(harness.processor.metrics().counters.framesFromStaleConnection).toBe(1);
+    expect(harness.processor.metrics().counters.tradesNormalized).toBe(0);
+  });
+
+  it("accepts the same frame when it comes from the current connection", () => {
+    const harness = createHarness({ channels: ["market_trades"] });
+    harness.processor.connectionOpened("c1");
+    harness.processor.connectionClosed({ reasonCode: "COINBASE_SOCKET_CLOSED" });
+    harness.processor.connectionOpened("c2");
+
+    const current = harness.processor.ingestFrame(frameText("market-trades-snapshot"), {
+      connectionId: "c2",
+    });
+    expect(trades(current)).toHaveLength(1);
+    expect(trades(current)[0]?.envelope.connectionId).toBe("c2");
+    expect(trades(current)[0]?.envelope.subscriptionGeneration).toBe(1);
+    expect(harness.processor.metrics().counters.framesFromStaleConnection).toBe(0);
+  });
+
+  it("does not let a stale frame stand in for liveness on the current connection", () => {
+    const harness = createHarness({ stalenessThresholdMs: 1_000 });
+    harness.processor.connectionOpened("c1");
+    harness.processor.connectionClosed({ reasonCode: "COINBASE_SOCKET_CLOSED" });
+    harness.processor.connectionOpened("c2");
+
+    harness.advanceMs(2_000);
+    harness.processor.ingestFrame(frameText("heartbeats"), { connectionId: "c1" });
+
+    // A frame from a dead socket says nothing about whether the current one is
+    // alive; letting it reset the clock would hide exactly the stall the bound
+    // exists to catch.
+    expect(feedEventTypes(harness.processor.pollStaleness())).toEqual(["FeedStale"]);
   });
 
   it("does not accept an undocumented event type as an authoritative snapshot", () => {
@@ -245,6 +388,83 @@ describe("reconnect, at the connection manager", () => {
     expect(factory.sockets).toHaveLength(1);
     timer.advanceMs(1);
     expect(factory.sockets).toHaveLength(2);
+    manager.stop();
+  });
+
+  it("refuses a frame delivered late by a socket it has already replaced", () => {
+    const { manager, factory, timer, outputs } = build();
+    manager.start();
+    const first = socketAt(factory, 0);
+    first.open();
+    first.dropConnection();
+    timer.advanceMs(1_000);
+    socketAt(factory, 1).open();
+
+    outputs.length = 0;
+    // A frame that was in flight when the first socket died is delivered after
+    // the replacement is already open. The listener belongs to the old socket.
+    first.listener.onFrame(frameText("market-trades-snapshot"));
+
+    expect(anomalyCodesOf(outputs)).toEqual(["COINBASE_STALE_CONNECTION_ACTIVITY"]);
+    expect(outputs.flatMap((output) => output.normalized)).toHaveLength(0);
+    expect(outputs.flatMap(feedEventTypes)).toEqual([]);
+    // It must not close the gap the reconnect opened, and it must not be
+    // published under the new connection's generation.
+    expect(manager.metrics().gapOpen).toBe(true);
+    expect(manager.metrics().counters.tradesNormalized).toBe(0);
+    expect(manager.metrics().counters.framesFromStaleConnection).toBe(1);
+    manager.stop();
+  });
+
+  it("does not report a superseded socket's late close as the live connection's disconnect", () => {
+    const { manager, factory, timer, outputs } = build();
+    manager.start();
+    const first = socketAt(factory, 0);
+    first.open();
+    first.dropConnection();
+    timer.advanceMs(1_000);
+    socketAt(factory, 1).open();
+
+    outputs.length = 0;
+    first.listener.onClose({ code: 1006, reason: "late close from the old socket" });
+
+    // A FeedDisconnected here would describe the connection that is currently
+    // open as having gone away.
+    expect(outputs.flatMap(feedEventTypes)).toEqual([]);
+    expect(anomalyCodesOf(outputs)).toEqual(["COINBASE_STALE_CONNECTION_ACTIVITY"]);
+    expect(manager.metrics().counters.disconnections).toBe(1);
+
+    // And it must not have scheduled a second reconnect racing the live socket.
+    timer.advanceMs(60_000);
+    expect(factory.sockets).toHaveLength(2);
+    manager.stop();
+  });
+
+  it("ignores a late error from a superseded socket instead of folding it into the next close", () => {
+    const { manager, factory, timer, outputs } = build();
+    manager.start();
+    const first = socketAt(factory, 0);
+    first.open();
+    first.dropConnection();
+    timer.advanceMs(1_000);
+    const second = socketAt(factory, 1);
+    second.open();
+
+    outputs.length = 0;
+    first.listener.onError(new Error("old socket, late error"));
+    expect(anomalyCodesOf(outputs)).toEqual(["COINBASE_STALE_CONNECTION_ACTIVITY"]);
+
+    outputs.length = 0;
+    second.dropConnection(1006, "unrelated");
+    const disconnected = outputs
+      .flatMap((output) => output.feedEvents)
+      .find((event) => event.eventType === "FeedDisconnected");
+    // The old socket's error belongs to the old socket. Attributing it to this
+    // close would blame the wrong connection for the wrong failure.
+    expect(disconnected?.eventType).toBe("FeedDisconnected");
+    if (disconnected?.eventType === "FeedDisconnected") {
+      expect(disconnected.payload.detail ?? "").not.toContain("late error");
+    }
     manager.stop();
   });
 

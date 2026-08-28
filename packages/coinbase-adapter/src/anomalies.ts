@@ -71,6 +71,38 @@ export type CoinbaseAnomalyCode =
   | "COINBASE_TOP_OF_BOOK_UNCHANGED"
   /** `heartbeat_counter` skipped: messages were missed even though none arrived. */
   | "COINBASE_HEARTBEAT_GAP"
+  /**
+   * `heartbeat_counter` repeated or moved backwards.
+   *
+   * Distinct from `COINBASE_SEQUENCE_REGRESSED`, which is about `sequence_num`:
+   * the two counters are independent facts and a consumer that saw only one code
+   * could not tell which of them stopped advancing. A non-advancing heartbeat is
+   * not a gap — nothing is provably missing — but it is not the documented
+   * once-a-second increment either, so it is reported rather than skipped.
+   */
+  | "COINBASE_HEARTBEAT_REGRESSED"
+  /**
+   * A `snapshot` event arrived but could not be applied in full, so it did not
+   * close a gap.
+   *
+   * `FeedResynchronized.authoritativeSnapshotApplied` is pinned to the literal
+   * `true` (ADR-002 §2.4), so the adapter may only emit that event when an
+   * authoritative snapshot really was applied. A snapshot with an entry the
+   * adapter had to reject is not one, and the reason the gap stayed open has to
+   * be visible rather than inferred from the absence of an event.
+   */
+  | "COINBASE_SNAPSHOT_NOT_APPLIED"
+  /**
+   * A socket callback or frame arrived from a connection that is no longer the
+   * current one.
+   *
+   * Relabelling such a frame with the current `connectionId` and
+   * `subscriptionGeneration` would attribute old-generation data to the new
+   * generation — precisely the provenance ADR-002 §2.4 makes the generation
+   * carry. The frame is therefore refused, and reported with the raw bytes so
+   * nothing is lost in silence.
+   */
+  | "COINBASE_STALE_CONNECTION_ACTIVITY"
   /** No frame has arrived for longer than the configured staleness bound. */
   | "COINBASE_FEED_STALE"
   /**
@@ -127,6 +159,9 @@ export const COINBASE_ANOMALY_SEVERITY: Readonly<Record<CoinbaseAnomalyCode, Inc
   COINBASE_DUPLICATE_TRADE: "LOG",
   COINBASE_TOP_OF_BOOK_UNCHANGED: "LOG",
   COINBASE_HEARTBEAT_GAP: "PAGE",
+  COINBASE_HEARTBEAT_REGRESSED: "NOTIFY",
+  COINBASE_SNAPSHOT_NOT_APPLIED: "NOTIFY",
+  COINBASE_STALE_CONNECTION_ACTIVITY: "NOTIFY",
   COINBASE_FEED_STALE: "NOTIFY",
   COINBASE_TRADE_HISTORY_NOT_BACKFILLED: "NOTIFY",
 };

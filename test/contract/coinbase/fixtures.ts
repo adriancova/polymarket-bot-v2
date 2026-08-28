@@ -212,3 +212,23 @@ export function frameTextWithSequence(id: string, sequenceNum: number): string {
     sequence_num: sequenceNum,
   });
 }
+
+/**
+ * The fixture's frame with a different envelope `timestamp`.
+ *
+ * Same purpose as {@link frameTextWithSequence}: one documented frame with one
+ * envelope field replaced, done visibly in code rather than by forking the
+ * fixture. Used where the assertion is only about the envelope's own time — the
+ * channel's payload is irrelevant to it, so a dedicated fixture per channel
+ * would add a file and no evidence.
+ */
+export function frameTextWithTimestamp(id: string, timestamp: string): string {
+  const found = fixture(id);
+  if (found.frame === undefined) {
+    throw new Error(`fixture "${id}" has no JSON frame to re-time`);
+  }
+  return JSON.stringify({
+    ...(found.frame as Record<string, unknown>),
+    timestamp,
+  });
+}

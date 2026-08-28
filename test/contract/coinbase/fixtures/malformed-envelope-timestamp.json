@@ -1,0 +1,38 @@
+{
+  "id": "malformed-envelope-timestamp",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "market-trades-update",
+    "source": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/advanced-trade-asyncapi.json",
+    "section": "StreamedMessage.timestamp — the envelope's server send time, documented as RFC 3339",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "timestamp changed from an RFC 3339 value to \"2023-02-09 20:19:36.100000000 +0000 UTC m=+91717.525857105\". That spelling is not invented: it is Go's default time rendering, which this same venue does use for the heartbeats channel's current_time field, so it is the most plausible way an RFC 3339 envelope field could arrive in an undocumented form.",
+      "sequence_num changed from 2 to 0, so the fixture can be the first frame of a scenario.",
+      "The second trade was dropped, so the assertion is about one entry.",
+      "trades[0] is otherwise unchanged, and its own time is still valid RFC 3339 — the point of the fixture is that the ENVELOPE time is the bad one."
+    ]
+  },
+  "classification": "MARKET_TRADES",
+  "expectation": "Parses: the wire schema requires only a non-empty string, because rejecting the whole frame would discard real trades over a misspelled publication time. The adapter emits COINBASE_TIMESTAMP_INVALID, still normalizes the trade (whose own RFC 3339 time is what becomes venueTimestamp), preserves the raw value verbatim in venueDetail.venueMessageTime, and refuses to record it as the channel's lastVenueTimestamp — an unvalidated string may not be reported as a venue time.",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09 20:19:36.100000000 +0000 UTC m=+91717.525857105",
+    "sequence_num": 0,
+    "events": [
+      {
+        "type": "update",
+        "trades": [
+          {
+            "trade_id": "000000001",
+            "product_id": "ETH-USD",
+            "price": "1260.02",
+            "size": "0.3",
+            "side": "SELL",
+            "time": "2019-08-14T20:42:28.265Z"
+          }
+        ]
+      }
+    ]
+  }
+}

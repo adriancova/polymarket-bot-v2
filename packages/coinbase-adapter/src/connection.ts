@@ -25,6 +25,14 @@
  * `CoinbaseStreamProcessor.resubscribed()` exists for a caller that has its own
  * evidence and wants the cheaper path.
  *
+ * EVERY CALLBACK IS BOUND TO ITS OWN SOCKET. A listener closes over the
+ * connection ordinal and id it was created for, so a callback from a socket the
+ * manager has already replaced is recognized as such and reported instead of
+ * being acted on. Without that binding a late frame from a dead socket would be
+ * handed to the processor and drafted onto the CURRENT `connectionId` and
+ * `subscriptionGeneration` — old-generation data wearing new-generation
+ * provenance, which is the one thing `subscriptionGeneration` exists to prevent.
+ *
  * BACKOFF IS DETERMINISTIC. No jitter, because jitter is unseeded randomness and
  * §12.4 makes runs reproducible; a fleet that needs jitter can supply a
  * {@link Timer} that adds it, which keeps the randomness at the composition
@@ -217,17 +225,41 @@ export class CoinbaseConnectionManager {
     socket?.close();
   }
 
+  /**
+   * Opens a connection, with every callback bound to THAT connection.
+   *
+   * A transport can call back on a socket the manager has already replaced: a
+   * close that races a reconnect, an error delivered afterwards, a frame that
+   * was in flight when the socket died. Checking only the manager's global state
+   * cannot tell those apart from the current socket's callbacks, so each
+   * listener closes over the connection's own ordinal and identity and asks
+   * `isCurrent()` first. A callback from a superseded socket changes no state
+   * and is reported as a typed anomaly instead.
+   *
+   * The ordinal, not the socket object, is the identity: `socketFactory.connect`
+   * may invoke `onOpen` before it returns, in which case `this.#socket` has not
+   * been assigned yet and comparing against it would misjudge the CURRENT
+   * connection as stale.
+   */
   #connect(): void {
     if (this.#state === "STOPPED") {
       return;
     }
     this.#state = "CONNECTING";
     this.#connectionOrdinal += 1;
-    const connectionId = `${this.#options.feedId}-c${String(this.#connectionOrdinal)}`;
+    const ordinal = this.#connectionOrdinal;
+    const connectionId = `${this.#options.feedId}-c${String(ordinal)}`;
+    const isCurrent = (): boolean => this.#connectionOrdinal === ordinal;
 
     this.#socket = this.#options.socketFactory.connect(this.#endpoint, {
       onOpen: () => {
         if (this.#state === "STOPPED") {
+          return;
+        }
+        if (!isCurrent()) {
+          this.#emit(
+            this.#processor.staleConnectionActivity({ connectionId, callback: "onOpen" }),
+          );
           return;
         }
         this.#state = "OPEN";
@@ -241,9 +273,13 @@ export class CoinbaseConnectionManager {
         if (this.#state === "STOPPED") {
           return;
         }
-        const result = this.#processor.ingestFrame(frame);
+        // The origin travels with the frame rather than being checked here, so
+        // there is ONE place that decides whether a frame belongs to the current
+        // generation, and it is the place that would otherwise draft the
+        // generation onto it.
+        const result = this.#processor.ingestFrame(frame, { connectionId });
         this.#emit(result);
-        if (result.requiresResubscription) {
+        if (result.requiresResubscription && isCurrent()) {
           // A gap is open and no snapshot can arrive on this subscription.
           // Closing takes the normal disconnect path, which records the
           // disconnection and opens a new generation with fresh snapshots.
@@ -252,6 +288,16 @@ export class CoinbaseConnectionManager {
       },
       onError: (error: unknown) => {
         if (this.#state === "STOPPED") {
+          return;
+        }
+        if (!isCurrent()) {
+          this.#emit(
+            this.#processor.staleConnectionActivity({
+              connectionId,
+              callback: "onError",
+              detail: error instanceof Error ? error.message : String(error),
+            }),
+          );
           return;
         }
         // The transport is expected to close after an error. The error is
@@ -263,8 +309,21 @@ export class CoinbaseConnectionManager {
         if (this.#state === "STOPPED") {
           return;
         }
+        const detail = describeClose(info, isCurrent() ? this.#lastError : undefined);
+        if (!isCurrent()) {
+          // Reporting this as a disconnection would attribute a superseded
+          // socket's death to the connection that is currently open, and
+          // scheduling a reconnect for it would race the one already in flight.
+          this.#emit(
+            this.#processor.staleConnectionActivity({
+              connectionId,
+              callback: "onClose",
+              ...(detail === undefined ? {} : { detail }),
+            }),
+          );
+          return;
+        }
         this.#socket = undefined;
-        const detail = describeClose(info, this.#lastError);
         this.#lastError = undefined;
         if (this.#state === "CONNECTING") {
           // Never opened: there is no connection to report as disconnected, and
