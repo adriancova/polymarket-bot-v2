@@ -86,6 +86,26 @@ table says otherwise.
   official pages; maker-side inversion required and correctly isolated);
   V4/V6 REJECT via H1/H2/M1. Deviations D1/D2/D3/D5 ACCEPT, D4 REJECT (M2).
   Remediation round 1 dispatched.
+- Remediation round 1 completed 2026-08-27 in `d03391f` (+ doc `72587d1`),
+  fresh repair session, probes reproduced first, per-finding mutation checks:
+  H1 → channel satisfaction only via per-entry applied/refused verdicts (a
+  knowingly suppressed duplicate counts as applied to avoid a reconnect
+  livelock — pinned by its own test; refusals reported via new
+  `COINBASE_SNAPSHOT_NOT_APPLIED`); H2 → `ingestFrame` takes a
+  connection-origin parameter and refuses superseded connections with no
+  state change, listeners bound to connection ordinal; M1 → deduplicator
+  split into `isKnown`/`remember`, identity recorded only after the domain
+  boundary; M2 → envelope timestamps validated on every classified arm
+  (invalid → venue-time cleared, raw preserved), heartbeat tracker switch
+  exhaustive with `COINBASE_HEARTBEAT_REGRESSED`; L1 → claim corrected in
+  handoff and module header. Also surfaced: a literal U+0000 byte in the
+  dedupe key separator replaced with a visible escape. Anomaly codes 16→19,
+  contract tests 72→91, three new fixtures. Orchestrator fast-forwarded the
+  canonical branch to `72587d1` and reproduced gates: root 1826/1826,
+  contract 91/91, paths clean, lockfile untouched. New disclosed risk for
+  review: a channel whose snapshot persistently fails to apply never
+  resynchronizes — loud reconnect loop, not silent. Review round 2
+  dispatched.
 
 **WP-080 (Binance adapter):**
 - Implemented by `wp-implementer` (Opus) on branch `worktree-agent-a24ead9170631b1c6`,
