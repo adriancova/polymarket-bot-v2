@@ -141,6 +141,35 @@ resumed via SendMessage per the recorded resume pattern (context intact).
   assertions against pinned commit `7fdbed4…`, 5 recorded divergences);
   §9 narrowings discharged at the venue edge; tick-size one-for-one;
   no invented sequence number. Review round 1 dispatched.
+- Review round 1 (fresh Codex `01a04623-3b3b-7e73-990e-6e45253a9c80`): **CHANGES
+  REQUIRED** — 0 blocker, 2 high (H1 stale socket callbacks cross the
+  generation boundary and are relabeled as current — the SAME defect class
+  found independently in WP-080 r1 and WP-090 r1; H2 gap lifecycle not
+  generation-bound: unsubscribe increments the generation without opening a
+  gap, and `markResynchronized` requires no open gap or expected generation,
+  so a stale snapshot acknowledgement for generation N closes generation
+  N+1's gap and double-emits FeedResynchronized), 2 medium (M1 the R-2
+  anchor table records the LOCAL loosened modifier for the five divergent
+  REST fields rather than the SDK modifier — proving divergence instead of
+  detecting it — two owned nested schemas unanchored, and REST requiredness
+  of min_order_size/tick_size/neg_risk/hash loosened without REST evidence;
+  M2 the §9 "any-length hex condition id" narrowing is capped at 200 chars
+  by the frozen domain `ConditionIdSchema` — a contract-level contradiction
+  the adapter cannot discharge; flagged for ADR-governed resolution), 1 low
+  (one-outcome-per-frame-element accounting overstated for multi-entry
+  price_change). C-1/U-1 evidence **PASS with caveat** (reviewer confirmed
+  the page's delta semantics and internal consistency; could not extract the
+  exact nested quote through its extractor); tick-size PASS (snapshot-emits-
+  nothing reading accepted); F6/F7 PASS (zero venue dependencies); D1/D2/D4/
+  D5/D6 ACCEPT, D3 REJECT (requiredness dimension). Remediation round 1
+  dispatched.
+- **Contract-owner items accumulated from batch 1B round 1** (for the next
+  ADR-modifying package or an orchestrator governance round): (1) ratify
+  C-1/U-1 across the four provisional-marked paths (WP-070 documentary
+  confirmation 2026-08-27); (2) rule the `takerSide` BID/ASK vocabulary
+  (WP-080 omission accepted pending ruling; WP-090 emits maker-inversion;
+  adapters must converge); (3) reconcile the frozen `ConditionIdSchema`
+  200-char cap with the §9 no-length-bound narrowing (WP-070 M2).
 
 ### WP-060 completion record (2026-08-27)
 
