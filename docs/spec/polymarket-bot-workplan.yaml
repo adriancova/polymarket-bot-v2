@@ -417,6 +417,16 @@ work_packages:
     allowed_paths:
       - packages/polymarket-public/src/rtds/**
       - test/contract/rtds/**
+      # Ratified 2026-08-28 (orchestrator; extends the 2026-08-26 M8 ordering
+      # note and the WP-020..WP-090 precedent): package.json edits confined to
+      # (a) the mechanical dependency declarations the RTDS subtree requires,
+      # (b) a "./rtds" subpath export so the API is reachable without touching
+      # WP-070's src/index.ts, and (c) the package-level script/typecheck
+      # registration for test/contract/rtds/** per the test-tree ratification;
+      # plus the mechanical lockfile update and the in-repo handoff.
+      - packages/polymarket-public/package.json
+      - pnpm-lock.yaml
+      - docs/handoffs/WP-100.md
     forbidden_paths:
       - packages/domain/**
     deliverables:
