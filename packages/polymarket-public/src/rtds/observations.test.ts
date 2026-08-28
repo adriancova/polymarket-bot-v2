@@ -101,17 +101,208 @@ describe("the first observation after a reconnect", () => {
     expect(JSON.stringify(verdict.quality)).not.toContain("missed");
   });
 
-  it("omits the interval when the first post-reconnect observation is not newer", () => {
+  it("carries no unavailability record when it measured the interval", () => {
+    const subject = tracker();
+    subject.remember(facts());
+    const verdict = subject.judge(
+      facts({ observationEpochMs: BASE_MS + 300_000, subscriptionGeneration: 2 }),
+    );
+    expect(
+      verdict.status === "accepted" ? verdict.quality.unobservedIntervalUnavailable : "missing",
+    ).toBeUndefined();
+  });
+});
+
+describe("a first post-reconnect observation that is NOT newer (round-1 finding M2)", () => {
+  /**
+   * The pre-gap newest is T+60s and the first observation of generation 2 is T,
+   * so the two cannot bound an interval — `fromAt` would be after `toAt`. The
+   * earlier design reported `unobservedInterval: undefined` here AND recorded
+   * generation 2, so no later observation could ever carry the interval either:
+   * the gap obligation was consumed and nothing was ever said about it.
+   */
+  function regressed() {
     const subject = tracker();
     subject.remember(facts({ observationEpochMs: BASE_MS + 60_000 }));
+    const first = facts({ observationEpochMs: BASE_MS, subscriptionGeneration: 2 });
+    const verdict = subject.judge(first);
+    subject.remember(first);
+    return { subject, verdict };
+  }
+
+  it("says so in a typed record instead of reporting nothing", () => {
+    const { verdict } = regressed();
+    expect(verdict.status).toBe("accepted");
+    if (verdict.status !== "accepted") return;
+    expect(verdict.quality.firstObservationOnSubscription).toBe(true);
+    expect(verdict.quality.outOfOrder).toBe(true);
+    expect(verdict.quality.sincePreviousObservationMs).toBe(-60_000);
+    // No interval can be MEASURED from this observation …
+    expect(verdict.quality.unobservedInterval).toBeUndefined();
+    // … and the gap is stated rather than dropped.
+    expect(verdict.quality.unobservedIntervalUnavailable).toEqual({
+      fromAt: new Date(BASE_MS + 60_000).toISOString(),
+      reasonCode: "RTDS_NO_OBSERVATION_NEWER_THAN_GAP",
+      previousSubscriptionGeneration: 1,
+    });
+  });
+
+  it("does NOT consume the obligation: the first newer observation pays it", () => {
+    const { subject } = regressed();
     const verdict = subject.judge(
-      facts({ observationEpochMs: BASE_MS, subscriptionGeneration: 2 }),
+      facts({ observationEpochMs: BASE_MS + 90_000, subscriptionGeneration: 2 }),
+    );
+    expect(verdict.status).toBe("accepted");
+    if (verdict.status !== "accepted") return;
+    // It is not the first observation of the subscription — that one already
+    // arrived, and this adapter does not restate history to make a field fit.
+    expect(verdict.quality.firstObservationOnSubscription).toBe(false);
+    expect(verdict.quality.unobservedIntervalUnavailable).toBeUndefined();
+    expect(verdict.quality.unobservedInterval).toEqual({
+      fromAt: new Date(BASE_MS + 60_000).toISOString(),
+      toAt: new Date(BASE_MS + 90_000).toISOString(),
+      durationMs: 30_000,
+      reasonCode: "RTDS_NO_REPLAY_AFTER_DISCONNECT",
+      previousSubscriptionGeneration: 1,
+    });
+  });
+
+  it("discharges the obligation exactly once", () => {
+    const { subject } = regressed();
+    const paying = facts({ observationEpochMs: BASE_MS + 90_000, subscriptionGeneration: 2 });
+    subject.remember(paying);
+    const verdict = subject.judge(
+      facts({ observationEpochMs: BASE_MS + 120_000, subscriptionGeneration: 2 }),
     );
     expect(verdict.status).toBe("accepted");
     if (verdict.status !== "accepted") return;
     expect(verdict.quality.unobservedInterval).toBeUndefined();
+    expect(verdict.quality.unobservedIntervalUnavailable).toBeUndefined();
+  });
+
+  it("keeps saying the gap is unmeasured while nothing newer arrives", () => {
+    const { subject } = regressed();
+    const stillOlder = facts({ observationEpochMs: BASE_MS + 30_000, subscriptionGeneration: 2 });
+    const verdict = subject.judge(stillOlder);
+    expect(verdict.status).toBe("accepted");
+    if (verdict.status !== "accepted") return;
+    expect(verdict.quality.firstObservationOnSubscription).toBe(false);
+    expect(verdict.quality.unobservedIntervalUnavailable).toEqual({
+      fromAt: new Date(BASE_MS + 60_000).toISOString(),
+      reasonCode: "RTDS_NO_OBSERVATION_NEWER_THAN_GAP",
+      previousSubscriptionGeneration: 1,
+    });
+  });
+
+  it("keeps the OLDER bound when a further reconnect happens first", () => {
+    // Two breaks, one still unmeasured: the interval reported must span the
+    // whole unobserved stretch, from the last observation before the FIRST
+    // break, not a shorter suffix of it.
+    const { subject } = regressed();
+    const verdict = subject.judge(
+      facts({ observationEpochMs: BASE_MS + 200_000, subscriptionGeneration: 3 }),
+    );
+    expect(verdict.status).toBe("accepted");
+    if (verdict.status !== "accepted") return;
+    expect(verdict.quality.firstObservationOnSubscription).toBe(true);
+    expect(verdict.quality.unobservedInterval).toEqual({
+      fromAt: new Date(BASE_MS + 60_000).toISOString(),
+      toAt: new Date(BASE_MS + 200_000).toISOString(),
+      durationMs: 140_000,
+      reasonCode: "RTDS_NO_REPLAY_AFTER_DISCONNECT",
+      previousSubscriptionGeneration: 1,
+    });
+  });
+
+  it("names the generation whose stream actually ended, not a later restatement", () => {
+    // The outstanding record is authoritative about the bound, and it must be:
+    // a later subscription can restate an instant this feed already had (a
+    // redelivery older than the bounded duplicate window is republished rather
+    // than suppressed), which moves the "newest observation's generation"
+    // forward without moving the observation. The unmeasured break still began
+    // when generation 1's stream ended.
+    const subject = tracker({ duplicateWindow: 1 });
+    subject.remember(facts({ observationEpochMs: BASE_MS + 60_000 }));
+    subject.remember(facts({ observationEpochMs: BASE_MS, subscriptionGeneration: 2 }));
+    // Outside the one-entry duplicate window, so this is a late observation,
+    // not a suppressed duplicate — and it re-stamps the newest instant with
+    // generation 2.
+    const restated = facts({
+      observationEpochMs: BASE_MS + 60_000,
+      subscriptionGeneration: 2,
+      value: "65000.5",
+    });
+    expect(subject.judge(restated).status).toBe("accepted");
+    subject.remember(restated);
+
+    const verdict = subject.judge(
+      facts({ observationEpochMs: BASE_MS + 90_000, subscriptionGeneration: 3 }),
+    );
+    expect(verdict.status === "accepted" ? verdict.quality.unobservedInterval : undefined).toEqual({
+      fromAt: new Date(BASE_MS + 60_000).toISOString(),
+      toAt: new Date(BASE_MS + 90_000).toISOString(),
+      durationMs: 30_000,
+      reasonCode: "RTDS_NO_REPLAY_AFTER_DISCONNECT",
+      previousSubscriptionGeneration: 1,
+    });
+  });
+
+  it("never states both an interval and its unavailability", () => {
+    // Mechanical guard over the whole ordering space of one break.
+    const offsets = [-60_000, -1, 0, 1, 30_000, 300_000];
+    for (const first of offsets) {
+      for (const second of offsets) {
+        const subject = tracker({ duplicateWindow: 1 });
+        subject.remember(facts({ observationEpochMs: BASE_MS }));
+        for (const [index, offset] of [first, second].entries()) {
+          const next = facts({
+            observationEpochMs: BASE_MS + offset,
+            subscriptionGeneration: 2 + index,
+          });
+          const verdict = subject.judge(next);
+          if (verdict.status !== "accepted") continue;
+          const measured = verdict.quality.unobservedInterval;
+          const unavailable = verdict.quality.unobservedIntervalUnavailable;
+          expect(measured === undefined || unavailable === undefined).toBe(true);
+          if (measured !== undefined) expect(measured.durationMs).toBeGreaterThan(0);
+          subject.remember(next);
+        }
+      }
+    }
+  });
+
+  it("still opens no gap at all while the subscription is unchanged", () => {
+    // The obligation exists only across a generation transition; an ordinary
+    // out-of-order arrival on one subscription is not a gap.
+    const subject = tracker();
+    subject.remember(facts({ observationEpochMs: BASE_MS + 60_000 }));
+    const verdict = subject.judge(facts({ observationEpochMs: BASE_MS }));
+    expect(verdict.status).toBe("accepted");
+    if (verdict.status !== "accepted") return;
     expect(verdict.quality.outOfOrder).toBe(true);
-    expect(verdict.quality.sincePreviousObservationMs).toBe(-60_000);
+    expect(verdict.quality.unobservedInterval).toBeUndefined();
+    expect(verdict.quality.unobservedIntervalUnavailable).toBeUndefined();
+  });
+
+  it("holds the obligation for an observation that was judged but never published", () => {
+    // `judge` records nothing, so a regressed first observation refused at the
+    // domain boundary leaves the series exactly as it was: the NEXT first
+    // observation of that subscription still measures the interval.
+    const subject = tracker();
+    subject.remember(facts({ observationEpochMs: BASE_MS + 60_000 }));
+    subject.judge(facts({ observationEpochMs: BASE_MS, subscriptionGeneration: 2 }));
+    const verdict = subject.judge(
+      facts({ observationEpochMs: BASE_MS + 90_000, subscriptionGeneration: 2 }),
+    );
+    expect(verdict.status === "accepted" ? verdict.quality : undefined).toMatchObject({
+      firstObservationOnSubscription: true,
+      unobservedInterval: {
+        fromAt: new Date(BASE_MS + 60_000).toISOString(),
+        toAt: new Date(BASE_MS + 90_000).toISOString(),
+        durationMs: 30_000,
+        previousSubscriptionGeneration: 1,
+      },
+    });
   });
 });
 

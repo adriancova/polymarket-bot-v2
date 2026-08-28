@@ -19,6 +19,25 @@
  * restatement is not suppressed as a duplicate of something that was never
  * published (the defect WP-090's review found in the sibling adapter).
  *
+ * ## A generation break is an obligation, and it is discharged exactly once
+ *
+ * When a series' next observation arrives under a NEW subscription generation,
+ * this tracker owes the caller one statement about the interval it did not
+ * observe. The ordinary case pays it immediately: the first post-break
+ * observation is newer than the last pre-break one, so the two bound a MEASURED
+ * {@link RtdsUnobservedInterval}.
+ *
+ * The awkward case is a first post-break observation that is NOT newer — a
+ * replayed or regressed instant. Its bounds would cross, so no interval can be
+ * measured from it, and the round-1 review found that the earlier design then
+ * consumed the obligation anyway and reported nothing, on that observation or on
+ * any later one. It is now modelled explicitly: the obligation stays OUTSTANDING
+ * on the series, every observation while it is outstanding carries a typed
+ * {@link RtdsUnobservedIntervalUnavailable}, and the first observation newer than
+ * the pre-break bound — on that subscription or a later one — carries the
+ * measured interval and discharges it. Exactly one of the two fields is present
+ * whenever a break is outstanding, and neither is present otherwise.
+ *
  * ## Two bounds, and what each costs
  *
  * Both bounds are this client's, not venue facts, and both consequences are
@@ -36,7 +55,11 @@
  *    the venue.
  */
 
-import type { RtdsObservationQuality, RtdsUnobservedInterval } from "./result.js";
+import type {
+  RtdsObservationQuality,
+  RtdsUnobservedInterval,
+  RtdsUnobservedIntervalUnavailable,
+} from "./result.js";
 
 /** One observation, as the tracker needs to see it. */
 export interface ObservationFacts {
@@ -74,6 +97,20 @@ interface RecentObservation {
   readonly value: string;
 }
 
+/**
+ * A subscription break whose unobserved interval has no end bound yet.
+ *
+ * Set when the first observation of a new generation is not newer than the last
+ * one before the break; cleared by the first observation that IS newer, which is
+ * the one that can measure the interval.
+ */
+interface OutstandingGap {
+  readonly fromEpochMs: number;
+  readonly fromIso: string;
+  /** The generation the pre-break observation arrived under. */
+  readonly fromGeneration: number;
+}
+
 interface SeriesHistory {
   /** Bounded FIFO of recent instants, oldest first. */
   readonly recent: RecentObservation[];
@@ -84,6 +121,68 @@ interface SeriesHistory {
   newestGeneration: number;
   /** The generation of the most recent observation of any age. */
   lastGeneration: number;
+  /** An unmeasured subscription break, or `undefined` when none is outstanding. */
+  outstandingGap: OutstandingGap | undefined;
+}
+
+/** What one observation says about this series' unobserved interval. */
+interface GapAssessment {
+  readonly unobservedInterval?: RtdsUnobservedInterval;
+  readonly unobservedIntervalUnavailable?: RtdsUnobservedIntervalUnavailable;
+  /** The gap still outstanding AFTER this observation is recorded. */
+  readonly outstandingGap: OutstandingGap | undefined;
+}
+
+/**
+ * Decides what one observation can say about a series' unobserved interval.
+ *
+ * PURE, and the single source of that decision: {@link TwapObservationTracker.judge}
+ * reports it and {@link TwapObservationTracker.remember} records its consequence,
+ * both from this one function, so the reported quality and the retained state can
+ * never disagree.
+ *
+ * An already-outstanding gap takes precedence over a newer generation break: its
+ * `fromAt` is the older bound, so measuring from it reports the whole unobserved
+ * span rather than a shorter suffix of it.
+ */
+function assessGap(
+  history: SeriesHistory,
+  facts: ObservationFacts,
+  firstOnSubscription: boolean,
+): GapAssessment {
+  const outstanding =
+    history.outstandingGap ??
+    (firstOnSubscription
+      ? {
+          fromEpochMs: history.newestEpochMs,
+          fromIso: history.newestIso,
+          fromGeneration: history.newestGeneration,
+        }
+      : undefined);
+
+  if (outstanding === undefined) {
+    return { outstandingGap: undefined };
+  }
+  if (facts.observationEpochMs > outstanding.fromEpochMs) {
+    return {
+      unobservedInterval: {
+        fromAt: outstanding.fromIso,
+        toAt: facts.observationIso,
+        durationMs: facts.observationEpochMs - outstanding.fromEpochMs,
+        reasonCode: "RTDS_NO_REPLAY_AFTER_DISCONNECT",
+        previousSubscriptionGeneration: outstanding.fromGeneration,
+      },
+      outstandingGap: undefined,
+    };
+  }
+  return {
+    unobservedIntervalUnavailable: {
+      fromAt: outstanding.fromIso,
+      reasonCode: "RTDS_NO_OBSERVATION_NEWER_THAN_GAP",
+      previousSubscriptionGeneration: outstanding.fromGeneration,
+    },
+    outstandingGap: outstanding,
+  };
 }
 
 export interface TwapObservationTrackerOptions {
@@ -144,16 +243,7 @@ export class TwapObservationTracker {
 
     const firstOnSubscription = history.lastGeneration !== facts.subscriptionGeneration;
     const sincePreviousObservationMs = facts.observationEpochMs - history.newestEpochMs;
-    const unobservedInterval: RtdsUnobservedInterval | undefined =
-      firstOnSubscription && sincePreviousObservationMs > 0
-        ? {
-            fromAt: history.newestIso,
-            toAt: facts.observationIso,
-            durationMs: sincePreviousObservationMs,
-            reasonCode: "RTDS_NO_REPLAY_AFTER_DISCONNECT",
-            previousSubscriptionGeneration: history.newestGeneration,
-          }
-        : undefined;
+    const gap = assessGap(history, facts, firstOnSubscription);
 
     return {
       status: "accepted",
@@ -162,7 +252,12 @@ export class TwapObservationTracker {
         firstObservationOnSubscription: firstOnSubscription,
         previousObservationAt: history.newestIso,
         sincePreviousObservationMs,
-        ...(unobservedInterval === undefined ? {} : { unobservedInterval }),
+        ...(gap.unobservedInterval === undefined
+          ? {}
+          : { unobservedInterval: gap.unobservedInterval }),
+        ...(gap.unobservedIntervalUnavailable === undefined
+          ? {}
+          : { unobservedIntervalUnavailable: gap.unobservedIntervalUnavailable }),
         outOfOrder: sincePreviousObservationMs <= 0,
         observationAgeMs,
       },
@@ -184,7 +279,18 @@ export class TwapObservationTracker {
       newestIso: facts.observationIso,
       newestGeneration: facts.subscriptionGeneration,
       lastGeneration: facts.subscriptionGeneration,
+      outstandingGap: undefined,
     };
+    if (existing !== undefined) {
+      // Computed from the PRE-update history, and from the same function `judge`
+      // reported to the caller: a break this observation could not measure stays
+      // outstanding, and one it measured is discharged here and never again.
+      history.outstandingGap = assessGap(
+        existing,
+        facts,
+        existing.lastGeneration !== facts.subscriptionGeneration,
+      ).outstandingGap;
+    }
     history.recent.push({ epochMs: facts.observationEpochMs, value: facts.value });
     while (history.recent.length > this.#options.duplicateWindow) history.recent.shift();
     if (facts.observationEpochMs >= history.newestEpochMs) {

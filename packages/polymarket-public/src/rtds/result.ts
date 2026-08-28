@@ -98,14 +98,44 @@ export interface RtdsObservationQuality {
    * The interval this feed did NOT observe, when the previous observation came
    * from an earlier subscription.
    *
-   * Present exactly when an observation is the first of a subscription AND a
-   * previous one is known. It is a measured interval between two real
-   * observations; how many updates fell inside it is unknown and is not stated.
-   * A consumer must treat the interval as unrecoverable — RTDS offers no replay
-   * — which is why ADR-009 §6 requires a TWAP-dependent strategy to HALT on an
-   * RTDS gap rather than interpolate or backfill.
+   * Present on the first observation of a subscription when a previous one is
+   * known AND this one is NEWER than it — which is the ordinary case, because a
+   * TWAP stream that resumes publishes forward. When the first observation after
+   * the break is NOT newer (a regressed or replayed instant), the interval
+   * cannot be measured from it: its two bounds would cross. The obligation is
+   * then not discharged and not dropped either — it stays outstanding on the
+   * series, {@link RtdsObservationQuality.unobservedIntervalUnavailable} says so
+   * in typed form, and the interval is attached to the first later observation
+   * that IS newer than the last pre-break one, whichever subscription that
+   * arrives on (round-1 review finding M2).
+   *
+   * Exactly one of `unobservedInterval` and `unobservedIntervalUnavailable` is
+   * ever present on one quality block; a series with no outstanding gap carries
+   * neither.
+   *
+   * It is a measured interval between two real observations; how many updates
+   * fell inside it is unknown and is not stated. A consumer must treat the
+   * interval as unrecoverable — RTDS offers no replay — which is why ADR-009 §6
+   * requires a TWAP-dependent strategy to HALT on an RTDS gap rather than
+   * interpolate or backfill.
    */
   readonly unobservedInterval?: RtdsUnobservedInterval;
+  /**
+   * An unobserved interval that EXISTS but cannot be measured yet.
+   *
+   * Emitted on every observation of a series that has an outstanding
+   * subscription break whose end bound has not been observed: the first
+   * observation after the break was not newer than the last one before it, so no
+   * two real observations bound the gap. The gap is still real, and this field
+   * is the honest statement of it — the alternative, silently reporting no
+   * interval, is exactly the defect round-1 review finding M2 records.
+   *
+   * A consumer must treat this the same way it treats
+   * {@link RtdsObservationQuality.unobservedInterval}: as an unrecoverable break
+   * in TWAP coverage. Its extent is a lower bound only — the gap started at
+   * `fromAt` and has not been closed by any observation yet.
+   */
+  readonly unobservedIntervalUnavailable?: RtdsUnobservedIntervalUnavailable;
   /**
    * The Chainlink observation time is not newer than the newest already seen for
    * this series.
@@ -130,11 +160,39 @@ export interface RtdsObservationQuality {
 export interface RtdsUnobservedInterval {
   /** Chainlink observation time of the last update received before the break. */
   readonly fromAt: string;
-  /** Chainlink observation time of the first update received after it. */
+  /**
+   * Chainlink observation time of the first update received after it that is
+   * newer than `fromAt` — which is the first update of the new subscription
+   * unless that one regressed (see
+   * {@link RtdsObservationQuality.unobservedIntervalUnavailable}).
+   */
   readonly toAt: string;
+  /** Strictly positive by construction: `toAt` is newer than `fromAt`. */
   readonly durationMs: number;
   /** Stable `CodeString`: RTDS provides no snapshot, history or replay. */
   readonly reasonCode: "RTDS_NO_REPLAY_AFTER_DISCONNECT";
+  /** The subscription generation the last pre-break observation arrived under. */
+  readonly previousSubscriptionGeneration: number;
+}
+
+/**
+ * A real unobserved interval whose end bound has not been observed yet.
+ *
+ * Deliberately carries no `toAt` and no `durationMs`: there is no second real
+ * observation to measure against, and inventing one is the thing this whole
+ * adapter refuses to do. It names the bound it DOES have, and why the other is
+ * missing.
+ */
+export interface RtdsUnobservedIntervalUnavailable {
+  /** Chainlink observation time of the last update received before the break. */
+  readonly fromAt: string;
+  /**
+   * Stable `CodeString`: no observation newer than `fromAt` has been received
+   * since the break, so the interval has no measurable end bound yet. The
+   * observation carrying this field is itself older than or equal to `fromAt`,
+   * which is also why it is flagged `outOfOrder`.
+   */
+  readonly reasonCode: "RTDS_NO_OBSERVATION_NEWER_THAN_GAP";
   /** The subscription generation the last pre-break observation arrived under. */
   readonly previousSubscriptionGeneration: number;
 }

@@ -135,6 +135,22 @@
       }
     },
     {
+      "name": "thirty-btc-t1-regressed-after-outage",
+      "purpose": "An observation whose Chainlink instant (19:00:15) is OLDER than the last one received before a reconnect (t1, 19:00:30) and was never published before. Used as the first update after a reconnect, where no interval can be measured from it because its bounds would cross (round-1 review finding M2). Nothing about RTDS cadence is implied: this is the documented frame with its observation timestamp and E18 value changed.",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785179130500,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65005.125,
+          "full_accuracy_value": "65005125000000000000000",
+          "timestamp": 1785178815000,
+          "window_s": 30
+        }
+      }
+    },
+    {
       "name": "thirty-btc-absent-publisher-timestamp",
       "purpose": "The envelope timestamp absent, which the page's own Python type allows (`timestamp: datetime | None`).",
       "payload": {

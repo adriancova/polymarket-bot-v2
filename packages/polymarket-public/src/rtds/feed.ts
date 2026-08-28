@@ -38,7 +38,11 @@
  * 2. the first update of each series after a (re)connect carries
  *    `quality.firstObservationOnSubscription`, and — when this feed had seen
  *    that series before — a MEASURED `quality.unobservedInterval` between the
- *    last update it received and this one;
+ *    last update it received and this one. If that first update is not NEWER
+ *    than the last pre-break one, no two observations bound the gap: the break
+ *    stays outstanding, `quality.unobservedIntervalUnavailable` says so on every
+ *    observation until one is newer, and that one carries the measured interval
+ *    (round-1 review finding M2). The obligation is never consumed silently;
  * 3. nothing is ever interpolated, back-filled, replayed, or carried forward:
  *    an interval with no observation simply has no event.
  *

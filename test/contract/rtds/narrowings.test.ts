@@ -114,6 +114,51 @@ describe("fixture-only strictness is not inherited by this runtime parser", () =
   });
 });
 
+describe("the SDK's epoch-like tolerance is NOT inherited by the observation time", () => {
+  // The opposite direction from the rules above, and it is the point: §9's
+  // binding is that fixture-only STRICTNESS must not be inherited, not that
+  // every tolerance found anywhere in the SDK must be. `payload.timestamp` is
+  // documented as unix ms by the current page's direct-RTDS example and by the
+  // frozen report §10.3, and it decides `windowEndAt`, `windowStartAt`,
+  // ordering and duplicate identity — so it is read as unix ms and nothing
+  // else (round-1 review finding M1).
+
+  it("refuses a date-like observation timestamp instead of dating the window from it", () => {
+    for (const timestamp of ["2026-07-27T19:00:00Z", "2026-07-27", "1785178800000.0"]) {
+      const { events, problems } = normalizeRtdsFrame(
+        [{ ...UPDATE, payload: { ...UPDATE.payload, timestamp } }],
+        context(),
+      );
+      expect(events).toEqual([]);
+      expect(problems[0]?.code).toBe("RTDS_INVALID_OBSERVATION_TIMESTAMP");
+    }
+  });
+
+  it("never reinterprets a small observation timestamp as seconds", () => {
+    // The generic parser multiplies anything below 1e12 by 1000. Here the value
+    // is read as the milliseconds the venue documents, so the window it dates
+    // is 1970 — wrong on its face and caught by any freshness threshold —
+    // instead of a rescaled 2026 instant that would look right and be invented.
+    const { events, problems } = normalizeRtdsFrame(
+      [{ ...UPDATE, payload: { ...UPDATE.payload, timestamp: 1785178800 } }],
+      context(),
+    );
+    expect(problems).toEqual([]);
+    expect(events[0]?.payload.windowEndAt).toBe("1970-01-21T15:52:58.800Z");
+  });
+
+  it("keeps the tolerant reading for the publisher timestamp, which decides nothing", () => {
+    const { events, problems } = normalizeRtdsFrame(
+      [{ ...UPDATE, timestamp: "2026-07-27T19:00:00.123Z" }],
+      context(),
+    );
+    expect(problems).toEqual([]);
+    expect(events[0]?.provenance.venueTimestamp).toBe("2026-07-27T19:00:00.123Z");
+    // And the observation time it did NOT come from is still the frozen one.
+    expect(events[0]?.payload.windowEndAt).toBe("2026-07-27T19:00:00.000Z");
+  });
+});
+
 describe("the exact-decimal boundary", () => {
   it("never lets a JavaScript number carry an economic value", () => {
     const { events } = normalizeRtdsFrame([UPDATE], context());

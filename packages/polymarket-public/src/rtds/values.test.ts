@@ -1,7 +1,12 @@
 import { divDecimalExact } from "@polymarket-bot/decimal";
 import { describe, expect, it } from "vitest";
 
-import { normalizeFullAccuracyValue, normalizeRtdsInstant, shiftInstant } from "./values.js";
+import {
+  normalizeFullAccuracyValue,
+  normalizeRtdsObservationInstant,
+  normalizeRtdsPublisherInstant,
+  shiftInstant,
+} from "./values.js";
 
 function value(raw: unknown): string {
   const outcome = normalizeFullAccuracyValue(raw);
@@ -77,27 +82,112 @@ describe("full_accuracy_value refusals are typed values, never throws", () => {
   });
 });
 
-describe("instants", () => {
+describe("the Chainlink observation time is Unix epoch milliseconds, and only that", () => {
   it("reads the documented epoch-millisecond form", () => {
-    const outcome = normalizeRtdsInstant(1785178800000);
+    const outcome = normalizeRtdsObservationInstant(1785178800000);
     expect(outcome).toEqual({
       status: "ok",
       value: { iso: "2026-07-27T19:00:00.000Z", epochMs: 1785178800000 },
     });
   });
 
-  it("round-trips the ISO form back to the same milliseconds", () => {
-    const outcome = normalizeRtdsInstant("1785178800123");
+  it("reads the all-digit spelling as the same milliseconds", () => {
+    const outcome = normalizeRtdsObservationInstant("1785178800123");
     expect(outcome.status === "ok" ? outcome.value.epochMs : 0).toBe(1785178800123);
   });
 
-  it("reports an absent or unusable instant instead of substituting one", () => {
-    expect(normalizeRtdsInstant(undefined).status).toBe("absent");
-    expect(normalizeRtdsInstant(null).status).toBe("absent");
-    expect(normalizeRtdsInstant("not a date").status).toBe("invalid");
-    expect(normalizeRtdsInstant(1.5).status).toBe("invalid");
+  it("never applies the SDK's seconds-versus-milliseconds heuristic", () => {
+    // Round-1 review finding M1, in its own probe: the generic epoch-like
+    // parser reads a number below 1e12 as SECONDS, which turned 1234 into
+    // 1970-01-01T00:20:34.000Z (epochMs 1234000). This field is documented as
+    // unix ms by both the current page and the frozen report §10.3, so the
+    // value is read literally — mis-scaling `windowEndAt` is not recoverable
+    // downstream, and this is the field the window, the ordering and the
+    // duplicate identity are all built on.
+    for (const raw of [1, 1234, 999_999_999_999]) {
+      const strict = normalizeRtdsObservationInstant(raw);
+      expect(strict.status === "ok" ? strict.value.epochMs : -1).toBe(raw);
+      const tolerant = normalizeRtdsPublisherInstant(raw);
+      expect(tolerant.status === "ok" ? tolerant.value.epochMs : -1).toBe(raw * 1000);
+    }
   });
 
+  it("refuses every date-like string the generic parser would accept", () => {
+    for (const raw of [
+      "2026-08-28T12:00:00Z",
+      "2026-08-28",
+      "2026-08-28T12:00:00.000Z",
+      "not a date",
+      "some time yesterday",
+    ]) {
+      const outcome = normalizeRtdsObservationInstant(raw);
+      expect(outcome.status).toBe("invalid");
+      // And the tolerant publisher parser is unchanged, which is the whole
+      // point of keeping the two apart.
+      expect(normalizeRtdsPublisherInstant("2026-08-28T12:00:00Z").status).toBe("ok");
+    }
+  });
+
+  it("refuses digit strings that are not bare milliseconds", () => {
+    for (const raw of [
+      " 1785178800000",
+      "1785178800000 ",
+      "+1785178800000",
+      "-1785178800000",
+      "1785178800000.0",
+      "1.7851788e12",
+      "0x1a",
+      "１７８５",
+    ]) {
+      expect(normalizeRtdsObservationInstant(raw).status).toBe("invalid");
+    }
+  });
+
+  it("refuses a number that is not a safe whole millisecond count", () => {
+    for (const raw of [1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(normalizeRtdsObservationInstant(raw).status).toBe("invalid");
+    }
+    expect(normalizeRtdsObservationInstant("9007199254740993").status).toBe("invalid");
+  });
+
+  it("refuses a value that is not an epoch at all", () => {
+    for (const raw of [true, {}, [], 1785178800000n, () => 1785178800000]) {
+      expect(normalizeRtdsObservationInstant(raw).status).toBe("invalid");
+    }
+  });
+
+  it("refuses a negative or unrepresentable instant", () => {
+    // No plausibility WINDOW is invented — how old is too old is operator
+    // policy, and it lives in the staleness threshold (RTDS-U1) — but a
+    // pre-1970 observation time cannot be a Chainlink observation, and beyond
+    // the `Date` range `toISOString()` throws inside the message loop.
+    expect(normalizeRtdsObservationInstant(-1).status).toBe("invalid");
+    expect(normalizeRtdsObservationInstant(9e15).status).toBe("invalid");
+    expect(normalizeRtdsObservationInstant(8.64e15).status).toBe("ok");
+  });
+
+  it("reports absence as absence rather than substituting an instant", () => {
+    for (const raw of [undefined, null, ""]) {
+      expect(normalizeRtdsObservationInstant(raw).status).toBe("absent");
+    }
+  });
+});
+
+describe("the publisher timestamp keeps the tolerant reading, deliberately", () => {
+  it("accepts the forms the observation time refuses", () => {
+    // Nothing is computed from it: it decorates provenance, and its documented
+    // type is `timestamp: datetime | None`. An unusable one costs the
+    // decoration, never the observation.
+    expect(normalizeRtdsPublisherInstant("2026-08-28").status).toBe("ok");
+    expect(normalizeRtdsPublisherInstant(1785178800123).status).toBe("ok");
+    expect(normalizeRtdsPublisherInstant(undefined).status).toBe("absent");
+    expect(normalizeRtdsPublisherInstant(null).status).toBe("absent");
+    expect(normalizeRtdsPublisherInstant("not a date").status).toBe("invalid");
+    expect(normalizeRtdsPublisherInstant(1.5).status).toBe("invalid");
+  });
+});
+
+describe("instants", () => {
   it("shifts an instant back by a whole lookback window", () => {
     const shifted = shiftInstant(1785178800000, -30_000);
     expect(shifted).toEqual({

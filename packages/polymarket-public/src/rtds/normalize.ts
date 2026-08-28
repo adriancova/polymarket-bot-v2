@@ -27,6 +27,17 @@
  * timestamp is when the publisher submitted the update to RTDS." The three are
  * kept distinct and none is substituted for another.
  *
+ * They are also read with DIFFERENT strictness, on purpose. The observation time
+ * is load-bearing — it becomes `windowEndAt`, anchors `windowStartAt`, and is
+ * the identity duplicates and ordering are decided on — so it is parsed as Unix
+ * epoch milliseconds and nothing else (`normalizeRtdsObservationInstant`; the
+ * frozen report §10.3 writes the field as `timestamp (unix ms)`). The publisher
+ * timestamp is provenance nothing is computed from, and its documented type
+ * already allows it to be absent, so it keeps the package's generic epoch-like
+ * reading (`normalizeRtdsPublisherInstant`). Swapping the two would put a
+ * seconds-versus-milliseconds heuristic on the one field that cannot survive
+ * one.
+ *
  * ## Where the window's start comes from — a documented derivation, not a fact
  *
  * `ReferenceTwapObserved` requires `windowStartAt` and `windowEndAt`. RTDS
@@ -63,7 +74,12 @@ import type {
   RtdsProblem,
   RtdsProblemCode,
 } from "./result.js";
-import { normalizeFullAccuracyValue, normalizeRtdsInstant, shiftInstant } from "./values.js";
+import {
+  normalizeFullAccuracyValue,
+  normalizeRtdsObservationInstant,
+  normalizeRtdsPublisherInstant,
+  shiftInstant,
+} from "./values.js";
 import { RtdsEnvelopeSchema, RtdsTwapUpdatePayloadSchema } from "./venue.js";
 
 /** The domain's bound on identifier-like strings, which `symbol` is one of. */
@@ -208,7 +224,11 @@ function normalizeEnvelope(
     );
   }
 
-  const observation = normalizeRtdsInstant(payload.timestamp);
+  // Strict Unix epoch milliseconds — NOT the generic epoch-like reading the
+  // publisher timestamp gets a few lines below. See
+  // `normalizeRtdsObservationInstant`: this value becomes `windowEndAt`, anchors
+  // `windowStartAt`, and is the identity duplicates and ordering are decided on.
+  const observation = normalizeRtdsObservationInstant(payload.timestamp);
   if (observation.status !== "ok") {
     return problem(
       "RTDS_INVALID_OBSERVATION_TIMESTAMP",
@@ -289,7 +309,7 @@ function normalizeEnvelope(
     );
   }
 
-  const publisher = normalizeRtdsInstant(envelope.data.timestamp);
+  const publisher = normalizeRtdsPublisherInstant(envelope.data.timestamp);
   const provenance: RtdsEventProvenance = {
     source: "rtds",
     sourceChannel: channel,

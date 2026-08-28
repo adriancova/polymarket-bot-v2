@@ -252,6 +252,85 @@ describe("every refusal is typed, carries the raw value, and drops nothing", () 
   });
 });
 
+describe("the observation timestamp is read strictly, the publisher's is not", () => {
+  it("refuses every encoding the direct-RTDS payload is not documented to use", () => {
+    // Round-1 review finding M1. The frozen report §10.3 writes this field as
+    // `timestamp (unix ms)` and the page's example prints `1785178800000`; the
+    // generic SDK "epoch-like" reading (seconds heuristic, calendar date, any
+    // date-time string) belongs to a different surface and previously let
+    // arbitrary strings set `windowEndAt`.
+    for (const timestamp of [
+      "2026-07-27T19:00:00Z",
+      "2026-07-27",
+      "2026-07-27T19:00:00.000Z",
+      1785178800000.5,
+      "+1785178800000",
+      " 1785178800000",
+      "1785178800000.0",
+      -1,
+      Number.MAX_SAFE_INTEGER + 1,
+    ]) {
+      const value = { ...THIRTY_UPDATE, payload: { ...THIRTY_UPDATE.payload, timestamp } };
+      const { events, problems } = normalizeOne(value);
+      expect(events).toEqual([]);
+      expect(problems).toHaveLength(1);
+      expect(problems[0]?.code).toBe("RTDS_INVALID_OBSERVATION_TIMESTAMP");
+      // The evidence rides on the problem: the raw envelope, unmodified.
+      expect(problems[0]?.raw).toBe(value);
+    }
+  });
+
+  it("still classifies a non-string non-number by the payload shape", () => {
+    // Classification order is unchanged: SHAPE is judged by the zod schema and
+    // MEANING by `./values.ts`, so a boolean where an instant belongs is a
+    // payload-shape refusal, not a timestamp one. Either way it is one typed
+    // problem carrying the raw frame, and never an event.
+    const value = {
+      ...THIRTY_UPDATE,
+      payload: { ...THIRTY_UPDATE.payload, timestamp: true },
+    };
+    const { events, problems } = normalizeOne(value);
+    expect(events).toEqual([]);
+    expect(problems[0]?.code).toBe("RTDS_INVALID_TWAP_PAYLOAD");
+    expect(problems[0]?.raw).toBe(value);
+  });
+
+  it("reads a small epoch value literally instead of rescaling it into plausibility", () => {
+    // A seconds-scaled timestamp used to be multiplied by 1000 and published as
+    // a confidently wrong 2026 window. It is now read as the milliseconds the
+    // venue documents, which lands in 1970 — visibly wrong, flagged
+    // `outOfOrder` against real data, and caught by any freshness threshold —
+    // rather than silently inventing a plausible instant.
+    const { events, problems } = normalizeOne({
+      ...THIRTY_UPDATE,
+      payload: { ...THIRTY_UPDATE.payload, timestamp: 1785178800 },
+    });
+    expect(problems).toEqual([]);
+    expect(events[0]?.payload.windowEndAt).toBe("1970-01-21T15:52:58.800Z");
+    expect(events[0]?.payload.windowStartAt).toBe("1970-01-21T15:52:28.800Z");
+  });
+
+  it("accepts the all-digit millisecond spelling as the same instant", () => {
+    const { events, problems } = normalizeOne({
+      ...THIRTY_UPDATE,
+      payload: { ...THIRTY_UPDATE.payload, timestamp: "1785178800000" },
+    });
+    expect(problems).toEqual([]);
+    expect(events[0]?.payload.windowEndAt).toBe("2026-07-27T19:00:00.000Z");
+  });
+
+  it("keeps the publisher timestamp tolerant, which is the point of the split", () => {
+    // The same string that is refused as an observation time is accepted as
+    // publisher provenance, because nothing is computed from it.
+    const { events, problems } = normalizeOne({
+      ...THIRTY_UPDATE,
+      timestamp: "2026-07-27T19:00:00.123Z",
+    });
+    expect(problems).toEqual([]);
+    expect(events[0]?.provenance.venueTimestamp).toBe("2026-07-27T19:00:00.123Z");
+  });
+});
+
 describe("the publisher timestamp is a decoration, not a gate", () => {
   it("publishes without a venueTimestamp when the envelope carries none", () => {
     // The page's own Python type is `timestamp: datetime | None`.
@@ -346,5 +425,60 @@ describe("first-update quality after a subscription change", () => {
         previousSubscriptionGeneration: 1,
       },
     });
+    expect(events[0]?.quality.unobservedIntervalUnavailable).toBeUndefined();
+  });
+
+  it("states the gap even when the first observation of the new generation regressed", () => {
+    // Round-1 review finding M2, end to end: the break is real, it just cannot
+    // be measured from an observation older than the last pre-break one.
+    const tracker = new TwapObservationTracker({ duplicateWindow: 8, maxTrackedSeries: 8 });
+    normalizeRtdsFrame(
+      [
+        {
+          ...THIRTY_UPDATE,
+          timestamp: 1785179100123,
+          payload: { ...THIRTY_UPDATE.payload, timestamp: 1785179100000 },
+        },
+      ],
+      context({ tracker, receivedEpochMs: 1785179100200 }),
+    );
+    const regressed = normalizeRtdsFrame(
+      [THIRTY_UPDATE],
+      context({ tracker, subscriptionGeneration: 2 }),
+    );
+    expect(regressed.problems).toEqual([]);
+    expect(regressed.events[0]?.quality).toMatchObject({
+      firstObservationOnSubscription: true,
+      outOfOrder: true,
+      unobservedIntervalUnavailable: {
+        fromAt: "2026-07-27T19:05:00.000Z",
+        reasonCode: "RTDS_NO_OBSERVATION_NEWER_THAN_GAP",
+        previousSubscriptionGeneration: 1,
+      },
+    });
+    expect(regressed.events[0]?.quality.unobservedInterval).toBeUndefined();
+
+    // And the obligation is still outstanding: the next observation newer than
+    // the pre-break one measures it.
+    const measured = normalizeRtdsFrame(
+      [
+        {
+          ...THIRTY_UPDATE,
+          timestamp: 1785179400123,
+          payload: { ...THIRTY_UPDATE.payload, timestamp: 1785179400000 },
+        },
+      ],
+      context({ tracker, subscriptionGeneration: 2, receivedEpochMs: 1785179400200 }),
+    );
+    expect(measured.events[0]?.quality.unobservedInterval).toEqual({
+      fromAt: "2026-07-27T19:05:00.000Z",
+      toAt: "2026-07-27T19:10:00.000Z",
+      durationMs: 300_000,
+      reasonCode: "RTDS_NO_REPLAY_AFTER_DISCONNECT",
+      previousSubscriptionGeneration: 1,
+    });
+    // Still no count of anything: the interval is measured, the updates inside
+    // it are unknown.
+    expect(JSON.stringify(measured.events[0]?.quality)).not.toMatch(/missed|skipped/iu);
   });
 });

@@ -216,6 +216,78 @@ describe("a reconnect fabricates nothing", () => {
   });
 });
 
+describe("a reconnect whose first update is not newer than the last one before it", () => {
+  /**
+   * Round-1 review finding M2, at the feed level. The break is real; what is
+   * missing is a second real observation to measure it against, and inventing
+   * one is exactly what this adapter refuses to do. So the obligation is
+   * neither discharged nor forgotten: it is stated, then measured as soon as an
+   * observation can bound it.
+   */
+  function regressedAfterReconnect() {
+    const context = harness();
+    context.feed.start();
+    context.latest().emitOpen();
+    context.latest().emitJson(example("thirty-btc-t0"));
+    context.latest().emitJson(example("thirty-btc-t1"));
+    context.latest().emitClose({ code: 1006, reason: "socket dropped" });
+    context.scheduler.advance(1_000);
+    context.latest().emitOpen();
+    context.latest().emitJson(example("thirty-btc-t1-regressed-after-outage"));
+    return context;
+  }
+
+  it("states the gap it cannot measure rather than reporting none", () => {
+    const context = regressedAfterReconnect();
+    const quality = context.observations().at(-1)?.quality;
+    expect(quality).toMatchObject({
+      firstObservationOnSubscription: true,
+      outOfOrder: true,
+      unobservedIntervalUnavailable: {
+        fromAt: "2026-07-27T19:00:30.000Z",
+        reasonCode: "RTDS_NO_OBSERVATION_NEWER_THAN_GAP",
+        previousSubscriptionGeneration: 1,
+      },
+    });
+    expect(quality?.unobservedInterval).toBeUndefined();
+    // The observation itself is still published — it is real data.
+    expect(context.observations()).toHaveLength(3);
+    expect(context.problems).toEqual([]);
+  });
+
+  it("measures the interval on the first later update that can bound it", () => {
+    const context = regressedAfterReconnect();
+    context.latest().emitJson(example("thirty-btc-t2-after-outage"));
+    const quality = context.observations().at(-1)?.quality;
+    expect(quality?.unobservedIntervalUnavailable).toBeUndefined();
+    expect(quality?.unobservedInterval).toEqual({
+      fromAt: "2026-07-27T19:00:30.000Z",
+      toAt: "2026-07-27T19:05:30.000Z",
+      durationMs: 300_000,
+      reasonCode: "RTDS_NO_REPLAY_AFTER_DISCONNECT",
+      previousSubscriptionGeneration: 1,
+    });
+    // Measured between two real observations, and still no count of what fell
+    // inside it.
+    expect(JSON.stringify(quality)).not.toMatch(/missed|skipped|expectedUpdates/iu);
+  });
+
+  it("fabricates nothing to make the interval measurable", () => {
+    const context = regressedAfterReconnect();
+    // Three received updates, three published observations, no fourth one
+    // invented to bound the gap, and no recovery claimed.
+    expect(context.observations().map((event) => event.payload.windowEndAt)).toEqual([
+      "2026-07-27T19:00:00.000Z",
+      "2026-07-27T19:00:30.000Z",
+      "2026-07-27T19:00:15.000Z",
+    ]);
+    expect(context.events.map((event) => event.eventType)).not.toContain("FeedResynchronized");
+    // The feed's own gap state is unchanged by any of this: it is cleared by an
+    // acknowledgement, never by an observation.
+    expect(context.feed.openGap?.subscriptionGeneration).toBe(2);
+  });
+});
+
 describe("staleness is surfaced as data quality", () => {
   it("emits FeedStale and exposes the same fact as a typed metric", () => {
     const context = harness({ updateStalenessMs: 30_000, stalenessCheckIntervalMs: 5_000 });

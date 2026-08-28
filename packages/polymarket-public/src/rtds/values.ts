@@ -89,16 +89,120 @@ export interface VenueInstant {
   readonly epochMs: number;
 }
 
+/** Unix epoch milliseconds, written out in full. Nothing else is accepted. */
+const EPOCH_MILLISECONDS_PATTERN = /^\d+$/u;
+
 /**
- * Normalizes an RTDS instant.
+ * The largest epoch millisecond value `Date` can represent.
  *
- * Delegates the epoch-form question to the package's existing venue-instant
- * helper — the one that implements every form the official SDK accepts — so
- * this package has exactly one answer to "what is an epoch-like timestamp",
- * and derives the millisecond value back from the ISO form it returns. The
- * round trip is exact: the ISO form carries milliseconds.
+ * Boundary hygiene, not a venue fact: beyond it `new Date(...).toISOString()`
+ * throws, and a throw in the message loop is a dropped event.
  */
-export function normalizeRtdsInstant(value: unknown): ValueNormalization<VenueInstant> {
+const MAX_EPOCH_MS = 8.64e15;
+
+/**
+ * Normalizes the CHAINLINK OBSERVATION timestamp — `payload.timestamp`.
+ *
+ * ## Why this field gets its own parser (round-1 review finding M1)
+ *
+ * This value is load-bearing: it becomes `windowEndAt`, it anchors the derived
+ * `windowStartAt`, and it is the identity a duplicate, a conflict and an
+ * out-of-order arrival are all decided on. Getting its SCALE wrong does not
+ * produce an error — it produces a confidently wrong window.
+ *
+ * The direct-RTDS representation is stated by both authorities and neither is
+ * ambiguous:
+ *
+ *   * the current official page (accessed 2026-08-28) prints
+ *     `"timestamp": 1785178800000` in the direct-RTDS update example and calls
+ *     it "the Chainlink observation time";
+ *   * the frozen report §10.3 writes the payload as
+ *     `{symbol, value (number), full_accuracy_value (string integer),
+ *     timestamp (unix ms), window_s}` — **unix ms**, in as many words.
+ *
+ * So this parser reads Unix epoch MILLISECONDS and nothing else. It deliberately
+ * does NOT delegate to `../normalize/values.ts`'s `normalizeVenueInstant`, which
+ * implements the official SDK's generic `EpochLikeToIsoDateTimeStringSchema`
+ * flexibility — a numeric seconds-versus-milliseconds heuristic below
+ * `1_000_000_000_000`, a `YYYY-MM-DD` calendar date, and any other date-like
+ * string. That flexibility belongs to the SDK-normalized surface, which is a
+ * DIFFERENT surface on the same page (`payload.windowSeconds`, `DecimalString`
+ * values), and applying it here silently reinterpreted `1234` as seconds
+ * (`1970-01-01T00:20:34.000Z`) and accepted `"2026-08-28T12:00:00Z"` as an
+ * observation time RTDS is not documented to send.
+ *
+ * Two spellings of the same unambiguous fact are accepted:
+ *
+ * | Wire form | Read as |
+ * | --- | --- |
+ * | JSON number, a safe integer | epoch milliseconds |
+ * | all-digit string, a safe integer | epoch milliseconds |
+ *
+ * The digit string is accepted because it cannot be mis-scaled — it is the
+ * exact form the SDK's own `EpochMillisecondsStringSchema` uses for every
+ * adjacent Polymarket timestamp, and it is read as milliseconds with no
+ * heuristic applied — while the envelope schema already admits a string there.
+ * Anything else (a fractional or unsafe number, a signed or spaced digit
+ * string, a date-time string, a calendar date, a boolean, an object) is refused,
+ * and the caller turns the refusal into `RTDS_INVALID_OBSERVATION_TIMESTAMP`
+ * carrying the raw value. Absence stays ABSENT so the caller can say so.
+ *
+ * The value must also be non-negative: an observation time before 1970 cannot
+ * be a Chainlink observation on a feed that publishes current prices, and
+ * accepting one would let a negative number through as a plausible-looking
+ * window. No upper freshness bound is applied here — how old is too old is
+ * operator policy, and it lives in the staleness threshold (RTDS-U1).
+ */
+export function normalizeRtdsObservationInstant(value: unknown): ValueNormalization<VenueInstant> {
+  if (value === undefined || value === null || value === "") {
+    return { status: "absent" };
+  }
+
+  let epochMs: number;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      return invalid(
+        `the Chainlink observation time must be a whole number of Unix epoch milliseconds, received ${String(value)}`,
+      );
+    }
+    epochMs = value;
+  } else if (typeof value === "string") {
+    if (!EPOCH_MILLISECONDS_PATTERN.test(value)) {
+      return invalid(
+        `the Chainlink observation time must be Unix epoch milliseconds, received "${truncate(value)}": this field takes no date-like string and no seconds-versus-milliseconds heuristic`,
+      );
+    }
+    epochMs = Number(value);
+    if (!Number.isSafeInteger(epochMs)) {
+      return invalid(`epoch milliseconds are not a safe integer: "${truncate(value)}"`);
+    }
+  } else {
+    return invalid(`expected Unix epoch milliseconds, received ${typeof value}`);
+  }
+
+  if (epochMs < 0 || epochMs > MAX_EPOCH_MS) {
+    return invalid(`epoch milliseconds out of range: ${String(epochMs)}`);
+  }
+  return { status: "ok", value: { iso: new Date(epochMs).toISOString(), epochMs } };
+}
+
+/**
+ * Normalizes the PUBLISHER timestamp — the envelope's own `timestamp`.
+ *
+ * A different field with a different job: "the outer timestamp is when the
+ * publisher submitted the update to RTDS". It is provenance, not economics —
+ * nothing is computed from it, and its documented Python type is
+ * `timestamp: datetime | None`, so it is allowed to be missing outright. An
+ * unusable one therefore clears `venueTimestamp` and is COUNTED rather than
+ * costing an otherwise complete observation.
+ *
+ * Because nothing load-bearing rides on it, this one keeps the package's single
+ * generic epoch-like reading (`normalizeVenueInstant`), tolerating every form
+ * the official SDK accepts. The tolerance is confined to this function on
+ * purpose: {@link normalizeRtdsObservationInstant} is where the strictness has
+ * to be, and the two must never be swapped.
+ */
+export function normalizeRtdsPublisherInstant(value: unknown): ValueNormalization<VenueInstant> {
   const normalized = normalizeVenueInstant(value);
   if (normalized.status !== "ok") return normalized;
   const epochMs = Date.parse(normalized.value);
@@ -116,7 +220,7 @@ export function normalizeRtdsInstant(value: unknown): ValueNormalization<VenueIn
  */
 export function shiftInstant(epochMs: number, deltaMs: number): ValueNormalization<VenueInstant> {
   const shifted = epochMs + deltaMs;
-  if (!Number.isFinite(shifted) || Math.abs(shifted) > 8.64e15) {
+  if (!Number.isFinite(shifted) || Math.abs(shifted) > MAX_EPOCH_MS) {
     return invalid(`shifted instant is out of range: ${String(shifted)}`);
   }
   return { status: "ok", value: { iso: new Date(shifted).toISOString(), epochMs: shifted } };

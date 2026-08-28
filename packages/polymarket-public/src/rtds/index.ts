@@ -70,7 +70,12 @@ export type { InboundRtdsFrame, RtdsFrame, RtdsSubscriptionEntry } from "./frame
 export { RtdsEnvelopeSchema, RtdsTwapUpdatePayloadSchema, isUpdateEnvelope } from "./venue.js";
 export type { RtdsEnvelope, RtdsTwapUpdatePayload } from "./venue.js";
 
-export { normalizeFullAccuracyValue, normalizeRtdsInstant, shiftInstant } from "./values.js";
+export {
+  normalizeFullAccuracyValue,
+  normalizeRtdsObservationInstant,
+  normalizeRtdsPublisherInstant,
+  shiftInstant,
+} from "./values.js";
 export type { VenueInstant } from "./values.js";
 
 export { TwapObservationTracker } from "./observations.js";
@@ -94,6 +99,7 @@ export type {
   RtdsProblem,
   RtdsProblemCode,
   RtdsUnobservedInterval,
+  RtdsUnobservedIntervalUnavailable,
 } from "./result.js";
 
 export {

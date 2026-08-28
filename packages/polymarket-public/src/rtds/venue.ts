@@ -61,8 +61,14 @@ import { RTDS_UPDATE_TYPE } from "./config.js";
  *   and required to be a STRING: a JSON number cannot carry a 23-digit integer
  *   exactly, and this is the only field the exact-decimal path may read
  *   (ADR-001 §8.3).
- * - `timestamp` — "the Chainlink observation time". Required; every epoch-like
- *   form the SDK accepts is accepted at the value boundary.
+ * - `timestamp` — "the Chainlink observation time". Required. Typed as a
+ *   number-or-string here because that is a SHAPE question; the MEANING is
+ *   settled in `./values.ts`, which reads this field as Unix epoch milliseconds
+ *   and refuses every other encoding (`normalizeRtdsObservationInstant`). Both
+ *   authorities agree on the representation — the page's direct-RTDS example
+ *   prints `1785178800000`, and the frozen report §10.3 writes the payload field
+ *   as `timestamp (unix ms)` — so the generic epoch-like tolerance the SDK
+ *   surface enjoys is deliberately NOT extended to it (round-1 finding M1).
  * - `window_s` — the lookback window in seconds. Required, and cross-checked
  *   against the topic in `./normalize.ts`: a payload that disagrees with its own
  *   topic is a contradiction, not something to resolve by preferring one side.
