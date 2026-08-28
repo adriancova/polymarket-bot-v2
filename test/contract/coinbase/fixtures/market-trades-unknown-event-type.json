@@ -1,0 +1,37 @@
+{
+  "id": "market-trades-unknown-event-type",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "market-trades-snapshot",
+    "source": "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+    "section": "Protocol — \"New message types can be added at any time. Clients are expected to ignore messages they do not support.\"",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 8.",
+      "events[0].type changed to \"backfill\", a value the documentation does not list. Not a claim that Coinbase sends it: it is the venue's own statement that new types appear, tested against this repository's rule that a client may not *silently* ignore what it does not support (§8.3).",
+      "trades[0].trade_id changed to \"000000005\"."
+    ]
+  },
+  "classification": "MARKET_TRADES",
+  "expectation": "Parses. The trades are still normalized — data that arrived is not discarded because its wrapper is unfamiliar. Emits a COINBASE_UNKNOWN_EVENT_TYPE anomaly. Critically, the frame is NOT treated as a snapshot, so it cannot close an open gap: only a documented \"snapshot\" can do that.",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09T20:19:42.000000000Z",
+    "sequence_num": 8,
+    "events": [
+      {
+        "type": "backfill",
+        "trades": [
+          {
+            "trade_id": "000000005",
+            "product_id": "ETH-USD",
+            "price": "1260.06",
+            "size": "0.2",
+            "side": "SELL",
+            "time": "2019-08-14T20:42:31.000Z"
+          }
+        ]
+      }
+    ]
+  }
+}

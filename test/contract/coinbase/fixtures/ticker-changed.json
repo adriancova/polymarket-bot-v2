@@ -1,0 +1,45 @@
+{
+  "id": "ticker-changed",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "ticker-snapshot",
+    "source": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/ticker",
+    "section": "Ticker — top-of-book fields best_bid, best_ask, best_bid_quantity, best_ask_quantity",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 5.",
+      "events[0].type changed from \"snapshot\" to \"update\".",
+      "All four best_* values changed, modelling a match that did move the top of book.",
+      "best_bid_quantity is spelled \"1.50\" and best_ask_quantity \"2\" — the venue types these as unconstrained strings and documents no canonical spelling, so the adapter's canonicalization is exercised here too."
+    ]
+  },
+  "classification": "TICKER",
+  "expectation": "Parses. Produces one ReferenceTopOfBookChanged with bidPrice 21932.5, bidSize 1.5, askPrice 21934.1, askSize 2 — all canonical decimal strings, none of them ever a JavaScript number.",
+  "frame": {
+    "channel": "ticker",
+    "timestamp": "2023-02-09T20:30:39.000000000Z",
+    "sequence_num": 5,
+    "events": [
+      {
+        "type": "update",
+        "tickers": [
+          {
+            "type": "ticker",
+            "product_id": "BTC-USD",
+            "price": "21933.00",
+            "volume_24_h": "16038.30770938",
+            "low_24_h": "21835.29",
+            "high_24_h": "23011.18",
+            "low_52_w": "15460",
+            "high_52_w": "48240",
+            "price_percent_chg_24_h": "-4.15775596190603",
+            "best_bid": "21932.50",
+            "best_bid_quantity": "1.50",
+            "best_ask": "21934.10",
+            "best_ask_quantity": "2"
+          }
+        ]
+      }
+    ]
+  }
+}

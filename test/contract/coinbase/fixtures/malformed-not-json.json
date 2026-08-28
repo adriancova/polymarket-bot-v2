@@ -1,0 +1,16 @@
+{
+  "id": "malformed-not-json",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": null,
+    "source": "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+    "section": "Protocol — \"The WebSocket feed uses a bidirectional protocol that encodes all messages as JSON objects.\"",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "There is no documented Coinbase frame that is not JSON, so this fixture has no documented basis and is labelled accordingly. It exists because ADR-004 §1 records that other feeds in this repository DO send bare text frames (Polymarket's PING/PONG), and because a parser must have a defined answer for a frame the venue should never send."
+    ]
+  },
+  "classification": "REJECTED",
+  "expectation": "Classified REJECTED/NOT_JSON. Produces a COINBASE_FRAME_NOT_JSON anomaly carrying the text verbatim, so the caller can hand the same bytes to the WAL and to a data-quality incident. It is never dropped, and it never throws out of the read loop.",
+  "rawText": "PONG"
+}

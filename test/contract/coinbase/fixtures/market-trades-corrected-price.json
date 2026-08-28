@@ -1,0 +1,38 @@
+{
+  "id": "market-trades-corrected-price",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "malformed-snapshot-empty-price",
+    "source": "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+    "section": "Sequence Numbers — \"Sequence numbers that are less than the previous number can be ignored or represent a message that has arrived out of order.\", i.e. the venue may redeliver a message",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 1, so it follows the frame it corrects.",
+      "events[0].type changed from \"snapshot\" to \"update\" — the other documented value — because a redelivery arrives as an update.",
+      "trades[0].price changed from \"\" to \"1260.09\": this is the SAME trade (same product_id and trade_id) carrying a usable price.",
+      "Everything else is unchanged from the fixture this is based on, which is the point: only the price differs."
+    ]
+  },
+  "classification": "MARKET_TRADES",
+  "expectation": "Parses. Produces one ReferenceTradeObserved for trade 000000042 on ETH-USD at price 1260.09. It must NOT be suppressed as a duplicate of the refused copy in malformed-snapshot-empty-price: no version of that trade was ever normalized, so nothing was emitted twice. A refused trade may not reserve its identity in the dedupe window.",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09T20:19:36.39625135Z",
+    "sequence_num": 1,
+    "events": [
+      {
+        "type": "update",
+        "trades": [
+          {
+            "trade_id": "000000042",
+            "product_id": "ETH-USD",
+            "price": "1260.09",
+            "size": "0.3",
+            "side": "BUY",
+            "time": "2019-08-14T20:42:29.265Z"
+          }
+        ]
+      }
+    ]
+  }
+}

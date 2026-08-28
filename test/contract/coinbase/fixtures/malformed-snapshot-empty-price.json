@@ -1,0 +1,38 @@
+{
+  "id": "malformed-snapshot-empty-price",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "market-trades-snapshot",
+    "source": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/market-trades",
+    "section": "MarketTrade.price — \"Price of the trade\", typed as a string with no documented format and no statement that it is always present and non-empty",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "trades[0].trade_id changed from \"000000000\" to \"000000042\", so this is a different trade from the documented example's and cannot be confused with it inside a dedupe window.",
+      "trades[0].price changed from \"1260.01\" to \"\". Whether Coinbase ever sends an empty decimal is UNVERIFIED (U-CB-1); the adapter refuses it rather than mapping it to absent or to zero, and this fixture is what pins that refusal.",
+      "trades[0].time advanced so the trade is distinguishable from the documented example's.",
+      "events[0].type is left as \"snapshot\", which is the whole point: this is the venue's authoritative statement of current state, and the adapter cannot apply it."
+    ]
+  },
+  "classification": "MARKET_TRADES",
+  "expectation": "Parses as a market_trades frame — the wire schema types price as an unconstrained string, so emptiness is a decimal-boundary failure, not a shape failure. Produces NO ReferenceTradeObserved and a COINBASE_ECONOMIC_FIELD_INVALID anomaly. Because the only entry of a snapshot event was refused, the snapshot was not applied: it does NOT mark market_trades resynchronized, it emits COINBASE_SNAPSHOT_NOT_APPLIED, and an open gap stays open.",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09T20:19:35.39625135Z",
+    "sequence_num": 0,
+    "events": [
+      {
+        "type": "snapshot",
+        "trades": [
+          {
+            "trade_id": "000000042",
+            "product_id": "ETH-USD",
+            "price": "",
+            "size": "0.3",
+            "side": "BUY",
+            "time": "2019-08-14T20:42:29.265Z"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "id": "malformed-nonpositive-size",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "market-trades-snapshot",
+    "source": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/market-trades",
+    "section": "MarketTrade.size — \"Base size of the trade\", type: string with no documented lower bound",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 11.",
+      "trades[0].trade_id changed to \"000000007\".",
+      "trades[0].size changed to \"0\". The venue documents no bound on size; the frozen domain contract requires a POSITIVE decimal for a trade size, because a trade of zero base units is not an observation of a trade.",
+      "A second, valid trade follows it in the same batch."
+    ]
+  },
+  "classification": "MARKET_TRADES",
+  "expectation": "The zero-size trade is REFUSED at the decimal boundary with a COINBASE_ECONOMIC_FIELD_INVALID anomaly — never clamped, never rounded up, never dropped in silence. The valid trade in the SAME batch is still normalized: one bad entry does not discard a 250 ms batch.",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09T20:19:44.000000000Z",
+    "sequence_num": 11,
+    "events": [
+      {
+        "type": "update",
+        "trades": [
+          {
+            "trade_id": "000000007",
+            "product_id": "ETH-USD",
+            "price": "1260.07",
+            "size": "0",
+            "side": "BUY",
+            "time": "2019-08-14T20:42:33.000Z"
+          },
+          {
+            "trade_id": "000000008",
+            "product_id": "ETH-USD",
+            "price": "1260.08",
+            "size": "0.9",
+            "side": "SELL",
+            "time": "2019-08-14T20:42:33.500Z"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "id": "malformed-json-number-price",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "market-trades-snapshot",
+    "source": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/market-trades",
+    "section": "MarketTrade.price — type: string",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 9.",
+      "trades[0].price changed from the string \"1260.01\" to the JSON NUMBER 1260.01. The AsyncAPI types price as a string, so this is not a documented form. It is tested because ADR-001 §8.2 records that another venue in this repository does send JSON-number decimals, and because a price that arrives as an IEEE-754 double has already lost exactness before any adapter sees it.",
+      "trades[0].trade_id changed to \"000000006\"."
+    ]
+  },
+  "classification": "REJECTED",
+  "expectation": "Classified REJECTED/SHAPE, with a typed anomaly naming the field and carrying the raw frame. The value is NOT accepted and converted: a JSON number is not an exact decimal, and silently reading one would put an inexact economic value into the system (§7.3, ADR-001 §7). If Coinbase is ever documented to send numbers here, the fix is an explicit, cited normalization in normalize.ts — not a relaxation of this schema.",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09T20:19:43.000000000Z",
+    "sequence_num": 9,
+    "events": [
+      {
+        "type": "update",
+        "trades": [
+          {
+            "trade_id": "000000006",
+            "product_id": "ETH-USD",
+            "price": 1260.01,
+            "size": "0.3",
+            "side": "BUY",
+            "time": "2019-08-14T20:42:32.000Z"
+          }
+        ]
+      }
+    ]
+  }
+}

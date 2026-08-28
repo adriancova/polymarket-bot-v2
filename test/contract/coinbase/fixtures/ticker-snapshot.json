@@ -1,0 +1,39 @@
+{
+  "id": "ticker-snapshot",
+  "provenance": {
+    "kind": "DOCUMENTED_EXAMPLE",
+    "source": "https://docs.cdp.coinbase.com/coinbase-business/advanced-trade-apis/websocket/websocket-channels",
+    "section": "Ticker Channel — \"Ticker message\"",
+    "accessedAt": "2026-08-27",
+    "modifications": []
+  },
+  "classification": "TICKER",
+  "expectation": "Parses. Produces one ReferenceTopOfBookChanged for BTC-USD with bidPrice 21931.98, bidSize 8000.21, askPrice 21933.98, askSize 8038.07770938. venueTimestamp is the message timestamp, the only venue time this channel supplies. Records a ticker snapshot for the current subscription generation. The non-top-of-book fields (price, volume_24_h, the 24h and 52w extremes, price_percent_chg_24_h) have no home in the frozen contract and are not carried into it.",
+  "frame": {
+    "channel": "ticker",
+    "timestamp": "2023-02-09T20:30:37.167359596Z",
+    "sequence_num": 0,
+    "events": [
+      {
+        "type": "snapshot",
+        "tickers": [
+          {
+            "type": "ticker",
+            "product_id": "BTC-USD",
+            "price": "21932.98",
+            "volume_24_h": "16038.28770938",
+            "low_24_h": "21835.29",
+            "high_24_h": "23011.18",
+            "low_52_w": "15460",
+            "high_52_w": "48240",
+            "price_percent_chg_24_h": "-4.15775596190603",
+            "best_bid": "21931.98",
+            "best_bid_quantity": "8000.21",
+            "best_ask": "21933.98",
+            "best_ask_quantity": "8038.07770938"
+          }
+        ]
+      }
+    ]
+  }
+}

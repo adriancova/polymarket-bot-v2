@@ -1,0 +1,49 @@
+{
+  "id": "market-trades-update",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "market-trades-snapshot",
+    "source": "https://docs.cdp.coinbase.com/coinbase-business/advanced-trade-apis/websocket/websocket-channels",
+    "section": "Market Trades Channel — \"Market Trades Message\"",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "events[0].type changed from \"snapshot\" to \"update\" — both are documented values of that field, and the channel page states an update carries the trades of the last 250 ms.",
+      "sequence_num changed from 0 to 2, because every documented example prints 0 in isolation and a multi-frame scenario needs increasing values.",
+      "trades[0].trade_id changed from \"000000000\" to \"000000001\" so this is a different trade from the snapshot's.",
+      "trades[0].price changed from \"1260.01\" to \"1260.02\" and trades[0].time advanced, so the update is distinguishable.",
+      "trades[0].side changed from \"BUY\" to \"SELL\" — the other documented value — so the taker-side derivation is exercised in both directions.",
+      "A second trade was added to the same update, because the channel page states an update \"can contain one or many trades\".",
+      "The second trade's price and size are spelled \"1260.030\" and \"1.50\" — trailing fractional zeros. The venue types both fields as an unconstrained string and documents no canonical spelling, so an adapter must not assume one; this exercises the ADR-001 §3 normalization the boundary requires."
+    ]
+  },
+  "classification": "MARKET_TRADES",
+  "expectation": "Parses. Produces two ReferenceTradeObserved events. The maker SELL yields takerSide BID; the maker BUY yields takerSide ASK. The second trade's price and size are canonicalized to \"1260.03\" and \"1.5\" before the domain boundary. Does not record a snapshot, because its type is \"update\".",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09T20:19:36.10000000Z",
+    "sequence_num": 2,
+    "events": [
+      {
+        "type": "update",
+        "trades": [
+          {
+            "trade_id": "000000001",
+            "product_id": "ETH-USD",
+            "price": "1260.02",
+            "size": "0.3",
+            "side": "SELL",
+            "time": "2019-08-14T20:42:28.265Z"
+          },
+          {
+            "trade_id": "000000002",
+            "product_id": "ETH-USD",
+            "price": "1260.030",
+            "size": "1.50",
+            "side": "BUY",
+            "time": "2019-08-14T20:42:28.400Z"
+          }
+        ]
+      }
+    ]
+  }
+}

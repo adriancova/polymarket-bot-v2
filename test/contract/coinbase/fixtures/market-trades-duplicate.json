@@ -1,0 +1,37 @@
+{
+  "id": "market-trades-duplicate",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "market-trades-snapshot",
+    "source": "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+    "section": "Sequence Numbers — \"Sequence numbers that are less than the previous number can be ignored or represent a message that has arrived out of order.\"",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 3, so the frame arrives later in a scenario.",
+      "events[0].type changed from \"snapshot\" to \"update\" — the other documented value — so this models a redelivery rather than a resubscription snapshot.",
+      "Everything else is byte-for-byte the documented example, which is the point: the trade_id and product_id are identical, so the trade is the same trade."
+    ]
+  },
+  "classification": "MARKET_TRADES",
+  "expectation": "Parses. Produces NO ReferenceTradeObserved, because trade 000000000 on ETH-USD was already normalized. Emits a COINBASE_DUPLICATE_TRADE anomaly with the raw frame and increments tradesDuplicateSuppressed. Suppression is recorded, never silent.",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09T20:19:37.00000000Z",
+    "sequence_num": 3,
+    "events": [
+      {
+        "type": "update",
+        "trades": [
+          {
+            "trade_id": "000000000",
+            "product_id": "ETH-USD",
+            "price": "1260.01",
+            "size": "0.3",
+            "side": "BUY",
+            "time": "2019-08-14T20:42:27.265Z"
+          }
+        ]
+      }
+    ]
+  }
+}

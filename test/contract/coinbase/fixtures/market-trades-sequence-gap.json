@@ -1,0 +1,37 @@
+{
+  "id": "market-trades-sequence-gap",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "market-trades-snapshot",
+    "source": "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+    "section": "Sequence Numbers — \"Sequence numbers that are greater than one integer value from the previous number indicate that a message has been dropped.\"",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 12, so that following a frame numbered 2 it skips nine values.",
+      "events[0].type changed from \"snapshot\" to \"update\".",
+      "trades[0].trade_id changed to \"000000009\" so the trade is new and duplicate suppression does not mask the gap."
+    ]
+  },
+  "classification": "MARKET_TRADES",
+  "expectation": "Parses, and the trade IS normalized — a gap does not justify discarding the data that did arrive. Emits a COINBASE_SEQUENCE_GAP anomaly, a FeedGapDetected with requiresAuthoritativeSnapshot true, and sets requiresResubscription, because the venue offers no replay and only a fresh subscription can produce an authoritative snapshot.",
+  "frame": {
+    "channel": "market_trades",
+    "timestamp": "2023-02-09T20:19:40.000000000Z",
+    "sequence_num": 12,
+    "events": [
+      {
+        "type": "update",
+        "trades": [
+          {
+            "trade_id": "000000009",
+            "product_id": "ETH-USD",
+            "price": "1260.11",
+            "size": "0.4",
+            "side": "BUY",
+            "time": "2019-08-14T20:42:35.100Z"
+          }
+        ]
+      }
+    ]
+  }
+}

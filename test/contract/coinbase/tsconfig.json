@@ -1,0 +1,17 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": "../../..",
+    "paths": {
+      "@polymarket-bot/coinbase-adapter": ["packages/coinbase-adapter/src/index.ts"],
+      "@polymarket-bot/coinbase-adapter/testing": [
+        "packages/coinbase-adapter/src/testing/index.ts"
+      ],
+      "@polymarket-bot/domain": ["packages/domain/src/index.ts"],
+      "@polymarket-bot/decimal": ["packages/decimal/src/index.ts"]
+    }
+  },
+  "include": ["."]
+}

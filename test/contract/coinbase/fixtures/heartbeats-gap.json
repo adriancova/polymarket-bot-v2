@@ -1,0 +1,28 @@
+{
+  "id": "heartbeats-gap",
+  "provenance": {
+    "kind": "SYNTHETIC_COMPLETION",
+    "basedOn": "heartbeats",
+    "source": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/websocket/heartbeats",
+    "section": "Heartbeats — \"Each message carries a heartbeat_counter so clients can detect missed messages.\"",
+    "accessedAt": "2026-08-27",
+    "modifications": [
+      "sequence_num changed from 0 to 1, so it follows the baseline heartbeat.",
+      "heartbeat_counter changed from 3049 to 3051, skipping 3050. The venue publishes this counter for exactly this purpose.",
+      "current_time advanced by two seconds, consistent with a one-per-second cadence and two elapsed heartbeats."
+    ]
+  },
+  "classification": "HEARTBEATS",
+  "expectation": "Parses. sequence_num is in order, so nothing is wrong at the connection level — and that is the point: heartbeat_counter detects loss during a period when no market-data message was expected. Emits a COINBASE_HEARTBEAT_GAP anomaly and a FeedGapDetected with requiresAuthoritativeSnapshot true.",
+  "frame": {
+    "channel": "heartbeats",
+    "timestamp": "2023-06-23T20:31:28.122969572Z",
+    "sequence_num": 1,
+    "events": [
+      {
+        "current_time": "2023-06-23 20:31:58.121961769 +0000 UTC m=+91719.525857105",
+        "heartbeat_counter": 3051
+      }
+    ]
+  }
+}

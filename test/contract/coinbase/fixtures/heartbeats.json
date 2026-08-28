@@ -1,0 +1,23 @@
+{
+  "id": "heartbeats",
+  "provenance": {
+    "kind": "DOCUMENTED_EXAMPLE",
+    "source": "https://docs.cdp.coinbase.com/coinbase-business/advanced-trade-apis/websocket/websocket-channels",
+    "section": "Heartbeats Channel — \"Heartbeats Message\"",
+    "accessedAt": "2026-08-27",
+    "modifications": []
+  },
+  "classification": "HEARTBEATS",
+  "expectation": "Parses. Produces no reference event. Establishes the heartbeat_counter baseline at 3049. current_time is Go's default time rendering, not RFC 3339, so it is preserved verbatim and never parsed as a timestamp; the RFC 3339 message timestamp is the heartbeat's venue time.",
+  "frame": {
+    "channel": "heartbeats",
+    "timestamp": "2023-06-23T20:31:26.122969572Z",
+    "sequence_num": 0,
+    "events": [
+      {
+        "current_time": "2023-06-23 20:31:56.121961769 +0000 UTC m=+91717.525857105",
+        "heartbeat_counter": 3049
+      }
+    ]
+  }
+}
