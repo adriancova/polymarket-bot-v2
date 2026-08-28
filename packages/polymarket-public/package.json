@@ -3,15 +3,24 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Public, unauthenticated Polymarket market-data adapter (WP-070): market WebSocket client, subscription manager, REST book snapshot fetcher, and normalization into the frozen domain events. No credential, signer, or order path exists here.",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./testing": "./src/testing/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/contract/polymarket-public/tsconfig.json",
+    "test:contract": "vitest run --config ../../test/contract/polymarket-public/vitest.config.ts"
+  },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }
