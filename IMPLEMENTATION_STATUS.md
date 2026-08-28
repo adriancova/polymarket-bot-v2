@@ -225,6 +225,26 @@ table says otherwise.
   REJECTED (false for OPEN); ND1/ND2 ACCEPT; WP-120 unique-id obligation
   sound but insufficient alone — the adapter must register pending ids.
   Remediation round 2 dispatched.
+- Remediation round 2 completed 2026-08-27 in `352380f`, probes reproduced
+  first, per-finding mutation checks: `connecting(connectionId)` is now
+  required-argument and REGISTERS the pending attempt; OPEN accepted only
+  for the registered identity; pre-open ERROR/CLOSE only for it and only
+  while nothing is live (legitimate failed-connect path preserved);
+  everything else refused for all four event types with typed `rejected`
+  (carrying `pendingConnectionId`), a counter, and the new distinct
+  `BINANCE_UNAUTHORIZED_CONNECTION_EVENT` incident; `close()` revokes the
+  outstanding authorization; abandoned attempts retired; malformed/reused
+  identities throw at registration. All four review probes now refusals
+  (fresh-IDLE forged close; connecting-interval forged close;
+  post-shutdown unknown error; evicted-identity OPEN after 257
+  retirements — live socket and generation unchanged). The 44-vs-45
+  mutation-count discrepancy settled by re-running both exact mutations
+  (44 and 45 respectively, both now recorded). Disclosed deviation:
+  `connecting()` signature change (required id; unmerged package, no
+  consumer). Final WP-120 identity contract: uniqueness AND registration.
+  Orchestrator fast-forwarded the canonical branch to `352380f` and
+  reproduced gates: root 1953/1953, contract 119/119, paths clean,
+  lockfile untouched. Review round 3 dispatched.
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
