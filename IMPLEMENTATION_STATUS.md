@@ -149,6 +149,30 @@ table says otherwise.
   V3/V5 FAIL only via H1/M1/M2/L1. All five deviations and all assumptions
   ACCEPTED (incident-per-generation contingent on H1). Remediation round 1
   dispatched.
+- Remediation round 1 completed 2026-08-27 in `73b70bc`, fresh repair session,
+  probes reproduced first, per-finding mutation checks (identity-gate
+  mutation → 44 failures): H1 → `connectionId` required on all four
+  socket-event variants, stamped once per socket by the factory; the feed
+  accepts events only from the live socket (bounded retired-id FIFO 256);
+  refused events mutate nothing and return typed `rejected` outcomes with a
+  counter and incident; frames get a `STALE_CONNECTION` classification with
+  raw preserved; ERROR/CLOSE from a never-live identity still accepted while
+  nothing is live (failed connect attempts can direct reconnects); M1 →
+  wrapper must equal the payload-derived lowercase `<symbol>@<suffix>` AND
+  belong to the resolved subscription set (`CHANNEL_MISMATCH`/
+  `CHANNEL_NOT_SUBSCRIBED`); an unconfirmable wrapper is
+  `UNVERIFIED_WRAPPER` and never becomes `sourceChannel`; M2 → bounded
+  per-key FIFO window of recent id→identity pairs (default 64), previously
+  seen ids duplicate regardless of arrival order, eviction consequence
+  documented and observable; L1 → register text distinguishes one-vs-both
+  unusable sides with a behavior-pinning test; L2 → UTF-8 byte measurement;
+  off-state frames now `STALE_CONNECTION` instead of throwing. Disclosed
+  deviation: socket-event callbacks take the connection id as a REQUIRED
+  first parameter (identity cannot be optional without reopening H1;
+  package unmerged). New load-bearing WP-120 obligation: supply a unique
+  `connectionId` per attempt. Orchestrator fast-forwarded the canonical
+  branch to `73b70bc` and reproduced gates: root 1943/1943, contract
+  115/115, paths clean, lockfile untouched. Review round 2 dispatched.
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
