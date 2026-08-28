@@ -41,6 +41,21 @@
  * reported as a data-quality incident — it changes no connection state
  * (round-1 review, finding H1).
  *
+ * AN IDENTITY IS AUTHORIZED BEFORE IT IS BELIEVED. Being unrecognised is not a
+ * licence: an identity the feed never authorized may not open a connection,
+ * disconnect one, or record an error against one. {@link
+ * BinanceReferenceFeed.connecting} registers the identity the caller is about to
+ * open, and that ONE identity is the pending attempt. `OPEN` is accepted only for
+ * it; a pre-open `ERROR`/`CLOSE` is accepted only for it and only while no socket
+ * is live (that is a connection attempt reporting its own failure, which must
+ * still produce the reconnect directive the driver needs). Every other identity —
+ * on a fresh `IDLE` feed, during a replacement's connecting interval, after the
+ * caller shut the feed down, or from a socket retired past the bounded memory
+ * below — is refused for all four event types, counted, and reported. Without
+ * this, "no socket is live" was itself the authorization, and any well-formed
+ * string could disconnect a feed or open a subscription generation (round-2
+ * review, finding R2-M1).
+ *
  * NOTHING IS DROPPED SILENTLY (§8.3). Every frame produces a
  * {@link FrameOutcome} carrying the decoded frame, a classification, and any
  * emissions. A duplicate, a stale update, an unknown event type, a malformed
@@ -52,10 +67,12 @@
  * `onClose` are transport callbacks: a throw inside one surfaces in the driver's
  * event loop, where it destroys the frame rather than recording it. Every
  * misuse a transport can commit — a frame while nothing is open, an event from a
- * retired socket, an open on a closed feed — is therefore a classified outcome.
- * Direct caller mistakes that are not socket events (constructing with a bad
- * option, calling {@link BinanceReferenceFeed.connecting} on a closed feed) still
- * throw, because those are programming errors on a path the caller controls.
+ * retired or unauthorized socket, an open on a closed feed — is therefore a
+ * classified outcome. Direct caller mistakes that are not socket events
+ * (constructing with a bad option, calling
+ * {@link BinanceReferenceFeed.connecting} on a closed feed or with an identity
+ * this feed already listened to, retired, or authorized) still throw, because
+ * those are programming errors on a path the caller controls.
  *
  * NO CONFIGURATION IS READ (WP-080 acceptance 3). This module reads no
  * environment variable, no file, and no strategy configuration; every knob is a
@@ -136,12 +153,22 @@ export const BINANCE_CONNECTION_CHANNEL = "binance:stream-connection" as const;
  *
  * Bounded for the same reason the sequence tracker is: the identities come from
  * the caller and the set would otherwise grow for the life of the process.
- * Eviction is FIFO and its consequence is stated rather than hidden — an event
- * from a socket retired more than this many connections ago is no longer
- * recognised as `RETIRED` but as `UNKNOWN`, which is still refused whenever a
- * socket is live. Only when nothing is live can such an event be accepted, and
- * then the worst case is one extra `FeedDisconnected` and reconnect directive
- * for a feed that is already disconnected.
+ *
+ * EVICTION CHANGES NO ACCEPTANCE DECISION. Authorization comes from the
+ * registered pending attempt and the live socket, never from the absence of a
+ * memory: `OPEN` requires the pending identity, `MESSAGE` requires the live one,
+ * and `ERROR`/`CLOSE` require the live one or the pending one while nothing is
+ * live. An identity evicted from this FIFO is therefore described as `UNKNOWN`
+ * rather than `RETIRED` and is refused exactly as a `RETIRED` one would be, for
+ * all four event types (round-2 review, R2-M1; before that fix an evicted
+ * identity could open a connection and supersede the live socket).
+ *
+ * What eviction does cost is a caller-contract CHECK: {@link
+ * BinanceReferenceFeed.connecting} refuses to register an identity it remembers
+ * retiring, and after this many retirements it can no longer catch a caller that
+ * reuses an ancient id. That is a violation of the caller's own documented
+ * obligation — one connection id identifies exactly one connection — and it
+ * grants no socket any authority the caller did not deliberately hand it.
  */
 const MAX_REMEMBERED_RETIRED_CONNECTIONS = 256;
 
@@ -186,6 +213,14 @@ export type RejectedSocketEvent = {
   readonly relation: ConnectionIdentityRelation;
   /** The identity the feed is listening to, if any. */
   readonly liveConnectionId: string | undefined;
+  /**
+   * The identity the caller registered for the attempt in flight, if any.
+   *
+   * Reported beside `liveConnectionId` because together they are the whole
+   * authorization state: a refusal is explained by what the feed was listening
+   * to and what it had authorized, not by what the event claimed.
+   */
+  readonly pendingConnectionId: string | undefined;
   readonly detail: string;
 };
 
@@ -274,7 +309,16 @@ export class BinanceReferenceFeed {
    * `FeedDisconnected` it produces still names the socket it belongs to.
    */
   #connectionId: string | undefined;
-  /** Identities that were live and no longer are; bounded, FIFO. */
+  /**
+   * Identity the caller registered for the connection attempt in flight.
+   *
+   * The authorization for the next `OPEN`, and — while nothing is live — for a
+   * pre-open `ERROR`/`CLOSE`. Cleared when the attempt resolves (it opened, its
+   * close was applied, the caller registered another attempt, or the caller shut
+   * the feed down), so an attempt authorizes exactly one connection.
+   */
+  #pendingConnectionId: string | undefined;
+  /** Identities that were live or pending and no longer are; bounded, FIFO. */
   readonly #retiredConnectionIds = new Set<string>();
   #subscriptionGeneration = 0;
   #openedGenerations = 0;
@@ -381,6 +425,17 @@ export class BinanceReferenceFeed {
     return this.#liveConnectionId;
   }
 
+  /**
+   * Identity registered for the connection attempt in flight, if any.
+   *
+   * Exposed because it is half of the answer to "why was that event refused?",
+   * and a driver that has lost track of its own attempt should be able to see
+   * what the feed authorized.
+   */
+  public get pendingConnectionId(): string | undefined {
+    return this.#pendingConnectionId;
+  }
+
   public get subscriptionGeneration(): number {
     return this.#subscriptionGeneration;
   }
@@ -395,21 +450,64 @@ export class BinanceReferenceFeed {
   }
 
   /**
-   * Records that the caller is about to open a connection.
+   * Registers the connection attempt the caller is about to make.
+   *
+   * `connectionId` is REQUIRED and is the authorization for that attempt: it is
+   * the only identity whose `OPEN` this feed will accept, and — while no socket
+   * is live — the only one whose pre-open `ERROR`/`CLOSE` it will apply. Passing
+   * it here rather than discovering it on the `OPEN` event is what makes "the
+   * feed has never heard of this socket" a refusal instead of a licence
+   * (round-2 review, R2-M1). The same value must be given to the transport on
+   * the {@link BinanceSocketRequest}.
    *
    * Returns the URL to open, so the caller never has to assemble one itself and
    * cannot accidentally connect to a different endpoint than the one recorded on
    * `FeedConnected`.
+   *
+   * THROWS, unlike the socket-event paths. Registering an attempt is a direct
+   * caller action, not a transport callback, so a mistake here is a programming
+   * error and a silent value would hide it: a closed feed opens nothing, an
+   * identity must be well formed, and an identity this feed already listened to,
+   * retired, or authorized cannot be registered again — one connection id
+   * identifies exactly one connection.
    */
-  public connecting(): { readonly url: string; readonly attempt: number } {
+  public connecting(connectionId: string): {
+    readonly url: string;
+    readonly attempt: number;
+    readonly connectionId: string;
+  } {
     if (this.#state === "CLOSED") {
       throw new BinanceStateError("a closed feed cannot open a new connection", {
         feedId: this.#feedId,
       });
     }
+    const relation = this.#relationOf(connectionId);
+    if (relation === "INVALID") {
+      throw new BinanceConfigurationError(
+        `connectionId must be 1..${String(MAX_CONNECTION_ID_LENGTH)} characters`,
+        { feedId: this.#feedId, length: connectionId.length },
+      );
+    }
+    if (relation !== "UNKNOWN") {
+      throw new BinanceStateError(
+        `connectionId ${excerptIdentity(connectionId)} is already this feed's ${relation} connection; a connection id identifies exactly one connection`,
+        { feedId: this.#feedId, relation },
+      );
+    }
+
+    // An attempt the caller replaced without resolving is over: it can never
+    // open, and its late events are another socket's, so it joins the retired
+    // identities rather than staying authorized.
+    this.#abandonPendingAttempt();
+
     this.#state = "CONNECTING";
+    this.#pendingConnectionId = connectionId;
     this.#connections.connectionAttempts += 1;
-    return { url: this.#built.url, attempt: this.#connections.connectionAttempts };
+    return {
+      url: this.#built.url,
+      attempt: this.#connections.connectionAttempts,
+      connectionId,
+    };
   }
 
   /** The single entry point a transport driver uses. */
@@ -439,14 +537,19 @@ export class BinanceReferenceFeed {
    * unseeded randomness: a UUID generated here would make a replay diverge from
    * the run it replays (§12.4).
    *
-   * An OPEN is accepted only for an identity the feed has never listened to.
-   * Re-opening the live identity is a transport bug (ids are documented as
-   * unique per connection) and reviving a retired one would resurrect a socket
-   * this feed has already accounted for; either would create a subscription
-   * generation that does not correspond to a new subscription. An OPEN for a
-   * *different* new identity while one is live is accepted — that is a
-   * make-before-break reconnect — and it retires the previous socket, whose
-   * later events are then refused rather than mixed into the new connection.
+   * An OPEN is accepted ONLY for the identity the caller registered with
+   * {@link connecting}. Nothing else opens a connection here: not a live
+   * identity re-announcing itself (a transport bug — ids are documented as
+   * unique per connection), not a retired one (reviving it would resurrect a
+   * socket this feed has already accounted for), and above all not an identity
+   * the feed never authorized, whose OPEN would otherwise create a subscription
+   * generation for a socket nothing asked for and supersede the live connection
+   * (round-2 review, R2-M1, probe 4).
+   *
+   * An OPEN for the registered identity while another socket is live IS accepted
+   * — that is a make-before-break reconnect, which the caller authorized by
+   * registering the attempt — and it retires the previous socket, whose later
+   * events are then refused rather than mixed into the new connection.
    */
   public onOpen(connectionId: string, receipt: ReceiptStamp): FeedOutcome {
     if (this.#state === "CLOSED") {
@@ -457,7 +560,7 @@ export class BinanceReferenceFeed {
       });
     }
     const relation = this.#relationOf(connectionId);
-    if (relation !== "UNKNOWN") {
+    if (relation !== "PENDING") {
       return this.#reject("OPEN", connectionId, receipt, {
         relation,
         detail:
@@ -465,10 +568,14 @@ export class BinanceReferenceFeed {
             ? `connectionId must be 1..${String(MAX_CONNECTION_ID_LENGTH)} characters`
             : relation === "LIVE"
               ? "this connection is already open; a connection id must identify exactly one connection"
-              : "this connection id was already used and retired; a retired socket is never revived",
+              : relation === "RETIRED"
+                ? "this connection id was already used and retired; a retired socket is never revived"
+                : "no connection attempt was registered for this identity; only the identity passed to connecting() may open a connection",
       });
     }
 
+    // The attempt resolved: it authorized this connection and no other.
+    this.#pendingConnectionId = undefined;
     // A make-before-break open supersedes the socket that was live.
     this.#retire(this.#liveConnectionId);
 
@@ -517,9 +624,12 @@ export class BinanceReferenceFeed {
   /**
    * The transport reported an error on the socket.
    *
-   * Accepted from the live socket, and from a socket the feed has never heard
-   * from while none is live — that second case is a connection attempt that
-   * failed before it ever opened, which is exactly when an error matters most.
+   * Accepted from the live socket, and from the REGISTERED pending attempt while
+   * none is live — that second case is a connection attempt that failed before
+   * it ever opened, which is exactly when an error matters most. An error under
+   * any other identity is refused: it is another socket's, or nobody's, and
+   * counting it as this feed's would report a connection problem the feed's own
+   * sockets never had (round-2 review, R2-M1, probes 1 and 3).
    */
   public onSocketError(
     connectionId: string,
@@ -530,7 +640,11 @@ export class BinanceReferenceFeed {
     if (!this.#acceptsLifecycleEvent(relation)) {
       return this.#reject("ERROR", connectionId, receipt, {
         relation,
-        detail: "an error from a socket this feed is not listening to changes nothing here",
+        detail:
+          "an error from a socket this feed is neither listening to nor authorized changes nothing here",
+        ...(this.#state === "CLOSED"
+          ? { directive: { kind: "STOP", reason: "CLOSED_BY_CALLER" } as const }
+          : {}),
       });
     }
     this.#connections.socketErrors += 1;
@@ -552,27 +666,48 @@ export class BinanceReferenceFeed {
    * Emits `FeedDisconnected` and directs a reconnect. A close is never treated
    * as an end of data unless the caller asked for one with {@link close}.
    *
-   * A close is accepted from the live socket, or — when none is live — from a
-   * socket that never opened, so a failed connection attempt still produces the
-   * reconnect directive the driver needs. A close from an already-retired socket
-   * is refused: acting on it would disconnect a healthy connection and start a
-   * reconnect nothing asked for (round-1 review, H1).
+   * A close is accepted from the live socket, or — when none is live — from the
+   * REGISTERED pending attempt, so a connection attempt that failed before it
+   * opened still produces the reconnect directive the driver needs. Every other
+   * close is refused: from an already-retired socket, because acting on it would
+   * disconnect a healthy connection and start a reconnect nothing asked for
+   * (round-1 review, H1); from an identity the feed never authorized, because
+   * "nothing is live" is not a licence to disconnect a feed on any well-formed
+   * string that arrives — on a fresh `IDLE` feed, or during a replacement's
+   * connecting interval, that forged close used to emit `FeedDisconnected` and
+   * spend a reconnect attempt (round-2 review, R2-M1, probes 1 and 2).
    */
   public onClose(
     connectionId: string,
     receipt: ReceiptStamp,
     input: { readonly code?: number; readonly reason?: string } = {},
   ): FeedOutcome {
-    if (this.#state === "CLOSED") {
-      return { emissions: [], directive: { kind: "STOP", reason: "CLOSED_BY_CALLER" } };
-    }
     const relation = this.#relationOf(connectionId);
+    if (this.#state === "CLOSED") {
+      // The caller shut the feed down and retired its socket; that socket's own
+      // close is the expected epilogue and is not an anomaly. Any OTHER identity
+      // closing a feed that is already closed is refused as data, so a forged
+      // close after shutdown is visible rather than absorbed.
+      if (relation === "RETIRED" || relation === "LIVE") {
+        return { emissions: [], directive: { kind: "STOP", reason: "CLOSED_BY_CALLER" } };
+      }
+      return this.#reject("CLOSE", connectionId, receipt, {
+        relation,
+        detail:
+          "the feed was closed by its caller; a close from an identity it never listened to changes nothing",
+        directive: { kind: "STOP", reason: "CLOSED_BY_CALLER" },
+      });
+    }
     if (!this.#acceptsLifecycleEvent(relation)) {
       return this.#reject("CLOSE", connectionId, receipt, {
         relation,
         detail:
-          "a close from a socket this feed is not listening to disconnects nothing and directs no reconnect",
+          "a close from a socket this feed is neither listening to nor authorized disconnects nothing and directs no reconnect",
       });
+    }
+    // The attempt resolved by failing; it authorizes nothing further.
+    if (relation === "PENDING") {
+      this.#pendingConnectionId = undefined;
     }
     this.#connections.disconnects += 1;
     const context = this.#contextFor(receipt, BINANCE_CONNECTION_CHANNEL, connectionId);
@@ -624,6 +759,10 @@ export class BinanceReferenceFeed {
     this.#state = "CLOSED";
     this.#connectedAt = undefined;
     this.#retire(this.#liveConnectionId);
+    // A shutdown revokes the outstanding authorization too: an attempt the
+    // caller registered and then shut down may not open, error, or close its way
+    // back into this feed.
+    this.#abandonPendingAttempt();
     const emissions: AdapterEmission[] = wasConnected
       ? [
           feedDisconnected(context, {
@@ -1024,13 +1163,24 @@ export class BinanceReferenceFeed {
   // Socket identity
   // -------------------------------------------------------------------------
 
-  /** How an identity relates to the socket this feed is listening to. */
+  /**
+   * How an identity relates to the connections this feed authorized.
+   *
+   * Ordered from the most specific claim to the least: what it is listening to,
+   * what it authorized, what it has finished with, and finally "nothing at all".
+   * The three named relations are mutually exclusive by construction —
+   * {@link connecting} registers only an identity that is `UNKNOWN` — so the
+   * order is documentation rather than a tie-break.
+   */
   #relationOf(connectionId: string): ConnectionIdentityRelation {
     if (!isWellFormedConnectionId(connectionId)) {
       return "INVALID";
     }
     if (connectionId === this.#liveConnectionId) {
       return "LIVE";
+    }
+    if (connectionId === this.#pendingConnectionId) {
+      return "PENDING";
     }
     if (this.#retiredConnectionIds.has(connectionId)) {
       return "RETIRED";
@@ -1041,17 +1191,32 @@ export class BinanceReferenceFeed {
   /**
    * Whether an ERROR or CLOSE may be applied.
    *
-   * The live socket always may. An identity the feed has never listened to may
-   * only when nothing is live — that is a connection attempt reporting its own
-   * failure, and refusing it would strand the driver with no reconnect
-   * directive. While a socket IS live, an unknown identity is another socket and
-   * is refused, exactly like a retired one.
+   * The live socket always may. The registered pending attempt may only while
+   * nothing is live: that is a connection attempt reporting its own failure, and
+   * refusing it would strand the driver with no reconnect directive. While a
+   * socket IS live, only that socket describes the feed's connection state — a
+   * replacement attempt failing must not emit `FeedDisconnected` for a feed that
+   * is not disconnected, so its close is refused as data and the driver, which
+   * holds the identity it registered, sees its own attempt fail in the returned
+   * {@link RejectedSocketEvent}.
+   *
+   * Every other identity is refused unconditionally. Before the round-2 fix this
+   * returned `true` for any `UNKNOWN` identity whenever nothing was live, which
+   * made "no socket is live" the authorization and let a forged close disconnect
+   * an `IDLE` feed and spend a reconnect attempt (R2-M1).
    */
   #acceptsLifecycleEvent(relation: ConnectionIdentityRelation): boolean {
     if (relation === "LIVE") {
       return true;
     }
-    return relation === "UNKNOWN" && this.#liveConnectionId === undefined;
+    return relation === "PENDING" && this.#liveConnectionId === undefined;
+  }
+
+  /** Retires the registered attempt, if any, so it authorizes nothing further. */
+  #abandonPendingAttempt(): void {
+    const pending = this.#pendingConnectionId;
+    this.#pendingConnectionId = undefined;
+    this.#retire(pending);
   }
 
   /** Retires an identity, evicting the oldest when the bounded set is full. */
@@ -1088,9 +1253,9 @@ export class BinanceReferenceFeed {
     this.#connections.lifecycleEventsNotFromLiveConnection += 1;
     const context = this.#contextFor(receipt, BINANCE_CONNECTION_CHANNEL);
     const incident = this.#openIncident(context, {
-      reasonCode: BINANCE_REASON_CODES.retiredConnectionEvent,
+      reasonCode: refusalReasonCode(input.relation),
       severity: "NOTIFY",
-      detail: `${eventType} from connection ${excerptIdentity(connectionId)} (${input.relation}; live connection ${this.#liveConnectionId ?? "none"}): ${input.detail}`,
+      detail: `${eventType} from connection ${excerptIdentity(connectionId)} (${input.relation}; live connection ${this.#liveConnectionId ?? "none"}; registered attempt ${this.#pendingConnectionId ?? "none"}): ${input.detail}`,
     });
     return {
       emissions: incident === undefined ? [] : [incident],
@@ -1100,6 +1265,7 @@ export class BinanceReferenceFeed {
         connectionId,
         relation: input.relation,
         liveConnectionId: this.#liveConnectionId,
+        pendingConnectionId: this.#pendingConnectionId,
         detail: input.detail,
       },
     };
@@ -1128,7 +1294,7 @@ export class BinanceReferenceFeed {
     this.#pushIncident(emissions, context, {
       reasonCode: noLiveSocket
         ? BINANCE_REASON_CODES.frameWithoutConnection
-        : BINANCE_REASON_CODES.retiredConnectionEvent,
+        : refusalReasonCode(relation),
       severity: "NOTIFY",
       detail: noLiveSocket
         ? `a frame arrived from connection ${excerptIdentity(connectionId)} while the feed was ${this.#state} with no live socket; a transport delivers messages only between OPEN and CLOSE — raw: ${rawExcerpt(raw)}`
@@ -1146,6 +1312,7 @@ export class BinanceReferenceFeed {
         connectionId,
         relation,
         liveConnectionId: this.#liveConnectionId,
+        pendingConnectionId: this.#pendingConnectionId,
         detail: noLiveSocket ? "no socket was live" : "the frame came from another socket",
       },
     };
@@ -1255,6 +1422,23 @@ function channelOf(decoded: DecodedFrame): string {
     return decoded.streamName;
   }
   return BINANCE_CONNECTION_CHANNEL;
+}
+
+/**
+ * Which incident a refusal opens, by what the identity actually was.
+ *
+ * The two cases need different operator responses, so they are not one bucket. A
+ * `LIVE` or `RETIRED` identity is a socket that IS or WAS this feed's: a
+ * duplicate open, or a superseded socket still talking — a transport-lifecycle
+ * problem. Anything else — an identity the feed never authorized, or a pending
+ * attempt claiming an effect it may not have — is traffic from a socket this
+ * feed has no relationship with, which is a different question entirely: who
+ * opened it, and why is it calling back into this feed?
+ */
+function refusalReasonCode(relation: ConnectionIdentityRelation): string {
+  return relation === "LIVE" || relation === "RETIRED"
+    ? BINANCE_REASON_CODES.retiredConnectionEvent
+    : BINANCE_REASON_CODES.unauthorizedConnectionEvent;
 }
 
 /** A bounded rendering of a connection id for an incident `detail`. */

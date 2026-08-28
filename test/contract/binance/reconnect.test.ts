@@ -40,8 +40,9 @@ function driveSession(): {
     switch (step.step) {
       case "OPEN": {
         // The harness records which socket is open, because every socket event
-        // now carries the identity of the socket that produced it.
-        harness.feed.connecting();
+        // now carries the identity of the socket that produced it — and the
+        // attempt is registered under that identity before the socket exists.
+        harness.feed.connecting(step.connectionId);
         harness.connectionId = step.connectionId;
         const outcome = harness.feed.onOpen(step.connectionId, stamp);
         harness.emissions.push(...outcome.emissions);
@@ -288,5 +289,92 @@ describe("overlapping sockets", () => {
     expect(replay.classification).toBe("DUPLICATE_SUPPRESSED");
     expect(replay.emissions).toEqual([]);
     expect(harness.feed.metrics(harness.clock.peek()).frames.lateTradesEmitted).toBe(0);
+  });
+});
+
+/**
+ * A reconnect is directed by the feed's OWN sockets, and by nothing else.
+ *
+ * The reconnect path's other hard case: an event that is well formed, carries a
+ * plausible identity, and belongs to no connection this feed ever authorized.
+ * Accepting one while nothing was live meant a fresh feed could be "disconnected"
+ * before it had ever connected, and a forged close during a replacement's
+ * connecting interval could spend the caller's last reconnect attempt and stop
+ * the feed for good (round-2 review, finding R2-M1).
+ */
+describe("unauthorized lifecycle events", () => {
+  it("does not disconnect or reconnect a feed that never authorized the socket", () => {
+    const harness = createHarness();
+    const close = harness.feed.onClose("forged-identity", harness.clock.advance(1), {
+      code: 1006,
+    });
+
+    expect(eventTypesOf(close.emissions)).not.toContain("FeedDisconnected");
+    expect(close.directive.kind).toBe("NONE");
+    expect(close.rejected?.relation).toBe("UNKNOWN");
+
+    const metrics = harness.feed.metrics(harness.clock.peek());
+    expect(metrics.state).toBe("IDLE");
+    expect(metrics.connections.connectionAttempts).toBe(0);
+    expect(metrics.connections.disconnects).toBe(0);
+    // Refused, and recorded: a refusal that left no trace would be the silent
+    // drop §8.3 forbids.
+    expect(metrics.connections.lifecycleEventsNotFromLiveConnection).toBe(1);
+    expect(metrics.openIncidentReasonCodes).toEqual([
+      "BINANCE_UNAUTHORIZED_CONNECTION_EVENT",
+    ]);
+  });
+
+  it("keeps the reconnect budget for the attempt the caller actually registered", () => {
+    const harness = createHarness({
+      reconnect: { initialDelayMs: 10, maxDelayMs: 20, multiplier: 2, maxAttempts: 1 },
+    });
+    open(harness, "conn-a");
+    expect(closeSocket(harness, harness.clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "RECONNECT_AFTER",
+      delayMs: 10,
+      attempt: 1,
+    });
+
+    // The replacement is registered; its socket has not opened yet.
+    harness.feed.connecting("conn-b");
+    const forged = harness.feed.onClose("forged-identity", harness.clock.advance(1), {
+      code: 1006,
+    });
+    expect(eventTypesOf(forged.emissions)).not.toContain("FeedDisconnected");
+    expect(forged.directive.kind).toBe("NONE");
+
+    const authorized = harness.feed.onClose("conn-b", harness.clock.advance(1), { code: 1006 });
+    expect(eventTypesOf(authorized.emissions)).toEqual(["FeedDisconnected"]);
+    expect(authorized.directive).toEqual({
+      kind: "STOP",
+      reason: "RECONNECT_ATTEMPTS_EXHAUSTED",
+    });
+  });
+
+  it("opens no connection for an identity the caller never registered", () => {
+    const harness = createHarness();
+    open(harness, "conn-a");
+    const forged = harness.feed.onOpen("forged-identity", harness.clock.advance(1));
+
+    expect(eventTypesOf(forged.emissions)).not.toContain("FeedConnected");
+    expect(forged.rejected?.relation).toBe("UNKNOWN");
+    const metrics = harness.feed.metrics(harness.clock.peek());
+    expect(metrics.connectionId).toBe("conn-a");
+    expect(metrics.subscriptionGeneration).toBe(0);
+    expect(metrics.connections.connectionsOpened).toBe(1);
+  });
+
+  it("counts no error against a feed the caller has already shut down", () => {
+    const harness = createHarness();
+    open(harness, "conn-a");
+    harness.feed.close(harness.clock.advance(1), "operator shutdown");
+
+    const forged = harness.feed.onSocketError("forged-identity", harness.clock.advance(1), {
+      detail: "noise",
+    });
+    expect(forged.rejected?.relation).toBe("UNKNOWN");
+    expect(forged.directive).toEqual({ kind: "STOP", reason: "CLOSED_BY_CALLER" });
+    expect(harness.feed.metrics(harness.clock.peek()).connections.socketErrors).toBe(0);
   });
 });

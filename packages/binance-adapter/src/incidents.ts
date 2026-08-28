@@ -98,6 +98,19 @@ export const BINANCE_REASON_CODES = {
    */
   retiredConnectionEvent: "BINANCE_RETIRED_CONNECTION_EVENT",
   /**
+   * An event arrived under an identity this feed never authorized.
+   *
+   * Distinct from `retiredConnectionEvent`, which describes a socket that WAS
+   * this feed's: this code describes traffic from an identity the feed neither
+   * listens to nor registered with `connecting()` — a foreign socket, a leaked
+   * one, a forged callback, or a socket retired so long ago that the bounded
+   * retired-id memory no longer recognises it. None of them may open a
+   * connection, disconnect one, or record an error against one, and refusing
+   * without recording would be the silent drop §8.3 forbids (round-2 review,
+   * finding R2-M1).
+   */
+  unauthorizedConnectionEvent: "BINANCE_UNAUTHORIZED_CONNECTION_EVENT",
+  /**
    * A frame arrived while no socket was live.
    *
    * A transport delivers messages only between OPEN and CLOSE, so this is a

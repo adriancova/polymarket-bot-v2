@@ -31,6 +31,11 @@
  *   from any later state. A transport that reports a retired socket's close
  *   without its identity makes that close indistinguishable from the live
  *   socket's, and the feed would then tear down a healthy connection.
+ * - **Open only what the feed authorized.** The identity on the request must be
+ *   the one the caller registered with `BinanceReferenceFeed.connecting()` for
+ *   that attempt. The feed refuses every event from an identity it neither
+ *   listens to nor authorized, so a socket the driver never registered — a leaked
+ *   one, a second driver's, a forged callback — changes nothing here.
  * - **Deliver each message as one string.** The frame opcode on the JSON stream
  *   endpoint is not documented (`BNC-U1`), so a transport that receives a binary
  *   frame must decode it as UTF-8 and deliver the string; if it cannot decode
@@ -98,21 +103,30 @@ export type BinanceSocketEvent =
     };
 
 /**
- * How a socket identity relates to what the feed is currently listening to.
+ * How a socket identity relates to the connections this feed authorized.
  *
- * Deliberately a statement about KNOWLEDGE rather than about intent: the feed
- * knows which socket is live and which identities it has retired, and nothing
- * else. `UNKNOWN` is not an error by itself — a connection attempt that fails
- * before it ever opens reports its error and close under an identity the feed
- * has never seen live — so the acceptance rule combines the relation with the
- * event type (see `BinanceReferenceFeed`).
+ * A statement about what the feed has been TOLD, not about what a socket
+ * claims. The feed knows three things: which socket it is listening to, which
+ * identity the caller registered for the connection attempt in flight
+ * (`BinanceReferenceFeed.connecting`), and which identities it has retired.
+ * Every other identity is `UNKNOWN` and carries no authority at all — it cannot
+ * open a connection, disconnect one, or record an error against one (WP-080
+ * round-2 review, finding R2-M1).
  */
 export type ConnectionIdentityRelation =
   /** The identity of the socket the feed is currently listening to. */
   | "LIVE"
-  /** An identity that was live and has since been superseded or closed. */
+  /**
+   * The identity the caller registered for the connection attempt in flight.
+   *
+   * This is the only identity that may open a connection, and — while nothing
+   * is live — the only one whose pre-open `ERROR`/`CLOSE` is applied, because
+   * that is a connection attempt reporting its own failure.
+   */
+  | "PENDING"
+  /** An identity that was live or pending and has since been superseded, closed, or abandoned. */
   | "RETIRED"
-  /** An identity the feed has never seen live: a pending or foreign socket. */
+  /** An identity this feed never authorized: a foreign, forged, or stale-beyond-memory socket. */
   | "UNKNOWN"
   /** Not a well-formed connection id at all. */
   | "INVALID";
@@ -128,6 +142,12 @@ export type BinanceSocket = {
  * `connectionId` is supplied by the caller rather than minted by the transport
  * so that identity comes from one place — the composition root that also records
  * it — and so no part of this package reads unseeded randomness (§12.4).
+ *
+ * IT MUST BE THE IDENTITY THE CALLER REGISTERED with
+ * `BinanceReferenceFeed.connecting(connectionId)` for this attempt. The feed
+ * applies an event only from the socket it is listening to or from the identity
+ * it authorized; a socket opened under any other identity is refused, however
+ * well formed its events are (round-2 review, R2-M1).
  */
 export type BinanceSocketRequest = {
   readonly url: string;

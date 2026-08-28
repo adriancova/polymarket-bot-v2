@@ -84,7 +84,7 @@ describe("connect", () => {
   it("emits FeedConnected and an unwaived gap on the first subscription", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     const outcome = feed.onOpen("conn-1", clock.stamp());
 
     expect(typesOf(outcome.emissions)).toEqual([
@@ -100,10 +100,10 @@ describe("connect", () => {
   it("NEVER emits FeedResynchronized — it applies no authoritative snapshot (ADR-002 §2.4)", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     const first = feed.onOpen("conn-1", clock.stamp());
     feed.onClose("conn-1", clock.advance(100));
-    feed.connecting();
+    feed.connecting("conn-2");
     const second = feed.onOpen("conn-2", clock.advance(1_000));
 
     const all = [...typesOf(first.emissions), ...typesOf(second.emissions)];
@@ -113,17 +113,17 @@ describe("connect", () => {
   it("increments the subscription generation on every resubscription (§7.1)", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     expect(feed.subscriptionGeneration).toBe(0);
 
     feed.onClose("conn-1", clock.advance(10));
-    feed.connecting();
+    feed.connecting("conn-2");
     feed.onOpen("conn-2", clock.advance(10));
     expect(feed.subscriptionGeneration).toBe(1);
 
     feed.onClose("conn-2", clock.advance(10));
-    feed.connecting();
+    feed.connecting("conn-3");
     feed.onOpen("conn-3", clock.advance(10));
     expect(feed.subscriptionGeneration).toBe(2);
   });
@@ -131,10 +131,10 @@ describe("connect", () => {
   it("uses the reconnect reason code from the second connection onward", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     feed.onClose("conn-1", clock.advance(10));
-    feed.connecting();
+    feed.connecting("conn-2");
     const outcome = feed.onOpen("conn-2", clock.advance(10));
     const gap = outcome.emissions[1]?.payload as { reasonCode: string };
     expect(gap.reasonCode).toBe(BINANCE_REASON_CODES.reconnect);
@@ -143,7 +143,7 @@ describe("connect", () => {
   it("refuses an empty or over-long connection id, as data rather than as a throw", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     for (const badId of ["", "x".repeat(101)]) {
       const outcome = feed.onOpen(badId, clock.advance(1));
       expect(outcome.rejected?.relation).toBe("INVALID");
@@ -157,10 +157,10 @@ describe("socket identity (round-1 review, H1)", () => {
   it("does not record a retired socket's message as the live connection's", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-a");
     feed.onOpen("conn-a", clock.advance(1));
     feed.onClose("conn-a", clock.advance(1), { code: 1006 });
-    feed.connecting();
+    feed.connecting("conn-b");
     feed.onOpen("conn-b", clock.advance(1));
 
     // The retired socket delivers a buffered frame after its replacement is up.
@@ -182,10 +182,10 @@ describe("socket identity (round-1 review, H1)", () => {
   it("does not let a retired socket's close disconnect the live feed", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-a");
     feed.onOpen("conn-a", clock.advance(1));
     feed.onClose("conn-a", clock.advance(1), { code: 1006 });
-    feed.connecting();
+    feed.connecting("conn-b");
     feed.onOpen("conn-b", clock.advance(1));
 
     const outcome = feed.onClose("conn-a", clock.advance(1), { code: 1006, reason: "late" });
@@ -202,10 +202,10 @@ describe("socket identity (round-1 review, H1)", () => {
   it("retires the superseded socket when two sockets overlap", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-a");
     feed.onOpen("conn-a", clock.advance(1));
     // A make-before-break reconnect: conn-b opens while conn-a never closed.
-    feed.connecting();
+    feed.connecting("conn-b");
     const opened = feed.onOpen("conn-b", clock.advance(1));
     expect(opened.rejected).toBeUndefined();
     expect(feed.liveConnectionId).toBe("conn-b");
@@ -221,7 +221,7 @@ describe("socket identity (round-1 review, H1)", () => {
   it("refuses a second OPEN carrying the identity of the live connection", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-a");
     feed.onOpen("conn-a", clock.advance(1));
     const outcome = feed.onOpen("conn-a", clock.advance(1));
 
@@ -235,10 +235,12 @@ describe("socket identity (round-1 review, H1)", () => {
   it("never revives a retired connection id", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-a");
     feed.onOpen("conn-a", clock.advance(1));
     feed.onClose("conn-a", clock.advance(1));
-    feed.connecting();
+    // The caller registered conn-b for the replacement attempt; the transport
+    // announces the RETIRED conn-a instead.
+    feed.connecting("conn-b");
     const outcome = feed.onOpen("conn-a", clock.advance(1));
 
     expect(outcome.rejected?.relation).toBe("RETIRED");
@@ -250,7 +252,7 @@ describe("socket identity (round-1 review, H1)", () => {
   it("still accepts the close of an attempt that never opened, so a failed connect reconnects", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-attempt");
     const error = feed.onSocketError("conn-attempt", clock.advance(1), {
       detail: "connect ECONNREFUSED",
     });
@@ -268,7 +270,7 @@ describe("socket identity (round-1 review, H1)", () => {
   it("refuses a foreign socket's error while a connection is live", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-a");
     feed.onOpen("conn-a", clock.advance(1));
     const outcome = feed.onSocketError("conn-elsewhere", clock.advance(1), { detail: "noise" });
 
@@ -279,10 +281,10 @@ describe("socket identity (round-1 review, H1)", () => {
   it("does not let a retired socket's frame re-arm the staleness clock", () => {
     const clock = createManualClock();
     const feed = newFeed({ stalenessThresholdMs: 10_000 });
-    feed.connecting();
+    feed.connecting("conn-a");
     feed.onOpen("conn-a", clock.advance(1));
     feed.onClose("conn-a", clock.advance(1));
-    feed.connecting();
+    feed.connecting("conn-b");
     feed.onOpen("conn-b", clock.advance(1));
     feed.onFrame("conn-b", tradeFrame({ t: 1 }), clock.advance(1));
 
@@ -310,7 +312,7 @@ describe("socket identity (round-1 review, H1)", () => {
   it("classifies an OPEN on a closed feed instead of throwing", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.advance(1));
     feed.close(clock.advance(1));
 
@@ -323,7 +325,7 @@ describe("socket identity (round-1 review, H1)", () => {
   it("drives every socket event through one entry point, using the event's own identity", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-a");
     feed.handleSocketEvent({ type: "OPEN", connectionId: "conn-a" }, clock.advance(1));
     const applied = feed.handleSocketEvent(
       { type: "MESSAGE", connectionId: "conn-a", data: tradeFrame({ t: 5 }) },
@@ -340,6 +342,283 @@ describe("socket identity (round-1 review, H1)", () => {
   });
 });
 
+/**
+ * Being unrecognised is not a licence (round-2 review, finding R2-M1).
+ *
+ * Round 1 correlated events to the LIVE socket, which closed the retired-socket
+ * hole but left the other half open: whenever nothing was live, any well-formed
+ * identity was accepted. A forged close on a fresh feed disconnected it and
+ * directed a reconnect; a forged close during a replacement's connecting
+ * interval spent the caller's last reconnect attempt; a forged error after
+ * shutdown was counted as the feed's; and an identity evicted from the bounded
+ * retired memory could OPEN, supersede the live socket, and advance the
+ * subscription generation. Authorization now comes from a registered attempt —
+ * `connecting(connectionId)` — so each of the four probes is a refusal.
+ */
+describe("connection authorization (round-2 review, R2-M1)", () => {
+  const FORGED = "forged-identity";
+
+  /** Drives all four socket-event types under one identity. */
+  function driveAllFour(
+    feed: BinanceReferenceFeed,
+    clock: ReturnType<typeof createManualClock>,
+    connectionId: string,
+  ): {
+    open: ReturnType<BinanceReferenceFeed["onOpen"]>;
+    message: FrameOutcome;
+    error: ReturnType<BinanceReferenceFeed["onSocketError"]>;
+    close: ReturnType<BinanceReferenceFeed["onClose"]>;
+  } {
+    return {
+      open: feed.onOpen(connectionId, clock.advance(1)),
+      message: feed.onFrame(connectionId, tradeFrame({ t: 1 }), clock.advance(1)),
+      error: feed.onSocketError(connectionId, clock.advance(1), { detail: "forged" }),
+      close: feed.onClose(connectionId, clock.advance(1), { code: 1006 }),
+    };
+  }
+
+  it("refuses all four event types on a fresh IDLE feed that authorized nothing", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    const outcomes = driveAllFour(feed, clock, FORGED);
+
+    for (const outcome of Object.values(outcomes)) {
+      expect(outcome.rejected?.relation).toBe("UNKNOWN");
+      expect(outcome.rejected?.pendingConnectionId).toBeUndefined();
+      expect(typesOf(outcome.emissions)).not.toContain("FeedDisconnected");
+      expect(typesOf(outcome.emissions)).not.toContain("FeedConnected");
+      expect(outcome.directive).toEqual({ kind: "NONE" });
+    }
+    expect(outcomes.message.classification).toBe("STALE_CONNECTION");
+    expect(feed.state).toBe("IDLE");
+    expect(feed.liveConnectionId).toBeUndefined();
+
+    const metrics = feed.metrics(clock.peek());
+    expect(metrics.connections.connectionAttempts).toBe(0);
+    expect(metrics.connections.connectionsOpened).toBe(0);
+    expect(metrics.connections.disconnects).toBe(0);
+    expect(metrics.connections.socketErrors).toBe(0);
+    // Refused, but never silently: three lifecycle refusals and one frame.
+    expect(metrics.connections.lifecycleEventsNotFromLiveConnection).toBe(3);
+    expect(metrics.frames.framesNotFromLiveConnection).toBe(1);
+    expect(metrics.openIncidentReasonCodes).toContain(
+      BINANCE_REASON_CODES.unauthorizedConnectionEvent,
+    );
+  });
+
+  it("does not let a forged close spend the reconnect budget during a connecting interval", () => {
+    const clock = createManualClock();
+    const feed = newFeed({
+      reconnect: { initialDelayMs: 10, maxDelayMs: 20, multiplier: 2, maxAttempts: 1 },
+    });
+    feed.connecting("conn-1");
+    feed.onOpen("conn-1", clock.advance(1));
+    expect(feed.onClose("conn-1", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "RECONNECT_AFTER",
+      delayMs: 10,
+      attempt: 1,
+    });
+
+    // The replacement attempt is registered but has not opened yet.
+    feed.connecting("conn-2");
+    const outcomes = driveAllFour(feed, clock, FORGED);
+    for (const outcome of Object.values(outcomes)) {
+      expect(outcome.rejected?.relation).toBe("UNKNOWN");
+      expect(outcome.rejected?.pendingConnectionId).toBe("conn-2");
+      expect(typesOf(outcome.emissions)).not.toContain("FeedDisconnected");
+      expect(outcome.directive).toEqual({ kind: "NONE" });
+    }
+    expect(feed.metrics(clock.peek()).connections.disconnects).toBe(1);
+
+    // The AUTHORIZED attempt's own failure is still applied, and the budget the
+    // forgery could not spend is still there to be spent by it.
+    const authorized = feed.onClose("conn-2", clock.advance(1), { code: 1006 });
+    expect(typesOf(authorized.emissions)).toEqual(["FeedDisconnected"]);
+    expect(authorized.directive).toEqual({
+      kind: "STOP",
+      reason: "RECONNECT_ATTEMPTS_EXHAUSTED",
+    });
+  });
+
+  it("refuses all four event types after the caller shut the feed down", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    feed.connecting("conn-1");
+    feed.onOpen("conn-1", clock.advance(1));
+    feed.close(clock.advance(1), "operator shutdown");
+
+    const outcomes = driveAllFour(feed, clock, FORGED);
+    for (const outcome of Object.values(outcomes)) {
+      expect(outcome.rejected?.relation).toBe("UNKNOWN");
+      expect(typesOf(outcome.emissions)).not.toContain("FeedDisconnected");
+      expect(typesOf(outcome.emissions)).not.toContain("FeedConnected");
+    }
+    // A closed feed says so, rather than leaving the driver to infer it.
+    for (const outcome of [outcomes.open, outcomes.error, outcomes.close]) {
+      expect(outcome.directive).toEqual({ kind: "STOP", reason: "CLOSED_BY_CALLER" });
+    }
+    expect(feed.state).toBe("CLOSED");
+    const metrics = feed.metrics(clock.peek());
+    expect(metrics.connections.socketErrors).toBe(0);
+    expect(metrics.connections.disconnects).toBe(0);
+    expect(metrics.connections.connectionsOpened).toBe(1);
+  });
+
+  it("stays quiet about the caller's own socket closing after a deliberate shutdown", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    feed.connecting("conn-1");
+    feed.onOpen("conn-1", clock.advance(1));
+    feed.close(clock.advance(1), "operator shutdown");
+
+    // The transport reports the close of the socket the caller just closed: the
+    // expected epilogue of a shutdown, not an anomaly to count and report.
+    const outcome = feed.onClose("conn-1", clock.advance(1), { code: 1000 });
+    expect(outcome.emissions).toEqual([]);
+    expect(outcome.rejected).toBeUndefined();
+    expect(outcome.directive).toEqual({ kind: "STOP", reason: "CLOSED_BY_CALLER" });
+    expect(
+      feed.metrics(clock.peek()).connections.lifecycleEventsNotFromLiveConnection,
+    ).toBe(0);
+  });
+
+  it("revokes an outstanding authorization when the caller shuts the feed down", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    // An attempt is in flight when the operator shuts the feed down.
+    feed.connecting("conn-attempt");
+    feed.close(clock.advance(1), "operator shutdown");
+    expect(feed.pendingConnectionId).toBeUndefined();
+
+    const outcomes = driveAllFour(feed, clock, "conn-attempt");
+    expect(outcomes.open.rejected?.relation).toBe("RETIRED");
+    expect(typesOf(outcomes.open.emissions)).not.toContain("FeedConnected");
+    expect(outcomes.message.classification).toBe("STALE_CONNECTION");
+    expect(outcomes.error.rejected?.relation).toBe("RETIRED");
+    // The abandoned socket's own close is the expected epilogue of a shutdown.
+    expect(outcomes.close.emissions).toEqual([]);
+    expect(outcomes.close.directive).toEqual({ kind: "STOP", reason: "CLOSED_BY_CALLER" });
+
+    const metrics = feed.metrics(clock.peek());
+    expect(metrics.connections.socketErrors).toBe(0);
+    expect(metrics.connections.connectionsOpened).toBe(0);
+    expect(metrics.connections.disconnects).toBe(0);
+  });
+
+  it("refuses an identity evicted from the bounded retired memory, OPEN included", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    // 257 connections retire the first identity out of the 256-entry FIFO.
+    for (let index = 0; index < 257; index += 1) {
+      const id = `conn-${String(index)}`;
+      feed.connecting(id);
+      feed.onOpen(id, clock.advance(1));
+      feed.onClose(id, clock.advance(1));
+    }
+    feed.connecting("conn-live");
+    feed.onOpen("conn-live", clock.advance(1));
+    const generation = feed.subscriptionGeneration;
+
+    const outcomes = driveAllFour(feed, clock, "conn-0");
+    for (const outcome of Object.values(outcomes)) {
+      // Evicted, so no longer RECOGNISED as retired — and refused all the same.
+      expect(outcome.rejected?.relation).toBe("UNKNOWN");
+      expect(typesOf(outcome.emissions)).not.toContain("FeedConnected");
+      expect(typesOf(outcome.emissions)).not.toContain("FeedDisconnected");
+    }
+    // The live socket and its subscription generation are untouched: before the
+    // fix this OPEN superseded conn-live and advanced the generation.
+    expect(feed.liveConnectionId).toBe("conn-live");
+    expect(feed.subscriptionGeneration).toBe(generation);
+    expect(feed.state).toBe("OPEN");
+    expect(feed.metrics(clock.peek()).connections.connectionsOpened).toBe(258);
+
+    // An identity still inside the window is described as RETIRED, and refused
+    // exactly the same way: the memory classifies, it does not authorize.
+    const remembered = feed.onOpen("conn-256", clock.advance(1));
+    expect(remembered.rejected?.relation).toBe("RETIRED");
+    expect(feed.liveConnectionId).toBe("conn-live");
+  });
+
+  it("still applies the registered attempt's own pre-open failure", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    const attempt = feed.connecting("conn-attempt");
+    expect(attempt.connectionId).toBe("conn-attempt");
+    expect(feed.pendingConnectionId).toBe("conn-attempt");
+
+    const error = feed.onSocketError("conn-attempt", clock.advance(1), {
+      detail: "connect ECONNREFUSED",
+    });
+    expect(error.rejected).toBeUndefined();
+    expect(feed.metrics(clock.peek()).connections.socketErrors).toBe(1);
+    // An error does not resolve the attempt; the close that follows does.
+    expect(feed.pendingConnectionId).toBe("conn-attempt");
+
+    const close = feed.onClose("conn-attempt", clock.advance(1), { code: 1006 });
+    expect(typesOf(close.emissions)).toEqual(["FeedDisconnected"]);
+    expect(close.directive).toEqual({ kind: "RECONNECT_AFTER", delayMs: 1_000, attempt: 1 });
+    expect(feed.pendingConnectionId).toBeUndefined();
+
+    // Having resolved by failing, it authorizes nothing further.
+    const late = feed.onOpen("conn-attempt", clock.advance(1));
+    expect(late.rejected?.relation).toBe("RETIRED");
+  });
+
+  it("does not let a replacement attempt's failure disconnect the live socket", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    feed.connecting("conn-a");
+    feed.onOpen("conn-a", clock.advance(1));
+    // A make-before-break replacement is registered and fails before it opens.
+    feed.connecting("conn-b");
+    const outcome = feed.onClose("conn-b", clock.advance(1), { code: 1006 });
+
+    expect(outcome.rejected?.relation).toBe("PENDING");
+    expect(typesOf(outcome.emissions)).not.toContain("FeedDisconnected");
+    expect(outcome.directive).toEqual({ kind: "NONE" });
+    expect(feed.liveConnectionId).toBe("conn-a");
+    expect(feed.metrics(clock.peek()).connections.disconnects).toBe(0);
+  });
+
+  it("registers an attempt only under an identity this feed has never seen", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    // A malformed identity cannot be registered at all.
+    expect(() => feed.connecting("")).toThrow(BinanceConfigurationError);
+    expect(() => feed.connecting("x".repeat(101))).toThrow(BinanceConfigurationError);
+    expect(feed.metrics(clock.peek()).connections.connectionAttempts).toBe(0);
+
+    feed.connecting("conn-a");
+    // The attempt in flight is not registered twice.
+    expect(() => feed.connecting("conn-a")).toThrow(BinanceStateError);
+    feed.onOpen("conn-a", clock.advance(1));
+    // Nor is the identity of the socket the feed is listening to.
+    expect(() => feed.connecting("conn-a")).toThrow(BinanceStateError);
+
+    feed.onClose("conn-a", clock.advance(1));
+    // Nor a retired one: one connection id identifies exactly one connection.
+    expect(() => feed.connecting("conn-a")).toThrow(BinanceStateError);
+    expect(feed.metrics(clock.peek()).connections.connectionAttempts).toBe(1);
+  });
+
+  it("retires an attempt the caller abandoned by registering another", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    feed.connecting("conn-a");
+    feed.connecting("conn-b");
+
+    const abandoned = feed.onOpen("conn-a", clock.advance(1));
+    expect(abandoned.rejected?.relation).toBe("RETIRED");
+    expect(feed.liveConnectionId).toBeUndefined();
+
+    const registered = feed.onOpen("conn-b", clock.advance(1));
+    expect(registered.rejected).toBeUndefined();
+    expect(feed.liveConnectionId).toBe("conn-b");
+    expect(feed.pendingConnectionId).toBeUndefined();
+  });
+});
+
 describe("frames", () => {
   function openFeed(): {
     feed: BinanceReferenceFeed;
@@ -348,7 +627,7 @@ describe("frames", () => {
   } {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     return { feed, clock, connectionId: "conn-1" };
   }
@@ -572,7 +851,7 @@ describe("channel provenance (round-1 review, M1)", () => {
   } {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     return { feed, clock };
   }
@@ -615,7 +894,7 @@ describe("channel provenance (round-1 review, M1)", () => {
   it("refuses a frame for a channel this connection never subscribed to", () => {
     const clock = createManualClock();
     const feed = newFeed({ subscriptions: [{ symbol: "BTCUSDT", suffix: "trade" }] });
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
 
     // A well-formed, self-consistent bookTicker frame — for a stream the URL
@@ -667,7 +946,7 @@ describe("disconnect and reconnect", () => {
   it("emits FeedDisconnected and directs a backed-off reconnect", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     const outcome = feed.onClose("conn-1", clock.advance(10), { code: 1006, reason: "abnormal" });
 
@@ -678,7 +957,7 @@ describe("disconnect and reconnect", () => {
   it("backs off further on consecutive failures and resets after a successful open", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
 
     expect(feed.onClose("conn-1", clock.advance(1)).directive).toEqual({
@@ -688,14 +967,14 @@ describe("disconnect and reconnect", () => {
     });
     // The retry's socket fails before it ever opens: a second consecutive
     // failure, reported by the socket that failed.
-    feed.connecting();
+    feed.connecting("conn-2");
     expect(feed.onClose("conn-2", clock.advance(1)).directive).toEqual({
       kind: "RECONNECT_AFTER",
       delayMs: 2_000,
       attempt: 2,
     });
 
-    feed.connecting();
+    feed.connecting("conn-3");
     feed.onOpen("conn-3", clock.advance(1));
     expect(feed.onClose("conn-3", clock.advance(1)).directive).toEqual({
       kind: "RECONNECT_AFTER",
@@ -707,7 +986,7 @@ describe("disconnect and reconnect", () => {
   it("does not advance the backoff when the same socket closes twice", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     feed.onClose("conn-1", clock.advance(1));
     const repeat = feed.onClose("conn-1", clock.advance(1));
@@ -722,10 +1001,10 @@ describe("disconnect and reconnect", () => {
     const feed = newFeed({
       reconnect: { initialDelayMs: 10, maxDelayMs: 20, multiplier: 2, maxAttempts: 1 },
     });
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     feed.onClose("conn-1", clock.advance(1));
-    feed.connecting();
+    feed.connecting("conn-2");
     const outcome = feed.onClose("conn-2", clock.advance(1));
     expect(outcome.directive).toEqual({
       kind: "STOP",
@@ -736,24 +1015,24 @@ describe("disconnect and reconnect", () => {
   it("stops and does not reconnect when the caller closes the feed", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     const outcome = feed.close(clock.advance(1), "operator shutdown");
 
     expect(typesOf(outcome.emissions)).toEqual(["FeedDisconnected"]);
     expect(outcome.directive).toEqual({ kind: "STOP", reason: "CLOSED_BY_CALLER" });
     expect(feed.state).toBe("CLOSED");
-    expect(() => feed.connecting()).toThrow(BinanceStateError);
+    expect(() => feed.connecting("conn-2")).toThrow(BinanceStateError);
   });
 
   it("remembers venue ids across a reconnect, so a replayed frame is still a duplicate", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     feed.onFrame("conn-1", tradeFrame({ t: 42 }), clock.advance(1));
     feed.onClose("conn-1", clock.advance(1));
-    feed.connecting();
+    feed.connecting("conn-2");
     feed.onOpen("conn-2", clock.advance(1_000));
 
     const outcome = feed.onFrame("conn-2", tradeFrame({ t: 42 }), clock.advance(1));
@@ -763,11 +1042,11 @@ describe("disconnect and reconnect", () => {
   it("recognises a replayed frame across a reconnect even when newer ids arrived first", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     feed.onFrame("conn-1", tradeFrame({ t: 42 }), clock.advance(1));
     feed.onClose("conn-1", clock.advance(1));
-    feed.connecting();
+    feed.connecting("conn-2");
     feed.onOpen("conn-2", clock.advance(1_000));
     feed.onFrame("conn-2", tradeFrame({ t: 43 }), clock.advance(1));
 
@@ -781,7 +1060,7 @@ describe("staleness", () => {
   it("reports nothing before the caller's threshold is reached", () => {
     const clock = createManualClock();
     const feed = newFeed({ stalenessThresholdMs: 10_000 });
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     expect(feed.checkStaleness(clock.advance(9_999)).emissions).toEqual([]);
   });
@@ -789,7 +1068,7 @@ describe("staleness", () => {
   it("emits FeedStale once per silence episode, re-armed by the next frame", () => {
     const clock = createManualClock();
     const feed = newFeed({ stalenessThresholdMs: 10_000 });
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     feed.onFrame("conn-1", tradeFrame(), clock.advance(1_000));
 
@@ -809,7 +1088,7 @@ describe("staleness", () => {
   it("measures staleness from the connect stamp before any frame has arrived", () => {
     const clock = createManualClock();
     const feed = newFeed({ stalenessThresholdMs: 5_000 });
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     const outcome = feed.checkStaleness(clock.advance(5_000));
     expect(typesOf(outcome.emissions)).toEqual(["FeedStale"]);
@@ -827,7 +1106,7 @@ describe("metrics", () => {
   it("reports staleness, generation, and per-stream sequence state", () => {
     const clock = createManualClock();
     const feed = newFeed({ stalenessThresholdMs: 30_000 });
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     feed.onFrame("conn-1", tradeFrame({ t: 7 }), clock.advance(1_000));
     feed.onFrame("conn-1", bookTickerFrame({ u: 11 }), clock.advance(1_000));
@@ -858,7 +1137,7 @@ describe("metrics", () => {
   it("publishes the duplicate window's bound, so its reach is not assumed", () => {
     const clock = createManualClock();
     const feed = newFeed({ maxRecentIdsPerStream: 4 });
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     for (const t of [1, 2, 3, 4, 5, 6]) {
       feed.onFrame("conn-1", tradeFrame({ t }), clock.advance(1));
@@ -872,7 +1151,7 @@ describe("metrics", () => {
   it("reports the venue-to-receipt lag from the last trade", () => {
     const clock = createManualClock({ startAt: "2022-12-31T19:43:02.000Z" });
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     // Venue trade time is …:02.136Z; the frame is received at …:02.436Z.
     feed.onFrame("conn-1", tradeFrame(), clock.advance(436));
@@ -886,7 +1165,7 @@ describe("metrics", () => {
   it("lists the reason codes with an incident still open", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
     feed.onFrame("conn-1", "bad", clock.advance(1));
 
@@ -901,7 +1180,7 @@ describe("the UNVERIFIED register describes what the code actually does", () => 
   it("BNC-U4 distinguishes one unusable book side from both (round-1 review, L1)", () => {
     const clock = createManualClock();
     const feed = newFeed();
-    feed.connecting();
+    feed.connecting("conn-1");
     feed.onOpen("conn-1", clock.stamp());
 
     const oneSide = feed.onFrame(

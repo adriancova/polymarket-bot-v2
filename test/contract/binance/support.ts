@@ -58,7 +58,9 @@ export function createHarness(
 
 /** Opens the feed and collects the resulting emissions. */
 export function open(harness: Harness, connectionId: string): readonly AdapterEmission[] {
-  harness.feed.connecting();
+  // The attempt is registered before the socket exists: only the identity the
+  // caller registers may open a connection (round-2 review, R2-M1).
+  harness.feed.connecting(connectionId);
   harness.connectionId = connectionId;
   const outcome = harness.feed.onOpen(connectionId, harness.clock.peek());
   harness.emissions.push(...outcome.emissions);
