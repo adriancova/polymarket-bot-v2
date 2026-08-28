@@ -31,7 +31,10 @@
  * can tell which socket delivered a frame passes that identity to
  * {@link CoinbaseStreamProcessor.ingestFrame}; a frame from a socket that is no
  * longer current is refused and reported rather than drafted onto the current
- * connection's generation.
+ * connection's generation. A caller that has RETIRED a socket whose replacement
+ * has not opened yet knows something this processor cannot — in that window the
+ * retired socket's id is still the one held here — and states it through
+ * {@link CoinbaseStreamProcessor.staleConnectionFrame}.
  *
  * NO CONFIGURATION, NO ENVIRONMENT, NO CLOCK OF ITS OWN. Every parameter arrives
  * as a constructor argument and every impure capability arrives as a port. This
@@ -140,7 +143,11 @@ export type CoinbaseIngestResult = CoinbaseProcessorOutput & {
  * OPTIONAL, AND THAT IS DELIBERATE. A caller driving the processor by hand — a
  * replay, a test — has exactly one connection in view and can omit it; when it
  * is omitted the processor cannot check, and says so by not checking rather than
- * by guessing. The bundled {@link CoinbaseConnectionManager} always supplies it.
+ * by guessing. The bundled {@link CoinbaseConnectionManager} always supplies it,
+ * AND additionally gates on its own connection ordinal, which is authoritative
+ * earlier than anything the processor can see. A direct caller that owns several
+ * sockets must supply this on every frame: omitting it turns the origin check
+ * off, and no other mechanism in this package can turn it back on.
  */
 export type CoinbaseFrameOrigin = {
   readonly connectionId: string;
@@ -471,21 +478,12 @@ export class CoinbaseStreamProcessor {
     const anomalies: CoinbaseAnomaly[] = [];
 
     if (from !== undefined && from.connectionId !== this.#connectionId) {
-      this.#counters.framesFromStaleConnection += 1;
       anomalies.push(
-        this.#anomaly(
-          "COINBASE_STALE_CONNECTION_ACTIVITY",
-          `a frame was delivered by connection "${from.connectionId.slice(0, 64)}", which is not the current connection "${this.#connectionId === "" ? "<none>" : this.#connectionId.slice(0, 64)}" at subscription generation ${String(this.#generation)}; it is refused rather than relabelled with the current generation, and its raw bytes are preserved here`,
-          {
-            receivedAt,
-            ...(classified.kind === "REJECTED"
-              ? {}
-              : { channel: classified.frame.channel, sequenceNum: classified.frame.sequence_num }),
-            ...(classified.text === undefined ? {} : { rawFrame: classified.text }),
-            ...(classified.kind === "REJECTED" && classified.byteLength !== undefined
-              ? { rawFrameByteLength: classified.byteLength }
-              : {}),
-          },
+        this.#staleFrameAnomaly(
+          classified,
+          from,
+          receivedAt,
+          `which is not the current connection "${this.#connectionId === "" ? "<none>" : this.#connectionId.slice(0, 64)}" at subscription generation ${String(this.#generation)}`,
         ),
       );
       // Deliberately NOT recorded as evidence of liveness: a frame from a dead
@@ -573,6 +571,73 @@ export class CoinbaseStreamProcessor {
 
     this.#maybeResynchronize(receivedAt, feedEvents);
     return this.#finish(classified.kind, normalized, feedEvents, anomalies);
+  }
+
+  /**
+   * Refuses a frame the TRANSPORT OWNER already knows came from a retired
+   * socket.
+   *
+   * Why this exists next to {@link CoinbaseStreamProcessor.ingestFrame}'s own
+   * origin check: the two callers know different things at different moments.
+   * The processor's notion of "current" is the connection that last OPENED, so
+   * between the moment a socket is abandoned and the moment its replacement
+   * opens, a frame from the abandoned socket still carries the `connectionId`
+   * the processor holds — it looks current, and `ingestFrame` would accept it,
+   * publish its trades, and let its `snapshot` close the gap the reconnect
+   * opened. The transport owner knows better the instant it starts the
+   * replacement attempt, because it keeps a connection ordinal. This entry point
+   * is how it says so.
+   *
+   * The frame is counted as received, counted as refused
+   * (`framesFromStaleConnection`), and reported with its raw bytes preserved.
+   * NOTHING else changes: no sequence observation, no dedupe entry, no snapshot
+   * mark, and no staleness reset — a frame from a retired socket is not evidence
+   * that its replacement is alive.
+   *
+   * The caller asserts the origin is retired; the processor does not second-
+   * guess it, because the caller is the only party that can know.
+   */
+  staleConnectionFrame(raw: CoinbaseRawFrame, from: CoinbaseFrameOrigin): CoinbaseIngestResult {
+    const receivedAt = this.#wallClock.nowIso();
+    this.#counters.framesReceived += 1;
+    const classified = classifyFrame(raw);
+    return this.#finish(
+      classified.kind,
+      [],
+      [],
+      [
+        this.#staleFrameAnomaly(
+          classified,
+          from,
+          receivedAt,
+          `whose socket the transport owner has already retired; its replacement has not reported itself open yet, so this adapter's own view still names "${this.#connectionId === "" ? "<none>" : this.#connectionId.slice(0, 64)}" at subscription generation ${String(this.#generation)}, and a frame from a retired socket is no evidence about the connection replacing it`,
+        ),
+      ],
+    );
+  }
+
+  /** The one `COINBASE_STALE_CONNECTION_ACTIVITY` a refused frame produces. */
+  #staleFrameAnomaly(
+    classified: CoinbaseClassifiedFrame,
+    from: CoinbaseFrameOrigin,
+    receivedAt: string,
+    why: string,
+  ): CoinbaseAnomaly {
+    this.#counters.framesFromStaleConnection += 1;
+    return this.#anomaly(
+      "COINBASE_STALE_CONNECTION_ACTIVITY",
+      `a frame was delivered by connection "${from.connectionId.slice(0, 64)}", ${why}; it is refused rather than relabelled with the current generation, and its raw bytes are preserved here`,
+      {
+        receivedAt,
+        ...(classified.kind === "REJECTED"
+          ? {}
+          : { channel: classified.frame.channel, sequenceNum: classified.frame.sequence_num }),
+        ...(classified.text === undefined ? {} : { rawFrame: classified.text }),
+        ...(classified.kind === "REJECTED" && classified.byteLength !== undefined
+          ? { rawFrameByteLength: classified.byteLength }
+          : {}),
+      },
+    );
   }
 
   /**
@@ -735,6 +800,15 @@ export class CoinbaseStreamProcessor {
    * adapter refused still satisfied its channel and could produce a
    * `FeedResynchronized` carrying `authoritativeSnapshotApplied: true` when no
    * authoritative state had been applied at all.
+   *
+   * A REFUSED SNAPSHOT ALSO REVOKES AN EARLIER MARK. The mark means "this
+   * channel's current state has been established on this generation", and a
+   * newer snapshot the adapter could not apply is the venue restating that state
+   * in terms this adapter cannot read — so the older mark no longer describes
+   * anything known to be current. Leaving it standing let the OTHER channel's
+   * later snapshot emit `FeedResynchronized` while the newest statement on this
+   * channel was unapplied, which contradicts this very anomaly's claim that the
+   * gap stays open until a snapshot applies in full.
    */
   #noteSnapshot(
     channel: CoinbaseChannel,
@@ -749,11 +823,12 @@ export class CoinbaseStreamProcessor {
       this.#snapshotSeen.add(channel);
       return;
     }
+    const revoked = this.#snapshotSeen.delete(channel);
     this.#counters.snapshotsNotApplied += 1;
     anomalies.push(
       this.#anomaly(
         "COINBASE_SNAPSHOT_NOT_APPLIED",
-        `the ${channel} snapshot carried at least one entry this adapter had to refuse, so it is not an authoritative statement of current state: ${channel} is NOT recorded as resynchronized on subscription generation ${String(this.#generation)}, and any open gap stays open until a snapshot arrives that applies in full`,
+        `the ${channel} snapshot carried at least one entry this adapter had to refuse, so it is not an authoritative statement of current state: ${channel} is NOT recorded as resynchronized on subscription generation ${String(this.#generation)}${revoked ? ", and the mark an earlier snapshot on this channel had earned is revoked, because this newer statement of current state could not be applied" : ""}, and any open gap stays open until a snapshot arrives that applies in full`,
         { receivedAt: where.receivedAt, channel, sequenceNum: where.sequenceNum, rawFrame: where.rawFrame },
       ),
     );

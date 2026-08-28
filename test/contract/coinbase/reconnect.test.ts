@@ -171,6 +171,49 @@ describe("reconnect, at the processor", () => {
     expect(harness.processor.gapOpen).toBe(false);
   });
 
+  it("revokes an earlier snapshot mark when a newer snapshot on that channel is refused", () => {
+    // The exact ordered sequence: a trades snapshot that APPLIES, then a newer
+    // trades snapshot the adapter must refuse, then a valid ticker snapshot.
+    // The mark the first one earned describes state the second one has just
+    // restated in terms this adapter cannot read, so it no longer describes
+    // anything known to be current. Left standing, it let the ticker snapshot
+    // emit `FeedResynchronized` while the newest word on `market_trades` was
+    // unapplied — contradicting the very anomaly that says the gap stays open
+    // until a snapshot applies in full.
+    const harness = createHarness();
+    harness.processor.connectionOpened("c1");
+    harness.processor.connectionClosed({ reasonCode: "COINBASE_SOCKET_CLOSED" });
+    harness.processor.connectionOpened("c2");
+
+    const applied = harness.processor.ingestFrame(frameText("market-trades-snapshot"));
+    expect(trades(applied)).toHaveLength(1);
+    expect(feedEventTypes(applied)).not.toContain("FeedResynchronized");
+
+    const refused = harness.processor.ingestFrame(
+      frameTextWithSequence("malformed-snapshot-empty-price", 1),
+    );
+    expect(anomalyCodes(refused)).toEqual([
+      "COINBASE_ECONOMIC_FIELD_INVALID",
+      "COINBASE_SNAPSHOT_NOT_APPLIED",
+    ]);
+
+    const ticker = harness.processor.ingestFrame(frameTextWithSequence("ticker-snapshot", 2));
+    expect(tops(ticker)).toHaveLength(1);
+    expect(feedEventTypes(ticker)).not.toContain("FeedResynchronized");
+    expect(harness.processor.gapOpen).toBe(true);
+    expect(harness.processor.metrics().counters.resynchronizations).toBe(0);
+
+    // Revocation delays resynchronization; it does not block it. A trades
+    // snapshot that applies — here by suppressing trades already emitted —
+    // re-earns the mark and closes the gap.
+    const closed = harness.processor.ingestFrame(
+      frameTextWithSequence("market-trades-snapshot", 3),
+    );
+    expect(anomalyCodes(closed)).toContain("COINBASE_DUPLICATE_TRADE");
+    expect(feedEvent(closed, "FeedResynchronized").payload.authoritativeSnapshotApplied).toBe(true);
+    expect(harness.processor.gapOpen).toBe(false);
+  });
+
   it("refuses a frame delivered by a connection it has already replaced", () => {
     const harness = createHarness({ channels: ["market_trades"] });
     harness.processor.connectionOpened("c1");
@@ -413,6 +456,87 @@ describe("reconnect, at the connection manager", () => {
     expect(manager.metrics().gapOpen).toBe(true);
     expect(manager.metrics().counters.tradesNormalized).toBe(0);
     expect(manager.metrics().counters.framesFromStaleConnection).toBe(1);
+    manager.stop();
+  });
+
+  it("refuses a frame from a retired socket while its replacement is still connecting", () => {
+    const { manager, factory, timer, outputs } = build();
+    manager.start();
+    const first = socketAt(factory, 0);
+    first.open();
+    first.dropConnection();
+    timer.advanceMs(1_000);
+    // The replacement socket EXISTS but has not reported itself open, so the
+    // processor's own view still names the retired connection. Only the
+    // manager's ordinal knows the difference in this window.
+    expect(factory.sockets).toHaveLength(2);
+    expect(socketAt(factory, 1).opened).toBe(false);
+    expect(manager.metrics().connectionId).toBe("coinbase.reference-c1");
+
+    outputs.length = 0;
+    first.listener.onFrame(frameText("market-trades-snapshot"));
+
+    expect(anomalyCodesOf(outputs)).toEqual(["COINBASE_STALE_CONNECTION_ACTIVITY"]);
+    const anomaly = outputs.flatMap((output) => output.anomalies)[0];
+    // The bytes must survive the refusal: they are the only record of what the
+    // dead socket said.
+    expect(anomaly?.rawFrame).toBe(frameText("market-trades-snapshot"));
+    expect(anomaly?.detail).toContain("coinbase.reference-c1");
+    expect(outputs.flatMap((output) => output.normalized)).toHaveLength(0);
+    expect(outputs.flatMap(feedEventTypes)).toEqual([]);
+
+    const metrics = manager.metrics();
+    expect(metrics.counters.framesFromStaleConnection).toBe(1);
+    expect(metrics.counters.tradesNormalized).toBe(0);
+    // Not evidence of liveness either: the replacement has not said anything.
+    expect(metrics.lastMessageAt).toBeUndefined();
+
+    // The replacement then opens, which is what declares the gap. The retired
+    // socket's `snapshot` may not close it: it was never applied.
+    socketAt(factory, 1).open();
+    expect(manager.metrics().gapOpen).toBe(true);
+    expect(manager.metrics().counters.tradesNormalized).toBe(0);
+    manager.stop();
+  });
+
+  it("sends its subscriptions even when the transport reports open before connect() returns", () => {
+    // A transport may report `onOpen` synchronously, from inside `connect()`,
+    // before the manager holds any socket handle. Reporting `FeedConnected` for
+    // a subscription that was never sent would be a connection that receives
+    // nothing and says it is healthy.
+    const factory = new FakeCoinbaseSocketFactory({ openOnConnect: true });
+    const timer = new ManualTimer();
+    const outputs: CoinbaseFeedOutput[] = [];
+    const manager = new CoinbaseConnectionManager({
+      feedId: "coinbase.reference",
+      productIds: ["ETH-USD"],
+      socketFactory: factory,
+      timer,
+      wallClock: new ManualWallClock("2026-08-27T12:00:00.000Z"),
+      monotonicClock: new ManualMonotonicClock(0n),
+      onOutput: (output) => outputs.push(output),
+    });
+
+    manager.start();
+    const expectedSubscriptions = [
+      '{"type":"subscribe","channel":"heartbeats"}',
+      '{"type":"subscribe","channel":"market_trades","product_ids":["ETH-USD"]}',
+      '{"type":"subscribe","channel":"ticker","product_ids":["ETH-USD"]}',
+    ];
+    expect(socketAt(factory, 0).sent).toEqual(expectedSubscriptions);
+    expect(outputs.flatMap(feedEventTypes)).toEqual(["FeedConnected"]);
+
+    // The same must hold on the reconnect path, which reaches `#connect` from a
+    // timer rather than from `start()`.
+    socketAt(factory, 0).dropConnection();
+    timer.advanceMs(1_000);
+    expect(factory.sockets).toHaveLength(2);
+    expect(socketAt(factory, 1).sent).toEqual(expectedSubscriptions);
+
+    // A subscribed connection receives, and what it receives resynchronizes.
+    socketAt(factory, 1).deliver(frameText("market-trades-snapshot"));
+    socketAt(factory, 1).deliver(frameTextWithSequence("ticker-snapshot", 1));
+    expect(outputs.flatMap(feedEventTypes)).toContain("FeedResynchronized");
     manager.stop();
   });
 

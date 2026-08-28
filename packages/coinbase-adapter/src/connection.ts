@@ -25,13 +25,19 @@
  * `CoinbaseStreamProcessor.resubscribed()` exists for a caller that has its own
  * evidence and wants the cheaper path.
  *
- * EVERY CALLBACK IS BOUND TO ITS OWN SOCKET. A listener closes over the
- * connection ordinal and id it was created for, so a callback from a socket the
- * manager has already replaced is recognized as such and reported instead of
- * being acted on. Without that binding a late frame from a dead socket would be
- * handed to the processor and drafted onto the CURRENT `connectionId` and
- * `subscriptionGeneration` — old-generation data wearing new-generation
- * provenance, which is the one thing `subscriptionGeneration` exists to prevent.
+ * EVERY CALLBACK IS BOUND TO ITS OWN SOCKET, FRAMES INCLUDED. A listener closes
+ * over the connection ordinal and id it was created for, so a callback from a
+ * socket the manager has already replaced is recognized as such and reported
+ * instead of being acted on. Without that binding a late frame from a dead
+ * socket would be handed to the processor and drafted onto the CURRENT
+ * `connectionId` and `subscriptionGeneration` — old-generation data wearing
+ * new-generation provenance, which is the one thing `subscriptionGeneration`
+ * exists to prevent. The ordinal is authoritative from the instant a
+ * REPLACEMENT ATTEMPT STARTS, which is earlier than any other view of the
+ * truth: until that replacement reports itself open, the processor still holds
+ * the retired socket's `connectionId` and cannot tell its frames from live ones.
+ * That window is precisely when a socket that died mid-flight delivers its last
+ * frames, so it is the manager, not the processor, that has to refuse them.
  *
  * BACKOFF IS DETERMINISTIC. No jitter, because jitter is unseeded randomness and
  * §12.4 makes runs reproducible; a fleet that needs jitter can supply a
@@ -240,6 +246,25 @@ export class CoinbaseConnectionManager {
    * may invoke `onOpen` before it returns, in which case `this.#socket` has not
    * been assigned yet and comparing against it would misjudge the CURRENT
    * connection as stale.
+   *
+   * THE ORDINAL ALSO GATES FRAMES, NOT ONLY THE OTHER THREE CALLBACKS. It
+   * becomes authoritative here, one line after it is incremented, which is
+   * strictly earlier than the processor's own notion of "current" — that one
+   * only moves when the REPLACEMENT reports itself open. In the window between,
+   * a frame from the retired socket still carries the id the processor holds, so
+   * the processor cannot recognize it. This is the only place that can, so it
+   * does, and hands the frame to
+   * {@link CoinbaseStreamProcessor.staleConnectionFrame} to be counted and
+   * reported with its raw bytes rather than ingested.
+   *
+   * NOTHING HERE DEPENDS ON `connect()` HAVING RETURNED. A transport may report
+   * a synchronous `onOpen` — an already-connected bridge, a mock, a socket that
+   * completes its handshake inside the constructor — and at that instant no
+   * socket handle exists to send on. An action that needs the handle is
+   * therefore held by `withSocket` and run the moment the handle exists. Before
+   * that, `#sendSubscriptions` read `this.#socket`, found `undefined`, and
+   * silently sent nothing: `FeedConnected` on a subscription that was never
+   * made, on the very timing this ordinal binding exists to survive.
    */
   #connect(): void {
     if (this.#state === "STOPPED") {
@@ -251,7 +276,30 @@ export class CoinbaseConnectionManager {
     const connectionId = `${this.#options.feedId}-c${String(ordinal)}`;
     const isCurrent = (): boolean => this.#connectionOrdinal === ordinal;
 
-    this.#socket = this.#options.socketFactory.connect(this.#endpoint, {
+    /**
+     * THIS attempt's handle, once `connect()` has returned it.
+     *
+     * Explicitly `undefined` until then, because that is the state the whole
+     * mechanism below exists for: a callback can fire while there is nothing to
+     * act on.
+     */
+    let socket: CoinbaseSocket | undefined = undefined;
+    /** Actions raised by a callback that fired before the handle existed. */
+    let pending: ((socket: CoinbaseSocket) => void)[] = [];
+    /** This attempt's socket is finished: it closed, whoever noticed. */
+    let retired = false;
+    const withSocket = (action: (socket: CoinbaseSocket) => void): void => {
+      if (retired || this.#state === "STOPPED" || !isCurrent()) {
+        return;
+      }
+      if (socket === undefined) {
+        pending.push(action);
+        return;
+      }
+      action(socket);
+    };
+
+    const opened = this.#options.socketFactory.connect(this.#endpoint, {
       onOpen: () => {
         if (this.#state === "STOPPED") {
           return;
@@ -267,23 +315,34 @@ export class CoinbaseConnectionManager {
         // The generation is established before any frame can arrive, so every
         // event carries the generation it was actually received under.
         this.#emit(this.#processor.connectionOpened(connectionId));
-        this.#sendSubscriptions();
+        withSocket((open) => {
+          this.#sendSubscriptions(open);
+        });
       },
       onFrame: (frame: CoinbaseRawFrame) => {
         if (this.#state === "STOPPED") {
           return;
         }
-        // The origin travels with the frame rather than being checked here, so
-        // there is ONE place that decides whether a frame belongs to the current
-        // generation, and it is the place that would otherwise draft the
-        // generation onto it.
+        if (!isCurrent()) {
+          // This socket has been abandoned, whether or not its replacement has
+          // opened. Only the ordinal knows that yet, so the refusal is stated
+          // here and the frame is reported — with its bytes — rather than
+          // ingested under a generation it was not received on.
+          this.#emit(this.#processor.staleConnectionFrame(frame, { connectionId }));
+          return;
+        }
+        // The origin still travels with the frame: the processor is the place
+        // that would otherwise draft the current generation onto it, so it
+        // checks too, against what IT knows.
         const result = this.#processor.ingestFrame(frame, { connectionId });
         this.#emit(result);
-        if (result.requiresResubscription && isCurrent()) {
+        if (result.requiresResubscription) {
           // A gap is open and no snapshot can arrive on this subscription.
           // Closing takes the normal disconnect path, which records the
           // disconnection and opens a new generation with fresh snapshots.
-          this.#dropConnection();
+          withSocket((open) => {
+            this.#dropSocket(open);
+          });
         }
       },
       onError: (error: unknown) => {
@@ -306,6 +365,9 @@ export class CoinbaseConnectionManager {
         this.#lastError = error;
       },
       onClose: (info) => {
+        // Whoever it belongs to, this socket is over: no deferred action may be
+        // run on it afterwards.
+        retired = true;
         if (this.#state === "STOPPED") {
           return;
         }
@@ -342,13 +404,48 @@ export class CoinbaseConnectionManager {
         this.#scheduleReconnect();
       },
     });
-  }
 
-  #sendSubscriptions(): void {
-    const socket = this.#socket;
-    if (socket === undefined) {
+    if (retired) {
+      // The socket closed before its handle existed. Its close path has already
+      // run; adopting the handle now would leave a dead socket in `#socket`.
+      pending = [];
       return;
     }
+    if (this.#stopped() || !isCurrent()) {
+      // The attempt was abandoned while `connect()` was still running — a
+      // consumer that called `stop()` from inside a synchronous callback, or a
+      // reconnect that overtook this attempt. The handle is closed rather than
+      // adopted, because a socket nobody owns would stay open.
+      pending = [];
+      opened.close();
+      return;
+    }
+    socket = opened;
+    this.#socket = opened;
+    const deferred = pending;
+    pending = [];
+    for (const action of deferred) {
+      if (retired || this.#stopped() || !isCurrent()) {
+        break;
+      }
+      action(opened);
+    }
+  }
+
+  /**
+   * `#state === "STOPPED"`, behind a method on purpose.
+   *
+   * `#connect` assigns `#state = "CONNECTING"` and the compiler then narrows the
+   * field to that literal for the rest of the body — sound only if nothing can
+   * change it in between. Something can: a transport that calls back
+   * synchronously reaches `#emit`, and a consumer may call `stop()` from there.
+   * Reading through a call keeps the check the compiler would otherwise erase.
+   */
+  #stopped(): boolean {
+    return this.#state === "STOPPED";
+  }
+
+  #sendSubscriptions(socket: CoinbaseSocket): void {
     // One channel per subscription message (`subscribe-within-5s`), and the
     // heartbeats channel takes no products (`heartbeats`).
     if (this.#subscribeHeartbeats) {
@@ -359,10 +456,19 @@ export class CoinbaseConnectionManager {
     }
   }
 
+  /** Closes one specific socket, forgetting it only if it is the one in use. */
+  #dropSocket(socket: CoinbaseSocket): void {
+    if (this.#socket === socket) {
+      this.#socket = undefined;
+    }
+    socket.close();
+  }
+
   #dropConnection(): void {
     const socket = this.#socket;
-    this.#socket = undefined;
-    socket?.close();
+    if (socket !== undefined) {
+      this.#dropSocket(socket);
+    }
   }
 
   #scheduleReconnect(): void {

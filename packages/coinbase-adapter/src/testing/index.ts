@@ -181,14 +181,35 @@ export class FakeCoinbaseSocket implements CoinbaseSocket {
   }
 }
 
+export type FakeCoinbaseSocketFactoryOptions = {
+  /**
+   * Report the connection open from INSIDE `connect()`, before it returns.
+   *
+   * A real transport may do this — an already-connected bridge, an in-process
+   * mock, a client that completes its handshake during construction — and it is
+   * the one timing in which the manager has no socket handle to act on yet.
+   * Nothing the manager does on `onOpen` may depend on `connect()` having
+   * returned, and this option is how that is testable offline.
+   */
+  readonly openOnConnect?: boolean;
+};
+
 /** Socket factory that opens {@link FakeCoinbaseSocket}s and reaches no network. */
 export class FakeCoinbaseSocketFactory implements CoinbaseSocketFactory {
   /** Every socket ever opened, in order. */
   readonly sockets: FakeCoinbaseSocket[] = [];
+  readonly #openOnConnect: boolean;
+
+  constructor(options: FakeCoinbaseSocketFactoryOptions = {}) {
+    this.#openOnConnect = options.openOnConnect ?? false;
+  }
 
   connect(endpoint: string, listener: CoinbaseSocketListener): CoinbaseSocket {
     const socket = new FakeCoinbaseSocket(endpoint, listener);
     this.sockets.push(socket);
+    if (this.#openOnConnect) {
+      socket.open();
+    }
     return socket;
   }
 

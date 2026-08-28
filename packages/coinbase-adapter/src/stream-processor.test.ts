@@ -146,6 +146,46 @@ describe("lifecycle", () => {
     expect(after.counters.staleConnectionCallbacks).toBe(1);
   });
 
+  it("records a frame from a retired socket without ingesting it", () => {
+    // The window the transport owner alone can see: the retired socket's id is
+    // still the one this processor holds, so `ingestFrame` could not tell the
+    // difference and would publish the frame under the current generation.
+    const processor = new CoinbaseStreamProcessor(options());
+    processor.connectionOpened("c1");
+    const before = processor.metrics();
+    // A perfectly well-formed frame, and still refused: what disqualifies it is
+    // where it came from, not what it says.
+    const frame = JSON.stringify({
+      channel: "heartbeats",
+      timestamp: "2023-06-23T20:31:26.122969572Z",
+      sequence_num: 0,
+      events: [{ current_time: "2023-06-23 20:31:56 +0000 UTC", heartbeat_counter: 3049 }],
+    });
+
+    const output = processor.staleConnectionFrame(frame, { connectionId: "c1" });
+
+    expect(output.classification).toBe("HEARTBEATS");
+    expect(output.anomalies.map((anomaly) => anomaly.code)).toEqual([
+      "COINBASE_STALE_CONNECTION_ACTIVITY",
+    ]);
+    expect(output.anomalies[0]?.rawFrame).toBe(frame);
+    expect(output.anomalies[0]?.channel).toBe("heartbeats");
+    expect(output.normalized).toHaveLength(0);
+    expect(output.feedEvents).toHaveLength(0);
+
+    const after = processor.metrics();
+    expect(after.counters.framesFromStaleConnection).toBe(1);
+    // Counted as received — nothing is dropped in silence — and accounted for
+    // nowhere else: no channel state, and no liveness.
+    expect(after.counters.framesReceived).toBe(before.counters.framesReceived + 1);
+    expect(after.perChannel).toEqual(before.perChannel);
+    expect(after.lastMessageAt).toBeUndefined();
+    expect(after.counters.heartbeatsReceived).toBe(0);
+    // A frame is not a callback: the two are counted apart because they are
+    // different events.
+    expect(after.counters.staleConnectionCallbacks).toBe(0);
+  });
+
   it("counts frames received even when they cannot be read", () => {
     const processor = new CoinbaseStreamProcessor(options());
     processor.connectionOpened("c1");
