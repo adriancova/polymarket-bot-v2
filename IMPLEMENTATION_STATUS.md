@@ -364,6 +364,28 @@ resumed via SendMessage per the recorded resume pattern (context intact).
   recorded divergence is the right call; the eight both-sources-required
   fields stay fail-closed. ND5 bid/ask-ordering contradiction verified
   recorded. Remediation round 2 dispatched.
+- Remediation round 2 completed 2026-08-27 in `21cae1b` (+ doc `9e931cc`),
+  probes reproduced byte-for-byte first: R2-H1 → per-attempt deferred
+  socket-action queue on `FeedSocketSession` (the WP-090 shape); `#onOpen`
+  defers its whole body so plan→send→FeedConnected order holds
+  synchronously and asynchronously; stop/staleness/heartbeat/abandoned-
+  socket closes routed through the queue; R2-H2 → no reconnect gap when
+  the desired set is empty; invariant restated in the true direction
+  ("every gap opens under a generation the same transition advanced") and
+  re-swept including two empty reconnects; R2-M1 → claim withdrawn at both
+  primitives.ts locations plus a third found by sweep (order-book.ts);
+  R2-L1 → structural identity-based `reachableObjectSchemas()` guard
+  walking zod `_def` with canary tests proving non-vacuity; R2-L2 →
+  description corrected, +3 assertions (anchor cases 510). Disclosures:
+  mutation C (`#sendFrames` deferral) is not killed alone — defense in
+  depth jointly load-bearing with the open deferral (A+C kills 3); a
+  synchronous post-open pre-return frame is stamped with the
+  pre-subscription generation (the generation it genuinely arrived under;
+  disclosed); `FeedGapDetected` now conditional on the desired set — WP-120
+  must key recovery off `feed.openGap`, never off "a reconnect happened".
+  Orchestrator fast-forwarded the canonical branch to `9e931cc` and
+  reproduced gates: root 1894/1894, contract 581/581, paths clean,
+  lockfile untouched. Review round 3 dispatched.
 - **Contract-owner items accumulated from batch 1B round 1** (for the next
   ADR-modifying package or an orchestrator governance round): (1) ratify
   C-1/U-1 across the four provisional-marked paths (WP-070 documentary
