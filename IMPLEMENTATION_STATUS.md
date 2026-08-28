@@ -110,7 +110,20 @@ table says otherwise.
 **WP-070 (Polymarket public adapter):** implementer session hit an API session
 limit after reporting all gates green, before writing the handoff document;
 resumed via SendMessage per the recorded resume pattern (context intact).
-Candidate pending.
+- Implemented by `wp-implementer` (Opus) on branch `worktree-agent-af750220276628c72`,
+  base `145fc32`; chain `f4d374d` (impl) → `f16390c` (handoff SHA record).
+  42 files, all allowed; lockfile +16/−0. Orchestrator reproduced gates:
+  root 1869/1869, contract 177/177 (offline), check:deps PASS. No
+  `@polymarket/client` or archived-client import (F6/F7) — native
+  WebSocket/fetch behind injected ports. Headlines: **C-1/U-1 CONFIRMED by
+  current official documentation 2026-08-27** (new page
+  `docs.polymarket.com/api-reference/wss/market`: `price_change.size` = "New
+  aggregate size (0 means level removed)"), correctly NOT self-ratified
+  (protected paths untouched; ADR ratification queued for the orchestrator);
+  R-2 discharged for owned schemas via an executable SDK anchor table (116
+  assertions against pinned commit `7fdbed4…`, 5 recorded divergences);
+  §9 narrowings discharged at the venue edge; tick-size one-for-one;
+  no invented sequence number. Review round 1 dispatched.
 
 ### WP-060 completion record (2026-08-27)
 
