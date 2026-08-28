@@ -81,9 +81,18 @@ packages/ledger           packages/pnl
 packages/universe         packages/settlement
 packages/simulation       packages/config
 packages/observability    packages/testkit (test-only)
+packages/strategies/**    (class entry: every concrete strategy package)
 ```
 
-`packages/strategies/**` is a **restricted** member of this layer: see §3.
+The `packages/strategies/**` **class entry** above is restricted further than any
+other layer-1 package — F3 and F11 in §3 — and it is stated **inside the fence**
+so the §6 check reads it from the same shape as every other assignment. Each
+concrete strategy package it matches is classified layer 1; a class matching zero
+packages is not an error (§6). *(Moved from prose into the fence 2026-08-28 by
+`GOV-1B`, closing `docs/handoffs/WP-015.md` `follow_up` 1. The parser also
+accepts the prose form `` `<path>` … member of this layer ``, and that phrasing
+must now stay out of §2, because a package assigned twice — even to the same
+layer — is a `CHK` error by design.)*
 
 ### Layer 2 — adapters and infrastructure
 
@@ -160,12 +169,39 @@ row. Two known cases will need one and do not have a citation today:
 | F11 | A strategy reading a clock or unseeded randomness (`Date.now`, `Math.random`) | §6 invariant 2, §7.6, ADR-005 §1 |
 | F12 | Any workspace edge from a lower-numbered layer to a higher-numbered one | §5.2 (the allowed direction is one-way), §2 of this document |
 | F13 | Any **same-layer** workspace edge not listed in §2.1 | §2, §2.1 of this document |
+| F14 | Inside a **purity-restricted** package (`packages/domain`, `packages/strategies/**`, `packages/ledger`, `packages/simulation`), any construct that makes F1–F8/F11 **unevaluable**: a module load whose specifier is not a static literal; a reference to a module-**loading capability** (`require` and its aliases, a CommonJS `Module` object incl. `process.mainModule`/`require.main`, `createRequire` and its result, `process.getBuiltinModule`, the `node:module` namespace/`Module` class/`register`) in a position that escapes this document's analysis; a computed member read on such a capability; and a reference to an **evaluator** (`eval`, `Function`, or a read of the `.constructor` property) | §5.2 and ADR-005 §1, read as intent rather than as a list of spellings: a package forbidden to perform I/O has no legitimate use for a module loader or an evaluator, and a construct that defeats static checking cannot be permitted to *establish* compliance. Numbered 2026-08-28 (`GOV-1B`) from `docs/handoffs/WP-015.md` `follow_up` 6 |
 
 F3 and F11 are the two that matter most for correctness rather than tidiness:
 they are what makes deterministic replay possible (§12.4).
 
 F12 and F13 are the layer model restated as edge rules so that §6's check has
 something mechanical to evaluate; they are not additional policy.
+
+**F14 is additional policy, and is stated as such.** It was invented by the §6
+check under review pressure (`WP-015` rounds 1–6) and rested on that package's
+handoff alone; `WP-015` `follow_up` 6 asked the contract owner to either number
+it or drop it. It is numbered here, with three deliberate consequences:
+
+1. **It forbids *holding* the capability, not only using it.** A restricted
+   package may not reference a module loader at all, even without loading
+   anything forbidden with it. The weaker rule ("do not load a forbidden
+   module") is unenforceable, because rounds 3–9 each found one more legal
+   spelling that loaded a module while naming none.
+2. **It is deliberately noisy for contrived-but-legal wrapping.** A finding does
+   not prove a forbidden module was loaded, only that the check can no longer
+   prove one was not. The trade is *noisy, never silent*, and it costs nothing in
+   practice because the constructs it flags have no legitimate use in a package
+   that may not perform I/O.
+3. **The check emits this rule under the id `F-OPAQUE`**, which predates the
+   number. The id is an accepted alias for F14; renaming it in
+   `tools/check-dependency-direction.mjs` and its tests is a **tooling
+   follow-up**, not a contract change, and this row is the citation that rule
+   was missing either way.
+
+Two ids the check emits are **not** rules of this section: `F-CLOSED`, which is
+§6's fail-closed behavior (an unclassified package, or a §2 named entry with no
+manifest), and `CHK`, which is a broken contract parse or an unparseable source
+file.
 
 ---
 
@@ -205,23 +241,37 @@ exactly one layer (§2).
 | `packages/decimal` imports only `decimal.js` and `node:crypto` and performs no I/O | **Enforced by construction**; `docs/contracts/domain.md` §1 |
 | TypeScript project references and `pnpm` workspace resolution | A package can only import a workspace package it declares as a dependency |
 | `pnpm typecheck`, `pnpm lint`, `pnpm test` | Run locally and in CI (`.github/workflows/ci.yml`) |
+| **The §6 check itself** — cycles (F9), layer conformance (F12/F13), forbidden specifiers and impure globals (F1–F8, F11), and the opaque-construct rule (F14) | **Implemented and CI-wired.** `tools/check-dependency-direction.mjs`, run by the root script `check:deps` and by the "Dependency direction and package boundaries" step in `.github/workflows/ci.yml`, between the lint and unit-test steps. It parses §2 and §2.1 from **this document** at run time (§6) and fails closed on a contract it cannot parse |
 
-**No automated dependency-direction or cycle check exists yet.** `WP-010`
-delivered typecheck, lint, unit tests, dependency vulnerability scanning, and a
-compose health job — not a graph check
-(`.github/workflows/ci.yml`, `docs/handoffs/WP-010.md`). Until the check in §6
-exists, F1–F13 rest on review, on the frozen packages' construction, and on the
-determinism golden test. In particular, **nothing today evaluates the §2 layer
-assignment or the §2.1 edge list**; they are data waiting for a consumer.
+*(Corrected 2026-08-28 by `GOV-1B`, closing `docs/handoffs/WP-015.md`
+`follow_up` 7.)* This section previously said "**No automated
+dependency-direction or cycle check exists yet**" and that "nothing today
+evaluates the §2 layer assignment or the §2.1 edge list". Both statements were
+true when written — `WP-010` delivered typecheck, lint, unit tests, dependency
+vulnerability scanning, and a compose health job, but no graph check — and both
+became false when **`WP-015`** shipped and merged the check. They are corrected
+in place rather than left standing, per
+[`protected-contracts.md`](./protected-contracts.md) §4.
+
+What still rests on review rather than on the check is stated in §6's limits
+paragraph, not here: the check is a floor over enumerated library names and
+recognised loader spellings, not a proof.
 
 ---
 
-## 6. CI enforcement expectation
+## 6. CI enforcement: the specification, and the check that implements it
 
 Handoff §5.2 requires that **circular package dependencies fail CI**. The check
 that satisfies it must do three things, and it is deliberately specified here so
 that the owning work package implements the whole rule rather than only the
 cycle half.
+
+**This section is no longer only an expectation.** `WP-015` implemented it as
+`tools/check-dependency-direction.mjs`, wired to the root script `check:deps`
+and to a CI step of its own (§5). The specification below is unchanged and is
+still the authority; what follows it is now a description of something that
+runs. **Owner: `WP-015`** (merged). Residual questions the check raised for this
+document are collected in §6.1.
 
 It consumes two pieces of data, both of which live **only** here: the §2 layer
 assignment (package → layer, total and single-valued) and the §2.1 permitted-
@@ -233,16 +283,36 @@ runs three rules over it.
 `dependencies`/`devDependencies` of each (`workspace:` specifiers), directed from
 dependent to dependency. The **workspace root** `package.json` is not a layered
 node: it owns root tooling, and its `@polymarket-bot/testkit` devDependency is a
-root-gate wiring detail, not an inter-package edge. As of 2026-08-26 the
-repository declares three `workspace:*` dependencies — that root devDependency,
-**S0** (`packages/domain` → `packages/decimal`), and `apps/ops-cli` →
-`packages/decimal` (a `devDependency`, added by the Wave 0 closeout remediation
-so the venue-fixture canonical-decimal grammar is tested against the frozen one;
-finding M5) — so the layered graph has exactly two edges and a check written
-today would pass: S0 is the §2.1-listed same-layer edge, and `apps/ops-cli`
-(layer 3) → `packages/decimal` (layer 0) is an ordinary downward edge needing no
-§2.1 row. That is the point of writing the spec before the graph gets
-interesting.
+root-gate wiring detail, not an inter-package edge.
+
+**The graph as of 2026-08-28** (verified by running the check; it reports the
+counts itself): **34 workspace packages, 11 layered edges**, and it passes. The
+distribution matters more than the total — every edge except one is an ordinary
+downward edge:
+
+| Edge | Layers | Verdict |
+| --- | --- | --- |
+| `packages/domain` → `packages/decimal` | 0 → 0 | the §2.1 **S0** same-layer edge |
+| `apps/ops-cli` → `packages/decimal` (`devDependency`) | 3 → 0 | downward (Wave 0 closeout finding M5: the venue-fixture canonical-decimal grammar is tested against the frozen one) |
+| `packages/event-bus` → `packages/domain` | 2 → 0 | downward (`WP-060`) |
+| `packages/storage-postgres` → `packages/decimal`, `packages/domain` | 2 → 0 | downward (`WP-050`) |
+| `packages/polymarket-public`, `packages/binance-adapter`, `packages/coinbase-adapter` → `packages/decimal`, `packages/domain` (2 each) | 2 → 0 | downward (`WP-070`, `WP-080`, `WP-090`) |
+
+**Finding of fact, batch 1B (recorded 2026-08-28 by `GOV-1B`):** the three
+adapters merged in Wave 1 batch 1B created **no same-layer edge**. Each declares
+exactly `@polymarket-bot/decimal` and `@polymarket-bot/domain` (both layer 0) as
+`dependencies`, and **none takes a `devDependency` on `packages/testkit` or on
+any other layer-2 package** — their `devDependencies` are `@types/node`,
+`typescript`, and `vitest`, none of which is a workspace member. **No §2.1 row is
+therefore added**, and the `packages/testkit` case flagged under §2.1 remains
+unevidenced and unwritten.
+
+*(This paragraph replaces a 2026-08-26 statement that the repository declared
+"three `workspace:*` dependencies" and that "the layered graph has exactly two
+edges", which the check now contradicts by direct count. Corrected in place per
+[`protected-contracts.md`](./protected-contracts.md) §4. The original point still
+holds and is worth keeping: the spec was written before the graph got
+interesting, and it did not have to change when it did.)*
 
 1. **Cycle detection.** Fail on any cycle in that graph. Non-zero exit, named
    cycle in the output. This is the rule §5.2 states literally, and it is what
@@ -303,11 +373,43 @@ Requirements on the check itself:
   the check parses them or is generated from them. A test's private copy of either
   table is exactly how coverage drifts.
 
-**Owner: not yet assigned.** The natural home is the workspace-tooling package
-that owns root quality gates (`WP-010`'s successor for repository tooling); it is
-recorded as follow-up in `docs/handoffs/WP-030.md`, and `WP-010`'s own follow-up
-already anticipates it ("Consider automated repository-inventory/path-ownership
-validation as tooling in a later work package").
+**The shapes the check parses**, stated here because §2 and §2.1 are now *input
+to a program* and an editor needs to know what will still be read (added
+2026-08-28, `WP-015` `follow_up` 1):
+
+| Where | Shape that assigns a package |
+| --- | --- |
+| §2, a `### Layer <n> — …` subsection | a backticked path in the **first cell** of a table row (Layer 0), a path token inside a **fenced block** (Layers 1–3, including the `packages/strategies/**` class entry), or the prose form `` `<path>` … member of this layer `` |
+| §2.1 | a table row after the header separator, with **at least three cells**: id, `` `from` → `to` `` (either arrow spelling), and a **numeric** layer |
+
+Two edit hazards follow directly, and both fail the gate rather than degrading
+silently: assigning one package **twice** — even to the same layer, and even by
+stating it in a fence *and* in the prose form — is a `CHK` error; and a §2.1 row
+whose edge, layer, or endpoints do not parse and cross-validate against §2 is a
+`CHK` error, not a skipped row.
+
+**Owner: `WP-015`** (merged; `tools/check-dependency-direction.mjs` and its unit
+suite). *(Corrected 2026-08-28 by `GOV-1B`, closing `docs/handoffs/WP-015.md`
+`follow_up` 7. This paragraph previously read "**Owner: not yet assigned**" and
+pointed at a hypothetical successor to `WP-010`.)* Ongoing maintenance the
+check's own limits impose stays distributed: every package owner adds a new
+filesystem, database, network, or signing dependency to the matching catalogue in
+that file **in the same change** (`WP-015` `follow_up` 5), because the catalogues
+are enumerations and cannot infer a library's nature from its name.
+
+### 6.1 Open contract-owner items about this document
+
+Recorded here so they are owned rather than remembered. Each is a question
+`WP-015` raised and deliberately did **not** answer, because answering it means
+adding or changing a numbered rule in this document.
+
+| # | Item | Status |
+| --- | --- | --- |
+| 1 | **The positive callee-resolution rule** (`WP-015` `follow_up` 8): "a purity-restricted package's source may contain no call whose callee does not statically resolve to a declared import binding or a known-pure local." It is the **durable** fix for F14's residuals — reflective acquisition (`Reflect.get(process, "mainModule").require(…)`), runtime-computed member names, and cross-file capability injection — because it is total over what the walk sees regardless of which loader or evaluator the callee names, ending the "add the one spelling the last round missed" pattern that rounds 3–9 each repeated | **OPEN, and deliberately not implemented on 2026-08-28.** It needs a numbered §3 rule *and* it carries a real noise trade-off: it flags every dynamically-dispatched call inside a restricted package. That is contract-level policy about how those packages may be written, not a tooling preference, so it is not adopted as a side effect of numbering F14. Whoever adopts it writes the §3 row, states the noise trade-off, and only then extends the check |
+| 2 | **Does rule 3 apply to a strategy package's own test files?** (`WP-015` `follow_up` 2, its `assumptions` 6 / risk 3) | **OPEN.** Today the scan does not distinguish them. A strategy's test may legitimately need a clock or a fixture loader that ADR-005 §1 forbids the strategy itself; until this is ruled, the answer is the checker's current behavior, not a documented decision. `WP-220` will hit it first |
+| 3 | **Should a computed property read whose key cannot be statically folded fail closed inside a restricted package?** (`WP-015` `follow_up` 9) | **OPEN.** Today it does not, which leaves `f[parts.join("")]` as a route to `.constructor`; closing it would overturn the accepted ruling that `table[key]` on a non-capability object adds no noise. The two rulings are in genuine tension and only this document can settle it — item 1 above subsumes it |
+| 4 | **A cross-package *deep* import** (bypassing a package's `exports` entry point) has no §3 row (`WP-015` `follow_up` 3), and `packages/decimal`'s documented import allowlist (§5) is "enforced by construction" with no F-row either (`follow_up` 4) | **OPEN.** Both are candidate §3 rows; neither may be implemented in the check before it has a cited row here |
+| 5 | **The §2.1 allowlist is pinned by a test.** `test/unit/tooling/dependency-direction.test.ts` asserts the shipping allowlist ids are exactly `["S0", "S1", "S2"]` | **Recorded, not a defect.** The first package that adds a §2.1 row updates that assertion in the same change; a contract edit alone would fail `pnpm test`. Noted because a governance round that adds rows and a tooling package that owns the test are usually not the same package |
 
 ---
 
