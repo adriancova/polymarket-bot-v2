@@ -61,6 +61,57 @@ table says otherwise.
   `.nullish()`-to-absent adapter rule, and the §9 fixture-only-narrowings
   binding list.
 
+### Wave 1 batch 1B in-flight records (2026-08-27)
+
+**WP-090 (Coinbase adapter):**
+- Implemented by `wp-implementer` (Opus) on branch `worktree-agent-aab9b11346f9eb037`,
+  base `145fc32`; chain `aa74419` (impl) → `44eb525` (handoff SHA record).
+  58 files, all allowed; lockfile +16/−0. Orchestrator reproduced gates:
+  root 1823/1823, contract 72/72 (offline), check:deps PASS. Public
+  unauthenticated Advanced Trade WS; 15 venue facts cited (2026-08-27);
+  C-CB-1 (per-product vs per-connection `sequence_num`) resolved per-connection
+  on AsyncAPI authority; disclosed read-only 25s public-feed observation (no
+  credential/order/fixture) settles the ADR-004 Coinbase-framing item: all
+  frames UTF-8 JSON.
+- Review round 1 (fresh Codex `01a044bd-10a2-7a22-8777-e20d8ac910dc`): **CHANGES
+  REQUIRED** — 0 blocker, 2 high (H1 a malformed snapshot records channel
+  satisfaction before validation, so an invalid trade snapshot plus a valid
+  ticker snapshot falsely emits `FeedResynchronized`; H2 frames/callbacks from a
+  closed connection are accepted and relabeled as current-generation data),
+  2 medium (M1 a rejected trade reserves its dedupe identity so a corrected
+  valid copy is suppressed; M2 silent paths — market-trades message timestamp
+  unvalidated before use as venue time, heartbeat counter reuse/regression
+  silently continued), 1 low (handoff "every frame yields output" overclaim).
+  Venue judgments: V1/V2/V3/V5 ACCEPT (reviewer independently refetched the
+  official pages; maker-side inversion required and correctly isolated);
+  V4/V6 REJECT via H1/H2/M1. Deviations D1/D2/D3/D5 ACCEPT, D4 REJECT (M2).
+  Remediation round 1 dispatched.
+
+**WP-080 (Binance adapter):**
+- Implemented by `wp-implementer` (Opus) on branch `worktree-agent-a24ead9170631b1c6`,
+  base `145fc32`; chain `cff20ba` (impl) → `be5d67a` (handoff). 48 files, all
+  allowed; lockfile +16/−0. Orchestrator reproduced gates: root 1902/1902,
+  contract 108/108 (offline), check:deps PASS. 15 venue facts cited from the
+  official `binance/binance-spot-api-docs` (2026-08-27); ADR-004 framing item
+  answered (JSON endpoints carry JSON; the binary SBE path is a different,
+  key-required host, refused by construction); UNVERIFIED register BNC-U1..U6.
+  Review round 1 dispatched.
+- **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
+  frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
+  `BookSideSchema.optional()` documented only as "Taker side when the venue
+  reports it" — the BID/ASK meaning for a taker is not specified. WP-090
+  computes it (maker-side inversion, reviewer-accepted); WP-080 omits it
+  (BNC-U5: refuses to guess the vocabulary mapping). Both are contract-legal;
+  the semantic ruling (which BookSide value names the taker's side) is a
+  domain-contract documentation gap for the next ADR-modifying package or an
+  orchestrator governance round, and the two adapters must converge once
+  ruled (WP-080 follow_up; register R-3 family).
+
+**WP-070 (Polymarket public adapter):** implementer session hit an API session
+limit after reporting all gates green, before writing the handoff document;
+resumed via SendMessage per the recorded resume pattern (context intact).
+Candidate pending.
+
 ### WP-060 completion record (2026-08-27)
 
 - Review round 3 (fresh Codex session `01a0447d-5890-7a72-8808-810b0e473f2d`,
