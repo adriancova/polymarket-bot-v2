@@ -211,9 +211,14 @@ value-form reason can no longer be spent on a presence change.
 The contract suite then:
 
 1. compares the anchor table's field set against the package's zod schemas, key
-   for key, in both directions — **and** enumerates the package's exported
-   object schemas, so an exported nested schema that is never anchored fails
-   (this is what `VenueBookLevelSchema` and `MarketEventMessageSchema` were);
+   for key, in both directions — **and** walks the package's public surface for
+   every object schema it can reach, so a nested schema that is never anchored
+   fails (this is what `VenueBookLevelSchema` and `MarketEventMessageSchema`
+   were). The walk follows zod's wrappers (transforms, pipes, refinements,
+   `.optional()`, arrays, records, unions) and an object's own fields, matching
+   schemas by identity rather than by name, because round-2 finding L1 was that
+   the first version of this guard matched a naming convention and a wrapped or
+   renamed export could evade it;
 2. asserts each anchor's field count against the number read from the SDK
    source, so adding a field without re-reading the SDK fails;
 3. drives the LOCAL modifier as an accept/reject vector against the real parser
@@ -222,9 +227,12 @@ The contract suite then:
 4. drives the SDK and REST modifiers as obligations: this parser may never be
    stricter than the SDK about presence, and any loosening relative to either
    source needs a recorded `presence` divergence;
-5. requires every `value-form` divergence to carry a vector the stricter source
-   rejects and this parser accepts, so "deliberately looser" is a claim a test
-   makes rather than a sentence in a table;
+5. requires every `value-form` divergence to carry a vector **this parser
+   accepts**, plus the reason, authority and pinned citation for the source rule
+   it departs from. The suite does not vendor or execute the SDK or the OpenAPI
+   document, so what the SOURCE rejects is recorded and cited rather than run —
+   round-2 finding L2 is that this step used to be described as proving the
+   rejection;
 6. requires every citation to embed the pinned commit (or the official spec URL
    with its retrieval date) and rejects a mutable `blob/main` link.
 
@@ -234,11 +242,11 @@ the SDK do. Only `timestamp` and `last_trade_price` tolerate absence, because
 the SDK declares those two `.nullish()`, and both divergences from the OpenAPI
 are recorded with that evidence.
 
-## 6. The feed's two safety invariants
+## 6. The feed's four safety invariants
 
-Both were added by round-1 review findings H1 and H2, and both are about the
-same thing: an event must say what actually happened, on the connection it
-actually happened on.
+All four were added by review findings — H1 and H2 in each of rounds 1 and 2 —
+and all four are about the same thing: an event must say what actually happened,
+on the connection it actually happened on.
 
 **1. Every socket callback is bound to the session that installed it.** A
 transport may deliver a frame, an open, an error or a close for a socket the
@@ -271,11 +279,29 @@ generation N, applied after a reconnect or a subscription change opened
 generation N+1, must not close the newer gap. A rejection is returned rather
 than thrown, because a late snapshot is a race and not a defect.
 
-Related: on a live connection the subscription generation now advances
-**exactly when a gap is opened for it**. Adding tokens replaces server-side
-subscription state, so it advances the generation and opens a gap; removing
-tokens does neither, because the venue's dynamic `unsubscribe` leaves the rest
-of the subscription in place and nothing still subscribed missed anything.
+**3. No socket-dependent action is lost because the handle has not arrived.** A
+transport is not obliged to open asynchronously: an already-connected one calls
+`onOpen` from inside the factory call, before the feed has a socket to send on.
+Before round-2 finding H1 that published `FeedConnected` while the subscription
+frame went nowhere — a feed that believed it was subscribed to a socket it had
+sent nothing on. Each connect attempt now queues socket-dependent work and runs
+it the instant the handle exists, so the subscription is written before
+`FeedConnected` is published, a `stop()` from inside a synchronous callback still
+closes its socket, and an attempt overtaken before its handle arrived is closed
+rather than leaked.
+
+**4. Every gap opens under a generation no gap has used.** Gap identity is the
+`subscriptionGeneration`, so it has to be unique, and it is: every gap this feed
+opens is opened by a transition that advances the generation in the same step.
+Adding tokens replaces server-side subscription state, so it advances the
+generation and opens a gap; removing tokens does neither, because the venue's
+dynamic `unsubscribe` leaves the rest of the subscription in place and nothing
+still subscribed missed anything; and a reconnect **with nothing subscribed**
+resubscribes nothing, advances nothing and opens nothing (round-2 finding H2 —
+it used to open a gap at the unchanged generation, which the previous gap's
+acknowledgement then closed). The converse is not claimed: the generation also
+advances where nothing was missed and no gap is owed — the first connection, and
+any change made while disconnected.
 
 ## 7. Ports
 

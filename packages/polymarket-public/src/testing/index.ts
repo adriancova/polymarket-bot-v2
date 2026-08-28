@@ -212,8 +212,23 @@ export class FakeWebSocket {
   }
 }
 
+export interface FakeWebSocketFactoryOptions {
+  /**
+   * Runs INSIDE the factory call, before the handle is returned.
+   *
+   * A transport is not obliged to open asynchronously: a pooled or already-open
+   * connection can call `onOpen` — or deliver a queued frame, or fail — while
+   * the caller is still waiting for the socket object. `emitOpen()` from here
+   * plays exactly that transport, which is what round-2 finding H1 was about:
+   * the feed published `FeedConnected` and sent no subscription, because it had
+   * no handle to send on yet. A test that never sets this gets the ordinary
+   * asynchronous transport, which is every real one.
+   */
+  readonly onCreate?: (socket: FakeWebSocket) => void;
+}
+
 /** A socket factory that records every socket it creates. */
-export function fakeWebSocketFactory(): {
+export function fakeWebSocketFactory(options: FakeWebSocketFactoryOptions = {}): {
   readonly factory: PublicWebSocketFactory;
   readonly sockets: FakeWebSocket[];
   latest(): FakeWebSocket;
@@ -222,6 +237,7 @@ export function fakeWebSocketFactory(): {
   const factory: PublicWebSocketFactory = (url, handlers) => {
     const fake = new FakeWebSocket(url, handlers);
     sockets.push(fake);
+    options.onCreate?.(fake);
     return fake.socket;
   };
   return {

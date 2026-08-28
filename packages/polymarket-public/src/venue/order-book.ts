@@ -50,10 +50,15 @@
  *    so pinning either would reject a documented response. The hash is carried
  *    opaquely and compared for equality only, which is exactly what the page
  *    says it is for. Emptiness is still rejected: an empty hash is not a hash.
- * 2. **`market` carries no byte-length bound.** ADR-002 §7 makes it binding
- *    that a runtime parser accepts any hex condition id the SDK's
+ * 2. **`market` carries no byte-length bound in this schema.** ADR-002 §7 makes
+ *    it binding that a runtime parser accepts any hex condition id the SDK's
  *    `ConditionIdResponseSchema` accepts, and that schema deliberately
  *    "validates hex syntax without constraining the condition ID byte length".
+ *    This is the RAW WIRE form only: normalization caps a condition id at 200
+ *    characters (`packages/domain`'s `MAX_IDENTIFIER_LENGTH`) and reports a
+ *    longer one as an `INVALID_CONDITION_ID` problem, so the package does not
+ *    accept "any length" end to end — see `./primitives.ts`
+ *    (`VenueConditionIdSchema`) and README §4.1.
  * 3. **`tick_size` stays a decimal STRING.** The SDK pipes it through
  *    `DecimalStringSchema.transform(Number)` into an enum of six float
  *    literals. Converting an exact decimal to an IEEE-754 double is forbidden

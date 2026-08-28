@@ -29,9 +29,18 @@
  * replaced, expect a snapshot" saw a boundary that never happened. The venue's
  * dynamic `unsubscribe` frame removes only the named assets and leaves the rest
  * of the subscription untouched, so for everything still subscribed nothing was
- * missed and nothing is owed. The rule the feed now enforces is the honest one:
- * **on a live connection the generation advances exactly when a gap is opened
- * for it.**
+ * missed and nothing is owed. The rule the feed now enforces is the honest one,
+ * stated in the direction that is actually true: **every gap the feed opens is
+ * opened by a transition that advances this counter in the same step**, so gap
+ * generations are unique and strictly increasing and the generation alone
+ * identifies a gap. Not the converse — the counter also advances where nothing
+ * was missed and no gap is owed (the first connection; a change made while
+ * disconnected). Round-2 finding H2 was the one remaining break in the true
+ * direction: an EMPTY reconnect opened a gap while
+ * {@link MarketSubscriptionManager.planFullSubscription} left the counter
+ * alone, so an acknowledgement written for the previous gap closed the new one.
+ * The feed no longer opens that gap, because a subscription to nothing has
+ * nothing to recover.
  *
  * The counter starts at `0`, meaning "nothing has been subscribed yet"; the
  * first real subscription is generation `1`. `0` is therefore never carried by
@@ -186,6 +195,12 @@ export class MarketSubscriptionManager {
    * server-side subscription state, so the whole set is re-sent and the
    * generation advances, which is precisely the signal the gateway needs to
    * require a fresh authoritative snapshot (§7.1, §9.1).
+   *
+   * When the desired set is EMPTY nothing is re-sent and the generation does
+   * NOT advance, and the caller must not treat that reconnect as a gap: there
+   * is no affected market, and a gap opened at an unchanged generation would be
+   * indistinguishable from the previous one (round-2 finding H2). The feed
+   * reads {@link FullSubscription.assets} for exactly that decision.
    */
   planFullSubscription(): FullSubscription {
     const assets = [...this.#assets];

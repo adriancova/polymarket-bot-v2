@@ -44,9 +44,13 @@
  *
  * 1. **Completeness, both directions.** Every key of the package's zod schema
  *    must appear in the table and vice versa, read at runtime from
- *    `schema.shape`. Plus: every object schema the package EXPORTS must be
- *    anchored, which is what closes M1(a) — `VenueBookLevelSchema` and
- *    `MarketEventMessageSchema` were exported, load-bearing, and unanchored.
+ *    `schema.shape`. Plus: every object schema REACHABLE from the package's
+ *    public surface — through zod's wrappers and through an object's own
+ *    fields, by identity rather than by name — must be anchored, and every
+ *    anchored schema must be reachable. That closes M1(a)
+ *    (`VenueBookLevelSchema` and `MarketEventMessageSchema` were exported,
+ *    load-bearing and unanchored) and round-2 L1 (the guard that closed M1(a)
+ *    matched a naming convention, so a wrapped or renamed export evaded it).
  * 2. **Field count against the SDK.** `sdkFieldCount` is the number counted in
  *    the SDK source at the pinned commit, so adding a field to both the schema
  *    and the table without re-reading the SDK fails.
@@ -55,10 +59,14 @@
  *    accepts must parse here (an adapter may not be stricter than the venue),
  *    and everything it REQUIRES must either be required here too or carry a
  *    recorded `presence` divergence.
- * 5. **Value-form divergences must be executable**: each carries at least one
- *    `localOnlyValue` — a value the SDK's own value form rejects — which must
- *    parse here. A value-form reason with no vector, or a vector with no
- *    reason, fails.
+ * 5. **Value-form divergences must be executable, on the half that can be**:
+ *    each carries at least one `localOnlyValue` — a value recorded as being
+ *    outside the SDK's own value form — and the suite proves that THIS parser
+ *    accepts it. That the SOURCE rejects it is recorded, not executed: the SDK
+ *    is not vendored or run here, so the claim rests on the row's `reason`,
+ *    `authority` and pinned `citation` (round-2 finding L2 — the suite used to
+ *    describe this as proving the rejection). A value-form reason with no
+ *    vector, or a vector with no reason, still fails.
  * 6. **Citation hygiene.** Every citation embeds the pinned commit or an
  *    official documentation URL with a retrieval date; a mutable `blob/main`
  *    link is rejected.
@@ -829,7 +837,7 @@ const newMarketAnchor: SdkSchemaAnchor = {
           dimension: "value-form",
           from: "sdk",
           reason:
-            "the SDK types this field ConditionIdSchema, which refuses anything but a 31/32-byte hex string; ADR-002 §7 makes it binding that a runtime parser accept any hex condition id ConditionIdResponseSchema accepts, which 'validates hex syntax without constraining the condition ID byte length'",
+            "the SDK types this field ConditionIdSchema, which refuses anything but a 31/32-byte hex string; ADR-002 §7 makes it binding that a runtime parser accept any hex condition id ConditionIdResponseSchema accepts, which 'validates hex syntax without constraining the condition ID byte length'. This row describes the WIRE schema only: normalization caps a condition id at packages/domain's 200-character MAX_IDENTIFIER_LENGTH and reports a longer one as an INVALID_CONDITION_ID problem (README §4.1)",
           authority: "ADR-002 §7; docs/contracts/protected-contracts.md §9",
         },
       ],
@@ -1042,7 +1050,7 @@ export const ORDER_BOOK_ANCHOR: SdkSchemaAnchor = {
           dimension: "value-form",
           from: "sdk",
           reason:
-            "the SDK bounds the condition id to 31/32 bytes; ADR-002 §7 forbids a runtime parser from inheriting that narrowing, because ConditionIdResponseSchema — the SDK's own response-side schema — 'validates hex syntax without constraining the condition ID byte length'",
+            "the SDK bounds the condition id to 31/32 bytes; ADR-002 §7 forbids a runtime parser from inheriting that narrowing, because ConditionIdResponseSchema — the SDK's own response-side schema — 'validates hex syntax without constraining the condition ID byte length'. This row describes the WIRE schema only: normalization caps a condition id at packages/domain's 200-character MAX_IDENTIFIER_LENGTH and reports a longer one as an INVALID_CONDITION_ID problem (README §4.1)",
           authority: "ADR-002 §7; docs/contracts/protected-contracts.md §9",
         },
       ],

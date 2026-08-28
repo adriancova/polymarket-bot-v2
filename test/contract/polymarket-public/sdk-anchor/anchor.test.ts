@@ -11,9 +11,17 @@
  * - the SDK and REST modifiers are asserted as OBLIGATIONS on the local one —
  *   never stricter than the venue, never looser without a recorded, reasoned
  *   divergence naming the dimension it moves;
- * - every `value-form` divergence must carry a vector that the stricter source
- *   rejects and this parser accepts, so "deliberately looser" is a claim a test
- *   makes rather than a sentence in a table.
+ * - every `value-form` divergence must carry a vector this parser accepts, plus
+ *   a reason, an authority and a pinned citation for the source rule it departs
+ *   from, so "deliberately looser" is half behaviour and half evidence rather
+ *   than a sentence in a table.
+ *
+ * What is NOT executed, stated plainly because round-2 finding L2 is that the
+ * suite used to imply otherwise: the SDK's and the OpenAPI's own schemas. This
+ * suite neither vendors nor runs them — vendoring one would be a second
+ * transcription needing its own guard — so every claim about what the SOURCE
+ * does is a recorded, cited claim, and every claim about what this package does
+ * is behaviour.
  */
 
 import { describe, expect, it } from "vitest";
@@ -53,6 +61,87 @@ import {
  */
 interface ShapedSchema {
   readonly shape: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Zod 4's internal descriptor, as far as the coverage guard below needs it.
+ *
+ * Reading `_def` is reading an internal, and that is deliberate: the guard has
+ * to see through whatever wrapper an export happens to be, and a wrapper hides
+ * `.shape`. The risk of an internal — that a zod change makes the traversal
+ * find nothing and the guard pass vacuously — is answered by the guard's second
+ * direction, which fails loudly when a schema the table anchors is no longer
+ * reachable.
+ */
+interface ZodDef {
+  readonly type: string;
+  readonly shape?: Readonly<Record<string, unknown>>;
+  /** `z.pipe`, and therefore `.transform()`: input and output schemas. */
+  readonly in?: unknown;
+  readonly out?: unknown;
+  /** `.optional()`, `.nullable()`, `.default()`, `.catch()`, `.readonly()`. */
+  readonly innerType?: unknown;
+  /** `z.array()`. */
+  readonly element?: unknown;
+  /** `z.record()`, `z.map()`. */
+  readonly keyType?: unknown;
+  readonly valueType?: unknown;
+  /** `z.union()`, `z.discriminatedUnion()`. */
+  readonly options?: readonly unknown[];
+}
+
+function zodDef(value: unknown): ZodDef | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const def = (value as { _def?: unknown })._def;
+  if (typeof def !== "object" || def === null) return undefined;
+  if (typeof (def as ZodDef).type !== "string") return undefined;
+  return def as ZodDef;
+}
+
+/**
+ * Every object schema reachable from the package's public surface, by path.
+ *
+ * Covered: an exported object schema; one wrapped in a transform, a pipe, a
+ * refinement, `.optional()`/`.nullable()`/`.default()`, an array, a record or a
+ * union; and any object schema used as a FIELD of one of those, at any depth.
+ * The traversal is by object identity, so a schema reachable by several paths
+ * is one entry and a recursive schema terminates.
+ *
+ * Not covered, and this is the guard's stated boundary: a schema the package
+ * neither exports nor references from something it exports — a module-private
+ * schema built and used inside a function body, say. Nothing like that exists
+ * in this package today (every `z.object(...)` in `src/**` is an export), and
+ * if one appears it is invisible here, which is why the boundary is written
+ * down rather than implied.
+ */
+function reachableObjectSchemas(): ReadonlyMap<object, string> {
+  const found = new Map<object, string>();
+  const seen = new Set<unknown>();
+  const visit = (value: unknown, path: string): void => {
+    const def = zodDef(value);
+    if (def === undefined || seen.has(value)) return;
+    seen.add(value);
+    if (def.type === "object" && def.shape !== undefined) {
+      found.set(value as object, path);
+      for (const [key, child] of Object.entries(def.shape)) {
+        visit(child, `${path}.${key}`);
+      }
+      return;
+    }
+    visit(def.in, `${path}<in>`);
+    visit(def.out, `${path}<out>`);
+    visit(def.innerType, `${path}<inner>`);
+    visit(def.element, `${path}[]`);
+    visit(def.keyType, `${path}<key>`);
+    visit(def.valueType, `${path}<value>`);
+    for (const [index, option] of (def.options ?? []).entries()) {
+      visit(option, `${path}|${String(index)}`);
+    }
+  };
+  for (const [name, value] of Object.entries(packageSurface as Record<string, unknown>)) {
+    visit(value, name);
+  }
+  return found;
 }
 
 /** Maps an anchor's `localSchema` name to the schema it must describe. */
@@ -210,27 +299,48 @@ describe("completeness", () => {
     );
   });
 
-  it("anchors every object schema the package EXPORTS, nested ones included", () => {
+  it("the local-schema map is exactly the set of schemas the table anchors", () => {
+    // `LOCAL_SCHEMAS` is what the guard below compares against, so it may not
+    // drift from the table it is supposed to represent.
+    expect(Object.keys(LOCAL_SCHEMAS).sort()).toEqual(
+      [...new Set(ALL_ANCHORS.map((anchor) => anchor.localSchema))].sort(),
+    );
+  });
+
+  it("anchors every object schema REACHABLE from the package surface, however wrapped", () => {
     // Round-1 finding M1(a): `VenueBookLevelSchema` and
     // `MarketEventMessageSchema` were exported and load-bearing — every book
     // level and every lifecycle event's parent metadata goes through them — and
-    // neither appeared in the table. Enumerating the package surface is what
-    // makes that impossible to repeat: a new exported object schema fails here
-    // until it is anchored.
-    const exported = Object.entries(packageSurface as Record<string, unknown>)
-      .filter(([name, value]) => {
-        if (!name.endsWith("Schema")) return false;
-        if (typeof value !== "object" || value === null) return false;
-        const shape = (value as { shape?: unknown }).shape;
-        return typeof shape === "object" && shape !== null;
-      })
-      .map(([name]) => name)
+    // neither appeared in the table.
+    //
+    // Round-2 finding L1: the guard that closed it matched exports whose NAME
+    // ended in `Schema` and whose runtime value exposed `.shape` directly, so a
+    // transformed, refined or differently named export slipped past it. This
+    // version is structural instead of conventional — it follows zod's wrappers
+    // and an object's own fields, by identity — and it compares schema OBJECTS,
+    // not names, in both directions. See `reachableObjectSchemas` for exactly
+    // what it can and cannot see.
+    const reachable = reachableObjectSchemas();
+    const anchored = new Map<object, string>(
+      Object.entries(LOCAL_SCHEMAS).map(([name, schema]) => [schema as object, name]),
+    );
+
+    // Everything the package can hand to a consumer is anchored...
+    const unanchored = [...reachable]
+      .filter(([schema]) => !anchored.has(schema))
+      .map(([, path]) => path)
       .sort();
-    const anchoredNames = new Set(ALL_ANCHORS.map((anchor) => anchor.localSchema));
-    const unanchored = exported.filter((name) => !anchoredNames.has(name));
-    expect(unanchored, `unanchored exported object schemas: ${unanchored.join(", ")}`).toEqual([]);
-    // ...and the table is not padded with schemas the package does not export.
-    expect([...anchoredNames].sort()).toEqual(exported);
+    expect(unanchored, `unanchored object schemas: ${unanchored.join(", ")}`).toEqual([]);
+
+    // ...and the table is not padded with schemas the surface cannot reach.
+    // This direction is also the canary: if zod's internals change and the
+    // traversal stops finding anything, this fails rather than passing empty.
+    const unreachable = [...anchored]
+      .filter(([schema]) => !reachable.has(schema))
+      .map(([, name]) => name)
+      .sort();
+    expect(unreachable, `anchored but unreachable: ${unreachable.join(", ")}`).toEqual([]);
+    expect(reachable.size).toBe(anchored.size);
   });
 });
 
@@ -359,8 +469,22 @@ describe("obligations the SDK and the REST spec impose on the local modifier", (
 
 describe("recorded divergences are executable", () => {
   it.each(NAMED_VECTORS)(
-    "%s: every value-form divergence carries a vector the source rejects",
+    "%s: every value-form divergence has a vector THIS parser accepts and a cited source rule",
     (_name, anchor, field) => {
+      // Round-2 finding L2: this case used to be titled "carries a vector the
+      // source rejects", which claimed more than it did. The SDK and the
+      // OpenAPI document are NOT executed anywhere in this suite — neither is
+      // vendored, and vendoring one to run it would be a second transcription
+      // to keep honest. So the split is:
+      //
+      //   * mechanically executed here — the vector PARSES through this
+      //     package's real entry point, so "we accept this" is behaviour;
+      //   * recorded, not executed — that the stricter source rejects it. That
+      //     half rests on the row's `reason` and `authority`, both asserted
+      //     below to be present, and on the permalink to the source line that
+      //     the citation tests pin to the reference commit.
+      //
+      // A vector with no reason, and a reason with no vector, both still fail.
       const valueForm = divergences(field, "value-form");
       if (valueForm.length === 0) {
         expect(
@@ -379,6 +503,15 @@ describe("recorded divergences are executable", () => {
           `${field.field} should accept ${JSON.stringify(value)}`,
         ).toBe(true);
       }
+      // The recorded half, made explicit at the point that depends on it.
+      for (const divergence of valueForm) {
+        expect(divergence.reason.length, `${field.field} value-form reason`).toBeGreaterThan(40);
+        expect(
+          divergence.authority.length,
+          `${field.field} value-form authority`,
+        ).toBeGreaterThan(10);
+      }
+      expect(field.citation, `${field.field} citation`).toContain(SDK_REFERENCE_COMMIT);
     },
   );
 

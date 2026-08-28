@@ -56,9 +56,11 @@ interface Harness {
   types(): readonly string[];
 }
 
-function harness(): Harness {
+function harness(
+  transport: Parameters<typeof fakeWebSocketFactory>[0] = {},
+): Harness {
   const scheduler = new ManualScheduler();
-  const sockets = fakeWebSocketFactory();
+  const sockets = fakeWebSocketFactory(transport);
   const directory = staticMarketDirectory({ known: [MARKET], registrable: [MARKET] });
   const events: NormalizedPublicEventAny[] = [];
   const problems: PublicMarketProblem[] = [];
@@ -310,6 +312,94 @@ describe("a full connect → consume → drop → recover cycle", () => {
       const serialized = JSON.stringify(event.provenance);
       expect(serialized).not.toMatch(/ingestSeq|sequenceNumber|"seq"/u);
     }
+  });
+});
+
+describe("transports and subscriptions the round-2 review found unhandled", () => {
+  it("subscribes a transport that was already connected when the factory returned", () => {
+    // Round-2 finding H1. A transport is not obliged to open asynchronously,
+    // and this one calls `onOpen` from inside the factory call — on the FIRST
+    // connection and on the reconnect. Both must send the subscription and both
+    // must consume the fixtures afterwards; before the fix the feed published
+    // `FeedConnected` having sent nothing, so the socket was never subscribed
+    // and every subsequent frame in this test would have been venue traffic
+    // nobody asked for.
+    const subject = harness({ onCreate: (socket) => socket.emitOpen() });
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+
+    expect(subject.sockets.latest().sentFrames).toEqual([
+      {
+        assets_ids: [MARKET.yesTokenId],
+        type: "market",
+        custom_feature_enabled: true,
+        initial_dump: true,
+      },
+    ]);
+    expect(subject.types()).toEqual(["FeedConnected"]);
+
+    subject.sockets.latest().emitJson(fixtureExample("book-snapshot", "book-snapshot"));
+    expect(subject.problems).toEqual([]);
+    expect(subject.types()).toEqual(["FeedConnected", "BookSnapshot"]);
+
+    // The reconnect path, same transport behaviour: the socket opens inside the
+    // factory call, so nothing here emits the open.
+    subject.sockets.latest().emitClose({ code: 1006, reason: "abnormal closure" });
+    subject.scheduler.advance(1_000);
+
+    expect(subject.sockets.sockets).toHaveLength(2);
+    expect(subject.sockets.latest().sentFrames).toHaveLength(1);
+    expect(subject.types()).toEqual([
+      "FeedConnected",
+      "BookSnapshot",
+      "FeedDisconnected",
+      "FeedConnected",
+      "FeedGapDetected",
+    ]);
+    expect(subject.feed.openGap?.subscriptionGeneration).toBe(
+      subject.feed.subscriptionGeneration,
+    );
+  });
+
+  it("owes no snapshot for a reconnect with nothing subscribed", () => {
+    // Round-2 finding H2. `planFullSubscription()` of an empty set resubscribes
+    // nothing and does not advance the generation, so a gap opened here would
+    // carry the generation the PREVIOUS gap already used — and the gateway's
+    // acknowledgement of that older gap would close it, publishing a recovery
+    // nobody performed. There are also no affected markets to recover.
+    const subject = harness();
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+    subject.sockets.latest().emitClose({ code: 1006 });
+    subject.scheduler.advance(1_000);
+    subject.sockets.latest().emitOpen();
+
+    // A real gap, acknowledged the ordinary way.
+    const gap = subject.feed.openGap?.subscriptionGeneration ?? -1;
+    expect(subject.feed.markResynchronized({ subscriptionGeneration: gap }).status).toBe(
+      "accepted",
+    );
+
+    // Everything is unsubscribed, and the connection drops again.
+    subject.feed.unsubscribe([MARKET.yesTokenId]);
+    subject.sockets.latest().emitClose({ code: 1006 });
+    subject.scheduler.advance(1_000);
+    subject.sockets.latest().emitOpen();
+
+    expect(subject.feed.subscriptionGeneration).toBe(gap);
+    expect(subject.feed.openGap).toBeUndefined();
+    expect(subject.feed.isAwaitingSnapshot).toBe(false);
+    expect(subject.sockets.latest().sent).toEqual([]);
+    // Replaying the acknowledgement already spent on the earlier gap publishes
+    // nothing: there is exactly one recovery in this whole lifecycle.
+    expect(subject.feed.markResynchronized({ subscriptionGeneration: gap })).toMatchObject({
+      status: "rejected",
+      reasonCode: "NO_OPEN_GAP",
+    });
+    expect(subject.events.filter((event) => event.eventType === "FeedResynchronized")).toHaveLength(
+      1,
+    );
   });
 });
 

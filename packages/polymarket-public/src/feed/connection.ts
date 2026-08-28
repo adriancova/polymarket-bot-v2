@@ -13,7 +13,8 @@
  * | Transition | Event |
  * | --- | --- |
  * | socket opened, subscription sent | `FeedConnected` |
- * | opened again after a previous connection | `FeedConnected` **and** `FeedGapDetected` |
+ * | opened again after a previous connection, with tokens subscribed | `FeedConnected` **and** `FeedGapDetected` |
+ * | opened again with NOTHING subscribed | `FeedConnected` only — nothing was missed |
  * | no `PONG` within the window | `FeedStale`, then a disconnect if configured |
  * | socket closed, for any reason | `FeedDisconnected` |
  * | tokens ADDED to the subscription of a live connection | `FeedGapDetected` |
@@ -22,11 +23,13 @@
  * A gap is emitted on reconnect and on a subscription addition because in both
  * cases the server-side subscription state was replaced and anything published
  * meanwhile was not received. §7.1 makes the consequence unconditional: a new
- * authoritative snapshot is required before affected markets resume. This
+ * authoritative snapshot is required before affected markets resume — which is
+ * why a reconnect with NOTHING subscribed emits none: it replaced no
+ * subscription and has no affected market to recover (invariant 4). This
  * adapter never emits `FeedResynchronized` on its own — reopening a socket is
  * not a recovery, and only the caller knows whether it applied a snapshot.
  *
- * ## Two invariants the round-1 review added, and what they mean here
+ * ## Four invariants the reviews added, and what they mean here
  *
  * 1. **Every callback is bound to the socket session that installed it.** A
  *    transport can deliver a frame, an open, an error or a close for a socket
@@ -46,6 +49,27 @@
  *    taken for an OLDER one. It now takes the acknowledged generation, matches
  *    it against the open gap, and returns a typed rejection instead of
  *    publishing a recovery that did not happen.
+ * 3. **No socket-dependent action is dropped because the handle has not
+ *    arrived.** A transport may call `onOpen` — or `onError`, or `onClose` —
+ *    synchronously, from inside the factory call, before `#connect()` has
+ *    anything to send on. Every such action is queued on the attempt's session
+ *    and run the instant the handle is assigned, so the subscription really is
+ *    written before `FeedConnected` is published, a `stop()` issued from inside
+ *    a synchronous callback still closes the socket it could not yet see, and an
+ *    overtaken attempt's socket is still closed rather than leaked (round-2
+ *    finding H1: the synchronous case published `FeedConnected` having sent
+ *    nothing).
+ * 4. **Every gap this feed opens advances the generation in the same step, so
+ *    gap generations are unique and strictly increasing.** That is what makes
+ *    the generation a sufficient acknowledgement identity. The two gap-opening
+ *    transitions are an addition pushed to a live connection and a full
+ *    (re)subscription of a NON-EMPTY set; a reconnect with nothing subscribed
+ *    resubscribes nothing, advances nothing, and therefore opens no gap
+ *    (round-2 finding H2: it used to open one at the unchanged generation,
+ *    which an acknowledgement written for the PREVIOUS gap then closed).
+ *    The converse is deliberately not claimed: the generation may advance with
+ *    no gap — on the first connection, and on a change made while disconnected
+ *    — because in those cases nothing was missed.
  *
  * ## Credentials
  *
@@ -180,6 +204,17 @@ interface FeedSocketSession {
   /** The socket this session owns; assigned immediately after the factory call. */
   socket: PublicWebSocket | undefined;
   /**
+   * Socket-dependent work requested before the factory returned the handle.
+   *
+   * A transport that is already connected — a pooled or pre-opened socket, or a
+   * test double — may call `onOpen` (or `onError`, or `onClose`) DURING the
+   * factory call, while `socket` is still `undefined`. Anything that needs the
+   * socket is queued here and run, in request order, the moment the handle is
+   * assigned (round-2 finding H1). Empty for a transport that opens
+   * asynchronously, which is every real one.
+   */
+  readonly deferred: SocketAction[];
+  /**
    * The subscription generation this session is serving.
    *
    * Updated only while the session is live, and frozen at its last value the
@@ -191,15 +226,22 @@ interface FeedSocketSession {
   retired: boolean;
 }
 
+/** Something that can only be done once a session's socket handle exists. */
+type SocketAction = (socket: PublicWebSocket) => void;
+
 /** A gap that is open and still owed an authoritative snapshot. */
 export interface OpenFeedGap {
   readonly reasonCode: FeedGapReason;
   /**
    * The generation the gap was opened under.
    *
-   * This is the gap's identity: every gap this feed opens is opened by a
-   * transition that also advanced the generation, so an acknowledgement naming
-   * a different one is either stale or invented.
+   * This is the gap's identity, and it is unambiguous because every gap this
+   * feed opens is opened by a transition that advances the generation in the
+   * same step — an addition pushed to a live connection, or a full
+   * (re)subscription of a non-empty set. Gap generations are therefore unique
+   * and strictly increasing, so an acknowledgement naming a different one is
+   * either stale or invented. A reconnect with nothing subscribed resubscribes
+   * nothing and opens no gap, which is what keeps that true (round-2 H2).
    */
   readonly subscriptionGeneration: number;
   readonly connectionId: string | undefined;
@@ -336,9 +378,10 @@ export class PublicMarketFeed {
     this.#requireRunning();
     const delta = this.#subscriptions.add(tokenIds);
     if (delta.added.length === 0) return;
-    if (this.#status === "open") {
+    const session = this.#session;
+    if (this.#status === "open" && session !== undefined) {
       this.#noteGeneration(delta.generation);
-      this.#sendFrames(delta.frames);
+      this.#sendFrames(session, delta.frames);
       this.#openGapAt(
         FEED_GAP_REASONS.subscriptionReplaced,
         delta.generation,
@@ -363,8 +406,9 @@ export class PublicMarketFeed {
     this.#requireRunning();
     const delta = this.#subscriptions.remove(tokenIds);
     if (delta.removed.length === 0) return;
-    if (this.#status === "open") {
-      this.#sendFrames(delta.frames);
+    const session = this.#session;
+    if (this.#status === "open" && session !== undefined) {
+      this.#sendFrames(session, delta.frames);
     }
   }
 
@@ -435,8 +479,13 @@ export class PublicMarketFeed {
     this.#cancelReconnect = undefined;
     this.#stopTimers();
     const session = this.#retireSession();
-    if (session?.socket !== undefined) {
-      session.socket.close();
+    if (session !== undefined) {
+      // Deferred when `stop()` was called from inside a synchronous transport
+      // callback: the handle does not exist yet, and a socket nobody closes is a
+      // socket that stays open after the feed is gone (round-2 H1).
+      this.#withSocket(session, (socket) => {
+        socket.close();
+      });
     }
     if (wasConnected && session !== undefined) {
       this.#emitDisconnected(session, FEED_DISCONNECT_REASONS.clientStopped, undefined);
@@ -466,11 +515,12 @@ export class PublicMarketFeed {
     const session: FeedSocketSession = {
       connectionId,
       socket: undefined,
+      deferred: [],
       generation: this.#subscriptions.generation,
       retired: false,
     };
     this.#session = session;
-    session.socket = this.#deps.webSocketFactory(this.#options.url, {
+    const socket = this.#deps.webSocketFactory(this.#options.url, {
       onOpen: () => {
         this.#onOpen(session);
       },
@@ -484,6 +534,36 @@ export class PublicMarketFeed {
         this.#onError(session, error);
       },
     });
+    session.socket = socket;
+    // Whatever the callbacks asked this socket to do while the factory call was
+    // still in flight runs now, in the order it was asked, on this attempt's own
+    // handle. Work queued for a session that has ALREADY been retired still runs,
+    // because that is how an abandoned socket gets closed rather than leaked; the
+    // queued open — the one action with something to decide — re-checks liveness
+    // for itself and closes instead of connecting when it lost the race.
+    const deferred = session.deferred.splice(0, session.deferred.length);
+    for (const action of deferred) {
+      action(socket);
+    }
+  }
+
+  /**
+   * Runs `action` on a session's socket, now or as soon as the handle exists.
+   *
+   * Every socket-dependent thing this feed does goes through here. Before
+   * round-2 finding H1, `#onOpen` reached for `session.socket` directly: a
+   * transport that called `onOpen` synchronously from inside the factory call
+   * found it `undefined`, so the subscription frame was dropped — silently,
+   * while `FeedConnected` was published anyway, leaving a feed that believed it
+   * was subscribed to a socket that had been sent nothing.
+   */
+  #withSocket(session: FeedSocketSession, action: SocketAction): void {
+    const socket = session.socket;
+    if (socket === undefined) {
+      session.deferred.push(action);
+      return;
+    }
+    action(socket);
   }
 
   /**
@@ -505,12 +585,30 @@ export class PublicMarketFeed {
     return session;
   }
 
+  /**
+   * The socket opened — possibly before `#connect()` holds the handle.
+   *
+   * The whole open is deferred as one unit rather than only the send, so the
+   * published order is the documented one in both cases: plan the subscription,
+   * write it to the socket, then publish `FeedConnected`. A consumer therefore
+   * never sees "connected" for a socket the subscription has not reached.
+   */
   #onOpen(session: FeedSocketSession): void {
+    this.#withSocket(session, () => {
+      this.#handleOpen(session);
+    });
+  }
+
+  #handleOpen(session: FeedSocketSession): void {
     if (!this.#isLive(session)) {
       // A socket this feed abandoned has opened. It is not ours to use and not
       // ours to leave running: closing it is the only state change here, and
       // its close callback will be ignored for the same reason this one is.
-      session.socket?.close();
+      // (Liveness is re-checked HERE, after any deferral, because the attempt
+      // can be overtaken or stopped between the callback and the handle.)
+      this.#withSocket(session, (socket) => {
+        socket.close();
+      });
       return;
     }
     this.#status = "open";
@@ -520,7 +618,7 @@ export class PublicMarketFeed {
 
     const subscription = this.#subscriptions.planFullSubscription();
     session.generation = subscription.generation;
-    this.#sendFrames(subscription.frames);
+    this.#sendFrames(session, subscription.frames);
 
     this.#handlers.onEvent(
       feedConnected({
@@ -532,10 +630,18 @@ export class PublicMarketFeed {
       }),
     );
 
-    if (this.#hasConnectedBefore) {
+    if (this.#hasConnectedBefore && subscription.assets.length > 0) {
       // A reconnection replaced the server-side subscription state, so whatever
       // was published while the socket was down was not received. The feed is
       // connected AND in the gap state until the caller applies a snapshot.
+      //
+      // ...unless nothing is subscribed. Then there are no affected markets,
+      // nothing was missed, and `planFullSubscription()` sent no frame and did
+      // not advance the generation — so a gap opened here would carry the SAME
+      // generation as the previous one, and an acknowledgement written for that
+      // older gap would close this newer one (round-2 finding H2). Demanding an
+      // authoritative snapshot for an empty subscription would also be the
+      // round-1 H2 mistake in another costume.
       this.#openGapAt(
         FEED_GAP_REASONS.reconnected,
         subscription.generation,
@@ -681,7 +787,11 @@ export class PublicMarketFeed {
   #startTimers(): void {
     this.#stopTimers();
     this.#cancelHeartbeat = this.#deps.timers.setInterval(() => {
-      this.#session?.socket?.send(MARKET_HEARTBEAT_REQUEST);
+      const session = this.#session;
+      if (session === undefined) return;
+      this.#withSocket(session, (socket) => {
+        socket.send(MARKET_HEARTBEAT_REQUEST);
+      });
     }, this.#options.heartbeatIntervalMs);
     this.#cancelWatchdog = this.#deps.timers.setInterval(() => {
       this.#checkStaleness();
@@ -728,7 +838,11 @@ export class PublicMarketFeed {
     this.#closeDetail = `no PONG for ${String(Math.round(stalenessMs))}ms`;
     this.#stopTimers();
     // Close and let the normal close path emit the disconnect and reconnect.
-    session?.socket?.close();
+    if (session !== undefined) {
+      this.#withSocket(session, (socket) => {
+        socket.close();
+      });
+    }
   }
 
   // ---- helpers -------------------------------------------------------------
@@ -772,12 +886,24 @@ export class PublicMarketFeed {
     );
   }
 
-  #sendFrames(frames: readonly Readonly<Record<string, unknown>>[]): void {
-    const socket = this.#session?.socket;
-    if (socket === undefined) return;
-    for (const frame of frames) {
-      socket.send(JSON.stringify(frame));
-    }
+  /**
+   * Writes frames to a NAMED session's socket, never to "whatever is live".
+   *
+   * The session is a parameter rather than a read of `#session` for the same
+   * reason every callback carries one, and the write goes through
+   * {@link PublicMarketFeed.#withSocket} so a frame is never dropped merely
+   * because the factory call had not returned the handle yet (round-2 H1).
+   */
+  #sendFrames(
+    session: FeedSocketSession,
+    frames: readonly Readonly<Record<string, unknown>>[],
+  ): void {
+    if (frames.length === 0) return;
+    this.#withSocket(session, (socket) => {
+      for (const frame of frames) {
+        socket.send(JSON.stringify(frame));
+      }
+    });
   }
 
   #requireRunning(): void {
