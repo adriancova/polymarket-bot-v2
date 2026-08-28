@@ -213,15 +213,41 @@ export function normalizeVenueTokenId(value: unknown): ValueNormalization<TokenI
 /**
  * Normalizes a venue condition id.
  *
- * NO byte-length bound is applied. The `WP-000` fixture catalogue narrows a
- * condition id to 31/32 bytes; ADR-002 §7 makes it binding that a runtime
- * parser accepts "any hex condition id the SDK accepts", and the SDK's
- * `ConditionIdResponseSchema` "validates hex syntax without constraining the
- * condition ID byte length". The market channel types the field looser still —
- * a bare `z.string()` — so a non-hex value is accepted here too and left for
- * the catalogue to judge. Only emptiness and the domain's identifier length
- * bound are enforced, because `ConditionIdSchema` in `packages/domain` is a
- * bounded non-empty string and an over-long value would fail there anyway.
+ * The `WP-000` fixture catalogue narrows a condition id to 31/32 bytes;
+ * ADR-002 §7 and `docs/contracts/protected-contracts.md` §9 make it binding
+ * that a runtime parser accept "any hex condition id
+ * `ConditionIdResponseSchema` accepts (no 31/32-byte bound at runtime)", and
+ * that SDK schema "validates hex syntax without constraining the condition ID
+ * byte length". The market channel types the field looser still — a bare
+ * `z.string()` — so a non-hex value is accepted here too and left for the
+ * catalogue to judge.
+ *
+ * ## The 31/32-byte narrowing is NOT inherited. A different bound applies.
+ *
+ * Round-1 review finding M2. This function is bounded at
+ * {@link MAX_IDENTIFIER_LENGTH} = 200 characters, which is NOT the fixture
+ * catalogue's narrowing and is not a venue fact: it is
+ * `packages/domain`'s `ConditionIdSchema` (a bounded non-empty string), which
+ * every payload carrying a condition id is validated against. Enforcing it
+ * here rather than downstream turns an over-long id into a typed
+ * `INVALID_CONDITION_ID` problem carrying the raw value, instead of a
+ * `PAYLOAD_CONTRACT_VIOLATION` at emission time — but it is still a length
+ * bound, and §9's binding names none.
+ *
+ * So the honest statement, and the one the README, the handoff and
+ * `test/contract/polymarket-public/narrowings.test.ts` now make, is:
+ *
+ * - a hex condition id of **any length up to 200 characters** is accepted,
+ *   which covers the 31-byte and 32-byte forms the fixture catalogue allows,
+ *   every shorter one, and everything up to more than three times the 66
+ *   characters the venue is documented to publish;
+ * - **beyond 200 characters it is rejected**, as an observable problem, never
+ *   as a throw and never as a silent drop;
+ * - and therefore the §9 row is **discharged in substance but not literally**.
+ *   Reconciling `ConditionIdSchema`'s cap with §9's "no length constraint" is a
+ *   contract-owner decision (`packages/domain` is frozen and outside this
+ *   package's allowed paths); the orchestrator carries it as contract-owner
+ *   item 3 in `IMPLEMENTATION_STATUS.md`. This package does not claim it closed.
  */
 export function normalizeVenueConditionId(value: unknown): ValueNormalization<string> {
   if (isWireAbsent(value)) {
@@ -240,9 +266,20 @@ export function normalizeVenueConditionId(value: unknown): ValueNormalization<st
  * Maps the venue's `BUY`/`SELL` vocabulary onto the domain's `BID`/`ASK`.
  *
  * The venue enumerates the field as `BUY | SELL` on both the price change and
- * the last trade, and documents the trade's as "From taker's perspective". A
- * buy rests on, or lifts into, the bid side; a sell the ask side. The SDK
- * upper-cases before matching, so this does too.
+ * the last trade, and documents the trade's as "From taker's perspective". The
+ * mapping is by the ORDER's own side: a buy order is a bid, a sell order is an
+ * ask. Note what that is not — a buy TAKER does not lift the bid side, it
+ * consumes the ask side, and a sell taker hits the bid side (this comment
+ * previously said a buy "lifts into the bid side", which is backwards;
+ * round-1 review note). The mapping itself is unchanged and is the intended
+ * one: `BookLevelChanged.side` names the side of the book the level belongs to,
+ * and `PublicTradeObserved.takerSide` names the side the taker's own order was
+ * on, which is what the venue's field means. A consumer that reads `takerSide`
+ * as "the side of the book that was consumed" would have it inverted; whether
+ * every adapter in this repository should spell that the same way is the open
+ * cross-adapter semantic question recorded in `docs/handoffs/WP-070.md`.
+ *
+ * The SDK upper-cases before matching, so this does too.
  *
  * An unrecognized value is NOT mapped to a default. ADR-002 §7: "A runtime
  * parser must treat an unrecognized value as first-class UNKNOWN — routed to

@@ -105,8 +105,11 @@ describe("normalization into BookSnapshot", () => {
     expect(events[0]?.provenance).not.toHaveProperty("connectionId");
   });
 
-  it("maps a null or empty optional to ABSENT and still produces a snapshot", async () => {
-    const { subject } = fetcher(example("single-book-empty-optionals"));
+  it("maps the two absence-tolerant fields to ABSENT and still produces a snapshot", async () => {
+    // `timestamp` and `last_trade_price` are the only two fields of this
+    // response the SDK declares nullish; the official OpenAPI lists all ten
+    // under `required`, and round-1 finding M1 restored the other eight here.
+    const { subject } = fetcher(example("single-book-absent-optionals"));
     const { events, problems } = await subject.fetchSnapshot(YES.yesTokenId);
     expect(problems).toEqual([]);
     expect(events[0]?.payload).toEqual({
@@ -114,7 +117,24 @@ describe("normalization into BookSnapshot", () => {
       tokenId: YES.yesTokenId,
       bids: [],
       asks: [],
+      venueBookHash: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
     });
+    expect(events[0]?.provenance).not.toHaveProperty("venueTimestamp");
+  });
+
+  it("refuses a response missing a field the official REST contract requires", async () => {
+    // A snapshot is the authority a gap recovery rebuilds from (§7.1): a body
+    // that does not match the published contract must fail loudly rather than
+    // become a half-populated authoritative document.
+    const complete = example("single-book-40-char-hash") as Record<string, unknown>;
+    for (const field of ["hash", "min_order_size", "tick_size", "neg_risk"]) {
+      const body = { ...complete };
+      delete body[field];
+      const { subject } = fetcher(body);
+      await expect(subject.fetchSnapshot(YES.yesTokenId), field).rejects.toThrow(
+        /did not match the documented shape/u,
+      );
+    }
   });
 
   it("produces the same payload shape as the WebSocket book path", async () => {

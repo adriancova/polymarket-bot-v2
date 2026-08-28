@@ -223,7 +223,7 @@ describe("reconnect", () => {
 });
 
 describe("markResynchronized", () => {
-  it("is caller-driven: reopening a socket is not a recovery", () => {
+  function reconnected(): Harness {
     const subject = harness();
     subject.feed.subscribe([MARKET.yesTokenId]);
     subject.feed.start();
@@ -231,16 +231,306 @@ describe("markResynchronized", () => {
     subject.sockets.latest().emitClose({});
     subject.scheduler.advance(1_000);
     subject.sockets.latest().emitOpen();
+    return subject;
+  }
+
+  it("is caller-driven: reopening a socket is not a recovery", () => {
+    const subject = reconnected();
 
     expect(subject.eventTypes()).not.toContain("FeedResynchronized");
     expect(subject.feed.isAwaitingSnapshot).toBe(true);
 
-    subject.feed.markResynchronized();
+    const gap = subject.feed.openGap;
+    expect(gap?.reasonCode).toBe("FEED_RECONNECTED");
+    const outcome = subject.feed.markResynchronized({
+      subscriptionGeneration: gap?.subscriptionGeneration ?? -1,
+    });
+
+    expect(outcome).toEqual({
+      status: "accepted",
+      subscriptionGeneration: gap?.subscriptionGeneration,
+    });
     expect(subject.eventTypes().at(-1)).toBe("FeedResynchronized");
     expect(subject.events.at(-1)?.payload).toMatchObject({
       authoritativeSnapshotApplied: true,
+      subscriptionGeneration: gap?.subscriptionGeneration,
     });
     expect(subject.feed.isAwaitingSnapshot).toBe(false);
+  });
+
+  it("refuses an acknowledgement when no gap is open, and publishes nothing", () => {
+    // H2: this used to emit `FeedResynchronized` unconditionally, so a caller
+    // could declare a recovery from nothing.
+    const subject = harness();
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+
+    const outcome = subject.feed.markResynchronized({
+      subscriptionGeneration: subject.feed.subscriptionGeneration,
+    });
+    expect(outcome).toMatchObject({ status: "rejected", reasonCode: "NO_OPEN_GAP" });
+    expect(subject.eventTypes()).not.toContain("FeedResynchronized");
+  });
+
+  it("refuses a DUPLICATE acknowledgement of the same gap", () => {
+    const subject = reconnected();
+    const generation = subject.feed.subscriptionGeneration;
+
+    expect(subject.feed.markResynchronized({ subscriptionGeneration: generation }).status).toBe(
+      "accepted",
+    );
+    const second = subject.feed.markResynchronized({ subscriptionGeneration: generation });
+
+    expect(second).toMatchObject({ status: "rejected", reasonCode: "NO_OPEN_GAP" });
+    expect(subject.events.filter((event) => event.eventType === "FeedResynchronized")).toHaveLength(
+      1,
+    );
+  });
+
+  it("refuses a snapshot taken for an older generation than the open gap's", () => {
+    // The race that matters: the gateway fetched a snapshot for generation N,
+    // and by the time it applied it a subscription change had opened the gap
+    // for generation N+1. Closing the newer gap with the older snapshot would
+    // publish an authoritative recovery nobody performed.
+    const subject = reconnected();
+    const staleGeneration = subject.feed.subscriptionGeneration;
+    subject.feed.subscribe([MARKET.noTokenId]);
+    const currentGeneration = subject.feed.subscriptionGeneration;
+    expect(currentGeneration).toBeGreaterThan(staleGeneration);
+
+    const outcome = subject.feed.markResynchronized({
+      subscriptionGeneration: staleGeneration,
+    });
+
+    expect(outcome).toEqual({
+      status: "rejected",
+      reasonCode: "GENERATION_MISMATCH",
+      detail: expect.stringContaining(String(currentGeneration)) as unknown as string,
+      expectedSubscriptionGeneration: currentGeneration,
+    });
+    expect(subject.eventTypes()).not.toContain("FeedResynchronized");
+    expect(subject.feed.isAwaitingSnapshot).toBe(true);
+  });
+
+  it("names the open gap so a caller can acknowledge it at all", () => {
+    const subject = reconnected();
+    expect(subject.feed.openGap).toMatchObject({
+      reasonCode: "FEED_RECONNECTED",
+      subscriptionGeneration: subject.feed.subscriptionGeneration,
+      connectionId: "conn-2",
+    });
+  });
+});
+
+describe("subscription changes and the generation (H2)", () => {
+  it("opens a gap for an ADDITION on a live connection, under the new generation", () => {
+    const subject = harness();
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+    subject.feed.subscribe([MARKET.yesTokenId]);
+
+    expect(subject.feed.openGap?.subscriptionGeneration).toBe(
+      subject.feed.subscriptionGeneration,
+    );
+  });
+
+  it("a REMOVAL neither advances the generation nor opens a gap", () => {
+    // Before the fix this advanced 2 → 3 with `emittedGap: false`, so events
+    // carried a generation boundary that nothing accounted for.
+    const subject = harness();
+    subject.feed.subscribe([MARKET.yesTokenId, MARKET.noTokenId]);
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+    const before = subject.feed.subscriptionGeneration;
+
+    subject.feed.unsubscribe([MARKET.noTokenId]);
+
+    expect(subject.feed.subscriptionGeneration).toBe(before);
+    expect(subject.eventTypes()).not.toContain("FeedGapDetected");
+    expect(subject.feed.isAwaitingSnapshot).toBe(false);
+    // The unsubscribe frame is still sent: the desired set really did change.
+    expect(subject.sockets.latest().sentFrames.at(-1)).toEqual({
+      operation: "unsubscribe",
+      assets_ids: [MARKET.noTokenId],
+    });
+  });
+
+  it("on a live connection the generation changes exactly when a gap opens", () => {
+    const subject = harness();
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+
+    const observed: { generation: number; gaps: number }[] = [];
+    const record = (): void => {
+      observed.push({
+        generation: subject.feed.subscriptionGeneration,
+        gaps: subject.events.filter((event) => event.eventType === "FeedGapDetected").length,
+      });
+    };
+    record();
+    subject.feed.subscribe([MARKET.noTokenId]);
+    record();
+    subject.feed.unsubscribe([MARKET.noTokenId]);
+    record();
+    subject.feed.subscribe([MARKET.yesTokenId]); // already subscribed: a no-op
+    record();
+    subject.sockets.latest().emitClose({});
+    subject.scheduler.advance(1_000);
+    subject.sockets.latest().emitOpen();
+    record();
+
+    for (let index = 1; index < observed.length; index += 1) {
+      const previous = observed[index - 1];
+      const current = observed[index];
+      if (previous === undefined || current === undefined) continue;
+      expect(
+        current.generation !== previous.generation,
+        `step ${String(index)}: generation ${String(previous.generation)} → ${String(current.generation)}, gaps ${String(previous.gaps)} → ${String(current.gaps)}`,
+      ).toBe(current.gaps !== previous.gaps);
+    }
+  });
+
+  it("a newer gap supersedes an older one, and only the newer can be closed", () => {
+    const subject = harness();
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    const firstGap = subject.feed.openGap?.subscriptionGeneration ?? -1;
+    subject.feed.subscribe([MARKET.noTokenId]);
+    const secondGap = subject.feed.openGap?.subscriptionGeneration ?? -1;
+
+    expect(secondGap).toBeGreaterThan(firstGap);
+    expect(
+      subject.feed.markResynchronized({ subscriptionGeneration: firstGap }),
+    ).toMatchObject({ reasonCode: "GENERATION_MISMATCH" });
+    expect(
+      subject.feed.markResynchronized({ subscriptionGeneration: secondGap }).status,
+    ).toBe("accepted");
+  });
+});
+
+describe("stale socket callbacks (H1)", () => {
+  interface Reconnected {
+    readonly subject: Harness;
+    readonly stale: ReturnType<Harness["sockets"]["latest"]>;
+    readonly live: ReturnType<Harness["sockets"]["latest"]>;
+  }
+
+  function reconnected(): Reconnected {
+    const subject = harness();
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    const stale = subject.sockets.latest();
+    stale.emitOpen();
+    stale.emitClose({ code: 1006, reason: "abnormal" });
+    subject.scheduler.advance(1_000);
+    const live = subject.sockets.latest();
+    live.emitOpen();
+    return { subject, stale, live };
+  }
+
+  const BOOK_FRAME = JSON.stringify({
+    event_type: "book",
+    market: MARKET.conditionId,
+    asset_id: MARKET.yesTokenId,
+    timestamp: "1782753357257",
+    bids: [{ price: "0.08", size: "1" }],
+    asks: [{ price: "0.09", size: "2" }],
+  });
+
+  it("onMessage: a frame from a retired socket is never published as current data", () => {
+    // Before the fix this became a BookSnapshot stamped `conn-2`, generation 3,
+    // with zero problems reported.
+    const { subject, stale } = reconnected();
+    const eventsBefore = subject.events.length;
+
+    stale.handlers.onMessage(BOOK_FRAME);
+
+    expect(subject.events).toHaveLength(eventsBefore);
+    expect(subject.problems).toHaveLength(1);
+    expect(subject.problems[0]).toMatchObject({
+      code: "STALE_CONNECTION_FRAME",
+      raw: BOOK_FRAME,
+    });
+    expect(subject.problems[0]?.detail).toContain("conn-1");
+    expect(subject.problems[0]?.detail).toContain("conn-2");
+  });
+
+  it("onMessage: the raw record keeps the frame, labelled with the socket it arrived on", () => {
+    const { subject, stale } = reconnected();
+    stale.handlers.onMessage(BOOK_FRAME);
+
+    expect(subject.frames.at(-1)).toMatchObject({
+      connectionId: "conn-1",
+      subscriptionGeneration: 2,
+      payload: BOOK_FRAME,
+    });
+    // ...while the live connection is conn-2 under generation 3.
+    expect(subject.feed.connectionId).toBe("conn-2");
+    expect(subject.feed.subscriptionGeneration).toBe(3);
+  });
+
+  it("onOpen: a retired socket that opens changes nothing and is closed", () => {
+    const { subject, stale } = reconnected();
+    const generationBefore = subject.feed.subscriptionGeneration;
+    const eventsBefore = subject.eventTypes().length;
+    stale.closedByClient = false;
+
+    stale.handlers.onOpen();
+
+    expect(subject.feed.subscriptionGeneration).toBe(generationBefore);
+    expect(subject.eventTypes()).toHaveLength(eventsBefore);
+    expect(stale.closedByClient).toBe(true);
+  });
+
+  it("onError: a retired socket's error does not relabel the live disconnect", () => {
+    // Before the fix the live connection's close was reported as
+    // TRANSPORT_ERROR carrying the DEAD socket's message.
+    const { subject, stale, live } = reconnected();
+
+    stale.handlers.onError(new Error("stale socket exploded"));
+    live.emitClose({ code: 1001, reason: "going away" });
+
+    const disconnect = subject.events.at(-1);
+    expect(disconnect?.eventType).toBe("FeedDisconnected");
+    expect(disconnect?.payload).toMatchObject({
+      connectionId: "conn-2",
+      reasonCode: "TRANSPORT_CLOSED",
+    });
+    expect(JSON.stringify(disconnect?.payload)).not.toContain("stale socket exploded");
+  });
+
+  it("onClose: a second close from a retired socket reports and reconnects nothing", () => {
+    const { subject, stale } = reconnected();
+    const eventsBefore = subject.eventTypes().length;
+    const socketsBefore = subject.sockets.sockets.length;
+
+    stale.handlers.onClose({ code: 1006, reason: "late close" });
+    // Long enough for any reconnect backoff to fire, short enough that the LIVE
+    // connection's staleness watchdog (30 s) has nothing to say.
+    subject.scheduler.advance(5_000);
+
+    expect(subject.events.slice(eventsBefore).map((event) => event.eventType)).not.toContain(
+      "FeedDisconnected",
+    );
+    expect(subject.sockets.sockets).toHaveLength(socketsBefore);
+  });
+
+  it("a frame arriving after stop() is reported, not published and not dropped", () => {
+    const subject = harness();
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    const socket = subject.sockets.latest();
+    socket.emitOpen();
+    subject.feed.stop();
+
+    socket.handlers.onMessage(BOOK_FRAME);
+
+    expect(subject.eventTypes()).not.toContain("BookSnapshot");
+    expect(subject.problems[0]?.code).toBe("STALE_CONNECTION_FRAME");
+    expect(subject.frames.at(-1)?.payload).toBe(BOOK_FRAME);
   });
 });
 

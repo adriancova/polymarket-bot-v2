@@ -156,13 +156,32 @@ describe("normalizeVenueConditionId", () => {
     expect(normalizeVenueConditionId(value)).toEqual({ status: "ok", value });
   });
 
-  it("accepts a hex condition id of any other length", () => {
+  it("accepts a hex condition id of any other length up to the domain bound", () => {
     for (const value of ["0x00", `0x${"c".repeat(40)}`, `0x${"d".repeat(128)}`]) {
       expect(normalizeVenueConditionId(value), value).toEqual({ status: "ok", value });
     }
   });
 
-  it("bounds the length so an over-long value fails here rather than at the domain", () => {
+  it("states its ACTUAL boundary: 200 characters accepted, 201 rejected", () => {
+    // Round-1 finding M2. This bound is `packages/domain`'s frozen
+    // `ConditionIdSchema` (`MAX_IDENTIFIER_LENGTH`), not a venue fact and not
+    // the fixture catalogue's 31/32-byte narrowing, and it is NOT what
+    // `docs/contracts/protected-contracts.md` §9 describes. Asserting the exact
+    // boundary is how this package stops claiming "any length".
+    const atBound = `0x${"e".repeat(198)}`;
+    expect(atBound).toHaveLength(200);
+    expect(normalizeVenueConditionId(atBound)).toEqual({ status: "ok", value: atBound });
+
+    const pastBound = `${atBound}e`;
+    expect(pastBound).toHaveLength(201);
+    expect(normalizeVenueConditionId(pastBound)).toEqual({
+      status: "invalid",
+      reason: "condition id exceeds 200 characters",
+    });
+  });
+
+  it("reports an over-long value rather than throwing", () => {
+    expect(() => normalizeVenueConditionId(`0x${"e".repeat(400)}`)).not.toThrow();
     expect(normalizeVenueConditionId(`0x${"e".repeat(400)}`).status).toBe("invalid");
   });
 });

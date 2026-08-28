@@ -16,10 +16,24 @@ describe("MarketSubscriptionManager generations", () => {
     expect(manager().generation).toBe(0);
   });
 
-  it("advances on a change that will actually be sent", () => {
+  it("advances on an ADDITION that will actually be sent", () => {
     const subject = manager();
     expect(subject.add(["a"]).generation).toBe(1);
-    expect(subject.remove(["a"]).generation).toBe(2);
+    expect(subject.add(["b"]).generation).toBe(2);
+  });
+
+  it("does NOT advance on a removal: nothing still subscribed missed anything", () => {
+    // Round-1 finding H2. A removal used to advance the counter, so a live feed
+    // published a generation boundary with no gap and no snapshot obligation
+    // behind it. The unsubscribe frame is still produced — the desired set did
+    // change — but the subscription of everything that remains is untouched.
+    const subject = manager();
+    subject.add(["a", "b"]);
+    const removal = subject.remove(["b"]);
+    expect(removal.removed).toEqual(["b"]);
+    expect(removal.frames).toEqual([{ operation: "unsubscribe", assets_ids: ["b"] }]);
+    expect(removal.generation).toBe(1);
+    expect(subject.generation).toBe(1);
   });
 
   it("does NOT advance on a no-op change", () => {

@@ -13,7 +13,7 @@
  * authoritative snapshot before affected markets resume." So the counter
  * advances on exactly two things:
  *
- * - a **change to the desired set** that will be pushed to the server, and
+ * - an **addition to the desired set** that will be pushed to the server, and
  * - a **full (re)subscription**, which is what happens on every connect and
  *   every reconnect.
  *
@@ -21,6 +21,17 @@
  * subscribed sends nothing, so nothing was resubscribed, and inventing a
  * generation for it would tell a consumer to expect a snapshot that will never
  * come.
+ *
+ * It does NOT advance on a **removal** either, and that is a round-1 review fix
+ * (finding H2). A removal used to advance it, which meant a live feed could
+ * publish events under a brand-new generation with no gap and no explanation:
+ * a consumer reading `subscriptionGeneration` as "the subscription was
+ * replaced, expect a snapshot" saw a boundary that never happened. The venue's
+ * dynamic `unsubscribe` frame removes only the named assets and leaves the rest
+ * of the subscription untouched, so for everything still subscribed nothing was
+ * missed and nothing is owed. The rule the feed now enforces is the honest one:
+ * **on a live connection the generation advances exactly when a gap is opened
+ * for it.**
  *
  * The counter starts at `0`, meaning "nothing has been subscribed yet"; the
  * first real subscription is generation `1`. `0` is therefore never carried by
@@ -58,7 +69,13 @@ export interface MarketSubscriptionManagerOptions {
 export interface SubscriptionDelta {
   readonly added: readonly string[];
   readonly removed: readonly string[];
-  /** The generation after the change; unchanged when nothing changed. */
+  /**
+   * The generation after the change.
+   *
+   * Unchanged when nothing changed, and unchanged by a removal: only an
+   * addition or a full (re)subscription replaces server-side subscription
+   * state.
+   */
   readonly generation: number;
   /** Frames to send on an open connection. Empty when nothing changed. */
   readonly frames: readonly MarketSubscriptionFrame[];
@@ -134,7 +151,16 @@ export class MarketSubscriptionManager {
     };
   }
 
-  /** Removes tokens from the desired set. */
+  /**
+   * Removes tokens from the desired set, RETAINING the generation.
+   *
+   * Removing an asset does not replace the subscription for the assets that
+   * remain: the venue's dynamic `unsubscribe` frame names the assets to drop
+   * and leaves the rest in place, so nothing that is still subscribed missed
+   * anything. Advancing the generation here would announce a subscription
+   * boundary — and therefore, per §7.1, a snapshot obligation — for markets
+   * whose stream never broke (round-1 finding H2).
+   */
   remove(tokenIds: readonly string[]): SubscriptionDelta {
     const removed: string[] = [];
     for (const tokenId of tokenIds) {
@@ -145,7 +171,6 @@ export class MarketSubscriptionManager {
     if (removed.length === 0) {
       return { added: [], removed: [], generation: this.#generation, frames: [] };
     }
-    this.#generation += 1;
     return {
       added: [],
       removed,

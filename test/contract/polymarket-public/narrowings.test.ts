@@ -9,6 +9,15 @@
  * first: "an adapter that forwards a raw `null` … into a domain schema has
  * skipped its own job".
  *
+ * **One row is discharged in substance but not literally, and says so.**
+ * Narrowing 3 (the condition-id byte length) is bounded here at the frozen
+ * domain identifier cap of 200 characters, which §9's wording does not
+ * sanction. Round-1 finding M2: the tests below assert that ACTUAL boundary —
+ * accepted up to 200, reported as a typed problem past it — instead of
+ * probing only lengths that happen to fit. The reconciliation is a
+ * contract-owner item, not something this package may decide by editing
+ * `packages/domain`.
+ *
  * Two rows of the binding list have no surface in this package, and saying so
  * is part of discharging them:
  *
@@ -169,6 +178,39 @@ describe("narrowing 2 — the wire empty string for an optional decimal", () => 
 });
 
 describe("narrowing 3 — the 31/32-byte condition-id bound", () => {
+  /**
+   * The §9 row reads "Accept any hex condition id `ConditionIdResponseSchema`
+   * accepts (no 31/32-byte bound at runtime)". The fixture catalogue's
+   * narrowing is genuinely not inherited — every length below is accepted —
+   * but the row is NOT discharged literally, and round-1 finding M2 is that
+   * this suite used to imply it was:
+   *
+   * `normalizeVenueConditionId` is bounded at 200 characters, which is
+   * `packages/domain`'s frozen `ConditionIdSchema` bound (`MAX_IDENTIFIER_LENGTH`),
+   * not the venue's. The tests below assert the ACTUAL boundary rather than a
+   * comfortable subset of it, and the reconciliation of that cap with §9 is a
+   * contract-owner item (`IMPLEMENTATION_STATUS.md`, contract-owner item 3);
+   * `packages/domain` is frozen and outside this package's allowed paths.
+   */
+  const DOMAIN_IDENTIFIER_CAP = 200;
+
+  function announceMarket(conditionId: string) {
+    const market: TestMarketDefinition = { ...SHORT_CONDITION_MARKET, conditionId };
+    return normalizeMarketEvents(
+      [
+        {
+          event_type: "new_market",
+          id: "1",
+          market: conditionId,
+          assets_ids: [market.yesTokenId, market.noTokenId],
+          outcomes: ["Yes", "No"],
+          timestamp: "1782753357257",
+        },
+      ],
+      { directory: staticMarketDirectory({ registrable: [market] }) },
+    );
+  }
+
   it("accepts a 31-byte hex condition id", () => {
     // `ConditionIdResponseSchema` "validates hex syntax without constraining
     // the condition ID byte length".
@@ -190,19 +232,43 @@ describe("narrowing 3 — the 31/32-byte condition-id bound", () => {
     });
   });
 
-  it("accepts a condition id of any other hex length the venue might send", () => {
-    for (const conditionId of ["0x00", `0x${"c".repeat(40)}`, `0x${"d".repeat(96)}`]) {
-      const { problems } = run([
-        {
-          event_type: "book",
-          market: conditionId,
-          asset_id: MARKET.yesTokenId,
-          bids: [],
-          asks: [],
-        },
-      ]);
-      expect(problems, conditionId).toEqual([]);
+  it("accepts every hex length up to the domain identifier bound, on the path that CHECKS it", () => {
+    // `book` and `market_resolved` take their condition id from the catalogue,
+    // so they never exercise this rule; `new_market` is the one event whose
+    // `market` field is normalized, which is why the boundary is probed here.
+    for (const length of [4, 42, 66, 98, DOMAIN_IDENTIFIER_CAP]) {
+      const conditionId = `0x${"c".repeat(length - 2)}`;
+      const { events, problems } = announceMarket(conditionId);
+      expect(problems, `${String(length)} characters`).toEqual([]);
+      expect(events[0]?.payload, `${String(length)} characters`).toMatchObject({ conditionId });
     }
+  });
+
+  it("REJECTS beyond 200 characters — a domain bound, not a venue fact — as an observable problem", () => {
+    for (const length of [DOMAIN_IDENTIFIER_CAP + 1, 400]) {
+      const conditionId = `0x${"c".repeat(length - 2)}`;
+      // Never a throw: a length failure in a message loop that threw would be
+      // the dropped event §8.3 forbids.
+      expect(() => announceMarket(conditionId)).not.toThrow();
+      const { events, problems } = announceMarket(conditionId);
+      expect(events, `${String(length)} characters`).toEqual([]);
+      expect(problems, `${String(length)} characters`).toHaveLength(1);
+      expect(problems[0]?.code).toBe("INVALID_CONDITION_ID");
+      // ...and never a silent drop: the raw event rides on the problem.
+      expect(problems[0]?.raw).toMatchObject({ event_type: "new_market", market: conditionId });
+      expect(problems[0]?.detail).toContain("200");
+    }
+  });
+
+  it("does not claim the §9 row is discharged: the bound is recorded, not hidden", () => {
+    // A test that only ever probed lengths BELOW the cap would report this
+    // narrowing as fully inherited-not, which is what round 1 caught. The cap
+    // is asserted explicitly so a change to it fails here.
+    const atCap = `0x${"c".repeat(DOMAIN_IDENTIFIER_CAP - 2)}`;
+    const pastCap = `${atCap}c`;
+    expect(atCap).toHaveLength(DOMAIN_IDENTIFIER_CAP);
+    expect(announceMarket(atCap).problems).toEqual([]);
+    expect(announceMarket(pastCap).problems[0]?.code).toBe("INVALID_CONDITION_ID");
   });
 });
 

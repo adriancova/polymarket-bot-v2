@@ -16,17 +16,29 @@
  * on {@link PublicMarketEventProvenance}: ordering comes from
  * `(gatewayEpoch, ingestSeq)`, and the venue timestamp and venue-provided
  * hashes carried here are validation aids, not ordering keys. `observedIndex`
- * exists only to keep one inbound frame's events in the order they appeared
- * *inside that frame* — it is scoped to a single `normalize*` call, is not
- * comparable across frames, and is never persisted as an ordinal.
+ * and {@link PublicMarketEventProvenance.entryIndex} exist only to keep one
+ * inbound frame's outcomes in the order they appeared *inside that frame* —
+ * they are scoped to a single `normalize*` call, are not comparable across
+ * frames, and are never persisted as an ordinal.
  *
  * ## Problems are data, not exceptions
  *
  * §8.3: "dropping trading or raw market events silently is forbidden". Every
- * element of every inbound frame is accounted for in exactly one of
- * {@link PublicMarketNormalization.events} or
- * {@link PublicMarketNormalization.problems} — the contract suite asserts that
- * accounting. A problem carries the raw value so the caller can open a
+ * element of every inbound frame is accounted for in
+ * {@link PublicMarketNormalization.events} and
+ * {@link PublicMarketNormalization.problems}, and the contract suite asserts
+ * that accounting. The unit is **the venue's own accounting unit**, which is
+ * not always the frame element (round-1 finding L1):
+ *
+ * - an element that asserts one fact — a `book`, a trade, a tick-size change, a
+ *   lifecycle event — produces exactly one event or exactly one problem;
+ * - an element that batches N facts — a `price_change` with N entries in
+ *   `price_changes` — produces exactly N outcomes, one per entry, each carrying
+ *   the same `observedIndex` and its own `entryIndex`;
+ * - an element that asserts nothing (an empty `price_changes`) produces exactly
+ *   one problem, because a batch asserting no change is itself worth reporting.
+ *
+ * A problem carries the raw value so the caller can open a
  * `DataQualityIncidentOpened` with the evidence attached.
  */
 
@@ -67,8 +79,19 @@ export interface PublicMarketEventProvenance {
   readonly connectionId?: string;
   /** Bumped on every (re)subscription, per §7.1 / ADR-002 §2.4. */
   readonly subscriptionGeneration?: number;
-  /** Position within the single frame being normalized. Not an ordinal. */
+  /** Position of the ELEMENT within the single frame being normalized. Not an ordinal. */
   readonly observedIndex: number;
+  /**
+   * Position within a batching element, when the element carries a batch.
+   *
+   * A `price_change` element carries `price_changes: [...]`, and each entry is
+   * its own book-level change. Those outcomes share an `observedIndex` — they
+   * came from one frame element — so this is what totally orders them:
+   * `(observedIndex, entryIndex ?? 0)` orders every outcome of one frame.
+   * Absent for an element that is not a batch. Like `observedIndex`, scoped to
+   * one `normalize*` call and never persisted as an ordinal.
+   */
+  readonly entryIndex?: number;
 }
 
 /** One normalized domain event, ready for the gateway to envelope. */
@@ -145,7 +168,15 @@ export type PublicMarketProblemCode =
   /** The winning token is neither of the market's two outcome tokens. */
   | "UNKNOWN_WINNING_TOKEN"
   /** A payload the adapter built was rejected by its own domain contract. */
-  | "PAYLOAD_CONTRACT_VIOLATION";
+  | "PAYLOAD_CONTRACT_VIOLATION"
+  /**
+   * A frame arrived on a connection this feed had already retired.
+   *
+   * Not published as current data — its subscription generation is gone — and
+   * not dropped either (§8.3): the raw frame rides on the problem, labelled
+   * with the connection it actually arrived on.
+   */
+  | "STALE_CONNECTION_FRAME";
 
 /** One inbound value that did not become an event, with the evidence. */
 export interface PublicMarketProblem {
@@ -159,8 +190,10 @@ export interface PublicMarketProblem {
   readonly tokenId?: string;
   /** The raw wire condition id, when one was in scope. */
   readonly conditionId?: string;
-  /** Position within the frame, matching {@link PublicMarketEventProvenance}. */
+  /** Position of the element within the frame, matching {@link PublicMarketEventProvenance}. */
   readonly observedIndex: number;
+  /** Position within a batching element, matching {@link PublicMarketEventProvenance.entryIndex}. */
+  readonly entryIndex?: number;
   /** The offending value, preserved so an incident carries its evidence. */
   readonly raw: unknown;
 }
@@ -168,7 +201,9 @@ export interface PublicMarketProblem {
 /**
  * The result of normalizing one inbound frame.
  *
- * Total by construction: every inbound element lands in exactly one array.
+ * Total by construction: every fact an inbound element asserts lands in exactly
+ * one of the two arrays — one outcome per element, or one per batched entry for
+ * an element that batches (see this module's header).
  */
 export interface PublicMarketNormalization {
   readonly events: readonly NormalizedPublicMarketEvent[];

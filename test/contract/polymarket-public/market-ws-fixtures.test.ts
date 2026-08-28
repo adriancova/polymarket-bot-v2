@@ -214,5 +214,92 @@ describe("the whole fixture catalogue as one batched frame", () => {
     expect(events.map((event) => event.provenance.observedIndex)).toEqual(
       payloads.map((_payload, index) => index),
     );
+    // Only the batching element type carries an entry index — a `price_change`
+    // is a batch even when it batches one entry — and every other element
+    // carries none. The batching case is the next describe block.
+    for (const [index, event] of events.entries()) {
+      const isBatched =
+        (examples[index]?.payload as { event_type?: string } | undefined)?.event_type ===
+        "price_change";
+      expect(event.provenance.entryIndex, `${String(index)}`).toBe(isBatched ? 0 : undefined);
+    }
+  });
+});
+
+describe("the accounting unit is the venue's, not the frame element (L1)", () => {
+  const BATCHED_PRICE_CHANGE = {
+    event_type: "price_change",
+    market: FIXTURE_MARKET.conditionId,
+    timestamp: "1782753357257",
+    price_changes: [
+      { asset_id: FIXTURE_MARKET.yesTokenId, price: "0.08", size: "1", side: "BUY" },
+      { asset_id: FIXTURE_MARKET.yesTokenId, price: "0.09", size: "0", side: "SELL" },
+      // A side the venue does not document: one problem, not a lost element.
+      { asset_id: FIXTURE_MARKET.yesTokenId, price: "0.1", size: "2", side: "MIDDLE" },
+    ],
+  };
+
+  it("one element carrying N entries produces exactly N outcomes", () => {
+    // Round-1 finding L1: the claim used to be "exactly one outcome per frame
+    // element", which this case never satisfied — three outcomes came out of
+    // one element and nothing said so.
+    const { events, problems } = normalizeMarketEvents([BATCHED_PRICE_CHANGE], {
+      directory: directory(),
+    });
+    expect(events).toHaveLength(2);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]?.code).toBe("UNKNOWN_SIDE");
+  });
+
+  it("(observedIndex, entryIndex) totally orders the outcomes of one frame", () => {
+    const { events, problems } = normalizeMarketEvents(
+      [loadMarketWsFixture("book-snapshot").examples[0]?.payload, BATCHED_PRICE_CHANGE],
+      { directory: directory() },
+    );
+    const ordered = [
+      ...events.map((event) => ({
+        observedIndex: event.provenance.observedIndex,
+        entryIndex: event.provenance.entryIndex,
+      })),
+      ...problems.map((problem) => ({
+        observedIndex: problem.observedIndex,
+        entryIndex: problem.entryIndex,
+      })),
+    ].sort(
+      (left, right) =>
+        left.observedIndex - right.observedIndex ||
+        (left.entryIndex ?? 0) - (right.entryIndex ?? 0),
+    );
+
+    expect(ordered).toEqual([
+      // The single-fact element: no entry index.
+      { observedIndex: 0, entryIndex: undefined },
+      { observedIndex: 1, entryIndex: 0 },
+      { observedIndex: 1, entryIndex: 1 },
+      { observedIndex: 1, entryIndex: 2 },
+    ]);
+    // No two outcomes of the frame share a position.
+    const positions = ordered.map(
+      (entry) => `${String(entry.observedIndex)}:${String(entry.entryIndex ?? 0)}`,
+    );
+    expect(new Set(positions).size).toBe(positions.length);
+  });
+
+  it("an element that asserts nothing is still reported exactly once", () => {
+    const { events, problems } = normalizeMarketEvents(
+      [
+        {
+          event_type: "price_change",
+          market: FIXTURE_MARKET.conditionId,
+          timestamp: "1782753357257",
+          price_changes: [],
+        },
+      ],
+      { directory: directory() },
+    );
+    expect(events).toEqual([]);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toMatchObject({ code: "INVALID_EVENT_PAYLOAD", observedIndex: 0 });
+    expect(problems[0]).not.toHaveProperty("entryIndex");
   });
 });

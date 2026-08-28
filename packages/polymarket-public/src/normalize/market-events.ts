@@ -11,9 +11,14 @@
  * a non-canonical decimal into a domain schema would fail here, loudly, in its
  * own tests — not later, in a consumer, on a payload nobody can trace back.
  *
- * **2. Nothing is dropped.** Every element of every frame becomes exactly one
- * event or exactly one problem (§8.3). A batched `price_change` with four
- * entries produces four outcomes, even when three of them fail.
+ * **2. Nothing is dropped.** Every fact an inbound frame asserts becomes
+ * exactly one event or exactly one problem (§8.3). The accounting unit is the
+ * VENUE's unit, not the frame element: an element that asserts one fact
+ * produces one outcome, while a `price_change` batching four entries produces
+ * four outcomes — one per entry, each stamped with the element's
+ * `observedIndex` and its own `entryIndex` — even when three of them fail
+ * (round-1 finding L1: this used to be stated as "exactly one outcome per frame
+ * element", which the batched case never satisfied).
  *
  * **3. No venue sequence number is invented** (§9.4, ADR-002 §2.3).
  *
@@ -276,7 +281,11 @@ function normalizePriceChange(
     return;
   }
 
-  for (const entry of event.price_changes) {
+  // One entry is one book-level change: the element is a BATCH, so each entry
+  // gets its own outcome and its own `entryIndex`, and the pair
+  // `(observedIndex, entryIndex)` totally orders them within the frame.
+  for (const [entryIndex, entry] of event.price_changes.entries()) {
+    sink.beginEntry(entryIndex);
     const entryContext = { ...context, tokenId: entry.asset_id };
     const identity = resolveIdentity(entry.asset_id, directory, sink, entry, entryContext);
     if (identity === undefined) continue;
@@ -320,6 +329,7 @@ function normalizePriceChange(
       entryContext,
     );
   }
+  sink.endEntry();
 }
 
 // --------------------------------------------------------------------------
@@ -807,6 +817,7 @@ class NormalizationSink {
   readonly #connectionId: string | undefined;
   readonly #subscriptionGeneration: number | undefined;
   #index = 0;
+  #entryIndex: number | undefined;
 
   constructor(context: MarketNormalizationContext) {
     this.#sourceChannel = context.sourceChannel ?? MARKET_WEBSOCKET_CHANNEL;
@@ -816,6 +827,17 @@ class NormalizationSink {
 
   beginElement(index: number): void {
     this.#index = index;
+    this.#entryIndex = undefined;
+  }
+
+  /** Enters one entry of a batching element, so its outcome is ordered within it. */
+  beginEntry(entryIndex: number): void {
+    this.#entryIndex = entryIndex;
+  }
+
+  /** Leaves the batch: subsequent outcomes belong to the element as a whole. */
+  endEntry(): void {
+    this.#entryIndex = undefined;
   }
 
   problem(
@@ -832,6 +854,7 @@ class NormalizationSink {
       ...(context.tokenId === undefined ? {} : { tokenId: context.tokenId }),
       ...(context.conditionId === undefined ? {} : { conditionId: context.conditionId }),
       observedIndex: this.#index,
+      ...(this.#entryIndex === undefined ? {} : { entryIndex: this.#entryIndex }),
       raw,
     });
   }
@@ -865,6 +888,7 @@ class NormalizationSink {
         ? {}
         : { subscriptionGeneration: this.#subscriptionGeneration }),
       observedIndex: this.#index,
+      ...(this.#entryIndex === undefined ? {} : { entryIndex: this.#entryIndex }),
     };
     this.#events.push({
       eventType,

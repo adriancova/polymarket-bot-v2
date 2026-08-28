@@ -109,24 +109,31 @@ describe("fetchSnapshot", () => {
     expect(result.events[0]?.payload).toMatchObject({ venueBookHash: hash });
   });
 
-  it("accepts a book whose optional fields are null or empty", async () => {
+  it("accepts a book whose two absence-tolerant fields are null or empty", async () => {
+    // `timestamp` and `last_trade_price` are the only two the SDK declares
+    // nullish; the official OpenAPI lists all ten under `required`, and
+    // round-1 finding M1 restored the other eight (`../venue/order-book.ts`).
     const { subject } = fetcher(() => ({
       status: 200,
-      body: JSON.stringify(
-        bookBody({
-          hash: null,
-          timestamp: null,
-          min_order_size: "",
-          tick_size: null,
-          neg_risk: null,
-          last_trade_price: "",
-        }),
-      ),
+      body: JSON.stringify(bookBody({ timestamp: null, last_trade_price: "" })),
     }));
     const result = await subject.fetchSnapshot(MARKET.yesTokenId);
     expect(result.problems).toEqual([]);
-    expect(result.events[0]?.payload).not.toHaveProperty("venueBookHash");
     expect(result.events[0]?.provenance).not.toHaveProperty("venueTimestamp");
+  });
+
+  it("refuses a book missing a field the REST contract requires", async () => {
+    // A snapshot is the authority a gap recovery rebuilds from; a body that
+    // does not match the published contract fails loudly instead of becoming a
+    // half-populated authoritative document.
+    for (const field of ["hash", "min_order_size", "tick_size", "neg_risk"]) {
+      const body = bookBody() as Record<string, unknown>;
+      delete body[field];
+      const { subject } = fetcher(() => ({ status: 200, body: JSON.stringify(body) }));
+      await expect(subject.fetchSnapshot(MARKET.yesTokenId), field).rejects.toBeInstanceOf(
+        PublicMarketSnapshotInvalidError,
+      );
+    }
   });
 
   it("reports an unknown market as a problem, not as a thrown error", async () => {

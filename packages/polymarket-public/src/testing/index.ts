@@ -163,6 +163,20 @@ export class FakeWebSocket {
     return this.#open && !this.#closed;
   }
 
+  /**
+   * The raw callbacks the feed installed, for stale-callback tests.
+   *
+   * The `emit*` helpers below model a well-behaved transport: they will not
+   * deliver a second close, and `emitOpen` marks the socket open. A real
+   * transport is under no such obligation — it can deliver a queued frame, a
+   * late error, or a second close for a socket the client has already
+   * abandoned — and the feed must survive exactly that (round-1 finding H1).
+   * Reaching for these is how a test plays the badly-behaved transport.
+   */
+  get handlers(): PublicWebSocketHandlers {
+    return this.#handlers;
+  }
+
   /** Every frame the feed sent, parsed as JSON where possible. */
   get sentFrames(): readonly unknown[] {
     return this.sent.map((raw) => {

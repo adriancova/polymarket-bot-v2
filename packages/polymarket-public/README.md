@@ -32,10 +32,15 @@ Three things this package deliberately never does:
   Service; a parameter version and its `parameterVersionRef` are catalogue
   state. Both arrive through a port, and a missing answer becomes a reported
   problem rather than a guess.
-- **It drops nothing silently** (§8.3). Every element of every inbound frame
-  becomes exactly one normalized event or exactly one
-  `PublicMarketProblem` carrying the raw value; the contract suite asserts that
-  accounting.
+- **It drops nothing silently** (§8.3). Every fact an inbound frame asserts
+  becomes exactly one normalized event or exactly one `PublicMarketProblem`
+  carrying the raw value, and the contract suite asserts that accounting. The
+  unit is the venue's, not the frame element's: an element that asserts one fact
+  yields one outcome, while a `price_change` batching N entries yields N — each
+  stamped with the element's `observedIndex` and its own `entryIndex`, so
+  `(observedIndex, entryIndex ?? 0)` totally orders one frame's outcomes.
+  (Round-1 review finding L1: this used to be stated as "exactly one outcome per
+  frame element", which the batched case never satisfied.)
 
 ## 2. Book price-change semantics — C-1 / U-1, **CONFIRMED 2026-08-27**
 
@@ -120,6 +125,8 @@ configuration snapshot to be re-verified at each phase gate (handoff §1.2).
 | `book.hash` is the "Hash of the orderbook content"; `price_change[].hash` is the "Hash of the order that caused this change" | api-reference/wss/market |
 | `last_trade_price.side` is "From taker's perspective" | api-reference/wss/market |
 | `GET /book?token_id=…`, `POST /books` with `[{"token_id":"…"}]`, "Maximum 500 items per request" | market-data/prices-order-books |
+| `OrderBookSummary` lists all ten properties (`market`, `asset_id`, `timestamp`, `hash`, `bids`, `asks`, `min_order_size`, `tick_size`, `neg_risk`, `last_trade_price`) under `required`, and `OrderSummary` requires `price` and `size` | api-reference/market-data/get-order-book (`/api-spec/clob-openapi.yaml`) |
+| The same OpenAPI describes `bids` as "sorted by price descending" and `asks` as "sorted by price ascending" — the opposite of the prose page above. The adapter imposes the domain order on both sides and trusts neither | api-reference/market-data/get-order-book vs market-data/prices-order-books |
 
 `level` is documented as existing, with a default and an enumeration, and with
 no statement of what the three levels mean. This package therefore never sends
@@ -147,30 +154,130 @@ before it is emitted. A payload that fails becomes a
 `PAYLOAD_CONTRACT_VIOLATION` problem: the adapter reports its own bug rather
 than shipping a malformed document downstream.
 
+### 4.1 One §9 narrowing is discharged in substance, NOT literally
+
+`docs/contracts/protected-contracts.md` §9 requires a runtime parser to "accept
+any hex condition id `ConditionIdResponseSchema` accepts (**no** 31/32-byte
+bound at runtime)". The fixture catalogue's 31/32-byte narrowing is genuinely
+not inherited — a 4-character id and a 128-character id are both accepted — but
+**a different bound applies, and this package does not claim the row is
+closed** (round-1 review finding M2).
+
+`normalizeVenueConditionId` rejects a condition id longer than **200
+characters**. That number is not the venue's: it is `MAX_IDENTIFIER_LENGTH` in
+the frozen `packages/domain`, which `ConditionIdSchema` — and therefore every
+payload carrying a condition id — enforces. Checking it at the venue edge turns
+an over-long id into a typed `INVALID_CONDITION_ID` problem carrying the raw
+frame rather than a `PAYLOAD_CONTRACT_VIOLATION` at emission time; it does not
+make the bound disappear.
+
+| Condition-id length | Behaviour |
+| --- | --- |
+| ≤ 200 characters (includes the 66-character form the venue publishes, the 64-character 31-byte form, and everything shorter) | accepted, carried through unchanged |
+| > 200 characters | one `INVALID_CONDITION_ID` problem carrying the raw value. Never a throw, never a silent drop |
+
+Both rows are asserted in
+`test/contract/polymarket-public/narrowings.test.ts` and
+`src/normalize/values.test.ts` at the exact boundary. Reconciling
+`ConditionIdSchema`'s cap with §9's wording is a contract-owner decision —
+`packages/domain` is frozen and outside this package's allowed paths — and the
+orchestrator carries it as **contract-owner item 3** in
+`IMPLEMENTATION_STATUS.md`.
+
 ## 5. R-2: the SDK anchor table
 
 `docs/contracts/protected-contracts.md` §8.1 assigns register item R-2 to this
 package: hand-transcribed venue schemas must not be silently load-bearing.
 
-The mechanism is `test/contract/polymarket-public/sdk-anchor/`. It records, for
-every field of every venue schema this package owns, the modifier the official
-SDK declares, with a commit permalink to the pinned reference commit
-`7fdbed42484b5d279c71aa36d3757d18968260da`. The contract suite then:
+The mechanism is `test/contract/polymarket-public/sdk-anchor/`. Every field of
+every venue schema this package owns is a row recording **three modifiers
+separately**, each with its own citation:
+
+| Column | Source |
+| --- | --- |
+| `sdkModifier` | the official SDK at the pinned commit `7fdbed42484b5d279c71aa36d3757d18968260da` |
+| `restModifier` | for the REST book, the venue's own OpenAPI document (`GET /book`, `OrderBookSummary`), retrieved 2026-08-27 |
+| `localModifier` | what this package declares |
+
+Round-1 review finding M1 is why the columns are separate: the first version
+recorded ONE modifier — the local one — and called it the SDK's, so a field this
+package had quietly loosened read as agreement with the SDK, and four REST
+fields both first-party sources declare `required` parsed happily when omitted.
+Every difference between the columns must now name its **dimension** —
+`presence` (may the key be absent or `null`?) or `value-form` (what may a
+present value look like?) — its source, its reason and its authority. A
+value-form reason can no longer be spent on a presence change.
+
+The contract suite then:
 
 1. compares the anchor table's field set against the package's zod schemas, key
-   for key, in both directions;
+   for key, in both directions — **and** enumerates the package's exported
+   object schemas, so an exported nested schema that is never anchored fails
+   (this is what `VenueBookLevelSchema` and `MarketEventMessageSchema` were);
 2. asserts each anchor's field count against the number read from the SDK
    source, so adding a field without re-reading the SDK fails;
-3. drives every modifier as an accept/reject vector against the real parser —
-   omission must fail a `required` field, `null` must pass a `.nullish()` one,
-   and `""` must additionally pass an optional decimal;
-4. requires every citation to embed the pinned commit and rejects a mutable
-   `blob/main` link;
-5. requires a written reason (`sdkDivergence`) wherever this package is
-   deliberately looser than the SDK, so a divergence is never indistinguishable
-   from a transcription mistake.
+3. drives the LOCAL modifier as an accept/reject vector against the real parser
+   — omission and `null` must fail a `required` field, `null` and absence must
+   pass a `.nullish()` one, `""` must additionally pass an optional decimal;
+4. drives the SDK and REST modifiers as obligations: this parser may never be
+   stricter than the SDK about presence, and any loosening relative to either
+   source needs a recorded `presence` divergence;
+5. requires every `value-form` divergence to carry a vector the stricter source
+   rejects and this parser accepts, so "deliberately looser" is a claim a test
+   makes rather than a sentence in a table;
+6. requires every citation to embed the pinned commit (or the official spec URL
+   with its retrieval date) and rejects a mutable `blob/main` link.
 
-## 6. Ports
+The REST book therefore now **requires** `market`, `asset_id`, `bids`, `asks`,
+`min_order_size`, `tick_size`, `neg_risk` and `hash`, exactly as the OpenAPI and
+the SDK do. Only `timestamp` and `last_trade_price` tolerate absence, because
+the SDK declares those two `.nullish()`, and both divergences from the OpenAPI
+are recorded with that evidence.
+
+## 6. The feed's two safety invariants
+
+Both were added by round-1 review findings H1 and H2, and both are about the
+same thing: an event must say what actually happened, on the connection it
+actually happened on.
+
+**1. Every socket callback is bound to the session that installed it.** A
+transport may deliver a frame, an open, an error or a close for a socket the
+feed has already abandoned. Each of the four closures captures an immutable
+session token (its `connectionId`, its socket, the generation it was serving)
+and does nothing unless that token is still the live one:
+
+| Late callback | What happens |
+| --- | --- |
+| `onMessage` | the raw frame is recorded under the STALE session's `connectionId`/generation, and reported as a `STALE_CONNECTION_FRAME` problem carrying the frame. Never published as current data, never dropped (§8.3) |
+| `onOpen` | the abandoned socket is closed. No `FeedConnected`, no generation change, no timers |
+| `onError` | ignored: a dead socket's failure may not relabel the live connection's disconnect |
+| `onClose` | ignored: that session's disconnect was published when it was retired |
+
+**2. A gap is closed only by an acknowledgement naming its exact generation.**
+`markResynchronized` takes the generation being acknowledged and returns a typed
+outcome:
+
+```ts
+const gap = feed.openGap;                       // reasonCode, subscriptionGeneration, ...
+await gateway.applyAuthoritativeSnapshot(gap);
+const outcome = feed.markResynchronized({ subscriptionGeneration: gap.subscriptionGeneration });
+// { status: "accepted" } | { status: "rejected", reasonCode: "NO_OPEN_GAP" | "GENERATION_MISMATCH", ... }
+```
+
+No open gap → `NO_OPEN_GAP` and nothing is published, which is also what stops a
+duplicate acknowledgement. A generation other than the open gap's →
+`GENERATION_MISMATCH`, which is the race that matters: a snapshot fetched for
+generation N, applied after a reconnect or a subscription change opened
+generation N+1, must not close the newer gap. A rejection is returned rather
+than thrown, because a late snapshot is a race and not a defect.
+
+Related: on a live connection the subscription generation now advances
+**exactly when a gap is opened for it**. Adding tokens replaces server-side
+subscription state, so it advances the generation and opens a gap; removing
+tokens does neither, because the venue's dynamic `unsubscribe` leaves the rest
+of the subscription in place and nothing still subscribed missed anything.
+
+## 7. Ports
 
 Nothing here reads a clock, opens a socket, performs a request, or generates an
 identifier directly; `src/runtime.ts` holds the only implementations that touch
@@ -182,7 +289,7 @@ suite run offline with no network and no real time.
 announcement → registration, observed parameter change → version assignment.
 Every method may decline, and a declined answer becomes a reported problem.
 
-## 7. Safety
+## 8. Safety
 
 PUBLIC market data only. No environment variable is read, no header
 authenticates anything, no signer or wallet exists, no order is placed, and no

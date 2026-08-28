@@ -177,21 +177,97 @@ describe("a full connect → consume → drop → recover cycle", () => {
     // A reopened socket is not a recovery, and the stream does not claim one.
     expect(subject.types()).not.toContain("FeedResynchronized");
 
-    // The gateway obtains the authoritative snapshot the gap requires...
-    const snapshot = await subject.snapshots.fetchSnapshot(MARKET.yesTokenId, {
+    // The gateway reads which generation it owes a snapshot for...
+    const gap = subject.feed.openGap;
+    expect(gap).toMatchObject({
+      reasonCode: "FEED_RECONNECTED",
       subscriptionGeneration: subject.feed.subscriptionGeneration,
+    });
+
+    // ...obtains the authoritative snapshot the gap requires...
+    const snapshot = await subject.snapshots.fetchSnapshot(MARKET.yesTokenId, {
+      subscriptionGeneration: gap?.subscriptionGeneration ?? 0,
     });
     expect(snapshot.problems).toEqual([]);
     expect(snapshot.events[0]?.eventType).toBe("BookSnapshot");
 
-    // ...and only then is the resynchronization declared.
-    subject.feed.markResynchronized();
+    // ...and only then is the resynchronization declared, for that generation
+    // and no other.
+    const outcome = subject.feed.markResynchronized({
+      subscriptionGeneration: gap?.subscriptionGeneration ?? 0,
+    });
+    expect(outcome.status).toBe("accepted");
     expect(subject.types().at(-1)).toBe("FeedResynchronized");
     expect(subject.events.at(-1)?.payload).toMatchObject({
       authoritativeSnapshotApplied: true,
-      subscriptionGeneration: subject.feed.subscriptionGeneration,
+      subscriptionGeneration: gap?.subscriptionGeneration,
     });
     expect(subject.feed.isAwaitingSnapshot).toBe(false);
+
+    // A second acknowledgement of the same gap publishes nothing.
+    expect(
+      subject.feed.markResynchronized({
+        subscriptionGeneration: gap?.subscriptionGeneration ?? 0,
+      }),
+    ).toMatchObject({ status: "rejected", reasonCode: "NO_OPEN_GAP" });
+    expect(subject.events.filter((event) => event.eventType === "FeedResynchronized")).toHaveLength(
+      1,
+    );
+  });
+
+  it("refuses to close a NEWER gap with a snapshot taken for an older generation", async () => {
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    subject.sockets.latest().emitOpen();
+    subject.sockets.latest().emitClose({ code: 1006 });
+    subject.scheduler.advance(1_000);
+    subject.sockets.latest().emitOpen();
+
+    // The gateway fetches the snapshot the reconnect gap asked for...
+    const staleGeneration = subject.feed.openGap?.subscriptionGeneration ?? 0;
+    const snapshot = await subject.snapshots.fetchSnapshot(MARKET.yesTokenId, {
+      subscriptionGeneration: staleGeneration,
+    });
+    expect(snapshot.events).toHaveLength(1);
+
+    // ...but before it is applied, a subscription change opens a newer gap.
+    subject.feed.subscribe([MARKET.noTokenId]);
+    const currentGeneration = subject.feed.openGap?.subscriptionGeneration ?? 0;
+    expect(currentGeneration).toBeGreaterThan(staleGeneration);
+
+    expect(
+      subject.feed.markResynchronized({ subscriptionGeneration: staleGeneration }),
+    ).toMatchObject({
+      status: "rejected",
+      reasonCode: "GENERATION_MISMATCH",
+      expectedSubscriptionGeneration: currentGeneration,
+    });
+    expect(subject.types()).not.toContain("FeedResynchronized");
+    expect(subject.feed.isAwaitingSnapshot).toBe(true);
+  });
+
+  it("never publishes a frame from a socket it has already abandoned", async () => {
+    subject.feed.subscribe([MARKET.yesTokenId]);
+    subject.feed.start();
+    const abandoned = subject.sockets.latest();
+    abandoned.emitOpen();
+    abandoned.emitClose({ code: 1006 });
+    subject.scheduler.advance(1_000);
+    subject.sockets.latest().emitOpen();
+
+    const eventsBefore = subject.events.length;
+    const frame = JSON.stringify(fixtureExample("book-snapshot", "book-snapshot"));
+    abandoned.handlers.onMessage(frame);
+
+    // No event, one problem carrying the raw frame, and the raw record labelled
+    // with the connection it really arrived on.
+    expect(subject.events).toHaveLength(eventsBefore);
+    expect(subject.problems.at(-1)).toMatchObject({
+      code: "STALE_CONNECTION_FRAME",
+      raw: frame,
+    });
+    expect(subject.frames.at(-1)).toMatchObject({ connectionId: "conn-1", payload: frame });
+    await Promise.resolve();
   });
 
   it("resubscribes the full token set on the new connection", () => {
