@@ -474,4 +474,133 @@ describe("make-before-break replacement", () => {
       "BINANCE_PENDING_ATTEMPT_EVENT_INADMISSIBLE",
     );
   });
+
+  /**
+   * The handover's other outcome: the live socket goes away first (R4-M1).
+   *
+   * A driver obeys the returned directive — that is the whole contract of this
+   * package — so `RECONNECT_AFTER` while its own replacement was still in flight
+   * told it to register a third identity, retiring the socket it had already
+   * opened and racing a second connection at the venue, against a documented
+   * budget of 300 attempts per five minutes. `state` reported `IDLE` for a feed
+   * that was connecting, and the caller's `maxAttempts` was charged for an
+   * attempt that had not failed.
+   */
+  describe("the live socket closes while the replacement is still opening", () => {
+    it("retains the authorization, reports CONNECTING, and directs no second attempt", () => {
+      const harness = createHarness({ stalenessThresholdMs: 10_000 });
+      open(harness, "conn-a");
+      harness.feed.onFrame("conn-a", TRADE(1), harness.clock.advance(1));
+      harness.feed.connecting("conn-b");
+
+      const close = harness.feed.onClose("conn-a", harness.clock.advance(1), { code: 1006 });
+      harness.emissions.push(...close.emissions);
+
+      // The interruption is reported for the socket that closed…
+      expect(eventTypesOf(close.emissions)).toEqual(["FeedDisconnected"]);
+      expect(close.emissions[0]?.connectionId).toBe("conn-a");
+      // …and the driver is told to do nothing, because it already is.
+      expect(close.directive).toEqual({ kind: "NONE" });
+
+      const metrics = harness.feed.metrics(harness.clock.peek());
+      expect(metrics.state).toBe("CONNECTING");
+      expect(metrics.connectionId).toBeUndefined();
+      expect(metrics.pendingConnectionId).toBe("conn-b");
+      expect(metrics.connections.disconnects).toBe(1);
+      // One outage, one attempt registered by the driver: no third connection.
+      expect(metrics.connections.connectionAttempts).toBe(2);
+    });
+
+    it("adopts that replacement when it opens, with a new generation and no gap in the books", () => {
+      const harness = createHarness({ stalenessThresholdMs: 10_000 });
+      open(harness, "conn-a");
+      harness.emissions.push(
+        ...harness.feed.onFrame("conn-a", TRADE(1), harness.clock.advance(1)).emissions,
+      );
+      harness.feed.connecting("conn-b");
+      harness.emissions.push(
+        ...harness.feed.onClose("conn-a", harness.clock.advance(1), { code: 1006 }).emissions,
+      );
+
+      const opened = harness.feed.onOpen("conn-b", harness.clock.advance(1_000));
+      harness.emissions.push(...opened.emissions);
+      expect(eventTypesOf(opened.emissions)).toEqual([
+        "FeedConnected",
+        "FeedGapDetected",
+        "DataQualityIncidentOpened",
+      ]);
+      expect((opened.emissions[1]?.payload as { requiresAuthoritativeSnapshot: boolean })
+        .requiresAuthoritativeSnapshot).toBe(true);
+      expect(eventTypesOf(harness.emissions)).not.toContain("FeedResynchronized");
+
+      harness.emissions.push(
+        ...harness.feed.onFrame("conn-b", TRADE(2), harness.clock.advance(1)).emissions,
+      );
+      const trades = harness.emissions.filter(
+        (emission) => emission.eventType === "ReferenceTradeObserved",
+      );
+      expect(trades.map((emission) => emission.connectionId)).toEqual(["conn-a", "conn-b"]);
+      expect(trades.map((emission) => emission.subscriptionGeneration)).toEqual([0, 1]);
+
+      // The shared sequence tracker survives the handover, so a replay across it
+      // is still a duplicate rather than a second publication.
+      const replay = harness.feed.onFrame("conn-b", TRADE(1), harness.clock.advance(1));
+      expect(replay.classification).toBe("DUPLICATE_SUPPRESSED");
+
+      const metrics = harness.feed.metrics(harness.clock.peek());
+      expect(metrics.state).toBe("OPEN");
+      expect(metrics.connectionId).toBe("conn-b");
+      expect(metrics.pendingConnectionId).toBeUndefined();
+      expect(metrics.connections.connectionsOpened).toBe(2);
+    });
+
+    it("makes exactly one reconnect decision when the replacement fails as well", () => {
+      const harness = createHarness();
+      open(harness, "conn-a");
+      harness.feed.connecting("conn-b");
+
+      const liveClose = harness.feed.onClose("conn-a", harness.clock.advance(1), { code: 1006 });
+      const attemptClose = harness.feed.onClose("conn-b", harness.clock.advance(1), { code: 1006 });
+
+      const directives = [liveClose.directive, attemptClose.directive];
+      expect(directives.filter((directive) => directive.kind === "RECONNECT_AFTER")).toHaveLength(
+        1,
+      );
+      expect(attemptClose.directive).toEqual({
+        kind: "RECONNECT_AFTER",
+        delayMs: 1_000,
+        attempt: 1,
+      });
+      expect(harness.feed.metrics(harness.clock.peek()).state).toBe("IDLE");
+    });
+
+    it("keeps the attempt budget intact across the interleaving", () => {
+      const harness = createHarness({
+        reconnect: { initialDelayMs: 10, maxDelayMs: 20, multiplier: 2, maxAttempts: 1 },
+      });
+      open(harness, "conn-a");
+      harness.feed.connecting("conn-b");
+
+      expect(harness.feed.onClose("conn-a", harness.clock.advance(1), { code: 1006 }).directive)
+        .toEqual({ kind: "NONE" });
+      // The one attempt the caller allowed is spent by the attempt that failed…
+      expect(harness.feed.onClose("conn-b", harness.clock.advance(1), { code: 1006 }).directive)
+        .toEqual({ kind: "RECONNECT_AFTER", delayMs: 10, attempt: 1 });
+
+      // …and only the NEXT failure exhausts it.
+      harness.feed.connecting("conn-c");
+      expect(harness.feed.onClose("conn-c", harness.clock.advance(1), { code: 1006 }).directive)
+        .toEqual({ kind: "STOP", reason: "RECONNECT_ATTEMPTS_EXHAUSTED" });
+    });
+
+    it("still directs a reconnect for a live close with nothing in flight", () => {
+      const harness = createHarness();
+      open(harness, "conn-a");
+      const close = closeSocket(harness, harness.clock.advance(1), { code: 1006 });
+
+      expect(eventTypesOf(close.emissions)).toEqual(["FeedDisconnected"]);
+      expect(close.directive).toEqual({ kind: "RECONNECT_AFTER", delayMs: 1_000, attempt: 1 });
+      expect(harness.feed.metrics(harness.clock.peek()).state).toBe("IDLE");
+    });
+  });
 });

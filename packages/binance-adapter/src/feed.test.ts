@@ -815,6 +815,193 @@ describe("make-before-break replacement (round-3 review, R3-M1/R3-L1)", () => {
   });
 });
 
+/**
+ * The other half of the handover: the live socket loses the race (R4-M1).
+ *
+ * A make-before-break replacement can be authorized and still not open by the
+ * time the socket it replaces goes away — the venue's own `serverShutdown`
+ * notice produces exactly that schedule. The close used to clear nothing,
+ * report `IDLE`, and return `RECONNECT_AFTER` while the caller's replacement was
+ * still in flight: a driver obeying that directive registers a THIRD identity,
+ * which retires the replacement it had already opened (its later `OPEN` is then
+ * refused as `RETIRED`), opens a redundant socket, and spends a second reconnect
+ * attempt on one outage. `CONNECTING` is documented as "an attempt is in flight
+ * AND no socket is live", which is precisely this state, and `NONE` is
+ * documented as "one is already in flight".
+ */
+describe("live close during a pending handover (round-4 review, R4-M1)", () => {
+  /** Opens `conn-live`, registers `conn-replacement`, and lets the feed go stale. */
+  function handoverInFlight(): {
+    feed: BinanceReferenceFeed;
+    clock: ReturnType<typeof createManualClock>;
+    stale: ReturnType<BinanceReferenceFeed["checkStaleness"]>;
+  } {
+    const clock = createManualClock();
+    const feed = newFeed({ stalenessThresholdMs: 10_000 });
+    feed.connecting("conn-live");
+    feed.onOpen("conn-live", clock.advance(1));
+    feed.connecting("conn-replacement");
+    const stale = feed.checkStaleness(clock.advance(10_000));
+    return { feed, clock, stale };
+  }
+
+  it("keeps the authorized replacement, becomes CONNECTING, and directs nothing", () => {
+    const { feed, clock, stale } = handoverInFlight();
+
+    // The reported interleaving up to the close: the live socket's silence is
+    // still reported, and the registration is still in flight beside it.
+    expect(typesOf(stale.emissions)).toEqual(["FeedStale"]);
+    expect(feed.state).toBe("OPEN");
+    expect(feed.pendingConnectionId).toBe("conn-replacement");
+
+    const close = feed.onClose("conn-live", clock.advance(1), { code: 1006 });
+
+    // The disconnect is real and is reported for the socket that closed…
+    expect(typesOf(close.emissions)).toEqual(["FeedDisconnected"]);
+    expect(close.emissions[0]?.connectionId).toBe("conn-live");
+    expect(close.rejected).toBeUndefined();
+    // …but the caller already has an attempt in flight, so nothing is directed.
+    expect(close.directive).toEqual({ kind: "NONE" });
+    expect(feed.state).toBe("CONNECTING");
+    expect(feed.liveConnectionId).toBeUndefined();
+    expect(feed.pendingConnectionId).toBe("conn-replacement");
+
+    const metrics = feed.metrics(clock.peek());
+    expect(metrics.state).toBe("CONNECTING");
+    expect(metrics.connectionId).toBeUndefined();
+    expect(metrics.pendingConnectionId).toBe("conn-replacement");
+    expect(metrics.connections.disconnects).toBe(1);
+  });
+
+  it("says nothing about staleness and hears no frame while nothing is live", () => {
+    const { feed, clock } = handoverInFlight();
+    feed.onClose("conn-live", clock.advance(1), { code: 1006 });
+
+    // `CONNECTING` is honest in both directions: no socket is live, so a frame
+    // from the not-yet-open attempt is still refused as one that arrived with
+    // no live socket, and the staleness clock is not running against anything.
+    const early = feed.onFrame("conn-replacement", tradeFrame({ t: 7 }), clock.advance(1));
+    expect(early.classification).toBe("STALE_CONNECTION");
+    expect((early.emissions[0]?.payload as { reasonCode: string }).reasonCode).toBe(
+      BINANCE_REASON_CODES.frameWithoutConnection,
+    );
+    expect(feed.checkStaleness(clock.advance(60_000)).emissions).toEqual([]);
+    expect(feed.metrics(clock.peek()).connections.staleEpisodes).toBe(1);
+  });
+
+  it("adopts the replacement when it opens, exactly as if the live socket were still up", () => {
+    const { feed, clock } = handoverInFlight();
+    feed.onClose("conn-live", clock.advance(1), { code: 1006 });
+
+    const opened = feed.onOpen("conn-replacement", clock.advance(1_000));
+    expect(opened.rejected).toBeUndefined();
+    expect(typesOf(opened.emissions)).toEqual([
+      "FeedConnected",
+      "FeedGapDetected",
+      "DataQualityIncidentOpened",
+    ]);
+    expect(feed.state).toBe("OPEN");
+    expect(feed.liveConnectionId).toBe("conn-replacement");
+    expect(feed.pendingConnectionId).toBeUndefined();
+    expect(feed.subscriptionGeneration).toBe(1);
+    expect(feed.metrics(clock.peek()).connections.connectionsOpened).toBe(2);
+
+    // The adopted socket is heard, under its own id and generation, and its
+    // staleness clock runs again.
+    const frame = feed.onFrame("conn-replacement", tradeFrame({ t: 11 }), clock.advance(1));
+    expect(frame.classification).toBe("NORMALIZED");
+    expect(frame.emissions[0]?.connectionId).toBe("conn-replacement");
+    expect(frame.emissions[0]?.subscriptionGeneration).toBe(1);
+    expect(typesOf(feed.checkStaleness(clock.advance(10_000)).emissions)).toEqual(["FeedStale"]);
+
+    // The socket that closed stays retired: adoption revives nothing.
+    expect(feed.onFrame("conn-live", tradeFrame({ t: 12 }), clock.advance(1)).rejected?.relation)
+      .toBe("RETIRED");
+  });
+
+  it("charges exactly one reconnect attempt when the replacement then fails too", () => {
+    const { feed, clock } = handoverInFlight();
+    const liveClose = feed.onClose("conn-live", clock.advance(1), { code: 1006 });
+    expect(liveClose.directive).toEqual({ kind: "NONE" });
+
+    // Now the attempt itself fails, with nothing live: THIS is the failure that
+    // costs an attempt, and it is the first one for this outage.
+    const pendingClose = feed.onClose("conn-replacement", clock.advance(1), { code: 1006 });
+    expect(typesOf(pendingClose.emissions)).toEqual(["FeedDisconnected"]);
+    expect(pendingClose.directive).toEqual({ kind: "RECONNECT_AFTER", delayMs: 1_000, attempt: 1 });
+    expect(feed.state).toBe("IDLE");
+    expect(feed.pendingConnectionId).toBeUndefined();
+
+    // …and the backoff continues from there rather than from a phantom attempt.
+    feed.connecting("conn-third");
+    expect(feed.onClose("conn-third", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "RECONNECT_AFTER",
+      delayMs: 2_000,
+      attempt: 2,
+    });
+  });
+
+  it("does not spend the caller's attempt budget twice for one outage", () => {
+    const clock = createManualClock();
+    const feed = newFeed({
+      reconnect: { initialDelayMs: 10, maxDelayMs: 40, multiplier: 2, maxAttempts: 2 },
+    });
+    feed.connecting("conn-live");
+    feed.onOpen("conn-live", clock.advance(1));
+    feed.connecting("conn-replacement");
+
+    expect(feed.onClose("conn-live", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "NONE",
+    });
+    expect(feed.onClose("conn-replacement", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "RECONNECT_AFTER",
+      delayMs: 10,
+      attempt: 1,
+    });
+    feed.connecting("conn-third");
+    // The second of the caller's two attempts, not the third: before the fix the
+    // live close had already spent one and this returned STOP.
+    expect(feed.onClose("conn-third", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "RECONNECT_AFTER",
+      delayMs: 20,
+      attempt: 2,
+    });
+    feed.connecting("conn-fourth");
+    expect(feed.onClose("conn-fourth", clock.advance(1), { code: 1006 }).directive).toEqual({
+      kind: "STOP",
+      reason: "RECONNECT_ATTEMPTS_EXHAUSTED",
+    });
+  });
+
+  it("still directs the reconnect when the live socket closes with no attempt in flight", () => {
+    const clock = createManualClock();
+    const feed = newFeed();
+    feed.connecting("conn-live");
+    feed.onOpen("conn-live", clock.advance(1));
+
+    // The NONE branch is keyed on an attempt being in flight, not on the closing
+    // socket being the live one: with nothing registered, the close directs the
+    // reconnect it always did.
+    const close = feed.onClose("conn-live", clock.advance(1), { code: 1006 });
+    expect(close.directive).toEqual({ kind: "RECONNECT_AFTER", delayMs: 1_000, attempt: 1 });
+    expect(feed.state).toBe("IDLE");
+  });
+
+  it("lets the caller abandon the retained attempt by registering another", () => {
+    const { feed, clock } = handoverInFlight();
+    feed.onClose("conn-live", clock.advance(1), { code: 1006 });
+
+    // Retaining the authorization does not trap the driver: registering a new
+    // attempt retires the old one, which is the ordinary abandonment rule.
+    feed.connecting("conn-third");
+    expect(feed.pendingConnectionId).toBe("conn-third");
+    expect(feed.state).toBe("CONNECTING");
+    expect(feed.onOpen("conn-replacement", clock.advance(1)).rejected?.relation).toBe("RETIRED");
+    expect(feed.onOpen("conn-third", clock.advance(1)).rejected).toBeUndefined();
+    expect(feed.liveConnectionId).toBe("conn-third");
+  });
+});
+
 describe("frames", () => {
   function openFeed(): {
     feed: BinanceReferenceFeed;

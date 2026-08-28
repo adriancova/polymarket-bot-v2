@@ -52,7 +52,12 @@
  * of the replacement. Before this fix {@link BinanceReferenceFeed.connecting}
  * moved the feed to `CONNECTING` unconditionally, and the live socket's own
  * market data was then refused as "a frame with no live socket" and its silence
- * went unreported (round-3 review, finding R3-M1).
+ * went unreported (round-3 review, finding R3-M1). The other half of the same
+ * handover is what happens when the live socket loses the race and closes first:
+ * the replacement the caller authorized is still in flight, so the feed keeps it,
+ * becomes `CONNECTING`, and directs NOTHING — a driver told to reconnect there
+ * would register a third identity, retire the replacement it had already opened,
+ * and spend a second reconnect attempt on one outage (round-4 review, R4-M1).
  *
  * AN IDENTITY IS AUTHORIZED BEFORE IT IS BELIEVED. Being unrecognised is not a
  * licence: an identity the feed never authorized may not open a connection,
@@ -334,9 +339,12 @@ export class BinanceReferenceFeed {
    * Identity the caller registered for the connection attempt in flight.
    *
    * The authorization for the next `OPEN`, and — while nothing is live — for a
-   * pre-open `ERROR`/`CLOSE`. Cleared when the attempt resolves (it opened, its
-   * close was applied, the caller registered another attempt, or the caller shut
-   * the feed down), so an attempt authorizes exactly one connection.
+   * pre-open `ERROR`/`CLOSE`. Cleared when the ATTEMPT resolves (it opened, its
+   * own close was applied, the caller registered another attempt, or the caller
+   * shut the feed down), so an attempt authorizes exactly one connection.
+   * ANOTHER socket's close does not resolve it: when the live socket closes
+   * mid-handover the attempt is still in flight and stays authorized, and the
+   * feed becomes `CONNECTING` around it (round-4 review, R4-M1).
    */
   #pendingConnectionId: string | undefined;
   /** Identities that were live or pending and no longer are; bounded, FIFO. */
@@ -711,6 +719,19 @@ export class BinanceReferenceFeed {
    * Emits `FeedDisconnected` and directs a reconnect. A close is never treated
    * as an end of data unless the caller asked for one with {@link close}.
    *
+   * A RECONNECT IS DIRECTED ONLY WHEN NO ATTEMPT IS ALREADY IN FLIGHT. If the
+   * live socket closes while the caller's registered replacement is still
+   * pending, that authorization survives the close: the feed becomes
+   * `CONNECTING` (nothing live, one attempt outstanding — exactly what the state
+   * means), keeps the pending identity, and returns `NONE`, because the caller
+   * has already opened that socket. Directing a `RECONNECT_AFTER` here made the
+   * driver register a third identity, which retires the replacement it had
+   * authorized and opens a redundant socket, while `state` reported `IDLE` for a
+   * feed that was connecting; it also charged the caller's `maxAttempts` budget
+   * for an attempt that had not failed (round-4 review, R4-M1). The
+   * `FeedDisconnected` for the socket that actually closed is emitted either
+   * way: the handover is a real interruption, whatever happens next.
+   *
    * A close is accepted from the live socket, or — when none is live — from the
    * REGISTERED pending attempt, so a connection attempt that failed before it
    * opened still produces the reconnect directive the driver needs. Every other
@@ -772,12 +793,30 @@ export class BinanceReferenceFeed {
       }),
     ];
 
-    this.#state = "IDLE";
     this.#connectedAt = undefined;
     // The socket that closed is done: a further event carrying its identity is
     // a retired socket talking, not this feed's connection.
     this.#retire(connectionId);
 
+    // A REPLACEMENT THE CALLER ALREADY AUTHORIZED IS STILL AN ATTEMPT IN
+    // FLIGHT. When the live socket closes mid-handover the feed has exactly the
+    // shape `CONNECTING` describes — nothing live, one attempt outstanding — and
+    // the caller has already opened that socket, so there is nothing to direct:
+    // `NONE` is documented as "one is already in flight". Directing a reconnect
+    // here told the driver to register a THIRD identity, which retires the
+    // authorized replacement mid-flight (its later `OPEN` would then be refused
+    // as `RETIRED`), opens a redundant socket, and reports `IDLE` for a feed
+    // that is connecting. It also spent a reconnect attempt on an outage the
+    // pending attempt has not failed yet, so one logical outage consumed two
+    // slots of the caller's `maxAttempts` budget (round-4 review, R4-M1). The
+    // attempt is charged when the attempt itself fails — the branch below, on
+    // the pending socket's own close.
+    if (this.#pendingConnectionId !== undefined) {
+      this.#state = "CONNECTING";
+      return { emissions, directive: NO_DIRECTIVE };
+    }
+
+    this.#state = "IDLE";
     this.#reconnectAttempt += 1;
     const maxAttempts = this.#reconnect.maxAttempts;
     if (maxAttempts !== undefined && this.#reconnectAttempt > maxAttempts) {

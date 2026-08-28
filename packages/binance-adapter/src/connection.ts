@@ -60,7 +60,15 @@ import { BINANCE_LIMITS } from "./venue.js";
 export type FeedConnectionState =
   /** Constructed; no connection attempted yet. */
   | "IDLE"
-  /** A connection attempt is in flight AND no socket is live. */
+  /**
+   * A connection attempt is in flight AND no socket is live.
+   *
+   * Reached from `IDLE` when the caller registers the first attempt, and from
+   * `OPEN` when the live socket closes while a replacement attempt is already
+   * registered — the authorization survives that close, so the feed is
+   * connecting rather than idle and directs no second attempt (WP-080 round-4
+   * review, R4-M1).
+   */
   | "CONNECTING"
   /**
    * The socket is open and frames may arrive.
