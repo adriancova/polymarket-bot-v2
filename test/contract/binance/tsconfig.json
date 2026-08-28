@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@polymarket-bot/binance-adapter": ["../../../packages/binance-adapter/src/index.ts"],
+      "@polymarket-bot/binance-adapter/testing": [
+        "../../../packages/binance-adapter/src/testing/index.ts"
+      ],
+      "@polymarket-bot/domain": ["../../../packages/domain/src/index.ts"],
+      "@polymarket-bot/decimal": ["../../../packages/decimal/src/index.ts"]
+    }
+  },
+  "include": ["**/*.ts"]
+}

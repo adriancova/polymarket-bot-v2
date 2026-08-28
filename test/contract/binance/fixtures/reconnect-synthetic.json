@@ -1,0 +1,107 @@
+{
+  "fixtureId": "reconnect-synthetic",
+  "kind": "session",
+  "provenance": "SYNTHETIC_DERIVED",
+  "source": {
+    "document": "WebSocket Streams for Binance — \"General WSS information\" (24-hour connection lifetime; server ping every 20s), \"Server Shutdown\", \"Trade Streams\", \"Individual Symbol Book Ticker Streams\"",
+    "url": "https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md#general-wss-information",
+    "accessedAt": "2026-08-27"
+  },
+  "notes": [
+    "SYNTHETIC SESSION. Frame shapes are documented; the disconnect/reconnect SCRIPT is composed here, because the venue publishes no example transcript.",
+    "The venue facts it exercises: a single connection is valid for at most 24 hours and 'expect to be disconnected at the 24 hour mark'; a `serverShutdown` event precedes a shutdown and instructs establishing a new connection; and the documentation defines NO replay, resume, or backfill parameter for `<symbol>@trade` or `<symbol>@bookTicker`.",
+    "Because there is no replay, a reconnect cannot claim continuity: the expected result is `FeedConnected` + `FeedGapDetected` (+ incident), and NEVER `FeedResynchronized` (ADR-002 §2.4).",
+    "Elapsed times are the driver's; they are not venue facts."
+  ],
+  "steps": [
+    { "step": "OPEN", "connectionId": "conn-a", "advanceMs": 0 },
+    {
+      "step": "FRAME",
+      "label": "trade-before-outage",
+      "advanceMs": 500,
+      "expectedClassification": "NORMALIZED",
+      "json": {
+        "stream": "bnbbtc@trade",
+        "data": {
+          "e": "trade",
+          "E": 1672515782136,
+          "s": "BNBBTC",
+          "t": 12345,
+          "p": "0.001",
+          "q": "100",
+          "T": 1672515782136,
+          "m": true,
+          "M": true
+        }
+      }
+    },
+    {
+      "step": "FRAME",
+      "label": "server-shutdown-notice",
+      "advanceMs": 500,
+      "expectedClassification": "SERVER_SHUTDOWN",
+      "json": { "e": "serverShutdown", "E": 1770123456789 }
+    },
+    { "step": "CLOSE", "advanceMs": 100, "code": 1001, "reason": "going away" },
+    { "step": "OPEN", "connectionId": "conn-b", "advanceMs": 1000 },
+    {
+      "step": "FRAME",
+      "label": "trade-replayed-after-reconnect",
+      "advanceMs": 200,
+      "expectedClassification": "DUPLICATE_SUPPRESSED",
+      "json": {
+        "stream": "bnbbtc@trade",
+        "data": {
+          "e": "trade",
+          "E": 1672515782136,
+          "s": "BNBBTC",
+          "t": 12345,
+          "p": "0.001",
+          "q": "100",
+          "T": 1672515782136,
+          "m": true,
+          "M": true
+        }
+      }
+    },
+    {
+      "step": "FRAME",
+      "label": "trade-after-reconnect",
+      "advanceMs": 200,
+      "expectedClassification": "NORMALIZED",
+      "json": {
+        "stream": "bnbbtc@trade",
+        "data": {
+          "e": "trade",
+          "E": 1672515790000,
+          "s": "BNBBTC",
+          "t": 12999,
+          "p": "0.0011",
+          "q": "10",
+          "T": 1672515790000,
+          "m": false,
+          "M": true
+        }
+      }
+    },
+    { "step": "CLOSE", "advanceMs": 100, "code": 1006 },
+    { "step": "OPEN", "connectionId": "conn-c", "advanceMs": 2000 },
+    {
+      "step": "FRAME",
+      "label": "book-ticker-after-second-reconnect",
+      "advanceMs": 100,
+      "expectedClassification": "NORMALIZED",
+      "json": {
+        "stream": "bnbusdt@bookTicker",
+        "data": {
+          "u": 400900217,
+          "s": "BNBUSDT",
+          "b": "25.35190000",
+          "B": "31.21000000",
+          "a": "25.36520000",
+          "A": "40.66000000"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,124 @@
+{
+  "fixtureId": "lifecycle-documented",
+  "kind": "frames",
+  "provenance": "OFFICIAL_EXAMPLE",
+  "source": {
+    "document": "WebSocket Streams for Binance — \"Server Shutdown\", \"Live Subscribing/Unsubscribing to streams\", \"Error Messages\"",
+    "url": "https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md#server-shutdown",
+    "accessedAt": "2026-08-27"
+  },
+  "notes": [
+    "Every frame here is copied from a documented example: the two `serverShutdown` forms, the four control responses, and four rows of the documented \"Error Messages\" table.",
+    "SYNTHETIC COMPLETION, labelled explicitly: two documented error rows contain `%s` printf placeholders (`{\"code\": 0, \"msg\": \"Unknown property\",\"id\": %s}` and `{\"code\":3,\"msg\":\"Invalid JSON: expected value at line %s column %s\"}`). A `%s` is not a JSON value, so each placeholder is filled with a plausible value of the type the documentation implies — an id of `5` and line/column `1`. Nothing else in this file was completed, and no field was added or removed.",
+    "The error table is NOT stated to be exhaustive, so the decoder types `code` as an integer rather than an enum."
+  ],
+  "sequential": false,
+  "frames": [
+    {
+      "label": "server-shutdown-raw",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "SERVER_SHUTDOWN",
+      "expectedClassification": "SERVER_SHUTDOWN",
+      "json": {
+        "e": "serverShutdown",
+        "E": 1770123456789
+      }
+    },
+    {
+      "label": "server-shutdown-combined",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "SERVER_SHUTDOWN",
+      "expectedClassification": "SERVER_SHUTDOWN",
+      "json": {
+        "stream": "!serverShutdown",
+        "data": {
+          "e": "serverShutdown",
+          "E": 1770123456789
+        }
+      }
+    },
+    {
+      "label": "subscribe-ack",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "CONTROL_RESPONSE",
+      "expectedClassification": "CONTROL",
+      "json": {
+        "result": null,
+        "id": 1
+      }
+    },
+    {
+      "label": "unsubscribe-ack",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "CONTROL_RESPONSE",
+      "expectedClassification": "CONTROL",
+      "json": {
+        "result": null,
+        "id": 312
+      }
+    },
+    {
+      "label": "list-subscriptions",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "CONTROL_RESPONSE",
+      "expectedClassification": "CONTROL",
+      "json": {
+        "result": [
+          "btcusdt@aggTrade"
+        ],
+        "id": 3
+      }
+    },
+    {
+      "label": "get-property",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "CONTROL_RESPONSE",
+      "expectedClassification": "CONTROL",
+      "json": {
+        "result": true,
+        "id": 2
+      }
+    },
+    {
+      "label": "error-unknown-property",
+      "provenance": "OFFICIAL_EXAMPLE_WITH_PLACEHOLDER_FILLED",
+      "expectedKind": "CONTROL_ERROR",
+      "expectedClassification": "CONTROL",
+      "json": {
+        "code": 0,
+        "msg": "Unknown property",
+        "id": 5
+      }
+    },
+    {
+      "label": "error-invalid-value-type",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "CONTROL_ERROR",
+      "expectedClassification": "CONTROL",
+      "json": {
+        "code": 1,
+        "msg": "Invalid value type: expected Boolean"
+      }
+    },
+    {
+      "label": "error-too-many-parameters",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "CONTROL_ERROR",
+      "expectedClassification": "CONTROL",
+      "json": {
+        "code": 2,
+        "msg": "Invalid request: too many parameters"
+      }
+    },
+    {
+      "label": "error-invalid-json",
+      "provenance": "OFFICIAL_EXAMPLE_WITH_PLACEHOLDER_FILLED",
+      "expectedKind": "CONTROL_ERROR",
+      "expectedClassification": "CONTROL",
+      "json": {
+        "code": 3,
+        "msg": "Invalid JSON: expected value at line 1 column 1"
+      }
+    }
+  ]
+}

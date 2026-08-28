@@ -1,0 +1,54 @@
+{
+  "fixtureId": "trade-documented",
+  "kind": "frames",
+  "provenance": "OFFICIAL_EXAMPLE",
+  "source": {
+    "document": "WebSocket Streams for Binance — \"Trade Streams\" and \"General WSS information\"",
+    "url": "https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-streams.md#trade-streams",
+    "accessedAt": "2026-08-27"
+  },
+  "notes": [
+    "`raw-payload` is the payload block the venue publishes for `<symbol>@trade`, copied field for field including `M` (documented as \"Ignore\").",
+    "`combined-wrapper` wraps that same payload in the documented combined-stream envelope `{\"stream\":\"<streamName>\",\"data\":<rawPayload>}`. The wrapper is documented; pairing it with this payload is the only composition step, and it changes no field."
+  ],
+  "sequential": false,
+  "frames": [
+    {
+      "label": "raw-payload",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "TRADE",
+      "expectedClassification": "NORMALIZED",
+      "json": {
+        "e": "trade",
+        "E": 1672515782136,
+        "s": "BNBBTC",
+        "t": 12345,
+        "p": "0.001",
+        "q": "100",
+        "T": 1672515782136,
+        "m": true,
+        "M": true
+      }
+    },
+    {
+      "label": "combined-wrapper",
+      "provenance": "OFFICIAL_EXAMPLE",
+      "expectedKind": "TRADE",
+      "expectedClassification": "NORMALIZED",
+      "json": {
+        "stream": "bnbbtc@trade",
+        "data": {
+          "e": "trade",
+          "E": 1672515782136,
+          "s": "BNBBTC",
+          "t": 12345,
+          "p": "0.001",
+          "q": "100",
+          "T": 1672515782136,
+          "m": true,
+          "M": true
+        }
+      }
+    }
+  ]
+}
