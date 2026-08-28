@@ -504,6 +504,16 @@ work_packages:
       - apps/research-worker/**
       - python/research/compaction/**
       - test/integration/parquet/**
+      # Ratified 2026-08-28 (WP-020..WP-110 precedent): mechanical lockfile
+      # updates from these packages' declared dependencies only (pnpm and, for
+      # python/research/compaction, the uv lockfile the same mechanical way);
+      # and the in-repo structured handoff for pre-merge review.
+      - pnpm-lock.yaml
+      - python/uv.lock
+      # python/pyproject.toml only for the mechanical dependency declarations
+      # the compaction module requires (same rule as package.json elsewhere).
+      - python/pyproject.toml
+      - docs/handoffs/WP-130.md
     forbidden_paths:
       - apps/trader/**
       - packages/domain/**
