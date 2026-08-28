@@ -30,7 +30,7 @@ Maximum permitted run mode: `PAPER`
 | `WP-090`               | Complete | All ✓ | Merged `335b1b0` (impl chain `aa74419`→…→`fa518e7`, 3 review rounds) |
 | `WP-070`               | Complete | All ✓ | Merged `f2f0258` (impl chain `f4d374d`→…→`97ddcf1`, 4 review rounds) |
 | `WP-080`               | Complete | All ✓ | Merged `d0d66bf` (impl chain `cff20ba`→…→`a77c8f0`, 6 review rounds) |
-| `WP-100`               | IN_PROGRESS (authorized; ratifications added 2026-08-28) | All ✓ | Packet dispatched 2026-08-28 to `wp-implementer` (Opus), base `75c6521`; session resumed once after a server error |
+| `WP-100`               | IN_REVIEW (candidate `e14cdc7`) | All ✓ | Impl `d51dcd5` on base `75c6521`; session resumed twice after server errors; review round 1 dispatched 2026-08-28 |
 | `WP-110`               | IN_PROGRESS (authorized per runbook 1C — WP-000 ✓, WP-040 ✓) | All ✓ | Packet dispatched 2026-08-28 |
 | `GOV-1B` (contract-owner governance round) | IN_PROGRESS (orchestrator-authorized bounded package) | Batch 1B ✓ | Ratify C-1/U-1; rule `takerSide` vocabulary; reconcile `ConditionIdSchema` cap vs §9 — dispatched 2026-08-28, independent review required before merge |
 | `WP-130`               | Ready (authorized per runbook 1D — WP-040 ✓, WP-050 ✓; queued for a free agent slot) | All ✓ | Unassigned — dispatch after an active loop closes |
