@@ -122,6 +122,21 @@ table says otherwise.
   U+0000 fix verified; post-open retired callbacks all correctly refused
   with observable counters; reconnect-loop risk accepted as loud fail-closed
   with WP-120 owning escalation. Remediation round 2 dispatched.
+- Remediation round 2 completed 2026-08-27 in `e31b711` (+ doc `fa518e7`),
+  probes reproduced byte-for-byte first, per-finding mutation checks:
+  R2-H1 → `#noteSnapshot` deletes the channel's seen-mark when a snapshot is
+  not fully applied (revocation reported in the anomaly; deliberately does
+  NOT re-open an already-closed gap — a refused restatement establishes no
+  loss); R2-M1 → manager gates `onFrame` on the captured ordinal AND the
+  processor gained `staleConnectionFrame(raw, from)` (counts, classifies
+  with raw preserved, zero state change); R2-M2 → per-attempt
+  `withSocket(action)` holds socket-dependent actions until `connect()`
+  returns; synchronous callbacks remain legal; the `onFrame`-triggered drop
+  shared the hole and is covered; R2-L1 → five→four corrected; R2-L2 →
+  optional `from` kept per the accepted API shape with the risk documented
+  precisely. Orchestrator fast-forwarded the canonical branch to `fa518e7`
+  and reproduced gates: root 1827/1827, contract 94/94, paths clean,
+  lockfile untouched. Review round 3 dispatched.
 
 **WP-080 (Binance adapter):**
 - Implemented by `wp-implementer` (Opus) on branch `worktree-agent-a24ead9170631b1c6`,
