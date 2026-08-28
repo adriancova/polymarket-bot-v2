@@ -28,7 +28,9 @@ Maximum permitted run mode: `PAPER`
 | `WP-050`               | Complete | All ✓             | Merged `8a607ec` (impl chain `32cb0a8`→`3c2228a`→`a972e96`→`3f35a0c`→`b3a906f`→`22db770`, 4 review rounds) |
 | `WP-060`               | Complete | All ✓ | Merged `af29b08` (impl chain `d7bbb0f`→…→`954e764`, 3 review rounds) |
 | `WP-090`               | Complete | All ✓ | Merged `335b1b0` (impl chain `aa74419`→…→`fa518e7`, 3 review rounds) |
-| `WP-070`, `WP-080`     | IN_PROGRESS (Wave 1 batch 1B; C-4 phase gate satisfied 2026-08-27) | All ✓ | In remediation round 2 of their review loops; workplan lockfile/handoff ratifications added 2026-08-27 |
+| `WP-070`               | Complete | All ✓ | Merged `f2f0258` (impl chain `f4d374d`→…→`97ddcf1`, 4 review rounds) |
+| `WP-080`               | IN_PROGRESS (Wave 1 batch 1B) | All ✓ | In remediation round 5 (single narrowing finding per round since r2); implementer session resumed after a second API session limit |
+| `WP-100`               | Ready (authorized — unblocked by the WP-070 merge; path subset now exclusive) | All ✓ | Unassigned — packet not yet written; needs workplan lockfile/handoff ratification comments first (WP-100 may also add RTDS dependency declarations to packages/polymarket-public/package.json per the 2026-08-26 ordering note) |
 | `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
@@ -493,6 +495,30 @@ resumed via SendMessage per the recorded resume pattern (context intact).
   Orchestrator fast-forwarded the canonical branch to `97ddcf1` and
   reproduced gates: root 1903/1903, contract 583/583, paths clean,
   lockfile untouched. Review round 4 dispatched.
+- Review round 4 (fresh Codex `01a046a3-c4fa-7b73-818c-fd55fae07f7c`,
+  candidate `97ddcf1` vs base `145fc32`): **ACCEPT** — 0 findings above NOTE
+  (sole NOTE: a stale doc comment at feed/subscriptions.ts:45 saying
+  generation 0 is "never carried by an event", contradicted by the accepted
+  empty-subscription behavior — runtime correct, documentation residual for
+  a future authorized packet). R3-H1 and R3-M1 verified FIXED with
+  independent probes (no third socket in the overtake race; conn-2 stays
+  authoritative; CONNECTION_SUPERSEDED confirmed genuinely unreachable
+  today and accepted as defense-in-depth; pre-return frames refused with
+  raw preserved and correct generation provenance; pre-return PONG ruled
+  unreachable-before-PING; empty-subscription probes show no wedged state);
+  the round-2 test change verified not weakened; full regression matrix
+  clean.
+- Merged to `main` as `f2f0258` under the release manager's standing
+  delegation (2026-08-27, recorded 2026-08-28 after a session-limit
+  interruption). The lockfile union with WP-090's block auto-merged cleanly
+  and `pnpm install --frozen-lockfile` accepted it without regeneration.
+  Post-merge on `main`: root 2003/2003 (60 files), fault 89/89, integration
+  208/208 + 81/81, contract 583/583 + 94/94 via the root `test:contract`
+  script extended by the orchestrator to run both suites, audit clean.
+  **WP-100 is now unblocked** (sequenced strictly after the WP-070 merge;
+  path subset now exclusive). Contract-owner items 1-3 (C-1/U-1
+  ratification, `takerSide` ruling, `ConditionIdSchema` cap) remain queued
+  for the governance round after batch 1B closes.
 - **Contract-owner items accumulated from batch 1B round 1** (for the next
   ADR-modifying package or an orchestrator governance round): (1) ratify
   C-1/U-1 across the four provisional-marked paths (WP-070 documentary
