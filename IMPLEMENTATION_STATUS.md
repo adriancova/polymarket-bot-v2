@@ -298,6 +298,23 @@ table says otherwise.
   through pending registration; adoption/abandonment/stop/second-
   registration/shared-tracker-handover/metrics all PASS). Remediation
   round 4 dispatched.
+- Remediation round 4 completed 2026-08-27 in `e2ec1a1`, probe reproduced
+  first (incl. the predicted double-charge: two RECONNECT_AFTER decisions
+  and two maxAttempts slots for one outage): the `onClose` branch is keyed
+  on AN ATTEMPT BEING IN FLIGHT (`#pendingConnectionId !== undefined` →
+  CONNECTING + directive NONE, attempt not charged), which preserves the
+  nothing-live failed-connect path (a PENDING close clears the pending id
+  as that attempt's resolution before the branch is evaluated); the
+  reconnect attempt is charged only when the attempt itself fails;
+  `CONNECTING`'s second entry edge documented; risk text rewritten
+  (registration survives a live close; three ending events named;
+  no-timer consequence disclosed with the WP-120 deadline follow-up).
+  12 new tests across unit+contract incl. attempt-budget accounting and a
+  control; three independent mutations each pinned. New WP-120 driver
+  obligation: read NONE after a FeedDisconnected as "wait for the attempt
+  you already started". Orchestrator fast-forwarded the canonical branch
+  to `e2ec1a1` and reproduced gates: root 1968/1968, contract 128/128,
+  paths clean, lockfile untouched. Review round 5 dispatched.
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
