@@ -315,6 +315,21 @@ table says otherwise.
   you already started". Orchestrator fast-forwarded the canonical branch
   to `e2ec1a1` and reproduced gates: root 1968/1968, contract 128/128,
   paths clean, lockfile untouched. Review round 5 dispatched.
+- Review round 5 (fresh Codex `01a046a0-8dac-76f0-b9c2-c8e956a2fbd9`): **CHANGES
+  REQUIRED** — 0 blocker/high, 1 medium (R5-M1, the packet's P6 hunt
+  confirmed: when the PENDING socket closes FIRST — refused while live is
+  open, registration deliberately retained — a later live close sees the
+  stale pending id and parks the feed in CONNECTING + NONE with no attempt
+  actually in flight; an obedient driver stalls indefinitely; the round-4
+  branch composed with the round-2 disclosed residual), 1 low (R5-L1: risk
+  text calls the retained registration an "attempt in flight" and tells
+  WP-120 to wait for it — wrong for the pending-close-first ordering).
+  P1-P5/P7/P8 all PASS (live-close-first, adoption, single-charge budget,
+  control, failed-connect, stop, re-registration); mutation counts
+  mechanically credible; accepted residuals unchanged. Remediation round 5
+  dispatched: an already-closed pending socket must not count as in
+  flight — the P6 live close must reconnect normally (IDLE, pending
+  cleared/retired, exactly one RECONNECT_AFTER at attempt 1).
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
