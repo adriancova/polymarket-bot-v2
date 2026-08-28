@@ -283,6 +283,31 @@ resumed via SendMessage per the recorded resume pattern (context intact).
   bid/ask ordering (follow_up). Orchestrator fast-forwarded the canonical
   branch to `d71eb85` and reproduced gates: root 1886/1886, contract
   578/578, paths clean, lockfile untouched. Review round 2 dispatched.
+- Review round 2 (fresh Codex `01a04658-4c9f-78d1-ab1a-9af7d72c2ff4`): **CHANGES
+  REQUIRED**, strictly narrower — 0 blocker, 2 high (R2-H1 synchronous
+  `onOpen` publishes FeedConnected without sending the subscription — the
+  session goes live before the factory call returns the socket, so
+  `#sendFrames` sends nothing; the same sibling-adapter timing defect;
+  R2-H2 an empty-set reconnect opens a gap WITHOUT advancing the generation
+  — `remove()` retains the generation when no assets remain but the
+  reconnect gap opens unconditionally, so an old same-generation
+  acknowledgement closes the newer gap; the swept invariant test misses it
+  because it reconnects with an asset remaining), 1 medium (the withdrawn
+  any-length condition-id claim survives verbatim in
+  `src/venue/primitives.ts:34`/`:70` — location missed by the repair),
+  2 low (anchor coverage guard is name-convention-bound; the
+  "source rejects the vector" test description overstates what is
+  mechanically executed). Fix judgments: H1 otherwise complete (session
+  binding incl. the connecting-interval refusal verified), H2 otherwise
+  complete (remove/double-ack/stale-gen/N+1-race all pass), M1 FIXED, L1
+  FIXED, comment FIXED. **ND3 judged NOT a finding**: SDK-over-OpenAPI
+  presence authority is defensible — the reviewer re-fetched current
+  official docs and found the higher-level OrderBook documentation
+  independently declares `timestamp?`/`lastTradePrice?` nullable, a
+  first-party source conflict at the same §1.1 tier; union acceptance with
+  recorded divergence is the right call; the eight both-sources-required
+  fields stay fail-closed. ND5 bid/ask-ordering contradiction verified
+  recorded. Remediation round 2 dispatched.
 - **Contract-owner items accumulated from batch 1B round 1** (for the next
   ADR-modifying package or an orchestrator governance round): (1) ratify
   C-1/U-1 across the four provisional-marked paths (WP-070 documentary
