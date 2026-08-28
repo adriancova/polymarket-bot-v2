@@ -48,6 +48,9 @@ jobs:
       - name: WAL fault-injection tests
         run: pnpm test:fault
 
+      - name: Venue contract tests (offline fixtures)
+        run: pnpm test:contract
+
       - name: Dependency vulnerability scan (pnpm lockfile)
         run: pnpm audit --audit-level high
 

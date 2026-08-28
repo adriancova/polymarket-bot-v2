@@ -27,7 +27,8 @@ Maximum permitted run mode: `PAPER`
 | `WP-040`               | Complete | All ✓             | Merged `d23bb67` (impl chain `0a73ffe`→…→`f8982bf`, 5 review rounds) |
 | `WP-050`               | Complete | All ✓             | Merged `8a607ec` (impl chain `32cb0a8`→`3c2228a`→`a972e96`→`3f35a0c`→`b3a906f`→`22db770`, 4 review rounds) |
 | `WP-060`               | Complete | All ✓ | Merged `af29b08` (impl chain `d7bbb0f`→…→`954e764`, 3 review rounds) |
-| `WP-070`, `WP-080`, `WP-090` | IN_PROGRESS (Wave 1 batch 1B; C-4 phase gate satisfied 2026-08-27) | All ✓ | Packets dispatched 2026-08-27 to three parallel `wp-implementer` (Opus) sessions; workplan lockfile/handoff ratifications added 2026-08-27 |
+| `WP-090`               | Complete | All ✓ | Merged `335b1b0` (impl chain `aa74419`→…→`fa518e7`, 3 review rounds) |
+| `WP-070`, `WP-080`     | IN_PROGRESS (Wave 1 batch 1B; C-4 phase gate satisfied 2026-08-27) | All ✓ | In remediation round 2 of their review loops; workplan lockfile/handoff ratifications added 2026-08-27 |
 | `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
@@ -137,6 +138,24 @@ table says otherwise.
   precisely. Orchestrator fast-forwarded the canonical branch to `fa518e7`
   and reproduced gates: root 1827/1827, contract 94/94, paths clean,
   lockfile untouched. Review round 3 dispatched.
+- Review round 3 (fresh Codex `01a0465f-25ef-7451-8601-9744555a22c7`,
+  candidate `fa518e7` vs base `145fc32`): **ACCEPT** — 0 findings above NOTE
+  (sole NOTE: sandbox-blocked root-suite subprocess tests; covered by the
+  orchestrator's exact-commit 51/1827 reproduction). All round-2 fixes
+  verified under direct adversarial interleavings (post-closure refusal →
+  reconnect → single-channel snapshot does NOT resync; connecting-window
+  frames refused with zero mutation; synchronous-open subscription delivery
+  proven on start, reconnect, stop-from-callback, overtaken-attempt, and
+  already-closed paths); no-reopen rationale ACCEPTED; trusts-its-caller
+  trade ACCEPTED as disclosed LOW; mutation claims spot-verified.
+- Merged to `main` as `335b1b0` under the release manager's standing
+  delegation (2026-08-27). Post-merge on `main`: root 1827/1827, fault
+  89/89, integration 208/208 + 81/81, contract 94/94 via the NEW root
+  `test:contract` script wired by the orchestrator in the completion commit
+  (with a CI "Venue contract tests (offline fixtures)" step; to be extended
+  as WP-070/WP-080 merge), audit clean, frozen install verified.
+  WP-090 is the first batch-1B merge; WP-070/WP-080 remain on base
+  `145fc32` and their lockfile unions will be reconciled at their merges.
 
 **WP-080 (Binance adapter):**
 - Implemented by `wp-implementer` (Opus) on branch `worktree-agent-a24ead9170631b1c6`,
