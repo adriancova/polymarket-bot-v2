@@ -283,6 +283,21 @@ table says otherwise.
   owns no timer). Orchestrator fast-forwarded the canonical branch to
   `38a6bb2` and reproduced gates: root 1961/1961, contract 123/123, paths
   clean, lockfile untouched. Review round 4 dispatched.
+- Review round 4 (fresh Codex `01a0468b-af5d-7bc2-834c-4ad0ce4b4f5e`): **CHANGES
+  REQUIRED** on one remaining interleaving — 0 blocker/high, 1 medium
+  (R4-M1: an accepted close clears the pending identity only when the
+  closing socket is itself PENDING; when the LIVE socket closes with a
+  replacement pending, the feed sets IDLE and directs RECONNECT_AFTER while
+  the authorization survives — a compliant caller registers a third
+  identity, retiring the authorized replacement, risking redundant sockets
+  or a handover gap; contradicts the documented CONNECTING and NONE
+  semantics), 1 low (R4-L1: the round-3 risk text says the registration
+  lasts only until "the live socket closes" and "nothing else changes" —
+  both wrong for this interleaving). R3-M1 and R3-L1 confirmed FIXED
+  (three-way refusal vocabulary verified; live frames/staleness flow
+  through pending registration; adoption/abandonment/stop/second-
+  registration/shared-tracker-handover/metrics all PASS). Remediation
+  round 4 dispatched.
 - **Cross-adapter `takerSide` divergence flagged by the orchestrator**: the
   frozen `ReferenceTradeObservedPayloadSchema.takerSide` is
   `BookSideSchema.optional()` documented only as "Taker side when the venue
