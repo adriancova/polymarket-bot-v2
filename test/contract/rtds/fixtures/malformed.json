@@ -1,0 +1,166 @@
+{
+  "fixture": "rtds/malformed",
+  "source": "https://docs.polymarket.com/market-data/chainlink-twap",
+  "retrieved": "2026-08-28",
+  "sanitized": true,
+  "provenance": "DELIBERATELY BROKEN PROBES, not observed venue traffic. Each example is the official page's direct-RTDS update frame with exactly one thing wrong, so the adapter's refusal can be pinned to that one cause. No example asserts that the venue ever sends such a frame; they assert that if one arrived it would be reported with its raw value rather than published or dropped (§8.3).",
+  "examples": [
+    {
+      "name": "window-contradicts-topic",
+      "purpose": "window_s says 60 on the 30-second topic. The window is never resolved by preferring one side.",
+      "expectedProblemCode": "RTDS_WINDOW_TOPIC_MISMATCH",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65000.5,
+          "full_accuracy_value": "65000500000000000000000",
+          "timestamp": 1785178800000,
+          "window_s": 60
+        }
+      }
+    },
+    {
+      "name": "display-value-only",
+      "purpose": "full_accuracy_value missing. The floating `value` must never be used as a fallback (ADR-001 §8.3).",
+      "expectedProblemCode": "RTDS_INVALID_TWAP_PAYLOAD",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65000.5,
+          "timestamp": 1785178800000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "full-accuracy-as-json-number",
+      "purpose": "The exact value sent as a JSON number, which cannot carry 23 digits exactly.",
+      "expectedProblemCode": "RTDS_INVALID_TWAP_PAYLOAD",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65000.5,
+          "full_accuracy_value": 6.50005e22,
+          "timestamp": 1785178800000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "full-accuracy-not-an-integer",
+      "purpose": "A fractional E18 value, which the documented fixed-point form cannot be.",
+      "expectedProblemCode": "RTDS_INVALID_TWAP_VALUE",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65000.5,
+          "full_accuracy_value": "65000.5",
+          "timestamp": 1785178800000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "negative-exact-value",
+      "purpose": "The page calls the field SIGNED; ReferenceTwapObserved.value is non-negative, so a negative TWAP is reported, not clamped.",
+      "expectedProblemCode": "RTDS_NEGATIVE_TWAP_VALUE",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": -65000.5,
+          "full_accuracy_value": "-65000500000000000000000",
+          "timestamp": 1785178800000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "unmodelled-topic",
+      "purpose": "Another RTDS channel. Out of scope for this adapter, and never guessed at.",
+      "expectedProblemCode": "RTDS_UNKNOWN_TOPIC",
+      "payload": {
+        "topic": "crypto_prices",
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": { "symbol": "btc/usd", "value": 65000.5 }
+      }
+    },
+    {
+      "name": "unmodelled-message-type",
+      "purpose": "Only `update` is documented for these topics; anything else is reported rather than assumed harmless.",
+      "expectedProblemCode": "RTDS_UNKNOWN_MESSAGE_TYPE",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "snapshot",
+        "timestamp": 1785178800123,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65000.5,
+          "full_accuracy_value": "65000500000000000000000",
+          "timestamp": 1785178800000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "empty-symbol",
+      "purpose": "The domain requires a non-empty symbol, and acceptance 1 requires it to be explicit.",
+      "expectedProblemCode": "RTDS_INVALID_SYMBOL",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": {
+          "symbol": "",
+          "value": 65000.5,
+          "full_accuracy_value": "65000500000000000000000",
+          "timestamp": 1785178800000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "unusable-observation-timestamp",
+      "purpose": "The Chainlink observation time is what the window is anchored to; without it there is no window.",
+      "expectedProblemCode": "RTDS_INVALID_OBSERVATION_TIMESTAMP",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65000.5,
+          "full_accuracy_value": "65000500000000000000000",
+          "timestamp": "some time yesterday",
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "envelope-topic-not-a-string",
+      "purpose": "A frame that is JSON but not the documented envelope at all.",
+      "expectedProblemCode": "RTDS_INVALID_ENVELOPE",
+      "payload": {
+        "topic": 30,
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": {}
+      }
+    }
+  ]
+}

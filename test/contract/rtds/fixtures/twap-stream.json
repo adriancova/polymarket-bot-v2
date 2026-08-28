@@ -1,0 +1,153 @@
+{
+  "fixture": "rtds/twap-stream",
+  "source": "https://docs.polymarket.com/market-data/chainlink-twap",
+  "retrieved": "2026-08-28",
+  "sanitized": true,
+  "provenance": "DERIVED FROM THE DOCUMENTED EXAMPLE, not observed on a live socket. Every example below is the official page's direct-RTDS update frame with the symbol, the observation timestamp and the E18 value changed; no field was added, removed or renamed. The values are internally consistent under the documented scale (full_accuracy_value / 10^18), which is the only relation this suite asserts about them. Cadence is NOT implied: the instants are chosen to exercise adjacency, a long unobserved interval, and out-of-order arrival, and the page states the windows are lookback windows, not publication cadences.",
+  "notes": "Base instant 1785178800000 = 2026-07-27T19:00:00.000Z, the same instant the frozen WP-000 fixture uses.",
+  "examples": [
+    {
+      "name": "thirty-btc-t0",
+      "purpose": "The documented 30-second example, unchanged; the anchor observation of the btc/usd 30s series.",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178800123,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65000.5,
+          "full_accuracy_value": "65000500000000000000000",
+          "timestamp": 1785178800000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "thirty-btc-t1",
+      "purpose": "A later observation of the same series, 30 seconds after t0.",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178830150,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65010.25,
+          "full_accuracy_value": "65010250000000000000000",
+          "timestamp": 1785178830000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "thirty-btc-t2-after-outage",
+      "purpose": "An observation five minutes after t1, used as the first update following a reconnect.",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785179130200,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 64900.75,
+          "full_accuracy_value": "64900750000000000000000",
+          "timestamp": 1785179130000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "thirty-btc-t1-redelivered",
+      "purpose": "A byte-identical redelivery of t1, for duplicate handling.",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178830150,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65010.25,
+          "full_accuracy_value": "65010250000000000000000",
+          "timestamp": 1785178830000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "thirty-btc-t1-contradicted",
+      "purpose": "t1's instant restated with a different exact value, for the contradiction path.",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178830900,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65011.25,
+          "full_accuracy_value": "65011250000000000000000",
+          "timestamp": 1785178830000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "thirty-eth-t0",
+      "purpose": "A second symbol on the same window, for series independence and for the documented multi-symbol advice (omit filters, filter client-side).",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178800321,
+        "payload": {
+          "symbol": "eth/usd",
+          "value": 3200.25,
+          "full_accuracy_value": "3200250000000000000000",
+          "timestamp": 1785178800000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "sixty-eth-t0",
+      "purpose": "The documented 60-second example, unchanged.",
+      "payload": {
+        "topic": "crypto_prices_twap_sixty",
+        "type": "update",
+        "timestamp": 1785178860123,
+        "payload": {
+          "symbol": "eth/usd",
+          "value": 3200.25,
+          "full_accuracy_value": "3200250000000000000000",
+          "timestamp": 1785178860000,
+          "window_s": 60
+        }
+      }
+    },
+    {
+      "name": "thirty-btc-sub-wei-precision",
+      "purpose": "An E18 value whose last digits no IEEE-754 double can hold, proving the exact path never reads the floating `value`.",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "timestamp": 1785178860500,
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65000.5,
+          "full_accuracy_value": "65000500000000000000001",
+          "timestamp": 1785178860000,
+          "window_s": 30
+        }
+      }
+    },
+    {
+      "name": "thirty-btc-absent-publisher-timestamp",
+      "purpose": "The envelope timestamp absent, which the page's own Python type allows (`timestamp: datetime | None`).",
+      "payload": {
+        "topic": "crypto_prices_twap_thirty",
+        "type": "update",
+        "payload": {
+          "symbol": "btc/usd",
+          "value": 65000.5,
+          "full_accuracy_value": "65000500000000000000000",
+          "timestamp": 1785178890000,
+          "window_s": 30
+        }
+      }
+    }
+  ]
+}
