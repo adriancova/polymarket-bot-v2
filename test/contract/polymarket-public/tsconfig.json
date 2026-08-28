@@ -1,0 +1,17 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": "../../..",
+    "paths": {
+      "@polymarket-bot/polymarket-public": ["packages/polymarket-public/src/index.ts"],
+      "@polymarket-bot/polymarket-public/testing": [
+        "packages/polymarket-public/src/testing/index.ts"
+      ],
+      "@polymarket-bot/domain": ["packages/domain/src/index.ts"],
+      "@polymarket-bot/decimal": ["packages/decimal/src/index.ts"]
+    }
+  },
+  "include": ["."]
+}

@@ -1,0 +1,91 @@
+{
+  "fixture": "polymarket-public/clob-book-rest",
+  "source": "https://docs.polymarket.com/market-data/prices-order-books",
+  "retrieved": "2026-08-27",
+  "sanitized": true,
+  "notes": "Public CLOB order-book REST reads (GET /book, POST /books), reconstructed from the API-tab examples published on the source page and retrieved read-only and unauthenticated on 2026-08-27. Owned by WP-070, NOT part of the frozen WP-000 catalogue under test/fixtures/venue/. The page states verbatim: 'Bids are ordered by ascending price and asks by descending price, so the best bid and ask are the last entries in their respective arrays. Each response also includes a hash for the order-book state.' The identifiers are the documentation's own published examples; elided values such as '...' are replaced with full-length synthetic ones. Two hash forms are frozen because the page publishes both: its TypeScript tab prints a 40-character digest and its API tab a 64-character one for the same field, so a parser may pin neither. last_trade_price is frozen at the page's own non-canonical '0.090' spelling, which is evidence that the wire is not canonical. Round-1 review correction (M1, 2026-08-27): every example now carries market, asset_id, bids, asks, hash, min_order_size, tick_size and neg_risk, because the official OpenAPI for GET /book (https://docs.polymarket.com/api-reference/market-data/get-order-book.md, /api-spec/clob-openapi.yaml, OrderBookSummary) lists all ten properties under `required` and the SDK's OrderBookSchema requires those eight. The former 'single-book-empty-optionals' example asserted a response shape neither source publishes and is replaced by 'single-book-absent-optionals', which exercises only the two fields the SDK declares nullish.",
+  "examples": [
+    {
+      "name": "single-book-40-char-hash",
+      "payload": {
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "timestamp": "1782753357257",
+        "hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "bids": [
+          { "price": "0.01", "size": "2151131.59" },
+          { "price": "0.02", "size": "139963.89" },
+          { "price": "0.03", "size": "208169.44" }
+        ],
+        "asks": [
+          { "price": "0.99", "size": "218442.27" },
+          { "price": "0.98", "size": "13229.55" },
+          { "price": "0.97", "size": "4338.7" }
+        ],
+        "min_order_size": "5",
+        "tick_size": "0.01",
+        "neg_risk": false,
+        "last_trade_price": "0.090"
+      }
+    },
+    {
+      "name": "single-book-64-char-hash",
+      "payload": {
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "timestamp": "1782753357257",
+        "hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "bids": [{ "price": "0.01", "size": "2151131.59" }],
+        "asks": [{ "price": "0.99", "size": "218442.27" }],
+        "min_order_size": "5",
+        "tick_size": "0.01",
+        "neg_risk": false,
+        "last_trade_price": "0.090"
+      }
+    },
+    {
+      "name": "batch-books",
+      "payload": [
+        {
+          "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+          "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+          "timestamp": "1782753357257",
+          "hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+          "bids": [{ "price": "0.01", "size": "2151131.59" }],
+          "asks": [{ "price": "0.99", "size": "218442.27" }],
+          "min_order_size": "5",
+          "tick_size": "0.01",
+          "neg_risk": false,
+          "last_trade_price": "0.090"
+        },
+        {
+          "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+          "asset_id": "7305630249804085635496399869905769372294302716159034447326228509068694952392",
+          "timestamp": "1782753357257",
+          "hash": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+          "bids": [{ "price": "0.02", "size": "139963.89" }],
+          "asks": [{ "price": "0.98", "size": "13229.55" }],
+          "min_order_size": "5",
+          "tick_size": "0.01",
+          "neg_risk": false,
+          "last_trade_price": "0.910"
+        }
+      ]
+    },
+    {
+      "name": "single-book-absent-optionals",
+      "payload": {
+        "market": "0x747dc809fb79e1b05be09c42d6179459a58de2ef3e40f02484a4e1260f741f75",
+        "asset_id": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "timestamp": null,
+        "hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "bids": [],
+        "asks": [],
+        "min_order_size": "5",
+        "tick_size": "0.01",
+        "neg_risk": false,
+        "last_trade_price": ""
+      }
+    }
+  ]
+}
