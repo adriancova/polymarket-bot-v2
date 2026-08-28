@@ -295,7 +295,7 @@ downward edge:
 | `packages/domain` → `packages/decimal` | 0 → 0 | the §2.1 **S0** same-layer edge |
 | `apps/ops-cli` → `packages/decimal` (`devDependency`) | 3 → 0 | downward (Wave 0 closeout finding M5: the venue-fixture canonical-decimal grammar is tested against the frozen one) |
 | `packages/event-bus` → `packages/domain` | 2 → 0 | downward (`WP-060`) |
-| `packages/storage-postgres` → `packages/decimal`, `packages/domain` | 2 → 0 | downward (`WP-050`) |
+| `packages/storage-postgres` → `packages/decimal`, `packages/domain` | 2 → 0 | downward (`WP-040`) |
 | `packages/polymarket-public`, `packages/binance-adapter`, `packages/coinbase-adapter` → `packages/decimal`, `packages/domain` (2 each) | 2 → 0 | downward (`WP-070`, `WP-080`, `WP-090`) |
 
 **Finding of fact, batch 1B (recorded 2026-08-28 by `GOV-1B`):** the three
