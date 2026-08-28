@@ -274,10 +274,29 @@ importers:
         version: 5.9.3
 
   packages/settlement:
+    dependencies:
+      '@polymarket-bot/decimal':
+        specifier: workspace:*
+        version: link:../decimal
+      '@polymarket-bot/domain':
+        specifier: workspace:*
+        version: link:../domain
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
     devDependencies:
+      '@types/node':
+        specifier: ^24.13.3
+        version: 24.13.3
+      fast-check:
+        specifier: ^4.9.0
+        version: 4.9.0
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   packages/simulation:
     devDependencies:
@@ -356,10 +375,29 @@ importers:
         version: 5.9.3
 
   packages/universe:
+    dependencies:
+      '@polymarket-bot/decimal':
+        specifier: workspace:*
+        version: link:../decimal
+      '@polymarket-bot/domain':
+        specifier: workspace:*
+        version: link:../domain
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
     devDependencies:
+      '@types/node':
+        specifier: ^24.13.3
+        version: 24.13.3
+      fast-check:
+        specifier: ^4.9.0
+        version: 4.9.0
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
 packages:
 
