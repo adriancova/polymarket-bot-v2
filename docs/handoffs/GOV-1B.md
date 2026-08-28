@@ -489,7 +489,7 @@ Two commits on branch `worktree-agent-a2fda1388250a1546`, both based on
 
 | Commit | SHA |
 | --- | --- |
-| governance round (the four ADRs, the amendments, the registers, the comment-only `book.ts` edit, this handoff) | `TO_BE_FILLED_BY_THE_SHA_RECORD_COMMIT` |
+| governance round (the four ADRs, the amendments, the registers, the comment-only `book.ts` edit, this handoff) | `be45ad3c7a4d0aff2c6f2a29c7a5cc2a7507202a` |
 | SHA record (branch tip) | reported in the agent's reply |
 
 A commit cannot contain its own hash, so the first commit's SHA is written by the
