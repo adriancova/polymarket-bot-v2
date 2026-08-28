@@ -407,6 +407,24 @@ resumed via SendMessage per the recorded resume pattern (context intact).
   Orchestrator fast-forwarded the canonical branch to `9e931cc` and
   reproduced gates: root 1894/1894, contract 581/581, paths clean,
   lockfile untouched. Review round 3 dispatched.
+- Review round 3 (fresh Codex `01a0467f-fbb2-7e30-b39a-4e21c71645f5`): **CHANGES
+  REQUIRED**, still narrowing — 0 blocker, 1 high (R3-H1: after a
+  disconnect, `#scheduleReconnect` arms a timer and a manual `start()`
+  during the backoff opens conn-2, but the stale timer still fires and
+  `#connect()` overwrites the session with conn-3 WITHOUT retiring or
+  closing conn-2 — a physically live subscribed socket leaks, its
+  callbacks become non-authoritative by identity overwrite, and the open
+  gap still names conn-2; the prior overtaking test never started a second
+  connection while a timer was pending), 1 medium (R3-M1: a queued frame
+  delivered after synchronous onOpen but before the factory returns is
+  published as a current BookSnapshot under the manager's PRE-subscription
+  generation — the round-2 disclosure's "generation it genuinely arrived
+  under" was REJECTED as subscription provenance; must be refused/reported
+  as pre-subscription data until the subscription is written), 0 low.
+  R2-H2/R2-M1/R2-L1/R2-L2 all FIXED; undead mutation C ruled ADEQUATE
+  disclosure (whole-open deferral covers the only no-handle path);
+  empty-reconnect gap semantics ruled CORRECT per ADR-002 (no affected
+  markets) and recorded loudly enough. Remediation round 3 dispatched.
 - **Contract-owner items accumulated from batch 1B round 1** (for the next
   ADR-modifying package or an orchestrator governance round): (1) ratify
   C-1/U-1 across the four provisional-marked paths (WP-070 documentary
