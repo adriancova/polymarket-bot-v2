@@ -223,6 +223,33 @@ resumed via SendMessage per the recorded resume pattern (context intact).
   nothing reading accepted); F6/F7 PASS (zero venue dependencies); D1/D2/D4/
   D5/D6 ACCEPT, D3 REJECT (requiredness dimension). Remediation round 1
   dispatched.
+- Remediation round 1 completed 2026-08-27 in `ef4713c` (+ doc `d71eb85`),
+  fresh repair session, probes reproduced first, per-finding mutation checks
+  (11 code + 5 anchor-table mutations all caught): H1 → immutable
+  `FeedSocketSession` built before the factory call, all four callbacks
+  capture it, `#isLive(session)` gates every path; stale frames recorded
+  under the STALE session's identity with a new `STALE_CONNECTION_FRAME`
+  problem (no false attribution, §8.3 satisfied); stale opens close the
+  abandoned socket; H2 → unsubscribe retains the generation (rule: on a live
+  connection the generation advances exactly when a gap opens — swept
+  invariant test); `markResynchronized` takes the expected
+  `subscriptionGeneration` and returns accepted/rejected with
+  `NO_OPEN_GAP`/`GENERATION_MISMATCH`; M1 → REST requiredness restored for
+  hash/min_order_size/tick_size/neg_risk on fresh first-party evidence (the
+  venue's own OpenAPI requires all ten; SDK requires 8/10; only
+  timestamp/last_trade_price stay absence-tolerant as reasoned presence
+  divergences citing the SDK), anchor table records sdk/rest/local modifiers
+  separately with per-dimension reasons, both unanchored schemas anchored,
+  policed by an exported-schema enumeration test (116→509 assertions);
+  M2 → any-length claim withdrawn in place, >200-char boundary asserted as a
+  typed `INVALID_CONDITION_ID` problem (no throw/silent drop), discharged
+  in substance not literally, ADR flag stands (contract-owner item 3);
+  L1 → per-entry `entryIndex` added, claim restated as the venue's
+  accounting unit; side comment corrected. New evidence for the venue
+  report re-issue: the GET /book OpenAPI also contradicts the prose page on
+  bid/ask ordering (follow_up). Orchestrator fast-forwarded the canonical
+  branch to `d71eb85` and reproduced gates: root 1886/1886, contract
+  578/578, paths clean, lockfile untouched. Review round 2 dispatched.
 - **Contract-owner items accumulated from batch 1B round 1** (for the next
   ADR-modifying package or an orchestrator governance round): (1) ratify
   C-1/U-1 across the four provisional-marked paths (WP-070 documentary
