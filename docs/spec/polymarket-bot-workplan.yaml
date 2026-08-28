@@ -450,6 +450,11 @@ work_packages:
       - test/unit/universe/**
       - test/unit/settlement/**
       - db/seeds/settlement-specs/**
+      # Ratified 2026-08-28 (WP-020..WP-100 precedent): mechanical lockfile
+      # update from these packages' declared dependencies only; and the
+      # in-repo structured handoff for pre-merge review.
+      - pnpm-lock.yaml
+      - docs/handoffs/WP-110.md
     forbidden_paths:
       - packages/domain/**
       - apps/trader/**
