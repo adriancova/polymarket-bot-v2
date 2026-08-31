@@ -162,7 +162,12 @@ def test_every_segment_the_manifest_pins_declares_a_wal_checksum() -> None:
     for segment in manifest.segments:
         assert len(segment.segment_sha256) == 64
         assert int(segment.segment_sha256, 16) >= 0
-        assert not segment.wal_segment_deleted
+    # The fixture was produced under the retain policy, so no deletion
+    # happened and no retention receipt exists. Deletion state lives in the
+    # receipt, never in the manifest.
+    assert manifest.wal_retention_policy == "retain"
+    assert not (MANIFEST_PATH.parent / "retention-receipt.json").exists()
+    assert "walSegmentDeleted" not in MANIFEST_PATH.read_text(encoding="utf-8")
 
 
 def test_the_manifest_records_the_schema_versions_it_pins() -> None:

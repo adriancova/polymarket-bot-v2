@@ -28,6 +28,7 @@ import type {
   SegmentDeletionRequest,
   WalSegmentRetention,
 } from "../ports.js";
+import { verifyRetentionProof } from "../retention-proof.js";
 import { sha256Hex } from "../wal-format.js";
 
 /** A clock that advances only when a test says so. */
@@ -170,8 +171,12 @@ export type RecordingRetention = WalSegmentRetention & {
 };
 
 /**
- * Retention that deletes from a {@link MemoryFileSystem} after re-checking the
- * object store, mirroring the real implementation's guard.
+ * Retention that deletes from a {@link MemoryFileSystem} after applying the
+ * **same proof the real implementation applies** (`verifyRetentionProof`):
+ * the persisted dataset manifest is fetched from the store and checked against
+ * the segment's bytes and the object's rows before anything is removed. A unit
+ * test that passes against this double is therefore testing the real
+ * precondition, including the manifest-before-deletion ordering.
  */
 export function recordingRetention(options: {
   readonly fileSystem: MemoryFileSystem;
@@ -183,14 +188,17 @@ export function recordingRetention(options: {
     policyName: "delete-after-verified-upload",
     requests,
     async deleteSegment(request: SegmentDeletionRequest): Promise<void> {
-      const stored = await options.objectStore.get(request.verifiedObjectKey);
-      if (sha256Hex(stored) !== request.verifiedObjectSha256) {
-        throw new CompactionError(
-          "RETENTION_GUARD",
-          "refusing to delete a WAL segment: the stored object's digest changed",
-          { segmentId: request.segmentId },
-        );
-      }
+      const segmentPath = options.fileSystem.joinPath(
+        options.walDirectoryPath,
+        `${request.segmentId}.wal.jsonl`,
+      );
+      await verifyRetentionProof(
+        {
+          objectStore: options.objectStore,
+          readSegmentFile: () => options.fileSystem.readWholeFile(segmentPath),
+        },
+        request,
+      );
       requests.push(request);
       options.fileSystem.remove(options.walDirectoryPath, `${request.segmentId}.wal.jsonl`);
       options.fileSystem.remove(

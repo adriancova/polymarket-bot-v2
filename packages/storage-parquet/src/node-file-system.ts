@@ -21,7 +21,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 
-import { ObjectImmutabilityError, RetentionGuardError } from "./errors.js";
+import { ObjectImmutabilityError } from "./errors.js";
 import type {
   CompactionClock,
   CompactionFileSystem,
@@ -30,6 +30,7 @@ import type {
   SegmentDeletionRequest,
   WalSegmentRetention,
 } from "./ports.js";
+import { verifyRetentionProof } from "./retention-proof.js";
 import { walManifestFileName, walSegmentFileName } from "./wal-format.js";
 
 /** A `CompactionFileSystem` backed by `node:fs`. */
@@ -190,10 +191,15 @@ export function fileSystemObjectStore(rootDirectory: string): ObjectStore {
  * - `packages/storage-wal` cannot delete: its filesystem port has no delete
  *   operation, and `docs/contracts/wal-format.md` §2 records that deletion
  *   belongs to `WP-130` "and only after a verified upload (ADR-004 §5)".
- * - The request it receives carries the verified object key and the digest that
- *   was **re-read from the object store**, and this implementation re-checks
- *   both against the store before unlinking anything. Trusting the caller would
- *   make the guarantee a comment; re-checking makes it a mechanism.
+ * - **The request is treated as a set of claims, never as proof.** Before any
+ *   unlink, {@link verifyRetentionProof} independently fetches the persisted
+ *   dataset manifest and its digest sidecar from the object store, requires
+ *   the manifest to pin this exact segment (checksum, record count, byte
+ *   size, object key, object checksum), requires the segment file about to be
+ *   deleted to hash to that pin, and requires the stored object to reproduce
+ *   the file's frame lines byte for byte. A caller supplying an arbitrary
+ *   object, its own digest, and a nonexistent manifest key — round-1 review's
+ *   probe — is refused with `RetentionGuardError`.
  * - It removes the segment **and** its sidecar manifest, in that order. A
  *   manifest without a segment is a `SEGMENT_MISSING` refusal on the next run,
  *   which is a loud, correct state to crash into; a segment without a manifest
@@ -211,27 +217,6 @@ export function deleteAfterVerifiedUploadRetention(options: {
   return {
     policyName: "delete-after-verified-upload",
     async deleteSegment(request: SegmentDeletionRequest): Promise<void> {
-      const head = await options.objectStore.head(request.verifiedObjectKey);
-      if (head === null) {
-        throw new RetentionGuardError(
-          "refusing to delete a WAL segment: its verified object is not in the store",
-          { segmentId: request.segmentId, objectKey: request.verifiedObjectKey },
-        );
-      }
-      const bytes = await options.objectStore.get(request.verifiedObjectKey);
-      const digest = createHash("sha256").update(bytes).digest("hex");
-      if (digest !== request.verifiedObjectSha256) {
-        throw new RetentionGuardError(
-          "refusing to delete a WAL segment: the stored object's digest changed",
-          {
-            segmentId: request.segmentId,
-            objectKey: request.verifiedObjectKey,
-            expected: request.verifiedObjectSha256,
-            observed: digest,
-          },
-        );
-      }
-
       const segmentPath = fileSystem.joinPath(
         options.walDirectoryPath,
         walSegmentFileName(request.segmentId),
@@ -240,6 +225,15 @@ export function deleteAfterVerifiedUploadRetention(options: {
         options.walDirectoryPath,
         walManifestFileName(request.segmentId),
       );
+
+      await verifyRetentionProof(
+        {
+          objectStore: options.objectStore,
+          readSegmentFile: () => fileSystem.readWholeFile(segmentPath),
+        },
+        request,
+      );
+
       await rm(segmentPath, { force: true });
       await rm(manifestPath, { force: true });
     },

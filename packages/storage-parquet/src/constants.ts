@@ -67,6 +67,24 @@ export const DATASET_MANIFEST_OBJECT_NAME = "manifest.json";
 /** Sidecar holding the lowercase hex SHA-256 of the manifest object's bytes. */
 export const DATASET_MANIFEST_DIGEST_OBJECT_NAME = "manifest.sha256";
 
+/**
+ * Object holding the retention receipt, next to the dataset manifest.
+ *
+ * Deletion state is deliberately **not** part of the dataset manifest: the
+ * manifest is immutable and is persisted and read-back-verified *before* any
+ * deletion is permitted, so at the moment it is written no deletion has
+ * happened yet, and recording one there would require mutating an immutable
+ * artifact. What retention actually removed is stated afterwards in this
+ * separate receipt object. Written only when a deleting retention policy ran.
+ */
+export const DATASET_RETENTION_RECEIPT_OBJECT_NAME = "retention-receipt.json";
+
+/** Identity of the retention receipt document. */
+export const RETENTION_RECEIPT_FORMAT_ID = "polymarket-bot/retention-receipt/v1";
+
+/** Document version of the retention receipt. */
+export const RETENTION_RECEIPT_VERSION = 1;
+
 /** File extension of a compacted data object. */
 export const PARQUET_OBJECT_SUFFIX = ".parquet";
 
@@ -84,6 +102,21 @@ export const DEFAULT_MAX_SEGMENT_BYTES = 256 * 1024 * 1024;
 
 /** Largest single JSON Lines record a reader will accept, in bytes. */
 export const DEFAULT_MAX_RECORD_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Largest total batch — the summed on-disk bytes of every candidate segment —
+ * one compaction run will accept, in bytes.
+ *
+ * The compactor's resident set is proportional to the **whole batch**, not to
+ * one segment: dispatch ordinals and `(gatewayEpoch, ingestSeq)` deduplication
+ * span segments, so every verified segment's records stay in memory until the
+ * dataset manifest is written. This bound makes that cost a configured number
+ * instead of "however much the WAL directory holds". It is checked against
+ * file sizes *before* any segment is read; past it the run is refused with
+ * {@link ../errors.js CompactionBatchLimitError} and nothing has been touched.
+ * A caller compacts a larger backlog in batches via `segmentIds`.
+ */
+export const DEFAULT_MAX_TOTAL_BATCH_BYTES = 1024 * 1024 * 1024;
 
 /**
  * Rows per Parquet row group.

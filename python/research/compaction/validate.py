@@ -19,20 +19,32 @@ The checks, and what each one would catch:
 4. **Ordinal integrity.** ``datasetRowOrdinal`` is unique and forms the dense
    range ``0 .. written-1``. This is what makes ``ORDER BY datasetRowOrdinal``
    a faithful reconstruction of dispatch order (§8.4) rather than a hope.
-5. **Deduplication.** Exactly one replay-eligible row per
-   ``(gatewayEpoch, ingestSeq)``. The `WP-050` completion record makes this
-   reconciliation a binding obligation on every WAL consumer.
-6. **Incident exclusion.** Every row inside a pinned window is marked
-   ineligible with that window's id, and the per-window counts match. Catches
-   the failure mode that matters most here: a manifest that *says* it excluded
-   an incident over a dataset where nothing is marked.
-7. **Payload digests.** ``payloadSha256`` recomputed over ``payloadUtf8`` for
+5. **Row integrity.** ``ingestSeq`` matches the canonical unsigned-integer
+   grammar of ``wal-format.md`` §5 (up to **40 digits** — which is why no
+   check here ever casts it to a bounded integer type; see below), and every
+   row's ``replayEligible``/``exclusionReason`` pair has a legal shape.
+6. **Deduplication, with provenance.** Exactly one replay-eligible row per
+   ``(gatewayEpoch, ingestSeq)``; and every row *marked* ``duplicate:<n>``
+   really is one — the row at ordinal ``n`` exists, comes earlier, shares the
+   key, and is byte-identical (same ``frameLineSha256``). A mislabeled
+   "duplicate" would silently drop a genuine record from replay.
+7. **Incident exclusion, bidirectionally.** Every replay-eligible row inside a
+   pinned window is an error; every row *labeled* ``incident:<id>`` must lie
+   inside that window's declared range; the per-window counts match; and the
+   window's ``excludedSegmentIds`` reconcile with the segments the labeled
+   rows actually came from. One direction alone accepts false provenance.
+8. **Payload digests.** ``payloadSha256`` recomputed over ``payloadUtf8`` for
    every row, in DuckDB. This is the end-to-end byte-exactness check: if a
    payload lost a byte anywhere between the venue frame and this query, the
    digest the gateway computed no longer matches.
-8. **Segment coverage.** Every pinned segment's ``recordCount`` equals the rows
-   its object holds, and no unpinned segment appears in the data.
+9. **Segment coverage and the retention receipt.** Every pinned segment's
+   ``recordCount`` equals the rows its object holds, no unpinned segment
+   appears in the data, and — when a retention receipt exists — every segment
+   it claims was deleted is pinned and its object is present.
 
+``ingestSeq`` ordering is decided on **canonical decimal strings** — compare
+lengths first, then lexicographically — never by casting: the grammar admits
+40 digits and even DuckDB's ``HUGEINT`` (INT128) cannot represent that domain.
 A finding is returned, not raised: a validation job that stops at the first
 problem tells an operator one thing about a dataset when they need all of them.
 """
@@ -42,6 +54,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -55,8 +68,18 @@ from research.compaction.manifest import (
     ManifestError,
     PARQUET_LAYOUT_ID,
     PARQUET_LAYOUT_VERSION,
+    RETENTION_RECEIPT_FORMAT_ID,
+    RETENTION_RECEIPT_OBJECT_NAME,
+    RETENTION_RECEIPT_VERSION,
     load_manifest,
 )
+
+#: ``wal-format.md`` §5: canonical unsigned decimal, no leading zeros, ≤ 40
+#: digits. Enforced by the row-integrity check, which is what entitles the
+#: range comparisons below to compare by (length, lexicographic) instead of
+#: casting — no bounded integer type (INT64 *or* INT128) can hold 40 digits.
+_CANONICAL_UNSIGNED = re.compile(r"^(0|[1-9][0-9]*)$")
+_MAX_SEQ_DIGITS = 40
 
 #: DuckDB's SQL type for each physical type the layout pins.
 _DUCKDB_TYPE_BY_PHYSICAL_TYPE = {
@@ -361,13 +384,74 @@ def _check_ordinals(
         )
 
 
+def _check_row_integrity(
+    connection: duckdb.DuckDBPyConnection,
+    paths: Sequence[Path],
+    findings: list[ValidationFinding],
+) -> None:
+    """Check 5: field grammar and exclusion shape the later checks rely on."""
+    if not paths:
+        return
+    path_strings = [str(p) for p in paths]
+
+    bad_seq = connection.execute(
+        r"""
+        select datasetRowOrdinal, ingestSeq
+        from read_parquet($paths)
+        where not regexp_matches(ingestSeq, '^(0|[1-9][0-9]*)$')
+           or length(ingestSeq) > 40
+        order by datasetRowOrdinal
+        limit 20
+        """,
+        {"paths": path_strings},
+    ).fetchall()
+    if bad_seq:
+        findings.append(
+            ValidationFinding(
+                check="ingest-seq-grammar",
+                severity="error",
+                message=(
+                    "ingestSeq must be a canonical unsigned decimal string of at most "
+                    "40 digits (wal-format.md §5)"
+                ),
+                details={"sample": [list(row) for row in bad_seq]},
+            )
+        )
+
+    bad_shape = connection.execute(
+        """
+        select datasetRowOrdinal, replayEligible, exclusionReason
+        from read_parquet($paths)
+        where (replayEligible and exclusionReason is not null)
+           or (not replayEligible and (exclusionReason is null
+               or (exclusionReason not like 'incident:%'
+                   and exclusionReason not like 'duplicate:%')))
+        order by datasetRowOrdinal
+        limit 20
+        """,
+        {"paths": path_strings},
+    ).fetchall()
+    if bad_shape:
+        findings.append(
+            ValidationFinding(
+                check="exclusion-reason-shape",
+                severity="error",
+                message=(
+                    "an eligible row must carry no exclusionReason, and an ineligible "
+                    "row must carry 'incident:<id>' or 'duplicate:<ordinal>'"
+                ),
+                details={"sample": [list(row) for row in bad_shape]},
+            )
+        )
+
+
 def _check_deduplication(
     connection: duckdb.DuckDBPyConnection,
     manifest: DatasetManifest,
     paths: Sequence[Path],
     findings: list[ValidationFinding],
 ) -> None:
-    """Check 5: exactly one replay-eligible row per (gatewayEpoch, ingestSeq)."""
+    """Check 6: one eligible row per key, and duplicate marks carry real provenance."""
     if not paths:
         return
     duplicates = connection.execute(
@@ -412,6 +496,55 @@ def _check_deduplication(
             )
         )
 
+    # Provenance: counting labels proves nothing about their truth. A row
+    # marked `duplicate:<n>` asserts that the row at ordinal `n` is an earlier,
+    # byte-identical copy of the same frame — earlier in dispatch order,
+    # sharing (gatewayEpoch, ingestSeq), and with the same frameLineSha256
+    # (duplicates are re-recordings, so the whole WAL line is identical). A
+    # mark whose claim does not hold hides a genuine record from replay.
+    false_provenance = connection.execute(
+        """
+        with data as (select * from read_parquet($paths)),
+        marked as (
+            select
+                datasetRowOrdinal,
+                gatewayEpoch,
+                ingestSeq,
+                frameLineSha256,
+                exclusionReason,
+                try_cast(substr(exclusionReason, 11) as bigint) as claimed_ordinal
+            from data
+            where exclusionReason like 'duplicate:%'
+        )
+        select m.datasetRowOrdinal, m.exclusionReason
+        from marked m
+        left join data first_copy
+            on first_copy.datasetRowOrdinal = m.claimed_ordinal
+        where m.claimed_ordinal is null
+           or first_copy.datasetRowOrdinal is null
+           or first_copy.datasetRowOrdinal >= m.datasetRowOrdinal
+           or first_copy.gatewayEpoch != m.gatewayEpoch
+           or first_copy.ingestSeq != m.ingestSeq
+           or first_copy.frameLineSha256 != m.frameLineSha256
+           or first_copy.exclusionReason like 'duplicate:%'
+        order by m.datasetRowOrdinal
+        limit 20
+        """,
+        {"paths": [str(p) for p in paths]},
+    ).fetchall()
+    if false_provenance:
+        findings.append(
+            ValidationFinding(
+                check="duplicate-provenance",
+                severity="error",
+                message=(
+                    "rows are marked as duplicates without an earlier byte-identical "
+                    "copy at the ordinal their mark names"
+                ),
+                details={"sample": [list(row) for row in false_provenance]},
+            )
+        )
+
 
 def _check_incident_exclusions(
     connection: duckdb.DuckDBPyConnection,
@@ -419,21 +552,56 @@ def _check_incident_exclusions(
     paths: Sequence[Path],
     findings: list[ValidationFinding],
 ) -> None:
-    """Check 6: pinned windows are actually applied to the data."""
+    """Check 7: pinned windows are applied to the data — in both directions.
+
+    One direction ("every in-window row is excluded") accepts false
+    provenance: a row could be excluded for the wrong reason, or a row far
+    outside the window could carry the window's label and inflate its count.
+    So membership and labels are checked against each other: no eligible row
+    inside a window, no labeled row outside its window, counts exact, and the
+    pinned ``excludedSegmentIds`` reconciled against the segments the labeled
+    rows actually came from.
+    """
     if not paths:
         return
     path_strings = [str(p) for p in paths]
 
+    # Membership is decided on `(gatewayEpoch, ingestSeq)` exactly as the
+    # compactor decides it (`compareUnsignedIntegerStrings`): canonical
+    # unsigned decimal strings compare by length first, then lexicographically.
+    # Never by casting — the grammar admits 40 digits, and DuckDB's HUGEINT
+    # (INT128) cannot represent that domain; the pre-remediation cast raised a
+    # ConversionException on a valid 40-digit value. The grammar this relies
+    # on (no leading zeros) is enforced by the row-integrity check.
+    in_window = """
+        gatewayEpoch = $epoch
+        and (length(ingestSeq) > length($from_seq)
+             or (length(ingestSeq) = length($from_seq) and ingestSeq >= $from_seq))
+        and (length(ingestSeq) < length($to_seq)
+             or (length(ingestSeq) = length($to_seq) and ingestSeq <= $to_seq))
+    """
+
     for window in manifest.excluded_incident_windows:
-        # Membership is decided on `(gatewayEpoch, ingestSeq)` as an integer
-        # comparison, matching the compactor: `ingestSeq` is stored as text
-        # because it may exceed INT64, so the cast is to DuckDB's 128-bit
-        # decimal rather than to BIGINT.
-        in_window = """
-            gatewayEpoch = $epoch
-            and cast(ingestSeq as hugeint) >= cast($from_seq as hugeint)
-            and cast(ingestSeq as hugeint) <= cast($to_seq as hugeint)
-        """
+        reason = f"incident:{window.incident_id}"
+        bad_bounds = [
+            bound
+            for bound in (window.from_ingest_seq, window.to_ingest_seq)
+            if not _CANONICAL_UNSIGNED.match(bound) or len(bound) > _MAX_SEQ_DIGITS
+        ]
+        if bad_bounds:
+            findings.append(
+                ValidationFinding(
+                    check="incident-window-grammar",
+                    severity="error",
+                    message=(
+                        f"incident window {window.incident_id} pins non-canonical "
+                        "ingestSeq bounds; its range cannot be evaluated"
+                    ),
+                    details={"incidentId": window.incident_id, "bounds": bad_bounds},
+                )
+            )
+            continue
+
         parameters = {
             "paths": path_strings,
             "epoch": window.gateway_epoch,
@@ -458,9 +626,33 @@ def _check_incident_exclusions(
                 )
             )
 
+        # The other direction: a row carrying this window's label must lie
+        # inside the range the manifest declares for it. This is what catches
+        # the round-1 probe — an out-of-window row labeled incident:inc-1
+        # previously validated, silently mislabeling which data was excluded.
+        labeled_outside = connection.execute(
+            f"""
+            select count(*) from read_parquet($paths)
+            where exclusionReason = $reason and not ({in_window})
+            """,
+            {**parameters, "reason": reason},
+        ).fetchone()[0]
+        if labeled_outside:
+            findings.append(
+                ValidationFinding(
+                    check="incident-exclusion-range",
+                    severity="error",
+                    message=(
+                        f"{labeled_outside} row(s) carry the label of incident window "
+                        f"{window.incident_id} but lie outside its declared range"
+                    ),
+                    details={"incidentId": window.incident_id},
+                )
+            )
+
         marked = connection.execute(
             "select count(*) from read_parquet($paths) where exclusionReason = $reason",
-            {"paths": path_strings, "reason": f"incident:{window.incident_id}"},
+            {"paths": path_strings, "reason": reason},
         ).fetchone()[0]
         if marked != window.excluded_record_count:
             findings.append(
@@ -472,6 +664,31 @@ def _check_incident_exclusions(
                         "count the manifest pins"
                     ),
                     details={"expected": window.excluded_record_count, "observed": marked},
+                )
+            )
+
+        observed_segments = [
+            row[0]
+            for row in connection.execute(
+                """
+                select distinct segmentId from read_parquet($paths)
+                where exclusionReason = $reason
+                order by segmentId
+                """,
+                {"paths": path_strings, "reason": reason},
+            ).fetchall()
+        ]
+        pinned_segments = sorted(window.excluded_segment_ids)
+        if observed_segments != pinned_segments:
+            findings.append(
+                ValidationFinding(
+                    check="incident-exclusion-segments",
+                    severity="error",
+                    message=(
+                        f"the segments carrying incident {window.incident_id}'s label "
+                        "differ from the excludedSegmentIds the manifest pins"
+                    ),
+                    details={"pinned": pinned_segments, "observed": observed_segments},
                 )
             )
 
@@ -548,11 +765,10 @@ def _check_payload_digests(
 def _check_segment_coverage(
     connection: duckdb.DuckDBPyConnection,
     manifest: DatasetManifest,
-    object_root: Path,
     paths: Sequence[Path],
     findings: list[ValidationFinding],
 ) -> None:
-    """Check 8: pinned segments and the rows in the data agree, both ways."""
+    """Check 9a: pinned segments and the rows in the data agree, both ways."""
     if not paths:
         return
     observed = dict(
@@ -593,19 +809,109 @@ def _check_segment_coverage(
             )
         )
 
-    # A deleted WAL segment is only safe because its object survives; say so if
-    # the manifest claims a deletion for a segment whose object is missing.
-    for segment in manifest.segments:
-        if not segment.wal_segment_deleted:
+
+def _check_retention_receipt(
+    manifest: DatasetManifest,
+    manifest_file: Path,
+    object_root: Path,
+    findings: list[ValidationFinding],
+) -> None:
+    """Check 9b: the retention receipt, when present, tells a coherent story.
+
+    Deletion state is not in the (persisted-before-deletion, immutable)
+    manifest; it lives in the receipt written next to it after retention ran.
+    A deleted WAL segment is only safe because its verified object survives,
+    so every deletion the receipt claims must name a pinned segment whose
+    object is present. A malformed receipt is a finding, never a raise.
+    """
+    receipt_path = manifest_file.parent / RETENTION_RECEIPT_OBJECT_NAME
+    if not receipt_path.is_file():
+        if manifest.wal_retention_policy != "retain":
+            findings.append(
+                ValidationFinding(
+                    check="retention-receipt-absent",
+                    severity="warning",
+                    message=(
+                        f"the manifest records retention policy "
+                        f"{manifest.wal_retention_policy!r} but no retention receipt "
+                        "exists; deletions, if any, are unreported"
+                    ),
+                    details={"expectedPath": str(receipt_path)},
+                )
+            )
+        return
+
+    def broken(message: str, details: dict[str, Any] | None = None) -> None:
+        findings.append(
+            ValidationFinding(
+                check="retention-receipt",
+                severity="error",
+                message=message,
+                details=details or {},
+            )
+        )
+
+    try:
+        document = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        broken(f"retention receipt could not be read: {error}")
+        return
+    if not isinstance(document, dict):
+        broken("retention receipt is not a JSON object")
+        return
+    if document.get("retentionReceiptFormatId") != RETENTION_RECEIPT_FORMAT_ID:
+        broken(
+            "retention receipt declares an unknown format",
+            {"formatId": document.get("retentionReceiptFormatId")},
+        )
+        return
+    if document.get("retentionReceiptVersion") != RETENTION_RECEIPT_VERSION:
+        broken(
+            "retention receipt version is not readable by this build",
+            {"version": document.get("retentionReceiptVersion")},
+        )
+        return
+    if document.get("datasetId") != manifest.dataset_id:
+        broken(
+            "retention receipt names a different dataset",
+            {"expected": manifest.dataset_id, "observed": document.get("datasetId")},
+        )
+    manifest_digest = hashlib.sha256(manifest_file.read_bytes()).hexdigest()
+    if document.get("datasetManifestSha256") != manifest_digest:
+        broken(
+            "retention receipt pins a different manifest digest than the manifest's bytes",
+            {
+                "pinned": document.get("datasetManifestSha256"),
+                "observed": manifest_digest,
+            },
+        )
+
+    deleted = document.get("deletedSegments")
+    if not isinstance(deleted, list):
+        broken("retention receipt's deletedSegments is not an array")
+        return
+    pinned_segments = {segment.segment_id: segment for segment in manifest.segments}
+    for entry in deleted:
+        if not isinstance(entry, dict) or not isinstance(entry.get("segmentId"), str):
+            broken("retention receipt lists a malformed deletion entry", {"entry": str(entry)})
             continue
-        path = _object_path(object_root, segment.object_key)
-        if not path.is_file():
+        segment_id = entry["segmentId"]
+        segment = pinned_segments.get(segment_id)
+        if segment is None:
+            broken(
+                f"retention receipt claims deletion of segment {segment_id}, "
+                "which the manifest does not pin",
+                {"segmentId": segment_id},
+            )
+            continue
+        object_path = _object_path(object_root, segment.object_key)
+        if not object_path.is_file():
             findings.append(
                 ValidationFinding(
                     check="deleted-segment-object",
                     severity="error",
                     message=(
-                        f"segment {segment.segment_id} was deleted from the WAL but its "
+                        f"segment {segment_id} was deleted from the WAL but its "
                         "compacted object is missing"
                     ),
                     details={"objectKey": segment.object_key},
@@ -654,6 +960,7 @@ def validate_dataset(
 
     findings: list[ValidationFinding] = []
     present = _check_objects(manifest, root, findings)
+    _check_retention_receipt(manifest, manifest_file, root, findings)
 
     connection = duckdb.connect()
     try:
@@ -666,10 +973,11 @@ def validate_dataset(
         layout_failed = any(f.check.startswith("layout-") for f in findings)
         if present and not layout_failed:
             _check_ordinals(connection, manifest, present, findings)
+            _check_row_integrity(connection, present, findings)
             _check_deduplication(connection, manifest, present, findings)
             _check_incident_exclusions(connection, manifest, present, findings)
             _check_payload_digests(connection, present, findings)
-            _check_segment_coverage(connection, manifest, root, present, findings)
+            _check_segment_coverage(connection, manifest, present, findings)
     finally:
         connection.close()
 

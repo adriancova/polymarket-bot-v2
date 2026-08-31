@@ -67,7 +67,20 @@ export interface ObjectStore {
   get(key: string): Promise<Uint8Array>;
 }
 
-/** A segment the compactor asks to have deleted, and the proof it may be. */
+/**
+ * A segment the compactor asks to have deleted.
+ *
+ * Every field here is a **claim to be re-verified, never proof**. A caller can
+ * put any bytes in a request, so an implementation that compared these fields
+ * only against each other would delete whatever the caller told it to —
+ * round-1 review demonstrated exactly that with an arbitrary object and its
+ * own digest. The proof lives in the durable store: the persisted dataset
+ * manifest named by `datasetManifestKey` must pin this segment's checksum,
+ * record count, object key and object checksum, and the object must actually
+ * provide the segment's rows. `verifyRetentionProof` in `retention-proof.ts`
+ * performs that check, and every implementation must apply it (or one at least
+ * as strong) before unlinking anything.
+ */
 export type SegmentDeletionRequest = {
   readonly segmentId: string;
   readonly gatewayEpoch: string;
@@ -79,7 +92,11 @@ export type SegmentDeletionRequest = {
   readonly verifiedObjectKey: string;
   /** SHA-256 of the verified object, re-read from the store. */
   readonly verifiedObjectSha256: string;
-  /** The dataset manifest key that pins this segment. */
+  /**
+   * Key of the dataset manifest that pins this segment. The manifest is
+   * persisted and read-back-verified before retention is invoked, so an
+   * implementation can — and must — fetch it from the store as the proof.
+   */
   readonly datasetManifestKey: string;
 };
 
@@ -96,14 +113,21 @@ export type SegmentDeletionRequest = {
  * 1. **It is off by default.** {@link retainAllWalSegments} is the default
  *    retention, and it deletes nothing. A deployment that wants the disk
  *    reclaimed opts in.
- * 2. **It is only ever called with a completed verification.** The request
- *    carries the object key and the digest that was re-read from the store, so
- *    an implementation can re-check the precondition itself instead of trusting
- *    its caller.
- * 3. **It is called after the dataset manifest is written**, never before —
- *    a segment whose bytes are gone and whose manifest was never persisted is
+ * 2. **It is called only after the dataset manifest and its digest sidecar
+ *    are persisted to the store and read-back-verified** — never before. A
+ *    segment whose bytes are gone and whose manifest was never persisted is
  *    unrecoverable, and that ordering is what ADR-004's "delete-after-verify"
- *    actually requires.
+ *    actually requires. The compactor enforces it mechanically: the manifest
+ *    write and verification precede the first `deleteSegment` call, and a
+ *    failure there aborts the run with every WAL byte still on disk.
+ * 3. **An implementation trusts the store, not the caller.** The request's
+ *    fields are claims; the proof is the persisted manifest the request names,
+ *    re-fetched from the store and checked against the segment's own bytes and
+ *    the object's rows (`retention-proof.ts`). An implementation that skipped
+ *    that check would delete whatever its caller asserted.
+ *
+ * Deletion state is reported afterwards in the retention receipt object
+ * (`retention-receipt.ts`), never by mutating the immutable manifest.
  */
 export interface WalSegmentRetention {
   /** Human-readable policy name, recorded in the compaction result. */

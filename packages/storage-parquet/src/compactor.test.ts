@@ -5,10 +5,13 @@ import type { CompactionOptions, CompactionResult } from "./compactor.js";
 import {
   DATASET_MANIFEST_DIGEST_OBJECT_NAME,
   DATASET_MANIFEST_OBJECT_NAME,
+  DATASET_RETENTION_RECEIPT_OBJECT_NAME,
 } from "./constants.js";
 import { encodeDatasetManifest, parseDatasetManifest } from "./dataset-manifest.js";
 import {
+  CompactionBatchLimitError,
   CompactionConfigurationError,
+  CrossEpochOrderError,
   DuplicateDivergenceError,
   ObjectVerificationError,
 } from "./errors.js";
@@ -502,6 +505,68 @@ describe("compactWalDirectory", () => {
     );
   });
 
+  it("refuses a mixed-epoch batch instead of inventing a chronology", async () => {
+    // Reviewer probe (M1): chronological input OLDER (epoch ffff…) and NEWER
+    // (epoch 0000…) previously came out archived in reverse, because epochs
+    // were ordered by their lexical UUID order. Epochs are identities, not
+    // timestamps, so the compactor now refuses to order them at all.
+    const { fileSystem, objectStore, run } = harness();
+    const older = buildSegmentFixture({
+      gatewayEpoch: "ffffffff-0000-7000-8000-000000000001",
+      segmentIndex: 0,
+      frames: [{ ingestSeq: "1", payloadUtf8: "older" }],
+    });
+    const newer = buildSegmentFixture({
+      gatewayEpoch: "00000000-0000-7000-8000-000000000002",
+      segmentIndex: 0,
+      frames: [{ ingestSeq: "1", payloadUtf8: "newer" }],
+    });
+    place(fileSystem, older);
+    place(fileSystem, newer);
+
+    await expect(run()).rejects.toBeInstanceOf(CrossEpochOrderError);
+    // Refused before anything was written or deleted.
+    expect(objectStore.keys()).toStrictEqual([]);
+    expect(fileSystem.list(WAL_DIR)).toHaveLength(4);
+
+    // Epoch-by-epoch compaction through `segmentIds` still works.
+    const single = await run({ segmentIds: [older.segmentId] });
+    expect(single.verifiedSegmentIds).toStrictEqual([older.segmentId]);
+    expect(single.manifest.gatewayEpochs).toStrictEqual([
+      "ffffffff-0000-7000-8000-000000000001",
+    ]);
+  });
+
+  it("refuses a batch past maxTotalBatchBytes before reading a single segment", async () => {
+    // M3: the resident set is proportional to the whole batch, so the bound is
+    // a refusal at the door, not an OOM later. Nothing read, nothing uploaded.
+    const { fileSystem, objectStore, run } = harness();
+    const a = segmentA();
+    const b = segmentB();
+    place(fileSystem, a);
+    place(fileSystem, b);
+    const combined = a.segmentBytes.byteLength + b.segmentBytes.byteLength;
+
+    await expect(run({ maxTotalBatchBytes: combined - 1 })).rejects.toBeInstanceOf(
+      CompactionBatchLimitError,
+    );
+    expect(objectStore.keys()).toStrictEqual([]);
+    expect(fileSystem.list(WAL_DIR)).toHaveLength(4);
+
+    // Exactly at the bound, the run proceeds.
+    const result = await run({ maxTotalBatchBytes: combined });
+    expect(result.rowsWritten).toBe(5);
+
+    // And a caller can compact the same backlog in bounded batches.
+    const batch = await run({
+      datasetId: "ds-batch",
+      objectKeyPrefix: "datasets/ds-batch",
+      maxTotalBatchBytes: a.segmentBytes.byteLength,
+      segmentIds: [a.segmentId],
+    });
+    expect(batch.verifiedSegmentIds).toStrictEqual([a.segmentId]);
+  });
+
   it("compacts an explicitly supplied subset of segments", async () => {
     const { fileSystem, run } = harness();
     const a = segmentA();
@@ -543,8 +608,8 @@ describe("compactWalDirectory", () => {
 });
 
 describe("retention (ADR-004 §5: delete only after a verified upload)", () => {
-  it("deletes nothing by default", async () => {
-    const { fileSystem, run } = harness();
+  it("deletes nothing by default, and writes no retention receipt", async () => {
+    const { fileSystem, objectStore, run } = harness();
     const a = segmentA();
     place(fileSystem, a);
 
@@ -552,7 +617,11 @@ describe("retention (ADR-004 §5: delete only after a verified upload)", () => {
     expect(result.deletedSegmentIds).toStrictEqual([]);
     expect(result.manifest.walRetentionPolicy).toBe("retain");
     expect(fileSystem.list(WAL_DIR)).toContain(a.segmentFileName);
-    expect(result.manifest.segments.every((segment) => !segment.walSegmentDeleted)).toBe(true);
+    expect(result.retentionReceiptObjectKey).toBeNull();
+    expect(result.retentionReceiptSha256).toBeNull();
+    expect(objectStore.keys()).not.toContain(
+      `datasets/ds-1/${DATASET_RETENTION_RECEIPT_OBJECT_NAME}`,
+    );
   });
 
   it("deletes a segment and its sidecar only after the object is verified", async () => {
@@ -570,12 +639,153 @@ describe("retention (ADR-004 §5: delete only after a verified upload)", () => {
     expect(request?.verifiedObjectSha256).toBe(result.manifest.objects[0]?.sha256);
     expect(request?.segmentSha256).toBe(a.manifest.segmentSha256);
     expect(request?.datasetManifestKey).toBe(result.manifestObjectKey);
-    expect(result.manifest.segments[0]?.walSegmentDeleted).toBe(true);
     // The data survived the deletion.
     const rows = await readParquetObject(
       await objectStore.get(result.manifest.objects[0]?.objectKey ?? ""),
     );
     expect(rows.map((row) => row.record.ingestSeq)).toStrictEqual(["1", "2"]);
+  });
+
+  it("persists and verifies the manifest BEFORE the first deletion is requested", async () => {
+    // The H1 ordering, asserted directly: at the moment `deleteSegment` runs,
+    // the manifest and its digest sidecar must already be readable from the
+    // store, because they are the proof a deleted segment stays recoverable.
+    const { fileSystem, objectStore, run } = harness();
+    const a = segmentA();
+    place(fileSystem, a);
+    const observedAtDeletion: string[][] = [];
+    const inner = recordingRetention({ fileSystem, walDirectoryPath: WAL_DIR, objectStore });
+    const result = await run({
+      retention: {
+        policyName: inner.policyName,
+        async deleteSegment(request) {
+          observedAtDeletion.push([...objectStore.keys()]);
+          await inner.deleteSegment(request);
+        },
+      },
+    });
+    expect(observedAtDeletion).toHaveLength(1);
+    expect(observedAtDeletion[0]).toContain(result.manifestObjectKey);
+    expect(observedAtDeletion[0]).toContain(`datasets/ds-1/${DATASET_MANIFEST_DIGEST_OBJECT_NAME}`);
+  });
+
+  it("writes a retention receipt naming what was deleted, pinned to the manifest", async () => {
+    const { fileSystem, objectStore, run } = harness();
+    const a = segmentA();
+    place(fileSystem, a);
+    const retention = recordingRetention({ fileSystem, walDirectoryPath: WAL_DIR, objectStore });
+
+    const result = await run({ retention });
+
+    expect(result.retentionReceiptObjectKey).toBe(
+      `datasets/ds-1/${DATASET_RETENTION_RECEIPT_OBJECT_NAME}`,
+    );
+    const receiptBytes = await objectStore.get(result.retentionReceiptObjectKey ?? "");
+    expect(sha256Hex(receiptBytes)).toBe(result.retentionReceiptSha256);
+    const receipt = JSON.parse(Buffer.from(receiptBytes).toString("utf8")) as {
+      retentionReceiptFormatId: string;
+      datasetManifestObjectKey: string;
+      datasetManifestSha256: string;
+      deletedSegments: { segmentId: string }[];
+      retentionFailures: unknown[];
+    };
+    expect(receipt.retentionReceiptFormatId).toBe("polymarket-bot/retention-receipt/v1");
+    expect(receipt.datasetManifestObjectKey).toBe(result.manifestObjectKey);
+    expect(receipt.datasetManifestSha256).toBe(result.manifestSha256);
+    expect(receipt.deletedSegments.map((entry) => entry.segmentId)).toStrictEqual([a.segmentId]);
+    expect(receipt.retentionFailures).toStrictEqual([]);
+    // Deletion state is NOT in the manifest: it was persisted before retention.
+    const storedManifest = Buffer.from(
+      await objectStore.get(result.manifestObjectKey),
+    ).toString("utf8");
+    expect(storedManifest).not.toContain("walSegmentDeleted");
+  });
+
+  it("keeps every WAL byte when the manifest cannot be persisted", async () => {
+    // Reviewer probe (H1), now inverted: a store whose put() fails for the
+    // manifest object must abort the run with the WAL fully intact and no
+    // deletion ever requested.
+    const { fileSystem, objectStore, run } = harness();
+    const a = segmentA();
+    place(fileSystem, a);
+    const failing: typeof objectStore = {
+      ...objectStore,
+      async put(key: string, bytes: Uint8Array) {
+        if (key.endsWith(DATASET_MANIFEST_OBJECT_NAME)) {
+          throw new Error("store rejected the manifest put");
+        }
+        await objectStore.put(key, bytes);
+      },
+    };
+    const retention = recordingRetention({
+      fileSystem,
+      walDirectoryPath: WAL_DIR,
+      objectStore: failing,
+    });
+
+    await expect(run({ retention, objectStore: failing })).rejects.toThrow(
+      "store rejected the manifest put",
+    );
+    expect(retention.requests).toStrictEqual([]);
+    expect(fileSystem.list(WAL_DIR)).toStrictEqual([a.segmentFileName, a.manifestFileName]);
+    expect(objectStore.keys().some((key) => key.endsWith(DATASET_MANIFEST_OBJECT_NAME))).toBe(
+      false,
+    );
+  });
+
+  it("keeps every WAL byte when the manifest read-back fails verification", async () => {
+    const { fileSystem, objectStore, run } = harness();
+    const a = segmentA();
+    place(fileSystem, a);
+    const lying: typeof objectStore = {
+      ...objectStore,
+      async get(key: string) {
+        const bytes = await objectStore.get(key);
+        if (key.endsWith(DATASET_MANIFEST_OBJECT_NAME)) {
+          const mutated = Buffer.from(bytes);
+          mutated[0] = (mutated[0] ?? 0) ^ 0xff;
+          return mutated;
+        }
+        return bytes;
+      },
+    };
+    const retention = recordingRetention({
+      fileSystem,
+      walDirectoryPath: WAL_DIR,
+      objectStore: lying,
+    });
+
+    await expect(run({ retention, objectStore: lying })).rejects.toBeInstanceOf(
+      ObjectVerificationError,
+    );
+    expect(retention.requests).toStrictEqual([]);
+    expect(fileSystem.list(WAL_DIR)).toStrictEqual([a.segmentFileName, a.manifestFileName]);
+  });
+
+  it("keeps every WAL byte when the digest sidecar cannot be persisted", async () => {
+    const { fileSystem, objectStore, run } = harness();
+    const a = segmentA();
+    place(fileSystem, a);
+    const failing: typeof objectStore = {
+      ...objectStore,
+      async put(key: string, bytes: Uint8Array) {
+        if (key.endsWith(DATASET_MANIFEST_DIGEST_OBJECT_NAME)) {
+          throw new Error("store rejected the digest sidecar put");
+        }
+        await objectStore.put(key, bytes);
+      },
+    };
+    const retention = recordingRetention({
+      fileSystem,
+      walDirectoryPath: WAL_DIR,
+      objectStore: failing,
+    });
+
+    await expect(run({ retention, objectStore: failing })).rejects.toThrow(
+      "store rejected the digest sidecar put",
+    );
+    expect(retention.requests).toStrictEqual([]);
+    expect(fileSystem.list(WAL_DIR)).toStrictEqual([a.segmentFileName, a.manifestFileName]);
   });
 
   it("never deletes a refused segment, even when retention is enabled", async () => {

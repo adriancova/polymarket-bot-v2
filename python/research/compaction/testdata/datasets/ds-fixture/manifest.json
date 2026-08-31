@@ -175,8 +175,7 @@
       "truncatedTailBytes": 0,
       "objectKey": "datasets/ds-fixture/0190a3e0-0000-7000-8000-000000000001-000000.parquet",
       "firstDatasetRowOrdinal": 0,
-      "lastDatasetRowOrdinal": 3,
-      "walSegmentDeleted": false
+      "lastDatasetRowOrdinal": 3
     },
     {
       "segmentId": "0190a3e0-0000-7000-8000-000000000001-000001",
@@ -195,8 +194,7 @@
       "truncatedTailBytes": 0,
       "objectKey": "datasets/ds-fixture/0190a3e0-0000-7000-8000-000000000001-000001.parquet",
       "firstDatasetRowOrdinal": 4,
-      "lastDatasetRowOrdinal": 6,
-      "walSegmentDeleted": false
+      "lastDatasetRowOrdinal": 6
     }
   ],
   "objects": [

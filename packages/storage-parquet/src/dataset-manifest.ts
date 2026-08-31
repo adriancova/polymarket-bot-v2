@@ -38,6 +38,16 @@
  * so the same dataset produces the same bytes and therefore the same
  * `manifestSha256`. The digest is written to a sidecar object rather than into
  * the manifest, because a document cannot contain its own hash.
+ *
+ * ## Deletion state lives elsewhere
+ *
+ * The manifest carries **no** per-segment deletion flag. It is persisted and
+ * read-back-verified *before* retention is allowed to delete anything (the
+ * ADR-004 §5 ordering made mechanical), so at the moment it is written no
+ * deletion has happened — and it is immutable, so no later deletion could be
+ * recorded in it without changing pinned bytes. What retention actually
+ * removed is stated afterwards in the separate retention receipt
+ * ({@link ./retention-receipt.js}).
  */
 
 import {
@@ -86,8 +96,6 @@ export type DatasetSegmentEntry = {
   readonly objectKey: string;
   readonly firstDatasetRowOrdinal: number | null;
   readonly lastDatasetRowOrdinal: number | null;
-  /** Whether retention removed the segment after verification. */
-  readonly walSegmentDeleted: boolean;
 };
 
 /** One compacted object pinned by the dataset. */
@@ -339,7 +347,6 @@ export function encodeDatasetManifest(manifest: DatasetManifest): Uint8Array {
       objectKey: segment.objectKey,
       firstDatasetRowOrdinal: segment.firstDatasetRowOrdinal,
       lastDatasetRowOrdinal: segment.lastDatasetRowOrdinal,
-      walSegmentDeleted: segment.walSegmentDeleted,
     })),
     objects: manifest.objects.map((object) => ({
       objectKey: object.objectKey,

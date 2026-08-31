@@ -9,6 +9,11 @@
  * deletion is the *last* thing that can possibly happen, and every step before
  * it is a precondition someone can check:
  *
+ * 0. **Bound the batch.** The run's resident set is proportional to the whole
+ *    batch (ordinals and deduplication span segments), so the summed candidate
+ *    file sizes are checked against `maxTotalBatchBytes` before any segment is
+ *    read. Past the bound the run is refused whole; a caller batches with
+ *    `segmentIds`.
  * 1. **Enumerate manifests, not segments.** `wal-format.md` §2: a segment with
  *    no sidecar manifest is unverified and "a compactor must not consume it".
  *    Listing manifests rather than `.wal.jsonl` files makes that structural
@@ -16,10 +21,15 @@
  * 2. **Verify each segment against its own bytes.** Checksum, record count,
  *    byte size, and every field the manifest shares with the header, the
  *    footer, and the records (§6.3). A refusal excludes the segment and is
- *    pinned in the dataset manifest with its issue codes.
- * 3. **Order records by dispatch order** — segment ordinal, then position in
- *    the file — and assign a dense `datasetRowOrdinal`. §8.4: replay consumes
- *    recorded dispatch order and "must not sort solely by venue timestamp".
+ *    pinned in the dataset manifest with its issue codes. Verified segments
+ *    spanning more than one gateway epoch refuse the run: the WAL contract
+ *    defines no cross-epoch chronology, and inventing one (an epoch UUID's
+ *    lexical order, for instance) would fabricate the dispatch order §8.4
+ *    treats as ground truth.
+ * 3. **Order records by dispatch order** — segment ordinal within the single
+ *    epoch, then position in the file — and assign a dense
+ *    `datasetRowOrdinal`. §8.4: replay consumes recorded dispatch order and
+ *    "must not sort solely by venue timestamp".
  * 4. **Mark, never drop.** Incident-window records and duplicate copies are
  *    written with `replayEligible = false`. See `incidents.ts` for why: after
  *    step 8 the dataset may be the only copy.
@@ -29,21 +39,30 @@
  *    one computed from the bytes the store returned, not from the bytes this
  *    process holds. A store that accepted a write and serves something else
  *    fails the run here, before any retention decision.
- * 7. **Write the dataset manifest**, and verify it the same way.
+ * 7. **Write the dataset manifest and its digest sidecar, and read both back.**
+ *    Until the manifest is durably in the store, nothing may be deleted: a
+ *    segment whose bytes are gone and whose manifest was never persisted is
+ *    unrecoverable. This step *is* the grant retention waits for.
  * 8. **Only now, retention.** And only for segments whose every record is in a
- *    verified object that the written manifest pins.
+ *    verified object that the persisted manifest pins — which the retention
+ *    implementation re-checks from the store itself (`retention-proof.ts`).
+ *    What was deleted is then reported in a separate retention receipt object,
+ *    because the manifest is immutable and deletion state is not part of a
+ *    dataset's archival identity.
  *
- * A failure at any step leaves the WAL untouched. "The delete-after-verify rule
- * means a broken upload path fills the disk instead of losing data. That is the
- * intended failure direction" (ADR-004, Consequences).
+ * A failure at any step up to and including 7 leaves the WAL untouched. "The
+ * delete-after-verify rule means a broken upload path fills the disk instead of
+ * losing data. That is the intended failure direction" (ADR-004, Consequences).
  */
 
 import {
   DATASET_MANIFEST_DIGEST_OBJECT_NAME,
   DATASET_MANIFEST_OBJECT_NAME,
+  DATASET_RETENTION_RECEIPT_OBJECT_NAME,
   DEFAULT_MAX_LISTED_DUPLICATE_KEYS,
   DEFAULT_MAX_RECORD_BYTES,
   DEFAULT_MAX_SEGMENT_BYTES,
+  DEFAULT_MAX_TOTAL_BATCH_BYTES,
   DEFAULT_ROW_GROUP_SIZE,
   PARQUET_OBJECT_SUFFIX,
 } from "./constants.js";
@@ -64,7 +83,9 @@ import {
   encodeDatasetManifest,
 } from "./dataset-manifest.js";
 import {
+  CompactionBatchLimitError,
   CompactionConfigurationError,
+  CrossEpochOrderError,
   DuplicateDivergenceError,
   ObjectVerificationError,
 } from "./errors.js";
@@ -82,6 +103,8 @@ import type {
   WalSegmentRetention,
 } from "./ports.js";
 import { retainAllWalSegments } from "./ports.js";
+import { buildRetentionReceipt, encodeRetentionReceipt } from "./retention-receipt.js";
+import type { RetentionReceiptDeletion, RetentionReceiptFailure } from "./retention-receipt.js";
 import type {
   RawFrameRecord,
   WalSegmentIssue,
@@ -126,6 +149,17 @@ export type CompactionOptions = {
   readonly rowGroupSize?: number;
   readonly maxSegmentBytes?: number;
   readonly maxRecordBytes?: number;
+  /**
+   * Bound on the summed on-disk bytes of every candidate segment in one run.
+   *
+   * The compactor holds every verified segment's records in memory for the
+   * whole run — dispatch ordinals and deduplication span segments — so its
+   * resident set is proportional to the batch, not to one segment. Checked
+   * against file sizes before any segment is read; exceeding it throws
+   * `CompactionBatchLimitError` and touches nothing. Defaults to
+   * {@link DEFAULT_MAX_TOTAL_BATCH_BYTES}.
+   */
+  readonly maxTotalBatchBytes?: number;
   readonly maxListedDuplicateKeys?: number;
   /**
    * Segments to consider. Defaults to every segment with a sidecar manifest.
@@ -148,6 +182,14 @@ export type CompactionResult = {
   readonly refusedSegments: readonly ExcludedSegmentEntry[];
   readonly deletedSegmentIds: readonly string[];
   readonly retentionFailures: readonly { segmentId: string; detail: string }[];
+  /**
+   * Key of the retention receipt object, or `null` when the policy was
+   * `retain` and no receipt was written. Deletion state lives in the receipt,
+   * never in the (already persisted, immutable) dataset manifest.
+   */
+  readonly retentionReceiptObjectKey: string | null;
+  /** SHA-256 of the receipt as read back from the store, or `null`. */
+  readonly retentionReceiptSha256: string | null;
   readonly rowsWritten: number;
   readonly replayEligibleRows: number;
   readonly objectBytesUploaded: number;
@@ -166,14 +208,15 @@ function sortSegments(results: readonly Extract<WalSegmentReadResult, { status: 
   WalSegmentReadResult,
   { status: "verified" }
 >[] {
-  // Dispatch order across segments: gateway epoch, then the per-directory
-  // ordinal the header records, then the id as a last, total tiebreak. Epoch
-  // first because a restart begins a new epoch and its ordinals restart from
-  // zero (`wal-format.md` §2), so ordinal alone is not a total order.
+  // Dispatch order across segments of ONE gateway epoch: the per-directory
+  // ordinal the header records (`wal-format.md` §4 calls it an ordering aid),
+  // then the id as a deterministic total tiebreak. The single-epoch invariant
+  // is enforced before this function runs: the WAL contract defines no
+  // cross-epoch chronology, and an earlier revision that ordered epochs by
+  // their lexical UUID order was fabricating one — round-1 review reproduced a
+  // chronologically older epoch archived after a newer one. A mixed-epoch
+  // batch is refused (`CrossEpochOrderError`), never re-ordered by guesswork.
   return [...results].sort((left, right) => {
-    if (left.manifest.gatewayEpoch !== right.manifest.gatewayEpoch) {
-      return left.manifest.gatewayEpoch < right.manifest.gatewayEpoch ? -1 : 1;
-    }
     if (left.manifest.segmentIndex !== right.manifest.segmentIndex) {
       return left.manifest.segmentIndex - right.manifest.segmentIndex;
     }
@@ -201,6 +244,7 @@ export async function compactWalDirectory(
   const incidentWindows = options.incidentWindows ?? [];
   const maxSegmentBytes = options.maxSegmentBytes ?? DEFAULT_MAX_SEGMENT_BYTES;
   const maxRecordBytes = options.maxRecordBytes ?? DEFAULT_MAX_RECORD_BYTES;
+  const maxTotalBatchBytes = options.maxTotalBatchBytes ?? DEFAULT_MAX_TOTAL_BATCH_BYTES;
   const maxListedDuplicateKeys =
     options.maxListedDuplicateKeys ?? DEFAULT_MAX_LISTED_DUPLICATE_KEYS;
   const codec: DatasetCodec = options.codec ?? "UNCOMPRESSED";
@@ -224,6 +268,33 @@ export async function compactWalDirectory(
   // ---- 1. Enumerate the segments that carry a sidecar manifest. ----------
   const candidateSegmentIds =
     options.segmentIds ?? (await listManifestedSegmentIds(options.fileSystem, options.walDirectoryPath));
+  const bytesSource = walBytesSource(options.fileSystem, options.walDirectoryPath);
+
+  // ---- 0. Bound the batch, from file sizes, before reading anything. -----
+  //
+  // Every verified segment's records stay in memory until the manifest is
+  // written (ordinals and deduplication span segments), so the resident set is
+  // proportional to the batch. The bound is checked here — before a single
+  // byte is read — and a run past it is refused whole: nothing read, nothing
+  // uploaded, nothing deleted.
+  let totalCandidateBytes = 0;
+  for (const segmentId of candidateSegmentIds) {
+    const byteLength = await bytesSource.segmentByteLength(segmentId);
+    if (byteLength !== null) {
+      totalCandidateBytes += byteLength;
+    }
+  }
+  if (totalCandidateBytes > maxTotalBatchBytes) {
+    throw new CompactionBatchLimitError(
+      "candidate segments exceed the per-run compaction batch bound; " +
+        "compact in smaller batches by passing segmentIds, or raise maxTotalBatchBytes",
+      {
+        totalCandidateBytes,
+        maxTotalBatchBytes,
+        candidateSegmentCount: candidateSegmentIds.length,
+      },
+    );
+  }
 
   // ---- 2. Read and verify each one. -------------------------------------
   const verified: Extract<WalSegmentReadResult, { status: "verified" }>[] = [];
@@ -231,11 +302,10 @@ export async function compactWalDirectory(
   const refusedClosedAt: (string | null)[] = [];
 
   for (const segmentId of candidateSegmentIds) {
-    const result = await readWalSegment(
-      walBytesSource(options.fileSystem, options.walDirectoryPath),
-      segmentId,
-      { maxSegmentBytes, maxRecordBytes },
-    );
+    const result = await readWalSegment(bytesSource, segmentId, {
+      maxSegmentBytes,
+      maxRecordBytes,
+    });
     if (result.status === "verified") {
       verified.push(result);
       options.observer?.onSegmentVerified?.({
@@ -260,6 +330,21 @@ export async function compactWalDirectory(
     }
   }
 
+  // Verified segments must share one gateway epoch. Epoch UUIDs establish
+  // identity, not chronology (`wal-format.md` §4, §7.1), and `segmentIndex`
+  // has per-directory meaning only within an epoch — so no cross-epoch
+  // dispatch order can be derived from anything this compactor can see.
+  // Refusing is the conservative answer until the WAL contract defines one;
+  // a caller compacts epoch by epoch via `segmentIds`.
+  const verifiedEpochs = [...new Set(verified.map((s) => s.manifest.gatewayEpoch))].sort();
+  if (verifiedEpochs.length > 1) {
+    throw new CrossEpochOrderError(
+      "verified segments span multiple gateway epochs and the WAL contract defines " +
+        "no cross-epoch chronology; compact one epoch at a time via segmentIds",
+      { gatewayEpochs: verifiedEpochs },
+    );
+  }
+
   const ordered = sortSegments(verified);
 
   // ---- 3./4. Assign dispatch ordinals; mark exclusions. ------------------
@@ -272,6 +357,12 @@ export async function compactWalDirectory(
   let ordinal = 0;
   let segmentDeclared = 0;
   let segmentRead = 0;
+  // First and last row in dispatch order, tracked here instead of
+  // materializing a dataset-wide row list a second time: the per-segment rows
+  // in `rowsBySegment` are the only dataset-sized structure this run holds,
+  // and the batch bound above is what bounds it.
+  let firstRow: DatasetRow | null = null;
+  let lastRow: DatasetRow | null = null;
 
   for (const segment of ordered) {
     segmentDeclared += segment.manifest.recordCount;
@@ -349,10 +440,13 @@ export async function compactWalDirectory(
         );
       }
       rows.push(row);
+      firstRow = firstRow ?? row;
+      lastRow = row;
       ordinal += 1;
     }
     rowsBySegment.set(segment.segmentId, rows);
   }
+  const totalRows = ordinal;
 
   // ---- 5./6. Encode, upload, and read back every object. -----------------
   const objects: DatasetObjectEntry[] = [];
@@ -437,16 +531,10 @@ export async function compactWalDirectory(
       objectKey,
       firstDatasetRowOrdinal: first === null ? null : first.datasetRowOrdinal,
       lastDatasetRowOrdinal: last === null ? null : last.datasetRowOrdinal,
-      // Filled in below, after retention runs. Written here as `false` so the
-      // field is never absent.
-      walSegmentDeleted: false,
     });
   }
 
-  // ---- 7. The dataset manifest. -----------------------------------------
-  const allRows = ordered.flatMap((segment) => rowsBySegment.get(segment.segmentId) ?? []);
-  const firstRow = allRows[0] ?? null;
-  const lastRow = allRows[allRows.length - 1] ?? null;
+  // ---- 7. The dataset manifest, durable BEFORE any deletion. -------------
   const eventIdentity = (row: DatasetRow | null): EventIdentity | null =>
     row === null
       ? null
@@ -470,7 +558,7 @@ export async function compactWalDirectory(
     ...new Set(ordered.map((segment) => segment.manifest.gatewayEpoch)),
   ].sort();
 
-  const buildManifest = (deletedSegmentIds: ReadonlySet<string>): DatasetManifest => ({
+  const manifest: DatasetManifest = {
     datasetManifestFormatId: currentSchemaVersions().datasetManifestFormatId,
     datasetManifestVersion: currentSchemaVersions().datasetManifestVersion,
     datasetId: options.datasetId,
@@ -489,7 +577,7 @@ export async function compactWalDirectory(
     recordCounts: {
       segmentDeclared,
       segmentRead,
-      written: allRows.length,
+      written: totalRows,
       replayEligible: replayEligibleTotal,
       excludedByIncident,
       excludedAsDuplicate: duplicateRecordCount,
@@ -500,34 +588,62 @@ export async function compactWalDirectory(
       duplicateKeys,
       duplicateKeysTruncated: duplicateRecordCount > duplicateKeys.length,
     },
-    segments: segmentEntries.map((entry) => ({
-      ...entry,
-      walSegmentDeleted: deletedSegmentIds.has(entry.segmentId),
-    })),
+    segments: segmentEntries,
     objects,
     excludedSegments: refused,
     excludedIncidentWindows,
     walRetentionPolicy: retention.policyName,
-  });
+  };
 
-  // The manifest is written **before** any deletion, and it is written again
-  // afterwards only if retention actually removed something — see below.
+  // The manifest and its digest sidecar are persisted and read back **before**
+  // any deletion is even considered. This ordering is the public guarantee of
+  // `ports.ts` (`WalSegmentRetention`) and the mechanical form of ADR-004 §5:
+  // until the immutable manifest is durably in the store and verified, a
+  // deleted segment would be unrecoverable, so nothing may be deleted. A
+  // failure anywhere in this step throws, and the WAL has lost no byte.
   const manifestObjectKey = objectKeyFor(DATASET_MANIFEST_OBJECT_NAME);
   const digestObjectKey = objectKeyFor(DATASET_MANIFEST_DIGEST_OBJECT_NAME);
+  const manifestBytes = encodeDatasetManifest(manifest);
+  const manifestSha256 = datasetManifestDigest(manifest);
 
-  const preRetentionManifest = buildManifest(new Set());
+  await options.objectStore.put(manifestObjectKey, manifestBytes);
+  const storedManifest = await options.objectStore.get(manifestObjectKey);
+  const storedManifestSha256 = sha256Hex(storedManifest);
+  if (storedManifestSha256 !== manifestSha256) {
+    throw new ObjectVerificationError("dataset manifest read back with a different digest", {
+      objectKey: manifestObjectKey,
+      expected: manifestSha256,
+      observed: storedManifestSha256,
+    });
+  }
+  const digestBytes = Buffer.from(`${manifestSha256}\n`, "utf8");
+  await options.objectStore.put(digestObjectKey, digestBytes);
+  const storedDigest = Buffer.from(await options.objectStore.get(digestObjectKey));
+  if (!storedDigest.equals(digestBytes)) {
+    throw new ObjectVerificationError("manifest digest sidecar read back with different bytes", {
+      objectKey: digestObjectKey,
+      expected: manifestSha256,
+      observed: storedDigest.toString("utf8").trim(),
+    });
+  }
 
-  // ---- 8. Retention: the only step that removes anything. ---------------
+  options.observer?.onDatasetManifestWritten?.({
+    datasetId: options.datasetId,
+    objectKey: manifestObjectKey,
+    manifestSha256,
+    rowCount: totalRows,
+  });
+
+  // ---- 8. Retention: the only step that removes anything. ----------------
   //
-  // Ordering note: ADR-004 §5 requires upload + checksum verification before a
-  // deletion. Both are complete above. The manifest is written *after* the
-  // deletions so that `walSegmentDeleted` is a fact rather than an intention —
-  // but the deletions are only permitted because the objects are already
-  // verified, and a crash between a deletion and the manifest write loses no
-  // data: the object holds every record, and re-running compaction over the
-  // remaining segments produces the manifest again.
+  // Reached only with the manifest durable and verified above. The deletion
+  // request restates what this run verified, but the retention implementation
+  // must not take the caller's word for it: it re-fetches the persisted
+  // manifest from the store and re-verifies the segment's bytes and the
+  // object's rows against it before unlinking (`retention-proof.ts`).
   const deletedSegmentIds: string[] = [];
-  const retentionFailures: { segmentId: string; detail: string }[] = [];
+  const retentionFailures: RetentionReceiptFailure[] = [];
+  const deletions: RetentionReceiptDeletion[] = [];
 
   if (retention.policyName !== "retain") {
     for (const entry of segmentEntries) {
@@ -548,6 +664,11 @@ export async function compactWalDirectory(
           datasetManifestKey: manifestObjectKey,
         });
         deletedSegmentIds.push(entry.segmentId);
+        deletions.push({
+          segmentId: entry.segmentId,
+          verifiedObjectKey: verifiedObject.key,
+          verifiedObjectSha256: verifiedObject.sha256,
+        });
         options.observer?.onSegmentDeleted?.({
           segmentId: entry.segmentId,
           verifiedObjectKey: verifiedObject.key,
@@ -561,29 +682,38 @@ export async function compactWalDirectory(
     }
   }
 
-  const manifest =
-    deletedSegmentIds.length === 0 ? preRetentionManifest : buildManifest(new Set(deletedSegmentIds));
-  const manifestBytes = encodeDatasetManifest(manifest);
-  const manifestSha256 = datasetManifestDigest(manifest);
-
-  await options.objectStore.put(manifestObjectKey, manifestBytes);
-  const storedManifest = await options.objectStore.get(manifestObjectKey);
-  const storedManifestSha256 = sha256Hex(storedManifest);
-  if (storedManifestSha256 !== manifestSha256) {
-    throw new ObjectVerificationError("dataset manifest read back with a different digest", {
-      objectKey: manifestObjectKey,
-      expected: manifestSha256,
-      observed: storedManifestSha256,
+  // ---- 9. The retention receipt: report what was removed. ----------------
+  //
+  // Written only when a deleting policy ran, after the fact, because deletion
+  // state is not part of the immutable manifest (see `retention-receipt.ts`).
+  // A failure here throws loudly but loses no data: every deletion above was
+  // permitted only by the already-durable manifest.
+  let retentionReceiptObjectKey: string | null = null;
+  let retentionReceiptSha256: string | null = null;
+  if (retention.policyName !== "retain") {
+    retentionReceiptObjectKey = objectKeyFor(DATASET_RETENTION_RECEIPT_OBJECT_NAME);
+    const receipt = buildRetentionReceipt({
+      datasetId: options.datasetId,
+      datasetManifestObjectKey: manifestObjectKey,
+      datasetManifestSha256: manifestSha256,
+      walRetentionPolicy: retention.policyName,
+      completedAt: new Date(options.clock.nowMs()).toISOString(),
+      deletedSegments: deletions,
+      retentionFailures,
     });
+    const receiptBytes = encodeRetentionReceipt(receipt);
+    retentionReceiptSha256 = sha256Hex(receiptBytes);
+    await options.objectStore.put(retentionReceiptObjectKey, receiptBytes);
+    const storedReceipt = await options.objectStore.get(retentionReceiptObjectKey);
+    const storedReceiptSha256 = sha256Hex(storedReceipt);
+    if (storedReceiptSha256 !== retentionReceiptSha256) {
+      throw new ObjectVerificationError("retention receipt read back with a different digest", {
+        objectKey: retentionReceiptObjectKey,
+        expected: retentionReceiptSha256,
+        observed: storedReceiptSha256,
+      });
+    }
   }
-  await options.objectStore.put(digestObjectKey, Buffer.from(`${manifestSha256}\n`, "utf8"));
-
-  options.observer?.onDatasetManifestWritten?.({
-    datasetId: options.datasetId,
-    objectKey: manifestObjectKey,
-    manifestSha256,
-    rowCount: allRows.length,
-  });
 
   return {
     datasetId: options.datasetId,
@@ -594,7 +724,9 @@ export async function compactWalDirectory(
     refusedSegments: refused,
     deletedSegmentIds,
     retentionFailures,
-    rowsWritten: allRows.length,
+    retentionReceiptObjectKey,
+    retentionReceiptSha256,
+    rowsWritten: totalRows,
     replayEligibleRows: replayEligibleTotal,
     objectBytesUploaded,
     durationMs: options.clock.monotonicMs() - startedAtMonotonicMs,
@@ -766,4 +898,3 @@ async function verifyUploadedObject(input: {
 
   return { sha256, byteLength: head.byteLength, rowCount: decoded.length };
 }
-

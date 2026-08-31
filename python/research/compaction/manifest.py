@@ -18,6 +18,9 @@ DATASET_MANIFEST_FORMAT_ID = "polymarket-bot/dataset-manifest/v1"
 DATASET_MANIFEST_VERSION = 1
 PARQUET_LAYOUT_ID = "polymarket-bot/parquet-raw-frames/v1"
 PARQUET_LAYOUT_VERSION = 1
+RETENTION_RECEIPT_FORMAT_ID = "polymarket-bot/retention-receipt/v1"
+RETENTION_RECEIPT_VERSION = 1
+RETENTION_RECEIPT_OBJECT_NAME = "retention-receipt.json"
 
 
 class ManifestError(Exception):
@@ -26,7 +29,13 @@ class ManifestError(Exception):
 
 @dataclass(frozen=True)
 class SegmentEntry:
-    """One WAL segment pinned by the dataset (handoff §8.4)."""
+    """One WAL segment pinned by the dataset (handoff §8.4).
+
+    Deletion state is deliberately absent: the manifest is persisted before
+    retention may delete anything, so what was deleted is reported in the
+    separate retention receipt object (``retention-receipt.json``), which the
+    validator reconciles when it is present.
+    """
 
     segment_id: str
     gateway_epoch: str
@@ -36,7 +45,6 @@ class SegmentEntry:
     first_ingest_seq: str | None
     last_ingest_seq: str | None
     object_key: str
-    wal_segment_deleted: bool
 
 
 @dataclass(frozen=True)
@@ -188,7 +196,6 @@ def parse_manifest(document: Any) -> DatasetManifest:
             first_ingest_seq=_optional_str(e.get("firstIngestSeq"), "firstIngestSeq"),
             last_ingest_seq=_optional_str(e.get("lastIngestSeq"), "lastIngestSeq"),
             object_key=_require_str(_require(e, "objectKey", "segment"), "objectKey"),
-            wal_segment_deleted=bool(_require(e, "walSegmentDeleted", "segment")),
         )
         for e in _require_list(_require(root, "segments", "manifest"), "segments")
     )

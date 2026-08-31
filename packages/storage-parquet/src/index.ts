@@ -43,13 +43,17 @@ export {
   DATASET_MANIFEST_FORMAT_ID,
   DATASET_MANIFEST_OBJECT_NAME,
   DATASET_MANIFEST_VERSION,
+  DATASET_RETENTION_RECEIPT_OBJECT_NAME,
   DEFAULT_MAX_LISTED_DUPLICATE_KEYS,
   DEFAULT_MAX_RECORD_BYTES,
   DEFAULT_MAX_SEGMENT_BYTES,
+  DEFAULT_MAX_TOTAL_BATCH_BYTES,
   DEFAULT_ROW_GROUP_SIZE,
   PARQUET_LAYOUT_ID,
   PARQUET_LAYOUT_VERSION,
   PARQUET_OBJECT_SUFFIX,
+  RETENTION_RECEIPT_FORMAT_ID,
+  RETENTION_RECEIPT_VERSION,
   SUPPORTED_WAL_MANIFEST_VERSION,
   SUPPORTED_WAL_SCHEMA_VERSION,
   WAL_FORMAT_ID,
@@ -58,8 +62,10 @@ export {
 } from "./constants.js";
 
 export {
+  CompactionBatchLimitError,
   CompactionConfigurationError,
   CompactionError,
+  CrossEpochOrderError,
   DatasetManifestError,
   DuplicateDivergenceError,
   ObjectImmutabilityError,
@@ -67,6 +73,20 @@ export {
   RetentionGuardError,
   type CompactionErrorCode,
 } from "./errors.js";
+
+export {
+  buildRetentionReceipt,
+  encodeRetentionReceipt,
+  retentionReceiptDigest,
+  type RetentionReceipt,
+  type RetentionReceiptDeletion,
+  type RetentionReceiptFailure,
+} from "./retention-receipt.js";
+
+export {
+  verifyRetentionProof,
+  type RetentionProofContext,
+} from "./retention-proof.js";
 
 export {
   compareUnsignedIntegerStrings,

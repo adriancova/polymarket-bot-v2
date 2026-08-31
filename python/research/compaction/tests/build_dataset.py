@@ -242,7 +242,6 @@ def build_manifest(
                 "objectKey": object_key_by_segment[segment_id],
                 "firstDatasetRowOrdinal": rows[0].ordinal,
                 "lastDatasetRowOrdinal": rows[-1].ordinal,
-                "walSegmentDeleted": retention_policy != "retain",
             }
             for segment_id, rows in segment_rows.items()
         ],
@@ -336,6 +335,35 @@ def build_dataset(
     manifest_path = root / prefix / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    if retention_policy != "retain":
+        # Deletion state lives in the retention receipt, written after the
+        # (already durable) manifest — mirroring the compactor's ordering.
+        receipt = {
+            "retentionReceiptFormatId": "polymarket-bot/retention-receipt/v1",
+            "retentionReceiptVersion": 1,
+            "datasetId": dataset_id,
+            "datasetManifestObjectKey": f"{prefix}/manifest.json",
+            "datasetManifestSha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            "walRetentionPolicy": retention_policy,
+            "completedAt": "2026-01-01T00:00:01.000Z",
+            "deletedSegments": [
+                {
+                    "segmentId": segment["segmentId"],
+                    "verifiedObjectKey": segment["objectKey"],
+                    "verifiedObjectSha256": next(
+                        digest
+                        for key, _rows, _length, digest in objects
+                        if key == segment["objectKey"]
+                    ),
+                }
+                for segment in manifest["segments"]
+            ],
+            "retentionFailures": [],
+        }
+        receipt_path = root / prefix / "retention-receipt.json"
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+
     return manifest_path
 
 

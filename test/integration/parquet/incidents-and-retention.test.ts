@@ -159,7 +159,25 @@ describe("retention (ADR-004 §5)", () => {
     expect(result.deletedSegmentIds.length).toBe(result.manifest.segments.length);
     expect(result.retentionFailures).toStrictEqual([]);
     expect(await readdir(workspace.walDirectoryPath)).toStrictEqual([]);
-    expect(result.manifest.segments.every((segment) => segment.walSegmentDeleted)).toBe(true);
+
+    // Deletion state lives in the retention receipt, not in the (persisted-
+    // before-deletion, immutable) manifest.
+    expect(result.retentionReceiptObjectKey).toBe("datasets/ds-incidents/retention-receipt.json");
+    const receipt = JSON.parse(
+      await readFile(
+        join(workspace.objectStoreRoot, result.retentionReceiptObjectKey ?? ""),
+        "utf8",
+      ),
+    ) as {
+      datasetManifestSha256: string;
+      deletedSegments: { segmentId: string }[];
+      retentionFailures: unknown[];
+    };
+    expect(receipt.datasetManifestSha256).toBe(result.manifestSha256);
+    expect(receipt.deletedSegments.map((entry) => entry.segmentId).sort()).toStrictEqual(
+      result.manifest.segments.map((segment) => segment.segmentId).sort(),
+    );
+    expect(receipt.retentionFailures).toStrictEqual([]);
 
     // Everything that was in the WAL is still readable from the archive.
     const rows = await rowsOf(result);
@@ -189,6 +207,30 @@ describe("retention (ADR-004 §5)", () => {
     ).rejects.toBeInstanceOf(ObjectVerificationError);
 
     // The intended failure direction: the disk fills, the data survives.
+    expect((await readdir(workspace.walDirectoryPath)).sort()).toStrictEqual(before.sort());
+  });
+
+  it("keeps the WAL intact when the manifest cannot be persisted", async () => {
+    // Round-1 review's H1 probe on real files: with deletion enabled, a store
+    // that rejects the manifest put must leave every WAL byte on disk,
+    // because the manifest is persisted BEFORE any deletion is granted.
+    await record();
+    const before = await readdir(workspace.walDirectoryPath);
+    const backing = fileSystemObjectStore(workspace.objectStoreRoot);
+    const failing: ObjectStore = {
+      put: async (key, bytes) => {
+        if (key.endsWith("/manifest.json")) {
+          throw new Error("manifest put rejected");
+        }
+        await backing.put(key, bytes);
+      },
+      head: (key) => backing.head(key),
+      get: (key) => backing.get(key),
+    };
+
+    await expect(
+      compact({ deleteAfterVerify: true, objectStore: failing }),
+    ).rejects.toThrow("manifest put rejected");
     expect((await readdir(workspace.walDirectoryPath)).sort()).toStrictEqual(before.sort());
   });
 

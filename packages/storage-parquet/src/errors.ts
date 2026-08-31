@@ -27,7 +27,11 @@ export type CompactionErrorCode =
   /** Two records share `(gatewayEpoch, ingestSeq)` but differ in content. */
   | "DUPLICATE_DIVERGENCE"
   /** A segment deletion was attempted without a completed verification. */
-  | "RETENTION_GUARD";
+  | "RETENTION_GUARD"
+  /** Verified segments span gateway epochs with no defined chronology. */
+  | "CROSS_EPOCH_ORDER"
+  /** The candidate segments exceed the per-run compaction batch bound. */
+  | "BATCH_LIMIT";
 
 /** Base class for every error this package raises. */
 export class CompactionError extends Error {
@@ -108,5 +112,42 @@ export class DuplicateDivergenceError extends CompactionError {
 export class RetentionGuardError extends CompactionError {
   constructor(message: string, details: Readonly<Record<string, unknown>> = {}) {
     super("RETENTION_GUARD", message, details);
+  }
+}
+
+/**
+ * Verified segments span more than one gateway epoch.
+ *
+ * A gateway epoch is an identity, not a timestamp: `wal-format.md` §4 gives
+ * `segmentIndex` per-directory meaning *within* an epoch and defines no
+ * ordering between epochs, and an epoch UUID's lexical order says nothing
+ * about which epoch came first. §8.4 requires replay to consume recorded
+ * dispatch order, so a compactor that invented a cross-epoch chronology —
+ * lexical, mtime-based, or otherwise — would fabricate exactly the ordering
+ * replay treats as ground truth. Until the WAL contract defines cross-epoch
+ * chronology, a mixed-epoch input is refused whole: the caller may compact one
+ * epoch at a time by passing `segmentIds`.
+ */
+export class CrossEpochOrderError extends CompactionError {
+  constructor(message: string, details: Readonly<Record<string, unknown>> = {}) {
+    super("CROSS_EPOCH_ORDER", message, details);
+  }
+}
+
+/**
+ * The candidate segments exceed `maxTotalBatchBytes`.
+ *
+ * The compactor holds every verified segment's records in memory for the whole
+ * run (dispatch ordinals and deduplication span segments), so its resident set
+ * is bounded by the total bytes of the batch, not by one segment. The bound is
+ * enforced *before* any segment is read, and exceeding it refuses the run
+ * rather than degrading it: nothing is uploaded, nothing is deleted, and the
+ * WAL is untouched — the ADR-004 failure direction. The caller compacts in
+ * bounded batches by passing `segmentIds` subsets, or raises the bound
+ * deliberately.
+ */
+export class CompactionBatchLimitError extends CompactionError {
+  constructor(message: string, details: Readonly<Record<string, unknown>> = {}) {
+    super("BATCH_LIMIT", message, details);
   }
 }
