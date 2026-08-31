@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { SettlementSpecValidationError } from "./errors.js";
 import {
   RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24,
+  WHOLE_FIELD_FAMILY_MAX_TAIL_TOKENS,
   isReviewedSettlementSpec,
   parseSettlementSpec,
   placeholderRuleTextReason,
@@ -189,7 +190,20 @@ describe("SettlementSpecSchema", () => {
     });
 
     it("reassembles a marker split by non-ASCII characters instead of laundering it", () => {
-      expect(placeholderRuleTextReason("tb\u00add - complete after review")).toContain(
+      // Expectation UPDATED in round 4 (annotated per the round-1 precedent):
+      // the soft hyphen becomes whitespace under normalization, so the new
+      // (strictly earlier) whitespace-split marker rule now catches this
+      // sample on the plain candidate. The refusal itself is unchanged and
+      // still pinned at both gates via the shared fixtures; the stripping
+      // layer keeps its own dedicated pin below.
+      expect(placeholderRuleTextReason("tb\u00add - complete after review")).toContain("tbd");
+    });
+
+    it("still reaches the stripping layer for a non-ASCII-split PREFIX form", () => {
+      // Round-4 pin: no whitespace/join rule reassembles a split multi-word
+      // prefix, so only the non-ASCII-stripping candidate catches this \u2014 the
+      // stripping layer stays mutation-visible after the round-4 rules landed.
+      expect(placeholderRuleTextReason("unspec\u00adified complete later")).toContain(
         "stripping non-ASCII",
       );
     });
@@ -284,6 +298,110 @@ describe("SettlementSpecSchema", () => {
       ).toBeUndefined();
       expect(
         placeholderRuleTextReason("To do so, the operator must first halt the series."),
+      ).toBeUndefined();
+    });
+  });
+
+  // Round-4 review, M-1 and M-2: pin WHICH rule catches each newly closed
+  // class and which boundary each new rule must not cross, so a refactor
+  // cannot silently shift a class onto a narrower rule or widen a rule past
+  // its pinned boundary.
+  describe("placeholderRuleTextReason round-4 rules (M-1, M-2)", () => {
+    it("refuses a marker split across whitespace at any position (reviewer probe)", () => {
+      expect(placeholderRuleTextReason("Policy TO DO later.")).toContain("split across whitespace");
+      expect(placeholderRuleTextReason("Policy TO DO later.")).toContain("todo");
+      expect(placeholderRuleTextReason("Policy is TO DO.")).toContain("split across whitespace");
+    });
+
+    it("refuses a field-start split marker with a non-grammatical tail", () => {
+      expect(placeholderRuleTextReason("TO DO: confirm with ops")).toContain(
+        "split across whitespace",
+      );
+      expect(placeholderRuleTextReason("to do later")).toContain("split across whitespace");
+    });
+
+    it("refuses the split-fixme adjacency as self-announcing (deliberate call)", () => {
+      expect(placeholderRuleTextReason("fix me before launch")).toContain("fixme");
+    });
+
+    it("joins split fragments of mixed lengths and digit substitutions", () => {
+      expect(placeholderRuleTextReason("to d o later")).toContain("todo");
+      expect(placeholderRuleTextReason("place holder")).toContain("placeholder");
+      expect(placeholderRuleTextReason("f1x me before launch")).toContain("fixme");
+    });
+
+    it("exempts only the grammatical To-do opener, at field start, with a clause", () => {
+      expect(
+        placeholderRuleTextReason("To do so, the operator must first halt the series."),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason(
+          "To do this correctly, the operator halts the series before any settlement.",
+        ),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("To do that, escalate to the operator and halt the series first."),
+      ).toBeUndefined();
+      // The exemption's own boundary: a bare opener with nothing after the
+      // continuation word, a digit-substituted opener, and a mid-sentence
+      // marker all refuse.
+      expect(placeholderRuleTextReason("to do so")).toContain("split across whitespace");
+      expect(placeholderRuleTextReason("t0 d0 so later")).toContain("todo");
+      expect(placeholderRuleTextReason("Policy is TO DO.")).toContain("todo");
+    });
+
+    it("refuses a whole-field entry split by whitespace (condensed rule)", () => {
+      expect(placeholderRuleTextReason("un known")).toContain("ignoring whitespace");
+      expect(placeholderRuleTextReason("un known")).toContain("unknown");
+    });
+
+    it("refuses the whole-field unfinished families regardless of the tail (reviewer probes)", () => {
+      expect(placeholderRuleTextReason("pending legal review")).toContain(
+        "unfinished-form family",
+      );
+      expect(placeholderRuleTextReason("awaiting input")).toContain("unfinished-form family");
+      expect(placeholderRuleTextReason("pending outside counsel signoff")).toContain(
+        "unfinished-form family",
+      );
+      expect(placeholderRuleTextReason("not yet drafted")).toContain("unfinished-form family");
+      expect(placeholderRuleTextReason("to be agreed")).toContain("unfinished-form family");
+      expect(placeholderRuleTextReason("yet to be agreed")).toContain("unfinished-form family");
+    });
+
+    it("refuses the conventional unfinished-field entries (reviewer probe)", () => {
+      expect(placeholderRuleTextReason("intentionally left blank")).toContain(
+        "intentionally left blank",
+      );
+      expect(placeholderRuleTextReason("left blank")).toContain("left blank");
+      expect(placeholderRuleTextReason("see attached")).toContain("see attached");
+    });
+
+    it("bounds the family at four trailing tokens (the documented residual)", () => {
+      expect(WHOLE_FIELD_FAMILY_MAX_TAIL_TOKENS).toBe(4);
+      // head + 4 refuses; head + 5 passes the family rule (an honestly
+      // disclosed residual, defended by the human verified_by gate — NOT a
+      // claim that such text is a rule).
+      expect(placeholderRuleTextReason("pending legal review and signoff")).toContain(
+        "unfinished-form family",
+      );
+      expect(
+        placeholderRuleTextReason("pending review by outside counsel signoff"),
+      ).toBeUndefined();
+    });
+
+    it("keeps long head-opened sentences past the family bound (whole-field only)", () => {
+      expect(
+        placeholderRuleTextReason(
+          "Awaiting venue confirmation, the operator holds settlement open and escalates within 24h.",
+        ),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason(
+          "Not yet resolved markets are held open and escalated to the operator after 48 hours.",
+        ),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("Pending completion of the dispute review, no position is settled."),
       ).toBeUndefined();
     });
   });

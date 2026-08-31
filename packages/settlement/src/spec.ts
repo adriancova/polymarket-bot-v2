@@ -87,7 +87,13 @@ import {
  * whitespace-delimited span are joined whatever their lengths
  * ({@link joinedTokenSpans}) — and its digit folds were enumerative, so
  * `"TB0"` slipped through — now a digit in a mixed letter+digit token stands
- * for ANY letter when testing marker equality ({@link tokenMatchesMarker})).
+ * for ANY letter when testing marker equality ({@link tokenMatchesMarker});
+ * and again in round 4: markers split across WHITESPACE (`"TO DO"`) and
+ * whole-field unfinished-form FAMILIES (`"pending legal review"`) both
+ * slipped through — now adjacent tokens are joined and tested against the
+ * marker list at any position ({@link whitespaceJoinedMarkerReason}), and a
+ * whole field opening with a family head refuses regardless of its tail
+ * ({@link wholeFieldFamilyReason})).
  * The value is first put through the Unicode gate of
  * {@link placeholderRuleTextReason} (NFKC, mixed-script refusal, confusable
  * folding, non-ASCII stripping — the exact rule is documented there), and each
@@ -101,15 +107,32 @@ import {
  * 2. the normalized form EQUALS one of {@link PLACEHOLDER_RULE_TEXTS} (so
  *    `"N / A"`, `"n/a"` and `"n.a."` all normalize to `"n a"` / `"n a"` forms
  *    listed below); or
- * 3. the normalized form STARTS WITH one of {@link PLACEHOLDER_RULE_PREFIXES}
+ * 3. the normalized form, with ALL whitespace removed, equals a listed entry
+ *    with its whitespace removed (round 4: `"un known"` → `"unknown"`,
+ *    `"pend ing"` → `"pending"` — a whole-field entry cannot be revived by
+ *    splitting it, whatever the split points); or
+ * 4. the normalized form is a whole-field UNFINISHED-FORM FAMILY — it opens
+ *    with `pending`, `awaiting`, `not yet`, `yet to be`, or `to be` and
+ *    carries at most {@link WHOLE_FIELD_FAMILY_MAX_TAIL_TOKENS} further
+ *    tokens (round 4: `"pending legal review"`, `"awaiting input"` refuse
+ *    REGARDLESS of the tail's content; the exact bound and its rationale are
+ *    documented on {@link wholeFieldFamilyReason}); or
+ * 5. the normalized form STARTS WITH one of {@link PLACEHOLDER_RULE_PREFIXES}
  *    followed by more text (`"TBD - complete after review"` → `"tbd complete
  *    after review"`): a rule that opens by declaring itself undetermined is
  *    not a rule, whatever follows; or
- * 4. ANY whitespace-delimited token of the normalized form equals one of
+ * 6. ANY whitespace-delimited token of the normalized form equals one of
  *    {@link PLACEHOLDER_MARKER_TOKENS} (round 2: `"Use primary source; TBD -
  *    complete after review."` is poisoned by the marker wherever it sits),
  *    including after folding digit-for-letter substitutions inside a token
- *    (`"T0D0"` → `"todo"`).
+ *    (`"T0D0"` → `"todo"`); or
+ * 7. ANY run of ADJACENT tokens, concatenated, matches one of
+ *    {@link PLACEHOLDER_MARKER_TOKENS} under the same digit-wildcard rule
+ *    (round 4: `"Policy TO DO later."`, `"fix me before launch"`,
+ *    `"to d o later"` — a marker split across whitespace announces
+ *    unfinishedness exactly as its joined form does), EXCEPT the one
+ *    grammatical opener documented on {@link whitespaceJoinedMarkerReason}
+ *    ("To do so/this/that, …" at field start).
  *
  * The prefix list is deliberately narrower than the exact list: `"none"`,
  * `"unknown"`, `"nil"` and `"null"` legitimately BEGIN real policy sentences
@@ -271,6 +294,30 @@ export const PLACEHOLDER_RULE_TEXTS: readonly string[] = Object.freeze([
   "to come",
   "more to come",
   "details later",
+  // Round-4 additions (review finding M-2): the conventional unfinished-field
+  // entries. `pending legal review`, `awaiting input` and every other
+  // `pending <X>` / `awaiting <X>` / `not yet <X>` / `yet to be <X>` /
+  // `to be <X>` short form are refused by the FAMILY rule
+  // ({@link wholeFieldFamilyReason}) rather than enumerated here; these are
+  // the conventional entries outside those families. Whole-field ONLY.
+  "intentionally left blank",
+  "intentionally blank",
+  "deliberately left blank",
+  "left blank",
+  "page intentionally left blank",
+  "this page intentionally left blank",
+  "this section intentionally left blank",
+  "same as below",
+  "as above",
+  "as below",
+  "see attached",
+  "see previous",
+  "refer above",
+  "refer below",
+  "ditto",
+  "nothing here",
+  "nothing yet",
+  "no content",
 ]);
 
 /**
@@ -330,6 +377,54 @@ export const PLACEHOLDER_MARKER_TOKENS: readonly string[] = Object.freeze([
   "lorem",
   "ipsum",
 ]);
+
+/** The longest marker; adjacent-token joins never need to grow past it. */
+const MAX_MARKER_LENGTH = Math.max(...PLACEHOLDER_MARKER_TOKENS.map((marker) => marker.length));
+
+/**
+ * Every {@link PLACEHOLDER_RULE_TEXTS} entry with its whitespace removed,
+ * mapped back to the entry (round-4 review, M-1 sibling class): a whole-field
+ * entry cannot be revived by splitting it with whitespace (`"un known"`,
+ * `"pend ing"`, `"to be de termined"`), because the whole field with ALL
+ * spaces removed is compared against the entries with THEIR spaces removed.
+ * Whole-field only — this rule never fires mid-sentence.
+ */
+const CONDENSED_PLACEHOLDER_RULE_TEXTS: ReadonlyMap<string, string> = new Map(
+  PLACEHOLDER_RULE_TEXTS.map((entry) => [entry.split(" ").join(""), entry] as const),
+);
+
+/**
+ * Whole-field unfinished-form FAMILY heads (round-4 review, M-2).
+ *
+ * Round 3's `pending X` / `to be X` coverage was enumerative on X, and the
+ * round-4 reviewer revived the family with `"pending legal review"` and
+ * `"awaiting input"`. These heads now refuse as a FAMILY: a whole field that
+ * opens with one of them and carries at most
+ * {@link WHOLE_FIELD_FAMILY_MAX_TAIL_TOKENS} further tokens refuses
+ * REGARDLESS of what the tail says. See {@link wholeFieldFamilyReason} for
+ * the bound and its rationale. Order: longer heads first, so `"yet to be"`
+ * is reported as its own family rather than falling through.
+ */
+export const PLACEHOLDER_WHOLE_FIELD_FAMILY_HEADS: readonly (readonly string[])[] = Object.freeze([
+  Object.freeze(["yet", "to", "be"]),
+  Object.freeze(["not", "yet"]),
+  Object.freeze(["to", "be"]),
+  Object.freeze(["pending"]),
+  Object.freeze(["awaiting"]),
+]);
+
+/**
+ * How many tokens may follow a family head before the field stops being a
+ * bare unfinished-state fragment (see {@link wholeFieldFamilyReason}).
+ */
+export const WHOLE_FIELD_FAMILY_MAX_TAIL_TOKENS = 4;
+
+/**
+ * The one exemption to the whitespace-split marker rule
+ * ({@link whitespaceJoinedMarkerReason}): the English infinitive-purpose
+ * opener "To do so/this/that, <clause>". Deliberately closed and tiny.
+ */
+const TODO_OPENER_CONTINUATIONS: ReadonlySet<string> = new Set(["so", "this", "that"]);
 
 /**
  * Digit-for-letter substitutions folded inside a token, so `"n0ne"` cannot
@@ -590,7 +685,108 @@ function tokenMatchesMarker(token: string, marker: string): boolean {
 }
 
 /**
- * Runs the ASCII placeholder rules (whole-field, prefix, any-position marker,
+ * Whether the whole field is a bare unfinished-state fragment of a known
+ * FAMILY: it opens with a family head (`pending`, `awaiting`, `not yet`,
+ * `yet to be`, `to be`) and carries at most
+ * {@link WHOLE_FIELD_FAMILY_MAX_TAIL_TOKENS} further tokens — refused
+ * REGARDLESS of what the tail says (round-4 review, M-2: round 3 enumerated
+ * the tails, and `"pending legal review"` / `"awaiting input"` revived the
+ * family).
+ *
+ * THE BOUND, exactly: head + 0..4 tail tokens refuses; head + 5 or more
+ * passes this rule. Rationale: a real policy STATES an action or
+ * consequence, and every legitimate sample in this repository that opens
+ * with such a head is a full sentence well past the bound ("Pending
+ * completion of the dispute review, no position is settled." — head + 9 —
+ * stays accepted, pinned at both gates). A short head-opened fragment
+ * ("pending legal review", "awaiting input", "to be agreed") names a
+ * waiting state and no rule. The bound is deliberately a token count, not a
+ * grammar judgment: a legitimate SHORT head-opened policy ("Pending
+ * disputes halt settlement.") is a false refusal, accepted as directional
+ * (recoverable at review time), and a NOVEL unfinished phrase padded past
+ * the bound ("pending review by outside counsel signoff") passes this rule
+ * — that residual is disclosed, not claimed away; the human `verified_by`
+ * gate remains the real defense.
+ */
+function wholeFieldFamilyReason(form: string): string | undefined {
+  const tokens = form.split(" ");
+  for (const head of PLACEHOLDER_WHOLE_FIELD_FAMILY_HEADS) {
+    if (
+      tokens.length >= head.length &&
+      tokens.length <= head.length + WHOLE_FIELD_FAMILY_MAX_TAIL_TOKENS &&
+      head.every((word, index) => tokens[index] === word)
+    ) {
+      return `is a whole-field unfinished-form family "${head.join(" ")} …" (${String(tokens.length - head.length)} trailing tokens; a bare waiting state, not a rule)`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * A {@link PLACEHOLDER_MARKER_TOKENS} marker split across WHITESPACE, at any
+ * token position, or `undefined` (round-4 review, M-1: `"Policy TO DO
+ * later."` — {@link joinedTokenSpans} joins punctuation-separated segments
+ * WITHIN one whitespace span, and {@link joinedSingleLetterRuns} joins
+ * single-letter runs, so multi-letter fragments split across whitespace were
+ * never joined).
+ *
+ * THE RULE, exactly: every run of 2 or more ADJACENT tokens whose
+ * concatenation is no longer than the longest marker is tested against the
+ * marker list with {@link tokenMatchesMarker} (so digit substitution inside
+ * the split fragments — `"f1x me"` — is also caught). A match refuses at ANY
+ * position, with exactly ONE exemption, the English infinitive-purpose
+ * opener: the literal tokens `to do` AT FIELD START, immediately followed by
+ * a grammatical continuation of the phrase (`so`, `this`, `that`) with at
+ * least one further token after it — "To do so, the operator must first
+ * halt the series." states a procedure and is pinned as accepted. The
+ * exemption is deliberately that narrow: it requires the exact letters
+ * (`t0 d0 so …` is not grammar), the field-start position (mid-sentence
+ * "… is TO DO …" always refuses, and the false refusal of mid-sentence
+ * "… fails to do so …" is accepted as directional), and a continuation
+ * (`"TO DO"`, `"to do later"`, `"to do so"` bare all refuse). A field-start
+ * split marker with any OTHER tail (`"TO DO: confirm with ops"`) refuses
+ * through this same rule.
+ *
+ * DELIBERATE CALL (round-4 packet): `"fix me"` split across whitespace IS
+ * self-announcing and refuses at any position. Inside a settlement policy
+ * field the adjacency has no legitimate reading — "Please fix me a report"
+ * is not settlement prose — and a false refusal is recoverable at review
+ * time, while a live editor marker reaching `REVIEWED_MODEL_BACKED` is not.
+ */
+function whitespaceJoinedMarkerReason(form: string): string | undefined {
+  const tokens = form.split(" ");
+  for (let start = 0; start < tokens.length - 1; start += 1) {
+    let joined = tokens[start] ?? "";
+    for (let end = start + 1; end < tokens.length; end += 1) {
+      joined += tokens[end] ?? "";
+      if (joined.length > MAX_MARKER_LENGTH) {
+        break;
+      }
+      for (const marker of PLACEHOLDER_MARKER_TOKENS) {
+        if (!tokenMatchesMarker(joined, marker)) {
+          continue;
+        }
+        const isGrammaticalTodoOpener =
+          marker === "todo" &&
+          start === 0 &&
+          end === 1 &&
+          tokens[0] === "to" &&
+          tokens[1] === "do" &&
+          tokens.length > 3 &&
+          TODO_OPENER_CONTINUATIONS.has(tokens[2] ?? "");
+        if (isGrammaticalTodoOpener) {
+          continue;
+        }
+        return `contains the placeholder marker "${marker}" split across whitespace`;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Runs the ASCII placeholder rules (whole-field, condensed whole-field,
+ * whole-field family, prefix, any-position marker, whitespace-split marker,
  * digit folds) over one candidate string. `undefined` when nothing matched.
  */
 function asciiPlaceholderReason(candidate: string): string | undefined {
@@ -613,6 +809,14 @@ function asciiPlaceholderReason(candidate: string): string | undefined {
     if (PLACEHOLDER_RULE_TEXTS.includes(form)) {
       return `normalizes to the placeholder "${form}"`;
     }
+    const condensedEntry = CONDENSED_PLACEHOLDER_RULE_TEXTS.get(form.split(" ").join(""));
+    if (condensedEntry !== undefined) {
+      return `normalizes (ignoring whitespace) to the placeholder "${condensedEntry}"`;
+    }
+    const familyReason = wholeFieldFamilyReason(form);
+    if (familyReason !== undefined) {
+      return familyReason;
+    }
     for (const prefix of PLACEHOLDER_RULE_PREFIXES) {
       if (form === prefix || form.startsWith(`${prefix} `)) {
         return `begins with the placeholder marker "${prefix}"`;
@@ -624,6 +828,10 @@ function asciiPlaceholderReason(candidate: string): string | undefined {
           return `contains the self-announcing placeholder marker "${marker}"`;
         }
       }
+    }
+    const splitMarkerReason = whitespaceJoinedMarkerReason(form);
+    if (splitMarkerReason !== undefined) {
+      return splitMarkerReason;
     }
   }
   return undefined;

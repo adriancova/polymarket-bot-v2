@@ -74,6 +74,31 @@ export const PLACEHOLDER_POLICY_ATTACK_SAMPLES: readonly string[] = Object.freez
   "W.IP: finalize escalation matrix", // dotted marker, 1+2-letter segments (joined token spans)
   "F1X.ME later", // dotted AND digit-substituted marker (joined spans + wildcard/fold)
   "τβδ; use primary source.", // Greek δ unmapped (post-fold non-Latin refusal)
+  // --- Round-4 reviewer probes, verbatim (each reproduced as a live bypass
+  // --- at the round-4 candidate 5ef6c31 before being pinned here; `TO DO`
+  // --- already refused there via the round-3 whole-field entry and is pinned
+  // --- as a required round-4 fixture).
+  "Policy TO DO later.", // r4 M-1: marker split across whitespace, mid-sentence
+  "pending legal review", // r4 M-2: whole-field "pending <anything>" family
+  "awaiting input", // r4 M-2: whole-field "awaiting <anything>" family
+  "intentionally left blank", // r4 M-2: conventional unfinished-field entry
+  // --- Round-4 required fixtures and class-mates. ---
+  "TO DO", // whole-field split marker (whole-field entry + split-marker rule)
+  "TO DO: confirm with ops", // field-start split marker with a non-grammatical tail
+  "Policy is TO DO.", // split marker at field end
+  "to do later", // field-start split marker, no grammatical continuation
+  "to do so", // bare opener with nothing after the continuation word
+  "fix me before launch", // split fixme — deliberately self-announcing (documented in spec.ts)
+  "to d o later", // mixed-length whitespace split of a marker
+  "place holder", // split marker pair
+  "un known", // whole-field entry split by whitespace (condensed whole-field rule)
+  "pending outside counsel signoff", // family: pending + 3 tail tokens
+  "awaiting final numbers", // family: awaiting + 2 tail tokens
+  "not yet drafted", // family: not yet + 1 tail token
+  "to be agreed", // family: to be + 1 tail token
+  "yet to be agreed", // family: yet to be + 1 tail token
+  "left blank", // conventional unfinished-field entry
+  "see attached", // conventional unfinished-field entry
 ]);
 
 /**
@@ -108,6 +133,14 @@ export const LEGITIMATE_POLICY_SAMPLES: readonly string[] = Object.freeze([
   "Ambiguous prints (e.g. crossed quotes) are excluded from the observation.",
   "The T+1 settlement convention applies; disputes escalate within 24h.",
   "Pending completion of the dispute review, no position is settled.",
+  // --- Round-4 boundary additions: the grammatical "To do so/this/that, …"
+  // --- opener survives the whitespace-split marker rule, and long
+  // --- head-opened SENTENCES survive the whole-field family bound.
+  "To do so, the operator must first halt the series.",
+  "To do this correctly, the operator halts the series before any settlement.",
+  "To do that, escalate to the operator and halt the series first.",
+  "Awaiting venue confirmation, the operator holds settlement open and escalates within 24h.",
+  "Not yet resolved markets are held open and escalated to the operator after 48 hours.",
 ]);
 
 const baseSpec = {
