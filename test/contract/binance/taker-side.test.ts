@@ -34,6 +34,7 @@ import {
 import { ReferenceTradeObservedPayloadSchema } from "@polymarket-bot/domain";
 import { describe, expect, it } from "vitest";
 
+import { ruledSideForBinanceFlagIn } from "./adr014-ruling.js";
 import { frameText, framesFixture } from "./fixtures.js";
 import { createHarness, deliver, open } from "./support.js";
 
@@ -67,17 +68,18 @@ function sideNamingATakerWhoWas(action: "buying" | "selling"): string {
   return side;
 }
 
-/** §3's Binance row: the mapping the ADR derives from the documented `m`. */
+/**
+ * §3's Binance row: the mapping the ADR derives from the documented `m`.
+ *
+ * Parsed by `./adr014-ruling.ts`, which reads ONLY the span between the
+ * `### 3` and `### 4` headings and requires exactly one row there stating both
+ * arms. The first version of this suite searched the whole document and, when
+ * review round 1 reworded or reformatted the real §3 row, silently fell
+ * through to the wording's historical duplicates in §7 — see
+ * `adr014-ruling.test.ts`, where those probes are pinned permanently.
+ */
 function ruledSideForBinanceFlag(buyerIsMaker: boolean): string {
-  const pattern = new RegExp(String.raw`\x60m = ${String(buyerIsMaker)} → (BID|ASK)\x60`, "u");
-  const match = pattern.exec(ADR_014);
-  const side = match?.[1];
-  if (side === undefined) {
-    throw new Error(
-      `ADR-014 §3 no longer states a mapping for Binance's m = ${String(buyerIsMaker)}`,
-    );
-  }
-  return side;
+  return ruledSideForBinanceFlagIn(ADR_014, buyerIsMaker);
 }
 
 const DOCUMENTED_BUYER_IS_MAKER = framesFixture("trade-documented");
