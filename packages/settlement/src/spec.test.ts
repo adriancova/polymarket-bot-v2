@@ -215,6 +215,79 @@ describe("SettlementSpecSchema", () => {
     });
   });
 
+  // Round-3 review, M1: pin WHICH rule catches each newly closed class, so a
+  // refactor cannot silently shift a class onto a different (and possibly
+  // narrower) rule without this suite noticing.
+  describe("placeholderRuleTextReason round-3 rules (M1)", () => {
+    it("joins multi-letter dotted segments within one span (TO.DO)", () => {
+      expect(placeholderRuleTextReason("TO.DO: confirm with ops")).toContain("todo");
+    });
+
+    it("joins multi-letter dotted segments within one span (FI.XME)", () => {
+      expect(placeholderRuleTextReason("FI.XME before launch")).toContain("fixme");
+    });
+
+    it("joins dotted segments of mixed lengths within one span (W.IP)", () => {
+      expect(placeholderRuleTextReason("W.IP: finalize escalation matrix")).toContain("wip");
+    });
+
+    it("refuses a Greek token left partially non-Latin after folding (lunate sigma)", () => {
+      expect(placeholderRuleTextReason("τβϲ; use primary source.")).toContain(
+        "after folding known homoglyphs",
+      );
+    });
+
+    it("refuses a Cyrillic token left partially non-Latin after folding (д)", () => {
+      expect(placeholderRuleTextReason("ТВД; use primary source.")).toContain(
+        "after folding known homoglyphs",
+      );
+    });
+
+    it("treats a digit in a marker-length token as a stand-in for any letter (TB0)", () => {
+      expect(placeholderRuleTextReason("TB0")).toContain("tbd");
+    });
+
+    it("catches a marker that is both dotted and digit-substituted (F1X.ME)", () => {
+      expect(placeholderRuleTextReason("F1X.ME later")).toContain("fixme");
+    });
+
+    it("keeps accented Latin out of the post-fold non-Latin refusal", () => {
+      expect(
+        placeholderRuleTextReason("A naïve reading of the rules is escalated for human review."),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("Résolution follows the venue's published procedure."),
+      ).toBeUndefined();
+    });
+
+    it("keeps ordinary words containing marker substrings at token boundaries", () => {
+      expect(
+        placeholderRuleTextReason("Mastodon announcements by the venue are not authoritative."),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("Autodial escalation is disabled; a human operator confirms."),
+      ).toBeUndefined();
+    });
+
+    it("keeps mixed letter+digit tokens whose letters match no marker", () => {
+      expect(
+        placeholderRuleTextReason("The T+1 settlement convention applies; escalate within 24h."),
+      ).toBeUndefined();
+    });
+
+    it("refuses the whole-field pending/to-do family, whole field only", () => {
+      expect(placeholderRuleTextReason("pending completion")).toContain("pending completion");
+      expect(placeholderRuleTextReason("to do")).toContain("to do");
+      expect(placeholderRuleTextReason("to be done")).toContain("to be done");
+      expect(
+        placeholderRuleTextReason("Pending completion of the dispute review, no position is settled."),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("To do so, the operator must first halt the series."),
+      ).toBeUndefined();
+    });
+  });
+
   it("refuses a clarification policy that states a placeholder", () => {
     const result = SettlementSpecSchema.safeParse({
       ...terminalSpotSpecSample(),

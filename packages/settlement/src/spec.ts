@@ -78,10 +78,16 @@ import {
  * not." A spec whose dispute policy reads `TBD` is not a reviewed artifact, and
  * a `not null` column cannot tell the difference — so the refusal lives here.
  *
- * MATCHING (tightened in remediation round 1, finding M1, and again in round 2:
+ * MATCHING (tightened in remediation round 1, finding M1; again in round 2:
  * round 1's normalization stripped non-ASCII characters and matched only whole
  * fields or prefixes, so `"pending review"`, `"fill me in"`, a
- * Cyrillic-lookalike `"ТВD - …"` and a mid-sentence `"…; TBD - …"` all passed).
+ * Cyrillic-lookalike `"ТВD - …"` and a mid-sentence `"…; TBD - …"` all passed;
+ * and again in round 3: round 2 joined only SINGLE-letter dotted segments, so
+ * `"TO.DO"`/`"FI.XME"` slipped through — now the alphanumeric segments of any
+ * whitespace-delimited span are joined whatever their lengths
+ * ({@link joinedTokenSpans}) — and its digit folds were enumerative, so
+ * `"TB0"` slipped through — now a digit in a mixed letter+digit token stands
+ * for ANY letter when testing marker equality ({@link tokenMatchesMarker})).
  * The value is first put through the Unicode gate of
  * {@link placeholderRuleTextReason} (NFKC, mixed-script refusal, confusable
  * folding, non-ASCII stripping — the exact rule is documented there), and each
@@ -221,6 +227,50 @@ export const PLACEHOLDER_RULE_TEXTS: readonly string[] = Object.freeze([
   "text here",
   "policy here",
   "content here",
+  // Round-3 additions (review finding M1, class (a)): whole-field forms of the
+  // "to do" / "to be done" / "pending X" / "not yet X" families. Whole-field
+  // ONLY, deliberately: "Pending completion of the review, halt all entries."
+  // and "To do so, the operator must halt." open real policy sentences, so
+  // none of these joins the prefix or marker lists.
+  "to do",
+  "to be done",
+  "to be written",
+  "to be added",
+  "to be filled",
+  "to be filled in",
+  "to be completed",
+  "to be reviewed",
+  "to be provided",
+  "to be supplied",
+  "to be finalized",
+  "to be finalised",
+  "yet to be determined",
+  "yet to be defined",
+  "yet to be decided",
+  "not yet determined",
+  "not yet defined",
+  "not yet decided",
+  "not yet specified",
+  "not yet written",
+  "not yet known",
+  "not yet available",
+  "not yet final",
+  "pending completion",
+  "pending definition",
+  "pending decision",
+  "pending determination",
+  "pending specification",
+  "pending confirmation",
+  "pending verification",
+  "pending finalization",
+  "pending input",
+  "pending content",
+  "pending update",
+  "details to follow",
+  "to follow",
+  "to come",
+  "more to come",
+  "details later",
 ]);
 
 /**
@@ -282,11 +332,16 @@ export const PLACEHOLDER_MARKER_TOKENS: readonly string[] = Object.freeze([
 ]);
 
 /**
- * Digit-for-letter substitutions folded inside a token before marker matching,
- * so `"T0D0"` and `"f1xme"` cannot dodge {@link PLACEHOLDER_MARKER_TOKENS} (and
- * `"n0ne"` cannot dodge the whole-field list). Two maps because `1` reads as
- * both `i` and `l`. Applied ONLY to tokens that mix letters and digits: a pure
- * number ("within 48 hours") is never touched.
+ * Digit-for-letter substitutions folded inside a token, so `"n0ne"` cannot
+ * dodge the WHOLE-FIELD list and `"t0 d0"` folds to `"to do"`. Two maps
+ * because `1` reads as both `i` and `l`. Applied ONLY to tokens that mix
+ * letters and digits: a pure number ("within 48 hours") is never touched.
+ *
+ * Since round 3 these folds carry the whole-field and prefix rules only;
+ * MARKER-token matching no longer depends on them, because
+ * {@link tokenMatchesMarker} treats any digit in a mixed token as a stand-in
+ * for any letter (the fold maps were enumerative — `"TB0"` dodged `0 → o`).
+ * The folds still run over every form for defense in depth.
  */
 const DIGIT_FOLDS: readonly Readonly<Record<string, string>>[] = [
   Object.freeze({ "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b", "9": "g" }),
@@ -297,8 +352,12 @@ const DIGIT_FOLDS: readonly Readonly<Record<string, string>>[] = [
  * Known single-character Unicode homoglyphs of ASCII letters (Cyrillic and
  * Greek), keyed by their LOWERCASE form. Deliberately a fixed, reviewable
  * table rather than a library: folding is used only to MATCH — a fold can
- * cause a refusal, never an acceptance — so an unmapped lookalike fails
- * closed through the mixed-script and stripped-form rules below.
+ * cause a refusal, never an acceptance — and the table's completeness is NOT
+ * load-bearing, because any letter still non-Latin AFTER the fold refuses the
+ * whole value ({@link unmappedNonLatinLetter}; round-3 review, M1c — the
+ * round-2 claim that the mixed-script and stripped-form rules covered
+ * unmapped lookalikes was wrong: stripping DELETED an unmapped marker while
+ * ASCII prose kept the field alive).
  */
 const CONFUSABLE_TO_ASCII: Readonly<Record<string, string>> = Object.freeze({
   // Cyrillic.
@@ -383,6 +442,38 @@ function joinedSingleLetterRuns(normalized: string): string {
   return output.join(" ");
 }
 
+/**
+ * Joins the alphanumeric segments of every WHITESPACE-DELIMITED span, so a
+ * marker split by punctuation inside one span matches its plain form whatever
+ * the segment lengths: `"TO.DO: confirm"` → `"todo confirm"`, `"FI.XME"` →
+ * `"fixme"`, `"fix.me"` → `"fixme"`, `"T.B.D."` → `"tbd"`.
+ *
+ * Round-3 review, M1 class (b): {@link joinedSingleLetterRuns} joined only
+ * runs of SINGLE-letter segments (`T.B.D.`), so a marker whose dotted
+ * segments were longer (`TO.DO`, `FI.XME`) slipped through. This form
+ * operates on the RAW candidate rather than the normalized form because
+ * normalization erases the span boundaries (a dot and a space both become
+ * one space): the dots in `"TO.DO"` mark ONE visual token, and its segments
+ * are joined; `"to do"` (two spans) is a separate, whole-field concern.
+ * Punctuation-only spans vanish, exactly as under normalization.
+ *
+ * Only printable-ASCII punctuation joins segments. A NON-ASCII separator
+ * (`"tb­d"`) is treated as a span boundary here, because reassembling
+ * text split by invisible characters is the stripped candidate's single
+ * responsibility in {@link placeholderRuleTextReason} — that candidate
+ * re-runs this joiner over the ASCII-only text and reassembles the marker
+ * there, keeping each layer's reason honest.
+ */
+function joinedTokenSpans(candidate: string): string {
+  return candidate
+    .toLowerCase()
+    .replace(NON_ASCII_PRINTABLE, " ")
+    .split(/\s+/u)
+    .map((span) => span.replace(/[^a-z0-9]+/gu, ""))
+    .filter((segment) => segment !== "")
+    .join(" ");
+}
+
 /** Folds digit-for-letter substitutions in every mixed letter+digit token of `form`. */
 function digitFoldedForm(form: string, fold: Readonly<Record<string, string>>): string {
   return form
@@ -440,6 +531,65 @@ function confusablesFolded(lower: string): string {
 }
 
 /**
+ * The first letter that is still non-Latin AFTER homoglyph folding, or
+ * `undefined`.
+ *
+ * Round-3 review, M1 class (c) — the STRUCTURAL rule that makes the fold
+ * table's completeness non-load-bearing. The round-2 pipeline ran the
+ * mixed-script check only BEFORE folding, so an originally single-script
+ * token (`"τβϲ"`) whose letters were only PARTIALLY mapped folded into a
+ * mixed token (`"tbϲ"`) that no rule ever re-examined; the stripping
+ * candidate then deleted the unmapped letters and the marker evaporated
+ * while the substantive ASCII suffix kept the field alive. After folding,
+ * a remaining non-Latin letter means one of exactly two things — an
+ * UNMAPPED confusable, or genuinely non-Latin content (which the matcher
+ * already treats as refusable when it is the whole value) — and BOTH refuse.
+ * Accented Latin (`é`, `ï`, `résolution`, `naïve`) is Latin script and is
+ * never touched by this rule.
+ */
+function unmappedNonLatinLetter(folded: string): string | undefined {
+  for (const char of folded) {
+    if (ANY_LETTER.test(char) && !LATIN_LETTER.test(char)) {
+      return char;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Whether `token` equals `marker`, treating each DIGIT in a mixed
+ * letter+digit token as a stand-in for any letter.
+ *
+ * Round-3 hardening (review note on class 4): the two fixed digit-fold maps
+ * were enumerative — `"TB0"` dodged them because `0` mapped only to `o` —
+ * and enumerating which letter each digit "looks like" re-fights the same
+ * losing battle as the homoglyph table. Structurally, a digit inside an
+ * otherwise-alphabetic token of marker length is a substitution by
+ * construction, so it may stand for ANY letter when testing marker
+ * equality. A pure-number token (`"48"`) never matches (no letter), every
+ * LETTER must still match exactly, and lengths must agree, so `"24h"`
+ * cannot match `"tbd"` and ordinary words are untouched.
+ */
+function tokenMatchesMarker(token: string, marker: string): boolean {
+  if (token === marker) {
+    return true;
+  }
+  if (token.length !== marker.length) {
+    return false;
+  }
+  if (!/[0-9]/u.test(token) || !/[a-z]/u.test(token)) {
+    return false;
+  }
+  for (let index = 0; index < token.length; index += 1) {
+    const char = token.charAt(index);
+    if (char !== marker.charAt(index) && !(char >= "0" && char <= "9")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Runs the ASCII placeholder rules (whole-field, prefix, any-position marker,
  * digit folds) over one candidate string. `undefined` when nothing matched.
  */
@@ -449,7 +599,11 @@ function asciiPlaceholderReason(candidate: string): string | undefined {
     return "contains no ASCII letters or digits (nothing that states a rule)";
   }
   const forms = new Set<string>();
-  for (const base of [normalized, joinedSingleLetterRuns(normalized)]) {
+  const bases = [normalized, joinedSingleLetterRuns(normalized), joinedTokenSpans(candidate)];
+  for (const base of bases) {
+    if (base === "") {
+      continue;
+    }
     forms.add(base);
     for (const fold of DIGIT_FOLDS) {
       forms.add(digitFoldedForm(base, fold));
@@ -465,8 +619,10 @@ function asciiPlaceholderReason(candidate: string): string | undefined {
       }
     }
     for (const token of form.split(" ")) {
-      if (PLACEHOLDER_MARKER_TOKENS.includes(token)) {
-        return `contains the self-announcing placeholder marker "${token}"`;
+      for (const marker of PLACEHOLDER_MARKER_TOKENS) {
+        if (tokenMatchesMarker(token, marker)) {
+          return `contains the self-announcing placeholder marker "${marker}"`;
+        }
       }
     }
   }
@@ -488,14 +644,22 @@ function asciiPlaceholderReason(candidate: string): string | undefined {
  * 2. Any token that mixes Latin with non-Latin letters is REFUSED outright
  *    (`"ТВD"`): mixed script inside a token is confusable by construction,
  *    and refusal — never silent normalization — is the only safe response.
- * 3. The ASCII rules then run over THREE candidates, refusing on any hit:
- *    the value itself; the value with every known Cyrillic/Greek homoglyph
- *    folded to its ASCII form ({@link CONFUSABLE_TO_ASCII}, so an all-Cyrillic
- *    `"ТВ…"` lookalike is read as what it visually spells); and the value with
- *    every non-printable-ASCII character REMOVED (so a marker split by
+ * 3. Every known Cyrillic/Greek homoglyph is folded to its ASCII form
+ *    ({@link CONFUSABLE_TO_ASCII}), and any letter that is STILL non-Latin
+ *    after the fold refuses the value outright (round-3 review, M1c
+ *    structural rule — see {@link unmappedNonLatinLetter}): a leftover
+ *    letter is either an unmapped confusable (`"τβϲ"` folding to `"tbϲ"`)
+ *    or genuinely non-Latin content, and both fail closed rather than being
+ *    stripped into acceptance. The fold table's completeness is therefore
+ *    not load-bearing: an unmapped lookalike is refused, never laundered.
+ * 4. The ASCII rules then run over THREE candidates, refusing on any hit:
+ *    the value itself; the homoglyph-folded value (so an all-Cyrillic
+ *    `"ТВ…"` lookalike is read as what it visually spells); and the value
+ *    with every non-printable-ASCII character REMOVED (so a marker split by
  *    zero-width or soft-hyphen characters — `"tb­d"` — reassembles into
- *    the form it was hiding).
- * 4. A value with NO readable ASCII content at all is refused by the
+ *    the form it was hiding; after rule 3, stripping can only remove
+ *    NON-LETTER characters, so it can no longer delete an unmapped marker).
+ * 5. A value with NO readable ASCII content at all is refused by the
  *    empty-normalization rule. When in doubt this matcher REFUSES: a false
  *    refusal of legitimate policy text is recoverable at review time; a
  *    placeholder reaching `REVIEWED_MODEL_BACKED` is not.
@@ -509,9 +673,15 @@ export function placeholderRuleTextReason(value: string): string | undefined {
   }
 
   const lower = canonical.toLowerCase();
+  const folded = confusablesFolded(lower);
+  const leftover = unmappedNonLatinLetter(folded);
+  if (leftover !== undefined) {
+    return `contains the non-Latin letter "${leftover}" after folding known homoglyphs to ASCII (an unmapped confusable or non-Latin content; refused rather than stripped)`;
+  }
+
   const candidates: readonly (readonly [string, string])[] = [
     [lower, ""],
-    [confusablesFolded(lower), " after folding Unicode homoglyphs to ASCII"],
+    [folded, " after folding Unicode homoglyphs to ASCII"],
     [lower.replace(NON_ASCII_PRINTABLE, ""), " after stripping non-ASCII characters"],
   ];
   for (const [candidate, how] of candidates) {

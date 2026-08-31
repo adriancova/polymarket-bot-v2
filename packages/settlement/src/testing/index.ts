@@ -30,9 +30,11 @@ export const SAMPLE_RULES_VERSION_ID = "01936f00-0000-7000-8000-00000000b001";
  * suites to pin the identical list, so it lives here rather than in either
  * test file).
  *
- * The first four are the round-2 reviewer probes, verbatim. The rest are this
- * remediation's added attack cases, each annotated with the matcher rule that
- * catches it.
+ * The first four are the round-2 reviewer probes, verbatim. The next block is
+ * round 2's added attack cases, each annotated with the matcher rule that
+ * catches it. The final block is the round-3 reviewer probes (verbatim) plus
+ * that round's class-mates — every entry was REPRODUCED as a live bypass at
+ * the round-3 candidate (59273bc) before being pinned here.
  */
 export const PLACEHOLDER_POLICY_ATTACK_SAMPLES: readonly string[] = Object.freeze([
   "pending review", // reviewer probe: whole-field common phrase
@@ -57,6 +59,21 @@ export const PLACEHOLDER_POLICY_ATTACK_SAMPLES: readonly string[] = Object.freez
   "fill in later",
   "insert policy here",
   "complete after review",
+  // --- Round-3 reviewer probes, verbatim. ---
+  "pending completion", // r3 probe 1: whole-field "pending X" form
+  "to do", // r3 probe 1: whole-field form
+  "TO.DO: confirm with ops", // r3 probe 2: multi-letter dotted segments (joined token spans)
+  "FI.XME before launch", // r3 probe 2: multi-letter dotted segments (joined token spans)
+  "τβϲ; use primary source.", // r3 probe 3: Greek, lunate sigma ϲ unmapped (post-fold non-Latin refusal)
+  "ТВД; use primary source.", // r3 probe 3: Cyrillic, д unmapped (post-fold non-Latin refusal)
+  "TB0", // r3 note 4: a digit stands in for any letter (marker wildcard)
+  // --- Round-3 class-mates (each reproduced as a live bypass at the candidate). ---
+  "to be done", // whole-field "to be X" form
+  "pending definition", // whole-field "pending X" form
+  "fix.me before launch", // dotted marker, lowercase multi-letter segments (joined token spans)
+  "W.IP: finalize escalation matrix", // dotted marker, 1+2-letter segments (joined token spans)
+  "F1X.ME later", // dotted AND digit-substituted marker (joined spans + wildcard/fold)
+  "τβδ; use primary source.", // Greek δ unmapped (post-fold non-Latin refusal)
 ]);
 
 /**
@@ -65,6 +82,12 @@ export const PLACEHOLDER_POLICY_ATTACK_SAMPLES: readonly string[] = Object.freez
  * `None`/`Unknown`/`Pending`/`In progress`/`draft`-adjacent words, carry
  * accented Latin, or contain letter+digit tokens. A matcher change that
  * refuses any of these is over-broad.
+ *
+ * Round-3 additions pin the boundaries of that round's structural rules:
+ * accented Latin survives the post-fold non-Latin refusal (Latin script is
+ * never "leftover"); ordinary words CONTAINING a marker substring survive the
+ * token-boundary rule; dotted clause numbers and `e.g.` survive the joined
+ * token spans; and `T+1` / `24h` survive the digit-wildcard marker matching.
  */
 export const LEGITIMATE_POLICY_SAMPLES: readonly string[] = Object.freeze([
   "Halt and escalate to the operator; no substitute source is used.",
@@ -77,6 +100,14 @@ export const LEGITIMATE_POLICY_SAMPLES: readonly string[] = Object.freeze([
   "Reviews complete within 24h; disputes escalate to the operator.",
   "In progress disputes halt settlement until the venue publishes an outcome.",
   "The draft resolution proposed by UMA is not final until the vote completes.",
+  // --- Round-3 boundary additions. ---
+  "A naïve reading of the rules is escalated to the operator for human review.",
+  "Mastodon announcements by the venue are not authoritative for settlement.",
+  "Autodial escalation is disabled; a human operator confirms every halt.",
+  "Escalate per §4.2.1 of the venue procedure; halt on any doubt.",
+  "Ambiguous prints (e.g. crossed quotes) are excluded from the observation.",
+  "The T+1 settlement convention applies; disputes escalate within 24h.",
+  "Pending completion of the dispute review, no position is settled.",
 ]);
 
 const baseSpec = {
