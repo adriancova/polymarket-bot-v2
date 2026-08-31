@@ -77,30 +77,159 @@ import {
  * ADR-009 §5.4: "'Halt and escalate' is a legitimate policy; 'unspecified' is
  * not." A spec whose dispute policy reads `TBD` is not a reviewed artifact, and
  * a `not null` column cannot tell the difference — so the refusal lives here.
- * Compared case-insensitively after trimming; punctuation-only values are
- * included because `-` and `?` are the two most common ways to fill a required
- * field with nothing.
+ *
+ * MATCHING (tightened in remediation round 1, finding M1: exact-string matching
+ * let `"TBD - complete after review"`, `"to be determined"`, `"???"`,
+ * `"not specified"` and `"N / A"` through). A candidate value is NORMALIZED —
+ * lowercased, every run of non-alphanumeric characters collapsed to a single
+ * space, then trimmed — and refused when:
+ *
+ * 1. the normalized form is EMPTY (the value was punctuation-only: `"???"`,
+ *    `"-"`, `"..."`); or
+ * 2. the normalized form EQUALS one of {@link PLACEHOLDER_RULE_TEXTS} (so
+ *    `"N / A"`, `"n/a"` and `"n.a."` all normalize to `"n a"` / `"n a"` forms
+ *    listed below); or
+ * 3. the normalized form STARTS WITH one of {@link PLACEHOLDER_RULE_PREFIXES}
+ *    followed by more text (`"TBD - complete after review"` → `"tbd complete
+ *    after review"`): a rule that opens by declaring itself undetermined is
+ *    not a rule, whatever follows.
+ *
+ * The prefix list is deliberately narrower than the exact list: `"none"`,
+ * `"unknown"`, `"nil"` and `"null"` legitimately BEGIN real policy sentences
+ * ("None of the fallback sources may be used; halt."), so they refuse only as
+ * the entire (normalized) value.
  */
 export const PLACEHOLDER_RULE_TEXTS: readonly string[] = Object.freeze([
-  "-",
-  "--",
-  "?",
-  "??",
-  ".",
-  "n/a",
+  "n a",
   "na",
   "none",
   "nil",
   "null",
   "placeholder",
+  "pending",
+  "later",
+  "missing",
   "tba",
   "tbc",
   "tbd",
   "todo",
   "fixme",
+  "wip",
+  "xxx",
   "unknown",
   "unspecified",
+  "undecided",
+  "undetermined",
+  "not specified",
+  "not applicable",
+  "not available",
+  "not defined",
+  "not determined",
+  "no policy",
+  "to be determined",
+  "to be decided",
+  "to be announced",
+  "to be confirmed",
+  "to be specified",
+  "to be defined",
+  "see above",
+  "see below",
+  "same as above",
 ]);
+
+/**
+ * Placeholder markers that poison a rule even as a PREFIX of a longer value.
+ *
+ * These are the self-announcing "unfinished" markers; unlike `"none"` or
+ * `"unknown"`, no legitimate policy sentence begins with them.
+ */
+export const PLACEHOLDER_RULE_PREFIXES: readonly string[] = Object.freeze([
+  "tbd",
+  "tba",
+  "tbc",
+  "todo",
+  "fixme",
+  "wip",
+  "xxx",
+  "placeholder",
+  "n a",
+  "not specified",
+  "not applicable",
+  "not defined",
+  "not determined",
+  "to be determined",
+  "to be decided",
+  "to be announced",
+  "to be confirmed",
+  "to be specified",
+  "to be defined",
+  "unspecified",
+  "undecided",
+  "undetermined",
+]);
+
+/**
+ * Lowercases and collapses every non-alphanumeric run to one space, trimmed.
+ *
+ * `"TBD - complete after review"` → `"tbd complete after review"`;
+ * `"N / A"` → `"n a"`; `"???"` → `""`.
+ */
+function normalizedRuleText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, " ")
+    .trim();
+}
+
+/**
+ * Joins runs of single-letter tokens, so dotted abbreviations match their
+ * plain forms: `"t b d fill in later"` → `"tbd fill in later"` (from
+ * `"T.B.D. fill in later"`), `"n a"` → `"na"`.
+ */
+function joinedSingleLetterRuns(normalized: string): string {
+  const output: string[] = [];
+  let run: string[] = [];
+  for (const token of normalized.split(" ")) {
+    if (token.length === 1) {
+      run.push(token);
+      continue;
+    }
+    if (run.length > 0) {
+      output.push(run.join(""));
+      run = [];
+    }
+    output.push(token);
+  }
+  if (run.length > 0) {
+    output.push(run.join(""));
+  }
+  return output.join(" ");
+}
+
+/**
+ * The reason `value` states no rule, or `undefined` when it plausibly does.
+ *
+ * Exported so activation tests and future loaders can probe the matcher
+ * directly; the schema refusal below routes through it.
+ */
+export function placeholderRuleTextReason(value: string): string | undefined {
+  const normalized = normalizedRuleText(value);
+  if (normalized === "") {
+    return "contains no letters or digits (punctuation-only)";
+  }
+  const forms = [normalized, joinedSingleLetterRuns(normalized)];
+  for (const form of forms) {
+    if (PLACEHOLDER_RULE_TEXTS.includes(form)) {
+      return `normalizes to the placeholder "${form}"`;
+    }
+    for (const prefix of PLACEHOLDER_RULE_PREFIXES) {
+      if (form === prefix || form.startsWith(`${prefix} `)) {
+        return `begins with the placeholder marker "${prefix}"`;
+      }
+    }
+  }
+  return undefined;
+}
 
 const MINIMUM_RULE_TEXT_LENGTH = 3;
 
@@ -125,10 +254,11 @@ export const SettlementRuleTextSchema = z
       });
       return;
     }
-    if (PLACEHOLDER_RULE_TEXTS.includes(value.toLowerCase())) {
+    const placeholderReason = placeholderRuleTextReason(value);
+    if (placeholderReason !== undefined) {
       ctx.addIssue({
         code: "custom",
-        message: `states a placeholder (${value}) rather than a rule; ADR-009 §5.4 requires a stated policy`,
+        message: `states a placeholder rather than a rule (${placeholderReason}); ADR-009 §5.4 requires a stated policy`,
       });
     }
   });

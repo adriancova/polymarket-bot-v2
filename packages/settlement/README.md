@@ -95,9 +95,14 @@ repeating here:
   to be unverified, cannot be constructed. This mirrors WP-040's
   `settlement_specs_verification_complete` check.
 - **Rule text may not be a placeholder.** ADR-009 §5.4: "'Halt and escalate' is
-  a legitimate policy; 'unspecified' is not." `SettlementRuleTextSchema` refuses
-  `TBD`, `n/a`, `unknown`, `-`, and the rest of `PLACEHOLDER_RULE_TEXTS`, and
-  refuses leading/trailing whitespace so one rule has one representation.
+  a legitimate policy; 'unspecified' is not." `SettlementRuleTextSchema`
+  normalizes case, whitespace and punctuation and then refuses punctuation-only
+  values (`???`, `- - -`), semantic placeholder phrases (`to be determined`,
+  `not specified`, `N / A`, `T.B.D.`, and the rest of
+  `PLACEHOLDER_RULE_TEXTS`), and placeholder PREFIXES
+  (`TBD - complete after review`; see `PLACEHOLDER_RULE_PREFIXES`), tightened
+  in remediation round 1 (finding M1). It also refuses leading/trailing
+  whitespace so one rule has one representation.
 
 ## 4. Model selection (§9.3, acceptance 1)
 

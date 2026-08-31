@@ -73,8 +73,16 @@ export type UniverseRefusalCode =
   // --- readiness ------------------------------------------------------------
   /** The market has not opened yet. */
   | "UNIVERSE_MARKET_NOT_OPEN"
-  /** The market's trading window has ended. */
-  | "UNIVERSE_MARKET_CLOSED"
+  /**
+   * The market's SCHEDULED close instant has elapsed.
+   *
+   * This is a statement about the schedule, NOT a venue-confirmed closure: no
+   * domain event asserts "trading has ended", so the projection cannot know it
+   * (round-1 review, M3). New activation is refused past the scheduled close,
+   * but observation continues until `MarketResolved` or reconciliation
+   * establishes closure.
+   */
+  | "UNIVERSE_SCHEDULED_CLOSE_ELAPSED"
   /** The market has resolved. */
   | "UNIVERSE_MARKET_RESOLVED"
   /** The market's settlement state is not the ordinary pending one. */
@@ -87,6 +95,21 @@ export type UniverseRefusalCode =
   | "UNIVERSE_SETTLEMENT_RULES_VERSION_DRIFT"
   /** The settlement verdict contradicts itself. */
   | "UNIVERSE_SETTLEMENT_VERDICT_INCONSISTENT"
+  /**
+   * A verdict that CLAIMS to permit activation is missing an identity the
+   * universe layer must correlate (series id, settlement-spec id, rules
+   * version, payoff model) or carries refusals despite permitting.
+   */
+  | "UNIVERSE_SETTLEMENT_VERDICT_INCOMPLETE"
+  /**
+   * A permitted settlement verdict was presented without the approved
+   * `SeriesDefinition` it must be correlated against.
+   */
+  | "UNIVERSE_SERIES_DEFINITION_REQUIRED"
+  /** The settlement verdict names a different series than this market is bound to. */
+  | "UNIVERSE_SETTLEMENT_SERIES_MISMATCH"
+  /** The settlement verdict's spec is not the series' active settlement spec. */
+  | "UNIVERSE_SETTLEMENT_SPEC_MISMATCH"
   /** The market has no recorded parameters. */
   | "UNIVERSE_PARAMETERS_MISSING"
   /** A timestamp handed to a readiness check is not a parseable instant. */

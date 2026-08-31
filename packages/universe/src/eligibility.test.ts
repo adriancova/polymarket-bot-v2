@@ -136,6 +136,128 @@ describe("evaluateMarketReadiness", () => {
     ]);
   });
 
+  // -------------------------------------------------------------------------
+  // Round-1 review, H2: a permitted verdict must be COMPLETE and must be
+  // CORRELATED against the market's own records. Before remediation, every
+  // identity field was optional and every correlation was silently skipped
+  // when a field was absent — a verdict for series B activated a market bound
+  // to series A, and a verdict with no rules version at all activated too.
+  // -------------------------------------------------------------------------
+  describe("permitted-verdict correlation (round-1, H2)", () => {
+    it("refuses a permitted verdict naming a different series than the binding (reviewer probe)", () => {
+      const readiness = evaluateMarketReadiness(tradeableProjection(), {
+        asOf: AS_OF,
+        settlement: permittingSettlementView({
+          seriesId: "01936f00-0000-7000-8000-00000000a999",
+        }),
+        series: approvedSeries,
+      });
+      expect(readiness.modelDependentActivationAllowed).toBe(false);
+      // Mismatch against the approved binding AND against the supplied series.
+      expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
+        "UNIVERSE_SETTLEMENT_SERIES_MISMATCH",
+        "UNIVERSE_SETTLEMENT_SERIES_MISMATCH",
+      ]);
+    });
+
+    it.each(["rulesVersionId", "seriesId", "settlementSpecId", "payoffModel"] as const)(
+      "refuses a permitted verdict with %s removed (reviewer probe for rulesVersionId)",
+      (field) => {
+        const readiness = evaluateMarketReadiness(tradeableProjection(), {
+          asOf: AS_OF,
+          settlement: permittingSettlementView({ [field]: undefined }),
+          series: approvedSeries,
+        });
+        expect(readiness.modelDependentActivationAllowed).toBe(false);
+        expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
+          "UNIVERSE_SETTLEMENT_VERDICT_INCOMPLETE",
+        ]);
+      },
+    );
+
+    it("refuses a permitted verdict that carries refusals, or none at all", () => {
+      for (const refusals of [
+        [{ code: "SETTLEMENT_ANYTHING", message: "left over" }],
+        undefined,
+      ]) {
+        const readiness = evaluateMarketReadiness(tradeableProjection(), {
+          asOf: AS_OF,
+          settlement: permittingSettlementView({ refusals }),
+          series: approvedSeries,
+        });
+        expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
+          "UNIVERSE_SETTLEMENT_VERDICT_INCOMPLETE",
+        ]);
+      }
+    });
+
+    it("requires the approved series definition to correlate against", () => {
+      const readiness = evaluateMarketReadiness(tradeableProjection(), {
+        asOf: AS_OF,
+        settlement: permittingSettlementView(),
+      });
+      expect(readiness.modelDependentActivationAllowed).toBe(false);
+      expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
+        "UNIVERSE_SERIES_DEFINITION_REQUIRED",
+      ]);
+    });
+
+    it("refuses a verdict for a spec that is not the series' active settlement spec", () => {
+      const readiness = evaluateMarketReadiness(tradeableProjection(), {
+        asOf: AS_OF,
+        settlement: permittingSettlementView(),
+        series: {
+          ...approvedSeries,
+          activeSettlementSpecId: "01936f00-0000-7000-8000-00000000c999",
+        },
+      });
+      expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
+        "UNIVERSE_SETTLEMENT_SPEC_MISMATCH",
+      ]);
+    });
+
+    it("refuses a verdict when the series binds no active settlement spec at all", () => {
+      const series = { ...approvedSeries };
+      delete (series as { activeSettlementSpecId?: string }).activeSettlementSpecId;
+      const readiness = evaluateMarketReadiness(tradeableProjection(), {
+        asOf: AS_OF,
+        settlement: permittingSettlementView(),
+        series,
+      });
+      expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
+        "UNIVERSE_SETTLEMENT_SPEC_MISMATCH",
+      ]);
+    });
+
+    it("fails closed when the market's own rules version is unknown", () => {
+      const unknownRules = { ...tradeableProjection() };
+      delete (unknownRules as { rulesVersionId?: string }).rulesVersionId;
+      const readiness = evaluateMarketReadiness(unknownRules, {
+        asOf: AS_OF,
+        settlement: permittingSettlementView(),
+        series: approvedSeries,
+      });
+      expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
+        "UNIVERSE_SETTLEMENT_RULES_VERSION_DRIFT",
+      ]);
+    });
+  });
+
+  it("refuses an invalid asOf before any lifecycle or schedule logic (round-1, M2)", () => {
+    // Reviewer probe: no cutoff policy at all — previously returned
+    // allowed=true, lifecycle=OPEN, refusals=[].
+    const readiness = evaluateMarketReadiness(tradeableProjection(), {
+      asOf: "not-a-timestamp",
+      settlement: permittingSettlementView(),
+      series: approvedSeries,
+    });
+    expect(readiness.modelDependentActivationAllowed).toBe(false);
+    expect(readiness.observationReady).toBe(false);
+    expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
+      "UNIVERSE_TIMESTAMP_INVALID",
+    ]);
+  });
+
   it("blocks activation on a suggested series binding (§9.2)", () => {
     const suggested: MarketProjection = {
       ...tradeableProjection(),
@@ -149,6 +271,9 @@ describe("evaluateMarketReadiness", () => {
     expect(readiness.modelDependentActivationAllowed).toBe(false);
     expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
       "UNIVERSE_SERIES_BINDING_NOT_APPROVED",
+      // A permitted verdict with no series definition to correlate against is
+      // itself a refusal (round-1 review, H2).
+      "UNIVERSE_SERIES_DEFINITION_REQUIRED",
     ]);
     expect(hasApprovedSeriesBinding(suggested)).toBe(false);
   });
@@ -164,6 +289,7 @@ describe("evaluateMarketReadiness", () => {
     });
     expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
       "UNIVERSE_SERIES_UNBOUND",
+      "UNIVERSE_SERIES_DEFINITION_REQUIRED",
     ]);
   });
 
@@ -192,7 +318,11 @@ describe("evaluateMarketReadiness", () => {
         settlement: permittingSettlementView(),
         series: { ...approvedSeries, seriesId: "01936f00-0000-7000-8000-00000000a555" },
       }).refusals.map((refusal) => refusal.code),
-    ).toEqual(["UNIVERSE_SERIES_UNKNOWN"]);
+    ).toEqual([
+      "UNIVERSE_SERIES_UNKNOWN",
+      // ... and the permitted verdict cannot be correlated against it either.
+      "UNIVERSE_SETTLEMENT_SERIES_MISMATCH",
+    ]);
   });
 
   it("blocks a market that has not opened", () => {
@@ -212,7 +342,7 @@ describe("evaluateMarketReadiness", () => {
     ]);
   });
 
-  it("blocks a market whose trading window has ended", () => {
+  it("refuses new activation past the scheduled close but KEEPS observing (round-1, M3)", () => {
     const readiness = evaluateMarketReadiness(tradeableProjection(), {
       asOf: "2026-08-28T12:16:00Z",
       settlement: permittingSettlementView(),
@@ -220,8 +350,48 @@ describe("evaluateMarketReadiness", () => {
     });
 
     expect(readiness.effectiveLifecycleState).toBe("CLOSED");
+    // The venue never confirmed closure: no §7.4 event asserts "trading has
+    // ended". If the venue trades past its schedule, this market may still be
+    // holding an open position — its data stays worth consuming.
+    expect(readiness.observationReady).toBe(true);
+    expect(readiness.modelDependentActivationAllowed).toBe(false);
+    expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
+      "UNIVERSE_SCHEDULED_CLOSE_ELAPSED",
+    ]);
+  });
+
+  it("does not observe a never-opened market past its scheduled close", () => {
+    const discovered: MarketProjection = {
+      ...tradeableProjection(),
+      lifecycleState: "DISCOVERED",
+    };
+    const readiness = evaluateMarketReadiness(discovered, {
+      asOf: "2026-08-28T12:16:00Z",
+      settlement: permittingSettlementView(),
+      series: approvedSeries,
+    });
+    // Observation needs an observed open; the schedule refusal still applies.
     expect(readiness.observationReady).toBe(false);
-    expect(readiness.refusals.map((refusal) => refusal.code)).toEqual(["UNIVERSE_MARKET_CLOSED"]);
+    expect(readiness.refusals.map((refusal) => refusal.code)).toEqual([
+      "UNIVERSE_MARKET_NOT_OPEN",
+      "UNIVERSE_SCHEDULED_CLOSE_ELAPSED",
+    ]);
+  });
+
+  it("stops observing once the market RESOLVES (venue-confirmed end of trading)", () => {
+    const resolved: MarketProjection = {
+      ...tradeableProjection(),
+      lifecycleState: "RESOLVED",
+      outcomeState: "YES_WIN",
+      resolvedAt: "2026-08-28T12:15:30Z",
+    };
+    const readiness = evaluateMarketReadiness(resolved, {
+      asOf: "2026-08-28T12:16:00Z",
+      settlement: permittingSettlementView(),
+      series: approvedSeries,
+    });
+    expect(readiness.observationReady).toBe(false);
+    expect(readiness.effectiveLifecycleState).toBe("RESOLVED");
   });
 
   it("blocks a resolved market", () => {

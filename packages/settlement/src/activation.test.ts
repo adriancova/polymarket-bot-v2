@@ -68,6 +68,25 @@ describe("classifySettlementActivation", () => {
     expect(verdict.refusals[0]?.code).toBe("SETTLEMENT_SPEC_INVALID");
   });
 
+  // Round-1 review, M1: each of these was previously accepted AND classified
+  // REVIEWED_MODEL_BACKED with a verified verification block. A placeholder in
+  // a required policy field must never reach the permitted status.
+  it.each([
+    "TBD - complete after review",
+    "to be determined",
+    "???",
+    "not specified",
+    "N / A",
+    "TODO: write the dispute policy",
+    "not applicable",
+  ])("never permits activation on the placeholder policy %j (round-1, M1)", (placeholder) => {
+    const verdict = classifySettlementActivation({
+      spec: { ...verifiedSpec(terminalSpotSpecSample()), disputePolicy: placeholder },
+    });
+    expect(verdict.status).toBe("SPEC_INVALID");
+    expect(verdict.modelDependentActivationAllowed).toBe(false);
+  });
+
   it("blocks activation when the observation type has no implementing model", () => {
     const verdict = classifySettlementActivation({
       spec: {

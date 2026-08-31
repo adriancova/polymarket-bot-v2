@@ -35,6 +35,7 @@ import { isApprovedSeriesBinding, type SeriesDefinition } from "./series.js";
 import {
   ACTIVATION_PERMITTED_STATUS,
   isConsistentSettlementActivation,
+  permittedSettlementActivationProblems,
   type SettlementActivationView,
 } from "./settlement-binding.js";
 import { instantMilliseconds } from "./time.js";
@@ -85,40 +86,74 @@ export function evaluateMarketReadiness(
   input: MarketReadinessInput,
 ): MarketReadiness {
   const refusals: UniverseRefusal[] = [];
-  const lifecycle = effectiveLifecycleState(projection, input.asOf);
   const internalMarketId = projection.identity.internalMarketId;
 
+  // --- the "as of" instant, validated FIRST (round-1 review, M2) ----------
+  // Every downstream answer — the derived lifecycle state, the close cutoff —
+  // is a function of this instant. An unparseable instant must not fall
+  // through to the stored state (failing open); it makes the whole question
+  // unanswerable, so the answer is a refusal with nothing else evaluated.
+  const asOfMs = instantMilliseconds(input.asOf);
+  if (asOfMs === undefined) {
+    return Object.freeze({
+      internalMarketId,
+      observationReady: false,
+      modelDependentActivationAllowed: false,
+      effectiveLifecycleState: projection.lifecycleState,
+      refusals: Object.freeze([
+        universeRefusal(
+          "UNIVERSE_TIMESTAMP_INVALID",
+          "`asOf` is not a parseable instant; readiness cannot be evaluated",
+          { internalMarketId, asOf: input.asOf },
+        ),
+      ]),
+    });
+  }
+
+  const lifecycle = effectiveLifecycleState(projection, input.asOf);
+
   // --- lifecycle ----------------------------------------------------------
-  switch (lifecycle) {
-    case "DISCOVERED":
+  if (lifecycle === "RESOLVED") {
+    refusals.push(
+      universeRefusal("UNIVERSE_MARKET_RESOLVED", "the market has resolved", {
+        internalMarketId,
+        outcomeState: projection.outcomeState,
+      }),
+    );
+  } else {
+    if (projection.lifecycleState === "DISCOVERED") {
       refusals.push(
         universeRefusal("UNIVERSE_MARKET_NOT_OPEN", "the market has not opened", {
           internalMarketId,
-          lifecycleState: lifecycle,
+          lifecycleState: projection.lifecycleState,
         }),
       );
-      break;
-    case "CLOSED":
+    }
+    if (lifecycle === "CLOSED") {
+      // Derived from the SCHEDULE, not observed from the venue (round-1
+      // review, M3): no event asserts "trading has ended", so this refuses
+      // NEW activation without claiming the market is closed as a fact.
       refusals.push(
-        universeRefusal("UNIVERSE_MARKET_CLOSED", "the market's trading window has ended", {
-          internalMarketId,
-          closeInstant: effectiveCloseInstant(projection),
-          asOf: input.asOf,
-        }),
+        universeRefusal(
+          "UNIVERSE_SCHEDULED_CLOSE_ELAPSED",
+          "the market's scheduled close instant has elapsed; new activation is refused, but closure is not venue-confirmed",
+          {
+            internalMarketId,
+            closeInstant: effectiveCloseInstant(projection),
+            asOf: input.asOf,
+          },
+        ),
       );
-      break;
-    case "RESOLVED":
-      refusals.push(
-        universeRefusal("UNIVERSE_MARKET_RESOLVED", "the market has resolved", {
-          internalMarketId,
-          outcomeState: projection.outcomeState,
-        }),
-      );
-      break;
-    default:
-      break;
+    }
   }
-  const observationReady = lifecycle === "OPEN" || lifecycle === "CLOSING";
+  // Observability follows the EVENT-DRIVEN state, not the schedule (round-1
+  // review, M3): a market the venue opened and has not resolved is still
+  // producing data worth consuming even past its scheduled close — that is
+  // precisely when a market holding an open position most needs watching.
+  // The venue documents that trading stops at RESOLUTION; nothing observed
+  // asserts it stopped at the schedule.
+  const observationReady =
+    projection.lifecycleState === "OPEN" || projection.lifecycleState === "CLOSING";
 
   // --- settlement state ---------------------------------------------------
   if (projection.outcomeState !== "PENDING") {
@@ -202,19 +237,12 @@ export function evaluateMarketReadiness(
   }
 
   // --- close cutoff -------------------------------------------------------
+  // `asOf` was validated at the top of this function; `asOfMs` is defined.
   const minimumSecondsToClose = input.policy?.minimumSecondsToClose;
   if (minimumSecondsToClose !== undefined) {
     const closeInstant = effectiveCloseInstant(projection);
     const closeMs = closeInstant === undefined ? undefined : instantMilliseconds(closeInstant);
-    const asOfMs = instantMilliseconds(input.asOf);
-    if (asOfMs === undefined) {
-      refusals.push(
-        universeRefusal("UNIVERSE_TIMESTAMP_INVALID", "`asOf` is not a parseable instant", {
-          internalMarketId,
-          asOf: input.asOf,
-        }),
-      );
-    } else if (closeMs === undefined) {
+    if (closeMs === undefined) {
       // A cutoff policy with no close instant to measure against cannot be
       // evaluated; refusing is the safe direction.
       refusals.push(
@@ -240,6 +268,10 @@ export function evaluateMarketReadiness(
   }
 
   // --- settlement activation (§9.2, acceptance 3) -------------------------
+  // A verdict that claims to permit activation is CORRELATED, not believed
+  // (round-1 review, H2): it must be internally consistent, complete, and
+  // must name the SAME series, settlement spec, and rules version that this
+  // market's own records name. Any missing or mismatched identity refuses.
   const settlement = input.settlement;
   if (!isConsistentSettlementActivation(settlement)) {
     refusals.push(
@@ -266,25 +298,109 @@ export function evaluateMarketReadiness(
         },
       ),
     );
-  } else if (
-    settlement.rulesVersionId !== undefined &&
-    projection.rulesVersionId !== undefined &&
-    settlement.rulesVersionId !== projection.rulesVersionId
-  ) {
-    // §6 invariant 9: a review of superseded rules is not a review of what is
-    // trading now. This is the check that catches a rules change arriving after
-    // a spec was signed.
-    refusals.push(
-      universeRefusal(
-        "UNIVERSE_SETTLEMENT_RULES_VERSION_DRIFT",
-        "the reviewed settlement spec names a different market rules version than the market is trading under",
-        {
-          internalMarketId,
-          marketRulesVersionId: projection.rulesVersionId,
-          specRulesVersionId: settlement.rulesVersionId,
-        },
-      ),
-    );
+  } else {
+    const problems = permittedSettlementActivationProblems(settlement);
+    if (problems.length > 0) {
+      refusals.push(
+        universeRefusal(
+          "UNIVERSE_SETTLEMENT_VERDICT_INCOMPLETE",
+          `the verdict claims to permit activation but cannot be correlated: ${problems
+            .map((problem) => `${problem.field} — ${problem.problem}`)
+            .join("; ")}`,
+          { internalMarketId, problems },
+        ),
+      );
+    } else {
+      // The verdict is complete; now every identity it names must match the
+      // market's own records.
+      if (
+        binding.kind === "APPROVED" &&
+        settlement.seriesId !== binding.seriesId
+      ) {
+        refusals.push(
+          universeRefusal(
+            "UNIVERSE_SETTLEMENT_SERIES_MISMATCH",
+            "the settlement verdict names a different series than the one this market is bound to",
+            {
+              internalMarketId,
+              boundSeriesId: binding.seriesId,
+              verdictSeriesId: settlement.seriesId,
+            },
+          ),
+        );
+      }
+      if (input.series === undefined) {
+        // Correlating the verdict's spec against the series' ACTIVE spec
+        // requires the approved series definition; without it, the
+        // correlation would be silently skipped, which is exactly the
+        // fail-open H2 exploited.
+        refusals.push(
+          universeRefusal(
+            "UNIVERSE_SERIES_DEFINITION_REQUIRED",
+            "a permitted settlement verdict requires the approved series definition to correlate against; none was supplied",
+            { internalMarketId, verdictSeriesId: settlement.seriesId },
+          ),
+        );
+      } else {
+        if (settlement.seriesId !== input.series.seriesId) {
+          refusals.push(
+            universeRefusal(
+              "UNIVERSE_SETTLEMENT_SERIES_MISMATCH",
+              "the settlement verdict names a different series than the supplied series definition",
+              {
+                internalMarketId,
+                suppliedSeriesId: input.series.seriesId,
+                verdictSeriesId: settlement.seriesId,
+              },
+            ),
+          );
+        } else if (input.series.activeSettlementSpecId === undefined) {
+          refusals.push(
+            universeRefusal(
+              "UNIVERSE_SETTLEMENT_SPEC_MISMATCH",
+              "the series binds no active settlement spec, so no verdict can be its review",
+              { internalMarketId, seriesId: input.series.seriesId },
+            ),
+          );
+        } else if (settlement.settlementSpecId !== input.series.activeSettlementSpecId) {
+          refusals.push(
+            universeRefusal(
+              "UNIVERSE_SETTLEMENT_SPEC_MISMATCH",
+              "the settlement verdict is for a different spec than the series' active settlement spec",
+              {
+                internalMarketId,
+                activeSettlementSpecId: input.series.activeSettlementSpecId,
+                verdictSettlementSpecId: settlement.settlementSpecId,
+              },
+            ),
+          );
+        }
+      }
+      // §6 invariant 9: a review of superseded rules is not a review of what
+      // is trading now. Both sides are REQUIRED: an unknown market rules
+      // version cannot confirm the review applies, so it fails closed.
+      if (projection.rulesVersionId === undefined) {
+        refusals.push(
+          universeRefusal(
+            "UNIVERSE_SETTLEMENT_RULES_VERSION_DRIFT",
+            "the market's trading rules version is unknown, so the reviewed rules version cannot be confirmed to apply",
+            { internalMarketId, specRulesVersionId: settlement.rulesVersionId },
+          ),
+        );
+      } else if (settlement.rulesVersionId !== projection.rulesVersionId) {
+        refusals.push(
+          universeRefusal(
+            "UNIVERSE_SETTLEMENT_RULES_VERSION_DRIFT",
+            "the reviewed settlement spec names a different market rules version than the market is trading under",
+            {
+              internalMarketId,
+              marketRulesVersionId: projection.rulesVersionId,
+              specRulesVersionId: settlement.rulesVersionId,
+            },
+          ),
+        );
+      }
+    }
   }
 
   return Object.freeze({

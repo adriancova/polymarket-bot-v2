@@ -14,7 +14,11 @@
  * observed) and `MarketResolved`, and nothing that asserts "the trading window
  * has now ended". It is therefore DERIVED from the scheduled close instant and
  * an "as of" instant the caller supplies — see `effectiveLifecycleState` in
- * `lifecycle.ts` — and never stored as a transition. Inventing a
+ * `lifecycle.ts` — and never stored as a transition. Because it is derived
+ * from a SCHEDULE, it asserts only "the announced close instant has elapsed",
+ * never "the venue stopped trading" (round-1 review, M3): the schedule can be
+ * wrong in either direction, and readiness treats derived `CLOSED` as an
+ * activation stop while observation continues. Inventing a
  * `MarketClosed` event to make it storable would be exactly the "work around a
  * missing contract by inventing a shape" that this package must not do; the gap
  * is reported in `docs/handoffs/WP-110.md` instead.

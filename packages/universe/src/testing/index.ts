@@ -13,7 +13,10 @@
 import type { MarketIdentity } from "../identity.js";
 import type { ParameterObservation } from "../parameters.js";
 import type { SeriesDefinition } from "../series.js";
-import type { SettlementActivationView } from "../settlement-binding.js";
+import type {
+  SettlementActivationView,
+  UnvalidatedSettlementActivationView,
+} from "../settlement-binding.js";
 
 export const SAMPLE_MARKET_ID = "01936f00-0000-7000-8000-00000000d001";
 export const SAMPLE_SERIES_ID = "01936f00-0000-7000-8000-00000000a001";
@@ -61,13 +64,21 @@ export function seriesDefinitionSample(): SeriesDefinition {
     cadence: "PT15M",
     description: "Example rolling series; membership and settlement are unreviewed.",
     binding: { approved: false },
+    activeSettlementSpecId: SAMPLE_SETTLEMENT_SPEC_ID,
     active: true,
   };
 }
 
-/** A settlement verdict that permits activation. */
+/**
+ * A settlement verdict that permits activation.
+ *
+ * The cast is DELIBERATE and test-only: adversarial tests use `overrides` to
+ * build verdicts a compliant producer could never emit (an inconsistent flag,
+ * a blocked status with permitted fields), which is exactly what the runtime
+ * checks must refuse.
+ */
 export function permittingSettlementView(
-  overrides: Partial<SettlementActivationView> = {},
+  overrides: Partial<UnvalidatedSettlementActivationView> = {},
 ): SettlementActivationView {
   return {
     status: "REVIEWED_MODEL_BACKED",
@@ -78,7 +89,7 @@ export function permittingSettlementView(
     payoffModel: "ReferenceOpenUpDownModel",
     refusals: [],
     ...overrides,
-  };
+  } as SettlementActivationView;
 }
 
 /** A settlement verdict that blocks activation because nobody reviewed the spec. */

@@ -132,11 +132,17 @@ export {
   ACTIVATION_PERMITTED_STATUS,
   SETTLEMENT_ACTIVATION_STATUSES,
   isConsistentSettlementActivation,
+  permittedSettlementActivationProblems,
 } from "./settlement-binding.js";
 export type {
+  BlockedSettlementActivationStatus,
+  BlockedSettlementActivationView,
+  PermittedSettlementActivationView,
+  PermittedVerdictProblem,
   SettlementActivationStatus,
   SettlementActivationView,
   SettlementRefusalView,
+  UnvalidatedSettlementActivationView,
 } from "./settlement-binding.js";
 
 export {

@@ -186,6 +186,36 @@ describe("TwapBinaryModel", () => {
     expect(refusalCodes(result)).toEqual(["SETTLEMENT_TIMESTAMP_INVALID"]);
   });
 
+  it("refuses boundaries spanning a different interval than the declared window (round-1, H1)", () => {
+    // Reviewer probe: tagged 30 seconds, but the timestamps span one hour.
+    // The tag alone previously satisfied the check and the market settled on
+    // an average the spec was never reviewed for.
+    const result = evaluateSettlement(twap, {
+      ...twapObservationSample(),
+      windowStartAt: "2026-08-28T11:00:00Z",
+      windowEndAt: "2026-08-28T12:00:00Z",
+    });
+    expect(refusalCodes(result)).toEqual(["SETTLEMENT_OBSERVATION_WINDOW_MISMATCH"]);
+  });
+
+  it("refuses a zero-length window (equal boundaries)", () => {
+    const result = evaluateSettlement(twap, {
+      ...twapObservationSample(),
+      windowStartAt: "2026-08-28T12:00:00Z",
+      windowEndAt: "2026-08-28T12:00:00Z",
+    });
+    expect(refusalCodes(result)).toEqual(["SETTLEMENT_OBSERVATION_WINDOW_INVALID"]);
+  });
+
+  it("refuses a window one millisecond short of the declared length", () => {
+    const result = evaluateSettlement(twap, {
+      ...twapObservationSample(),
+      windowStartAt: "2026-08-28T11:59:30.001Z",
+      windowEndAt: "2026-08-28T12:00:00Z",
+    });
+    expect(refusalCodes(result)).toEqual(["SETTLEMENT_OBSERVATION_WINDOW_MISMATCH"]);
+  });
+
   it("compares instants rather than strings across offsets", () => {
     const result = evaluateSettlement(twap, {
       ...twapObservationSample(),
@@ -261,6 +291,48 @@ describe("ReferenceOpenUpDownModel", () => {
         windowEndAt: "2026-08-28T12:00:00Z",
       });
       expect(refusalCodes(result)).toEqual(["SETTLEMENT_OBSERVATION_WINDOW_MISMATCH"]);
+    });
+
+    it("refuses an inverted window (round-1, H1)", () => {
+      // Reviewer probe: windowStartAt AFTER windowEndAt previously passed,
+      // because this branch checked presence and the numeric tag only.
+      const result = evaluateSettlement(twapUpDown, {
+        ...referenceOpenUpDownObservationSample(),
+        windowSeconds: 60,
+        windowStartAt: "2026-08-28T12:01:00Z",
+        windowEndAt: "2026-08-28T12:00:00Z",
+      });
+      expect(refusalCodes(result)).toEqual(["SETTLEMENT_OBSERVATION_WINDOW_INVALID"]);
+    });
+
+    it("refuses equal window boundaries", () => {
+      const result = evaluateSettlement(twapUpDown, {
+        ...referenceOpenUpDownObservationSample(),
+        windowSeconds: 60,
+        windowStartAt: "2026-08-28T12:00:00Z",
+        windowEndAt: "2026-08-28T12:00:00Z",
+      });
+      expect(refusalCodes(result)).toEqual(["SETTLEMENT_OBSERVATION_WINDOW_INVALID"]);
+    });
+
+    it("refuses boundaries spanning a different interval than the declared window", () => {
+      const result = evaluateSettlement(twapUpDown, {
+        ...referenceOpenUpDownObservationSample(),
+        windowSeconds: 60,
+        windowStartAt: "2026-08-28T11:00:00Z",
+        windowEndAt: "2026-08-28T12:00:00Z",
+      });
+      expect(refusalCodes(result)).toEqual(["SETTLEMENT_OBSERVATION_WINDOW_MISMATCH"]);
+    });
+
+    it("refuses an unparseable window boundary", () => {
+      const result = evaluateSettlement(twapUpDown, {
+        ...referenceOpenUpDownObservationSample(),
+        windowSeconds: 60,
+        windowStartAt: "not-a-timestamp",
+        windowEndAt: "2026-08-28T12:00:00Z",
+      });
+      expect(refusalCodes(result)).toEqual(["SETTLEMENT_TIMESTAMP_INVALID"]);
     });
   });
 });

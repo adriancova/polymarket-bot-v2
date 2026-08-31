@@ -75,12 +75,58 @@ export interface UniverseRegistry {
   readonly seriesIdBySeriesKey: ReadonlyMap<string, string>;
 }
 
+// ---------------------------------------------------------------------------
+// Immutability enforcement (round-1 review, H3)
+//
+// `ReadonlyMap` and a shallow `Object.freeze` are COMPILE-TIME promises only:
+// the reviewer's probe mutated a registered series' nested `binding` in place
+// and forged an approval `approveSeries` never granted, and the exposed maps
+// were ordinary `Map` instances a cast away from mutation. Stored values are
+// therefore deeply frozen, and every exposed collection has its mutators
+// replaced with throwing functions, so in-place forgery fails loudly at
+// runtime rather than silently succeeding.
+// ---------------------------------------------------------------------------
+
+/** Recursively freezes an acyclic value in place and returns it. */
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  const target = value as unknown as object;
+  if (seen.has(target)) {
+    return value;
+  }
+  seen.add(target);
+  Object.freeze(target);
+  for (const key of Reflect.ownKeys(target)) {
+    deepFreeze((target as Record<PropertyKey, unknown>)[key], seen);
+  }
+  return value;
+}
+
+function refuseMutation(): never {
+  throw new TypeError(
+    "universe registry collections are immutable; every operation returns a new registry",
+  );
+}
+
+/** A `Map` whose mutators throw, frozen, exposed as `ReadonlyMap`. */
+function immutableMap<K, V>(entries?: Iterable<readonly [K, V]>): ReadonlyMap<K, V> {
+  const map = new Map<K, V>(entries);
+  Object.defineProperties(map, {
+    set: { value: refuseMutation },
+    delete: { value: refuseMutation },
+    clear: { value: refuseMutation },
+  });
+  return Object.freeze(map);
+}
+
 const EMPTY_REGISTRY: UniverseRegistry = Object.freeze({
-  markets: new Map<InternalMarketId, MarketProjection>(),
-  series: new Map<string, SeriesDefinition>(),
-  marketIdByConditionId: new Map<ConditionId, InternalMarketId>(),
-  marketIdByTokenId: new Map<TokenId, InternalMarketId>(),
-  seriesIdBySeriesKey: new Map<string, string>(),
+  markets: immutableMap<InternalMarketId, MarketProjection>(),
+  series: immutableMap<string, SeriesDefinition>(),
+  marketIdByConditionId: immutableMap<ConditionId, InternalMarketId>(),
+  marketIdByTokenId: immutableMap<TokenId, InternalMarketId>(),
+  seriesIdBySeriesKey: immutableMap<string, string>(),
 });
 
 /** An empty registry. */
@@ -93,8 +139,8 @@ function withMarket(
   projection: MarketProjection,
 ): UniverseRegistry {
   const markets = new Map(registry.markets);
-  markets.set(projection.identity.internalMarketId, projection);
-  return Object.freeze({ ...registry, markets });
+  markets.set(projection.identity.internalMarketId, deepFreeze(projection));
+  return Object.freeze({ ...registry, markets: immutableMap(markets) });
 }
 
 function issuesOf(error: { readonly issues: readonly { readonly path: readonly PropertyKey[]; readonly message: string }[] }): readonly string[] {
@@ -151,11 +197,18 @@ export function registerSeries(
   }
 
   const seriesMap = new Map(registry.series);
-  seriesMap.set(series.seriesId, Object.freeze(series));
+  // Deep, not shallow (round-1 review, H3): a shallowly frozen series left
+  // its nested `binding` mutable, and a caller holding `registry.series`
+  // could forge `approved: true` in place.
+  seriesMap.set(series.seriesId, deepFreeze(series));
   const keyMap = new Map(registry.seriesIdBySeriesKey);
   keyMap.set(series.seriesKey, series.seriesId);
   return universeOk(
-    Object.freeze({ ...registry, series: seriesMap, seriesIdBySeriesKey: keyMap }),
+    Object.freeze({
+      ...registry,
+      series: immutableMap(seriesMap),
+      seriesIdBySeriesKey: immutableMap(keyMap),
+    }),
   );
 }
 
@@ -179,8 +232,8 @@ export function approveSeries(
     return universeFailure(invalid("series approval", issuesOf(parsed.error)));
   }
   const seriesMap = new Map(registry.series);
-  seriesMap.set(series.seriesId, Object.freeze(parsed.data));
-  return universeOk(Object.freeze({ ...registry, series: seriesMap }));
+  seriesMap.set(series.seriesId, deepFreeze(parsed.data));
+  return universeOk(Object.freeze({ ...registry, series: immutableMap(seriesMap) }));
 }
 
 // ---------------------------------------------------------------------------
@@ -287,13 +340,13 @@ export function registerMarket(
   }
 
   const parameters = createParameterHistory(identity.internalMarketId, input.parameters);
-  const projection: MarketProjection = Object.freeze({
-    identity: Object.freeze(identity),
+  const projection: MarketProjection = deepFreeze({
+    identity,
     seriesBinding: UNBOUND_SERIES_BINDING,
     lifecycleState: "DISCOVERED",
     outcomeState: "PENDING",
     metadataVersion,
-    clarifications: Object.freeze([]),
+    clarifications: [],
     parameters,
   });
 
@@ -307,9 +360,9 @@ export function registerMarket(
 
   const next = Object.freeze({
     ...registry,
-    markets,
-    marketIdByConditionId: byCondition,
-    marketIdByTokenId: byToken,
+    markets: immutableMap(markets),
+    marketIdByConditionId: immutableMap(byCondition),
+    marketIdByTokenId: immutableMap(byToken),
   });
   return universeOk({ registry: next, projection, event: discoveredEvent(next, projection) });
 }

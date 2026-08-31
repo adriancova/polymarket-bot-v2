@@ -704,6 +704,15 @@ export function recordObservedOutcomeState(
  * close instant the market announced — the `MarketClosing` instant when there
  * is one, otherwise the scheduled `closeTime` parameter — and the caller's "as
  * of" instant. Time enters as DATA: this function reads no clock.
+ *
+ * `CLOSED` HERE MEANS "THE SCHEDULED CLOSE HAS ELAPSED" AND NOTHING MORE
+ * (round-1 review, M3). It is a statement about the schedule, not an observed
+ * venue fact: the venue may close early (the schedule then overstates the
+ * window) or keep trading past the announced instant (the schedule then
+ * understates it), and no §7.4 event asserts either. Consumers must treat
+ * derived `CLOSED` as "refuse NEW activation" — see `eligibility.ts`, which
+ * keeps OBSERVING an opened, unresolved market past its scheduled close until
+ * `MarketResolved` or reconciliation establishes closure.
  */
 export function effectiveLifecycleState(
   projection: MarketProjection,

@@ -101,6 +101,46 @@ describe("SettlementSpecSchema", () => {
     },
   );
 
+  // Round-1 review, M1: exact-string matching let every one of these through.
+  // The matcher now normalizes case, whitespace and punctuation, refuses
+  // punctuation-only values, semantic placeholder phrases, and placeholder
+  // prefixes.
+  it.each([
+    "TBD - complete after review", // reviewer probe: placeholder prefix
+    "to be determined", // reviewer probe: semantic phrase
+    "???", // reviewer probe: punctuation-only above the length minimum
+    "not specified", // reviewer probe: semantic phrase
+    "N / A", // reviewer probe: spaced punctuation variant
+    "To Be Determined.",
+    "T.B.D.",
+    "n.a.",
+    "TODO: write the dispute policy",
+    "FIXME later",
+    "placeholder text",
+    "not applicable",
+    "to be confirmed with legal",
+    "...",
+    "- - -",
+  ])("refuses the placeholder variant %j (round-1, M1)", (placeholder) => {
+    const result = SettlementSpecSchema.safeParse({
+      ...terminalSpotSpecSample(),
+      disputePolicy: placeholder,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it.each([
+    "Halt and escalate to the operator; no substitute source is used.",
+    "None of the fallback sources may be used; halt and page the operator.",
+    "Unknown outcomes are escalated to a human reviewer before any settlement.",
+  ])("still accepts the stated policy %j", (policy) => {
+    const result = SettlementSpecSchema.safeParse({
+      ...terminalSpotSpecSample(),
+      disputePolicy: policy,
+    });
+    expect(result.success).toBe(true);
+  });
+
   it("refuses a clarification policy that states a placeholder", () => {
     const result = SettlementSpecSchema.safeParse({
       ...terminalSpotSpecSample(),

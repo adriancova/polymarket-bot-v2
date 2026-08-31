@@ -143,6 +143,86 @@ function orderedInstants(
   return settlementOk({ earlierMs, laterMs });
 }
 
+/**
+ * Validates a TWAP observation window against the spec that consumes it.
+ *
+ * ENDPOINT CONVENTION (explicit, because H1 of the round-1 review showed the
+ * boundaries were previously unchecked): `windowStartAt` and `windowEndAt` are
+ * the two boundary INSTANTS of the averaging interval, and the interval's
+ * length is measured as `windowEndAt − windowStartAt` at millisecond
+ * precision. A declared `windowSeconds` of 30 therefore requires
+ * `windowEndAt − windowStartAt === 30000 ms` exactly — the end boundary sits
+ * exactly `windowSeconds` after the start boundary. Whether the endpoints
+ * themselves are inclusive ticks is the feed's affair (the spec's
+ * `window_start_rule` / `window_end_rule` state it in prose); what this
+ * evaluator enforces is that the timestamps SPAN the declared window:
+ *
+ * 1. the numeric tag must equal the spec's `window_seconds`;
+ * 2. both boundaries must parse as instants;
+ * 3. the window must be strictly ordered (`windowEndAt > windowStartAt`); and
+ * 4. the elapsed interval must equal the declared window exactly.
+ *
+ * Without 3 and 4, an observation TAGGED with the reviewed window but averaged
+ * over a different (or inverted, or empty) span would settle the market on a
+ * number the venue never used.
+ */
+function checkTwapWindow(
+  spec: SettlementSpec,
+  window: {
+    readonly windowSeconds: number;
+    readonly windowStartAt: string;
+    readonly windowEndAt: string;
+  },
+): SettlementResult<void> {
+  if (window.windowSeconds !== spec.windowSeconds) {
+    return settlementFailure(
+      settlementRefusal(
+        "SETTLEMENT_OBSERVATION_WINDOW_MISMATCH",
+        `observation averages ${String(window.windowSeconds)}s but the spec settles on ${String(spec.windowSeconds)}s`,
+        {
+          observationWindowSeconds: window.windowSeconds,
+          specWindowSeconds: spec.windowSeconds,
+        },
+      ),
+    );
+  }
+  const boundaries = orderedInstants(
+    "windowStartAt",
+    window.windowStartAt,
+    "windowEndAt",
+    window.windowEndAt,
+  );
+  if (!boundaries.ok) {
+    return boundaries;
+  }
+  if (boundaries.value.laterMs <= boundaries.value.earlierMs) {
+    return settlementFailure(
+      settlementRefusal(
+        "SETTLEMENT_OBSERVATION_WINDOW_INVALID",
+        "the observation window ends at or before it starts",
+        { windowStartAt: window.windowStartAt, windowEndAt: window.windowEndAt },
+      ),
+    );
+  }
+  const elapsedMs = boundaries.value.laterMs - boundaries.value.earlierMs;
+  const declaredMs = window.windowSeconds * 1000;
+  if (elapsedMs !== declaredMs) {
+    return settlementFailure(
+      settlementRefusal(
+        "SETTLEMENT_OBSERVATION_WINDOW_MISMATCH",
+        `the observation window spans ${String(elapsedMs / 1000)}s between its boundaries but declares a ${String(window.windowSeconds)}s average; the timestamps do not cover the reviewed window`,
+        {
+          windowStartAt: window.windowStartAt,
+          windowEndAt: window.windowEndAt,
+          declaredWindowSeconds: window.windowSeconds,
+          elapsedSeconds: elapsedMs / 1000,
+        },
+      ),
+    );
+  }
+  return settlementOk(undefined);
+}
+
 function requireComparison(spec: SettlementSpec): SettlementResult<ComparisonOperator> {
   /* c8 ignore next 9 -- unreachable through a validated spec: every model requires `comparison`. */
   if (spec.comparison === undefined) {
@@ -203,35 +283,14 @@ function evaluateTwap(
     return operator;
   }
   // ADR-009 §6: a TWAP spec depends on a window the feed publishes. An
-  // observation averaged over a DIFFERENT window is not the value the spec was
-  // reviewed for, and accepting it would settle the market on a number the
-  // venue never used.
-  if (observation.windowSeconds !== spec.windowSeconds) {
-    return settlementFailure(
-      settlementRefusal(
-        "SETTLEMENT_OBSERVATION_WINDOW_MISMATCH",
-        `observation averages ${String(observation.windowSeconds)}s but the spec settles on ${String(spec.windowSeconds)}s`,
-        { observationWindowSeconds: observation.windowSeconds, specWindowSeconds: spec.windowSeconds },
-      ),
-    );
-  }
-  const window = orderedInstants(
-    "windowStartAt",
-    observation.windowStartAt,
-    "windowEndAt",
-    observation.windowEndAt,
-  );
+  // observation averaged over a DIFFERENT window — whether mis-tagged, or
+  // tagged correctly but with boundary timestamps spanning something else — is
+  // not the value the spec was reviewed for, and accepting it would settle the
+  // market on a number the venue never used. See {@link checkTwapWindow} for
+  // the endpoint convention.
+  const window = checkTwapWindow(spec, observation);
   if (!window.ok) {
     return window;
-  }
-  if (window.value.laterMs <= window.value.earlierMs) {
-    return settlementFailure(
-      settlementRefusal(
-        "SETTLEMENT_OBSERVATION_WINDOW_INVALID",
-        "the observation window ends at or before it starts",
-        { windowStartAt: observation.windowStartAt, windowEndAt: observation.windowEndAt },
-      ),
-    );
   }
   const satisfied = satisfiesComparison(observation.twapValue, observation.strike, operator.value);
   return settlementOk(
@@ -269,17 +328,17 @@ function evaluateReferenceOpenUpDown(
         ),
       );
     }
-    if (observation.windowSeconds !== spec.windowSeconds) {
-      return settlementFailure(
-        settlementRefusal(
-          "SETTLEMENT_OBSERVATION_WINDOW_MISMATCH",
-          `observation averages ${String(observation.windowSeconds)}s but the spec settles on ${String(spec.windowSeconds)}s`,
-          {
-            observationWindowSeconds: observation.windowSeconds,
-            specWindowSeconds: spec.windowSeconds,
-          },
-        ),
-      );
+    // The same window discipline as `evaluateTwap` (round-1 review, H1): the
+    // tag must match the spec AND the boundary timestamps must be ordered and
+    // span exactly the declared window. See {@link checkTwapWindow} for the
+    // endpoint convention.
+    const window = checkTwapWindow(spec, {
+      windowSeconds: observation.windowSeconds,
+      windowStartAt: observation.windowStartAt,
+      windowEndAt: observation.windowEndAt,
+    });
+    if (!window.ok) {
+      return window;
     }
   } else if (
     observation.windowSeconds !== undefined ||

@@ -82,12 +82,18 @@ The projection folds the frozen §7.4 events. Four rules shape it:
    `MarketOpened` with a different instant is refused; a `MarketClosing` that
    moves the close is applied, because §9.2 versions `close_time`.
 
-**`CLOSED` is derived, never stored.** The frozen contracts carry `MarketClosing`
-and `MarketResolved` and nothing asserting "the trading window has now ended", so
+**`CLOSED` is derived, never stored — and it means "scheduled close elapsed",
+nothing more.** The frozen contracts carry `MarketClosing` and `MarketResolved`
+and nothing asserting "the trading window has now ended", so
 `effectiveLifecycleState(projection, asOf)` computes it from the announced close
-instant and the caller's instant. Inventing a `MarketClosed` event would be a
-contract change this package may not make; the gap is reported in
-`docs/handoffs/WP-110.md`.
+instant and the caller's instant. Because it is a statement about the SCHEDULE,
+it can be wrong in either direction — the venue may close early or trade past
+the announced instant — so readiness refuses NEW activation past the scheduled
+close (`UNIVERSE_SCHEDULED_CLOSE_ELAPSED`) while `observationReady` continues to
+follow the event-driven state until `MarketResolved` or reconciliation
+establishes closure (remediation round 1, finding M3). Inventing a
+`MarketClosed` event would be a contract change this package may not make; the
+gap is reported in `docs/handoffs/WP-110.md`.
 
 Ordering uses `gatewayEpoch + ingestSeq` (§7.1): an event that does not advance
 the sequence WITHIN an epoch is refused as a replay, while a new epoch (a gateway
@@ -102,10 +108,19 @@ same-layer edges — has no row for either direction. Neither imports the other.
 layer's verdict; the composition root wires the two, and a divergence between the
 two status unions is a type error at that wiring site.
 
-The verdict is not taken on faith: `evaluateMarketReadiness` refuses a verdict
-whose status and permission flag disagree, and independently refuses activation
-when the reviewed spec's rules version is not the version the market is trading
-under (§6 invariant 9).
+The verdict is not taken on faith (tightened in remediation round 1, finding
+H2). The permitted arm of `SettlementActivationView` is a discriminated shape
+that REQUIRES the series id, settlement-spec id, rules-version id, payoff model
+and an empty refusal list, and `evaluateMarketReadiness` re-checks all of that
+at runtime and then CORRELATES it: the verdict's series must be the market's
+approved binding and the supplied `SeriesDefinition`, the verdict's spec must be
+that series' `activeSettlementSpecId`, and the verdict's rules version must be
+the version the market is trading under (§6 invariant 9) — with both sides
+required, failing closed when the market's own rules version is unknown. A
+verdict whose status and permission flag disagree is refused outright. The
+status vocabulary is additionally pinned against the settlement package's
+SOURCE TEXT in `settlement-binding.test.ts` (a test-only file read; no import
+edge), so a vocabulary change on either side fails a test.
 
 ## 6. Readiness: two answers, not one
 
@@ -124,5 +139,9 @@ instant exists, the check refuses rather than skipping.
 
 No I/O, no clock, no randomness, no mutable global state. `Date.parse` is used
 only to parse strings the CALLER supplied (`time.ts`); `Date.now()` and
-`new Date()` appear nowhere. The one filesystem read in the package is
-`seeds.test.ts`, a test.
+`new Date()` appear nowhere. The only filesystem reads in the package are two
+tests: `seeds.test.ts` (seed validation) and `settlement-binding.test.ts` (the
+cross-package vocabulary pin). Registry values are DEEPLY frozen and the
+exposed collections refuse `set`/`delete`/`clear` at runtime (remediation
+round 1, finding H3), so an in-place forgery of a series approval throws
+instead of succeeding.

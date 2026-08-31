@@ -59,8 +59,10 @@ export type {
 } from "./vocabulary.js";
 
 export {
+  PLACEHOLDER_RULE_PREFIXES,
   PLACEHOLDER_RULE_TEXTS,
   RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24,
+  placeholderRuleTextReason,
   SettlementRuleTextSchema,
   SettlementSpecSchema,
   SettlementVerificationSchema,

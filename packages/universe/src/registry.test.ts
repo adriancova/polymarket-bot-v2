@@ -467,3 +467,93 @@ describe("applyMarketEvent", () => {
     ).toEqual(["UNIVERSE_TERMINAL_OUTCOME_REQUIRES_EVENT"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Round-1 review, H3: `ReadonlyMap` typing and a shallow freeze are
+// compile-time promises only. The reviewer registered an UNAPPROVED series,
+// reached its mutable nested `binding` through `registry.series`, forged
+// `{approved: true, approvedBy: "attacker"}` in place, and
+// `bindMarketToSeries` accepted it without `approveSeries` ever being called.
+// These probes are permanent: stored data must be deeply frozen and the
+// exposed collections must refuse mutation at runtime.
+// ---------------------------------------------------------------------------
+describe("registry immutability (round-1, H3)", () => {
+  it("refuses in-place forgery of a series approval (reviewer probe)", () => {
+    const registry = value(registerSeries(registryWithMarket(), seriesDefinitionSample()));
+
+    const stored = registry.series.get(SAMPLE_SERIES_ID);
+    expect(stored).toBeDefined();
+    expect(Object.isFrozen(stored)).toBe(true);
+    expect(Object.isFrozen(stored?.binding)).toBe(true);
+    expect(() => {
+      Object.assign(stored!.binding as unknown as Record<string, unknown>, {
+        approved: true,
+        approvedBy: "attacker",
+        approvedAt: "2026-08-28T00:00:00Z",
+      });
+    }).toThrow(TypeError);
+
+    // The forgery failed, so binding must still refuse: nobody approved it.
+    expect(
+      codes(
+        bindMarketToSeries(registry, {
+          internalMarketId: SAMPLE_MARKET_ID,
+          seriesId: SAMPLE_SERIES_ID,
+          approvedBy: "operator",
+          approvedAt: "2026-08-28T00:00:00Z",
+        }),
+      ),
+    ).toEqual(["UNIVERSE_SERIES_BINDING_NOT_APPROVED"]);
+  });
+
+  it("deep-freezes an approved series too", () => {
+    const registry = registryWithApprovedSeries();
+    const stored = registry.series.get(SAMPLE_SERIES_ID);
+    expect(Object.isFrozen(stored)).toBe(true);
+    expect(Object.isFrozen(stored?.binding)).toBe(true);
+    expect(() => {
+      (stored!.binding as unknown as Record<string, unknown>)["approvedBy"] = "attacker";
+    }).toThrow(TypeError);
+  });
+
+  it("every registry collection refuses set/delete/clear", () => {
+    const registry = value(registerSeries(registryWithMarket(), seriesDefinitionSample()));
+    const collections = [
+      registry.markets,
+      registry.series,
+      registry.marketIdByConditionId,
+      registry.marketIdByTokenId,
+      registry.seriesIdBySeriesKey,
+    ];
+    for (const collection of collections) {
+      const map = collection as unknown as Map<unknown, unknown>;
+      expect(() => map.set("forged", {})).toThrow(TypeError);
+      expect(() => map.delete("anything")).toThrow(TypeError);
+      expect(() => map.clear()).toThrow(TypeError);
+    }
+  });
+
+  it("freezes stored projections, including after a binding update", () => {
+    let registry = registryWithApprovedSeries();
+    registry = value(
+      bindMarketToSeries(registry, {
+        internalMarketId: SAMPLE_MARKET_ID,
+        seriesId: SAMPLE_SERIES_ID,
+        approvedBy: "operator",
+        approvedAt: "2026-08-28T00:00:00Z",
+      }),
+    );
+    const projection = [...registry.markets.values()][0];
+    expect(projection).toBeDefined();
+    expect(Object.isFrozen(projection)).toBe(true);
+    expect(Object.isFrozen(projection?.seriesBinding)).toBe(true);
+    expect(Object.isFrozen(projection?.identity)).toBe(true);
+    expect(() => {
+      (projection as unknown as Record<string, unknown>)["lifecycleState"] = "RESOLVED";
+    }).toThrow(TypeError);
+    expect(() => {
+      (projection!.seriesBinding as unknown as Record<string, unknown>)["approvedBy"] =
+        "attacker";
+    }).toThrow(TypeError);
+  });
+});
