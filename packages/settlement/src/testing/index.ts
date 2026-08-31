@@ -99,6 +99,51 @@ export const PLACEHOLDER_POLICY_ATTACK_SAMPLES: readonly string[] = Object.freez
   "yet to be agreed", // family: yet to be + 1 tail token
   "left blank", // conventional unfinished-field entry
   "see attached", // conventional unfinished-field entry
+  // --- Round-5 reviewer probes, verbatim (each reproduced as a live bypass
+  // --- at the round-5 candidate 23b4e3f before being pinned here).
+  "left intentionally blank", // R5-M1: word-order permutation of "intentionally left blank"
+  "see attachment", // R5-M1: morphological variant of "see attached"
+  // --- Round-5 class-mates (every entry below was ALSO reproduced as a live
+  // --- bypass at the candidate, or is a within-class variant closed by the
+  // --- same mechanism). Word-order permutations:
+  "blank intentionally left", // permutation (canonical-multiset rule)
+  "intentionally blank left", // permutation (canonical-multiset rule)
+  "blank left", // permutation of "left blank"
+  "empty left", // permutation of the round-5 entry "left empty"
+  "left intentionally empty", // permutation of "intentionally left empty"
+  "omitted intentionally", // permutation of "intentionally omitted"
+  // Morphological variants (bounded CONVENTIONAL_TOKEN_CANONICAL table):
+  "see attachments", // attachments → attached
+  "see enclosure", // enclosure → enclosed (round-5 entry "see enclosed")
+  "see enclosures", // enclosures → enclosed
+  "see previously", // previously → previous
+  "dittos", // dittos → ditto
+  "no contents", // contents → content
+  "purposefully left blank", // purposefully → purposely
+  "same as previously", // previously → previous
+  // Article/stopword insertion ({the, a, an, to} dropped before comparison):
+  "refer to attachment", // refer → see, to dropped, attachment → attached
+  "see the attachment", // the dropped, attachment → attached
+  "refer to the attachment", // both stopwords dropped
+  "refer to enclosure", // refer → see, to dropped, enclosure → enclosed
+  "the attachment", // the dropped → the round-5 single-token entry "attached"
+  // Glued (condensed) permutation/morphology combinations:
+  "seeattachment", // glued morphological variant (expanded condensed map)
+  "leftintentionallyblank", // glued word-order permutation (expanded condensed map)
+  // Round-5 swept conventional entries (each closed under permutation,
+  // stopwords, and morphology by the structural rules):
+  "see enclosed",
+  "attached",
+  "enclosed",
+  "deliberately blank",
+  "left empty",
+  "intentionally left empty",
+  "purposely left blank",
+  "intentionally omitted",
+  "same as previous",
+  "as previous",
+  "space intentionally left blank",
+  "this space intentionally left blank",
 ]);
 
 /**
@@ -141,6 +186,16 @@ export const LEGITIMATE_POLICY_SAMPLES: readonly string[] = Object.freeze([
   "To do that, escalate to the operator and halt the series first.",
   "Awaiting venue confirmation, the operator holds settlement open and escalates within 24h.",
   "Not yet resolved markets are held open and escalated to the operator after 48 hours.",
+  // --- Round-5 boundary additions (R5-M1 item 4): the canonical-multiset and
+  // --- expanded-condensed rules are WHOLE-FIELD only, so a real sentence
+  // --- CONTAINING the conventional words must keep parsing AND activating.
+  // --- The first two are the reviewer's own negatives, verbatim.
+  "The attachment referenced in §2 governs disputes.",
+  "Intentionally leaving the venue field blank is refused by the schema.",
+  "See §4.",
+  "Refer all disputes to the operator; see §4 for the escalation path.",
+  "Attached exhibits do not override this policy; the stated rule governs.",
+  "Blank observations are refused and escalated to the operator.",
 ]);
 
 const baseSpec = {

@@ -93,7 +93,17 @@ import {
  * slipped through — now adjacent tokens are joined and tested against the
  * marker list at any position ({@link whitespaceJoinedMarkerReason}), and a
  * whole field opening with a family head refuses regardless of its tail
- * ({@link wholeFieldFamilyReason})).
+ * ({@link wholeFieldFamilyReason});
+ * and again in round 5: the conventional unfinished-field ENTRIES were matched
+ * exact/condensed-only, so a word-order permutation (`"left intentionally
+ * blank"`) and a morphological variant (`"see attachment"`) both slipped
+ * through — now a whole-field value whose canonical TOKEN MULTISET (stopwords
+ * {@link PLACEHOLDER_STOPWORD_TOKENS} dropped, morphological variants
+ * {@link CONVENTIONAL_TOKEN_CANONICAL} folded) equals an enumerated entry's
+ * refuses regardless of word order ({@link canonicalMultisetKey}), and the
+ * condensed (whitespace-removed) comparison covers every permutation of every
+ * listed morphological-variant spelling of every entry, so gluing cannot
+ * revive a permuted or morphed entry either).
  * The value is first put through the Unicode gate of
  * {@link placeholderRuleTextReason} (NFKC, mixed-script refusal, confusable
  * folding, non-ASCII stripping — the exact rule is documented there), and each
@@ -110,7 +120,19 @@ import {
  * 3. the normalized form, with ALL whitespace removed, equals a listed entry
  *    with its whitespace removed (round 4: `"un known"` → `"unknown"`,
  *    `"pend ing"` → `"pending"` — a whole-field entry cannot be revived by
- *    splitting it, whatever the split points); or
+ *    splitting it, whatever the split points), where "a listed entry" covers,
+ *    since round 5, every word-order permutation of every listed
+ *    morphological-variant spelling of the entry (`"seeattachment"`,
+ *    `"leftintentionallyblank"` — gluing cannot revive a permuted or morphed
+ *    entry); or
+ * 3a. (round 5) the normalized form's canonical TOKEN MULTISET — stopwords
+ *    {@link PLACEHOLDER_STOPWORD_TOKENS} dropped, morphological variants
+ *    {@link CONVENTIONAL_TOKEN_CANONICAL} folded to their canonical token —
+ *    equals a listed entry's canonical multiset, so a conventional entry
+ *    refuses regardless of word order, inserted articles, or listed
+ *    morphology (`"left intentionally blank"`, `"see attachment"`,
+ *    `"refer to the attachment"`); whole-field only, and cardinality must
+ *    match exactly, so a real sentence CONTAINING the words still parses; or
  * 4. the normalized form is a whole-field UNFINISHED-FORM FAMILY — it opens
  *    with `pending`, `awaiting`, `not yet`, `yet to be`, or `to be` and
  *    carries at most {@link WHOLE_FIELD_FAMILY_MAX_TAIL_TOKENS} further
@@ -318,7 +340,163 @@ export const PLACEHOLDER_RULE_TEXTS: readonly string[] = Object.freeze([
   "nothing here",
   "nothing yet",
   "no content",
+  // Round-5 additions (review finding R5-M1, sweep): conventional
+  // unfinished-field entries whose permutation/morphology neighbors were
+  // still live. Every entry in this list — round-5 or earlier — is closed
+  // under word-order permutation, article insertion/removal
+  // ({@link PLACEHOLDER_STOPWORD_TOKENS}), and the bounded morphology table
+  // ({@link CONVENTIONAL_TOKEN_CANONICAL}) by the canonical-multiset rule,
+  // so these entries need only name each conventional phrase once.
+  // Whole-field ONLY.
+  "see enclosed",
+  "attached",
+  "enclosed",
+  "deliberately blank",
+  "left empty",
+  "intentionally left empty",
+  "purposely left blank",
+  "intentionally omitted",
+  "same as previous",
+  "as previous",
+  "space intentionally left blank",
+  "this space intentionally left blank",
 ]);
+
+/**
+ * Tokens ignored when comparing a whole-field value against a conventional
+ * entry's token multiset (round-5 review, R5-M1).
+ *
+ * EXACTLY the four English article/infinitive particles `the`, `a`, `an`,
+ * `to` — dropped from BOTH sides of the comparison, so `"see the attachment"`
+ * and `"refer to attachment"` match `"see attached"`. Deliberately tiny: a
+ * larger stopword set (of, in, is, …) would begin matching real sentences.
+ * The whole-field cardinality requirement (every non-stopword token must be
+ * accounted for) is what keeps a substantive sentence containing these words
+ * out of reach.
+ */
+export const PLACEHOLDER_STOPWORD_TOKENS: readonly string[] = Object.freeze([
+  "the",
+  "a",
+  "an",
+  "to",
+]);
+
+const PLACEHOLDER_STOPWORD_SET: ReadonlySet<string> = new Set(PLACEHOLDER_STOPWORD_TOKENS);
+
+/**
+ * Morphological variants of the conventional-entry vocabulary, mapped
+ * variant → canonical token (round-5 review, R5-M1).
+ *
+ * A BOUNDED, EXPLICIT table — no stemmer, no dependency. Each row is a form a
+ * colleague would read as the same conventional word: verb/noun/plural forms
+ * of the referential words (`attachment` → `attached`, `enclosure` →
+ * `enclosed`), the referential verb class (`refer`/`referred`/`referring` →
+ * `see` — "refer above" and "see above" are the same convention), the
+ * direction pair (`below` → `above` — "see below" and "see above" are the
+ * same convention, so one canonical class covers both), adjective↔adverb
+ * pairs of the blank-field adverbs, and plurals of listed nouns. Folding is
+ * used only to MATCH (a fold can cause a refusal, never an acceptance), and
+ * it applies ONLY inside the whole-field canonical-multiset and condensed
+ * comparisons — mid-sentence uses of these ordinary words are untouched.
+ */
+export const CONVENTIONAL_TOKEN_CANONICAL: Readonly<Record<string, string>> = Object.freeze({
+  attach: "attached",
+  attaches: "attached",
+  attaching: "attached",
+  attachment: "attached",
+  attachments: "attached",
+  enclose: "enclosed",
+  encloses: "enclosed",
+  enclosing: "enclosed",
+  enclosure: "enclosed",
+  enclosures: "enclosed",
+  refer: "see",
+  refers: "see",
+  referred: "see",
+  referring: "see",
+  below: "above",
+  intentional: "intentionally",
+  deliberate: "deliberately",
+  purposeful: "purposely",
+  purposefully: "purposely",
+  dittos: "ditto",
+  contents: "content",
+  blanks: "blank",
+  previously: "previous",
+});
+
+/** Folds one normalized token to its canonical conventional form. */
+function canonicalConventionalToken(token: string): string {
+  return CONVENTIONAL_TOKEN_CANONICAL[token] ?? token;
+}
+
+/**
+ * The order-insensitive canonical key of a token list: stopwords dropped,
+ * morphological variants folded, tokens sorted. `undefined` when nothing
+ * remains (a value of pure stopwords matches no entry rather than an empty
+ * key).
+ */
+function canonicalMultisetKey(tokens: readonly string[]): string | undefined {
+  const canonical = tokens
+    .filter((token) => !PLACEHOLDER_STOPWORD_SET.has(token))
+    .map(canonicalConventionalToken)
+    .sort();
+  return canonical.length === 0 ? undefined : canonical.join(" ");
+}
+
+/**
+ * Every {@link PLACEHOLDER_RULE_TEXTS} entry keyed by its canonical token
+ * multiset (round-5 review, R5-M1): a whole-field value with the same
+ * canonical multiset is the same conventional phrase whatever its word
+ * order. First entry wins where canonical classes merge keys (`"see above"`
+ * and `"refer below"` share one key), so the reported entry is a canonical
+ * representative of the class.
+ */
+const CANONICAL_PLACEHOLDER_MULTISETS: ReadonlyMap<string, string> = (() => {
+  const map = new Map<string, string>();
+  for (const entry of PLACEHOLDER_RULE_TEXTS) {
+    const key = canonicalMultisetKey(entry.split(" "));
+    if (key !== undefined && !map.has(key)) {
+      map.set(key, entry);
+    }
+  }
+  return map;
+})();
+
+/**
+ * canonical token → every listed spelling of it (the canonical itself plus
+ * each {@link CONVENTIONAL_TOKEN_CANONICAL} variant), for entry-side
+ * expansion of the condensed map.
+ */
+const CONVENTIONAL_CANONICAL_TO_VARIANTS: ReadonlyMap<string, readonly string[]> = (() => {
+  const classes = new Map<string, string[]>();
+  for (const [variant, canonical] of Object.entries(CONVENTIONAL_TOKEN_CANONICAL)) {
+    const list = classes.get(canonical) ?? [canonical];
+    list.push(variant);
+    classes.set(canonical, list);
+  }
+  return classes;
+})();
+
+/** Every listed spelling of `token`'s canonical class (identity when unlisted). */
+function tokenVariantForms(token: string): readonly string[] {
+  return CONVENTIONAL_CANONICAL_TO_VARIANTS.get(canonicalConventionalToken(token)) ?? [token];
+}
+
+/** All orderings of `tokens` (entries carry no duplicate tokens and at most five). */
+function tokenPermutations(tokens: readonly string[]): readonly (readonly string[])[] {
+  if (tokens.length <= 1) {
+    return [tokens];
+  }
+  const output: (readonly string[])[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const rest = [...tokens.slice(0, index), ...tokens.slice(index + 1)];
+    for (const permutation of tokenPermutations(rest)) {
+      output.push([tokens[index] ?? "", ...permutation]);
+    }
+  }
+  return output;
+}
 
 /**
  * Placeholder markers that poison a rule even as a PREFIX of a longer value.
@@ -388,10 +566,44 @@ const MAX_MARKER_LENGTH = Math.max(...PLACEHOLDER_MARKER_TOKENS.map((marker) => 
  * `"pend ing"`, `"to be de termined"`), because the whole field with ALL
  * spaces removed is compared against the entries with THEIR spaces removed.
  * Whole-field only — this rule never fires mid-sentence.
+ *
+ * EXPANDED in round 5 (R5-M1, one step ahead of the token-level closure):
+ * the keys cover every word-order permutation of every listed
+ * morphological-variant spelling of every entry, so a GLUED permutation or
+ * morphological variant (`"seeattachment"`, `"leftintentionallyblank"`)
+ * cannot revive an entry through the condensed comparison either. The
+ * expansion is entry-side and finite (entries carry at most five tokens and
+ * each token at most six listed spellings — a few thousand keys, computed
+ * once at module load). Keys do NOT include glued stopword insertions
+ * (`"seetheattachment"`): segmenting unspaced text is out of scope, and the
+ * residual is disclosed rather than claimed away. First entry wins where
+ * classes merge, as in the canonical-multiset map.
  */
-const CONDENSED_PLACEHOLDER_RULE_TEXTS: ReadonlyMap<string, string> = new Map(
-  PLACEHOLDER_RULE_TEXTS.map((entry) => [entry.split(" ").join(""), entry] as const),
-);
+const CONDENSED_PLACEHOLDER_RULE_TEXTS: ReadonlyMap<string, string> = (() => {
+  const map = new Map<string, string>();
+  for (const entry of PLACEHOLDER_RULE_TEXTS) {
+    const variantSets = entry.split(" ").map(tokenVariantForms);
+    let sequences: (readonly string[])[] = [[]];
+    for (const variants of variantSets) {
+      const next: (readonly string[])[] = [];
+      for (const sequence of sequences) {
+        for (const variant of variants) {
+          next.push([...sequence, variant]);
+        }
+      }
+      sequences = next;
+    }
+    for (const sequence of sequences) {
+      for (const permutation of tokenPermutations(sequence)) {
+        const key = permutation.join("");
+        if (!map.has(key)) {
+          map.set(key, entry);
+        }
+      }
+    }
+  }
+  return map;
+})();
 
 /**
  * Whole-field unfinished-form FAMILY heads (round-4 review, M-2).
@@ -786,8 +998,9 @@ function whitespaceJoinedMarkerReason(form: string): string | undefined {
 
 /**
  * Runs the ASCII placeholder rules (whole-field, condensed whole-field,
- * whole-field family, prefix, any-position marker, whitespace-split marker,
- * digit folds) over one candidate string. `undefined` when nothing matched.
+ * canonical-multiset whole-field, whole-field family, prefix, any-position
+ * marker, whitespace-split marker, digit folds) over one candidate string.
+ * `undefined` when nothing matched.
  */
 function asciiPlaceholderReason(candidate: string): string | undefined {
   const normalized = normalizedRuleText(candidate);
@@ -808,6 +1021,16 @@ function asciiPlaceholderReason(candidate: string): string | undefined {
   for (const form of forms) {
     if (PLACEHOLDER_RULE_TEXTS.includes(form)) {
       return `normalizes to the placeholder "${form}"`;
+    }
+    // The canonical-multiset rule runs BEFORE the condensed rule so that a
+    // token-level permutation/morphology variant is reported by the rule that
+    // owns the class; the condensed rule then owns only the GLUED forms
+    // (whose single token matches no multiset).
+    const canonicalKey = canonicalMultisetKey(form.split(" "));
+    const canonicalEntry =
+      canonicalKey === undefined ? undefined : CANONICAL_PLACEHOLDER_MULTISETS.get(canonicalKey);
+    if (canonicalEntry !== undefined) {
+      return `matches the placeholder "${canonicalEntry}" up to word order, stopwords (the/a/an/to), and listed morphological variants`;
     }
     const condensedEntry = CONDENSED_PLACEHOLDER_RULE_TEXTS.get(form.split(" ").join(""));
     if (condensedEntry !== undefined) {

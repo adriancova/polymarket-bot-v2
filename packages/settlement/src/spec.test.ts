@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { SettlementSpecValidationError } from "./errors.js";
 import {
+  CONVENTIONAL_TOKEN_CANONICAL,
+  PLACEHOLDER_STOPWORD_TOKENS,
   RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24,
   WHOLE_FIELD_FAMILY_MAX_TAIL_TOKENS,
   isReviewedSettlementSpec,
@@ -403,6 +405,109 @@ describe("SettlementSpecSchema", () => {
       expect(
         placeholderRuleTextReason("Pending completion of the dispute review, no position is settled."),
       ).toBeUndefined();
+    });
+  });
+
+  // Round-5 review, R5-M1: pin WHICH rule catches each newly closed class and
+  // which boundary each new rule must not cross. The conventional-entry class
+  // is closed STRUCTURALLY (canonical token multisets + entry-side condensed
+  // expansion), not by enumerating the two reviewer strings.
+  describe("placeholderRuleTextReason round-5 rules (R5-M1)", () => {
+    it("refuses a word-order permutation of a conventional entry (reviewer probe)", () => {
+      expect(placeholderRuleTextReason("left intentionally blank")).toContain("up to word order");
+      expect(placeholderRuleTextReason("left intentionally blank")).toContain(
+        "intentionally left blank",
+      );
+      expect(placeholderRuleTextReason("blank intentionally left")).toContain("up to word order");
+      expect(placeholderRuleTextReason("intentionally blank left")).toContain("up to word order");
+      expect(placeholderRuleTextReason("blank left")).toContain("left blank");
+    });
+
+    it("refuses a morphological variant of a referential entry (reviewer probe)", () => {
+      expect(placeholderRuleTextReason("see attachment")).toContain("see attached");
+      expect(placeholderRuleTextReason("see attachments")).toContain("see attached");
+      expect(placeholderRuleTextReason("see enclosure")).toContain("see enclosed");
+      expect(placeholderRuleTextReason("dittos")).toContain("ditto");
+      expect(placeholderRuleTextReason("no contents")).toContain("no content");
+      expect(placeholderRuleTextReason("purposefully left blank")).toContain(
+        "purposely left blank",
+      );
+    });
+
+    it("drops exactly the four stopwords the/a/an/to before comparing", () => {
+      expect([...PLACEHOLDER_STOPWORD_TOKENS]).toEqual(["the", "a", "an", "to"]);
+      expect(placeholderRuleTextReason("see the attachment")).toContain("see attached");
+      expect(placeholderRuleTextReason("refer to attachment")).toContain("see attached");
+      expect(placeholderRuleTextReason("refer to the attachment")).toContain("see attached");
+      expect(placeholderRuleTextReason("the attachment")).toContain("attached");
+    });
+
+    it("keeps the morphology table bounded and explicit (no stemmer)", () => {
+      // Pin the load-bearing rows: a refactor that drops a class silently
+      // reopens its variants. The table is variant → canonical.
+      expect(CONVENTIONAL_TOKEN_CANONICAL["attachment"]).toBe("attached");
+      expect(CONVENTIONAL_TOKEN_CANONICAL["attachments"]).toBe("attached");
+      expect(CONVENTIONAL_TOKEN_CANONICAL["enclosure"]).toBe("enclosed");
+      expect(CONVENTIONAL_TOKEN_CANONICAL["refer"]).toBe("see");
+      expect(CONVENTIONAL_TOKEN_CANONICAL["below"]).toBe("above");
+      expect(Object.isFrozen(CONVENTIONAL_TOKEN_CANONICAL)).toBe(true);
+      // Un-stemmed forms outside the table stay outside: "specified" is not
+      // laundered into "unspecified", and unknown words are identity.
+      expect(CONVENTIONAL_TOKEN_CANONICAL["specified"]).toBeUndefined();
+      expect(CONVENTIONAL_TOKEN_CANONICAL["document"]).toBeUndefined();
+    });
+
+    it("refuses glued permutation/morphology combinations (expanded condensed map)", () => {
+      expect(placeholderRuleTextReason("seeattachment")).toContain("ignoring whitespace");
+      expect(placeholderRuleTextReason("seeattachment")).toContain("see attached");
+      expect(placeholderRuleTextReason("leftintentionallyblank")).toContain("ignoring whitespace");
+      expect(placeholderRuleTextReason("leftintentionallyblank")).toContain(
+        "intentionally left blank",
+      );
+    });
+
+    it("stays whole-field only: real sentences containing the words parse (reviewer negatives)", () => {
+      expect(
+        placeholderRuleTextReason("The attachment referenced in §2 governs disputes."),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("Intentionally leaving the venue field blank is refused by the schema."),
+      ).toBeUndefined();
+      expect(placeholderRuleTextReason("See §4.")).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("Refer all disputes to the operator; see §4 for the escalation path."),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("Attached exhibits do not override this policy; the stated rule governs."),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("Blank observations are refused and escalated to the operator."),
+      ).toBeUndefined();
+    });
+
+    it("keeps the disclosed round-5 residuals visible rather than claiming them away", () => {
+      // An entry plus a substantive (non-stopword) extra token is NOT closed:
+      // cardinality must match exactly, so this passes the matcher and the
+      // human verified_by gate remains the defense. Pinned so the residual
+      // cannot silently move in either direction.
+      expect(placeholderRuleTextReason("see attached document")).toBeUndefined();
+      // A NEW COMBINATION of enumerated tokens that is not itself an entry
+      // (nor a permutation/morph of one) is a novel family, not closed.
+      expect(placeholderRuleTextReason("ditto above")).toBeUndefined();
+      // A glued form with a fused stopword: segmenting unspaced text is out
+      // of scope for the condensed expansion (documented on the map).
+      expect(placeholderRuleTextReason("seetheattachment")).toBeUndefined();
+    });
+
+    it("keeps the pre-round-5 disclosed residuals passing (no silent widening)", () => {
+      // These demonstrate the round-4 residual disclosure (novel families,
+      // split prefixes, family-bound padding, novel prose) and must KEEP
+      // passing: the round-5 closure is scoped to the conventional-entry
+      // class, not a general prose judgment.
+      expect(placeholderRuleTextReason("ask ops first")).toBeUndefined();
+      expect(placeholderRuleTextReason("Ask Bob before settling.")).toBeUndefined();
+      expect(placeholderRuleTextReason("To be clear, disputes settle per §4.")).toBeUndefined();
+      expect(placeholderRuleTextReason("un specified complete later")).toBeUndefined();
     });
   });
 
