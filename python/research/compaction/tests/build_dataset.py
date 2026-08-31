@@ -21,6 +21,8 @@ from typing import Any
 
 import duckdb
 
+from research.compaction.validate import canonical_frame_line
+
 _COLUMNS = [
     ("datasetRowOrdinal", "INT64", False),
     ("segmentId", "BYTE_ARRAY_UTF8", False),
@@ -57,14 +59,17 @@ class Row:
     replay_eligible: bool = True
     exclusion_reason: str | None = None
     payload_sha256: str | None = None
+    #: Override for the STORED frameLineSha256, so a test can forge a claim
+    #: the reconstructed bytes do not back (round-2 review, M-A). Left `None`,
+    #: the stored digest is the honest hash of `frame_line(self)`.
+    frame_line_sha256: str | None = None
 
     def to_tuple(self) -> tuple[Any, ...]:
         payload_digest = self.payload_sha256 or hashlib.sha256(
             self.payload.encode("utf-8")
         ).hexdigest()
-        line_digest = hashlib.sha256(
-            f"{self.segment_id}/{self.ingest_seq}".encode("utf-8")
-        ).hexdigest()
+        line = frame_line(self)
+        line_digest = self.frame_line_sha256 or hashlib.sha256(line).hexdigest()
         return (
             self.ordinal,
             self.segment_id,
@@ -81,11 +86,35 @@ class Row:
             self.payload,
             payload_digest,
             100 + self.ordinal,
-            420,
+            len(line),
             line_digest,
             self.replay_eligible,
             self.exclusion_reason,
         )
+
+
+def frame_line(row: Row) -> bytes:
+    """The canonical WAL line the row's archived columns reconstruct to.
+
+    The validator recomputes ``frameLineSha256`` from the archived columns
+    (``canonical_frame_line``), so a synthetic dataset must carry honest
+    digests to validate — the earlier builder fabricated them from
+    ``segment_id/ingest_seq``, which is exactly the kind of unbacked claim the
+    round-2 remediation made the validator stop trusting.
+    """
+    return canonical_frame_line(
+        gateway_epoch=EPOCH,
+        ingest_seq=row.ingest_seq,
+        source="polymarket",
+        endpoint="wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        connection_id="conn-1",
+        subscription_generation=0,
+        received_at="2026-01-01T00:00:00.000Z",
+        received_monotonic_ns="1000000",
+        payload_utf8=row.payload,
+        payload_sha256=row.payload_sha256
+        or hashlib.sha256(row.payload.encode("utf-8")).hexdigest(),
+    )
 
 
 def write_object(path: Path, rows: list[Row]) -> tuple[int, str]:
@@ -380,6 +409,7 @@ __all__ = [
     "build_dataset",
     "build_manifest",
     "default_rows",
+    "frame_line",
     "incident_window",
     "replace",
     "rewrite_manifest",

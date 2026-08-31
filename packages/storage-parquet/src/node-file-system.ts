@@ -195,9 +195,11 @@ export function fileSystemObjectStore(rootDirectory: string): ObjectStore {
  *   unlink, {@link verifyRetentionProof} independently fetches the persisted
  *   dataset manifest and its digest sidecar from the object store, requires
  *   the manifest to pin this exact segment (checksum, record count, byte
- *   size, object key, object checksum), requires the segment file about to be
- *   deleted to hash to that pin, and requires the stored object to reproduce
- *   the file's frame lines byte for byte. A caller supplying an arbitrary
+ *   size, whole-file digest, object key, object checksum), requires the
+ *   segment file about to be deleted to hash to those pins — including the
+ *   whole-file `segmentFileSha256`, which is what covers the footer the WAL
+ *   span digest cannot — and requires the stored object to reproduce the
+ *   file's frame lines byte for byte. A caller supplying an arbitrary
  *   object, its own digest, and a nonexistent manifest key — round-1 review's
  *   probe — is refused with `RetentionGuardError`.
  * - It removes the segment **and** its sidecar manifest, in that order. A

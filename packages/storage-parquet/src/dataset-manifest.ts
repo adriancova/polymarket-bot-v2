@@ -83,6 +83,18 @@ export type DatasetSegmentEntry = {
   readonly segmentSha256: string;
   readonly checksummedByteLength: number;
   readonly byteSize: number;
+  /**
+   * SHA-256 over the segment file's **entire** `byteSize` bytes, footer
+   * included, computed at compaction time from the bytes that were verified
+   * and archived.
+   *
+   * `segmentSha256` covers only the checksummed span (`wal-format.md` §7),
+   * which necessarily excludes the footer line — so it cannot detect a
+   * same-length mutation of the footer made after compaction. Retention
+   * (`retention-proof.ts`) requires the file it is about to delete to hash to
+   * this pin over its full length, closing that gap (round-2 review, L-2).
+   */
+  readonly segmentFileSha256: string;
   readonly recordCount: number;
   readonly firstIngestSeq: string | null;
   readonly lastIngestSeq: string | null;
@@ -336,6 +348,7 @@ export function encodeDatasetManifest(manifest: DatasetManifest): Uint8Array {
       segmentSha256: segment.segmentSha256,
       checksummedByteLength: segment.checksummedByteLength,
       byteSize: segment.byteSize,
+      segmentFileSha256: segment.segmentFileSha256,
       recordCount: segment.recordCount,
       firstIngestSeq: segment.firstIngestSeq,
       lastIngestSeq: segment.lastIngestSeq,

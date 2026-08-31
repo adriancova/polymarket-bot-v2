@@ -21,13 +21,21 @@ The checks, and what each one would catch:
    a faithful reconstruction of dispatch order (§8.4) rather than a hope.
 5. **Row integrity.** ``ingestSeq`` matches the canonical unsigned-integer
    grammar of ``wal-format.md`` §5 (up to **40 digits** — which is why no
-   check here ever casts it to a bounded integer type; see below), and every
-   row's ``replayEligible``/``exclusionReason`` pair has a legal shape.
+   check here ever casts it to a bounded integer type; see below), every
+   row's ``replayEligible``/``exclusionReason`` pair has a legal shape, and
+   every row's ``frameLineSha256`` is **recomputed**: the original WAL line is
+   independently reconstructed from the archived columns — an exact mirror of
+   the TypeScript ``encodeFrameLine`` per ``wal-format.md`` §5 (the ten §9.1
+   keys in their declared order, ``JSON.stringify`` escaping, one terminating
+   ``LF``) — and hashed. A stored digest is a claim, never evidence.
 6. **Deduplication, with provenance.** Exactly one replay-eligible row per
    ``(gatewayEpoch, ingestSeq)``; and every row *marked* ``duplicate:<n>``
    really is one — the row at ordinal ``n`` exists, comes earlier, shares the
-   key, and is byte-identical (same ``frameLineSha256``). A mislabeled
-   "duplicate" would silently drop a genuine record from replay.
+   key, is not itself duplicate-marked, and its **verified** bytes (the
+   recomputed digests of check 5, never the stored strings) are identical to
+   the marked row's. A mislabeled "duplicate" would silently drop a genuine
+   record from replay — round-2 review forged one by stamping the same
+   claimed ``frameLineSha256`` on two different payloads.
 7. **Incident exclusion, bidirectionally.** Every replay-eligible row inside a
    pinned window is an error; every row *labeled* ``incident:<id>`` must lie
    inside that window's declared range; the per-window counts match; and the
@@ -47,6 +55,14 @@ lengths first, then lexicographically — never by casting: the grammar admits
 40 digits and even DuckDB's ``HUGEINT`` (INT128) cannot represent that domain.
 A finding is returned, not raised: a validation job that stops at the first
 problem tells an operator one thing about a dataset when they need all of them.
+That contract holds for malformed artifacts too: an unknown pinned column
+type, a pinned object that does not decode as Parquet (a manifest and its
+digest sidecar can consistently pin arbitrary bytes), and any DuckDB failure
+mid-check all become structured findings naming what broke — never an escaped
+exception. The one documented refusal is ``ManifestError``: a manifest that is
+absent, unreadable, hostile, or of an unknown version cannot even *name* the
+dataset being described, so there is exactly one thing to tell the operator
+(exit code 2 at the CLI, a typed raise at the API).
 """
 
 from __future__ import annotations
@@ -89,6 +105,57 @@ _DUCKDB_TYPE_BY_PHYSICAL_TYPE = {
 }
 
 _SEVERITIES = ("error", "warning")
+
+
+def canonical_frame_line(
+    *,
+    gateway_epoch: str,
+    ingest_seq: str,
+    source: str,
+    endpoint: str,
+    connection_id: str,
+    subscription_generation: int,
+    received_at: str,
+    received_monotonic_ns: str,
+    payload_utf8: str,
+    payload_sha256: str,
+) -> bytes:
+    """The exact bytes of the WAL segment line these archived fields came from.
+
+    This mirrors ``encodeFrameLine`` in
+    ``packages/storage-parquet/src/wal-format.ts`` **byte for byte**, per
+    ``wal-format.md`` §5 and §12.4: ``JSON.stringify`` of the ten handoff §9.1
+    keys in their declared order, plus the terminating ``LF``, encoded as
+    UTF-8 — the §5 rule that one record has exactly one byte sequence is what
+    entitles this module to *recompute* ``frameLineSha256`` instead of
+    trusting the stored string.
+
+    ``json.dumps(..., ensure_ascii=False, separators=(",", ":"))`` produces
+    the identical bytes: no whitespace, insertion-ordered keys, and the same
+    escape set as ``JSON.stringify`` — exactly ``"``, ``\\``, and the C0
+    controls, with the short escapes ``\\b \\t \\n \\f \\r`` and lowercase
+    ``\\u00xx`` for the rest; everything else (including DEL, U+2028/U+2029,
+    and astral-plane characters) is emitted literally by both. The committed
+    fixture — written by the real TypeScript compactor with adversarial
+    payloads (NUL, DEL, a tab, an emoji, a literal backslash-n) — is the
+    cross-implementation proof that the two encoders agree
+    (``tests/test_committed_fixture.py``).
+    """
+    record = {
+        "gatewayEpoch": gateway_epoch,
+        "ingestSeq": ingest_seq,
+        "source": source,
+        "endpoint": endpoint,
+        "connectionId": connection_id,
+        "subscriptionGeneration": subscription_generation,
+        "receivedAt": received_at,
+        "receivedMonotonicNs": received_monotonic_ns,
+        "payloadUtf8": payload_utf8,
+        "payloadSha256": payload_sha256,
+    }
+    return (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
 
 
 @dataclass(frozen=True)
@@ -203,6 +270,46 @@ def _check_objects(
     return present
 
 
+def _check_objects_decode(
+    connection: duckdb.DuckDBPyConnection,
+    manifest: DatasetManifest,
+    object_root: Path,
+    findings: list[ValidationFinding],
+) -> list[Path]:
+    """Check 1b: every present object actually decodes as Parquet.
+
+    Presence, length, and checksum (check 1) say only that the store kept the
+    bytes the manifest pins — and a manifest plus its digest sidecar can
+    consistently pin **arbitrary** bytes. Round-2 review pinned a text file
+    that way, and the pre-remediation validator escaped with DuckDB's raw
+    ``InvalidInputException`` instead of a finding. Here the decode failure is
+    a structured finding naming the object, and the object is excluded from
+    every query-based check below (running them against an undecodable file
+    would only repeat the same failure twenty ways).
+    """
+    readable: list[Path] = []
+    for entry in manifest.objects:
+        path = _object_path(object_root, entry.object_key)
+        if not path.is_file():
+            continue
+        try:
+            connection.execute(
+                "select count(*) from read_parquet($path)", {"path": str(path)}
+            ).fetchone()
+        except duckdb.Error as error:
+            findings.append(
+                ValidationFinding(
+                    check="object-parquet",
+                    severity="error",
+                    message=f"pinned object does not decode as Parquet: {entry.object_key}",
+                    details={"objectKey": entry.object_key, "error": str(error)},
+                )
+            )
+            continue
+        readable.append(path)
+    return readable
+
+
 def _check_layout(
     connection: duckdb.DuckDBPyConnection,
     manifest: DatasetManifest,
@@ -236,6 +343,34 @@ def _check_layout(
         )
         return
 
+    # A pinned physical type outside the implemented set must be a finding,
+    # not a KeyError out of the dictionary lookup below: round-2 review pinned
+    # "BOGUS" and the pre-remediation validator escaped uncaught, including
+    # through main().
+    unknown_types = sorted(
+        {
+            physical_type
+            for _name, physical_type, _nullable in manifest.columns
+            if physical_type not in _DUCKDB_TYPE_BY_PHYSICAL_TYPE
+        }
+    )
+    if unknown_types:
+        findings.append(
+            ValidationFinding(
+                check="layout-column-type",
+                severity="error",
+                message=(
+                    "manifest pins column physical types this validator does not "
+                    "implement; the pinned layout cannot be evaluated"
+                ),
+                details={
+                    "unknown": unknown_types,
+                    "supported": sorted(_DUCKDB_TYPE_BY_PHYSICAL_TYPE),
+                },
+            )
+        )
+        return
+
     described = connection.execute(
         "describe select * from read_parquet($paths)", {"paths": [str(p) for p in paths]}
     ).fetchall()
@@ -260,12 +395,20 @@ def _check_counts(
     manifest: DatasetManifest,
     object_root: Path,
     findings: list[ValidationFinding],
+    readable: frozenset[Path],
+    skip_totals: bool,
 ) -> int:
-    """Check 3: per-object and total row counts reconcile."""
+    """Check 3: per-object and total row counts reconcile.
+
+    Objects that failed the decode gate (check 1b) are skipped — their row
+    counts are unobservable — and when any object failed it, the dataset-level
+    totals are skipped too rather than reported against a partial sum that
+    would bury the decode finding under arithmetic noise.
+    """
     total = 0
     for entry in manifest.objects:
         path = _object_path(object_root, entry.object_key)
-        if not path.is_file():
+        if not path.is_file() or path not in readable:
             continue
         row_count = connection.execute(
             "select count(*) from read_parquet($path)", {"path": str(path)}
@@ -297,6 +440,8 @@ def _check_counts(
                 )
             )
 
+    if skip_totals:
+        return total
     counts = manifest.record_counts
     if total != counts.written:
         findings.append(
@@ -445,13 +590,186 @@ def _check_row_integrity(
         )
 
 
+def _check_frame_lines(
+    connection: duckdb.DuckDBPyConnection,
+    paths: Sequence[Path],
+    findings: list[ValidationFinding],
+) -> None:
+    """Checks 5b and 6b: recomputed frame-line digests, and duplicate
+    provenance decided on them.
+
+    Every row's original WAL line is independently reconstructed from the
+    archived columns (``canonical_frame_line``) and hashed; a row whose stored
+    ``frameLineSha256`` or ``frameLineByteLength`` disagrees with the
+    reconstruction is a ``frame-line-digest`` finding. This is what makes the
+    stored digest *evidence*: round-2 review stamped one claimed digest on two
+    different payloads and the pre-remediation validator — which compared the
+    stored strings to each other — accepted a genuine frame's silent exclusion
+    as a "duplicate".
+
+    Duplicate provenance therefore uses only **verified** digests: a row
+    marked ``duplicate:<n>`` must have the row at ordinal ``n`` existing,
+    earlier, sharing ``(gatewayEpoch, ingestSeq)``, not itself
+    duplicate-marked, and reconstructing to byte-identical WAL-line bytes.
+    """
+    if not paths:
+        return
+    path_strings = [str(p) for p in paths]
+
+    marked_rows = connection.execute(
+        """
+        select datasetRowOrdinal, gatewayEpoch, ingestSeq, exclusionReason
+        from read_parquet($paths)
+        where exclusionReason like 'duplicate:%'
+        order by datasetRowOrdinal
+        """,
+        {"paths": path_strings},
+    ).fetchall()
+    marked: list[tuple[int, str, str, str, int | None]] = []
+    needed: set[int] = set()
+    for ordinal, epoch, seq, reason in marked_rows:
+        claimed_text = reason[len("duplicate:") :]
+        claimed = int(claimed_text) if _CANONICAL_UNSIGNED.match(claimed_text) else None
+        marked.append((ordinal, epoch, seq, reason, claimed))
+        needed.add(ordinal)
+        if claimed is not None:
+            needed.add(claimed)
+
+    # One streaming pass over every row: reconstruct, hash, compare. The
+    # verified digest is retained only for the ordinals duplicate provenance
+    # needs, so memory is bounded by the duplicate count, not the dataset.
+    cursor = connection.execute(
+        """
+        select datasetRowOrdinal, gatewayEpoch, ingestSeq, source, endpoint,
+               connectionId, subscriptionGeneration, receivedAt,
+               receivedMonotonicNs, payloadUtf8, payloadSha256,
+               frameLineByteLength, frameLineSha256, exclusionReason
+        from read_parquet($paths)
+        order by datasetRowOrdinal
+        """,
+        {"paths": path_strings},
+    )
+    mismatch_count = 0
+    mismatch_sample: list[list[Any]] = []
+    verified: dict[int, tuple[str, str, str | None, str | None]] = {}
+    while True:
+        batch = cursor.fetchmany(2048)
+        if not batch:
+            break
+        for row in batch:
+            (
+                ordinal,
+                epoch,
+                seq,
+                source,
+                endpoint,
+                connection_id,
+                generation,
+                received_at,
+                monotonic_ns,
+                payload,
+                payload_digest,
+                stored_length,
+                stored_digest,
+                reason,
+            ) = row
+            recomputed: str | None
+            try:
+                line = canonical_frame_line(
+                    gateway_epoch=epoch,
+                    ingest_seq=seq,
+                    source=source,
+                    endpoint=endpoint,
+                    connection_id=connection_id,
+                    subscription_generation=generation,
+                    received_at=received_at,
+                    received_monotonic_ns=monotonic_ns,
+                    payload_utf8=payload,
+                    payload_sha256=payload_digest,
+                )
+                recomputed = hashlib.sha256(line).hexdigest()
+                length_agrees = len(line) == stored_length
+            except (TypeError, ValueError, UnicodeEncodeError):
+                # A row whose columns cannot even be re-encoded (a NULL where
+                # the layout forbids one, an unencodable string) is a
+                # mismatch, not a crash — findings, never raises.
+                recomputed = None
+                length_agrees = False
+            if recomputed != stored_digest or not length_agrees:
+                mismatch_count += 1
+                if len(mismatch_sample) < 20:
+                    mismatch_sample.append([ordinal, stored_digest, recomputed])
+            if ordinal in needed:
+                verified[ordinal] = (epoch, seq, reason, recomputed)
+
+    if mismatch_count:
+        findings.append(
+            ValidationFinding(
+                check="frame-line-digest",
+                severity="error",
+                message=(
+                    "rows whose frameLineSha256 or frameLineByteLength does not "
+                    "match the independently reconstructed WAL line "
+                    "(wal-format.md §5 canonical form); a stored digest is a "
+                    "claim, not evidence"
+                ),
+                details={"mismatchedRows": mismatch_count, "sample": mismatch_sample},
+            )
+        )
+
+    false_provenance_count = 0
+    false_provenance_sample: list[list[Any]] = []
+    for ordinal, epoch, seq, reason, claimed in marked:
+        target = None if claimed is None else verified.get(claimed)
+        own = verified.get(ordinal)
+        problem: str | None = None
+        if claimed is None:
+            problem = "the mark does not name a canonical ordinal"
+        elif target is None:
+            problem = "no row exists at the claimed ordinal"
+        elif claimed >= ordinal:
+            problem = "the claimed first copy does not come earlier"
+        elif (target[0], target[1]) != (epoch, seq):
+            problem = "the claimed first copy has a different (gatewayEpoch, ingestSeq)"
+        elif target[2] is not None and target[2].startswith("duplicate:"):
+            problem = "the claimed first copy is itself marked as a duplicate"
+        elif own is None or own[3] is None or target[3] is None or own[3] != target[3]:
+            problem = "the verified bytes differ from the claimed first copy's"
+        if problem is not None:
+            false_provenance_count += 1
+            if len(false_provenance_sample) < 20:
+                false_provenance_sample.append([ordinal, reason, problem])
+
+    if false_provenance_count:
+        findings.append(
+            ValidationFinding(
+                check="duplicate-provenance",
+                severity="error",
+                message=(
+                    "rows are marked as duplicates without an earlier copy, at the "
+                    "ordinal their mark names, whose independently verified bytes "
+                    "are identical"
+                ),
+                details={
+                    "falselyMarkedRows": false_provenance_count,
+                    "sample": false_provenance_sample,
+                },
+            )
+        )
+
+
 def _check_deduplication(
     connection: duckdb.DuckDBPyConnection,
     manifest: DatasetManifest,
     paths: Sequence[Path],
     findings: list[ValidationFinding],
 ) -> None:
-    """Check 6: one eligible row per key, and duplicate marks carry real provenance."""
+    """Check 6: one eligible row per key, and the duplicate count is exact.
+
+    The *truth* of each duplicate mark — an earlier, byte-identical copy at
+    the claimed ordinal — is decided in :func:`_check_frame_lines` on
+    recomputed digests, never on the stored strings this query could read.
+    """
     if not paths:
         return
     duplicates = connection.execute(
@@ -493,55 +811,6 @@ def _check_deduplication(
                 severity="error",
                 message="rows marked as duplicates differ from the manifest's count",
                 details={"expected": manifest.duplicate_record_count, "observed": marked},
-            )
-        )
-
-    # Provenance: counting labels proves nothing about their truth. A row
-    # marked `duplicate:<n>` asserts that the row at ordinal `n` is an earlier,
-    # byte-identical copy of the same frame — earlier in dispatch order,
-    # sharing (gatewayEpoch, ingestSeq), and with the same frameLineSha256
-    # (duplicates are re-recordings, so the whole WAL line is identical). A
-    # mark whose claim does not hold hides a genuine record from replay.
-    false_provenance = connection.execute(
-        """
-        with data as (select * from read_parquet($paths)),
-        marked as (
-            select
-                datasetRowOrdinal,
-                gatewayEpoch,
-                ingestSeq,
-                frameLineSha256,
-                exclusionReason,
-                try_cast(substr(exclusionReason, 11) as bigint) as claimed_ordinal
-            from data
-            where exclusionReason like 'duplicate:%'
-        )
-        select m.datasetRowOrdinal, m.exclusionReason
-        from marked m
-        left join data first_copy
-            on first_copy.datasetRowOrdinal = m.claimed_ordinal
-        where m.claimed_ordinal is null
-           or first_copy.datasetRowOrdinal is null
-           or first_copy.datasetRowOrdinal >= m.datasetRowOrdinal
-           or first_copy.gatewayEpoch != m.gatewayEpoch
-           or first_copy.ingestSeq != m.ingestSeq
-           or first_copy.frameLineSha256 != m.frameLineSha256
-           or first_copy.exclusionReason like 'duplicate:%'
-        order by m.datasetRowOrdinal
-        limit 20
-        """,
-        {"paths": [str(p) for p in paths]},
-    ).fetchall()
-    if false_provenance:
-        findings.append(
-            ValidationFinding(
-                check="duplicate-provenance",
-                severity="error",
-                message=(
-                    "rows are marked as duplicates without an earlier byte-identical "
-                    "copy at the ordinal their mark names"
-                ),
-                details={"sample": [list(row) for row in false_provenance]},
             )
         )
 
@@ -876,7 +1145,12 @@ def _check_retention_receipt(
             "retention receipt names a different dataset",
             {"expected": manifest.dataset_id, "observed": document.get("datasetId")},
         )
-    manifest_digest = hashlib.sha256(manifest_file.read_bytes()).hexdigest()
+    try:
+        manifest_bytes = manifest_file.read_bytes()
+    except OSError as error:
+        broken(f"the manifest's own bytes could not be re-read: {error}")
+        return
+    manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
     if document.get("datasetManifestSha256") != manifest_digest:
         broken(
             "retention receipt pins a different manifest digest than the manifest's bytes",
@@ -891,6 +1165,7 @@ def _check_retention_receipt(
         broken("retention receipt's deletedSegments is not an array")
         return
     pinned_segments = {segment.segment_id: segment for segment in manifest.segments}
+    pinned_objects = {obj.object_key: obj for obj in manifest.objects}
     for entry in deleted:
         if not isinstance(entry, dict) or not isinstance(entry.get("segmentId"), str):
             broken("retention receipt lists a malformed deletion entry", {"entry": str(entry)})
@@ -904,6 +1179,39 @@ def _check_retention_receipt(
                 {"segmentId": segment_id},
             )
             continue
+        # Each deletion entry states WHICH verified object licensed it. Those
+        # two fields are reporting, not proof (the proof is the retention
+        # guard's, before the unlink) — but a report that contradicts the
+        # manifest it pins is a broken report, and round-2 review falsified
+        # both fields on a pinned segment with ok=True. Reconcile them.
+        receipt_object_key = entry.get("verifiedObjectKey")
+        if receipt_object_key != segment.object_key:
+            broken(
+                f"retention receipt names a different object for segment {segment_id} "
+                "than the manifest pins",
+                {
+                    "segmentId": segment_id,
+                    "pinned": segment.object_key,
+                    "receipt": receipt_object_key,
+                },
+            )
+        receipt_object_digest = entry.get("verifiedObjectSha256")
+        pinned_object = pinned_objects.get(segment.object_key)
+        if pinned_object is None:
+            broken(
+                f"the manifest pins no object entry for segment {segment_id}'s objectKey",
+                {"segmentId": segment_id, "objectKey": segment.object_key},
+            )
+        elif receipt_object_digest != pinned_object.sha256:
+            broken(
+                f"retention receipt pins a different object digest for segment "
+                f"{segment_id} than the manifest",
+                {
+                    "segmentId": segment_id,
+                    "pinned": pinned_object.sha256,
+                    "receipt": receipt_object_digest,
+                },
+            )
         object_path = _object_path(object_root, segment.object_key)
         if not object_path.is_file():
             findings.append(
@@ -941,6 +1249,36 @@ def _infer_object_root(manifest_file: Path, manifest: DatasetManifest) -> Path:
     return root
 
 
+def _run_guarded(
+    findings: list[ValidationFinding], check_name: str, action: Any
+) -> Any:
+    """Run one query-based check; a DuckDB failure is a finding, never a raise.
+
+    The decode gate (check 1b) catches an object whose *footer* is not
+    Parquet, but DuckDB reads lazily: a file with a valid footer and corrupt
+    pages can pass ``count(*)`` (answered from metadata) and still fail when a
+    later check reads the columns. The findings-not-raises contract has to
+    hold there too, so every check that touches DuckDB runs under this guard
+    and a residual engine failure becomes a structured finding naming the
+    check that hit it.
+    """
+    try:
+        return action()
+    except duckdb.Error as error:
+        findings.append(
+            ValidationFinding(
+                check="validator-query",
+                severity="error",
+                message=(
+                    f"a DuckDB query failed during the {check_name} check; the "
+                    "artifact could not be fully validated"
+                ),
+                details={"check": check_name, "error": str(error)},
+            )
+        )
+        return None
+
+
 def validate_dataset(
     manifest_path: str | Path, object_root: str | Path | None = None
 ) -> ValidationReport:
@@ -962,22 +1300,57 @@ def validate_dataset(
     present = _check_objects(manifest, root, findings)
     _check_retention_receipt(manifest, manifest_file, root, findings)
 
+    rows = 0
     connection = duckdb.connect()
     try:
-        if present:
-            _check_layout(connection, manifest, present, findings)
-        rows = _check_counts(connection, manifest, root, findings)
+        # An object that does not decode as Parquet is excluded from every
+        # query below; the decode finding, which names it, is the story.
+        readable = _check_objects_decode(connection, manifest, root, findings)
+        decode_failed = len(readable) < len(present)
+        if readable:
+            _run_guarded(
+                findings,
+                "layout",
+                lambda: _check_layout(connection, manifest, readable, findings),
+            )
+        counted = _run_guarded(
+            findings,
+            "counts",
+            lambda: _check_counts(
+                connection,
+                manifest,
+                root,
+                findings,
+                readable=frozenset(readable),
+                skip_totals=decode_failed,
+            ),
+        )
+        rows = counted if isinstance(counted, int) else 0
         # The remaining checks read columns by name, so they are meaningless if
-        # the layout check already failed. Running them anyway would bury the
-        # real finding under a pile of DuckDB binder errors.
+        # the layout check already failed (or an object did not decode at
+        # all). Running them anyway would bury the real finding under a pile
+        # of DuckDB binder errors.
         layout_failed = any(f.check.startswith("layout-") for f in findings)
-        if present and not layout_failed:
-            _check_ordinals(connection, manifest, present, findings)
-            _check_row_integrity(connection, present, findings)
-            _check_deduplication(connection, manifest, present, findings)
-            _check_incident_exclusions(connection, manifest, present, findings)
-            _check_payload_digests(connection, present, findings)
-            _check_segment_coverage(connection, manifest, present, findings)
+        if readable and not layout_failed and not decode_failed:
+            for check_name, check in (
+                ("ordinals", lambda: _check_ordinals(connection, manifest, readable, findings)),
+                ("row-integrity", lambda: _check_row_integrity(connection, readable, findings)),
+                ("frame-lines", lambda: _check_frame_lines(connection, readable, findings)),
+                (
+                    "deduplication",
+                    lambda: _check_deduplication(connection, manifest, readable, findings),
+                ),
+                (
+                    "incident-exclusions",
+                    lambda: _check_incident_exclusions(connection, manifest, readable, findings),
+                ),
+                ("payload-digests", lambda: _check_payload_digests(connection, readable, findings)),
+                (
+                    "segment-coverage",
+                    lambda: _check_segment_coverage(connection, manifest, readable, findings),
+                ),
+            ):
+                _run_guarded(findings, check_name, check)
     finally:
         connection.close()
 

@@ -180,6 +180,63 @@ describe("deleteAfterVerifiedUploadRetention: the proof comes from the store", (
     expect(await readdir(walDir)).toHaveLength(2);
   });
 
+  it("refuses a same-length mutation of the footer, which the span digest cannot see", async () => {
+    // Round-2 review probe (L-2): the WAL's own segmentSha256 covers only the
+    // checksummed span (wal-format.md §7) and the footer line necessarily sits
+    // outside it, so mutating closeReason "shutdown" -> "faultedx" in place —
+    // same file length, span digest still verifying — was accepted and the
+    // file deleted. The whole-file digest pinned at compaction time
+    // (segmentFileSha256) must refuse it.
+    const fixture = victim();
+    await placeSegment(fixture);
+    const result = await compact();
+
+    const segmentPath = join(walDir, fixture.segmentFileName);
+    const original = await readFile(segmentPath);
+    const mutated = Buffer.from(
+      original.toString("utf8").replace('"closeReason":"shutdown"', '"closeReason":"faultedx"'),
+      "utf8",
+    );
+    expect(mutated.byteLength).toBe(original.byteLength);
+    expect(mutated.equals(original)).toBe(false);
+    await writeFile(segmentPath, mutated);
+
+    await expect(retention.deleteSegment(requestFor(result, fixture))).rejects.toBeInstanceOf(
+      RetentionGuardError,
+    );
+    expect(await readdir(walDir)).toHaveLength(2);
+  });
+
+  it("refuses a manifest that pins no whole-file digest, rather than trusting it", async () => {
+    // Fails closed: a manifest lacking segmentFileSha256 proves nothing about
+    // the footer bytes, so it licenses no deletion.
+    const fixture = victim();
+    await placeSegment(fixture);
+    const result = await compact();
+    const truthful = requestFor(result, fixture);
+
+    const stripped: DatasetManifest = {
+      ...result.manifest,
+      segments: result.manifest.segments.map((segment) => {
+        const clone: Record<string, unknown> = { ...segment };
+        delete clone["segmentFileSha256"];
+        return clone as unknown as (typeof result.manifest.segments)[number];
+      }),
+    };
+    const strippedBytes = encodeDatasetManifest(stripped);
+    const strippedKey = `datasets/stripped/${DATASET_MANIFEST_OBJECT_NAME}`;
+    await objectStore.put(strippedKey, strippedBytes);
+    await objectStore.put(
+      `datasets/stripped/${DATASET_MANIFEST_DIGEST_OBJECT_NAME}`,
+      Buffer.from(`${sha256Hex(strippedBytes)}\n`, "utf8"),
+    );
+
+    await expect(
+      retention.deleteSegment({ ...truthful, datasetManifestKey: strippedKey }),
+    ).rejects.toBeInstanceOf(RetentionGuardError);
+    expect(await readdir(walDir)).toHaveLength(2);
+  });
+
   it("refuses when the segment file changed after compaction", async () => {
     const fixture = victim();
     await placeSegment(fixture);

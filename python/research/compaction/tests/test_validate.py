@@ -17,6 +17,7 @@ from .build_dataset import (
     Row,
     build_dataset,
     default_rows,
+    frame_line,
     incident_window,
     rewrite_manifest,
 )
@@ -273,6 +274,60 @@ def test_a_duplicate_mark_must_point_at_a_byte_identical_copy(tmp_path: Path) ->
     assert "duplicate-provenance" in checks(report)
 
 
+def test_a_forged_duplicate_of_a_different_payload_is_detected(tmp_path: Path) -> None:
+    # Reviewer probe (round 2, M-A), verbatim: row 0 (ingestSeq 7, payload
+    # "first payload") and row 1 (same key, payload "DIFFERENT payload",
+    # marked duplicate:0), BOTH carrying the same claimed frameLineSha256.
+    # The pre-remediation validator compared the two STORED strings and
+    # returned {'ok': True, 'findings': []} — a genuine frame silently
+    # excluded from replay. The digests must be recomputed from the archived
+    # columns, and provenance decided on the verified bytes.
+    seg = f"{EPOCH}-000000"
+    first = Row(0, seg, 0, 0, "7", "first payload")
+    forged_digest = hashlib.sha256(frame_line(first)).hexdigest()
+    rows = [
+        first,
+        Row(
+            1,
+            seg,
+            0,
+            1,
+            "7",
+            "DIFFERENT payload",
+            replay_eligible=False,
+            exclusion_reason="duplicate:0",
+            frame_line_sha256=forged_digest,
+        ),
+    ]
+    manifest_path = build_dataset(tmp_path, rows=rows, incident_windows=[])
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    # The stamped digest does not match row 1's reconstructed bytes...
+    assert "frame-line-digest" in checks(report)
+    # ...and the verified bytes of the two rows differ, so the mark is false.
+    assert "duplicate-provenance" in checks(report)
+
+
+def test_a_tampered_frame_line_digest_is_detected_on_any_row(tmp_path: Path) -> None:
+    # The digest-mismatch finding class is general row integrity, not only
+    # duplicate provenance: a stored frameLineSha256 that the reconstructed
+    # line does not hash to is an error wherever it appears.
+    rows = default_rows()
+    rows[0] = Row(
+        0,
+        rows[0].segment_id,
+        0,
+        0,
+        "1",
+        '{"event_type":"book"}',
+        frame_line_sha256="0" * 64,
+    )
+    manifest_path = build_dataset(tmp_path, rows=rows)
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    assert "frame-line-digest" in checks(report)
+
+
 def test_incident_excluded_segment_ids_must_reconcile(tmp_path: Path) -> None:
     # The window pins excludedSegmentIds; rows carrying its label from another
     # segment falsify the pin.
@@ -442,6 +497,91 @@ def test_a_future_layout_version_is_refused(tmp_path: Path) -> None:
     assert "layout-version" in checks(report)
 
 
+def test_an_unknown_pinned_column_type_is_a_finding_not_a_crash(tmp_path: Path) -> None:
+    # Reviewer probe (round 2, M-B, 1): physicalType "BOGUS" previously
+    # escaped as KeyError('BOGUS') from the dictionary lookup, including
+    # through main() — contradicting the findings-not-raises contract.
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["columns"][0].update({"physicalType": "BOGUS"}),
+    )
+    report = validate_dataset(manifest_path)  # must not raise
+    assert not report.ok
+    assert "layout-column-type" in checks(report)
+
+
+def test_an_unknown_pinned_column_type_fails_the_cli_cleanly(tmp_path: Path, capsys) -> None:
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["columns"][0].update({"physicalType": "BOGUS"}),
+    )
+    assert main(["--manifest", str(manifest_path)]) == 1  # must not raise
+    assert "layout-column-type" in capsys.readouterr().out
+
+
+def _pin_non_parquet_bytes(tmp_path: Path) -> Path:
+    """A manifest and checksum consistently pinning arbitrary NON-Parquet bytes."""
+    manifest_path = build_dataset(tmp_path)
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    victim_key = document["objects"][0]["objectKey"]
+    junk = b"these are not parquet bytes at all"
+    (tmp_path / victim_key).write_bytes(junk)
+    document["objects"][0]["byteLength"] = len(junk)
+    document["objects"][0]["sha256"] = hashlib.sha256(junk).hexdigest()
+    manifest_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    return manifest_path
+
+
+def test_consistently_pinned_non_parquet_bytes_are_a_finding_not_a_crash(
+    tmp_path: Path,
+) -> None:
+    # Reviewer probe (round 2, M-B, 2): presence, length, and checksum all
+    # pass — a manifest and its sidecar can pin ANY bytes — and the
+    # pre-remediation validator escaped with DuckDB's InvalidInputException
+    # ("No magic bytes found at end of file"), including through main().
+    manifest_path = _pin_non_parquet_bytes(tmp_path)
+    report = validate_dataset(manifest_path)  # must not raise
+    assert not report.ok
+    assert "object-parquet" in checks(report)
+    finding = next(f for f in report.findings if f.check == "object-parquet")
+    assert finding.details["objectKey"]  # the finding names the object
+
+
+def test_non_parquet_bytes_fail_the_cli_cleanly(tmp_path: Path, capsys) -> None:
+    manifest_path = _pin_non_parquet_bytes(tmp_path)
+    assert main(["--manifest", str(manifest_path)]) == 1  # must not raise
+    assert "object-parquet" in capsys.readouterr().out
+
+
+def test_a_receipt_with_falsified_object_provenance_is_an_error(tmp_path: Path) -> None:
+    # Reviewer probe (round 2, L-1): each receipt deletion entry states which
+    # verified object licensed it; falsifying BOTH fields on a pinned segment
+    # previously validated with ok=True. Reporting, not proof — but a report
+    # that contradicts the manifest it pins is a broken report.
+    manifest_path = build_dataset(tmp_path, retention_policy="delete-after-verified-upload")
+    receipt_path = manifest_path.parent / "retention-receipt.json"
+    document = json.loads(receipt_path.read_text(encoding="utf-8"))
+    document["deletedSegments"][0]["verifiedObjectKey"] = "somewhere/else.parquet"
+    document["deletedSegments"][0]["verifiedObjectSha256"] = "f" * 64
+    receipt_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    assert "retention-receipt" in checks(report)
+
+
+def test_a_receipt_with_a_falsified_object_digest_alone_is_an_error(tmp_path: Path) -> None:
+    manifest_path = build_dataset(tmp_path, retention_policy="delete-after-verified-upload")
+    receipt_path = manifest_path.parent / "retention-receipt.json"
+    document = json.loads(receipt_path.read_text(encoding="utf-8"))
+    document["deletedSegments"][0]["verifiedObjectSha256"] = "f" * 64
+    receipt_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    assert "retention-receipt" in checks(report)
+
+
 def test_an_empty_dataset_validates(tmp_path: Path) -> None:
     manifest_path = build_dataset(tmp_path, rows=[], incident_windows=[])
     report = validate_dataset(manifest_path)
@@ -490,6 +630,56 @@ class TestManifestParsing:
         )
         with pytest.raises(ManifestError, match="store-relative"):
             validate_dataset(manifest_path)
+
+    @pytest.mark.parametrize(
+        ("label", "mutate"),
+        [
+            ("segments is not a list", lambda doc: doc.update({"segments": {}})),
+            ("a segment entry is a string", lambda doc: doc["segments"].__setitem__(0, "x")),
+            (
+                "a count is a string",
+                lambda doc: doc["recordCounts"].update({"written": "5"}),
+            ),
+            (
+                "a count is a boolean",
+                lambda doc: doc["recordCounts"].update({"written": True}),
+            ),
+            ("recordCounts is missing", lambda doc: doc.pop("recordCounts")),
+            ("a column has no name", lambda doc: doc["columns"][0].pop("name")),
+            (
+                "an object rowCount is a string",
+                lambda doc: doc["objects"][0].update({"rowCount": "many"}),
+            ),
+            (
+                "an incident entry is a list",
+                lambda doc: doc.update({"excludedIncidentWindows": [[]]}),
+            ),
+            (
+                "schemaVersions is a string",
+                lambda doc: doc.update({"schemaVersions": "v1"}),
+            ),
+        ],
+    )
+    def test_every_malformed_shape_is_a_manifest_error_not_a_traceback(
+        self, tmp_path: Path, label: str, mutate
+    ) -> None:
+        # Round-2 M-B sweep: the manifest parser must refuse every
+        # malformed-input shape with the typed ManifestError — never a
+        # KeyError, TypeError, or AttributeError that escapes main() as a
+        # traceback. (ManifestError is the one documented refusal: a manifest
+        # this broken cannot even name the dataset being described.)
+        manifest_path = build_dataset(tmp_path)
+        rewrite_manifest(manifest_path, mutate)
+        with pytest.raises(ManifestError):
+            validate_dataset(manifest_path)
+
+    def test_a_malformed_shape_exits_two_at_the_cli(self, tmp_path: Path, capsys) -> None:
+        manifest_path = build_dataset(tmp_path)
+        rewrite_manifest(
+            manifest_path, lambda doc: doc["recordCounts"].update({"written": "5"})
+        )
+        assert main(["--manifest", str(manifest_path)]) == 2  # structured, no traceback
+        assert "manifest error" in capsys.readouterr().err
 
 
 class TestCli:

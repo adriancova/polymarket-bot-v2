@@ -218,6 +218,18 @@ export type WalSegmentReadResult =
       readonly footer: WalSegmentFooter | null;
       readonly records: readonly WalRecordEntry[];
       readonly computedSegmentSha256: string;
+      /**
+       * SHA-256 over the segment file's **entire** bytes, footer included.
+       *
+       * The WAL's own `segmentSha256` covers only the checksummed span (§7:
+       * header plus frame lines) — the footer necessarily sits outside it, so
+       * a digest of the span alone cannot detect a post-compaction,
+       * same-length footer mutation. The compactor pins this whole-file
+       * digest in the dataset manifest (`segmentFileSha256`) so the retention
+       * guard can require the file it is about to delete to be byte-for-byte
+       * the file that was verified and archived (round-2 review, L-2).
+       */
+      readonly computedFileSha256: string;
       readonly byteSize: number;
     }
   | {
@@ -1045,6 +1057,7 @@ export async function readWalSegment(
     footer: scan.footer,
     records: scan.records,
     computedSegmentSha256: scan.computedSha256,
+    computedFileSha256: sha256Hex(bytes),
     byteSize: bytes.byteLength,
   };
 }

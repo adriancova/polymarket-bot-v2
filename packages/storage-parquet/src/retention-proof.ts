@@ -21,8 +21,16 @@
  *    checksum, checksummed byte length, byte size, record count, and the
  *    object key — and pin the object with the checksum the request claims.
  * 3. The **segment file about to be deleted** must hash to the pinned segment
- *    checksum. A file that changed since compaction is not the file the
- *    manifest describes, and deleting it would destroy unarchived bytes.
+ *    checksum over the checksummed span **and** to the pinned whole-file
+ *    digest (`segmentFileSha256`) over its entire length, footer included. A
+ *    file that changed since compaction is not the file the manifest
+ *    describes, and deleting it would destroy unarchived bytes. The span
+ *    digest alone cannot see the footer — the WAL's `segmentSha256`
+ *    necessarily excludes the line that carries it (`wal-format.md` §7) — so
+ *    round-2 review mutated `closeReason` in place without changing the file
+ *    length and the guard deleted the file. The whole-file pin, computed at
+ *    compaction time before any deletion eligibility, closes that gap; a
+ *    manifest that does not pin it is refused rather than trusted.
  * 4. The **stored object** must hash to the manifest's pin and must actually
  *    provide the segment's rows: exactly `recordCount` rows for this segment,
  *    with dense record indices, each re-encoding to the exact byte range of
@@ -179,6 +187,27 @@ export async function verifyRetentionProof(
       segmentId: request.segmentId,
       pinned: segmentEntry.segmentSha256,
       observed: observedSegmentSha256,
+    });
+  }
+  // The span digest above cannot cover the footer line (`wal-format.md` §7),
+  // so a same-length footer mutation would pass it. The whole-file pin is what
+  // makes "this is the file that was archived" true of every byte. A manifest
+  // without the pin proves nothing about the footer and is refused: the pin is
+  // produced at compaction time, before deletion eligibility ever exists.
+  const pinnedFileSha256: unknown = (segmentEntry as { segmentFileSha256?: unknown })
+    .segmentFileSha256;
+  if (typeof pinnedFileSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(pinnedFileSha256)) {
+    refuse("the persisted manifest does not pin a whole-file digest for it", {
+      segmentId: request.segmentId,
+      segmentFileSha256: pinnedFileSha256,
+    });
+  }
+  const observedFileSha256 = sha256Hex(segmentBytes);
+  if (observedFileSha256 !== pinnedFileSha256) {
+    refuse("the segment file's bytes differ from the pinned whole-file digest", {
+      segmentId: request.segmentId,
+      pinned: pinnedFileSha256,
+      observed: observedFileSha256,
     });
   }
 

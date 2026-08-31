@@ -520,6 +520,10 @@ export async function compactWalDirectory(
       segmentSha256: segment.manifest.segmentSha256,
       checksummedByteLength: segment.manifest.checksummedByteLength,
       byteSize: segment.manifest.byteSize,
+      // Whole-file digest, footer included, computed from the bytes this run
+      // read and verified — pinned so retention can prove the file it deletes
+      // is byte-for-byte the file that was archived (round-2 review, L-2).
+      segmentFileSha256: segment.computedFileSha256,
       recordCount: segment.records.length,
       firstIngestSeq: segment.manifest.firstIngestSeq,
       lastIngestSeq: segment.manifest.lastIngestSeq,
