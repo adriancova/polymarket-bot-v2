@@ -512,6 +512,12 @@ work_packages:
       - python/uv.lock
       # python/pyproject.toml only for the mechanical dependency declarations
       # the compaction module requires (same rule as package.json elsewhere).
+      # Ratified 2026-08-30 (post-review-r1, disclosed deviation D1): ALSO the
+      # additive pytest testpaths entry "research/compaction/tests" — a
+      # test-collection wiring line, not a dependency, required so the plain
+      # `uv run pytest` gate collects the module's colocated suite. Bounded to
+      # exactly that one list entry; any other pyproject change stays
+      # unauthorized.
       - python/pyproject.toml
       - docs/handoffs/WP-130.md
     forbidden_paths:
