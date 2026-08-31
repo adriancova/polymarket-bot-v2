@@ -6,7 +6,8 @@ Usage::
     uv run python -m research.compaction --manifest ... --json
 
 Exit codes: ``0`` the dataset validated, ``1`` it did not, ``2`` the manifest
-itself could not be read.
+itself could not be read, ``3`` an unexpected internal error (rendered as one
+structured line, never a traceback).
 """
 
 from research.compaction.validate import main

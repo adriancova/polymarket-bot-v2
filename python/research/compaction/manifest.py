@@ -21,6 +21,10 @@ PARQUET_LAYOUT_VERSION = 1
 RETENTION_RECEIPT_FORMAT_ID = "polymarket-bot/retention-receipt/v1"
 RETENTION_RECEIPT_VERSION = 1
 RETENTION_RECEIPT_OBJECT_NAME = "retention-receipt.json"
+#: The digest sidecar the compactor writes next to ``manifest.json``: the
+#: manifest bytes' SHA-256 as 64 lowercase hex characters plus one ``LF``
+#: (``DATASET_MANIFEST_DIGEST_OBJECT_NAME`` in the TypeScript constants).
+DATASET_MANIFEST_DIGEST_OBJECT_NAME = "manifest.sha256"
 
 
 class ManifestError(Exception):
@@ -35,12 +39,26 @@ class SegmentEntry:
     retention may delete anything, so what was deleted is reported in the
     separate retention receipt object (``retention-receipt.json``), which the
     validator reconciles when it is present.
+
+    Two distinct digests are pinned per segment. ``segment_sha256`` is the
+    WAL-chain identity: the digest over ``0..checksummedByteLength`` that the
+    WAL's own manifest chain defines. ``segment_file_sha256`` is the
+    deletion-time identity: the round-2 whole-file pin over the segment file's
+    entire bytes, footer included, which is what the TypeScript retention
+    guard requires before an unlink. Both are **required**: a manifest
+    omitting either (or pinning a non-string) is refused with
+    ``ManifestError``, exactly like every other required field — the parser's
+    contract is shape, and a missing pin is a shape this build cannot read.
+    Whether a *present* digest's value is well-formed (64 lowercase hex) is
+    the validator's business, reported as a finding, matching how the
+    validator treats every other manifest-pinned value it can evaluate.
     """
 
     segment_id: str
     gateway_epoch: str
     segment_index: int
     segment_sha256: str
+    segment_file_sha256: str
     record_count: int
     first_ingest_seq: str | None
     last_ingest_seq: str | None
@@ -192,6 +210,9 @@ def parse_manifest(document: Any) -> DatasetManifest:
             gateway_epoch=_require_str(_require(e, "gatewayEpoch", "segment"), "gatewayEpoch"),
             segment_index=_require_int(_require(e, "segmentIndex", "segment"), "segmentIndex"),
             segment_sha256=_require_str(_require(e, "segmentSha256", "segment"), "segmentSha256"),
+            segment_file_sha256=_require_str(
+                _require(e, "segmentFileSha256", "segment"), "segmentFileSha256"
+            ),
             record_count=_require_int(_require(e, "recordCount", "segment"), "recordCount"),
             first_ingest_seq=_optional_str(e.get("firstIngestSeq"), "firstIngestSeq"),
             last_ingest_seq=_optional_str(e.get("lastIngestSeq"), "lastIngestSeq"),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno as errno_module
 import hashlib
 import json
 from pathlib import Path
@@ -25,6 +26,26 @@ from .build_dataset import (
 
 def checks(report) -> set[str]:
     return {finding.check for finding in report.findings}
+
+
+def require_read_denial(tmp_path: Path) -> None:
+    """Skip when ``chmod 000`` does not actually deny reads (e.g. as root).
+
+    The permission-based tests below need the operating system to enforce the
+    mode bits; a root user (or some container filesystems) reads a mode-000
+    file anyway, which would make the probe meaningless rather than failing.
+    """
+    probe = tmp_path / "read-denial-probe"
+    probe.write_text("x", encoding="utf-8")
+    probe.chmod(0)
+    try:
+        probe.read_bytes()
+    except PermissionError:
+        return
+    finally:
+        probe.chmod(0o600)
+        probe.unlink()
+    pytest.skip("chmod 000 does not deny reads in this environment (running as root?)")
 
 
 def test_a_well_formed_dataset_validates(tmp_path: Path) -> None:
@@ -580,6 +601,251 @@ def test_a_receipt_with_a_falsified_object_digest_alone_is_an_error(tmp_path: Pa
     report = validate_dataset(manifest_path)
     assert not report.ok
     assert "retention-receipt" in checks(report)
+
+
+def _make_object_unreadable(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a dataset and chmod 000 its first pinned object."""
+    manifest_path = build_dataset(tmp_path)
+    manifest = load_manifest(manifest_path)
+    victim = tmp_path / manifest.objects[0].object_key
+    victim.chmod(0)
+    return manifest_path, victim
+
+
+def test_an_unreadable_pinned_object_is_a_finding_not_a_crash(tmp_path: Path) -> None:
+    # Reviewer probe (round 3, M-1), direct API: chmod 000 a pinned object.
+    # The pre-remediation validator hashed objects before any guard layer and
+    # escaped with a raw PermissionError — through validate_dataset() and
+    # main() alike — contradicting the findings-not-raises contract.
+    require_read_denial(tmp_path)
+    manifest_path, victim = _make_object_unreadable(tmp_path)
+    try:
+        report = validate_dataset(manifest_path)  # must not raise
+    finally:
+        victim.chmod(0o600)
+    assert not report.ok
+    finding = next(f for f in report.findings if f.check == "object-read")
+    # The finding names the object and the errno, per the required contract.
+    assert finding.details["objectKey"] == load_manifest(manifest_path).objects[0].object_key
+    assert finding.details["errno"] == errno_module.EACCES
+    # The unreadable object is excluded from the DuckDB checks: no misleading
+    # object-parquet finding, and no arithmetic noise burying the real story.
+    assert "object-parquet" not in checks(report)
+    assert {f.check for f in report.errors} == {"object-read"}
+
+
+def test_an_unreadable_pinned_object_fails_the_cli_cleanly(tmp_path: Path, capsys) -> None:
+    # The same probe through the CLI: `uv run python -m research.compaction
+    # --manifest …` previously exited 1 with a full PermissionError traceback.
+    require_read_denial(tmp_path)
+    manifest_path, victim = _make_object_unreadable(tmp_path)
+    try:
+        assert main(["--manifest", str(manifest_path)]) == 1  # must not raise
+    finally:
+        victim.chmod(0o600)
+    assert "object-read" in capsys.readouterr().out
+
+
+def test_an_unreadable_manifest_is_a_manifest_error(tmp_path: Path, capsys) -> None:
+    # Sibling sweep (round 3, M-1): a manifest file the process cannot read
+    # cannot even name the dataset — the documented ManifestError refusal
+    # (typed raise at the API, exit 2 at the CLI), never a traceback.
+    require_read_denial(tmp_path)
+    manifest_path = build_dataset(tmp_path)
+    manifest_path.chmod(0)
+    try:
+        with pytest.raises(ManifestError, match="could not be read"):
+            validate_dataset(manifest_path)
+        assert main(["--manifest", str(manifest_path)]) == 2
+    finally:
+        manifest_path.chmod(0o600)
+    assert "manifest error" in capsys.readouterr().err
+
+
+def test_an_unreadable_dataset_directory_is_a_manifest_error(tmp_path: Path, capsys) -> None:
+    # Sibling sweep (round 3, M-1): an unreadable dataset directory makes the
+    # manifest unreadable, which is the same documented refusal.
+    require_read_denial(tmp_path)
+    manifest_path = build_dataset(tmp_path)
+    dataset_dir = manifest_path.parent
+    dataset_dir.chmod(0)
+    try:
+        with pytest.raises(ManifestError, match="could not be read"):
+            validate_dataset(manifest_path)
+        assert main(["--manifest", str(manifest_path)]) == 2
+    finally:
+        dataset_dir.chmod(0o700)
+    assert "manifest error" in capsys.readouterr().err
+
+
+def test_an_unreadable_retention_receipt_is_a_finding(tmp_path: Path, capsys) -> None:
+    # Sibling sweep (round 3, M-1): past a parseable manifest, everything is
+    # findings — including a receipt the process cannot open.
+    require_read_denial(tmp_path)
+    manifest_path = build_dataset(tmp_path, retention_policy="delete-after-verified-upload")
+    receipt_path = manifest_path.parent / "retention-receipt.json"
+    receipt_path.chmod(0)
+    try:
+        report = validate_dataset(manifest_path)  # must not raise
+        assert not report.ok
+        assert "retention-receipt" in checks(report)
+        assert main(["--manifest", str(manifest_path)]) == 1
+    finally:
+        receipt_path.chmod(0o600)
+    assert "retention-receipt" in capsys.readouterr().out
+
+
+def test_an_unreadable_manifest_digest_sidecar_is_a_finding(tmp_path: Path, capsys) -> None:
+    # Reviewer probe (round 3, M-2): an unreadable manifest.sha256 previously
+    # returned ok=True because the validator never opened the sidecar at all.
+    require_read_denial(tmp_path)
+    manifest_path = build_dataset(tmp_path)
+    sidecar = manifest_path.parent / "manifest.sha256"
+    sidecar.chmod(0)
+    try:
+        report = validate_dataset(manifest_path)  # must not raise
+        assert not report.ok
+        assert "manifest-digest-unreadable" in checks(report)
+        assert main(["--manifest", str(manifest_path)]) == 1
+    finally:
+        sidecar.chmod(0o600)
+    assert "manifest-digest-unreadable" in capsys.readouterr().out
+
+
+def test_an_unexpected_exception_is_a_structured_cli_error(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    # Round-3 M-1's defensive boundary: an exception NO specific finding class
+    # anticipated must leave the CLI as one structured line and exit code 3 —
+    # never a traceback. Injected by patching validate_dataset itself, since
+    # every known failure class now has a specific finding and cannot be used
+    # to reach this path.
+    import research.compaction.validate as validate_module
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("wired to fail")
+
+    monkeypatch.setattr(validate_module, "validate_dataset", explode)
+    manifest_path = build_dataset(tmp_path)
+    assert validate_module.main(["--manifest", str(manifest_path)]) == 3  # must not raise
+    err = capsys.readouterr().err
+    assert "unexpected error (RuntimeError): wired to fail" in err
+    assert "Traceback" not in err
+
+
+def test_a_forged_segment_file_digest_is_a_finding(tmp_path: Path) -> None:
+    # Reviewer probe (round 3, M-2), verbatim: segmentFileSha256 forged to
+    # "xyz" previously returned ok=True — the Python side silently ignored the
+    # round-2 whole-file pin. A pin no SHA-256 can ever equal licenses
+    # nothing; grammar (64 lowercase hex) is a finding. The VALUE is not
+    # re-verifiable store-side (the WAL file is deleted post-retention) and is
+    # carried, per the documented boundary.
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["segments"][0].update({"segmentFileSha256": "xyz"}),
+    )
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    assert "segment-file-digest-grammar" in checks(report)
+    finding = next(f for f in report.findings if f.check == "segment-file-digest-grammar")
+    assert finding.details["segmentId"]  # the finding names the segment
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        pytest.param("A" * 64, id="uppercase-hex"),
+        pytest.param("0" * 63, id="too-short"),
+        pytest.param("0" * 64 + "0", id="too-long"),
+        pytest.param("", id="empty"),
+    ],
+)
+def test_every_malformed_segment_file_digest_grammar_is_a_finding(
+    tmp_path: Path, forged: str
+) -> None:
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["segments"][0].update({"segmentFileSha256": forged}),
+    )
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    assert "segment-file-digest-grammar" in checks(report)
+
+
+def test_a_forged_segment_file_digest_fails_the_cli_cleanly(tmp_path: Path, capsys) -> None:
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["segments"][0].update({"segmentFileSha256": "xyz"}),
+    )
+    assert main(["--manifest", str(manifest_path)]) == 1
+    assert "segment-file-digest-grammar" in capsys.readouterr().out
+
+
+def test_a_missing_segment_file_digest_is_refused(tmp_path: Path, capsys) -> None:
+    # Reviewer probe (round 3, M-2), verbatim: a manifest with the field
+    # removed previously returned ok=True. It is now REQUIRED by the parser —
+    # a missing pin is a shape this build cannot read, the same ManifestError
+    # contract as every other required field (typed raise / exit 2).
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["segments"][0].pop("segmentFileSha256"),
+    )
+    with pytest.raises(ManifestError, match="segmentFileSha256"):
+        validate_dataset(manifest_path)
+    assert main(["--manifest", str(manifest_path)]) == 2
+    assert "manifest error" in capsys.readouterr().err
+
+
+def test_a_non_string_segment_file_digest_is_refused(tmp_path: Path) -> None:
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["segments"][0].update({"segmentFileSha256": 5}),
+    )
+    with pytest.raises(ManifestError, match="expected a string"):
+        validate_dataset(manifest_path)
+
+
+def test_an_absent_manifest_digest_sidecar_is_a_finding(tmp_path: Path, capsys) -> None:
+    # Round 3, M-2: the compactor writes and read-back-verifies the sidecar
+    # before any deletion, so a dataset without one is broken, not new.
+    manifest_path = build_dataset(tmp_path)
+    (manifest_path.parent / "manifest.sha256").unlink()
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    assert "manifest-digest-absent" in checks(report)
+    assert main(["--manifest", str(manifest_path)]) == 1
+    assert "manifest-digest-absent" in capsys.readouterr().out
+
+
+def test_a_malformed_manifest_digest_sidecar_is_a_finding(tmp_path: Path, capsys) -> None:
+    manifest_path = build_dataset(tmp_path)
+    (manifest_path.parent / "manifest.sha256").write_text(
+        "not a digest at all\n", encoding="utf-8"
+    )
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    assert "manifest-digest-malformed" in checks(report)
+    assert main(["--manifest", str(manifest_path)]) == 1
+    assert "manifest-digest-malformed" in capsys.readouterr().out
+
+
+def test_a_contradicting_manifest_digest_sidecar_is_a_finding(tmp_path: Path, capsys) -> None:
+    # Reviewer probe (round 3, M-2), verbatim: a well-formed sidecar of 64
+    # zeroes contradicting the manifest bytes previously returned ok=True.
+    manifest_path = build_dataset(tmp_path)
+    (manifest_path.parent / "manifest.sha256").write_text("0" * 64 + "\n", encoding="utf-8")
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    assert "manifest-digest-mismatch" in checks(report)
+    finding = next(f for f in report.findings if f.check == "manifest-digest-mismatch")
+    assert finding.details["pinned"] == "0" * 64
+    assert main(["--manifest", str(manifest_path)]) == 1
+    assert "manifest-digest-mismatch" in capsys.readouterr().out
 
 
 def test_an_empty_dataset_validates(tmp_path: Path) -> None:

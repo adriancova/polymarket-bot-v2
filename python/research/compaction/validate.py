@@ -10,7 +10,24 @@ TypeScript that produced the artifact.
 The checks, and what each one would catch:
 
 1. **Object presence, length and SHA-256.** Bit rot, a truncated upload, or a
-   manifest pinning an object that was never written.
+   manifest pinning an object that was never written. An object the process
+   cannot even open — permissions, I/O failure — is the finding
+   ``object-read``, naming the object and the errno; it is then excluded from
+   every query-based check, whose absence would only restate the same failure.
+1b. **The manifest's own digest sidecar.** ``manifest.sha256`` next to the
+   manifest must exist, be readable, be 64 lowercase hex, and match the
+   SHA-256 of the manifest's actual bytes — four distinct finding classes
+   (``manifest-digest-absent`` / ``-unreadable`` / ``-malformed`` /
+   ``-mismatch``), because each tells the operator a different story. The
+   compactor writes and read-back-verifies the sidecar before deletion is
+   ever considered, so a dataset without a coherent one is broken, not new.
+1c. **Per-segment ``segmentFileSha256`` grammar.** The whole-file WAL digest
+   pinned at compaction time (the round-2 deletion-time identity) must be
+   present (the parser refuses a manifest without it) and well-formed —
+   64 lowercase hex — else the finding ``segment-file-digest-grammar``. Its
+   *value* is deliberately not re-verified here: it describes the WAL segment
+   file at deletion time, and after retention that file no longer exists to
+   hash. The validator checks presence and grammar, and carries the value.
 2. **Layout.** Column names, order, and DuckDB's inferred types against the
    pinned column list. Catches a writer that changed the schema without bumping
    ``parquetLayoutVersion``.
@@ -57,12 +74,16 @@ A finding is returned, not raised: a validation job that stops at the first
 problem tells an operator one thing about a dataset when they need all of them.
 That contract holds for malformed artifacts too: an unknown pinned column
 type, a pinned object that does not decode as Parquet (a manifest and its
-digest sidecar can consistently pin arbitrary bytes), and any DuckDB failure
-mid-check all become structured findings naming what broke — never an escaped
-exception. The one documented refusal is ``ManifestError``: a manifest that is
-absent, unreadable, hostile, or of an unknown version cannot even *name* the
-dataset being described, so there is exactly one thing to tell the operator
-(exit code 2 at the CLI, a typed raise at the API).
+digest sidecar can consistently pin arbitrary bytes), an object the process
+cannot read at all, and any DuckDB failure mid-check all become structured
+findings naming what broke — never an escaped exception. The one documented
+refusal is ``ManifestError``: a manifest that is absent, unreadable, hostile,
+or of an unknown version cannot even *name* the dataset being described, so
+there is exactly one thing to tell the operator (exit code 2 at the CLI, a
+typed raise at the API). The CLI additionally carries a last defensive
+boundary: an exception no specific class anticipated is rendered as one
+structured ``unexpected error`` line and exit code 3 — a backstop for the
+unforeseen, never a substitute for a specific finding where a class exists.
 """
 
 from __future__ import annotations
@@ -80,6 +101,7 @@ from typing import Any
 import duckdb
 
 from research.compaction.manifest import (
+    DATASET_MANIFEST_DIGEST_OBJECT_NAME,
     DatasetManifest,
     ManifestError,
     PARQUET_LAYOUT_ID,
@@ -96,6 +118,10 @@ from research.compaction.manifest import (
 #: casting — no bounded integer type (INT64 *or* INT128) can hold 40 digits.
 _CANONICAL_UNSIGNED = re.compile(r"^(0|[1-9][0-9]*)$")
 _MAX_SEQ_DIGITS = 40
+
+#: The one spelling of a SHA-256 digest this repository writes anywhere:
+#: exactly 64 lowercase hex characters (``sha256Hex`` on the TypeScript side).
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 #: DuckDB's SQL type for each physical type the layout pins.
 _DUCKDB_TYPE_BY_PHYSICAL_TYPE = {
@@ -231,9 +257,22 @@ def _object_path(object_root: Path, object_key: str) -> Path:
 
 def _check_objects(
     manifest: DatasetManifest, object_root: Path, findings: list[ValidationFinding]
-) -> list[Path]:
-    """Check 1: every pinned object exists with the pinned length and digest."""
+) -> tuple[list[Path], list[Path]]:
+    """Check 1: every pinned object exists with the pinned length and digest.
+
+    Returns ``(present, hashable)``: the objects that exist, and the subset
+    the process could actually stat/open/hash. An object the process cannot
+    read — permissions dropped, an I/O error mid-read — is the finding
+    ``object-read``, naming the object and the errno, **per object**: round-3
+    review chmod-000'd a pinned object and the pre-remediation validator
+    escaped with a raw ``PermissionError`` traceback, through ``main()``,
+    contradicting the findings-not-raises contract. An unreadable object is
+    excluded from every DuckDB-based check below (each would only re-raise the
+    same failure under a misleading name) and from the dataset totals, exactly
+    like an undecodable one.
+    """
     present: list[Path] = []
+    hashable: list[Path] = []
     for entry in manifest.objects:
         path = _object_path(object_root, entry.object_key)
         if not path.is_file():
@@ -246,7 +285,25 @@ def _check_objects(
                 )
             )
             continue
-        byte_length = path.stat().st_size
+        present.append(path)
+        try:
+            byte_length = path.stat().st_size
+            digest = _sha256_file(path)
+        except OSError as error:
+            findings.append(
+                ValidationFinding(
+                    check="object-read",
+                    severity="error",
+                    message=f"pinned object could not be read: {entry.object_key}",
+                    details={
+                        "objectKey": entry.object_key,
+                        "path": str(path),
+                        "errno": error.errno,
+                        "error": str(error),
+                    },
+                )
+            )
+            continue
         if byte_length != entry.byte_length:
             findings.append(
                 ValidationFinding(
@@ -256,7 +313,6 @@ def _check_objects(
                     details={"expected": entry.byte_length, "observed": byte_length},
                 )
             )
-        digest = _sha256_file(path)
         if digest != entry.sha256:
             findings.append(
                 ValidationFinding(
@@ -266,8 +322,112 @@ def _check_objects(
                     details={"expected": entry.sha256, "observed": digest},
                 )
             )
-        present.append(path)
-    return present
+        hashable.append(path)
+    return present, hashable
+
+
+def _check_manifest_digest(
+    manifest_file: Path, findings: list[ValidationFinding]
+) -> None:
+    """Check 1b: the ``manifest.sha256`` sidecar backs the manifest's bytes.
+
+    The compactor writes the sidecar next to the manifest — the manifest
+    bytes' SHA-256, 64 lowercase hex plus one LF — and read-back-verifies both
+    **before** deletion is ever considered, so every real dataset has a
+    coherent pair. Round-3 review pointed a sidecar of 64 zeroes at a
+    contradicting manifest, deleted the sidecar, and made it unreadable: all
+    returned ``ok=True`` because the validator never opened it. Each failure
+    mode is its own finding class — absent, unreadable, malformed, mismatched
+    — because each tells the operator a different story (never written /
+    cannot tell / not a digest at all / the manifest changed after pinning).
+    """
+    sidecar_path = manifest_file.parent / DATASET_MANIFEST_DIGEST_OBJECT_NAME
+
+    def broken(check: str, message: str, details: dict[str, Any]) -> None:
+        findings.append(
+            ValidationFinding(
+                check=check,
+                severity="error",
+                message=message,
+                details={"sidecarPath": str(sidecar_path), **details},
+            )
+        )
+
+    if not sidecar_path.is_file():
+        broken(
+            "manifest-digest-absent",
+            "the manifest digest sidecar does not exist; the manifest's bytes "
+            "are unverified",
+            {},
+        )
+        return
+    try:
+        sidecar_text = sidecar_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        broken(
+            "manifest-digest-unreadable",
+            f"the manifest digest sidecar could not be read: {error}",
+            {"errno": getattr(error, "errno", None), "error": str(error)},
+        )
+        return
+    pinned = sidecar_text.strip()
+    if not _SHA256_HEX.match(pinned):
+        broken(
+            "manifest-digest-malformed",
+            "the manifest digest sidecar does not contain a SHA-256 digest "
+            "(64 lowercase hex characters)",
+            {"observed": sidecar_text[:100]},
+        )
+        return
+    try:
+        manifest_bytes = manifest_file.read_bytes()
+    except OSError as error:
+        broken(
+            "manifest-digest-unreadable",
+            f"the manifest's own bytes could not be re-read to compare: {error}",
+            {"errno": getattr(error, "errno", None), "error": str(error)},
+        )
+        return
+    observed = hashlib.sha256(manifest_bytes).hexdigest()
+    if observed != pinned:
+        broken(
+            "manifest-digest-mismatch",
+            "the manifest digest sidecar contradicts the manifest's actual bytes",
+            {"pinned": pinned, "observed": observed},
+        )
+
+
+def _check_segment_file_digests(
+    manifest: DatasetManifest, findings: list[ValidationFinding]
+) -> None:
+    """Check 1c: every pinned ``segmentFileSha256`` is a well-formed digest.
+
+    The whole-file WAL digest (round-2's deletion-time pin) is required by the
+    parser; here its **grammar** — 64 lowercase hex — is enforced, because a
+    pin no digest can ever equal (round-3 review forged ``"xyz"``) licenses
+    nothing and can only mean corruption or forgery. The pin's *value* is
+    deliberately not re-verified: it describes the WAL segment file at
+    deletion time, and once retention has run that file no longer exists to
+    hash. Presence and grammar are validated; the value is carried for the
+    consumers (retention guard, ops tooling) that can still observe the file.
+    """
+    for segment in manifest.segments:
+        if not _SHA256_HEX.match(segment.segment_file_sha256):
+            findings.append(
+                ValidationFinding(
+                    check="segment-file-digest-grammar",
+                    severity="error",
+                    message=(
+                        f"segment {segment.segment_id} pins a malformed "
+                        "segmentFileSha256; the whole-file WAL digest must be "
+                        "64 lowercase hex characters"
+                    ),
+                    details={
+                        "segmentId": segment.segment_id,
+                        "observed": segment.segment_file_sha256[:100],
+                    },
+                )
+            )
 
 
 def _check_objects_decode(
@@ -275,8 +435,9 @@ def _check_objects_decode(
     manifest: DatasetManifest,
     object_root: Path,
     findings: list[ValidationFinding],
+    hashable: frozenset[Path],
 ) -> list[Path]:
-    """Check 1b: every present object actually decodes as Parquet.
+    """Check 1d: every readable present object actually decodes as Parquet.
 
     Presence, length, and checksum (check 1) say only that the store kept the
     bytes the manifest pins — and a manifest plus its digest sidecar can
@@ -285,12 +446,15 @@ def _check_objects_decode(
     ``InvalidInputException`` instead of a finding. Here the decode failure is
     a structured finding naming the object, and the object is excluded from
     every query-based check below (running them against an undecodable file
-    would only repeat the same failure twenty ways).
+    would only repeat the same failure twenty ways). An object check 1 could
+    not even read (``object-read``) is skipped outright: probing it with
+    DuckDB would repeat the OS failure under the misleading name
+    ``object-parquet``.
     """
     readable: list[Path] = []
     for entry in manifest.objects:
         path = _object_path(object_root, entry.object_key)
-        if not path.is_file():
+        if not path.is_file() or path not in hashable:
             continue
         try:
             connection.execute(
@@ -1297,16 +1461,24 @@ def validate_dataset(
         root = Path(object_root).resolve()
 
     findings: list[ValidationFinding] = []
-    present = _check_objects(manifest, root, findings)
+    present, hashable = _check_objects(manifest, root, findings)
+    _check_manifest_digest(manifest_file, findings)
+    _check_segment_file_digests(manifest, findings)
     _check_retention_receipt(manifest, manifest_file, root, findings)
 
     rows = 0
     connection = duckdb.connect()
     try:
-        # An object that does not decode as Parquet is excluded from every
-        # query below; the decode finding, which names it, is the story.
-        readable = _check_objects_decode(connection, manifest, root, findings)
-        decode_failed = len(readable) < len(present)
+        # An object that does not decode as Parquet — or that check 1 could
+        # not read at all — is excluded from every query below; the finding
+        # that names it is the story.
+        readable = _check_objects_decode(
+            connection, manifest, root, findings, hashable=frozenset(hashable)
+        )
+        # True when any present object was unreadable (check 1) or did not
+        # decode (check 1d): its rows are unobservable, so the dataset-level
+        # totals and the row-level checks would only bury the real finding.
+        degraded = len(readable) < len(present)
         if readable:
             _run_guarded(
                 findings,
@@ -1322,7 +1494,7 @@ def validate_dataset(
                 root,
                 findings,
                 readable=frozenset(readable),
-                skip_totals=decode_failed,
+                skip_totals=degraded,
             ),
         )
         rows = counted if isinstance(counted, int) else 0
@@ -1331,7 +1503,7 @@ def validate_dataset(
         # all). Running them anyway would bury the real finding under a pile
         # of DuckDB binder errors.
         layout_failed = any(f.check.startswith("layout-") for f in findings)
-        if readable and not layout_failed and not decode_failed:
+        if readable and not layout_failed and not degraded:
             for check_name, check in (
                 ("ordinals", lambda: _check_ordinals(connection, manifest, readable, findings)),
                 ("row-integrity", lambda: _check_row_integrity(connection, readable, findings)),
@@ -1365,45 +1537,62 @@ def validate_dataset(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entry point. Exit code 0 means the dataset validated."""
-    parser = argparse.ArgumentParser(
-        prog="research.compaction",
-        description=(
-            "Validate a compacted Parquet dataset against its manifest using DuckDB "
-            "(handoff §2, §8.4; WP-130 acceptance criteria)."
-        ),
-    )
-    parser.add_argument("--manifest", required=True, help="path to the dataset manifest JSON")
-    parser.add_argument(
-        "--object-root",
-        default=None,
-        help="object-store root; defaults to two directories above the manifest",
-    )
-    parser.add_argument("--json", action="store_true", help="emit the report as JSON")
-    arguments = parser.parse_args(argv)
+    """CLI entry point.
 
+    Exit codes: ``0`` the dataset validated; ``1`` it did not (the findings
+    are printed, never raised); ``2`` the manifest itself could not be read
+    (``ManifestError``, the one documented refusal); ``3`` an exception no
+    specific finding class anticipated — the last defensive boundary, which
+    renders it as one structured ``unexpected error`` line instead of a
+    traceback. Exit 3 existing never excuses an escape path: everywhere a
+    failure class is known (unreadable object, undecodable object, DuckDB
+    failure, malformed receipt or sidecar…) the contract remains a *specific*
+    finding and exit 1.
+    """
     try:
-        report = validate_dataset(arguments.manifest, arguments.object_root)
-    except ManifestError as error:
-        print(f"manifest error: {error}", file=sys.stderr)
-        return 2
+        parser = argparse.ArgumentParser(
+            prog="research.compaction",
+            description=(
+                "Validate a compacted Parquet dataset against its manifest using DuckDB "
+                "(handoff §2, §8.4; WP-130 acceptance criteria)."
+            ),
+        )
+        parser.add_argument(
+            "--manifest", required=True, help="path to the dataset manifest JSON"
+        )
+        parser.add_argument(
+            "--object-root",
+            default=None,
+            help="object-store root; defaults to two directories above the manifest",
+        )
+        parser.add_argument("--json", action="store_true", help="emit the report as JSON")
+        arguments = parser.parse_args(argv)
 
-    if arguments.json:
-        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
-    else:
-        print(f"dataset {report.dataset_id}")
-        print(f"  objects checked: {report.objects_checked}")
-        print(f"  rows checked:    {report.rows_checked}")
-        if report.ok:
-            print("  result:          OK")
+        try:
+            report = validate_dataset(arguments.manifest, arguments.object_root)
+        except ManifestError as error:
+            print(f"manifest error: {error}", file=sys.stderr)
+            return 2
+
+        if arguments.json:
+            print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
         else:
-            print(f"  result:          {len(report.errors)} error(s)")
-            for finding in report.findings:
-                print(f"    [{finding.severity}] {finding.check}: {finding.message}")
-                if finding.details:
-                    print(f"      {json.dumps(finding.details, sort_keys=True)}")
+            print(f"dataset {report.dataset_id}")
+            print(f"  objects checked: {report.objects_checked}")
+            print(f"  rows checked:    {report.rows_checked}")
+            if report.ok:
+                print("  result:          OK")
+            else:
+                print(f"  result:          {len(report.errors)} error(s)")
+                for finding in report.findings:
+                    print(f"    [{finding.severity}] {finding.check}: {finding.message}")
+                    if finding.details:
+                        print(f"      {json.dumps(finding.details, sort_keys=True)}")
 
-    return 0 if report.ok else 1
+        return 0 if report.ok else 1
+    except Exception as error:  # noqa: BLE001 - the CLI's last defensive boundary
+        print(f"unexpected error ({type(error).__name__}): {error}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised through __main__.py

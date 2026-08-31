@@ -260,6 +260,16 @@ def build_manifest(
                 "segmentSha256": hashlib.sha256(segment_id.encode("utf-8")).hexdigest(),
                 "checksummedByteLength": 1000,
                 "byteSize": 1400,
+                # The round-2 whole-file pin, REQUIRED by the manifest reader.
+                # No WAL file exists behind a synthetic dataset, so the honest
+                # statement this fixture can make is a real, deterministic
+                # SHA-256 (well-formed grammar); the validator checks presence
+                # and grammar only — the value describes the WAL file at
+                # deletion time, which nothing store-side can re-observe.
+                # Forgery tests override it through `rewrite_manifest`.
+                "segmentFileSha256": hashlib.sha256(
+                    f"{segment_id}:whole-file".encode("utf-8")
+                ).hexdigest(),
                 "recordCount": len(rows),
                 "firstIngestSeq": rows[0].ingest_seq,
                 "lastIngestSeq": rows[-1].ingest_seq,
@@ -364,6 +374,7 @@ def build_dataset(
     manifest_path = root / prefix / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    write_manifest_sidecar(manifest_path)
 
     if retention_policy != "retain":
         # Deletion state lives in the retention receipt, written after the
@@ -396,11 +407,29 @@ def build_dataset(
     return manifest_path
 
 
+def write_manifest_sidecar(manifest_path: Path) -> None:
+    """Write the digest sidecar the compactor always writes next to a manifest.
+
+    64 lowercase hex plus one LF, matching the TypeScript
+    ``DATASET_MANIFEST_DIGEST_OBJECT_NAME`` bytes exactly.
+    """
+    digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    (manifest_path.parent / "manifest.sha256").write_text(digest + "\n", encoding="utf-8")
+
+
 def rewrite_manifest(manifest_path: Path, mutate: Any) -> None:
-    """Apply a mutation to a written manifest, for negative tests."""
+    """Apply a mutation to a written manifest, for negative tests.
+
+    The digest sidecar is refreshed to match the mutated bytes: this models
+    the **stronger** adversary — a manifest and its sidecar can consistently
+    pin arbitrary content, so no negative test may lean on a stale sidecar to
+    detect its forgery. Tests attacking the sidecar itself overwrite
+    ``manifest.sha256`` directly, after this call.
+    """
     document = json.loads(manifest_path.read_text(encoding="utf-8"))
     mutate(document)
     manifest_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    write_manifest_sidecar(manifest_path)
 
 
 __all__ = [
@@ -413,5 +442,6 @@ __all__ = [
     "incident_window",
     "replace",
     "rewrite_manifest",
+    "write_manifest_sidecar",
     "write_object",
 ]
