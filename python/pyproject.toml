@@ -3,7 +3,14 @@ name = "polymarket-bot-research"
 version = "0.0.0"
 description = "Python research workspace for the Polymarket bot (statistics, calibration, reports). Never a second strategy implementation."
 requires-python = ">=3.12"
-dependencies = []
+# `duckdb` is declared by WP-130: handoff §2 locks "DuckDB/Polars over Parquet"
+# as the research query layer, and `research.compaction.validate` is the
+# dataset-validation job that reads a compacted Parquet dataset back and
+# reconciles it against its manifest. It is an embedded, in-process engine: no
+# server, no network, no credential.
+dependencies = [
+    "duckdb>=1.4,<2",
+]
 
 [dependency-groups]
 dev = [
@@ -14,5 +21,9 @@ dev = [
 package = false
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# `research/compaction/tests` added by WP-130 so the compaction validator's
+# suite is collected by the plain `uv run pytest` gate. The module's tests live
+# next to the module rather than in the top-level `tests/` tree, which this
+# work package does not own.
+testpaths = ["tests", "research/compaction/tests"]
 pythonpath = ["."]

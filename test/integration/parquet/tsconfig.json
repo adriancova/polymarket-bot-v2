@@ -1,0 +1,18 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": "../../..",
+    "paths": {
+      "@polymarket-bot/storage-parquet": ["packages/storage-parquet/src/index.ts"],
+      "@polymarket-bot/storage-parquet/testing": [
+        "packages/storage-parquet/src/testing/index.ts"
+      ],
+      "@polymarket-bot/storage-wal": ["packages/storage-wal/src/index.ts"],
+      "@polymarket-bot/storage-wal/testing": ["packages/storage-wal/src/testing/index.ts"],
+      "@polymarket-bot/research-worker": ["apps/research-worker/src/index.ts"]
+    }
+  },
+  "include": ["."]
+}
