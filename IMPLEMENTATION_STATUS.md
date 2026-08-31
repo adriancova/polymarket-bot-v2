@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-08-26  
+Last updated: 2026-08-30  
 Specification version: 2.0.0  
 Current phase: `phase-1` — recording-ready (Wave 0 closed 2026-08-26)  
 Maximum permitted run mode: `PAPER`
@@ -30,17 +30,62 @@ Maximum permitted run mode: `PAPER`
 | `WP-090`               | Complete | All ✓ | Merged `335b1b0` (impl chain `aa74419`→…→`fa518e7`, 3 review rounds) |
 | `WP-070`               | Complete | All ✓ | Merged `f2f0258` (impl chain `f4d374d`→…→`97ddcf1`, 4 review rounds) |
 | `WP-080`               | Complete | All ✓ | Merged `d0d66bf` (impl chain `cff20ba`→…→`a77c8f0`, 6 review rounds) |
-| `WP-100`               | CHANGES_REQUESTED (r1) | All ✓ | Impl `d51dcd5` on base `75c6521`. Review r1 (Codex `01a0498b-9f3c-7440-9030-f4161343c99e`): CHANGES REQUIRED — 2 medium (M1 the load-bearing observation timestamp uses the generic epoch-like heuristic — a direct-RTDS ms value of 1234 reinterpreted as seconds, corrupting windowEndAt/windowStartAt/ordering/duplicate identity; must accept safe-integer epoch-ms only, refuse others as `RTDS_INVALID_OBSERVATION_TIMESTAMP`, publisher-timestamp tolerance may stay separate; M2 an out-of-order FIRST observation after reconnect consumes the generation transition without producing the measured `unobservedInterval` — and later newer observations then cannot either; must model explicitly with a typed interval-unavailable state and pin later-newer ordering), 1 low (handoff subtree counts 18→17, 9→11). **E18 adoption ACCEPTED** (page re-fetched; exact-arithmetic precision probe; display value never read); DV1 accepted with the integration condition (acknowledgement is never an authoritative resync downstream); DV2-DV5 accepted, DV6 rejected via M1; sibling sweep S1-S4/S6 PASS, S5 fails only via M2; RTDS-U1..U6 accepted. Remediation round 1 dispatched 2026-08-28. **Remediation completed** in `3624593` (+ doc `2e5be65`): M1 → strict `normalizeRtdsObservationInstant` (safe-integer/all-digit unix-ms only; date strings, seconds heuristic, negatives, fractionals refused as `RTDS_INVALID_OBSERVATION_TIMESTAMP` with raw preserved) beside the unchanged tolerant publisher parser, ambiguous name removed; M2 → generation break modeled as a per-series obligation discharged exactly once (measured interval when first post-break observation is newer; typed `unobservedIntervalUnavailable` otherwise with the obligation OUTSTANDING; the first later newer observation carries the measured interval from the ORIGINAL pre-break bound; one pure `assessGap` shared by judge/remember). Mutation M2-b initially SURVIVED — diagnosed as a real test hole, discriminating test added, then killed. Orchestrator fast-forwarded to `2e5be65` and reproduced gates (root 2138, WP-070 contract 583 unchanged, rtds 65, lockfile byte-identical). Review round 2 dispatched |
-| `WP-110`               | IN_REVIEW (candidate `7e03fa9`) | All ✓ | Impl `1f15a8e` on base `7b76943`; **U-6 CONFIRMED** on the current official resolution page 2026-08-28 (50/50 "each token redeems for $0.50" + post-open "Additional context" clarifications published onchain); CANCELLED payout refused as `SETTLEMENT_CANCELLED_PAYOUT_UNVERIFIED` (no documented mechanic); ADR-009 §4 `MarketDisputed` condition recorded unmet; same-layer edge avoided via a structural port; orchestrator reproduced gates (root 2581/2581, lockfile +38/−0). Strict review round 1 dispatched 2026-08-28 |
+| `WP-100`               | Complete | All ✓ | Merged `e3ac6a3` + root wiring `eaf18f4` (impl chain `d51dcd5`→`3624593`→`2e5be65`, 2 review rounds; round 2 **ACCEPT**, Codex `01a049b2-0370-7a01-9553-6b1a503d7979`). See completion record below |
+| `WP-110`               | CHANGES_REQUESTED (r1) | All ✓ | Impl `1f15a8e` on base `7b76943`, candidate `7e03fa9`; **U-6 CONFIRMED** on the current official resolution page 2026-08-28 (50/50 "each token redeems for $0.50" + post-open "Additional context" clarifications published onchain); CANCELLED payout refused as `SETTLEMENT_CANCELLED_PAYOUT_UNVERIFIED` (no documented mechanic); ADR-009 §4 `MarketDisputed` condition recorded unmet; same-layer edge avoided via a structural port; orchestrator reproduced gates (root 2581/2581, lockfile +38/−0). Strict review round 1 (Codex `01a049af-3d7c-7ef3-890a-40e340ad486a`): **CHANGES REQUIRED** — 3 high (H1 TWAP observations never validated against the declared averaging window — a 30s-tagged observation spanning an hour, and an inverted window, both settled YES_WIN; H2 Universe readiness accepts a verified settlement verdict belonging to another series/spec — no seriesId/settlementSpecId/rulesVersionId correlation, `input.series` unused, so an unverified target spec can activate via an injected foreign verdict — acceptance criterion 3 FAILS at the Universe boundary; H3 registered series approval is mutable in place — only the outer object is frozen, nested `binding` reachable through the registry map can be flipped to approved without `approveSeries`), 3 medium (M1 placeholder policies like "TBD - complete after review"/"???" pass verification and activation, violating ADR-009 §5.4; M2 invalid `asOf` fails OPEN at the readiness boundary unless a cutoff policy is supplied; M3 scheduled `closeTime` elapsing is represented as observed `CLOSED` — false terminal state if the venue trades past schedule; the handoff disclosed only the inverse early-close case). Criteria 1/2/4 PASS (20-cell TWAP-terminal matrix, exact 50/50 identities, immutable history); criterion 3 FAILS via H2/M1. D1 FAIL-in-part (port weaker than the real verdict; pin is local not cross-package), D5 FAIL-in-part (M3), D7 FAIL-in-part (M1/M2); D2/D3/D4-API/D6 PASS. U-6 non-confirmations all handled correctly (CANCELLED refusal, no invented dispute event, register rows left to follow_up). Remediation round 1 dispatched 2026-08-30 |
 | `GOV-1B` (contract-owner governance round) | Complete | Batch 1B ✓ | Merged `dd61e1e` (chain `be45ad3`→`6127818`→`deb6050`, review round 1 **ACCEPT** — Codex `01a04995-a14e-7020-97a3-9a196b2eb90e`, 0 findings above LOW; LOW-1 attribution typo fixed pre-merge by the orchestrator, disclosed, `check:deps` re-verified; LOW-2 recorded as open contract item below). ADR-013 closes C-1/U-1 (**WP-150 released** to replace-not-accumulate); ADR-014 rules `takerSide` = the aggressor order's own side (WP-070/WP-090 verified conformant in code; **mandatory WP-080 follow-up dispatched** — map `m:true→ASK`, remove `BOOK_SIDE_CONSUMED`, close BNC-U5); ADR-015 rules the 200-char identifier bound boundary hardening; ADR-016 ratifies the four R-3 shapes; dependency-direction machine-readable (F14; mutation-proved fence; 34/11 edge table). Post-merge gates green (root 2250/2250; check:deps; ops:verify-venue; audit; main-tree lint clean excluding in-flight worktrees). **Open contract items carried**: ADR-016 UUID boundary rule for future external input (normalize-vs-refuse — next governance round); GOV-1B follow-ups 2-6 (ADR-014 comment pointers, domain.md §10 rows, venue-report AsyncAPI indexing, F14 tool rename, §6.1 items incl. WP-015 follow_up 8) |
-| `WP-130`               | Ready (authorized per runbook 1D — WP-040 ✓, WP-050 ✓; queued for a free agent slot) | All ✓ | Unassigned — dispatch after an active loop closes |
-| `WP-100`               | Dependency-ready; sequenced AFTER `WP-070` merges (path subset) | All ✓ | — |
+| `WP-130`               | IMPLEMENTING (authorized per runbook 1D — WP-040 ✓, WP-050 ✓) | All ✓ | `wp-implementer` (Opus) on branch `worktree-agent-a422f1462076a65fe`, base `9a5b551`; dispatched 2026-08-28; session-limit interruption resumed 2026-08-30 (last state: incident windows and the dataset manifest) |
+| `WP-080-FU1` (ADR-014 takerSide conformance) | IMPLEMENTING (mandatory follow-up per GOV-1B) | `WP-080` ✓, ADR-014 ✓ | `wp-implementer` (Opus) on branch `worktree-agent-a0b698943b5260f48`, base `9a5b551`; dispatched 2026-08-28; session-limit interruption resumed 2026-08-30 (last state: mutation-2 test-gap repair) |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
 
 Authorization vocabulary: "Ready (authorized)" rows are the only packages agents
 may begin in the current run; "Dependency-ready" rows must not start until this
 table says otherwise.
+
+### WP-100 completion record (2026-08-30)
+
+- Implemented by `wp-implementer` (Opus) on branch
+  `worktree-agent-ae974c3cda2ffa0dd`, base `75c6521`; chain `d51dcd5` (impl) →
+  `3624593` (remediation round 1) → `2e5be65` (handoff SHA record). 30 files,
+  all within authorized paths; lockfile untouched (sha256 identical at base and
+  candidate). Polymarket RTDS Chainlink TWAP observation feed: E18 exact
+  fixed-point `full_accuracy_value` path (display value never read),
+  never-resynchronizing subscription model with generation acknowledgements,
+  per-series gap obligations, typed refusals with raw-envelope preservation.
+- Review round 1 (Codex `01a0498b-9f3c-7440-9030-f4161343c99e`): CHANGES
+  REQUIRED — M1 observation-timestamp heuristic, M2 gap-obligation modeling,
+  L1 handoff counts (full detail in git history of this file at `a9545b2`).
+  Remediation round 1 (fresh repair session, probes reproduced first,
+  per-finding mutation checks; mutation M2-b exposed a real test hole, fixed).
+- Review round 2 (fresh Codex `01a049b2-0370-7a01-9553-6b1a503d7979`):
+  **ACCEPT** — zero BLOCKER/HIGH/MEDIUM/LOW. R1-M1/M2/L1 all FIXED with direct
+  probes (strict ms-only observation parser vs tolerant publisher parser
+  mutation-killed; stacked-break, eviction, restatement-attribution, and
+  mutual-exclusivity probes on `assessGap`). Judgment calls ruled:
+  all-digit-string acceptance ACCEPTED (matches SDK `^\d+$`, cannot trigger
+  seconds rescaling); absence of a plausibility window ACCEPTED (no invented
+  venue threshold; seconds-spelled input publishes a visibly-wrong 1970 window
+  that must fail freshness downstream — honest disclosure). Residual NOTE:
+  series eviction clears an outstanding gap obligation; reappearance reports
+  `firstObservationEver` with neither interval field (documented).
+- Merged `e3ac6a3` (`--no-ff`); root wiring `eaf18f4` adds the RTDS suite to
+  root `test:contract` (flows into the existing CI venue-contract step).
+  Post-merge gates on main: frozen install PASS; typecheck PASS (34 projects);
+  main-tree lint clean (excluding in-flight worktrees); `check:deps` PASS;
+  root suite 2385/2385 (79 files); contract chain 583/583 + RTDS 65/65 +
+  Binance 131/131 + Coinbase 94/94. Worktrees `agent-ae974c3cda2ffa0dd` and
+  `agent-ad1b84cc52570e1ec` removed; branches deleted after ancestry checks.
+- **Binding obligations carried to WP-120**: handle both interval fields
+  (`unobservedInterval` measured vs `unobservedIntervalUnavailable`),
+  freshness/eviction signals (a reappearing evicted series is
+  `firstObservationEver`), RTDS `openGap.recoverableFromVenue===false` → halt;
+  acknowledgement is never an authoritative resync downstream.
+- Registry note: the Codex companion job registry for the round-2 review was
+  found wiped (empty state at 2026-08-28 15:13 local, cause unknown); the
+  verdict was recovered from the persisted Codex session rollout
+  `01a049b2-0370-7a01-9553-6b1a503d7979` under `~/.codex/sessions`, which
+  contains the full review text and gate log. Treated as authoritative — same
+  session id family, candidate SHA `2e5be65` named in the handoff line.
 
 ### Wave 1 batch 1B phase-gate record (2026-08-27)
 
