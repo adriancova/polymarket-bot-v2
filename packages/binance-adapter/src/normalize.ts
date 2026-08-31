@@ -47,41 +47,10 @@ import type { BinanceTimeUnit } from "./venue.js";
 
 export { ReferenceTopOfBookChangedContract, ReferenceTradeObservedContract };
 
-/**
- * How (or whether) the venue's `m` flag becomes the domain's `takerSide`.
- *
- * THE AMBIGUITY IS REAL AND IS NOT THIS PACKAGE'S TO RESOLVE (`BNC-U5`). Binance
- * documents `m` as "Is the buyer the market maker?". The frozen contract
- * documents `takerSide` as "Taker side when the venue reports it" and says
- * nothing more; `BookSide` is `BID | ASK`. Two readings are equally available
- * and they map `m` to OPPOSITE values:
- *
- * - `BOOK_SIDE_CONSUMED` — the side of the book the taker removed liquidity
- *   from. `m = true` means the buyer was the maker, so the taker was the seller,
- *   so the taker hit the **bid**.
- * - `TAKER_ORDER_DIRECTION` — the direction of the taker's own order expressed
- *   as a book side. `m = true` means the taker was selling, which is an **ask**.
- *
- * `OMIT` is the default. `takerSide` is optional in the contract, and ADR-002 §6
- * settles the precedent for exactly this situation: "a producer that cannot
- * supply them must omit them rather than guess." The raw `buyerIsMaker` boolean
- * is preserved on the decoded frame either way, so nothing is lost — the fact
- * simply does not cross the boundary under an invented interpretation. A caller
- * that owns the ruling opts into a named convention and thereby records which
- * one it meant.
- */
-export const TAKER_SIDE_CONVENTIONS = [
-  "OMIT",
-  "BOOK_SIDE_CONSUMED",
-  "TAKER_ORDER_DIRECTION",
-] as const;
-export type TakerSideConvention = (typeof TAKER_SIDE_CONVENTIONS)[number];
-
 /** Context a normalization needs from the connection. */
 export type NormalizationContext = {
   /** The unit the connection was opened with; nothing in a frame states it. */
   readonly timeUnit: BinanceTimeUnit;
-  readonly takerSideConvention: TakerSideConvention;
 };
 
 /** One value that could not be represented at the domain boundary. */
@@ -156,13 +125,13 @@ export function normalizeTrade(
     return { ok: false, failures };
   }
 
-  const takerSide = takerSideFor(frame.buyerIsMaker, context.takerSideConvention);
   const payload: ReferenceTradeObservedPayload = {
     venue: BINANCE_EVENT_SOURCE,
     symbol: frame.symbol,
     price: price.value,
     size: size.value,
-    ...(takerSide === undefined ? {} : { takerSide }),
+    // Always present, never configured: see {@link takerSideFor} (ADR-014).
+    takerSide: takerSideFor(frame.buyerIsMaker),
     venueTradeId: String(frame.tradeId),
   };
 
@@ -230,19 +199,44 @@ export function normalizeBookTicker(
   return { ok: true, payload, venueTimestamp: undefined, omittedSides: omitted };
 }
 
-/** Applies the caller's declared {@link TakerSideConvention} to Binance's `m`. */
-export function takerSideFor(
-  buyerIsMaker: boolean,
-  convention: TakerSideConvention,
-): BookSide | undefined {
-  switch (convention) {
-    case "OMIT":
-      return undefined;
-    case "BOOK_SIDE_CONSUMED":
-      // buyer is maker → taker sold into the resting bid.
-      return buyerIsMaker ? "BID" : "ASK";
-    case "TAKER_ORDER_DIRECTION":
-      // buyer is maker → the taker's own order was a sell, i.e. an ask.
-      return buyerIsMaker ? "ASK" : "BID";
-  }
+/**
+ * Binance's documented `m` flag → the domain's `takerSide`, under ADR-014.
+ *
+ * THE VOCABULARY IS RULED, NOT CHOSEN HERE. ADR-014 ("`takerSide` names the
+ * aggressor order's own side", Accepted 2026-08-28) §1 fixes the meaning of the
+ * frozen field: "**`BID`** ⇔ **the taker was buying.**" and "**`ASK`** ⇔ **the
+ * taker was selling.**" §2 states the rejected reading separately, because the
+ * two are exact inverses and a reader who assumes the other one gets every sign
+ * backwards: "A **buying** taker consumes resting **asks** and is still recorded
+ * as **`BID`**. A **selling** taker hits resting **bids** and is still recorded
+ * as **`ASK`**."
+ *
+ * THE VENUE FIELD. `WS_STREAMS` documents `m` as "Is the buyer the market
+ * maker?", and ADR-014 §3's Binance row derives this mapping from that one
+ * sentence: "`m = true → ASK` (the buyer was the maker, so the taker was the
+ * **seller**); `m = false → BID`". This function is that row and nothing else.
+ *
+ * WHY IT IS ALWAYS EMITTED. ADR-014's §7 follow-up item 3 required this package
+ * to decide AND state whether the default becomes the mapping or stays `OMIT`;
+ * it decided emission. `m` is documented on every `<symbol>@trade` payload, so
+ * the aggressor's role is always reported and never inferred: ADR-002 §6 ("a
+ * producer that cannot supply them must omit them rather than guess") — the rule
+ * that kept this field absent while `BNC-U5` was open — no longer applies to it.
+ * The mapping is therefore
+ * the adapter's behavior, not an option, and this function is total.
+ *
+ * WHY THERE IS NO SELECTABLE CONVENTION ANY MORE. The shipped
+ * `BOOK_SIDE_CONSUMED` reading (`m = true → BID`) emits the inverse of the ruled
+ * meaning, which ADR-014 §4.3 calls "a contract violation, not a configuration
+ * choice"; the §7 follow-up's item 2 therefore requires its removal rather than
+ * its demotion to a non-default, "one configuration flag away". `BNC-U5` is
+ * closed by that ruling — see `BINANCE_RESOLVED` in `./venue.ts`.
+ *
+ * The venue's own boolean is untouched by any of this: `buyerIsMaker` survives
+ * verbatim on the decoded frame (`./frames.ts`), so a consumer can read the raw
+ * fact without re-deriving it from the mapped side.
+ */
+export function takerSideFor(buyerIsMaker: boolean): BookSide {
+  // ADR-014 §3: the buyer being the maker means the TAKER was the seller.
+  return buyerIsMaker ? "ASK" : "BID";
 }

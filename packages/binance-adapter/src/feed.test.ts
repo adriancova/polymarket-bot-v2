@@ -70,6 +70,31 @@ describe("construction", () => {
     expect(() => newFeed({ feedId: "binance reference" })).toThrow(BinanceConfigurationError);
   });
 
+  it("refuses the `takerSideConvention` ADR-014 removed, rather than ignoring it", () => {
+    // A silently ignored option is the failure mode this guard exists for: an
+    // operator who had configured `BOOK_SIDE_CONSUMED` — the reading that emits
+    // the INVERSE of ADR-014 §1's meaning — must be told the setting is gone,
+    // not quietly given different behavior. The key is not in the options type
+    // any more, so a TypeScript caller cannot reach this; a JSON-shaped one can.
+    const withRemovedOption = {
+      feedId: "binance.reference",
+      subscriptions: [{ symbol: "BTCUSDT", suffix: "trade" }],
+      stalenessThresholdMs: 30_000,
+      takerSideConvention: "BOOK_SIDE_CONSUMED",
+    } as unknown as ConstructorParameters<typeof BinanceReferenceFeed>[0];
+
+    expect(() => new BinanceReferenceFeed(withRemovedOption)).toThrow(BinanceConfigurationError);
+    expect(() => new BinanceReferenceFeed(withRemovedOption)).toThrow(/ADR-014/u);
+    // Even the conforming name is refused: nothing about `takerSide` is settable.
+    expect(
+      () =>
+        new BinanceReferenceFeed({
+          ...withRemovedOption,
+          takerSideConvention: "TAKER_ORDER_DIRECTION",
+        } as unknown as ConstructorParameters<typeof BinanceReferenceFeed>[0]),
+    ).toThrow(BinanceConfigurationError);
+  });
+
   it("exposes the URL it will connect to and the streams it encodes", () => {
     const feed = newFeed();
     expect(feed.url).toBe(
@@ -1210,6 +1235,29 @@ describe("frames", () => {
     expect(emission.sourceChannel).toBe("btcusdt@trade");
     expect(emission.subscriptionGeneration).toBe(0);
     expect(emission.connectionId).toBe("conn-1");
+  });
+
+  it("puts ADR-014's `takerSide` on every trade emission, with no option to pass", () => {
+    // `newFeed()` passes feedId, subscriptions and a staleness threshold — and
+    // nothing about takerSide, because there is nothing to pass. Before ADR-014
+    // this same call emitted a payload with the field ABSENT.
+    const { feed, clock } = openFeed();
+    const sides: Record<string, unknown> = {};
+    for (const [t, m] of [
+      [1, true],
+      [2, false],
+    ] as const) {
+      const outcome = feed.onFrame("conn-1", tradeFrame({ t, m }), clock.advance(1));
+      const emission = outcome.emissions.find(
+        (candidate) => candidate.eventType === "ReferenceTradeObserved",
+      );
+      if (emission === undefined) {
+        throw new Error("expected a ReferenceTradeObserved emission");
+      }
+      sides[String(m)] = (emission.payload as { takerSide?: unknown }).takerSide;
+    }
+    // ADR-014 §3: `m = true → ASK` (the taker was the seller); `m = false → BID`.
+    expect(sides).toEqual({ true: "ASK", false: "BID" });
   });
 
   it("normalizes a bookTicker with NO venue timestamp, never substituting the receipt time", () => {

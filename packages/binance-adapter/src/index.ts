@@ -35,7 +35,14 @@
  * VENUE FACTS. Every load-bearing claim about Binance is quoted and cited in
  * `./venue.ts`, with its access date; everything the documentation does not state
  * is enumerated in `BINANCE_UNVERIFIED` and handled conservatively rather than
- * assumed.
+ * assumed, and an item an outside authority settles moves to `BINANCE_RESOLVED`
+ * with what changed.
+ *
+ * `takerSide`. Every emitted `ReferenceTradeObserved` carries it, mapped from the
+ * documented `m` under ADR-014: `m = true → ASK`, `m = false → BID`, where the
+ * side names the AGGRESSOR's own order (`BID` ⇔ the taker was buying), NOT the
+ * side of the book consumed. It is not configurable; the pre-ruling
+ * `takerSideConvention` option is gone (`BNC-U5`, closed).
  */
 
 export {
@@ -129,19 +136,13 @@ export type {
   FeedMetricsInput,
 } from "./metrics.js";
 
-export {
-  normalizeBookTicker,
-  normalizeTrade,
-  takerSideFor,
-  TAKER_SIDE_CONVENTIONS,
-} from "./normalize.js";
+export { normalizeBookTicker, normalizeTrade, takerSideFor } from "./normalize.js";
 export type {
   NormalizationContext,
   NormalizationFailure,
   NormalizationRejected,
   NormalizedTopOfBook,
   NormalizedTrade,
-  TakerSideConvention,
 } from "./normalize.js";
 
 export {
@@ -185,6 +186,7 @@ export {
   BINANCE_LIMITS,
   BINANCE_PUBLIC_STREAM_ENDPOINTS,
   BINANCE_RAW_STREAM_PATH,
+  BINANCE_RESOLVED,
   BINANCE_SBE_ENDPOINT_HOST,
   BINANCE_SERVER_SHUTDOWN_EVENT_TYPE,
   BINANCE_STREAM_SUFFIXES,

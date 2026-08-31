@@ -2,11 +2,13 @@ import { CodeStringSchema } from "@polymarket-bot/domain";
 import { describe, expect, it } from "vitest";
 
 import { BINANCE_REASON_CODES } from "./incidents.js";
+import { takerSideFor } from "./normalize.js";
 import {
   BINANCE_DEFAULT_ENDPOINT,
   BINANCE_FRAMING_RULING,
   BINANCE_LIMITS,
   BINANCE_PUBLIC_STREAM_ENDPOINTS,
+  BINANCE_RESOLVED,
   BINANCE_SBE_ENDPOINT_HOST,
   BINANCE_UNVERIFIED,
   explainNonPublicEndpoint,
@@ -72,6 +74,64 @@ describe("unverified register", () => {
     for (const entry of BINANCE_UNVERIFIED) {
       expect(entry.conservativeBehavior.length).toBeGreaterThan(20);
       expect(entry.documented.length).toBeGreaterThan(20);
+    }
+  });
+});
+
+describe("resolved register", () => {
+  it("no longer carries BNC-U5 as an open item", () => {
+    // It was open only because the FROZEN CONTRACT's vocabulary was unstated.
+    // ADR-014 stated it, so keeping the item open would misreport this package
+    // as still guessing.
+    const openIds: readonly string[] = BINANCE_UNVERIFIED.map((entry) => entry.id);
+    expect(openIds).not.toContain("BNC-U5");
+  });
+
+  it("keeps BNC-U5 discoverable, with its authority and its date", () => {
+    const entry = BINANCE_RESOLVED.find((candidate) => candidate.id === "BNC-U5");
+    if (entry === undefined) {
+      throw new Error("BNC-U5 must remain in the resolved register, not vanish");
+    }
+    expect(entry.closedAt).toBe("2026-08-28");
+    // The ruling's date and this package's remediation date are separate facts.
+    expect(entry.remediatedAt).toBe("2026-08-30");
+    expect(entry.closedBy).toContain("ADR-014");
+    expect(entry.closedBy).toContain("m = true → ASK");
+    expect(entry.closedBy).toContain("m = false → BID");
+    expect(entry.wasOpenBecause.length).toBeGreaterThan(20);
+  });
+
+  it("records what changed in this package, not merely that something did", () => {
+    const entry = BINANCE_RESOLVED.find((candidate) => candidate.id === "BNC-U5");
+    if (entry === undefined) {
+      throw new Error("BNC-U5 is missing from the resolved register");
+    }
+    // The three things ADR-014's §7 follow-up required, each visible in the text.
+    expect(entry.whatChanged).toContain("BOOK_SIDE_CONSUMED");
+    expect(entry.whatChanged).toContain("DELETED");
+    expect(entry.whatChanged).toContain("takerSideConvention");
+    // Item 3: the default had to be decided AND stated.
+    expect(entry.defaultDecision).toContain("DECIDED");
+    // Item 4: the raw venue value survives either way.
+    expect(entry.preserved).toContain("buyerIsMaker");
+  });
+
+  it("describes the mapping the code actually implements", () => {
+    // The register is checked against behavior, so prose and code cannot drift:
+    // if `takerSideFor` were inverted, this fails with the register unchanged.
+    const entry = BINANCE_RESOLVED.find((candidate) => candidate.id === "BNC-U5");
+    if (entry === undefined) {
+      throw new Error("BNC-U5 is missing from the resolved register");
+    }
+    expect(entry.whatChanged).toContain(`m = true → ${takerSideFor(true)}`);
+    expect(entry.whatChanged).toContain(`m = false → ${takerSideFor(false)}`);
+    expect(takerSideFor(true)).toBe("ASK");
+  });
+
+  it("shares no id with the open register", () => {
+    const open = new Set<string>(BINANCE_UNVERIFIED.map((entry) => entry.id));
+    for (const entry of BINANCE_RESOLVED) {
+      expect(open.has(entry.id), `${entry.id} is both open and resolved`).toBe(false);
     }
   });
 });

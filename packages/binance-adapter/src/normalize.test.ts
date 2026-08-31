@@ -44,7 +44,7 @@ function bookTickerFrame(
   };
 }
 
-const MILLISECOND_CONTEXT = { timeUnit: "MILLISECOND", takerSideConvention: "OMIT" } as const;
+const MILLISECOND_CONTEXT = { timeUnit: "MILLISECOND" } as const;
 
 describe("normalizeTrade", () => {
   it("canonicalizes the venue's decimal spelling (ADR-001 §3)", () => {
@@ -94,12 +94,48 @@ describe("normalizeTrade", () => {
     expect(result.payload.venueTradeId).toBe("12345");
   });
 
-  it("omits `takerSide` by default, because the contract's convention is unstated (BNC-U5)", () => {
-    const result = normalizeTrade(tradeFrame(), MILLISECOND_CONTEXT);
-    if (!result.ok) {
+  it("emits `takerSide` for every trade, with no configuration (ADR-014; BNC-U5 closed)", () => {
+    // The pre-ADR-014 behavior this replaces: absent by default, present only
+    // under a caller-selected convention. ADR-014 ruled the vocabulary, so the
+    // mapping is the adapter's behavior and there is nothing to opt into.
+    const buyerIsMaker = normalizeTrade(tradeFrame({ buyerIsMaker: true }), MILLISECOND_CONTEXT);
+    const buyerIsTaker = normalizeTrade(tradeFrame({ buyerIsMaker: false }), MILLISECOND_CONTEXT);
+    if (!buyerIsMaker.ok || !buyerIsTaker.ok) {
       throw new Error("unreachable");
     }
-    expect("takerSide" in result.payload).toBe(false);
+
+    // ADR-014 §3, the Binance row: "`m = true → ASK` (the buyer was the maker,
+    // so the taker was the **seller**); `m = false → BID`".
+    expect(buyerIsMaker.payload.takerSide).toBe("ASK");
+    expect(buyerIsTaker.payload.takerSide).toBe("BID");
+    expect("takerSide" in buyerIsMaker.payload).toBe(true);
+    expect(ReferenceTradeObservedPayloadSchema.safeParse(buyerIsMaker.payload).success).toBe(true);
+    expect(ReferenceTradeObservedPayloadSchema.safeParse(buyerIsTaker.payload).success).toBe(true);
+  });
+
+  it("maps only `m`: the same frame with `m` flipped is the only thing that moves the side", () => {
+    // Guards against a mapping that reads something else (price direction, a
+    // quote, an id parity) and happens to agree on the documented example.
+    const sides = [true, false].flatMap((buyerIsMaker) =>
+      [
+        { tradeId: 1, priceRaw: "0.001", quantityRaw: "100" },
+        { tradeId: 2, priceRaw: "999", quantityRaw: "0.00000001" },
+      ].map((variant) => {
+        const result = normalizeTrade(tradeFrame({ ...variant, buyerIsMaker }), MILLISECOND_CONTEXT);
+        if (!result.ok) {
+          throw new Error("unreachable");
+        }
+        return { buyerIsMaker, takerSide: result.payload.takerSide };
+      }),
+    );
+    expect(sides.filter((entry) => entry.buyerIsMaker).map((entry) => entry.takerSide)).toEqual([
+      "ASK",
+      "ASK",
+    ]);
+    expect(sides.filter((entry) => !entry.buyerIsMaker).map((entry) => entry.takerSide)).toEqual([
+      "BID",
+      "BID",
+    ]);
   });
 
   it("rejects a non-positive price instead of clamping it (ADR-002 §7)", () => {
@@ -129,10 +165,7 @@ describe("normalizeTrade", () => {
 
   it("reads the same epoch differently under the connection's declared unit", () => {
     const millis = normalizeTrade(tradeFrame(), MILLISECOND_CONTEXT);
-    const micros = normalizeTrade(tradeFrame(), {
-      timeUnit: "MICROSECOND",
-      takerSideConvention: "OMIT",
-    });
+    const micros = normalizeTrade(tradeFrame(), { timeUnit: "MICROSECOND" });
     if (!millis.ok || !micros.ok) {
       throw new Error("unreachable");
     }
@@ -140,29 +173,43 @@ describe("normalizeTrade", () => {
   });
 });
 
-describe("takerSideFor", () => {
-  it("omits by default", () => {
-    expect(takerSideFor(true, "OMIT")).toBeUndefined();
-    expect(takerSideFor(false, "OMIT")).toBeUndefined();
+describe("takerSideFor (ADR-014)", () => {
+  it("maps the documented `m` exactly as ADR-014 §3's Binance row states", () => {
+    // "A boolean **\"is the buyer the market maker\"** (Binance `m`) |
+    //  `m = true → ASK` (the buyer was the maker, so the taker was the
+    //  **seller**); `m = false → BID`"
+    expect(takerSideFor(true)).toBe("ASK");
+    expect(takerSideFor(false)).toBe("BID");
   });
 
-  it("maps `m` to opposite values under the two named conventions, which is the point", () => {
-    expect(takerSideFor(true, "BOOK_SIDE_CONSUMED")).toBe("BID");
-    expect(takerSideFor(true, "TAKER_ORDER_DIRECTION")).toBe("ASK");
-    expect(takerSideFor(false, "BOOK_SIDE_CONSUMED")).toBe("ASK");
-    expect(takerSideFor(false, "TAKER_ORDER_DIRECTION")).toBe("BID");
+  it("is NOT the side of the book that was consumed (ADR-014 §2)", () => {
+    // §2: "A **buying** taker consumes resting **asks** and is still recorded as
+    // **`BID`**. A **selling** taker hits resting **bids** and is still recorded
+    // as **`ASK`**." `m = true` means the taker was SELLING; the consumed-side
+    // reading would have said `BID`, and that value is now a contract violation
+    // (§4.3), not an alternative convention.
+    expect(takerSideFor(true)).not.toBe("BID");
+    expect(takerSideFor(false)).not.toBe("ASK");
   });
 
-  it("produces a value the frozen payload accepts when a convention is chosen", () => {
-    const result = normalizeTrade(tradeFrame(), {
-      timeUnit: "MILLISECOND",
-      takerSideConvention: "BOOK_SIDE_CONSUMED",
-    });
-    if (!result.ok) {
-      throw new Error("unreachable");
+  it("is total: there is no configuration and no absent case", () => {
+    // The removed `takerSideConvention` parameter would show up here as a second
+    // formal argument, so a convention cannot be reintroduced unnoticed.
+    expect(takerSideFor.length).toBe(1);
+    for (const buyerIsMaker of [true, false]) {
+      expect(takerSideFor(buyerIsMaker)).toMatch(/^(BID|ASK)$/u);
     }
-    expect(result.payload.takerSide).toBe("BID");
-    expect(ReferenceTradeObservedPayloadSchema.safeParse(result.payload).success).toBe(true);
+  });
+
+  it("produces a value the frozen payload accepts", () => {
+    for (const buyerIsMaker of [true, false]) {
+      const result = normalizeTrade(tradeFrame({ buyerIsMaker }), MILLISECOND_CONTEXT);
+      if (!result.ok) {
+        throw new Error("unreachable");
+      }
+      expect(result.payload.takerSide).toBe(takerSideFor(buyerIsMaker));
+      expect(ReferenceTradeObservedPayloadSchema.safeParse(result.payload).success).toBe(true);
+    }
   });
 });
 
