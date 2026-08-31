@@ -9,6 +9,8 @@ import {
 } from "./activation.js";
 import { RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24 } from "./spec.js";
 import {
+  LEGITIMATE_POLICY_SAMPLES,
+  PLACEHOLDER_POLICY_ATTACK_SAMPLES,
   terminalSpotSpecSample,
   twapSpecSample,
   verifiedSpec,
@@ -86,6 +88,32 @@ describe("classifySettlementActivation", () => {
     expect(verdict.status).toBe("SPEC_INVALID");
     expect(verdict.modelDependentActivationAllowed).toBe(false);
   });
+
+  // Round-2 review, M1: the same shared fixture list `spec.test.ts` pins at
+  // construction, pinned here at the ACTIVATION gate — a placeholder policy on
+  // an otherwise verified spec must never reach REVIEWED_MODEL_BACKED. The
+  // four reviewer probes head the list.
+  it.each([...PLACEHOLDER_POLICY_ATTACK_SAMPLES])(
+    "never permits activation on the placeholder policy %j (round-2, M1)",
+    (placeholder) => {
+      const verdict = classifySettlementActivation({
+        spec: { ...verifiedSpec(terminalSpotSpecSample()), disputePolicy: placeholder },
+      });
+      expect(verdict.status).toBe("SPEC_INVALID");
+      expect(verdict.modelDependentActivationAllowed).toBe(false);
+    },
+  );
+
+  it.each([...LEGITIMATE_POLICY_SAMPLES])(
+    "still permits activation with the legitimate policy %j (round-2, M1 boundary)",
+    (policy) => {
+      const verdict = classifySettlementActivation({
+        spec: { ...verifiedSpec(terminalSpotSpecSample()), disputePolicy: policy },
+      });
+      expect(verdict.status).toBe("REVIEWED_MODEL_BACKED");
+      expect(verdict.modelDependentActivationAllowed).toBe(true);
+    },
+  );
 
   it("blocks activation when the observation type has no implementing model", () => {
     const verdict = classifySettlementActivation({

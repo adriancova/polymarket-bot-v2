@@ -76,8 +76,11 @@ export interface SettlementRefusalView {
  * which series, which spec, which rules version and which model it reviewed
  * cannot be correlated with the market it is applied to, and an uncorrelated
  * permission is how a verdict for series A activates a market bound to
- * series B (round-1 review, H2). `refusals` must be present and EMPTY —
- * checked at runtime by {@link permittedSettlementActivationProblems}.
+ * series B (round-1 review, H2). `refusals` must be present and EMPTY — the
+ * empty tuple type makes a permitted verdict carrying a refusal a COMPILE
+ * error (round-2 review, L1), and
+ * {@link permittedSettlementActivationProblems} still re-checks it at runtime
+ * because a value can lie about its compile-time shape.
  */
 export interface PermittedSettlementActivationView {
   readonly status: typeof ACTIVATION_PERMITTED_STATUS;
@@ -87,7 +90,11 @@ export interface PermittedSettlementActivationView {
   /** The market rules version the spec was reviewed against. */
   readonly rulesVersionId: string;
   readonly payoffModel: string;
-  readonly refusals: readonly SettlementRefusalView[];
+  /**
+   * Typed as the empty tuple: a verdict that carries any refusal is not a
+   * permission, and the type now says so (round-2 review, L1).
+   */
+  readonly refusals: readonly [];
 }
 
 /** A verdict that BLOCKS activation. May be sparse: a refusal needs no identity. */

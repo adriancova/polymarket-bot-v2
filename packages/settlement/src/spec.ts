@@ -78,26 +78,41 @@ import {
  * not." A spec whose dispute policy reads `TBD` is not a reviewed artifact, and
  * a `not null` column cannot tell the difference — so the refusal lives here.
  *
- * MATCHING (tightened in remediation round 1, finding M1: exact-string matching
- * let `"TBD - complete after review"`, `"to be determined"`, `"???"`,
- * `"not specified"` and `"N / A"` through). A candidate value is NORMALIZED —
- * lowercased, every run of non-alphanumeric characters collapsed to a single
- * space, then trimmed — and refused when:
+ * MATCHING (tightened in remediation round 1, finding M1, and again in round 2:
+ * round 1's normalization stripped non-ASCII characters and matched only whole
+ * fields or prefixes, so `"pending review"`, `"fill me in"`, a
+ * Cyrillic-lookalike `"ТВD - …"` and a mid-sentence `"…; TBD - …"` all passed).
+ * The value is first put through the Unicode gate of
+ * {@link placeholderRuleTextReason} (NFKC, mixed-script refusal, confusable
+ * folding, non-ASCII stripping — the exact rule is documented there), and each
+ * resulting ASCII candidate is NORMALIZED — lowercased, every run of
+ * non-alphanumeric characters collapsed to a single space, then trimmed — and
+ * refused when:
  *
- * 1. the normalized form is EMPTY (the value was punctuation-only: `"???"`,
- *    `"-"`, `"..."`); or
+ * 1. the normalized form is EMPTY (the value was punctuation-only — `"???"`,
+ *    `"-"`, `"..."` — or contained nothing this matcher can read as ASCII
+ *    text); or
  * 2. the normalized form EQUALS one of {@link PLACEHOLDER_RULE_TEXTS} (so
  *    `"N / A"`, `"n/a"` and `"n.a."` all normalize to `"n a"` / `"n a"` forms
  *    listed below); or
  * 3. the normalized form STARTS WITH one of {@link PLACEHOLDER_RULE_PREFIXES}
  *    followed by more text (`"TBD - complete after review"` → `"tbd complete
  *    after review"`): a rule that opens by declaring itself undetermined is
- *    not a rule, whatever follows.
+ *    not a rule, whatever follows; or
+ * 4. ANY whitespace-delimited token of the normalized form equals one of
+ *    {@link PLACEHOLDER_MARKER_TOKENS} (round 2: `"Use primary source; TBD -
+ *    complete after review."` is poisoned by the marker wherever it sits),
+ *    including after folding digit-for-letter substitutions inside a token
+ *    (`"T0D0"` → `"todo"`).
  *
  * The prefix list is deliberately narrower than the exact list: `"none"`,
  * `"unknown"`, `"nil"` and `"null"` legitimately BEGIN real policy sentences
  * ("None of the fallback sources may be used; halt."), so they refuse only as
- * the entire (normalized) value.
+ * the entire (normalized) value. The any-position marker list is narrower
+ * still: only self-announcing "unfinished" tokens (`tbd`, `todo`, `fixme`, …)
+ * poison a sentence at any position — ordinary words such as "review" never
+ * do, so "Disputes are resolved by the review committee within 48 hours."
+ * parses.
  */
 export const PLACEHOLDER_RULE_TEXTS: readonly string[] = Object.freeze([
   "n a",
@@ -135,6 +150,77 @@ export const PLACEHOLDER_RULE_TEXTS: readonly string[] = Object.freeze([
   "see above",
   "see below",
   "same as above",
+  // Round-2 additions (review finding M1a): common whole-field placeholder
+  // phrases. Whole-field ONLY — several of these words appear mid-sentence in
+  // real policies ("held pending review of the dispute" names a process), so
+  // they refuse only as the entire normalized value.
+  "pending review",
+  "pending approval",
+  "under review",
+  "in review",
+  "awaiting review",
+  "awaiting approval",
+  "needs review",
+  "review pending",
+  "review needed",
+  "review required",
+  "fill me in",
+  "fill in",
+  "fill this in",
+  "fill in later",
+  "fill me in later",
+  "draft",
+  "first draft",
+  "rough draft",
+  "work in progress",
+  "in progress",
+  "incomplete",
+  "unfinished",
+  "coming soon",
+  "insert here",
+  "insert text here",
+  "insert policy here",
+  "insert rule here",
+  "add later",
+  "write later",
+  "write me",
+  "complete later",
+  "complete after review",
+  "finish later",
+  "finalize later",
+  "define later",
+  "decide later",
+  "determine later",
+  "specify later",
+  "revisit",
+  "revisit later",
+  "needs definition",
+  "needs content",
+  "empty",
+  "blank",
+  "do not use",
+  "delete me",
+  "replace me",
+  "replace this",
+  "change me",
+  "edit me",
+  "update me",
+  "update later",
+  "temp",
+  "temporary",
+  "tmp",
+  "test",
+  "testing",
+  "dummy",
+  "dummy text",
+  "filler",
+  "filler text",
+  "sample text",
+  "example text",
+  "your text here",
+  "text here",
+  "policy here",
+  "content here",
 ]);
 
 /**
@@ -167,6 +253,97 @@ export const PLACEHOLDER_RULE_PREFIXES: readonly string[] = Object.freeze([
   "undecided",
   "undetermined",
 ]);
+
+/**
+ * Self-announcing "unfinished" markers that poison a rule at ANY token
+ * position (round-2 review, M1b).
+ *
+ * `"Use primary source; TBD - complete after review."` is not a policy: the
+ * marker announces that part of the rule is unwritten, wherever it sits. The
+ * list is STRICTLY the marker class — acronyms and editor conventions with no
+ * legitimate reading inside a settlement policy sentence. Ordinary words that
+ * merely relate to reviewing (`review`, `pending`, `draft` as a verb, …) are
+ * deliberately absent: "Disputes are resolved by the review committee within
+ * 48 hours." is a real policy and must parse. (`lorem`/`ipsum` are the
+ * standard filler-text tokens; `xxx` mid-sentence is a fill-in-the-blank for
+ * whatever it stands in for, e.g. "per clause XXX".)
+ */
+export const PLACEHOLDER_MARKER_TOKENS: readonly string[] = Object.freeze([
+  "tbd",
+  "tba",
+  "tbc",
+  "todo",
+  "fixme",
+  "wip",
+  "xxx",
+  "placeholder",
+  "lorem",
+  "ipsum",
+]);
+
+/**
+ * Digit-for-letter substitutions folded inside a token before marker matching,
+ * so `"T0D0"` and `"f1xme"` cannot dodge {@link PLACEHOLDER_MARKER_TOKENS} (and
+ * `"n0ne"` cannot dodge the whole-field list). Two maps because `1` reads as
+ * both `i` and `l`. Applied ONLY to tokens that mix letters and digits: a pure
+ * number ("within 48 hours") is never touched.
+ */
+const DIGIT_FOLDS: readonly Readonly<Record<string, string>>[] = [
+  Object.freeze({ "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b", "9": "g" }),
+  Object.freeze({ "0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b", "9": "g" }),
+];
+
+/**
+ * Known single-character Unicode homoglyphs of ASCII letters (Cyrillic and
+ * Greek), keyed by their LOWERCASE form. Deliberately a fixed, reviewable
+ * table rather than a library: folding is used only to MATCH — a fold can
+ * cause a refusal, never an acceptance — so an unmapped lookalike fails
+ * closed through the mixed-script and stripped-form rules below.
+ */
+const CONFUSABLE_TO_ASCII: Readonly<Record<string, string>> = Object.freeze({
+  // Cyrillic.
+  "а": "a",
+  "в": "b",
+  "е": "e",
+  "ѐ": "e",
+  "ё": "e",
+  "і": "i",
+  "ї": "i",
+  "ј": "j",
+  "к": "k",
+  "м": "m",
+  "н": "h",
+  "о": "o",
+  "р": "p",
+  "с": "c",
+  "т": "t",
+  "у": "y",
+  "х": "x",
+  "ѕ": "s",
+  "ѵ": "v",
+  "ԁ": "d",
+  "һ": "h",
+  "ӏ": "l",
+  // Greek.
+  "α": "a",
+  "β": "b",
+  "γ": "y",
+  "ε": "e",
+  "ζ": "z",
+  "η": "n",
+  "ι": "i",
+  "κ": "k",
+  "ν": "v",
+  "ο": "o",
+  "ρ": "p",
+  "τ": "t",
+  "υ": "y",
+  "χ": "x",
+  "ω": "w",
+});
+
+/** Printable-ASCII test used by the stripping rule (everything else is "non-ASCII" here). */
+const NON_ASCII_PRINTABLE = /[^\x20-\x7e]/gu;
 
 /**
  * Lowercases and collapses every non-alphanumeric run to one space, trimmed.
@@ -206,18 +383,78 @@ function joinedSingleLetterRuns(normalized: string): string {
   return output.join(" ");
 }
 
+/** Folds digit-for-letter substitutions in every mixed letter+digit token of `form`. */
+function digitFoldedForm(form: string, fold: Readonly<Record<string, string>>): string {
+  return form
+    .split(" ")
+    .map((token) =>
+      /[0-9]/u.test(token) && /[a-z]/u.test(token)
+        ? token.replace(/[0-9]/gu, (digit) => fold[digit] ?? digit)
+        : token,
+    )
+    .join(" ");
+}
+
+const ANY_LETTER = /\p{L}/u;
+const LATIN_LETTER = /\p{Script=Latin}/u;
+
 /**
- * The reason `value` states no rule, or `undefined` when it plausibly does.
+ * The first token that mixes Latin with non-Latin letters, or `undefined`.
  *
- * Exported so activation tests and future loaders can probe the matcher
- * directly; the schema refusal below routes through it.
+ * Round-2 review, M1c: a token such as `"ТВD"` (Cyrillic Т and В, Latin D) is
+ * a confusable by construction — no natural-language word mixes scripts inside
+ * one token — and the old normalization LAUNDERED it by silently discarding
+ * the non-ASCII letters. Such a value is refused outright rather than
+ * normalized. Tokens are maximal letter runs; combining marks are ignored
+ * (they are stripped by normalization anyway).
  */
-export function placeholderRuleTextReason(value: string): string | undefined {
-  const normalized = normalizedRuleText(value);
-  if (normalized === "") {
-    return "contains no letters or digits (punctuation-only)";
+function mixedScriptToken(value: string): string | undefined {
+  for (const match of value.matchAll(/[\p{L}\p{M}]+/gu)) {
+    const token = match[0];
+    let hasLatin = false;
+    let hasNonLatin = false;
+    for (const char of token) {
+      if (!ANY_LETTER.test(char)) {
+        continue;
+      }
+      if (LATIN_LETTER.test(char)) {
+        hasLatin = true;
+      } else {
+        hasNonLatin = true;
+      }
+    }
+    if (hasLatin && hasNonLatin) {
+      return token;
+    }
   }
-  const forms = [normalized, joinedSingleLetterRuns(normalized)];
+  return undefined;
+}
+
+/** Folds every mapped Unicode homoglyph in an (already lowercased) string to its ASCII form. */
+function confusablesFolded(lower: string): string {
+  let output = "";
+  for (const char of lower) {
+    output += CONFUSABLE_TO_ASCII[char] ?? char;
+  }
+  return output;
+}
+
+/**
+ * Runs the ASCII placeholder rules (whole-field, prefix, any-position marker,
+ * digit folds) over one candidate string. `undefined` when nothing matched.
+ */
+function asciiPlaceholderReason(candidate: string): string | undefined {
+  const normalized = normalizedRuleText(candidate);
+  if (normalized === "") {
+    return "contains no ASCII letters or digits (nothing that states a rule)";
+  }
+  const forms = new Set<string>();
+  for (const base of [normalized, joinedSingleLetterRuns(normalized)]) {
+    forms.add(base);
+    for (const fold of DIGIT_FOLDS) {
+      forms.add(digitFoldedForm(base, fold));
+    }
+  }
   for (const form of forms) {
     if (PLACEHOLDER_RULE_TEXTS.includes(form)) {
       return `normalizes to the placeholder "${form}"`;
@@ -226,6 +463,61 @@ export function placeholderRuleTextReason(value: string): string | undefined {
       if (form === prefix || form.startsWith(`${prefix} `)) {
         return `begins with the placeholder marker "${prefix}"`;
       }
+    }
+    for (const token of form.split(" ")) {
+      if (PLACEHOLDER_MARKER_TOKENS.includes(token)) {
+        return `contains the self-announcing placeholder marker "${token}"`;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The reason `value` states no rule, or `undefined` when it plausibly does.
+ *
+ * Exported so activation tests and future loaders can probe the matcher
+ * directly; the schema refusal below routes through it.
+ *
+ * THE UNICODE RULE (round-2 review, M1c — stated exactly, because round 1's
+ * normalization could LAUNDER a lookalike into acceptance by discarding its
+ * non-ASCII letters):
+ *
+ * 1. The value is NFKC-normalized first, so fullwidth/stylized forms
+ *    (`"ＴＢＤ"`, `"𝐓𝐁𝐃"`) reach the matcher as their ASCII equivalents.
+ * 2. Any token that mixes Latin with non-Latin letters is REFUSED outright
+ *    (`"ТВD"`): mixed script inside a token is confusable by construction,
+ *    and refusal — never silent normalization — is the only safe response.
+ * 3. The ASCII rules then run over THREE candidates, refusing on any hit:
+ *    the value itself; the value with every known Cyrillic/Greek homoglyph
+ *    folded to its ASCII form ({@link CONFUSABLE_TO_ASCII}, so an all-Cyrillic
+ *    `"ТВ…"` lookalike is read as what it visually spells); and the value with
+ *    every non-printable-ASCII character REMOVED (so a marker split by
+ *    zero-width or soft-hyphen characters — `"tb­d"` — reassembles into
+ *    the form it was hiding).
+ * 4. A value with NO readable ASCII content at all is refused by the
+ *    empty-normalization rule. When in doubt this matcher REFUSES: a false
+ *    refusal of legitimate policy text is recoverable at review time; a
+ *    placeholder reaching `REVIEWED_MODEL_BACKED` is not.
+ */
+export function placeholderRuleTextReason(value: string): string | undefined {
+  const canonical = value.normalize("NFKC");
+
+  const mixed = mixedScriptToken(canonical);
+  if (mixed !== undefined) {
+    return `mixes Unicode scripts inside the token "${mixed}" (confusable by construction; refused rather than normalized)`;
+  }
+
+  const lower = canonical.toLowerCase();
+  const candidates: readonly (readonly [string, string])[] = [
+    [lower, ""],
+    [confusablesFolded(lower), " after folding Unicode homoglyphs to ASCII"],
+    [lower.replace(NON_ASCII_PRINTABLE, ""), " after stripping non-ASCII characters"],
+  ];
+  for (const [candidate, how] of candidates) {
+    const reason = asciiPlaceholderReason(candidate);
+    if (reason !== undefined) {
+      return `${reason}${how}`;
     }
   }
   return undefined;

@@ -29,6 +29,7 @@ import {
   SETTLEMENT_ACTIVATION_STATUSES,
   isConsistentSettlementActivation,
   permittedSettlementActivationProblems,
+  type PermittedSettlementActivationView,
 } from "./settlement-binding.js";
 import { permittingSettlementView, unverifiedSettlementView } from "./testing/index.js";
 
@@ -129,6 +130,44 @@ describe("settlement activation port", () => {
           }),
         ).map((problem) => problem.field),
       ).toEqual(["refusals"]);
+    });
+  });
+
+  // Round-2 review, L1: `refusals` on the permitted arm is the empty tuple
+  // type, so a permitted verdict carrying a refusal is a COMPILE error (the
+  // reviewer's tsc probe compiled clean when it was `readonly
+  // SettlementRefusalView[]`). If the type ever loosens again, the
+  // `@ts-expect-error` below becomes "unused" and `tsc --noEmit` fails —
+  // a negative compile-time test with no cross-package import.
+  describe("permitted-arm refusals type (round-2, L1)", () => {
+    it("rejects a permitted verdict carrying a refusal at compile time and at runtime", () => {
+      const forged: PermittedSettlementActivationView = {
+        status: "REVIEWED_MODEL_BACKED",
+        modelDependentActivationAllowed: true,
+        settlementSpecId: "01936f00-0000-7000-8000-00000000c001",
+        seriesId: "01936f00-0000-7000-8000-00000000a001",
+        rulesVersionId: "01936f00-0000-7000-8000-00000000b001",
+        payoffModel: "ReferenceOpenUpDownModel",
+        // @ts-expect-error -- round-2 L1: the permitted arm's refusals are typed `readonly []`; one refusal must not compile
+        refusals: [{ code: "SETTLEMENT_ANYTHING", message: "left over" }],
+      };
+      // The runtime check refuses the same forgery independently of the type.
+      expect(
+        permittedSettlementActivationProblems(forged).map((problem) => problem.field),
+      ).toEqual(["refusals"]);
+    });
+
+    it("accepts the honest empty refusal list at compile time", () => {
+      const honest: PermittedSettlementActivationView = {
+        status: "REVIEWED_MODEL_BACKED",
+        modelDependentActivationAllowed: true,
+        settlementSpecId: "01936f00-0000-7000-8000-00000000c001",
+        seriesId: "01936f00-0000-7000-8000-00000000a001",
+        rulesVersionId: "01936f00-0000-7000-8000-00000000b001",
+        payoffModel: "ReferenceOpenUpDownModel",
+        refusals: [],
+      };
+      expect(permittedSettlementActivationProblems(honest)).toEqual([]);
     });
   });
 });

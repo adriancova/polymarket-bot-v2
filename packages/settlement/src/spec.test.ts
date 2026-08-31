@@ -5,11 +5,14 @@ import {
   RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24,
   isReviewedSettlementSpec,
   parseSettlementSpec,
+  placeholderRuleTextReason,
   safeParseSettlementSpec,
   settlementSpecReviewBlockers,
   SettlementSpecSchema,
 } from "./spec.js";
 import {
+  LEGITIMATE_POLICY_SAMPLES,
+  PLACEHOLDER_POLICY_ATTACK_SAMPLES,
   referenceOpenUpDownSpecSample,
   terminalSpotSpecSample,
   thresholdByDateSpecSample,
@@ -139,6 +142,77 @@ describe("SettlementSpecSchema", () => {
       disputePolicy: policy,
     });
     expect(result.success).toBe(true);
+  });
+
+  // Round-2 review, M1: the round-1 matcher stripped non-ASCII characters and
+  // matched only whole fields or prefixes, so a whole-field common phrase, a
+  // mid-sentence marker, and a Cyrillic-lookalike marker all reached
+  // REVIEWED_MODEL_BACKED. The shared fixture list pins every reviewer probe
+  // and every added attack case; `activation.test.ts` pins the SAME list at
+  // the activation gate.
+  it.each([...PLACEHOLDER_POLICY_ATTACK_SAMPLES])(
+    "refuses the placeholder %j at construction (round-2, M1)",
+    (placeholder) => {
+      const result = SettlementSpecSchema.safeParse({
+        ...terminalSpotSpecSample(),
+        disputePolicy: placeholder,
+      });
+      expect(result.success).toBe(false);
+    },
+  );
+
+  it.each([...LEGITIMATE_POLICY_SAMPLES])(
+    "still accepts the legitimate policy %j (round-2, M1 boundary)",
+    (policy) => {
+      const result = SettlementSpecSchema.safeParse({
+        ...terminalSpotSpecSample(),
+        disputePolicy: policy,
+      });
+      expect(result.success).toBe(true);
+    },
+  );
+
+  // Pin WHICH Unicode rule catches each confusable class, so a refactor that
+  // keeps refusing but for the wrong reason (or stops refusing one class while
+  // another still catches the sample) is visible.
+  describe("placeholderRuleTextReason Unicode handling (round-2, M1)", () => {
+    it("refuses a token mixing Latin and non-Latin scripts outright", () => {
+      expect(placeholderRuleTextReason("ТВD - complete after review")).toContain(
+        "mixes Unicode scripts",
+      );
+    });
+
+    it("reads an all-Cyrillic homoglyph marker as what it visually spells", () => {
+      expect(placeholderRuleTextReason("Т В D - complete after review")).toContain(
+        "folding Unicode homoglyphs",
+      );
+    });
+
+    it("reassembles a marker split by non-ASCII characters instead of laundering it", () => {
+      expect(placeholderRuleTextReason("tb\u00add - complete after review")).toContain(
+        "stripping non-ASCII",
+      );
+    });
+
+    it("normalizes fullwidth forms before matching (NFKC)", () => {
+      expect(placeholderRuleTextReason("ＴＢＤ - complete after review")).toContain("tbd");
+    });
+
+    it("folds digit-for-letter substitutions inside a token", () => {
+      expect(placeholderRuleTextReason("T0D0: write the dispute policy")).toContain("todo");
+    });
+
+    it("finds a self-announcing marker at any token position", () => {
+      expect(placeholderRuleTextReason("Use primary source; TBD - complete after review.")).toContain(
+        "tbd",
+      );
+    });
+
+    it("does not treat ordinary words about reviewing as markers", () => {
+      expect(
+        placeholderRuleTextReason("Disputes are resolved by the review committee within 48 hours."),
+      ).toBeUndefined();
+    });
   });
 
   it("refuses a clarification policy that states a placeholder", () => {

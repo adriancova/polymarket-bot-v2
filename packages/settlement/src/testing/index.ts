@@ -24,6 +24,61 @@ export const SAMPLE_SERIES_ID = "01936f00-0000-7000-8000-00000000a001";
 /** A fixed, valid UUIDv7 for a sample market rules version. */
 export const SAMPLE_RULES_VERSION_ID = "01936f00-0000-7000-8000-00000000b001";
 
+/**
+ * Placeholder policy values that must NEVER be accepted in a required rule
+ * field — at construction OR at activation (round-2 review, M1 requires both
+ * suites to pin the identical list, so it lives here rather than in either
+ * test file).
+ *
+ * The first four are the round-2 reviewer probes, verbatim. The rest are this
+ * remediation's added attack cases, each annotated with the matcher rule that
+ * catches it.
+ */
+export const PLACEHOLDER_POLICY_ATTACK_SAMPLES: readonly string[] = Object.freeze([
+  "pending review", // reviewer probe: whole-field common phrase
+  "fill me in", // reviewer probe: whole-field common phrase
+  "ТВD - complete after review", // reviewer probe: Cyrillic Т/В + Latin D → mixed-script token
+  "Use primary source; TBD - complete after review.", // reviewer probe: marker mid-sentence
+  "Use primary source; T.B.D. - complete after review.", // dotted marker mid-sentence (joined runs)
+  "ＴＢＤ - complete after review", // fullwidth (NFKC)
+  "Т В D - complete after review", // spaced Cyrillic homoglyphs (confusable fold + joined runs)
+  "tb\u00add - complete after review", // soft-hyphen-split marker (non-ASCII stripping)
+  "T0D0: write the dispute policy", // digit-for-letter marker (0 → o)
+  "f1xme before launch", // digit-for-letter marker (1 → i)
+  "n0ne", // digit-for-letter whole-field placeholder
+  "Halt and escalate. TODO revisit.", // marker at any token position
+  "Escalate per clause XXX of the venue rules.", // xxx stands in for the unwritten clause
+  "Lorem ipsum dolor sit amet.", // filler text
+  "pending approval",
+  "under review",
+  "awaiting review",
+  "draft",
+  "work in progress",
+  "fill in later",
+  "insert policy here",
+  "complete after review",
+]);
+
+/**
+ * Legitimate policy texts that must KEEP parsing (round-2 review, M1
+ * boundary): substantive sentences that merely mention review, begin with
+ * `None`/`Unknown`/`Pending`/`In progress`/`draft`-adjacent words, carry
+ * accented Latin, or contain letter+digit tokens. A matcher change that
+ * refuses any of these is over-broad.
+ */
+export const LEGITIMATE_POLICY_SAMPLES: readonly string[] = Object.freeze([
+  "Halt and escalate to the operator; no substitute source is used.",
+  "None. Disputes are not accepted.",
+  "Unknown outcomes resolve per §4.",
+  "Disputes are resolved by the review committee within 48 hours.",
+  "Pending disputes are held open and settle nothing until resolved.",
+  "Fill prices from the primary feed are authoritative for settlement.",
+  "Résolution follows the venue's published procedure; halt on any doubt.",
+  "Reviews complete within 24h; disputes escalate to the operator.",
+  "In progress disputes halt settlement until the venue publishes an outcome.",
+  "The draft resolution proposed by UMA is not final until the vote completes.",
+]);
+
 const baseSpec = {
   seriesId: SAMPLE_SERIES_ID,
   specVersion: 1,
