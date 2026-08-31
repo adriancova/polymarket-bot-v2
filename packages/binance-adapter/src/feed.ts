@@ -142,8 +142,6 @@ import {
   ReferenceTradeObservedContract,
   normalizeBookTicker,
   normalizeTrade,
-  TAKER_SIDE_CONVENTIONS,
-  type TakerSideConvention,
 } from "./normalize.js";
 import { buildEmission } from "./emission.js";
 import {
@@ -299,8 +297,17 @@ export type BinanceReferenceFeedOptions = {
   /** Nothing in a frame states its unit; the connection does. */
   readonly timeUnit?: BinanceTimeUnit;
   readonly reconnect?: ReconnectPolicy;
-  /** Defaults to `OMIT`; see {@link TakerSideConvention} and `BNC-U5`. */
-  readonly takerSideConvention?: TakerSideConvention;
+  /*
+   * NOT AN OPTION: `takerSide`.
+   *
+   * The removed `takerSideConvention` option used to let a caller pick how
+   * Binance's `m` became the domain's `takerSide`, or suppress it. ADR-014 ruled
+   * the field's meaning, so there is nothing left to select: every trade now
+   * carries `takerSide` from `m` (`m = true → ASK`, `m = false → BID`). See
+   * `takerSideFor` in `./normalize.ts`, and `BINANCE_RESOLVED` (`BNC-U5`) in
+   * `./venue.ts`. Passing the removed key is refused by the constructor rather
+   * than ignored.
+   */
   /** Bound on per-stream sequence state; see `SequenceTracker`. */
   readonly maxTrackedStreams?: number;
   /**
@@ -320,7 +327,6 @@ export class BinanceReferenceFeed {
   readonly #built: BuiltStreamUrl;
   readonly #stalenessThresholdMs: number;
   readonly #reconnect: ReconnectPolicy;
-  readonly #takerSideConvention: TakerSideConvention;
   readonly #sequences: SequenceTracker;
   /** The channels this connection subscribed to; a frame claiming another is refused. */
   readonly #expectedStreams: ReadonlySet<string>;
@@ -422,12 +428,17 @@ export class BinanceReferenceFeed {
         `stalenessThresholdMs must be a positive safe integer, received ${String(options.stalenessThresholdMs)}`,
       );
     }
-    const convention = options.takerSideConvention ?? "OMIT";
-    const conventions: readonly string[] = TAKER_SIDE_CONVENTIONS;
-    if (!conventions.includes(convention)) {
+    // ADR-014 removed the selectable `takerSideConvention`, and a caller that
+    // still passes one is REFUSED rather than quietly ignored. The removed
+    // `BOOK_SIDE_CONSUMED` reading emitted the inverse of the ruled meaning, so
+    // an operator who configured it must learn that their setting is gone —
+    // silently doing something else, however correct, would hide the change.
+    if ("takerSideConvention" in options) {
+      const removed = (options as { readonly takerSideConvention?: unknown })
+        .takerSideConvention;
       throw new BinanceConfigurationError(
-        `takerSideConvention must be one of ${TAKER_SIDE_CONVENTIONS.join(", ")}`,
-        { takerSideConvention: convention },
+        "takerSideConvention was removed by ADR-014: takerSide is always emitted from Binance's `m` (m = true -> ASK, m = false -> BID) and no other convention is selectable",
+        { takerSideConvention: removed },
       );
     }
     const reconnect = options.reconnect ?? DEFAULT_RECONNECT_POLICY;
@@ -441,7 +452,6 @@ export class BinanceReferenceFeed {
     });
     this.#stalenessThresholdMs = options.stalenessThresholdMs;
     this.#reconnect = reconnect;
-    this.#takerSideConvention = convention;
     this.#sequences = new SequenceTracker(
       options.maxTrackedStreams,
       options.maxRecentIdsPerStream,
@@ -1150,10 +1160,7 @@ export class BinanceReferenceFeed {
       };
     }
 
-    const normalized = normalizeTrade(decoded, {
-      timeUnit: this.#built.timeUnit,
-      takerSideConvention: this.#takerSideConvention,
-    });
+    const normalized = normalizeTrade(decoded, { timeUnit: this.#built.timeUnit });
     if (!normalized.ok) {
       this.#frames.unrepresentableValues += 1;
       this.#pushIncident(emissions, context, {

@@ -6,7 +6,9 @@
  * invent venue behavior." Every constant below is quoted from the official
  * Binance Spot API documentation and is tagged with the exact source and access
  * date. Anything the documentation does not state is recorded in
- * {@link BINANCE_UNVERIFIED} rather than assumed.
+ * {@link BINANCE_UNVERIFIED} rather than assumed, and an item an outside
+ * authority later settles moves to {@link BINANCE_RESOLVED} rather than
+ * disappearing.
  *
  * SOURCES (accessed 2026-08-27):
  *
@@ -224,6 +226,12 @@ export const BINANCE_FRAMING_RULING = {
  * Recorded as data (rather than as prose in a comment) so a test can assert the
  * list is non-empty and the handoff can enumerate it without drifting. Each
  * entry names the conservative behavior chosen instead of an assumption.
+ *
+ * An entry leaves this list only when an authority OUTSIDE this package settles
+ * it; it then moves to {@link BINANCE_RESOLVED} with what closed it, so a
+ * closure is auditable and an id that once appeared in this package's output can
+ * still be looked up. Nothing here may close its own open item by deciding the
+ * behavior it already chose is fine.
  */
 export const BINANCE_UNVERIFIED = [
   {
@@ -257,20 +265,45 @@ export const BINANCE_UNVERIFIED = [
       "A non-positive best price is not representable as the domain's positive `bidPrice`/`askPrice`, and mapping it to 'absent' would be an invention of the ADR-001 §8.1 kind ('an absent best bid is not a zero best bid'). The two cases are kept apart. ONE unusable side: that side is OMITTED from the event with its raw value recorded and a data-quality incident opened, and the other side is still published — the frame is `NORMALIZED` and counted as a partial top of book, because suppressing a real best ask on account of an unrepresentable best bid would discard an observation the venue did make. BOTH sides unusable: the frame is classified `UNREPRESENTABLE`, an incident is opened, and no event is emitted, because there would be nothing left to say.",
   },
   {
-    id: "BNC-U5",
-    subject: "Which book side the domain's `takerSide` names",
-    documented:
-      "Binance documents `m` as 'Is the buyer the market maker?'. The frozen domain contract documents `takerSide` only as 'Taker side when the venue reports it' and does not say whether `BID`/`ASK` names the side of the book the taker consumed or the direction of the taker's own order — the two readings map `m` to opposite values.",
-    conservativeBehavior:
-      "`takerSide` is OMITTED by default (it is optional in the contract; ADR-002 §6: 'a producer that cannot supply them must omit them rather than guess'). A caller that owns the ruling may opt into a named convention explicitly; the raw `buyerIsMaker` boolean is preserved on the decoded frame either way.",
-  },
-  {
     id: "BNC-U6",
     subject: "Precision of integer JSON fields (`t`, `u`, `E`, `T`)",
     documented:
       "They are documented as JSON numbers (`REST` types the trade id as LONG); the documentation does not bound them below 2^53.",
     conservativeBehavior:
       "A parsed integer that is not a JavaScript safe integer is rejected with a typed error instead of being carried as a silently rounded value.",
+  },
+] as const;
+
+/**
+ * Register entries that were open and are now CLOSED, each with its authority.
+ *
+ * The counterpart of {@link BINANCE_UNVERIFIED}. Closing an item by deleting it
+ * would erase both the question and the answer: an operator reading a recorded
+ * event, or a reviewer reading a past handoff, still meets these ids. So the
+ * entry stays, states WHO closed it, WHEN, and WHAT CHANGED in this package as a
+ * result.
+ *
+ * The one entry here is not a venue fact that later became documented — Binance
+ * documents `m` exactly as it always did. `BNC-U5` was a question about the
+ * FROZEN DOMAIN CONTRACT's vocabulary, and only the contract owner could answer
+ * it. It did, in ADR-014.
+ */
+export const BINANCE_RESOLVED = [
+  {
+    id: "BNC-U5",
+    subject: "Which book side the domain's `takerSide` names",
+    closedAt: "2026-08-28",
+    remediatedAt: "2026-08-30",
+    closedBy:
+      "ADR-014 — takerSide names the aggressor order's own side — Accepted 2026-08-28, recorded by the GOV-1B contract-owner governance round. §1: `BID` ⇔ the taker was buying; `ASK` ⇔ the taker was selling. §2, stated separately because the readings are inverses: a buying taker consumes resting asks and is STILL recorded as `BID`. §3's Binance row derives this venue's mapping from the documented `m` ('Is the buyer the market maker?'): '`m = true → ASK` (the buyer was the maker, so the taker was the seller); `m = false → BID`'.",
+    wasOpenBecause:
+      "Binance documents `m` as 'Is the buyer the market maker?', and the frozen domain contract documented `takerSide` only as 'Taker side when the venue reports it' — which does not say whether `BID`/`ASK` names the side of the book the taker consumed or the direction of the taker's own order. The two readings map `m` to OPPOSITE values, so this package omitted the field rather than guess (ADR-002 §6).",
+    whatChanged:
+      "Ruled 2026-08-28, remediated in this package 2026-08-30, under ADR-014's mandatory bounded follow-up: (1) `takerSide` is now ALWAYS emitted on `ReferenceTradeObserved`, mapped `m = true → ASK`, `m = false → BID` — the pre-ruling `TAKER_ORDER_DIRECTION` behavior, which ADR-014 §7 verified conformant; (2) the selectable `BOOK_SIDE_CONSUMED` convention was DELETED, because it emits the inverse of the ruled meaning and ADR-014 §4.3 calls that 'a contract violation, not a configuration choice'; (3) the `takerSideConvention` option and its `OMIT` default were removed with it, and passing the removed key now throws `BinanceConfigurationError` instead of being ignored.",
+    defaultDecision:
+      "ADR-014's §7 follow-up item 3 required this package to decide AND state whether the default becomes the mapping or stays `OMIT`. DECIDED: the mapping, emitted unconditionally. `m` is documented on every `<symbol>@trade` payload, so the aggressor's role is always REPORTED rather than inferred, and ADR-002 §6's 'omit rather than guess' — the rule that justified the old default — no longer applies. No heuristic is used anywhere (ADR-014 §6).",
+    preserved:
+      "The venue's raw boolean is untouched: `buyerIsMaker` still survives verbatim on the decoded trade frame (`./frames.ts`), so a consumer can read Binance's own spelling without re-deriving it from the mapped side.",
   },
 ] as const;
 

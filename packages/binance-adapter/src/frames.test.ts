@@ -41,6 +41,24 @@ describe("decodeFrame — documented shapes", () => {
     expect(decoded.buyerIsMaker).toBe(true);
   });
 
+  it("preserves the venue's raw `m` verbatim, both polarities, unmapped (ADR-014)", () => {
+    // The decoded frame keeps Binance's own boolean. `takerSide` is DERIVED from
+    // it at the domain boundary (`./normalize.ts`), and ADR-014's §7 follow-up
+    // item 4 requires the raw value to survive that derivation, so a consumer
+    // never has to invert the mapping to recover what the venue said.
+    for (const buyerIsMaker of [true, false]) {
+      const decoded = decodeFrame(
+        JSON.stringify({ ...(JSON.parse(DOCUMENTED_TRADE) as object), m: buyerIsMaker }),
+      );
+      if (decoded.kind !== "TRADE") {
+        throw new Error("unreachable");
+      }
+      expect(decoded.buyerIsMaker).toBe(buyerIsMaker);
+      // …and it is still a boolean, not a book side: the frame layer maps nothing.
+      expect(typeof decoded.buyerIsMaker).toBe("boolean");
+    }
+  });
+
   it("does not report `M` as unknown: the venue documents it, as 'Ignore'", () => {
     // `unknownFields` reports VENUE schema drift, not this package's modelling
     // choices. Listing `M` would open a data-quality incident on every trade.

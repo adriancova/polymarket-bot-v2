@@ -299,7 +299,16 @@ export type DecodedTradeFrame = DecodedBase & {
   readonly eventTimeEpoch: number;
   /** `T` — trade time, in the connection's declared unit. */
   readonly tradeTimeEpoch: number;
-  /** `m` — "Is the buyer the market maker?", preserved verbatim (see `BNC-U5`). */
+  /**
+   * `m` — "Is the buyer the market maker?", preserved verbatim.
+   *
+   * The domain's `takerSide` is derived from it (`m = true → ASK`,
+   * `m = false → BID`, ADR-014; see `takerSideFor` in `./normalize.ts`), and the
+   * raw boolean still survives here, unmapped, so a consumer reads the venue's
+   * own statement rather than re-deriving it. `BNC-U5` — the question of which
+   * side `takerSide` names — is closed by that ADR (`BINANCE_RESOLVED` in
+   * `./venue.ts`).
+   */
   readonly buyerIsMaker: boolean;
 };
 
