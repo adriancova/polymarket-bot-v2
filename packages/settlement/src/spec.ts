@@ -103,7 +103,12 @@ import {
  * refuses regardless of word order ({@link canonicalMultisetKey}), and the
  * condensed (whitespace-removed) comparison covers every permutation of every
  * listed morphological-variant spelling of every entry, so gluing cannot
- * revive a permuted or morphed entry either).
+ * revive a permuted or morphed entry either);
+ * and again in round 6: round 5's OWN stopword mechanism introduced a gap —
+ * a whole field made ONLY of the configured stopwords (`"the the to"`)
+ * emptied to no canonical multiset, matched no entry, and every remaining
+ * rule accepted it — now a non-empty normalized form whose EVERY token is a
+ * stopword refuses structurally ({@link stopwordOnlyFormReason}).
  * The value is first put through the Unicode gate of
  * {@link placeholderRuleTextReason} (NFKC, mixed-script refusal, confusable
  * folding, non-ASCII stripping — the exact rule is documented there), and each
@@ -114,6 +119,14 @@ import {
  * 1. the normalized form is EMPTY (the value was punctuation-only — `"???"`,
  *    `"-"`, `"..."` — or contained nothing this matcher can read as ASCII
  *    text); or
+ * 1a. (round 6) the normalized form is NON-EMPTY but EVERY one of its tokens
+ *    is one of the four stopwords {@link PLACEHOLDER_STOPWORD_TOKENS}
+ *    (`"the the to"`, `"The To"`, `"the, the."`): a field of pure
+ *    articles/particles carries no rule content, exactly as a
+ *    punctuation-only field does. Checked per candidate FORM, so dotted
+ *    spans (`"T.O. T.H.E."` → `"to the"`), digit substitutions
+ *    (`"th3 t0"`), and zero-width splits (via the stripped candidate)
+ *    cannot revive it ({@link stopwordOnlyFormReason}); or
  * 2. the normalized form EQUALS one of {@link PLACEHOLDER_RULE_TEXTS} (so
  *    `"N / A"`, `"n/a"` and `"n.a."` all normalize to `"n a"` / `"n a"` forms
  *    listed below); or
@@ -373,6 +386,12 @@ export const PLACEHOLDER_RULE_TEXTS: readonly string[] = Object.freeze([
  * The whole-field cardinality requirement (every non-stopword token must be
  * accounted for) is what keeps a substantive sentence containing these words
  * out of reach.
+ *
+ * ROUND 6 (R6-M1): a field consisting ONLY of these tokens is itself refused
+ * ({@link stopwordOnlyFormReason}). Dropping the stopwords from both sides of
+ * the entry comparison must not make a pure-stopword field invisible to every
+ * rule — which is exactly what happened at the round-6 candidate
+ * (`"the the to"` activated as reviewed).
  */
 export const PLACEHOLDER_STOPWORD_TOKENS: readonly string[] = Object.freeze([
   "the",
@@ -434,7 +453,10 @@ function canonicalConventionalToken(token: string): string {
  * The order-insensitive canonical key of a token list: stopwords dropped,
  * morphological variants folded, tokens sorted. `undefined` when nothing
  * remains (a value of pure stopwords matches no entry rather than an empty
- * key).
+ * key). Since round 6, a whole-field form the stopwords EMPTY never reaches
+ * this comparison at all: {@link stopwordOnlyFormReason} refuses it first —
+ * the round-6 review proved that "matches no entry" quietly became "passes
+ * every rule" for such a field.
  */
 function canonicalMultisetKey(tokens: readonly string[]): string | undefined {
   const canonical = tokens
@@ -997,10 +1019,45 @@ function whitespaceJoinedMarkerReason(form: string): string | undefined {
 }
 
 /**
- * Runs the ASCII placeholder rules (whole-field, condensed whole-field,
- * canonical-multiset whole-field, whole-field family, prefix, any-position
- * marker, whitespace-split marker, digit folds) over one candidate string.
- * `undefined` when nothing matched.
+ * The refusal for a whole-field form made ONLY of stopword tokens, or
+ * `undefined` (round-6 review, R6-M1).
+ *
+ * Round 5 introduced {@link PLACEHOLDER_STOPWORD_TOKENS} so conventional
+ * entries could be matched net of articles, and {@link canonicalMultisetKey}
+ * deliberately returned `undefined` for a form the stopwords emptied — which
+ * meant a field made ONLY of stopwords (`"the the to"`) matched no entry and
+ * sailed through every remaining rule to `REVIEWED_MODEL_BACKED`. Such a
+ * field carries no rule content — the SAME reasoning as the
+ * punctuation-only/empty-normalization refusal in
+ * {@link asciiPlaceholderReason}: nothing that states a rule survives
+ * normalization, the tokens that do survive are pure articles/particles.
+ *
+ * Checked per candidate FORM inside {@link asciiPlaceholderReason}, before
+ * every other per-form rule, so each encoding layer covers its own class:
+ * the plain normalized form catches `"the the to"` / `"The To"` /
+ * `"the, the."` and a zero-width space BETWEEN stopwords; the joined-span
+ * form catches dotted spellings (`"T.O. T.H.E."` → `"to the"`); the digit
+ * folds catch substitutions (`"th3 t0"` → `"the to"`); and the
+ * non-ASCII-stripping candidate of {@link placeholderRuleTextReason}
+ * catches a zero-width split INSIDE a stopword (a U+200B between `t` and
+ * `he`, reassembling to `"the to"`). Whole-field only by construction: a
+ * single non-stopword
+ * token anywhere in the form defeats the check, so a real sentence — which
+ * names a subject and an action — is untouched.
+ */
+function stopwordOnlyFormReason(form: string): string | undefined {
+  const tokens = form.split(" ");
+  if (tokens.every((token) => PLACEHOLDER_STOPWORD_SET.has(token))) {
+    return "consists only of the stopword tokens the/a/an/to (pure articles and particles state no rule, exactly as a punctuation-only field states none)";
+  }
+  return undefined;
+}
+
+/**
+ * Runs the ASCII placeholder rules (stopword-only whole-field, whole-field,
+ * condensed whole-field, canonical-multiset whole-field, whole-field family,
+ * prefix, any-position marker, whitespace-split marker, digit folds) over one
+ * candidate string. `undefined` when nothing matched.
  */
 function asciiPlaceholderReason(candidate: string): string | undefined {
   const normalized = normalizedRuleText(candidate);
@@ -1019,6 +1076,13 @@ function asciiPlaceholderReason(candidate: string): string | undefined {
     }
   }
   for (const form of forms) {
+    // Round 6 (R6-M1): the stopword-only rule runs FIRST — a pure-stopword
+    // form must be refused for being content-free, not fall through to the
+    // entry comparisons that (by design) cannot see it.
+    const stopwordOnlyReason = stopwordOnlyFormReason(form);
+    if (stopwordOnlyReason !== undefined) {
+      return stopwordOnlyReason;
+    }
     if (PLACEHOLDER_RULE_TEXTS.includes(form)) {
       return `normalizes to the placeholder "${form}"`;
     }

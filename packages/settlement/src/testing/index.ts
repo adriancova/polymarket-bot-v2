@@ -144,6 +144,27 @@ export const PLACEHOLDER_POLICY_ATTACK_SAMPLES: readonly string[] = Object.freez
   "as previous",
   "space intentionally left blank",
   "this space intentionally left blank",
+  // --- Round-6 reviewer probe, verbatim (reproduced as a live bypass at the
+  // --- round-6 candidate f227361 before the fix: matcher returned no reason,
+  // --- construction PASSED, activation REVIEWED_MODEL_BACKED with
+  // --- allowed:true). Round 5's own stopword mechanism emptied the field to
+  // --- no canonical multiset, so it matched no entry and no other rule saw it.
+  "the the to", // R6-M1: stopword-only field (stopword-only whole-field rule)
+  // --- Round-6 class-mates. Every multi-character entry below was ALSO
+  // --- reproduced as a live bypass at the candidate. "to" and "a" were
+  // --- refused there ONLY by the 3-character schema length minimum — the
+  // --- matcher itself returned no reason — and are pinned so the class
+  // --- refusal does not depend on an unrelated length gate.
+  "to", // single stopword (matcher-level bypass at the candidate)
+  "a", // single stopword (matcher-level bypass at the candidate)
+  "an the", // stopword pair
+  "to to to to", // repeated stopword
+  "the, the.", // stopwords with punctuation
+  "The To", // mixed case
+  "t​he to", // zero-width space INSIDE a stopword (stripped candidate reassembles "the to")
+  "the​ the to", // zero-width space BETWEEN stopwords (plain candidate; U+200B normalizes to a space)
+  "T.O. T.H.E.", // dotted stopword spans (joined token spans -> "to the")
+  "th3 t0", // digit-substituted stopwords (digit folds -> "the to")
 ]);
 
 /**

@@ -511,6 +511,78 @@ describe("SettlementSpecSchema", () => {
     });
   });
 
+  // Round-6 review, R6-M1: round 5's own stopword mechanism introduced the
+  // gap — a whole field of pure stopwords emptied to no canonical multiset,
+  // matched no entry, and every remaining rule accepted it (`"the the to"`
+  // activated as REVIEWED_MODEL_BACKED at the candidate). Pin the new
+  // structural rule, WHICH candidate layer catches each encoding, and the
+  // whole-field boundary in both directions.
+  describe("placeholderRuleTextReason round-6 rule (R6-M1)", () => {
+    it("refuses a stopword-only field (reviewer probe)", () => {
+      const reason = placeholderRuleTextReason("the the to");
+      expect(reason).toContain("only of the stopword tokens");
+      expect(reason).toContain("the/a/an/to");
+    });
+
+    it("refuses single stopwords at the matcher, independently of the length minimum", () => {
+      // At the candidate, "to" and "a" were refused ONLY by the 3-character
+      // schema minimum — the matcher itself returned no reason. The class
+      // rule now refuses them at the matcher, so the refusal does not hang
+      // on an unrelated length gate.
+      expect(placeholderRuleTextReason("to")).toContain("only of the stopword tokens");
+      expect(placeholderRuleTextReason("a")).toContain("only of the stopword tokens");
+      expect(placeholderRuleTextReason("an the")).toContain("only of the stopword tokens");
+      expect(placeholderRuleTextReason("to to to to")).toContain("only of the stopword tokens");
+    });
+
+    it("refuses punctuated and mixed-case stopword-only fields", () => {
+      expect(placeholderRuleTextReason("the, the.")).toContain("only of the stopword tokens");
+      expect(placeholderRuleTextReason("The To")).toContain("only of the stopword tokens");
+    });
+
+    it("pins WHICH candidate layer catches zero-width-split stopword-only fields", () => {
+      // BOTH were live bypasses at the round-6 candidate (no earlier layer
+      // refused them; verified by probe before the fix). A U+200B BETWEEN
+      // stopwords normalizes to a space, so the plain candidate catches it;
+      // INSIDE a stopword it splits the token ("t he to") and only the
+      // non-ASCII-stripping candidate reassembles "the to".
+      const between = placeholderRuleTextReason("the​ the to");
+      expect(between).toContain("only of the stopword tokens");
+      expect(between).not.toContain("stripping non-ASCII");
+      const inside = placeholderRuleTextReason("t​he to");
+      expect(inside).toContain("only of the stopword tokens");
+      expect(inside).toContain("stripping non-ASCII");
+    });
+
+    it("applies per candidate form: dotted spans and digit folds cannot revive it", () => {
+      // "T.O. T.H.E." only becomes stopword-only in the joined-span form
+      // ("to the"); "th3 t0" only in the digit-folded form ("the to").
+      expect(placeholderRuleTextReason("T.O. T.H.E.")).toContain("only of the stopword tokens");
+      expect(placeholderRuleTextReason("th3 t0")).toContain("only of the stopword tokens");
+    });
+
+    it("stays whole-field only: stopwords alongside real tokens are untouched", () => {
+      expect(placeholderRuleTextReason("To the operator: halt.")).toBeUndefined();
+      expect(placeholderRuleTextReason("A halt.")).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("Halt and escalate to the operator; no substitute source is used."),
+      ).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("The attachment referenced in §2 governs disputes."),
+      ).toBeUndefined();
+    });
+
+    it("keeps the disclosed round-6 residual visible rather than claiming it away", () => {
+      // The rule is scoped to EXACTLY the four configured stopwords: a
+      // content-free field built from OTHER function words is a different
+      // (still open) class, disclosed rather than claimed closed — widening
+      // the stopword set to chase it would begin refusing real sentences
+      // (documented on PLACEHOLDER_STOPWORD_TOKENS). Pinned so the residual
+      // can move in neither direction silently.
+      expect(placeholderRuleTextReason("of the")).toBeUndefined();
+    });
+  });
+
   it("refuses a clarification policy that states a placeholder", () => {
     const result = SettlementSpecSchema.safeParse({
       ...terminalSpotSpecSample(),
