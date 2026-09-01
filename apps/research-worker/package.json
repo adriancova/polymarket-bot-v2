@@ -3,15 +3,26 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder application scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Research worker (WP-130): compacts verified WAL segments into checksummed Parquet objects and immutable dataset manifests. Holds no credential, opens no venue connection, and places no order.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/integration/parquet/tsconfig.json",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/main.mjs",
+    "start": "pnpm run typecheck && pnpm run build && node ./dist/main.mjs",
+    "test:integration": "vitest run --config ../../test/integration/parquet/vitest.config.ts",
+    "fixture:python": "UPDATE_PYTHON_FIXTURE=1 vitest run --config ../../test/integration/parquet/vitest.config.ts"
+  },
+  "dependencies": {
+    "@polymarket-bot/storage-parquet": "workspace:*"
   },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@polymarket-bot/storage-wal": "workspace:*",
+    "@types/node": "^24.13.3",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }
