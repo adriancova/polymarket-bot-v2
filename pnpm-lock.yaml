@@ -43,10 +43,44 @@ importers:
         version: 5.9.3
 
   apps/data-gateway:
+    dependencies:
+      '@polymarket-bot/binance-adapter':
+        specifier: workspace:*
+        version: link:../../packages/binance-adapter
+      '@polymarket-bot/coinbase-adapter':
+        specifier: workspace:*
+        version: link:../../packages/coinbase-adapter
+      '@polymarket-bot/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
+      '@polymarket-bot/event-bus':
+        specifier: workspace:*
+        version: link:../../packages/event-bus
+      '@polymarket-bot/polymarket-public':
+        specifier: workspace:*
+        version: link:../../packages/polymarket-public
+      '@polymarket-bot/storage-wal':
+        specifier: workspace:*
+        version: link:../../packages/storage-wal
+      '@polymarket-bot/universe':
+        specifier: workspace:*
+        version: link:../../packages/universe
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
     devDependencies:
+      '@types/node':
+        specifier: ^24.13.3
+        version: 24.13.3
+      esbuild:
+        specifier: ^0.28.2
+        version: 0.28.2
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   apps/ops-cli:
     devDependencies:

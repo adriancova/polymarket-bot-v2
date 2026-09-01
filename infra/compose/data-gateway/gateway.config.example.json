@@ -1,0 +1,35 @@
+{
+  "streamName": "market-events",
+  "tickIntervalMs": 1000,
+  "wal": {
+    "rootPath": "./wal",
+    "maxSegmentBytes": 67108864,
+    "maxSegmentAgeMs": 900000,
+    "fsyncIntervalMs": 1000
+  },
+  "markets": [
+    {
+      "internalMarketId": "01990000-0000-7000-8000-000000000001",
+      "conditionId": "0xabababababababababababababababababababababababababababababababab",
+      "yesTokenId": "11111",
+      "noTokenId": "22222",
+      "parameters": {
+        "tickSize": "0.01",
+        "minimumOrderSize": "5",
+        "negRisk": false,
+        "tradingDelaySeconds": 0,
+        "status": "OPEN"
+      },
+      "observedAt": "2026-09-01T00:00:00.000Z"
+    }
+  ],
+  "binance": {
+    "feedId": "binance-reference",
+    "symbols": ["BTCUSDT"],
+    "stalenessThresholdMs": 30000
+  },
+  "coinbase": {
+    "feedId": "coinbase-reference",
+    "productIds": ["BTC-USD"]
+  }
+}

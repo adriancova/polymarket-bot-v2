@@ -1,0 +1,545 @@
+/**
+ * The Market Data Gateway and Recorder — the WP-120 composition root.
+ *
+ * Assembles, per handoff §9.1: the venue adapters (WP-070/WP-080/WP-090/
+ * WP-100), envelope assignment (`gatewayEpoch`, `ingestSeq`, receipt stamps,
+ * connection metadata — ADR-002), the WAL raw-frame recorder (WP-050), the
+ * event-bus transport (WP-060), the universe-backed market directory
+ * (WP-110), staleness surveillance, gap→snapshot→resync recovery, and
+ * data-quality incident emission.
+ *
+ * Failure boundaries (§4.2), as wired here:
+ *
+ * - transport outage → `GatewayPublisher` halts publication terminally for
+ *   this epoch, an incident is surfaced through the observer, and RECORDING
+ *   CONTINUES: every feed driver's WAL path is independent of the publisher.
+ * - WAL refusal/fault → PAGE incident, affected derived data unpublished; the
+ *   feed-health stream keeps flowing so the outage is visible.
+ * - a trader deploy touches nothing here: this process owns no trader state.
+ *
+ * Everything impure is injected (`GatewayPorts`), so the whole gateway runs
+ * in a test with manual clocks, scripted sockets, an in-memory filesystem,
+ * and an in-memory transport — no network, no Docker (§12.4).
+ */
+
+import type { BinanceSocketFactory } from "@polymarket-bot/binance-adapter";
+import { BinanceReferenceFeed, DEFAULT_RECONNECT_POLICY } from "@polymarket-bot/binance-adapter";
+import type { CoinbaseSocketFactory } from "@polymarket-bot/coinbase-adapter";
+import { CoinbaseConnectionManager } from "@polymarket-bot/coinbase-adapter";
+import type { MarketEventTransport } from "@polymarket-bot/event-bus";
+import type {
+  PublicHttpClient,
+  PublicWebSocketFactory,
+} from "@polymarket-bot/polymarket-public";
+import {
+  DEFAULT_PUBLIC_MARKET_FEED_OPTIONS,
+  PublicBookSnapshotFetcher,
+  PublicMarketFeed,
+} from "@polymarket-bot/polymarket-public";
+import { RtdsTwapFeed, RTDS_WEBSOCKET_URL } from "@polymarket-bot/polymarket-public/rtds";
+import type { WalFileSystem, WalWriterMetrics } from "@polymarket-bot/storage-wal";
+
+import type { GatewayConfig } from "./config.js";
+import { ConnectionIdFactory } from "./connection-ids.js";
+import { UniverseMarketDirectory, type UniverseDirectoryMetrics } from "./directory.js";
+import type { DispatcherMetrics, DispatcherObserver } from "./dispatcher.js";
+import { GatewayDispatcher } from "./dispatcher.js";
+import { GatewayStateError } from "./errors.js";
+import type { BinanceFeedDriverMetrics } from "./feeds/binance.js";
+import { BinanceFeedDriver } from "./feeds/binance.js";
+import type { CoinbaseFeedDriverMetrics } from "./feeds/coinbase.js";
+import { CoinbaseFeedDriver } from "./feeds/coinbase.js";
+import type { PolymarketFeedDriverMetrics } from "./feeds/polymarket.js";
+import { PolymarketFeedDriver } from "./feeds/polymarket.js";
+import type { RtdsFeedDriverMetrics } from "./feeds/rtds.js";
+import { RtdsFeedDriver } from "./feeds/rtds.js";
+import type { IncidentRegistryMetrics } from "./incidents.js";
+import { IncidentRegistry } from "./incidents.js";
+import { GatewayJournal } from "./journal.js";
+import type {
+  CancelScheduled,
+  GatewayClock,
+  GatewayIdSource,
+  GatewayTimers,
+} from "./ports.js";
+import type { GatewayPublisherMetrics, PublicationHalt } from "./publisher.js";
+import { GatewayPublisher } from "./publisher.js";
+import { IngestSequencer } from "./sequencer.js";
+import type { SubscriptionPlan } from "./subscription-plan.js";
+import { planSubscriptions } from "./subscription-plan.js";
+
+/** Operational visibility, independent of the transport being reachable. */
+export interface GatewayObserver extends DispatcherObserver {
+  onPublicationHalted?(halt: PublicationHalt): void;
+  onRecordingFailure?(failure: { readonly reason: string; readonly detail: string }): void;
+}
+
+/** Everything impure the gateway needs, injected. */
+export interface GatewayPorts {
+  readonly clock: GatewayClock;
+  readonly ids: GatewayIdSource;
+  readonly timers: GatewayTimers;
+  readonly walFileSystem: WalFileSystem;
+  readonly transport: MarketEventTransport;
+  readonly polymarketSocketFactory?: PublicWebSocketFactory;
+  readonly polymarketHttpClient?: PublicHttpClient;
+  readonly rtdsSocketFactory?: PublicWebSocketFactory;
+  readonly binanceSocketFactory?: BinanceSocketFactory;
+  readonly coinbaseSocketFactory?: CoinbaseSocketFactory;
+  readonly observer?: GatewayObserver;
+}
+
+export interface GatewayMetrics {
+  readonly gatewayEpoch: string;
+  readonly wal: WalWriterMetrics;
+  readonly publisher: GatewayPublisherMetrics;
+  readonly dispatcher: DispatcherMetrics;
+  readonly incidents: IncidentRegistryMetrics;
+  readonly directory: UniverseDirectoryMetrics | undefined;
+  readonly polymarket: PolymarketFeedDriverMetrics | undefined;
+  readonly rtds: RtdsFeedDriverMetrics | undefined;
+  readonly binance: BinanceFeedDriverMetrics | undefined;
+  readonly coinbase: CoinbaseFeedDriverMetrics | undefined;
+}
+
+type GatewayState = "created" | "running" | "stopped";
+
+export class DataGateway {
+  readonly #config: GatewayConfig;
+  readonly #ports: GatewayPorts;
+  readonly #sequencer: IngestSequencer;
+  readonly #journal: GatewayJournal;
+  readonly #publisher: GatewayPublisher;
+  readonly #dispatcher: GatewayDispatcher;
+  readonly #plan: SubscriptionPlan;
+  readonly #directory: UniverseMarketDirectory | undefined;
+
+  #polymarketFeed: PublicMarketFeed | undefined;
+  #polymarketDriver: PolymarketFeedDriver | undefined;
+  #rtdsFeed: RtdsTwapFeed | undefined;
+  #rtdsDriver: RtdsFeedDriver | undefined;
+  #binanceDriver: BinanceFeedDriver | undefined;
+  #coinbaseManager: CoinbaseConnectionManager | undefined;
+  #coinbaseDriver: CoinbaseFeedDriver | undefined;
+
+  #state: GatewayState = "created";
+  #cancelTick: CancelScheduled | undefined;
+
+  private constructor(args: {
+    config: GatewayConfig;
+    ports: GatewayPorts;
+    sequencer: IngestSequencer;
+    journal: GatewayJournal;
+    publisher: GatewayPublisher;
+    dispatcher: GatewayDispatcher;
+    plan: SubscriptionPlan;
+    directory: UniverseMarketDirectory | undefined;
+  }) {
+    this.#config = args.config;
+    this.#ports = args.ports;
+    this.#sequencer = args.sequencer;
+    this.#journal = args.journal;
+    this.#publisher = args.publisher;
+    this.#dispatcher = args.dispatcher;
+    this.#plan = args.plan;
+    this.#directory = args.directory;
+    this.#buildFeeds();
+  }
+
+  /** Builds the gateway: one epoch, one WAL directory, one publish stream. */
+  static async create(config: GatewayConfig, ports: GatewayPorts): Promise<DataGateway> {
+    const gatewayEpoch = ports.ids.newUuid();
+    const sequencer = new IngestSequencer(gatewayEpoch);
+    const observer = ports.observer ?? {};
+
+    // Late-bound so the journal/publisher callbacks can reach the dispatcher
+    // that is constructed after them. A holder rather than a reassigned
+    // binding: the callbacks close over the holder, and the one assignment
+    // below fills it before any of them can fire.
+    const late: { dispatcher?: GatewayDispatcher } = {};
+
+    const journal = await GatewayJournal.open({
+      walRootPath: config.wal.rootPath,
+      fileSystem: ports.walFileSystem,
+      clock: ports.clock,
+      sequencer,
+      ...(config.wal.queueCapacity === undefined
+        ? {}
+        : { queueCapacity: config.wal.queueCapacity }),
+      ...(config.wal.queueMaxBytes === undefined
+        ? {}
+        : { queueMaxBytes: config.wal.queueMaxBytes }),
+      ...(config.wal.maxSegmentBytes === undefined
+        ? {}
+        : { maxSegmentBytes: config.wal.maxSegmentBytes }),
+      ...(config.wal.maxSegmentAgeMs === undefined
+        ? {}
+        : { maxSegmentAgeMs: config.wal.maxSegmentAgeMs }),
+      ...(config.wal.fsyncIntervalMs === undefined
+        ? {}
+        : { fsyncIntervalMs: config.wal.fsyncIntervalMs }),
+      ...(config.wal.fsyncByteThreshold === undefined
+        ? {}
+        : { fsyncByteThreshold: config.wal.fsyncByteThreshold }),
+      ...(config.wal.maxTotalBytes === undefined
+        ? {}
+        : { maxTotalBytes: config.wal.maxTotalBytes }),
+      onRecordingFailure: (failure) => {
+        observer.onRecordingFailure?.(failure);
+        // A writer FAULT (as opposed to a per-frame refusal, which the feed
+        // drivers report per frame) is a PAGE incident of its own.
+        if (failure.reason === "write-fault") {
+          late.dispatcher?.openIncident({
+            scope: "wal",
+            reasonCode: "GATEWAY_WAL_WRITE_FAULT",
+            severity: "PAGE",
+            detail: failure.detail,
+          });
+        }
+      },
+    });
+
+    const publisher = new GatewayPublisher({
+      transport: ports.transport,
+      stream: config.streamName,
+      onPublicationHalted: (halt) => {
+        observer.onPublicationHalted?.(halt);
+        // §8.3: a critical queue that cannot accept an event opens an
+        // incident. The incident's own publication is suppressed while
+        // halted; the observer callback above is the delivery that works.
+        late.dispatcher?.openIncident({
+          scope: "transport",
+          reasonCode:
+            halt.cause === "EVENT_BUS_PUBLISH_QUEUE_FULL"
+              ? "GATEWAY_PUBLISH_QUEUE_FULL"
+              : "GATEWAY_TRANSPORT_UNAVAILABLE",
+          severity: "PAGE",
+          detail: `publication halted at ingestSeq ${halt.haltedAtIngestSeq}: ${halt.detail}; the WAL keeps recording`,
+        });
+      },
+    });
+
+    const dispatcher = new GatewayDispatcher({
+      clock: ports.clock,
+      ids: ports.ids,
+      sequencer,
+      publisher,
+      incidents: new IncidentRegistry(),
+      observer,
+    });
+    late.dispatcher = dispatcher;
+
+    const directory =
+      config.polymarket === undefined
+        ? undefined
+        : new UniverseMarketDirectory(config.markets, ports.clock);
+
+    return new DataGateway({
+      config,
+      ports,
+      sequencer,
+      journal,
+      publisher,
+      dispatcher,
+      plan: planSubscriptions(config),
+      directory,
+    });
+  }
+
+  #buildFeeds(): void {
+    const config = this.#config;
+    const ports = this.#ports;
+
+    if (config.polymarket !== undefined) {
+      if (ports.polymarketSocketFactory === undefined || ports.polymarketHttpClient === undefined) {
+        throw new GatewayStateError(
+          "the Polymarket feed is configured but its socket factory or HTTP client port is missing",
+        );
+      }
+      if (this.#directory === undefined) {
+        throw new GatewayStateError("the Polymarket feed requires the universe directory");
+      }
+      const feedConfig = config.polymarket;
+      const url = feedConfig.url ?? DEFAULT_PUBLIC_MARKET_FEED_OPTIONS.url;
+      const fetcher = new PublicBookSnapshotFetcher({
+        http: ports.polymarketHttpClient,
+        directory: this.#directory,
+        ...(feedConfig.snapshotBaseUrl === undefined
+          ? {}
+          : { baseUrl: feedConfig.snapshotBaseUrl }),
+      });
+      const driver = new PolymarketFeedDriver({
+        feedId: feedConfig.feedId,
+        endpoint: url,
+        journal: this.#journal,
+        dispatcher: this.#dispatcher,
+        clock: ports.clock,
+        timers: ports.timers,
+        snapshotFetcher: fetcher,
+      });
+      const connectionIds = new ConnectionIdFactory(feedConfig.feedId);
+      const feed = new PublicMarketFeed(
+        {
+          clock: {
+            nowMs: () => ports.clock.nowMs(),
+            monotonicMs: () => Number(ports.clock.monotonicNs() / 1_000_000n),
+          },
+          timers: ports.timers,
+          webSocketFactory: ports.polymarketSocketFactory,
+          directory: this.#directory,
+          connectionId: () => connectionIds.next(),
+        },
+        {
+          onEvent: (event) => {
+            driver.onEvent(event);
+          },
+          onProblem: (problem) => {
+            driver.onProblem(problem);
+          },
+          onRawFrame: (frame) => {
+            driver.onRawFrame(frame);
+          },
+        },
+        {
+          feedId: feedConfig.feedId,
+          url,
+          ...(feedConfig.customFeatureEnabled === undefined
+            ? {}
+            : { customFeatureEnabled: feedConfig.customFeatureEnabled }),
+          ...(feedConfig.maximumAssetsPerSubscriptionFrame === undefined
+            ? {}
+            : {
+                maximumAssetsPerSubscriptionFrame:
+                  feedConfig.maximumAssetsPerSubscriptionFrame,
+              }),
+          ...(feedConfig.heartbeatIntervalMs === undefined
+            ? {}
+            : { heartbeatIntervalMs: feedConfig.heartbeatIntervalMs }),
+          ...(feedConfig.pongTimeoutMs === undefined
+            ? {}
+            : { pongTimeoutMs: feedConfig.pongTimeoutMs }),
+          ...(feedConfig.stalenessCheckIntervalMs === undefined
+            ? {}
+            : { stalenessCheckIntervalMs: feedConfig.stalenessCheckIntervalMs }),
+        },
+      );
+      driver.bind(feed);
+      this.#polymarketFeed = feed;
+      this.#polymarketDriver = driver;
+    }
+
+    if (config.rtds !== undefined) {
+      if (ports.rtdsSocketFactory === undefined) {
+        throw new GatewayStateError(
+          "the RTDS feed is configured but its socket factory port is missing",
+        );
+      }
+      const feedConfig = config.rtds;
+      const url = feedConfig.url ?? RTDS_WEBSOCKET_URL;
+      const driver = new RtdsFeedDriver({
+        feedId: feedConfig.feedId,
+        endpoint: url,
+        journal: this.#journal,
+        dispatcher: this.#dispatcher,
+        clock: ports.clock,
+        plannedSymbols: this.#plan.rtdsPlannedSymbols,
+        maxObservationAgeMs: feedConfig.maxObservationAgeMs,
+      });
+      const connectionIds = new ConnectionIdFactory(feedConfig.feedId);
+      const feed = new RtdsTwapFeed(
+        {
+          clock: {
+            nowMs: () => ports.clock.nowMs(),
+            monotonicMs: () => Number(ports.clock.monotonicNs() / 1_000_000n),
+          },
+          timers: ports.timers,
+          webSocketFactory: ports.rtdsSocketFactory,
+          connectionId: () => connectionIds.next(),
+        },
+        {
+          onEvent: (event) => {
+            driver.onEvent(event);
+          },
+          onProblem: (problem) => {
+            driver.onProblem(problem);
+          },
+          onRawFrame: (frame) => {
+            driver.onRawFrame(frame);
+          },
+        },
+        {
+          feedId: feedConfig.feedId,
+          url,
+          subscriptions: this.#plan.rtdsSubscriptions,
+          ...(feedConfig.updateStalenessMs === undefined
+            ? {}
+            : { updateStalenessMs: feedConfig.updateStalenessMs }),
+          ...(feedConfig.stalenessCheckIntervalMs === undefined
+            ? {}
+            : { stalenessCheckIntervalMs: feedConfig.stalenessCheckIntervalMs }),
+        },
+      );
+      driver.bind(feed);
+      this.#rtdsFeed = feed;
+      this.#rtdsDriver = driver;
+    }
+
+    if (config.binance !== undefined) {
+      if (ports.binanceSocketFactory === undefined) {
+        throw new GatewayStateError(
+          "the Binance feed is configured but its socket factory port is missing",
+        );
+      }
+      const feedConfig = config.binance;
+      const reconnectPolicy =
+        feedConfig.reconnect === undefined
+          ? DEFAULT_RECONNECT_POLICY
+          : {
+              initialDelayMs: feedConfig.reconnect.initialDelayMs,
+              maxDelayMs: feedConfig.reconnect.maxDelayMs,
+              multiplier: feedConfig.reconnect.multiplier,
+              ...(feedConfig.reconnect.maxAttempts === undefined
+                ? {}
+                : { maxAttempts: feedConfig.reconnect.maxAttempts }),
+            };
+      const feed = new BinanceReferenceFeed({
+        feedId: feedConfig.feedId,
+        subscriptions: this.#plan.binanceSubscriptions,
+        stalenessThresholdMs: feedConfig.stalenessThresholdMs,
+        ...(feedConfig.endpoint === undefined ? {} : { endpoint: feedConfig.endpoint }),
+        reconnect: reconnectPolicy,
+      });
+      this.#binanceDriver = new BinanceFeedDriver({
+        feedId: feedConfig.feedId,
+        feed,
+        socketFactory: ports.binanceSocketFactory,
+        journal: this.#journal,
+        dispatcher: this.#dispatcher,
+        clock: ports.clock,
+        timers: ports.timers,
+        reconnectPolicy,
+        unauthorizedEventEscalationThreshold: feedConfig.unauthorizedEventEscalationThreshold,
+      });
+    }
+
+    if (config.coinbase !== undefined) {
+      if (ports.coinbaseSocketFactory === undefined) {
+        throw new GatewayStateError(
+          "the Coinbase feed is configured but its socket factory port is missing",
+        );
+      }
+      const feedConfig = config.coinbase;
+      const driver = new CoinbaseFeedDriver({
+        feedId: feedConfig.feedId,
+        journal: this.#journal,
+        dispatcher: this.#dispatcher,
+        clock: this.#ports.clock,
+        snapshotFailureEscalationThreshold: feedConfig.snapshotFailureEscalationThreshold,
+        reconnectLoopEscalationThreshold: feedConfig.reconnectLoopEscalationThreshold,
+      });
+      const manager = new CoinbaseConnectionManager({
+        feedId: feedConfig.feedId,
+        productIds: this.#plan.coinbaseProductIds,
+        socketFactory: driver.wrapSocketFactory(ports.coinbaseSocketFactory),
+        timer: {
+          schedule: (delayMs, run) => {
+            const cancel = this.#ports.timers.setTimeout(run, delayMs);
+            return { cancel };
+          },
+        },
+        wallClock: {
+          nowIso: () => new Date(this.#ports.clock.nowMs()).toISOString(),
+        },
+        monotonicClock: {
+          nowNs: () => this.#ports.clock.monotonicNs(),
+        },
+        ...(feedConfig.stalenessThresholdMs === undefined
+          ? {}
+          : { stalenessThresholdMs: feedConfig.stalenessThresholdMs }),
+        ...(feedConfig.stalenessPollIntervalMs === undefined
+          ? {}
+          : { stalenessPollIntervalMs: feedConfig.stalenessPollIntervalMs }),
+        ...(feedConfig.endpoint === undefined ? {} : { endpoint: feedConfig.endpoint }),
+        onOutput: (output) => {
+          driver.onOutput(output);
+        },
+      });
+      driver.bind(manager);
+      this.#coinbaseManager = manager;
+      this.#coinbaseDriver = driver;
+    }
+  }
+
+  get gatewayEpoch(): string {
+    return this.#sequencer.gatewayEpoch;
+  }
+
+  /** Starts every configured feed and the gateway tick. */
+  start(): void {
+    if (this.#state !== "created") {
+      throw new GatewayStateError(`the gateway cannot start from state ${this.#state}`);
+    }
+    this.#state = "running";
+    if (this.#polymarketFeed !== undefined) {
+      this.#polymarketFeed.subscribe(this.#plan.polymarketTokenIds);
+      this.#polymarketFeed.start();
+    }
+    this.#rtdsFeed?.start();
+    this.#binanceDriver?.start();
+    this.#coinbaseManager?.start();
+    this.#scheduleTick();
+  }
+
+  /**
+   * One gateway tick: WAL fsync/rotation cadence (the published data-loss
+   * bound is only real if someone drives it — WP-050 known risk 7), Binance
+   * staleness, and Coinbase reconnect-loop surveillance.
+   */
+  async tick(): Promise<void> {
+    await this.#journal.tick();
+    this.#binanceDriver?.tick();
+    this.#coinbaseDriver?.tick();
+  }
+
+  #scheduleTick(): void {
+    this.#cancelTick = this.#ports.timers.setInterval(() => {
+      void this.tick();
+    }, this.#config.tickIntervalMs);
+  }
+
+  /** Waits for in-flight publications and WAL drains to settle (tests, shutdown). */
+  async settle(): Promise<void> {
+    await this.#publisher.settle();
+    await this.#journal.settle();
+  }
+
+  async stop(): Promise<void> {
+    if (this.#state === "stopped") return;
+    this.#state = "stopped";
+    this.#cancelTick?.();
+    this.#cancelTick = undefined;
+    this.#polymarketDriver?.stop();
+    this.#polymarketFeed?.stop();
+    this.#rtdsFeed?.stop();
+    this.#binanceDriver?.stop();
+    this.#coinbaseManager?.stop();
+    await this.settle();
+    await this.#journal.close();
+    await this.#ports.transport.close();
+  }
+
+  metrics(): GatewayMetrics {
+    return {
+      gatewayEpoch: this.#sequencer.gatewayEpoch,
+      wal: this.#journal.metrics(),
+      publisher: this.#publisher.metrics(),
+      dispatcher: this.#dispatcher.metrics(),
+      incidents: this.#dispatcher.incidents.metrics(),
+      directory: this.#directory?.metrics(),
+      polymarket: this.#polymarketDriver?.metrics(),
+      rtds: this.#rtdsDriver?.metrics(),
+      binance: this.#binanceDriver?.metrics(),
+      coinbase: this.#coinbaseDriver?.metrics(),
+    };
+  }
+}

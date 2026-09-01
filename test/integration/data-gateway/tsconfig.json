@@ -1,0 +1,36 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": "../../..",
+    "paths": {
+      "@polymarket-bot/data-gateway": ["apps/data-gateway/src/index.ts"],
+      "@polymarket-bot/data-gateway/testing": ["apps/data-gateway/src/testing/index.ts"],
+      "@polymarket-bot/domain": ["packages/domain/src/index.ts"],
+      "@polymarket-bot/decimal": ["packages/decimal/src/index.ts"],
+      "@polymarket-bot/event-bus": ["packages/event-bus/src/index.ts"],
+      "@polymarket-bot/event-bus/testing": ["packages/event-bus/src/testing/index.ts"],
+      "@polymarket-bot/storage-wal": ["packages/storage-wal/src/index.ts"],
+      "@polymarket-bot/storage-wal/testing": ["packages/storage-wal/src/testing/index.ts"],
+      "@polymarket-bot/polymarket-public": ["packages/polymarket-public/src/index.ts"],
+      "@polymarket-bot/polymarket-public/rtds": [
+        "packages/polymarket-public/src/rtds/index.ts"
+      ],
+      "@polymarket-bot/polymarket-public/testing": [
+        "packages/polymarket-public/src/testing/index.ts"
+      ],
+      "@polymarket-bot/binance-adapter": ["packages/binance-adapter/src/index.ts"],
+      "@polymarket-bot/binance-adapter/testing": [
+        "packages/binance-adapter/src/testing/index.ts"
+      ],
+      "@polymarket-bot/coinbase-adapter": ["packages/coinbase-adapter/src/index.ts"],
+      "@polymarket-bot/coinbase-adapter/testing": [
+        "packages/coinbase-adapter/src/testing/index.ts"
+      ],
+      "@polymarket-bot/universe": ["packages/universe/src/index.ts"],
+      "@polymarket-bot/universe/testing": ["packages/universe/src/testing/index.ts"]
+    }
+  },
+  "include": ["."]
+}
