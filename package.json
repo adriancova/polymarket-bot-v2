@@ -15,7 +15,7 @@
     "check:deps": "node tools/check-dependency-direction.mjs",
     "test": "vitest run --config test/vitest.config.ts",
     "test:fault": "pnpm --filter @polymarket-bot/storage-wal test:fault",
-    "test:integration": "pnpm --filter @polymarket-bot/storage-postgres test:integration && pnpm --filter @polymarket-bot/event-bus test:integration",
+    "test:integration": "pnpm --filter @polymarket-bot/storage-postgres test:integration && pnpm --filter @polymarket-bot/event-bus test:integration && pnpm --filter @polymarket-bot/research-worker test:integration",
     "test:contract": "pnpm --filter @polymarket-bot/polymarket-public test:contract && pnpm --filter @polymarket-bot/polymarket-public test:contract:rtds && pnpm --filter @polymarket-bot/binance-adapter test:contract && pnpm --filter @polymarket-bot/coinbase-adapter test:contract",
     "test:compose": "docker compose config --quiet && docker compose up -d --wait && docker compose exec -T postgres pg_isready -U devlocal -d polymarket_bot_dev && docker compose exec -T redis redis-cli ping && docker compose down",
     "audit": "pnpm audit --audit-level high",
@@ -25,7 +25,7 @@
     "dev:gateway": "node -e \"console.error('NOT IMPLEMENTED: the data gateway arrives with its owning work package.'); process.exit(1)\"",
     "dev:paper": "node -e \"console.error('NOT IMPLEMENTED: the paper trader arrives with its owning work package.'); process.exit(1)\"",
     "ops:verify-venue": "pnpm --filter @polymarket-bot/ops-cli run verify-venue",
-    "ops:validate-dataset": "node -e \"console.error('NOT IMPLEMENTED: dataset validation arrives with its owning work package.'); process.exit(1)\""
+    "ops:validate-dataset": "cd python && uv run python -m research.compaction"
   },
   "devDependencies": {
     "@eslint/js": "^9.33.0",
