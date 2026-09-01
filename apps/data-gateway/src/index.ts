@@ -71,6 +71,8 @@ export type {
   CancelScheduled,
   GatewayClock,
   GatewayIdSource,
+  GatewayLifetime,
   GatewayReceipt,
   GatewayTimers,
+  ReleaseLifetime,
 } from "./ports.js";

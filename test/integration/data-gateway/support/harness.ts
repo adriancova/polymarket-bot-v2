@@ -57,6 +57,14 @@ export interface Harness {
   readonly config: GatewayConfig;
   readonly clock: ManualGatewayClock;
   readonly timers: ManualGatewayTimers;
+  /**
+   * Lifetime-anchor accounting (round-2 review R2-H5): the counting fake
+   * behind the gateway's `lifetime` port. In production the handle is a
+   * REFERENCED interval that holds the process alive; here it is only
+   * counted, so no test can hang on it. `start()` must acquire exactly once
+   * and `stop()` must release exactly once.
+   */
+  readonly lifetime: { acquired: number; released: number };
   readonly transport: MemoryEventTransport;
   readonly walFileSystem: MemoryFileSystem;
   readonly polymarketSockets: ScriptedPublicSocketFactory;
@@ -121,6 +129,7 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
   const incidents: RecordedIncident[] = [];
   const halts: string[] = [];
   const recordingFailures: string[] = [];
+  const lifetime = { acquired: 0, released: 0 };
 
   const config = parseGatewayConfig({
     streamName: STREAM,
@@ -144,6 +153,14 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
     clock,
     ids: deterministicIdSource(options.idSeed ?? 0),
     timers,
+    lifetime: {
+      acquire: () => {
+        lifetime.acquired += 1;
+        return () => {
+          lifetime.released += 1;
+        };
+      },
+    },
     walFileSystem,
     transport: gatewayTransport,
     polymarketSocketFactory: polymarketSockets.factory,
@@ -182,6 +199,7 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
     config,
     clock,
     timers,
+    lifetime,
     transport,
     walFileSystem,
     polymarketSockets,

@@ -60,7 +60,9 @@ import type {
   CancelScheduled,
   GatewayClock,
   GatewayIdSource,
+  GatewayLifetime,
   GatewayTimers,
+  ReleaseLifetime,
 } from "./ports.js";
 import type {
   GatewayPublisherMetrics,
@@ -102,6 +104,16 @@ export interface GatewayPorts {
   readonly clock: GatewayClock;
   readonly ids: GatewayIdSource;
   readonly timers: GatewayTimers;
+  /**
+   * Process-lifetime anchor (round-2 review R2-H5). Every timer above is
+   * unref'd, so without this a running gateway whose feeds are all in
+   * reconnect wait (and whose transport holds no socket) keeps NOTHING
+   * referenced and the host process exits mid-recording. The gateway owns the
+   * handle — acquired in `start()`, released exactly once in `stop()` — so
+   * every composition that supplies the port gets liveness, not just
+   * `main.ts`. Optional: test compositions inject a counting fake or nothing.
+   */
+  readonly lifetime?: GatewayLifetime;
   readonly walFileSystem: WalFileSystem;
   readonly transport: MarketEventTransport;
   readonly polymarketSocketFactory?: PublicWebSocketFactory;
@@ -147,6 +159,13 @@ export class DataGateway {
 
   #state: GatewayState = "created";
   #cancelTick: CancelScheduled | undefined;
+  /**
+   * The owned, REFERENCED lifetime handle (R2-H5): held for exactly the
+   * `running` state, released exactly once — in `stop()`'s `finally`, or on a
+   * `start()` that throws mid-way (so a fatal startup path exits instead of
+   * hanging on an orphaned handle).
+   */
+  #releaseLifetime: ReleaseLifetime | undefined;
 
   private constructor(args: {
     config: GatewayConfig;
@@ -518,20 +537,40 @@ export class DataGateway {
     this.#publisher.haltPublication(cause, detail);
   }
 
-  /** Starts every configured feed and the gateway tick. */
+  /**
+   * Starts every configured feed and the gateway tick.
+   *
+   * The lifetime handle is acquired FIRST (R2-H5): every timer in this app is
+   * unref'd, so a running gateway must be alive by ownership — from before the
+   * first feed starts until `stop()` releases the handle — never by whichever
+   * socket or reconnect timer happens to be in flight. Without this, a
+   * recording-only process (transport halted at startup) whose feeds were all
+   * waiting to reconnect exited 0 on its own, mid-recording.
+   */
   start(): void {
     if (this.#state !== "created") {
       throw new GatewayStateError(`the gateway cannot start from state ${this.#state}`);
     }
     this.#state = "running";
-    if (this.#polymarketFeed !== undefined) {
-      this.#polymarketFeed.subscribe(this.#plan.polymarketTokenIds);
-      this.#polymarketFeed.start();
+    this.#releaseLifetime = this.#ports.lifetime?.acquire();
+    try {
+      if (this.#polymarketFeed !== undefined) {
+        this.#polymarketFeed.subscribe(this.#plan.polymarketTokenIds);
+        this.#polymarketFeed.start();
+      }
+      this.#rtdsFeed?.start();
+      this.#binanceDriver?.start();
+      this.#coinbaseManager?.start();
+      this.#scheduleTick();
+    } catch (error) {
+      // A start that throws must not leave a referenced handle behind: the
+      // composition root's fatal path sets an exit code and returns, and an
+      // orphaned handle would turn that into a silent hang.
+      const release = this.#releaseLifetime;
+      this.#releaseLifetime = undefined;
+      release?.();
+      throw error;
     }
-    this.#rtdsFeed?.start();
-    this.#binanceDriver?.start();
-    this.#coinbaseManager?.start();
-    this.#scheduleTick();
   }
 
   /**
@@ -560,16 +599,28 @@ export class DataGateway {
   async stop(): Promise<void> {
     if (this.#state === "stopped") return;
     this.#state = "stopped";
-    this.#cancelTick?.();
-    this.#cancelTick = undefined;
-    this.#polymarketDriver?.stop();
-    this.#polymarketFeed?.stop();
-    this.#rtdsFeed?.stop();
-    this.#binanceDriver?.stop();
-    this.#coinbaseManager?.stop();
-    await this.settle();
-    await this.#journal.close();
-    await this.#ports.transport.close();
+    try {
+      this.#cancelTick?.();
+      this.#cancelTick = undefined;
+      this.#polymarketDriver?.stop();
+      this.#polymarketFeed?.stop();
+      this.#rtdsFeed?.stop();
+      this.#binanceDriver?.stop();
+      this.#coinbaseManager?.stop();
+      await this.settle();
+      await this.#journal.close();
+      await this.#ports.transport.close();
+    } finally {
+      // Released LAST, so the process stays referenced through the whole
+      // shutdown sequence, and in a `finally`, so a failing close still lets
+      // the process exit (with the composition root's error exit code) rather
+      // than hang on the anchor. Exactly once: the state guard above makes a
+      // second `stop()` return before reaching here, and the handle is cleared
+      // before it is called.
+      const release = this.#releaseLifetime;
+      this.#releaseLifetime = undefined;
+      release?.();
+    }
   }
 
   metrics(): GatewayMetrics {

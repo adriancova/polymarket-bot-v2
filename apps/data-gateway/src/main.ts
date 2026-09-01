@@ -27,8 +27,18 @@
  * public feed start anyway. A recorder restarted while Redis is down records
  * every frame; round 1 exited and recorded nothing.
  *
- * The process therefore exits ONLY on a defect it cannot record through: a
- * missing or invalid configuration, or a failure to open the WAL itself.
+ * ## The process stays alive by OWNERSHIP, not by accident (review R2-H5)
+ *
+ * Every timer in this app is unref'd (`systemGatewayTimers`), so a running
+ * gateway whose transport is down and whose feeds are all waiting to reconnect
+ * would otherwise hold nothing referenced — and at `e9cee46` the recording-only
+ * process really did print its banner and then EXIT 0 on its own, unable to
+ * ever reconnect and record. `DataGateway.start()` therefore acquires a
+ * REFERENCED lifetime handle through the `lifetime` port
+ * (`systemGatewayLifetime()` here) and `stop()` releases it exactly once, so
+ * the intended contract now holds: the process runs until a shutdown signal,
+ * or until a startup defect it cannot record through (missing or invalid
+ * configuration, or a WAL that will not open) makes it exit loudly.
  *
  * Safety: this process reads no signer, wallet, or API key, submits no order,
  * and cannot be configured to. The repository defaults `MAX_RUN_MODE=PAPER`,
@@ -51,6 +61,7 @@ import { DataGateway } from "./gateway.js";
 import {
   systemGatewayClock,
   systemGatewayIdSource,
+  systemGatewayLifetime,
   systemGatewayTimers,
 } from "./system.js";
 import { UnavailableEventTransport } from "./unavailable-transport.js";
@@ -91,6 +102,11 @@ async function main(): Promise<void> {
     clock: systemGatewayClock(),
     ids: systemGatewayIdSource(),
     timers: systemGatewayTimers(),
+    // R2-H5: the referenced counterweight to the unref'd timers above. The
+    // gateway acquires it in start() and releases it in stop(), so this
+    // process lives until a shutdown signal even when every feed is in
+    // reconnect wait and the transport holds no socket.
+    lifetime: systemGatewayLifetime(),
     walFileSystem: nodeWalFileSystem(),
     transport,
     polymarketSocketFactory: globalWebSocketFactory(),

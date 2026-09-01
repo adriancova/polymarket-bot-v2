@@ -14,7 +14,14 @@
 
 import { randomInt, randomUUID } from "node:crypto";
 
-import type { CancelScheduled, GatewayClock, GatewayIdSource, GatewayTimers } from "./ports.js";
+import type {
+  CancelScheduled,
+  GatewayClock,
+  GatewayIdSource,
+  GatewayLifetime,
+  GatewayTimers,
+  ReleaseLifetime,
+} from "./ports.js";
 
 /** Wall clock from `Date.now()`, monotonic nanoseconds from `process.hrtime.bigint()`. */
 export function systemGatewayClock(): GatewayClock {
@@ -57,6 +64,8 @@ export function systemGatewayIdSource(): GatewayIdSource {
  *
  * Handles are unref'd so scheduled work never holds the process open past a
  * requested shutdown — the same choice `polymarket-public`'s runtime makes.
+ * The counterweight is `systemGatewayLifetime()` below: process liveness is
+ * OWNED by the gateway's start/stop, never borrowed from a scheduled timer.
  */
 export function systemGatewayTimers(): GatewayTimers {
   return {
@@ -70,6 +79,45 @@ export function systemGatewayTimers(): GatewayTimers {
     setInterval: (handler, intervalMs): CancelScheduled => {
       const handle = setInterval(handler, intervalMs);
       handle.unref?.();
+      return () => {
+        clearInterval(handle);
+      };
+    },
+  };
+}
+
+/**
+ * Node's timer-delay ceiling (2^31 − 1 ms ≈ 24.8 days). The lifetime anchor's
+ * interval only bounds how often its no-op callback runs; the handle's
+ * EXISTENCE is what holds the event loop, so the period is set to the maximum
+ * the runtime accepts without clamping.
+ */
+const LIFETIME_ANCHOR_INTERVAL_MS = 2_147_483_647;
+
+/**
+ * The one deliberately REFERENCED handle in this app (round-2 review R2-H5).
+ *
+ * Everything `systemGatewayTimers()` schedules is unref'd, and at `e9cee46`
+ * that meant a recording-only startup (transport down, publication halted, WAL
+ * open) whose configured feed was waiting to reconnect held no referenced
+ * handle at all: the real process printed "PUBLICATION HALTED, RECORDING
+ * ONLY" and then exited 0 on its own, never reconnecting and never recording.
+ * The same hole exists with a live transport whenever every feed is in
+ * reconnect wait — a Redis socket holding the loop open is incidental, not
+ * owned.
+ *
+ * `acquire()` takes a referenced no-op interval and returns its release;
+ * `DataGateway.start()`/`stop()` own the exactly-once pairing. Release clears
+ * the interval, so a requested shutdown still ends the process promptly — the
+ * unref policy for ordinary timers is unchanged.
+ */
+export function systemGatewayLifetime(): GatewayLifetime {
+  return {
+    acquire: (): ReleaseLifetime => {
+      // Deliberately NOT unref'd: this handle is the process's reason to live.
+      const handle = setInterval(() => {
+        // The handle's existence, not this callback, is the point.
+      }, LIFETIME_ANCHOR_INTERVAL_MS);
       return () => {
         clearInterval(handle);
       };

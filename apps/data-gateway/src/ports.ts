@@ -48,6 +48,30 @@ export interface GatewayTimers {
   setInterval(handler: () => void, intervalMs: number): CancelScheduled;
 }
 
+/** Releases one held lifetime handle. Calling it exactly once is the OWNER's job. */
+export type ReleaseLifetime = () => void;
+
+/**
+ * Process-lifetime anchor (round-2 review R2-H5).
+ *
+ * Every `GatewayTimers` handle is unref'd so scheduled work never holds the
+ * process open past a requested shutdown — but that policy needs a
+ * counterweight: a RUNNING gateway whose transport is down and whose feeds are
+ * all in reconnect wait holds NOTHING referenced, and a real Node process in
+ * that state exits 0 on its own, mid-recording. `DataGateway.start()` acquires
+ * one handle through this port and `stop()` releases it exactly once, so a
+ * running gateway is alive BY OWNERSHIP, not by whichever socket or timer
+ * happens to be in flight.
+ *
+ * The port is optional: the real composition root (`main.ts`) MUST supply
+ * `systemGatewayLifetime()`; test compositions supply a counting fake or
+ * nothing at all, which is why the manual-clock harness can never hang on it.
+ */
+export interface GatewayLifetime {
+  /** Takes one handle; while any handle is held, the host process must stay alive. */
+  acquire(): ReleaseLifetime;
+}
+
 /** A receipt stamp: both §7.1 receipt fields, taken in one clock read. */
 export interface GatewayReceipt {
   /** Wall-clock ISO-8601 instant. */
