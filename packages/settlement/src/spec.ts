@@ -1019,8 +1019,54 @@ function whitespaceJoinedMarkerReason(form: string): string | undefined {
 }
 
 /**
+ * Whether `token` can be partitioned COMPLETELY into a sequence of the four
+ * {@link PLACEHOLDER_STOPWORD_TOKENS} (round-7 review, R7-M1).
+ *
+ * Round 6's stopword-only rule tested tokens one at a time, and
+ * {@link joinedSingleLetterRuns} concatenates an ENTIRE run of single-letter
+ * tokens — so the boundary between two ADJACENT whitespace-split stopwords
+ * vanished: `"t h e t o"` joined to the single opaque blob `"theto"`, which
+ * matched no stopword, no marker, and no entry, and the field activated as
+ * `REVIEWED_MODEL_BACKED`. This helper restores the lost boundaries: a blob
+ * that is exactly a sequence of glued stopwords is treated as that sequence
+ * of stopword tokens rather than as one opaque token.
+ *
+ * THE SEARCH IS EXHAUSTIVE (dynamic programming over every split position),
+ * not greedy — so ambiguity is a non-question: `"anthe"` is found as
+ * `an+the` even though `a+n…` dead-ends, `"toto"` as `to+to`, `"athe"` as
+ * `a+the`. Bounded: O(length × 4) with four fixed stopwords of length ≤ 3.
+ *
+ * When NO complete partition exists (`"theto"` partitions; `"thex"` does
+ * not), the token stays an opaque blob and this helper reports `false` — the
+ * field stays ALIVE unless another rule fires, exactly as if the blob had
+ * been typed directly (`"thex"`, or an enumeration like `"a b c"` joining to
+ * `"abc"`). That is the deliberate conservative outcome: partitioning is
+ * used only to MATCH the stopword class — it can cause a refusal, never an
+ * acceptance, and never widens beyond sequences of exactly the four
+ * configured stopwords.
+ */
+function partitionsIntoStopwords(token: string): boolean {
+  if (token === "") {
+    return false;
+  }
+  const reachable = new Array<boolean>(token.length + 1).fill(false);
+  reachable[0] = true;
+  for (let index = 0; index < token.length; index += 1) {
+    if (reachable[index] !== true) {
+      continue;
+    }
+    for (const stopword of PLACEHOLDER_STOPWORD_TOKENS) {
+      if (token.startsWith(stopword, index)) {
+        reachable[index + stopword.length] = true;
+      }
+    }
+  }
+  return reachable[token.length] === true;
+}
+
+/**
  * The refusal for a whole-field form made ONLY of stopword tokens, or
- * `undefined` (round-6 review, R6-M1).
+ * `undefined` (round-6 review, R6-M1; extended in round 7, R7-M1).
  *
  * Round 5 introduced {@link PLACEHOLDER_STOPWORD_TOKENS} so conventional
  * entries could be matched net of articles, and {@link canonicalMultisetKey}
@@ -1032,23 +1078,34 @@ function whitespaceJoinedMarkerReason(form: string): string | undefined {
  * {@link asciiPlaceholderReason}: nothing that states a rule survives
  * normalization, the tokens that do survive are pure articles/particles.
  *
+ * ROUND 7 (R7-M1): a token counts as stopword material when it IS a stopword
+ * or when it partitions completely into stopwords
+ * ({@link partitionsIntoStopwords} — a stopword is its own one-part
+ * partition, so one predicate covers both). This closes the
+ * adjacent-whitespace-split encoding: `"t h e t o"` joins to `"theto"`,
+ * which is `the+to`, and the glued spelling `"theto"` typed directly is the
+ * same class. A token with NO complete partition (`"thex"`, `"policy"`)
+ * keeps the field alive unless another rule fires.
+ *
  * Checked per candidate FORM inside {@link asciiPlaceholderReason}, before
  * every other per-form rule, so each encoding layer covers its own class:
  * the plain normalized form catches `"the the to"` / `"The To"` /
- * `"the, the."` and a zero-width space BETWEEN stopwords; the joined-span
+ * `"the, the."` and a zero-width space BETWEEN stopwords; the
+ * joined-single-letter-run form catches whitespace-split runs
+ * (`"t h e t o"` → `"theto"`, `"a n t h e"` → `"anthe"`); the joined-span
  * form catches dotted spellings (`"T.O. T.H.E."` → `"to the"`); the digit
  * folds catch substitutions (`"th3 t0"` → `"the to"`); and the
  * non-ASCII-stripping candidate of {@link placeholderRuleTextReason}
  * catches a zero-width split INSIDE a stopword (a U+200B between `t` and
  * `he`, reassembling to `"the to"`). Whole-field only by construction: a
- * single non-stopword
- * token anywhere in the form defeats the check, so a real sentence — which
- * names a subject and an action — is untouched.
+ * single non-stopword-material token anywhere in the form defeats the check,
+ * so a real sentence — which names a subject and an action — is untouched
+ * (`"t h e policy"` joins to `"the policy"` and stays alive).
  */
 function stopwordOnlyFormReason(form: string): string | undefined {
   const tokens = form.split(" ");
-  if (tokens.every((token) => PLACEHOLDER_STOPWORD_SET.has(token))) {
-    return "consists only of the stopword tokens the/a/an/to (pure articles and particles state no rule, exactly as a punctuation-only field states none)";
+  if (tokens.every(partitionsIntoStopwords)) {
+    return "consists only of the stopword tokens the/a/an/to, whole or glued into runs (pure articles and particles state no rule, exactly as a punctuation-only field states none)";
   }
   return undefined;
 }

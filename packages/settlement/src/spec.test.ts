@@ -17,6 +17,7 @@ import {
   LEGITIMATE_POLICY_SAMPLES,
   PLACEHOLDER_POLICY_ATTACK_SAMPLES,
   referenceOpenUpDownSpecSample,
+  stopwordPairEncodingMatrix,
   terminalSpotSpecSample,
   thresholdByDateSpecSample,
   twapSpecSample,
@@ -546,10 +547,10 @@ describe("SettlementSpecSchema", () => {
       // stopwords normalizes to a space, so the plain candidate catches it;
       // INSIDE a stopword it splits the token ("t he to") and only the
       // non-ASCII-stripping candidate reassembles "the to".
-      const between = placeholderRuleTextReason("the​ the to");
+      const between = placeholderRuleTextReason("the\u200B the to");
       expect(between).toContain("only of the stopword tokens");
       expect(between).not.toContain("stripping non-ASCII");
-      const inside = placeholderRuleTextReason("t​he to");
+      const inside = placeholderRuleTextReason("t\u200Bhe to");
       expect(inside).toContain("only of the stopword tokens");
       expect(inside).toContain("stripping non-ASCII");
     });
@@ -580,6 +581,100 @@ describe("SettlementSpecSchema", () => {
       // (documented on PLACEHOLDER_STOPWORD_TOKENS). Pinned so the residual
       // can move in neither direction silently.
       expect(placeholderRuleTextReason("of the")).toBeUndefined();
+    });
+  });
+
+  // Round-7 review, R7-M1: joinedSingleLetterRuns concatenates an ENTIRE run
+  // of single-letter tokens, so the boundary between ADJACENT whitespace-split
+  // stopwords vanished — "t h e t o" joined to the opaque blob "theto", which
+  // matched no stopword, no marker, and no entry, and the field activated as
+  // REVIEWED_MODEL_BACKED at the candidate. Pin the bounded stopword
+  // partition, the generated pair matrix, and the boundary in both directions.
+  describe("placeholderRuleTextReason round-7 rule (R7-M1)", () => {
+    it("refuses adjacent whitespace-split stopwords (reviewer probes)", () => {
+      for (const probe of ["t h e t o", "t o t h e", "t h e t h e", "a n t h e", "T H E\tT O"]) {
+        expect(placeholderRuleTextReason(probe), probe).toContain("only of the stopword tokens");
+      }
+    });
+
+    it("refuses tab- and multi-space-separated split stopword runs", () => {
+      expect(placeholderRuleTextReason("T H E\tT O")).toContain("only of the stopword tokens");
+      expect(placeholderRuleTextReason("t  h  e   t  o")).toContain("only of the stopword tokens");
+    });
+
+    it("refuses the glued blob and long runs through the same exhaustive partition", () => {
+      // "theto" typed directly is the same lost-boundary blob the split run
+      // joins to. The partition is exhaustive DP, not greedy: "anthe" is
+      // found as an+the even though a+n… dead-ends, and all four stopwords
+      // split into one run still partition.
+      expect(placeholderRuleTextReason("theto")).toContain("only of the stopword tokens");
+      expect(placeholderRuleTextReason("a n t h e")).toContain("only of the stopword tokens");
+      expect(placeholderRuleTextReason("t h e a a n t o")).toContain("only of the stopword tokens");
+    });
+
+    it("refuses mixed encodings glued to a whitespace-split run", () => {
+      // Whitespace-split "the" + dotted "to": the dot normalizes to a space,
+      // the run joins to "theto", and the partition finds the+to.
+      expect(placeholderRuleTextReason("t h e t.o")).toContain("only of the stopword tokens");
+      // Whitespace-split "the" + U+200B-split "to": the plain candidate
+      // normalizes the zero-width space to a token boundary ("t h e t o" ->
+      // "theto"); this value already refused at the round-7 candidate via the
+      // stripping layer and is pinned so the class cannot silently reopen.
+      expect(placeholderRuleTextReason("t h e t\u200Bo")).toContain("only of the stopword tokens");
+    });
+
+    it("refuses every value of the generated 4x4x4x4 stopword pair matrix (zero bypasses)", () => {
+      // Reproduces the round-7 reviewer's 256-combination approach: every
+      // adjacent pair of the four stopwords, each in each of the four
+      // encodings (plain, dotted, whitespace-split, U+200B-split). 37 of
+      // these were live bypasses at the candidate — all with a
+      // whitespace-split neighbor.
+      const matrix = stopwordPairEncodingMatrix();
+      expect(matrix).toHaveLength(256);
+      const bypasses = matrix.filter((value) => placeholderRuleTextReason(value) === undefined);
+      expect(bypasses).toEqual([]);
+    });
+
+    it("refuses every stopword pair matrix value at the construction gate", () => {
+      const bypasses = stopwordPairEncodingMatrix().filter(
+        (value) =>
+          SettlementSpecSchema.safeParse({ ...terminalSpotSpecSample(), disputePolicy: value })
+            .success,
+      );
+      expect(bypasses).toEqual([]);
+    });
+
+    it("keeps a real token alive next to a split stopword run (false-positive boundary)", () => {
+      // A real non-stopword token defeats the whole-field rule: "t h e
+      // policy" joins to "the policy" and stays alive, and single-letter
+      // enumerations join to opaque blobs with no complete stopword
+      // partition.
+      expect(placeholderRuleTextReason("t h e policy")).toBeUndefined();
+      expect(
+        placeholderRuleTextReason("Escalate per clause a b c of the venue rules."),
+      ).toBeUndefined();
+    });
+
+    it("pins the no-complete-partition outcome: an unpartitionable blob stays opaque", () => {
+      // Deliberate conservative outcome (documented on
+      // partitionsIntoStopwords): when NO complete stopword partition exists
+      // and no other rule fires, the joined blob behaves exactly as if typed
+      // directly — alive, defended by the human verified_by gate. Widening to
+      // refuse arbitrary single-letter runs would refuse real enumerations
+      // like "a b c".
+      expect(placeholderRuleTextReason("t h e x")).toBeUndefined();
+      expect(placeholderRuleTextReason("thex")).toBeUndefined();
+      // The round-6 disclosed residual "of the" stays open in split form too:
+      // "ofthe" has no complete partition ("of" is not a stopword). No silent
+      // widening in either direction.
+      expect(placeholderRuleTextReason("o f t h e")).toBeUndefined();
+    });
+
+    it("leaves markers unaffected: split markers still refuse via their own rules", () => {
+      const wholeField = placeholderRuleTextReason("F I X M E");
+      expect(wholeField).toContain("fixme");
+      expect(wholeField).not.toContain("stopword");
+      expect(placeholderRuleTextReason("Policy F I X M E later.")).toContain("fixme");
     });
   });
 

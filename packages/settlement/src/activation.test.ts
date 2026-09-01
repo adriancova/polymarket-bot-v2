@@ -11,6 +11,7 @@ import { RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24 } from "./spec.js";
 import {
   LEGITIMATE_POLICY_SAMPLES,
   PLACEHOLDER_POLICY_ATTACK_SAMPLES,
+  stopwordPairEncodingMatrix,
   terminalSpotSpecSample,
   twapSpecSample,
   verifiedSpec,
@@ -114,6 +115,23 @@ describe("classifySettlementActivation", () => {
       expect(verdict.modelDependentActivationAllowed).toBe(true);
     },
   );
+
+  // Round-7 review, R7-M1: the generated 256-value stopword pair matrix (all
+  // pairs of {the, a, an, to} across the four encodings — plain, dotted,
+  // whitespace-split, U+200B-split) pinned at the ACTIVATION gate, matching
+  // the matcher/construction pins in spec.test.ts. 37 of these were live
+  // activation bypasses at the round-7 candidate — all with a
+  // whitespace-split neighbor whose single-letter run joined into an opaque
+  // blob ("t h e t o" -> "theto").
+  it("never permits activation on any generated stopword pair matrix value (round-7, R7-M1)", () => {
+    const bypasses = stopwordPairEncodingMatrix().filter((value) => {
+      const verdict = classifySettlementActivation({
+        spec: { ...verifiedSpec(terminalSpotSpecSample()), disputePolicy: value },
+      });
+      return verdict.status !== "SPEC_INVALID" || verdict.modelDependentActivationAllowed;
+    });
+    expect(bypasses).toEqual([]);
+  });
 
   it("blocks activation when the observation type has no implementing model", () => {
     const verdict = classifySettlementActivation({

@@ -161,11 +161,75 @@ export const PLACEHOLDER_POLICY_ATTACK_SAMPLES: readonly string[] = Object.freez
   "to to to to", // repeated stopword
   "the, the.", // stopwords with punctuation
   "The To", // mixed case
-  "t​he to", // zero-width space INSIDE a stopword (stripped candidate reassembles "the to")
-  "the​ the to", // zero-width space BETWEEN stopwords (plain candidate; U+200B normalizes to a space)
+  // Round 7 (honesty repair): the two U+200B fixtures below are written as
+  // "\u200B" ESCAPES, not literal zero-width bytes, so the fixture is
+  // source-visible and cannot be silently dropped or altered by a formatter,
+  // an editor, or a copy-paste that strips invisible characters. The escape
+  // produces the IDENTICAL runtime string the round-6 literals produced, so
+  // the same candidate layers are exercised (pinned in spec.test.ts).
+  "t\u200Bhe to", // zero-width space INSIDE a stopword (stripped candidate reassembles "the to")
+  "the\u200B the to", // zero-width space BETWEEN stopwords (plain candidate; U+200B normalizes to a space)
   "T.O. T.H.E.", // dotted stopword spans (joined token spans -> "to the")
   "th3 t0", // digit-substituted stopwords (digit folds -> "the to")
+  // --- Round-7 reviewer probes, verbatim (each reproduced as a live bypass
+  // --- at the round-7 candidate 15f8f17 before the fix: matcher returned no
+  // --- reason, construction PASSED, activation REVIEWED_MODEL_BACKED with
+  // --- allowed:true). joinedSingleLetterRuns concatenates an ENTIRE run of
+  // --- single-letter tokens, so ADJACENT whitespace-split stopwords lost
+  // --- their boundary: "t h e t o" joined to the opaque blob "theto", which
+  // --- matched no stopword, marker, or entry. Closed by the bounded
+  // --- stopword partition (spec.ts partitionsIntoStopwords).
+  "t h e t o", // R7-M1: adjacent whitespace-split stopwords (the + to)
+  "t o t h e", // R7-M1: reversed order (to + the)
+  "t h e t h e", // R7-M1: repeated split stopword (the + the)
+  "a n t h e", // R7-M1: an + the ("anthe" needs backtracking: a+n dead-ends)
+  "T H E\tT O", // R7-M1: tab-separated split stopwords (tabs normalize to spaces)
+  // --- Round-7 class-mates (each reproduced as a live bypass at the
+  // --- candidate, or a within-class spelling closed by the same partition).
+  "t  h  e   t  o", // multiple spaces between split letters
+  "t h e t.o", // mixed encodings: whitespace-split "the" + dotted "to"
+  "t h e t\u200Bo", // mixed encodings: whitespace-split "the" + U+200B-split "to"
+  "theto", // glued stopwords typed directly (the same lost-boundary blob)
+  "t h e a a n t o", // very long run: all four stopwords whitespace-split
 ]);
+
+/**
+ * The four spellings of one stopword used by the round-7 pair matrix
+ * (R7-M1): plain, dotted (a printable-ASCII separator inside one span),
+ * whitespace-split (one letter per token), and U+200B-split (a zero-width
+ * space between every letter — written as escapes so the encoding is
+ * source-visible).
+ */
+export const STOPWORD_PAIR_ENCODINGS: readonly ((word: string) => string)[] = Object.freeze([
+  (word: string): string => word,
+  (word: string): string => word.split("").join("."),
+  (word: string): string => word.split("").join(" "),
+  (word: string): string => word.split("").join("\u200B"),
+]);
+
+/**
+ * Every adjacent PAIR of the four stopwords `{the, a, an, to}`, each word in
+ * each of the four {@link STOPWORD_PAIR_ENCODINGS} — 4 words × 4 words ×
+ * 4 encodings × 4 encodings = 256 values, generated rather than hand-listed
+ * (round-7 review, R7-M1: the reviewer's generated matrix found 37 live
+ * bypasses at the candidate, all with whitespace-split neighbors). Every
+ * value must refuse at the matcher, at construction, AND at activation;
+ * `spec.test.ts` and `activation.test.ts` pin the same generated list.
+ */
+export function stopwordPairEncodingMatrix(): readonly string[] {
+  const stopwords = ["the", "a", "an", "to"] as const;
+  const values: string[] = [];
+  for (const first of stopwords) {
+    for (const second of stopwords) {
+      for (const encodeFirst of STOPWORD_PAIR_ENCODINGS) {
+        for (const encodeSecond of STOPWORD_PAIR_ENCODINGS) {
+          values.push(`${encodeFirst(first)} ${encodeSecond(second)}`);
+        }
+      }
+    }
+  }
+  return Object.freeze(values);
+}
 
 /**
  * Legitimate policy texts that must KEEP parsing (round-2 review, M1
