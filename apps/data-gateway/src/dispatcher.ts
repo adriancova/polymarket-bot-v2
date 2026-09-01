@@ -1,17 +1,43 @@
 /**
  * The single funnel from adapter output to the transport.
  *
- * Assignment (eventId, ingestSeq) and submission happen in ONE synchronous
- * step, which is what keeps the transport's strictly-increasing-per-epoch
- * publish rule satisfiable: two async feed callbacks can interleave, but a
- * sequence value is submitted the moment it is assigned, so submission order
- * IS assignment order (see `publisher.ts`).
+ * ## What "one step" does and does not guarantee (round-1 review L1)
  *
- * A rejected envelope is routed, never swallowed (ADR-002 Consequences): the
- * typed failure opens a `DataQualityIncidentOpened` via the incident registry
- * — whose own envelope goes through this same funnel — and is counted. The
- * recursion terminates because an incident draft that itself fails contract
- * validation is counted and reported through the observer only.
+ * Assignment and submission happen in ONE SYNCHRONOUS TURN: no `await`
+ * separates `sequencer.next()` from `publisher.enqueue()`, so no other
+ * dispatch can interleave between them and SUBMISSION ORDER IS ASSIGNMENT
+ * ORDER. That — and only that — is what the transport's
+ * strictly-increasing-per-epoch publish rule needs, and it is what
+ * `publisher.ts` relies on.
+ *
+ * It does NOT guarantee that every assigned sequence reaches the transport.
+ * Envelope validation runs BETWEEN assignment and submission, so a draft that
+ * fails its frozen contract consumes its `ingestSeq` and publishes nothing:
+ * a bad draft followed by two good ones publishes 2 and 3 with 1 absent.
+ * Round 1 described this as "assign and submit in one step", which read as if
+ * that hole could not occur. It can, and it is loud: the rejection is counted
+ * (`envelopeRejections`), reported to the observer, and opens a
+ * `GATEWAY_ENVELOPE_REJECTED` incident.
+ *
+ * A hole is not a breach of the ordering contract. Raw WAL frames draw from
+ * the SAME counter (`sequencer.ts`), so a published stream's `ingestSeq` is
+ * non-contiguous BY DESIGN and a consumer that read contiguity as a
+ * completeness check would already be wrong — completeness lives in the WAL,
+ * and the transport's own resync arithmetic watches its publication ordinals,
+ * not `ingestSeq`.
+ *
+ * Validation is deliberately not moved before assignment: `completeEnvelope`
+ * validates the COMPLETE envelope, identity included, so validating first
+ * would mean validating a different document than the one published — a
+ * weaker check bought with a stronger-sounding sentence.
+ *
+ * ## Rejections are routed, never swallowed
+ *
+ * ADR-002 Consequences: the typed failure opens a `DataQualityIncidentOpened`
+ * via the incident registry — whose own envelope goes through this same funnel
+ * — and is counted. The recursion terminates because an incident draft that
+ * itself fails contract validation is counted and reported through the
+ * observer only.
  */
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
@@ -79,8 +105,10 @@ export class GatewayDispatcher {
   /**
    * Assigns, completes, validates, and submits one event.
    *
-   * Synchronous up to the submission; the returned promise reports the
-   * publish outcome and never rejects.
+   * Synchronous up to the submission; the returned promise reports the publish
+   * outcome and never rejects. A validation failure between the assignment and
+   * the submission consumes the sequence and publishes nothing — see the
+   * module header for exactly what that does and does not break.
    */
   dispatch(draft: EnvelopeDraft, context: DispatchContext = {}): Promise<PublishOutcome> {
     const receipt = context.receipt ?? takeReceipt(this.#clock);

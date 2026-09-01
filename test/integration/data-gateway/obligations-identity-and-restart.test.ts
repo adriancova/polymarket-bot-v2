@@ -7,9 +7,11 @@
  *   gateway publishes may carry a repeated identity, and a replay of an
  *   already-assigned identity is refused with a counter rather than
  *   double-published.
- * - **7.** The durable consumer id and the stream name are stable across
- *   restarts, because the transport keys checkpoints, resync state, and lag by
- *   them. Only the EPOCH changes on restart.
+ * - **7.** The STREAM NAME — the half of the durable consumer key this
+ *   producer-only process owns — is stable across restarts, because the
+ *   transport keys checkpoints, resync state, and lag by `(stream,
+ *   consumerId)`. Only the EPOCH changes on restart. The gateway mints no
+ *   consumer id and never subscribes; that half is the trader's.
  * - **9.** `PRE_SUBSCRIPTION_FRAME` is a transport observation, not a
  *   data-quality incident about the market (WP-070 round-3 follow-up 1).
  * - **11.** WAL epoch handling at restart is consistent with `wal-format.md`
@@ -19,6 +21,8 @@
  */
 
 import { describe, expect, it } from "vitest";
+
+import { GatewayConfigurationError, parseGatewayConfig } from "@polymarket-bot/data-gateway";
 
 import { binanceTradeFrame, buildHarness, polymarketBookFrame, MARKET } from "./support/harness.js";
 import { recordedFrames, walEpochDirectories } from "./support/wal.js";
@@ -74,7 +78,20 @@ describe("obligation 1 — (gatewayEpoch, ingestSeq) is the dedup identity", () 
   });
 });
 
-describe("obligation 7 — durable consumer identity is stable across restarts", () => {
+/**
+ * ROUND-1 REVIEW L2 — what this package can and cannot prove about
+ * obligation 7.
+ *
+ * Obligation 7 is "durable consumer ids are stable across restarts". A
+ * consumer id is minted and checkpointed by a CONSUMER, and this process is
+ * producer-only: it publishes and never subscribes, so it holds no consumer id
+ * and its configuration schema has no field for one. The half of the durable
+ * key it owns is the STREAM NAME, and that is exactly what these tests assert
+ * — under a name that says so, rather than one that claims coverage the test
+ * does not provide. The consumer half belongs to the trader (`WP-180`), and
+ * the handoff's obligation table now says that instead of implying otherwise.
+ */
+describe("obligation 7 (gateway half) — the stream name is stable across restarts", () => {
   it("keeps the stream name fixed while the gateway epoch changes on restart", async () => {
     const config = {
       binance: {
@@ -110,6 +127,49 @@ describe("obligation 7 — durable consumer identity is stable across restarts",
     // And the new epoch restarts ingestSeq at 1, which is not a regression —
     // the epoch is the other half of the ordering identity.
     expect(second.published()[0]?.ingestSeq).toBe("1");
+  });
+
+  it("holds no consumer id at all, because it never subscribes", async () => {
+    const harness = await buildHarness({
+      config: {
+        binance: {
+          feedId: "binance-reference",
+          symbols: ["BTCUSDT"],
+          stalenessThresholdMs: 30_000,
+        },
+      },
+    });
+    harness.gateway.start();
+    harness.binanceSockets.current.open();
+    harness.binanceSockets.current.message(
+      binanceTradeFrame("BTCUSDT", 1, harness.clock.nowMs()),
+    );
+    await harness.settle();
+    expect(harness.published().length).toBeGreaterThan(0);
+
+    // Producer-only, for the whole life of the process: the transport double
+    // counts subscriptions and saw none. So there is no consumer checkpoint,
+    // resync state, or lag here to keep stable, and the obligation-7 claim
+    // this package can make is the stream-name one above — no more.
+    expect(harness.transport.subscribeCalls).toBe(0);
+    // Nor is there anywhere to put a consumer id: the strict schema has no
+    // such field, so a configuration that tried to set one fails loudly.
+    expect(Object.keys(harness.config)).not.toContain("consumerId");
+    expect(() =>
+      parseGatewayConfig({
+        streamName: "market-events",
+        wal: { rootPath: "/wal" },
+        markets: [],
+        consumerId: "trader-1",
+        binance: {
+          feedId: "binance-reference",
+          symbols: ["BTCUSDT"],
+          stalenessThresholdMs: 30_000,
+        },
+      }),
+    ).toThrow(GatewayConfigurationError);
+
+    await harness.gateway.stop();
   });
 });
 

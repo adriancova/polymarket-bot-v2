@@ -185,3 +185,67 @@ describe("acceptance 4 — a transport outage stops publication but not WAL reco
     expect(manifests.length).toBe(segments.length);
   });
 });
+
+/**
+ * ROUND-1 REVIEW FINDING H5 — the outage that starts BEFORE the process does.
+ *
+ * Acceptance 4 says a Redis outage stops publication but not WAL recording.
+ * Round 1 honoured that mid-run and violated it at startup: `main.ts` awaited
+ * `RedisStreamsEventTransport.connect()` before `DataGateway.create()`, before
+ * the WAL was opened, and before any feed started, then exited on failure. A
+ * recorder restarted during an outage therefore recorded NOTHING — and those
+ * minutes of venue data are gone forever, while Redis comes back in seconds.
+ *
+ * `main.ts` now builds the gateway on `UnavailableEventTransport`, calls
+ * `haltPublication`, and starts everything else; the harness models exactly
+ * that sequence with `startupTransportFailure`.
+ */
+describe("acceptance 4 — a transport outage AT STARTUP still records", () => {
+  it("records every frame to the WAL with publication halted from the first instant", async () => {
+    const harness = await buildHarness({
+      config: { ...BINANCE_CONFIG },
+      startupTransportFailure: "ECONNREFUSED 127.0.0.1:6379 (injected)",
+    });
+
+    // Halted before a single feed has started — no submission was attempted.
+    expect(harness.gateway.metrics().publisher.halted).toBe(true);
+    expect(harness.halts).toContain("EVENT_BUS_UNAVAILABLE");
+    const startupIncidents = harness.incidents.filter(
+      (incident) => incident.reasonCode === "GATEWAY_TRANSPORT_UNAVAILABLE",
+    );
+    expect(startupIncidents).toHaveLength(1);
+    expect(startupIncidents[0]?.severity).toBe("PAGE");
+    expect(startupIncidents[0]?.detail).toContain("the WAL keeps recording");
+
+    // And now the whole recorder runs, exactly as it would with a healthy bus.
+    harness.gateway.start();
+    const socket = harness.binanceSockets.current;
+    socket.open();
+    for (let index = 1; index <= 5; index += 1) {
+      harness.clock.advance(100);
+      socket.message(binanceTradeFrame("BTCUSDT", index, harness.clock.nowMs()));
+    }
+    await harness.settle();
+    await harness.gateway.stop();
+
+    const frames = recordedFrames(harness.walFileSystem, harness.gateway.gatewayEpoch);
+    expect(frames).toHaveLength(5);
+    const tradeIds = frames.map(
+      (frame) => (JSON.parse(frame.payloadUtf8) as { data: { t: number } }).data.t,
+    );
+    expect(tradeIds).toEqual([1, 2, 3, 4, 5]);
+    // Nothing was dropped on the recording path, and nothing was published.
+    const metrics = harness.gateway.metrics();
+    expect(metrics.wal.queue.messagesDropped).toBe(0);
+    expect(metrics.binance?.framesRefusedByWal).toBe(0);
+    expect(metrics.publisher.published).toBe(0);
+    expect(metrics.publisher.suppressedWhileHalted).toBeGreaterThan(0);
+    // Every closed segment is manifested, so a compactor can verify the
+    // recording made during the outage (wal-format.md §2).
+    const paths = Object.keys(harness.walFileSystem.snapshot());
+    const segments = paths.filter((path) => path.endsWith(".wal.jsonl"));
+    const manifests = paths.filter((path) => path.endsWith(".wal.manifest.json"));
+    expect(segments.length).toBeGreaterThan(0);
+    expect(manifests.length).toBe(segments.length);
+  });
+});

@@ -5,6 +5,44 @@ import { IncidentRegistry } from "./incidents.js";
 const AT_MS = 1_772_400_000_000;
 
 describe("IncidentRegistry", () => {
+  // ROUND-1 REVIEW L5: the `(scope, reasonCode)` key separator is a NUL, and
+  // round 1 wrote it as a LITERAL NUL BYTE in the source — which made Git
+  // classify the module as binary and hide its diff from review. The escape
+  // that replaced it produces the identical runtime string, and this pins the
+  // runtime property that made a NUL the right separator in the first place:
+  // no printable delimiter can be forged out of a scope or a reason code, so
+  // two distinct pairs can never share a key. Under a `:` separator the two
+  // pairs below collide and the second incident would be suppressed as a
+  // repeat of the first — a silently dropped incident.
+  it("cannot collide two distinct (scope, reasonCode) pairs on one key", () => {
+    const registry = new IncidentRegistry();
+    const first = registry.open({
+      scope: "feed",
+      reasonCode: "A:B",
+      severity: "NOTIFY",
+      detail: "one",
+      atMs: AT_MS,
+    });
+    const second = registry.open({
+      scope: "feed:A",
+      reasonCode: "B",
+      severity: "NOTIFY",
+      detail: "two",
+      atMs: AT_MS,
+    });
+    expect(first.opened).toBe(true);
+    expect(second.opened).toBe(true);
+    expect(first.incidentId).not.toBe(second.incidentId);
+    expect(registry.metrics().incidentsOpened).toBe(2);
+    expect(registry.metrics().repeatsSuppressed).toBe(0);
+    // And each key is independently addressable afterwards.
+    expect(registry.isOpen("feed", "A:B")).toBe(true);
+    expect(registry.isOpen("feed:A", "B")).toBe(true);
+    registry.markClosed("feed", "A:B");
+    expect(registry.isOpen("feed", "A:B")).toBe(false);
+    expect(registry.isOpen("feed:A", "B")).toBe(true);
+  });
+
   it("opens an incident with a complete internal-source draft", () => {
     const registry = new IncidentRegistry();
     const outcome = registry.open({

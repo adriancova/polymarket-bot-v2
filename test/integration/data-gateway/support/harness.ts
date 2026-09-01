@@ -11,7 +11,11 @@
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import { FakeCoinbaseSocketFactory } from "@polymarket-bot/coinbase-adapter/testing";
 import type { GatewayConfig, GatewayObserver } from "@polymarket-bot/data-gateway";
-import { DataGateway, parseGatewayConfig } from "@polymarket-bot/data-gateway";
+import {
+  DataGateway,
+  parseGatewayConfig,
+  UnavailableEventTransport,
+} from "@polymarket-bot/data-gateway";
 import {
   deterministicIdSource,
   ManualGatewayClock,
@@ -83,6 +87,17 @@ export interface HarnessOptions {
   readonly http?: (request: PublicHttpRequest) => PublicHttpResponse | Promise<PublicHttpResponse>;
   readonly observer?: GatewayObserver;
   /**
+   * Models a process that STARTED while the event bus was unreachable
+   * (§4.2, round-1 review H5).
+   *
+   * The gateway is built on `UnavailableEventTransport` and immediately put
+   * into the terminal publication halt, which is exactly the sequence
+   * `main.ts` runs. `published()` therefore reads an untouched
+   * `MemoryEventTransport` and is empty by construction — the point of the
+   * test is that the WAL is not.
+   */
+  readonly startupTransportFailure?: string;
+  /**
    * Distinguishes one modelled process lifetime from another.
    *
    * A test that models a RESTART passes a different seed, so the second
@@ -120,12 +135,17 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
       throw new Error("no HTTP route configured for this test");
     });
 
+  const gatewayTransport =
+    options.startupTransportFailure === undefined
+      ? transport
+      : new UnavailableEventTransport(options.startupTransportFailure);
+
   const gateway = await DataGateway.create(config, {
     clock,
     ids: deterministicIdSource(options.idSeed ?? 0),
     timers,
     walFileSystem,
-    transport,
+    transport: gatewayTransport,
     polymarketSocketFactory: polymarketSockets.factory,
     polymarketHttpClient: async (request) => httpRoute(request),
     rtdsSocketFactory: rtdsSockets.factory,
@@ -149,6 +169,13 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
         : { onEnvelopeRejected: options.observer.onEnvelopeRejected.bind(options.observer) }),
     },
   });
+
+  if (options.startupTransportFailure !== undefined) {
+    // Exactly what `main.ts` does after a failed startup connection: the same
+    // terminal halt and the same PAGE incident a mid-run outage produces,
+    // BEFORE any feed starts — and the WAL is already open.
+    gateway.haltPublication("EVENT_BUS_UNAVAILABLE", options.startupTransportFailure);
+  }
 
   return {
     gateway,

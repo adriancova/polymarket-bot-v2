@@ -8,8 +8,9 @@
  * - BOTH interval fields are handled — the measured `unobservedInterval` AND
  *   the typed `unobservedIntervalUnavailable`. "No measured interval" is never
  *   read as "no gap" (WP-100 round-1 known risk 2, follow-up 2);
- * - the freshness/eviction signals are read: a reappearing evicted series
- *   reports `firstObservationEver`, which is a statement about this adapter
+ * - the freshness/eviction signals are read: a series that is REALLY evicted
+ *   (257 distinct series against the adapter's 256-series bound) reports
+ *   `firstObservationEver` again, which is a statement about this adapter
  *   instance and not about the venue (WP-100 known risk 4);
  * - a SECONDS-spelled RTDS observation timestamp publishes a visibly-wrong
  *   1970 window, and the gateway's freshness logic must FAIL it (WP-100
@@ -150,7 +151,7 @@ describe("obligation 8 — RTDS coverage breaks, freshness, and symbol planning"
     await harness.gateway.stop();
   });
 
-  it("reads firstObservationEver, including for a series that reappears after eviction", async () => {
+  it("reads firstObservationEver for a new series and not for a continuing one", async () => {
     const harness = await buildHarness({ config: { ...RTDS_CONFIG } });
     harness.gateway.start();
     const socket = harness.rtdsSockets.current;
@@ -161,9 +162,8 @@ describe("obligation 8 — RTDS coverage breaks, freshness, and symbol planning"
     await harness.settle();
 
     // The very first observation of a series is a first observation ever — for
-    // this adapter instance. A reappearing evicted series reports the same
-    // thing, which is why the gateway counts it rather than treating it as a
-    // claim about the venue's history.
+    // this adapter instance, which is a statement about this process and not
+    // about the venue's history.
     expect(harness.gateway.metrics().rtds?.firstObservations).toBe(1);
 
     harness.clock.advance(1_000);
@@ -173,6 +173,51 @@ describe("obligation 8 — RTDS coverage breaks, freshness, and symbol planning"
     await harness.settle();
     // A continuing series is not a first observation.
     expect(harness.gateway.metrics().rtds?.firstObservations).toBe(1);
+
+    await harness.gateway.stop();
+  });
+
+  // ROUND-1 REVIEW L3: the round-1 test was NAMED for reappearance after
+  // eviction and never caused an eviction — it sent one series twice. The
+  // adapter's tracker holds `maxTrackedSeries` (256) series and evicts the
+  // least recently updated, so an eviction takes 257 distinct series. This
+  // one actually does it, and the reappearing series' second
+  // `firstObservationEver` is the evidence the eviction happened.
+  it("reports firstObservationEver AGAIN for a series that really was evicted", async () => {
+    const harness = await buildHarness({ config: { ...RTDS_CONFIG } });
+    harness.gateway.start();
+    const socket = harness.rtdsSockets.current;
+    socket.open();
+
+    const observe = (symbol: string): void => {
+      harness.clock.advance(1);
+      socket.message(rtdsUpdateFrame({ symbol, observationMs: harness.clock.nowMs() }));
+    };
+
+    observe("btc/usd");
+    await harness.settle();
+    expect(harness.gateway.metrics().rtds?.firstObservations).toBe(1);
+
+    // 256 further distinct series push the tracker past its bound, and
+    // `btc/usd` is the least recently updated, so it is the one evicted.
+    const fillerCount = 256;
+    for (let index = 0; index < fillerCount; index += 1) {
+      observe(`fil${String(index)}/usd`);
+    }
+    await harness.settle();
+    // Every filler is a new series, hence a first observation of its own; none
+    // of them is published, because none is planned.
+    expect(harness.gateway.metrics().rtds?.firstObservations).toBe(1 + fillerCount);
+    expect(harness.gateway.metrics().rtds?.unplannedSymbolObservations).toBe(fillerCount);
+    expect(harness.publishedOfType("ReferenceTwapObserved")).toHaveLength(1);
+
+    // The evicted series reappears. The adapter truthfully reports a FIRST
+    // observation again: "first" is a claim about this adapter instance, never
+    // about the venue's history (WP-100 known risk 4).
+    observe("btc/usd");
+    await harness.settle();
+    expect(harness.gateway.metrics().rtds?.firstObservations).toBe(2 + fillerCount);
+    expect(harness.publishedOfType("ReferenceTwapObserved")).toHaveLength(2);
 
     await harness.gateway.stop();
   });

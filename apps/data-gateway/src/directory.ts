@@ -56,6 +56,19 @@ const MAX_RETAINED_OBSERVATIONS = 256;
 export interface UniverseDirectoryMetrics {
   readonly knownMarkets: number;
   readonly declinedRegistrations: number;
+  /**
+   * Declined announcements the bounded memory has dropped (round-1 review L4).
+   *
+   * `declinedRegistrations` counts every announcement ever declined;
+   * `declinedRegistrationsRetained` is how many of them a diagnosing operator
+   * can still read. Without this third number, the retained list silently
+   * stops being the whole story — §8.3's rule is that every bound is loud, and
+   * a bound with no counter is not.
+   */
+  readonly declinedRegistrationsRetained: number;
+  readonly declinedRegistrationsEvicted: number;
+  /** The retention bound itself, so the two counts above can be read against it. */
+  readonly declinedRegistrationsCapacity: number;
   readonly parameterVersionsAssigned: number;
   readonly parameterAssignmentsDeclined: number;
 }
@@ -65,6 +78,7 @@ export class UniverseMarketDirectory implements PublicMarketDirectory {
   readonly #clock: GatewayClock;
   readonly #declined: ObservedNewMarket[] = [];
   #declinedCount = 0;
+  #declinedEvicted = 0;
   #versionsAssigned = 0;
   #assignmentsDeclined = 0;
 
@@ -131,7 +145,11 @@ export class UniverseMarketDirectory implements PublicMarketDirectory {
     this.#declinedCount += 1;
     this.#declined.push(observation);
     if (this.#declined.length > MAX_RETAINED_OBSERVATIONS) {
+      // Bounded memory, LOUDLY bounded: the oldest observation leaves and the
+      // eviction is counted, so `declinedRegistrations` never silently
+      // disagrees with what `declinedRegistrations` (the list) still holds.
       this.#declined.shift();
+      this.#declinedEvicted += 1;
     }
     return undefined;
   }
@@ -186,6 +204,9 @@ export class UniverseMarketDirectory implements PublicMarketDirectory {
     return {
       knownMarkets: this.#registry.markets.size,
       declinedRegistrations: this.#declinedCount,
+      declinedRegistrationsRetained: this.#declined.length,
+      declinedRegistrationsEvicted: this.#declinedEvicted,
+      declinedRegistrationsCapacity: MAX_RETAINED_OBSERVATIONS,
       parameterVersionsAssigned: this.#versionsAssigned,
       parameterAssignmentsDeclined: this.#assignmentsDeclined,
     };

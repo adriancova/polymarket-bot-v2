@@ -62,7 +62,11 @@ import type {
   GatewayIdSource,
   GatewayTimers,
 } from "./ports.js";
-import type { GatewayPublisherMetrics, PublicationHalt } from "./publisher.js";
+import type {
+  GatewayPublisherMetrics,
+  PublicationHalt,
+  PublicationHaltCause,
+} from "./publisher.js";
 import { GatewayPublisher } from "./publisher.js";
 import { IngestSequencer } from "./sequencer.js";
 import type { SubscriptionPlan } from "./subscription-plan.js";
@@ -71,8 +75,27 @@ import { planSubscriptions } from "./subscription-plan.js";
 /** Operational visibility, independent of the transport being reachable. */
 export interface GatewayObserver extends DispatcherObserver {
   onPublicationHalted?(halt: PublicationHalt): void;
+  onPublishRejected?(rejection: {
+    readonly ingestSeq: string;
+    readonly detail: string;
+  }): void;
   onRecordingFailure?(failure: { readonly reason: string; readonly detail: string }): void;
 }
+
+/**
+ * One PAGE incident reason code per halt cause.
+ *
+ * Every cause is terminal and every one costs the rest of the epoch's
+ * publication, so the operator procedure is the same in all four cases (see
+ * `infra/compose/data-gateway/README.md`); the codes differ so a dashboard can
+ * separate an infrastructure outage from a gateway-side defect.
+ */
+const PUBLICATION_HALT_REASON_CODES: Readonly<Record<PublicationHaltCause, string>> = {
+  EVENT_BUS_PUBLISH_QUEUE_FULL: "GATEWAY_PUBLISH_QUEUE_FULL",
+  EVENT_BUS_UNAVAILABLE: "GATEWAY_TRANSPORT_UNAVAILABLE",
+  GATEWAY_PUBLISH_ADMISSION_OVERFLOW: "GATEWAY_PUBLISH_ADMISSION_OVERFLOW",
+  GATEWAY_PUBLISH_REJECTED: "GATEWAY_PUBLISH_REJECTED",
+};
 
 /** Everything impure the gateway needs, injected. */
 export interface GatewayPorts {
@@ -202,6 +225,15 @@ export class DataGateway {
     const publisher = new GatewayPublisher({
       transport: ports.transport,
       stream: config.streamName,
+      clock: ports.clock,
+      maxQueueDepth: config.publisher.maxQueueDepth,
+      maxQueueBytes: config.publisher.maxQueueBytes,
+      onPublishRejected: (rejection) => {
+        // Informational only: the halt that follows is what an operator acts
+        // on, and it arrives through `onPublicationHalted` below. Round 1 wired
+        // NOTHING here, so a non-outage rejection was invisible (review H3).
+        observer.onPublishRejected?.(rejection);
+      },
       onPublicationHalted: (halt) => {
         observer.onPublicationHalted?.(halt);
         // §8.3: a critical queue that cannot accept an event opens an
@@ -209,10 +241,7 @@ export class DataGateway {
         // halted; the observer callback above is the delivery that works.
         late.dispatcher?.openIncident({
           scope: "transport",
-          reasonCode:
-            halt.cause === "EVENT_BUS_PUBLISH_QUEUE_FULL"
-              ? "GATEWAY_PUBLISH_QUEUE_FULL"
-              : "GATEWAY_TRANSPORT_UNAVAILABLE",
+          reasonCode: PUBLICATION_HALT_REASON_CODES[halt.cause],
           severity: "PAGE",
           detail: `publication halted at ingestSeq ${halt.haltedAtIngestSeq}: ${halt.detail}; the WAL keeps recording`,
         });
@@ -472,6 +501,21 @@ export class DataGateway {
 
   get gatewayEpoch(): string {
     return this.#sequencer.gatewayEpoch;
+  }
+
+  /**
+   * Halts publication terminally, with no submission attempted (§4.2).
+   *
+   * The startup case: the transport was unreachable when the process came up.
+   * Round 1 connected the transport BEFORE building the gateway and exited on
+   * failure, so a recorder restarted while Redis was down recorded NOTHING —
+   * the exact opposite of acceptance 4. `main.ts` now builds the gateway
+   * regardless and calls this, which puts publication in the same terminal
+   * halt (and opens the same PAGE incident) a mid-run outage would, while the
+   * WAL and every public feed run untouched.
+   */
+  haltPublication(cause: PublicationHaltCause, detail: string): void {
+    this.#publisher.haltPublication(cause, detail);
   }
 
   /** Starts every configured feed and the gateway tick. */

@@ -47,8 +47,34 @@ describe("UniverseMarketDirectory", () => {
     expect(directory.registerDiscoveredMarket(observation)).toBeUndefined();
     expect(directory.declinedRegistrations).toHaveLength(1);
     expect(directory.metrics().declinedRegistrations).toBe(1);
+    expect(directory.metrics().declinedRegistrationsRetained).toBe(1);
+    expect(directory.metrics().declinedRegistrationsEvicted).toBe(0);
     // Still not resolvable afterwards.
     expect(directory.identityForToken("55555")).toBeUndefined();
+  });
+
+  // Round-1 review L4: the retained-observation memory is bounded, and a bound
+  // with no counter is a silent one (§8.3). Past the cap the oldest
+  // observation leaves and the departure is COUNTED, so a diagnosing operator
+  // can tell "I am reading everything" from "I am reading the tail".
+  it("counts evictions once the bounded observation memory is full", () => {
+    const directory = new UniverseMarketDirectory([MARKET], new ManualGatewayClock());
+    const capacity = directory.metrics().declinedRegistrationsCapacity;
+    expect(capacity).toBeGreaterThan(0);
+    for (let index = 0; index < capacity + 5; index += 1) {
+      directory.registerDiscoveredMarket({
+        venueMarketId: `mkt-${String(index)}`,
+        conditionId: "0x" + index.toString(16).padStart(62, "0"),
+        tokenIds: [String(index * 2), String(index * 2 + 1)],
+        outcomes: ["Yes", "No"],
+      });
+    }
+    const metrics = directory.metrics();
+    expect(metrics.declinedRegistrations).toBe(capacity + 5);
+    expect(metrics.declinedRegistrationsRetained).toBe(capacity);
+    expect(metrics.declinedRegistrationsEvicted).toBe(5);
+    // The retained window is the NEWEST observations, oldest first.
+    expect(directory.declinedRegistrations[0]?.venueMarketId).toBe("mkt-5");
   });
 
   // §6 invariant 9 / ADR-002 §6: the catalogue versions parameters; the

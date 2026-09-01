@@ -9,16 +9,39 @@
  * itself injects. `RecordingCoinbaseSocketFactory` wraps the real factory:
  * its `onFrame` records the exact frame to the WAL and only then forwards it
  * to the manager's own listener, so the WAL enqueue provably precedes
- * normalization and publication. Each wrapped listener closes over ITS
- * connection's identity, so a frame from a superseded socket is recorded
- * under the id of the socket that produced it — never relabeled (the defect
- * class all three 1B adapters guard against is not reintroduced here).
+ * normalization and publication. Each wrapped listener closes over ITS OWN
+ * socket's provenance, so a frame from a superseded socket is recorded under
+ * the identity AND the generation of the socket that produced it — never
+ * relabeled (the defect class all three 1B adapters guard against is not
+ * reintroduced here; see the next section for how round 1 half-reintroduced
+ * it anyway).
  *
- * The wrapper derives the same `<feedId>-c<ordinal>` identity the manager
- * mints, by counting `connect()` calls in lockstep (the manager calls the
- * factory exactly once per attempt, and mints exactly one id per attempt).
- * The integration suite pins that correspondence: the connectionId on a
- * normalized event equals the connectionId on its recorded raw frame.
+ * ## Provenance is CAPTURED, not looked up (round-1 review M1)
+ *
+ * Round 1 captured the connection id by closure but read
+ * `subscriptionGeneration` from the manager's CURRENT metrics at the instant
+ * each frame arrived. A late frame from a superseded socket was therefore
+ * recorded with the LIVE socket's generation: the raw WAL record described
+ * `c1`'s bytes as belonging to `c2`'s generation — the precise relabelling
+ * defect `subscriptionGeneration` exists to prevent, reintroduced at the
+ * recording layer after all three 1B adapters guarded against it.
+ *
+ * Each wrapped socket now owns an immutable {@link CoinbaseSocketProvenance}
+ * captured at ITS OWN `onOpen`, and every frame from that socket is recorded
+ * under it, forever. The capture reads the manager's own `connectionId` and
+ * `subscriptionGeneration` — not a guess — and it knows the read applies to
+ * THIS socket because `counters.connectionsOpened` advanced by exactly one
+ * across the forwarded `onOpen`. The manager never advances a generation
+ * mid-connection (it reconnects instead of calling
+ * `CoinbaseStreamProcessor.resubscribed()`), so the captured value stays true
+ * for the socket's whole life.
+ *
+ * The `<feedId>-c<ordinal>` lockstep guess survives ONLY as the fallback for
+ * a frame that arrives before the manager adopted the socket — a window in
+ * which no generation has been established at all. Such frames are recorded
+ * with generation `0` and COUNTED
+ * (`framesWithoutEstablishedProvenance`), so "no generation was established"
+ * is visible rather than mistaken for generation zero.
  *
  * A binary frame cannot enter the WAL (`payloadUtf8` cannot hold it,
  * ADR-004 §1); it is counted here and surfaces as the adapter's own
@@ -65,6 +88,19 @@ interface CurrentRawFrame {
 }
 
 /**
+ * One socket's immutable recording provenance.
+ *
+ * `established` distinguishes "the manager adopted this socket and told us its
+ * identity and generation" from "this socket delivered a frame before it was
+ * adopted, so no generation exists yet and `0` is a placeholder, not a claim".
+ */
+export interface CoinbaseSocketProvenance {
+  connectionId: string;
+  subscriptionGeneration: number;
+  established: boolean;
+}
+
+/**
  * Wraps a socket factory so every text frame reaches the WAL before the
  * manager's own listener sees it. Created by the driver; handed to the
  * manager's constructor.
@@ -80,17 +116,33 @@ export class RecordingCoinbaseSocketFactory implements CoinbaseSocketFactory {
   }
 
   connect(endpoint: string, listener: CoinbaseSocketListener): CoinbaseSocket {
-    // In lockstep with the manager: one `connect()` per attempt, one id per
-    // attempt, same shape (`<feedId>-c<ordinal>`). Pinned by a test.
     this.#connectOrdinal += 1;
-    const connectionId = `${this.#driver.feedId}-c${String(this.#connectOrdinal)}`;
+    // Provisional until this socket is adopted: the manager's own id format,
+    // derived from the attempt ordinal. It labels ONLY frames that arrive in
+    // the pre-adoption window, and those are counted.
+    const provenance: CoinbaseSocketProvenance = {
+      connectionId: `${this.#driver.feedId}-c${String(this.#connectOrdinal)}`,
+      subscriptionGeneration: 0,
+      established: false,
+    };
     return this.#inner.connect(endpoint, {
       onOpen: () => {
+        const openedBefore = this.#driver.managerConnectionsOpened();
         listener.onOpen();
+        const adopted = this.#driver.managerProvenance();
+        if (adopted !== undefined && adopted.connectionsOpened === openedBefore + 1) {
+          // The manager ran `connectionOpened` for THIS socket, so its current
+          // view describes this socket. Captured once; never re-read.
+          provenance.connectionId = adopted.connectionId;
+          provenance.subscriptionGeneration = adopted.subscriptionGeneration;
+          provenance.established = true;
+        }
       },
       onFrame: (frame: CoinbaseRawFrame) => {
-        // WAL first; the identity is THIS socket's, captured by closure.
-        this.#driver.recordRawFrame(frame, connectionId, endpoint);
+        // WAL first; the provenance is THIS socket's, captured at its open and
+        // immutable thereafter — a superseded socket's frame is never
+        // relabelled with the live socket's generation.
+        this.#driver.recordRawFrame(frame, provenance, endpoint);
         listener.onFrame(frame);
         this.#driver.clearCurrentRawFrame();
       },
@@ -117,6 +169,11 @@ export interface CoinbaseFeedDriverMetrics {
   readonly framesRecorded: number;
   readonly framesRefusedByWal: number;
   readonly binaryFramesUnrecorded: number;
+  /**
+   * Frames recorded before the manager adopted their socket, so no
+   * `subscriptionGeneration` had been established and `0` is a placeholder.
+   */
+  readonly framesWithoutEstablishedProvenance: number;
   readonly eventsDispatched: number;
   readonly eventsSuppressedUnrecorded: number;
   readonly anomaliesRouted: number;
@@ -133,6 +190,7 @@ export class CoinbaseFeedDriver {
   #framesRecorded = 0;
   #framesRefusedByWal = 0;
   #binaryFramesUnrecorded = 0;
+  #framesWithoutEstablishedProvenance = 0;
   #eventsDispatched = 0;
   #eventsSuppressed = 0;
   #anomaliesRouted = 0;
@@ -157,8 +215,34 @@ export class CoinbaseFeedDriver {
     return new RecordingCoinbaseSocketFactory(inner, this);
   }
 
+  /** `counters.connectionsOpened`, read by the factory across a forwarded open. */
+  managerConnectionsOpened(): number {
+    return this.#manager?.metrics().counters.connectionsOpened ?? -1;
+  }
+
+  /** The manager's own current connection identity and generation. */
+  managerProvenance():
+    | {
+        readonly connectionId: string;
+        readonly subscriptionGeneration: number;
+        readonly connectionsOpened: number;
+      }
+    | undefined {
+    const metrics = this.#manager?.metrics();
+    if (metrics === undefined) return undefined;
+    return {
+      connectionId: metrics.connectionId,
+      subscriptionGeneration: metrics.subscriptionGeneration,
+      connectionsOpened: metrics.counters.connectionsOpened,
+    };
+  }
+
   /** Called by the recording factory, inside the frame callback, WAL-first. */
-  recordRawFrame(frame: CoinbaseRawFrame, connectionId: string, endpoint: string): void {
+  recordRawFrame(
+    frame: CoinbaseRawFrame,
+    provenance: CoinbaseSocketProvenance,
+    endpoint: string,
+  ): void {
     if (typeof frame !== "string") {
       // `payloadUtf8` cannot hold binary (ADR-004 §1); decoding on a guess
       // would store an interpretation, not evidence. Counted here; the
@@ -167,12 +251,17 @@ export class CoinbaseFeedDriver {
       this.#currentRaw = undefined;
       return;
     }
+    if (!provenance.established) {
+      // No generation exists for this socket yet: `0` below is a placeholder,
+      // not a claim about generation zero. Counted so it is never mistaken.
+      this.#framesWithoutEstablishedProvenance += 1;
+    }
     const receipt = takeReceipt(this.#options.clock);
     const outcome = this.#options.journal.record({
       source: "coinbase",
       endpoint,
-      connectionId,
-      subscriptionGeneration: this.#manager?.metrics().subscriptionGeneration ?? 0,
+      connectionId: provenance.connectionId,
+      subscriptionGeneration: provenance.subscriptionGeneration,
       receipt,
       payloadUtf8: frame,
     });
@@ -350,6 +439,7 @@ export class CoinbaseFeedDriver {
       framesRecorded: this.#framesRecorded,
       framesRefusedByWal: this.#framesRefusedByWal,
       binaryFramesUnrecorded: this.#binaryFramesUnrecorded,
+      framesWithoutEstablishedProvenance: this.#framesWithoutEstablishedProvenance,
       eventsDispatched: this.#eventsDispatched,
       eventsSuppressedUnrecorded: this.#eventsSuppressed,
       anomaliesRouted: this.#anomaliesRouted,

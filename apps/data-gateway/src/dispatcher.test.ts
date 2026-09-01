@@ -13,7 +13,7 @@ const EPOCH = "00000000-0000-4000-8000-000000000001";
 function build(observer: ConstructorParameters<typeof GatewayDispatcher>[0]["observer"] = {}) {
   const clock = new ManualGatewayClock();
   const transport = new MemoryEventTransport();
-  const publisher = new GatewayPublisher({ transport, stream: "market" });
+  const publisher = new GatewayPublisher({ transport, stream: "market", clock });
   const dispatcher = new GatewayDispatcher({
     clock,
     ids: deterministicIdSource(),
@@ -133,6 +133,38 @@ describe("GatewayDispatcher", () => {
     const published = transport.published("market");
     expect(published).toHaveLength(1);
     expect(published[0]?.source).toBe("coinbase");
+  });
+
+  // ROUND-1 REVIEW L1: "assign and submit in one step" was not literally true
+  // — validation sits between the two, so a rejected draft consumes a
+  // sequence and publishes nothing. This pins the guarantee that IS made
+  // (strictly increasing submission order) and the one that is NOT
+  // (contiguity), so the code comment and the behaviour cannot drift apart.
+  it("consumes a sequence for a rejected draft, leaving a gap that is counted and incident-observable", async () => {
+    const incidents: string[] = [];
+    const { transport, dispatcher } = build({
+      onIncident: (incident) => incidents.push(incident.reasonCode),
+    });
+    const badDraft: EnvelopeDraft = { ...validDraft, payload: { nonsense: true } };
+
+    // Sequence 1 is assigned to the bad draft and never published; the
+    // incident opened for it takes sequence 2; the good drafts take 3 and 4.
+    await dispatcher.dispatch(badDraft);
+    await dispatcher.dispatch(validDraft);
+    await dispatcher.dispatch(validDraft);
+
+    const sequences = transport.published("market").map((envelope) => envelope.ingestSeq);
+    expect(sequences).not.toContain("1");
+    // NOT contiguous — and that is the documented, correct outcome, because
+    // raw WAL frames draw from this same counter.
+    expect(sequences).toEqual(["2", "3", "4"]);
+    // STRICTLY INCREASING — the guarantee the transport actually needs.
+    for (let index = 1; index < sequences.length; index += 1) {
+      expect(BigInt(sequences[index] ?? "0") > BigInt(sequences[index - 1] ?? "0")).toBe(true);
+    }
+    // The hole is never silent.
+    expect(dispatcher.metrics().envelopeRejections).toBe(1);
+    expect(incidents).toEqual(["GATEWAY_ENVELOPE_REJECTED"]);
   });
 
   it("openIncident dispatches a valid internal DataQualityIncidentOpened envelope", async () => {

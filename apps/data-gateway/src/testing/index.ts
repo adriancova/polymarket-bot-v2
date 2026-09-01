@@ -16,6 +16,11 @@ import type {
 import { uuidV7At } from "../system.js";
 
 export { MemoryEventTransport } from "./memory-transport.js";
+export {
+  createObservingWalFileSystem,
+  type FileSystemObservations,
+  type ObservingWalFileSystem,
+} from "./observing-file-system.js";
 
 /** A clock the test moves by hand. Monotonic ns derives from the same steps. */
 export class ManualGatewayClock implements GatewayClock {

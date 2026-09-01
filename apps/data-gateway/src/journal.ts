@@ -36,7 +36,36 @@
  *
  * The writer schedules nothing; the gateway drives `drain()` after every
  * accepted enqueue and `tick()` on an interval at most the configured fsync
- * interval, so the published data-loss bound (`dataLossBoundMs`) is real.
+ * interval, so the published data-loss bound (`dataLossBoundMs`) is real. The
+ * configuration schema now REFUSES `tickIntervalMs > fsyncIntervalMs`
+ * (`config.ts`), so the bound cannot be falsified by a deployment.
+ *
+ * ## One operation chain, and nothing outside it (round-1 review H1)
+ *
+ * The WP-050 writer is explicitly single-threaded: it guards `drain()` against
+ * a second `drain()` and nothing else. `tick()`, `flush()`, `rotate()`, and
+ * `close()` all mutate the SAME active-segment state, so any two of them in
+ * flight at once can finalize a segment while a drain is appending to it —
+ * which produces a frame that is both manifested and pending, violating the
+ * `wal-format.md` accepted-frame invariant (a frame is at every instant
+ * queued, durable-and-manifested, or in `pendingFrames()` — exactly one).
+ *
+ * Every asynchronous, filesystem-touching writer call in this journal
+ * therefore runs on ONE serial chain (`#run`): drains, ticks, flushes, and the
+ * close. Nothing awaits a partial chain and then calls the writer, which is
+ * precisely the round-1 defect — `tick()` awaited the drain chain and then
+ * called `writer.tick()` outside it, so a frame arriving in between started a
+ * second, concurrent writer operation.
+ *
+ * Two writer calls stay off the chain, deliberately, and neither can
+ * interleave with an operation because neither awaits:
+ *
+ * - `enqueue()` (inside {@link GatewayJournal.record}) is SYNCHRONOUS and only
+ *   touches the in-memory admission queue; acceptance 1 needs the accept/refuse
+ *   decision to be synchronous with the frame's arrival.
+ * - `metrics()` and `pendingFrames()` are synchronous reads. A reader that
+ *   samples them while an operation is in flight sees a mid-operation snapshot,
+ *   which is what a metric is.
  */
 
 import type {
@@ -104,7 +133,8 @@ export class GatewayJournal {
   readonly #writer: WalWriter;
   readonly #sequencer: IngestSequencer;
   readonly #onFailure: GatewayJournalOptions["onRecordingFailure"];
-  #draining: Promise<void> = Promise.resolve();
+  /** The one chain every asynchronous writer operation runs on. */
+  #operations: Promise<void> = Promise.resolve();
   #faulted = false;
 
   private constructor(writer: WalWriter, options: GatewayJournalOptions) {
@@ -218,32 +248,65 @@ export class GatewayJournal {
     return { recorded: true, ingestSeq };
   }
 
-  /** Serializes drains so two enqueues cannot interleave writer calls. */
-  #scheduleDrain(): void {
-    this.#draining = this.#draining.then(async () => {
-      if (this.#faulted) return;
+  /**
+   * Queues one writer operation on the single serial chain.
+   *
+   * The returned promise never rejects: a writer failure is turned into the
+   * journal's fault state and reported through `onRecordingFailure`, because
+   * the callers are socket callbacks and a shutdown path, neither of which can
+   * usefully handle a rejection.
+   */
+  #run(
+    operation: () => Promise<void>,
+    options: { readonly evenWhenFaulted?: boolean } = {},
+  ): Promise<void> {
+    const settled = this.#operations.then(async () => {
+      if (this.#faulted && options.evenWhenFaulted !== true) return;
       try {
-        await this.#writer.drain();
+        await operation();
       } catch (error) {
         this.#noteFault(error);
       }
     });
+    this.#operations = settled;
+    return settled;
+  }
+
+  /** Queues a drain. Called synchronously after every accepted enqueue. */
+  #scheduleDrain(): void {
+    void this.#run(async () => {
+      await this.#writer.drain();
+    });
   }
 
   /** Time-driven fsync and rotation; call on an interval ≤ the fsync interval. */
-  async tick(): Promise<void> {
-    await this.#draining;
-    if (this.#faulted) return;
-    try {
+  tick(): Promise<void> {
+    return this.#run(async () => {
       await this.#writer.tick();
-    } catch (error) {
-      this.#noteFault(error);
-    }
+    });
   }
 
-  /** Waits for all scheduled drains to settle (test and shutdown support). */
+  /** Drains and forces an fsync, regardless of the periodic policy. */
+  flush(): Promise<void> {
+    return this.#run(async () => {
+      await this.#writer.flush();
+    });
+  }
+
+  /**
+   * Waits for every queued operation to settle (test and shutdown support).
+   *
+   * Loops until the chain stops growing: an operation may queue while an
+   * earlier one is in flight, and a `settle()` that awaited only the chain it
+   * captured on entry would return with work still pending.
+   */
   async settle(): Promise<void> {
-    await this.#draining;
+    let chain = this.#operations;
+    for (;;) {
+      await chain;
+      if (this.#operations === chain) return;
+      chain = this.#operations;
+    }
   }
 
   /** Frames the writer is still answerable for after a fault. */
@@ -255,13 +318,21 @@ export class GatewayJournal {
     return this.#writer.metrics();
   }
 
+  /**
+   * Closes the writer, on the same chain as every other operation.
+   *
+   * Runs even when the journal is already faulted, because WP-050's faulted
+   * `close()` is the call that RECONCILES the segment against what is actually
+   * on disk and settles `pendingFrames()`.
+   */
   async close(): Promise<void> {
-    await this.#draining;
-    try {
-      await this.#writer.close();
-    } catch (error) {
-      this.#noteFault(error);
-    }
+    await this.settle();
+    await this.#run(
+      async () => {
+        await this.#writer.close();
+      },
+      { evenWhenFaulted: true },
+    );
   }
 
   #noteFault(error: unknown): void {

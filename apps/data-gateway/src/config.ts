@@ -23,9 +23,14 @@
  * shapes that look time- or boot-derived (see `STREAM_NAME_PATTERN`).
  */
 
+import { DEFAULT_FSYNC_INTERVAL_MS } from "@polymarket-bot/storage-wal";
 import { z } from "zod";
 
 import { GatewayConfigurationError } from "./errors.js";
+import {
+  DEFAULT_PUBLISH_QUEUE_MAX_BYTES,
+  DEFAULT_PUBLISH_QUEUE_MAX_DEPTH,
+} from "./publisher.js";
 
 /** Matches the transport's own stream-name discipline: a bounded code string. */
 const CODE_STRING = /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/u;
@@ -160,6 +165,19 @@ export const CoinbaseFeedConfigSchema = z.strictObject({
   reconnectLoopEscalationThreshold: z.number().int().positive().default(5),
 });
 
+/**
+ * Bounds on the publisher's admission queue (§8.3: every queue is bounded).
+ *
+ * Safety parameters, not throughput knobs. Raising either one buys tolerance
+ * for a longer transport stall and costs memory plus a longer window of events
+ * that exist only in the WAL; crossing either one is a terminal publication
+ * halt with a PAGE incident, never a drop.
+ */
+export const PublisherConfigSchema = z.strictObject({
+  maxQueueDepth: z.number().int().positive().default(DEFAULT_PUBLISH_QUEUE_MAX_DEPTH),
+  maxQueueBytes: z.number().int().positive().default(DEFAULT_PUBLISH_QUEUE_MAX_BYTES),
+});
+
 export const GatewayConfigSchema = z.strictObject({
   /** Stable across restarts; see the module header. */
   streamName: z
@@ -169,7 +187,18 @@ export const GatewayConfigSchema = z.strictObject({
       message: "streamName must not be a UUID: it must be stable across restarts",
     }),
   wal: WalConfigSchema,
-  /** Gateway tick cadence, driving WAL fsync/rotation and staleness checks. */
+  publisher: PublisherConfigSchema.default({
+    maxQueueDepth: DEFAULT_PUBLISH_QUEUE_MAX_DEPTH,
+    maxQueueBytes: DEFAULT_PUBLISH_QUEUE_MAX_BYTES,
+  }),
+  /**
+   * Gateway tick cadence, driving WAL fsync/rotation and staleness checks.
+   *
+   * MUST be at or below the effective `wal.fsyncIntervalMs`: the WAL writer
+   * schedules nothing, so an idle recorder is only fsynced by this tick, and a
+   * slower tick would make the published `dataLossBoundMs` a false claim
+   * (round-1 review M2 — validated below, not merely documented).
+   */
   tickIntervalMs: z.number().int().positive().default(1_000),
   markets: z.array(MarketConfigSchema),
   polymarket: PolymarketFeedConfigSchema.optional(),
@@ -204,6 +233,22 @@ export function parseGatewayConfig(value: unknown): GatewayConfig {
   if (config.polymarket !== undefined && config.markets.length === 0) {
     throw new GatewayConfigurationError(
       "the Polymarket feed requires at least one configured market: subscriptions and the universe directory are configuration, not discovery (§9.2)",
+    );
+  }
+  // Round-1 review M2: the WAL's published `dataLossBoundMs` IS
+  // `fsyncIntervalMs`, and nothing but this gateway's tick drives an idle
+  // writer's fsync. A tick slower than the fsync interval therefore advertises
+  // a bound the deployment cannot keep — an idle final frame can sit unsynced
+  // for a whole tick. That is a configuration defect, so it fails at startup.
+  const effectiveFsyncIntervalMs = config.wal.fsyncIntervalMs ?? DEFAULT_FSYNC_INTERVAL_MS;
+  if (config.tickIntervalMs > effectiveFsyncIntervalMs) {
+    throw new GatewayConfigurationError(
+      "tickIntervalMs must be at or below wal.fsyncIntervalMs: the WAL writer schedules nothing, so a slower tick would make the published dataLossBoundMs a false claim",
+      {
+        tickIntervalMs: config.tickIntervalMs,
+        fsyncIntervalMs: effectiveFsyncIntervalMs,
+        fsyncIntervalMsIsDefault: config.wal.fsyncIntervalMs === undefined,
+      },
     );
   }
   const feedIds = [

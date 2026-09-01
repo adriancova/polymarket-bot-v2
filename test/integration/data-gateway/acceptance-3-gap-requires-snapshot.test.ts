@@ -18,7 +18,9 @@
  *    gateway does NOT wait for one: it halts the feed with a PAGE incident and
  *    clears the adapter's gap state — and the acknowledgement is NEVER an
  *    authoritative resync (no `FeedResynchronized` is published, because none
- *    exists on that feed).
+ *    exists on that feed). Round-1 review H4: the halt is TERMINAL, and the
+ *    post-gap frame below is what proves it — raw recording continues,
+ *    normalized publication does not.
  */
 
 import { describe, expect, it } from "vitest";
@@ -32,6 +34,7 @@ import {
   rtdsUpdateFrame,
   MARKET,
 } from "./support/harness.js";
+import { recordedFrames } from "./support/wal.js";
 
 function restRoute(): (request: PublicHttpRequest) => PublicHttpResponse {
   return (request) => {
@@ -186,6 +189,34 @@ describe("acceptance 3 — gap recovery requires an authoritative snapshot", () 
     expect(harness.publishedOfType("FeedResynchronized")).toHaveLength(0);
     expect(harness.gateway.metrics().rtds?.unrecoverableGapsAcknowledged).toBe(1);
 
+    // ROUND-1 REVIEW H4: "halts" has to mean the feed STOPS. Round 1 opened
+    // the incident, acknowledged the gap, and then went on publishing — the
+    // test stopped one assertion too early to see it. The halt is now real
+    // and terminal for the epoch.
+    expect(harness.gateway.metrics().rtds?.halted).toBe(true);
+
+    // A POST-GAP FRAME: recorded raw, never published. A consumer that read
+    // only the data stream would otherwise see an unbroken TWAP series across
+    // a permanently unobserved interval.
+    const publishedBeforePostGapFrame = harness.publishedOfType("ReferenceTwapObserved").length;
+    harness.clock.advance(1_000);
+    second.message(
+      rtdsUpdateFrame({ symbol: "btc/usd", observationMs: harness.clock.nowMs() }),
+    );
+    await harness.settle();
+
+    expect(harness.publishedOfType("ReferenceTwapObserved")).toHaveLength(
+      publishedBeforePostGapFrame,
+    );
+    expect(harness.gateway.metrics().rtds?.observationsSuppressedAfterGap).toBe(1);
+    // The suppression is not a drop: the raw frame is on disk, verbatim.
+    expect(harness.gateway.metrics().rtds?.framesRefusedByWal).toBe(0);
+
     await harness.gateway.stop();
+    const frames = recordedFrames(harness.walFileSystem, harness.gateway.gatewayEpoch);
+    expect(frames.some((frame) => frame.payloadUtf8.includes("crypto_prices_twap"))).toBe(true);
+    // Every frame the sockets delivered reached the WAL, including the ones
+    // after the halt.
+    expect(harness.gateway.metrics().rtds?.framesRecorded).toBe(frames.length);
   });
 });

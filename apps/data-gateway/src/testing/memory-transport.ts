@@ -59,9 +59,52 @@ export class MemoryEventTransport implements MarketEventTransport {
   #failNextQueueFull = false;
   #closed = false;
   #beforePublish: ((envelope: EventEnvelope<unknown>) => void) | undefined;
+  #publishCalls = 0;
+  #subscribeCalls = 0;
+  #stallGate: { promise: Promise<void>; release: () => void } | undefined;
 
   constructor(retention: RetentionPolicy = { maxEvents: 10_000 }) {
     this.retention = retention;
+  }
+
+  /** How many times `publish` was ENTERED, whatever it then did. */
+  get publishCalls(): number {
+    return this.#publishCalls;
+  }
+
+  /**
+   * How many times a consumer subscribed.
+   *
+   * The gateway is producer-only, so this stays at `0` for the whole of its
+   * life — which is the evidence obligation 7's consumer half is not this
+   * package's to satisfy (round-1 review L2).
+   */
+  get subscribeCalls(): number {
+    return this.#subscribeCalls;
+  }
+
+  /**
+   * Every publish from now on hangs until {@link resumePublishes}.
+   *
+   * A transport that neither succeeds nor fails is the shape round-1 review
+   * H2 probed with: the publisher's Promise chain admitted 999 further
+   * envelopes behind ONE stalled call, with `halted === false`.
+   */
+  stallPublishes(): void {
+    if (this.#stallGate !== undefined) return;
+    let release = (): void => undefined;
+    const promise = new Promise<void>((resolve) => {
+      release = () => {
+        resolve();
+      };
+    });
+    this.#stallGate = { promise, release };
+  }
+
+  /** Releases stalled publishes and stops stalling new ones. */
+  resumePublishes(): void {
+    this.#stallGate?.release();
+    this.#stallGate = undefined;
   }
 
   /**
@@ -91,11 +134,23 @@ export class MemoryEventTransport implements MarketEventTransport {
     return (this.#streams.get(stream) ?? []).map((stored) => stored.envelope);
   }
 
-  publish(
+  async publish(
     stream: EventStreamName,
     envelope: EventEnvelope<unknown>,
   ): Promise<PublishReceipt> {
+    this.#publishCalls += 1;
     this.#beforePublish?.(envelope);
+    const stall = this.#stallGate;
+    if (stall !== undefined) {
+      await stall.promise;
+    }
+    return this.#publishNow(stream, envelope);
+  }
+
+  #publishNow(
+    stream: EventStreamName,
+    envelope: EventEnvelope<unknown>,
+  ): Promise<PublishReceipt> {
     if (this.#closed) {
       return Promise.reject(new EventBusStateError("the transport is closed"));
     }
@@ -144,6 +199,7 @@ export class MemoryEventTransport implements MarketEventTransport {
   subscribe<TPayload = unknown>(
     options: SubscribeOptions,
   ): Promise<EventSubscription<TPayload>> {
+    this.#subscribeCalls += 1;
     const events = () => this.#streams.get(options.stream) ?? [];
     let position = 0;
     const subscription: EventSubscription<TPayload> = {

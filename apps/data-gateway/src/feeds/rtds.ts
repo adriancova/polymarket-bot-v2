@@ -1,18 +1,38 @@
 /**
  * RTDS TWAP feed driver: the gateway's ownership of the WP-100 adapter.
  *
- * ## The gap is unrecoverable, and the gateway must not wait for a snapshot
+ * ## The gap is unrecoverable, so the feed HALTS — really halts
  *
  * `feed.openGap.recoverableFromVenue === false` is a type-level fact: RTDS
  * publishes no replay and Chainlink's own report endpoint needs credentials
- * this platform may not hold. On a gap this driver HALTS the feed's data
- * quality claim — a PAGE `DataQualityIncidentOpened` naming
- * `RTDS_UNRECOVERABLE_GAP` — and then clears the adapter's gap state with
- * `acknowledgeUnobservedInterval`. THE ACKNOWLEDGEMENT IS NEVER AN
- * AUTHORITATIVE RESYNC (WP-100 review condition DV1): no `FeedResynchronized`
- * exists on this feed, none is synthesized here, and the incident stays open
- * in the registry — downstream TWAP consumers must halt per ADR-009 §6, and
- * the recorded stream says so.
+ * this platform may not hold. On such a gap this driver:
+ *
+ * 1. opens a PAGE `DataQualityIncidentOpened` naming `RTDS_UNRECOVERABLE_GAP`;
+ * 2. clears the adapter's gap state with `acknowledgeUnobservedInterval` —
+ *    THE ACKNOWLEDGEMENT IS NEVER AN AUTHORITATIVE RESYNC (WP-100 review
+ *    condition DV1): no `FeedResynchronized` exists on this feed, none is
+ *    synthesized here, and the incident stays open in the registry;
+ * 3. **TERMINALLY HALTS NORMALIZED PUBLICATION FOR THIS FEED AND EPOCH.**
+ *
+ * Step 3 was missing in round 1 (review finding H4): the driver said "halt",
+ * opened the incident, cleared the gap — and then kept publishing
+ * `ReferenceTwapObserved` as if nothing had happened. A downstream TWAP
+ * consumer is required to halt (ADR-009 §6), but a consumer that missed the
+ * incident and watched only the data stream saw an unbroken series across a
+ * permanently unobserved interval. Post-gap observations are now counted and
+ * suppressed instead.
+ *
+ * What KEEPS flowing after the halt, deliberately:
+ *
+ * - **raw WAL recording**, untouched — the evidence is the point of the
+ *   recorder, and the frames are still real venue bytes (§9.1);
+ * - **feed-health events and incidents**, so the halt is visible in the very
+ *   stream an operator reads to diagnose it.
+ *
+ * The halt is for the epoch, like the publication halt in `publisher.ts`, and
+ * for the same reason: resuming mid-epoch would hand consumers a series whose
+ * continuity they cannot check. A restart mints a new epoch and a new
+ * first-observation mark, which is the §7.1 path.
  *
  * ## Both interval fields mean "coverage broke here"
  *
@@ -86,6 +106,10 @@ export interface RtdsFeedDriverMetrics {
   readonly transportObservations: number;
   readonly problemsRouted: number;
   readonly stallsObserved: number;
+  /** True once an unrecoverable gap halted normalized publication (H4). */
+  readonly halted: boolean;
+  /** Observations recorded raw but NOT published, because the feed is halted. */
+  readonly observationsSuppressedAfterGap: number;
 }
 
 interface CurrentRawFrame {
@@ -111,6 +135,8 @@ export class RtdsFeedDriver {
   #transportObservations = 0;
   #problemsRouted = 0;
   #stallsObserved = 0;
+  #halted = false;
+  #observationsSuppressedAfterGap = 0;
 
   constructor(options: RtdsFeedDriverOptions) {
     this.#options = options;
@@ -118,6 +144,11 @@ export class RtdsFeedDriver {
 
   bind(feed: RtdsTwapFeed): void {
     this.#feed = feed;
+  }
+
+  /** True once an unrecoverable gap terminally halted normalized publication. */
+  get halted(): boolean {
+    return this.#halted;
   }
 
   /** The feed's `onRawFrame` handler: WAL first, always. */
@@ -157,7 +188,18 @@ export class RtdsFeedDriver {
         // incident is already open; the suppression is counted there.
         return;
       }
+      // Quality judgement runs even while halted: coverage breaks, freshness
+      // failures, and the first-observation signals are DIAGNOSTICS, and an
+      // operator diagnosing a halted feed needs them more, not less.
       this.#handleObservationQuality(event);
+      if (this.#halted) {
+        // Review H4: the feed is halted on a permanently unobserved interval.
+        // The frame is already in the WAL (replay keeps every byte) and the
+        // diagnostics above still fire; what must NOT happen is a normalized
+        // TWAP series that looks continuous across a gap no venue can fill.
+        this.#observationsSuppressedAfterGap += 1;
+        return;
+      }
       const symbol = event.payload.symbol.toLowerCase();
       if (!this.#options.plannedSymbols.has(symbol)) {
         // The venue delivers every symbol on a multi-symbol subscription; the
@@ -321,11 +363,15 @@ export class RtdsFeedDriver {
     if ((gap.recoverableFromVenue as boolean) !== false) {
       return;
     }
+    // TERMINAL, and set BEFORE anything else: the incident's own dispatch and
+    // the acknowledgement both run through code that could deliver another
+    // observation, and none of them may find the feed still publishing.
+    this.#halted = true;
     this.#options.dispatcher.openIncident({
       scope: this.#options.feedId,
       reasonCode: "RTDS_UNRECOVERABLE_GAP",
       severity: "PAGE",
-      detail: `TWAP stream gap at generation ${String(gap.subscriptionGeneration)} (${gap.unrecoverableReason}); no venue-side recovery exists — the interval is permanently unobserved and TWAP-dependent consumers must halt (ADR-009 §6)`,
+      detail: `TWAP stream gap at generation ${String(gap.subscriptionGeneration)} (${gap.unrecoverableReason}); no venue-side recovery exists — the interval is permanently unobserved, this gateway has HALTED normalized RTDS publication for the rest of this epoch (raw recording continues), and TWAP-dependent consumers must halt (ADR-009 §6). Recovery is a process restart, which mints a new epoch.`,
       feedId: this.#options.feedId,
     });
     // Clears the adapter's gap state. NOT a resynchronization: no
@@ -356,6 +402,8 @@ export class RtdsFeedDriver {
       transportObservations: this.#transportObservations,
       problemsRouted: this.#problemsRouted,
       stallsObserved: this.#stallsObserved,
+      halted: this.#halted,
+      observationsSuppressedAfterGap: this.#observationsSuppressedAfterGap,
     };
   }
 }

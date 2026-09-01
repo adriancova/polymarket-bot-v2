@@ -26,8 +26,18 @@ export { IngestSequencer } from "./sequencer.js";
 export { ConnectionIdFactory } from "./connection-ids.js";
 export { GatewayJournal } from "./journal.js";
 export type { RawFrameInput, RecordOutcome } from "./journal.js";
-export { GatewayPublisher } from "./publisher.js";
-export type { GatewayPublisherMetrics, PublicationHalt, PublishOutcome } from "./publisher.js";
+export {
+  DEFAULT_PUBLISH_QUEUE_MAX_BYTES,
+  DEFAULT_PUBLISH_QUEUE_MAX_DEPTH,
+  GatewayPublisher,
+} from "./publisher.js";
+export type {
+  GatewayPublisherMetrics,
+  PublicationHalt,
+  PublicationHaltCause,
+  PublishOutcome,
+} from "./publisher.js";
+export { UnavailableEventTransport } from "./unavailable-transport.js";
 export { GatewayDispatcher } from "./dispatcher.js";
 export type { DispatcherMetrics, DispatcherObserver } from "./dispatcher.js";
 export { IncidentRegistry, GATEWAY_INTERNAL_CHANNEL } from "./incidents.js";

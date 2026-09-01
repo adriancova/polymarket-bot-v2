@@ -101,6 +101,19 @@ describe("obligation 2 — the recorded frame carries the identity of the socket
     second.open();
     await harness.settle();
 
+    // The LIVE socket delivers an ordinary frame, so the test has both
+    // generations on disk to compare.
+    harness.clock.advance(10);
+    second.deliver(
+      coinbaseTradesSnapshot({
+        productId: "BTC-USD",
+        sequenceNum: 1,
+        atIso: new Date(harness.clock.nowMs()).toISOString(),
+        tradeId: "live-trade",
+      }),
+    );
+    await harness.settle();
+
     // The DEAD socket delivers a late frame.
     harness.clock.advance(10);
     const lateIso = new Date(harness.clock.nowMs()).toISOString();
@@ -129,6 +142,47 @@ describe("obligation 2 — the recorded frame carries the identity of the socket
     // Recorded under the retired socket's identity, never the live one.
     expect(lateFrame?.connectionId).toBe(`${COINBASE_CONFIG.coinbase.feedId}-c1`);
     expect(lateFrame?.connectionId).not.toBe(`${COINBASE_CONFIG.coinbase.feedId}-c2`);
+
+    // ROUND-1 REVIEW M1: the GENERATION has to travel with the connection id.
+    // Round 1 captured the id by closure but read the generation from the
+    // manager's current metrics at delivery, so this frame was recorded at
+    // generation 1 — c2's — describing c1's bytes with c2's provenance, which
+    // is the exact relabelling `subscriptionGeneration` exists to prevent.
+    // c1 opened first, so its generation is 0; c2's is 1.
+    expect(lateFrame?.subscriptionGeneration).toBe(0);
+    const liveFrames = frames.filter(
+      (frame) => frame.connectionId === `${COINBASE_CONFIG.coinbase.feedId}-c2`,
+    );
+    expect(liveFrames.length).toBeGreaterThan(0);
+    for (const frame of liveFrames) {
+      expect(frame.subscriptionGeneration).toBe(1);
+    }
+    // Every frame here arrived on an adopted socket, so no frame needed the
+    // pre-adoption placeholder.
+    expect(harness.gateway.metrics().coinbase?.framesWithoutEstablishedProvenance).toBe(0);
+  });
+
+  it("records the manager's OWN connection id and generation, not a counted guess", async () => {
+    const harness = await buildHarness({ config: { ...COINBASE_CONFIG } });
+    harness.gateway.start();
+    const socket = harness.coinbaseSockets.current;
+    socket.open();
+    await harness.settle();
+    const atIso = new Date(harness.clock.nowMs()).toISOString();
+    socket.deliver(coinbaseTradesSnapshot({ productId: "BTC-USD", sequenceNum: 1, atIso }));
+    await harness.settle();
+
+    const trades = harness.publishedOfType("ReferenceTradeObserved");
+    expect(trades).toHaveLength(1);
+
+    await harness.gateway.stop();
+    const frames = recordedFrames(harness.walFileSystem, harness.gateway.gatewayEpoch);
+    expect(frames).toHaveLength(1);
+    // The raw record and the event agree on BOTH provenance fields, because
+    // the record's came from the manager rather than from a parallel count.
+    expect(frames[0]?.connectionId).toBe(trades[0]?.connectionId);
+    expect(frames[0]?.subscriptionGeneration).toBe(trades[0]?.subscriptionGeneration);
+    expect(frames[0]?.subscriptionGeneration).toBe(0);
   });
 });
 
