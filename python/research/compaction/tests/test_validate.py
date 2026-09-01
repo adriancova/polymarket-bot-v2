@@ -5,6 +5,10 @@ from __future__ import annotations
 import errno as errno_module
 import hashlib
 import json
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -946,6 +950,363 @@ class TestManifestParsing:
         )
         assert main(["--manifest", str(manifest_path)]) == 2  # structured, no traceback
         assert "manifest error" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Round-4 remediation: nullability pins (M-A), path-hostile keys and
+# encoding-safe rendering (M-B), object-state classification (L-A).
+# ---------------------------------------------------------------------------
+
+#: The committed fixture, written by the real TypeScript compactor: eighteen
+#: REQUIRED columns and one OPTIONAL (`exclusionReason`) — the ground truth
+#: for the REQUIRED direction of the nullability reconciliation, which the
+#: DuckDB-writing synthetic builder cannot produce (it emits every column
+#: OPTIONAL, NOT NULL constraints notwithstanding).
+FIXTURE_MANIFEST = (
+    Path(__file__).resolve().parent.parent
+    / "testdata"
+    / "datasets"
+    / "ds-fixture"
+    / "manifest.json"
+)
+
+#: The directory `python -m research.compaction` resolves from.
+PYTHON_ROOT = Path(__file__).resolve().parents[3]
+
+requires_fixture = pytest.mark.skipif(
+    not FIXTURE_MANIFEST.is_file(),
+    reason=(
+        "committed fixture is absent; regenerate it with "
+        "`pnpm --filter @polymarket-bot/research-worker fixture:python`"
+    ),
+)
+
+
+def copy_fixture(tmp_path: Path) -> Path:
+    """A mutable copy of the committed fixture; returns its manifest path."""
+    target = tmp_path / "datasets" / "ds-fixture"
+    shutil.copytree(FIXTURE_MANIFEST.parent, target)
+    return target / "manifest.json"
+
+
+def run_real_cli(manifest_path: Path) -> subprocess.CompletedProcess[str]:
+    """The genuine subprocess CLI, not a StringIO capture.
+
+    Round-4 M-B only reproduced through a real process: a StringIO capture
+    never encodes, so an output-encoding detonation is invisible to `main()`
+    tests. `PYTHONIOENCODING=utf-8` pins the strict-UTF-8 stream the reviewer
+    hit, so this test means the same thing on any machine.
+    """
+    return subprocess.run(  # noqa: S603 - fixed argv, our own module
+        [sys.executable, "-m", "research.compaction", "--manifest", str(manifest_path)],
+        capture_output=True,
+        text=True,
+        errors="backslashreplace",
+        cwd=PYTHON_ROOT,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        timeout=120,
+    )
+
+
+@requires_fixture
+def test_a_nullability_pin_of_true_over_a_required_column_is_a_finding(
+    tmp_path: Path,
+) -> None:
+    # Reviewer probe (round 4, M-A), the flip direction the real compactor's
+    # output can witness: the fixture pins segmentId nullable:false and its
+    # objects declare the column REQUIRED; a manifest claiming nullable:true
+    # (refreshed sidecar and all) previously validated ok=True because only
+    # name and physical type were compared.
+    manifest_path = copy_fixture(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["columns"][1].update({"nullable": True}),
+    )
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    finding = next(f for f in report.findings if f.check == "layout-column-nullability")
+    assert finding.details["objectKey"]
+    [mismatch] = finding.details["mismatches"]
+    assert mismatch["column"] == "segmentId"
+    assert mismatch["pinnedNullable"] is True
+    assert mismatch["observedRepetition"] == "REQUIRED"
+
+
+@requires_fixture
+def test_a_nullability_pin_of_false_over_an_optional_column_is_a_finding(
+    tmp_path: Path,
+) -> None:
+    # The other direction, on the same real-writer object: exclusionReason is
+    # genuinely OPTIONAL, and a pin of false must not validate over it.
+    manifest_path = copy_fixture(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["columns"][18].update({"nullable": False}),
+    )
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    finding = next(f for f in report.findings if f.check == "layout-column-nullability")
+    [mismatch] = finding.details["mismatches"]
+    assert mismatch["column"] == "exclusionReason"
+    assert mismatch["pinnedNullable"] is False
+    assert mismatch["observedRepetition"] == "OPTIONAL"
+
+
+def test_a_nullability_pin_of_false_over_a_duckdb_written_object_is_a_finding(
+    tmp_path: Path,
+) -> None:
+    # The synthetic builder's objects are OPTIONAL throughout (DuckDB's
+    # writer), so its manifests honestly pin nullable:true; forging false must
+    # be caught without the committed fixture in the loop.
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["columns"][1].update({"nullable": False}),
+    )
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    assert "layout-column-nullability" in checks(report)
+
+
+def test_a_nullability_flip_fails_the_cli_cleanly(tmp_path: Path, capsys) -> None:
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["columns"][1].update({"nullable": False}),
+    )
+    assert main(["--manifest", str(manifest_path)]) == 1
+    assert "layout-column-nullability" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        pytest.param("false", id="string-false"),
+        pytest.param({"bizarre": True}, id="bizarre-object"),
+        pytest.param(1, id="integer-one"),
+        pytest.param(None, id="null"),
+    ],
+)
+def test_a_non_boolean_nullable_pin_is_refused(tmp_path: Path, forged) -> None:
+    # Reviewer probes (round 4, M-A): nullable "false" (string) and
+    # {"bizarre": true} previously validated green through bool(...) coercion.
+    # The parser's contract is shape (the round-3 segmentFileSha256 choice):
+    # a non-boolean is a ManifestError, never a truthiness guess.
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["columns"][1].update({"nullable": forged}),
+    )
+    with pytest.raises(ManifestError, match="expected a boolean"):
+        validate_dataset(manifest_path)
+
+
+def test_a_non_boolean_nullable_pin_exits_two_at_the_cli(tmp_path: Path, capsys) -> None:
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["columns"][1].update({"nullable": "false"}),
+    )
+    assert main(["--manifest", str(manifest_path)]) == 2
+    assert "manifest error" in capsys.readouterr().err
+
+
+def test_a_surrogate_object_key_is_refused(tmp_path: Path, capsys) -> None:
+    # Reviewer probe (round 4, M-B): an object key parsed from an escaped
+    # unpaired surrogate ("\ud800" in the manifest JSON) previously became an
+    # object-present finding and then detonated the real CLI's output encoder
+    # (exit 3, UnicodeEncodeError). Such a key cannot be encoded to UTF-8, so
+    # no store — and no TypeScript writer — can ever hold the object it
+    # names: it is a manifest shape, refused as ManifestError.
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["objects"][0].update({"objectKey": "datasets/ds-test/\ud800.parquet"}),
+    )
+    with pytest.raises(ManifestError, match="unpaired surrogate"):
+        validate_dataset(manifest_path)
+    assert main(["--manifest", str(manifest_path)]) == 2
+    assert "manifest error" in capsys.readouterr().err
+
+
+def test_a_surrogate_object_key_exits_two_through_the_real_cli(tmp_path: Path) -> None:
+    # The probe's own reproduction path, pinned: StringIO capture showed exit
+    # 1 while the real subprocess died with exit 3 — so this asserts through
+    # a genuine subprocess, where the output encoder actually runs.
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["objects"][0].update({"objectKey": "datasets/ds-test/\ud800.parquet"}),
+    )
+    result = run_real_cli(manifest_path)
+    assert result.returncode == 2, result.stderr
+    assert "manifest error" in result.stderr
+    assert "unexpected error" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    [
+        (
+            "segmentId",
+            lambda doc: doc["segments"][0].update({"segmentId": "seg-\ud800"}),
+        ),
+        (
+            "gatewayEpoch",
+            lambda doc: doc["segments"][0].update({"gatewayEpoch": "\ud800" + EPOCH[1:]}),
+        ),
+        (
+            "incidentId",
+            lambda doc: doc["excludedIncidentWindows"][0]["window"].update(
+                {"incidentId": "inc-\udfff"}
+            ),
+        ),
+        (
+            "datasetId",
+            lambda doc: doc.update({"datasetId": "ds-\ud800"}),
+        ),
+        (
+            "incident reason",
+            lambda doc: doc["excludedIncidentWindows"][0]["window"].update(
+                {"reason": "gap \ud800 gap"}
+            ),
+        ),
+    ],
+)
+def test_every_hostile_manifest_string_field_is_refused(
+    tmp_path: Path, label: str, mutate
+) -> None:
+    # M-B sibling sweep: every string the manifest parser accepts flows into
+    # finding messages, details, or paths, so the unpaired-surrogate refusal
+    # holds for all of them, not only object keys.
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(manifest_path, mutate)
+    with pytest.raises(ManifestError, match="unpaired surrogate"):
+        validate_dataset(manifest_path)
+
+
+def test_an_object_key_with_a_nul_byte_is_refused(tmp_path: Path) -> None:
+    manifest_path = build_dataset(tmp_path)
+    rewrite_manifest(
+        manifest_path,
+        lambda doc: doc["objects"][0].update({"objectKey": "datasets/ds\x00test/x.parquet"}),
+    )
+    with pytest.raises(ManifestError, match="NUL"):
+        validate_dataset(manifest_path)
+
+
+def test_a_hostile_receipt_field_renders_as_a_finding_through_the_real_cli(
+    tmp_path: Path,
+) -> None:
+    # M-B half (b), pinned where it matters: the retention receipt is NOT
+    # parsed by the manifest parser (malformed receipts are findings, not
+    # refusals), so a hostile receipt field is content a finding must carry.
+    # Rendering is encoding-safe (backslashreplace), so the real CLI reports
+    # the specific finding at exit 1 — never the exit-3 backstop.
+    manifest_path = build_dataset(tmp_path, retention_policy="delete-after-verified-upload")
+    receipt_path = manifest_path.parent / "retention-receipt.json"
+    document = json.loads(receipt_path.read_text(encoding="utf-8"))
+    document["deletedSegments"][0]["segmentId"] = "seg-\ud800-hostile"
+    receipt_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    result = run_real_cli(manifest_path)
+    assert result.returncode == 1, result.stderr
+    assert "unexpected error" not in result.stderr
+    assert "retention-receipt" in result.stdout
+    # The hostile character is carried as its escape, not dropped.
+    assert "\\ud800" in result.stdout
+
+
+def test_render_safe_escapes_what_no_stream_can_encode() -> None:
+    from research.compaction.validate import _render_safe
+
+    assert _render_safe("plain ascii") == "plain ascii"
+    assert _render_safe("x\ud800y") == "x\\ud800y"
+    # Ordinary non-ASCII text is passed through untouched.
+    assert _render_safe("emoji \U0001f600") == "emoji \U0001f600"
+
+
+def _chmod_after_hash(validate_module, victim: Path):
+    """A `_sha256_file` wrapper that drops the object's permissions post-hash."""
+    real_sha = validate_module._sha256_file
+
+    def wrapper(path: Path) -> str:
+        digest = real_sha(path)
+        if path == victim:
+            path.chmod(0)
+        return digest
+
+    return wrapper
+
+
+def test_an_object_unreadable_at_decode_time_is_object_read_not_object_parquet(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Reviewer probe (round 4, L-A): chmod 000 AFTER check 1 hashed the object
+    # but before the DuckDB decode. DuckDB reported "Permission denied" and
+    # the pre-remediation validator classified it object-parquet — a decode
+    # verdict about a file the OS never let it read. A permission failure is
+    # object-read wherever it is observed.
+    require_read_denial(tmp_path)
+    import research.compaction.validate as validate_module
+
+    manifest_path = build_dataset(tmp_path)
+    victim = tmp_path / load_manifest(manifest_path).objects[0].object_key
+    monkeypatch.setattr(
+        validate_module, "_sha256_file", _chmod_after_hash(validate_module, victim)
+    )
+    try:
+        report = validate_dataset(manifest_path)  # must not raise
+    finally:
+        victim.chmod(0o600)
+    assert not report.ok
+    assert "object-parquet" not in checks(report)
+    finding = next(f for f in report.findings if f.check == "object-read")
+    assert finding.details["errno"] == errno_module.EACCES
+    # Degraded: the specific finding is the story, not partial-total noise.
+    assert {f.check for f in report.errors} == {"object-read"}
+
+
+def test_a_directory_at_a_pinned_object_path_is_a_distinct_finding(tmp_path: Path) -> None:
+    # Reviewer probe (round 4, L-A): a directory at the pinned path was
+    # reported as "missing" (object-present) and buried under SIX derivative
+    # count/ordinal/incident findings, because non-file objects never entered
+    # the degraded comparison.
+    manifest_path = build_dataset(tmp_path)
+    victim = tmp_path / load_manifest(manifest_path).objects[0].object_key
+    victim.unlink()
+    victim.mkdir()
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    finding = next(f for f in report.findings if f.check == "object-not-a-file")
+    assert finding.details["observed"] == "directory"
+    # The derivative noise is suppressed; the classification is the story.
+    assert {f.check for f in report.errors} == {"object-not-a-file"}
+
+
+def test_a_dangling_symlink_at_a_pinned_object_path_is_a_distinct_finding(
+    tmp_path: Path,
+) -> None:
+    manifest_path = build_dataset(tmp_path)
+    victim = tmp_path / load_manifest(manifest_path).objects[0].object_key
+    victim.unlink()
+    victim.symlink_to(tmp_path / "nowhere")
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    finding = next(f for f in report.findings if f.check == "object-not-a-file")
+    assert finding.details["observed"] == "dangling-symlink"
+    assert {f.check for f in report.errors} == {"object-not-a-file"}
+
+
+def test_a_missing_object_suppresses_the_derivative_findings(tmp_path: Path) -> None:
+    # L-A's third leg: a genuinely missing object keeps its object-present
+    # class but must set the degraded state like every other unavailable
+    # object — previously the totals ran against the partial dataset and
+    # buried the finding under arithmetic noise.
+    manifest_path = build_dataset(tmp_path)
+    (tmp_path / load_manifest(manifest_path).objects[0].object_key).unlink()
+    report = validate_dataset(manifest_path)
+    assert not report.ok
+    assert {f.check for f in report.errors} == {"object-present"}
 
 
 class TestCli:

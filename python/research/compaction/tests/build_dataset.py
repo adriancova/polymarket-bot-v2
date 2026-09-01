@@ -23,25 +23,33 @@ import duckdb
 
 from research.compaction.validate import canonical_frame_line
 
+# The manifest's `nullable` pin is a claim about the object's Parquet schema
+# (repetition REQUIRED/OPTIONAL), and the round-4 validator reconciles the
+# claim against the file. DuckDB's Parquet writer emits **every** column as
+# OPTIONAL — even columns declared NOT NULL — so the honest pin for this
+# builder's objects is `nullable: true` throughout. The REQUIRED direction is
+# covered by the committed `testdata/` fixture, written by the real TypeScript
+# compactor, whose eighteen non-nullable columns are REQUIRED. Tests forging a
+# nullability pin flip one of these through `rewrite_manifest`.
 _COLUMNS = [
-    ("datasetRowOrdinal", "INT64", False),
-    ("segmentId", "BYTE_ARRAY_UTF8", False),
-    ("segmentIndex", "INT64", False),
-    ("segmentRecordIndex", "INT64", False),
-    ("gatewayEpoch", "BYTE_ARRAY_UTF8", False),
-    ("ingestSeq", "BYTE_ARRAY_UTF8", False),
-    ("source", "BYTE_ARRAY_UTF8", False),
-    ("endpoint", "BYTE_ARRAY_UTF8", False),
-    ("connectionId", "BYTE_ARRAY_UTF8", False),
-    ("subscriptionGeneration", "INT64", False),
-    ("receivedAt", "BYTE_ARRAY_UTF8", False),
-    ("receivedMonotonicNs", "BYTE_ARRAY_UTF8", False),
-    ("payloadUtf8", "BYTE_ARRAY_UTF8", False),
-    ("payloadSha256", "BYTE_ARRAY_UTF8", False),
-    ("frameLineByteOffset", "INT64", False),
-    ("frameLineByteLength", "INT64", False),
-    ("frameLineSha256", "BYTE_ARRAY_UTF8", False),
-    ("replayEligible", "BOOLEAN", False),
+    ("datasetRowOrdinal", "INT64", True),
+    ("segmentId", "BYTE_ARRAY_UTF8", True),
+    ("segmentIndex", "INT64", True),
+    ("segmentRecordIndex", "INT64", True),
+    ("gatewayEpoch", "BYTE_ARRAY_UTF8", True),
+    ("ingestSeq", "BYTE_ARRAY_UTF8", True),
+    ("source", "BYTE_ARRAY_UTF8", True),
+    ("endpoint", "BYTE_ARRAY_UTF8", True),
+    ("connectionId", "BYTE_ARRAY_UTF8", True),
+    ("subscriptionGeneration", "INT64", True),
+    ("receivedAt", "BYTE_ARRAY_UTF8", True),
+    ("receivedMonotonicNs", "BYTE_ARRAY_UTF8", True),
+    ("payloadUtf8", "BYTE_ARRAY_UTF8", True),
+    ("payloadSha256", "BYTE_ARRAY_UTF8", True),
+    ("frameLineByteOffset", "INT64", True),
+    ("frameLineByteLength", "INT64", True),
+    ("frameLineSha256", "BYTE_ARRAY_UTF8", True),
+    ("replayEligible", "BOOLEAN", True),
     ("exclusionReason", "BYTE_ARRAY_UTF8", True),
 ]
 

@@ -150,9 +150,34 @@ def _require_int(value: Any, where: str) -> int:
     return value
 
 
+def _require_bool(value: Any, where: str) -> bool:
+    # An actual JSON boolean — not a string "false", not an object, not 0/1.
+    # The parser's contract is shape (round 3's segmentFileSha256 choice):
+    # a truthiness coercion here let `"false"` and `{"bizarre": true}` pins
+    # validate green in round 4's review, which is a shape this build must
+    # refuse, not reinterpret.
+    if not isinstance(value, bool):
+        raise ManifestError(f"{where}: expected a boolean")
+    return value
+
+
 def _require_str(value: Any, where: str) -> str:
     if not isinstance(value, str):
         raise ManifestError(f"{where}: expected a string")
+    # A parsed JSON string can carry an unpaired surrogate (an escaped
+    # "\ud800" in the document), which cannot be encoded back to UTF-8: it
+    # detonates any path operation or output stream that touches it. The
+    # TypeScript writer can never produce such a string — every manifest
+    # string is built from filesystem/config text Node decodes with U+FFFD
+    # replacement (see the round-4 handoff citation) — so it is a shape this
+    # build refuses, like every other malformed required field.
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ManifestError(
+            f"{where}: string contains an unpaired surrogate and cannot be "
+            "encoded to UTF-8"
+        ) from error
     return value
 
 
@@ -196,7 +221,7 @@ def parse_manifest(document: Any) -> DatasetManifest:
         return (
             _require_str(_require(column, "name", "column"), "name"),
             _require_str(_require(column, "physicalType", "column"), "physicalType"),
-            bool(_require(column, "nullable", "column")),
+            _require_bool(_require(column, "nullable", "column"), "nullable"),
         )
 
     columns = tuple(

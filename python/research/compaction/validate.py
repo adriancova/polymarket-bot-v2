@@ -12,8 +12,13 @@ The checks, and what each one would catch:
 1. **Object presence, length and SHA-256.** Bit rot, a truncated upload, or a
    manifest pinning an object that was never written. An object the process
    cannot even open — permissions, I/O failure — is the finding
-   ``object-read``, naming the object and the errno; it is then excluded from
-   every query-based check, whose absence would only restate the same failure.
+   ``object-read``, naming the object and the errno (wherever the denial is
+   observed, the DuckDB decode step included); a pinned path holding
+   something other than a regular file — a directory, a dangling symlink —
+   is ``object-not-a-file``, naming what was found. Every unavailable pinned
+   object is then excluded from the query-based checks **and** marks the
+   dataset degraded, so the totals and row-level checks are skipped instead
+   of restating the same failure as partial-dataset arithmetic.
 1b. **The manifest's own digest sidecar.** ``manifest.sha256`` next to the
    manifest must exist, be readable, be 64 lowercase hex, and match the
    SHA-256 of the manifest's actual bytes — four distinct finding classes
@@ -28,9 +33,12 @@ The checks, and what each one would catch:
    *value* is deliberately not re-verified here: it describes the WAL segment
    file at deletion time, and after retention that file no longer exists to
    hash. The validator checks presence and grammar, and carries the value.
-2. **Layout.** Column names, order, and DuckDB's inferred types against the
-   pinned column list. Catches a writer that changed the schema without bumping
-   ``parquetLayoutVersion``.
+2. **Layout.** Column names, order, DuckDB's inferred types, and each
+   column's **nullability** (the pinned ``nullable`` against the file's
+   actual Parquet repetition, ``REQUIRED``/``OPTIONAL``) against the pinned
+   column list. Catches a writer that changed the schema without bumping
+   ``parquetLayoutVersion``, and a manifest whose nullability pins contradict
+   the object (``layout-column-nullability``).
 3. **Row counts, per object and in total**, against ``recordCounts`` and each
    object's ``rowCount``. Catches a dropped page or a mis-stated count.
 4. **Ordinal integrity.** ``datasetRowOrdinal`` is unique and forms the dense
@@ -89,6 +97,7 @@ unforeseen, never a substitute for a specific finding where a class exists.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import re
@@ -249,7 +258,13 @@ def _sha256_file(path: Path) -> str:
 def _object_path(object_root: Path, object_key: str) -> Path:
     # Object keys are store-relative and never absolute or traversing; the
     # compactor enforces that when it writes them. Re-checking here keeps a
-    # hand-edited manifest from reading an arbitrary file.
+    # hand-edited manifest from reading an arbitrary file. A NUL byte is
+    # path-hostile the same way (the parser already refuses the unencodable
+    # kind — unpaired surrogates — for every manifest string): no filesystem
+    # accepts it, and the TypeScript writer builds keys only from
+    # filename/config text that cannot contain one.
+    if "\x00" in object_key:
+        raise ManifestError(f"object key {object_key!r} contains a NUL byte")
     if object_key.startswith("/") or ".." in Path(object_key).parts:
         raise ManifestError(f"object key {object_key!r} is not store-relative")
     return object_root / object_key
@@ -260,30 +275,69 @@ def _check_objects(
 ) -> tuple[list[Path], list[Path]]:
     """Check 1: every pinned object exists with the pinned length and digest.
 
-    Returns ``(present, hashable)``: the objects that exist, and the subset
-    the process could actually stat/open/hash. An object the process cannot
-    read — permissions dropped, an I/O error mid-read — is the finding
-    ``object-read``, naming the object and the errno, **per object**: round-3
-    review chmod-000'd a pinned object and the pre-remediation validator
-    escaped with a raw ``PermissionError`` traceback, through ``main()``,
-    contradicting the findings-not-raises contract. An unreadable object is
-    excluded from every DuckDB-based check below (each would only re-raise the
-    same failure under a misleading name) and from the dataset totals, exactly
-    like an undecodable one.
+    Returns ``(present, hashable)``: the objects that exist as regular files,
+    and the subset the process could actually stat/open/hash. An object the
+    process cannot read — permissions dropped, an I/O error mid-read — is the
+    finding ``object-read``, naming the object and the errno, **per object**:
+    round-3 review chmod-000'd a pinned object and the pre-remediation
+    validator escaped with a raw ``PermissionError`` traceback, through
+    ``main()``, contradicting the findings-not-raises contract. An unreadable
+    object is excluded from every DuckDB-based check below (each would only
+    re-raise the same failure under a misleading name) and from the dataset
+    totals, exactly like an undecodable one.
+
+    Three distinct unavailable states, three distinct classes (round-4 L-A: a
+    directory at a pinned path was reported as "missing" and then buried under
+    derivative count/ordinal noise):
+
+    - nothing at the path at all → ``object-present`` (missing);
+    - something at the path that is not a regular file — a directory, a
+      dangling symlink, a device — → ``object-not-a-file``, naming what was
+      actually observed;
+    - a regular file the process cannot read → ``object-read``.
+
+    Every one of them makes the dataset *degraded* in :func:`validate_dataset`
+    — its rows are unobservable, so the dataset-level totals and the row-level
+    checks are skipped rather than reported against a partial dataset.
     """
     present: list[Path] = []
     hashable: list[Path] = []
     for entry in manifest.objects:
         path = _object_path(object_root, entry.object_key)
         if not path.is_file():
-            findings.append(
-                ValidationFinding(
-                    check="object-present",
-                    severity="error",
-                    message=f"pinned object is missing: {entry.object_key}",
-                    details={"objectKey": entry.object_key, "path": str(path)},
+            if path.is_dir():
+                observed_state = "directory"
+            elif path.exists():
+                observed_state = "not-a-regular-file"
+            elif path.is_symlink():
+                observed_state = "dangling-symlink"
+            else:
+                observed_state = None
+            if observed_state is not None:
+                findings.append(
+                    ValidationFinding(
+                        check="object-not-a-file",
+                        severity="error",
+                        message=(
+                            f"pinned object path is not a regular file "
+                            f"({observed_state}): {entry.object_key}"
+                        ),
+                        details={
+                            "objectKey": entry.object_key,
+                            "path": str(path),
+                            "observed": observed_state,
+                        },
+                    )
                 )
-            )
+            else:
+                findings.append(
+                    ValidationFinding(
+                        check="object-present",
+                        severity="error",
+                        message=f"pinned object is missing: {entry.object_key}",
+                        details={"objectKey": entry.object_key, "path": str(path)},
+                    )
+                )
             continue
         present.append(path)
         try:
@@ -450,6 +504,14 @@ def _check_objects_decode(
     not even read (``object-read``) is skipped outright: probing it with
     DuckDB would repeat the OS failure under the misleading name
     ``object-parquet``.
+
+    Classification is decided on **what actually failed**, not on which layer
+    reported it: DuckDB wraps an OS permission failure in its own
+    ``IOException`` ("Cannot open file … Permission denied"), and round-4
+    review dropped an object's permissions *after* check 1 hashed it — the
+    pre-remediation validator reported ``object-parquet`` for a file whose
+    bytes it had just proven readable and well-pinned. A permission failure is
+    ``object-read`` wherever it is observed.
     """
     readable: list[Path] = []
     for entry in manifest.objects:
@@ -461,26 +523,62 @@ def _check_objects_decode(
                 "select count(*) from read_parquet($path)", {"path": str(path)}
             ).fetchone()
         except duckdb.Error as error:
-            findings.append(
-                ValidationFinding(
-                    check="object-parquet",
-                    severity="error",
-                    message=f"pinned object does not decode as Parquet: {entry.object_key}",
-                    details={"objectKey": entry.object_key, "error": str(error)},
+            if _is_permission_denied(error):
+                findings.append(
+                    ValidationFinding(
+                        check="object-read",
+                        severity="error",
+                        message=f"pinned object could not be read: {entry.object_key}",
+                        details={
+                            "objectKey": entry.object_key,
+                            "path": str(path),
+                            "errno": errno.EACCES,
+                            "error": str(error),
+                        },
+                    )
                 )
-            )
+            else:
+                findings.append(
+                    ValidationFinding(
+                        check="object-parquet",
+                        severity="error",
+                        message=f"pinned object does not decode as Parquet: {entry.object_key}",
+                        details={"objectKey": entry.object_key, "error": str(error)},
+                    )
+                )
             continue
         readable.append(path)
     return readable
 
 
+def _is_permission_denied(error: duckdb.Error) -> bool:
+    """True when a DuckDB failure is the OS denying the read, not bad bytes."""
+    return isinstance(error, duckdb.IOException) and "Permission denied" in str(error)
+
+
 def _check_layout(
     connection: duckdb.DuckDBPyConnection,
     manifest: DatasetManifest,
+    object_root: Path,
     paths: Sequence[Path],
     findings: list[ValidationFinding],
 ) -> None:
-    """Check 2: the file's columns are the pinned ones, in the pinned order."""
+    """Check 2: the file's columns are the pinned ones, in the pinned order —
+    including each column's **nullability**.
+
+    The pin's third field, ``nullable``, is a statement about the object's
+    Parquet schema: the TypeScript writer maps it one-to-one onto the schema
+    element's repetition (``parquet-object.ts`` passes ``column.nullable`` to
+    the writer, which emits ``OPTIONAL`` for ``true`` and ``REQUIRED`` for
+    ``false`` — observable in the committed fixture, whose eighteen
+    non-nullable columns are ``REQUIRED`` and whose one nullable column,
+    ``exclusionReason``, is ``OPTIONAL``). Round-4 review flipped a pin and
+    the pre-remediation validator compared only name and physical type, so a
+    manifest could claim any nullability over any object. The pin is now
+    reconciled against each object's actual repetition metadata (DuckDB's
+    ``parquet_schema``); a disagreement in **either direction** is the finding
+    ``layout-column-nullability``.
+    """
     if manifest.parquet_layout_id != PARQUET_LAYOUT_ID:
         findings.append(
             ValidationFinding(
@@ -552,6 +650,64 @@ def _check_layout(
                 details={"expected": expected, "observed": observed},
             )
         )
+        # With the names/types already wrong, a per-column nullability
+        # comparison would be noise about a layout the finding above says is
+        # not the pinned one at all.
+        return
+
+    _check_layout_nullability(connection, manifest, object_root, paths, findings)
+
+
+def _check_layout_nullability(
+    connection: duckdb.DuckDBPyConnection,
+    manifest: DatasetManifest,
+    object_root: Path,
+    paths: Sequence[Path],
+    findings: list[ValidationFinding],
+) -> None:
+    """The pinned ``nullable`` against each object's actual repetition."""
+    path_set = frozenset(paths)
+    pinned_nullable = {name: nullable for name, _type, nullable in manifest.columns}
+    for entry in manifest.objects:
+        path = _object_path(object_root, entry.object_key)
+        if path not in path_set:
+            continue
+        # Leaf schema elements only (num_children is null): for this flat
+        # layout those are exactly the columns, in schema order.
+        leaves = connection.execute(
+            """
+            select name, repetition_type from parquet_schema($path)
+            where num_children is null
+            """,
+            {"path": str(path)},
+        ).fetchall()
+        mismatches: list[dict[str, Any]] = []
+        for name, repetition in leaves:
+            nullable = pinned_nullable.get(name)
+            if nullable is None:
+                continue  # an unknown column is `layout-columns`' story
+            pinned_repetition = "OPTIONAL" if nullable else "REQUIRED"
+            if repetition != pinned_repetition:
+                mismatches.append(
+                    {
+                        "column": name,
+                        "pinnedNullable": nullable,
+                        "pinnedRepetition": pinned_repetition,
+                        "observedRepetition": repetition,
+                    }
+                )
+        if mismatches:
+            findings.append(
+                ValidationFinding(
+                    check="layout-column-nullability",
+                    severity="error",
+                    message=(
+                        "pinned column nullability contradicts the object's "
+                        f"Parquet schema: {entry.object_key}"
+                    ),
+                    details={"objectKey": entry.object_key, "mismatches": mismatches},
+                )
+            )
 
 
 def _check_counts(
@@ -1475,15 +1631,19 @@ def validate_dataset(
         readable = _check_objects_decode(
             connection, manifest, root, findings, hashable=frozenset(hashable)
         )
-        # True when any present object was unreadable (check 1) or did not
-        # decode (check 1d): its rows are unobservable, so the dataset-level
-        # totals and the row-level checks would only bury the real finding.
-        degraded = len(readable) < len(present)
+        # True when ANY pinned object is unavailable — missing, not a regular
+        # file, unreadable (check 1), or undecodable (check 1d): its rows are
+        # unobservable, so the dataset-level totals and the row-level checks
+        # would only bury the real finding under partial-dataset arithmetic.
+        # Round-4 review found the earlier `readable < present` comparison let
+        # a missing or non-regular object (never in `present`) leak six
+        # derivative count/ordinal/incident findings.
+        degraded = len(readable) < len(manifest.objects)
         if readable:
             _run_guarded(
                 findings,
                 "layout",
-                lambda: _check_layout(connection, manifest, readable, findings),
+                lambda: _check_layout(connection, manifest, root, readable, findings),
             )
         counted = _run_guarded(
             findings,
@@ -1536,6 +1696,40 @@ def validate_dataset(
     )
 
 
+def _render_safe(text: str) -> str:
+    """Text that any output stream can encode, whatever the text contains.
+
+    A finding *names* what it found, so hostile artifact content — for
+    example a string a hostile JSON document smuggled in — can end up inside a
+    finding message. Rendering must never detonate on it: round-4 review put
+    an escaped unpaired surrogate in a manifest and the real CLI died with
+    ``UnicodeEncodeError`` *while printing the finding*, exit 3 — the backstop
+    substituting for a known class, which the contract forbids. Unencodable
+    characters are rendered as their ``\\uXXXX`` escapes (``backslashreplace``)
+    instead. The parser now refuses that particular manifest shape outright;
+    this is the defense in depth that keeps every *future* finding printable.
+    """
+    return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def _reconfigure_output_streams() -> None:
+    """Second belt: make the real CLI's streams themselves encoding-safe.
+
+    ``_render_safe`` guarantees UTF-8-encodable output; if the process's
+    stdout is narrower than UTF-8 (a C-locale pipe), the stream still has to
+    carry whatever the findings contain, so its error handler is switched to
+    ``backslashreplace`` where the stream supports it (a captured ``StringIO``
+    does not, and never encodes anyway).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="backslashreplace")
+            except (OSError, ValueError):  # pragma: no cover - stream refused
+                pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point.
 
@@ -1550,6 +1744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     finding and exit 1.
     """
     try:
+        _reconfigure_output_streams()
         parser = argparse.ArgumentParser(
             prog="research.compaction",
             description=(
@@ -1571,13 +1766,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             report = validate_dataset(arguments.manifest, arguments.object_root)
         except ManifestError as error:
-            print(f"manifest error: {error}", file=sys.stderr)
+            print(_render_safe(f"manifest error: {error}"), file=sys.stderr)
             return 2
 
         if arguments.json:
-            print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+            # `ensure_ascii` (the default) escapes every non-ASCII code point,
+            # unpaired surrogates included, so this line is printable as-is;
+            # `_render_safe` is applied anyway so no future serializer change
+            # can quietly reopen the rendering hole.
+            print(_render_safe(json.dumps(report.to_dict(), indent=2, sort_keys=True)))
         else:
-            print(f"dataset {report.dataset_id}")
+            print(_render_safe(f"dataset {report.dataset_id}"))
             print(f"  objects checked: {report.objects_checked}")
             print(f"  rows checked:    {report.rows_checked}")
             if report.ok:
@@ -1585,13 +1784,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 print(f"  result:          {len(report.errors)} error(s)")
                 for finding in report.findings:
-                    print(f"    [{finding.severity}] {finding.check}: {finding.message}")
+                    print(
+                        _render_safe(
+                            f"    [{finding.severity}] {finding.check}: {finding.message}"
+                        )
+                    )
                     if finding.details:
-                        print(f"      {json.dumps(finding.details, sort_keys=True)}")
+                        print(
+                            _render_safe(
+                                f"      {json.dumps(finding.details, sort_keys=True)}"
+                            )
+                        )
 
         return 0 if report.ok else 1
     except Exception as error:  # noqa: BLE001 - the CLI's last defensive boundary
-        print(f"unexpected error ({type(error).__name__}): {error}", file=sys.stderr)
+        print(
+            _render_safe(f"unexpected error ({type(error).__name__}): {error}"),
+            file=sys.stderr,
+        )
         return 3
 
 
