@@ -241,57 +241,78 @@ export class DataGateway {
       },
     });
 
-    const publisher = new GatewayPublisher({
-      transport: ports.transport,
-      stream: config.streamName,
-      clock: ports.clock,
-      maxQueueDepth: config.publisher.maxQueueDepth,
-      maxQueueBytes: config.publisher.maxQueueBytes,
-      onPublishRejected: (rejection) => {
-        // Informational only: the halt that follows is what an operator acts
-        // on, and it arrives through `onPublicationHalted` below. Round 1 wired
-        // NOTHING here, so a non-outage rejection was invisible (review H3).
-        observer.onPublishRejected?.(rejection);
-      },
-      onPublicationHalted: (halt) => {
-        observer.onPublicationHalted?.(halt);
-        // §8.3: a critical queue that cannot accept an event opens an
-        // incident. The incident's own publication is suppressed while
-        // halted; the observer callback above is the delivery that works.
-        late.dispatcher?.openIncident({
-          scope: "transport",
-          reasonCode: PUBLICATION_HALT_REASON_CODES[halt.cause],
-          severity: "PAGE",
-          detail: `publication halted at ingestSeq ${halt.haltedAtIngestSeq}: ${halt.detail}; the WAL keeps recording`,
-        });
-      },
-    });
+    // R3-H1: `create()` is transactional over what IT acquires. The journal
+    // above is the one real resource this method opens (an open WAL writer);
+    // everything below is in-memory construction — but `#buildFeeds()` (run
+    // by the constructor) throws on a configured feed whose port is missing,
+    // and `planSubscriptions` throws on contradictory plans. If anything
+    // after the journal opened throws, the journal is closed before the error
+    // escapes, so a caller that sees `create()` reject holds NO acquired
+    // resource. Ownership of the journal transfers to the constructed gateway
+    // exactly at `new DataGateway(...)` returning (its `stop()` closes it),
+    // so this close cannot double with the gateway's own. `journal.close()`
+    // is non-rejecting by contract (every writer operation runs on the serial
+    // chain, which converts failures into the fault state), so the original
+    // error is the one the caller sees. NOTE: the transport in `ports` is the
+    // CALLER's to release when `create()` rejects — this method never
+    // connected it and closing borrowed resources would break single
+    // ownership (`run.ts` is that caller in the real process).
+    try {
+      const publisher = new GatewayPublisher({
+        transport: ports.transport,
+        stream: config.streamName,
+        clock: ports.clock,
+        maxQueueDepth: config.publisher.maxQueueDepth,
+        maxQueueBytes: config.publisher.maxQueueBytes,
+        onPublishRejected: (rejection) => {
+          // Informational only: the halt that follows is what an operator acts
+          // on, and it arrives through `onPublicationHalted` below. Round 1 wired
+          // NOTHING here, so a non-outage rejection was invisible (review H3).
+          observer.onPublishRejected?.(rejection);
+        },
+        onPublicationHalted: (halt) => {
+          observer.onPublicationHalted?.(halt);
+          // §8.3: a critical queue that cannot accept an event opens an
+          // incident. The incident's own publication is suppressed while
+          // halted; the observer callback above is the delivery that works.
+          late.dispatcher?.openIncident({
+            scope: "transport",
+            reasonCode: PUBLICATION_HALT_REASON_CODES[halt.cause],
+            severity: "PAGE",
+            detail: `publication halted at ingestSeq ${halt.haltedAtIngestSeq}: ${halt.detail}; the WAL keeps recording`,
+          });
+        },
+      });
 
-    const dispatcher = new GatewayDispatcher({
-      clock: ports.clock,
-      ids: ports.ids,
-      sequencer,
-      publisher,
-      incidents: new IncidentRegistry(),
-      observer,
-    });
-    late.dispatcher = dispatcher;
+      const dispatcher = new GatewayDispatcher({
+        clock: ports.clock,
+        ids: ports.ids,
+        sequencer,
+        publisher,
+        incidents: new IncidentRegistry(),
+        observer,
+      });
+      late.dispatcher = dispatcher;
 
-    const directory =
-      config.polymarket === undefined
-        ? undefined
-        : new UniverseMarketDirectory(config.markets, ports.clock);
+      const directory =
+        config.polymarket === undefined
+          ? undefined
+          : new UniverseMarketDirectory(config.markets, ports.clock);
 
-    return new DataGateway({
-      config,
-      ports,
-      sequencer,
-      journal,
-      publisher,
-      dispatcher,
-      plan: planSubscriptions(config),
-      directory,
-    });
+      return new DataGateway({
+        config,
+        ports,
+        sequencer,
+        journal,
+        publisher,
+        dispatcher,
+        plan: planSubscriptions(config),
+        directory,
+      });
+    } catch (error) {
+      await journal.close();
+      throw error;
+    }
   }
 
   #buildFeeds(): void {

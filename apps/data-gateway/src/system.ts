@@ -2,7 +2,10 @@
  * The only module in this app that touches a runtime global.
  *
  * Everything else takes its clock, timers, and identifier source as a port
- * (`./ports.ts`); `main.ts` is the only importer of this module. That is the
+ * (`./ports.ts`); the only importers of this module are the composition
+ * roots — `main.ts` and the dev-only R3-H1 subprocess probe entry
+ * (`./testing/fatal-startup-probe-entry.ts`), which exists precisely to run
+ * `main.ts`'s sequence on the real system ports. That is the
  * same discipline every upstream package keeps (`runtime.ts` in
  * `polymarket-public`, `node-runtime.ts` in `coinbase-adapter`,
  * `node-file-system.ts` in `storage-wal`), and it is what keeps the whole

@@ -5,7 +5,9 @@
  * counter, identifier minting, timers — arrives through a port, exactly as the
  * adapters and the WAL demand of their callers (§12.1, §12.4). `system.ts`
  * holds the only implementations that touch a runtime global, and nothing in
- * this app imports it except `main.ts`.
+ * this app imports it except the composition roots (`main.ts` and the
+ * dev-only subprocess probe entry under `./testing`) and the deterministic
+ * doubles' shared `uuidV7At` helper.
  *
  * The adapters' own ports (`PublicMarketClock`, `WalClock`, the Coinbase
  * `Timer`/`WallClock`/`MonotonicClock`, the Binance `ReceiptStamp` source) are

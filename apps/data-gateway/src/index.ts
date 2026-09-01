@@ -9,7 +9,8 @@
  * unauthenticated, and the configuration schema cannot represent
  * authentication material (`./config.ts`).
  *
- * `./system.ts` is the only impure module and only `./main.ts` imports it;
+ * `./system.ts` is the only impure module, imported only by the composition
+ * roots (`./main.ts` and the dev-only R3-H1 probe entry under `./testing`);
  * everything else is driven through injected ports (§12.4).
  */
 
