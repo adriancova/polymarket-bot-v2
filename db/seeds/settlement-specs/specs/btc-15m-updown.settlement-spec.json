@@ -1,0 +1,27 @@
+{
+  "seedFormatVersion": 1,
+  "status": "EXAMPLE_UNREVIEWED",
+  "notice": "EXAMPLE CONFIGURATION - NOT A REVIEWED SETTLEMENT SPEC. verification.status is UNVERIFIED and no reviewer is named, so this spec blocks model-dependent strategy activation (handoff section 9.2, WP-110 acceptance 3). The resolution source, observation type, and window below describe how such a series COULD settle; whether this Polymarket series settles that way is a venue fact this repository has not verified. A reviewer must establish it from the market's own rules text, record the rules version, and confirm the window against the feed's currently published windows before this spec may be marked verified.",
+  "settlementSpec": {
+    "settlementSpecId": "01936f00-0000-7000-8000-0000000025bd",
+    "seriesId": "01936f00-0000-7000-8000-0000000015bd",
+    "specVersion": 1,
+    "resolutionSource": "Chainlink TWAP published on the venue real-time data service (UNVERIFIED for this series; the reviewer must confirm the market rules name this source).",
+    "referenceSymbol": "btc.usd",
+    "observationType": "TWAP",
+    "windowSeconds": 30,
+    "windowStartRule": "Thirty seconds before the market close instant, exclusive of the start boundary.",
+    "windowEndRule": "The market close instant, inclusive.",
+    "comparison": "GT",
+    "referenceOpenSource": "The reference price published for the market open instant, used as the up/down strike.",
+    "timestampBoundary": "All boundaries are venue-published instants in UTC; the close instant is included in the window.",
+    "roundingRule": "No rounding: the feed's exact full-accuracy decimal value is compared as published.",
+    "fallbackSource": "None. If the primary observation is unavailable, halt the series and escalate to the operator; no substitute source is used and no value is interpolated.",
+    "disputePolicy": "Halt entries for the market, keep the position observable, and settle nothing while a dispute is open; a dispute is an in-flight process, not an outcome.",
+    "clarificationPolicy": "On any post-open clarification, halt entries for the series and require a fresh human review of this spec against the amended rules before the series resumes.",
+    "payoffModel": "ReferenceOpenUpDownModel",
+    "verification": {
+      "status": "UNVERIFIED"
+    }
+  }
+}

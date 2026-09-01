@@ -1,0 +1,17 @@
+{
+  "seedFormatVersion": 1,
+  "status": "EXAMPLE_UNREVIEWED",
+  "notice": "EXAMPLE CONFIGURATION - NOT A REVIEWED SERIES BINDING. binding.approved is false, so no market may be bound to this series for live trading until a human approves the binding (handoff section 9.2: series binding is configuration, not heuristic-only).",
+  "series": {
+    "seriesId": "01936f00-0000-7000-8000-0000000015bd",
+    "seriesKey": "btc-15m-updown",
+    "displayName": "BTC 15-minute up/down (example)",
+    "underlyingSymbol": "btc.usd",
+    "cadence": "PT15M",
+    "description": "Example rolling series used by the first strategy configuration in handoff section 13.2. Membership rules and settlement semantics are unreviewed.",
+    "binding": {
+      "approved": false
+    },
+    "active": true
+  }
+}

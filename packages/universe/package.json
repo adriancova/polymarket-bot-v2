@@ -3,15 +3,24 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Universe service (WP-110): market identity binding, configuration-driven series grouping, immutable versioned market-parameter history, market lifecycle projection, and per-market eligibility/readiness predicates. Pure layer-1 logic: no I/O, no clock, no venue call.",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./testing": "./src/testing/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*",
+    "zod": "^4.4.3"
+  },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "fast-check": "^4.9.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }
