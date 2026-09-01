@@ -14,7 +14,9 @@
  * `GatewayJournal.open` — spied here to hand back a close-counting fake.
  */
 
+import type { CoinbaseSocketFactory } from "@polymarket-bot/coinbase-adapter";
 import { FakeCoinbaseSocketFactory } from "@polymarket-bot/coinbase-adapter/testing";
+import type { MarketEventTransport } from "@polymarket-bot/event-bus";
 import { createMemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -117,5 +119,95 @@ describe("DataGateway.create() transactionality (R3-H1)", () => {
 
     await gateway.stop();
     expect(closes(), "double stop stays exactly-once").toBe(1);
+  });
+});
+
+/** A CONNECTED transport double whose `close()` calls are counted. */
+function countingTransport(): { transport: MarketEventTransport; closes: () => number } {
+  const inner = new MemoryEventTransport();
+  let closes = 0;
+  return {
+    closes: () => closes,
+    transport: {
+      transportId: inner.transportId,
+      retention: inner.retention,
+      publish: (stream, envelope) => inner.publish(stream, envelope),
+      subscribe: (options) => inner.subscribe(options),
+      streamMetrics: (stream) => inner.streamMetrics(stream),
+      close: async (): Promise<void> => {
+        closes += 1;
+        await inner.close();
+      },
+    },
+  };
+}
+
+describe("DataGateway.stop() per-resource disposal isolation (round 4)", () => {
+  it("still closes the journal and the transport when an earlier feed's socket close throws mid-stop", async () => {
+    // The round-4 item-2 probe: an already-started feed whose socket `close()`
+    // throws SYNCHRONOUSLY during `stop()`'s disposal sequence. Every one of
+    // the four feed teardowns ends in an unguarded `socket.close()`
+    // (`PublicMarketFeed`/`RtdsTwapFeed` via `#withSocket`, the Binance driver's
+    // `this.#socket?.close()`, `CoinbaseConnectionManager.stop()`'s
+    // `socket?.close()`), so this ordering is reachable IN-REPO with nothing
+    // contract-violating on the transport side. At `95c8aa9` the throw
+    // abandoned every later disposal — `settle()`, `journal.close()`, and
+    // `transport.close()` — leaving a connected transport referenced: the hang
+    // shape, reached from inside the repository's own lifecycle.
+    const { journal, closes: journalCloses } = closeCountingJournal();
+    vi.spyOn(GatewayJournal, "open").mockResolvedValue(journal);
+    const { transport, closes } = countingTransport();
+    const throwingCloseSocketFactory: CoinbaseSocketFactory = {
+      connect: () => ({
+        send: () => {
+          // Never exercised: the socket is torn down before any subscribe.
+        },
+        close: () => {
+          throw new Error("injected socket close failure");
+        },
+      }),
+    };
+
+    const config = parseGatewayConfig({
+      streamName: "market-events",
+      wal: { rootPath: "/wal" },
+      markets: [],
+      coinbase: { productIds: ["BTC-USD"] },
+    });
+    const gateway = await DataGateway.create(
+      config,
+      ports({ transport, coinbaseSocketFactory: throwingCloseSocketFactory }),
+    );
+    gateway.start();
+
+    let rejection: unknown;
+    await gateway.stop().then(
+      () => {
+        throw new Error("stop() must reject when a disposal failed, not swallow it");
+      },
+      (error: unknown) => {
+        rejection = error;
+      },
+    );
+
+    // Per-resource isolation: the failed feed disposal must not abandon the
+    // rest. Both remaining owned resources are released, exactly once each.
+    expect(
+      closes(),
+      "the transport must still be closed after an earlier feed disposal threw",
+    ).toBe(1);
+    expect(
+      journalCloses(),
+      "the WAL journal must still be closed after an earlier feed disposal threw",
+    ).toBe(1);
+    // The failure is collected and surfaced, naming the resource, not lost.
+    expect(rejection).toMatchObject({ code: "GATEWAY_DISPOSAL_FAILED" });
+    expect(String((rejection as Error).message)).toContain("coinbase-manager");
+    expect(String((rejection as Error).message)).toContain("injected socket close failure");
+
+    // Double stop stays exactly-once (the round-2 discipline, unchanged).
+    await gateway.stop();
+    expect(closes()).toBe(1);
+    expect(journalCloses()).toBe(1);
   });
 });

@@ -50,7 +50,7 @@ import { nodeWalFileSystem } from "@polymarket-bot/storage-wal";
 
 import { parseGatewayConfig } from "../config.js";
 import { GatewayConfigurationError } from "../errors.js";
-import { runGatewaySequence } from "../run.js";
+import { DEFAULT_CLEANUP_DEADLINE_MS, runGatewaySequence } from "../run.js";
 import {
   systemGatewayClock,
   systemGatewayIdSource,
@@ -70,6 +70,11 @@ const REFERENCED_HANDLE_INTERVAL_MS = 2_147_483_647;
  */
 function connectedReferencedTransport(): MarketEventTransport {
   const inner = new MemoryEventTransport();
+  // Round 4: `GATEWAY_PROBE_TRANSPORT_CLOSE=reject-holding-handle` models the
+  // round-4 finding's transport — `close()` REJECTS before releasing its
+  // referenced handle, so a failed cleanup leaves the handle alive. The
+  // default ("resolve") is the round-3 behavior, unchanged.
+  const closeMode = process.env["GATEWAY_PROBE_TRANSPORT_CLOSE"] ?? "resolve";
   // Deliberately NOT unref'd: this is the connected socket's stand-in.
   const handle = setInterval(() => {
     // The handle's existence, not this callback, is the point.
@@ -84,6 +89,9 @@ function connectedReferencedTransport(): MarketEventTransport {
     close: async (): Promise<void> => {
       closeCalls += 1;
       console.error(`[probe] transport.close() call ${String(closeCalls)}`);
+      if (closeMode === "reject-holding-handle") {
+        throw new Error("injected transport close rejection (handle still referenced)");
+      }
       clearInterval(handle);
       await inner.close();
     },
@@ -105,6 +113,10 @@ async function main(): Promise<void> {
     // CONNECTED — and owns a referenced handle until close().
     connectTransport: () => Promise.resolve(connectedReferencedTransport()),
     retentionEvents: 100_000,
+    // Round 4: same knob `main.ts` exposes, so the deadline tests run fast.
+    cleanupDeadlineMs: Number(
+      process.env["GATEWAY_CLEANUP_DEADLINE_MS"] ?? String(DEFAULT_CLEANUP_DEADLINE_MS),
+    ),
     ports: {
       clock: systemGatewayClock(),
       ids: systemGatewayIdSource(),
@@ -131,6 +143,16 @@ async function main(): Promise<void> {
       },
       setExitCode: (code) => {
         process.exitCode = code;
+      },
+      // Round 4: identical to `main.ts` — referenced timer, forced exit.
+      armCleanupDeadline: (delayMs, onExpiry) => {
+        const handle = setTimeout(onExpiry, delayMs);
+        return () => {
+          clearTimeout(handle);
+        };
+      },
+      forceExit: (code) => {
+        process.exit(code);
       },
     },
   });

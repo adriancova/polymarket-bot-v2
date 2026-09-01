@@ -20,7 +20,7 @@ import { FakeCoinbaseSocketFactory } from "@polymarket-bot/coinbase-adapter/test
 import type { CoinbaseSocketFactory } from "@polymarket-bot/coinbase-adapter";
 import type { MarketEventTransport } from "@polymarket-bot/event-bus";
 import { createMemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { parseGatewayConfig } from "./config.js";
 import { GatewayStateError } from "./errors.js";
@@ -48,20 +48,34 @@ const MARKET = {
   observedAt: "2026-08-30T12:00:00.000Z",
 } as const;
 
+/** One armed cleanup deadline, as the fake host recorded it (round 4). */
+interface RecordedDeadline {
+  readonly delayMs: number;
+  /** Simulates the referenced timer firing. */
+  readonly expire: () => void;
+  readonly cancelled: () => boolean;
+}
+
 interface RecordingHost extends GatewayHost {
   readonly lines: string[];
   readonly exitCodes: number[];
   readonly shutdownHandlers: Array<() => void>;
+  readonly deadlines: RecordedDeadline[];
+  readonly forcedExits: number[];
 }
 
 function recordingHost(): RecordingHost {
   const lines: string[] = [];
   const exitCodes: number[] = [];
   const shutdownHandlers: Array<() => void> = [];
+  const deadlines: RecordedDeadline[] = [];
+  const forcedExits: number[] = [];
   return {
     lines,
     exitCodes,
     shutdownHandlers,
+    deadlines,
+    forcedExits,
     logError: (line, detail) => {
       lines.push(detail === undefined ? line : `${line} :: ${String(detail)}`);
     },
@@ -71,11 +85,33 @@ function recordingHost(): RecordingHost {
     setExitCode: (code) => {
       exitCodes.push(code);
     },
+    armCleanupDeadline: (delayMs, onExpiry) => {
+      let cancelled = false;
+      deadlines.push({
+        delayMs,
+        expire: onExpiry,
+        cancelled: () => cancelled,
+      });
+      return () => {
+        cancelled = true;
+      };
+    },
+    forceExit: (code) => {
+      forcedExits.push(code);
+    },
   };
 }
 
-/** A CONNECTED transport double whose `close()` calls are counted. */
-function countingTransport(): { transport: MarketEventTransport; closes: () => number } {
+/**
+ * A CONNECTED transport double whose `close()` calls are counted.
+ *
+ * `closeRejects` models the round-4 finding's transport: `close()` rejects
+ * before releasing anything, standing where the reviewer's reference-owning
+ * probe put its handle-holding close.
+ */
+function countingTransport(
+  options: { readonly closeRejects?: boolean } = {},
+): { transport: MarketEventTransport; closes: () => number } {
   const inner = new MemoryEventTransport();
   let closes = 0;
   return {
@@ -84,10 +120,13 @@ function countingTransport(): { transport: MarketEventTransport; closes: () => n
       transportId: inner.transportId,
       retention: inner.retention,
       publish: (stream, envelope) => inner.publish(stream, envelope),
-      subscribe: (options) => inner.subscribe(options),
+      subscribe: (subscribeOptions) => inner.subscribe(subscribeOptions),
       streamMetrics: (stream) => inner.streamMetrics(stream),
       close: async (): Promise<void> => {
         closes += 1;
+        if (options.closeRejects === true) {
+          throw new Error("injected transport close rejection (handle still referenced)");
+        }
         await inner.close();
       },
     },
@@ -100,12 +139,16 @@ function baseOptions(args: {
   readonly host: GatewayHost;
   readonly lifetime: { acquired: number; released: number };
   readonly coinbaseSocketFactory?: CoinbaseSocketFactory;
+  readonly cleanupDeadlineMs?: number;
 }): GatewaySequenceOptions {
   const clock = new ManualGatewayClock();
   return {
     config: parseGatewayConfig(args.config),
     connectTransport: args.connectTransport,
     retentionEvents: 1_000,
+    ...(args.cleanupDeadlineMs === undefined
+      ? {}
+      : { cleanupDeadlineMs: args.cleanupDeadlineMs }),
     ports: {
       clock,
       ids: deterministicIdSource(),
@@ -248,5 +291,146 @@ describe("runGatewaySequence transactional startup (R3-H1)", () => {
     await gateway.stop();
     expect(closes()).toBe(1);
     expect(lifetime).toEqual({ acquired: 1, released: 1 });
+  });
+});
+
+describe("the cleanup hard-deadline (round 4)", () => {
+  it("a fatal cleanup whose transport close rejects leaves the deadline armed; its expiry logs and forces exit 1", async () => {
+    // The round-4 finding, in-process: at `95c8aa9` this cleanup failure was
+    // only logged and the original error rethrown to a handler that sets
+    // `process.exitCode = 1` — with the rejecting close still holding its
+    // referenced handle, that was the hang. The deadline is the fallback.
+    const host = recordingHost();
+    const lifetime = { acquired: 0, released: 0 };
+    const { transport, closes } = countingTransport({ closeRejects: true });
+    const options = baseOptions({
+      config: {
+        streamName: "market-events",
+        wal: { rootPath: "/wal" },
+        markets: [MARKET],
+        polymarket: { feedId: "pm-main" },
+      },
+      connectTransport: () => Promise.resolve(transport),
+      host,
+      lifetime,
+      cleanupDeadlineMs: 1_234,
+    });
+
+    // The ORIGINAL error still escapes — the cleanup failure never masks it.
+    await expect(runGatewaySequence(options)).rejects.toBeInstanceOf(GatewayStateError);
+
+    expect(closes(), "the close was attempted").toBe(1);
+    expect(host.lines.join("\n")).toContain("fatal-path transport close failed");
+    expect(host.deadlines, "the deadline was armed at cleanup entry").toHaveLength(1);
+    expect(host.deadlines[0]?.delayMs).toBe(1_234);
+    expect(
+      host.deadlines[0]?.cancelled(),
+      "a cleanup that FAILED must not clear its deadline — the handle may still be referenced",
+    ).toBe(false);
+    expect(host.forcedExits, "the deadline has not fired yet").toEqual([]);
+
+    // The referenced timer fires: the expiry logs and forces the exit.
+    host.deadlines[0]?.expire();
+    expect(host.forcedExits).toEqual([1]);
+    expect(host.lines.join("\n")).toContain("cleanup deadline");
+  });
+
+  it("a fatal cleanup that completes clears its deadline and forces nothing", async () => {
+    // Test (c), in-process: the deadline must be a fallback, not a tax on the
+    // clean fatal path — armed, then CLEARED, with no forced exit and no
+    // deadline log (the round-2 stray-referenced-timer lesson).
+    const host = recordingHost();
+    const lifetime = { acquired: 0, released: 0 };
+    const { transport, closes } = countingTransport();
+    const options = baseOptions({
+      config: {
+        streamName: "market-events",
+        wal: { rootPath: "/wal" },
+        markets: [MARKET],
+        polymarket: { feedId: "pm-main" },
+      },
+      connectTransport: () => Promise.resolve(transport),
+      host,
+      lifetime,
+    });
+
+    await expect(runGatewaySequence(options)).rejects.toBeInstanceOf(GatewayStateError);
+
+    expect(closes()).toBe(1);
+    expect(host.deadlines).toHaveLength(1);
+    expect(
+      host.deadlines[0]?.cancelled(),
+      "a completed cleanup must clear its deadline",
+    ).toBe(true);
+    expect(host.forcedExits).toEqual([]);
+    expect(host.lines.join("\n")).not.toContain("cleanup deadline");
+  });
+
+  it("the shutdown path arms the same deadline and clears it when stop() completes (exit code 0 untouched)", async () => {
+    const host = recordingHost();
+    const lifetime = { acquired: 0, released: 0 };
+    const { transport, closes } = countingTransport();
+    const options = baseOptions({
+      config: {
+        streamName: "market-events",
+        wal: { rootPath: "/wal" },
+        markets: [],
+        coinbase: { productIds: ["BTC-USD"] },
+      },
+      connectTransport: () => Promise.resolve(transport),
+      host,
+      lifetime,
+    });
+
+    await runGatewaySequence(options);
+    expect(host.deadlines, "no deadline exists while the gateway runs").toHaveLength(0);
+
+    host.shutdownHandlers[0]?.();
+    expect(host.deadlines, "the shutdown path arms the deadline at entry").toHaveLength(1);
+    await vi.waitFor(() => {
+      expect(host.exitCodes).toEqual([0]);
+    });
+    expect(closes()).toBe(1);
+    expect(
+      host.deadlines[0]?.cancelled(),
+      "a completed stop() must clear the shutdown deadline before the exit code is set",
+    ).toBe(true);
+    expect(host.forcedExits).toEqual([]);
+  });
+
+  it("a stop() that rejects during shutdown leaves the deadline armed; its expiry forces exit 1", async () => {
+    const host = recordingHost();
+    const lifetime = { acquired: 0, released: 0 };
+    const { transport, closes } = countingTransport({ closeRejects: true });
+    const options = baseOptions({
+      config: {
+        streamName: "market-events",
+        wal: { rootPath: "/wal" },
+        markets: [],
+        coinbase: { productIds: ["BTC-USD"] },
+      },
+      connectTransport: () => Promise.resolve(transport),
+      host,
+      lifetime,
+    });
+
+    await runGatewaySequence(options);
+    host.shutdownHandlers[0]?.();
+    await vi.waitFor(() => {
+      expect(host.exitCodes).toEqual([1]);
+    });
+
+    expect(closes(), "the close was attempted (stop() isolates disposals)").toBe(1);
+    // stop()'s per-resource isolation released everything else; the lifetime
+    // anchor is gone even though the transport close failed.
+    expect(lifetime).toEqual({ acquired: 1, released: 1 });
+    expect(host.lines.join("\n")).toContain("data-gateway: shutdown error");
+    expect(host.deadlines).toHaveLength(1);
+    expect(host.deadlines[0]?.cancelled(), "a failed stop() must not clear the deadline").toBe(
+      false,
+    );
+
+    host.deadlines[0]?.expire();
+    expect(host.forcedExits).toEqual([1]);
   });
 });

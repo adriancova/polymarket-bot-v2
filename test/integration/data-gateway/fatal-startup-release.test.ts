@@ -247,6 +247,104 @@ describe("fatal startup releases every acquired resource (R3-H1)", () => {
   );
 
   it(
+    "a transport whose close() REJECTS while holding its referenced handle: the cleanup deadline forces exit 1 (round 4)",
+    async () => {
+      // The round-4 finding: at `95c8aa9` a cleanup FAILURE was only logged
+      // and the original error rethrown to a handler that merely set
+      // `process.exitCode = 1` — no fallback exit existed. A transport whose
+      // `close()` rejects before releasing its referenced handle therefore
+      // produced the fatal log and then the ORIGINAL hang shape (timeout,
+      // exit 124). The fix: a REFERENCED hard-deadline timer armed at
+      // fatal-cleanup entry that forces a nonzero exit when cleanup does not
+      // complete, cleared only when cleanup succeeds.
+      const walRootFile = join(workDir, "wal-root-is-a-file");
+      await writeFile(walRootFile, "not a directory\n");
+      const configPath = join(workDir, "gateway.json");
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          streamName: "market-events",
+          wal: { rootPath: walRootFile, fsyncIntervalMs: 100 },
+          tickIntervalMs: 100,
+          markets: [],
+          coinbase: { productIds: ["BTC-USD"], endpoint: "wss://127.0.0.1:1" },
+        }),
+      );
+
+      const outcome = await runToExit(
+        probeBundlePath,
+        configPath,
+        {
+          GATEWAY_PROBE_TRANSPORT_CLOSE: "reject-holding-handle",
+          GATEWAY_CLEANUP_DEADLINE_MS: "1500",
+        },
+        15_000,
+        "round-4 regression: the fatal path with a rejecting, handle-holding transport " +
+          "close hung instead of exiting — no fallback exit deadline fired",
+      );
+
+      expect(outcome.stderr, "the cleanup failure itself must be logged").toContain(
+        "fatal-path transport close failed",
+      );
+      expect(outcome.stderr, "the deadline must announce the forced exit").toContain(
+        "cleanup deadline",
+      );
+      expect(outcome.stderr).toContain("data-gateway: fatal");
+      expect(outcome.code).toBe(1);
+      expect(outcome.signal).toBeNull();
+    },
+    30_000,
+  );
+
+  it(
+    "a clean fatal cleanup clears the deadline: exit 1 arrives well before the deadline with no deadline log (round 4)",
+    async () => {
+      // The round-2 lesson, applied to the new timer: the deadline is the one
+      // deliberately REFERENCED fallback, so a cleanup that completes must
+      // CLEAR it — a stray referenced deadline would hold the exiting process
+      // open until its expiry and then force-exit a process that had already
+      // finished its cleanup. Deadline 8 s, exit asserted well under it.
+      const walRootFile = join(workDir, "wal-root-is-a-file");
+      await writeFile(walRootFile, "not a directory\n");
+      const configPath = join(workDir, "gateway.json");
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          streamName: "market-events",
+          wal: { rootPath: walRootFile, fsyncIntervalMs: 100 },
+          tickIntervalMs: 100,
+          markets: [],
+          coinbase: { productIds: ["BTC-USD"], endpoint: "wss://127.0.0.1:1" },
+        }),
+      );
+
+      const startedAtMs = Date.now();
+      const outcome = await runToExit(
+        probeBundlePath,
+        configPath,
+        { GATEWAY_CLEANUP_DEADLINE_MS: "8000" },
+        15_000,
+        "round-4 regression: the clean fatal path hung instead of exiting",
+      );
+      const elapsedMs = Date.now() - startedAtMs;
+
+      expect(outcome.stderr).toContain(
+        "startup failed before the gateway existed; closing the event-bus transport",
+      );
+      expect(outcome.stderr, "a cleared deadline must never fire").not.toContain(
+        "cleanup deadline",
+      );
+      expect(outcome.code).toBe(1);
+      expect(outcome.signal).toBeNull();
+      expect(
+        elapsedMs,
+        "a cleared deadline must not hold the exiting process to its expiry",
+      ).toBeLessThan(6_000);
+    },
+    30_000,
+  );
+
+  it(
     "the REAL bundle's WAL-open fatal path runs the same cleanup and exits 1 promptly (unavailable-transport fallback)",
     async () => {
       // Closed loopback ports can only produce the fallback transport state,

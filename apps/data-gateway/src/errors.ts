@@ -30,7 +30,16 @@ export type GatewayErrorCode =
    */
   | "GATEWAY_PUBLICATION_HALTED"
   /** A completed envelope failed its frozen domain contract (ADR-002 §3/§5). */
-  | "GATEWAY_ENVELOPE_REJECTED";
+  | "GATEWAY_ENVELOPE_REJECTED"
+  /**
+   * One or more resource disposals failed during `stop()` (round 4).
+   *
+   * `stop()` isolates every disposal: each one is attempted, failures are
+   * collected here, and every remaining resource is still released. The error
+   * therefore reports what did NOT close cleanly — it never means a later
+   * disposal was skipped because an earlier one threw.
+   */
+  | "GATEWAY_DISPOSAL_FAILED";
 
 export class GatewayError extends Error {
   readonly code: GatewayErrorCode;
@@ -91,5 +100,41 @@ export class GatewayEnvelopeRejectedError extends GatewayError {
       details,
       cause === undefined ? {} : { cause },
     );
+  }
+}
+
+/** One failed disposal, named: which resource, and what it threw. */
+export interface DisposalFailure {
+  readonly resource: string;
+  readonly error: unknown;
+}
+
+/**
+ * `DataGateway.stop()` attempted every disposal and at least one failed.
+ *
+ * The message names each failed resource so an operator log line is complete
+ * on its own; `failures` carries the original errors; `cause` is the first
+ * one, preserving the established `{ cause }` idiom for aggregation.
+ */
+export class GatewayDisposalError extends GatewayError {
+  readonly failures: readonly DisposalFailure[];
+
+  constructor(failures: readonly DisposalFailure[]) {
+    const described = failures
+      .map(
+        (failure) =>
+          `${failure.resource}: ${
+            failure.error instanceof Error ? failure.error.message : String(failure.error)
+          }`,
+      )
+      .join("; ");
+    super(
+      "GATEWAY_DISPOSAL_FAILED",
+      `gateway stop(): ${String(failures.length)} resource disposal(s) failed (${described}); ` +
+        "every disposal was still attempted and the lifetime anchor was released",
+      { resources: failures.map((failure) => failure.resource) },
+      { cause: failures[0]?.error },
+    );
+    this.failures = failures;
   }
 }

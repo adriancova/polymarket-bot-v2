@@ -59,13 +59,14 @@ export type { CoinbaseFeedDriverMetrics } from "./feeds/coinbase.js";
 
 export {
   GatewayConfigurationError,
+  GatewayDisposalError,
   GatewayEnvelopeRejectedError,
   GatewayError,
   GatewayPublicationHaltedError,
   GatewayRecordingError,
   GatewayStateError,
 } from "./errors.js";
-export type { GatewayErrorCode } from "./errors.js";
+export type { DisposalFailure, GatewayErrorCode } from "./errors.js";
 
 export { isoFromMs, takeReceipt } from "./ports.js";
 export type {

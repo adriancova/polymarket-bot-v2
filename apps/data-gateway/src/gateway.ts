@@ -44,7 +44,8 @@ import { ConnectionIdFactory } from "./connection-ids.js";
 import { UniverseMarketDirectory, type UniverseDirectoryMetrics } from "./directory.js";
 import type { DispatcherMetrics, DispatcherObserver } from "./dispatcher.js";
 import { GatewayDispatcher } from "./dispatcher.js";
-import { GatewayStateError } from "./errors.js";
+import type { DisposalFailure } from "./errors.js";
+import { GatewayDisposalError, GatewayStateError } from "./errors.js";
 import type { BinanceFeedDriverMetrics } from "./feeds/binance.js";
 import { BinanceFeedDriver } from "./feeds/binance.js";
 import type { CoinbaseFeedDriverMetrics } from "./feeds/coinbase.js";
@@ -617,20 +618,56 @@ export class DataGateway {
     await this.#journal.settle();
   }
 
+  /**
+   * Stops everything, attempting EVERY disposal even when one fails (round 4).
+   *
+   * Before this round, the disposals below ran in one `try`: a feed whose
+   * socket `close()` threw synchronously — an in-repo ordering, since every
+   * feed teardown ends in an unguarded `socket.close()` — abandoned every
+   * later disposal, leaving the WAL journal open and the transport CONNECTED
+   * and referenced. On the fatal-startup and signal paths that referenced
+   * transport is exactly what wedges the "exiting" process.
+   *
+   * Per-resource isolation: each disposal is attempted, failures are
+   * collected, all resources are released, the lifetime anchor is released in
+   * the `finally`, and a single `GatewayDisposalError` naming every failed
+   * resource is thrown at the end (callers log it; the error never means a
+   * disposal was skipped).
+   */
   async stop(): Promise<void> {
     if (this.#state === "stopped") return;
     this.#state = "stopped";
+    const failures: DisposalFailure[] = [];
+    const attempt = (resource: string, dispose: () => void): void => {
+      try {
+        dispose();
+      } catch (error) {
+        failures.push({ resource, error });
+      }
+    };
+    const attemptAsync = async (
+      resource: string,
+      dispose: () => Promise<void>,
+    ): Promise<void> => {
+      try {
+        await dispose();
+      } catch (error) {
+        failures.push({ resource, error });
+      }
+    };
     try {
-      this.#cancelTick?.();
-      this.#cancelTick = undefined;
-      this.#polymarketDriver?.stop();
-      this.#polymarketFeed?.stop();
-      this.#rtdsFeed?.stop();
-      this.#binanceDriver?.stop();
-      this.#coinbaseManager?.stop();
-      await this.settle();
-      await this.#journal.close();
-      await this.#ports.transport.close();
+      attempt("gateway-tick", () => {
+        this.#cancelTick?.();
+        this.#cancelTick = undefined;
+      });
+      attempt("polymarket-driver", () => this.#polymarketDriver?.stop());
+      attempt("polymarket-feed", () => this.#polymarketFeed?.stop());
+      attempt("rtds-feed", () => this.#rtdsFeed?.stop());
+      attempt("binance-driver", () => this.#binanceDriver?.stop());
+      attempt("coinbase-manager", () => this.#coinbaseManager?.stop());
+      await attemptAsync("settle", () => this.settle());
+      await attemptAsync("wal-journal", () => this.#journal.close());
+      await attemptAsync("event-bus-transport", () => this.#ports.transport.close());
     } finally {
       // Released LAST, so the process stays referenced through the whole
       // shutdown sequence, and in a `finally`, so a failing close still lets
@@ -641,6 +678,9 @@ export class DataGateway {
       const release = this.#releaseLifetime;
       this.#releaseLifetime = undefined;
       release?.();
+    }
+    if (failures.length > 0) {
+      throw new GatewayDisposalError(failures);
     }
   }
 

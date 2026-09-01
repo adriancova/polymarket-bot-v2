@@ -17,6 +17,14 @@
  *                              ADR-003: a safety parameter, not a tuning knob —
  *                              size it against the worst tolerated trader
  *                              restart.
+ * - `GATEWAY_CLEANUP_DEADLINE_MS` (default 10000) hard deadline for both
+ *                              cleanup paths — fatal startup and signal
+ *                              shutdown (round 4, `run.ts` module header). If
+ *                              a resource's cleanup hangs or rejects while
+ *                              holding a referenced handle, the process
+ *                              force-exits nonzero when this expires instead
+ *                              of wedging. A safety parameter, not a tuning
+ *                              knob.
  *
  * ## Recording does not depend on the transport (§4.2, review H5)
  *
@@ -52,6 +60,17 @@
  * cannot record through (missing or invalid configuration, or a WAL that will
  * not open) makes it exit loudly, promptly, with a nonzero code.
  *
+ * ## The cleanup itself is deadline-guarded (round 4)
+ *
+ * Transactional release assumed the cleanup calls COMPLETE. A transport whose
+ * `close()` rejected before releasing its referenced handle produced the
+ * fatal log and then the original hang, because a cleanup failure was only
+ * logged and `process.exitCode = 1` moves nothing that is still referenced.
+ * Both cleanup paths (fatal startup and signal shutdown) now arm a REFERENCED
+ * hard-deadline timer (`GATEWAY_CLEANUP_DEADLINE_MS`, default 10 s) that
+ * forces `process.exit(1)` if cleanup does not complete, and is cleared when
+ * it does — see `run.ts` for the invariant and the both-paths decision.
+ *
  * Safety: this process reads no signer, wallet, or API key, submits no order,
  * and cannot be configured to. The repository defaults `MAX_RUN_MODE=PAPER`,
  * `ALLOW_REAL_ORDERS=false`, `LIVE_MICRO_MAX_ORDER_NOTIONAL=0`,
@@ -68,7 +87,7 @@ import { nodeWalFileSystem } from "@polymarket-bot/storage-wal";
 
 import { parseGatewayConfig } from "./config.js";
 import { GatewayConfigurationError } from "./errors.js";
-import { runGatewaySequence } from "./run.js";
+import { DEFAULT_CLEANUP_DEADLINE_MS, runGatewaySequence } from "./run.js";
 import {
   systemGatewayClock,
   systemGatewayIdSource,
@@ -87,9 +106,13 @@ async function main(): Promise<void> {
 
   const redisUrl = process.env["GATEWAY_REDIS_URL"] ?? "redis://127.0.0.1:6379";
   const retentionEvents = Number(process.env["GATEWAY_RETENTION_EVENTS"] ?? "100000");
+  const cleanupDeadlineMs = Number(
+    process.env["GATEWAY_CLEANUP_DEADLINE_MS"] ?? String(DEFAULT_CLEANUP_DEADLINE_MS),
+  );
 
   await runGatewaySequence({
     config,
+    cleanupDeadlineMs,
     connectTransport: () =>
       RedisStreamsEventTransport.connect({
         connection: { url: redisUrl },
@@ -150,6 +173,20 @@ async function main(): Promise<void> {
       setExitCode: (code) => {
         process.exitCode = code;
       },
+      // Round 4: the cleanup hard-deadline. Deliberately NOT unref'd — the
+      // second exception to the unref-everything policy, alongside the
+      // lifetime anchor (`run.ts` documents why the reference is the point).
+      armCleanupDeadline: (delayMs, onExpiry) => {
+        const handle = setTimeout(onExpiry, delayMs);
+        return () => {
+          clearTimeout(handle);
+        };
+      },
+      // Only a cleanup deadline's expiry reaches this: a cleanup that hung or
+      // failed holding a referenced handle cannot exit by draining the loop.
+      forceExit: (code) => {
+        process.exit(code);
+      },
     },
   });
 }
@@ -165,9 +202,13 @@ main().catch((error: unknown) => {
     return;
   }
   // R3-H1: by the time an error arrives here, `runGatewaySequence` has
-  // already released every resource startup acquired (transport, journal,
-  // lifetime anchor), so setting the exit code IS the exit: nothing
-  // referenced remains to hold the process open.
+  // already RUN the cleanup for every resource startup acquired (transport,
+  // journal, lifetime anchor). When that cleanup completed, nothing
+  // referenced remains and setting the exit code IS the exit. When it did
+  // not — a close that rejected or hung while holding its referenced handle
+  // (round 4) — the cleanup deadline armed inside the sequence is still
+  // running and forces exit 1 at its expiry, so this line is never the last
+  // word on a wedged process.
   console.error("data-gateway: fatal", error);
   process.exitCode = 1;
 });
