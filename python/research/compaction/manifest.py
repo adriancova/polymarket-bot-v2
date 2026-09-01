@@ -358,15 +358,92 @@ def parse_manifest(document: Any) -> DatasetManifest:
     )
 
 
+def decode_utf8(data: bytes, what: str) -> str:
+    """The document's bytes as text, or ``ManifestError`` naming the bad byte.
+
+    The TypeScript writer emits every JSON document as UTF-8
+    (``Buffer.from(JSON.stringify(...), "utf8")``), so bytes that do not
+    decode are corruption or forgery — a classifiable shape of the document
+    itself. Round-5 review put a raw ``0xFF`` byte in a manifest and the
+    ``UnicodeDecodeError`` out of ``read_text`` (not an ``OSError``) escaped
+    to the CLI's exit-3 backstop, which never substitutes for a known class.
+    """
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ManifestError(
+            f"{what} is not valid UTF-8: {error.reason} at byte offset {error.start}"
+        ) from error
+
+
+def _refuse_json_constant(token: str) -> Any:
+    # Python's json accepts NaN/Infinity/-Infinity as an extension, parsing
+    # them into floats. RFC 8259 JSON has no such literals and the writer's
+    # JSON.stringify can never emit them (it serializes non-finite numbers as
+    # null), so they are refused at parse — deterministically, rather than
+    # left to surface as a confusing per-field "expected an integer" or to
+    # slip through a position no shape gate consumes.
+    raise ValueError(f"JSON has no literal {token}")
+
+
+def _refuse_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    # Python's json — like JavaScript's JSON.parse — silently keeps the LAST
+    # value of a duplicated key. JSON.stringify of a JS object can never emit
+    # a duplicate key, and a document pinning two values under one name is
+    # not a coherent authority: whichever copy a reader adopts, the other
+    # pinned value vanishes without a finding (round-5 probe: a duplicated
+    # walRetentionPolicy flipped the effective policy and validated ok=True).
+    # An ambiguous shape, refused like every other shape this build cannot
+    # read.
+    document: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError(f"duplicate key {key!r} in a JSON object")
+        document[key] = value
+    return document
+
+
+def parse_strict_json(text: str, what: str) -> Any:
+    """``json.loads`` where every parse-level failure is ``ManifestError``.
+
+    Round-5 review reached the CLI's exit-3 backstop with documents the old
+    ``except json.JSONDecodeError`` did not classify: a JSON integer with
+    more digits than Python's int-conversion limit raises a plain
+    ``ValueError``, and pathological nesting raises ``RecursionError``. An
+    unparseable document is a *known* class — the caller's documented
+    refusal or finding — so **any** exception during the parse becomes
+    ``ManifestError`` carrying the parser's own message. Two non-standard
+    shapes Python's parser would otherwise accept are refused explicitly:
+    NaN/Infinity literals and duplicate object keys (rationales at the
+    hooks).
+    """
+    try:
+        return json.loads(
+            text,
+            parse_constant=_refuse_json_constant,
+            object_pairs_hook=_refuse_duplicate_keys,
+        )
+    except Exception as error:  # noqa: BLE001 — every parse failure is the document's
+        raise ManifestError(
+            f"{what} is not valid JSON ({type(error).__name__}): {error}"
+        ) from error
+
+
 def load_manifest(path: str | Path) -> DatasetManifest:
-    """Read and parse a manifest file."""
+    """Read and parse a manifest file.
+
+    Every failure of the manifest file *itself* — an unreadable file, bytes
+    that are not UTF-8, text that is not strict JSON — is ``ManifestError``,
+    the one documented refusal (exit 2 at the CLI). The read is explicit
+    bytes-then-decode-then-parse so that each boundary's failure is
+    classified where it happens, and none can fall through to the exit-3
+    backstop (round-5 findings F-1 and F-2).
+    """
     manifest_path = Path(path)
     try:
-        text = manifest_path.read_text(encoding="utf-8")
+        raw = manifest_path.read_bytes()
     except OSError as error:
         raise ManifestError(f"manifest {manifest_path} could not be read: {error}") from error
-    try:
-        document = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ManifestError(f"manifest {manifest_path} is not valid JSON: {error}") from error
+    text = decode_utf8(raw, f"manifest {manifest_path}")
+    document = parse_strict_json(text, f"manifest {manifest_path}")
     return parse_manifest(document)

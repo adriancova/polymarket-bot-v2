@@ -24,6 +24,7 @@ from .build_dataset import (
     default_rows,
     frame_line,
     incident_window,
+    replace,
     rewrite_manifest,
 )
 
@@ -1331,3 +1332,250 @@ class TestCli:
         payload = json.loads(capsys.readouterr().out)
         assert payload["ok"] is True
         assert payload["rowsChecked"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Round-5 remediation: the manifest LOADING boundary. F-1 (bytes that are not
+# UTF-8) and F-2 (a JSON integer beyond Python's int-conversion limit) both
+# reached the exit-3 backstop, though an unparseable manifest is the
+# documented ManifestError → exit 2 class; the same shapes escaped the
+# retention-receipt read (documented boundary: findings, never raises) and —
+# for F-2 — the duplicate-mark int() over Parquet row data. Kindred
+# parse-level shapes (RecursionError nesting, NaN/Infinity literals,
+# duplicate keys) are pinned alongside.
+# ---------------------------------------------------------------------------
+
+
+def _corrupt_utf8(path: Path, offset: int = 5) -> None:
+    """Insert a raw 0xFF byte — invalid in any UTF-8 stream — at ``offset``."""
+    data = path.read_bytes()
+    path.write_bytes(data[:offset] + b"\xff" + data[offset:])
+
+
+def test_a_manifest_with_invalid_utf8_bytes_is_refused(tmp_path: Path, capsys) -> None:
+    # Round-5 F-1, orchestrator-confirmed: a raw 0xFF byte in the manifest
+    # file previously escaped load_manifest as UnicodeDecodeError (read_text
+    # raises it past the OSError catch) → exit 3. The manifest's own bytes
+    # failing to decode is a manifest-shape failure: ManifestError, exit 2,
+    # naming the byte offset.
+    manifest_path = build_dataset(tmp_path)
+    _corrupt_utf8(manifest_path)
+    with pytest.raises(ManifestError, match="not valid UTF-8") as excinfo:
+        validate_dataset(manifest_path)
+    assert "byte offset 5" in str(excinfo.value)
+    assert main(["--manifest", str(manifest_path)]) == 2
+    assert "manifest error" in capsys.readouterr().err
+
+
+def test_a_manifest_with_invalid_utf8_bytes_exits_two_through_the_real_cli(
+    tmp_path: Path,
+) -> None:
+    # The finding's own reproduction path: the genuine subprocess CLI.
+    manifest_path = build_dataset(tmp_path)
+    _corrupt_utf8(manifest_path)
+    result = run_real_cli(manifest_path)
+    assert result.returncode == 2, result.stderr
+    assert "manifest error" in result.stderr
+    assert "unexpected error" not in result.stderr
+
+
+def test_a_manifest_integer_beyond_the_int_limit_is_refused(
+    tmp_path: Path, capsys
+) -> None:
+    # Round-5 F-2, orchestrator-confirmed: json.loads raises a plain
+    # ValueError (not JSONDecodeError) for a number with more digits than
+    # Python's int-conversion limit (4300 by default), which previously
+    # escaped to the exit-3 backstop. Any parse-level failure of the manifest
+    # is now ManifestError. (Only the class is asserted, not the message: on
+    # an interpreter configured with a higher limit the number parses and the
+    # version-shape refusal fires instead — the same class either way.)
+    manifest_path = build_dataset(tmp_path)
+    text = manifest_path.read_text(encoding="utf-8")
+    needle = '"datasetManifestVersion": 1'
+    assert needle in text
+    manifest_path.write_text(
+        text.replace(needle, '"datasetManifestVersion": ' + "1" * 5000),
+        encoding="utf-8",
+    )
+    with pytest.raises(ManifestError):
+        validate_dataset(manifest_path)
+    assert main(["--manifest", str(manifest_path)]) == 2
+    assert "manifest error" in capsys.readouterr().err
+
+
+def test_a_manifest_integer_beyond_the_int_limit_exits_two_through_the_real_cli(
+    tmp_path: Path,
+) -> None:
+    manifest_path = build_dataset(tmp_path)
+    text = manifest_path.read_text(encoding="utf-8")
+    manifest_path.write_text(
+        text.replace('"datasetManifestVersion": 1', '"datasetManifestVersion": ' + "1" * 5000),
+        encoding="utf-8",
+    )
+    result = run_real_cli(manifest_path)
+    assert result.returncode == 2, result.stderr
+    assert "manifest error" in result.stderr
+    assert "unexpected error" not in result.stderr
+
+
+def test_a_pathologically_nested_manifest_is_refused(tmp_path: Path, capsys) -> None:
+    # Kindred parse-level shape: nesting the JSON scanner cannot descend
+    # raises RecursionError, which previously escaped to the backstop the
+    # same way F-2's ValueError did. Any parse failure is the document's.
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        '{"datasetManifestFormatId": ' + "[" * 50_000 + "]" * 50_000 + "}",
+        encoding="utf-8",
+    )
+    with pytest.raises(ManifestError, match="not valid JSON"):
+        load_manifest(manifest_path)
+    assert main(["--manifest", str(manifest_path)]) == 2
+    assert "manifest error" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_a_nan_or_infinity_literal_in_the_manifest_is_refused(
+    tmp_path: Path, literal: str
+) -> None:
+    # Kindred parse-level shape: Python's json accepts NaN/Infinity as an
+    # extension, parsing them into floats. RFC 8259 JSON has no such
+    # literals and JSON.stringify can never emit them, so they are refused
+    # at parse — deterministically, not left to whichever per-field shape
+    # gate the float happens to land in.
+    manifest_path = build_dataset(tmp_path)
+    text = manifest_path.read_text(encoding="utf-8")
+    needle = '"segmentDeclared": 5'
+    assert needle in text
+    manifest_path.write_text(
+        text.replace(needle, f'"segmentDeclared": {literal}'), encoding="utf-8"
+    )
+    with pytest.raises(ManifestError, match="JSON has no literal"):
+        validate_dataset(manifest_path)
+
+
+@pytest.mark.parametrize(
+    ("label", "needle", "replacement"),
+    [
+        (
+            "top-level walRetentionPolicy",
+            '"walRetentionPolicy": "retain"',
+            '"walRetentionPolicy": "retain", '
+            '"walRetentionPolicy": "delete-after-verified-upload"',
+        ),
+        (
+            "nested recordCounts.written",
+            '"written": 5',
+            '"written": 5, "written": 4',
+        ),
+    ],
+)
+def test_a_duplicate_key_in_the_manifest_is_refused(
+    tmp_path: Path, label: str, needle: str, replacement: str
+) -> None:
+    # Kindred parse-level shape, probed at round 5: Python's json (like
+    # JSON.parse) silently keeps the LAST value of a duplicated key — a
+    # duplicated walRetentionPolicy flipped the effective policy and still
+    # validated ok=True with a refreshed sidecar. A manifest pinning two
+    # values under one name is not a coherent authority: ambiguous shape,
+    # refused.
+    manifest_path = build_dataset(tmp_path)
+    text = manifest_path.read_text(encoding="utf-8")
+    assert needle in text
+    manifest_path.write_text(text.replace(needle, replacement), encoding="utf-8")
+    with pytest.raises(ManifestError, match="duplicate key"):
+        validate_dataset(manifest_path)
+
+
+def test_an_undecodable_retention_receipt_is_a_finding(tmp_path: Path) -> None:
+    # Round-5 receipt sweep, F-1's shape: a raw 0xFF byte in the receipt
+    # raised UnicodeDecodeError past the old (OSError, JSONDecodeError)
+    # catch → exit 3. The receipt's documented boundary is findings, never
+    # raises; the strict loaders' refusal is downgraded to the
+    # retention-receipt class.
+    manifest_path = build_dataset(tmp_path, retention_policy="delete-after-verified-upload")
+    _corrupt_utf8(manifest_path.parent / "retention-receipt.json")
+    report = validate_dataset(manifest_path)  # must not raise
+    assert not report.ok
+    assert {f.check for f in report.errors} == {"retention-receipt"}
+    result = run_real_cli(manifest_path)
+    assert result.returncode == 1, result.stderr
+    assert "unexpected error" not in result.stderr
+    assert "retention-receipt" in result.stdout
+
+
+def test_a_receipt_integer_beyond_the_int_limit_is_a_finding(tmp_path: Path) -> None:
+    # Round-5 receipt sweep, F-2's shape.
+    manifest_path = build_dataset(tmp_path, retention_policy="delete-after-verified-upload")
+    receipt_path = manifest_path.parent / "retention-receipt.json"
+    text = receipt_path.read_text(encoding="utf-8")
+    needle = '"retentionReceiptVersion": 1'
+    assert needle in text
+    receipt_path.write_text(
+        text.replace(needle, '"retentionReceiptVersion": ' + "1" * 5000),
+        encoding="utf-8",
+    )
+    report = validate_dataset(manifest_path)  # must not raise
+    assert not report.ok
+    assert {f.check for f in report.errors} == {"retention-receipt"}
+    result = run_real_cli(manifest_path)
+    assert result.returncode == 1, result.stderr
+    assert "unexpected error" not in result.stderr
+    assert "retention-receipt" in result.stdout
+
+
+def test_a_duplicate_key_in_the_receipt_is_a_finding(tmp_path: Path) -> None:
+    # The kindred shapes flow through the same strict parser at the receipt
+    # boundary — where the documented outcome is the finding, not the
+    # refusal. Pinned so the two boundaries cannot drift together.
+    manifest_path = build_dataset(tmp_path, retention_policy="delete-after-verified-upload")
+    receipt_path = manifest_path.parent / "retention-receipt.json"
+    text = receipt_path.read_text(encoding="utf-8")
+    needle = '"retentionReceiptVersion": 1'
+    assert needle in text
+    receipt_path.write_text(
+        text.replace(needle, '"retentionReceiptVersion": 1, "retentionReceiptVersion": 2'),
+        encoding="utf-8",
+    )
+    report = validate_dataset(manifest_path)  # must not raise
+    assert not report.ok
+    assert {f.check for f in report.errors} == {"retention-receipt"}
+
+
+def test_an_undecodable_manifest_digest_sidecar_is_a_finding(
+    tmp_path: Path, capsys
+) -> None:
+    # Round-5 sidecar sweep: the sidecar loader already catches
+    # UnicodeDecodeError (and parses no JSON, so the int-limit shape cannot
+    # arise there); undecodable bytes land in its documented
+    # manifest-digest-unreadable class, exit 1. Pinned so the sidecar's
+    # loading boundary cannot silently regress to the backstop either.
+    manifest_path = build_dataset(tmp_path)
+    (manifest_path.parent / "manifest.sha256").write_bytes(b"\xff" * 10)
+    report = validate_dataset(manifest_path)  # must not raise
+    assert not report.ok
+    assert {f.check for f in report.errors} == {"manifest-digest-unreadable"}
+    assert main(["--manifest", str(manifest_path)]) == 1
+    assert "manifest-digest-unreadable" in capsys.readouterr().out
+
+
+def test_a_duplicate_mark_with_an_unrepresentable_ordinal_is_a_finding(
+    tmp_path: Path,
+) -> None:
+    # Round-5 int-conversion sweep beyond the manifest: a Parquet row marked
+    # duplicate:<5000 canonical digits> reached int() at claim-parsing time
+    # and escaped as the same ValueError shape as F-2 (exit 3, probed).
+    # datasetRowOrdinal is an INT64 column holding dense ordinals, so a mark
+    # longer than 19 digits can name no row: false provenance, the
+    # documented duplicate-provenance finding.
+    rows = default_rows()
+    rows[4] = replace(
+        rows[4], replay_eligible=False, exclusion_reason="duplicate:" + "1" * 5000
+    )
+    manifest_path = build_dataset(tmp_path, rows=rows)
+    report = validate_dataset(manifest_path)  # must not raise
+    assert not report.ok
+    finding = next(f for f in report.findings if f.check == "duplicate-provenance")
+    assert any(
+        sample[2] == "the mark does not name a canonical ordinal"
+        for sample in finding.details["sample"]
+    )

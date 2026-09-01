@@ -118,7 +118,9 @@ from research.compaction.manifest import (
     RETENTION_RECEIPT_FORMAT_ID,
     RETENTION_RECEIPT_OBJECT_NAME,
     RETENTION_RECEIPT_VERSION,
+    decode_utf8,
     load_manifest,
+    parse_strict_json,
 )
 
 #: ``wal-format.md`` §5: canonical unsigned decimal, no leading zeros, ≤ 40
@@ -127,6 +129,15 @@ from research.compaction.manifest import (
 #: casting — no bounded integer type (INT64 *or* INT128) can hold 40 digits.
 _CANONICAL_UNSIGNED = re.compile(r"^(0|[1-9][0-9]*)$")
 _MAX_SEQ_DIGITS = 40
+
+#: ``datasetRowOrdinal`` is an INT64 column holding the dense range
+#: ``0..written-1``, so no real ordinal has more than 19 decimal digits. A
+#: duplicate mark naming a longer number can reference no row — and must
+#: never reach ``int()``, whose conversion limit (4300 digits by default)
+#: otherwise turns a hostile mark into a ``ValueError`` escape: the round-5
+#: F-2 shape, observed reaching the exit-3 backstop via a Parquet row marked
+#: ``duplicate:<5000 digits>``.
+_MAX_ORDINAL_DIGITS = 19
 
 #: The one spelling of a SHA-256 digest this repository writes anywhere:
 #: exactly 64 lowercase hex characters (``sha256Hex`` on the TypeScript side).
@@ -949,7 +960,15 @@ def _check_frame_lines(
     needed: set[int] = set()
     for ordinal, epoch, seq, reason in marked_rows:
         claimed_text = reason[len("duplicate:") :]
-        claimed = int(claimed_text) if _CANONICAL_UNSIGNED.match(claimed_text) else None
+        # The digit bound comes BEFORE the conversion: `int()` on an
+        # unbounded hostile string is the round-5 ValueError escape, and a
+        # number no INT64 ordinal can equal names no row anyway.
+        claimed = (
+            int(claimed_text)
+            if _CANONICAL_UNSIGNED.match(claimed_text)
+            and len(claimed_text) <= _MAX_ORDINAL_DIGITS
+            else None
+        )
         marked.append((ordinal, epoch, seq, reason, claimed))
         needed.add(ordinal)
         if claimed is not None:
@@ -1441,8 +1460,23 @@ def _check_retention_receipt(
         )
 
     try:
-        document = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        receipt_bytes = receipt_path.read_bytes()
+    except OSError as error:
+        broken(f"retention receipt could not be read: {error}")
+        return
+    # The receipt's documented boundary is findings, never raises (unlike the
+    # manifest, a dataset with a broken receipt can still name itself), so
+    # the strict loaders' typed refusal is caught and downgraded here. The
+    # loaders classify every byte-level and parse-level failure: round-5
+    # review put a raw 0xFF byte and a beyond-the-int-limit integer in the
+    # receipt, and the resulting UnicodeDecodeError/ValueError — caught by
+    # neither `OSError` nor `json.JSONDecodeError` — escaped to the CLI's
+    # exit-3 backstop, which never substitutes for a known class.
+    try:
+        document = parse_strict_json(
+            decode_utf8(receipt_bytes, "retention receipt"), "retention receipt"
+        )
+    except ManifestError as error:
         broken(f"retention receipt could not be read: {error}")
         return
     if not isinstance(document, dict):
