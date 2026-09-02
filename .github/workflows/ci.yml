@@ -51,6 +51,9 @@ jobs:
       - name: Venue contract tests (offline fixtures)
         run: pnpm test:contract
 
+      - name: Recorder soak-harness smoke (bounded, loopback-only; no elapsed-evidence claim)
+        run: pnpm test:soak-smoke
+
       - name: Dependency vulnerability scan (pnpm lockfile)
         run: pnpm audit --audit-level high
 
