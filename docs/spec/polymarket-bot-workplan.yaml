@@ -550,6 +550,11 @@ work_packages:
       - infra/prometheus/**
       - test/soak/recorder/**
       - docs/runbooks/recorder.md
+      # Ratified 2026-09-01 (WP-020..WP-130 precedent): mechanical pnpm-lock.yaml
+      # updates from this package's declared dependencies only, and the in-repo
+      # structured handoff for pre-merge review.
+      - pnpm-lock.yaml
+      - docs/handoffs/WP-140.md
     forbidden_paths:
       - packages/domain/**
     deliverables:
