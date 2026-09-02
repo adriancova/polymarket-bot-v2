@@ -78,8 +78,19 @@ against merged, reviewed evidence (no item claimed beyond its evidence):
 
 Wave 1 development is COMPLETE. Deploying the recorder to accumulate real
 soak evidence is an operator action per runbook §1F/§7; Wave 2 may proceed
-meanwhile. Before the first phase-2 package dispatch, the C-4 phase-gate
-venue re-check is due (protected-contracts §C-4: "next at phase-2 gate").
+meanwhile.
+
+**C-4 phase-2 start-gate venue re-check EXECUTED 2026-09-02** by the
+orchestrator (the owner per the Wave-0 closeout record): both pages
+re-fetched live. Result consistent with both prior checks — the
+review-claimed archived-SDK references are STILL NOT reproduced.
+`/trading/quickstart` demonstrates only the unified client, now observed
+in both languages (TS `@polymarket/client` with `createSecureClient` and
+`@polymarket/client/viem`; Python `polymarket` with `AsyncSecureClient` —
+the Python package is a new observation, relevant to WP-260's pin-with-a-
+fresh-check obligation); `/trading/overview` names no SDK.
+Protected-contracts §C-4 row updated; next re-check at the phase-3 start
+gate. The phase-2 gate is OPEN.
 
 ### WP-140 completion record (2026-09-02)
 
