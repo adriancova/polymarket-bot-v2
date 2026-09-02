@@ -1,0 +1,48 @@
+# Local operation of the Market Data Gateway and Recorder (WP-120).
+#
+# A FRAGMENT, not a second stack: it declares the one dependency the gateway
+# needs to run locally — Redis, for the WP-060 event-bus transport — pinned to
+# the same image the root `docker-compose.yml` and the event-bus Testcontainers
+# suite use, so a developer runs one server rather than two versions of it.
+#
+# NOTHING HERE IS REQUIRED BY ANY TEST. The gateway's integration suite
+# (`pnpm --filter @polymarket-bot/data-gateway test:integration`) runs entirely
+# offline against injected in-memory transports and scripted sockets; this file
+# exists for LOCAL OPERATION and for the optional manual smoke described in
+# README.md.
+#
+# SAFETY. The gateway consumes PUBLIC, unauthenticated market data only. No
+# credential, signer, wallet, or API key appears here or is representable in
+# the gateway's configuration schema. The repository's run-mode defaults
+# (MAX_RUN_MODE=PAPER, ALLOW_REAL_ORDERS=false, LIVE_MICRO_MAX_ORDER_NOTIONAL=0,
+# LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0) are untouched by this fragment.
+#
+# Usage (from the repository root):
+#   docker compose -f infra/compose/data-gateway/compose.yaml up -d
+#   GATEWAY_CONFIG_PATH=infra/compose/data-gateway/gateway.config.example.json \
+#     pnpm --filter @polymarket-bot/data-gateway start
+#
+# The dev-local Redis in the root `docker-compose.yml` serves equally well; use
+# whichever is already running. Ports bind to 127.0.0.1 only.
+name: polymarket-bot-data-gateway
+
+services:
+  redis:
+    image: redis:7.4.2-alpine
+    container_name: polymarket-bot-gateway-redis
+    # Append-only persistence, matching the root stack: the transport's
+    # retention bound is a safety parameter (ADR-003), and losing the stream to
+    # a container restart would turn an ordinary restart into a hard resync.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${PMB_GATEWAY_REDIS_PORT:-6379}:6379"
+    volumes:
+      - gateway-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  gateway-redis-data:

@@ -3,15 +3,31 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder application scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Market Data Gateway and Recorder (WP-120): assembles the public venue adapters, the WAL raw-frame recorder, and the event-bus transport into the independent recording process. PUBLIC, unauthenticated market data only; no credential, signer, wallet, or order path exists here.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/integration/data-gateway/tsconfig.json",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=cjs --target=node24 --outfile=dist/main.cjs",
+    "start": "pnpm run typecheck && pnpm run build && node ./dist/main.cjs",
+    "test:integration": "vitest run --config ../../test/integration/data-gateway/vitest.config.ts"
+  },
+  "dependencies": {
+    "@polymarket-bot/binance-adapter": "workspace:*",
+    "@polymarket-bot/coinbase-adapter": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*",
+    "@polymarket-bot/event-bus": "workspace:*",
+    "@polymarket-bot/polymarket-public": "workspace:*",
+    "@polymarket-bot/storage-wal": "workspace:*",
+    "@polymarket-bot/universe": "workspace:*",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }
