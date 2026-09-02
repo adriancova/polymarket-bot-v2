@@ -756,11 +756,56 @@ Rules:
    `packages/domain` (ADR-004 §1). Changing its shape is a WAL format change and
    follows this section, not the domain contract-freeze rule.
 
+### 12.1 Cross-epoch chronology — ruled: epochs are identity, not chronology
+
+*(Added 2026-09-02 by `GOV-1C`, the contract-owner governance round, closing
+`WP-130` `follow_up` 8. This is a ruling on what this format has always
+defined, not a change to any byte.)*
+
+1. **A `gatewayEpoch` establishes identity, never order.** This format defines
+   **no** chronological order — total or partial — between two segments whose
+   headers carry different `gatewayEpoch` values. `segmentIndex` is a
+   per-directory ordinal **within one epoch** (§4: "ordering aid, not
+   identity"), and nothing a reader can see in the bytes orders one epoch
+   against another.
+2. **A compaction batch is single-epoch.** A consumer that must dispatch
+   records in a defined order (the `WP-130` compactor; any future replay
+   assembler) processes one epoch at a time and **refuses** mixed-epoch input
+   rather than inventing an order. This ratifies the shipped behavior:
+   `packages/storage-parquet` raises `CrossEpochOrderError`
+   ("`CROSS_EPOCH_ORDER`") on a verified batch spanning epochs, and a caller
+   compacts epoch by epoch via `segmentIds`.
+3. **Mixed-epoch *directories* are not ruled out.** They arise legitimately — a
+   recorder restart in place writes new-epoch segments beside old-epoch ones
+   (§12's single-writer row already notes the interleaving) — and remain valid
+   on disk. What is ruled out is deriving a cross-epoch *chronology* from
+   anything this format records.
+4. **What may NOT be used as a chronology**, each rejected on evidence:
+   - the epoch id's UUIDv7 timestamp bits, or any lexical/derived ordering of
+     epoch ids — `WP-130` review round 1 (finding M1) reproduced a
+     chronologically older epoch archived after a newer one under exactly that
+     inference, and the id is opaque by §2;
+   - header/footer wall-clock fields (`createdAt`, `closedAt`) or frame
+     `receivedAt` — wall clocks step across restarts and carry no cross-boot
+     monotonic guarantee (`receivedMonotonicNs` is explicitly per-process);
+   - file names or directory listing order — §2: identity is what the header
+     says, never what the name implies, and ADR-004 §5 has replay consume
+     manifests, not listings.
+5. **The reopen path is stated, not left open.** If cross-epoch ordering is
+   ever needed, it requires **new recorded evidence** — a record written at
+   epoch start that a reader can verifiably order (for example a monotonic
+   epoch-succession record naming the predecessor epoch), which is a frame- or
+   header-shape change — and therefore an ADR-004 amendment **before**
+   implementation, with a `walSchemaVersion` bump, per rules 1 and 3 of this
+   section. Until then, any component that claims a cross-epoch order is
+   asserting something this contract does not contain.
+
 ### Open items and known limits
 
 | Item | Status |
 | --- | --- |
 | Single-writer-per-directory | An invariant, not an enforced one: no lock file exists. A second writer would refuse to reopen an existing segment file, but two writers with different epochs can interleave segments in one directory. |
+| Cross-epoch chronology | **Ruled 2026-09-02 (§12.1): none is defined.** Epochs are identity, not chronology; a compaction batch is single-epoch (`CrossEpochOrderError` ratified); defining an order later requires new recorded evidence and an ADR-004 amendment with a version bump. |
 | Directory fsync | Not performed; file-creation durability depends on the filesystem. |
 | Binary payloads | Out of scope; requires an ADR-004 amendment (§5.1). |
 | Compaction, upload, deletion, dataset manifests | `WP-130`. This package writes and verifies; it never deletes. |

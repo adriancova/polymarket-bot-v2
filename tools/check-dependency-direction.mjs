@@ -39,9 +39,21 @@
  *      scanned in package source (a bare `node:` import appears in no
  *      dependency list, so `package.json` cannot see it).
  *
- * Two non-contract rule ids appear in output alongside F1–F13:
- *   - `F-CLOSED` — the §6 fail-closed bullets (classification/mirror).
- *   - `F-OPAQUE` — a construct that makes F1–F8/F11 unevaluable inside a
+ * Two further rule ids appear in output alongside F1–F13:
+ *   - `F-CLOSED` — the §6 fail-closed bullets (classification/mirror). Not a
+ *     §3 rule (contract §3, closing paragraph).
+ *   - **F14** — numbered 2026-08-28 by `GOV-1B` as contract §3 row F14, from
+ *     `docs/handoffs/WP-015.md` `follow_up` 6. Human-readable findings lead
+ *     with `FAIL [F14]` since 2026-09-02 (`GOV-1C`); the JSON report's
+ *     machine `rule` field still carries the pre-numbering id `F-OPAQUE`,
+ *     which contract §3 F14 records as an **accepted alias** — the pinned
+ *     unit suite (`test/unit/tooling/dependency-direction.test.ts`) asserts
+ *     that id structurally, and swapping it there and here in one change is
+ *     the remaining tooling follow-up. Findings additionally carry
+ *     `contractRule: "F14"` in the JSON report so both ids are machine-
+ *     readable. Throughout the comments below the rule is discussed under
+ *     its historical working name `F-OPAQUE`; the two names are the same
+ *     rule. The rule: a construct that makes F1–F8/F11 unevaluable inside a
  *     purity-restricted package: a dynamic `import()`, a `require`-capability
  *     call (bare, aliased, `module.require`, `process.mainModule.require`,
  *     `require.main.require`, or reflected) or a `process.getBuiltinModule(...)`
@@ -2332,6 +2344,10 @@ function scanSourceFile(ts, rootDir, fileRel) {
 function violation(entry) {
   return {
     rule: entry.rule,
+    // Present only where the contract §3 row id and the machine `rule` id
+    // differ — today exactly F14, whose `rule` field carries the accepted
+    // alias `F-OPAQUE` (see the module header).
+    ...(entry.contractRule === undefined ? {} : { contractRule: entry.contractRule }),
     subject: entry.subject,
     message: entry.message,
     doc: entry.doc,
@@ -2886,17 +2902,20 @@ function runCheck(rootDir) {
         }
       }
 
-      // F-OPAQUE — a module load a static check cannot read. Restricted to the
-      // packages whose whole point is a purity constraint; elsewhere a
-      // composition root may legitimately load a module by computed name.
+      // F14 (contract §3; machine `rule` field carries the accepted alias
+      // `F-OPAQUE` — see the module header) — a module load a static check
+      // cannot read. Restricted to the packages whose whole point is a purity
+      // constraint; elsewhere a composition root may legitimately load a
+      // module by computed name.
       if (isPurityRestricted) {
         for (const hit of scan.opaque) {
           push({
             rule: "F-OPAQUE",
+            contractRule: "F14",
             subject: pkg.dir,
             location: `${fileRel}:${hit.line}`,
             message: opaqueMessage(hit, pkg.dir),
-            doc: `${CONTRACT_REL} §6 rule 3; ADR-005 §1`,
+            doc: `${CONTRACT_REL} §3 (F14, emitted under the accepted alias F-OPAQUE); ADR-005 §1`,
             fix: opaqueFix(hit),
           });
         }
@@ -2932,7 +2951,11 @@ function formatReport(result, rootDir) {
   const lines = [];
   const counts = new Map();
   for (const item of result.violations) {
-    counts.set(item.rule, (counts.get(item.rule) ?? 0) + 1);
+    // Human-readable output leads with the contract §3 rule id (F14) where
+    // one exists; the machine `rule` field keeps the accepted alias
+    // (`F-OPAQUE`) — see the module header.
+    const displayRule = item.contractRule ?? item.rule;
+    counts.set(displayRule, (counts.get(displayRule) ?? 0) + 1);
   }
 
   lines.push(`dependency-direction check (${CONTRACT_REL} §6)`);
@@ -2951,13 +2974,19 @@ function formatReport(result, rootDir) {
     lines.push("PASS: no cycle (F9), no upward edge (F12), no unlisted same-layer edge (F13),");
     lines.push("      no forbidden import specifier or impure global (F1-F8, F11), no opaque");
     lines.push("      import()/require() and no evaluator (eval/Function/.constructor) in a");
-    lines.push("      restricted package, every workspace package classified.");
+    lines.push("      restricted package (F14), every workspace package classified.");
     return `${lines.join("\n")}\n`;
   }
 
   for (const item of result.violations) {
-    lines.push(`FAIL [${item.rule}] ${item.subject}${item.location ? ` (${item.location})` : ""}`);
+    const displayRule = item.contractRule ?? item.rule;
+    lines.push(`FAIL [${displayRule}] ${item.subject}${item.location ? ` (${item.location})` : ""}`);
     lines.push(`       ${item.message}`);
+    if (item.contractRule !== undefined) {
+      lines.push(
+        `   id: contract §3 row ${item.contractRule}; the machine \`rule\` field and pre-2026-09-02 output spell this finding FAIL [${item.rule}] (accepted alias, §3 F14)`,
+      );
+    }
     lines.push(`  doc: ${item.doc}`);
     if (item.fix) lines.push(`  fix: ${item.fix}`);
     lines.push("");
@@ -2995,11 +3024,13 @@ Enforces docs/contracts/dependency-direction.md §6:
   F12/F13   no upward edge; same-layer edges only when listed in §2.1
   F1-F8,F11 no forbidden import specifier or non-deterministic global
   F-CLOSED  §6 fail-closed: unclassified package, or §2 entry with no manifest
-  F-OPAQUE  no dynamic import()/require() with a non-static specifier, no
+  F14       no dynamic import()/require() with a non-static specifier, no
             require capability escaping into a value the check cannot follow, and
             no evaluator — eval/Function, or the .constructor property that hands
             out the Function constructor — in a package whose purity is
-            constrained (domain, strategies, ledger, simulation)
+            constrained (domain, strategies, ledger, simulation). The JSON
+            report's machine "rule" field carries this rule's accepted alias,
+            the pre-numbering id F-OPAQUE (contract §3 F14)
 The §2 layer table and the §2.1 allowlist are parsed from the contract and
 validated eagerly; an unparseable or inconsistent row is a CHK error, not a
 skipped row. Source is parsed with the TypeScript compiler API (a root
