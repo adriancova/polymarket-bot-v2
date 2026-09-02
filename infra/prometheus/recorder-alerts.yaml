@@ -1,0 +1,226 @@
+# Recorder alert rules (WP-140).
+#
+# Severities follow handoff §14.4: `page` and `notify`. Every rule's meaning
+# and operator action is in docs/runbooks/recorder.md ("Alarms").
+#
+# Machine-checked: packages/observability/src/recorder/infra-consistency.test.ts
+# asserts every recorder_* series referenced here is one the exporter emits,
+# and that the declared alert-name set matches this file EXACTLY in both
+# directions (a rename shows up as missing AND unexpected) — covering the
+# WP-120-obligated alarms (recorder EXIT; best-effort early queue-age
+# warning; WAL refusals; RTDS halt; publication halt; compaction lag;
+# upload failure) and every other rule here.
+#
+# TWO ALARMS ARE LOG-BASED, NOT METRIC-BASED, and are deliberately NOT faked
+# here as PromQL:
+#   1. "Recorder FAILED to exit" — the signal is the stderr line
+#      `data-gateway: cleanup deadline (<n> ms) expired on the <path> path`
+#      followed by forced exit, and any `[disposal] <resource> cleanup failed`
+#      lines before it. A process wedged with the deadline log printed and no
+#      exit is the failure; metrics cannot see it because the exporter lives
+#      in the process that is wedged. Alarm on the log line in the log
+#      pipeline, and treat RecorderExited firing WITHOUT a preceding
+#      operator-requested shutdown as the paired signal.
+#   2. `[disposal]` cleanup failures during shutdown — same vehicle.
+# See docs/runbooks/recorder.md, "Forced-exit signals".
+
+groups:
+  - name: recorder-liveness
+    rules:
+      # WP-120 obligation: alarm on a recorder EXIT. The recorder runs until
+      # signalled (bidirectional exit contract); an exit nobody requested is
+      # a page regardless of exit code.
+      - alert: RecorderExited
+        expr: up{job="recorder"} == 0 or absent(up{job="recorder"})
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "Recorder process is down (exited or unscrapeable)"
+          description: "The data gateway exits only on a shutdown signal or a fatal startup defect. If no operator requested this, treat it as an incident; if a shutdown WAS requested and the process is still up instead, that is the FAILED-to-exit case — see the runbook's forced-exit section."
+
+  - name: recorder-publication
+    rules:
+      # Handoff §14.4 page: "Data gateway unable to record or publish."
+      - alert: RecorderPublicationHalted
+        expr: recorder_publisher_halted == 1
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "Publication halted (terminal for this epoch; recording continues)"
+          description: "Cause label on recorder_publisher_halt_info. Follow the restart procedure in docs/runbooks/recorder.md — do NOT kill the recorder in a hurry; it is still recording."
+
+      # WP-120 round-1 queue-age alarm, honestly framed: this is BEST-EFFORT
+      # EARLY WARNING, not a guarantee of firing before the admission bound —
+      # a fast burst can fill the 1024-entry/8 MiB queue inside the 5s age
+      # threshold + 15s scrape interval + 1m `for:` window. The ENFORCED
+      # guarantee is in-process and independent of Prometheus: crossing the
+      # bound is a terminal publication halt with a PAGE incident
+      # (GATEWAY_PUBLISH_ADMISSION_OVERFLOW, WP-120's machinery). This rule
+      # buys advisory lead time in the slow-drain case; the pending soak will
+      # size its threshold from real data (docs/runbooks/recorder.md §5).
+      - alert: RecorderPublishQueueAgeHigh
+        expr: recorder_publisher_oldest_queued_age_ms > 5000
+        for: 1m
+        labels:
+          severity: notify
+        annotations:
+          summary: "Publish queue head is aging: the transport is not draining"
+          description: "Best-effort early warning, advisory lead time only — a fast burst can cross the admission bound before this fires; the enforced guarantee is the in-process terminal halt plus PAGE incident on overflow (WP-120). If this keeps rising, the bound will be crossed and publication will halt terminally. Investigate the event bus now."
+
+      - alert: RecorderPublishQueueNearBound
+        expr: >-
+          recorder_publisher_queue_depth / recorder_publisher_queue_max_depth > 0.8
+          or recorder_publisher_queue_bytes / recorder_publisher_queue_max_bytes > 0.8
+        for: 1m
+        labels:
+          severity: notify
+        annotations:
+          summary: "Publish admission queue above 80% of a bound"
+          description: "Crossing the bound is a terminal publication halt (GATEWAY_PUBLISH_ADMISSION_OVERFLOW)."
+
+      - alert: RecorderPublishAdmissionRefusals
+        expr: increase(recorder_publisher_admission_refusals_total[5m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "Publish admissions are being refused (queue full)"
+          description: "Accompanies or immediately precedes a terminal halt."
+
+  - name: recorder-wal
+    rules:
+      # Handoff §14.4 page: unable to record.
+      - alert: RecorderWalFaulted
+        expr: recorder_wal_faulted == 1
+        labels:
+          severity: page
+        annotations:
+          summary: "WAL writer faulted — recording is failing"
+          description: "The disk is the priority. recorder_wal_pending_frame_count frames are handed back awaiting recovery; the next start crash-recovers the tail (WP-050)."
+
+      - alert: RecorderWalRefusals
+        expr: >-
+          increase(recorder_feed_frames_refused_by_wal_total[5m]) > 0
+          or increase(recorder_wal_write_faults_total[5m]) > 0
+          or increase(recorder_wal_capacity_refusals_total[5m]) > 0
+          or increase(recorder_wal_validation_rejections_total[5m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "The WAL is refusing frames — the raw record is incomplete"
+          description: "Every refusal is a frame that cannot be re-fetched. Check disk capacity (recorder_wal_capacity_remaining_bytes) and the [wal] log lines."
+
+      - alert: RecorderWalDroppedMessages
+        expr: increase(recorder_wal_queue_messages_dropped_total[5m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "Acknowledged WAL drops occurred — recorded data loss"
+          description: "This counter only moves when a caller acknowledged discarding a refused frame. It must stay 0."
+
+      - alert: RecorderWalUnmanifestedSegments
+        expr: recorder_wal_unmanifested_faulted_segments > 0
+        labels:
+          severity: notify
+        annotations:
+          summary: "Faulted segments exist without manifests"
+          description: "Each is unverified until recovery finalizes it, and each is a data-quality incident."
+
+      - alert: RecorderFsyncOverdue
+        expr: recorder_wal_ms_since_last_fsync > recorder_wal_data_loss_bound_ms
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "fsync cadence has fallen behind the published data-loss bound"
+          description: "The dataLossBoundMs the writer publishes is only true while the fsync tick runs. If this fires, the real exposure is recorder_wal_unproven_frame_count frames / recorder_wal_bytes_unsynced bytes."
+
+  - name: recorder-feeds
+    rules:
+      # Handoff §14.4 notify: feed reconnect or resync.
+      - alert: RecorderFeedStalls
+        expr: increase(recorder_feed_stalls_observed_total[15m]) > 0
+        labels:
+          severity: notify
+        annotations:
+          summary: "Feed staleness detected ({{ $labels.feed }})"
+          description: "Stall detection, resubscription, and (Polymarket) authoritative snapshot recovery are automatic; repeated stalls are a venue or network problem."
+
+      - alert: RecorderRtdsHalted
+        expr: recorder_rtds_halted == 1
+        labels:
+          severity: page
+        annotations:
+          summary: "RTDS TWAP publication halted for this epoch (unrecoverable gap)"
+          description: "The venue offers no replay; the unobserved interval is permanently unobserved. TWAP-dependent consumers must halt (ADR-009 §6). Restart to begin a new observation window."
+
+      - alert: RecorderPolymarketSnapshotFailures
+        expr: increase(recorder_polymarket_snapshot_fetch_failures_total[15m]) > 2
+        labels:
+          severity: notify
+        annotations:
+          summary: "Authoritative snapshot fetches are failing"
+          description: "Gap recovery depends on snapshots; repeated failures leave subscriptions suspended."
+
+  - name: recorder-compaction
+    rules:
+      - alert: RecorderCompactionLagHigh
+        expr: recorder_compaction_lag_ms > 3600000
+        labels:
+          severity: notify
+        annotations:
+          summary: "Compaction is more than an hour behind"
+          description: "Oldest refused segment is aging. Remember this series only sees segments a cycle refused; combine with recorder_wal_active_segment_age_ms (WP-130 known risk 3)."
+
+      - alert: RecorderCompactionFailing
+        expr: increase(recorder_compaction_cycles_failed_total[3h]) > 0
+        labels:
+          severity: notify
+        annotations:
+          summary: "Compaction cycles are failing"
+          description: "The WAL is untouched by a failed cycle, so nothing is lost yet — but retention cannot progress and disk will grow."
+
+      - alert: RecorderUploadFailed
+        expr: recorder_upload_failed == 1
+        labels:
+          severity: notify
+        annotations:
+          summary: "The last compaction cycle failed to upload/verify its objects"
+          description: "objectUploadStatus=failed; the worker's lastFailureReason names the cause. WAL segments are never deleted until upload and checksum verification succeed, so data is safe and disk is the pressure."
+
+      - alert: RecorderRetentionFailures
+        expr: recorder_compaction_last_cycle_retention_failures > 0
+        labels:
+          severity: notify
+        annotations:
+          summary: "Verified WAL segments could not be deleted"
+          description: "A disk-space problem, not a data one: the dataset is uploaded and verified; the WAL copy just refused to go."
+
+  - name: recorder-validation
+    rules:
+      - alert: RecorderValidationFindings
+        expr: sum(recorder_validation_findings{severity="error"}) by (job, class) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "Dataset validation reported error findings ({{ $labels.job }}: {{ $labels.class }})"
+          description: "The finding class names what broke; the runbook's finding-class table says what each means operationally and what to do."
+
+      - alert: RecorderValidationNotOk
+        expr: recorder_validation_ok == 0
+        labels:
+          severity: notify
+        annotations:
+          summary: "The last validation run did not come back clean ({{ $labels.job }})"
+          description: "See recorder_validation_findings for the classes."
+
+  - name: recorder-soak
+    rules:
+      - alert: RecorderSoakEvidenceInvalid
+        expr: recorder_soak_status_info{status="INVALID"} == 1
+        labels:
+          severity: notify
+        annotations:
+          summary: "Soak evidence set contains an invalid record"
+          description: "Evaluation is fail-closed and will not skip bad evidence; resolve the named record. PENDING is the normal state; QUALIFYING_WINDOW_FOUND is a CANDIDATE for out-of-band provenance review — completion of the external-evidence gate is a governance record in IMPLEMENTATION_STATUS.md, never a metric value."

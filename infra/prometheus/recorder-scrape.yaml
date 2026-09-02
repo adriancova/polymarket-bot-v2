@@ -1,0 +1,45 @@
+# Recorder scrape configuration fragment (WP-140).
+#
+# Merge the `scrape_configs` entries below into the deployment's
+# prometheus.yml, and add `recorder-alerts.yaml` to its `rule_files`.
+#
+# WIRING STATUS, disclosed: the exporter is a pure render function
+# (`packages/observability/src/recorder/render.ts`); neither
+# `apps/data-gateway` nor `apps/research-worker` serves an HTTP /metrics
+# endpoint yet — that wiring is a composition-root change outside WP-140's
+# paths and is recorded as a follow-up in docs/handoffs/WP-140.md. Until it
+# lands, these jobs will show the targets DOWN, which is exactly what the
+# RecorderExited alert reports. Do not point these at anything other than
+# loopback/private addresses: handoff §15 forbids public network exposure for
+# internal metrics endpoints.
+#
+# Safety: scraping is read-only public-market telemetry. No credential exists
+# or may be added here. MAX_RUN_MODE=PAPER, ALLOW_REAL_ORDERS=false,
+# LIVE_MICRO_MAX_ORDER_NOTIONAL=0, LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 are
+# untouched by observability.
+
+scrape_configs:
+  # The Market Data Gateway / Recorder process (WP-120).
+  - job_name: "recorder"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["127.0.0.1:9464"]
+        labels:
+          service: "data-gateway"
+
+  # The compaction research worker (WP-130).
+  - job_name: "recorder-compaction"
+    scrape_interval: 60s
+    static_configs:
+      - targets: ["127.0.0.1:9465"]
+        labels:
+          service: "research-worker"
+
+  # Validation jobs (dataset validation, book comparison) and the soak
+  # evaluator publish point-in-time results; the intended vehicle is the
+  # node_exporter textfile collector (write the rendered exposition to a
+  # *.prom file) or a one-shot pushgateway on loopback. Either way the series
+  # arrive under the recorder_* names this repository's exporter emits.
+
+rule_files:
+  - "recorder-alerts.yaml"

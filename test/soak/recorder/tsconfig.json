@@ -1,0 +1,13 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": "../../..",
+    "paths": {
+      "@polymarket-bot/data-gateway": ["apps/data-gateway/src/index.ts"],
+      "@polymarket-bot/research-worker": ["apps/research-worker/src/index.ts"]
+    }
+  },
+  "include": ["."]
+}

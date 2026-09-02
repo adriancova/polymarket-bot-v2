@@ -1,0 +1,14 @@
+{
+  "name": "@polymarket-bot-test/soak-recorder",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WP-140 recorder soak harness: runs the real data-gateway bundle for a bounded window (loopback-only by default), writes machine-readable evidence records with first-class duration, and evaluates them fail-closed — a soak is PENDING until real elapsed evidence meets the threshold. NOT a workspace package (test-tree precedent: WP-020/WP-120/WP-130); tools resolve from the root toolchain.",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ./tsconfig.json",
+    "soak:run": "node ./run-soak.mjs",
+    "soak:smoke": "vitest run --config ./vitest.config.ts soak-smoke",
+    "soak:evaluate": "vitest run --config ./vitest.config.ts evaluate.job",
+    "soak:compare-books": "vitest run --config ./vitest.config.ts compare.job"
+  }
+}

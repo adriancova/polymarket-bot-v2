@@ -1,0 +1,173 @@
+/**
+ * Fully-populated metric-snapshot fixtures for the recorder exporter tests.
+ *
+ * Every optional producer section is present and every `null`-able field is
+ * non-null, so rendering these fixtures exercises every family the exporter
+ * can emit from producer snapshots — which is what lets the tests assert
+ * "every family in the table is reachable" rather than sampling.
+ *
+ * Values are arbitrary but distinct, so a transposed field shows up as a
+ * wrong number, not a coincidence.
+ */
+
+import type {
+  RecorderCompactionMetricsInput,
+  RecorderGatewayMetricsInput,
+} from "./metric-shapes.js";
+
+export function fullyPopulatedGatewaySnapshot(): RecorderGatewayMetricsInput {
+  return {
+    gatewayEpoch: "0198c0de-0000-7000-8000-000000000001",
+    wal: {
+      state: "open",
+      queue: {
+        currentDepth: 3,
+        maximumDepth: 4096,
+        highWaterDepth: 17,
+        oldestMessageAgeMs: 21,
+        messagesDropped: 0,
+        consumerLag: 2,
+        overflowSignals: 1,
+        currentByteDepth: 1536,
+        maximumByteDepth: 8_388_608,
+      },
+      activeSegmentRecordCount: 41,
+      activeSegmentByteLength: 20_480,
+      activeSegmentAgeMs: 1_234,
+      segmentsOpened: 6,
+      segmentsFinalized: 5,
+      rotations: 4,
+      framesAccepted: 1_000,
+      framesWritten: 998,
+      framesDurable: 990,
+      bytesWritten: 512_000,
+      bytesUnsynced: 4_096,
+      recordsUnsynced: 8,
+      fsyncCount: 120,
+      lastFsyncDurationMs: 3,
+      totalFsyncDurationMs: 400,
+      msSinceLastFsync: 250,
+      dataLossBoundMs: 1_000,
+      totalSegmentBytes: 480_000,
+      capacityBytes: 1_000_000_000,
+      capacityRemainingBytes: 999_520_000,
+      unprovenFrameCount: 8,
+      retainedRecordCount: 41,
+      unmanifestedFaultedSegments: 0,
+      overflowSignals: 1,
+      capacityRefusals: 0,
+      closedRefusals: 0,
+      faultedRefusals: 0,
+      validationRejections: 0,
+      writeFaults: 0,
+      pendingFrameCount: 0,
+    },
+    publisher: {
+      published: 950,
+      duplicatesRefused: 1,
+      suppressedWhileHalted: 12,
+      rejectedByTransport: 0,
+      admissionRefusals: 2,
+      halted: true,
+      halt: {
+        cause: "EVENT_BUS_UNAVAILABLE",
+        detail: "the event bus was unreachable at startup",
+        haltedAtIngestSeq: "938",
+      },
+      queueDepth: 7,
+      queueMaxDepthObserved: 64,
+      queueMaxDepth: 1_024,
+      queueBytes: 3_584,
+      queueMaxBytesObserved: 32_768,
+      queueMaxBytes: 8_388_608,
+      oldestQueuedAgeMs: 45,
+    },
+    dispatcher: { dispatched: 949, envelopeRejections: 1 },
+    incidents: { incidentsOpened: 4, repeatsSuppressed: 9, trackedKeys: 3, evictedKeys: 1 },
+    directory: {
+      knownMarkets: 2,
+      declinedRegistrations: 5,
+      declinedRegistrationsRetained: 4,
+      declinedRegistrationsEvicted: 1,
+      declinedRegistrationsCapacity: 256,
+      parameterVersionsAssigned: 3,
+      parameterAssignmentsDeclined: 1,
+    },
+    polymarket: {
+      framesRecorded: 400,
+      framesRefusedByWal: 1,
+      eventsDispatched: 380,
+      marketEventsSuppressedUnrecorded: 2,
+      transportObservations: 12,
+      problemsRouted: 3,
+      stallsObserved: 1,
+      snapshotRecoveries: 2,
+      snapshotFetchFailures: 1,
+      resyncRejections: 1,
+    },
+    rtds: {
+      framesRecorded: 150,
+      framesRefusedByWal: 0,
+      observationsDispatched: 140,
+      unplannedSymbolObservations: 1,
+      freshnessFailures: 2,
+      coverageBreaks: 1,
+      firstObservations: 2,
+      outOfOrderObservations: 1,
+      unrecoverableGapsAcknowledged: 1,
+      gapAcknowledgementRejections: 0,
+      transportObservations: 5,
+      problemsRouted: 2,
+      stallsObserved: 1,
+      halted: true,
+      observationsSuppressedAfterGap: 6,
+    },
+    binance: {
+      framesRecorded: 300,
+      framesRefusedByWal: 0,
+      emissionsDispatched: 290,
+      emissionsSuppressedUnrecorded: 1,
+      rejectedSocketEvents: 2,
+      unauthorizedSocketEvents: 1,
+      stallsObserved: 2,
+      pendingCloseFailures: 1,
+      reconnectsScheduled: 3,
+      waitedOnOutstandingAttempt: 1,
+      directiveStops: 1,
+      pendingConnectionId: "binance-conn-7",
+    },
+    coinbase: {
+      framesRecorded: 250,
+      framesRefusedByWal: 0,
+      binaryFramesUnrecorded: 1,
+      framesWithoutEstablishedProvenance: 2,
+      eventsDispatched: 240,
+      eventsSuppressedUnrecorded: 1,
+      anomaliesRouted: 2,
+      snapshotEscalations: 1,
+      reconnectLoopEscalations: 1,
+    },
+  };
+}
+
+export function fullyPopulatedCompactionSnapshot(): RecorderCompactionMetricsInput {
+  return {
+    cyclesStarted: 10,
+    cyclesSucceeded: 8,
+    cyclesFailed: 2,
+    objectUploadStatus: "failed",
+    lastFailureReason: "object store refused the PUT",
+    compactionLagMs: 65_000,
+    lastCycleSegmentsCompacted: 5,
+    lastCycleSegmentsRefused: 1,
+    lastCycleRowsWritten: 12_000,
+    lastCycleObjectBytes: 2_048_000,
+    lastCycleSegmentsDeleted: 4,
+    lastCycleRetentionFailures: 1,
+    lastCycleDurationMs: 900,
+    totalSegmentsCompacted: 40,
+    totalRowsWritten: 96_000,
+    totalObjectBytes: 16_384_000,
+    totalSegmentsDeleted: 36,
+  };
+}
