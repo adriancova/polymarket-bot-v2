@@ -74,6 +74,32 @@ export interface GatewayLifetime {
   acquire(): ReleaseLifetime;
 }
 
+/** Disarms an armed cleanup deadline. Idempotent. */
+export type CancelCleanupDeadline = () => void;
+
+/**
+ * A referenced hard-deadline bracket for a cleanup await on a FAILURE path
+ * (round 5, M-2).
+ *
+ * `arm()` starts the deadline; the returned cancel disarms it. The
+ * composition sequence (`run.ts`) derives the implementation from
+ * `GatewayHost.armCleanupDeadline`, so an expiry logs the standard
+ * `cleanup deadline … expired` line and force-exits the process — the same
+ * fallback the sequence's own cleanup arms use. `DataGateway.create()` takes
+ * this capability so its internal post-open journal cleanup runs under the
+ * same guarantee: before round 5, a `journal.close()` that never settled
+ * inside `create()`'s catch left the returned promise pending forever, the
+ * sequence's deadline never armed (it arms only once `create()` rejects), and
+ * a connected transport's referenced handle held the process indefinitely.
+ *
+ * The bracket is armed only once a failure path has BEGUN — never around a
+ * normal open — so an ordinarily slow startup is never treated as a cleanup
+ * failure.
+ */
+export interface CleanupDeadline {
+  arm(): CancelCleanupDeadline;
+}
+
 /** A receipt stamp: both §7.1 receipt fields, taken in one clock read. */
 export interface GatewayReceipt {
   /** Wall-clock ISO-8601 instant. */

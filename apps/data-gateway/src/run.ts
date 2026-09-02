@@ -29,7 +29,11 @@
  *   clears the handle before this cleanup can see it).
  * - `create()` itself guarantees the same transactionality one level down:
  *   if it throws after opening the WAL journal, it closes the journal before
- *   the error escapes (`gateway.ts`).
+ *   the error escapes (`gateway.ts`) — and since round 5 (M-2) that internal
+ *   close runs under the same fatal-startup deadline this sequence arms,
+ *   supplied through the `CleanupDeadline` capability: a never-settling
+ *   journal close used to leave `create()` pending forever, before this
+ *   sequence's own catch (and therefore its deadline) could ever run.
  *
  * The signal path cannot race the fatal path: `SIGINT`/`SIGTERM` handlers are
  * registered only AFTER `start()` succeeds, at which point the fatal cleanup
@@ -60,9 +64,14 @@
  * whose `stop()` never resolves would wedge the process identically, and a
  * supervisor's kill-grace SIGKILL would only mask that defect (exit 137, no
  * evidence), not fix it. The invariant: on any fatal startup error the
- * process exits nonzero within the deadline even if a resource's cleanup
- * hangs or rejects while holding a referenced handle; on a shutdown signal
- * the process exits within the deadline even if `stop()` does not resolve.
+ * process exits nonzero within one deadline of any cleanup hang or rejection
+ * — including a hang inside `create()`'s own post-open cleanup (round 5,
+ * M-2) — and on a shutdown signal the process exits within the deadline even
+ * if `stop()` does not resolve. Every cleanup is ATTEMPTED; a forced exit at
+ * deadline expiry may leave disposal incomplete, in which case the WAL tail
+ * is crash-recovered on the next start (the WP-050 recovery shape) — the
+ * contract is bounded, attempted, evidenced cleanup, never guaranteed
+ * release.
  *
  * ## Why a separate module
  *
@@ -82,9 +91,13 @@
 import type { MarketEventTransport } from "@polymarket-bot/event-bus";
 
 import type { GatewayConfig } from "./config.js";
+import { GatewayConfigurationError } from "./errors.js";
 import type { GatewayPorts } from "./gateway.js";
 import { DataGateway } from "./gateway.js";
+import type { CancelCleanupDeadline } from "./ports.js";
 import { UnavailableEventTransport } from "./unavailable-transport.js";
+
+export type { CancelCleanupDeadline } from "./ports.js";
 
 /**
  * The composition root's process-level effects, as a port.
@@ -93,9 +106,6 @@ import { UnavailableEventTransport } from "./unavailable-transport.js";
  * tests pass recorders. Kept minimal on purpose: this is not a general
  * process abstraction, it is exactly what the startup sequence needs.
  */
-/** Disarms an armed cleanup deadline. Idempotent. */
-export type CancelCleanupDeadline = () => void;
-
 export interface GatewayHost {
   /** Operator-facing log line (the real host writes to stderr). */
   logError(line: string, detail?: unknown): void;
@@ -140,6 +150,15 @@ export interface GatewaySequenceOptions {
    * it as `GATEWAY_CLEANUP_DEADLINE_MS`. A safety parameter, not a tuning
    * knob: it bounds how long a hung or handle-holding cleanup can keep a
    * process alive that has already decided to exit.
+   *
+   * Round 5 (M-1): validated FAIL-CLOSED before any resource is acquired —
+   * it must be a whole number of milliseconds in
+   * [{@link MIN_CLEANUP_DEADLINE_MS}, {@link MAX_CLEANUP_DEADLINE_MS}].
+   * Anything else (`NaN`, zero, negative, fractional, `Infinity`, beyond
+   * Node's timer range) is refused with a typed configuration error, because
+   * Node's `setTimeout` silently coerces every such value to an effectively
+   * IMMEDIATE deadline — which force-exits healthy cleanups (a legitimate
+   * 50 ms transport close was force-exited after ~4 ms under `NaN`).
    */
   readonly cleanupDeadlineMs?: number;
   /** Every gateway port except the transport, which this sequence derives. */
@@ -156,6 +175,89 @@ export interface GatewaySequenceOptions {
 export const DEFAULT_CLEANUP_DEADLINE_MS = 10_000;
 
 /**
+ * Smallest permitted cleanup deadline (round 5, M-1): 100 ms.
+ *
+ * The deadline is a FALLBACK, so it must never race a healthy cleanup. Every
+ * real disposal in this app completes in single-digit milliseconds, but is
+ * subject to event-loop and OS scheduling jitter of tens of milliseconds —
+ * below 100 ms the "fallback" starts winning races against cleanups that were
+ * completing normally (the round-5 reviewer's probe: an unvalidated `NaN`,
+ * coerced by Node to ~1 ms, force-exited a legitimate 50 ms transport close
+ * after ~4 ms, while 200 ms let it complete). 100 ms sits comfortably above
+ * that jitter while still bounding a wedged process to a tenth of a second.
+ */
+export const MIN_CLEANUP_DEADLINE_MS = 100;
+
+/**
+ * Largest permitted cleanup deadline (round 5, M-1): Node's timer maximum
+ * (2^31 − 1 ms). Beyond it `setTimeout` coerces the delay to ~1 ms, which
+ * would silently invert the meaning — the LARGEST requested deadline becoming
+ * the most immediate forced exit.
+ */
+export const MAX_CLEANUP_DEADLINE_MS = 2_147_483_647;
+
+/** The environment variable `main.ts` (and the probe entry) expose. */
+const CLEANUP_DEADLINE_ENV_VAR = "GATEWAY_CLEANUP_DEADLINE_MS";
+
+/** Whole decimal milliseconds; anything else fails closed. */
+const WHOLE_DECIMAL_MS = /^\d+$/u;
+
+function refuseCleanupDeadline(offending: string | number): GatewayConfigurationError {
+  // The M2 cadence precedent (`config.ts`): a ONE-LINE refusal naming the
+  // variable, the offending value, and the permitted domain, raised as the
+  // typed configuration error so `main.ts` exits 1 before anything opens.
+  const shown = typeof offending === "string" ? JSON.stringify(offending) : String(offending);
+  return new GatewayConfigurationError(
+    `${CLEANUP_DEADLINE_ENV_VAR} (cleanupDeadlineMs) must be a whole number of milliseconds ` +
+      `from ${String(MIN_CLEANUP_DEADLINE_MS)} to ${String(MAX_CLEANUP_DEADLINE_MS)}, got ` +
+      `${shown}: Node coerces every other value to an effectively immediate timer, which ` +
+      "would force-exit healthy cleanups; unset or empty means the default " +
+      `${String(DEFAULT_CLEANUP_DEADLINE_MS)}`,
+    {
+      variable: CLEANUP_DEADLINE_ENV_VAR,
+      offendingValue: typeof offending === "number" ? String(offending) : offending,
+      permittedMinMs: MIN_CLEANUP_DEADLINE_MS,
+      permittedMaxMs: MAX_CLEANUP_DEADLINE_MS,
+      defaultMs: DEFAULT_CLEANUP_DEADLINE_MS,
+    },
+  );
+}
+
+function isValidCleanupDeadlineMs(value: number): boolean {
+  return (
+    Number.isSafeInteger(value) &&
+    value >= MIN_CLEANUP_DEADLINE_MS &&
+    value <= MAX_CLEANUP_DEADLINE_MS
+  );
+}
+
+/**
+ * Parses `GATEWAY_CLEANUP_DEADLINE_MS` FAIL-CLOSED (round 5, M-1).
+ *
+ * Unset or empty means {@link DEFAULT_CLEANUP_DEADLINE_MS} — the package's
+ * established treatment of an empty environment value as absent
+ * (`GATEWAY_CONFIG_PATH` in `main.ts`), pinned by test. Every present value
+ * must be a plain whole-decimal string inside the permitted domain; anything
+ * else (`NaN`, `-5`, `0`, `Infinity`, `2147483648`, `1500.5`, text,
+ * whitespace, scientific notation) throws the one-line typed refusal, because
+ * before round 5 every one of those reached `setTimeout` unchecked and became
+ * an effectively immediate deadline that punished healthy cleanups.
+ */
+export function parseCleanupDeadlineMs(raw: string | undefined): number {
+  if (raw === undefined || raw === "") {
+    return DEFAULT_CLEANUP_DEADLINE_MS;
+  }
+  if (!WHOLE_DECIMAL_MS.test(raw)) {
+    throw refuseCleanupDeadline(raw);
+  }
+  const value = Number(raw);
+  if (!isValidCleanupDeadlineMs(value)) {
+    throw refuseCleanupDeadline(raw);
+  }
+  return value;
+}
+
+/**
  * Runs the whole startup sequence and returns the RUNNING gateway.
  *
  * On a fatal error it releases everything acquired so far (see the module
@@ -170,6 +272,14 @@ export async function runGatewaySequence(
 ): Promise<DataGateway> {
   const { config, host } = options;
   const cleanupDeadlineMs = options.cleanupDeadlineMs ?? DEFAULT_CLEANUP_DEADLINE_MS;
+  // Round 5 (M-1): fail closed BEFORE any resource is acquired. This seam
+  // guards programmatic callers the same way `parseCleanupDeadlineMs` guards
+  // the environment: an out-of-domain value here would otherwise flow
+  // straight into `setTimeout`, where Node coerces it to an effectively
+  // immediate deadline.
+  if (!isValidCleanupDeadlineMs(cleanupDeadlineMs)) {
+    throw refuseCleanupDeadline(cleanupDeadlineMs);
+  }
 
   // Round 4: the fallback exit deadline, armed at every cleanup entry and
   // cleared only when that cleanup COMPLETES (module header: a cleanup that
@@ -205,7 +315,20 @@ export async function runGatewaySequence(
   const startGateway = async (): Promise<DataGateway> => {
     let created: DataGateway | undefined;
     try {
-      created = await DataGateway.create(config, { ...options.ports, transport });
+      // Round 5 (M-2): `create()`'s own post-open cleanup — the journal close
+      // it awaits before rejecting — runs under the SAME fatal-startup
+      // deadline as this sequence's cleanup arms below. Without it, a
+      // never-settling `journal.close()` after a post-open construction error
+      // left `create()` pending forever: the catch below never ran, no
+      // deadline ever armed, and a connected transport's referenced handle
+      // held the process indefinitely. `create()` arms the capability only
+      // once its failure path begins — never around a normal open — so a
+      // slow-but-healthy startup is untouched.
+      created = await DataGateway.create(
+        config,
+        { ...options.ports, transport },
+        { cleanupDeadline: { arm: () => armCleanupDeadline("fatal-startup") } },
+      );
       if (transportFailure !== undefined) {
         // Same terminal halt, same PAGE incident, same operator story as a
         // mid-run outage — but the WAL is already open and the feeds start

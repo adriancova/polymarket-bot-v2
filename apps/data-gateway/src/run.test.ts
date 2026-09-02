@@ -20,18 +20,29 @@ import { FakeCoinbaseSocketFactory } from "@polymarket-bot/coinbase-adapter/test
 import type { CoinbaseSocketFactory } from "@polymarket-bot/coinbase-adapter";
 import type { MarketEventTransport } from "@polymarket-bot/event-bus";
 import { createMemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parseGatewayConfig } from "./config.js";
-import { GatewayStateError } from "./errors.js";
+import { GatewayConfigurationError, GatewayStateError } from "./errors.js";
+import { GatewayJournal } from "./journal.js";
 import type { GatewayHost, GatewaySequenceOptions } from "./run.js";
-import { runGatewaySequence } from "./run.js";
+import {
+  DEFAULT_CLEANUP_DEADLINE_MS,
+  MAX_CLEANUP_DEADLINE_MS,
+  MIN_CLEANUP_DEADLINE_MS,
+  parseCleanupDeadlineMs,
+  runGatewaySequence,
+} from "./run.js";
 import {
   deterministicIdSource,
   ManualGatewayClock,
   ManualGatewayTimers,
   MemoryEventTransport,
 } from "./testing/index.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const MARKET = {
   internalMarketId: "01990000-0000-7000-8000-000000000001",
@@ -321,16 +332,23 @@ describe("the cleanup hard-deadline (round 4)", () => {
 
     expect(closes(), "the close was attempted").toBe(1);
     expect(host.lines.join("\n")).toContain("fatal-path transport close failed");
-    expect(host.deadlines, "the deadline was armed at cleanup entry").toHaveLength(1);
-    expect(host.deadlines[0]?.delayMs).toBe(1_234);
+    // Round 5 (M-2): TWO brackets now exist on this path — create()'s own,
+    // around its completed journal close (armed then cancelled), and the
+    // sequence's, around the rejecting transport close (armed, kept).
+    expect(host.deadlines, "both cleanup brackets armed at their entries").toHaveLength(2);
     expect(
       host.deadlines[0]?.cancelled(),
+      "create()'s bracket was cancelled when its journal close completed",
+    ).toBe(true);
+    expect(host.deadlines[1]?.delayMs).toBe(1_234);
+    expect(
+      host.deadlines[1]?.cancelled(),
       "a cleanup that FAILED must not clear its deadline — the handle may still be referenced",
     ).toBe(false);
     expect(host.forcedExits, "the deadline has not fired yet").toEqual([]);
 
     // The referenced timer fires: the expiry logs and forces the exit.
-    host.deadlines[0]?.expire();
+    host.deadlines[1]?.expire();
     expect(host.forcedExits).toEqual([1]);
     expect(host.lines.join("\n")).toContain("cleanup deadline");
   });
@@ -357,10 +375,16 @@ describe("the cleanup hard-deadline (round 4)", () => {
     await expect(runGatewaySequence(options)).rejects.toBeInstanceOf(GatewayStateError);
 
     expect(closes()).toBe(1);
-    expect(host.deadlines).toHaveLength(1);
+    // Round 5 (M-2): create()'s bracket around its journal close, then the
+    // sequence's around the transport close — BOTH completed, BOTH cleared.
+    expect(host.deadlines).toHaveLength(2);
     expect(
       host.deadlines[0]?.cancelled(),
-      "a completed cleanup must clear its deadline",
+      "a completed cleanup must clear its deadline (create()'s bracket)",
+    ).toBe(true);
+    expect(
+      host.deadlines[1]?.cancelled(),
+      "a completed cleanup must clear its deadline (the sequence's bracket)",
     ).toBe(true);
     expect(host.forcedExits).toEqual([]);
     expect(host.lines.join("\n")).not.toContain("cleanup deadline");
@@ -432,5 +456,177 @@ describe("the cleanup hard-deadline (round 4)", () => {
 
     host.deadlines[0]?.expire();
     expect(host.forcedExits).toEqual([1]);
+  });
+});
+
+describe("the cleanup deadline is validated fail-closed (round 5, M-1)", () => {
+  // The finding: `Number(env)` accepted NaN, -5, 0, Infinity, and 2147483648,
+  // and `run.ts` forwarded the result straight to setTimeout — Node coerces
+  // every one to an effectively immediate deadline, so a LEGITIMATE 50 ms
+  // transport close was force-exited after ~4 ms under NaN while 200
+  // completed normally. Both seams now refuse everything outside the domain.
+
+  it("the env seam refuses every hostile value with the one-line typed refusal", () => {
+    // The five reviewer probes, a float, a non-numeric string — plus the
+    // strictness pins fail-closed implies: whitespace, sign, scientific
+    // notation, and below-minimum values are all refused too.
+    const hostile = [
+      "NaN",
+      "-5",
+      "0",
+      "Infinity",
+      "2147483648",
+      "1500.5",
+      "abc",
+      " 200",
+      "+200",
+      "1e3",
+      "99",
+    ];
+    for (const value of hostile) {
+      let thrown: unknown;
+      try {
+        parseCleanupDeadlineMs(value);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown, `${JSON.stringify(value)} must be refused`).toBeInstanceOf(
+        GatewayConfigurationError,
+      );
+      const message = (thrown as Error).message;
+      expect(message, "the refusal names the variable").toContain("GATEWAY_CLEANUP_DEADLINE_MS");
+      expect(message, "the refusal names the offending value").toContain(
+        `got ${JSON.stringify(value)}`,
+      );
+      expect(message, "the refusal names the permitted domain").toContain(
+        "from 100 to 2147483647",
+      );
+    }
+  });
+
+  it("the env seam accepts the domain and pins unset-or-empty as the default", () => {
+    // Decided and pinned: unset and empty both mean the default — the
+    // package's established treatment of an empty environment value as
+    // absent (`GATEWAY_CONFIG_PATH`).
+    expect(parseCleanupDeadlineMs(undefined)).toBe(DEFAULT_CLEANUP_DEADLINE_MS);
+    expect(parseCleanupDeadlineMs("")).toBe(DEFAULT_CLEANUP_DEADLINE_MS);
+    expect(parseCleanupDeadlineMs("100")).toBe(MIN_CLEANUP_DEADLINE_MS);
+    expect(parseCleanupDeadlineMs("2147483647")).toBe(MAX_CLEANUP_DEADLINE_MS);
+    expect(parseCleanupDeadlineMs("10000")).toBe(10_000);
+  });
+
+  it("the sequence seam refuses an out-of-domain option BEFORE any resource is acquired", async () => {
+    // A programmatic caller bypasses the env parser, so the sequence itself
+    // fails closed: no transport connect, no deadline, no signal handler —
+    // nothing exists yet when the typed refusal escapes.
+    const hostile = [Number.NaN, -5, 0, Number.POSITIVE_INFINITY, 2_147_483_648, 1500.5, 99];
+    for (const value of hostile) {
+      const host = recordingHost();
+      const lifetime = { acquired: 0, released: 0 };
+      const { transport, closes } = countingTransport();
+      const connect = vi.fn(() => Promise.resolve(transport));
+      const options = baseOptions({
+        config: {
+          streamName: "market-events",
+          wal: { rootPath: "/wal" },
+          markets: [],
+          coinbase: { productIds: ["BTC-USD"] },
+        },
+        connectTransport: connect,
+        host,
+        lifetime,
+        cleanupDeadlineMs: value,
+      });
+
+      await expect(
+        runGatewaySequence(options),
+        `${String(value)} must be refused`,
+      ).rejects.toBeInstanceOf(GatewayConfigurationError);
+
+      expect(connect, `${String(value)}: nothing may be acquired`).not.toHaveBeenCalled();
+      expect(closes()).toBe(0);
+      expect(host.deadlines, `${String(value)}: no deadline may arm`).toHaveLength(0);
+      expect(host.shutdownHandlers).toHaveLength(0);
+      expect(lifetime).toEqual({ acquired: 0, released: 0 });
+    }
+  });
+});
+
+describe("create()'s internal cleanup runs under the deadline (round 5, M-2)", () => {
+  it("a never-settling journal close after a post-open construction error: the deadline armed inside create() fires, logs, and forces exit 1", async () => {
+    // The reviewer's regression, in-process. At 767ecfd `create()` awaited
+    // `journal.close()` BEFORE rejecting, and the sequence armed its deadline
+    // only in its catch — so a close that never settled left the sequence
+    // pending forever: deadline arms 0, transport closes 0, and a connected
+    // transport's referenced handle would hold the process indefinitely.
+    const neverSettlingJournal = {
+      close: (): Promise<void> =>
+        new Promise<void>(() => {
+          // Deliberately never settles.
+        }),
+      settle: async (): Promise<void> => {},
+      tick: async (): Promise<void> => {},
+    };
+    vi.spyOn(GatewayJournal, "open").mockResolvedValue(
+      neverSettlingJournal as unknown as GatewayJournal,
+    );
+
+    const host = recordingHost();
+    const lifetime = { acquired: 0, released: 0 };
+    const { transport, closes } = countingTransport();
+    const options = baseOptions({
+      config: {
+        streamName: "market-events",
+        wal: { rootPath: "/wal" },
+        markets: [MARKET],
+        // The post-open construction refusal: the feed is configured but its
+        // ports are absent, so #buildFeeds throws AFTER the journal opened.
+        polymarket: { feedId: "pm-main" },
+      },
+      connectTransport: () => Promise.resolve(transport),
+      host,
+      lifetime,
+      cleanupDeadlineMs: 1_500,
+    });
+
+    // The sequence CANNOT settle while create()'s close hangs — that is the
+    // finding. Deliberately not awaited; it stays pending past this test.
+    const sequence = runGatewaySequence(options);
+    sequence.catch(() => {
+      // Never reached in this scenario; guards a future unhandled rejection.
+    });
+
+    await vi.waitFor(() => {
+      expect(host.deadlines, "create() must arm the deadline at failure-path entry").toHaveLength(
+        1,
+      );
+    });
+    expect(host.deadlines[0]?.delayMs).toBe(1_500);
+    expect(
+      host.deadlines[0]?.cancelled(),
+      "a close that never settles must never cancel its deadline",
+    ).toBe(false);
+    expect(closes(), "the sequence catch never ran, so the transport is untouched").toBe(0);
+    expect(host.forcedExits).toEqual([]);
+
+    // The sequence is pending — create() never rejected.
+    const settledState = await Promise.race([
+      sequence.then(
+        () => "settled",
+        () => "settled",
+      ),
+      new Promise<string>((resolvePending) => {
+        setTimeout(() => {
+          resolvePending("pending");
+        }, 25);
+      }),
+    ]);
+    expect(settledState, "create() cannot settle while its close hangs").toBe("pending");
+
+    // The referenced timer fires: forced nonzero exit, deadline log present.
+    host.deadlines[0]?.expire();
+    expect(host.forcedExits).toEqual([1]);
+    expect(host.lines.join("\n")).toContain("cleanup deadline");
+    expect(host.lines.join("\n")).toContain("fatal-startup");
   });
 });

@@ -46,11 +46,24 @@ the `apps/research-worker` precedent established by `WP-130`.
 | `GATEWAY_CONFIG_PATH` | *(required)* | JSON file matching `GatewayConfigSchema` |
 | `GATEWAY_REDIS_URL` | `redis://127.0.0.1:6379` | transport connection |
 | `GATEWAY_RETENTION_EVENTS` | `100000` | transport retention bound |
+| `GATEWAY_CLEANUP_DEADLINE_MS` | `10000` | hard deadline (milliseconds) for both cleanup paths — fatal startup and signal shutdown; a whole number from `100` to `2147483647`; unset or empty means the default; any other value refuses startup with exit 1 |
 | `PMB_GATEWAY_REDIS_PORT` | `6379` | host port for the compose Redis |
 
 **Retention is a safety parameter, not a tuning knob** (ADR-003). Retention
 shorter than the worst tolerated trader restart turns an ordinary restart into
 a hard resync plus an authoritative-snapshot cycle.
+
+**The cleanup deadline is a safety parameter too.** If a resource's cleanup
+hangs or fails while holding a referenced handle, the process force-exits
+nonzero when the deadline expires (stderr shows `cleanup deadline … expired`)
+instead of wedging. On a forced exit, disposal may be incomplete: treat the
+WAL tail as crash-recovered — the next start recovers it (the `WP-050`
+recovery shape) and nothing manifested is lost. The value is validated
+fail-closed at startup: below `100` the deadline would race cleanups that are
+completing normally (OS/event-loop jitter), and outside Node's timer range
+(`1`–`2147483647` ms) the runtime silently coerces the delay to an effectively
+immediate timer — either way the "fallback" would punish healthy cleanups, so
+such values are refused before any resource is acquired.
 
 ## Configuration notes
 

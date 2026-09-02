@@ -25,6 +25,7 @@ import { GatewayStateError } from "./errors.js";
 import type { GatewayPorts } from "./gateway.js";
 import { DataGateway } from "./gateway.js";
 import { GatewayJournal } from "./journal.js";
+import type { CleanupDeadline } from "./ports.js";
 import {
   deterministicIdSource,
   ManualGatewayClock,
@@ -119,6 +120,119 @@ describe("DataGateway.create() transactionality (R3-H1)", () => {
 
     await gateway.stop();
     expect(closes(), "double stop stays exactly-once").toBe(1);
+  });
+});
+
+/** Records the round-5 M-2 capability's arms and cancels. */
+function recordingDeadline(): {
+  deadline: CleanupDeadline;
+  arms: () => number;
+  cancels: () => number;
+} {
+  let arms = 0;
+  let cancels = 0;
+  return {
+    arms: () => arms,
+    cancels: () => cancels,
+    deadline: {
+      arm: () => {
+        arms += 1;
+        return () => {
+          cancels += 1;
+        };
+      },
+    },
+  };
+}
+
+describe("create()'s post-open cleanup under the deadline capability (round 5, M-2)", () => {
+  it("arms the capability at failure-path entry and cancels it when the journal close completes", async () => {
+    const { journal, closes } = closeCountingJournal();
+    vi.spyOn(GatewayJournal, "open").mockResolvedValue(journal);
+    const { deadline, arms, cancels } = recordingDeadline();
+
+    const config = parseGatewayConfig({
+      streamName: "market-events",
+      wal: { rootPath: "/wal" },
+      markets: [MARKET],
+      polymarket: { feedId: "pm-main" },
+    });
+
+    // The ORIGINAL error still escapes; the bracket changes only its bound.
+    await expect(
+      DataGateway.create(config, ports(), { cleanupDeadline: deadline }),
+    ).rejects.toBeInstanceOf(GatewayStateError);
+
+    expect(arms(), "armed exactly once, when the failure path began").toBe(1);
+    expect(cancels(), "cancelled exactly once, when the close completed").toBe(1);
+    expect(closes(), "the journal is still closed exactly once").toBe(1);
+  });
+
+  it("never arms the capability on a successful create(): the deadline guards failure paths, not normal opens", async () => {
+    const { journal, closes } = closeCountingJournal();
+    vi.spyOn(GatewayJournal, "open").mockResolvedValue(journal);
+    const { deadline, arms } = recordingDeadline();
+
+    const config = parseGatewayConfig({
+      streamName: "market-events",
+      wal: { rootPath: "/wal" },
+      markets: [],
+      coinbase: { productIds: ["BTC-USD"] },
+    });
+
+    const gateway = await DataGateway.create(config, ports(), { cleanupDeadline: deadline });
+    expect(arms(), "an ordinary startup must never be treated as a cleanup failure").toBe(0);
+
+    await gateway.stop();
+    expect(closes()).toBe(1);
+    expect(arms(), "stop() is bounded by the sequence's own deadline, not this bracket").toBe(0);
+  });
+
+  it("a never-settling journal close keeps the armed capability uncancelled and create() pending", async () => {
+    // The M-2 shape at the create() seam: the bracket stays armed (its expiry
+    // — log plus forced exit — belongs to the sequence that supplied it, and
+    // is exercised in run.test.ts and the subprocess regression).
+    const neverSettlingJournal = {
+      close: (): Promise<void> =>
+        new Promise<void>(() => {
+          // Deliberately never settles.
+        }),
+      settle: async (): Promise<void> => {},
+      tick: async (): Promise<void> => {},
+    };
+    vi.spyOn(GatewayJournal, "open").mockResolvedValue(
+      neverSettlingJournal as unknown as GatewayJournal,
+    );
+    const { deadline, arms, cancels } = recordingDeadline();
+
+    const config = parseGatewayConfig({
+      streamName: "market-events",
+      wal: { rootPath: "/wal" },
+      markets: [MARKET],
+      polymarket: { feedId: "pm-main" },
+    });
+
+    const creating = DataGateway.create(config, ports(), { cleanupDeadline: deadline });
+    creating.catch(() => {
+      // Never reached in this scenario; guards a future unhandled rejection.
+    });
+
+    await vi.waitFor(() => {
+      expect(arms()).toBe(1);
+    });
+    const settledState = await Promise.race([
+      creating.then(
+        () => "settled",
+        () => "settled",
+      ),
+      new Promise<string>((resolvePending) => {
+        setTimeout(() => {
+          resolvePending("pending");
+        }, 25);
+      }),
+    ]);
+    expect(settledState, "create() cannot settle while its close hangs").toBe("pending");
+    expect(cancels(), "a hung close must never cancel the bracket").toBe(0);
   });
 });
 

@@ -24,7 +24,14 @@
  *                              holding a referenced handle, the process
  *                              force-exits nonzero when this expires instead
  *                              of wedging. A safety parameter, not a tuning
- *                              knob.
+ *                              knob. Round 5 (M-1): parsed FAIL-CLOSED — a
+ *                              whole number of milliseconds from 100 to
+ *                              2147483647; unset or empty means the default;
+ *                              anything else is refused with a one-line
+ *                              typed error and exit 1 before any resource is
+ *                              acquired, because Node coerces such values to
+ *                              an effectively immediate deadline that
+ *                              force-exits healthy cleanups.
  *
  * ## Recording does not depend on the transport (§4.2, review H5)
  *
@@ -45,20 +52,23 @@
  * REFERENCED lifetime handle through the `lifetime` port
  * (`systemGatewayLifetime()` here) and `stop()` releases it exactly once.
  *
- * ## Fatal startup releases everything it acquired (review R3-H1)
+ * ## Fatal startup cleans up everything it acquired (review R3-H1)
  *
  * The mirror image of R2-H5: at `45c231c` a fatal error AFTER the transport
  * connected — a WAL that would not open — logged `data-gateway: fatal`, set
  * the exit code, and then sat forever on the connected transport's referenced
  * socket, which nothing closed. Startup is now TRANSACTIONAL
  * (`runGatewaySequence` in `./run.ts`): on any fatal startup error, every
- * resource acquired so far is released exactly once — the transport directly
- * if the gateway does not exist yet, or via `gateway.stop()` (journal,
- * transport, lifetime anchor) if it does — before the error reaches the
- * handler below. The intended contract therefore holds in BOTH directions:
- * the process runs until a shutdown signal, or until a startup defect it
- * cannot record through (missing or invalid configuration, or a WAL that will
- * not open) makes it exit loudly, promptly, with a nonzero code.
+ * resource acquired so far has its cleanup ATTEMPTED exactly once — the
+ * transport directly if the gateway does not exist yet, or via
+ * `gateway.stop()` (journal, transport, lifetime anchor) if it does — before
+ * the error reaches the handler below; when a cleanup will not complete, the
+ * round-4 deadline below bounds it, and a forced exit may leave that disposal
+ * incomplete (the WAL tail is then crash-recovered on the next start, the
+ * WP-050 recovery shape). The intended contract therefore holds in BOTH
+ * directions: the process runs until a shutdown signal, or until a startup
+ * defect it cannot record through (missing or invalid configuration, or a WAL
+ * that will not open) makes it exit loudly, promptly, with a nonzero code.
  *
  * ## The cleanup itself is deadline-guarded (round 4)
  *
@@ -87,7 +97,7 @@ import { nodeWalFileSystem } from "@polymarket-bot/storage-wal";
 
 import { parseGatewayConfig } from "./config.js";
 import { GatewayConfigurationError } from "./errors.js";
-import { DEFAULT_CLEANUP_DEADLINE_MS, runGatewaySequence } from "./run.js";
+import { parseCleanupDeadlineMs, runGatewaySequence } from "./run.js";
 import {
   systemGatewayClock,
   systemGatewayIdSource,
@@ -106,9 +116,12 @@ async function main(): Promise<void> {
 
   const redisUrl = process.env["GATEWAY_REDIS_URL"] ?? "redis://127.0.0.1:6379";
   const retentionEvents = Number(process.env["GATEWAY_RETENTION_EVENTS"] ?? "100000");
-  const cleanupDeadlineMs = Number(
-    process.env["GATEWAY_CLEANUP_DEADLINE_MS"] ?? String(DEFAULT_CLEANUP_DEADLINE_MS),
-  );
+  // Round 5 (M-1): fail closed. `Number(env)` accepted NaN, 0, -5, Infinity,
+  // and beyond-timer-range values, every one of which Node coerces to an
+  // effectively immediate deadline — turning the fallback into a punishment
+  // for healthy cleanups. The parser refuses everything outside the domain
+  // with a one-line typed error, before any resource is acquired.
+  const cleanupDeadlineMs = parseCleanupDeadlineMs(process.env["GATEWAY_CLEANUP_DEADLINE_MS"]);
 
   await runGatewaySequence({
     config,

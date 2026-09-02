@@ -59,6 +59,7 @@ import { IncidentRegistry } from "./incidents.js";
 import { GatewayJournal } from "./journal.js";
 import type {
   CancelScheduled,
+  CleanupDeadline,
   GatewayClock,
   GatewayIdSource,
   GatewayLifetime,
@@ -123,6 +124,22 @@ export interface GatewayPorts {
   readonly binanceSocketFactory?: BinanceSocketFactory;
   readonly coinbaseSocketFactory?: CoinbaseSocketFactory;
   readonly observer?: GatewayObserver;
+}
+
+/**
+ * Options for {@link DataGateway.create} beyond the ports (round 5, M-2).
+ *
+ * `cleanupDeadline` brings `create()`'s internal post-open cleanup — the
+ * journal close it awaits before rejecting — under the composition sequence's
+ * cleanup hard-deadline. `runGatewaySequence` ALWAYS supplies it (derived
+ * from the required `GatewayHost` effects); it is optional here only so
+ * library and test callers of `create()` are not forced to fabricate a
+ * process-exit capability — such a caller keeps the round-4 semantics, where
+ * the await is bounded by `GatewayJournal.close()`'s non-rejecting contract
+ * but not by a timer.
+ */
+export interface GatewayCreateOptions {
+  readonly cleanupDeadline?: CleanupDeadline;
 }
 
 export interface GatewayMetrics {
@@ -190,7 +207,11 @@ export class DataGateway {
   }
 
   /** Builds the gateway: one epoch, one WAL directory, one publish stream. */
-  static async create(config: GatewayConfig, ports: GatewayPorts): Promise<DataGateway> {
+  static async create(
+    config: GatewayConfig,
+    ports: GatewayPorts,
+    options: GatewayCreateOptions = {},
+  ): Promise<DataGateway> {
     const gatewayEpoch = ports.ids.newUuid();
     const sequencer = new IngestSequencer(gatewayEpoch);
     const observer = ports.observer ?? {};
@@ -258,6 +279,17 @@ export class DataGateway {
     // CALLER's to release when `create()` rejects — this method never
     // connected it and closing borrowed resources would break single
     // ownership (`run.ts` is that caller in the real process).
+    //
+    // Round 5 (M-2): that internal close was the ONE cleanup await on the
+    // startup failure path outside the round-4 deadline — the sequence arms
+    // its deadline only in ITS catch, which a never-settling `journal.close()`
+    // here prevented from ever running, so a connected transport's referenced
+    // handle held the "rejecting" process forever. The catch below therefore
+    // arms the caller-supplied `cleanupDeadline` capability the moment the
+    // failure path begins (never around the normal open above) and cancels it
+    // only when the close COMPLETES: a close that hangs — or ever broke the
+    // non-rejecting contract — ends in the deadline's logged, forced nonzero
+    // exit instead of a wedge.
     try {
       const publisher = new GatewayPublisher({
         transport: ports.transport,
@@ -311,7 +343,9 @@ export class DataGateway {
         directory,
       });
     } catch (error) {
+      const cancelDeadline = options.cleanupDeadline?.arm();
       await journal.close();
+      cancelDeadline?.();
       throw error;
     }
   }

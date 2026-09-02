@@ -15,7 +15,12 @@
  */
 
 export { DataGateway } from "./gateway.js";
-export type { GatewayMetrics, GatewayObserver, GatewayPorts } from "./gateway.js";
+export type {
+  GatewayCreateOptions,
+  GatewayMetrics,
+  GatewayObserver,
+  GatewayPorts,
+} from "./gateway.js";
 
 export { GatewayConfigSchema, parseGatewayConfig } from "./config.js";
 export type { GatewayConfig, MarketConfig } from "./config.js";
@@ -70,7 +75,9 @@ export type { DisposalFailure, GatewayErrorCode } from "./errors.js";
 
 export { isoFromMs, takeReceipt } from "./ports.js";
 export type {
+  CancelCleanupDeadline,
   CancelScheduled,
+  CleanupDeadline,
   GatewayClock,
   GatewayIdSource,
   GatewayLifetime,

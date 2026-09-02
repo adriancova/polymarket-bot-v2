@@ -32,6 +32,14 @@
  * state closed loopback ports can produce (the `UnavailableEventTransport`
  * fallback): WAL-open failure → cleanup log → prompt exit 1.
  *
+ * Round 5 adds four pins: hostile `GATEWAY_CLEANUP_DEADLINE_MS` values are
+ * refused fail-closed through the REAL bundle before anything opens, unset or
+ * empty means the default (M-1); a valid deadline never punishes a
+ * legitimate slow cleanup (M-1); and a `journal.close()` that never settles
+ * inside `create()`'s own post-open cleanup still force-exits within the
+ * bound (M-2 — before the fix that child hung to this suite's SIGKILL guard
+ * with the deadline never armed and the transport never closed).
+ *
  * SAFETY: closed loopback ports only (`redis://127.0.0.1:1`,
  * `wss://127.0.0.1:1`, and a refused-before-dial `ws://127.0.0.1:1`); no
  * server listens anywhere; no venue, no credential, nothing leaves this
@@ -383,5 +391,220 @@ describe("fatal startup releases every acquired resource (R3-H1)", () => {
       expect(outcome.signal).toBeNull();
     },
     40_000,
+  );
+
+  it(
+    "hostile GATEWAY_CLEANUP_DEADLINE_MS values are refused fail-closed before anything opens (round 5, M-1)",
+    async () => {
+      // The round-5 finding: `Number(env)` accepted every one of these, and
+      // Node's setTimeout coerced each to an effectively immediate deadline —
+      // NaN force-exited a LEGITIMATE 50 ms transport close after ~4 ms. The
+      // config here is VALID; only the deadline is hostile, so a pass proves
+      // the refusal happens before the transport is attempted or the WAL
+      // opens (the unreachable-bus line below never appears).
+      const configPath = join(workDir, "gateway.json");
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          streamName: "market-events",
+          wal: { rootPath: join(workDir, "wal"), fsyncIntervalMs: 100 },
+          tickIntervalMs: 100,
+          markets: [],
+          coinbase: { productIds: ["BTC-USD"], endpoint: "wss://127.0.0.1:1" },
+        }),
+      );
+
+      // The five reviewer probes, a float, and a non-numeric string.
+      const hostile = ["NaN", "-5", "0", "Infinity", "2147483648", "1500.5", "not-a-number"];
+      for (const value of hostile) {
+        const outcome = await runToExit(
+          mainBundlePath,
+          configPath,
+          {
+            GATEWAY_REDIS_URL: "redis://127.0.0.1:1",
+            GATEWAY_CLEANUP_DEADLINE_MS: value,
+          },
+          15_000,
+          `round-5 M-1 regression: GATEWAY_CLEANUP_DEADLINE_MS=${value} did not refuse promptly`,
+        );
+        expect(outcome.stderr, `${value}: the refusal must name the variable`).toContain(
+          "GATEWAY_CLEANUP_DEADLINE_MS",
+        );
+        expect(outcome.stderr, `${value}: the refusal must name the offending value`).toContain(
+          `got "${value}"`,
+        );
+        expect(outcome.stderr, `${value}: the refusal must name the permitted domain`).toContain(
+          "from 100 to 2147483647",
+        );
+        expect(
+          outcome.stderr,
+          `${value}: the refusal must precede the transport attempt`,
+        ).not.toContain("the event bus was unreachable at startup");
+        expect(outcome.stderr, `${value}: nothing may start`).not.toContain(
+          "data-gateway running",
+        );
+        expect(outcome.code, `${value}: exit code`).toBe(1);
+        expect(outcome.signal, `${value}: no signal`).toBeNull();
+      }
+    },
+    120_000,
+  );
+
+  it(
+    "an unset-or-empty GATEWAY_CLEANUP_DEADLINE_MS means the default: the sequence still runs (round 5, M-1)",
+    async () => {
+      // Pins the decided empty/unset semantics through the REAL bundle: empty
+      // is absent (the package's GATEWAY_CONFIG_PATH treatment), so the
+      // sequence runs under the default deadline — proven by the fatal
+      // cleanup lines appearing with NO deadline refusal.
+      const walRootFile = join(workDir, "wal-root-is-a-file");
+      await writeFile(walRootFile, "not a directory\n");
+      const configPath = join(workDir, "gateway.json");
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          streamName: "market-events",
+          wal: { rootPath: walRootFile, fsyncIntervalMs: 100 },
+          tickIntervalMs: 100,
+          markets: [],
+          coinbase: { productIds: ["BTC-USD"], endpoint: "wss://127.0.0.1:1" },
+        }),
+      );
+
+      const outcome = await runToExit(
+        mainBundlePath,
+        configPath,
+        { GATEWAY_REDIS_URL: "redis://127.0.0.1:1", GATEWAY_CLEANUP_DEADLINE_MS: "" },
+        20_000,
+        "round-5 M-1 regression: an empty GATEWAY_CLEANUP_DEADLINE_MS hung instead of defaulting",
+      );
+
+      expect(outcome.stderr, "empty means default, never a refusal").not.toContain(
+        "must be a whole number of milliseconds",
+      );
+      expect(outcome.stderr, "the sequence ran under the default").toContain(
+        "startup failed before the gateway existed; closing the event-bus transport",
+      );
+      expect(outcome.code).toBe(1);
+      expect(outcome.signal).toBeNull();
+    },
+    40_000,
+  );
+
+  it(
+    "a valid small deadline never punishes a legitimate slow cleanup (round 5, M-1)",
+    async () => {
+      // The reviewer's healthy-cleanup control, pinned: a transport close that
+      // LEGITIMATELY takes 50 ms under a valid 200 ms deadline completes
+      // normally — exit 1 by the ordinary fatal path, deadline log absent.
+      // (Unfixed, `NaN` reached setTimeout here and force-exited this same
+      // close after ~4 ms with `cleanup deadline (NaN ms)` on stderr.)
+      const walRootFile = join(workDir, "wal-root-is-a-file");
+      await writeFile(walRootFile, "not a directory\n");
+      const configPath = join(workDir, "gateway.json");
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          streamName: "market-events",
+          wal: { rootPath: walRootFile, fsyncIntervalMs: 100 },
+          tickIntervalMs: 100,
+          markets: [],
+          coinbase: { productIds: ["BTC-USD"], endpoint: "wss://127.0.0.1:1" },
+        }),
+      );
+
+      const outcome = await runToExit(
+        probeBundlePath,
+        configPath,
+        {
+          GATEWAY_PROBE_TRANSPORT_CLOSE: "resolve-after-50ms",
+          GATEWAY_CLEANUP_DEADLINE_MS: "200",
+        },
+        15_000,
+        "round-5 M-1 regression: the legitimate 50 ms close under a 200 ms deadline hung",
+      );
+
+      expect(outcome.stderr, "a healthy cleanup must never see the deadline fire").not.toContain(
+        "cleanup deadline",
+      );
+      expect(outcome.stderr).toContain("[probe] transport.close() call 1");
+      expect(outcome.stderr).not.toContain("[probe] transport.close() call 2");
+      expect(outcome.code).toBe(1);
+      expect(outcome.signal).toBeNull();
+    },
+    30_000,
+  );
+
+  it(
+    "a journal close that never settles inside create()'s own cleanup: the deadline forces exit 1 within the bound (round 5, M-2)",
+    async () => {
+      // The reviewer's exact regression: a post-open feed-construction
+      // refusal (the Polymarket ports are omitted while the feed is
+      // configured) plus a never-settling journal close, with the
+      // reference-owning transport connected. At 767ecfd `create()` awaited
+      // `journal.close()` BEFORE rejecting and the sequence's deadline armed
+      // only in its catch — so this child stayed pending forever: deadline
+      // arms 0, transport closes 0, referenced handle held until this
+      // suite's SIGKILL guard. Fixed, create() arms the sequence-supplied
+      // deadline the moment its failure path begins, and the expiry forces
+      // the exit.
+      const configPath = join(workDir, "gateway.json");
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          streamName: "market-events",
+          wal: { rootPath: join(workDir, "wal"), fsyncIntervalMs: 100 },
+          tickIntervalMs: 100,
+          markets: [
+            {
+              internalMarketId: "01990000-0000-7000-8000-000000000001",
+              conditionId: "0x" + "ab".repeat(31),
+              yesTokenId: "11111",
+              noTokenId: "22222",
+              parameters: {
+                tickSize: "0.01",
+                minimumOrderSize: "5",
+                negRisk: false,
+                tradingDelaySeconds: 0,
+                status: "OPEN",
+              },
+              observedAt: "2026-08-30T12:00:00.000Z",
+            },
+          ],
+          polymarket: { feedId: "pm-main", url: "wss://127.0.0.1:1" },
+        }),
+      );
+
+      const startedAtMs = Date.now();
+      const outcome = await runToExit(
+        probeBundlePath,
+        configPath,
+        {
+          GATEWAY_PROBE_OMIT_PORT: "polymarket",
+          GATEWAY_PROBE_JOURNAL_CLOSE: "never-settle",
+          GATEWAY_CLEANUP_DEADLINE_MS: "1500",
+        },
+        15_000,
+        "round-5 M-2 regression: a never-settling journal close inside create() hung " +
+          "instead of force-exiting — the deadline never covered create()'s own cleanup",
+      );
+      const elapsedMs = Date.now() - startedAtMs;
+
+      expect(outcome.stderr, "the injected hang must have been reached").toContain(
+        "[probe] journal.close() will never settle (injected)",
+      );
+      expect(outcome.stderr, "the deadline must announce the forced exit").toContain(
+        "cleanup deadline",
+      );
+      expect(outcome.stderr).toContain("fatal-startup");
+      expect(
+        outcome.stderr,
+        "the sequence catch never runs — create() is still pending when the deadline fires",
+      ).not.toContain("[probe] transport.close() call");
+      expect(outcome.code).toBe(1);
+      expect(outcome.signal).toBeNull();
+      expect(elapsedMs, "the forced exit must arrive within the bound").toBeLessThan(10_000);
+    },
+    30_000,
   );
 });

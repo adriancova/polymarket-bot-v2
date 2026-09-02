@@ -50,7 +50,8 @@ import { nodeWalFileSystem } from "@polymarket-bot/storage-wal";
 
 import { parseGatewayConfig } from "../config.js";
 import { GatewayConfigurationError } from "../errors.js";
-import { DEFAULT_CLEANUP_DEADLINE_MS, runGatewaySequence } from "../run.js";
+import { GatewayJournal } from "../journal.js";
+import { parseCleanupDeadlineMs, runGatewaySequence } from "../run.js";
 import {
   systemGatewayClock,
   systemGatewayIdSource,
@@ -73,7 +74,10 @@ function connectedReferencedTransport(): MarketEventTransport {
   // Round 4: `GATEWAY_PROBE_TRANSPORT_CLOSE=reject-holding-handle` models the
   // round-4 finding's transport — `close()` REJECTS before releasing its
   // referenced handle, so a failed cleanup leaves the handle alive. The
-  // default ("resolve") is the round-3 behavior, unchanged.
+  // default ("resolve") is the round-3 behavior, unchanged. Round 5 (M-1)
+  // adds "resolve-after-50ms": a HEALTHY close that merely takes 50 ms — the
+  // reviewer's legitimate-cleanup shape, which a valid deadline must never
+  // punish (and which an unvalidated `NaN` deadline force-exited after ~4 ms).
   const closeMode = process.env["GATEWAY_PROBE_TRANSPORT_CLOSE"] ?? "resolve";
   // Deliberately NOT unref'd: this is the connected socket's stand-in.
   const handle = setInterval(() => {
@@ -92,6 +96,13 @@ function connectedReferencedTransport(): MarketEventTransport {
       if (closeMode === "reject-holding-handle") {
         throw new Error("injected transport close rejection (handle still referenced)");
       }
+      if (closeMode === "resolve-after-50ms") {
+        // A LEGITIMATE close that takes 50 ms (round 5, M-1): resolves and
+        // releases the handle, just not instantly.
+        await new Promise<void>((resolveDelay) => {
+          setTimeout(resolveDelay, 50);
+        });
+      }
       clearInterval(handle);
       await inner.close();
     },
@@ -107,6 +118,28 @@ async function main(): Promise<void> {
   }
   const config = parseGatewayConfig(JSON.parse(await readFile(configPath, "utf8")));
 
+  // Round 5 (M-2): `GATEWAY_PROBE_JOURNAL_CLOSE=never-settle` models a WAL
+  // disposal that never settles, striking inside `DataGateway.create()`'s own
+  // post-open cleanup — the one cleanup await the round-4 deadline did not
+  // cover (the sequence's deadline armed only after `create()` rejected,
+  // which a never-settling close prevents forever). Dev-only prototype patch:
+  // no production seam exists to replace the internal journal in a bundled
+  // subprocess, and adding one for a test's sake would be worse.
+  if (process.env["GATEWAY_PROBE_JOURNAL_CLOSE"] === "never-settle") {
+    GatewayJournal.prototype.close = function neverSettlingClose(): Promise<void> {
+      console.error("[probe] journal.close() will never settle (injected)");
+      return new Promise<void>(() => {
+        // Deliberately never settles.
+      });
+    };
+  }
+
+  // Round 5 (M-2): `GATEWAY_PROBE_OMIT_PORT=polymarket` omits the Polymarket
+  // feed's ports so a config that enables that feed makes `#buildFeeds()`
+  // throw AFTER the journal opened — the post-open construction refusal of
+  // the reviewer's regression, injected without touching any source.
+  const omitPolymarketPorts = process.env["GATEWAY_PROBE_OMIT_PORT"] === "polymarket";
+
   await runGatewaySequence({
     config,
     // The one substitution (see the header): resolves — the transport is
@@ -114,17 +147,20 @@ async function main(): Promise<void> {
     connectTransport: () => Promise.resolve(connectedReferencedTransport()),
     retentionEvents: 100_000,
     // Round 4: same knob `main.ts` exposes, so the deadline tests run fast.
-    cleanupDeadlineMs: Number(
-      process.env["GATEWAY_CLEANUP_DEADLINE_MS"] ?? String(DEFAULT_CLEANUP_DEADLINE_MS),
-    ),
+    // Round 5 (M-1): the same fail-closed parser, too.
+    cleanupDeadlineMs: parseCleanupDeadlineMs(process.env["GATEWAY_CLEANUP_DEADLINE_MS"]),
     ports: {
       clock: systemGatewayClock(),
       ids: systemGatewayIdSource(),
       timers: systemGatewayTimers(),
       lifetime: systemGatewayLifetime(),
       walFileSystem: nodeWalFileSystem(),
-      polymarketSocketFactory: globalWebSocketFactory(),
-      polymarketHttpClient: globalHttpClient(),
+      ...(omitPolymarketPorts
+        ? {}
+        : {
+            polymarketSocketFactory: globalWebSocketFactory(),
+            polymarketHttpClient: globalHttpClient(),
+          }),
       rtdsSocketFactory: globalWebSocketFactory(),
       binanceSocketFactory: createWebSocketFactory(),
       coinbaseSocketFactory: nodeWebSocketFactory,
