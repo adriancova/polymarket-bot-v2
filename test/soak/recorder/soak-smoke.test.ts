@@ -5,10 +5,12 @@
  * REAL gateway bundle through the REAL harness (`run-soak.mjs`) for a
  * SECONDS-long loopback window and proves the evidence-collection machinery
  * works end to end: the record is written, parses under the fail-closed
- * schema, carries first-class honest duration, and evaluates to **PENDING**.
- * A soak's LENGTH cannot be tested by a test; only real elapsed time
- * provides it, and the final assertion here is precisely that this run does
- * not — and cannot — mark the soak satisfied.
+ * exact-key schema (primitives only — no status, no derived claims), carries
+ * first-class honest duration, and evaluates to **PENDING**. A soak's LENGTH
+ * cannot be tested by a test; only real elapsed time provides it, and the
+ * final assertion here is precisely that this run lands on PENDING — and
+ * that no state of the evaluator is presentable as completion (the best is
+ * QUALIFYING_WINDOW_FOUND, a candidate for human provenance review).
  *
  * Subprocess pattern per test/integration/data-gateway/process-liveness.test.ts
  * (WP-120): closed LOOPBACK ports only, nothing leaves the machine, and the
@@ -129,7 +131,8 @@ describe("soak-smoke: the evidence machinery, end to end", () => {
 
     // The recorder really ran, in the recording-only posture, and exited 0
     // on request with the shutdown log — the bidirectional exit contract's
-    // healthy half, observed from outside.
+    // healthy half, observed from outside. PRIMITIVES ONLY: cleanliness is
+    // not in the record; the evaluator derives it from these facts.
     expect(record.observed.runningBannerSeen).toBe(true);
     expect(record.observed.recordingOnly).toBe(true);
     expect(record.observed.shutdownLogSeen).toBe(true);
@@ -137,7 +140,7 @@ describe("soak-smoke: the evidence machinery, end to end", () => {
     expect(record.exit).toEqual({
       code: 0,
       signal: null,
-      cleanShutdown: true,
+      shutdownRequested: true,
       forcedKill: false,
     });
 
@@ -149,7 +152,8 @@ describe("soak-smoke: the evidence machinery, end to end", () => {
     expect(record.wal.epochs).toBeGreaterThanOrEqual(1);
     expect(record.wal.segments).toBe(0);
     expect(record.wal.records).toBe(0);
-    expect(record.wal.unexplainedGapSignals).toBe(0);
+    expect(record.observed.gapIncidents).toBe(0);
+    expect(record.observed.walRecordingFailures).toBe(0);
 
     // THE POINT: a seconds-long window evaluates to PENDING, and the reasons
     // carry the honest arithmetic. No path in this harness can mark the soak
@@ -195,7 +199,9 @@ describe("soak-smoke: the evidence machinery, end to end", () => {
     if (!parsed.ok) {
       return;
     }
-    expect(parsed.record.exit.cleanShutdown).toBe(false);
+    // No shutdown was requested (the process died first) — the primitives
+    // say so, and the evaluator derives "not clean" from them.
+    expect(parsed.record.exit.shutdownRequested).toBe(false);
     expect(parsed.record.exit.code).toBe(1);
     expect(parsed.record.observed.runningBannerSeen).toBe(false);
     // The window ended when the process died, not at the requested 30s.

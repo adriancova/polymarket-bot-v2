@@ -9,13 +9,19 @@
  * ONE machine-readable evidence record per window.
  *
  * Duration is FIRST-CLASS in the record (`startedAt`/`endedAt`/`elapsedMs`)
- * and the record carries NO status field: status exists only as the output
- * of the fail-closed evaluator
- * (`packages/observability/src/recorder/soak-evidence.ts`, run by
- * `pnpm run soak:evaluate` in this directory). A real soak is THIS script
- * run longer with a reviewed configuration — same harness, same record
- * shape, honest elapsed time either way. Nothing here can mark a soak
- * complete.
+ * and the record carries NO status field and NO derived claims — primitives
+ * only (exit code/signal, which signals the harness sent, which log lines it
+ * saw, what the WAL scan found); anything derived ("was the shutdown clean",
+ * "how many unexplained-gap signals") is computed by the fail-closed
+ * evaluator (`packages/observability/src/recorder/soak-evidence.ts`, run by
+ * `pnpm run soak:evaluate` in this directory), whose best terminal state is
+ * QUALIFYING_WINDOW_FOUND — a CANDIDATE for out-of-band provenance review,
+ * never completion. The harness and the evaluator share a filesystem trust
+ * domain, so the evaluator checks internal consistency, not provenance;
+ * closing the external-evidence gate is a governance act recorded in
+ * IMPLEMENTATION_STATUS.md. A real soak is THIS script run longer with a
+ * reviewed configuration — same harness, same record shape, honest elapsed
+ * time either way. Nothing here can mark a soak complete.
  *
  * Defaults are LOOPBACK-ONLY and self-contained: with no SOAK_CONFIG_PATH a
  * throwaway config is written that points the one configured feed at a
@@ -223,10 +229,13 @@ async function main() {
     cleanupDeadlineExpired: false,
     disposalFailures: 0,
     incidents: 0,
+    // Of the incidents, those with a GAP-shaped reason code — a PRIMITIVE
+    // observation; the evaluator derives "unexplained-gap signals" from it
+    // (plus walRecordingFailures) and refuses to qualify over any.
+    gapIncidents: 0,
     halts: 0,
     walRecordingFailures: 0,
   };
-  let gapIncidents = 0;
   let stderrTail = [];
   let pending = "";
   child.stderr.on("data", (chunk) => {
@@ -257,11 +266,11 @@ async function main() {
       const incident = INCIDENT_LINE.exec(line);
       if (incident !== null) {
         observed.incidents += 1;
-        // Gap-shaped incidents count toward the "unexplained" tally: the
-        // evaluator refuses to satisfy over them, and an operator explains
-        // them (or does not) in review — the conservative direction.
+        // Gap-shaped incidents count toward the derived "unexplained" tally:
+        // the evaluator refuses to qualify over them, and an operator
+        // explains them (or does not) in review — the conservative direction.
         if (incident.groups.reason.toUpperCase().includes("GAP")) {
-          gapIncidents += 1;
+          observed.gapIncidents += 1;
         }
       }
       if (line.startsWith(HALT_LINE)) {
@@ -307,17 +316,20 @@ async function main() {
 
   const endedAtMs = Date.now();
   const elapsedMs = Number((process.hrtime.bigint() - startedMonotonic) / 1000000n);
+  // For the harness EXIT CODE only — this is deliberately NOT recorded: the
+  // record carries the primitives and the evaluator derives cleanliness.
   const cleanShutdown =
     requestedShutdown &&
     !forcedKill &&
     exited !== undefined &&
     exited.code === 0 &&
     exited.signal === null &&
-    observed.shutdownLogSeen;
+    observed.shutdownLogSeen &&
+    !observed.cleanupDeadlineExpired;
 
   const wal = await scanWal(walRoot);
   const record = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "recorder-soak-window",
     harness: "test/soak/recorder/run-soak.mjs",
     startedAt: new Date(startedAtMs).toISOString(),
@@ -326,14 +338,11 @@ async function main() {
     exit: {
       code: exited?.code ?? null,
       signal: exited?.signal ?? null,
-      cleanShutdown,
+      shutdownRequested: requestedShutdown,
       forcedKill,
     },
     observed,
-    wal: {
-      ...wal,
-      unexplainedGapSignals: observed.walRecordingFailures + gapIncidents,
-    },
+    wal,
     notes: `stderr tail (${String(stderrTail.length)} lines) follows the record in the run log; window requested ${String(durationMs)} ms`,
   };
 
@@ -344,7 +353,7 @@ async function main() {
   await writeFile(recordPath, `${JSON.stringify(record, null, 2)}\n`);
   console.error(`run-soak: evidence written to ${recordPath}`);
   console.error(
-    `run-soak: window ${String(elapsedMs)} ms; records ${String(wal.records)}; clean shutdown ${String(cleanShutdown)}. Status is decided ONLY by soak:evaluate — a short window is honestly PENDING.`,
+    `run-soak: window ${String(elapsedMs)} ms; records ${String(wal.records)}; clean shutdown ${String(cleanShutdown)} (derived, not recorded). Status is decided ONLY by soak:evaluate — a short window is honestly PENDING, and the best any evidence can reach is QUALIFYING_WINDOW_FOUND, a candidate for human provenance review.`,
   );
   for (const line of stderrTail.slice(-40)) {
     console.error(`  | ${line}`);

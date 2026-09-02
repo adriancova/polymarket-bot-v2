@@ -8,26 +8,56 @@
  * elapsed-time evidence exists." The `WP-140` acceptance criterion restates
  * it: "Time-based soak remains pending until real elapsed evidence exists."
  *
- * This module is the machinery that makes PENDING the explicit,
- * machine-visible state. The soak harness (`test/soak/recorder/`) writes one
- * evidence record per recording window; the record's duration is
- * **first-class and recomputed** — `startedAt`/`endedAt` ISO timestamps plus
- * a claimed `elapsedMs` that evaluation recomputes and cross-checks. The
- * ONLY way to a `SATISFIED` status is through `evaluateSoakEvidence`, and it
- * fails closed:
+ * ## The trust domain, stated plainly (remediation round 1)
+ *
+ * The harness (`test/soak/recorder/`) and this evaluator share a FILESYSTEM
+ * TRUST DOMAIN: evidence records are unauthenticated JSON files, and anything
+ * that can write the evidence directory can write a record. Therefore this
+ * evaluator enforces INTERNAL CONSISTENCY and STRUCTURAL QUALIFICATION —
+ * never provenance. A hand-written but internally consistent record is
+ * indistinguishable from a real one HERE, by construction, and the verdict
+ * lattice is designed around that fact:
+ *
+ * - `INVALID` — some record is malformed, carries an unknown key, or
+ *   contradicts itself (poisons the whole set; bad evidence is resolved,
+ *   never skipped);
+ * - `PENDING` — no structurally qualifying window at or above the threshold
+ *   exists yet;
+ * - `QUALIFYING_WINDOW_FOUND` — the TERMINAL BEST state: one contiguous,
+ *   internally consistent window at or above the threshold, in which the
+ *   recorder demonstrably recorded, shut down cleanly on request (derived
+ *   from primitives, below), and reported zero unexplained-gap signals.
+ *
+ * `QUALIFYING_WINDOW_FOUND` is a CANDIDATE, not completion. No output of
+ * this module — status string, artifact, metric label — is named or
+ * presentable as final external-evidence satisfaction. Closing the gate is a
+ * GOVERNANCE ACT: the operator/orchestrator reviews the candidate window's
+ * provenance out of band (who started the run, the run log, the WAL on disk)
+ * and records completion in `IMPLEMENTATION_STATUS.md`. The evaluator's
+ * candidate state is the INPUT to that human step, never the step itself.
+ *
+ * ## Primitives only — no derived claims in the schema
+ *
+ * Records carry PRIMITIVE observations exclusively (exit code/signal, which
+ * signals the harness sent, which log lines it saw, what the WAL scan
+ * found). Derived facts — "was the shutdown clean", "how many
+ * unexplained-gap signals" — are computed HERE from those primitives
+ * (`derivedCleanShutdown`, `derivedUnexplainedGapSignals`), so there is no
+ * free-standing boolean a forged record can set to a value its own
+ * primitives contradict. Schema v1 carried two such derived fields
+ * (`exit.cleanShutdown`, `wal.unexplainedGapSignals`) and validated shape
+ * only; v2 removes them, rejects unknown keys at every level (a smuggled
+ * `status` key poisons the set), and cross-checks the consistency relations
+ * between the primitives that remain.
+ *
+ * Parsing fails closed:
  *
  * - no records → PENDING;
- * - any record that does not parse, whose timestamps are incoherent, whose
- *   claimed elapsed disagrees with its timestamps, or whose `endedAt` lies
- *   in the future → INVALID (the whole evidence set; a tampered or broken
- *   record is a fact an operator must resolve, not skip);
- * - the longest valid window below the threshold → PENDING;
- * - SATISFIED requires one single contiguous valid window at or above the
- *   threshold during which the recorder demonstrably ran (`runningBannerSeen`),
- *   shut down cleanly when asked, and reported **zero** unexplained-gap
- *   signals — the Phase-1 operational gate is "sustained recording soak with
- *   no unexplained gaps", so a window with gap signals cannot satisfy it no
- *   matter how long it is.
+ * - any record that does not parse, carries an unknown key anywhere, whose
+ *   timestamps are incoherent, whose claimed elapsed disagrees with its
+ *   timestamps, whose `endedAt` lies in the future, or whose primitive facts
+ *   contradict each other → INVALID for the whole set;
+ * - the longest valid window below the threshold → PENDING.
  *
  * There is deliberately no way to inject a lower threshold: the threshold is
  * a reviewed constant. A run that is not long enough is PENDING, honestly.
@@ -42,7 +72,12 @@
  * reviewed edit; nothing else in the machinery moves.
  */
 
-export const SOAK_EVIDENCE_SCHEMA_VERSION = 1;
+/**
+ * v2: derived fields removed from the schema (primitives only), exact-key
+ * validation, consistency relations. v1 records are refused (no real
+ * evidence exists; the evidence directory is runtime output, never a commit).
+ */
+export const SOAK_EVIDENCE_SCHEMA_VERSION = 2;
 
 export const SOAK_EVIDENCE_KIND = "recorder-soak-window";
 
@@ -64,13 +99,18 @@ export const SOAK_ELAPSED_TOLERANCE_MS = 5_000;
  */
 export const SOAK_FUTURE_SKEW_TOLERANCE_MS = 60_000;
 
+/**
+ * Exit facts, primitives only. "Was the shutdown clean" is NOT recorded —
+ * it is derived by `derivedCleanShutdown` from these plus the observed log
+ * lines, so a record cannot claim a cleanliness its own facts contradict.
+ */
 export interface SoakExitEvidence {
   /** The subprocess exit code; `null` when it was killed by a signal. */
   readonly code: number | null;
   /** The killing signal name; `null` on a normal exit. */
   readonly signal: string | null;
-  /** True when the recorder exited 0 after the harness's shutdown signal. */
-  readonly cleanShutdown: boolean;
+  /** True when the harness requested shutdown (SIGTERM) after the full window. */
+  readonly shutdownRequested: boolean;
   /** True when the harness had to force-kill the recorder (failed to exit). */
   readonly forcedKill: boolean;
 }
@@ -88,6 +128,8 @@ export interface SoakObservedEvidence {
   readonly disposalFailures: number;
   /** `[incident]` lines counted. */
   readonly incidents: number;
+  /** Of the `[incident]` lines, those whose reason code contains `GAP`. */
+  readonly gapIncidents: number;
   /** `[halt]` lines counted. */
   readonly halts: number;
   /** `[wal] recording failure` lines counted. */
@@ -103,17 +145,13 @@ export interface SoakWalEvidence {
   readonly records: number;
   /** Sum of manifest `byteSize`s. */
   readonly bytes: number;
-  /**
-   * Unexplained-gap signals for the window: WAL recording failures plus any
-   * frames-refused / messages-dropped evidence the harness observed. Zero is
-   * required for a SATISFIED soak (Phase-1 operational gate).
-   */
-  readonly unexplainedGapSignals: number;
 }
 
 /**
  * One recording window, as the harness observed it. The record carries **no
- * status field**: status exists only as the output of evaluation.
+ * status field and no derived fields** — primitives only; unknown keys at
+ * any level are refused (exact-key schema). Status exists only as the
+ * output of evaluation, and its best value is a candidate state.
  */
 export interface SoakWindowEvidence {
   readonly schemaVersion: typeof SOAK_EVIDENCE_SCHEMA_VERSION;
@@ -132,13 +170,19 @@ export interface SoakWindowEvidence {
   readonly notes?: string | undefined;
 }
 
-export type SoakStatus = "PENDING" | "SATISFIED" | "INVALID";
+/**
+ * The verdict lattice. `QUALIFYING_WINDOW_FOUND` is the terminal BEST state
+ * and is a candidate for out-of-band provenance review — no status value
+ * names or implies final external-evidence satisfaction, so no
+ * repository-controlled input can produce one that does.
+ */
+export type SoakStatus = "PENDING" | "QUALIFYING_WINDOW_FOUND" | "INVALID";
 
 export interface SoakEvaluation {
   readonly status: SoakStatus;
   /** Longest single valid window, ms; 0 with no valid windows. */
   readonly longestWindowMs: number;
-  /** Longest single window that also qualifies (clean, gap-free), ms. */
+  /** Longest single window that also structurally qualifies, ms. */
   readonly longestQualifyingWindowMs: number;
   readonly validWindows: number;
   readonly invalidRecords: number;
@@ -167,13 +211,66 @@ function isNonNegativeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+const TOP_LEVEL_KEYS = [
+  "schemaVersion",
+  "kind",
+  "harness",
+  "startedAt",
+  "endedAt",
+  "elapsedMs",
+  "exit",
+  "observed",
+  "wal",
+  "notes",
+] as const;
+
+const EXIT_KEYS = ["code", "signal", "shutdownRequested", "forcedKill"] as const;
+
+const OBSERVED_KEYS = [
+  "runningBannerSeen",
+  "recordingOnly",
+  "shutdownLogSeen",
+  "cleanupDeadlineExpired",
+  "disposalFailures",
+  "incidents",
+  "gapIncidents",
+  "halts",
+  "walRecordingFailures",
+] as const;
+
+const WAL_KEYS = ["epochs", "segments", "records", "bytes"] as const;
+
 /**
- * Parse one evidence record, fail-closed: anything missing, mistyped, or
- * incoherent is a stated reason, never a default.
+ * Exact-key check: the first key not in `allowed`, or `null`. A smuggled key
+ * — `status` above all — poisons the record; evidence carries exactly the
+ * declared primitives and nothing else.
+ */
+function unknownKey(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+): string | null {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) {
+      return key;
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse one evidence record, fail-closed: anything missing, mistyped,
+ * unknown-keyed, or self-contradictory is a stated reason, never a default.
  */
 export function parseSoakWindowEvidence(value: unknown): ParseResult {
   if (!isRecord(value)) {
     return { ok: false, reason: "evidence record is not a JSON object" };
+  }
+  const topExtra = unknownKey(value, TOP_LEVEL_KEYS);
+  if (topExtra !== null) {
+    return {
+      ok: false,
+      reason: `unknown key ${JSON.stringify(topExtra)} at the top level — evidence records carry exactly the declared primitive fields (no status, no derived claims)`,
+    };
   }
   if (value["schemaVersion"] !== SOAK_EVIDENCE_SCHEMA_VERSION) {
     return {
@@ -201,37 +298,64 @@ export function parseSoakWindowEvidence(value: unknown): ParseResult {
     return { ok: false, reason: "elapsedMs must be a non-negative safe integer" };
   }
   const exit = value["exit"];
+  if (!isRecord(exit)) {
+    return { ok: false, reason: "exit evidence is malformed" };
+  }
+  const exitExtra = unknownKey(exit, EXIT_KEYS);
+  if (exitExtra !== null) {
+    return {
+      ok: false,
+      reason: `unknown key ${JSON.stringify(exitExtra)} in exit — exit facts are primitives only (cleanliness is derived at evaluation, never recorded)`,
+    };
+  }
   if (
-    !isRecord(exit) ||
     !(exit["code"] === null || isFiniteNumber(exit["code"])) ||
     !(exit["signal"] === null || typeof exit["signal"] === "string") ||
-    !isBoolean(exit["cleanShutdown"]) ||
+    !isBoolean(exit["shutdownRequested"]) ||
     !isBoolean(exit["forcedKill"])
   ) {
     return { ok: false, reason: "exit evidence is malformed" };
   }
   const observed = value["observed"];
+  if (!isRecord(observed)) {
+    return { ok: false, reason: "observed evidence is malformed" };
+  }
+  const observedExtra = unknownKey(observed, OBSERVED_KEYS);
+  if (observedExtra !== null) {
+    return {
+      ok: false,
+      reason: `unknown key ${JSON.stringify(observedExtra)} in observed — exact-key schema`,
+    };
+  }
   if (
-    !isRecord(observed) ||
     !isBoolean(observed["runningBannerSeen"]) ||
     !isBoolean(observed["recordingOnly"]) ||
     !isBoolean(observed["shutdownLogSeen"]) ||
     !isBoolean(observed["cleanupDeadlineExpired"]) ||
     !isNonNegativeInteger(observed["disposalFailures"]) ||
     !isNonNegativeInteger(observed["incidents"]) ||
+    !isNonNegativeInteger(observed["gapIncidents"]) ||
     !isNonNegativeInteger(observed["halts"]) ||
     !isNonNegativeInteger(observed["walRecordingFailures"])
   ) {
     return { ok: false, reason: "observed evidence is malformed" };
   }
   const wal = value["wal"];
+  if (!isRecord(wal)) {
+    return { ok: false, reason: "wal evidence is malformed" };
+  }
+  const walExtra = unknownKey(wal, WAL_KEYS);
+  if (walExtra !== null) {
+    return {
+      ok: false,
+      reason: `unknown key ${JSON.stringify(walExtra)} in wal — exact-key schema (gap signals are derived from observed primitives, never recorded)`,
+    };
+  }
   if (
-    !isRecord(wal) ||
     !isNonNegativeInteger(wal["epochs"]) ||
     !isNonNegativeInteger(wal["segments"]) ||
     !isNonNegativeInteger(wal["records"]) ||
-    !isNonNegativeInteger(wal["bytes"]) ||
-    !isNonNegativeInteger(wal["unexplainedGapSignals"])
+    !isNonNegativeInteger(wal["bytes"])
   ) {
     return { ok: false, reason: "wal evidence is malformed" };
   }
@@ -239,52 +363,117 @@ export function parseSoakWindowEvidence(value: unknown): ParseResult {
   if (notes !== undefined && typeof notes !== "string") {
     return { ok: false, reason: "notes must be a string when present" };
   }
-  return {
-    ok: true,
-    record: {
-      schemaVersion: SOAK_EVIDENCE_SCHEMA_VERSION,
-      kind: SOAK_EVIDENCE_KIND,
-      harness,
-      startedAt,
-      endedAt,
-      elapsedMs,
-      exit: {
-        code: exit["code"] as number | null,
-        signal: exit["signal"] as string | null,
-        cleanShutdown: exit["cleanShutdown"] as boolean,
-        forcedKill: exit["forcedKill"] as boolean,
-      },
-      observed: {
-        runningBannerSeen: observed["runningBannerSeen"] as boolean,
-        recordingOnly: observed["recordingOnly"] as boolean,
-        shutdownLogSeen: observed["shutdownLogSeen"] as boolean,
-        cleanupDeadlineExpired: observed["cleanupDeadlineExpired"] as boolean,
-        disposalFailures: observed["disposalFailures"] as number,
-        incidents: observed["incidents"] as number,
-        halts: observed["halts"] as number,
-        walRecordingFailures: observed["walRecordingFailures"] as number,
-      },
-      wal: {
-        epochs: wal["epochs"] as number,
-        segments: wal["segments"] as number,
-        records: wal["records"] as number,
-        bytes: wal["bytes"] as number,
-        unexplainedGapSignals: wal["unexplainedGapSignals"] as number,
-      },
-      ...(notes === undefined ? {} : { notes }),
+
+  const record: SoakWindowEvidence = {
+    schemaVersion: SOAK_EVIDENCE_SCHEMA_VERSION,
+    kind: SOAK_EVIDENCE_KIND,
+    harness,
+    startedAt,
+    endedAt,
+    elapsedMs,
+    exit: {
+      code: exit["code"] as number | null,
+      signal: exit["signal"] as string | null,
+      shutdownRequested: exit["shutdownRequested"] as boolean,
+      forcedKill: exit["forcedKill"] as boolean,
     },
+    observed: {
+      runningBannerSeen: observed["runningBannerSeen"] as boolean,
+      recordingOnly: observed["recordingOnly"] as boolean,
+      shutdownLogSeen: observed["shutdownLogSeen"] as boolean,
+      cleanupDeadlineExpired: observed["cleanupDeadlineExpired"] as boolean,
+      disposalFailures: observed["disposalFailures"] as number,
+      incidents: observed["incidents"] as number,
+      gapIncidents: observed["gapIncidents"] as number,
+      halts: observed["halts"] as number,
+      walRecordingFailures: observed["walRecordingFailures"] as number,
+    },
+    wal: {
+      epochs: wal["epochs"] as number,
+      segments: wal["segments"] as number,
+      records: wal["records"] as number,
+      bytes: wal["bytes"] as number,
+    },
+    ...(notes === undefined ? {} : { notes }),
   };
+
+  const contradiction = consistencyViolation(record);
+  if (contradiction !== null) {
+    return { ok: false, reason: `facts contradict: ${contradiction}` };
+  }
+  return { ok: true, record };
 }
 
 /**
- * Why a valid window does not qualify toward SATISFIED, or `null` if it does.
+ * Consistency relations between the recorded primitives. A violated relation
+ * is a contradiction; a contradictory record poisons the set to INVALID.
+ * Every relation here is a strict invariant of the harness/process contract
+ * — a real record cannot violate one.
+ */
+export function consistencyViolation(record: SoakWindowEvidence): string | null {
+  const { exit, observed, wal } = record;
+  if ((exit.code === null) === (exit.signal === null)) {
+    return "exactly one of exit.code / exit.signal must be null — a process exits with a code or by a signal, never both or neither";
+  }
+  if (exit.forcedKill && !exit.shutdownRequested) {
+    return "forcedKill without shutdownRequested — the harness only force-kills after a requested shutdown timed out";
+  }
+  if (observed.recordingOnly && !observed.runningBannerSeen) {
+    return "recordingOnly without runningBannerSeen — the recording-only marker is a suffix of the running banner";
+  }
+  if (observed.gapIncidents > observed.incidents) {
+    return "gapIncidents exceeds incidents — every gap incident is an incident";
+  }
+  if (observed.cleanupDeadlineExpired && exit.code === 0) {
+    return "cleanupDeadlineExpired with exit code 0 — the cleanup-deadline force-exit is nonzero by contract (WP-120)";
+  }
+  if (wal.records > 0 && wal.segments === 0) {
+    return "wal.records > 0 with zero segments — records are summed from segment manifests";
+  }
+  if (wal.bytes > 0 && wal.segments === 0) {
+    return "wal.bytes > 0 with zero segments — bytes are summed from segment manifests";
+  }
+  if (wal.segments > 0 && wal.epochs === 0) {
+    return "wal.segments > 0 with zero epochs — segments live inside epoch directories";
+  }
+  return null;
+}
+
+/**
+ * Was the shutdown clean? DERIVED, never recorded: the harness requested it,
+ * did not have to force-kill, the process exited 0 without a signal, the
+ * shutdown log was seen, and no cleanup deadline expired.
+ */
+export function derivedCleanShutdown(record: SoakWindowEvidence): boolean {
+  return (
+    record.exit.shutdownRequested &&
+    !record.exit.forcedKill &&
+    record.exit.code === 0 &&
+    record.exit.signal === null &&
+    record.observed.shutdownLogSeen &&
+    !record.observed.cleanupDeadlineExpired
+  );
+}
+
+/**
+ * Unexplained-gap signals for the window: WAL recording failures plus
+ * GAP-reason incidents. DERIVED from observed primitives, never recorded.
+ * Zero is required for a window to qualify (Phase-1 operational gate:
+ * "sustained recording soak with no unexplained gaps") — the conservative
+ * reading: even a venue-side gap disqualifies until an operator reviews it.
+ */
+export function derivedUnexplainedGapSignals(record: SoakWindowEvidence): number {
+  return record.observed.walRecordingFailures + record.observed.gapIncidents;
+}
+
+/**
+ * Why a valid window does not structurally qualify, or `null` if it does.
+ * Qualification feeds `QUALIFYING_WINDOW_FOUND` — a candidate state; see the
+ * module header for what qualification does NOT establish (provenance).
  */
 export function disqualifyingReason(record: SoakWindowEvidence): string | null {
   if (!record.observed.runningBannerSeen) {
     return "the recorder's running banner was never seen — the window shows no recording";
-  }
-  if (!record.exit.cleanShutdown) {
-    return "the window did not end in a clean requested shutdown";
   }
   if (record.exit.forcedKill) {
     return "the harness had to force-kill the recorder";
@@ -292,11 +481,15 @@ export function disqualifyingReason(record: SoakWindowEvidence): string | null {
   if (record.observed.cleanupDeadlineExpired) {
     return "the cleanup deadline expired (forced exit)";
   }
-  if (record.wal.unexplainedGapSignals > 0) {
-    return `${String(record.wal.unexplainedGapSignals)} unexplained-gap signal(s) — a sustained soak requires zero`;
+  if (!derivedCleanShutdown(record)) {
+    return "the window did not end in a clean requested shutdown (derived from the exit and log primitives)";
   }
   if (record.observed.walRecordingFailures > 0) {
     return `${String(record.observed.walRecordingFailures)} WAL recording failure(s)`;
+  }
+  const gapSignals = derivedUnexplainedGapSignals(record);
+  if (gapSignals > 0) {
+    return `${String(gapSignals)} unexplained-gap signal(s) — a sustained soak requires zero`;
   }
   if (record.wal.records === 0) {
     return "no records were written — a soak must demonstrate recording, not just liveness";
@@ -305,7 +498,8 @@ export function disqualifyingReason(record: SoakWindowEvidence): string | null {
 }
 
 /**
- * Evaluate an evidence set. See the module header for the fail-closed rules.
+ * Evaluate an evidence set. See the module header for the fail-closed rules
+ * and for what the best status does — and does not — mean.
  *
  * `nowMs` is injected (epoch milliseconds) so the future-evidence check is
  * testable; callers pass `Date.now()`.
@@ -381,10 +575,10 @@ export function evaluateSoakEvidence(
   }
   if (longestQualifyingWindowMs >= thresholdMs) {
     reasons.push(
-      `status SATISFIED: a qualifying window of ${String(longestQualifyingWindowMs)} ms meets the ${String(thresholdMs)} ms threshold`,
+      `status QUALIFYING_WINDOW_FOUND: a structurally qualifying window of ${String(longestQualifyingWindowMs)} ms meets the ${String(thresholdMs)} ms threshold — a CANDIDATE for out-of-band provenance review, not completion; the evaluator cannot verify provenance (shared filesystem trust domain), and the external-evidence gate closes only by a governance record in IMPLEMENTATION_STATUS.md`,
     );
     return {
-      status: "SATISFIED",
+      status: "QUALIFYING_WINDOW_FOUND",
       longestWindowMs,
       longestQualifyingWindowMs,
       validWindows,

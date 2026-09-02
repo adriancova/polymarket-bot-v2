@@ -359,7 +359,7 @@
     {
       "id": 60,
       "type": "row",
-      "title": "Soak evidence (external-evidence gate: PENDING until real elapsed evidence exists)",
+      "title": "Soak evidence (external-evidence gate: PENDING until real elapsed evidence exists; closed only by a governance record)",
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
       "panels": []
     },
@@ -367,7 +367,7 @@
       "id": 61,
       "type": "stat",
       "title": "Soak status (one-hot; PENDING is the honest default)",
-      "description": "Only the fail-closed evaluator (packages/observability/src/recorder/soak-evidence.ts) can set SATISFIED, and only from real elapsed evidence records. INVALID means an evidence record failed validation and must be resolved.",
+      "description": "The fail-closed evaluator (packages/observability/src/recorder/soak-evidence.ts) reports at most QUALIFYING_WINDOW_FOUND: a structurally qualifying CANDIDATE window whose provenance it cannot verify — the harness and evaluator share a filesystem trust domain. Completing the external-evidence gate is a governance act recorded in IMPLEMENTATION_STATUS.md after out-of-band provenance review; no value of this metric names or implies completion. INVALID means an evidence record failed validation and must be resolved.",
       "gridPos": { "h": 6, "w": 12, "x": 0, "y": 68 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [{ "refId": "A", "expr": "recorder_soak_status_info", "legendFormat": "{{status}}" }]

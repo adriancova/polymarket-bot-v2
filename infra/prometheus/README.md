@@ -8,4 +8,5 @@
 Both files are validated by
 `packages/observability/src/recorder/infra-consistency.test.ts`: every
 `recorder_*` series an alert references must be one the exporter emits, and
-the WP-120-obligated alarms must be present by name.
+the declared alert-name set must match the expected set EXACTLY in both
+directions — a renamed alert fails as missing and as unexpected at once.

@@ -121,14 +121,19 @@ interface EpochReportEntry {
 function runJob(walRoot: string): {
   readonly epochs: EpochReportEntry[];
   readonly linesRefused: number;
+  readonly epochIdentityRefusals: number;
 } {
-  const { epochs, linesRefused } = readRecordedFrames(walRoot, "polymarket");
+  const { epochs, linesRefused, epochIdentityRefusals } = readRecordedFrames(
+    walRoot,
+    "polymarket",
+  );
   return {
     epochs: epochs.map((epoch) => ({
       gatewayEpoch: epoch.gatewayEpoch,
       report: compareRecordedBooks(epoch.frames),
     })),
     linesRefused,
+    epochIdentityRefusals,
   };
 }
 
@@ -138,6 +143,7 @@ describe("book snapshot comparison job", () => {
     // about a real recording.
     const outcome = runJob(writeFixtureWal());
     expect(outcome.linesRefused).toBe(0);
+    expect(outcome.epochIdentityRefusals).toBe(0);
     expect(outcome.epochs).toHaveLength(1);
     const report = outcome.epochs[0]?.report;
     expect(report?.ok).toBe(true);
@@ -185,6 +191,84 @@ describe("book snapshot comparison job", () => {
     expect(report?.findings[0]?.check).toBe("book-divergence");
   });
 
+  it("PERMANENT (reviewer probe, M-2): a frame declaring epoch-B inside epoch-A/ is refused, not admitted", () => {
+    // Round 1 the reader keyed on directory placement only and ADMITTED this
+    // frame. Epoch identity must agree four ways (directory, header, frame,
+    // footer); a mismatch is refused input, counted before any comparison.
+    const root = mkdtempSync(join(tmpdir(), "compare-epoch-mix-wal-"));
+    scratchDirs.push(root);
+    mkdirSync(join(root, "epoch-A"), { recursive: true });
+    const payloadUtf8 = JSON.stringify({
+      event_type: "book",
+      asset_id: "3333",
+      bids: [{ price: "0.40", size: "100" }],
+      asks: [],
+    });
+    const lines = [
+      JSON.stringify({ record: "header", gatewayEpoch: "epoch-A", segmentId: "seg-000001" }),
+      JSON.stringify({
+        gatewayEpoch: "epoch-B",
+        ingestSeq: "1",
+        source: "polymarket",
+        payloadUtf8,
+        payloadSha256: sha256Hex(payloadUtf8),
+      }),
+    ];
+    writeFileSync(join(root, "epoch-A", "seg-000001.wal.jsonl"), `${lines.join("\n")}\n`);
+    const outcome = runJob(root);
+    expect(outcome.epochs[0]?.report.framesSeen).toBe(0);
+    expect(outcome.linesRefused).toBe(1);
+    expect(outcome.epochIdentityRefusals).toBe(1);
+  });
+
+  it("a segment whose header disagrees with its directory is refused whole", () => {
+    const root = mkdtempSync(join(tmpdir(), "compare-epoch-header-wal-"));
+    scratchDirs.push(root);
+    mkdirSync(join(root, "epoch-A"), { recursive: true });
+    const payloadUtf8 = JSON.stringify({ event_type: "book", asset_id: "4", bids: [], asks: [] });
+    const lines = [
+      // Identity is what the header says, and it says epoch-B: the directory
+      // name and the header disagree, and the reader adjudicates for neither.
+      JSON.stringify({ record: "header", gatewayEpoch: "epoch-B", segmentId: "seg-000001" }),
+      JSON.stringify({
+        gatewayEpoch: "epoch-A",
+        ingestSeq: "1",
+        source: "polymarket",
+        payloadUtf8,
+        payloadSha256: sha256Hex(payloadUtf8),
+      }),
+    ];
+    writeFileSync(join(root, "epoch-A", "seg-000001.wal.jsonl"), `${lines.join("\n")}\n`);
+    const outcome = runJob(root);
+    expect(outcome.epochs[0]?.report.framesSeen).toBe(0);
+    expect(outcome.linesRefused).toBe(2);
+    expect(outcome.epochIdentityRefusals).toBe(2);
+  });
+
+  it("a footer whose epoch disagrees is refused and counted", () => {
+    const root = mkdtempSync(join(tmpdir(), "compare-epoch-footer-wal-"));
+    scratchDirs.push(root);
+    mkdirSync(join(root, "epoch-A"), { recursive: true });
+    const payloadUtf8 = JSON.stringify({ event_type: "book", asset_id: "5", bids: [], asks: [] });
+    const lines = [
+      JSON.stringify({ record: "header", gatewayEpoch: "epoch-A", segmentId: "seg-000001" }),
+      JSON.stringify({
+        gatewayEpoch: "epoch-A",
+        ingestSeq: "1",
+        source: "polymarket",
+        payloadUtf8,
+        payloadSha256: sha256Hex(payloadUtf8),
+      }),
+      JSON.stringify({ record: "footer", gatewayEpoch: "epoch-B", recordCount: 1 }),
+    ];
+    writeFileSync(join(root, "epoch-A", "seg-000001.wal.jsonl"), `${lines.join("\n")}\n`);
+    const outcome = runJob(root);
+    // The coherent frame is admitted; the lying footer is refused.
+    expect(outcome.epochs[0]?.report.framesSeen).toBe(1);
+    expect(outcome.linesRefused).toBe(1);
+    expect(outcome.epochIdentityRefusals).toBe(1);
+  });
+
   it("with SOAK_WAL_DIR set: compares the real recording and writes the report", () => {
     if (realWalDir === undefined || realWalDir === "") {
       // The automated posture ran above; the real-WAL posture needs a real
@@ -204,6 +288,7 @@ describe("book snapshot comparison job", () => {
           generatedAt: new Date().toISOString(),
           walRoot: realWalDir,
           linesRefused: outcome.linesRefused,
+          epochIdentityRefusals: outcome.epochIdentityRefusals,
           epochs: outcome.epochs,
         },
         null,

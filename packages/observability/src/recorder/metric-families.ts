@@ -209,9 +209,9 @@ export const RECORDER_METRIC_FAMILIES: readonly RecorderMetricFamily[] = [
   family("recorder_validation_findings", "gauge", "validation", "Findings by class from the last validation run (the WP-130 validator's classes plus the book-comparison classes).", ["job", "class", "severity"]),
 
   // --- Soak evidence (external-evidence gate; honesty machinery) -----------
-  family("recorder_soak_status_info", "gauge", "soak", "One-hot soak evidence status: PENDING until real elapsed evidence meets the threshold; INVALID if any evidence record fails validation.", ["status"]),
-  family("recorder_soak_longest_window_ms", "gauge", "soak", "Longest verified contiguous recording window in the evidence set, in milliseconds."),
-  family("recorder_soak_threshold_ms", "gauge", "soak", "The real-elapsed threshold a soak must meet to be SATISFIED."),
+  family("recorder_soak_status_info", "gauge", "soak", "One-hot soak evidence status: PENDING until real elapsed evidence meets the threshold; QUALIFYING_WINDOW_FOUND when a structurally qualifying CANDIDATE window exists (provenance unverified — completing the external-evidence gate is a governance act recorded in IMPLEMENTATION_STATUS.md, never a value of this metric); INVALID if any evidence record fails validation.", ["status"]),
+  family("recorder_soak_longest_window_ms", "gauge", "soak", "Longest claimed contiguous recording window in the evidence set, in milliseconds (recorded by the harness, internally cross-checked; provenance unverified)."),
+  family("recorder_soak_threshold_ms", "gauge", "soak", "The real-elapsed threshold a candidate window must meet to reach QUALIFYING_WINDOW_FOUND."),
   family("recorder_soak_windows_total", "counter", "soak", "Valid evidence windows recorded."),
 ];
 

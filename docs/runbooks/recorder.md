@@ -166,8 +166,13 @@ behind the bound.
 ## 5. Queue and admission bounds (and sizing them from soak data)
 
 Two bounded queues protect the recorder; **crossing a publisher bound is a
-terminal halt, never a drop** — so the alarms are set to warn BEFORE the
-bound:
+terminal halt, never a drop**. The ENFORCED guarantee lives in-process:
+overflow halts publication terminally and raises a PAGE incident
+(`GATEWAY_PUBLISH_ADMISSION_OVERFLOW`, WP-120's machinery), with recording
+unaffected. The Prometheus alarms are **best-effort early warning on top of
+that** — advisory lead time, not a guarantee of firing first: a fast burst
+can fill the 1024-entry/8 MiB queue inside the 5 s age threshold plus the
+15 s scrape interval plus the 1 m `for:` window.
 
 | Bound | Default | Meaning |
 | --- | --- | --- |
@@ -176,10 +181,14 @@ bound:
 | WAL queue depth / bytes | WP-050 defaults | frames accepted, not yet handed to the segment writer |
 
 Watch `recorder_publisher_oldest_queued_age_ms`
-(`RecorderPublishQueueAgeHigh`, > 5 s) and the 80%-of-bound headroom alert
-(`RecorderPublishQueueNearBound`). These are **safety parameters, not
-throughput knobs**: raising them buys tolerance for a longer transport stall
-and costs memory plus a longer window of events that exist only in the WAL.
+(`RecorderPublishQueueAgeHigh`, > 5 s — best-effort, see above) and the
+80%-of-bound headroom alert (`RecorderPublishQueueNearBound`). The bounds
+themselves are **safety parameters, not throughput knobs**: raising them buys
+tolerance for a longer transport stall and costs memory plus a longer window
+of events that exist only in the WAL. (An in-process predictive early-warning
+signal — one that could actually promise lead time — would be an
+`apps/data-gateway` change; noted as an optional follow-up for the apps
+owner in `docs/handoffs/WP-140.md`.)
 
 **Sizing from soak data — explicitly pending.** The bounds are reasoned, not
 measured (WP-120 `known_risks`; carried follow-up "size the admission bounds
@@ -255,11 +264,33 @@ directory and **fails on any divergence**.
 
 **Status right now: PENDING. No soak has run.** Handoff §16.7: time-based
 gates cannot be faked; they stay `PENDING_EXTERNAL_EVIDENCE` until real
-elapsed-time evidence exists. Nothing in this repository can mark the soak
-complete — the evaluator is fail-closed and the threshold is a reviewed
-constant (24 h, `SOAK_ELAPSED_EVIDENCE_THRESHOLD_MS`; a conservative
-assumption recorded in `docs/handoffs/WP-140.md`, since neither the handoff
-nor the work plan states a duration).
+elapsed-time evidence exists.
+
+**The trust domain, stated plainly.** The soak harness and the evaluator
+share a **filesystem trust domain**: evidence records are unauthenticated
+JSON files, and anything that can write the evidence directory can write a
+record. The evaluator therefore enforces **internal consistency and
+structural qualification, not provenance** — a hand-written but internally
+consistent record is indistinguishable from a real one at evaluation time,
+by construction. The design answer is the verdict lattice: the evaluator's
+terminal states are exactly `INVALID` / `PENDING` /
+`QUALIFYING_WINDOW_FOUND`, and the BEST of them is a **candidate**, not
+completion. A forged-but-consistent 25 h file yields at most
+`QUALIFYING_WINDOW_FOUND` — never any state named or presentable as final
+external-evidence satisfaction, because no such state exists in the domain.
+
+**Closing the gate is a governance act, not an evaluator output.** The
+procedure: the operator/orchestrator takes a `QUALIFYING_WINDOW_FOUND`
+evaluation, reviews the candidate window's provenance **out of band** — who
+started the run and when, the harness run log with its stderr tail, the WAL
+directories and manifests on disk, the reviewed configuration used — and
+only then records completion in `IMPLEMENTATION_STATUS.md`. The evaluator's
+candidate state is the INPUT to that human step, never the step itself.
+
+The threshold is a reviewed constant (24 h,
+`SOAK_ELAPSED_EVIDENCE_THRESHOLD_MS`; a conservative assumption recorded in
+`docs/handoffs/WP-140.md`, since neither the handoff nor the work plan
+states a duration), and there is no way to inject a lower one.
 
 ### Running a real soak
 
@@ -285,7 +316,11 @@ nor the work plan states a duration).
 3. **Where evidence lands**: one `soak-window-<startedAt>.json` per window in
    the evidence directory. The record's duration is first-class
    (`startedAt`/`endedAt`/`elapsedMs`, cross-checked at evaluation); it
-   carries **no status field**.
+   carries **no status field and no derived fields** — primitives only
+   (exact-key schema: any extra key, `status` above all, poisons the set to
+   `INVALID`; derived facts like shutdown cleanliness and gap signals are
+   computed at evaluation from the primitives, and contradictions between
+   primitives poison the set too).
 4. Evaluate:
 
    ```bash
@@ -293,22 +328,27 @@ nor the work plan states a duration).
      pnpm --dir test/soak/recorder run soak:evaluate
    ```
 
-   writes `soak-status.json` + `soak-status.prom`. **What marks it
-   complete**: `SATISFIED` requires ONE contiguous valid window ≥ 24 h in
-   which the recorder demonstrably ran and recorded
-   (`runningBannerSeen`, `wal.records > 0`), shut down cleanly on request,
-   and reported **zero** unexplained-gap signals (WAL recording failures and
-   GAP-reason incidents both count — the conservative direction; a window
-   with venue-side gaps stays PENDING until an operator reviews and either
-   re-runs or explains them in the completion record). `INVALID` means an
-   evidence record failed validation — evaluation never skips bad evidence;
-   resolve the named record.
+   writes `soak-status.json` + `soak-status.prom`. **What the evaluator can
+   mark — and what it cannot**: `QUALIFYING_WINDOW_FOUND` requires ONE
+   contiguous valid window ≥ 24 h in which the recorder demonstrably ran and
+   recorded (`runningBannerSeen`, `wal.records > 0`), shut down cleanly on
+   request (derived from the exit and log primitives), and reported **zero**
+   unexplained-gap signals (WAL recording failures and GAP-reason incidents
+   both count — the conservative direction; a window with venue-side gaps
+   stays PENDING until an operator reviews and either re-runs or explains
+   them in the completion record). It is a **candidate, not completion** —
+   see the trust-domain statement above. `INVALID` means an evidence record
+   failed validation — evaluation never skips bad evidence; resolve the
+   named record.
 5. Run the validation jobs over the soak's output: §6's dataset validation
    on anything compacted, and §6.1's book comparison with
    `SOAK_WAL_DIR=<the soak's WAL root>`.
 6. Report the outcome to the orchestrator with the status artifacts. The
    package-status line "External time-based evidence" moves off `pending`
-   only on a `SATISFIED` evaluation over real records — never on a claim.
+   only by the governance act described above: a `QUALIFYING_WINDOW_FOUND`
+   evaluation PLUS out-of-band provenance review PLUS the completion record
+   in `IMPLEMENTATION_STATUS.md` — never on an evaluator output alone, and
+   never on a claim.
 
 The automated smoke (`pnpm --dir test/soak/recorder run soak:smoke`) runs
 the SAME harness for seconds against closed loopback ports and asserts the

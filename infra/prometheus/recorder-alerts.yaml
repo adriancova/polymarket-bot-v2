@@ -5,9 +5,11 @@
 #
 # Machine-checked: packages/observability/src/recorder/infra-consistency.test.ts
 # asserts every recorder_* series referenced here is one the exporter emits,
-# and that the WP-120-obligated alarms (recorder EXIT; oldest-queued-age
-# BEFORE the bound; WAL refusals; RTDS halt; publication halt; compaction
-# lag; upload failure) are all present by name.
+# and that the declared alert-name set matches this file EXACTLY in both
+# directions (a rename shows up as missing AND unexpected) — covering the
+# WP-120-obligated alarms (recorder EXIT; best-effort early queue-age
+# warning; WAL refusals; RTDS halt; publication halt; compaction lag;
+# upload failure) and every other rule here.
 #
 # TWO ALARMS ARE LOG-BASED, NOT METRIC-BASED, and are deliberately NOT faked
 # here as PromQL:
@@ -49,10 +51,15 @@ groups:
           summary: "Publication halted (terminal for this epoch; recording continues)"
           description: "Cause label on recorder_publisher_halt_info. Follow the restart procedure in docs/runbooks/recorder.md — do NOT kill the recorder in a hurry; it is still recording."
 
-      # WP-120 round-1 obligation: alarm on oldest-queued-age WELL BEFORE the
-      # depth/byte bound — the bound is a terminal halt, and an operator wants
-      # warning before one. 5s of head age at a 15s scrape is early relative
-      # to the default bounds (1024 envelopes / 8 MiB).
+      # WP-120 round-1 queue-age alarm, honestly framed: this is BEST-EFFORT
+      # EARLY WARNING, not a guarantee of firing before the admission bound —
+      # a fast burst can fill the 1024-entry/8 MiB queue inside the 5s age
+      # threshold + 15s scrape interval + 1m `for:` window. The ENFORCED
+      # guarantee is in-process and independent of Prometheus: crossing the
+      # bound is a terminal publication halt with a PAGE incident
+      # (GATEWAY_PUBLISH_ADMISSION_OVERFLOW, WP-120's machinery). This rule
+      # buys advisory lead time in the slow-drain case; the pending soak will
+      # size its threshold from real data (docs/runbooks/recorder.md §5).
       - alert: RecorderPublishQueueAgeHigh
         expr: recorder_publisher_oldest_queued_age_ms > 5000
         for: 1m
@@ -60,7 +67,7 @@ groups:
           severity: notify
         annotations:
           summary: "Publish queue head is aging: the transport is not draining"
-          description: "If this keeps rising, the admission bound will be crossed and publication will halt terminally. Investigate the event bus now."
+          description: "Best-effort early warning, advisory lead time only — a fast burst can cross the admission bound before this fires; the enforced guarantee is the in-process terminal halt plus PAGE incident on overflow (WP-120). If this keeps rising, the bound will be crossed and publication will halt terminally. Investigate the event bus now."
 
       - alert: RecorderPublishQueueNearBound
         expr: >-
@@ -216,4 +223,4 @@ groups:
           severity: notify
         annotations:
           summary: "Soak evidence set contains an invalid record"
-          description: "Evaluation is fail-closed and will not skip bad evidence; resolve the named record. PENDING is the normal state until a real qualifying window meets the threshold."
+          description: "Evaluation is fail-closed and will not skip bad evidence; resolve the named record. PENDING is the normal state; QUALIFYING_WINDOW_FOUND is a CANDIDATE for out-of-band provenance review — completion of the external-evidence gate is a governance record in IMPLEMENTATION_STATUS.md, never a metric value."

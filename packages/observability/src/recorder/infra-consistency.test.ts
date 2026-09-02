@@ -9,7 +9,9 @@
  *    reachable);
  * 2. each acceptance-1 category has at least one dashboard panel bound to a
  *    metric of that category;
- * 3. the WP-120-obligated charts and alarms exist by name.
+ * 3. the WP-120-obligated charts exist by name, and the alert rules declare
+ *    EXACTLY the expected alert-name set (both directions — a rename fails
+ *    as missing and unexpected at once; remediation round 1, M-1).
  *
  * The dashboard JSON and rules YAML are read from the repository — they ARE
  * the artifacts under test, so a private copy here would defeat the point.
@@ -167,33 +169,56 @@ describe("the recorder alert rules", () => {
     }
   });
 
-  it("contains the obligated alarms by name", () => {
-    for (const alert of [
+  it("the declared alert-name set matches the expected set EXACTLY, both directions", () => {
+    // Remediation round 1, M-1: substring matching accepted prefix renames
+    // (`RecorderExitedRenamed` passed). Parse the actual `alert:` declarations
+    // and require set equality — a rename now fails twice: the old name is
+    // missing AND the new name is unexpected.
+    const declared = [...alertsSource.matchAll(/^\s*-\s*alert:\s*(?<name>\S+)\s*$/gmu)]
+      .map((match) => match.groups?.["name"] ?? "")
+      .filter((name) => name !== "");
+    expect(new Set(declared).size, "duplicate alert names declared").toBe(declared.length);
+
+    const expected = [
       // WP-120: alarm on recorder EXIT.
       "RecorderExited",
-      // WP-120 round 1: alarm on oldest-queued-age BEFORE the bound.
+      // §14.4 page: unable to record or publish.
+      "RecorderPublicationHalted",
+      // WP-120 round 1 queue signals. The age alarm is BEST-EFFORT early
+      // warning (advisory lead time); the enforced guarantee is the
+      // in-process terminal halt + PAGE incident on overflow (WP-120).
       "RecorderPublishQueueAgeHigh",
       "RecorderPublishQueueNearBound",
       "RecorderPublishAdmissionRefusals",
-      // §14.4 page: unable to record or publish.
-      "RecorderPublicationHalted",
       "RecorderWalFaulted",
       "RecorderWalRefusals",
       "RecorderWalDroppedMessages",
+      "RecorderWalUnmanifestedSegments",
       // ADR-004 §3: the data-loss bound is only true while fsync runs.
       "RecorderFsyncOverdue",
       // Feed halts.
-      "RecorderRtdsHalted",
       "RecorderFeedStalls",
+      "RecorderRtdsHalted",
+      "RecorderPolymarketSnapshotFailures",
       // WP-130 signals.
       "RecorderCompactionLagHigh",
+      "RecorderCompactionFailing",
       "RecorderUploadFailed",
+      "RecorderRetentionFailures",
       "RecorderValidationFindings",
+      "RecorderValidationNotOk",
       // Soak-evidence honesty.
       "RecorderSoakEvidenceInvalid",
-    ]) {
-      expect(alertsSource, `alert ${alert} is missing`).toContain(`- alert: ${alert}`);
-    }
+    ];
+    const declaredSet = new Set(declared);
+    const expectedSet = new Set(expected);
+    const missing = expected.filter((name) => !declaredSet.has(name));
+    const unexpected = declared.filter((name) => !expectedSet.has(name));
+    expect(missing, `expected alerts missing from the rules file`).toEqual([]);
+    expect(
+      unexpected,
+      `alerts declared in the rules file but not in the expected set — update BOTH together`,
+    ).toEqual([]);
   });
 
   it("documents the log-based FAILED-to-exit alarm instead of faking it as PromQL", () => {
@@ -202,15 +227,33 @@ describe("the recorder alert rules", () => {
     expect(alertsSource).toContain("FAILED to exit");
   });
 
-  it("the oldest-age alarm threshold sits BELOW what the bound implies", () => {
-    // The obligation is warning BEFORE the halt. 5s of head age with the
-    // default 1024-deep/8MiB queue is early; this pin keeps a future edit
-    // from quietly moving the alarm to after the horse has left.
-    const match = /RecorderPublishQueueAgeHigh[\s\S]*?expr:\s*recorder_publisher_oldest_queued_age_ms\s*>\s*(?<ms>\d+)/u.exec(
+  it("the queue-age alarm promises only what it can keep: best-effort early warning", () => {
+    // Remediation round 1, M-3 (orchestrator authority): a "fires BEFORE the
+    // admission bound" claim is unenforceable — a fast burst can fill the
+    // 1024-entry/8 MiB queue inside the age threshold + scrape interval +
+    // `for:` window. The alarm is BEST-EFFORT advisory lead time; the
+    // ENFORCED guarantee is the in-process terminal halt + PAGE incident on
+    // overflow (WP-120's machinery). This test pins the honest wording AND
+    // the (reasoned, soak-pending) threshold value so neither can quietly
+    // drift back into a guarantee nobody enforces.
+    const rule = /- alert: RecorderPublishQueueAgeHigh[\s\S]*?(?=- alert: |$)/u.exec(
       alertsSource,
     );
+    expect(rule).not.toBeNull();
+    const ruleText = rule?.[0] ?? "";
+    const match = /expr:\s*recorder_publisher_oldest_queued_age_ms\s*>\s*(?<ms>\d+)/u.exec(
+      ruleText,
+    );
     expect(match).not.toBeNull();
-    expect(Number(match?.groups?.["ms"])).toBeLessThanOrEqual(30_000);
+    // The reasoned threshold, pending sizing from real soak data (runbook §5).
+    expect(Number(match?.groups?.["ms"])).toBe(5_000);
+    // The honest framing is present…
+    expect(ruleText).toContain("Best-effort early warning");
+    expect(ruleText).toContain("advisory lead time");
+    expect(ruleText).toContain("in-process terminal halt");
+    // …and the unenforceable guarantee wording is absent.
+    expect(ruleText.toLowerCase()).not.toContain("before the bound");
+    expect(ruleText.toLowerCase()).not.toContain("guarantees");
   });
 });
 

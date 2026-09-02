@@ -12,10 +12,12 @@
  *     (`recorder_soak_*`), ready for a node_exporter textfile collector.
  *
  * An empty or missing evidence directory is not an error: it is exactly the
- * honest state — **PENDING** — and the job writes it as such. Only a real
- * qualifying window at or above the threshold produces SATISFIED, and no
- * assertion here requires that: the job succeeds by REPORTING truthfully,
- * not by the soak being done.
+ * honest state — **PENDING** — and the job writes it as such. The best any
+ * evidence set can reach is QUALIFYING_WINDOW_FOUND — a structurally
+ * qualifying CANDIDATE window whose provenance the evaluator cannot verify
+ * (shared filesystem trust domain); completing the external-evidence gate is
+ * a governance record in IMPLEMENTATION_STATUS.md, never this job's output.
+ * No assertion here requires anything beyond truthful reporting.
  *
  * (Vitest is the repository's execution vehicle for TypeScript jobs in test
  * trees — the WP-020/WP-120/WP-130 precedent; there is no runtime build for
@@ -75,8 +77,11 @@ describe("soak evidence evaluation job", () => {
     const promPath = join(evidenceDir, "soak-status.prom");
     writeFileSync(promPath, renderExposition(soakMetricSamples(evaluation)));
 
-    // The job's own honesty requirements — NOT a demand that the soak be done.
-    expect(["PENDING", "SATISFIED", "INVALID"]).toContain(evaluation.status);
+    // The job's own honesty requirements — NOT a demand that the soak be
+    // done. The domain has no completion-shaped state: the best is a
+    // candidate for out-of-band provenance review.
+    expect(["PENDING", "QUALIFYING_WINDOW_FOUND", "INVALID"]).toContain(evaluation.status);
+    expect(JSON.stringify(evaluation)).not.toContain("SATISFIED");
     expect(evaluation.thresholdMs).toBeGreaterThan(0);
     if (recordFiles.length === 0) {
       expect(evaluation.status).toBe("PENDING");

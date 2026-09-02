@@ -393,7 +393,7 @@ export function validationMetricSamples(
 /** Samples for a soak-evidence evaluation (see `soak-evidence.ts`). */
 export function soakMetricSamples(evaluation: SoakEvaluation): readonly MetricSample[] {
   const samples: MetricSample[] = [];
-  for (const status of ["PENDING", "SATISFIED", "INVALID"] as const) {
+  for (const status of ["PENDING", "QUALIFYING_WINDOW_FOUND", "INVALID"] as const) {
     samples.push({
       name: "recorder_soak_status_info",
       value: bool(evaluation.status === status),
