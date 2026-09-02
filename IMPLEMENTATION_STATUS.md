@@ -86,9 +86,17 @@ table says otherwise.
   `check:deps` 34 packages / 24 edges (7 gateway edges, all downward); root
   3329/3329 (117 files); gateway integration 58/58; contract chain 583 + 65
   + 158 + 94. Worktree and branch cleaned up.
-- **Escalated to the operator (unresolved)**: `data.raw_segments` (§10.2)
-  ownership — WP-120 declines it (a PostgreSQL dependency in the recorder's
-  path violates §4.2); WP-040 and WP-130 merged without it.
+- **Escalated to the operator — RESOLVED 2026-09-02**: `data.raw_segments`
+  (§10.2) ownership — WP-120 declined it (a PostgreSQL dependency in the
+  recorder's path violates §4.2); WP-040 and WP-130 merged without it. The
+  operator chose deferral: **WP-210 inherits it** (the first consumer that
+  queries recorded segments — its event source owns the migration plus a
+  manifest-reading importer/backfill job; the table is backfillable from
+  manifests at any time, so nothing is lost by waiting). At WP-210
+  authorization the orchestrator ratifies a bounded storage-postgres
+  migration-path grant covering both this table and the still-open WP-110
+  `payoff_model NOT NULL` divergence. Recorded in the workplan's WP-210
+  entry.
 - **Follow-ups carried**: WP-140 recorder runbook (bidirectional exit
   contract; deadline and `[disposal]` operator signals; liveness alarming;
   queue metrics charting; admission-bound sizing from soak data);

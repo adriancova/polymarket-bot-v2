@@ -708,6 +708,17 @@ work_packages:
   - id: WP-210
     phase: phase-2
     title: Replay clock, event source, simulated venue, and fill models
+    # Operator decision 2026-09-02: WP-210 inherits the orphaned
+    # data.raw_segments (§10.2) catalog table — declined by WP-120 (a
+    # PostgreSQL dependency in the recorder's path violates §4.2) and not
+    # persisted by WP-130 (manifests are the on-disk source of truth,
+    # backfillable). WP-210's event source is the first consumer that
+    # queries recorded segments, so it owns the migration plus a
+    # manifest-reading importer/backfill job. At WP-210 authorization the
+    # orchestrator ratifies a bounded storage-postgres migration-path grant
+    # covering BOTH this table (and data.dataset_manifests if needed) AND
+    # the still-open WP-110 payoff_model NOT NULL divergence (also owned by
+    # "the migration owner"), consolidating the two open migration items.
     goal: Execute the same core logic against historical/live data with deterministic Tier 0 and queue-estimated Tier 1 simulation.
     depends_on: [WP-130, WP-150, WP-190, WP-200]
     allowed_paths:
