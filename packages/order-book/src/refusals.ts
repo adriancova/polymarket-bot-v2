@@ -42,18 +42,28 @@ export type OrderBookRefusalCode =
    */
   | "ORDER_BOOK_STALE_SUBSCRIPTION_GENERATION"
   /**
-   * A level change carries a NEWER generation than the baseline snapshot's. A
-   * generation advances exactly when a gap opens
-   * (`packages/polymarket-public/src/feed/subscriptions.ts`), and a gap
-   * requires an authoritative snapshot before affected markets resume (§7.1);
-   * a delta may not resume the market on its own.
+   * A level change carries a NEWER generation than the baseline snapshot's.
+   * The producer's invariant is ONE-WAY
+   * (`packages/polymarket-public/src/feed/subscriptions.ts`): every gap the
+   * feed opens advances the generation in the same step, but the generation
+   * also advances where no gap is owed (the first connection; a change made
+   * while disconnected). A newer generation therefore may or may not mean a
+   * gap; the book cannot tell, so it fails closed — a gap requires an
+   * authoritative snapshot before affected markets resume (§7.1), and a delta
+   * may not resume the market on its own.
    */
   | "ORDER_BOOK_GENERATION_AHEAD_REQUIRES_SNAPSHOT"
   /**
    * The update carries no subscription generation where one is required.
-   * Fail closed: every legitimate producer path stamps one (WS events carry
-   * the session's generation; REST snapshots taken to close a gap are stamped
-   * by the fetcher), so an unstamped update is unattributable to a stream.
+   * Fail closed: WS events always carry the session's generation
+   * (`polymarket-public/src/feed/connection.ts`), but REST snapshots are
+   * stamped only when the fetcher's caller supplies the generation — the
+   * generic fetcher permits omission
+   * (`polymarket-public/src/snapshot/fetcher.ts`), and the normalizer then
+   * omits it from provenance, so an unstamped snapshot is producible TODAY.
+   * It is unattributable to a subscription and is refused; the `WP-120`
+   * composition root must stamp gap-closing snapshots via the fetcher
+   * context.
    */
   | "ORDER_BOOK_MISSING_SUBSCRIPTION_GENERATION"
   /**

@@ -23,10 +23,15 @@
  * - **Freshness identity is `(gatewayEpoch, subscriptionGeneration)`**,
  *   adopted from the last applied authoritative snapshot. A level change must
  *   match it exactly: an older generation is the §9.4 stale-generation
- *   refusal; a newer generation means a gap opened and §7.1 requires an
- *   authoritative snapshot before the market resumes; a different epoch is
- *   unordered against this book (`wal-format.md` §12.1 — epochs are identity,
- *   not chronology).
+ *   refusal; a newer generation is refused pending a snapshot. The producer's
+ *   invariant is ONE-WAY (`polymarket-public/src/feed/subscriptions.ts`):
+ *   every opened gap advances the generation, but the generation also
+ *   advances where no gap is owed (the first connection; a change made while
+ *   disconnected). The book therefore cannot tell those causes apart and
+ *   fails closed — §7.1 requires an authoritative snapshot under the new
+ *   generation before the market resumes. A different epoch is unordered
+ *   against this book (`wal-format.md` §12.1 — epochs are identity, not
+ *   chronology).
  * - **No invented sequence number** (§9.4 closing rule): ordering uses the
  *   gateway's `ingestSeq` within one epoch, strictly increasing, and nothing
  *   else. `updatesApplied` is a local diagnostic counter, not an ordinal, and
@@ -201,7 +206,7 @@ export class OutcomeTokenBook {
     if (generation === undefined) {
       return refuse(
         "ORDER_BOOK_MISSING_SUBSCRIPTION_GENERATION",
-        "snapshot carries no subscriptionGeneration; every legitimate producer path stamps one (WS session generation; REST gap-close snapshots via the fetcher context), so an unstamped snapshot is unattributable and is refused",
+        "snapshot carries no subscriptionGeneration; WS sessions stamp one, but the generic REST fetcher stamps only when its caller supplies the generation (polymarket-public/src/snapshot/fetcher.ts), so an unstamped snapshot is producible today, is unattributable to a subscription, and is refused — the composition root (WP-120) must stamp gap-closing snapshots via the fetcher context",
         { gatewayEpoch: meta.meta.gatewayEpoch, ingestSeq: meta.meta.ingestSeq },
       );
     }
@@ -302,7 +307,7 @@ export class OutcomeTokenBook {
     if (generation > this.#baseline.subscriptionGeneration) {
       return refuse(
         "ORDER_BOOK_GENERATION_AHEAD_REQUIRES_SNAPSHOT",
-        "the level change's subscriptionGeneration is newer than the baseline snapshot's; a generation advances exactly when a gap opens, and §7.1 requires an authoritative snapshot before the market resumes",
+        "the level change's subscriptionGeneration is newer than the baseline snapshot's; every opened gap advances the generation (one-way — it also advances without a gap, e.g. on first connection or a change made while disconnected), so the book cannot rule a gap out and §7.1 requires an authoritative snapshot before the market resumes",
         {
           incomingGeneration: generation,
           currentGeneration: this.#baseline.subscriptionGeneration,

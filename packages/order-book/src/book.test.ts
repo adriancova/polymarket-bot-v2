@@ -148,7 +148,15 @@ describe("applySnapshot", () => {
     }
   });
 
-  it("refuses a snapshot with no subscriptionGeneration (fail closed)", () => {
+  it("refuses an UNSTAMPED snapshot — the shape the generic REST fetcher produces today when its caller omits the generation — so the WP-120 composition root MUST stamp gap-closing snapshots via the fetcher context", () => {
+    // Producer reality (remediation round 1, finding M1): the generic REST
+    // fetcher takes `subscriptionGeneration` as an OPTIONAL context field
+    // (`polymarket-public/src/snapshot/fetcher.ts`), and the normalizer then
+    // omits it from provenance (`polymarket-public/src/normalize/snapshot.ts`).
+    // A BookSnapshot with no generation is therefore a PRESENT capability of
+    // the shipped producer, not a hypothetical. This refusal is the intended
+    // integration failure mode at the WP-120 boundary: typed and visible,
+    // never silent adoption of an unattributable baseline.
     const book = new OutcomeTokenBook({ internalMarketId: MARKET_ID, tokenId: TOKEN_ID });
     const outcome = book.applySnapshot({
       payload: snapshotPayload(),
@@ -157,7 +165,11 @@ describe("applySnapshot", () => {
     expect(outcome.applied).toBe(false);
     if (!outcome.applied) {
       expect(outcome.refusal.code).toBe("ORDER_BOOK_MISSING_SUBSCRIPTION_GENERATION");
+      expect(outcome.refusal.evidence).toEqual({ gatewayEpoch: EPOCH_A, ingestSeq: "10" });
     }
+    // Nothing was adopted: the refused snapshot left no baseline behind.
+    expect(book.baseline()).toBeUndefined();
+    expect(book.updatesApplied()).toBe(0);
   });
 
   it("acceptance 2: a stale subscription generation is rejected, carrying both generations", () => {
@@ -232,6 +244,54 @@ describe("applySnapshot", () => {
     });
     expect(outcome.applied).toBe(true);
     expect(book.baseline()).toEqual({ gatewayEpoch: EPOCH_B, subscriptionGeneration: 1 });
+  });
+
+  it("a NEW-epoch snapshot carrying a LOWER generation than the baseline re-baselines — epochs are identity, not chronology (wal-format §12.1); generations are per-feed counters that reset with a new feed instance", () => {
+    const book = new OutcomeTokenBook({ internalMarketId: MARKET_ID, tokenId: TOKEN_ID });
+    expect(
+      book.applySnapshot({
+        payload: snapshotPayload(),
+        meta: meta({ subscriptionGeneration: 5 }),
+      }).applied,
+    ).toBe(true);
+    expect(book.baseline()).toEqual({ gatewayEpoch: EPOCH_A, subscriptionGeneration: 5 });
+
+    // A restarted gateway (new epoch) runs a restarted feed whose generation
+    // counter began again at 1, so "2" being numerically lower than "5" says
+    // nothing about time. This snapshot is the §7.1 "new authoritative
+    // snapshot" a restart requires, and it re-baselines wholesale.
+    const outcome = book.applySnapshot({
+      payload: snapshotPayload({ bids: [{ price: "0.05", size: "10" }], asks: [] }),
+      meta: meta({ gatewayEpoch: EPOCH_B, ingestSeq: "1", subscriptionGeneration: 2 }),
+    });
+    expect(outcome.applied).toBe(true);
+    expect(book.baseline()).toEqual({ gatewayEpoch: EPOCH_B, subscriptionGeneration: 2 });
+    expect(book.levels("BID")).toEqual([{ price: "0.05", size: "10" }]);
+    expect(book.levels("ASK")).toEqual([]);
+
+    // Generation comparisons now run against the NEW baseline only. The old
+    // epoch's higher number is AHEAD here — refused pending a snapshot, not
+    // treated as "newer in time".
+    const oldEpochsNumber = book.applyLevelChange({
+      payload: levelChangePayload({ price: "0.05", size: "1" }),
+      meta: meta({ gatewayEpoch: EPOCH_B, ingestSeq: "2", subscriptionGeneration: 5 }),
+    });
+    expect(oldEpochsNumber.applied).toBe(false);
+    if (!oldEpochsNumber.applied) {
+      expect(oldEpochsNumber.refusal.code).toBe("ORDER_BOOK_GENERATION_AHEAD_REQUIRES_SNAPSHOT");
+      expect(oldEpochsNumber.refusal.evidence).toEqual({
+        incomingGeneration: 5,
+        currentGeneration: 2,
+      });
+    }
+
+    // A delta matching the new baseline applies.
+    const matching = book.applyLevelChange({
+      payload: levelChangePayload({ price: "0.05", size: "7" }),
+      meta: meta({ gatewayEpoch: EPOCH_B, ingestSeq: "3", subscriptionGeneration: 2 }),
+    });
+    expect(matching.applied).toBe(true);
+    expect(book.levels("BID")).toEqual([{ price: "0.05", size: "7" }]);
   });
 
   it("refuses a replayed or reordered snapshot within one epoch (ingestSeq must strictly increase)", () => {
