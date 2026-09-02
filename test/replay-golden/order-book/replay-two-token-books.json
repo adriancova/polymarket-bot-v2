@@ -1,0 +1,165 @@
+{
+  "fixture": "order-book/replay-two-token-books",
+  "notes": "See README.md in this directory for full provenance. Venue-shaped values are from the frozen WP-000 market-ws fixture catalogue (2026-08-24) under the ADR-013-ratified semantics; identifiers assigned in-process and the whole NO side are synthetic and declared as such.",
+  "market": {
+    "internalMarketId": "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+    "yesTokenId": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+    "noTokenId": "999905882767731489358349912513945399560393482969656700824895970500493757159999"
+  },
+  "gatewayEpoch": "018f3a2b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+  "steps": [
+    {
+      "kind": "snapshot",
+      "note": "frozen book-snapshot example, YES token",
+      "meta": {
+        "gatewayEpoch": "018f3a2b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+        "ingestSeq": "101",
+        "subscriptionGeneration": 1,
+        "venueTimestamp": "2026-06-29T17:15:57.257Z",
+        "receivedAt": "2026-06-29T17:15:57.400Z"
+      },
+      "payload": {
+        "internalMarketId": "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+        "tokenId": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "bids": [
+          { "price": "0.07", "size": "5000" },
+          { "price": "0.08", "size": "33343.4" }
+        ],
+        "asks": [
+          { "price": "0.09", "size": "163939.58" },
+          { "price": "0.1", "size": "7500.25" }
+        ],
+        "venueBookHash": "0x0000000000000000000000000000000000000000000000000000000000abc123"
+      }
+    },
+    {
+      "kind": "snapshot",
+      "note": "synthetic NO-token baseline (declared synthetic; routing coverage only)",
+      "meta": {
+        "gatewayEpoch": "018f3a2b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+        "ingestSeq": "102",
+        "subscriptionGeneration": 1,
+        "receivedAt": "2026-06-29T17:15:57.450Z"
+      },
+      "payload": {
+        "internalMarketId": "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+        "tokenId": "999905882767731489358349912513945399560393482969656700824895970500493757159999",
+        "bids": [{ "price": "0.9", "size": "120" }],
+        "asks": [{ "price": "0.91", "size": "80.5" }]
+      }
+    },
+    {
+      "kind": "levelChange",
+      "note": "frozen price-change example 'level-updated' (BUY -> BID per ADR-014)",
+      "meta": {
+        "gatewayEpoch": "018f3a2b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+        "ingestSeq": "103",
+        "subscriptionGeneration": 1,
+        "venueTimestamp": "2026-06-29T17:15:57.257Z",
+        "receivedAt": "2026-06-29T17:15:57.500Z"
+      },
+      "payload": {
+        "internalMarketId": "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+        "tokenId": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BID",
+        "price": "0.08",
+        "size": "33343.4"
+      }
+    },
+    {
+      "kind": "levelChange",
+      "note": "frozen price-change example 'level-removed-absolute-zero-UNVERIFIED' (semantics since ratified by ADR-013: size 0 REMOVES the level)",
+      "meta": {
+        "gatewayEpoch": "018f3a2b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+        "ingestSeq": "104",
+        "subscriptionGeneration": 1,
+        "venueTimestamp": "2026-06-29T17:15:58.000Z",
+        "receivedAt": "2026-06-29T17:15:58.100Z"
+      },
+      "payload": {
+        "internalMarketId": "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+        "tokenId": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BID",
+        "price": "0.08",
+        "size": "0"
+      }
+    },
+    {
+      "kind": "levelChange",
+      "note": "ADR-013 §2 replace-not-accumulate template on the frozen grid: 5000 -> 5, never 5005 and never 4995",
+      "meta": {
+        "gatewayEpoch": "018f3a2b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+        "ingestSeq": "105",
+        "subscriptionGeneration": 1,
+        "receivedAt": "2026-06-29T17:15:58.200Z"
+      },
+      "payload": {
+        "internalMarketId": "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+        "tokenId": "107505882767731489358349912513945399560393482969656700824895970500493757150417",
+        "side": "BID",
+        "price": "0.07",
+        "size": "5"
+      }
+    },
+    {
+      "kind": "levelChange",
+      "note": "zero-removal on the NO book (synthetic values; ADR-013 semantics)",
+      "meta": {
+        "gatewayEpoch": "018f3a2b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+        "ingestSeq": "106",
+        "subscriptionGeneration": 1,
+        "receivedAt": "2026-06-29T17:15:58.300Z"
+      },
+      "payload": {
+        "internalMarketId": "0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+        "tokenId": "999905882767731489358349912513945399560393482969656700824895970500493757159999",
+        "side": "BID",
+        "price": "0.9",
+        "size": "0"
+      }
+    },
+    {
+      "kind": "tickSize",
+      "note": "frozen tick-size-change example: new_tick_size 0.001",
+      "tickSize": "0.001"
+    }
+  ],
+  "expected": {
+    "yesSerialization": [
+      "polymarket-bot/order-book/v1",
+      "market 0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+      "token 107505882767731489358349912513945399560393482969656700824895970500493757150417",
+      "epoch 018f3a2b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+      "generation 1",
+      "lastIngestSeq 105",
+      "venueBookHash 0x0000000000000000000000000000000000000000000000000000000000abc123",
+      "tickSize 0.001",
+      "bestBid 0.07 5",
+      "bestAsk 0.09 163939.58",
+      "spread 0.02",
+      "depth bids 1 5 asks 2 171439.83",
+      "bids 1",
+      "0.07 5",
+      "asks 2",
+      "0.09 163939.58",
+      "0.1 7500.25"
+    ],
+    "noSerialization": [
+      "polymarket-bot/order-book/v1",
+      "market 0192aaaa-bbbb-7ccc-8ddd-eeeeffff0001",
+      "token 999905882767731489358349912513945399560393482969656700824895970500493757159999",
+      "epoch 018f3a2b-4c5d-7e6f-8a9b-0c1d2e3f4a5b",
+      "generation 1",
+      "lastIngestSeq 106",
+      "venueBookHash -",
+      "tickSize 0.001",
+      "bestBid - -",
+      "bestAsk 0.91 80.5",
+      "spread -",
+      "depth bids 0 0 asks 1 80.5",
+      "bids 0",
+      "asks 1",
+      "0.91 80.5"
+    ]
+  }
+}
