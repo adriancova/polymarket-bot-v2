@@ -280,9 +280,11 @@ export class DataGateway {
     // everything below is in-memory construction — but `#buildFeeds()` (run
     // by the constructor) throws on a configured feed whose port is missing,
     // and `planSubscriptions` throws on contradictory plans. If anything
-    // after the journal opened throws, the journal is closed before the error
-    // escapes, so a caller that sees `create()` reject holds NO acquired
-    // resource. Ownership of the journal transfers to the constructed gateway
+    // after the journal opened throws, a close of the journal is INITIATED
+    // (and awaited under the cleanup deadline) before the original error
+    // escapes; a close that rejects or hangs may leave the journal's own
+    // resources unreleased — the deadline bounds the process exit in that
+    // case. Ownership of the journal transfers to the constructed gateway
     // exactly at `new DataGateway(...)` returning (its `stop()` closes it),
     // so this close cannot double with the gateway's own. `journal.close()`
     // is non-rejecting by contract (every writer operation runs on the serial

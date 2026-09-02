@@ -34,10 +34,11 @@ export type GatewayErrorCode =
   /**
    * One or more resource disposals failed during `stop()` (round 4).
    *
-   * `stop()` isolates every disposal: each one is attempted, failures are
-   * collected here, and every remaining resource is still released. The error
-   * therefore reports what did NOT close cleanly — it never means a later
-   * disposal was skipped because an earlier one threw. This error only
+   * `stop()` isolates every disposal: each independent cleanup is INITIATED
+   * (a hang cannot block siblings, though a hung disposal may remain
+   * incomplete at the deadline's forced exit), settled failures are collected
+   * here. The error therefore reports what did NOT close cleanly — it never
+   * means a later disposal was skipped because an earlier one THREW. This error only
    * exists when `stop()` SETTLES, so a disposal that HANGS can never appear
    * in it — which is why every failure is also reported the moment it is
    * collected (`GatewayObserver.onDisposalFailure`, round 6 M-1), and the
