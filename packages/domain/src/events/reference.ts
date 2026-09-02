@@ -61,6 +61,18 @@ export const ReferenceTradeObservedPayloadSchema = z.strictObject({
   ...referenceShape,
   price: PositiveDecimalStringSchema,
   size: PositiveDecimalStringSchema,
+  /**
+   * Taker side when the venue reports it — under the ADR-014 vocabulary: the
+   * value names the AGGRESSOR ORDER'S OWN SIDE. `BID` ⇔ the taker was buying,
+   * `ASK` ⇔ the taker was selling — NOT the side of the book consumed
+   * (ADR-014 §1–§2; the per-venue mappings, including Binance's documented
+   * `m` flag and Coinbase's documented maker side, are tabulated in ADR-014
+   * §3). An adapter that cannot state the value under this convention omits
+   * the field (ADR-014 §4); a value may not be emitted under any other
+   * convention. Ruled 2026-08-28
+   * (docs/adr/ADR-014-taker-side-names-the-aggressor-order-side.md); pointer
+   * added 2026-09-02 by GOV-1C — comment-only, hash-proved (register R-7b).
+   */
   takerSide: BookSideSchema.optional(),
   venueTradeId: NonEmptyStringSchema.optional(),
 });

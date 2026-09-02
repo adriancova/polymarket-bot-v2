@@ -58,7 +58,12 @@ rule above, and it is bounded by all four of:
 
 An ADR that merely *wants* a venue fact still does not fetch one.
 [ADR-013](./ADR-013-book-price-change-absolute-size-confirmed.md) §7 is the
-first and, so far, only use.
+first use. The second is the 2026-09-02 amendment to
+[ADR-009](./ADR-009-settlement-spec-and-payoff-model-selection.md) §5,
+recording `WP-110`'s mandated 2026-08-28 confirmation of U-6 (the case
+ADR-009 §5.2 itself created); its amendment block states how each of the four
+conditions is met. *(This sentence previously read "the first and, so far,
+only use"; corrected 2026-09-02 per `protected-contracts.md` §4.)*
 
 ---
 
@@ -81,7 +86,10 @@ first and, so far, only use.
 | [ADR-013](./ADR-013-book-price-change-absolute-size-confirmed.md) | Book `price_change` carries absolute aggregate size, with zero removal (C-1/U-1 ratified) | Accepted | §9.4, §23, §1.1–1.2 | `WP-020` (done, unchanged), `WP-070` (done), `WP-150` |
 | [ADR-014](./ADR-014-taker-side-names-the-aggressor-order-side.md) | `takerSide` names the aggressor order's own side | Accepted | §7.4 | `WP-020` (done, unchanged), `WP-070`/`WP-090` (conform), `WP-080` (follow-up owed) |
 | [ADR-015](./ADR-015-repository-identifier-bound.md) | The repository identifier bound is boundary hardening, not a venue narrowing | Accepted | §7.2, §7.3, §8.3 | `WP-020` (done, unchanged), `WP-070` (done), every adapter |
-| [ADR-016](./ADR-016-ratified-inferred-domain-shapes.md) | Ratification of the four unratified `domain.md` §8 inferences (R-3) | Accepted | §7.2, §7.4, §14.4 | `WP-020` (done, unchanged) |
+| [ADR-016](./ADR-016-ratified-inferred-domain-shapes.md) | Ratification of the four unratified `domain.md` §8 inferences (R-3); §2 amended 2026-09-02 — external UUID-shaped input is **refused**, not case-folded (R-8) | Accepted | §7.2, §7.4, §14.4 | `WP-020` (done, unchanged); every future external input surface |
+| [ADR-017](./ADR-017-dataset-manifest-and-retention-receipt-artifact-contract.md) | Dataset-manifest and retention-receipt artifact contract (two digest roles; `nullable` = Parquet repetition; strict-JSON profile; receipt = reporting, not proof) | Accepted | §8.4, §12.5, §10.2 | `WP-130` (done, unchanged) |
+| [ADR-018](./ADR-018-app-local-esbuild-runtime-build-convention.md) | Workspace apps that must run use an app-local esbuild bundle (ESM default; CJS where a CJS-only dependency forces it) | Accepted | §2, §5 | `WP-120`/`WP-130` (done, unchanged); `apps/trader` and later apps |
+| [ADR-019](./ADR-019-soak-evidence-threshold-policy.md) | Soak-evidence threshold: 24 contiguous hours, one window, no summing | Accepted | §16.7, §17 | `WP-140` (done, unchanged) |
 
 Companion contract documentation (not ADRs, same authority chain):
 

@@ -6,6 +6,12 @@
 - **Implemented by:** `WP-020` — all four are already implemented and frozen;
   this record ratifies them **as decided** and changes no code
 - **Supersedes / Superseded by:** none
+- **Amendments:** 2026-09-02 (`GOV-1C`) — §2's external-boundary sentence was
+  decided both ways at once ("lowercases it … and a mixed-case value is that
+  adapter's typed failure"); the dated block in §2 rules it single-valued:
+  **refuse, do not normalize**. Register item **R-8**
+  (`docs/contracts/protected-contracts.md` §8.1). The original sentence is
+  kept and marked; no other section is touched and no code changed.
 
 ## Context
 
@@ -81,10 +87,63 @@ Consequences that bind:
 
 - Any future component that *receives* a UUID from an external system lowercases
   it **at its adapter boundary**, and a mixed-case value is that adapter's typed
-  failure — not a domain-schema relaxation.
+  failure — not a domain-schema relaxation. *(As written 2026-08-28 this
+  sentence named both normalize and refuse; the 2026-09-02 amendment below
+  rules it: the second half is the rule.)*
 - The version and variant nibbles are pinned deliberately: `Uuidv7Schema` exists
   because §7.1 requires time-ordered `eventId`s, and a v4 in that position would
   break the ordering property the field is there to provide.
+
+**Amendment, 2026-09-02 (`GOV-1C`; register item R-8) — the external-boundary
+rule is REFUSE, not normalize.**
+
+The first consequence above prescribed two opposite behaviors in one sentence.
+The ruling, stated so a future adapter can conform to it or violate it:
+
+1. **A UUID-shaped identifier arriving from an external input surface must
+   already be in the canonical lowercase form.** A mixed-case — or otherwise
+   non-canonical — spelling is a **typed refusal at that surface, carrying the
+   raw value**, exactly the shape ADR-015 §5 prescribes for an over-long
+   identifier: never truncation, never a silent repair, never a case-fold.
+2. **Why refuse rather than fold, when RFC 9562 makes hex digits
+   case-insensitive on input.** Folding would be *technically* safe (the
+   grammar is ASCII-only, so Unicode-confusable risk is excluded before any
+   fold), and this amendment does not pretend otherwise — the rule is
+   repository **boundary hardening** in ADR-015's sense, not a claim about
+   UUID semantics. The reasons it is right here:
+   - **Every UUID in these contracts is generated in-process** (§2 above), so
+     the only way a well-behaved external caller obtains one is from this
+     repository — already lowercase. A caller must **round-trip identifiers
+     byte-for-byte**; a mixed-case arrival is therefore evidence of a
+     transforming pipeline, and the repository's strict-boundary rationale
+     applies verbatim: "a silently coerced value hides a real integration
+     bug" (`domain.md` §3.2). Refusal rejects nothing a correct caller sends —
+     the same property that justified ADR-015's bound.
+   - **Folding creates a second accepted spelling at every future surface**,
+     and with it the evidence-vs-interpretation split this repository records
+     raw frames to avoid: a recorded raw input carrying `ABC…` whose derived
+     domain document carries `abc…` makes byte-level reconciliation of
+     evidence against interpretation fail on every such identifier.
+   - **The established direction is fail-closed** (`WP-110`'s
+     placeholder/confusable hardening; ADR-015's typed refusal), and unlike
+     the decimal case — where venues *documentedly* emit spellings such as
+     `"1.50"` and `normalizeDecimalString` exists for exactly that traffic —
+     **no external system is documented or expected to re-case these
+     identifiers**, so a fold buys interoperability with nothing known.
+3. **Consequences for future adapters and surfaces** (config files, the
+   control API, database/import tooling, replay input — uniformly):
+   - no adapter may offer a fold-on-input convenience for UUID-shaped
+     identifiers, and none may accept uppercase "just for lookups";
+   - the refusal is a **typed problem carrying the raw value**, so the
+     evidence survives and the caller's defect is diagnosable;
+   - this rules external **input** only — it does not change the frozen
+     schemas (which already accept lowercase only), does not touch any venue
+     wire format (venue identifiers are not UUIDs; their rules are ADR-015's),
+     and moves no `schemaVersion` (no emitted field set changed).
+4. **Reopen condition:** evidence of a real external system that legitimately
+   re-cases repository identifiers **and** a superseding ADR that states how
+   recorded evidence disambiguates raw versus folded spellings. Absent both,
+   refusal stands.
 
 ### 3. Incident `severity` is exactly `LOG` / `NOTIFY` / `PAGE`
 

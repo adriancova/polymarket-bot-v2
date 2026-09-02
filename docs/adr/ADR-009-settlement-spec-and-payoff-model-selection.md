@@ -8,6 +8,13 @@
   yet implemented**. The outcome-state vocabulary and the `MarketResolved`
   contract are already frozen by `WP-020`.
 - **Supersedes / Superseded by:** none
+- **Amendments:** 2026-09-02 (`GOV-1C`) — §5 gains a dated block recording that
+  its §5.2/§5.3 conditions are **discharged**: `WP-110`'s mandated 2026-08-28
+  verification closed U-6 documentarily (the 50/50 payout is $0.50 per token,
+  stated directly by the venue). The original §5 text is unedited; the
+  register row is `docs/contracts/protected-contracts.md` §8 U-6. `CANCELLED`
+  mechanics remain unverified (new register row **U-10**) and §4's
+  `MarketDisputed` condition remains unmet.
 
 ## Context
 
@@ -141,6 +148,30 @@ Decision:
    every reviewed spec must state what happens on a post-open clarification even
    while the venue mechanics are unverified. "Halt and escalate" is a legitimate
    policy; "unspecified" is not.
+
+**Amendment, 2026-09-02 (`GOV-1C`): the §5.2 condition is discharged and the
+§5.3 conditional is confirmed.** `WP-110` performed the verification this
+section mandated, on 2026-08-28, against the exact page U-6 named
+(`https://docs.polymarket.com/concepts/resolution`, HTTP 200 in rendered and
+Markdown forms; verbatim quotes, dates, and method in
+`docs/handoffs/WP-110.md` §"venue facts verified"). The venue states the 50/50
+payout **directly** — "Market resolves 50/50 — each token redeems for \$0.50"
+— so the payout is no longer an inference from the collateral statement:
+`SPLIT_50_50_PAYOUT_PER_SHARE = "0.5"` is venue-verified as of that date, and
+the §5.2 UNVERIFIED-marker obligation **for the 50/50 outcome and post-open
+clarification** is lifted. Recorded under the `docs/adr/README.md` bounded
+exception for a ratifying record of a work package's **mandated** verification
+(all four conditions met: §1.1 precedence; URL + date + verbatim quotes held
+in the `WP-110` handoff, documentary-not-observational stated; the frozen
+report cited for U-6's origin and not edited; the gap recorded — the
+resolution page is still absent from any report's source index and is listed
+as owed in `docs/venue/verified-2026-09-02.md`). Three things this amendment
+does **not** do: it does not verify `CANCELLED` mechanics (register row
+**U-10**; the `SETTLEMENT_CANCELLED_PAYOUT_UNVERIFIED` refusal stands), it
+does not change §4 (no dispute transition event was found; the
+`umaResolutionStatus` vocabulary is undocumented — register row **U-11**),
+and it claims nothing observational (handoff §1.2 keeps the fact volatile;
+each phase gate re-verifies).
 
 ### 6. TWAP specs must name a window the feed actually publishes
 

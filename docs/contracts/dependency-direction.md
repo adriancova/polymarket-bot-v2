@@ -170,6 +170,8 @@ row. Two known cases will need one and do not have a citation today:
 | F12 | Any workspace edge from a lower-numbered layer to a higher-numbered one | §5.2 (the allowed direction is one-way), §2 of this document |
 | F13 | Any **same-layer** workspace edge not listed in §2.1 | §2, §2.1 of this document |
 | F14 | Inside a **purity-restricted** package (`packages/domain`, `packages/strategies/**`, `packages/ledger`, `packages/simulation`), any construct that makes F1–F8/F11 **unevaluable**: a module load whose specifier is not a static literal; a reference to a module-**loading capability** (`require` and its aliases, a CommonJS `Module` object incl. `process.mainModule`/`require.main`, `createRequire` and its result, `process.getBuiltinModule`, the `node:module` namespace/`Module` class/`register`) in a position that escapes this document's analysis; a computed member read on such a capability; and a reference to an **evaluator** (`eval`, `Function`, or a read of the `.constructor` property) | §5.2 and ADR-005 §1, read as intent rather than as a list of spellings: a package forbidden to perform I/O has no legitimate use for a module loader or an evaluator, and a construct that defeats static checking cannot be permitted to *establish* compliance. Numbered 2026-08-28 (`GOV-1B`) from `docs/handoffs/WP-015.md` `follow_up` 6 |
+| F15 | `packages/decimal` importing anything beyond `decimal.js` and `node:crypto` | `docs/contracts/domain.md` §1 ("Dependencies: `decimal.js` and `node:crypto` only … the package performs no I/O") and §2 of this document (the Layer 0 "May import" cell). Numbered 2026-09-02 (`GOV-1C`) from `docs/handoffs/WP-015.md` `follow_up` 4 via §6.1 item 4 — the allowlist was "enforced by construction" with no F-row, so a violating edit would have been a review finding rather than a gate failure. **Not yet implemented by the §6 check** (the same tooling follow-up as the F14 machine-id swap); until then, enforcement-by-construction and review remain the mechanism |
+| F16 | A cross-package **deep import** — any workspace import specifier that resolves inside another workspace package other than through that package's `package.json` `exports` map | `docs/handoffs/WP-015.md` `follow_up` 3 via §6.1 item 4, numbered 2026-09-02 (`GOV-1C`) on the evidence that **every** workspace package (28/28 as of this date) declares an `exports` map, so "bypassing the entry point" is well-defined. Largely platform-enforced already: Node refuses an unexported subpath (`ERR_PACKAGE_PATH_NOT_EXPORTED`) and `NodeNext` resolution mirrors it at typecheck — the row exists so a widened `exports` map or a bundler that resolves around encapsulation is a contract violation, not a loophole. **Not yet implemented by the §6 check** (same tooling follow-up) |
 
 F3 and F11 are the two that matter most for correctness rather than tidiness:
 they are what makes deterministic replay possible (§12.4).
@@ -192,11 +194,20 @@ it or drop it. It is numbered here, with three deliberate consequences:
    prove one was not. The trade is *noisy, never silent*, and it costs nothing in
    practice because the constructs it flags have no legitimate use in a package
    that may not perform I/O.
-3. **The check emits this rule under the id `F-OPAQUE`**, which predates the
-   number. The id is an accepted alias for F14; renaming it in
-   `tools/check-dependency-direction.mjs` and its tests is a **tooling
-   follow-up**, not a contract change, and this row is the citation that rule
-   was missing either way.
+3. **The id `F-OPAQUE`, which predates the number, is an accepted alias for
+   F14.** *(State updated 2026-09-02 by `GOV-1C`, discharging the tooling half
+   of `GOV-1B` `follow_up` 5 to the extent a governance round can.)* The
+   check's **human-readable findings now lead with `FAIL [F14]`**, each
+   carrying an `id:` traceability line naming the alias, and its JSON report
+   carries **both** ids (`contractRule: "F14"` alongside the machine field
+   `rule: "F-OPAQUE"`). The machine `rule` field was **not** renamed, because
+   `test/unit/tooling/dependency-direction.test.ts` pins the alias
+   structurally (`entry.rule === "F-OPAQUE"` and `FAIL [F-OPAQUE]` output
+   assertions, 30+ sites) and test paths are outside a governance round's
+   scope — swapping the machine field and that suite **in one change** is the
+   remaining tooling follow-up. Until it lands, a JSON consumer keys on
+   `rule: "F-OPAQUE"` or `contractRule: "F14"`; both are stable, and this row
+   is the citation for both spellings.
 
 Two ids the check emits are **not** rules of this section: `F-CLOSED`, which is
 §6's fail-closed behavior (an unclassified package, or a §2 named entry with no
@@ -238,7 +249,7 @@ exactly one layer (§2).
 | Mechanism | Status |
 | --- | --- |
 | `packages/domain` imports only `zod` and `@polymarket-bot/decimal`; no Node built-in, no `process`/`globalThis`, no clock, no randomness | **Enforced by construction** in the frozen package; documented in `docs/contracts/domain.md` §2 |
-| `packages/decimal` imports only `decimal.js` and `node:crypto` and performs no I/O | **Enforced by construction**; `docs/contracts/domain.md` §1 |
+| `packages/decimal` imports only `decimal.js` and `node:crypto` and performs no I/O | **Enforced by construction**; `docs/contracts/domain.md` §1. Numbered **F15** in §3 (2026-09-02); not yet evaluated by the §6 check |
 | TypeScript project references and `pnpm` workspace resolution | A package can only import a workspace package it declares as a dependency |
 | `pnpm typecheck`, `pnpm lint`, `pnpm test` | Run locally and in CI (`.github/workflows/ci.yml`) |
 | **The §6 check itself** — cycles (F9), layer conformance (F12/F13), forbidden specifiers and impure globals (F1–F8, F11), and the opaque-construct rule (F14) | **Implemented and CI-wired.** `tools/check-dependency-direction.mjs`, run by the root script `check:deps` and by the "Dependency direction and package boundaries" step in `.github/workflows/ci.yml`, between the lint and unit-test steps. It parses §2 and §2.1 from **this document** at run time (§6) and fails closed on a contract it cannot parse |
@@ -397,19 +408,21 @@ filesystem, database, network, or signing dependency to the matching catalogue i
 that file **in the same change** (`WP-015` `follow_up` 5), because the catalogues
 are enumerations and cannot infer a library's nature from its name.
 
-### 6.1 Open contract-owner items about this document
+### 6.1 Contract-owner items about this document (ruled 2026-09-02)
 
 Recorded here so they are owned rather than remembered. Each is a question
 `WP-015` raised and deliberately did **not** answer, because answering it means
-adding or changing a numbered rule in this document.
+adding or changing a numbered rule in this document. *(Status column ruled
+2026-09-02 by `GOV-1C`, the contract-owner round `GOV-1B` `follow_up` 6
+assigned; the item descriptions are kept verbatim as history.)*
 
 | # | Item | Status |
 | --- | --- | --- |
-| 1 | **The positive callee-resolution rule** (`WP-015` `follow_up` 8): "a purity-restricted package's source may contain no call whose callee does not statically resolve to a declared import binding or a known-pure local." It is the **durable** fix for F14's residuals — reflective acquisition (`Reflect.get(process, "mainModule").require(…)`), runtime-computed member names, and cross-file capability injection — because it is total over what the walk sees regardless of which loader or evaluator the callee names, ending the "add the one spelling the last round missed" pattern that rounds 3–9 each repeated | **OPEN, and deliberately not implemented on 2026-08-28.** It needs a numbered §3 rule *and* it carries a real noise trade-off: it flags every dynamically-dispatched call inside a restricted package. That is contract-level policy about how those packages may be written, not a tooling preference, so it is not adopted as a side effect of numbering F14. Whoever adopts it writes the §3 row, states the noise trade-off, and only then extends the check |
-| 2 | **Does rule 3 apply to a strategy package's own test files?** (`WP-015` `follow_up` 2, its `assumptions` 6 / risk 3) | **OPEN.** Today the scan does not distinguish them. A strategy's test may legitimately need a clock or a fixture loader that ADR-005 §1 forbids the strategy itself; until this is ruled, the answer is the checker's current behavior, not a documented decision. `WP-220` will hit it first |
-| 3 | **Should a computed property read whose key cannot be statically folded fail closed inside a restricted package?** (`WP-015` `follow_up` 9) | **OPEN.** Today it does not, which leaves `f[parts.join("")]` as a route to `.constructor`; closing it would overturn the accepted ruling that `table[key]` on a non-capability object adds no noise. The two rulings are in genuine tension and only this document can settle it — item 1 above subsumes it |
-| 4 | **A cross-package *deep* import** (bypassing a package's `exports` entry point) has no §3 row (`WP-015` `follow_up` 3), and `packages/decimal`'s documented import allowlist (§5) is "enforced by construction" with no F-row either (`follow_up` 4) | **OPEN.** Both are candidate §3 rows; neither may be implemented in the check before it has a cited row here |
-| 5 | **The §2.1 allowlist is pinned by a test.** `test/unit/tooling/dependency-direction.test.ts` asserts the shipping allowlist ids are exactly `["S0", "S1", "S2"]` | **Recorded, not a defect.** The first package that adds a §2.1 row updates that assertion in the same change; a contract edit alone would fail `pnpm test`. Noted because a governance round that adds rows and a tooling package that owns the test are usually not the same package |
+| 1 | **The positive callee-resolution rule** (`WP-015` `follow_up` 8): "a purity-restricted package's source may contain no call whose callee does not statically resolve to a declared import binding or a known-pure local." It is the **durable** fix for F14's residuals — reflective acquisition (`Reflect.get(process, "mainModule").require(…)`), runtime-computed member names, and cross-file capability injection — because it is total over what the walk sees regardless of which loader or evaluator the callee names, ending the "add the one spelling the last round missed" pattern that rounds 3–9 each repeated | **RULED 2026-09-02 (`GOV-1C`): NOT adopted, with a binding tripwire.** Not adopted because the frozen `packages/domain` itself dispatches dynamically as a matter of design — every `schema.parse(...)`, registry lookup, and structural-contract callback is a call whose callee is a parameter or property value, not "a declared import binding or a known-pure local" — so the rule as drafted floods the one package it most needs to protect, and a rule that must be waived wholesale for existing frozen code enforces nothing. What is adopted instead is the **tripwire**: the next F14-class escape spelling found that the existing enumerations do not catch is closed by adopting a total rule (this one, or an equivalent), **in the closing change, as a mandatory §3 row with its noise trade-off stated** — declining a second time is not available. Until the tripwire fires, F14's noisy-never-silent floor plus review is the accepted mechanism, and the residuals stay disclosed (item 3) |
+| 2 | **Does rule 3 apply to a strategy package's own test files?** (`WP-015` `follow_up` 2, its `assumptions` 6 / risk 3) | **RULED 2026-09-02 (`GOV-1C`): YES — test files inside a purity-restricted package are in scope**, which documents the checker's shipped behavior as the decision rather than an accident. Reasons: a strategy test that reads a real clock or unseeded randomness is exactly the nondeterminism §12.4 exists to exclude, and the repository already has the sanctioned alternatives (injected manual clocks and seeded sources — the `WP-120`/`WP-140` test pattern; fixtures enter as imported modules or inline literals, not `node:fs` reads). Consequence for `WP-220` and every later strategy package: write tests under the same purity rules as the strategy; a genuine need that cannot be met that way is a **cited change to this document first** (a scoped exemption row with its boundary stated), never a checker workaround |
+| 3 | **Should a computed property read whose key cannot be statically folded fail closed inside a restricted package?** (`WP-015` `follow_up` 9) | **RULED 2026-09-02 (`GOV-1C`): it stays non-fail-closed**, preserving the accepted `WP-015` ruling that `table[key]` on a non-capability object adds no noise — overturning that would flag ordinary data-table dispatch throughout restricted packages, which is item 1's noise trade-off arriving by another door. The residual (`f[parts.join("")]` as a route to `.constructor`) remains **disclosed, accepted, and covered by item 1's tripwire**: an actual escape through it fires the tripwire and forces the total rule |
+| 4 | **A cross-package *deep* import** (bypassing a package's `exports` entry point) has no §3 row (`WP-015` `follow_up` 3), and `packages/decimal`'s documented import allowlist (§5) is "enforced by construction" with no F-row either (`follow_up` 4) | **CLOSED 2026-09-02 (`GOV-1C`) by writing the rows: §3 F15** (the `packages/decimal` allowlist; basis `domain.md` §1) **and §3 F16** (no cross-package deep import around an `exports` map; basis: all 28 workspace packages declare one, and Node/`NodeNext` already refuse unexported subpaths). Neither is implemented in the §6 check yet — that is the same single tooling follow-up as the F14 machine-id swap, and per this item's own rule the cited rows now exist **before** any implementation |
+| 5 | **The §2.1 allowlist is pinned by a test.** `test/unit/tooling/dependency-direction.test.ts` asserts the shipping allowlist ids are exactly `["S0", "S1", "S2"]` | **Recorded, not a defect — reviewed 2026-09-02 (`GOV-1C`) and it stands unchanged.** The first package that adds a §2.1 row updates that assertion in the same change; a contract edit alone would fail `pnpm test`. Noted because a governance round that adds rows and a tooling package that owns the test are usually not the same package — exactly the constraint the F14 machine-id swap hit (§3 F14, consequence 3) |
 
 ---
 

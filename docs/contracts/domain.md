@@ -569,6 +569,73 @@ accepted ADRs, which are now the change-control gate referenced in §9:
 | §2 dependency direction | [`dependency-direction.md`](./dependency-direction.md) |
 | §9 contract freeze | [`protected-contracts.md`](./protected-contracts.md) §3 |
 
+The following rows were added on 2026-09-02 by `GOV-1C` (additive only, closing
+register item **R-7a** — `protected-contracts.md` §8.1; no decision in §1–§9 is
+changed). They record the four ADRs the 2026-08-28 governance round accepted
+after this table was written:
+
+| This document | Ratifying ADR |
+| --- | --- |
+| `events/book.ts` `BookLevelChanged.size` — absolute aggregate size, `"0"` removes the level (the C-1/U-1 semantics the frozen comments now state as CONFIRMED) | [ADR-013](../adr/ADR-013-book-price-change-absolute-size-confirmed.md) |
+| `takerSide` in `events/book.ts` / `events/reference.ts` — names the **aggressor order's own side** (`BID` ⇔ the taker was buying), never the side of the book consumed; per-venue mappings tabulated there | [ADR-014](../adr/ADR-014-taker-side-names-the-aggressor-order-side.md) |
+| §7's `MAX_IDENTIFIER_LENGTH` bound read together with the "no 31/32-byte narrowing" rule — the bound is deliberate repository-wide boundary hardening, beyond it a typed refusal is correct adapter behavior, and raising it requires an ADR plus a `schemaVersion` statement | [ADR-015](../adr/ADR-015-repository-identifier-bound.md) |
+| §8's four previously-unratified inferences: `TokenId` canonical unsigned integer string; **UUIDs lowercase only** (external-boundary rule refined by the ADR's 2026-09-02 amendment: a non-canonical UUID-shaped arrival is **refused**, not case-folded); incident `severity` = `LOG`/`NOTIFY`/`PAGE`; payload field sets beyond §7.4's names as repository design | [ADR-016](../adr/ADR-016-ratified-inferred-domain-shapes.md) |
+
 Runtime parsers built on these contracts must not inherit the `WP-000`
 fixture-only narrowings; the binding list is
 [ADR-002](../adr/ADR-002-event-envelope-and-ordering-semantics.md) §7.
+
+---
+
+## 11. Registered producer conventions
+
+Added 2026-09-02 by `GOV-1C` (additive only; no schema, type, or code changed —
+**no emitted field set changed, therefore `schemaVersion` is unchanged**,
+ADR-002 §3). This section registers conventions that *producers* of domain
+documents follow inside otherwise-opaque contract fields, so a downstream
+consumer that wants to parse one depends on a contract, not on a convention it
+reverse-engineered (`WP-120` `follow_up` 4; its `known_risks` 3).
+
+### 11.1 `causationId` — the gateway's raw-frame reference
+
+The §7.1 envelope field `causationId` is, **at the schema level, an opaque
+bounded string**, and stays one. Within it, the data gateway
+(`apps/data-gateway`, `WP-120`) emits exactly one registered format for an
+event derived from a recorded raw frame:
+
+```text
+causationId := "raw:" <gatewayEpoch> ":" <ingestSeq>
+```
+
+| Component | Grammar | Meaning |
+| --- | --- | --- |
+| `"raw:"` | literal prefix | names the referent kind: a recorded **raw WAL frame** |
+| `<gatewayEpoch>` | the referenced frame's `gatewayEpoch` — in this repository a lowercase UUIDv7 (§7.1, §8) | the epoch component of the frame's dedup identity |
+| `<ingestSeq>` | the referenced frame's `ingestSeq` — canonical unsigned integer string, no leading zeros | the sequence component of the frame's dedup identity |
+
+Semantics, binding on producer and consumer alike:
+
+1. **The referent is the WAL record** whose `RawFrameRecord` carries exactly
+   that `(gatewayEpoch, ingestSeq)` pair (`wal-format.md` §5) — this is what
+   makes §6 invariant 4's chain ("fill → … → source event") terminate in bytes
+   on disk.
+2. **Both components come from the raw frame**, not from the event's own
+   envelope. For a gateway-derived event the two epochs are equal by
+   construction (raw frames and events draw from one sequencer, ADR-002 §2),
+   but a consumer **parses the components rather than assuming that equality**.
+3. **Parsing is unambiguous** despite `:` being legal inside neither component
+   in practice but unreserved in principle: split on the **first** and **last**
+   `:` — the prefix is fixed and `<ingestSeq>` contains no `:` by grammar, so
+   everything between belongs to `<gatewayEpoch>`.
+4. **An unregistered value is opaque, not an error.** A `causationId` that does
+   not begin with a registered prefix is the §7.1 baseline — an opaque
+   causation reference. A consumer must not refuse it and must not guess at
+   its structure.
+
+**Who may extend this.** New registered formats (a new prefix, or a widened
+grammar for `raw:`) are **contract-owner changes to this section** —
+orchestrator-approved, additive, one prefix per referent kind, and a prefix
+once registered is never reused or redefined. A producer (any app) may not
+emit a *new* machine-parseable convention inside `causationId` without
+registering it here first; consumers (`WP-210` replay, `WP-230`) may rely on
+exactly the registered set and the opacity rule above.
