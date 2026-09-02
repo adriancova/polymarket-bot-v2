@@ -126,7 +126,7 @@ export const RECORDER_METRIC_FAMILIES: readonly RecorderMetricFamily[] = [
   family("recorder_publisher_queue_bytes", "gauge", "queue-depth", "Publish admission queue bytes."),
   family("recorder_publisher_queue_max_bytes_observed", "gauge", "queue-depth", "High-water mark of the publish queue bytes."),
   family("recorder_publisher_queue_max_bytes", "gauge", "queue-depth", "Configured publish queue byte bound — crossing it is a terminal halt."),
-  family("recorder_publisher_oldest_queued_age_ms", "gauge", "lag", "How long the publish-queue head has waited, in milliseconds. Alarm on this BEFORE the depth/byte bound is reached: the bound is a halt."),
+  family("recorder_publisher_oldest_queued_age_ms", "gauge", "lag", "How long the publish-queue head has waited, in milliseconds. Best-effort early warning that the transport stopped draining (RecorderPublishQueueAgeHigh; advisory lead time only — a fast burst can cross the bound first). The only ENFORCED guarantee is the in-process terminal halt plus PAGE incident when a bound is crossed (WP-120)."),
 
   // --- Dispatcher ----------------------------------------------------------
   family("recorder_dispatcher_dispatched_total", "counter", "publication", "Events dispatched by the gateway dispatcher."),

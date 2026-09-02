@@ -25,6 +25,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ACCEPTANCE_1_CATEGORIES,
+  RECORDER_METRIC_FAMILIES,
   recorderMetricFamily,
   recorderMetricNamesByCategory,
 } from "./metric-families.js";
@@ -42,6 +43,7 @@ interface DashboardPanel {
   readonly id?: number;
   readonly type?: string;
   readonly title?: string;
+  readonly description?: string;
   readonly targets?: readonly DashboardTarget[];
 }
 interface Dashboard {
@@ -221,6 +223,18 @@ describe("the recorder alert rules", () => {
     ).toEqual([]);
   });
 
+  it("declares exactly 20 alerts in 7 groups (the count docs/handoffs/WP-140.md cites)", () => {
+    // Remediation round 2, LOW-1: the hand-off originally claimed "16 alerts
+    // in 7 groups"; direct parsing finds 20. The count is asserted HERE so
+    // the document can cite this test instead of a hand count — changing the
+    // rule set means updating the expected-name list above, this count, and
+    // the hand-off together.
+    const declared = [...alertsSource.matchAll(/^\s*-\s*alert:\s*\S+\s*$/gmu)];
+    expect(declared.length, "alert-rule count drifted — update docs/handoffs/WP-140.md").toBe(20);
+    const groups = [...alertsSource.matchAll(/^\s{2}-\s*name:\s*\S+\s*$/gmu)];
+    expect(groups.length, "rule-group count drifted — update docs/handoffs/WP-140.md").toBe(7);
+  });
+
   it("documents the log-based FAILED-to-exit alarm instead of faking it as PromQL", () => {
     expect(alertsSource).toContain("cleanup deadline");
     expect(alertsSource).toContain("[disposal]");
@@ -254,6 +268,111 @@ describe("the recorder alert rules", () => {
     // …and the unenforceable guarantee wording is absent.
     expect(ruleText.toLowerCase()).not.toContain("before the bound");
     expect(ruleText.toLowerCase()).not.toContain("guarantees");
+  });
+});
+
+describe("guarantee-shaped alarm wording is banned on EVERY operator surface", () => {
+  // Remediation round 2, M-3 residue. Round 1 (M-3) rewrote the ALERT RULE
+  // honestly, but its wording test policed only that rule's block — so the
+  // unenforceable "fires before the bound" promise survived on two other
+  // exported operator surfaces (the metric help text and the dashboard
+  // panel). This denylist now scans ALL operator-facing strings this package
+  // ships:
+  //
+  //   1. every metric-family help text (the exporter's HELP lines);
+  //   2. every dashboard panel title and description (rows included);
+  //   3. the alert rules YAML with comment lines stripped — stripped because
+  //      the header comments legitimately NEGATE the guarantee ("not a
+  //      guarantee of firing before the admission bound"), and a substring
+  //      denylist cannot see negation; every operator-rendered string
+  //      (alert names, summaries, descriptions) remains fully scanned.
+  //
+  // The denylist bans promissory SHAPES, not the word "guarantee" itself:
+  // the honest wording must stay able to NAME the one enforced guarantee —
+  // the in-process terminal halt plus PAGE incident on overflow (WP-120's
+  // machinery), which is independent of Prometheus. A Prometheus alarm
+  // behind a 5 s threshold + 15 s scrape + 1 m `for:` window can promise
+  // advisory lead time only.
+  const GUARANTEE_DENYLIST: readonly { readonly pattern: RegExp; readonly means: string }[] = [
+    {
+      pattern: /before the (?:\S+ )?bound/iu,
+      means: 'promises firing "before the … bound" — unenforceable under threshold + scrape + for: delays',
+    },
+    {
+      pattern: /well before/iu,
+      means: 'promises comfortable lead time ("well before") that nothing enforces',
+    },
+    {
+      pattern: /guaranteed/iu,
+      means: "declares something guaranteed where only the in-process halt is enforced",
+    },
+    {
+      pattern: /\bguarantees\b/iu,
+      means: "same, verb form (the round-1 ban, now applied to every surface)",
+    },
+  ];
+
+  function allPanels(): DashboardPanel[] {
+    // Rows included: their titles are operator-facing too.
+    return [...(dashboard.panels ?? [])];
+  }
+
+  function strippedAlertsSource(): string {
+    return alertsSource
+      .split("\n")
+      .filter((line) => !/^\s*#/u.test(line))
+      .join("\n");
+  }
+
+  it("no surface matches the guarantee denylist", () => {
+    const surfaces: readonly { readonly surface: string; readonly text: string }[] = [
+      ...RECORDER_METRIC_FAMILIES.map((entry) => ({
+        surface: `metric help: ${entry.name}`,
+        text: entry.help,
+      })),
+      ...allPanels().flatMap((panel) => [
+        { surface: `dashboard panel "${panel.title ?? "?"}": title`, text: panel.title ?? "" },
+        {
+          surface: `dashboard panel "${panel.title ?? "?"}": description`,
+          text: panel.description ?? "",
+        },
+      ]),
+      { surface: "alert rules YAML (comments stripped)", text: strippedAlertsSource() },
+    ];
+    // Collected, not short-circuited: a violation report names EVERY
+    // offending surface at once.
+    const violations: string[] = [];
+    for (const { surface, text } of surfaces) {
+      for (const { pattern, means } of GUARANTEE_DENYLIST) {
+        if (pattern.test(text)) {
+          violations.push(`${surface} matches denylisted ${String(pattern)} — ${means}`);
+        }
+      }
+    }
+    expect(violations).toEqual([]);
+  });
+
+  it("the queue-age metric help and dashboard panel name the enforced guarantee", () => {
+    // The honest restatement is pinned positively, mirroring the runbook §5
+    // and the RecorderPublishQueueAgeHigh annotation: best-effort/advisory
+    // early warning, with the in-process terminal halt + PAGE incident as
+    // the only ENFORCED guarantee.
+    const help = recorderMetricFamily("recorder_publisher_oldest_queued_age_ms")?.help ?? "";
+    expect(help).toContain("Best-effort early warning");
+    expect(help).toContain("advisory lead time");
+    expect(help).toContain("in-process terminal halt");
+    expect(help).toContain("PAGE incident");
+
+    const panel = dataPanels().find((candidate) =>
+      (candidate.targets ?? []).some(
+        (target) => target.expr === "recorder_publisher_oldest_queued_age_ms",
+      ),
+    );
+    expect(panel, "no dashboard panel charts recorder_publisher_oldest_queued_age_ms").toBeDefined();
+    expect(panel?.title ?? "").toContain("best-effort early warning");
+    expect(panel?.description ?? "").toContain("advisory lead time");
+    expect(panel?.description ?? "").toContain("in-process terminal halt");
+    expect(panel?.description ?? "").toContain("PAGE incident");
   });
 });
 

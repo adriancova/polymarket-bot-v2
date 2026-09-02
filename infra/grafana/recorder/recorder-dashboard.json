@@ -111,8 +111,8 @@
     {
       "id": 21,
       "type": "timeseries",
-      "title": "Oldest queued age (ALARM BEFORE THE BOUND)",
-      "description": "The publish bound is a terminal halt; this age gauge is the early warning that the transport stopped draining. Alert RecorderPublishQueueAgeHigh fires on it well before depth reaches the bound.",
+      "title": "Oldest queued age (best-effort early warning)",
+      "description": "The publish bound is a terminal halt; this age gauge is best-effort early warning that the transport stopped draining. Alert RecorderPublishQueueAgeHigh fires on it for advisory lead time only — a fast burst can cross the bound first, inside the 5 s threshold + 15 s scrape + 1 m for: window. The only ENFORCED guarantee is the in-process terminal halt plus PAGE incident on overflow (GATEWAY_PUBLISH_ADMISSION_OVERFLOW, WP-120); see docs/runbooks/recorder.md §5.",
       "gridPos": { "h": 7, "w": 8, "x": 0, "y": 15 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
