@@ -1,0 +1,388 @@
+{
+  "__comment": "Recorder observability dashboard (WP-140). Machine-checked: packages/observability/src/recorder/infra-consistency.test.ts asserts every recorder_* metric referenced here is emitted by the exporter (packages/observability/src/recorder/render.ts) and that the acceptance-1 signal categories (queue depth, lag, gaps, fsync, compaction, upload status) each have a bound panel. The only non-recorder_* series used is Prometheus's own `up` for the process-exit alarm view.",
+  "title": "Recorder — Market Data Gateway & Compaction (WP-140)",
+  "uid": "recorder-wp140",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "tags": ["recorder", "data-gateway", "wp-140", "paper-only"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Liveness — alarm on EXIT and on FAILED-to-exit (see docs/runbooks/recorder.md)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Recorder process up (EXIT alarm feeds on this)",
+      "description": "0 or absent = the recorder EXITED — page. A recorder that FAILED to exit (cleanup deadline expired) is a LOG signal, not a metric: `cleanup deadline … expired` and `[disposal]` stderr lines; see the runbook's forced-exit section.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "refId": "A", "expr": "up{job=\"recorder\"}" }]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Publication halted / RTDS halted / WAL faulted",
+      "description": "All three are one-way for the epoch; recovery is a restart (new epoch). Recording continues through a publication halt.",
+      "gridPos": { "h": 5, "w": 18, "x": 6, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_publisher_halted", "legendFormat": "publication halted" },
+        { "refId": "B", "expr": "recorder_publisher_halt_info", "legendFormat": "halt cause {{cause}}" },
+        { "refId": "C", "expr": "recorder_rtds_halted", "legendFormat": "rtds halted" },
+        { "refId": "D", "expr": "recorder_wal_faulted", "legendFormat": "wal faulted" },
+        { "refId": "E", "expr": "recorder_wal_closed", "legendFormat": "wal closed" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Queue depth — WAL and publish admission (bounds are halts; watch headroom)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "WAL queue depth vs bound",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_wal_queue_depth", "legendFormat": "depth" },
+        { "refId": "B", "expr": "recorder_wal_queue_high_water_depth", "legendFormat": "high water" },
+        { "refId": "C", "expr": "recorder_wal_queue_max_depth", "legendFormat": "bound" },
+        { "refId": "D", "expr": "recorder_wal_queue_byte_depth", "legendFormat": "bytes" },
+        { "refId": "E", "expr": "recorder_wal_queue_max_byte_depth", "legendFormat": "byte bound" }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Publish queue depth vs bound (WP-120 obligation gauges)",
+      "description": "queueDepth / queueMaxDepthObserved / queueBytes charted per docs/handoffs/WP-120.md follow_up (remediation round 1) item 1. Crossing either bound is a TERMINAL publication halt.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_publisher_queue_depth", "legendFormat": "depth" },
+        { "refId": "B", "expr": "recorder_publisher_queue_max_depth_observed", "legendFormat": "depth high water" },
+        { "refId": "C", "expr": "recorder_publisher_queue_max_depth", "legendFormat": "depth bound" },
+        { "refId": "D", "expr": "recorder_publisher_queue_bytes", "legendFormat": "bytes" },
+        { "refId": "E", "expr": "recorder_publisher_queue_max_bytes_observed", "legendFormat": "bytes high water" },
+        { "refId": "F", "expr": "recorder_publisher_queue_max_bytes", "legendFormat": "bytes bound" }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Admission refusals & queue overflow signals",
+      "description": "Any admission refusal accompanies a terminal halt; WAL overflow signals are refusals at the WAL bound (never drops).",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(recorder_publisher_admission_refusals_total[5m])", "legendFormat": "publish admission refusals (5m)" },
+        { "refId": "B", "expr": "increase(recorder_wal_queue_overflow_signals_total[5m])", "legendFormat": "wal overflow signals (5m)" },
+        { "refId": "C", "expr": "increase(recorder_wal_queue_messages_dropped_total[5m])", "legendFormat": "wal messages dropped (5m) — MUST be 0" }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Lag & staleness",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "panels": []
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Oldest queued age (ALARM BEFORE THE BOUND)",
+      "description": "The publish bound is a terminal halt; this age gauge is the early warning that the transport stopped draining. Alert RecorderPublishQueueAgeHigh fires on it well before depth reaches the bound.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_publisher_oldest_queued_age_ms", "legendFormat": "publish head age (ms)" },
+        { "refId": "B", "expr": "recorder_wal_queue_oldest_message_age_ms", "legendFormat": "wal head age (ms)" },
+        { "refId": "C", "expr": "recorder_wal_queue_consumer_lag", "legendFormat": "wal consumer lag (frames)" }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Compaction lag + active segment age (the whole picture)",
+      "description": "recorder_compaction_lag_ms only sees segments a cycle looked at and refused; a segment nobody compacted yet shows up as recorder_wal_active_segment_age_ms instead (WP-130 known risk 3). Read them together. Absence of the lag series means the last cycle left nothing behind — absent, not zero.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_compaction_lag_ms", "legendFormat": "compaction lag (ms)" },
+        { "refId": "B", "expr": "recorder_wal_active_segment_age_ms", "legendFormat": "active segment age (ms)" }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Feed staleness & reconnects",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(recorder_feed_stalls_observed_total[15m])", "legendFormat": "stalls {{feed}} (15m)" },
+        { "refId": "B", "expr": "increase(recorder_binance_reconnects_scheduled_total[15m])", "legendFormat": "binance reconnects (15m)" },
+        { "refId": "C", "expr": "increase(recorder_rtds_freshness_failures_total[15m])", "legendFormat": "rtds freshness failures (15m)" },
+        { "refId": "D", "expr": "recorder_feed_pending_connection_info", "legendFormat": "pending {{feed}} {{connection_id}}" }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Gaps — detection, recovery, and anything unexplained",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "panels": []
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Gap detection → authoritative snapshot (Polymarket)",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(recorder_polymarket_snapshot_recoveries_total[15m])", "legendFormat": "snapshot recoveries (15m)" },
+        { "refId": "B", "expr": "increase(recorder_polymarket_snapshot_fetch_failures_total[15m])", "legendFormat": "snapshot fetch failures (15m)" },
+        { "refId": "C", "expr": "increase(recorder_polymarket_resync_rejections_total[15m])", "legendFormat": "stale resync rejections (15m)" },
+        { "refId": "D", "expr": "increase(recorder_coinbase_snapshot_escalations_total[15m])", "legendFormat": "coinbase snapshot escalations (15m)" },
+        { "refId": "E", "expr": "increase(recorder_coinbase_reconnect_loop_escalations_total[15m])", "legendFormat": "coinbase reconnect-loop escalations (15m)" }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "RTDS gaps (unrecoverable: halts normalized publication for the epoch)",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(recorder_rtds_coverage_breaks_total[15m])", "legendFormat": "coverage breaks (15m)" },
+        { "refId": "B", "expr": "increase(recorder_rtds_unrecoverable_gaps_acknowledged_total[15m])", "legendFormat": "unrecoverable gaps (15m)" },
+        { "refId": "C", "expr": "increase(recorder_rtds_out_of_order_observations_total[15m])", "legendFormat": "out-of-order (15m)" },
+        { "refId": "D", "expr": "increase(recorder_rtds_observations_suppressed_after_gap_total[15m])", "legendFormat": "suppressed after gap (15m)" }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Recording completeness (any increase = the raw record is incomplete)",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(recorder_feed_frames_refused_by_wal_total[15m])", "legendFormat": "wal refusals {{feed}} (15m)" },
+        { "refId": "B", "expr": "increase(recorder_feed_suppressed_unrecorded_total[15m])", "legendFormat": "suppressed unrecorded {{feed}} (15m)" },
+        { "refId": "C", "expr": "increase(recorder_wal_write_faults_total[15m])", "legendFormat": "wal write faults (15m)" },
+        { "refId": "D", "expr": "recorder_wal_unmanifested_faulted_segments", "legendFormat": "unmanifested faulted segments" },
+        { "refId": "E", "expr": "increase(recorder_coinbase_binary_frames_unrecorded_total[15m])", "legendFormat": "coinbase binary unrecorded (15m)" },
+        { "refId": "F", "expr": "increase(recorder_wal_capacity_refusals_total[15m])", "legendFormat": "wal capacity refusals (15m)" }
+      ]
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Data-quality incidents",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 30 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(recorder_incidents_opened_total[15m])", "legendFormat": "opened (15m)" },
+        { "refId": "B", "expr": "increase(recorder_incidents_repeats_suppressed_total[15m])", "legendFormat": "repeats suppressed (15m)" },
+        { "refId": "C", "expr": "recorder_incidents_tracked_keys", "legendFormat": "tracked keys" }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Feed throughput (frames recorded / events dispatched)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 30 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "rate(recorder_feed_frames_recorded_total[5m])", "legendFormat": "frames/s {{feed}}" },
+        { "refId": "B", "expr": "rate(recorder_feed_dispatched_total[5m])", "legendFormat": "dispatched/s {{feed}}" },
+        { "refId": "C", "expr": "rate(recorder_publisher_published_total[5m])", "legendFormat": "published/s" },
+        { "refId": "D", "expr": "rate(recorder_dispatcher_dispatched_total[5m])", "legendFormat": "dispatcher/s" }
+      ]
+    },
+    {
+      "id": 40,
+      "type": "row",
+      "title": "Fsync & durability (the data-loss bound, made visible)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 37 },
+      "panels": []
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Fsync latency and cadence",
+      "description": "recorder_wal_data_loss_bound_ms is the configured fsync interval restated as what it is (ADR-004 §3): the frames of the last interval are what a power loss costs. ms_since_last_fsync above the bound means the tick is not running — alert RecorderFsyncOverdue.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 38 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_wal_fsync_last_duration_ms", "legendFormat": "last fsync (ms)" },
+        { "refId": "B", "expr": "rate(recorder_wal_fsync_total_duration_ms[5m]) / rate(recorder_wal_fsync_total[5m])", "legendFormat": "mean fsync (ms, 5m)" },
+        { "refId": "C", "expr": "recorder_wal_ms_since_last_fsync", "legendFormat": "since last fsync (ms)" },
+        { "refId": "D", "expr": "recorder_wal_data_loss_bound_ms", "legendFormat": "data-loss bound (ms)" }
+      ]
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Durability exposure (what a power loss costs right now)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 38 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_wal_unproven_frame_count", "legendFormat": "unproven frames" },
+        { "refId": "B", "expr": "recorder_wal_bytes_unsynced", "legendFormat": "bytes unsynced" },
+        { "refId": "C", "expr": "recorder_wal_records_unsynced", "legendFormat": "records unsynced" },
+        { "refId": "D", "expr": "rate(recorder_wal_frames_durable_total[5m])", "legendFormat": "frames durable/s" },
+        { "refId": "E", "expr": "recorder_wal_retained_record_count", "legendFormat": "retained (unmanifested) records" }
+      ]
+    },
+    {
+      "id": 43,
+      "type": "timeseries",
+      "title": "WAL growth & capacity (storage growth measured — Phase-1 operational gate)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 45 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_wal_total_segment_bytes", "legendFormat": "segment bytes on disk" },
+        { "refId": "B", "expr": "recorder_wal_capacity_remaining_bytes", "legendFormat": "capacity remaining" },
+        { "refId": "C", "expr": "recorder_wal_capacity_bytes", "legendFormat": "capacity bound" },
+        { "refId": "D", "expr": "rate(recorder_wal_bytes_written_total[5m])", "legendFormat": "bytes written/s" },
+        { "refId": "E", "expr": "recorder_wal_active_segment_bytes", "legendFormat": "active segment bytes" },
+        { "refId": "F", "expr": "increase(recorder_wal_rotations_total[1h])", "legendFormat": "rotations (1h)" },
+        { "refId": "G", "expr": "increase(recorder_wal_segments_finalized_total[1h])", "legendFormat": "segments finalized (1h)" }
+      ]
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Universe directory (reviewed configuration, not discovery)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 45 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_directory_known_markets", "legendFormat": "known markets" },
+        { "refId": "B", "expr": "increase(recorder_directory_declined_registrations_total[1h])", "legendFormat": "declined registrations (1h)" },
+        { "refId": "C", "expr": "recorder_directory_declined_registrations_retained", "legendFormat": "declined retained" },
+        { "refId": "D", "expr": "recorder_directory_declined_registrations_capacity", "legendFormat": "declined retention bound" }
+      ]
+    },
+    {
+      "id": 50,
+      "type": "row",
+      "title": "Compaction & archive (WP-130)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 },
+      "panels": []
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Compaction cycles",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 53 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(recorder_compaction_cycles_started_total[1h])", "legendFormat": "started (1h)" },
+        { "refId": "B", "expr": "increase(recorder_compaction_cycles_succeeded_total[1h])", "legendFormat": "succeeded (1h)" },
+        { "refId": "C", "expr": "increase(recorder_compaction_cycles_failed_total[1h])", "legendFormat": "failed (1h)" },
+        { "refId": "D", "expr": "recorder_compaction_last_cycle_duration_ms", "legendFormat": "last cycle duration (ms)" }
+      ]
+    },
+    {
+      "id": 52,
+      "type": "timeseries",
+      "title": "Last cycle output & retention",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 53 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_compaction_last_cycle_segments_compacted", "legendFormat": "segments compacted" },
+        { "refId": "B", "expr": "recorder_compaction_last_cycle_segments_refused", "legendFormat": "segments refused" },
+        { "refId": "C", "expr": "recorder_compaction_last_cycle_rows_written", "legendFormat": "rows written" },
+        { "refId": "D", "expr": "recorder_compaction_last_cycle_segments_deleted", "legendFormat": "segments deleted" },
+        { "refId": "E", "expr": "recorder_compaction_last_cycle_retention_failures", "legendFormat": "retention failures" }
+      ]
+    },
+    {
+      "id": 53,
+      "type": "stat",
+      "title": "Object upload status (last completed cycle)",
+      "description": "One-hot: exactly one of idle/succeeded/failed is 1. `failed` carries the reason in the worker's lastFailureReason (log/API), and alert RecorderUploadFailed fires on recorder_upload_failed.",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 53 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_upload_status", "legendFormat": "{{status}}" },
+        { "refId": "B", "expr": "recorder_upload_failed", "legendFormat": "failed flag" }
+      ]
+    },
+    {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Archive totals (process lifetime)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 60 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_compaction_segments_compacted_total", "legendFormat": "segments compacted" },
+        { "refId": "B", "expr": "recorder_compaction_rows_written_total", "legendFormat": "rows written" },
+        { "refId": "C", "expr": "recorder_compaction_object_bytes_total", "legendFormat": "object bytes" },
+        { "refId": "D", "expr": "recorder_compaction_segments_deleted_total", "legendFormat": "segments deleted" },
+        { "refId": "E", "expr": "recorder_compaction_last_cycle_object_bytes", "legendFormat": "last cycle object bytes" }
+      ]
+    },
+    {
+      "id": 55,
+      "type": "timeseries",
+      "title": "Dataset validation findings (WP-130 validator + book comparison)",
+      "description": "Classes are the validator's finding classes (python/research/compaction/validate.py) plus the book-comparison classes; the runbook's operational table says what each one means and what to do.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 60 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_validation_findings", "legendFormat": "{{job}} {{class}} ({{severity}})" },
+        { "refId": "B", "expr": "recorder_validation_ok", "legendFormat": "{{job}} ok" }
+      ]
+    },
+    {
+      "id": 60,
+      "type": "row",
+      "title": "Soak evidence (external-evidence gate: PENDING until real elapsed evidence exists)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
+      "panels": []
+    },
+    {
+      "id": 61,
+      "type": "stat",
+      "title": "Soak status (one-hot; PENDING is the honest default)",
+      "description": "Only the fail-closed evaluator (packages/observability/src/recorder/soak-evidence.ts) can set SATISFIED, and only from real elapsed evidence records. INVALID means an evidence record failed validation and must be resolved.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 68 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "refId": "A", "expr": "recorder_soak_status_info", "legendFormat": "{{status}}" }]
+    },
+    {
+      "id": 62,
+      "type": "timeseries",
+      "title": "Soak progress: longest qualifying window vs threshold",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 68 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_soak_longest_window_ms", "legendFormat": "longest window (ms)" },
+        { "refId": "B", "expr": "recorder_soak_threshold_ms", "legendFormat": "threshold (ms)" },
+        { "refId": "C", "expr": "recorder_soak_windows_total", "legendFormat": "windows recorded" }
+      ]
+    }
+  ]
+}
