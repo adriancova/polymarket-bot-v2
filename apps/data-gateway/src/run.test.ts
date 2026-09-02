@@ -11,9 +11,12 @@
  * process-liveness consequence, real bundle and probe entry) lives in
  * `test/integration/data-gateway/fatal-startup-release.test.ts`.
  *
- * The invariant under test: on ANY fatal startup error, every resource
- * acquired so far is released, `close` is called EXACTLY once per resource,
- * and the original error (not a cleanup error) is what escapes.
+ * The invariant under test: on ANY fatal startup error, every acquired
+ * resource's independent cleanup is INITIATED (round 6: a disposal that
+ * hangs cannot block a sibling's from being called), `close` is initiated
+ * EXACTLY once per resource, and the original error (not a cleanup error) is
+ * what escapes; when a cleanup completes, release follows, and when it does
+ * not, the round-4 deadline bounds the exit.
  */
 
 import { FakeCoinbaseSocketFactory } from "@polymarket-bot/coinbase-adapter/testing";
@@ -24,6 +27,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parseGatewayConfig } from "./config.js";
 import { GatewayConfigurationError, GatewayStateError } from "./errors.js";
+import type { GatewayObserver } from "./gateway.js";
 import { GatewayJournal } from "./journal.js";
 import type { GatewayHost, GatewaySequenceOptions } from "./run.js";
 import {
@@ -151,6 +155,7 @@ function baseOptions(args: {
   readonly lifetime: { acquired: number; released: number };
   readonly coinbaseSocketFactory?: CoinbaseSocketFactory;
   readonly cleanupDeadlineMs?: number;
+  readonly observer?: GatewayObserver;
 }): GatewaySequenceOptions {
   const clock = new ManualGatewayClock();
   return {
@@ -174,6 +179,7 @@ function baseOptions(args: {
       },
       walFileSystem: createMemoryFileSystem(),
       coinbaseSocketFactory: args.coinbaseSocketFactory ?? new FakeCoinbaseSocketFactory(),
+      ...(args.observer === undefined ? {} : { observer: args.observer }),
     },
     host: args.host,
   };
@@ -628,5 +634,90 @@ describe("create()'s internal cleanup runs under the deadline (round 5, M-2)", (
     expect(host.forcedExits).toEqual([1]);
     expect(host.lines.join("\n")).toContain("cleanup deadline");
     expect(host.lines.join("\n")).toContain("fatal-startup");
+  });
+});
+
+describe("shutdown disposal cannot be serialized behind a hang (round 6, M-1)", () => {
+  it("a hanging journal close plus a throwing feed close: the transport close is still initiated, the evidence is retained, and the deadline forces exit 1", async () => {
+    // The reviewer's combined probe at the sequence seam. At d2fbbfa
+    // `stop()` awaited its disposals sequentially, so this shutdown
+    // force-exited with the transport cleanup never attempted and the
+    // collected feed-close failure lost (GatewayDisposalError never existed
+    // because stop() never settled).
+    const hangingCloseJournal = {
+      close: (): Promise<void> =>
+        new Promise<void>(() => {
+          // Deliberately never settles.
+        }),
+      settle: async (): Promise<void> => {},
+      tick: async (): Promise<void> => {},
+    };
+    vi.spyOn(GatewayJournal, "open").mockResolvedValue(
+      hangingCloseJournal as unknown as GatewayJournal,
+    );
+    const host = recordingHost();
+    const lifetime = { acquired: 0, released: 0 };
+    const { transport, closes } = countingTransport();
+    const throwingFactory: CoinbaseSocketFactory = {
+      connect: () => ({
+        send: () => {
+          // Never exercised.
+        },
+        close: () => {
+          throw new Error("injected socket close failure");
+        },
+      }),
+    };
+    const disposalFailures: string[] = [];
+    const options = baseOptions({
+      config: {
+        streamName: "market-events",
+        wal: { rootPath: "/wal" },
+        markets: [],
+        coinbase: { productIds: ["BTC-USD"] },
+      },
+      connectTransport: () => Promise.resolve(transport),
+      host,
+      lifetime,
+      coinbaseSocketFactory: throwingFactory,
+      cleanupDeadlineMs: 2_000,
+      observer: {
+        onDisposalFailure: (failure) => {
+          disposalFailures.push(
+            `${failure.resource}: ${
+              failure.error instanceof Error ? failure.error.message : String(failure.error)
+            }`,
+          );
+        },
+      },
+    });
+
+    await runGatewaySequence(options);
+    host.shutdownHandlers[0]?.();
+    expect(host.deadlines, "the shutdown path arms the deadline at entry").toHaveLength(1);
+
+    // THE M-1 PIN at this seam: the transport disposal is initiated (and
+    // completes) even though the journal close never settles.
+    await vi.waitFor(() => {
+      expect(
+        closes(),
+        "the transport close must be initiated despite the hanging journal close",
+      ).toBe(1);
+    });
+    // Evidence retention: the settled feed-close failure is observable
+    // through the observer even though stop() can never settle.
+    expect(disposalFailures.join("\n")).toContain("coinbase-manager");
+    expect(disposalFailures.join("\n")).toContain("injected socket close failure");
+
+    // stop() is pending, so no natural exit happened and the deadline stays
+    // armed — the bounded, evidenced force-exit is the contract for a hang.
+    expect(host.exitCodes, "no natural exit while a disposal hangs").toEqual([]);
+    expect(host.deadlines[0]?.cancelled(), "a hung stop() must not clear the deadline").toBe(
+      false,
+    );
+    host.deadlines[0]?.expire();
+    expect(host.forcedExits).toEqual([1]);
+    expect(host.lines.join("\n")).toContain("cleanup deadline");
+    expect(host.lines.join("\n")).toContain("shutdown");
   });
 });

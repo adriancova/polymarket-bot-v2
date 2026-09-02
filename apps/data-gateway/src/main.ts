@@ -59,13 +59,16 @@
  * the exit code, and then sat forever on the connected transport's referenced
  * socket, which nothing closed. Startup is now TRANSACTIONAL
  * (`runGatewaySequence` in `./run.ts`): on any fatal startup error, every
- * resource acquired so far has its cleanup ATTEMPTED exactly once — the
- * transport directly if the gateway does not exist yet, or via
- * `gateway.stop()` (journal, transport, lifetime anchor) if it does — before
- * the error reaches the handler below; when a cleanup will not complete, the
- * round-4 deadline below bounds it, and a forced exit may leave that disposal
- * incomplete (the WAL tail is then crash-recovered on the next start, the
- * WP-050 recovery shape). The intended contract therefore holds in BOTH
+ * independent resource cleanup is INITIATED at most once — the transport
+ * directly if the gateway does not exist yet, or via `gateway.stop()`
+ * (journal, transport, lifetime anchor; since round 6 its independent
+ * disposal families start together, so a cleanup that hangs cannot block a
+ * sibling's from being called) — before the error reaches the handler below;
+ * when a cleanup will not complete, the round-4 deadline below bounds it, and
+ * a forced exit may leave that hung disposal incomplete (the WAL tail is then
+ * crash-recovered on the next start, the WP-050 recovery shape) with every
+ * settled disposal failure already logged (`[disposal]` lines). The intended
+ * contract therefore holds in BOTH
  * directions: the process runs until a shutdown signal, or until a startup
  * defect it cannot record through (missing or invalid configuration, or a WAL
  * that will not open) makes it exit loudly, promptly, with a nonzero code.
@@ -168,6 +171,18 @@ async function main(): Promise<void> {
         },
         onRecordingFailure: (failure) => {
           console.error(`[wal] recording failure (${failure.reason}): ${failure.detail}`);
+        },
+        // Round 6 (M-1), evidence retention: a disposal failure is logged the
+        // moment it is collected, because the aggregate GatewayDisposalError
+        // only exists if stop() settles — a sibling disposal that hangs
+        // would otherwise carry every collected failure into the cleanup
+        // deadline's forced exit, unobserved.
+        onDisposalFailure: (failure) => {
+          console.error(
+            `[disposal] ${failure.resource} cleanup failed: ${
+              failure.error instanceof Error ? failure.error.message : String(failure.error)
+            }`,
+          );
         },
       },
     },

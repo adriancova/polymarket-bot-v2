@@ -10,12 +10,21 @@
  *
  * ## Startup is TRANSACTIONAL (the R3-H1 invariant)
  *
- * On ANY fatal startup error, every resource's cleanup is CALLED, `close` is
- * called exactly once per resource, and the process exits nonzero — promptly
- * when the cleanup calls complete, and at latest at the cleanup deadline when
- * one of them fails or hangs (round 4, below; the round-3 wording "exits 1
- * promptly" silently assumed the cleanup calls themselves succeed). Ownership
- * is single and explicit, which is what makes exactly-once checkable:
+ * On ANY fatal startup error, every INDEPENDENT resource cleanup is
+ * INITIATED — `gateway.stop()` starts its independent disposal families
+ * together, so a cleanup that never settles cannot block a sibling's cleanup
+ * from being called (round 6, M-1; the round-4 wording "every resource's
+ * cleanup is CALLED" was false when an intermediate cleanup hung: sequential
+ * awaits meant a hanging journal close left the transport close uncalled) —
+ * `close` is initiated at most once per resource, and the process exits
+ * nonzero: promptly when the cleanup calls complete, and at latest at the
+ * cleanup deadline when one of them fails or hangs (round 4, below; the
+ * round-3 wording "exits 1 promptly" silently assumed the cleanup calls
+ * themselves succeed). A deadline expiry may leave the HUNG disposal
+ * incomplete; every sibling was already initiated and given the chance to
+ * settle, and every settled failure was already reported (`[disposal]`
+ * lines via `GatewayObserver.onDisposalFailure`). Ownership is single and
+ * explicit, which is what makes exactly-once checkable:
  *
  * - the TRANSPORT belongs to this sequence from the moment `connectTransport`
  *   resolves until `DataGateway.create()` returns; a failure in that window
@@ -67,11 +76,14 @@
  * process exits nonzero within one deadline of any cleanup hang or rejection
  * — including a hang inside `create()`'s own post-open cleanup (round 5,
  * M-2) — and on a shutdown signal the process exits within the deadline even
- * if `stop()` does not resolve. Every cleanup is ATTEMPTED; a forced exit at
- * deadline expiry may leave disposal incomplete, in which case the WAL tail
- * is crash-recovered on the next start (the WP-050 recovery shape) — the
- * contract is bounded, attempted, evidenced cleanup, never guaranteed
- * release.
+ * if `stop()` does not resolve. Every independent cleanup is INITIATED — a
+ * disposal that hangs cannot block its sibling families, which `stop()`
+ * starts together (round 6, M-1) — and every settled failure is reported at
+ * collection time (`GatewayObserver.onDisposalFailure`); a forced exit at
+ * deadline expiry may still leave the HUNG disposal itself incomplete, in
+ * which case the WAL tail is crash-recovered on the next start (the WP-050
+ * recovery shape) — the contract is bounded, initiated, evidenced cleanup,
+ * never guaranteed release.
  *
  * ## Why a separate module
  *

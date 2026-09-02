@@ -37,7 +37,11 @@ export type GatewayErrorCode =
    * `stop()` isolates every disposal: each one is attempted, failures are
    * collected here, and every remaining resource is still released. The error
    * therefore reports what did NOT close cleanly — it never means a later
-   * disposal was skipped because an earlier one threw.
+   * disposal was skipped because an earlier one threw. This error only
+   * exists when `stop()` SETTLES, so a disposal that HANGS can never appear
+   * in it — which is why every failure is also reported the moment it is
+   * collected (`GatewayObserver.onDisposalFailure`, round 6 M-1), and the
+   * hang's own evidence is the composition's cleanup-deadline log.
    */
   | "GATEWAY_DISPOSAL_FAILED";
 

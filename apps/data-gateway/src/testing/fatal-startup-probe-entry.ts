@@ -43,6 +43,7 @@
 import { readFile } from "node:fs/promises";
 
 import { createWebSocketFactory } from "@polymarket-bot/binance-adapter";
+import type { CoinbaseSocketFactory } from "@polymarket-bot/coinbase-adapter";
 import { nodeWebSocketFactory } from "@polymarket-bot/coinbase-adapter";
 import type { MarketEventTransport } from "@polymarket-bot/event-bus";
 import { globalHttpClient, globalWebSocketFactory } from "@polymarket-bot/polymarket-public";
@@ -140,6 +141,27 @@ async function main(): Promise<void> {
   // the reviewer's regression, injected without touching any source.
   const omitPolymarketPorts = process.env["GATEWAY_PROBE_OMIT_PORT"] === "polymarket";
 
+  // Round 6 (M-1): `GATEWAY_PROBE_COINBASE_SOCKET_CLOSE=throw` substitutes a
+  // Coinbase socket whose `close()` THROWS synchronously — the in-repo
+  // ordering of round-4 item 2 (every feed teardown ends in an unguarded
+  // socket close). The round-6 combined probe pairs it with the
+  // never-settling journal close above, so the shutdown disposal meets a
+  // SETTLED failure and a HANG at once. Nothing is dialled: the fake socket
+  // never opens and the configured endpoint is a closed loopback port anyway.
+  const coinbaseSocketFactory: CoinbaseSocketFactory =
+    process.env["GATEWAY_PROBE_COINBASE_SOCKET_CLOSE"] === "throw"
+      ? {
+          connect: () => ({
+            send: () => {
+              // Never exercised: the socket never opens (nothing listens).
+            },
+            close: (): void => {
+              throw new Error("injected coinbase socket close failure (probe)");
+            },
+          }),
+        }
+      : nodeWebSocketFactory;
+
   await runGatewaySequence({
     config,
     // The one substitution (see the header): resolves — the transport is
@@ -163,7 +185,19 @@ async function main(): Promise<void> {
           }),
       rtdsSocketFactory: globalWebSocketFactory(),
       binanceSocketFactory: createWebSocketFactory(),
-      coinbaseSocketFactory: nodeWebSocketFactory,
+      coinbaseSocketFactory,
+      // Round 6 (M-1), evidence retention: same line `main.ts` emits, so the
+      // spawning test can assert a collected disposal failure from stderr
+      // even when a sibling disposal hangs and the deadline force-exits.
+      observer: {
+        onDisposalFailure: (failure) => {
+          console.error(
+            `[disposal] ${failure.resource} cleanup failed: ${
+              failure.error instanceof Error ? failure.error.message : String(failure.error)
+            }`,
+          );
+        },
+      },
     },
     host: {
       logError: (line, detail) => {

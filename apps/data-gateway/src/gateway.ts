@@ -84,6 +84,18 @@ export interface GatewayObserver extends DispatcherObserver {
     readonly detail: string;
   }): void;
   onRecordingFailure?(failure: { readonly reason: string; readonly detail: string }): void;
+  /**
+   * One resource disposal failed (round 6, M-1 — evidence retention).
+   *
+   * Reported the MOMENT the failure is collected — during `stop()`'s
+   * disposal or `create()`'s own failure-path cleanup — because the
+   * aggregate `GatewayDisposalError` only exists if the disposal sequence
+   * SETTLES: a sibling disposal that hangs (bounded by the composition's
+   * cleanup deadline, which force-exits) would otherwise take every
+   * already-collected failure with it, unobserved. `main.ts` and the probe
+   * entry write these to stderr as `[disposal] …` lines.
+   */
+  onDisposalFailure?(failure: DisposalFailure): void;
 }
 
 /**
@@ -275,7 +287,10 @@ export class DataGateway {
     // so this close cannot double with the gateway's own. `journal.close()`
     // is non-rejecting by contract (every writer operation runs on the serial
     // chain, which converts failures into the fault state), so the original
-    // error is the one the caller sees. NOTE: the transport in `ports` is the
+    // error is the one the caller sees — and since round 6 (L-1) the close is
+    // guarded anyway: a rejection that breaks that contract is reported
+    // through the observer instead of replacing the original error.
+    // NOTE: the transport in `ports` is the
     // CALLER's to release when `create()` rejects — this method never
     // connected it and closing borrowed resources would break single
     // ownership (`run.ts` is that caller in the real process).
@@ -344,8 +359,20 @@ export class DataGateway {
       });
     } catch (error) {
       const cancelDeadline = options.cleanupDeadline?.arm();
-      await journal.close();
-      cancelDeadline?.();
+      try {
+        await journal.close();
+        cancelDeadline?.();
+      } catch (closeError) {
+        // Round 6 (L-1): a `journal.close()` that REJECTS — breaking its own
+        // non-rejecting contract — must not mask the original construction
+        // error (the round-6 probe: the caller saw the close rejection and
+        // the post-open construction error was lost). The rejection is
+        // reported as the disposal failure it is, and the deadline bracket
+        // deliberately stays ARMED: a rejected close may still hold
+        // resources (the round-4 design), so the supplied deadline — not
+        // this rejection — bounds a wedged process.
+        observer.onDisposalFailure?.({ resource: "wal-journal", error: closeError });
+      }
       throw error;
     }
   }
@@ -653,30 +680,48 @@ export class DataGateway {
   }
 
   /**
-   * Stops everything, attempting EVERY disposal even when one fails (round 4).
+   * Stops everything, INITIATING every independent disposal even when one
+   * fails or hangs (rounds 4 and 6).
    *
-   * Before this round, the disposals below ran in one `try`: a feed whose
-   * socket `close()` threw synchronously — an in-repo ordering, since every
-   * feed teardown ends in an unguarded `socket.close()` — abandoned every
-   * later disposal, leaving the WAL journal open and the transport CONNECTED
-   * and referenced. On the fatal-startup and signal paths that referenced
-   * transport is exactly what wedges the "exiting" process.
+   * Round 4: the disposals below ran in one `try`, so a feed whose socket
+   * `close()` threw synchronously — an in-repo ordering, since every feed
+   * teardown ends in an unguarded `socket.close()` — abandoned every later
+   * disposal, leaving the WAL journal open and the transport CONNECTED and
+   * referenced. Round 4's isolation collected failures per resource but
+   * still AWAITED the async disposals sequentially — so a disposal that
+   * HUNG (never settled) serialized its siblings out of existence: a
+   * never-settling `journal.close()` meant `transport.close()` was never
+   * even called, and the collected failures never reached the aggregate
+   * error because `stop()` itself could not settle (round 6, M-1).
    *
-   * Per-resource isolation: each disposal is attempted, failures are
-   * collected, all resources are released, the lifetime anchor is released in
-   * the `finally`, and a single `GatewayDisposalError` naming every failed
-   * resource is thrown at the end (callers log it; the error never means a
-   * disposal was skipped).
+   * The rule now: each disposal is isolated (failures collected AND reported
+   * through `observer.onDisposalFailure` the moment they are collected), the
+   * awaited disposals are grouped into their independent resource families
+   * and every family is INITIATED before anything is awaited, the lifetime
+   * anchor is released in the `finally`, and a single `GatewayDisposalError`
+   * naming every failed resource is thrown at the end when `stop()` settles.
+   * A disposal that hangs stalls only `stop()`'s own completion — bounded by
+   * the caller's cleanup deadline (`run.ts`), whose logged forced exit is
+   * that hang's evidence — never a sibling family's cleanup.
    */
   async stop(): Promise<void> {
     if (this.#state === "stopped") return;
     this.#state = "stopped";
+    const observer = this.#ports.observer ?? {};
     const failures: DisposalFailure[] = [];
+    const collect = (resource: string, error: unknown): void => {
+      failures.push({ resource, error });
+      // Round 6 (M-1), evidence retention: report the failure the moment it
+      // is collected. The aggregate error below only exists if stop()
+      // SETTLES — a sibling disposal that hangs would otherwise carry every
+      // already-collected failure into the deadline's forced exit, unseen.
+      observer.onDisposalFailure?.({ resource, error });
+    };
     const attempt = (resource: string, dispose: () => void): void => {
       try {
         dispose();
       } catch (error) {
-        failures.push({ resource, error });
+        collect(resource, error);
       }
     };
     const attemptAsync = async (
@@ -686,10 +731,14 @@ export class DataGateway {
       try {
         await dispose();
       } catch (error) {
-        failures.push({ resource, error });
+        collect(resource, error);
       }
     };
     try {
+      // The synchronous disposals first: none of these can hang (each is a
+      // plain call that returns or throws), and stopping the producers
+      // before the flushes below is genuinely ordered — a feed still running
+      // could enqueue into the journal and publisher mid-disposal.
       attempt("gateway-tick", () => {
         this.#cancelTick?.();
         this.#cancelTick = undefined;
@@ -699,9 +748,33 @@ export class DataGateway {
       attempt("rtds-feed", () => this.#rtdsFeed?.stop());
       attempt("binance-driver", () => this.#binanceDriver?.stop());
       attempt("coinbase-manager", () => this.#coinbaseManager?.stop());
-      await attemptAsync("settle", () => this.settle());
-      await attemptAsync("wal-journal", () => this.#journal.close());
-      await attemptAsync("event-bus-transport", () => this.#ports.transport.close());
+      // Round 6 (M-1): the awaited disposals span exactly TWO independent
+      // resource families, and BOTH are initiated here before anything is
+      // awaited, so a never-settling disposal in one family cannot prevent
+      // the other family's cleanup from ever being attempted. Finding of
+      // fact on the ordering:
+      //
+      // - `journal.close()` and `transport.close()` share NO ordering
+      //   requirement: the journal owns WAL/filesystem state, the transport
+      //   owns the event-bus connection, and neither calls into the other.
+      // - WITHIN the transport family the ordering is genuine: the
+      //   publisher's admitted publications flush onto the connection
+      //   (`publisher.settle()`) BEFORE it is severed — closing first would
+      //   abort in-flight publishes.
+      // - The journal needs no external settle: `GatewayJournal.close()`
+      //   settles its own serial operation chain first (its contract).
+      //
+      // `attemptAsync` never rejects, so `Promise.all` has allSettled
+      // semantics here: every settled failure is collected (and already
+      // reported above), and a family that hangs stalls only stop()'s
+      // completion — bounded by the caller's cleanup deadline — never a
+      // sibling.
+      const walFamily = attemptAsync("wal-journal", () => this.#journal.close());
+      const transportFamily = (async () => {
+        await attemptAsync("publisher-settle", () => this.#publisher.settle());
+        await attemptAsync("event-bus-transport", () => this.#ports.transport.close());
+      })();
+      await Promise.all([walFamily, transportFamily]);
     } finally {
       // Released LAST, so the process stays referenced through the whole
       // shutdown sequence, and in a `finally`, so a failing close still lets

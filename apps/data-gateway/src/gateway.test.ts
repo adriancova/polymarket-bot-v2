@@ -21,6 +21,7 @@ import { createMemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { parseGatewayConfig } from "./config.js";
+import type { DisposalFailure } from "./errors.js";
 import { GatewayStateError } from "./errors.js";
 import type { GatewayPorts } from "./gateway.js";
 import { DataGateway } from "./gateway.js";
@@ -234,6 +235,67 @@ describe("create()'s post-open cleanup under the deadline capability (round 5, M
     expect(settledState, "create() cannot settle while its close hangs").toBe("pending");
     expect(cancels(), "a hung close must never cancel the bracket").toBe(0);
   });
+
+  it("a journal close that REJECTS on the failure path cannot mask the original construction error (round 6, L-1)", async () => {
+    // The round-6 LOW: create()'s catch awaited the close WITHOUT catching its
+    // rejection, so a journal.close() that broke its own non-rejecting
+    // contract replaced the post-open construction error (the reviewer's
+    // probe: caught=CLOSE_REJECTION, isOriginal=false) — and the cleanup
+    // failure was never separately classified.
+    const rejectingJournal = {
+      close: (): Promise<void> => Promise.reject(new Error("CLOSE_REJECTION (injected)")),
+      settle: async (): Promise<void> => {},
+      tick: async (): Promise<void> => {},
+    };
+    vi.spyOn(GatewayJournal, "open").mockResolvedValue(
+      rejectingJournal as unknown as GatewayJournal,
+    );
+    const { deadline, arms, cancels } = recordingDeadline();
+    const disposalFailures: DisposalFailure[] = [];
+
+    const config = parseGatewayConfig({
+      streamName: "market-events",
+      wal: { rootPath: "/wal" },
+      markets: [MARKET],
+      // The post-open construction error: the feed is configured, its ports
+      // are absent, so #buildFeeds throws AFTER the journal opened.
+      polymarket: { feedId: "pm-main" },
+    });
+
+    let caught: unknown;
+    await DataGateway.create(
+      config,
+      ports({
+        observer: {
+          onDisposalFailure: (failure) => {
+            disposalFailures.push(failure);
+          },
+        },
+      }),
+      { cleanupDeadline: deadline },
+    ).then(
+      () => {
+        throw new Error("create() must reject on the construction error");
+      },
+      (error: unknown) => {
+        caught = error;
+      },
+    );
+
+    // The ORIGINAL error surfaces; the close rejection does not replace it.
+    expect(caught, "the original construction error must surface").toBeInstanceOf(
+      GatewayStateError,
+    );
+    // The cleanup rejection is separately classified, not lost.
+    expect(disposalFailures).toHaveLength(1);
+    expect(disposalFailures[0]?.resource).toBe("wal-journal");
+    expect(String((disposalFailures[0]?.error as Error).message)).toContain("CLOSE_REJECTION");
+    // The bracket stays ARMED: a rejected close may still hold resources
+    // (the round-4 design) — the supplied deadline, not the rejection,
+    // bounds a wedged process.
+    expect(arms(), "armed exactly once at failure-path entry").toBe(1);
+    expect(cancels(), "a REJECTED close must never cancel the bracket").toBe(0);
+  });
 });
 
 /** A CONNECTED transport double whose `close()` calls are counted. */
@@ -323,5 +385,108 @@ describe("DataGateway.stop() per-resource disposal isolation (round 4)", () => {
     await gateway.stop();
     expect(closes()).toBe(1);
     expect(journalCloses()).toBe(1);
+  });
+});
+
+describe("stop() initiates every independent disposal family (round 6, M-1)", () => {
+  it("a throwing feed close plus a HANGING journal close: the transport disposal is still initiated and the feed failure stays observable", async () => {
+    // The round-6 reviewer's combined probe. At d2fbbfa stop() awaited its
+    // disposals SEQUENTIALLY — journal.close() had to settle before
+    // transport.close() was even CALLED — so this combination force-exited
+    // (in the composed process) with socket=1, journal=1, transport=0: the
+    // transport cleanup was never attempted, and the collected feed-close
+    // failure never reached GatewayDisposalError (stop() cannot settle while
+    // the journal close hangs, so the aggregate error never exists).
+    let journalCloseCalls = 0;
+    const hangingCloseJournal = {
+      close: (): Promise<void> => {
+        journalCloseCalls += 1;
+        return new Promise<void>(() => {
+          // Deliberately never settles.
+        });
+      },
+      settle: async (): Promise<void> => {},
+      tick: async (): Promise<void> => {},
+    };
+    vi.spyOn(GatewayJournal, "open").mockResolvedValue(
+      hangingCloseJournal as unknown as GatewayJournal,
+    );
+    const { transport, closes } = countingTransport();
+    const throwingCloseSocketFactory: CoinbaseSocketFactory = {
+      connect: () => ({
+        send: () => {
+          // Never exercised: the socket is torn down before any subscribe.
+        },
+        close: () => {
+          throw new Error("injected socket close failure");
+        },
+      }),
+    };
+    const disposalFailures: DisposalFailure[] = [];
+
+    const config = parseGatewayConfig({
+      streamName: "market-events",
+      wal: { rootPath: "/wal" },
+      markets: [],
+      coinbase: { productIds: ["BTC-USD"] },
+    });
+    const gateway = await DataGateway.create(
+      config,
+      ports({
+        transport,
+        coinbaseSocketFactory: throwingCloseSocketFactory,
+        observer: {
+          onDisposalFailure: (failure) => {
+            disposalFailures.push(failure);
+          },
+        },
+      }),
+    );
+    gateway.start();
+
+    const stopping = gateway.stop();
+    stopping.catch(() => {
+      // Never reached in this scenario; guards a future unhandled rejection.
+    });
+
+    // THE M-1 PIN: the transport family is INITIATED — and completes — even
+    // though the WAL family's close never settles.
+    await vi.waitFor(() => {
+      expect(
+        closes(),
+        "the transport disposal must be initiated despite the hanging journal close",
+      ).toBe(1);
+    });
+    expect(journalCloseCalls, "the journal disposal was initiated too").toBe(1);
+
+    // Evidence retention: the SETTLED feed-close failure is observable NOW,
+    // through the observer — the aggregate GatewayDisposalError can never
+    // carry it, because stop() cannot settle while the journal close hangs.
+    expect(
+      disposalFailures.map((failure) => failure.resource),
+      "the collected feed-close failure must be reported at collection time",
+    ).toContain("coinbase-manager");
+    const feedFailure = disposalFailures.find(
+      (failure) => failure.resource === "coinbase-manager",
+    );
+    expect(String((feedFailure?.error as Error).message)).toContain(
+      "injected socket close failure",
+    );
+
+    // stop() itself stays pending on the hung family. In the composed
+    // process the sequence's cleanup deadline bounds this and force-exits —
+    // pinned in run.test.ts and the subprocess regression.
+    const settledState = await Promise.race([
+      stopping.then(
+        () => "settled",
+        () => "settled",
+      ),
+      new Promise<string>((resolvePending) => {
+        setTimeout(() => {
+          resolvePending("pending");
+        }, 25);
+      }),
+    ]);
+    expect(settledState, "stop() cannot settle while a disposal hangs").toBe("pending");
   });
 });

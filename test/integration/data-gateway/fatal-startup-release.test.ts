@@ -607,4 +607,108 @@ describe("fatal startup releases every acquired resource (R3-H1)", () => {
     },
     30_000,
   );
+
+  it(
+    "SIGTERM with a hanging journal close AND a throwing feed close: every sibling disposal is initiated, the evidence is retained, and the deadline forces exit 1 (round 6, M-1)",
+    async () => {
+      // The round-6 reviewer's combined probe, end to end. At d2fbbfa
+      // `stop()` awaited its disposals SEQUENTIALLY — `journal.close()` had
+      // to settle before `transport.close()` was even called — so this child
+      // force-exited with socket=1, journal=1, transport=0: the transport
+      // cleanup was never attempted, and the collected feed-close failure
+      // never reached `GatewayDisposalError` (stop() never settled, so the
+      // aggregate error never existed) or any log. Fixed, the two
+      // independent disposal families are INITIATED together (the transport
+      // close completes despite the hang), every settled failure is reported
+      // the moment it is collected, and the shutdown deadline still bounds
+      // the hung family with a logged, forced nonzero exit.
+      const configPath = join(workDir, "gateway.json");
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          streamName: "market-events",
+          wal: { rootPath: join(workDir, "wal"), fsyncIntervalMs: 100 },
+          tickIntervalMs: 100,
+          markets: [],
+          // Never dialled: the throwing-close fake socket replaces the real
+          // factory; the closed loopback port guards the config regardless.
+          coinbase: { productIds: ["BTC-USD"], endpoint: "wss://127.0.0.1:1" },
+        }),
+      );
+
+      const spawned = spawn(process.execPath, [probeBundlePath], {
+        env: {
+          ...process.env,
+          GATEWAY_CONFIG_PATH: configPath,
+          GATEWAY_PROBE_JOURNAL_CLOSE: "never-settle",
+          GATEWAY_PROBE_COINBASE_SOCKET_CLOSE: "throw",
+          GATEWAY_CLEANUP_DEADLINE_MS: "1500",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      child = spawned;
+      let stderr = "";
+      spawned.stderr.on("data", (chunk: Buffer) => {
+        stderr += String(chunk);
+      });
+      let exited: SpawnedOutcome | undefined;
+      const exitPromise = new Promise<SpawnedOutcome>((resolvePromise) => {
+        spawned.on("exit", (code, signal) => {
+          exited = { code, signal, stderr };
+          resolvePromise({ code, signal, stderr });
+        });
+      });
+
+      // Startup must complete: this probe is about the SIGNAL disposal path.
+      const runningDeadline = Date.now() + 20_000;
+      while (!stderr.includes("data-gateway running") && exited === undefined) {
+        if (Date.now() > runningDeadline) {
+          spawned.kill("SIGKILL");
+          throw new Error(`the probe child never finished startup; stderr:\n${stderr}`);
+        }
+        await delay(50);
+      }
+      expect(exited, `the child exited during startup; stderr:\n${stderr}`).toBeUndefined();
+
+      const signalledAtMs = Date.now();
+      spawned.kill("SIGTERM");
+      const outcome = await Promise.race([
+        exitPromise,
+        delay(15_000).then(() => "timed-out" as const),
+      ]);
+      if (outcome === "timed-out") {
+        spawned.kill("SIGKILL");
+        throw new Error(
+          "round-6 M-1 regression: the shutdown with a hanging journal close hung past " +
+            `the deadline instead of force-exiting; stderr:\n${stderr}`,
+        );
+      }
+      const elapsedMs = Date.now() - signalledAtMs;
+
+      expect(outcome.stderr).toContain("data-gateway: shutting down");
+      // journal=1: the hung disposal was initiated (its injected-hang line).
+      expect(outcome.stderr).toContain("[probe] journal.close() will never settle (injected)");
+      // THE PIN — transport=1, not 0: the sibling family was initiated and
+      // completed despite the hang, exactly once.
+      expect(
+        outcome.stderr,
+        "the transport disposal must be initiated despite the hanging journal close",
+      ).toContain("[probe] transport.close() call 1");
+      expect(outcome.stderr).not.toContain("[probe] transport.close() call 2");
+      // Evidence retention: the settled feed-close failure is on stderr even
+      // though stop() never settled and the process was force-exited.
+      expect(outcome.stderr, "the collected feed-close failure must be observable").toContain(
+        "[disposal] coinbase-manager cleanup failed: injected coinbase socket close failure (probe)",
+      );
+      // The hang's own evidence: the deadline log, then the forced exit.
+      expect(outcome.stderr, "the deadline must announce the forced exit").toContain(
+        "cleanup deadline",
+      );
+      expect(outcome.stderr).toContain("shutdown");
+      expect(outcome.code).toBe(1);
+      expect(outcome.signal).toBeNull();
+      expect(elapsedMs, "the forced exit must arrive within the bound").toBeLessThan(10_000);
+    },
+    60_000,
+  );
 });
