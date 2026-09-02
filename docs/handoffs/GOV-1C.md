@@ -633,7 +633,7 @@ own hash.
 
 | Commit | SHA |
 | --- | --- |
-| governance round (the three ADRs, the amendments, the registers, the venue re-issue, the comment-only domain edits, the tool edit, this handoff) | recorded by the follow-up commit |
+| governance round (the three ADRs, the amendments, the registers, the venue re-issue, the comment-only domain edits, the tool edit, this handoff) | `573a8a1498e4cc841ff643a06be3c81de681501f` |
 | SHA record (branch tip) | reported in the agent's reply |
 
 **The branch tip is the commit to review.**
