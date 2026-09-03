@@ -55,6 +55,103 @@ interface Case {
   readonly build: () => unknown;
 }
 
+/**
+ * THE ORACLES — review round 4, and the reason this file no longer contains an
+ * `Object.entries` walk.
+ *
+ * Rounds 2 and 3 checked the package's identity property with a test walk built
+ * on `Object.entries`, which is the primitive the PRODUCT used. That is not an
+ * oracle: it can only see what the implementation can see, so it proved nothing
+ * about a non-enumerable, inherited, or accessor-backed property — the three
+ * shapes review round 4 got a contract-invalid identifier through. A property
+ * proved with the implementation's own primitive is not proved.
+ *
+ * These two oracles are independent of the implementation in a specific,
+ * checkable way:
+ *
+ * - {@link stringsIn} enumerates through `Reflect.ownKeys` plus property
+ *   DESCRIPTORS, and it walks the PROTOTYPE CHAIN. It is therefore strictly
+ *   more sighted than the walk any product code performs: it reports strings
+ *   that are non-enumerable, that live on a prototype, and that sit behind a
+ *   getter (reported as an accessor by {@link notPlainOwnFrozenData}, never
+ *   invoked here — an oracle does not run the subject's code);
+ * - {@link notPlainOwnFrozenData} checks a structural property the product
+ *   never checks about its own output: that every object in an emitted record
+ *   is plain-prototyped, own-data-only, and frozen. That is what makes the
+ *   first oracle's extra sight decisive rather than incidental — on a value
+ *   with no accessors, no inherited state and no hidden properties,
+ *   "what `Object.entries` sees" and "what the value carries" are the same set,
+ *   so proving the record is such a value closes the question that round 3's
+ *   test could only assume.
+ */
+function stringsIn(value: unknown, path = ""): { path: string; value: string }[] {
+  const found: { path: string; value: string }[] = [];
+  const visit = (node: unknown, at: string, ancestors: Set<unknown>): void => {
+    if (typeof node === "string") {
+      found.push({ path: at, value: node });
+      return;
+    }
+    if (node === null || typeof node !== "object" || ancestors.has(node)) return;
+    ancestors.add(node);
+    const isArray = Array.isArray(node);
+    for (
+      let level: object | null = node;
+      level !== null && level !== Object.prototype && level !== Array.prototype;
+      level = Object.getPrototypeOf(level) as object | null
+    ) {
+      for (const key of Reflect.ownKeys(level)) {
+        if (typeof key !== "string") continue;
+        if (isArray && key === "length") continue;
+        const descriptor = Object.getOwnPropertyDescriptor(level, key);
+        if (descriptor === undefined || !("value" in descriptor)) continue;
+        visit(
+          descriptor.value,
+          isArray ? `${at}[${key}]` : at === "" ? key : `${at}.${key}`,
+          ancestors,
+        );
+      }
+    }
+    ancestors.delete(node);
+  };
+  visit(value, path, new Set());
+  return found;
+}
+
+/** Every way `value` fails to be a plain, own-data, deeply frozen record. */
+function notPlainOwnFrozenData(value: unknown, path = "record"): string[] {
+  const findings: string[] = [];
+  const visit = (node: unknown, at: string, ancestors: Set<unknown>): void => {
+    if (node === null || typeof node !== "object" || ancestors.has(node)) return;
+    ancestors.add(node);
+    const isArray = Array.isArray(node);
+    const prototype: unknown = Object.getPrototypeOf(node);
+    if (prototype !== (isArray ? Array.prototype : Object.prototype)) {
+      findings.push(`${at}: non-plain prototype`);
+    }
+    if (!Object.isFrozen(node)) findings.push(`${at}: not frozen`);
+    for (const key of Reflect.ownKeys(node)) {
+      if (typeof key === "symbol") {
+        findings.push(`${at}: symbol-keyed property ${String(key)}`);
+        continue;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(node, key);
+      if (descriptor === undefined) continue;
+      const memberPath = isArray ? `${at}[${key}]` : `${at}.${key}`;
+      if (!("value" in descriptor)) {
+        findings.push(`${memberPath}: accessor property`);
+        continue;
+      }
+      if (!descriptor.enumerable && !(isArray && key === "length")) {
+        findings.push(`${memberPath}: non-enumerable property`);
+      }
+      visit(descriptor.value, memberPath, ancestors);
+    }
+    ancestors.delete(node);
+  };
+  visit(value, path, new Set());
+  return findings;
+}
+
 function withEntry(mutate: (input: EvaluationInputFixture) => void): () => unknown {
   return () => {
     const input = entryInput();
@@ -992,17 +1089,11 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
     return UUID_SHAPE.test(value) && !UUID_CANONICAL.test(value);
   }
 
-  /** Every string reachable in a value, with the path it sits at. */
-  function stringsIn(value: unknown, path = ""): { path: string; value: string }[] {
-    if (typeof value === "string") return [{ path, value }];
-    if (Array.isArray(value)) return value.flatMap((item, i) => stringsIn(item, `${path}[${i}]`));
-    if (value !== null && typeof value === "object") {
-      return Object.entries(value).flatMap(([key, item]) =>
-        stringsIn(item, path === "" ? key : `${path}.${key}`),
-      );
-    }
-    return [];
-  }
+  // Every string reachable in a value is found by the module-scope `stringsIn`
+  // ORACLE (see its comment): descriptor-based and prototype-chain-walking, so
+  // it is strictly more sighted than any walk the package performs. Round 3's
+  // block-local `Object.entries` copy was removed in round 4, which found that
+  // primitive blind to three shapes the product also missed.
 
   /**
    * The ONLY strings an emitted record may carry non-canonically: VENUE-supplied
@@ -1271,25 +1362,28 @@ describe("the emission boundary — a record is never built from an unvalidated 
     return UUID_SHAPE.test(value) && !UUID_CANONICAL.test(value);
   }
 
-  function stringsIn(value: unknown, path = ""): { path: string; value: string }[] {
-    if (typeof value === "string") return [{ path, value }];
-    if (Array.isArray(value)) return value.flatMap((item, i) => stringsIn(item, `${path}[${i}]`));
-    if (value !== null && typeof value === "object") {
-      return Object.entries(value).flatMap(([key, item]) =>
-        stringsIn(item, path === "" ? key : `${path}.${key}`),
-      );
-    }
-    return [];
-  }
+  // The cases below use the module-scope `stringsIn` ORACLE. This block used to
+  // define its own `Object.entries` copy; review round 4 found that primitive
+  // blind to exactly the shapes the product's walk was blind to, so a test
+  // written on it could not have failed where the product failed.
 
   /**
    * The property names a record may legitimately carry a non-canonical
    * UUID-shaped string under, written INDEPENDENTLY of the package's own set so
    * that widening `NON_IDENTITY_KEYS` in `approved-intent.ts` does not silently
-   * widen what these tests accept. Each is a contract-typed non-identifier:
-   * §7.2 `VenueOrderId`, `DetailString` prose, §7.7 `tags`.
+   * widen what these tests accept. Each names the schema that types it as a
+   * non-identifier: `VenueOrderIdSchema` (`CancelIntentSchema.orderIds`),
+   * `DetailStringSchema` (`reason`, `resizeReason`, and — since round 4 —
+   * `IncidentActionRecommendationSchema.rationale`), and `TagSchema` (§7.7
+   * `tags`).
+   *
+   * SINGULAR `orderId` WAS REMOVED IN ROUND 4: no field an approved-intent
+   * record can carry is typed `VenueOrderId` under that name, and the
+   * repository's own `execution.orders` table has an in-process
+   * `order_id internal.uuid_v7` beside a separate `venue_order_id` column, so
+   * the name does not imply "venue".
    */
-  const EXCLUDED_KEY = /(^|\.)(orderIds\[\d+\]|orderId|reason|resizeReason|rationale|tags\[\d+\])$/u;
+  const EXCLUDED_KEY = /(^|\.)(orderIds\[\d+\]|reason|resizeReason|rationale|tags\[\d+\])$/u;
 
   const REQUEST = {
     approvedIntentId: CANONICAL,
@@ -1504,6 +1598,384 @@ describe("the emission boundary — a record is never built from an unvalidated 
     expect(() => {
       (resized.value as { approvedIntentId: string }).approvedIntentId = "tampered";
     }).toThrow(TypeError);
+  });
+});
+
+/**
+ * THE DATA-RECORD BOUNDARY — review round 4.
+ *
+ * FINDING. Round 3's emission boundary WALKED the record instead of listing its
+ * fields, but the walk's enumeration primitive — `Object.entries` — had become
+ * the new list. It sees only enumerable own properties, so three shapes carried
+ * a contract-invalid repository identifier straight through it:
+ *
+ * - the existing `worstCase.perMarket[0].marketId` made NON-ENUMERABLE:
+ *   `{"ok":true,"emitted":"01890000-…-AB","frozen":true,"codes":[]}`;
+ * - the same field moved to the object's PROTOTYPE: accepted, and editing that
+ *   prototype AFTER the call changed the value the returned record reported,
+ *   although the container answered `Object.isFrozen` with `true` — so the
+ *   emitted record was not deeply immutable either;
+ * - an enumerable GETTER: `Error("getter-fired")` escaped `resizeApprovedIntent`,
+ *   whose entire contract is a typed, non-throwing result.
+ *
+ * And the round-3 TEST walked with `Object.entries` too, so it could not have
+ * seen any of them: a property proved with the implementation's own primitive
+ * is not proved.
+ *
+ * FIX. `packages/risk/src/plain-data.ts` READS a value into plain own data
+ * before anything looks at it — descriptors only, so a getter is refused
+ * without ever being invoked; the prototype must be plain, because an inherited
+ * property is state a freeze cannot reach; non-enumerable data properties are
+ * READ (hiding a field does not remove it) and therefore checked. Both
+ * boundaries then use only that snapshot, and the snapshot is what gets
+ * emitted. `ApprovedIntentRecordSchema` states the record's complete runtime
+ * shape, so "this argument is a record" is checked rather than assumed.
+ *
+ * ORACLES. These cases use the module-scope {@link stringsIn} and
+ * {@link notPlainOwnFrozenData}, which walk descriptors and prototype chains —
+ * strictly more sighted than any walk the package performs — and check a
+ * structural property of the OUTPUT that the product never checks about itself.
+ */
+describe("the data-record boundary — a caller's object is not a record", () => {
+  const NON_CANONICAL = "01890000-0000-7000-8000-0000000000AB";
+  const CANONICAL = "01890000-0000-7000-8000-0000000000ab";
+
+  const UUID_SHAPE =
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;
+  const UUID_CANONICAL = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+  function nonCanonicalUuid(value: string): boolean {
+    return UUID_SHAPE.test(value) && !UUID_CANONICAL.test(value);
+  }
+
+  /** As in the block above, written independently of `NON_IDENTITY_KEYS`. */
+  const EXCLUDED_KEY = /(^|\.)(orderIds\[\d+\]|reason|resizeReason|rationale|tags\[\d+\])$/u;
+
+  const REQUEST = {
+    approvedIntentId: CANONICAL,
+    resizedAt: "2026-09-03T12:00:01.000Z",
+    newTargetShares: "50",
+    reason: "shrink",
+  };
+
+  /** A MUTABLE record, as a caller would hand one in (deserialized, rebuilt). */
+  function handBuiltRecord(
+    mutate: (input: EvaluationInputFixture) => void = () => undefined,
+  ): ApprovedIntentRecord {
+    const input = entryInput();
+    input.intent = positionIntent({ tags: ["alpha"] });
+    mutate(input);
+    const result = evaluateIntent(riskPolicy(), input);
+    if (!result.approved) throw new Error(`fixture not approved: ${codesOf(result).join(",")}`);
+    return structuredClone(result.record) as ApprovedIntentRecord;
+  }
+
+  /** The first per-market lot of a mutable record. */
+  function lotOf(record: ApprovedIntentRecord): Record<string, unknown> {
+    return (record.worstCase.perMarket as unknown as Record<string, unknown>[])[0] as Record<
+      string,
+      unknown
+    >;
+  }
+
+  function codes(result: ReturnType<typeof resizeApprovedIntent>): string[] {
+    return result.ok ? [] : result.refusals.map((refusal) => refusal.code);
+  }
+
+  it("REVIEWER'S PROBE (round 4a): a NON-ENUMERABLE identity property is refused, not emitted", () => {
+    const record = handBuiltRecord();
+    Object.defineProperty(lotOf(record), "marketId", {
+      value: NON_CANONICAL,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+
+    const resized = resizeApprovedIntent(record, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    if (resized.ok) return;
+    // Hiding a field from enumeration does not remove it from the value, so it
+    // is READ and then refused by name, with the raw value — a better answer
+    // than a shape refusal would be.
+    const identity = resized.refusals.find((r) => r.code === "RISK_UUID_NOT_CANONICAL");
+    expect(identity?.details["field"]).toBe("record.worstCase.perMarket[0].marketId");
+    expect(identity?.details["value"]).toBe(NON_CANONICAL);
+  });
+
+  it("REVIEWER'S PROBE (round 4b): an INHERITED property is refused — a freeze cannot reach a prototype", () => {
+    for (const inheritedValue of [NON_CANONICAL, CANONICAL]) {
+      const record = handBuiltRecord();
+      const lot = lotOf(record);
+      delete lot["marketId"];
+      const prototype: Record<string, unknown> = { marketId: inheritedValue };
+      Object.setPrototypeOf(lot, prototype);
+
+      const resized = resizeApprovedIntent(record, REQUEST);
+
+      // Refused whether the inherited value is hostile or benign: the defect is
+      // the SHAPE. A record that reports a value it does not own cannot be
+      // frozen, and round 4's probe changed a returned record's market id by
+      // editing this prototype after the call returned.
+      expect(resized.ok).toBe(false);
+      if (resized.ok) return;
+      expect(codes(resized)).toContain("RISK_INPUT_INVALID");
+      expect(JSON.stringify(resized.refusals)).toContain("record.worstCase.perMarket[0]");
+    }
+  });
+
+  it("REVIEWER'S PROBE (round 4c): a THROWING getter is a typed refusal, and is never invoked", () => {
+    const record = handBuiltRecord();
+    const lot = lotOf(record);
+    delete lot["marketId"];
+    let invoked = 0;
+    Object.defineProperty(lot, "marketId", {
+      get() {
+        invoked += 1;
+        throw new Error("getter-fired");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    // Round 4: `Error("getter-fired")` escaped this call.
+    const resized = resizeApprovedIntent(record, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    expect(codes(resized)).toContain("RISK_INPUT_INVALID");
+    // The boundary reads DESCRIPTORS, so no caller code runs inside it at all.
+    expect(invoked).toBe(0);
+  });
+
+  it("a getter cannot get one value validated and a different one emitted", () => {
+    const record = handBuiltRecord();
+    const lot = lotOf(record);
+    const clean = lot["marketId"] as string;
+    delete lot["marketId"];
+    let reads = 0;
+    Object.defineProperty(lot, "marketId", {
+      get() {
+        reads += 1;
+        return reads === 1 ? clean : NON_CANONICAL;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    const resized = resizeApprovedIntent(record, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    expect(reads).toBe(0);
+  });
+
+  it("a benign accessor is refused too: an emitted record carries data, not code", () => {
+    const record = handBuiltRecord();
+    const lot = lotOf(record);
+    const clean = lot["marketId"] as string;
+    delete lot["marketId"];
+    Object.defineProperty(lot, "marketId", {
+      get: () => clean,
+      enumerable: true,
+      configurable: true,
+    });
+
+    expect(resizeApprovedIntent(record, REQUEST).ok).toBe(false);
+  });
+
+  it("THE STRUCTURAL PROPERTY: every emitted record is plain, own-data and deeply frozen", () => {
+    const emitted: unknown[] = [];
+
+    for (const build of [
+      () => entryInput(),
+      () => {
+        const input = entryInput();
+        input.intent = reduceIntent({ targetShares: "100" });
+        input.portfolio.positions = [position()];
+        return input;
+      },
+      () => {
+        const input = entryInput();
+        input.intent = cancelIntent({ orderIds: [NON_CANONICAL] });
+        return input;
+      },
+    ]) {
+      const result = evaluateIntent(riskPolicy(), build());
+      expect(result.approved).toBe(true);
+      if (!result.approved) continue;
+      emitted.push(result.record);
+      const resized = resizeApprovedIntent(structuredClone(result.record), REQUEST);
+      if (resized.ok) emitted.push(resized.value);
+    }
+
+    for (const record of emitted) {
+      // ORACLE 2: plain prototype, own enumerable DATA properties only, frozen
+      // at every depth. This is what makes "the walk sees everything" true
+      // rather than assumed — on such a value every enumeration primitive
+      // reports the same set.
+      expect(notPlainOwnFrozenData(record)).toEqual([]);
+      // ORACLE 1: and nothing UUID-shaped-but-not-canonical is reachable by the
+      // more sighted walk either, except under a contract-typed exclusion.
+      expect(
+        stringsIn(record)
+          .filter((entry) => nonCanonicalUuid(entry.value))
+          .filter((entry) => !EXCLUDED_KEY.test(entry.path)),
+      ).toEqual([]);
+    }
+    // NON-VACUITY: entry, exit and cancel arms, plus resizes of them.
+    expect(emitted.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it("an emitted record shares no object with the argument it was built from", () => {
+    const caller = handBuiltRecord();
+    const resized = resizeApprovedIntent(caller, REQUEST);
+    expect(resized.ok).toBe(true);
+    if (!resized.ok) return;
+
+    // Materialized, not aliased: nothing the caller still holds is inside the
+    // record it got back, so no later edit of theirs can reach it.
+    expect(resized.value.worstCase).not.toBe(caller.worstCase);
+    expect(resized.value.worstCase.perMarket[0]).not.toBe(caller.worstCase.perMarket[0]);
+    expect(resized.value.intent).not.toBe(caller.intent);
+    expect(resized.value.recommendations).not.toBe(caller.recommendations);
+    // …and the values are nonetheless carried through byte for byte.
+    expect(resized.value.worstCase).toEqual(caller.worstCase);
+
+    lotOf(caller)["marketId"] = "MUTATED-AFTER-RETURN";
+    expect(resized.value.worstCase.perMarket[0]?.marketId).toBe(MARKET_A);
+  });
+
+  it("the ENGINE's records come through the boundary too, materialized rather than aliased", () => {
+    // Round 3 disclosed that no test could distinguish the engine's use of the
+    // emission boundary (mutation M-R3e survived): every string in an
+    // engine-built record is validated at the door or is a package literal, so
+    // bypassing the seal changed no refusal. Since round 4 the boundary also
+    // MATERIALIZES, which is observable: a sealed record is a fresh tree, so it
+    // cannot be the same object the evaluation carries beside it.
+    for (const build of [
+      () => entryInput(),
+      () => {
+        const input = entryInput();
+        input.intent = cancelIntent();
+        return input;
+      },
+    ]) {
+      const result = evaluateIntent(riskPolicy(), build());
+      expect(result.approved).toBe(true);
+      if (!result.approved) continue;
+      expect(result.record.worstCase).not.toBe(result.worstCase);
+      expect(result.record.worstCase).toEqual(result.worstCase);
+      expect(notPlainOwnFrozenData(result.record)).toEqual([]);
+    }
+  });
+
+  it("LOW (round 4): a singular `orderId` is CHECKED — the name does not imply a venue id", () => {
+    // `CancelIntent.orderIds` is typed `VenueOrderIdSchema`, so it is excluded.
+    // Singular `orderId` is typed that way nowhere, and the repository's own
+    // `execution.orders` table has an in-process `order_id internal.uuid_v7`
+    // beside a separate `venue_order_id` column. Excluding the NAME was wider
+    // than the contract behind it.
+    const record = handBuiltRecord() as unknown as Record<string, unknown>;
+    record["orderId"] = NON_CANONICAL;
+
+    const resized = resizeApprovedIntent(record as unknown as ApprovedIntentRecord, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    if (resized.ok) return;
+    const identity = resized.refusals.find((r) => r.code === "RISK_UUID_NOT_CANONICAL");
+    expect(identity?.details["field"]).toBe("record.orderId");
+    expect(identity?.details["value"]).toBe(NON_CANONICAL);
+  });
+
+  it("the contract-backed exclusions still ride through, byte for byte", () => {
+    const input = entryInput();
+    input.intent = cancelIntent({ orderIds: [NON_CANONICAL], reason: NON_CANONICAL });
+    const result = evaluateIntent(riskPolicy(), input);
+    expect(codesOf(result)).toEqual([]);
+    expect(result.approved).toBe(true);
+    if (!result.approved) return;
+    expect(result.record.intent).toMatchObject({
+      orderIds: [NON_CANONICAL],
+      reason: NON_CANONICAL,
+    });
+
+    const tagged = handBuiltRecord((withTag) => {
+      withTag.intent = positionIntent({ tags: ["f1890000-0000-7000-8000-0000000000AB"] });
+    });
+    const resized = resizeApprovedIntent(tagged, REQUEST);
+    expect(resized.ok).toBe(true);
+    if (!resized.ok) return;
+    expect(resized.value.intent).toMatchObject({
+      tags: ["f1890000-0000-7000-8000-0000000000AB"],
+    });
+  });
+
+  it("each exclusion is bounded by the TYPE its schema gives it, not by its key name", () => {
+    // A `tag` that is not a `CodeString` is refused, though `tags` is excluded
+    // from the IDENTITY check…
+    const badTag = handBuiltRecord() as unknown as { intent: { tags: string[] } };
+    badTag.intent.tags = ["not a code"];
+    expect(codes(resizeApprovedIntent(badTag as unknown as ApprovedIntentRecord, REQUEST))).toEqual(
+      ["RISK_INPUT_INVALID"],
+    );
+
+    // …and so is a `rationale` that is not a `DetailString`. That annotation
+    // (`IncidentActionRecommendationSchema.rationale`) was added in round 4:
+    // the exclusion cited a contract type the field did not have.
+    const badProse = handBuiltRecord() as unknown as {
+      recommendations: { rationale: string }[];
+    };
+    badProse.recommendations = [
+      {
+        kind: "RECOMMENDATION",
+        action: "CANCEL_RESTING_ORDERS",
+        failureClass: "VENUE_BOOK_STALE",
+        ordersScope: "ACCOUNT",
+        rationale: "",
+      } as unknown as { rationale: string },
+    ];
+    expect(
+      codes(resizeApprovedIntent(badProse as unknown as ApprovedIntentRecord, REQUEST)),
+    ).toEqual(["RISK_INPUT_INVALID"]);
+  });
+
+  it("a value that is not an approved-intent record is a typed refusal, never a throw", () => {
+    const notRecords: unknown[] = [
+      null,
+      undefined,
+      "record",
+      42,
+      [],
+      {},
+      { ...handBuiltRecord(), extraKey: "surprise" },
+    ];
+    for (const notRecord of notRecords) {
+      const resized = resizeApprovedIntent(notRecord as ApprovedIntentRecord, REQUEST);
+      expect(resized.ok).toBe(false);
+      expect(codes(resized)).toContain("RISK_INPUT_INVALID");
+    }
+
+    // A required field that is missing is named, not defaulted.
+    const missing = handBuiltRecord() as unknown as Record<string, unknown>;
+    delete missing["rootApprovedIntentId"];
+    const resized = resizeApprovedIntent(missing as unknown as ApprovedIntentRecord, REQUEST);
+    expect(resized.ok).toBe(false);
+    if (resized.ok) return;
+    expect(JSON.stringify(resized.refusals)).toContain("rootApprovedIntentId");
+  });
+
+  it("a cyclic or sparse record is a typed refusal, not a hang and not a throw", () => {
+    const cyclic = handBuiltRecord() as unknown as { worstCase: Record<string, unknown> };
+    cyclic.worstCase["self"] = cyclic.worstCase;
+    expect(
+      codes(resizeApprovedIntent(cyclic as unknown as ApprovedIntentRecord, REQUEST)),
+    ).toContain("RISK_INPUT_INVALID");
+
+    const sparse = handBuiltRecord() as unknown as { reasons: unknown };
+    const holes = ["RISK_APPROVED"];
+    holes.length = 3;
+    sparse.reasons = holes;
+    expect(
+      codes(resizeApprovedIntent(sparse as unknown as ApprovedIntentRecord, REQUEST)),
+    ).toContain("RISK_INPUT_INVALID");
   });
 });
 

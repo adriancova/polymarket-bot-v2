@@ -84,6 +84,19 @@ export const PortfolioPositionSchema = z.strictObject({
 export type PortfolioPosition = z.infer<typeof PortfolioPositionSchema>;
 
 export const PortfolioOpenOrderSchema = z.strictObject({
+  /**
+   * WHICH ORDER IDENTIFIER THIS IS, IS NOT ESTABLISHED (review round 4).
+   *
+   * The type here is `NonEmptyString` and nothing more. The repository has TWO
+   * order identifiers — an in-process `execution.orders.order_id
+   * internal.uuid_v7` and a separate `venue_order_id`
+   * (`db/migrations/0005_execution.up.sql`) — and no contract says which one a
+   * composition root will put here. Earlier text in this file asserted it was
+   * "venue-supplied (§7.2 `VenueOrderId`)"; that assertion is withdrawn, and
+   * the annotation is a contract-owner follow-up (`docs/handoffs/WP-180.md`,
+   * R3-2). Nothing in this package depends on the answer today — see
+   * {@link internalIdentityFields}.
+   */
   orderId: NonEmptyStringSchema,
   marketId: InternalMarketIdSchema,
   side: OutcomeSideSchema,
@@ -241,16 +254,37 @@ export type RiskEvaluationInput = z.infer<typeof RiskEvaluationInputSchema>;
  * against `intentId`, so a re-cased entry there silently under-matches §9.8
  * check 18 instead of failing.
  *
- * WHAT IS DELIBERATELY OUT OF SCOPE: VENUE-supplied opaque identifiers —
- * `CancelIntent.orderIds` and `portfolio.openOrders[].orderId` (§7.2
- * `VenueOrderId`). ADR-016 §2's amendment says the ruling "does not touch any
- * venue wire format (venue identifiers are not UUIDs; their rules are ADR-015's)",
- * and its in-process-generation premise is false for them: a venue string must
- * be round-tripped exactly as the venue spelled it, so refusing one would
- * reject a legitimate value — and, on a `CANCEL`, could trap a position for a
- * rule ADR-016 does not impose (§6 invariant 13). Market ids need no entry
- * here: `InternalMarketIdSchema` is lowercase-canonical UUIDv7 already, so the
- * schema above refuses a re-cased one as `RISK_INPUT_INVALID`.
+ * WHAT IS DELIBERATELY OUT OF SCOPE, AND ON WHAT AUTHORITY. Corrected
+ * 2026-09-03 (adversarial review round 4): the earlier text here put two fields
+ * in one clause and claimed both were "VENUE-supplied … (§7.2 `VenueOrderId`)".
+ * That is true of one of them and NOT ESTABLISHED of the other, and the two are
+ * out of scope for different reasons.
+ *
+ * - `CancelIntent.orderIds` — venue-supplied BY CONTRACT: the frozen domain
+ *   schema types it `z.array(VenueOrderIdSchema)`
+ *   (`packages/domain/src/intents.ts`). ADR-016 §2's amendment says the ruling
+ *   "does not touch any venue wire format (venue identifiers are not UUIDs;
+ *   their rules are ADR-015's)", and its in-process-generation premise is false
+ *   for these: a venue string must be round-tripped exactly as the venue
+ *   spelled it, so refusing one would reject a legitimate value — and, on a
+ *   `CANCEL`, would trap a position for a rule ADR-016 does not impose (§6
+ *   invariant 13).
+ * - `portfolio.openOrders[].orderId` — PROVENANCE UNDETERMINED. It is typed
+ *   only `NonEmptyStringSchema` above, and the repository holds both an
+ *   in-process `execution.orders.order_id internal.uuid_v7` and a separate
+ *   `venue_order_id` column (`db/migrations/0005_execution.up.sql`), so the
+ *   name settles nothing. It stays out of scope on a NARROWER ground that does
+ *   not depend on provenance: this function is the door that also admits a
+ *   `CANCEL`, so a refusal here can trap a position, while the field itself
+ *   never reaches an approved record — `approved-intent.ts` governs what an
+ *   emitted record may carry, and no emitted record carries a portfolio. If the
+ *   contract owner rules "repository-generated", the check belongs at that
+ *   boundary rather than at this door. Recorded as a contract-owner follow-up
+ *   (`docs/handoffs/WP-180.md`, R3-2).
+ *
+ * Market ids need no entry here: `InternalMarketIdSchema` is lowercase-canonical
+ * UUIDv7 already, so the schema above refuses a re-cased one as
+ * `RISK_INPUT_INVALID`.
  */
 function internalIdentityFields(
   data: RiskEvaluationInput,

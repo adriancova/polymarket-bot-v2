@@ -17,6 +17,9 @@
  * binds this package directly when it refuses a reduction.
  */
 
+import { DetailStringSchema, NonEmptyStringSchema } from "@polymarket-bot/domain";
+import { z } from "zod";
+
 import { deepFreeze } from "./guards.js";
 
 /** The §9.9 action ladder, verbatim. */
@@ -50,7 +53,12 @@ export const INCIDENT_FAILURE_CLASSES = [
 ] as const;
 export type IncidentFailureClass = (typeof INCIDENT_FAILURE_CLASSES)[number];
 
-export type RecommendationOrdersScope = "SIGNAL_DEPENDENT_QUOTES" | "MARKET" | "ACCOUNT";
+export const RECOMMENDATION_ORDERS_SCOPES = [
+  "SIGNAL_DEPENDENT_QUOTES",
+  "MARKET",
+  "ACCOUNT",
+] as const;
+export type RecommendationOrdersScope = (typeof RECOMMENDATION_ORDERS_SCOPES)[number];
 
 /** A typed recommendation. NEVER an action; the §9.9 controller consumes it. */
 export interface IncidentActionRecommendation {
@@ -60,9 +68,43 @@ export interface IncidentActionRecommendation {
   readonly failureClass: IncidentFailureClass;
   readonly ordersScope: RecommendationOrdersScope;
   readonly marketId?: string;
-  /** Quotes the handoff row this recommendation reproduces. Never parsed. */
+  /**
+   * Quotes the handoff row this recommendation reproduces.
+   *
+   * TYPED `DetailString` BY {@link IncidentActionRecommendationSchema} —
+   * "bounded human-readable text (never parsed, only displayed or logged)"
+   * (`packages/domain/src/primitives.ts`). The annotation is new in adversarial
+   * review round 4: `approved-intent.ts` excludes `rationale` from ADR-016 §2
+   * identity validation on the ground that the contract types it as prose, and
+   * round 4 found that no contract said so — the field was an unconstrained
+   * `string`, so the exclusion was wider than its own justification. The schema
+   * below is that missing annotation, stated where the field is defined.
+   */
   readonly rationale: string;
 }
+
+/**
+ * THE RUNTIME SHAPE of {@link IncidentActionRecommendation}.
+ *
+ * A recommendation travels inside every `ApprovedIntentRecord`, and
+ * `approved-intent.ts` reconstructs the whole record through a schema before
+ * emitting it. Every vocabulary field is closed to this package's own ladder
+ * and failure-class lists, so a hand-built record cannot smuggle an unknown
+ * action past the §9.9 controller.
+ */
+export const IncidentActionRecommendationSchema = z.strictObject({
+  kind: z.literal("RECOMMENDATION"),
+  action: z.enum(INCIDENT_ACTION_LADDER),
+  failureClass: z.enum(INCIDENT_FAILURE_CLASSES),
+  ordersScope: z.enum(RECOMMENDATION_ORDERS_SCOPES),
+  /**
+   * `NonEmptyString`, not `InternalMarketId`: ADR-016 §2 canonicality for every
+   * string in an emitted record is enforced by the identity walk in
+   * `approved-intent.ts`, which names the exact path and keeps the raw value.
+   */
+  marketId: NonEmptyStringSchema.optional(),
+  rationale: DetailStringSchema,
+});
 
 function recommendation(
   action: IncidentAction,

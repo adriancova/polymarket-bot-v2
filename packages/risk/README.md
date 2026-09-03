@@ -199,9 +199,10 @@ can carry one.
 | `context.strategyInstanceId` | **yes** | copied into every record |
 | `intent.intentId` | **yes** | copied to `sourceIntentId` and carried inside `record.intent` |
 | `guards.recentIntentIds[]` | **yes** | compared against `intentId`; a re-cased entry would silently under-match §9.8 check 18 |
-| `record.*` on `resizeApprovedIntent` | **yes** | the argument is typed, not parsed; everything it carries is inherited into the new record — see §4.3 |
+| `record.*` on `resizeApprovedIntent` | **yes** | the argument is typed by TypeScript only; everything it carries is inherited into the new record — see §4.3 and §4.4 (round 4: it is now read as data and parsed in full) |
 | any `marketId` **arriving as engine input** | n/a | `InternalMarketId` is lowercase-canonical UUIDv7 in the frozen schema, so a re-cased one is already `RISK_INPUT_INVALID` |
-| `intent.orderIds[]`, `portfolio.openOrders[].orderId` | **no** | §7.2 `VenueOrderId` — venue-supplied and opaque. ADR-016 §2 "does not touch any venue wire format", and its premise (every UUID here is generated in-process) is false for them: a venue string must round-trip exactly as the venue spelled it, and refusing one on a `CANCEL` could trap a position for a rule the ADR does not impose |
+| `intent.orderIds[]` | **no** | Venue-supplied **by contract**: `CancelIntentSchema.orderIds` is `z.array(VenueOrderIdSchema)`. ADR-016 §2 "does not touch any venue wire format", and its premise (every UUID here is generated in-process) is false for these: a venue string must round-trip exactly as the venue spelled it, and refusing one on a `CANCEL` would trap a position for a rule the ADR does not impose |
+| `portfolio.openOrders[].orderId` | **no** | **Corrected 2026-09-03 (review round 4).** This row used to claim the field was venue-supplied. It is **not established either way**: the schema types it only `NonEmptyString`, and the repository has both an in-process `execution.orders.order_id internal.uuid_v7` and a separate `venue_order_id` column (`db/migrations/0005_execution.up.sql`). It is out of scope on a narrower ground that does not need the answer: this door also admits a `CANCEL`, so a refusal here can trap a position, and the field never reaches an approved record. Contract-annotation follow-up R3-2 |
 
 ### 4.3 The emission boundary — why the table above is not the whole rule
 
@@ -222,15 +223,16 @@ So identity completeness is now derived from the code's shape:
   record it is about to emit. `resizeApprovedIntent` walks the record it
   inherits, and the parsed request, the same way — before it constructs
   anything;
-- **the exceptions are the closed set**, `NON_IDENTITY_KEYS`: `orderId` /
-  `orderIds` (§7.2 `VenueOrderId`), `reason` / `resizeReason` / `rationale`
-  (`DetailString` prose, "never parsed, only displayed or logged"), and `tags`
-  (§7.7 free-form strategy tags). Each entry is a string the frozen contract
-  types as something other than a repository identifier, and two of them ride
-  the `CANCEL` path, where over-refusal would trap a position;
-- **the inherited intent is parsed**, not trusted, because the resize computes
-  on it (`compareDecimal`, `absDecimal`). A hand-built `targetShares` is now a
-  typed `RISK_INPUT_INVALID` instead of a thrown `InvalidDecimalStringError`.
+- **the exceptions are the closed set**, `NON_IDENTITY_KEYS`: `orderIds`
+  (`CancelIntentSchema.orderIds` is `z.array(VenueOrderIdSchema)`), `reason` /
+  `resizeReason` / `rationale` (`DetailStringSchema` prose, "never parsed, only
+  displayed or logged"), and `tags` (`z.array(TagSchema)`, §7.7 free-form
+  strategy tags). Each entry names the schema that types it as something other
+  than a repository identifier, and two of them ride the `CANCEL` path, where
+  over-refusal would trap a position;
+- **the inherited record is parsed**, not trusted, because the resize computes
+  on it and copies most of it forward. A hand-built `targetShares` is a typed
+  `RISK_INPUT_INVALID` instead of a thrown `InvalidDecimalStringError`.
 
 A seventh identity field is therefore validated the moment it exists, with no
 edit here — and the suite notices too: `test/unit/risk/engine.test.ts`, describe
@@ -238,6 +240,58 @@ block *"the emission boundary — a record is never built from an unvalidated
 identity"*, generates its cases by walking a real record, so a new field is a
 new case automatically. The older block *"ADR-016 §2 — record identity is INPUT
 VALIDATION, never a cancel override"* still pins the door.
+
+**Two corrections, 2026-09-03 (adversarial review round 4).** Singular `orderId`
+was REMOVED from the exclusion set: no field an approved record can carry is
+typed `VenueOrderId` under that name, and the repository's own `execution.orders`
+table has an in-process `order_id internal.uuid_v7` beside a separate
+`venue_order_id` column, so the name does not imply "venue". And `rationale`'s
+exclusion cited a contract type the field did not have — it was an unconstrained
+`string`; `IncidentActionRecommendationSchema` now types it `DetailStringSchema`,
+so the justification is enforced rather than asserted. Each exclusion is bounded
+by its TYPE, not by its key name: a `tag` that is not a `CodeString`, or a
+`rationale` that is not a `DetailString`, is still refused — by the shape check
+rather than the identity check.
+
+### 4.4 The data-record boundary — why a walk was still not enough
+
+**Adversarial review round 4.** §4.3's walk used `Object.entries`, which reports
+only enumerable own properties. The enumeration primitive had become the new
+list, and three shapes carried a contract-invalid repository identifier through
+it: a **non-enumerable** property (accepted, emitted, and frozen into the
+returned record), a property on the object's **prototype** (accepted — and
+editing that prototype afterwards changed the value the "frozen" record
+reported, so the record was not deeply immutable either), and an **accessor**,
+whose getter `Object.entries` does not skip but INVOKES, so a throwing getter
+escaped `resizeApprovedIntent` as an exception. The round-3 test walked the same
+way, so it could not have caught any of them.
+
+So this package no longer treats a caller-supplied object as a record.
+`src/plain-data.ts` **reads** a value into plain own data before anything looks
+at it, and both boundaries use only that snapshot — for identity validation, for
+arithmetic, and as the value that is emitted:
+
+- values come from property **descriptors**, so a getter is refused without ever
+  being invoked. No caller code runs inside the boundary;
+- a **non-plain prototype** is refused: an inherited property is state the
+  container does not own, and `Object.freeze` cannot reach it;
+- a **non-enumerable data property is read**, not rejected — hiding a field does
+  not remove it — so it is checked like any other and comes back as a
+  `RISK_UUID_NOT_CANONICAL` refusal naming its exact path;
+- functions, symbols, symbol-keyed properties, cycles, sparse arrays and
+  excessive nesting are typed refusals. Every reflective operation is wrapped,
+  so a hostile `Proxy` cannot make this package throw where it contracts a typed
+  result;
+- `ApprovedIntentRecordSchema` states the record's **complete runtime shape**, so
+  `resizeApprovedIntent`'s `record` argument — typed by TypeScript, parsed by
+  nothing until now — is parsed in full before it is computed on.
+
+Two properties follow by construction rather than by argument: what any walk can
+see IS what the record carries, and an emitted record is a fresh, deeply frozen
+tree that shares no object with the caller — so no later edit of theirs can
+reach inside it. Pinned by `test/unit/risk/engine.test.ts`, describe block *"the
+data-record boundary — a caller's object is not a record"*, whose oracles walk
+descriptors and prototype chains instead of repeating the product's primitive.
 
 ### Staleness and exits, stated exactly
 
@@ -284,7 +338,7 @@ declared set** — the three surfaces are bound together by test.
 | Code | Meaning |
 | --- | --- |
 | `RISK_INPUT_INVALID` | The evaluation input, the policy, the resize request, or a resize's INHERITED intent failed its schema. |
-| `RISK_UUID_NOT_CANONICAL` | A UUID-shaped **repository** identifier arrived in a non-lowercase spelling. ADR-016 §2: refuse at the input surface, never case-fold. The door's fields and the venue exclusion are in §4.2; the record-walk rule that covers every other position is §4.3. |
+| `RISK_UUID_NOT_CANONICAL` | A UUID-shaped **repository** identifier arrived in a non-lowercase spelling. ADR-016 §2: refuse at the input surface, never case-fold. The door's fields and the venue exclusion are in §4.2; the record rule that covers every other position is §4.3, and the data-record boundary it rests on is §4.4. |
 | `RISK_INTENT_EXPIRED` | `validUntil` is before the caller-supplied evaluation instant, or the two are not comparable. |
 | `RISK_ZERO_DELTA` | The position intent resolves to no share delta; there is nothing to execute. |
 | `RISK_MARKET_CONTEXT_MISSING` | No market context was supplied for a market the intent touches. |
@@ -430,14 +484,18 @@ These four are exactly `PRIMARY_RISK_REASON_CODES`.
 | `worstCaseBasis` | `EVALUATED` (computed for this intent) or `INHERITED_UPPER_BOUND` (carried from the record being resized). |
 
 Records are deeply frozen: an in-place edit **throws**. A resize returns a new
-record and leaves the original untouched, including its `intent` object.
-Freezing happens **inside** `sealApprovedIntentRecord` (§4.3), so "emit a
-record" and "validate the record being emitted" are one act rather than two
-conventions.
+record and leaves the original untouched. Freezing happens **inside**
+`sealApprovedIntentRecord` (§4.3), so "emit a record" and "validate the record
+being emitted" are one act rather than two conventions — and since round 4 the
+value emitted is the *materialized* one (§4.4), so "deeply frozen" means the
+record cannot be changed through a prototype or a getter either, not merely that
+`Object.freeze` was called on it.
 
 `resizeApprovedIntent`'s `record` argument is INPUT, not a trusted value: it is
-typed but not parsed, so it is walked for ADR-016 §2 violations in full, and its
-`intent` is parsed against the frozen §7.7 contract, before anything is built.
+read into plain own data (§4.4), checked for ADR-016 §2 violations in full, and
+parsed against `ApprovedIntentRecordSchema` — including its `intent` against the
+frozen §7.7 contract — before anything is built. The returned record shares no
+object with it, so a caller cannot reach into a record it was given back.
 
 Ceilings the strategy set (`maximumTotalCost`, `maximumBuyPrice`,
 `minimumSellPrice`, `validUntil`) are copied unchanged by a resize — a ceiling

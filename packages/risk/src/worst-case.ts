@@ -43,7 +43,14 @@
  */
 
 import { addDecimal, compareDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
-import type { MoneyString, SharesString } from "@polymarket-bot/domain";
+import {
+  MoneyStringSchema,
+  NonEmptyStringSchema,
+  SharesStringSchema,
+  type MoneyString,
+  type SharesString,
+} from "@polymarket-bot/domain";
+import { z } from "zod";
 
 import { deepFreeze } from "./guards.js";
 
@@ -108,6 +115,54 @@ export interface WorstCaseAssessment {
   readonly worstCaseResolutionLoss: MoneyString;
   readonly cancelledOutcomeTreatment: typeof CANCELLED_OUTCOME_TREATMENT;
 }
+
+/**
+ * THE RUNTIME SHAPE of the interfaces above (adversarial review round 4).
+ *
+ * An `ApprovedIntentRecord` carries a {@link WorstCaseAssessment}, and
+ * `approved-intent.ts` reconstructs the whole record through a schema before
+ * emitting it — so the assessment needs a runtime shape, declared here where
+ * the interfaces are, rather than a second description of it kept in step by
+ * hand.
+ *
+ * SIGNS ARE DELIBERATELY UNCONSTRAINED. `worstCaseResolutionLoss` may be
+ * negative (a guaranteed profit), and this schema also validates records built
+ * by callers rather than by {@link assessWorstCase}. A non-negativity
+ * constraint here would turn a legitimate assessment into a refusal on the
+ * emission path — and that path also emits the record for a `CANCEL`, where a
+ * false refusal traps a position (§6 invariant 13). Exactness of the decimals
+ * IS constrained: every value is a canonical decimal string.
+ */
+export const PerOutcomeSettlementValueSchema = z.strictObject({
+  YES_WIN: MoneyStringSchema,
+  NO_WIN: MoneyStringSchema,
+  SPLIT_50_50: MoneyStringSchema,
+});
+
+export const MarketWorstCaseSchema = z.strictObject({
+  /**
+   * `NonEmptyString`, not `InternalMarketId`: ADR-016 §2 canonicality is
+   * enforced for every string in an emitted record by the identity walk in
+   * `approved-intent.ts`, which reports the exact path and keeps the raw value.
+   * Duplicating it as a shape constraint would only change a precise refusal
+   * into a vaguer one.
+   */
+  marketId: NonEmptyStringSchema,
+  yesShares: SharesStringSchema,
+  noShares: SharesStringSchema,
+  committedCost: MoneyStringSchema,
+  perOutcomeSettlementValue: PerOutcomeSettlementValueSchema,
+  worstVerifiedOutcome: z.enum(VERIFIED_TERMINAL_OUTCOMES),
+  worstVerifiedValue: MoneyStringSchema,
+});
+
+export const WorstCaseAssessmentSchema = z.strictObject({
+  committedCost: MoneyStringSchema,
+  perMarket: z.array(MarketWorstCaseSchema).readonly(),
+  maximumContractualLoss: MoneyStringSchema,
+  worstCaseResolutionLoss: MoneyStringSchema,
+  cancelledOutcomeTreatment: z.literal(CANCELLED_OUTCOME_TREATMENT),
+});
 
 /** Both-token settlement value of one market's holdings under one outcome. */
 export function settlementValueUnderOutcome(
