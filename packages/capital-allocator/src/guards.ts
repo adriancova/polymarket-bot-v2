@@ -16,6 +16,8 @@
  * are bounded non-empty strings).
  */
 
+import { ownDataDescriptor } from "./plain-data.js";
+
 /** Case-insensitive UUID shape (any variant/version — shape only). */
 const UUID_SHAPE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;
 
@@ -74,14 +76,15 @@ export function ownFlag(flags: object, key: string): boolean {
  * read `Object.prototype` as an existing entry and would then have written the
  * commitment components ONTO `Object.prototype` itself. `defineProperty` has
  * `CreateDataProperty` semantics and consults no setter.
+ *
+ * The DESCRIPTOR is built by `plain-data.ts`'s `ownDataDescriptor` rather than
+ * written as a literal (review round 8): a descriptor literal is an ordinary
+ * object, its fields are read with `HasProperty`, and an inherited `get` turned
+ * every `Object.defineProperty` in this repository into a `TypeError` — measured
+ * at the round-7 tip, where it escaped a public door as an exception.
  */
 export function setOwn<T>(table: Record<string, T>, key: string, value: T): void {
-  Object.defineProperty(table, key, {
-    value,
-    writable: true,
-    enumerable: true,
-    configurable: true,
-  });
+  Object.defineProperty(table, key, ownDataDescriptor(value));
 }
 
 /**

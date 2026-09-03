@@ -35,8 +35,13 @@
  * | `reflect-chain` | `Reflect.get/set/has/getPrototypeOf/setPrototypeOf` | the chain by construction (and any unrecognized `Reflect` member) |
  * | `object-entries` | `Object.entries(o)`, `Object.values(o)` | own-only, but it INVOKES every own getter |
  * | `structured-clone` | `structuredClone(o)` | invokes own getters, and the clone inherits `Object.prototype` |
- * | `own-enumeration` | `Object.keys`, `Object.getOwnPropertyNames`, `Reflect.ownKeys` | own-only names, no getter — safe, enumerated so the census is total |
+ * | `own-enumeration` | `Object.keys`, `Object.getOwnPropertyNames`, `Object.getOwnPropertySymbols`, `Reflect.ownKeys` | own-only names, no getter — safe, enumerated so the census is total |
  * | `computed-key` | `{ [k]: v }` | `CreateDataProperty` — safe, enumerated so the census is total |
+ * | `prototype-read` | `Object.getPrototypeOf(o)` | READS the chain — safe only where the answer is used to REFUSE or to classify |
+ * | `prototype-write` | `Object.setPrototypeOf(o, p)`, `Object.create(p)` | ESTABLISHES the chain: `Object.create(null)` removes it, any other argument installs one |
+ * | `object-from-entries` | `Object.fromEntries(xs)` | iterates its argument AND returns an ORDINARY object, so the result inherits `Object.prototype` |
+ * | `object-unclassified` | any other `Object.*` call | FAIL CLOSED: an `Object` member this table does not name becomes a named finding, never silence (review round 8) |
+ * | `with-statement` | `with (o) { … }` | resolves EVERY bare identifier in its body against `o`'s prototype chain |
  *
  * The census is the input to a test that requires EVERY site to be either an
  * own-property primitive or an explicitly registered exception carrying a
@@ -55,18 +60,33 @@
  * the mechanism that covers it instead; an under-stated boundary is the finding
  * this list exists to prevent recurring.
  *
- * 1. **A DOTTED READ** (`caps.liveMicroMaxOrderNotional`). It consults the
- *    prototype, and every field read in both packages is one, so a syntactic
- *    rule over them would be noise rather than a gate. Covered BEHAVIOURALLY by
- *    `inherited-state.test.ts`, which augments `Object.prototype` with each name
- *    these packages actually use and requires every public answer to be
- *    unchanged. That is what caught the caps-fence hole no syntactic rule would
- *    have flagged.
- * 2. **PER-PROPERTY OWN PREDICATES AND DESCRIPTOR READS** — `Object.hasOwn`,
- *    `Object.getOwnPropertyDescriptor(s)`, `Object.defineProperty`,
- *    `Reflect.getOwnPropertyDescriptor`, `Reflect.defineProperty`. They are
- *    own-only, they invoke no accessor, and they are the very primitives this
- *    review chain prescribes; flagging thirty of them would drown the table.
+ * 1. **DOTTED PROPERTY ACCESS, IN BOTH DIRECTIONS** — a READ
+ *    (`caps.liveMicroMaxOrderNotional`) and a WRITE (`lot.committedCost = …`).
+ *    A read consults the prototype; a WRITE consults it too, and invokes an
+ *    inherited SETTER if it finds one (review round 8 corrected this item, which
+ *    named only the read). Every field access in both packages is one of these,
+ *    so a syntactic rule over them would be noise rather than a gate. Covered
+ *    BEHAVIOURALLY by `inherited-state.test.ts`, which augments
+ *    `Object.prototype` with each name these packages actually use — including,
+ *    since round 8, every PROPERTY-DESCRIPTOR ATTRIBUTE name — and requires
+ *    every public answer to be unchanged. That is what caught the caps-fence
+ *    hole no syntactic rule would have flagged. Every dotted write in these
+ *    packages is onto an object the package itself built in the same function
+ *    (a lot accumulator, an exposure entry, a `null`-prototype descriptor, the
+ *    arena's own schema copy); a syntactic gate for them is recorded as a
+ *    follow-up rather than claimed here.
+ * 2. **PER-PROPERTY OWN PREDICATES, DESCRIPTOR READS AND INTEGRITY
+ *    PRIMITIVES** — the `Object` members named in {@link OBJECT_SILENT_MEMBERS}
+ *    (`hasOwn`, `getOwnPropertyDescriptor(s)`, `defineProperty`/`defineProperties`,
+ *    `freeze`/`isFrozen`, `seal`/`isSealed`, `preventExtensions`/`isExtensible`,
+ *    `is`), plus `Reflect.getOwnPropertyDescriptor` and `Reflect.defineProperty`.
+ *    They are own-only, they invoke no accessor, and they are the very
+ *    primitives this review chain prescribes; flagging thirty of them would
+ *    drown the table. The list is now EXPLICIT and the detector FAILS CLOSED
+ *    around it: any other `Object` member is reported as `object-unclassified`
+ *    (review round 8 — the previous version returned `undefined` for an
+ *    unrecognized member, so the detector itself failed open, which is the same
+ *    class of defect this mechanism exists to prevent).
  *    (`Reflect.*` is nonetheless classified above, so only the `Object.*` forms
  *    are excluded here.)
  * 3. **THE ITERATION PROTOCOL** — `for…of`, array destructuring (`const [a] =
@@ -91,10 +111,22 @@
  * 6. **DYNAMIC EVALUATION** — `eval`, `new Function`, dynamic `import()` of a
  *    computed specifier. None appears in either package; the repository-wide
  *    `check:deps` scanner is the mechanism that reports them.
- * 7. **CLASS SYNTAX** — `super.x`, `extends`, `instanceof`, `Object.create(p)`.
- *    Neither package declares a class or uses `instanceof`; every object either
- *    is a literal, is materialized with a `null` prototype, or comes from a
- *    library. `Object.create(null)` is the materializer's own primitive.
+ * 7. **CLASS SYNTAX** — `super.x`, `extends`, `instanceof`. Neither package
+ *    declares a class or uses `instanceof`; every object either is a literal,
+ *    is materialized with a `null` prototype, or comes from a library.
+ *    (`Object.create` is NO LONGER excluded here — review round 8 classifies it
+ *    as `prototype-write`, because `Object.create(null)` and `Object.create(p)`
+ *    differ by exactly the thing this census is about, and a registration makes
+ *    which one it is visible.)
+ * `with (o) { … }` is NOT an exclusion — review round 8 noted it was absent
+ * from a list that called itself complete, and it is now DETECTED
+ * (`with-statement`, above) rather than argued about. It is also independently
+ * rejected by TypeScript, with diagnostics 1101 ("`with` statements are not
+ * allowed in strict mode") and 2410 — but round 8 MEASURED where: both are
+ * SEMANTIC diagnostics, so `censusOfPrototypeAccess`'s syntactic-only guard
+ * would NOT have caught one, and `pnpm typecheck` is the gate that would.
+ * {@link diagnosticsOfSourceText} lets `prototype-access.test.ts` assert that
+ * second gate as a measurement instead of a claim.
  *
  * Items 1–7 are the WHOLE of the exclusion. A form not listed here and not in
  * the table above is an omission, and `prototype-access.test.ts` probes each
@@ -127,7 +159,12 @@ export type AccessKind =
   | "object-entries"
   | "structured-clone"
   | "own-enumeration"
-  | "computed-key";
+  | "computed-key"
+  | "prototype-read"
+  | "prototype-write"
+  | "object-from-entries"
+  | "object-unclassified"
+  | "with-statement";
 
 /** Every kind, so a test can prove the vocabulary is closed and exercised. */
 export const ACCESS_KINDS: readonly AccessKind[] = [
@@ -145,6 +182,11 @@ export const ACCESS_KINDS: readonly AccessKind[] = [
   "structured-clone",
   "own-enumeration",
   "computed-key",
+  "prototype-read",
+  "prototype-write",
+  "object-from-entries",
+  "object-unclassified",
+  "with-statement",
 ];
 
 export interface AccessSite {
@@ -261,12 +303,15 @@ function elementAccessKind(node: ts.ElementAccessExpression, parent: ts.Node | u
 /**
  * The `Object.*` / `Reflect.*` members whose CALL is a census site, by kind.
  *
- * `Reflect` is classified in FULL and fails closed: a member not named here is
- * reported as `reflect-chain`, the stricter kind, so a future `Reflect.foo`
- * cannot be silent. `Object` is not classified in full — its own-only
- * per-property primitives (`hasOwn`, `getOwnPropertyDescriptor`,
- * `defineProperty`) are the prescribed safe forms and are excluded by item 2 of
- * the scope list in the module header.
+ * BOTH ARE NOW CLASSIFIED IN FULL, AND BOTH FAIL CLOSED (review round 8). A
+ * `Reflect` member not named below is reported as `reflect-chain`; an `Object`
+ * member named neither here nor in {@link OBJECT_SILENT_MEMBERS} is reported as
+ * `object-unclassified`. The previous version returned `undefined` for an
+ * unrecognized `Object` member, so `Object.getPrototypeOf`,
+ * `Object.setPrototypeOf` and `Object.fromEntries` were all SILENT — the
+ * reviewer's mutation added exported `getPrototypeOf`/`setPrototypeOf` calls to a
+ * product source and the census's "every site is registered" test still passed.
+ * A detector that fails open is the defect it exists to prevent.
  */
 const OBJECT_MEMBER_KINDS: ReadonlyMap<string, AccessKind> = new Map<string, AccessKind>([
   ["assign", "object-assign"],
@@ -274,6 +319,38 @@ const OBJECT_MEMBER_KINDS: ReadonlyMap<string, AccessKind> = new Map<string, Acc
   ["values", "object-entries"],
   ["keys", "own-enumeration"],
   ["getOwnPropertyNames", "own-enumeration"],
+  ["getOwnPropertySymbols", "own-enumeration"],
+  ["getPrototypeOf", "prototype-read"],
+  ["setPrototypeOf", "prototype-write"],
+  ["create", "prototype-write"],
+  ["fromEntries", "object-from-entries"],
+]);
+
+/**
+ * The `Object.*` members that are deliberately SILENT — scope item 2.
+ *
+ * Every one is own-only and accessor-free: a per-property predicate, a
+ * descriptor read or write, or an integrity operation. They are the primitives
+ * this review chain prescribes, and reporting thirty of them would drown the
+ * registration table in the forms that are the ANSWER rather than the risk.
+ *
+ * The set is EXPLICIT so the fail-closed default has something to be closed
+ * against: `Object.groupBy`, `Object.entries`' future cousins, or anything a
+ * later ECMAScript adds is a named finding until somebody classifies it.
+ */
+const OBJECT_SILENT_MEMBERS: ReadonlySet<string> = new Set([
+  "hasOwn",
+  "getOwnPropertyDescriptor",
+  "getOwnPropertyDescriptors",
+  "defineProperty",
+  "defineProperties",
+  "freeze",
+  "isFrozen",
+  "seal",
+  "isSealed",
+  "preventExtensions",
+  "isExtensible",
+  "is",
 ]);
 
 const REFLECT_OWN_MEMBERS: ReadonlySet<string> = new Set([
@@ -303,7 +380,13 @@ function staticMemberCall(node: ts.CallExpression, objectName: string): string |
 /** The census kind of a CALL expression, or `undefined` if it is not a site. */
 function callKind(node: ts.CallExpression): AccessKind | undefined {
   const objectMember = staticMemberCall(node, "Object");
-  if (objectMember !== undefined) return OBJECT_MEMBER_KINDS.get(objectMember);
+  if (objectMember !== undefined) {
+    const kind = OBJECT_MEMBER_KINDS.get(objectMember);
+    if (kind !== undefined) return kind;
+    // FAIL CLOSED (review round 8): an `Object` member that is neither
+    // classified above nor explicitly silent becomes a NAMED finding.
+    return OBJECT_SILENT_MEMBERS.has(objectMember) ? undefined : "object-unclassified";
+  }
   const reflectMember = staticMemberCall(node, "Reflect");
   if (reflectMember !== undefined) {
     if (reflectMember === "ownKeys") return "own-enumeration";
@@ -402,6 +485,7 @@ function sitesIn(source: ts.SourceFile, repoRelative: string): AccessSite[] {
       push(node, "object-destructure");
     } else if (ts.isObjectBindingPattern(node)) push(node, "object-destructure");
     else if (ts.isForInStatement(node)) push(node, "for-in");
+    else if (ts.isWithStatement(node)) push(node, "with-statement");
     else if (ts.isSpreadAssignment(node)) push(node, "object-spread");
     else if (ts.isCallExpression(node)) {
       const kind = callKind(node);
@@ -424,6 +508,107 @@ function sitesIn(source: ts.SourceFile, repoRelative: string): AccessSite[] {
 /** Source text of a scanned file, for tests that need to read it. */
 export function readScannedFile(repoRelativePath: string): string {
   return readFileSync(resolve(REPO_ROOT, repoRelativePath), "utf8");
+}
+
+/**
+ * The COMPILER's diagnostic codes for one source TEXT — the gate behind scope
+ * item 8 (review round 8).
+ *
+ * `with (o) { … }` is the one prototype-consuming construct this census does not
+ * classify, because it is independently unavailable: TypeScript reports 1101 and
+ * 2410 for it, and {@link censusOfPrototypeAccess} throws on any SYNTACTIC
+ * diagnostic in a scanned file. A test can therefore assert the gate rather than
+ * assert a claim about it.
+ *
+ * The program is built over a virtual file so nothing is written to disk; the
+ * two diagnostic lists are returned separately because `with`'s grammar error is
+ * syntactic (the one the census refuses on) while its typing error is semantic.
+ */
+export function diagnosticsOfSourceText(
+  text: string,
+  fileName = "with-probe.ts",
+): { readonly syntactic: readonly number[]; readonly semantic: readonly number[] } {
+  const filePath = resolve(REPO_ROOT, fileName);
+  const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.ES2023, true, ts.ScriptKind.TS);
+  const options: ts.CompilerOptions = {
+    target: ts.ScriptTarget.ES2023,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    strict: true,
+    noEmit: true,
+    skipLibCheck: true,
+    noLib: true,
+  };
+  const host: ts.CompilerHost = {
+    getSourceFile: (requested) => (requested === filePath ? source : undefined),
+    writeFile: () => undefined,
+    getDefaultLibFileName: () => "lib.d.ts",
+    useCaseSensitiveFileNames: () => true,
+    getCanonicalFileName: (name) => name,
+    getCurrentDirectory: () => REPO_ROOT,
+    getNewLine: () => "\n",
+    fileExists: (requested) => requested === filePath,
+    readFile: (requested) => (requested === filePath ? text : undefined),
+  };
+  const program = ts.createProgram([filePath], options, host);
+  return {
+    syntactic: program.getSyntacticDiagnostics(source).map((diagnostic) => diagnostic.code),
+    semantic: program.getSemanticDiagnostics(source).map((diagnostic) => diagnostic.code),
+  };
+}
+
+/** One `X.safeParse(…)` call in a scanned file, with the receiver's text. */
+export interface SchemaParseSite {
+  readonly file: string;
+  readonly line: number;
+  /** The text to the left of `.safeParse` — the schema being asked. */
+  readonly receiver: string;
+  readonly enclosing: string;
+}
+
+/**
+ * Every `x.safeParse(…)` call in the product sources of both packages.
+ *
+ * THE ROUND-8 PIN. The fix for the round-8 BLOCKER is that a door asks a
+ * PARSING COPY of its schema (`schema-arena.ts`) rather than the schema itself,
+ * and "every door does that" is a property a reviewer should not have to check
+ * by reading. This resolves it from the syntax tree, so a new door — or a door
+ * that quietly goes back to the raw schema — is a failure with a file and a line.
+ */
+export function schemaParseSites(): readonly SchemaParseSite[] {
+  const sites: SchemaParseSite[] = [];
+  for (const file of scannedFiles()) {
+    const repoRelative = relative(REPO_ROOT, file).split("\\").join("/");
+    if (repoRelative.endsWith(".test.ts")) continue;
+    const source = ts.createSourceFile(
+      file,
+      readFileSync(file, "utf8"),
+      ts.ScriptTarget.ES2023,
+      true,
+      ts.ScriptKind.TS,
+    );
+    const ancestors: ts.Node[] = [];
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        (node.expression.name.text === "safeParse" || node.expression.name.text === "parse")
+      ) {
+        const { line } = source.getLineAndCharacterOfPosition(node.getStart(source));
+        sites.push({
+          file: repoRelative,
+          line: line + 1,
+          receiver: collapse(node.expression.expression.getText(source)),
+          enclosing: enclosingName(ancestors),
+        });
+      }
+      ancestors.push(node);
+      ts.forEachChild(node, visit);
+      ancestors.pop();
+    };
+    ts.forEachChild(source, visit);
+  }
+  return sites;
 }
 
 // ---------------------------------------------------------------------------

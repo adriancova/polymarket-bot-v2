@@ -14,6 +14,7 @@
  */
 
 import { parseRiskPolicy, type RiskPolicy } from "../../../packages/risk/src/index.js";
+import { ownDataDescriptor } from "../../../packages/risk/src/plain-data.js";
 
 /** Canonical lowercase UUIDv7 market ids (§7.2 / ADR-016). */
 export const MARKET_A = "01890000-0000-7000-8000-000000000001";
@@ -233,12 +234,10 @@ function zeroFilled(
   const out = { ...table };
   for (const key of keys ?? []) {
     if (Object.hasOwn(out, key)) continue;
-    Object.defineProperty(out, key, {
-      value: exposureEntry("0", "0"),
-      writable: true,
-      enumerable: true,
-      configurable: true,
-    });
+    // The DESCRIPTOR is prototype-free too (review round 8): a descriptor
+    // literal inherits, so `Object.prototype.get` alone makes every
+    // `defineProperty` in the process throw — including this fixture's.
+    Object.defineProperty(out, key, ownDataDescriptor(exposureEntry("0", "0")));
   }
   return out;
 }

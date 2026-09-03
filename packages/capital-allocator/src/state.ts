@@ -51,6 +51,7 @@ import {
   type CapitalRefusal,
   type CapitalResult,
 } from "./refusals.js";
+import { prototypeFreeParser } from "./schema-arena.js";
 
 /** Optional scope attribution for the §9.7 exposure dimensions. */
 export const ScopeAttributionSchema = z.strictObject({
@@ -200,6 +201,17 @@ function nonCanonicalIdRefusals(input: AllocatorStateInput): CapitalRefusal[] {
 }
 
 /**
+ * The door's parsing copy of {@link AllocatorStateInputSchema} (review round 8).
+ *
+ * Same validation, node for node — see `schema-arena.ts` — assembled onto
+ * containers with NO PROTOTYPE, with a parse context that has none either. An
+ * inherited SETTER can no longer be invoked while the library builds an output
+ * this door discards, and an inherited `skipChecks` can no longer turn the
+ * library's format checks into no-ops.
+ */
+const AllocatorStateInputParser = prototypeFreeParser(AllocatorStateInputSchema);
+
+/**
  * Validates and derives a frozen allocator state.
  *
  * Refuses (never repairs): schema failures, non-canonical UUID-shaped ids
@@ -229,7 +241,7 @@ export function createAllocatorState(input: unknown): CapitalResult<AllocatorSta
 function createAllocatorStateInner(input: unknown): CapitalResult<AllocatorState> {
   const read = readInputAsData(input, "state", "allocator state input");
   if (!read.ok) return capitalFailure(read.refusal);
-  const parsed = AllocatorStateInputSchema.safeParse(read.value);
+  const parsed = AllocatorStateInputParser.safeParse(read.value);
   if (!parsed.success) {
     return capitalFailure(
       capitalRefusal("CAPITAL_INPUT_INVALID", "allocator state input failed validation", {

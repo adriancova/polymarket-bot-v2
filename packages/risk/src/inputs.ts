@@ -44,6 +44,7 @@ import { ownProperty, uuidShapedNotCanonical } from "./guards.js";
 import { readPlainData } from "./plain-data.js";
 import { SCENARIO_KINDS } from "./policy.js";
 import { contained, riskRefusal, type RiskRefusal } from "./result.js";
+import { prototypeFreeParser } from "./schema-arena.js";
 
 /** Scope attribution for the §9.7 exposure dimensions (from the universe layer). */
 export const ScopeAttributionSchema = z.strictObject({
@@ -239,6 +240,17 @@ export const RiskEvaluationInputSchema = z.strictObject({
 export type RiskEvaluationInput = z.infer<typeof RiskEvaluationInputSchema>;
 
 /**
+ * The door's parsing copy of the schema above (review round 8).
+ *
+ * Same validation, node for node — see `schema-arena.ts` — but its output is
+ * assembled onto containers with NO PROTOTYPE, and its parse context has none
+ * either. The schema above stays the public, inferable one; this is the one the
+ * door asks. Built once, at module load: a schema the arena cannot copy is a
+ * build failure rather than an unprotected parse.
+ */
+const RiskEvaluationInputParser = prototypeFreeParser(RiskEvaluationInputSchema);
+
+/**
  * The REPOSITORY-INTERNAL identifiers this input carries, with their paths.
  *
  * ADR-016 §2 (2026-09-02 amendment) rules that a UUID-shaped identifier
@@ -415,6 +427,22 @@ export type RiskInputValidation =
  * wrong. The fix is not a narrower check — it is that this function no longer
  * reads the library's output at all (see the body, and proposition 5 in
  * `plain-data.ts`).
+ *
+ * AND NOT READING THAT OUTPUT WAS NOT ENOUGH (review round 8, BLOCKER).
+ * Discarding the library's output does not stop the library BUILDING it, and it
+ * builds it by ASSIGNMENT onto an ordinary object — so an inherited SETTER runs
+ * during the assembly, and a THROWING one aborted the parse. The reviewer's
+ * probe was again a valid `CANCEL` with its own `intent.reason` and a throwing
+ * `Object.prototype.reason`: `setterCalls=1, approved=false,
+ * ["RISK_INPUT_INVALID"]`, the cancel trapped before the choke point could see
+ * it. "Ignore an assembly failure and answer valid" is NOT the fix — measured,
+ * it is a FAIL-OPEN, because the library validates and assigns key by key, so
+ * the abort leaves every later key unvalidated (transcript in
+ * `schema-arena.ts`). The fix is that the assembly can no longer reach a
+ * polluted prototype: this door parses through {@link RiskEvaluationInputParser},
+ * whose containers and parse context have NO PROTOTYPE. Under a throwing or an
+ * accepting inherited setter the answer is now byte-identical to the clean one
+ * and the setter is invoked ZERO times.
  */
 export function validateEvaluationInput(input: unknown): RiskInputValidation {
   return contained(
@@ -446,7 +474,7 @@ function validateEvaluationInputInner(input: unknown): RiskInputValidation {
       ],
     };
   }
-  const parsed = RiskEvaluationInputSchema.safeParse(read.value);
+  const parsed = RiskEvaluationInputParser.safeParse(read.value);
   if (!parsed.success) {
     return {
       ok: false,

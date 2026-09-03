@@ -306,6 +306,67 @@ function ownDataValue(
 }
 
 /**
+ * A DATA DESCRIPTOR WITH NO PROTOTYPE (review round 8).
+ *
+ * WHY THE DESCRIPTOR ITSELF IS A BOUNDARY. `Object.defineProperty(o, k, { value,
+ * writable: true, … })` passes an ORDINARY OBJECT LITERAL, and the specification
+ * reads a descriptor's fields with `HasProperty` — which walks the prototype
+ * chain. So one property on `Object.prototype` changes what every descriptor in
+ * this package MEANS, and this round measured the consequence on the round-7
+ * tip, with a valid `CANCEL` and nothing else:
+ *
+ * ```text
+ * Object.prototype.get = "1000"            → evaluateIntent THREW
+ *                                             (TypeError: Getter must be a function)
+ * Object.prototype.get = () => "1000"      → evaluateIntent THREW
+ *                                             (Cannot both specify accessors and a value)
+ * Object.prototype.set = …                 → the same, both shapes
+ * ```
+ *
+ * THREW, not refused: the containment guard catches the failure and then builds
+ * a refusal, and building a refusal defines properties too — so the second
+ * attempt threw out of `evaluateIntent` itself. That is round 6's non-negotiable
+ * totality claim broken, and a trapped cancel, from a name nothing in the sweep's
+ * key material named. The descriptor is therefore built here, with NO PROTOTYPE:
+ * an absent field is absent, and no caller can add one.
+ *
+ * Every property this package defines goes through this function or
+ * {@link ownAccessorDescriptor}, so the fix is structural rather than a list of
+ * call sites.
+ */
+export function ownDataDescriptor(value: unknown): PropertyDescriptor {
+  const descriptor = Object.create(null) as PropertyDescriptor;
+  // Assignment is safe HERE and nowhere else in this module: the target has no
+  // prototype, so `Set` cannot find an inherited accessor to invoke.
+  descriptor.value = value;
+  descriptor.writable = true;
+  descriptor.enumerable = true;
+  descriptor.configurable = true;
+  return descriptor;
+}
+
+/**
+ * An ACCESSOR DESCRIPTOR WITH NO PROTOTYPE — the mirror of
+ * {@link ownDataDescriptor}, for the one place this repository defines an
+ * accessor (`schema-arena.ts`'s parse payload).
+ *
+ * The same measurement applies with the roles swapped: an inherited `value` or
+ * `writable` makes an accessor descriptor invalid, and `Object.defineProperty`
+ * answers with a `TypeError` rather than a refusal.
+ */
+export function ownAccessorDescriptor(
+  get: () => unknown,
+  set: (value: unknown) => void,
+): PropertyDescriptor {
+  const descriptor = Object.create(null) as PropertyDescriptor;
+  descriptor.get = get;
+  descriptor.set = set;
+  descriptor.enumerable = true;
+  descriptor.configurable = true;
+  return descriptor;
+}
+
+/**
  * Creates `key` on the materialized object as an OWN ENUMERABLE DATA property.
  *
  * `Object.defineProperty`, never `out[key] = value` — review round 5's first
@@ -318,14 +379,12 @@ function ownDataValue(
  * identity validation and deep immutability at once. `defineProperty` has
  * `CreateDataProperty` semantics: it defines on the object itself and consults
  * no setter, inherited or otherwise.
+ *
+ * The DESCRIPTOR is built by {@link ownDataDescriptor} rather than written as a
+ * literal here, for the reason measured there (review round 8).
  */
 function defineDataProperty(out: object, key: string, value: unknown): void {
-  Object.defineProperty(out, key, {
-    value,
-    writable: true,
-    enumerable: true,
-    configurable: true,
-  });
+  Object.defineProperty(out, key, ownDataDescriptor(value));
 }
 
 /**

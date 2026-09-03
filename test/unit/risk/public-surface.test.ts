@@ -592,6 +592,36 @@ describe("the duplicated data-record boundary cannot drift (review round 6, LOW 
     expect(allocatorShared).toBe(riskShared);
   });
 
+  /**
+   * The SECOND duplicated module, added in round 8 for the same §2.1 reason.
+   *
+   * `schema-arena.ts` is what makes a door's parse unable to reach a polluted
+   * prototype, and both packages have doors — so both need it, and neither may
+   * import the other. The drift test is the same one, on the same terms.
+   */
+  const ARENA_MARKER =
+    "// ---- shared body: byte-identical with the mirrored copy ---------------------";
+
+  it("the two parsing-arena copies are byte-identical below the shared marker", () => {
+    const riskCopy = readScannedFile("packages/risk/src/schema-arena.ts");
+    const allocatorCopy = readScannedFile("packages/capital-allocator/src/schema-arena.ts");
+    expect(riskCopy).toContain(ARENA_MARKER);
+    expect(allocatorCopy).toContain(ARENA_MARKER);
+    const riskShared = riskCopy.slice(riskCopy.indexOf(ARENA_MARKER));
+    const allocatorShared = allocatorCopy.slice(allocatorCopy.indexOf(ARENA_MARKER));
+    expect(riskShared.length).toBeGreaterThan(5000);
+    expect(allocatorShared).toBe(riskShared);
+  });
+
+  it("each parsing-arena copy carries its own package-specific header", () => {
+    const riskHeader =
+      readScannedFile("packages/risk/src/schema-arena.ts").split(ARENA_MARKER)[0] ?? "";
+    const allocatorHeader =
+      readScannedFile("packages/capital-allocator/src/schema-arena.ts").split(ARENA_MARKER)[0] ?? "";
+    expect(allocatorHeader).toContain("DUPLICATED, NOT SHARED");
+    expect(riskHeader).not.toBe(allocatorHeader);
+  });
+
   it("each copy carries its own package-specific header above the shared part", () => {
     const riskHeader = readScannedFile("packages/risk/src/plain-data.ts").split(MARKER)[0] ?? "";
     const allocatorHeader =

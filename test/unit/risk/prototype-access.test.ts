@@ -52,7 +52,9 @@ import {
   ACCESS_KINDS,
   censusOfPrototypeAccess,
   censusOfSourceText,
+  diagnosticsOfSourceText,
   scannedFiles,
+  schemaParseSites,
   type AccessKind,
   type AccessSite,
 } from "./prototype-access-scan.js";
@@ -96,6 +98,26 @@ const ENTRIES_OF_OUR_TABLE =
 /** `Object.entries` over a value a door already materialized. */
 const ENTRIES_OF_MATERIALIZED =
   "`Object.entries` is own-only but INVOKES every own getter, so it may run only on a value this package materialized. This one is a validated policy's own limits object, which came out of `readPlainData` as prototype-free own data with no accessor anywhere in it";
+
+/** `Object.create(null)` / `Object.setPrototypeOf(x, null)` — the chain REMOVED. */
+const PROTOTYPE_REMOVED =
+  "the argument is the literal `null`: this is the primitive that REMOVES the prototype chain rather than installing one, and it is how every container this package builds — a materialized record, a descriptor, the arena's assembly target — stops being able to answer a read from `Object.prototype` (review rounds 6 and 8)";
+
+/** `Object.getPrototypeOf` used to REFUSE rather than to trust. */
+const PROTOTYPE_READ_TO_REFUSE =
+  "reads the chain in order to REFUSE: the answer is compared against `Object.prototype` / `Array.prototype` / `null` and anything else is rejected as a non-plain prototype, so the read decides to say NO — it never makes an inherited value usable. Wrapped, so a throwing read is a refusal at a named path";
+
+/** `Object.getPrototypeOf` used to CLASSIFY a library-owned definition slot. */
+const PROTOTYPE_READ_TO_CLASSIFY =
+  "reads the chain to classify one slot of the schema library's own definition object: an ordinary object may be a container of schemas and is copied, anything else is carried through untouched. The value is the library's, built at module load from this repository's own declarations, and the read decides only whether to DESCEND";
+
+/** The live-micro fence's deliberate chain walk. */
+const PROTOTYPE_READ_FENCE =
+  "the live-micro fence walks the chain ON PURPOSE (review round 6, BLOCKER 1): the enforcement site reads `caps.liveMicroMaxOrderNotional` with a dotted read, which WOULD find an inherited value, so `absent` here has to mean UNREACHABLE rather than `undefined`. Every failure answers TRUE — `it might be there` is the fail-closed direction for an `AGENTS.md` floor";
+
+/** The arena's read of one slot of the library's own schema definition. */
+const READ_OF_LIBRARY_DEF =
+  "a plain read of one OWN slot of the schema library's definition object, by a name taken from `Object.getOwnPropertyNames` on the calling line. A descriptor read would be wrong here: an object schema stores its `shape` behind a memoizing GETTER, and the arena needs the shape. Nothing caller-supplied is reachable — these definitions are built at module load from this repository's own schema declarations (review round 8)";
 
 /** Destructuring a record this module built one expression earlier. */
 const DESTRUCTURE_OF_OUR_RECORD =
@@ -159,6 +181,104 @@ const REGISTERED: readonly Registration[] = [
       { file: "packages/capital-allocator/src/plain-data.ts", enclosing: "ownDataDetails", text: "Object.getOwnPropertyNames(details)" },
     ] as const
   ).map((site) => ({ ...site, kind: "own-enumeration" as const, count: 1, reason: OWN_ENUMERATION_PRIMITIVE })),
+
+  // --- the round-8 parsing arena, in both copies ----------------------------
+  ...(["risk", "capital-allocator"] as const).flatMap((packageName) => {
+    const file = `packages/${packageName}/src/schema-arena.ts`;
+    return [
+      {
+        file,
+        enclosing: "readSlot",
+        kind: "element-read" as const,
+        text: "source[name]",
+        count: 1,
+        reason: READ_OF_LIBRARY_DEF,
+      },
+      ...(
+        [
+          { enclosing: "isFreshOrdinaryContainer", text: "Object.getOwnPropertyNames(value)" },
+          { enclosing: "isFreshOrdinaryContainer", text: "Object.getOwnPropertySymbols(value)" },
+          { enclosing: "arenaContext", text: "Object.getOwnPropertyNames(given)" },
+          {
+            enclosing: "arenaSlot",
+            text: "Object.getOwnPropertyNames(value as Record<string, unknown>)",
+          },
+          { enclosing: "arenaNode", text: "Object.getOwnPropertyNames(def)" },
+        ] as const
+      ).map((site) => ({
+        ...site,
+        file,
+        kind: "own-enumeration" as const,
+        count: 1,
+        reason: OWN_ENUMERATION_PRIMITIVE,
+      })),
+      {
+        file,
+        enclosing: "arenaSlot",
+        kind: "prototype-read" as const,
+        text: "Object.getPrototypeOf(value)",
+        count: 1,
+        reason: PROTOTYPE_READ_TO_CLASSIFY,
+      },
+      {
+        file,
+        enclosing: "isFreshOrdinaryContainer",
+        kind: "prototype-read" as const,
+        text: "Object.getPrototypeOf(value)",
+        count: 2,
+        reason: `${PROTOTYPE_READ_TO_CLASSIFY} — here the question is narrower still: is this the FRESH, EMPTY ordinary container the library assigns when it starts assembling? Anything else, including a value that is already prototype-free, is left exactly as it is`,
+      },
+      {
+        file,
+        enclosing: "emptySlots",
+        kind: "prototype-write" as const,
+        text: "Object.create(null)",
+        count: 1,
+        reason: PROTOTYPE_REMOVED,
+      },
+      {
+        file,
+        enclosing: "prototypeFreeContainer",
+        kind: "prototype-write" as const,
+        text: "Object.setPrototypeOf(items, null)",
+        count: 1,
+        reason: `${PROTOTYPE_REMOVED} — the array case: an array with no prototype is still an array exotic object, so \`length\` and \`Array.isArray\` still work and \`items[i] = …\` has no chain to walk`,
+      },
+    ];
+  }),
+
+  // --- the prototype primitives in the mirrored data-record boundary --------
+  ...(["risk", "capital-allocator"] as const).flatMap((packageName) => {
+    const file = `packages/${packageName}/src/plain-data.ts`;
+    return [
+      {
+        file,
+        enclosing: "readInto",
+        kind: "prototype-read" as const,
+        text: "Object.getPrototypeOf(container)",
+        count: 1,
+        reason: PROTOTYPE_READ_TO_REFUSE,
+      },
+      ...(["emptyRecord", "ownDataDescriptor", "ownAccessorDescriptor"] as const).map(
+        (enclosing) => ({
+          file,
+          enclosing,
+          kind: "prototype-write" as const,
+          text: "Object.create(null)",
+          count: 1,
+          reason: PROTOTYPE_REMOVED,
+        }),
+      ),
+    ];
+  }),
+  {
+    file: "packages/capital-allocator/src/caps.ts",
+    enclosing: "reachableThroughPrototype",
+    kind: "prototype-read",
+    text: "Object.getPrototypeOf(current)",
+    count: 1,
+    reason: PROTOTYPE_READ_FENCE,
+  },
 
   // --- `Object.entries`, which INVOKES own getters (review round 7) ---------
   {
@@ -336,10 +456,11 @@ const REGISTERED: readonly Registration[] = [
  * diff.
  */
 const TEST_FILE_BUDGET: readonly { readonly file: string; readonly sites: number }[] = [
-  // 46 at round 6; 53 once round 7's detector also sees this file's
+  // 46 at round 6; 53 once round 7's detector also saw this file's
   // `Reflect.get`/`has`/`ownKeys`/`getOwnPropertyDescriptor` (the hostile-proxy
-  // handler) and its `Object.keys` assertions.
-  { file: "packages/capital-allocator/src/allocator.test.ts", sites: 53 },
+  // handler) and its `Object.keys` assertions; 54 once round 8's detector also
+  // sees its one `Object.getPrototypeOf` assertion (line 1130).
+  { file: "packages/capital-allocator/src/allocator.test.ts", sites: 54 },
 ];
 
 function keyOf(site: { file: string; enclosing: string; kind: string; text: string }): string {
@@ -443,6 +564,58 @@ describe("THE MECHANISM: every prototype-consulting construct is classified", ()
       if (!counted.has(file)) failures.push(`STALE BUDGET: ${file} has no sites at all`);
     }
     expect(failures).toEqual([]);
+  });
+});
+
+/**
+ * THE ROUND-8 PIN — every door asks a PARSING COPY, never the raw schema.
+ *
+ * The round-8 BLOCKER is fixed by `schema-arena.ts`: a door parses through a
+ * copy whose assembly containers and parse context have no prototype. "Every
+ * door does that" must not be a thing a reviewer checks by reading, so it is
+ * resolved from the syntax tree here: every `.safeParse(…)` / `.parse(…)` call
+ * in either package's product sources must name a registered arena parser.
+ */
+const ARENA_PARSERS: readonly { readonly file: string; readonly receiver: string }[] = [
+  { file: "packages/risk/src/inputs.ts", receiver: "RiskEvaluationInputParser" },
+  { file: "packages/risk/src/policy.ts", receiver: "RiskPolicyParser" },
+  { file: "packages/risk/src/approved-intent.ts", receiver: "ApprovedIntentRecordParser" },
+  { file: "packages/risk/src/approved-intent.ts", receiver: "ResizeRequestParser" },
+  { file: "packages/capital-allocator/src/state.ts", receiver: "AllocatorStateInputParser" },
+  { file: "packages/capital-allocator/src/reserve.ts", receiver: "ReservationRequestParser" },
+  { file: "packages/capital-allocator/src/caps.ts", receiver: "AllocatorCapsShapeParser" },
+];
+
+/** The one non-schema `parse` in either package, named so it cannot hide. */
+const NON_SCHEMA_PARSE = { file: "packages/risk/src/time.ts", receiver: "Date" } as const;
+
+describe("THE MECHANISM: every door parses through the prototype-free arena (round 8)", () => {
+  const sites = schemaParseSites();
+
+  it("is non-vacuous: it found the doors", () => {
+    expect(sites.length).toBeGreaterThanOrEqual(ARENA_PARSERS.length);
+    expect(sites.some((site) => site.file.endsWith("/inputs.ts"))).toBe(true);
+  });
+
+  it("every parse call names an arena parser (or the one audited exception)", () => {
+    const allowed = new Set(
+      [...ARENA_PARSERS, NON_SCHEMA_PARSE].map((entry) => `${entry.file}::${entry.receiver}`),
+    );
+    const failures = sites
+      .filter((site) => !allowed.has(`${site.file}::${site.receiver}`))
+      .map(
+        (site) =>
+          `RAW SCHEMA PARSE at ${site.file}:${String(site.line)} in ${site.enclosing} :: ` +
+          `${site.receiver}.safeParse(…) — a door must ask a copy built by ` +
+          "`prototypeFreeParser`, so the library's output assembly cannot reach `Object.prototype`",
+      );
+    expect(failures).toEqual([]);
+  });
+
+  it("every registered arena parser is actually used, so the list cannot rot", () => {
+    const used = new Set(sites.map((site) => `${site.file}::${site.receiver}`));
+    const stale = ARENA_PARSERS.filter((entry) => !used.has(`${entry.file}::${entry.receiver}`));
+    expect(stale).toEqual([]);
   });
 });
 
@@ -611,14 +784,109 @@ describe("THE MECHANISM: the detector sees each construct this package has been 
     });
   }
 
+  /**
+   * THE REVIEWER'S ROUND-8 MATRIX — the `Object.*` members the detector could
+   * not see, and the fail-closed default that makes the class finite.
+   *
+   * Review round 8 probed the detector directly and got NO SITES for
+   * `Object.getPrototypeOf`, `Object.setPrototypeOf` and `Object.fromEntries`,
+   * and demonstrated the consequence with a mutation: exported
+   * `getPrototypeOf`/`setPrototypeOf` calls added to a PRODUCT source passed
+   * both package typechecking and the census's "every site is registered" test.
+   * The cause was not three missing names — it was that `callKind` answered
+   * `undefined` for any `Object` member it did not recognize, so the detector
+   * failed OPEN. The last row is the fix; the first three are the symptoms.
+   */
+  const ROUND_8_MATRIX: readonly {
+    readonly shape: string;
+    readonly source: string;
+    readonly kind: AccessKind;
+  }[] = [
+    {
+      shape: "Object.getPrototypeOf(obj) — READS the chain",
+      source: "function f(o: object) { return Object.getPrototypeOf(o); }",
+      kind: "prototype-read",
+    },
+    {
+      shape: "Object.setPrototypeOf(obj, p) — INSTALLS a chain",
+      source: "function f(o: object, p: object) { return Object.setPrototypeOf(o, p); }",
+      kind: "prototype-write",
+    },
+    {
+      shape: "Object.create(p) — the same, at construction",
+      source: "function f(p: object) { return Object.create(p); }",
+      kind: "prototype-write",
+    },
+    {
+      shape: "Object.create(null) — the SAME KIND, reported so the argument is visible",
+      source: "function f() { return Object.create(null); }",
+      kind: "prototype-write",
+    },
+    {
+      shape: "Object.fromEntries(xs) — the result is an ORDINARY object",
+      source: "function f(xs: readonly [string, number][]) { return Object.fromEntries(xs); }",
+      kind: "object-from-entries",
+    },
+    {
+      shape: "an UNRECOGNIZED Object member FAILS CLOSED to a named finding",
+      // Parsed as TEXT, never type-checked: the point is that a member the
+      // tables do not name is reported rather than silently dropped.
+      source: "function f(o: object) { return Object.futureMember(o); }",
+      kind: "object-unclassified",
+    },
+    {
+      shape: "Object.groupBy — a real member neither table names today",
+      source: "function f(xs: readonly number[]) { return Object.groupBy(xs, (x) => String(x)); }",
+      kind: "object-unclassified",
+    },
+    {
+      shape: "Object.getOwnPropertySymbols(obj) — own names, no getter",
+      source: "function f(o: object) { return Object.getOwnPropertySymbols(o); }",
+      kind: "own-enumeration",
+    },
+  ];
+
+  for (const row of ROUND_8_MATRIX) {
+    it(`round 8 — detects: ${row.shape}`, () => {
+      expect(censusOfSourceText(row.source).map((site) => site.kind)).toContain(row.kind);
+    });
+  }
+
+  it("round 8 — the SILENT Object members really are silent, and are the whole list", () => {
+    // Item 2 of the scope list, exercised member by member. If one of these
+    // starts being reported, the exclusion list and the detector have drifted.
+    const silent = [
+      "Object.hasOwn(o, k)",
+      "Object.getOwnPropertyDescriptor(o, k)",
+      "Object.getOwnPropertyDescriptors(o)",
+      "Object.defineProperty(o, k, d)",
+      "Object.defineProperties(o, ds)",
+      "Object.freeze(o)",
+      "Object.isFrozen(o)",
+      "Object.seal(o)",
+      "Object.isSealed(o)",
+      "Object.preventExtensions(o)",
+      "Object.isExtensible(o)",
+      "Object.is(o, o)",
+    ];
+    for (const call of silent) {
+      expect(
+        censusOfSourceText(`function f(o: object, k: string, d: unknown, ds: unknown) { ${call}; }`),
+        call,
+      ).toEqual([]);
+    }
+  });
+
   it("every kind in the vocabulary is exercised by a probe in this file", () => {
     const probed = new Set<AccessKind>([
       ...ROUND_7_MATRIX.map((row) => row.kind),
+      ...ROUND_8_MATRIX.map((row) => row.kind),
       ...HISTORICAL.map((probe) => probe.kind),
       "delete-element",
       "object-assign",
       "computed-key",
       "object-spread",
+      "with-statement",
     ]);
     expect([...ACCESS_KINDS].filter((kind) => !probed.has(kind))).toEqual([]);
   });
@@ -649,8 +917,13 @@ describe("THE MECHANISM: the detector sees each construct this package has been 
       source: "function f(o: object) { return `${String(o)}${JSON.stringify(o)}`; }",
     },
     {
-      item: "7 — class syntax: instanceof and Object.create",
-      source: "function f(o: object) { return o instanceof Map ? Object.create(null) : o; }",
+      // Round 8 NARROWED this item: `Object.create` was excluded here and is
+      // now `prototype-write` (see the round-8 matrix), so only the class-syntax
+      // forms remain excluded.
+      item: "7 — class syntax: instanceof and super",
+      source:
+        "function f(o: object) { return o instanceof Map; }\n" +
+        "const g = { toString() { return super.toString(); } };\n",
     },
   ];
 
@@ -669,6 +942,50 @@ describe("THE MECHANISM: the detector sees each construct this package has been 
         "function caller(o: Record<string, unknown>) { return h(o, 'a'); }\n",
     );
     expect(sites.map((site) => `${site.enclosing}:${site.kind}`)).toEqual(["h:element-read"]);
+  });
+
+  /**
+   * ITEM 8 — `with`, and the gate that makes classifying it unnecessary.
+   *
+   * Review round 8 noted that `with (o) { … }` resolves every bare identifier in
+   * its body against `o`'s prototype chain, that the detector does not report
+   * it, and that the claimed-complete exclusion list did not mention it. It is
+   * now item 8, and this is the measurement behind it: TypeScript reports a
+   * SYNTACTIC diagnostic for `with`, and `censusOfPrototypeAccess` refuses to
+   * run on a file with one — so a `with` in either package cannot reach the
+   * classification stage at all.
+   */
+  it("round 8 — `with (o) { … }` is DETECTED, not argued about", () => {
+    const sites = censusOfSourceText(
+      "export function f(o: Record<string, unknown>): unknown {\n" +
+        "  with (o) { return value; }\n" +
+        "}\n",
+    );
+    expect(sites.map((site) => site.kind)).toContain("with-statement");
+    expect(sites.find((site) => site.kind === "with-statement")?.enclosing).toBe("f");
+  });
+
+  it("round 8 — and TypeScript rejects it independently, with the codes MEASURED", () => {
+    const diagnostics = diagnosticsOfSourceText(
+      "export function f(o: Record<string, unknown>): unknown {\n" +
+        "  with (o) { return value; }\n" +
+        "}\n",
+    );
+    // 1101 "`with` statements are not allowed in strict mode" and 2410 are both
+    // SEMANTIC, not syntactic — which matters, because `censusOfPrototypeAccess`
+    // only refuses on SYNTACTIC diagnostics. So the second gate is `pnpm
+    // typecheck`, not the census's own guard, and the census detects the
+    // construct itself rather than relying on either.
+    expect(diagnostics.semantic).toContain(1101);
+    expect(diagnostics.semantic).toContain(2410);
+    expect(diagnostics.syntactic).toEqual([]);
+  });
+
+  it("round 8 — the census's own guard: a SYNTACTIC diagnostic is what it refuses on", () => {
+    // `censusOfPrototypeAccess` throws when a scanned file cannot be parsed.
+    // Exercised here on the same machinery with a deliberately broken text,
+    // rather than by editing a product file.
+    expect(diagnosticsOfSourceText("export function f( {").syntactic.length).toBeGreaterThan(0);
   });
 
   it("reports the enclosing function and the line, so a failure names the site", () => {

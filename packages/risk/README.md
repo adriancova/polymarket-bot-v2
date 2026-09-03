@@ -439,6 +439,54 @@ door's schema and fails if it ever contributes a value the door does not apply.
 An inherited property may cost availability; it may never buy permission, and it
 may never trap a cancel.
 
+### 4.8 Not reading the library's output was not enough (review round 8)
+
+Round 7's rule — *a schema answers a question, it does not hand you the value* —
+was necessary and **not sufficient**. Discarding the output does not stop the
+library BUILDING it, and it builds it by ASSIGNMENT onto an object it created
+with `{}`. An ordinary object inherits from `Object.prototype`, so that
+assignment consults the prototype chain and invokes an inherited **setter**. The
+reviewer's probe, against the round-7 tip, was a valid `CANCEL` carrying its own
+`intent.reason` with a throwing setter at `Object.prototype.reason`:
+
+```text
+setterCalls=1, approved=false, codes=["RISK_INPUT_INVALID"]
+```
+
+— a cancel trapped by a failure inside an assembly nobody reads. An ACCEPTING
+setter was invoked three times across one validation and one evaluation: the
+answer survived, but a caller-supplied prototype was reading every validated
+field.
+
+**The obvious fix is a fail-open, and it was measured rather than assumed.**
+"Ignore an assembly failure and answer valid" fails because the library
+validates and assigns key by key: the abort leaves every later key unvalidated,
+so `{ a: { reason: "ok" }, b: 42 }` — invalid — comes back with no issues at all.
+
+So the assembly stops being able to reach a polluted prototype.
+`src/schema-arena.ts` builds each door a **parsing copy** of its schema: the same
+nodes, built by the library from the library's own definitions, running on a
+payload whose assembly container has **no prototype**, with a parse context that
+has none either. Under an accepting or a throwing inherited setter, on every key,
+every door now answers **byte-identically** to the clean answer and the setter is
+invoked **zero** times.
+
+The parse context matters on its own. The library reads optional switches off it
+(`ctx.skipChecks`, `ctx.direction`, `ctx.jitless`), and at the round-7 tip those
+reads walked the chain — so one non-enumerable `Object.prototype.skipChecks =
+true` turned **every format check in every door into a no-op**: an
+`evaluatedAt` of `"definitely-not-a-timestamp"` and a market id of
+`"not-a-uuid"` both validated. That was a live fail-open, found by this round and
+closed by it.
+
+Round 8 also found the same class **in this repository's own code**: a property
+descriptor written as an object literal is read through the prototype chain, so
+`Object.prototype.get` alone made every `Object.defineProperty` here a
+`TypeError` — and, because building a refusal defines properties too, it escaped
+`evaluateIntent` as an exception rather than a refusal. Every descriptor is now
+built with a `null` prototype (`ownDataDescriptor` / `ownAccessorDescriptor`),
+and every descriptor-attribute name is swept from here on.
+
 ### Staleness and exits, stated exactly
 
 | Stale or unmeasured feed | Entry | Exit / reduction | Cancel |

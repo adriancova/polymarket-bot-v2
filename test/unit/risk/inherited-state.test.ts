@@ -20,9 +20,10 @@
  * So this test does not look for sites. For every public door of both packages
  * it takes the answer, then re-takes it with `Object.prototype` carrying one
  * extra property — drawn MECHANICALLY from the names and strings that door's
- * own inputs contain, plus the composite keys these packages build — in four
- * shapes: a data string, a data object, a two-answer getter and a throwing
- * getter.
+ * own inputs contain, plus the composite keys these packages build and every
+ * property-descriptor attribute name — in six shapes: a data string, a data
+ * object, a two-answer getter, a throwing getter, an ACCEPTING SETTER and a
+ * THROWING SETTER (the last two are round 8's).
  *
  * THE PROPERTY IT ENFORCES, STATED EXACTLY. An inherited property may cost
  * AVAILABILITY; it may never buy PERMISSION, and it may never silently change
@@ -40,7 +41,12 @@
  * - for a door that runs NO schema, no inherited getter may be invoked at all.
  *   For a door that runs one, `zod`'s own compiled parser reads declared field
  *   names off objects IT creates, which this package cannot prevent; that
- *   measurement, and why it is not a hole, is recorded on {@link Scenario}.
+ *   measurement, and why it is not a hole, is recorded on {@link Scenario};
+ * - and, since round 8, NO INHERITED SETTER MAY BE INVOKED BY ANY DOOR, parsing
+ *   or not, for any key, in either setter mode. A read can be forced on this
+ *   package by a library; a WRITE of an inherited name is always somebody
+ *   assembling a value onto an ordinary object, and no door does that any more
+ *   (`schema-arena.ts`). Measured: ZERO across every scenario and key.
  *
  * WHAT ROUND 7 ADDED, AND WHY EACH WAS A BLIND SPOT:
  *
@@ -115,19 +121,38 @@ import {
 /**
  * How one extra property is put on `Object.prototype`.
  *
- * All four are NON-ENUMERABLE and CONFIGURABLE, which is the reviewer's probe
+ * All six are NON-ENUMERABLE and CONFIGURABLE, which is the reviewer's probe
  * shape: an enumerable one would break every `for…in` in the process and prove
  * nothing about this package. The two getters are the reviewer's exactly — one
  * that answers differently on a second read (the round-6 inventory probe) and
  * one that throws.
+ *
+ * THE TWO SETTER MODES ARE ROUND 8'S (the reviewer's BLOCKER). A getter is
+ * invoked when something READS a name; a SETTER is invoked when something
+ * WRITES one — and the schema library writes every validated field onto an
+ * ordinary object while assembling an output this package discards. An
+ * ACCEPTING setter measured that write happening at all (three invocations
+ * across one validation and one evaluation, at the reviewed tip); a THROWING
+ * one aborted the parse, and the valid `CANCEL` carrying its own
+ * `intent.reason` came back `RISK_INPUT_INVALID`. Both modes now run against
+ * every door, on every key, and the CANCEL scenarios additionally require a
+ * BYTE-IDENTICAL answer ({@link Scenario.identicalOrFail}).
  */
-type PollutionMode = "data-string" | "data-entry" | "two-answer-getter" | "throwing-getter";
+type PollutionMode =
+  | "data-string"
+  | "data-entry"
+  | "two-answer-getter"
+  | "throwing-getter"
+  | "accepting-setter"
+  | "throwing-setter";
 
 const POLLUTION_MODES: readonly PollutionMode[] = [
   "data-string",
   "data-entry",
   "two-answer-getter",
   "throwing-getter",
+  "accepting-setter",
+  "throwing-setter",
 ];
 
 const POISON_ENTRY = Object.freeze({
@@ -146,33 +171,95 @@ interface PollutionResult {
   readonly answer: string;
   readonly grade: "permissive" | "refusal" | "opaque";
   readonly getterCalls: number;
+  /**
+   * How many times an inherited SETTER was invoked (review round 8).
+   *
+   * Counted separately from reads because the property it supports is
+   * different and absolute: a read may be forced on this package by a library
+   * it does not control, but a WRITE of an inherited name is always somebody
+   * assembling a value onto an ordinary object — and after round 8 no door
+   * does that, for any key, in any mode. The sweep requires ZERO.
+   */
+  readonly setterCalls: number;
   readonly threw: string | undefined;
+}
+
+function pollutionDescriptor(
+  mode: PollutionMode,
+  count: () => void,
+  countWrite: () => void,
+): PropertyDescriptor {
+  switch (mode) {
+    case "data-string":
+      return { value: "1000", writable: true, enumerable: false, configurable: true };
+    case "data-entry":
+      return { value: POISON_ENTRY, writable: true, enumerable: false, configurable: true };
+    case "two-answer-getter": {
+      let reads = 0;
+      return {
+        get(): unknown {
+          count();
+          reads += 1;
+          return reads === 1 ? "1000" : "0";
+        },
+        enumerable: false,
+        configurable: true,
+      };
+    }
+    case "throwing-getter":
+      return {
+        get(): never {
+          count();
+          throw new Error("inherited-getter");
+        },
+        enumerable: false,
+        configurable: true,
+      };
+    case "accepting-setter":
+      // Round 8: a getter for anything that READS the name, and a setter that
+      // ACCEPTS — so a write is measured rather than turned into a failure. It
+      // is also the shape that shows what a polluted prototype could HARVEST.
+      return {
+        get(): unknown {
+          count();
+          return "1000";
+        },
+        set(): void {
+          countWrite();
+        },
+        enumerable: false,
+        configurable: true,
+      };
+    default:
+      // The reviewer's BLOCKER probe: a non-enumerable, configurable, THROWING
+      // setter. Nothing may write the name; everything must still answer.
+      return {
+        get(): unknown {
+          count();
+          return "1000";
+        },
+        set(): never {
+          countWrite();
+          throw new TypeError("inherited-setter");
+        },
+        enumerable: false,
+        configurable: true,
+      };
+  }
 }
 
 function withPollution(key: string, mode: PollutionMode, body: () => unknown): PollutionResult {
   let calls = 0;
-  const descriptor: PropertyDescriptor =
-    mode === "data-string"
-      ? { value: "1000", writable: true, enumerable: false, configurable: true }
-      : mode === "data-entry"
-        ? { value: POISON_ENTRY, writable: true, enumerable: false, configurable: true }
-        : mode === "two-answer-getter"
-          ? {
-              get(): unknown {
-                calls += 1;
-                return calls === 1 ? "1000" : "0";
-              },
-              enumerable: false,
-              configurable: true,
-            }
-          : {
-              get(): never {
-                calls += 1;
-                throw new Error("inherited-getter");
-              },
-              enumerable: false,
-              configurable: true,
-            };
+  let writes = 0;
+  const descriptor = pollutionDescriptor(
+    mode,
+    () => {
+      calls += 1;
+    },
+    () => {
+      writes += 1;
+    },
+  );
   Object.defineProperty(Object.prototype, key, descriptor);
   try {
     const answer = body();
@@ -180,6 +267,7 @@ function withPollution(key: string, mode: PollutionMode, body: () => unknown): P
       answer: describe_(answer),
       grade: permissiveness(answer),
       getterCalls: calls,
+      setterCalls: writes,
       threw: undefined,
     };
   } catch (error) {
@@ -187,6 +275,7 @@ function withPollution(key: string, mode: PollutionMode, body: () => unknown): P
       answer: "THREW",
       grade: "opaque",
       getterCalls: calls,
+      setterCalls: writes,
       threw: error instanceof Error ? error.message : String(error),
     };
   } finally {
@@ -280,8 +369,41 @@ const SCHEMA_DEFAULT_NAMES: readonly string[] = [
   ...ALLOCATOR_CAPS_DEFAULTS,
 ].flatMap((entry) => [...entry.path]);
 
+/**
+ * Every PROPERTY-DESCRIPTOR ATTRIBUTE name (review round 8).
+ *
+ * THE BLIND SPOT THIS CLOSES. `Object.defineProperty(o, k, { value, writable:
+ * true, … })` passes an ORDINARY OBJECT, and the specification reads a
+ * descriptor's fields with `HasProperty` — through the prototype chain. So one
+ * property on `Object.prototype` changes what every descriptor in these
+ * packages MEANS. None of these names is an input field name or a package
+ * concept, so neither the input-derived key material nor {@link INTERNAL_NAMES}
+ * had ever named them, and the round-8 probe measured the consequence on the
+ * round-7 tip with a valid `CANCEL` and nothing else:
+ *
+ * ```text
+ * Object.prototype.get = "1000"        → evaluateIntent THREW (Getter must be a function)
+ * Object.prototype.get = () => "1000"  → evaluateIntent THREW (accessors and a value)
+ * Object.prototype.set = …             → the same, both shapes
+ * ```
+ *
+ * THREW, not refused: the containment guard builds a refusal, and building one
+ * defines properties too. Both packages now build every descriptor with a `null`
+ * prototype (`plain-data.ts`, `ownDataDescriptor` / `ownAccessorDescriptor`),
+ * and these names are swept from here on so the class cannot come back.
+ */
+const DESCRIPTOR_ATTRIBUTE_NAMES: readonly string[] = [
+  "value",
+  "get",
+  "set",
+  "writable",
+  "enumerable",
+  "configurable",
+];
+
 const INTERNAL_NAMES: readonly string[] = [
   ...SCHEMA_DEFAULT_NAMES,
+  ...DESCRIPTOR_ATTRIBUTE_NAMES,
   "GLOBAL",
   "value",
   "combined",
@@ -433,6 +555,18 @@ function sweep(scenario: Scenario): string[] {
             `${scenario.name} | ${mode} on "${key}" | ANSWER CHANGED (${baselineGrade} → ${result.grade}) ${divergence(baseline, result.answer)}`,
           );
         }
+        continue;
+      }
+      if (result.setterCalls > 0) {
+        // ROUND 8, AND IT HOLDS FOR EVERY DOOR — parsing or not. An inherited
+        // setter runs only when something WRITES the name onto an ordinary
+        // object; the schema library did exactly that while assembling an
+        // output these doors discard, which is how a valid CANCEL was trapped.
+        // Each door now parses through a prototype-free arena, so the count is
+        // zero everywhere, and this asserts it rather than tolerating it.
+        failures.push(
+          `${scenario.name} | ${mode} on "${key}" | an inherited SETTER was INVOKED ${String(result.setterCalls)}×`,
+        );
         continue;
       }
       if (result.getterCalls > 0 && !scenario.parses) {
@@ -769,6 +903,28 @@ describe("THE MECHANISM: an inherited property changes no public answer", () => 
     };
     const quietFailures = sweep(quiet);
     expect(quietFailures.join("\n")).toContain("INVOKED");
+
+    // …and the round-8 rule is real too: a subject that WRITES a name onto an
+    // ordinary object invokes the inherited SETTER, and is caught even though
+    // its answer never changes. Without this, "zero setter invocations" above
+    // would be a property of a harness that cannot see one.
+    const writer: Scenario = {
+      name: "a subject that assembles its answer onto an ordinary object",
+      doors: [],
+      answer: () => {
+        const out: Record<string, unknown> = {};
+        out["marketId"] = "x";
+        return { constant: true };
+      },
+      material: { marketId: "x" },
+      parses: false,
+    };
+    const writerFailures = sweep(writer);
+    expect(writerFailures.join("\n")).toContain("SETTER was INVOKED");
+    // The throwing-setter mode of the same subject is a THROW, which is the
+    // reviewer's BLOCKER in miniature: an assembly nobody reads, aborting an
+    // answer.
+    expect(writerFailures.join("\n")).toContain("throwing-setter");
   });
 
   /**

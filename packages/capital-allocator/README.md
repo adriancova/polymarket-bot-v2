@@ -140,6 +140,17 @@ A cap configured for a scope dimension the request cannot be attributed to
 **fails closed** (`CAPITAL_SCOPE_KEY_MISSING`): an unattributable request cannot
 be proven within the cap.
 
+**And the parse that reaches the fence is prototype-free too** (review round 8).
+Every door in this package — `parseAllocatorCaps`, `createAllocatorState`,
+`evaluateReservation` — validates through a **parsing copy** of its schema
+(`src/schema-arena.ts`) whose output assembly and parse context have no
+prototype. Two measured consequences, both closed here: an inherited SETTER can
+no longer be invoked while the library assembles an output these doors discard
+(it aborted the parse when it threw), and an inherited `skipChecks` can no longer
+turn the library's own format checks into no-ops — which, at the round-7 tip,
+made a malformed decimal validate. The fence's three layers are unchanged and
+still apply in the same order.
+
 ## 3.1 Exposure snapshots: sparse, and sparse is not zero
 
 `exposureSnapshot` is sparse by construction — a scope with no positions,

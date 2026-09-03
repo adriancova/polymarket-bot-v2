@@ -45,6 +45,7 @@ import {
   type CapitalRefusal,
   type CapitalResult,
 } from "./refusals.js";
+import { prototypeFreeParser } from "./schema-arena.js";
 
 /**
  * The one permitted live-micro cap value: the exact canonical `AGENTS.md`
@@ -250,6 +251,17 @@ export const ALLOCATOR_CAPS_DEFAULTS: readonly SchemaDefault[] = Object.freeze(
 );
 
 /**
+ * The door's parsing copy of {@link AllocatorCapsShapeSchema} (review round 8).
+ *
+ * Same validation, node for node — see `schema-arena.ts` — assembled onto
+ * containers with NO PROTOTYPE, with a parse context that has none either. An
+ * inherited SETTER can no longer be invoked while the library builds an output
+ * this door discards, and an inherited `skipChecks` can no longer turn the
+ * library's format checks into no-ops.
+ */
+const AllocatorCapsShapeParser = prototypeFreeParser(AllocatorCapsShapeSchema);
+
+/**
  * Validates caller-supplied caps; refuses rather than repairing.
  *
  * The grammar is checked first so a malformed decimal reports
@@ -269,7 +281,7 @@ export function parseAllocatorCaps(input: unknown): CapitalResult<AllocatorCaps>
     () => {
       const read = readInputAsData(input, "caps", "allocator caps");
       if (!read.ok) return capitalFailure<AllocatorCaps>(read.refusal);
-      const parsed = AllocatorCapsShapeSchema.safeParse(read.value);
+      const parsed = AllocatorCapsShapeParser.safeParse(read.value);
       if (!parsed.success) {
         return capitalFailure<AllocatorCaps>(
           capitalRefusal("CAPITAL_INPUT_INVALID", "allocator caps failed validation", {

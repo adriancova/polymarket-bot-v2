@@ -62,6 +62,7 @@ import {
   type AllocatorState,
   type AppliedReservation,
 } from "./state.js";
+import { prototypeFreeParser } from "./schema-arena.js";
 
 export const ReservationRequestSchema = z.strictObject({
   reservationId: NonEmptyStringSchema,
@@ -187,6 +188,17 @@ export function evaluateReservation(
   );
 }
 
+/**
+ * The door's parsing copy of {@link ReservationRequestSchema} (review round 8).
+ *
+ * Same validation, node for node — see `schema-arena.ts` — assembled onto
+ * containers with NO PROTOTYPE, with a parse context that has none either. An
+ * inherited SETTER can no longer be invoked while the library builds an output
+ * this door discards, and an inherited `skipChecks` can no longer turn the
+ * library's format checks into no-ops.
+ */
+const ReservationRequestParser = prototypeFreeParser(ReservationRequestSchema);
+
 function evaluateReservationInner(
   state: AllocatorState,
   caps: AllocatorCaps,
@@ -194,7 +206,7 @@ function evaluateReservationInner(
 ): ReservationVerdict {
   const read = readInputAsData(request, "request", "reservation request");
   if (!read.ok) return refuseVerdict([read.refusal]);
-  const parsed = ReservationRequestSchema.safeParse(read.value);
+  const parsed = ReservationRequestParser.safeParse(read.value);
   if (!parsed.success) {
     return refuseVerdict([
       capitalRefusal("CAPITAL_INPUT_INVALID", "reservation request failed validation", {

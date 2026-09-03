@@ -35,6 +35,7 @@ import {
 import { FreshnessPolicySchema } from "./freshness.js";
 import { readPlainData, withSchemaDefaults, type SchemaDefault } from "./plain-data.js";
 import { contained, riskFailure, riskOk, riskRefusal, type RiskResult } from "./result.js";
+import { prototypeFreeParser } from "./schema-arena.js";
 
 export const SCENARIO_KINDS = ["SPOT", "VOLATILITY", "TIME", "LIQUIDITY"] as const;
 export type ScenarioKind = (typeof SCENARIO_KINDS)[number];
@@ -132,6 +133,17 @@ export const RISK_POLICY_DEFAULTS: readonly SchemaDefault[] = Object.freeze([
 ] as const);
 
 /**
+ * The door's parsing copy of {@link RiskPolicySchema} (review round 8).
+ *
+ * Same validation, node for node — see `schema-arena.ts` — assembled onto
+ * containers with NO PROTOTYPE, with a parse context that has none either. An
+ * inherited SETTER can no longer be invoked while the library builds an output
+ * this door discards, and an inherited `skipChecks` can no longer turn the
+ * library's format checks into no-ops.
+ */
+const RiskPolicyParser = prototypeFreeParser(RiskPolicySchema);
+
+/**
  * Validates a caller-supplied policy; refuses rather than repairing.
  *
  * READ AS DATA BEFORE IT IS PARSED (review round 5, BLOCKER 3). A policy is a
@@ -154,7 +166,7 @@ export function parseRiskPolicy(input: unknown): RiskResult<RiskPolicy> {
           ),
         );
       }
-      const parsed = RiskPolicySchema.safeParse(read.value);
+      const parsed = RiskPolicyParser.safeParse(read.value);
       if (!parsed.success) {
         return riskFailure<RiskPolicy>(
           riskRefusal("RISK_INPUT_INVALID", "risk policy failed validation", {

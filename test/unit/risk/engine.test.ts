@@ -1139,6 +1139,136 @@ describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
       expect(Object.hasOwn(Object.prototype, "reason")).toBe(false);
     });
   });
+
+  /**
+   * REVIEW ROUND 8, BLOCKER — an inherited SETTER may not trap a cancel either.
+   *
+   * Round 7 stopped every door READING the library's parse output. Round 8's
+   * reviewer showed that was necessary and not sufficient: discarding the output
+   * does not stop the library BUILDING it, and it builds it by ASSIGNMENT onto
+   * an ordinary object — so an inherited setter runs, and a THROWING one aborts
+   * the parse. The probe, verbatim, against the round-7 tip:
+   *
+   * ```text
+   * a valid CANCEL carrying its own `reason: "kill switch"`,
+   * with a non-enumerable configurable THROWING setter at Object.prototype.reason
+   *   → setterCalls=1, approved=false, codes=["RISK_INPUT_INVALID"]
+   * ```
+   *
+   * "Ignore an assembly failure and answer valid" is NOT the fix: the library
+   * validates and assigns key by key, so an abort leaves every LATER key
+   * unvalidated, and that answer would admit an input nobody checked (measured —
+   * see `schema-arena.ts`). The fix is that the assembly can no longer reach a
+   * polluted prototype: each door parses through a copy whose containers and
+   * parse context have none.
+   *
+   * The assertions below are the reviewer's own, in both setter modes: the
+   * answer must be BYTE-IDENTICAL to the clean one, and the setter invocation
+   * count must be reported — it is ZERO.
+   */
+  describe("an inherited SETTER never traps a valid CANCEL (round 8 BLOCKER)", () => {
+    const KEYS = [
+      "reason", // the reviewer's own probe: the CANCEL's own field
+      "marketId",
+      "type",
+      "intent",
+      "evaluatedAt",
+      "identifiers",
+      "approvedIntentId",
+    ] as const;
+
+    function withSetter<T>(
+      key: string,
+      mode: "accepting" | "throwing",
+      body: () => T,
+    ): { readonly value: T | string; readonly threw: boolean; readonly setterCalls: number } {
+      let setterCalls = 0;
+      Object.defineProperty(Object.prototype, key, {
+        get(): unknown {
+          return "INHERITED";
+        },
+        set(): void {
+          setterCalls += 1;
+          if (mode === "throwing") throw new TypeError("inherited-setter");
+        },
+        enumerable: false,
+        configurable: true,
+      });
+      try {
+        return { value: body(), threw: false, setterCalls };
+      } catch (error) {
+        return { value: `THREW ${String(error)}`, threw: true, setterCalls };
+      } finally {
+        delete (Object.prototype as Record<string, unknown>)[key];
+      }
+    }
+
+    for (const mode of ["accepting", "throwing"] as const) {
+      for (const key of KEYS) {
+        it(`is approved BYTE-IDENTICALLY under an ${mode} Object.prototype.${key}, with ZERO setter calls`, () => {
+          const input = entryInput();
+          input.intent = cancelIntent();
+          const clean = evaluateIntent(riskPolicy(), input);
+          expect(clean.approved).toBe(true);
+
+          const polluted = withSetter(key, mode, () => ({
+            validated: validateEvaluationInput(input).ok,
+            evaluation: JSON.stringify(evaluateIntent(riskPolicy(), input)),
+          }));
+
+          expect(polluted.threw).toBe(false);
+          expect(polluted.setterCalls).toBe(0);
+          expect(typeof polluted.value === "string" ? polluted.value : polluted.value.validated).toBe(
+            true,
+          );
+          expect(
+            typeof polluted.value === "string" ? polluted.value : polluted.value.evaluation,
+          ).toBe(JSON.stringify(clean));
+        });
+      }
+    }
+
+    it("the harness really does pollute: a naive assembly invokes the setter and throws", () => {
+      // Non-vacuity, in the shape of the defect itself: an ordinary object being
+      // assembled by assignment is exactly what the library was doing.
+      const accepted = withSetter("reason", "accepting", () => {
+        const out: Record<string, unknown> = {};
+        out["reason"] = "kill switch";
+        return Object.hasOwn(out, "reason");
+      });
+      expect(accepted.setterCalls).toBe(1);
+      expect(accepted.value).toBe(false); // the write never landed on the object
+
+      const thrown = withSetter("reason", "throwing", () => {
+        const out: Record<string, unknown> = {};
+        out["reason"] = "kill switch";
+        return "no throw";
+      });
+      expect(thrown.threw).toBe(true);
+      expect(thrown.setterCalls).toBe(1);
+      expect(Object.hasOwn(Object.prototype, "reason")).toBe(false);
+    });
+
+    it("a MALFORMED cancel is still refused under the same pollution (no fail-open)", () => {
+      // The other half of the BLOCKER: the fix may not buy the cancel's approval
+      // by skipping validation. A cancel whose `evaluatedAt` is not a timestamp
+      // is refused, polluted or not, and with the same code.
+      const input = entryInput();
+      input.intent = cancelIntent();
+      input.evaluatedAt = "not-a-timestamp";
+      const clean = evaluateIntent(riskPolicy(), input);
+      expect(clean.approved).toBe(false);
+      expect(codesOf(clean)).toEqual(["RISK_INPUT_INVALID"]);
+
+      for (const mode of ["accepting", "throwing"] as const) {
+        const polluted = withSetter(mode === "accepting" ? "reason" : "intent", mode, () =>
+          JSON.stringify(evaluateIntent(riskPolicy(), input)),
+        );
+        expect(polluted.threw, mode).toBe(false);
+        expect(polluted.value, mode).toBe(JSON.stringify(clean));
+      }
+    });
+  });
 });
 
 /**

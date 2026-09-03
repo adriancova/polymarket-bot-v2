@@ -118,6 +118,7 @@ import {
   type RiskResult,
 } from "./result.js";
 import { WorstCaseAssessmentSchema, type WorstCaseAssessment } from "./worst-case.js";
+import { prototypeFreeParser } from "./schema-arena.js";
 
 /** Whether a record's worst case was computed for THIS intent or inherited. */
 export type WorstCaseBasis = "EVALUATED" | "INHERITED_UPPER_BOUND";
@@ -300,6 +301,17 @@ function readRecordData(
 }
 
 /**
+ * The door's parsing copy of {@link ApprovedIntentRecordSchema} (review round 8).
+ *
+ * Same validation, node for node — see `schema-arena.ts` — assembled onto
+ * containers with NO PROTOTYPE, with a parse context that has none either. An
+ * inherited SETTER can no longer be invoked while the library builds an output
+ * this door discards, and an inherited `skipChecks` can no longer turn the
+ * library's format checks into no-ops.
+ */
+const ApprovedIntentRecordParser = prototypeFreeParser(ApprovedIntentRecordSchema);
+
+/**
  * THE SINGLE EMISSION BOUNDARY for approved-intent records.
  *
  * Every path that returns a record — `evaluateIntent`'s two arms and
@@ -337,7 +349,7 @@ export function sealApprovedIntentRecord(
       const data = readRecordData(draft, "record");
       if (!data.ok) return riskFailure<ApprovedIntentRecord>(data.refusal);
       const refusals: RiskRefusal[] = [...identityRefusalsFor(data.strings)];
-      const shape = ApprovedIntentRecordSchema.safeParse(data.value);
+      const shape = ApprovedIntentRecordParser.safeParse(data.value);
       if (!shape.success) {
         refusals.push(
           riskRefusal(
@@ -374,6 +386,17 @@ export const ResizeRequestSchema = z.strictObject({
   reason: DetailStringSchema,
 });
 export type ResizeRequest = z.infer<typeof ResizeRequestSchema>;
+
+/**
+ * The door's parsing copy of {@link ResizeRequestSchema} (review round 8).
+ *
+ * Same validation, node for node — see `schema-arena.ts` — assembled onto
+ * containers with NO PROTOTYPE, with a parse context that has none either. An
+ * inherited SETTER can no longer be invoked while the library builds an output
+ * this door discards, and an inherited `skipChecks` can no longer turn the
+ * library's format checks into no-ops.
+ */
+const ResizeRequestParser = prototypeFreeParser(ResizeRequestSchema);
 
 /** The intent shapes a risk resize can act on. */
 function resizableTargetShares(intent: Intent): string | undefined {
@@ -428,7 +451,7 @@ function resizeApprovedIntentInner(
   const requestData = readRecordData(request, "request");
   if (!requestData.ok) return riskFailure(requestData.refusal);
 
-  const parsed = ResizeRequestSchema.safeParse(requestData.value);
+  const parsed = ResizeRequestParser.safeParse(requestData.value);
   if (!parsed.success) {
     return riskFailure(
       riskRefusal("RISK_INPUT_INVALID", "resize request failed validation", {
@@ -509,7 +532,7 @@ function resizeApprovedIntentInner(
   // the intent is refused before anything is constructed. The parse OUTPUT is
   // deliberately discarded: the record is built from the values as they were
   // read, so nothing can be normalized on the way through.
-  const parsedRecord = ApprovedIntentRecordSchema.safeParse(inherited);
+  const parsedRecord = ApprovedIntentRecordParser.safeParse(inherited);
   if (!parsedRecord.success) {
     refusals.push(
       riskRefusal(
