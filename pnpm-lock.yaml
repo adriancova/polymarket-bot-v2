@@ -433,12 +433,23 @@ importers:
         version: 5.9.3
 
   packages/strategy-runtime:
+    dependencies:
+      '@polymarket-bot/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@polymarket-bot/strategy-sdk':
+        specifier: workspace:*
+        version: link:../strategy-sdk
     devDependencies:
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
 
   packages/strategy-sdk:
+    dependencies:
+      '@polymarket-bot/domain':
+        specifier: workspace:*
+        version: link:../domain
     devDependencies:
       typescript:
         specifier: ^5.9.2
