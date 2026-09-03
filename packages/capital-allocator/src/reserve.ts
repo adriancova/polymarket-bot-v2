@@ -14,11 +14,19 @@
  * independent shadow book and never touch live collateral or inventory.
  *
  * Real-order run modes (handoff §11: `EXECUTION_PROBE`, `LIVE_MICRO`, `LIVE`)
- * are additionally checked against the live-micro caps, which default to
- * exactly `"0"` (`AGENTS.md` safety defaults). With the defaults in place a
- * real-order-mode commitment with any positive notional is refused — this
- * package grants no real-order capacity unless a later, gated phase
- * explicitly configures it.
+ * are additionally checked against the live-micro caps, which are FENCED at
+ * exactly `"0"` (`AGENTS.md` non-weakenable safety defaults). A
+ * real-order-mode commitment with any positive notional is therefore refused,
+ * and this package grants no real-order capacity at all.
+ *
+ * Corrected 2026-09-02 (remediation round 1): this header previously said the
+ * caps merely "default to" `"0"` and could be raised by "a later, gated phase"
+ * configuring them. Adversarial review round 1 (HIGH) ruled that a weakening
+ * vector — a caller argument cannot raise a floor this package has no
+ * authority over. `caps.ts` now REFUSES any live-micro value other than the
+ * exact floor, and {@link evaluateReservation} re-applies that fence at the
+ * enforcement site for every run mode, so a hand-built caps object is unusable.
+ * Enabling live-micro capacity is a separate authorized work package.
  */
 
 import { addDecimal, compareDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
