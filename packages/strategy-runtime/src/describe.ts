@@ -25,6 +25,32 @@
  * operation in the language that cannot run caller code.
  */
 
+/**
+ * Normalizes a DIAGNOSTIC path or label — the `path` of a materialization, the
+ * `label` of a field snapshot — into text before anything interpolates it.
+ *
+ * Added 2026-09-03 in remediation round 4 (review round 4, MEDIUM 1). These
+ * arguments are typed `string`, so the type system stops a TypeScript caller;
+ * it stops nothing at runtime, and `materializeCheckpointableJson` accepted its
+ * `path` from any caller through the package's public API. Reproduced verbatim
+ * against the round-3 code:
+ *
+ *     materializeCheckpointableJson(1n, Symbol(...))  → threw TypeError:
+ *       Cannot convert a Symbol value to a string
+ *     path.toString() throws                          → escaped Error:
+ *       PATH_TOSTRING
+ *
+ * — because the refusal `${path}: bigint is not representable in JSON` runs
+ * `ToString` on whatever was passed. Two things were done about it: the `path`
+ * argument is no longer part of any PUBLIC signature (the exported wrappers take
+ * the value alone and the pathed forms are package-internal), and every
+ * diagnostic label is normalized here first, so even an internal caller that
+ * one day computes one cannot reopen the hole.
+ */
+export function describeLabel(label: unknown): string {
+  return typeof label === "string" ? label : describeCause(label);
+}
+
 /** Describes any thrown value as text. TOTAL: this function cannot throw. */
 export function describeCause(cause: unknown): string {
   try {

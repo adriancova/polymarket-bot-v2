@@ -31,8 +31,19 @@
  *   deep-frozen views of THAT evaluation's input. Retaining them across
  *   evaluations is a silently stale read of market data.
  * - `now` — the logical `evaluatedAt` of that evaluation; stale afterwards.
- * - `params` — the instance's frozen params, identical for the run's whole
- *   life. No hazard was found here.
+ * - `params` — the instance's params. DATED CORRECTION, 2026-09-03,
+ *   remediation round 4 (review round 4's HIGH 2): the sentence that stood here
+ *   through rounds 1–3, "the instance's frozen params, identical for the run's
+ *   whole life. No hazard was found here", was WRONG on both counts. The
+ *   runtime retained the caller's own object and merely deep-froze it, and
+ *   `Object.freeze` freezes neither a `Map`'s entries nor a getter's answers:
+ *   a producer that kept its object changed what `ctx.params()` returned after
+ *   the run had started (two runtimes with identical run identity, input and
+ *   seed produced `["MAP.9"]` and `["MAP.1"]`), and a frozen accessor object
+ *   answered five reads with five values. Params are now materialized into the
+ *   runtime's own inert copy at creation (`runtime.ts`), which is what makes
+ *   the rest of this comment's premise — that the context hands out only
+ *   runtime-owned data — true.
  * Only `rng` can perturb runtime state, but ALL of them are revoked on the
  * same discipline: a stale read should be loud, and a future capability added
  * to this object inherits the guard instead of re-opening the hole.
@@ -42,11 +53,12 @@
  * object it obtained during the callback; that object is deep-frozen plain
  * data and cannot affect runtime state or the RNG stream.
  *
- * Everything a strategy can reach from here is frozen: the views are the
- * runtime's own deep-frozen SNAPSHOT of the evaluation input (since remediation
- * round 3 the caller's objects are copied, not frozen in place — see
- * `input.ts`), params and state are frozen by the runtime before this is built,
- * and the RNG surface is a frozen draw-only facade — `snapshot`/`restore` stay
+ * Everything a strategy can reach from here is the runtime's own inert, frozen
+ * data: the views are its deep-frozen SNAPSHOT of the evaluation input (since
+ * remediation round 3 the caller's objects are copied, not frozen in place —
+ * see `input.ts`), the params are its materialized copy of the parsed
+ * configuration (round 4) and the state is its own fold, both frozen before
+ * this is built, and the RNG surface is a frozen draw-only facade — `snapshot`/`restore` stay
  * with the runtime, so a strategy can consume randomness but cannot rewind or
  * replant it.
  *

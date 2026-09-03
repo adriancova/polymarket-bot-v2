@@ -542,24 +542,64 @@ describe("the P1/P2 sweep: definition, ports and callbacks are captured once and
     }
   });
 
-  it("params that refuse to be frozen are PARAMS_NOT_FREEZABLE", () => {
-    const unfreezable = new Proxy(
+  it("params that merely refuse to be FROZEN are materialized and accepted (round 4 supersedes the round-3 refusal)", () => {
+    // Round 3 refused this as PARAMS_NOT_FREEZABLE, which was the same mistake
+    // it had just corrected for evaluation views: freezing a caller's object is
+    // not owning it. Since round 4 the params are COPIED, so a proxy whose
+    // `preventExtensions` throws is never asked to freeze — only to be read —
+    // and the run gets inert data. The caller's object is left alone.
+    const target = { edgeThreshold: "0.02" };
+    const unfreezable = new Proxy(target, {
+      preventExtensions(): boolean {
+        throw new Error("PARAMS_PREVENT_EXTENSIONS");
+      },
+    });
+    const { definition } = makeDefinition({ params: unfreezable });
+    let created: ReturnType<typeof createStrategyInstanceRuntime> | undefined;
+    expect(() => {
+      created = createStrategyInstanceRuntime(definition);
+    }).not.toThrow();
+    expect(created?.ok).toBe(true);
+    expect(Object.isFrozen(target)).toBe(false);
+    if (created?.ok !== true) {
+      return;
+    }
+    let seen: unknown;
+    // The copy is what the callback sees, and it is not the caller's object.
+    const harness = makeHarness({
+      params: unfreezable,
+      strategy: makeStrategy({
+        onFeatures: (ctx: StrategyContext): DecisionResult => {
+          seen = ctx.params();
+          return holdDecision(ctx);
+        },
+      }),
+    });
+    expect(harness.runtime.evaluate(makeInput("onFeatures")).kind).toBe("DECIDED");
+    expect(seen).toEqual({ edgeThreshold: "0.02" });
+    expect(seen).not.toBe(unfreezable);
+    expect(seen).not.toBe(target);
+    expect(Object.isFrozen(seen)).toBe(true);
+  });
+
+  it("params the runtime cannot READ are PARAMS_NOT_MATERIALIZABLE, never an escaped throw", () => {
+    const unreadable = new Proxy(
       { edgeThreshold: "0.02" },
       {
-        preventExtensions(): boolean {
-          throw new Error("PARAMS_PREVENT_EXTENSIONS");
+        get(): unknown {
+          throw new Error("PARAMS_GET_THREW");
         },
       },
     );
-    const { definition } = makeDefinition({ params: unfreezable });
+    const { definition } = makeDefinition({ params: unreadable });
     let created: ReturnType<typeof createStrategyInstanceRuntime> | undefined;
     expect(() => {
       created = createStrategyInstanceRuntime(definition);
     }).not.toThrow();
     expect(created?.ok).toBe(false);
     if (created?.ok === false) {
-      expect(created.refusal.code).toBe("PARAMS_NOT_FREEZABLE");
-      expect(created.refusal.detail).toContain("PARAMS_PREVENT_EXTENSIONS");
+      expect(created.refusal.code).toBe("PARAMS_NOT_MATERIALIZABLE");
+      expect(created.refusal.detail).toContain("PARAMS_GET_THREW");
     }
   });
 

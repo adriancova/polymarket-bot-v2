@@ -54,12 +54,54 @@ import { describeCause } from "./describe.js";
 import {
   canonicalJsonStringify,
   deepFreeze,
-  materializeCheckpointableJson,
+  materializeCheckpointableJsonAt,
 } from "./json.js";
 import { readOwnFieldsOnce } from "./read-once.js";
 import { isRngState, type RngState } from "./rng.js";
 
 export const STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION = 1;
+
+/**
+ * The last evaluation sequence a run may consume: `Number.MAX_SAFE_INTEGER - 1`
+ * = 9007199254740990.
+ *
+ * Added 2026-09-03 in remediation round 4 (review round 4's HIGH 1). Sequence
+ * numbers are IEEE-754 doubles, and above `Number.MAX_SAFE_INTEGER` the
+ * successor function stops being injective: `9007199254740991 + 1` and
+ * `9007199254740992 + 1` are the SAME value. A checkpoint carrying
+ * `checkpointSeq: Number.MAX_SAFE_INTEGER` restored an instance whose counter
+ * could no longer advance, and two ordinary DECIDED evaluations then persisted
+ * the same sequence — the reused-sequence class round 2 closed, reopened from
+ * the other end. Reproduced verbatim against the round-3 code:
+ *
+ *     created=true
+ *     sequences=[9007199254740992,9007199254740992]
+ *     checkpoints=[9007199254740992,9007199254740992]
+ *     safe=[false,false]
+ *
+ * The invariant this constant states: **every value the counter ever holds is
+ * an exact integer, and every increment is exact.** It follows that
+ * `checkpointSeq` may be at most this value (its successor, the next evaluation
+ * sequence, is then exactly `Number.MAX_SAFE_INTEGER`), and that an instance
+ * whose next sequence has reached `Number.MAX_SAFE_INTEGER` may not start
+ * another evaluation. Both bounds are enforced, not documented: a larger
+ * `checkpointSeq` is a `CHECKPOINT_SEQ_INVALID` refusal here, and an exhausted
+ * counter is an `EVALUATION_SEQ_EXHAUSTED` refusal in `runtime.ts` that is
+ * taken BEFORE the callback runs, so nothing is evaluated and no record is
+ * owed.
+ *
+ * Why the representation stays `number` (the alternative was an exact type):
+ * `checkpointSeq` and `DecisionRecord.evaluationSeq` travel in a checkpoint
+ * DOCUMENT and a decision record that the composition root serializes as JSON,
+ * and this package's own checkpointable grammar refuses `bigint` for exactly
+ * that reason ("bigint is not representable in JSON"). Making the counter a
+ * `bigint` would put the runtime in contradiction with its own boundary, and a
+ * canonical decimal STRING would change a §10.3 column mapping to buy range no
+ * run can reach: at one evaluation per millisecond, 2^53 - 1 sequences is
+ * ~285,000 years. The chosen answer is therefore a `number` plus two refusals
+ * that make exhaustion LOUD and terminal rather than silent and wrong.
+ */
+export const MAX_EVALUATION_SEQ = Number.MAX_SAFE_INTEGER - 1;
 
 /** Mirrors the storage vocabulary (`internal.instance_status`, WP-040). */
 export type InstanceStatus = "ACTIVE" | "PAUSED" | "STOPPED";
@@ -256,6 +298,20 @@ export function restoreCheckpoint(
         `${describeCause(found.checkpointSeq)}`,
     );
   }
+  if (found.checkpointSeq > MAX_EVALUATION_SEQ) {
+    // The SUCCESSOR is what this document is restored as (`checkpointSeq + 1`),
+    // so a `checkpointSeq` of `Number.MAX_SAFE_INTEGER` is refused even though
+    // it is itself a safe integer: its successor is not exactly representable,
+    // and an instance whose counter cannot advance persists two decisions under
+    // one sequence (round 4, HIGH 1).
+    return refuse(
+      "CHECKPOINT_SEQ_INVALID",
+      `checkpointSeq ${String(found.checkpointSeq)} is past the last sequence a run can ` +
+        `consume (${String(MAX_EVALUATION_SEQ)}): the next evaluation sequence would not be ` +
+        "exactly representable, so two decisions could share one sequence number — a run " +
+        "that reaches this bound is finished, and resumption is a new run (§9.6)",
+    );
+  }
   const checkpointSeq = found.checkpointSeq;
   if (!isInstanceStatus(found.status)) {
     return refuse(
@@ -269,7 +325,7 @@ export function restoreCheckpoint(
   // The lanes are MATERIALIZED before they are inspected: `isRngState` walks an
   // array, and an exotic `rngState` could answer its length one way and the
   // destructuring another. The copy is what is validated and what is returned.
-  const lanes = materializeCheckpointableJson(found.rngState, "rngState");
+  const lanes = materializeCheckpointableJsonAt(found.rngState, "rngState");
   if (!lanes.ok || !isRngState(lanes.value)) {
     return refuse(
       "CHECKPOINT_RNG_STATE_INVALID",
@@ -301,7 +357,7 @@ export function restoreCheckpoint(
   // `JSON.parse` output is inert already; it is materialized anyway because the
   // materializer is where the depth bound and the grammar live, and because the
   // COPY is what is frozen and returned.
-  const state = materializeCheckpointableJson(parsed, "state");
+  const state = materializeCheckpointableJsonAt(parsed, "state");
   if (!state.ok) {
     return refuse("CHECKPOINT_STATE_INVALID", `state is not checkpointable: ${state.problem}`);
   }
@@ -392,7 +448,7 @@ export function rebuildStateFromPatches(
     if (entry === undefined) {
       continue;
     }
-    const materialized = materializeCheckpointableJson(entry, path);
+    const materialized = materializeCheckpointableJsonAt(entry, path);
     if (!materialized.ok) {
       return {
         ok: false,

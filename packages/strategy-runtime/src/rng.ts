@@ -64,6 +64,25 @@ function seedLanes(seed: string): [number, number, number, number] {
  * The runtime-owned generator. Implements the SDK's `SeededRandom` draw
  * surface plus `snapshot`/`restore` for checkpointing — the strategy never
  * sees those two (the context hands out a frozen draw-only facade).
+ *
+ * PARTIAL BY CONTRACT, stated here because remediation round 4 derives the
+ * boundary list from the sources and every entry on it must carry an explicit
+ * totality classification (`test/unit/strategy-runtime/boundary-surface.test.ts`).
+ * Unlike the boundary functions in `json.ts`, `input.ts` and `checkpoint.ts`,
+ * this class makes no never-throws promise and has no return channel for a
+ * refusal:
+ *
+ * - `fromSeed(seed)` requires a string — the run's canonical unsigned-integer
+ *   seed, which `createStrategyInstanceRuntime` validates before calling;
+ * - `fromState(state)` and `restore(state)` require a state the caller has
+ *   validated with `isRngState` (the only internal caller passes the
+ *   MATERIALIZED lanes from `restoreCheckpoint`);
+ * - `nextIntBelow(maxExclusive)` throws `RangeError` on an out-of-range bound
+ *   DELIBERATELY: a strategy that asks for a draw below zero has a bug, and the
+ *   runtime contains the throw as `RUNTIME.CALLBACK_THREW` with exactly one
+ *   record, which is a better answer than a silently clamped draw.
+ *
+ * `isRngState` above is the total predicate that goes with these preconditions.
  */
 export class DeterministicRng {
   private a: number;

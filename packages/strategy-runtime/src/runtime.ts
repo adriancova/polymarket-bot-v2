@@ -43,8 +43,27 @@
  *   place and then re-read: freezing makes properties non-configurable but
  *   leaves getters and Proxy traps live, which produced both an escaped throw
  *   AFTER the callback had run and a silent callback/record divergence;
- * - the returned DECISION's `statePatch` is materialized (round 2);
- * - a CHECKPOINT document is snapshotted by `restoreCheckpoint` (round 3).
+ * - the returned DECISION's `statePatch` is materialized (round 2) and, since
+ *   round 4, ISOLATED from the value the domain schema walks, so the patch is
+ *   traversed exactly once and always under its own attribution;
+ * - a CHECKPOINT document is snapshotted by `restoreCheckpoint` (round 3);
+ * - the PARAMS are materialized at creation (round 4). Round 3 exempted them —
+ *   "a paramsSchema may legitimately produce a non-JSON value, and params never
+ *   enter a record or checkpoint bytes" — and review round 4 disproved the
+ *   exemption with two probes: `Object.freeze` leaves a `Map`'s entries and a
+ *   getter live, so a caller that kept its params object changed what
+ *   `ctx.params()` answered AFTER the run started, and two runtimes with the
+ *   same run identity, input and seed produced different decisions.
+ *   `ctx.params()` now answers with the runtime's own inert copy, and a params
+ *   value that cannot be copied is a typed `PARAMS_NOT_MATERIALIZABLE` refusal.
+ *
+ * SEQUENCE ARITHMETIC (round 4). `evaluationSeq` is an IEEE-754 double, so the
+ * counter is only meaningful while every increment is exact. `evaluate()`
+ * refuses before the callback once the counter reaches
+ * `MAX_EVALUATION_SEQ + 1`, and `restoreCheckpoint` refuses a document whose
+ * successor sequence would not be exactly representable. Without both, a
+ * checkpoint at `Number.MAX_SAFE_INTEGER` restored an instance that persisted
+ * two ordinary decisions under one sequence number.
  *
  * Containment (ADR-005 §3): a failed evaluation persists one RUNTIME-
  * attributed `skip` with a reserved reason code and no intents, discards
@@ -77,6 +96,7 @@ import {
 } from "@polymarket-bot/strategy-sdk";
 
 import {
+  MAX_EVALUATION_SEQ,
   restoreCheckpoint,
   STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
   type InstanceStatus,
@@ -85,7 +105,12 @@ import {
 import { buildStrategyContext, type ScopedStrategyContext } from "./context.js";
 import { describeCause } from "./describe.js";
 import { acquireEvaluationInput, type EvaluationInput } from "./input.js";
-import { canonicalJsonStringify, deepFreeze, materializeCheckpointableJson } from "./json.js";
+import {
+  canonicalJsonStringify,
+  deepFreeze,
+  materializeCheckpointableJsonAt,
+  materializeImmutableParamsAt,
+} from "./json.js";
 import type {
   ContainedFailure,
   EvaluationOutcome,
@@ -418,17 +443,44 @@ export function createStrategyInstanceRuntime(
     const errorDetail = error === undefined ? "schema rejection" : describeCause(error);
     return refuse("PARAMS_REJECTED", `params rejected by strategy.paramsSchema: ${errorDetail}`);
   }
-  const parsedParams =
-    resultFields.fields.data === undefined ? rawParams : resultFields.fields.data;
+  // The adapter result shape, made unambiguous in remediation round 4 (review
+  // round 4's MEDIUM 3). A successful result that CARRIES `data` supplies the
+  // parsed params — including when that value is `undefined`, which is what a
+  // legitimate Zod transform to `undefined` produces. A successful result with
+  // NO `data` property is the lenient adapter that validated without
+  // transforming, and the raw params it validated are used. Before this round
+  // both cases were read as "absent", so a schema that transformed the params
+  // away was ignored and the RAW caller object survived into the run:
+  //
+  //     safeParse → {success:true, data:undefined}
+  //     raw params → {raw:"should-not-survive-transform"}
+  //     ctx.params() observed the raw object
+  //
+  // `readOwnFieldsOnce` answers the presence question with one guarded
+  // `Reflect.has` per field, so telling the two apart costs no second read of
+  // the value.
+  const parsedParams = resultFields.present.data ? resultFields.fields.data : rawParams;
+
+  // Params are MATERIALIZED into the runtime's own inert copy (round 4, HIGH
+  // 2). Round 3 argued they should be guarded but not materialized, because a
+  // `paramsSchema` might legitimately produce a non-JSON value and params never
+  // reach a record or checkpoint bytes. Review round 4 disproved both halves of
+  // that with one probe: `Object.freeze` does not freeze a `Map`'s entries or
+  // make a getter inert, so two runtimes with the same run identity, input,
+  // seed and initially identical params produced DIFFERENT decisions after the
+  // caller mutated the `Map` it still held — a determinism break through the
+  // config id, and a `StrategyContext` that was not exclusively runtime-owned.
+  const materializedParams = materializeImmutableParamsAt(parsedParams, "params");
+  if (!materializedParams.ok) {
+    return refuse("PARAMS_NOT_MATERIALIZABLE", materializedParams.problem);
+  }
   let params: unknown;
   try {
-    params = deepFreeze(parsedParams);
+    params = deepFreeze(materializedParams.value);
   } catch (cause) {
-    // `deepFreeze` walks and freezes the parsed params, both of which can run
-    // caller code. Params are NOT materialized: a `paramsSchema` may legitimately
-    // produce a non-JSON value (a compiled matcher, a `Map`), they never enter a
-    // record or checkpoint bytes, and a strategy can only lie about its own
-    // configuration to itself. What is enforced is that they are freezable.
+    // A belt since round 4: what is frozen here is the copy above, which is
+    // fresh plain data. Kept because `evaluate()`'s and `create`'s "never
+    // throws" contracts may not rest on a reachability argument.
     return refuse(
       "PARAMS_NOT_FREEZABLE",
       `params could not be frozen for the run (${describeCause(cause)}); immutable ` +
@@ -559,6 +611,28 @@ class StrategyInstanceRuntime {
           detail:
             `instance is ${this.status}; the callback was not invoked and no record was ` +
             "persisted — resumption is a new run, not a runtime affordance",
+        },
+      };
+    }
+    // The sequence space is finite (round 4, HIGH 1). This check runs BEFORE
+    // anything is acquired or invoked, so an exhausted instance evaluates
+    // nothing, owes no record, and cannot silently continue: the condition is
+    // monotone in `evaluationSeq`, which only ever grows, so every subsequent
+    // call refuses identically. `MAX_EVALUATION_SEQ` is the last sequence a
+    // record may carry; reaching `MAX_EVALUATION_SEQ + 1` means the NEXT
+    // increment would not be exact, and two records under one sequence is
+    // precisely what this refuses to do.
+    if (this.evaluationSeq > MAX_EVALUATION_SEQ) {
+      return {
+        kind: "REFUSED",
+        refusal: {
+          code: "EVALUATION_SEQ_EXHAUSTED",
+          detail:
+            `the instance has consumed evaluation sequence ${String(MAX_EVALUATION_SEQ)}, the ` +
+            "last one this run can represent exactly; the callback was not invoked and no " +
+            "record was persisted — a further evaluation would have to share a sequence " +
+            "number with an existing decision, so the run is finished and resumption is a " +
+            "new run (§9.6)",
         },
       };
     }
@@ -775,12 +849,29 @@ class StrategyInstanceRuntime {
    * record that disagrees with the checkpoint it accompanies would break §6
    * invariant 8 for strategy state.
    *
-   * Attribution is per REGION (round 3): reading the returned value is
-   * `RUNTIME.DECISION_INVALID`, materializing the patch is
-   * `RUNTIME.STATE_PATCH_INVALID`. Before this round both regions were wrapped
-   * in one outer `catch` that called everything a decision problem, so a
-   * revoked-Proxy patch — a state-patch failure by any reading — was reported
-   * as `RUNTIME.DECISION_INVALID`.
+   * Attribution is per REGION (round 3), and since round 4 the regions are
+   * SEPARATED IN THE DATA rather than only in the control flow: reading the
+   * returned value is `RUNTIME.DECISION_INVALID`, and everything about the
+   * patch — reading it, traversing it, materializing it — is
+   * `RUNTIME.STATE_PATCH_INVALID`.
+   *
+   * Why the data separation was necessary (review round 4's MEDIUM 2). Round 3
+   * put the two regions in different `try` blocks but still ran
+   * `DecisionResultSchema.safeParse` over the WHOLE returned value first, and
+   * the domain schema types `statePatch` as `z.record(z.string(),
+   * z.unknown())` — a record whose own keys Zod enumerates. So a hostile patch
+   * at the TOP level was traversed inside the decision region and reported as a
+   * decision problem, while the SAME hostility one level down was reported as a
+   * patch problem:
+   *
+   *     topLevelRevoked outcome=CONTAINED reason=RUNTIME.DECISION_INVALID
+   *     nestedRevoked   outcome=CONTAINED reason=RUNTIME.STATE_PATCH_INVALID
+   *
+   * `isolateStatePatch` now lifts the raw patch out of the returned value
+   * before any schema traversal can inspect it, the schema validates the rest,
+   * and the patch is materialized afterwards under the patch attribution. The
+   * patch is read exactly ONCE on the way out, which also removes the double
+   * traversal the old order performed (Zod's record walk, then the boundary's).
    */
   private prepareDecision(
     input: EvaluationInput,
@@ -795,12 +886,23 @@ class StrategyInstanceRuntime {
       failure: { reasonCode: RUNTIME_REASON_CODES.statePatchInvalid, detail },
     });
 
+    // REGION 1 — isolate the raw statePatch. Nothing traverses it here.
+    const isolated = isolateStatePatch(returned, input.callback);
+    if (!isolated.ok) {
+      return isolated.region === "PATCH"
+        ? patchInvalid(isolated.problem)
+        : invalid(isolated.problem);
+    }
+
+    // REGION 2 — the decision WITHOUT its patch, validated by the domain schema.
     let parsed: ReturnType<typeof DecisionResultSchema.safeParse>;
     try {
-      parsed = DecisionResultSchema.safeParse(returned);
+      parsed = DecisionResultSchema.safeParse(isolated.decision);
     } catch (cause) {
       // Zod's `safeParse` catches its own errors, not a trap throw from the
-      // value being parsed.
+      // value being parsed. Unreachable for the patch since round 4 — the patch
+      // is not in the value being parsed — and still reachable for any other
+      // field the strategy made hostile, which is what this attributes.
       return invalid(
         `reading the value returned by strategy callback ${input.callback} threw ` +
           `(${describeCause(cause)}); a decision the runtime cannot read without executing ` +
@@ -827,23 +929,30 @@ class StrategyInstanceRuntime {
           "claimed by a strategy (ADR-005 §3)",
       );
     }
-    // Read once: `decision` is Zod's own output object, but its `statePatch`
-    // VALUES are the strategy's live objects (`z.unknown()` passes them
-    // through), which is why the boundary below materializes.
-    const statePatch: unknown = decision.statePatch;
-    if (statePatch === undefined) {
+    if (isolated.patch === undefined) {
       return {
         ok: true,
         prepared: { decision, state: this.state, stateJson: this.stateJson },
       };
     }
 
+    // REGION 3 — the patch, materialized into the runtime's own inert copy.
     try {
-      const materialized = materializeCheckpointableJson(statePatch, "statePatch");
+      const materialized = materializeCheckpointableJsonAt(isolated.patch, "statePatch");
       if (!materialized.ok) {
         return patchInvalid(`statePatch is not checkpointable JSON: ${materialized.problem}`);
       }
-      const patch = deepFreeze(materialized.value) as Readonly<Record<string, unknown>>;
+      const copy = materialized.value;
+      if (copy === null || typeof copy !== "object" || Array.isArray(copy)) {
+        // The shape rule the domain schema used to apply (`z.record(z.string(),
+        // …)`), applied here instead — to the inert copy, where the answer
+        // cannot change afterwards, and under the patch's own attribution.
+        return patchInvalid(
+          `statePatch must be a JSON object of string keys; the strategy returned ` +
+            `${describeCause(copy)} — state is the shallow-merge fold of these objects (§9.6)`,
+        );
+      }
+      const patch = deepFreeze(copy) as Readonly<Record<string, unknown>>;
       const state = deepFreeze({ ...this.state, ...patch });
       return {
         ok: true,
@@ -990,6 +1099,97 @@ class StrategyInstanceRuntime {
       stateJson: this.stateJson,
     };
   }
+}
+
+const STATE_PATCH_KEY = "statePatch";
+
+/**
+ * The result of lifting the raw `statePatch` out of a strategy's returned value
+ * before anything traverses it. `decision` is what the domain schema validates;
+ * `patch` is the untouched value the patch boundary will materialize.
+ */
+type IsolatedDecision =
+  | { readonly ok: true; readonly decision: unknown; readonly patch: unknown }
+  | { readonly ok: false; readonly region: "DECISION" | "PATCH"; readonly problem: string };
+
+/**
+ * Reads a returned decision's own enumerable string-keyed properties exactly
+ * ONCE and rebuilds them as plain data, holding `statePatch` aside.
+ *
+ * Two properties matter and neither is incidental:
+ *
+ * 1. **The patch is never in the object the schema walks.** `z.record` would
+ *    enumerate a top-level hostile patch inside the decision region and get it
+ *    the wrong attribution (round 4, MEDIUM 2). Attribution must not depend on
+ *    how deep inside the same field the hostility sits.
+ * 2. **Every property is read once**, so the value the schema validates is the
+ *    value the record carries — the round-3 principle applied to the one
+ *    caller-supplied object it had not reached yet. `Object.keys` is used
+ *    rather than `Reflect.ownKeys` because it is exactly what the strict object
+ *    schema itself can see, so the copy neither hides an unrecognized key nor
+ *    invents one.
+ *
+ * TOTAL: every operation on the returned value is guarded, and a failure names
+ * the region it belongs to.
+ */
+function isolateStatePatch(returned: unknown, callback: StrategyCallbackName): IsolatedDecision {
+  // `typeof` is the only operation performed before the guard, and it is the
+  // only one that cannot run caller code. A non-object cannot carry a patch;
+  // the schema below rejects it as the invalid decision it is.
+  if (typeof returned !== "object" || returned === null) {
+    return { ok: true, decision: returned, patch: undefined };
+  }
+  let keys: readonly string[];
+  try {
+    keys = Object.keys(returned);
+  } catch (cause) {
+    return {
+      ok: false,
+      region: "DECISION",
+      problem:
+        `enumerating the own keys of the value returned by strategy callback ${callback} threw ` +
+        `(${describeCause(cause)}); a decision the runtime cannot read without executing ` +
+        "strategy code is not a decision",
+    };
+  }
+  const decision: Record<string, unknown> = {};
+  let patch: unknown;
+  for (const key of keys) {
+    let value: unknown;
+    try {
+      value = (returned as Record<string, unknown>)[key];
+    } catch (cause) {
+      const isPatch = key === STATE_PATCH_KEY;
+      return {
+        ok: false,
+        region: isPatch ? "PATCH" : "DECISION",
+        problem: isPatch
+          ? `reading the statePatch returned by strategy callback ${callback} threw ` +
+            `(${describeCause(cause)})`
+          : `reading ${key} on the value returned by strategy callback ${callback} threw ` +
+            `(${describeCause(cause)}); a decision the runtime cannot read without executing ` +
+            "strategy code is not a decision",
+      };
+    }
+    if (key === STATE_PATCH_KEY) {
+      patch = value;
+      continue;
+    }
+    if (key === "__proto__") {
+      // `defineProperty`, not assignment: an own `__proto__` data property must
+      // land ON the copy (where the strict schema will refuse it as an
+      // unrecognized key) rather than silently re-parenting it.
+      Object.defineProperty(decision, key, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      continue;
+    }
+    decision[key] = value;
+  }
+  return { ok: true, decision, patch };
 }
 
 /** The one payload a callback takes beyond its context, if it takes one. */

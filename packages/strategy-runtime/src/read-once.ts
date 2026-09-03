@@ -22,12 +22,31 @@
  * throw, so `restoreCheckpoint(null as never, …)` and
  * `createStrategyInstanceRuntime({} as never)` refuse like any other malformed
  * argument.
+ *
+ * PRESENCE, added 2026-09-03 in remediation round 4 (review round 4's MEDIUM
+ * 3). A snapshot of values alone cannot distinguish a field that is ABSENT from
+ * one that is present and holds `undefined`, and `createStrategyInstanceRuntime`
+ * was reading that ambiguity the only way it could — as "absent" — which
+ * discarded a schema result that had successfully transformed the params to
+ * `undefined` and silently kept the RAW caller object instead. So each field is
+ * also probed once with a guarded `Reflect.has`, and `present[field]` answers
+ * that question without a second read of the VALUE. A hostile `has` trap is a
+ * typed problem like any other.
+ *
+ * The `label` is normalized through `describeLabel` before it is interpolated
+ * (round 4, MEDIUM 1): every call site passes a literal today, and this keeps
+ * that from being the load-bearing part of the totality claim.
  */
 
-import { describeCause } from "./describe.js";
+import { describeCause, describeLabel } from "./describe.js";
 
 export type FieldSnapshot<K extends string> =
-  | { readonly ok: true; readonly fields: Readonly<Record<K, unknown>> }
+  | {
+      readonly ok: true;
+      readonly fields: Readonly<Record<K, unknown>>;
+      /** `true` when the field EXISTS, even if its value is `undefined`. */
+      readonly present: Readonly<Record<K, boolean>>;
+    }
   | { readonly ok: false; readonly field: K; readonly problem: string };
 
 export function readOwnFieldsOnce<K extends string>(
@@ -36,23 +55,27 @@ export function readOwnFieldsOnce<K extends string>(
   fields: readonly K[],
 ): FieldSnapshot<K> {
   const snapshot = {} as Record<K, unknown>;
+  const present = {} as Record<K, boolean>;
   const readable = owner !== null && (typeof owner === "object" || typeof owner === "function");
+  const described = describeLabel(label);
   for (const field of fields) {
     if (!readable) {
       snapshot[field] = undefined;
+      present[field] = false;
       continue;
     }
     try {
+      present[field] = Reflect.has(owner as object, field);
       snapshot[field] = (owner as Record<string, unknown>)[field];
     } catch (cause) {
       return {
         ok: false,
         field,
         problem:
-          `${label}.${field} could not be read (${describeCause(cause)}) — an argument whose ` +
+          `${described}.${field} could not be read (${describeCause(cause)}) — an argument whose ` +
           "property access executes code is refused, not propagated",
       };
     }
   }
-  return { ok: true, fields: snapshot };
+  return { ok: true, fields: snapshot, present };
 }

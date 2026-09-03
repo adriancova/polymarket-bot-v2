@@ -30,6 +30,7 @@
  */
 
 import type { StrategyStateCheckpoint } from "./checkpoint.js";
+import { describeLabel } from "./describe.js";
 import type { DecisionRecord, DecisionTelemetry } from "./record.js";
 import type { ReservedRuntimeReasonCode } from "./reserved-codes.js";
 
@@ -58,7 +59,18 @@ export type EvaluationRefusalCode =
    * fails AFTER the callback ran is contained instead, with the reserved
    * `RUNTIME.CLOCK_INVALID` reason code, because the evaluation happened.
    */
-  | "CLOCK_INVALID";
+  | "CLOCK_INVALID"
+  /**
+   * The instance's evaluation-sequence counter has reached
+   * `Number.MAX_SAFE_INTEGER` and cannot advance without two decisions sharing
+   * one sequence number (remediation round 4; see `MAX_EVALUATION_SEQ` in
+   * `checkpoint.ts` for the arithmetic and for why the counter stays a
+   * `number`). The check runs BEFORE the callback, so nothing was evaluated and
+   * no record is owed; the condition is monotone, so every later `evaluate()`
+   * refuses the same way. A run that reaches it is finished: resumption is a
+   * new run, not a runtime affordance (§9.6).
+   */
+  | "EVALUATION_SEQ_EXHAUSTED";
 
 export interface EvaluationRefusal {
   readonly code: EvaluationRefusalCode;
@@ -142,8 +154,16 @@ export class StrategyContextRevokedError extends Error {
   readonly capability: StrategyContextCapability;
 
   constructor(capability: StrategyContextCapability) {
+    // `describeLabel`, not raw interpolation: this constructor is PUBLIC and
+    // its argument is interpolated, which is the same shape as review round 4's
+    // MEDIUM 1 (`new StrategyContextRevokedError(Symbol() as never)` threw
+    // `TypeError: Cannot convert a Symbol value to a string` from a class whose
+    // whole purpose is to be the typed refusal). The runtime's own call sites
+    // all pass a literal capability name; this makes that not the load-bearing
+    // part. Found by the derived boundary sweep, not by a report.
     super(
-      `StrategyContext capability ${capability} was used after its callback returned; the ` +
+      `StrategyContext capability ${describeLabel(capability)} was used after its callback ` +
+        "returned; the " +
         "context is invocation-scoped and was revoked (a post-return RNG draw would advance " +
         "a generator no checkpoint can reproduce — §12.4 determinism)",
     );
@@ -161,8 +181,30 @@ export type RuntimeCreationRefusalCode =
    * (or reading their own properties in order to freeze them) threw. Distinct
    * from `PARAMS_REJECTED`, which is the strategy's own schema saying no
    * (remediation round 3).
+   *
+   * BELT since remediation round 4: params are MATERIALIZED before they are
+   * frozen, so what `deepFreeze` now walks is the runtime's own fresh copy and
+   * cannot refuse. The code and its guard are kept because "unreachable" is a
+   * claim about today's call graph, and a `deepFreeze` that ever did throw here
+   * must still be a typed refusal rather than an escaped exception.
    */
   | "PARAMS_NOT_FREEZABLE"
+  /**
+   * The parsed params could not be read into the inert copy the runtime owns:
+   * they are (or contain) a `Map`, a `Set`, a `Date`, a class instance, a
+   * function, an accessor property, a symbol key, a cycle, or a value whose
+   * property access executes code (remediation round 4, review round 4's
+   * HIGH 2). Distinct from `PARAMS_REJECTED` (the strategy's own schema said
+   * no) and from `PARAMS_NOT_FREEZABLE` (the copy could not be frozen).
+   *
+   * The rule this enforces: §9.6 params are IMMUTABLE configuration, they are
+   * persisted as a `strategy.configs` record, and `ctx.params()` must answer
+   * the same thing for the whole life of a run. A strategy that wants a derived
+   * structure (a compiled matcher, a `Map` index) builds it from the
+   * materialized params inside `onStart` and keeps it on its own object — the
+   * runtime applies every callback with the strategy as its receiver.
+   */
+  | "PARAMS_NOT_MATERIALIZABLE"
   | "RUN_IDENTITY_INVALID"
   | "RUN_SEED_INVALID"
   | "WATCHDOG_BUDGET_INVALID"

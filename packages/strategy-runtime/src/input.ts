@@ -84,7 +84,7 @@ import {
   type VirtualPositionView,
 } from "@polymarket-bot/strategy-sdk";
 
-import { deepFreeze, materializeEvaluationView } from "./json.js";
+import { deepFreeze, materializeEvaluationViewAt } from "./json.js";
 
 export interface EvaluationViews {
   readonly market: MarketView;
@@ -155,7 +155,7 @@ function isBoundedNonEmptyString(value: unknown): value is string {
  * freezing it cannot run caller code and cannot fail.
  */
 export function acquireEvaluationInput(input: unknown): AcquireEvaluationInputResult {
-  const materialized = materializeEvaluationView(input, "input");
+  const materialized = materializeEvaluationViewAt(input, "input");
   if (!materialized.ok) {
     return {
       ok: false,
@@ -185,7 +185,7 @@ export function acquireEvaluationInput(input: unknown): AcquireEvaluationInputRe
  * unvalidated object past `evaluate()`.
  */
 export function validateEvaluationInput(input: unknown): InputValidationResult {
-  const materialized = materializeEvaluationView(input, "input");
+  const materialized = materializeEvaluationViewAt(input, "input");
   if (!materialized.ok) {
     return bad(
       `evaluation input could not be read into an inert snapshot: ${materialized.problem}`,

@@ -50,6 +50,7 @@ export type {
 } from "./record.js";
 
 export {
+  MAX_EVALUATION_SEQ,
   rebuildStateFromPatches,
   restoreCheckpoint,
   STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
@@ -77,6 +78,13 @@ export {
  * a Proxy, keep the Proxy — and after `restoreCheckpoint` was fixed to keep the
  * materialized copy, no internal caller was left to justify it. Validate by
  * materializing and keeping the returned copy.
+ *
+ * `materializeCheckpointableJson` takes the VALUE only. Its diagnostic `path`
+ * argument became package-internal in remediation round 4 (review round 4's
+ * MEDIUM 1): a caller-supplied path is not part of the value contract, and
+ * interpolating one into a refusal made a function that promises never to throw
+ * throw on `Symbol()` and on an object whose `toString` throws. The pathed
+ * forms the runtime uses internally are deliberately not re-exported.
  */
 export {
   canonicalJsonStringify,

@@ -136,13 +136,42 @@
  * API no accepted work package depends on. Callers validate by materializing
  * and keeping the copy.
  *
+ * DATED CORRECTION — 2026-09-03, remediation round 4 (review round 4's MEDIUM
+ * 1). Round 3's claim that these functions are total was still not true of one
+ * argument it never considered: the exported `materializeCheckpointableJson`
+ * took a caller-supplied DIAGNOSTIC `path`, and building a refusal interpolated
+ * it. Reproduced verbatim against the round-3 code:
+ *
+ *     materializeCheckpointableJson(1n, Symbol(...))  → threw TypeError:
+ *       Cannot convert a Symbol value to a string
+ *     path.toString() throws                          → escaped Error:
+ *       PATH_TOSTRING
+ *
+ * That argument was missing from round 3's 25-row entry-point sweep because the
+ * sweep enumerated ENTRY POINTS and their VALUES, not signatures. The `path`
+ * argument is now INTERNAL — the exported wrappers take the value alone, and
+ * the pathed forms (`materializeCheckpointableJsonAt`,
+ * `materializeEvaluationViewAt`, `materializeImmutableParamsAt`) are not
+ * re-exported from `index.ts` — and every diagnostic label is normalized
+ * through the total `describeLabel` before it is used. The boundary list is now
+ * DERIVED from the sources by
+ * `test/unit/strategy-runtime/boundary-surface.test.ts`, which reads every
+ * exported function's every parameter out of the TypeScript AST (a defaulted
+ * parameter like this one is invisible to `Function.length`, which is why a
+ * runtime enumeration would have missed it again) and fails when a new one
+ * appears unclassified.
+ *
+ * A THIRD grammar was added in the same round: `IMMUTABLE_PARAMS`, for the
+ * instance params (`runtime.ts`). See review round 4's HIGH 2 and the grammar
+ * table below.
+ *
  * Note on numbers: a checkpoint value may be a non-economic number (a counter,
  * a flag). ECONOMIC values inside strategy state must be canonical decimal
  * strings by §6 invariant 1 — that is a strategy-discipline rule reviewed with
  * the strategy (the domain deliberately types `statePatch` as opaque).
  */
 
-import { describeCause } from "./describe.js";
+import { describeCause, describeLabel } from "./describe.js";
 
 /**
  * The maximum nesting the materializing boundary accepts, in containers
@@ -241,6 +270,47 @@ const EVALUATION_VIEW: Grammar = {
 };
 
 /**
+ * The instance params (§9.6 "IMMUTABLE configuration"), added 2026-09-03 in
+ * remediation round 4 (review round 4's HIGH 2).
+ *
+ * Why params need a grammar of their own, and why they differ from the other
+ * two on exactly one axis:
+ *
+ * - like checkpointable state, ACCESSORS are refused. A getter on params is a
+ *   value that is recomputed on every read, and `ctx.params()` is read inside
+ *   callbacks: the reviewer's probe read one five times across two evaluations
+ *   and got five different answers through a `Object.isFrozen === true` object.
+ *   Refusing the accessor is what makes "the config id determines the params"
+ *   true rather than aspirational;
+ * - like evaluation views, `undefined` and non-finite numbers are ACCEPTED. A
+ *   params value never enters checkpoint bytes, a record, or a replay
+ *   comparison, so the two rules that exist to protect those bytes (`undefined`
+ *   has no JSON form; `NaN` in state is a replay divergence) buy nothing here
+ *   and would refuse a schema that legitimately leaves an optional field
+ *   `undefined`.
+ *
+ * Everything else follows from materializing: a `Map`, a `Set`, a `Date`, a
+ * class instance, a function, a `Proxy` with a non-plain prototype and a
+ * symbol-keyed or non-enumerable property are all refused by a rule that
+ * already existed, and a `Proxy` over a plain object is COPIED rather than
+ * refused — the copy is inert, so its traps can never run again.
+ */
+const IMMUTABLE_PARAMS: Grammar = {
+  acceptUndefined: true,
+  acceptNonFiniteNumbers: true,
+  acceptAccessors: false,
+  perKeyDescriptor: true,
+  maxDepth: MAX_MATERIALIZED_DEPTH,
+  exoticTail:
+    "params whose property access executes code cannot be taken into runtime ownership as " +
+    "the run's immutable configuration (§9.6)",
+  plainObjectRule:
+    "only plain objects and arrays can be taken into runtime ownership as params — a Map, a " +
+    "Set, a Date or a class instance is internally mutable or accessor-bearing, so it would " +
+    "let the caller change what ctx.params() answers after the run started",
+};
+
+/**
  * Validates a caller-supplied value against the grammar above AND returns a
  * fresh, plain, inert copy of it — one single walk, so the thing validated and
  * the thing kept are the same thing.
@@ -252,13 +322,36 @@ const EVALUATION_VIEW: Grammar = {
  * value here is read exactly ONCE and inside a guard, so a hostile or merely
  * broken value yields a stated problem rather than a throw. **Never throws** —
  * and since remediation round 3 that claim covers a revoked `Proxy`, a thrown
- * value that cannot be formatted, and arbitrarily deep ordinary data.
+ * value that cannot be formatted, and arbitrarily deep ordinary data, and since
+ * round 4 it is not qualified by a second argument either: the diagnostic path
+ * this walk reports is the runtime's own (see `ROOT_PATH` below).
  */
 export function materializeCheckpointableJson(
   value: unknown,
-  path = "$",
 ): MaterializeCheckpointableJsonResult {
-  const result = materializeWith(value, path, CHECKPOINTABLE_JSON);
+  return materializeCheckpointableJsonAt(value, ROOT_PATH);
+}
+
+/**
+ * The diagnostic path a PUBLIC materialization reports. The public functions
+ * take no path argument (round 4, MEDIUM 1): a caller-supplied path is not part
+ * of the value contract, and interpolating one is an operation on caller data
+ * inside a function that promises never to throw.
+ */
+const ROOT_PATH = "$";
+
+/**
+ * The pathed form, for the runtime's own call sites, which name the field they
+ * are materializing (`statePatch`, `rngState`, `state`, `patches[3]`). NOT
+ * re-exported from `index.ts`; the path is normalized through the total
+ * `describeLabel` regardless, so no internal caller can reopen MEDIUM 1 either.
+ * **Never throws.**
+ */
+export function materializeCheckpointableJsonAt(
+  value: unknown,
+  path: string,
+): MaterializeCheckpointableJsonResult {
+  const result = materializeWith(value, describeLabel(path), CHECKPOINTABLE_JSON);
   return result.ok ? { ok: true, value: result.value as CheckpointableJson } : result;
 }
 
@@ -270,8 +363,19 @@ export function materializeCheckpointableJson(
  * way to hand the runtime an input is `evaluate()`, which acquires this
  * snapshot itself. **Never throws.**
  */
-export function materializeEvaluationView(value: unknown, path = "$"): MaterializeResult {
-  return materializeWith(value, path, EVALUATION_VIEW);
+export function materializeEvaluationViewAt(value: unknown, path: string): MaterializeResult {
+  return materializeWith(value, describeLabel(path), EVALUATION_VIEW);
+}
+
+/**
+ * The same walk under the immutable-params grammar: the inert copy the runtime
+ * takes of the parsed params ONCE at creation, which is what `ctx.params()`
+ * answers with for the whole life of the run.
+ *
+ * Internal to the package. **Never throws.**
+ */
+export function materializeImmutableParamsAt(value: unknown, path: string): MaterializeResult {
+  return materializeWith(value, describeLabel(path), IMMUTABLE_PARAMS);
 }
 
 function fail(problem: string): { readonly ok: false; readonly problem: string } {
