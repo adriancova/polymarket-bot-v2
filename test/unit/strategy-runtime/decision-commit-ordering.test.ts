@@ -257,6 +257,24 @@ describe("a decision is never persisted before the state it depends on is final"
           ),
         }),
       },
+      // The same hostility applied at the TOP level of the patch, where Zod's
+      // record parse reads it before the boundary ever sees it.
+      {
+        name: "top-level post-freeze proxy",
+        patch: () => postFreezeProxy().proxy as Record<string, unknown>,
+      },
+      {
+        name: "top-level throwing proxy",
+        patch: () =>
+          new Proxy(
+            { a: 1 },
+            {
+              get(): unknown {
+                throw new Error("TOP_LEVEL_GET");
+              },
+            },
+          ) as Record<string, unknown>,
+      },
       { name: "function value", patch: () => ({ fn: (): number => 1 }) },
       { name: "date value", patch: () => ({ when: new Date(0) }) },
       { name: "self-referential patch", patch: selfReferentialPatch },
