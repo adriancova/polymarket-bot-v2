@@ -39,6 +39,8 @@ import {
   capitalFailure,
   capitalOk,
   capitalRefusal,
+  contained,
+  readInputAsData,
   type CapitalRefusal,
   type CapitalResult,
 } from "./refusals.js";
@@ -135,19 +137,40 @@ export type AllocatorCaps = z.infer<typeof AllocatorCapsSchema>;
  * `CAPITAL_INPUT_INVALID`, then the live-micro fence is applied separately so
  * a raised safety floor reports its own `CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED`
  * rather than hiding inside a generic schema failure.
+ *
+ * READ AS DATA BEFORE IT IS PARSED (review round 5, BLOCKER 3). This was the
+ * reported site: a valid-SHAPED object whose `globalAccountCap` was a throwing
+ * getter made this function THROW instead of refusing, because `zod` reads the
+ * property. THE FENCE ORDER IS UNCHANGED, and deliberately so — the read is a
+ * well-formedness check that runs before the grammar, and the live-micro fence
+ * still runs after the grammar and still reports its own code.
  */
 export function parseAllocatorCaps(input: unknown): CapitalResult<AllocatorCaps> {
-  const parsed = AllocatorCapsShapeSchema.safeParse(input);
-  if (!parsed.success) {
-    return capitalFailure(
-      capitalRefusal("CAPITAL_INPUT_INVALID", "allocator caps failed validation", {
-        issues: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`),
-      }),
-    );
-  }
-  const fence = liveMicroCapRefusals(parsed.data);
-  if (fence.length > 0) {
-    return capitalFailure(...fence);
-  }
-  return capitalOk(Object.freeze(parsed.data));
+  return contained(
+    () => {
+      const read = readInputAsData(input, "caps", "allocator caps");
+      if (!read.ok) return capitalFailure<AllocatorCaps>(read.refusal);
+      const parsed = AllocatorCapsShapeSchema.safeParse(read.value);
+      if (!parsed.success) {
+        return capitalFailure<AllocatorCaps>(
+          capitalRefusal("CAPITAL_INPUT_INVALID", "allocator caps failed validation", {
+            issues: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`),
+          }),
+        );
+      }
+      const fence = liveMicroCapRefusals(parsed.data);
+      if (fence.length > 0) {
+        return capitalFailure<AllocatorCaps>(...fence);
+      }
+      return capitalOk(Object.freeze(parsed.data));
+    },
+    (thrown) =>
+      capitalFailure(
+        capitalRefusal(
+          "CAPITAL_INPUT_INVALID",
+          "validating the allocator caps failed unexpectedly; caps that cannot be validated cannot be shown to respect the AGENTS.md live-micro floors (fail closed)",
+          { thrown },
+        ),
+      ),
+  );
 }

@@ -272,16 +272,14 @@ at it, and both boundaries use only that snapshot — for identity validation, f
 arithmetic, and as the value that is emitted:
 
 - values come from property **descriptors**, so a getter is refused without ever
-  being invoked. No caller code runs inside the boundary;
+  being invoked;
 - a **non-plain prototype** is refused: an inherited property is state the
   container does not own, and `Object.freeze` cannot reach it;
 - a **non-enumerable data property is read**, not rejected — hiding a field does
   not remove it — so it is checked like any other and comes back as a
   `RISK_UUID_NOT_CANONICAL` refusal naming its exact path;
 - functions, symbols, symbol-keyed properties, cycles, sparse arrays and
-  excessive nesting are typed refusals. Every reflective operation is wrapped,
-  so a hostile `Proxy` cannot make this package throw where it contracts a typed
-  result;
+  excessive nesting are typed refusals;
 - `ApprovedIntentRecordSchema` states the record's **complete runtime shape**, so
   `resizeApprovedIntent`'s `record` argument — typed by TypeScript, parsed by
   nothing until now — is parsed in full before it is computed on.
@@ -289,9 +287,70 @@ arithmetic, and as the value that is emitted:
 Two properties follow by construction rather than by argument: what any walk can
 see IS what the record carries, and an emitted record is a fresh, deeply frozen
 tree that shares no object with the caller — so no later edit of theirs can
-reach inside it. Pinned by `test/unit/risk/engine.test.ts`, describe block *"the
-data-record boundary — a caller's object is not a record"*, whose oracles walk
-descriptors and prototype chains instead of repeating the product's primitive.
+reach inside it.
+
+**Adversarial review round 5 corrected two sentences this section used to make**,
+and the corrections are the substance of §4.5.
+
+1. It said "**No caller code runs inside the boundary**", flat. False for a
+   `Proxy`: every reflective operation on one runs a trap, so a nested proxy in
+   an otherwise valid record was ACCEPTED after nine trap invocations.
+2. It said a hostile `Proxy` "cannot make this package throw". Also false: an
+   array proxy whose `length` answered with a throwing `@@toPrimitive` escaped
+   through the code that **built the refusal**, so the public
+   `resizeApprovedIntent` threw.
+
+### 4.5 What the boundary claims after round 5, and what it rests on
+
+The single absolute is replaced by three propositions, each testable
+separately. `src/plain-data.ts` states them at length; in short:
+
+1. **No code carried by the inspected value is invoked** — no getter, setter,
+   `Proxy` trap, `@@toPrimitive` or `toString`. Three mechanisms: descriptor
+   reads; a `Proxy` refused *before* any reflective operation by
+   `util.types.isProxy`, which is a V8-level predicate that consults no trap
+   (portable JavaScript has no such predicate — any portable probe already runs
+   a trap); and `Object.defineProperty` for every property of the materialized
+   tree, so no *inherited* setter runs either. **What it assumes:** that the
+   intrinsics are genuine. A process that has replaced `Object`, `Reflect` or
+   `util.types` has already lost, and no boundary inside it can help — a
+   different threat model from "a caller handed us a hostile value".
+2. **Totality is unconditional.** No public function of this package throws for
+   any input, whatever proposition 1 assumes: reflective operations are
+   wrapped, refusal text never coerces a caller-derived value, and every public
+   entry point carries an outer containment guard (`contained` in
+   `src/result.ts`). The cost is stated there: a genuine bug becomes a typed
+   refusal rather than a crash.
+3. **The output is plain own frozen data whatever the input did** — a fresh
+   tree built one `defineProperty` at a time, sharing no object with the
+   argument.
+
+Two more round-5 corrections, both narrowings rather than repairs:
+
+- **`__proto__` is refused as a property name.** Materializing it as an honest
+  own data property is necessary but not sufficient: `zod`'s `strictObject` is
+  blind to exactly this one key — it reports every other unrecognized name and
+  silently drops this one (measured; the transcript is in `src/plain-data.ts`).
+  A field a strict schema cannot report is a field this package cannot promise
+  to refuse, so the name is refused at the read instead.
+- **"Exactly one traversal primitive" was too broad.** What is true is that the
+  ADR-016 §2 **identity check** traverses nothing of its own — it consumes the
+  read's string inventory. `deepFreeze` (`src/guards.ts`) and the
+  `Object.entries` in `src/exposure-limits.ts` are traversals too; both run on
+  values already materialized or schema-validated, and `deepFreeze` is now
+  descriptor-based for the same reason the read is.
+- **Keyed tables use `ownEntry`/`Object.defineProperty`, never `table[key]`.**
+  A scope key is a `CodeString`, so `"constructor"` is admissible input, and
+  `table["constructor"]` answers the `Object` constructor rather than
+  `undefined` — which would have read as a *measured* scope carrying no
+  numbers, bypassing `RISK_EXPOSURE_ENTRY_MISSING` (§5, "Check 15 — capacity
+  limits"; review round 1, BLOCKER 2) and feeding `undefined` to decimal
+  arithmetic.
+
+Pinned by `test/unit/risk/engine.test.ts`, describe blocks *"the data-record
+boundary — a caller's object is not a record"* (round 4) and *"a hostile value
+at the boundary — review round 5"*, and by the audited-built-in test in
+`test/unit/risk/freshness.test.ts`.
 
 ### Staleness and exits, stated exactly
 
@@ -530,8 +589,24 @@ it, and adding one would be F13. Two consequences, both deliberate:
   a workspace package and declares no edge) to assert they still agree.
 
 Small helpers duplicated for the same reason, each with its own tests:
-`deepFreeze` / `uuidShapedNotCanonical` (from `packages/capital-allocator`) and
+`deepFreeze` / `uuidShapedNotCanonical` / `ownEntry` (shared with
+`packages/capital-allocator`), the whole of `src/plain-data.ts` (round 5 — the
+allocator needed the same door in front of its own schemas), and
 `instantMilliseconds` (from `packages/settlement`) — the WP-110 precedent.
+
+**One Node built-in is imported, and it is audited.** `src/plain-data.ts` holds
+`import { types } from "node:util";` and uses it only as `types.isProxy` (§4.5,
+proposition 1). Layer 1 has no import allowlist —
+`docs/contracts/dependency-direction.md` §2 states one only for layer 0, §3 F15
+binds `packages/decimal`, and the §3 F14 purity rule binds `packages/domain`,
+`packages/strategies/**`, `packages/ledger` and `packages/simulation`, none of
+which is this package. `pnpm check:deps` passes unchanged (34 packages, 30
+edges) and the import adds no workspace edge. On the substance: a type predicate
+opens no connection, reads no clock, touches no filesystem and consumes no
+entropy, so §9's claims below are unaffected. The line is pinned character for
+character, and its permitted use restricted to `isProxy`, by
+`test/unit/risk/freshness.test.ts` — which otherwise still refuses every `node:`
+import in both packages.
 
 ## 9. Safety
 

@@ -14,6 +14,8 @@
  * full vocabulary is documented in this package's `README.md`.
  */
 
+import { describeValue, readPlainData } from "./plain-data.js";
+
 /** Why an allocator construction, reservation, or transition was refused. */
 export type CapitalRefusalCode =
   // --- input validation -----------------------------------------------------
@@ -172,4 +174,63 @@ export function capitalFailure<T>(
   ...refusals: readonly CapitalRefusal[]
 ): CapitalResult<T> {
   return { ok: false, refusals: Object.freeze([...refusals]) };
+}
+
+/**
+ * THE OUTER CONTAINMENT GUARD (review round 5, BLOCKER 3).
+ *
+ * Every public entry point of this package promises a typed result, and review
+ * round 5 showed one that did not keep the promise: `parseAllocatorCaps` on a
+ * valid-SHAPED object whose `globalAccountCap` was a throwing getter threw
+ * `Error("caps-getter")` out of the call, because `zod` reads properties and a
+ * getter is caller code.
+ *
+ * The site fix is to read the input as data before parsing it
+ * (`plain-data.ts`). This is the structural half: whatever happens inside,
+ * the caller gets a refusal. `onThrow` supplies its shape, since this package
+ * has both `CapitalResult` and the `ReservationVerdict` arms.
+ *
+ * The refusal carries only the thrown value's TYPE, never its message and never
+ * a coercion of it — reading `.message` off a caller-supplied thrown object is
+ * one more place caller code can run. A genuine bug in this package therefore
+ * becomes a typed refusal rather than a crash: a real loss of signal, accepted
+ * because commitment accounting gates order placement, and a caller who
+ * receives an exception where the contract promises a refusal has no defined
+ * behaviour at all.
+ */
+export function contained<T>(body: () => T, onThrow: (thrown: string) => T): T {
+  try {
+    return body();
+  } catch (error) {
+    return onThrow(describeValue(error));
+  }
+}
+
+/**
+ * Reads a caller-supplied `unknown` into plain own data, or refuses.
+ *
+ * THE DOOR IN FRONT OF EVERY SCHEMA in this package (review round 5, BLOCKER
+ * 3). `safeParse` is a validator, not a safe way to LOOK at a caller's object:
+ * it reads properties, so a getter runs and a `Proxy` trap runs. `readPlainData`
+ * takes the value apart with descriptors, refuses what is not data, and hands
+ * the schema a materialized snapshot instead of the caller's object.
+ *
+ * `what` names the value in the refusal message ("allocator caps"), and `path`
+ * roots the per-problem paths ("caps.globalAccountCap: an accessor property…").
+ */
+export function readInputAsData(
+  value: unknown,
+  path: string,
+  what: string,
+): { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly refusal: CapitalRefusal } {
+  const read = readPlainData(value, path);
+  if (read.ok) return { ok: true, value: read.value };
+  return {
+    ok: false,
+    refusal: capitalRefusal(
+      "CAPITAL_INPUT_INVALID",
+      `the ${what} is not a data record: an input is a finite tree of plain own data, so hidden, inherited, computed or unreadable state is refused rather than inspected (fail closed)`,
+      { issues: read.problems.map((problem) => `${problem.path}: ${problem.problem}`) },
+    ),
+  };
 }

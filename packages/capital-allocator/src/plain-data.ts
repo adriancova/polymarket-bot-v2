@@ -1,127 +1,27 @@
 /**
- * THE DATA-RECORD BOUNDARY — adversarial review rounds 4 and 5.
+ * THE DATA-RECORD BOUNDARY — adversarial review round 5, BLOCKER 3.
  *
- * WHY THIS MODULE EXISTS. Round 3 replaced a list of identity fields with a
- * WALK over the record about to be emitted. Round 4 found the walk's
- * ENUMERATION PRIMITIVE had become the new list: `Object.entries` sees only
- * enumerable, own, string-keyed properties, so three shapes slipped past it —
- * a non-enumerable property, a property on the object's PROTOTYPE, and an
- * accessor (which `Object.entries` does not skip but INVOKES, so a throwing
- * getter escaped a function whose whole contract is a typed result). Worse, the
- * property test walked the same way, so it could never see what the product
- * missed.
+ * DUPLICATED, NOT SHARED, from `@polymarket-bot/risk`'s `src/plain-data.ts`.
+ * The `guards.ts` precedent in this same package applies verbatim: sharing a
+ * module between two layer-1 packages needs a same-layer edge that
+ * `docs/contracts/dependency-direction.md` §2.1 does not list, and this
+ * remediation may not widen a frozen contract to make its own life easier. The
+ * two copies are byte-identical below the header, each has its own tests, and
+ * `docs/handoffs/WP-180.md` records the duplication so a future contract owner
+ * can collapse them with one §2.1 row.
  *
- * The lesson generalizes past any particular primitive: a JavaScript object is
- * not the same thing as a data record. It can hide state behind enumerability,
- * inherit it, compute it on read, change it between two reads, or throw when
- * asked. So this package stops treating caller-supplied objects as records.
- * {@link readPlainData} READS a value into a record — a fresh tree of plain
- * objects, arrays and primitives, every property an own, enumerable, data
- * property — or refuses with the reason and the path. Everything downstream
- * (identity validation, arithmetic, emission) then operates on that tree, where
- * "what a walk can see" and "what the value carries" are the same set.
+ * WHY THIS PACKAGE NEEDS IT. `parseAllocatorCaps`, `createAllocatorState` and
+ * the reservation entry points all take a caller-supplied `unknown` and hand it
+ * straight to `safeParse`. `zod` READS properties, so a caller's getter runs
+ * inside the parse — review round 5 threw `Error("caps-getter")` straight out
+ * of `parseAllocatorCaps` from a valid-SHAPED object whose `globalAccountCap`
+ * was an accessor. A function whose contract is a typed refusal must not have
+ * an exception as one of its answers, and the fix is the same one the risk
+ * package landed: read the value into plain own data first, and let the schema
+ * see only that.
  *
- * WHAT IT REFUSES, AND WHY EACH IS NOT RECORD DATA:
- *
- * - a `Proxy`, refused FIRST, before any other operation touches it (see the
- *   claim below). A `Proxy` is not a value; it is a program that answers
- *   questions about a value, and it may answer differently each time, omit a
- *   property, describe one it does not have, or throw;
- * - a NON-PLAIN PROTOTYPE (anything but `Object.prototype`, `Array.prototype`
- *   or `null`). An inherited property is state the container does not own, and
- *   `Object.freeze` cannot freeze it: the round-4 probe froze a record and then
- *   changed the value it reported by editing the prototype afterwards. Refusing
- *   the shape outright is what makes "the emitted record is deeply immutable"
- *   true rather than approximately true;
- * - an ACCESSOR property. A getter is code, not data. It may throw, may return
- *   a different value on the next call (the validate-then-emit TOCTOU), and may
- *   have side effects. This module never invokes one: values are taken from
- *   property DESCRIPTORS, so a hostile getter is refused without ever running;
- * - a FUNCTION, SYMBOL or BIGINT value, and a SYMBOL-KEYED property. None can
- *   be a field of a persisted record; dropping them silently is the failure
- *   mode this whole review chain is about;
- * - a property named `__proto__` ({@link FORBIDDEN_KEY}) — the one name a
- *   `strictObject` in this repository provably cannot report as unrecognized,
- *   with the measurement recorded at that constant;
- * - a CYCLE, a SPARSE array, and nesting deeper than {@link MAX_DEPTH}. A
- *   record is a finite tree.
- *
- * WHAT IT DOES NOT REFUSE: a NON-ENUMERABLE own data property is READ, not
- * rejected. Hiding a field from enumeration does not make it disappear from the
- * value, so materializing it (as an ordinary own enumerable property) is what
- * lets the identity rules see it — the round-4 probe's uppercase market id
- * comes back as a `RISK_UUID_NOT_CANONICAL` refusal naming its exact path,
- * which is a better answer than a shape refusal.
- *
- * ---------------------------------------------------------------------------
- * THE CLAIM THIS MODULE MAKES, AND EXACTLY WHAT IT RESTS ON (round 5)
- * ---------------------------------------------------------------------------
- *
- * Round 4 wrote, without qualification, that "no caller code runs inside the
- * boundary at all". Review round 5 falsified it: a `Proxy` is caller code
- * wearing the shape of data, and `Object.getPrototypeOf`, `Reflect.ownKeys` and
- * `Object.getOwnPropertyDescriptor` all invoke its traps. A nested `Proxy` in an
- * otherwise valid record was accepted after NINE trap invocations; a trap could
- * omit a property or describe one that is not there; a trap result carrying
- * getters ran four of them inside `Object.getOwnPropertyDescriptor` itself; and
- * an array `Proxy` whose `length` answered with a throwing `@@toPrimitive`
- * turned the refusal-construction site into an escape hatch for an exception.
- *
- * The claim is now stated as three separate propositions, in decreasing order
- * of how much they rest on:
- *
- * 1. **NO CODE CARRIED BY THE INSPECTED VALUE IS INVOKED HERE.** No getter, no
- *    setter, no `Proxy` trap, no `@@toPrimitive`, no `toString`. Three
- *    mechanisms, all necessary:
- *    - values come from property DESCRIPTORS, never from a property read, so a
- *      getter is refused rather than run;
- *    - a `Proxy` is refused by {@link isProxyValue} BEFORE any reflective
- *      operation reaches it. **Portable JavaScript cannot do this**: every
- *      reflective operation on a `Proxy` runs a trap, so a portable check
- *      already IS the thing it is trying to avoid. `node:util`'s `types.isProxy`
- *      is a V8-level type predicate that consults no trap, and this package may
- *      import it (see {@link isProxyValue});
- *    - properties of the materialized tree are created with
- *      `Object.defineProperty` — `CreateDataProperty` semantics — so no
- *      INHERITED setter runs either. Round 5's first BLOCKER was exactly this:
- *      `out[key] = value` for `key = "__proto__"` invoked
- *      `Object.prototype.__proto__`'s setter, which set the emitted object's
- *      prototype instead of creating a field on it.
- *
- *    What proposition 1 does NOT cover, stated so it is not another absolute:
- *    it assumes the intrinsics are genuine — that `Object`, `Reflect`,
- *    `Array.prototype` and `util.types` have not been replaced process-wide. A
- *    process in which they have been replaced has already lost, and no boundary
- *    inside it can help. It is a different threat model from "a caller handed us
- *    a hostile value", which is the one this module answers.
- *
- * 2. **TOTALITY IS UNCONDITIONAL.** Nothing here throws, for any input,
- *    whatever proposition 1 assumes. Every reflective operation is wrapped and
- *    turns into a refusal at a named path; refusal text is built with
- *    {@link describeValue}, which never coerces a caller-derived value; and the
- *    public entry points of this package carry an outer containment guard, so a
- *    contract that promises a typed result keeps it even if an assumption above
- *    is wrong.
- *
- * 3. **THE OUTPUT IS PLAIN OWN FROZEN DATA, WHATEVER THE INPUT DID.** The value
- *    returned is a fresh tree this module built one `defineProperty` at a time
- *    from primitives it had already classified. It is not the caller's object,
- *    it shares no object with it, and no post-return edit the caller can make —
- *    to a prototype, to a getter, to a trap — reaches it.
- *
- * IT REPORTS THE STRINGS IT READ. The read yields an inventory of every string
- * it materialized, with the path and the property names on the way down. The
- * package's ADR-016 §2 identity rules consume that inventory instead of walking
- * again, so IDENTITY VALIDATION performs no traversal of its own and cannot be
- * blind in a different way than the read.
- *
- * (Round 4 wrote that more broadly — "exactly ONE traversal primitive in the
- * emission path". Review round 5 correctly narrowed it: `deepFreeze` in
- * `guards.ts` and the `Object.entries` in `exposure-limits.ts` are also
- * traversals. Both now run only on values this module has already materialized
- * or that a schema has already validated, and `deepFreeze` is descriptor-based
- * for the same reason this module is — but the honest claim is about identity
- * traversal, not about the package.)
+ * Everything below — including the round-5 claim and its stated assumptions —
+ * is the risk package's text, kept verbatim so the two copies can be diffed.
  */
 
 import { types } from "node:util";

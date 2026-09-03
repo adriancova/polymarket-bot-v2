@@ -218,13 +218,27 @@ export interface ExposureMeasuringFixture {
   resolutionWindowKeys?: readonly string[];
 }
 
+/**
+ * OWN test, OWN definition (review round 5). `out[key] ??= …` reads through the
+ * prototype chain, so a scope key of `"constructor"` — an admissible
+ * `CodeString` — found `Object` and skipped the write, and the fixture then
+ * silently failed to MEASURE a scope it said it measured. The product had the
+ * same defect at `packages/capital-allocator/src/exposure.ts`; this fixture is
+ * the mirror of `exposureSnapshotCovering`, so it carries the mirror fix.
+ */
 function zeroFilled(
   table: Record<string, ExposureEntryFixture>,
   keys: readonly string[] | undefined,
 ): Record<string, ExposureEntryFixture> {
   const out = { ...table };
   for (const key of keys ?? []) {
-    out[key] ??= exposureEntry("0", "0");
+    if (Object.hasOwn(out, key)) continue;
+    Object.defineProperty(out, key, {
+      value: exposureEntry("0", "0"),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
   }
   return out;
 }

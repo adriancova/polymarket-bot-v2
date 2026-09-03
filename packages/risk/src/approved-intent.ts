@@ -54,10 +54,10 @@
  *
  * The fix is not a better walk; it is refusing to treat a caller-supplied
  * object as a record at all. Both boundaries below now begin by READING their
- * argument into plain own data ({@link readPlainData}, descriptor-based, never
- * invoking caller code) and then use ONLY that snapshot — for identity
- * validation, for arithmetic, and as the value that is emitted. Two properties
- * follow by construction rather than by argument:
+ * argument into plain own data ({@link readPlainData}, descriptor-based) and
+ * then use ONLY that snapshot — for identity validation, for arithmetic, and as
+ * the value that is emitted. Two properties follow by construction rather than
+ * by argument:
  *
  * - what any walk can see IS what the record carries, because a materialized
  *   record has no hidden, inherited, or computed state left to see;
@@ -68,6 +68,24 @@
  * {@link ApprovedIntentRecordSchema} then states the record's complete runtime
  * shape, so "this is an approved-intent record" is checked rather than assumed
  * of a `record` argument that TypeScript alone cannot police.
+ *
+ * ROUND 5 CORRECTED TWO CLAIMS THIS HEADER USED TO MAKE.
+ *
+ * 1. It said the read "never invok[es] caller code", flatly. That was false for
+ *    a `Proxy`: every reflective operation on one runs a trap, so the read ran
+ *    nine of a caller's traps on a nested proxy and accepted the record. The
+ *    boundary now refuses a `Proxy` before touching it, by a trap-free
+ *    predicate, and `plain-data.ts` states the resulting claim with its
+ *    assumptions attached instead of as an absolute.
+ * 2. It said the package had "exactly one traversal primitive". Also false:
+ *    `deepFreeze` and `exposure-limits.ts` traverse too. What is true is the
+ *    thing that matters here — the ADR-016 §2 IDENTITY check walks nothing of
+ *    its own; it consumes the inventory the read produced.
+ *
+ * TOTALITY IS NOW STRUCTURAL. Both public functions below run inside
+ * {@link contained}, so an exception cannot leave a function whose contract is a
+ * typed result — however wrong an assumption above turns out to be. Three
+ * rounds running, the escape was a site nobody had thought of.
  */
 
 import { absDecimal, compareDecimal } from "@polymarket-bot/decimal";
@@ -91,7 +109,14 @@ import {
   IncidentActionRecommendationSchema,
   type IncidentActionRecommendation,
 } from "./recommendations.js";
-import { riskFailure, riskOk, riskRefusal, type RiskRefusal, type RiskResult } from "./result.js";
+import {
+  contained,
+  riskFailure,
+  riskOk,
+  riskRefusal,
+  type RiskRefusal,
+  type RiskResult,
+} from "./result.js";
 import { WorstCaseAssessmentSchema, type WorstCaseAssessment } from "./worst-case.js";
 
 /** Whether a record's worst case was computed for THIS intent or inherited. */
@@ -230,10 +255,16 @@ const NON_IDENTITY_KEYS: ReadonlySet<string> = new Set([
  * ADR-016 §2 refusals for the identity-bearing strings of a materialized value.
  *
  * TAKES THE INVENTORY {@link readPlainData} PRODUCED, and does not enumerate
- * anything itself. That is the round-4 correction in one line: this package now
- * has exactly one traversal primitive, it is descriptor-based, and it runs
- * before any value is trusted — so there is no second walk to be blind in a
- * different way, and no way to check one view of an object and emit another.
+ * anything itself. That is the round-4 correction in one line: IDENTITY
+ * VALIDATION performs no traversal of its own, so there is no second walk to be
+ * blind in a different way, and no way to check one view of an object and emit
+ * another.
+ *
+ * (Round 4 stated this as "this package now has exactly one traversal
+ * primitive". Review round 5 falsified that — `deepFreeze` in `guards.ts` and
+ * the `Object.entries` in `exposure-limits.ts` are traversals too, both over
+ * values that have already been materialized or schema-validated. The claim is
+ * narrowed to what it was always really about: the identity walk.)
  */
 function identityRefusalsFor(strings: readonly PlainDataString[]): readonly RiskRefusal[] {
   return identityRefusals(
@@ -301,25 +332,37 @@ function readRecordData(
 export function sealApprovedIntentRecord(
   draft: ApprovedIntentRecord,
 ): RiskResult<ApprovedIntentRecord> {
-  const data = readRecordData(draft, "record");
-  if (!data.ok) return riskFailure(data.refusal);
-  const refusals: RiskRefusal[] = [...identityRefusalsFor(data.strings)];
-  const shape = ApprovedIntentRecordSchema.safeParse(data.value);
-  if (!shape.success) {
-    refusals.push(
-      riskRefusal(
-        "RISK_INPUT_INVALID",
-        "the record being emitted does not satisfy the approved-intent record contract (fail closed)",
-        {
-          issues: shape.error.issues.map(
-            (issue) => `record.${issue.path.join(".")}: ${issue.message}`,
+  return contained(
+    () => {
+      const data = readRecordData(draft, "record");
+      if (!data.ok) return riskFailure<ApprovedIntentRecord>(data.refusal);
+      const refusals: RiskRefusal[] = [...identityRefusalsFor(data.strings)];
+      const shape = ApprovedIntentRecordSchema.safeParse(data.value);
+      if (!shape.success) {
+        refusals.push(
+          riskRefusal(
+            "RISK_INPUT_INVALID",
+            "the record being emitted does not satisfy the approved-intent record contract (fail closed)",
+            {
+              issues: shape.error.issues.map(
+                (issue) => `record.${issue.path.join(".")}: ${issue.message}`,
+              ),
+            },
           ),
-        },
+        );
+      }
+      if (refusals.length > 0) return riskFailure<ApprovedIntentRecord>(...refusals);
+      return riskOk(deepFreeze(data.value as ApprovedIntentRecord));
+    },
+    (thrown) =>
+      riskFailure(
+        riskRefusal(
+          "RISK_INPUT_INVALID",
+          "sealing the approved-intent record failed unexpectedly; a record that cannot be sealed is not emitted (fail closed)",
+          { thrown },
+        ),
       ),
-    );
-  }
-  if (refusals.length > 0) return riskFailure(...refusals);
-  return riskOk(deepFreeze(data.value as ApprovedIntentRecord));
+  );
 }
 
 export const ResizeRequestSchema = z.strictObject({
@@ -358,7 +401,34 @@ export function resizeApprovedIntent(
   record: ApprovedIntentRecord,
   request: unknown,
 ): RiskResult<ApprovedIntentRecord> {
-  const parsed = ResizeRequestSchema.safeParse(request);
+  return contained(
+    () => resizeApprovedIntentInner(record, request),
+    (thrown) =>
+      riskFailure(
+        riskRefusal(
+          "RISK_INPUT_INVALID",
+          "the resize failed unexpectedly; a resize that cannot be computed does not produce a record (fail closed)",
+          { thrown },
+        ),
+      ),
+  );
+}
+
+function resizeApprovedIntentInner(
+  record: ApprovedIntentRecord,
+  request: unknown,
+): RiskResult<ApprovedIntentRecord> {
+  // --- THE REQUEST IS READ AS DATA BEFORE IT IS PARSED (review round 5) -----
+  //
+  // `request` is a caller-supplied `unknown`, and `safeParse` READS it — so a
+  // throwing getter on `reason` or `newTargetShares` escaped this function as
+  // an exception rather than becoming a refusal. Round 4 already read the
+  // request, but read the zod OUTPUT, which is downstream of the very property
+  // reads that were the problem. The read now comes first.
+  const requestData = readRecordData(request, "request");
+  if (!requestData.ok) return riskFailure(requestData.refusal);
+
+  const parsed = ResizeRequestSchema.safeParse(requestData.value);
   if (!parsed.success) {
     return riskFailure(
       riskRefusal("RISK_INPUT_INVALID", "resize request failed validation", {
@@ -387,13 +457,11 @@ export function resizeApprovedIntent(
   // reads `inherited` rather than `record`. That is what closes the class: the
   // value this function validates, computes on, and copies into the new record
   // is one immutable snapshot, taken once, with nothing hidden behind
-  // enumerability, a prototype, or a getter. `request` is already the output of
-  // a zod parse, and goes through the same door so that no value in this
+  // enumerability, a prototype, a getter, or a `Proxy` trap. `request` goes
+  // through the same door ABOVE the schema (round 5), so that no value in this
   // function has been trusted on the strength of where it came from.
   const inheritedData = readRecordData(record, "record");
   if (!inheritedData.ok) return riskFailure(inheritedData.refusal);
-  const requestData = readRecordData(req, "request");
-  if (!requestData.ok) return riskFailure(requestData.refusal);
   // A `record` that is not an object at all reads cleanly AS DATA (`null` and
   // `"x"` are data), so the read cannot be what rejects it — and every line
   // below dereferences it. Round 4 found the unguarded version threw a

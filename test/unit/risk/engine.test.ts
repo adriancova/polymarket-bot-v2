@@ -21,11 +21,15 @@ import {
   RISK_REASON_CODE_COUNT,
   evaluateIntent,
   isRiskReasonCode,
+  parseRiskPolicy,
   resizeApprovedIntent,
   type ApprovedIntentRecord,
   type RiskPolicy,
   type RiskReasonCode,
 } from "../../../packages/risk/src/index.js";
+// The data-record boundary is INTERNAL (round 3's stance on new public surface
+// stands), so the one case that must observe it directly imports the module.
+import { readPlainData } from "../../../packages/risk/src/plain-data.js";
 import {
   FIXTURE_MEASURING,
   MARKET_A,
@@ -1976,6 +1980,525 @@ describe("the data-record boundary — a caller's object is not a record", () =>
     expect(
       codes(resizeApprovedIntent(sparse as unknown as ApprovedIntentRecord, REQUEST)),
     ).toContain("RISK_INPUT_INVALID");
+  });
+});
+
+/**
+ * A HOSTILE VALUE AT THE BOUNDARY — review round 5.
+ *
+ * FINDINGS. Round 4's boundary claimed, flatly, that "no caller code runs inside
+ * the boundary". Round 5 falsified it three ways, and found the materializer
+ * itself creating the wrong kind of property:
+ *
+ * - `out[key] = value` for `key === "__proto__"` invoked `Object.prototype`'s
+ *   inherited SETTER, so the value became the emitted object's PROTOTYPE and no
+ *   own property was created. `sealApprovedIntentRecord` returned
+ *   `ok=true, plainPrototype=false, prototypeFrozen=false`, and adding an
+ *   uppercase UUID `marketId` to that prototype AFTER the call changed what the
+ *   "validated, frozen" record reported;
+ * - a `Proxy` is caller code wearing the shape of data. A plain-looking one was
+ *   ACCEPTED after its traps ran (nine invocations for a nested one); a trap
+ *   result carrying getters ran four of them inside
+ *   `Object.getOwnPropertyDescriptor` itself; and an array `Proxy` whose
+ *   `length` answered with a throwing `@@toPrimitive` escaped through
+ *   `String(reported)` while the REFUSAL was being built, so the public
+ *   `resizeApprovedIntent` threw;
+ * - the public input doors handed caller objects straight to `zod`, which reads
+ *   properties — so a valid `CANCEL` representation with a throwing
+ *   `identifiers` getter THREW instead of refusing, and never reached the §6
+ *   invariant 13 choke point at all.
+ *
+ * WHAT THE FIX CLAIMS, AND WHAT IT DOES NOT. `plain-data.ts` states three
+ * separate propositions rather than one absolute: no code carried by the
+ * inspected value is invoked (descriptors, plus a trap-free `Proxy` predicate,
+ * plus `Object.defineProperty`); totality is unconditional (an outer containment
+ * guard); and the OUTPUT is plain own frozen data whatever the input did. The
+ * cases below are written against those three, not against the old absolute.
+ */
+describe("a hostile value at the boundary — review round 5", () => {
+  const NON_CANONICAL = "01890000-0000-7000-8000-0000000000AB";
+  const CANONICAL = "01890000-0000-7000-8000-0000000000ab";
+
+  const REQUEST = {
+    approvedIntentId: CANONICAL,
+    resizedAt: "2026-09-03T12:00:01.000Z",
+    newTargetShares: "50",
+    reason: "shrink",
+  };
+
+  function handBuilt(): ApprovedIntentRecord {
+    const input = entryInput();
+    input.intent = positionIntent({ tags: ["alpha"] });
+    const result = evaluateIntent(riskPolicy(), input);
+    if (!result.approved) throw new Error(`fixture not approved: ${codesOf(result).join(",")}`);
+    return structuredClone(result.record) as ApprovedIntentRecord;
+  }
+
+  function lot(record: ApprovedIntentRecord): Record<string, unknown> {
+    return (record.worstCase.perMarket as unknown as Record<string, unknown>[])[0] as Record<
+      string,
+      unknown
+    >;
+  }
+
+  function codes(result: ReturnType<typeof resizeApprovedIntent>): string[] {
+    return result.ok ? [] : result.refusals.map((refusal) => refusal.code);
+  }
+
+  /** Trap counter that also proves the handler was reachable at all. */
+  function countingProxy<T extends object>(
+    target: T,
+    counts: { value: number },
+  ): { proxy: T; handler: ProxyHandler<T> } {
+    const bump = <R>(compute: () => R): R => {
+      counts.value += 1;
+      return compute();
+    };
+    const handler: ProxyHandler<T> = {
+      getPrototypeOf: (t) => bump(() => Reflect.getPrototypeOf(t)),
+      ownKeys: (t) => bump(() => Reflect.ownKeys(t)),
+      getOwnPropertyDescriptor: (t, k) => bump(() => Reflect.getOwnPropertyDescriptor(t, k)),
+      get: (t, k, r) => bump(() => Reflect.get(t, k, r) as unknown),
+      has: (t, k) => bump(() => Reflect.has(t, k)),
+      isExtensible: (t) => bump(() => Reflect.isExtensible(t)),
+      preventExtensions: (t) => bump(() => Reflect.preventExtensions(t)),
+      defineProperty: (t, k, d) => bump(() => Reflect.defineProperty(t, k, d)),
+    };
+    return { proxy: new Proxy(target, handler), handler };
+  }
+
+  it("REVIEWER'S PROBE (round 5a): a non-enumerable own `__proto__` never becomes a prototype", () => {
+    const record = handBuilt() as unknown as Record<string, unknown>;
+    Object.defineProperty(record, "__proto__", {
+      value: {},
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+
+    const resized = resizeApprovedIntent(record as unknown as ApprovedIntentRecord, REQUEST);
+
+    // Refused, and refused BY NAME — the reviewer's draft was accepted with
+    // `plainPrototype:false`, which is what let a post-return prototype edit
+    // change a "frozen" record.
+    expect(resized.ok).toBe(false);
+    expect(codes(resized)).toContain("RISK_INPUT_INVALID");
+    expect(JSON.stringify(resized)).toContain("__proto__");
+    // And `Object.prototype` itself is untouched: nothing was written through
+    // the inherited setter on the way.
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+  });
+
+  it("materialization uses CreateDataProperty semantics — no INHERITED setter is ever invoked", () => {
+    // `__proto__` is refused as a NAME (the next case), which would leave the
+    // `Object.defineProperty` half of round 5's BLOCKER 1 unobservable — a fix
+    // no test can distinguish is a fix nobody is holding. So this case tests
+    // the PROPERTY rather than the one key that exposed it: with an inherited
+    // setter installed for an ordinary field name, `out[key] = value` invokes
+    // it and creates NO own property, while `Object.defineProperty` does not
+    // consult it at all.
+    //
+    // The intrinsic is restored in `finally`, and nothing else runs inside the
+    // window.
+    const record = handBuilt();
+    let setterInvoked = 0;
+    let read: ReturnType<typeof readPlainData> | undefined;
+    let resized: ReturnType<typeof resizeApprovedIntent> | undefined;
+    Object.defineProperty(Object.prototype, "marketId", {
+      set() {
+        setterInvoked += 1;
+      },
+      get() {
+        return undefined;
+      },
+      configurable: true,
+    });
+    let invokedByTheMaterializer = -1;
+    try {
+      read = readPlainData({ marketId: MARKET_A, lot: { marketId: MARKET_B } }, "value");
+      invokedByTheMaterializer = setterInvoked;
+      resized = resizeApprovedIntent(record, REQUEST);
+    } finally {
+      delete (Object.prototype as unknown as Record<string, unknown>)["marketId"];
+    }
+
+    // THE UNIT ASSERTION. With `out[key] = value`, the inherited setter would
+    // have swallowed both fields and neither own property would exist.
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    const materialized = read.value as Record<string, unknown>;
+    expect(Object.hasOwn(materialized, "marketId")).toBe(true);
+    expect(materialized["marketId"]).toBe(MARKET_A);
+    expect(Object.hasOwn(materialized["lot"] as object, "marketId")).toBe(true);
+    // The materializer invoked NOTHING. (The end-to-end count is deliberately
+    // not asserted: `zod` builds its parse output with assignment, so it does
+    // touch the setter. That output is discarded — nothing this package emits
+    // comes from it — but the honest scope for this assertion is the
+    // materializer, which is what round 5's BLOCKER 1 was about.)
+    expect(invokedByTheMaterializer).toBe(0);
+
+    // …and end to end the emitted record still carries the real value, which is
+    // what the setter would otherwise have erased.
+    expect(resized?.ok).toBe(true);
+    if (resized === undefined || !resized.ok) return;
+    expect(resized.value.worstCase.perMarket[0]?.marketId).toBe(MARKET_A);
+  });
+
+  it("root and nested `__proto__`, `constructor` and `prototype` are refused, never emitted", () => {
+    for (const key of ["__proto__", "constructor", "prototype"]) {
+      for (const nested of [false, true]) {
+        for (const enumerable of [false, true]) {
+          const record = handBuilt();
+          const target = nested
+            ? lot(record)
+            : (record as unknown as Record<string, unknown>);
+          Object.defineProperty(target, key, {
+            value: NON_CANONICAL,
+            enumerable,
+            writable: true,
+            configurable: true,
+          });
+
+          const resized = resizeApprovedIntent(record, REQUEST);
+          const where = `${key}${nested ? " (nested)" : " (root)"}${enumerable ? "" : " hidden"}`;
+          expect(resized.ok, where).toBe(false);
+          // Either shape refusal or identity refusal is acceptable; what is not
+          // acceptable is emission, an exception, or a silent drop.
+          expect(codes(resized).length, where).toBeGreaterThan(0);
+        }
+      }
+    }
+    // Non-vacuity, and the intrinsic is clean: 12 hostile cases and nothing
+    // leaked onto `Object.prototype`.
+    expect(Object.hasOwn(Object.prototype, "marketId")).toBe(false);
+    expect(({} as Record<string, unknown>)["marketId"]).toBeUndefined();
+  });
+
+  it("an emitted record is plain own frozen data, and no post-return edit reaches it", () => {
+    const caller = handBuilt();
+    const resized = resizeApprovedIntent(caller, REQUEST);
+    expect(resized.ok).toBe(true);
+    if (!resized.ok) return;
+
+    const emitted = resized.value as unknown as Record<string, unknown>;
+    expect(Object.getPrototypeOf(emitted)).toBe(Object.prototype);
+    expect(Object.hasOwn(emitted, "__proto__")).toBe(false);
+    expect(notPlainOwnFrozenData(emitted)).toEqual([]);
+
+    // POST-RETURN MUTABILITY, the round-4 probe's move: edit everything the
+    // caller still holds — the object, its sub-objects, and the prototype of
+    // each — and read the record again.
+    lot(caller)["marketId"] = "MUTATED-AFTER-RETURN";
+    Object.setPrototypeOf(caller, { marketId: "FROM-A-PROTOTYPE" });
+    expect(resized.value.worstCase.perMarket[0]?.marketId).toBe(MARKET_A);
+    expect(() => {
+      (emitted as { approvedIntentId: string }).approvedIntentId = "tampered";
+    }).toThrow(TypeError);
+  });
+
+  it("REVIEWER'S PROBE (round 5b): a Proxy at the ROOT is refused with ZERO trap invocations", () => {
+    const counts = { value: 0 };
+    const { proxy } = countingProxy(handBuilt() as object, counts);
+
+    const resized = resizeApprovedIntent(proxy as ApprovedIntentRecord, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    expect(codes(resized)).toContain("RISK_INPUT_INVALID");
+    // The load-bearing number. Round 5 recorded `getPrototypeOf=1, ownKeys=1,
+    // getOwnPropertyDescriptor=1` and `ok:true`.
+    expect(counts.value).toBe(0);
+    expect(JSON.stringify(resized)).toContain("Proxy");
+  });
+
+  it("REVIEWER'S PROBE (round 5c): a Proxy NESTED in a valid record is refused with ZERO traps", () => {
+    const counts = { value: 0 };
+    const record = handBuilt();
+    const perMarket = record.worstCase.perMarket as unknown as Record<string, unknown>[];
+    const { proxy } = countingProxy(perMarket[0] as object, counts);
+    perMarket[0] = proxy as Record<string, unknown>;
+
+    const resized = resizeApprovedIntent(record, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    // Round 5 recorded NINE trap invocations here, and an accepted record.
+    expect(counts.value).toBe(0);
+
+    // The counter is not vacuous: the same proxy answers a reflective operation
+    // when something other than the boundary asks.
+    expect(Reflect.ownKeys(proxy).length).toBeGreaterThan(0);
+    expect(counts.value).toBeGreaterThan(0);
+  });
+
+  it("REVIEWER'S PROBE (round 5d): an exotic descriptor cannot run getters inside the read", () => {
+    let getters = 0;
+    const record = handBuilt();
+    const perMarket = record.worstCase.perMarket as unknown as Record<string, unknown>[];
+    const inner = perMarket[0] as object;
+    perMarket[0] = new Proxy(inner, {
+      getOwnPropertyDescriptor(target, key) {
+        const real = Reflect.getOwnPropertyDescriptor(target, key);
+        // `Object.getOwnPropertyDescriptor` NORMALIZES a trap result, and that
+        // normalization reads `.value`, `.writable`, `.enumerable` and
+        // `.configurable` — four getters per property, running inside what the
+        // boundary believed was a pure reflective read.
+        return {
+          get value() {
+            getters += 1;
+            return real?.value as unknown;
+          },
+          get writable() {
+            getters += 1;
+            return true;
+          },
+          get enumerable() {
+            getters += 1;
+            return true;
+          },
+          get configurable() {
+            getters += 1;
+            return true;
+          },
+        } as PropertyDescriptor;
+      },
+    }) as Record<string, unknown>;
+
+    const resized = resizeApprovedIntent(record, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    expect(getters).toBe(0);
+  });
+
+  it("a Proxy that OMITS a property or LIES in a descriptor cannot be approved", () => {
+    for (const handler of [
+      {
+        ownKeys: (target: object) => Reflect.ownKeys(target).filter((k) => k !== "marketId"),
+        getOwnPropertyDescriptor: (target: object, key: string | symbol) =>
+          key === "marketId" ? undefined : Reflect.getOwnPropertyDescriptor(target, key),
+      },
+      {
+        getOwnPropertyDescriptor: (target: object, key: string | symbol) =>
+          key === "marketId"
+            ? { value: NON_CANONICAL, writable: true, enumerable: true, configurable: true }
+            : Reflect.getOwnPropertyDescriptor(target, key),
+      },
+    ] as ProxyHandler<object>[]) {
+      const record = handBuilt();
+      const perMarket = record.worstCase.perMarket as unknown as Record<string, unknown>[];
+      perMarket[0] = new Proxy(perMarket[0] as object, handler) as Record<string, unknown>;
+      expect(resizeApprovedIntent(record, REQUEST).ok).toBe(false);
+    }
+  });
+
+  it("REVIEWER'S PROBE (round 5e): a hostile array `length` cannot propagate an exception", () => {
+    let coerced = 0;
+    const record = handBuilt();
+    const worstCase = record.worstCase as unknown as Record<string, unknown>;
+    const realArray = worstCase["perMarket"] as unknown[];
+    const hostileLength = {
+      [Symbol.toPrimitive]() {
+        coerced += 1;
+        throw new Error("coerce-from-caller");
+      },
+    };
+    worstCase["perMarket"] = new Proxy(realArray, {
+      get: (target, key, receiver) =>
+        key === "length" ? hostileLength : (Reflect.get(target, key, receiver) as unknown),
+      getOwnPropertyDescriptor: (target, key) =>
+        key === "length"
+          ? { value: hostileLength, writable: true, enumerable: false, configurable: false }
+          : Reflect.getOwnPropertyDescriptor(target, key),
+    }) as unknown[];
+
+    // Round 5: this call threw `Error("coerce-from-caller")` — from the code
+    // that BUILT the refusal (`String(reported)`), not from the check.
+    const resized = resizeApprovedIntent(record, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    expect(coerced).toBe(0);
+  });
+
+  it("a revoked Proxy and a throwing descriptor trap stay typed refusals", () => {
+    const record = handBuilt();
+    const perMarket = record.worstCase.perMarket as unknown as Record<string, unknown>[];
+    const { proxy, revoke } = Proxy.revocable(perMarket[0] as object, {});
+    revoke();
+    perMarket[0] = proxy as Record<string, unknown>;
+    expect(codes(resizeApprovedIntent(record, REQUEST))).toContain("RISK_INPUT_INVALID");
+
+    const second = handBuilt();
+    const lots = second.worstCase.perMarket as unknown as Record<string, unknown>[];
+    lots[0] = new Proxy(lots[0] as object, {
+      getOwnPropertyDescriptor() {
+        throw new Error("descriptor-trap");
+      },
+    }) as Record<string, unknown>;
+    expect(codes(resizeApprovedIntent(second, REQUEST))).toContain("RISK_INPUT_INVALID");
+  });
+
+  it("REVIEWER'S PROBE (round 5f): a CANCEL with a throwing accessor is REFUSED, not thrown", () => {
+    let invoked = 0;
+    const input = entryInput();
+    input.intent = cancelIntent();
+    const hostile = { ...input } as Record<string, unknown>;
+    delete hostile["identifiers"];
+    Object.defineProperty(hostile, "identifiers", {
+      get() {
+        invoked += 1;
+        throw new Error("cancel-input-getter");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    // Round 5: this call THREW, so the cancel never reached the §6 invariant 13
+    // choke point. A refusal is the correct answer — the representation is
+    // malformed — but it must be a refusal.
+    const result = evaluateIntent(riskPolicy(), hostile);
+
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toContain("RISK_INPUT_INVALID");
+    expect(invoked).toBe(0);
+  });
+
+  it("the policy door refuses an accessor-bearing policy without invoking it", () => {
+    let invoked = 0;
+    const hostile: Record<string, unknown> = {
+      freshness: { venueBookMaxAgeMs: 1000, referenceFeedMaxAgeMs: 2000, featuresMaxAgeMs: 2000 },
+      scenario: { maxScenarioLoss: "10000" },
+      economics: {},
+      participation: {},
+      rateLimit: { safetyReserveRequests: 5 },
+      timeToClose: { entryCutoffSeconds: 60 },
+    };
+    Object.defineProperty(hostile, "limits", {
+      get() {
+        invoked += 1;
+        throw new Error("policy-getter");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    const parsed = parseRiskPolicy(hostile);
+    expect(parsed.ok).toBe(false);
+    expect(invoked).toBe(0);
+
+    // …and a Proxy policy is refused with no traps at all.
+    let traps = 0;
+    const proxied = new Proxy(
+      {},
+      {
+        ownKeys(target) {
+          traps += 1;
+          return Reflect.ownKeys(target);
+        },
+        getOwnPropertyDescriptor(target, key) {
+          traps += 1;
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+        getPrototypeOf(target) {
+          traps += 1;
+          return Reflect.getPrototypeOf(target);
+        },
+        get(target, key, receiver) {
+          traps += 1;
+          return Reflect.get(target, key, receiver) as unknown;
+        },
+      },
+    );
+    expect(parseRiskPolicy(proxied).ok).toBe(false);
+    expect(traps).toBe(0);
+  });
+
+  it("an INHERITED scope entry is not a measurement — RISK_EXPOSURE_ENTRY_MISSING still fires", () => {
+    // `strategyInstanceId` is a `CodeString`, so `"constructor"` is admissible
+    // input. `exposures.byStrategyInstance["constructor"]` answers the `Object`
+    // constructor — not `undefined` — so the round-1 BLOCKER-2 fix ("an omitted
+    // entry is unknown exposure, not zero") read an intrinsic as a measurement
+    // and then fed `undefined` to decimal arithmetic.
+    const input = entryInput();
+    input.context.strategyInstanceId = "constructor";
+    input.exposures = exposureSnapshot({ measuring: { marketIds: [MARKET_A, MARKET_B] } });
+
+    const result = evaluateIntent(
+      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perInstanceExposureCap: "500" } }),
+      input,
+    );
+
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toContain("RISK_EXPOSURE_ENTRY_MISSING");
+    // Named, with the offending scope key — not a decimal exception.
+    expect(JSON.stringify(result.refusals)).toContain("constructor");
+  });
+
+  it("an inherited member is not an exposure entry for a MEASURED scope either", () => {
+    // The mirror case: the snapshot genuinely measures `"constructor"` at zero,
+    // so the evaluation must proceed and compare against that zero.
+    const input = entryInput();
+    input.context.strategyInstanceId = "constructor";
+    input.exposures = exposureSnapshot({
+      measuring: { strategyInstanceIds: ["constructor"], marketIds: [MARKET_A, MARKET_B] },
+    });
+
+    const result = evaluateIntent(
+      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perInstanceExposureCap: "500" } }),
+      input,
+    );
+
+    expect(codesOf(result)).toEqual([]);
+    expect(result.approved).toBe(true);
+  });
+
+  it("the outer containment guard answers with a REJECTION, never an approval or a throw", () => {
+    // `policy` is TYPED `RiskPolicy` and never parsed at runtime, so it is the
+    // one argument the door does not see. A hostile one is the cleanest way to
+    // reach the guard from outside.
+    let invoked = 0;
+    const base = riskPolicy() as unknown as Record<string, unknown>;
+    const hostilePolicy = { ...base };
+    Object.defineProperty(hostilePolicy, "limits", {
+      get() {
+        invoked += 1;
+        throw new Error("policy-read-from-the-pipeline");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    const result = evaluateIntent(hostilePolicy as unknown as RiskPolicy, entryInput());
+
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toContain("RISK_INPUT_INVALID");
+    // The refusal carries the thrown value's TYPE only — never its message,
+    // which would be one more caller-controlled read.
+    expect(JSON.stringify(result.refusals)).not.toContain("policy-read-from-the-pipeline");
+    // Non-vacuity: the getter really was the thing that fired.
+    expect(invoked).toBeGreaterThan(0);
+    // A contained failure is a rejection, and a rejection is not a cancel
+    // override: no record, and the approved arm is unreachable.
+    expect("record" in result).toBe(false);
+  });
+
+  it("a contained CANCEL failure is still a refusal, not an approval (§6 invariant 13 unchanged)", () => {
+    const input = entryInput();
+    input.intent = cancelIntent();
+    const base = riskPolicy() as unknown as Record<string, unknown>;
+    const hostilePolicy = { ...base };
+    Object.defineProperty(hostilePolicy, "maxRunMode", {
+      get() {
+        throw new Error("policy-read");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+
+    const result = evaluateIntent(hostilePolicy as unknown as RiskPolicy, input);
+
+    // §6 invariant 13 protects a VALID cancel from RISK POLICY. It does not
+    // require answering when the evaluation could not be performed at all — the
+    // same boundary review round 2 drew for malformed input.
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toContain("RISK_INPUT_INVALID");
   });
 });
 

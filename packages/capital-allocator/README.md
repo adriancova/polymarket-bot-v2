@@ -123,6 +123,16 @@ otherwise mention. The zeros are exact: only the snapshot is sparse, the
 allocator state is complete, so a key it does not mention genuinely holds
 nothing.
 
+**A scope key is a `CodeString`, so an inherited property name is admissible
+input** (adversarial review round 5, the sweep behind that round's first
+BLOCKER). Every table here is therefore read with `ownEntry` and written with
+`setOwn` (`src/guards.ts`), never with `table[key]`: `"constructor"` answers the
+`Object` constructor rather than `undefined`, so the accumulator would have read
+an intrinsic as an existing entry and written commitment components onto it,
+`exposureSnapshotCovering` would have skipped the explicit zero it exists to
+guarantee, and the risk side's `RISK_EXPOSURE_ENTRY_MISSING` would have read the
+same intrinsic as a measurement.
+
 ## 4. Reservations
 
 - `evaluateReservation` answers "may this commitment be made" and changes
@@ -197,3 +207,20 @@ layer 0) plus `zod`. It imports **no** layer-1 peer — including
 **structurally** rather than through an edge, because
 `docs/contracts/dependency-direction.md` §2.1 lists no same-layer edge between
 them (F13). `test/unit/risk/ports.test.ts` pins that port.
+
+`src/plain-data.ts` is **duplicated** from `packages/risk`, not imported, for
+exactly the `src/guards.ts` reason: sharing it would need a §2.1 row that does
+not exist, and a remediation may not widen a frozen contract for its own
+convenience. The two copies are byte-identical below their headers.
+
+**One Node built-in is imported, and it is audited.** `src/plain-data.ts` holds
+`import { types } from "node:util";` and uses it only as `types.isProxy` — the
+one thing portable JavaScript cannot do, because every reflective operation on a
+`Proxy` runs a trap. Layer 1 carries no import allowlist (§2 states one only for
+layer 0; §3 F15 binds `packages/decimal`; §3 F14 binds `packages/domain`,
+`packages/strategies/**`, `packages/ledger` and `packages/simulation`).
+`pnpm check:deps` passes unchanged at 34 packages / 30 edges, and a type
+predicate performs no I/O — this package still opens no connection, reads no
+clock and holds no credential. The line and its permitted use are pinned by
+`test/unit/risk/freshness.test.ts`, which refuses every other `node:` import in
+both packages.

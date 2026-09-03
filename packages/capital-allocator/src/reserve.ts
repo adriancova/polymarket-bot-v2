@@ -44,11 +44,13 @@ import { z } from "zod";
 
 import { liveMicroCapRefusals, type AllocatorCaps } from "./caps.js";
 import { exposureSnapshot, shadowExposureSnapshot, type ExposureSnapshot } from "./exposure.js";
-import { deepFreeze, uuidShapedNotCanonical } from "./guards.js";
+import { deepFreeze, ownEntry, uuidShapedNotCanonical } from "./guards.js";
 import {
   capitalFailure,
   capitalOk,
   capitalRefusal,
+  contained,
+  readInputAsData,
   type CapitalRefusal,
   type CapitalResult,
 } from "./refusals.js";
@@ -149,16 +151,47 @@ function entryOf(snapshot: ExposureSnapshot, dimension: keyof ExposureSnapshot, 
   const table = snapshot[dimension] as Readonly<
     Record<string, { readonly combined: string }>
   >;
-  return key === undefined ? "0" : (table[key]?.combined ?? "0");
+  // OWN lookup (review round 5, the BLOCKER-1 sweep): a scope key is a bounded
+  // string, and `table["__proto__"]` would answer `Object.prototype`, whose
+  // `combined` is `undefined` — a cap comparison against nothing.
+  return key === undefined ? "0" : (ownEntry(table, key)?.combined ?? "0");
 }
 
-/** Evaluates a reservation without changing anything. */
+/**
+ * Evaluates a reservation without changing anything.
+ *
+ * READ AS DATA BEFORE IT IS PARSED, and CONTAINED (review round 5, BLOCKER 3 —
+ * the class reported against `parseAllocatorCaps`, swept across this package's
+ * public `unknown` surfaces). A contained failure is a REFUSED verdict, never a
+ * permitted one, and the live-micro fence below is unaffected: it runs on
+ * `caps`, after the request is known to be data.
+ */
 export function evaluateReservation(
   state: AllocatorState,
   caps: AllocatorCaps,
   request: unknown,
 ): ReservationVerdict {
-  const parsed = ReservationRequestSchema.safeParse(request);
+  return contained(
+    () => evaluateReservationInner(state, caps, request),
+    (thrown) =>
+      refuseVerdict([
+        capitalRefusal(
+          "CAPITAL_INPUT_INVALID",
+          "evaluating the reservation failed unexpectedly; a reservation that cannot be evaluated is not permitted (fail closed)",
+          { thrown },
+        ),
+      ]),
+  );
+}
+
+function evaluateReservationInner(
+  state: AllocatorState,
+  caps: AllocatorCaps,
+  request: unknown,
+): ReservationVerdict {
+  const read = readInputAsData(request, "request", "reservation request");
+  if (!read.ok) return refuseVerdict([read.refusal]);
+  const parsed = ReservationRequestSchema.safeParse(read.value);
   if (!parsed.success) {
     return refuseVerdict([
       capitalRefusal("CAPITAL_INPUT_INVALID", "reservation request failed validation", {
@@ -362,6 +395,24 @@ export function applyReservation(
   caps: AllocatorCaps,
   request: unknown,
 ): CapitalResult<{ readonly state: AllocatorState; readonly reservation: AppliedReservation }> {
+  return contained(
+    () => applyReservationInner(state, caps, request),
+    (thrown) =>
+      capitalFailure(
+        capitalRefusal(
+          "CAPITAL_INPUT_INVALID",
+          "applying the reservation failed unexpectedly; no reservation is applied and the state is unchanged (fail closed)",
+          { thrown },
+        ),
+      ),
+  );
+}
+
+function applyReservationInner(
+  state: AllocatorState,
+  caps: AllocatorCaps,
+  request: unknown,
+): CapitalResult<{ readonly state: AllocatorState; readonly reservation: AppliedReservation }> {
   const verdict = evaluateReservation(state, caps, request);
   if (!verdict.permitted) {
     return capitalFailure(...verdict.refusals);
@@ -385,6 +436,23 @@ export function applyReservation(
 
 /** Releases an applied reservation, returning its capacity. */
 export function releaseReservation(
+  state: AllocatorState,
+  reservationId: string,
+): CapitalResult<AllocatorState> {
+  return contained(
+    () => releaseReservationInner(state, reservationId),
+    (thrown) =>
+      capitalFailure(
+        capitalRefusal(
+          "CAPITAL_INPUT_INVALID",
+          "releasing the reservation failed unexpectedly; no capacity is returned and the state is unchanged (fail closed)",
+          { thrown },
+        ),
+      ),
+  );
+}
+
+function releaseReservationInner(
   state: AllocatorState,
   reservationId: string,
 ): CapitalResult<AllocatorState> {

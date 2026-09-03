@@ -41,6 +41,7 @@ import {
 
 import { FreshnessObservationSchema } from "./freshness.js";
 import { uuidShapedNotCanonical } from "./guards.js";
+import { readPlainData } from "./plain-data.js";
 import { SCENARIO_KINDS } from "./policy.js";
 import { riskRefusal, type RiskRefusal } from "./result.js";
 
@@ -363,9 +364,37 @@ export type RiskInputValidation =
  * and DO NOT add an early `return` between here and the choke point.
  * `test/unit/risk/engine.test.ts` ("ADR-016 §2 — record identity is INPUT
  * VALIDATION, never a cancel override") fails if you do.
+ *
+ * THE INPUT IS READ AS DATA BEFORE IT IS PARSED (review round 5, BLOCKER 3).
+ * `safeParse` is not a safe way to LOOK at a caller's object: `zod` reads
+ * properties, so a getter runs, and a getter that throws escapes as an
+ * exception from the one function whose entire job is to answer "is this input
+ * acceptable?" with a refusal. The reviewer's probe was a valid `CANCEL`
+ * representation with a throwing `identifiers` getter: it threw, so the cancel
+ * never reached the §6 invariant 13 choke point at all.
+ *
+ * `readPlainData` materializes the input first — descriptors only, no `Proxy`,
+ * no accessor — and the schema then parses THAT. An accessor-bearing
+ * representation is still refused, which is correct; what changes is that it is
+ * refused as `RISK_INPUT_INVALID` instead of escaping as a `TypeError`. Ordering
+ * matters here as much as at the choke point: the read is a well-formedness
+ * check, so it belongs in this function, ahead of everything.
  */
 export function validateEvaluationInput(input: unknown): RiskInputValidation {
-  const parsed = RiskEvaluationInputSchema.safeParse(input);
+  const read = readPlainData(input, "input");
+  if (!read.ok) {
+    return {
+      ok: false,
+      refusals: [
+        riskRefusal(
+          "RISK_INPUT_INVALID",
+          "the evaluation input is not a data record: a request is a finite tree of plain own data, so hidden, inherited, computed or unreadable state is refused rather than inspected (fail closed)",
+          { issues: read.problems.map((problem) => `${problem.path}: ${problem.problem}`) },
+        ),
+      ],
+    };
+  }
+  const parsed = RiskEvaluationInputSchema.safeParse(read.value);
   if (!parsed.success) {
     return {
       ok: false,

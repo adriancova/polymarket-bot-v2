@@ -41,11 +41,13 @@ import {
 } from "@polymarket-bot/domain";
 import { z } from "zod";
 
-import { deepFreeze, uuidShapedNotCanonical } from "./guards.js";
+import { deepFreeze, ownEntry, setOwn, uuidShapedNotCanonical } from "./guards.js";
 import {
   capitalFailure,
   capitalOk,
   capitalRefusal,
+  contained,
+  readInputAsData,
   type CapitalRefusal,
   type CapitalResult,
 } from "./refusals.js";
@@ -146,7 +148,12 @@ export function heldSharesByKey(state: {
   const held: Record<string, SharesString> = {};
   for (const position of state.positions) {
     const key = inventoryKey(position.strategyInstanceId, position.marketId, position.side);
-    held[key] = addDecimal(held[key] ?? "0", position.shares);
+    // OWN read, OWN write (review round 5, the BLOCKER-1 sweep). An
+    // `inventoryKey` always contains `|`, so it can never spell `"__proto__"`
+    // and this site was never live — but the discipline is applied everywhere a
+    // caller-derived key meets a table, so that the invariant is a property of
+    // the code rather than of an argument about the key grammar.
+    setOwn(held, key, addDecimal(ownEntry(held, key) ?? "0", position.shares));
   }
   return held;
 }
@@ -160,7 +167,7 @@ export function reservedSharesByKey(state: {
   for (const order of state.openOrders) {
     if (order.action !== "SELL") continue;
     const key = inventoryKey(order.strategyInstanceId, order.marketId, order.side);
-    reserved[key] = addDecimal(reserved[key] ?? "0", order.shares);
+    setOwn(reserved, key, addDecimal(ownEntry(reserved, key) ?? "0", order.shares));
   }
   for (const reservation of state.reservations) {
     if (reservation.action !== "SELL") continue;
@@ -169,7 +176,7 @@ export function reservedSharesByKey(state: {
       reservation.marketId,
       reservation.side,
     );
-    reserved[key] = addDecimal(reserved[key] ?? "0", reservation.shares);
+    setOwn(reserved, key, addDecimal(ownEntry(reserved, key) ?? "0", reservation.shares));
   }
   return reserved;
 }
@@ -198,9 +205,31 @@ function nonCanonicalIdRefusals(input: AllocatorStateInput): CapitalRefusal[] {
  * Refuses (never repairs): schema failures, non-canonical UUID-shaped ids
  * (ADR-016), duplicate identifiers, more than one live owner per market
  * (ADR-011), and sell orders reserving more than the owning instance holds.
+ *
+ * READ AS DATA BEFORE IT IS PARSED, and CONTAINED (review round 5, BLOCKER 3 —
+ * the same class the reviewer reported against `parseAllocatorCaps`, found by
+ * the sweep across this package's public `unknown` surfaces). `safeParse` reads
+ * properties, so a caller's getter runs inside it; `readInputAsData`
+ * materializes the value first and the schema sees only that.
  */
 export function createAllocatorState(input: unknown): CapitalResult<AllocatorState> {
-  const parsed = AllocatorStateInputSchema.safeParse(input);
+  return contained(
+    () => createAllocatorStateInner(input),
+    (thrown) =>
+      capitalFailure(
+        capitalRefusal(
+          "CAPITAL_INPUT_INVALID",
+          "constructing the allocator state failed unexpectedly; a state that cannot be validated cannot be shown to conserve collateral or inventory (fail closed)",
+          { thrown },
+        ),
+      ),
+  );
+}
+
+function createAllocatorStateInner(input: unknown): CapitalResult<AllocatorState> {
+  const read = readInputAsData(input, "state", "allocator state input");
+  if (!read.ok) return capitalFailure(read.refusal);
+  const parsed = AllocatorStateInputSchema.safeParse(read.value);
   if (!parsed.success) {
     return capitalFailure(
       capitalRefusal("CAPITAL_INPUT_INVALID", "allocator state input failed validation", {
@@ -237,7 +266,11 @@ export function createAllocatorState(input: unknown): CapitalResult<AllocatorSta
 
   const liveOwners: Record<string, string> = {};
   for (const owner of data.liveOwners) {
-    const existing = liveOwners[owner.marketId];
+    // OWN read / OWN write (review round 5, the BLOCKER-1 sweep): an inherited
+    // member must never read as an existing live owner, and no caller-derived
+    // key may reach an inherited setter. `marketId` is UUID-constrained here, so
+    // this site was not live; the discipline is uniform anyway.
+    const existing = ownEntry(liveOwners, owner.marketId);
     if (existing !== undefined && existing !== owner.strategyInstanceId) {
       refusals.push(
         capitalRefusal(
@@ -248,7 +281,7 @@ export function createAllocatorState(input: unknown): CapitalResult<AllocatorSta
       );
       continue;
     }
-    liveOwners[owner.marketId] = owner.strategyInstanceId;
+    setOwn(liveOwners, owner.marketId, owner.strategyInstanceId);
   }
 
   const skeleton = {
@@ -259,7 +292,7 @@ export function createAllocatorState(input: unknown): CapitalResult<AllocatorSta
   const held = heldSharesByKey(skeleton);
   const reserved = reservedSharesByKey(skeleton);
   for (const [key, reservedShares] of Object.entries(reserved)) {
-    const heldShares = held[key] ?? "0";
+    const heldShares = ownEntry(held, key) ?? "0";
     if (compareDecimal(reservedShares, heldShares) > 0) {
       refusals.push(
         capitalRefusal(
@@ -307,7 +340,11 @@ export function withLiveOwner(
   marketId: string,
   strategyInstanceId: string,
 ): CapitalResult<AllocatorState> {
-  const existing = state.liveOwners[marketId];
+  // OWN read (review round 5, the BLOCKER-1 sweep): `marketId` is a caller
+  // argument on this public function, and an inherited member must not read as
+  // a live owner. The object literal below writes with a computed key, which is
+  // `CreateDataProperty` and therefore already setter-independent.
+  const existing = ownEntry(state.liveOwners, marketId);
   if (existing !== undefined && existing !== strategyInstanceId) {
     return capitalFailure(
       capitalRefusal(

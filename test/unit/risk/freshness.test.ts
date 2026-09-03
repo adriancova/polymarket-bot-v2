@@ -110,6 +110,32 @@ describe("deadline comparison reads no clock", () => {
     return source.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/(^|\s)\/\/.*$/gmu, "$1");
   }
 
+  /**
+   * THE ONE AUDITED NODE BUILT-IN LINE (review round 5).
+   *
+   * This scan used to assert `not.toMatch(/from\s+"node:/)` — no built-in
+   * import at all — under the label "performs I/O". Round 5's second BLOCKER
+   * required rejecting a `Proxy` BEFORE any reflective operation touches it,
+   * and portable JavaScript cannot do that: every reflective operation on a
+   * `Proxy` runs a trap, so a portable probe is already the thing being
+   * prevented. `util.types.isProxy` is a V8-level type predicate that consults
+   * no trap.
+   *
+   * The blanket spelling is therefore replaced by an EXACT-MATCH ALLOWLIST,
+   * which is stronger everywhere except on the single audited line: any other
+   * `node:` import — `node:fs`, `node:crypto`, a different binding from
+   * `node:util`, a renamed one, a dynamic `import("node:…")` — fails, and the
+   * audited line is pinned character for character. The next test pins WHERE it
+   * may appear and HOW the binding may be used, across BOTH packages (this scan
+   * covered only `packages/risk`).
+   *
+   * The label's claim is unchanged in substance: a type predicate opens no
+   * connection, reads no clock, touches no filesystem and consumes no entropy.
+   * `docs/handoffs/WP-180.md` (remediation round 5) records the argument and
+   * the gate evidence.
+   */
+  const AUDITED_BUILTIN_IMPORT = 'import { types } from "node:util";';
+
   it("this package's source contains no clock read and no unseeded randomness", () => {
     const source = resolve(dirname(fileURLToPath(import.meta.url)), "../../../packages/risk/src");
     const scanned: string[] = [];
@@ -120,11 +146,44 @@ describe("deadline comparison reads no clock", () => {
       expect(code, `${entry} reads a clock`).not.toMatch(/Date\.now\s*\(/u);
       expect(code, `${entry} constructs a current Date`).not.toMatch(/new\s+Date\s*\(\s*\)/u);
       expect(code, `${entry} uses unseeded randomness`).not.toMatch(/Math\.random/u);
-      expect(code, `${entry} performs I/O`).not.toMatch(/from\s+"node:/u);
+      expect(code, `${entry} performs I/O`).not.toMatch(/import\s*\(\s*["']node:/u);
+      for (const line of code.split("\n")) {
+        if (!/node:/u.test(line)) continue;
+        expect(line.trim(), `${entry} performs I/O`).toBe(AUDITED_BUILTIN_IMPORT);
+      }
     }
     // The scan is only meaningful if it actually saw the module that parses
     // instants; an empty or mis-pathed directory would pass vacuously.
     expect(scanned).toContain("time.ts");
     expect(scanned.length).toBeGreaterThan(10);
+  });
+
+  it("the audited `node:util` line appears exactly where it is allowed, used only as a type predicate", () => {
+    const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+    const sites: string[] = [];
+    for (const pkg of ["risk", "capital-allocator"] as const) {
+      const source = resolve(root, "packages", pkg, "src");
+      for (const entry of readdirSync(source)) {
+        // `packages/capital-allocator` colocates its suite in `src`; a TEST may
+        // read the filesystem, and does (this file does too).
+        if (!entry.endsWith(".ts") || entry.endsWith(".test.ts")) continue;
+        const code = stripComments(readFileSync(join(source, entry), "utf8"));
+        for (const line of code.split("\n")) {
+          if (!/node:/u.test(line)) continue;
+          expect(line.trim(), `packages/${pkg}/src/${entry}`).toBe(AUDITED_BUILTIN_IMPORT);
+          sites.push(`${pkg}/${entry}`);
+        }
+        // The binding may be used for the trap-free `Proxy` predicate and
+        // nothing else: `types.isNativeError`, `types.isDate`, or any member
+        // read that is not `isProxy` fails here.
+        for (const use of code.match(/\btypes\s*\.\s*[A-Za-z0-9_$]+/gu) ?? []) {
+          expect(use.replace(/\s+/gu, ""), `packages/${pkg}/src/${entry}`).toBe("types.isProxy");
+        }
+      }
+    }
+    // Exactly one site per package: the mirrored data-record boundary. NOT a
+    // "greater than zero" check — a second site would be a second thing to
+    // audit, and this test is the audit.
+    expect(sites.sort()).toEqual(["capital-allocator/plain-data.ts", "risk/plain-data.ts"]);
   });
 });

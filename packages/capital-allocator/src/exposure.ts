@@ -29,7 +29,7 @@
 import { addDecimal, mulDecimal } from "@polymarket-bot/decimal";
 import type { MoneyString } from "@polymarket-bot/domain";
 
-import { deepFreeze } from "./guards.js";
+import { deepFreeze, ownEntry, setOwn } from "./guards.js";
 import type { AllocatorState, AppliedReservation, OpenOrderCommitment, PositionHolding } from "./state.js";
 
 /** One scope's exposure. Both components consume; `combined` is their sum. */
@@ -62,18 +62,27 @@ function bump(
   amount: MoneyString,
 ): void {
   if (key === undefined) return;
-  const entry = (table[key] ??= { openOrderCommitted: "0", positionCommitted: "0" });
+  // OWN lookup, OWN definition. `key` is caller data: a scope key is a bounded
+  // non-empty string, so `"__proto__"` is admissible, and `table[key] ??= …`
+  // would have read `Object.prototype` as an existing entry and then written
+  // this package's commitment components onto the intrinsic itself (review
+  // round 5, the BLOCKER-1 sweep). See `guards.ts`.
+  let entry = ownEntry<MutableEntry>(table, key);
+  if (entry === undefined) {
+    entry = { openOrderCommitted: "0", positionCommitted: "0" };
+    setOwn(table, key, entry);
+  }
   entry[component] = addDecimal(entry[component], amount);
 }
 
 function finalize(table: Table): Readonly<Record<string, ExposureEntry>> {
   const out: Record<string, ExposureEntry> = {};
   for (const [key, entry] of Object.entries(table)) {
-    out[key] = {
+    setOwn(out, key, {
       openOrderCommitted: entry.openOrderCommitted,
       positionCommitted: entry.positionCommitted,
       combined: addDecimal(entry.openOrderCommitted, entry.positionCommitted),
-    };
+    });
   }
   return out;
 }
@@ -183,7 +192,13 @@ function withExplicitZeros(
   if (keys === undefined || keys.length === 0) return table;
   const out: Record<string, ExposureEntry> = { ...table };
   for (const key of keys) {
-    out[key] ??= ZERO_ENTRY;
+    // OWN test, OWN definition (review round 5, the BLOCKER-1 sweep). With
+    // `out[key] ??= ZERO_ENTRY` a coverage key of `"__proto__"` read
+    // `Object.prototype` as already present, so the EXPLICIT ZERO this function
+    // exists to guarantee was silently not written — and the risk side's
+    // `RISK_EXPOSURE_ENTRY_MISSING` (round 1, BLOCKER 2) would have read the
+    // same inherited object as a measurement.
+    if (ownEntry(out, key) === undefined) setOwn(out, key, ZERO_ENTRY);
   }
   return out;
 }

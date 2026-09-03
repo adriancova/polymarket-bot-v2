@@ -34,6 +34,7 @@
 import { addDecimal, compareDecimal } from "@polymarket-bot/decimal";
 import type { MoneyString } from "@polymarket-bot/domain";
 
+import { ownEntry } from "./guards.js";
 import type { ExposureEntryView, ExposureSnapshotView, ScopeAttribution } from "./inputs.js";
 import type { RiskPolicy } from "./policy.js";
 import type { RiskReasonCode } from "./reasons.js";
@@ -155,7 +156,9 @@ export function checkExposureLimits(
   }
 
   if (limits.perInstanceExposureCap !== undefined) {
-    const entry = exposures.byStrategyInstance[probe.strategyInstanceId];
+    // `ownEntry`, never `table[key]` — see `guards.ts` (review round 5): an
+    // inherited member must not be mistaken for a measured scope.
+    const entry = ownEntry(exposures.byStrategyInstance, probe.strategyInstanceId);
     if (entry === undefined) {
       refusals.push(
         entryMissing(
@@ -180,7 +183,7 @@ export function checkExposureLimits(
 
   if (limits.perMarketExposureCap !== undefined) {
     for (const [marketId, contribution] of probe.perMarketContribution) {
-      const entry = exposures.byMarket[marketId];
+      const entry = ownEntry(exposures.byMarket, marketId);
       if (entry === undefined) {
         refusals.push(entryMissing("market", marketId, limits.perMarketExposureCap));
         continue;
@@ -250,7 +253,7 @@ export function checkExposureLimits(
     }
     const table = exposures[check.dimension];
     for (const [key, contribution] of contributionByKey) {
-      const entry = table[key];
+      const entry = ownEntry(table, key);
       if (entry === undefined) {
         refusals.push(entryMissing(check.label, key, cap));
         continue;

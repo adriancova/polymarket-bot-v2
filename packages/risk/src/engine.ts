@@ -79,7 +79,7 @@ import {
   recommendIncidentActions,
   type IncidentActionRecommendation,
 } from "./recommendations.js";
-import { riskRefusal, type RiskRefusal } from "./result.js";
+import { contained, riskRefusal, type RiskRefusal } from "./result.js";
 import { assessScenarios, type ScenarioAssessment } from "./scenario.js";
 import { isExpired } from "./time.js";
 import { assessWorstCase, type WorstCaseAssessment } from "./worst-case.js";
@@ -169,8 +169,44 @@ function heldBothSides(
  *
  * `input` is unknown and validated here: a caller that hands this engine an
  * unvalidated object gets a typed refusal, never a partially-checked approval.
+ *
+ * THE OUTER CONTAINMENT GUARD (review round 5). The door below reads the input
+ * as data before any schema touches it, which is what closes the reported
+ * defect — a valid `CANCEL` representation carrying a throwing `identifiers`
+ * getter used to THROW out of this function, so the cancel never reached the §6
+ * invariant 13 choke point at all. The guard is the belt to that braces, and it
+ * also covers the one argument the door does not see: `policy` is TYPED
+ * `RiskPolicy`, but a caller can hand-build one, and the pipeline reads it.
+ * Whatever happens, this function answers with an evaluation.
+ *
+ * A CONTAINED FAILURE IS A REJECTION, NEVER AN APPROVAL, and it is NOT a
+ * cancel-override: `rejected` is the same arm a malformed input takes, so the
+ * §6 invariant 13 machinery — which lives below, after the door — is not
+ * reached and cannot turn this into an approval.
  */
 export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluation {
+  return contained(
+    () => evaluateIntentInner(policy, input),
+    (thrown) =>
+      rejected(
+        {
+          refusals: [
+            riskRefusal(
+              "RISK_INPUT_INVALID",
+              "the evaluation failed unexpectedly; an intent that cannot be evaluated is not an approved intent (fail closed)",
+              { thrown },
+            ),
+          ],
+          recommendations: [],
+        },
+        undefined,
+        undefined,
+        undefined,
+      ),
+  );
+}
+
+function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation {
   const accumulator: Accumulator = { refusals: [], recommendations: [] };
 
   // --- INPUT VALIDATION — the door, and the one thing a CANCEL cannot bypass -

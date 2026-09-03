@@ -878,3 +878,255 @@ describe("independent shadow accounting (§9.7)", () => {
     expect(live.permitted).toBe(true);
   });
 });
+
+/**
+ * A HOSTILE VALUE AT THIS PACKAGE'S INPUT DOORS — review round 5, BLOCKER 3.
+ *
+ * The reported site was `parseAllocatorCaps`: a valid-SHAPED object whose
+ * `globalAccountCap` was a throwing getter made it THROW rather than refuse,
+ * because `zod` reads properties and a getter is caller code. The sweep found
+ * the same class at `createAllocatorState` and at both reservation entry
+ * points, and found a second, live defect on the way — every scope table in
+ * this package was keyed with `[]`, which reads and writes THROUGH the
+ * prototype chain, and this package's scope keys are `CodeString`s, so
+ * `"constructor"` is admissible input.
+ *
+ * Fixes: `src/plain-data.ts` (the risk package's data-record boundary,
+ * duplicated for the `guards.ts` reason), `readInputAsData` in front of every
+ * schema, `contained` around every public entry point, and `ownEntry`/`setOwn`
+ * at every table.
+ */
+describe("a hostile value at the input doors — review round 5", () => {
+  function throwingGetter(
+    base: Record<string, unknown>,
+    key: string,
+    counter: { value: number },
+  ): Record<string, unknown> {
+    const out = { ...base };
+    delete out[key];
+    Object.defineProperty(out, key, {
+      get() {
+        counter.value += 1;
+        throw new Error(`${key}-getter`);
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    return out;
+  }
+
+  function countingProxy<T extends object>(target: T, counter: { value: number }): T {
+    const bump = <R>(compute: () => R): R => {
+      counter.value += 1;
+      return compute();
+    };
+    return new Proxy(target, {
+      getPrototypeOf: (t) => bump(() => Reflect.getPrototypeOf(t)),
+      ownKeys: (t) => bump(() => Reflect.ownKeys(t)),
+      getOwnPropertyDescriptor: (t, k) => bump(() => Reflect.getOwnPropertyDescriptor(t, k)),
+      get: (t, k, r) => bump(() => Reflect.get(t, k, r) as unknown),
+      has: (t, k) => bump(() => Reflect.has(t, k)),
+    });
+  }
+
+  it("REVIEWER'S PROBE: parseAllocatorCaps REFUSES an accessor-bearing caps object", () => {
+    const invoked = { value: 0 };
+    const hostile = throwingGetter(
+      { globalAccountCap: "1000", perStrategyCap: "1000" },
+      "globalAccountCap",
+      invoked,
+    );
+
+    // Round 5: this call threw `Error("caps-getter")`, getter called once.
+    const parsed = parseAllocatorCaps(hostile);
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.refusals.map((r) => r.code)).toContain("CAPITAL_INPUT_INVALID");
+    expect(invoked.value).toBe(0);
+  });
+
+  it("every public `unknown` door refuses an accessor-bearing input without invoking it", () => {
+    const invoked = { value: 0 };
+
+    const hostileState = throwingGetter(
+      {
+        accountEquity: "1000",
+        availableCollateral: "1000",
+        positions: [],
+        openOrders: [],
+        liveOwners: [],
+      },
+      "availableCollateral",
+      invoked,
+    );
+    expect(createAllocatorState(hostileState).ok).toBe(false);
+
+    const hostileRequest = throwingGetter(
+      request() as unknown as Record<string, unknown>,
+      "shares",
+      invoked,
+    );
+    expect(evaluateReservation(state(), caps(), hostileRequest).permitted).toBe(false);
+    expect(applyReservation(state(), caps(), hostileRequest).ok).toBe(false);
+
+    expect(invoked.value).toBe(0);
+  });
+
+  it("every public `unknown` door refuses a Proxy with ZERO trap invocations", () => {
+    const traps = { value: 0 };
+
+    expect(
+      parseAllocatorCaps(countingProxy({ globalAccountCap: "1", perStrategyCap: "1" }, traps)).ok,
+    ).toBe(false);
+    expect(
+      createAllocatorState(
+        countingProxy(
+          {
+            accountEquity: "1000",
+            availableCollateral: "1000",
+            positions: [],
+            openOrders: [],
+            liveOwners: [],
+          },
+          traps,
+        ),
+      ).ok,
+    ).toBe(false);
+    expect(
+      evaluateReservation(
+        state(),
+        caps(),
+        countingProxy(request() as unknown as Record<string, unknown>, traps),
+      ).permitted,
+    ).toBe(false);
+
+    expect(traps.value).toBe(0);
+
+    // Non-vacuity: the same handler answers when someone other than a door asks.
+    const witness = countingProxy({ a: 1 }, traps);
+    expect(Reflect.ownKeys(witness)).toEqual(["a"]);
+    expect(traps.value).toBeGreaterThan(0);
+  });
+
+  it("THE LIVE-MICRO FENCE IS UNCHANGED BY THE NEW DOOR", () => {
+    // The round-1 HIGH fix, re-verified through the materializing door: only
+    // the exact canonical `"0"` is permitted, and a decimally-equal spelling is
+    // REFUSED rather than folded. The CODE differs by layer, and deliberately:
+    // at this door the grammar runs first (`"0.0"` is not a canonical money
+    // string), while the fence's own code is what a grammar-valid raise gets.
+    for (const field of LIVE_MICRO_CAP_FIELDS) {
+      for (const [value, code] of [
+        ["0.0", "CAPITAL_INPUT_INVALID"],
+        ["0.00", "CAPITAL_INPUT_INVALID"],
+        ["0.01", "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED"],
+        ["1", "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED"],
+      ] as const) {
+        const parsed = parseAllocatorCaps({
+          globalAccountCap: "1000",
+          perStrategyCap: "1000",
+          [field]: value,
+        });
+        expect(parsed.ok, `${field}=${value}`).toBe(false);
+        if (parsed.ok) continue;
+        expect(parsed.refusals.map((r) => r.code), `${field}=${value}`).toContain(code);
+      }
+      const floor = parseAllocatorCaps({
+        globalAccountCap: "1000",
+        perStrategyCap: "1000",
+        [field]: LIVE_MICRO_CAP_FLOOR,
+      });
+      expect(floor.ok, `${field}=floor`).toBe(true);
+    }
+
+    // Layer 3 — the enforcement site, where a hand-built caps object that never
+    // went through the door is re-fenced. `"0.0"` refuses HERE with the fence's
+    // own code, and the new containment guard does not swallow it.
+    for (const bogus of ["0.0", "0.00"]) {
+      const verdict = evaluateReservation(
+        state(),
+        { ...caps(), liveMicroMaxOrderNotional: bogus } as unknown as AllocatorCaps,
+        request(),
+      );
+      expect(verdict.permitted, bogus).toBe(false);
+      expect(refusalCodes(verdict), bogus).toContain("CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED");
+    }
+  });
+
+  it("an INHERITED member is never an exposure entry, and never a write target", () => {
+    // `strategyInstanceId` is a `CodeString`, so `"constructor"` is admissible.
+    // With `table[key] ??= …` the accumulator read the `Object` constructor as
+    // an existing entry and then wrote this package's commitment components
+    // onto the intrinsic itself.
+    const built = createAllocatorState({
+      accountEquity: "1000",
+      availableCollateral: "1000",
+      positions: [
+        {
+          positionId: "pos-1",
+          strategyInstanceId: "constructor",
+          marketId: MARKET_A,
+          side: "YES",
+          shares: "100",
+          costBasis: "40",
+        },
+      ],
+      openOrders: [],
+      liveOwners: [],
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+
+    const snapshot = exposureSnapshot(built.value);
+    expect(Object.hasOwn(snapshot.byStrategyInstance, "constructor")).toBe(true);
+    expect(snapshot.byStrategyInstance["constructor"]?.combined).toBe("40");
+    // The intrinsic is clean: no commitment component was written to it.
+    expect(Object.hasOwn(Object.prototype, "openOrderCommitted")).toBe(false);
+    expect(Object.hasOwn(Object.prototype, "positionCommitted")).toBe(false);
+  });
+
+  it("exposureSnapshotCovering writes an EXPLICIT ZERO for an inherited-name scope key", () => {
+    // The zero this function exists to guarantee. `out[key] ??= ZERO_ENTRY`
+    // found `Object` under `"constructor"` and skipped the write, so the risk
+    // side's `RISK_EXPOSURE_ENTRY_MISSING` (round 1, BLOCKER 2) would have read
+    // an intrinsic as a measurement instead.
+    const covering = exposureSnapshotCovering(state(), {
+      strategyInstanceIds: ["constructor", "toString", INSTANCE],
+      marketIds: [MARKET_A],
+    });
+    for (const key of ["constructor", "toString", INSTANCE]) {
+      expect(Object.hasOwn(covering.byStrategyInstance, key), key).toBe(true);
+      expect(covering.byStrategyInstance[key], key).toEqual(EXPOSURE_ZERO);
+    }
+  });
+
+  it("withLiveOwner does not read an inherited member as a live owner", () => {
+    // `marketId` is an ordinary string PARAMETER here — nothing parses it — so
+    // `state.liveOwners["constructor"]` used to answer the `Object` constructor
+    // and refuse with a `CAPITAL_LIVE_OWNERSHIP_CONFLICT` naming an intrinsic.
+    const owned = withLiveOwner(state({ liveOwners: [] }), "constructor", INSTANCE);
+    expect(owned.ok).toBe(true);
+    if (!owned.ok) return;
+    expect(Object.hasOwn(owned.value.liveOwners, "constructor")).toBe(true);
+    expect(owned.value.liveOwners["constructor"]).toBe(INSTANCE);
+  });
+
+  it("a `__proto__` field is refused rather than dropped, at every door", () => {
+    // Measured, not assumed: `zod`'s `strictObject` is blind to exactly this
+    // one key — it reports every other unrecognized name and silently drops
+    // this one. `plain-data.ts` refuses it so the "an unexpected field is
+    // refused, never dropped" contract has no hole.
+    const withProto: Record<string, unknown> = { globalAccountCap: "1000", perStrategyCap: "1000" };
+    Object.defineProperty(withProto, "__proto__", {
+      value: { globalAccountCap: "999999999" },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    const parsed = parseAllocatorCaps(withProto);
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(JSON.stringify(parsed.refusals)).toContain("__proto__");
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+  });
+});

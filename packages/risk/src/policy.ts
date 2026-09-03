@@ -33,7 +33,8 @@ import {
 } from "@polymarket-bot/domain";
 
 import { FreshnessPolicySchema } from "./freshness.js";
-import { riskFailure, riskOk, riskRefusal, type RiskResult } from "./result.js";
+import { readPlainData } from "./plain-data.js";
+import { contained, riskFailure, riskOk, riskRefusal, type RiskResult } from "./result.js";
 
 export const SCENARIO_KINDS = ["SPOT", "VOLATILITY", "TIME", "LIQUIDITY"] as const;
 export type ScenarioKind = (typeof SCENARIO_KINDS)[number];
@@ -96,15 +97,46 @@ export const RiskPolicySchema = z.strictObject({
 
 export type RiskPolicy = z.infer<typeof RiskPolicySchema>;
 
-/** Validates a caller-supplied policy; refuses rather than repairing. */
+/**
+ * Validates a caller-supplied policy; refuses rather than repairing.
+ *
+ * READ AS DATA BEFORE IT IS PARSED (review round 5, BLOCKER 3). A policy is a
+ * caller-supplied `unknown`, and handing one straight to `safeParse` means `zod`
+ * READS its properties — so a throwing getter on a required field escaped this
+ * function as an exception. The materialized value is what the schema sees, and
+ * the outer {@link contained} guard makes the typed-result promise structural
+ * rather than a claim about having found every site.
+ */
 export function parseRiskPolicy(input: unknown): RiskResult<RiskPolicy> {
-  const parsed = RiskPolicySchema.safeParse(input);
-  if (!parsed.success) {
-    return riskFailure(
-      riskRefusal("RISK_INPUT_INVALID", "risk policy failed validation", {
-        issues: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`),
-      }),
-    );
-  }
-  return riskOk(Object.freeze(parsed.data));
+  return contained(
+    () => {
+      const read = readPlainData(input, "policy");
+      if (!read.ok) {
+        return riskFailure<RiskPolicy>(
+          riskRefusal(
+            "RISK_INPUT_INVALID",
+            "the risk policy is not a data record: a configuration is a finite tree of plain own data, so hidden, inherited, computed or unreadable state is refused rather than inspected (fail closed)",
+            { issues: read.problems.map((problem) => `${problem.path}: ${problem.problem}`) },
+          ),
+        );
+      }
+      const parsed = RiskPolicySchema.safeParse(read.value);
+      if (!parsed.success) {
+        return riskFailure<RiskPolicy>(
+          riskRefusal("RISK_INPUT_INVALID", "risk policy failed validation", {
+            issues: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`),
+          }),
+        );
+      }
+      return riskOk(Object.freeze(parsed.data));
+    },
+    (thrown) =>
+      riskFailure(
+        riskRefusal(
+          "RISK_INPUT_INVALID",
+          "validating the risk policy failed unexpectedly; a policy that cannot be validated is not a usable policy (fail closed)",
+          { thrown },
+        ),
+      ),
+  );
 }

@@ -31,11 +31,61 @@ export function uuidShapedNotCanonical(value: string): boolean {
 }
 
 /**
+ * The OWN entry of a keyed table, or `undefined` — never an INHERITED one.
+ *
+ * THE SWEEP HALF OF ROUND 5'S FIRST BLOCKER (mirrors `packages/risk/src/guards.ts`).
+ * `table[key]` for `key === "__proto__"` answers `Object.prototype` rather than
+ * `undefined`, and this package's scope keys — `strategyInstanceId`, `seriesKey`,
+ * `underlyingKey`, `resolutionWindowKey` — are BOUNDED NON-EMPTY STRINGS, not
+ * UUIDs, so that key is admissible input rather than a hypothetical. Every
+ * "is there an entry?" test here is `=== undefined`, so an inherited member
+ * would have read as a measured scope carrying no numbers.
+ */
+export function ownEntry<T>(
+  table: Readonly<Record<string, T>> | undefined,
+  key: string,
+): T | undefined {
+  if (table === undefined) return undefined;
+  return Object.hasOwn(table, key) ? table[key] : undefined;
+}
+
+/**
+ * Creates or replaces an OWN, enumerable DATA property on a table being built.
+ *
+ * NEVER `table[key] = value`, where `key` comes from caller data. Assignment is
+ * `Set`: it walks the prototype chain, and for `key === "__proto__"` it invokes
+ * `Object.prototype`'s SETTER instead of creating a field — round 5's first
+ * BLOCKER, reported against the risk package's materializer and swept for here.
+ * In this package the same construct reached further: `table[key] ??= {...}`
+ * read `Object.prototype` as an existing entry and would then have written the
+ * commitment components ONTO `Object.prototype` itself. `defineProperty` has
+ * `CreateDataProperty` semantics and consults no setter.
+ */
+export function setOwn<T>(table: Record<string, T>, key: string, value: T): void {
+  Object.defineProperty(table, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/**
  * Recursively freezes plain objects and arrays. Returns the same reference.
  *
  * Recurses into ALREADY-frozen containers too (a zod `.readonly()` array
  * arrives shallow-frozen with mutable elements — skipping it would leave the
  * elements editable); a visited set makes cycles safe.
+ *
+ * DESCRIPTOR-BASED (review round 5). It used to recurse through
+ * `(value as Record<string, unknown>)[key]`, which is a property READ: on a
+ * value carrying an accessor it would invoke the getter, and on a `Proxy` it
+ * would run a trap. Every value this function is applied to is built from
+ * schema output or from values `plain-data.ts` has already materialized, so
+ * that was latent rather than live — but a freeze walk that runs the value's
+ * own code is the defect class round 5 is about, and the descriptor read costs
+ * nothing. Mirrors `packages/risk/src/guards.ts`, as the rest of this module
+ * does.
  */
 export function deepFreeze<T>(value: T): T {
   freezeRecursive(value, new WeakSet());
@@ -47,8 +97,10 @@ function freezeRecursive(value: unknown, visited: WeakSet<object>): void {
     return;
   }
   visited.add(value);
-  for (const key of Object.getOwnPropertyNames(value)) {
-    freezeRecursive((value as Record<string, unknown>)[key], visited);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !("value" in descriptor)) continue;
+    freezeRecursive(descriptor.value, visited);
   }
   Object.freeze(value);
 }
