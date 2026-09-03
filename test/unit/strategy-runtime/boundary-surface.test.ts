@@ -55,7 +55,16 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import { deriveBoundarySurface, type Derivation, type CallableShape } from "./boundary-derivation.js";
-import { holdDecision, makeHarness, makeInput, makeStrategy } from "./helpers.js";
+import {
+  CONFIG_ID,
+  holdDecision,
+  INSTANCE_ID,
+  makeHarness,
+  makeInput,
+  makeStrategy,
+  RUN_ID,
+  RUN_SEED,
+} from "./helpers.js";
 import type { StrategyContext } from "../../../packages/strategy-sdk/src/index.js";
 import {
   acquireEvaluationInput,
@@ -68,8 +77,11 @@ import {
   materializeCheckpointableJson,
   rebuildStateFromPatches,
   restoreCheckpoint,
+  STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
   StrategyContextRevokedError,
   validateEvaluationInput,
+  type CheckpointIdentity,
+  type StrategyStateCheckpoint,
 } from "../../../packages/strategy-runtime/src/index.js";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -618,6 +630,86 @@ const PUBLIC_TOTAL_CALLS: Readonly<Record<string, (args: readonly unknown[]) => 
 };
 
 /**
+ * Review round 6's LOW 1, closed.
+ *
+ * The defect was in the fuzz's ARGUMENT VECTOR, not in the product. When it
+ * drove parameter N, every OTHER position was `undefined` — so
+ * `restoreCheckpoint(undefined, hostile)` read the checkpoint, found no
+ * `checkpointSchemaVersion`, and returned a refusal BEFORE `identity` was read
+ * at all. Nineteen hostile values were "passed" to a parameter no line of code
+ * ever touched, and the assertion that nothing threw was vacuous.
+ *
+ * So every PUBLIC TOTAL callable with more than one parameter supplies a VALID
+ * baseline for the positions it is not fuzzing, and the set of such callables is
+ * checked against the registry — a second multi-parameter callable cannot be
+ * added without one. The baseline alone is still only an argument that the
+ * hostile value SHOULD be reached; `every hostile argument is actually READ`
+ * below turns that into evidence, with a proxy that records the access.
+ */
+function validCheckpoint(): StrategyStateCheckpoint {
+  return {
+    checkpointSchemaVersion: STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
+    runId: RUN_ID,
+    instanceId: INSTANCE_ID,
+    strategyName: "test-strategy",
+    strategyVersion: "1.0.0",
+    stateSchemaVersion: 1,
+    configId: CONFIG_ID,
+    runSeed: RUN_SEED,
+    checkpointSeq: 4,
+    status: "ACTIVE",
+    rngState: [1, 2, 3, 4],
+    stateJson: '{"count":2}',
+  };
+}
+
+function validIdentity(): CheckpointIdentity {
+  return {
+    runId: RUN_ID,
+    instanceId: INSTANCE_ID,
+    strategyName: "test-strategy",
+    strategyVersion: "1.0.0",
+    stateSchemaVersion: 1,
+    configId: CONFIG_ID,
+    runSeed: RUN_SEED,
+  };
+}
+
+const MULTI_PARAMETER_BASELINES: Readonly<Record<string, () => readonly unknown[]>> = {
+  // The only PUBLIC TOTAL callable with more than one parameter today. A VALID
+  // checkpoint in position 0 is what makes a hostile `identity` in position 1
+  // reachable at all.
+  restoreCheckpoint: () => [validCheckpoint(), validIdentity()],
+};
+
+/**
+ * A value that behaves exactly like `target` and remembers whether anything
+ * looked at it. This is what turns "we passed a hostile argument" into "the
+ * hostile argument was reached": round 5 already found three adapters whose
+ * assertions exercised nothing, and a later parameter that no code path reads is
+ * the same failure wearing different clothes.
+ */
+function readRecordingProxy<T extends object>(target: T): {
+  readonly value: T;
+  readonly wasRead: () => boolean;
+} {
+  let read = false;
+  const note = <R>(result: R): R => {
+    read = true;
+    return result;
+  };
+  const value = new Proxy(target, {
+    get: (owner, key, receiver) => note(Reflect.get(owner, key, receiver) as unknown),
+    has: (owner, key) => note(Reflect.has(owner, key)),
+    ownKeys: (owner) => note(Reflect.ownKeys(owner)),
+    getOwnPropertyDescriptor: (owner, key) =>
+      note(Reflect.getOwnPropertyDescriptor(owner, key)),
+    getPrototypeOf: (owner) => note(Reflect.getPrototypeOf(owner)),
+  });
+  return { value, wasRead: () => read };
+}
+
+/**
  * Review round 5's LOW, closed. A `PARTIAL` classification is a claim that the
  * callable CAN throw under a stated precondition; without a witness it is just
  * a way to leave a public function out of the fuzz. Downgrading something to
@@ -629,6 +721,77 @@ interface PartialWitness {
   /** Breaking that precondition, concretely. Must throw. */
   readonly breaks: () => unknown;
   readonly throws: ErrorConstructor | string;
+}
+
+/**
+ * Review round 6's LOW 2, closed by coupling rather than by narrowing.
+ *
+ * Round 5 claimed a "three-edit dead end". The mechanism does catch the
+ * downgrade, the adapter deletion, a renamed or removed witness, a witness that
+ * returns instead of throwing, and a simultaneous registry-and-witness deletion.
+ * What it did NOT catch is the cheapest third edit of all — a witness whose
+ * `breaks` is an unrelated closure that just throws:
+ *
+ * ```
+ * breaks: () => { throw new TypeError("precondition"); }   → set equality ✓, toThrow ✓
+ * ```
+ *
+ * `witnessThrewFromTheNamedCallable` asks the thrown error where it came from.
+ * The stack of a genuine witness contains a frame INSIDE these two packages
+ * whose function name ends in the callable's own last name segment:
+ *
+ * ```
+ * canonicalJsonStringify        at canonicalJsonStringify (…/src/json.ts:901)
+ * deepFreeze                    at deepFreeze             (…/src/json.ts:1005)
+ * DeterministicRng.fromSeed     at DeterministicRng.fromSeed (…/src/rng.ts:99)
+ * SeededRandom.nextIntBelow     at Object.nextIntBelow    (…/src/context.ts:119)
+ * an unrelated throwing closure at UNRELATED              (…/boundary-surface.test.ts)
+ * ```
+ *
+ * The last row has no package frame at all, and a witness pointed at the WRONG
+ * package function has a package frame with the wrong name. Both now fail.
+ *
+ * What this does NOT prove, stated plainly so nobody reads more into it: the
+ * error must ORIGINATE in a package function whose name matches, but a witness
+ * could still reach that function by a route other than the public entry point
+ * the registry names — `SeededRandom.nextIntBelow` is exactly such a case, since
+ * the throw comes from `DeterministicRng.nextIntBelow` beneath the facade and
+ * matches on the shared member name. Human review still carries the question of
+ * whether the witness's call is the one a caller would actually make.
+ */
+function witnessThrewFromTheNamedCallable(id: string, error: unknown): string | undefined {
+  if (!(error instanceof Error)) {
+    return `${id} threw a non-Error, which carries no evidence of where it came from`;
+  }
+  const stack = error.stack;
+  if (stack === undefined) {
+    return `${id} threw an Error with no stack, so its origin cannot be checked`;
+  }
+  const member = (id.split(".").pop() ?? id).trim();
+  const frames = stack
+    .split("\n")
+    .slice(1)
+    .filter(
+      (frame) =>
+        frame.includes("/packages/strategy-runtime/src/") ||
+        frame.includes("/packages/strategy-sdk/src/"),
+    );
+  if (frames.length === 0) {
+    return (
+      `${id} is classified PARTIAL, but the error its witness threw came from no frame inside ` +
+      "packages/strategy-runtime/src or packages/strategy-sdk/src — a closure that throws on " +
+      "its own is not a witness that this callable throws"
+    );
+  }
+  const matched = frames.some((frame) => {
+    const name = (/\s+at\s+([^(]+)\s+\(/.exec(frame)?.[1] ?? "").trim();
+    return name === member || name.endsWith(`.${member}`);
+  });
+  return matched
+    ? undefined
+    : `${id}'s witness threw from inside the packages, but from no frame named "${member}": ` +
+        `the witness is exercising a different callable than the one it is registered under\n` +
+        frames.join("\n");
 }
 
 function cyclicValue(): Record<string, unknown> {
@@ -789,16 +952,69 @@ describe("the boundary surface is resolved from the module graph, not scanned", 
         expect(() => call([]), id).not.toThrow();
         continue;
       }
+      // Round 6, LOW 1: a VALID value in every position this iteration is not
+      // fuzzing, so a hostile argument in a later position is actually reached
+      // instead of being answered by an earlier refusal.
+      const baseline = MULTI_PARAMETER_BASELINES[id]?.() ?? [];
       for (let position = 0; position < arity; position += 1) {
         for (const [label, value] of hostileValues()) {
           const args = Array.from({ length: arity }, (_, index) =>
-            index === position ? value : undefined,
+            index === position ? value : baseline[index],
           );
           expect(
             () => call(args),
             `${id} threw for a ${label} in parameter ${String(position)}`,
           ).not.toThrow();
         }
+      }
+    }
+  });
+
+  it("every hostile argument is actually READ: multi-parameter positions are reached", () => {
+    // Review round 6's LOW 1. `restoreCheckpoint(undefined, hostile)` returns on
+    // the checkpoint before `identity` is read, so the battery's later-parameter
+    // rows asserted nothing at all. A baseline argument alone does not prove the
+    // fix — this does, with a proxy in the target position that records the
+    // access, and a call that has to be non-throwing anyway.
+    const multiParameter = Object.entries(REGISTRY)
+      .filter(
+        ([, value]) =>
+          value.visibility === "PUBLIC" && value.totality === "TOTAL" && value.params.length > 1,
+      )
+      .map(([id]) => id)
+      .sort();
+    expect(
+      Object.keys(MULTI_PARAMETER_BASELINES).sort(),
+      "a PUBLIC TOTAL callable takes more than one parameter and has no valid baseline: without " +
+        "one, fuzzing its later parameters is vacuous — an earlier `undefined` answers first",
+    ).toEqual(multiParameter);
+
+    for (const id of multiParameter) {
+      const call = PUBLIC_TOTAL_CALLS[id];
+      const makeBaseline = MULTI_PARAMETER_BASELINES[id];
+      expect(call, id).toBeDefined();
+      expect(makeBaseline, id).toBeDefined();
+      if (call === undefined || makeBaseline === undefined) {
+        continue;
+      }
+      const arity = REGISTRY[id]?.params.length ?? 0;
+      for (let position = 0; position < arity; position += 1) {
+        const baseline = [...makeBaseline()];
+        const target = baseline[position];
+        expect(
+          typeof target === "object" && target !== null,
+          `${id} baseline for parameter ${String(position)} must be an object to be observable`,
+        ).toBe(true);
+        const probe = readRecordingProxy(target as object);
+        baseline[position] = probe.value;
+        expect(() => call(baseline), `${id} threw for its own valid baseline`).not.toThrow();
+        expect(
+          probe.wasRead(),
+          `${id} never READ parameter ${String(position)} (${
+            REGISTRY[id]?.params[position] ?? "?"
+          }) even with valid arguments everywhere else — every hostile value the battery puts ` +
+            "there is unreached, so those rows assert nothing",
+        ).toBe(true);
       }
     }
   });
@@ -844,18 +1060,89 @@ describe("the boundary surface is resolved from the module graph, not scanned", 
         "out of the fuzz: give it a concrete precondition and a call that breaks it",
     ).toEqual(partials);
 
-    for (const id of partials) {
-      const witness = PUBLIC_PARTIAL_WITNESSES[id];
-      expect(witness, id).toBeDefined();
-      if (witness === undefined) {
-        continue;
+    // Deeper stacks than the default 10 frames, so the package frame is present
+    // even for a witness that goes through the runtime's callback machinery.
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 60;
+    try {
+      for (const id of partials) {
+        const witness = PUBLIC_PARTIAL_WITNESSES[id];
+        expect(witness, id).toBeDefined();
+        if (witness === undefined) {
+          continue;
+        }
+        expect(witness.precondition.length, `${id} precondition`).toBeGreaterThan(15);
+        expect(
+          witness.breaks,
+          `${id} is classified PARTIAL but its documented precondition, broken, does not throw — ` +
+            "so PARTIAL is hiding it from the fuzz rather than describing it",
+        ).toThrow(witness.throws);
+
+        // Round 6, LOW 2: and the throw has to come from the callable it names.
+        let thrown: unknown;
+        try {
+          witness.breaks();
+        } catch (error) {
+          thrown = error;
+        }
+        const problem = witnessThrewFromTheNamedCallable(id, thrown);
+        expect(problem ?? "", problem ?? id).toBe("");
       }
-      expect(witness.precondition.length, `${id} precondition`).toBeGreaterThan(15);
-      expect(
-        witness.breaks,
-        `${id} is classified PARTIAL but its documented precondition, broken, does not throw — ` +
-          "so PARTIAL is hiding it from the fuzz rather than describing it",
-      ).toThrow(witness.throws);
+    } finally {
+      Error.stackTraceLimit = limit;
+    }
+  });
+
+  it("…and an unrelated closure that merely throws is NOT a witness (round 6, LOW 2)", () => {
+    // The escape round 6 found, executable. Every one of these satisfies
+    // `toThrow`; none of them is evidence that the named callable can throw.
+    const notWitnesses: ReadonlyArray<readonly [string, () => unknown]> = [
+      [
+        "canonicalJsonStringify",
+        () => {
+          throw new TypeError("a cyclic value has no canonical serialization");
+        },
+      ],
+      [
+        "deepFreeze",
+        () => {
+          throw new Error("PREVENT_EXTENSIONS");
+        },
+      ],
+      // …and a witness that DOES reach the packages, but a different callable
+      // than the one it is registered under.
+      ["deepFreeze", () => DeterministicRng.fromSeed("12345").nextIntBelow(0)],
+    ];
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 60;
+    try {
+      for (const [id, breaks] of notWitnesses) {
+        let thrown: unknown;
+        try {
+          breaks();
+        } catch (error) {
+          thrown = error;
+        }
+        expect(thrown, `${id}: the impostor must still throw, or it proves nothing`).toBeInstanceOf(
+          Error,
+        );
+        expect(
+          witnessThrewFromTheNamedCallable(id, thrown),
+          `an impostor witness for ${id} was accepted: the coupling is not doing its job`,
+        ).toBeDefined();
+      }
+      // …while the real ones are accepted, so the check is not simply strict.
+      for (const [id, witness] of Object.entries(PUBLIC_PARTIAL_WITNESSES)) {
+        let thrown: unknown;
+        try {
+          witness.breaks();
+        } catch (error) {
+          thrown = error;
+        }
+        expect(witnessThrewFromTheNamedCallable(id, thrown), id).toBeUndefined();
+      }
+    } finally {
+      Error.stackTraceLimit = limit;
     }
   });
 

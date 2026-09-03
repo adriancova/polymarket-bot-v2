@@ -53,6 +53,59 @@
  * mechanism which silently treats an unrecognized boundary as internal is worse
  * than one that stops.
  *
+ * ---------------------------------------------------------------------------
+ * REMEDIATION ROUND 6, 2026-09-03 — the binding property, stated once
+ *
+ * Review round 6 found that rule 4 above was true of the shapes it happened to
+ * meet and SILENT about three others. `visitHandedOut` called `visitProperties`
+ * and nothing else, so a compiler-clean fixture produced callables that appeared
+ * in NEITHER `callables` NOR `unresolved`: a getter returning a function, both
+ * branches of a generic conditional return, and the value type of a callable-only
+ * index signature. Round 5's own fail-closed handling of a class expression and
+ * of a non-class constructible proves the mechanism KNEW how to stop; it simply
+ * did not do it uniformly.
+ *
+ * The property this module now holds, and the one every future change must
+ * preserve:
+ *
+ *   **Every callable shape is either ENUMERATED BY NAME or recorded as
+ *   `unresolved` BY NAME. Silence is never an outcome.**
+ *
+ * What that required, mechanically:
+ *
+ * - a handed-out type's own CALL SIGNATURES are recorded (`X (returned)`), so a
+ *   function that returns a function — from a `return`, from a getter, or from
+ *   another returned callable — is on the list;
+ * - a conditional return type (`T extends … ? Left : Right`) is EXPANDED into
+ *   both branches through `ConditionalRoot.node`, and a type parameter becomes
+ *   its base constraint; a conditional that cannot be expanded is refused;
+ * - an INDEX SIGNATURE whose value type carries callables is refused by name.
+ *   That is deliberate rather than lazy: there is no concrete key, so there is
+ *   no name the fuzz could drive, and inventing one would be a registry entry no
+ *   probe can call. The reviewer's instruction, followed literally;
+ * - a foreign generic container's TYPE ARGUMENTS (`readonly Fn[]`,
+ *   `Promise<Facade>`, `ReadonlyMap<string, Facade>`) are refused by name for
+ *   the same reason — an element has an index, not a name. Our OWN generics are
+ *   not refused: their instantiated members are already reached as properties;
+ * - a handed-out type with CONSTRUCT signatures is visited when it is one of our
+ *   classes and refused otherwise, mirroring `visitValue`'s round-5 rule;
+ * - `MAX_SURFACE_DEPTH` now REFUSES when callables remain below it. It used to
+ *   return silently on the handed-out path, which truncated a ten-hop chain of
+ *   returned facades with no trace at all;
+ * - the walk no longer requires the handed-out type's own SYMBOL to be ours. It
+ *   did, so `Readonly<OurInterface>` — a mapped type whose alias symbol is the
+ *   standard library's — dropped every member. `Readonly<MarketView>` and its
+ *   siblings are the SDK's actual return types, so this one was a live hazard
+ *   rather than a hypothetical one; it carries no methods today, which is why
+ *   nothing was lost.
+ *
+ * The cost of this shape is over-refusal, never under-enumeration: a container
+ * of a NAMED facade is refused even though its members could have been named.
+ * That is the same trade the visibility rule makes — over-classifying costs a
+ * fuzz obligation, under-classifying costs a defect — and a refusal is a loud,
+ * reviewable stop rather than a silence.
+ * ---------------------------------------------------------------------------
+ *
  * Visibility is derived, never assumed:
  * - PUBLIC — the symbol is exported AS A VALUE from one of the ENTRY POINTS, or
  *   it is a member of a class or interface whose TYPE the entry points export.
@@ -88,7 +141,15 @@ export type CallableShape =
   | "getter"
   | "setter"
   | "declared method"
-  | "declared property function";
+  | "declared property function"
+  /**
+   * Round 6: a callable a handed-out TYPE is itself. `makeHandler()` returning
+   * `(value) => string`, a getter whose value is a function, a callable
+   * interface (the shape a callable `Proxy` is handed out under). Named by the
+   * SITE — `makeHandler (returned)` — because that is the expression a probe
+   * actually evaluates to reach it.
+   */
+  | "returned callable";
 
 /** Which of the four reachability rules put this callable on the list. */
 export type Reachability = "module export" | "class member" | "object property" | "handed out";
@@ -151,6 +212,26 @@ export interface DerivationRequest {
  * `MAX_MATERIALIZED_DEPTH`.
  */
 export const MAX_SURFACE_DEPTH = 8;
+
+/**
+ * Type flags that cannot carry a callable declared in these packages: the
+ * primitives, the top and bottom types, and `object`. Skipping them is not a
+ * silent omission — there is nothing there to omit — and it keeps the walk from
+ * enumerating `String.prototype` once per `now(): string`.
+ */
+const NON_CARRYING_TYPE_FLAGS =
+  ts.TypeFlags.Any |
+  ts.TypeFlags.Unknown |
+  ts.TypeFlags.Never |
+  ts.TypeFlags.Void |
+  ts.TypeFlags.Undefined |
+  ts.TypeFlags.Null |
+  ts.TypeFlags.StringLike |
+  ts.TypeFlags.NumberLike |
+  ts.TypeFlags.BigIntLike |
+  ts.TypeFlags.BooleanLike |
+  ts.TypeFlags.ESSymbolLike |
+  ts.TypeFlags.NonPrimitive;
 
 function sourceFilesUnder(root: string, relativeDir: string): string[] {
   const absolute = join(root, relativeDir);
@@ -239,9 +320,17 @@ class SurfaceWalk {
   private readonly ourFiles: ReadonlySet<string>;
   private readonly publicValues = new Set<ts.Symbol>();
   private readonly publicTypes = new Set<ts.Symbol>();
-  private readonly entries = new Map<ts.Symbol, DerivedCallable[]>();
+  /**
+   * Keyed by the declaring symbol where there is one, and by the derived id
+   * where there is not (round 6: a returned callable's signature may belong to
+   * an anonymous type). A symbol can carry several callables — every overload,
+   * and each half of an accessor pair — which is why the value is a list.
+   */
+  private readonly entries = new Map<ts.Symbol | string, DerivedCallable[]>();
   private readonly unresolved: UnresolvedCallable[] = [];
   private readonly walkedTypes = new Map<ts.Type, Set<Visibility>>();
+  /** Round 6: `visitClass` is reachable from a handed-out `typeof C`, so it is guarded. */
+  private readonly visitedClasses = new Set<ts.Symbol>();
 
   constructor(
     private readonly program: ts.Program,
@@ -400,7 +489,7 @@ class SurfaceWalk {
 
   // --- recording -------------------------------------------------------------
 
-  private record(symbol: ts.Symbol, entry: DerivedCallable): void {
+  private record(symbol: ts.Symbol | string, entry: DerivedCallable): void {
     const existing = this.entries.get(symbol) ?? [];
     this.entries.set(symbol, existing);
     const index = existing.findIndex((previous) => previous.id === entry.id);
@@ -464,19 +553,25 @@ class SurfaceWalk {
     via: Reachability,
     depth: number,
   ): void {
-    const calls = type.getCallSignatures();
-    if (calls.length > 0) {
-      this.recordSignatures(id, symbol, calls, visibility, via, depth);
+    const file = this.fileOf(symbol);
+    for (const constituent of this.concreteConstituents(id, file, type)) {
+      const calls = constituent.getCallSignatures();
+      if (calls.length > 0) {
+        this.recordSignatures(id, symbol, calls, visibility, via, depth);
+      }
+      if (
+        constituent.getConstructSignatures().length > 0 &&
+        (symbol.flags & ts.SymbolFlags.Class) === 0
+      ) {
+        this.refuse(
+          id,
+          file,
+          "a non-class value with construct signatures: enumerate it in boundary-derivation.ts " +
+            "rather than letting this walk guess how it is constructed",
+        );
+      }
+      this.visitCarrier(id, file, constituent, visibility, depth);
     }
-    if (type.getConstructSignatures().length > 0 && (symbol.flags & ts.SymbolFlags.Class) === 0) {
-      this.refuse(
-        id,
-        this.fileOf(symbol),
-        "a non-class value with construct signatures: enumerate it in boundary-derivation.ts " +
-          "rather than letting this walk guess how it is constructed",
-      );
-    }
-    this.visitProperties(id, type, visibility, depth);
   }
 
   private recordSignatures(
@@ -505,15 +600,22 @@ class SurfaceWalk {
         );
         return;
       }
+      const file = repoRelative(this.root, declaration.getSourceFile().fileName);
       this.record(symbol, {
         id: label,
-        file: repoRelative(this.root, declaration.getSourceFile().fileName),
+        file,
         visibility,
         params: parametersOf(declaration),
         shape,
         via,
       });
-      this.visitHandedOut(this.checker.getReturnTypeOfSignature(signature), visibility, depth + 1);
+      this.visitHandedOut(
+        label,
+        file,
+        this.checker.getReturnTypeOfSignature(signature),
+        visibility,
+        depth + 1,
+      );
     });
   }
 
@@ -538,6 +640,10 @@ class SurfaceWalk {
   }
 
   private visitClass(className: string, symbol: ts.Symbol): void {
+    if (this.visitedClasses.has(symbol)) {
+      return; // round 6: also reachable from a handed-out `typeof C`
+    }
+    this.visitedClasses.add(symbol);
     const declaration = (symbol.getDeclarations() ?? []).find(ts.isClassDeclaration);
     if (declaration === undefined) {
       this.refuse(className, this.fileOf(symbol), "class symbol without a class declaration");
@@ -644,7 +750,11 @@ class SurfaceWalk {
           via,
         });
       }
+      // Round 6: the accessor's VALUE may itself be a callable. `get handler():
+      // (value) => string` used to record the getter and lose the handler.
       this.visitHandedOut(
+        id,
+        this.fileOf(member),
         this.checker.getTypeOfSymbolAtLocation(member, accessors[0] as ts.Declaration),
         visibility,
         depth + 1,
@@ -654,10 +764,7 @@ class SurfaceWalk {
 
     const type = this.checker.getTypeOfSymbolAtLocation(member, declarations[0] as ts.Declaration);
     if (depth + 1 > MAX_SURFACE_DEPTH) {
-      if (
-        type.getCallSignatures().length > 0 ||
-        this.checker.getPropertiesOfType(type).some((property) => this.isOurs(property))
-      ) {
+      if (this.carriesCallables(type)) {
         this.refuse(
           id,
           this.fileOf(member),
@@ -673,22 +780,317 @@ class SurfaceWalk {
   /**
    * Rule 4: a type this package RETURNS is a value this package constructs and
    * hands to someone else, so its callable members are this package's callables.
+   *
+   * Round 6 made this TOTAL over the type. Before, it called `visitProperties`
+   * and nothing else, so a returned callable, an unresolved conditional branch
+   * and a callable index signature were all silently absent. Now every branch
+   * ends in an entry or a refusal.
    */
-  private visitHandedOut(type: ts.Type, handedOutBy: Visibility, depth: number): void {
-    if (depth > MAX_SURFACE_DEPTH) {
-      return;
-    }
-    const constituents = type.isUnion() || type.isIntersection() ? type.types : [type];
-    for (const constituent of constituents) {
-      const symbol = constituent.getSymbol() ?? constituent.aliasSymbol;
-      if (symbol === undefined || !this.isOurs(symbol)) {
+  private visitHandedOut(
+    ownerId: string,
+    file: string,
+    type: ts.Type,
+    handedOutBy: Visibility,
+    depth: number,
+  ): void {
+    for (const constituent of this.concreteConstituents(ownerId, file, type)) {
+      if ((constituent.flags & NON_CARRYING_TYPE_FLAGS) !== 0) {
+        continue; // a primitive, `void`, `never`: nothing to omit
+      }
+      if (depth > MAX_SURFACE_DEPTH) {
+        if (this.carriesCallables(constituent)) {
+          this.refuse(
+            `${ownerId} (returned)`,
+            file,
+            `the handed-out walk reached MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)}) with ` +
+              "callables still below it; flatten the chain of returned facades or classify this " +
+              "branch explicitly",
+          );
+        }
         continue;
       }
+      const symbol = constituent.getSymbol() ?? constituent.aliasSymbol;
+      const named = symbol !== undefined && this.isOurs(symbol) ? symbol.getName() : undefined;
       const visibility: Visibility =
         this.isPublicType(symbol) || handedOutBy === "PUBLIC" ? "PUBLIC" : "PACKAGE";
-      const name = symbol.getName();
-      this.visitProperties(name === "__type" ? "handed out" : name, constituent, visibility, depth);
+
+      // 1. The type IS a callable — `makeHandler(): (value) => string`, a getter
+      //    whose value is a function, a callable interface. Named by the site.
+      this.recordReturnedSignatures(ownerId, file, constituent, visibility, depth);
+
+      // 2. The type is CONSTRUCTIBLE. One of our classes is walked as a class;
+      //    anything else is refused, exactly as `visitValue` refuses it.
+      this.visitReturnedConstructible(ownerId, file, constituent, symbol);
+
+      // 3. Its members, its index signatures and its container type arguments.
+      this.visitCarrier(
+        named === undefined || named === "__type" || named === "__object"
+          ? `${ownerId} (returned)`
+          : named,
+        file,
+        constituent,
+        visibility,
+        depth,
+      );
     }
+  }
+
+  /** The call signatures a handed-out type carries, when they are declared here. */
+  private recordReturnedSignatures(
+    ownerId: string,
+    file: string,
+    type: ts.Type,
+    visibility: Visibility,
+    depth: number,
+  ): void {
+    const signatures = type.getCallSignatures();
+    signatures.forEach((signature, index) => {
+      const declaration = signature.getDeclaration() as ts.SignatureDeclaration | undefined;
+      const label =
+        signatures.length === 1
+          ? `${ownerId} (returned)`
+          : `${ownerId} (returned, overload ${String(index + 1)} of ${String(signatures.length)})`;
+      if (declaration === undefined) {
+        this.refuse(
+          label,
+          file,
+          "a returned call signature with no declaration: its parameters cannot be enumerated",
+        );
+        return;
+      }
+      if (!this.ourFiles.has(resolve(declaration.getSourceFile().fileName))) {
+        // Somebody else's callable, handed straight through. Rule 4 is about
+        // values this package CONSTRUCTS; a foreign declaration is outside it,
+        // the same way a foreign property is.
+        return;
+      }
+      this.record(label, {
+        id: label,
+        file: repoRelative(this.root, declaration.getSourceFile().fileName),
+        visibility,
+        params: parametersOf(declaration),
+        shape: "returned callable",
+        via: "handed out",
+      });
+      this.visitHandedOut(
+        label,
+        file,
+        this.checker.getReturnTypeOfSignature(signature),
+        visibility,
+        depth + 1,
+      );
+    });
+  }
+
+  /** A handed-out value someone can `new`: our class, or a refusal. */
+  private visitReturnedConstructible(
+    ownerId: string,
+    file: string,
+    type: ts.Type,
+    symbol: ts.Symbol | undefined,
+  ): void {
+    const constructs = type
+      .getConstructSignatures()
+      .filter((signature) => this.isOurSignature(signature));
+    if (constructs.length === 0) {
+      return;
+    }
+    if (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Class) !== 0 && this.isOurs(symbol)) {
+      this.visitClass(symbol.getName(), symbol);
+      return;
+    }
+    this.refuse(
+      `${ownerId} (returned)`,
+      file,
+      "a handed-out value with construct signatures that is not one of our classes: enumerate it " +
+        "in boundary-derivation.ts rather than letting this walk guess what `new` runs",
+    );
+  }
+
+  /**
+   * The parts of a type that carry callables but are not call signatures:
+   * properties, index signatures, and a foreign container's type arguments.
+   * Shared by the value walk and the handed-out walk so both fail closed the
+   * same way.
+   */
+  private visitCarrier(
+    ownerId: string,
+    file: string,
+    type: ts.Type,
+    visibility: Visibility,
+    depth: number,
+  ): void {
+    if ((type.flags & NON_CARRYING_TYPE_FLAGS) !== 0) {
+      return;
+    }
+    this.visitProperties(ownerId, type, visibility, depth);
+    let refusedByIndex = false;
+    for (const info of this.checker.getIndexInfosOfType(type)) {
+      if (!this.carriesCallables(info.type)) {
+        continue;
+      }
+      refusedByIndex = true;
+      this.refuse(
+        `${ownerId}[${this.checker.typeToString(info.keyType)}]`,
+        file,
+        "an index signature whose value type carries a callable: an index has no NAME, so there " +
+          "is no expression the hostile battery could drive. Give the value type a named " +
+          "declaration this walk can enumerate, or classify this branch explicitly — inventing " +
+          "a synthetic id here would be a registry entry no probe can call",
+      );
+    }
+    if (refusedByIndex) {
+      // An array is both: `readonly Fn[]` has a `[number]` index signature AND a
+      // type argument. One named refusal per site is loud enough; two is noise.
+      return;
+    }
+    this.foreignTypeArguments(type).forEach((argument, index) => {
+      if (!this.carriesCallables(argument)) {
+        return;
+      }
+      this.refuse(
+        `${ownerId} (type argument ${String(index + 1)} of ${this.checker.typeToString(type)})`,
+        file,
+        "a container declared outside these packages whose type argument carries a callable " +
+          "(an array element, a promised value, a map value): the element has an index or a key, " +
+          "not a name, so no probe can drive it. Hand out a named facade instead, or classify " +
+          "this branch explicitly",
+      );
+    });
+  }
+
+  /**
+   * Reduces a type to the constituents this walk can classify: unions and
+   * intersections are flattened, a CONDITIONAL type is expanded into both of its
+   * branches, and a type parameter becomes its base constraint. A conditional
+   * that cannot be expanded is REFUSED rather than skipped, which is the whole
+   * point of round 6.
+   */
+  private concreteConstituents(ownerId: string, file: string, type: ts.Type): ts.Type[] {
+    const concrete: ts.Type[] = [];
+    const pending: ts.Type[] = [type];
+    const seen = new Set<ts.Type>();
+    while (pending.length > 0) {
+      const current = pending.pop() as ts.Type;
+      if (seen.has(current)) {
+        continue;
+      }
+      seen.add(current);
+      if (current.isUnion() || current.isIntersection()) {
+        pending.push(...current.types);
+        continue;
+      }
+      if ((current.flags & ts.TypeFlags.Conditional) !== 0) {
+        const branches = conditionalBranches(this.checker, current as ts.ConditionalType);
+        if (branches === undefined) {
+          this.refuse(
+            `${ownerId} (conditional)`,
+            file,
+            "a conditional type whose branches this walk cannot expand: every callable in each " +
+              "branch would be invisible, so it stops instead. Return a named union of the " +
+              "branch types, or classify this branch explicitly",
+          );
+          continue;
+        }
+        pending.push(...branches);
+        continue;
+      }
+      if ((current.flags & ts.TypeFlags.Instantiable) !== 0) {
+        // A type PARAMETER. Its constraint is the most this package can know;
+        // an unconstrained `T` (`params<T>(): Readonly<T>`) is the CALLER's
+        // type, and a callable in it is the caller's callable, not ours.
+        const constraint = this.checker.getBaseConstraintOfType(current);
+        if (constraint !== undefined) {
+          pending.push(constraint);
+        }
+        continue;
+      }
+      concrete.push(current);
+    }
+    return concrete;
+  }
+
+  /** Type arguments of a generic declared OUTSIDE these packages. */
+  private foreignTypeArguments(type: ts.Type): readonly ts.Type[] {
+    if ((type.flags & ts.TypeFlags.Object) === 0) {
+      return [];
+    }
+    if (((type as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference) === 0) {
+      return [];
+    }
+    const reference = type as ts.TypeReference;
+    const target = reference.target.getSymbol();
+    if (target !== undefined && this.isOurs(target)) {
+      // One of OUR generics: `visitProperties` already walks its instantiated
+      // members, so refusing on the type argument would be a false alarm.
+      return [];
+    }
+    return this.checker.getTypeArguments(reference);
+  }
+
+  /**
+   * Does this type carry a callable DECLARED IN THESE PACKAGES, anywhere a
+   * bounded walk can reach? Used where the answer decides between "nothing to
+   * see" and "refuse by name": the depth bound, index signatures, and container
+   * type arguments.
+   */
+  private carriesCallables(type: ts.Type, depth = 0, seen = new Set<ts.Type>()): boolean {
+    if (depth > MAX_SURFACE_DEPTH || seen.has(type) || (type.flags & NON_CARRYING_TYPE_FLAGS) !== 0) {
+      return false;
+    }
+    seen.add(type);
+    if (type.isUnion() || type.isIntersection()) {
+      return type.types.some((constituent) => this.carriesCallables(constituent, depth + 1, seen));
+    }
+    if (
+      [...type.getCallSignatures(), ...type.getConstructSignatures()].some((signature) =>
+        this.isOurSignature(signature),
+      )
+    ) {
+      return true;
+    }
+    for (const property of this.checker.getPropertiesOfType(type)) {
+      const declarations = property.getDeclarations() ?? [];
+      if (
+        !this.isOurs(property) ||
+        property.getName().startsWith("#") ||
+        declarations.some((declaration) => hasModifier(declaration, ts.ModifierFlags.Private))
+      ) {
+        continue;
+      }
+      const declaration = declarations[0];
+      if (declaration === undefined) {
+        continue;
+      }
+      const propertyType = this.checker.getTypeOfSymbolAtLocation(property, declaration);
+      if (this.carriesCallables(propertyType, depth + 1, seen)) {
+        return true;
+      }
+    }
+    for (const info of this.checker.getIndexInfosOfType(type)) {
+      if (this.carriesCallables(info.type, depth + 1, seen)) {
+        return true;
+      }
+    }
+    if ((type.flags & ts.TypeFlags.Object) !== 0) {
+      const object = type as ts.ObjectType;
+      if ((object.objectFlags & ts.ObjectFlags.Reference) !== 0) {
+        for (const argument of this.checker.getTypeArguments(type as ts.TypeReference)) {
+          if (this.carriesCallables(argument, depth + 1, seen)) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  private isOurSignature(signature: ts.Signature): boolean {
+    const declaration = signature.getDeclaration() as ts.SignatureDeclaration | undefined;
+    return (
+      declaration !== undefined &&
+      this.ourFiles.has(resolve(declaration.getSourceFile().fileName))
+    );
   }
 
   /** The named type a member belongs to, when there is one. */
@@ -721,6 +1123,27 @@ class SurfaceWalk {
     }
     return undefined;
   }
+}
+
+/**
+ * Both branches of a conditional return type. A generic `T extends X ? A : B`
+ * is never resolved by the checker — the call has no argument yet — so the
+ * branches are read from the conditional's own declaration node, which is
+ * public API (`ConditionalRoot.node`). `undefined` means "could not expand",
+ * which the caller turns into a named refusal rather than a silent skip.
+ */
+function conditionalBranches(
+  checker: ts.TypeChecker,
+  type: ts.ConditionalType,
+): readonly ts.Type[] | undefined {
+  if (type.resolvedTrueType !== undefined && type.resolvedFalseType !== undefined) {
+    return [type.resolvedTrueType, type.resolvedFalseType];
+  }
+  const node: ts.ConditionalTypeNode | undefined = type.root.node;
+  if (node === undefined) {
+    return undefined;
+  }
+  return [checker.getTypeFromTypeNode(node.trueType), checker.getTypeFromTypeNode(node.falseType)];
 }
 
 function parametersOf(declaration: ts.SignatureDeclaration): string[] {

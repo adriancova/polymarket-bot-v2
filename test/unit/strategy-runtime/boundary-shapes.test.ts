@@ -31,6 +31,28 @@
  * | a value with construct signatures that is no class | INVISIBLE    | REFUSED, loudly |
  * | a private member                                    | absent       | absent |
  * | an interface only ever taken as a PARAMETER         | absent       | absent |
+ *
+ * REMEDIATION ROUND 6, 2026-09-03. Review round 6 pointed the same method at the
+ * RETURN position and found the derivation silent — not wrong, silent — for
+ * three shapes, and this round's own hunt found four more. The binding property
+ * is now stated once, in `boundary-derivation.ts`: *every callable shape is
+ * either enumerated by name or recorded as `unresolved` by name; silence is
+ * never an outcome.* Both halves are fixtures:
+ *
+ * | shape (round 6)                                      | round 5           | now |
+ * | ---------------------------------------------------- | ----------------- | --- |
+ * | a getter whose value is a function                   | SILENTLY ABSENT   | `X (returned)` |
+ * | a function that returns a function                   | SILENTLY ABSENT   | `X (returned)` |
+ * | a callable returned by a callable returned by a getter | SILENTLY ABSENT | both hops |
+ * | `T extends … ? Left : Right`                          | SILENTLY ABSENT   | both branches |
+ * | a callable interface (a callable `Proxy`'s type)      | SILENTLY ABSENT   | `X (returned)` |
+ * | `Readonly<OurInterface>` (found this round)           | SILENTLY ABSENT   | enumerated |
+ * | an anonymous inline return type                       | named `handed out` | named by its site |
+ * | a callable-only index signature                       | SILENTLY ABSENT   | REFUSED by name |
+ * | `readonly Fn[]` (found this round)                    | SILENTLY ABSENT   | REFUSED by name |
+ * | `Promise<Facade>` (found this round)                  | SILENTLY ABSENT   | REFUSED by name |
+ * | a handed-out `new (…)` (found this round)             | SILENTLY ABSENT   | REFUSED by name |
+ * | a chain past `MAX_SURFACE_DEPTH` (found this round)   | SILENTLY TRUNCATED | REFUSED by name |
  */
 
 import { dirname, join, resolve } from "node:path";
@@ -66,12 +88,35 @@ const EXPECTED_SHAPES: readonly string[] = [
   'ExportedClass.staticMethod [PUBLIC] (value) <method>',
   'HandedOutFacade.compute [PUBLIC] (value) <declared property function>',
   'HandedOutFacade.describe [PUBLIC] (value, label) <declared method>',
+  // Round 6: both branches of a generic conditional return type.
+  'LeftBranch.left [PUBLIC] (value) <declared method>',
+  'RightBranch.right [PUBLIC] (value) <declared method>',
+  // Round 6: a mapped type in the return position — `Readonly<MarketView>`'s shape.
+  'MappedFacade.mapped [PUBLIC] (value) <declared method>',
+  // Round 6: a getter whose value is a function, and two hops of the same.
+  'ReturningAccessor.handler (getter) [PUBLIC] () <getter>',
+  'ReturningAccessor.handler (returned) [PUBLIC] (value) <returned callable>',
+  'NestedReturningAccessor.outer (getter) [PUBLIC] () <getter>',
+  'NestedReturningAccessor.outer (returned) [PUBLIC] () <returned callable>',
+  'NestedReturningAccessor.outer (returned) (returned) [PUBLIC] (value) <returned callable>',
   'TypeOnlyExportedClass.constructor [PACKAGE] (seed) <constructor>',
   'TypeOnlyExportedClass.describe [PUBLIC] (value) <method>',
   'arrowConst [PUBLIC] (value) <callable const>',
   'clauseOnly [PUBLIC] (value) <function>',
+  'conditionalFactory [PUBLIC] (flag) <function>',
   'directlyInTheEntryPoint [PUBLIC] (value, label) <function>',
+  // Round 6: a callable interface — the type a callable `Proxy` is handed out under.
+  'makeCallableFacade [PUBLIC] () <function>',
+  'makeCallableFacade (returned) [PUBLIC] (value) <returned callable>',
   'makeFacade [PUBLIC] () <function>',
+  // Round 6: an ordinary function that returns a function.
+  'makeHandler [PUBLIC] () <function>',
+  'makeHandler (returned) [PUBLIC] (value) <returned callable>',
+  // Round 6: an anonymous inline return type, named by its SITE rather than
+  // by the placeholder "handed out" every such type used to share.
+  'makeInline [PUBLIC] () <function>',
+  'makeInline (returned).inline [PUBLIC] (value) <declared method>',
+  'makeMapped [PUBLIC] () <function>',
   'makeTypeOnly [PUBLIC] (seed) <function>',
   'objectApi.method [PUBLIC] (value) <method>',
   'objectApi.nested.deeper [PUBLIC] (value) <property function>',
@@ -156,6 +201,89 @@ describe("the derivation sees every export shape, and classifies each one", () =
     // that does not live here. Same for a declarations-only entry point.
     expect(ids).not.toContain("NeverImplementedPort.persist");
     expect(ids).not.toContain("DeclaredOnly.compute");
+  });
+
+  it("round 6: a callable reached through the RETURN position is enumerated, by name", () => {
+    // Review round 6's finding, made permanent. Every id below appeared in
+    // NEITHER `callables` NOR `unresolved` under round 5's walk: the derivation
+    // called `visitProperties` on a handed-out type and nothing else, so a
+    // returned callable, a conditional branch and a mapped-type member were all
+    // silently absent. Silence is the one outcome this mechanism may not have.
+    const byId = new Map(fixtureSurface().callables.map((entry) => [entry.id, entry]));
+    for (const [id, params] of [
+      // a getter whose value is a function, and the reviewer's note that an
+      // ordinary function returning a function has the same hole
+      ["ReturningAccessor.handler (returned)", ["value"]],
+      ["makeHandler (returned)", ["value"]],
+      // two hops: a callable returned from a callable returned from a getter
+      ["NestedReturningAccessor.outer (returned)", []],
+      ["NestedReturningAccessor.outer (returned) (returned)", ["value"]],
+      // BOTH branches of `T extends string ? LeftBranch : RightBranch`
+      ["LeftBranch.left", ["value"]],
+      ["RightBranch.right", ["value"]],
+      // a callable interface: the shape a callable `Proxy` is handed out under
+      ["makeCallableFacade (returned)", ["value"]],
+      // a mapped type — the SDK returns `Readonly<MarketView>` and its siblings
+      ["MappedFacade.mapped", ["value"]],
+      // an anonymous inline return type, named by its site
+      ["makeInline (returned).inline", ["value"]],
+    ] as ReadonlyArray<readonly [string, readonly string[]]>) {
+      const entry = byId.get(id);
+      expect(entry, `${id} is silently absent again`).toBeDefined();
+      expect(entry?.visibility, `${id} visibility`).toBe("PUBLIC");
+      expect(entry?.params, `${id} parameters`).toEqual(params);
+    }
+    // …and the walk still refuses nothing over this fixture, so the enumeration
+    // above is a real answer rather than a wave of refusals.
+    expect(fixtureSurface().unresolved).toEqual([]);
+  });
+
+  it("round 6: where no NAME reaches the callable, the walk REFUSES by name", () => {
+    // The other half of the binding property. An index has no name, an array
+    // element has an index, a promised value has neither; a probe cannot drive
+    // any of them, so inventing an id would put a registry entry in front of the
+    // hostile battery that it could never call. The reviewer's instruction —
+    // "emit `unresolved` where no concrete callable name can be driven" — taken
+    // literally. Every one of these was SILENT before this round.
+    const derivation = deriveBoundarySurface({
+      root: FIXTURES,
+      configRoot: REPO_ROOT,
+      packageDirs: ["unnamed/src"],
+      entryPoints: ["unnamed/src/index.ts"],
+    });
+    expect(derivation.diagnostics, "the fixture must be a program that compiles").toEqual([]);
+    expect(derivation.unresolved.map((entry) => entry.id).sort()).toEqual([
+      // a callable-only string index signature (the reviewer's shape 7)
+      "CallableIndex[string]",
+      // a chain of returned facades past MAX_SURFACE_DEPTH: it used to truncate
+      // in silence, which is how a whole subtree of callables could disappear
+      "Hop3.hop (returned)",
+      // `readonly ((value: unknown) => string)[]`
+      "arrayFactory (returned)[number]",
+      // a handed-out value someone can `new` that is not one of our classes
+      "constructibleFactory (returned)",
+      // a facade reachable only as a foreign container's type argument
+      "promiseFactory (returned) (type argument 1 of Promise<PromisedFacade>)",
+    ]);
+    for (const entry of derivation.unresolved) {
+      // A refusal has to tell the reader what to do about it, or it is just a
+      // different kind of dead end.
+      expect(entry.why.length, `${entry.id} explanation`).toBeGreaterThan(80);
+    }
+    // The factories themselves are still enumerated — the refusal is about what
+    // they RETURN, not about them — and the reachable part of the deep chain is
+    // enumerated up to the bound rather than dropped with it.
+    expect(derivation.callables.map((entry) => entry.id).sort()).toEqual([
+      "Hop0.hop",
+      "Hop1.hop",
+      "Hop2.hop",
+      "Hop3.hop",
+      "arrayFactory",
+      "constructibleFactory",
+      "deepFactory",
+      "indexFactory",
+      "promiseFactory",
+    ]);
   });
 
   it("a callable shape it cannot classify is REFUSED, not ignored", () => {
