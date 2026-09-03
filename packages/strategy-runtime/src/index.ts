@@ -68,6 +68,9 @@ export {
   canonicalJsonStringify,
   checkpointableJsonProblem,
   deepFreeze,
+  materializeCheckpointableJson,
+  type CheckpointableJson,
+  type MaterializeCheckpointableJsonResult,
 } from "./json.js";
 
 export { DeterministicRng, isRngState, type RngState } from "./rng.js";

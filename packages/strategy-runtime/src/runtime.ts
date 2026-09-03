@@ -17,6 +17,14 @@
  *   one `DecisionSink.persist` call per invoked callback, on every path —
  *   valid decision, empty/no-op decision (persisted like any other, ADR-005
  *   §2), throwing callback, watchdog timeout, invalid returned value;
+ * - do all of that work BEFORE persisting anything (review round 2). Every
+ *   step that reads strategy-supplied data — parsing the returned decision,
+ *   materializing and validating its `statePatch`, merging it into the state,
+ *   serializing the state — happens in one fallible region ahead of
+ *   `DecisionSink.persist`, so the commit that follows a persist cannot fail.
+ *   The invariants this protects: a persisted decision ALWAYS has its
+ *   checkpoint, an evaluation sequence number is NEVER re-used, and no
+ *   misbehaving strategy value can make `evaluate()` throw;
  * - checkpoint state after every persisted decision;
  * - restore compatible state on restart, refusing incompatibility (§9.6 "new
  *   run for every code, config, model, feature, or state-schema change").
@@ -57,9 +65,9 @@ import {
   type InstanceStatus,
   type StrategyStateCheckpoint,
 } from "./checkpoint.js";
-import { buildStrategyContext } from "./context.js";
+import { buildStrategyContext, type ScopedStrategyContext } from "./context.js";
 import { validateEvaluationInput, type EvaluationInput } from "./input.js";
-import { canonicalJsonStringify, checkpointableJsonProblem, deepFreeze } from "./json.js";
+import { canonicalJsonStringify, deepFreeze, materializeCheckpointableJson } from "./json.js";
 import type {
   ContainedFailure,
   EvaluationOutcome,
@@ -113,6 +121,27 @@ const UUID_SHAPED =
 function refuse(code: RuntimeCreationRefusalCode, detail: string): CreateRuntimeResult {
   return { ok: false, refusal: { code, detail } };
 }
+
+function describeCause(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}
+
+/**
+ * Everything one accepted decision commits, computed BEFORE anything is
+ * persisted: the decision as it will be recorded (its `statePatch` replaced by
+ * the runtime's own materialized copy), the next instance state, and that
+ * state's canonical bytes. Producing this can fail — that is the point of
+ * producing it first.
+ */
+interface PreparedDecision {
+  readonly decision: DecisionResult;
+  readonly state: Readonly<Record<string, unknown>>;
+  readonly stateJson: string;
+}
+
+type PrepareDecisionResult =
+  | { readonly ok: true; readonly prepared: PreparedDecision }
+  | { readonly ok: false; readonly failure: ContainedFailure };
 
 function identifierProblem(value: unknown, field: string): string | null {
   if (typeof value !== "string" || value.length === 0 || value.length > MAX_IDENTIFIER_LENGTH) {
@@ -291,6 +320,13 @@ export function createStrategyInstanceRuntime(
  */
 class StrategyInstanceRuntime {
   private state: Readonly<Record<string, unknown>>;
+  /**
+   * The canonical bytes of `state`, computed WITH it and never after a persist.
+   * Held as a field rather than recomputed inside `buildCheckpoint` so that no
+   * serialization — and therefore no possible failure — sits between
+   * `DecisionSink.persist` and `CheckpointStore.save`.
+   */
+  private stateJson: string;
   private evaluationSeq: number;
   private status: InstanceStatus;
   private evaluating = false;
@@ -309,6 +345,10 @@ class StrategyInstanceRuntime {
     initialStatus: InstanceStatus,
   ) {
     this.state = initialState;
+    // Safe here and only here: `initialState` is either the empty object or the
+    // `JSON.parse` output `restoreCheckpoint` already validated — inert data in
+    // both cases, never a caller's live object.
+    this.stateJson = canonicalJsonStringify(initialState);
     this.evaluationSeq = initialEvaluationSeq;
     this.status = initialStatus;
   }
@@ -323,7 +363,12 @@ class StrategyInstanceRuntime {
 
   /**
    * One evaluation: exactly one persisted decision record when (and only
-   * when) the callback is invoked. Never throws.
+   * when) the callback is invoked. Never throws — not for a callback that
+   * throws, not for a value the strategy returns, and not for a view the
+   * caller supplies. The two sequence facts that go with it: every persisted
+   * record consumes its own `evaluationSeq`, and an evaluation that reaches
+   * persistence and fails there leaves the instance PAUSED rather than
+   * re-usable, so no two records can ever share a sequence number.
    */
   evaluate(input: EvaluationInput): EvaluationOutcome {
     if (this.evaluating) {
@@ -364,7 +409,28 @@ class StrategyInstanceRuntime {
 
   private runEvaluation(input: EvaluationInput): EvaluationOutcome {
     const rngSnapshot = this.rng.snapshot();
-    const scoped = buildStrategyContext(input, this.params, this.state, this.rng);
+    let scoped: ScopedStrategyContext;
+    try {
+      scoped = buildStrategyContext(input, this.params, this.state, this.rng);
+    } catch (cause) {
+      // Building the context takes ownership of the caller's view objects and
+      // deep-freezes them in place (`input.ts`, `assumptions` 13). A view that
+      // refuses to be frozen — a Proxy, a host object, a sealed exotic — is an
+      // unusable INPUT, and the honest outcome is the input refusal: the
+      // callback was never invoked, so §6 invariant 3 does not bind and no
+      // record exists. It is refused rather than propagated because
+      // `evaluate()` may not throw.
+      return {
+        kind: "REFUSED",
+        refusal: {
+          code: "INPUT_INVALID",
+          detail:
+            `evaluation input could not be taken into runtime ownership (${describeCause(cause)}); ` +
+            "every view passed to evaluate() must be a plain, freezable object — the callback " +
+            "was not invoked and no record was persisted",
+        },
+      };
+    }
 
     let returned: DecisionResult | undefined;
     let thrown: unknown;
@@ -412,44 +478,37 @@ class StrategyInstanceRuntime {
       });
     }
 
-    const parsed = DecisionResultSchema.safeParse(returned);
-    if (!parsed.success) {
-      return this.contain(input, telemetry, rngSnapshot, {
-        reasonCode: RUNTIME_REASON_CODES.decisionInvalid,
-        detail:
-          `strategy callback ${input.callback} did not return a valid §7.5 DecisionResult: ` +
-          parsed.error.message,
-      });
+    // Everything that inspects what the strategy RETURNED happens here, in one
+    // fallible region that runs strictly BEFORE any persistence and entirely
+    // inside containment (review round 2). Validation, materialization of the
+    // state patch, the merged state and its canonical bytes are all produced
+    // now, so the commit below has nothing left that can fail. The `catch` is
+    // the belt to the materializer's braces: every step in `prepareDecision`
+    // already returns its failure, and a step that nonetheless throws — a
+    // hostile value reached through a path not yet enumerated — is still
+    // contained as the strategy's fault instead of escaping `evaluate()`.
+    let preparation: PrepareDecisionResult;
+    try {
+      preparation = this.prepareDecision(input, returned);
+    } catch (cause) {
+      preparation = {
+        ok: false,
+        failure: {
+          reasonCode: RUNTIME_REASON_CODES.decisionInvalid,
+          detail:
+            `inspecting the value returned by strategy callback ${input.callback} threw ` +
+            `(${describeCause(cause)}); a decision the runtime cannot read without executing ` +
+            "strategy code is not a decision",
+          cause,
+        },
+      };
     }
-    const decision = parsed.data;
-    if (decision.featureSnapshotRef !== input.features.snapshotRef) {
-      return this.contain(input, telemetry, rngSnapshot, {
-        reasonCode: RUNTIME_REASON_CODES.decisionInvalid,
-        detail:
-          `decision names featureSnapshotRef ${decision.featureSnapshotRef}, but this ` +
-          `evaluation saw ${input.features.snapshotRef} — the §6 invariant 4 chain must ` +
-          "name the snapshot the strategy actually saw",
-      });
+    if (!preparation.ok) {
+      return this.contain(input, telemetry, rngSnapshot, preparation.failure);
     }
-    if (decision.reasonCodes.some((code) => isReservedRuntimeReasonCode(code))) {
-      return this.contain(input, telemetry, rngSnapshot, {
-        reasonCode: RUNTIME_REASON_CODES.decisionInvalid,
-        detail:
-          "decision uses a reserved RUNTIME.* reason code; runtime attribution cannot be " +
-          "claimed by a strategy (ADR-005 §3)",
-      });
-    }
-    if (decision.statePatch !== undefined) {
-      const problem = checkpointableJsonProblem(decision.statePatch, "statePatch");
-      if (problem !== null) {
-        return this.contain(input, telemetry, rngSnapshot, {
-          reasonCode: RUNTIME_REASON_CODES.statePatchInvalid,
-          detail: `statePatch is not checkpointable JSON: ${problem}`,
-        });
-      }
-    }
+    const prepared = preparation.prepared;
 
-    const record = this.buildRecord(input, "STRATEGY", decision);
+    const record = this.buildRecord(input, "STRATEGY", prepared.decision);
     try {
       this.decisionSink.persist(record, telemetry);
     } catch (cause) {
@@ -457,9 +516,10 @@ class StrategyInstanceRuntime {
     }
 
     // Commit: state, sequence, lifecycle — only after the record is persisted.
-    if (decision.statePatch !== undefined) {
-      this.state = deepFreeze({ ...this.state, ...decision.statePatch });
-    }
+    // Every value assigned here was computed above, so this block cannot fail:
+    // a persisted decision always gets its sequence number and its checkpoint.
+    this.state = prepared.state;
+    this.stateJson = prepared.stateJson;
     const recordedSeq = this.evaluationSeq;
     this.evaluationSeq += 1;
     if (input.callback === "onStop") {
@@ -474,6 +534,79 @@ class StrategyInstanceRuntime {
     }
 
     return { kind: "DECIDED", record, telemetry, checkpoint };
+  }
+
+  /**
+   * Validates the returned decision and materializes everything the commit will
+   * need. Nothing here mutates the instance: a failure leaves the runtime
+   * exactly as it was, which is what lets the caller contain it.
+   *
+   * The `statePatch` is MATERIALIZED, not merely validated. A validated
+   * original is worth nothing if it is a Proxy: its traps can answer the
+   * validator one way and the serializer, the freezer, or the sink another.
+   * The materialized copy is therefore what goes into the state, into the
+   * checkpoint bytes, and into the persisted RECORD — the last of these because
+   * the decision log is what `rebuildStateFromPatches` folds, and a durable
+   * record that disagrees with the checkpoint it accompanies would break §6
+   * invariant 8 for strategy state.
+   */
+  private prepareDecision(
+    input: EvaluationInput,
+    returned: DecisionResult | undefined,
+  ): PrepareDecisionResult {
+    const invalid = (detail: string): PrepareDecisionResult => ({
+      ok: false,
+      failure: { reasonCode: RUNTIME_REASON_CODES.decisionInvalid, detail },
+    });
+
+    const parsed = DecisionResultSchema.safeParse(returned);
+    if (!parsed.success) {
+      return invalid(
+        `strategy callback ${input.callback} did not return a valid §7.5 DecisionResult: ` +
+          parsed.error.message,
+      );
+    }
+    const decision = parsed.data;
+    if (decision.featureSnapshotRef !== input.features.snapshotRef) {
+      return invalid(
+        `decision names featureSnapshotRef ${decision.featureSnapshotRef}, but this ` +
+          `evaluation saw ${input.features.snapshotRef} — the §6 invariant 4 chain must ` +
+          "name the snapshot the strategy actually saw",
+      );
+    }
+    if (decision.reasonCodes.some((code) => isReservedRuntimeReasonCode(code))) {
+      return invalid(
+        "decision uses a reserved RUNTIME.* reason code; runtime attribution cannot be " +
+          "claimed by a strategy (ADR-005 §3)",
+      );
+    }
+    if (decision.statePatch === undefined) {
+      return {
+        ok: true,
+        prepared: { decision, state: this.state, stateJson: this.stateJson },
+      };
+    }
+
+    const materialized = materializeCheckpointableJson(decision.statePatch, "statePatch");
+    if (!materialized.ok) {
+      return {
+        ok: false,
+        failure: {
+          reasonCode: RUNTIME_REASON_CODES.statePatchInvalid,
+          detail: `statePatch is not checkpointable JSON: ${materialized.problem}`,
+        },
+      };
+    }
+    const patch = deepFreeze(materialized.value) as Readonly<Record<string, unknown>>;
+    const state = deepFreeze({ ...this.state, ...patch });
+    return {
+      ok: true,
+      prepared: {
+        decision: { ...decision, statePatch: patch },
+        state,
+        stateJson: canonicalJsonStringify(state),
+      },
+    };
   }
 
   private invokeCallback(input: EvaluationInput, context: StrategyContext): DecisionResult {
@@ -606,7 +739,9 @@ class StrategyInstanceRuntime {
       checkpointSeq: recordedSeq,
       status: this.status,
       rngState: this.rng.snapshot(),
-      stateJson: canonicalJsonStringify(this.state),
+      // The bytes were computed together with the state they describe, before
+      // the decision was persisted; nothing is serialized after a persist.
+      stateJson: this.stateJson,
     };
   }
 }
