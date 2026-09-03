@@ -1528,6 +1528,36 @@ no signer or credentials. Wave 1 authorized per the package table.
 
 None.
 
+### Cross-package risk (recorded 2026-09-03): a schema parse output is not clean data
+
+**Discovered by WP-180's round-6 mechanical census; independently confirmed by the
+orchestrator against the pinned `zod` (4.4.3), and endorsed by WP-180's review round 7
+as "not WP-180-specific".** Two measured behaviours:
+
+- **Adoption.** An object whose own keys are `['a']`, with `b` on its prototype, parses
+  through `z.object({a, b?})` to `{"a":"x","b":"inherited"}` — the validated output
+  contains a field that was never in the input.
+- **Loss.** A get-only inherited accessor makes the library's own output assignment fail,
+  so a field present in the input is ABSENT from the validated output.
+
+So a successful parse guarantees neither that the output matches the input nor that it is
+free of ambient prototype state. Any code that treats a parse result as trustworthy data —
+the near-universal assumption — is relying on something the library does not provide.
+
+**Scope.** WP-180 fixes its own paths (materialize prototype-free BEFORE parsing; take the
+value from the materialized tree rather than the library's constructed output). **Every other
+caller-input schema boundary in the repository needs the same audit.** Known parsing surfaces
+include `packages/domain` (the frozen event/intent schemas every package parses through),
+WP-200's `packages/ledger` and `packages/pnl` (**merged** at `7e75f9a` — its records are
+parsed from caller-supplied values), WP-170's `packages/strategy-runtime`, and every adapter
+that parses venue payloads.
+
+**Owner: contract owner, as a bounded governance round** (it spans packages no single work
+package owns, and the remedy may belong in a contract rule rather than in each package).
+Not a blocker for WP-180 or WP-170 once their local paths are correct. **Not yet audited:**
+whether any merged package is presently exploitable — WP-200 in particular should be checked
+before it is relied on, since it is already on `main`.
+
 ## Deviations from specification
 
 - Root `eslint.config.mjs` was outside WP-010's literal `allowed_paths`; ratified into WP-010 ownership (see completion record).
