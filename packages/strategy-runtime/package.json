@@ -3,13 +3,17 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Deterministic strategy runtime (WP-170, handoff §9.6): immutable config loading, pure synchronous callback invocation with an injected-clock watchdog, exactly one persisted DecisionResult per callback (§6 invariant 3, ADR-005), deterministic seeded RNG, and versioned rebuildable state checkpoints. Pure layer-1 logic: no I/O, no wall clock, no ambient randomness; persistence is a port the composition root implements.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@polymarket-bot/domain": "workspace:*",
+    "@polymarket-bot/strategy-sdk": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.9.2"

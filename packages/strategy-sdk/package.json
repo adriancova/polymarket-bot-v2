@@ -3,13 +3,16 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Strategy SDK (WP-170): the pure, versioned Strategy interface (handoff §9.6), the StrategyContext and read-only view contracts (§7.6; ADR-005 §6), and the SeededRandom draw surface. Declarations over the frozen layer-0 domain contracts only — this dependency surface is part of what keeps strategies structurally unable to reach venue/storage adapters (dependency-direction contract F3/F11/F13).",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@polymarket-bot/domain": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.9.2"
