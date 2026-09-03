@@ -268,11 +268,17 @@ left as the dated 2026-08-24 snapshot it declares itself to be.
 
 **The ruling.** C-2 is **RESOLVED**, and resolved *against* folding:
 
-1. **C-2 is a documentation inconsistency, not an economic one.** The venue
+1. **C-2 reads as a documentation inconsistency — a copy artifact.** The venue
    describes one quantity — the taker fee, and the rebate computed from it —
    under two names, with identical arithmetic and an identical rounding floor.
-   Treating the two pages as describing two *different-sized* quantities would
-   be a misreading.
+   On the recorded evidence, the parallel prose supports reading the divergence
+   as a documentation artifact rather than as two differently-sized quantities.
+   *(Corrected 2026-09-03 by the orchestrator, disclosed pre-merge: the review
+   found the original wording — "a documentation inconsistency, not an economic
+   one" — asserted more than the evidence establishes. The parallel prose
+   strongly supports the copy-artifact reading but does not establish economic
+   reality. Stated as a reading, the operative rulings below are unchanged: by
+   known-risk 1 they hold either way.)*
 2. **That does not make them one asset, and this ADR does not rule that they
    are.** A shared magnitude is not an asserted identity of the underlying
    token. Finding 3 is decisive: inferring an on-chain equivalence from prose
@@ -318,8 +324,15 @@ more from it than it says:
   of this ADR** — §6's fee/rebate/reward mechanics, the scope table in §2, and
   the wallet-operation rules in §8 are all unaffected.
 - It does **not** change any run-mode default, credential boundary, or safety
-  ceiling (ADR-010), and it changes **no code** — `WP-200`'s shipped behavior
-  already conforms.
+  ceiling (ADR-010), and it changes **no code** — the `WP-200` handoff
+  **reports** that its shipped behavior conforms. That report is evidence of
+  intent and escalation, not proof of code conformance: `WP-200` was still
+  remediating HIGH findings when this amendment was written, and its own
+  handoff says the final state must be re-checked. **Conformance ratification
+  is deferred to `WP-200`'s final code review and merged state.**
+  *(Corrected 2026-09-03 by the orchestrator, disclosed pre-merge: the review
+  found the original wording ratified conformance on the strength of an
+  in-flight sibling branch's handoff alone.)*
 - It claims nothing **observational**: no payout was observed, no balance was
   read, no transaction was inspected. The fact stays volatile (handoff §1.2)
   and each phase gate re-verifies it.
