@@ -227,14 +227,23 @@ describe("state checkpointing: versioned, rebuildable, refusing on incompatibili
   });
 
   it("rebuildStateFromPatches is the shallow-merge fold, skips absent patches, and freezes the result", () => {
+    // The fold is unchanged; the SIGNATURE returns a typed result as of
+    // remediation round 3, because the patches come from a caller-loaded
+    // decision log and a fold that cannot report an unreadable patch would have
+    // to throw or lie (see the round-3 tests in `boundary-snapshots.test.ts`).
     const rebuilt = rebuildStateFromPatches([
       { a: 1, b: "x" },
       undefined,
       { b: "y", c: true },
       {},
     ]);
-    expect(rebuilt).toEqual({ a: 1, b: "y", c: true });
-    expect(Object.isFrozen(rebuilt)).toBe(true);
-    expect(rebuildStateFromPatches([])).toEqual({});
+    expect(rebuilt.ok).toBe(true);
+    if (!rebuilt.ok) {
+      return;
+    }
+    expect(rebuilt.state).toEqual({ a: 1, b: "y", c: true });
+    expect(Object.isFrozen(rebuilt.state)).toBe(true);
+    const empty = rebuildStateFromPatches([]);
+    expect(empty.ok && empty.state).toEqual({});
   });
 });

@@ -49,7 +49,16 @@ export type EvaluationRefusalCode =
   | "INSTANCE_PAUSED"
   | "INSTANCE_STOPPED"
   | "EVALUATION_REENTRANT"
-  | "INPUT_INVALID";
+  | "INPUT_INVALID"
+  /**
+   * The injected `MonotonicClock` threw or returned a non-`bigint` BEFORE the
+   * callback was invoked (remediation round 3). The clock is caller-supplied
+   * like any other port, and `evaluate()` may not throw; nothing ran, so no
+   * record exists and this is a refusal rather than containment. A clock that
+   * fails AFTER the callback ran is contained instead, with the reserved
+   * `RUNTIME.CLOCK_INVALID` reason code, because the evaluation happened.
+   */
+  | "CLOCK_INVALID";
 
 export interface EvaluationRefusal {
   readonly code: EvaluationRefusalCode;
@@ -147,6 +156,13 @@ export type RuntimeCreationRefusalCode =
   | "STRATEGY_SHAPE_INVALID"
   | "PARAMS_SCHEMA_UNSUPPORTED"
   | "PARAMS_REJECTED"
+  /**
+   * The parsed params could not be taken into runtime ownership: freezing them
+   * (or reading their own properties in order to freeze them) threw. Distinct
+   * from `PARAMS_REJECTED`, which is the strategy's own schema saying no
+   * (remediation round 3).
+   */
+  | "PARAMS_NOT_FREEZABLE"
   | "RUN_IDENTITY_INVALID"
   | "RUN_SEED_INVALID"
   | "WATCHDOG_BUDGET_INVALID"

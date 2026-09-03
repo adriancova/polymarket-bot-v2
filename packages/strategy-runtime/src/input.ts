@@ -14,22 +14,52 @@
  * §8.1 gives the core loop a latency budget. The boundary re-validation lives
  * where untrusted bytes enter (adapters), not on every tick.
  *
- * Ownership: by passing an `EvaluationInput`, the caller hands the view
- * objects to the runtime, which deep-freezes them IN PLACE before the strategy
- * can see them (§7.6 read-only views). The caller therefore may not keep
- * mutating a view it passes: the first evaluation freezes the producer's own
- * object, and its next in-place write throws in strict mode.
+ * Ownership — REPLACED 2026-09-03, remediation round 3 (review round 3's HIGH).
+ * The runtime no longer takes ownership of the caller's objects at all: it
+ * ACQUIRES one inert snapshot of the whole input (`acquireEvaluationInput`
+ * below), reading every caller-supplied property exactly once inside a guard,
+ * and every downstream consumer — validation, the `StrategyContext`, the
+ * callback, the persisted `DecisionRecord`, the checkpoint — reads that one
+ * snapshot and never the caller's object again.
  *
- * BINDING OBLIGATION ON THE COMPOSITION ROOT (WP-230), recorded 2026-09-02 in
- * remediation round 1 at the reviewer's request (finding L1): WP-230 must pass
- * a FRESH or explicitly COPIED view object per evaluation, and must carry an
- * INTEGRATION TEST that proves it — a test that runs two consecutive
- * evaluations against the real wiring and asserts the producers' own objects
- * are not the frozen ones (or, equivalently, that the producer can still
- * mutate its own state after an evaluation). In-place freezing of
- * caller-supplied objects is a deliberate, disclosed library-boundary choice
- * (`docs/handoffs/WP-170.md`: `assumptions` 13, `known_risks` 1); the test is
- * how that choice stops being a trap.
+ * What that replaced, and why (the prior text is preserved in the paragraph
+ * below so the change is legible): the runtime used to deep-freeze the caller's
+ * view objects IN PLACE and then re-read them afterwards. Freezing makes
+ * properties non-configurable; it does NOT make a `Proxy` trap or a getter
+ * inert. Two consequences were reproduced verbatim against the round-2 code:
+ *
+ *     outcome=THREW:POST_CALLBACK_MARKET_ID_GET
+ *     invoked=1  persist=0  checkpoints=0  evaluationSeq=0  status=ACTIVE
+ *
+ *     outcome=DECIDED
+ *     callbackSaw=018f4a7e-1111-7abc-8def-0123456789ab
+ *     recorded=018f4a7e-2222-7abc-8def-0123456789ab
+ *     frozen=true
+ *
+ * — a market view whose third `marketId` read threw made `evaluate()` throw
+ * AFTER the callback had run (so the RNG had advanced but no record and no
+ * checkpoint represented the evaluation, and sequence 0 was still unused), and
+ * a getter-based view handed market A to the callback and market B to the
+ * persisted record while `Object.isFrozen` reported `true`. A bigger
+ * `try`/`catch` would have contained the first and left the second silent.
+ *
+ * SUPERSEDED TEXT (round 1, kept for the record): "by passing an
+ * `EvaluationInput`, the caller hands the view objects to the runtime, which
+ * deep-freezes them IN PLACE before the strategy can see them (§7.6 read-only
+ * views). The caller therefore may not keep mutating a view it passes: the
+ * first evaluation freezes the producer's own object, and its next in-place
+ * write throws in strict mode." — followed by a BINDING OBLIGATION on WP-230 to
+ * pass a fresh or copied view per evaluation and to carry an integration test
+ * proving it.
+ *
+ * That obligation is DISCHARGED by construction as of this round: the runtime
+ * copies, so a producer may keep and mutate its own view objects, and no
+ * caller-visible object is frozen by an evaluation. What WP-230 gains instead
+ * is a cost — one deep copy of the views per evaluation, measured rather than
+ * asserted in `docs/handoffs/WP-170.md` (remediation round 3) — and one rule
+ * that survives: what the strategy sees is the snapshot, so a producer that
+ * mutates a view AFTER `evaluate()` returns changes nothing about that
+ * evaluation's record, checkpoint, or replay.
  */
 
 import {
@@ -53,6 +83,8 @@ import {
   type StrategyOrderView,
   type VirtualPositionView,
 } from "@polymarket-bot/strategy-sdk";
+
+import { deepFreeze, materializeEvaluationView } from "./json.js";
 
 export interface EvaluationViews {
   readonly market: MarketView;
@@ -86,6 +118,15 @@ export type InputValidationResult =
   | { readonly ok: true }
   | { readonly ok: false; readonly detail: string };
 
+/**
+ * The result of taking one inert snapshot of a caller-supplied evaluation
+ * input. `input` is fresh, plain, deep-frozen data that shares no object with
+ * the caller.
+ */
+export type AcquireEvaluationInputResult =
+  | { readonly ok: true; readonly input: EvaluationInput }
+  | { readonly ok: false; readonly detail: string };
+
 const CALLBACKS_WITHOUT_PAYLOAD = new Set(["onStart", "onMarketOpen", "onFeatures", "onTimer"]);
 
 function bad(detail: string): InputValidationResult {
@@ -100,8 +141,61 @@ function isBoundedNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= MAX_IDENTIFIER_LENGTH;
 }
 
-/** Validates one evaluation input. Returns typed detail; never throws. */
+/**
+ * Takes the runtime's ONE inert snapshot of a caller-supplied evaluation input
+ * and validates it. Never throws.
+ *
+ * Order matters and is the whole point (round 3): the snapshot is taken FIRST,
+ * so validation, the context, the callback, the record and the checkpoint all
+ * read the same materialized data. Validating the caller's live object and then
+ * using that object is the shape of the defect this replaced — the reads can
+ * disagree, and nothing about the first read binds the second.
+ *
+ * The snapshot is deep-frozen because it is the runtime's own data by then:
+ * freezing it cannot run caller code and cannot fail.
+ */
+export function acquireEvaluationInput(input: unknown): AcquireEvaluationInputResult {
+  const materialized = materializeEvaluationView(input, "input");
+  if (!materialized.ok) {
+    return {
+      ok: false,
+      detail:
+        `evaluation input could not be read into an inert snapshot (${materialized.problem}); ` +
+        "every view passed to evaluate() must be plain data the runtime can copy — the " +
+        "callback was not invoked and no record was persisted",
+    };
+  }
+  const snapshot = deepFreeze(materialized.value);
+  const validation = validateSnapshot(snapshot);
+  if (!validation.ok) {
+    return validation;
+  }
+  return { ok: true, input: snapshot as EvaluationInput };
+}
+
+/**
+ * Validates one evaluation input. Returns typed detail; never throws.
+ *
+ * TOTAL since remediation round 3: the value is materialized into an inert
+ * snapshot first, so no read this function performs can run caller code. The
+ * snapshot is then DISCARDED, which is safe here and is not the round-2 footgun
+ * (`checkpointableJsonProblem`), because the runtime never trusts a prior
+ * validation: `evaluate()` acquires its own snapshot and validates that. A
+ * caller may use this to pre-check an input; it cannot use it to smuggle an
+ * unvalidated object past `evaluate()`.
+ */
 export function validateEvaluationInput(input: unknown): InputValidationResult {
+  const materialized = materializeEvaluationView(input, "input");
+  if (!materialized.ok) {
+    return bad(
+      `evaluation input could not be read into an inert snapshot: ${materialized.problem}`,
+    );
+  }
+  return validateSnapshot(materialized.value);
+}
+
+/** The shallow, typed validation — always applied to an inert snapshot. */
+function validateSnapshot(input: unknown): InputValidationResult {
   if (!isRecord(input)) {
     return bad("input must be an object");
   }

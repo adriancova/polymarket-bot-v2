@@ -26,12 +26,27 @@ export const RUNTIME_REASON_CODES = {
   decisionInvalid: "RUNTIME.DECISION_INVALID",
   /** The returned `statePatch` is not checkpointable JSON. */
   statePatchInvalid: "RUNTIME.STATE_PATCH_INVALID",
+  /**
+   * The injected `MonotonicClock` failed AFTER the callback had run, so the
+   * elapsed time — and therefore whether the watchdog budget was met — is
+   * unknown (remediation round 3). The evaluation happened, so §6 invariant 3
+   * binds and exactly one record is persisted; it is attributed to the RUNTIME
+   * because the failure is the host's, not the strategy's.
+   */
+  clockInvalid: "RUNTIME.CLOCK_INVALID",
 } as const;
 
 export type ReservedRuntimeReasonCode =
   (typeof RUNTIME_REASON_CODES)[keyof typeof RUNTIME_REASON_CODES];
 
-/** True when a reason code is reserved for runtime attribution. */
+/**
+ * True when a reason code is reserved for runtime attribution.
+ *
+ * The `string` parameter is a type, not a guarantee: this is a public export
+ * and JavaScript callers exist. A non-string is not a reserved code, and
+ * answering `false` is honest — `code.startsWith` on a non-string would throw
+ * out of a predicate (remediation round 3, the P2 sweep).
+ */
 export function isReservedRuntimeReasonCode(code: string): boolean {
-  return code.startsWith(RESERVED_RUNTIME_REASON_CODE_PREFIX);
+  return typeof code === "string" && code.startsWith(RESERVED_RUNTIME_REASON_CODE_PREFIX);
 }

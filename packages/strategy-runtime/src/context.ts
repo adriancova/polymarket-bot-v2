@@ -42,11 +42,12 @@
  * object it obtained during the callback; that object is deep-frozen plain
  * data and cannot affect runtime state or the RNG stream.
  *
- * Everything a strategy can reach from here is frozen: the views are
- * deep-frozen in place (the caller handed ownership via `EvaluationInput`),
- * params and state are frozen by the runtime before this is built, and the
- * RNG surface is a frozen draw-only facade — `snapshot`/`restore` stay with
- * the runtime, so a strategy can consume randomness but cannot rewind or
+ * Everything a strategy can reach from here is frozen: the views are the
+ * runtime's own deep-frozen SNAPSHOT of the evaluation input (since remediation
+ * round 3 the caller's objects are copied, not frozen in place — see
+ * `input.ts`), params and state are frozen by the runtime before this is built,
+ * and the RNG surface is a frozen draw-only facade — `snapshot`/`restore` stay
+ * with the runtime, so a strategy can consume randomness but cannot rewind or
  * replant it.
  *
  * `now()` returns the logical evaluation timestamp injected with the input —
@@ -64,7 +65,6 @@ import type {
 } from "@polymarket-bot/strategy-sdk";
 
 import type { EvaluationInput } from "./input.js";
-import { deepFreeze } from "./json.js";
 import { StrategyContextRevokedError, type StrategyContextCapability } from "./outcomes.js";
 import type { DeterministicRng } from "./rng.js";
 
@@ -122,13 +122,18 @@ export function buildStrategyContext(
     }
   };
 
-  // Freeze the observable views in place; the caller handed ownership.
-  const market = deepFreeze(input.market);
-  const books = deepFreeze(input.books);
-  const features = deepFreeze(input.features);
-  const position = deepFreeze(input.position);
-  const orders = deepFreeze(input.orders);
-  const riskBudget = deepFreeze(input.riskBudget);
+  // `input` is the runtime's OWN inert, deep-frozen snapshot of the caller's
+  // evaluation input (`acquireEvaluationInput`), taken once before anything was
+  // invoked. Nothing is frozen here any more, because there is nothing left to
+  // freeze and nothing here may run caller code: these reads are plain-data
+  // reads, and every one of them yields exactly what the persisted record and
+  // the checkpoint will carry (remediation round 3).
+  const market = input.market;
+  const books = input.books;
+  const features = input.features;
+  const position = input.position;
+  const orders = input.orders;
+  const riskBudget = input.riskBudget;
   const evaluatedAt = input.evaluatedAt;
   const rngFacade = drawOnlyRng(rng, guard);
 

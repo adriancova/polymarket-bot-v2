@@ -356,12 +356,19 @@ describe("a decision is never persisted before the state it depends on is final"
     expect(harness.runtime.evaluate(makeInput("onFeatures")).kind).toBe("REFUSED");
   });
 
-  it("a view that cannot be taken into ownership is REFUSED, not thrown, and burns no sequence", () => {
-    const unfreezable = new Proxy(
+  it("a view the runtime cannot READ is REFUSED, not thrown, and burns no sequence", () => {
+    // CHANGED in remediation round 3, and the change is the finding. Round 2
+    // asserted that a view refusing `preventExtensions` was REFUSED, because
+    // the runtime froze the caller's view objects in place. It no longer
+    // freezes them — it copies them — so refusing-to-be-frozen is not a
+    // property of an unusable input any more (that half is the test below).
+    // What still refuses is a view the runtime cannot READ, which is the same
+    // guarantee under the new mechanism: no throw, no record, no sequence.
+    const unreadable = new Proxy(
       { snapshotRef: "snap-1", asOf: "2026-01-02T03:04:05.000Z", values: {} },
       {
-        preventExtensions(): boolean {
-          throw new Error("VIEW_PREVENT_EXTENSIONS");
+        get(): unknown {
+          throw new Error("VIEW_GET_THREW");
         },
       },
     );
@@ -369,14 +376,14 @@ describe("a decision is never persisted before the state it depends on is final"
 
     let outcome: EvaluationOutcome | undefined;
     expect(() => {
-      outcome = harness.runtime.evaluate(makeInput("onFeatures", { features: unfreezable }));
+      outcome = harness.runtime.evaluate(makeInput("onFeatures", { features: unreadable }));
     }).not.toThrow();
     expect(outcome?.kind).toBe("REFUSED");
     if (outcome?.kind !== "REFUSED") {
       return;
     }
     expect(outcome.refusal.code).toBe("INPUT_INVALID");
-    expect(outcome.refusal.detail).toContain("VIEW_PREVENT_EXTENSIONS");
+    expect(outcome.refusal.detail).toContain("VIEW_GET_THREW");
     // The callback was never invoked, so §6 invariant 3 does not bind: no
     // record, no checkpoint, no sequence consumed, and the instance is still
     // usable with a well-formed input.
@@ -385,6 +392,31 @@ describe("a decision is never persisted before the state it depends on is final"
     expect(harness.runtime.instanceStatus()).toBe("ACTIVE");
     expect(harness.runtime.evaluate(makeInput("onFeatures")).kind).toBe("DECIDED");
     expect(harness.sink.calls[0]?.record.evaluationSeq).toBe(0);
+  });
+
+  it("a view that merely refuses to be FROZEN is materialized and decided, and is never frozen", () => {
+    // The reviewer's round-3 NOTE, applied to the input boundary: only the
+    // one-read copy is retained, so materialization — not refusal — is the
+    // right shape. The caller's object is left exactly as it was.
+    const target = { snapshotRef: "snap-1", asOf: "2026-01-02T03:04:05.000Z", values: {} };
+    let freezeAttempts = 0;
+    const unfreezable = new Proxy(target, {
+      preventExtensions(): boolean {
+        freezeAttempts += 1;
+        throw new Error("VIEW_PREVENT_EXTENSIONS");
+      },
+    });
+    const harness = makeHarness();
+
+    let outcome: EvaluationOutcome | undefined;
+    expect(() => {
+      outcome = harness.runtime.evaluate(makeInput("onFeatures", { features: unfreezable }));
+    }).not.toThrow();
+    expect(outcome?.kind).toBe("DECIDED");
+    expect(freezeAttempts).toBe(0);
+    expect(Object.isExtensible(target)).toBe(true);
+    expect(harness.sink.calls).toHaveLength(1);
+    assertRecordsAndCheckpointsAgree(harness);
   });
 
   it("determinism: a Proxy-wrapped patch produces the same bytes as the plain object it copies", () => {

@@ -22,9 +22,22 @@ function isUint32(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 && value < UINT32_RANGE;
 }
 
-/** True when `state` is a well-formed serialized RNG state. */
+/**
+ * True when `state` is a well-formed serialized RNG state.
+ *
+ * TOTAL since remediation round 3: a predicate that throws is not a predicate,
+ * and every operation below can run caller code — `Array.isArray` throws on a
+ * REVOKED proxy, and `length`/`every` run traps. Callers that intend to KEEP
+ * the value should materialize it first and test the copy, which is what
+ * `restoreCheckpoint` does; this guard exists so that a direct caller passing
+ * something exotic gets `false` instead of an exception.
+ */
 export function isRngState(state: unknown): state is RngState {
-  return Array.isArray(state) && state.length === 4 && state.every((lane) => isUint32(lane));
+  try {
+    return Array.isArray(state) && state.length === 4 && state.every((lane) => isUint32(lane));
+  } catch {
+    return false;
+  }
 }
 
 /** cyrb128 fold of an arbitrary seed string into four uint32 lanes. */

@@ -7,7 +7,7 @@
  * The reviewer's reproduction:
  *
  * ```
- * checkpointableJsonProblem({ visible: 1, [Symbol("lost")]: 2 })  -> null
+ * problemOf({ visible: 1, [Symbol("lost")]: 2 })  -> null
  * canonicalJsonStringify   ({ visible: 1, [Symbol("lost")]: 2 })  -> {"visible":1}
  * ```
  *
@@ -37,13 +37,23 @@ import { describe, expect, it } from "vitest";
 
 import {
   canonicalJsonStringify,
-  checkpointableJsonProblem,
   createStrategyInstanceRuntime,
   deepFreeze,
+  materializeCheckpointableJson,
   restoreCheckpoint,
 } from "../../../packages/strategy-runtime/src/index.js";
 import type { DecisionResult, StrategyContext } from "../../../packages/strategy-sdk/src/index.js";
 import { CONFIG_ID, INSTANCE_ID, makeDefinition, makeInput, makeStrategy, RUN_ID, RUN_SEED } from "./helpers.js";
+
+/**
+ * The validate-only shape these tests were written against; the export it used
+ * to call (`checkpointableJsonProblem`) was removed in remediation round 3 (see
+ * `json.test.ts` for the reasoning). Every assertion is unchanged.
+ */
+function problemOf(value: unknown): string | null {
+  const result = materializeCheckpointableJson(value);
+  return result.ok ? null : result.problem;
+}
 
 /** Builds `{ visible: 1, [Symbol("lost")]: 2 }` — the reviewer's exact value. */
 function withSymbolKey(): Record<string, unknown> {
@@ -55,7 +65,7 @@ function withSymbolKey(): Record<string, unknown> {
 describe("M1: own-property forms that JSON cannot round-trip are refused, not silently dropped", () => {
   it("refuses a symbol-keyed property — the exact value the review reproduced", () => {
     const value = withSymbolKey();
-    const problem = checkpointableJsonProblem(value);
+    const problem = problemOf(value);
     expect(problem).not.toBeNull();
     expect(problem).toContain("symbol-keyed property");
     expect(problem).toContain("Symbol(lost)");
@@ -66,14 +76,14 @@ describe("M1: own-property forms that JSON cannot round-trip are refused, not si
 
   it("refuses a symbol key at any depth, naming the path", () => {
     const inner = withSymbolKey();
-    expect(checkpointableJsonProblem({ outer: { inner } })).toContain("$.outer.inner:");
-    expect(checkpointableJsonProblem([{ a: inner }])).toContain("$[0].a:");
+    expect(problemOf({ outer: { inner } })).toContain("$.outer.inner:");
+    expect(problemOf([{ a: inner }])).toContain("$[0].a:");
   });
 
   it("refuses a non-enumerable own property (invisible to Object.keys)", () => {
     const value: Record<string, unknown> = { visible: 1 };
     Object.defineProperty(value, "hidden", { value: 2, enumerable: false });
-    const problem = checkpointableJsonProblem(value);
+    const problem = problemOf(value);
     expect(problem).toContain("$.hidden");
     expect(problem).toContain("non-enumerable");
     expect(canonicalJsonStringify(value)).toBe('{"visible":1}');
@@ -89,7 +99,7 @@ describe("M1: own-property forms that JSON cannot round-trip are refused, not si
       },
       enumerable: true,
     });
-    const problem = checkpointableJsonProblem(value);
+    const problem = problemOf(value);
     expect(problem).toContain("$.computed");
     expect(problem).toContain("accessor");
     // Validating strategy state must not execute strategy code — and a getter
@@ -101,21 +111,21 @@ describe("M1: own-property forms that JSON cannot round-trip are refused, not si
   it("refuses a setter-only property too (it serializes as undefined)", () => {
     const value: Record<string, unknown> = {};
     Object.defineProperty(value, "writeOnly", { set: () => undefined, enumerable: true });
-    expect(checkpointableJsonProblem(value)).toContain("accessor");
+    expect(problemOf(value)).toContain("accessor");
   });
 
   it("refuses non-index own properties on an array (arrays serialize positionally)", () => {
     const withExtra = Object.assign([1, 2], { extra: 3 });
-    expect(checkpointableJsonProblem(withExtra)).toContain("non-index own property extra");
+    expect(problemOf(withExtra)).toContain("non-index own property extra");
     expect(canonicalJsonStringify(withExtra)).toBe("[1,2]");
 
     const withSymbol: unknown[] = [1];
     (withSymbol as unknown as Record<PropertyKey, unknown>)[Symbol("s")] = 9;
-    expect(checkpointableJsonProblem(withSymbol)).toContain("symbol-keyed property");
+    expect(problemOf(withSymbol)).toContain("symbol-keyed property");
 
     const withNonEnumerableIndex = [1, 2];
     Object.defineProperty(withNonEnumerableIndex, 0, { enumerable: false });
-    expect(checkpointableJsonProblem(withNonEnumerableIndex)).toContain("non-enumerable");
+    expect(problemOf(withNonEnumerableIndex)).toContain("non-enumerable");
   });
 
   it("still refuses an array hole (the value axis already covered it)", () => {
@@ -123,22 +133,22 @@ describe("M1: own-property forms that JSON cannot round-trip are refused, not si
     // which `no-sparse-arrays` forbids in this repository's lint config.
     const holed: unknown[] = [1, 2, 3];
     Reflect.deleteProperty(holed, 1);
-    expect(checkpointableJsonProblem(holed)).toContain("$[1]: undefined");
+    expect(problemOf(holed)).toContain("$[1]: undefined");
     // Why it must stay refused: the canonical serializer emits invalid text.
     expect(canonicalJsonStringify(holed)).toBe("[1,,3]");
     expect(() => JSON.parse(canonicalJsonStringify(holed)) as unknown).toThrow();
   });
 
   it("does NOT over-refuse: ordinary, deep-frozen, and JSON.parse-produced state still validates", () => {
-    expect(checkpointableJsonProblem({ a: 1, b: [1, 2, { c: "0.5" }], d: null })).toBeNull();
-    expect(checkpointableJsonProblem(deepFreeze({ a: { b: [1, { c: true }] } }))).toBeNull();
-    expect(checkpointableJsonProblem(Object.create(null) as object)).toBeNull();
+    expect(problemOf({ a: 1, b: [1, 2, { c: "0.5" }], d: null })).toBeNull();
+    expect(problemOf(deepFreeze({ a: { b: [1, { c: true }] } }))).toBeNull();
+    expect(problemOf(Object.create(null) as object)).toBeNull();
     expect(
-      checkpointableJsonProblem(JSON.parse('{"z":1,"a":{"b":[1,2,null]}}') as unknown),
+      problemOf(JSON.parse('{"z":1,"a":{"b":[1,2,null]}}') as unknown),
     ).toBeNull();
     // Length is the array intrinsic, not a serialized key.
-    expect(checkpointableJsonProblem([1, 2, 3])).toBeNull();
-    expect(checkpointableJsonProblem(Object.freeze([1, 2, 3]))).toBeNull();
+    expect(problemOf([1, 2, 3])).toBeNull();
+    expect(problemOf(Object.freeze([1, 2, 3]))).toBeNull();
   });
 
   it("the restore path is unaffected: a canonical checkpoint still restores", () => {
@@ -179,13 +189,13 @@ describe("M1: own-property forms that JSON cannot round-trip are refused, not si
       { "": 0, "0": 1, "é": true },
     ];
     for (const value of accepted) {
-      expect(checkpointableJsonProblem(value)).toBeNull();
+      expect(problemOf(value)).toBeNull();
       const roundTripped = JSON.parse(canonicalJsonStringify(value)) as unknown;
       expect(ownKeyTree(roundTripped)).toEqual(ownKeyTree(value));
     }
     // …and the rejected forms are exactly the ones that break it.
     for (const value of [withSymbolKey(), Object.assign([1], { x: 2 })]) {
-      expect(checkpointableJsonProblem(value)).not.toBeNull();
+      expect(problemOf(value)).not.toBeNull();
       const roundTripped = JSON.parse(canonicalJsonStringify(value)) as unknown;
       expect(ownKeyTree(roundTripped)).not.toEqual(ownKeyTree(value));
     }

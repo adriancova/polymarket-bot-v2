@@ -29,6 +29,23 @@
  * - restore compatible state on restart, refusing incompatibility (§9.6 "new
  *   run for every code, config, model, feature, or state-schema change").
  *
+ * ONE SNAPSHOT PER BOUNDARY (remediation round 3, review round 3's HIGH). Every
+ * value a caller hands this module is read exactly ONCE, into inert data, and
+ * that same data is what every later step uses:
+ *
+ * - the DEFINITION is snapshotted at creation — identifiers, versions, the
+ *   budget, the nine callback functions, and each port's method — so the
+ *   `strategyName` that was validated is the one every checkpoint carries, and
+ *   the `onFeatures` that was type-checked is the one that gets invoked;
+ * - the EVALUATION INPUT is materialized by `acquireEvaluationInput` before
+ *   anything is validated or invoked, so the market the callback sees is the
+ *   market the record names. Before this round the views were deep-FROZEN in
+ *   place and then re-read: freezing makes properties non-configurable but
+ *   leaves getters and Proxy traps live, which produced both an escaped throw
+ *   AFTER the callback had run and a silent callback/record divergence;
+ * - the returned DECISION's `statePatch` is materialized (round 2);
+ * - a CHECKPOINT document is snapshotted by `restoreCheckpoint` (round 3).
+ *
  * Containment (ADR-005 §3): a failed evaluation persists one RUNTIME-
  * attributed `skip` with a reserved reason code and no intents, discards
  * whatever the strategy returned, rolls the RNG back to its pre-invocation
@@ -66,7 +83,8 @@ import {
   type StrategyStateCheckpoint,
 } from "./checkpoint.js";
 import { buildStrategyContext, type ScopedStrategyContext } from "./context.js";
-import { validateEvaluationInput, type EvaluationInput } from "./input.js";
+import { describeCause } from "./describe.js";
+import { acquireEvaluationInput, type EvaluationInput } from "./input.js";
 import { canonicalJsonStringify, deepFreeze, materializeCheckpointableJson } from "./json.js";
 import type {
   ContainedFailure,
@@ -75,6 +93,7 @@ import type {
   RuntimeCreationRefusalCode,
 } from "./outcomes.js";
 import type { CheckpointStore, DecisionSink, MonotonicClock } from "./ports.js";
+import { readOwnFieldsOnce } from "./read-once.js";
 import type { DecisionRecord, DecisionTelemetry } from "./record.js";
 import { isReservedRuntimeReasonCode, RUNTIME_REASON_CODES } from "./reserved-codes.js";
 import { DeterministicRng } from "./rng.js";
@@ -111,19 +130,57 @@ export type CreateRuntimeResult =
   | { readonly ok: true; readonly runtime: StrategyInstanceRuntime }
   | { readonly ok: false; readonly refusal: RuntimeCreationRefusal };
 
-interface SafeParseLike {
-  safeParse(value: unknown): unknown;
-}
-
 const UUID_SHAPED =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-function refuse(code: RuntimeCreationRefusalCode, detail: string): CreateRuntimeResult {
-  return { ok: false, refusal: { code, detail } };
+const DEFINITION_FIELDS = [
+  "strategy",
+  "params",
+  "run",
+  "watchdog",
+  "clock",
+  "decisionSink",
+  "checkpointStore",
+  "restoreFrom",
+] as const;
+
+const STRATEGY_FIELDS = ["name", "version", "stateSchemaVersion", "paramsSchema"] as const;
+const RUN_FIELDS = ["runId", "instanceId", "configId", "runSeed"] as const;
+
+/**
+ * A captured port: the method read once at creation, plus the object it must
+ * be applied to. `Reflect.apply` is used at the call site so that no further
+ * property read happens on the caller's object — the method that was type-
+ * checked is the method that runs.
+ */
+interface CapturedPort<M> {
+  readonly receiver: unknown;
+  readonly method: M;
 }
 
-function describeCause(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
+type ClockMethod = (this: unknown) => unknown;
+type PersistMethod = (
+  this: unknown,
+  record: DecisionRecord,
+  telemetry: DecisionTelemetry,
+) => unknown;
+type SaveMethod = (this: unknown, checkpoint: StrategyStateCheckpoint) => unknown;
+type CallbackMethod = (this: unknown, context: StrategyContext, payload?: unknown) => unknown;
+
+/** The strategy as inert data plus the nine functions captured once. */
+interface CapturedStrategy {
+  readonly name: string;
+  readonly version: string;
+  readonly stateSchemaVersion: number;
+  /** The strategy object itself, used ONLY as the `this` of its own callbacks. */
+  readonly receiver: unknown;
+  readonly callbacks: Readonly<Record<StrategyCallbackName, CallbackMethod>>;
+}
+
+type SafeParseMethod = (this: unknown, value: unknown) => unknown;
+
+function refuse(code: RuntimeCreationRefusalCode, detail: string): CreateRuntimeResult {
+  return { ok: false, refusal: { code, detail } };
 }
 
 /**
@@ -155,136 +212,245 @@ function identifierProblem(value: unknown, field: string): string | null {
   return null;
 }
 
-function hasSafeParse(schema: unknown): schema is SafeParseLike {
-  return (
-    (typeof schema === "object" || typeof schema === "function") &&
-    schema !== null &&
-    typeof (schema as { safeParse?: unknown }).safeParse === "function"
-  );
-}
-
 /**
  * Loads, validates, freezes, and (optionally) restores one strategy instance.
- * Every failure is a typed refusal; nothing here throws.
+ * Every failure is a typed refusal; nothing here throws — including for a
+ * definition whose accessors throw, a `paramsSchema.safeParse` that throws, a
+ * params value that refuses to be frozen, and a checkpoint document whose
+ * `stateJson` getter throws on a second read (all four were live before
+ * remediation round 3).
  */
 export function createStrategyInstanceRuntime(
   definition: StrategyRuntimeDefinition,
 ): CreateRuntimeResult {
-  const { strategy, run, watchdog, clock, decisionSink, checkpointStore } = definition;
+  // --- ONE read of every field of the caller's definition ------------------
+  const outer = readOwnFieldsOnce(definition, "definition", DEFINITION_FIELDS);
+  if (!outer.ok) {
+    return refuse("STRATEGY_SHAPE_INVALID", outer.problem);
+  }
+  const strategy = outer.fields.strategy;
+  const rawParams = outer.fields.params;
+  const run = outer.fields.run;
+  const watchdog = outer.fields.watchdog;
+  const clock = outer.fields.clock;
+  const decisionSink = outer.fields.decisionSink;
+  const checkpointStore = outer.fields.checkpointStore;
+  const restoreFrom = outer.fields.restoreFrom;
 
   // --- strategy shape -----------------------------------------------------
   if (typeof strategy !== "object" || strategy === null) {
     return refuse("STRATEGY_SHAPE_INVALID", "strategy must be an object");
   }
-  const nameProblem = identifierProblem(strategy.name, "strategy.name");
+  const strategyFields = readOwnFieldsOnce(strategy, "strategy", STRATEGY_FIELDS);
+  if (!strategyFields.ok) {
+    return refuse("STRATEGY_SHAPE_INVALID", strategyFields.problem);
+  }
+  const name = strategyFields.fields.name;
+  const version = strategyFields.fields.version;
+  const stateSchemaVersion = strategyFields.fields.stateSchemaVersion;
+  const paramsSchema = strategyFields.fields.paramsSchema;
+
+  const nameProblem = identifierProblem(name, "strategy.name");
   if (nameProblem !== null) {
     return refuse("STRATEGY_SHAPE_INVALID", nameProblem);
   }
-  const versionProblem = identifierProblem(strategy.version, "strategy.version");
+  const versionProblem = identifierProblem(version, "strategy.version");
   if (versionProblem !== null) {
     return refuse("STRATEGY_SHAPE_INVALID", versionProblem);
   }
   if (
-    typeof strategy.stateSchemaVersion !== "number" ||
-    !Number.isSafeInteger(strategy.stateSchemaVersion) ||
-    strategy.stateSchemaVersion < 1
+    typeof stateSchemaVersion !== "number" ||
+    !Number.isSafeInteger(stateSchemaVersion) ||
+    stateSchemaVersion < 1
   ) {
     return refuse(
       "STRATEGY_SHAPE_INVALID",
-      `strategy.stateSchemaVersion must be a positive safe integer; received ${String(strategy.stateSchemaVersion)}`,
+      `strategy.stateSchemaVersion must be a positive safe integer; received ${describeCause(stateSchemaVersion)}`,
     );
   }
+  const callbackFields = readOwnFieldsOnce(strategy, "strategy", STRATEGY_CALLBACK_NAMES);
+  if (!callbackFields.ok) {
+    return refuse("STRATEGY_SHAPE_INVALID", callbackFields.problem);
+  }
+  const callbacks: Partial<Record<StrategyCallbackName, CallbackMethod>> = {};
   for (const callbackName of STRATEGY_CALLBACK_NAMES) {
-    if (typeof strategy[callbackName] !== "function") {
+    const callback = callbackFields.fields[callbackName];
+    if (typeof callback !== "function") {
       return refuse(
         "STRATEGY_SHAPE_INVALID",
         `strategy.${callbackName} must be a function (§9.6 requires all nine callbacks)`,
       );
     }
+    callbacks[callbackName] = callback as CallbackMethod;
   }
+  const capturedStrategy: CapturedStrategy = {
+    name: name as string,
+    version: version as string,
+    stateSchemaVersion,
+    receiver: strategy,
+    callbacks: Object.freeze(callbacks as Record<StrategyCallbackName, CallbackMethod>),
+  };
 
   // --- run identity and seed ---------------------------------------------
+  const runFields = readOwnFieldsOnce(run, "run", RUN_FIELDS);
+  if (!runFields.ok) {
+    return refuse("RUN_IDENTITY_INVALID", runFields.problem);
+  }
+  const runId = runFields.fields.runId;
+  const instanceId = runFields.fields.instanceId;
+  const configId = runFields.fields.configId;
+  const runSeed = runFields.fields.runSeed;
   for (const [field, value] of [
-    ["run.runId", run?.runId],
-    ["run.instanceId", run?.instanceId],
-    ["run.configId", run?.configId],
+    ["run.runId", runId],
+    ["run.instanceId", instanceId],
+    ["run.configId", configId],
   ] as const) {
     const problem = identifierProblem(value, field);
     if (problem !== null) {
       return refuse("RUN_IDENTITY_INVALID", problem);
     }
   }
-  if (!UnsignedBigIntStringSchema.safeParse(run.runSeed).success) {
+  if (typeof runSeed !== "string" || !UnsignedBigIntStringSchema.safeParse(runSeed).success) {
     return refuse(
       "RUN_SEED_INVALID",
       "run.runSeed must be a canonical unsigned integer string (§10.3 runs.run_seed)",
     );
   }
+  const capturedRun: RunIdentity = {
+    runId: runId as string,
+    instanceId: instanceId as string,
+    configId: configId as string,
+    runSeed,
+  };
 
   // --- watchdog and ports -------------------------------------------------
+  const watchdogFields = readOwnFieldsOnce(watchdog, "watchdog", ["evaluationBudgetUs"]);
+  if (!watchdogFields.ok) {
+    return refuse("WATCHDOG_BUDGET_INVALID", watchdogFields.problem);
+  }
+  const evaluationBudgetUs = watchdogFields.fields.evaluationBudgetUs;
   if (
-    typeof watchdog?.evaluationBudgetUs !== "number" ||
-    !Number.isSafeInteger(watchdog.evaluationBudgetUs) ||
-    watchdog.evaluationBudgetUs < 1
+    typeof evaluationBudgetUs !== "number" ||
+    !Number.isSafeInteger(evaluationBudgetUs) ||
+    evaluationBudgetUs < 1
   ) {
     return refuse(
       "WATCHDOG_BUDGET_INVALID",
       "watchdog.evaluationBudgetUs must be a positive safe integer",
     );
   }
-  if (typeof clock?.nowNs !== "function") {
+
+  const clockFields = readOwnFieldsOnce(clock, "clock", ["nowNs"]);
+  if (!clockFields.ok) {
+    return refuse("PORTS_INVALID", clockFields.problem);
+  }
+  const nowNs = clockFields.fields.nowNs;
+  if (typeof nowNs !== "function") {
     return refuse("PORTS_INVALID", "clock.nowNs must be a function");
   }
-  if (typeof decisionSink?.persist !== "function") {
+  const sinkFields = readOwnFieldsOnce(decisionSink, "decisionSink", ["persist"]);
+  if (!sinkFields.ok) {
+    return refuse("PORTS_INVALID", sinkFields.problem);
+  }
+  const persist = sinkFields.fields.persist;
+  if (typeof persist !== "function") {
     return refuse("PORTS_INVALID", "decisionSink.persist must be a function");
   }
-  if (typeof checkpointStore?.save !== "function") {
+  const storeFields = readOwnFieldsOnce(checkpointStore, "checkpointStore", ["save"]);
+  if (!storeFields.ok) {
+    return refuse("PORTS_INVALID", storeFields.problem);
+  }
+  const save = storeFields.fields.save;
+  if (typeof save !== "function") {
     return refuse("PORTS_INVALID", "checkpointStore.save must be a function");
   }
 
   // --- params: validate against the strategy's own schema, then freeze ----
-  if (!hasSafeParse(strategy.paramsSchema)) {
+  // `safeParse` is read ONCE (through the prototype chain, so a Zod schema's
+  // method is found) and applied with `Reflect.apply`: the function that was
+  // type-checked is the function that runs.
+  const schemaFields = readOwnFieldsOnce(paramsSchema, "strategy.paramsSchema", ["safeParse"]);
+  if (!schemaFields.ok) {
+    return refuse("PARAMS_SCHEMA_UNSUPPORTED", schemaFields.problem);
+  }
+  const safeParse = schemaFields.fields.safeParse;
+  if (typeof safeParse !== "function") {
     return refuse(
       "PARAMS_SCHEMA_UNSUPPORTED",
       "strategy.paramsSchema must expose safeParse(value) (§9.6 'JSON Schema/Zod'; " +
         "a JSON-Schema-based strategy wraps its validator in a safeParse adapter)",
     );
   }
-  const parseResult = strategy.paramsSchema.safeParse(definition.params);
-  if (
-    typeof parseResult !== "object" ||
-    parseResult === null ||
-    typeof (parseResult as { success?: unknown }).success !== "boolean"
-  ) {
+  let parseResult: unknown;
+  try {
+    parseResult = Reflect.apply(safeParse as SafeParseMethod, paramsSchema, [rawParams]);
+  } catch (cause) {
+    // A schema that throws is a schema the runtime cannot evaluate. Refused,
+    // not propagated: creation returns typed refusals only.
+    return refuse(
+      "PARAMS_SCHEMA_UNSUPPORTED",
+      `strategy.paramsSchema.safeParse threw (${describeCause(cause)}); a validator that throws ` +
+        "cannot answer whether the params are valid",
+    );
+  }
+  if (typeof parseResult !== "object" || parseResult === null) {
     return refuse(
       "PARAMS_SCHEMA_UNSUPPORTED",
       "strategy.paramsSchema.safeParse must return { success: boolean, ... }",
     );
   }
-  const typedResult = parseResult as { success: boolean; data?: unknown; error?: unknown };
-  if (!typedResult.success) {
-    const error = typedResult.error;
-    const errorDetail =
-      error instanceof Error ? error.message : error === undefined ? "schema rejection" : String(error);
+  const resultFields = readOwnFieldsOnce(parseResult, "paramsSchema.safeParse(...)", [
+    "success",
+    "data",
+    "error",
+  ]);
+  if (!resultFields.ok) {
+    return refuse("PARAMS_SCHEMA_UNSUPPORTED", resultFields.problem);
+  }
+  if (typeof resultFields.fields.success !== "boolean") {
+    return refuse(
+      "PARAMS_SCHEMA_UNSUPPORTED",
+      "strategy.paramsSchema.safeParse must return { success: boolean, ... }",
+    );
+  }
+  if (!resultFields.fields.success) {
+    const error = resultFields.fields.error;
+    const errorDetail = error === undefined ? "schema rejection" : describeCause(error);
     return refuse("PARAMS_REJECTED", `params rejected by strategy.paramsSchema: ${errorDetail}`);
   }
-  const params = deepFreeze(typedResult.data === undefined ? definition.params : typedResult.data);
+  const parsedParams =
+    resultFields.fields.data === undefined ? rawParams : resultFields.fields.data;
+  let params: unknown;
+  try {
+    params = deepFreeze(parsedParams);
+  } catch (cause) {
+    // `deepFreeze` walks and freezes the parsed params, both of which can run
+    // caller code. Params are NOT materialized: a `paramsSchema` may legitimately
+    // produce a non-JSON value (a compiled matcher, a `Map`), they never enter a
+    // record or checkpoint bytes, and a strategy can only lie about its own
+    // configuration to itself. What is enforced is that they are freezable.
+    return refuse(
+      "PARAMS_NOT_FREEZABLE",
+      `params could not be frozen for the run (${describeCause(cause)}); immutable ` +
+        "configuration (§9.6) must be a freezable object graph",
+    );
+  }
 
   // --- state and RNG: fresh, or restored from a compatible checkpoint -----
   let state: Readonly<Record<string, unknown>> = deepFreeze({});
-  let rng = DeterministicRng.fromSeed(run.runSeed);
+  let rng = DeterministicRng.fromSeed(capturedRun.runSeed);
   let nextEvaluationSeq = 0;
   let status: InstanceStatus = "ACTIVE";
 
-  if (definition.restoreFrom !== undefined) {
-    const restored = restoreCheckpoint(definition.restoreFrom, {
-      runId: run.runId,
-      instanceId: run.instanceId,
-      strategyName: strategy.name,
-      strategyVersion: strategy.version,
-      stateSchemaVersion: strategy.stateSchemaVersion,
-      configId: run.configId,
-      runSeed: run.runSeed,
+  if (restoreFrom !== undefined) {
+    const restored = restoreCheckpoint(restoreFrom as StrategyStateCheckpoint, {
+      runId: capturedRun.runId,
+      instanceId: capturedRun.instanceId,
+      strategyName: capturedStrategy.name,
+      strategyVersion: capturedStrategy.version,
+      stateSchemaVersion: capturedStrategy.stateSchemaVersion,
+      configId: capturedRun.configId,
+      runSeed: capturedRun.runSeed,
     });
     if (!restored.ok) {
       return refuse(restored.refusal.code, restored.refusal.detail);
@@ -298,13 +464,13 @@ export function createStrategyInstanceRuntime(
   return {
     ok: true,
     runtime: new StrategyInstanceRuntime(
-      strategy,
+      capturedStrategy,
       params,
-      run,
-      watchdog.evaluationBudgetUs,
-      clock,
-      decisionSink,
-      checkpointStore,
+      capturedRun,
+      evaluationBudgetUs,
+      { receiver: clock, method: nowNs as ClockMethod },
+      { receiver: decisionSink, method: persist as PersistMethod },
+      { receiver: checkpointStore, method: save as SaveMethod },
       state,
       rng,
       nextEvaluationSeq,
@@ -332,13 +498,13 @@ class StrategyInstanceRuntime {
   private evaluating = false;
 
   constructor(
-    private readonly strategy: Strategy<unknown, unknown>,
+    private readonly strategy: CapturedStrategy,
     private readonly params: unknown,
     private readonly run: RunIdentity,
     private readonly evaluationBudgetUs: number,
-    private readonly clock: MonotonicClock,
-    private readonly decisionSink: DecisionSink,
-    private readonly checkpointStore: CheckpointStore,
+    private readonly clock: CapturedPort<ClockMethod>,
+    private readonly decisionSink: CapturedPort<PersistMethod>,
+    private readonly checkpointStore: CapturedPort<SaveMethod>,
     initialState: Readonly<Record<string, unknown>>,
     private readonly rng: DeterministicRng,
     initialEvaluationSeq: number,
@@ -346,8 +512,8 @@ class StrategyInstanceRuntime {
   ) {
     this.state = initialState;
     // Safe here and only here: `initialState` is either the empty object or the
-    // `JSON.parse` output `restoreCheckpoint` already validated — inert data in
-    // both cases, never a caller's live object.
+    // materialized copy `restoreCheckpoint` produced — inert data in both
+    // cases, never a caller's live object.
     this.stateJson = canonicalJsonStringify(initialState);
     this.evaluationSeq = initialEvaluationSeq;
     this.status = initialStatus;
@@ -364,11 +530,16 @@ class StrategyInstanceRuntime {
   /**
    * One evaluation: exactly one persisted decision record when (and only
    * when) the callback is invoked. Never throws — not for a callback that
-   * throws, not for a value the strategy returns, and not for a view the
-   * caller supplies. The two sequence facts that go with it: every persisted
-   * record consumes its own `evaluationSeq`, and an evaluation that reaches
-   * persistence and fails there leaves the instance PAUSED rather than
-   * re-usable, so no two records can ever share a sequence number.
+   * throws, not for a value the strategy returns, not for a view the caller
+   * supplies, and not for a port that misbehaves. The two sequence facts that
+   * go with it: every persisted record consumes its own `evaluationSeq`, and an
+   * evaluation that reaches persistence and fails there leaves the instance
+   * PAUSED rather than re-usable, so no two records can ever share a sequence
+   * number.
+   *
+   * The input is ACQUIRED first: one inert, deep-frozen snapshot that
+   * validation, the context, the callback, the record and the checkpoint all
+   * read. Nothing below ever touches the caller's object again.
    */
   evaluate(input: EvaluationInput): EvaluationOutcome {
     if (this.evaluating) {
@@ -391,51 +562,60 @@ class StrategyInstanceRuntime {
         },
       };
     }
-    const validation = validateEvaluationInput(input);
-    if (!validation.ok) {
-      return {
-        kind: "REFUSED",
-        refusal: { code: "INPUT_INVALID", detail: validation.detail },
-      };
-    }
-
+    // The re-entrancy flag is set BEFORE the input is acquired, because
+    // acquiring it can run caller code: the view grammar invokes a getter once,
+    // and a getter that calls `evaluate()` again would otherwise start a nested
+    // evaluation that this one knows nothing about. Acquisition is part of the
+    // evaluation, so it is inside the guard.
     this.evaluating = true;
     try {
-      return this.runEvaluation(input);
+      const acquired = acquireEvaluationInput(input);
+      if (!acquired.ok) {
+        return {
+          kind: "REFUSED",
+          refusal: { code: "INPUT_INVALID", detail: acquired.detail },
+        };
+      }
+      return this.runEvaluation(acquired.input);
     } finally {
       this.evaluating = false;
     }
   }
 
+  /** @param input the runtime's own inert snapshot, never the caller's object. */
   private runEvaluation(input: EvaluationInput): EvaluationOutcome {
     const rngSnapshot = this.rng.snapshot();
     let scoped: ScopedStrategyContext;
     try {
       scoped = buildStrategyContext(input, this.params, this.state, this.rng);
     } catch (cause) {
-      // Building the context takes ownership of the caller's view objects and
-      // deep-freezes them in place (`input.ts`, `assumptions` 13). A view that
-      // refuses to be frozen — a Proxy, a host object, a sealed exotic — is an
-      // unusable INPUT, and the honest outcome is the input refusal: the
-      // callback was never invoked, so §6 invariant 3 does not bind and no
-      // record exists. It is refused rather than propagated because
-      // `evaluate()` may not throw.
+      // Unreachable since round 3 — the context is built from inert snapshot
+      // data — and kept as a belt: `evaluate()` may not throw, and a context
+      // that cannot be built means the callback was never invoked, so §6
+      // invariant 3 does not bind and no record exists.
       return {
         kind: "REFUSED",
         refusal: {
           code: "INPUT_INVALID",
           detail:
-            `evaluation input could not be taken into runtime ownership (${describeCause(cause)}); ` +
-            "every view passed to evaluate() must be a plain, freezable object — the callback " +
+            `the evaluation context could not be built (${describeCause(cause)}); the callback ` +
             "was not invoked and no record was persisted",
         },
       };
     }
 
+    const start = this.readClockNs();
+    if (!start.ok) {
+      // Before the callback: nothing ran, nothing is owed. A broken clock is a
+      // caller-error surface, not a strategy failure, so the instance stays
+      // usable and no sequence is consumed.
+      scoped.revoke();
+      return { kind: "REFUSED", refusal: { code: "CLOCK_INVALID", detail: start.detail } };
+    }
+
     let returned: DecisionResult | undefined;
     let thrown: unknown;
     let threw = false;
-    const startNs = this.clock.nowNs();
     try {
       returned = this.invokeCallback(input, scoped.context);
     } catch (cause) {
@@ -448,8 +628,24 @@ class StrategyInstanceRuntime {
       // and desynchronizing the stream from every checkpoint (finding H1).
       scoped.revoke();
     }
-    const endNs = this.clock.nowNs();
-    const elapsedNs = endNs > startNs ? endNs - startNs : 0n;
+    const end = this.readClockNs();
+    if (!end.ok) {
+      // AFTER the callback: the evaluation happened, so exactly one record is
+      // owed. The duration is unknown and telemetry says so with `null` rather
+      // than claiming zero.
+      return this.contain(
+        input,
+        { evaluationDurationUs: null },
+        rngSnapshot,
+        {
+          reasonCode: RUNTIME_REASON_CODES.clockInvalid,
+          detail:
+            `${end.detail} — the callback had already run, so the evaluation is recorded, but ` +
+            "whether it met the watchdog budget cannot be known",
+        },
+      );
+    }
+    const elapsedNs = end.value > start.value ? end.value - start.value : 0n;
     const durationUs = Number(elapsedNs / 1000n);
     const telemetry: DecisionTelemetry = { evaluationDurationUs: durationUs };
 
@@ -460,9 +656,7 @@ class StrategyInstanceRuntime {
         rngSnapshot,
         {
           reasonCode: RUNTIME_REASON_CODES.callbackThrew,
-          detail:
-            `strategy callback ${input.callback} threw: ` +
-            (thrown instanceof Error ? thrown.message : String(thrown)),
+          detail: `strategy callback ${input.callback} threw: ${describeCause(thrown)}`,
           cause: thrown,
         },
       );
@@ -482,11 +676,12 @@ class StrategyInstanceRuntime {
     // fallible region that runs strictly BEFORE any persistence and entirely
     // inside containment (review round 2). Validation, materialization of the
     // state patch, the merged state and its canonical bytes are all produced
-    // now, so the commit below has nothing left that can fail. The `catch` is
-    // the belt to the materializer's braces: every step in `prepareDecision`
-    // already returns its failure, and a step that nonetheless throws — a
-    // hostile value reached through a path not yet enumerated — is still
-    // contained as the strategy's fault instead of escaping `evaluate()`.
+    // now, so the commit below has nothing left that can fail. `prepareDecision`
+    // attributes its own failures — a throw while READING the decision is
+    // `DECISION_INVALID`, a throw while materializing the PATCH is
+    // `STATE_PATCH_INVALID` — and the `catch` here is the belt to those braces
+    // (round 3 fixed the mis-attribution that came from doing it the other way
+    // round).
     let preparation: PrepareDecisionResult;
     try {
       preparation = this.prepareDecision(input, returned);
@@ -510,7 +705,7 @@ class StrategyInstanceRuntime {
 
     const record = this.buildRecord(input, "STRATEGY", prepared.decision);
     try {
-      this.decisionSink.persist(record, telemetry);
+      this.persistRecord(record, telemetry);
     } catch (cause) {
       return this.halt("PERSIST_DECISION", record, cause);
     }
@@ -528,12 +723,42 @@ class StrategyInstanceRuntime {
 
     const checkpoint = this.buildCheckpoint(recordedSeq);
     try {
-      this.checkpointStore.save(checkpoint);
+      this.saveCheckpoint(checkpoint);
     } catch (cause) {
       return this.halt("SAVE_CHECKPOINT", record, cause);
     }
 
     return { kind: "DECIDED", record, telemetry, checkpoint };
+  }
+
+  /**
+   * Reads the injected clock. The clock is a caller-supplied port like any
+   * other, so calling it is guarded and its answer is type-checked before any
+   * arithmetic: mixing a non-`bigint` into `end - start` throws a `TypeError`
+   * out of a function that promises not to throw (remediation round 3).
+   */
+  private readClockNs(): { readonly ok: true; readonly value: bigint } | { readonly ok: false; readonly detail: string } {
+    let value: unknown;
+    try {
+      value = Reflect.apply(this.clock.method, this.clock.receiver, []);
+    } catch (cause) {
+      return { ok: false, detail: `MonotonicClock.nowNs threw (${describeCause(cause)})` };
+    }
+    if (typeof value !== "bigint") {
+      return {
+        ok: false,
+        detail: `MonotonicClock.nowNs must return a bigint of nanoseconds; received ${describeCause(value)}`,
+      };
+    }
+    return { ok: true, value };
+  }
+
+  private persistRecord(record: DecisionRecord, telemetry: DecisionTelemetry): void {
+    Reflect.apply(this.decisionSink.method, this.decisionSink.receiver, [record, telemetry]);
+  }
+
+  private saveCheckpoint(checkpoint: StrategyStateCheckpoint): void {
+    Reflect.apply(this.checkpointStore.method, this.checkpointStore.receiver, [checkpoint]);
   }
 
   /**
@@ -549,6 +774,13 @@ class StrategyInstanceRuntime {
    * the decision log is what `rebuildStateFromPatches` folds, and a durable
    * record that disagrees with the checkpoint it accompanies would break §6
    * invariant 8 for strategy state.
+   *
+   * Attribution is per REGION (round 3): reading the returned value is
+   * `RUNTIME.DECISION_INVALID`, materializing the patch is
+   * `RUNTIME.STATE_PATCH_INVALID`. Before this round both regions were wrapped
+   * in one outer `catch` that called everything a decision problem, so a
+   * revoked-Proxy patch — a state-patch failure by any reading — was reported
+   * as `RUNTIME.DECISION_INVALID`.
    */
   private prepareDecision(
     input: EvaluationInput,
@@ -558,8 +790,23 @@ class StrategyInstanceRuntime {
       ok: false,
       failure: { reasonCode: RUNTIME_REASON_CODES.decisionInvalid, detail },
     });
+    const patchInvalid = (detail: string): PrepareDecisionResult => ({
+      ok: false,
+      failure: { reasonCode: RUNTIME_REASON_CODES.statePatchInvalid, detail },
+    });
 
-    const parsed = DecisionResultSchema.safeParse(returned);
+    let parsed: ReturnType<typeof DecisionResultSchema.safeParse>;
+    try {
+      parsed = DecisionResultSchema.safeParse(returned);
+    } catch (cause) {
+      // Zod's `safeParse` catches its own errors, not a trap throw from the
+      // value being parsed.
+      return invalid(
+        `reading the value returned by strategy callback ${input.callback} threw ` +
+          `(${describeCause(cause)}); a decision the runtime cannot read without executing ` +
+          "strategy code is not a decision",
+      );
+    }
     if (!parsed.success) {
       return invalid(
         `strategy callback ${input.callback} did not return a valid §7.5 DecisionResult: ` +
@@ -580,56 +827,50 @@ class StrategyInstanceRuntime {
           "claimed by a strategy (ADR-005 §3)",
       );
     }
-    if (decision.statePatch === undefined) {
+    // Read once: `decision` is Zod's own output object, but its `statePatch`
+    // VALUES are the strategy's live objects (`z.unknown()` passes them
+    // through), which is why the boundary below materializes.
+    const statePatch: unknown = decision.statePatch;
+    if (statePatch === undefined) {
       return {
         ok: true,
         prepared: { decision, state: this.state, stateJson: this.stateJson },
       };
     }
 
-    const materialized = materializeCheckpointableJson(decision.statePatch, "statePatch");
-    if (!materialized.ok) {
+    try {
+      const materialized = materializeCheckpointableJson(statePatch, "statePatch");
+      if (!materialized.ok) {
+        return patchInvalid(`statePatch is not checkpointable JSON: ${materialized.problem}`);
+      }
+      const patch = deepFreeze(materialized.value) as Readonly<Record<string, unknown>>;
+      const state = deepFreeze({ ...this.state, ...patch });
       return {
-        ok: false,
-        failure: {
-          reasonCode: RUNTIME_REASON_CODES.statePatchInvalid,
-          detail: `statePatch is not checkpointable JSON: ${materialized.problem}`,
+        ok: true,
+        prepared: {
+          decision: { ...decision, statePatch: patch },
+          state,
+          stateJson: canonicalJsonStringify(state),
         },
       };
+    } catch (cause) {
+      // The boundary is total, so this is a belt; if it ever fires, the failure
+      // belongs to the PATCH, which is what the caller is told.
+      return patchInvalid(
+        `the statePatch returned by strategy callback ${input.callback} could not be ` +
+          `materialized (${describeCause(cause)})`,
+      );
     }
-    const patch = deepFreeze(materialized.value) as Readonly<Record<string, unknown>>;
-    const state = deepFreeze({ ...this.state, ...patch });
-    return {
-      ok: true,
-      prepared: {
-        decision: { ...decision, statePatch: patch },
-        state,
-        stateJson: canonicalJsonStringify(state),
-      },
-    };
   }
 
   private invokeCallback(input: EvaluationInput, context: StrategyContext): DecisionResult {
-    switch (input.callback) {
-      case "onStart":
-        return this.strategy.onStart(context);
-      case "onMarketOpen":
-        return this.strategy.onMarketOpen(context);
-      case "onFeatures":
-        return this.strategy.onFeatures(context);
-      case "onFill":
-        return this.strategy.onFill(context, input.fill);
-      case "onOrderUpdate":
-        return this.strategy.onOrderUpdate(context, input.order);
-      case "onTimer":
-        return this.strategy.onTimer(context);
-      case "onMarketClosing":
-        return this.strategy.onMarketClosing(context, input.secondsRemaining);
-      case "onMarketResolved":
-        return this.strategy.onMarketResolved(context, input.resolution);
-      case "onStop":
-        return this.strategy.onStop(context, input.reason);
-    }
+    // The captured function — the one validated at creation — applied to the
+    // strategy object as its receiver, so `this` still means what a class-based
+    // strategy expects while no property is re-read from the caller's object.
+    const method = this.strategy.callbacks[input.callback];
+    const payload = payloadFor(input);
+    const args = payload === undefined ? [context] : [context, payload];
+    return Reflect.apply(method, this.strategy.receiver, args) as DecisionResult;
   }
 
   /**
@@ -653,7 +894,7 @@ class StrategyInstanceRuntime {
     };
     const record = this.buildRecord(input, "RUNTIME", decision);
     try {
-      this.decisionSink.persist(record, telemetry);
+      this.persistRecord(record, telemetry);
     } catch (cause) {
       return this.halt("PERSIST_DECISION", record, cause);
     }
@@ -664,7 +905,7 @@ class StrategyInstanceRuntime {
 
     const checkpoint = this.buildCheckpoint(recordedSeq);
     try {
-      this.checkpointStore.save(checkpoint);
+      this.saveCheckpoint(checkpoint);
     } catch (cause) {
       return this.halt("SAVE_CHECKPOINT", record, cause);
     }
@@ -698,7 +939,7 @@ class StrategyInstanceRuntime {
             ? "RUNTIME.DECISION_PERSIST_FAILED"
             : "RUNTIME.CHECKPOINT_SAVE_FAILED",
         detail:
-          `${port} threw (${cause instanceof Error ? cause.message : String(cause)}); ` +
+          `${port} threw (${describeCause(cause)}); ` +
           "instance paused; the write was attempted exactly once and is not retried — " +
           "reconcile against the store's (runId, evaluationSeq) key before resuming",
       },
@@ -710,6 +951,11 @@ class StrategyInstanceRuntime {
     attribution: DecisionRecord["attribution"],
     decision: DecisionResult,
   ): DecisionRecord {
+    // Every field here comes from the runtime's own inert snapshots: the
+    // acquired evaluation input and the captured run identity. Round 3's HIGH
+    // was exactly this method re-reading `input.market.marketId` from the
+    // caller's live object AFTER the callback had run, which could throw or
+    // answer differently than the value the callback saw.
     const base = {
       decisionContractVersion: DECISION_RESULT_SCHEMA_VERSION,
       runId: this.run.runId,
@@ -743,6 +989,24 @@ class StrategyInstanceRuntime {
       // the decision was persisted; nothing is serialized after a persist.
       stateJson: this.stateJson,
     };
+  }
+}
+
+/** The one payload a callback takes beyond its context, if it takes one. */
+function payloadFor(input: EvaluationInput): unknown {
+  switch (input.callback) {
+    case "onFill":
+      return input.fill;
+    case "onOrderUpdate":
+      return input.order;
+    case "onMarketClosing":
+      return input.secondsRemaining;
+    case "onMarketResolved":
+      return input.resolution;
+    case "onStop":
+      return input.reason;
+    default:
+      return undefined;
   }
 }
 

@@ -39,10 +39,19 @@ import { describe, expect, it } from "vitest";
 
 import {
   canonicalJsonStringify,
-  checkpointableJsonProblem,
   deepFreeze,
   materializeCheckpointableJson,
 } from "../../../packages/strategy-runtime/src/index.js";
+
+/**
+ * The validate-only shape these tests were written against; the export it used
+ * to call (`checkpointableJsonProblem`) was removed in remediation round 3 (see
+ * `json.test.ts` for the reasoning). Every assertion is unchanged.
+ */
+function problemOf(value: unknown): string | null {
+  const result = materializeCheckpointableJson(value);
+  return result.ok ? null : result.problem;
+}
 
 /**
  * The reviewer's value: plain to every inspection until something freezes it,
@@ -207,8 +216,8 @@ describe("the checkpointable-state boundary materializes rather than trusting an
     for (const { name, value, path } of throwingTrapProxies()) {
       let problem: string | null = "unset";
       expect(() => {
-        problem = checkpointableJsonProblem(value);
-      }, `checkpointableJsonProblem must not throw for the ${name} trap`).not.toThrow();
+        problem = problemOf(value);
+      }, `the boundary must not throw for the ${name} trap`).not.toThrow();
       expect(problem, `the ${name} trap must be refused`).not.toBeNull();
       expect(problem).toContain(path);
       expect(problem).toContain("is not checkpointable");
@@ -223,9 +232,9 @@ describe("the checkpointable-state boundary materializes rather than trusting an
 
   it("a Proxy over a non-plain object is still refused by the prototype rule", () => {
     const date = new Proxy(new Date(0), {});
-    expect(checkpointableJsonProblem({ when: date })).toContain("only plain objects");
+    expect(problemOf({ when: date })).toContain("only plain objects");
     const map = new Proxy(new Map<string, number>(), {});
-    expect(checkpointableJsonProblem({ m: map })).toContain("only plain objects");
+    expect(problemOf({ m: map })).toContain("only plain objects");
   });
 
   it("a lying descriptor trap can only lie into inert data", () => {
@@ -269,7 +278,7 @@ describe("the checkpointable-state boundary materializes rather than trusting an
       },
       enumerable: true,
     });
-    expect(checkpointableJsonProblem(value)).toContain("accessor");
+    expect(problemOf(value)).toContain("accessor");
     expect(materializeCheckpointableJson(value).ok).toBe(false);
     expect(getterCalls).toBe(0);
   });
@@ -294,7 +303,7 @@ describe("the checkpointable-state boundary materializes rather than trusting an
       null,
     ];
     for (const value of accepted) {
-      expect(checkpointableJsonProblem(value), JSON.stringify(value) ?? "value").toBeNull();
+      expect(problemOf(value), JSON.stringify(value) ?? "value").toBeNull();
       const result = materializeCheckpointableJson(value);
       expect(result.ok).toBe(true);
       if (result.ok) {
@@ -375,7 +384,7 @@ describe("the checkpointable-state boundary materializes rather than trusting an
       Object.create(null) as object,
     ];
     for (const value of battery) {
-      const problem = checkpointableJsonProblem(value);
+      const problem = problemOf(value);
       const materialized = materializeCheckpointableJson(value);
       expect(materialized.ok).toBe(problem === null);
       if (!materialized.ok) {
@@ -385,7 +394,7 @@ describe("the checkpointable-state boundary materializes rather than trusting an
     // A cycle is refused by both, and neither hangs.
     const cyclic: Record<string, unknown> = {};
     cyclic["self"] = cyclic;
-    expect(checkpointableJsonProblem(cyclic)).toContain("circular structure");
+    expect(problemOf(cyclic)).toContain("circular structure");
     expect(materializeCheckpointableJson(cyclic).ok).toBe(false);
   });
 });

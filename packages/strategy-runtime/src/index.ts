@@ -20,8 +20,13 @@ export {
   type WatchdogPolicy,
 } from "./runtime.js";
 
-export type { EvaluationInput, EvaluationViews, InputValidationResult } from "./input.js";
-export { validateEvaluationInput } from "./input.js";
+export type {
+  AcquireEvaluationInputResult,
+  EvaluationInput,
+  EvaluationViews,
+  InputValidationResult,
+} from "./input.js";
+export { acquireEvaluationInput, validateEvaluationInput } from "./input.js";
 
 export type {
   ContainedFailure,
@@ -52,6 +57,7 @@ export {
   type CheckpointRefusal,
   type CheckpointRefusalCode,
   type InstanceStatus,
+  type RebuildStateResult,
   type RestoreCheckpointResult,
   type RestoredCheckpoint,
   type StrategyStateCheckpoint,
@@ -64,11 +70,19 @@ export {
   type ReservedRuntimeReasonCode,
 } from "./reserved-codes.js";
 
+/**
+ * The checkpointable-state boundary. `checkpointableJsonProblem` was REMOVED in
+ * remediation round 3 (review round 3's LOW): a public validate-then-retain
+ * predicate invites exactly the workflow that produced round 2's HIGH — validate
+ * a Proxy, keep the Proxy — and after `restoreCheckpoint` was fixed to keep the
+ * materialized copy, no internal caller was left to justify it. Validate by
+ * materializing and keeping the returned copy.
+ */
 export {
   canonicalJsonStringify,
-  checkpointableJsonProblem,
   deepFreeze,
   materializeCheckpointableJson,
+  MAX_MATERIALIZED_DEPTH,
   type CheckpointableJson,
   type MaterializeCheckpointableJsonResult,
 } from "./json.js";

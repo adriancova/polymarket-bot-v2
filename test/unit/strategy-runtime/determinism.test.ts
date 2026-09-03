@@ -127,10 +127,17 @@ describe("acceptance 3: same event/config/seed yields identical state and decisi
 
   it("state is rebuildable from the persisted statePatches alone and matches the checkpointed bytes (§9.6)", () => {
     const { sink, store } = runSequence("12345");
+    // `rebuildStateFromPatches` returns a typed RESULT since remediation round
+    // 3: it materializes every patch it folds, so a patch it cannot read is a
+    // stated problem instead of a throw. The fold itself is unchanged.
     const rebuilt = rebuildStateFromPatches(
       sink.calls.map((call) => call.record.decision.statePatch),
     );
-    expect(canonicalJsonStringify(rebuilt)).toBe(store.checkpoints.at(-1)?.stateJson);
+    expect(rebuilt.ok).toBe(true);
+    if (!rebuilt.ok) {
+      return;
+    }
+    expect(canonicalJsonStringify(rebuilt.state)).toBe(store.checkpoints.at(-1)?.stateJson);
   });
 
   it("a run interrupted mid-way and RESTORED from its checkpoint reproduces the identical tail (§9.6 restore)", () => {

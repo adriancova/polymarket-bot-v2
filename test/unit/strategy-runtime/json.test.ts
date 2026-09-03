@@ -16,21 +16,35 @@ import { describe, expect, it } from "vitest";
 
 import {
   canonicalJsonStringify,
-  checkpointableJsonProblem,
   deepFreeze,
+  materializeCheckpointableJson,
 } from "../../../packages/strategy-runtime/src/index.js";
 
-describe("checkpointableJsonProblem", () => {
+/**
+ * The validate-only shape these tests were written against.
+ *
+ * `checkpointableJsonProblem` was REMOVED from the package in remediation round
+ * 3 (review round 3's LOW): a public validate-then-retain predicate invites the
+ * workflow that produced round 2's HIGH. Every assertion below is unchanged —
+ * the walk is the same walk — but it now runs through the materializer with the
+ * copy discarded, which is what the deleted export did internally.
+ */
+function problemOf(value: unknown): string | null {
+  const result = materializeCheckpointableJson(value);
+  return result.ok ? null : result.problem;
+}
+
+describe("the checkpointable-JSON grammar", () => {
   it("accepts the JSON value grammar", () => {
-    expect(checkpointableJsonProblem(null)).toBeNull();
-    expect(checkpointableJsonProblem(true)).toBeNull();
-    expect(checkpointableJsonProblem(0)).toBeNull();
-    expect(checkpointableJsonProblem(-1.5)).toBeNull();
-    expect(checkpointableJsonProblem("0.01")).toBeNull();
-    expect(checkpointableJsonProblem([])).toBeNull();
-    expect(checkpointableJsonProblem({})).toBeNull();
+    expect(problemOf(null)).toBeNull();
+    expect(problemOf(true)).toBeNull();
+    expect(problemOf(0)).toBeNull();
+    expect(problemOf(-1.5)).toBeNull();
+    expect(problemOf("0.01")).toBeNull();
+    expect(problemOf([])).toBeNull();
+    expect(problemOf({})).toBeNull();
     expect(
-      checkpointableJsonProblem({ a: [1, "x", null, { b: false }], c: Object.create(null) }),
+      problemOf({ a: [1, "x", null, { b: false }], c: Object.create(null) }),
     ).toBeNull();
   });
 
@@ -46,7 +60,7 @@ describe("checkpointableJsonProblem", () => {
       [[1, [2, { deep: undefined }]], "$[1][1].deep"],
     ];
     for (const [value, path] of cases) {
-      const problem = checkpointableJsonProblem(value);
+      const problem = problemOf(value);
       expect(problem, JSON.stringify(path)).not.toBeNull();
       expect(problem).toContain(path);
     }
@@ -57,7 +71,7 @@ describe("checkpointableJsonProblem", () => {
       value = 1;
     }
     for (const value of [new Holder(), new Date(0), new Map(), new Set(), /re/]) {
-      expect(checkpointableJsonProblem({ a: value }), String(value)).toContain(
+      expect(problemOf({ a: value }), String(value)).toContain(
         "only plain objects are checkpointable",
       );
     }
@@ -66,12 +80,12 @@ describe("checkpointableJsonProblem", () => {
   it("rejects a circular structure instead of overflowing the stack", () => {
     const cyclic: Record<string, unknown> = { a: 1 };
     cyclic["self"] = cyclic;
-    expect(checkpointableJsonProblem(cyclic)).toContain("circular structure");
+    expect(problemOf(cyclic)).toContain("circular structure");
   });
 
   it("accepts the same object graph reached twice by different paths (a DAG is not a cycle)", () => {
     const shared = { x: 1 };
-    expect(checkpointableJsonProblem({ a: shared, b: shared })).toBeNull();
+    expect(problemOf({ a: shared, b: shared })).toBeNull();
   });
 });
 
