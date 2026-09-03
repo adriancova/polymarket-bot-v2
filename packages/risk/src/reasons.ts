@@ -87,6 +87,7 @@ export const RISK_REASON_CODES = [
   "RISK_UNDERLYING_EXPOSURE_EXCEEDED",
   "RISK_RESOLUTION_WINDOW_EXPOSURE_EXCEEDED",
   "RISK_EXPOSURE_SNAPSHOT_MISSING",
+  "RISK_EXPOSURE_ENTRY_MISSING",
   "RISK_SCOPE_KEY_MISSING",
 
   // --- check 16: worst-case contractual loss (PRIMARY) ----------------------
@@ -128,6 +129,18 @@ export const RISK_REASON_CODES = [
 ] as const;
 
 export type RiskReasonCode = (typeof RISK_REASON_CODES)[number];
+
+/**
+ * The published cardinality of {@link RISK_REASON_CODES}.
+ *
+ * Pinned as a constant, and asserted against the list in
+ * `test/unit/risk/engine.test.ts`, because the documented count drifted from
+ * the real vocabulary once already (review round 1, MEDIUM: the handoff claimed
+ * 56 against a 61-entry list). The count appears in `README.md` §5 and in
+ * `docs/handoffs/WP-180.md`; changing the list without changing all three fails
+ * the suite, which is the point.
+ */
+export const RISK_REASON_CODE_COUNT = 62;
 
 const CODE_SET: ReadonlySet<string> = new Set(RISK_REASON_CODES);
 

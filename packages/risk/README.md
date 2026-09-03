@@ -91,7 +91,7 @@ to place a new order is the safe direction, and a strategy that means "exit" has
 | §9.8 check | ENTRY | EXIT (`REDUCE_POSITION`) | CANCEL |
 | --- | :---: | :---: | :---: |
 | 1. run / strategy state | ✔ | ✔ | — (§6 inv. 13) |
-| 2. run mode within process maximum | ✔ | ✔ | ✔ |
+| 2. run mode within process maximum | ✔ | ✔ | — |
 | 3. real-order enablement and fencing | ✔ | ✔ | — |
 | 4. venue geographic eligibility | ✔ | ✔ (not `CLOSE_ONLY`) | — |
 | 5. market active / accepting | ✔ | ✔ (`CLOSE_ONLY` permitted) | — |
@@ -106,25 +106,69 @@ to place a new order is the safe direction, and a strategy that means "exit" has
 | 12. expected net edge | ✔ | — | — |
 | 13. participation limit | ✔ | — | — |
 | 14a. allocator verdict present | ✔ | — | — |
-| 14b. allocator verdict *refused* | ✔ | ✔ | ✔ |
+| 14b. allocator verdict *refused* | ✔ | ✔ | — |
 | 14c. sell ≤ confirmed inventory | ✔ | ✔ | — |
 | 15. per-order / per-scope / global limits | ✔ | — | — |
 | 16. worst-case contractual loss | ✔ | reported, not enforced | reported |
 | 17. scenario loss | ✔ | reported, not enforced | reported |
-| 18. duplicate intent / self-trade | ✔ | duplicate only | duplicate only |
+| 18. duplicate intent / self-trade | ✔ | duplicate only | — |
 | 19. rate-limit headroom | ✔ | — | — |
 | 20. time-to-close | ✔ | — | — |
 
 The two rules behind the "—" cells:
 
 - **§6 invariant 13** — "Safety cancellation outranks new order placement": a
-  `CANCEL` is not blocked by staleness, exposure, edge, headroom, or
-  time-to-close. It *is* still blocked by an out-of-range run mode, which is a
-  process configuration error rather than a market condition.
+  `CANCEL` is never blocked. See §4.1.
 - **Capacity limits gate entries, not exits.** An exit reduces exposure;
   enforcing a cap against it would block exactly the action that brings the
   account back inside the cap. The measures are still computed and returned so
   an operator can see them.
+
+### 4.1 A CANCEL is never blocked — and how that is enforced
+
+> **Corrected 2026-09-02 (remediation round 1).** This section previously read
+> "a `CANCEL` … *is* still blocked by an out-of-range run mode, which is a
+> process configuration error rather than a market condition", and the check
+> table marked checks 2, 14b, and 18 as applying to a cancel. **That was wrong
+> and the code matched it**: adversarial review round 1 (BLOCKER 1) found that a
+> run-mode mismatch and an explicit allocator refusal each blocked a cancel, and
+> a same-class audit of every gate additionally found a missing market context
+> and a non-canonical `approvedIntentId` doing the same. §6 invariant 13 admits
+> no exception: blocking a cancel can trap a position, which is precisely the
+> failure the invariant exists to prevent. The original wording is preserved
+> here rather than quietly replaced.
+
+The rule is now **structural**, not a per-check condition. `evaluateIntent`
+runs the pipeline, then reaches one choke point: if the disposition is `CANCEL`,
+every refusal that accumulated — from any gate, including gates added later —
+becomes a non-blocking observation on `cancelPriorityOverrides` and the cancel
+is **approved**, carrying its typed record, its recommendations, and its
+worst-case measure. The gates audited, and what the audit found:
+
+| Gate | Could it block a cancel before? | Now |
+| --- | --- | --- |
+| input schema validation (`RISK_INPUT_INVALID`) | yes | **yes, unavoidably** — until the input parses there is no disposition to privilege, and an unparseable request names no orders to cancel |
+| `RISK_UUID_NOT_CANONICAL` (record identity) | **yes — audit finding** | observed, never blocks |
+| `RISK_INTENT_EXPIRED` | no (§7.7 gives `CANCEL` no `validUntil`) | observed, never blocks |
+| intent-view refusals (`RISK_ZERO_DELTA`, `RISK_BASKET_LEG_UNBOUNDED`) | no (a cancel produces neither) | observed, never blocks |
+| check 1 run / strategy state | no (`placesOrders` guard) | never blocks |
+| check 2 run mode vs process maximum | **yes — reviewer's BLOCKER 1** | observed, never blocks |
+| check 3 real-order surface, check 4 eligibility | no (`placesOrders` guard) | never blocks |
+| `RISK_MARKET_CONTEXT_MISSING` | **yes — audit finding** | observed, never blocks |
+| checks 5, 7, 8, 9, 10, 11a | no (`placesOrders` guard) | never blocks |
+| checks 6, 11b, 12, 13, 15, 19, 20, self-trade | no (`isEntry` guard) | never blocks |
+| check 14a allocator verdict absent | no (`isEntry` guard) | never blocks |
+| check 14b allocator verdict **refused** | **yes — reviewer's BLOCKER 1** | observed, never blocks |
+| check 14c sell ≤ inventory | no (a cancel has no legs) | observed, never blocks |
+| `RISK_POSITION_STATE_UNKNOWN`, `RISK_QUOTE_MAX_INVENTORY_EXCEEDED` | no (EXIT / QUOTE only) | never blocks |
+| check 16 `RISK_WORST_CASE_UNBOUNDED` and the approval backstop | no (a cancel has no unbounded BUY leg) | observed, never blocks |
+| check 18 duplicate intent | no (§7.7 gives `CANCEL` no `intentId`) | observed, never blocks |
+
+`cancelPriorityOverrides` is **not** a refusal list. The evaluation is approved;
+the entries are what an operator and the §9.9 incident controller should still
+see. Pinned by `test/unit/risk/engine.test.ts`, describe block *"§6 invariant 13
+— a CANCEL survives every audited gate"*, including a case that trips all four
+audited gates at once.
 
 ### Staleness and exits, stated exactly
 
@@ -147,13 +191,24 @@ live (§6 invariant 2, §12.4).
 
 ## 5. Reason codes — the PACKAGE-OWNED vocabulary
 
+**The vocabulary has exactly 62 codes**, all listed below.
+
 Every rejection, approval, and recommendation carries a code from this list.
 Codes follow the frozen `CodeString` grammar (`^[A-Za-z][A-Za-z0-9_.:-]*$`, ≤ 64
 characters) so they are safe as metric labels (§14.3). **Adding a code is
 additive; changing the meaning of one is not** — operators alert on them. The
-list is exported at runtime as `RISK_REASON_CODES` so a consumer can validate a
-persisted code against the vocabulary of the version that wrote it, and
-`test/unit/risk/engine.test.ts` fails if any declared code becomes unreachable.
+list is exported at runtime as `RISK_REASON_CODES`, and its cardinality as
+`RISK_REASON_CODE_COUNT`, so a consumer can validate a persisted code against
+the vocabulary of the version that wrote it. `test/unit/risk/engine.test.ts`
+fails if any declared code becomes unreachable, if the count drifts from
+`RISK_REASON_CODE_COUNT`, **or if this section stops documenting exactly the
+declared set** — the three surfaces are bound together by test.
+
+> **Corrected 2026-09-02 (remediation round 1).** `docs/handoffs/WP-180.md`
+> claimed a 56-code vocabulary against a list that actually held 61 (adversarial
+> review round 1, MEDIUM); the count is now pinned in code and asserted, and
+> `RISK_EXPOSURE_ENTRY_MISSING` was added by the BLOCKER-2 fix in the same
+> round, bringing the total to 62.
 
 ### Input validation
 
@@ -233,6 +288,7 @@ persisted code against the vocabulary of the version that wrote it, and
 | `RISK_UNDERLYING_EXPOSURE_EXCEEDED` | The per-underlying cap. |
 | `RISK_RESOLUTION_WINDOW_EXPOSURE_EXCEEDED` | The per-resolution-window cap. |
 | `RISK_EXPOSURE_SNAPSHOT_MISSING` | A cap is configured and no snapshot was supplied. An unmeasured limit is not a passed limit. |
+| `RISK_EXPOSURE_ENTRY_MISSING` | A cap is configured and the supplied snapshot carries **no entry** for the queried scope. An absent entry is *unknown* exposure, not zero exposure. Supply an explicit zero entry (the allocator's `exposureSnapshotCovering` builds one for a declared key set). |
 | `RISK_SCOPE_KEY_MISSING` | A scope cap is configured for a dimension the market carries no attribution for. |
 
 Every entry consumes a limit from **both** components — resting open orders and

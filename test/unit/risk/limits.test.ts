@@ -69,7 +69,11 @@ describe("checkExposureLimits", () => {
   it("reports EVERY breach rather than only the first", () => {
     const refusals = checkExposureLimits(
       limitsOf({ globalExposureCap: "1", perMarketExposureCap: "1", perSeriesExposureCap: "1" }),
-      exposureSnapshot({}) as never,
+      // Every queried scope MEASURED at zero: the breaches below must come from
+      // the contribution, not from an unmeasured scope.
+      exposureSnapshot({
+        measuring: { marketIds: [MARKET_A], seriesKeys: ["s"] },
+      }) as never,
       probe,
     );
     expect(refusals.map((r) => r.code).sort()).toEqual([
@@ -82,7 +86,7 @@ describe("checkExposureLimits", () => {
   it("aggregates several markets sharing one scope key before comparing", () => {
     const refusals = checkExposureLimits(
       limitsOf({ perUnderlyingExposureCap: "15" }),
-      exposureSnapshot({}) as never,
+      exposureSnapshot({ measuring: { underlyingKeys: ["BTC"] } }) as never,
       {
         strategyInstanceId: "strat-a",
         perMarketContribution: new Map([
@@ -111,6 +115,96 @@ describe("checkExposureLimits", () => {
       },
     );
     expect(refusals.map((r) => r.code)).toEqual(["RISK_SCOPE_KEY_MISSING"]);
+  });
+
+  /**
+   * REVIEW ROUND 1, BLOCKER 2 — an absent entry was substituted with `"0"`, so
+   * a configured cap silently passed against exposure nobody had measured.
+   * These probes drive every dimension with a cap ROOMY enough that a real
+   * zero would pass: the refusal therefore proves the absence itself blocks,
+   * not the size of the contribution.
+   */
+  describe("an ABSENT entry is unknown exposure, never zero exposure", () => {
+    const roomy = "1000000";
+
+    it("per-strategy-instance: an unmeasured instance blocks", () => {
+      const refusals = checkExposureLimits(
+        limitsOf({ perInstanceExposureCap: roomy }),
+        exposureSnapshot({}) as never,
+        probe,
+      );
+      expect(refusals.map((r) => r.code)).toEqual(["RISK_EXPOSURE_ENTRY_MISSING"]);
+      expect(refusals[0]?.details["dimension"]).toBe("strategy-instance");
+      expect(refusals[0]?.details["key"]).toBe("strat-a");
+    });
+
+    it("per-market: an unmeasured market blocks", () => {
+      const refusals = checkExposureLimits(
+        limitsOf({ perMarketExposureCap: roomy }),
+        exposureSnapshot({}) as never,
+        probe,
+      );
+      expect(refusals.map((r) => r.code)).toEqual(["RISK_EXPOSURE_ENTRY_MISSING"]);
+      expect(refusals[0]?.details["key"]).toBe(MARKET_A);
+    });
+
+    it("per-series, per-underlying, per-resolution-window: an unmeasured scope blocks", () => {
+      for (const cap of [
+        "perSeriesExposureCap",
+        "perUnderlyingExposureCap",
+        "perResolutionWindowExposureCap",
+      ] as const) {
+        const refusals = checkExposureLimits(
+          limitsOf({ [cap]: roomy }),
+          exposureSnapshot({}) as never,
+          probe,
+        );
+        expect(refusals.map((r) => r.code)).toEqual(["RISK_EXPOSURE_ENTRY_MISSING"]);
+      }
+    });
+
+    it("an EXPLICIT zero entry is a measurement and passes the same cap", () => {
+      const refusals = checkExposureLimits(
+        limitsOf({
+          perInstanceExposureCap: roomy,
+          perMarketExposureCap: roomy,
+          perSeriesExposureCap: roomy,
+          perUnderlyingExposureCap: roomy,
+          perResolutionWindowExposureCap: roomy,
+        }),
+        exposureSnapshot({
+          measuring: {
+            strategyInstanceIds: ["strat-a"],
+            marketIds: [MARKET_A],
+            seriesKeys: ["s"],
+            underlyingKeys: ["u"],
+            resolutionWindowKeys: ["w"],
+          },
+        }) as never,
+        probe,
+      );
+      expect(refusals).toEqual([]);
+    });
+
+    it("a partially-complete snapshot blocks only the scope it omits", () => {
+      const refusals = checkExposureLimits(
+        limitsOf({ perMarketExposureCap: roomy, perUnderlyingExposureCap: roomy }),
+        exposureSnapshot({ measuring: { marketIds: [MARKET_A] } }) as never,
+        probe,
+      );
+      expect(refusals.map((r) => r.code)).toEqual(["RISK_EXPOSURE_ENTRY_MISSING"]);
+      expect(refusals[0]?.details["dimension"]).toBe("underlying");
+    });
+
+    it("an entry present but at a NONZERO value is used, not defaulted", () => {
+      const refusals = checkExposureLimits(
+        limitsOf({ perMarketExposureCap: "100" }),
+        exposureSnapshot({ byMarket: { [MARKET_A]: exposureEntry("60", "40") } }) as never,
+        probe,
+      );
+      expect(refusals.map((r) => r.code)).toEqual(["RISK_MARKET_EXPOSURE_EXCEEDED"]);
+      expect(refusals[0]?.details["current"]).toBe("100");
+    });
   });
 });
 

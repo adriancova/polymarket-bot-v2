@@ -29,6 +29,7 @@ import {
   createAllocatorState,
   evaluateReservation,
   exposureSnapshot,
+  exposureSnapshotCovering,
   parseAllocatorCaps,
   type ExposureEntry,
   type ReservationVerdict,
@@ -38,7 +39,18 @@ import {
   ExposureSnapshotViewSchema,
   evaluateIntent,
 } from "../../../packages/risk/src/index.js";
-import { INSTANCE, MARKET_A, codesOf, entryInput, riskPolicy } from "./fixtures.js";
+import {
+  INSTANCE,
+  MARKET_A,
+  MARKET_B,
+  allScenarios,
+  codesOf,
+  entryInput,
+  freshObservations,
+  market,
+  positionIntent,
+  riskPolicy,
+} from "./fixtures.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -183,6 +195,56 @@ describe("end-to-end: the allocator's own numbers drive the risk limit", () => {
     const refusal = result.refusals.find((r) => r.code === "RISK_ALLOCATION_REFUSED");
     expect(refusal).toBeDefined();
     expect(refusal?.details["allocatorCodes"]).toContain("CAPITAL_INVENTORY_INSUFFICIENT");
+  });
+
+  /**
+   * REVIEW ROUND 1, BLOCKER 2 — the two sides of the fix, end to end.
+   *
+   * `exposureSnapshot` is sparse: a market with no commitments has no row. The
+   * risk side now REFUSES that gap instead of reading it as zero, and
+   * `exposureSnapshotCovering` is how a composition root closes it honestly.
+   */
+  it("a sparse allocator snapshot blocks a cap on an unmentioned market", () => {
+    const { state } = allocatorFixture();
+    const input = entryInput();
+    // MARKET_B has no commitments, so the sparse snapshot has no row for it.
+    input.intent = { ...positionIntent(), marketId: MARKET_B };
+    input.markets = [market({ marketId: MARKET_B })];
+    input.freshness = freshObservations(MARKET_B);
+    input.scenarios = allScenarios("0.4", [MARKET_B]);
+    input.exposures = exposureSnapshot(state) as unknown as Record<string, unknown>;
+
+    const policy = riskPolicy({
+      // Roomy: if the absent row really meant zero, this would pass.
+      limits: { maxWorstCaseContractualLoss: "10000", perMarketExposureCap: "10000" },
+    });
+    const result = evaluateIntent(policy, input);
+
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toContain("RISK_EXPOSURE_ENTRY_MISSING");
+  });
+
+  it("the SAME evaluation passes once the allocator covers the queried scope", () => {
+    const { state } = allocatorFixture();
+    const input = entryInput();
+    input.intent = { ...positionIntent(), marketId: MARKET_B };
+    input.markets = [market({ marketId: MARKET_B })];
+    input.freshness = freshObservations(MARKET_B);
+    input.scenarios = allScenarios("0.4", [MARKET_B]);
+    const covering = exposureSnapshotCovering(state, { marketIds: [MARKET_B] });
+    input.exposures = covering as unknown as Record<string, unknown>;
+
+    // The covering snapshot is still a valid structural port.
+    expect(ExposureSnapshotViewSchema.safeParse(covering).success).toBe(true);
+    expect(covering.byMarket[MARKET_B]?.combined).toBe("0");
+
+    const policy = riskPolicy({
+      limits: { maxWorstCaseContractualLoss: "10000", perMarketExposureCap: "10000" },
+    });
+    const result = evaluateIntent(policy, input);
+
+    expect(codesOf(result)).toEqual([]);
+    expect(result.approved).toBe(true);
   });
 
   it("an applied reservation raises the allocator exposure the risk engine then sees", () => {

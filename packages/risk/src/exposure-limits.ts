@@ -9,21 +9,32 @@
  * derived field is convenient, but a limit check that trusted a peer's
  * arithmetic would pass a snapshot whose `combined` had drifted from its parts.
  *
- * FAIL CLOSED, twice over:
+ * FAIL CLOSED, three times over:
  *
  * - a configured cap with NO exposure snapshot supplied blocks
  *   (`RISK_EXPOSURE_SNAPSHOT_MISSING`) — an unmeasured limit is not a passed
  *   limit;
+ * - a configured cap whose queried scope is ABSENT from the supplied snapshot
+ *   blocks (`RISK_EXPOSURE_ENTRY_MISSING`) — see the next paragraph;
  * - a configured SCOPE cap (series, underlying, resolution window) for a market
  *   with no such attribution blocks (`RISK_SCOPE_KEY_MISSING`) — an
  *   unattributable request cannot be proven within the cap. This mirrors the
  *   allocator's `CAPITAL_SCOPE_KEY_MISSING`.
+ *
+ * AN ABSENT ENTRY IS UNKNOWN, NOT ZERO (review round 1, BLOCKER 2). This module
+ * previously substituted `"0"` for a scope the supplied snapshot did not
+ * mention, so a configured cap silently passed against unmeasured exposure —
+ * a fail-open limit bypass. The peer's snapshot is not this package's data and
+ * its gaps are not measurements of zero. A caller that means "this scope holds
+ * nothing" must SAY so with an explicit zero entry; the allocator's
+ * `exposureSnapshotCovering` builds exactly that snapshot for a declared key
+ * set. Nothing here substitutes a permissive value for unknown peer data.
  */
 
 import { addDecimal, compareDecimal } from "@polymarket-bot/decimal";
 import type { MoneyString } from "@polymarket-bot/domain";
 
-import type { ExposureSnapshotView, ScopeAttribution } from "./inputs.js";
+import type { ExposureEntryView, ExposureSnapshotView, ScopeAttribution } from "./inputs.js";
 import type { RiskPolicy } from "./policy.js";
 import type { RiskReasonCode } from "./reasons.js";
 import { riskRefusal, type RiskRefusal } from "./result.js";
@@ -41,10 +52,31 @@ export interface ExposureProbe {
 type ScopeDimension = "bySeries" | "byUnderlying" | "byResolutionWindow";
 type ScopeKeyField = keyof ScopeAttribution;
 
-/** Sum of an entry's two components. Never reads the peer's `combined`. */
-function committed(entry: { openOrderCommitted: string; positionCommitted: string } | undefined): MoneyString {
-  if (entry === undefined) return "0";
+/**
+ * Sum of an entry's two components. Never reads the peer's `combined`.
+ *
+ * TOTAL ON A PRESENT ENTRY ONLY. There is deliberately no `undefined` arm: the
+ * absence of an entry is handled by {@link entryMissing} at each call site, so
+ * this function cannot be the place a missing measurement becomes a zero.
+ */
+function committed(entry: ExposureEntryView): MoneyString {
   return addDecimal(entry.openOrderCommitted, entry.positionCommitted);
+}
+
+/**
+ * The refusal for a configured cap whose queried scope the supplied snapshot
+ * does not contain. An absent entry is UNKNOWN exposure, never zero exposure.
+ */
+function entryMissing(
+  dimension: string,
+  key: string | undefined,
+  cap: MoneyString,
+): RiskRefusal {
+  return riskRefusal(
+    "RISK_EXPOSURE_ENTRY_MISSING",
+    `a ${dimension} exposure limit is configured but the supplied allocator snapshot carries no entry for this scope; an absent entry is unknown exposure, not zero exposure, so the cap cannot be shown to hold (fail closed — supply an explicit zero entry for every queried scope)`,
+    { dimension, key, cap },
+  );
 }
 
 function breach(
@@ -106,6 +138,9 @@ export function checkExposureLimits(
     if (refusal !== undefined) refusals.push(refusal);
   };
 
+  // `global` is a REQUIRED field of `ExposureSnapshotViewSchema`, so a snapshot
+  // that reached this point always carries it; there is no absent-global case
+  // to substitute a zero for.
   if (limits.globalExposureCap !== undefined) {
     push(
       breach(
@@ -120,26 +155,42 @@ export function checkExposureLimits(
   }
 
   if (limits.perInstanceExposureCap !== undefined) {
-    push(
-      breach(
-        "RISK_INSTANCE_EXPOSURE_EXCEEDED",
-        "strategy-instance",
-        probe.strategyInstanceId,
-        committed(exposures.byStrategyInstance[probe.strategyInstanceId]),
-        probe.totalContribution,
-        limits.perInstanceExposureCap,
-      ),
-    );
+    const entry = exposures.byStrategyInstance[probe.strategyInstanceId];
+    if (entry === undefined) {
+      refusals.push(
+        entryMissing(
+          "strategy-instance",
+          probe.strategyInstanceId,
+          limits.perInstanceExposureCap,
+        ),
+      );
+    } else {
+      push(
+        breach(
+          "RISK_INSTANCE_EXPOSURE_EXCEEDED",
+          "strategy-instance",
+          probe.strategyInstanceId,
+          committed(entry),
+          probe.totalContribution,
+          limits.perInstanceExposureCap,
+        ),
+      );
+    }
   }
 
   if (limits.perMarketExposureCap !== undefined) {
     for (const [marketId, contribution] of probe.perMarketContribution) {
+      const entry = exposures.byMarket[marketId];
+      if (entry === undefined) {
+        refusals.push(entryMissing("market", marketId, limits.perMarketExposureCap));
+        continue;
+      }
       push(
         breach(
           "RISK_MARKET_EXPOSURE_EXCEEDED",
           "market",
           marketId,
-          committed(exposures.byMarket[marketId]),
+          committed(entry),
           contribution,
           limits.perMarketExposureCap,
         ),
@@ -199,7 +250,12 @@ export function checkExposureLimits(
     }
     const table = exposures[check.dimension];
     for (const [key, contribution] of contributionByKey) {
-      push(breach(check.code, check.label, key, committed(table[key]), contribution, cap));
+      const entry = table[key];
+      if (entry === undefined) {
+        refusals.push(entryMissing(check.label, key, cap));
+        continue;
+      }
+      push(breach(check.code, check.label, key, committed(entry), contribution, cap));
     }
   }
 

@@ -21,6 +21,7 @@
 export {
   PRIMARY_RISK_REASON_CODES,
   RISK_REASON_CODES,
+  RISK_REASON_CODE_COUNT,
   isPrimaryRiskReasonCode,
   isRiskReasonCode,
 } from "./reasons.js";

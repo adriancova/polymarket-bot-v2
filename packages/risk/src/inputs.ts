@@ -102,6 +102,22 @@ export const ExposureEntryViewSchema = z.looseObject({
 });
 export type ExposureEntryView = z.infer<typeof ExposureEntryViewSchema>;
 
+/**
+ * STRUCTURAL PORT — the allocator's whole exposure snapshot.
+ *
+ * THE SCOPE MAPS MAY BE SPARSE, AND SPARSE IS NOT ZERO. This schema cannot
+ * express "complete for the scopes this evaluation will query" — the query set
+ * is not known until the intent is normalized — so completeness is enforced
+ * where it can be: `exposure-limits.ts` refuses
+ * (`RISK_EXPOSURE_ENTRY_MISSING`) when a configured cap's queried key is absent
+ * from its table, rather than reading the absence as zero exposure (review
+ * round 1, BLOCKER 2). A caller states "this scope holds nothing" with an
+ * EXPLICIT zero entry; `@polymarket-bot/capital-allocator`'s
+ * `exposureSnapshotCovering` produces exactly that for a declared key set.
+ *
+ * `global` is REQUIRED: an account-wide total is always well defined, so its
+ * absence is a malformed snapshot rather than an unqueried scope.
+ */
 export const ExposureSnapshotViewSchema = z.looseObject({
   global: ExposureEntryViewSchema,
   byStrategyInstance: z.record(z.string(), ExposureEntryViewSchema),

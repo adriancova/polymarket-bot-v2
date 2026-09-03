@@ -11,9 +11,13 @@
  */
 
 export {
+  CAPITAL_REFUSAL_CODES,
+  CAPITAL_REFUSAL_CODES_ARE_EXHAUSTIVE,
+  CAPITAL_REFUSAL_CODE_COUNT,
   capitalFailure,
   capitalOk,
   capitalRefusal,
+  isCapitalRefusalCode,
 } from "./refusals.js";
 export type {
   CapitalRefusal,
@@ -22,8 +26,15 @@ export type {
   CapitalResult,
 } from "./refusals.js";
 
-export { AllocatorCapsSchema, parseAllocatorCaps } from "./caps.js";
-export type { AllocatorCaps } from "./caps.js";
+export {
+  AllocatorCapsSchema,
+  LIVE_MICRO_CAP_FIELDS,
+  LIVE_MICRO_CAP_FLOOR,
+  liveMicroCapRefusals,
+  nonFloorLiveMicroCapFields,
+  parseAllocatorCaps,
+} from "./caps.js";
+export type { AllocatorCaps, LiveMicroCapField } from "./caps.js";
 
 export {
   AllocatorStateInputSchema,
@@ -47,8 +58,13 @@ export type {
   ScopeAttribution,
 } from "./state.js";
 
-export { EXPOSURE_ZERO, exposureSnapshot, shadowExposureSnapshot } from "./exposure.js";
-export type { ExposureEntry, ExposureSnapshot } from "./exposure.js";
+export {
+  EXPOSURE_ZERO,
+  exposureSnapshot,
+  exposureSnapshotCovering,
+  shadowExposureSnapshot,
+} from "./exposure.js";
+export type { ExposureCoverage, ExposureEntry, ExposureSnapshot } from "./exposure.js";
 
 export {
   ReservationRequestSchema,

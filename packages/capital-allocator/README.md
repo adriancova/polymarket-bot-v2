@@ -59,24 +59,69 @@ Boundary semantics a caller must wire correctly:
 §9.7: "Initial defaults should reflect user-defined caps rather than hardcoded
 historical examples." So:
 
-| Cap | Default |
-| --- | --- |
-| `globalAccountCap` | **required**, no default |
-| `perStrategyCap` | **required**, no default |
-| `perMarketCap`, `perSeriesCap`, `perUnderlyingCap`, `perResolutionWindowCap` | optional, no default |
-| `liveMicroMaxOrderNotional` | **`"0"`** |
-| `liveMicroMaxAccountExposure` | **`"0"`** |
+| Cap | Default | Caller may set |
+| --- | --- | --- |
+| `globalAccountCap` | **required**, no default | yes |
+| `perStrategyCap` | **required**, no default | yes |
+| `perMarketCap`, `perSeriesCap`, `perUnderlyingCap`, `perResolutionWindowCap` | optional, no default | yes |
+| `liveMicroMaxOrderNotional` | **`"0"`** | **no — fenced** |
+| `liveMicroMaxAccountExposure` | **`"0"`** | **no — fenced** |
 
-The two live-micro defaults mirror the untouchable repository safety defaults
-(`AGENTS.md`: `LIVE_MICRO_MAX_ORDER_NOTIONAL=0`,
-`LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0`). A zero default is a safety floor, not an
-example, and **nothing in this package raises them implicitly**. With the
-defaults in place, any positive-notional commitment in a real-order run mode
-(`EXECUTION_PROBE`, `LIVE_MICRO`, `LIVE`) is refused.
+### The live-micro fence
+
+> **Corrected 2026-09-02 (remediation round 1).** This section previously said
+> only that the live-micro defaults "mirror the untouchable repository safety
+> defaults" and that "nothing in this package raises them implicitly". That was
+> true and *insufficient*: adversarial review round 1 (HIGH) found the caps
+> accepted any caller-supplied nonzero value, which made this package a
+> **weakening vector** for defaults `AGENTS.md` declares non-weakenable. The
+> original wording is preserved here rather than quietly replaced.
+
+`AGENTS.md` declares `LIVE_MICRO_MAX_ORDER_NOTIONAL=0` and
+`LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0` **non-weakenable**. A live-micro cap other
+than the exact canonical `"0"` is therefore **refused outright** —
+`CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED` — at three layers, so no caller path
+reaches a raised floor:
+
+1. `AllocatorCapsSchema` carries the fence as a schema refinement, so parsing
+   directly cannot bypass it;
+2. `parseAllocatorCaps` applies it separately, so a raised floor reports its own
+   typed code rather than a generic schema failure;
+3. `evaluateReservation` re-applies it at the enforcement site for **every** run
+   mode and accounting mode, so a hand-built caps object is unusable — no
+   reservation is evaluated against caps that weaken a safety default.
+
+Values are compared by exact canonical spelling, so a non-canonical or
+unparseable value refuses too (fail closed, and the comparison cannot throw).
+
+**Enabling live-micro capacity is a separate, explicitly authorized, fenced
+later-phase work package** with its own human approval and its own fencing
+authority — never an argument to this one. Until such a package exists, this
+package grants no real-order capacity at all: with the floors in place, any
+positive-notional commitment in a real-order run mode (`EXECUTION_PROBE`,
+`LIVE_MICRO`, `LIVE`) is refused
+(`CAPITAL_LIVE_MICRO_ORDER_NOTIONAL_EXCEEDED` /
+`CAPITAL_LIVE_MICRO_EXPOSURE_EXCEEDED`).
 
 A cap configured for a scope dimension the request cannot be attributed to
 **fails closed** (`CAPITAL_SCOPE_KEY_MISSING`): an unattributable request cannot
 be proven within the cap.
+
+## 3.1 Exposure snapshots: sparse, and sparse is not zero
+
+`exposureSnapshot` is sparse by construction — a scope with no positions,
+orders, or reservations simply has no row. **A consumer enforcing a cap must
+not read that absence as zero**: `@polymarket-bot/risk`'s §9.8 check 15 refuses
+it (`RISK_EXPOSURE_ENTRY_MISSING`) rather than passing a cap against unmeasured
+exposure (adversarial review round 1, BLOCKER 2 — that fail-open substitution
+was a real limit bypass).
+
+`exposureSnapshotCovering(state, coverage)` is how a composition root turns
+"I am about to query these scopes" into a snapshot that **answers** for every
+one of them, adding an explicit zero entry for any key the state does not
+otherwise mention. The zeros are exact: only the snapshot is sparse, the
+allocator state is complete, so a key it does not mention genuinely holds
+nothing.
 
 ## 4. Reservations
 
@@ -95,8 +140,22 @@ independence holds in both directions.
 
 ## 5. Reason codes — the PACKAGE-OWNED vocabulary
 
+**The vocabulary has exactly 19 codes**, all listed below.
+
 Stable `CodeString`-shaped identifiers, safe as metric labels (§14.3). Adding a
-code is additive; changing the meaning of one is not.
+code is additive; changing the meaning of one is not. The list is exported at
+runtime as `CAPITAL_REFUSAL_CODES`, its cardinality as
+`CAPITAL_REFUSAL_CODE_COUNT`, and `CAPITAL_REFUSAL_CODES_ARE_EXHAUSTIVE` is a
+compile-time proof that the list covers the whole `CapitalRefusalCode` union.
+`packages/capital-allocator/src/allocator.test.ts` fails if the count drifts, or
+if this section stops documenting exactly the declared set.
+
+> **Added 2026-09-02 (remediation round 1).** The runtime list, the count, and
+> the exhaustiveness proof are new: `docs/handoffs/WP-180.md` claimed the
+> allocator codes were "enumerated at runtime" when only the risk package's were
+> (adversarial review round 1, MEDIUM, on the neighbouring cardinality claim).
+> `CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED` was added by the HIGH fix in the same
+> round, taking the total from 18 to 19.
 
 | Code | Meaning |
 | --- | --- |
@@ -116,8 +175,9 @@ code is additive; changing the meaning of one is not.
 | `CAPITAL_SCOPE_KEY_MISSING` | A scope cap is configured but the request carries no attribution for it (fail closed). |
 | `CAPITAL_LIVE_OWNERSHIP_CONFLICT` | Another instance is the live owner of this market (ADR-011). |
 | `CAPITAL_LIVE_OWNERSHIP_MISSING` | No live owner is recorded; a live commitment needs one. |
-| `CAPITAL_LIVE_MICRO_ORDER_NOTIONAL_EXCEEDED` | A real-order-mode commitment above the live-micro per-order cap (default `"0"`). |
-| `CAPITAL_LIVE_MICRO_EXPOSURE_EXCEEDED` | A real-order-mode commitment above the live-micro account-exposure cap (default `"0"`). |
+| `CAPITAL_LIVE_MICRO_ORDER_NOTIONAL_EXCEEDED` | A real-order-mode commitment above the live-micro per-order cap (always `"0"`). |
+| `CAPITAL_LIVE_MICRO_EXPOSURE_EXCEEDED` | A real-order-mode commitment above the live-micro account-exposure cap (always `"0"`). |
+| `CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED` | A caller supplied a live-micro cap other than the exact `"0"` floor. `AGENTS.md` declares both non-weakenable; raising them is a separate authorized work package, not a caller argument. See §3's fence. |
 
 ## 6. Known boundary
 

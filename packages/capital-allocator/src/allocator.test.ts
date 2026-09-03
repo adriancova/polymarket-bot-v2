@@ -6,10 +6,31 @@
  * the intent gate in `test/unit/risk/acceptance.test.ts`.
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
-import { parseAllocatorCaps, type AllocatorCaps } from "./caps.js";
-import { exposureSnapshot, shadowExposureSnapshot } from "./exposure.js";
+import {
+  AllocatorCapsSchema,
+  LIVE_MICRO_CAP_FIELDS,
+  LIVE_MICRO_CAP_FLOOR,
+  parseAllocatorCaps,
+  type AllocatorCaps,
+} from "./caps.js";
+import {
+  EXPOSURE_ZERO,
+  exposureSnapshot,
+  exposureSnapshotCovering,
+  shadowExposureSnapshot,
+} from "./exposure.js";
+import {
+  CAPITAL_REFUSAL_CODES,
+  CAPITAL_REFUSAL_CODES_ARE_EXHAUSTIVE,
+  CAPITAL_REFUSAL_CODE_COUNT,
+  isCapitalRefusalCode,
+} from "./refusals.js";
 import {
   applyReservation,
   evaluateReservation,
@@ -97,6 +118,204 @@ describe("parseAllocatorCaps", () => {
   it("refuses a non-canonical decimal spelling", () => {
     const parsed = parseAllocatorCaps({ globalAccountCap: "1e3", perStrategyCap: "5" });
     expect(parsed.ok).toBe(false);
+  });
+});
+
+/**
+ * REVIEW ROUND 1, HIGH — the live-micro caps DEFAULTED to `"0"` but accepted
+ * any caller-supplied value, so this package was a weakening vector for the
+ * `AGENTS.md` non-weakenable safety defaults
+ * (`LIVE_MICRO_MAX_ORDER_NOTIONAL=0`, `LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0`).
+ * A nonzero live-micro cap is now refused OUTRIGHT, at three layers. Enabling
+ * live-micro capacity is a separate, explicitly authorized, fenced later-phase
+ * work package — never a caller argument to this one.
+ */
+describe("the live-micro cap fence (AGENTS.md safety defaults are not caller arguments)", () => {
+  for (const field of LIVE_MICRO_CAP_FIELDS) {
+    it(`parseAllocatorCaps REFUSES a nonzero ${field}`, () => {
+      const parsed = parseAllocatorCaps({
+        globalAccountCap: "1000",
+        perStrategyCap: "1000",
+        [field]: "1000000",
+      });
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) return;
+      expect(parsed.refusals.map((r) => r.code)).toEqual([
+        "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED",
+      ]);
+      expect(parsed.refusals[0]?.details["field"]).toBe(field);
+      expect(parsed.refusals[0]?.details["supplied"]).toBe("1000000");
+      expect(parsed.refusals[0]?.details["permitted"]).toBe(LIVE_MICRO_CAP_FLOOR);
+    });
+
+    it(`parseAllocatorCaps refuses even the smallest raise of ${field}`, () => {
+      const parsed = parseAllocatorCaps({
+        globalAccountCap: "1000",
+        perStrategyCap: "1000",
+        [field]: "0.000001",
+      });
+      expect(parsed.ok).toBe(false);
+    });
+  }
+
+  it("refuses both fields at once, naming both", () => {
+    const parsed = parseAllocatorCaps({
+      globalAccountCap: "1000",
+      perStrategyCap: "1000",
+      liveMicroMaxOrderNotional: "1",
+      liveMicroMaxAccountExposure: "1",
+    });
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) return;
+    expect(parsed.refusals.map((r) => r.details["field"])).toEqual([...LIVE_MICRO_CAP_FIELDS]);
+  });
+
+  it("accepts the exact floor, explicitly supplied", () => {
+    const parsed = parseAllocatorCaps({
+      globalAccountCap: "1000",
+      perStrategyCap: "1000",
+      liveMicroMaxOrderNotional: "0",
+      liveMicroMaxAccountExposure: "0",
+    });
+    expect(parsed.ok).toBe(true);
+  });
+
+  it("the schema itself carries the fence, so parsing directly cannot bypass it", () => {
+    const direct = AllocatorCapsSchema.safeParse({
+      globalAccountCap: "1000",
+      perStrategyCap: "1000",
+      liveMicroMaxOrderNotional: "5",
+    });
+    expect(direct.success).toBe(false);
+  });
+
+  it("the reservation gate refuses a HAND-BUILT caps object that raised a floor", () => {
+    // Bypasses `parseAllocatorCaps` and the schema entirely: the second fence
+    // layer lives at the enforcement site for exactly this caller.
+    const raised = {
+      ...caps(),
+      liveMicroMaxOrderNotional: "1000",
+      liveMicroMaxAccountExposure: "1000",
+    } as AllocatorCaps;
+    const verdict = evaluateReservation(state(), raised, request({ runMode: "LIVE_MICRO" }));
+    expect(verdict.permitted).toBe(false);
+    expect(refusalCodes(verdict)).toContain("CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED");
+  });
+
+  it("a raised floor makes the caps unusable in EVERY run mode, PAPER included", () => {
+    const raised = { ...caps(), liveMicroMaxOrderNotional: "1000" } as AllocatorCaps;
+    for (const runMode of ["PAPER", "BACKTEST", "EXECUTION_PROBE", "LIVE_MICRO", "LIVE"] as const) {
+      const verdict = evaluateReservation(state(), raised, request({ runMode }));
+      expect(verdict.permitted).toBe(false);
+      expect(refusalCodes(verdict)).toContain("CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED");
+    }
+  });
+
+  it("applyReservation cannot slip past it either", () => {
+    const raised = { ...caps(), liveMicroMaxAccountExposure: "1000" } as AllocatorCaps;
+    const applied = applyReservation(state(), raised, request());
+    expect(applied.ok).toBe(false);
+    if (applied.ok) return;
+    expect(applied.refusals.map((r) => r.code)).toContain("CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED");
+  });
+
+  it("a non-canonical or unparseable value also refuses (fail closed, never throws)", () => {
+    for (const bogus of ["0.0", "00", "-0", "", "abc"]) {
+      const raised = { ...caps(), liveMicroMaxOrderNotional: bogus } as AllocatorCaps;
+      const verdict = evaluateReservation(state(), raised, request());
+      expect(verdict.permitted).toBe(false);
+      expect(refusalCodes(verdict)).toContain("CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED");
+    }
+  });
+});
+
+describe("the refusal-code vocabulary", () => {
+  it("matches its documented cardinality exactly (README §5 and the handoff)", () => {
+    expect(CAPITAL_REFUSAL_CODES.length).toBe(CAPITAL_REFUSAL_CODE_COUNT);
+    expect(CAPITAL_REFUSAL_CODE_COUNT).toBe(19);
+    expect(CAPITAL_REFUSAL_CODES_ARE_EXHAUSTIVE).toBe(true);
+  });
+
+  it("declares each code exactly once and recognises each one", () => {
+    expect(new Set(CAPITAL_REFUSAL_CODES).size).toBe(CAPITAL_REFUSAL_CODES.length);
+    for (const code of CAPITAL_REFUSAL_CODES) {
+      expect(isCapitalRefusalCode(code)).toBe(true);
+    }
+    expect(isCapitalRefusalCode("CAPITAL_NOT_A_REAL_CODE")).toBe(false);
+  });
+
+  it("every code fits the frozen CodeString grammar (§14.3 metric labels)", () => {
+    for (const code of CAPITAL_REFUSAL_CODES) {
+      expect(code).toMatch(/^[A-Za-z][A-Za-z0-9_.:-]*$/u);
+      expect(code.length).toBeLessThanOrEqual(64);
+    }
+  });
+
+  it("the README documents every declared code, and declares every documented one", () => {
+    const readme = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), "../README.md"),
+      "utf8",
+    );
+    const documented = new Set(
+      [...readme.matchAll(/`(CAPITAL_[A-Z0-9_]+)`/gu)].map((match) => match[1] as string),
+    );
+    // Exported identifiers that share the code prefix but are not codes.
+    documented.delete("CAPITAL_REFUSAL_CODES");
+    documented.delete("CAPITAL_REFUSAL_CODE_COUNT");
+    documented.delete("CAPITAL_REFUSAL_CODES_ARE_EXHAUSTIVE");
+    expect(CAPITAL_REFUSAL_CODES.filter((code) => !documented.has(code))).toEqual([]);
+    expect([...documented].filter((code) => !isCapitalRefusalCode(code))).toEqual([]);
+    expect(documented.size).toBe(CAPITAL_REFUSAL_CODE_COUNT);
+  });
+});
+
+/**
+ * REVIEW ROUND 1, BLOCKER 2 — the consumer side must not read an absent entry
+ * as zero, so the snapshot must be able to ANSWER for every scope a consumer
+ * will query. `exposureSnapshotCovering` is how a composition root says which
+ * scopes those are.
+ */
+describe("exposureSnapshotCovering — explicit zeros for every queried scope", () => {
+  it("adds an explicit zero entry for a scope the state does not mention", () => {
+    const snapshot = exposureSnapshotCovering(state(), {
+      strategyInstanceIds: [INSTANCE],
+      marketIds: [MARKET_A, MARKET_B],
+      seriesKeys: ["btc-15m"],
+      underlyingKeys: ["BTC"],
+      resolutionWindowKeys: ["w1"],
+    });
+    expect(snapshot.byStrategyInstance[INSTANCE]).toEqual(EXPOSURE_ZERO);
+    expect(snapshot.byMarket[MARKET_A]).toEqual(EXPOSURE_ZERO);
+    expect(snapshot.byMarket[MARKET_B]).toEqual(EXPOSURE_ZERO);
+    expect(snapshot.bySeries["btc-15m"]).toEqual(EXPOSURE_ZERO);
+    expect(snapshot.byUnderlying["BTC"]).toEqual(EXPOSURE_ZERO);
+    expect(snapshot.byResolutionWindow["w1"]).toEqual(EXPOSURE_ZERO);
+  });
+
+  it("never overwrites a real measurement with a zero", () => {
+    const withExposure = state({
+      positions: [
+        {
+          positionId: "p-1",
+          marketId: MARKET_A,
+          strategyInstanceId: INSTANCE,
+          side: "YES",
+          shares: "100",
+          costBasis: "40",
+        },
+      ],
+    });
+    const snapshot = exposureSnapshotCovering(withExposure, {
+      marketIds: [MARKET_A, MARKET_B],
+    });
+    expect(snapshot.byMarket[MARKET_A]?.combined).toBe("40");
+    expect(snapshot.byMarket[MARKET_B]).toEqual(EXPOSURE_ZERO);
+  });
+
+  it("declares nothing when the coverage is empty, and stays frozen", () => {
+    const snapshot = exposureSnapshotCovering(state(), {});
+    expect(Object.keys(snapshot.byMarket)).toEqual([]);
+    expect(Object.isFrozen(snapshot)).toBe(true);
   });
 });
 

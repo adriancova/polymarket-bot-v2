@@ -163,6 +163,70 @@ export function exposureSnapshot(state: AllocatorState): ExposureSnapshot {
 }
 
 /**
+ * The scope keys a consumer intends to QUERY this snapshot for.
+ *
+ * Every listed key is guaranteed to be present in the returned snapshot, with
+ * an explicit zero entry when the state does not otherwise mention it.
+ */
+export interface ExposureCoverage {
+  readonly strategyInstanceIds?: readonly string[];
+  readonly marketIds?: readonly string[];
+  readonly seriesKeys?: readonly string[];
+  readonly underlyingKeys?: readonly string[];
+  readonly resolutionWindowKeys?: readonly string[];
+}
+
+function withExplicitZeros(
+  table: Readonly<Record<string, ExposureEntry>>,
+  keys: readonly string[] | undefined,
+): Readonly<Record<string, ExposureEntry>> {
+  if (keys === undefined || keys.length === 0) return table;
+  const out: Record<string, ExposureEntry> = { ...table };
+  for (const key of keys) {
+    out[key] ??= ZERO_ENTRY;
+  }
+  return out;
+}
+
+/**
+ * {@link exposureSnapshot} with an EXPLICIT ZERO ENTRY for every key in
+ * `coverage` the state does not otherwise mention.
+ *
+ * WHY THIS EXISTS. `exposureSnapshot` is sparse by construction: a scope with
+ * no positions, orders, or reservations simply has no row. A consumer that
+ * enforces a cap cannot read that absence as "zero" — absence is *unknown*,
+ * and `@polymarket-bot/risk`'s §9.8 check 15 refuses it
+ * (`RISK_EXPOSURE_ENTRY_MISSING`) rather than passing a cap against unmeasured
+ * exposure (review round 1, BLOCKER 2). This builder is how a composition root
+ * turns "I am about to query these scopes" into a snapshot that ANSWERS for
+ * every one of them, with a zero that is a measurement rather than a gap.
+ *
+ * The zeros are exact and honest: this state is the allocator's own complete
+ * record of commitments, so a key it does not mention genuinely holds nothing.
+ * Only the SNAPSHOT is sparse; the state is not.
+ */
+export function exposureSnapshotCovering(
+  state: AllocatorState,
+  coverage: ExposureCoverage,
+): ExposureSnapshot {
+  const snapshot = exposureSnapshot(state);
+  return deepFreeze({
+    global: snapshot.global,
+    byStrategyInstance: withExplicitZeros(
+      snapshot.byStrategyInstance,
+      coverage.strategyInstanceIds,
+    ),
+    byMarket: withExplicitZeros(snapshot.byMarket, coverage.marketIds),
+    bySeries: withExplicitZeros(snapshot.bySeries, coverage.seriesKeys),
+    byUnderlying: withExplicitZeros(snapshot.byUnderlying, coverage.underlyingKeys),
+    byResolutionWindow: withExplicitZeros(
+      snapshot.byResolutionWindow,
+      coverage.resolutionWindowKeys,
+    ),
+  });
+}
+
+/**
  * One instance's SHADOW book (§9.7 "preserves independent shadow
  * accounting"): built ONLY from that instance's shadow reservations. Shadow
  * commitments never consume live collateral and live commitments never

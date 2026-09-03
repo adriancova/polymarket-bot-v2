@@ -206,7 +206,39 @@ export function exposureEntry(
   return { openOrderCommitted, positionCommitted };
 }
 
-/** An allocator-shaped exposure snapshot with everything else at zero. */
+/**
+ * Scope keys a snapshot MEASURES at zero, mirroring the allocator's
+ * `exposureSnapshotCovering`.
+ */
+export interface ExposureMeasuringFixture {
+  strategyInstanceIds?: readonly string[];
+  marketIds?: readonly string[];
+  seriesKeys?: readonly string[];
+  underlyingKeys?: readonly string[];
+  resolutionWindowKeys?: readonly string[];
+}
+
+function zeroFilled(
+  table: Record<string, ExposureEntryFixture>,
+  keys: readonly string[] | undefined,
+): Record<string, ExposureEntryFixture> {
+  const out = { ...table };
+  for (const key of keys ?? []) {
+    out[key] ??= exposureEntry("0", "0");
+  }
+  return out;
+}
+
+/**
+ * An allocator-shaped exposure snapshot.
+ *
+ * SPARSE BY DEFAULT, AND SPARSE IS NOT ZERO. The scope tables default to `{}`,
+ * which the risk side refuses (`RISK_EXPOSURE_ENTRY_MISSING`) whenever a cap
+ * for that dimension is configured — an omitted entry is unknown exposure, not
+ * zero exposure (review round 1, BLOCKER 2). A test that means "this scope is
+ * MEASURED and holds nothing" lists the key under `measuring`, which is what
+ * `exposureSnapshotCovering` produces in production.
+ */
 export function exposureSnapshot(overrides: {
   global?: ExposureEntryFixture;
   byStrategyInstance?: Record<string, ExposureEntryFixture>;
@@ -214,16 +246,37 @@ export function exposureSnapshot(overrides: {
   bySeries?: Record<string, ExposureEntryFixture>;
   byUnderlying?: Record<string, ExposureEntryFixture>;
   byResolutionWindow?: Record<string, ExposureEntryFixture>;
+  measuring?: ExposureMeasuringFixture;
 } = {}): Record<string, unknown> {
+  const measuring = overrides.measuring ?? {};
   return {
     global: overrides.global ?? exposureEntry("0", "0"),
-    byStrategyInstance: overrides.byStrategyInstance ?? {},
-    byMarket: overrides.byMarket ?? {},
-    bySeries: overrides.bySeries ?? {},
-    byUnderlying: overrides.byUnderlying ?? {},
-    byResolutionWindow: overrides.byResolutionWindow ?? {},
+    byStrategyInstance: zeroFilled(
+      overrides.byStrategyInstance ?? {},
+      measuring.strategyInstanceIds,
+    ),
+    byMarket: zeroFilled(overrides.byMarket ?? {}, measuring.marketIds),
+    bySeries: zeroFilled(overrides.bySeries ?? {}, measuring.seriesKeys),
+    byUnderlying: zeroFilled(overrides.byUnderlying ?? {}, measuring.underlyingKeys),
+    byResolutionWindow: zeroFilled(
+      overrides.byResolutionWindow ?? {},
+      measuring.resolutionWindowKeys,
+    ),
   };
 }
+
+/**
+ * The scope keys the standard fixtures query: the baseline instance, both
+ * markets, and the attribution `market()` carries. Handy shorthand for
+ * "everything the evaluation will look up is measured at zero".
+ */
+export const FIXTURE_MEASURING: ExposureMeasuringFixture = {
+  strategyInstanceIds: [INSTANCE],
+  marketIds: [MARKET_A, MARKET_B],
+  seriesKeys: ["btc-15m"],
+  underlyingKeys: ["BTC"],
+  resolutionWindowKeys: ["w1"],
+};
 
 /** The fully-passing ENTRY baseline. Mutate one field per test. */
 export function entryInput(): EvaluationInputFixture {

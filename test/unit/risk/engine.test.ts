@@ -10,20 +10,27 @@
  * is what keeps a published vocabulary honest as an alerting surface (§14.3).
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
   RISK_REASON_CODES,
+  RISK_REASON_CODE_COUNT,
   evaluateIntent,
   isRiskReasonCode,
   type RiskPolicy,
   type RiskReasonCode,
 } from "../../../packages/risk/src/index.js";
 import {
+  FIXTURE_MEASURING,
   MARKET_A,
   MARKET_B,
   VALID_UNTIL,
   allScenarios,
+  cancelIntent,
   codesOf,
   entryInput,
   exitInput,
@@ -348,7 +355,7 @@ const CASES: readonly Case[] = [
         limits: { maxWorstCaseContractualLoss: "10000", perInstanceExposureCap: "10" },
       }),
     build: withEntry((input) => {
-      input.exposures = exposureSnapshot({});
+      input.exposures = exposureSnapshot({ measuring: FIXTURE_MEASURING });
     }),
   },
   {
@@ -357,7 +364,7 @@ const CASES: readonly Case[] = [
     policy: () =>
       riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perMarketExposureCap: "10" } }),
     build: withEntry((input) => {
-      input.exposures = exposureSnapshot({});
+      input.exposures = exposureSnapshot({ measuring: FIXTURE_MEASURING });
     }),
   },
   {
@@ -366,7 +373,7 @@ const CASES: readonly Case[] = [
     policy: () =>
       riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perSeriesExposureCap: "10" } }),
     build: withEntry((input) => {
-      input.exposures = exposureSnapshot({});
+      input.exposures = exposureSnapshot({ measuring: FIXTURE_MEASURING });
     }),
   },
   {
@@ -377,7 +384,7 @@ const CASES: readonly Case[] = [
         limits: { maxWorstCaseContractualLoss: "10000", perUnderlyingExposureCap: "10" },
       }),
     build: withEntry((input) => {
-      input.exposures = exposureSnapshot({});
+      input.exposures = exposureSnapshot({ measuring: FIXTURE_MEASURING });
     }),
   },
   {
@@ -388,7 +395,7 @@ const CASES: readonly Case[] = [
         limits: { maxWorstCaseContractualLoss: "10000", perResolutionWindowExposureCap: "10" },
       }),
     build: withEntry((input) => {
-      input.exposures = exposureSnapshot({});
+      input.exposures = exposureSnapshot({ measuring: FIXTURE_MEASURING });
     }),
   },
   {
@@ -398,6 +405,19 @@ const CASES: readonly Case[] = [
       riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", globalExposureCap: "10000" } }),
     build: withEntry((input) => {
       delete input.exposures;
+    }),
+  },
+  {
+    code: "RISK_EXPOSURE_ENTRY_MISSING",
+    name: "check 15: a configured cap whose queried scope the snapshot omits is not a passed cap",
+    policy: () =>
+      riskPolicy({
+        // Deliberately roomy: if the omitted entry really were zero the intent
+        // would PASS. It must not — an absent entry is unknown, not zero.
+        limits: { maxWorstCaseContractualLoss: "10000", perMarketExposureCap: "10000" },
+      }),
+    build: withEntry((input) => {
+      input.exposures = exposureSnapshot({ byMarket: {} });
     }),
   },
   {
@@ -591,6 +611,37 @@ describe("the reason-code vocabulary", () => {
   it("declares each code exactly once", () => {
     expect(new Set(RISK_REASON_CODES).size).toBe(RISK_REASON_CODES.length);
   });
+
+  /**
+   * CARDINALITY PIN (review round 1, MEDIUM).
+   *
+   * The no-dead-entry test above proves reachability against whatever the list
+   * currently is; it cannot notice that the DOCUMENTED count has drifted from
+   * it — and it had: the handoff claimed 56 against a 61-entry list. This test
+   * binds the list, the exported constant, `packages/risk/README.md` §5, and
+   * `docs/handoffs/WP-180.md` to one number, so adding a code without updating
+   * the documentation fails the suite.
+   */
+  it("matches its documented cardinality exactly (README §5 and the handoff)", () => {
+    expect(RISK_REASON_CODES.length).toBe(RISK_REASON_CODE_COUNT);
+    expect(RISK_REASON_CODE_COUNT).toBe(62);
+  });
+
+  it("the README documents every declared code, and declares every documented one", () => {
+    const readme = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), "../../../packages/risk/README.md"),
+      "utf8",
+    );
+    const documented = new Set(
+      [...readme.matchAll(/`(RISK_[A-Z0-9_]+)`/gu)].map((match) => match[1] as string),
+    );
+    // `RISK_REASON_CODES` is the list's own name, not a code.
+    documented.delete("RISK_REASON_CODES");
+    documented.delete("RISK_REASON_CODE_COUNT");
+    expect(RISK_REASON_CODES.filter((code) => !documented.has(code))).toEqual([]);
+    expect([...documented].filter((code) => !isRiskReasonCode(code))).toEqual([]);
+    expect(documented.size).toBe(RISK_REASON_CODE_COUNT);
+  });
 });
 
 describe("refusals accumulate rather than short-circuit", () => {
@@ -686,15 +737,172 @@ describe("disposition matrix", () => {
     expect(result.record.worstCase.maximumContractualLoss).toBe("0");
   });
 
-  it("a CANCEL is still refused when the run mode exceeds the process maximum", () => {
+  /**
+   * CORRECTED IN REMEDIATION ROUND 1 (review round 1, BLOCKER 1).
+   *
+   * This test previously asserted the OPPOSITE — that a run-mode mismatch
+   * refuses a CANCEL — and so encoded the defect as the contract. §6 invariant
+   * 13 ("Safety cancellation outranks new order placement") admits no such
+   * exception: a blocked cancel can trap a position, which is the failure the
+   * invariant exists to prevent. The mismatch is now a non-blocking
+   * OBSERVATION on `cancelPriorityOverrides` and the cancel is approved.
+   */
+  it("a CANCEL is NOT refused when the run mode exceeds the process maximum (§6 invariant 13)", () => {
     const input = entryInput();
     input.intent = { type: "CANCEL", reason: "kill switch" };
     input.context.runMode = "LIVE";
 
     const result = evaluateIntent(riskPolicy(), input);
 
+    expect(codesOf(result)).toEqual([]);
+    expect(result.approved).toBe(true);
+    if (!result.approved) return;
+    expect(result.record.reasons).toContain("RISK_CANCEL_ALWAYS_PERMITTED");
+    // The gate still RAN and is still visible; it simply did not block.
+    expect(result.cancelPriorityOverrides.map((r) => r.code)).toEqual([
+      "RISK_RUN_MODE_EXCEEDS_MAXIMUM",
+    ]);
+    // The record honestly names the mode the caller asked for.
+    expect(result.record.runMode).toBe("LIVE");
+  });
+});
+
+/**
+ * §6 INVARIANT 13, gate by gate.
+ *
+ * Remediation round 1 audited EVERY gate in `evaluateIntent` for the
+ * "a cancel can be blocked" defect class, not only the two the reviewer cited.
+ * The four gates below are the ones that could reach a `CANCEL` at all; every
+ * other gate is already guarded by `placesOrders` / `isEntry` / a disposition
+ * test, or is structurally unreachable for a cancel (a cancel has no legs, no
+ * `intentId`, and no `validUntil`). The last test drives all four at once so
+ * the structural choke point — not four separate conditions — is what is
+ * pinned.
+ */
+describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
+  interface GateCase {
+    readonly name: string;
+    readonly overriddenCode: string;
+    readonly trip: (input: EvaluationInputFixture) => void;
+  }
+
+  const GATES: readonly GateCase[] = [
+    {
+      name: "check 2: the run mode exceeds the configured process maximum",
+      overriddenCode: "RISK_RUN_MODE_EXCEEDS_MAXIMUM",
+      trip: (input) => {
+        input.context.runMode = "LIVE";
+      },
+    },
+    {
+      name: "check 14: the capital allocator explicitly REFUSED",
+      overriddenCode: "RISK_ALLOCATION_REFUSED",
+      trip: (input) => {
+        input.allocation = {
+          permitted: false,
+          refusals: [{ code: "CAPITAL_COLLATERAL_INSUFFICIENT" }],
+        };
+      },
+    },
+    {
+      name: "no market context was supplied for the market being cancelled",
+      overriddenCode: "RISK_MARKET_CONTEXT_MISSING",
+      trip: (input) => {
+        input.markets = [];
+      },
+    },
+    {
+      name: "the approvedIntentId is UUID-shaped but not canonical (ADR-016 §2)",
+      overriddenCode: "RISK_UUID_NOT_CANONICAL",
+      trip: (input) => {
+        input.identifiers.approvedIntentId = "01890000-0000-7000-8000-0000000000AB";
+      },
+    },
+  ];
+
+  for (const gate of GATES) {
+    it(`is approved despite ${gate.name}`, () => {
+      const input = entryInput();
+      input.intent = cancelIntent();
+      gate.trip(input);
+
+      const result = evaluateIntent(riskPolicy(), input);
+
+      expect(codesOf(result)).toEqual([]);
+      expect(result.approved).toBe(true);
+      if (!result.approved) return;
+      expect(result.cancelPriorityOverrides.map((r) => r.code)).toContain(gate.overriddenCode);
+    });
+  }
+
+  it("a CANCEL survives every audited gate, all tripped at once", () => {
+    const policy = riskPolicy({
+      limits: {
+        maxWorstCaseContractualLoss: "0",
+        globalExposureCap: "0",
+        perInstanceExposureCap: "0",
+        perMarketExposureCap: "0",
+        maxOrderNotional: "0",
+      },
+      scenario: { maxScenarioLoss: "0" },
+      participation: { maxOrderShares: "1" },
+    });
+    const input = entryInput();
+    input.intent = cancelIntent();
+    // Every state flag, feed, peer view, and headroom input hostile at once.
+    input.context.runMode = "LIVE";
+    input.context.runStatePermitsIntent = false;
+    input.context.strategyStatePermitsIntent = false;
+    input.context.venueEligibility = "BLOCKED";
+    input.identifiers.approvedIntentId = "01890000-0000-7000-8000-0000000000AB";
+    input.markets = [];
+    input.freshness = [];
+    input.portfolio = { positions: [position()], openOrders: [] };
+    input.allocation = {
+      permitted: false,
+      refusals: [{ code: "CAPITAL_COLLATERAL_INSUFFICIENT" }],
+    };
+    delete input.exposures;
+    input.scenarios = [];
+    input.guards.recentIntentIds = ["intent-1"];
+    input.rateLimit = {};
+    input.economics = {};
+
+    const result = evaluateIntent(policy, input);
+
+    expect(codesOf(result)).toEqual([]);
+    expect(result.approved).toBe(true);
+    if (!result.approved) return;
+    expect(result.record.reasons).toEqual(["RISK_APPROVED", "RISK_CANCEL_ALWAYS_PERMITTED"]);
+    // The measure is still computed and returned, from the portfolio alone.
+    expect(result.record.worstCase.maximumContractualLoss).toBe("40");
+    // Every gate that fired is visible, and NONE of them blocked.
+    const overridden = result.cancelPriorityOverrides.map((r) => r.code);
+    expect(overridden).toContain("RISK_UUID_NOT_CANONICAL");
+    expect(overridden).toContain("RISK_RUN_MODE_EXCEEDS_MAXIMUM");
+    expect(overridden).toContain("RISK_MARKET_CONTEXT_MISSING");
+    expect(overridden).toContain("RISK_ALLOCATION_REFUSED");
+    for (const code of overridden) {
+      expect(isRiskReasonCode(code)).toBe(true);
+    }
+  });
+
+  it("an ENTRY and an EXIT never carry overrides — only a CANCEL can", () => {
+    const entry = evaluateIntent(riskPolicy(), entryInput());
+    expect(entry.approved).toBe(true);
+    if (entry.approved) expect(entry.cancelPriorityOverrides).toEqual([]);
+
+    const exit = evaluateIntent(riskPolicy(), exitInput());
+    expect(exit.approved).toBe(true);
+    if (exit.approved) expect(exit.cancelPriorityOverrides).toEqual([]);
+  });
+
+  it("the only thing a CANCEL cannot bypass is input validation itself", () => {
+    // Until the input parses there is no disposition to privilege, and an
+    // unparseable request names no orders to cancel.
+    const result = evaluateIntent(riskPolicy(), { intent: { type: "CANCEL" } });
     expect(result.approved).toBe(false);
-    expect(codesOf(result)).toContain("RISK_RUN_MODE_EXCEEDS_MAXIMUM");
+    expect(codesOf(result)).toEqual(["RISK_INPUT_INVALID"]);
   });
 });
 

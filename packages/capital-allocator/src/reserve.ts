@@ -34,7 +34,7 @@ import {
 } from "@polymarket-bot/domain";
 import { z } from "zod";
 
-import type { AllocatorCaps } from "./caps.js";
+import { liveMicroCapRefusals, type AllocatorCaps } from "./caps.js";
 import { exposureSnapshot, shadowExposureSnapshot, type ExposureSnapshot } from "./exposure.js";
 import { deepFreeze, uuidShapedNotCanonical } from "./guards.js";
 import {
@@ -161,6 +161,14 @@ export function evaluateReservation(
   const req = parsed.data;
 
   const refusals: CapitalRefusal[] = [];
+
+  // --- the live-micro fence, second layer (review round 1, HIGH) -----------
+  // `parseAllocatorCaps` refuses a raised live-micro floor, but `caps` is a
+  // plain value and a caller can hand-build one. Re-checked HERE, at the
+  // enforcement site, for EVERY run mode and accounting mode: a caps object
+  // that weakens an `AGENTS.md` safety default is not usable at all, so no
+  // reservation is evaluated against it.
+  refusals.push(...liveMicroCapRefusals(caps));
 
   if (uuidShapedNotCanonical(req.reservationId)) {
     refusals.push(

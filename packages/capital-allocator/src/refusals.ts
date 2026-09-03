@@ -66,10 +66,78 @@ export type CapitalRefusalCode =
   | "CAPITAL_LIVE_OWNERSHIP_MISSING"
 
   // --- real-order modes (safety §0.2; workplan defaults) --------------------
-  /** A real-order-mode commitment exceeds the live-micro per-order notional cap (default "0"). */
+  /** A real-order-mode commitment exceeds the live-micro per-order notional cap (always "0"). */
   | "CAPITAL_LIVE_MICRO_ORDER_NOTIONAL_EXCEEDED"
-  /** A real-order-mode commitment exceeds the live-micro account exposure cap (default "0"). */
-  | "CAPITAL_LIVE_MICRO_EXPOSURE_EXCEEDED";
+  /** A real-order-mode commitment exceeds the live-micro account exposure cap (always "0"). */
+  | "CAPITAL_LIVE_MICRO_EXPOSURE_EXCEEDED"
+  /**
+   * A caller supplied a live-micro cap other than the exact `"0"` floor.
+   * `AGENTS.md` declares `LIVE_MICRO_MAX_ORDER_NOTIONAL=0` and
+   * `LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0` NON-WEAKENABLE, so raising them is not
+   * a caller argument to this package. Review round 1 (HIGH): the caps merely
+   * DEFAULTED to `"0"` and accepted any caller-supplied value, which made this
+   * package a weakening vector. Enabling live-micro capacity is a separate,
+   * explicitly authorized, fenced later-phase work package — never an argument.
+   */
+  | "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED";
+
+/**
+ * Every code above, enumerated at runtime.
+ *
+ * The union is the contract; this list makes it inspectable by a consumer that
+ * has only values (a metric dashboard, an alert rule, a persisted refusal from
+ * an older version). {@link CAPITAL_REFUSAL_CODES_ARE_EXHAUSTIVE} is a
+ * compile-time proof that the list covers the union, so a code added to the
+ * union without being added here is a type error rather than a silent gap.
+ */
+export const CAPITAL_REFUSAL_CODES = [
+  "CAPITAL_INPUT_INVALID",
+  "CAPITAL_UUID_NOT_CANONICAL",
+  "CAPITAL_DUPLICATE_IDENTIFIER",
+  "CAPITAL_UNKNOWN_RESERVATION",
+  "CAPITAL_OVERSELL_UNBACKED",
+  "CAPITAL_COLLATERAL_INSUFFICIENT",
+  "CAPITAL_INVENTORY_INSUFFICIENT",
+  "CAPITAL_GLOBAL_CAP_EXCEEDED",
+  "CAPITAL_STRATEGY_CAP_EXCEEDED",
+  "CAPITAL_MARKET_CAP_EXCEEDED",
+  "CAPITAL_SERIES_CAP_EXCEEDED",
+  "CAPITAL_UNDERLYING_CAP_EXCEEDED",
+  "CAPITAL_RESOLUTION_WINDOW_CAP_EXCEEDED",
+  "CAPITAL_SCOPE_KEY_MISSING",
+  "CAPITAL_LIVE_OWNERSHIP_CONFLICT",
+  "CAPITAL_LIVE_OWNERSHIP_MISSING",
+  "CAPITAL_LIVE_MICRO_ORDER_NOTIONAL_EXCEEDED",
+  "CAPITAL_LIVE_MICRO_EXPOSURE_EXCEEDED",
+  "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED",
+] as const satisfies readonly CapitalRefusalCode[];
+
+/**
+ * The published cardinality of {@link CAPITAL_REFUSAL_CODES}, asserted in
+ * `packages/capital-allocator/src/allocator.test.ts` and stated in
+ * `README.md` §5. Pinned because a documented count drifted from the real
+ * vocabulary once already (review round 1, MEDIUM).
+ */
+export const CAPITAL_REFUSAL_CODE_COUNT = 19;
+
+/**
+ * Compile-time proof that {@link CAPITAL_REFUSAL_CODES} covers the whole
+ * union. If a code is added to `CapitalRefusalCode` and not to the list, the
+ * gap type stops being `never` and this declaration fails to compile.
+ */
+export const CAPITAL_REFUSAL_CODES_ARE_EXHAUSTIVE: Exclude<
+  CapitalRefusalCode,
+  (typeof CAPITAL_REFUSAL_CODES)[number]
+> extends never
+  ? true
+  : ["codes missing from CAPITAL_REFUSAL_CODES"] = true;
+
+const CAPITAL_CODE_SET: ReadonlySet<string> = new Set(CAPITAL_REFUSAL_CODES);
+
+/** True when `code` belongs to this package's vocabulary. */
+export function isCapitalRefusalCode(code: string): code is CapitalRefusalCode {
+  return CAPITAL_CODE_SET.has(code);
+}
 
 export type CapitalRefusalDetails = Readonly<Record<string, unknown>>;
 

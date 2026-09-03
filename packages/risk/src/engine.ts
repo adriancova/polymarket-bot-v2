@@ -32,8 +32,14 @@
  * `disposition` guards below. The two rules that matter most:
  *
  * - §6 invariant 13, "Safety cancellation outranks new order placement": a
- *   `CANCEL` is never blocked by staleness, exposure, edge, rate-limit
- *   headroom, or time-to-close.
+ *   `CANCEL` is NEVER blocked — not by staleness, exposure, edge, rate-limit
+ *   headroom, time-to-close, run mode, an allocator refusal, a missing market
+ *   context, or any gate added later. This is a STRUCTURAL choke point at the
+ *   end of the pipeline (see "§6 INVARIANT 13" below), not a per-gate
+ *   condition, because a blocked cancel can trap a position and per-gate
+ *   conditions are exactly what a later edit forgets. Everything the pipeline
+ *   accumulated for a cancel is returned as non-blocking
+ *   `cancelPriorityOverrides` observations.
  * - §6 invariant 12, "No blind flatten": an EXIT into a stale, unsynchronized,
  *   or unknown book IS blocked, and the refusal carries cancel-and-reconcile
  *   recommendations so the reduction happens after reconciliation, under the
@@ -81,6 +87,14 @@ export type RiskEvaluation =
       readonly approved: true;
       readonly record: ApprovedIntentRecord;
       readonly refusals: readonly [];
+      /**
+       * §6 invariant 13. Gates that WOULD have refused a non-cancel intent and
+       * were overridden because a safety cancellation may never be blocked.
+       * Non-empty only on a `CANCEL`; the evaluation is APPROVED regardless.
+       * These are observations for the operator and the §9.9 controller — they
+       * are NOT refusals, and a consumer must not treat them as ones.
+       */
+      readonly cancelPriorityOverrides: readonly RiskRefusal[];
       readonly recommendations: readonly IncidentActionRecommendation[];
       readonly worstCase: WorstCaseAssessment;
       readonly scenario: ScenarioAssessment | undefined;
@@ -665,11 +679,22 @@ export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluati
   // against it would block exactly the action that brings the account back
   // inside the cap.
   const perMarketContribution = new Map<string, MoneyString>();
-  if (isEntry && view.boundedCost !== undefined) {
+  // An UNBOUNDED leg has no cost to compare against a cap, and a zero is not a
+  // conservative stand-in for one. `view.boundedCost === undefined` and an
+  // unbounded leg are the same condition (`intent-view.ts`), and it is already
+  // refused as `RISK_WORST_CASE_UNBOUNDED` at check 16 — so the intent never
+  // passes on the strength of a skipped capacity check.
+  let anyLegUnbounded = false;
+  for (const legs of legsByMarket.values()) {
+    if (legs.some((leg) => leg.boundedCost === undefined)) anyLegUnbounded = true;
+  }
+  if (isEntry && view.boundedCost !== undefined && !anyLegUnbounded) {
     for (const [marketId, legs] of legsByMarket) {
       let contribution: MoneyString = "0";
       for (const leg of legs) {
-        contribution = addDecimal(contribution, leg.boundedCost ?? "0");
+        // Narrowed by `anyLegUnbounded` above; never defaulted to "0".
+        if (leg.boundedCost === undefined) continue;
+        contribution = addDecimal(contribution, leg.boundedCost);
       }
       perMarketContribution.set(marketId, contribution);
     }
@@ -898,6 +923,63 @@ export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluati
     }
   }
 
+  // --- §6 INVARIANT 13 — THE CANCEL CHOKE POINT ----------------------------
+  //
+  // "Safety cancellation outranks new order placement." A blocked cancel can
+  // trap a position, which is precisely the failure this invariant exists to
+  // prevent, so a CANCEL is privileged HERE, structurally, rather than by a
+  // condition on each individual gate: once the input has parsed and the
+  // disposition is `CANCEL`, every refusal the pipeline accumulated — from any
+  // gate, including gates added after this was written — becomes a
+  // non-blocking observation and the cancel is approved.
+  //
+  // Review round 1 (BLOCKER 1) found run-mode mismatch and an explicit
+  // allocator refusal blocking cancels; the same-class audit of every gate in
+  // this function additionally found `RISK_MARKET_CONTEXT_MISSING` and
+  // `RISK_UUID_NOT_CANONICAL`. The audit and its findings are tabulated in
+  // `README.md` §4.1 and `docs/handoffs/WP-180.md`.
+  //
+  // The ONE thing a cancel cannot bypass is input validation itself
+  // (`RISK_INPUT_INVALID`, returned far above): until the input parses there is
+  // no disposition to privilege, and an unparseable request names no orders to
+  // cancel. That is a limit of knowledge, not a risk gate.
+  //
+  // DO NOT add an early `return rejected(...)` above this point, and DO NOT
+  // make this condition narrower. `test/unit/risk/engine.test.ts`
+  // ("a CANCEL survives every audited gate, all tripped at once") fails if you
+  // do.
+  if (isCancel) {
+    // A cancel contributes no BUY leg, so `lots` is the portfolio's own lot set
+    // and `buildWorstCaseLots` cannot have returned `undefined` (it does so
+    // only for an unbounded BUY leg). The `[]` arm is structurally unreachable
+    // and is an EXACT empty lot set, not a substituted measurement.
+    const cancelWorstCase = worstCase ?? assessWorstCase(lots ?? []);
+    const cancelRecord: ApprovedIntentRecord = {
+      approvedIntentId: data.identifiers.approvedIntentId,
+      lineage: "ORIGINAL",
+      rootApprovedIntentId: data.identifiers.approvedIntentId,
+      ...(view.intentId === undefined ? {} : { sourceIntentId: view.intentId }),
+      intent: data.intent,
+      approvedAt: data.evaluatedAt,
+      runMode: data.context.runMode,
+      strategyInstanceId: data.context.strategyInstanceId,
+      reasons: ["RISK_APPROVED", "RISK_CANCEL_ALWAYS_PERMITTED"],
+      worstCase: cancelWorstCase,
+      worstCaseBasis: "EVALUATED",
+      recommendations: accumulator.recommendations,
+    };
+    return deepFreeze({
+      approved: true as const,
+      record: cancelRecord,
+      refusals: [] as const,
+      cancelPriorityOverrides: [...accumulator.refusals],
+      recommendations: accumulator.recommendations,
+      worstCase: cancelWorstCase,
+      scenario,
+      freshness,
+    });
+  }
+
   if (accumulator.refusals.length > 0 || worstCase === undefined) {
     if (worstCase === undefined && accumulator.refusals.length === 0) {
       // Unreachable: an undefined assessment always pushes
@@ -914,8 +996,8 @@ export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluati
     return rejected(accumulator, worstCase, scenario, freshness);
   }
 
+  // A `CANCEL` returned at the choke point above and never reaches here.
   const reasons: RiskReasonCode[] = ["RISK_APPROVED"];
-  if (isCancel) reasons.push("RISK_CANCEL_ALWAYS_PERMITTED");
   if (view.disposition === "EXIT") reasons.push("RISK_EXIT_CAPACITY_CHECKS_INAPPLICABLE");
 
   const record: ApprovedIntentRecord = {
@@ -937,6 +1019,8 @@ export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluati
     approved: true as const,
     record,
     refusals: [] as const,
+    // Only a CANCEL can override a gate; every other approval overrode nothing.
+    cancelPriorityOverrides: [] as const,
     recommendations: accumulator.recommendations,
     worstCase,
     scenario,
