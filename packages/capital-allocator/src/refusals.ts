@@ -14,7 +14,7 @@
  * full vocabulary is documented in this package's `README.md`.
  */
 
-import { describeValue, readPlainData } from "./plain-data.js";
+import { describeValue, ownDataDetails, readPlainData } from "./plain-data.js";
 
 /** Why an allocator construction, reservation, or transition was refused. */
 export type CapitalRefusalCode =
@@ -152,13 +152,20 @@ export interface CapitalRefusal {
   readonly details: CapitalRefusalDetails;
 }
 
-/** Builds a refusal. Kept as a function so every refusal has the same shape. */
+/**
+ * Builds a refusal. Kept as a function so every refusal has the same shape.
+ *
+ * TOTAL FOR ANY `details` (review round 6, BLOCKER 3), for the same reason and
+ * by the same mechanism as `@polymarket-bot/risk`'s `riskRefusal`: a spread of
+ * a caller-supplied object runs its traps and getters, so the refusal
+ * constructor itself could throw. See {@link ownDataDetails}.
+ */
 export function capitalRefusal(
   code: CapitalRefusalCode,
   message: string,
   details: CapitalRefusalDetails = {},
 ): CapitalRefusal {
-  return Object.freeze({ code, message, details: Object.freeze({ ...details }) });
+  return Object.freeze({ code, message, details: ownDataDetails(details) });
 }
 
 /** A successful result, or the refusals that prevented it. */

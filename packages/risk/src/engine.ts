@@ -64,7 +64,7 @@ import {
 import { sealApprovedIntentRecord, type ApprovedIntentRecord } from "./approved-intent.js";
 import { checkExposureLimits } from "./exposure-limits.js";
 import { assessFreshness, blocksAsStale, type FreshnessAssessment } from "./freshness.js";
-import { deepFreeze } from "./guards.js";
+import { deepFreeze, ownFlag } from "./guards.js";
 import {
   validateEvaluationInput,
   type MarketContext,
@@ -284,7 +284,9 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   // enablement and fencing are valid, and refuses instead of assuming
   // (`AGENTS.md`: ALLOW_REAL_ORDERS=false). A second, independent floor under
   // check 2 for a caller who configured a higher `maxRunMode`.
-  if (placesOrders && RUN_MODE_PLACES_REAL_ORDERS[data.context.runMode]) {
+  // OWN read of the frozen domain table (review round 6): a run mode the table
+  // does not own is not a real-order mode because `Object.prototype` says so.
+  if (placesOrders && ownFlag(RUN_MODE_PLACES_REAL_ORDERS, data.context.runMode)) {
     accumulator.refusals.push(
       riskRefusal(
         "RISK_REAL_ORDER_SURFACE_UNSUPPORTED",

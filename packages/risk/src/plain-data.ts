@@ -109,6 +109,15 @@
  *    it shares no object with it, and no post-return edit the caller can make —
  *    to a prototype, to a getter, to a trap — reaches it.
  *
+ * 4. **AN ABSENT FIELD IS ABSENT** (added in review round 6). The materialized
+ *    tree has NO PROTOTYPE, so no read of it — dotted, computed, by a schema, by
+ *    anything — can be answered by `Object.prototype`. Proposition 2's totality
+ *    assumption was read too widely in round 5: ADDING a property to
+ *    `Object.prototype` does not replace an intrinsic, and review round 6 ruled
+ *    it in scope. It is a fail-open, not a curiosity — see {@link emptyRecord}
+ *    for the measured `zod` transcript in which an inherited optional field is
+ *    ADOPTED into the parse output as though the caller had supplied it.
+ *
  * IT REPORTS THE STRINGS IT READ. The read yields an inventory of every string
  * it materialized, with the path and the property names on the way down. The
  * package's ADR-016 §2 identity rules consume that inventory instead of walking
@@ -387,7 +396,14 @@ function ownDataValue(
     return { present: false };
   }
   if (descriptor === undefined) return { present: false };
-  if (!("value" in descriptor)) {
+  // `Object.hasOwn`, NOT `"value" in descriptor` (review round 6). The descriptor
+  // is a fresh ordinary object, but an ordinary object inherits from
+  // `Object.prototype`, and `in` answers for an INHERITED name: with
+  // `Object.prototype.value` defined, every ACCESSOR descriptor would have read
+  // as a data descriptor and this function would have accepted `undefined` as
+  // the field's value instead of refusing the getter. Found by the round-6
+  // census, not by a reviewer — see `test/unit/risk/prototype-access.test.ts`.
+  if (!Object.hasOwn(descriptor, "value")) {
     state.problems.push({
       path,
       problem:
@@ -455,6 +471,218 @@ function defineDataProperty(out: object, key: string, value: unknown): void {
  */
 const FORBIDDEN_KEY = "__proto__";
 
+/**
+ * A fresh object with NO PROTOTYPE, for the materialized tree.
+ *
+ * WHY NOT `{}` (review round 6). An ordinary object literal inherits from
+ * `Object.prototype`, so "this record does not carry that field" and "nobody has
+ * put that name on `Object.prototype`" became the same question. They are not
+ * the same question, and the difference is a FAIL-OPEN. Measured against the
+ * pinned `zod`, with `Object.prototype.b` defined non-enumerably:
+ *
+ * ```text
+ * schema = z.strictObject({ a: z.string(), b: z.string().optional() })
+ * schema.safeParse({ a: "x" })            → { a: "x", b: "inherited" }   ← ADOPTED
+ * schema.safeParse(nullPrototype{a:"x"})  → { a: "x" }
+ * ```
+ *
+ * So a validator handed an ordinary object ADOPTS an inherited value as though
+ * the caller had supplied it — an absent `venueEligibility` would arrive as
+ * `"ELIGIBLE"` and §9.8 check 4 would pass on a fact nobody supplied. The
+ * materialized tree therefore has no prototype at all: absence stays absence,
+ * for the schema and for every later read, whatever syntax that read uses.
+ *
+ * This is also what makes the round-6 BLOCKERs' class closed rather than their
+ * three sites patched: an own-property helper fixes a COMPUTED read, and this
+ * fixes every DOTTED read of input data as well.
+ */
+function emptyRecord(): Record<string, unknown> {
+  return Object.create(null) as Record<string, unknown>;
+}
+
+/**
+ * Rebuilds an already-validated tree as own data with NO PROTOTYPE.
+ *
+ * THE SECOND HALF OF THE ROUND-6 INHERITANCE FIX. A schema's OUTPUT is the
+ * schema's own object, and `zod` builds it with `{}` — so even when the input
+ * was prototype-free, the parsed value this package then reasons over inherits
+ * from `Object.prototype` again, and an ABSENT OPTIONAL FIELD read off it
+ * (`data.context.venueEligibility`) would be answered by whatever is on the
+ * prototype. Every door re-hardens the parse output through this function, so
+ * the tree the pipeline reasons over is prototype-free end to end.
+ *
+ * TOTAL: it runs on data this package has already materialized and validated,
+ * takes values from descriptors, and never invokes anything.
+ */
+function ownDataTree<T>(value: T): T {
+  return hardenValue(value, 0) as T;
+}
+
+/** The own DATA value of `key`, or `undefined`. Never an accessor, never inherited. */
+function dataValue(container: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(container, key);
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return undefined;
+  return descriptor.value;
+}
+
+/**
+ * Every path present in `before` and MISSING from `after`.
+ *
+ * WHY A VALIDATED VALUE IS COMPARED WITH ITSELF (review round 6). A validator's
+ * output is the validator's own object, and it BUILDS that object by
+ * assignment. An inherited GET-ONLY accessor on `Object.prototype` makes an
+ * assignment to that name fail, so the field silently vanishes from the parse
+ * output while the parse still reports success. Measured on the pinned `zod`:
+ * with a get-only `Object.prototype.perMarketCap`, a configured per-market cap
+ * disappeared from the parsed caps — a cap the caller set, silently not
+ * enforced, which is a FAIL-OPEN produced by prototype augmentation alone.
+ *
+ * So each door compares what it READ with what it is about to USE, and refuses
+ * on any loss rather than proceeding with a value that is quietly smaller than
+ * the caller's. A member whose read value is `undefined` is not counted: a
+ * schema may legitimately omit it, and an absent optional field is not a loss.
+ */
+function lostKeyPaths(before: unknown, after: unknown, path: string): readonly string[] {
+  const lost: string[] = [];
+  const walk = (left: unknown, right: unknown, at: string, depth: number): void => {
+    if (depth >= MAX_DEPTH || left === null || typeof left !== "object") return;
+    if (Array.isArray(left)) {
+      if (!Array.isArray(right)) {
+        lost.push(at);
+        return;
+      }
+      for (let index = 0; index < left.length; index += 1) {
+        const key = String(index);
+        if (!Object.hasOwn(right, key)) {
+          lost.push(`${at}[${key}]`);
+          continue;
+        }
+        walk(dataValue(left, key), dataValue(right, key), `${at}[${key}]`, depth + 1);
+      }
+      return;
+    }
+    if (right === null || typeof right !== "object" || Array.isArray(right)) {
+      lost.push(at);
+      return;
+    }
+    for (const key of Object.getOwnPropertyNames(left)) {
+      const value = dataValue(left, key);
+      if (value === undefined) continue;
+      if (!Object.hasOwn(right, key)) {
+        lost.push(`${at}.${key}`);
+        continue;
+      }
+      walk(value, dataValue(right, key), `${at}.${key}`, depth + 1);
+    }
+  };
+  walk(before, after, path, 0);
+  return lost;
+}
+
+/** A parse output that is safe to reason over, or the fields it lost. */
+export type HardenedParse =
+  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: false; readonly lost: readonly string[] };
+
+/**
+ * Makes a schema's output safe to reason over: PROTOTYPE-FREE and COMPLETE.
+ *
+ * Two round-6 findings, one call:
+ *
+ * 1. {@link ownDataTree} — the output inherits from `Object.prototype`, so an
+ *    ABSENT OPTIONAL FIELD read off it is answered by whatever is on the
+ *    prototype. The hardened tree has no prototype, so absence stays absence
+ *    for every read downstream, dotted or computed.
+ * 2. {@link lostKeyPaths} — the output can be SMALLER than what was read, and
+ *    silently so. A door that would proceed on a truncated value refuses
+ *    instead.
+ *
+ * `read` is the materialized input the schema saw; `parsed` is what it
+ * returned.
+ */
+export function hardenParsed(read: unknown, parsed: unknown, path = "value"): HardenedParse {
+  const value = ownDataTree(parsed);
+  const lost = lostKeyPaths(read, value, path);
+  if (lost.length > 0) return { ok: false, lost };
+  return { ok: true, value };
+}
+
+function hardenValue(value: unknown, depth: number): unknown {
+  if (value === null || typeof value !== "object" || depth >= MAX_DEPTH) return value;
+  if (Array.isArray(value)) {
+    const items: unknown[] = [];
+    for (const item of value as readonly unknown[]) items.push(hardenValue(item, depth + 1));
+    return items;
+  }
+  const out = emptyRecord();
+  for (const key of Object.getOwnPropertyNames(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) continue;
+    defineDataProperty(out, key, hardenValue(descriptor.value, depth + 1));
+  }
+  return out;
+}
+
+/**
+ * A frozen, prototype-free, own-DATA copy of a refusal's `details`.
+ *
+ * TOTAL FOR ANY VALUE (review round 6, BLOCKER 3). The refusal constructors
+ * used `{ ...details }`, which is an own-only READ but still runs a `Proxy`'s
+ * `ownKeys` and `getOwnPropertyDescriptor` traps and invokes any GETTER on the
+ * object: `riskRefusal(code, message, proxyDetails)` THREW out of a public
+ * export whose entire purpose is to be the way this package says "no".
+ *
+ * A refusal is EVIDENCE, so nothing is silently dropped: an accessor, an
+ * unreadable descriptor and a `__proto__` name are not copied — they are code,
+ * a failure and an unvalidatable name respectively — and their COUNT is
+ * recorded under `detailsUnreadable`, so the evidence says that it is
+ * incomplete rather than pretending it is not.
+ */
+export function ownDataDetails(details: unknown): Readonly<Record<string, unknown>> {
+  const out = emptyRecord();
+  if (details === null || typeof details !== "object") {
+    if (details !== undefined) {
+      defineDataProperty(out, "detailsNotAnObject", describeValue(details));
+    }
+    return Object.freeze(out);
+  }
+  let names: readonly string[];
+  try {
+    names = Object.getOwnPropertyNames(details);
+  } catch {
+    defineDataProperty(out, "detailsUnreadable", "its own property names could not be read");
+    return Object.freeze(out);
+  }
+  let skipped = 0;
+  for (const name of names) {
+    if (name === FORBIDDEN_KEY) {
+      skipped += 1;
+      continue;
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(details, name);
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    if (descriptor === undefined) continue;
+    if (!Object.hasOwn(descriptor, "value")) {
+      skipped += 1;
+      continue;
+    }
+    defineDataProperty(out, name, descriptor.value);
+  }
+  if (skipped > 0) {
+    defineDataProperty(
+      out,
+      "detailsUnreadable",
+      `${String(skipped)} propert${skipped === 1 ? "y" : "ies"} of the supplied details are not own data and were not copied`,
+    );
+  }
+  return Object.freeze(out);
+}
+
 function readObject(
   container: object,
   path: string,
@@ -464,7 +692,7 @@ function readObject(
 ): unknown {
   const stringKeys = ownStringKeys(container, path, state);
   if (stringKeys === undefined) return undefined;
-  const out: Record<string, unknown> = {};
+  const out: Record<string, unknown> = emptyRecord();
   for (const key of stringKeys) {
     const memberPath = `${path}.${key}`;
     if (key === FORBIDDEN_KEY) {
@@ -515,7 +743,8 @@ function reportedLength(
     state.problems.push({ path, problem: "its length could not be read" });
     return { ok: false };
   }
-  if (descriptor === undefined || !("value" in descriptor)) {
+  // `Object.hasOwn`, not `in` — same round-6 reason as {@link ownDataValue}.
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
     state.problems.push({
       path,
       problem: "its length is not an own data property, so the array is not data",

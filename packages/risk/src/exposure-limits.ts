@@ -238,7 +238,15 @@ export function checkExposureLimits(
     // contributions aggregate before the comparison.
     const contributionByKey = new Map<string, MoneyString>();
     for (const [marketId, contribution] of probe.perMarketContribution) {
-      const key = probe.scopeByMarket.get(marketId)?.[check.field];
+      // OWN read of the scope attribution (review round 6). `scope?.[field]`
+      // walks the prototype chain, so a market carrying NO series attribution
+      // would have been given one by `Object.prototype` — and an attributed
+      // market skips `RISK_SCOPE_KEY_MISSING` and is compared against the cap
+      // for a scope nobody supplied.
+      const key = ownEntry(
+        probe.scopeByMarket.get(marketId) as Readonly<Record<string, string>> | undefined,
+        check.field,
+      );
       if (key === undefined) {
         refusals.push(
           riskRefusal(
@@ -251,7 +259,14 @@ export function checkExposureLimits(
       }
       contributionByKey.set(key, addDecimal(contributionByKey.get(key) ?? "0", contribution));
     }
-    const table = exposures[check.dimension];
+    // OWN read of the DIMENSION too (review round 6): the snapshot is the
+    // caller's value, so a dimension it does not own must not be supplied by its
+    // prototype. An absent dimension leaves `table` undefined, which `ownEntry`
+    // turns into `RISK_EXPOSURE_ENTRY_MISSING` below — the fail-closed arm.
+    const table = ownEntry(
+      exposures as unknown as Readonly<Record<string, Readonly<Record<string, ExposureEntryView>>>>,
+      check.dimension,
+    );
     for (const [key, contribution] of contributionByKey) {
       const entry = ownEntry(table, key);
       if (entry === undefined) {

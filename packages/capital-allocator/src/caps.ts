@@ -35,6 +35,7 @@ import { z } from "zod";
 
 import { NonNegativeMoneyStringSchema } from "@polymarket-bot/domain";
 
+import { hardenParsed } from "./plain-data.js";
 import {
   capitalFailure,
   capitalOk,
@@ -63,33 +64,129 @@ export type LiveMicroCapField = (typeof LIVE_MICRO_CAP_FIELDS)[number];
 const LIVE_MICRO_FENCE_MESSAGE =
   "a live-micro cap other than the exact \"0\" floor is not permitted; AGENTS.md declares LIVE_MICRO_MAX_ORDER_NOTIONAL=0 and LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 non-weakenable, and enabling live-micro capacity is a separate authorized work package, not a caller argument";
 
-/** The fenced fields whose supplied value is not the exact floor. */
+/**
+ * What the fence could establish about one field. See {@link readCapField}.
+ *
+ * `atFloor` is the only permissive answer, and it is granted for exactly two
+ * readings: an OWN DATA property spelled exactly `"0"`, and a name that is not
+ * reachable on the object at all (absent — the schema default supplies the
+ * floor). Everything else, including everything unreadable, is `false`.
+ */
+interface CapFieldReading {
+  readonly atFloor: boolean;
+  /** The own data value, when there is one; otherwise `undefined`. */
+  readonly supplied: unknown;
+  /** Present when the value could not be read as data, saying why. */
+  readonly notData: string | undefined;
+}
+
+const AT_FLOOR: CapFieldReading = { atFloor: true, supplied: undefined, notData: undefined };
+
+function notAtFloor(notData: string): CapFieldReading {
+  return { atFloor: false, supplied: undefined, notData };
+}
+
+/**
+ * Whether `field` is reachable anywhere on `caps`'s prototype chain.
+ *
+ * Own descriptors, never `in`: `in` runs a `Proxy`'s `has` trap, and this
+ * function is part of a fence that must be total. Any failure answers TRUE —
+ * "it might be there" is the fail-closed direction, because the ENFORCEMENT
+ * site (`reserve.ts`) reads `caps.liveMicroMaxOrderNotional` with a dotted read,
+ * which WOULD find an inherited value.
+ */
+function reachableThroughPrototype(caps: object, field: string): boolean {
+  let current: object | null = caps;
+  for (let depth = 0; depth < 64 && current !== null; depth += 1) {
+    try {
+      if (Object.getOwnPropertyDescriptor(current, field) !== undefined) return true;
+    } catch {
+      return true;
+    }
+    try {
+      current = Object.getPrototypeOf(current) as object | null;
+    } catch {
+      return true;
+    }
+  }
+  return current !== null;
+}
+
+/**
+ * Reads one fenced field WITHOUT running caller code, and TOTALLY.
+ *
+ * Review round 6, BLOCKERs 1 and 3, at one site:
+ *
+ * - `caps[field]` was a `Get`, so a `Proxy` handler ran and
+ *   `nonFloorLiveMicroCapFields(proxy)` THREW out of a public export;
+ * - a dotted `Get` also walks the prototype chain, so an INHERITED
+ *   `liveMicroMaxOrderNotional` read as "absent, therefore fine" HERE while the
+ *   enforcement site in `reserve.ts` read the very same inherited value as the
+ *   cap. That is a weakening of an `AGENTS.md` non-weakenable floor by prototype
+ *   augmentation alone, and it is why "absent" now means UNREACHABLE rather than
+ *   `undefined`.
+ */
+function readCapField(caps: unknown, field: LiveMicroCapField): CapFieldReading {
+  if (caps === null || typeof caps !== "object") {
+    return notAtFloor("the caps value is not an object, so no floor can be established");
+  }
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(caps, field);
+  } catch {
+    return notAtFloor("its property descriptor could not be read");
+  }
+  if (descriptor === undefined) {
+    return reachableThroughPrototype(caps, field)
+      ? notAtFloor("an INHERITED value, which the enforcement site would read as the cap")
+      : AT_FLOOR;
+  }
+  if (!Object.hasOwn(descriptor, "value")) {
+    return notAtFloor("an accessor property: a getter is code, not a cap");
+  }
+  const value: unknown = descriptor.value;
+  if (value === LIVE_MICRO_CAP_FLOOR) return AT_FLOOR;
+  return { atFloor: false, supplied: value, notData: undefined };
+}
+
+/**
+ * The fenced fields that could NOT be shown to sit at the exact floor.
+ *
+ * TOTAL for any value, including a `Proxy` and a hostile descriptor (review
+ * round 6, BLOCKER 3): whatever cannot be read is reported as non-floor, so the
+ * fence's failure direction is REFUSAL.
+ */
 export function nonFloorLiveMicroCapFields(
   caps: Partial<Record<LiveMicroCapField, unknown>>,
 ): readonly LiveMicroCapField[] {
-  return LIVE_MICRO_CAP_FIELDS.filter((field) => {
-    const value = caps[field];
-    // Absent is fine: the schema default supplies the floor.
-    return value !== undefined && value !== LIVE_MICRO_CAP_FLOOR;
-  });
+  return LIVE_MICRO_CAP_FIELDS.filter((field) => !readCapField(caps, field).atFloor);
 }
 
 /**
  * Typed refusals for every fenced field that is not at the floor.
  *
  * Exported so the reservation gate can apply the same fence to a caps object
- * that never went through {@link parseAllocatorCaps}.
+ * that never went through {@link parseAllocatorCaps}. Total for the same reason
+ * {@link nonFloorLiveMicroCapFields} is.
  */
 export function liveMicroCapRefusals(
   caps: Partial<Record<LiveMicroCapField, unknown>>,
 ): readonly CapitalRefusal[] {
-  return nonFloorLiveMicroCapFields(caps).map((field) =>
-    capitalRefusal("CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED", LIVE_MICRO_FENCE_MESSAGE, {
-      field,
-      supplied: caps[field],
-      permitted: LIVE_MICRO_CAP_FLOOR,
-    }),
-  );
+  const refusals: CapitalRefusal[] = [];
+  for (const field of LIVE_MICRO_CAP_FIELDS) {
+    const reading = readCapField(caps, field);
+    if (reading.atFloor) continue;
+    refusals.push(
+      capitalRefusal(
+        "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED",
+        LIVE_MICRO_FENCE_MESSAGE,
+        reading.notData === undefined
+          ? { field, supplied: reading.supplied, permitted: LIVE_MICRO_CAP_FLOOR }
+          : { field, suppliedNotData: reading.notData, permitted: LIVE_MICRO_CAP_FLOOR },
+      ),
+    );
+  }
+  return refusals;
 }
 
 /**
@@ -158,11 +255,46 @@ export function parseAllocatorCaps(input: unknown): CapitalResult<AllocatorCaps>
           }),
         );
       }
-      const fence = liveMicroCapRefusals(parsed.data);
+      // THE PARSE OUTPUT IS RE-HARDENED (review round 6). `zod` builds its
+      // result with `{}`, so an ABSENT OPTIONAL CAP (`perMarketCap`, …) read off
+      // it would have been answered by `Object.prototype` — a cap nobody
+      // configured. And it can be SMALLER than what was read: with an inherited
+      // GET-ONLY accessor named `perMarketCap`, `zod`'s own assignment fails and
+      // a cap the caller DID configure vanishes from the output while the parse
+      // still succeeds. Both are refused here. The FENCE ORDER IS UNCHANGED:
+      // grammar, then hardening, then the live-micro fence with its own code.
+      const hardened = hardenParsed(read.value, parsed.data, "caps");
+      if (!hardened.ok) {
+        return capitalFailure<AllocatorCaps>(
+          capitalRefusal(
+            "CAPITAL_INPUT_INVALID",
+            "the validated caps lost fields between validation and use, so a configured cap could go unenforced (fail closed)",
+            { lost: [...hardened.lost] },
+          ),
+        );
+      }
+      const data = hardened.value as AllocatorCaps;
+      // THE FENCED FIELDS MUST BE PRESENT IN THE OUTPUT (review round 6). The
+      // schema DEFAULTS them, so after a successful parse they are always own
+      // data — unless an inherited get-only accessor blocked `zod`'s assignment
+      // of the default, in which case the caps this function would bless carry
+      // no live-micro floor at all. The absence is refused here rather than
+      // discovered later as an arithmetic failure at the enforcement gate.
+      const missing = LIVE_MICRO_CAP_FIELDS.filter((field) => !Object.hasOwn(data, field));
+      if (missing.length > 0) {
+        return capitalFailure<AllocatorCaps>(
+          capitalRefusal(
+            "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED",
+            LIVE_MICRO_FENCE_MESSAGE,
+            { missingAfterValidation: [...missing], permitted: LIVE_MICRO_CAP_FLOOR },
+          ),
+        );
+      }
+      const fence = liveMicroCapRefusals(data);
       if (fence.length > 0) {
         return capitalFailure<AllocatorCaps>(...fence);
       }
-      return capitalOk(Object.freeze(parsed.data));
+      return capitalOk(Object.freeze(data));
     },
     (thrown) =>
       capitalFailure(

@@ -44,7 +44,8 @@ import { z } from "zod";
 
 import { liveMicroCapRefusals, type AllocatorCaps } from "./caps.js";
 import { exposureSnapshot, shadowExposureSnapshot, type ExposureSnapshot } from "./exposure.js";
-import { deepFreeze, ownEntry, uuidShapedNotCanonical } from "./guards.js";
+import { deepFreeze, ownEntry, ownFlag, uuidShapedNotCanonical } from "./guards.js";
+import { hardenParsed } from "./plain-data.js";
 import {
   capitalFailure,
   capitalOk,
@@ -148,12 +149,15 @@ function capRefusals(probes: readonly CapProbe[], contribution: string): Capital
 
 function entryOf(snapshot: ExposureSnapshot, dimension: keyof ExposureSnapshot, key?: string): string {
   if (dimension === "global") return snapshot.global.combined;
-  const table = snapshot[dimension] as Readonly<
-    Record<string, { readonly combined: string }>
-  >;
-  // OWN lookup (review round 5, the BLOCKER-1 sweep): a scope key is a bounded
-  // string, and `table["__proto__"]` would answer `Object.prototype`, whose
-  // `combined` is `undefined` — a cap comparison against nothing.
+  // OWN lookup TWICE (review rounds 5 and 6): once for the DIMENSION — the
+  // snapshot is a value a caller can hand us, so a dimension the snapshot does
+  // not own must not be answered by its prototype — and once for the KEY, which
+  // is a bounded scope string, where `table["__proto__"]` would answer
+  // `Object.prototype` and compare a cap against nothing.
+  const table = ownEntry(
+    snapshot as unknown as Readonly<Record<string, Readonly<Record<string, { readonly combined: string }>>>>,
+    dimension,
+  );
   return key === undefined ? "0" : (ownEntry(table, key)?.combined ?? "0");
 }
 
@@ -199,7 +203,24 @@ function evaluateReservationInner(
       }),
     ]);
   }
-  const req = parsed.data;
+  // THE PARSE OUTPUT IS RE-HARDENED (review round 6). `zod` builds its result
+  // with `{}`, so an ABSENT OPTIONAL FIELD of the parsed request —
+  // `req.scope`, `req.scope?.seriesKey` — would have been answered by
+  // `Object.prototype`, attributing a commitment to a scope nobody supplied.
+  // The same call refuses an output SMALLER than what was read: a request whose
+  // `scope` vanished would skip `CAPITAL_SCOPE_KEY_MISSING` on a configured
+  // scope cap.
+  const hardened = hardenParsed(read.value, parsed.data, "request");
+  if (!hardened.ok) {
+    return refuseVerdict([
+      capitalRefusal(
+        "CAPITAL_INPUT_INVALID",
+        "the validated reservation request lost fields between validation and use, so what would be committed is not what was requested (fail closed)",
+        { lost: [...hardened.lost] },
+      ),
+    ]);
+  }
+  const req = hardened.value as ReservationRequest;
 
   const refusals: CapitalRefusal[] = [];
 
@@ -236,7 +257,16 @@ function evaluateReservationInner(
 
   if (req.accountingMode === "LIVE") {
     // --- one live owner per market (ADR-011; §9.7 v1) ----------------------
-    const owner = state.liveOwners[req.marketId];
+    // OWN lookup (review round 6, BLOCKER 1 — THE MOST SERIOUS DEFECT IN THIS
+    // PACKAGE'S HISTORY: a FAIL-OPEN on the live-ownership gate). `state
+    // .liveOwners[req.marketId]` is `Get`, which walks the prototype chain, so
+    // an INHERITED owner authorized a LIVE commitment where
+    // `CAPITAL_LIVE_OWNERSHIP_MISSING` was owed — reproduced twice, once with a
+    // caller-built `liveOwners` and once, more seriously, with a state THIS
+    // LIBRARY built and a single non-enumerable `Object.prototype` property
+    // spelled as the market's UUID. Ownership is a fact the state OWNS or does
+    // not have.
+    const owner = ownEntry(state.liveOwners, req.marketId);
     if (owner === undefined) {
       refusals.push(
         capitalRefusal(
@@ -256,7 +286,10 @@ function evaluateReservationInner(
     }
 
     // --- real-order modes: live-micro caps (defaults "0") ------------------
-    if (RUN_MODE_PLACES_REAL_ORDERS[req.runMode]) {
+    // OWN read of the frozen domain table (review round 6): a run mode the
+    // table does not own is not a real-order mode because something on
+    // `Object.prototype` says so.
+    if (ownFlag(RUN_MODE_PLACES_REAL_ORDERS, req.runMode)) {
       if (compareDecimal(cost, caps.liveMicroMaxOrderNotional) > 0) {
         refusals.push(
           capitalRefusal(
@@ -290,8 +323,15 @@ function evaluateReservationInner(
     }
     if (req.action === "SELL") {
       const key = inventoryKey(req.strategyInstanceId, req.marketId, req.side);
-      const held = heldSharesByKey(state)[key] ?? "0";
-      const reserved = reservedSharesByKey(state)[key] ?? "0";
+      // OWN lookups (review round 6, BLOCKER 1). These two tables are built
+      // fresh by this package, and that did NOT make them safe: they are
+      // ordinary objects, so `table[key]` for a key the table does not own was
+      // answered by `Object.prototype`. The reviewer's probe put a TWO-ANSWER
+      // GETTER on the composite inventory key and a SELL with ZERO holdings saw
+      // `held=1000, reserved=0` and was permitted. Inventory is what the state
+      // OWNS.
+      const held = ownEntry(heldSharesByKey(state), key) ?? "0";
+      const reserved = ownEntry(reservedSharesByKey(state), key) ?? "0";
       const free = subDecimal(held, reserved);
       if (compareDecimal(req.shares, free) > 0) {
         refusals.push(

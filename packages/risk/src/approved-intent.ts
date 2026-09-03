@@ -103,7 +103,7 @@ import { z } from "zod";
 
 import { deepFreeze } from "./guards.js";
 import { identityRefusals } from "./inputs.js";
-import { readPlainData, type PlainDataString } from "./plain-data.js";
+import { hardenParsed, readPlainData, type PlainDataString } from "./plain-data.js";
 import { RISK_REASON_CODES, type RiskReasonCode } from "./reasons.js";
 import {
   IncidentActionRecommendationSchema,
@@ -436,7 +436,25 @@ function resizeApprovedIntentInner(
       }),
     );
   }
-  const req = parsed.data;
+  // THE PARSE OUTPUT IS HARDENED (review round 6), and this one is not a
+  // hypothetical: `zod` assembles its output by ASSIGNMENT, so an inherited
+  // GET-ONLY accessor named `approvedIntentId` made the assignment fail, the
+  // field vanish from the output, and the following read fall through to the
+  // PROTOTYPE — the emitted record's own identity came back as the inherited
+  // getter's answer (`"0"`), with the parse still reporting success. Found by
+  // `test/unit/risk/inherited-state.test.ts`, which is why that mechanism
+  // exists. A truncated request is refused, never resized.
+  const hardened = hardenParsed(requestData.value, parsed.data, "request");
+  if (!hardened.ok) {
+    return riskFailure(
+      riskRefusal(
+        "RISK_INPUT_INVALID",
+        "the validated resize request lost fields between validation and use, so the resize would not be the one that was asked for (fail closed)",
+        { lost: [...hardened.lost] },
+      ),
+    );
+  }
+  const req = hardened.value as ResizeRequest;
   const refusals: RiskRefusal[] = [];
 
   // --- THE INHERITED BOUNDARY — read and validated BEFORE anything is built --

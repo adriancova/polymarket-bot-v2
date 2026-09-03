@@ -199,12 +199,23 @@ export function assessWorstCase(lots: readonly MarketHoldingLot[]): WorstCaseAss
       NO_WIN: settlementValueUnderOutcome(lot.yesShares, lot.noShares, "NO_WIN"),
       SPLIT_50_50: settlementValueUnderOutcome(lot.yesShares, lot.noShares, "SPLIT_50_50"),
     };
+    // NAMED, not computed (review round 6). This used to read
+    // `perOutcome[outcome]`, a `Get` with a computed key: the object is built
+    // one line above and owns all three names, so it was never live, but the
+    // round-6 census enumerates every computed access in this package and the
+    // three outcomes are worth writing out rather than registering an
+    // exception. The comparison order is unchanged (`VERIFIED_TERMINAL_OUTCOMES`
+    // order, first minimum wins).
     let worstOutcome: VerifiedTerminalOutcome = "YES_WIN";
     let worstValue = perOutcome.YES_WIN;
-    for (const outcome of VERIFIED_TERMINAL_OUTCOMES) {
-      if (compareDecimal(perOutcome[outcome], worstValue) < 0) {
+    for (const [outcome, value] of [
+      ["YES_WIN", perOutcome.YES_WIN],
+      ["NO_WIN", perOutcome.NO_WIN],
+      ["SPLIT_50_50", perOutcome.SPLIT_50_50],
+    ] as readonly (readonly [VerifiedTerminalOutcome, MoneyString])[]) {
+      if (compareDecimal(value, worstValue) < 0) {
         worstOutcome = outcome;
-        worstValue = perOutcome[outcome];
+        worstValue = value;
       }
     }
     worstVerifiedTotal = addDecimal(worstVerifiedTotal, worstValue);

@@ -19,6 +19,7 @@ import {
   instantMilliseconds,
 } from "../../../packages/risk/src/index.js";
 import { MARKET_A, MARKET_B } from "./fixtures.js";
+import { auditNodeBuiltins, auditScannedFiles } from "./prototype-access-scan.js";
 
 const policy = { venueBookMaxAgeMs: 1000, referenceFeedMaxAgeMs: 2000, featuresMaxAgeMs: 2000 };
 
@@ -173,17 +174,105 @@ describe("deadline comparison reads no clock", () => {
           expect(line.trim(), `packages/${pkg}/src/${entry}`).toBe(AUDITED_BUILTIN_IMPORT);
           sites.push(`${pkg}/${entry}`);
         }
-        // The binding may be used for the trap-free `Proxy` predicate and
-        // nothing else: `types.isNativeError`, `types.isDate`, or any member
-        // read that is not `isProxy` fails here.
-        for (const use of code.match(/\btypes\s*\.\s*[A-Za-z0-9_$]+/gu) ?? []) {
-          expect(use.replace(/\s+/gu, ""), `packages/${pkg}/src/${entry}`).toBe("types.isProxy");
-        }
       }
     }
     // Exactly one site per package: the mirrored data-record boundary. NOT a
     // "greater than zero" check — a second site would be a second thing to
     // audit, and this test is the audit.
     expect(sites.sort()).toEqual(["capital-allocator/plain-data.ts", "risk/plain-data.ts"]);
+  });
+
+  /**
+   * HOW THE BINDING MAY BE USED — AST, NOT TEXT (review round 6, LOW B).
+   *
+   * The previous version of this check matched the regular expression
+   * `\btypes\s*\.\s*[A-Za-z0-9_$]+` and required every hit to read `isProxy`.
+   * Review round 6 showed the pin is LEXICAL and bypassable four ways, and gave
+   * the transcript:
+   *
+   * ```text
+   * types.isDate               rejected
+   * const t = types; t.isDate  accepted
+   * const { isDate } = types   accepted
+   * types["isDate"]            accepted
+   * ```
+   *
+   * The replacement resolves the IMPORT to its local binding and classifies
+   * every reference to that binding by its syntactic parent, so an alias, a
+   * destructuring and a computed access are each reported as what they are. The
+   * reviewer was explicit that this is a STRENGTHENING and not a retraction:
+   * the shipped source uses only `types.isProxy`, and `util.types` predicates
+   * introduce no I/O.
+   */
+  it("the audited binding is used ONLY as `types.isProxy`, by AST and not by text", () => {
+    const audited = auditScannedFiles().filter((entry) => !entry.file.endsWith(".test.ts"));
+    const failures: string[] = [];
+    const importedFiles: string[] = [];
+
+    for (const { file, audit } of audited) {
+      for (const specifier of audit.dynamicSpecifiers) {
+        if (specifier.startsWith("node:")) {
+          failures.push(`${file}: dynamic import of ${specifier}`);
+        }
+      }
+      for (const entry of audit.imports) {
+        importedFiles.push(file);
+        if (entry.specifier !== "node:util" || entry.form !== "named" || entry.imported !== "types") {
+          failures.push(
+            `${file}:${String(entry.line)}: ${entry.form} import of ${entry.imported} from ${entry.specifier}`,
+          );
+          continue;
+        }
+        if (entry.binding !== "types") {
+          failures.push(`${file}:${String(entry.line)}: renamed binding \`${entry.binding}\``);
+        }
+        for (const use of entry.uses) {
+          if (use !== "types.isProxy") failures.push(`${file}: ${use}`);
+        }
+        if (entry.uses.length === 0) {
+          failures.push(`${file}: the audited import is never used`);
+        }
+      }
+    }
+
+    expect(failures).toEqual([]);
+    expect(importedFiles.sort()).toEqual([
+      "packages/capital-allocator/src/plain-data.ts",
+      "packages/risk/src/plain-data.ts",
+    ]);
+  });
+
+  it("the AST audit rejects each of the four bypasses the reviewer demonstrated", () => {
+    const usesOf = (body: string): readonly string[] => {
+      const audit = auditNodeBuiltins(`import { types } from "node:util";\n${body}\n`);
+      return audit.imports.flatMap((entry) => entry.uses);
+    };
+
+    expect(usesOf("export const a = types.isProxy(x);")).toEqual(["types.isProxy"]);
+    // 1. a different member
+    expect(usesOf("export const a = types.isDate(x);")).toEqual(["types.isDate"]);
+    // 2. an alias
+    expect(usesOf("const t = types;\nexport const a = t.isDate(x);")[0]).toContain(
+      "ALIASED or DESTRUCTURED",
+    );
+    // 3. destructuring
+    expect(usesOf("const { isDate } = types;\nexport const a = isDate(x);")[0]).toContain(
+      "ALIASED or DESTRUCTURED",
+    );
+    // 4. computed access
+    expect(usesOf('export const a = types["isDate"](x);')[0]).toContain("[computed]");
+    // …and a bare reference passed somewhere else
+    expect(usesOf("export const a = use(types);")[0]).toContain("BARE REFERENCE");
+    // a renamed binding is seen as itself
+    const renamed = auditNodeBuiltins(
+      'import { types as t } from "node:util";\nexport const a = t.isProxy(x);\n',
+    );
+    expect(renamed.imports[0]?.binding).toBe("t");
+    // a dynamic import is seen
+    expect(
+      auditNodeBuiltins('export const fs = await import("node:fs");').dynamicSpecifiers,
+    ).toEqual(["node:fs"]);
+    // a property that merely shares the name is not a use
+    expect(usesOf("export const a = other.types;")).toEqual([]);
   });
 });

@@ -72,7 +72,16 @@ function bump(
     entry = { openOrderCommitted: "0", positionCommitted: "0" };
     setOwn(table, key, entry);
   }
-  entry[component] = addDecimal(entry[component], amount);
+  // NAMED, not computed (review round 6). `entry[component]` was a computed READ
+  // and a computed WRITE on an object built one line above; both fields are
+  // always own, so it was not live — but the round-6 census enumerates every
+  // computed access in this package, and a component accumulator is not worth an
+  // exception entry when the two names can simply be written out.
+  if (component === "openOrderCommitted") {
+    entry.openOrderCommitted = addDecimal(entry.openOrderCommitted, amount);
+  } else {
+    entry.positionCommitted = addDecimal(entry.positionCommitted, amount);
+  }
 }
 
 function finalize(table: Table): Readonly<Record<string, ExposureEntry>> {
@@ -152,7 +161,12 @@ function snapshotFromItems(
     bumpAll(tables, reservation, "openOrderCommitted", reservation.cost);
   }
   return deepFreeze({
-    global: finalize(tables.global)[GLOBAL_KEY] ?? ZERO_ENTRY,
+    // OWN lookup (review round 6). The table is this package's own, and the key
+    // is a package literal — and it was still a `Get` that walked the prototype
+    // chain, so `Object.prototype.GLOBAL` would have become the ACCOUNT-WIDE
+    // exposure figure every global cap is compared against. The reviewer
+    // reported the site; the reason it matters is that one.
+    global: ownEntry(finalize(tables.global), GLOBAL_KEY) ?? ZERO_ENTRY,
     byStrategyInstance: finalize(tables.byStrategyInstance),
     byMarket: finalize(tables.byMarket),
     bySeries: finalize(tables.bySeries),

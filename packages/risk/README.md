@@ -315,12 +315,37 @@ separately. `src/plain-data.ts` states them at length; in short:
    intrinsics are genuine. A process that has replaced `Object`, `Reflect` or
    `util.types` has already lost, and no boundary inside it can help — a
    different threat model from "a caller handed us a hostile value".
-2. **Totality is unconditional.** No public function of this package throws for
-   any input, whatever proposition 1 assumes: reflective operations are
-   wrapped, refusal text never coerces a caller-derived value, and every public
-   entry point carries an outer containment guard (`contained` in
-   `src/result.ts`). The cost is stated there: a genuine bug becomes a typed
-   refusal rather than a crash.
+2. **Totality is a property of the CLASSIFIED surface, not of the word
+   "public".** *Corrected 2026-09-03 (review round 6).* Round 5 wrote here:
+   "Totality is unconditional. No public function of this package throws for any
+   input." **That was false**, and the reviewer's five-line matrix proved it:
+   `assessWorstCase`, `riskRefusal`, `exposureSnapshot`,
+   `nonFloorLiveMicroCapFields` and `validateEvaluationInput` all threw on a
+   `Proxy` or an inherited getter. The functions round 5 had wrapped were total;
+   the exported SURFACE was not, because nobody had enumerated it. What is true,
+   and now enumerated export by export in
+   `test/unit/risk/public-surface.test.ts` — which fails if an export is added
+   without a classification:
+
+   - every public function that takes an `unknown` (`validateEvaluationInput`,
+     `parseRiskPolicy`, `evaluateIntent`, `resizeApprovedIntent`), the refusal
+     constructors (`riskRefusal`, `riskOk`, `riskFailure`) and the pure
+     predicates are **TOTAL**: they answer with a typed refusal for any value,
+     including a `Proxy`, an inherited getter and a hostile descriptor;
+   - the typed helpers whose result type cannot express a refusal —
+     `assessWorstCase`, `buildWorstCaseLots`, `assessScenarios`,
+     `assessFreshness`, `buildIntentView`, `heldShares`, `checkExposureLimits`,
+     `recommendIncidentActions`, `settlementValueUnderOutcome` — **PROPAGATE**,
+     deliberately. Containing them would mean INVENTING a measurement, and the
+     only inventable number here is `"0"`: a worst-case loss of zero, or an
+     empty exposure snapshot, is precisely the fail-open
+     `RISK_EXPOSURE_ENTRY_MISSING` exists to prevent. Every in-repository call
+     site runs inside `contained`, so no public ANSWER of this package is ever
+     an exception; the classification test runs each hostile call and requires
+     it to throw, so the entry is a measurement rather than a hope.
+
+   The cost of containment where it IS applied is stated in `src/result.ts`: a
+   genuine bug becomes a typed refusal rather than a crash.
 3. **The output is plain own frozen data whatever the input did** — a fresh
    tree built one `defineProperty` at a time, sharing no object with the
    argument.
@@ -351,6 +376,40 @@ Pinned by `test/unit/risk/engine.test.ts`, describe blocks *"the data-record
 boundary — a caller's object is not a record"* (round 4) and *"a hostile value
 at the boundary — review round 5"*, and by the audited-built-in test in
 `test/unit/risk/freshness.test.ts`.
+
+### 4.6 An absent field is absent (review round 6)
+
+A fourth proposition, added because round 6 found the third fail-open of this
+chain and the first that needed no hostile input at all: **`Object.prototype` is
+reachable state, and "this record has no such field" and "nobody has put that
+name on `Object.prototype`" are different questions.**
+
+- The materialized tree has **no prototype** (`Object.create(null)`), and each
+  door re-hardens the SCHEMA'S OUTPUT the same way, because a validator builds
+  its result with `{}`. Measured on the pinned `zod`:
+  `z.strictObject({ b: z.string().optional() }).safeParse({ a: "x" })` with an
+  inherited `b` returns `{ a: "x", b: "inherited" }` — the validator **adopts**
+  it. An absent `venueEligibility` would have arrived as `"ELIGIBLE"` and §9.8
+  check 4 would have passed on a fact nobody supplied.
+- A door also refuses a parse output that is **smaller** than what it read. An
+  inherited GET-ONLY accessor makes an assignment inside the validator fail, so
+  a field can vanish from the output while the parse still reports success —
+  measured on `resizeApprovedIntent`, where the emitted record's own
+  `approvedIntentId` came back as the inherited getter's answer.
+- Every computed table read goes through `ownEntry` / `ownFlag` /
+  `ownProperty`, and `"intentId" in intent` — which consults the prototype, and
+  which made a valid CANCEL refuse with `RISK_UUID_NOT_CANONICAL` — is an
+  own-property test.
+
+Two mechanisms hold this, and neither is a list: `test/unit/risk/prototype-access.test.ts`
+asks the TypeScript compiler for every computed access, `in`, spread and
+`Object.assign` in both packages and requires each to be an own-property
+primitive or a registered exception with a reason;
+`test/unit/risk/inherited-state.test.ts` re-runs every public door with
+`Object.prototype` carrying one extra property — the names drawn from the
+door's own inputs — and requires the answer to be unchanged, or to have become a
+typed refusal. An inherited property may cost availability; it may never buy
+permission.
 
 ### Staleness and exits, stated exactly
 
@@ -607,6 +666,16 @@ entropy, so §9's claims below are unaffected. The line is pinned character for
 character, and its permitted use restricted to `isProxy`, by
 `test/unit/risk/freshness.test.ts` — which otherwise still refuses every `node:`
 import in both packages.
+
+*Strengthened 2026-09-03 (review round 6, LOW).* The "used only as
+`types.isProxy`" half of that pin was LEXICAL — a regular expression over the
+source — and the reviewer showed it accepted `const t = types; t.isDate`,
+`const { isDate } = types` and `types["isDate"]` while rejecting only the
+literal `types.isDate`. It is now AST-based: the import is resolved to its local
+binding and every reference to that binding is classified by its syntactic
+parent, so an alias, a destructuring, a computed access, a renamed binding and a
+dynamic `import("node:…")` are each reported. The four bypasses are permanent
+test cases.
 
 ## 9. Safety
 

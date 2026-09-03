@@ -42,6 +42,7 @@ import {
 import { z } from "zod";
 
 import { deepFreeze, ownEntry, setOwn, uuidShapedNotCanonical } from "./guards.js";
+import { hardenParsed } from "./plain-data.js";
 import {
   capitalFailure,
   capitalOk,
@@ -237,7 +238,24 @@ function createAllocatorStateInner(input: unknown): CapitalResult<AllocatorState
       }),
     );
   }
-  const data = parsed.data;
+  // THE PARSE OUTPUT IS RE-HARDENED (review round 6): `zod` builds its result
+  // with `{}`, so an absent optional field of a position or an order —
+  // `scope`, and every key under it — would have been answered by
+  // `Object.prototype`, attributing a holding to a scope nobody supplied. The
+  // same call refuses an output SMALLER than what was read: an inherited
+  // get-only accessor makes `zod`'s assignment fail, and a state missing a
+  // position or an open order is a state that under-states its own commitments.
+  const hardenedState = hardenParsed(read.value, parsed.data, "state");
+  if (!hardenedState.ok) {
+    return capitalFailure(
+      capitalRefusal(
+        "CAPITAL_INPUT_INVALID",
+        "the validated allocator state lost fields between validation and use, so it would under-state the commitments it was given (fail closed)",
+        { lost: [...hardenedState.lost] },
+      ),
+    );
+  }
+  const data = hardenedState.value as AllocatorStateInput;
 
   const refusals: CapitalRefusal[] = nonCanonicalIdRefusals(data);
 
@@ -334,8 +352,32 @@ function createAllocatorStateInner(input: unknown): CapitalResult<AllocatorState
  *
  * ADR-011 / §9.7 v1: conflicting live ownership is rejected, never netted.
  * Idempotent for the same owner. Returns a NEW state; the original is frozen.
+ *
+ * CONTAINED (review round 6, BLOCKER 3). It answers with a `CapitalResult`, so
+ * an ownership question it cannot answer must be a REFUSAL rather than an
+ * exception — this is the classification the public-surface matrix in
+ * `test/unit/risk/public-surface.test.ts` records for it, and that test runs the
+ * hostile call.
  */
 export function withLiveOwner(
+  state: AllocatorState,
+  marketId: string,
+  strategyInstanceId: string,
+): CapitalResult<AllocatorState> {
+  return contained(
+    () => withLiveOwnerInner(state, marketId, strategyInstanceId),
+    (thrown) =>
+      capitalFailure(
+        capitalRefusal(
+          "CAPITAL_INPUT_INVALID",
+          "recording the live owner failed unexpectedly; ownership that cannot be established is not claimed (fail closed)",
+          { thrown },
+        ),
+      ),
+  );
+}
+
+function withLiveOwnerInner(
   state: AllocatorState,
   marketId: string,
   strategyInstanceId: string,

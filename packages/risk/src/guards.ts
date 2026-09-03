@@ -46,6 +46,44 @@ export function ownEntry<T>(
 }
 
 /**
+ * One OWN property of `container`, with an explicit PRESENCE flag.
+ *
+ * Never inherited, and never an accessor invocation: the value comes from the
+ * descriptor. `Object.hasOwn` alone would answer the presence question but a
+ * following `container[key]` would still invoke an OWN getter, and the whole
+ * point of the round-6 fix at `inputs.ts` is that asking whether a field exists
+ * must not run anybody's code.
+ *
+ * `present: false` covers three cases that are one case for this package: no
+ * such property, an inherited one, and an accessor.
+ */
+export function ownProperty(
+  container: object,
+  key: string,
+): { readonly present: boolean; readonly value: unknown } {
+  const descriptor = Object.getOwnPropertyDescriptor(container, key);
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+    return { present: false, value: undefined };
+  }
+  return { present: true, value: descriptor.value };
+}
+
+/**
+ * True when `flags` OWNS `key` and its value is exactly `true`.
+ *
+ * For a frozen lookup table of booleans (`RUN_MODE_PLACES_REAL_ORDERS`). The
+ * key is validated caller data, so `flags[key]` would consult the prototype for
+ * any spelling the table does not own — review round 6's census flagged the call
+ * site, and a fence over real-order run modes is the last place to answer from
+ * anywhere but the table itself. Mirrors
+ * `packages/capital-allocator/src/guards.ts`.
+ */
+export function ownFlag(flags: object, key: string): boolean {
+  if (!Object.hasOwn(flags, key)) return false;
+  return (flags as Record<string, unknown>)[key] === true;
+}
+
+/**
  * Recursively freezes plain objects and arrays. Returns the same reference.
  * Recurses into already-frozen containers (a zod `.readonly()` array arrives
  * shallow-frozen with mutable elements); a visited set makes cycles safe.
@@ -77,7 +115,13 @@ function freezeRecursive(value: unknown, visited: WeakSet<object>): void {
   visited.add(value);
   for (const key of Reflect.ownKeys(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !("value" in descriptor)) continue;
+    // `Object.hasOwn`, not `"value" in descriptor` (review round 6). A
+    // descriptor object inherits from `Object.prototype`, so `in` answers for an
+    // inherited `value` too: with `Object.prototype.value` defined, an ACCESSOR
+    // would have been treated as a data property and `descriptor.value` —
+    // `undefined` — recursed into. Found by the round-6 census
+    // (`test/unit/risk/prototype-access.test.ts`), not by a reviewer.
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) continue;
     freezeRecursive(descriptor.value, visited);
   }
   Object.freeze(value);

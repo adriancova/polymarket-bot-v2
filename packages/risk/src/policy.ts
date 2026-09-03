@@ -33,7 +33,7 @@ import {
 } from "@polymarket-bot/domain";
 
 import { FreshnessPolicySchema } from "./freshness.js";
-import { readPlainData } from "./plain-data.js";
+import { hardenParsed, readPlainData } from "./plain-data.js";
 import { contained, riskFailure, riskOk, riskRefusal, type RiskResult } from "./result.js";
 
 export const SCENARIO_KINDS = ["SPOT", "VOLATILITY", "TIME", "LIQUIDITY"] as const;
@@ -128,7 +128,24 @@ export function parseRiskPolicy(input: unknown): RiskResult<RiskPolicy> {
           }),
         );
       }
-      return riskOk(Object.freeze(parsed.data));
+      // THE PARSE OUTPUT IS RE-HARDENED (review round 6): `zod` builds its
+      // result with `{}`, so every ABSENT OPTIONAL LIMIT of the parsed policy
+      // (`limits.perMarketExposureCap`, `economics.*`, `participation.*`) would
+      // have been answered by `Object.prototype` — a configured cap nobody
+      // configured, or a missing one that suddenly exists. The same call
+      // refuses a parse output that LOST a field the caller supplied: a
+      // silently dropped limit is a limit nobody enforces.
+      const hardened = hardenParsed(read.value, parsed.data, "policy");
+      if (!hardened.ok) {
+        return riskFailure<RiskPolicy>(
+          riskRefusal(
+            "RISK_INPUT_INVALID",
+            "the validated policy lost fields between validation and use, so a configured limit could go unenforced (fail closed)",
+            { lost: [...hardened.lost] },
+          ),
+        );
+      }
+      return riskOk(Object.freeze(hardened.value as RiskPolicy));
     },
     (thrown) =>
       riskFailure(

@@ -8,7 +8,7 @@
  * recoverable condition.
  */
 
-import { describeValue } from "./plain-data.js";
+import { describeValue, ownDataDetails } from "./plain-data.js";
 import type { RiskReasonCode } from "./reasons.js";
 
 export type RiskRefusalDetails = Readonly<Record<string, unknown>>;
@@ -21,12 +21,22 @@ export interface RiskRefusal {
   readonly details: RiskRefusalDetails;
 }
 
+/**
+ * Builds a refusal.
+ *
+ * TOTAL FOR ANY `details` (review round 6, BLOCKER 3). It used to be
+ * `Object.freeze({ ...details })`, and a spread of a caller-supplied object runs
+ * that object's `ownKeys` and descriptor traps and invokes its getters — so the
+ * reviewer's `riskRefusal(code, message, proxyDetails)` THREW. See
+ * {@link ownDataDetails}: the evidence is copied as own data, and what cannot be
+ * copied is COUNTED rather than dropped in silence.
+ */
 export function riskRefusal(
   code: RiskReasonCode,
   message: string,
   details: RiskRefusalDetails = {},
 ): RiskRefusal {
-  return Object.freeze({ code, message, details: Object.freeze({ ...details }) });
+  return Object.freeze({ code, message, details: ownDataDetails(details) });
 }
 
 /** A successful result, or the refusals that prevented it. */

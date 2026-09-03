@@ -40,10 +40,10 @@ import {
 } from "@polymarket-bot/domain";
 
 import { FreshnessObservationSchema } from "./freshness.js";
-import { uuidShapedNotCanonical } from "./guards.js";
-import { readPlainData } from "./plain-data.js";
+import { ownProperty, uuidShapedNotCanonical } from "./guards.js";
+import { hardenParsed, readPlainData } from "./plain-data.js";
 import { SCENARIO_KINDS } from "./policy.js";
-import { riskRefusal, type RiskRefusal } from "./result.js";
+import { contained, riskRefusal, type RiskRefusal } from "./result.js";
 
 /** Scope attribution for the §9.7 exposure dimensions (from the universe layer). */
 export const ScopeAttributionSchema = z.strictObject({
@@ -291,10 +291,25 @@ function internalIdentityFields(
   data: RiskEvaluationInput,
 ): readonly { readonly field: string; readonly value: unknown }[] {
   const intent: Intent = data.intent;
+  const ownIntentId = ownProperty(intent, "intentId");
+  // `Object.hasOwn`, NOT `"intentId" in intent` (review round 6, BLOCKER 2).
+  // `in` answers for an INHERITED name, and both directions were wrong:
+  //
+  // - an inherited NON-CANONICAL UUID made an otherwise valid CANCEL — which
+  //   carries no `intentId` at all — refuse with `RISK_UUID_NOT_CANONICAL`.
+  //   That is the CANCEL TRAP §6 invariant 13 exists to prevent, arriving
+  //   through the one door a cancel cannot bypass;
+  // - an inherited THROWING getter turned this function, and with it
+  //   `validateEvaluationInput`, into a throw.
+  //
+  // An identifier this repository generated is a field the intent OWNS. (The
+  // input tree is prototype-free since round 6, so this can no longer be
+  // reached through the door either; the own test is the site's own guarantee,
+  // not a second copy of that one.)
   return [
     { field: "identifiers.approvedIntentId", value: data.identifiers.approvedIntentId },
     { field: "context.strategyInstanceId", value: data.context.strategyInstanceId },
-    ...("intentId" in intent ? [{ field: "intent.intentId", value: intent.intentId }] : []),
+    ...(ownIntentId.present ? [{ field: "intent.intentId", value: ownIntentId.value }] : []),
     ...data.guards.recentIntentIds.map((value, index) => ({
       field: `guards.recentIntentIds[${index}]`,
       value,
@@ -379,8 +394,33 @@ export type RiskInputValidation =
  * refused as `RISK_INPUT_INVALID` instead of escaping as a `TypeError`. Ordering
  * matters here as much as at the choke point: the read is a well-formedness
  * check, so it belongs in this function, ahead of everything.
+ *
+ * THIS FUNCTION DOES NOT THROW (review round 6, BLOCKER 3, non-negotiable).
+ * Round 5 wrapped `evaluateIntent` but not this function, and the reviewer's
+ * inherited THROWING getter proved the difference: `evaluateIntent` answered
+ * `RISK_INPUT_INVALID` while `validateEvaluationInput` — which returns a typed
+ * validation union and is exported for a caller to use directly — threw. The
+ * site is fixed (`internalIdentityFields` tests own-ness), and the function now
+ * also runs inside the containment guard, because a door that answers with an
+ * exception has no defined behaviour for the caller standing in it.
  */
 export function validateEvaluationInput(input: unknown): RiskInputValidation {
+  return contained(
+    () => validateEvaluationInputInner(input),
+    (thrown) => ({
+      ok: false,
+      refusals: [
+        riskRefusal(
+          "RISK_INPUT_INVALID",
+          "validating the evaluation input failed unexpectedly; an input that cannot be validated is not a validated input (fail closed)",
+          { thrown },
+        ),
+      ],
+    }),
+  );
+}
+
+function validateEvaluationInputInner(input: unknown): RiskInputValidation {
   const read = readPlainData(input, "input");
   if (!read.ok) {
     return {
@@ -405,7 +445,36 @@ export function validateEvaluationInput(input: unknown): RiskInputValidation {
       ],
     };
   }
-  const refusals = identityRefusals(internalIdentityFields(parsed.data));
+  // THE PARSE OUTPUT IS RE-HARDENED (review round 6). The input tree handed to
+  // the schema is prototype-free, but `zod` builds its RESULT with `{}` — so
+  // every later read of an ABSENT OPTIONAL field of the validated input
+  // (`context.venueEligibility`, `market.bookSynchronized`, `exposures`,
+  // `allocation`, `scope.seriesKey`) would have been answered by whatever sits
+  // on `Object.prototype`, and §9.8 checks would have passed on facts nobody
+  // supplied. Measured: `z.strictObject({b: z.string().optional()})` parsing
+  // `{a:"x"}` with an inherited `b` returns `{a:"x", b:"inherited"}` — the
+  // validator ADOPTS it. `ownDataTree` gives the pipeline the same data with no
+  // prototype, so absence stays absence for every read downstream, whatever
+  // syntax that read uses. `hardenParsed` also refuses a parse output that is
+  // SMALLER than what was read: an inherited get-only accessor makes `zod`'s
+  // own assignment fail, so a field can vanish from the output while the parse
+  // still reports success, and an evaluation on a quietly truncated input is
+  // exactly the "unknown read as absent" failure this round is about.
+  const hardened = hardenParsed(read.value, parsed.data, "input");
+  if (!hardened.ok) {
+    return {
+      ok: false,
+      refusals: [
+        riskRefusal(
+          "RISK_INPUT_INVALID",
+          "the validated input lost fields between validation and use, so what would be evaluated is not what was supplied (fail closed)",
+          { lost: [...hardened.lost] },
+        ),
+      ],
+    };
+  }
+  const data = hardened.value as RiskEvaluationInput;
+  const refusals = identityRefusals(internalIdentityFields(data));
   if (refusals.length > 0) return { ok: false, refusals };
-  return { ok: true, data: parsed.data };
+  return { ok: true, data };
 }

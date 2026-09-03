@@ -121,7 +121,18 @@ function stringsIn(value: unknown, path = ""): { path: string; value: string }[]
   return found;
 }
 
-/** Every way `value` fails to be a plain, own-data, deeply frozen record. */
+/**
+ * Every way `value` fails to be a plain, own-data, deeply frozen record.
+ *
+ * STRENGTHENED IN REVIEW ROUND 6, not relaxed. An emitted record's objects must
+ * now have NO PROTOTYPE AT ALL, where this oracle previously required exactly
+ * `Object.prototype`. The reason is the round-6 finding that `Object.prototype`
+ * is reachable state: a record that inherits from it answers for names nobody
+ * put in it, and `zod` will even ADOPT such a name into a parse output. `null`
+ * is strictly less state than `Object.prototype`, so every record that passes
+ * this oracle now would have passed it before; the converse is false, which is
+ * what makes this a stronger assertion rather than an accommodation.
+ */
 function notPlainOwnFrozenData(value: unknown, path = "record"): string[] {
   const findings: string[] = [];
   const visit = (node: unknown, at: string, ancestors: Set<unknown>): void => {
@@ -129,7 +140,7 @@ function notPlainOwnFrozenData(value: unknown, path = "record"): string[] {
     ancestors.add(node);
     const isArray = Array.isArray(node);
     const prototype: unknown = Object.getPrototypeOf(node);
-    if (prototype !== (isArray ? Array.prototype : Object.prototype)) {
+    if (prototype !== (isArray ? Array.prototype : null)) {
       findings.push(`${at}: non-plain prototype`);
     }
     if (!Object.isFrozen(node)) findings.push(`${at}: not frozen`);
@@ -2181,7 +2192,9 @@ describe("a hostile value at the boundary — review round 5", () => {
     if (!resized.ok) return;
 
     const emitted = resized.value as unknown as Record<string, unknown>;
-    expect(Object.getPrototypeOf(emitted)).toBe(Object.prototype);
+    // `null`, not `Object.prototype` (review round 6): an emitted record now
+    // inherits nothing at all. See {@link notPlainOwnFrozenData}.
+    expect(Object.getPrototypeOf(emitted)).toBe(null);
     expect(Object.hasOwn(emitted, "__proto__")).toBe(false);
     expect(notPlainOwnFrozenData(emitted)).toEqual([]);
 

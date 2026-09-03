@@ -50,6 +50,20 @@ export function ownEntry<T>(
 }
 
 /**
+ * True when `flags` OWNS `key` and its value is exactly `true`.
+ *
+ * For a frozen lookup table of booleans (`RUN_MODE_PLACES_REAL_ORDERS`). The
+ * key is validated caller data, so `flags[key]` would consult the prototype for
+ * any spelling the table does not own — review round 6's census flagged both
+ * call sites, and a fence over real-order run modes is the last place to answer
+ * from anywhere but the table itself.
+ */
+export function ownFlag(flags: object, key: string): boolean {
+  if (!Object.hasOwn(flags, key)) return false;
+  return (flags as Record<string, unknown>)[key] === true;
+}
+
+/**
  * Creates or replaces an OWN, enumerable DATA property on a table being built.
  *
  * NEVER `table[key] = value`, where `key` comes from caller data. Assignment is
@@ -99,7 +113,12 @@ function freezeRecursive(value: unknown, visited: WeakSet<object>): void {
   visited.add(value);
   for (const key of Reflect.ownKeys(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !("value" in descriptor)) continue;
+    // `Object.hasOwn`, not `"value" in descriptor` (review round 6). A
+    // descriptor object inherits from `Object.prototype`, so `in` answers for an
+    // inherited `value` too: with `Object.prototype.value` defined, an ACCESSOR
+    // would have been treated as a data property and `descriptor.value` —
+    // `undefined` — recursed into. Mirrors `packages/risk/src/guards.ts`.
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) continue;
     freezeRecursive(descriptor.value, visited);
   }
   Object.freeze(value);

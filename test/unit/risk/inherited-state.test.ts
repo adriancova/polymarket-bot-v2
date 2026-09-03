@@ -1,0 +1,872 @@
+/**
+ * THE MECHANISM, PART 2 — an inherited property changes no answer.
+ *
+ * WHY A BEHAVIOURAL MECHANISM AS WELL AS THE SYNTACTIC ONE
+ * (`prototype-access.test.ts`). Review round 6's first BLOCKER had two probes,
+ * and the second is the one that generalizes: augmenting `Object.prototype`
+ * with a single non-enumerable property — a market's UUID — flipped a
+ * reservation that a LIBRARY-CREATED state had correctly refused
+ * (`CAPITAL_LIVE_OWNERSHIP_MISSING`) into `permitted=true, no refusals`. No
+ * hostile input was involved. A syntactic rule over computed reads would not
+ * have caught the two other members of the same class this suite found:
+ *
+ * - `zod` ADOPTS an inherited optional field into its parse output, so an
+ *   absent `venueEligibility` arrived as `"ELIGIBLE"` — measured, see below;
+ * - the live-micro fence read `caps[field]` as "absent, therefore fine" while
+ *   the enforcement site read the SAME inherited value as the cap, which is a
+ *   weakening of an `AGENTS.md` non-weakenable floor by prototype augmentation
+ *   alone.
+ *
+ * So this test does not look for sites. For every public door of both packages
+ * it takes the answer, then re-takes it with `Object.prototype` carrying one
+ * extra property — drawn MECHANICALLY from the names and strings that door's
+ * own inputs contain, plus the composite keys these packages build — in four
+ * shapes: a data string, a data object, a two-answer getter and a throwing
+ * getter.
+ *
+ * THE PROPERTY IT ENFORCES, STATED EXACTLY. An inherited property may cost
+ * AVAILABILITY; it may never buy PERMISSION, and it may never silently change
+ * data:
+ *
+ * - an answer carrying a permission bit must be IDENTICAL, or must have become
+ *   a typed REFUSAL (a refusal may also change its reason);
+ * - an answer carrying no permission bit — an exposure snapshot — must be
+ *   identical, full stop;
+ * - nothing may throw;
+ * - for a door that runs NO schema, no inherited getter may be invoked at all.
+ *   For a door that runs one, `zod`'s own compiled parser reads declared field
+ *   names off objects IT creates, which this package cannot prevent; that
+ *   measurement, and why it is not a hole, is recorded on {@link Scenario}.
+ *
+ * SCOPE, STATED. The sweep proves the property for the scenarios it runs, which
+ * are the public doors with their fully-passing fixtures and their principal
+ * refusal arms. It is not a proof for a path no scenario reaches. Array-index
+ * names are excluded, with the measured reason at {@link ARRAY_INDEX}. The
+ * intrinsics assumption is unchanged and is NOT what this tests: adding a
+ * property to `Object.prototype` does not replace `Object`, `Reflect`,
+ * `Array.prototype` or `util.types`, and review round 6 ruled that augmentation
+ * in scope.
+ */
+
+import { describe, expect, it } from "vitest";
+
+import {
+  createAllocatorState,
+  evaluateReservation,
+  applyReservation,
+  exposureSnapshotCovering,
+  liveMicroCapRefusals,
+  nonFloorLiveMicroCapFields,
+  parseAllocatorCaps,
+  releaseReservation,
+  withLiveOwner,
+  type AllocatorCaps,
+  type AllocatorState,
+} from "../../../packages/capital-allocator/src/index.js";
+import { deepFreeze as allocatorDeepFreeze } from "../../../packages/capital-allocator/src/guards.js";
+import { deepFreeze as riskDeepFreeze } from "../../../packages/risk/src/guards.js";
+import {
+  evaluateIntent,
+  parseRiskPolicy,
+  resizeApprovedIntent,
+  validateEvaluationInput,
+} from "../../../packages/risk/src/index.js";
+import {
+  cancelIntent,
+  codesOf,
+  entryInput,
+  exitInput,
+  EVALUATED_AT,
+  FIXTURE_MEASURING,
+  INSTANCE,
+  MARKET_A,
+  MARKET_B,
+  exposureEntry,
+  exposureSnapshot as exposureSnapshotFixture,
+  riskPolicy,
+} from "./fixtures.js";
+
+// ---------------------------------------------------------------------------
+// the pollution harness
+// ---------------------------------------------------------------------------
+
+/**
+ * How one extra property is put on `Object.prototype`.
+ *
+ * All four are NON-ENUMERABLE and CONFIGURABLE, which is the reviewer's probe
+ * shape: an enumerable one would break every `for…in` in the process and prove
+ * nothing about this package. The two getters are the reviewer's exactly — one
+ * that answers differently on a second read (the round-6 inventory probe) and
+ * one that throws.
+ */
+type PollutionMode = "data-string" | "data-entry" | "two-answer-getter" | "throwing-getter";
+
+const POLLUTION_MODES: readonly PollutionMode[] = [
+  "data-string",
+  "data-entry",
+  "two-answer-getter",
+  "throwing-getter",
+];
+
+const POISON_ENTRY = Object.freeze({
+  openOrderCommitted: "1000",
+  positionCommitted: "1000",
+  combined: "1000",
+  // enough of an allocator verdict / owner / scope to be mistaken for one
+  permitted: true,
+  refusals: [],
+  seriesKey: "poison",
+  underlyingKey: "poison",
+  resolutionWindowKey: "poison",
+});
+
+interface PollutionResult {
+  readonly answer: string;
+  readonly grade: "permissive" | "refusal" | "opaque";
+  readonly getterCalls: number;
+  readonly threw: string | undefined;
+}
+
+function withPollution(key: string, mode: PollutionMode, body: () => unknown): PollutionResult {
+  let calls = 0;
+  const descriptor: PropertyDescriptor =
+    mode === "data-string"
+      ? { value: "1000", writable: true, enumerable: false, configurable: true }
+      : mode === "data-entry"
+        ? { value: POISON_ENTRY, writable: true, enumerable: false, configurable: true }
+        : mode === "two-answer-getter"
+          ? {
+              get(): unknown {
+                calls += 1;
+                return calls === 1 ? "1000" : "0";
+              },
+              enumerable: false,
+              configurable: true,
+            }
+          : {
+              get(): never {
+                calls += 1;
+                throw new Error("inherited-getter");
+              },
+              enumerable: false,
+              configurable: true,
+            };
+  Object.defineProperty(Object.prototype, key, descriptor);
+  try {
+    const answer = body();
+    return {
+      answer: describe_(answer),
+      grade: permissiveness(answer),
+      getterCalls: calls,
+      threw: undefined,
+    };
+  } catch (error) {
+    return {
+      answer: "THREW",
+      grade: "opaque",
+      getterCalls: calls,
+      threw: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    delete (Object.prototype as Record<string, unknown>)[key];
+  }
+}
+
+/** A stable, order-sensitive rendering of an answer. */
+function describe_(value: unknown): string {
+  return JSON.stringify(value) ?? "undefined";
+}
+
+/**
+ * The candidate keys for one scenario, derived from its own inputs.
+ *
+ * Every own property NAME and every STRING VALUE in the input tree, plus the
+ * composite keys these packages build (`instance|market|side`) and the names
+ * the packages use internally. Names already present on `Object.prototype` or
+ * `Array.prototype` are excluded: this sweep ADDS a property, it does not
+ * replace an intrinsic member, which is a different threat model and the one
+ * both packages explicitly do not answer.
+ */
+function candidateKeys(material: unknown, extra: readonly string[] = []): string[] {
+  const found = new Set<string>();
+  const harvest = (value: unknown, depth: number): void => {
+    if (depth > 8 || value === null || value === undefined) return;
+    if (typeof value === "string") {
+      found.add(value);
+      return;
+    }
+    if (typeof value !== "object") return;
+    for (const [key, member] of Object.entries(value)) {
+      found.add(key);
+      harvest(member, depth + 1);
+    }
+  };
+  harvest(material, 0);
+  for (const key of extra) found.add(key);
+  return [...found].filter(
+    (key) =>
+      key.length > 0 &&
+      key.length < 90 &&
+      !ARRAY_INDEX.test(key) &&
+      !Object.hasOwn(Object.prototype, key) &&
+      !Object.hasOwn(Array.prototype, key),
+  );
+}
+
+/**
+ * An array-index NAME, excluded from the sweep — with the reason measured
+ * rather than assumed.
+ *
+ * A property named `"0"` on `Object.prototype` is not a fact about these
+ * packages; it is a fact about ARRAY INDEXING everywhere in the process, and
+ * two measurements make that concrete:
+ *
+ * - as a GET-ONLY accessor it makes `Array.prototype.push` THROW on any empty
+ *   array (`Cannot set property 0 of #<Object> which has only a getter`) —
+ *   including inside the test runner and inside `decimal.js`;
+ * - as a data property it is read by `decimal.js`'s own internals, which
+ *   changed an arithmetic result and therefore a refusal CODE, with no code in
+ *   either of these packages involved.
+ *
+ * Neither package reads an array element by computed key in product code (the
+ * round-6 census confirms: zero numeric `element-read` sites outside the test
+ * files), so the exclusion removes noise about third-party array machinery
+ * without hiding a site of ours. It is recorded as a residual in
+ * `docs/handoffs/WP-180.md`.
+ */
+const ARRAY_INDEX = /^(?:0|[1-9][0-9]*)$/u;
+
+const INTERNAL_NAMES: readonly string[] = [
+  "GLOBAL",
+  "value",
+  "combined",
+  "openOrderCommitted",
+  "positionCommitted",
+  "liveMicroMaxOrderNotional",
+  "liveMicroMaxAccountExposure",
+  "globalAccountCap",
+  "perStrategyCap",
+  "perMarketCap",
+  "perSeriesCap",
+  "perUnderlyingCap",
+  "perResolutionWindowCap",
+  "permitted",
+  "refusals",
+  "scope",
+  "seriesKey",
+  "underlyingKey",
+  "resolutionWindowKey",
+  "intentId",
+  "venueEligibility",
+  "bookSynchronized",
+  "exposures",
+  "allocation",
+  "byMarket",
+  "bySeries",
+  "byUnderlying",
+  "byResolutionWindow",
+  "byStrategyInstance",
+  "global",
+  "reason",
+  "sourceIntentId",
+  `${INSTANCE}|${MARKET_A}|YES`,
+  `${INSTANCE}|${MARKET_A}|NO`,
+  `${INSTANCE}|${MARKET_B}|YES`,
+];
+
+interface Scenario {
+  readonly name: string;
+  /**
+   * The answer under test. Must be deterministic, and must do NOTHING but call
+   * the subject: every input is built at module scope, OUTSIDE the polluted
+   * window, so that what is measured is the product's behaviour and not the
+   * fixture builders' (they read optional fields off ordinary objects, as test
+   * builders may).
+   */
+  readonly answer: () => unknown;
+  /** The value whose names and strings the sweep draws its keys from. */
+  readonly material: unknown;
+  /**
+   * Whether the door runs a `zod` schema.
+   *
+   * MEASURED, NOT ASSUMED (review round 6). `zod`'s compiled object parser
+   * reads its declared field names back off objects IT creates with `{}`, so an
+   * inherited getter named like a schema field IS invoked inside `safeParse` —
+   * stack captured, `zod/v4/core/schemas.js` → the compiled parser, with the
+   * input this package handed it being prototype-free. That is not reachable
+   * from this package without dropping `zod`, so for parsing doors the sweep
+   * asserts the ANSWER property (which contains a throwing getter as a
+   * refusal), and for NON-parsing doors — pure computation, where every read is
+   * ours — it additionally requires ZERO invocations. The reviewer's own site
+   * probes below assert zero at the sites the BLOCKER named.
+   */
+  readonly parses: boolean;
+}
+
+/**
+ * How permissive an answer is, for the one divergence this sweep tolerates.
+ *
+ * THE PROPERTY THIS SWEEP ENFORCES: prototype augmentation may cost
+ * AVAILABILITY, never PERMISSION, and never silently alters data. An answer
+ * that is identical passes; an answer that turned from permitted into a typed
+ * REFUSAL passes (that is fail-closed, and is what an inherited get-only
+ * accessor can cause — it makes `zod`'s own output assembly drop a field, since
+ * an assignment finds the inherited accessor and cannot write); anything else
+ * fails, including any change to an answer that carries no permission bit at
+ * all.
+ */
+function permissiveness(answer: unknown): "permissive" | "refusal" | "opaque" {
+  if (answer === null || typeof answer !== "object") return "opaque";
+  const record = answer as Record<string, unknown>;
+  for (const flag of ["approved", "permitted", "ok"]) {
+    if (Object.hasOwn(record, flag)) return record[flag] === true ? "permissive" : "refusal";
+  }
+  return "opaque";
+}
+
+/** Where two renderings first diverge, with a little context on each side. */
+function divergence(baseline: string, polluted: string): string {
+  let index = 0;
+  while (index < baseline.length && index < polluted.length && baseline[index] === polluted[index]) {
+    index += 1;
+  }
+  const from = Math.max(0, index - 40);
+  return `at ${String(index)}: …${baseline.slice(from, index + 60)} → …${polluted.slice(from, index + 60)}`;
+}
+
+function sweep(scenario: Scenario): string[] {
+  const baselineAnswer = scenario.answer();
+  const baseline = describe_(baselineAnswer);
+  const baselineGrade = permissiveness(baselineAnswer);
+  const failures: string[] = [];
+  for (const key of candidateKeys(scenario.material, INTERNAL_NAMES)) {
+    for (const mode of POLLUTION_MODES) {
+      const result = withPollution(key, mode, scenario.answer);
+      if (result.threw !== undefined) {
+        failures.push(`${scenario.name} | ${mode} on "${key}" | THREW ${result.threw}`);
+        continue;
+      }
+      if (result.answer !== baseline) {
+        // The one tolerated divergence: an answer that carries a permission bit
+        // may become a REFUSAL (a refusal may also change its reason). It may
+        // never become permissive, never stay permissive with different
+        // content, and an answer with no permission bit at all — a snapshot —
+        // may not change in any way.
+        const tolerated = baselineGrade !== "opaque" && result.grade === "refusal";
+        if (!tolerated) {
+          failures.push(
+            `${scenario.name} | ${mode} on "${key}" | ANSWER CHANGED (${baselineGrade} → ${result.grade}) ${divergence(baseline, result.answer)}`,
+          );
+        }
+        continue;
+      }
+      if (result.getterCalls > 0 && !scenario.parses) {
+        failures.push(
+          `${scenario.name} | ${mode} on "${key}" | an inherited getter was INVOKED ${String(result.getterCalls)}× and the answer did not change`,
+        );
+      }
+    }
+  }
+  return failures;
+}
+
+// ---------------------------------------------------------------------------
+// the scenarios: every public door, with its inputs
+// ---------------------------------------------------------------------------
+
+const CAPS_INPUT = { globalAccountCap: "1000", perStrategyCap: "1000" };
+
+function caps(overrides: Record<string, unknown> = {}): AllocatorCaps {
+  const parsed = parseAllocatorCaps({ ...CAPS_INPUT, ...overrides });
+  if (!parsed.ok) throw new Error(JSON.stringify(parsed.refusals));
+  return parsed.value;
+}
+
+const STATE_INPUT = {
+  accountEquity: "1000",
+  availableCollateral: "1000",
+  positions: [
+    {
+      positionId: "p-1",
+      marketId: MARKET_A,
+      strategyInstanceId: INSTANCE,
+      side: "YES",
+      shares: "100",
+      costBasis: "40",
+      scope: { seriesKey: "btc-15m", underlyingKey: "BTC", resolutionWindowKey: "w1" },
+    },
+  ],
+  openOrders: [],
+  liveOwners: [{ marketId: MARKET_A, strategyInstanceId: INSTANCE }],
+};
+
+const UNOWNED_STATE_INPUT = { ...STATE_INPUT, liveOwners: [] };
+
+function state(input: unknown = STATE_INPUT): AllocatorState {
+  const created = createAllocatorState(input);
+  if (!created.ok) throw new Error(JSON.stringify(created.refusals));
+  return created.value;
+}
+
+const BUY_REQUEST = {
+  reservationId: "res-1",
+  strategyInstanceId: INSTANCE,
+  runMode: "PAPER",
+  accountingMode: "LIVE",
+  marketId: MARKET_A,
+  side: "YES",
+  action: "BUY",
+  price: "0.5",
+  shares: "100",
+  scope: { seriesKey: "btc-15m", underlyingKey: "BTC", resolutionWindowKey: "w1" },
+};
+
+const SELL_REQUEST = {
+  ...BUY_REQUEST,
+  reservationId: "res-2",
+  action: "SELL",
+  shares: "10",
+};
+
+const POLICY_INPUT = {
+  freshness: { venueBookMaxAgeMs: 1000, referenceFeedMaxAgeMs: 2000, featuresMaxAgeMs: 2000 },
+  limits: { maxWorstCaseContractualLoss: "10000" },
+  scenario: { maxScenarioLoss: "10000" },
+  economics: {},
+  participation: {},
+  rateLimit: { safetyReserveRequests: 5 },
+  timeToClose: { entryCutoffSeconds: 60 },
+};
+
+/** An entry whose §9.8 check 15 path is fully exercised: caps AND a snapshot. */
+function exposureInput(): ReturnType<typeof entryInput> {
+  const input = entryInput();
+  input.exposures = exposureSnapshotFixture({
+    byMarket: { [MARKET_A]: exposureEntry("10", "10") },
+    measuring: FIXTURE_MEASURING,
+  });
+  return input;
+}
+
+const EXPOSURE_POLICY = riskPolicy({
+  limits: {
+    maxWorstCaseContractualLoss: "10000",
+    globalExposureCap: "10000",
+    perInstanceExposureCap: "10000",
+    perMarketExposureCap: "10000",
+    perSeriesExposureCap: "10000",
+    perUnderlyingExposureCap: "10000",
+    perResolutionWindowExposureCap: "10000",
+  },
+});
+
+function approvedRecord(): Record<string, unknown> {
+  const evaluation = evaluateIntent(riskPolicy(), entryInput());
+  if (!evaluation.approved) throw new Error(JSON.stringify(codesOf(evaluation)));
+  return structuredClone(evaluation.record) as unknown as Record<string, unknown>;
+}
+
+const RESIZE_REQUEST = {
+  approvedIntentId: "approved-2",
+  resizedAt: EVALUATED_AT,
+  newTargetShares: "50",
+  reason: "risk reduction",
+};
+
+// Every input is built HERE, at module scope, outside any polluted window.
+const POLICY = riskPolicy();
+const ENTRY = entryInput();
+const EXIT = exitInput();
+const CANCEL = (() => {
+  const input = entryInput();
+  input.intent = cancelIntent();
+  return input;
+})();
+const EXPOSURE_ENTRY_INPUT = exposureInput();
+const NO_SNAPSHOT_INPUT = (() => {
+  const input = entryInput();
+  delete input.exposures;
+  return input;
+})();
+const CAPS = caps();
+const OWNED_STATE = state();
+const UNOWNED_STATE = state(UNOWNED_STATE_INPUT);
+const FLAT_STATE = state({ ...STATE_INPUT, positions: [] });
+const APPLIED = applyReservation(OWNED_STATE, CAPS, BUY_REQUEST);
+const APPLIED_STATE = APPLIED.ok ? APPLIED.value.state : OWNED_STATE;
+const RECORD = approvedRecord();
+const COVERAGE = {
+  strategyInstanceIds: [INSTANCE],
+  marketIds: [MARKET_A, MARKET_B],
+  seriesKeys: ["btc-15m"],
+  underlyingKeys: ["BTC"],
+  resolutionWindowKeys: ["w1"],
+};
+const SELL_NO_SIDE = { ...SELL_REQUEST, side: "NO" };
+
+const SCENARIOS: readonly Scenario[] = [
+  {
+    name: "evaluateIntent — a fully passing ENTRY",
+    answer: () => evaluateIntent(POLICY, ENTRY),
+    material: ENTRY,
+    parses: true,
+  },
+  {
+    name: "evaluateIntent — a fully passing EXIT",
+    answer: () => evaluateIntent(POLICY, EXIT),
+    material: EXIT,
+    parses: true,
+  },
+  {
+    name: "evaluateIntent — a CANCEL (§6 invariant 13)",
+    answer: () => evaluateIntent(POLICY, CANCEL),
+    material: CANCEL,
+    parses: true,
+  },
+  {
+    name: "evaluateIntent — every exposure limit configured and measured",
+    answer: () => evaluateIntent(EXPOSURE_POLICY, EXPOSURE_ENTRY_INPUT),
+    material: EXPOSURE_ENTRY_INPUT,
+    parses: true,
+  },
+  {
+    name: "evaluateIntent — an entry with NO exposure snapshot (fail closed)",
+    answer: () => evaluateIntent(EXPOSURE_POLICY, NO_SNAPSHOT_INPUT),
+    material: NO_SNAPSHOT_INPUT,
+    parses: true,
+  },
+  {
+    name: "validateEvaluationInput — the door",
+    answer: () => validateEvaluationInput(ENTRY),
+    material: ENTRY,
+    parses: true,
+  },
+  {
+    name: "parseRiskPolicy",
+    answer: () => parseRiskPolicy(POLICY_INPUT),
+    material: POLICY_INPUT,
+    parses: true,
+  },
+  {
+    name: "resizeApprovedIntent",
+    answer: () => resizeApprovedIntent(RECORD as never, RESIZE_REQUEST),
+    material: { record: RECORD, request: RESIZE_REQUEST },
+    parses: true,
+  },
+  {
+    name: "parseAllocatorCaps",
+    answer: () => parseAllocatorCaps(CAPS_INPUT),
+    material: CAPS_INPUT,
+    parses: true,
+  },
+  {
+    name: "createAllocatorState",
+    answer: () => createAllocatorState(STATE_INPUT),
+    material: STATE_INPUT,
+    parses: true,
+  },
+  {
+    name: "evaluateReservation — a LIVE BUY that is permitted",
+    answer: () => evaluateReservation(OWNED_STATE, CAPS, BUY_REQUEST),
+    material: { state: STATE_INPUT, request: BUY_REQUEST },
+    parses: true,
+  },
+  {
+    name: "evaluateReservation — a LIVE SELL against held inventory",
+    answer: () => evaluateReservation(OWNED_STATE, CAPS, SELL_REQUEST),
+    material: { state: STATE_INPUT, request: SELL_REQUEST },
+    parses: true,
+  },
+  {
+    name: "evaluateReservation — NO live owner recorded (the round-6 BLOCKER path)",
+    answer: () => evaluateReservation(UNOWNED_STATE, CAPS, BUY_REQUEST),
+    material: { state: UNOWNED_STATE_INPUT, request: BUY_REQUEST },
+    parses: true,
+  },
+  {
+    name: "evaluateReservation — a SELL with ZERO holdings (the round-6 inventory probe)",
+    answer: () => evaluateReservation(FLAT_STATE, CAPS, SELL_NO_SIDE),
+    material: { state: { ...STATE_INPUT, positions: [] }, request: SELL_NO_SIDE },
+    parses: true,
+  },
+  {
+    name: "applyReservation",
+    answer: () => applyReservation(OWNED_STATE, CAPS, BUY_REQUEST),
+    material: { state: STATE_INPUT, request: BUY_REQUEST },
+    parses: true,
+  },
+  {
+    name: "releaseReservation",
+    answer: () => releaseReservation(APPLIED_STATE, "res-1"),
+    material: { state: STATE_INPUT, request: BUY_REQUEST },
+    parses: false,
+  },
+  {
+    name: "exposureSnapshotCovering",
+    answer: () => exposureSnapshotCovering(OWNED_STATE, COVERAGE),
+    material: { state: STATE_INPUT, coverage: COVERAGE },
+    parses: false,
+  },
+  {
+    name: "withLiveOwner",
+    answer: () => withLiveOwner(UNOWNED_STATE, MARKET_A, INSTANCE),
+    material: { state: UNOWNED_STATE_INPUT, marketId: MARKET_A, instance: INSTANCE },
+    parses: false,
+  },
+  {
+    name: "the live-micro fence (AGENTS.md floors)",
+    answer: () => ({
+      fields: nonFloorLiveMicroCapFields(CAPS),
+      refusals: liveMicroCapRefusals(CAPS),
+    }),
+    material: CAPS_INPUT,
+    parses: false,
+  },
+];
+
+describe("THE MECHANISM: an inherited property changes no public answer", () => {
+  for (const scenario of SCENARIOS) {
+    it(`is unmoved by anything on Object.prototype: ${scenario.name}`, () => {
+      expect(sweep(scenario)).toEqual([]);
+    });
+  }
+
+  it("the sweep is non-vacuous: it really does pollute, and really does compare", () => {
+    // A subject that DOES read through the prototype must be caught — otherwise
+    // every assertion above is a tautology about a harness that does nothing.
+    const naive: Scenario = {
+      name: "a deliberately naive subject",
+      answer: () => {
+        const table: Record<string, string> = { present: "own" };
+        return { read: table["marketId"] ?? "absent" };
+      },
+      material: { marketId: "x" },
+      parses: false,
+    };
+    const failures = sweep(naive);
+    expect(failures.length).toBeGreaterThan(0);
+    expect(failures.join("\n")).toContain("ANSWER CHANGED");
+
+    // …and a subject that READS an inherited value without changing its answer
+    // is caught too, so "no getter ran" is a real assertion and not one the
+    // harness can only make when something else already failed.
+    const quiet: Scenario = {
+      name: "a subject that reads the prototype and discards the answer",
+      answer: () => {
+        const table: Record<string, string> = {};
+        // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+        table["marketId"];
+        return { constant: true };
+      },
+      material: { marketId: "x" },
+      parses: false,
+    };
+    const quietFailures = sweep(quiet);
+    expect(quietFailures.join("\n")).toContain("INVOKED");
+  });
+
+  it("the key material is derived from the inputs, not from a hand-written list", () => {
+    const keys = candidateKeys({ a: { b: "c" }, d: ["e"] }, ["extra"]);
+    expect(keys).toContain("a");
+    expect(keys).toContain("b");
+    expect(keys).toContain("c");
+    expect(keys).toContain("e");
+    expect(keys).toContain("extra");
+    // and it never REPLACES an intrinsic member: the NAMES are dropped (their
+    // values are still harvested as candidate names, which is the point of the
+    // harvest — only the intrinsic spellings are excluded)
+    expect(candidateKeys({ toString: "x", hasOwnProperty: "y" })).toEqual(["x", "y"]);
+    expect(candidateKeys({ a: "b" }, ["toString", "constructor", "length"])).toEqual(["a", "b"]);
+  });
+});
+
+describe("review round 6 — the reviewer's probes, kept", () => {
+  it("REVIEWER'S PROBE (6a): an INHERITED live owner cannot authorize a LIVE reservation", () => {
+    const base = state(UNOWNED_STATE_INPUT);
+    const hostile: AllocatorState = {
+      ...base,
+      liveOwners: Object.create({ [MARKET_A]: INSTANCE }) as Record<string, string>,
+    };
+    expect(Object.hasOwn(hostile.liveOwners, MARKET_A)).toBe(false);
+    // the inherited value really is visible to an ordinary read — non-vacuity
+    expect((hostile.liveOwners as Record<string, string>)[MARKET_A]).toBe(INSTANCE);
+
+    const verdict = evaluateReservation(hostile, caps(), BUY_REQUEST);
+    expect(verdict.permitted).toBe(false);
+    expect(verdict.refusals.map((refusal) => refusal.code)).toContain(
+      "CAPITAL_LIVE_OWNERSHIP_MISSING",
+    );
+  });
+
+  it("REVIEWER'S PROBE (6b): a LIBRARY-CREATED state is not made permissive by Object.prototype", () => {
+    const library = state(UNOWNED_STATE_INPUT);
+    const before = evaluateReservation(library, caps(), BUY_REQUEST);
+    expect(before.permitted).toBe(false);
+
+    const after = withPollution(MARKET_A, "data-string", () =>
+      evaluateReservation(library, caps(), BUY_REQUEST),
+    );
+    expect(after.threw).toBeUndefined();
+    expect(after.answer).toBe(describe_(before));
+    expect(after.answer).toContain("CAPITAL_LIVE_OWNERSHIP_MISSING");
+  });
+
+  it("REVIEWER'S PROBE (6c): an INHERITED two-answer inventory getter cannot fund a SELL", () => {
+    const flat = state({ ...STATE_INPUT, positions: [] });
+    const inventory = `${INSTANCE}|${MARKET_A}|YES`;
+    let calls = 0;
+    Object.defineProperty(Object.prototype, inventory, {
+      configurable: true,
+      enumerable: false,
+      get(): string {
+        calls += 1;
+        return calls === 1 ? "1000" : "0";
+      },
+    });
+    try {
+      const verdict = evaluateReservation(flat, caps(), SELL_REQUEST);
+      expect(calls).toBe(0);
+      expect(verdict.permitted).toBe(false);
+      expect(verdict.refusals.map((refusal) => refusal.code)).toContain(
+        "CAPITAL_INVENTORY_INSUFFICIENT",
+      );
+    } finally {
+        delete (Object.prototype as Record<string, unknown>)[inventory];
+    }
+  });
+
+  it("REVIEWER'S PROBE (6d): a valid CANCEL is not trapped by an INHERITED non-canonical intentId", () => {
+    const input = entryInput();
+    input.intent = cancelIntent();
+    const clean = evaluateIntent(riskPolicy(), input);
+    expect(clean.approved).toBe(true);
+
+    Object.defineProperty(Object.prototype, "intentId", {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value: "01890000-0000-7000-8000-00000000000A",
+    });
+    try {
+      const polluted = evaluateIntent(riskPolicy(), input);
+      expect(codesOf(polluted)).toEqual([]);
+      expect(polluted.approved).toBe(true);
+    } finally {
+        delete (Object.prototype as Record<string, unknown>)["intentId"];
+    }
+  });
+
+  it("REVIEWER'S PROBE (6e): an INHERITED THROWING intentId getter does not escape the door", () => {
+    const input = entryInput();
+    input.intent = cancelIntent();
+    let calls = 0;
+    Object.defineProperty(Object.prototype, "intentId", {
+      configurable: true,
+      enumerable: false,
+      get(): never {
+        calls += 1;
+        throw new Error("prototype-intent-getter");
+      },
+    });
+    try {
+      const validated = validateEvaluationInput(input);
+      const evaluation = evaluateIntent(riskPolicy(), input);
+      expect(calls).toBe(0);
+      expect(validated.ok).toBe(true);
+      expect(evaluation.approved).toBe(true);
+    } finally {
+        delete (Object.prototype as Record<string, unknown>)["intentId"];
+    }
+  });
+
+  it("an INHERITED optional field is not ADOPTED by the parse (the measured `zod` behaviour)", () => {
+    // `venueEligibility` is absent from the fixture and consulted only when the
+    // run mode places real orders; the parse must not invent one, and the
+    // engine must not see one.
+    const input = entryInput();
+    const clean = validateEvaluationInput(input);
+    expect(clean.ok).toBe(true);
+    if (!clean.ok) return;
+    expect(Object.hasOwn(clean.data.context, "venueEligibility")).toBe(false);
+
+    Object.defineProperty(Object.prototype, "venueEligibility", {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value: "ELIGIBLE",
+    });
+    try {
+      const polluted = validateEvaluationInput(input);
+      expect(polluted.ok).toBe(true);
+      if (!polluted.ok) return;
+      expect(Object.hasOwn(polluted.data.context, "venueEligibility")).toBe(false);
+      expect(polluted.data.context.venueEligibility).toBeUndefined();
+    } finally {
+        delete (Object.prototype as Record<string, unknown>)["venueEligibility"];
+    }
+  });
+
+  it("an INHERITED live-micro cap cannot raise an AGENTS.md floor", () => {
+    // Found by this mechanism, not by the reviewer: the fence read an absent
+    // field as "fine" while `reserve.ts` read the inherited value as the cap.
+    const handBuilt = Object.create({ liveMicroMaxOrderNotional: "1000" }) as Record<
+      string,
+      unknown
+    >;
+    handBuilt["globalAccountCap"] = "1000";
+    handBuilt["perStrategyCap"] = "1000";
+    handBuilt["liveMicroMaxAccountExposure"] = "0";
+
+    expect(nonFloorLiveMicroCapFields(handBuilt)).toContain("liveMicroMaxOrderNotional");
+    const refusals = liveMicroCapRefusals(handBuilt);
+    expect(refusals.map((refusal) => refusal.code)).toContain(
+      "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED",
+    );
+
+    // …and the reservation gate refuses on it, for every run mode.
+    const verdict = evaluateReservation(state(), handBuilt as never, BUY_REQUEST);
+    expect(verdict.permitted).toBe(false);
+    expect(verdict.refusals.map((refusal) => refusal.code)).toContain(
+      "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED",
+    );
+  });
+});
+
+describe("deepFreeze reads descriptors, in both copies (review round 6, LOW A)", () => {
+  /**
+   * The round-5 mutation M-R5l — `deepFreeze` back to property reads — was
+   * reported as surviving. Review round 6 showed it is distinguishable after
+   * all: a freeze walk that READS properties invokes an accessor, and a walk
+   * that reads DESCRIPTORS does not. This is that observation, for each copy.
+   */
+  for (const [name, deepFreeze] of [
+    ["packages/risk", riskDeepFreeze],
+    ["packages/capital-allocator", allocatorDeepFreeze],
+  ] as const) {
+    it(`${name}: freezing an accessor-bearing object invokes NO getter`, () => {
+      let calls = 0;
+      const nested = { inner: {} };
+      const subject = {
+        plain: nested,
+        get computed(): string {
+          calls += 1;
+          return "never-read";
+        },
+      };
+
+      const frozen = deepFreeze(subject);
+
+      expect(calls).toBe(0);
+      expect(frozen).toBe(subject);
+      expect(Object.isFrozen(subject)).toBe(true);
+      // the DATA members are still reached and frozen at depth — the walk did
+      // not simply stop when it met the accessor
+      expect(Object.isFrozen(nested)).toBe(true);
+      expect(Object.isFrozen(nested.inner)).toBe(true);
+      // and the accessor is still an accessor: freezing does not run it
+      const descriptor = Object.getOwnPropertyDescriptor(subject, "computed");
+      expect(descriptor?.get).toBeTypeOf("function");
+      expect(calls).toBe(0);
+    });
+  }
+});
