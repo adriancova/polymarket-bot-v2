@@ -12,8 +12,10 @@
  *
  * So the site list is no longer produced by looking. `prototype-access-scan.ts`
  * asks the TypeScript compiler for every element access, `in`, computed
- * compound assignment, `delete`, spread and `Object.assign` in both packages,
- * and this test requires each one to be either
+ * compound assignment, `delete`, spread, `Object.assign`, DESTRUCTURING,
+ * `for…in`, `Reflect.*`, `Object.entries`/`values`/`keys`,
+ * `Object.getOwnPropertyNames` and `structuredClone` in both packages, and this
+ * test requires each one to be either
  *
  * - an OWN-PROPERTY PRIMITIVE (the body of `ownEntry` / `ownFlag`), or
  * - an EXPLICITLY REGISTERED exception carrying a REASON,
@@ -22,11 +24,17 @@
  * an already-registered one — fails by name. A registration that no longer
  * matches anything fails too, so the table cannot rot into fiction.
  *
- * WHAT THIS DOES NOT COVER, STATED SO IT IS NOT A FIFTH ABSOLUTE:
+ * WHAT THIS DOES NOT COVER, STATED SO IT IS NOT A FIFTH ABSOLUTE. Round 6 named
+ * ONE excluded form (the dotted read). Review round 7 measured the detector and
+ * found four more silent — destructuring, `Reflect.get`, `for…in` and
+ * `structuredClone` — so the primary build mechanism would have accepted any of
+ * them as a future regression without classifying it. Those four are detected
+ * now, and the COMPLETE exclusion list is stated in the `prototype-access-scan
+ * .ts` module header, items 1–7, with the mechanism that covers each instead.
+ * The negative probes at the bottom of this file exercise that list, so it is
+ * checked rather than merely written. Two boundaries of this file itself:
  *
- * - a DOTTED read (`caps.liveMicroMaxOrderNotional`) also consults the
- *   prototype. Every field read in both packages is one, so a syntactic rule
- *   over them would be noise. That class is covered behaviourally instead, by
+ * - a DOTTED read is excluded (item 1) and is covered behaviourally, by
  *   `inherited-state.test.ts`, which augments `Object.prototype` with the names
  *   these packages actually use and requires every public answer to be
  *   unchanged. It is what caught the live-micro caps hole, which no syntactic
@@ -41,6 +49,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ACCESS_KINDS,
   censusOfPrototypeAccess,
   censusOfSourceText,
   scannedFiles,
@@ -75,6 +84,22 @@ const CREATE_DATA_PROPERTY =
 /** A fixture builder's override spread. */
 const FIXTURE_OVERRIDES =
   "a fixture builder's override spread over its own literal; the fixture tree is handed to a public door, which materializes it before anything reads it";
+
+/** `Reflect.ownKeys` / `Object.getOwnPropertyNames` — the safe enumeration. */
+const OWN_ENUMERATION_PRIMITIVE =
+  "own-only and accessor-free: it reports OWN property NAMES and invokes no getter, which is exactly why this review chain prescribes it over `Object.entries`/`for…in`. Enumerated by the census for TOTALITY, not because the site is risky (review round 7)";
+
+/** `Object.entries` over a table this package built itself. */
+const ENTRIES_OF_OUR_TABLE =
+  "`Object.entries` is own-only but INVOKES every own getter, so it may run only on a value this package built. This table is constructed in this module from validated data, with `setOwn`, and never holds an accessor";
+
+/** `Object.entries` over a value a door already materialized. */
+const ENTRIES_OF_MATERIALIZED =
+  "`Object.entries` is own-only but INVOKES every own getter, so it may run only on a value this package materialized. This one is a validated policy's own limits object, which came out of `readPlainData` as prototype-free own data with no accessor anywhere in it";
+
+/** Destructuring a record this module built one expression earlier. */
+const DESTRUCTURE_OF_OUR_RECORD =
+  "destructuring is one `Get` per name — the prototype chain, and any getter — so it may run only on a value this package built. These are the `{ field, value }` records `internalIdentityFields` constructs as object literals in this same module (review round 7)";
 
 interface Registration {
   readonly file: string;
@@ -119,6 +144,56 @@ const REGISTERED: readonly Registration[] = [
     text: "(flags as Record<string, unknown>)[key]",
     count: 1,
     reason: OWN_PRIMITIVE,
+  },
+
+  // --- the own-only enumeration primitives (review round 7) -----------------
+  ...(
+    [
+      { file: "packages/risk/src/guards.ts", enclosing: "freezeRecursive", text: "Reflect.ownKeys(value)" },
+      { file: "packages/risk/src/plain-data.ts", enclosing: "ownStringKeys", text: "Reflect.ownKeys(container)" },
+      { file: "packages/risk/src/plain-data.ts", enclosing: "copyPlainData", text: "Object.getOwnPropertyNames(value)" },
+      { file: "packages/risk/src/plain-data.ts", enclosing: "ownDataDetails", text: "Object.getOwnPropertyNames(details)" },
+      { file: "packages/capital-allocator/src/guards.ts", enclosing: "freezeRecursive", text: "Reflect.ownKeys(value)" },
+      { file: "packages/capital-allocator/src/plain-data.ts", enclosing: "ownStringKeys", text: "Reflect.ownKeys(container)" },
+      { file: "packages/capital-allocator/src/plain-data.ts", enclosing: "copyPlainData", text: "Object.getOwnPropertyNames(value)" },
+      { file: "packages/capital-allocator/src/plain-data.ts", enclosing: "ownDataDetails", text: "Object.getOwnPropertyNames(details)" },
+    ] as const
+  ).map((site) => ({ ...site, kind: "own-enumeration" as const, count: 1, reason: OWN_ENUMERATION_PRIMITIVE })),
+
+  // --- `Object.entries`, which INVOKES own getters (review round 7) ---------
+  {
+    file: "packages/risk/src/exposure-limits.ts",
+    enclosing: "checkExposureLimits",
+    kind: "object-entries",
+    text: "Object.entries(limits)",
+    count: 1,
+    reason: ENTRIES_OF_MATERIALIZED,
+  },
+  {
+    file: "packages/capital-allocator/src/exposure.ts",
+    enclosing: "finalize",
+    kind: "object-entries",
+    text: "Object.entries(table)",
+    count: 1,
+    reason: ENTRIES_OF_OUR_TABLE,
+  },
+  {
+    file: "packages/capital-allocator/src/state.ts",
+    enclosing: "createAllocatorStateInner",
+    kind: "object-entries",
+    text: "Object.entries(reserved)",
+    count: 1,
+    reason: `${ENTRIES_OF_OUR_TABLE} — \`reservedSharesByKey\` builds it with \`setOwn\` from the validated state`,
+  },
+
+  // --- destructuring, which is one `Get` per name (review round 7) ----------
+  {
+    file: "packages/risk/src/inputs.ts",
+    enclosing: "identityRefusals",
+    kind: "object-destructure",
+    text: "{ field, value }",
+    count: 1,
+    reason: DESTRUCTURE_OF_OUR_RECORD,
   },
 
   // --- risk -----------------------------------------------------------------
@@ -261,7 +336,10 @@ const REGISTERED: readonly Registration[] = [
  * diff.
  */
 const TEST_FILE_BUDGET: readonly { readonly file: string; readonly sites: number }[] = [
-  { file: "packages/capital-allocator/src/allocator.test.ts", sites: 46 },
+  // 46 at round 6; 53 once round 7's detector also sees this file's
+  // `Reflect.get`/`has`/`ownKeys`/`getOwnPropertyDescriptor` (the hostile-proxy
+  // handler) and its `Object.keys` assertions.
+  { file: "packages/capital-allocator/src/allocator.test.ts", sites: 53 },
 ];
 
 function keyOf(site: { file: string; enclosing: string; kind: string; text: string }): string {
@@ -439,8 +517,158 @@ describe("THE MECHANISM: the detector sees each construct this package has been 
     ).toContain("computed-key");
   });
 
-  it("does not report a plain dotted read, which is the documented boundary of this rule", () => {
-    expect(censusOfSourceText("function f(o: { a: number }) { return o.a; }")).toEqual([]);
+  /**
+   * THE REVIEWER'S ROUND-7 MATRIX, AS THE DETECTOR'S OWN TEST.
+   *
+   * Review round 7 ran `censusOfSourceText` over ten shapes and found four of
+   * them SILENT and UNDISCLOSED: destructuring, `Reflect.get`, `for…in` and
+   * `structuredClone`. No registered exception covered them, so a future
+   * regression through any of them would have entered the build UNCLASSIFIED.
+   * Each is now a kind, and each row below is one cell of that matrix.
+   */
+  const ROUND_7_MATRIX: readonly {
+    readonly shape: string;
+    readonly source: string;
+    readonly kind: AccessKind;
+  }[] = [
+    {
+      shape: "const { value } = obj — one `Get` per name, chain and getters",
+      source: "function f(o: { value: number }) { const { value } = o; return value; }",
+      kind: "object-destructure",
+    },
+    {
+      shape: "function f({ value }) — the same, in a parameter",
+      source: "function f({ value }: { value: number }) { return value; }",
+      kind: "object-destructure",
+    },
+    {
+      shape: "({ value } = obj) — destructuring ASSIGNMENT, which has no binding pattern",
+      source: "function f(o: { value: number }) { let value = 0; ({ value } = o); return value; }",
+      kind: "object-destructure",
+    },
+    {
+      shape: "Reflect.get(obj, key) — the prototype chain by construction",
+      source: "function f(o: object, k: string) { return Reflect.get(o, k); }",
+      kind: "reflect-chain",
+    },
+    {
+      shape: "Reflect.has(obj, key) — the chain, like `in`",
+      source: "function f(o: object, k: string) { return Reflect.has(o, k); }",
+      kind: "reflect-chain",
+    },
+    {
+      shape: "an UNRECOGNIZED Reflect member fails closed to the chain-walking kind",
+      // Parsed as TEXT by `censusOfSourceText`, never type-checked: the point is
+      // that a member the table does not name is classified anyway.
+      source: "function f(o: object) { return Reflect.futureMember(o); }",
+      kind: "reflect-chain",
+    },
+    {
+      shape: "for (const key in obj) — ENUMERATES inherited names",
+      source: "function f(o: object) { const out: string[] = []; for (const key in o) out.push(key); return out; }",
+      kind: "for-in",
+    },
+    {
+      shape: "Object.entries(obj) — own-only, but it INVOKES every own getter",
+      source: "function f(o: object) { return Object.entries(o); }",
+      kind: "object-entries",
+    },
+    {
+      shape: "Object.values(obj) — the same invocation",
+      source: "function f(o: object) { return Object.values(o); }",
+      kind: "object-entries",
+    },
+    {
+      shape: "structuredClone(obj) — invokes own getters, clone inherits Object.prototype",
+      source: "function f(o: object) { return structuredClone(o); }",
+      kind: "structured-clone",
+    },
+    {
+      shape: "Object.keys(obj) — own names, no getter: benign, but ENUMERATED",
+      source: "function f(o: object) { return Object.keys(o); }",
+      kind: "own-enumeration",
+    },
+    {
+      shape: "Object.getOwnPropertyNames(obj) — the same, including non-enumerable",
+      source: "function f(o: object) { return Object.getOwnPropertyNames(o); }",
+      kind: "own-enumeration",
+    },
+    {
+      shape: "Reflect.ownKeys(obj) — own names, symbols included",
+      source: "function f(o: object) { return Reflect.ownKeys(o); }",
+      kind: "own-enumeration",
+    },
+    {
+      shape: "obj?.[key] — an optional element read is still an element read",
+      source: "function f(o: Record<string, unknown> | undefined, k: string) { return o?.[k]; }",
+      kind: "element-read",
+    },
+  ];
+
+  for (const row of ROUND_7_MATRIX) {
+    it(`round 7 — detects: ${row.shape}`, () => {
+      expect(censusOfSourceText(row.source).map((site) => site.kind)).toContain(row.kind);
+    });
+  }
+
+  it("every kind in the vocabulary is exercised by a probe in this file", () => {
+    const probed = new Set<AccessKind>([
+      ...ROUND_7_MATRIX.map((row) => row.kind),
+      ...HISTORICAL.map((probe) => probe.kind),
+      "delete-element",
+      "object-assign",
+      "computed-key",
+      "object-spread",
+    ]);
+    expect([...ACCESS_KINDS].filter((kind) => !probed.has(kind))).toEqual([]);
+  });
+
+  /**
+   * THE EXCLUDED FORMS, EXERCISED.
+   *
+   * Items 1–7 of the scope list in `prototype-access-scan.ts`. A census whose
+   * boundary is only prose is the round-6 failure repeated: each excluded form
+   * is asserted SILENT here, so the list cannot drift away from the detector in
+   * either direction — a form that starts being reported fails this test and
+   * must be registered and documented.
+   */
+  const EXCLUDED: readonly { readonly item: string; readonly source: string }[] = [
+    { item: "1 — a dotted read", source: "function f(o: { a: number }) { return o.a; }" },
+    {
+      item: "2 — Object.hasOwn / getOwnPropertyDescriptor / defineProperty",
+      source:
+        'function f(o: object, k: string) { if (Object.hasOwn(o, k)) { const d = Object.getOwnPropertyDescriptor(o, k); Object.defineProperty(o, k, { value: d }); } }',
+    },
+    {
+      item: "3 — the iteration protocol: for…of, array destructuring, array spread",
+      source:
+        "function f(xs: readonly number[]) { let t = 0; for (const x of xs) t += x; const [a] = xs; return [t, a, ...xs]; }",
+    },
+    {
+      item: "5 — implicit coercion: String(), a template, JSON.stringify",
+      source: "function f(o: object) { return `${String(o)}${JSON.stringify(o)}`; }",
+    },
+    {
+      item: "7 — class syntax: instanceof and Object.create",
+      source: "function f(o: object) { return o instanceof Map ? Object.create(null) : o; }",
+    },
+  ];
+
+  for (const excluded of EXCLUDED) {
+    it(`the documented boundary holds — item ${excluded.item} is NOT reported`, () => {
+      expect(censusOfSourceText(excluded.source)).toEqual([]);
+    });
+  }
+
+  it("item 4 — a helper is flagged at ITSELF, and its call sites are not reasoned about", () => {
+    // The limitation, stated as a measurement: the read is reported once, in the
+    // helper, and calling it adds nothing. No site is ever exonerated by an
+    // argument about who calls it.
+    const sites = censusOfSourceText(
+      "function h(o: Record<string, unknown>, k: string) { return o[k]; }\n" +
+        "function caller(o: Record<string, unknown>) { return h(o, 'a'); }\n",
+    );
+    expect(sites.map((site) => `${site.enclosing}:${site.kind}`)).toEqual(["h:element-read"]);
   });
 
   it("reports the enclosing function and the line, so a failure names the site", () => {

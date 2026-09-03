@@ -41,7 +41,7 @@ import {
 
 import { FreshnessObservationSchema } from "./freshness.js";
 import { ownProperty, uuidShapedNotCanonical } from "./guards.js";
-import { hardenParsed, readPlainData } from "./plain-data.js";
+import { readPlainData } from "./plain-data.js";
 import { SCENARIO_KINDS } from "./policy.js";
 import { contained, riskRefusal, type RiskRefusal } from "./result.js";
 
@@ -403,6 +403,18 @@ export type RiskInputValidation =
  * site is fixed (`internalIdentityFields` tests own-ness), and the function now
  * also runs inside the containment guard, because a door that answers with an
  * exception has no defined behaviour for the caller standing in it.
+ *
+ * AND IT DOES NOT REFUSE A CANCEL FOR SOMEBODY ELSE'S BOOKKEEPING (review round
+ * 7, BLOCKER). Round 6 made this function refuse whenever the schema's OUTPUT
+ * came back smaller than the input, which under a get-only inherited accessor it
+ * silently does. The reviewer's probe was a valid `CANCEL` with an intact
+ * `intent.reason` and a get-only `Object.prototype.reason`: the parse succeeded,
+ * the output had dropped the field, and the door answered `RISK_INPUT_INVALID`.
+ * The lost field was an artefact of the LIBRARY'S output assembly, not of the
+ * caller's input, so §6 invariant 13 protects that cancel and the refusal was
+ * wrong. The fix is not a narrower check — it is that this function no longer
+ * reads the library's output at all (see the body, and proposition 5 in
+ * `plain-data.ts`).
  */
 export function validateEvaluationInput(input: unknown): RiskInputValidation {
   return contained(
@@ -445,35 +457,27 @@ function validateEvaluationInputInner(input: unknown): RiskInputValidation {
       ],
     };
   }
-  // THE PARSE OUTPUT IS RE-HARDENED (review round 6). The input tree handed to
-  // the schema is prototype-free, but `zod` builds its RESULT with `{}` — so
-  // every later read of an ABSENT OPTIONAL field of the validated input
-  // (`context.venueEligibility`, `market.bookSynchronized`, `exposures`,
-  // `allocation`, `scope.seriesKey`) would have been answered by whatever sits
-  // on `Object.prototype`, and §9.8 checks would have passed on facts nobody
-  // supplied. Measured: `z.strictObject({b: z.string().optional()})` parsing
-  // `{a:"x"}` with an inherited `b` returns `{a:"x", b:"inherited"}` — the
-  // validator ADOPTS it. `ownDataTree` gives the pipeline the same data with no
-  // prototype, so absence stays absence for every read downstream, whatever
-  // syntax that read uses. `hardenParsed` also refuses a parse output that is
-  // SMALLER than what was read: an inherited get-only accessor makes `zod`'s
-  // own assignment fail, so a field can vanish from the output while the parse
-  // still reports success, and an evaluation on a quietly truncated input is
-  // exactly the "unknown read as absent" failure this round is about.
-  const hardened = hardenParsed(read.value, parsed.data, "input");
-  if (!hardened.ok) {
-    return {
-      ok: false,
-      refusals: [
-        riskRefusal(
-          "RISK_INPUT_INVALID",
-          "the validated input lost fields between validation and use, so what would be evaluated is not what was supplied (fail closed)",
-          { lost: [...hardened.lost] },
-        ),
-      ],
-    };
-  }
-  const data = hardened.value as RiskEvaluationInput;
+  // THE VALIDATED INPUT IS THE MATERIALIZED TREE, NOT THE PARSE OUTPUT
+  // (review round 7; see proposition 5 in `plain-data.ts`).
+  //
+  // The schema was asked a QUESTION and it answered `success`. Its OUTPUT is a
+  // separate object it assembles by assignment on an object it created with
+  // `{}`, and that assembly is not trustworthy: it ADOPTS an inherited field,
+  // and an inherited GET-ONLY accessor makes the assignment fail so a field
+  // VANISHES from the output while the parse still reports success. Round 6
+  // answered the second by refusing any output smaller than the input, and the
+  // reviewer's round-7 probe showed what that costs — a get-only
+  // `Object.prototype.reason`, a CANCEL whose own `intent.reason` was intact,
+  // and the door refused it: `lost: ["input.intent.reason"]`, a valid cancel
+  // trapped by an artefact of somebody else's output assembly (§6 invariant 13).
+  //
+  // `read.value` is this package's own tree: own data, no prototype, built one
+  // `defineProperty` at a time, and the exact bytes the schema just validated.
+  // `RiskEvaluationInputSchema` contributes NOTHING of its own — no default, no
+  // transform, no coercion — so the validated value and the read value are the
+  // same value. That is not an assumption: `test/unit/risk/schema-output.test.ts`
+  // walks the schema and fails if any value-producing node is ever added to it.
+  const data = read.value as RiskEvaluationInput;
   const refusals = identityRefusals(internalIdentityFields(data));
   if (refusals.length > 0) return { ok: false, refusals };
   return { ok: true, data };

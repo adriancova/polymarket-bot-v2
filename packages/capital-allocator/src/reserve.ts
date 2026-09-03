@@ -45,7 +45,6 @@ import { z } from "zod";
 import { liveMicroCapRefusals, type AllocatorCaps } from "./caps.js";
 import { exposureSnapshot, shadowExposureSnapshot, type ExposureSnapshot } from "./exposure.js";
 import { deepFreeze, ownEntry, ownFlag, uuidShapedNotCanonical } from "./guards.js";
-import { hardenParsed } from "./plain-data.js";
 import {
   capitalFailure,
   capitalOk,
@@ -203,24 +202,16 @@ function evaluateReservationInner(
       }),
     ]);
   }
-  // THE PARSE OUTPUT IS RE-HARDENED (review round 6). `zod` builds its result
-  // with `{}`, so an ABSENT OPTIONAL FIELD of the parsed request —
-  // `req.scope`, `req.scope?.seriesKey` — would have been answered by
-  // `Object.prototype`, attributing a commitment to a scope nobody supplied.
-  // The same call refuses an output SMALLER than what was read: a request whose
-  // `scope` vanished would skip `CAPITAL_SCOPE_KEY_MISSING` on a configured
-  // scope cap.
-  const hardened = hardenParsed(read.value, parsed.data, "request");
-  if (!hardened.ok) {
-    return refuseVerdict([
-      capitalRefusal(
-        "CAPITAL_INPUT_INVALID",
-        "the validated reservation request lost fields between validation and use, so what would be committed is not what was requested (fail closed)",
-        { lost: [...hardened.lost] },
-      ),
-    ]);
-  }
-  const req = hardened.value as ReservationRequest;
+  // THE VALIDATED REQUEST IS THE MATERIALIZED TREE (review round 7): the parse
+  // answered the QUESTION, and its output object is not read. An ABSENT OPTIONAL
+  // FIELD — `req.scope`, `req.scope?.seriesKey` — stays absent because
+  // `read.value` has no prototype, so no commitment is attributed to a scope
+  // nobody supplied; and a `scope` the caller DID supply can no longer vanish in
+  // an output assembly that an inherited get-only accessor defeats, which would
+  // have skipped `CAPITAL_SCOPE_KEY_MISSING` on a configured scope cap.
+  // `ReservationRequestSchema` contributes no value of its own (pinned by
+  // `test/unit/risk/schema-output.test.ts`).
+  const req = read.value as ReservationRequest;
 
   const refusals: CapitalRefusal[] = [];
 

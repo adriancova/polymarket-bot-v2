@@ -391,24 +391,6 @@ function emptyRecord(): Record<string, unknown> {
   return Object.create(null) as Record<string, unknown>;
 }
 
-/**
- * Rebuilds an already-validated tree as own data with NO PROTOTYPE.
- *
- * THE SECOND HALF OF THE ROUND-6 INHERITANCE FIX. A schema's OUTPUT is the
- * schema's own object, and `zod` builds it with `{}` — so even when the input
- * was prototype-free, the parsed value this package then reasons over inherits
- * from `Object.prototype` again, and an ABSENT OPTIONAL FIELD read off it
- * (`data.context.venueEligibility`) would be answered by whatever is on the
- * prototype. Every door re-hardens the parse output through this function, so
- * the tree the pipeline reasons over is prototype-free end to end.
- *
- * TOTAL: it runs on data this package has already materialized and validated,
- * takes values from descriptors, and never invokes anything.
- */
-function ownDataTree<T>(value: T): T {
-  return hardenValue(value, 0) as T;
-}
-
 /** The own DATA value of `key`, or `undefined`. Never an accessor, never inherited. */
 function dataValue(container: object, key: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(container, key);
@@ -417,99 +399,133 @@ function dataValue(container: object, key: string): unknown {
 }
 
 /**
- * Every path present in `before` and MISSING from `after`.
+ * One value a SCHEMA supplies when the caller's field is absent — a `.default()`.
  *
- * WHY A VALIDATED VALUE IS COMPARED WITH ITSELF (review round 6). A validator's
- * output is the validator's own object, and it BUILDS that object by
- * assignment. An inherited GET-ONLY accessor on `Object.prototype` makes an
- * assignment to that name fail, so the field silently vanishes from the parse
- * output while the parse still reports success. Measured on the pinned `zod`:
- * with a get-only `Object.prototype.perMarketCap`, a configured per-market cap
- * disappeared from the parsed caps — a cap the caller set, silently not
- * enforced, which is a FAIL-OPEN produced by prototype augmentation alone.
- *
- * So each door compares what it READ with what it is about to USE, and refuses
- * on any loss rather than proceeding with a value that is quietly smaller than
- * the caller's. A member whose read value is `undefined` is not counted: a
- * schema may legitimately omit it, and an absent optional field is not a loss.
+ * `path` is the field's position in the validated tree (`["economics",
+ * "riskBuffer"]`), and `value` is what the schema declares. It is the ONLY kind
+ * of content a door takes from anywhere but the materialized read, and it comes
+ * from the door's own declared table rather than from the library's output —
+ * see proposition 5 in the module header, and the measurement below.
  */
-function lostKeyPaths(before: unknown, after: unknown, path: string): readonly string[] {
-  const lost: string[] = [];
-  const walk = (left: unknown, right: unknown, at: string, depth: number): void => {
-    if (depth >= MAX_DEPTH || left === null || typeof left !== "object") return;
-    if (Array.isArray(left)) {
-      if (!Array.isArray(right)) {
-        lost.push(at);
-        return;
-      }
-      for (let index = 0; index < left.length; index += 1) {
-        const key = String(index);
-        if (!Object.hasOwn(right, key)) {
-          lost.push(`${at}[${key}]`);
-          continue;
-        }
-        walk(dataValue(left, key), dataValue(right, key), `${at}[${key}]`, depth + 1);
-      }
-      return;
-    }
-    if (right === null || typeof right !== "object" || Array.isArray(right)) {
-      lost.push(at);
-      return;
-    }
-    for (const key of Object.getOwnPropertyNames(left)) {
-      const value = dataValue(left, key);
-      if (value === undefined) continue;
-      if (!Object.hasOwn(right, key)) {
-        lost.push(`${at}.${key}`);
-        continue;
-      }
-      walk(value, dataValue(right, key), `${at}.${key}`, depth + 1);
-    }
-  };
-  walk(before, after, path, 0);
-  return lost;
+export interface SchemaDefault {
+  readonly path: readonly string[];
+  readonly value: unknown;
 }
 
-/** A parse output that is safe to reason over, or the fields it lost. */
-export type HardenedParse =
+/** A validated tree with its schema's defaults applied, or the paths it could not fill. */
+export type DefaultedData =
   | { readonly ok: true; readonly value: unknown }
-  | { readonly ok: false; readonly lost: readonly string[] };
+  | { readonly ok: false; readonly unfilled: readonly string[] };
 
 /**
- * Makes a schema's output safe to reason over: PROTOTYPE-FREE and COMPLETE.
+ * Applies a schema's own DEFAULTS to the materialized tree, in place.
  *
- * Two round-6 findings, one call:
+ * WHY THE DEFAULTS ARE NOT TAKEN FROM THE PARSE OUTPUT (review round 7).
+ * Proposition 5 says the validated value is the value this module read; a
+ * default is the one thing that value cannot contain, because the caller did not
+ * supply it. Reading it back off the library's output is exactly what
+ * proposition 5 forbids, and the reason is measured, not theoretical — with a
+ * get-only `Object.prototype.d` and a schema declaring `d` with a default:
  *
- * 1. {@link ownDataTree} — the output inherits from `Object.prototype`, so an
- *    ABSENT OPTIONAL FIELD read off it is answered by whatever is on the
- *    prototype. The hardened tree has no prototype, so absence stays absence
- *    for every read downstream, dotted or computed.
- * 2. {@link lostKeyPaths} — the output can be SMALLER than what was read, and
- *    silently so. A door that would proceed on a truncated value refuses
- *    instead.
+ * ```text
+ * z.strictObject({ a: z.string(), d: z.string().default("FLOOR") })
+ *   .safeParse(nullPrototype{ a: "x" })
+ *     → success: true, own keys of the output: ["a"], output.d === "inherited"
+ * ```
  *
- * `read` is the materialized input the schema saw; `parsed` is what it
- * returned.
+ * The default was never assigned (the inherited accessor is get-only), the key
+ * is not own, and the READ of it walks the prototype chain to the attacker's
+ * value. Round 6's loss check could not see this at all: the field is missing
+ * from the INPUT too, so nothing was "lost". Measured consequences at the
+ * round-6 tip, with one get-only property on `Object.prototype` and no hostile
+ * input whatsoever:
+ *
+ * ```text
+ * "requireVerifiedSettlementForEntries" → §9.8 check 6 SKIPPED: an entry with
+ *                                          unverified settlement was APPROVED
+ * "requirePositiveNetEdgeForEntries"    → §9.8 check 12 SKIPPED: an entry with
+ *                                          a NEGATIVE net edge was APPROVED
+ * "maxRunMode"                          → §9.8 check 2 silently gone: a LIVE run
+ *                                          mode no longer exceeds the maximum
+ * ```
+ *
+ * So the door declares its defaults and this function applies them to the tree
+ * it already owns. `undefined` counts as absent, which is `zod`'s own rule for
+ * when a default applies. The value is COPIED per call ({@link copyPlainData}),
+ * so two parses never share a mutable object, and it is defined with
+ * `CreateDataProperty` semantics like every other property of the tree.
+ *
+ * FAIL CLOSED: if the container a default belongs to is missing or is not a
+ * record, the path is reported as `unfilled` and the door refuses. A successful
+ * parse should make that unreachable — every defaulted field in this repository
+ * sits under a REQUIRED object — and an unreachable state that arrives anyway is
+ * not a state to guess in.
  */
-export function hardenParsed(read: unknown, parsed: unknown, path = "value"): HardenedParse {
-  const value = ownDataTree(parsed);
-  const lost = lostKeyPaths(read, value, path);
-  if (lost.length > 0) return { ok: false, lost };
-  return { ok: true, value };
+export function withSchemaDefaults(
+  read: unknown,
+  defaults: readonly SchemaDefault[],
+): DefaultedData {
+  const unfilled: string[] = [];
+  for (const entry of defaults) {
+    const target = targetOf(read, entry.path);
+    if (target === undefined) {
+      unfilled.push(entry.path.join("."));
+      continue;
+    }
+    if (dataValue(target.container, target.key) !== undefined) continue;
+    defineDataProperty(target.container, target.key, copyPlainData(entry.value, 0));
+  }
+  if (unfilled.length > 0) return { ok: false, unfilled };
+  return { ok: true, value: read };
 }
 
-function hardenValue(value: unknown, depth: number): unknown {
+/**
+ * The record that would OWN the last name of `path`, with that name.
+ *
+ * NO ELEMENT ACCESS. The walk carries the pending name instead of indexing
+ * `path`, so this module still contains no numeric `element-read` — the census
+ * in `test/unit/risk/prototype-access.test.ts` reports zero of them in product
+ * code, and the pollution sweep's exclusion of array-index NAMES rests on that
+ * being true (`test/unit/risk/inherited-state.test.ts`, `ARRAY_INDEX`).
+ */
+function targetOf(
+  read: unknown,
+  path: readonly string[],
+): { readonly container: object; readonly key: string } | undefined {
+  let current: unknown = read;
+  let pending: string | undefined;
+  for (const name of path) {
+    if (pending !== undefined) {
+      if (current === null || typeof current !== "object" || Array.isArray(current)) return undefined;
+      current = dataValue(current, pending);
+    }
+    pending = name;
+  }
+  if (pending === undefined) return undefined;
+  if (current === null || typeof current !== "object" || Array.isArray(current)) return undefined;
+  return { container: current, key: pending };
+}
+
+/**
+ * A fresh, prototype-free, own-DATA copy of a value THIS REPOSITORY declared.
+ *
+ * Used only for a {@link SchemaDefault}'s value, which is a literal in one of
+ * this package's own modules — so this is about aliasing (two parses must not
+ * share one mutable array), not about hostility. Arrays stay arrays: a default
+ * such as the four required scenario kinds is iterated downstream.
+ */
+function copyPlainData(value: unknown, depth: number): unknown {
   if (value === null || typeof value !== "object" || depth >= MAX_DEPTH) return value;
   if (Array.isArray(value)) {
     const items: unknown[] = [];
-    for (const item of value as readonly unknown[]) items.push(hardenValue(item, depth + 1));
+    for (const item of value as readonly unknown[]) items.push(copyPlainData(item, depth + 1));
     return items;
   }
   const out = emptyRecord();
   for (const key of Object.getOwnPropertyNames(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) continue;
-    defineDataProperty(out, key, hardenValue(descriptor.value, depth + 1));
+    defineDataProperty(out, key, copyPlainData(descriptor.value, depth + 1));
   }
   return out;
 }

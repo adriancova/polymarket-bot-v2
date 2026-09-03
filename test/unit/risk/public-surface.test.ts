@@ -36,6 +36,7 @@ import { describe, expect, it } from "vitest";
 
 import * as allocator from "../../../packages/capital-allocator/src/index.js";
 import * as risk from "../../../packages/risk/src/index.js";
+import { INSTANCE, MARKET_A, entryInput, riskPolicy } from "./fixtures.js";
 import { readScannedFile } from "./prototype-access-scan.js";
 
 /** A handler whose every trap throws — the reviewer's probe shape. */
@@ -492,6 +493,79 @@ describe("THE MECHANISM: the public surface is enumerated and classified", () =>
       { reservationId: "r" },
     );
     expect(verdict.permitted).toBe(false);
+  });
+});
+
+/**
+ * THE EXPORTED RECORD'S CONSUMER-VISIBLE SHAPE — README §6.1 (review round 7).
+ *
+ * An emitted record has a `null` prototype. That is a real change to a public
+ * value and the reviewer asked for consumer-facing guidance rather than a
+ * handoff footnote, so `packages/risk/README.md` §6.1 states it for WP-190 and
+ * WP-230. A documented behaviour nothing measures is a claim, so every row of
+ * that table is asserted here — including the two that RESTORE `Object.prototype`
+ * and are therefore the ones a consumer can get wrong.
+ */
+describe("the emitted record: what a consumer sees (README §6.1)", () => {
+  const evaluation = risk.evaluateIntent(riskPolicy(), entryInput());
+  if (!evaluation.approved) throw new Error("the fixture must approve");
+  const record = evaluation.record as unknown as Record<string, unknown>;
+
+  it("has NO prototype, so the inherited object methods are absent", () => {
+    expect(Object.getPrototypeOf(record)).toBeNull();
+    expect(record instanceof Object).toBe(false);
+    expect((record as { hasOwnProperty?: unknown }).hasOwnProperty).toBeUndefined();
+    expect((record as { toString?: unknown }).toString).toBeUndefined();
+    expect((record as { valueOf?: unknown }).valueOf).toBeUndefined();
+    // …at every depth, not only at the root
+    expect(Object.getPrototypeOf(record["intent"] as object)).toBeNull();
+  });
+
+  it("answers every ordinary read: hasOwn, `in`, dotted, destructuring, keys, JSON", () => {
+    expect(Object.hasOwn(record, "approvedIntentId")).toBe(true);
+    expect("approvedIntentId" in record).toBe(true);
+    expect(record["approvedIntentId"]).toBe("approved-1");
+    const { approvedIntentId } = record as { approvedIntentId: string };
+    expect(approvedIntentId).toBe("approved-1");
+    expect(Object.keys(record).length).toBeGreaterThan(5);
+    expect(JSON.parse(JSON.stringify(record))).toEqual(record);
+    expect(Object.isFrozen(record)).toBe(true);
+  });
+
+  it("a spread, a clone and a JSON round trip all RESTORE Object.prototype", () => {
+    // The consequence the README tells a consumer to re-harden after: the copy
+    // is an ordinary object again, so an absent optional field read off it can
+    // once more be answered by whatever sits on `Object.prototype`.
+    expect(Object.getPrototypeOf({ ...record })).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(structuredClone(record))).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(JSON.parse(JSON.stringify(record)) as object)).toBe(
+      Object.prototype,
+    );
+  });
+
+  it("the allocator's state is MIXED, and the README says which parts are which", () => {
+    const state = allocator.createAllocatorState({
+      accountEquity: "1000",
+      availableCollateral: "1000",
+      positions: [
+        {
+          positionId: "p-1",
+          marketId: MARKET_A,
+          strategyInstanceId: INSTANCE,
+          side: "YES",
+          shares: "1",
+          costBasis: "1",
+        },
+      ],
+      openOrders: [],
+      liveOwners: [],
+    });
+    expect(state.ok).toBe(true);
+    if (!state.ok) return;
+    // the container is this package's own literal…
+    expect(Object.getPrototypeOf(state.value)).toBe(Object.prototype);
+    // …and every member that came from the caller is materialized, so prototype-free
+    expect(Object.getPrototypeOf(state.value.positions[0] as object)).toBeNull();
   });
 });
 

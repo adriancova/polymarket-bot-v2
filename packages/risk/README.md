@@ -384,32 +384,60 @@ chain and the first that needed no hostile input at all: **`Object.prototype` is
 reachable state, and "this record has no such field" and "nobody has put that
 name on `Object.prototype`" are different questions.**
 
-- The materialized tree has **no prototype** (`Object.create(null)`), and each
-  door re-hardens the SCHEMA'S OUTPUT the same way, because a validator builds
-  its result with `{}`. Measured on the pinned `zod`:
-  `z.strictObject({ b: z.string().optional() }).safeParse({ a: "x" })` with an
-  inherited `b` returns `{ a: "x", b: "inherited" }` — the validator **adopts**
-  it. An absent `venueEligibility` would have arrived as `"ELIGIBLE"` and §9.8
+- The materialized tree has **no prototype** (`Object.create(null)`), so a
+  validator handed it cannot **adopt** an inherited field. Measured on the pinned
+  `zod`: `z.strictObject({ b: z.string().optional() }).safeParse({ a: "x" })`
+  with an inherited `b` returns `{ a: "x", b: "inherited" }` for an ordinary
+  object, and `{ a: "x" }` for a prototype-free one. An absent
+  `venueEligibility` would otherwise have arrived as `"ELIGIBLE"` and §9.8
   check 4 would have passed on a fact nobody supplied.
-- A door also refuses a parse output that is **smaller** than what it read. An
-  inherited GET-ONLY accessor makes an assignment inside the validator fail, so
-  a field can vanish from the output while the parse still reports success —
-  measured on `resizeApprovedIntent`, where the emitted record's own
-  `approvedIntentId` came back as the inherited getter's answer.
 - Every computed table read goes through `ownEntry` / `ownFlag` /
   `ownProperty`, and `"intentId" in intent` — which consults the prototype, and
   which made a valid CANCEL refuse with `RISK_UUID_NOT_CANONICAL` — is an
   own-property test.
 
-Two mechanisms hold this, and neither is a list: `test/unit/risk/prototype-access.test.ts`
-asks the TypeScript compiler for every computed access, `in`, spread and
-`Object.assign` in both packages and requires each to be an own-property
-primitive or a registered exception with a reason;
+### 4.7 The validated value is the value we read (review round 7)
+
+Round 6 also made each door **refuse a parse output smaller than what it read**,
+because an inherited GET-ONLY accessor makes an assignment inside the validator
+fail and a field can vanish from the output while the parse still reports
+success. Review round 7 ruled that refusal a BLOCKER, and it was right to: its
+probe was a valid `CANCEL` with an intact `intent.reason` and a get-only
+`Object.prototype.reason`, and the door answered `RISK_INPUT_INVALID` with
+`lost: ["input.intent.reason"]` — a **cancel trapped by an artefact of the
+library's output assembly**, which §6 invariant 13 forbids.
+
+The answer is architectural rather than a narrower check. **No door reads the
+library's output.** A door materializes the input, asks the schema the QUESTION,
+and then uses **the materialized tree** — own data, no prototype, built here one
+`defineProperty` at a time. Adoption and loss both stop being detectable
+conditions and start being unreachable ones.
+
+What a schema legitimately CONTRIBUTES — a `.default()` — is applied from a table
+the door declares (`RISK_POLICY_DEFAULTS`, `ALLOCATOR_CAPS_DEFAULTS`), because
+that value is not the caller's and cannot come from the read. That is not
+bookkeeping: at the round-6 tip, one get-only inherited accessor made `zod` fail
+to assign its own default, so the key was missing from the output and the later
+read walked the chain — `requireVerifiedSettlementForEntries` silently skipped
+§9.8 check 6 and **approved** an entry with unverified settlement,
+`requirePositiveNetEdgeForEntries` silently skipped check 12 and **approved** a
+negative-edge entry, and `maxRunMode` made check 2 disappear. All three refuse
+today.
+
+Three mechanisms hold this, and none is a list. `test/unit/risk/prototype-access.test.ts`
+asks the TypeScript compiler for every computed access, `in`, spread,
+`Object.assign`, destructuring, `for…in`, `Reflect.*`, `Object.entries`/`keys`
+and `structuredClone` in both packages and requires each to be an own-property
+primitive or a registered exception with a reason — and states the complete list
+of forms it does NOT see, each exercised by a probe.
 `test/unit/risk/inherited-state.test.ts` re-runs every public door with
-`Object.prototype` carrying one extra property — the names drawn from the
-door's own inputs — and requires the answer to be unchanged, or to have become a
-typed refusal. An inherited property may cost availability; it may never buy
-permission.
+`Object.prototype` carrying one extra property — the names drawn from the door's
+own inputs and from the doors' default tables — and requires the answer to be
+unchanged, or to have become a typed refusal; **on a CANCEL, unchanged is the
+only permitted outcome.** `test/unit/risk/schema-output.test.ts` walks each
+door's schema and fails if it ever contributes a value the door does not apply.
+An inherited property may cost availability; it may never buy permission, and it
+may never trap a cancel.
 
 ### Staleness and exits, stated exactly
 
@@ -620,6 +648,46 @@ Ceilings the strategy set (`maximumTotalCost`, `maximumBuyPrice`,
 stays valid under a smaller size, and scaling one would be this package
 inventing a number the strategy did not supply. Re-running `evaluateIntent` on a
 resized intent produces a fresh `EVALUATED` record.
+
+### 6.1 Consuming an emitted record — it has a `null` prototype
+
+**Read this before consuming a record in WP-190 (execution planner) or WP-230.**
+An emitted `ApprovedIntentRecord` is the materialized tree (§4.4), so every
+object in it is created with `Object.create(null)`. That is deliberate — it is
+what makes "this record has no such field" a different question from "nobody has
+put that name on `Object.prototype`" (§4.6) — and it is a real difference from an
+ordinary object. Measured:
+
+| Works | Does NOT work |
+| --- | --- |
+| `Object.hasOwn(record, key)` | `record.hasOwnProperty(key)` — `undefined` |
+| `Object.keys` / `entries` / `values` | `record.toString()`, `record.valueOf()` — `undefined` |
+| `JSON.stringify(record)` | `record instanceof Object` — `false` |
+| `key in record`, `record.field`, destructuring | `util.inspect` renders `[Object: null prototype] { … }` |
+| `expect(...).toEqual(record)` (vitest / jest) | |
+
+Consequences for a consumer, stated so none of them is a surprise:
+
+- use `Object.hasOwn(record, key)`, never `record.hasOwnProperty(key)`, and never
+  `record instanceof Object` as a "is this an object" test — use
+  `typeof value === "object" && value !== null`;
+- **a spread or a clone RESTORES `Object.prototype`.** `{ ...record }` and
+  `structuredClone(record)` both work and both produce an ORDINARY object, which
+  silently gives up the property above. If a consumer copies a record and then
+  reads optional fields off the copy, an inherited name can answer for an absent
+  field again. Re-harden the copy (build it with `Object.create(null)`), or
+  re-validate it against `ApprovedIntentRecordSchema` and read only own
+  properties;
+- persistence and transport are unaffected: `JSON.stringify` produces the same
+  bytes as for an ordinary object, and a record round-tripped through JSON comes
+  back ordinary — so the boundary to re-establish is the one where a record
+  RE-ENTERS a decision path, not the one where it leaves the process.
+
+The same is true of the object `parseRiskPolicy` returns, and of the
+caller-supplied parts of an allocator state (`packages/capital-allocator/README.md`
+§2.1). No contract specifies a prototype for any of them, no consumer package
+exists yet, and this is recorded in `docs/handoffs/WP-180.md` (round 6 deviation
+R6-5, promoted here in round 7 at the reviewer's instruction).
 
 ## 7. Incident action recommendations
 

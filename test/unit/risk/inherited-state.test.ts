@@ -30,6 +30,10 @@
  *
  * - an answer carrying a permission bit must be IDENTICAL, or must have become
  *   a typed REFUSAL (a refusal may also change its reason);
+ * - EXCEPT ON A CANCEL, where it must be IDENTICAL, full stop (review round 7).
+ *   "It became a refusal instead" is fail-closed for an entry and a TRAPPED
+ *   POSITION for a cancel — §6 invariant 13 — which is exactly the BLOCKER round
+ *   7 reported. See {@link Scenario.identicalOrFail};
  * - an answer carrying no permission bit — an exposure snapshot — must be
  *   identical, full stop;
  * - nothing may throw;
@@ -37,6 +41,18 @@
  *   For a door that runs one, `zod`'s own compiled parser reads declared field
  *   names off objects IT creates, which this package cannot prevent; that
  *   measurement, and why it is not a hole, is recorded on {@link Scenario}.
+ *
+ * WHAT ROUND 7 ADDED, AND WHY EACH WAS A BLIND SPOT:
+ *
+ * - the key material now includes every name a SCHEMA DEFAULT occupies
+ *   ({@link SCHEMA_DEFAULT_NAMES}). A defaulted field is absent from the input by
+ *   definition, so input-derived keys could never name one — and that is where
+ *   round 7 found three fail-opens (§9.8 checks 2, 6 and 12 silently skipped
+ *   because `zod` could not assign its own default over a get-only inherited
+ *   accessor, and the later read walked the chain);
+ * - THE JOIN: every public FUNCTION of both packages must now be swept by a
+ *   scenario or registered with a reason, so a new door cannot arrive without
+ *   one (round 6 follow-up R6-2).
  *
  * SCOPE, STATED. The sweep proves the property for the scenarios it runs, which
  * are the public doors with their fully-passing fixtures and their principal
@@ -50,6 +66,10 @@
 
 import { describe, expect, it } from "vitest";
 
+// Namespace imports for THE JOIN (R6-2): the swept surface is read from the
+// module rather than from a hand list, exactly as `public-surface.test.ts` does.
+import * as allocatorModule from "../../../packages/capital-allocator/src/index.js";
+import * as riskModule from "../../../packages/risk/src/index.js";
 import {
   createAllocatorState,
   evaluateReservation,
@@ -63,6 +83,7 @@ import {
   type AllocatorCaps,
   type AllocatorState,
 } from "../../../packages/capital-allocator/src/index.js";
+import { ALLOCATOR_CAPS_DEFAULTS } from "../../../packages/capital-allocator/src/caps.js";
 import { deepFreeze as allocatorDeepFreeze } from "../../../packages/capital-allocator/src/guards.js";
 import { deepFreeze as riskDeepFreeze } from "../../../packages/risk/src/guards.js";
 import {
@@ -71,6 +92,7 @@ import {
   resizeApprovedIntent,
   validateEvaluationInput,
 } from "../../../packages/risk/src/index.js";
+import { RISK_POLICY_DEFAULTS } from "../../../packages/risk/src/policy.js";
 import {
   cancelIntent,
   codesOf,
@@ -236,7 +258,30 @@ function candidateKeys(material: unknown, extra: readonly string[] = []): string
  */
 const ARRAY_INDEX = /^(?:0|[1-9][0-9]*)$/u;
 
+/**
+ * Every NAME a schema DEFAULT occupies — derived from the doors' own tables.
+ *
+ * THE BLIND SPOT THIS CLOSES (review round 7). The key material above is
+ * harvested from a scenario's INPUT, and a defaulted field is by definition
+ * ABSENT from the input: `maxRunMode`, `requireVerifiedSettlementForEntries`,
+ * `requiredKinds`, `riskBuffer` and `requirePositiveNetEdgeForEntries` were
+ * therefore never candidate keys, and the sweep could not see the class round 7
+ * found — a get-only inherited accessor defeats `zod`'s assignment of its OWN
+ * default, so the key is missing from the output and the later read walks the
+ * chain. At the round-6 tip that silently skipped §9.8 checks 6 and 12 and
+ * APPROVED entries both refuse today.
+ *
+ * Derived from `RISK_POLICY_DEFAULTS` / `ALLOCATOR_CAPS_DEFAULTS` rather than
+ * hand-listed, so a default added to a door is swept without anyone remembering
+ * — and `schema-output.test.ts` independently binds those tables to the schemas.
+ */
+const SCHEMA_DEFAULT_NAMES: readonly string[] = [
+  ...RISK_POLICY_DEFAULTS,
+  ...ALLOCATOR_CAPS_DEFAULTS,
+].flatMap((entry) => [...entry.path]);
+
 const INTERNAL_NAMES: readonly string[] = [
+  ...SCHEMA_DEFAULT_NAMES,
   "GLOBAL",
   "value",
   "combined",
@@ -277,6 +322,16 @@ const INTERNAL_NAMES: readonly string[] = [
 interface Scenario {
   readonly name: string;
   /**
+   * The PUBLIC EXPORTS this scenario exercises, by name.
+   *
+   * THE JOIN (round 6 follow-up R6-2, closed in round 7). Round 6 left the
+   * scenario list and the exported surface as two tables nothing connected, so
+   * adding a public door without adding a scenario was caught by nothing. The
+   * test at the bottom of this file requires every FUNCTION export of both
+   * packages to appear here or in {@link NOT_SWEPT} with a reason.
+   */
+  readonly doors: readonly string[];
+  /**
    * The answer under test. Must be deterministic, and must do NOTHING but call
    * the subject: every input is built at module scope, OUTSIDE the polluted
    * window, so that what is measured is the product's behaviour and not the
@@ -301,6 +356,23 @@ interface Scenario {
    * probes below assert zero at the sites the BLOCKER named.
    */
   readonly parses: boolean;
+  /**
+   * When true, the ONE tolerated divergence is not tolerated for this scenario:
+   * the answer must be byte-identical under every key and every mode.
+   *
+   * SET FOR THE CANCEL, AND ONLY FOR THE CANCEL (review round 7, BLOCKER). §6
+   * invariant 13 says a valid cancel is not blocked; "it became a typed refusal
+   * instead" is a fail-closed answer for an ENTRY and a TRAPPED POSITION for a
+   * cancel, which is what the reviewer's probe demonstrated. Measured after the
+   * round-7 fix: with the tolerance disabled everywhere, the surviving
+   * divergences are all on ENTRY-shaped parsing doors and all in the two GETTER
+   * modes — `zod`'s own compiled parser reading declared names off objects it
+   * created, contained as a typed refusal — and the CANCEL scenario has NONE.
+   *
+   * IF THIS EVER FAILS, A CANCEL IS BEING TRAPPED AGAIN. It is a finding, not a
+   * flag to clear.
+   */
+  readonly identicalOrFail?: boolean;
 }
 
 /**
@@ -352,7 +424,10 @@ function sweep(scenario: Scenario): string[] {
         // never become permissive, never stay permissive with different
         // content, and an answer with no permission bit at all — a snapshot —
         // may not change in any way.
-        const tolerated = baselineGrade !== "opaque" && result.grade === "refusal";
+        const tolerated =
+          scenario.identicalOrFail !== true &&
+          baselineGrade !== "opaque" &&
+          result.grade === "refusal";
         if (!tolerated) {
           failures.push(
             `${scenario.name} | ${mode} on "${key}" | ANSWER CHANGED (${baselineGrade} → ${result.grade}) ${divergence(baseline, result.answer)}`,
@@ -507,114 +582,143 @@ const SELL_NO_SIDE = { ...SELL_REQUEST, side: "NO" };
 const SCENARIOS: readonly Scenario[] = [
   {
     name: "evaluateIntent — a fully passing ENTRY",
+    doors: ["evaluateIntent"],
     answer: () => evaluateIntent(POLICY, ENTRY),
     material: ENTRY,
     parses: true,
   },
   {
     name: "evaluateIntent — a fully passing EXIT",
+    doors: ["evaluateIntent"],
     answer: () => evaluateIntent(POLICY, EXIT),
     material: EXIT,
     parses: true,
   },
   {
     name: "evaluateIntent — a CANCEL (§6 invariant 13)",
+    doors: ["evaluateIntent"],
     answer: () => evaluateIntent(POLICY, CANCEL),
     material: CANCEL,
     parses: true,
+    // A cancel that "merely" became a refusal is a TRAPPED POSITION.
+    identicalOrFail: true,
+  },
+  {
+    name: "validateEvaluationInput — a CANCEL at the door (§6 invariant 13)",
+    doors: ["validateEvaluationInput"],
+    answer: () => validateEvaluationInput(CANCEL),
+    material: CANCEL,
+    parses: true,
+    identicalOrFail: true,
   },
   {
     name: "evaluateIntent — every exposure limit configured and measured",
+    doors: ["evaluateIntent"],
     answer: () => evaluateIntent(EXPOSURE_POLICY, EXPOSURE_ENTRY_INPUT),
     material: EXPOSURE_ENTRY_INPUT,
     parses: true,
   },
   {
     name: "evaluateIntent — an entry with NO exposure snapshot (fail closed)",
+    doors: ["evaluateIntent"],
     answer: () => evaluateIntent(EXPOSURE_POLICY, NO_SNAPSHOT_INPUT),
     material: NO_SNAPSHOT_INPUT,
     parses: true,
   },
   {
     name: "validateEvaluationInput — the door",
+    doors: ["validateEvaluationInput"],
     answer: () => validateEvaluationInput(ENTRY),
     material: ENTRY,
     parses: true,
   },
   {
     name: "parseRiskPolicy",
+    doors: ["parseRiskPolicy"],
     answer: () => parseRiskPolicy(POLICY_INPUT),
     material: POLICY_INPUT,
     parses: true,
   },
   {
     name: "resizeApprovedIntent",
+    doors: ["resizeApprovedIntent"],
     answer: () => resizeApprovedIntent(RECORD as never, RESIZE_REQUEST),
     material: { record: RECORD, request: RESIZE_REQUEST },
     parses: true,
   },
   {
     name: "parseAllocatorCaps",
+    doors: ["parseAllocatorCaps"],
     answer: () => parseAllocatorCaps(CAPS_INPUT),
     material: CAPS_INPUT,
     parses: true,
   },
   {
     name: "createAllocatorState",
+    doors: ["createAllocatorState"],
     answer: () => createAllocatorState(STATE_INPUT),
     material: STATE_INPUT,
     parses: true,
   },
   {
     name: "evaluateReservation — a LIVE BUY that is permitted",
+    doors: ["evaluateReservation"],
     answer: () => evaluateReservation(OWNED_STATE, CAPS, BUY_REQUEST),
     material: { state: STATE_INPUT, request: BUY_REQUEST },
     parses: true,
   },
   {
     name: "evaluateReservation — a LIVE SELL against held inventory",
+    doors: ["evaluateReservation"],
     answer: () => evaluateReservation(OWNED_STATE, CAPS, SELL_REQUEST),
     material: { state: STATE_INPUT, request: SELL_REQUEST },
     parses: true,
   },
   {
     name: "evaluateReservation — NO live owner recorded (the round-6 BLOCKER path)",
+    doors: ["evaluateReservation"],
     answer: () => evaluateReservation(UNOWNED_STATE, CAPS, BUY_REQUEST),
     material: { state: UNOWNED_STATE_INPUT, request: BUY_REQUEST },
     parses: true,
   },
   {
     name: "evaluateReservation — a SELL with ZERO holdings (the round-6 inventory probe)",
+    doors: ["evaluateReservation"],
     answer: () => evaluateReservation(FLAT_STATE, CAPS, SELL_NO_SIDE),
     material: { state: { ...STATE_INPUT, positions: [] }, request: SELL_NO_SIDE },
     parses: true,
   },
   {
     name: "applyReservation",
+    doors: ["applyReservation"],
     answer: () => applyReservation(OWNED_STATE, CAPS, BUY_REQUEST),
     material: { state: STATE_INPUT, request: BUY_REQUEST },
     parses: true,
   },
   {
     name: "releaseReservation",
+    doors: ["releaseReservation"],
     answer: () => releaseReservation(APPLIED_STATE, "res-1"),
     material: { state: STATE_INPUT, request: BUY_REQUEST },
     parses: false,
   },
   {
     name: "exposureSnapshotCovering",
+    doors: ["exposureSnapshotCovering"],
     answer: () => exposureSnapshotCovering(OWNED_STATE, COVERAGE),
     material: { state: STATE_INPUT, coverage: COVERAGE },
     parses: false,
   },
   {
     name: "withLiveOwner",
+    doors: ["withLiveOwner"],
     answer: () => withLiveOwner(UNOWNED_STATE, MARKET_A, INSTANCE),
     material: { state: UNOWNED_STATE_INPUT, marketId: MARKET_A, instance: INSTANCE },
     parses: false,
   },
   {
     name: "the live-micro fence (AGENTS.md floors)",
+    doors: ["nonFloorLiveMicroCapFields", "liveMicroCapRefusals"],
     answer: () => ({
       fields: nonFloorLiveMicroCapFields(CAPS),
       refusals: liveMicroCapRefusals(CAPS),
@@ -636,6 +740,7 @@ describe("THE MECHANISM: an inherited property changes no public answer", () => 
     // every assertion above is a tautology about a harness that does nothing.
     const naive: Scenario = {
       name: "a deliberately naive subject",
+      doors: [],
       answer: () => {
         const table: Record<string, string> = { present: "own" };
         return { read: table["marketId"] ?? "absent" };
@@ -652,6 +757,7 @@ describe("THE MECHANISM: an inherited property changes no public answer", () => 
     // harness can only make when something else already failed.
     const quiet: Scenario = {
       name: "a subject that reads the prototype and discards the answer",
+      doors: [],
       answer: () => {
         const table: Record<string, string> = {};
         // eslint-disable-next-line @typescript-eslint/no-unused-expressions
@@ -663,6 +769,92 @@ describe("THE MECHANISM: an inherited property changes no public answer", () => 
     };
     const quietFailures = sweep(quiet);
     expect(quietFailures.join("\n")).toContain("INVOKED");
+  });
+
+  /**
+   * THE JOIN — round 6's follow-up R6-2, closed.
+   *
+   * Round 6 shipped two tables nothing connected: this file's SCENARIOS and
+   * `public-surface.test.ts`'s classified exports. A new public door therefore
+   * needed no pollution scenario, and its absence was silent. The exported
+   * surface is read HERE from the module namespaces — the same mechanical source
+   * the surface test uses — and every FUNCTION must be swept or registered.
+   */
+  const PROPAGATES_BY_CLASSIFICATION =
+    "classified `propagates` in `public-surface.test.ts`: typed parameters and a result type that cannot express a refusal, so it is a helper rather than a door. Every in-repository call site runs inside a containment guard, and the DOOR that contains it is swept above";
+  const PRIMITIVE_OVER_PRIMITIVES =
+    "a constructor or predicate over primitives and values this package built; it reads no caller-supplied record, so there is no lookup for an inherited property to answer";
+
+  const NOT_SWEPT: readonly { readonly name: string; readonly reason: string }[] = [
+    ...(
+      [
+        "assessWorstCase",
+        "settlementValueUnderOutcome",
+        "buildWorstCaseLots",
+        "assessScenarios",
+        "assessFreshness",
+        "buildIntentView",
+        "heldShares",
+        "checkExposureLimits",
+        "recommendIncidentActions",
+        "exposureSnapshot",
+        "shadowExposureSnapshot",
+        "heldSharesByKey",
+        "reservedSharesByKey",
+      ] as const
+    ).map((name) => ({ name, reason: PROPAGATES_BY_CLASSIFICATION })),
+    ...(
+      [
+        "riskRefusal",
+        "riskOk",
+        "riskFailure",
+        "isRiskReasonCode",
+        "isPrimaryRiskReasonCode",
+        "instantMilliseconds",
+        "isExpired",
+        "blocksAsStale",
+        "capitalRefusal",
+        "capitalOk",
+        "capitalFailure",
+        "isCapitalRefusalCode",
+        "inventoryKey",
+      ] as const
+    ).map((name) => ({ name, reason: PRIMITIVE_OVER_PRIMITIVES })),
+  ];
+
+  it("every public FUNCTION of both packages is swept, or registered with a reason (R6-2)", () => {
+    const exported = [
+      ...Object.entries(riskModule as Record<string, unknown>),
+      ...Object.entries(allocatorModule as Record<string, unknown>),
+    ]
+      .filter(([, value]) => typeof value === "function")
+      .map(([name]) => name);
+    expect(exported.length).toBeGreaterThan(20); // non-vacuity
+
+    const swept = new Set(SCENARIOS.flatMap((scenario) => scenario.doors));
+    const registered = new Map(NOT_SWEPT.map((entry) => [entry.name, entry.reason]));
+    const failures: string[] = [];
+    for (const name of exported) {
+      if (swept.has(name) || registered.has(name)) continue;
+      failures.push(
+        `${name} is a public function with NO pollution scenario and no registration — add a scenario to SCENARIOS (naming it in \`doors\`) or register it in NOT_SWEPT with a reason`,
+      );
+    }
+    // and neither table may rot: a registration or a `doors` entry that names
+    // nothing exported is a stale claim about coverage.
+    for (const [name] of registered) {
+      if (!exported.includes(name)) failures.push(`STALE registration: ${name} is not an export`);
+    }
+    for (const name of swept) {
+      if (!exported.includes(name)) failures.push(`STALE scenario door: ${name} is not an export`);
+    }
+    expect(failures).toEqual([]);
+  });
+
+  it("every NOT_SWEPT registration carries a substantive reason", () => {
+    for (const entry of NOT_SWEPT) {
+      expect(entry.reason.length, entry.name).toBeGreaterThan(40);
+    }
   });
 
   it("the key material is derived from the inputs, not from a hand-written list", () => {

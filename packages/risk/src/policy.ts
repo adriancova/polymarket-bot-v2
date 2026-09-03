@@ -33,7 +33,7 @@ import {
 } from "@polymarket-bot/domain";
 
 import { FreshnessPolicySchema } from "./freshness.js";
-import { hardenParsed, readPlainData } from "./plain-data.js";
+import { readPlainData, withSchemaDefaults, type SchemaDefault } from "./plain-data.js";
 import { contained, riskFailure, riskOk, riskRefusal, type RiskResult } from "./result.js";
 
 export const SCENARIO_KINDS = ["SPOT", "VOLATILITY", "TIME", "LIQUIDITY"] as const;
@@ -98,6 +98,40 @@ export const RiskPolicySchema = z.strictObject({
 export type RiskPolicy = z.infer<typeof RiskPolicySchema>;
 
 /**
+ * EVERY value this schema supplies when the caller omits the field.
+ *
+ * WHY A TABLE AND NOT THE PARSE OUTPUT (review round 7). A `.default()` is the
+ * one part of a validated policy that does not come from the caller, so it is
+ * the one part {@link parseRiskPolicy} cannot take from the materialized read —
+ * and taking it from `zod`'s output is what proposition 5 in `plain-data.ts`
+ * forbids, for a measured reason. With a single get-only accessor on
+ * `Object.prototype`, `zod` fails to assign its own default, the key is not own
+ * in the output, and the later read of it walks the chain to the attacker's
+ * value. At the round-6 tip that silently disabled real checks:
+ *
+ * ```text
+ * get-only Object.prototype.requireVerifiedSettlementForEntries
+ *   → §9.8 check 6 skipped; an entry with unverified settlement was APPROVED
+ * get-only Object.prototype.requirePositiveNetEdgeForEntries
+ *   → §9.8 check 12 skipped; an entry with a NEGATIVE net edge was APPROVED
+ * get-only Object.prototype.maxRunMode
+ *   → §9.8 check 2 gone; a LIVE run mode no longer exceeded the maximum
+ * ```
+ *
+ * The table is bound to the schema by `test/unit/risk/schema-output.test.ts`:
+ * every `.default()` in `RiskPolicySchema` must appear here with the same value,
+ * and an entry here that the schema does not declare fails too. Adding a default
+ * to the schema without adding it here does not compile past that test.
+ */
+export const RISK_POLICY_DEFAULTS: readonly SchemaDefault[] = Object.freeze([
+  { path: Object.freeze(["maxRunMode"]), value: "PAPER" },
+  { path: Object.freeze(["requireVerifiedSettlementForEntries"]), value: true },
+  { path: Object.freeze(["scenario", "requiredKinds"]), value: [...SCENARIO_KINDS] },
+  { path: Object.freeze(["economics", "riskBuffer"]), value: "0" },
+  { path: Object.freeze(["economics", "requirePositiveNetEdgeForEntries"]), value: true },
+] as const);
+
+/**
  * Validates a caller-supplied policy; refuses rather than repairing.
  *
  * READ AS DATA BEFORE IT IS PARSED (review round 5, BLOCKER 3). A policy is a
@@ -128,24 +162,26 @@ export function parseRiskPolicy(input: unknown): RiskResult<RiskPolicy> {
           }),
         );
       }
-      // THE PARSE OUTPUT IS RE-HARDENED (review round 6): `zod` builds its
-      // result with `{}`, so every ABSENT OPTIONAL LIMIT of the parsed policy
-      // (`limits.perMarketExposureCap`, `economics.*`, `participation.*`) would
-      // have been answered by `Object.prototype` — a configured cap nobody
-      // configured, or a missing one that suddenly exists. The same call
-      // refuses a parse output that LOST a field the caller supplied: a
-      // silently dropped limit is a limit nobody enforces.
-      const hardened = hardenParsed(read.value, parsed.data, "policy");
-      if (!hardened.ok) {
+      // THE VALIDATED POLICY IS THE MATERIALIZED TREE (review round 7). The
+      // parse answered the QUESTION; its output object is not read. `read.value`
+      // is own data with no prototype, so an ABSENT OPTIONAL LIMIT
+      // (`limits.perMarketExposureCap`, `economics.minOrderNotional`,
+      // `participation.maxOrderShares`) stays absent for every read downstream
+      // instead of being answered by `Object.prototype`, and a limit the caller
+      // DID configure can no longer vanish in the library's output assembly.
+      // The schema's own defaults are applied from the declared table, because
+      // they are the one part of the answer the caller did not supply.
+      const defaulted = withSchemaDefaults(read.value, RISK_POLICY_DEFAULTS);
+      if (!defaulted.ok) {
         return riskFailure<RiskPolicy>(
           riskRefusal(
             "RISK_INPUT_INVALID",
-            "the validated policy lost fields between validation and use, so a configured limit could go unenforced (fail closed)",
-            { lost: [...hardened.lost] },
+            "a policy default could not be applied to the validated policy, so a safety default would be missing rather than enforced (fail closed)",
+            { unfilled: [...defaulted.unfilled] },
           ),
         );
       }
-      return riskOk(Object.freeze(hardened.value as RiskPolicy));
+      return riskOk(Object.freeze(defaulted.value as RiskPolicy));
     },
     (thrown) =>
       riskFailure(

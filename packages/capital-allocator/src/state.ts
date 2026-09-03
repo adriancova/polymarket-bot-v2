@@ -42,7 +42,6 @@ import {
 import { z } from "zod";
 
 import { deepFreeze, ownEntry, setOwn, uuidShapedNotCanonical } from "./guards.js";
-import { hardenParsed } from "./plain-data.js";
 import {
   capitalFailure,
   capitalOk,
@@ -238,24 +237,16 @@ function createAllocatorStateInner(input: unknown): CapitalResult<AllocatorState
       }),
     );
   }
-  // THE PARSE OUTPUT IS RE-HARDENED (review round 6): `zod` builds its result
-  // with `{}`, so an absent optional field of a position or an order —
-  // `scope`, and every key under it — would have been answered by
-  // `Object.prototype`, attributing a holding to a scope nobody supplied. The
-  // same call refuses an output SMALLER than what was read: an inherited
-  // get-only accessor makes `zod`'s assignment fail, and a state missing a
-  // position or an open order is a state that under-states its own commitments.
-  const hardenedState = hardenParsed(read.value, parsed.data, "state");
-  if (!hardenedState.ok) {
-    return capitalFailure(
-      capitalRefusal(
-        "CAPITAL_INPUT_INVALID",
-        "the validated allocator state lost fields between validation and use, so it would under-state the commitments it was given (fail closed)",
-        { lost: [...hardenedState.lost] },
-      ),
-    );
-  }
-  const data = hardenedState.value as AllocatorStateInput;
+  // THE VALIDATED STATE IS THE MATERIALIZED TREE (review round 7): the parse
+  // answered the QUESTION, and its output object is not read. An absent optional
+  // field of a position or an order — `scope`, and every key under it — stays
+  // absent because `read.value` has no prototype, so no holding is attributed to
+  // a scope nobody supplied; and a position or an open order can no longer
+  // vanish in an output assembly that an inherited get-only accessor defeats,
+  // which would have under-stated the very commitments this state exists to
+  // conserve. `AllocatorStateInputSchema` contributes no value of its own
+  // (pinned by `test/unit/risk/schema-output.test.ts`).
+  const data = read.value as AllocatorStateInput;
 
   const refusals: CapitalRefusal[] = nonCanonicalIdRefusals(data);
 

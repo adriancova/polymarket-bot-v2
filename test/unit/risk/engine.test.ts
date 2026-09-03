@@ -23,6 +23,7 @@ import {
   isRiskReasonCode,
   parseRiskPolicy,
   resizeApprovedIntent,
+  validateEvaluationInput,
   type ApprovedIntentRecord,
   type RiskPolicy,
   type RiskReasonCode,
@@ -762,9 +763,14 @@ describe("the reason-code vocabulary", () => {
     const documented = new Set(
       [...readme.matchAll(/`(RISK_[A-Z0-9_]+)`/gu)].map((match) => match[1] as string),
     );
-    // `RISK_REASON_CODES` is the list's own name, not a code.
+    // `RISK_`-prefixed names that are NOT reason codes: the list's own name, its
+    // count, and (review round 7) the policy door's declared default table,
+    // which README §4.7 names because a consumer reading about the checks that
+    // vanished under prototype pollution needs to know where the floor comes
+    // from. Each exclusion is a NAME this package exports, never a code.
     documented.delete("RISK_REASON_CODES");
     documented.delete("RISK_REASON_CODE_COUNT");
+    documented.delete("RISK_POLICY_DEFAULTS");
     expect(RISK_REASON_CODES.filter((code) => !documented.has(code))).toEqual([]);
     expect([...documented].filter((code) => !isRiskReasonCode(code))).toEqual([]);
     expect(documented.size).toBe(RISK_REASON_CODE_COUNT);
@@ -1047,6 +1053,91 @@ describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
     const result = evaluateIntent(riskPolicy(), { intent: { type: "CANCEL" } });
     expect(result.approved).toBe(false);
     expect(codesOf(result)).toEqual(["RISK_INPUT_INVALID"]);
+  });
+
+  /**
+   * REVIEW ROUND 7, BLOCKER — a GET-ONLY inherited field may not trap a cancel.
+   *
+   * The reviewer's probe, kept as a mandatory case. `Object.prototype.reason` is
+   * defined as a GET-ONLY accessor and nothing else changes: the caller's
+   * `intent.reason` is its own valid string, the materialized input is intact,
+   * and the schema reports success. But `zod` assembles its output BY
+   * ASSIGNMENT, and an assignment that finds an inherited get-only accessor does
+   * not write — so the field vanished from the output, and remediation round 6's
+   * "the output is smaller than the input" check refused the whole request:
+   *
+   * ```text
+   * clean:    approved=true, codes=[]
+   * polluted: validateOk=false, approved=false
+   * code:     RISK_INPUT_INVALID
+   * lost:     ["input.intent.reason"]
+   * getterCalls=0
+   * ```
+   *
+   * The lost field was an artefact of the LIBRARY'S output assembly, not of the
+   * caller's input, so this is a VALID cancel and §6 invariant 13 protects it.
+   * Round 7 stopped reading that output at all: the door validates the
+   * materialized tree and then USES the materialized tree. The assertions are the
+   * reviewer's own — `approved=true`, and ZERO getter invocations, because
+   * nothing in either package reads that name through a prototype.
+   */
+  describe("a get-only inherited field never traps a valid CANCEL (round 7 BLOCKER)", () => {
+    /** Every name whose get-only inherited accessor refused a CANCEL at round 6. */
+    const TRAPPED_AT_ROUND_6 = [
+      "reason", // the reviewer's own probe: the CANCEL's own field
+      "marketId",
+      "type",
+      "bookSynchronized",
+      "allocation",
+      "approvedIntentId",
+    ] as const;
+
+    function withGetOnly<T>(key: string, body: () => T): { readonly value: T; readonly calls: number } {
+      let calls = 0;
+      Object.defineProperty(Object.prototype, key, {
+        get(): unknown {
+          calls += 1;
+          return "1000";
+        },
+        enumerable: false,
+        configurable: true,
+      });
+      try {
+        return { value: body(), calls };
+      } finally {
+        delete (Object.prototype as Record<string, unknown>)[key];
+      }
+    }
+
+    for (const key of TRAPPED_AT_ROUND_6) {
+      it(`is approved, with ZERO getter calls, under a get-only Object.prototype.${key}`, () => {
+        const input = entryInput();
+        input.intent = cancelIntent();
+        const clean = evaluateIntent(riskPolicy(), input);
+        expect(clean.approved).toBe(true);
+
+        const polluted = withGetOnly(key, () => ({
+          validated: validateEvaluationInput(input),
+          evaluation: evaluateIntent(riskPolicy(), input),
+        }));
+
+        expect(polluted.value.validated.ok).toBe(true);
+        expect(codesOf(polluted.value.evaluation)).toEqual([]);
+        expect(polluted.value.evaluation.approved).toBe(true);
+        expect(polluted.calls).toBe(0);
+        // and the answer is the same answer, not merely another approval
+        expect(JSON.stringify(polluted.value.evaluation)).toBe(JSON.stringify(clean));
+      });
+    }
+
+    it("the harness really does pollute: a naive read of the same name sees it", () => {
+      // Non-vacuity. If the descriptor were not installed, every case above
+      // would pass for the wrong reason.
+      const seen = withGetOnly("reason", () => ({} as Record<string, unknown>)["reason"]);
+      expect(seen.value).toBe("1000");
+      expect(seen.calls).toBe(1);
+      expect(Object.hasOwn(Object.prototype, "reason")).toBe(false);
+    });
   });
 });
 

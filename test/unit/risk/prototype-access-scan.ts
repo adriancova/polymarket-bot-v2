@@ -23,28 +23,83 @@
  *
  * | kind | construct | why it is prototype-consulting |
  * | --- | --- | --- |
- * | `element-read` | `o[k]` | `Get` walks the prototype chain |
+ * | `element-read` | `o[k]`, `o?.[k]` | `Get` walks the prototype chain |
  * | `element-write` | `o[k] = v` | `Set` walks the chain and invokes an inherited SETTER |
  * | `element-compound` | `o[k] ??= v`, `o[k] += v`, `o[k]++` | a `Get` and a `Set` |
  * | `delete-element` | `delete o[k]` | own-only, but it is how a table is edited |
  * | `in` | `k in o` | answers TRUE for an inherited or a prototype member |
- * | `object-spread` | `{ ...o }` | own-only READ, but the RESULT inherits `Object.prototype` |
+ * | `object-spread` | `{ ...o }` | own-only READ, but it INVOKES own getters and the RESULT inherits `Object.prototype` |
  * | `object-assign` | `Object.assign(t, o)` | same, plus it invokes inherited setters on the target |
+ * | `object-destructure` | `const { v } = o`, `function f({ v })`, `({ v } = o)` | one `Get` per name: the chain, and any getter |
+ * | `for-in` | `for (const k in o)` | ENUMERATES inherited enumerable names |
+ * | `reflect-chain` | `Reflect.get/set/has/getPrototypeOf/setPrototypeOf` | the chain by construction (and any unrecognized `Reflect` member) |
+ * | `object-entries` | `Object.entries(o)`, `Object.values(o)` | own-only, but it INVOKES every own getter |
+ * | `structured-clone` | `structuredClone(o)` | invokes own getters, and the clone inherits `Object.prototype` |
+ * | `own-enumeration` | `Object.keys`, `Object.getOwnPropertyNames`, `Reflect.ownKeys` | own-only names, no getter — safe, enumerated so the census is total |
  * | `computed-key` | `{ [k]: v }` | `CreateDataProperty` — safe, enumerated so the census is total |
  *
  * The census is the input to a test that requires EVERY site to be either an
  * own-property primitive or an explicitly registered exception carrying a
  * reason. Nothing is classified by being unnoticed.
  *
- * SCOPE, STATED SO IT IS NOT A FOURTH ABSOLUTE. This census covers COMPUTED
- * member access, `in`, spreads and `Object.assign`. It does NOT cover a plain
- * dotted read (`caps.liveMicroMaxOrderNotional`), which also consults the
- * prototype: every field read in both packages is one, so a rule over them
- * would be noise rather than a gate. The complementary mechanism for that class
- * is behavioural rather than syntactic — `inherited-state.test.ts` augments
- * `Object.prototype` with each key these packages actually use and requires
- * every public answer to be unchanged — and it is what caught the caps-fence
- * hole that no syntactic rule would have flagged.
+ * ---------------------------------------------------------------------------
+ * SCOPE — THE COMPLETE LIST OF WHAT THIS DETECTOR DOES NOT SEE (round 7)
+ * ---------------------------------------------------------------------------
+ *
+ * Round 6 stated the boundary as "not a plain dotted read". Review round 7
+ * measured the boundary instead of reading it, and found it under-stated: four
+ * further forms — destructuring, `Reflect.get`, `for…in` and `structuredClone` —
+ * were SILENT, so the primary build mechanism would have accepted any of them as
+ * a future regression WITHOUT classifying it. All four are detected above now.
+ * What remains excluded is listed here IN FULL, each with the reason and with
+ * the mechanism that covers it instead; an under-stated boundary is the finding
+ * this list exists to prevent recurring.
+ *
+ * 1. **A DOTTED READ** (`caps.liveMicroMaxOrderNotional`). It consults the
+ *    prototype, and every field read in both packages is one, so a syntactic
+ *    rule over them would be noise rather than a gate. Covered BEHAVIOURALLY by
+ *    `inherited-state.test.ts`, which augments `Object.prototype` with each name
+ *    these packages actually use and requires every public answer to be
+ *    unchanged. That is what caught the caps-fence hole no syntactic rule would
+ *    have flagged.
+ * 2. **PER-PROPERTY OWN PREDICATES AND DESCRIPTOR READS** — `Object.hasOwn`,
+ *    `Object.getOwnPropertyDescriptor(s)`, `Object.defineProperty`,
+ *    `Reflect.getOwnPropertyDescriptor`, `Reflect.defineProperty`. They are
+ *    own-only, they invoke no accessor, and they are the very primitives this
+ *    review chain prescribes; flagging thirty of them would drown the table.
+ *    (`Reflect.*` is nonetheless classified above, so only the `Object.*` forms
+ *    are excluded here.)
+ * 3. **THE ITERATION PROTOCOL** — `for…of`, array destructuring (`const [a] =
+ *    xs`), array spread (`[...xs]`, `f(...xs)`), `yield*`. Each resolves
+ *    `Symbol.iterator` on an intrinsic PROTOTYPE, which is round 5's stated
+ *    assumption (`plain-data.ts`, proposition 1: the intrinsics are genuine),
+ *    not the caller-supplied-value threat model. A caller-supplied value never
+ *    reaches one of these before being materialized, and a materialized record
+ *    is an array or a prototype-FREE object, which has no `Symbol.iterator` to
+ *    inherit.
+ * 4. **CALL-SITE AND DATA-FLOW REASONING.** A helper that receives an object and
+ *    reads `o[k]` is flagged AT THE HELPER, once; the census says nothing about
+ *    what its callers pass, and no site is exonerated by an argument about its
+ *    callers. This is a limitation of a syntactic census and is why every
+ *    registration carries a reason about the VALUE, not about the syntax.
+ * 5. **IMPLICIT COERCION** — `String(o)`, `` `${o}` ``, `o == x`, `+o`,
+ *    `JSON.stringify(o)`. Each can invoke an inherited `toString`, `valueOf`,
+ *    `@@toPrimitive` or `toJSON`. Round 5's escape was exactly this
+ *    (`String(reported)` on a hostile `length`), and the answer was structural
+ *    rather than syntactic: `describeValue` never coerces a caller-derived
+ *    value, and every public door runs inside a containment guard.
+ * 6. **DYNAMIC EVALUATION** — `eval`, `new Function`, dynamic `import()` of a
+ *    computed specifier. None appears in either package; the repository-wide
+ *    `check:deps` scanner is the mechanism that reports them.
+ * 7. **CLASS SYNTAX** — `super.x`, `extends`, `instanceof`, `Object.create(p)`.
+ *    Neither package declares a class or uses `instanceof`; every object either
+ *    is a literal, is materialized with a `null` prototype, or comes from a
+ *    library. `Object.create(null)` is the materializer's own primitive.
+ *
+ * Items 1–7 are the WHOLE of the exclusion. A form not listed here and not in
+ * the table above is an omission, and `prototype-access.test.ts` probes each
+ * detected form AND each excluded form so this list is exercised rather than
+ * merely written.
  */
 
 import { readFileSync, readdirSync } from "node:fs";
@@ -66,7 +121,31 @@ export type AccessKind =
   | "in"
   | "object-spread"
   | "object-assign"
+  | "object-destructure"
+  | "for-in"
+  | "reflect-chain"
+  | "object-entries"
+  | "structured-clone"
+  | "own-enumeration"
   | "computed-key";
+
+/** Every kind, so a test can prove the vocabulary is closed and exercised. */
+export const ACCESS_KINDS: readonly AccessKind[] = [
+  "element-read",
+  "element-write",
+  "element-compound",
+  "delete-element",
+  "in",
+  "object-spread",
+  "object-assign",
+  "object-destructure",
+  "for-in",
+  "reflect-chain",
+  "object-entries",
+  "structured-clone",
+  "own-enumeration",
+  "computed-key",
+];
 
 export interface AccessSite {
   /** Repository-relative path, POSIX separators. */
@@ -179,13 +258,72 @@ function elementAccessKind(node: ts.ElementAccessExpression, parent: ts.Node | u
   return "element-read";
 }
 
-function isObjectAssign(node: ts.CallExpression): boolean {
+/**
+ * The `Object.*` / `Reflect.*` members whose CALL is a census site, by kind.
+ *
+ * `Reflect` is classified in FULL and fails closed: a member not named here is
+ * reported as `reflect-chain`, the stricter kind, so a future `Reflect.foo`
+ * cannot be silent. `Object` is not classified in full — its own-only
+ * per-property primitives (`hasOwn`, `getOwnPropertyDescriptor`,
+ * `defineProperty`) are the prescribed safe forms and are excluded by item 2 of
+ * the scope list in the module header.
+ */
+const OBJECT_MEMBER_KINDS: ReadonlyMap<string, AccessKind> = new Map<string, AccessKind>([
+  ["assign", "object-assign"],
+  ["entries", "object-entries"],
+  ["values", "object-entries"],
+  ["keys", "own-enumeration"],
+  ["getOwnPropertyNames", "own-enumeration"],
+]);
+
+const REFLECT_OWN_MEMBERS: ReadonlySet<string> = new Set([
+  "ownKeys",
+  "getOwnPropertyDescriptor",
+  "defineProperty",
+  "deleteProperty",
+  "isExtensible",
+  "preventExtensions",
+  "apply",
+  "construct",
+]);
+
+/** `X.member(…)` → the member name, when the callee is exactly that shape. */
+function staticMemberCall(node: ts.CallExpression, objectName: string): string | undefined {
   const callee = node.expression;
-  return (
+  if (
     ts.isPropertyAccessExpression(callee) &&
     ts.isIdentifier(callee.expression) &&
-    callee.expression.text === "Object" &&
-    callee.name.text === "assign"
+    callee.expression.text === objectName
+  ) {
+    return callee.name.text;
+  }
+  return undefined;
+}
+
+/** The census kind of a CALL expression, or `undefined` if it is not a site. */
+function callKind(node: ts.CallExpression): AccessKind | undefined {
+  const objectMember = staticMemberCall(node, "Object");
+  if (objectMember !== undefined) return OBJECT_MEMBER_KINDS.get(objectMember);
+  const reflectMember = staticMemberCall(node, "Reflect");
+  if (reflectMember !== undefined) {
+    if (reflectMember === "ownKeys") return "own-enumeration";
+    // FAIL CLOSED: anything not on the own-only list is the chain-walking kind.
+    return REFLECT_OWN_MEMBERS.has(reflectMember) ? "own-enumeration" : "reflect-chain";
+  }
+  if (ts.isIdentifier(node.expression) && node.expression.text === "structuredClone") {
+    return "structured-clone";
+  }
+  return undefined;
+}
+
+/**
+ * An object destructuring ASSIGNMENT (`({ a } = o)`), which has no binding
+ * pattern node — the left side is parsed as an object LITERAL.
+ */
+function isDestructuringAssignment(node: ts.BinaryExpression): boolean {
+  return (
+    node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+    ts.isObjectLiteralExpression(node.left)
   );
 }
 
@@ -260,9 +398,15 @@ function sitesIn(source: ts.SourceFile, repoRelative: string): AccessSite[] {
     if (ts.isElementAccessExpression(node)) push(node, elementAccessKind(node, parent));
     else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.InKeyword) {
       push(node, "in");
-    } else if (ts.isSpreadAssignment(node)) push(node, "object-spread");
-    else if (ts.isCallExpression(node) && isObjectAssign(node)) push(node, "object-assign");
-    else if (
+    } else if (ts.isBinaryExpression(node) && isDestructuringAssignment(node)) {
+      push(node, "object-destructure");
+    } else if (ts.isObjectBindingPattern(node)) push(node, "object-destructure");
+    else if (ts.isForInStatement(node)) push(node, "for-in");
+    else if (ts.isSpreadAssignment(node)) push(node, "object-spread");
+    else if (ts.isCallExpression(node)) {
+      const kind = callKind(node);
+      if (kind !== undefined) push(node, kind);
+    } else if (
       ts.isComputedPropertyName(node) &&
       parent !== undefined &&
       ts.isPropertyAssignment(parent)

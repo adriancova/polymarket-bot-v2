@@ -35,7 +35,7 @@ import { z } from "zod";
 
 import { NonNegativeMoneyStringSchema } from "@polymarket-bot/domain";
 
-import { hardenParsed } from "./plain-data.js";
+import { withSchemaDefaults, type SchemaDefault } from "./plain-data.js";
 import {
   capitalFailure,
   capitalOk,
@@ -228,6 +228,28 @@ export const AllocatorCapsSchema = AllocatorCapsShapeSchema.superRefine((caps, c
 export type AllocatorCaps = z.infer<typeof AllocatorCapsSchema>;
 
 /**
+ * EVERY value this schema supplies when the caller omits the field — and both
+ * of them are `AGENTS.md` safety floors.
+ *
+ * WHY A TABLE AND NOT THE PARSE OUTPUT (review round 7). `zod` assembles its
+ * output by assignment, and with a get-only `Object.prototype
+ * .liveMicroMaxOrderNotional` the assignment of its OWN default fails: the key
+ * is not own in the output, and reading it walks the chain to the attacker's
+ * value. Round 6 caught that as a missing field and refused (the check below is
+ * still there); round 7 removes the exposure — the floor now comes from this
+ * table, which `test/unit/risk/schema-output.test.ts` binds to the schema's
+ * `.default()` values and to {@link LIVE_MICRO_CAP_FIELDS}, so a fenced field
+ * cannot be defaulted to anything but the floor and cannot be dropped from
+ * either list without failing.
+ */
+export const ALLOCATOR_CAPS_DEFAULTS: readonly SchemaDefault[] = Object.freeze(
+  LIVE_MICRO_CAP_FIELDS.map((field) => ({
+    path: Object.freeze([field]),
+    value: LIVE_MICRO_CAP_FLOOR,
+  })),
+);
+
+/**
  * Validates caller-supplied caps; refuses rather than repairing.
  *
  * The grammar is checked first so a malformed decimal reports
@@ -255,31 +277,37 @@ export function parseAllocatorCaps(input: unknown): CapitalResult<AllocatorCaps>
           }),
         );
       }
-      // THE PARSE OUTPUT IS RE-HARDENED (review round 6). `zod` builds its
-      // result with `{}`, so an ABSENT OPTIONAL CAP (`perMarketCap`, …) read off
-      // it would have been answered by `Object.prototype` — a cap nobody
-      // configured. And it can be SMALLER than what was read: with an inherited
-      // GET-ONLY accessor named `perMarketCap`, `zod`'s own assignment fails and
-      // a cap the caller DID configure vanishes from the output while the parse
-      // still succeeds. Both are refused here. The FENCE ORDER IS UNCHANGED:
-      // grammar, then hardening, then the live-micro fence with its own code.
-      const hardened = hardenParsed(read.value, parsed.data, "caps");
-      if (!hardened.ok) {
+      // THE VALIDATED CAPS ARE THE MATERIALIZED TREE (review round 7). `zod`
+      // answered the QUESTION; its output object is not read. That closes both
+      // round-6 findings at once: an ABSENT OPTIONAL CAP (`perMarketCap`, …)
+      // stays absent because `read.value` has no prototype, and a cap the caller
+      // DID configure can no longer vanish in an output assembly that an
+      // inherited get-only accessor defeats. THE FENCE ORDER IS UNCHANGED:
+      // grammar, then the schema's own defaults, then the live-micro fence with
+      // its own code.
+      //
+      // The two fenced fields are the reason this door needs a default table at
+      // all: their floor is the schema's `.default()`, not the caller's, and
+      // taking it from `zod`'s output is exactly what proposition 5 in
+      // `plain-data.ts` forbids — measured, that output can lack the key and
+      // answer the later read from `Object.prototype` instead.
+      const defaulted = withSchemaDefaults(read.value, ALLOCATOR_CAPS_DEFAULTS);
+      if (!defaulted.ok) {
         return capitalFailure<AllocatorCaps>(
           capitalRefusal(
-            "CAPITAL_INPUT_INVALID",
-            "the validated caps lost fields between validation and use, so a configured cap could go unenforced (fail closed)",
-            { lost: [...hardened.lost] },
+            "CAPITAL_LIVE_MICRO_CAP_NOT_PERMITTED",
+            LIVE_MICRO_FENCE_MESSAGE,
+            { unfilled: [...defaulted.unfilled], permitted: LIVE_MICRO_CAP_FLOOR },
           ),
         );
       }
-      const data = hardened.value as AllocatorCaps;
-      // THE FENCED FIELDS MUST BE PRESENT IN THE OUTPUT (review round 6). The
-      // schema DEFAULTS them, so after a successful parse they are always own
-      // data — unless an inherited get-only accessor blocked `zod`'s assignment
-      // of the default, in which case the caps this function would bless carry
-      // no live-micro floor at all. The absence is refused here rather than
-      // discovered later as an arithmetic failure at the enforcement gate.
+      const data = defaulted.value as AllocatorCaps;
+      // THE FENCED FIELDS MUST BE PRESENT (review round 6, kept as the second of
+      // the three fence layers). `withSchemaDefaults` above now guarantees it
+      // from a table this package declares rather than from the library's
+      // output, so this is defence in depth — and it stays, because "the caps
+      // this function blesses carry no live-micro floor at all" is the one
+      // outcome the `AGENTS.md` floors may never have.
       const missing = LIVE_MICRO_CAP_FIELDS.filter((field) => !Object.hasOwn(data, field));
       if (missing.length > 0) {
         return capitalFailure<AllocatorCaps>(

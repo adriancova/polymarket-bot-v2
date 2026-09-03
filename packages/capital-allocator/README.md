@@ -54,6 +54,28 @@ Boundary semantics a caller must wire correctly:
 - A state whose sell orders reserve more tokens than the owning instance holds
   is **refused at construction** (§9.14).
 
+### 2.1 Consuming a state — its caller-supplied parts have a `null` prototype
+
+**Read this before consuming a state or a verdict downstream.** Everything this
+package took from a caller is the *materialized* tree (`src/plain-data.ts`), so
+it is created with `Object.create(null)`; the containers this package builds
+itself are ordinary objects. Measured, and pinned by
+`test/unit/risk/public-surface.test.ts`:
+
+| Value | Prototype |
+| --- | --- |
+| `state` itself, `state.liveOwners` | `Object.prototype` (built here) |
+| `state.positions[i]`, `state.openOrders[i]`, and their `scope` | **`null`** (materialized from the caller) |
+| the caps object `parseAllocatorCaps` returns | **`null`** (materialized from the caller) |
+
+So on a materialized member use `Object.hasOwn(value, key)`, not
+`value.hasOwnProperty(key)`, and do not use `value instanceof Object` as an
+"is this an object" test. `JSON.stringify`, `Object.keys`, `in`, dotted reads and
+destructuring all behave normally. A **spread or a `structuredClone` RESTORES
+`Object.prototype`**, which silently gives up the guarantee that an absent field
+reads as absent — re-harden or re-validate a copy before reading optional fields
+off it. The same guidance, in full, is in `packages/risk/README.md` §6.1.
+
 ## 3. Caps
 
 §9.7: "Initial defaults should reflect user-defined caps rather than hardcoded
