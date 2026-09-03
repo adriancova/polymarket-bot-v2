@@ -46,7 +46,8 @@ import {
 } from "@polymarket-bot/domain";
 import { z } from "zod";
 
-import { deepFreeze, uuidShapedNotCanonical } from "./guards.js";
+import { deepFreeze } from "./guards.js";
+import { identityRefusals } from "./inputs.js";
 import type { RiskReasonCode } from "./reasons.js";
 import type { IncidentActionRecommendation } from "./recommendations.js";
 import { riskFailure, riskOk, riskRefusal, type RiskRefusal, type RiskResult } from "./result.js";
@@ -132,15 +133,31 @@ export function resizeApprovedIntent(
   const req = parsed.data;
   const refusals: RiskRefusal[] = [];
 
-  if (uuidShapedNotCanonical(req.approvedIntentId)) {
-    refusals.push(
-      riskRefusal(
-        "RISK_UUID_NOT_CANONICAL",
-        "approvedIntentId is UUID-shaped but not canonical lowercase (ADR-016 §2: refuse, never case-fold)",
-        { approvedIntentId: req.approvedIntentId },
-      ),
-    );
-  }
+  // --- ADR-016 §2 identity validation — the input surface of THIS function ---
+  //
+  // Both arguments are input. `request` is caller data; `record` is TYPED as an
+  // `ApprovedIntentRecord` but is not parsed at runtime, so a hand-built one can
+  // carry anything — and every identity field below is copied INTO the new
+  // record (`supersedesApprovedIntentId`, `rootApprovedIntentId`,
+  // `sourceIntentId`, `strategyInstanceId`, and the intent's own `intentId`).
+  // Validating them here is what makes "no path emits a contract-invalid
+  // approved record" true of this function too, not only of `evaluateIntent`
+  // (adversarial review round 2). Refuse, never case-fold; the raw value rides
+  // out on the refusal. Venue-supplied opaque ids are out of scope for the same
+  // reason as in `inputs.ts`.
+  refusals.push(
+    ...identityRefusals([
+      { field: "request.approvedIntentId", value: req.approvedIntentId },
+      { field: "record.approvedIntentId", value: record.approvedIntentId },
+      { field: "record.rootApprovedIntentId", value: record.rootApprovedIntentId },
+      { field: "record.supersedesApprovedIntentId", value: record.supersedesApprovedIntentId },
+      { field: "record.sourceIntentId", value: record.sourceIntentId },
+      { field: "record.strategyInstanceId", value: record.strategyInstanceId },
+      ...("intentId" in record.intent
+        ? [{ field: "record.intent.intentId", value: record.intent.intentId }]
+        : []),
+    ]),
+  );
 
   if (
     req.approvedIntentId === record.approvedIntentId ||

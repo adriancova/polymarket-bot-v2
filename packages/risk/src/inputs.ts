@@ -13,6 +13,12 @@
  * the named fields and ignores the rest) and pinned by the compile-time
  * assignability test in `test/unit/risk/` (the WP-110 universe↔settlement
  * precedent, strengthened: the pin is `tsc`-checked, not source-text-parsed).
+ *
+ * THIS MODULE OWNS THE WHOLE INPUT SURFACE. {@link validateEvaluationInput} is
+ * the single door into the §9.8 pipeline: it parses the schema AND applies
+ * ADR-016 §2 identity validation, and it answers before any disposition exists.
+ * See the block comment on that function — a well-formedness rule belongs HERE,
+ * never as a pipeline gate.
  */
 
 import { z } from "zod";
@@ -30,10 +36,13 @@ import {
   PositiveDecimalStringSchema,
   PriceStringSchema,
   RunModeSchema,
+  type Intent,
 } from "@polymarket-bot/domain";
 
 import { FreshnessObservationSchema } from "./freshness.js";
+import { uuidShapedNotCanonical } from "./guards.js";
 import { SCENARIO_KINDS } from "./policy.js";
+import { riskRefusal, type RiskRefusal } from "./result.js";
 
 /** Scope attribution for the §9.7 exposure dimensions (from the universe layer). */
 export const ScopeAttributionSchema = z.strictObject({
@@ -214,3 +223,126 @@ export const RiskEvaluationInputSchema = z.strictObject({
   }),
 });
 export type RiskEvaluationInput = z.infer<typeof RiskEvaluationInputSchema>;
+
+/**
+ * The REPOSITORY-INTERNAL identifiers this input carries, with their paths.
+ *
+ * ADR-016 §2 (2026-09-02 amendment) rules that a UUID-shaped identifier
+ * arriving at an external input surface must already be canonical lowercase,
+ * and that a non-canonical spelling is "a typed refusal at that surface,
+ * carrying the raw value … never truncation, never a silent repair, never a
+ * case-fold". The rule's own justification is that "every UUID in these
+ * contracts is generated in-process", so a mixed-case arrival is evidence of a
+ * transforming pipeline in the CALLER.
+ *
+ * WHAT IS IN SCOPE: identifiers this repository generates. `approvedIntentId`
+ * (the record's own identity and its lineage root), `strategyInstanceId`, the
+ * intent's own `intentId`, and the duplicate-guard list — which is compared
+ * against `intentId`, so a re-cased entry there silently under-matches §9.8
+ * check 18 instead of failing.
+ *
+ * WHAT IS DELIBERATELY OUT OF SCOPE: VENUE-supplied opaque identifiers —
+ * `CancelIntent.orderIds` and `portfolio.openOrders[].orderId` (§7.2
+ * `VenueOrderId`). ADR-016 §2's amendment says the ruling "does not touch any
+ * venue wire format (venue identifiers are not UUIDs; their rules are ADR-015's)",
+ * and its in-process-generation premise is false for them: a venue string must
+ * be round-tripped exactly as the venue spelled it, so refusing one would
+ * reject a legitimate value — and, on a `CANCEL`, could trap a position for a
+ * rule ADR-016 does not impose (§6 invariant 13). Market ids need no entry
+ * here: `InternalMarketIdSchema` is lowercase-canonical UUIDv7 already, so the
+ * schema above refuses a re-cased one as `RISK_INPUT_INVALID`.
+ */
+function internalIdentityFields(
+  data: RiskEvaluationInput,
+): readonly { readonly field: string; readonly value: unknown }[] {
+  const intent: Intent = data.intent;
+  return [
+    { field: "identifiers.approvedIntentId", value: data.identifiers.approvedIntentId },
+    { field: "context.strategyInstanceId", value: data.context.strategyInstanceId },
+    ...("intentId" in intent ? [{ field: "intent.intentId", value: intent.intentId }] : []),
+    ...data.guards.recentIntentIds.map((value, index) => ({
+      field: `guards.recentIntentIds[${index}]`,
+      value,
+    })),
+  ];
+}
+
+/**
+ * Refusals for every ADR-016 §2 identity violation in `data`, raw values kept.
+ *
+ * Total and non-throwing on a hand-built object: a non-string value cannot be
+ * a non-canonical UUID, so it is left to the schema (or, for the record shapes
+ * `approved-intent.ts` reuses this on, to the caller's own type checking).
+ * ALL violations are reported; the check does not stop at the first.
+ */
+export function identityRefusals(
+  fields: readonly { readonly field: string; readonly value: unknown }[],
+): readonly RiskRefusal[] {
+  const refusals: RiskRefusal[] = [];
+  for (const { field, value } of fields) {
+    if (typeof value !== "string" || !uuidShapedNotCanonical(value)) continue;
+    refusals.push(
+      riskRefusal(
+        "RISK_UUID_NOT_CANONICAL",
+        "a repository identifier is UUID-shaped but not canonical lowercase (ADR-016 §2: refuse at the input surface, never case-fold)",
+        { field, value },
+      ),
+    );
+  }
+  return refusals;
+}
+
+/** A validated input, or the typed refusals that stopped it at the door. */
+export type RiskInputValidation =
+  | { readonly ok: true; readonly data: RiskEvaluationInput }
+  | { readonly ok: false; readonly refusals: readonly RiskRefusal[] };
+
+/**
+ * INPUT VALIDATION — the single door into `evaluateIntent`.
+ *
+ * WHY THIS IS ONE FUNCTION, AND WHY IDENTITY VALIDATION LIVES IN IT
+ * (adversarial review round 2, BLOCKER).
+ *
+ * §6 invariant 13 makes a `CANCEL` immune to every RISK gate: `engine.ts` has a
+ * structural choke point that turns any refusal the pipeline accumulated into a
+ * non-blocking observation. Remediation round 1 left the ADR-016 identity check
+ * inside that pipeline, so a `CANCEL` carrying a UUID-shaped, NON-CANONICAL
+ * `approvedIntentId` was APPROVED and the id was copied verbatim into the
+ * emitted record — a contract-invalid record, which ADR-016 §2 forbids
+ * ("none may accept uppercase 'just for lookups'").
+ *
+ * Review round 2 ruled the boundary: `evaluateIntent(policy, input: unknown)`
+ * IS an input surface, and "safety cancellation outranks new order placement"
+ * does not authorize emitting a contract-invalid record. The two invariants do
+ * not collide — §6 invariant 13 protects a VALID cancel from being trapped by
+ * risk policy; it does not require accepting a malformed identity.
+ *
+ * So the rule is now: a request whose identity is malformed never becomes a
+ * request at all. This function answers BEFORE `buildIntentView`, so there is
+ * no disposition to privilege and nothing for the choke point to override — the
+ * same standing the schema refusal already had.
+ *
+ * THE ID IS NEVER NORMALIZED. ADR-016 §2 is refuse-not-fold: the raw value
+ * rides back out on `details.value` and no lowercased form is ever produced.
+ *
+ * DO NOT move a well-formedness check out of this function into the pipeline,
+ * and DO NOT add an early `return` between here and the choke point.
+ * `test/unit/risk/engine.test.ts` ("ADR-016 §2 — record identity is INPUT
+ * VALIDATION, never a cancel override") fails if you do.
+ */
+export function validateEvaluationInput(input: unknown): RiskInputValidation {
+  const parsed = RiskEvaluationInputSchema.safeParse(input);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      refusals: [
+        riskRefusal("RISK_INPUT_INVALID", "risk evaluation input failed validation", {
+          issues: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`),
+        }),
+      ],
+    };
+  }
+  const refusals = identityRefusals(internalIdentityFields(parsed.data));
+  if (refusals.length > 0) return { ok: false, refusals };
+  return { ok: true, data: parsed.data };
+}

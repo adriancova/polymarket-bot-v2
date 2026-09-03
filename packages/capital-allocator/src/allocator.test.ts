@@ -230,7 +230,18 @@ describe("the live-micro cap fence (AGENTS.md safety defaults are not caller arg
 });
 
 describe("the refusal-code vocabulary", () => {
-  it("matches its documented cardinality exactly (README §5 and the handoff)", () => {
+  /**
+   * WHAT THIS BINDS (corrected in remediation round 2 — review round 2, LOW):
+   * `CAPITAL_REFUSAL_CODES`, `CAPITAL_REFUSAL_CODE_COUNT`, the compile-time
+   * exhaustiveness proof, and — in the README test below — `README.md` §5. The
+   * previous title also claimed `docs/handoffs/WP-180.md`, which neither test
+   * reads. The handoff is an append-only historical record; binding a package
+   * suite to it would oblige future packages to edit a closed package's
+   * governance record, so the living README is what is machine-bound and the
+   * handoff's number stays prose verified at review time. Same reasoning, same
+   * wording, as `test/unit/risk/engine.test.ts`.
+   */
+  it("matches its documented cardinality exactly (list, constant, exhaustiveness)", () => {
     expect(CAPITAL_REFUSAL_CODES.length).toBe(CAPITAL_REFUSAL_CODE_COUNT);
     expect(CAPITAL_REFUSAL_CODE_COUNT).toBe(19);
     expect(CAPITAL_REFUSAL_CODES_ARE_EXHAUSTIVE).toBe(true);

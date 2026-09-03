@@ -138,17 +138,33 @@ The two rules behind the "—" cells:
 > failure the invariant exists to prevent. The original wording is preserved
 > here rather than quietly replaced.
 
+> **Corrected 2026-09-03 (remediation round 2).** The `RISK_UUID_NOT_CANONICAL`
+> row below read "observed, never blocks", and the paragraph after it called
+> input *schema* validation the one unavoidable gate. Adversarial review round 2
+> (BLOCKER) established what that combination produced: a `CANCEL` carrying a
+> UUID-shaped, **non-canonical** `approvedIntentId` was approved and the id was
+> copied verbatim into the emitted record — a contract-invalid record, which
+> ADR-016 §2 forbids ("none may accept uppercase 'just for lookups'"). The
+> ruling: `evaluateIntent(policy, input: unknown)` **is** an input surface, and
+> §6 invariant 13 protects a **valid** cancel from risk *policy* — it does not
+> require accepting a malformed identity. Identity validation is therefore
+> **input validation**, applied at the door for every disposition, and the id is
+> still never case-folded. The superseded row is preserved below, struck.
+
 The rule is now **structural**, not a per-check condition. `evaluateIntent`
-runs the pipeline, then reaches one choke point: if the disposition is `CANCEL`,
-every refusal that accumulated — from any gate, including gates added later —
-becomes a non-blocking observation on `cancelPriorityOverrides` and the cancel
-is **approved**, carrying its typed record, its recommendations, and its
-worst-case measure. The gates audited, and what the audit found:
+first passes the request through **one input door**
+(`inputs.ts` `validateEvaluationInput`: the schema *and* ADR-016 §2 identity
+validation), then runs the pipeline, then reaches one choke point: if the
+disposition is `CANCEL`, every refusal that accumulated — from any gate,
+including gates added later — becomes a non-blocking observation on
+`cancelPriorityOverrides` and the cancel is **approved**, carrying its typed
+record, its recommendations, and its worst-case measure. The gates audited, and
+what the audit found:
 
 | Gate | Could it block a cancel before? | Now |
 | --- | --- | --- |
-| input schema validation (`RISK_INPUT_INVALID`) | yes | **yes, unavoidably** — until the input parses there is no disposition to privilege, and an unparseable request names no orders to cancel |
-| `RISK_UUID_NOT_CANONICAL` (record identity) | **yes — audit finding** | observed, never blocks |
+| input validation — schema (`RISK_INPUT_INVALID`) **and** ADR-016 §2 identity (`RISK_UUID_NOT_CANONICAL`) | yes | **yes, unavoidably** — it answers before a disposition exists. An unparseable request names no orders to cancel, and a request whose identity is malformed is not a valid cancel |
+| ~~`RISK_UUID_NOT_CANONICAL` (record identity)~~ *(superseded; it is input validation, one row up)* | **yes — audit finding** | ~~observed, never blocks~~ **refused at the door** |
 | `RISK_INTENT_EXPIRED` | no (§7.7 gives `CANCEL` no `validUntil`) | observed, never blocks |
 | intent-view refusals (`RISK_ZERO_DELTA`, `RISK_BASKET_LEG_UNBOUNDED`) | no (a cancel produces neither) | observed, never blocks |
 | check 1 run / strategy state | no (`placesOrders` guard) | never blocks |
@@ -167,8 +183,30 @@ worst-case measure. The gates audited, and what the audit found:
 `cancelPriorityOverrides` is **not** a refusal list. The evaluation is approved;
 the entries are what an operator and the §9.9 incident controller should still
 see. Pinned by `test/unit/risk/engine.test.ts`, describe block *"§6 invariant 13
-— a CANCEL survives every audited gate"*, including a case that trips all four
-audited gates at once.
+— a CANCEL survives every audited gate"*, including a case that trips all three
+audited risk gates at once, with every other input hostile too.
+
+### 4.2 ADR-016 §2 identity validation — what the door checks
+
+A UUID-shaped identifier that is not canonical lowercase is **refused with the
+raw value, never case-folded** (ADR-016 §2, 2026-09-02 amendment). The check
+runs at the input door, so no disposition can override it and no approved record
+can carry one.
+
+| Field | In scope? | Why |
+| --- | --- | --- |
+| `identifiers.approvedIntentId` | **yes** | the record's own identity and its lineage root |
+| `context.strategyInstanceId` | **yes** | copied into every record |
+| `intent.intentId` | **yes** | copied to `sourceIntentId` and carried inside `record.intent` |
+| `guards.recentIntentIds[]` | **yes** | compared against `intentId`; a re-cased entry would silently under-match §9.8 check 18 |
+| `record.*` on `resizeApprovedIntent` | **yes** | the argument is typed, not parsed; its identity fields are inherited into the new record |
+| any `marketId` | n/a | `InternalMarketId` is lowercase-canonical UUIDv7 in the frozen schema, so a re-cased one is already `RISK_INPUT_INVALID` |
+| `intent.orderIds[]`, `portfolio.openOrders[].orderId` | **no** | §7.2 `VenueOrderId` — venue-supplied and opaque. ADR-016 §2 "does not touch any venue wire format", and its premise (every UUID here is generated in-process) is false for them: a venue string must round-trip exactly as the venue spelled it, and refusing one on a `CANCEL` could trap a position for a rule the ADR does not impose |
+
+The property — *no path emits an approved record carrying a non-canonical
+repository identifier* — is asserted directly over emitted records, not
+site by site, in `test/unit/risk/engine.test.ts`, describe block *"ADR-016 §2 —
+record identity is INPUT VALIDATION, never a cancel override"*.
 
 ### Staleness and exits, stated exactly
 
@@ -215,7 +253,7 @@ declared set** — the three surfaces are bound together by test.
 | Code | Meaning |
 | --- | --- |
 | `RISK_INPUT_INVALID` | The evaluation input, policy, or resize request failed its schema. |
-| `RISK_UUID_NOT_CANONICAL` | A UUID-shaped id arrived in a non-lowercase spelling. ADR-016 §2: refuse, never case-fold. |
+| `RISK_UUID_NOT_CANONICAL` | A UUID-shaped **repository** identifier arrived in a non-lowercase spelling. ADR-016 §2: refuse at the input surface, never case-fold. Fields and exclusions in §4.1's follow-on table (§4.2). |
 | `RISK_INTENT_EXPIRED` | `validUntil` is before the caller-supplied evaluation instant, or the two are not comparable. |
 | `RISK_ZERO_DELTA` | The position intent resolves to no share delta; there is nothing to execute. |
 | `RISK_MARKET_CONTEXT_MISSING` | No market context was supplied for a market the intent touches. |

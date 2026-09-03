@@ -21,6 +21,8 @@ import {
   RISK_REASON_CODE_COUNT,
   evaluateIntent,
   isRiskReasonCode,
+  resizeApprovedIntent,
+  type ApprovedIntentRecord,
   type RiskPolicy,
   type RiskReasonCode,
 } from "../../../packages/risk/src/index.js";
@@ -39,6 +41,7 @@ import {
   market,
   openOrder,
   position,
+  reduceIntent,
   riskPolicy,
   type EvaluationInputFixture,
 } from "./fixtures.js";
@@ -617,12 +620,23 @@ describe("the reason-code vocabulary", () => {
    *
    * The no-dead-entry test above proves reachability against whatever the list
    * currently is; it cannot notice that the DOCUMENTED count has drifted from
-   * it — and it had: the handoff claimed 56 against a 61-entry list. This test
-   * binds the list, the exported constant, `packages/risk/README.md` §5, and
-   * `docs/handoffs/WP-180.md` to one number, so adding a code without updating
-   * the documentation fails the suite.
+   * it — and it had: the handoff claimed 56 against a 61-entry list.
+   *
+   * WHAT THESE TWO TESTS ACTUALLY BIND (corrected in remediation round 2 —
+   * review round 2, LOW): three surfaces, `RISK_REASON_CODES`,
+   * `RISK_REASON_CODE_COUNT`, and `packages/risk/README.md` §5. The earlier
+   * comment also claimed `docs/handoffs/WP-180.md`, which neither test reads —
+   * the claim was wrong, and this is the corrected statement of it.
+   *
+   * That the handoff stays UNBOUND is deliberate, not an omission. It is an
+   * append-only historical record of a work package, dated round by round; a
+   * suite that parsed it would oblige every FUTURE package that adds a reason
+   * code to edit a closed package's governance record, which is the opposite of
+   * how handoffs are maintained here. The living documentation is the package
+   * README, and that is what is machine-bound. The handoff's number is prose,
+   * verified at review time — which is exactly how the round-1 drift was found.
    */
-  it("matches its documented cardinality exactly (README §5 and the handoff)", () => {
+  it("matches its documented cardinality exactly (list, constant, README §5)", () => {
     expect(RISK_REASON_CODES.length).toBe(RISK_REASON_CODE_COUNT);
     expect(RISK_REASON_CODE_COUNT).toBe(62);
   });
@@ -772,12 +786,16 @@ describe("disposition matrix", () => {
  *
  * Remediation round 1 audited EVERY gate in `evaluateIntent` for the
  * "a cancel can be blocked" defect class, not only the two the reviewer cited.
- * The four gates below are the ones that could reach a `CANCEL` at all; every
- * other gate is already guarded by `placesOrders` / `isEntry` / a disposition
- * test, or is structurally unreachable for a cancel (a cancel has no legs, no
- * `intentId`, and no `validUntil`). The last test drives all four at once so
- * the structural choke point — not four separate conditions — is what is
- * pinned.
+ * The three RISK GATES below are the ones that could reach a `CANCEL` at all;
+ * every other gate is already guarded by `placesOrders` / `isEntry` / a
+ * disposition test, or is structurally unreachable for a cancel (a cancel has
+ * no legs, no `intentId`, and no `validUntil`). The last test drives all three
+ * at once, plus every other hostile input, so the structural choke point — not
+ * three separate conditions — is what is pinned.
+ *
+ * The audit's fourth finding, `RISK_UUID_NOT_CANONICAL`, is no longer a gate:
+ * review round 2 ruled it INPUT VALIDATION, which a cancel does not bypass.
+ * See the following describe block.
  */
 describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
   interface GateCase {
@@ -811,13 +829,20 @@ describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
         input.markets = [];
       },
     },
-    {
-      name: "the approvedIntentId is UUID-shaped but not canonical (ADR-016 §2)",
-      overriddenCode: "RISK_UUID_NOT_CANONICAL",
-      trip: (input) => {
-        input.identifiers.approvedIntentId = "01890000-0000-7000-8000-0000000000AB";
-      },
-    },
+    /**
+     * CORRECTED IN REMEDIATION ROUND 2 (review round 2, BLOCKER).
+     *
+     * A fourth case lived here: *"the approvedIntentId is UUID-shaped but not
+     * canonical (ADR-016 §2)"*, asserting that the identity violation was
+     * OVERRIDDEN and the cancel approved. That encoded the defect as the
+     * contract — the approved record was then emitted carrying the
+     * non-canonical id, which ADR-016 §2 forbids. Review round 2 ruled that
+     * §6 invariant 13 protects a VALID cancel from risk policy and does not
+     * require accepting a malformed identity, so the check moved to input
+     * validation. Its replacement is the describe block below, which asserts
+     * the opposite outcome (a typed REFUSAL, no record) rather than deleting
+     * the coverage.
+     */
   ];
 
   for (const gate of GATES) {
@@ -854,7 +879,11 @@ describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
     input.context.runStatePermitsIntent = false;
     input.context.strategyStatePermitsIntent = false;
     input.context.venueEligibility = "BLOCKED";
-    input.identifiers.approvedIntentId = "01890000-0000-7000-8000-0000000000AB";
+    // A VALID identity, deliberately UUID-shaped and canonical: the cancel path
+    // must stay open for a well-formed request (remediation round 2 moved the
+    // ADR-016 §2 check to input validation, so a non-canonical id here would
+    // now refuse at the door and prove nothing about the choke point).
+    input.identifiers.approvedIntentId = "01890000-0000-7000-8000-0000000000ab";
     input.markets = [];
     input.freshness = [];
     input.portfolio = { positions: [position()], openOrders: [] };
@@ -878,7 +907,9 @@ describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
     expect(result.record.worstCase.maximumContractualLoss).toBe("40");
     // Every gate that fired is visible, and NONE of them blocked.
     const overridden = result.cancelPriorityOverrides.map((r) => r.code);
-    expect(overridden).toContain("RISK_UUID_NOT_CANONICAL");
+    // An input-validation refusal is NOT overridable, so none may appear here.
+    expect(overridden).not.toContain("RISK_UUID_NOT_CANONICAL");
+    expect(overridden).not.toContain("RISK_INPUT_INVALID");
     expect(overridden).toContain("RISK_RUN_MODE_EXCEEDS_MAXIMUM");
     expect(overridden).toContain("RISK_MARKET_CONTEXT_MISSING");
     expect(overridden).toContain("RISK_ALLOCATION_REFUSED");
@@ -903,6 +934,292 @@ describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
     const result = evaluateIntent(riskPolicy(), { intent: { type: "CANCEL" } });
     expect(result.approved).toBe(false);
     expect(codesOf(result)).toEqual(["RISK_INPUT_INVALID"]);
+  });
+});
+
+/**
+ * ADR-016 §2 IDENTITY VALIDATION — the other side of the invariant-13 line.
+ *
+ * REVIEW ROUND 2, BLOCKER. Remediation round 1 left this check inside the §9.8
+ * pipeline, where the cancel choke point turned it into a non-blocking
+ * override: a `CANCEL` carrying a UUID-shaped, NON-CANONICAL `approvedIntentId`
+ * was APPROVED and the id was copied verbatim into the emitted record. The
+ * reviewer ruled that ADR-016 §2 requires a typed refusal AT AN INPUT SURFACE
+ * and explicitly forbids accepting uppercase UUIDs "for lookup or persistence";
+ * that `evaluateIntent(policy, input: unknown)` is such a surface; and that
+ * "safety cancellation outranks new order placement" does not authorize
+ * emitting a contract-invalid approved record. §6 invariant 13 protects a VALID
+ * cancel from being trapped by risk POLICY — it does not require accepting a
+ * malformed identity.
+ *
+ * The sweep the reviewer asked for found the defect in FIVE record fields, from
+ * THREE input fields: `approvedIntentId` → `approvedIntentId` +
+ * `rootApprovedIntentId`, `intent.intentId` → `sourceIntentId` +
+ * `intent.intentId`, and `context.strategyInstanceId` → `strategyInstanceId`.
+ * The last test states the property directly over emitted records rather than
+ * enumerating the sites, so a NEW field copied from unvalidated input is caught
+ * without anyone remembering to add a case.
+ */
+describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel override", () => {
+  /** UUID-shaped, non-canonical. */
+  const NON_CANONICAL = "01890000-0000-7000-8000-0000000000AB";
+  /** The same value canonically spelled. It must never be PRODUCED from it. */
+  const CANONICAL = "01890000-0000-7000-8000-0000000000ab";
+  /** `CodeString` must start with a letter, so a code-shaped UUID starts at `f`. */
+  const NON_CANONICAL_CODE = "f1890000-0000-7000-8000-0000000000AB";
+  const CANONICAL_CODE = "f1890000-0000-7000-8000-0000000000ab";
+
+  /**
+   * An INDEPENDENT oracle — deliberately not the package's own guard, so a
+   * mutation of `guards.ts` cannot make these tests agree with the defect.
+   */
+  const UUID_SHAPE =
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;
+  const UUID_CANONICAL = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+  function nonCanonicalUuid(value: string): boolean {
+    return UUID_SHAPE.test(value) && !UUID_CANONICAL.test(value);
+  }
+
+  /** Every string reachable in a value, with the path it sits at. */
+  function stringsIn(value: unknown, path = ""): { path: string; value: string }[] {
+    if (typeof value === "string") return [{ path, value }];
+    if (Array.isArray(value)) return value.flatMap((item, i) => stringsIn(item, `${path}[${i}]`));
+    if (value !== null && typeof value === "object") {
+      return Object.entries(value).flatMap(([key, item]) =>
+        stringsIn(item, path === "" ? key : `${path}.${key}`),
+      );
+    }
+    return [];
+  }
+
+  /**
+   * The ONLY strings an emitted record may carry non-canonically: VENUE-supplied
+   * opaque identifiers (§7.2 `VenueOrderId`). ADR-016 §2's amendment says the
+   * ruling "does not touch any venue wire format (venue identifiers are not
+   * UUIDs; their rules are ADR-015's)", and its premise — every UUID here is
+   * generated in-process — is false for them. A test below proves this
+   * exclusion is exact and non-vacuous.
+   */
+  const VENUE_ID_PATH = /^intent\.orderIds\[\d+\]$/u;
+
+  interface IdentityCase {
+    readonly field: string;
+    readonly hostile: (input: EvaluationInputFixture) => void;
+    readonly valid: (input: EvaluationInputFixture) => void;
+  }
+
+  const IDENTITY_FIELDS: readonly IdentityCase[] = [
+    {
+      field: "identifiers.approvedIntentId",
+      hostile: (input) => {
+        input.identifiers.approvedIntentId = NON_CANONICAL;
+      },
+      valid: (input) => {
+        input.identifiers.approvedIntentId = CANONICAL;
+      },
+    },
+    {
+      field: "context.strategyInstanceId",
+      hostile: (input) => {
+        input.context.strategyInstanceId = NON_CANONICAL_CODE;
+      },
+      valid: (input) => {
+        input.context.strategyInstanceId = CANONICAL_CODE;
+      },
+    },
+    {
+      field: "intent.intentId",
+      hostile: (input) => {
+        input.intent = { ...input.intent, intentId: NON_CANONICAL };
+      },
+      valid: (input) => {
+        input.intent = { ...input.intent, intentId: CANONICAL };
+      },
+    },
+    {
+      field: "guards.recentIntentIds[0]",
+      hostile: (input) => {
+        input.guards.recentIntentIds = [NON_CANONICAL];
+      },
+      valid: (input) => {
+        input.guards.recentIntentIds = [CANONICAL];
+      },
+    },
+  ];
+
+  it("REVIEWER'S PROBE: a CANCEL with a non-canonical approvedIntentId is REFUSED, with no record", () => {
+    const input = entryInput();
+    input.intent = cancelIntent();
+    input.identifiers.approvedIntentId = NON_CANONICAL;
+
+    const result = evaluateIntent(riskPolicy(), input);
+
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toEqual(["RISK_UUID_NOT_CANONICAL"]);
+    // No approved arm at all — not an approval carrying an observation.
+    expect(result).not.toHaveProperty("record");
+    expect(result).not.toHaveProperty("cancelPriorityOverrides");
+  });
+
+  for (const identity of IDENTITY_FIELDS) {
+    it(`refuses ${identity.field}, naming the field and carrying the RAW value`, () => {
+      const input = entryInput();
+      identity.hostile(input);
+
+      const result = evaluateIntent(riskPolicy(), input);
+
+      expect(result.approved).toBe(false);
+      expect(codesOf(result)).toEqual(["RISK_UUID_NOT_CANONICAL"]);
+      const refusal = result.refusals[0];
+      expect(refusal?.details["field"]).toBe(identity.field);
+      expect(nonCanonicalUuid(String(refusal?.details["value"]))).toBe(true);
+    });
+  }
+
+  it("refuses identically for an ENTRY, an EXIT, and a CANCEL — before a disposition exists", () => {
+    for (const build of [entryInput, exitInput, () => ({ ...entryInput(), intent: cancelIntent() })]) {
+      const input = build() as EvaluationInputFixture;
+      input.identifiers.approvedIntentId = NON_CANONICAL;
+      const result = evaluateIntent(riskPolicy(), input);
+      expect(result.approved).toBe(false);
+      expect(codesOf(result)).toEqual(["RISK_UUID_NOT_CANONICAL"]);
+    }
+  });
+
+  it("reports EVERY identity violation at once — the door does not short-circuit", () => {
+    const input = entryInput();
+    for (const identity of IDENTITY_FIELDS) identity.hostile(input);
+
+    const result = evaluateIntent(riskPolicy(), input);
+
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toEqual(IDENTITY_FIELDS.map(() => "RISK_UUID_NOT_CANONICAL"));
+    expect(result.refusals.map((r) => r.details["field"])).toEqual(
+      IDENTITY_FIELDS.map((identity) => identity.field),
+    );
+  });
+
+  it("NEVER case-folds: no canonical form of the id appears anywhere in the result", () => {
+    const input = entryInput();
+    input.identifiers.approvedIntentId = NON_CANONICAL;
+
+    const result = evaluateIntent(riskPolicy(), input);
+
+    const seen = stringsIn(result).map((s) => s.value);
+    expect(seen).toContain(NON_CANONICAL);
+    expect(seen).not.toContain(CANONICAL);
+  });
+
+  it("resizeApprovedIntent refuses a non-canonical identity INHERITED from a hand-built record", () => {
+    const approved = evaluateIntent(riskPolicy(), entryInput());
+    expect(approved.approved).toBe(true);
+    if (!approved.approved) return;
+
+    for (const field of [
+      "approvedIntentId",
+      "rootApprovedIntentId",
+      "sourceIntentId",
+      "strategyInstanceId",
+    ] as const) {
+      const handBuilt = { ...approved.record, [field]: NON_CANONICAL } as ApprovedIntentRecord;
+      const resized = resizeApprovedIntent(handBuilt, {
+        approvedIntentId: CANONICAL,
+        resizedAt: "2026-09-03T12:00:01.000Z",
+        newTargetShares: "50",
+        reason: "shrink",
+      });
+      expect(resized.ok).toBe(false);
+      if (resized.ok) return;
+      expect(resized.refusals.map((r) => r.code)).toContain("RISK_UUID_NOT_CANONICAL");
+      expect(resized.refusals.map((r) => r.details["field"])).toContain(`record.${field}`);
+    }
+  });
+
+  it("a canonical lowercase UUID in every identity field is ACCEPTED and copied verbatim", () => {
+    const input = entryInput();
+    for (const identity of IDENTITY_FIELDS) identity.valid(input);
+    // The duplicate guard must not fire on this canonical entry.
+    input.guards.recentIntentIds = [];
+
+    const result = evaluateIntent(riskPolicy(), input);
+
+    expect(codesOf(result)).toEqual([]);
+    expect(result.approved).toBe(true);
+    if (!result.approved) return;
+    expect(result.record.approvedIntentId).toBe(CANONICAL);
+    expect(result.record.rootApprovedIntentId).toBe(CANONICAL);
+    expect(result.record.sourceIntentId).toBe(CANONICAL);
+    expect(result.record.strategyInstanceId).toBe(CANONICAL_CODE);
+  });
+
+  it("a VENUE-supplied opaque orderId is out of ADR-016 §2's scope and never blocks a cancel", () => {
+    const input = entryInput();
+    input.intent = cancelIntent({ orderIds: [NON_CANONICAL] });
+
+    const result = evaluateIntent(riskPolicy(), input);
+
+    expect(codesOf(result)).toEqual([]);
+    expect(result.approved).toBe(true);
+    if (!result.approved) return;
+    // Round-tripped byte for byte: a venue string is the venue's spelling.
+    expect(result.record.intent).toMatchObject({ orderIds: [NON_CANONICAL] });
+    // …and it is the ONLY non-canonical string the record carries, at exactly
+    // the declared venue path (the exclusion is exact, and non-vacuous).
+    expect(stringsIn(result.record).filter((s) => nonCanonicalUuid(s.value))).toEqual([
+      { path: "intent.orderIds[0]", value: NON_CANONICAL },
+    ]);
+  });
+
+  it("THE BINDING PROPERTY: no path emits an approved record carrying a non-canonical id", () => {
+    const dispositions: readonly ((input: EvaluationInputFixture) => void)[] = [
+      () => undefined,
+      (input) => {
+        input.intent = reduceIntent();
+        input.portfolio.positions = [position()];
+      },
+      (input) => {
+        input.intent = cancelIntent();
+      },
+    ];
+
+    const offending: { path: string; value: string }[] = [];
+    let recordsEmitted = 0;
+
+    for (const setDisposition of dispositions) {
+      for (const identity of [...IDENTITY_FIELDS.map((f) => f.hostile), () => undefined]) {
+        const input = entryInput();
+        setDisposition(input);
+        identity(input);
+
+        const result = evaluateIntent(riskPolicy(), input);
+        if (!result.approved) continue;
+        recordsEmitted += 1;
+        offending.push(
+          ...stringsIn(result.record).filter(
+            (s) => nonCanonicalUuid(s.value) && !VENUE_ID_PATH.test(s.path),
+          ),
+        );
+
+        // The resize path emits records too, and inherits identity fields.
+        const resized = resizeApprovedIntent(result.record, {
+          approvedIntentId: CANONICAL,
+          resizedAt: "2026-09-03T12:00:01.000Z",
+          newTargetShares: "50",
+          reason: "shrink",
+        });
+        if (!resized.ok) continue;
+        recordsEmitted += 1;
+        offending.push(
+          ...stringsIn(resized.value).filter(
+            (s) => nonCanonicalUuid(s.value) && !VENUE_ID_PATH.test(s.path),
+          ),
+        );
+      }
+    }
+
+    expect(offending).toEqual([]);
+    // NON-VACUITY: the battery really did emit records to inspect.
+    expect(recordsEmitted).toBeGreaterThanOrEqual(3);
   });
 });
 

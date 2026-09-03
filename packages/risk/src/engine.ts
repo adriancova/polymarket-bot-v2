@@ -32,14 +32,21 @@
  * `disposition` guards below. The two rules that matter most:
  *
  * - §6 invariant 13, "Safety cancellation outranks new order placement": a
- *   `CANCEL` is NEVER blocked — not by staleness, exposure, edge, rate-limit
- *   headroom, time-to-close, run mode, an allocator refusal, a missing market
- *   context, or any gate added later. This is a STRUCTURAL choke point at the
- *   end of the pipeline (see "§6 INVARIANT 13" below), not a per-gate
- *   condition, because a blocked cancel can trap a position and per-gate
- *   conditions are exactly what a later edit forgets. Everything the pipeline
- *   accumulated for a cancel is returned as non-blocking
+ *   `CANCEL` is NEVER blocked by a RISK GATE — not by staleness, exposure,
+ *   edge, rate-limit headroom, time-to-close, run mode, an allocator refusal, a
+ *   missing market context, or any gate added later. This is a STRUCTURAL choke
+ *   point at the end of the pipeline (see "§6 INVARIANT 13" below), not a
+ *   per-gate condition, because a blocked cancel can trap a position and
+ *   per-gate conditions are exactly what a later edit forgets. Everything the
+ *   pipeline accumulated for a cancel is returned as non-blocking
  *   `cancelPriorityOverrides` observations.
+ *
+ *   What the invariant does NOT do is admit a malformed request. INPUT
+ *   VALIDATION — the schema and ADR-016 §2 identity validation, both in
+ *   `inputs.ts` — answers before a disposition exists, and a cancel is subject
+ *   to it exactly like every other intent (adversarial review round 2). The
+ *   invariant protects a VALID cancel from risk policy; it does not require
+ *   this package to emit a contract-invalid approved record.
  * - §6 invariant 12, "No blind flatten": an EXIT into a stale, unsynchronized,
  *   or unknown book IS blocked, and the refusal carries cancel-and-reconcile
  *   recommendations so the reduction happens after reconciliation, under the
@@ -57,9 +64,9 @@ import {
 import type { ApprovedIntentRecord } from "./approved-intent.js";
 import { checkExposureLimits } from "./exposure-limits.js";
 import { assessFreshness, blocksAsStale, type FreshnessAssessment } from "./freshness.js";
-import { deepFreeze, uuidShapedNotCanonical } from "./guards.js";
+import { deepFreeze } from "./guards.js";
 import {
-  RiskEvaluationInputSchema,
+  validateEvaluationInput,
   type MarketContext,
   type RiskEvaluationInput,
   type ScopeAttribution,
@@ -166,28 +173,23 @@ function heldBothSides(
 export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluation {
   const accumulator: Accumulator = { refusals: [], recommendations: [] };
 
-  const parsed = RiskEvaluationInputSchema.safeParse(input);
-  if (!parsed.success) {
-    accumulator.refusals.push(
-      riskRefusal("RISK_INPUT_INVALID", "risk evaluation input failed validation", {
-        issues: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`),
-      }),
-    );
+  // --- INPUT VALIDATION — the door, and the one thing a CANCEL cannot bypass -
+  //
+  // `validateEvaluationInput` parses the schema AND applies ADR-016 §2 identity
+  // validation, and it answers HERE — before `buildIntentView`, so before a
+  // disposition exists. That ordering is the whole point (adversarial review
+  // round 2): a malformed request never becomes a request, so the §6 invariant
+  // 13 choke point below has nothing to override and no contract-invalid
+  // approved record can be emitted. A well-formedness rule belongs in
+  // `inputs.ts`, NOT in the pipeline.
+  const validated = validateEvaluationInput(input);
+  if (!validated.ok) {
+    accumulator.refusals.push(...validated.refusals);
     return rejected(accumulator, undefined, undefined, undefined);
   }
-  const data = parsed.data;
+  const data = validated.data;
 
-  // --- pre-checks on the record's own identity and the intent's deadline ----
-  if (uuidShapedNotCanonical(data.identifiers.approvedIntentId)) {
-    accumulator.refusals.push(
-      riskRefusal(
-        "RISK_UUID_NOT_CANONICAL",
-        "approvedIntentId is UUID-shaped but not canonical lowercase (ADR-016 §2: refuse, never case-fold)",
-        { approvedIntentId: data.identifiers.approvedIntentId },
-      ),
-    );
-  }
-
+  // --- pre-check on the intent's deadline ----------------------------------
   const built = buildIntentView(data.intent, data.portfolio);
   const view = built.view;
   accumulator.refusals.push(...built.refusals);
@@ -935,19 +937,29 @@ export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluati
   //
   // Review round 1 (BLOCKER 1) found run-mode mismatch and an explicit
   // allocator refusal blocking cancels; the same-class audit of every gate in
-  // this function additionally found `RISK_MARKET_CONTEXT_MISSING` and
-  // `RISK_UUID_NOT_CANONICAL`. The audit and its findings are tabulated in
-  // `README.md` §4.1 and `docs/handoffs/WP-180.md`.
+  // this function additionally found `RISK_MARKET_CONTEXT_MISSING`. The audit
+  // and its findings are tabulated in `README.md` §4.1 and
+  // `docs/handoffs/WP-180.md`.
   //
-  // The ONE thing a cancel cannot bypass is input validation itself
-  // (`RISK_INPUT_INVALID`, returned far above): until the input parses there is
-  // no disposition to privilege, and an unparseable request names no orders to
-  // cancel. That is a limit of knowledge, not a risk gate.
+  // WHAT A CANCEL CANNOT BYPASS IS INPUT VALIDATION — the whole of it, returned
+  // far above by `validateEvaluationInput`: the schema (`RISK_INPUT_INVALID`)
+  // and ADR-016 §2 identity validation (`RISK_UUID_NOT_CANONICAL`). Until the
+  // input parses and its identifiers are well formed there is no disposition to
+  // privilege, and a request naming a malformed identity is not a valid cancel.
+  // That is a limit of knowledge, not a risk gate.
   //
-  // DO NOT add an early `return rejected(...)` above this point, and DO NOT
-  // make this condition narrower. `test/unit/risk/engine.test.ts`
-  // ("a CANCEL survives every audited gate, all tripped at once") fails if you
-  // do.
+  // Remediation round 1 had the identity check in the pipeline, where this
+  // choke point turned it into a non-blocking override and the record was
+  // emitted carrying the non-canonical id. Review round 2 ruled that a
+  // contract-invalid approved record may not be emitted, and that §6 invariant
+  // 13 protects a VALID cancel from risk policy rather than requiring a
+  // malformed identity to be accepted. Hence the check moved to the door.
+  //
+  // DO NOT add an early `return rejected(...)` between the input door and this
+  // point, and DO NOT make this condition narrower.
+  // `test/unit/risk/engine.test.ts` ("a CANCEL survives every audited gate, all
+  // tripped at once" and "ADR-016 §2 — record identity is INPUT VALIDATION,
+  // never a cancel override") fails if you do.
   if (isCancel) {
     // A cancel contributes no BUY leg, so `lots` is the portfolio's own lot set
     // and `buildWorstCaseLots` cannot have returned `undefined` (it does so

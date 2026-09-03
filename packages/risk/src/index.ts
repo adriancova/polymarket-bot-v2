@@ -60,6 +60,7 @@ export {
   RiskEvaluationInputSchema,
   ScenarioViewSchema,
   ScopeAttributionSchema,
+  validateEvaluationInput,
 } from "./inputs.js";
 export type {
   AllocationVerdictView,
@@ -70,6 +71,7 @@ export type {
   PortfolioPosition,
   PortfolioView,
   RiskEvaluationInput,
+  RiskInputValidation,
   ScenarioView,
   ScopeAttribution,
 } from "./inputs.js";
