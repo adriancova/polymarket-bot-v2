@@ -1612,6 +1612,18 @@ as "not WP-180-specific".** Two measured behaviours:
   contains a field that was never in the input.
 - **Loss.** A get-only inherited accessor makes the library's own output assignment fail,
   so a field present in the input is ABSENT from the validated output.
+- **Defaults defeated (added 2026-09-03, orchestrator-confirmed — the most dangerous of the
+  three).** The same single get-only inherited accessor also defeats a schema's OWN
+  `.default()`: `z.object({a, flag: z.boolean().default(true)})` parsing `{a:"x"}` normally
+  yields an own `flag: true`, but with `flag` defined as a get-only accessor on
+  `Object.prototype` the parse still SUCCEEDS while `flag` never lands in the output as an
+  own property. Any check gated on a defaulted setting being present therefore SKIPS.
+  WP-180's round-7 remediation measured three LIVE fail-opens from exactly this at its own
+  reviewed tip, with no hostile input beyond that one accessor:
+  `requireVerifiedSettlementForEntries` → §9.8 check 6 skipped, an unverified settlement
+  APPROVED; `requirePositiveNetEdgeForEntries` → check 12 skipped, a negative net edge
+  APPROVED; and **`maxRunMode` → check 2 gone, so LIVE no longer exceeded the maximum** —
+  a run-mode ceiling silently ceasing to be enforced.
 
 So a successful parse guarantees neither that the output matches the input nor that it is
 free of ambient prototype state. Any code that treats a parse result as trustworthy data —
@@ -1624,6 +1636,10 @@ include `packages/domain` (the frozen event/intent schemas every package parses 
 WP-200's `packages/ledger` and `packages/pnl` (**merged** at `7e75f9a` — its records are
 parsed from caller-supplied values), WP-170's `packages/strategy-runtime`, and every adapter
 that parses venue payloads.
+
+**The audit question is therefore broader than "did my fields survive?" — it is "is any of
+this value the library's rather than mine?", which covers adopted fields, dropped fields,
+and defaults. A safety-relevant setting expressed as a schema default is the sharpest case.**
 
 **Owner: contract owner, as a bounded governance round** (it spans packages no single work
 package owns, and the remedy may belong in a contract rule rather than in each package).
