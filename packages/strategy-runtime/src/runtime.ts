@@ -7,7 +7,10 @@
  * - validate parameters against the strategy's schema (Zod-structural
  *   `safeParse`; anything else is a typed refusal, never a guess);
  * - own per-instance state and the deterministic seeded RNG;
- * - invoke synchronous callbacks;
+ * - invoke synchronous callbacks, handing each ONE invocation-scoped
+ *   `StrategyContext` that is revoked in a `finally` the moment the callback
+ *   returns or throws (a retained context must never advance the RNG between
+ *   callbacks — see `context.ts` and review finding H1);
  * - enforce the evaluation-time watchdog (injected monotonic clock; the
  *   runtime itself reads no clock);
  * - persist EXACTLY ONE `DecisionResult` per evaluation (§6 invariant 3):
@@ -45,6 +48,7 @@ import {
   STRATEGY_CALLBACK_NAMES,
   type Strategy,
   type StrategyCallbackName,
+  type StrategyContext,
 } from "@polymarket-bot/strategy-sdk";
 
 import {
@@ -53,7 +57,7 @@ import {
   type InstanceStatus,
   type StrategyStateCheckpoint,
 } from "./checkpoint.js";
-import { buildStrategyContext, drawOnlyRng } from "./context.js";
+import { buildStrategyContext } from "./context.js";
 import { validateEvaluationInput, type EvaluationInput } from "./input.js";
 import { canonicalJsonStringify, checkpointableJsonProblem, deepFreeze } from "./json.js";
 import type {
@@ -360,18 +364,23 @@ class StrategyInstanceRuntime {
 
   private runEvaluation(input: EvaluationInput): EvaluationOutcome {
     const rngSnapshot = this.rng.snapshot();
-    const facade = drawOnlyRng(this.rng);
-    const context = buildStrategyContext(input, this.params, this.state, facade);
+    const scoped = buildStrategyContext(input, this.params, this.state, this.rng);
 
     let returned: DecisionResult | undefined;
     let thrown: unknown;
     let threw = false;
     const startNs = this.clock.nowNs();
     try {
-      returned = this.invokeCallback(input, context);
+      returned = this.invokeCallback(input, scoped.context);
     } catch (cause) {
       threw = true;
       thrown = cause;
+    } finally {
+      // The context is a capability for THIS invocation only. Revoking here —
+      // on the returning path and the throwing path alike — is what stops a
+      // retained `ctx` from drawing from the live generator between callbacks
+      // and desynchronizing the stream from every checkpoint (finding H1).
+      scoped.revoke();
     }
     const endNs = this.clock.nowNs();
     const elapsedNs = endNs > startNs ? endNs - startNs : 0n;
@@ -467,10 +476,7 @@ class StrategyInstanceRuntime {
     return { kind: "DECIDED", record, telemetry, checkpoint };
   }
 
-  private invokeCallback(
-    input: EvaluationInput,
-    context: ReturnType<typeof buildStrategyContext>,
-  ): DecisionResult {
+  private invokeCallback(input: EvaluationInput, context: StrategyContext): DecisionResult {
     switch (input.callback) {
       case "onStart":
         return this.strategy.onStart(context);

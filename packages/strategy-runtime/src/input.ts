@@ -15,8 +15,21 @@
  * where untrusted bytes enter (adapters), not on every tick.
  *
  * Ownership: by passing an `EvaluationInput`, the caller hands the view
- * objects to the runtime, which deep-freezes them in place before the strategy
- * can see them (§7.6 read-only views).
+ * objects to the runtime, which deep-freezes them IN PLACE before the strategy
+ * can see them (§7.6 read-only views). The caller therefore may not keep
+ * mutating a view it passes: the first evaluation freezes the producer's own
+ * object, and its next in-place write throws in strict mode.
+ *
+ * BINDING OBLIGATION ON THE COMPOSITION ROOT (WP-230), recorded 2026-09-02 in
+ * remediation round 1 at the reviewer's request (finding L1): WP-230 must pass
+ * a FRESH or explicitly COPIED view object per evaluation, and must carry an
+ * INTEGRATION TEST that proves it — a test that runs two consecutive
+ * evaluations against the real wiring and asserts the producers' own objects
+ * are not the frozen ones (or, equivalently, that the producer can still
+ * mutate its own state after an evaluation). In-place freezing of
+ * caller-supplied objects is a deliberate, disclosed library-boundary choice
+ * (`docs/handoffs/WP-170.md`: `assumptions` 13, `known_risks` 1); the test is
+ * how that choice stops being a trap.
  */
 
 import {

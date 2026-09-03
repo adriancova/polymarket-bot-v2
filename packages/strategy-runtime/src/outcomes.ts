@@ -4,6 +4,11 @@
  * branches on `kind`/`code`, and a hung, throwing, or misbehaving strategy is
  * CONTAINED — the runtime never crashes and never lets §6 invariant 3 slip.
  *
+ * ONE documented exception, added 2026-09-02 in remediation round 1:
+ * `StrategyContextRevokedError` (below) is thrown, because the frozen §7.6
+ * context methods have no return channel for a refusal. It is a caller-error
+ * surface like `REFUSED`, not a decision; see the class comment.
+ *
  * The four kinds:
  *
  * - `DECIDED` — the callback ran within budget and returned a valid §7.5
@@ -77,6 +82,66 @@ export type EvaluationOutcome =
       readonly cause: unknown;
       readonly incident: IncidentReport;
     };
+
+/**
+ * The capabilities a `StrategyContext` hands to ONE callback invocation. Every
+ * one is revoked when that invocation returns or throws (see `context.ts`);
+ * the name is carried on the refusal so an operator reading an incident knows
+ * exactly which capability was reached for after the fact.
+ */
+export type StrategyContextCapability =
+  | "now"
+  | "market"
+  | "book"
+  | "features"
+  | "position"
+  | "orders"
+  | "riskBudget"
+  | "params"
+  | "state"
+  | "rng"
+  | "rng.nextUint32"
+  | "rng.nextFloat53"
+  | "rng.nextIntBelow";
+
+/** The `code` carried by every `StrategyContextRevokedError`. */
+export const STRATEGY_CONTEXT_REVOKED = "STRATEGY_CONTEXT_REVOKED";
+
+/**
+ * The typed refusal for using a `StrategyContext` capability after the
+ * invocation that received it has ended.
+ *
+ * This is the ONE place the package refuses by throwing rather than by
+ * returning, and the exception is forced by the frozen §7.6 shape: `SeededRandom
+ * .nextUint32(): number` has no return channel for a refusal, and every other
+ * context method is likewise typed to return data. Silently returning a stale
+ * or fabricated value would be the very failure this class exists to prevent —
+ * a post-return `rng()` draw that advanced the live generator produced a
+ * decision stream that no checkpoint could reproduce (review finding H1).
+ *
+ * Where the throw lands:
+ * - inside a LATER callback (a strategy that stashed the old context), the
+ *   runtime's own containment catches it and persists exactly one
+ *   `RUNTIME.CALLBACK_THREW` skip — no new reserved reason code is needed,
+ *   and the detail names the capability;
+ * - outside any callback, it propagates to whoever made the out-of-band call,
+ *   which is the only honest answer: no evaluation is in progress, so there is
+ *   no decision record to attribute it to.
+ */
+export class StrategyContextRevokedError extends Error {
+  readonly code: typeof STRATEGY_CONTEXT_REVOKED = STRATEGY_CONTEXT_REVOKED;
+  readonly capability: StrategyContextCapability;
+
+  constructor(capability: StrategyContextCapability) {
+    super(
+      `StrategyContext capability ${capability} was used after its callback returned; the ` +
+        "context is invocation-scoped and was revoked (a post-return RNG draw would advance " +
+        "a generator no checkpoint can reproduce — §12.4 determinism)",
+    );
+    this.name = "StrategyContextRevokedError";
+    this.capability = capability;
+  }
+}
 
 export type RuntimeCreationRefusalCode =
   | "STRATEGY_SHAPE_INVALID"

@@ -31,7 +31,10 @@ export type {
   IncidentReport,
   RuntimeCreationRefusal,
   RuntimeCreationRefusalCode,
+  StrategyContextCapability,
 } from "./outcomes.js";
+
+export { STRATEGY_CONTEXT_REVOKED, StrategyContextRevokedError } from "./outcomes.js";
 
 export type { CheckpointStore, DecisionSink, MonotonicClock } from "./ports.js";
 
