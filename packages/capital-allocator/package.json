@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Capital allocator (WP-180): commitment accounting where open orders and positions both consume limits, per-scope exposure tracking (global/instance/market/series/underlying/resolution-window), user-defined caps with zero-defaulted live-micro caps, reservation lifecycle, and v1 one-live-owner conflict rejection with independent shadow accounting. Pure layer-1 logic: no I/O, no clock, no network, no credential surface.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
@@ -11,7 +11,14 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*",
+    "zod": "^4.4.3"
+  },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }

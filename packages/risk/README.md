@@ -1,0 +1,352 @@
+# `@polymarket-bot/risk`
+
+Owner: `WP-180`
+Authority: `docs/spec/polymarket-bot-orchestrator-handoff.md` §9.8 (Risk Engine),
+§9.9 (Incident Controller — recommendations only), §6 invariants 10/12/13/18,
+§7.7 (intents and the resize rule), §14.3 (metrics are labelled by reason code)
+Related: [`docs/handoffs/WP-180.md`](../../docs/handoffs/WP-180.md),
+[`docs/handoffs/WP-110.md`](../../docs/handoffs/WP-110.md) (settlement payoffs),
+[ADR-016](../../docs/adr/ADR-016-ratified-inferred-domain-shapes.md) (UUID refusal),
+[`docs/contracts/dependency-direction.md`](../../docs/contracts/dependency-direction.md)
+
+Pure layer-1 logic. **No I/O, no clock, no network, no credential, no signer, no
+order-placement surface.** Every monetary and size value is an exact decimal
+string (`@polymarket-bot/decimal`); no binary float appears anywhere (§6
+invariant 1).
+
+---
+
+## 1. What this package does
+
+`evaluateIntent(policy, input)` runs the §9.8 pre-trade checks over one intent
+and returns either an **approved-intent record** or the **typed refusals** that
+prevented it, plus **incident action recommendations** for the §9.9 controller.
+
+`resizeApprovedIntent(record, request)` implements §7.7's rule that "a risk veto
+never silently mutates an intent. A resize creates a new approved-intent record
+linked to the original."
+
+## 2. Three rules that shape everything here
+
+1. **Fail closed.** Unknown never permits. A missing market context, an
+   unmeasured feed, an absent exposure snapshot, an absent allocator verdict, an
+   unbounded cost, an unsupplied scenario — each *blocks*. There is no code path
+   in which absence is read as "fine".
+2. **Worst-case contractual loss is PRIMARY.** `limits.maxWorstCaseContractualLoss`
+   is the one **required** limit in the policy; every other cap is optional. The
+   check runs even when secondary checks have already refused, and the assessment
+   is returned on both arms of the result. Its codes are listed in
+   `PRIMARY_RISK_REASON_CODES`.
+3. **This package executes nothing.** It owns no connection. §9.9 says "the
+   Incident Controller—not the ordinary risk gate—originates operational safety
+   actions"; what this package emits is `kind: "RECOMMENDATION"` data for that
+   controller, which is a later work package.
+
+## 3. Worst-case contractual loss, and the `CANCELLED` outcome
+
+The measure uses WP-110's **venue-verified** settlement payoff semantics —
+both tokens, evaluated per outcome (`packages/settlement/src/payout.ts`,
+retrieved 2026-08-28 from the venue's resolution documentation):
+
+| Outcome | YES share redeems | NO share redeems |
+| --- | --- | --- |
+| `YES_WIN` | `1` | `0` |
+| `NO_WIN` | `0` | `1` |
+| `SPLIT_50_50` | `0.5` | `0.5` |
+
+**`CANCELLED` is never valued.** The venue documents no cancellation, void, or
+refund mechanic (WP-110 register row **U-10**, UNVERIFIED), and
+`payoutPerShare("CANCELLED")` **refuses** with
+`SETTLEMENT_CANCELLED_PAYOUT_UNVERIFIED`. This package invents no payout either.
+The unverified outcome is instead **bounded**: an outcome token is an asset, so
+no redemption path can charge its holder, every unverified redemption is `≥ 0`,
+and the loss across *all* terminal outcomes is therefore bounded by a
+**zero-redemption floor**. That produces two measures:
+
+- **`maximumContractualLoss` (PRIMARY, binding)** — committed cost against the
+  zero floor. Deliberately conservative: a fully hedged YES/NO pair is *not*
+  credited its verified hedge value, because crediting it would rely on a
+  cancellation payout the venue does not document.
+- **`worstCaseResolutionLoss`** — committed cost minus the per-market minimum
+  settlement value over the three **verified** outcomes (§9.8's "worst-case
+  resolution PnL"). May be negative, meaning a guaranteed profit.
+
+`cancelledOutcomeTreatment` on every assessment states this in one machine-
+readable value: `ZERO_REDEMPTION_FLOOR_UNVERIFIED_U10`.
+
+Conservative simplifications, each of which overstates loss and never
+understates it: resting BUY orders are assumed to fill at their limit price;
+resting SELL orders are assumed **not** to fill (retaining the exposed tokens and
+forgoing the proceeds); a candidate entry is assumed to fill fully at its bound;
+a `QUOTE` level names no outcome token (§7.7), so its bought shares are placed on
+whichever token settles **worse**.
+
+## 4. Which checks apply to which intent
+
+Disposition is derived from the intent **type**. A `POSITION` intent that happens
+to reduce a holding is still an `ENTRY` and gets the stricter treatment — refusing
+to place a new order is the safe direction, and a strategy that means "exit" has
+`REDUCE_POSITION`.
+
+| §9.8 check | ENTRY | EXIT (`REDUCE_POSITION`) | CANCEL |
+| --- | :---: | :---: | :---: |
+| 1. run / strategy state | ✔ | ✔ | — (§6 inv. 13) |
+| 2. run mode within process maximum | ✔ | ✔ | ✔ |
+| 3. real-order enablement and fencing | ✔ | ✔ | — |
+| 4. venue geographic eligibility | ✔ | ✔ (not `CLOSE_ONLY`) | — |
+| 5. market active / accepting | ✔ | ✔ (`CLOSE_ONLY` permitted) | — |
+| 6. settlement spec verified | ✔ | — | — |
+| 7a. features / reference feed fresh | ✔ | — (§9.9 row 1) | — |
+| 7b. venue book fresh | ✔ | **✔** (§9.9 row 2, §6 inv. 12) | — |
+| 8. book synchronized | ✔ | ✔ | — |
+| 9. trading parameters known | ✔ | ✔ | — |
+| 10. price on tick | ✔ | ✔ | — |
+| 11a. size ≥ market minimum | ✔ | ✔ | — |
+| 11b. economic floor | ✔ | — | — |
+| 12. expected net edge | ✔ | — | — |
+| 13. participation limit | ✔ | — | — |
+| 14a. allocator verdict present | ✔ | — | — |
+| 14b. allocator verdict *refused* | ✔ | ✔ | ✔ |
+| 14c. sell ≤ confirmed inventory | ✔ | ✔ | — |
+| 15. per-order / per-scope / global limits | ✔ | — | — |
+| 16. worst-case contractual loss | ✔ | reported, not enforced | reported |
+| 17. scenario loss | ✔ | reported, not enforced | reported |
+| 18. duplicate intent / self-trade | ✔ | duplicate only | duplicate only |
+| 19. rate-limit headroom | ✔ | — | — |
+| 20. time-to-close | ✔ | — | — |
+
+The two rules behind the "—" cells:
+
+- **§6 invariant 13** — "Safety cancellation outranks new order placement": a
+  `CANCEL` is not blocked by staleness, exposure, edge, headroom, or
+  time-to-close. It *is* still blocked by an out-of-range run mode, which is a
+  process configuration error rather than a market condition.
+- **Capacity limits gate entries, not exits.** An exit reduces exposure;
+  enforcing a cap against it would block exactly the action that brings the
+  account back inside the cap. The measures are still computed and returned so
+  an operator can see them.
+
+### Staleness and exits, stated exactly
+
+| Stale or unmeasured feed | Entry | Exit / reduction | Cancel |
+| --- | --- | --- | --- |
+| features / reference feed | **BLOCKED** | permitted | permitted |
+| venue book | **BLOCKED** | **BLOCKED**, with `CANCEL_RESTING_ORDERS` + `RECONCILE_ACCOUNT` recommendations | permitted |
+
+Sources, verbatim: §9.9 row 1 ("External reference feed stale, Polymarket
+healthy → Cancel signal-dependent quotes; halt new entries" — the venue book is
+healthy, so exits are not halted); §9.9 row 2 ("Polymarket book stale → Cancel
+resting orders; no blind aggressive orders"); §6 invariant 12 ("No blind flatten.
+Unknown position or book state causes cancel and reconciliation before any
+protected reduction action"). The protected reduction happens *after*
+reconciliation, under the incident controller — not here, and not now.
+
+Staleness itself is a **caller-supplied measurement** (`ageMs`). This package
+reads no clock, so the same inputs give the same verdict on replay as they did
+live (§6 invariant 2, §12.4).
+
+## 5. Reason codes — the PACKAGE-OWNED vocabulary
+
+Every rejection, approval, and recommendation carries a code from this list.
+Codes follow the frozen `CodeString` grammar (`^[A-Za-z][A-Za-z0-9_.:-]*$`, ≤ 64
+characters) so they are safe as metric labels (§14.3). **Adding a code is
+additive; changing the meaning of one is not** — operators alert on them. The
+list is exported at runtime as `RISK_REASON_CODES` so a consumer can validate a
+persisted code against the vocabulary of the version that wrote it, and
+`test/unit/risk/engine.test.ts` fails if any declared code becomes unreachable.
+
+### Input validation
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_INPUT_INVALID` | The evaluation input, policy, or resize request failed its schema. |
+| `RISK_UUID_NOT_CANONICAL` | A UUID-shaped id arrived in a non-lowercase spelling. ADR-016 §2: refuse, never case-fold. |
+| `RISK_INTENT_EXPIRED` | `validUntil` is before the caller-supplied evaluation instant, or the two are not comparable. |
+| `RISK_ZERO_DELTA` | The position intent resolves to no share delta; there is nothing to execute. |
+| `RISK_MARKET_CONTEXT_MISSING` | No market context was supplied for a market the intent touches. |
+
+### Checks 1–4 — state, mode, enablement, eligibility
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_RUN_STATE_BLOCKS` | The run state does not permit this intent. |
+| `RISK_STRATEGY_STATE_BLOCKS` | The strategy instance state does not permit this intent. |
+| `RISK_RUN_MODE_EXCEEDS_MAXIMUM` | The requested run mode is above the configured process maximum (§11). |
+| `RISK_REAL_ORDER_SURFACE_UNSUPPORTED` | The run mode places real orders, and this package cannot verify enablement or fencing (§6 invariants 16, 17). **It refuses by construction** — a second floor under check 2. |
+| `RISK_VENUE_ELIGIBILITY_UNVERIFIED` | Eligibility is not a verified `ELIGIBLE` result. Absent = unverified = blocked (§6 invariant 18). |
+
+### Checks 5–6 — market and settlement
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_MARKET_NOT_ACCEPTING` | The market is halted. |
+| `RISK_MARKET_STATUS_UNKNOWN` | The market status is `UNKNOWN`; acting on it would be blind. |
+| `RISK_MARKET_CLOSE_ONLY` | Close-only: new entries blocked, reductions permitted. |
+| `RISK_SETTLEMENT_UNVERIFIED` | Settlement readiness does not permit model-dependent activation (§9.3, WP-110). Absent = unverified. |
+
+### Check 7 — freshness
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_FEATURES_STALE` | The feature snapshot is older than its policy limit. |
+| `RISK_REFERENCE_FEED_STALE` | The external reference feed is older than its limit. |
+| `RISK_BOOK_STALE` | The venue book for this market is older than its limit (entry). |
+| `RISK_FRESHNESS_UNKNOWN` | A required feed carries **no** measurement. Unknown is treated exactly like stale. |
+| `RISK_BOOK_STALE_NO_BLIND_REDUCTION` | A **reduction** into a stale or unmeasured book. §6 invariant 12: cancel and reconcile first. |
+
+### Checks 8–11 — book, parameters, price, size
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_BOOK_NOT_SYNCHRONIZED` | The local book is not confirmed synchronized. Absent = unknown = blocked. |
+| `RISK_TRADING_PARAMETERS_UNKNOWN` | Tick size, minimum order size, or the parameter version is unknown (§6 invariant 9). |
+| `RISK_PRICE_NOT_TICK_CONFORMANT` | A leg price is not an exact multiple of the tick size. |
+| `RISK_SIZE_BELOW_MINIMUM` | A leg is below the market's minimum order size. |
+| `RISK_NOTIONAL_BELOW_ECONOMIC_FLOOR` | An **entry** below the configured economic floor. Never applied to an exit. |
+
+### Check 12 — economics
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_NET_EDGE_NOT_POSITIVE` | Edge does not survive fees, slippage, and the risk buffer. |
+| `RISK_EDGE_INPUTS_MISSING` | A declared edge, fee estimate, or slippage estimate is absent. An unsupplied cost is not a zero cost. |
+
+### Checks 13–14 — participation, balances, inventory
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_PARTICIPATION_LIMIT_EXCEEDED` | More bought shares than the configured per-intent limit. |
+| `RISK_ALLOCATION_REFUSED` | The capital allocator refused; its own codes ride in `details.allocatorCodes`. |
+| `RISK_ALLOCATION_VERDICT_MISSING` | No allocator verdict supplied for an **entry**; balances and reservations are unproven. |
+| `RISK_SELL_EXCEEDS_INVENTORY` | A sell leg exceeds the confirmed holding (§6 invariant 10). |
+| `RISK_QUOTE_MAX_INVENTORY_EXCEEDED` | A fully-filled quote ladder would breach the intent's own `maximumInventory`. |
+
+### Check 15 — capacity limits
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_PER_ORDER_NOTIONAL_EXCEEDED` | The intent's bounded notional exceeds the per-order limit. |
+| `RISK_GLOBAL_EXPOSURE_EXCEEDED` | The global cap. |
+| `RISK_INSTANCE_EXPOSURE_EXCEEDED` | The per-strategy-instance cap. |
+| `RISK_MARKET_EXPOSURE_EXCEEDED` | The per-market cap. |
+| `RISK_SERIES_EXPOSURE_EXCEEDED` | The per-series cap. |
+| `RISK_UNDERLYING_EXPOSURE_EXCEEDED` | The per-underlying cap. |
+| `RISK_RESOLUTION_WINDOW_EXPOSURE_EXCEEDED` | The per-resolution-window cap. |
+| `RISK_EXPOSURE_SNAPSHOT_MISSING` | A cap is configured and no snapshot was supplied. An unmeasured limit is not a passed limit. |
+| `RISK_SCOPE_KEY_MISSING` | A scope cap is configured for a dimension the market carries no attribution for. |
+
+Every entry consumes a limit from **both** components — resting open orders and
+held positions — and this package **recomputes** their sum rather than reading
+the `combined` field the allocator also publishes, so a drifted derived field
+cannot pass a limit.
+
+### Check 16 — the PRIMARY measure
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_WORST_CASE_LOSS_EXCEEDED` | Projected maximum contractual loss above `limits.maxWorstCaseContractualLoss`. |
+| `RISK_WORST_CASE_RESOLUTION_LOSS_EXCEEDED` | Projected worst-case loss over the three verified outcomes above its limit. |
+| `RISK_WORST_CASE_UNBOUNDED` | The intent bounds no maximum cost, so it cannot be shown to pass the primary limit. |
+| `RISK_BASKET_LEG_UNBOUNDED` | A buying basket leg carries no `maximumBuyPrice` (§9.10: a basket is coordinated, not atomic — each leg's risk must be bounded). |
+
+These four are exactly `PRIMARY_RISK_REASON_CODES`.
+
+### Check 17 — scenarios
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_SCENARIO_LOSS_EXCEEDED` | The worst supplied scenario exceeds `scenario.maxScenarioLoss`. |
+| `RISK_SCENARIO_MISSING` | A required shock kind (`SPOT`, `VOLATILITY`, `TIME`, `LIQUIDITY`) was not supplied. |
+| `RISK_SCENARIO_MARKS_INCOMPLETE` | A supplied scenario does not mark every held market; a partial mark understates the loss. |
+
+### Checks 18–20 — guards, headroom, close
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_DUPLICATE_INTENT` | This `intentId` was already evaluated. |
+| `RISK_SELF_TRADE` | The intent would cross the account's own resting order on the same market and token. |
+| `RISK_RATE_LIMIT_HEADROOM_INSUFFICIENT` | Headroom at or below the safety reserve (§6 invariant 13). |
+| `RISK_RATE_LIMIT_UNKNOWN` | Headroom was not supplied. |
+| `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` | Inside the configured entry cutoff before close. |
+| `RISK_TIME_TO_CLOSE_UNKNOWN` | Time to close was not supplied. |
+
+### Reductions and unknown state
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_POSITION_STATE_UNKNOWN` | A reduction was requested for a market the supplied portfolio holds no position in (§6 invariant 12). |
+
+### Approvals
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_APPROVED` | The intent passed every applicable check. |
+| `RISK_CANCEL_ALWAYS_PERMITTED` | Approved as a safety cancellation (§6 invariant 13). |
+| `RISK_EXIT_CAPACITY_CHECKS_INAPPLICABLE` | Approved as a reduction; capacity, edge, and time gates do not apply. |
+
+### Resize
+
+| Code | Meaning |
+| --- | --- |
+| `RISK_RESIZE_NOT_A_REDUCTION` | A risk resize must strictly reduce `|targetShares|`. |
+| `RISK_RESIZE_ID_REUSED` | The new record reused an id from the lineage; that would edit, not create. |
+| `RISK_RESIZE_UNSUPPORTED_TYPE` | Only `POSITION` and `REDUCE_POSITION` carry a single resizable `targetShares`. |
+| `RISK_RESIZE_INCOHERENT` | The resize would flip the side of the original intent. |
+
+## 6. Approved-intent records and resize lineage
+
+| Field | Meaning |
+| --- | --- |
+| `approvedIntentId` | This record's own identity. |
+| `lineage` | `ORIGINAL` or `RESIZED`. |
+| `supersedesApprovedIntentId` | The record this one replaces (absent on an `ORIGINAL`). |
+| `rootApprovedIntentId` | Head of the chain, so an arbitrarily long resize chain is traceable in one hop. |
+| `sourceIntentId` | The strategy's own `intentId`. Absent for `CANCEL` and `REDUCE_POSITION`, which §7.7 gives none. |
+| `worstCaseBasis` | `EVALUATED` (computed for this intent) or `INHERITED_UPPER_BOUND` (carried from the record being resized). |
+
+Records are deeply frozen: an in-place edit **throws**. A resize returns a new
+record and leaves the original untouched, including its `intent` object.
+
+Ceilings the strategy set (`maximumTotalCost`, `maximumBuyPrice`,
+`minimumSellPrice`, `validUntil`) are copied unchanged by a resize — a ceiling
+stays valid under a smaller size, and scaling one would be this package
+inventing a number the strategy did not supply. Re-running `evaluateIntent` on a
+resized intent produces a fresh `EVALUATED` record.
+
+## 7. Incident action recommendations
+
+`recommendIncidentActions(failureClass, marketId?)` returns the §9.9 default
+actions for a failure class as `kind: "RECOMMENDATION"` data. The action
+vocabulary is the §9.9 ladder verbatim, and the mapping reproduces the §9.9
+default-action table row by row, each recommendation quoting the row it comes
+from. **Nothing here performs an action**, and no recommendation carries a
+callable.
+
+## 8. Dependency boundary
+
+`packages/risk` declares exactly `@polymarket-bot/decimal` and
+`@polymarket-bot/domain` (both layer 0) plus `zod`. It imports **no** layer-1
+peer: `docs/contracts/dependency-direction.md` §2.1 lists no same-layer edge for
+it, and adding one would be F13. Two consequences, both deliberate:
+
+- The **capital-allocator** exposure snapshot and reservation verdict are
+  consumed **structurally**, as loose views (`ExposureSnapshotViewSchema`,
+  `AllocationVerdictViewSchema`). `test/unit/risk/ports.test.ts` pins the port
+  three ways: `tsc`-checked field names, a runtime parse of real allocator
+  output, and an end-to-end pass driving a refusal from the allocator's own
+  numbers.
+- The **settlement** payout constants are **mirrored**, not imported, and
+  `test/unit/risk/worst-case.test.ts` imports both packages (a test tree is not
+  a workspace package and declares no edge) to assert they still agree.
+
+Small helpers duplicated for the same reason, each with its own tests:
+`deepFreeze` / `uuidShapedNotCanonical` (from `packages/capital-allocator`) and
+`instantMilliseconds` (from `packages/settlement`) — the WP-110 precedent.
+
+## 9. Safety
+
+- `maxRunMode` defaults to `PAPER` and nothing in this package raises it.
+- Any run mode that places real orders is refused outright
+  (`RISK_REAL_ORDER_SURFACE_UNSUPPORTED`), independently of the configured
+  maximum, because this package cannot verify enablement or fencing.
+- No credential, signer, order-placement surface, or network call exists here.
