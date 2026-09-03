@@ -37,6 +37,16 @@ export {
   type RightBranch,
 } from "./returned.js";
 
+/**
+ * Round 7: a class VALUE handed out by a public factory, and a key-remapped
+ * mapped type. Note what is NOT exported here — neither class, and neither
+ * `RemapSource` nor `Remapped` — so the factories are the only path that puts
+ * any of it in a caller's hands.
+ */
+export { abstractClassFactory, concreteClassFactory } from "./classes.js";
+export { twiceReachedFactory } from "./twice-reached.js";
+export { remappedFactory } from "./remapped.js";
+
 /** Declared HERE, not re-exported: review round 5's `directIndexTomorrow`. */
 export function directlyInTheEntryPoint(value: unknown, label = "root"): string {
   return `${label}: ${typeof value}`;

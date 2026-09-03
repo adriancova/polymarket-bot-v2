@@ -53,6 +53,20 @@
  * | `Promise<Facade>` (found this round)                  | SILENTLY ABSENT   | REFUSED by name |
  * | a handed-out `new (…)` (found this round)             | SILENTLY ABSENT   | REFUSED by name |
  * | a chain past `MAX_SURFACE_DEPTH` (found this round)   | SILENTLY TRUNCATED | REFUSED by name |
+ *
+ * REMEDIATION ROUND 7, 2026-09-03. Review round 7 found three more, and the
+ * first of them is the only one so far that hid PUBLIC callables from the
+ * hostile battery rather than merely from the list:
+ *
+ * | shape (round 7)                                       | round 6           | now |
+ * | ----------------------------------------------------- | ----------------- | --- |
+ * | a class VALUE returned by a public factory             | every member PACKAGE | PUBLIC, member by member |
+ * | …its abstract constructor                              | PACKAGE `constructor` | PUBLIC `abstract constructor` |
+ * | …its abstract declarations                             | PACKAGE `method`, as if we implemented it | PACKAGE `abstract declaration` |
+ * | a callable far below a returned index value            | SILENTLY ABSENT   | REFUSED by name |
+ * | a callable far below a foreign container's argument    | SILENTLY ABSENT   | REFUSED by name |
+ * | a callable far below a NAMED property chain            | SILENTLY ABSENT   | REFUSED by name |
+ * | a key-REMAPPED mapped property                         | SILENTLY ABSENT   | enumerated under the remapped name |
  */
 
 import { dirname, join, resolve } from "node:path";
@@ -62,6 +76,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   deriveBoundarySurface,
+  MAX_SURFACE_DEPTH,
   type Derivation,
   type DerivedCallable,
 } from "./boundary-derivation.js";
@@ -80,6 +95,27 @@ function describeEntry(entry: DerivedCallable): string {
  * is precisely the failure round 5 reported.
  */
 const EXPECTED_SHAPES: readonly string[] = [
+  // Round 7, M7-3: a class VALUE handed out by a public factory. Neither class
+  // is exported by name, so every PUBLIC below is derived from the factory's
+  // return type alone — which is exactly what the walk used to drop.
+  'AbstractHandedOut.compute [PACKAGE] (value) <abstract declaration>',
+  'AbstractHandedOut.concrete [PUBLIC] (value) <method>',
+  'AbstractHandedOut.constructor [PUBLIC] (label) <abstract constructor>',
+  'AbstractHandedOut.execute [PACKAGE] (value) <abstract declaration>',
+  'AbstractHandedOut.handler (getter) [PACKAGE] () <abstract declaration>',
+  'AbstractHandedOut.parse [PUBLIC] (raw) <method>',
+  'ConcreteHandedOut.constructor [PUBLIC] (seed) <constructor>',
+  'ConcreteHandedOut.run [PUBLIC] (value) <method>',
+  // …and a class the walk meets as package-internal FIRST and as handed-out
+  // second: the visited-class guard has to admit the second reading.
+  'TwiceReachedClass.constructor [PUBLIC] (note) <constructor>',
+  'TwiceReachedClass.reached [PUBLIC] (value) <method>',
+  'abstractClassFactory [PUBLIC] () <function>',
+  'concreteClassFactory [PUBLIC] () <function>',
+  'twiceReachedFactory [PUBLIC] () <function>',
+  // Round 7, M7-1: a key-remapped mapped property, under its remapped name.
+  'remappedFactory [PUBLIC] () <function>',
+  'remappedFactory (returned).renamed_handler [PUBLIC] (value) <declared method>',
   'ExportedClass.constructor [PUBLIC] (label) <constructor>',
   'ExportedClass.current (getter) [PUBLIC] () <getter>',
   'ExportedClass.current (setter) [PUBLIC] (next) <setter>',
@@ -130,7 +166,7 @@ const EXPECTED_SHAPES: readonly string[] = [
   'withRest [PUBLIC] (values) <function>',
 ];
 
-/** One program for the whole file; it costs ~45 ms to build. */
+/** One program for the whole file; it costs ~47 ms to build. */
 let cached: Derivation | undefined;
 function fixtureSurface(): Derivation {
   cached ??= deriveBoundarySurface({
@@ -140,6 +176,22 @@ function fixtureSurface(): Derivation {
     entryPoints: ["main/src/index.ts", "declarations/src/index.ts"],
   });
   return cached;
+}
+
+/**
+ * The refusal half, cached the same way (~45 ms). Round 7 added a second test
+ * over this fixture, and a second program build with it until this cache; the
+ * derivation is a pure function of the fixture, so one build answers both.
+ */
+let cachedUnnamed: Derivation | undefined;
+function unnamedSurface(): Derivation {
+  cachedUnnamed ??= deriveBoundarySurface({
+    root: FIXTURES,
+    configRoot: REPO_ROOT,
+    packageDirs: ["unnamed/src"],
+    entryPoints: ["unnamed/src/index.ts"],
+  });
+  return cachedUnnamed;
 }
 
 describe("the derivation sees every export shape, and classifies each one", () => {
@@ -245,16 +297,19 @@ describe("the derivation sees every export shape, and classifies each one", () =
     // hostile battery that it could never call. The reviewer's instruction —
     // "emit `unresolved` where no concrete callable name can be driven" — taken
     // literally. Every one of these was SILENT before this round.
-    const derivation = deriveBoundarySurface({
-      root: FIXTURES,
-      configRoot: REPO_ROOT,
-      packageDirs: ["unnamed/src"],
-      entryPoints: ["unnamed/src/index.ts"],
-    });
+    const derivation = unnamedSurface();
     expect(derivation.diagnostics, "the fixture must be a program that compiles").toEqual([]);
     expect(derivation.unresolved.map((entry) => entry.id).sort()).toEqual([
       // a callable-only string index signature (the reviewer's shape 7)
       "CallableIndex[string]",
+      // Round 7, M7-2, at the enumeration's own depth bound: the same chain
+      // reached by NAME. Nothing was refused here before, because the predicate
+      // that decides whether to refuse answered "nothing below".
+      "Deep7.next",
+      // Round 7, M7-2: a callable far below a returned string-index value. The
+      // predicate ran out of depth and reported "no callables", so this was in
+      // NEITHER list — silence behind a bound documented as always refusing.
+      "DeepIndex[string]",
       // a chain of returned facades past MAX_SURFACE_DEPTH: it used to truncate
       // in silence, which is how a whole subtree of callables could disappear
       "Hop3.hop (returned)",
@@ -262,6 +317,13 @@ describe("the derivation sees every export shape, and classifies each one", () =
       "arrayFactory (returned)[number]",
       // a handed-out value someone can `new` that is not one of our classes
       "constructibleFactory (returned)",
+      // Round 7, M7-2, on the foreign-container path.
+      "deepContainerFactory (returned) (type argument 1 of Promise<Deep0>)",
+      // Round 7, M7-1's other half: a synthesized property whose OWN call
+      // signature is the standard library's, with one of ours underneath. The
+      // walk will not claim somebody else's implementation, and it will not
+      // pass over ours either, so it stops.
+      "foreignRemappedFactory (returned).x_stringify",
       // a facade reachable only as a foreign container's type argument
       "promiseFactory (returned) (type argument 1 of Promise<PromisedFacade>)",
     ]);
@@ -280,10 +342,136 @@ describe("the derivation sees every export shape, and classifies each one", () =
       "Hop3.hop",
       "arrayFactory",
       "constructibleFactory",
+      "deepContainerFactory",
       "deepFactory",
+      "deepIndexFactory",
+      "deepNamedFactory",
+      "foreignRemappedFactory",
       "indexFactory",
       "promiseFactory",
     ]);
+  });
+
+  it("round 7: depth exhaustion is REFUSED by name, never answered “no callable”", () => {
+    // Review round 7's M7-2. `carriesCallables` was a BOOLEAN, so the one thing
+    // it could not say is "I ran out of depth before I could tell" — and every
+    // caller read that silence as "there is nothing there". The reviewer's
+    // reproduction: a callable ten property hops beneath a returned string-index
+    // value gave `callables: [deepIndexFactory]`, `unresolved: []`,
+    // `diagnostics: []`, which contradicts both the binding property and the
+    // claim that MAX_SURFACE_DEPTH always refuses.
+    //
+    // Three sites consult the predicate, and the fixture chain is long enough to
+    // exhaust it at all three. Each must now name its refusal AND say that the
+    // bound, not the type, is the reason — a reader who cannot tell "nothing is
+    // there" from "I could not look" is back where round 7 started.
+    const why = new Map(unnamedSurface().unresolved.map((entry) => [entry.id, entry.why]));
+    for (const id of [
+      "DeepIndex[string]", // an index signature's value type
+      "deepContainerFactory (returned) (type argument 1 of Promise<Deep0>)", // a container's argument
+      "Deep7.next", // the enumeration's own depth bound, over a named chain
+    ]) {
+      const explanation = why.get(id);
+      expect(explanation, `${id} is silently absent again`).toBeDefined();
+      expect(explanation, `${id} must say the BOUND is why`).toContain(
+        `MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)})`,
+      );
+      expect(explanation, `${id} must not claim the branch is empty`).toMatch(
+        /could not be shown callable-free|cannot be shown callable-free/,
+      );
+    }
+    // …and the refusals that DO know there is a callable still say so, so the
+    // two answers are distinguishable rather than merged into one hedge.
+    expect(why.get("CallableIndex[string]")).toContain("carries a callable");
+    expect(why.get("Hop3.hop (returned)")).toContain("with callables still below it");
+  });
+
+  it("round 7: a class VALUE a public factory hands out is PUBLIC, member by member", () => {
+    // Review round 7's M7-3, the only finding of rounds 5–7 that hid callables
+    // from the hostile BATTERY rather than only from the list.
+    // `visitReturnedConstructible` called `visitClass` without saying how the
+    // class had reached the caller, so `visitClass` asked the entry points, got
+    // "not exported", and produced:
+    //
+    //   abstractClassFactory          PUBLIC
+    //   AbstractHandedOut.parse       PUBLIC   ← by accident, through the property walk
+    //   AbstractHandedOut.concrete    PACKAGE
+    //   AbstractHandedOut.execute     PACKAGE
+    //   AbstractHandedOut.constructor PACKAGE
+    //
+    // PACKAGE entries never enter `PUBLIC_TOTAL_CALLS`, so those were public
+    // callables going unfuzzed. Neither class in the fixture is exported by
+    // name: every PUBLIC below is derived from the factory's return type alone.
+    const byId = new Map(fixtureSurface().callables.map((entry) => [entry.id, entry]));
+    const expected: ReadonlyArray<readonly [string, string, string, readonly string[]]> = [
+      // 1 — a CONCRETE constructor: `new C(x)` is the caller's to make.
+      ["ConcreteHandedOut.constructor", "PUBLIC", "constructor", ["seed"]],
+      // 2 — an ABSTRACT constructor: `new C(x)` will not compile, but a subclass
+      //     the caller writes reaches this body through `super(...)`, with the
+      //     caller's arguments. Named as what it is so a probe knows how to
+      //     drive it.
+      ["AbstractHandedOut.constructor", "PUBLIC", "abstract constructor", ["label"]],
+      // 3 — CONCRETE prototype implementations: the body is ours.
+      ["ConcreteHandedOut.run", "PUBLIC", "method", ["value"]],
+      ["AbstractHandedOut.concrete", "PUBLIC", "method", ["value"]],
+      // …and a static, which is reachable on the handed-out value itself.
+      ["AbstractHandedOut.parse", "PUBLIC", "method", ["raw"]],
+      // 4 — ABSTRACT declarations: the body is the CALLER's subclass's, so this
+      //     package owes no hostile-argument obligation for them. Enumerated by
+      //     name anyway — absence from both lists is the outcome the mechanism
+      //     may not have — and PACKAGE, which is what keeps them out of the
+      //     battery without hiding them.
+      ["AbstractHandedOut.execute", "PACKAGE", "abstract declaration", ["value"]],
+      ["AbstractHandedOut.handler (getter)", "PACKAGE", "abstract declaration", []],
+      ["AbstractHandedOut.compute", "PACKAGE", "abstract declaration", ["value"]],
+    ];
+    for (const [id, visibility, shape, params] of expected) {
+      const entry = byId.get(id);
+      expect(entry, `${id} is missing from the derivation`).toBeDefined();
+      expect(entry?.visibility, `${id} visibility`).toBe(visibility);
+      expect(entry?.shape, `${id} shape`).toBe(shape);
+      expect(entry?.params, `${id} parameters`).toEqual(params);
+    }
+    // And the ORDER must not decide the answer. `TwiceReachedClass` is exported
+    // from its own module, so the walk derives PACKAGE for it before the public
+    // factory is ever reached; the visited-class guard has to admit the second,
+    // public reading instead of returning early on the symbol it has seen.
+    expect(byId.get("TwiceReachedClass.constructor")?.visibility, "PACKAGE first, PUBLIC second").toBe(
+      "PUBLIC",
+    );
+    expect(byId.get("TwiceReachedClass.reached")?.visibility).toBe("PUBLIC");
+    // An abstract property that is not callable is not a callable: there is
+    // nothing there to enumerate, and nothing there to omit.
+    expect([...byId.keys()]).not.toContain("AbstractHandedOut.tag");
+    // …and a class NOT handed out keeps its package-internal constructor, so
+    // this is a derived distinction rather than a blanket promotion.
+    expect(byId.get("TypeOnlyExportedClass.constructor")?.visibility).toBe("PACKAGE");
+    expect(fixtureSurface().unresolved).toEqual([]);
+  });
+
+  it("round 7: a key-remapped mapped property is enumerated under its REMAPPED name", () => {
+    // Review round 7's M7-1. `Readonly<T>` keeps each property's original
+    // declaration, which is why round 6's `MappedFacade.mapped` worked; a
+    // remapping clause (`as`) synthesizes a fresh symbol with NO declaration
+    // anywhere, and `visitProperties` gated on `isOurs`, which needs one. The
+    // reviewer's fixture produced `remappedFactory` alone: neither
+    // `renamed_handler` nor any refusal.
+    //
+    // Enumeration rather than refusal, because the name is real and a caller can
+    // drive it: `remappedFactory().renamed_handler(value)`.
+    const byId = new Map(fixtureSurface().callables.map((entry) => [entry.id, entry]));
+    const remapped = byId.get("remappedFactory (returned).renamed_handler");
+    expect(remapped, "the remapped callable is silently absent again").toBeDefined();
+    expect(remapped?.visibility).toBe("PUBLIC");
+    expect(remapped?.params, "the parameters come from the ORIGINAL declaration").toEqual([
+      "value",
+    ]);
+    expect(remapped?.shape).toBe("declared method");
+    // The remapped DATA property is not a callable, and the source interface is
+    // never returned directly, so neither contributes an entry.
+    expect([...byId.keys()]).not.toContain("remappedFactory (returned).renamed_tag");
+    expect([...byId.keys()]).not.toContain("RemapSource.handler");
+    expect(fixtureSurface().unresolved).toEqual([]);
   });
 
   it("a callable shape it cannot classify is REFUSED, not ignored", () => {

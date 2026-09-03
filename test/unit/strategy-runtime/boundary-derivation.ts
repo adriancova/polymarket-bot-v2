@@ -105,6 +105,48 @@
  * fuzz obligation, under-classifying costs a defect — and a refusal is a loud,
  * reviewable stop rather than a silence.
  * ---------------------------------------------------------------------------
+ * REMEDIATION ROUND 7, 2026-09-03 — the three holes left in the mechanism
+ *
+ * Round 6 stated the binding property; round 7 found three places that did not
+ * hold it. Two were silences of the round-6 kind. The third was worse, because
+ * it hid PUBLIC callables from the hostile battery rather than merely from the
+ * list:
+ *
+ * - **M7-3, a handed-out CLASS VALUE lost its visibility.**
+ *   `visitReturnedConstructible` called `visitClass` without saying how the
+ *   class got into the caller's hands, and `visitClass` asked only the entry
+ *   points. So `abstractClassFactory(): typeof AbstractClass` — a PUBLIC
+ *   factory — produced `AbstractClass.constructor`, `.concrete` and `.execute`
+ *   as PACKAGE, and only the STATIC leaked to PUBLIC (through the property
+ *   walk, by accident). PACKAGE entries never enter the battery, so real public
+ *   surface went unfuzzed. `visitClass` now takes the handed-out visibility and
+ *   distinguishes the four cases the finding named:
+ *
+ *   | on a class value the caller holds | answer |
+ *   | --- | --- |
+ *   | a concrete constructor  | PUBLIC `constructor` — `new C(x)` is the caller's |
+ *   | an abstract constructor | PUBLIC `abstract constructor` — reached by `super(...)` from a subclass the caller writes, still with the caller's arguments |
+ *   | a concrete prototype implementation | PUBLIC — the body is ours, the argument is theirs |
+ *   | an abstract declaration | PACKAGE `abstract declaration` — the body is the CALLER's subclass's, so there is nothing of ours to fuzz; enumerated by name so it is never merely absent |
+ *
+ *   The visited-class guard is keyed by the derived visibilities, so a class
+ *   first met as PACKAGE is re-walked when a public path hands it out.
+ *
+ * - **M7-2, `carriesCallables` turned depth exhaustion into "no callable".** A
+ *   boolean that cannot express *I do not know* is exactly what produces
+ *   silence: a callable ten property hops beneath a returned string-index value
+ *   was in neither list. The predicate is tri-state now (`CallableVerdict`),
+ *   and `indeterminate` REFUSES by name everywhere `callable` does.
+ *
+ * - **M7-1, a key-REMAPPED mapped property was skipped.** `{ [K in keyof T as
+ *   `renamed_${K}`]: T[K] }` synthesizes a property symbol with NO declaration
+ *   at all, and `visitProperties` gated on `isOurs`, which needs one. The
+ *   compiler still knows the property's TYPE and that type's call signature is
+ *   declared here, so the callable is enumerated under its actual accessible
+ *   name (`renamed_handler`) rather than refused. A synthesized property whose
+ *   own call signature is declared elsewhere is refused instead — the walk will
+ *   not claim somebody else's implementation.
+ * ---------------------------------------------------------------------------
  *
  * Visibility is derived, never assumed:
  * - PUBLIC — the symbol is exported AS A VALUE from one of the ENTRY POINTS, or
@@ -149,7 +191,36 @@ export type CallableShape =
    * SITE — `makeHandler (returned)` — because that is the expression a probe
    * actually evaluates to reach it.
    */
-  | "returned callable";
+  | "returned callable"
+  /**
+   * Round 7: the constructor of an ABSTRACT class. `new C(x)` on the handed-out
+   * value is a type error, so this constructor is reached through `super(...)`
+   * in a subclass the CALLER writes — with the caller's arguments, running this
+   * package's constructor body. It is a caller-data boundary like any other,
+   * and it is given its own shape so the reader wiring a probe knows the call
+   * has to go through a subclass.
+   */
+  | "abstract constructor"
+  /**
+   * Round 7: an ABSTRACT member declaration on a class this package hands out.
+   * There is no body here — the CALLER's subclass supplies it — so this is the
+   * same ruling review round 6 confirmed for `DecisionSink` and the other ports
+   * this package only ever takes: a contract somebody else implements is not
+   * this package's callable, and it carries no hostile-argument obligation. It
+   * is enumerated anyway, by name and as PACKAGE, because being absent from
+   * both lists is the one outcome this module may not have.
+   */
+  | "abstract declaration";
+
+/**
+ * Round 7: the answer to "does this type carry a callable of ours?" has three
+ * values, not two. A BOOLEAN cannot say *I ran out of depth before I could
+ * tell*, so `carriesCallables` used to turn depth exhaustion into "no
+ * callables" and the walk then stayed silent about that branch — review round
+ * 7's M7-2, reproduced with a callable ten property hops beneath a returned
+ * string-index value, which produced no entry and no refusal at all.
+ */
+export type CallableVerdict = "none" | "callable" | "indeterminate";
 
 /** Which of the four reachability rules put this callable on the list. */
 export type Reachability = "module export" | "class member" | "object property" | "handed out";
@@ -329,8 +400,14 @@ class SurfaceWalk {
   private readonly entries = new Map<ts.Symbol | string, DerivedCallable[]>();
   private readonly unresolved: UnresolvedCallable[] = [];
   private readonly walkedTypes = new Map<ts.Type, Set<Visibility>>();
-  /** Round 6: `visitClass` is reachable from a handed-out `typeof C`, so it is guarded. */
-  private readonly visitedClasses = new Set<ts.Symbol>();
+  /**
+   * Round 6: `visitClass` is reachable from a handed-out `typeof C`, so it is
+   * guarded. Round 7: keyed by the DERIVED VISIBILITIES rather than by the
+   * symbol alone. A class first met as a package-internal declaration and then
+   * handed out by a public factory has to be walked again, or the second,
+   * public reading never happens and the first, wrong one stands.
+   */
+  private readonly visitedClasses = new Map<ts.Symbol, Set<string>>();
 
   constructor(
     private readonly program: ts.Program,
@@ -622,6 +699,7 @@ class SurfaceWalk {
   /** Non-private members of an object type that are declared in these packages. */
   private visitProperties(
     owner: string,
+    file: string,
     type: ts.Type,
     visibility: Visibility,
     depth: number,
@@ -632,30 +710,58 @@ class SurfaceWalk {
     }
     this.walkedTypes.set(type, (walked ?? new Set<Visibility>()).add(visibility));
     for (const property of this.checker.getPropertiesOfType(type)) {
-      if (!this.isOurs(property) || property.getName().startsWith("#")) {
+      const name = property.getName();
+      if (name.startsWith("#")) {
+        continue; // a private field is not reachable from outside its class
+      }
+      const declarations = property.getDeclarations() ?? [];
+      if (declarations.length === 0) {
+        // Round 7, M7-1: a property the compiler SYNTHESIZED. The `isOurs` gate
+        // below needs a declaration, and a key-remapped mapped property has
+        // none, so it used to be skipped in silence.
+        this.visitSynthesizedProperty(`${owner}.${name}`, file, property, visibility, depth);
         continue;
       }
-      this.visitMember(`${owner}.${property.getName()}`, property, visibility, "object property", depth);
+      if (!this.isOurs(property)) {
+        continue; // a foreign declaration: somebody else's implementation
+      }
+      this.visitMember(`${owner}.${name}`, property, visibility, "object property", depth);
     }
   }
 
-  private visitClass(className: string, symbol: ts.Symbol): void {
-    if (this.visitedClasses.has(symbol)) {
-      return; // round 6: also reachable from a handed-out `typeof C`
-    }
-    this.visitedClasses.add(symbol);
+  /**
+   * @param handedOut how the class VALUE reached the caller, when a walk
+   * already established that it did. Round 7's M7-3: this used to be dropped,
+   * so a class returned by a public factory was classified as though the entry
+   * points were the only way to reach it.
+   */
+  private visitClass(className: string, symbol: ts.Symbol, handedOut?: Visibility): void {
     const declaration = (symbol.getDeclarations() ?? []).find(ts.isClassDeclaration);
     if (declaration === undefined) {
       this.refuse(className, this.fileOf(symbol), "class symbol without a class declaration");
       return;
     }
-    // The class VALUE (its constructor and statics) is reachable only where the
-    // value itself is exported; INSTANCE members are reachable wherever an
-    // instance can escape, which a publicly exported TYPE already implies.
-    const valueExported = this.publicValues.has(symbol);
-    const staticVisibility: Visibility = valueExported ? "PUBLIC" : "PACKAGE";
+    // The class VALUE (its constructor and statics) is reachable where the value
+    // itself is exported OR where a public callable HANDS IT OUT — `new C(x)`
+    // and `C.f(x)` both need the value, and a factory returning `typeof C` gives
+    // the caller exactly that. INSTANCE members are reachable wherever an
+    // instance can escape, which a publicly exported TYPE already implies and
+    // which holding the class value implies too.
+    const valueInCallersHands = this.publicValues.has(symbol) || handedOut === "PUBLIC";
+    const staticVisibility: Visibility = valueInCallersHands ? "PUBLIC" : "PACKAGE";
     const instanceVisibility: Visibility =
-      valueExported || this.publicTypes.has(symbol) ? "PUBLIC" : "PACKAGE";
+      valueInCallersHands || this.publicTypes.has(symbol) ? "PUBLIC" : "PACKAGE";
+    const reading = `${staticVisibility}/${instanceVisibility}`;
+    const visited = this.visitedClasses.get(symbol) ?? new Set<string>();
+    if (visited.has(reading)) {
+      return; // round 6: also reachable from a handed-out `typeof C`
+    }
+    this.visitedClasses.set(symbol, visited.add(reading));
+    // An ABSTRACT class cannot be `new`ed, on the handed-out value or anywhere
+    // else; its constructor runs from a subclass's `super(...)`, with whatever
+    // arguments that subclass passes. Still a caller-data boundary, but not one
+    // a probe can drive with `new`, so it is named as what it is.
+    const abstractClass = hasModifier(declaration, ts.ModifierFlags.Abstract);
 
     const staticType = this.checker.getTypeOfSymbolAtLocation(symbol, declaration);
     for (const signature of staticType.getConstructSignatures()) {
@@ -671,7 +777,7 @@ class SurfaceWalk {
         file: repoRelative(this.root, constructor.getSourceFile().fileName),
         visibility: staticVisibility,
         params: parametersOf(constructor),
-        shape: "constructor",
+        shape: abstractClass ? "abstract constructor" : "constructor",
         via: "class member",
       });
     }
@@ -734,6 +840,19 @@ class SurfaceWalk {
       visibility = "PACKAGE"; // reachable to subclasses only, which live here
     }
 
+    // Round 7, M7-3: an ABSTRACT member has no body in these packages. Calling
+    // it runs the CALLER's subclass, which is the same ruling review round 6
+    // confirmed for `DecisionSink` and the other ports this package only takes:
+    // not our implementation, so not our hostile-argument obligation. It is
+    // enumerated by name and as PACKAGE rather than dropped, because absence
+    // from both lists is the outcome this module may not have — and it is
+    // enumerated HERE, before the accessor and value branches, so no later path
+    // can quietly re-record it as a concrete implementation of ours.
+    if (declarations.every((declaration) => hasModifier(declaration, ts.ModifierFlags.Abstract))) {
+      this.recordAbstractDeclarations(id, member, declarations, via);
+      return;
+    }
+
     const accessors = declarations.filter(
       (declaration): declaration is ts.AccessorDeclaration =>
         ts.isGetAccessorDeclaration(declaration) || ts.isSetAccessorDeclaration(declaration),
@@ -764,17 +883,166 @@ class SurfaceWalk {
 
     const type = this.checker.getTypeOfSymbolAtLocation(member, declarations[0] as ts.Declaration);
     if (depth + 1 > MAX_SURFACE_DEPTH) {
-      if (this.carriesCallables(type)) {
+      const verdict = this.carriesCallables(type);
+      if (verdict !== "none") {
         this.refuse(
           id,
           this.fileOf(member),
-          `the surface walk reached MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)}) with ` +
-            "callables still below it; flatten the value or classify this branch explicitly",
+          verdict === "callable"
+            ? `the surface walk reached MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)}) with ` +
+                "callables still below it; flatten the value or classify this branch explicitly"
+            : // Round 7, M7-2: the predicate hit its own bound, so "no callables"
+              // is unknown rather than established.
+              `the surface walk reached MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)}) and ` +
+                "the predicate that looks below it ran out of depth too, so this branch cannot " +
+                "be shown callable-free; flatten the value or classify this branch explicitly",
         );
       }
       return;
     }
     this.visitValue(id, member, type, visibility, via, depth + 1);
+  }
+
+  /**
+   * An ABSTRACT member, enumerated by name and classified PACKAGE. Round 7's
+   * M7-3 asked for the distinction between a concrete prototype implementation
+   * — whose body is here, and which therefore takes caller data into OUR code —
+   * and an abstract declaration, whose body is the caller's. This is the second
+   * half of it, and it is a classification rather than an omission so that a
+   * reader can see the mechanism made the distinction on purpose.
+   */
+  private recordAbstractDeclarations(
+    id: string,
+    member: ts.Symbol,
+    declarations: readonly ts.Declaration[],
+    via: Reachability,
+  ): void {
+    for (const declaration of declarations) {
+      const file = repoRelative(this.root, declaration.getSourceFile().fileName);
+      if (ts.isGetAccessorDeclaration(declaration) || ts.isSetAccessorDeclaration(declaration)) {
+        this.record(member, {
+          id: `${id} (${ts.isGetAccessorDeclaration(declaration) ? "getter" : "setter"})`,
+          file,
+          visibility: "PACKAGE",
+          params: parametersOf(declaration),
+          shape: "abstract declaration",
+          via,
+        });
+        continue;
+      }
+      if (ts.isMethodDeclaration(declaration)) {
+        this.record(member, {
+          id,
+          file,
+          visibility: "PACKAGE",
+          params: parametersOf(declaration),
+          shape: "abstract declaration",
+          via,
+        });
+        continue;
+      }
+      // `abstract handler: (value) => string` — a PROPERTY whose type is
+      // callable. A plain `abstract readonly tag: string` is not a callable at
+      // all, so there is nothing there to enumerate and nothing to omit.
+      const signatures = this.checker
+        .getTypeOfSymbolAtLocation(member, declaration)
+        .getCallSignatures();
+      signatures.forEach((signature, index) => {
+        const label =
+          signatures.length === 1
+            ? id
+            : `${id} (overload ${String(index + 1)} of ${String(signatures.length)})`;
+        const signatureDeclaration = signature.getDeclaration() as
+          | ts.SignatureDeclaration
+          | undefined;
+        if (signatureDeclaration === undefined) {
+          this.refuse(
+            label,
+            file,
+            "an abstract member whose call signature has no declaration: its parameters cannot " +
+              "be enumerated, so the shape is refused rather than guessed at",
+          );
+          return;
+        }
+        this.record(member, {
+          id: label,
+          file,
+          visibility: "PACKAGE",
+          params: parametersOf(signatureDeclaration),
+          shape: "abstract declaration",
+          via,
+        });
+      });
+    }
+  }
+
+  /**
+   * A property the COMPILER synthesized: it has a NAME and a TYPE but no
+   * declaration anywhere. Round 7's M7-1 — `{ [K in keyof T as
+   * `renamed_${K}`]: T[K] }` produces exactly this, and the `isOurs` gate in
+   * `visitProperties` needs a declaration, so the callable beneath
+   * `renamed_handler` was in neither list.
+   *
+   * The name is real and a caller can drive it, so the walk enumerates rather
+   * than refuses — but only when the callable underneath is DECLARED here. A
+   * synthesized property whose own call signature comes from another package is
+   * somebody else's implementation, which is the frontier round 6 fixed for
+   * returned signatures; here it is loud instead of silent, because a mapped
+   * type over a foreign source is a shape a reader should look at.
+   */
+  private visitSynthesizedProperty(
+    id: string,
+    file: string,
+    property: ts.Symbol,
+    visibility: Visibility,
+    depth: number,
+  ): void {
+    if (property.getName() === "prototype") {
+      // A class's own instance side. `visitClass` enumerates it WITH the
+      // abstract/concrete distinction, which this path cannot make; walking it
+      // again through `C.prototype` would add nothing and bypass that.
+      return;
+    }
+    const type = this.checker.getTypeOfSymbol(property);
+    const verdict = this.carriesCallables(type);
+    if (verdict === "none") {
+      return; // a data property: an answer, not a silence
+    }
+    if (verdict === "indeterminate") {
+      this.refuse(
+        id,
+        file,
+        "a synthesized property (a mapped type's remapped key, or a union member) whose value " +
+          `type could not be shown callable-free within MAX_SURFACE_DEPTH (${String(
+            MAX_SURFACE_DEPTH,
+          )}): it is refused rather than assumed empty. Flatten the type or classify this ` +
+          "branch explicitly",
+      );
+      return;
+    }
+    if (depth + 1 > MAX_SURFACE_DEPTH) {
+      this.refuse(
+        id,
+        file,
+        `the surface walk reached MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)}) at a ` +
+          "synthesized property with callables still below it; flatten the value or classify " +
+          "this branch explicitly",
+      );
+      return;
+    }
+    const calls = type.getCallSignatures();
+    if (calls.length > 0 && !calls.every((signature) => this.isOurSignature(signature))) {
+      this.refuse(
+        id,
+        file,
+        "a synthesized property whose own call signature is declared OUTSIDE these packages: " +
+          "the walk will not claim somebody else's implementation, and it will not pass over " +
+          "the callables it does own underneath. Give the value type a named declaration this " +
+          "walk can enumerate, or classify this branch explicitly",
+      );
+      return;
+    }
+    this.visitValue(id, property, type, visibility, "object property", depth + 1);
   }
 
   /**
@@ -798,13 +1066,20 @@ class SurfaceWalk {
         continue; // a primitive, `void`, `never`: nothing to omit
       }
       if (depth > MAX_SURFACE_DEPTH) {
-        if (this.carriesCallables(constituent)) {
+        const verdict = this.carriesCallables(constituent);
+        if (verdict !== "none") {
           this.refuse(
             `${ownerId} (returned)`,
             file,
-            `the handed-out walk reached MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)}) with ` +
-              "callables still below it; flatten the chain of returned facades or classify this " +
-              "branch explicitly",
+            verdict === "callable"
+              ? `the handed-out walk reached MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)}) ` +
+                  "with callables still below it; flatten the chain of returned facades or " +
+                  "classify this branch explicitly"
+              : // Round 7, M7-2: unknown is not empty.
+                `the handed-out walk reached MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)}) ` +
+                  "and the predicate that looks below it ran out of depth too, so this branch " +
+                  "cannot be shown callable-free; flatten the chain of returned facades or " +
+                  "classify this branch explicitly",
           );
         }
         continue;
@@ -818,9 +1093,12 @@ class SurfaceWalk {
       //    whose value is a function, a callable interface. Named by the site.
       this.recordReturnedSignatures(ownerId, file, constituent, visibility, depth);
 
-      // 2. The type is CONSTRUCTIBLE. One of our classes is walked as a class;
-      //    anything else is refused, exactly as `visitValue` refuses it.
-      this.visitReturnedConstructible(ownerId, file, constituent, symbol);
+      // 2. The type is CONSTRUCTIBLE. One of our classes is walked as a class,
+      //    WITH the visibility this walk just derived (round 7's M7-3: dropping
+      //    it left every member of a publicly returned class PACKAGE, and a
+      //    PACKAGE entry never reaches the hostile battery); anything else is
+      //    refused, exactly as `visitValue` refuses it.
+      this.visitReturnedConstructible(ownerId, file, constituent, symbol, visibility);
 
       // 3. Its members, its index signatures and its container type arguments.
       this.visitCarrier(
@@ -888,6 +1166,7 @@ class SurfaceWalk {
     file: string,
     type: ts.Type,
     symbol: ts.Symbol | undefined,
+    handedOut: Visibility,
   ): void {
     const constructs = type
       .getConstructSignatures()
@@ -896,7 +1175,7 @@ class SurfaceWalk {
       return;
     }
     if (symbol !== undefined && (symbol.flags & ts.SymbolFlags.Class) !== 0 && this.isOurs(symbol)) {
-      this.visitClass(symbol.getName(), symbol);
+      this.visitClass(symbol.getName(), symbol, handedOut);
       return;
     }
     this.refuse(
@@ -923,20 +1202,28 @@ class SurfaceWalk {
     if ((type.flags & NON_CARRYING_TYPE_FLAGS) !== 0) {
       return;
     }
-    this.visitProperties(ownerId, type, visibility, depth);
+    this.visitProperties(ownerId, file, type, visibility, depth);
     let refusedByIndex = false;
     for (const info of this.checker.getIndexInfosOfType(type)) {
-      if (!this.carriesCallables(info.type)) {
+      const verdict = this.carriesCallables(info.type);
+      if (verdict === "none") {
         continue;
       }
       refusedByIndex = true;
       this.refuse(
         `${ownerId}[${this.checker.typeToString(info.keyType)}]`,
         file,
-        "an index signature whose value type carries a callable: an index has no NAME, so there " +
-          "is no expression the hostile battery could drive. Give the value type a named " +
-          "declaration this walk can enumerate, or classify this branch explicitly — inventing " +
-          "a synthetic id here would be a registry entry no probe can call",
+        verdict === "callable"
+          ? "an index signature whose value type carries a callable: an index has no NAME, so " +
+              "there is no expression the hostile battery could drive. Give the value type a " +
+              "named declaration this walk can enumerate, or classify this branch explicitly — " +
+              "inventing a synthetic id here would be a registry entry no probe can call"
+          : // Round 7, M7-2. The predicate ran out of depth before it could tell,
+            // and "I do not know" is not "there is nothing there".
+            "an index signature whose value type could not be shown callable-free within " +
+              `MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)}): a callable may sit below the ` +
+              "bound, and an index has no name to drive it with either way, so this branch is " +
+              "refused rather than assumed empty. Flatten the value type or classify it explicitly",
       );
     }
     if (refusedByIndex) {
@@ -945,16 +1232,24 @@ class SurfaceWalk {
       return;
     }
     this.foreignTypeArguments(type).forEach((argument, index) => {
-      if (!this.carriesCallables(argument)) {
+      const verdict = this.carriesCallables(argument);
+      if (verdict === "none") {
         return;
       }
       this.refuse(
         `${ownerId} (type argument ${String(index + 1)} of ${this.checker.typeToString(type)})`,
         file,
-        "a container declared outside these packages whose type argument carries a callable " +
-          "(an array element, a promised value, a map value): the element has an index or a key, " +
-          "not a name, so no probe can drive it. Hand out a named facade instead, or classify " +
-          "this branch explicitly",
+        verdict === "callable"
+          ? "a container declared outside these packages whose type argument carries a callable " +
+              "(an array element, a promised value, a map value): the element has an index or a " +
+              "key, not a name, so no probe can drive it. Hand out a named facade instead, or " +
+              "classify this branch explicitly"
+          : // Round 7, M7-2, on the container path.
+            "a container declared outside these packages whose type argument could not be shown " +
+              `callable-free within MAX_SURFACE_DEPTH (${String(MAX_SURFACE_DEPTH)}): a callable ` +
+              "may sit below the bound, and an element has an index or a key rather than a name, " +
+              "so this branch is refused rather than assumed empty. Hand out a named facade " +
+              "instead, or classify this branch explicitly",
       );
     });
   }
@@ -1031,58 +1326,119 @@ class SurfaceWalk {
   /**
    * Does this type carry a callable DECLARED IN THESE PACKAGES, anywhere a
    * bounded walk can reach? Used where the answer decides between "nothing to
-   * see" and "refuse by name": the depth bound, index signatures, and container
-   * type arguments.
+   * see" and "refuse by name": the depth bound, index signatures, container
+   * type arguments and (round 7) synthesized properties.
+   *
+   * ROUND 7, M7-2 — why this returns three values and not two. It used to
+   * return `false` both for *there is no callable here* and for *I ran out of
+   * depth before I could tell*, and the callers treated the second as the
+   * first. A callable ten property hops beneath a returned string-index value
+   * was therefore in NEITHER list — the exact silence the binding property
+   * forbids, sitting behind a bound that was documented as always refusing.
+   * `indeterminate` now propagates out of every branch that truncates, and each
+   * caller refuses by name for it.
+   *
+   * `seen` remembers the DEPTH at which a type was explored rather than merely
+   * that it was: a type first met near the bound (and truncated there) must be
+   * explored again when a shallower path reaches it, or the truncation would be
+   * inherited as a definite "none" by a branch that had the budget to look.
    */
-  private carriesCallables(type: ts.Type, depth = 0, seen = new Set<ts.Type>()): boolean {
-    if (depth > MAX_SURFACE_DEPTH || seen.has(type) || (type.flags & NON_CARRYING_TYPE_FLAGS) !== 0) {
-      return false;
+  private carriesCallables(
+    type: ts.Type,
+    depth = 0,
+    seen = new Map<ts.Type, number>(),
+  ): CallableVerdict {
+    if ((type.flags & NON_CARRYING_TYPE_FLAGS) !== 0) {
+      return "none"; // a primitive, `void`, `never`: there is nothing to omit
     }
-    seen.add(type);
+    if (depth > MAX_SURFACE_DEPTH) {
+      return "indeterminate";
+    }
+    const exploredAt = seen.get(type);
+    if (exploredAt !== undefined && exploredAt <= depth) {
+      // Already explored with at least this much budget — including the
+      // co-inductive case of a type currently on the stack, which is how a
+      // recursive facade terminates.
+      return "none";
+    }
+    seen.set(type, depth);
+
+    let truncated = false;
+    /** True as soon as a definite callable is found; records truncation on the way. */
+    const carries = (candidate: ts.Type): boolean => {
+      const verdict = this.carriesCallables(candidate, depth + 1, seen);
+      if (verdict === "callable") {
+        return true;
+      }
+      if (verdict === "indeterminate") {
+        truncated = true;
+      }
+      return false;
+    };
+    const settle = (): CallableVerdict => (truncated ? "indeterminate" : "none");
+
     if (type.isUnion() || type.isIntersection()) {
-      return type.types.some((constituent) => this.carriesCallables(constituent, depth + 1, seen));
+      for (const constituent of type.types) {
+        if (carries(constituent)) {
+          return "callable";
+        }
+      }
+      return settle();
     }
     if (
       [...type.getCallSignatures(), ...type.getConstructSignatures()].some((signature) =>
         this.isOurSignature(signature),
       )
     ) {
-      return true;
+      return "callable";
     }
     for (const property of this.checker.getPropertiesOfType(type)) {
       const declarations = property.getDeclarations() ?? [];
       if (
-        !this.isOurs(property) ||
         property.getName().startsWith("#") ||
         declarations.some((declaration) => hasModifier(declaration, ts.ModifierFlags.Private))
       ) {
+        continue;
+      }
+      if (declarations.length === 0) {
+        // Round 7, M7-1: a synthesized property, which the enumeration now
+        // follows. The predicate follows it too, so the two agree about what is
+        // down there.
+        if (property.getName() === "prototype") {
+          continue; // the class's instance side, which `visitClass` owns
+        }
+        if (carries(this.checker.getTypeOfSymbol(property))) {
+          return "callable";
+        }
+        continue;
+      }
+      if (!this.isOurs(property)) {
         continue;
       }
       const declaration = declarations[0];
       if (declaration === undefined) {
         continue;
       }
-      const propertyType = this.checker.getTypeOfSymbolAtLocation(property, declaration);
-      if (this.carriesCallables(propertyType, depth + 1, seen)) {
-        return true;
+      if (carries(this.checker.getTypeOfSymbolAtLocation(property, declaration))) {
+        return "callable";
       }
     }
     for (const info of this.checker.getIndexInfosOfType(type)) {
-      if (this.carriesCallables(info.type, depth + 1, seen)) {
-        return true;
+      if (carries(info.type)) {
+        return "callable";
       }
     }
     if ((type.flags & ts.TypeFlags.Object) !== 0) {
       const object = type as ts.ObjectType;
       if ((object.objectFlags & ts.ObjectFlags.Reference) !== 0) {
         for (const argument of this.checker.getTypeArguments(type as ts.TypeReference)) {
-          if (this.carriesCallables(argument, depth + 1, seen)) {
-            return true;
+          if (carries(argument)) {
+            return "callable";
           }
         }
       }
     }
-    return false;
+    return settle();
   }
 
   private isOurSignature(signature: ts.Signature): boolean {
