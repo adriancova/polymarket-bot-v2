@@ -62,8 +62,16 @@ first use. The second is the 2026-09-02 amendment to
 [ADR-009](./ADR-009-settlement-spec-and-payoff-model-selection.md) §5,
 recording `WP-110`'s mandated 2026-08-28 confirmation of U-6 (the case
 ADR-009 §5.2 itself created); its amendment block states how each of the four
-conditions is met. *(This sentence previously read "the first and, so far,
-only use"; corrected 2026-09-02 per `protected-contracts.md` §4.)*
+conditions is met. The third is the 2026-09-03 amendment to
+[ADR-006](./ADR-006-actual-ledger-versus-virtual-allocation.md) §7, resolving
+conflict **C-2** (USDC vs pUSD denomination) — the case ADR-006 §7 item 4
+itself created; it likewise walks all four conditions. That amendment also
+records the one respect in which its fit is imperfect and which a reader
+should not generalize from: item 4's mandate named `WP-200`, whose grant made
+both the fetch and the amendment impossible, so the **contract owner executed
+the same mandate in that package's place** rather than let it lapse. *(This
+sentence previously read "the first and, so far, only use"; corrected
+2026-09-02 per `protected-contracts.md` §4, and extended 2026-09-03.)*
 
 ---
 
@@ -76,7 +84,7 @@ only use"; corrected 2026-09-02 per `protected-contracts.md` §4.)*
 | [ADR-003](./ADR-003-gateway-to-trader-transport.md) | Gateway-to-trader transport | Accepted | §2, §9.1, §4.2 | `WP-060` |
 | [ADR-004](./ADR-004-wal-format-durability-and-compaction.md) | WAL format, durability, and compaction | Accepted | §9.1, §12.5 | `WP-050`, `WP-130` |
 | [ADR-005](./ADR-005-strategy-purity-and-decision-result.md) | Strategy purity and `DecisionResult` contract | Accepted | §6.2–6.3, §7.5–7.7, §9.6 | `WP-020` (done), `WP-170` |
-| [ADR-006](./ADR-006-actual-ledger-versus-virtual-allocation.md) | Actual ledger versus virtual allocation | Accepted | §6.7–6.8, §9.15, §9.16 | `WP-040`, `WP-200` |
+| [ADR-006](./ADR-006-actual-ledger-versus-virtual-allocation.md) | Actual ledger versus virtual allocation; §7 amended 2026-09-03 — C-2 (USDC vs pUSD) **resolved as a documentation inconsistency**, denominations stay distinct | Accepted | §6.7–6.8, §9.15, §9.16 | `WP-040`, `WP-200` |
 | [ADR-007](./ADR-007-signed-order-idempotency-and-unknown-submissions.md) | Signed-order idempotency and unknown submissions | Accepted | §6.6, §9.11, §9.17 | `WP-260`, `WP-270`, `WP-290` |
 | [ADR-008](./ADR-008-live-writer-fencing-and-heartbeat-health-lease.md) | Live-writer fencing and heartbeat health lease | Accepted | §6.16, §9.18, §4.2 | `WP-320`, `WP-330` |
 | [ADR-009](./ADR-009-settlement-spec-and-payoff-model-selection.md) | `SettlementSpec` and payoff-model selection | Accepted | §9.2, §9.3, §6.9 | `WP-110` |
