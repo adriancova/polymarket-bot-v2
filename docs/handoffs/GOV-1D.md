@@ -427,7 +427,7 @@ implementation SHA into this table — a commit cannot contain its own hash.
 
 | Commit | SHA |
 | --- | --- |
-| governance round (ADR-006 §7 amendment, README, C-2 register row + §5 precedent, `verified-2026-09-03.md`, this handoff) | *(written by the SHA-record commit below)* |
+| governance round (ADR-006 §7 amendment, README, C-2 register row + §5 precedent, `verified-2026-09-03.md`, this handoff) | `4b63060e77591a397cccc95f805b769383372e13` |
 | SHA record (branch tip) | reported in the agent's reply |
 
 **The branch tip is the commit to review.** This round is **not** marked
