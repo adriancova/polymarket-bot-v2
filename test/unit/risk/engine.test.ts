@@ -41,6 +41,7 @@ import {
   market,
   openOrder,
   position,
+  positionIntent,
   reduceIntent,
   riskPolicy,
   type EvaluationInputFixture,
@@ -959,6 +960,17 @@ describe("§6 invariant 13 — a CANCEL survives every audited gate", () => {
  * The last test states the property directly over emitted records rather than
  * enumerating the sites, so a NEW field copied from unvalidated input is caught
  * without anyone remembering to add a case.
+ *
+ * CORRECTION, 2026-09-03 (review round 3). The last claim above was TOO STRONG
+ * as this block wrote it. These tests mutate the ENGINE'S INPUT, which the door
+ * validates, and then resize a record the ENGINE built — so the resize path's
+ * own input, a HAND-BUILT record, was never driven hostile beyond four named
+ * fields. Review round 3 found a sixth (`record.intent.marketId`) that this
+ * battery cannot see, and remediation round 3's probe found 43 further
+ * positions. The property is now enforced structurally at the emission boundary
+ * and pinned by the block BELOW, which generates its cases from a record's own
+ * shape instead of from any list. Everything in this block still holds and is
+ * unmodified.
  */
 describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel override", () => {
   /** UUID-shaped, non-canonical. */
@@ -1220,6 +1232,278 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
     expect(offending).toEqual([]);
     // NON-VACUITY: the battery really did emit records to inspect.
     expect(recordsEmitted).toBeGreaterThanOrEqual(3);
+  });
+});
+
+/**
+ * THE EMISSION BOUNDARY — review round 3.
+ *
+ * FINDING. `resizeApprovedIntent` validated a LIST of seven inherited identity
+ * fields and then copied the WHOLE intent into the new record, so a hand-built
+ * record with `intent.marketId = "01890000-…-AB"` resized cleanly and the
+ * emitted record carried the contract-invalid id
+ * (`{"ok":true,"emittedMarketId":"01890000-0000-7000-8000-0000000000AB"}`).
+ * Rounds 2 and 3 each fixed a list and each left the property false, so the
+ * list is gone: `sealApprovedIntentRecord` WALKS the record being emitted, and
+ * the resize walks the record it inherits, checking every string at every depth
+ * except the closed `NON_IDENTITY_KEYS` set (venue ids, `DetailString` prose,
+ * strategy tags — each a contract-typed non-identifier).
+ *
+ * WHY THIS BLOCK IS DIFFERENT FROM THE ONE ABOVE. Its cases are GENERATED from
+ * a real record's own shape: it walks a valid record, drives every string
+ * position hostile in turn, and asserts the outcome per position. A seventh
+ * identity field added tomorrow becomes a new position with no edit here — that
+ * is the mechanism the previous two rounds lacked, and it is what makes
+ * "no record-emitting path emits an unvalidated identity" a property of the
+ * code's shape rather than of a maintained list.
+ */
+describe("the emission boundary — a record is never built from an unvalidated identity", () => {
+  const NON_CANONICAL = "01890000-0000-7000-8000-0000000000AB";
+  /** Letter-leading, so it satisfies `CodeString`/`Tag` too. */
+  const NON_CANONICAL_CODE = "f1890000-0000-7000-8000-0000000000AB";
+  const CANONICAL = "01890000-0000-7000-8000-0000000000ab";
+
+  /** An INDEPENDENT oracle, as in the block above. */
+  const UUID_SHAPE =
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;
+  const UUID_CANONICAL = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+  function nonCanonicalUuid(value: string): boolean {
+    return UUID_SHAPE.test(value) && !UUID_CANONICAL.test(value);
+  }
+
+  function stringsIn(value: unknown, path = ""): { path: string; value: string }[] {
+    if (typeof value === "string") return [{ path, value }];
+    if (Array.isArray(value)) return value.flatMap((item, i) => stringsIn(item, `${path}[${i}]`));
+    if (value !== null && typeof value === "object") {
+      return Object.entries(value).flatMap(([key, item]) =>
+        stringsIn(item, path === "" ? key : `${path}.${key}`),
+      );
+    }
+    return [];
+  }
+
+  /**
+   * The property names a record may legitimately carry a non-canonical
+   * UUID-shaped string under, written INDEPENDENTLY of the package's own set so
+   * that widening `NON_IDENTITY_KEYS` in `approved-intent.ts` does not silently
+   * widen what these tests accept. Each is a contract-typed non-identifier:
+   * §7.2 `VenueOrderId`, `DetailString` prose, §7.7 `tags`.
+   */
+  const EXCLUDED_KEY = /(^|\.)(orderIds\[\d+\]|orderId|reason|resizeReason|rationale|tags\[\d+\])$/u;
+
+  const REQUEST = {
+    approvedIntentId: CANONICAL,
+    resizedAt: "2026-09-03T12:00:01.000Z",
+    newTargetShares: "50",
+    reason: "shrink",
+  };
+
+  function approvedRecord(mutate: (input: EvaluationInputFixture) => void): ApprovedIntentRecord {
+    const input = entryInput();
+    mutate(input);
+    const result = evaluateIntent(riskPolicy(), input);
+    if (!result.approved) throw new Error(`fixture not approved: ${codesOf(result).join(",")}`);
+    return result.record;
+  }
+
+  /** A POSITION record whose intent also carries a strategy tag. */
+  function positionRecord(): ApprovedIntentRecord {
+    return approvedRecord((input) => {
+      input.intent = positionIntent({ tags: ["alpha"] });
+    });
+  }
+
+  /** A REDUCE_POSITION record: carries `intent.reason`, and no `intentId`. */
+  function reductionRecord(): ApprovedIntentRecord {
+    return approvedRecord((input) => {
+      input.intent = reduceIntent({ targetShares: "100" });
+      input.portfolio.positions = [position()];
+    });
+  }
+
+  /** A record carrying a recommendation — `marketId` AND free-text `rationale`. */
+  function recommendingRecord(): ApprovedIntentRecord {
+    return {
+      ...positionRecord(),
+      recommendations: [
+        {
+          kind: "RECOMMENDATION",
+          action: "CANCEL_RESTING_ORDERS",
+          failureClass: "VENUE_BOOK_STALE",
+          ordersScope: "MARKET",
+          marketId: MARKET_A,
+          rationale: '§9.9: "Cancel resting orders; no blind aggressive orders"',
+        },
+      ],
+    };
+  }
+
+  /** A deep clone of `record` with the string at `path` replaced. */
+  function withStringAt(
+    record: ApprovedIntentRecord,
+    path: string,
+    value: string,
+  ): ApprovedIntentRecord {
+    const clone = structuredClone(record) as unknown as Record<string, unknown>;
+    const steps = path.replace(/\[(\d+)\]/gu, ".$1").split(".");
+    let cursor: Record<string, unknown> = clone;
+    for (const step of steps.slice(0, -1)) {
+      cursor = cursor[step] as Record<string, unknown>;
+    }
+    cursor[steps[steps.length - 1] as string] = value;
+    return clone as unknown as ApprovedIntentRecord;
+  }
+
+  it("REVIEWER'S PROBE (round 3): a POSITION resize refuses a non-canonical INHERITED intent.marketId", () => {
+    const handBuilt = withStringAt(positionRecord(), "intent.marketId", NON_CANONICAL);
+
+    const resized = resizeApprovedIntent(handBuilt, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    if (resized.ok) return;
+    expect(resized.refusals.map((r) => r.code)).toContain("RISK_UUID_NOT_CANONICAL");
+    const identity = resized.refusals.find((r) => r.code === "RISK_UUID_NOT_CANONICAL");
+    expect(identity?.details["field"]).toBe("record.intent.marketId");
+    // The RAW value rides out; no canonical form is ever produced.
+    expect(identity?.details["value"]).toBe(NON_CANONICAL);
+    expect(stringsIn(resized).map((s) => s.value)).not.toContain(CANONICAL.toLowerCase());
+  });
+
+  it("the same for a REDUCE_POSITION resize (the §7.7 shape with no intentId)", () => {
+    const handBuilt = withStringAt(reductionRecord(), "intent.marketId", NON_CANONICAL);
+
+    const resized = resizeApprovedIntent(handBuilt, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    if (resized.ok) return;
+    expect(resized.refusals.map((r) => r.details["field"])).toContain("record.intent.marketId");
+  });
+
+  it("worstCase.perMarket[].marketId — an internal id NO field list had named — is refused", () => {
+    const handBuilt = withStringAt(
+      positionRecord(),
+      "worstCase.perMarket[0].marketId",
+      NON_CANONICAL,
+    );
+
+    const resized = resizeApprovedIntent(handBuilt, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    if (resized.ok) return;
+    expect(resized.refusals.map((r) => r.details["field"])).toContain(
+      "record.worstCase.perMarket[0].marketId",
+    );
+  });
+
+  it("recommendations[].marketId is refused; its free-text rationale is not an identifier", () => {
+    const hostileId = withStringAt(recommendingRecord(), "recommendations[0].marketId", NON_CANONICAL);
+    const refused = resizeApprovedIntent(hostileId, REQUEST);
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.refusals.map((r) => r.details["field"])).toContain(
+      "record.recommendations[0].marketId",
+    );
+
+    const hostileProse = withStringAt(
+      recommendingRecord(),
+      "recommendations[0].rationale",
+      NON_CANONICAL,
+    );
+    const allowed = resizeApprovedIntent(hostileProse, REQUEST);
+    expect(allowed.ok).toBe(true);
+  });
+
+  it("a hand-built intent that is not a §7.7 intent is a TYPED refusal, never a throw", () => {
+    // Before this round `compareDecimal` threw `InvalidDecimalStringError` out
+    // of a function whose entire contract is to return a typed result.
+    const handBuilt = withStringAt(positionRecord(), "intent.targetShares", "not-a-decimal");
+
+    const resized = resizeApprovedIntent(handBuilt, REQUEST);
+
+    expect(resized.ok).toBe(false);
+    if (resized.ok) return;
+    expect(resized.refusals.map((r) => r.code)).toContain("RISK_INPUT_INVALID");
+  });
+
+  it("THE STRUCTURAL PROPERTY: every string position of a hand-built record, generated from its shape", () => {
+    const bases = [positionRecord(), reductionRecord(), recommendingRecord()];
+    const emittedInvalid: { mutated: string; path: string; value: string }[] = [];
+    const acceptedIdentity: string[] = [];
+    let checkedPositions = 0;
+    let excludedPositions = 0;
+
+    for (const base of bases) {
+      for (const site of stringsIn(base)) {
+        const handBuilt = withStringAt(base, site.path, NON_CANONICAL_CODE);
+        // A typed result, ALWAYS: identity validation may not throw.
+        const resized = resizeApprovedIntent(handBuilt, REQUEST);
+
+        if (EXCLUDED_KEY.test(site.path)) {
+          excludedPositions += 1;
+          // The exclusions are real: a venue id, a prose reason, and a tag are
+          // ACCEPTED and round-tripped byte for byte. Over-refusing one of
+          // these on a CANCEL is how a position gets trapped (§6 invariant 13).
+          expect(resized.ok).toBe(true);
+          if (!resized.ok) continue;
+          expect(stringsIn(resized.value).map((s) => s.value)).toContain(NON_CANONICAL_CODE);
+          continue;
+        }
+
+        checkedPositions += 1;
+        if (resized.ok) {
+          acceptedIdentity.push(site.path);
+          emittedInvalid.push(
+            ...stringsIn(resized.value)
+              .filter((s) => nonCanonicalUuid(s.value) && !EXCLUDED_KEY.test(s.path))
+              .map((s) => ({ mutated: site.path, path: s.path, value: s.value })),
+          );
+          continue;
+        }
+        // Refused — and the refusal names the position and keeps the raw value.
+        expect(resized.refusals.map((r) => r.details["field"])).toContain(`record.${site.path}`);
+      }
+    }
+
+    expect(acceptedIdentity).toEqual([]);
+    expect(emittedInvalid).toEqual([]);
+    // NON-VACUITY, both ways: the battery really did drive dozens of identity
+    // positions hostile, and it really did exercise the exclusions.
+    expect(checkedPositions).toBeGreaterThan(50);
+    expect(excludedPositions).toBeGreaterThanOrEqual(3);
+  });
+
+  it("the boundary adds NO new way to refuse a cancel: venue ids and prose ride through", () => {
+    for (const intent of [
+      cancelIntent({ orderIds: [NON_CANONICAL] }),
+      cancelIntent({ reason: NON_CANONICAL }),
+      cancelIntent({ orderIds: [NON_CANONICAL], reason: NON_CANONICAL }),
+    ]) {
+      const input = entryInput();
+      input.intent = intent;
+
+      const result = evaluateIntent(riskPolicy(), input);
+
+      expect(codesOf(result)).toEqual([]);
+      expect(result.approved).toBe(true);
+      if (!result.approved) continue;
+      // Round-tripped byte for byte, at the excluded paths and nowhere else.
+      expect(
+        stringsIn(result.record)
+          .filter((s) => nonCanonicalUuid(s.value))
+          .every((s) => EXCLUDED_KEY.test(s.path)),
+      ).toBe(true);
+    }
+  });
+
+  it("every emitted record is frozen BY the boundary — the resize path included", () => {
+    const resized = resizeApprovedIntent(positionRecord(), REQUEST);
+    expect(resized.ok).toBe(true);
+    if (!resized.ok) return;
+    expect(Object.isFrozen(resized.value)).toBe(true);
+    expect(Object.isFrozen(resized.value.reasons)).toBe(true);
+    expect(() => {
+      (resized.value as { approvedIntentId: string }).approvedIntentId = "tampered";
+    }).toThrow(TypeError);
   });
 });
 

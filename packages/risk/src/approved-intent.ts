@@ -33,11 +33,24 @@
  * evaluation, so the field states which it is rather than letting a consumer
  * assume. Re-running {@link evaluateIntent} on the resized intent produces an
  * `"EVALUATED"` record.
+ *
+ * THE EMISSION BOUNDARY (adversarial review round 3). Every path in this
+ * package that returns an `ApprovedIntentRecord` goes through
+ * {@link sealApprovedIntentRecord}, and that function is the only place a
+ * record is frozen and handed out. It does not consult a LIST of identity
+ * fields — rounds 2 and 3 both proved a list is a thing reviewers outgrow — it
+ * WALKS the record it is about to emit and refuses any string that is
+ * UUID-shaped but not canonical (ADR-016 §2), wherever it sits. The default is
+ * "checked"; the exceptions are {@link NON_IDENTITY_KEYS}, a closed set in
+ * which every entry is a string the frozen domain contract types as something
+ * other than a repository identifier. A field added to the record tomorrow is
+ * therefore validated with no edit here and no edit in the suite.
  */
 
 import { absDecimal, compareDecimal } from "@polymarket-bot/decimal";
 import {
   DetailStringSchema,
+  IntentSchema,
   IsoTimestampSchema,
   NonEmptyStringSchema,
   SharesStringSchema,
@@ -90,6 +103,102 @@ export interface ApprovedIntentRecord {
   readonly resizeReason?: string;
 }
 
+/**
+ * Property names whose strings are NOT repository identifiers, and which the
+ * ADR-016 §2 walk therefore skips. THE SET IS CLOSED AND EVERY ENTRY CITES THE
+ * CONTRACT THAT MAKES IT A NON-IDENTIFIER — a name not listed here is checked,
+ * which is the direction that keeps the rule true of fields nobody has written
+ * yet:
+ *
+ * - `orderId` / `orderIds` — §7.2 `VenueOrderId`, an opaque VENUE string.
+ *   ADR-016 §2's amendment says the ruling "does not touch any venue wire
+ *   format (venue identifiers are not UUIDs; their rules are ADR-015's)", and
+ *   its premise ("every UUID in these contracts is generated in-process") is
+ *   false for one: a venue string must round-trip exactly as the venue spelled
+ *   it. On a `CANCEL` (`CancelIntent.orderIds`) refusing one would trap a
+ *   position for a rule the ADR does not impose — §6 invariant 13's direction.
+ * - `reason` / `resizeReason` / `rationale` — `DetailString`, "bounded
+ *   human-readable text (never parsed, only displayed or logged)"
+ *   (`packages/domain/src/primitives.ts`). `CancelIntent.reason` rides on the
+ *   cancel path, so an over-refusal here would trap a position too.
+ * - `tags` — §7.7 `tags`, typed `Tag` = `CodeString`, "free-form strategy tag".
+ *   A tag admits the UUID grammar, but it names nothing this repository looks
+ *   up.
+ *
+ * A KEY-NAME rule, deliberately: a new field is validated by DEFAULT, and the
+ * only way to lose that is to name an identity field `reason`, `rationale`,
+ * `tags`, or `orderId`. That tradeoff is stated in `docs/handoffs/WP-180.md`
+ * (remediation round 3) rather than left implicit.
+ */
+const NON_IDENTITY_KEYS: ReadonlySet<string> = new Set([
+  "orderId",
+  "orderIds",
+  "reason",
+  "resizeReason",
+  "rationale",
+  "tags",
+]);
+
+/**
+ * Every identity-bearing string reachable in `value`, with the path it sits at.
+ *
+ * Total and non-throwing on any value, including a hand-built one carrying
+ * `undefined`, functions, or cycles: identity validation must never be the
+ * thing that throws out of a function whose contract is a typed refusal.
+ */
+function identityStringsIn(
+  value: unknown,
+  path: string,
+  seen: WeakSet<object> = new WeakSet(),
+): { readonly field: string; readonly value: unknown }[] {
+  if (typeof value === "string") return [{ field: path, value }];
+  if (value === null || typeof value !== "object" || seen.has(value)) return [];
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => identityStringsIn(item, `${path}[${index}]`, seen));
+  }
+  return Object.entries(value).flatMap(([key, item]) =>
+    NON_IDENTITY_KEYS.has(key) ? [] : identityStringsIn(item, `${path}.${key}`, seen),
+  );
+}
+
+/**
+ * ADR-016 §2 refusals for every identity-bearing string inside `value`.
+ *
+ * Used by the emission boundary and by the resize's inherited-record check;
+ * both walk rather than enumerate.
+ */
+function walkedIdentityRefusals(value: unknown, path: string): readonly RiskRefusal[] {
+  return identityRefusals(identityStringsIn(value, path));
+}
+
+/**
+ * THE SINGLE EMISSION BOUNDARY for approved-intent records.
+ *
+ * Every path that returns a record — `evaluateIntent`'s two arms and
+ * {@link resizeApprovedIntent} — builds a draft and hands it here. This
+ * function walks the draft (see {@link NON_IDENTITY_KEYS}) and either refuses
+ * with the raw value intact, or freezes and returns it. Freezing lives here so
+ * that "emit a record" and "validate the record being emitted" are one act.
+ *
+ * WHY A WALK AND NOT A FIELD LIST. Review round 2 fixed one field, swept, and
+ * found five plus a duplicate guard; review round 3 still found a sixth
+ * (`record.intent.marketId`) and this round's probe found the property false at
+ * 43 more positions, including `worstCase.perMarket[].marketId` — an internal
+ * market id no list had named. Enumerating fields does not establish the
+ * property; deriving it from the record's own shape does.
+ *
+ * NOTHING IS NORMALIZED. ADR-016 §2 is refuse-not-fold: the draft is returned
+ * byte-for-byte or not at all, and the refusal carries the raw value.
+ */
+export function sealApprovedIntentRecord(
+  draft: ApprovedIntentRecord,
+): RiskResult<ApprovedIntentRecord> {
+  const refusals = walkedIdentityRefusals(draft, "record");
+  if (refusals.length > 0) return riskFailure(...refusals);
+  return riskOk(deepFreeze(draft));
+}
+
 export const ResizeRequestSchema = z.strictObject({
   /** The NEW record's identity. Must differ from the record being resized. */
   approvedIntentId: NonEmptyStringSchema,
@@ -133,31 +242,52 @@ export function resizeApprovedIntent(
   const req = parsed.data;
   const refusals: RiskRefusal[] = [];
 
-  // --- ADR-016 §2 identity validation — the input surface of THIS function ---
+  // --- THE INHERITED BOUNDARY — validated BEFORE anything is constructed -----
   //
   // Both arguments are input. `request` is caller data; `record` is TYPED as an
-  // `ApprovedIntentRecord` but is not parsed at runtime, so a hand-built one can
-  // carry anything — and every identity field below is copied INTO the new
-  // record (`supersedesApprovedIntentId`, `rootApprovedIntentId`,
-  // `sourceIntentId`, `strategyInstanceId`, and the intent's own `intentId`).
-  // Validating them here is what makes "no path emits a contract-invalid
-  // approved record" true of this function too, not only of `evaluateIntent`
-  // (adversarial review round 2). Refuse, never case-fold; the raw value rides
-  // out on the refusal. Venue-supplied opaque ids are out of scope for the same
-  // reason as in `inputs.ts`.
-  refusals.push(
-    ...identityRefusals([
-      { field: "request.approvedIntentId", value: req.approvedIntentId },
-      { field: "record.approvedIntentId", value: record.approvedIntentId },
-      { field: "record.rootApprovedIntentId", value: record.rootApprovedIntentId },
-      { field: "record.supersedesApprovedIntentId", value: record.supersedesApprovedIntentId },
-      { field: "record.sourceIntentId", value: record.sourceIntentId },
-      { field: "record.strategyInstanceId", value: record.strategyInstanceId },
-      ...("intentId" in record.intent
-        ? [{ field: "record.intent.intentId", value: record.intent.intentId }]
-        : []),
-    ]),
-  );
+  // `ApprovedIntentRecord` but is NOT parsed at runtime, so a hand-built one can
+  // carry anything — and almost all of it is copied INTO the new record.
+  //
+  // Round 2 validated a LIST of seven identity fields here. Review round 3
+  // found the list still incomplete (`record.intent.marketId`), and this
+  // round's probe found 43 further positions at which a hand-built record
+  // reached an emitted record uninspected — including
+  // `worstCase.perMarket[].marketId`, an internal market id no list had named.
+  // So the list is gone. Both arguments are WALKED in full: every string at
+  // every depth is checked unless its property name is in `NON_IDENTITY_KEYS`,
+  // which is what makes completeness a property of the code's shape rather than
+  // of anyone's memory. Refuse, never case-fold; the raw value rides out on the
+  // refusal.
+  refusals.push(...walkedIdentityRefusals(record, "record"));
+  refusals.push(...walkedIdentityRefusals(req, "request"));
+
+  // The intent is not merely COPIED, it is COMPUTED ON (`signOf`,
+  // `compareDecimal`, `absDecimal` below), so the inherited intent is parsed
+  // against the frozen domain contract before any of that runs. Two things this
+  // buys, both found by the round-3 probe: a non-canonical `marketId` anywhere
+  // in the intent is a typed refusal rather than an emitted record, and a
+  // hand-built `targetShares` of `"f1890000-…"` is a typed refusal rather than
+  // an `InvalidDecimalStringError` THROWN out of a function whose whole
+  // contract is to return one. The parse OUTPUT is deliberately discarded: the
+  // record is built from the original values, so nothing can be normalized on
+  // the way through.
+  const parsedIntent = IntentSchema.safeParse(record.intent);
+  if (!parsedIntent.success) {
+    refusals.push(
+      riskRefusal(
+        "RISK_INPUT_INVALID",
+        "the inherited intent does not satisfy the frozen §7.7 contract; a resize computes on it, so it is parsed before it is used (fail closed)",
+        {
+          issues: parsedIntent.error.issues.map(
+            (issue) => `record.intent.${issue.path.join(".")}: ${issue.message}`,
+          ),
+        },
+      ),
+    );
+    // Every check below reads `record.intent`; with it unparsed there is
+    // nothing safe to compute, so report what is known and stop.
+    return riskFailure(...refusals);
+  }
 
   if (
     req.approvedIntentId === record.approvedIntentId ||
@@ -222,8 +352,12 @@ export function resizeApprovedIntent(
 
   const reasons: RiskReasonCode[] = [...record.reasons];
 
-  return riskOk(
-    deepFreeze({
+  // The draft goes out through the emission boundary like every other record;
+  // the boundary is what freezes it. The walk above already covered everything
+  // inherited, so the seal cannot refuse today — it is what keeps the property
+  // true when a future edit adds a field sourced from somewhere else.
+  return sealApprovedIntentRecord(
+    {
       approvedIntentId: req.approvedIntentId,
       lineage: "RESIZED" as const,
       supersedesApprovedIntentId: record.approvedIntentId,
@@ -238,6 +372,6 @@ export function resizeApprovedIntent(
       worstCaseBasis: "INHERITED_UPPER_BOUND" as const,
       recommendations: record.recommendations,
       resizeReason: req.reason,
-    }),
+    },
   );
 }

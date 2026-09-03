@@ -61,7 +61,7 @@ import {
   type SharesString,
 } from "@polymarket-bot/domain";
 
-import type { ApprovedIntentRecord } from "./approved-intent.js";
+import { sealApprovedIntentRecord, type ApprovedIntentRecord } from "./approved-intent.js";
 import { checkExposureLimits } from "./exposure-limits.js";
 import { assessFreshness, blocksAsStale, type FreshnessAssessment } from "./freshness.js";
 import { deepFreeze } from "./guards.js";
@@ -966,7 +966,15 @@ export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluati
     // only for an unbounded BUY leg). The `[]` arm is structurally unreachable
     // and is an EXACT empty lot set, not a substituted measurement.
     const cancelWorstCase = worstCase ?? assessWorstCase(lots ?? []);
-    const cancelRecord: ApprovedIntentRecord = {
+    // THE EMISSION BOUNDARY (`approved-intent.ts`), the same one the resize
+    // path uses. It walks the record about to be emitted for ADR-016 §2
+    // violations. It cannot fire here — every string in this draft came through
+    // `validateEvaluationInput` above or is a package literal — and it is
+    // deliberately NOT part of the override set below: the round-2 ruling is
+    // that a contract-invalid approved record may not be emitted for a cancel
+    // either. If it ever did fire, the cancel fails closed with the typed
+    // identity refusal, exactly as a schema failure at the door would.
+    const sealedCancel = sealApprovedIntentRecord({
       approvedIntentId: data.identifiers.approvedIntentId,
       lineage: "ORIGINAL",
       rootApprovedIntentId: data.identifiers.approvedIntentId,
@@ -979,10 +987,18 @@ export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluati
       worstCase: cancelWorstCase,
       worstCaseBasis: "EVALUATED",
       recommendations: accumulator.recommendations,
-    };
+    });
+    if (!sealedCancel.ok) {
+      return rejected(
+        { refusals: [...sealedCancel.refusals], recommendations: accumulator.recommendations },
+        cancelWorstCase,
+        scenario,
+        freshness,
+      );
+    }
     return deepFreeze({
       approved: true as const,
-      record: cancelRecord,
+      record: sealedCancel.value,
       refusals: [] as const,
       cancelPriorityOverrides: [...accumulator.refusals],
       recommendations: accumulator.recommendations,
@@ -1012,7 +1028,9 @@ export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluati
   const reasons: RiskReasonCode[] = ["RISK_APPROVED"];
   if (view.disposition === "EXIT") reasons.push("RISK_EXIT_CAPACITY_CHECKS_INAPPLICABLE");
 
-  const record: ApprovedIntentRecord = {
+  // THE EMISSION BOUNDARY, as above: no path in this package returns a record
+  // it has not walked.
+  const sealed = sealApprovedIntentRecord({
     approvedIntentId: data.identifiers.approvedIntentId,
     lineage: "ORIGINAL",
     rootApprovedIntentId: data.identifiers.approvedIntentId,
@@ -1025,11 +1043,19 @@ export function evaluateIntent(policy: RiskPolicy, input: unknown): RiskEvaluati
     worstCase,
     worstCaseBasis: "EVALUATED",
     recommendations: accumulator.recommendations,
-  };
+  });
+  if (!sealed.ok) {
+    return rejected(
+      { refusals: [...sealed.refusals], recommendations: accumulator.recommendations },
+      worstCase,
+      scenario,
+      freshness,
+    );
+  }
 
   return deepFreeze({
     approved: true as const,
-    record,
+    record: sealed.value,
     refusals: [] as const,
     // Only a CANCEL can override a gate; every other approval overrode nothing.
     cancelPriorityOverrides: [] as const,

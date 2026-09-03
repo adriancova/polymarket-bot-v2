@@ -199,14 +199,45 @@ can carry one.
 | `context.strategyInstanceId` | **yes** | copied into every record |
 | `intent.intentId` | **yes** | copied to `sourceIntentId` and carried inside `record.intent` |
 | `guards.recentIntentIds[]` | **yes** | compared against `intentId`; a re-cased entry would silently under-match §9.8 check 18 |
-| `record.*` on `resizeApprovedIntent` | **yes** | the argument is typed, not parsed; its identity fields are inherited into the new record |
-| any `marketId` | n/a | `InternalMarketId` is lowercase-canonical UUIDv7 in the frozen schema, so a re-cased one is already `RISK_INPUT_INVALID` |
+| `record.*` on `resizeApprovedIntent` | **yes** | the argument is typed, not parsed; everything it carries is inherited into the new record — see §4.3 |
+| any `marketId` **arriving as engine input** | n/a | `InternalMarketId` is lowercase-canonical UUIDv7 in the frozen schema, so a re-cased one is already `RISK_INPUT_INVALID` |
 | `intent.orderIds[]`, `portfolio.openOrders[].orderId` | **no** | §7.2 `VenueOrderId` — venue-supplied and opaque. ADR-016 §2 "does not touch any venue wire format", and its premise (every UUID here is generated in-process) is false for them: a venue string must round-trip exactly as the venue spelled it, and refusing one on a `CANCEL` could trap a position for a rule the ADR does not impose |
 
-The property — *no path emits an approved record carrying a non-canonical
-repository identifier* — is asserted directly over emitted records, not
-site by site, in `test/unit/risk/engine.test.ts`, describe block *"ADR-016 §2 —
-record identity is INPUT VALIDATION, never a cancel override"*.
+### 4.3 The emission boundary — why the table above is not the whole rule
+
+**Corrected 2026-09-03 (adversarial review round 3).** §4.2's field table
+describes the ENGINE'S DOOR, and rounds 2 and 3 each proved that a table of
+fields is not a property. Round 2 fixed one field and its sweep found five;
+round 3 still found a sixth — `record.intent.marketId`, inherited by
+`resizeApprovedIntent` from a hand-built record and copied whole into the
+emitted record — and remediation round 3's probe found the property false at 43
+further positions, including `worstCase.perMarket[].marketId`.
+
+So identity completeness is now derived from the code's shape:
+
+- **one boundary.** `sealApprovedIntentRecord` is the only place an
+  `ApprovedIntentRecord` is frozen and returned. `evaluateIntent`'s two arms
+  and `resizeApprovedIntent` all go through it;
+- **a walk, not a list.** It checks *every* string at *every* depth of the
+  record it is about to emit. `resizeApprovedIntent` walks the record it
+  inherits, and the parsed request, the same way — before it constructs
+  anything;
+- **the exceptions are the closed set**, `NON_IDENTITY_KEYS`: `orderId` /
+  `orderIds` (§7.2 `VenueOrderId`), `reason` / `resizeReason` / `rationale`
+  (`DetailString` prose, "never parsed, only displayed or logged"), and `tags`
+  (§7.7 free-form strategy tags). Each entry is a string the frozen contract
+  types as something other than a repository identifier, and two of them ride
+  the `CANCEL` path, where over-refusal would trap a position;
+- **the inherited intent is parsed**, not trusted, because the resize computes
+  on it (`compareDecimal`, `absDecimal`). A hand-built `targetShares` is now a
+  typed `RISK_INPUT_INVALID` instead of a thrown `InvalidDecimalStringError`.
+
+A seventh identity field is therefore validated the moment it exists, with no
+edit here — and the suite notices too: `test/unit/risk/engine.test.ts`, describe
+block *"the emission boundary — a record is never built from an unvalidated
+identity"*, generates its cases by walking a real record, so a new field is a
+new case automatically. The older block *"ADR-016 §2 — record identity is INPUT
+VALIDATION, never a cancel override"* still pins the door.
 
 ### Staleness and exits, stated exactly
 
@@ -252,8 +283,8 @@ declared set** — the three surfaces are bound together by test.
 
 | Code | Meaning |
 | --- | --- |
-| `RISK_INPUT_INVALID` | The evaluation input, policy, or resize request failed its schema. |
-| `RISK_UUID_NOT_CANONICAL` | A UUID-shaped **repository** identifier arrived in a non-lowercase spelling. ADR-016 §2: refuse at the input surface, never case-fold. Fields and exclusions in §4.1's follow-on table (§4.2). |
+| `RISK_INPUT_INVALID` | The evaluation input, the policy, the resize request, or a resize's INHERITED intent failed its schema. |
+| `RISK_UUID_NOT_CANONICAL` | A UUID-shaped **repository** identifier arrived in a non-lowercase spelling. ADR-016 §2: refuse at the input surface, never case-fold. The door's fields and the venue exclusion are in §4.2; the record-walk rule that covers every other position is §4.3. |
 | `RISK_INTENT_EXPIRED` | `validUntil` is before the caller-supplied evaluation instant, or the two are not comparable. |
 | `RISK_ZERO_DELTA` | The position intent resolves to no share delta; there is nothing to execute. |
 | `RISK_MARKET_CONTEXT_MISSING` | No market context was supplied for a market the intent touches. |
@@ -400,6 +431,13 @@ These four are exactly `PRIMARY_RISK_REASON_CODES`.
 
 Records are deeply frozen: an in-place edit **throws**. A resize returns a new
 record and leaves the original untouched, including its `intent` object.
+Freezing happens **inside** `sealApprovedIntentRecord` (§4.3), so "emit a
+record" and "validate the record being emitted" are one act rather than two
+conventions.
+
+`resizeApprovedIntent`'s `record` argument is INPUT, not a trusted value: it is
+typed but not parsed, so it is walked for ADR-016 §2 violations in full, and its
+`intent` is parsed against the frozen §7.7 contract, before anything is built.
 
 Ceilings the strategy set (`maximumTotalCost`, `maximumBuyPrice`,
 `minimumSellPrice`, `validUntil`) are copied unchanged by a resize — a ceiling
