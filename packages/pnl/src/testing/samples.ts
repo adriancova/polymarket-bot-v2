@@ -1,0 +1,247 @@
+/**
+ * Sample values and builders for this package's tests.
+ *
+ * TEST-ONLY SUPPORT MODULE. Deliberately not re-exported from `src/index.ts`.
+ */
+
+import { PnlSettlementEvidence } from "../evidence.js";
+import type { PnlOwner, PnlStreamIdentity } from "../records.js";
+
+export const ACCOUNT = "acct-paper-1";
+export const INSTANCE_A = "018f3a5c-2222-7000-8000-00000000000a";
+export const INSTANCE_B = "018f3a5c-2222-7000-8000-00000000000b";
+export const MARKET_A = "018f3a5c-1111-7000-8000-000000000001";
+export const RUN_A = "018f3a5c-3333-7000-8000-00000000000a";
+
+/** pUSD and USDC are two DIFFERENT assets — ADR-006 §7, C-2 unresolved. */
+export const PUSD = "pUSD";
+export const USDC = "USDC";
+
+export const YES_TOKEN =
+  "71321045679252212594626385532706912750332728571942532289631379312455583992563";
+export const NO_TOKEN =
+  "52114319501245915516055106046884209969926127482827954674443846427813813222426";
+
+export const TIMESTAMP = "2026-09-02T12:00:00.000Z";
+export const PERIOD_START = "2026-09-01T00:00:00.000Z";
+export const PERIOD_END = "2026-09-02T00:00:00.000Z";
+
+export const ENVIRONMENT = "PAPER";
+
+export const INSTANCE_OWNER: PnlOwner = {
+  scope: "VIRTUAL_STRATEGY",
+  accountRef: ACCOUNT,
+  instanceId: INSTANCE_A,
+};
+export const ACCOUNT_OWNER: PnlOwner = { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT };
+export const UNATTRIBUTED_OWNER: PnlOwner = { scope: "UNATTRIBUTED", accountRef: ACCOUNT };
+
+/** The stream identities those owners fold in — the `pnl_snapshots` identity. */
+export const INSTANCE_STREAM: PnlStreamIdentity = {
+  scope: "VIRTUAL_STRATEGY",
+  environment: ENVIRONMENT,
+  accountRef: ACCOUNT,
+  instanceId: INSTANCE_A,
+};
+export const ACCOUNT_STREAM: PnlStreamIdentity = {
+  scope: "ACTUAL_ACCOUNT",
+  environment: ENVIRONMENT,
+  accountRef: ACCOUNT,
+};
+export const UNATTRIBUTED_STREAM: PnlStreamIdentity = {
+  scope: "UNATTRIBUTED",
+  environment: ENVIRONMENT,
+  accountRef: ACCOUNT,
+};
+
+/** Deterministic record refs, all canonical lowercase UUIDv7. */
+export function ref(n: number): string {
+  return `018f3a5c-6666-7000-8000-${n.toString(16).padStart(12, "0")}`;
+}
+
+/** A ledger transaction id, disjoint from `ref`. */
+export function ledgerTx(n: number): string {
+  return `018f3a5c-7777-7000-8000-${n.toString(16).padStart(12, "0")}`;
+}
+
+export function buy(
+  n: number,
+  shares: string,
+  price: string,
+  owner: PnlOwner = INSTANCE_OWNER,
+): Record<string, unknown> {
+  return {
+    kind: "TRADE",
+    ref: ref(n),
+    owner,
+    marketId: MARKET_A,
+    tokenAssetId: YES_TOKEN,
+    denominationAsset: PUSD,
+    side: "BUY",
+    shares,
+    price,
+  };
+}
+
+export function sell(
+  n: number,
+  shares: string,
+  price: string,
+  owner: PnlOwner = INSTANCE_OWNER,
+): Record<string, unknown> {
+  return { ...buy(n, shares, price, owner), side: "SELL" };
+}
+
+export function fee(
+  n: number,
+  amount: string,
+  scheduleVersionRef?: string,
+  owner: PnlOwner = INSTANCE_OWNER,
+): Record<string, unknown> {
+  return {
+    kind: "FEE",
+    ref: ref(n),
+    owner,
+    denominationAsset: PUSD,
+    amount,
+    ...(scheduleVersionRef === undefined ? {} : { scheduleVersionRef }),
+  };
+}
+
+/** An OBSERVED reward payout: settlement-grade, evidenced by a ledger id. */
+export function rewardPayout(
+  n: number,
+  amount: string,
+  owner: PnlOwner = INSTANCE_OWNER,
+): Record<string, unknown> {
+  return {
+    kind: "REWARD_PAYOUT",
+    ref: ref(n),
+    owner,
+    programType: "LIQUIDITY_REWARD",
+    amount,
+    denominationAsset: PUSD,
+    ledgerTransactionId: ledgerTx(n),
+  };
+}
+
+export const REWARD_INCOME_ACCOUNT = "income-rewards";
+export const ATTRIBUTION_CLEARING = "clearing-attribution";
+
+/**
+ * The ledger transaction that BOOKS `rewardPayout(n, amount, owner)` — the
+ * settlement evidence a payout must be proven against (ADR-006 §6).
+ *
+ * Shaped exactly as `@polymarket-bot/ledger` would append it: balanced per
+ * asset, and attributed within the owner's own `(accountRef, assetId)` bucket
+ * so the ledger's parity check passes. A reward that no strategy claimed is
+ * attributed to `UNATTRIBUTED`, which is what ADR-006's consequence list says
+ * happens ("a daily reward payout that arrives before its schedule is modeled
+ * … will halt a market").
+ */
+export function rewardPayoutEvidence(
+  n: number,
+  amount: string,
+  owner: PnlOwner = INSTANCE_OWNER,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const mirror =
+    owner.scope === "VIRTUAL_STRATEGY"
+      ? {
+          scope: "VIRTUAL_STRATEGY",
+          accountRef: owner.accountRef,
+          assetId: PUSD,
+          assetKind: "COLLATERAL",
+          amount,
+          instanceId: owner.instanceId,
+        }
+      : {
+          // No strategy claimed it, so the attribution side is UNATTRIBUTED —
+          // which also satisfies an UNATTRIBUTED-owner stream's own bucket.
+          scope: "UNATTRIBUTED",
+          accountRef: owner.accountRef,
+          assetId: PUSD,
+          assetKind: "COLLATERAL",
+          amount,
+        };
+  return {
+    ledgerTransactionId: ledgerTx(n),
+    eventType: "LIQUIDITY_REWARD",
+    environment: ENVIRONMENT,
+    accountRef: owner.accountRef,
+    source: "internal",
+    occurredAt: TIMESTAMP,
+    entries: [
+      {
+        scope: "ACTUAL_ACCOUNT",
+        accountRef: owner.accountRef,
+        assetId: PUSD,
+        assetKind: "COLLATERAL",
+        amount,
+      },
+      {
+        scope: "REWARD_INCOME",
+        accountRef: REWARD_INCOME_ACCOUNT,
+        assetId: PUSD,
+        assetKind: "COLLATERAL",
+        amount: `-${amount}`,
+      },
+      mirror,
+      {
+        scope: "EXTERNAL_CLEARING",
+        accountRef: ATTRIBUTION_CLEARING,
+        assetId: PUSD,
+        assetKind: "COLLATERAL",
+        amount: `-${amount}`,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+/** A reward ESTIMATE: analytics, never money. */
+export function rewardEstimate(
+  n: number,
+  amount: string,
+  owner: PnlOwner = INSTANCE_OWNER,
+): Record<string, unknown> {
+  return {
+    kind: "REWARD_ESTIMATE",
+    ref: ref(n),
+    owner,
+    programType: "LIQUIDITY_REWARD",
+    amount,
+    denominationAsset: PUSD,
+    methodology: "QUADRATIC_SCORE_V1",
+    periodStart: PERIOD_START,
+    periodEnd: PERIOD_END,
+    computedAt: TIMESTAMP,
+  };
+}
+
+/** Builds settlement evidence, throwing if a fixture is malformed. */
+export function evidenceOf(transactions: readonly unknown[]): PnlSettlementEvidence {
+  const result = PnlSettlementEvidence.from(transactions);
+  if (!result.ok) {
+    throw new Error(`evidence refused: ${JSON.stringify(result.refusals)}`);
+  }
+  return result.value;
+}
+
+export function realization(
+  n: number,
+  shares: string,
+  payoutPerShare: string,
+  owner: PnlOwner = INSTANCE_OWNER,
+): Record<string, unknown> {
+  return {
+    kind: "REALIZATION",
+    ref: ref(n),
+    owner,
+    realizationKind: "REDEEM",
+    tokenAssetId: YES_TOKEN,
+    shares,
+    payoutPerShare,
+    denominationAsset: PUSD,
+  };
+}

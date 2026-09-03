@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Append-only accounting ledger (WP-200, handoff §9.15): balanced per-asset transactions with explicit external-clearing accounts, the six §9.15 scopes, fill allocation with an explicit UNATTRIBUTED scope, and rebuildable balance/position projections. Pure layer-1 logic: no I/O, no clock, no randomness, no connection — persistence is a composition-root binding to the WP-040 accounting schema.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
@@ -11,7 +11,15 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*",
+    "zod": "^4.4.3"
+  },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "fast-check": "^4.9.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }

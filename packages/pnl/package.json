@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "PnL engine (WP-200, handoff §9.16): per-owner, per-denomination profit-and-loss projections with realized and unrealized strictly separated, reward estimates never booked as realized, and fee/reward schedule version references carried where available. Pure layer-1 logic: no I/O, no clock, no randomness. Consumes ledger-derived records structurally (no same-layer package edge).",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
@@ -11,7 +11,15 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*",
+    "zod": "^4.4.3"
+  },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "fast-check": "^4.9.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }
