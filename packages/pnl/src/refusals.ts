@@ -63,7 +63,15 @@ export type PnlRefusalCode =
    * type, wrong environment, an unsettled state, no matching `REWARD_INCOME`
    * entries, or nothing credited to this owner.
    */
-  | "PNL_REWARD_EVIDENCE_MISMATCH";
+  | "PNL_REWARD_EVIDENCE_MISMATCH"
+  /**
+   * The named ledger transaction has ALREADY been realized by this stream
+   * under a different record reference. One observed payout is one booking is
+   * one realization: deduplicating the PnL record's own `ref` says nothing
+   * about the money, because two distinct refs can name the same booking
+   * (review round 2, HIGH-2).
+   */
+  | "PNL_REWARD_EVIDENCE_ALREADY_REALIZED";
 
 export type PnlRefusalDetails = Readonly<Record<string, unknown>>;
 

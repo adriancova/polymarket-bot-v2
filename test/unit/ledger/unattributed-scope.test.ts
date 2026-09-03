@@ -155,6 +155,9 @@ describe("a fill matching no known allocation", () => {
         accountRef: ACCOUNT,
         assetId: YES_TOKEN,
         net: "10",
+        // `buildFillPosting` attributes every share it moves, so the ADR-006
+        // §2 partition holds and nothing is unexplained (round 2).
+        unexplainedActualMovement: "0",
         affectedMarketIds: [MARKET_A],
         haltTriggerCount: 1,
         haltRequired: true,
@@ -163,6 +166,7 @@ describe("a fill matching no known allocation", () => {
         accountRef: ACCOUNT,
         assetId: PUSD,
         net: "-4",
+        unexplainedActualMovement: "0",
         affectedMarketIds: [MARKET_A],
         haltTriggerCount: 1,
         haltRequired: true,

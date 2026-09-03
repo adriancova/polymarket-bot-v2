@@ -118,6 +118,7 @@ export type {
   LedgerProjection,
   UnattributedActivityRecord,
   UnattributedExposureLine,
+  UnexplainedActualMovementRecord,
   VirtualPositionLine,
 } from "./projections.js";
 

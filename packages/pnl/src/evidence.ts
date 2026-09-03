@@ -33,6 +33,14 @@
  *     its instance — by exactly the claimed amount, so one instance's payout
  *     cannot be realized into another's stream, or into another account's.
  *
+ * AND THE EVIDENCE STAYS THE EVIDENCE (review round 2, HIGH-3). Round 1 froze
+ * the transaction object only, leaving its legs writable and handing the
+ * internal value out of `find()`, so a genuine 5 pUSD booking could be edited
+ * into a 999 pUSD booking AFTER it passed all six checks. Every booking is now
+ * sealed leg by leg on the way in, copied and sealed again on the way out, and
+ * the verification reads a value no caller has ever held. A boundary that
+ * checks a document and then lets the document be rewritten is not a boundary.
+ *
  * WHAT IT DOES NOT CLAIM. This package cannot verify that the supplied
  * transactions were really appended to a real ledger — it is layer 1 and owns
  * no connection, and no `docs/contracts/dependency-direction.md` §2.1 row
@@ -155,11 +163,51 @@ export type PnlEvidenceTransaction = Readonly<
 const CONSTRUCTION_TOKEN: unique symbol = Symbol("polymarket-bot/pnl/settlement-evidence");
 
 /**
+ * A private, deeply frozen COPY of a booked transaction.
+ *
+ * THE DEFECT THIS CLOSES (review round 2, HIGH-3). `from()` froze the
+ * transaction OBJECT and nothing else, so its `entries` array and every entry
+ * in it stayed writable — and `find()` handed the internal transaction out. A
+ * caller could therefore build evidence from a genuine 5 pUSD booking,
+ * afterwards edit the `REWARD_INCOME` leg from `−5` to `−999` and the owner's
+ * leg from `+5` to `+999` by ordinary property assignment, and realize a 999
+ * pUSD payout. Validating a value and then handing out a mutable reference to
+ * it validates nothing: the check ran on a document that no longer exists.
+ *
+ * So every transaction is copied leg by leg and frozen at every level on the
+ * way IN, and copied and frozen again on the way OUT, so the set never shares
+ * an object with anyone. Two copies rather than one because the internal copy
+ * is what the verification reads (through {@link SEALED_BOOKINGS}): even if a
+ * future edit made the outbound copy shallow again, the evidence the check runs
+ * against would still be untouched.
+ */
+function sealedTransaction(transaction: PnlEvidenceTransaction): PnlEvidenceTransaction {
+  const entries = transaction.entries.map((entry) => Object.freeze({ ...entry }));
+  return Object.freeze({ ...transaction, entries: Object.freeze(entries) });
+}
+
+/**
+ * Module-private access to each evidence set's sealed bookings.
+ *
+ * `verifyRewardPayoutEvidence` reads THIS, not `evidence.find(...)`: a method
+ * call dispatches through `PnlSettlementEvidence.prototype`, and a prototype is
+ * a mutable object in JavaScript, so a caller could have replaced `find` with
+ * one that returns whatever it likes. A `WeakMap` populated by the constructor
+ * cannot be reached from outside this module and holds nothing alive.
+ */
+const SEALED_BOOKINGS = new WeakMap<
+  PnlSettlementEvidence,
+  ReadonlyMap<string, PnlEvidenceTransaction>
+>();
+
+/**
  * The booked transactions a fold may realize payouts against.
  *
- * Immutable, and constructible ONLY through {@link PnlSettlementEvidence.from},
- * which validates every transaction. An identifier is not evidence; this value
- * is.
+ * DEEPLY immutable, and constructible ONLY through
+ * {@link PnlSettlementEvidence.from}, which validates every transaction and
+ * seals it leg by leg. An identifier is not evidence; this value is — and,
+ * since review round 2, it is evidence that still says what it said when it was
+ * checked (see {@link sealedTransaction}).
  */
 export class PnlSettlementEvidence {
   readonly #transactions: ReadonlyMap<string, PnlEvidenceTransaction>;
@@ -175,6 +223,7 @@ export class PnlSettlementEvidence {
       );
     }
     this.#transactions = transactions;
+    SEALED_BOOKINGS.set(this, transactions);
     Object.freeze(this);
   }
 
@@ -217,7 +266,7 @@ export class PnlSettlementEvidence {
         );
         return;
       }
-      byId.set(transaction.ledgerTransactionId, Object.freeze(transaction));
+      byId.set(transaction.ledgerTransactionId, sealedTransaction(transaction));
     });
     if (refusals.length > 0) {
       return pnlFailure(...refusals);
@@ -225,10 +274,21 @@ export class PnlSettlementEvidence {
     return pnlOk(new PnlSettlementEvidence(CONSTRUCTION_TOKEN, byId));
   }
 
-  /** The booked transaction with this id, if this evidence set holds one. */
+  /**
+   * A deeply frozen COPY of the booked transaction with this id, if this
+   * evidence set holds one.
+   *
+   * A copy, not the internal value: nothing outside this class ever holds a
+   * reference to the evidence the verification reads (review round 2, HIGH-3).
+   * The copy is itself frozen at every level, so a caller cannot edit what it
+   * was handed either — the mutation fails loudly instead of producing a
+   * document that disagrees with the one that was checked.
+   */
   find(ledgerTransactionId: string): PnlEvidenceTransaction | undefined {
-    return this.#transactions.get(ledgerTransactionId);
+    const booked = this.#transactions.get(ledgerTransactionId);
+    return booked === undefined ? undefined : sealedTransaction(booked);
   }
+
 
   /** How many bookings this evidence set carries. */
   get size(): number {
@@ -286,7 +346,7 @@ export function verifyRewardPayoutEvidence(
       ),
     ];
   }
-  const booked = evidence.find(claim.ledgerTransactionId);
+  const booked = SEALED_BOOKINGS.get(evidence)?.get(claim.ledgerTransactionId);
   if (booked === undefined) {
     return [
       pnlRefusal(

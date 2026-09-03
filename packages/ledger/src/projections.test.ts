@@ -346,6 +346,9 @@ describe("acceptance 4: unattributed activity is an explicit, visible scope", ()
         accountRef: ACCOUNT,
         assetId: PUSD,
         net: "-25",
+        // Every transaction in this scenario attributes what it moves, so no
+        // partition breach exists (remediation round 2).
+        unexplainedActualMovement: "0",
         affectedMarketIds: [MARKET_A],
         haltTriggerCount: 2,
         haltRequired: true,
@@ -365,6 +368,7 @@ describe("acceptance 4: unattributed activity is an explicit, visible scope", ()
         accountRef: ACCOUNT,
         assetId: PUSD,
         net: "0",
+        unexplainedActualMovement: "0",
         affectedMarketIds: [],
         haltTriggerCount: 1,
         haltRequired: true,
@@ -407,10 +411,11 @@ describe("serializeProjection", () => {
   });
 
   it("carries a versioned domain prefix", () => {
-    // v2 since remediation round 1: the map keys became JSON composites, so
-    // the sorted key order — and the bytes — changed. The CONTENT did not.
+    // v2 at remediation round 1: the map keys became JSON composites, so the
+    // sorted key order — and the bytes — changed. v3 at round 2: the oracle
+    // covers `unexplainedMovements`, a section a mutated history can change.
     expect(serializeProjection(emptyProjection())).toContain(
-      "polymarket-bot/ledger-projection/v2",
+      "polymarket-bot/ledger-projection/v3",
     );
   });
 });

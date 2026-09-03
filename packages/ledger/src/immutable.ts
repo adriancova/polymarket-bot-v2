@@ -14,13 +14,25 @@
  * non-writable, non-configurable properties that THROW, and is then frozen.
  * A mutation attempt fails loudly instead of silently succeeding.
  *
+ * GUARDING THE CONTAINER IS NOT ENOUGH (remediation round 2, 2026-09-03,
+ * review HIGH-4). Round 1 sealed the containers and left their VALUES writable,
+ * so `projection.balances.get(key).balance = "999"` succeeded by ordinary
+ * property assignment — no capability bypass required — and the corrupted line
+ * then compounded: a later `+2` produced `1001` incrementally where a rebuild
+ * from the same history produced `7`. A monetary value a consumer can edit is
+ * a monetary value a consumer can invent, whether it is reached through the
+ * container or through what the container holds. So `frozenMap`/`frozenSet`
+ * now DEEP-FREEZE every key and value they hold, recursively.
+ *
  * Honest limits, stated rather than implied:
  *
  * - `Map.prototype.set.call(guarded, k, v)` still reaches the internal slot.
  *   Nothing short of a wrapper object closes that, and a wrapper would stop
  *   being a `Map` (`instanceof`, `new Map(other)`, structural equality in
  *   tests). The guard is a loud-failure boundary for ordinary use, not a
- *   capability confinement.
+ *   capability confinement. This limit applies to the CONTAINER only: the
+ *   values inside are ordinary frozen objects, and ordinary property
+ *   assignment on them throws.
  * - The guard properties are NON-ENUMERABLE, so `Object.keys`, spreads, and
  *   deep-equality comparisons see exactly what an unguarded `Map` shows.
  *
@@ -32,6 +44,51 @@
 /** The mutators that would rewrite recorded state. */
 const MAP_MUTATORS = ["set", "delete", "clear"] as const;
 const SET_MUTATORS = ["add", "delete", "clear"] as const;
+
+/**
+ * Objects this module has already walked and frozen.
+ *
+ * Serves two purposes at once: it terminates a cyclic walk, and it makes the
+ * walk O(1) amortized per object. The fold copies its maps on every
+ * transaction, so without the memo every fold would re-walk every line it
+ * carried forward. A member of this set is frozen, so its own property values
+ * cannot have changed since it was walked — skipping it is sound, not merely
+ * cheap. `WeakSet` holds no object alive.
+ */
+const DEEP_FROZEN = new WeakSet<object>();
+
+/**
+ * Recursively freezes a value, following arrays and own enumerable data
+ * properties. Primitives pass through untouched.
+ *
+ * Only ENUMERABLE DATA properties are followed: an accessor is never invoked
+ * (reading one to freeze it could run caller code), and the non-enumerable
+ * mutator guards this module installs are not walked.
+ */
+export function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  const object = value as unknown as object;
+  if (DEEP_FROZEN.has(object)) {
+    return value;
+  }
+  DEEP_FROZEN.add(object);
+  Object.freeze(object);
+  if (Array.isArray(object)) {
+    for (const item of object) {
+      deepFreeze(item);
+    }
+    return value;
+  }
+  for (const key of Object.keys(object)) {
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (descriptor !== undefined && "value" in descriptor) {
+      deepFreeze(descriptor.value);
+    }
+  }
+  return value;
+}
 
 function refuse(container: string, method: string): () => never {
   return () => {
@@ -54,12 +111,22 @@ function guard<T extends object>(container: string, target: T, methods: readonly
   return Object.freeze(target);
 }
 
-/** Freezes a map's contents as well as its properties. */
+/**
+ * Seals a map: its entries cannot be added, replaced, or removed, AND every
+ * key and value it holds is deep-frozen (review round 2, HIGH-4).
+ */
 export function frozenMap<K, V>(map: Map<K, V>): ReadonlyMap<K, V> {
+  for (const [key, value] of map) {
+    deepFreeze(key);
+    deepFreeze(value);
+  }
   return guard("Map", map, MAP_MUTATORS);
 }
 
-/** Freezes a set's contents as well as its properties. */
+/** Seals a set the same way, deep-freezing every member. */
 export function frozenSet<T>(set: Set<T>): ReadonlySet<T> {
+  for (const value of set) {
+    deepFreeze(value);
+  }
   return guard("Set", set, SET_MUTATORS);
 }

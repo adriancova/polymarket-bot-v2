@@ -169,13 +169,27 @@ describe("the reviewer's cross-account counterexample", () => {
       activityKind: "ACTUAL_ARRIVAL",
       haltRequired: true,
     });
+    // Since remediation round 2 the exposure ALSO names account A's −5, which
+    // no attribution leg ever claimed. Under the round-1 code that movement
+    // appeared in no exposure line at all: it had no UNATTRIBUTED entry to be
+    // summarized from, so the operator saw only account B.
     expect(unattributedExposure(projection)).toEqual([
+      {
+        accountRef: ACCOUNT,
+        assetId: PUSD,
+        net: "0",
+        unexplainedActualMovement: "-5",
+        affectedMarketIds: [],
+        haltTriggerCount: 1,
+        haltRequired: true,
+      },
       {
         accountRef: OTHER_ACCOUNT,
         assetId: PUSD,
         net: "5",
+        unexplainedActualMovement: "5",
         affectedMarketIds: [],
-        haltTriggerCount: 1,
+        haltTriggerCount: 2,
         haltRequired: true,
       },
     ]);

@@ -27,10 +27,17 @@ import type { OpenLot, PnlState } from "./state.js";
  * v2 (remediation round 1, 2026-09-02): a state now carries its full stream
  * IDENTITY — scope, environment, account, instance, run, market — where v1
  * carried only an owner. The bytes changed, so the version did.
+ *
+ * v3 (remediation round 2, 2026-09-03): the REALIZED view carries
+ * `consumedRewardEvidence` — which booked ledger transactions this stream has
+ * already realized. It belongs in the realized view because it is part of the
+ * money: it is the difference between "5 was booked once" and "5 was booked
+ * twice from one observation", and a rebuild must reconstruct it or the
+ * second booking would slip through.
  */
-export const PNL_STATE_SERIALIZATION_DOMAIN = "polymarket-bot/pnl-state/v2";
+export const PNL_STATE_SERIALIZATION_DOMAIN = "polymarket-bot/pnl-state/v3";
 
-/** Serialization domain for snapshot rows (v2 for the same reason). */
+/** Serialization domain for snapshot rows (v2; the row shape is unchanged). */
 export const PNL_SNAPSHOT_SERIALIZATION_DOMAIN = "polymarket-bot/pnl-snapshot/v2";
 
 function stableStringify(value: unknown): string {
@@ -81,6 +88,12 @@ function lotsRecord(map: ReadonlyMap<string, OpenLot>): Readonly<Record<string, 
  * `recordCount` / `refs`, because folding ANY record moves those and the
  * question this view answers is "did the money change", not "did anything
  * happen".
+ *
+ * Deliberately INCLUDES `consumedRewardEvidence` (round 2): only a realized
+ * reward payout moves it, and it is what stops one booked payout from being
+ * realized twice — so it is part of the money, not bookkeeping. Folding an
+ * estimate still leaves these bytes identical, which is what acceptance 3
+ * asserts.
  */
 function realizedView(state: PnlState): Readonly<Record<string, unknown>> {
   return {
@@ -91,6 +104,7 @@ function realizedView(state: PnlState): Readonly<Record<string, unknown>> {
     feesBySchedule: sortedRecord(state.feesBySchedule),
     realizedRewards: sortedRecord(state.realizedRewards),
     rewardsByProgram: sortedRecord(state.rewardsByProgram),
+    consumedRewardEvidence: sortedRecord(state.consumedRewardEvidence),
     reversedRefs: [...state.reversedRefs].sort(),
   };
 }

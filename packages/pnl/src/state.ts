@@ -117,6 +117,21 @@ export interface PnlState {
   /** trade ref -> applied effect (for exact reversals). */
   readonly tradeLog: ReadonlyMap<string, AppliedTradeEffect>;
   readonly reversedRefs: ReadonlySet<string>;
+  /**
+   * ledgerTransactionId -> the record `ref` that realized it.
+   *
+   * ONE OBSERVED PAYOUT IS ONE REALIZATION (review round 2, HIGH-2). Round 1
+   * deduplicated the PnL record's own `ref` and tracked no ledger evidence, so
+   * two records with different refs naming the SAME booked 5 pUSD transaction
+   * both folded and `realizedRewards` became 10 — the same money booked twice
+   * from one observation. This map is the consumed-evidence identity, and it
+   * lives IN the folded state rather than in a caller's memory: it is derived
+   * from the record stream, so a rebuild reconstructs it exactly, and it is
+   * carried by `serializePnlState`/`serializeRealizedPnl` so the byte oracle
+   * sees it. A consumed set held outside the state would vanish on rebuild and
+   * let the second record through.
+   */
+  readonly consumedRewardEvidence: ReadonlyMap<string, string>;
 }
 
 /**
@@ -148,6 +163,7 @@ export function emptyPnlState(identity: PnlStreamIdentity): PnlState {
     estimatesByProgram: frozenMap(new Map<string, DecimalString>()),
     tradeLog: frozenMap(new Map<string, AppliedTradeEffect>()),
     reversedRefs: frozenSet(new Set<string>()),
+    consumedRewardEvidence: frozenMap(new Map<string, string>()),
   });
 }
 
@@ -232,6 +248,7 @@ interface MutableState {
   estimatesByProgram: Map<string, DecimalString>;
   tradeLog: Map<string, AppliedTradeEffect>;
   reversedRefs: Set<string>;
+  consumedRewardEvidence: Map<string, string>;
 }
 
 function thaw(state: PnlState): MutableState {
@@ -250,6 +267,7 @@ function thaw(state: PnlState): MutableState {
     estimatesByProgram: new Map(state.estimatesByProgram),
     tradeLog: new Map(state.tradeLog),
     reversedRefs: new Set(state.reversedRefs),
+    consumedRewardEvidence: new Map(state.consumedRewardEvidence),
   };
 }
 
@@ -257,6 +275,11 @@ function thaw(state: PnlState): MutableState {
  * Seals a folded state: every container is frozen against runtime mutation as
  * well as against the type system (`immutable.ts`), because a `readonly` type
  * stops a TypeScript caller and nothing else.
+ *
+ * `frozenMap`/`frozenSet` also DEEP-FREEZE what they hold (review round 2,
+ * HIGH-4): sealing `lots` while leaving the `OpenLot` inside it writable let a
+ * consumer rewrite a cost basis from 4 to 999 by ordinary property assignment,
+ * and the next snapshot reported the 999.
  */
 function freeze(state: MutableState): PnlState {
   return Object.freeze({
@@ -274,6 +297,7 @@ function freeze(state: MutableState): PnlState {
     estimatesByProgram: frozenMap(state.estimatesByProgram),
     tradeLog: frozenMap(state.tradeLog),
     reversedRefs: frozenSet(state.reversedRefs),
+    consumedRewardEvidence: frozenMap(state.consumedRewardEvidence),
   });
 }
 
@@ -640,12 +664,44 @@ function applyFee(state: PnlState, record: PnlFeeRecord): PnlResult<PnlState> {
  * denomination, for exactly this amount. A caller holding only a canonical
  * UUID cannot realize anything (`evidence.ts` states what the boundary does
  * and does not guarantee).
+ *
+ * AND ONE OBSERVATION REALIZES ONCE (review round 2, HIGH-2). The evidence
+ * check is stateless — it answers "does this booking support this claim?" — so
+ * on its own it answers YES every time it is asked. Two payout records with
+ * different `ref`s naming one booked 5 pUSD transaction therefore both folded
+ * and booked 10. The stream now records which bookings it has consumed and
+ * refuses the second, naming the record that consumed it first.
+ *
+ * The consumption key is the LEDGER TRANSACTION ID alone, not
+ * `(transaction, denomination)` or `(transaction, program)`. A transaction
+ * carries one `eventType`, so one booking supports one program; the only shape
+ * this coarser key refuses that a finer one would admit is a single booking
+ * crediting rewards in two denominations at once. That is refused deliberately:
+ * no reward-posting builder exists yet (`follow_up`), ADR-006 §7 keeps
+ * denominations apart anyway, and a loud refusal of an unusual booking is the
+ * right way to lose that argument — double-realized money is not.
  */
 function applyRewardPayout(
   state: PnlState,
   record: PnlRewardPayoutRecord,
   evidence: PnlSettlementEvidence | undefined,
 ): PnlResult<PnlState> {
+  const consumedBy = state.consumedRewardEvidence.get(record.ledgerTransactionId);
+  if (consumedBy !== undefined) {
+    return pnlFailure(
+      pnlRefusal(
+        "PNL_REWARD_EVIDENCE_ALREADY_REALIZED",
+        `reward payout ${record.ref} names ledger transaction ` +
+          `${record.ledgerTransactionId}, which record ${consumedBy} already realized in ` +
+          "this stream; one observed payout is realized once (ADR-006 §6)",
+        {
+          ref: record.ref,
+          ledgerTransactionId: record.ledgerTransactionId,
+          alreadyRealizedBy: consumedBy,
+        },
+      ),
+    );
+  }
   const unproven = verifyRewardPayoutEvidence(
     {
       ref: record.ref,
@@ -664,6 +720,7 @@ function applyRewardPayout(
   const next = thaw(state);
   addTo(next.realizedRewards, record.denominationAsset, record.amount);
   addTo(next.rewardsByProgram, key2(record.denominationAsset, record.programType), record.amount);
+  next.consumedRewardEvidence.set(record.ledgerTransactionId, record.ref);
   next.refs.add(record.ref);
   next.recordCount += 1;
   return pnlOk(freeze(next));
