@@ -48,7 +48,22 @@ export type PnlRefusalCode =
    * An open position has no midpoint mark: unrealized PnL at midpoint is a
    * required measure (§9.16) and is never guessed.
    */
-  | "PNL_MARK_MISSING";
+  | "PNL_MARK_MISSING"
+  /**
+   * A reward payout arrived with no settlement evidence to check it against.
+   * ADR-006 §6: only an OBSERVED payout realizes a reward, and an identifier
+   * is not an observation — the caller supplies the booked ledger
+   * transaction, not its id (`evidence.ts`).
+   */
+  | "PNL_REWARD_EVIDENCE_MISSING"
+  /** The named ledger transaction is not in the supplied evidence set. */
+  | "PNL_REWARD_EVIDENCE_UNKNOWN"
+  /**
+   * The named transaction exists but does not book THIS payout: wrong event
+   * type, wrong environment, an unsettled state, no matching `REWARD_INCOME`
+   * entries, or nothing credited to this owner.
+   */
+  | "PNL_REWARD_EVIDENCE_MISMATCH";
 
 export type PnlRefusalDetails = Readonly<Record<string, unknown>>;
 

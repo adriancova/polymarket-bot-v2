@@ -62,9 +62,35 @@ export const PnlSnapshotInputSchema = z.strictObject({
 
 export type PnlSnapshotInput = Readonly<z.infer<typeof PnlSnapshotInputSchema>>;
 
-/** One §10.5 `pnl_snapshots`-shaped row. All measures share one denomination. */
+/**
+ * One §10.5 `pnl_snapshots`-shaped row. All measures share one denomination.
+ *
+ * The identity fields are flattened onto the row rather than nested in an
+ * owner object, because they ARE the table's identity columns — `scope`,
+ * `environment`, and `account_ref` are NOT NULL there, and `instance_id`,
+ * `run_id`, and `market_id` participate in its unique key. A composition root
+ * binds them with {@link toPnlSnapshotRow}, which is total: every column it
+ * produces exists, and every NOT NULL column without a database default is
+ * produced (pinned against the migration by the cross-package suite in
+ * `test/unit/ledger/`).
+ *
+ * The three per-version breakdowns have no columns in that table; they are
+ * §9.16 analytics this engine reports and the row mapper deliberately does not
+ * persist. Dropping them silently in a mapping would be worse than saying so.
+ */
 export interface PnlSnapshot {
-  readonly owner: PnlOwner;
+  /** `accounting.pnl_snapshots.scope` — the owner's ledger scope. */
+  readonly scope: PnlOwner["scope"];
+  /** `environment` — the run mode this stream folds (§10.8 separation). */
+  readonly environment: string;
+  /** `account_ref` — NOT NULL for every scope, including a strategy stream. */
+  readonly accountRef: string;
+  /** `instance_id` — the strategy instance, or null for a non-strategy stream. */
+  readonly instanceId: string | null;
+  /** `run_id` — the run this stream is scoped to, or null. */
+  readonly runId: string | null;
+  /** `market_id` — the market this stream is scoped to, or null. */
+  readonly marketId: string | null;
   readonly denominationAsset: string;
   readonly asOf: string;
   readonly grossTradingPnl: DecimalString;
@@ -213,7 +239,13 @@ export function computePnlSnapshot(
 
     snapshots.push(
       Object.freeze({
-        owner: state.owner,
+        scope: state.identity.scope,
+        environment: state.identity.environment,
+        accountRef: state.identity.accountRef,
+        instanceId:
+          state.identity.scope === "VIRTUAL_STRATEGY" ? state.identity.instanceId : null,
+        runId: state.identity.runId ?? null,
+        marketId: state.identity.marketId ?? null,
         denominationAsset: denomination,
         asOf,
         grossTradingPnl,
@@ -242,4 +274,71 @@ export function computePnlSnapshot(
   }
 
   return pnlOk(Object.freeze(snapshots));
+}
+
+/**
+ * The `accounting.pnl_snapshots` row a snapshot binds to (§10.5), in the
+ * camelCase spelling `packages/storage-postgres` uses for its column inputs.
+ *
+ * This exists because "the record fields mirror the columns" is a claim a
+ * composition root has to be able to execute. Before remediation round 1 it
+ * could not: a `PnlSnapshot` carried an owner and measures, while the table
+ * requires `scope`, `environment`, and a NOT NULL `account_ref`, and keys its
+ * rows by `(scope, environment, account_ref, instance_id, market_id, as_of)`.
+ * Three of those were underivable from the value, so any binding would have
+ * had to invent them.
+ *
+ * Deliberately absent, each because the DATABASE owns it: `pnl_snapshot_id`
+ * (default `uuid_generate_v7()`), `computed_at` (default `now()`), and
+ * `rebuilt_at` (set by a rebuild, not by a computation). Deliberately absent
+ * because NO column exists: `feesByScheduleVersion`, `rewardsByProgram`, and
+ * `estimatesByProgram`.
+ */
+export interface PnlSnapshotRow {
+  readonly scope: string;
+  readonly environment: string;
+  readonly accountRef: string;
+  readonly instanceId: string | null;
+  readonly runId: string | null;
+  readonly marketId: string | null;
+  readonly denominationAsset: string;
+  readonly grossTradingPnl: DecimalString;
+  readonly coreNetPnl: DecimalString;
+  readonly allInPnl: DecimalString;
+  readonly realizedPnl: DecimalString;
+  readonly unrealizedPnlMidpoint: DecimalString;
+  readonly unrealizedPnlModel: DecimalString | null;
+  readonly unrealizedPnlLiquidation: DecimalString | null;
+  readonly worstCaseResolutionPnl: DecimalString | null;
+  readonly feesPaid: DecimalString;
+  readonly rewardEstimateTotal: DecimalString;
+  readonly realizedRewards: DecimalString;
+  readonly capitalCommitted: DecimalString;
+  readonly asOf: string;
+}
+
+/** Binds one snapshot to its `accounting.pnl_snapshots` row, field for field. */
+export function toPnlSnapshotRow(snapshot: PnlSnapshot): PnlSnapshotRow {
+  return Object.freeze({
+    scope: snapshot.scope,
+    environment: snapshot.environment,
+    accountRef: snapshot.accountRef,
+    instanceId: snapshot.instanceId,
+    runId: snapshot.runId,
+    marketId: snapshot.marketId,
+    denominationAsset: snapshot.denominationAsset,
+    grossTradingPnl: snapshot.grossTradingPnl,
+    coreNetPnl: snapshot.coreNetPnl,
+    allInPnl: snapshot.allInPnl,
+    realizedPnl: snapshot.realizedPnl,
+    unrealizedPnlMidpoint: snapshot.unrealizedPnlMidpoint,
+    unrealizedPnlModel: snapshot.unrealizedPnlModel,
+    unrealizedPnlLiquidation: snapshot.unrealizedPnlLiquidation,
+    worstCaseResolutionPnl: snapshot.worstCaseResolutionPnl,
+    feesPaid: snapshot.feesPaid,
+    rewardEstimateTotal: snapshot.rewardEstimateTotal,
+    realizedRewards: snapshot.realizedRewards,
+    capitalCommitted: snapshot.capitalCommitted,
+    asOf: snapshot.asOf,
+  });
 }

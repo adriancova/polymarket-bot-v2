@@ -1,12 +1,18 @@
 /**
  * The PnL fold (§9.16, §6 invariants 8 and 14).
  *
- * A `PnlState` is an immutable value folding one OWNER's record stream —
- * one strategy instance, the actual account, or the unattributed bucket —
- * exactly the granularity of the §10.5 `pnl_snapshots` rows. Applying a
- * record returns a NEW state; `foldPnlRecords` rebuilds from zero through
- * the SAME step, so rebuild-equals-incremental holds by construction and is
- * verified byte-for-byte in tests (§6 invariant 8).
+ * A `PnlState` is an immutable value folding one STREAM's records — one
+ * strategy instance in one account, one account, or one account's
+ * unattributed bucket, in one environment — exactly the identity of the
+ * §10.5 `pnl_snapshots` rows it produces (`PnlStreamIdentity` in
+ * `records.ts`, which states why the identity is the stream's and not the
+ * snapshot call's). Applying a record returns a NEW state; `foldPnlRecords`
+ * rebuilds from zero through the SAME step, so rebuild-equals-incremental
+ * holds by construction and is verified byte-for-byte in tests (§6
+ * invariant 8).
+ *
+ * A reward payout realizes ONLY against `PnlSettlementEvidence` — the booked
+ * ledger transaction itself, not its identifier (`evidence.ts`).
  *
  * Everything monetary is per DENOMINATION ASSET and never summed across
  * denominations (ADR-006 §7: USDC and pUSD are never interchangeable; the
@@ -35,6 +41,9 @@ import {
   subDecimal,
 } from "@polymarket-bot/decimal";
 
+import type { PnlSettlementEvidence } from "./evidence.js";
+import { verifyRewardPayoutEvidence } from "./evidence.js";
+import { frozenMap, frozenSet } from "./immutable.js";
 import type { PnlRefusal, PnlResult } from "./refusals.js";
 import { PnlConfigurationError, pnlFailure, pnlOk, pnlRefusal } from "./refusals.js";
 import type {
@@ -45,10 +54,11 @@ import type {
   PnlRecord,
   PnlRewardEstimateRecord,
   PnlRewardPayoutRecord,
+  PnlStreamIdentity,
   PnlTradeRecord,
   PnlTradeReversalRecord,
 } from "./records.js";
-import { PnlOwnerSchema, PnlRecordSchema } from "./records.js";
+import { PnlRecordSchema, PnlStreamIdentitySchema, pnlOwnerOf } from "./records.js";
 
 const ZERO: DecimalString = "0";
 
@@ -78,6 +88,13 @@ function key2(a: string, b: string): string {
 }
 
 export interface PnlState {
+  /**
+   * Who this stream is, in the persistence identity the §10.5
+   * `pnl_snapshots` rows require: scope, environment, account, and (for a
+   * strategy stream) instance, plus any run/market scoping.
+   */
+  readonly identity: PnlStreamIdentity;
+  /** The owner half of {@link identity} — what every record's owner must match. */
   readonly owner: PnlOwner;
   readonly recordCount: number;
   readonly refs: ReadonlySet<string>;
@@ -102,40 +119,52 @@ export interface PnlState {
   readonly reversedRefs: ReadonlySet<string>;
 }
 
-/** An empty state for one owner. Throws on a malformed owner. */
-export function emptyPnlState(owner: PnlOwner): PnlState {
-  const parsed = PnlOwnerSchema.safeParse(owner);
+/**
+ * An empty state for one stream. Throws on a malformed identity — including
+ * one missing `environment` or `accountRef`, which are NOT NULL columns of
+ * `accounting.pnl_snapshots` and are not derivable from a PnL value, so a
+ * stream that cannot state them is a stream whose rows cannot be written.
+ */
+export function emptyPnlState(identity: PnlStreamIdentity): PnlState {
+  const parsed = PnlStreamIdentitySchema.safeParse(identity);
   if (!parsed.success) {
-    throw new PnlConfigurationError("owner is not a PnL owner", { raw: owner });
+    throw new PnlConfigurationError("value is not a PnL stream identity", {
+      raw: identity,
+      issues: formatIssues(parsed.error),
+    });
   }
   return Object.freeze({
-    owner: Object.freeze(parsed.data),
+    identity: Object.freeze(parsed.data),
+    owner: pnlOwnerOf(parsed.data),
     recordCount: 0,
-    refs: new Set<string>(),
-    lots: new Map<string, OpenLot>(),
-    realizedTrading: new Map<string, DecimalString>(),
-    feesPaid: new Map<string, DecimalString>(),
-    feesBySchedule: new Map<string, DecimalString>(),
-    realizedRewards: new Map<string, DecimalString>(),
-    rewardsByProgram: new Map<string, DecimalString>(),
-    rewardEstimates: new Map<string, DecimalString>(),
-    estimatesByProgram: new Map<string, DecimalString>(),
-    tradeLog: new Map<string, AppliedTradeEffect>(),
-    reversedRefs: new Set<string>(),
+    refs: frozenSet(new Set<string>()),
+    lots: frozenMap(new Map<string, OpenLot>()),
+    realizedTrading: frozenMap(new Map<string, DecimalString>()),
+    feesPaid: frozenMap(new Map<string, DecimalString>()),
+    feesBySchedule: frozenMap(new Map<string, DecimalString>()),
+    realizedRewards: frozenMap(new Map<string, DecimalString>()),
+    rewardsByProgram: frozenMap(new Map<string, DecimalString>()),
+    rewardEstimates: frozenMap(new Map<string, DecimalString>()),
+    estimatesByProgram: frozenMap(new Map<string, DecimalString>()),
+    tradeLog: frozenMap(new Map<string, AppliedTradeEffect>()),
+    reversedRefs: frozenSet(new Set<string>()),
   });
 }
 
+/**
+ * Owner equality. Every owner names an account, and a strategy owner names
+ * the account its attribution partitions as well as its instance: the same
+ * instance's records booked in a DIFFERENT account belong to a different
+ * stream and a different `pnl_snapshots` row.
+ */
 function sameOwner(a: PnlOwner, b: PnlOwner): boolean {
-  if (a.scope !== b.scope) {
+  if (a.scope !== b.scope || a.accountRef !== b.accountRef) {
     return false;
   }
   if (a.scope === "VIRTUAL_STRATEGY" && b.scope === "VIRTUAL_STRATEGY") {
     return a.instanceId === b.instanceId;
   }
-  if (a.scope !== "VIRTUAL_STRATEGY" && b.scope !== "VIRTUAL_STRATEGY") {
-    return a.accountRef === b.accountRef;
-  }
-  return false;
+  return true;
 }
 
 const UUID_SHAPED_PATTERN =
@@ -189,6 +218,7 @@ function formatIssues(error: {
 }
 
 interface MutableState {
+  identity: PnlStreamIdentity;
   owner: PnlOwner;
   recordCount: number;
   refs: Set<string>;
@@ -206,6 +236,7 @@ interface MutableState {
 
 function thaw(state: PnlState): MutableState {
   return {
+    identity: state.identity,
     owner: state.owner,
     recordCount: state.recordCount,
     refs: new Set(state.refs),
@@ -222,8 +253,28 @@ function thaw(state: PnlState): MutableState {
   };
 }
 
+/**
+ * Seals a folded state: every container is frozen against runtime mutation as
+ * well as against the type system (`immutable.ts`), because a `readonly` type
+ * stops a TypeScript caller and nothing else.
+ */
 function freeze(state: MutableState): PnlState {
-  return Object.freeze({ ...state });
+  return Object.freeze({
+    identity: state.identity,
+    owner: state.owner,
+    recordCount: state.recordCount,
+    refs: frozenSet(state.refs),
+    lots: frozenMap(state.lots),
+    realizedTrading: frozenMap(state.realizedTrading),
+    feesPaid: frozenMap(state.feesPaid),
+    feesBySchedule: frozenMap(state.feesBySchedule),
+    realizedRewards: frozenMap(state.realizedRewards),
+    rewardsByProgram: frozenMap(state.rewardsByProgram),
+    rewardEstimates: frozenMap(state.rewardEstimates),
+    estimatesByProgram: frozenMap(state.estimatesByProgram),
+    tradeLog: frozenMap(state.tradeLog),
+    reversedRefs: frozenSet(state.reversedRefs),
+  });
 }
 
 function addTo(map: Map<string, DecimalString>, key: string, amount: DecimalString): void {
@@ -249,8 +300,17 @@ function basisOfRemoval(
 /**
  * Applies one record, returning the new state or the refusals. The receiver
  * is never modified.
+ *
+ * `evidence` is required only by `REWARD_PAYOUT`, which realizes money and
+ * therefore must be proven against the booked ledger transaction rather than
+ * against its identifier (`evidence.ts`). Every other record kind carries its
+ * own facts and ignores it.
  */
-export function applyPnlRecord(state: PnlState, input: unknown): PnlResult<PnlState> {
+export function applyPnlRecord(
+  state: PnlState,
+  input: unknown,
+  evidence?: PnlSettlementEvidence,
+): PnlResult<PnlState> {
   const uuidRefusals = collectUuidRefusals(input);
   if (uuidRefusals.length > 0) {
     return pnlFailure(...uuidRefusals);
@@ -293,7 +353,7 @@ export function applyPnlRecord(state: PnlState, input: unknown): PnlResult<PnlSt
     case "FEE":
       return applyFee(state, record);
     case "REWARD_PAYOUT":
-      return applyRewardPayout(state, record);
+      return applyRewardPayout(state, record, evidence);
     case "REWARD_ESTIMATE":
       return applyRewardEstimate(state, record);
   }
@@ -301,12 +361,13 @@ export function applyPnlRecord(state: PnlState, input: unknown): PnlResult<PnlSt
 
 /** Folds a whole stream from zero — the rebuild path (§6 invariant 8). */
 export function foldPnlRecords(
-  owner: PnlOwner,
+  identity: PnlStreamIdentity,
   records: readonly unknown[],
+  evidence?: PnlSettlementEvidence,
 ): PnlResult<PnlState> {
-  let state = emptyPnlState(owner);
+  let state = emptyPnlState(identity);
   for (const [index, record] of records.entries()) {
-    const result = applyPnlRecord(state, record);
+    const result = applyPnlRecord(state, record, evidence);
     if (!result.ok) {
       return pnlFailure(
         pnlRefusal("PNL_INPUT_INVALID", `fold refused at record index ${index}`, {
@@ -570,10 +631,36 @@ function applyFee(state: PnlState, record: PnlFeeRecord): PnlResult<PnlState> {
   return pnlOk(freeze(next));
 }
 
+/**
+ * ADR-006 §6: "only an observed payout creates a `REWARD_INCOME` entry."
+ *
+ * The observation is the BOOKED LEDGER TRANSACTION, and this handler will not
+ * move `realizedRewards` until the supplied evidence proves that transaction
+ * books this program's payout, in this environment, for this owner, in this
+ * denomination, for exactly this amount. A caller holding only a canonical
+ * UUID cannot realize anything (`evidence.ts` states what the boundary does
+ * and does not guarantee).
+ */
 function applyRewardPayout(
   state: PnlState,
   record: PnlRewardPayoutRecord,
+  evidence: PnlSettlementEvidence | undefined,
 ): PnlResult<PnlState> {
+  const unproven = verifyRewardPayoutEvidence(
+    {
+      ref: record.ref,
+      ledgerTransactionId: record.ledgerTransactionId,
+      programType: record.programType,
+      amount: record.amount,
+      denominationAsset: record.denominationAsset,
+    },
+    state.owner,
+    state.identity.environment,
+    evidence,
+  );
+  if (unproven.length > 0) {
+    return pnlFailure(...unproven);
+  }
   const next = thaw(state);
   addTo(next.realizedRewards, record.denominationAsset, record.amount);
   addTo(next.rewardsByProgram, key2(record.denominationAsset, record.programType), record.amount);

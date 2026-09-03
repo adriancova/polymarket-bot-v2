@@ -58,10 +58,23 @@ export const FillPostingIdsSchema = z.strictObject({
 
 export type FillPostingIds = Readonly<z.infer<typeof FillPostingIdsSchema>>;
 
-/** The owner of a PnL stream (mirrored structurally by `@polymarket-bot/pnl`). */
+/**
+ * The owner of a PnL stream (mirrored structurally by `@polymarket-bot/pnl`).
+ *
+ * EVERY owner names the account whose holdings it concerns, including a
+ * strategy instance's: attribution is a partition of a real account's balance
+ * (ADR-006 §2), the ledger entry carrying it has a NOT NULL `account_ref`, and
+ * `accounting.pnl_snapshots.account_ref` is NOT NULL as well. An
+ * account-less strategy owner made two accounts' records interchangeable in
+ * one stream (remediation round 1, 2026-09-02).
+ */
 export type PnlOwner =
   | { readonly scope: "ACTUAL_ACCOUNT"; readonly accountRef: string }
-  | { readonly scope: "VIRTUAL_STRATEGY"; readonly instanceId: string }
+  | {
+      readonly scope: "VIRTUAL_STRATEGY";
+      readonly accountRef: string;
+      readonly instanceId: string;
+    }
   | { readonly scope: "UNATTRIBUTED"; readonly accountRef: string };
 
 /** A trade the PnL engine folds (structural contract with `@polymarket-bot/pnl`). */
@@ -151,7 +164,11 @@ export function buildFillPosting(
   // The exact per-owner partition. Multiplication over exact decimals is
   // distributive, so per-owner costs sum to price × fill.shares exactly.
   const slices: OwnerSlice[] = allocation.allocations.map((alloc) => ({
-    owner: { scope: "VIRTUAL_STRATEGY", instanceId: alloc.instanceId },
+    owner: {
+      scope: "VIRTUAL_STRATEGY",
+      accountRef: fill.accountRef,
+      instanceId: alloc.instanceId,
+    },
     shares: alloc.shares,
     cost: mulDecimal(fill.price, alloc.shares),
     fee: alloc.feeAmount,

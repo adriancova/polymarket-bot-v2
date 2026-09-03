@@ -28,12 +28,14 @@ import {
   Ledger,
   allocateFill,
   applyTransaction,
+  balanceLineKey,
   buildFillPosting,
   emptyProjection,
   projectLedger,
   serializeLedger,
   serializeProjection,
   unattributedExposure,
+  virtualPositionKey,
 } from "../../../packages/ledger/src/index.js";
 import type {
   FillAllocationResult,
@@ -188,11 +190,17 @@ describe("acceptance 2: a seeded scenario rebuilt from zero", () => {
   });
 
   it("holds the ADR-006 §2 partition end to end", () => {
-    const actualTokens = live.projection.balances.get(`ACTUAL_ACCOUNT|${ACCOUNT}|${YES_TOKEN}`);
-    const virtualA = live.projection.virtualPositions.get(`${INSTANCE_A}|${YES_TOKEN}`);
-    const virtualB = live.projection.virtualPositions.get(`${INSTANCE_B}|${YES_TOKEN}`);
+    const actualTokens = live.projection.balances.get(
+      balanceLineKey("ACTUAL_ACCOUNT", ACCOUNT, YES_TOKEN),
+    );
+    const virtualA = live.projection.virtualPositions.get(
+      virtualPositionKey(INSTANCE_A, YES_TOKEN),
+    );
+    const virtualB = live.projection.virtualPositions.get(
+      virtualPositionKey(INSTANCE_B, YES_TOKEN),
+    );
     const unattributedTokens = live.projection.balances.get(
-      `UNATTRIBUTED|${ACCOUNT}|${YES_TOKEN}`,
+      balanceLineKey("UNATTRIBUTED", ACCOUNT, YES_TOKEN),
     );
     // Bought 10 + 5, sold 4 → 11 actual. A: 6 + 5 = 11; B: 4 - 3 = 1;
     // unattributed: -1 (the unclaimed share of the sell). 11 + 1 - 1 = 11.

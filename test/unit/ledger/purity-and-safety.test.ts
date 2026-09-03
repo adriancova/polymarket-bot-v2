@@ -145,8 +145,9 @@ describe("no economic value passes through a JavaScript number", () => {
 
   it("refuses a numeric PnL amount and a numeric mark", () => {
     const owner = { scope: "ACTUAL_ACCOUNT", accountRef: "acct-paper-1" } as const;
+    const stream = { ...owner, environment: "PAPER" } as const;
     expect(
-      foldPnlRecords(owner, [
+      foldPnlRecords(stream, [
         {
           kind: "FEE",
           ref: "018f3a5c-6666-7000-8000-000000000001",
@@ -157,7 +158,7 @@ describe("no economic value passes through a JavaScript number", () => {
       ]).ok,
     ).toBe(false);
 
-    const empty = foldPnlRecords(owner, []);
+    const empty = foldPnlRecords(stream, []);
     expect(empty.ok).toBe(true);
     if (!empty.ok) {
       return;
@@ -225,6 +226,7 @@ describe("the same inputs always produce the same outputs", () => {
 
   it("serializes a PnL state identically across runs", () => {
     const owner = { scope: "ACTUAL_ACCOUNT", accountRef: "acct-paper-1" } as const;
+    const stream = { ...owner, environment: "PAPER" } as const;
     const records = [
       {
         kind: "FEE",
@@ -235,8 +237,8 @@ describe("the same inputs always produce the same outputs", () => {
         scheduleVersionRef: "fees-v1",
       },
     ];
-    const first = foldPnlRecords(owner, records);
-    const second = foldPnlRecords(owner, records);
+    const first = foldPnlRecords(stream, records);
+    const second = foldPnlRecords(stream, records);
     expect(first.ok && second.ok).toBe(true);
     if (!first.ok || !second.ok) {
       return;

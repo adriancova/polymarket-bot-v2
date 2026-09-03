@@ -16,6 +16,7 @@ import {
   checkPerAssetBalance,
   isExactNegation,
   legDeltas,
+  legKey,
   netByAsset,
 } from "./balance.js";
 import { Ledger } from "./ledger.js";
@@ -270,8 +271,16 @@ describe("legDeltas / isExactNegation (ADR-006 §5.2)", () => {
       }),
     );
     expect(deltas.size).toBe(2);
-    expect(deltas.get(`ACTUAL_ACCOUNT|${ACCOUNT}||${PUSD}`)).toBe("-4");
-    expect(deltas.get(`ACTUAL_ACCOUNT|${OTHER_ACCOUNT}||${PUSD}`)).toBe("4");
+    expect(
+      deltas.get(
+        legKey({ scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT, assetId: PUSD }),
+      ),
+    ).toBe("-4");
+    expect(
+      deltas.get(
+        legKey({ scope: "ACTUAL_ACCOUNT", accountRef: OTHER_ACCOUNT, assetId: PUSD }),
+      ),
+    ).toBe("4");
   });
 
   it("treats an exact leg-for-leg negation as a compensating reversal", () => {

@@ -24,8 +24,10 @@ import { describe, expect, it } from "vitest";
 import {
   Ledger,
   allocateFill,
+  balanceLineKey,
   buildFillPosting,
   projectLedger,
+  virtualPositionKey,
 } from "../../../packages/ledger/src/index.js";
 import type {
   FillAllocationResult,
@@ -34,11 +36,17 @@ import type {
 } from "../../../packages/ledger/src/index.js";
 import {
   PnlRecordSchema,
+  PnlSettlementEvidence,
   computePnlSnapshot,
   emptyPnlState,
   foldPnlRecords,
 } from "../../../packages/pnl/src/index.js";
-import type { PnlOwner, PnlSnapshot, PnlState } from "../../../packages/pnl/src/index.js";
+import type {
+  PnlOwner,
+  PnlSnapshot,
+  PnlState,
+  PnlStreamIdentity,
+} from "../../../packages/pnl/src/index.js";
 
 const ACCOUNT = "acct-paper-1";
 const PUSD = "pUSD";
@@ -105,8 +113,13 @@ function assertOwnersAgree(ledgerOwner: LedgerPnlOwner): PnlOwner {
   return ledgerOwner;
 }
 
+/** The stream identity an owner folds in, for this suite's single environment. */
+function streamFor(owner: PnlOwner): PnlStreamIdentity {
+  return { ...owner, environment: "PAPER" };
+}
+
 function foldFor(owner: PnlOwner, records: readonly unknown[]): PnlState {
-  const result = foldPnlRecords(owner, records);
+  const result = foldPnlRecords(streamFor(owner), records);
   if (!result.ok) {
     throw new Error(`fold refused: ${JSON.stringify(result.refusals)}`);
   }
@@ -170,22 +183,37 @@ describe("every record the ledger emits parses under the PnL schemas", () => {
       scope: "ACTUAL_ACCOUNT",
       accountRef: ACCOUNT,
     });
-    expect(assertOwnersAgree({ scope: "VIRTUAL_STRATEGY", instanceId: INSTANCE_A })).toEqual({
-      scope: "VIRTUAL_STRATEGY",
-      instanceId: INSTANCE_A,
-    });
+    expect(
+      assertOwnersAgree({
+        scope: "VIRTUAL_STRATEGY",
+        accountRef: ACCOUNT,
+        instanceId: INSTANCE_A,
+      }),
+    ).toEqual({ scope: "VIRTUAL_STRATEGY", accountRef: ACCOUNT, instanceId: INSTANCE_A });
     expect(assertOwnersAgree({ scope: "UNATTRIBUTED", accountRef: ACCOUNT })).toEqual({
       scope: "UNATTRIBUTED",
       accountRef: ACCOUNT,
     });
   });
 
+  it("names the fill's account on EVERY owner, including a strategy's", () => {
+    // `accounting.pnl_snapshots.account_ref` is NOT NULL for every scope, and
+    // attribution partitions a real account's balance (ADR-006 §2). A record
+    // whose owner had no account could not open a persistable stream
+    // (remediation round 1).
+    const records = posting(fill(1), [{ instanceId: INSTANCE_A, shares: "6" }], 10).pnlRecords;
+    expect(records.length).toBeGreaterThan(0);
+    for (const record of records) {
+      expect(record.owner.accountRef).toBe(ACCOUNT);
+    }
+  });
+
   it("emits every record with an owner the PnL engine can fold", () => {
     const records = posting(fill(1), [{ instanceId: INSTANCE_A, shares: "6" }], 10).pnlRecords;
     for (const record of records) {
       // Each record must be foldable into a state opened for its own owner.
-      const state = emptyPnlState(record.owner);
-      const result = foldPnlRecords(state.owner, [record]);
+      const state = emptyPnlState(streamFor(record.owner));
+      const result = foldPnlRecords(state.identity, [record]);
       expect(result.ok).toBe(true);
     }
   });
@@ -232,23 +260,27 @@ describe("end to end: one fill, one ledger, one PnL snapshot", () => {
 
   it("keeps the ledger and the PnL engine telling the same position story", () => {
     const projection = projectLedger(ledgerOf());
-    const virtualA = projection.virtualPositions.get(`${INSTANCE_A}|${YES_TOKEN}`);
-    const ownerA: PnlOwner = { scope: "VIRTUAL_STRATEGY", instanceId: INSTANCE_A };
+    const virtualA = projection.virtualPositions.get(
+      virtualPositionKey(INSTANCE_A, YES_TOKEN),
+    );
+    const ownerA: PnlOwner = { scope: "VIRTUAL_STRATEGY", accountRef: ACCOUNT, instanceId: INSTANCE_A };
     const pnlA = foldFor(ownerA, recordsFor(ownerA));
 
     // Instance A bought 6 and sold 6: flat in both views.
     expect(virtualA).toBeUndefined();
     expect(pnlA.lots.has(YES_TOKEN)).toBe(false);
 
-    const virtualB = projection.virtualPositions.get(`${INSTANCE_B}|${YES_TOKEN}`);
-    const ownerB: PnlOwner = { scope: "VIRTUAL_STRATEGY", instanceId: INSTANCE_B };
+    const virtualB = projection.virtualPositions.get(
+      virtualPositionKey(INSTANCE_B, YES_TOKEN),
+    );
+    const ownerB: PnlOwner = { scope: "VIRTUAL_STRATEGY", accountRef: ACCOUNT, instanceId: INSTANCE_B };
     const pnlB = foldFor(ownerB, recordsFor(ownerB));
     expect(virtualB?.balance).toBe("4");
     expect(pnlB.lots.get(YES_TOKEN)?.shares).toBe("4");
   });
 
   it("computes instance A's realized PnL and fee from the same fills", () => {
-    const ownerA: PnlOwner = { scope: "VIRTUAL_STRATEGY", instanceId: INSTANCE_A };
+    const ownerA: PnlOwner = { scope: "VIRTUAL_STRATEGY", accountRef: ACCOUNT, instanceId: INSTANCE_A };
     const rows = snapshotFor(foldFor(ownerA, recordsFor(ownerA)), {});
     const row = rows.find((entry) => entry.denominationAsset === PUSD);
     // Bought 6 @ 0.4 (basis 2.4), sold 6 @ 0.55 (proceeds 3.3): realized 0.9.
@@ -261,7 +293,7 @@ describe("end to end: one fill, one ledger, one PnL snapshot", () => {
   });
 
   it("values instance B's open position against a caller-supplied mark", () => {
-    const ownerB: PnlOwner = { scope: "VIRTUAL_STRATEGY", instanceId: INSTANCE_B };
+    const ownerB: PnlOwner = { scope: "VIRTUAL_STRATEGY", accountRef: ACCOUNT, instanceId: INSTANCE_B };
     const rows = snapshotFor(foldFor(ownerB, recordsFor(ownerB)), {
       [YES_TOKEN]: { midpoint: "0.5" },
     });
@@ -274,10 +306,178 @@ describe("end to end: one fill, one ledger, one PnL snapshot", () => {
 
   it("reconciles the actual-account stream against the ledger's actual position", () => {
     const projection = projectLedger(ledgerOf());
-    const actual = projection.balances.get(`ACTUAL_ACCOUNT|${ACCOUNT}|${YES_TOKEN}`);
+    const actual = projection.balances.get(
+      balanceLineKey("ACTUAL_ACCOUNT", ACCOUNT, YES_TOKEN),
+    );
     const ownerActual: PnlOwner = { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT };
     const pnlActual = foldFor(ownerActual, recordsFor(ownerActual));
     expect(actual?.balance).toBe("4");
     expect(pnlActual.lots.get(YES_TOKEN)?.shares).toBe("4");
+  });
+});
+
+/**
+ * The settlement-evidence bridge, end to end (review round 1, MEDIUM).
+ *
+ * The PnL engine now demands the BOOKED ledger transaction before it realizes
+ * a reward. That demand is only honest if the shape it demands is a shape the
+ * LEDGER accepts — otherwise the boundary would be unsatisfiable and the
+ * first caller to hit it would be tempted to loosen it. So this suite appends
+ * the booking to a real `Ledger` (per-asset zero-sum AND the per-account
+ * attribution parity), hands the appended transaction to the PnL engine as
+ * evidence, and only then realizes the payout.
+ */
+describe("a reward realizes only against a booking the ledger itself accepts", () => {
+  const REWARD_INCOME_ACCOUNT = "income-rewards";
+  const ATTRIBUTION_CLEARING = "clearing-attribution";
+  const REWARD_TX = id("4444", 90);
+  const REWARD_AMOUNT = "5";
+
+  /** `ACTUAL +5`, `REWARD_INCOME −5`, the instance's mirror `+5`, clearing `−5`. */
+  const rewardBooking = {
+    ledgerTransactionId: REWARD_TX,
+    eventType: "LIQUIDITY_REWARD",
+    environment: "PAPER",
+    accountRef: ACCOUNT,
+    source: "internal",
+    occurredAt: TIMESTAMP,
+    settlementState: "CONFIRMED",
+    entries: [
+      {
+        scope: "ACTUAL_ACCOUNT",
+        accountRef: ACCOUNT,
+        assetId: PUSD,
+        assetKind: "COLLATERAL",
+        amount: REWARD_AMOUNT,
+      },
+      {
+        scope: "REWARD_INCOME",
+        accountRef: REWARD_INCOME_ACCOUNT,
+        assetId: PUSD,
+        assetKind: "COLLATERAL",
+        amount: `-${REWARD_AMOUNT}`,
+      },
+      {
+        scope: "VIRTUAL_STRATEGY",
+        accountRef: ACCOUNT,
+        assetId: PUSD,
+        assetKind: "COLLATERAL",
+        amount: REWARD_AMOUNT,
+        instanceId: INSTANCE_A,
+      },
+      {
+        scope: "EXTERNAL_CLEARING",
+        accountRef: ATTRIBUTION_CLEARING,
+        assetId: PUSD,
+        assetKind: "COLLATERAL",
+        amount: `-${REWARD_AMOUNT}`,
+      },
+    ],
+  };
+
+  function appendedBooking(): unknown {
+    const result = Ledger.empty("PAPER").append(rewardBooking);
+    if (!result.ok) {
+      throw new Error(`the evidence shape is not appendable: ${JSON.stringify(result.refusals)}`);
+    }
+    return result.value.appended.transaction;
+  }
+
+  it("appends: the demanded evidence shape is a legal ledger transaction", () => {
+    const result = Ledger.empty("PAPER").append(rewardBooking);
+    expect(result.ok).toBe(true);
+  });
+
+  it("parses as evidence, straight from the appended record", () => {
+    const evidence = PnlSettlementEvidence.from([appendedBooking()]);
+    expect(evidence.ok).toBe(true);
+    if (!evidence.ok) {
+      return;
+    }
+    expect(evidence.value.find(REWARD_TX)?.eventType).toBe("LIQUIDITY_REWARD");
+  });
+
+  it("realizes the payout, and only with that evidence in hand", () => {
+    const owner: PnlOwner = {
+      scope: "VIRTUAL_STRATEGY",
+      accountRef: ACCOUNT,
+      instanceId: INSTANCE_A,
+    };
+    const payout = {
+      kind: "REWARD_PAYOUT",
+      ref: id("6666", 90),
+      owner,
+      programType: "LIQUIDITY_REWARD",
+      amount: REWARD_AMOUNT,
+      denominationAsset: PUSD,
+      ledgerTransactionId: REWARD_TX,
+    };
+    const evidence = PnlSettlementEvidence.from([appendedBooking()]);
+    expect(evidence.ok).toBe(true);
+    if (!evidence.ok) {
+      return;
+    }
+
+    const realized = foldPnlRecords(streamFor(owner), [payout], evidence.value);
+    expect(realized.ok).toBe(true);
+    if (!realized.ok) {
+      return;
+    }
+    expect(realized.value.realizedRewards.get(PUSD)).toBe(REWARD_AMOUNT);
+
+    // The same record, without the booking: nothing realizes.
+    const unevidenced = foldPnlRecords(streamFor(owner), [payout]);
+    expect(unevidenced.ok).toBe(false);
+    if (unevidenced.ok) {
+      return;
+    }
+    expect(unevidenced.refusals.map((refusal) => refusal.code)).toContain(
+      "PNL_REWARD_EVIDENCE_MISSING",
+    );
+  });
+
+  it("shows the ledger's own view of the same booking: attributed, not unattributed", () => {
+    const result = Ledger.empty("PAPER").append(rewardBooking);
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    const projection = projectLedger(result.value.ledger);
+    expect(projection.unattributedActivity).toEqual([]);
+    expect(
+      projection.virtualPositions.get(virtualPositionKey(INSTANCE_A, PUSD))?.balance,
+    ).toBe(REWARD_AMOUNT);
+  });
+
+  it("halts instead, when the reward arrives with no strategy claiming it", () => {
+    // ADR-006's consequence list, exactly: "a daily reward payout that arrives
+    // before its schedule is modeled … will halt a market."
+    const unclaimed = {
+      ...rewardBooking,
+      ledgerTransactionId: id("4444", 91),
+      entries: rewardBooking.entries.map((entry) =>
+        entry.scope === "VIRTUAL_STRATEGY"
+          ? {
+              scope: "UNATTRIBUTED",
+              accountRef: ACCOUNT,
+              assetId: PUSD,
+              assetKind: "COLLATERAL",
+              amount: REWARD_AMOUNT,
+            }
+          : entry,
+      ),
+    };
+    const result = Ledger.empty("PAPER").append(unclaimed);
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    const projection = projectLedger(result.value.ledger);
+    expect(projection.unattributedActivity[0]).toMatchObject({
+      accountRef: ACCOUNT,
+      assetId: PUSD,
+      activityKind: "ACTUAL_ARRIVAL",
+      haltRequired: true,
+    });
   });
 });

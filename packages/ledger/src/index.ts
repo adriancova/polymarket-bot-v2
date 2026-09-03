@@ -82,12 +82,16 @@ export type {
 } from "./transaction.js";
 
 export {
+  attributionBucketKey,
+  attributionBuckets,
   checkAttributionParity,
   checkPerAssetBalance,
   isExactNegation,
   legDeltas,
+  legKey,
   netByAsset,
 } from "./balance.js";
+export type { AttributionBucket } from "./balance.js";
 
 export { Ledger } from "./ledger.js";
 export type { LedgerAppendSuccess } from "./ledger.js";
@@ -98,15 +102,18 @@ export {
   actualPositions,
   applyTransaction,
   auditAttributionPartition,
+  balanceLineKey,
   balancesOfScope,
   emptyProjection,
   projectLedger,
   serializeLedger,
   serializeProjection,
   unattributedExposure,
+  virtualPositionKey,
   virtualPositions,
 } from "./projections.js";
 export type {
+  AttributionPartitionViolation,
   BalanceLine,
   LedgerProjection,
   UnattributedActivityRecord,

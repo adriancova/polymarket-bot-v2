@@ -149,9 +149,10 @@ describe("a fill matching no known allocation", () => {
     expect(virtualPositions(projection)).toEqual([]);
   });
 
-  it("surfaces the exposure with an open halt obligation per asset", () => {
+  it("surfaces the exposure with an open halt obligation per (account, asset)", () => {
     expect(unattributedExposure(projection)).toEqual([
       {
+        accountRef: ACCOUNT,
         assetId: YES_TOKEN,
         net: "10",
         affectedMarketIds: [MARKET_A],
@@ -159,6 +160,7 @@ describe("a fill matching no known allocation", () => {
         haltRequired: true,
       },
       {
+        accountRef: ACCOUNT,
         assetId: PUSD,
         net: "-4",
         affectedMarketIds: [MARKET_A],
@@ -175,7 +177,7 @@ describe("a fill matching no known allocation", () => {
     expect(unattributedRecords).toHaveLength(1);
 
     const folded = foldPnlRecords(
-      { scope: "UNATTRIBUTED", accountRef: ACCOUNT },
+      { scope: "UNATTRIBUTED", environment: "PAPER", accountRef: ACCOUNT },
       unattributedRecords,
     );
     expect(folded.ok).toBe(true);
@@ -186,7 +188,12 @@ describe("a fill matching no known allocation", () => {
 
     // And the strategy's stream refuses to absorb it.
     const misattributed = foldPnlRecords(
-      { scope: "VIRTUAL_STRATEGY", instanceId: INSTANCE_A },
+      {
+        scope: "VIRTUAL_STRATEGY",
+        environment: "PAPER",
+        accountRef: ACCOUNT,
+        instanceId: INSTANCE_A,
+      },
       unattributedRecords,
     );
     expect(misattributed.ok).toBe(false);

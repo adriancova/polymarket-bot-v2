@@ -21,11 +21,17 @@
 import type { PnlSnapshot } from "./snapshot.js";
 import type { OpenLot, PnlState } from "./state.js";
 
-/** Serialization domain prefix; changing the format is a versioned decision. */
-export const PNL_STATE_SERIALIZATION_DOMAIN = "polymarket-bot/pnl-state/v1";
+/**
+ * Serialization domain prefix; changing the format is a versioned decision.
+ *
+ * v2 (remediation round 1, 2026-09-02): a state now carries its full stream
+ * IDENTITY — scope, environment, account, instance, run, market — where v1
+ * carried only an owner. The bytes changed, so the version did.
+ */
+export const PNL_STATE_SERIALIZATION_DOMAIN = "polymarket-bot/pnl-state/v2";
 
-/** Serialization domain for snapshot rows. */
-export const PNL_SNAPSHOT_SERIALIZATION_DOMAIN = "polymarket-bot/pnl-snapshot/v1";
+/** Serialization domain for snapshot rows (v2 for the same reason). */
+export const PNL_SNAPSHOT_SERIALIZATION_DOMAIN = "polymarket-bot/pnl-snapshot/v2";
 
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") {
@@ -78,7 +84,7 @@ function lotsRecord(map: ReadonlyMap<string, OpenLot>): Readonly<Record<string, 
  */
 function realizedView(state: PnlState): Readonly<Record<string, unknown>> {
   return {
-    owner: state.owner,
+    identity: state.identity,
     lots: lotsRecord(state.lots),
     realizedTrading: sortedRecord(state.realizedTrading),
     feesPaid: sortedRecord(state.feesPaid),

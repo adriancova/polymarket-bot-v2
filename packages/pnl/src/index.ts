@@ -14,8 +14,10 @@
  * - **The rule the handoff states verbatim**: "Reward estimates are never
  *   booked as realized." A `REWARD_ESTIMATE` record has no settlement-evidence
  *   field to state, and folding one moves the estimate buckets and nothing
- *   else. Only a `REWARD_PAYOUT` — which REQUIRES the ledger transaction id of
- *   the observed payout — realizes a reward.
+ *   else. Only a `REWARD_PAYOUT` realizes a reward, and only against
+ *   `PnlSettlementEvidence` — the BOOKED ledger transaction, checked for the
+ *   right event type, environment, denomination, amount, and owner. An
+ *   identifier is not an observation (`evidence.ts`).
  * - **Fee and reward schedule versioning** (§9.16 "versioned per market where
  *   available"): every fee and reward carries its schedule/program version
  *   reference where the caller has one, and the snapshot reports the totals
@@ -25,8 +27,13 @@
  * PERSISTENCE BOUNDARY (recorded WP-200 decision): this is layer 1 — it owns
  * computation and typed records, never a connection. §10.5's `pnl_snapshots`
  * table is the persistence binding target; the composition root writes
- * `PnlSnapshot` rows through `packages/storage-postgres` (layer 2). Nothing
- * here imports it (dependency direction §2/F12).
+ * `toPnlSnapshotRow(snapshot)` through `packages/storage-postgres` (layer 2).
+ * Nothing here imports it (dependency direction §2/F12). Every identity that
+ * table requires — scope, environment, a NOT NULL account, and any instance,
+ * run, or market scoping — is carried by the STREAM (`PnlStreamIdentity`), so
+ * the binding is total and no field has to be invented by the caller
+ * (remediation round 1; pinned against the migration by the cross-package
+ * suite in `test/unit/ledger/`).
  *
  * DEPENDENCY DIRECTION (`docs/contracts/dependency-direction.md`): layer 1,
  * depending downward on `@polymarket-bot/domain`, `@polymarket-bot/decimal`,
@@ -66,8 +73,10 @@ export {
   PnlRewardPayoutRecordSchema,
   PnlRewardProgramSchema,
   PnlSettlementStateSchema,
+  PnlStreamIdentitySchema,
   PnlTradeRecordSchema,
   PnlTradeReversalRecordSchema,
+  pnlOwnerOf,
 } from "./records.js";
 export type {
   PnlCostBasisInjectionRecord,
@@ -77,9 +86,25 @@ export type {
   PnlRecord,
   PnlRewardEstimateRecord,
   PnlRewardPayoutRecord,
+  PnlStreamIdentity,
   PnlTradeRecord,
   PnlTradeReversalRecord,
 } from "./records.js";
+
+export {
+  PNL_EVIDENCE_ASSET_KINDS,
+  PNL_EVIDENCE_SCOPES,
+  PNL_REWARD_LEDGER_EVENTS,
+  PnlEvidenceEntrySchema,
+  PnlEvidenceTransactionSchema,
+  PnlSettlementEvidence,
+  verifyRewardPayoutEvidence,
+} from "./evidence.js";
+export type {
+  PnlEvidenceEntry,
+  PnlEvidenceTransaction,
+  RewardPayoutClaim,
+} from "./evidence.js";
 
 export {
   applyPnlRecord,
@@ -89,8 +114,13 @@ export {
 } from "./state.js";
 export type { OpenLot, PnlState } from "./state.js";
 
-export { PnlMarkSchema, PnlSnapshotInputSchema, computePnlSnapshot } from "./snapshot.js";
-export type { PnlSnapshot, PnlSnapshotInput } from "./snapshot.js";
+export {
+  PnlMarkSchema,
+  PnlSnapshotInputSchema,
+  computePnlSnapshot,
+  toPnlSnapshotRow,
+} from "./snapshot.js";
+export type { PnlSnapshot, PnlSnapshotInput, PnlSnapshotRow } from "./snapshot.js";
 
 export {
   PNL_SNAPSHOT_SERIALIZATION_DOMAIN,

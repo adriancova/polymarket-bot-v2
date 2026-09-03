@@ -17,23 +17,30 @@ import { computePnlSnapshot } from "./snapshot.js";
 import type { PnlSnapshot } from "./snapshot.js";
 import { foldPnlRecords } from "./state.js";
 import type { PnlState } from "./state.js";
+import type { PnlSettlementEvidence } from "./evidence.js";
 import {
-  INSTANCE_OWNER,
+  ACCOUNT,
+  ENVIRONMENT,
+  INSTANCE_A,
+  INSTANCE_STREAM,
   MARKET_A,
   NO_TOKEN,
   PUSD,
+  RUN_A,
   TIMESTAMP,
   USDC,
   YES_TOKEN,
   buy,
+  evidenceOf,
   fee,
   rewardEstimate,
   rewardPayout,
+  rewardPayoutEvidence,
   sell,
 } from "./testing/samples.js";
 
-function fold(records: readonly unknown[]): PnlState {
-  const result = foldPnlRecords(INSTANCE_OWNER, records);
+function fold(records: readonly unknown[], evidence?: PnlSettlementEvidence): PnlState {
+  const result = foldPnlRecords(INSTANCE_STREAM, records, evidence);
   if (!result.ok) {
     throw new Error(`fold refused: ${JSON.stringify(result.refusals)}`);
   }
@@ -111,9 +118,34 @@ describe("the §9.16 measures", () => {
     expect(withReservation.capitalCommitted).toBe("12.4");
   });
 
-  it("carries the owner and the caller-supplied asOf", () => {
-    expect(row.owner).toEqual(INSTANCE_OWNER);
+  it("carries the whole persistence identity and the caller-supplied asOf", () => {
+    // The `accounting.pnl_snapshots` identity columns, on the row itself:
+    // scope, environment, and a NOT NULL account_ref, plus the optional
+    // instance/run/market scoping. A row missing any of them could not be
+    // written (remediation round 1).
+    expect(row.scope).toBe("VIRTUAL_STRATEGY");
+    expect(row.environment).toBe(ENVIRONMENT);
+    expect(row.accountRef).toBe(ACCOUNT);
+    expect(row.instanceId).toBe(INSTANCE_A);
+    expect(row.runId).toBeNull();
+    expect(row.marketId).toBeNull();
     expect(row.asOf).toBe(TIMESTAMP);
+  });
+
+  it("reports the run and market scoping a stream states", () => {
+    const scoped = foldPnlRecords(
+      { ...INSTANCE_STREAM, runId: RUN_A, marketId: MARKET_A },
+      [buy(1, "10", "0.4")],
+    );
+    expect(scoped.ok).toBe(true);
+    if (!scoped.ok) {
+      return;
+    }
+    const rows = snapshots(scoped.value, {
+      asOf: TIMESTAMP,
+      marks: { [YES_TOKEN]: { midpoint: "0.5" } },
+    });
+    expect(rows[0]).toMatchObject({ runId: RUN_A, marketId: MARKET_A });
   });
 });
 
@@ -231,10 +263,10 @@ describe("denominations are reported separately, never summed", () => {
   });
 
   it("scopes the per-program breakdowns to the row's own denomination", () => {
-    const state = fold([
-      rewardPayout(1, "3"),
-      { ...rewardEstimate(2, "9"), denominationAsset: USDC },
-    ]);
+    const state = fold(
+      [rewardPayout(1, "3"), { ...rewardEstimate(2, "9"), denominationAsset: USDC }],
+      evidenceOf([rewardPayoutEvidence(1, "3")]),
+    );
     const rows = snapshots(state, { asOf: TIMESTAMP, marks: {} });
     const pusd = rows.find((row) => row.denominationAsset === PUSD)!;
     const usdc = rows.find((row) => row.denominationAsset === USDC)!;

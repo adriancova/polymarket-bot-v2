@@ -17,6 +17,7 @@ import type { PnlState } from "./state.js";
 import {
   ACCOUNT_OWNER,
   INSTANCE_OWNER,
+  INSTANCE_STREAM,
   MARKET_A,
   NO_TOKEN,
   PUSD,
@@ -29,8 +30,8 @@ import {
   sell,
 } from "./testing/samples.js";
 
-function fold(records: readonly unknown[], owner = INSTANCE_OWNER): PnlState {
-  const result = foldPnlRecords(owner, records);
+function fold(records: readonly unknown[], stream = INSTANCE_STREAM): PnlState {
+  const result = foldPnlRecords(stream, records);
   if (!result.ok) {
     throw new Error(`fold refused: ${JSON.stringify(result.refusals)}`);
   }
@@ -48,7 +49,7 @@ describe("emptyPnlState", () => {
   });
 
   it("starts with nothing realized and nothing open", () => {
-    const state = emptyPnlState(INSTANCE_OWNER);
+    const state = emptyPnlState(INSTANCE_STREAM);
     expect(state.recordCount).toBe(0);
     expect(state.lots.size).toBe(0);
     expect(state.realizedTrading.size).toBe(0);
@@ -107,7 +108,7 @@ describe("average-cost lots", () => {
 
 describe("realized recognition and its refusals", () => {
   it("refuses a sell with no inventory (venue report §10.2)", () => {
-    expect(codesOf(emptyPnlState(INSTANCE_OWNER), sell(1, "1", "0.5"))).toEqual(["PNL_OVERSELL"]);
+    expect(codesOf(emptyPnlState(INSTANCE_STREAM), sell(1, "1", "0.5"))).toEqual(["PNL_OVERSELL"]);
   });
 
   it("refuses a sell larger than the position, naming both quantities", () => {
@@ -139,14 +140,14 @@ describe("realized recognition and its refusals", () => {
 
   it("refuses a trade already marked FAILED: a failure is a reversal, not a recognition", () => {
     expect(
-      codesOf(emptyPnlState(INSTANCE_OWNER), { ...buy(1, "1", "0.5"), settlementState: "FAILED" }),
+      codesOf(emptyPnlState(INSTANCE_STREAM), { ...buy(1, "1", "0.5"), settlementState: "FAILED" }),
     ).toEqual(["PNL_SETTLEMENT_FAILED_TRADE"]);
   });
 
   it("accepts a trade in any non-FAILED settlement state", () => {
     for (const settlementState of ["MATCHED", "MINED", "CONFIRMED", "RETRYING"]) {
       expect(
-        applyPnlRecord(emptyPnlState(INSTANCE_OWNER), { ...buy(1, "1", "0.5"), settlementState }).ok,
+        applyPnlRecord(emptyPnlState(INSTANCE_STREAM), { ...buy(1, "1", "0.5"), settlementState }).ok,
       ).toBe(true);
     }
   });
@@ -181,7 +182,7 @@ describe("denominations never interchange (ADR-006 §7, C-2 unresolved)", () => 
 
 describe("stream discipline", () => {
   it("refuses a record belonging to a different owner", () => {
-    expect(codesOf(emptyPnlState(INSTANCE_OWNER), buy(1, "1", "0.5", ACCOUNT_OWNER))).toEqual([
+    expect(codesOf(emptyPnlState(INSTANCE_STREAM), buy(1, "1", "0.5", ACCOUNT_OWNER))).toEqual([
       "PNL_OWNER_MISMATCH",
     ]);
   });
@@ -193,7 +194,7 @@ describe("stream discipline", () => {
 
   it("refuses a non-canonical UUID ref, carrying the raw value (ADR-016 §2)", () => {
     const upper = ref(1).toUpperCase();
-    const result = applyPnlRecord(emptyPnlState(INSTANCE_OWNER), {
+    const result = applyPnlRecord(emptyPnlState(INSTANCE_STREAM), {
       ...buy(1, "1", "0.5"),
       ref: upper,
     });
@@ -207,7 +208,7 @@ describe("stream discipline", () => {
 
   it("refuses a numeric amount: no economic value passes through a JS number", () => {
     expect(
-      codesOf(emptyPnlState(INSTANCE_OWNER), { ...buy(1, "1", "0.5"), shares: 1 }),
+      codesOf(emptyPnlState(INSTANCE_STREAM), { ...buy(1, "1", "0.5"), shares: 1 }),
     ).toEqual(["PNL_INPUT_INVALID"]);
   });
 
@@ -241,7 +242,7 @@ describe("compensating reversals (ADR-006 §5.2)", () => {
   });
 
   it("refuses a reversal of a trade this stream never folded", () => {
-    expect(codesOf(emptyPnlState(INSTANCE_OWNER), reversal(2, ref(1)))).toEqual([
+    expect(codesOf(emptyPnlState(INSTANCE_STREAM), reversal(2, ref(1)))).toEqual([
       "PNL_REVERSAL_UNKNOWN",
     ]);
   });
@@ -288,7 +289,7 @@ describe("acceptance 2 for the PnL fold: rebuild equals incremental", () => {
   ];
 
   it("is byte-equal between a step-by-step fold and a from-zero rebuild", () => {
-    let incremental = emptyPnlState(INSTANCE_OWNER);
+    let incremental = emptyPnlState(INSTANCE_STREAM);
     for (const record of HISTORY) {
       const result = applyPnlRecord(incremental, record);
       if (!result.ok) {
@@ -316,7 +317,7 @@ describe("acceptance 2 for the PnL fold: rebuild equals incremental", () => {
   it("refuses the rebuild outright when the drop breaks an invariant", () => {
     // Dropping BOTH buys leaves no inventory for the sell: the fold refuses
     // and names the offending index rather than inventing a short position.
-    const result = foldPnlRecords(INSTANCE_OWNER, HISTORY.slice(2));
+    const result = foldPnlRecords(INSTANCE_STREAM, HISTORY.slice(2));
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;

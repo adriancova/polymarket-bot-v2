@@ -336,11 +336,14 @@ describe("acceptance 4: unattributed activity is an explicit, visible scope", ()
     expect(projection.unattributedActivity).toHaveLength(4);
   });
 
-  it("summarizes net exposure per asset, with the halt triggers counted", () => {
+  it("summarizes net exposure per (account, asset), with the halt triggers counted", () => {
     // 100 arrived unexplained, 100 was attributed away, 25 left unexplained:
-    // net -25, matching the UNATTRIBUTED balance line exactly.
+    // net -25, matching the UNATTRIBUTED balance line exactly. The line names
+    // the ACCOUNT whose balance is exposed: an exposure summed across accounts
+    // describes no account (remediation round 1).
     expect(unattributedExposure(projection)).toEqual([
       {
+        accountRef: ACCOUNT,
         assetId: PUSD,
         net: "-25",
         affectedMarketIds: [MARKET_A],
@@ -350,7 +353,7 @@ describe("acceptance 4: unattributed activity is an explicit, visible scope", ()
     ]);
   });
 
-  it("still reports an asset whose unattributed exposure has netted to zero", () => {
+  it("still reports a bucket whose unattributed exposure has netted to zero", () => {
     // 10 arrives unattributed, then all 10 is attributed to an instance. Net
     // is zero; "nothing unexplained ever happened" is still false.
     const ledger = seededLedger([
@@ -359,6 +362,7 @@ describe("acceptance 4: unattributed activity is an explicit, visible scope", ()
     ]);
     expect(unattributedExposure(projectLedger(ledger))).toEqual([
       {
+        accountRef: ACCOUNT,
         assetId: PUSD,
         net: "0",
         affectedMarketIds: [],
@@ -403,8 +407,10 @@ describe("serializeProjection", () => {
   });
 
   it("carries a versioned domain prefix", () => {
+    // v2 since remediation round 1: the map keys became JSON composites, so
+    // the sorted key order — and the bytes — changed. The CONTENT did not.
     expect(serializeProjection(emptyProjection())).toContain(
-      "polymarket-bot/ledger-projection/v1",
+      "polymarket-bot/ledger-projection/v2",
     );
   });
 });

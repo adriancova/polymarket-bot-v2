@@ -4,12 +4,14 @@
  * TEST-ONLY SUPPORT MODULE. Deliberately not re-exported from `src/index.ts`.
  */
 
-import type { PnlOwner } from "../records.js";
+import { PnlSettlementEvidence } from "../evidence.js";
+import type { PnlOwner, PnlStreamIdentity } from "../records.js";
 
 export const ACCOUNT = "acct-paper-1";
 export const INSTANCE_A = "018f3a5c-2222-7000-8000-00000000000a";
 export const INSTANCE_B = "018f3a5c-2222-7000-8000-00000000000b";
 export const MARKET_A = "018f3a5c-1111-7000-8000-000000000001";
+export const RUN_A = "018f3a5c-3333-7000-8000-00000000000a";
 
 /** pUSD and USDC are two DIFFERENT assets — ADR-006 §7, C-2 unresolved. */
 export const PUSD = "pUSD";
@@ -24,8 +26,33 @@ export const TIMESTAMP = "2026-09-02T12:00:00.000Z";
 export const PERIOD_START = "2026-09-01T00:00:00.000Z";
 export const PERIOD_END = "2026-09-02T00:00:00.000Z";
 
-export const INSTANCE_OWNER: PnlOwner = { scope: "VIRTUAL_STRATEGY", instanceId: INSTANCE_A };
+export const ENVIRONMENT = "PAPER";
+
+export const INSTANCE_OWNER: PnlOwner = {
+  scope: "VIRTUAL_STRATEGY",
+  accountRef: ACCOUNT,
+  instanceId: INSTANCE_A,
+};
 export const ACCOUNT_OWNER: PnlOwner = { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT };
+export const UNATTRIBUTED_OWNER: PnlOwner = { scope: "UNATTRIBUTED", accountRef: ACCOUNT };
+
+/** The stream identities those owners fold in — the `pnl_snapshots` identity. */
+export const INSTANCE_STREAM: PnlStreamIdentity = {
+  scope: "VIRTUAL_STRATEGY",
+  environment: ENVIRONMENT,
+  accountRef: ACCOUNT,
+  instanceId: INSTANCE_A,
+};
+export const ACCOUNT_STREAM: PnlStreamIdentity = {
+  scope: "ACTUAL_ACCOUNT",
+  environment: ENVIRONMENT,
+  accountRef: ACCOUNT,
+};
+export const UNATTRIBUTED_STREAM: PnlStreamIdentity = {
+  scope: "UNATTRIBUTED",
+  environment: ENVIRONMENT,
+  accountRef: ACCOUNT,
+};
 
 /** Deterministic record refs, all canonical lowercase UUIDv7. */
 export function ref(n: number): string {
@@ -98,6 +125,80 @@ export function rewardPayout(
   };
 }
 
+export const REWARD_INCOME_ACCOUNT = "income-rewards";
+export const ATTRIBUTION_CLEARING = "clearing-attribution";
+
+/**
+ * The ledger transaction that BOOKS `rewardPayout(n, amount, owner)` — the
+ * settlement evidence a payout must be proven against (ADR-006 §6).
+ *
+ * Shaped exactly as `@polymarket-bot/ledger` would append it: balanced per
+ * asset, and attributed within the owner's own `(accountRef, assetId)` bucket
+ * so the ledger's parity check passes. A reward that no strategy claimed is
+ * attributed to `UNATTRIBUTED`, which is what ADR-006's consequence list says
+ * happens ("a daily reward payout that arrives before its schedule is modeled
+ * … will halt a market").
+ */
+export function rewardPayoutEvidence(
+  n: number,
+  amount: string,
+  owner: PnlOwner = INSTANCE_OWNER,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const mirror =
+    owner.scope === "VIRTUAL_STRATEGY"
+      ? {
+          scope: "VIRTUAL_STRATEGY",
+          accountRef: owner.accountRef,
+          assetId: PUSD,
+          assetKind: "COLLATERAL",
+          amount,
+          instanceId: owner.instanceId,
+        }
+      : {
+          // No strategy claimed it, so the attribution side is UNATTRIBUTED —
+          // which also satisfies an UNATTRIBUTED-owner stream's own bucket.
+          scope: "UNATTRIBUTED",
+          accountRef: owner.accountRef,
+          assetId: PUSD,
+          assetKind: "COLLATERAL",
+          amount,
+        };
+  return {
+    ledgerTransactionId: ledgerTx(n),
+    eventType: "LIQUIDITY_REWARD",
+    environment: ENVIRONMENT,
+    accountRef: owner.accountRef,
+    source: "internal",
+    occurredAt: TIMESTAMP,
+    entries: [
+      {
+        scope: "ACTUAL_ACCOUNT",
+        accountRef: owner.accountRef,
+        assetId: PUSD,
+        assetKind: "COLLATERAL",
+        amount,
+      },
+      {
+        scope: "REWARD_INCOME",
+        accountRef: REWARD_INCOME_ACCOUNT,
+        assetId: PUSD,
+        assetKind: "COLLATERAL",
+        amount: `-${amount}`,
+      },
+      mirror,
+      {
+        scope: "EXTERNAL_CLEARING",
+        accountRef: ATTRIBUTION_CLEARING,
+        assetId: PUSD,
+        assetKind: "COLLATERAL",
+        amount: `-${amount}`,
+      },
+    ],
+    ...overrides,
+  };
+}
+
 /** A reward ESTIMATE: analytics, never money. */
 export function rewardEstimate(
   n: number,
@@ -116,6 +217,15 @@ export function rewardEstimate(
     periodEnd: PERIOD_END,
     computedAt: TIMESTAMP,
   };
+}
+
+/** Builds settlement evidence, throwing if a fixture is malformed. */
+export function evidenceOf(transactions: readonly unknown[]): PnlSettlementEvidence {
+  const result = PnlSettlementEvidence.from(transactions);
+  if (!result.ok) {
+    throw new Error(`evidence refused: ${JSON.stringify(result.refusals)}`);
+  }
+  return result.value;
 }
 
 export function realization(

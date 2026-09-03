@@ -24,19 +24,33 @@ import { applyPnlRecord, emptyPnlState, foldPnlRecords } from "./state.js";
 import type { PnlState } from "./state.js";
 import {
   INSTANCE_OWNER,
+  INSTANCE_STREAM,
   PUSD,
   TIMESTAMP,
   buy,
+  evidenceOf,
   fee,
   ledgerTx,
   ref,
   rewardEstimate,
   rewardPayout,
+  rewardPayoutEvidence,
   sell,
 } from "./testing/samples.js";
 
+/**
+ * The bookings the payouts in this suite are proven against (ADR-006 §6). A
+ * payout with no matching booking does not realize — that boundary has its own
+ * suite in `reward-evidence.test.ts`; here it is simply supplied, so these
+ * tests stay about the estimate-versus-realized rule.
+ */
+const EVIDENCE = evidenceOf([
+  rewardPayoutEvidence(2, "3"),
+  rewardPayoutEvidence(4, "5"),
+]);
+
 function fold(records: readonly unknown[]): PnlState {
-  const result = foldPnlRecords(INSTANCE_OWNER, records);
+  const result = foldPnlRecords(INSTANCE_STREAM, records, EVIDENCE);
   if (!result.ok) {
     throw new Error(`fold refused: ${JSON.stringify(result.refusals)}`);
   }
@@ -188,7 +202,7 @@ describe("the rule is enforced by the schema, not only by the handler", () => {
     const smuggled = { ...rewardEstimate(1, "5"), ledgerTransactionId: ledgerTx(1) };
     expect(PnlRewardEstimateRecordSchema.safeParse(smuggled).success).toBe(false);
 
-    const result = applyPnlRecord(emptyPnlState(INSTANCE_OWNER), smuggled);
+    const result = applyPnlRecord(emptyPnlState(INSTANCE_STREAM), smuggled);
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;
@@ -206,7 +220,7 @@ describe("the rule is enforced by the schema, not only by the handler", () => {
       denominationAsset: PUSD,
     };
     expect(PnlRewardPayoutRecordSchema.safeParse(unevidenced).success).toBe(false);
-    expect(applyPnlRecord(emptyPnlState(INSTANCE_OWNER), unevidenced).ok).toBe(false);
+    expect(applyPnlRecord(emptyPnlState(INSTANCE_STREAM), unevidenced).ok).toBe(false);
   });
 
   it("requires an estimate to state its methodology and period", () => {
