@@ -15,7 +15,9 @@ buildExecutionPlan(record, inputs): PlannerResult<ExecutionPlan>
 ```
 
 - `record` — an `ApprovedIntentRecord` exactly as `packages/risk` emits it
-  (consumed **structurally**; no same-layer edge exists — see §5).
+  (consumed **structurally**, by shape: this package imports no risk *type* and
+  no risk *logic*. The §2.1 **S4** edge added 2026-09-04 carries the parse door
+  and nothing else — see §5).
 - `inputs` — this package's `PlanningInputs` document (see `src/inputs.ts`).
 
 Both are `unknown` at runtime. The answer is always a typed result; an
@@ -111,14 +113,27 @@ travels with the edge — **no rule, policy, or evaluation logic may cross it**;
 this package's leg selection, tick conformance, slicing, hysteresis and
 escalation policy are its own. `test/unit/execution-planner/mirrors.test.ts` is
 now the DELETION guard: it fails if either module's body reappears in any
-package outside `packages/risk`. This package still declares **no `zod`
-dependency** at all: it calls `.safeParse` only on schema objects the domain
-package exports, through the arena that `packages/risk` owns.
+package outside `packages/risk`.
+
+**The S4 edge brings no `zod` with it — measured, not assumed.** This package
+declares no `zod` dependency, and it acquires none transitively: neither door
+module imports the library (`schema-arena.ts` describes its node shapes
+*structurally*, so that it imports nothing), and pnpm's strict layout links no
+`zod` under this package, so `import { z } from "zod"` in `src/` fails to
+resolve — `TS2307`, probed with the S4 edge declared. `.safeParse` is called
+only on schema objects `packages/domain` exports, through the arena
+`packages/risk` owns. *(Recorded 2026-09-04 in `WP-180-FU2` remediation round 1:
+the collapse candidate's handoff had listed transitive `zod` reachability as an
+open risk, and the review measured it away.)*
 
 **Structural ports.** `ApprovedIntentRecord` (in) and the allocator's
 `ReservationRequest` (out) are consumed/emitted by shape;
 `test/unit/execution-planner/ports.test.ts` pins both against the real
-packages at compile time and runtime, and asserts no workspace edge exists.
+packages at compile time and runtime. *(Corrected 2026-09-04: that sentence used
+to end "and asserts no workspace edge exists", which `GOV-2A`'s S3/S4 ruling
+overturned in this same collapse — the suite now asserts that the door edge
+EXISTS, runs only into `packages/risk`, and carries only the two door subpaths
+at any depth of `src`.)*
 
 **Consuming a plan**: like risk's emitted records (see
 `packages/risk/README.md` §6.1), a sealed plan is a deeply frozen tree with

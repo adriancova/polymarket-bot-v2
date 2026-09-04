@@ -9,10 +9,6 @@
  * from the test tree so the package cannot drift under it silently).
  */
 
-import { readFileSync, readdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-
 import { describe, expect, it } from "vitest";
 
 import { buildExecutionPlan } from "../../../packages/execution-planner/src/index.js";
@@ -22,11 +18,7 @@ import {
   approvedPosition,
   planningInputs,
 } from "./fixtures.js";
-
-const packageSrc = resolve(
-  dirname(fileURLToPath(import.meta.url)),
-  "../../../packages/execution-planner/src",
-);
+import { packageSourceFiles, readSource } from "./source-scan.js";
 
 describe("determinism (§12.4 by analogy)", () => {
   it("builds byte-identical plans from independently built equal fixtures", () => {
@@ -63,12 +55,22 @@ describe("purity — the impure primitives do not appear in the package source",
   function stripComments(text: string): string {
     return text.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/\/\/[^\n]*/gu, "");
   }
-  const sources = readdirSync(packageSrc)
-    .filter((name) => name.endsWith(".ts"))
-    .map((name) => ({ name, text: stripComments(readFileSync(join(packageSrc, name), "utf8")) }));
+  // RECURSIVE (review round 1, finding M7). This enumeration used to be
+  // `readdirSync(src)`, one level deep; a `src/nested/sneak.ts` importing the
+  // risk ENGINE — which the §2.1 S4 ruling forbids crossing the edge, and which
+  // the mirror collapse made resolvable — was invisible to it and to the two
+  // ports suites at the same time.
+  const sources = packageSourceFiles("packages/execution-planner").map((name) => ({
+    name,
+    text: stripComments(readSource(name)),
+  }));
 
   it("scans a non-empty source tree (the pin cannot pass vacuously)", () => {
     expect(sources.length).toBeGreaterThan(10);
+    // Every file the walker returns is under this package's `src`, at any depth.
+    for (const source of sources) {
+      expect(source.name.startsWith("packages/execution-planner/src/")).toBe(true);
+    }
   });
 
   it("never reads a clock or entropy and never performs I/O", () => {
@@ -98,9 +100,17 @@ describe("purity — the impure primitives do not appear in the package source",
     // mirrored parse door into `packages/risk`. They are enumerated one by one,
     // not admitted by prefix: the package ROOT (`@polymarket-bot/risk`) exports
     // the risk ENGINE, and the ruling forbids rule, policy or evaluation logic
-    // travelling this edge. `zod` is still absent from this package's source —
-    // it now reaches the pinned library only through the arena that
-    // `packages/risk` owns and declares.
+    // travelling this edge.
+    //
+    // AND THE EDGE CARRIES NO `zod`, MEASURED (review round 1 NOTE; the first
+    // candidate's handoff carried the opposite worry as a known risk). It is
+    // false three ways: neither door module imports `zod` at all —
+    // `schema-arena.ts` describes the library's node shapes STRUCTURALLY,
+    // precisely so that it imports nothing; pnpm's strict layout links no `zod`
+    // under this package, so `import { z } from "zod"` in this package's `src`
+    // fails to resolve even WITH the S4 edge declared (probed at the
+    // remediation tip: TS2307, not a lint opinion); and the allowlist below
+    // keeps it that way.
     const allowed = new Set([
       "@polymarket-bot/decimal",
       "@polymarket-bot/domain",

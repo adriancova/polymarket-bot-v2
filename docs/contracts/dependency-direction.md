@@ -189,11 +189,46 @@ and its own rule was applied: `WP-180-FU2` moved the rows and the pinned
 assertion in the **same change**, which is this one. The graph the check now
 reports is **34 packages / 43 edges** — the 41 of 2026-09-04 plus S3 and S4.
 
-**Executed 2026-09-04 by `WP-180-FU2`** (`allowed_paths`:
-`packages/risk/**`, `packages/{capital-allocator,execution-planner}/**`,
-`test/unit/{risk,capital-allocator,execution-planner}/**`,
-`test/unit/tooling/dependency-direction.test.ts`, `pnpm-lock.yaml`'s two
-importer blocks, and this document). What landed, in one change: the two modules
+**The grant, as `GOV-2A` wrote it on 2026-09-04.** Quoted, not paraphrased: a
+recorded grant is the evidence of what was authorised, and editing it to match
+what was later done destroys the only record a reader could check the work
+against.
+
+> **Owner: a bounded `WP-180-FU2` / mirror-collapse package**, with
+> `allowed_paths` covering `packages/risk/src/{plain-data,schema-arena}.ts`,
+> `packages/{capital-allocator,execution-planner}/**`,
+> `test/unit/{risk,capital-allocator,execution-planner}/**`,
+> `test/unit/tooling/dependency-direction.test.ts`, and this document.
+> Migration path, in one change: move the two modules into `packages/risk`'s
+> `exports` map; delete both copies; add the `workspace:*` dependency to each
+> consumer; move S3/S4 into the table above; update the pinned allowlist
+> assertion; keep `mirrors.test.ts` as a *deletion* guard (it must fail if a
+> fourth copy appears) or retire it with its reason recorded.
+
+**CORRECTION — 2026-09-04, `WP-180-FU2` remediation round 1 (review finding
+MEDIUM-2).** Two paths were written that the quoted list does not name:
+
+- **`packages/risk/package.json`.** The grant listed only
+  `packages/risk/src/{plain-data,schema-arena}.ts`, but its own migration
+  instruction is "move the two modules into `packages/risk`'s `exports` map",
+  and the `exports` map lives in the manifest. The instruction cannot be carried
+  out inside the paths the same paragraph lists.
+- **`pnpm-lock.yaml`, the two importer blocks only.** "Add the `workspace:*`
+  dependency to each consumer" cannot be done without it: a workspace dependency
+  that is not in the lockfile fails `pnpm install --frozen-lockfile`, which is a
+  gate on every merge here.
+
+**The orchestrator ruled both within the INTENDED authorization** — a `GOV-2A`
+drafting error, not implementer overreach — and **ratified them** in
+`WP-180-FU2` remediation round 1. The effective `allowed_paths` are therefore
+the quoted list **plus** those two entries, and nothing else was written.
+
+This note exists because the first `WP-180-FU2` candidate (`823209a`) instead
+**rewrote** the quoted paragraph into a list matching what it had touched, with
+no disclosure that the recorded grant had changed. That rewrite is undone above.
+A grant that silently grows to fit the diff cannot be used to audit the diff.
+
+**Executed 2026-09-04 by `WP-180-FU2`.** What landed, in one change: the two modules
 are exported from `packages/risk`'s `exports` map as `./plain-data` and
 `./schema-arena` and nothing else was added to that map; both copies are
 **deleted**; each consumer declares `@polymarket-bot/risk: workspace:*`; S3/S4
@@ -224,7 +259,13 @@ rather than left to a handoff, because a reader who finds them later is entitled
 to know they were anticipated:
 
 - `test/unit/execution-planner/mirrors.test.ts` — drift guard → deletion guard
-  (the ruling's own instruction);
+  (the ruling's own instruction). Its copy fingerprint was **strengthened
+  2026-09-04** (remediation round 1, review finding LOW-1): the first candidate
+  required ALL of three declaration lines per module, so a full pasted copy with
+  the single identifier `describeValue` renamed evaded it entirely. It now
+  reports a file that matches **at least four of twelve** distinctive body
+  lines, compared whitespace-insensitively, and the test states its measured
+  evasion bar rather than claiming one;
 - `test/unit/risk/public-surface.test.ts` — the four round-6 drift tests
   retired, with their reason recorded in place; their subject is deleted;
 - `test/unit/risk/freshness.test.ts` — the `node:util` site census is an
@@ -242,6 +283,20 @@ to know they were anticipated:
   all;
 - `test/unit/execution-planner/determinism.test.ts` — its import allowlist gains
   the two door subpaths, enumerated one by one rather than by prefix;
+- `test/unit/execution-planner/source-scan.ts` *(added 2026-09-04, remediation
+  round 1, review finding MEDIUM-1)* — the one recursive source walker the four
+  guards above now share. **Why the two preceding claims needed it**: at the
+  first candidate (`823209a`) those scans enumerated `<package>/src` ONE LEVEL
+  DEEP, so "a bare `@polymarket-bot/risk` import of the engine now FAILS" held
+  only for a top-level file. A file at
+  `packages/execution-planner/src/nested/sneak.ts` importing `parseRiskPolicy`
+  from the package root passed all four guards, `pnpm check:deps` (34/43),
+  `pnpm typecheck` and `pnpm lint` — reachability that the collapse itself
+  created, because before it the same file failed to compile (TS2307, dependency
+  undeclared). Measured both ways at `823209a` and at the remediation tip, with
+  a second probe two directories deep and a third importing a NON-door subpath.
+  The claims above are true at any depth now, and there is one scan idiom rather
+  than three so they cannot drift apart again;
 - `test/unit/risk/schema-arena.test.ts` — the allocator-arena binding is now an
   alias of the canonical one; every differential assertion over the allocator's
   three door schemas, including the `AGENTS.md` live-micro fence, is unchanged.
@@ -299,21 +354,32 @@ The distinction is per **binding**, not per module, and the table names bindings
 | --- | --- | --- | --- | --- | --- |
 | `packages/domain` | 0 | *(none)* | — | F2: not even a built-in. Unchanged by this ruling | `domain.md` §2 |
 | `packages/decimal` | 0 | `node:crypto` | `createHash` | F15's existing allowlist, restated here for one table | `domain.md` §1, F15 |
-| `packages/risk` | 1 | `node:util` | `types.isProxy` | `src/plain-data.ts:157`. A pure-JS proxy probe *runs a trap*, i.e. executes caller code inside the door that exists to stop caller code running (`plain-data.ts:78-83`) | `WP-180` R6-1 |
-| `packages/capital-allocator` | 1 | `node:util` | `types.isProxy` | `src/plain-data.ts:27`. Same mirrored module, same reason | `WP-180` R6-1 |
-| `packages/execution-planner` | 1 | `node:util` | `types.isProxy` | `src/plain-data.ts:25` (mirror) **and** `src/pluck.ts:28,58` (the §6 invariant 13 minimal-read cancel path) | `WP-190` R1-N2 |
+| `packages/risk` | 1 | `node:util` | `types.isProxy` | `src/plain-data.ts:171` (used at `:201`). A pure-JS proxy probe *runs a trap*, i.e. executes caller code inside the door that exists to stop caller code running (`plain-data.ts:92-97`) | `WP-180` R6-1 |
+| `packages/execution-planner` | 1 | `node:util` | `types.isProxy` | `src/pluck.ts:28` (used at `:58`) — the §6 invariant 13 minimal-read cancel path | `WP-190` R1-N2 |
 | `packages/features` | 1 | `node:crypto` | `createHash` | `src/hash.ts:14`. Content addressing needs SHA-256; a hand-rolled FIPS 180-4 implementation in production code is a correctness liability, and `WP-160`'s review used exactly that as an independent *oracle* rather than as the shipped path | `WP-160` R1-N1 |
 
 **The table is exhaustive for the layer-0 and layer-1 PRODUCTION import
 surface**, and a package outside it importing any built-in *in a production
-source file* is a violation (F17). Verified mechanically at `main` `2d7e7da`: a
-census of every non-test `node:` import under `packages/` and `apps/` returns
-exactly these five files below layer 2 — `packages/{risk,capital-allocator}/src/plain-data.ts`,
-`packages/execution-planner/src/{plain-data,pluck}.ts`,
+source file* is a violation (F17). Verified mechanically at `main` `2d7e7da`,
+and **re-run 2026-09-04 after the mirror collapse** (`WP-180-FU2` remediation
+round 1): a census of every non-test `node:` import under `packages/` and
+`apps/` returns exactly these **three** files below layer 2 —
+`packages/risk/src/plain-data.ts`, `packages/execution-planner/src/pluck.ts`,
 `packages/features/src/hash.ts` — plus `packages/decimal`'s existing one. Every
 other `node:` import in the workspace is in a layer-2 package
 (`event-bus`, `storage-wal`, `storage-postgres`, `storage-parquet`) or a layer-3
 app (`data-gateway`, `ops-cli`, `research-worker`).
+
+*(Was five at `2d7e7da`. The collapse deleted the two mirrored
+`src/plain-data.ts` copies, so `packages/capital-allocator` now imports **no**
+Node built-in in production source at all and its row is REMOVED — an allowlist
+row for a package that imports nothing over-permits, and this table is the
+permission. `packages/execution-planner`'s row loses its `src/plain-data.ts`
+citation and keeps `src/pluck.ts`, which is its own non-mirror file. Row removal
+and re-citation both happen here, in the same change as the deletion that made
+them true; the row and the fact may not drift apart. Corrected 2026-09-04 in
+`WP-180-FU2` remediation round 1, review finding LOW-2 — the original candidate
+left the over-permitting row and the two stale line citations standing.)*
 
 **Test files are outside this table, and that scope is stated rather than
 implied** *(qualified 2026-09-04 in `GOV-2A`'s round-1 review remediation; the

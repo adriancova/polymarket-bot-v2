@@ -21,9 +21,8 @@
  *    rests on.
  */
 
-import { readFileSync, readdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -48,8 +47,7 @@ import {
   marketInput,
   planningInputs,
 } from "./fixtures.js";
-
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+import { packageSourceFiles, readSource, repoRoot } from "./source-scan.js";
 
 // --- 1. compile-time pins ---------------------------------------------------
 
@@ -248,35 +246,44 @@ describe("independence — the only workspace edges are the cited §2.1 door edg
     ]);
   });
 
+  /**
+   * The scan is `source-scan.ts`'s RECURSIVE walker (review round 1, finding
+   * M7). It used to be `readdirSync(src)`, one level deep, and a file at
+   * `packages/execution-planner/src/nested/sneak.ts` importing the risk ENGINE
+   * from the package root passed this test, `determinism.test.ts`,
+   * `check:deps`, `typecheck` and `lint` — the collapse is what made that
+   * import RESOLVE, so the depth of this scan is now load-bearing.
+   */
   it("the S4 edge carries the parse door and NOTHING ELSE — not the package root", () => {
-    const directory = resolve(repoRoot, "packages/execution-planner/src");
+    const files = packageSourceFiles("packages/execution-planner");
     const specifiers: string[] = [];
-    for (const entry of readdirSync(directory)) {
-      if (!entry.endsWith(".ts")) continue;
-      const text = readFileSync(resolve(directory, entry), "utf8");
-      for (const match of text.matchAll(/(?:from|import\()\s*"(@polymarket-bot\/risk[^"]*)"/gu)) {
+    for (const file of files) {
+      for (const match of readSource(file).matchAll(
+        /(?:from|import\()\s*"(@polymarket-bot\/risk[^"]*)"/gu,
+      )) {
         specifiers.push(match[1] ?? "");
       }
     }
-    // Non-vacuity: the planner really does consume the door.
+    // Non-vacuity: the scan found the tree, and the planner really does consume
+    // the door.
+    expect(files.length).toBeGreaterThan(10);
     expect(specifiers.length).toBeGreaterThan(0);
     expect([...new Set(specifiers)].sort()).toEqual(DOOR_SUBPATHS);
   });
 
   it("the record and reservation ports stay STRUCTURAL: no import of the engine or the allocator", () => {
-    const directory = resolve(repoRoot, "packages/execution-planner/src");
-    for (const entry of readdirSync(directory)) {
-      if (!entry.endsWith(".ts")) continue;
-      const text = readFileSync(resolve(directory, entry), "utf8");
-      for (const match of text.matchAll(/(?:from|import\()\s*"([^"]+)"/gu)) {
+    const files = packageSourceFiles("packages/execution-planner");
+    expect(files.length).toBeGreaterThan(10);
+    for (const file of files) {
+      for (const match of readSource(file).matchAll(/(?:from|import\()\s*"([^"]+)"/gu)) {
         const specifier = match[1] ?? "";
-        expect(specifier, `${entry} imports the allocator`).not.toMatch(
+        expect(specifier, `${file} imports the allocator`).not.toMatch(
           /^@polymarket-bot\/capital-allocator(?:\/|$)/u,
         );
         // The package ROOT of `packages/risk` is where the engine, the policy
         // and the recommendations live. Only the door subpaths may be imported.
         if (specifier.startsWith("@polymarket-bot/risk")) {
-          expect(DOOR_SUBPATHS, `${entry} imports ${specifier}`).toContain(specifier);
+          expect(DOOR_SUBPATHS, `${file} imports ${specifier}`).toContain(specifier);
         }
       }
     }

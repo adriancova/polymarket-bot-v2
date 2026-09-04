@@ -31,9 +31,8 @@
  * and imports nothing from `packages/capital-allocator`.
  */
 
-import { readFileSync, readdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -64,8 +63,12 @@ import {
   positionIntent,
   riskPolicy,
 } from "./fixtures.js";
-
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+// The one recursive source scan, shared with the three other guards that read
+// this repository's sources; see that module's header for why there is only
+// one. A test tree is not a workspace package, so importing across it declares
+// no edge — `test/unit/execution-planner/fixtures.ts` already imports this
+// directory's fixtures in the other direction.
+import { packageSourceFiles, readSource, repoRoot } from "../execution-planner/source-scan.js";
 
 /**
  * COMPILE-TIME PIN. The risk engine reads exactly these two components of an
@@ -329,16 +332,22 @@ describe("exactly one workspace edge exists between the two packages, and it is 
     // bare `from "@polymarket-bot/risk"` — the package root, which exports the
     // engine, the policy and the recommendations — is a violation, and so is
     // any future third subpath.
-    const directory = resolve(repoRoot, "packages", "capital-allocator", "src");
+    //
+    // The scan is RECURSIVE (review round 1, finding M7): its one-level-deep
+    // predecessor could not see `src/<anything>/<file>.ts`, and after the
+    // collapse such a file resolves the engine root and compiles.
+    const files = packageSourceFiles("packages/capital-allocator");
     const specifiers: string[] = [];
-    for (const entry of readdirSync(directory)) {
-      if (!entry.endsWith(".ts")) continue;
-      const text = readFileSync(resolve(directory, entry), "utf8");
-      for (const match of text.matchAll(/(?:from|import\()\s*"(@polymarket-bot\/risk[^"]*)"/gu)) {
+    for (const file of files) {
+      for (const match of readSource(file).matchAll(
+        /(?:from|import\()\s*"(@polymarket-bot\/risk[^"]*)"/gu,
+      )) {
         specifiers.push(match[1] ?? "");
       }
     }
-    // Non-vacuity: the allocator really does consume the door.
+    // Non-vacuity: the scan found the tree, and the allocator really does
+    // consume the door.
+    expect(files.length).toBeGreaterThan(5);
     expect(specifiers.length).toBeGreaterThan(0);
     expect([...new Set(specifiers)].sort()).toEqual(DOOR_SUBPATHS);
   });
@@ -356,10 +365,12 @@ describe("exactly one workspace edge exists between the two packages, and it is 
       "@polymarket-bot/features",
     ];
     for (const name of ["risk", "capital-allocator"] as const) {
-      const directory = resolve(repoRoot, "packages", name, "src");
-      for (const entry of readdirSync(directory)) {
-        if (!entry.endsWith(".ts")) continue;
-        const text = readFileSync(resolve(directory, entry), "utf8");
+      // Recursive, for finding M7's reason: a nested file is still this
+      // package's source, and after the collapse it can resolve the engine.
+      const files = packageSourceFiles(`packages/${name}`);
+      expect(files.length).toBeGreaterThan(5);
+      for (const file of files) {
+        const text = readSource(file);
         for (const peer of forbiddenPeers) {
           if (peer === `@polymarket-bot/${name}`) continue;
           for (const match of text.matchAll(/(?:from|import\()\s*"([^"]+)"/gu)) {
@@ -370,7 +381,7 @@ describe("exactly one workspace edge exists between the two packages, and it is 
               name === "capital-allocator" &&
               peer === "@polymarket-bot/risk" &&
               DOOR_SUBPATHS.includes(specifier);
-            expect(permitted, `${name}/src/${entry} imports ${specifier}`).toBe(true);
+            expect(permitted, `${file} imports ${specifier}`).toBe(true);
           }
         }
       }

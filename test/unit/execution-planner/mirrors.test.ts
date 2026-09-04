@@ -26,11 +26,12 @@
  * THREE THINGS ARE PINNED, and each fails closed:
  *
  * 1. **No fourth copy.** No file under any workspace package's `src` tree
- *    outside `packages/risk` carries either module's body. The scan walks every
- *    `packages/<name>/src` — and `packages/strategies/<name>/src` — recursively,
- *    and it matches by CONTENT, not by filename: a copy renamed `parse-door.ts`,
- *    or pasted into the middle of a larger file, is caught by the same
- *    fingerprint, because renaming the file is the first thing a copy would do.
+ *    outside `packages/risk` carries either module's body. The scan is
+ *    `./source-scan.ts`'s recursive walker — shared with the three other guards
+ *    that read this repository's sources, for the reason recorded there — and it
+ *    matches by CONTENT, not by filename: a copy renamed `parse-door.ts`, or
+ *    pasted into the middle of a larger file, is caught by the same fingerprint,
+ *    because renaming the file is the first thing a copy would do.
  * 2. **The canonical bodies are unchanged by the collapse.** Their sha256 below
  *    the header markers is pinned to what the three deleted copies carried.
  *    This is the byte-identity claim the collapse rests on, kept mechanical.
@@ -42,13 +43,17 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+import {
+  packageSourceFiles,
+  readSource,
+  repoRoot,
+  workspaceSourceFiles,
+} from "./source-scan.js";
 
 /** The canonical package. Everything else is a copy site. */
 const CANONICAL = "packages/risk";
@@ -89,9 +94,8 @@ const CONSUMERS = [
   { row: "S4", dir: "packages/execution-planner" },
 ] as const;
 
-function read(relativePath: string): string {
-  return readFileSync(resolve(repoRoot, relativePath), "utf8");
-}
+/** The shared scan's reader, under this file's original short name. */
+const read = readSource;
 
 /** Everything from the module's body marker down. */
 function bodyOf(relativePath: string, marker: RegExp): string {
@@ -106,64 +110,103 @@ function sha256(text: string): string {
 }
 
 /**
- * Every `.ts` file under some workspace package's `src`, recursively, with its
- * repository-relative path. Test files are included deliberately: a copy of the
- * door parked in a `.test.ts` is still a second implementation to fix.
- */
-function workspaceSourceFiles(): readonly string[] {
-  const found: string[] = [];
-
-  const walk = (absolute: string, relative: string): void => {
-    for (const entry of readdirSync(absolute)) {
-      if (entry === "node_modules" || entry === "dist") continue;
-      const childAbsolute = join(absolute, entry);
-      const childRelative = `${relative}/${entry}`;
-      if (statSync(childAbsolute).isDirectory()) walk(childAbsolute, childRelative);
-      else if (entry.endsWith(".ts")) found.push(childRelative);
-    }
-  };
-
-  const packagesRoot = resolve(repoRoot, "packages");
-  for (const entry of readdirSync(packagesRoot)) {
-    const packageDir = join(packagesRoot, entry);
-    if (!statSync(packageDir).isDirectory()) continue;
-    // `packages/strategies/*` nests one level deeper.
-    const candidates = existsSync(join(packageDir, "package.json"))
-      ? [[packageDir, `packages/${entry}`] as const]
-      : readdirSync(packageDir)
-          .map((nested) => [join(packageDir, nested), `packages/${entry}/${nested}`] as const)
-          .filter(([absolute]) => statSync(absolute).isDirectory());
-    for (const [absolute, relative] of candidates) {
-      const source = join(absolute, "src");
-      if (existsSync(source)) walk(source, `${relative}/src`);
-    }
-  }
-
-  return found;
-}
-
-/**
  * Distinctive lines from each body, used as the copy fingerprint.
  *
- * A whole-body hash catches only a VERBATIM paste. These are exact source lines
- * from deep inside each module — not from its header, and not generic enough to
- * appear in ordinary code — so a copy that edits a comment, reflows a line, or
- * pastes two thirds of the module is still caught. All three must appear in a
- * file for it to be reported, which is what keeps an incidental one-line
- * coincidence from failing this test.
+ * WHY NOT A WHOLE-BODY HASH: it catches only a VERBATIM paste, and a copy is
+ * free to reindent.
+ *
+ * WHY NOT "ALL OF A SHORT LIST" (the shape review round 1 finding LOW-1
+ * defeated): this table used to hold three DECLARATION lines per module and
+ * required every one of them to be present. A full pasted copy of
+ * `plain-data.ts` with the single identifier `describeValue` renamed to
+ * `describeVal_` therefore evaded the guard completely — one edit, and the
+ * conjunction was false. A conjunction over N lines has the evasion cost of its
+ * WEAKEST line, which is 1.
+ *
+ * WHAT IS PINNED INSTEAD: **at least {@link MATCH_THRESHOLD} of the twelve**
+ * lines below, per module. They are exact source lines drawn from across the
+ * whole body — not from the header — and deliberately spread over many
+ * different identifiers, with several carrying no local identifier at all
+ * (refusal strings, library-pin error text, expressions written only in
+ * built-ins). Comparison normalizes runs of whitespace on both sides, so a
+ * reindent or a reflow does not help either.
+ *
+ * THE EVASION BAR, MEASURED RATHER THAN ASSERTED. Every variant below was
+ * built from the canonical file, dropped into a consumer's `src`, and scored by
+ * this file's own matcher (`WP-180-FU2` remediation round 1):
+ *
+ * | variant | score | verdict |
+ * | --- | --- | --- |
+ * | verbatim paste | 12/12 | caught |
+ * | round-1 M3: one identifier renamed (`describeValue`→`describeVal_`) | 12/12 | caught |
+ * | two identifiers renamed (+ `readPlainData`) | 12/12 | caught |
+ * | `schema-arena` with ALL THREE of the retired fingerprints renamed | 11/12 | caught |
+ * | all comments stripped and the file reindented | 12/12 | caught |
+ * | comments stripped AND eight identifiers renamed | 1/12 | **EVADES** |
+ *
+ * So the bar is: a paste survives renaming, reindenting and comment-stripping
+ * individually, and falls only to a systematic obfuscation pass that renames
+ * roughly every identifier the code lines are written in — which, for this
+ * module, includes the refusal-payload key names `problem` and `state`, so the
+ * evading copy no longer emits this module's refusal SHAPE. And a genuine
+ * re-implementation, sharing behaviour but no text, is invisible here by
+ * construction. That is the honest limit: this guard answers copy-paste,
+ * because pasting is the cheap path back to three implementations, and it does
+ * not claim to answer a determined author.
+ *
+ * FALSE POSITIVES: each line was verified unique inside its own module and
+ * absent from every other workspace source file at this tip. Four independent
+ * exact matches from one module in one unrelated file is not a coincidence a
+ * reviewer needs to be protected from.
  */
 const FINGERPRINTS: Readonly<Record<string, readonly string[]>> = {
   "packages/risk/src/plain-data.ts": [
-    "export function readPlainData(",
-    "export function ownDataDescriptor(",
-    "export function describeValue(",
+    "return value.length > 64 ? `a ${String(value.length)}-character string` : `\"${value}\"`;",
+    "const state: ReadState = { problems: [], strings: [], ancestors: new WeakSet() };",
+    "if (state.problems.length > 0) return { ok: false, problems: state.problems };",
+    "state.problems.push({ path, problem: `a record carries data, not a ${kind}` });",
+    'state.problems.push({ path, problem: "a cycle: a record is a finite tree of data" });',
+    "problem: `a symbol-keyed property (${String(key)}) is not record data`,",
+    "Object.defineProperty(out, key, ownDataDescriptor(value));",
+    'if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return undefined;',
+    'if (value === null || typeof value !== "object" || depth >= MAX_DEPTH) return value;',
+    'defineDataProperty(out, "detailsUnreadable", "its own property names could not be read");',
+    'problem: "its length is not an own data property, so the array is not data",',
+    'state.problems.push({ path, problem: "a sparse array: a record has no holes" });',
   ],
   "packages/risk/src/schema-arena.ts": [
-    "export function prototypeFreeParser<",
-    "function severOrdinaryChain(",
-    "function arenaNode(",
+    'export const SCHEMA_ARENA_ERROR = "schema arena";',
+    "export const ARENA_NODE_TYPES: readonly string[] = [",
+    '" the internal layout this arena is pinned to. Re-measure before upgrading.",',
+    '" it could silently discard library state, so this fails the build instead —" +',
+    "Object.defineProperty(target, name, ownDataDescriptor(value));",
+    "const slots = internals as { def?: unknown; constr?: unknown; check?: unknown; run?: unknown };",
+    "Object.getPrototypeOf(value) === Array.prototype && (value as readonly unknown[]).length === 0",
+    "held = isFreshOrdinaryContainer(next) ? prototypeFreeContainer(next) : next;",
+    'const given = ctx !== null && typeof ctx === "object" ? (ctx as object) : undefined;',
+    'severOrdinaryChain(copy._zod, "the _zod container of a check copy");',
+    '" the arena has never measured. Re-measure before upgrading the library.",',
+    "`${SCHEMA_ARENA_ERROR}: the value handed to the arena is not a schema node (no _zod.def/constr/run)`,",
   ],
 };
+
+/**
+ * How many fingerprint lines make a file a copy. Four of twelve: high enough
+ * that no honest file reaches it by coincidence, low enough that renaming
+ * identifiers — the cheap evasion — cannot get under it.
+ */
+const MATCH_THRESHOLD = 4;
+
+/** Whitespace-insensitive: a copy may reindent or reflow, and often will. */
+function normalize(text: string): string {
+  return text.replace(/\s+/gu, " ");
+}
+
+/** How many of `lines` appear in `text`, comparing whitespace-insensitively. */
+function matchCount(text: string, lines: readonly string[]): number {
+  const haystack = normalize(text);
+  return lines.filter((line) => haystack.includes(normalize(line))).length;
+}
 
 describe("the collapsed parse door exists in exactly one package (WP-180-FU2)", () => {
   it("the canonical bodies are the ones the collapse claimed: unchanged, byte for byte", () => {
@@ -174,21 +217,25 @@ describe("the collapsed parse door exists in exactly one package (WP-180-FU2)", 
     }
   });
 
-  it("the fingerprints are non-vacuous: every one of them is in the canonical file", () => {
+  it("the fingerprints are non-vacuous: the canonical file matches ALL of its own, well above the threshold", () => {
     for (const module of MODULES) {
       const lines = FINGERPRINTS[module.file];
       expect(lines, `no fingerprint registered for ${module.file}`).toBeDefined();
-      expect(lines ?? []).not.toHaveLength(0);
-      const text = read(module.file);
-      for (const line of lines ?? []) {
-        expect(text, `${module.file} no longer contains its own fingerprint: ${line}`).toContain(
-          line,
-        );
-      }
+      // Twelve lines and a threshold of four: the ratio is the evasion bar, so
+      // it is asserted rather than left to the reader to recompute.
+      expect((lines ?? []).length, `${module.file} fingerprint size`).toBe(12);
+      expect((lines ?? []).length).toBeGreaterThanOrEqual(3 * MATCH_THRESHOLD);
+      // The detector itself is what is exercised here, not `toContain` — a
+      // fingerprint the real matcher cannot find is a fingerprint that is not
+      // guarding anything.
+      expect(
+        matchCount(read(module.file), lines ?? []),
+        `${module.file} no longer matches its own fingerprint`,
+      ).toBe(12);
     }
   });
 
-  it("the scan is non-vacuous: it walks every workspace package's src, not one directory", () => {
+  it("the scan is non-vacuous AND RECURSIVE: it walks every workspace src tree, not one directory", () => {
     const files = workspaceSourceFiles();
     expect(files.length).toBeGreaterThan(100);
     for (const module of MODULES) expect(files).toContain(module.file);
@@ -199,6 +246,24 @@ describe("the collapsed parse door exists in exactly one package (WP-180-FU2)", 
     expect(files).not.toContain("packages/capital-allocator/src/schema-arena.ts");
     expect(files).not.toContain("packages/execution-planner/src/plain-data.ts");
     expect(files).not.toContain("packages/execution-planner/src/schema-arena.ts");
+
+    // RECURSION, PROVED ON REAL NESTED FILES (review round 1, finding M7). Both
+    // exported walkers are the same code path, and both are asserted here
+    // because `ports.test.ts` and `determinism.test.ts` now depend on the
+    // descent: a `src/nested/sneak.ts` importing the risk ENGINE passed all
+    // four of these guards while they enumerated `src` one level deep.
+    expect(files).toContain("packages/observability/src/recorder/render.ts");
+    expect(files).toContain("packages/domain/src/events/events.test.ts");
+    expect(packageSourceFiles("packages/observability")).toContain(
+      "packages/observability/src/recorder/render.ts",
+    );
+    expect(packageSourceFiles("packages/settlement")).toContain(
+      "packages/settlement/src/models/registry.ts",
+    );
+    // …and a package whose `src` is flat is still fully enumerated.
+    expect(packageSourceFiles("packages/execution-planner")).toContain(
+      "packages/execution-planner/src/pluck.ts",
+    );
   });
 
   it("NO FOURTH COPY: no file outside packages/risk carries either module's body", () => {
@@ -209,9 +274,11 @@ describe("the collapsed parse door exists in exactly one package (WP-180-FU2)", 
       const text = read(file);
       for (const module of MODULES) {
         const lines = FINGERPRINTS[module.file] ?? [];
-        if (lines.every((line) => text.includes(line))) {
+        const matched = matchCount(text, lines);
+        if (matched >= MATCH_THRESHOLD) {
           offenders.push(
-            `${file} reproduces the body of ${module.file} — the parse door was collapsed to` +
+            `${file} reproduces the body of ${module.file} (${String(matched)} of` +
+              ` ${String(lines.length)} fingerprint lines) — the parse door was collapsed to` +
               ` ${CANONICAL} by GOV-2A; import it as \`@polymarket-bot/risk${module.subpath.slice(1)}\`` +
               " and add the §2.1 same-layer row, do not paste it",
           );
