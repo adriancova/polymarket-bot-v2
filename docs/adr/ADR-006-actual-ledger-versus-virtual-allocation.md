@@ -6,6 +6,17 @@
 - **Implemented by:** `WP-040` (schemas and constraints), `WP-200` (ledger,
   allocations, projections, PnL) — **not yet implemented**
 - **Supersedes / Superseded by:** none
+- **Amendments:** 2026-09-03 (`GOV-1D`) — §7 gains a dated block discharging
+  its own **item 4**: C-2 (USDC vs pUSD) is **RESOLVED as a documentation
+  inconsistency**, on four independently re-fetched official pages. The
+  resolution does **not** authorize folding the two denominations; §7 items
+  1–3 are unchanged and binding, and distinct asset identifiers remain
+  mandatory. The original §7 text is unedited; the register row is
+  `docs/contracts/protected-contracts.md` §8 **C-2**, and the fetch evidence is
+  `docs/venue/verified-2026-09-03.md`. The amendment also records one drift the
+  re-fetch found: the liquidity-rewards page now names **no** settlement token,
+  so the Evidence section's phrase "each in pUSD" is no longer supported for
+  that program.
 
 ## Context
 
@@ -170,6 +181,212 @@ NO pair is backed by exactly $1 of collateral locked through the CTF contracts",
 with the pUSD, Conditional Tokens, and CTF collateral-adapter contract addresses
 recorded verbatim (venue report §10.2). Buying consumes pUSD; selling requires
 outcome-token inventory (venue report §10.2).
+
+**Amendment, 2026-09-03 (`GOV-1D`): item 4 is discharged. C-2 is RESOLVED as a
+documentation inconsistency — and the resolution keeps the denominations
+distinct.**
+
+**Who performed the mandated verification, and why not `WP-200`.** Item 4 above
+assigns the verification to "`WP-200` and the fee/reward accounting work".
+`WP-200` **refused it and escalated**, correctly: resolving C-2 requires
+fetching current official pages and recording the result in `docs/adr/**`, and
+neither is inside that package's grant (`docs/handoffs/WP-200.md` `deviations`
+3, `follow_up` 1). Rather than let the mandate lapse or be discharged by
+assumption, the contract owner executed it in this orchestrator-authorized
+governance round. The `WP-200` handoff **reports** that it shipped in
+conformance with items 1–3 in the meantime — explicit asset identifiers, USDC
+and pUSD as two ids it states no code path treats as interchangeable, no
+implicit "cash" asset, no cross-denomination sum. That report is evidence of
+intent, not proof of code conformance; this amendment **ratifies no `WP-200`
+behavior** — conformance ratification is deferred to `WP-200`'s final code
+review and merged state (see the consequences section below) — and changes no
+code. *(Corrected 2026-09-03 by the orchestrator, disclosed pre-merge: the
+confirming review found this paragraph still ratified `WP-200` conformance
+after the first correction qualified only the consequences section and the
+register row.)*
+
+**Method and evidence.** Four read-only, unauthenticated GETs performed on
+**2026-09-03**, each recorded with URL, HTTP status, byte count, SHA-256, and
+timestamp in the new dated report
+[`docs/venue/verified-2026-09-03.md`](../venue/verified-2026-09-03.md) §1: all
+four **HTTP 200** — `trading/fees.md` (8 128 bytes), `programs/maker-rebates.md`
+(5 945), `programs/taker-rebates.md` (7 769), `programs/liquidity-rewards.md`
+(7 191). All four pages were reachable; no page in scope was unretrievable.
+The retrieval was independently cross-checked against a separate fetch of the
+same four URLs on the same date: identical statuses, byte counts, and digests.
+Every claim below is **documentary**; nothing here is observational, and no
+credential, key, or authenticated endpoint was used.
+
+**Finding 1 — the inconsistency persists in current documentation.** It is not
+an artifact of the frozen 2026-08-24 snapshot. The fees page still says USDC
+(12 occurrences, no mention of pUSD); the maker-rebates and taker-rebates pages
+still say pUSD (9 and 7 occurrences, no mention of USDC).
+
+**Finding 2 — its shape is a documentation-copy artifact: the same quantity,
+formula, and rounding floor described under two names.** Verbatim, from
+`trading/fees.md` and `programs/maker-rebates.md` respectively:
+
+> Taker fees are calculated in **USDC** and vary based on the share price. The
+> fee amount in **USDC** is symmetric around 50% probability — a trade at 30¢
+> incurs the same dollar fee as a trade at 70¢.
+
+> Taker fees are calculated in **pUSD** and vary based on the share price. The
+> fee amount in **pUSD** is symmetric around 50% probability — a trade at 30¢
+> incurs the same dollar fee as a trade at 70¢.
+
+The two sentences are identical except for the token name. So are the precision
+sentences — "The smallest fee charged is **0.00001 USDC**" versus "The smallest
+fee charged is 0.00001 pUSD", with the same `0.00001` magnitude and the same
+"rounded to 5 decimal places" rule — and the formula is the same expression
+(`fee = C × feeRate × p × (1 - p)` versus `fee_equivalent = C × feeRate × p ×
+(1 - p)`). Three further corroborations are recorded in the report §3.3: the
+rebate page states in its own words that rebates use "the **same formula as
+taker fees**"; it **defers to the fees page for the numeric tables** ("For
+detailed fee tables for each market category, see the [Fees](/trading/fees)
+page") — i.e. the pUSD page sends the reader to the USDC page for the same
+tables; and both pages embed the **identical** fee-curve chart asset
+(`datawrapper-chart-dJ74e`).
+
+**Finding 3 — no page asserts an equivalence.** Searched across all four
+bodies, **no fetched page states that USDC and pUSD are the same asset, states
+any conversion rate or mechanism between them, or gives a contract address
+linking them** (report §3.4). The only "equivalent" strings are the rebate
+formula's `fee_equivalent`/`total_fee_equivalent` scoring weights. The one
+adjacent use of the name — "no Polymarket fees to deposit or withdraw USDC" —
+names USDC as the **deposit/withdrawal** asset, a different referent from both
+the fee unit and §10.2's pUSD collateral, and **no fetched page relates the
+two**.
+
+**Finding 4 — drift, disclosed: the liquidity-rewards page now names no
+settlement token.** Frozen report §11 characterizes C-2 as covering the
+"maker-rebates, taker-rebates, and liquidity-rewards pages"; as of this
+retrieval the liquidity-rewards page contains **zero** occurrences of the
+substring `usd` in any case. Its minimum is stated as "The minimum reward
+payout is **\$1**" — a dollar figure with no token. **C-2's live scope is
+therefore narrower than the frozen report describes:** the inconsistency today
+is fees (USDC) versus the two *rebate* pages (pUSD). The frozen report is not
+edited (`protected-contracts.md` §2); current official documentation controls
+(handoff §1.1). **This amendment is also the correction-of-fact note that
+`docs/adr/README.md` and `protected-contracts.md` §4 require for this ADR's own
+Evidence section**, whose phrase "maker rebates …, taker rebates …, and
+liquidity rewards … — each in pUSD with a $1 minimum accrual" is, as of
+2026-09-03, **no longer supported for liquidity rewards**. The Evidence text is
+left as the dated 2026-08-24 snapshot it declares itself to be.
+
+**The ruling.** C-2 is **RESOLVED**, and resolved *against* folding:
+
+1. **C-2 reads as a documentation inconsistency — a copy artifact.** The venue
+   describes one quantity — the taker fee, and the rebate computed from it —
+   under two names, with identical arithmetic and an identical rounding floor.
+   On the recorded evidence, the parallel prose supports reading the divergence
+   as a documentation artifact rather than as two differently-sized quantities.
+   *(Corrected 2026-09-03 by the orchestrator, disclosed pre-merge: the review
+   found the original wording — "a documentation inconsistency, not an economic
+   one" — asserted more than the evidence establishes. The parallel prose
+   strongly supports the copy-artifact reading but does not establish economic
+   reality. Stated as a reading, the operative rulings below are unchanged: by
+   known-risk 1 they hold either way.)*
+2. **That does not make them one asset, and this ADR does not rule that they
+   are.** A shared magnitude is not an asserted identity of the underlying
+   token. Finding 3 is decisive: inferring an on-chain equivalence from prose
+   parallelism would be **inventing venue behavior** (`AGENTS.md`), which is
+   forbidden however plausible the inference feels.
+3. **Item 2 stands unchanged and binding: USDC and pUSD may not be treated as
+   interchangeable.** Distinct asset identifiers remain **mandatory**. No code
+   path may sum, net, or substitute across them, and no type may bake in an
+   equality. **If a conversion exists, it is an explicit, recorded ledger
+   transaction with its own evidence** — evidence this round looked for and did
+   not find.
+4. **Item 3 stands unchanged, and item 4's discharge sharpens it.** A fee or
+   rebate entry is denominated in the unit **asserted by the source it was
+   derived from**, and that source is recorded alongside it with the versioned
+   fee/reward snapshot (§9.13). Concretely: a **fee** derived from
+   `trading/fees.md` is recorded in **USDC**; a **maker or taker rebate**
+   derived from `programs/maker-rebates.md` or `programs/taker-rebates.md` is
+   recorded in **pUSD**; and in both cases the source page and its retrieval
+   date travel with the entry.
+5. **Liquidity rewards have no source-asserted denomination, and none may be
+   assumed** (finding 4). This is the one place the discharge *adds* an
+   obligation rather than ratifying an existing one. A reward-schedule snapshot
+   derived from the liquidity-rewards page records its denomination as **not
+   asserted by the source** — it may not default to pUSD merely because the
+   sibling programs do. §6's existing rule supplies the safe path: only an
+   **observed payout** creates a `REWARD_INCOME` entry, and the observation
+   itself carries the asset actually received, which is evidence rather than
+   inference. If a payout is observed whose asset cannot be determined, the
+   correct outcome is the one §3 and §9.15 already mandate — `UNATTRIBUTED` and
+   a halt of the affected market — **not** a guessed denomination.
+
+**What this ruling does NOT do**, stated plainly so no later reader can borrow
+more from it than it says:
+
+- It does **not** assert that USDC and pUSD are the same on-chain asset, nor
+  that they are different ones. It records that **no fetched page says either**.
+- It does **not** authorize folding the two denominations, collapsing them into
+  a single "cash" asset, or introducing an implicit conversion. Item 1's
+  explicit-asset-identifier rule and item 2's non-interchangeability rule are
+  untouched.
+- It does **not** state a conversion rate. There is no evidence for one.
+- It does **not** change §7 items 1, 2, or 3, and it changes **no other section
+  of this ADR** — §6's fee/rebate/reward mechanics, the scope table in §2, and
+  the wallet-operation rules in §8 are all unaffected.
+- It does **not** change any run-mode default, credential boundary, or safety
+  ceiling (ADR-010), and it changes **no code** — the `WP-200` handoff
+  **reports** that its shipped behavior conforms. That report is evidence of
+  intent and escalation, not proof of code conformance: `WP-200` was still
+  remediating HIGH findings when this amendment was written, and its own
+  handoff says the final state must be re-checked. **Conformance ratification
+  is deferred to `WP-200`'s final code review and merged state.**
+  *(Corrected 2026-09-03 by the orchestrator, disclosed pre-merge: the review
+  found the original wording ratified conformance on the strength of an
+  in-flight sibling branch's handoff alone.)*
+- It claims nothing **observational**: no payout was observed, no balance was
+  read, no transaction was inspected. The fact stays volatile (handoff §1.2)
+  and each phase gate re-verifies it.
+
+**Recorded under the `docs/adr/README.md` bounded venue-fetch exception (third
+use).** All four conditions, walked explicitly:
+
+1. **Handoff §1.1 already ranks current official documentation above the
+   in-repo report**, so this ADR asserts nothing on its own authority — it
+   records what the venue's own current pages say, and where they contradict
+   the frozen report (finding 4) the current pages control by that same rule.
+2. **The record carries the URL, the retrieval date, and verbatim quotes**, and
+   distinguishes documentary confirmation from observation: every finding above
+   is documentary and is labelled so; report §1 additionally carries HTTP
+   status, byte count, and SHA-256 per fetch so a reviewer can re-fetch and
+   diff.
+3. **The frozen report is still cited for the item's origin and prior status**
+   — `verified-2026-08-24.md` §6 and §11 C-2 — **and is not edited**
+   (`protected-contracts.md` §2). Finding 4's drift is recorded as drift beside
+   it, not written into it.
+4. **The gap is still recorded for the next verification round.** All four
+   pages are already in the frozen report's §14 source index, so this round
+   incurs no new source-index debt; the debts it *does* incur are enumerated in
+   `verified-2026-09-03.md` §5 — the liquidity-rewards denomination, the
+   undocumented deposited-USDC-to-pUSD-collateral funding path, and the
+   standing §1.2 full re-verification.
+
+One honest note on the exception's fit, for the reviewer: its text describes "a
+venue fact that **a work package's own mandated** verification obtained". Here
+the mandate is this ADR's own §7 item 4 and it named `WP-200`, but `WP-200`'s
+grant made the fetch and the amendment impossible, so the contract owner
+executed the same mandate in its place. The shape is otherwise identical to the
+first two uses (ADR-013 §7 for ADR-002 §8.3's mandate; ADR-009 §5's 2026-09-02
+amendment for ADR-009 §5.2's own mandate) — a *ratifying* record of a
+*mandated* verification, not an ADR fetching a fact it merely wanted.
+
+**Reopen condition.** This resolution is reopened by **a venue assertion of
+equivalence or conversion** — any official page that states USDC and pUSD are
+the same asset, states a conversion rate or mechanism between them, publishes a
+contract address linking them, or documents the funding path from deposited
+USDC into pUSD collateral. Such evidence does **not** by itself authorize
+folding: it authorizes modeling an **explicit, recorded conversion transaction**
+under item 2, and it requires a superseding amendment here that states how
+recorded historical entries in the two denominations are to be read. The
+narrower re-scoping trigger is finding 4 — if the venue names a settlement
+token for liquidity rewards, ruling 5's "not asserted by the source" lapses for
+that program and the register row is updated with that evidence.
 
 ### 8. Wallet operations are ledger transactions
 
