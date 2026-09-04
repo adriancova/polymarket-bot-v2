@@ -3,13 +3,17 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Execution planner (WP-190): converts approved intents into immutable execution plans (handoff §9.10) — economic-leg selection that respects actual unreserved inventory, exact tick-conforming prices with capped marketable limits, slicing, cancel/replace hysteresis, deadline and escalation policy, partial-fill handling, coordinated-basket leg-risk policy (never labeled atomic), labeled estimates, and reservation requirements that must be applied before submission. Pure layer-1 logic: no I/O, no clock, no network, no credential surface, no order placement.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.9.2"
