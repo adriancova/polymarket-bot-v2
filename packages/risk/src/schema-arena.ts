@@ -1,6 +1,19 @@
 /**
  * THE PARSING ARENA — adversarial review round 8.
  *
+ * CANONICAL, AND THE ONLY COPY (`WP-180-FU2`, 2026-09-04). This module used to
+ * be DUPLICATED into `packages/capital-allocator` and
+ * `packages/execution-planner`, byte-identical below the shared-body marker and
+ * bound by a drift test. `GOV-2A` ruled the duplication out and collapsed the
+ * three copies here. Both consumers now import it as
+ * `@polymarket-bot/risk/schema-arena` across the
+ * `docs/contracts/dependency-direction.md` §2.1 **S3** / **S4** same-layer
+ * edges; the module is reachable only through this package's `exports` map
+ * (F16). Nothing below the shared-body marker changed in the collapse — the
+ * body is byte for byte what review rounds 8-9 left here.
+ * `test/unit/execution-planner/mirrors.test.ts` is now the DELETION guard: it
+ * fails if a copy of this body reappears under any other package's `src`.
+ *
  * WHY THIS MODULE EXISTS. Round 7 established that a schema is asked a QUESTION
  * and that its OUTPUT is not evidence: every door validates the materialized
  * tree and then uses the materialized tree. Review round 8 found that rule

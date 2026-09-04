@@ -37,7 +37,6 @@ import { describe, expect, it } from "vitest";
 import * as allocator from "../../../packages/capital-allocator/src/index.js";
 import * as risk from "../../../packages/risk/src/index.js";
 import { INSTANCE, MARKET_A, entryInput, riskPolicy } from "./fixtures.js";
-import { readScannedFile } from "./prototype-access-scan.js";
 
 /** A handler whose every trap throws — the reviewer's probe shape. */
 function hostileProxy(label: string): ProxyHandler<object> {
@@ -569,64 +568,32 @@ describe("the emitted record: what a consumer sees (README §6.1)", () => {
   });
 });
 
-describe("the duplicated data-record boundary cannot drift (review round 6, LOW C)", () => {
-  /**
-   * `packages/capital-allocator/src/plain-data.ts` is a COPY of the risk
-   * module, not an import: sharing it would need a same-layer edge that
-   * `docs/contracts/dependency-direction.md` §2.1 does not list. Round 5 stated
-   * the two are byte-identical below their headers and verified it by hand;
-   * review round 6 noted that no test bound them. This is that test.
-   */
-  const MARKER = 'import { types } from "node:util";';
-
-  it("the two copies are byte-identical from the audited import to the end of the file", () => {
-    const riskCopy = readScannedFile("packages/risk/src/plain-data.ts");
-    const allocatorCopy = readScannedFile("packages/capital-allocator/src/plain-data.ts");
-    const riskShared = riskCopy.slice(riskCopy.indexOf(MARKER));
-    const allocatorShared = allocatorCopy.slice(allocatorCopy.indexOf(MARKER));
-
-    // non-vacuity: the marker exists in both, and the shared part is the bulk
-    expect(riskCopy).toContain(MARKER);
-    expect(allocatorCopy).toContain(MARKER);
-    expect(riskShared.length).toBeGreaterThan(5000);
-    expect(allocatorShared).toBe(riskShared);
-  });
-
-  /**
-   * The SECOND duplicated module, added in round 8 for the same §2.1 reason.
-   *
-   * `schema-arena.ts` is what makes a door's parse unable to reach a polluted
-   * prototype, and both packages have doors — so both need it, and neither may
-   * import the other. The drift test is the same one, on the same terms.
-   */
-  const ARENA_MARKER =
-    "// ---- shared body: byte-identical with the mirrored copy ---------------------";
-
-  it("the two parsing-arena copies are byte-identical below the shared marker", () => {
-    const riskCopy = readScannedFile("packages/risk/src/schema-arena.ts");
-    const allocatorCopy = readScannedFile("packages/capital-allocator/src/schema-arena.ts");
-    expect(riskCopy).toContain(ARENA_MARKER);
-    expect(allocatorCopy).toContain(ARENA_MARKER);
-    const riskShared = riskCopy.slice(riskCopy.indexOf(ARENA_MARKER));
-    const allocatorShared = allocatorCopy.slice(allocatorCopy.indexOf(ARENA_MARKER));
-    expect(riskShared.length).toBeGreaterThan(5000);
-    expect(allocatorShared).toBe(riskShared);
-  });
-
-  it("each parsing-arena copy carries its own package-specific header", () => {
-    const riskHeader =
-      readScannedFile("packages/risk/src/schema-arena.ts").split(ARENA_MARKER)[0] ?? "";
-    const allocatorHeader =
-      readScannedFile("packages/capital-allocator/src/schema-arena.ts").split(ARENA_MARKER)[0] ?? "";
-    expect(allocatorHeader).toContain("DUPLICATED, NOT SHARED");
-    expect(riskHeader).not.toBe(allocatorHeader);
-  });
-
-  it("each copy carries its own package-specific header above the shared part", () => {
-    const riskHeader = readScannedFile("packages/risk/src/plain-data.ts").split(MARKER)[0] ?? "";
-    const allocatorHeader =
-      readScannedFile("packages/capital-allocator/src/plain-data.ts").split(MARKER)[0] ?? "";
-    expect(allocatorHeader).toContain("DUPLICATED, NOT SHARED");
-    expect(riskHeader).not.toBe(allocatorHeader);
-  });
-});
+/*
+ * RETIRED 2026-09-04 (`WP-180-FU2`), WITH ITS REASON RECORDED.
+ *
+ * A `describe("the duplicated data-record boundary cannot drift (review round
+ * 6, LOW C)")` block stood here with four tests. They bound
+ * `packages/capital-allocator/src/{plain-data,schema-arena}.ts` to the risk
+ * originals: byte-identical below the marker, each with its own
+ * `DUPLICATED, NOT SHARED` header. Round 6 added them because round 5 had
+ * verified the duplication BY HAND and nothing held it.
+ *
+ * `GOV-2A` then ruled the duplication itself out
+ * (`docs/contracts/dependency-direction.md` §2.1, mirror-collapse subsection):
+ * a drift guard proves the copies are identical but cannot make a fix to them
+ * atomic, and this is the repository's only prototype-free parse door. The
+ * copies are deleted; `packages/capital-allocator` imports the canonical
+ * modules across the §2.1 **S3** edge. The four tests are therefore not
+ * weakened, they are UNSATISFIABLE — their subject does not exist — and
+ * deleting them here is not a coverage loss:
+ *
+ * - the drift they guarded is now impossible by construction (one copy cannot
+ *   drift from itself), and
+ * - the failure that replaced it — a FOURTH copy appearing instead of an edge
+ *   being added — is guarded by `test/unit/execution-planner/mirrors.test.ts`,
+ *   repurposed in the same change from a drift guard into a DELETION guard
+ *   that scans every workspace package's `src` tree by content fingerprint.
+ *
+ * Nothing else in this file changed: every behavioural assertion about the
+ * public surface above is the one `WP-180` shipped.
+ */

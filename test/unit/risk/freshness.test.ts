@@ -176,10 +176,15 @@ describe("deadline comparison reads no clock", () => {
         }
       }
     }
-    // Exactly one site per package: the mirrored data-record boundary. NOT a
-    // "greater than zero" check — a second site would be a second thing to
-    // audit, and this test is the audit.
-    expect(sites.sort()).toEqual(["capital-allocator/plain-data.ts", "risk/plain-data.ts"]);
+    // Exactly ONE site in the two packages together: the data-record boundary,
+    // which `WP-180-FU2` collapsed into `packages/risk` on 2026-09-04 —
+    // `packages/capital-allocator` no longer imports ANY Node built-in in
+    // production source, because it imports the door across the
+    // `docs/contracts/dependency-direction.md` §2.1 S3 edge instead of copying
+    // it. NOT a "greater than zero" check — a second site would be a second
+    // thing to audit, and this test is the audit. The allocator staying at zero
+    // is an assertion too: this list is exhaustive over both packages.
+    expect(sites.sort()).toEqual(["risk/plain-data.ts"]);
   });
 
   /**
@@ -236,10 +241,10 @@ describe("deadline comparison reads no clock", () => {
     }
 
     expect(failures).toEqual([]);
-    expect(importedFiles.sort()).toEqual([
-      "packages/capital-allocator/src/plain-data.ts",
-      "packages/risk/src/plain-data.ts",
-    ]);
+    // One file, since the 2026-09-04 collapse (`WP-180-FU2`): the canonical
+    // copy. The allocator's mirror is deleted, not moved — see the comment on
+    // the site census above.
+    expect(importedFiles.sort()).toEqual(["packages/risk/src/plain-data.ts"]);
   });
 
   it("the AST audit rejects each of the four bypasses the reviewer demonstrated", () => {

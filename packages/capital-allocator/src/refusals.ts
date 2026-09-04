@@ -14,7 +14,7 @@
  * full vocabulary is documented in this package's `README.md`.
  */
 
-import { describeValue, ownDataDetails, readPlainData } from "./plain-data.js";
+import { describeValue, ownDataDetails, readPlainData } from "@polymarket-bot/risk/plain-data";
 
 /** Why an allocator construction, reservation, or transition was refused. */
 export type CapitalRefusalCode =

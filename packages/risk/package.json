@@ -6,7 +6,9 @@
   "description": "Risk-policy engine (WP-180): the handoff §9.8 pre-trade check pipeline with worst-case contractual loss as the primary hard limit (grounded in WP-110's venue-verified settlement payoffs; the unverified CANCELLED outcome is floor-bounded, never valued), exposure/scenario/freshness/economic checks, structured reason codes, approved-intent records with resize-as-new-record lineage, and typed incident action recommendations (never actions). Pure layer-1 logic: no I/O, no clock, no network, no credential surface.",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./plain-data": "./src/plain-data.ts",
+    "./schema-arena": "./src/schema-arena.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

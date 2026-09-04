@@ -27,7 +27,7 @@
 
 import { types } from "node:util";
 
-import { readPlainData, type PlainDataRead } from "./plain-data.js";
+import { readPlainData, type PlainDataRead } from "@polymarket-bot/risk/plain-data";
 
 /** One step failed: where, and why the container could not answer it as data. */
 export interface PluckProblem {

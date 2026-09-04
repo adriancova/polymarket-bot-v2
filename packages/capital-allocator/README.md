@@ -57,7 +57,8 @@ Boundary semantics a caller must wire correctly:
 ### 2.1 Consuming a state — its caller-supplied parts have a `null` prototype
 
 **Read this before consuming a state or a verdict downstream.** Everything this
-package took from a caller is the *materialized* tree (`src/plain-data.ts`), so
+package took from a caller is the *materialized* tree
+(`@polymarket-bot/risk/plain-data`), so
 it is created with `Object.create(null)`; the containers this package builds
 itself are ordinary objects. Measured, and pinned by
 `test/unit/risk/public-surface.test.ts`:
@@ -143,7 +144,7 @@ be proven within the cap.
 **And the parse that reaches the fence is prototype-free too** (review round 8).
 Every door in this package — `parseAllocatorCaps`, `createAllocatorState`,
 `evaluateReservation` — validates through a **parsing copy** of its schema
-(`src/schema-arena.ts`) whose output assembly and parse context have no
+(`@polymarket-bot/risk/schema-arena`) whose output assembly and parse context have no
 prototype. Two measured consequences, both closed here: an inherited SETTER can
 no longer be invoked while the library assembles an output these doors discard
 (it aborted the parse when it threw), and an inherited `skipChecks` can no longer
@@ -268,19 +269,28 @@ positions is the caller's responsibility.
 
 ## 7. Dependency boundary
 
-Declares exactly `@polymarket-bot/decimal` and `@polymarket-bot/domain` (both
-layer 0) plus `zod`. It imports **no** layer-1 peer — including
-`@polymarket-bot/risk`, which consumes this package's snapshot and verdict
-**structurally** rather than through an edge, because
-`docs/contracts/dependency-direction.md` §2.1 lists no same-layer edge between
-them (F13). `test/unit/risk/ports.test.ts` pins that port.
+Declares `@polymarket-bot/decimal` and `@polymarket-bot/domain` (both layer 0),
+`zod`, and — since 2026-09-04 — `@polymarket-bot/risk`, a layer-1 peer, across
+the `docs/contracts/dependency-direction.md` §2.1 **S3** same-layer edge.
 
-`src/plain-data.ts` is **duplicated** from `packages/risk`, not imported, for
-exactly the `src/guards.ts` reason: sharing it would need a §2.1 row that does
-not exist, and a remediation may not widen a frozen contract for its own
-convenience. The two copies are byte-identical below their headers — and since
-review round 6 that is a TEST rather than a claim: `test/unit/risk/public-surface.test.ts`
-compares the two files from the audited `node:util` import to the last byte.
+**What that edge carries, and what it may never carry.** Exactly the two
+prototype-free parse-door modules, `@polymarket-bot/risk/plain-data` and
+`@polymarket-bot/risk/schema-arena`, reached through `packages/risk`'s `exports`
+map (F16). `GOV-2A`'s mirror-collapse ruling is explicit that **no rule, policy,
+or evaluation logic may travel this edge**: this package's caps, exposure
+accounting, reservation lifecycle and live-micro fence are its own, and a future
+need to import a risk *decision* from here is a different problem with a
+different answer. `packages/risk` still consumes this package's snapshot and
+verdict **structurally** rather than through an edge, so the graph stays acyclic
+(F9) and the port is still pinned by `test/unit/risk/ports.test.ts`.
+
+`src/plain-data.ts` and `src/schema-arena.ts` used to be **duplicated** here,
+byte-identical below their headers and bound by a drift test. `GOV-2A` ruled the
+duplication out — a security mechanism that must be fixed in three places, in
+three grants, is the wrong shape for a security mechanism — and `WP-180-FU2`
+deleted both copies. `test/unit/execution-planner/mirrors.test.ts` is now a
+DELETION guard: it fails if either module's body reappears in any package
+outside `packages/risk`.
 
 **Which exports are TOTAL, and which propagate** (review round 6, BLOCKER 3).
 Round 5's handoff claimed "no public function throws for any input"; the
@@ -304,17 +314,19 @@ without a classification:
   exception. The test runs each hostile call and requires it to throw, so the
   classification is measured rather than asserted.
 
-**One Node built-in is imported, and it is audited.** `src/plain-data.ts` holds
-`import { types } from "node:util";` and uses it only as `types.isProxy` — the
-one thing portable JavaScript cannot do, because every reflective operation on a
-`Proxy` runs a trap. Layer 1 carries no import allowlist (§2 states one only for
-layer 0; §3 F15 binds `packages/decimal`; §3 F14 binds `packages/domain`,
-`packages/strategies/**`, `packages/ledger` and `packages/simulation`).
-`pnpm check:deps` passes unchanged at 34 packages / 30 edges, and a type
-predicate performs no I/O — this package still opens no connection, reads no
-clock and holds no credential. The line and its permitted use are pinned by
-`test/unit/risk/freshness.test.ts`, which refuses every other `node:` import in
-both packages. Since review round 6 that pin is **AST-based**: the previous
+**No Node built-in is imported here any more, and that is now the audit.** This
+package used to hold one — `import { types } from "node:util";` in its copy of
+`src/plain-data.ts`, used only as `types.isProxy`, the one thing portable
+JavaScript cannot do because every reflective operation on a `Proxy` runs a
+trap. The 2026-09-04 collapse (`WP-180-FU2`) deleted that copy, so the built-in
+now lives once, in `packages/risk`, where
+`docs/contracts/dependency-direction.md` §2.2 enumerates it. This package's
+production sources import **zero** `node:` specifiers, and
+`test/unit/risk/freshness.test.ts` asserts that as an EQUALITY over both
+packages rather than as an absence: the census lists exactly
+`risk/plain-data.ts` and nothing else. A type predicate performs no I/O either
+way — this package still opens no connection, reads no clock and holds no
+credential. Since review round 6 that pin is **AST-based**: the previous
 version matched a regular expression and was bypassable four ways (`const t =
 types`, `const { isDate } = types`, `types["isDate"]`, and a bare reference).
 The audit now resolves the import to its local binding and classifies every

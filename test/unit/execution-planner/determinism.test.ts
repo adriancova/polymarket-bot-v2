@@ -91,9 +91,23 @@ describe("purity — the impure primitives do not appear in the package source",
     }
   });
 
-  it("imports only the declared downward edges, node:util, and its own modules — and NEVER zod", () => {
+  it("imports only the declared downward edges, the S4 door, node:util, and its own modules — and NEVER zod", () => {
     const importPattern = /from\s+"([^"]+)"/gu;
-    const allowed = new Set(["@polymarket-bot/decimal", "@polymarket-bot/domain", "node:util"]);
+    // The two `@polymarket-bot/risk` subpaths are the §2.1 **S4** same-layer
+    // edge, added 2026-09-04 by `WP-180-FU2` when `GOV-2A` collapsed the
+    // mirrored parse door into `packages/risk`. They are enumerated one by one,
+    // not admitted by prefix: the package ROOT (`@polymarket-bot/risk`) exports
+    // the risk ENGINE, and the ruling forbids rule, policy or evaluation logic
+    // travelling this edge. `zod` is still absent from this package's source —
+    // it now reaches the pinned library only through the arena that
+    // `packages/risk` owns and declares.
+    const allowed = new Set([
+      "@polymarket-bot/decimal",
+      "@polymarket-bot/domain",
+      "@polymarket-bot/risk/plain-data",
+      "@polymarket-bot/risk/schema-arena",
+      "node:util",
+    ]);
     for (const source of sources) {
       for (const match of source.text.matchAll(importPattern)) {
         const specifier = match[1] ?? "";

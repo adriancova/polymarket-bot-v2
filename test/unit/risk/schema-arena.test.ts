@@ -44,9 +44,26 @@ import {
   SCHEMA_ARENA_ERROR,
   prototypeFreeParser,
 } from "../../../packages/risk/src/schema-arena.js";
-import { prototypeFreeParser as allocatorParser } from "../../../packages/capital-allocator/src/schema-arena.js";
 import { validateEvaluationInput } from "../../../packages/risk/src/index.js";
 import { cancelIntent, entryInput, positionIntent, riskPolicy } from "./fixtures.js";
+
+/**
+ * The allocator's arena, which since 2026-09-04 (`WP-180-FU2`) IS this arena.
+ *
+ * This used to be `import { prototypeFreeParser as allocatorParser } from
+ * "…/packages/capital-allocator/src/schema-arena.js"` — a second, byte-
+ * identical copy. `GOV-2A` collapsed the copies into `packages/risk`, and
+ * `packages/capital-allocator` now imports it across the
+ * `docs/contracts/dependency-direction.md` §2.1 S3 edge, so the two bindings
+ * denote one function. The alias is kept, and so is every differential
+ * assertion below, because what the corpus pins is not "the allocator has its
+ * own arena" but "the ALLOCATOR'S THREE DOOR SCHEMAS get the same verdict from
+ * the arena copy as from the library" — including the `AGENTS.md` live-micro
+ * fence, which must refuse a raised cap in BOTH. Collapsing the module does not
+ * make that question go away; it makes one answer serve both packages, which is
+ * the point of the collapse.
+ */
+const allocatorParser = prototypeFreeParser;
 
 // ---------------------------------------------------------------------------
 // helpers

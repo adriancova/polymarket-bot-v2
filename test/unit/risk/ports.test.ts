@@ -1,10 +1,12 @@
 /**
  * The capital-allocator → risk STRUCTURAL PORT, pinned.
  *
- * `packages/capital-allocator` and `packages/risk` are both layer 1 and
- * `docs/contracts/dependency-direction.md` §2.1 lists no same-layer edge
- * between them (F13), so the risk engine consumes the allocator's exposure
- * snapshot and reservation verdict STRUCTURALLY — by shape, not by import.
+ * `packages/capital-allocator` and `packages/risk` are both layer 1, and the
+ * direction that matters here — **risk consuming the allocator** — has no
+ * `docs/contracts/dependency-direction.md` §2.1 row and never will, because it
+ * would close a cycle (F9). So the risk engine consumes the allocator's
+ * exposure snapshot and reservation verdict STRUCTURALLY — by shape, not by
+ * import.
  *
  * A structural port rots silently, so this file pins it three ways:
  *
@@ -14,8 +16,19 @@
  * 3. an END-TO-END pass: the allocator's own snapshot driving a risk refusal.
  *
  * A test tree is not a workspace package, so importing both here declares no
- * dependency edge — and the last test asserts that neither manifest declares
- * the other, which is the property the whole arrangement rests on.
+ * dependency edge — and the last describe asserts what the manifests and the
+ * sources may declare, which is the property the whole arrangement rests on.
+ *
+ * **Updated 2026-09-04 (`WP-180-FU2`).** The last describe used to assert that
+ * NEITHER manifest declares the other. `GOV-2A` then ruled the
+ * `plain-data`/`schema-arena` mirror collapse and wrote §2.1 row **S3**:
+ * `packages/capital-allocator` → `packages/risk`, carrying the prototype-free
+ * parse door and NOTHING ELSE. One direction of that assertion is therefore
+ * now false by ruling, and the tests below assert the ruling instead — which is
+ * strictly stronger than what they replaced, because the old spelling
+ * (`from "@polymarket-bot/risk"`) could not see a subpath import at all. The
+ * reverse direction is unchanged and still absolute: `packages/risk` declares
+ * and imports nothing from `packages/capital-allocator`.
  */
 
 import { readFileSync, readdirSync } from "node:fs";
@@ -269,43 +282,71 @@ describe("end-to-end: the allocator's own numbers drive the risk limit", () => {
   });
 });
 
-describe("no workspace edge exists between the two packages", () => {
+describe("exactly one workspace edge exists between the two packages, and it is S3", () => {
   function manifest(name: string): Record<string, Record<string, string> | undefined> {
     return JSON.parse(
       readFileSync(resolve(repoRoot, "packages", name, "package.json"), "utf8"),
     ) as Record<string, Record<string, string> | undefined>;
   }
 
-  it("neither manifest declares the other (dependency-direction F13)", () => {
-    for (const [self, other] of [
-      ["risk", "@polymarket-bot/capital-allocator"],
-      ["capital-allocator", "@polymarket-bot/risk"],
-    ] as const) {
-      const declared = {
-        ...(manifest(self)["dependencies"] ?? {}),
-        ...(manifest(self)["devDependencies"] ?? {}),
-      };
-      expect(Object.keys(declared)).not.toContain(other);
-    }
+  function declaredWorkspacePeers(name: string): string[] {
+    return Object.keys({
+      ...(manifest(name)["dependencies"] ?? {}),
+      ...(manifest(name)["devDependencies"] ?? {}),
+    })
+      .filter((dependency) => dependency.startsWith("@polymarket-bot/"))
+      .sort();
+  }
+
+  /** The two subpaths §2.1 S3 permits, and the only ones. */
+  const DOOR_SUBPATHS = ["@polymarket-bot/risk/plain-data", "@polymarket-bot/risk/schema-arena"];
+
+  it("the edge runs allocator → risk and NEVER back (F9: the reverse would close a cycle)", () => {
+    expect(declaredWorkspacePeers("capital-allocator")).toContain("@polymarket-bot/risk");
+    expect(declaredWorkspacePeers("risk")).not.toContain("@polymarket-bot/capital-allocator");
   });
 
-  it("neither package declares any other layer-1 workspace peer", () => {
-    // The only workspace dependencies either package may hold are the two
-    // layer-0 contracts; anything else would be a same-layer edge needing a
-    // cited §2.1 row.
-    for (const name of ["risk", "capital-allocator"] as const) {
-      const declared = Object.keys({
-        ...(manifest(name)["dependencies"] ?? {}),
-        ...(manifest(name)["devDependencies"] ?? {}),
-      }).filter((dependency) => dependency.startsWith("@polymarket-bot/"));
-      expect(declared.sort()).toEqual(["@polymarket-bot/decimal", "@polymarket-bot/domain"]);
-    }
+  it("neither package declares any layer-1 workspace peer beyond the S3 edge", () => {
+    // The only workspace dependencies `packages/risk` may hold are the two
+    // layer-0 contracts. `packages/capital-allocator` holds those plus exactly
+    // one same-layer edge, the cited §2.1 S3 row; anything else would be an
+    // unlisted same-layer edge (F13).
+    expect(declaredWorkspacePeers("risk")).toEqual([
+      "@polymarket-bot/decimal",
+      "@polymarket-bot/domain",
+    ]);
+    expect(declaredWorkspacePeers("capital-allocator")).toEqual([
+      "@polymarket-bot/decimal",
+      "@polymarket-bot/domain",
+      "@polymarket-bot/risk",
+    ]);
   });
 
-  it("neither package's source IMPORTS the other, or any other layer-1 peer", () => {
-    // Prose references to a peer package are expected — the mirrored modules
-    // cite where they were mirrored from. What must not appear is an import
-    // SPECIFIER, so the assertion is on `from "<name>"`, not on the name.
+  it("the S3 edge carries the parse door and NOTHING ELSE — not the package root", () => {
+    // GOV-2A's constraint, verbatim: "No rule, policy, or evaluation logic may
+    // travel this edge." Mechanically, that means every `@polymarket-bot/risk`
+    // specifier in the allocator's source is one of the two door subpaths. A
+    // bare `from "@polymarket-bot/risk"` — the package root, which exports the
+    // engine, the policy and the recommendations — is a violation, and so is
+    // any future third subpath.
+    const directory = resolve(repoRoot, "packages", "capital-allocator", "src");
+    const specifiers: string[] = [];
+    for (const entry of readdirSync(directory)) {
+      if (!entry.endsWith(".ts")) continue;
+      const text = readFileSync(resolve(directory, entry), "utf8");
+      for (const match of text.matchAll(/(?:from|import\()\s*"(@polymarket-bot\/risk[^"]*)"/gu)) {
+        specifiers.push(match[1] ?? "");
+      }
+    }
+    // Non-vacuity: the allocator really does consume the door.
+    expect(specifiers.length).toBeGreaterThan(0);
+    expect([...new Set(specifiers)].sort()).toEqual(DOOR_SUBPATHS);
+  });
+
+  it("neither package's source IMPORTS any other layer-1 peer", () => {
+    // Prose references to a peer package are expected. What must not appear is
+    // an import SPECIFIER, so the assertion is on `from "<name>"` and on
+    // `from "<name>/…"`, not on the bare name.
     const forbiddenPeers = [
       "@polymarket-bot/capital-allocator",
       "@polymarket-bot/risk",
@@ -321,8 +362,16 @@ describe("no workspace edge exists between the two packages", () => {
         const text = readFileSync(resolve(directory, entry), "utf8");
         for (const peer of forbiddenPeers) {
           if (peer === `@polymarket-bot/${name}`) continue;
-          expect(text, `${name}/src/${entry} imports ${peer}`).not.toContain(`from "${peer}"`);
-          expect(text, `${name}/src/${entry} imports ${peer}`).not.toContain(`import("${peer}")`);
+          for (const match of text.matchAll(/(?:from|import\()\s*"([^"]+)"/gu)) {
+            const specifier = match[1] ?? "";
+            if (specifier !== peer && !specifier.startsWith(`${peer}/`)) continue;
+            // The one permitted crossing is the cited §2.1 S3 door edge.
+            const permitted =
+              name === "capital-allocator" &&
+              peer === "@polymarket-bot/risk" &&
+              DOOR_SUBPATHS.includes(specifier);
+            expect(permitted, `${name}/src/${entry} imports ${specifier}`).toBe(true);
+          }
         }
       }
     }

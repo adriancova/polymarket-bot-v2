@@ -18,8 +18,8 @@ import {
   explainCanonicalDecimalString,
   type DecimalRange,
 } from "@polymarket-bot/decimal";
+import { describeValue } from "@polymarket-bot/risk/plain-data";
 
-import { describeValue } from "./plain-data.js";
 import { uuidShapedNotCanonical } from "./guards.js";
 
 export interface Problem {

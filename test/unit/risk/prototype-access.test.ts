@@ -176,14 +176,17 @@ const REGISTERED: readonly Registration[] = [
       { file: "packages/risk/src/plain-data.ts", enclosing: "copyPlainData", text: "Object.getOwnPropertyNames(value)" },
       { file: "packages/risk/src/plain-data.ts", enclosing: "ownDataDetails", text: "Object.getOwnPropertyNames(details)" },
       { file: "packages/capital-allocator/src/guards.ts", enclosing: "freezeRecursive", text: "Reflect.ownKeys(value)" },
-      { file: "packages/capital-allocator/src/plain-data.ts", enclosing: "ownStringKeys", text: "Reflect.ownKeys(container)" },
-      { file: "packages/capital-allocator/src/plain-data.ts", enclosing: "copyPlainData", text: "Object.getOwnPropertyNames(value)" },
-      { file: "packages/capital-allocator/src/plain-data.ts", enclosing: "ownDataDetails", text: "Object.getOwnPropertyNames(details)" },
     ] as const
   ).map((site) => ({ ...site, kind: "own-enumeration" as const, count: 1, reason: OWN_ENUMERATION_PRIMITIVE })),
 
-  // --- the round-8 parsing arena, in both copies ----------------------------
-  ...(["risk", "capital-allocator"] as const).flatMap((packageName) => {
+  // --- the round-8 parsing arena ---------------------------------------------
+  // Registered once, not twice: `WP-180-FU2` collapsed the mirrored copy in
+  // `packages/capital-allocator` into this one on 2026-09-04, and the allocator
+  // now imports it across the §2.1 S3 edge. Every site below is unchanged — the
+  // module's body was not edited by the collapse, only its duplication removed.
+  // `test/unit/execution-planner/mirrors.test.ts` fails if a copy reappears, so
+  // a second package's sites cannot return unregistered.
+  ...(["risk"] as const).flatMap((packageName) => {
     const file = `packages/${packageName}/src/schema-arena.ts`;
     return [
       {
@@ -278,8 +281,9 @@ const REGISTERED: readonly Registration[] = [
     ];
   }),
 
-  // --- the prototype primitives in the mirrored data-record boundary --------
-  ...(["risk", "capital-allocator"] as const).flatMap((packageName) => {
+  // --- the prototype primitives in the data-record boundary -----------------
+  // Registered once for the same reason as the arena above (`WP-180-FU2`).
+  ...(["risk"] as const).flatMap((packageName) => {
     const file = `packages/${packageName}/src/plain-data.ts`;
     return [
       {

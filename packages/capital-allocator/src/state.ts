@@ -39,6 +39,7 @@ import {
   type RunModeSchema,
   type SharesString,
 } from "@polymarket-bot/domain";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
 import { deepFreeze, ownEntry, setOwn, uuidShapedNotCanonical } from "./guards.js";
@@ -51,7 +52,6 @@ import {
   type CapitalRefusal,
   type CapitalResult,
 } from "./refusals.js";
-import { prototypeFreeParser } from "./schema-arena.js";
 
 /** Optional scope attribution for the §9.7 exposure dimensions. */
 export const ScopeAttributionSchema = z.strictObject({

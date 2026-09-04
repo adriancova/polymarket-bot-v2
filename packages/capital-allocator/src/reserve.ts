@@ -40,6 +40,7 @@ import {
   RUN_MODE_PLACES_REAL_ORDERS,
   RunModeSchema,
 } from "@polymarket-bot/domain";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
 import { liveMicroCapRefusals, type AllocatorCaps } from "./caps.js";
@@ -62,7 +63,6 @@ import {
   type AllocatorState,
   type AppliedReservation,
 } from "./state.js";
-import { prototypeFreeParser } from "./schema-arena.js";
 
 export const ReservationRequestSchema = z.strictObject({
   reservationId: NonEmptyStringSchema,

@@ -39,11 +39,11 @@
 
 import { compareDecimal } from "@polymarket-bot/decimal";
 import { RUN_MODES, type RunMode } from "@polymarket-bot/domain";
+import { readPlainData } from "@polymarket-bot/risk/plain-data";
 
 import { InternalMarketIdDoor, IsoTimestampDoor } from "./doors.js";
 import { deepFreeze, uuidShapedNotCanonical } from "./guards.js";
 import type { ScopeAttribution } from "./inputs.js";
-import { readPlainData } from "./plain-data.js";
 import {
   contained,
   plannerFailure,

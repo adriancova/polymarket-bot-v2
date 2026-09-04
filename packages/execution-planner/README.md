@@ -87,28 +87,33 @@ verbatim (never UUID-checked, ADR-016 §2 exclusion `orderIds`/`reason`). A
 genuinely malformed cancel still refuses: nothing becomes a cancel by
 accident.
 
-## 5. Boundaries and mirrored modules
+## 5. Boundaries and the shared parse door
 
 Every value this package did not construct is read into a prototype-free
-materialized tree first (`src/plain-data.ts`), and every domain-schema parse
-goes through a warmed, prototype-free arena copy (`src/schema-arena.ts`,
-wrapping `packages/domain`'s frozen `IntentSchema` / `IsoTimestampSchema` /
-`InternalMarketIdSchema`) — the measured cross-package `zod` classes
-(IMPLEMENTATION_STATUS.md, Open blockers: adoption, loss, defeated defaults,
-`skipChecks`, inherited `when`, cold-lazy poisoning, descriptor literals)
-are probed directly in `test/unit/execution-planner/hostile-inputs.test.ts`.
+materialized tree first (`@polymarket-bot/risk/plain-data`), and every
+domain-schema parse goes through a warmed, prototype-free arena copy
+(`@polymarket-bot/risk/schema-arena`, wrapping `packages/domain`'s frozen
+`IntentSchema` / `IsoTimestampSchema` / `InternalMarketIdSchema`) — the measured
+cross-package `zod` classes (IMPLEMENTATION_STATUS.md, Open blockers: adoption,
+loss, defeated defaults, `skipChecks`, inherited `when`, cold-lazy poisoning,
+descriptor literals) are probed directly in
+`test/unit/execution-planner/hostile-inputs.test.ts`.
 
-**Mirrored modules.** `plain-data.ts` and `schema-arena.ts` are duplicated,
-not shared, from `packages/risk` (as `packages/capital-allocator` already
-duplicates them): a shared module needs a
-`docs/contracts/dependency-direction.md` §2.1 same-layer edge that does not
-exist, and this package may not widen a frozen contract for its own
-convenience. The copies are byte-identical below their headers —
-`test/unit/execution-planner/mirrors.test.ts` fails on any drift across all
-three packages — and the third duplication is recorded for the contract
-owner's cross-package schema-boundary governance round to collapse with one
-§2.1 row. This package declares **no `zod` dependency** at all: it calls
-`.safeParse` only on schema objects the domain package exports.
+**The parse door is imported, not copied** *(changed 2026-09-04 by
+`WP-180-FU2`; this section previously read "Mirrored modules" and described a
+third byte-identical duplication)*. `plain-data.ts` and `schema-arena.ts` used
+to be duplicated here from `packages/risk`, because a shared module needed a
+`docs/contracts/dependency-direction.md` §2.1 same-layer edge that did not
+exist. `GOV-2A` ruled the duplication out and wrote the edge: this package
+declares `@polymarket-bot/risk` and consumes the two modules across §2.1
+**S4**, through `packages/risk`'s `exports` map (F16). The ruling's constraint
+travels with the edge — **no rule, policy, or evaluation logic may cross it**;
+this package's leg selection, tick conformance, slicing, hysteresis and
+escalation policy are its own. `test/unit/execution-planner/mirrors.test.ts` is
+now the DELETION guard: it fails if either module's body reappears in any
+package outside `packages/risk`. This package still declares **no `zod`
+dependency** at all: it calls `.safeParse` only on schema objects the domain
+package exports, through the arena that `packages/risk` owns.
 
 **Structural ports.** `ApprovedIntentRecord` (in) and the allocator's
 `ReservationRequest` (out) are consumed/emitted by shape;

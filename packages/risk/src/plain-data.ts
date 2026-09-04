@@ -1,6 +1,20 @@
 /**
  * THE DATA-RECORD BOUNDARY — adversarial review rounds 4 and 5.
  *
+ * CANONICAL, AND THE ONLY COPY (`WP-180-FU2`, 2026-09-04). This module used to
+ * be DUPLICATED into `packages/capital-allocator` and
+ * `packages/execution-planner`, byte-identical below the marker and bound by a
+ * drift test. `GOV-2A` ruled the duplication out — a security mechanism that
+ * must be fixed in three places, in three grants, is the wrong shape for a
+ * security mechanism — and collapsed the three copies here. Both consumers now
+ * import it as `@polymarket-bot/risk/plain-data` across the
+ * `docs/contracts/dependency-direction.md` §2.1 **S3** / **S4** same-layer
+ * edges; the module is reachable only through this package's `exports` map
+ * (F16). Nothing below this header changed in the collapse — the body is byte
+ * for byte what review rounds 4-9 left here. `test/unit/execution-planner/
+ * mirrors.test.ts` is now the DELETION guard: it fails if a copy of this body
+ * reappears under any other package's `src`.
+ *
  * WHY THIS MODULE EXISTS. Round 3 replaced a list of identity fields with a
  * WALK over the record about to be emitted. Round 4 found the walk's
  * ENUMERATION PRIMITIVE had become the new list: `Object.entries` sees only

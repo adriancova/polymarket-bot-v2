@@ -798,7 +798,7 @@ describe("dependency-direction check — round-1 review regressions", () => {
     it("keeps the shipping contract valid under all of the above", () => {
       const report = runCheckerJson(repoRoot);
       expect(report.ok).toBe(true);
-      expect(report.allowlist.map((row) => row.id)).toEqual(["S0", "S1", "S2"]);
+      expect(report.allowlist.map((row) => row.id)).toEqual(["S0", "S1", "S2", "S3", "S4"]);
       for (const row of report.allowlist) expect(row.layer).not.toBeNull();
     });
   });
