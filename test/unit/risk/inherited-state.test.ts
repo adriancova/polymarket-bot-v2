@@ -70,6 +70,10 @@
  * in scope.
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 // Namespace imports for THE JOIN (R6-2): the swept surface is read from the
@@ -121,11 +125,22 @@ import {
 /**
  * How one extra property is put on `Object.prototype`.
  *
- * All six are NON-ENUMERABLE and CONFIGURABLE, which is the reviewer's probe
- * shape: an enumerable one would break every `for…in` in the process and prove
- * nothing about this package. The two getters are the reviewer's exactly — one
- * that answers differently on a second read (the round-6 inventory probe) and
- * one that throws.
+ * All six are NON-ENUMERABLE and CONFIGURABLE. Round 6 justified excluding
+ * enumerable data properties with "an enumerable one would break every
+ * `for…in` in the process and prove nothing about this package" — and review
+ * round 9 PARTIALLY FALSIFIED that (2026-09-04, measured): on a COLD first
+ * parse the schema library's own lazy `for…in` walk met the inherited
+ * enumerable key DETERMINISTICALLY INSIDE the door, threw, and the containment
+ * guard trapped a valid CANCEL as `RISK_INPUT_INVALID` — an order-dependent
+ * defect this warm-process sweep could never see (any one clean parse warms
+ * the lazies and the trap stops firing). The rationale's other half still
+ * stands: in THIS process, which is mid-test-run, a long-lived enumerable
+ * pollutant would perturb the harness itself, so the enumerable-data class is
+ * covered where coldness can be controlled instead — `cold-first-parse.test.ts`
+ * (a worker whose first door parse happens inside the polluted window) and the
+ * cold-by-construction copies in `schema-arena.test.ts`. The two getters below
+ * are the round-6 reviewer's exactly — one that answers differently on a
+ * second read (the inventory probe) and one that throws.
  *
  * THE TWO SETTER MODES ARE ROUND 8'S (the reviewer's BLOCKER). A getter is
  * invoked when something READS a name; a SETTER is invoked when something
@@ -320,7 +335,11 @@ function candidateKeys(material: unknown, extra: readonly string[] = []): string
       key.length < 90 &&
       !ARRAY_INDEX.test(key) &&
       !Object.hasOwn(Object.prototype, key) &&
-      !Object.hasOwn(Array.prototype, key),
+      // Names OWN on `Array.prototype` are excluded because the sweep ADDS,
+      // never replaces — EXCEPT the audited round-9 carve-outs, where the own
+      // member shadows the chain and adding the name to `Object.prototype`
+      // replaces nothing an array can see ({@link ZOD_ARRAY_SHADOWED_NAMES}).
+      (!Object.hasOwn(Array.prototype, key) || ZOD_ARRAY_SHADOWED_NAMES.has(key)),
   );
 }
 
@@ -401,9 +420,90 @@ const DESCRIPTOR_ATTRIBUTE_NAMES: readonly string[] = [
   "configurable",
 ];
 
+/**
+ * Every name the SCHEMA LIBRARY'S PARSE PATH can consult on a container it
+ * built (review round 9).
+ *
+ * THE BLIND SPOT THIS CLOSES. The library keeps per-node state in `inst._zod`
+ * — an ordinary object literal — and reads OPTIONAL fields off it, off its
+ * parse context, off check definitions and off its payload objects at parse
+ * time. None of those names is an input field, a schema default or a
+ * descriptor attribute, so no earlier key material ever named one — and round
+ * 9 measured two as LIVE FAIL-OPENS at the round-8 tip: `optin`+`optout`
+ * together waived every required key, and `when: () => false` skipped every
+ * custom check (`docs/handoffs/WP-180.md`, round 9, transcripts). The arena
+ * now severs every container it builds (`schema-arena.ts`,
+ * `severOrdinaryChain`), and these names are swept from here on so the class
+ * cannot come back.
+ *
+ * DERIVED, NOT REMEMBERED. {@link consultedZodSlotNames} re-extracts the
+ * `_zod.<name>` reads from the library's SHIPPED source at test time, and the
+ * audit test below requires this hand-reviewed list to cover that extraction
+ * IN FULL — so a `zod` upgrade that starts consulting a new instance slot
+ * arrives as a FAILING TEST, not as a silent hole. The names beyond the
+ * `_zod.` extraction are the parse-context switches (`skipChecks`,
+ * `direction`, `jitless`, `async` — round 8's finding, kept swept), the
+ * definition/check switches (`when`, `abort`, `coerce`, `catchall`,
+ * `unionFallback`, `inclusive`, `discriminator`), the payload/issue fields the
+ * abort logic reads (`aborted`, `continue`), and `disc` (the reviewer's name
+ * for the discriminator-map state; a closure in the shipped build, swept
+ * anyway so a future version that materializes it is already covered).
+ */
+const ZOD_PARSE_STATE_NAMES: readonly string[] = [
+  // _zod instance slots (the mechanical extraction, hand-reviewed below)
+  "bag",
+  "check",
+  "constr",
+  "def",
+  "deferred",
+  "innerType",
+  "onattach",
+  "optin",
+  "optout",
+  "parent",
+  "parse",
+  "pattern",
+  "propValues",
+  "qin",
+  "run",
+  "traits",
+  "values",
+  "version",
+  // parse-context switches (round 8's class, kept in the material)
+  "skipChecks",
+  "direction",
+  "jitless",
+  "async",
+  // definition and check switches read during a parse
+  "when",
+  "abort",
+  "coerce",
+  "catchall",
+  "unionFallback",
+  "inclusive",
+  "discriminator",
+  // payload/issue fields the abort logic reads
+  "aborted",
+  "continue",
+  // the discriminator-map state, by the reviewer's name
+  "disc",
+];
+
+/**
+ * Names on {@link ZOD_PARSE_STATE_NAMES} that are OWN properties of
+ * `Array.prototype` and would otherwise be dropped by {@link candidateKeys}'
+ * intrinsic filter. Adding one of these to `Object.prototype` REPLACES no
+ * intrinsic — an array still finds `Array.prototype.values` first, because the
+ * own member shadows the chain — so the sweep may carry them. (`keys` and
+ * `entries` would need the same carve-out but are not consulted `_zod` slots;
+ * they are normalized-table fields the library always writes as OWN.)
+ */
+const ZOD_ARRAY_SHADOWED_NAMES: ReadonlySet<string> = new Set(["values"]);
+
 const INTERNAL_NAMES: readonly string[] = [
   ...SCHEMA_DEFAULT_NAMES,
   ...DESCRIPTOR_ATTRIBUTE_NAMES,
+  ...ZOD_PARSE_STATE_NAMES,
   "GLOBAL",
   "value",
   "combined",
@@ -1025,6 +1125,124 @@ describe("THE MECHANISM: an inherited property changes no public answer", () => 
     // harvest — only the intrinsic spellings are excluded)
     expect(candidateKeys({ toString: "x", hasOwnProperty: "y" })).toEqual(["x", "y"]);
     expect(candidateKeys({ a: "b" }, ["toString", "constructor", "length"])).toEqual(["a", "b"]);
+  });
+});
+
+describe("the zod slot-name audit is MECHANICAL (review round 9)", () => {
+  /**
+   * Eight review rounds of this package say hand-enumerated site lists always
+   * miss one, so the round-9 slot-name material is not allowed to be one. This
+   * re-derives, from the library's SHIPPED parse-path source, every `_zod`
+   * instance-slot name it reads with a dotted access, and requires the pinned
+   * audit and the swept material to cover the derivation IN FULL — a `zod`
+   * upgrade that starts consulting a new slot is therefore a FAILING TEST here,
+   * before it can be a silent prototype walk in a door.
+   *
+   * The `.cjs` build is read (rather than the `.js` one the test runner loads)
+   * because the two are compiled from the same source and the text is what is
+   * being audited; `versions.cjs` pins the library, and the lockfile pins the
+   * version this audit was made against.
+   */
+  const ZOD_CORE = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "../../../packages/domain/node_modules/zod/v4/core",
+  );
+  /** The files on the synchronous parse path, construction included. */
+  const PARSE_PATH_FILES = ["core.cjs", "parse.cjs", "schemas.cjs", "checks.cjs", "util.cjs"];
+
+  /** The audited extraction at `zod@4.4.3`, sorted — the pin an upgrade hits. */
+  const EXPECTED_ZOD_SLOT_READS: readonly string[] = [
+    "bag",
+    "check",
+    "constr",
+    "def",
+    "deferred",
+    "innerType",
+    "onattach",
+    "optin",
+    "optout",
+    "parent",
+    "parse",
+    "pattern",
+    "propValues",
+    "qin",
+    "run",
+    "traits",
+    "values",
+    "version",
+  ];
+
+  function shippedSource(file: string): string {
+    return readFileSync(resolve(ZOD_CORE, file), "utf8");
+  }
+
+  it("every `_zod.<name>` read in the shipped library is audited and swept", () => {
+    const extracted = new Set<string>();
+    for (const file of PARSE_PATH_FILES) {
+      for (const match of shippedSource(file).matchAll(/_zod\.([A-Za-z_$][A-Za-z0-9_$]*)/gu)) {
+        extracted.add(match[1] ?? "");
+      }
+    }
+    expect([...extracted].sort()).toEqual([...EXPECTED_ZOD_SLOT_READS]);
+    const material = new Set(ZOD_PARSE_STATE_NAMES);
+    const unswept = [...extracted].filter((name) => !material.has(name));
+    expect(unswept).toEqual([]);
+  });
+
+  it("the one COMPUTED `_zod[…]` read is pinned, and its keys are already audited", () => {
+    // `getTupleOptStart(items, key)` reads `items[i]._zod[key]`; its only two
+    // call sites pass "optin" and "optout", both on the audited list. A new
+    // computed read — one this extraction cannot name — fails here.
+    const counts = PARSE_PATH_FILES.map(
+      (file) => (shippedSource(file).match(/_zod\[/gu) ?? []).length,
+    );
+    expect(counts).toEqual([0, 0, 1, 0, 0]);
+    const schemas = shippedSource("schemas.cjs");
+    expect(schemas).toContain('getTupleOptStart(items, "optin")');
+    expect(schemas).toContain('getTupleOptStart(items, "optout")');
+  });
+
+  it("non-vacuity: the extraction sees the two names round 9 measured live", () => {
+    const schemas = shippedSource("schemas.cjs");
+    expect(schemas).toContain("._zod.optin");
+    expect(schemas).toContain("._zod.optout");
+    expect(schemas).toContain(".def.when");
+  });
+
+  it("the audited names actually REACH the sweep's key material (anti-vacuity)", () => {
+    // The round-9 mutation check found this gap in its own first draft: with
+    // `ZOD_PARSE_STATE_NAMES` removed from `INTERNAL_NAMES`, every test above
+    // still passed, because the derivation only bound the extraction to the
+    // CONSTANT and nothing bound the constant to the material the sweep
+    // actually runs. This binds it: every audited name must survive
+    // `candidateKeys`' filters and arrive as a candidate key.
+    const keys = new Set(candidateKeys({}, INTERNAL_NAMES));
+    const missing = ZOD_PARSE_STATE_NAMES.filter((name) => !keys.has(name));
+    expect(missing).toEqual([]);
+  });
+
+  it("the carve-out is exactly what it claims: an ADD that replaces nothing", () => {
+    for (const name of ZOD_ARRAY_SHADOWED_NAMES) {
+      expect(ZOD_PARSE_STATE_NAMES).toContain(name);
+      expect(Object.hasOwn(Array.prototype, name)).toBe(true);
+      expect(Object.hasOwn(Object.prototype, name)).toBe(false);
+      // an array still answers from its own prototype, not from the chain
+      Object.defineProperty(Object.prototype, name, {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value: "inherited",
+      });
+      try {
+        expect(([] as unknown as Record<string, unknown>)[name]).not.toBe("inherited");
+        expect(({} as Record<string, unknown>)[name]).toBe("inherited");
+      } finally {
+        delete (Object.prototype as Record<string, unknown>)[name];
+      }
+    }
+    // and the swept material actually receives the carved-out names
+    const keys = candidateKeys({}, [...ZOD_ARRAY_SHADOWED_NAMES]);
+    for (const name of ZOD_ARRAY_SHADOWED_NAMES) expect(keys).toContain(name);
   });
 });
 

@@ -118,6 +118,26 @@
  *    as `prototype-write`, because `Object.create(null)` and `Object.create(p)`
  *    differ by exactly the thing this census is about, and a registration makes
  *    which one it is visible.)
+ * 8. **INDIRECTION AROUND A STATIC MEMBER CALL** (review round 9, stated after
+ *    the reviewer measured both forms passing the census). The `Object.*` /
+ *    `Reflect.*` classification matches one callee shape — an IDENTIFIER named
+ *    `Object` or `Reflect`, a dot, a member, a CALL — so two forms evade it:
+ *    - **alias capture**: `const zz = Object.getPrototypeOf;` binds the
+ *      function without calling it, and the later `zz(o)` call has no `Object`
+ *      in its callee. This is item 1's territory (a dotted READ of a member),
+ *      but it deserves its own naming because the captured member is one the
+ *      table would have CLASSIFIED at a direct call site;
+ *    - **a cast in the callee**: `(Object as unknown as { groupBy… }).groupBy(…)`
+ *      wraps the identifier in a parenthesized `as`-expression, so
+ *      `staticMemberCall` does not see `Object` and the fail-closed
+ *      `object-unclassified` default never fires.
+ *    The census is a guard against ACCIDENT — an unclassified member arriving
+ *    in ordinary code — not against a author writing indirection to defeat it;
+ *    that author also has to get the alias or the cast past `pnpm lint`,
+ *    `pnpm typecheck` and an adversarial review that has now named both forms.
+ *    Neither form appears in either package today, and a detector upgrade
+ *    (resolving aliases and unwrapping casts) is recorded as a follow-up in
+ *    `docs/handoffs/WP-180.md` rather than claimed here.
  * `with (o) { … }` is NOT an exclusion — review round 8 noted it was absent
  * from a list that called itself complete, and it is now DETECTED
  * (`with-statement`, above) rather than argued about. It is also independently
@@ -127,8 +147,15 @@
  * would NOT have caught one, and `pnpm typecheck` is the gate that would.
  * {@link diagnosticsOfSourceText} lets `prototype-access.test.ts` assert that
  * second gate as a measurement instead of a claim.
+ * CORRECTED (review round 9, 2026-09-04): round 8's framing had the layers in
+ * the wrong order. The reviewer measured that a `// @ts-expect-error` comment
+ * suppresses BOTH diagnostics — `pnpm typecheck` exits 0 — and that `pnpm lint`
+ * stays clean too, while the census's `with-statement` DETECTOR still fails
+ * closed naming the site. The detector, not the type checker, is the layer
+ * that survives suppression comments; the round-8 sentences above are kept
+ * as written so the correction is visible rather than silent.
  *
- * Items 1–7 are the WHOLE of the exclusion. A form not listed here and not in
+ * Items 1–8 are the WHOLE of the exclusion. A form not listed here and not in
  * the table above is an omission, and `prototype-access.test.ts` probes each
  * detected form AND each excluded form so this list is exercised rather than
  * merely written.

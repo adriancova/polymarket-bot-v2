@@ -479,3 +479,199 @@ describe("the parse CONTEXT is prototype-free too (a live fail-open, closed)", (
     }
   });
 });
+
+describe("the copies' INSTANCE-SLOT containers are prototype-free too (review round 9)", () => {
+  /**
+   * ROUND 9'S BLOCKER, AND ITS CLASS. The library keeps per-node state in
+   * `inst._zod` — an ordinary object literal — and the parse path reads
+   * OPTIONAL fields off it. `el._zod.optin` and `el._zod.optout` decide whether
+   * a MISSING REQUIRED KEY is refused; on an ordinary container both reads
+   * walked the chain, and the PAIR on `Object.prototype` waived every required
+   * key in every door (measured at the round-8 tip: an entry missing
+   * `evaluatedAt` VALIDATED). Either name alone does not flip —
+   * `handlePropertyResult` needs both — which is measured below rather than
+   * assumed. The fix severs every copy's `_zod` container
+   * (`severOrdinaryChain`), so an absent slot answers `undefined` exactly as a
+   * clean process does.
+   */
+  function withData<T>(entries: readonly (readonly [string, unknown])[], body: () => T): T {
+    for (const [name, value] of entries) {
+      Object.defineProperty(Object.prototype, name, {
+        configurable: true,
+        enumerable: false,
+        writable: true,
+        value,
+      });
+    }
+    try {
+      return body();
+    } finally {
+      for (const [name] of entries) {
+        delete (Object.prototype as Record<string, unknown>)[name];
+      }
+    }
+  }
+
+  const OPT_PAIR = [
+    ["optin", "optional"],
+    ["optout", "optional"],
+  ] as const;
+
+  const missingRequiredKey = (): Record<string, unknown> => {
+    const input = entryInput() as unknown as Record<string, unknown>;
+    delete input["evaluatedAt"];
+    return input;
+  };
+
+  it("an inherited optin/optout pair no longer waives a required key", () => {
+    const clean = JSON.stringify(validateEvaluationInput(missingRequiredKey()));
+    expect(clean).toContain('"ok":false');
+    const polluted = withData(OPT_PAIR, () =>
+      JSON.stringify(validateEvaluationInput(missingRequiredKey())),
+    );
+    expect(polluted).toBe(clean);
+  });
+
+  /**
+   * The raw probes force the INTERPRETED parser (`jitless: true` — a documented
+   * per-parse option), which is the code path every arena copy runs: the
+   * COMPILED fastpass bakes `optin`/`optout` in at compile time, so once any
+   * clean parse in this worker has compiled it, the raw schema's compiled
+   * route stops being foolable — an order-dependence, not a defense. On a cold
+   * process the door itself flipped (transcript in `docs/handoffs/WP-180.md`,
+   * round 9).
+   */
+  interface JitlessParseable {
+    safeParse(value: unknown, ctx: { jitless: boolean }): { success: boolean };
+  }
+
+  it("non-vacuity: the RAW schema is still fooled by the pair, so the test measures the fix", () => {
+    const tree = materialized(missingRequiredKey());
+    const raw = RiskEvaluationInputSchema as unknown as JitlessParseable;
+    expect(raw.safeParse(tree, { jitless: true }).success).toBe(false);
+    expect(withData(OPT_PAIR, () => raw.safeParse(tree, { jitless: true }).success)).toBe(true);
+  });
+
+  it("measured precondition: either name ALONE flips nothing, even on the raw schema", () => {
+    const tree = materialized(missingRequiredKey());
+    const raw = RiskEvaluationInputSchema as unknown as JitlessParseable;
+    expect(
+      withData([["optin", "optional"]], () => raw.safeParse(tree, { jitless: true }).success),
+    ).toBe(false);
+    expect(
+      withData([["optout", "optional"]], () => raw.safeParse(tree, { jitless: true }).success),
+    ).toBe(false);
+  });
+
+  /**
+   * THE SAME CLASS, ON A CHECK. `runChecks` reads `ch._zod.def.when` before
+   * running a check; a shared check's def is an ordinary library literal, so
+   * one inherited `when: () => false` skipped every check that does not carry
+   * its own `when` — and the door schemas carry `custom` refinements that do
+   * not. Measured at the round-8 tip: `strategyInstanceId: "has whitespace"`
+   * VALIDATED under the pollution and was refused clean. The fix COPIES check
+   * instances with prototype-free definitions (`arenaCheck`).
+   */
+  const customCheckViolation = (): Record<string, unknown> => {
+    const input = cancelInput();
+    const context = input["context"] as Record<string, unknown>;
+    context["strategyInstanceId"] = "has whitespace";
+    return input;
+  };
+
+  it("an inherited `when` no longer skips a door's custom check", () => {
+    const clean = JSON.stringify(validateEvaluationInput(customCheckViolation()));
+    expect(clean).toContain('"ok":false');
+    const polluted = withData([["when", () => false]], () =>
+      JSON.stringify(validateEvaluationInput(customCheckViolation())),
+    );
+    expect(polluted).toBe(clean);
+  });
+
+  it("non-vacuity: the RAW schema skips its custom check under inherited `when`", () => {
+    const tree = materialized(customCheckViolation());
+    const raw = RiskEvaluationInputSchema as unknown as Parseable;
+    expect(raw.safeParse(tree).success).toBe(false);
+    expect(withData([["when", () => false]], () => raw.safeParse(tree).success)).toBe(true);
+  });
+
+  it("the severed containers are structurally what the fix claims", () => {
+    const copy = prototypeFreeParser(RiskEvaluationInputSchema) as unknown as {
+      _zod: { def: Record<string, unknown> };
+    };
+    expect(Object.getPrototypeOf(copy._zod)).toBeNull();
+    // the rebuilt spread-literal shape was severed after warming
+    expect(Object.getPrototypeOf(copy._zod.def["shape"] as object)).toBeNull();
+  });
+});
+
+describe("a COLD copy is immune to ENUMERABLE inherited data (review round 9, H-1)", () => {
+  /**
+   * ROUND 9'S HIGH. On the FIRST parse the library rebuilds an object schema's
+   * `shape` as an ordinary spread literal and walks it with `for…in` to compute
+   * `propValues` and the discriminated-union `disc` map. `for…in` on an
+   * ordinary object ENUMERATES inherited enumerable names, so ONE enumerable
+   * data property (`zzUnrelated: 1`) made a cold first parse THROW
+   * (`TypeError … reading 'values'`), the containment guard converted that into
+   * an input refusal, and a valid CANCEL was trapped (§6 invariant 13).
+   * Measured worse at the round-8 tip: the half-computed lazy is POISONED, so
+   * every LATER parse of that copy failed too — clean or polluted.
+   *
+   * The copies here are COLD BY CONSTRUCTION — each `prototypeFreeParser` call
+   * builds a fresh graph with fresh lazies — so this test does not depend on
+   * worker isolation. The door-level cold-process scenario (a whole process
+   * whose first door parse happens under pollution) lives in
+   * `cold-first-parse.test.ts`, which must be the only parser in its worker.
+   */
+  function withEnumerableData<T>(name: string, value: unknown, body: () => T): T {
+    Object.defineProperty(Object.prototype, name, {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value,
+    });
+    try {
+      return body();
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)[name];
+    }
+  }
+
+  const validCancel = (): unknown => materialized(cancelInput());
+  const malformedCancel = (): unknown => {
+    const input = cancelInput();
+    input["evaluatedAt"] = "definitely-not-a-timestamp";
+    return materialized(input);
+  };
+
+  it("a fresh copy's FIRST parse under enumerable pollution answers byte-identically", () => {
+    const clean = prototypeFreeParser(RiskEvaluationInputSchema) as unknown as Parseable;
+    const cleanValid = verdictOf(clean, validCancel());
+    const cleanMalformed = verdictOf(clean, malformedCancel());
+    expect(cleanValid).toContain('"success":true');
+    expect(cleanMalformed).toContain('"success":false');
+
+    // a SECOND fresh copy whose first-ever parse happens under the pollution
+    const cold = prototypeFreeParser(RiskEvaluationInputSchema) as unknown as Parseable;
+    const polluted = withEnumerableData("zzUnrelated", 1, () => ({
+      valid: verdictOf(cold, validCancel()),
+      malformed: verdictOf(cold, malformedCancel()),
+    }));
+    expect(polluted.valid).toBe(cleanValid);
+    expect(polluted.malformed).toBe(cleanMalformed);
+
+    // and the copy is not poisoned afterwards either
+    expect(verdictOf(cold, validCancel())).toBe(cleanValid);
+  });
+
+  it("a shape-key-named enumerable data property changes nothing either", () => {
+    // `type` is the discriminator: at the round-8 tip a cold `propValues` walk
+    // could meet it as an inherited entry. Post-fix the walk happened at build
+    // time, on a clean process, and the rebuilt containers are severed.
+    const cold = prototypeFreeParser(RiskEvaluationInputSchema) as unknown as Parseable;
+    const clean = prototypeFreeParser(RiskEvaluationInputSchema) as unknown as Parseable;
+    const expected = verdictOf(clean, validCancel());
+    const polluted = withEnumerableData("type", "1000", () => verdictOf(cold, validCancel()));
+    expect(polluted).toBe(expected);
+  });
+});

@@ -79,9 +79,78 @@ interface ArenaNode {
   };
 }
 
+/**
+ * A `zod` CHECK instance — `.min()`, `.max()`, a `.refine()` — described the
+ * same way. A check has `check` where a schema node has `run`, and review
+ * round 9 measured why the arena must copy rather than share them: the parse
+ * path reads `ch._zod.def.when` to decide whether a check runs at all, a shared
+ * check's def is an ordinary library literal, and one inherited
+ * `when: () => false` on `Object.prototype` silently skipped every custom check
+ * in every door (a `strategyInstanceId` of `"has whitespace"` VALIDATED at the
+ * round-8 tip).
+ */
+interface ArenaCheck {
+  readonly _zod: {
+    readonly def: Record<string, unknown>;
+    readonly constr: new (def: unknown) => ArenaCheck;
+    readonly check: (payload: ArenaPayload) => unknown;
+  };
+}
+
+/** One memo per build: original node → copy, original check → copy. */
+interface ArenaMemo {
+  readonly nodes: WeakMap<object, ArenaNode>;
+  readonly checks: WeakMap<object, ArenaCheck>;
+}
+
 /** A fresh container for slots, with no prototype and therefore no inheritance. */
 function emptySlots(): Record<string, unknown> {
   return Object.create(null) as Record<string, unknown>;
+}
+
+/**
+ * Severs an ORDINARY container's prototype chain, so an absent field answers
+ * `undefined` — the clean-process answer — instead of whatever a caller has put
+ * on `Object.prototype`. This is review round 9's class fix: the library keeps
+ * per-instance state in ordinary object literals (`_zod`, its `bag`, the
+ * rebuilt `shape`, the `propValues` table) and its parse path reads OPTIONAL
+ * fields off them (`optin`, `optout`, `values`, `when`, …), so every such read
+ * on a copy was a prototype walk. Two were measured as live fail-opens
+ * (transcripts in the module header); the fix removes the chain those reads
+ * walked rather than pinning the two names that happened to be caught.
+ *
+ * FAILS LOUDLY, BY DESIGN. When `requiredFor` is given, the container is one
+ * the arena's correctness DEPENDS on being an ordinary own-data object — a
+ * copy's `_zod`. If a `zod` upgrade ever ships one inheriting from anything but
+ * `Object.prototype` (state moved onto a class prototype, say), severing would
+ * silently discard that state — so this throws at BUILD TIME instead, which is
+ * module load, before any door can answer. Without `requiredFor` the container
+ * is merely hardened when it is ordinary and left alone otherwise (a `Set`, a
+ * `Map`, a `RegExp` are the library's own typed values and keep their
+ * prototypes).
+ */
+function severOrdinaryChain(container: unknown, requiredFor: string | undefined): void {
+  if (container === null || typeof container !== "object") {
+    if (requiredFor !== undefined) {
+      throw new Error(
+        `${SCHEMA_ARENA_ERROR}: ${requiredFor} is not an object, so the library has changed` +
+          " the internal layout this arena is pinned to. Re-measure before upgrading.",
+      );
+    }
+    return;
+  }
+  const chain = Object.getPrototypeOf(container);
+  if (chain === Object.prototype) {
+    Object.setPrototypeOf(container, null);
+    return;
+  }
+  if (chain !== null && requiredFor !== undefined) {
+    throw new Error(
+      `${SCHEMA_ARENA_ERROR}: ${requiredFor} inherits from an unexpected prototype. Severing` +
+        " it could silently discard library state, so this fails the build instead —" +
+        " re-measure the pinned internals before upgrading the library.",
+    );
+  }
 }
 
 /**
@@ -103,14 +172,18 @@ function defineSlot(target: Record<string, unknown>, name: string, value: unknow
 }
 
 /**
- * One slot of a schema DEFINITION, by name.
+ * One slot of a schema DEFINITION or of a copy's `_zod` container, by name.
  *
  * A plain read, deliberately: the library stores an object schema's `shape`
- * behind a memoizing GETTER, so a descriptor read would hand back the accessor
- * instead of the shape. Nothing caller-supplied is reachable here — these are
- * the definition objects the library built at module load from this
- * repository's own schema declarations — and `name` is always an OWN name of
- * `source`, taken from `Object.getOwnPropertyNames` on the line that calls this.
+ * behind a memoizing GETTER (and several `_zod` slots behind lazy getters), so
+ * a descriptor read would hand back the accessor instead of the value. Nothing
+ * caller-supplied is reachable here — these are the definition objects the
+ * library built at module load from this repository's own schema declarations,
+ * or `_zod` containers the arena has already severed. `name` is either an OWN
+ * name of `source` (taken from `Object.getOwnPropertyNames` on the calling
+ * line) or, in {@link warmNode} only, a possibly-absent slot on a container
+ * whose prototype is `null` — where an absent read answers `undefined` without
+ * consulting any chain.
  */
 function readSlot(source: Record<string, unknown>, name: string): unknown {
   return source[name];
@@ -123,6 +196,28 @@ function isArenaNode(value: unknown): value is ArenaNode {
   const slots = internals as { def?: unknown; constr?: unknown; run?: unknown };
   return (
     typeof slots.run === "function" &&
+    typeof slots.constr === "function" &&
+    slots.def !== null &&
+    typeof slots.def === "object"
+  );
+}
+
+/**
+ * A PURE check instance: it has `check` and no `run`. A string-format schema is
+ * BOTH a schema node and a check — it carries `run` — so {@link arenaSlot}
+ * classifies it as a node first, and its def (where its `when` would live) is
+ * already the prototype-free copy. This predicate is only for the residents of
+ * a definition's `checks` array: `min_length`, `max_length`, `greater_than`,
+ * `custom` and their kin.
+ */
+function isArenaCheck(value: unknown): value is ArenaCheck {
+  if (value === null || typeof value !== "object") return false;
+  const internals = (value as { _zod?: unknown })._zod;
+  if (internals === null || typeof internals !== "object") return false;
+  const slots = internals as { def?: unknown; constr?: unknown; check?: unknown; run?: unknown };
+  return (
+    slots.run === undefined &&
+    typeof slots.check === "function" &&
     typeof slots.constr === "function" &&
     slots.def !== null &&
     typeof slots.def === "object"
@@ -233,9 +328,10 @@ function arenaContext(ctx: unknown): object {
   return arena;
 }
 
-/** One definition slot, with every schema inside it replaced by its copy. */
-function arenaSlot(value: unknown, memo: WeakMap<object, ArenaNode>): unknown {
+/** One definition slot, with every schema OR CHECK inside it replaced by its copy. */
+function arenaSlot(value: unknown, memo: ArenaMemo): unknown {
   if (isArenaNode(value)) return arenaNode(value, memo);
+  if (isArenaCheck(value)) return arenaCheck(value, memo);
   if (Array.isArray(value)) {
     const items: unknown[] = [];
     for (const item of value as readonly unknown[]) items.push(arenaSlot(item, memo));
@@ -258,6 +354,88 @@ function arenaSlot(value: unknown, memo: WeakMap<object, ArenaNode>): unknown {
 }
 
 /**
+ * One CHECK of the parsing copy: same rule, prototype-free definition.
+ *
+ * Round 8 carried check instances over SHARED, and round 9 measured the
+ * consequence: the parse path reads `ch._zod.def.when` before running a check,
+ * a shared check's def is an ordinary library literal, and one inherited
+ * `when: () => false` skipped every custom check in every door — a live
+ * fail-open (module header). A shared def cannot be severed without mutating
+ * the library's own schema, so the check is COPIED exactly as a node is: the
+ * library's own constructor, a definition with no prototype, and a `_zod`
+ * container that cannot answer through a chain.
+ */
+function arenaCheck(original: ArenaCheck, memo: ArenaMemo): ArenaCheck {
+  const built = memo.checks.get(original);
+  if (built !== undefined) return built;
+  const def = original._zod.def;
+  const arenaDef = emptySlots();
+  for (const name of Object.getOwnPropertyNames(def)) {
+    defineSlot(arenaDef, name, arenaSlot(readSlot(def, name), memo));
+  }
+  const copy = new original._zod.constr(arenaDef);
+  memo.checks.set(original, copy);
+  severOrdinaryChain(copy._zod, "the _zod container of a check copy");
+  // A refinement built with the BASE check class keeps its RULE in instance
+  // state rather than in its definition (`_zod.check` is assigned directly, so
+  // reconstructing from the definition alone loses it — measured:
+  // `ch._zod.check is not a function` on every door). Carry every missing OWN
+  // DATA slot over from the original: the rule function is shared, which is
+  // exactly what round 8 already accepted for every check, and the slot lands
+  // on a severed container. An ACCESSOR instance slot would mean the library
+  // keeps check state in a shape this arena has never measured, so that fails
+  // the build instead of guessing.
+  const originalSlots = original._zod as unknown as Record<string, unknown>;
+  const copySlots = copy._zod as unknown as Record<string, unknown>;
+  for (const name of Object.getOwnPropertyNames(originalSlots)) {
+    if (name === "def" || Object.hasOwn(copySlots, name)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(originalSlots, name);
+    if (descriptor === undefined) continue;
+    if (!Object.hasOwn(descriptor, "value")) {
+      throw new Error(
+        `${SCHEMA_ARENA_ERROR}: a check instance carries the accessor slot "${name}", which` +
+          " the arena has never measured. Re-measure before upgrading the library.",
+      );
+    }
+    defineSlot(copySlots, name, descriptor.value);
+  }
+  return copy;
+}
+
+/**
+ * Forces every LAZILY BUILT parse structure of a fresh copy NOW — at build
+ * time, which is module load, which is clean by definition — and severs the
+ * chains of the ordinary containers the library rebuilt along the way.
+ *
+ * WHY (review round 9, the cold-first-parse trap). On the FIRST parse the
+ * library rebuilds an object schema's `shape` as an ordinary spread literal,
+ * walks it with `for…in` to compute `propValues`, and builds the
+ * discriminated-union discriminator map from those tables. `for…in` on an
+ * ordinary object ENUMERATES inherited enumerable names, so one enumerable
+ * data property on `Object.prototype` made a cold first parse throw — and the
+ * half-computed lazy is then POISONED, so every later parse of that copy fails
+ * too, clean or not (both measured; module header). One probe parse with an
+ * object-shaped value forces all of it while the process is clean: the `shape`
+ * getter, the normalized key tables, `propValues`, and the discriminator map
+ * (`disc` is reached whenever the discriminated union sees ANY object). The
+ * probe's verdict is discarded; a throw here is a BUILD failure, which is the
+ * loud outcome this module prefers to an unprotected parse.
+ */
+function warmNode(copy: ArenaNode): void {
+  copy._zod.run({ value: {}, issues: [] }, emptySlots());
+  // The library memoized `shape` as an ordinary `{ ...sh }` spread on the
+  // copy's own definition during the probe; sever it so no later walk or read
+  // of it can meet an inherited name.
+  const def = copy._zod.def;
+  if (Object.hasOwn(def, "shape")) severOrdinaryChain(readSlot(def, "shape"), undefined);
+  // Reading `propValues` forces that lazy for node kinds the probe could not
+  // reach it on; the table it returns is an ordinary literal, so sever it too.
+  const slots = copy._zod as unknown as Record<string, unknown>;
+  severOrdinaryChain(readSlot(slots, "propValues"), undefined);
+  severOrdinaryChain(readSlot(slots, "bag"), undefined);
+}
+
+/**
  * One node of the parsing copy: same kind, same definition, protected payload.
  *
  * The definition handed to the library's own constructor has NO PROTOTYPE
@@ -265,9 +443,16 @@ function arenaSlot(value: unknown, memo: WeakMap<object, ArenaNode>): unknown {
  * optional definition slots (`checks`, `catchall`, `error`) at construction
  * time, and on an ordinary definition object an absent slot is answered by
  * `Object.prototype`.
+ *
+ * Since round 9 the copy's `_zod` INSTANCE-SLOT container is severed as well —
+ * the parse path reads `optin`, `optout`, `values`, `pattern` and `propValues`
+ * off it, and on an ordinary container every absent one of those was a
+ * prototype walk (`optin`+`optout` together waived required keys; module
+ * header) — and the copy is WARMED so no lazy structure is left for a polluted
+ * first parse to build ({@link warmNode}).
  */
-function arenaNode(original: ArenaNode, memo: WeakMap<object, ArenaNode>): ArenaNode {
-  const built = memo.get(original);
+function arenaNode(original: ArenaNode, memo: ArenaMemo): ArenaNode {
+  const built = memo.nodes.get(original);
   if (built !== undefined) return built;
   const def = original._zod.def;
   const type = readSlot(def, "type");
@@ -286,10 +471,12 @@ function arenaNode(original: ArenaNode, memo: WeakMap<object, ArenaNode>): Arena
     defineSlot(arenaDef, name, arenaSlot(readSlot(def, name), memo));
   }
   const copy = new original._zod.constr(arenaDef);
-  memo.set(original, copy);
+  memo.nodes.set(original, copy);
+  severOrdinaryChain(copy._zod, `the _zod container of a "${type}" copy`);
   const libraryRun = copy._zod.run;
   copy._zod.run = (payload: ArenaPayload, ctx: object): unknown =>
     libraryRun(arenaPayload(payload), arenaContext(ctx));
+  warmNode(copy);
   return copy;
 }
 
@@ -313,5 +500,9 @@ export function prototypeFreeParser<T>(schema: T): T {
       `${SCHEMA_ARENA_ERROR}: the value handed to the arena is not a schema node (no _zod.def/constr/run)`,
     );
   }
-  return arenaNode(schema, new WeakMap<object, ArenaNode>()) as unknown as T;
+  const memo: ArenaMemo = {
+    nodes: new WeakMap<object, ArenaNode>(),
+    checks: new WeakMap<object, ArenaCheck>(),
+  };
+  return arenaNode(schema, memo) as unknown as T;
 }

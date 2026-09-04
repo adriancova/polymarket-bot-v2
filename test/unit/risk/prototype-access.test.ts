@@ -204,6 +204,10 @@ const REGISTERED: readonly Registration[] = [
             text: "Object.getOwnPropertyNames(value as Record<string, unknown>)",
           },
           { enclosing: "arenaNode", text: "Object.getOwnPropertyNames(def)" },
+          // round 9: the check copy walks the check's definition and the
+          // original's instance slots by OWN names, both at build time
+          { enclosing: "arenaCheck", text: "Object.getOwnPropertyNames(def)" },
+          { enclosing: "arenaCheck", text: "Object.getOwnPropertyNames(originalSlots)" },
         ] as const
       ).map((site) => ({
         ...site,
@@ -212,6 +216,33 @@ const REGISTERED: readonly Registration[] = [
         count: 1,
         reason: OWN_ENUMERATION_PRIMITIVE,
       })),
+      // --- round 9: the class fix — sever the library's own state containers -
+      {
+        file,
+        enclosing: "severOrdinaryChain",
+        kind: "prototype-read" as const,
+        text: "Object.getPrototypeOf(container)",
+        count: 1,
+        reason:
+          `${PROTOTYPE_READ_TO_CLASSIFY} — the question here is which of three states the` +
+          " library's state container is in: ordinary (sever it), already prototype-free" +
+          " (done), or something the arena has never measured (REFUSE the build, loudly —" +
+          " review round 9, where an ordinary `_zod` container answered `optin`/`optout`" +
+          " from `Object.prototype` and waived required keys)",
+      },
+      {
+        file,
+        enclosing: "severOrdinaryChain",
+        kind: "prototype-write" as const,
+        text: "Object.setPrototypeOf(container, null)",
+        count: 1,
+        reason:
+          `${PROTOTYPE_REMOVED} — review round 9's class fix: the library keeps per-node` +
+          " state in ordinary literals (`_zod`, its `bag`, the rebuilt `shape`, the" +
+          " `propValues` table) and its parse path reads OPTIONAL fields off them, so the" +
+          " chain those reads walked is removed at build time rather than the two caught" +
+          " names being pinned",
+      },
       {
         file,
         enclosing: "arenaSlot",
@@ -925,6 +956,24 @@ describe("THE MECHANISM: the detector sees each construct this package has been 
         "function f(o: object) { return o instanceof Map; }\n" +
         "const g = { toString() { return super.toString(); } };\n",
     },
+    {
+      // Round 9: the reviewer measured both of these passing the census, and
+      // the boundary is now STATED (scope item 8) instead of undocumented. The
+      // alias binds a classifiable member without a call; the cast hides the
+      // `Object` identifier from `staticMemberCall`. The census guards against
+      // accident, not against an author writing indirection to defeat it —
+      // typecheck, lint and review carry those forms.
+      item: "8 — alias capture of a classified member (round 9: stated, exercised)",
+      source: "export const zz = Object.getPrototypeOf;",
+    },
+    {
+      item: "8 — a cast in the callee defeats the member match (round 9: stated, exercised)",
+      source:
+        "function f(xs: readonly number[]) {\n" +
+        "  return (Object as unknown as { groupBy(a: unknown, b: unknown): unknown })" +
+        ".groupBy(xs, (x: number) => String(x));\n" +
+        "}",
+    },
   ];
 
   for (const excluded of EXCLUDED) {
@@ -945,15 +994,14 @@ describe("THE MECHANISM: the detector sees each construct this package has been 
   });
 
   /**
-   * ITEM 8 — `with`, and the gate that makes classifying it unnecessary.
+   * `with`, and the gate that makes classifying it unnecessary.
    *
    * Review round 8 noted that `with (o) { … }` resolves every bare identifier in
    * its body against `o`'s prototype chain, that the detector does not report
    * it, and that the claimed-complete exclusion list did not mention it. It is
-   * now item 8, and this is the measurement behind it: TypeScript reports a
-   * SYNTACTIC diagnostic for `with`, and `censusOfPrototypeAccess` refuses to
-   * run on a file with one — so a `with` in either package cannot reach the
-   * classification stage at all.
+   * now a DETECTED KIND (the scope list's `with` clause; "item 8" is the
+   * round-9 indirection boundary), and the measurements behind the layering are
+   * below — including round 9's, which reversed round 8's ordering of them.
    */
   it("round 8 — `with (o) { … }` is DETECTED, not argued about", () => {
     const sites = censusOfSourceText(
@@ -979,6 +1027,26 @@ describe("THE MECHANISM: the detector sees each construct this package has been 
     expect(diagnostics.semantic).toContain(1101);
     expect(diagnostics.semantic).toContain(2410);
     expect(diagnostics.syntactic).toEqual([]);
+  });
+
+  it("round 9 — a suppression comment defeats the TYPE gate, and the DETECTOR survives", () => {
+    // The reviewer measured round 8's framing backwards in one direction:
+    // `// @ts-expect-error` swallows BOTH `with` diagnostics (1101 and 2410),
+    // so `pnpm typecheck` exits clean — and eslint stays clean too. The layer
+    // that survives the suppression comment is the census's own
+    // `with-statement` detector, which still fails closed naming the site.
+    // (`object`, not `Record`: the probe harness runs `noLib`, where `Record`
+    // itself is a 2304 that would muddy the measurement.)
+    const suppressed =
+      "export function f(o: object): unknown {\n" +
+      "  // @ts-expect-error deliberately suppressed for the round-9 measurement\n" +
+      "  with (o) { return 0; }\n" +
+      "}\n";
+    const diagnostics = diagnosticsOfSourceText(suppressed);
+    expect(diagnostics.semantic).toEqual([]);
+    expect(diagnostics.syntactic).toEqual([]);
+    const sites = censusOfSourceText(suppressed);
+    expect(sites.map((site) => site.kind)).toContain("with-statement");
   });
 
   it("round 8 — the census's own guard: a SYNTACTIC diagnostic is what it refuses on", () => {
