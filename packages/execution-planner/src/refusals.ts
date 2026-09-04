@@ -14,7 +14,7 @@
  * reason code). The vocabulary is PACKAGE-OWNED and documented in `README.md`.
  */
 
-import { describeValue, ownDataDetails, readPlainData } from "./plain-data.js";
+import { describeValue, ownDataDetails, readPlainData } from "@polymarket-bot/risk/plain-data";
 
 /** Why a plan could not be built or sealed. */
 export type PlannerRefusalCode =

@@ -27,8 +27,7 @@ import {
   InternalMarketIdSchema,
   IsoTimestampSchema,
 } from "@polymarket-bot/domain";
-
-import { prototypeFreeParser } from "./schema-arena.js";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 
 /** §7.7 intents, discriminated on `type`. Built (and warmed) at module load. */
 export const IntentDoor = prototypeFreeParser(IntentSchema);

@@ -22,8 +22,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -48,8 +47,7 @@ import {
   marketInput,
   planningInputs,
 } from "./fixtures.js";
-
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+import { packageSourceFiles, readSource, repoRoot } from "./source-scan.js";
 
 // --- 1. compile-time pins ---------------------------------------------------
 
@@ -179,39 +177,115 @@ describe("the record port — WP-180's records as they are actually shaped at 98
   });
 });
 
-describe("independence — no workspace edge exists in any direction", () => {
-  it("no manifest among the three declares any of the others", () => {
-    const names = [
-      "packages/execution-planner",
-      "packages/risk",
-      "packages/capital-allocator",
-    ];
-    const manifests = names.map((name) => {
-      const parsed = JSON.parse(readFileSync(resolve(repoRoot, name, "package.json"), "utf8")) as {
-        name: string;
-        dependencies?: Record<string, string>;
-        devDependencies?: Record<string, string>;
-      };
-      return parsed;
-    });
-    const workspaceNames = new Set(manifests.map((manifest) => manifest.name));
-    for (const manifest of manifests) {
-      for (const dependency of Object.keys({
-        ...manifest.dependencies,
-        ...manifest.devDependencies,
-      })) {
-        expect(workspaceNames.has(dependency), `${manifest.name} declares ${dependency}`).toBe(false);
-      }
+/**
+ * INDEPENDENCE, AS IT STANDS AFTER THE MIRROR COLLAPSE.
+ *
+ * This describe used to be "no workspace edge exists in any direction" and
+ * asserted that none of the three manifests declared any of the others.
+ * `GOV-2A` ruled that shape out on 2026-09-04 and wrote
+ * `docs/contracts/dependency-direction.md` §2.1 rows **S3** and **S4**: both
+ * this package and `packages/capital-allocator` now declare
+ * `@polymarket-bot/risk`, and the reason is a security mechanism that may not
+ * be maintained in three places.
+ *
+ * The independence that still holds — and that these tests now assert
+ * positively rather than by a blanket "no edge" — is:
+ *
+ * - **direction**: `packages/risk` declares NEITHER consumer, so the graph is
+ *   acyclic (F9) and the ports below stay structural in the direction that
+ *   matters;
+ * - **surface**: the edge carries the prototype-free parse door and nothing
+ *   else, which is the ruling's own constraint ("No rule, policy, or
+ *   evaluation logic may travel this edge"). The record port and the
+ *   reservation port above are STILL structural: this package neither imports
+ *   `packages/risk`'s engine nor `packages/capital-allocator` at all.
+ */
+describe("independence — the only workspace edges are the cited §2.1 door edges", () => {
+  interface Manifest {
+    readonly name: string;
+    readonly dependencies?: Record<string, string>;
+    readonly devDependencies?: Record<string, string>;
+  }
+
+  const DOOR_SUBPATHS = ["@polymarket-bot/risk/plain-data", "@polymarket-bot/risk/schema-arena"];
+
+  function manifestOf(dir: string): Manifest {
+    return JSON.parse(readFileSync(resolve(repoRoot, dir, "package.json"), "utf8")) as Manifest;
+  }
+
+  function peersOf(manifest: Manifest): string[] {
+    return Object.keys({ ...manifest.dependencies, ...manifest.devDependencies })
+      .filter((dependency) => dependency.startsWith("@polymarket-bot/"))
+      .sort();
+  }
+
+  it("among the three, the only declared edges are S3 and S4 — both INTO packages/risk", () => {
+    const planner = manifestOf("packages/execution-planner");
+    const risk = manifestOf("packages/risk");
+    const allocator = manifestOf("packages/capital-allocator");
+    const theThree = new Set([planner.name, risk.name, allocator.name]);
+
+    // S4 and S3: each consumer declares the canonical package, and only it.
+    for (const consumer of [planner, allocator]) {
+      const amongTheThree = peersOf(consumer).filter((dependency) => theThree.has(dependency));
+      expect(amongTheThree, `${consumer.name}'s edges among the three`).toEqual([risk.name]);
     }
+    // The reverse direction stays empty: risk declares neither consumer (F9).
+    expect(peersOf(risk).filter((dependency) => theThree.has(dependency))).toEqual([]);
+    // And the two consumers still do not know about each other.
+    expect(peersOf(planner)).not.toContain(allocator.name);
+    expect(peersOf(allocator)).not.toContain(planner.name);
   });
 
-  it("the planner's dependency list is exactly the two downward edges", () => {
-    const manifest = JSON.parse(
-      readFileSync(resolve(repoRoot, "packages/execution-planner/package.json"), "utf8"),
-    ) as { dependencies?: Record<string, string> };
+  it("the planner's dependency list is the two downward edges plus the S4 door edge", () => {
+    const manifest = manifestOf("packages/execution-planner");
     expect(Object.keys(manifest.dependencies ?? {}).sort()).toEqual([
       "@polymarket-bot/decimal",
       "@polymarket-bot/domain",
+      "@polymarket-bot/risk",
     ]);
+  });
+
+  /**
+   * The scan is `source-scan.ts`'s RECURSIVE walker (review round 1, finding
+   * M7). It used to be `readdirSync(src)`, one level deep, and a file at
+   * `packages/execution-planner/src/nested/sneak.ts` importing the risk ENGINE
+   * from the package root passed this test, `determinism.test.ts`,
+   * `check:deps`, `typecheck` and `lint` — the collapse is what made that
+   * import RESOLVE, so the depth of this scan is now load-bearing.
+   */
+  it("the S4 edge carries the parse door and NOTHING ELSE — not the package root", () => {
+    const files = packageSourceFiles("packages/execution-planner");
+    const specifiers: string[] = [];
+    for (const file of files) {
+      for (const match of readSource(file).matchAll(
+        /(?:from|import\()\s*"(@polymarket-bot\/risk[^"]*)"/gu,
+      )) {
+        specifiers.push(match[1] ?? "");
+      }
+    }
+    // Non-vacuity: the scan found the tree, and the planner really does consume
+    // the door.
+    expect(files.length).toBeGreaterThan(10);
+    expect(specifiers.length).toBeGreaterThan(0);
+    expect([...new Set(specifiers)].sort()).toEqual(DOOR_SUBPATHS);
+  });
+
+  it("the record and reservation ports stay STRUCTURAL: no import of the engine or the allocator", () => {
+    const files = packageSourceFiles("packages/execution-planner");
+    expect(files.length).toBeGreaterThan(10);
+    for (const file of files) {
+      for (const match of readSource(file).matchAll(/(?:from|import\()\s*"([^"]+)"/gu)) {
+        const specifier = match[1] ?? "";
+        expect(specifier, `${file} imports the allocator`).not.toMatch(
+          /^@polymarket-bot\/capital-allocator(?:\/|$)/u,
+        );
+        // The package ROOT of `packages/risk` is where the engine, the policy
+        // and the recommendations live. Only the door subpaths may be imported.
+        if (specifier.startsWith("@polymarket-bot/risk")) {
+          expect(DOOR_SUBPATHS, `${file} imports ${specifier}`).toContain(specifier);
+        }
+      }
+    }
   });
 });

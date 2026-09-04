@@ -16,7 +16,7 @@
  * are bounded non-empty strings).
  */
 
-import { ownDataDescriptor } from "./plain-data.js";
+import { ownDataDescriptor } from "@polymarket-bot/risk/plain-data";
 
 /** Case-insensitive UUID shape (any variant/version — shape only). */
 const UUID_SHAPE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/u;

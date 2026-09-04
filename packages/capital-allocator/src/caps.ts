@@ -34,8 +34,9 @@
 import { z } from "zod";
 
 import { NonNegativeMoneyStringSchema } from "@polymarket-bot/domain";
+import { withSchemaDefaults, type SchemaDefault } from "@polymarket-bot/risk/plain-data";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 
-import { withSchemaDefaults, type SchemaDefault } from "./plain-data.js";
 import {
   capitalFailure,
   capitalOk,
@@ -45,7 +46,6 @@ import {
   type CapitalRefusal,
   type CapitalResult,
 } from "./refusals.js";
-import { prototypeFreeParser } from "./schema-arena.js";
 
 /**
  * The one permitted live-micro cap value: the exact canonical `AGENTS.md`

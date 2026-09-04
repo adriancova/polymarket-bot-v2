@@ -13,7 +13,8 @@
   },
   "dependencies": {
     "@polymarket-bot/decimal": "workspace:*",
-    "@polymarket-bot/domain": "workspace:*"
+    "@polymarket-bot/domain": "workspace:*",
+    "@polymarket-bot/risk": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.9.2"
