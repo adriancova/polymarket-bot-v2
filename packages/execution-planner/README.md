@@ -112,8 +112,11 @@ declares `@polymarket-bot/risk` and consumes the two modules across §2.1
 travels with the edge — **no rule, policy, or evaluation logic may cross it**;
 this package's leg selection, tick conformance, slicing, hysteresis and
 escalation policy are its own. `test/unit/execution-planner/mirrors.test.ts` is
-now the DELETION guard: it fails if either module's body reappears in any
-package outside `packages/risk`.
+now the DELETION guard: it fails if either module's body reappears under the
+`src` tree of any workspace member outside `packages/risk` — every `apps/*` as
+well as every `packages/*` *(the `apps/*` half was added 2026-09-04 in
+`WP-180-FU2` remediation round 2, review finding LOW-B, which measured a
+verbatim paste into `apps/trader/src/` passing the guard)*.
 
 **The S4 edge brings no `zod` with it — measured, not assumed.** This package
 declares no `zod` dependency, and it acquires none transitively: neither door

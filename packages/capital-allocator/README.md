@@ -289,8 +289,10 @@ byte-identical below their headers and bound by a drift test. `GOV-2A` ruled the
 duplication out — a security mechanism that must be fixed in three places, in
 three grants, is the wrong shape for a security mechanism — and `WP-180-FU2`
 deleted both copies. `test/unit/execution-planner/mirrors.test.ts` is now a
-DELETION guard: it fails if either module's body reappears in any package
-outside `packages/risk`.
+DELETION guard: it fails if either module's body reappears under the `src` tree
+of any workspace member outside `packages/risk` — every `apps/*` as well as
+every `packages/*` *(the `apps/*` half was added 2026-09-04 in `WP-180-FU2`
+remediation round 2, review finding LOW-B)*.
 
 **Which exports are TOTAL, and which propagate** (review round 6, BLOCKER 3).
 Round 5's handoff claimed "no public function throws for any input"; the

@@ -748,10 +748,34 @@ callable.
 
 ## 8. Dependency boundary
 
+> **CORRECTION — 2026-09-04, `WP-180-FU2` remediation round 2 (review NOTE-A).**
+> Three statements below were left stale by `GOV-2A` and by this package's own
+> mirror collapse, and are corrected in place at the points they occur:
+>
+> 1. **`src/plain-data.ts` is no longer "duplicated".** `GOV-2A` ruled the
+>    duplication out and `WP-180-FU2` collapsed the three copies into this
+>    package; `packages/capital-allocator` and `packages/execution-planner` now
+>    import it across `docs/contracts/dependency-direction.md` §2.1 **S3** /
+>    **S4**. This package is the source of the door, not a co-owner of a mirror.
+> 2. **The graph is no longer "34 packages, 30 edges".** `pnpm check:deps`
+>    reports **34 packages / 43 edges** at the time of this note; the number
+>    grows again as parallel work packages merge, so treat the tool's output as
+>    authoritative and this figure as dated.
+> 3. **Layer 1 is no longer "no import allowlist".** `GOV-2A` §2.2 (2026-09-04)
+>    ruled a bounded, enumerated Node built-in allowlist for layers 0 and 1, with
+>    rule **F17** binding it; `node:util` in this package is on it. The import is
+>    still permitted — what changed is that it is permitted BY a list rather than
+>    by the absence of one.
+
 `packages/risk` declares exactly `@polymarket-bot/decimal` and
 `@polymarket-bot/domain` (both layer 0) plus `zod`. It imports **no** layer-1
-peer: `docs/contracts/dependency-direction.md` §2.1 lists no same-layer edge for
-it, and adding one would be F13. Two consequences, both deliberate:
+peer: `docs/contracts/dependency-direction.md` §2.1 lists no same-layer edge
+*out of* it, and adding one would be F13. *(Since 2026-09-04 the §2.1 table does
+list two edges **into** it — **S3** and **S4**, by which
+`packages/capital-allocator` and `packages/execution-planner` consume the
+collapsed parse door. This package is the target of those rows, never the
+source; the direction is the whole point of them.)* Two consequences, both
+deliberate:
 
 - The **capital-allocator** exposure snapshot and reservation verdict are
   consumed **structurally**, as loose views (`ExposureSnapshotViewSchema`,
@@ -765,18 +789,38 @@ it, and adding one would be F13. Two consequences, both deliberate:
 
 Small helpers duplicated for the same reason, each with its own tests:
 `deepFreeze` / `uuidShapedNotCanonical` / `ownEntry` (shared with
-`packages/capital-allocator`), the whole of `src/plain-data.ts` (round 5 — the
-allocator needed the same door in front of its own schemas), and
-`instantMilliseconds` (from `packages/settlement`) — the WP-110 precedent.
+`packages/capital-allocator`) and `instantMilliseconds` (from
+`packages/settlement`) — the WP-110 precedent.
+
+**`src/plain-data.ts` and `src/schema-arena.ts` are NOT on that list any more**
+*(corrected 2026-09-04, `WP-180-FU2` remediation round 2; this paragraph used to
+name "the whole of `src/plain-data.ts` (round 5 — the allocator needed the same
+door in front of its own schemas)" as a duplication)*. `GOV-2A` ruled that
+duplication out — a security mechanism that must be fixed in three places, in
+three grants, is the wrong shape for a security mechanism — and `WP-180-FU2`
+collapsed the three copies here, publishing them through this package's
+`exports` map as `./plain-data` and `./schema-arena`. Both consumers import
+them across §2.1 **S3** / **S4**, and
+`test/unit/execution-planner/mirrors.test.ts` is the deletion guard that fails
+if a fourth copy appears under any workspace member's `src`.
 
 **One Node built-in is imported, and it is audited.** `src/plain-data.ts` holds
 `import { types } from "node:util";` and uses it only as `types.isProxy` (§4.5,
-proposition 1). Layer 1 has no import allowlist —
-`docs/contracts/dependency-direction.md` §2 states one only for layer 0, §3 F15
-binds `packages/decimal`, and the §3 F14 purity rule binds `packages/domain`,
-`packages/strategies/**`, `packages/ledger` and `packages/simulation`, none of
-which is this package. `pnpm check:deps` passes unchanged (34 packages, 30
-edges) and the import adds no workspace edge. On the substance: a type predicate
+proposition 1). **It is on layer 1's enumerated allowlist** — `GOV-2A` ruled one
+on 2026-09-04 (`docs/contracts/dependency-direction.md` §2.2, rule **F17**:
+layers 0 and 1 may import only the built-ins that subsection lists, in
+production source), and `node:util` for `types.isProxy` in this package is a
+listed entry with this paragraph as its recorded justification. *(Corrected
+2026-09-04, `WP-180-FU2` remediation round 2: this sentence used to read "Layer
+1 has no import allowlist — §2 states one only for layer 0", which was true when
+it was written and was overturned by §2.2. The permission is unchanged; what
+changed is that it now rests on a list rather than on the absence of one. §3 F15
+still binds `packages/decimal` and the §3 F14 purity rule still binds
+`packages/domain`, `packages/strategies/**`, `packages/ledger` and
+`packages/simulation`, none of which is this package.)* `pnpm check:deps` passes
+(**34 packages, 43 edges** at the time of this note — 30 before `GOV-2A`, and
+the count rises as parallel packages merge, so the tool is the authority) and
+the import adds no workspace edge. On the substance: a type predicate
 opens no connection, reads no clock, touches no filesystem and consumes no
 entropy, so §9's claims below are unaffected. The line is pinned character for
 character, and its permitted use restricted to `isProxy`, by

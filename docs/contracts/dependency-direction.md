@@ -203,7 +203,17 @@ against.
 > `exports` map; delete both copies; add the `workspace:*` dependency to each
 > consumer; move S3/S4 into the table above; update the pinned allowlist
 > assertion; keep `mirrors.test.ts` as a *deletion* guard (it must fail if a
-> fourth copy appears) or retire it with its reason recorded.
+> fourth copy appears) or retire it with its reason recorded. **Acceptance is
+> behavioural, not structural**: every `WP-180`/`WP-190` pollution battery must
+> still pass against the single implementation, because the point of collapsing
+> them is that one fix protects all three — not that the files got shorter.
+
+*(The closing sentence of that quotation was restored 2026-09-04 in
+`WP-180-FU2` remediation round 2, review finding LOW-A: the round-1 restoration
+stopped at "…or retire it with its reason recorded" and dropped the acceptance
+criterion, which is the half of the grant that says what "done" means. Checked
+against `8d8d47e:docs/contracts/dependency-direction.md`; the blockquote is now
+that paragraph in full.)*
 
 **CORRECTION — 2026-09-04, `WP-180-FU2` remediation round 1 (review finding
 MEDIUM-2).** Two paths were written that the quoted list does not name:
@@ -235,8 +245,12 @@ are exported from `packages/risk`'s `exports` map as `./plain-data` and
 are in the table above; the pinned allowlist assertion reads
 `["S0","S1","S2","S3","S4"]`; and `test/unit/execution-planner/mirrors.test.ts`
 is repurposed from a *drift* guard into a **deletion** guard — it fails if either
-module's body reappears under any `packages/*/src` outside `packages/risk`, and
-it pins that both consumers resolve the modules through the `exports` map. The
+module's body reappears under any `apps/*/src` or `packages/*/src` outside
+`packages/risk` *(the `apps/*` half added 2026-09-04 in remediation round 2,
+review finding LOW-B: the round-1 walker read `packages/` only, and a verbatim
+`cp` of the door into `apps/trader/src/` passed the guard 7/7 —
+`pnpm-workspace.yaml` globs `apps/*` and six apps have `src` trees)*, and it
+pins that both consumers resolve the modules through the `exports` map. The
 risk copies' bodies were **not** edited: below their markers they are byte for
 byte the files `WP-180` review rounds 4-9 left, sha256
 `a318a50100758ba968f0360795655d78dbb3ec86beebb861e0b1006793dc7826`
@@ -259,13 +273,33 @@ rather than left to a handoff, because a reader who finds them later is entitled
 to know they were anticipated:
 
 - `test/unit/execution-planner/mirrors.test.ts` — drift guard → deletion guard
-  (the ruling's own instruction). Its copy fingerprint was **strengthened
-  2026-09-04** (remediation round 1, review finding LOW-1): the first candidate
-  required ALL of three declaration lines per module, so a full pasted copy with
-  the single identifier `describeValue` renamed evaded it entirely. It now
-  reports a file that matches **at least four of twelve** distinctive body
-  lines, compared whitespace-insensitively, and the test states its measured
-  evasion bar rather than claiming one;
+  (the ruling's own instruction). Its copy fingerprint has been strengthened
+  twice, and the second time because the first attempt's own bar was wrong:
+  - *2026-09-04, remediation round 1 (review finding LOW-1)* — the first
+    candidate required ALL of three declaration lines per module, so a full
+    pasted copy with the single identifier `describeValue` renamed evaded it
+    entirely. Replaced by "at least four of twelve distinctive body lines".
+  - *2026-09-04, remediation round 2 (review finding MEDIUM-A)* — those twelve
+    lines were whole STATEMENTS, and nine of the `plain-data` twelve were
+    written in four identifiers (`problems`, `problem`, `out`, `state`). The
+    reviewer pasted the whole module into `packages/execution-planner/src` with
+    THREE consistent renames and string literals untouched: **3/12, evaded**,
+    with `typecheck`, `lint`, `check:deps` and every test still green. Both
+    tables were re-derived on one rule — **anchor only on what a
+    paste-and-adapt does not change**: refusal payloads, strings the `zod`
+    library fixes (`_zod`, `def`/`constr`/`run`/`check`, `jitless`,
+    `propValues`), and expressions written solely in built-ins and `lib` types.
+    Fourteen anchors per module now, threshold four, and **not one anchor
+    carries a local identifier**. Re-measured: the reviewer's three-rename copy
+    scores 14/14; renaming all 27 names `plain-data` declares scores 14/14;
+    `schema-arena`'s round-1 set, measured rather than assumed, fell to **3/12
+    under a mass rename** and its replacement holds at 13/14. The honest bar is
+    now that **no identifier rename evades at any scale**, and that evasion
+    needs eleven of the fourteen anchors broken — measured cheapest route:
+    reword all seven refusal payloads, rename the `detailsNotAnObject` evidence
+    key and restyle three construction expressions, i.e. change what the door
+    says and how it builds. False positives measured over all 510 workspace
+    `.ts` sources: maximum 2 of 14. The test carries the full ladder;
 - `test/unit/risk/public-surface.test.ts` — the four round-6 drift tests
   retired, with their reason recorded in place; their subject is deleted;
 - `test/unit/risk/freshness.test.ts` — the `node:util` site census is an
@@ -296,7 +330,13 @@ to know they were anticipated:
   undeclared). Measured both ways at `823209a` and at the remediation tip, with
   a second probe two directories deep and a third importing a NON-door subpath.
   The claims above are true at any depth now, and there is one scan idiom rather
-  than three so they cannot drift apart again;
+  than three so they cannot drift apart again. *Widened 2026-09-04 in
+  remediation round 2 (review finding LOW-B)*: its workspace walk covered
+  `packages/` alone, so the deletion guard's "any workspace member" was false
+  for the six `apps/*` with `src` trees — a verbatim paste into
+  `apps/trader/src/` passed 7/7. It now walks the roots `pnpm-workspace.yaml`
+  globs, `apps/*` included, and the app trees are asserted by name so removing
+  one fails rather than shrinking the guard;
 - `test/unit/risk/schema-arena.test.ts` — the allocator-arena binding is now an
   alias of the canonical one; every differential assertion over the allocator's
   three door schemas, including the `AGENTS.md` live-micro fence, is unchanged.
