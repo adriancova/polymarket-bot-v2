@@ -298,8 +298,13 @@ to know they were anticipated:
     needs eleven of the fourteen anchors broken — measured cheapest route:
     reword all seven refusal payloads, rename the `detailsNotAnObject` evidence
     key and restyle three construction expressions, i.e. change what the door
-    says and how it builds. False positives measured over all 510 workspace
-    `.ts` sources: maximum 2 of 14. The test carries the full ladder;
+    says and how it builds. (Corrected 2026-09-04, review round 3 LOW-1: the
+    payload anchors were also reachable SYNTACTICALLY by splitting each literal
+    into runtime-identical concatenated halves; the matcher now collapses
+    literal concatenation before comparing, measured to restore 14/14 against
+    that route with the false-positive maximum unchanged, so the payload half
+    of the route requires an actual rewording again.) False positives measured
+    over all 510 workspace `.ts` sources: maximum 2 of 14. The test carries the full ladder;
 - `test/unit/risk/public-surface.test.ts` — the four round-6 drift tests
   retired, with their reason recorded in place; their subject is deleted;
 - `test/unit/risk/freshness.test.ts` — the `node:util` site census is an

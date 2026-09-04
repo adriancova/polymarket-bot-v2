@@ -192,8 +192,11 @@ function sha256(text: string): string {
  * there rewords all seven refusal payloads (so the copy no longer says what
  * this door says when it refuses), renames the `detailsNotAnObject` evidence
  * key (so it no longer emits this door's refusal SHAPE), and restyles three of
- * the module's construction expressions. That is a deliberate rewrite of the
- * door's observable behaviour, not an adaptation. A genuine re-implementation,
+ * the module's construction expressions. Rewording a payload means CHANGING
+ * it: `normalize` collapses string-literal concatenation first, so splitting a
+ * payload into runtime-identical halves does not count (round-3 LOW-1 measured
+ * that syntactic route and this collapse closing it). The expression restyles
+ * remain reachable syntactically; the payload half of the route does not. A genuine re-implementation,
  * sharing behaviour but no text, remains invisible here by construction: this
  * guard answers copy-paste, because pasting is the cheap path back to three
  * implementations, and it does not claim to answer a determined author.
@@ -295,9 +298,16 @@ const MATCH_THRESHOLD = 4;
  */
 const MIN_FINGERPRINT_SIZE = 3 * MATCH_THRESHOLD;
 
-/** Whitespace-insensitive: a copy may reindent or reflow, and often will. */
+/**
+ * Whitespace-insensitive: a copy may reindent or reflow, and often will.
+ * Literal concatenation is collapsed first (`"a" + "a"` quote-pairs), so
+ * splitting a payload string into runtime-identical concatenated halves does
+ * not break an anchor — the round-3 reviewer measured this exact transform
+ * defeating seven anchors syntactically, and measured this collapse restoring
+ * 14/14 with the workspace false-positive maximum unchanged at 2/14.
+ */
 function normalize(text: string): string {
-  return text.replace(/\s+/gu, " ");
+  return text.replace(/(["'`])\s*\+\s*\1/gu, "").replace(/\s+/gu, " ");
 }
 
 /** How many of `lines` appear in `text`, comparing whitespace-insensitively. */
@@ -414,6 +424,10 @@ describe("the collapsed parse door exists in exactly one package (WP-180-FU2)", 
     // …and the descent applies to an app's tree too, not just its top level.
     expect(files).toContain("apps/data-gateway/src/feeds/polymarket.ts");
     expect(files).toContain("apps/ops-cli/src/verify-venue/checks.ts");
+    // The THIRD workspace root: nothing else pins that packages/strategies/*
+    // members are walked (round-3 LOW-2 — deleting the container branch left
+    // every guard green while the scope silently shrank).
+    expect(files).toContain("packages/strategies/static-bracket/src/index.ts");
     // The deleted copies are gone, by name as well as by content.
     expect(files).not.toContain("packages/capital-allocator/src/plain-data.ts");
     expect(files).not.toContain("packages/capital-allocator/src/schema-arena.ts");
