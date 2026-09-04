@@ -87,16 +87,30 @@ exists but the package's own structure keeps it off a decision;
 | `apps/data-gateway` | `parseGatewayConfig` | caller (operator config) | **LIVE** ×2 — a get-only inherited `tickIntervalMs` defeats its `.default()` and the `dataLossBoundMs` startup check silently passes; an inherited `binance` block satisfies "at least one feed must be configured" | **MEDIUM** — startup-time, operator-supplied, unattended process | **WP-120-FU1** / the next bounded grant on `apps/data-gateway/**` |
 | `packages/event-bus` | `validateEnvelope` (Redis wire) | wire | **LIVE** — clean throws `EventBusEnvelopeError`; under non-enumerable `skipChecks` an envelope with `eventId: "not-a-uuid"`, `receivedAt: "yesterday"` is accepted. Returns the caller's own object, so adoption/loss do not apply to the output | **MEDIUM** — the trader's consumption boundary; ordering/dedup keys off these fields | **WP-060-FU1** / the next bounded grant on `packages/event-bus/**` |
 | `packages/features` (`WP-160`, `3d49946`) | `computeFeatureSnapshot` (no `zod`); `selectIndexedValues` | caller in, **caller out** | **LIVE (output side only)** — the package carries no runtime schema library and materializes inputs, but `selectIndexedValues` members are ordinary literals: under a non-enumerable inherited `reason` **both** members gain `reason`, and an `ABSENT` member gains a `value` | **MEDIUM** — these values are destined for PostgreSQL indexing next to decisions | **WP-160-FU1** (already carried as `WP-160` R1-L3; this round measured it independently) |
-| `packages/binance-adapter` | `decodeFrame`, `BinanceTradePayloadSchema` (`z.looseObject`) | wire | **CONTAINED** — the `looseObject` output does adopt an inherited enumerable key, but `decodeFrame` reads named fields explicitly and its `unknownFields` list is empty under pollution, so the adopted key does not reach the recorded frame | LOW | recorder-pipeline hardening round (§5 item 3) |
+| `packages/binance-adapter` | `decodeFrame`, `BinanceTradePayloadSchema` (`z.looseObject`) | wire | **LIVE** — a **declared** key missing from the wire is supplied from the prototype. A `trade` frame with `q` deleted is refused clean (`kind=MALFORMED`, `reason=SCHEMA_MISMATCH`) and, under a **non-enumerable** inherited `q`, decodes as `kind=TRADE` with `quantityRaw="999999"` and `unknownFields=[]` (probe M). It flows on: `normalizeTrade` emits `size:"999999"` (`normalize.ts:108`) and the dedup fingerprint becomes `64000.25\|999999\|1700000000000\|false` (`sequence.ts:298`), so a fabricated quantity is both recorded and used as trade identity. **Corrected 2026-09-04 (`GOV-2A` remediation round 1).** The original row measured only *unknown-key* adoption through `looseObject` and read the empty `unknownFields` list as containment; "reads named fields explicitly" (`frames.ts:469-472`) is precisely the mechanism by which the injected value lands, and the empty `unknownFields` is what makes it *silent* rather than what makes it safe | **MEDIUM** — unattended recorder, and the corruption is in the dataset's economic field and its dedup identity (same class and deployment story as the coinbase and rtds rows below) | recorder-pipeline hardening round (§5 item 3) |
 | `packages/coinbase-adapter` | `CoinbaseFrameEnvelopeSchema` | wire | **LIVE (routing)** — a missing required `channel` is satisfied from the prototype (`"ticker"`), so a frame routes as a channel it never declared | **MEDIUM** — unattended recorder; misrouting corrupts a recorded dataset | recorder-pipeline hardening round (§5 item 3) |
 | `packages/polymarket-public` (incl. rtds) | `RtdsEnvelopeSchema`, `RtdsTwapUpdatePayloadSchema` | wire | **LIVE (routing)** — a missing required `type` is satisfied from the prototype (`"update"`). The TWAP payload's numeric checks are **not** format checks and hold under `skipChecks` | **MEDIUM** — same class and same deployment reality as coinbase | recorder-pipeline hardening round (§5 item 3) |
-| `packages/universe` | `registerSeries` / `lifecycle.ts` (consumes `parsed.data` at 10 sites) | wire (gateway-published lifecycle payloads) | **NOT REACHED by probe** — the doors probed refused on type/shape before any format check ran; the `parsed.data` consumption is structurally the adoption/loss class and is **assumed exposed** on the §1 rule | **MEDIUM (unconfirmed)** | next bounded grant on `packages/universe/**`; must probe, not assume |
-| `packages/settlement` | `safeParseSettlementSpec` | caller | **NOT REACHED by probe** — same reason | **LOW (unconfirmed)** | next bounded grant on `packages/settlement/**` |
+| `packages/universe` | `applyMarketLifecycleEvent` (`lifecycle.ts:269`; `parsed.data` consumed at 10 sites) | wire (gateway-published lifecycle payloads) | **LIVE** — measured, not assumed (probe O). A `MarketResolved` payload with `outcome` deleted is refused clean (`UNIVERSE_INPUT_INVALID`) and, under a non-enumerable inherited `outcome`, **resolves the market**: `lifecycleState=RESOLVED`, `outcomeState=YES_WIN`. The same holds for `resolvedAt` (a market resolves at `2099-01-01T00:00:00Z`, an instant no event carried) and for `conditionId` — the identity key `checkIdentity` exists to refuse an event naming a different market, and it is satisfiable from the prototype. **Corrected 2026-09-04 (`GOV-2A` remediation round 1)**: the original row read the structure and declined to measure it, which its own rule forbids | **HIGH** — a terminal outcome is the projection's one irreversible transition, restricted by the frozen contract to `MarketResolved` (`domain.md` §6.2, `lifecycle.ts` rule 1), and it is reachable from the prototype; the market's resolved state gates settlement and eligibility | next bounded grant on `packages/universe/**` |
+| `packages/settlement` | `safeParseSettlementSpec` (`spec.ts:1429`; `z.strictObject` + `superRefine`) | caller | **LIVE** — measured by a required-key sweep (probe N). Of the 16 own keys of `terminalSpotSpecSample()`, **14 are required** (deleting any one is refused clean) and **all 14 adopt from `Object.prototype`**: `settlementSpecId`, `seriesId`, `specVersion`, `referenceSymbol`, `observationType`, `resolutionSource`, `comparison`, `strikeSource`, `timestampBoundary`, `roundingRule`, `fallbackSource`, `disputePolicy`, `clarificationPolicy`, `verification`. What that means concretely: an adopted `resolutionSource` is a spec that settles against a source **its own text never named**; an adopted `verification` is sharper still — a spec carrying no verification key at all parses as `{status:"VERIFIED"}` and `isReviewedSettlementSpec` returns `true`, which is the gate on model-dependent activation (`activation.ts:128`). **Corrected 2026-09-04 (`GOV-2A` remediation round 1)**: "refused on type/shape before any format check ran" answered a *format-check* question; adoption is a different class and is reached by a ~30-line sweep | **HIGH** — settlement-spec integrity decides payouts; §6 invariant 9 (a change is a new version, never an edit) and ADR-009 §5.4's stated-policy rule both rest on this door, and the review gate is itself adoptable | next bounded grant on `packages/settlement/**` |
 | `packages/order-book` | `validateIngestMeta` (scalar parses only) | wire meta | **LIVE (inherited from `packages/domain`)** — scalar `safeParse` on `UuidSchema` / `IsoTimestampSchema` / `UnsignedBigIntStringSchema`; no object parse, so no adoption/loss | LOW–MEDIUM | next bounded grant on `packages/order-book/**` |
 | `packages/risk`, `packages/capital-allocator` (`WP-180`, `98a6cc1`) | every door | caller | **CLOSED** — D1–D4. Probe K3 confirms the arena copy of a domain schema still refuses what the raw schema accepts under `skipChecks` | — | — |
 | `packages/execution-planner` (`WP-190`, `5aa11e3`) | every door | caller | **CLOSED** — same mechanism, third mirror | — | — |
-| `packages/storage-postgres`, `storage-wal`, `storage-parquet`, `observability` | one `.parse` each, on internally-constructed values | internal | **CONTAINED** | LOW | none assigned; recorded |
+| `packages/storage-postgres`, `storage-wal`, `storage-parquet`, `observability` | *(none — there is no `zod` door in any of the four)* | — | **n/a — outside this class, measured.** None of the four declares `zod` in its `package.json` or imports it anywhere in `src/`, and none contains a schema parse. Every `.parse(` in their sources is `JSON.parse` or `Date.parse`: `storage-postgres/src/timestamps.ts:63`, `storage-wal/src/raw-frame.ts:149`, four sites in `storage-parquet` (`compactor.ts:759`, `wal-format.ts:517`, `testing/index.ts:43`, `compactor.test.ts:582`), six in `observability` (`soak-evidence.ts:290,293,525,526`, `soak-evidence.test.ts:17`, `render.test.ts:271`). **Corrected 2026-09-04 (`GOV-2A` remediation round 1)**: the original row asserted "one `.parse` each, on internally-constructed values" and a CONTAINED verdict for doors that do not exist — a measured-sounding verdict that was never measured. These packages **do** validate hand-written structures (`parseDatasetManifest`, the WAL frame validators, `parseSoakWindowEvidence`); that is a different class, is not what ADR-020 rules on, and was **not** measured here | — | none; recorded |
 | `packages/decimal` | no `zod` | — | n/a — but see `dependency-direction.md` §2.2 and `GOV-2A` `follow_up` 5 for the `divDecimal` explicit-options hazard | — | — |
+
+**The tally, and it is the number every other document must quote.** The table
+above carries **LIVE for twelve merged packages and one app**:
+`packages/{domain,ledger,pnl,strategy-runtime,event-bus,features,order-book,
+binance-adapter,coinbase-adapter,polymarket-public,universe,settlement}` and
+`apps/data-gateway`. Three packages are **CLOSED** (`risk`,
+`capital-allocator`, `execution-planner`), and five are **outside the class**
+(`decimal`, `storage-postgres`, `storage-wal`, `storage-parquet`,
+`observability` — no `zod` door). *(Recounted 2026-09-04 in `GOV-2A`
+remediation round 1. The round-1 headline said "five merged packages and one
+app", which counted neither the `features`, `order-book`, `coinbase-adapter`
+and `polymarket-public` rows the same table already carried as LIVE, nor the
+three rows that round-1 review corrected — `binance-adapter`, `settlement`,
+`universe`.)*
 
 **Deployment reading, required whenever one of these rows is quoted.** Nothing on
 the wire can write `Object.prototype`; every row above needs code already
@@ -140,9 +154,11 @@ statement of conformance.
    `runtime.ts:918` and the six scalar identifier parses in `input.ts`.
 3. **Recorder-pipeline hardening round** — `packages/{polymarket-public,
    binance-adapter,coinbase-adapter}/**` and `apps/data-gateway/**`: the routing
-   adoptions (rtds `type`, coinbase `channel`) and the gateway's two defeated
-   startup checks. One round, because they share a deployment story and a test
-   shape.
+   adoptions (rtds `type`, coinbase `channel`), **binance's trade-payload
+   declared-key adoption (`q` → `quantityRaw` → normalized `size` and the dedup
+   fingerprint; added 2026-09-04 when that row was corrected from CONTAINED to
+   LIVE)**, and the gateway's two defeated startup checks. One round, because
+   they share a deployment story and a test shape.
 4. **`WP-160-FU1`** — `selectIndexedValues` members routed through the existing
    `ownFrozenTree` / `ownPlainCopy` machinery. **Must land before any consumer
    indexes snapshot values into PostgreSQL.**
@@ -155,6 +171,16 @@ statement of conformance.
    **Deliberately last**, and deliberately not a CI gate today: a gate every
    merged package fails is a gate that gets waived wholesale
    (`dependency-direction.md` §6.1 item 1).
+7. **`packages/settlement` and `packages/universe`** *(added 2026-09-04 when
+   both rows became LIVE on measurement — §3)*. Two bounded grants, one per
+   package, each owing the D1-D4 door plus a regression test per measured row:
+   `safeParseSettlementSpec` / `parseSettlementSpec` and the activation path that
+   consumes them (`activation.ts:128`), and `applyMarketLifecycleEvent`'s
+   `parsed.data` consumption at all ten sites. **Settlement ranks with the
+   monetary follow-ups** (item 1): an adoptable `verification` means the review
+   gate on model-dependent activation is not load-bearing. Each owner must probe
+   the doors this audit did **not** reach — the other seven lifecycle folds, the
+   series-binding doors, and specs other than the sampled one.
 
 ---
 

@@ -1,7 +1,10 @@
 # GOV-2A completion record — cross-package schema-boundary governance round
 
-- **State**: candidate for review (doc-only). Not merged, not marked complete.
-- **Base**: `main` `2d7e7da`; branch `worktree-agent-a9d317e245f6f9a01`
+- **State**: candidate for review (doc-only), **remediation round 1 applied**. Not
+  merged, not marked complete.
+- **Base**: `main` `2d7e7da`; round-1 candidate `bc15d25` (branch
+  `worktree-agent-a9d317e245f6f9a01`); this tip is the round-1 remediation commit
+  on top of it. §10 below is the finding-by-finding record of that remediation.
 - **Round type**: contract-owner governance round. **DOC-ONLY** — no `packages/**`,
   `apps/**`, `test/**`, `tools/**`, `db/**`, `python/**`, `.github/**`,
   `docs/venue/**`, `package.json`, or `pnpm-lock.yaml` path was touched.
@@ -28,8 +31,11 @@ items, all executed:
 2. **Every merged raw-`zod` boundary is audited, mechanically.** Boundaries found
    by grep; verdicts established by **executed probes** in a `/dev/shm` scratch
    copy of `main` `2d7e7da` (`pnpm install --frozen-lockfile`, `zod@4.4.3`
-   confirmed from the resolved store). **Live fail-opens in five packages and one
-   app**, each with a severity and a named owner — including two that defeat the
+   confirmed from the resolved store). **Live fail-opens in twelve packages and one
+   app** *(count corrected in remediation round 1 — §10 LOW-1; the first pass said
+   "five packages and one app", undercounting rows its own table already carried
+   and three rows that round-1 review overturned)*, each with a severity and a
+   named owner — including two that defeat the
    recorded `WP-040` obligation **F16**, one that defeats an ADR-016 identifier
    rule inside `WP-170`, one that defeats the gateway's `dataLossBoundMs` startup
    check, and the frozen §7.5 `DecisionResultSchema`, whose **every required key
@@ -71,15 +77,23 @@ its normative companion is [`docs/contracts/schema-boundary.md`](../contracts/sc
 
 ## files_changed
 
-**9 files, all in the packet's allowed paths.**
+**8 files, all in the packet's allowed paths** — 3 new, 5 modified. *(Corrected
+in remediation round 1 — §10 LOW-3. The first pass said "9 files … New (2) …
+Modified (7)": it double-counted (the `docs/adr/README.md` /
+`docs/contracts/*` parenthetical below is a note about files already listed, not
+a ninth file) and it listed this record itself as modified when it is new.
+Reproduce with `git diff --name-only 2d7e7da..<tip>`, which prints exactly
+eight paths, and `git diff --name-status 2d7e7da..<tip>`, which marks three of
+them `A`.)*
 
-New (2):
+New (3):
 
 - `docs/adr/ADR-020-schema-parse-boundary-integrity.md` — the ruling.
 - `docs/contracts/schema-boundary.md` — the normative companion: door
   definition (D1-D4), measured-class table, per-package audit, owners.
+- `docs/handoffs/GOV-2A.md` — this record.
 
-Modified (7):
+Modified (5):
 
 - `docs/adr/ADR-006-actual-ledger-versus-virtual-allocation.md` — **+89/−0**, a
   dated second §7 amendment appended before §8. Append-only, verified by
@@ -88,16 +102,20 @@ Modified (7):
 - `docs/adr/README.md` — ADR-020 index row; ADR-006's index row annotated with
   the second amendment; `schema-boundary.md` added to the companion-contract list.
 - `docs/contracts/dependency-direction.md` — the §2.1 pre-authorised
-  mirror-collapse ruling; new §2.2 (Node built-in allowlist); new §3 **F17**;
+  mirror-collapse ruling; new §2.2 (Node built-in allowlist); new §3 **F17**
+  (scoped to production imports in remediation round 1, with the test-file
+  census and the F17-versus-rule-3 reconciliation added to §2.2);
   `Related` header line extended.
 - `docs/contracts/protected-contracts.md` — §8.1 rows **R-9** (the `WP-040`
-  obligation re-assignment) and **R-10** (the schema-boundary class); a dated
-  closing note on the §8 **C-2** row.
-- `docs/handoffs/GOV-2A.md` — this record.
+  obligation re-assignment, plus the round-1 grant-time flag on F19) and
+  **R-10** (the schema-boundary class); a dated closing note on the §8 **C-2**
+  row.
 - `IMPLEMENTATION_STATUS.md` — **only** the "Cross-package risk" record under
   `## Open blockers`. No table row, no header, no other section.
-- *(`docs/adr/README.md` and `docs/contracts/*` are the only protected paths
-  touched; both are inside the packet's grant.)*
+
+*(`docs/adr/README.md` and `docs/contracts/*` are the only protected paths
+touched; both are inside the packet's grant. This parenthetical is a note about
+files already listed above, not a further file.)*
 
 Lockfile: untouched (`git diff` empty). No `package.json` anywhere was modified.
 
@@ -114,7 +132,31 @@ where `z.strictObject` fails closed on the enumerable form), and they are the
 finding that produced probe F. Nothing in the repository was modified to make a
 probe pass.
 
-Gates **run at this tip**, in this worktree, all green:
+> **Disclosure added in remediation round 1 (§10 NOTE-2).** Those ten round-1
+> probe files lived **only** in `/dev/shm/gov2a`, which no longer exists, and
+> they were never committed. Their sources are therefore **not recoverable**,
+> and the "49 assertions, 46 pass / 3 fail" count above **cannot be re-derived
+> from this record** — it is kept because a superseded claim is corrected in
+> place rather than erased (`protected-contracts.md` §4), not because it is
+> independently checkable. What survives of round 1 is the transcripts below and
+> the fact that round-1 review reproduced every LIVE row from them, several
+> verbatim. The three probes added in remediation round 1 are committed **in
+> full, as source**, in **Appendix A**, together with the sandbox recipe and the
+> exact command, so they are re-runnable by anyone. The standing rule this sets
+> for later rounds: **a probe that is cited is a probe whose source is
+> committed.**
+
+Remediation round 1 added **three probe files, 44 measured parse/decode outcomes**
+(M: 5, N: 32, O: 7), all passing, run against a `/dev/shm/gov2arem` scratch copy
+of this candidate tree. That tree is byte-identical to `main` `2d7e7da` outside
+`docs/` and `IMPLEMENTATION_STATUS.md` (verified:
+`git diff --stat 2d7e7da..<tip> -- . ':!docs' ':!IMPLEMENTATION_STATUS.md'` is
+**empty**), so the new probes measure exactly the code the round-1 audit
+measured. Transcripts: §10.
+
+Gates **run at this tip**, all green (in a `/dev/shm` scratch copy of the tip,
+`git archive` + `pnpm install --frozen-lockfile`; this worktree carries no
+`node_modules`):
 
 | Gate | Result |
 | --- | --- |
@@ -124,9 +166,9 @@ Gates **run at this tip**, in this worktree, all green:
 | `pnpm typecheck` | exit 0 |
 | `pnpm lint` | exit 0 |
 | `pnpm install --frozen-lockfile` | clean; `git diff --stat pnpm-lock.yaml` **EMPTY** |
-| `git diff --name-only 2d7e7da` | `IMPLEMENTATION_STATUS.md`, `docs/adr/ADR-006-…md`, `docs/adr/README.md`, `docs/contracts/dependency-direction.md`, `docs/contracts/protected-contracts.md` (+ 3 untracked new files, all in `docs/`) — allowed paths only |
-| `IMPLEMENTATION_STATUS.md` diff | two hunks, both inside the Cross-package risk record (`@@ -1655,2 +1655,40 @@` and `@@ -1661,7 +1699,109 @@`). No table row, no header, no other section |
-| ADR append-only | `git diff --numstat` = **89 insertions, 0 deletions**. Proven cryptographically: deleting the inserted span from the tip file reproduces the base byte-for-byte — SHA-256 `d969e3d8e1a1913add9cc9a8f441097d10585c1ad81d0be2c7915dcb0381c80a` on both sides (30 288 base bytes, 36 307 tip, 6 019 inserted) |
+| `git diff --name-only 2d7e7da..<tip>` | exactly the **eight** files listed under `files_changed` — allowed paths only, no new file outside them |
+| `IMPLEMENTATION_STATUS.md` diff | **one** hunk at default context (`@@ -1653,17 +1653,175 @@ that parses venue payloads.`), **four** at `-U0` (`@@ -1655,0 +1656,40 @@`, `@@ -1661,0 +1702,110 @@`, `@@ -1664 +1814 @@`, `@@ -1666 +1816,9 @@`). Every one is inside the Cross-package risk record: no table row, no header, no other section. *(Corrected in remediation round 1 — §10 LOW-3. The first pass claimed "two hunks" and quoted two headers that reproduce at neither context setting; the line numbers below shift again with this remediation's own edits, so the durable check is the **confinement**, which `git diff -U0` shows directly: every hunk lands between the record's first line and the `## Deviations from specification` heading that follows it.)* |
+| ADR append-only | `git diff --numstat` = **89 insertions, 0 deletions**. Proven cryptographically: deleting the inserted span (tip lines 391-479) reproduces the base byte-for-byte — SHA-256 `d969e3d8e1a1913add9cc9a8f441097d10585c1ad81d0be2c7915dcb0381c80a` on both sides. **30 588 base bytes, 36 640 tip, 6 052 inserted** *(byte counts corrected in remediation round 1 — §10 LOW-3; the first pass wrote 30 288 / 36 307 / 6 019, which `wc -c` on `git show 2d7e7da:…` and `git show <tip>:…` refutes. The SHA-256 was and is **correct**, and was re-verified: `git show <tip>:… \| sed '391,479d' \| sha256sum` prints it.)* |
 
 **Negative control, run deliberately.** Adding S3/S4 as real §2.1 table rows in
 the sandbox: `check:deps` **PASS 34/41** with both rows parsed and
@@ -156,11 +198,12 @@ The authoritative table (with door names, severities and owners) is
 | `packages/coinbase-adapter` | **LIVE (routing)** | missing required `channel` supplied from the prototype | recorder-pipeline round |
 | `packages/polymarket-public` (rtds) | **LIVE (routing)** | missing required `type` supplied from the prototype | recorder-pipeline round |
 | `packages/features` (WP-160) | **LIVE (output side)** | `selectIndexedValues` members adopt `reason`/`value`; destined for PostgreSQL indexing | `WP-160-FU1` |
-| `packages/binance-adapter` | **CONTAINED** | `looseObject` adopts, but `decodeFrame` reads named fields and `unknownFields` stays empty | recorder-pipeline round |
-| `packages/universe`, `packages/settlement` | **NOT REACHED** | doors refused on shape before any format check; `parsed.data` consumption is structurally exposed and is **assumed**, not proven | must probe, not assume |
+| `packages/binance-adapter` | **LIVE** *(was CONTAINED; corrected in remediation round 1, probe M)* | a trade frame whose declared `q` is absent from the wire decodes as `TRADE` with `quantityRaw: "999999"` from the prototype; `unknownFields` stays empty, which is what makes it silent, not what makes it safe. It reaches `normalizeTrade`'s `size` and the dedup fingerprint | recorder-pipeline round |
+| `packages/settlement` | **LIVE** *(was NOT REACHED; corrected in remediation round 1, probe N)* | all **14** required keys of a sample spec adopt from `Object.prototype`, including `resolutionSource`, `comparison`, `strikeSource` — and `verification`, so a spec naming no review at all parses `VERIFIED` and `isReviewedSettlementSpec` returns `true` | next bounded grant on `packages/settlement/**` |
+| `packages/universe` | **LIVE** *(was NOT REACHED; corrected in remediation round 1, probe O)* | a `MarketResolved` payload with `outcome` deleted resolves the market from the prototype (`RESOLVED`/`YES_WIN`); `resolvedAt` and the `conditionId` identity key are adoptable too | next bounded grant on `packages/universe/**` |
 | `packages/order-book` | **LIVE (inherited)** | scalar domain-schema parses only; no object parse | next bounded grant |
 | `packages/risk`, `packages/capital-allocator`, `packages/execution-planner` | **CLOSED** | D1-D4; probe K3 confirms the arena still refuses what the raw schema accepts | — |
-| `storage-*`, `observability` | **CONTAINED** | internally-constructed values, parsed defensively | recorded |
+| `storage-*`, `observability` | **n/a — outside the class** *(was CONTAINED; corrected in remediation round 1)* | none of the four imports `zod` or contains a schema parse; every `.parse(` is `JSON.parse`/`Date.parse`. The round-1 verdict described doors that do not exist | none; recorded |
 
 **What a probe result means.** Nothing on the wire can write `Object.prototype`;
 every finding needs code already executing in the process. They say *"this check
@@ -370,9 +413,14 @@ one caller that can reach the hazardous path.
    from names: `WP-300` owns `packages/inventory/**` and the reservation service
    and wallet-operation state machine; `WP-270` owns `packages/oms/**` and the
    submission-attempt protocol; `WP-290` owns the break taxonomy.
-6. **"Not reached by probe" is reported as such.** `packages/universe` and
+6. ~~**"Not reached by probe" is reported as such.** `packages/universe` and
    `packages/settlement` are marked exposed-by-structure and **unconfirmed**; I
-   did not upgrade a structural reading into a measurement.
+   did not upgrade a structural reading into a measurement.~~ **Superseded
+   2026-09-04 in remediation round 1 (§10 MEDIUM-1).** Reporting the gap honestly
+   was right; leaving it was not — the round's own rule is *probe, don't assume*,
+   and both doors were reachable. Both are now **measured LIVE** (probes N and
+   O). The residual assumption is narrower and is stated in `known_risks` 2: the
+   sweep covers one sample spec and one event type per package, not every door.
 
 ---
 
@@ -405,6 +453,18 @@ one caller that can reach the hazardous path.
    hypotheses the measurements refuted (`strictObject` fails closed on the
    enumerable form). Kept and reported rather than smoothed away — they are what
    led to probe F and to the sharpest finding in the round.
+7. **Remediation round 1 rippled beyond the four documents LOW-1 names.** Fixing
+   a verdict changes every place that quotes it, so three further corrections
+   were made inside the same allowed paths, each a consequence of a finding
+   rather than new scope: `protected-contracts.md` **R-10**'s package list (it
+   enumerated the same headline as eight packages), `schema-boundary.md` §5 item
+   3 (binance's finding named in the recorder round it was already assigned to)
+   and a new §5 item 7 with a matching `follow_up` 9 (a LIVE HIGH row with no
+   staged owner would be a fresh gap, which R-10's own rule forbids). The
+   "~7,000 pollution states" → "~7,000-call battery" correction (NOTE-4) was
+   applied to ADR-020 §6 and its Evidence list as well as to the status record,
+   because the same WP-180 fact is quoted in all three and correcting one would
+   leave the others contradicting it.
 
 ---
 
@@ -412,12 +472,21 @@ one caller that can reach the hazardous path.
 
 1. **The audit is a floor, not a proof.** It probes one representative door per
    package with one pollution shape per class. `WP-180` needed nine probe
-   campaigns and ~7,000 pollution states to bound *two* packages; a package marked
-   CONTAINED here is "not shown to fail open by these probes", not "safe".
-2. **`packages/universe` and `packages/settlement` are unconfirmed.** Their doors
-   refused on shape before reaching a format check, so my probes are inconclusive.
-   `universe/lifecycle.ts` consumes `parsed.data` at ten sites and is structurally
-   the adoption class. Their owners **must probe, not read**.
+   campaigns and a ~7,000-call tuned pollution battery to bound *two* packages; a
+   package marked CONTAINED here is "not shown to fail open by these probes", not
+   "safe". **Round-1 review proved this the hard way**: of the three negative
+   verdicts in the table, *all three* were wrong — `binance-adapter` (CONTAINED),
+   `settlement` and `universe` (NOT REACHED). A negative verdict in an audit like
+   this deserves more scepticism than a positive one, because a positive verdict
+   carries a transcript and a negative one carries an argument.
+2. ~~**`packages/universe` and `packages/settlement` are unconfirmed.**~~
+   **Closed 2026-09-04 in remediation round 1: both are measured LIVE** (probes N
+   and O). The residual is narrower: probe N sweeps the required keys of **one**
+   sample spec (`terminalSpotSpecSample()`) and probe O exercises **one** event
+   type (`MarketResolved`) of the eight `applyMarketLifecycleEvent` folds, at
+   three keys. The other seven folds and the `registerSeries` / series-binding
+   doors are structurally the same class and remain **unmeasured**; their owner
+   still must probe, not read.
 3. **Every finding is still live on `main`.** This round records and assigns; it
    fixes nothing. The window between this ruling and the last follow-up is a
    window in which the escalation record is accurate and the code is not fixed.
@@ -425,8 +494,16 @@ one caller that can reach the hazardous path.
    currently authorized. R-10's register rule ("an entry leaves this table only by
    being done or ratified") is the only thing preventing quiet expiry.
 5. **F17 is not machine-checked**, like F15 and F16 before it. A layer-1 package
-   can add `node:fs` today and only review will catch it. The enumeration is
-   accurate as of `2d7e7da` and was verified by census; it will drift.
+   can add `node:fs` to a production file today and only review will catch it.
+   The enumeration is accurate as of `2d7e7da` and was verified by census; it
+   will drift. **And the rule as first drafted was already violated by merged
+   code**: remediation round 1 measured six layer-1 *test* files importing
+   un-enumerated built-ins, so F17 is now explicitly production-only, with §2.2
+   carrying the census and the reconciliation against §6.1 item 2 (which rules
+   test files **in** scope for rule 3). A later round that machine-checks F17
+   inherits that scope decision and must not silently widen it — widening it
+   would fail six merged files on day one, which is the failure mode §6.1 item 1
+   ruled against.
 6. **The C-2 ratification holds in an unpolluted process.** Stated in the
    amendment itself. Items 1-2 and ruling 5 rest on per-asset arithmetic that no
    measured class touches, which is why they hold — but the door in front of them
@@ -456,8 +533,9 @@ one caller that can reach the hazardous path.
    six scalar identifier parses in `input.ts`.
 3. **Recorder-pipeline hardening round** —
    `packages/{polymarket-public,binance-adapter,coinbase-adapter}/**` and
-   `apps/data-gateway/**`: the two routing adoptions and the gateway's two
-   defeated startup checks. One round; they share a deployment story.
+   `apps/data-gateway/**`: the two routing adoptions, **binance's declared-key
+   adoption (probe M)**, and the gateway's two defeated startup checks. One
+   round; they share a deployment story.
 4. **`WP-160-FU1`** — route `selectIndexedValues` members through
    `ownFrozenTree`/`ownPlainCopy`. **Must land before any consumer indexes
    snapshot values into PostgreSQL.**
@@ -477,24 +555,532 @@ one caller that can reach the hazardous path.
    `packages/execution-planner/src/refusals.ts:180-187` and
    `packages/features/src/inputs.ts:686-690` — correct the claim text or guard the
    helper, in the next bounded round touching each package.
-9. **`WP-040` obligations, re-assigned** (register `R-9`): **F12, F18, F19 →
-   `WP-300`**; **F17 → `WP-270`**; **F19's reconciliation-break arm → `WP-290`**.
-   Each owner discharges its rows in its own review and records it.
-10. **The fee/reward accounting work** owes ADR-006 §7 item 3's provenance half:
+9. **Two bounded grants, `packages/settlement/**` and `packages/universe/**`**
+   *(added in remediation round 1, when both rows became LIVE —
+   `schema-boundary.md` §5 item 7)*: the D1-D4 door on
+   `safeParseSettlementSpec`/`parseSettlementSpec` and on
+   `applyMarketLifecycleEvent`'s ten `parsed.data` sites, a regression per
+   measured row, and a probe of the doors this round did **not** reach (the
+   other seven lifecycle folds, the series-binding doors, non-sampled spec
+   shapes). Settlement ranks with follow-up 1: its **review gate is itself
+   adoptable**.
+10. **`WP-040` obligations, re-assigned** (register `R-9`): **F12, F18, F19 →
+    `WP-300`**; **F17 → `WP-270`**; **F19's reconciliation-break arm → `WP-290`**.
+    Each owner discharges its rows in its own review and records it. **Flagged in
+    remediation round 1 (§10 NOTE-3): F19's insert path has no wallet-operations
+    repository yet and neither `WP-300` nor `WP-290` owns
+    `packages/storage-postgres/**`, so that grant needs a bounded path widening
+    or an explicit split, decided when it is written.**
+11. **The fee/reward accounting work** owes ADR-006 §7 item 3's provenance half:
     the versioned §9.13 snapshot that makes the source page and retrieval date
     travel with a fee or reward entry. The `scheduleVersionRef` /
     `programVersionRef` hooks exist; no builder emits one.
-11. **Orchestrator**: record this round in `IMPLEMENTATION_STATUS.md`'s work-package
+12. **Orchestrator**: record this round in `IMPLEMENTATION_STATUS.md`'s work-package
     table (this round may not edit it), and note that the Cross-package risk record
     is now **discharged as an audit and open as a remediation**.
 
 ---
 
+## 10. Remediation round 1 (2026-09-04) — the negative side of the audit
+
+Round-1 review (in-harness, adversarial) returned **CHANGES REQUIRED**: 1 HIGH, 3
+MEDIUM, 4 LOW, 4 NOTE. Its positive verdicts stand — every LIVE row reproduced,
+several verbatim; the C-2 ratification verified cryptographically; the §2.1
+mirror staging legitimate, negative control reproduced; the §2.2 built-in census
+exhaustive. **Every defect was on the audit's negative side: the rows that said
+"not a problem".** That is the durable lesson and it is recorded in
+`known_risks` 1.
+
+| Finding | Ruling | What changed |
+| --- | --- | --- |
+| **HIGH-1** — `binance-adapter` is not CONTAINED | **UPHELD**, reproduced (probe M) | `schema-boundary.md` §3 row rewritten to **LIVE / MEDIUM**, same owner; the effect chain (`normalize.ts:108`, `sequence.ts:298`) stated; named in §5 item 3 and `follow_up` 3 |
+| **MEDIUM-1** — settlement verdict and reason both wrong; universe unmeasured | **UPHELD**, both measured (probes N, O) | both rows rewritten to **LIVE / HIGH** from measurement; new §5 item 7 and `follow_up` 9 give them owners; `assumptions` 6 and `known_risks` 2 corrected |
+| **MEDIUM-2** — the storage row asserts doors that do not exist | **UPHELD**, censused | row rewritten to **n/a — outside the class**, with the `zod`-absence census and every `.parse(` site classified |
+| **MEDIUM-3** — F17 violated by merged code the day it ships | **UPHELD**, censused | F17 scoped to **production (non-test) source files** in the rule text; §2.2 carries the test-file census and the explicit reconciliation with §6.1 item 2 (F17 = runtime import surface; rule 3 = purity, which holds everywhere) |
+| **LOW-1** — headline undercount | **UPHELD**, recounted | **twelve packages + one app**, enumerated in `schema-boundary.md` §3 and quoted identically in ADR-020, `IMPLEMENTATION_STATUS.md`, this record, and (ripple) `protected-contracts.md` R-10 |
+| **LOW-2** — detached ADR index row | **UPHELD** | blank line at `docs/adr/README.md:101` deleted; the ADR-020 row now joins the index table |
+| **LOW-3** — stale handoff numbers | **UPHELD**, all three re-measured | `files_changed` → 8 files / 3 new / 5 modified; the hunk claim replaced with what actually reproduces (1 hunk default, 4 at `-U0`) plus the durable confinement check; ADR-006 byte counts → 30 588 / 36 640 / 6 052 (the SHA-256 was correct and was re-verified) |
+| **LOW-4** — wrong cross-reference | **UPHELD** | ADR-020 §5 now cites `schema-boundary.md` **§5** |
+| **NOTE-1** — one-directional collision note | **ADOPTED** | the F17 row now carries the reciprocal `WP-040`-F17 id-namespace note pointing at `protected-contracts.md` R-9 |
+| **NOTE-2** — commit the probe sources | **ADOPTED, with a disclosure** | the three new probes are committed in full (**Appendix A**) with the sandbox recipe and command; the round-1 sources are **unrecoverable** and that is stated in `tests_run` rather than papered over |
+| **NOTE-3** — F19 grant-time flag | **ADOPTED** | recorded in `protected-contracts.md` R-9 and in `follow_up` 10 |
+| **NOTE-4** — calls ≠ states | **ADOPTED** | "~7,000-call tuned pollution battery" (WP-180's wording) in the status record, and the same correction in ADR-020 §6 / Evidence |
+
+### Probe transcripts — remediation round 1
+
+Sandbox: `git archive HEAD | tar -x -C /dev/shm/gov2arem`,
+`pnpm --dir /dev/shm/gov2arem install --frozen-lockfile`, `zod@4.4.3` read back
+from `/dev/shm/gov2arem/node_modules/.pnpm/zod@4.4.3`. Run with
+`pnpm --dir /dev/shm/gov2arem exec vitest run --config /dev/shm/gov2arem/probe/vitest.config.ts`.
+Sources: Appendix A. `NE` = non-enumerable inherited property.
+
+#### M — `packages/binance-adapter`: a DECLARED key supplied from the prototype
+
+```text
+M1 clean frame:                  {"kind":"TRADE","quantityRaw":"0.5","unknownFields":[],"reason":null}
+M2 `q` deleted, clean prototype: {"kind":"MALFORMED","unknownFields":[],"reason":"SCHEMA_MISMATCH"}
+M3 `q` deleted, NE inherited q:  {"kind":"TRADE","quantityRaw":"999999","unknownFields":[],"reason":null}
+M4 normalizeTrade of M3:         {"ok":true,"size":"999999"}
+M5 tradeIdentity of M3:          "64000.25|999999|1700000000000|false"
+```
+
+The round-1 audit ran only H1/I2 — *unknown*-key adoption through `looseObject`,
+where the non-enumerable form is not adopted and `unknownFields` stays empty —
+and read that as containment. M3 is the class the coinbase and rtds rows were
+ruled LIVE on, and `decodeFrame`'s "reads named fields explicitly"
+(`frames.ts:469-472`) is the mechanism that delivers it. M4/M5 are why it
+matters: the fabricated quantity becomes the normalized `size` and the dedup
+identity of a recorded trade.
+
+#### N — `packages/settlement`: required-key adoption sweep
+
+```text
+N0 sample own keys (16): seriesId,specVersion,rulesVersionId,referenceSymbol,timestampBoundary,
+   roundingRule,fallbackSource,disputePolicy,clarificationPolicy,verification,settlementSpecId,
+   resolutionSource,observationType,comparison,strikeSource,payoffModel
+N0 clean parse: {"ok":true,"detail":"ACCEPTED"}
+N1 required keys for this sample: 14/16          ← rulesVersionId and payoffModel are optional here
+N2 ADOPTABLE from Object.prototype: 14/14 — seriesId,specVersion,referenceSymbol,timestampBoundary,
+   roundingRule,fallbackSource,disputePolicy,clarificationPolicy,verification,settlementSpecId,
+   resolutionSource,observationType,comparison,strikeSource
+N3 still refused: (none)
+  resolutionSource: clean=REFUSED  NE-inherited=ACCEPTED
+     adopted="Example reference exchange terminal print at the close instant."
+  comparison:       clean=REFUSED  NE-inherited=ACCEPTED  adopted="GTE"
+  strikeSource:     clean=REFUSED  NE-inherited=ACCEPTED
+     adopted="The strike stated in the market rules text."
+  settlementSpecId: clean=REFUSED  NE-inherited=ACCEPTED
+     adopted="01936f00-0000-7000-8000-00000000c001"
+  verification:     clean=REFUSED  NE-inherited=ACCEPTED  adopted={"status":"UNVERIFIED"}
+  (the remaining nine required keys behave identically; full sweep in the probe source)
+N4 no `verification` own key, NE inherited VERIFIED:
+   {"ok":true,"verification":{"status":"VERIFIED","verifiedBy":"nobody",
+    "verifiedAt":"2026-08-28T00:00:00Z"},"isReviewed":true}
+```
+
+Round 1 wrote "refused on type/shape before any format check ran". That answers a
+*format-check* question; adoption is a different class and a ~30-line sweep
+reaches it. **N4 is the sharp one**: `isReviewedSettlementSpec` is the gate on
+model-dependent activation, and a spec that names no review at all passes it.
+
+#### O — `packages/universe`: `parsed.data` consumed at ten sites
+
+```text
+O1 MarketResolved complete, clean:      {"ok":true,"lifecycleState":"RESOLVED",
+                                         "outcomeState":"YES_WIN","resolvedAt":"2026-08-28T12:15:30Z"}
+O2 `outcome` deleted, clean prototype:  {"ok":false,"codes":["UNIVERSE_INPUT_INVALID"]}
+O3 `outcome` deleted, NE inherited:     {"ok":true,"lifecycleState":"RESOLVED",
+                                         "outcomeState":"YES_WIN","resolvedAt":"2026-08-28T12:15:30Z"}
+O4 `conditionId` deleted, clean:        {"ok":false,"codes":["UNIVERSE_INPUT_INVALID"]}
+O5 `conditionId` deleted, NE inherited: {"ok":true,"lifecycleState":"RESOLVED",
+                                         "outcomeState":"NO_WIN","resolvedAt":"2026-08-28T12:15:30Z"}
+O6 `resolvedAt` deleted, clean:         {"ok":false,"codes":["UNIVERSE_INPUT_INVALID"]}
+O7 `resolvedAt` deleted, NE inherited:  {"ok":true,"lifecycleState":"RESOLVED",
+                                         "outcomeState":"CANCELLED","resolvedAt":"2099-01-01T00:00:00Z"}
+```
+
+O3 is a **terminal outcome reached from the prototype** — the transition
+`lifecycle.ts` rule 1 restricts to `MarketResolved` and the frozen contract
+restricts to four states. O5 defeats `checkIdentity`, the guard that exists to
+refuse an event naming a different market. O7 records a resolution instant no
+event carried.
+
+#### Mechanical censuses (no probe needed)
+
+```text
+storage-postgres / storage-wal / storage-parquet / observability
+  `zod` in package.json:        none of the four
+  `from "zod"` in src/:         none of the four
+  every `.parse(` in src/:      JSON.parse or Date.parse only —
+    storage-postgres: json.ts:65 (JSON), timestamps.ts:63 (Date)
+    storage-wal:      segment-format.ts:294, manifest.ts:347 (JSON), raw-frame.ts:149 (Date)
+    storage-parquet:  4 Date.parse (compactor.ts:759, wal-format.ts:517,
+                      testing/index.ts:43, compactor.test.ts:582) + JSON.parse sites
+    observability:    6 Date.parse (soak-evidence.ts:290,293,525,526,
+                      soak-evidence.test.ts:17, render.test.ts:271) + JSON.parse sites
+
+layer-0/1 `node:` imports in TEST files, at 2d7e7da
+  NOT enumerated by §2.2 (would violate F17 as first drafted):
+    packages/universe/src/seeds.test.ts                      node:fs, node:path, node:url
+    packages/universe/src/settlement-binding.test.ts         node:fs, node:path, node:url
+    packages/settlement/src/seeds.test.ts                    node:fs, node:path, node:url
+    packages/observability/src/recorder/infra-consistency.test.ts    node:fs, node:path, node:url
+    packages/observability/src/recorder/validation-findings.test.ts  node:fs, node:path, node:url
+    packages/capital-allocator/src/allocator.test.ts         node:fs, node:path, node:url
+  enumerated for their package (not violations either way):
+    packages/decimal/src/hash.test.ts                        node:crypto
+    packages/features/src/snapshot.test.ts                   node:crypto
+  NON-test census re-run: unchanged — exactly the five files §2.2 lists, plus decimal's.
+
+WP-040 F19 grant-time check
+  packages/storage-postgres/src/repositories/: balances, catalog, fencing, fills,
+    ledger, orders, ownership, strategy — no wallet-operations repository
+  WP-300 allowed_paths: packages/inventory/**, test/unit/inventory/**,
+    test/contract/wallet-operations/**            → no packages/storage-postgres/**
+  WP-290 allowed_paths: packages/oms/src/reconciliation/**,
+    packages/ledger/src/reconciliation/**, test/fault-injection/reconciliation/**,
+    docs/runbooks/reconciliation.md               → no packages/storage-postgres/**
+  F18 runtime enforcement EXISTS: db/migrations/0006_accounting.up.sql:297,
+    accounting.assert_ledger_wallet_operation_market → errcode PMB12
+```
+
+---
+
+## Appendix A — probe sources (remediation round 1), verbatim
+
+Committed so the transcripts above are re-runnable. Each file goes at
+`probe/<name>` in a `/dev/shm` scratch copy; nothing in the repository is
+modified. **Each block below is byte-identical to the file that produced the
+transcript above** — verified by extracting the block and `diff`-ing it against
+the executed file, all four empty. The probes were written first and the
+document quotes them, not the other way round. Assertions are deliberately **not** used inside the polluted window
+(`expect` builds property descriptors and throws under `Object.prototype.get` —
+probe J4/R8-1): each probe collects strings, restores the prototype in a
+`finally`, and logs afterwards.
+
+### `probe/vitest.config.ts`
+
+```ts
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { defineConfig } from "vitest/config";
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+export default defineConfig({
+  test: {
+    include: ["probe/**/*.probe.test.ts"],
+    root: repoRoot,
+    passWithNoTests: false,
+  },
+});
+```
+
+### `probe/m-binance-declared-key.probe.test.ts`
+
+```ts
+import { test } from "vitest";
+
+import {
+  decodeFrame,
+  normalizeTrade,
+  tradeIdentity,
+} from "../packages/binance-adapter/src/index.js";
+
+const CLEAN_TRADE = JSON.stringify({
+  e: "trade", E: 1_700_000_000_000, s: "BTCUSDT", t: 12_345,
+  p: "64000.25", q: "0.5", T: 1_700_000_000_000, m: false,
+});
+
+const NO_Q_TRADE = JSON.stringify({
+  e: "trade", E: 1_700_000_000_000, s: "BTCUSDT", t: 12_345,
+  p: "64000.25", T: 1_700_000_000_000, m: false,
+});
+
+function describeFrame(frame: unknown): string {
+  const f = frame as Record<string, unknown>;
+  return JSON.stringify({
+    kind: f["kind"],
+    quantityRaw: f["quantityRaw"],
+    unknownFields: f["unknownFields"],
+    reason: f["reason"] ?? null,
+  });
+}
+
+test("M — binance declared-key adoption", () => {
+  const lines: string[] = [];
+
+  lines.push(`M1 clean frame:                  ${describeFrame(decodeFrame(CLEAN_TRADE))}`);
+  lines.push(`M2 \`q\` deleted, clean prototype: ${describeFrame(decodeFrame(NO_Q_TRADE))}`);
+
+  let polluted: unknown;
+  let normalized = "";
+  let fingerprint = "";
+  Object.defineProperty(Object.prototype, "q", {
+    value: "999999", enumerable: false, configurable: true, writable: true,
+  });
+  try {
+    polluted = decodeFrame(NO_Q_TRADE);
+    const frame = polluted as {
+      kind: string; priceRaw: string; quantityRaw: string;
+      tradeTimeEpoch: number; buyerIsMaker: boolean;
+    };
+    if (frame.kind === "TRADE") {
+      const result = normalizeTrade(frame as never, { timeUnit: "MILLISECOND" });
+      normalized = JSON.stringify(
+        result.ok
+          ? { ok: true, size: (result.payload as { size?: unknown }).size }
+          : { ok: false, failures: (result as { failures?: unknown }).failures },
+      );
+      fingerprint = tradeIdentity({
+        priceRaw: frame.priceRaw,
+        quantityRaw: frame.quantityRaw,
+        tradeTimeEpoch: frame.tradeTimeEpoch,
+        buyerIsMaker: frame.buyerIsMaker,
+      });
+    }
+  } finally {
+    delete (Object.prototype as Record<string, unknown>)["q"];
+  }
+
+  lines.push(`M3 \`q\` deleted, NE inherited q:  ${describeFrame(polluted)}`);
+  lines.push(`M4 normalizeTrade of M3:         ${normalized}`);
+  lines.push(`M5 tradeIdentity of M3:          ${JSON.stringify(fingerprint)}`);
+
+  for (const line of lines) {
+    console.log(line);
+  }
+});
+```
+
+### `probe/n-settlement-sweep.probe.test.ts`
+
+```ts
+import { test } from "vitest";
+
+import {
+  isReviewedSettlementSpec,
+  safeParseSettlementSpec,
+} from "../packages/settlement/src/index.js";
+import { terminalSpotSpecSample } from "../packages/settlement/src/testing/index.js";
+
+type Spec = Record<string, unknown>;
+
+function outcome(value: unknown): { ok: boolean; detail: string } {
+  const result = safeParseSettlementSpec(value);
+  if (result.ok) {
+    return { ok: true, detail: "ACCEPTED" };
+  }
+  const refusal = result.refusal as { code: string; details: { issues?: readonly string[] } };
+  return { ok: false, detail: `${refusal.code}: ${(refusal.details.issues ?? []).join(" | ")}` };
+}
+
+test("N — settlement required-key adoption sweep", () => {
+  const lines: string[] = [];
+  const sample = terminalSpotSpecSample() as unknown as Spec;
+  const keys = Object.keys(sample);
+
+  lines.push(`N0 sample own keys (${String(keys.length)}): ${keys.join(",")}`);
+  lines.push(`N0 clean parse: ${JSON.stringify(outcome(sample))}`);
+
+  const adoptable: string[] = [];
+  const refused: string[] = [];
+  const cleanRefusalCodes: string[] = [];
+  const rows: string[] = [];
+
+  for (const key of keys) {
+    const stripped: Spec = { ...sample };
+    delete stripped[key];
+
+    const clean = outcome(stripped);
+    if (clean.ok) {
+      rows.push(`  ${key}: NOT REQUIRED for this sample (clean parse still ACCEPTED)`);
+      continue;
+    }
+    cleanRefusalCodes.push(key);
+
+    let pollutedOk = false;
+    let adoptedValue: unknown;
+    Object.defineProperty(Object.prototype, key, {
+      value: sample[key], enumerable: false, configurable: true, writable: true,
+    });
+    try {
+      const result = safeParseSettlementSpec(stripped);
+      pollutedOk = result.ok;
+      if (result.ok) {
+        adoptedValue = (result.spec as unknown as Spec)[key];
+      }
+    } finally {
+      delete (Object.prototype as Spec)[key];
+    }
+
+    if (pollutedOk) {
+      adoptable.push(key);
+      rows.push(
+        `  ${key}: clean=REFUSED  NE-inherited=ACCEPTED  adopted=${JSON.stringify(adoptedValue)}`,
+      );
+    } else {
+      refused.push(key);
+      rows.push(`  ${key}: clean=REFUSED  NE-inherited=REFUSED`);
+    }
+  }
+
+  lines.push(
+    `N1 required keys for this sample: ${String(cleanRefusalCodes.length)}/${String(keys.length)}`,
+  );
+  lines.push(
+    `N2 ADOPTABLE from Object.prototype: ${String(adoptable.length)}/${String(cleanRefusalCodes.length)} — ${adoptable.join(",")}`,
+  );
+  lines.push(`N3 still refused: ${refused.length === 0 ? "(none)" : refused.join(",")}`);
+  lines.push(...rows);
+
+  const unverifiable: Spec = { ...sample };
+  delete unverifiable["verification"];
+  let n4 = "";
+  Object.defineProperty(Object.prototype, "verification", {
+    value: { status: "VERIFIED", verifiedBy: "nobody", verifiedAt: "2026-08-28T00:00:00Z" },
+    enumerable: false, configurable: true, writable: true,
+  });
+  try {
+    const result = safeParseSettlementSpec(unverifiable);
+    n4 = JSON.stringify({
+      ok: result.ok,
+      verification: result.ok ? (result.spec as unknown as Spec)["verification"] : null,
+      isReviewed: result.ok ? isReviewedSettlementSpec(result.spec) : null,
+    });
+  } finally {
+    delete (Object.prototype as Spec)["verification"];
+  }
+  lines.push(`N4 no \`verification\` own key, NE inherited VERIFIED: ${n4}`);
+
+  for (const line of lines) {
+    console.log(line);
+  }
+});
+```
+
+### `probe/o-universe.probe.test.ts`
+
+```ts
+import { test } from "vitest";
+
+import {
+  applyMarketLifecycleEvent,
+  createParameterHistory,
+  UNBOUND_SERIES_BINDING,
+  type MarketLifecycleInput,
+  type MarketProjection,
+} from "../packages/universe/src/index.js";
+import {
+  SAMPLE_MARKET_ID,
+  marketIdentitySample,
+  parameterObservationSample,
+} from "../packages/universe/src/testing/index.js";
+
+const CONDITION_ID = marketIdentitySample().conditionId;
+const MARKET_REF = { internalMarketId: SAMPLE_MARKET_ID, conditionId: CONDITION_ID } as const;
+
+function openedProjection(): MarketProjection {
+  const discovered: MarketProjection = {
+    identity: marketIdentitySample(),
+    seriesBinding: UNBOUND_SERIES_BINDING,
+    lifecycleState: "DISCOVERED",
+    outcomeState: "PENDING",
+    metadataVersion: 1,
+    clarifications: [],
+    parameters: createParameterHistory(SAMPLE_MARKET_ID, parameterObservationSample()),
+  };
+  const result = applyMarketLifecycleEvent(discovered, {
+    eventType: "MarketOpened",
+    payload: { ...MARKET_REF, openedAt: "2026-08-28T12:00:00Z" },
+  });
+  if (!result.ok) {
+    throw new Error("fixture setup failed");
+  }
+  return result.value.projection;
+}
+
+function describe(result: ReturnType<typeof applyMarketLifecycleEvent>): string {
+  if (!result.ok) {
+    return JSON.stringify({ ok: false, codes: result.refusals.map((refusal) => refusal.code) });
+  }
+  const projection = result.value.projection;
+  return JSON.stringify({
+    ok: true,
+    lifecycleState: projection.lifecycleState,
+    outcomeState: projection.outcomeState,
+    resolvedAt: projection.resolvedAt ?? null,
+  });
+}
+
+function run(input: MarketLifecycleInput): string {
+  return describe(applyMarketLifecycleEvent(openedProjection(), input));
+}
+
+test("O — universe lifecycle declared-key adoption", () => {
+  const lines: string[] = [];
+
+  lines.push(`O1 MarketResolved complete, clean:        ${run({
+    eventType: "MarketResolved",
+    payload: { ...MARKET_REF, outcome: "YES_WIN", resolvedAt: "2026-08-28T12:15:30Z" },
+  })}`);
+  lines.push(`O2 \`outcome\` deleted, clean prototype:    ${run({
+    eventType: "MarketResolved",
+    payload: { ...MARKET_REF, resolvedAt: "2026-08-28T12:15:30Z" },
+  })}`);
+
+  let o3 = "";
+  Object.defineProperty(Object.prototype, "outcome", {
+    value: "YES_WIN", enumerable: false, configurable: true, writable: true,
+  });
+  try {
+    o3 = run({
+      eventType: "MarketResolved",
+      payload: { ...MARKET_REF, resolvedAt: "2026-08-28T12:15:30Z" },
+    });
+  } finally {
+    delete (Object.prototype as Record<string, unknown>)["outcome"];
+  }
+  lines.push(`O3 \`outcome\` deleted, NE inherited:       ${o3}`);
+
+  lines.push(`O4 \`conditionId\` deleted, clean:          ${run({
+    eventType: "MarketResolved",
+    payload: {
+      internalMarketId: SAMPLE_MARKET_ID,
+      outcome: "NO_WIN",
+      resolvedAt: "2026-08-28T12:15:30Z",
+    },
+  })}`);
+  let o5 = "";
+  Object.defineProperty(Object.prototype, "conditionId", {
+    value: CONDITION_ID, enumerable: false, configurable: true, writable: true,
+  });
+  try {
+    o5 = run({
+      eventType: "MarketResolved",
+      payload: {
+        internalMarketId: SAMPLE_MARKET_ID,
+        outcome: "NO_WIN",
+        resolvedAt: "2026-08-28T12:15:30Z",
+      },
+    });
+  } finally {
+    delete (Object.prototype as Record<string, unknown>)["conditionId"];
+  }
+  lines.push(`O5 \`conditionId\` deleted, NE inherited:   ${o5}`);
+
+  lines.push(`O6 \`resolvedAt\` deleted, clean:           ${run({
+    eventType: "MarketResolved",
+    payload: { ...MARKET_REF, outcome: "CANCELLED" },
+  })}`);
+  let o7 = "";
+  Object.defineProperty(Object.prototype, "resolvedAt", {
+    value: "2099-01-01T00:00:00Z", enumerable: false, configurable: true, writable: true,
+  });
+  try {
+    o7 = run({
+      eventType: "MarketResolved",
+      payload: { ...MARKET_REF, outcome: "CANCELLED" },
+    });
+  } finally {
+    delete (Object.prototype as Record<string, unknown>)["resolvedAt"];
+  }
+  lines.push(`O7 \`resolvedAt\` deleted, NE inherited:    ${o7}`);
+
+  for (const line of lines) {
+    console.log(line);
+  }
+});
+```
+
+---
+
 ## commit_sha
 
-One commit on branch `worktree-agent-a9d317e245f6f9a01`, based on `2d7e7da`. Its
+Two commits on the candidate branch, based on `main` `2d7e7da`: the round-1
+candidate `bc15d25`, and one remediation commit on top of it. The remediation
 SHA is reported in the agent's returned handoff — a commit cannot contain its own
 hash.
 
-**Not merged. Not marked complete.** A strict adversarial review follows on this
+**Not merged. Not marked complete.** A second adversarial review follows on this
 tip and, per `AGENTS.md`, it may not be performed by this agent.

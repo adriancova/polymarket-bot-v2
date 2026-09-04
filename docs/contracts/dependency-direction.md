@@ -262,8 +262,9 @@ The distinction is per **binding**, not per module, and the table names bindings
 | `packages/execution-planner` | 1 | `node:util` | `types.isProxy` | `src/plain-data.ts:25` (mirror) **and** `src/pluck.ts:28,58` (the §6 invariant 13 minimal-read cancel path) | `WP-190` R1-N2 |
 | `packages/features` | 1 | `node:crypto` | `createHash` | `src/hash.ts:14`. Content addressing needs SHA-256; a hand-rolled FIPS 180-4 implementation in production code is a correctness liability, and `WP-160`'s review used exactly that as an independent *oracle* rather than as the shipped path | `WP-160` R1-N1 |
 
-**The table is exhaustive for layers 0 and 1**, and a package outside it importing
-any built-in is a violation (F17). Verified mechanically at `main` `2d7e7da`: a
+**The table is exhaustive for the layer-0 and layer-1 PRODUCTION import
+surface**, and a package outside it importing any built-in *in a production
+source file* is a violation (F17). Verified mechanically at `main` `2d7e7da`: a
 census of every non-test `node:` import under `packages/` and `apps/` returns
 exactly these five files below layer 2 — `packages/{risk,capital-allocator}/src/plain-data.ts`,
 `packages/execution-planner/src/{plain-data,pluck}.ts`,
@@ -271,6 +272,34 @@ exactly these five files below layer 2 — `packages/{risk,capital-allocator}/sr
 other `node:` import in the workspace is in a layer-2 package
 (`event-bus`, `storage-wal`, `storage-postgres`, `storage-parquet`) or a layer-3
 app (`data-gateway`, `ops-cli`, `research-worker`).
+
+**Test files are outside this table, and that scope is stated rather than
+implied** *(qualified 2026-09-04 in `GOV-2A`'s round-1 review remediation; the
+first drafting said "importing any built-in" with no such qualification, and its
+own census sentence covered only non-test imports)*. The same census run over
+**test** files at `2d7e7da` returns six layer-1 files importing built-ins this
+table does not enumerate — `packages/universe/src/{seeds,settlement-binding}.test.ts`,
+`packages/settlement/src/seeds.test.ts`,
+`packages/observability/src/recorder/{infra-consistency,validation-findings}.test.ts`
+and `packages/capital-allocator/src/allocator.test.ts`, all reading seed or
+dashboard fixtures through `node:fs` / `node:path` / `node:url` — plus two that
+*are* enumerated for their package (`packages/decimal/src/hash.test.ts` and
+`packages/features/src/snapshot.test.ts`, both `node:crypto`). An unqualified
+F17 would therefore have been violated by merged code on the day it shipped,
+which is precisely the "a gate every merged package fails is a gate that gets
+waived wholesale" failure mode §6.1 item 1 ruled against.
+
+**Why tests are out of F17's scope while they are IN scope for rule 3** (§6.1
+item 2 ruled that a purity-restricted package's test files *are* covered): the
+two rules govern different properties. F17 governs a package's **runtime import
+surface** — what the shipped module graph is allowed to reach, and a fixture
+read that never executes in the trading process does not widen it. Rule 3
+governs **purity**, which is a property of *behaviour* and therefore holds
+wherever the code runs: a strategy test that reads a real clock or unseeded
+randomness reintroduces exactly the nondeterminism §12.4 exists to exclude. So a
+strategy test may still not read `Date.now`, and a layer-1 test may read a
+fixture file. The rulings are not in tension, and neither may be cited to relax
+the other.
 
 **Adding a row is a contract edit with a citation**, exactly like §2.1: name the
 binding, walk the five properties, and say what the alternative costs. "It was
@@ -306,7 +335,7 @@ coverage drifts (§6).
 | F14 | Inside a **purity-restricted** package (`packages/domain`, `packages/strategies/**`, `packages/ledger`, `packages/simulation`), any construct that makes F1–F8/F11 **unevaluable**: a module load whose specifier is not a static literal; a reference to a module-**loading capability** (`require` and its aliases, a CommonJS `Module` object incl. `process.mainModule`/`require.main`, `createRequire` and its result, `process.getBuiltinModule`, the `node:module` namespace/`Module` class/`register`) in a position that escapes this document's analysis; a computed member read on such a capability; and a reference to an **evaluator** (`eval`, `Function`, or a read of the `.constructor` property) | §5.2 and ADR-005 §1, read as intent rather than as a list of spellings: a package forbidden to perform I/O has no legitimate use for a module loader or an evaluator, and a construct that defeats static checking cannot be permitted to *establish* compliance. Numbered 2026-08-28 (`GOV-1B`) from `docs/handoffs/WP-015.md` `follow_up` 6 |
 | F15 | `packages/decimal` importing anything beyond `decimal.js` and `node:crypto` | `docs/contracts/domain.md` §1 ("Dependencies: `decimal.js` and `node:crypto` only … the package performs no I/O") and §2 of this document (the Layer 0 "May import" cell). Numbered 2026-09-02 (`GOV-1C`) from `docs/handoffs/WP-015.md` `follow_up` 4 via §6.1 item 4 — the allowlist was "enforced by construction" with no F-row, so a violating edit would have been a review finding rather than a gate failure. **Not yet implemented by the §6 check** (the same tooling follow-up as the F14 machine-id swap); until then, enforcement-by-construction and review remain the mechanism |
 | F16 | A cross-package **deep import** — any workspace import specifier that resolves inside another workspace package other than through that package's `package.json` `exports` map | `docs/handoffs/WP-015.md` `follow_up` 3 via §6.1 item 4, numbered 2026-09-02 (`GOV-1C`) on the evidence that **every** workspace package (28/28 as of this date) declares an `exports` map, so "bypassing the entry point" is well-defined. Largely platform-enforced already: Node refuses an unexported subpath (`ERR_PACKAGE_PATH_NOT_EXPORTED`) and `NodeNext` resolution mirrors it at typecheck — the row exists so a widened `exports` map or a bundler that resolves around encapsulation is a contract violation, not a loophole. **Not yet implemented by the §6 check** (same tooling follow-up) |
-| F17 | A **layer-0 or layer-1** package importing a Node built-in binding that §2.2's table does not enumerate for that package | §2.2 (ruled 2026-09-04 by `GOV-2A`), discharging `WP-180` `follow_up` R6-1, `WP-190` R1-N2, and `WP-160` R1-N1, which each disclosed an instance and asked the contract owner to rule rather than ratifying it locally. Generalises F2 (`packages/domain`: none) and F15 (`packages/decimal`: `node:crypto` only) into one criterion — trap-free, entropy-free, clock-free, I/O-free, synchronous and pure — plus an exhaustive per-package enumeration, so a new import is a cited contract edit rather than a reviewer's judgment call. Layers 2 and 3 are **not** constrained by this row. **Not yet implemented by the §6 check** (same tooling follow-up as F15/F16) |
+| F17 | A **layer-0 or layer-1** package importing, **in a production (non-test) source file**, a Node built-in binding that §2.2's table does not enumerate for that package | §2.2 (ruled 2026-09-04 by `GOV-2A`), discharging `WP-180` `follow_up` R6-1, `WP-190` R1-N2, and `WP-160` R1-N1, which each disclosed an instance and asked the contract owner to rule rather than ratifying it locally. Generalises F2 (`packages/domain`: none) and F15 (`packages/decimal`: `node:crypto` only) into one criterion — trap-free, entropy-free, clock-free, I/O-free, synchronous and pure — plus an exhaustive per-package enumeration, so a new import is a cited contract edit rather than a reviewer's judgment call. Layers 2 and 3 are **not** constrained by this row. **The production-only scope is part of the rule** *(qualified 2026-09-04 in `GOV-2A`'s round-1 review remediation, which measured six layer-1 **test** files importing un-enumerated built-ins at the tip that shipped this row — see §2.2, which also states why test files are outside F17 while §6.1 item 2 holds them inside rule 3: F17 governs a package's runtime import surface, rule 3 governs purity, which is a property of behaviour everywhere)*. **Note the id namespace:** this F17 is a §3 forbidden-edge id and is unrelated to `WP-040` obligation **F17** (the OMS may not label an order `SIGNED` before its submission-attempt row exists), re-assigned to `WP-270` in [`protected-contracts.md`](./protected-contracts.md) §8.1 **R-9**; the two reached the same number by coincidence on the same date. **Not yet implemented by the §6 check** (same tooling follow-up as F15/F16) |
 
 F3 and F11 are the two that matter most for correctness rather than tidiness:
 they are what makes deterministic replay possible (§12.4).

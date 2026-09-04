@@ -30,10 +30,15 @@ owns; this ADR is the ruling that escalation asked for.
 **What is new here is not the class — it is the measurement.** `GOV-2A` audited
 every merged raw-`zod` boundary against a `/dev/shm` scratch copy of `main`
 (`2d7e7da`), with executed probes rather than reading. The audit found **live
-fail-opens in five merged packages and one app**, including two that defeat a
-recorded `WP-040` obligation and a gateway startup safety check, and one — the
-frozen `§7.5 DecisionResult` schema — where **every required key can be supplied
-from `Object.prototype`**. It also found a variant nobody had recorded: the
+fail-opens in twelve merged packages and one app** (the tally is
+`docs/contracts/schema-boundary.md` §3; three of the twelve —
+`binance-adapter`, `settlement`, `universe` — were measured in this ADR's
+round-1 review remediation, which overturned two "not reached by probe" rows
+and one wrong CONTAINED verdict), including two that defeat a recorded `WP-040`
+obligation and a gateway startup safety check, one — the frozen
+`§7.5 DecisionResult` schema — where **every required key can be supplied from
+`Object.prototype`**, and a settlement spec whose own review status is
+adoptable. It also found a variant nobody had recorded: the
 **non-enumerable** form of the pollution, which defeats the accidental
 `z.strictObject` protection that made several of these boundaries look safe.
 
@@ -127,14 +132,14 @@ stated whenever one of these findings is reported.
 
 No package is required to retrofit the door in a round it does not own. The
 staging is by measured exposure, and the owners are recorded in
-`docs/contracts/schema-boundary.md` §4 and in `GOV-2A`'s `follow_up`. **A new or
+`docs/contracts/schema-boundary.md` **§5** and in `GOV-2A`'s `follow_up`. **A new or
 substantially rewritten boundary opened after this date conforms on arrival** —
 that is the part that binds immediately, because it costs nothing at
 construction time and is expensive to retrofit.
 
 ### 6. No refusal, cancel, or permission decision may vary with ambient prototype state
 
-`WP-180` measured, over ~7,000 pollution states, that refusal **composition**
+`WP-180` measured, with a ~7,000-**call** tuned pollution battery, that refusal **composition**
 (message, path, issue ordering) can vary while permission never does and cancels
 stay byte-identical. That is the bound, and it is the bound every conforming
 door must keep: **composition may vary; permission may not, and a `SAFETY_CANCEL`
@@ -196,7 +201,8 @@ process. That is a superseding-ADR decision, not a package-level one.
   — round-6 census, round-7 three live fail-opens (including `maxRunMode`),
   round-8 `skipChecks` and descriptor literals, round-9 `optin`/`optout`, `when`,
   `values`, cold-lazy poisoning and the arena's sever/warm mechanism, round-10
-  independent confirmation (nine probe campaigns, ~7,000 pollution states).
+  independent confirmation (nine probe campaigns, a ~7,000-call tuned pollution
+  battery).
 - **Third conforming instance:** `docs/handoffs/WP-190.md` (the mirrored
   `plain-data.ts` / `schema-arena.ts` in `packages/execution-planner`, drift-
   guarded three ways).

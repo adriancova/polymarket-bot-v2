@@ -98,7 +98,6 @@ sentence previously read "the first and, so far, only use"; corrected
 | [ADR-017](./ADR-017-dataset-manifest-and-retention-receipt-artifact-contract.md) | Dataset-manifest and retention-receipt artifact contract (two digest roles; `nullable` = Parquet repetition; strict-JSON profile; receipt = reporting, not proof) | Accepted | §8.4, §12.5, §10.2 | `WP-130` (done, unchanged) |
 | [ADR-018](./ADR-018-app-local-esbuild-runtime-build-convention.md) | Workspace apps that must run use an app-local esbuild bundle (ESM default; CJS where a CJS-only dependency forces it) | Accepted | §2, §5 | `WP-120`/`WP-130` (done, unchanged); `apps/trader` and later apps |
 | [ADR-019](./ADR-019-soak-evidence-threshold-policy.md) | Soak-evidence threshold: 24 contiguous hours, one window, no summing | Accepted | §16.7, §17 | `WP-140` (done, unchanged) |
-
 | [ADR-020](./ADR-020-schema-parse-boundary-integrity.md) | A schema parse result is not clean data: every caller/wire-input boundary parses through a prototype-free door (`zod@4.4.3` reads its own state and the input's properties through the prototype chain) | Accepted | §6, §7, §7.5, §9.15, §11 | `WP-180`/`WP-190` conform; staged owners in [`docs/contracts/schema-boundary.md`](../contracts/schema-boundary.md) §5 |
 
 Companion contract documentation (not ADRs, same authority chain):

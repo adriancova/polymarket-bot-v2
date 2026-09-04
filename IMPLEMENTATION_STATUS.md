@@ -1677,7 +1677,9 @@ that parses venue payloads.
 - **Refusal COMPOSITION varies, but the bound is measured (added 2026-09-04).** Issue-literal
   fields and message resolution (`fallback`, `message`, `path`, `input`, `deferred`, parse-ctx
   reads) can still be answered through a chain on the refusal path. WP-180's round-10 review
-  bounded it over ~7,000 pollution states: **permission never varies, cancels are
+  bounded it with a **~7,000-call tuned pollution battery** (WP-180's own wording, restored
+  2026-09-04 in `GOV-2A`'s round-1 review remediation — the number counts *calls*, not distinct
+  pollution states, and this record's WP-180 row states it that way): **permission never varies, cancels are
   byte-identical, and the refusal codes-family is unmoved** — only composition (message text,
   path, issue ordering) moves. That bound is now the conformance statement every closed door
   owes (ADR-020 §6).
@@ -1747,8 +1749,14 @@ reproduced in the `/dev/shm` audit), with owners:**
 DISCHARGED, and the answer is not reassuring.** Every merged raw-`zod` boundary was found
 mechanically (a grep of `zod` imports and `.parse`/`.safeParse` call sites across `packages/`
 and `apps/`) and probed against a `/dev/shm` scratch copy of `main` `2d7e7da` installed
-`--frozen-lockfile`. **Live fail-opens were measured in five packages and one app**, the
-sharpest being:
+`--frozen-lockfile`. **Live fail-opens were measured in TWELVE packages and one app**
+(`packages/{domain,ledger,pnl,strategy-runtime,event-bus,features,order-book,binance-adapter,
+coinbase-adapter,polymarket-public,universe,settlement}` + `apps/data-gateway`; the
+authoritative per-row tally is `docs/contracts/schema-boundary.md` §3). *(Count corrected
+2026-09-04 in `GOV-2A`'s round-1 review remediation: the original "five packages and one app"
+undercounted rows the same audit table already carried, and three further rows — binance-adapter
+(a wrong CONTAINED verdict), settlement and universe (both "not reached by probe") — became LIVE
+on measurement in that remediation.)* The sharpest are:
 
 - `packages/domain` (frozen, the root cause): `Uuidv7Schema` and `IsoTimestampSchema` accept
   `"NOT-A-UUID"` / `"yesterday"` under an inherited `skipChecks`, and **every required key of
@@ -1769,6 +1777,16 @@ sharpest being:
 - `packages/event-bus` (Redis wire), `packages/coinbase-adapter` (missing `channel` supplied
   from the prototype), `packages/polymarket-public` rtds (missing `type` supplied from the
   prototype): routing and envelope validation defeated at the recorder's wire boundary.
+- **Measured in the round-1 review remediation (2026-09-04), each overturning a negative verdict
+  the first pass recorded:** `packages/binance-adapter` — a trade frame with `q` deleted is
+  `MALFORMED` clean and decodes as a TRADE with `quantityRaw: "999999"` under a non-enumerable
+  inherited `q`, which flows into the normalized `size` and into the dedup fingerprint (the first
+  pass tested only *unknown*-key adoption and called it CONTAINED); `packages/settlement` — of
+  the 16 own keys of a sample spec, the 14 that are required are **all** adoptable from
+  `Object.prototype`, and a spec with no `verification` key parses as `{status:"VERIFIED"}` with
+  `isReviewedSettlementSpec` returning `true`; `packages/universe` — a `MarketResolved` payload
+  with `outcome` deleted **resolves the market** under an inherited `outcome`, and `resolvedAt`
+  and the `conditionId` identity key are adoptable too.
 
 **What a probe result MEANS.** Nothing on the wire can write `Object.prototype`; every finding
 above requires code already executing in the process. They say *"this check is not load-bearing
