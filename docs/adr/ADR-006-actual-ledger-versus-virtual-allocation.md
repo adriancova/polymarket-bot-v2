@@ -388,6 +388,95 @@ narrower re-scoping trigger is finding 4 — if the venue names a settlement
 token for liquidity rewards, ruling 5's "not asserted by the source" lapses for
 that program and the register row is updated with that evidence.
 
+**Second amendment, 2026-09-04 (`GOV-2A`): the deferred conformance
+ratification is CLOSED. `WP-200` at its merged state conforms to §7 items 1-3
+and to the 2026-09-03 amendment's ruling 5.**
+
+The 2026-09-03 amendment deliberately ratified no `WP-200` behavior, because
+`WP-200` was mid-remediation and the contract owner had read its handoff rather
+than run its code ("conformance ratification is deferred to `WP-200`'s final
+code review and merged state"; `GOV-1D` `known_risks` 7 and `follow_up` 4 both
+carry it). `WP-200` merged at **`7e75f9a`** with review round 3 **ACCEPT**. This
+amendment discharges that carried item against the merged code, on **executed
+evidence** — probes run in a `/dev/shm` scratch copy of `main` **`2d7e7da`**,
+installed with `pnpm install --frozen-lockfile`; full transcripts in
+`docs/handoffs/GOV-2A.md` (probes B, E, K). Nothing here is observational: no
+payout, balance, transaction, or credential was involved, and no network call was
+made.
+
+**Item 1 — explicit asset identifiers, no implicit "cash": CONFORMANT.**
+`LedgerEntryInputSchema` (`packages/ledger/src/transaction.ts`) requires both
+`assetId` (a non-empty string) and `assetKind` (`COLLATERAL` | `OUTCOME_TOKEN`)
+on every leg. Measured: a balanced reward transaction with `assetId` deleted from
+both legs is refused `LEDGER_INPUT_INVALID` (probe K2). There is no default asset
+anywhere in the vocabulary, and `packages/ledger/src/vocabulary.ts` states the
+rule at the definition site.
+
+**Item 2 — USDC and pUSD never interchangeable; conversion only as an explicit
+recorded transaction: CONFORMANT, and enforced rather than documented.** The
+balance rule is keyed by asset: `netByAsset` on a transaction moving `−5 pUSD`
+against `+5 USDC` returns two separate buckets, `{pUSD: "-5", USDC: "5"}`, and
+`checkPerAssetBalance` emits **two** `LEDGER_UNBALANCED_ASSET` refusals, one per
+asset; `Ledger.append` refuses the transaction (probe K1). An *implicit*
+conversion is therefore not merely discouraged — it is structurally unbookable,
+because the only way to balance a transaction that touches two denominations is
+to give each denomination its own balanced pair of legs, which is exactly the
+"explicit, recorded ledger transaction with its own evidence" this item
+requires. No code path sums across `assetId`.
+
+**Item 3 — denominated in the unit its source asserts: CONFORMANT on the
+denomination; the source-provenance half is REPRESENTABLE BUT UNEXERCISED, and
+that is recorded rather than ratified.** Every monetary record names its own
+`denominationAsset` as a required field with no default
+(`packages/pnl/src/records.ts`: trade, realization, cost-basis injection, fee,
+reward payout, reward estimate), and a record whose denomination contradicts an
+open lot's is refused. The provenance hook exists — `scheduleVersionRef` on a fee
+and `programVersionRef` on a reward point at the §9.13 versioned snapshot that
+would carry the source page and its retrieval date. **No builder emits such a
+snapshot yet** (`WP-200` `follow_up` 6: the §9.14 path that constructs these does
+not exist). So "the source page and its retrieval date travel with the entry" is
+today an obligation on the *first package that books a real fee or reward*, not a
+discharged fact. **Owner: the fee/reward accounting work**, recorded in
+`docs/handoffs/GOV-2A.md` `follow_up`.
+
+**Ruling 5 — no default unit for liquidity rewards: CONFORMANT, structurally.**
+`PnlRewardPayoutRecordSchema.denominationAsset` is **required with no
+`.default()`**, and `LIQUIDITY_REWARD` is an ordinary `programType` value with no
+denomination special-casing anywhere — so a reward payout that does not name its
+asset is *unrepresentable*, which is stronger than "does not default to pUSD".
+Better still, naming it is not sufficient: `packages/pnl/src/evidence.ts` requires
+the named ledger transaction to book `REWARD_INCOME` **in that same asset**
+(`entry.scope === "REWARD_INCOME" && entry.assetId === claim.denominationAsset`)
+for the claimed amount. The denomination therefore comes from the **observed
+payout's own asset**, which is precisely the safe path ruling 5 named. The
+`UNATTRIBUTED` + halt fallback exists as the `UNATTRIBUTED` scope,
+`unattributedExposure`, and `applyTransaction`'s recorded `haltRequired`; per
+`WP-200`'s carried reviewer NOTE, **acting** on `haltRequired` is an integration
+obligation owed by whoever builds the composition root, and this amendment
+ratifies the ledger's recording of it, not any caller's response to it.
+
+**One limit on all four verdicts, stated so it is not read away.** These rules
+are enforced by code that validates through `zod@4.4.3`, and
+[ADR-020](./ADR-020-schema-parse-boundary-integrity.md) records — with measured
+probes at this same merged state — that a `zod` boundary can be defeated by
+ambient `Object.prototype` state. Two of `GOV-2A`'s findings land on this very
+door: a non-enumerable inherited `marketId` defeats the `WP-040` F16 market
+requirement, and a non-enumerable inherited `skipChecks` admits a
+non-canonical `ledgerTransactionId` and a malformed `occurredAt` (probes B1, F2,
+F3). **Neither defeats items 1-3 or ruling 5** — the per-asset balance rule is
+ordinary arithmetic over the parsed legs and does not depend on a format check,
+which is why K1 and K2 hold — but the honest statement is that C-2 conformance is
+verified **in an unpolluted process**, which is the only process any of this code
+has ever run in and requires an attacker already executing inside it. The
+retrofit owner is `WP-200-FU1` (`docs/contracts/schema-boundary.md` §5 item 1).
+
+**What this second amendment does NOT do.** It does not revisit the C-2 ruling
+itself — findings 1-4, the five rulings, and the reopen condition above are
+untouched and remain the operative text. It records no venue fact and performs no
+fetch; the 2026-09-03 retrieval remains the evidence, and the two gaps in
+`docs/venue/verified-2026-09-03.md` §5 carry forward unpaid. It changes no code,
+no run-mode default, and no safety ceiling.
+
 ### 8. Wallet operations are ledger transactions
 
 Split, merge, redeem, approve, and transfer are first-class wallet operations

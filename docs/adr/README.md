@@ -84,7 +84,7 @@ sentence previously read "the first and, so far, only use"; corrected
 | [ADR-003](./ADR-003-gateway-to-trader-transport.md) | Gateway-to-trader transport | Accepted | §2, §9.1, §4.2 | `WP-060` |
 | [ADR-004](./ADR-004-wal-format-durability-and-compaction.md) | WAL format, durability, and compaction | Accepted | §9.1, §12.5 | `WP-050`, `WP-130` |
 | [ADR-005](./ADR-005-strategy-purity-and-decision-result.md) | Strategy purity and `DecisionResult` contract | Accepted | §6.2–6.3, §7.5–7.7, §9.6 | `WP-020` (done), `WP-170` |
-| [ADR-006](./ADR-006-actual-ledger-versus-virtual-allocation.md) | Actual ledger versus virtual allocation; §7 amended 2026-09-03 — C-2 (USDC vs pUSD) **resolved as a documentation inconsistency**, denominations stay distinct | Accepted | §6.7–6.8, §9.15, §9.16 | `WP-040`, `WP-200` |
+| [ADR-006](./ADR-006-actual-ledger-versus-virtual-allocation.md) | Actual ledger versus virtual allocation; §7 amended 2026-09-03 — C-2 (USDC vs pUSD) **resolved as a documentation inconsistency**, denominations stay distinct; §7 amended again 2026-09-04 (`GOV-2A`) — the deferred `WP-200` conformance ratification **closed against merged `7e75f9a`** on executed probes | Accepted | §6.7–6.8, §9.15, §9.16 | `WP-040`, `WP-200` |
 | [ADR-007](./ADR-007-signed-order-idempotency-and-unknown-submissions.md) | Signed-order idempotency and unknown submissions | Accepted | §6.6, §9.11, §9.17 | `WP-260`, `WP-270`, `WP-290` |
 | [ADR-008](./ADR-008-live-writer-fencing-and-heartbeat-health-lease.md) | Live-writer fencing and heartbeat health lease | Accepted | §6.16, §9.18, §4.2 | `WP-320`, `WP-330` |
 | [ADR-009](./ADR-009-settlement-spec-and-payoff-model-selection.md) | `SettlementSpec` and payoff-model selection | Accepted | §9.2, §9.3, §6.9 | `WP-110` |
@@ -99,12 +99,18 @@ sentence previously read "the first and, so far, only use"; corrected
 | [ADR-018](./ADR-018-app-local-esbuild-runtime-build-convention.md) | Workspace apps that must run use an app-local esbuild bundle (ESM default; CJS where a CJS-only dependency forces it) | Accepted | §2, §5 | `WP-120`/`WP-130` (done, unchanged); `apps/trader` and later apps |
 | [ADR-019](./ADR-019-soak-evidence-threshold-policy.md) | Soak-evidence threshold: 24 contiguous hours, one window, no summing | Accepted | §16.7, §17 | `WP-140` (done, unchanged) |
 
+| [ADR-020](./ADR-020-schema-parse-boundary-integrity.md) | A schema parse result is not clean data: every caller/wire-input boundary parses through a prototype-free door (`zod@4.4.3` reads its own state and the input's properties through the prototype chain) | Accepted | §6, §7, §7.5, §9.15, §11 | `WP-180`/`WP-190` conform; staged owners in [`docs/contracts/schema-boundary.md`](../contracts/schema-boundary.md) §5 |
+
 Companion contract documentation (not ADRs, same authority chain):
 
 - [`docs/contracts/domain.md`](../contracts/domain.md) — the frozen `WP-020`
   domain and decimal contracts.
 - [`docs/contracts/dependency-direction.md`](../contracts/dependency-direction.md)
   — the §5.2 dependency graph and its CI enforcement expectation.
+- [`docs/contracts/schema-boundary.md`](../contracts/schema-boundary.md) —
+  ADR-020's normative companion: the door definition, the measured classes at the
+  pinned `zod`, the per-package audit at `main` `2d7e7da`, and the owner
+  assignments.
 - [`docs/contracts/protected-contracts.md`](../contracts/protected-contracts.md)
   — the protected-path policy, the ratification-precedent mechanism, and the
   consolidated register of open venue-fact items.
