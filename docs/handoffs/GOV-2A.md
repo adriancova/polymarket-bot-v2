@@ -663,7 +663,7 @@ Round 1 wrote "refused on type/shape before any format check ran". That answers 
 reaches it. **N4 is the sharp one**: `isReviewedSettlementSpec` is the gate on
 model-dependent activation, and a spec that names no review at all passes it.
 
-#### O — `packages/universe`: `parsed.data` consumed at ten sites
+#### O — `packages/universe`: `parsed.data` consumed at nine sites
 
 ```text
 O1 MarketResolved complete, clean:      {"ok":true,"lifecycleState":"RESOLVED",
@@ -693,7 +693,7 @@ storage-postgres / storage-wal / storage-parquet / observability
   `from "zod"` in src/:         none of the four
   every `.parse(` in src/:      JSON.parse or Date.parse only —
     storage-postgres: json.ts:65 (JSON), timestamps.ts:63 (Date)
-    storage-wal:      segment-format.ts:294, manifest.ts:347 (JSON), raw-frame.ts:149 (Date)
+    storage-wal:      segment-format.ts:294, manifest.ts:347, manifest.test.ts:45 (JSON), raw-frame.ts:149 (Date)
     storage-parquet:  4 Date.parse (compactor.ts:759, wal-format.ts:517,
                       testing/index.ts:43, compactor.test.ts:582) + JSON.parse sites
     observability:    6 Date.parse (soak-evidence.ts:290,293,525,526,
