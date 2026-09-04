@@ -9,6 +9,21 @@
 - **Codex CLI:** independent, preferably read-only, adversarial reviewer.
 - **Git + CI:** durable source of truth and mechanical acceptance gate.
 
+**Model roles (operator policy, 2026-09-04)**
+
+- The orchestrator (main Claude Code session) runs on **Fable 5**.
+- Every Claude subagent (wp-implementer, adversarial-reviewer, governance rounds, etc.)
+  is launched with an explicit **Opus 5** override (`model: opus`) — subagents never
+  inherit the orchestrator's model.
+- Codex CLI reviews run on **SOL** (`gpt-5.6-sol`) — the configured default in
+  `~/.codex/config.toml`; pass `--model gpt-5.6-sol` explicitly if the default ever
+  changes. Codex is used for doc/governance rounds only: its content filter kills
+  reviews containing prototype-pollution/input-validation probe content, so those
+  reviews run in-harness.
+- A subagent killed by a rate limit or model switch must NOT be resumed (it would keep
+  its original model): launch a FRESH agent with the same packet plus a progress
+  summary, pointed at the dead agent's worktree only if it left committed work.
+
 The agent conversation is disposable. The repository is the memory.
 
 ---
