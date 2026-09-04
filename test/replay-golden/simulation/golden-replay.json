@@ -1,0 +1,208 @@
+{
+  "fixture": "simulation/golden-replay",
+  "manifest": {
+    "datasetManifestFormatId": "polymarket-bot/dataset-manifest/v1",
+    "datasetManifestVersion": 1,
+    "datasetId": "2026-06-29T17-00Z",
+    "createdAt": "2026-06-29T18:00:00.000Z",
+    "schemaVersions": {
+      "walFormatId": "polymarket-bot/wal/v1",
+      "walSchemaVersion": 1,
+      "walManifestVersion": 1,
+      "parquetLayoutId": "polymarket-bot/parquet-raw-frames/v1",
+      "parquetLayoutVersion": 1,
+      "datasetManifestFormatId": "polymarket-bot/dataset-manifest/v1",
+      "datasetManifestVersion": 1
+    },
+    "writer": {
+      "library": "hyparquet-writer",
+      "libraryVersion": "0.16.6",
+      "codec": "UNCOMPRESSED",
+      "rowGroupSize": 10000
+    },
+    "columns": [
+      {
+        "name": "datasetRowOrdinal",
+        "physicalType": "INT64",
+        "nullable": false
+      }
+    ],
+    "replayPins": {
+      "normalizerVersion": null,
+      "featureSetVersion": null,
+      "runSeed": null,
+      "fillModelVersion": null,
+      "latencyModelVersion": null,
+      "feeSnapshotVersion": null,
+      "rewardSnapshotVersion": null,
+      "settlementSpecVersions": [],
+      "note": "Null entries are run-scoped handoff SS12.5 pins a compactor cannot know."
+    },
+    "gatewayEpochs": [
+      "0190a3e0-0000-7000-8000-000000000001"
+    ],
+    "eventRange": {
+      "first": {
+        "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+        "ingestSeq": "1",
+        "receivedAt": "2026-06-29T17:15:57.300Z",
+        "datasetRowOrdinal": 0
+      },
+      "last": {
+        "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+        "ingestSeq": "9",
+        "receivedAt": "2026-06-29T17:15:57.500Z",
+        "datasetRowOrdinal": 2
+      }
+    },
+    "recordCounts": {
+      "segmentDeclared": 3,
+      "segmentRead": 3,
+      "written": 3,
+      "replayEligible": 3,
+      "excludedByIncident": 0,
+      "excludedAsDuplicate": 0
+    },
+    "deduplication": {
+      "policy": "first-wins-in-dispatch-order",
+      "duplicateRecordCount": 0,
+      "duplicateKeys": [],
+      "duplicateKeysTruncated": false
+    },
+    "segments": [
+      {
+        "segmentId": "0190a3e0-0000-7000-8000-000000000001-000000",
+        "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+        "segmentIndex": 0,
+        "segmentSha256": "5a882b4b33a8a01688e4b80d09ffbb2c5f8de4954a3ab4f7b93786b15e136d14",
+        "checksummedByteLength": 1536,
+        "byteSize": 1600,
+        "segmentFileSha256": "73b5a43d61014ac58daa14525f42ca0b59e331791f887ff6d429d918a3190241",
+        "recordCount": 3,
+        "firstIngestSeq": "1",
+        "lastIngestSeq": "9",
+        "firstReceivedAt": "2026-06-29T17:15:57.300Z",
+        "lastReceivedAt": "2026-06-29T17:15:57.500Z",
+        "closeReason": "shutdown",
+        "footerPresent": true,
+        "truncatedTailBytes": 0,
+        "objectKey": "datasets/2026-06-29T17-00Z/part-00000.parquet",
+        "firstDatasetRowOrdinal": 0,
+        "lastDatasetRowOrdinal": 2
+      }
+    ],
+    "objects": [
+      {
+        "objectKey": "datasets/2026-06-29T17-00Z/part-00000.parquet",
+        "byteLength": 2670,
+        "sha256": "e9a742118d2e75aceeb36142b57fac44a0ce247b20b4528a0cb726be36fc1276",
+        "rowCount": 3,
+        "replayEligibleRowCount": 3,
+        "firstDatasetRowOrdinal": 0,
+        "lastDatasetRowOrdinal": 2,
+        "segmentIds": [
+          "0190a3e0-0000-7000-8000-000000000001-000000"
+        ]
+      }
+    ],
+    "excludedSegments": [],
+    "excludedIncidentWindows": [],
+    "walRetentionPolicy": "retain-all"
+  },
+  "rows": [
+    {
+      "datasetRowOrdinal": 0,
+      "segmentId": "0190a3e0-0000-7000-8000-000000000001-000000",
+      "segmentIndex": 0,
+      "segmentRecordIndex": 0,
+      "record": {
+        "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+        "ingestSeq": "1",
+        "source": "polymarket",
+        "endpoint": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        "connectionId": "conn-1",
+        "subscriptionGeneration": 1,
+        "receivedAt": "2026-06-29T17:15:57.300Z",
+        "receivedMonotonicNs": "1000000000",
+        "payloadUtf8": "{\"event_type\":\"book\",\"asset_id\":\"7134526469571836016\",\"market\":\"0x1234\",\"timestamp\":\"1782753357257\",\"bids\":[{\"price\":\"0.07\",\"size\":\"100\"}],\"asks\":[{\"price\":\"0.09\",\"size\":\"60\"}]}",
+        "payloadSha256": "7267ada4f3205d0d9d22f6d9fac841aa4401ef92dea9c5d817029d60ffc71914"
+      },
+      "frameLineByteOffset": 0,
+      "frameLineByteLength": 512,
+      "frameLineSha256": "5147c34eda521ca9d79cbae3bc7648f91c26c089fb96644d69c977ba9aeb5543",
+      "replayEligible": true,
+      "exclusionReason": null
+    },
+    {
+      "datasetRowOrdinal": 1,
+      "segmentId": "0190a3e0-0000-7000-8000-000000000001-000000",
+      "segmentIndex": 0,
+      "segmentRecordIndex": 1,
+      "record": {
+        "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+        "ingestSeq": "4",
+        "source": "polymarket",
+        "endpoint": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        "connectionId": "conn-1",
+        "subscriptionGeneration": 1,
+        "receivedAt": "2026-06-29T17:15:57.100Z",
+        "receivedMonotonicNs": "1100000000",
+        "payloadUtf8": "{\"event_type\":\"last_trade_price\",\"asset_id\":\"7134526469571836016\",\"market\":\"0x1234\",\"timestamp\":\"1782753357000\",\"price\":\"0.08\",\"size\":\"5\",\"side\":\"BUY\"}",
+        "payloadSha256": "17cdb8077e928b34ac11fd350f0ae00d878e0362a1edf0732cae8040dc7a643c"
+      },
+      "frameLineByteOffset": 512,
+      "frameLineByteLength": 512,
+      "frameLineSha256": "0b061a6f6bda20c3e8496b438e9436aca86213b32008dc6d4627312184292709",
+      "replayEligible": true,
+      "exclusionReason": null
+    },
+    {
+      "datasetRowOrdinal": 2,
+      "segmentId": "0190a3e0-0000-7000-8000-000000000001-000000",
+      "segmentIndex": 0,
+      "segmentRecordIndex": 2,
+      "record": {
+        "gatewayEpoch": "0190a3e0-0000-7000-8000-000000000001",
+        "ingestSeq": "9",
+        "source": "polymarket",
+        "endpoint": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+        "connectionId": "conn-1",
+        "subscriptionGeneration": 1,
+        "receivedAt": "2026-06-29T17:15:57.500Z",
+        "receivedMonotonicNs": "1200000000",
+        "payloadUtf8": "{\"event_type\":\"price_change\",\"asset_id\":\"7134526469571836016\",\"market\":\"0x1234\",\"timestamp\":\"1782753357500\",\"price\":\"0.08\",\"size\":\"33343.4\",\"side\":\"BUY\"}",
+        "payloadSha256": "d636d854509e8af268d846770f4763b7d25cc8dac4652a5c65f24e63d4e3d57c"
+      },
+      "frameLineByteOffset": 1024,
+      "frameLineByteLength": 512,
+      "frameLineSha256": "79ed31e58c62112c05d54e498d8c579c7232fd693e1c8c7e3a875ec9224f09a6",
+      "replayEligible": true,
+      "exclusionReason": null
+    }
+  ],
+  "runPins": {
+    "normalizerVersion": "golden/market-frame/v1",
+    "featureSetVersion": "features-v1",
+    "runSeed": "42",
+    "fillModelVersion": "sim/tier0/v1",
+    "fillModelParametersHash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "latencyModelVersion": "sim/latency/v1",
+    "latencyModelParametersHash": "1111111111111111111111111111111111111111111111111111111111111111",
+    "feeSnapshotVersion": "fees/2026-08-24",
+    "rewardSnapshotVersion": "rewards/2026-08-24",
+    "settlementSpecVersions": [],
+    "simulatorVersion": "wp-210/v1"
+  },
+  "expected": {
+    "serialization": [
+      "polymarket-bot/simulation-run/v1",
+      "run simulator=wp-210/v1 seed=42 fillModel=sim/tier0/v1 fillModelParams=0000000000000000000000000000000000000000000000000000000000000000 latencyModel=sim/latency/v1 latencyModelParams=1111111111111111111111111111111111111111111111111111111111111111",
+      "pins normalizer=golden/market-frame/v1 featureSet=features-v1 fee=fees/2026-08-24 reward=rewards/2026-08-24 settlement=",
+      "dataset id=2026-06-29T17-00Z epoch=0190a3e0-0000-7000-8000-000000000001 objects=1 walSegments=NOT_AVAILABLE_ARCHIVED_ONLY",
+      "counts read=3 delivered=3 excludedIncident=0 excludedDuplicate=0 venueTimestampInversions=1",
+      "clock start=2026-06-29T17:15:57.300Z end=2026-06-29T17:15:57.500Z startNs=1000000000 endNs=1200000000 advances=3 wallClockRegressions=1",
+      "economics basis=REALIZED_IN_REPLAY_PATH buy=0 sell=0 fees=0 net=0 sharesBought=0 sharesSold=0 fills=0 markoutPenaltyApplied=false",
+      "end"
+    ]
+  }
+}
