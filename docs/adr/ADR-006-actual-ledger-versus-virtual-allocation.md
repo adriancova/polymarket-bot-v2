@@ -193,10 +193,17 @@ fetching current official pages and recording the result in `docs/adr/**`, and
 neither is inside that package's grant (`docs/handoffs/WP-200.md` `deviations`
 3, `follow_up` 1). Rather than let the mandate lapse or be discharged by
 assumption, the contract owner executed it in this orchestrator-authorized
-governance round. `WP-200` shipped in conformance with items 1–3 in the
-meantime — explicit asset identifiers, USDC and pUSD as two ids no code path
-treats as interchangeable, no implicit "cash" asset, no cross-denomination sum
-— so this amendment **ratifies** that behavior and changes no code.
+governance round. The `WP-200` handoff **reports** that it shipped in
+conformance with items 1–3 in the meantime — explicit asset identifiers, USDC
+and pUSD as two ids it states no code path treats as interchangeable, no
+implicit "cash" asset, no cross-denomination sum. That report is evidence of
+intent, not proof of code conformance; this amendment **ratifies no `WP-200`
+behavior** — conformance ratification is deferred to `WP-200`'s final code
+review and merged state (see the consequences section below) — and changes no
+code. *(Corrected 2026-09-03 by the orchestrator, disclosed pre-merge: the
+confirming review found this paragraph still ratified `WP-200` conformance
+after the first correction qualified only the consequences section and the
+register row.)*
 
 **Method and evidence.** Four read-only, unauthenticated GETs performed on
 **2026-09-03**, each recorded with URL, HTTP status, byte count, SHA-256, and

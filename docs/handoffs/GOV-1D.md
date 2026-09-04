@@ -150,7 +150,14 @@ reading goes further is finding 5 / ruling 5 below.
    already mandate: `UNATTRIBUTED` and a halt of the affected market, **not** a
    guessed denomination.
 
-**`WP-200`'s shipped behavior is ratified as conforming** and no code changed.
+The `WP-200` handoff **reports** its shipped behavior conforms; that report is
+evidence of intent, not proof of code conformance, and **conformance
+ratification is deferred to `WP-200`'s final code review and merged state**. No
+code changed. *(Corrected 2026-09-03 by the orchestrator, disclosed pre-merge:
+the review found the original sentence — "shipped behavior is ratified as
+conforming" — over-claimed on an in-flight sibling handoff; this handoff line
+was brought in line with the corrected ADR-006 wording when the confirming
+round's sweep found it still carried the old claim.)*
 
 **What the ruling does NOT do** (stated in the amendment itself, so no later
 reader can borrow more from it than it says): it does not assert USDC and pUSD
@@ -216,8 +223,10 @@ equivalence, a conversion, or a linking contract address. Distinct asset
 identifiers remain mandatory (§7 item 2 unchanged); a conversion must be an
 explicit recorded ledger transaction with its own evidence; each entry is
 denominated in the unit its source asserts (§7 item 3 unchanged), with the
-source recorded alongside. `WP-200`'s shipped behavior is ratified as
-conforming.
+source recorded alongside. The `WP-200` handoff reports conforming shipped
+behavior; conformance ratification is deferred to `WP-200`'s final code review
+and merged state. *(Corrected 2026-09-03 by the orchestrator, disclosed
+pre-merge, same correction as the amendment text.)*
 
 One drift was found and disclosed rather than smoothed over: the
 liquidity-rewards page now names **no** settlement token, narrowing C-2's live
