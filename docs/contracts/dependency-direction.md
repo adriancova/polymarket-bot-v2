@@ -5,7 +5,10 @@ Authority: `docs/spec/polymarket-bot-orchestrator-handoff.md` §5.1, §5.2, §9.
 §21
 Related: [ADR-005](../adr/ADR-005-strategy-purity-and-decision-result.md)
 (strategy purity), [ADR-010](../adr/ADR-010-run-mode-enablement-and-production-key-boundary.md)
-(SDK and signer boundary), [`protected-contracts.md`](./protected-contracts.md)
+(SDK and signer boundary), [`protected-contracts.md`](./protected-contracts.md),
+[ADR-020](../adr/ADR-020-schema-parse-boundary-integrity.md) /
+[`schema-boundary.md`](./schema-boundary.md) (why §2.1's pending mirror-collapse
+row exists)
 
 ---
 
@@ -136,6 +139,71 @@ establishes the edge; "it compiles more easily this way" is not a basis.
 | S1 | `packages/strategy-runtime` → `packages/strategy-sdk` | 1 | `WP-170` owns both paths and delivers "strategy interface", "context implementation", and "runtime and watchdog" together; its acceptance criterion "Runtime persists exactly one decision per callback" requires the runtime to invoke the SDK-declared callback (work plan `WP-170`; ADR-005 §2, §6). |
 | S2 | `packages/strategies/*` → `packages/strategy-sdk` (each concrete strategy package, e.g. `packages/strategies/static-bracket`) | 1 | A strategy implements the `WP-170` interface and receives `StrategyContext` — which ADR-005 §6 places in `WP-170`, not in `packages/domain` — and ADR-005 §1 forbids it from obtaining any of that by I/O. `WP-220` (`packages/strategies/static-bracket/**`) `depends_on` `WP-170` and is forbidden from modifying it, so it consumes it. If `WP-170` declares the interface in `packages/strategy-runtime` instead, this row must be corrected rather than widened. |
 
+#### Pre-authorised, not yet listed: the `plain-data` / `schema-arena` mirror collapse (ruled 2026-09-04 by `GOV-2A`)
+
+**The ruling is (a): the three byte-identical copies are collapsed to one
+canonical implementation behind a same-layer edge. Duplication-with-drift-guard
+is NOT ratified as the permanent shape.** `packages/risk`,
+`packages/capital-allocator` (`WP-180`, merged `98a6cc1`) and
+`packages/execution-planner` (`WP-190`, merged `5aa11e3`) each carry a
+byte-identical `src/plain-data.ts` and `src/schema-arena.ts` below their header
+markers, guarded three ways by `test/unit/execution-planner/mirrors.test.ts`.
+
+The drift guard proves the three copies are *identical*; it cannot make a fix to
+them *atomic*. These modules are the repository's only prototype-free parse door
+([ADR-020](../adr/ADR-020-schema-parse-boundary-integrity.md) §3), the mechanism
+that closes a class measured to defeat a run-mode ceiling, a `WP-040` ledger
+obligation, and every format check in the process. A security mechanism that must
+be fixed in three places, in three grants, is the wrong shape for exactly that
+mechanism — and `docs/contracts/schema-boundary.md` §5 assigns four more packages
+that would otherwise copy it a fourth, fifth, sixth and seventh time.
+
+**Canonical source: `packages/risk`.** It is where `WP-180` authored the
+mechanism, it is the package whose review rounds 6-10 established the behaviour,
+and both other copies are downstream of it in origin as well as in content.
+`packages/execution-planner` already consumes `packages/risk`'s
+`ApprovedIntentRecord` shape (`docs/handoffs/WP-190.md` `assumptions` 1), so the
+dependency is real rather than invented for code sharing.
+
+**The rows to add, verbatim** (id, edge, layer, basis — one per consumer, because
+§2.1 rows are ordered pairs):
+
+```text
+S3 | `packages/capital-allocator` → `packages/risk` | 1 |
+S4 | `packages/execution-planner` → `packages/risk` | 1 |
+basis: GOV-2A 2026-09-04 mirror-collapse ruling (this subsection); ADR-020 §3;
+docs/contracts/schema-boundary.md §1. The consumed surface is the prototype-free
+parse door only — `plain-data.ts` and `schema-arena.ts` — exported through
+packages/risk's `exports` map (F16). No rule, policy, or evaluation logic may
+travel this edge; a consumer needing that has found a different problem.
+```
+
+**Why they are stated here instead of listed in the table above.** §6.1 item 5
+records that `test/unit/tooling/dependency-direction.test.ts` pins the shipping
+allowlist ids to exactly `["S0", "S1", "S2"]`. `GOV-2A` reproduced the
+consequence mechanically in a `/dev/shm` scratch copy: with S3 and S4 added,
+`check:deps` still **PASSES** (34 packages / 41 edges, both rows parsed and
+cross-validated against §2), and
+`test/unit/tooling/dependency-direction.test.ts:801` **FAILS** (`["S0","S1","S2"]`
+vs `["S0","S1","S2","S3","S4"]`). `test/**` is outside a governance round's
+scope, so listing the rows here today would break the gate this document exists
+to keep. **This is the case §6.1 item 5 predicted**, and its own rule applies:
+the row and the pinned assertion move in the **same change**.
+
+**Owner: a bounded `WP-180-FU2` / mirror-collapse package**, with
+`allowed_paths` covering `packages/risk/src/{plain-data,schema-arena}.ts`,
+`packages/{capital-allocator,execution-planner}/**`,
+`test/unit/{risk,capital-allocator,execution-planner}/**`,
+`test/unit/tooling/dependency-direction.test.ts`, and this document.
+Migration path, in one change: move the two modules into `packages/risk`'s
+`exports` map; delete both copies; add the `workspace:*` dependency to each
+consumer; move S3/S4 into the table above; update the pinned allowlist
+assertion; keep `mirrors.test.ts` as a *deletion* guard (it must fail if a fourth
+copy appears) or retire it with its reason recorded. **Acceptance is behavioural,
+not structural**: every `WP-180`/`WP-190` pollution battery must still pass
+against the single implementation, because the point of collapsing them is that
+one fix protects all three — not that the files got shorter.
+
 Nothing else is enumerated yet, and that is deliberate: the check **fails closed**
 (§6), so the first package that genuinely needs a new same-layer edge adds its
 row. Two known cases will need one and do not have a citation today:
@@ -149,6 +217,101 @@ row. Two known cases will need one and do not have a citation today:
   layer-1 package, then `packages/simulation` implementing `ExecutionVenue`
   (`WP-210`) is a same-layer edge needing a row; if they land lower, it is an
   ordinary downward edge. `WP-190`/`WP-210` settle it.
+
+### 2.2 Node built-ins below layer 2: a bounded, enumerated allowlist (ruled 2026-09-04 by `GOV-2A`)
+
+Layers 2 and 3 own connections, filesystems, and process boundaries; a Node
+built-in there needs no permission from this document (F1–F8 and F11 still
+apply). **Layers 0 and 1 are different**, and until now the rule for them existed
+only as `packages/domain`'s blanket ban (F2) and `packages/decimal`'s one-line
+allowlist (F15). Four merged layer-1 packages then imported a built-in and each
+disclosed it as an open contract question — `WP-180` R6-1 (`node:util` in
+`packages/risk` and `packages/capital-allocator`), `WP-190` R1-N2 (a third
+package *and* a new non-mirror file), `WP-160` R1-N1 (`node:crypto` in
+`packages/features`). This subsection is the ruling those three asked for.
+
+**The rule is an allowlist, not a per-instance ratification.** Ratifying case by
+case would have to be re-argued at every new import and gives a reviewer no
+criterion; a blanket ban would forbid the two uses below, both of which exist
+*because* the alternative is worse. So: a layer-0 or layer-1 package may import a
+Node built-in **only if** the imported binding satisfies all five properties and
+**the package, specifier, and binding are enumerated in the table below**.
+
+The five properties — a binding must be all of them:
+
+1. **Trap-free** — it cannot run user code. (This is why `util.types.isProxy` is
+   here at all: every *reflective* way to detect a `Proxy` runs a trap, so the
+   pure-JS alternative is the hazard it exists to avoid.)
+2. **Entropy-free** — no randomness, seeded or otherwise (§6 invariant 2, §12.4).
+3. **Clock-free** — no wall clock, no monotonic clock (§12.4 determinism, F11).
+4. **I/O-free** — no filesystem, socket, child process, or environment read.
+5. **Synchronous and pure** — same inputs, same output, no observable side
+   effect, no scheduling.
+
+`node:crypto`'s `createHash` qualifies on all five; `randomUUID`, `randomBytes`,
+and `generateKeyPair` fail (2). `node:util`'s `types` namespace qualifies;
+`util.promisify` and `util.inspect` do not (5, and `inspect` can run getters).
+The distinction is per **binding**, not per module, and the table names bindings.
+
+| Package | Layer | Specifier | Binding | Why the alternative is worse | Cited by |
+| --- | --- | --- | --- | --- | --- |
+| `packages/domain` | 0 | *(none)* | — | F2: not even a built-in. Unchanged by this ruling | `domain.md` §2 |
+| `packages/decimal` | 0 | `node:crypto` | `createHash` | F15's existing allowlist, restated here for one table | `domain.md` §1, F15 |
+| `packages/risk` | 1 | `node:util` | `types.isProxy` | `src/plain-data.ts:157`. A pure-JS proxy probe *runs a trap*, i.e. executes caller code inside the door that exists to stop caller code running (`plain-data.ts:78-83`) | `WP-180` R6-1 |
+| `packages/capital-allocator` | 1 | `node:util` | `types.isProxy` | `src/plain-data.ts:27`. Same mirrored module, same reason | `WP-180` R6-1 |
+| `packages/execution-planner` | 1 | `node:util` | `types.isProxy` | `src/plain-data.ts:25` (mirror) **and** `src/pluck.ts:28,58` (the §6 invariant 13 minimal-read cancel path) | `WP-190` R1-N2 |
+| `packages/features` | 1 | `node:crypto` | `createHash` | `src/hash.ts:14`. Content addressing needs SHA-256; a hand-rolled FIPS 180-4 implementation in production code is a correctness liability, and `WP-160`'s review used exactly that as an independent *oracle* rather than as the shipped path | `WP-160` R1-N1 |
+
+**The table is exhaustive for the layer-0 and layer-1 PRODUCTION import
+surface**, and a package outside it importing any built-in *in a production
+source file* is a violation (F17). Verified mechanically at `main` `2d7e7da`: a
+census of every non-test `node:` import under `packages/` and `apps/` returns
+exactly these five files below layer 2 — `packages/{risk,capital-allocator}/src/plain-data.ts`,
+`packages/execution-planner/src/{plain-data,pluck}.ts`,
+`packages/features/src/hash.ts` — plus `packages/decimal`'s existing one. Every
+other `node:` import in the workspace is in a layer-2 package
+(`event-bus`, `storage-wal`, `storage-postgres`, `storage-parquet`) or a layer-3
+app (`data-gateway`, `ops-cli`, `research-worker`).
+
+**Test files are outside this table, and that scope is stated rather than
+implied** *(qualified 2026-09-04 in `GOV-2A`'s round-1 review remediation; the
+first drafting said "importing any built-in" with no such qualification, and its
+own census sentence covered only non-test imports)*. The same census run over
+**test** files at `2d7e7da` returns six layer-1 files importing built-ins this
+table does not enumerate — `packages/universe/src/{seeds,settlement-binding}.test.ts`,
+`packages/settlement/src/seeds.test.ts`,
+`packages/observability/src/recorder/{infra-consistency,validation-findings}.test.ts`
+and `packages/capital-allocator/src/allocator.test.ts`, all reading seed or
+dashboard fixtures through `node:fs` / `node:path` / `node:url` — plus two that
+*are* enumerated for their package (`packages/decimal/src/hash.test.ts` and
+`packages/features/src/snapshot.test.ts`, both `node:crypto`). An unqualified
+F17 would therefore have been violated by merged code on the day it shipped,
+which is precisely the "a gate every merged package fails is a gate that gets
+waived wholesale" failure mode §6.1 item 1 ruled against.
+
+**Why tests are out of F17's scope while they are IN scope for rule 3** (§6.1
+item 2 ruled that a purity-restricted package's test files *are* covered): the
+two rules govern different properties. F17 governs a package's **runtime import
+surface** — what the shipped module graph is allowed to reach, and a fixture
+read that never executes in the trading process does not widen it. Rule 3
+governs **purity**, which is a property of *behaviour* and therefore holds
+wherever the code runs: a strategy test that reads a real clock or unseeded
+randomness reintroduces exactly the nondeterminism §12.4 exists to exclude. So a
+strategy test may still not read `Date.now`, and a layer-1 test may read a
+fixture file. The rulings are not in tension, and neither may be cited to relax
+the other.
+
+**Adding a row is a contract edit with a citation**, exactly like §2.1: name the
+binding, walk the five properties, and say what the alternative costs. "It was
+convenient" is not a basis, and neither is "another package already imports it."
+
+**Not yet implemented by the §6 check.** F17 joins F15 and F16 as a stated rule
+the checker does not evaluate; that is the same single tooling follow-up (§6.1
+item 4, and `docs/contracts/schema-boundary.md` §5 item 6). Enforcement today is
+this table plus review. The check already reads §2 and §2.1 from this document at
+run time, so the natural implementation reads §2.2 the same way rather than
+copying the table into the tool — a private copy of this table is exactly how
+coverage drifts (§6).
 
 ---
 
@@ -172,6 +335,7 @@ row. Two known cases will need one and do not have a citation today:
 | F14 | Inside a **purity-restricted** package (`packages/domain`, `packages/strategies/**`, `packages/ledger`, `packages/simulation`), any construct that makes F1–F8/F11 **unevaluable**: a module load whose specifier is not a static literal; a reference to a module-**loading capability** (`require` and its aliases, a CommonJS `Module` object incl. `process.mainModule`/`require.main`, `createRequire` and its result, `process.getBuiltinModule`, the `node:module` namespace/`Module` class/`register`) in a position that escapes this document's analysis; a computed member read on such a capability; and a reference to an **evaluator** (`eval`, `Function`, or a read of the `.constructor` property) | §5.2 and ADR-005 §1, read as intent rather than as a list of spellings: a package forbidden to perform I/O has no legitimate use for a module loader or an evaluator, and a construct that defeats static checking cannot be permitted to *establish* compliance. Numbered 2026-08-28 (`GOV-1B`) from `docs/handoffs/WP-015.md` `follow_up` 6 |
 | F15 | `packages/decimal` importing anything beyond `decimal.js` and `node:crypto` | `docs/contracts/domain.md` §1 ("Dependencies: `decimal.js` and `node:crypto` only … the package performs no I/O") and §2 of this document (the Layer 0 "May import" cell). Numbered 2026-09-02 (`GOV-1C`) from `docs/handoffs/WP-015.md` `follow_up` 4 via §6.1 item 4 — the allowlist was "enforced by construction" with no F-row, so a violating edit would have been a review finding rather than a gate failure. **Not yet implemented by the §6 check** (the same tooling follow-up as the F14 machine-id swap); until then, enforcement-by-construction and review remain the mechanism |
 | F16 | A cross-package **deep import** — any workspace import specifier that resolves inside another workspace package other than through that package's `package.json` `exports` map | `docs/handoffs/WP-015.md` `follow_up` 3 via §6.1 item 4, numbered 2026-09-02 (`GOV-1C`) on the evidence that **every** workspace package (28/28 as of this date) declares an `exports` map, so "bypassing the entry point" is well-defined. Largely platform-enforced already: Node refuses an unexported subpath (`ERR_PACKAGE_PATH_NOT_EXPORTED`) and `NodeNext` resolution mirrors it at typecheck — the row exists so a widened `exports` map or a bundler that resolves around encapsulation is a contract violation, not a loophole. **Not yet implemented by the §6 check** (same tooling follow-up) |
+| F17 | A **layer-0 or layer-1** package importing, **in a production (non-test) source file**, a Node built-in binding that §2.2's table does not enumerate for that package | §2.2 (ruled 2026-09-04 by `GOV-2A`), discharging `WP-180` `follow_up` R6-1, `WP-190` R1-N2, and `WP-160` R1-N1, which each disclosed an instance and asked the contract owner to rule rather than ratifying it locally. Generalises F2 (`packages/domain`: none) and F15 (`packages/decimal`: `node:crypto` only) into one criterion — trap-free, entropy-free, clock-free, I/O-free, synchronous and pure — plus an exhaustive per-package enumeration, so a new import is a cited contract edit rather than a reviewer's judgment call. Layers 2 and 3 are **not** constrained by this row. **The production-only scope is part of the rule** *(qualified 2026-09-04 in `GOV-2A`'s round-1 review remediation, which measured six layer-1 **test** files importing un-enumerated built-ins at the tip that shipped this row — see §2.2, which also states why test files are outside F17 while §6.1 item 2 holds them inside rule 3: F17 governs a package's runtime import surface, rule 3 governs purity, which is a property of behaviour everywhere)*. **Note the id namespace:** this F17 is a §3 forbidden-edge id and is unrelated to `WP-040` obligation **F17** (the OMS may not label an order `SIGNED` before its submission-attempt row exists), re-assigned to `WP-270` in [`protected-contracts.md`](./protected-contracts.md) §8.1 **R-9**; the two reached the same number by coincidence on the same date. **Not yet implemented by the §6 check** (same tooling follow-up as F15/F16) |
 
 F3 and F11 are the two that matter most for correctness rather than tidiness:
 they are what makes deterministic replay possible (§12.4).

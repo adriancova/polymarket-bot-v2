@@ -1654,17 +1654,175 @@ that parses venue payloads.
   because building a refusal defines properties. **Every other `Object.defineProperty` in the
   repository still passes an ordinary descriptor literal** (WP-180 follow-up R8-1).
 
+- **Required-key enforcement waived (added 2026-09-04, `GOV-2A`; source: WP-180 round 9,
+  R9-2).** An inherited `optin`/`optout` PAIR waives required-key enforcement: a schema's own
+  required key is satisfied from `Object.prototype`. Measured by `GOV-2A` on the interpreted
+  parser (`jitless`) and on a **cold first parse**; a warm compiled fastpass bakes the pair and
+  is not fooled — an order-dependence, not a defence. WP-180 measured this at its own base as
+  its round-9 BLOCKER (`ok:TRUE`, full data adopted).
+- **Custom checks skipped (added 2026-09-04, `GOV-2A`; source: WP-180 round 9, a THIRD live
+  fail-open WP-180 found by following its reviewer's audit list).** An inherited `when`
+  function skips every custom check (`.refine`/`.superRefine`), so a whitespace rule, a
+  cross-field rule, or any hand-written invariant expressed as a custom check simply does not
+  run. Reproduced by `GOV-2A`.
+- **`values` reads (added 2026-09-04).** The record enum-key path reads `values` off the chain.
+  Measured to fail **CLOSED** (a refusal, not an acceptance) — availability, never permission.
+  Recorded so the class is enumerated, not because it admits anything.
+- **Cold-lazy poisoning (added 2026-09-04, `GOV-2A`; source: WP-180 round 9, measured WORSE
+  than reported).** Enumerable pollution present during a schema's **FIRST** parse aborts the
+  library's lazy build of `shape`/`propValues`/`disc`, throws a `TypeError` out of the door, and
+  leaves that schema object **permanently poisoned**: every later parse fails in a clean
+  process. A cold-process door trap is therefore not merely order-dependent but persistent, and
+  it traps a CANCEL as readily as anything else. `GOV-2A` reproduced this on
+  `packages/pnl`'s own `PnlRecordSchema`.
+- **Refusal COMPOSITION varies, but the bound is measured (added 2026-09-04).** Issue-literal
+  fields and message resolution (`fallback`, `message`, `path`, `input`, `deferred`, parse-ctx
+  reads) can still be answered through a chain on the refusal path. WP-180's round-10 review
+  bounded it with a **~7,000-call tuned pollution battery** (WP-180's own wording, restored
+  2026-09-04 in `GOV-2A`'s round-1 review remediation — the number counts *calls*, not distinct
+  pollution states, and this record's WP-180 row states it that way): **permission never varies, cancels are
+  byte-identical, and the refusal codes-family is unmoved** — only composition (message text,
+  path, issue ordering) moves. That bound is now the conformance statement every closed door
+  owes (ADR-020 §6).
+- **`z.strictObject` is NOT a mitigation, and the NON-ENUMERABLE variant is the sharp one
+  (added 2026-09-04, `GOV-2A` — new, not previously recorded by any package).** Every class
+  above was reported with an *enumerable* inherited property. `z.strictObject` refuses an
+  enumerable inherited *unknown* key as `unrecognized_keys`, which made several merged doors
+  look immune and is why an enumerable `skipChecks` bounces off them. It is blind to a
+  **non-enumerable** one, and it never protected a key the schema itself declares. Measured at
+  the merged ledger door: the same call that refuses an enumerable `skipChecks` **accepts** a
+  non-enumerable one and admits `ledgerTransactionId: "totally-not-a-uuid"` with
+  `occurredAt: "yesterday-ish"`. A door may not cite `strictObject` as its defence.
+
 **The audit question is therefore broader than "did my fields survive?" — it is "is any of
 this value the library's rather than mine?", which covers adopted fields, dropped fields,
 defaults, format checks, and descriptor literals. A safety-relevant setting expressed as a
 schema default is a sharp case; wholesale disablement of format validation via an inherited
 context flag is sharper still, and reaches every merged package.**
 
+**Corroborations from Wave 2 batch 2B (added 2026-09-04, `GOV-2A`; each independently
+reproduced in the `/dev/shm` audit), with owners:**
+
+- **Layer-0 `divDecimal` with EXPLICIT `DivisionOptions` throws under pollution** (WP-160
+  disclosure). It calls `Decimal.clone` **per invocation**, and under an inherited get-only
+  `Object.prototype.set` that throws `TypeError: Cannot set property set of #<Object> which has
+  only a getter`; the default path (module-load-time constructors) is unaffected. `GOV-2A`
+  greped every call site: **four production callers** — `packages/features/src/decimal-policy.ts:79,89`
+  and `packages/pnl/src/state.ts:320` are default-path and unreachable; **`packages/order-book/src/executable-price.ts:116`
+  passes a caller-supplied `request.division`** and is the one explicit-options caller. Probed
+  end-to-end: `executablePrice` returns a clean quote by default under the same pollution and
+  **throws** when the caller supplies `division`. Availability, not permission — but it escapes
+  as an untyped throw from a layer-1 door. **Owner: a bounded `packages/decimal` round** (move
+  the options path to module-load-time constructors, as the default path already does).
+- **WP-160 R1-L3 — a LIVE output-side adoption in a merged package.**
+  `selectIndexedValues` (`packages/features/src/snapshot.ts:430-442`) builds ordinary object
+  literals. Measured: under a non-enumerable inherited `reason`, **both** returned members gain
+  it — including the `OK` member, which has no reason at all — and under an inherited `value`
+  an `ABSENT` member gains a `value`. These are the values §9.5 destines for **PostgreSQL
+  indexing next to decisions**. **Owner: `WP-160-FU1`, and it must land BEFORE any consumer
+  indexes snapshot values.**
+- **R8-1 corroborated by both batch-2B implementers, and by `GOV-2A`.** vitest/chai `expect`
+  builds property descriptors as object literals and throws under `Object.prototype.get`
+  pollution (`expect(1).toBe(1)` → `TypeError: Invalid property descriptor…`). Tooling-layer:
+  it means a pollution battery can break its own assertion library, so batteries must assert
+  outside the polluted window. **Owner: the repo-wide descriptor-literal follow-up (R8-1),
+  reaffirmed.**
+- **WP-160 R1-N3 / WP-180 R9-1 — detector dodgeability.** The source-scan and census
+  detectors are regex/syntax based and are defeated by aliasing, casts, and indirection; both
+  packages disclosed it independently and both compensate behaviourally. **Owner: one
+  detector-hardening round for the class** (`docs/contracts/schema-boundary.md` §5 item 6),
+  not two package-local patches.
+- **WP-180 carried R8-2 (a syntactic gate for dotted writes) — FOLDED**, not separately
+  owned. It would flag ~30 sites, each needing the registration the computed writes already
+  carry; it is the same detector-hardening owner as R9-1/R1-N3 and lands with it or not at all.
+- **WP-190 R1-L1 (totality-claim scoping) — RULED 2026-09-04 (`GOV-2A`): claims are scoped to
+  COMPOSED ENTRIES; helpers need not be total.** A package's "every public entry point promises
+  a typed result" claim means its composed doors (`buildExecutionPlan`, `sealExecutionPlan`,
+  `computeFeatureSnapshot`, `evaluate`), which are the surfaces a caller is meant to use. An
+  exported helper below that line may throw on precondition violation, **provided the claim
+  text says so**. Consequence, and the actual work: `packages/execution-planner/src/refusals.ts:180-187`
+  and `packages/features/src/inputs.ts:686-690` (WP-160 R1-L2) both currently claim more than
+  they deliver and must be **corrected in text or guarded in code** by the next bounded round
+  touching each package. Ruled rather than deferred because leaving it open makes every future
+  handoff re-litigate what "public entry point" means.
+
+**`GOV-2A` audit outcome (2026-09-04) — this record's "Not yet audited" line is now
+DISCHARGED, and the answer is not reassuring.** Every merged raw-`zod` boundary was found
+mechanically (a grep of `zod` imports and `.parse`/`.safeParse` call sites across `packages/`
+and `apps/`) and probed against a `/dev/shm` scratch copy of `main` `2d7e7da` installed
+`--frozen-lockfile`. **Live fail-opens were measured in TWELVE packages and one app**
+(`packages/{domain,ledger,pnl,strategy-runtime,event-bus,features,order-book,binance-adapter,
+coinbase-adapter,polymarket-public,universe,settlement}` + `apps/data-gateway`; the
+authoritative per-row tally is `docs/contracts/schema-boundary.md` §3). *(Count corrected
+2026-09-04 in `GOV-2A`'s round-1 review remediation: the original "five packages and one app"
+undercounted rows the same audit table already carried, and three further rows — binance-adapter
+(a wrong CONTAINED verdict), settlement and universe (both "not reached by probe") — became LIVE
+on measurement in that remediation.)* The sharpest are:
+
+- `packages/domain` (frozen, the root cause): `Uuidv7Schema` and `IsoTimestampSchema` accept
+  `"NOT-A-UUID"` / `"yesterday"` under an inherited `skipChecks`, and **every required key of
+  the §7.5 `DecisionResultSchema` can be supplied from `Object.prototype`** — the schema behind
+  §6 invariant 3's one persisted decision per callback.
+- `packages/ledger` (WP-200, merged `7e75f9a` — the package this record singled out): a
+  non-enumerable inherited `marketId` **defeats WP-040 obligation F16**, so a transaction
+  booking a fill with no market is ACCEPTED with an injected market id; a non-enumerable
+  `skipChecks` admits a non-canonical `ledgerTransactionId` and a malformed `occurredAt`.
+- `packages/pnl` (WP-200): the same, plus an **escaped `TypeError`** from a cold first parse.
+- `packages/strategy-runtime` (WP-170): materialize-first defeats adoption and loss, but the
+  format checks flow through raw domain schemas — a non-canonical uppercase `marketId` and
+  `evaluatedAt: "yesterday"` are **accepted**, so ADR-016's "refused, never case-folded" stops
+  being enforced.
+- `apps/data-gateway`: a get-only inherited `tickIntervalMs` defeats its `.default()` and the
+  `dataLossBoundMs` startup check **silently passes**; an inherited `binance` block satisfies
+  "at least one feed must be configured".
+- `packages/event-bus` (Redis wire), `packages/coinbase-adapter` (missing `channel` supplied
+  from the prototype), `packages/polymarket-public` rtds (missing `type` supplied from the
+  prototype): routing and envelope validation defeated at the recorder's wire boundary.
+- **Measured in the round-1 review remediation (2026-09-04), each overturning a negative verdict
+  the first pass recorded:** `packages/binance-adapter` — a trade frame with `q` deleted is
+  `MALFORMED` clean and decodes as a TRADE with `quantityRaw: "999999"` under a non-enumerable
+  inherited `q`, which flows into the normalized `size` and into the dedup fingerprint (the first
+  pass tested only *unknown*-key adoption and called it CONTAINED); `packages/settlement` — of
+  the 16 own keys of a sample spec, the 14 that are required are **all** adoptable from
+  `Object.prototype`, and a spec with no `verification` key parses as `{status:"VERIFIED"}` with
+  `isReviewedSettlementSpec` returning `true`; `packages/universe` — a `MarketResolved` payload
+  with `outcome` deleted **resolves the market** under an inherited `outcome`, and `resolvedAt`
+  and the `conditionId` identity key are adoptable too.
+
+**What a probe result MEANS.** Nothing on the wire can write `Object.prototype`; every finding
+above requires code already executing in the process. They say *"this check is not load-bearing
+against an attacker already inside the process"*, not *"a venue can turn this off"*. They still
+matter because several are the **only** enforcement of a recorded obligation (F16), an ADR-016
+identifier rule, or a data-loss bound — and the recorder pipeline (adapters → gateway) runs
+**unattended**, so nobody is watching when one of them stops firing.
+
+**Ruled and recorded**, so this is owned rather than remembered:
+[ADR-020](docs/adr/ADR-020-schema-parse-boundary-integrity.md) is the decision (a raw parse
+result is not validated data; caller/wire boundaries parse through a prototype-free door;
+`strictObject` is not a mitigation; the `zod` pin is a contract), and
+[`docs/contracts/schema-boundary.md`](docs/contracts/schema-boundary.md) is the normative
+companion carrying the door definition, the measured-class table, the **per-package audit
+table with a verdict, a severity and a named owner for every merged package**, and the staged
+follow-ups (`WP-200-FU1`, `WP-170-FU1`, a recorder-pipeline hardening round, `WP-160-FU1`, the
+mirror collapse, and the detector/tooling round — deliberately last, because a CI gate every
+merged package fails is a gate that gets waived wholesale). Two things bind immediately: a
+**new or substantially rewritten** caller/wire boundary conforms on arrival, and a `zod`
+upgrade is a contract change, never a lockfile-only edit. Full transcripts:
+`docs/handoffs/GOV-2A.md`.
+
 **Owner: contract owner, as a bounded governance round** (it spans packages no single work
 package owns, and the remedy may belong in a contract rule rather than in each package).
-Not a blocker for WP-180 or WP-170 once their local paths are correct. **Not yet audited:**
+Not a blocker for WP-180 or WP-170 once their local paths are correct. ~~**Not yet audited:**
 whether any merged package is presently exploitable — WP-200 in particular should be checked
-before it is relied on, since it is already on `main`.
+before it is relied on, since it is already on `main`.~~ *(Struck 2026-09-04 by `GOV-2A`,
+which is that governance round: the audit was performed with executed probes, WP-200 included,
+and the answer is recorded in the `GOV-2A` audit-outcome block above and in
+`docs/contracts/schema-boundary.md` §3. The original sentence is kept rather than deleted
+because it is the question this round was dispatched to answer — per
+`docs/contracts/protected-contracts.md` §4, a superseded statement is corrected in place with
+its date, not erased. **The record stays open**: it is discharged as an *audit* and remains
+open as a *remediation*, since every finding it names is still live on `main` and its owners
+are staged.)*
 
 ## Deviations from specification
 
