@@ -24,11 +24,17 @@ four of:
 | D3 | **Take values from the materialized tree, not from `parsed.data`** | The library's output assembly invokes inherited setters and can drop or invent fields |
 | D4 | **Emit prototype-free** — the door's own result has a null prototype | Closes the output side; an emitted record is read by someone else's `?? default` |
 
-`packages/risk`, `packages/capital-allocator` (`WP-180`) and
-`packages/execution-planner` (`WP-190`) implement all four. Their
-`plain-data.ts` / `schema-arena.ts` pair is the reference implementation and is
-byte-identical across the three packages below its header markers, enforced
-three ways by `test/unit/execution-planner/mirrors.test.ts`.
+`packages/risk` implements all four; its `plain-data.ts` / `schema-arena.ts`
+pair is the canonical implementation. *(Corrected 2026-09-05: the pair was
+originally mirrored byte-identically into `packages/capital-allocator` and
+`packages/execution-planner`; `WP-180-FU2` (merged `625c83b`) collapsed the
+mirrors to the one canonical copy in `packages/risk`, consumed over the §2.1
+same-layer rows — S3/S4 (`WP-180`/`WP-190`), and since `WP-200-FU1` (merged
+`a30fec8`) also S5/S6 (`packages/ledger`, `packages/pnl`). A repo-wide
+deletion guard in `test/unit/execution-planner/mirrors.test.ts` forbids any
+copy, and per-edge door-only pins live in `test/unit/risk/ports.test.ts`,
+`test/unit/execution-planner/ports.test.ts` and
+`test/unit/ledger/ports.test.ts`.)*
 
 **What is not a door:**
 
@@ -81,8 +87,8 @@ exists but the package's own structure keeps it off a decision;
 | Package / app | Door probed | Exposure | Verdict | Severity | Owner |
 | --- | --- | --- | --- | --- | --- |
 | `packages/domain` (frozen) | `Uuidv7Schema`, `IsoTimestampSchema`, `DecisionResultSchema` | caller/wire (every package parses through these) | **LIVE** — `skipChecks` makes both primitives accept `"NOT-A-UUID"` / `"yesterday"`; every required `DecisionResult` key is satisfiable from the prototype | **HIGH** (root cause; frozen path, so the fix is at the doors) | contract owner — closed by ADR-020 §3 at each door, **not** by editing the frozen package |
-| `packages/ledger` (`WP-200`, `7e75f9a`) | `validateTransactionInput` | caller | **LIVE** ×2 — a non-enumerable inherited `marketId` defeats WP-040 obligation **F16** (a fill-booking transaction with no market is ACCEPTED); a non-enumerable `skipChecks` admits `ledgerTransactionId: "totally-not-a-uuid"`, `occurredAt: "yesterday-ish"` | **HIGH** — monetary path, and F16 is a recorded obligation | **WP-200-FU1** (bounded, `packages/{ledger,pnl}/**` + their tests) |
-| `packages/pnl` (`WP-200`) | `PnlRecordSchema` and the record schemas | caller | **LIVE** — same classes; additionally the discriminated union **throws an escaped `TypeError`** on a cold first parse under enumerable pollution and is then permanently poisoned | **HIGH** — an escaped throw from a door that documents typed refusals | **WP-200-FU1** |
+| `packages/ledger` (`WP-200`, `7e75f9a`; door: `WP-200-FU1`, `a30fec8`) | every door (`validateTransactionInput`, `Ledger.empty/append/rebuild`, `allocateFill`, `buildFillPosting`, the eight `balance.ts` exports) | caller | **CLOSED** (2026-09-05) — D1–D4 through the canonical `packages/risk` door over §2.1 row S5, door-only pinned by `test/unit/ledger/ports.test.ts`. The original LIVE ×2 measurement (the non-enumerable `marketId` F16 defeat; non-enumerable `skipChecks` admitting garbage ids) reproduced at base `761db76` and refused at the tip; verified by two review rounds (r2: independent divergence census — zero PERMISSION, zero ESCAPE; honest fold byte-identical base→tip). Disclosed residual: a fail-closed availability class at index `"0"` (constructors refuse under inherited index-`0` interference; widening owned by the `packages/risk` grant-and-widen round) — `docs/handoffs/WP-200-FU1.md` | — | — |
+| `packages/pnl` (`WP-200`; door: `WP-200-FU1`, `a30fec8`) | every door (`applyPnlRecord`, `emptyPnlState`, `foldPnlRecords`, `computePnlSnapshot`, `PnlSettlementEvidence.from`, `toPnlSnapshotRow`) | caller | **CLOSED** (2026-09-05) — D1–D4 through the canonical `packages/risk` door over §2.1 row S6, same pins. The original LIVE classes reproduced at base and refused at the tip, including the cold-first-parse escaped `TypeError` and its permanent poisoning (the base also threw a bare `TypeError` from `emptyPnlState` under inherited index-`0` interference — a pre-existing escape the door converts into the typed `PnlConfigurationError` channel, measured in `WP-200-FU1` remediation r1 and confirmed in r2) | — | — |
 | `packages/strategy-runtime` (`WP-170`, `9d0971b`) | `validateEvaluationInput` / `acquireEvaluationInput`; the `DecisionResult` parse at `runtime.ts:918` | caller (strategy code) | **LIVE** — D1 is present (materialize-first) and defeats adoption/loss, but the format checks flow through raw domain schemas: under `skipChecks` an input with `evaluatedAt: "yesterday"` and a non-canonical uppercase `marketId` is **accepted**, so ADR-016's "refused, never case-folded" stops being enforced | **HIGH** — §6 invariant 3's one persisted decision, §6 invariant 4's traceability chain | **WP-170-FU1** (bounded, add D2/D3 to the existing materializer) |
 | `apps/data-gateway` | `parseGatewayConfig` | caller (operator config) | **LIVE** ×2 — a get-only inherited `tickIntervalMs` defeats its `.default()` and the `dataLossBoundMs` startup check silently passes; an inherited `binance` block satisfies "at least one feed must be configured" | **MEDIUM** — startup-time, operator-supplied, unattended process | **WP-120-FU1** / the next bounded grant on `apps/data-gateway/**` |
 | `packages/event-bus` | `validateEnvelope` (Redis wire) | wire | **LIVE** — clean throws `EventBusEnvelopeError`; under non-enumerable `skipChecks` an envelope with `eventId: "not-a-uuid"`, `receivedAt: "yesterday"` is accepted. Returns the caller's own object, so adoption/loss do not apply to the output | **MEDIUM** — the trader's consumption boundary; ordering/dedup keys off these fields | **WP-060-FU1** / the next bounded grant on `packages/event-bus/**` |
@@ -99,18 +105,19 @@ exists but the package's own structure keeps it off a decision;
 | `packages/decimal` | no `zod` | — | n/a — but see `dependency-direction.md` §2.2 and `GOV-2A` `follow_up` 5 for the `divDecimal` explicit-options hazard | — | — |
 
 **The tally, and it is the number every other document must quote.** The table
-above carries **LIVE for twelve merged packages and one app**:
-`packages/{domain,ledger,pnl,strategy-runtime,event-bus,features,order-book,
+above carries **LIVE for ten merged packages and one app**:
+`packages/{domain,strategy-runtime,event-bus,features,order-book,
 binance-adapter,coinbase-adapter,polymarket-public,universe,settlement}` and
-`apps/data-gateway`. Three packages are **CLOSED** (`risk`,
-`capital-allocator`, `execution-planner`), and five are **outside the class**
-(`decimal`, `storage-postgres`, `storage-wal`, `storage-parquet`,
-`observability` — no `zod` door). *(Recounted 2026-09-04 in `GOV-2A`
-remediation round 1. The round-1 headline said "five merged packages and one
-app", which counted neither the `features`, `order-book`, `coinbase-adapter`
-and `polymarket-public` rows the same table already carried as LIVE, nor the
-three rows that round-1 review corrected — `binance-adapter`, `settlement`,
-`universe`.)*
+`apps/data-gateway`. Five packages are **CLOSED** (`risk`,
+`capital-allocator`, `execution-planner`, `ledger`, `pnl`), and five are
+**outside the class** (`decimal`, `storage-postgres`, `storage-wal`,
+`storage-parquet`, `observability` — no `zod` door). *(Recounted 2026-09-05:
+`ledger` and `pnl` flipped LIVE→CLOSED when `WP-200-FU1` merged (`a30fec8`).
+Previously recounted 2026-09-04 in `GOV-2A` remediation round 1, whose
+round-1 headline said "five merged packages and one app" — it counted neither
+the `features`, `order-book`, `coinbase-adapter` and `polymarket-public` rows
+the same table already carried as LIVE, nor the three rows that round-1 review
+corrected — `binance-adapter`, `settlement`, `universe`.)*
 
 **Deployment reading, required whenever one of these rows is quoted.** Nothing on
 the wire can write `Object.prototype`; every row above needs code already
@@ -144,11 +151,17 @@ statement of conformance.
 
 ## 5. Owner assignments (follow-ups, not implemented here)
 
-1. **`WP-200-FU1`** — `packages/{ledger,pnl}/**` + their tests: the D1–D4 door on
+1. **`WP-200-FU1` — EXECUTED** (merged `a30fec8`, 2026-09-05; two review
+   rounds, r2 ACCEPT; `docs/handoffs/WP-200-FU1.md`): the D1–D4 door on
    `validateTransactionInput`, `allocateFill`, `buildFillPosting`, and the PnL
-   record parses; the cold-lazy throw on `PnlRecordSchema` closed; a regression
-   test per §3 row. Also carries `WP-200`'s existing LOW residual (the
-   deep-freeze memoisation set added to before the freeze succeeds).
+   record parses; the cold-lazy throw on `PnlRecordSchema` closed; a
+   regression test per §3 row; `WP-200`'s deep-freeze LOW residual closed in
+   both duplicated modules. Successor obligations it spawned: the
+   `packages/risk` grant-and-widen round (`plain-data.ts` append surface →
+   `CreateDataProperty` + an index-`"0"` regression) and the
+   `packages/decimal` round (the invented `Object.prototype["0"]` on
+   exactly-zero results; the `subDecimal` index-`0` throw; `follow_up` 5's
+   `divDecimal` hazard).
 2. **`WP-170-FU1`** — `packages/strategy-runtime/**`: D2/D3 added to the
    existing materializer, covering the `DecisionResult` parse at
    `runtime.ts:918` and the six scalar identifier parses in `input.ts`.
