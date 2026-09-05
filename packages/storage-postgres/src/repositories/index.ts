@@ -9,6 +9,7 @@
 
 export * from "./balances.js";
 export * from "./catalog.js";
+export * from "./dataset-catalog.js";
 export * from "./fencing.js";
 export * from "./fills.js";
 export * from "./ledger.js";
@@ -19,6 +20,7 @@ export * from "./strategy.js";
 import type { PolymarketBotDatabase } from "../database.js";
 import { createBalanceRepository } from "./balances.js";
 import { createCatalogRepository } from "./catalog.js";
+import { createDatasetCatalogRepository } from "./dataset-catalog.js";
 import { createFencingRepository } from "./fencing.js";
 import { createFillRepository } from "./fills.js";
 import { createLedgerRepository } from "./ledger.js";
@@ -30,6 +32,8 @@ import { createStrategyRepository } from "./strategy.js";
 export type Repositories = {
   readonly balances: ReturnType<typeof createBalanceRepository>;
   readonly catalog: ReturnType<typeof createCatalogRepository>;
+  /** WP-210: the manifest-reading `data.raw_segments` / `data.dataset_manifests` importer. */
+  readonly datasetCatalog: ReturnType<typeof createDatasetCatalogRepository>;
   readonly fencing: ReturnType<typeof createFencingRepository>;
   readonly fills: ReturnType<typeof createFillRepository>;
   readonly ledger: ReturnType<typeof createLedgerRepository>;
@@ -42,6 +46,7 @@ export function createRepositories(db: PolymarketBotDatabase): Repositories {
   return {
     balances: createBalanceRepository(db),
     catalog: createCatalogRepository(db),
+    datasetCatalog: createDatasetCatalogRepository(db),
     fencing: createFencingRepository(db),
     fills: createFillRepository(db),
     ledger: createLedgerRepository(db),

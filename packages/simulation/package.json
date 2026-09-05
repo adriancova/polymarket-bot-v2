@@ -3,13 +3,16 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Replay clock, dataset event source, simulated execution venue, and Tier 0 / Tier 1 fill models with optimistic/base/conservative queue scenarios (WP-210; handoff §8.4, §12; ADR-012). Pure layer-1 logic: one downward workspace dependency, no runtime schema library anywhere in its closure, no Node built-in, no clock read, no network, no signer, no credential, no real order.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.9.2"

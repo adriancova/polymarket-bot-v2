@@ -31,10 +31,29 @@ importers:
         version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   apps/backtest-cli:
+    dependencies:
+      '@polymarket-bot/polymarket-public':
+        specifier: workspace:*
+        version: link:../../packages/polymarket-public
+      '@polymarket-bot/simulation':
+        specifier: workspace:*
+        version: link:../../packages/simulation
+      '@polymarket-bot/storage-parquet':
+        specifier: workspace:*
+        version: link:../../packages/storage-parquet
     devDependencies:
+      '@types/node':
+        specifier: ^24.13.3
+        version: 24.13.3
+      esbuild:
+        specifier: ^0.28.2
+        version: 0.28.2
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   apps/control-api:
     devDependencies:
@@ -458,6 +477,10 @@ importers:
         version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   packages/simulation:
+    dependencies:
+      '@polymarket-bot/decimal':
+        specifier: workspace:*
+        version: link:../decimal
     devDependencies:
       typescript:
         specifier: ^5.9.2

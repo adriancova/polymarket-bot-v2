@@ -3,15 +3,25 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder application scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Backtest CLI (WP-210): verifies a WP-130 dataset against its manifest and replays it deterministically through the simulation package. BACKTEST mode, simulated venue, no credential, no venue connection, no signer, no order.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/main.mjs",
+    "start": "pnpm run typecheck && pnpm run build && node ./dist/main.mjs"
+  },
+  "dependencies": {
+    "@polymarket-bot/polymarket-public": "workspace:*",
+    "@polymarket-bot/simulation": "workspace:*",
+    "@polymarket-bot/storage-parquet": "workspace:*"
   },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }
