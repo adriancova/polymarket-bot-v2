@@ -20,7 +20,7 @@
     "test:contract": "pnpm --filter @polymarket-bot/polymarket-public test:contract && pnpm --filter @polymarket-bot/polymarket-public test:contract:rtds && pnpm --filter @polymarket-bot/binance-adapter test:contract && pnpm --filter @polymarket-bot/coinbase-adapter test:contract",
     "test:compose": "docker compose config --quiet && docker compose up -d --wait && docker compose exec -T postgres pg_isready -U devlocal -d polymarket_bot_dev && docker compose exec -T redis redis-cli ping && docker compose down",
     "audit": "pnpm audit --audit-level high",
-    "test:replay": "node -e \"console.error('NOT IMPLEMENTED: replay tests arrive with WP-120+ (replay/simulation work packages).'); process.exit(1)\"",
+    "test:replay": "vitest run --config test/vitest.config.ts test/replay-golden test/unit/simulation/golden-replay.test.ts",
     "db:migrate": "pnpm --filter @polymarket-bot/storage-postgres db:migrate",
     "dev:infra": "docker compose up -d",
     "dev:gateway": "pnpm --filter @polymarket-bot/data-gateway start",
