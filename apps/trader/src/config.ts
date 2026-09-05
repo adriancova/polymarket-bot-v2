@@ -183,6 +183,20 @@ const InfrastructureConfigSchema = z.strictObject({
 export const TraderConfigSchema = z.strictObject({
   /** The environment every ledger transaction and PnL stream is stamped with. */
   environment: z.literal("PAPER"),
+  /**
+   * The §9.8 policy, validated by `packages/risk`'s OWN door.
+   *
+   * Deliberately `unknown` here. Restating `RiskPolicySchema` in this file would
+   * create a second authority on the safety policy that can drift from the
+   * first, and it would bypass `parseRiskPolicy` — which is a D1-D4 door whose
+   * `.default()` values come from a bound TABLE precisely because a defeated
+   * default silently disabled §9.8 checks 2, 6 and 12 in that package's own
+   * review round 6. The trader hands the document to `parseRiskPolicy` at
+   * startup and refuses to start on a refusal.
+   */
+  riskPolicy: z.unknown(),
+  /** The §9.7 caps, validated by `packages/capital-allocator`'s own door. */
+  allocatorCaps: z.unknown(),
   accounting: AccountingConfigSchema,
   queues: QueueBoundsSchema,
   features: FeatureConfigSchema,

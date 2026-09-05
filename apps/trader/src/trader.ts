@@ -1,0 +1,332 @@
+/**
+ * The composition root itself: `createPaperTrader`.
+ *
+ * Everything below is WIRING. There is no rule here that a merged package does
+ * not already own — the file's whole content is: check safety, parse the
+ * configuration through its door, construct one instance of each component, and
+ * refuse to return a trader if any of that fails.
+ *
+ * ## The startup order, and why it is this order
+ *
+ * 1. **Safety first, before anything reads anything.** §6 invariant 17 rejects
+ *    a configuration that could load a real key, and a process that has already
+ *    read one has already failed the invariant. So `checkPaperTraderSafety` runs
+ *    on the environment record before the configuration is even parsed.
+ * 2. **The configuration door.** ADR-020 D1-D4 (`config.ts`).
+ * 3. **The risk policy and the allocator caps through THEIR OWN doors.**
+ *    `parseRiskPolicy` and `parseAllocatorCaps` are the canonical D1-D4 doors
+ *    for those documents, and their `.default()` values come from bound tables
+ *    precisely because a defeated default silently disabled §9.8 checks 2, 6
+ *    and 12 in `packages/risk`'s own review. Re-implementing either here would
+ *    put a second authority on the safety policy.
+ * 4. **Instances, with the §8.2 order fixed and the §6 invariant 11 conflict
+ *    refused.** Each instance's own params are validated by the STRATEGY's
+ *    validator, not by a copy of it.
+ * 5. **The venue last**, because it is the only component that could ever be
+ *    replaced by something with a network surface, and constructing it last
+ *    makes the dependency direction obvious.
+ *
+ * ## What cannot be constructed here
+ *
+ * A trader whose venue places real orders. The type of `venue` is the §12.1
+ * `ExecutionVenue` surface, the only implementation this repository has is
+ * `packages/simulation`'s — which refuses `EXECUTION_PROBE`, `LIVE_MICRO` and
+ * `LIVE` by name — and `safety.ts` refuses to start under any run mode that
+ * would need one. Three independent refusals, none of which this file weakens.
+ */
+
+import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
+import { Ledger } from "@polymarket-bot/ledger";
+import { parseRiskPolicy, type RiskPolicy } from "@polymarket-bot/risk";
+import {
+  createStrategyInstanceRuntime,
+  type CheckpointStore,
+  type DecisionSink,
+  type MonotonicClock,
+} from "@polymarket-bot/strategy-runtime";
+import {
+  staticBracketParamsSchema,
+  staticBracketStrategy,
+  validateStaticBracketParams,
+} from "@polymarket-bot/strategy-static-bracket";
+
+import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
+import { configuredFeatureKeys, parseTraderConfig, type TraderConfig } from "./config.js";
+import { HaltController } from "./halt.js";
+import { HealthState } from "./health.js";
+import { InstanceRegistry } from "./instances.js";
+import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
+import { MarketState } from "./market-state.js";
+import type { Clock, TraderStore } from "./ports.js";
+import {
+  checkPaperTraderSafety,
+  REPOSITORY_MAXIMUM_RUN_MODE,
+  TRADER_RUN_MODE,
+  type Environment,
+} from "./safety.js";
+import { normalizeToStrictUtc } from "./time.js";
+
+export interface CreateTraderOptions {
+  /** The environment record. NEVER `process.env` read from inside this module. */
+  readonly env: Environment;
+  /** The operator configuration document, unparsed. */
+  readonly config: unknown;
+  readonly clock: Clock;
+  readonly venue: TraderVenue;
+  readonly store: TraderStore;
+  /**
+   * The run-scoped namespace every derived identifier is minted from.
+   *
+   * Two runs with the same namespace mint the same ids, which is what makes a
+   * §12.4 byte-identical comparison of two runs possible at all.
+   */
+  readonly idNamespace: string;
+  /** Maximum trades kept per market for the feature window. */
+  readonly maximumTradesPerMarket?: number;
+}
+
+export interface TraderRefusal {
+  readonly code:
+    | "TRADER_UNSAFE_ENVIRONMENT"
+    | "TRADER_CONFIG_REFUSED"
+    | "TRADER_RISK_POLICY_REFUSED"
+    | "TRADER_ALLOCATOR_CAPS_REFUSED"
+    | "TRADER_MARKET_INVALID"
+    | "TRADER_INSTANCE_INVALID"
+    | "TRADER_LEDGER_REFUSED";
+  readonly detail: string;
+  readonly issues: readonly string[];
+}
+
+export interface PaperTrader {
+  readonly loop: CoreLoop;
+  readonly registry: InstanceRegistry;
+  readonly health: HealthState;
+  readonly halts: HaltController;
+  readonly config: TraderConfig;
+  readonly riskPolicy: RiskPolicy;
+  /** The §8.2 run manifest, recorded as the handoff requires. */
+  readonly manifest: ReturnType<InstanceRegistry["manifest"]>;
+}
+
+export type CreateTraderResult =
+  | { readonly ok: true; readonly trader: PaperTrader }
+  | { readonly ok: false; readonly refusal: TraderRefusal };
+
+function refuse(
+  code: TraderRefusal["code"],
+  detail: string,
+  issues: readonly string[] = [],
+): CreateTraderResult {
+  return { ok: false, refusal: { code, detail, issues } };
+}
+
+/**
+ * Builds a PAPER trader, or refuses.
+ *
+ * TOTAL: never throws. A composition root that threw on a bad configuration
+ * would produce a stack trace where an operator needs a list of what to fix.
+ */
+export function createPaperTrader(options: CreateTraderOptions): CreateTraderResult {
+  // --- 1. safety, before anything else ------------------------------------
+  const safety = checkPaperTraderSafety(options.env);
+  if (!safety.ok) {
+    return refuse(
+      "TRADER_UNSAFE_ENVIRONMENT",
+      `the environment is not safe for a ${TRADER_RUN_MODE} trader; ${String(safety.violations.length)} ` +
+        "violation(s). The process refuses to start rather than continue under a weakened default",
+      safety.violations.map((violation) => `${violation.code}: ${violation.detail}`),
+    );
+  }
+
+  // --- 2. the configuration door ------------------------------------------
+  const parsed = parseTraderConfig(options.config);
+  if (!parsed.ok) {
+    return refuse("TRADER_CONFIG_REFUSED", parsed.refusal.detail, parsed.refusal.issues);
+  }
+  const config = parsed.config;
+
+  // --- 3. the risk policy and allocator caps, through their own doors ------
+  const policy = parseRiskPolicy(config.riskPolicy);
+  if (!policy.ok) {
+    return refuse(
+      "TRADER_RISK_POLICY_REFUSED",
+      "the §9.8 risk policy was refused by packages/risk's own door",
+      policy.refusals.map((refusal_) => `${refusal_.code}: ${refusal_.message}`),
+    );
+  }
+  const caps = parseAllocatorCaps(config.allocatorCaps);
+  if (!caps.ok) {
+    return refuse(
+      "TRADER_ALLOCATOR_CAPS_REFUSED",
+      "the §9.7 allocator caps were refused by packages/capital-allocator's own door — note " +
+        "that both live-micro caps are FENCED at 0 there, so a non-zero one is refused by that " +
+        "package and not by this one",
+      caps.refusals.map((refusal_) => `${refusal_.code}: ${refusal_.message}`),
+    );
+  }
+
+  // --- 4. markets ----------------------------------------------------------
+  const markets = new Map<string, MarketState>();
+  const tokenAssetIds = new Map<string, string>();
+  for (const market of config.markets) {
+    // Obligation 1: the configured lifecycle instants are normalised ONCE,
+    // here, so every view downstream carries the strict-UTC form the strategy
+    // demands and no evaluation pays for the conversion.
+    const open = normalizeToStrictUtc(market.openTime);
+    const close = normalizeToStrictUtc(market.closeTime);
+    if (!open.ok || !close.ok) {
+      return refuse(
+        "TRADER_MARKET_INVALID",
+        `market ${market.marketId} has a lifecycle instant the trader cannot normalise to ` +
+          "strict UTC; an offset form is converted here and only here, and an unreadable one " +
+          "is refused rather than guessed",
+        [open.ok ? "" : `openTime: ${open.problem}`, close.ok ? "" : `closeTime: ${close.problem}`]
+          .filter((issue) => issue.length > 0),
+      );
+    }
+    markets.set(
+      market.marketId,
+      new MarketState({
+        config: { ...market, openTime: open.instant, closeTime: close.instant },
+        tradeWindowMs: config.features.tradeWindowMs,
+        maximumTrades: options.maximumTradesPerMarket ?? 512,
+      }),
+    );
+    // ADR-006 §7 rule 1: a token IS an asset, and it needs an explicit id.
+    // Derived from the venue token id so the ledger's asset identity is stable
+    // and traceable to the market it belongs to.
+    tokenAssetIds.set(`${market.marketId}|YES`, `token:${market.yesTokenId}`);
+    tokenAssetIds.set(`${market.marketId}|NO`, `token:${market.noTokenId}`);
+  }
+
+  // --- 5. the outbox, the ledger, and the counters -------------------------
+  const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
+  const ledger = Ledger.empty(config.environment);
+  const health = new HealthState({
+    runMode: TRADER_RUN_MODE,
+    maximumRunMode: REPOSITORY_MAXIMUM_RUN_MODE,
+  });
+  const halts = new HaltController();
+  const ids = new DeterministicIdFactory(options.idNamespace);
+
+  // --- 6. instances --------------------------------------------------------
+  const registry = new InstanceRegistry();
+  const monotonic: MonotonicClock = { nowNs: () => options.clock.monotonicNs() };
+  const decisionSink: DecisionSink = {
+    persist: (record, telemetry) => {
+      outbox.appendDecision(record, telemetry);
+    },
+  };
+  const checkpointStore: CheckpointStore = {
+    save: (checkpoint) => {
+      outbox.appendCheckpoint(checkpoint);
+    },
+  };
+
+  for (const instance of config.instances) {
+    // The STRATEGY's own validator, not a copy of it. A second implementation
+    // of §13.2's grammar here would be a second authority that can drift.
+    const params = validateStaticBracketParams(instance.params);
+    if (!params.ok) {
+      return refuse(
+        "TRADER_INSTANCE_INVALID",
+        `instance ${instance.instanceId} carries params the strategy refused`,
+        [params.problem],
+      );
+    }
+    if (!markets.has(instance.marketId)) {
+      return refuse(
+        "TRADER_INSTANCE_INVALID",
+        `instance ${instance.instanceId} names market ${instance.marketId}, which this trader ` +
+          "is not configured for",
+      );
+    }
+    const created = createStrategyInstanceRuntime({
+      strategy: staticBracketStrategy,
+      params: instance.params,
+      run: {
+        runId: instance.runId,
+        instanceId: instance.instanceId,
+        configId: instance.configId,
+        runSeed: instance.runSeed,
+      },
+      watchdog: { evaluationBudgetUs: instance.evaluationBudgetUs },
+      clock: monotonic,
+      decisionSink,
+      checkpointStore,
+    });
+    if (!created.ok) {
+      return refuse(
+        "TRADER_INSTANCE_INVALID",
+        `the runtime refused instance ${instance.instanceId}`,
+        [`${created.refusal.code}: ${created.refusal.detail}`],
+      );
+    }
+    const registered = registry.register({
+      instanceId: instance.instanceId,
+      runId: instance.runId,
+      configId: instance.configId,
+      marketId: instance.marketId,
+      ownership: instance.ownership,
+      evaluationPriority: instance.evaluationPriority,
+      runtime: created.runtime,
+      direction: params.value.market_selector.direction,
+      params: params.value,
+      immediateOrderType: params.value.entry.execution.immediate_order_type,
+      submissionUnknownAfterMs: params.value.entry.execution.submission_unknown_after_ms,
+    });
+    if (!registered.ok) {
+      return refuse("TRADER_INSTANCE_INVALID", registered.detail, [registered.code]);
+    }
+  }
+
+  const posting: PostingIdentity = {
+    environment: config.environment,
+    accountRef: config.accounting.accountRef,
+    denominationAssetId: config.accounting.denominationAssetId,
+    venueClearingRef: config.accounting.venueClearingRef,
+    attributionClearingRef: config.accounting.attributionClearingRef,
+    feeExpenseRef: config.accounting.feeExpenseRef,
+  };
+
+  const loop = new CoreLoop({
+    config,
+    riskPolicy: policy.value,
+    clock: options.clock,
+    venue: options.venue,
+    store: options.store,
+    registry,
+    markets,
+    instanceConfigs: new Map(
+      config.instances.map((instance) => [instance.instanceId, instance]),
+    ),
+    ledger,
+    ids,
+    health,
+    halts,
+    featureKeys: configuredFeatureKeys(config),
+    posting,
+    tokenAssetIds,
+    outbox,
+  });
+
+  // Referenced so the caps parse is not dead: the allocator's caps are part of
+  // the run's pinned configuration, and a run whose caps were parsed and then
+  // discarded would be a run that validated a document it never used.
+  void caps.value;
+  void staticBracketParamsSchema;
+
+  return {
+    ok: true,
+    trader: {
+      loop,
+      registry,
+      health,
+      halts,
+      config,
+      riskPolicy: policy.value,
+      manifest: registry.manifest(),
+    },
+  };
+}

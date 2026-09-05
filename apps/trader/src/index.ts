@@ -170,3 +170,51 @@ export {
   type RegisterResult,
   type RegisteredInstance,
 } from "./instances.js";
+
+export {
+  MarketState,
+  type ActiveIncident,
+  type MarketLifecycle,
+  type ObservedTradeRecord,
+} from "./market-state.js";
+
+export {
+  DeterministicIdFactory,
+  postFill,
+  projectionOf,
+  type FillClaim,
+  type PostFillOutcome,
+  type PostingIdentity,
+  type TraceLink,
+} from "./accounting.js";
+
+export {
+  ORDER_TYPE_TAG_PREFIX,
+  OrderTimeInForceBook,
+  PROTECTIVE_EXIT_TAGS,
+  buildPlanningInputs,
+  buildRiskEvaluationInput,
+  isProtectiveExitIntent,
+  resolveTimeInForce,
+  runPlanner,
+  runRiskCheck,
+  type PortfolioOpenOrderInput,
+  type PortfolioPositionInput,
+  type RiskInputContext,
+} from "./pipeline.js";
+
+export {
+  CoreLoop,
+  DecisionOutboxBuffer,
+  type CoreLoopOptions,
+  type DecisionTrace,
+  type TraderVenue,
+} from "./loop.js";
+
+export {
+  createPaperTrader,
+  type CreateTraderOptions,
+  type CreateTraderResult,
+  type PaperTrader,
+  type TraderRefusal,
+} from "./trader.js";

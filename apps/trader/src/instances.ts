@@ -48,6 +48,16 @@ export interface RegisteredInstance {
   readonly ownership: Ownership;
   readonly evaluationPriority: number;
   readonly runtime: StrategyInstanceRuntime;
+  /**
+   * The outcome side this instance's configuration binds
+   * (`market_selector.direction`).
+   *
+   * It selects which of the market's two books the feature snapshot is computed
+   * over: the executable-price features describe ONE token's ladder, and an
+   * instance configured on `NO` whose trigger read the `YES` book would be
+   * comparing its threshold against a price for the other outcome.
+   */
+  readonly direction: "YES" | "NO";
   /** The strategy's own validated params, kept for the seams that read tags. */
   readonly params: unknown;
   /** `entry.execution.immediate_order_type`, resolved at registration. */
