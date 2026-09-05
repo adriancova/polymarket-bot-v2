@@ -211,6 +211,14 @@ export {
   type TraderVenue,
 } from "./loop.js";
 
+export { pump, type PumpOptions, type PumpResult } from "./pump.js";
+
+export {
+  ReferenceState,
+  type ReferencePoint,
+  type ReferenceVenueName,
+} from "./reference-state.js";
+
 export {
   createPaperTrader,
   type CreateTraderOptions,
