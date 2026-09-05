@@ -749,6 +749,12 @@ work_packages:
     allowed_paths:
       - packages/strategies/static-bracket/**
       - test/unit/strategies/static-bracket/**
+      # Ratified 2026-09-05 (WP-220 review rounds 1 and 4, GOV-1): declaring
+      # the package's two workspace:* links (@polymarket-bot/strategy-sdk,
+      # @polymarket-bot/decimal) mechanically updates the root lockfile's own
+      # importer block; WP-220 may modify pnpm-lock.yaml for that purpose only
+      # (WP-020 precedent for a protected path serving a package's deliverable).
+      - pnpm-lock.yaml
     forbidden_paths:
       - packages/domain/**
       - packages/polymarket-secure/**
