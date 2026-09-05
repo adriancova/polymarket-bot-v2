@@ -122,28 +122,34 @@ export class Ledger {
    * IT IS NOT A PASS-THROUGH, and the comment that used to say it was is
    * corrected here (`WP-200-FU1` review round 1, finding M2 — measured, not
    * reasoned). A run mode is a string, but materializing even a string appends
-   * to the shared door's `state.strings` accumulator with `Array.prototype
-   * .push`, which is `Set` and therefore consults the prototype chain for the
-   * INDEX name. So an inherited get-only accessor at `Object.prototype["0"]`
-   * makes that FIRST append throw, and this constructor answers:
+   * to the shared door's `state.strings` accumulator, and at `WP-200-FU1`'s tip
+   * that append used `Array.prototype.push`, which is `Set` and therefore
+   * consults the prototype chain for the INDEX name. An inherited get-only
+   * accessor at `Object.prototype["0"]` made that FIRST append throw:
    *
    * ```text
-   * tip 7d5ac34, get-only accessor at Object.prototype["0"]:
-   *   Ledger.empty("PAPER")       -> THREW LedgerConfigurationError
-   *   Ledger.rebuild("PAPER", []) -> THREW LedgerConfigurationError (cannot construct)
-   * base 761db76, the same probe:
-   *   Ledger.empty("PAPER")       -> OK
-   *   Ledger.rebuild("PAPER", []) -> OK
+   * get-only accessor at Object.prototype["0"]     base 761db76   tip 7d5ac34
+   *   Ledger.empty("PAPER")                        OK             LedgerConfigurationError
+   *   Ledger.rebuild("PAPER", [])                  OK             LedgerConfigurationError
    * ```
    *
-   * That is a TIP-ONLY AVAILABILITY class, and it FAILS CLOSED: nothing is
-   * admitted, nothing is invented, and the answer is this function's own
-   * documented typed error rather than a bare `TypeError`. It is disclosed
-   * rather than fixed because the root cause is `packages/risk`'s
-   * `plain-data.ts` — outside `WP-200-FU1`'s allowed paths — and its widening to
-   * `CreateDataProperty` appends is queued as a separate authorized round. The
-   * ledger battery in `test/unit/ledger/schema-boundary.test.ts` carries `"0"`
-   * in its key material precisely so this class cannot grow unobserved.
+   * THAT CLASS IS CLOSED (`WP-020-FU1`). The queued `packages/risk` round
+   * landed: `plain-data.ts`'s whole append surface — 23 sites — now uses
+   * `CreateDataProperty` semantics, which define on the array itself and
+   * consult nothing. Re-measured with the same probe at that round's tip, both
+   * constructors answer `OK` under EVERY measured shape at every index name,
+   * exactly as in a clean process, and `test/unit/ledger/schema-boundary.test
+   * .ts` inverted its pin to assert that rather than the two refusals. The
+   * base/tip pair above is kept as HISTORY: it is the measurement that
+   * justified the follow-up, and re-deriving it needs two trees.
+   *
+   * WHAT IS STILL TRUE, so this is not a new absolute: a get-only or throwing
+   * accessor at an index name still defeats `Array.prototype.push` everywhere
+   * else in the process — `zod`'s own `issues: []`, this package's own
+   * accumulators, and the eight `packages/risk` modules outside the door's
+   * file — so other doors in that battery still answer with a typed refusal
+   * under exactly those two shapes. It remains AVAILABILITY, never permission,
+   * and the battery enumerates it per shape and per answer.
    */
   static empty(environment: RunMode): Ledger {
     try {

@@ -175,12 +175,24 @@ export interface PnlState {
  *   tip  7d5ac34  emptyPnlState(IDENTITY) -> THREW PnlConfigurationError (typed)
  * ```
  *
- * So for THIS function the class is not new — it existed at base and escaped
- * untyped; the door converts it into the documented channel. It is availability,
- * not permission: nothing is admitted and nothing is invented. The root cause is
- * `packages/risk`'s `plain-data.ts` appending with `Array.prototype.push`
- * instead of `CreateDataProperty`; that module is outside `WP-200-FU1`'s allowed
- * paths and its widening is queued as a separate authorized round.
+ * THAT CLASS IS CLOSED (`WP-020-FU1`), and the pair above is kept as HISTORY.
+ * The queued `packages/risk` round landed: `plain-data.ts`'s whole append
+ * surface now uses `CreateDataProperty` semantics, so the accumulator no longer
+ * consults the prototype chain for an index name at all. Re-measured with the
+ * same probe at that round's tip:
+ *
+ * ```text
+ *   tip WP-020-FU1  emptyPnlState(IDENTITY) -> OK, byte-identical to clean
+ * ```
+ *
+ * The outer guard stays, for the reason it was added: it is what makes "throws
+ * `PnlConfigurationError`, or returns a state" true for every input rather than
+ * for the ones somebody thought of, and a get-only accessor at an index name
+ * still defeats `Array.prototype.push` everywhere ELSE in the process —
+ * `zod`'s own `issues: []`, this package's own accumulators, the eight
+ * `packages/risk` modules outside the door's file. Where that surfaces it is
+ * still availability, never permission: nothing is admitted and nothing is
+ * invented.
  */
 export function emptyPnlState(identity: PnlStreamIdentity): PnlState {
   try {

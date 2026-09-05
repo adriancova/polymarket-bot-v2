@@ -43,24 +43,31 @@
  * NAMED string keys inherited by `Object.prototype`, enumerable and
  * non-enumerable, including a required grammar key, an inherited `get`, an
  * inherited `_zod`, an inherited `toString`, and state/decision keys polluted
- * around a running callback — the door's PERMISSION does not vary, an
- * acceptance stays an acceptance, a refusal stays a refusal, no callback
- * throws, and a decision is byte-identical.
+ * around a running callback — AND, since `WP-020-FU1`, NUMERIC-INDEX names at
+ * `"0"`, `"1"`, `"2"` and `"3"` in both enumerability shapes — the door's
+ * PERMISSION does not vary, an acceptance stays an acceptance, a refusal stays
+ * a refusal, no callback throws, and a decision is byte-identical.
  *
- * MEASURED AND OPEN, disclosed rather than claimed away: NUMERIC-INDEX
- * pollution. With `Object.prototype["0"]` defined, `subDecimal` throws whenever
- * its exact result is zero, which happens inside `observe.ts`'s book walk on the
- * ordinary path where the walk consumes exactly the requested size. This
- * package's guards contain the throw (`economics.ts` `guarded`), so the
- * OBSERVED behaviour is a recorded refusal — `SB.REFUSED_BOOK_PARTICIPATION`
- * where a clean process would have entered. The DIRECTION is fail-closed: an
- * entry becomes a hold, and no exit, cancel or reduction is affected. The root
- * cause is in `packages/decimal`, which is outside this package's paths and is
- * queued with two sibling decimal findings; nothing here can fix it, and
- * pretending the class is covered would be worse than naming it. Reaching it at
- * all requires an already-compromised process. `hostile-config.test.ts` carries
- * the probe as a DOCUMENTED EXPECTATION: it asserts today's fail-closed refusal
- * and will fail loudly if the direction ever changes.
+ * THE NUMERIC-INDEX CLASS WAS OPEN AND IS NOW CLOSED, and the history is kept
+ * because the promotion is the interesting part. `WP-220` review round 1 (M2)
+ * measured that with `Object.prototype["0"]` defined, `subDecimal` threw
+ * whenever its exact result was zero — which `observe.ts`'s book walk hits on
+ * the ORDINARY path, where the walk consumes exactly the requested size. This
+ * package's guards contained the throw (`economics.ts` `guarded`), so the
+ * observed behaviour was a recorded refusal — `SB.REFUSED_BOOK_PARTICIPATION`
+ * where a clean process would have entered. Fail-closed, but a real loss of
+ * availability from ambient state, and the root cause was in `packages/decimal`,
+ * outside this package's paths.
+ *
+ * `WP-020-FU1` fixed it there: no internal read or write on any arithmetic path
+ * can consult a prototype for an index name any more (the measurement, the root
+ * cause inside `decimal.js`, and the one residual are recorded in
+ * `packages/decimal/src/prototype-guard.ts`). The two probes in
+ * `hostile-config.test.ts` were PROMOTED in the same commit from documented
+ * expectations to ordinary permission-does-not-vary cases, and they now assert
+ * byte-identity of the whole decision rather than the direction of a refusal —
+ * so a revert of the decimal fix fails here by name. Reaching the class at all
+ * still requires an already-compromised process.
  *
  * Purity: no I/O, no clock, no randomness, no `node:` import, no evaluator, no
  * `.constructor` read (F14).

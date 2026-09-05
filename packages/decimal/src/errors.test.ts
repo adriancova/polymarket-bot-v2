@@ -47,7 +47,11 @@ const PERMITTED_CODES: ReadonlyMap<string, readonly DecimalErrorCode[]> = new Ma
   ],
   [
     DecimalRangeError.name,
-    ["DECIMAL_OUT_OF_RANGE", "DECIMAL_INVALID_PRECISION"] satisfies DecimalErrorCode[],
+    [
+      "DECIMAL_OUT_OF_RANGE",
+      "DECIMAL_INVALID_PRECISION",
+      "DECIMAL_INVALID_OPTIONS",
+    ] satisfies DecimalErrorCode[],
   ],
   [DecimalDivisionByZeroError.name, ["DECIMAL_DIVISION_BY_ZERO"] satisfies DecimalErrorCode[]],
   [DecimalInexactError.name, ["DECIMAL_INEXACT"] satisfies DecimalErrorCode[]],
@@ -87,6 +91,23 @@ const THROW_SITES: ReadonlyArray<readonly [string, () => unknown]> = [
   ["divDecimalExact by zero", () => divDecimalExact("1", "0")],
   ["divDecimalExact non-terminating", () => divDecimalExact("1", "3")],
   ["divDecimal bad precision", () => divDecimal("1", "3", { precision: 0 })],
+  // `WP-020-FU1` / `GOV-2A` follow-up 5: at base each of these escaped the
+  // taxonomy — the first two as `decimal.js`'s own untyped
+  // `Error("[DecimalError] Invalid argument: rounding: …")`, the third as
+  // whatever the caller's getter threw, the fourth as a silent fall-back to the
+  // defaults. All four are now this package's typed refusal.
+  ["divDecimal bad rounding (out of range)", () => divDecimal("1", "3", { rounding: 99 as never })],
+  ["divDecimal bad rounding (not a number)", () => divDecimal("1", "3", { rounding: "x" as never })],
+  [
+    "divDecimal accessor option",
+    () =>
+      divDecimal("1", "3", {
+        get precision(): number {
+          throw new Error("a division option must never be able to run caller code");
+        },
+      }),
+  ],
+  ["divDecimal non-object options", () => divDecimal("1", "3", 4 as never)],
   ["mulDecimal overlong result", () => mulDecimal(`1${"0".repeat(600)}`, `1${"0".repeat(600)}`)],
   ["isTickConformant zero tick", () => isTickConformant("0.5", "0")],
   ["assertTickConformant off grid", () => assertTickConformant("0.075", "0.01")],

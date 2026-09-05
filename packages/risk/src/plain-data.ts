@@ -10,10 +10,12 @@
  * import it as `@polymarket-bot/risk/plain-data` across the
  * `docs/contracts/dependency-direction.md` §2.1 **S3** / **S4** same-layer
  * edges; the module is reachable only through this package's `exports` map
- * (F16). Nothing below this header changed in the collapse — the body is byte
- * for byte what review rounds 4-9 left here. `test/unit/execution-planner/
- * mirrors.test.ts` is now the DELETION guard: it fails if a copy of this body
- * reappears under any other package's `src`.
+ * (F16). Nothing below this header changed in the collapse itself — the body
+ * was byte for byte what review rounds 4-9 left here, and the ONE later change
+ * is `WP-020-FU1`'s append widening (proposition 4b and {@link appendData}),
+ * which is why `test/unit/execution-planner/mirrors.test.ts`'s body pin was
+ * re-derived in that round. That test is also the DELETION guard: it fails if a
+ * copy of this body reappears under any other package's `src`.
  *
  * WHY THIS MODULE EXISTS. Round 3 replaced a list of identity fields with a
  * WALK over the record about to be emitted. Round 4 found the walk's
@@ -131,6 +133,15 @@
  *    it in scope. It is a fail-open, not a curiosity — see {@link emptyRecord}
  *    for the measured `zod` transcript in which an inherited optional field is
  *    ADOPTED into the parse output as though the caller had supplied it.
+ *
+ * 4b. **AND NO PROPERTY THIS MODULE WRITES IS ANSWERED BY A PROTOTYPE EITHER**
+ *    (`WP-020-FU1`, executing `WP-200-FU1`'s round-1 GRANT-AND-WIDEN ruling).
+ *    Proposition 4 closed the READS. The WRITES had one hole left: this module
+ *    accumulated into ordinary arrays with `Array.prototype.push`, which is
+ *    `Set`, which consults the prototype chain FOR THE INDEX NAME. Every append
+ *    now goes through {@link appendData}, where the measurement, the 23 call
+ *    sites, and the reason `defineProperty` is the right primitive are
+ *    recorded.
  *
  * 5. **THE VALIDATED VALUE IS THE VALUE THIS MODULE READ** (review round 7).
  *    A schema is asked a QUESTION — is this acceptable? — and its answer is
@@ -305,12 +316,12 @@ function readInto(
   if (value === null) return null;
   const kind = typeof value;
   if (kind === "string") {
-    state.strings.push({ path, keys, value: value as string });
+    appendData(state.strings, { path, keys, value: value as string });
     return value;
   }
   if (kind === "number" || kind === "boolean" || kind === "undefined") return value;
   if (kind !== "object") {
-    state.problems.push({ path, problem: `a record carries data, not a ${kind}` });
+    appendData(state.problems, { path, problem: `a record carries data, not a ${kind}` });
     return undefined;
   }
 
@@ -324,11 +335,11 @@ function readInto(
   try {
     proxied = isProxyValue(container);
   } catch {
-    state.problems.push({ path, problem: "it could not be classified as data" });
+    appendData(state.problems, { path, problem: "it could not be classified as data" });
     return undefined;
   }
   if (proxied) {
-    state.problems.push({
+    appendData(state.problems, {
       path,
       problem:
         "a Proxy: a record is data, and a Proxy is code that answers questions about data — it may answer differently on a second read, omit a property, describe one it does not have, or throw",
@@ -337,11 +348,11 @@ function readInto(
   }
 
   if (state.ancestors.has(container)) {
-    state.problems.push({ path, problem: "a cycle: a record is a finite tree of data" });
+    appendData(state.problems, { path, problem: "a cycle: a record is a finite tree of data" });
     return undefined;
   }
   if (depth >= MAX_DEPTH) {
-    state.problems.push({ path, problem: `nested deeper than ${MAX_DEPTH} levels` });
+    appendData(state.problems, { path, problem: `nested deeper than ${MAX_DEPTH} levels` });
     return undefined;
   }
 
@@ -349,7 +360,7 @@ function readInto(
   try {
     prototype = Object.getPrototypeOf(container);
   } catch {
-    state.problems.push({ path, problem: "its prototype could not be read" });
+    appendData(state.problems, { path, problem: "its prototype could not be read" });
     return undefined;
   }
 
@@ -357,12 +368,12 @@ function readInto(
   try {
     isArray = Array.isArray(container);
   } catch {
-    state.problems.push({ path, problem: "it could not be classified as data" });
+    appendData(state.problems, { path, problem: "it could not be classified as data" });
     return undefined;
   }
 
   if (prototype !== null && prototype !== (isArray ? Array.prototype : Object.prototype)) {
-    state.problems.push({
+    appendData(state.problems, {
       path,
       problem:
         "a non-plain prototype: an inherited property is state the record does not own, and freezing the record cannot freeze it",
@@ -390,19 +401,19 @@ function ownStringKeys(
   try {
     ownKeys = Reflect.ownKeys(container);
   } catch {
-    state.problems.push({ path, problem: "its own property names could not be read" });
+    appendData(state.problems, { path, problem: "its own property names could not be read" });
     return undefined;
   }
   const stringKeys: string[] = [];
   for (const key of ownKeys) {
     if (typeof key === "symbol") {
-      state.problems.push({
+      appendData(state.problems, {
         path,
         problem: `a symbol-keyed property (${String(key)}) is not record data`,
       });
       continue;
     }
-    stringKeys.push(key);
+    appendData(stringKeys, key);
   }
   return stringKeys;
 }
@@ -427,7 +438,7 @@ function ownDataValue(
   try {
     descriptor = Object.getOwnPropertyDescriptor(container, key);
   } catch {
-    state.problems.push({ path, problem: "its property descriptor could not be read" });
+    appendData(state.problems, { path, problem: "its property descriptor could not be read" });
     return { present: false };
   }
   if (descriptor === undefined) return { present: false };
@@ -439,7 +450,7 @@ function ownDataValue(
   // the field's value instead of refusing the getter. Found by the round-6
   // census, not by a reviewer — see `test/unit/risk/prototype-access.test.ts`.
   if (!Object.hasOwn(descriptor, "value")) {
-    state.problems.push({
+    appendData(state.problems, {
       path,
       problem:
         "an accessor property: a getter is code, not data — it can throw, can answer differently on a second read, and cannot be frozen",
@@ -529,6 +540,47 @@ export function ownAccessorDescriptor(
  */
 function defineDataProperty(out: object, key: string, value: unknown): void {
   Object.defineProperty(out, key, ownDataDescriptor(value));
+}
+
+/**
+ * Appends to one of THIS MODULE'S OWN arrays, with `CreateDataProperty`
+ * semantics. Never `Array.prototype.push` (`WP-020-FU1`).
+ *
+ * `push` is `Set`, and `Set` at an index the array does not own yet consults
+ * the PROTOTYPE CHAIN — for the INDEX NAME. So an inherited get-only accessor
+ * at `Object.prototype["0"]` makes the FIRST append to an empty array throw
+ * `TypeError: Cannot set property 0 of #<Object> which has only a getter`, and
+ * a read-only inherited data property at the same name makes it throw too. It
+ * is the same class as everything else in this module's header, one link
+ * further down the chain than the reads it already closes, and it is not
+ * hypothetical: `WP-200-FU1` measured it through the ledger door, on an HONEST
+ * input, at base `761db76` versus its tip:
+ *
+ * ```text
+ * get-only accessor at Object.prototype["0"]       base 761db76   tip 7d5ac34
+ *   Ledger.empty("PAPER")                          OK             LedgerConfigurationError
+ *   Ledger.rebuild("PAPER", [])                    OK             LedgerConfigurationError
+ *   emptyPnlState(valid identity)                  bare TypeError PnlConfigurationError
+ * ```
+ *
+ * Every one of those is this function's absence: `readPlainData`'s outer guard
+ * caught the append's `TypeError` and turned an honest call into a refusal. The
+ * direction was always fail-closed — nothing was ever admitted or invented —
+ * but a door whose AVAILABILITY varies with ambient prototype state has not met
+ * ADR-020 §6 either, and `WP-200-FU1`'s review round 1 ruled the whole append
+ * surface in scope rather than the one line it had measured. The surface is:
+ * `state.strings`, `state.problems`, `stringKeys`, `unfilled`, `copyPlainData`'s
+ * `items`, and `readArray`'s output — 23 call sites, all through here.
+ *
+ * `Object.defineProperty` has `CreateDataProperty` semantics: it defines on the
+ * array itself and consults no inherited accessor, and it maintains `length`
+ * exactly as `push` would. The descriptor is built by {@link ownDataDescriptor}
+ * for the round-8 reason recorded there. (The same fix, and the same reasoning,
+ * as `test/unit/ledger/pollution.ts`'s own `appendData` — a harness that was
+ * defeated by this class while measuring it.)
+ */
+function appendData<T>(target: T[], value: T): void {
+  Object.defineProperty(target, `${target.length}`, ownDataDescriptor(value));
 }
 
 /**
@@ -672,7 +724,7 @@ export function withSchemaDefaults(
   for (const entry of defaults) {
     const target = targetOf(read, entry.path);
     if (target === undefined) {
-      unfilled.push(entry.path.join("."));
+      appendData(unfilled, entry.path.join("."));
       continue;
     }
     if (dataValue(target.container, target.key) !== undefined) continue;
@@ -721,7 +773,9 @@ function copyPlainData(value: unknown, depth: number): unknown {
   if (value === null || typeof value !== "object" || depth >= MAX_DEPTH) return value;
   if (Array.isArray(value)) {
     const items: unknown[] = [];
-    for (const item of value as readonly unknown[]) items.push(copyPlainData(item, depth + 1));
+    for (const item of value as readonly unknown[]) {
+      appendData(items, copyPlainData(item, depth + 1));
+    }
     return items;
   }
   const out = emptyRecord();
@@ -806,7 +860,7 @@ function readObject(
   for (const key of stringKeys) {
     const memberPath = `${path}.${key}`;
     if (key === FORBIDDEN_KEY) {
-      state.problems.push({
+      appendData(state.problems, {
         path: memberPath,
         problem:
           'a "__proto__" property: it is the one property name a strict schema in this repository cannot report as unrecognized, so a field under it could never be validated — and a record whose extra fields cannot be refused is not a record',
@@ -850,12 +904,12 @@ function reportedLength(
   try {
     descriptor = Object.getOwnPropertyDescriptor(container, "length");
   } catch {
-    state.problems.push({ path, problem: "its length could not be read" });
+    appendData(state.problems, { path, problem: "its length could not be read" });
     return { ok: false };
   }
   // `Object.hasOwn`, not `in` — same round-6 reason as {@link ownDataValue}.
   if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
-    state.problems.push({
+    appendData(state.problems, {
       path,
       problem: "its length is not an own data property, so the array is not data",
     });
@@ -880,7 +934,7 @@ function readArray(
     if (key === "length") continue;
     const index = arrayIndex(key);
     if (index === undefined) {
-      state.problems.push({
+      appendData(state.problems, {
         path: `${path}.${key}`,
         problem: "a non-index property on an array is not record data",
       });
@@ -898,13 +952,13 @@ function readArray(
   // against the reported length: a mismatch means holes, which a record has not.
   const length = highest + 1;
   if (members.size !== length) {
-    state.problems.push({ path, problem: "a sparse array: a record has no holes" });
+    appendData(state.problems, { path, problem: "a sparse array: a record has no holes" });
     return undefined;
   }
   const reported = reportedLength(container, path, state);
   if (!reported.ok) return undefined;
   if (reported.value !== length) {
-    state.problems.push({
+    appendData(state.problems, {
       path,
       // `describeValue`, not `String(...)`: the reported length is a
       // caller-derived value, and coercing one to build a refusal is how round
@@ -915,6 +969,6 @@ function readArray(
   }
 
   const out: unknown[] = [];
-  for (let index = 0; index < length; index += 1) out.push(members.get(index));
+  for (let index = 0; index < length; index += 1) appendData(out, members.get(index));
   return out;
 }

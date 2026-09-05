@@ -363,6 +363,18 @@ function candidateKeys(material: unknown, extra: readonly string[] = []): string
  * files), so the exclusion removes noise about third-party array machinery
  * without hiding a site of ours. It is recorded as a residual in
  * `docs/handoffs/WP-180.md`.
+ *
+ * WHAT `WP-020-FU1` CHANGED, and why this exclusion nevertheless stays. The
+ * SECOND reason above is now false: `packages/decimal` neutralizes index names
+ * on both prototypes for the duration of every operation, so an inherited data
+ * property no longer changes any arithmetic result. The FIRST is still true —
+ * `Array.prototype.push` remains `Set` — and `packages/risk` still accumulates
+ * with `push` in the eight modules OUTSIDE `plain-data.ts`, whose 23 appends
+ * that round converted. So the exclusion still removes real third-party and
+ * out-of-file noise from THIS sweep, and the class it excludes is measured
+ * directly instead, per shape and per index, in
+ * `test/unit/risk/index-name-pollution.test.ts` — including the remainder this
+ * file would otherwise be silently carrying.
  */
 const ARRAY_INDEX = /^(?:0|[1-9][0-9]*)$/u;
 

@@ -18,6 +18,7 @@ export type DecimalErrorCode =
   | "DECIMAL_NOT_CANONICAL"
   | "DECIMAL_OUT_OF_RANGE"
   | "DECIMAL_INVALID_PRECISION"
+  | "DECIMAL_INVALID_OPTIONS"
   | "DECIMAL_DIVISION_BY_ZERO"
   | "DECIMAL_INEXACT"
   | "DECIMAL_INVALID_TICK";
@@ -35,7 +36,7 @@ export type DecimalErrorCode =
  * | Class | Codes |
  * | --- | --- |
  * | `InvalidDecimalStringError` | every shape/grammar code (`DECIMAL_NOT_A_STRING` … `DECIMAL_NOT_CANONICAL`) |
- * | `DecimalRangeError` | `DECIMAL_OUT_OF_RANGE`, `DECIMAL_INVALID_PRECISION` |
+ * | `DecimalRangeError` | `DECIMAL_OUT_OF_RANGE`, `DECIMAL_INVALID_PRECISION`, `DECIMAL_INVALID_OPTIONS` |
  * | `DecimalDivisionByZeroError` | `DECIMAL_DIVISION_BY_ZERO` |
  * | `DecimalInexactError` | `DECIMAL_INEXACT` |
  * | `InvalidTickSizeError` | `DECIMAL_INVALID_TICK` |
@@ -77,6 +78,14 @@ export class InvalidDecimalStringError extends DecimalError {}
  *   {@link DecimalInexactError}, which is documented to mean a result could not
  *   be represented exactly and would have mislabeled a bad argument as a
  *   precision loss).
+ * - `DECIMAL_INVALID_OPTIONS` — a *caller argument* that is not usable data at
+ *   all: `divDecimal`'s `options` was not an object, one of its fields was an
+ *   accessor rather than data, its descriptor could not be read, or `rounding`
+ *   was not one of the nine `decimal.js` rounding modes. Added by `WP-020-FU1`
+ *   (`GOV-2A` follow-up 5) because at base every one of those escaped this
+ *   package's taxonomy as a bare `TypeError` or as `decimal.js`'s own
+ *   `Error("[DecimalError] Invalid argument: …")`, which no caller can branch
+ *   on and no metric can label.
  */
 export class DecimalRangeError extends DecimalError {}
 
