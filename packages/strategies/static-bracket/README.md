@@ -122,7 +122,7 @@ review round 3, and readable in `engine.ts`'s `isEntry` branches):
 |---|---|
 | Inside the configured entry cutoff before close | `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` — the §9.8 check-20 time-to-close gate applies its *entry* half |
 | Market is `CLOSE_ONLY` | `RISK_MARKET_CLOSE_ONLY` — blocked, though a reduction is exactly what a close-only market still permits |
-| Venue book stale | refused as `RISK_BOOK_STALE` instead of `RISK_BOOK_STALE_NO_BLIND_REDUCTION`, and the `POSITION_STATE_UNKNOWN` incident recommendation the reduction path adds is **not** raised |
+| Venue book stale | refused with the entry-shaped staleness code (`RISK_BOOK_STALE`; `RISK_FRESHNESS_UNKNOWN` for an unmeasured book) instead of `RISK_BOOK_STALE_NO_BLIND_REDUCTION`, and the `POSITION_STATE_UNKNOWN` incident recommendation the reduction path adds is **not** raised |
 | Default policy `economics.requirePositiveNetEdgeForEntries: true` | §9.8 check 12 demands `expectedNetEdge`, which no exit of this strategy carries, so **every exit is refused** (`RISK_EDGE_INPUTS_MISSING`) |
 
 The last row is **half pre-existing**: the take-profit was already a `POSITION`
@@ -298,6 +298,15 @@ here because a wiring that breaks one produces a *quiet* misbehaviour.
    again each time; §9.10's `RESERVE_BEFORE_SUBMISSION` rule is what turns the
    second and later ones into `PLAN_INVENTORY_INSUFFICIENT` refusals. See
    "Re-emitting an exit **compounds**" above for the whole of it.
+10. **Cancel reconciliation is the OMS/composition root's job.** An unconfirmed
+    cancel has no in-package timeout: if the venue acknowledges but never
+    confirms, the instance waits in `SB.AWAITING_CANCEL_CONFIRMATION` with the
+    stop, holding timeout and close cutoff deferred (the review-round-3
+    self-edge made this a quiet wait where it was previously a loud halt that
+    abandoned the position with the same protections dead). The root must
+    resolve every cancel to a terminal fact — confirmed, rejected, or
+    `SILENCE_EXCEEDED` via `submission_unknown_after_ms` — the §6 invariant 6
+    family, same as the awaiting-fill posture.
 
 ## Closed in review round 3: the cancel race no longer halts
 
