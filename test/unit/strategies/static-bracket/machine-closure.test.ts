@@ -14,7 +14,7 @@
  * halted it with an OPEN POSITION and zero intents, so the stop never fired
  * again.
  *
- * This file closes the loop from the other side, four ways:
+ * This file closes the loop from the other side, five ways:
  *
  * 1. **A bounded state sweep** through the SHIPPED callback: every reachable
  *    combination of bracket state, entry-order state, exit-order state,
@@ -37,6 +37,12 @@
  *    found halting the instance permanently with an open position. Terminal
  *    states have no outgoing edge and must not gain one; the VIEW is absorbed
  *    instead.
+ * 5. **Order views over NON-TERMINAL tracked orders** — the complement round 2
+ *    recorded and did not close. An `OPEN` view (or any status this package
+ *    cannot interpret) for an order whose cancel is in flight halted the
+ *    instance while it held the position; review round 3 reproduced it through
+ *    the real runtime and sanctioned ONE machine row for it. The whole
+ *    `(non-terminal track state × view status)` space is swept here.
  */
 
 import { readFileSync } from "node:fs";
@@ -54,6 +60,7 @@ import {
   ORDER_TRIGGERS,
   REASONS,
   TERMINAL_ORDER_STATES,
+  orderTransition,
   staticBracketParamsSchema,
   staticBracketStrategy,
   type InstanceState,
@@ -682,10 +689,15 @@ describe("the shape of the two machines is pinned", () => {
     expect(new Set(INSTANCE_TRIGGERS).size).toBe(INSTANCE_TRIGGERS.length);
   });
 
-  it("declares 8 order states, 9 order triggers and 27 order edges", () => {
+  it("declares 8 order states, 9 order triggers and 28 order edges", () => {
+    // FORCING FINDING r3-B1: 27 -> 28. The review-round-3 remediation added
+    // exactly one row — `CANCEL_PENDING --OBSERVED_WORKING--> CANCEL_PENDING` —
+    // and this pin is the one existing assertion it was allowed to move. No
+    // order STATE and no order TRIGGER was added, and the instance table is
+    // untouched at 11 / 21 / 63.
     expect(ORDER_STATES).toHaveLength(8);
     expect(ORDER_TRIGGERS).toHaveLength(9);
-    expect(ORDER_TRANSITIONS).toHaveLength(27);
+    expect(ORDER_TRANSITIONS).toHaveLength(28);
     expect(TERMINAL_ORDER_STATES).toHaveLength(4);
     // Terminal means terminal: no edge leaves one, not even a self-loop. A fill
     // that arrives for an already-terminal order updates the ALLOCATION through
@@ -698,12 +710,51 @@ describe("the shape of the two machines is pinned", () => {
     }
   });
 
+  it("the ONE row r3-B1 added is the cancel-race self-edge, and it resolves nothing", () => {
+    // The sanctioned fix, asserted as data. `OPEN` is the only status the SDK
+    // lets a root report for an order whose cancel is in flight (there is no
+    // CANCEL_PENDING status in `strategy-sdk`'s `StrategyOrderStatus`), and §6
+    // invariant 6 maps every status this package cannot interpret onto
+    // `OBSERVED_WORKING` — so the trigger is ordinary traffic, not an anomaly.
+    const edge = ORDER_TRANSITIONS.find(
+      (candidate) => candidate.from === "CANCEL_PENDING" && candidate.trigger === "OBSERVED_WORKING",
+    );
+    expect(edge, "CANCEL_PENDING --OBSERVED_WORKING--> must exist").toBeDefined();
+    expect(edge?.to).toBe("CANCEL_PENDING");
+    expect(edge?.basis).toBe(
+      "a still-working view during the cancel race does not resolve the cancel",
+    );
+    // It is a SELF-edge, exactly like the partial-fill row beside it: the cancel
+    // stays unresolved, so nothing downstream may read it as a confirmation.
+    const moved = orderTransition("CANCEL_PENDING", "OBSERVED_WORKING");
+    expect(moved.ok).toBe(true);
+    if (moved.ok) expect(moved.to).toBe("CANCEL_PENDING");
+    // And the inconsistency it closes: the sibling state already had this row.
+    const sibling = ORDER_TRANSITIONS.find(
+      (candidate) =>
+        candidate.from === "SUBMISSION_UNKNOWN" && candidate.trigger === "OBSERVED_WORKING",
+    );
+    expect(sibling?.to).toBe("WORKING");
+    // The cancel path still terminates only on evidence: the three §13.3
+    // terminals plus the fill that lost the race.
+    const leaving = ORDER_TRANSITIONS.filter(
+      (candidate) => candidate.from === "CANCEL_PENDING" && candidate.to !== "CANCEL_PENDING",
+    ).map((candidate) => candidate.to);
+    expect([...leaving].sort()).toEqual(["CANCELED", "EXPIRED", "FILLED", "REJECTED", "SUBMISSION_UNKNOWN"]);
+  });
+
   it("has no duplicate (from, trigger) row, so the table is a function", () => {
     const seen = new Set<string>();
     for (const edge of INSTANCE_TRANSITIONS) {
       const key = `${edge.from}/${edge.trigger}`;
       expect(seen.has(key), `duplicate row ${key}`).toBe(false);
       seen.add(key);
+    }
+    const orderSeen = new Set<string>();
+    for (const edge of ORDER_TRANSITIONS) {
+      const key = `${edge.from}/${edge.trigger}`;
+      expect(orderSeen.has(key), `duplicate order row ${key}`).toBe(false);
+      orderSeen.add(key);
     }
   });
 
@@ -753,6 +804,68 @@ describe("every move() call site names a pair the table contains", () => {
       (match) => evaded[(match.index ?? 0) + "move".length] !== "(",
     );
     expect(caught, "the alias evasion is what this check exists to reject").toHaveLength(1);
+  });
+
+  it("no MEMBER call named `move`, and `./machine.js` is imported by NAME only", () => {
+    // FORCING FINDING r3-L2, and the third demonstrated evasion of this census.
+    // Both checks above deliberately exclude an occurrence preceded by `.`
+    // (`(?<![\w.$])`), because `moveOrder` and English prose would otherwise be
+    // noise — which leaves one idiomatic hole wide open:
+    //
+    //     import * as machineNs from "./machine.js";
+    //     ... machineNs.move(state, "RESUME")
+    //
+    // REPRODUCED at e316782 with a `move` helper added to `machine.ts`: the
+    // whole file stayed green (27/27), the package suite stayed green (299/299)
+    // when the smuggled transition was behaviour-neutral, and `tsc --noEmit`
+    // passed — an unmarked, uncensused transition site in the shipped strategy.
+    //
+    // Two rules close it, both on `decide.ts`:
+    //
+    // 1. no MEMBER access named `move` may be CALLED — `anything.move(` is
+    //    rejected outright, whatever the namespace is called;
+    // 2. the import of `./machine.js` must be a plain NAMED import: no
+    //    `import * as ns`, no `as` renaming (which would let a named import be
+    //    smuggled in under another identifier and escape rule 1 anyway).
+    //
+    // RESIDUAL, stated rather than hidden: this is still lexical, not a parser.
+    // It does not see a member access built at run time (`ns["mo" + "ve"](...)`)
+    // and it does not read the other modules. An author with commit access to
+    // this file can always evade any test in it; what this closes is the
+    // idiomatic, review-invisible route.
+    const code = decideCode();
+
+    const members = [...code.matchAll(/\.\s*move\s*\(/gu)].map((match) => {
+      const line = code.slice(0, match.index ?? 0).split("\n").length;
+      return `line ${String(line)}: ${match[0].trim()}`;
+    });
+    expect(members, "a member call named `move` bypasses the whole census").toEqual([]);
+
+    const imports = [...code.matchAll(/import(?![\w$])([^;]*?)from\s*"\.\/machine\.js"/gu)];
+    expect(imports, "decide.ts must import ./machine.js exactly once").toHaveLength(1);
+    const clause = (imports[0]?.[1] ?? "").trim();
+    expect(clause.startsWith("{"), `namespace or default import of ./machine.js: ${clause}`).toBe(
+      true,
+    );
+    expect(clause.includes("*"), `namespace import of ./machine.js: ${clause}`).toBe(false);
+    expect(
+      /(?<![\w$])as(?![\w$])/u.test(clause),
+      `renamed import of ./machine.js: ${clause}`,
+    ).toBe(false);
+
+    // The two checks have content: each really does reject the reproduction.
+    const withNamespace = `import * as machineNs from "./machine.js";\n${code}\n  machineNs.move(state, "RESUME");\n`;
+    expect([...withNamespace.matchAll(/\.\s*move\s*\(/gu)]).toHaveLength(1);
+    const smuggled = [
+      ...withNamespace.matchAll(/import(?![\w$])([^;]*?)from\s*"\.\/machine\.js"/gu),
+    ].map((match) => match[1]?.trim() ?? "");
+    expect(smuggled.some((entry) => entry.includes("*"))).toBe(true);
+    // ...and a renamed named-import is caught by the same clause rule.
+    const renamed = 'import { instanceTransition as go } from "./machine.js";';
+    const renamedClause = (
+      [...renamed.matchAll(/import(?![\w$])([^;]*?)from\s*"\.\/machine\.js"/gu)][0]?.[1] ?? ""
+    ).trim();
+    expect(/(?<![\w$])as(?![\w$])/u.test(renamedClause)).toBe(true);
   });
 
   it("every marker DECLARES the triggers its site passes, and the table agrees", () => {
@@ -1201,6 +1314,184 @@ describe("a REPEATED view for a terminal tracked order is absorbed, never halted
     );
     expect(stopped.decisionType).toBe("reduce");
     expect(places(stopped)).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. The NON-TERMINAL half of the same surface (r3-B1)
+// ---------------------------------------------------------------------------
+
+/**
+ * THE COMPLEMENT OF THE SWEEP ABOVE, WHICH ROUND 2 LEFT OPEN AND RECORDED.
+ *
+ * Round 2 closed the repeated view over a TERMINAL tracked order and wrote down
+ * what it did not close: `track CANCEL_PENDING + view status OPEN` and the same
+ * with an unrecognised status still HALTED — 2 of the 28
+ * `(non-terminal track state × view status)` shapes, REPRODUCED again at
+ * e316782 by this round before the fix (the other 26 never halted).
+ *
+ * Round 3 confirmed the route is ordinary traffic rather than an anomaly:
+ * `strategy-sdk`'s `StrategyOrderStatus` has no CANCEL_PENDING member, so `OPEN`
+ * is the only status a root can report for an order whose cancel is in flight,
+ * and §6 invariant 6 sends every status this package cannot interpret to the
+ * same trigger. The answer is the sanctioned machine row
+ * `CANCEL_PENDING --OBSERVED_WORKING--> CANCEL_PENDING`, which resolves nothing
+ * and licenses nothing (asserted as data above, and as behaviour below).
+ */
+const NON_TERMINAL_TRACK_STATES: readonly OrderState[] = ORDER_STATES.filter(
+  (state) => !(TERMINAL_ORDER_STATES as readonly string[]).includes(state),
+);
+
+describe("a view for a NON-TERMINAL tracked order never halts either (r3-B1)", () => {
+  it("sweeps every (non-terminal track state × view status) shape with ZERO halts", () => {
+    const halted: string[] = [];
+    const offenders: string[] = [];
+    let evaluated = 0;
+    for (const trackState of NON_TERMINAL_TRACK_STATES) {
+      for (const status of VIEW_STATUSES) {
+        evaluated += 1;
+        const track: OrderTrack = {
+          ...terminalTrack("EXIT", "CANCELED"),
+          state: trackState,
+          viewFilledShares: "0",
+        };
+        const state = stateWith({
+          instanceState: "EXIT_WORKING",
+          legOutcome: "YES",
+          allocatedShares: "50",
+          allocatedCost: "17.5",
+          entriesExecuted: 1,
+          openedAtMs: NOW_MS - 1000,
+          exitOrder: track,
+        });
+        const decision = staticBracketStrategy.onOrderUpdate(
+          context(params(), state, { yesShares: "50" }),
+          {
+            orderId: "order-1",
+            marketId: "018f4a7e-1111-7abc-8def-0123456789ab",
+            outcome: "YES",
+            side: "SELL",
+            price: "0.5",
+            requestedShares: "50",
+            filledShares: "0",
+            status,
+            placedAt: T_NOW,
+          } as never,
+        );
+        if (decision.reasonCodes.includes(REASONS.halted)) {
+          halted.push(`${trackState}/${status}`);
+        }
+        // §6 invariant 13 over the widened surface: absorbing the cancel race
+        // may not become a route to a placement, alone or beside a cancel.
+        if (places(decision) > 0 || (cancels(decision) > 0 && places(decision) > 0)) {
+          offenders.push(`${trackState}/${status}`);
+        }
+      }
+    }
+    // 4 non-terminal track states x 7 view statuses.
+    expect(evaluated).toBe(28);
+    // Was `["CANCEL_PENDING/OPEN", "CANCEL_PENDING/SOMETHING_NEW"]` at e316782.
+    expect(halted).toEqual([]);
+    expect(offenders).toEqual([]);
+  });
+
+  it("the cancel race stays a cancel race: a working view resolves nothing", () => {
+    // The self-edge must not be readable as a confirmation. After an `OPEN`
+    // view for an order whose cancel is in flight the track is STILL
+    // CANCEL_PENDING, the instance still holds its allocation, and the next
+    // evaluation still refuses to place — SB.AWAITING_CANCEL_CONFIRMATION.
+    for (const status of ["OPEN", "PARTIALLY_FILLED", "whatever"]) {
+      const track: OrderTrack = {
+        ...terminalTrack("EXIT", "CANCELED"),
+        state: "CANCEL_PENDING",
+        viewFilledShares: "0",
+      };
+      const state = stateWith({
+        instanceState: "EXIT_WORKING",
+        legOutcome: "YES",
+        allocatedShares: "50",
+        allocatedCost: "17.5",
+        entriesExecuted: 1,
+        openedAtMs: NOW_MS - 1000,
+        exitOrder: track,
+      });
+      const views = { yesShares: "50", features: { [STOP_KEY]: "0.1" } };
+      const raced = staticBracketStrategy.onOrderUpdate(context(params(), state, views), {
+        orderId: "order-1",
+        marketId: "018f4a7e-1111-7abc-8def-0123456789ab",
+        outcome: "YES",
+        side: "SELL",
+        price: "0.5",
+        requestedShares: "50",
+        filledShares: "0",
+        status,
+        placedAt: T_NOW,
+      } as never);
+      expect(raced.reasonCodes, status).not.toContain(REASONS.halted);
+      const after = nextState(state, raced);
+      expect((after.exitOrder as OrderTrack).state, status).toBe("CANCEL_PENDING");
+      expect(after.allocatedShares, status).toBe("50");
+      expect(after.instanceState, status).toBe("EXIT_WORKING");
+
+      // §6 invariant 13 on the very next evaluation, with the stop deep in the
+      // money: no reduction, and no SECOND cancel for the cancel already sent.
+      const next = staticBracketStrategy.onFeatures(context(params(), after, views));
+      expect(places(next), status).toBe(0);
+      expect(cancels(next), status).toBe(0);
+      expect(next.reasonCodes, status).toContain(REASONS.awaitingCancel);
+      expect(next.reasonCodes, status).not.toContain(REASONS.halted);
+    }
+  });
+
+  it("neither planTakeProfit nor planProtectedReduce places over the widened surface", () => {
+    // §6 invariant 13 asserted on BOTH exit builders, on both economic legs and
+    // in both exit-hosting bracket states, with an unresolved cancel in flight.
+    // The take-profit path is reached with the stop quiet; the protected-reduce
+    // path with the stop deep in the money.
+    for (const leg of ["YES", "NO"] as const) {
+      for (const instanceState of ["EXIT_PLANNED", "EXIT_WORKING"] as const) {
+        for (const stop of [undefined, { [STOP_KEY]: "0.1" }]) {
+          const complement = leg === "NO";
+          const track: OrderTrack = {
+            kind: "EXIT",
+            intentId: "sb-take-profit-1",
+            orderId: "order-2",
+            state: "CANCEL_PENDING",
+            outcome: leg,
+            side: complement ? "BUY" : "SELL",
+            limitPrice: "0.5",
+            // Deliberately STALE: the allocation has moved, so the take-profit
+            // path wants to replace this order and must not be allowed to.
+            requestedShares: "20",
+            filledShares: "0",
+            viewFilledShares: "0",
+            placedAtMs: NOW_MS - 500,
+            escalated: false,
+          };
+          const state = stateWith({
+            instanceState,
+            legOutcome: leg,
+            allocatedShares: "50",
+            allocatedCost: "17.5",
+            legBaselineShares: complement ? "100" : "0",
+            entriesExecuted: 1,
+            openedAtMs: NOW_MS - 1000,
+            exitOrder: track,
+          });
+          const label = `${leg}/${instanceState}/${stop === undefined ? "quiet" : "stop"}`;
+          const decision = staticBracketStrategy.onFeatures(
+            context(params(PREFERRING), state, {
+              ...(complement ? { noShares: "50" } : { yesShares: "50" }),
+              ...(stop === undefined ? {} : { features: stop }),
+            }),
+          );
+          expect(places(decision), label).toBe(0);
+          expect(cancels(decision), label).toBe(0);
+          expect(decision.reasonCodes, label).toContain(REASONS.awaitingCancel);
+          expect(decision.reasonCodes, label).not.toContain(REASONS.halted);
+        }
+      }
+    }
   });
 });
 

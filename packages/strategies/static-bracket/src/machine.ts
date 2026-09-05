@@ -596,6 +596,12 @@ export const ORDER_TRANSITIONS: readonly OrderTransition[] = Object.freeze([
   },
   {
     from: "CANCEL_PENDING",
+    trigger: "OBSERVED_WORKING",
+    to: "CANCEL_PENDING",
+    basis: "a still-working view during the cancel race does not resolve the cancel",
+  },
+  {
+    from: "CANCEL_PENDING",
     trigger: "OBSERVED_EXPIRED",
     to: "EXPIRED",
     basis: "observed terminal",

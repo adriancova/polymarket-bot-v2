@@ -1703,6 +1703,29 @@ function planTakeProfit(
  * this many shares, this side, this price bound. It is the same shape
  * {@link planTakeProfit} already emits, so both exits are read the same way.
  *
+ * WHAT THE SHAPE CHANGE COSTS, STATED WHERE IT IS MADE (two disclosures, both
+ * carried in full in this package's README):
+ *
+ * 1. RE-EMISSION COMPOUNDS. A `REDUCE_POSITION`'s `targetShares` is a LEVEL, so
+ *    re-planning "sell down to 0" on five consecutive evaluations collapsed to
+ *    one action. A DELTA does not: five evaluations plan five times the
+ *    allocation. Nothing in this package prevents that — a reduction creates no
+ *    order track, because there is no venue order id to track until the OMS
+ *    answers — and what contains it is §9.10's "reserve collateral/inventory
+ *    before submission" responsibility (`RESERVE_BEFORE_SUBMISSION` on every
+ *    plan), whose reservations make the second and later plans refuse with
+ *    `PLAN_INVENTORY_INSUFFICIENT`. That is a composition-root obligation, and
+ *    it is listed as one rather than assumed.
+ * 2. THE RISK SEAM READS IT AS AN ENTRY. `packages/risk` derives disposition
+ *    from the intent TYPE alone, so a `POSITION` — this one included — is
+ *    `ENTRY` and a protective reduction gets entry treatment: the §9.8 check-20
+ *    time-to-close entry gate, the CLOSE_ONLY block, the entry-shaped stale-book
+ *    refusal, and (with the default `requirePositiveNetEdgeForEntries`) a
+ *    refusal for the `expectedNetEdge` no exit here carries. The direction is
+ *    fail-closed — a refused exit, never a wrong order — which is why the
+ *    deviation stands; correcting it needs the planner and the risk contract,
+ *    not this file.
+ *
  * INTERPRETATION — the fields `PositionIntent` requires and
  * `ReducePositionIntent` does not have:
  *

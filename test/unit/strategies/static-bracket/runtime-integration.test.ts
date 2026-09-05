@@ -545,6 +545,152 @@ describe("through the real runtime — the stale-data path", () => {
   });
 });
 
+/**
+ * THE CANCEL RACE (r3-B1), DRIVEN THROUGH THE REAL RUNTIME.
+ *
+ * The exact route review round 3 reproduced: a resting take-profit, a stop, the
+ * safety cancel it issues — and then ONE ORDINARY ORDER VIEW saying the order is
+ * still `OPEN`, which is the only thing a root CAN say about an order whose
+ * cancel is in flight (`strategy-sdk`'s `StrategyOrderStatus` has no
+ * CANCEL_PENDING member) and which §6 invariant 6 also makes the destination of
+ * every status this package cannot interpret.
+ *
+ * At e316782 that view HALTED the instance while it held 50 shares, with the
+ * stop, the holding timeout and the close cutoff all dead behind `planTick`'s
+ * halt short-circuit — `illegal order transition CANCEL_PENDING
+ * --OBSERVED_WORKING-->`. The sanctioned self-edge absorbs it: the cancel stays
+ * unresolved, the instance keeps its position and its protections, and the stop
+ * fires the moment the cancel is confirmed.
+ */
+describe("through the real runtime — an ordinary view during the cancel race", () => {
+  const STOPPING: ViewOptions = { yesShares: "50", features: { [STOP_KEY]: "0.2" } };
+  const restingExit = (overrides: Record<string, unknown> = {}) =>
+    order({ orderId: "order-2", side: "SELL", price: "0.5", requestedShares: "50", ...overrides });
+
+  /** Enter, fill, rest a take-profit, then stop out and cancel it. */
+  function upToTheCancel(runtime: StrategyInstanceRuntime): void {
+    step(runtime, "onStart");
+    step(runtime, "onFeatures", { features: { [TRIGGER_KEY]: "0.35" } });
+    step(runtime, "onOrderUpdate", { orders: [order()] }, { order: order() });
+    step(runtime, "onFill", { yesShares: "50" }, fillPayload());
+    step(
+      runtime,
+      "onOrderUpdate",
+      { yesShares: "50", orders: [restingExit()] },
+      { order: restingExit() },
+    );
+  }
+
+  for (const status of ["OPEN", "whatever"]) {
+    it(`a "${status}" view neither halts nor resolves the cancel, and the stop still fires`, () => {
+      const { runtime, store } = harness();
+      upToTheCancel(runtime);
+      expect(currentState(store)["instanceState"]).toBe("EXIT_WORKING");
+
+      const cancelled = step(runtime, "onFeatures", { ...STOPPING, orders: [restingExit()] });
+      expect(cancelled.kind === "DECIDED" && cancelled.record.decision.decisionType).toBe("cancel");
+      expect(cancelled.kind === "DECIDED" && cancelled.record.decision.reasonCodes).toContain(
+        "SB.SAFETY_CANCEL",
+      );
+      const cancelling = currentState(store);
+      expect((cancelling["exitOrder"] as Record<string, unknown>)["state"]).toBe("CANCEL_PENDING");
+      // The position is necessarily still held on this route: the reduction is
+      // withheld until the withdrawal is confirmed (§6 invariant 13).
+      expect(cancelling["allocatedShares"]).toBe("50");
+
+      // THE VIEW. Ordinary traffic, and formerly fatal.
+      const raced = step(
+        runtime,
+        "onOrderUpdate",
+        { ...STOPPING, orders: [restingExit({ status })] },
+        { order: restingExit({ status }) },
+      );
+      expect(raced.kind === "DECIDED" && raced.record.decision.reasonCodes).not.toContain(
+        "SB.HALTED",
+      );
+      const after = currentState(store);
+      expect(after["instanceState"]).toBe("EXIT_WORKING");
+      expect(after["haltReason"]).toBeNull();
+      expect(after["allocatedShares"]).toBe("50");
+      // Still CANCEL_PENDING: a working view is not a cancel confirmation.
+      expect((after["exitOrder"] as Record<string, unknown>)["state"]).toBe("CANCEL_PENDING");
+
+      // The protections are alive — and §6 invariant 13 still holds: no
+      // reduction, and no second cancel, while the first is unconfirmed.
+      const waiting = step(runtime, "onFeatures", STOPPING);
+      expect(waiting.kind === "DECIDED" && waiting.record.decision.reasonCodes).toContain(
+        "SB.STOP_TRIGGERED",
+      );
+      expect(waiting.kind === "DECIDED" && waiting.record.decision.reasonCodes).toContain(
+        "SB.AWAITING_CANCEL_CONFIRMATION",
+      );
+      expect(waiting.kind === "DECIDED" && waiting.record.decision.intents).toHaveLength(0);
+
+      // The venue confirms the cancel; only now does the stop act.
+      step(
+        runtime,
+        "onOrderUpdate",
+        { ...STOPPING, orders: [restingExit({ status: "CANCELED" })] },
+        { order: restingExit({ status: "CANCELED" }) },
+      );
+      const stopped = step(runtime, "onFeatures", STOPPING);
+      expect(stopped.kind === "DECIDED" && stopped.record.decision.decisionType).toBe("reduce");
+      if (stopped.kind === "DECIDED") {
+        const reduction = protectedReductions(stopped.record.decision)[0];
+        expect(reduction).toBeDefined();
+        expect((reduction as { direction: string }).direction).toBe("YES");
+        expect((reduction as { targetShares: string }).targetShares).toBe("-50");
+        expect((reduction as { minimumSellPrice?: string }).minimumSellPrice).toBe("0.26");
+      }
+      expect(currentState(store)["haltReason"]).toBeNull();
+    });
+  }
+
+  it("is byte-identical across repeats and run seeds over the cancel-race route", () => {
+    const script = (runSeed: string): string => {
+      const clock = new ManualClock();
+      const sink = new RecordingSink();
+      const created = createStrategyInstanceRuntime({
+        strategy: staticBracketStrategy,
+        params: baseConfig(),
+        run: { runId: RUN_ID, instanceId: INSTANCE_ID, configId: CONFIG_ID, runSeed },
+        watchdog: { evaluationBudgetUs: 500_000 },
+        clock,
+        decisionSink: sink,
+        checkpointStore: new RecordingStore(),
+      });
+      if (!created.ok) throw new Error("the runtime must accept the configuration");
+      const runtime = created.runtime;
+      upToTheCancel(runtime);
+      step(runtime, "onFeatures", { ...STOPPING, orders: [restingExit()] });
+      step(
+        runtime,
+        "onOrderUpdate",
+        { ...STOPPING, orders: [restingExit({ status: "OPEN" })] },
+        { order: restingExit({ status: "OPEN" }) },
+      );
+      step(runtime, "onFeatures", STOPPING);
+      step(
+        runtime,
+        "onOrderUpdate",
+        { ...STOPPING, orders: [restingExit({ status: "CANCELED" })] },
+        { order: restingExit({ status: "CANCELED" }) },
+      );
+      step(runtime, "onFeatures", STOPPING);
+      return JSON.stringify(sink.calls.map((call) => call.record.decision));
+    };
+    const first = script(RUN_SEED);
+    expect(script(RUN_SEED)).toBe(first);
+    expect(script("999999999")).toBe(first);
+    // The route really is the one described: a cancel, a working view absorbed
+    // during the race, and a reduction only afterwards.
+    expect(first).toContain("SB.SAFETY_CANCEL");
+    expect(first).toContain("SB.AWAITING_CANCEL_CONFIRMATION");
+    expect(first).toContain("sb.protected-reduce");
+    expect(first).not.toContain("SB.HALTED");
+  });
+});
+
 describe("through the real runtime — determinism and safety", () => {
   it("is byte-identical across two runtimes with different seeds", () => {
     const script = (): string => {

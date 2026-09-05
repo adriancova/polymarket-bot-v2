@@ -16,6 +16,7 @@ import { describe, expect, it } from "vitest";
 import type { DecisionResult, Intent } from "../../../../packages/domain/src/index.js";
 import {
   REASONS,
+  compare,
   staticBracketParamsSchema,
   staticBracketStrategy,
   type OrderTrack,
@@ -111,10 +112,21 @@ function assertReducesExposure(
   const entrySign = entry.targetShares.startsWith("-") ? -1 : 1;
   const exitSign = position.targetShares.startsWith("-") ? -1 : 1;
   expect(exitSign, "an exit must trade the opposite way to its entry").toBe(-entrySign);
-  const magnitude = position.targetShares.replace("-", "");
-  expect(Number(magnitude), "an exit may never exceed the confirmed open allocation").toBeLessThanOrEqual(
-    Number(open),
-  );
+  // NOTE-1 (r3): §6 invariant 1 — economics are compared as EXACT DECIMALS,
+  // never through `Number()`. The magnitudes here are small today, but a test
+  // that reads a share count as a float is exactly the habit the invariant
+  // exists to forbid, and it would silently stop discriminating at 17 digits.
+  // `compare` is the package's own exact comparison (a guarded
+  // `compareDecimal`), and it returns an Outcome rather than throwing.
+  const magnitude = position.targetShares.startsWith("-")
+    ? position.targetShares.slice(1)
+    : position.targetShares;
+  const bounded = compare(magnitude, open, "exit magnitude");
+  expect(bounded.ok, "both magnitudes must be canonical decimals").toBe(true);
+  expect(
+    bounded.ok ? bounded.value : 1,
+    "an exit may never exceed the confirmed open allocation",
+  ).toBeLessThanOrEqual(0);
   // A SELL exit is bounded below and a BUY exit above; never both, never neither.
   const floors = [position.minimumSellPrice, position.maximumBuyPrice].filter(
     (bound) => bound !== undefined,

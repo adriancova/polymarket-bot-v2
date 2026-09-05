@@ -331,6 +331,108 @@ describe("§6 invariant 12 — no blind flatten", () => {
     expect(decision.intents.filter((intent) => intent.type === "REDUCE_POSITION")).toHaveLength(0);
   });
 
+  /**
+   * THE RAW-HOLDING HALF OF `positionCovers` (r2-L2), PINNED (r3-L1).
+   *
+   * The gate was added by the round-2 remediation and then covered by nothing:
+   * review round 3 deleted it and all 299 tests passed. It is REACHABLE and
+   * BEHAVIOUR-CHANGING, which is what makes the hole matter:
+   *
+   * - `legBaselineShares` is written as `held − allocated` at the first entry
+   *   fill, so a position view that lags that fill records a NEGATIVE baseline;
+   *   `readDecimalField` also admits a negative on rehydration (the documents
+   *   below are read through the shipped state reader, and none of them halts
+   *   on an unreadable field);
+   * - a negative baseline inflates every later `legExposure` reading by the lag,
+   *   which SATISFIES the exposure half of `positionCovers` — the
+   *   over-permissive direction. With the raw half deleted, each shape below
+   *   emits `SELL 50 YES` while the account holds fewer than 50 (0, in the first
+   *   shape). With it, each refuses and reconciles.
+   *
+   * MUTATION: deleting the raw half makes every case here fail.
+   */
+  it("refuses a SELL-side take-profit the RAW holding cannot cover (r2-L2 / r3-L1)", () => {
+    const shapes: readonly (readonly [string, string])[] = [
+      ["-50", "0"],
+      ["-50", "30"],
+      ["-20", "30"],
+      ["-50", "49"],
+      ["-1", "49"],
+    ];
+    for (const [baseline, held] of shapes) {
+      const label = `baseline ${baseline}, held ${held}`;
+      const state = stateWith({
+        instanceState: "OPEN",
+        allocatedShares: "50",
+        allocatedCost: "17.5",
+        legOutcome: "YES",
+        legBaselineShares: baseline,
+        entriesExecuted: 1,
+        openedAtMs: NOW_MS - 1000,
+      });
+      const decision = staticBracketStrategy.onFeatures(
+        context(params(), state, { yesShares: held }),
+      );
+      // No intent at all — not a take-profit, not a reduction, not a cancel
+      // (nothing is resting to cancel).
+      expect(decision.intents, label).toHaveLength(0);
+      expect(decision.decisionType, label).toBe("hold");
+      expect(decision.reasonCodes, label).toContain(REASONS.positionMismatch);
+      expect(decision.reasonCodes, label).toContain(REASONS.noBlindFlatten);
+      expect(decision.reasonCodes, label).toContain(REASONS.paused);
+      // The document really was READ (the reader accepts a negative decimal),
+      // so this is a refusal by the gate and not a refusal by the parser.
+      expect(decision.reasonCodes, label).not.toContain(REASONS.halted);
+      const patch = decision.statePatch as Record<string, unknown>;
+      expect(patch["instanceState"], label).toBe("PAUSED");
+      expect(patch["legBaselineShares"], label).toBe(baseline);
+    }
+  });
+
+  it("the raw-holding gate does NOT narrow a bracket that really holds its allocation", () => {
+    // Discrimination: the same shapes with an honest baseline pass the gate, so
+    // the refusals above are the gate doing its job rather than the fixture
+    // being unreachable. A BUY-side (complement) exit spends collateral rather
+    // than shares and is deliberately outside the raw check.
+    const direct = staticBracketStrategy.onFeatures(
+      context(
+        params(),
+        stateWith({
+          instanceState: "OPEN",
+          allocatedShares: "50",
+          allocatedCost: "17.5",
+          legOutcome: "YES",
+          legBaselineShares: "0",
+          entriesExecuted: 1,
+          openedAtMs: NOW_MS - 1000,
+        }),
+        { yesShares: "50" },
+      ),
+    );
+    expect(direct.decisionType).toBe("exit");
+    expect(direct.intents).toHaveLength(1);
+
+    const complement = staticBracketStrategy.onFeatures(
+      context(
+        params(),
+        stateWith({
+          instanceState: "OPEN",
+          allocatedShares: "50",
+          allocatedCost: "17.5",
+          legOutcome: "NO",
+          // Short 50 NO against an inventory of 100: the exit BUYS NO back, and
+          // the raw holding of NO is irrelevant to whether it may.
+          legBaselineShares: "100",
+          entriesExecuted: 1,
+          openedAtMs: NOW_MS - 1000,
+        }),
+        { noShares: "50" },
+      ),
+    );
+    expect(complement.decisionType).toBe("exit");
+    expect(complement.intents).toHaveLength(1);
+  });
+
   it("pauses on a fill it cannot attribute to one of its own intents (§6 invariant 7)", () => {
     const decision = staticBracketStrategy.onFill(
       context(params(), open, { yesShares: "50" }),

@@ -101,6 +101,89 @@ posture is unchanged, `partialFillPolicy: ACCEPT_ANY`, `validUntil`) as a marked
 INTERPRETATION, and states what is lost: the reduction's free-text `reason`,
 which survives as reason codes and `modelOutputs.reduceCause`.
 
+### What that costs at the risk seam: **every exit arrives as an `ENTRY`**
+
+This is the disclosed price of the decision above, and it is stated here rather
+than left for someone to discover in an incident.
+
+`packages/risk`'s `intent-view.ts` derives the risk DISPOSITION from the intent
+**type alone**: `CANCEL → CANCEL`, `REDUCE_POSITION → EXIT`, and
+`POSITION | QUOTE | BASKET → ENTRY`. Because this strategy emits every exit as a
+`POSITION` delta, **its protective reductions are classified `ENTRY` by the
+merged risk engine** — verified through the real `buildIntentView`, which
+answers `disposition: ENTRY` for both the `sb.take-profit` and the
+`sb.protected-reduce` intent. The classification is deliberately fail-closed on
+the risk side (entry treatment can only refuse more), so the consequence is
+never a wrong order; it is a **refused protective exit**, and these are the four
+places it bites (reproduced end to end through the merged `evaluateIntent` by
+review round 3, and readable in `engine.ts`'s `isEntry` branches):
+
+| Situation | What happens to a protective reduction from this strategy |
+|---|---|
+| Inside the configured entry cutoff before close | `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` — the §9.8 check-20 time-to-close gate applies its *entry* half |
+| Market is `CLOSE_ONLY` | `RISK_MARKET_CLOSE_ONLY` — blocked, though a reduction is exactly what a close-only market still permits |
+| Venue book stale | refused as `RISK_BOOK_STALE` instead of `RISK_BOOK_STALE_NO_BLIND_REDUCTION`, and the `POSITION_STATE_UNKNOWN` incident recommendation the reduction path adds is **not** raised |
+| Default policy `economics.requirePositiveNetEdgeForEntries: true` | §9.8 check 12 demands `expectedNetEdge`, which no exit of this strategy carries, so **every exit is refused** (`RISK_EDGE_INPUTS_MISSING`) |
+
+The last row is **half pre-existing**: the take-profit was already a `POSITION`
+without an `expectedNetEdge` at `b17d461`, so that refusal predates the
+round-2 change; what round 2 added is the *protected reduction* to the same
+treatment.
+
+§9.8 check 20 ("time-to-close policy permits **entry or reduction**") and §9.9's
+ladder — `HALT_NEW_ENTRIES` above `PROTECTED_REDUCE` — both depend on telling an
+entry from a reduction, and a strategy whose exits are indistinguishable from
+entries erases that distinction for its own intents.
+
+**The deviation stands anyway**, and the reason is the whole of it: the
+alternatives put *wrong orders on the wire* (a `REDUCE_POSITION` becomes a
+second entry on the complement leg, and sells inventory this bracket never
+opened on either leg — both reproduced through the merged planner, above). A
+refusal is strictly better than a wrong order. Closing it properly is a
+**cross-package** change and is carried as follow-up:
+
+- `packages/execution-planner`'s `buildReductionPlan` must honour
+  `maximumBuyPrice` and must not act on sides the intent did not name; and/or a
+  domain ADR adding a `direction` to §7.7's `ReducePositionIntent`;
+- `packages/risk`'s intent-view mapping needs a way to recognise a **protective
+  reduction**. The `sb.protected-reduce` tag already exists on the intent;
+  whether the risk engine may read intent TAGS is a contract question for that
+  round, not a decision this package may take.
+
+### Re-emitting an exit **compounds**: it is a delta, not a level
+
+At `b17d461` an exit was a `REDUCE_POSITION`, whose `targetShares` is a LEVEL:
+re-emitting "sell down to 0" five times collapsed to one action, so a strategy
+that re-planned its exit on five consecutive evaluations was idempotent by
+construction.
+
+**That is no longer true.** Every exit is now a signed `POSITION` **DELTA**, and
+five evaluations that each plan a reduction plan `5 × 50 = 250` shares against a
+50-share allocation. Nothing inside this package prevents that: the strategy
+does not track intents in flight across evaluations, and a protected reduction
+deliberately does not create an order track (there is no venue order id to track
+until the OMS answers).
+
+What contains it today is the **execution planner**, and only the planner:
+§9.10's own responsibility — "reserve collateral/inventory before submission",
+which `packages/execution-planner` carries on every plan as
+`reservationRule: "RESERVE_BEFORE_SUBMISSION"` — makes each accepted plan
+reserve the inventory it will spend, and the second and later reductions are
+then refused with `PLAN_INVENTORY_INSUFFICIENT` (reviewer-verified through the
+merged planner).
+That is a real mechanism, not an accident — but it is *someone else's*
+mechanism, so it is written down here as an obligation on the wiring rather than
+assumed:
+
+> **A reservation taken by an accepted plan must be honoured before the next
+> evaluation's reduction is planned.** A composition root that plans from stale
+> inventory — or that drops reservations between evaluations — turns a repeated
+> protective exit into a multiple of the position.
+
+No code changed for this in review round 3: the containment is the planner's
+stated responsibility, and duplicating it inside the strategy would put two
+authorities on the same rule.
+
 ## The `btc-15m-updown` caveat (carried from `WP-110`)
 
 §13.2's example binds `market_selector.series_id: btc-15m-updown`. **That series
@@ -169,11 +252,29 @@ here because a wiring that breaks one produces a *quiet* misbehaviour.
    fail-safe — a frozen live order blocks new entries (see the in-flight guard
    in `planEntry`) rather than causing one — but it is a real obligation on the
    wiring, and it is listed here rather than left implicit.
-5. **A repeated order view is ordinary traffic.** Nothing in §8.1 or §9.6
-   promises at-most-once delivery, so a second `FILLED`/`CANCELED` view for an
-   order the instance already tracks as terminal is *absorbed*: the evidence is
-   folded, the sub-machine is not consulted, and the instance does not halt.
-   Roots may redeliver freely.
+5. **A repeated order VIEW is ordinary traffic; a repeated FILL is not.** The
+   two halves of this obligation point in opposite directions and are stated
+   separately because one paragraph covering both would be read as covering
+   both.
+   - **Order views are idempotent and repeat-safe.** Nothing in §8.1 or §9.6
+     promises at-most-once delivery, so a second `FILLED`/`CANCELED` view for an
+     order the instance already tracks as terminal is *absorbed* (the evidence
+     is folded, the sub-machine is not consulted, the instance does not halt),
+     and a view that says an order is still `OPEN` while its cancel is in flight
+     is absorbed by the sub-machine's own cancel-race self-edge. **Roots may
+     redeliver views freely.**
+   - **Fills must be delivered AT MOST ONCE.** A `StrategyFill` is settlement
+     evidence, and the fold that consumes it ADDS: redelivering one fill of 50
+     shares makes the instance believe it holds 100, which then sizes its exit
+     at 100 (§13.3 rule 1 is computed from the fold, and the fold is the only
+     writer). This package cannot tell a redelivered fill from a second real
+     one — §7.7 gives a fill no identity the strategy could deduplicate on
+     beyond its order id, and one order legitimately fills many times — so
+     **de-duplicating the fill stream is the composition root's obligation**
+     (`WP-230`). It is not new to the delta-shaped exits: the ordinary entry
+     path has always double-counted a redelivered fill. Whether the runtime seam
+     should carry a fill identity at all is recorded as follow-up rather than
+     guessed at here.
 6. **Views must be fresh or copied per evaluation** (WP-170 `follow_up` 2), and
    `StrategyContextRevokedError` must not be swallowed.
 7. **`StrategyOrderView.filledShares` is read as EVIDENCE, never as
@@ -191,31 +292,48 @@ here because a wiring that breaks one produces a *quiet* misbehaviour.
    root that withholds fills from a paused instance leaves it believing it holds
    less than it does — the one direction this package cannot defend against,
    because it never sees the event.
+9. **A reservation an accepted plan took must be honoured before the next
+   evaluation's reduction is planned.** Every exit is a signed DELTA, so
+   re-planning a protective exit on consecutive evaluations names the allocation
+   again each time; §9.10's `RESERVE_BEFORE_SUBMISSION` rule is what turns the
+   second and later ones into `PLAN_INVENTORY_INSUFFICIENT` refusals. See
+   "Re-emitting an exit **compounds**" above for the whole of it.
 
-## Known exposure: an `OPEN` view while a cancel is in flight HALTS
+## Closed in review round 3: the cancel race no longer halts
 
-`CANCEL_PENDING --OBSERVED_WORKING-->` is not an edge of the §13.3 working-order
-sub-machine, and `planOrderUpdate` halts on an illegal sub-machine move. So a
-view with `status: "OPEN"` — or any status this package does not recognise,
-which is read as `OBSERVED_WORKING` per §6 invariant 6 — that arrives for an
-order whose cancel has been requested but not yet confirmed halts the instance.
-That is an ordinary venue message: the order really is still open until the
-cancel is processed.
+Round 2 recorded a known exposure here: a view with `status: "OPEN"` — or any
+status this package does not recognise, which is read as `OBSERVED_WORKING` per
+§6 invariant 6 — arriving for an order whose cancel had been requested but not
+yet confirmed HALTED the instance, because
+`CANCEL_PENDING --OBSERVED_WORKING-->` was not an edge of the §13.3
+working-order sub-machine and `planOrderUpdate` halts on an illegal move. Two of
+the 28 `(non-terminal track state × view status)` shapes.
 
-**This is not fixed here.** It is not one of the review findings this round was
-authorised to remediate, and closing it needs either a new sub-machine edge
-(which moves the pinned machine counts) or a second absorption branch — both
-changes a reviewer should see proposed rather than smuggled into a remediation.
-It is reproduced and recorded so the next round can decide:
+Review round 3 reproduced it through the **real WP-170 runtime** — stop →
+`SB.SAFETY_CANCEL` → one ordinary `OPEN` view → `SB.HALTED` holding 50 shares,
+with the stop, the holding timeout and the close cutoff all dead — and
+sanctioned **one** machine row for it:
 
 ```
-track CANCEL_PENDING + view status OPEN            -> SB.HALTED
-track CANCEL_PENDING + unrecognised view status    -> SB.HALTED
+CANCEL_PENDING --OBSERVED_WORKING--> CANCEL_PENDING
+  "a still-working view during the cancel race does not resolve the cancel"
 ```
 
-Two of the 28 `(non-terminal track state × view status)` shapes. The repeated
-**terminal**-view halt this round did fix is separately swept in
-`machine-closure.test.ts` (1,008 shapes, zero halts).
+It is a SELF-edge, deliberately: a working view is not a cancel confirmation, so
+the cancel stays unresolved and §6 invariant 13 keeps holding — no replacement,
+no second cancel, no reduction until the venue confirms the withdrawal
+(`SB.AWAITING_CANCEL_CONFIRMATION`). It is also the row the sub-machine was
+already inconsistent for want of: `SUBMISSION_UNKNOWN --OBSERVED_WORKING-->
+WORKING` has always existed. `OPEN` is the ONLY status a root can report for an
+order whose cancel is in flight — `strategy-sdk`'s `StrategyOrderStatus` has no
+CANCEL_PENDING member — so this is ordinary traffic, not an anomaly.
+
+The pinned order-machine counts move with it, and nothing else does: **8 order
+states, 9 order triggers, 28 order edges** (27 before), instance table unchanged
+at 11 states / 21 triggers / 63 edges. `machine-closure.test.ts` sweeps the 28
+non-terminal shapes (zero halts, from two) beside the 1,008 terminal ones, and
+`runtime-integration.test.ts` drives the exact route: not halted, still
+`CANCEL_PENDING`, and the stop fires the moment the cancel confirms.
 
 ## Known exposure: numeric-index prototype pollution
 
