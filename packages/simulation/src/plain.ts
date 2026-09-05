@@ -348,7 +348,7 @@ function readArray(container: object, path: string, depth: number, state: ReadSt
  * | a FUNCTION (a digest, a core loop) | no | same |
  * | BYTES (`Uint8Array`) | no | `strict-json.ts` is the D1 reader for wire bytes and BUILDS its tree as it parses |
  * | a PRIMITIVE (an id, a decimal string, a count) | no | there is nothing to adopt, and the grammar predicates are total |
- * | a value THIS PACKAGE built (a `LoadedDataset`, a `ReplayRecord`) | no | it is already an own frozen tree, built by the door that materialized what it came from |
+ * | a value THIS PACKAGE built (a `LoadedDataset`, a `ReplayRecord`) | no | its LEAVES were materialized by the door that admitted them. For `ReplayRecord` the tree is also frozen; a `LoadedDataset` container is NOT frozen (round-5 review LOW-1/LOW-2 measured `loaded.records` live and mutable) — the reason this row holds is provenance, not frozenness |
  * | the door's own OPTIONS BAG | read ONCE per field | it is a call-site literal; the record each field yields is materialized, so one read cannot be made to disagree with a later one |
  * | `ReplayClock.advanceTo`'s recorded instant — THE CARVE-OUT | read ONCE per field | it runs once per delivered event, so a copy per event is the cost the design refuses; both fields are PRIMITIVES, each is read exactly once into a local, and the method is totality-guarded so a throwing accessor is contained rather than raised |
  *
