@@ -15,11 +15,14 @@
 - Every Claude subagent (wp-implementer, adversarial-reviewer, governance rounds, etc.)
   is launched with an explicit **Opus 5** override (`model: opus`) — subagents never
   inherit the orchestrator's model.
-- Codex CLI reviews run on **SOL** (`gpt-5.6-sol`) — the configured default in
-  `~/.codex/config.toml`; pass `--model gpt-5.6-sol` explicitly if the default ever
-  changes. Codex is used for doc/governance rounds only: its content filter kills
-  reviews containing prototype-pollution/input-validation probe content, so those
-  reviews run in-harness.
+- Codex CLI reviews run on **Astra** (`gpt-6-astra`, medium reasoning) — operator
+  switch 2026-09-05 after the rollout probe succeeded (`codex exec -m gpt-6-astra`
+  answered; `astra` and `gpt-5.7-astra` still return the server-side 400 on a
+  ChatGPT account). Pass `--model gpt-6-astra` explicitly. Fallback if Astra
+  regresses: **SOL** (`gpt-5.6-sol`), the previous policy model. Codex is used for
+  doc/governance rounds only: its content filter kills reviews containing
+  prototype-pollution/input-validation probe content (content-triggered — a model
+  switch does NOT lift it), so those reviews run in-harness.
 - A subagent killed by a rate limit or model switch must NOT be resumed (it would keep
   its original model): launch a FRESH agent with the same packet plus a progress
   summary, pointed at the dead agent's worktree only if it left committed work.
