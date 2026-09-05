@@ -3,13 +3,17 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder library scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Static Bracket, the first strategy (WP-220, handoff §13). Pure, deterministic, side-effect-free; emits intents only. Not presumed profitable.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/strategy-sdk": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.9.2"
