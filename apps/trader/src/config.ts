@@ -296,6 +296,45 @@ const ScenarioConfigSchema = z.strictObject({
   yesPriceShock: CanonicalDecimal,
 });
 
+/**
+ * The §12.5 run pins the simulated venue is constructed from.
+ *
+ * > "Every replay run pins: … normalizer version, feature-set version, … run
+ * > seed, **fill-model version and parameters**, latency-model version and
+ * > parameters, **fee/reward snapshot versions**, settlement-spec versions."
+ *   — handoff §12.5
+ *
+ * REQUIRED, every field, with NO default. A run whose fill model was chosen by
+ * a default is a run nobody can reproduce or compare, which defeats §12.4
+ * before the first event arrives — and ADR-012's evidence hierarchy rests on
+ * knowing exactly which model produced a number.
+ *
+ * The FEE SNAPSHOT is operator-stated for the same §6 invariant 9 reason the
+ * market parameters are: "historical runs use historical parameters", and a
+ * process that read today's fee schedule into a replay of last week would be
+ * reporting a counterfactual.
+ */
+const SimulationConfigSchema = z.strictObject({
+  /** §12.5's fill-model version pin. Carried on EVERY simulated fill. */
+  fillModelVersion: CodeString,
+  /** Content identity of §12.5's fill-model parameters. */
+  fillModelParametersHash: z.string().regex(/^[0-9a-f]{64}$/u, {
+    message: "must be 64 lowercase hexadecimal characters",
+  }),
+  /** §6 invariant 9 / §12.5: the fee schedule this run books against. */
+  feeSchedule: z.strictObject({
+    snapshotVersion: CodeString,
+    takerFeeRate: NonNegativeDecimal,
+    makerFeeRate: NonNegativeDecimal,
+    roundingDecimalPlaces: z.number().int().min(0).max(18),
+    roundingMode: z.enum(["HALF_UP", "HALF_EVEN", "UP", "DOWN"]),
+    minimumChargedFee: NonNegativeDecimal,
+    feeCurrency: CodeString,
+  }),
+  /** Starting simulated cash. The venue books against it (§12.1). */
+  startingCash: NonNegativeDecimal,
+});
+
 /** The infrastructure endpoints. Names only — no credential is representable. */
 const InfrastructureConfigSchema = z.strictObject({
   /** Redis stream the gateway publishes normalized events to (ADR-003). */
@@ -303,6 +342,15 @@ const InfrastructureConfigSchema = z.strictObject({
   consumerId: Identifier,
   /** Maximum events per `poll`. Bounded (§8.3). */
   receiveBatchSize: z.number().int().positive().max(10_000),
+  /**
+   * §9.1's bounded retention, in events.
+   *
+   * ADR-003's Consequences: "Retention size is a **safety parameter**, not a
+   * tuning knob. Retention shorter than the worst tolerated trader restart
+   * converts an ordinary restart into a hard resync plus an
+   * authoritative-snapshot cycle." Required, therefore, and undefaulted.
+   */
+  retentionMaxEvents: z.number().int().positive().max(10_000_000),
 });
 
 export const TraderConfigSchema = z.strictObject({
@@ -326,6 +374,7 @@ export const TraderConfigSchema = z.strictObject({
   queues: QueueBoundsSchema,
   features: FeatureConfigSchema,
   planning: PlanningConfigSchema,
+  simulation: SimulationConfigSchema,
   requestBudget: RequestBudgetSchema,
   /**
    * The shock scenarios §9.8 check 17 evaluates.
@@ -372,8 +421,46 @@ function deepFreeze<T>(value: T): T {
  * The order is the point (D1 before D2): the value is materialized FIRST, so
  * the tree the schema inspects and the tree the caller receives are the same
  * tree, and no second read of the caller's object can disagree with the first.
+ *
+ * ## Why the containment guard is not decoration (MEASURED, 2026-09-05)
+ *
+ * The warmed arena protects the PARSE. It does not protect the library's own
+ * ERROR CONSTRUCTION, and that is a different code path with a different
+ * exposure. Measured against the pinned `zod@4.4.3`, with one NON-ENUMERABLE
+ * inherited `Object.prototype.get`:
+ *
+ * ```text
+ * arena.safeParse(VALID)    -> ok
+ * arena.safeParse(INVALID)  -> TypeError: Invalid property descriptor.
+ *                              Cannot both specify accessors and a value or
+ *                              writable attribute
+ * ```
+ *
+ * That is `docs/contracts/schema-boundary.md` §2's "Descriptor literals" class
+ * arriving on the REFUSAL path — so a door with no guard turns "this
+ * configuration is invalid" into an escaped `TypeError`, on exactly the input
+ * it exists to refuse. `packages/risk`'s own doors wrap their bodies in
+ * `contained(...)` for the same reason; this one does the same with its own
+ * guard, so a refusal stays a refusal.
  */
 export function parseTraderConfig(input: unknown): ParseConfigResult {
+  try {
+    return parseTraderConfigInner(input);
+  } catch (cause) {
+    return {
+      ok: false,
+      refusal: {
+        code: "TRADER_CONFIG_NOT_DATA",
+        detail:
+          "reading the trader configuration failed unexpectedly and was contained (fail " +
+          "closed); a configuration that cannot be evaluated is not a valid configuration",
+        issues: [cause instanceof Error ? cause.message : String(cause)],
+      },
+    };
+  }
+}
+
+function parseTraderConfigInner(input: unknown): ParseConfigResult {
   // D1.
   const read = readPlainData(input, "config");
   if (!read.ok) {

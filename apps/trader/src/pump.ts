@@ -40,7 +40,7 @@
  * into a silent gap, which is the one thing §8.3 forbids.
  */
 
-import { HaltController } from "./halt.js";
+import type { HaltController } from "./halt.js";
 import type { CoreLoop } from "./loop.js";
 import type { MarketEventFeed } from "./ports.js";
 

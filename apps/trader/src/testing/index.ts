@@ -156,6 +156,8 @@ export class MemoryEventFeed implements MarketEventFeed {
 export class MemoryTraderStore implements TraderStore {
   readonly decisions: { record: DecisionRecord; telemetry: DecisionTelemetry }[] = [];
   readonly checkpoints: StrategyStateCheckpoint[] = [];
+  /** The instant each checkpoint was captured at, in the same order. */
+  readonly checkpointInstants: string[] = [];
   readonly transactions: AppendedLedgerTransaction[] = [];
   readonly pnlSnapshots: PnlSnapshot[] = [];
   #failure: { kind: "UNAVAILABLE" | "UNREADABLE"; detail: string } | undefined;
@@ -185,11 +187,15 @@ export class MemoryTraderStore implements TraderStore {
     return await Promise.resolve(portOk(null));
   }
 
-  async saveCheckpoint(checkpoint: StrategyStateCheckpoint): Promise<PortResult<null>> {
+  async saveCheckpoint(
+    checkpoint: StrategyStateCheckpoint,
+    capturedAt: string,
+  ): Promise<PortResult<null>> {
     if (this.#failure !== undefined) {
       return await Promise.resolve(portFailed(this.#failure.kind, this.#failure.detail));
     }
     this.checkpoints.push(checkpoint);
+    this.checkpointInstants.push(capturedAt);
     return await Promise.resolve(portOk(null));
   }
 

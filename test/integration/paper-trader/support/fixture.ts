@@ -37,7 +37,6 @@ import {
   unmodeledRateLimits,
   type BookView,
   type FeeScheduleSnapshot,
-  type PlannedOrderView,
   type RecordedEventIdentity,
   type TimeInForce,
 } from "@polymarket-bot/simulation";
@@ -195,6 +194,20 @@ export function traderConfig(overrides: Record<string, unknown> = {}): Record<st
       maxPlanLifetimeMs: 30_000,
       submissionUnknownAfterMs: 5_000,
     },
+    simulation: {
+      fillModelVersion: "tier0.fixture",
+      fillModelParametersHash: "a".repeat(64),
+      feeSchedule: {
+        snapshotVersion: "fixture.2026-03-04",
+        takerFeeRate: "0",
+        makerFeeRate: "0",
+        roundingDecimalPlaces: 6,
+        roundingMode: "HALF_UP",
+        minimumChargedFee: "0",
+        feeCurrency: "pUSD",
+      },
+      startingCash: "1000",
+    },
     requestBudget: { capacity: 100, windowMs: 60_000 },
     scenarios: [
       { scenarioId: "spot.down", kind: "SPOT", yesPriceShock: "-0.1" },
@@ -206,6 +219,7 @@ export function traderConfig(overrides: Record<string, unknown> = {}): Record<st
       eventStream: "polymarket.normalized",
       consumerId: "trader-1",
       receiveBatchSize: 128,
+      retentionMaxEvents: 100_000,
     },
     markets: [
       {
@@ -431,7 +445,7 @@ export function assemble(
       // (`pipeline.ts`); this fixture policy asks the trader's book through the
       // hook the venue provides. The fixture's strategy configures `FAK`, so an
       // unfilled remainder is cancelled rather than rested.
-      timeInForceFor(_order: PlannedOrderView): TimeInForce {
+      timeInForceFor(): TimeInForce {
         return "FAK";
       },
       statedExpiryNsFor(): bigint | undefined {

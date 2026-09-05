@@ -155,6 +155,31 @@ function ownNumber(record: unknown, key: string): number | undefined {
  * same tree (D3/D4). No step re-reads the caller's object.
  */
 export function readEventEnvelope(input: unknown): ReadEventResult {
+  try {
+    return readEventEnvelopeInner(input);
+  } catch (cause) {
+    // The warmed arena protects the PARSE; it does not protect the library's
+    // own ERROR CONSTRUCTION, which builds property descriptors from object
+    // literals and throws under an inherited `Object.prototype.get`
+    // (`docs/contracts/schema-boundary.md` §2's "Descriptor literals" class;
+    // measured against the pinned `zod` and transcribed in `config.ts`'s
+    // header). Without this guard a malformed event would raise a `TypeError`
+    // out of the one function whose entire job is to answer "this event is
+    // malformed".
+    return {
+      ok: false,
+      refusal: {
+        code: "EVENT_NOT_DATA",
+        detail:
+          "reading the event failed unexpectedly and was contained (fail closed); an event " +
+          "this process cannot evaluate is not an event it may act on",
+        issues: [cause instanceof Error ? cause.message : String(cause)],
+      },
+    };
+  }
+}
+
+function readEventEnvelopeInner(input: unknown): ReadEventResult {
   const read = readPlainData(input, "event");
   if (!read.ok) {
     return {

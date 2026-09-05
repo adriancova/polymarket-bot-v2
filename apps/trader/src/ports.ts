@@ -124,7 +124,16 @@ export interface TraderStore {
     record: DecisionRecord,
     telemetry: DecisionTelemetry,
   ): Promise<PortResult<null>>;
-  saveCheckpoint(checkpoint: StrategyStateCheckpoint): Promise<PortResult<null>>;
+  /**
+   * @param capturedAt the strict-UTC instant of the evaluation this checkpoint
+   *   belongs to. §10.3's `state_checkpoints.captured_at` is NOT NULL and the
+   *   checkpoint value itself carries no instant — the runtime reads no clock —
+   *   so the loop supplies the one the evaluation used, not a wall-clock read.
+   */
+  saveCheckpoint(
+    checkpoint: StrategyStateCheckpoint,
+    capturedAt: string,
+  ): Promise<PortResult<null>>;
   appendLedgerTransaction(
     transaction: AppendedLedgerTransaction,
   ): Promise<PortResult<null>>;

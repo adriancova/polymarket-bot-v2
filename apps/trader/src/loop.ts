@@ -62,6 +62,7 @@ import type {
   ExecutionResult,
   SimulatedFill,
   SimulatedOrder,
+  TimeInForce,
 } from "@polymarket-bot/simulation";
 import type { RiskPolicy } from "@polymarket-bot/risk";
 import {
@@ -78,9 +79,9 @@ import type {
 } from "@polymarket-bot/strategy-sdk";
 
 import {
-  DeterministicIdFactory,
   postFill,
   projectionOf,
+  type DeterministicIdFactory,
   type PostingIdentity,
   type TraceLink,
 } from "./accounting.js";
@@ -88,10 +89,10 @@ import { CancelLedger } from "./cancels.js";
 import type { InstanceConfig, MarketConfig, TraderConfig } from "./config.js";
 import { readEventEnvelope } from "./event-door.js";
 import { FillDeduplicator } from "./fills.js";
-import { HaltController, haltOnLedgerProjection } from "./halt.js";
-import { HealthState, type HealthSnapshot } from "./health.js";
-import { InstanceRegistry, type RegisteredInstance } from "./instances.js";
-import { MarketState } from "./market-state.js";
+import { haltOnLedgerProjection, type HaltController } from "./halt.js";
+import type { HealthSnapshot, HealthState } from "./health.js";
+import type { InstanceRegistry, RegisteredInstance } from "./instances.js";
+import type { MarketState } from "./market-state.js";
 import { OrderViewTracker, isTerminalStatus, toStrategyOrderView } from "./orders.js";
 import {
   buildPlanningInputs,
@@ -312,6 +313,19 @@ export class CoreLoop {
   /** The §9.16 records one instance's stream has accumulated, in order. */
   pnlRecords(instanceId: string): readonly PnlRecord[] {
     return Object.freeze([...(this.#pnlRecords.get(instanceId) ?? [])]);
+  }
+
+  /**
+   * The venue's `ExecutionPolicy.timeInForceFor` answer for one planned order.
+   *
+   * Published because the venue asks the COMPOSITION ROOT for it — "a silently
+   * assumed FAK would change every unfilled remainder's fate" — and the answer
+   * is recorded here, at plan time, from the emitting intent's own tag. A venue
+   * policy that reads this cannot invent one: an order whose value was never
+   * recorded answers `undefined`, and the policy must refuse rather than guess.
+   */
+  timeInForceFor(plannedOrderId: string): TimeInForce | undefined {
+    return this.#timeInForce.get(plannedOrderId);
   }
 
   ledger(): Ledger {
@@ -1401,7 +1415,7 @@ export class CoreLoop {
       }
     }
     for (const checkpoint of drained.checkpoints) {
-      const written = await this.#options.store.saveCheckpoint(checkpoint);
+      const written = await this.#options.store.saveCheckpoint(checkpoint, this.#lastInstant);
       if (!written.ok) {
         this.#options.halts.halt(
           { kind: "GLOBAL" },

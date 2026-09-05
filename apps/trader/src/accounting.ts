@@ -42,11 +42,11 @@
  */
 
 import {
-  Ledger,
   allocateFill,
   buildFillPosting,
   projectLedger,
   type AppendedLedgerTransaction,
+  type Ledger,
   type FillAllocationResult,
   type LedgerProjection,
   type LedgerRefusal,

@@ -80,9 +80,15 @@ describe("acceptance 3 — the end-to-end paper fixture emits a traceable fill a
 
     // --- hop 5: intent ---------------------------------------------------
     expect(entry.intentIds).toContain(chain.intentId);
-    expect(persisted?.record.decision.intents.map((intent) => intent.intentId)).toContain(
-      chain.intentId,
-    );
+    // §7.7's `CancelIntent` carries no `intentId`, so the union is narrowed
+    // rather than read through — the chain names a POSITION intent, and an
+    // assertion that pretended every intent had an id would be reading a field
+    // the contract does not promise.
+    expect(
+      persisted?.record.decision.intents
+        .filter((intent) => intent.type !== "CANCEL" && intent.type !== "REDUCE_POSITION")
+        .map((intent) => intent.intentId),
+    ).toContain(chain.intentId);
 
     // --- hop 4: execution plan (via the approved intent) -----------------
     expect(chain.approvedIntentId).not.toBe("");
