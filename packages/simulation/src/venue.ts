@@ -61,7 +61,7 @@ import { readFeeScheduleSnapshot, type FeeScheduleSnapshot } from "./fees.js";
 import { sizeAtPrice, type FillModelIdentity, type SimulatedFill } from "./fill-model.js";
 import { isNonEmptyString } from "./grammar.js";
 import { readLatencyModel, sampleLatency, type LatencyModel } from "./latency.js";
-import { ownFrozenTree } from "./plain.js";
+import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import {
   PLANNING_DEPTH_AWARENESS,
   SIMULATED_RUN_MODES,
@@ -89,7 +89,16 @@ import {
   type SameInstantAdditions,
 } from "./queue.js";
 import type { RateLimitBudget } from "./rate-limit.js";
-import { simulationRefusal, totally, type SimulationRefusal, type SimulationResult } from "./refusals.js";
+import {
+  defineData,
+  describeForRefusal,
+  plainRecord,
+  simulationRefusal,
+  totally,
+  totallyAsync,
+  type SimulationRefusal,
+  type SimulationResult,
+} from "./refusals.js";
 import { simulationFailure, simulationOk } from "./refusals.js";
 import type { SeededStreams } from "./seed.js";
 import { tier0Immediate, tier0Maker } from "./tier0.js";
@@ -193,6 +202,17 @@ function compareStrings(left: string, right: string): -1 | 0 | 1 {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+/**
+ * The materialize policy for the venue doors whose records carry §7.1 instants.
+ *
+ * `ObservedTrade.monotonicNs` is a `bigint`, so the door that takes one must be
+ * able to carry a `bigint` or it could not read a legitimate argument at all.
+ * `queue.ts` names the same policy for the same reason; `plain.ts`'s
+ * `MaterializePolicy` states why a `bigint` is the ONE primitive this relaxation
+ * admits and why it adopts nothing.
+ */
+const RECORDED_INSTANTS_ARE_BIGINTS = Object.freeze({ bigintIsData: true });
+
 function positionKey(key: PositionKey): string {
   // A unit separator, so a market id that happens to end in "YES" cannot forge
   // a collision with a different market's key.
@@ -216,9 +236,17 @@ export class SimulatedVenue implements ExecutionVenue {
     this.#cash = options.startingCash;
   }
 
-  /** Every fill this venue produced, in production order. */
+  /**
+   * Every fill this venue produced, in production order.
+   *
+   * A FROZEN COPY of the list, not the live one (round-4 review, MEDIUM-2's
+   * class-member sweep). The previous version handed out `this.#fills` itself,
+   * so a consumer — `runReplay` reads this getter to build the §12.4 bytes —
+   * could `push` a fill the venue never produced into the venue's own ledger.
+   * Each member is already an `ownFrozenTree`; only the container was live.
+   */
   get fills(): readonly SimulatedFill[] {
-    return this.#fills;
+    return Object.freeze([...this.#fills]);
   }
 
   /** The recorded event the venue is currently positioned at. */
@@ -255,9 +283,37 @@ export class SimulatedVenue implements ExecutionVenue {
    *
    * Called by the run driver for every delivered event. The venue has no clock
    * of its own and no way to advance itself.
+   *
+   * D1 (round-4 review, MEDIUM-1). The identity is a CALLER RECORD the venue
+   * KEEPS: it is stamped onto every order, every fill and every account snapshot
+   * this venue produces afterwards, and printed in the §12.4 bytes. The previous
+   * version stored the caller's own object, so mutating `identity.ingestSeq`
+   * after the call changed a later snapshot's recorded-event anchor from `"1"` to
+   * `"999999"` — an outcome anchored to an event that never happened (§6
+   * invariant 15) — and a getter-bearing identity was carried until D4's copier
+   * hit it, making `queryAccountState` REJECT its promise. It is materialized
+   * here, once, under the WIRE policy: a `RecordedEventIdentity` is four
+   * PRIMITIVES (`README.md` §5 item 11 — a `bigint` is data only at the doors
+   * whose records carry §7.1 nanoseconds, and this is not one).
+   *
+   * It ANSWERS now rather than returning `void`, because a refusal a caller
+   * cannot see is not a refusal: `replay.ts` stops the run on one.
    */
-  observe(identity: RecordedEventIdentity): void {
-    this.#atEvent = identity;
+  observe(identity: RecordedEventIdentity): SimulationResult<null> {
+    const read = readOwnPlainInput<RecordedEventIdentity>(
+      identity,
+      "the recorded event identity the venue is positioned at",
+    );
+    if (!read.ok) return read;
+    const materialized = read.value;
+    if (materialized === null || typeof materialized !== "object") {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a recorded event identity is a record (§7.1: gatewayEpoch, ingestSeq, receivedAt, datasetRowOrdinal)",
+      );
+    }
+    this.#atEvent = ownFrozenTree<RecordedEventIdentity>(materialized);
+    return simulationOk(null);
   }
 
   /**
@@ -267,6 +323,10 @@ export class SimulatedVenue implements ExecutionVenue {
    * touch/trade-through", and Tier 1 "decrement according to observed trades".
    * The trade is a recorded fact handed over by the run driver — the venue
    * neither reads a feed nor decides what a trade is.
+   *
+   * D1 (round-4 review, MEDIUM-1): the whole argument is materialized before
+   * anything is validated or computed — see {@link SimulatedVenue.#observeTradeSync}
+   * for exactly what that closed.
    */
   observeTrade(input: {
     readonly marketId: string;
@@ -282,11 +342,30 @@ export class SimulatedVenue implements ExecutionVenue {
     return totally("observing a trade at the simulated venue", () => this.#observeTradeSync(input));
   }
 
+  /**
+   * Submits one plan (§12.1). NEVER rejects: it answers a REFUSED result.
+   *
+   * D1 (round-4 review, MEDIUM-2's class-member sweep). The plan is a caller
+   * DATA record — an id, a run mode, groups of planned orders, all primitives —
+   * and it was read RAW. Measured at `d56e707`: a `limitPrice` accessor
+   * answering `"0.5"` for `validatePlannedOrder` and `"0.99"` afterwards was
+   * ACCEPTED, and the venue booked an order printing `limit=0.99` with a fill it
+   * had never validated the price of (the plan's `limitPrice` was read four
+   * times); and an `executionPlanId` accessor that THREW made `submit` REJECT
+   * its promise, out of the one method in this class whose documented bound is
+   * that it never does — because `#refuse` read the caller's plan again on the
+   * refusal path, OUTSIDE the totality guard.
+   *
+   * So: the plan is materialized first, `#refuse` takes an already-read id
+   * rather than the plan, and a plan that is not data is refused
+   * `SIMULATION_INPUT_NOT_DATA` under an id of `""` — a plan whose id cannot be
+   * read as data has no id this venue may quote.
+   */
   async submit(plan: ExecutionPlanView): Promise<ExecutionResult> {
     return await Promise.resolve(
       totallyResult(
         () => this.#submitSync(plan),
-        (refusal) => this.#refuse(plan, refusal),
+        (refusal) => this.#refuse("", refusal),
       ),
     );
   }
@@ -297,33 +376,108 @@ export class SimulatedVenue implements ExecutionVenue {
    * `SAFETY_CANCEL` plans are scheduled ahead of `PLACEMENT` plans by WP-190's
    * own rank, and ties keep their given order (a stable sort), so the schedule
    * is deterministic for a fixed input.
+   *
+   * Its own read of the caller's plans is the PRIORITY, taken exactly once per
+   * plan through a total guard (round-4 review, MEDIUM-2's class-member sweep).
+   * A priority that cannot be read is not a credible `SAFETY_CANCEL`, so such a
+   * plan schedules LAST and `submit` — which materializes it — refuses it; a
+   * throwing accessor no longer escapes this method as a rejected promise.
    */
   async submitAll(plans: readonly ExecutionPlanView[]): Promise<readonly ExecutionResult[]> {
-    const indexed = plans.map((plan, index) => ({ plan, index }));
+    const contained = await totallyAsync(
+      "submitting a batch of plans to the simulated venue",
+      async () => simulationOk(await this.#submitAllInner(plans)),
+    );
+    return contained.ok ? contained.value : Object.freeze([this.#refuse("", contained.refusal)]);
+  }
+
+  async #submitAllInner(
+    plans: readonly ExecutionPlanView[],
+  ): Promise<readonly ExecutionResult[]> {
+    const offered = Array.isArray(plans) ? plans : [];
+    const indexed = offered.map((plan, index) => ({
+      plan,
+      index,
+      // ONE read of the caller's plan, contained: `undefined` when it could not
+      // be read at all, which sorts after both real priorities.
+      priority: readPlanPriority(plan),
+    }));
     indexed.sort((left, right) => {
-      const byPriority = comparePlanPriority(left.plan.priority, right.plan.priority);
+      const byPriority = comparePriorityOrUnknown(left.priority, right.priority);
       return byPriority !== 0 ? byPriority : left.index - right.index;
     });
     const results: ExecutionResult[] = [];
     for (const entry of indexed) {
       results.push(await this.submit(entry.plan));
     }
-    return results;
+    // FROZEN: each result is already an `ownFrozenTree`; the list around them is
+    // this venue's answer too, and a consumer that could splice a result into it
+    // could report a submission this venue never made.
+    return Object.freeze(results);
   }
 
+  /**
+   * Cancels (§12.1, §6 invariant 13). NEVER rejects.
+   *
+   * D1 and totality (round-4 review, MEDIUM-1 / MEDIUM-2): the command is a
+   * caller DATA record (an id, a reason, a scope of ids), so it is materialized
+   * before anything is read, and the whole step sits inside a totality guard. A
+   * `scope` accessor that threw used to REJECT this promise. `CancelResult`
+   * carries no refusal field, so a refusal is reported the way §6 invariant 13
+   * requires the privileged path to report one: nothing cancelled, and the
+   * reason travelling with the result in `notCancelled`.
+   */
   async cancel(command: CancelCommand): Promise<CancelResult> {
-    return await Promise.resolve(this.#cancelSync(command));
+    const contained = totally("cancelling at the simulated venue", () => {
+      const read = readOwnPlainInput<CancelCommand>(command, "the cancel command");
+      if (!read.ok) return read;
+      const materialized = read.value;
+      if (materialized === null || typeof materialized !== "object") {
+        return simulationFailure<CancelResult>(
+          "SIMULATION_INPUT_INVALID",
+          "a cancel command is a record carrying an execution plan id, a reason and a scope",
+        );
+      }
+      return simulationOk(this.#cancelSync(materialized));
+    });
+    return await Promise.resolve(
+      contained.ok ? contained.value : refusedCancel(contained.refusal),
+    );
   }
 
+  /**
+   * The simulated account state (§12.1). NEVER rejects.
+   *
+   * Round-4 review MEDIUM-1: this method REJECTED its promise with
+   * `NotOwnPlainDataError` whenever the venue had been positioned at a
+   * getter-bearing identity, because D4's copier met the caller's accessor while
+   * emitting the snapshot. `observe` now materializes that identity, so THAT
+   * ingress is closed — and the guard below is not decoration, because one
+   * caller-supplied value still reaches the copier without a door in front of
+   * it: `SimulatedVenueOptions.startingCash` is typed `string` but is whatever
+   * the composition root constructed the venue with. `submit` refuses a
+   * non-canonical balance by name (§6 invariant 1); this method has no refusal
+   * channel to do that in, so it CONTAINS instead.
+   *
+   * `AccountSnapshot` is a §12.1 shape and carries no refusal field, so the
+   * contained branch answers a snapshot that CANNOT be mistaken for a real one:
+   * its `cashBalance` is not a decimal string, so every consumer's §6 invariant
+   * 1 door refuses it rather than reading a fabricated balance, and its
+   * positions and open orders are empty rather than partial. `README.md` §5
+   * item 12 discloses it.
+   */
   async queryAccountState(): Promise<AccountSnapshot> {
-    return await Promise.resolve(this.#accountSync());
+    const contained = totally("querying the simulated account state", () =>
+      simulationOk(this.#accountSync()),
+    );
+    return await Promise.resolve(contained.ok ? contained.value : unreadableAccount());
   }
 
   // -------------------------------------------------------------------------
 
-  #refuse(plan: ExecutionPlanView, refusal: SimulationRefusal): ExecutionResult {
+  #refuse(executionPlanId: string, refusal: SimulationRefusal): ExecutionResult {
     return ownFrozenTree<ExecutionResult>({
-      executionPlanId: typeof plan?.executionPlanId === "string" ? plan.executionPlanId : "",
+      executionPlanId: typeof executionPlanId === "string" ? executionPlanId : "",
       accepted: false,
       orders: [],
       fills: [],
@@ -338,13 +492,21 @@ export class SimulatedVenue implements ExecutionVenue {
     });
   }
 
-  #submitSync(plan: ExecutionPlanView): ExecutionResult {
+  #submitSync(offered: ExecutionPlanView): ExecutionResult {
+    // D1 FIRST: see {@link SimulatedVenue.submit}. Everything below reads the
+    // MATERIALIZED plan, so the order this venue books is the order it validated.
+    const read = readOwnPlainInput<ExecutionPlanView>(offered, "the execution plan");
+    if (!read.ok) return this.#refuse("", read.refusal);
+    const plan = read.value;
     if (plan === null || typeof plan !== "object") {
-      return this.#refuse(plan, simulationRefusal("SIMULATION_INPUT_INVALID", "a plan is a record"));
+      return this.#refuse("", simulationRefusal("SIMULATION_INPUT_INVALID", "a plan is a record"));
     }
+    // Read ONCE, from the materialized tree, so every refusal below quotes the
+    // same id the accepted result would have carried.
+    const planId: string = typeof plan.executionPlanId === "string" ? plan.executionPlanId : "";
     if (!(SIMULATED_RUN_MODES as readonly string[]).includes(plan.runMode)) {
       return this.#refuse(
-        plan,
+        planId,
         simulationRefusal(
           "SIMULATED_VENUE_RUN_MODE_REQUIRES_LIVE_SIGNER",
           `run mode ${String(plan.runMode)} requires a live signer and real orders (§11); a simulated venue may not serve it`,
@@ -354,7 +516,7 @@ export class SimulatedVenue implements ExecutionVenue {
     }
     if (plan.runMode !== this.#options.runMode) {
       return this.#refuse(
-        plan,
+        planId,
         simulationRefusal(
           "SIMULATED_VENUE_PLAN_UNSUPPORTED",
           `this venue serves ${this.#options.runMode} and the plan names ${plan.runMode}`,
@@ -364,7 +526,7 @@ export class SimulatedVenue implements ExecutionVenue {
     }
     if (!isCanonicalDecimalString(this.#cash)) {
       return this.#refuse(
-        plan,
+        planId,
         simulationRefusal(
           "SIMULATION_INPUT_INVALID",
           "the venue's cash balance is not a canonical decimal string; every economic value it books is exact (§6 invariant 1)",
@@ -373,11 +535,11 @@ export class SimulatedVenue implements ExecutionVenue {
       );
     }
     const fees = readFeeScheduleSnapshot(this.#options.feeSnapshot);
-    if (!fees.ok) return this.#refuse(plan, fees.refusal);
+    if (!fees.ok) return this.#refuse(planId, fees.refusal);
     const atEvent = this.#atEvent;
     if (atEvent === undefined) {
       return this.#refuse(
-        plan,
+        planId,
         simulationRefusal(
           "SIMULATED_VENUE_NO_BOOK",
           "the venue has not been positioned at any recorded event, so nothing it produced could be anchored to one",
@@ -420,7 +582,7 @@ export class SimulatedVenue implements ExecutionVenue {
 
     if (!Array.isArray(plan.groups)) {
       return this.#refuse(
-        plan,
+        planId,
         simulationRefusal("SIMULATION_INPUT_INVALID", "a placement plan carries execution groups"),
       );
     }
@@ -431,16 +593,16 @@ export class SimulatedVenue implements ExecutionVenue {
     for (const group of plan.groups) {
       if (group === null || typeof group !== "object" || !Array.isArray(group.orders)) {
         return this.#refuse(
-          plan,
+          planId,
           simulationRefusal("SIMULATION_INPUT_INVALID", "an execution group carries planned orders"),
         );
       }
       for (const planned of group.orders) {
         const validated = validatePlannedOrder(planned);
-        if (!validated.ok) return this.#refuse(plan, validated.refusal);
+        if (!validated.ok) return this.#refuse(planId, validated.refusal);
         if (this.#orders.has(planned.plannedOrderId)) {
           return this.#refuse(
-            plan,
+            planId,
             simulationRefusal(
               "SIMULATED_VENUE_DUPLICATE_ORDER",
               "a planned order id was submitted twice; §6 invariant 6 makes an unknown submission a reconciliation question, never a silent retry",
@@ -456,7 +618,7 @@ export class SimulatedVenue implements ExecutionVenue {
         });
         if (!admitted.admitted) {
           return this.#refuse(
-            plan,
+            planId,
             simulationRefusal(
               "SIMULATED_VENUE_RATE_LIMITED",
               admitted.reason ??
@@ -466,7 +628,7 @@ export class SimulatedVenue implements ExecutionVenue {
           );
         }
         const executed = this.#executeOne(plan, group.marketId, planned, atEvent, fees.value);
-        if ("refusal" in executed) return this.#refuse(plan, executed.refusal);
+        if ("refusal" in executed) return this.#refuse(planId, executed.refusal);
         orders.push(executed.order);
         for (const fill of executed.fills) fills.push(fill);
         if (executed.band !== undefined) bands.push(executed.band);
@@ -1014,7 +1176,7 @@ export class SimulatedVenue implements ExecutionVenue {
     });
   }
 
-  #observeTradeSync(input: {
+  #observeTradeSync(offered: {
     readonly marketId: string;
     readonly side: "YES" | "NO";
     readonly price: string;
@@ -1025,23 +1187,80 @@ export class SimulatedVenue implements ExecutionVenue {
     readonly fills: readonly SimulatedFill[];
     readonly bands: readonly RestingFillBand[];
   }> {
-    if (!isNonEmptyString(input.marketId) || (input.side !== "YES" && input.side !== "NO")) {
+    // D1 FIRST (round-4 review, MEDIUM-1). This door read the CALLER'S OWN
+    // record repeatedly — `price` three times, `shares` three, `monotonicNs`
+    // six — so an accessor honest for the checks and lying afterwards was
+    // validated as one trade and computed over as another. Measured at
+    // `d56e707`, with a `price` answering `"0.46"` for
+    // `isCanonicalDecimalString` and `"0.4"` after, against a 0.45-resting
+    // order: Tier 1 answered `ok: true` with `filled=50` in BOTH `result.bands`
+    // and `venue.restingBands()`, which the §12.4 `band` line then printed; and
+    // the Tier-0 shape produced a MAKER fill that moved `cashBalance` from
+    // `1000` to `995.5` and booked a 10-share position — from a trade whose
+    // validated price was away from the resting price.
+    //
+    // The whole argument is materialized once, under
+    // `RECORDED_INSTANTS_ARE_BIGINTS` (`monotonicNs` is §7.1 recorded
+    // nanoseconds — `plain.ts`'s `MaterializePolicy`), and EVERY read below is
+    // of the materialized tree. A hostile record is refused
+    // `SIMULATION_INPUT_NOT_DATA` naming the argument, rather than reaching D4's
+    // copier and coming back as `SIMULATION_INTERNAL` — the blame-the-package
+    // shape round 3 closed at `tier0Immediate`.
+    const read = readOwnPlainInput<{
+      readonly marketId: string;
+      readonly side: "YES" | "NO";
+      readonly price: string;
+      readonly shares: string;
+      readonly monotonicNs: bigint;
+      readonly atEvent: RecordedEventIdentity;
+    }>(offered, "the observed trade", RECORDED_INSTANTS_ARE_BIGINTS);
+    if (!read.ok) return read;
+    const input = read.value;
+    if (input === null || typeof input !== "object") {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "an observed trade is a record carrying a market, a side, a price, a size and the recorded instant it printed at",
+      );
+    }
+    // ONE READ PER FIELD, out of the materialized tree, into locals. Everything
+    // below uses the locals, so there is no second read to disagree with a first
+    // even if the materializer were ever weakened.
+    const marketId: unknown = input.marketId;
+    const side: unknown = input.side;
+    const price: unknown = input.price;
+    const shares: unknown = input.shares;
+    const monotonicNs: unknown = input.monotonicNs;
+    const atEvent = ownFrozenTree<RecordedEventIdentity>(
+      input.atEvent as RecordedEventIdentity,
+    );
+
+    if (!isNonEmptyString(marketId) || (side !== "YES" && side !== "NO")) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "an observed trade names a market and an outcome side",
       );
     }
-    if (!isCanonicalDecimalString(input.price) || !isCanonicalDecimalString(input.shares)) {
+    if (!isCanonicalDecimalString(price) || !isCanonicalDecimalString(shares)) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "an observed trade carries canonical decimal price and size (§6 invariant 1)",
-        { price: String(input.price), shares: String(input.shares) },
+        { price: describeForRefusal(price), shares: describeForRefusal(shares) },
       );
     }
-    if (compareDecimal(input.shares, "0") <= 0) {
+    if (compareDecimal(shares, "0") <= 0) {
       return simulationFailure("SIMULATION_INPUT_INVALID", "an observed trade has positive size");
     }
-    if (typeof input.monotonicNs !== "bigint" || input.monotonicNs < 0n) {
+    // The PRICE bound the queue door already enforces (round-3 review, NOTE-3),
+    // enforced here too: the venue's own guard is what `queue.ts` says it no
+    // longer depends on, and a non-positive price is not a price.
+    if (compareDecimal(price, "0") <= 0) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "an observed trade prints at a strictly positive price; the at-price / through-price comparison a maker fill turns on is not defined for a non-positive one",
+        { price },
+      );
+    }
+    if (typeof monotonicNs !== "bigint" || monotonicNs < 0n) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "an observed trade carries the recorded monotonic nanoseconds of the event that printed it (§7.1)",
@@ -1050,25 +1269,25 @@ export class SimulatedVenue implements ExecutionVenue {
     const fees = readFeeScheduleSnapshot(this.#options.feeSnapshot);
     if (!fees.ok) return fees;
 
-    const key = positionKey({ marketId: input.marketId, side: input.side });
+    const key = positionKey({ marketId, side });
     const observed = this.#trades.get(key) ?? [];
     const last = observed[observed.length - 1];
-    if (last !== undefined && input.monotonicNs < last.monotonicNs) {
+    if (last !== undefined && monotonicNs < last.monotonicNs) {
       return simulationFailure(
         "REPLAY_CLOCK_NOT_MONOTONE",
         "an observed trade arrives earlier than one already reported for this market and side; replay follows recorded dispatch order (§8.4, §6 invariant 15) and a queue walk over an unordered list truncates silently",
         {
-          marketId: input.marketId,
+          marketId,
           previousMonotonicNs: last.monotonicNs.toString(),
-          monotonicNs: input.monotonicNs.toString(),
+          monotonicNs: monotonicNs.toString(),
         },
       );
     }
     const trade = ownFrozenTree<ObservedTrade>({
-      price: input.price,
-      shares: input.shares,
-      monotonicNs: input.monotonicNs,
-      atEvent: input.atEvent,
+      price,
+      shares,
+      monotonicNs,
+      atEvent,
     });
     observed.push(trade);
     this.#trades.set(key, observed);
@@ -1078,13 +1297,13 @@ export class SimulatedVenue implements ExecutionVenue {
     // Ordered by a value-derived key: two resting orders must be visited in the
     // same order on every replay of the same dataset (§12.4).
     const records = [...this.#resting.values()]
-      .filter((record) => record.marketId === input.marketId && record.side === input.side)
+      .filter((record) => record.marketId === marketId && record.side === side)
       .sort((left, right) => compareStrings(left.simulatedOrderId, right.simulatedOrderId));
 
     for (const record of records) {
-      if (input.monotonicNs < record.restingFromNs) continue;
-      if (record.effectiveExpiryNs !== undefined && input.monotonicNs >= record.effectiveExpiryNs) {
-        this.#expire(record, input.atEvent);
+      if (monotonicNs < record.restingFromNs) continue;
+      if (record.effectiveExpiryNs !== undefined && monotonicNs >= record.effectiveExpiryNs) {
+        this.#expire(record, atEvent);
         continue;
       }
       if (this.#options.model.tier === "TIER_0") {
@@ -1097,9 +1316,9 @@ export class SimulatedVenue implements ExecutionVenue {
           action: record.action,
           restingPrice: record.restingPrice,
           remainingShares: record.remainingShares,
-          observedTradePrice: input.price,
+          observedTradePrice: price,
           feeSnapshot: fees.value,
-          atEvent: input.atEvent,
+          atEvent,
         });
         if (!outcome.ok) return outcome;
         if (outcome.value.trigger === "NONE") continue;
@@ -1116,7 +1335,7 @@ export class SimulatedVenue implements ExecutionVenue {
               ...existing,
               filledShares: addDecimal(existing.filledShares, outcome.value.filledShares),
               state: "FILLED",
-              atEvent: input.atEvent,
+              atEvent,
             }),
           );
         }
@@ -1221,15 +1440,43 @@ export class SimulatedVenue implements ExecutionVenue {
     current.shares = addDecimal(current.shares, delta);
   }
 
+  /**
+   * The cancel step, over OWN data.
+   *
+   * Both callers hand it a materialized record: the public
+   * {@link SimulatedVenue.cancel} materializes the caller's command, and
+   * `#submitSync` builds one from the already-materialized plan. Its reads are
+   * therefore of trees this package built — and the scope is still read ONCE,
+   * defensively, because a materialized record can still be the wrong SHAPE and
+   * `CancelResult` reports that the way §6 invariant 13 requires: nothing
+   * cancelled, and the reason travelling with the result.
+   */
   #cancelSync(command: CancelCommand): CancelResult {
     const cancelled: string[] = [];
     const notCancelled: { simulatedOrderId: string; reason: string }[] = [];
+    const offeredScope: unknown = command.scope;
+    if (offeredScope === null || typeof offeredScope !== "object") {
+      return ownFrozenTree<CancelResult>({
+        executionPlanId:
+          typeof command.executionPlanId === "string" ? command.executionPlanId : "",
+        cancelled: [],
+        notCancelled: [
+          {
+            simulatedOrderId: "(no scope)",
+            reason:
+              "SIMULATION_INPUT_INVALID: a cancel command carries a scope naming order ids or a market; nothing was cancelled",
+          },
+        ],
+        venueClass: "SIMULATED",
+      });
+    }
+    const scope = offeredScope as { readonly marketId?: string; readonly orderIds?: readonly string[] };
+    const scopedOrderIds = scope.orderIds;
+    const scopedMarketId = scope.marketId;
     const targets =
-      command.scope.orderIds ??
+      scopedOrderIds ??
       [...this.#orders.values()]
-        .filter((order) =>
-          command.scope.marketId === undefined ? true : order.marketId === command.scope.marketId,
-        )
+        .filter((order) => (scopedMarketId === undefined ? true : order.marketId === scopedMarketId))
         .map((order) => order.simulatedOrderId);
 
     const admitted = this.#options.rateLimits.admit({
@@ -1299,6 +1546,78 @@ export class SimulatedVenue implements ExecutionVenue {
       atEvent,
     });
   }
+}
+
+/**
+ * Reads one caller plan's PRIORITY, once, without letting it escape.
+ *
+ * {@link SimulatedVenue.submitAll} schedules on this value (§6 invariant 13) and
+ * `submit` validates everything else, so this is the one caller read the batch
+ * seam makes on its own. `undefined` means the read failed — a throwing accessor
+ * or trap — and such a plan is scheduled LAST rather than being trusted with the
+ * privileged rank it could not state.
+ */
+function readPlanPriority(plan: ExecutionPlanView): "SAFETY_CANCEL" | "PLACEMENT" | undefined {
+  const read = totally("reading a plan's scheduling priority", () => {
+    const priority: unknown = plan === null || typeof plan !== "object" ? undefined : plan.priority;
+    return simulationOk(priority);
+  });
+  if (!read.ok) return undefined;
+  return read.value === "SAFETY_CANCEL" || read.value === "PLACEMENT" ? read.value : undefined;
+}
+
+/** {@link comparePlanPriority}, with "the priority could not be read" sorting last. */
+function comparePriorityOrUnknown(
+  left: "SAFETY_CANCEL" | "PLACEMENT" | undefined,
+  right: "SAFETY_CANCEL" | "PLACEMENT" | undefined,
+): -1 | 0 | 1 {
+  if (left === undefined && right === undefined) return 0;
+  if (left === undefined) return 1;
+  if (right === undefined) return -1;
+  return comparePlanPriority(left, right);
+}
+
+/**
+ * The cancel result for a command that could not be read at all.
+ *
+ * `CancelResult` carries no refusal field, so the refusal is reported where §6
+ * invariant 13 requires a privileged-path failure to be reported: nothing in
+ * `cancelled`, and the reason travelling in `notCancelled`.
+ */
+function refusedCancel(refusal: SimulationRefusal): CancelResult {
+  return ownFrozenTree<CancelResult>({
+    executionPlanId: "",
+    cancelled: [],
+    notCancelled: [
+      { simulatedOrderId: "(the command could not be read)", reason: `${refusal.code}: ${refusal.message}` },
+    ],
+    venueClass: "SIMULATED",
+  });
+}
+
+/**
+ * The account snapshot for a contained INTERNAL fault.
+ *
+ * Reached when a member of the snapshot is not own plain data — in practice, a
+ * `startingCash` the composition root did not construct as a decimal string,
+ * which is the one caller value this method has no door in front of. It is built
+ * with `plainRecord`/`defineData` rather than through D4's copier, so the
+ * failure path cannot fail the same way the path it contains did.
+ *
+ * `cashBalance` is deliberately NOT a decimal string: §6 invariant 1 makes every
+ * economic value an exact decimal, so a consumer's own decimal door refuses this
+ * one rather than reading a fabricated balance, and an empty `positions` cannot
+ * be mistaken for a measured flat book because the balance beside it does not
+ * parse. `README.md` §5 item 12 discloses the shape.
+ */
+function unreadableAccount(): AccountSnapshot {
+  const snapshot = plainRecord();
+  defineData(snapshot, "venueClass", "SIMULATED");
+  defineData(snapshot, "cashBalance", "SIMULATION_INTERNAL_NO_ACCOUNT_STATE");
+  defineData(snapshot, "positions", Object.freeze([]));
+  defineData(snapshot, "openOrders", Object.freeze([]));
+  defineData(snapshot, "atEvent", null);
+  return Object.freeze(snapshot) as unknown as AccountSnapshot;
 }
 
 /**

@@ -331,16 +331,50 @@ export function totally<TValue>(
     }
     return compute();
   } catch (cause) {
-    let described = "an unexpected failure";
-    try {
-      described = cause instanceof Error ? `${cause.name}` : typeof cause;
-    } catch {
-      described = "an unreadable failure";
-    }
-    return simulationFailure(
-      "SIMULATION_INTERNAL",
-      `${describeForRefusal(what)} failed unexpectedly and is refused rather than answered (fail closed)`,
-      { failure: described },
-    );
+    return containedFailure(what, cause);
   }
+}
+
+/**
+ * {@link totally} for a computation that returns a PROMISE.
+ *
+ * A rejected promise is a thrown exception that arrives one tick later, and the
+ * bound ADR-020 §6 states — "no throw escapes" — is about the door's ANSWER, not
+ * about which tick it fails on. Round-4 review MEDIUM-1 measured
+ * `SimulatedVenue.queryAccountState` REJECTING its promise on a hostile observed
+ * identity; the whole-surface battery had not caught it because it swallowed
+ * rejections with `.catch(() => undefined)` instead of awaiting them. It now
+ * awaits, and every async door in this package answers through this guard.
+ */
+export async function totallyAsync<TValue>(
+  what: string,
+  compute: () => Promise<SimulationResult<TValue>> | SimulationResult<TValue>,
+): Promise<SimulationResult<TValue>> {
+  try {
+    if (typeof compute !== "function") {
+      return simulationFailure(
+        "SIMULATION_INTERNAL",
+        `${describeForRefusal(what)} was given no computation to run and is refused rather than answered (fail closed)`,
+      );
+    }
+    return await compute();
+  } catch (cause) {
+    return containedFailure(what, cause);
+  }
+}
+
+/** The one rendering both totality guards use for a contained failure. */
+function containedFailure<TValue>(what: string, cause: unknown): SimulationResult<TValue> {
+  let described = "an unexpected failure";
+  try {
+    described = cause instanceof Error ? `${cause.name}` : typeof cause;
+  } catch {
+    /* c8 ignore next -- `instanceof` on an exotic cause; the fallback is the point. */
+    described = "an unreadable failure";
+  }
+  return simulationFailure(
+    "SIMULATION_INTERNAL",
+    `${describeForRefusal(what)} failed unexpectedly and is refused rather than answered (fail closed)`,
+    { failure: described },
+  );
 }

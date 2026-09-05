@@ -319,17 +319,27 @@ function readArray(container: object, path: string, depth: number, state: ReadSt
 /**
  * Reads a CALLER value at a door, or answers that door's typed refusal.
  *
- * ## THE RULE, stated as narrowly as it is actually true (round-3 review)
+ * ## THE RULE, stated as narrowly as it is actually true (round-3, round-4)
  *
- * > A door materializes every caller-supplied **data** argument through
+ * > Every exported FUNCTION, and every public METHOD of every exported class,
+ * > materializes every caller-supplied **data** argument through
  * > {@link materializeInput} before it validates or computes anything, reads
  * > only the materialized tree afterwards, and never returns the caller's own
- * > object.
+ * > object. There is exactly ONE carve-out, named in the table below and in
+ * > `README.md` §2: {@link ../clock.js#ReplayClock.advanceTo}.
  *
  * The round-2 wording said "a door that takes a caller record", and the round-3
  * hostility drive showed that claim was WIDER than the code: four doors still
- * took their records raw, and two of them accepted a lying accessor. It is also
- * wider than any code could be, because not every argument is data:
+ * took their records raw, and two of them accepted a lying accessor. The round-3
+ * wording then said "a DOOR", which turned out to be NARROWER than the surface:
+ * round 4 measured `SimulatedVenue.observeTrade` re-reading a lying `price` into
+ * both the §12.4 band bytes and a booked cash movement, `observe` storing the
+ * caller's own identity record, and `submit` booking a `limitPrice` it had
+ * validated as a different number — none of which the partition covered, because
+ * it stopped at exported functions. The rule is stated over the whole surface
+ * now, and `doors.test.ts` walks class prototypes to hold it.
+ *
+ * It is still narrower than "every argument", because not every argument is data:
  *
  * | Argument kind | Materialized? | Why |
  * | --- | --- | --- |
@@ -338,14 +348,19 @@ function readArray(container: object, path: string, depth: number, state: ReadSt
  * | a FUNCTION (a digest, a core loop) | no | same |
  * | BYTES (`Uint8Array`) | no | `strict-json.ts` is the D1 reader for wire bytes and BUILDS its tree as it parses |
  * | a PRIMITIVE (an id, a decimal string, a count) | no | there is nothing to adopt, and the grammar predicates are total |
+ * | a value THIS PACKAGE built (a `LoadedDataset`, a `ReplayRecord`) | no | it is already an own frozen tree, built by the door that materialized what it came from |
  * | the door's own OPTIONS BAG | read ONCE per field | it is a call-site literal; the record each field yields is materialized, so one read cannot be made to disagree with a later one |
+ * | `ReplayClock.advanceTo`'s recorded instant — THE CARVE-OUT | read ONCE per field | it runs once per delivered event, so a copy per event is the cost the design refuses; both fields are PRIMITIVES, each is read exactly once into a local, and the method is totality-guarded so a throwing accessor is contained rather than raised |
  *
- * `test/unit/simulation/doors.test.ts` holds that table MECHANICALLY: every
- * exported function is classified as a record door (driven with the nested
- * hostility battery), a non-record door (with the reason its argument is not
- * data), or a pure helper (with the door that validated what reaches it) — and
- * the three lists are required to partition the export surface exactly, so a
- * tenth door cannot be added without classifying it.
+ * `test/unit/simulation/doors.test.ts` holds that table MECHANICALLY, over BOTH
+ * halves of the surface: every exported FUNCTION is classified as a record door
+ * (driven with the nested hostility battery), a non-record door (with the reason
+ * its argument is not data), or a pure helper (with the door that validated what
+ * reaches it); and every public METHOD and STATIC of every exported CLASS is
+ * classified as one of those, a PORT ANSWER (no caller argument at all), or the
+ * ONE-READ carve-out above. Both partitions must be exact, so neither a tenth
+ * door nor a new class method can be added without classifying it — and
+ * classifying it as a record door subscribes it to the whole battery.
  *
  * {@link ownPlainCopy} is D4, an emitter for trees this package BUILT; pointing
  * it at a caller object made it the ingress path for a getter (which it would

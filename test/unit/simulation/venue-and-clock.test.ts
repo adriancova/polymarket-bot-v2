@@ -17,6 +17,7 @@ import {
   comparePlanPriority,
   createReplayClock,
   deriveStreams,
+  isDecimalString,
   tier0Model,
   tier1Model,
   tokenBucketRateLimits,
@@ -966,5 +967,361 @@ describe("§6 invariant 13 — a failed SAFETY_CANCEL is never reported as a suc
     expect(result.accepted).toBe(true);
     expect(result.notCancelled).toEqual([]);
     expect(result.orders[0]?.state).toBe("CANCELLED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-4 review MEDIUM-1: the venue's own class-member seam
+// ---------------------------------------------------------------------------
+
+/**
+ * A record whose `price` is honest for the first read and lies afterwards.
+ *
+ * This is the reviewer's round-4 probe verbatim: `"0.46"` for the canonicality
+ * check, `"0.4"` for everything after it, against an order resting at `0.45`.
+ */
+function lyingPriceTrade(monotonicNs: bigint): {
+  readonly record: Record<string, unknown>;
+  reads(): number;
+} {
+  let reads = 0;
+  const record: Record<string, unknown> = {
+    marketId: MARKET_ID,
+    side: "YES",
+    shares: "10",
+    monotonicNs,
+    atEvent: AT_EVENT,
+  };
+  Object.defineProperty(record, "price", {
+    get: () => {
+      reads += 1;
+      return reads <= 1 ? "0.46" : "0.4";
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  return { record, reads: () => reads };
+}
+
+describe("observeTrade materializes its record before it computes (round-4 MEDIUM-1)", () => {
+  it("a lying price cannot move a Tier-1 BAND — the value the §12.4 bytes print", async () => {
+    // MEASURED AT `d56e707`: `ok: true`, and `filled=50` appeared in BOTH the
+    // returned `bands` and `venue.restingBands()` — so a trade validated as
+    // being away from the resting price filled the whole order in the artifact.
+    const simulated = tier1Venue([{ price: "0.45", size: "100" }], [{ price: "0.55", size: "100" }]);
+    const rested = await simulated.submit(
+      planWith(order({ executionStyle: "REST", postOnly: true, limitPrice: "0.45", shares: "50" })),
+    );
+    expect(rested.accepted).toBe(true);
+    expect(rested.bands[0]?.optimistic.filledShares).toBe("0");
+
+    const lying = lyingPriceTrade(2_000_000_000n);
+    const observed = simulated.observeTrade(lying.record as never);
+    expect(observed.ok).toBe(false);
+    if (observed.ok) return;
+    expect(observed.refusal.code).toBe("SIMULATION_INPUT_NOT_DATA");
+    // The accessor was REFUSED WITHOUT BEING INVOKED…
+    expect(lying.reads()).toBe(0);
+    // …and nothing in the venue moved.
+    expect(simulated.restingBands()[0]?.optimistic.filledShares).toBe("0");
+    expect(simulated.restingBands()[0]?.conservative.filledShares).toBe("0");
+  });
+
+  it("a lying price cannot move CASH or POSITIONS on the Tier-0 maker path", async () => {
+    // MEASURED AT `d56e707`: a MAKER fill was produced and `cashBalance` moved
+    // `1000` → `995.5` with a 10-share position booked, from a trade whose
+    // validated price never touched the resting price.
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.45", size: "100" }], [{ price: "0.55", size: "100" }]) },
+    });
+    const rested = await simulated.submit(
+      planWith(order({ executionStyle: "REST", postOnly: true, limitPrice: "0.45", shares: "10" })),
+    );
+    expect(rested.orders[0]?.state).toBe("RESTING");
+    const before = await simulated.queryAccountState();
+    expect(before.cashBalance).toBe("1000");
+
+    const lying = lyingPriceTrade(2_000_000_000n);
+    const observed = simulated.observeTrade(lying.record as never);
+    expect(observed.ok).toBe(false);
+    if (observed.ok) return;
+    expect(observed.refusal.code).toBe("SIMULATION_INPUT_NOT_DATA");
+    expect(lying.reads()).toBe(0);
+
+    const after = await simulated.queryAccountState();
+    expect(after.cashBalance).toBe("1000");
+    expect(after.positions).toEqual([]);
+    expect(simulated.fills).toEqual([]);
+  });
+
+  it("an honest trade still fills exactly as before (the fix refuses nothing legitimate)", () => {
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.45", size: "100" }], [{ price: "0.55", size: "100" }]) },
+    });
+    const observed = simulated.observeTrade({
+      marketId: MARKET_ID,
+      side: "YES",
+      price: "0.46",
+      shares: "10",
+      monotonicNs: 2_000_000_000n,
+      atEvent: AT_EVENT,
+    });
+    expect(observed.ok).toBe(true);
+  });
+
+  it("a hostile record is blamed on the CALLER, not on this package", () => {
+    // Round 3 closed this shape at `tier0Immediate`; round 4 found it here: a
+    // cyclic argument reached D4's copier and came back `SIMULATION_INTERNAL`.
+    const simulated = venue();
+    const cyclic: Record<string, unknown> = {
+      marketId: MARKET_ID,
+      side: "YES",
+      price: "0.5",
+      shares: "10",
+      monotonicNs: 2_000_000_000n,
+    };
+    cyclic["atEvent"] = cyclic;
+    const observed = simulated.observeTrade(cyclic as never);
+    expect(observed.ok).toBe(false);
+    if (observed.ok) return;
+    expect(observed.refusal.code).toBe("SIMULATION_INPUT_NOT_DATA");
+    expect(observed.refusal.message).toContain("cycle");
+  });
+
+  it("a Proxy cannot make the descriptor read and a later read disagree", async () => {
+    // The `Proxy` containment claim, measured rather than asserted
+    // (`plain.ts`'s disclosed limit, `README.md` §5 item 3). A `Proxy` is the one
+    // hostile shape this package cannot DETECT — every probe for one runs a trap
+    // — so the claim is narrower: each field is read EXACTLY ONCE into the tree,
+    // and everything downstream consumes only that tree. Here the descriptor
+    // trap answers `"0.46"` (away from the 0.45 resting price, so no fill) and
+    // every later property read answers `"0.4"` (through it, so a fill). The
+    // venue must behave exactly as it does for the honest `"0.46"` record.
+    const target: Record<string, unknown> = {
+      marketId: MARKET_ID,
+      side: "YES",
+      price: "0.46",
+      shares: "10",
+      monotonicNs: 2_000_000_000n,
+      atEvent: AT_EVENT,
+    };
+    let getTrapReads = 0;
+    const lying = new Proxy(target, {
+      get: (held, key, receiver) => {
+        if (key === "price") {
+          getTrapReads += 1;
+          return "0.4";
+        }
+        return Reflect.get(held, key, receiver);
+      },
+    });
+
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.45", size: "100" }], [{ price: "0.55", size: "100" }]) },
+    });
+    await simulated.submit(
+      planWith(order({ executionStyle: "REST", postOnly: true, limitPrice: "0.45", shares: "10" })),
+    );
+    const observed = simulated.observeTrade(lying as never);
+    expect(observed.ok).toBe(true);
+    if (!observed.ok) return;
+    // The trap NEVER ran: the descriptor read is the only read of the field.
+    expect(getTrapReads).toBe(0);
+    // …so the venue saw the 0.46 trade, which is away from the resting price.
+    expect(observed.value.fills).toEqual([]);
+    const account = await simulated.queryAccountState();
+    expect(account.cashBalance).toBe("1000");
+    expect(account.positions).toEqual([]);
+  });
+
+  it("a non-positive observed price is refused at the venue too", () => {
+    const simulated = venue();
+    const observed = simulated.observeTrade({
+      marketId: MARKET_ID,
+      side: "YES",
+      price: "-0.5",
+      shares: "10",
+      monotonicNs: 2_000_000_000n,
+      atEvent: AT_EVENT,
+    });
+    expect(observed.ok).toBe(false);
+    if (observed.ok) return;
+    expect(observed.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+    expect(observed.refusal.message).toContain("strictly positive");
+  });
+});
+
+describe("observe stores its own copy of the recorded identity (round-4 MEDIUM-1)", () => {
+  it("mutating the caller's identity AFTER the call changes nothing the venue answers", async () => {
+    // MEASURED AT `d56e707`: `venue.atEvent === identity`, and setting
+    // `identity.ingestSeq = "999999"` afterwards changed a later account
+    // snapshot's recorded-event anchor from `"1"` to `"999999"` — an outcome
+    // anchored to an event that never happened (§6 invariant 15).
+    const identity: Record<string, unknown> = { ...AT_EVENT };
+    const simulated = venue();
+    const positioned = simulated.observe(identity as never);
+    expect(positioned.ok).toBe(true);
+    expect(simulated.atEvent).not.toBe(identity);
+
+    const first = await simulated.queryAccountState();
+    identity["ingestSeq"] = "999999";
+    const second = await simulated.queryAccountState();
+    expect(first.atEvent?.ingestSeq).toBe("1");
+    expect(second.atEvent?.ingestSeq).toBe("1");
+    expect(simulated.atEvent?.ingestSeq).toBe("1");
+  });
+
+  it("REFUSES a getter-bearing identity, and queryAccountState still ANSWERS", async () => {
+    // MEASURED AT `d56e707`: the identity was stored raw, and
+    // `queryAccountState()` REJECTED its promise with `NotOwnPlainDataError`
+    // when D4's copier met the accessor — contradicting the README's totality
+    // bound at the one seam whose whole contract is that it answers.
+    const hostile = {} as Record<string, unknown>;
+    Object.defineProperty(hostile, "gatewayEpoch", {
+      get: () => "0190a3e0-0000-7000-8000-000000000001",
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(hostile, "ingestSeq", {
+      get: () => "1",
+      enumerable: true,
+      configurable: true,
+    });
+    const simulated = venue();
+    const positioned = simulated.observe(hostile as never);
+    expect(positioned.ok).toBe(false);
+    if (positioned.ok) return;
+    expect(positioned.refusal.code).toBe("SIMULATION_INPUT_NOT_DATA");
+
+    let rejected: unknown;
+    let snapshot: Awaited<ReturnType<SimulatedVenue["queryAccountState"]>> | undefined;
+    try {
+      snapshot = await simulated.queryAccountState();
+    } catch (cause) {
+      rejected = cause;
+    }
+    expect(rejected).toBeUndefined();
+    expect(snapshot?.venueClass).toBe("SIMULATED");
+    expect(snapshot?.cashBalance).toBe("1000");
+  });
+
+  it("queryAccountState CONTAINS a startingCash that is not own plain data", async () => {
+    // The one caller value this method has no door in front of:
+    // `SimulatedVenueOptions.startingCash` is typed `string` and is whatever the
+    // composition root built the venue with. `submit` refuses a non-canonical
+    // balance BY NAME (§6 invariant 1); this method has no refusal channel, so
+    // it contains — and answers a snapshot whose balance does not parse, rather
+    // than rejecting its promise or inventing a number.
+    const cyclic: Record<string, unknown> = {};
+    cyclic["self"] = cyclic;
+    const simulated = venue({ startingCash: cyclic as unknown as string });
+    let rejected: unknown;
+    let snapshot: Awaited<ReturnType<SimulatedVenue["queryAccountState"]>> | undefined;
+    try {
+      snapshot = await simulated.queryAccountState();
+    } catch (cause) {
+      rejected = cause;
+    }
+    expect(rejected).toBeUndefined();
+    expect(snapshot?.venueClass).toBe("SIMULATED");
+    expect(snapshot?.cashBalance).toBe("SIMULATION_INTERNAL_NO_ACCOUNT_STATE");
+    expect(snapshot?.positions).toEqual([]);
+    expect(snapshot?.openOrders).toEqual([]);
+    expect(snapshot?.atEvent).toBeNull();
+    // …and it is NOT a decimal string, so a consumer's own §6 invariant 1 door
+    // refuses it rather than reading a fabricated balance.
+    expect(isDecimalString(snapshot?.cashBalance)).toBe(false);
+  });
+});
+
+describe("cancel is a door too (round-4 MEDIUM-1)", () => {
+  it("a throwing scope accessor is CONTAINED, and nothing is reported as cancelled", async () => {
+    // MEASURED AT `d56e707`: `cancel` REJECTED its promise with the caller's own
+    // `Error`, out of the §6 invariant 13 privileged path.
+    const hostile = {
+      executionPlanId: "plan-1",
+      reason: "kill switch",
+      priority: "SAFETY_CANCEL",
+    } as Record<string, unknown>;
+    Object.defineProperty(hostile, "scope", {
+      get: () => {
+        throw new Error("a scope accessor that throws");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    let rejected: unknown;
+    let result: Awaited<ReturnType<SimulatedVenue["cancel"]>> | undefined;
+    try {
+      result = await venue().cancel(hostile as never);
+    } catch (cause) {
+      rejected = cause;
+    }
+    expect(rejected).toBeUndefined();
+    expect(result?.cancelled).toEqual([]);
+    expect(result?.notCancelled[0]?.reason).toContain("SIMULATION_INPUT_NOT_DATA");
+  });
+
+  it("a legitimate cancel is unchanged", async () => {
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]) },
+    });
+    await simulated.submit(planWith(order({ executionStyle: "REST", limitPrice: "0.45" })));
+    const result = await simulated.cancel({
+      executionPlanId: "plan-1",
+      reason: "kill switch",
+      scope: { orderIds: ["order-1"] },
+      priority: "SAFETY_CANCEL",
+    });
+    expect(result.cancelled).toEqual(["order-1"]);
+    expect(result.notCancelled).toEqual([]);
+  });
+});
+
+describe("submit materializes its plan (round-4 MEDIUM-2's class-member sweep)", () => {
+  it("a lying limitPrice cannot be validated as one price and booked as another", async () => {
+    // MEASURED AT `d56e707`: ACCEPTED, with the order booked as `limit=0.99`
+    // and a fill produced — the plan's `limitPrice` was read four times.
+    let reads = 0;
+    const planned = { ...order({ executionStyle: "MARKETABLE_LIMIT" }) } as Record<string, unknown>;
+    delete planned["limitPrice"];
+    Object.defineProperty(planned, "limitPrice", {
+      get: () => {
+        reads += 1;
+        return reads <= 1 ? "0.5" : "0.99";
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const result = await venue().submit(planWith(planned as never));
+    expect(result.accepted).toBe(false);
+    expect(result.refusalCode).toBe("SIMULATION_INPUT_NOT_DATA");
+    expect(reads).toBe(0);
+    expect(result.orders).toEqual([]);
+    expect(result.fills).toEqual([]);
+  });
+
+  it("a throwing executionPlanId accessor does not make submit REJECT", async () => {
+    // MEASURED AT `d56e707`: the promise REJECTED, because `#refuse` read the
+    // caller's plan again OUTSIDE the totality guard.
+    const hostile = { runMode: "BACKTEST" } as Record<string, unknown>;
+    Object.defineProperty(hostile, "executionPlanId", {
+      get: () => {
+        throw new Error("an executionPlanId accessor that throws");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    let rejected: unknown;
+    let result: Awaited<ReturnType<SimulatedVenue["submit"]>> | undefined;
+    try {
+      result = await venue().submit(hostile as never);
+    } catch (cause) {
+      rejected = cause;
+    }
+    expect(rejected).toBeUndefined();
+    expect(result?.accepted).toBe(false);
+    expect(result?.refusalCode).toBe("SIMULATION_INPUT_NOT_DATA");
+    expect(result?.executionPlanId).toBe("");
   });
 });

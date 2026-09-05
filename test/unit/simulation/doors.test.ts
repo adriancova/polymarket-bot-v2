@@ -47,6 +47,7 @@ import {
   computeFee,
   computeMarkouts,
   consumeDepth,
+  DatasetEventSource,
   deriveReplayEventId,
   deriveStreams,
   isCanonicalUuidV7,
@@ -66,8 +67,12 @@ import {
   readSameInstantAdditions,
   reconcileRunPins,
   replayPathEconomics,
+  runEventSource,
+  runReplay,
   serializeBand,
   simulateResting,
+  simulationFailure,
+  simulationOk,
   simulationRefusal,
   sizeAtPrice,
   SimulatedVenue,
@@ -786,7 +791,7 @@ describe("the bound: no throw escapes any door of this package", () => {
     return built;
   }
 
-  it("no throw escapes any DOOR, under hostile arguments", () => {
+  it("no throw escapes any DOOR, under hostile arguments", async () => {
     // ADR-020 §6's bound is "no throw escapes", and the round-1 review found
     // five doors plus `SimulatedVenue.submit` that leaked
     // `InvalidDecimalStringError` when a TYPE-VALID but non-canonical decimal
@@ -865,7 +870,16 @@ describe("the bound: no throw escapes any door of this package", () => {
         for (const argumentList of [[argument], [argument, argument], [argument, argument, argument]]) {
           try {
             const outcome = (value as (...args: unknown[]) => unknown)(...argumentList);
-            if (outcome instanceof Promise) outcome.catch(() => undefined);
+            // AWAITED, not swallowed (round-4 review, MEDIUM-1's class). The
+            // previous line was `outcome.catch(() => undefined)`, which discards
+            // exactly the failure ADR-020 §6's bound is about: a REJECTED PROMISE
+            // is a throw that escapes one tick later. Awaiting it here found
+            // three live violations at `d56e707` — `loadDataset`
+            // ("Cannot destructure property 'dataset' of 'options' as it is
+            // null"), `runEventSource` ("Cannot read properties of null (reading
+            // 'events')") and `runReplay` ("Cannot read properties of null
+            // (reading 'runPins')") — each of which now answers a typed refusal.
+            if (outcome instanceof Promise) await outcome;
           } catch (cause) {
             escapes.push(`${name}(${String(argumentList.length)}): ${String(cause)}`);
           }
@@ -907,6 +921,65 @@ describe("the bound: no throw escapes any door of this package", () => {
     for (const name of Object.keys(PURE_HELPERS)) {
       expect(functions, `${name} is listed as a pure helper but is not exported`).toContain(name);
     }
+  });
+
+  it("an ASYNC door REFUSES rather than rejecting, when a PORT it was given throws", async () => {
+    // Round-4 review MEDIUM-1's class, at the three async doors. Awaiting the
+    // battery above found them rejecting on a hostile ARGUMENT; these three
+    // probes close the other half — a port that throws MID-RUN, which no
+    // argument check can anticipate and only the totality guard contains.
+    const fixture = buildDataset({ frames: OUT_OF_ORDER_VENUE_FRAMES });
+    const manifest = readDatasetManifestText(fixture.manifestText);
+    expect(manifest.ok).toBe(true);
+    if (!manifest.ok) return;
+
+    // 1. `loadDataset`, with a DIGEST port that throws.
+    const loaded = await loadDataset({
+      dataset: manifest.value,
+      archive: fixture.archive,
+      digestSha256: () => {
+        throw new Error("a digest port that throws");
+      },
+    });
+    expect(loaded.ok).toBe(false);
+    if (loaded.ok) return;
+    expect(loaded.refusal.code).toBe("SIMULATION_INTERNAL");
+
+    // 2. `runEventSource`, with a NORMALIZER that throws mid-stream.
+    const verified = await loadDataset({
+      dataset: manifest.value,
+      archive: fixture.archive,
+      digestSha256: sha256Hex,
+    });
+    expect(verified.ok).toBe(true);
+    if (!verified.ok) return;
+    const created = DatasetEventSource.create(verified.value, {
+      normalizerVersion: "test/throwing/v1",
+      normalize: () => {
+        throw new Error("a normalizer that throws");
+      },
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const drained = await runEventSource(created.value);
+    expect(drained.ok).toBe(false);
+    if (drained.ok) return;
+    expect(drained.refusal.code).toBe("SIMULATION_INTERNAL");
+
+    // 3. `runReplay`, with an options bag whose `runPins` read throws.
+    const trapping = new Proxy(
+      {},
+      {
+        get: (_held, key) => {
+          if (key === "then") return undefined;
+          throw new Error("an options trap that throws");
+        },
+      },
+    );
+    const replayed = await runReplay(trapping as never);
+    expect(replayed.ok).toBe(false);
+    if (replayed.ok) return;
+    expect(replayed.refusal.code).toBe("SIMULATION_INTERNAL");
   });
 
   it("SimulatedVenue.submit REFUSES rather than rejecting, on every hostile plan", async () => {
@@ -959,8 +1032,17 @@ type RecordPath = readonly string[];
 interface RecordDoor {
   /** Unique label for this probe; several probes may target one export. */
   readonly id: string;
-  /** The EXPORT this drives, for the partition check below. */
+  /**
+   * The EXPORT this drives, for the partition check below.
+   *
+   * For a CLASS MEMBER (round-4 review, MEDIUM-2) this is the class's export
+   * name and {@link RecordDoor.member} names the method, so
+   * `SimulatedVenue.observeTrade` is checked against the class-member partition
+   * rather than against the exported-function partition.
+   */
   readonly name: string;
+  /** The method, when this door is a class member: `"observeTrade"`. */
+  readonly member?: string;
   readonly valid: () => unknown;
   /**
    * Whether the ARGUMENT ITSELF is the caller data record.
@@ -980,7 +1062,16 @@ interface RecordDoor {
    * be declared.
    */
   readonly notData?: Readonly<Record<string, string>>;
-  readonly drive: (value: unknown) => SimulationResult<unknown>;
+  /**
+   * Drives the door.
+   *
+   * It may answer a PROMISE (round-4 review, MEDIUM-2): three of the class
+   * members this table now covers — `submit`, `submitAll`, `cancel` — are async,
+   * and a door that fails one tick later has still failed. Each async entry
+   * adapts its own answer shape onto `SimulationResult` at the call site, and
+   * says how.
+   */
+  readonly drive: (value: unknown) => SimulationResult<unknown> | Promise<SimulationResult<unknown>>;
 }
 
 /**
@@ -993,13 +1084,33 @@ interface RecordDoor {
  * probed, except:
  *
  * - a PORT — an object with a function-valued own member; its contract is those
- *   methods and materializing it would delete them;
+ *   methods and materializing it would delete them. Round-4 review NOTE-2: the
+ *   walker used to skip a port's WHOLE SUBTREE, so a HYBRID (an object carrying
+ *   both methods and a nested data record) would have been silently unprobed. It
+ *   now declines to probe the hybrid ITSELF — that object is a port — and keeps
+ *   walking its non-function members, so a nested data record inside one is
+ *   probed like any other. `the walker walks PAST a port's methods` below
+ *   measures it on a synthetic hybrid, because no fixture here is one: the only
+ *   hybrids the fixtures contain (`BOOK_PORT`) carry PRIMITIVE data members, and
+ *   a primitive holds no position the hostility classes could be planted at.
  * - a CLASS INSTANCE — a non-plain prototype; `plain.ts` refuses those as data
  *   by policy, so a door cannot be asked to materialize one;
  * - anything the door declares in {@link RecordDoor.notData}, with its reason.
  *
  * A data member added to a fixture is therefore probed without anyone
  * remembering to list it.
+ *
+ * DISCLOSED LIMIT (round-4 review NOTE-1): the walk is over the positions a
+ * fixture INSTANTIATES. Where a field is a UNION with a record arm and the
+ * fixture uses the primitive arm — `sameInstantAdditions: "NOT_OBSERVED"` — the
+ * record arm yields no position, so nothing probes it. That is closed HERE by
+ * fixture rather than by machinery: every union in these fixtures with a record
+ * arm has a SECOND-ARM entry in {@link RECORD_DOORS} (`… (observed additions
+ * arm)`), and `every union with a record arm has a second-arm fixture` below
+ * fails if a first-arm-only union is added. The reviewer's own round-4 probe of
+ * the gap — `{ observedShares: <cyclic> }` at `simulateResting` — was REFUSED,
+ * so the gap was in the MEASUREMENT, not in the door; the second-arm entries
+ * make that mechanical.
  */
 function deriveRecordPaths(door: RecordDoor): readonly RecordPath[] {
   const paths: RecordPath[] = [];
@@ -1010,17 +1121,20 @@ function deriveRecordPaths(door: RecordDoor): readonly RecordPath[] {
     const prototype: unknown = Object.getPrototypeOf(value);
     const isArray = Array.isArray(value);
     if (prototype !== null && prototype !== (isArray ? Array.prototype : Object.prototype)) return;
-    for (const key of Object.keys(value)) {
-      if (typeof (value as Record<string, unknown>)[key] === "function") return; // a PORT
-    }
-    if (path.length > 0 || door.argumentIsData) paths.push(path);
+    const isPort = Object.keys(value).some(
+      (key) => typeof (value as Record<string, unknown>)[key] === "function",
+    );
+    // A PORT is not a data position — but its DATA members still are.
+    if (!isPort && (path.length > 0 || door.argumentIsData)) paths.push(path);
     if (isArray) {
       // The first element stands for the array: planting into it is nesting.
       walk((value as unknown[])[0], [...path, "0"]);
       return;
     }
     for (const key of Object.keys(value)) {
-      walk((value as Record<string, unknown>)[key], [...path, key]);
+      const member: unknown = (value as Record<string, unknown>)[key];
+      if (typeof member === "function") continue; // a METHOD is not data
+      walk(member, [...path, key]);
     }
   };
   walk(door.valid(), []);
@@ -1084,6 +1198,21 @@ const RESTING_ORDER = (): Record<string, unknown> => ({
   restingFromNs: 1000n,
 });
 
+/**
+ * The SECOND ARM of the one union in these fixtures that has a record arm
+ * (round-4 review, NOTE-1).
+ *
+ * `SameInstantAdditions` is `"NOT_OBSERVED" | { observedShares }`. The fixture
+ * above instantiates the PRIMITIVE arm, and the walker can only derive
+ * positions a fixture instantiates, so nothing probed the record arm — the
+ * record a door reads `observedShares` out of. This one instantiates it, and the
+ * doors that take it are entered TWICE in {@link RECORD_DOORS}, once per arm.
+ */
+const RESTING_ORDER_OBSERVED_ARM = (): Record<string, unknown> => ({
+  ...RESTING_ORDER(),
+  sameInstantAdditions: { observedShares: "5" },
+});
+
 const OBSERVED_TRADE = (): Record<string, unknown> => ({
   price: "0.5",
   shares: "40",
@@ -1121,9 +1250,18 @@ const MARKOUT_DIAGNOSTIC = (): Record<string, unknown> => ({
 
 /** A VALID band, built by the door that builds bands. */
 function validBand(): Record<string, unknown> {
+  return bandFrom(RESTING_ORDER());
+}
+
+/** The same band, built from the union's RECORD arm (round-4 review, NOTE-1). */
+function validBandObservedArm(): Record<string, unknown> {
+  return bandFrom(RESTING_ORDER_OBSERVED_ARM());
+}
+
+function bandFrom(order: Record<string, unknown>): Record<string, unknown> {
   const built = simulateResting({
     model: TIER_1_MODEL() as never,
-    order: RESTING_ORDER() as never,
+    order: order as never,
     trades: [OBSERVED_TRADE()] as never,
     parameters: QUEUE_PARAMETERS() as never,
     feeSnapshot: FEE_SNAPSHOT() as never,
@@ -1220,9 +1358,29 @@ const RECORD_DOORS: readonly RecordDoor[] = [
     drive: (value) => simulateResting(value as never),
   },
   {
+    id: "simulateResting (observed same-instant additions arm)",
+    name: "simulateResting",
+    valid: () => ({
+      model: TIER_1_MODEL(),
+      order: RESTING_ORDER_OBSERVED_ARM(),
+      trades: [OBSERVED_TRADE()],
+      parameters: QUEUE_PARAMETERS(),
+      feeSnapshot: FEE_SNAPSHOT(),
+    }),
+    argumentIsData: false,
+    drive: (value) => simulateResting(value as never),
+  },
+  {
     id: "checkBandOrdering",
     name: "checkBandOrdering",
     valid: validBand,
+    argumentIsData: true,
+    drive: (value) => checkBandOrdering(value as never),
+  },
+  {
+    id: "checkBandOrdering (observed same-instant additions arm)",
+    name: "checkBandOrdering",
+    valid: validBandObservedArm,
     argumentIsData: true,
     drive: (value) => checkBandOrdering(value as never),
   },
@@ -1401,7 +1559,177 @@ const RECORD_DOORS: readonly RecordDoor[] = [
     argumentIsData: false,
     drive: (value) => reconcileRunPins(value as never, runPins()),
   },
+
+  // --- CLASS MEMBERS (round-4 review, MEDIUM-2) -----------------------------
+  //
+  // The partition used to stop at exported FUNCTIONS, so every method of
+  // `SimulatedVenue` / `ReplayClock` / `DatasetEventSource` / `SeededStream` sat
+  // outside it: the reviewer added an unclassified caller-record method to
+  // `SimulatedVenue` and it survived the entire suite. The four below are the
+  // members that take a caller DATA record, and they are subscribed to exactly
+  // the same nested battery as every exported record door.
+  {
+    id: "SimulatedVenue.observe",
+    name: "SimulatedVenue",
+    member: "observe",
+    valid: AT_EVENT,
+    argumentIsData: true,
+    drive: (value) => probeVenue().observe(value as never),
+  },
+  {
+    id: "SimulatedVenue.observeTrade",
+    name: "SimulatedVenue",
+    member: "observeTrade",
+    valid: () => ({
+      marketId: "m-1",
+      side: "YES",
+      price: "0.5",
+      shares: "10",
+      monotonicNs: 2000n,
+      atEvent: AT_EVENT(),
+    }),
+    argumentIsData: true,
+    drive: (value) => probeVenue().observeTrade(value as never),
+  },
+  {
+    id: "SimulatedVenue.submit",
+    name: "SimulatedVenue",
+    member: "submit",
+    valid: PLACEMENT_PLAN,
+    argumentIsData: true,
+    // ADAPTER: `submit` answers an `ExecutionResult`, never a `SimulationResult`,
+    // because ADR-020 §6's bound has to be honoured by REFUSING rather than by
+    // rejecting. Its refusal fields are mapped onto the battery's shape here, so
+    // the battery measures the venue's own answer rather than a proxy for it.
+    drive: async (value) => executionResultAsResult(await probeVenue().submit(value as never)),
+  },
+  {
+    id: "SimulatedVenue.submitAll",
+    name: "SimulatedVenue",
+    member: "submitAll",
+    valid: () => [PLACEMENT_PLAN()],
+    // The argument is a LIST, not a record: each PLAN in it is the caller data
+    // record, and `submit` materializes each one. The batch's own read of the
+    // caller is the scheduling PRIORITY, taken once per plan through a total
+    // guard — measured by `a batch schedules on a priority it read once` below.
+    argumentIsData: false,
+    // ADAPTER: a batch is refused when ANY of its results is, so a hostile plan
+    // planted beside a valid one cannot pass by hiding behind the valid one.
+    drive: async (value) => {
+      const results = await probeVenue().submitAll(value as never);
+      for (const result of results) {
+        const mapped = executionResultAsResult(result);
+        if (!mapped.ok) return mapped;
+      }
+      return simulationOk(results);
+    },
+  },
+  {
+    id: "SimulatedVenue.cancel",
+    name: "SimulatedVenue",
+    member: "cancel",
+    valid: () => ({
+      executionPlanId: "plan-1",
+      reason: "kill switch",
+      scope: { orderIds: ["o-1"] },
+      priority: "SAFETY_CANCEL",
+    }),
+    argumentIsData: true,
+    // ADAPTER: `CancelResult` carries no refusal field, so an unreadable command
+    // is reported the way §6 invariant 13 requires — nothing cancelled, and the
+    // reason in `notCancelled` under the venue's own marker id. Only that marker
+    // is read as a refusal: "order id `o-1` is unknown to this venue" is a
+    // perfectly good CANCEL RESULT and must not be mistaken for an input refusal.
+    drive: async (value) => cancelResultAsResult(await probeVenue().cancel(value as never)),
+  },
 ];
+
+/**
+ * A venue with every option the probes above need, positioned at nothing.
+ *
+ * Freshly built per drive, because these doors MUTATE: a venue that already
+ * knows `o-1` refuses the second submission of it (§6 invariant 6), which would
+ * make every probe after the first refuse for the wrong reason.
+ */
+function probeVenue(): SimulatedVenue {
+  const clock = createReplayClock({
+    receivedAt: "2026-01-01T00:00:00.000Z",
+    receivedMonotonicNs: "1000",
+  });
+  if (!clock.ok) throw new Error("the probe clock refused");
+  const venue = new SimulatedVenue({
+    clock: clock.value,
+    runMode: "BACKTEST",
+    model: tier0Model({ fillModelVersion: "sim/tier0/v1", fillModelParametersHash: "0".repeat(64) }),
+    feeSnapshot: FEE_SNAPSHOT() as never,
+    rateLimits: unmodeledRateLimits("no venue budget model is wired in this test"),
+    policy: {
+      timeInForceFor: () => "GTC",
+      statedExpiryNsFor: () => undefined,
+      sameInstantAdditionsFor: () => "NOT_OBSERVED",
+    },
+    startingCash: "1000",
+    books: { book: () => BOOK_PORT as never },
+  });
+  // POSITIONED: the venue refuses to produce anything anchored to no recorded
+  // event, so a probe against an unpositioned one would measure that refusal
+  // instead of the door under test.
+  const positioned = venue.observe(AT_EVENT() as never);
+  if (!positioned.ok) throw new Error(`the probe venue refused its own identity: ${positioned.refusal.message}`);
+  return venue;
+}
+
+/** A valid placement plan for the venue above: one non-crossing resting order. */
+function PLACEMENT_PLAN(): Record<string, unknown> {
+  return {
+    executionPlanId: "plan-1",
+    runMode: "BACKTEST",
+    planKind: "POSITION",
+    priority: "PLACEMENT",
+    groups: [
+      {
+        marketId: "m-1",
+        orders: [
+          {
+            plannedOrderId: "o-1",
+            side: "YES",
+            action: "BUY",
+            limitPrice: "0.4",
+            shares: "10",
+            postOnly: true,
+            executionStyle: "REST",
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function executionResultAsResult(result: {
+  readonly accepted: boolean;
+  readonly refusalCode?: string;
+  readonly refusalMessage?: string;
+}): SimulationResult<unknown> {
+  if (result.accepted) return simulationOk(result);
+  return simulationFailure(
+    (result.refusalCode ?? "SIMULATION_INTERNAL") as never,
+    result.refusalMessage ?? "the venue refused without saying why",
+  );
+}
+
+/** The venue's own marker for "the command could not be read as data". */
+const UNREADABLE_COMMAND = "(the command could not be read)";
+
+function cancelResultAsResult(result: {
+  readonly notCancelled: readonly { readonly simulatedOrderId: string; readonly reason: string }[];
+}): SimulationResult<unknown> {
+  const unreadable = result.notCancelled.find(
+    (entry) => entry.simulatedOrderId === UNREADABLE_COMMAND,
+  );
+  if (unreadable === undefined) return simulationOk(result);
+  const [code, ...rest] = unreadable.reason.split(": ");
+  return simulationFailure((code ?? "SIMULATION_INTERNAL") as never, rest.join(": "));
+}
 
 function manifestPinsFixture(): Record<string, unknown> {
   const pins = runPins();
@@ -1450,6 +1778,96 @@ const NON_RECORD_DOORS: Readonly<Record<string, string>> = Object.freeze({
   totally: "a label and a FUNCTION — the totality guard itself",
 });
 
+// ---------------------------------------------------------------------------
+// The partition, extended to CLASS MEMBERS (round-4 review, MEDIUM-2)
+// ---------------------------------------------------------------------------
+
+/**
+ * The five buckets a public class member may be in.
+ *
+ * `RECORD DOOR` is the only one that is not self-describing: it is a CLAIM that
+ * the member is entered in {@link RECORD_DOORS}, and the partition test below
+ * checks it, so tagging a method `RECORD DOOR` subscribes it to the whole nested
+ * hostility battery rather than exempting it.
+ */
+const MEMBER_BUCKETS = [
+  "RECORD DOOR",
+  "ONE-READ DOOR",
+  "NON-RECORD DOOR",
+  "PORT ANSWER",
+  "PURE HELPER",
+] as const;
+
+/**
+ * Every public member of every exported CLASS, classified.
+ *
+ * WHY THIS EXISTS. Round-4 review MEDIUM-2: the partition covered exported
+ * FUNCTIONS and explicitly filtered class constructors out, so every method of
+ * `SimulatedVenue`, `ReplayClock`, `DatasetEventSource` and `SeededStream` was
+ * outside it. The reviewer ADDED an unclassified caller-record method to
+ * `SimulatedVenue` and it survived all 5268 tests. The table below is walked
+ * against the real prototypes and statics, so the same mutation now fails BY
+ * NAME.
+ *
+ * THE BUCKETS, and what each one asserts:
+ *
+ * - **RECORD DOOR** — takes a caller DATA record, materializes it before
+ *   validating or computing, and is driven by the nested battery.
+ * - **ONE-READ DOOR** — takes a caller record and does NOT materialize it,
+ *   because it runs once per delivered event and a copy per event is the cost
+ *   the design refuses. It reads each PRIMITIVE field exactly once into a local
+ *   and is totality-guarded. There is exactly ONE, and its two properties are
+ *   probed by name below.
+ * - **NON-RECORD DOOR** — its argument is a PORT, a FUNCTION, BYTES, a
+ *   PRIMITIVE, or a value this package itself built.
+ * - **PORT ANSWER** — takes NO caller argument: a getter or a nullary method
+ *   over the object's own state. Nothing to materialize; the claim is that it is
+ *   TOTAL and hands out no alias of live internal state.
+ * - **PURE HELPER** — answers a VALUE rather than `{ ok }`, with the door that
+ *   validated what reaches it named.
+ */
+const CLASS_MEMBERS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
+  SimulatedVenue: Object.freeze({
+    fills: "PORT ANSWER — no argument; answers a FROZEN COPY of the fill list, never the live array",
+    atEvent: "PORT ANSWER — no argument; answers the materialized identity `observe` stored",
+    ordersSnapshot: "PORT ANSWER — no argument; a fresh array of frozen orders, ordered by id",
+    restingBands: "PORT ANSWER — no argument; a fresh array of frozen bands, ordered by id",
+    observe: "RECORD DOOR",
+    observeTrade: "RECORD DOOR",
+    submit: "RECORD DOOR",
+    submitAll: "RECORD DOOR",
+    cancel: "RECORD DOOR",
+    queryAccountState:
+      "PORT ANSWER — no argument; totality-guarded, and every member of the snapshot is a tree this package built",
+  }),
+  ReplayClock: Object.freeze({
+    now: "PORT ANSWER — no argument; the recorded instant the clock is positioned at",
+    monotonicNs: "PORT ANSWER — no argument",
+    epochMilliseconds: "PORT ANSWER — no argument; derived arithmetically, never parsed",
+    observations: "PORT ANSWER — no argument; a frozen prototype-free diagnostic record",
+    advanceTo: "ONE-READ DOOR",
+    positionedAt:
+      "PURE HELPER — three validated PRIMITIVES; `createReplayClock` is the door that validated them",
+  }),
+  DatasetEventSource: Object.freeze({
+    clock: "PORT ANSWER — no argument; the `ReplayClock` this source drives, which is itself a port",
+    loaded: "PORT ANSWER — no argument; the verified dataset this package built",
+    refusal: "PORT ANSWER — no argument; the frozen refusal that ended iteration, if any",
+    report: "PORT ANSWER — no argument; a frozen prototype-free counter record",
+    events: "PORT ANSWER — no argument; the §12.1 stream itself",
+    identityOf:
+      "PURE HELPER — a `ReplayRecord` this package BUILT (`loadDataset` materializes every decoded row and emits it frozen); it answers a value, not `{ ok }`",
+    create:
+      "NON-RECORD DOOR — a `LoadedDataset` this package built and a NORMALIZER port, whose contract is its `normalize` method",
+  }),
+  SeededStream: Object.freeze({
+    draws: "PORT ANSWER — no argument; the draw counter",
+    nextUint64: "PORT ANSWER — no argument; the next draw",
+    nextBelow:
+      "PURE HELPER — a PRIMITIVE `bigint` bound; its caller is `sampleLatency`, over a distribution `readLatencyModel` validated",
+  }),
+});
+
 describe("the record-door table is DERIVED, not maintained (round-3 review, LOW-1)", () => {
   it("partitions the whole export surface: a tenth door cannot be added unclassified", () => {
     // THE MECHANISM. Round 3: the old table was hand-written and checked by
@@ -1469,7 +1887,11 @@ describe("the record-door table is DERIVED, not maintained (round-3 review, LOW-
       )
       .sort();
 
-    const recordDoorNames = new Set(RECORD_DOORS.map((door) => door.name));
+    const recordDoorNames = new Set(
+      // The class-member entries are partitioned by CLASS_MEMBERS below, against
+      // the real prototypes, rather than against the exported-function list.
+      RECORD_DOORS.filter((door) => door.member === undefined).map((door) => door.name),
+    );
     const nonRecordDoorNames = new Set(Object.keys(NON_RECORD_DOORS));
     const pureHelperNames = new Set(Object.keys(PURE_HELPERS));
 
@@ -1527,13 +1949,347 @@ describe("the record-door table is DERIVED, not maintained (round-3 review, LOW-
     }
     expect(faults, faults.join("\n")).toEqual([]);
   });
+
+  it("the walker walks PAST a port's methods into its data (round-4 review, NOTE-2)", () => {
+    // The mechanism, measured on a SYNTHETIC hybrid, because no fixture here is
+    // one: `BOOK_PORT` carries methods beside PRIMITIVE data, and a primitive
+    // holds no position a hostility class could be planted at. Before the fix the
+    // walker `return`ed at the first function-valued member and the whole subtree
+    // — including `hybrid.nested` — was silently unprobed.
+    const hybrid: RecordDoor = {
+      id: "synthetic hybrid",
+      name: "synthetic",
+      valid: () => ({
+        port: {
+          method: () => undefined,
+          identity: "a primitive, which yields no position",
+          nested: { deeper: { leaf: 1 } },
+        },
+        plain: { leaf: 1 },
+      }),
+      argumentIsData: false,
+      drive: () => simulationOk(null),
+    };
+    const derived = deriveRecordPaths(hybrid).map(describePath);
+    // The PORT itself is not a data position…
+    expect(derived).not.toContain("port");
+    // …and its data subtree is.
+    expect(derived).toContain("port.nested");
+    expect(derived).toContain("port.nested.deeper");
+    expect(derived).toContain("plain");
+  });
+
+  it("every union with a record arm has a second-arm fixture (round-4 review, NOTE-1)", () => {
+    // The walker can only derive positions a fixture INSTANTIATES, so a union
+    // whose record arm is never built is never probed. `SameInstantAdditions` is
+    // the only such union in these fixtures; both arms are entered, and the
+    // record arm really does yield a derived position (otherwise the second entry
+    // would be a duplicate of the first and would measure nothing).
+    const firstArm = RECORD_DOORS.find((door) => door.id === "simulateResting");
+    const secondArm = RECORD_DOORS.find(
+      (door) => door.id === "simulateResting (observed same-instant additions arm)",
+    );
+    expect(firstArm, "the first-arm entry disappeared").toBeDefined();
+    expect(secondArm, "the second-arm entry disappeared").toBeDefined();
+    if (firstArm === undefined || secondArm === undefined) return;
+    const first = deriveRecordPaths(firstArm).map(describePath);
+    const second = deriveRecordPaths(secondArm).map(describePath);
+    expect(first).not.toContain("order.sameInstantAdditions");
+    expect(second).toContain("order.sameInstantAdditions");
+
+    const bandArm = RECORD_DOORS.find(
+      (door) => door.id === "checkBandOrdering (observed same-instant additions arm)",
+    );
+    expect(bandArm, "the band's second-arm entry disappeared").toBeDefined();
+    if (bandArm === undefined) return;
+    expect(deriveRecordPaths(bandArm).map(describePath)).toContain("sameInstantAdditions");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The partition, over CLASS MEMBERS (round-4 review, MEDIUM-2)
+// ---------------------------------------------------------------------------
+
+/** Every public member of one exported class, as the runtime really has them. */
+function publicMembersOf(constructor: unknown): readonly string[] {
+  const value = constructor as { readonly prototype: object };
+  const statics = Object.getOwnPropertyNames(constructor).filter(
+    (key) => !["length", "name", "prototype"].includes(key),
+  );
+  const members = Object.getOwnPropertyNames(value.prototype).filter((key) => key !== "constructor");
+  return [...statics, ...members].sort();
+}
+
+/** Every exported CLASS, by export name. */
+function exportedClasses(): readonly (readonly [string, unknown])[] {
+  const exported = simulation as unknown as Record<string, unknown>;
+  return Object.keys(exported)
+    .filter(
+      (name) =>
+        typeof exported[name] === "function" &&
+        /^class[\s{]/u.test(Function.prototype.toString.call(exported[name])),
+    )
+    .sort()
+    .map((name) => [name, exported[name]] as const);
+}
+
+describe("the partition covers CLASS MEMBERS too (round-4 review, MEDIUM-2)", () => {
+  it("classifies every public member of every exported class", () => {
+    // THE MUTATION THIS CATCHES, by name: the reviewer added a caller-record
+    // method to `SimulatedVenue` and it survived all 5268 tests, because the
+    // partition filtered class constructors out and stopped at exported
+    // FUNCTIONS. Every prototype member and every static of every exported class
+    // is now walked against CLASS_MEMBERS.
+    const unclassified: string[] = [];
+    const badBucket: string[] = [];
+    const stale: string[] = [];
+    let membersChecked = 0;
+
+    for (const [className, constructor] of exportedClasses()) {
+      const declared = CLASS_MEMBERS[className];
+      if (declared === undefined) {
+        unclassified.push(`${className}: the whole class is classified nowhere`);
+        continue;
+      }
+      const actual = publicMembersOf(constructor);
+      for (const member of actual) {
+        membersChecked += 1;
+        const bucket = declared[member];
+        if (bucket === undefined) {
+          unclassified.push(`${className}.${member}`);
+          continue;
+        }
+        if (!MEMBER_BUCKETS.some((known) => bucket.startsWith(known))) {
+          badBucket.push(`${className}.${member}: "${bucket}" names no known bucket`);
+        }
+      }
+      for (const member of Object.keys(declared)) {
+        if (!actual.includes(member)) {
+          stale.push(`CLASS_MEMBERS lists ${className}.${member}, which the class does not have`);
+        }
+      }
+    }
+    // Every class in the table is a class the package still exports.
+    const classNames = exportedClasses().map(([name]) => name);
+    for (const className of Object.keys(CLASS_MEMBERS)) {
+      if (!classNames.includes(className)) {
+        stale.push(`CLASS_MEMBERS lists ${className}, which is not an exported class`);
+      }
+    }
+
+    expect(
+      unclassified,
+      `these public class members are classified nowhere — add each to CLASS_MEMBERS as a RECORD DOOR (which subscribes it to the nested hostility battery via RECORD_DOORS), or as a ONE-READ DOOR / NON-RECORD DOOR / PORT ANSWER / PURE HELPER with the reason:\n${unclassified.join("\n")}`,
+    ).toEqual([]);
+    expect(badBucket, badBucket.join("\n")).toEqual([]);
+    expect(stale, stale.join("\n")).toEqual([]);
+    // Not vacuous: the four exported classes really were walked.
+    expect(classNames).toEqual(["DatasetEventSource", "ReplayClock", "SeededStream", "SimulatedVenue"]);
+    expect(membersChecked).toBeGreaterThan(24);
+  });
+
+  it("a member tagged RECORD DOOR really is driven by the nested battery", () => {
+    // Tagging is a CLAIM, not a waiver: `RECORD DOOR` means "entered in
+    // RECORD_DOORS", so it cannot be used to exempt a method from the battery.
+    const driven = new Set(
+      RECORD_DOORS.filter((door) => door.member !== undefined).map(
+        (door) => `${door.name}.${String(door.member)}`,
+      ),
+    );
+    const missing: string[] = [];
+    const extra: string[] = [];
+    for (const [className, members] of Object.entries(CLASS_MEMBERS)) {
+      for (const [member, bucket] of Object.entries(members)) {
+        const qualified = `${className}.${member}`;
+        if (bucket.startsWith("RECORD DOOR") && !driven.has(qualified)) {
+          missing.push(`${qualified} is tagged RECORD DOOR but has no RECORD_DOORS entry`);
+        }
+        if (!bucket.startsWith("RECORD DOOR") && driven.has(qualified)) {
+          extra.push(`${qualified} is driven as a record door but is not tagged one`);
+        }
+      }
+    }
+    expect(missing, missing.join("\n")).toEqual([]);
+    expect(extra, extra.join("\n")).toEqual([]);
+    expect(driven.size).toBe(5);
+  });
+
+  it("the ONE-READ carve-out is exactly one member, and both its claims hold", () => {
+    // The carve-out is named, counted, and PROBED — it is the one place in this
+    // package where a caller record is read without being materialized.
+    const oneRead: string[] = [];
+    for (const [className, members] of Object.entries(CLASS_MEMBERS)) {
+      for (const [member, bucket] of Object.entries(members)) {
+        if (bucket.startsWith("ONE-READ DOOR")) oneRead.push(`${className}.${member}`);
+      }
+    }
+    expect(oneRead).toEqual(["ReplayClock.advanceTo"]);
+
+    const built = createReplayClock({
+      receivedAt: "2026-01-01T00:00:00.000Z",
+      receivedMonotonicNs: "1000",
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const clock = built.value;
+
+    // CLAIM 1 — one read per field: an accessor cannot answer the monotonicity
+    // check with one value and position the clock with another.
+    let monotonicReads = 0;
+    const lying = {} as Record<string, unknown>;
+    Object.defineProperty(lying, "receivedAt", {
+      value: "2026-01-01T00:00:01.000Z",
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(lying, "receivedMonotonicNs", {
+      get: () => {
+        monotonicReads += 1;
+        return monotonicReads <= 1 ? "2000" : "999999999";
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const advanced = clock.advanceTo(lying as never);
+    expect(advanced.ok).toBe(true);
+    expect(monotonicReads).toBe(1);
+    expect(clock.monotonicNs()).toBe(2000n);
+
+    // CLAIM 2 — total: a throwing accessor is CONTAINED, not raised at the
+    // caller. Round-4 review LOW-1: at `d56e707` this threw the caller's own
+    // `Error` out of a door whose signature promises a typed refusal.
+    const throwing = {} as Record<string, unknown>;
+    Object.defineProperty(throwing, "receivedAt", {
+      get: () => {
+        throw new Error("an accessor that throws inside advanceTo");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    let thrown: unknown;
+    let contained: SimulationResult<null> | undefined;
+    try {
+      contained = clock.advanceTo(throwing as never);
+    } catch (cause) {
+      thrown = cause;
+    }
+    expect(thrown).toBeUndefined();
+    expect(contained?.ok).toBe(false);
+    if (contained === undefined || contained.ok) return;
+    expect(contained.refusal.code).toBe("SIMULATION_INTERNAL");
+    // …and the clock did not move on the failed read.
+    expect(clock.monotonicNs()).toBe(2000n);
+  });
+
+  it("a batch schedules on a priority it read once, and a throwing one is contained", async () => {
+    // `submitAll`'s ONE caller read is the scheduling priority (§6 invariant 13).
+    // At `d56e707` it was read raw inside the sort comparator, so a THROWING
+    // accessor escaped as a rejected promise out of a method that answers a list
+    // of results.
+    let reads = 0;
+    const throwing = { ...PLACEMENT_PLAN() } as Record<string, unknown>;
+    delete throwing["priority"];
+    Object.defineProperty(throwing, "priority", {
+      get: () => {
+        reads += 1;
+        throw new Error("a priority accessor that throws");
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    let rejected: unknown;
+    let results: readonly { readonly accepted: boolean; readonly refusalCode?: string }[] = [];
+    try {
+      results = await probeVenue().submitAll([throwing] as never);
+    } catch (cause) {
+      rejected = cause;
+    }
+    expect(rejected).toBeUndefined();
+    expect(reads).toBe(1);
+    expect(results.length).toBe(1);
+    expect(results[0]?.accepted).toBe(false);
+    expect(results[0]?.refusalCode).toBe("SIMULATION_INPUT_NOT_DATA");
+
+    // …and the §6 invariant 13 ordering still holds for readable plans: a
+    // SAFETY_CANCEL plan is submitted before a PLACEMENT one whatever order they
+    // arrive in.
+    const cancelPlan = {
+      executionPlanId: "cancel-1",
+      runMode: "BACKTEST",
+      planKind: "CANCEL",
+      priority: "SAFETY_CANCEL",
+      reason: "kill switch",
+      scope: { orderIds: [] as string[] },
+    };
+    const ordered = await probeVenue().submitAll([PLACEMENT_PLAN(), cancelPlan] as never);
+    expect(ordered.map((result) => result.executionPlanId)).toEqual(["cancel-1", "plan-1"]);
+  });
+
+  it("every PORT ANSWER is total and hands out no alias of live state", async () => {
+    // A member that takes no caller argument still has two properties worth
+    // measuring: it cannot throw, and it cannot hand a consumer the venue's own
+    // mutable state. Round-4 review MEDIUM-2's sweep found `SimulatedVenue.fills`
+    // handing out `this.#fills` itself, which `runReplay` reads to build the
+    // §12.4 bytes — so a consumer could push a fill the venue never produced.
+    const venue = probeVenue();
+    venue.observe(AT_EVENT() as never);
+    const submitted = await venue.submit(PLACEMENT_PLAN() as never);
+    expect(submitted.accepted, submitted.refusalMessage ?? "").toBe(true);
+
+    const fills = venue.fills as unknown as unknown[];
+    expect(Object.isFrozen(fills)).toBe(true);
+    expect(venue.fills).not.toBe(venue.fills); // a fresh copy each read
+    const orders = venue.ordersSnapshot();
+    expect(orders).not.toBe(venue.ordersSnapshot());
+    expect(venue.atEvent).toBeDefined();
+    expect(Object.isFrozen(venue.atEvent)).toBe(true);
+
+    // Total under every pollution class, for every no-argument member of every
+    // exported class the table classifies as a PORT ANSWER.
+    const clock = createReplayClock({
+      receivedAt: "2026-01-01T00:00:00.000Z",
+      receivedMonotonicNs: "1000",
+    });
+    expect(clock.ok).toBe(true);
+    if (!clock.ok) return;
+    const instances: Readonly<Record<string, unknown>> = {
+      SimulatedVenue: venue,
+      ReplayClock: clock.value,
+      SeededStream: deriveStreams("42")["latency.decision"],
+    };
+    const escapes: string[] = [];
+    for (const battery of CLASSES) {
+      const failures = await underPollutionAsync(battery.install, async () => {
+        const found: string[] = [];
+        for (const [className, members] of Object.entries(CLASS_MEMBERS)) {
+          const instance = instances[className];
+          if (instance === undefined) continue; // driven by its own suite
+          for (const [member, bucket] of Object.entries(members)) {
+            if (!bucket.startsWith("PORT ANSWER")) continue;
+            try {
+              const read: unknown = (instance as Record<string, unknown>)[member];
+              if (typeof read === "function") {
+                const answered: unknown = (read as () => unknown).call(instance);
+                if (answered instanceof Promise) await answered;
+              }
+            } catch (cause) {
+              found.push(`${battery.name}/${className}.${member}: ${String(cause)}`);
+            }
+          }
+        }
+        return found;
+      });
+      escapes.push(...failures);
+    }
+    expect(escapes, escapes.join("\n")).toEqual([]);
+  });
 });
 
 describe("D1: a door materializes its caller record before it touches it", () => {
-  it("every record door ACCEPTS its valid example (the probes below are not vacuous)", () => {
+  it("every record door ACCEPTS its valid example (the probes below are not vacuous)", async () => {
     const faults: string[] = [];
     for (const door of RECORD_DOORS) {
-      const outcome = door.drive(door.valid());
+      const outcome = await door.drive(door.valid());
       if (!outcome.ok) {
         faults.push(`${door.id}: ${outcome.refusal.code}: ${outcome.refusal.message}`);
       }
@@ -1541,7 +2297,7 @@ describe("D1: a door materializes its caller record before it touches it", () =>
     expect(faults, faults.join("\n")).toEqual([]);
   });
 
-  it("REFUSES every hostility class, at every record it claims, NESTED", () => {
+  it("REFUSES every hostility class, at every record it claims, NESTED", async () => {
     // Faults are COLLECTED, not asserted inside the loop: a bare `expect` throws
     // on the first door and the remaining ones are never measured, so a
     // regression in the twentieth door would hide behind one in the first.
@@ -1561,7 +2317,10 @@ describe("D1: a door materializes its caller record before it touches it", () =>
           let outcome: SimulationResult<unknown> | undefined;
           let thrown: unknown;
           try {
-            outcome = door.drive(argument);
+            // AWAITED (round-4 review, MEDIUM-2): a door that fails one tick
+            // later has still failed, and three of the members this table now
+            // covers are async.
+            outcome = await door.drive(argument);
           } catch (cause) {
             thrown = cause;
           }
@@ -1598,7 +2357,7 @@ describe("D1: a door materializes its caller record before it touches it", () =>
     expect(probes).toBeGreaterThan(150);
   });
 
-  it("REFUSES the same three classes at the ROOT of each record", () => {
+  it("REFUSES the same three classes at the ROOT of each record", async () => {
     // The round-2 shape, kept: hostility planted ON the record rather than
     // inside it. Both are measured because they fail differently — a door that
     // checks `typeof input.order === "object"` before materializing would pass
@@ -1629,7 +2388,7 @@ describe("D1: a door materializes its caller record before it touches it", () =>
           let outcome: SimulationResult<unknown> | undefined;
           let thrown: unknown;
           try {
-            outcome = door.drive(argument);
+            outcome = await door.drive(argument);
           } catch (cause) {
             thrown = cause;
           }
@@ -1652,7 +2411,7 @@ describe("D1: a door materializes its caller record before it touches it", () =>
     expect(faults, faults.join("\n")).toEqual([]);
   });
 
-  it("emits a tree of its OWN, not an alias of the caller's record", () => {
+  it("emits a tree of its OWN, not an alias of the caller's record", async () => {
     // D4 on the way out, and the reason D1 has to happen on the way in: the
     // emitted value must not be the caller's object, or a later mutation of the
     // caller's object would change a value this package already answered with.
@@ -1662,7 +2421,7 @@ describe("D1: a door materializes its caller record before it touches it", () =>
     const faults: string[] = [];
     for (const door of RECORD_DOORS) {
       const offered = door.valid();
-      const outcome = door.drive(offered);
+      const outcome = await door.drive(offered);
       if (!outcome.ok) {
         faults.push(`${door.id}: ${outcome.refusal.code}: ${outcome.refusal.message}`);
         continue;
@@ -1670,6 +2429,21 @@ describe("D1: a door materializes its caller record before it touches it", () =>
       const emitted: unknown = outcome.value;
       if (emitted === offered) faults.push(`${door.id}: emitted the caller's own object`);
       if (emitted === null || typeof emitted !== "object") continue;
+      if (Array.isArray(emitted)) {
+        // A LIST answer (a batch of results): the container must be frozen and
+        // every member must be its own frozen prototype-free tree. Checking the
+        // container's prototype would only assert that `Array.prototype` is
+        // `Array.prototype`.
+        if (!Object.isFrozen(emitted)) faults.push(`${door.id}: emitted an unfrozen list`);
+        for (const member of emitted as readonly unknown[]) {
+          if (member === null || typeof member !== "object") continue;
+          if (Object.getPrototypeOf(member) !== null) {
+            faults.push(`${door.id}: emitted a list member with a prototype`);
+          }
+          if (!Object.isFrozen(member)) faults.push(`${door.id}: emitted an unfrozen list member`);
+        }
+        continue;
+      }
       // A door that answers a PRIMITIVE (a size, an id) has nothing to alias.
       if (Object.getPrototypeOf(emitted) !== null && !(emitted instanceof ReplayClock)) {
         faults.push(`${door.id}: emitted a value with a prototype`);

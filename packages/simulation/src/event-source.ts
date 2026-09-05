@@ -72,6 +72,7 @@ import {
   simulationFailure,
   simulationOk,
   totally,
+  totallyAsync,
   type SimulationRefusal,
   type SimulationResult,
 } from "./refusals.js";
@@ -468,11 +469,47 @@ export interface LoadDatasetOptions {
 
 /**
  * Verifies and orders a dataset. Total: every failure is a typed refusal.
+ *
+ * TOTAL INCLUDES THE PROMISE (round-4 review, MEDIUM-1's class). This door used
+ * to REJECT on a hostile options bag — `Cannot destructure property 'dataset' of
+ * 'options' as it is null`, `dataset.objects is not iterable` — and the
+ * whole-surface battery had not caught it because it swallowed rejections with
+ * `.catch(() => undefined)` instead of awaiting them. It now awaits.
  */
 export async function loadDataset(
   options: LoadDatasetOptions,
 ): Promise<SimulationResult<LoadedDataset>> {
+  return await totallyAsync("loading a dataset", async () => await loadDatasetInner(options));
+}
+
+async function loadDatasetInner(
+  options: LoadDatasetOptions,
+): Promise<SimulationResult<LoadedDataset>> {
+  if (options === null || typeof options !== "object") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "loading a dataset takes an options record naming the dataset, the archive reader and the digest",
+    );
+  }
   const { dataset, archive, digestSha256 } = options;
+  if (dataset === null || typeof dataset !== "object" || !Array.isArray(dataset.objects)) {
+    return simulationFailure(
+      "REPLAY_MANIFEST_INVALID",
+      "the dataset a load is given is the OUTPUT of `readDatasetManifestText`/`readDatasetManifestBytes`, which names the archived objects it pins",
+    );
+  }
+  if (archive === null || typeof archive !== "object" || typeof archive.readObject !== "function") {
+    return simulationFailure(
+      "REPLAY_ARCHIVE_UNREADABLE",
+      "loading a dataset needs an archive reader; without one there are no bytes to verify against the manifest's pins",
+    );
+  }
+  if (typeof digestSha256 !== "function") {
+    return simulationFailure(
+      "REPLAY_OBJECT_CHECKSUM_MISMATCH",
+      "loading a dataset needs a SHA-256 digest; §8.4 makes the manifest's checksums the trust boundary and they cannot be checked without one",
+    );
+  }
 
   const byOrdinal = new Map<number, ValidatedRow>();
   let objectsVerified = 0;
@@ -1116,13 +1153,24 @@ function checkProvenance(
 export async function runEventSource(
   source: DatasetEventSource,
 ): Promise<SimulationResult<readonly EventEnvelope<unknown>[]>> {
-  const out: EventEnvelope<unknown>[] = [];
-  for await (const envelope of source.events()) {
-    out.push(envelope);
-  }
-  const refusal = source.refusal;
-  if (refusal !== undefined) {
-    return { ok: false, refusal } as SimulationResult<readonly EventEnvelope<unknown>[]>;
-  }
-  return simulationOk(out);
+  // TOTAL INCLUDES THE PROMISE (round-4 review, MEDIUM-1's class): this door
+  // used to REJECT on a hostile argument (`Cannot read properties of null
+  // (reading 'events')`) and on a normalizer that THREW inside the iteration.
+  return await totallyAsync("draining a dataset event source", async () => {
+    if (source === null || typeof source !== "object" || typeof source.events !== "function") {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "draining an event source takes a `DatasetEventSource`; its contract is its `events()` stream",
+      );
+    }
+    const out: EventEnvelope<unknown>[] = [];
+    for await (const envelope of source.events()) {
+      out.push(envelope);
+    }
+    const refusal = source.refusal;
+    if (refusal !== undefined) {
+      return { ok: false, refusal } as SimulationResult<readonly EventEnvelope<unknown>[]>;
+    }
+    return simulationOk(out);
+  });
 }

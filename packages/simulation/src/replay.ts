@@ -47,7 +47,12 @@ import { replayPathEconomics, type ReplayPathEconomics } from "./markout.js";
 import { ownFrozenTree } from "./plain.js";
 import type { EventEnvelope, RecordedEventIdentity, SimulatedOrder } from "./ports.js";
 import type { RestingFillBand } from "./queue.js";
-import { simulationOk, totally, type SimulationResult } from "./refusals.js";
+import {
+  simulationFailure,
+  simulationOk,
+  totallyAsync,
+  type SimulationResult,
+} from "./refusals.js";
 import { serializeRun, type SerializableDelivery } from "./serialize.js";
 import type { SimulatedVenue } from "./venue.js";
 
@@ -109,10 +114,30 @@ export interface ReplayRunResult {
   readonly serialization: string;
 }
 
-/** Runs a replay. Total: every failure is a typed refusal. */
+/**
+ * Runs a replay. Total: every failure is a typed refusal.
+ *
+ * TOTAL INCLUDES THE PROMISE (round-4 review, MEDIUM-1's class). `runReplay`
+ * used to REJECT on a hostile options bag — `Cannot read properties of null
+ * (reading 'runPins')` — which the whole-surface battery had not caught because
+ * it swallowed rejections instead of awaiting them. It now awaits, and this door
+ * answers through {@link ./refusals.js#totallyAsync}.
+ */
 export async function runReplay(
   options: ReplayRunOptions,
 ): Promise<SimulationResult<ReplayRunResult>> {
+  return await totallyAsync("running a replay", async () => await runReplayInner(options));
+}
+
+async function runReplayInner(
+  options: ReplayRunOptions,
+): Promise<SimulationResult<ReplayRunResult>> {
+  if (options === null || typeof options !== "object") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a replay run takes an options record naming its dataset, archive, digest, normalizer and run pins",
+    );
+  }
   // Validated BEFORE anything is read: ADR-012 §4 — "A result whose fill-model
   // parameters are not pinned is not reproducible and is not evidence of
   // anything." A run that cannot be cited is refused rather than produced.
@@ -153,7 +178,13 @@ export async function runReplay(
       }
       eventsDelivered += 1;
       const identity = DatasetEventSource.identityOf(record);
-      options.venue?.observe(identity);
+      // `observe` ANSWERS now (round-4 review, MEDIUM-1): it materializes the
+      // identity it will stamp on every order, fill and snapshot, so it can
+      // refuse one. A refusal STOPS the run — a venue positioned at nothing is
+      // not a venue whose output is anchored to a recorded event (§6 invariant
+      // 15), and continuing would produce results anchored to the PREVIOUS one.
+      const positioned = options.venue?.observe(identity);
+      if (positioned !== undefined && !positioned.ok) return positioned;
       const hook = options.coreLoop;
       if (hook !== undefined) {
         const outcome = await hook({
@@ -225,17 +256,4 @@ export async function runReplay(
 
 function collectOrders(venue: SimulatedVenue | undefined): readonly SimulatedOrder[] {
   return venue === undefined ? [] : venue.ordersSnapshot();
-}
-
-async function totallyAsync<TValue>(
-  what: string,
-  compute: () => Promise<SimulationResult<TValue>>,
-): Promise<SimulationResult<TValue>> {
-  try {
-    return await compute();
-  } catch (cause) {
-    return totally(what, () => {
-      throw cause;
-    });
-  }
 }

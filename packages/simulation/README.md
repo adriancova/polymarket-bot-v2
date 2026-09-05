@@ -48,7 +48,7 @@ This package's event source parses RECORDED WIRE DATA, so ADR-020 §3 applies.
 
 | Step | What this package does |
 | --- | --- |
-| **D1 — materialize prototype-free before parsing** | Manifest and pin BYTES go through `strict-json.ts`, which BUILDS the tree with `Object.create(null)` and `Object.defineProperty` as it parses, so there is no intermediate `JSON.parse` result at all. Decoded dataset rows go through `plain.ts`'s `materializeInput`, which reads property DESCRIPTORS (a getter is refused without being invoked), refuses `__proto__` as a name, symbol keys, accessors, cycles, sparse holes and non-plain prototypes. **Every door materializes every caller-supplied DATA argument** through `readOwnPlainInput` before it validates or computes, reads only the materialized tree afterwards, and never returns the caller's own object. What is NOT materialized is exactly: a PORT (an object whose contract is its methods — `BookView`, `MidTimeline`, `DepthTimeline`, `DatasetArchiveReader`, a seeded stream), a FUNCTION, BYTES (`strict-json.ts` is itself the D1 reader for those), and a PRIMITIVE. A door's own OPTIONS BAG is a call-site literal and is read ONCE PER FIELD, so one read cannot be made to disagree with a later one. See `plain.ts`'s `readOwnPlainInput` for the table, and §5 item 10 for the one shape this policy refuses that a root might legitimately build. |
+| **D1 — materialize prototype-free before parsing** | Manifest and pin BYTES go through `strict-json.ts`, which BUILDS the tree with `Object.create(null)` and `Object.defineProperty` as it parses, so there is no intermediate `JSON.parse` result at all. Decoded dataset rows go through `plain.ts`'s `materializeInput`, which reads property DESCRIPTORS (a getter is refused without being invoked), refuses `__proto__` as a name, symbol keys, accessors, cycles, sparse holes and non-plain prototypes. **Every exported function, and every public method of every exported class, that takes a caller-supplied DATA argument materializes it** through `readOwnPlainInput` before it validates or computes, reads only the materialized tree afterwards, and never returns the caller's own object. What is NOT materialized is exactly: a PORT (an object whose contract is its methods — `BookView`, `MidTimeline`, `DepthTimeline`, `DatasetArchiveReader`, a seeded stream), a FUNCTION, BYTES (`strict-json.ts` is itself the D1 reader for those), a PRIMITIVE, a value this package itself built, and **one named carve-out**: `ReplayClock.advanceTo` runs once per delivered event, so it reads each of its two PRIMITIVE fields exactly once into a local instead of copying a record per event — and is totality-guarded, so a throwing accessor is contained rather than raised. A door's own OPTIONS BAG is likewise a call-site literal read ONCE PER FIELD, so one read cannot be made to disagree with a later one. See `plain.ts`'s `readOwnPlainInput` for the table, and §5 item 10 for the one shape this policy refuses that a root might legitimately build. |
 | **D2 — parse through a severed, warmed arena** | **Not applicable, and that is the strongest form of it rather than a waiver.** D2 exists to sever a `zod` node's `_zod` container and force its lazies. This package runs no schema library, and `zod` is absent from its ENTIRE dependency closure: it declares one workspace dependency, `@polymarket-bot/decimal`, which depends on `decimal.js` and `node:crypto` only. There is therefore no `skipChecks` / `optin` / `optout` / `when` / `values` slot to inherit and no lazy build to poison. `test/unit/simulation/purity.test.ts` checks the closure from the manifests; `doors.test.ts` installs those exact keys anyway and measures that nothing moves. |
 | **D3 — take values from the materialized tree** | By construction: there is no library output to take them from. Every field is read with `readField`, an own-property read of the materialized tree. |
 | **D4 — emit prototype-free** | Every emitted record is `ownFrozenTree`: null prototype, deep-frozen, `undefined` members dropped, so an absent optional field cannot be answered by a polluted `Object.prototype` in the consumer. Its copier reads DESCRIPTORS, is cycle-guarded and is bounded at `MAX_INPUT_DEPTH`; because D1 now runs first at every record door, those guards are ASSERTIONS about trees this package built, and a violation raises inside a totality guard rather than producing a partial tree. Round-3 review MEDIUM-1: `checkBandOrdering`'s OK path returned the CALLER'S OWN band — unfrozen, prototype-bearing — which contradicted this row; `doors.test.ts` now asserts the property for every record door rather than for the five it used to list. |
@@ -62,16 +62,24 @@ descriptor literals, `values`, and cold-lazy poisoning:
    VALUES, clean and under every class.
 2. **A `SAFETY_CANCEL` is byte-identical.** `SimulatedVenue.cancel` produces the
    same JSON bytes clean and under every class.
-3. **No throw escapes.** Every door is total under every class, including on
-   malformed and hostile input. `doors.test.ts` drives every exported DOOR — by
-   reflection, so a door added later is covered automatically — with a battery of
-   hostile arguments (`null`, a non-canonical decimal string, a `Proxy`, a
-   symbol, a null-prototype record, a CYCLIC record and array, a getter-bearing
-   record, a record nested past `MAX_INPUT_DEPTH`, and each of those three
-   classes NESTED inside a record whose keys the doors read) and requires a
-   refusal, never an exception. The cyclic argument is a VALID parameter set with
-   a self-reference, so it reaches the door's copy step rather than being
-   rejected on its first field.
+3. **No throw escapes, and no promise rejects.** Every door is total under every
+   class, including on malformed and hostile input. `doors.test.ts` drives every
+   exported DOOR — by reflection, so a door added later is covered automatically
+   — with a battery of hostile arguments (`null`, a non-canonical decimal string,
+   a `Proxy`, a symbol, a null-prototype record, a CYCLIC record and array, a
+   getter-bearing record, a record nested past `MAX_INPUT_DEPTH`, and each of
+   those three classes NESTED inside a record whose keys the doors read) and
+   requires a refusal, never an exception. The cyclic argument is a VALID
+   parameter set with a self-reference, so it reaches the door's copy step rather
+   than being rejected on its first field. An ASYNC door's answer is **awaited**
+   (round-4 review): a rejected promise is a throw that escapes one tick later,
+   and the battery used to discard it with `.catch(() => undefined)` — which is
+   how `loadDataset`, `runEventSource` and `runReplay` were rejecting on a
+   hostile options bag, and `SimulatedVenue.queryAccountState` on a
+   getter-bearing observed identity, with the suite green. Every async door now
+   answers through `refusals.ts`'s `totallyAsync`, and the two §12.1 seam methods
+   whose types carry no refusal field (`cancel`, `queryAccountState`) report one
+   the way their own shapes allow — see §5 item 12.
 4. **A caller record is refused, not read.** For every RECORD DOOR the bound is
    stronger: the cyclic / accessor / over-deep classes are planted at EVERY data
    position of a VALID argument — positions **derived by walking the fixture**,
@@ -81,13 +89,35 @@ descriptor literals, `values`, and cold-lazy poisoning:
    previous table named five doors and checked itself by list equality, so
    nothing detected a sixth. The three lists (record doors, non-record doors with
    the reason their argument is not data, pure helpers with the door that
-   validated what reaches them) must now PARTITION the export surface exactly, so
+   validated what reaches them) must PARTITION the exported FUNCTIONS exactly, so
    a new export fails the suite until it is classified — and classifying it as a
    record door subscribes it to the whole battery.
+5. **The partition covers CLASS METHODS too, not only exported functions**
+   (round-4 review MEDIUM-2). The previous mechanism filtered class constructors
+   out, so every method of `SimulatedVenue`, `ReplayClock`, `DatasetEventSource`
+   and `SeededStream` sat outside it — the reviewer added an unclassified
+   caller-record method to `SimulatedVenue` and it survived the whole suite.
+   `doors.test.ts` now walks each exported class's PROTOTYPE and STATICS and
+   requires every public member to be classified in exactly one of five buckets:
+   **record door** (materializes, and is entered in the battery table — so the
+   tag is a claim the suite checks, never a waiver), **one-read door** (the
+   single `ReplayClock.advanceTo` carve-out above, whose two properties are
+   probed by name), **non-record door** (its argument is a port, a function,
+   bytes, a primitive, or a value this package built), **port answer** (no caller
+   argument at all: it must be total and must hand out no alias of live internal
+   state), and **pure helper** (answers a value rather than `{ ok }`, with the
+   door that validated what reaches it named). `SimulatedVenue.observe`,
+   `observeTrade`, `submit`, `submitAll` and `cancel` are record doors and are
+   driven by the same nested battery as every exported one.
 
 `SimulatedVenue.submit` returns an `ExecutionResult` rather than a
 `SimulationResult`, so it honours the same bound by producing a REFUSED result:
-it never rejects its promise.
+it never rejects its promise. The battery drives it through that shape rather
+than around it — the adapter that maps `refusalCode`/`refusalMessage` onto the
+battery's verdict is in `doors.test.ts` beside the entry, so the venue's own
+answer is what is measured. A refused plan carries `executionPlanId: ""` when the
+plan itself could not be read as data, because a plan whose id is an accessor has
+no id this venue may quote.
 
 The validators are bound to the FROZEN contracts they mirror by
 `test/unit/simulation/grammar-cross.test.ts`, which compares each predicate with
@@ -241,10 +271,31 @@ key.
     prototype rather than a wrong answer.
 11. **A `bigint` is data at the doors whose records carry §7.1 instants, and
     nowhere else.** `RestingOrderInput.restingFromNs` and
-    `ObservedTrade.monotonicNs` are `bigint`, so `simulateResting` materializes
-    with `bigintIsData`. Every WIRE door keeps the default, which refuses a
-    `bigint`: one cannot come from JSON, so at a wire door its presence means the
-    value was constructed rather than recorded. A `bigint` is a primitive —
-    immutable, identity-free, carrying no prototype and no code — so admitting it
-    adopts nothing and invokes nothing, and every other non-plain value stays
-    refused under both settings.
+    `ObservedTrade.monotonicNs` are `bigint`, so `simulateResting` and
+    `SimulatedVenue.observeTrade` materialize with `bigintIsData`. Every WIRE
+    door keeps the default, which refuses a `bigint`: one cannot come from JSON,
+    so at a wire door its presence means the value was constructed rather than
+    recorded. `SimulatedVenue.observe` also keeps the default, because a
+    `RecordedEventIdentity` is four primitives and none of them is a `bigint`. A
+    `bigint` is a primitive — immutable, identity-free, carrying no prototype and
+    no code — so admitting it adopts nothing and invokes nothing, and every other
+    non-plain value stays refused under both settings.
+12. **Two §12.1 seam methods have no refusal field to refuse INTO, and say so in
+    the shapes they do have** (round-4 review MEDIUM-1). `ExecutionVenue` fixes
+    `cancel(): Promise<CancelResult>` and `queryAccountState(): Promise<AccountSnapshot>`,
+    and neither result type carries a refusal code — but rejecting the promise is
+    exactly what the bound above forbids, and it is what both were measured doing
+    at `d56e707`. So: `cancel` reports a command it could not read the way §6
+    invariant 13 requires a privileged-path failure to be reported — nothing in
+    `cancelled`, and the reason in `notCancelled` under the marker id
+    `(the command could not be read)`. `queryAccountState` answers a snapshot
+    whose `cashBalance` is `SIMULATION_INTERNAL_NO_ACCOUNT_STATE` — deliberately
+    NOT a decimal string, so a consumer's own §6 invariant 1 door refuses it
+    rather than reading a fabricated balance — with empty positions and open
+    orders and a `null` recorded event. That branch is reached when a member of
+    the snapshot is not own plain data, which in practice means a
+    `SimulatedVenueOptions.startingCash` the composition root did not construct
+    as a decimal string: it is the one caller value this method has no door in
+    front of, because `submit` refuses it by name and this method cannot. The
+    cost is real and is stated here rather than hidden: an operator reading that
+    snapshot learns the venue could not answer, not what its positions were.

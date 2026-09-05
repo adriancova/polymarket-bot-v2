@@ -40,6 +40,7 @@ import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import {
   simulationFailure,
   simulationOk,
+  totally,
   type SimulationResult,
 } from "./refusals.js";
 
@@ -83,17 +84,32 @@ export class ReplayClock implements Clock {
   #wallClockRegressions = 0;
   #epochMilliseconds: number;
 
-  private constructor(start: RecordedInstant, startEpochMilliseconds: number) {
-    this.#startedAt = start.receivedAt;
-    this.#at = start.receivedAt;
-    this.#startedMonotonicNs = BigInt(start.receivedMonotonicNs);
+  private constructor(receivedAt: string, receivedMonotonicNs: string, startEpochMilliseconds: number) {
+    this.#startedAt = receivedAt;
+    this.#at = receivedAt;
+    this.#startedMonotonicNs = BigInt(receivedMonotonicNs);
     this.#monotonicNs = this.#startedMonotonicNs;
     this.#epochMilliseconds = startEpochMilliseconds;
   }
 
-  /** Internal construction hook; {@link createReplayClock} is the door. */
-  static positionedAt(start: RecordedInstant, startEpochMilliseconds: number): ReplayClock {
-    return new ReplayClock(start, startEpochMilliseconds);
+  /**
+   * Internal construction hook; {@link createReplayClock} is the door.
+   *
+   * It takes the three VALIDATED PRIMITIVES rather than a record (round-4
+   * review, MEDIUM-2). A public static that took a caller RECORD would be a door
+   * in disguise: it read `start.receivedAt` and `start.receivedMonotonicNs`
+   * inside the constructor, so a getter ran and a `BigInt()` conversion could
+   * throw out of a method whose signature promises a clock. With primitives
+   * there is nothing to adopt and nothing to invoke, and the class-member
+   * partition in `test/unit/simulation/doors.test.ts` classifies it as a pure
+   * helper with `createReplayClock` named as the door that validated them.
+   */
+  static positionedAt(
+    receivedAt: string,
+    receivedMonotonicNs: string,
+    startEpochMilliseconds: number,
+  ): ReplayClock {
+    return new ReplayClock(receivedAt, receivedMonotonicNs, startEpochMilliseconds);
   }
 
   /** The recorded wall-clock instant of the last delivered event (§12.1). */
@@ -119,12 +135,28 @@ export class ReplayClock implements Clock {
    * in dispatch order — the failure §8.4 exists to prevent.
    */
   advanceTo(instant: RecordedInstant): SimulationResult<null> {
-    // ONE READ PER FIELD (round-3 review, MEDIUM-1's class). This method runs
-    // once per delivered event, so materializing here would copy a record per
-    // event; instead each of the two PRIMITIVE fields is read exactly once,
-    // into a local, and the validation and the state update use that local. No
-    // accessor can answer the monotonicity check with one value and position the
-    // clock with another.
+    // TOTAL (round-4 review, LOW-1). The one-read design below is kept — see the
+    // comment in `#advanceToSync` — but a caller field is still CALLER CODE when
+    // it is an accessor or a `Proxy` trap, and one that THROWS used to escape
+    // this method: `advanceTo(hostile)` raised the caller's own `Error` out of a
+    // door whose signature promises a typed refusal. The guard turns it into
+    // `SIMULATION_INTERNAL`, which is the same containment every other door in
+    // this package sits inside.
+    return totally("advancing the replay clock to a recorded instant", () =>
+      this.#advanceToSync(instant),
+    );
+  }
+
+  #advanceToSync(instant: RecordedInstant): SimulationResult<null> {
+    // ONE READ PER FIELD (round-3 review, MEDIUM-1's class; KEPT at round 4,
+    // LOW-1). This method runs once per delivered event, so materializing here
+    // would copy a record per event; instead each of the two PRIMITIVE fields is
+    // read exactly once, into a local, and the validation and the state update
+    // use that local. No accessor can answer the monotonicity check with one
+    // value and position the clock with another. `doors.test.ts` classifies this
+    // as the package's ONE one-read door and probes both properties: a lying
+    // accessor cannot make the check and the use disagree, and a throwing one is
+    // contained above rather than escaping.
     if (instant === null || typeof instant !== "object") {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
@@ -241,7 +273,11 @@ export function createReplayClock(offered: RecordedInstant): SimulationResult<Re
   const validated = validateInstantFields(start.receivedAt, start.receivedMonotonicNs);
   if (!validated.ok) return validated;
   return simulationOk(
-    ReplayClock.positionedAt(validated.value, validated.value.epochMilliseconds),
+    ReplayClock.positionedAt(
+      validated.value.receivedAt,
+      validated.value.receivedMonotonicNs,
+      validated.value.epochMilliseconds,
+    ),
   );
 }
 
