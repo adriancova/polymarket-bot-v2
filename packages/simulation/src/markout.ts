@@ -42,7 +42,7 @@ import { addDecimal, compareDecimal, isCanonicalDecimalString, mulDecimal, subDe
 import { ownFrozenTree } from "./plain.js";
 import type { RecordedEventIdentity } from "./ports.js";
 import type { SimulatedFill } from "./fill-model.js";
-import { simulationFailure, simulationOk, type SimulationResult } from "./refusals.js";
+import { simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
 
 /** One §12.3 horizon. `milliseconds` is `null` for the resolution horizon. */
 export interface MarkoutHorizon {
@@ -116,6 +116,33 @@ export function computeMarkouts(input: {
   readonly resolutionValuePerShare?: string;
   readonly horizons?: readonly MarkoutHorizon[];
 }): SimulationResult<MarkoutDiagnostics> {
+  return totally("computing markouts", () => computeMarkoutsInner(input));
+}
+
+function computeMarkoutsInner(input: {
+  readonly fill: SimulatedFill;
+  readonly filledAtNs: bigint;
+  readonly midTimeline: MidTimeline;
+  readonly resolutionValuePerShare?: string;
+  readonly horizons?: readonly MarkoutHorizon[];
+}): SimulationResult<MarkoutDiagnostics> {
+  const fill = input.fill;
+  if (fill === null || typeof fill !== "object") {
+    return simulationFailure("SIMULATION_INPUT_INVALID", "a markout is computed about one fill");
+  }
+  if (!isCanonicalDecimalString(fill.price) || !isCanonicalDecimalString(fill.shares)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "the fill carries a non-canonical decimal (§6 invariant 1)",
+      { price: String(fill.price), shares: String(fill.shares) },
+    );
+  }
+  if (typeof input.filledAtNs !== "bigint") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a markout is anchored to the recorded monotonic instant of the fill (§7.1)",
+    );
+  }
   const horizons = input.horizons ?? MARKOUT_HORIZONS;
   const direction = input.fill.action === "BUY" ? 1 : -1;
   const observations: MarkoutObservation[] = [];
@@ -238,14 +265,55 @@ export interface ReplayPathEconomics {
   readonly markoutPenaltyApplied: false;
 }
 
-/** Folds fills into the replay path's realized economics. Exact throughout. */
-export function replayPathEconomics(fills: readonly SimulatedFill[]): ReplayPathEconomics {
+/**
+ * Folds fills into the replay path's realized economics. Exact throughout.
+ *
+ * TOTAL, and it returns a RESULT: the round-1 review found that a fill carrying
+ * a type-valid but non-canonical decimal reached `mulDecimal` and THREW out of a
+ * function that the run driver, the CLI and the stress-scenario builder all call
+ * (ADR-020 §6 — no throw escapes a door).
+ */
+export function replayPathEconomics(
+  fills: readonly SimulatedFill[],
+): SimulationResult<ReplayPathEconomics> {
+  if (!Array.isArray(fills)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "the replay path's economics are folded from an array of fills",
+    );
+  }
   let buyNotional = "0";
   let sellNotional = "0";
   let fees = "0";
   let sharesBought = "0";
   let sharesSold = "0";
-  for (const fill of fills) {
+  for (let index = 0; index < fills.length; index += 1) {
+    const fill = fills[index];
+    if (fill === null || fill === undefined || typeof fill !== "object") {
+      return simulationFailure("SIMULATION_INPUT_INVALID", "a fill is not a record", { index });
+    }
+    if (
+      !isCanonicalDecimalString(fill.price) ||
+      !isCanonicalDecimalString(fill.shares) ||
+      !isCanonicalDecimalString(fill.feeAmount)
+    ) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a fill carries a non-canonical decimal; the replay path's economics are exact (§6 invariant 1)",
+        {
+          index,
+          price: String(fill.price),
+          shares: String(fill.shares),
+          feeAmount: String(fill.feeAmount),
+        },
+      );
+    }
+    if (fill.action !== "BUY" && fill.action !== "SELL") {
+      return simulationFailure("SIMULATION_INPUT_INVALID", "a fill's action is BUY or SELL", {
+        index,
+        offered: String(fill.action),
+      });
+    }
     const notional = mulDecimal(fill.price, fill.shares);
     if (fill.action === "BUY") {
       buyNotional = addDecimal(buyNotional, notional);
@@ -256,17 +324,19 @@ export function replayPathEconomics(fills: readonly SimulatedFill[]): ReplayPath
     }
     fees = addDecimal(fees, fill.feeAmount);
   }
-  return ownFrozenTree<ReplayPathEconomics>({
-    basis: "REALIZED_IN_REPLAY_PATH",
-    buyNotional,
-    sellNotional,
-    fees,
-    netCashFlow: subDecimal(subDecimal(sellNotional, buyNotional), fees),
-    sharesBought,
-    sharesSold,
-    fillCount: fills.length,
-    markoutPenaltyApplied: false,
-  });
+  return simulationOk(
+    ownFrozenTree<ReplayPathEconomics>({
+      basis: "REALIZED_IN_REPLAY_PATH",
+      buyNotional,
+      sellNotional,
+      fees,
+      netCashFlow: subDecimal(subDecimal(sellNotional, buyNotional), fees),
+      sharesBought,
+      sharesSold,
+      fillCount: fills.length,
+      markoutPenaltyApplied: false,
+    }),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -312,13 +382,45 @@ export function markoutStressScenario(input: {
   readonly fills: readonly SimulatedFill[];
   readonly diagnostics: readonly MarkoutDiagnostics[];
 }): SimulationResult<MarkoutStressScenario> {
-  const replay = replayPathEconomics(input.fills);
+  return totally("building a markout stress scenario", () => markoutStressScenarioInner(input));
+}
+
+function markoutStressScenarioInner(input: {
+  readonly scenarioName: string;
+  readonly horizon: string;
+  readonly fills: readonly SimulatedFill[];
+  readonly diagnostics: readonly MarkoutDiagnostics[];
+}): SimulationResult<MarkoutStressScenario> {
+  const folded = replayPathEconomics(input.fills);
+  if (!folded.ok) return folded;
+  const replay = folded.value;
+  if (!Array.isArray(input.diagnostics)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a stress scenario is built from an array of markout diagnostics",
+    );
+  }
   let penalty = "0";
   let matched = 0;
   for (const diagnostic of input.diagnostics) {
-    const observation = diagnostic.observations.find((entry) => entry.horizon === input.horizon);
+    if (diagnostic === null || typeof diagnostic !== "object" || !Array.isArray(diagnostic.observations)) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a markout diagnostic must carry its observations",
+      );
+    }
+    const observation = diagnostic.observations.find(
+      (entry: MarkoutObservation) => entry.horizon === input.horizon,
+    );
     if (observation === undefined) continue;
     matched += 1;
+    if (!isCanonicalDecimalString(observation.total)) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a markout observation carries a non-canonical total",
+        { horizon: input.horizon, offered: String(observation.total) },
+      );
+    }
     if (compareDecimal(observation.total, "0") < 0) {
       penalty = addDecimal(penalty, subDecimal("0", observation.total));
     }

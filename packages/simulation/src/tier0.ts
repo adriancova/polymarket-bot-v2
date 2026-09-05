@@ -33,7 +33,7 @@ import {
 } from "./fill-model.js";
 import { ownFrozenTree } from "./plain.js";
 import type { BookView, RecordedEventIdentity } from "./ports.js";
-import { simulationFailure, simulationOk, type SimulationResult } from "./refusals.js";
+import { simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
 
 /** The identity every Tier-0 result carries. */
 export function tier0Model(input: {
@@ -72,6 +72,21 @@ export interface Tier0ImmediateOutcome {
  * would hide it.
  */
 export function tier0Immediate(input: {
+  readonly model: FillModelIdentity;
+  readonly book: BookView;
+  readonly simulatedOrderId: string;
+  readonly marketId: string;
+  readonly side: "YES" | "NO";
+  readonly action: "BUY" | "SELL";
+  readonly limitPrice: string;
+  readonly shares: string;
+  readonly feeSnapshot: FeeScheduleSnapshot;
+  readonly atEvent: RecordedEventIdentity;
+}): SimulationResult<Tier0ImmediateOutcome> {
+  return totally("executing a Tier-0 immediate order", () => tier0ImmediateInner(input));
+}
+
+function tier0ImmediateInner(input: {
   readonly model: FillModelIdentity;
   readonly book: BookView;
   readonly simulatedOrderId: string;
@@ -159,6 +174,22 @@ export interface Tier0MakerOutcome {
  * regression use, and it is why {@link ../queue.js} exists for Tier 1.
  */
 export function tier0Maker(input: {
+  readonly model: FillModelIdentity;
+  readonly simulatedOrderId: string;
+  readonly marketId: string;
+  readonly tokenId: string;
+  readonly side: "YES" | "NO";
+  readonly action: "BUY" | "SELL";
+  readonly restingPrice: string;
+  readonly remainingShares: string;
+  readonly observedTradePrice: string;
+  readonly feeSnapshot: FeeScheduleSnapshot;
+  readonly atEvent: RecordedEventIdentity;
+}): SimulationResult<Tier0MakerOutcome> {
+  return totally("executing a Tier-0 maker order", () => tier0MakerInner(input));
+}
+
+function tier0MakerInner(input: {
   readonly model: FillModelIdentity;
   readonly simulatedOrderId: string;
   readonly marketId: string;

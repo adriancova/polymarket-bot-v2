@@ -63,6 +63,9 @@ function problem(at: number, message: string): StrictJsonOutcome {
 export function decodeUtf8Strict(
   bytes: Uint8Array,
 ): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly at: number } {
+  // Total in the ADR-020 §6 sense: a caller that is not holding bytes gets the
+  // outcome's `ok: false`, never an exception.
+  if (!(bytes instanceof Uint8Array)) return { ok: false, at: 0 };
   let out = "";
   let index = 0;
   while (index < bytes.length) {
@@ -121,6 +124,7 @@ export function decodeUtf8Strict(
 export function encodeUtf8Strict(
   text: string,
 ): { readonly ok: true; readonly bytes: Uint8Array } | { readonly ok: false; readonly at: number } {
+  if (typeof text !== "string") return { ok: false, at: 0 };
   const out: number[] = [];
   for (let index = 0; index < text.length; index += 1) {
     const unit = text.charCodeAt(index);
@@ -196,6 +200,9 @@ class Reader {
 
 /** Parses UTF-8 bytes under the ADR-017 §3 profile. */
 export function parseStrictJsonBytes(bytes: Uint8Array): StrictJsonOutcome {
+  if (!(bytes instanceof Uint8Array)) {
+    return problem(0, "a strict-JSON document is read from bytes");
+  }
   const decoded = decodeUtf8Strict(bytes);
   if (!decoded.ok) {
     return problem(
@@ -208,6 +215,9 @@ export function parseStrictJsonBytes(bytes: Uint8Array): StrictJsonOutcome {
 
 /** Parses a decoded string under the ADR-017 §3 profile. */
 export function parseStrictJsonText(text: string): StrictJsonOutcome {
+  if (typeof text !== "string") {
+    return problem(0, "a strict-JSON document is read from text");
+  }
   const reader = new Reader(text);
   reader.skipWhitespace();
   const value = parseValue(reader, 0);

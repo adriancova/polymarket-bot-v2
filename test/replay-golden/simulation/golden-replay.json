@@ -184,7 +184,7 @@
     "normalizerVersion": "golden/market-frame/v1",
     "featureSetVersion": "features-v1",
     "runSeed": "42",
-    "fillModelVersion": "sim/tier0/v1",
+    "fillModelVersion": "sim/tier1/v1",
     "fillModelParametersHash": "0000000000000000000000000000000000000000000000000000000000000000",
     "latencyModelVersion": "sim/latency/v1",
     "latencyModelParametersHash": "1111111111111111111111111111111111111111111111111111111111111111",
@@ -195,13 +195,18 @@
   },
   "expected": {
     "serialization": [
-      "polymarket-bot/simulation-run/v1",
-      "run simulator=wp-210/v1 seed=42 fillModel=sim/tier0/v1 fillModelParams=0000000000000000000000000000000000000000000000000000000000000000 latencyModel=sim/latency/v1 latencyModelParams=1111111111111111111111111111111111111111111111111111111111111111",
+      "polymarket-bot/simulation-run/v2",
+      "run simulator=wp-210/v1 seed=42 fillModel=sim/tier1/v1 fillModelParams=0000000000000000000000000000000000000000000000000000000000000000 latencyModel=sim/latency/v1 latencyModelParams=1111111111111111111111111111111111111111111111111111111111111111",
       "pins normalizer=golden/market-frame/v1 featureSet=features-v1 fee=fees/2026-08-24 reward=rewards/2026-08-24 settlement=",
       "dataset id=2026-06-29T17-00Z epoch=0190a3e0-0000-7000-8000-000000000001 objects=1 walSegments=NOT_AVAILABLE_ARCHIVED_ONLY",
-      "counts read=3 delivered=3 excludedIncident=0 excludedDuplicate=0 venueTimestampInversions=1",
+      "counts read=3 delivered=3 excludedIncident=0 excludedDuplicate=0 receivedAtInversions=1",
+      "delivery envelopes=3 venueTimestampInversions=1 withoutVenueTimestamp=0",
       "clock start=2026-06-29T17:15:57.300Z end=2026-06-29T17:15:57.500Z startNs=1000000000 endNs=1200000000 advances=3 wallClockRegressions=1",
-      "economics basis=REALIZED_IN_REPLAY_PATH buy=0 sell=0 fees=0 net=0 sharesBought=0 sharesSold=0 fills=0 markoutPenaltyApplied=false",
+      "order golden-order-rest golden-plan-1 0x1234 7134526469571836016 YES BUY 0.08 50 0 RESTING REST TIER_1_RESTING_BAND true 0190a3e0-0000-7000-8000-000000000001 1 0",
+      "order golden-order-take golden-plan-1 0x1234 7134526469571836016 YES BUY 0.09 10 10 FILLED MARKETABLE_LIMIT POINT false 0190a3e0-0000-7000-8000-000000000001 1 0",
+      "fill golden-order-take/t1/0 golden-order-take 0x1234 7134526469571836016 YES BUY 0.09 10 0.05733 TAKER TIER_1 sim/tier1/v1 SIMULATED_NOT_REAL_EVIDENCE TOP_OF_BOOK_ONLY 0190a3e0-0000-7000-8000-000000000001 1 0",
+      "economics basis=REALIZED_IN_REPLAY_PATH buy=0.9 sell=0 fees=0.05733 net=-0.95733 sharesBought=10 sharesSold=0 fills=1 markoutPenaltyApplied=false",
+      "band order=golden-order-rest market=0x1234 price=0.08 queueModel=sim/queue/v1 fillModel=sim/tier1/v1 basis=OPTIMISTIC_BASE_CONSERVATIVE_CANCELLATION_ASSUMPTIONS optimistic[ filled=5 remaining=45 queueAhead=0 queueLeft=0 postCancelFills=0 fills=1 ] base[ filled=5 remaining=45 queueAhead=0 queueLeft=0 postCancelFills=0 fills=1 ] conservative[ filled=5 remaining=45 queueAhead=0 queueLeft=0 postCancelFills=0 fills=1 ]",
       "end"
     ]
   }

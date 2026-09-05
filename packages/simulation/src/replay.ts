@@ -48,7 +48,7 @@ import { ownFrozenTree } from "./plain.js";
 import type { EventEnvelope, RecordedEventIdentity, SimulatedOrder } from "./ports.js";
 import type { RestingFillBand } from "./queue.js";
 import { simulationOk, totally, type SimulationResult } from "./refusals.js";
-import { serializeRun } from "./serialize.js";
+import { serializeRun, type SerializableDelivery } from "./serialize.js";
 import type { SimulatedVenue } from "./venue.js";
 
 /** What the core-loop hook is given for one delivered envelope. */
@@ -90,11 +90,20 @@ export interface ReplayRunOptions {
 export interface ReplayRunResult {
   readonly pins: ReplayRunPins;
   readonly load: DatasetLoadReport;
+  /** What the delivery path observed, including the §8.4 venue-time disagreement. */
+  readonly delivery: SerializableDelivery;
   readonly clock: ReplayClockObservations;
   readonly eventsDelivered: number;
   readonly orders: readonly SimulatedOrder[];
   readonly fills: readonly SimulatedFill[];
   readonly economics: ReplayPathEconomics;
+  /**
+   * Every Tier-1 resting BAND the run produced.
+   *
+   * Taken from the venue when one is driving the run, so a band reaches the
+   * report through the same §12.1 seam a live adapter would sit behind, rather
+   * than through a caller that happened to pass one in.
+   */
   readonly bands: readonly RestingFillBand[];
   /** The §12.4 canonical form. Byte-identical for a fixed dataset/config/seed. */
   readonly serialization: string;
@@ -172,13 +181,25 @@ export async function runReplay(
 
   const fills = options.venue?.fills ?? [];
   const orders = collectOrders(options.venue);
-  const economics = replayPathEconomics(fills);
+  const folded = replayPathEconomics(fills);
+  if (!folded.ok) return folded;
+  const economics = folded.value;
   const clock = source.clock.observations();
-  const bands = options.bands ?? [];
+  // The venue's own bands when a venue drove the run: acceptance 4's band is
+  // produced behind the §12.1 seam, not handed in beside it. `options.bands`
+  // remains for a caller that computed bands without a venue.
+  const bands = options.venue?.restingBands() ?? options.bands ?? [];
+  const report = source.report();
+  const delivery: SerializableDelivery = {
+    envelopesDelivered: report.envelopesDelivered,
+    venueTimestampInversions: report.venueTimestampInversions,
+    envelopesWithoutVenueTimestamp: report.envelopesWithoutVenueTimestamp,
+  };
 
   const serialization = serializeRun({
     pins: pins.value,
     load: loaded.value.report,
+    delivery,
     clock,
     orders,
     fills,
@@ -190,6 +211,7 @@ export async function runReplay(
     ownFrozenTree<ReplayRunResult>({
       pins: pins.value,
       load: loaded.value.report,
+      delivery,
       clock,
       eventsDelivered,
       orders,

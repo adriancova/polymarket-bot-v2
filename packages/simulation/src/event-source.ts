@@ -68,6 +68,7 @@ import { materializeInput, ownFrozenTree } from "./plain.js";
 import type { ReplayDataset } from "./manifest.js";
 import type { EventEnvelope, MarketEventSource, RecordedEventIdentity } from "./ports.js";
 import {
+  describeForRefusal,
   simulationFailure,
   simulationOk,
   totally,
@@ -150,12 +151,34 @@ export function deriveReplayEventId(
     readonly index: number;
   },
 ): SimulationResult<string> {
+  if (input === null || typeof input !== "object") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "an event id is derived from a recorded identity record (§7.1)",
+    );
+  }
+  if (typeof digest !== "function") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "the SHA-256 port is supplied by the composition root; this package imports no Node built-in",
+    );
+  }
+  if (
+    !isNonEmptyString(input.gatewayEpoch) ||
+    !isNonEmptyString(input.ingestSeq) ||
+    !isNonNegativeInteger(input.index)
+  ) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "an event id is derived from (gatewayEpoch, ingestSeq, index); each is required",
+    );
+  }
   const epochMs = isoToEpochMilliseconds(input.receivedAt);
   if (epochMs === undefined || epochMs < 0 || epochMs > 0xffff_ffff_ffff) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "receivedAt is not an instant a UUIDv7 timestamp field can carry",
-      { receivedAt: input.receivedAt },
+      { receivedAt: describeForRefusal(input.receivedAt) },
     );
   }
   // Unit separators, so two different identities cannot concatenate to one seed.
@@ -223,11 +246,18 @@ export interface DatasetLoadReport {
   readonly rowsExcludedByIncident: number;
   readonly rowsExcludedAsDuplicate: number;
   /**
-   * How many delivered events carry a `venueTimestamp` EARLIER than one already
-   * delivered. Observed and reported; never used to reorder anything. A nonzero
-   * count is the concrete evidence that dispatch order and venue time disagree.
+   * How many replay-eligible ROWS carry a recorded arrival wall clock
+   * (`receivedAt`) EARLIER than one already ordered ahead of them.
+   *
+   * Observed and reported; never used to reorder anything. It is named for what
+   * it measures: a dataset row carries no venue timestamp — that field belongs
+   * to the normalized §7.1 envelope — so the venue-time disagreement is counted
+   * on the delivery path instead ({@link EventSourceReport}). Compared on EPOCH
+   * MILLISECONDS, because two ISO-8601 instants with different UTC offsets do
+   * not compare correctly as strings (`clock.ts`'s own rule; the lexical form
+   * this used to use was the GOV-1C-deprecated one).
    */
-  readonly venueTimestampInversions: number;
+  readonly receivedAtInversions: number;
   readonly walSegmentVerification: "VERIFIED" | "NOT_AVAILABLE_ARCHIVED_ONLY";
 }
 
@@ -717,7 +747,7 @@ export async function loadDataset(
     if (mismatch !== undefined) return { ok: false, refusal: mismatch };
   }
 
-  const inversions = countVenueTimestampInversions(records);
+  const inversions = countReceivedAtInversions(records);
 
   return simulationOk({
     dataset,
@@ -730,7 +760,7 @@ export async function loadDataset(
       rowsDelivered: records.length,
       rowsExcludedByIncident: excludedByIncident,
       rowsExcludedAsDuplicate: excludedAsDuplicate,
-      venueTimestampInversions: inversions,
+      receivedAtInversions: inversions,
       walSegmentVerification,
     }),
   });
@@ -826,18 +856,26 @@ function justifyExclusion(
 }
 
 /**
- * Counts delivered records whose recorded frame arrival is out of order with
- * respect to `receivedAt`.
+ * Counts ordered records whose recorded frame arrival wall clock is out of order.
  *
  * DIAGNOSTIC ONLY. This function's answer is reported and never consulted by
  * any ordering decision; it exists so an operator can see *how much* dispatch
  * order and wall-clock order disagree for a dataset.
+ *
+ * Compared on EPOCH MILLISECONDS. `"2026-01-01T00:00:10.000+01:00"` is earlier
+ * than `"2026-01-01T00:00:00.000Z"` and sorts after it as a string, so a lexical
+ * comparison of §7.1 timestamps answers a different question than the one asked.
+ * A timestamp that cannot be converted arithmetically is COUNTED as unreadable
+ * rather than silently treated as ordered — but it cannot occur here, because
+ * the clock validated every one of them before this point.
  */
-function countVenueTimestampInversions(records: readonly ReplayRecord[]): number {
+function countReceivedAtInversions(records: readonly ReplayRecord[]): number {
   let inversions = 0;
-  let highWater: string | undefined;
+  let highWater: number | undefined;
   for (const record of records) {
-    const at = record.frame.receivedAt;
+    const at = isoToEpochMilliseconds(record.frame.receivedAt);
+    /* c8 ignore next -- the manifest door validated every recorded instant. */
+    if (at === undefined) continue;
     if (highWater !== undefined && at < highWater) inversions += 1;
     if (highWater === undefined || at > highWater) highWater = at;
   }
@@ -853,6 +891,27 @@ export interface EventSourceReport {
   readonly load: DatasetLoadReport;
   readonly envelopesDelivered: number;
   readonly recordsConsumed: number;
+  /**
+   * How many DELIVERED envelopes carry a `venueTimestamp` EARLIER than one
+   * already delivered.
+   *
+   * This is the §8.4 disagreement an operator wants to see: replay follows
+   * recorded dispatch order and must not sort by venue timestamp, and a nonzero
+   * count here is the concrete evidence that the two orders differ for this
+   * dataset. It is counted HERE, on the delivery path, because `venueTimestamp`
+   * is a field of the normalized §7.1 envelope — a recorded dataset row does not
+   * carry one. Compared on EPOCH MILLISECONDS (see
+   * {@link DatasetLoadReport.receivedAtInversions}).
+   *
+   * DIAGNOSTIC ONLY: nothing is reordered by it, ever.
+   */
+  readonly venueTimestampInversions: number;
+  /**
+   * Delivered envelopes with no `venueTimestamp` at all, or one that could not
+   * be read arithmetically. §7.1 makes the field optional, so its absence is
+   * REPORTED rather than counted as ordered.
+   */
+  readonly envelopesWithoutVenueTimestamp: number;
 }
 
 /**
@@ -869,6 +928,9 @@ export class DatasetEventSource implements MarketEventSource {
   readonly #clock: ReplayClock;
   #envelopesDelivered = 0;
   #recordsConsumed = 0;
+  #venueTimestampInversions = 0;
+  #envelopesWithoutVenueTimestamp = 0;
+  #venueTimestampHighWaterMs: number | undefined;
   #refusal: SimulationRefusal | undefined;
 
   private constructor(loaded: LoadedDataset, normalizer: ReplayNormalizer, clock: ReplayClock) {
@@ -905,7 +967,27 @@ export class DatasetEventSource implements MarketEventSource {
       load: this.#loaded.report,
       envelopesDelivered: this.#envelopesDelivered,
       recordsConsumed: this.#recordsConsumed,
+      venueTimestampInversions: this.#venueTimestampInversions,
+      envelopesWithoutVenueTimestamp: this.#envelopesWithoutVenueTimestamp,
     });
+  }
+
+  /**
+   * Observes one delivered envelope's VENUE timestamp, for the report.
+   *
+   * Never consulted by an ordering decision (§8.4, §6 invariant 15, ADR-002 §2:
+   * replay follows recorded dispatch order and must not sort by venue time).
+   */
+  #observeVenueTimestamp(envelope: EventEnvelope<unknown>): void {
+    const stated = envelope.venueTimestamp;
+    const at = typeof stated === "string" ? isoToEpochMilliseconds(stated) : undefined;
+    if (at === undefined) {
+      this.#envelopesWithoutVenueTimestamp += 1;
+      return;
+    }
+    const highWater = this.#venueTimestampHighWaterMs;
+    if (highWater !== undefined && at < highWater) this.#venueTimestampInversions += 1;
+    if (highWater === undefined || at > highWater) this.#venueTimestampHighWaterMs = at;
   }
 
   async *events(): AsyncIterable<EventEnvelope<unknown>> {
@@ -940,6 +1022,7 @@ export class DatasetEventSource implements MarketEventSource {
           return;
         }
         this.#envelopesDelivered += 1;
+        this.#observeVenueTimestamp(envelope);
         yield envelope;
       }
     }

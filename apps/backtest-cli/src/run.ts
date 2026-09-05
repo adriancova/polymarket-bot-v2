@@ -102,7 +102,13 @@ export function renderBacktestOutcome(outcome: BacktestOutcome): string {
       `excluded_duplicate=${String(outcome.result.load.rowsExcludedAsDuplicate)}`,
       `objects_verified=${String(outcome.result.load.objectsVerified)}`,
       `wal_segment_verification=${outcome.result.load.walSegmentVerification}`,
-      `venue_timestamp_inversions=${String(outcome.result.load.venueTimestampInversions)}`,
+      // Two different disagreements, reported separately: recorded ARRIVAL wall
+      // clock out of order across the ordered rows, and normalized envelopes
+      // whose VENUE timestamp is out of order against recorded dispatch order
+      // (§8.4 — replay follows dispatch order and never sorts by venue time).
+      `received_at_inversions=${String(outcome.result.load.receivedAtInversions)}`,
+      `venue_timestamp_inversions=${String(outcome.result.delivery.venueTimestampInversions)}`,
+      `envelopes_without_venue_timestamp=${String(outcome.result.delivery.envelopesWithoutVenueTimestamp)}`,
       "",
       outcome.result.serialization,
     ].join("\n");

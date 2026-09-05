@@ -22,7 +22,12 @@
 
 import { isNonEmptyString, isNonNegativeInteger, isPositiveInteger } from "./grammar.js";
 import { ownFrozenTree } from "./plain.js";
-import { simulationFailure, simulationOk, type SimulationResult } from "./refusals.js";
+import {
+  describeForRefusal,
+  simulationFailure,
+  simulationOk,
+  type SimulationResult,
+} from "./refusals.js";
 import type { SeededStream, SeededStreams } from "./seed.js";
 
 /** One candidate latency and its integer weight. */
@@ -56,11 +61,19 @@ export function readLatencyDistribution(
   distribution: LatencyDistribution,
   what: string,
 ): SimulationResult<LatencyDistribution> {
+  const component = describeForRefusal(what);
+  if (distribution === null || typeof distribution !== "object") {
+    return simulationFailure(
+      "FILL_MODEL_LATENCY_DISTRIBUTION_INVALID",
+      `${component} is not a latency distribution`,
+      { component },
+    );
+  }
   if (!Array.isArray(distribution.samples) || distribution.samples.length === 0) {
     return simulationFailure(
       "FILL_MODEL_LATENCY_DISTRIBUTION_INVALID",
-      `${what} has no samples; a latency model with nothing to draw from would silently mean "no latency", which is the Tier-0 assumption §12.2 bounds to wiring use`,
-      { component: what },
+      `${component} has no samples; a latency model with nothing to draw from would silently mean "no latency", which is the Tier-0 assumption §12.2 bounds to wiring use`,
+      { component },
     );
   }
   let total = 0;
@@ -68,23 +81,23 @@ export function readLatencyDistribution(
     if (!isNonNegativeInteger(sample.milliseconds)) {
       return simulationFailure(
         "FILL_MODEL_LATENCY_DISTRIBUTION_INVALID",
-        `${what} carries a latency that is not a non-negative integer number of milliseconds`,
-        { component: what },
+        `${component} carries a latency that is not a non-negative integer number of milliseconds`,
+        { component },
       );
     }
     if (!isPositiveInteger(sample.weight)) {
       return simulationFailure(
         "FILL_MODEL_LATENCY_DISTRIBUTION_INVALID",
-        `${what} carries a weight that is not a positive integer; integer weights are what make the draw exactly reproducible`,
-        { component: what },
+        `${component} carries a weight that is not a positive integer; integer weights are what make the draw exactly reproducible`,
+        { component },
       );
     }
     total += sample.weight;
     if (!Number.isSafeInteger(total)) {
       return simulationFailure(
         "FILL_MODEL_LATENCY_DISTRIBUTION_INVALID",
-        `${what} has weights that overflow exact integer arithmetic`,
-        { component: what },
+        `${component} has weights that overflow exact integer arithmetic`,
+        { component },
       );
     }
   }
@@ -93,6 +106,12 @@ export function readLatencyDistribution(
 
 /** Validates a whole latency model. */
 export function readLatencyModel(model: LatencyModel): SimulationResult<LatencyModel> {
+  if (model === null || typeof model !== "object") {
+    return simulationFailure(
+      "FILL_MODEL_PARAMETERS_UNPINNED",
+      "a latency model is a record naming its version, its four components and its basis (§12.5, ADR-012 §7)",
+    );
+  }
   if (!isNonEmptyString(model.latencyModelVersion)) {
     return simulationFailure(
       "FILL_MODEL_PARAMETERS_UNPINNED",

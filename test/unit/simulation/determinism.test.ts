@@ -28,7 +28,12 @@ import {
   runReplay,
   sampleLatency,
   serializeRun,
+  simulateResting,
+  simulatedFill,
+  tier1Model,
   type LatencyModel,
+  type RestingFillBand,
+  type SimulatedOrder,
 } from "../../../packages/simulation/src/index.js";
 
 import {
@@ -278,13 +283,26 @@ describe("acceptance 2 — the same manifest/config/seed is byte-identical", () 
         `delivered=${String(result.load.rowsDelivered)}`,
         `excludedIncident=${String(result.load.rowsExcludedByIncident)}`,
         `excludedDuplicate=${String(result.load.rowsExcludedAsDuplicate)}`,
-        `venueTimestampInversions=${String(result.load.venueTimestampInversions)}`,
+        `receivedAtInversions=${String(result.load.receivedAtInversions)}`,
+      ].join(" "),
+    );
+    expect(lines[5]).toBe(
+      [
+        "delivery",
+        `envelopes=${String(result.delivery.envelopesDelivered)}`,
+        `venueTimestampInversions=${String(result.delivery.venueTimestampInversions)}`,
+        `withoutVenueTimestamp=${String(result.delivery.envelopesWithoutVenueTimestamp)}`,
       ].join(" "),
     );
     expect(lines[lines.length - 1]).toBe("end");
   });
 
-  it("serializeRun does not depend on the ORDER of the orders and fills it is given", () => {
+  it("serializeRun does not depend on the ORDER of the orders, fills and bands it is given", () => {
+    // ROUND-1 REVIEW (L3): this probe used to hand BOTH calls an empty
+    // `orders`/`fills` array, so it compared two identical trivial runs and
+    // could not have failed against a serializer that emitted insertion order.
+    // It now serializes three orders, three fills and two bands, once in one
+    // order and once REVERSED, and requires the same bytes.
     const shared = {
       pins: runPins(),
       load: {
@@ -295,9 +313,14 @@ describe("acceptance 2 — the same manifest/config/seed is byte-identical", () 
         rowsDelivered: 3,
         rowsExcludedByIncident: 0,
         rowsExcludedAsDuplicate: 0,
-        venueTimestampInversions: 0,
+        receivedAtInversions: 0,
         walSegmentVerification: "NOT_AVAILABLE_ARCHIVED_ONLY",
       } as const,
+      delivery: {
+        envelopesDelivered: 3,
+        venueTimestampInversions: 1,
+        envelopesWithoutVenueTimestamp: 0,
+      },
       clock: {
         advances: 3,
         wallClockRegressions: 0,
@@ -317,10 +340,114 @@ describe("acceptance 2 — the same manifest/config/seed is byte-identical", () 
         fillCount: 0,
         markoutPenaltyApplied: false,
       } as const,
-      bands: [],
     };
-    const orderA = serializeRun({ ...shared, orders: [], fills: [] });
-    const orderB = serializeRun({ ...shared, orders: [], fills: [] });
-    expect(orderA).toBe(orderB);
+    const orders = ["order-c", "order-a", "order-b"].map((id) => simulatedOrder(id));
+    const fills = ["fill-b", "fill-c", "fill-a"].map((id) => fillNamed(id));
+    const bands = [restingBand("order-b", "0.4"), restingBand("order-a", "0.6")];
+
+    const forward = serializeRun({ ...shared, orders, fills, bands });
+    const backward = serializeRun({
+      ...shared,
+      orders: [...orders].reverse(),
+      fills: [...fills].reverse(),
+      bands: [...bands].reverse(),
+    });
+    expect(forward).toBe(backward);
+
+    // …and the probe is not vacuous: the run it serialized is non-empty, and the
+    // two inputs really were in different orders.
+    expect(forward.split("\n").filter((line) => line.startsWith("order "))).toHaveLength(3);
+    expect(forward.split("\n").filter((line) => line.startsWith("fill "))).toHaveLength(3);
+    expect(forward.split("\n").filter((line) => line.startsWith("band "))).toHaveLength(2);
+    expect(orders.map((order) => order.simulatedOrderId)).not.toEqual(
+      [...orders].reverse().map((order) => order.simulatedOrderId),
+    );
   });
 });
+
+const AT_EVENT = {
+  gatewayEpoch: "0190a3e0-0000-7000-8000-000000000001",
+  ingestSeq: "1",
+  receivedAt: "2026-01-01T00:00:00.000Z",
+  datasetRowOrdinal: 0,
+};
+
+const TIER1 = tier1Model({
+  fillModelVersion: "sim/tier1/v1",
+  fillModelParametersHash: "0".repeat(64),
+});
+
+function simulatedOrder(simulatedOrderId: string): SimulatedOrder {
+  return {
+    simulatedOrderId,
+    plannedOrderId: simulatedOrderId,
+    executionPlanId: "plan-1",
+    marketId: "0190a3e0-0000-7000-8000-00000000000a",
+    tokenId: "1234",
+    side: "YES",
+    action: "BUY",
+    limitPrice: "0.5",
+    requestedShares: "10",
+    filledShares: "10",
+    state: "FILLED",
+    postOnly: false,
+    executionStyle: "MARKETABLE_LIMIT",
+    fillEstimateKind: "POINT",
+    atEvent: AT_EVENT,
+  };
+}
+
+function fillNamed(simulatedFillId: string) {
+  return simulatedFill({
+    simulatedFillId,
+    simulatedOrderId: "order-a",
+    marketId: "0190a3e0-0000-7000-8000-00000000000a",
+    tokenId: "1234",
+    side: "YES",
+    action: "BUY",
+    price: "0.5",
+    shares: "10",
+    feeAmount: "0.175",
+    liquidityRole: "TAKER",
+    model: TIER1,
+    atEvent: AT_EVENT,
+  });
+}
+
+/** A real band, produced by the real model, so the probe serializes real shapes. */
+function restingBand(simulatedOrderId: string, restingPrice: string): RestingFillBand {
+  const band = simulateResting({
+    model: TIER1,
+    order: {
+      simulatedOrderId,
+      marketId: "0190a3e0-0000-7000-8000-00000000000a",
+      tokenId: "1234",
+      side: "YES",
+      action: "BUY",
+      restingPrice,
+      shares: "50",
+      queueAheadAtPlacement: "10",
+      sameInstantAdditionsShares: "0",
+      restingFromNs: 0n,
+    },
+    trades: [{ price: restingPrice, shares: "30", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+    parameters: {
+      queueModelVersion: "sim/queue/v1",
+      cancellationRatio: { OPTIMISTIC: "0.5", BASE: "0.1", CONSERVATIVE: "0" },
+      cancelEffectiveAfterMs: { OPTIMISTIC: 10, BASE: 50, CONSERVATIVE: 250 },
+      placedBehindSameInstantAdditions: { OPTIMISTIC: false, BASE: false, CONSERVATIVE: true },
+      basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+    },
+    feeSnapshot: {
+      snapshotVersion: "fees/2026-08-24",
+      takerFeeRate: "0.07",
+      makerFeeRate: "0",
+      roundingDecimalPlaces: 5,
+      roundingMode: "HALF_UP",
+      minimumChargedFee: "0.00001",
+      feeCurrency: "USDC",
+    },
+  });
+  if (!band.ok) throw new Error(`${band.refusal.code}: ${band.refusal.message}`);
+  return band.value;
+}

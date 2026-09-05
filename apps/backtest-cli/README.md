@@ -41,9 +41,18 @@ counts and exclusions against the manifest's own numbers, replays every recorded
 frame in recorded dispatch order, and prints the §12.4 canonical run
 serialization.
 
-`--pins` is the complete §12.5 run-scoped pin set. Every field is REQUIRED:
+`--pins` is the complete §12.5 run-scoped pin set. Every field is REQUIRED and
+NOTHING ELSE is accepted — `readRunPins` refuses an unknown key, so a pin set
+carrying a field nothing reads is a refusal rather than a silent pass-through.
 ADR-012 §4 — "A result whose fill-model parameters are not pinned is not
 reproducible and is not evidence of anything."
+
+The report prints two ordering diagnostics, and they measure different things:
+`received_at_inversions` counts recorded ARRIVAL wall clocks out of order across
+the dispatch-ordered rows, and `venue_timestamp_inversions` counts DELIVERED
+envelopes whose `venueTimestamp` is earlier than one already delivered — the
+§8.4 disagreement. Both are compared on epoch milliseconds, both are reported,
+and neither reorders anything.
 
 ## The two shipped normalizers
 

@@ -158,15 +158,26 @@ describe("Tier 0 is never used for deployment decisions (§12.2)", () => {
     expect(outcome.refusal.message).toContain("deployment decision");
   });
 
-  it("accepts a Tier-1 band, which is permitted AS A BAND", () => {
+  it("a Tier-1 identity alone is NOT quotable: the band is what is permitted", () => {
     const model = tier1Model({
       fillModelVersion: "sim/tier1/v1",
       fillModelParametersHash: "0".repeat(64),
     });
     expect(model.permittedUse).toBe("RESEARCH_AND_COMPARISON_BAND_ONLY");
     expect(model.deploymentDecisionUse).toBe("PERMITTED_AS_BAND");
+    // ROUND-1 REVIEW (M7). This assertion used to expect `{ model }` — a value
+    // carrying a Tier-1 identity and no band — to be ACCEPTED, which pinned the
+    // behaviour ADR-012 §1 forbids: "A Tier 1 result that is quoted as a single
+    // number instead of a band has already violated this ADR". The gate is now
+    // structural, so the identity alone is refused and the band is accepted;
+    // `a Tier-1 resting result is a BAND` below quotes the real one.
     const outcome = quoteForDeploymentDecision({ model });
-    expect(outcome.ok).toBe(true);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("FILL_MODEL_BAND_INCONSISTENT");
+
+    const point = quoteForDeploymentDecision({ model, filledShares: "10" });
+    expect(point.ok).toBe(false);
   });
 });
 
@@ -222,7 +233,21 @@ describe("a Tier-1 resting result is a BAND, never one falsely precise fill", ()
     expect(new Set(filled).size).toBeGreaterThan(1);
   });
 
-  it("is ordered OPTIMISTIC >= BASE >= CONSERVATIVE", () => {
+  it("is quotable in a deployment decision — as the band, and only as the band", () => {
+    const band = restingBand();
+    expect(quoteForDeploymentDecision(band).ok).toBe(true);
+    // …and one member of it, lifted out, is not.
+    expect(
+      quoteForDeploymentDecision({ model: band.model, filledShares: band.base.filledShares }).ok,
+    ).toBe(false);
+  });
+
+  it("is ordered OPTIMISTIC >= BASE >= CONSERVATIVE for THIS parameterization", () => {
+    // No cancel is requested in this fixture, so every fill is a pre-cancel
+    // fill and the derivable ordering (see `checkBandOrdering`) applies to the
+    // totals directly. It is NOT a general claim about filled shares across
+    // scenarios: with a cancel in play, two opposing forces act and the totals
+    // are not monotone (round-1 review HIGH-1).
     const band = restingBand();
     expect(Number(band.optimistic.filledShares)).toBeGreaterThanOrEqual(
       Number(band.base.filledShares),

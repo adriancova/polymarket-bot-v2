@@ -45,7 +45,7 @@ import type {
   SimulatedRunMode,
 } from "./ports.js";
 import { PLANNING_DEPTH_AWARENESS, SIMULATED_EVIDENCE_CLASS } from "./ports.js";
-import { simulationFailure, simulationOk, type SimulationResult } from "./refusals.js";
+import { simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
 
 /** The two fill-model tiers of §12.2. There is no third. */
 export type FillModelTier = "TIER_0" | "TIER_1";
@@ -128,21 +128,78 @@ export function simulatedFill(input: {
  * future caller that ignores the type. ADR-012 §1: "A Tier 1 result that is
  * quoted as a single number instead of a band has already violated this ADR",
  * and §2 item 4: "'The simulator says it fills' is not a promotion argument."
+ *
+ * ROUND-1 REVIEW (M7): the Tier-1 half of that rule used to be checked by the
+ * `deploymentDecisionUse` STRING alone, so a bare `{ model, filledShares }` —
+ * a single number wearing a Tier-1 identity — passed the gate, which is the
+ * exact violation ADR-012 §1 names. The check below is now STRUCTURAL: a
+ * Tier-1 result must actually BE a band, with all three labelled scenarios
+ * present and its band basis and quotation rule intact.
  */
 export function quoteForDeploymentDecision<
   TResult extends { readonly model: FillModelIdentity },
 >(
   result: TResult["model"]["deploymentDecisionUse"] extends "FORBIDDEN" ? never : TResult,
 ): SimulationResult<TResult> {
-  const use = result.model.deploymentDecisionUse;
-  if (use === "FORBIDDEN") {
-    return simulationFailure(
-      "SIMULATION_INPUT_INVALID",
-      "a Tier-0 pipeline-smoke result may never be quoted in a deployment decision (§12.2, ADR-012 §1)",
-      { tier: result.model.tier, permittedUse: result.model.permittedUse },
-    );
+  return totally("quoting a simulated result for a deployment decision", () => {
+    if (result === null || typeof result !== "object") {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a quotable result must be a record carrying the model that produced it",
+      );
+    }
+    const model: FillModelIdentity | undefined = result.model;
+    if (model === null || typeof model !== "object") {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a quotable result must name the fill model that produced it (§12.5 pins it per run)",
+      );
+    }
+    if (model.deploymentDecisionUse === "FORBIDDEN") {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a Tier-0 pipeline-smoke result may never be quoted in a deployment decision (§12.2, ADR-012 §1)",
+        { tier: String(model.tier), permittedUse: String(model.permittedUse) },
+      );
+    }
+    if (model.tier === "TIER_1" && !isThreeScenarioBand(result)) {
+      return simulationFailure(
+        "FILL_MODEL_BAND_INCONSISTENT",
+        "a Tier-1 result quoted for a deployment decision must BE the band: ADR-012 §1 — 'A Tier 1 result that is quoted as a single number instead of a band has already violated this ADR'",
+        { tier: String(model.tier), permittedUse: String(model.permittedUse) },
+      );
+    }
+    return simulationOk(result);
+  });
+}
+
+/**
+ * Structural recognition of a {@link ../queue.js#RestingFillBand}.
+ *
+ * Written here rather than imported as a type guard on purpose: this module is
+ * below `queue.ts` in the import graph, and what the gate needs is not the
+ * nominal type but the OBSERVABLE shape — all three labelled scenarios, each
+ * carrying its own filled quantity, plus the band's basis and quotation rule.
+ */
+function isThreeScenarioBand(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (record["bandBasis"] !== "OPTIMISTIC_BASE_CONSERVATIVE_CANCELLATION_ASSUMPTIONS") return false;
+  if (record["quotationRule"] !== "REPORT_THE_BAND_NEVER_ONE_MEMBER") return false;
+  for (const [member, label] of [
+    ["optimistic", "OPTIMISTIC"],
+    ["base", "BASE"],
+    ["conservative", "CONSERVATIVE"],
+  ] as const) {
+    const scenario = record[member];
+    if (scenario === null || typeof scenario !== "object") return false;
+    const outcome = scenario as Record<string, unknown>;
+    if (outcome["scenario"] !== label) return false;
+    if (!isCanonicalDecimalString(outcome["filledShares"])) return false;
+    if (!isCanonicalDecimalString(outcome["remainingShares"])) return false;
+    if (!isCanonicalDecimalString(outcome["fillsAfterCancelRequest"])) return false;
   }
-  return simulationOk(result);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +237,27 @@ export function consumeDepth(input: {
   readonly limitPrice: string;
   readonly shares: string;
 }): SimulationResult<DepthConsumption> {
+  return totally("consuming depth", () => consumeDepthInner(input));
+}
+
+function consumeDepthInner(input: {
+  readonly ladder: readonly BookLevelView[];
+  readonly action: "BUY" | "SELL";
+  readonly limitPrice: string;
+  readonly shares: string;
+}): SimulationResult<DepthConsumption> {
   const { ladder, action, limitPrice, shares } = input;
+  if (!Array.isArray(ladder)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a ladder is an array of aggregate levels, best first",
+    );
+  }
+  if (action !== "BUY" && action !== "SELL") {
+    return simulationFailure("SIMULATION_INPUT_INVALID", "an order action is BUY or SELL", {
+      offered: String(action),
+    });
+  }
   if (!isCanonicalDecimalString(limitPrice) || !isCanonicalDecimalString(shares)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
@@ -231,11 +308,15 @@ export function consumeDepth(input: {
       action === "BUY"
         ? compareDecimal(level.price, limitPrice) <= 0
         : compareDecimal(level.price, limitPrice) >= 0;
+    // Checked BEFORE the limit test: an order that is already fully filled did
+    // not stop at its limit price, it stopped because it was done. The other
+    // order round-1 review probe P6 found reports `stoppedAtLimit` on a complete
+    // fill, which reads as "the limit bound this execution" when it did not.
+    if (compareDecimal(remaining, "0") <= 0) break;
     if (!withinLimit) {
       stoppedAtLimit = true;
       break;
     }
-    if (compareDecimal(remaining, "0") <= 0) break;
 
     const take = compareDecimal(level.size, remaining) <= 0 ? level.size : remaining;
     matched.push({ price: level.price, shares: take });
@@ -307,10 +388,39 @@ export function toFillFact(
  * rounding policy, and would hide from the ledger the per-level prices §6
  * invariant 4's traceability chain is supposed to carry.
  */
-export function sizeAtPrice(ladder: readonly BookLevelView[], price: string): string {
+export function sizeAtPrice(
+  ladder: readonly BookLevelView[],
+  price: string,
+): SimulationResult<string> {
+  // `compareDecimal` THROWS on a value that is not a canonical decimal string,
+  // so a door that documents typed refusals validates first (ADR-020 §6's "no
+  // throw escapes"; the same class the round-1 review found here).
+  if (!Array.isArray(ladder)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a ladder is an array of aggregate levels",
+    );
+  }
+  if (!isCanonicalDecimalString(price)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a price must be a canonical decimal string (§6 invariant 1)",
+      { offered: String(price) },
+    );
+  }
   let total = "0";
   for (const level of ladder) {
+    if (level === null || typeof level !== "object") {
+      return simulationFailure("SIMULATION_INPUT_INVALID", "a book level is not a record");
+    }
+    if (!isCanonicalDecimalString(level.price) || !isCanonicalDecimalString(level.size)) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a book level carries a non-canonical decimal; a malformed level is refused rather than skipped",
+        { price: String(level.price), size: String(level.size) },
+      );
+    }
     if (compareDecimal(level.price, price) === 0) total = addDecimal(total, level.size);
   }
-  return total;
+  return simulationOk(total);
 }

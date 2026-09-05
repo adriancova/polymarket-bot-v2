@@ -13,7 +13,7 @@ acceptance 2: "Same manifest/config/seed is byte-identical."
 | `manifest` | A `polymarket-bot/dataset-manifest/v1` document in `WP-130`'s exact shape and key order |
 | `rows` | The decoded dataset rows (`WP-130` `DecodedDatasetRow`) the manifest's one object contains |
 | `runPins` | The complete §12.5 run-scoped pin set (§12.5's normalizer, feature-set, seed, fill/latency model, fee/reward snapshot, settlement-spec versions, plus the simulator version) |
-| `expected.serialization` | The `polymarket-bot/simulation-run/v1` canonical form, line by line, compared **byte-for-byte** |
+| `expected.serialization` | The `polymarket-bot/simulation-run/v2` canonical form, line by line, compared **byte-for-byte** |
 
 ## Provenance
 
@@ -56,21 +56,50 @@ purpose:
 Sorting by venue timestamp gives `(4, 1, 9)`; the recorded dispatch order is
 `(1, 4, 9)`. §8.4 requires the second, and the golden bytes would change if the
 implementation ever produced the first. The wall clock also steps backwards
-between ordinals 0 and 1, which is why `venueTimestampInversions=1` and
-`wallClockRegressions=1` appear in the pinned output — both are OBSERVED and
-reported, and neither reorders anything.
+between ordinals 0 and 1, which is why BOTH diagnostics appear in the pinned
+output — `venueTimestampInversions=1` on the `delivery` line (the normalized
+envelopes' venue timestamps) and `receivedAtInversions=1` on the `counts` line
+(the recorded arrival wall clock), plus `wallClockRegressions=1` from the clock.
+All three are OBSERVED and reported, and none reorders anything.
 
 The `ingestSeq` values are non-contiguous (`1`, `4`, `9`) on purpose too: one
 gateway counter serves raw frames AND normalized events (`WP-120`), so raw
 frames alone are never contiguous, and a replay that required contiguity would
 refuse every real dataset.
 
+## What the golden RUN does (regenerated, round-1 review)
+
+The first version of this fixture drove **no venue and no core loop**, so its
+pinned bytes carried zero orders, zero fills and zero economics — §12.4's
+byte-identity list ("simulated order events, fills, …") was unexercised by the
+very test that exists to guard it. The run now drives a **Tier-1** simulated
+venue through the §12.1 seam:
+
+| At | What the core loop does | Why the outcome is what it is |
+| --- | --- | --- |
+| ordinal 0 (`book`, `ingestSeq` 1) | submits `golden-plan-1` with two orders | the recorded book is bid `0.07 × 100`, ask `0.09 × 60` |
+| — `golden-order-take` | `MARKETABLE_LIMIT` BUY, limit `0.09`, 10 shares | crosses the `0.09` ask, so it TAKES: one fill, 10 @ `0.09` |
+| — `golden-order-rest` | `REST` BUY, limit `0.08`, 50 shares, `postOnly` | inside the spread, so it RESTS; a `postOnly` order that does not cross is not rejected (venue report §2.3) |
+| ordinal 1 (`last_trade_price`, `ingestSeq` 4) | reports the recorded trade (`0.08 × 5`) to the venue | the resting order is AT `0.08` and nothing is queued ahead of it there, so all 5 shares reach it |
+| ordinal 2 (`price_change`, `ingestSeq` 9) | nothing | a book update is not a trade |
+
+Two model choices keep the run hand-derivable and seed-stable: every latency
+distribution has ONE sample at 0 ms (so the sampled latency is 0 whatever the
+seed draws — the seed still matters and is still pinned), and the fee snapshot is
+the frozen 2026-08-24 one (taker `0.07`, maker `0`, 5 decimal places, `HALF_UP`).
+
+A **Tier-1 resting order books no point-precise fill**: ADR-012 §1 makes its
+estimate the optimistic/base/conservative BAND, so the order line carries
+`fillEstimateKind=TIER_1_RESTING_BAND` and `filledShares=0`, and the `band` line
+carries the estimate. The `fillModelVersion` pin is `sim/tier1/v1` because that
+is the model that ran (§12.5).
+
 ## How `expected.serialization` was derived
 
 **By hand, from `serializeRun`'s published grammar and this fixture's own
 declared values — not captured from a run.** The derivation, line by line:
 
-1. `polymarket-bot/simulation-run/v1` — the format id constant.
+1. `polymarket-bot/simulation-run/v2` — the format id constant.
 2. `run …` — the five §12.5 model pins, verbatim from `runPins`.
 3. `pins …` — the four remaining §12.5 pins; `settlement=` is empty because the
    fixture pins no settlement-spec version.
@@ -79,13 +108,36 @@ declared values — not captured from a run.** The derivation, line by line:
    supplies no WAL-segment reader, and the source says so rather than implying a
    check happened.
 5. `counts …` — `read` and `delivered` from the manifest's own `recordCounts`;
-   `venueTimestampInversions=1` from the table above.
-6. `clock …` — `start`/`startNs` from row 0 and `end`/`endNs` from row 2, because
+   `receivedAtInversions=1` from the arrival column of the table above
+   (`…57.300Z`, then `…57.100Z`, compared on epoch milliseconds).
+6. `delivery …` — `envelopes=3` (the normalizer emits one per frame);
+   `venueTimestampInversions=1` from the venue-timestamp column
+   (`…357257`, then `…357000`); `withoutVenueTimestamp=0` because every frame
+   carries one.
+7. `clock …` — `start`/`startNs` from row 0 and `end`/`endNs` from row 2, because
    the clock is positioned at the first record and advanced by every one;
    `advances=3` (one per delivered record) and `wallClockRegressions=1`.
-7. `economics …` — all zero: this replay drives no core loop and no venue, so no
-   order and no fill exist. `markoutPenaltyApplied=false` is a literal (§12.3).
-8. `end`.
+8. `order …` ×2 — ordered by `simulatedOrderId`, so `golden-order-rest` precedes
+   `golden-order-take`. Fields in `serializeRun`'s fixed order: plan id, market,
+   the book's `tokenId`, side, action, limit, requested, filled, state, style,
+   fill-estimate kind, `postOnly`, and the recorded event identity the state was
+   reached at — ordinal 0, because both orders were booked against the recorded
+   `book` frame.
+9. `fill …` — one taker fill: `10 @ 0.09`. The fee is the ADR-012 §5.4 formula on
+   the frozen snapshot: `10 × 0.07 × 0.09 × (1 − 0.09) = 0.05733`, already exact
+   at 5 decimal places, so the rounding mode does not bite. Its id is
+   `<orderId>/t1/<level index>`.
+10. `economics …` — folded from that one fill: `buy = 0.09 × 10 = 0.9`,
+    `sell = 0`, `fees = 0.05733`, `net = 0 − 0.9 − 0.05733 = −0.95733`,
+    `sharesBought = 10`, `fills = 1`. `markoutPenaltyApplied=false` is a literal
+    (§12.3). The resting order contributes NOTHING here: a band is not cash.
+11. `band …` — the resting order's estimate. Queue ahead at placement is the
+    aggregate size observed at `0.08`, which is `0` (the recorded book's only bid
+    is at `0.07`), so the observed trade's 5 shares reach the order in every
+    scenario: `filled=5 remaining=45` three times, `postCancelFills=0` because no
+    cancel was requested. The three scenarios agreeing here is a property of THIS
+    book, not a general one.
+12. `end`.
 
 If a change moves these bytes, re-derive them the same way; do not paste the new
 output. The suite additionally asserts that the replay is reproducible and that

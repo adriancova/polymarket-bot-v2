@@ -52,6 +52,7 @@
 export {
   SIMULATION_REFUSAL_CODES,
   defineData,
+  describeForRefusal,
   isSimulationRefusalCode,
   ownDataDescriptor,
   ownDataDetails,
@@ -141,6 +142,7 @@ export type {
   PlannedOrderView,
   PlanningDepthAwareness,
   RecordedEventIdentity,
+  RestingFillBandLike,
   RunMode,
   SimulatedEvidenceClass,
   SimulatedFillLike,
@@ -202,6 +204,7 @@ export {
   FEE_ROUNDING_MODES,
   computeFee,
   readFeeScheduleSnapshot,
+  readRoundingMode,
   roundDecimal,
   sumFees,
 } from "./fees.js";
@@ -289,4 +292,4 @@ export type {
 } from "./replay.js";
 
 export { SIMULATION_RUN_SERIALIZATION_VERSION, serializeBand, serializeRun } from "./serialize.js";
-export type { SerializableRun } from "./serialize.js";
+export type { SerializableDelivery, SerializableRun } from "./serialize.js";

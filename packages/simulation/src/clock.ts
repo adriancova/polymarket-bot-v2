@@ -159,6 +159,12 @@ export class ReplayClock implements Clock {
 }
 
 function validateInstant(instant: RecordedInstant): SimulationResult<number> {
+  if (instant === null || typeof instant !== "object") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a recorded instant is a record carrying receivedAt and receivedMonotonicNs (§7.1)",
+    );
+  }
   if (!isIsoTimestamp(instant.receivedAt)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",

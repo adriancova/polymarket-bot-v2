@@ -32,8 +32,15 @@ import {
   simulatedFill,
   tier1Model,
   type MidTimeline,
+  type SimulationResult,
   type SimulatedFill,
 } from "../../../packages/simulation/src/index.js";
+
+/** Unwraps a door's result in a test, failing loudly rather than silently. */
+function unwrap<TValue>(result: SimulationResult<TValue>): TValue {
+  if (!result.ok) throw new Error(`${result.refusal.code}: ${result.refusal.message}`);
+  return result.value;
+}
 
 const MODEL = tier1Model({
   fillModelVersion: "sim/tier1/v1",
@@ -80,7 +87,10 @@ describe("acceptance 3 — the replay path does not subtract the adverse move tw
   const exit = fill({ simulatedFillId: "f-sell", action: "SELL", price: "0.4", shares: "100" });
 
   it("the replay path's economics ARE the adverse move, computed once", () => {
-    const economics = replayPathEconomics([entry, exit]);
+    const folded = replayPathEconomics([entry, exit]);
+    expect(folded.ok).toBe(true);
+    if (!folded.ok) return;
+    const economics = folded.value;
     // The independent oracle, written out: paid 0.5 × 100 = 50, received
     // 0.4 × 100 = 40, no fees. Net −10.
     expect(economics.buyNotional).toBe("50");
@@ -90,8 +100,18 @@ describe("acceptance 3 — the replay path does not subtract the adverse move tw
     expect(economics.markoutPenaltyApplied).toBe(false);
   });
 
+  it("REFUSES a fill carrying a non-canonical decimal rather than throwing", () => {
+    // Round-1 review M4: this door reached `mulDecimal` unguarded, so a
+    // type-valid non-canonical string escaped as an exception.
+    const hostile = { ...entry, shares: "1,5" } as unknown as typeof entry;
+    const folded = replayPathEconomics([hostile]);
+    expect(folded.ok).toBe(false);
+    if (folded.ok) return;
+    expect(folded.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+  });
+
   it("computing markouts does not change the replay path's economics", () => {
-    const before = replayPathEconomics([entry, exit]);
+    const before = unwrap(replayPathEconomics([entry, exit]));
     const diagnostics = computeMarkouts({
       fill: entry,
       filledAtNs: 0n,
@@ -106,7 +126,7 @@ describe("acceptance 3 — the replay path does not subtract the adverse move tw
     expect(oneSecond?.perShare).toBe("-0.1");
     expect(oneSecond?.total).toBe("-10");
 
-    const after = replayPathEconomics([entry, exit]);
+    const after = unwrap(replayPathEconomics([entry, exit]));
     expect(after).toEqual(before);
     expect(after.netCashFlow).toBe("-10");
     // NOT −20, which is what subtracting the markout from the realized path
@@ -184,7 +204,7 @@ describe("acceptance 3 — the replay path does not subtract the adverse move tw
 
 describe("the replay-path economics record has no markout term at all", () => {
   it("its key set is exactly the pinned list", () => {
-    const economics = replayPathEconomics([]);
+    const economics = unwrap(replayPathEconomics([]));
     expect(Object.keys(economics).sort()).toEqual([...REPLAY_PATH_ECONOMICS_KEYS].sort());
   });
 

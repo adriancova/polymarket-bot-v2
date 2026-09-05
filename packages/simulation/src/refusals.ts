@@ -87,6 +87,14 @@ export const SIMULATION_REFUSAL_CODES = [
   "SIMULATED_VENUE_DUPLICATE_ORDER",
   /** A cancel names an order this venue never accepted. */
   "SIMULATED_VENUE_UNKNOWN_ORDER",
+  /**
+   * A `SAFETY_CANCEL` plan did not cancel everything it named.
+   *
+   * §6 invariant 13 makes safety cancellation the privileged path, so a partial
+   * or total failure on it is reported as a refusal at the `ExecutionVenue`
+   * seam rather than being lost behind `accepted: true`.
+   */
+  "SIMULATED_VENUE_CANCEL_INCOMPLETE",
 
   // --- fill models ---------------------------------------------------------
   /** The fill-model parameters are absent or not pinned (§12.5, ADR-012 §4). */
@@ -151,6 +159,42 @@ export function defineData(target: object, key: string, value: unknown): void {
 /** A fresh prototype-free record. */
 export function plainRecord(): Record<string, unknown> {
   return Object.create(null) as Record<string, unknown>;
+}
+
+/**
+ * A TOTAL rendering of any value, for a refusal message or detail.
+ *
+ * `String(value)` is not total: `String(Object.create(null))` throws
+ * `TypeError: Cannot convert object to primitive value`, and a template literal
+ * throws on a symbol. Both were found escaping this package's own doors by the
+ * round-1 review's hostile drive — a door whose REFUSAL PATH throws is not
+ * total, and the refusal is the part that has to work.
+ */
+export function describeForRefusal(value: unknown): string {
+  switch (typeof value) {
+    case "string":
+      return value;
+    case "number":
+    case "boolean":
+      return String(value);
+    case "bigint":
+      return `${value.toString()}n`;
+    case "symbol":
+      return "(a symbol)";
+    case "undefined":
+      return "(absent)";
+    case "function":
+      return "(a function)";
+    default:
+      break;
+  }
+  if (value === null) return "(null)";
+  try {
+    return describeNonPrimitive(value);
+  } catch {
+    /* c8 ignore next -- describeNonPrimitive reads only `typeof` and length. */
+    return "(an unreadable value)";
+  }
 }
 
 function describeNonPrimitive(value: unknown): string {
@@ -279,6 +323,12 @@ export function totally<TValue>(
   compute: () => SimulationResult<TValue>,
 ): SimulationResult<TValue> {
   try {
+    if (typeof compute !== "function") {
+      return simulationFailure(
+        "SIMULATION_INTERNAL",
+        `${describeForRefusal(what)} was given no computation to run and is refused rather than answered (fail closed)`,
+      );
+    }
     return compute();
   } catch (cause) {
     let described = "an unexpected failure";
@@ -289,7 +339,7 @@ export function totally<TValue>(
     }
     return simulationFailure(
       "SIMULATION_INTERNAL",
-      `${what} failed unexpectedly and is refused rather than answered (fail closed)`,
+      `${describeForRefusal(what)} failed unexpectedly and is refused rather than answered (fail closed)`,
       { failure: described },
     );
   }

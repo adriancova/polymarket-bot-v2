@@ -706,11 +706,31 @@ const RUN_PIN_STRING_FIELDS: readonly (keyof ReplayRunPins)[] = [
   "simulatorVersion",
 ];
 
-/** Validates a run pin set, prototype-free in and out. */
+/** Every key a §12.5 run pin set may carry. Nothing else crosses this door. */
+const RUN_PIN_KEYS: readonly string[] = [...RUN_PIN_STRING_FIELDS, "runSeed", "settlementSpecVersions"];
+
+/**
+ * Validates a run pin set, prototype-free in and out.
+ *
+ * STRICT: an unknown key is refused, not carried. The manifest door two hundred
+ * lines above this one already refuses unknown keys, and these pins are the same
+ * kind of thing — the §12.5 record a run is cited by. A pin set that quietly
+ * carried an extra field would let a caller believe something was pinned that
+ * nothing reads (round-1 review L6).
+ */
 export function readRunPins(value: unknown): SimulationResult<ReplayRunPins> {
   return totally("reading the run pins", () => {
     if (!isRecord(value)) {
       return simulationFailure("SIMULATION_INPUT_INVALID", "the run pins must be a record");
+    }
+    for (const key of recordKeys(value)) {
+      if (!RUN_PIN_KEYS.includes(key)) {
+        return simulationFailure(
+          "REPLAY_MANIFEST_INVALID",
+          `the run pins carry an unknown key ${JSON.stringify(key)}; §12.5 fixes what a run pins and this door does not pass anything else through`,
+          { key },
+        );
+      }
     }
     for (const field of RUN_PIN_STRING_FIELDS) {
       const member = readField(value, field);
@@ -760,6 +780,18 @@ export function reconcileRunPins(
   dataset: ReplayDataset,
   run: ReplayRunPins,
 ): SimulationResult<ReplayRunPins> {
+  if (dataset === null || typeof dataset !== "object" || !isRecord(dataset.pins)) {
+    return simulationFailure(
+      "REPLAY_MANIFEST_INVALID",
+      "run pins are reconciled against a dataset manifest that carries its own pins (§12.5)",
+    );
+  }
+  if (run === null || typeof run !== "object") {
+    return simulationFailure(
+      "REPLAY_MANIFEST_PIN_MISSING",
+      "a run pin set is a record (§12.5)",
+    );
+  }
   const checks: readonly (readonly [string, string | null, string])[] = [
     ["normalizerVersion", dataset.pins.normalizerVersion, run.normalizerVersion],
     ["featureSetVersion", dataset.pins.featureSetVersion, run.featureSetVersion],

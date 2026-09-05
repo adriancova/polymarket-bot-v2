@@ -13,11 +13,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   GTD_EARLY_EXPIRY_MS,
+  checkBandOrdering,
   computeFee,
   consumeDepth,
   deriveStreams,
+  quoteForDeploymentDecision,
   readFeeScheduleSnapshot,
   readLatencyModel,
+  readRoundingMode,
   roundDecimal,
   simulateResting,
   sizeAtPrice,
@@ -28,6 +31,7 @@ import {
   tier1Model,
   type BookLevelView,
   type DepthTimeline,
+  type FeeRoundingMode,
   type FeeScheduleSnapshot,
   type LatencyModel,
   type MarketExecutionParameters,
@@ -159,10 +163,58 @@ describe("exact depth arithmetic (§6 invariant 1)", () => {
   });
 
   it("sums size at one price exactly", () => {
-    expect(sizeAtPrice([{ price: "0.5", size: "1.5" }, { price: "0.5", size: "2.25" }], "0.5")).toBe(
-      "3.75",
-    );
-    expect(sizeAtPrice([{ price: "0.5", size: "1" }], "0.6")).toBe("0");
+    const summed = sizeAtPrice([{ price: "0.5", size: "1.5" }, { price: "0.5", size: "2.25" }], "0.5");
+    expect(summed.ok).toBe(true);
+    if (!summed.ok) return;
+    expect(summed.value).toBe("3.75");
+    const absent = sizeAtPrice([{ price: "0.5", size: "1" }], "0.6");
+    expect(absent.ok).toBe(true);
+    if (!absent.ok) return;
+    expect(absent.value).toBe("0");
+  });
+
+  it("REFUSES a non-canonical level rather than throwing (ADR-020 §6)", () => {
+    // Round-1 review M4: `compareDecimal` throws on a type-valid non-canonical
+    // string, and this door reached it unguarded.
+    const hostile = sizeAtPrice([{ price: "1,5", size: "1" }], "0.5");
+    expect(hostile.ok).toBe(false);
+    if (hostile.ok) return;
+    expect(hostile.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+    expect(sizeAtPrice([{ price: "0.5", size: "1" }], "zero").ok).toBe(false);
+  });
+
+  it("does not report stoppedAtLimit for an order that simply finished", () => {
+    // Round-1 review L4 (probe P6): the walk used to test the limit before it
+    // tested completion, so a fully filled order whose NEXT level was beyond
+    // the limit reported that the limit had bound it.
+    const complete = consumeDepth({
+      ladder: [
+        { price: "0.5", size: "10" },
+        { price: "0.9", size: "10" },
+      ],
+      action: "BUY",
+      limitPrice: "0.6",
+      shares: "10",
+    });
+    expect(complete.ok).toBe(true);
+    if (!complete.ok) return;
+    expect(complete.value.remainingShares).toBe("0");
+    expect(complete.value.stoppedAtLimit).toBe(false);
+
+    // …and an order that really was bound by its limit still says so.
+    const bound = consumeDepth({
+      ladder: [
+        { price: "0.5", size: "10" },
+        { price: "0.9", size: "10" },
+      ],
+      action: "BUY",
+      limitPrice: "0.6",
+      shares: "15",
+    });
+    expect(bound.ok).toBe(true);
+    if (!bound.ok) return;
+    expect(bound.value.remainingShares).toBe("5");
+    expect(bound.value.stoppedAtLimit).toBe(true);
   });
 });
 
@@ -233,15 +285,49 @@ describe("the fee model (ADR-012 §5.4)", () => {
   it("rounds on the digit string, never through a float", () => {
     // 1.005 is famously not representable in binary floating point; a float
     // round-half-up would give 1.00.
-    expect(roundDecimal("1.005", 2, "HALF_UP")).toBe("1.01");
-    expect(roundDecimal("1.005", 2, "HALF_EVEN")).toBe("1");
-    expect(roundDecimal("1.015", 2, "HALF_EVEN")).toBe("1.02");
-    expect(roundDecimal("1.0049", 2, "HALF_UP")).toBe("1");
-    expect(roundDecimal("1.0001", 2, "UP")).toBe("1.01");
-    expect(roundDecimal("1.0099", 2, "DOWN")).toBe("1");
-    expect(roundDecimal("9.999", 2, "UP")).toBe("10");
-    expect(roundDecimal("0.000001", 0, "UP")).toBe("1");
-    expect(roundDecimal("-1.005", 2, "HALF_UP")).toBe("-1.01");
+    const rounded = (value: string, places: number, mode: FeeRoundingMode): string => {
+      const outcome = roundDecimal(value, places, mode);
+      if (!outcome.ok) throw new Error(`${outcome.refusal.code}: ${outcome.refusal.message}`);
+      return outcome.value;
+    };
+    expect(rounded("1.005", 2, "HALF_UP")).toBe("1.01");
+    expect(rounded("1.005", 2, "HALF_EVEN")).toBe("1");
+    expect(rounded("1.015", 2, "HALF_EVEN")).toBe("1.02");
+    expect(rounded("1.0049", 2, "HALF_UP")).toBe("1");
+    expect(rounded("1.0001", 2, "UP")).toBe("1.01");
+    expect(rounded("1.0099", 2, "DOWN")).toBe("1");
+    expect(rounded("9.999", 2, "UP")).toBe("10");
+    expect(rounded("0.000001", 0, "UP")).toBe("1");
+    expect(rounded("-1.005", 2, "HALF_UP")).toBe("-1.01");
+  });
+
+  it("REFUSES an unknown rounding mode instead of quietly rounding DOWN", () => {
+    // Round-1 review M5 (probe Q4): `computeFee` fell through a `default:` in
+    // its rounding switch, so an unrecognised mode truncated silently — a
+    // direction the venue documentation does not state, chosen for the operator.
+    const unknown = computeFee({
+      shares: "100",
+      price: "0.5",
+      liquidityRole: "TAKER",
+      snapshot: { ...FEES, roundingDecimalPlaces: 0, roundingMode: "SIDEWAYS" as FeeRoundingMode },
+    });
+    expect(unknown.ok).toBe(false);
+    if (unknown.ok) return;
+    expect(unknown.refusal.code).toBe("FILL_MODEL_FEE_SNAPSHOT_MISSING");
+    expect(readRoundingMode("SIDEWAYS" as FeeRoundingMode).ok).toBe(false);
+    expect(roundDecimal("1.005", 2, "SIDEWAYS" as FeeRoundingMode).ok).toBe(false);
+  });
+
+  it("REFUSES a snapshot whose rate is not a canonical decimal, rather than throwing", () => {
+    const hostile = computeFee({
+      shares: "100",
+      price: "0.5",
+      liquidityRole: "TAKER",
+      snapshot: { ...FEES, takerFeeRate: "1,5" },
+    });
+    expect(hostile.ok).toBe(false);
+    if (hostile.ok) return;
+    expect(hostile.refusal.code).toBe("FILL_MODEL_FEE_SNAPSHOT_MISSING");
   });
 });
 
@@ -497,6 +583,35 @@ describe("Tier 1 immediate orders (§12.2, ADR-012 §5)", () => {
     if (outcome.ok) return;
     expect(outcome.refusal.code).toBe("FILL_MODEL_LATENCY_DISTRIBUTION_INVALID");
   });
+
+  it("refuses an empty distribution ON THE EXECUTION PATH, not only at the door", () => {
+    // Round-1 review M6 (probe U2): `sampleLatencyMs` falls back to `?? 0`, so
+    // an unvalidated model turned "no latency data" into "no latency" — the
+    // Tier-0 assumption §12.2 bounds to wiring use, wearing a Tier-1 label.
+    const outcome = tier1Immediate({
+      ...base,
+      timeline: timeline([{ price: "0.5", size: "100" }]),
+      streams: streams(),
+      timeInForce: "FAK",
+      latencyModel: { ...LATENCY, network: { samples: [] } },
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("FILL_MODEL_LATENCY_DISTRIBUTION_INVALID");
+  });
+
+  it("refuses an unvalidated fee snapshot on the execution path", () => {
+    const outcome = tier1Immediate({
+      ...base,
+      timeline: timeline([{ price: "0.5", size: "100" }]),
+      streams: streams(),
+      timeInForce: "FAK",
+      feeSnapshot: { ...FEES, roundingMode: "SIDEWAYS" as FeeRoundingMode },
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("FILL_MODEL_FEE_SNAPSHOT_MISSING");
+  });
 });
 
 describe("Tier 1 resting orders — queue-ahead and the band (§12.2)", () => {
@@ -609,9 +724,340 @@ describe("Tier 1 resting orders — queue-ahead and the band (§12.2)", () => {
     if (!outcome.ok) return;
     expect(outcome.value.optimistic.fillsAfterCancelRequest).toBe("0");
     expect(outcome.value.conservative.fillsAfterCancelRequest).toBe("50");
-    // The adverse quantity is ordered the other way, and the band check passes.
-    expect(Number(outcome.value.optimistic.fillsAfterCancelRequest)).toBeLessThanOrEqual(
-      Number(outcome.value.conservative.fillsAfterCancelRequest),
+    // The effectiveness INSTANTS are ordered, which is what the delay ordering
+    // actually implies — 10 ms, 50 ms and 250 ms after the same request.
+    expect(outcome.value.optimistic.cancelEffectiveAtNs).toBe("10000000");
+    expect(outcome.value.base.cancelEffectiveAtNs).toBe("50000000");
+    expect(outcome.value.conservative.cancelEffectiveAtNs).toBe("250000000");
+  });
+
+  it("REFUSES observed trades that are not in recorded monotonic order", () => {
+    // Round-1 review M10 (probe P5): the walk stops at the first trade at or
+    // after its cancel-effectiveness instant, so an unsorted list truncated the
+    // walk and returned a SMALLER fill as though it were the answer — the same
+    // trades, sorted, gave 10 rather than 0.
+    const restingOrder = {
+      simulatedOrderId: "o-1",
+      marketId: MARKET.marketId,
+      tokenId: "1234",
+      side: "YES" as const,
+      action: "BUY" as const,
+      restingPrice: "0.5",
+      shares: "50",
+      queueAheadAtPlacement: "0",
+      sameInstantAdditionsShares: "0",
+      restingFromNs: 0n,
+      cancelRequestedAtNs: 4_000n,
+    };
+    const parameters: QueueModelParameters = {
+      ...QUEUE,
+      cancellationRatio: { OPTIMISTIC: "0", BASE: "0", CONSERVATIVE: "0" },
+      cancelEffectiveAfterMs: { OPTIMISTIC: 0, BASE: 0, CONSERVATIVE: 0 },
+    };
+    const early = { price: "0.5", shares: "10", monotonicNs: 1_000n, atEvent: AT_EVENT };
+    const late = { price: "0.5", shares: "10", monotonicNs: 5_000n, atEvent: AT_EVENT };
+
+    const sorted = simulateResting({
+      model,
+      order: restingOrder,
+      trades: [early, late],
+      parameters,
+      feeSnapshot: FEES,
+    });
+    expect(sorted.ok).toBe(true);
+    if (!sorted.ok) return;
+    expect(sorted.value.base.filledShares).toBe("10");
+
+    const unsorted = simulateResting({
+      model,
+      order: restingOrder,
+      trades: [late, early],
+      parameters,
+      feeSnapshot: FEES,
+    });
+    expect(unsorted.ok).toBe(false);
+    if (unsorted.ok) return;
+    expect(unsorted.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+    expect(unsorted.refusal.message).toContain("non-decreasing");
+  });
+});
+
+describe("the band's ordering claim is exactly what the parameters imply (§12.2, ADR-012 §1)", () => {
+  const model = tier1Model({
+    fillModelVersion: "sim/tier1/v1",
+    fillModelParametersHash: "0".repeat(64),
+  });
+
+  const restingOrder = {
+    simulatedOrderId: "o-1",
+    marketId: MARKET.marketId,
+    tokenId: "1234",
+    side: "YES" as const,
+    action: "BUY" as const,
+    restingPrice: "0.5",
+    shares: "50",
+    queueAheadAtPlacement: "100",
+    sameInstantAdditionsShares: "0",
+    restingFromNs: 0n,
+    cancelRequestedAtNs: 0n,
+  };
+
+  /** The same order with no cancel requested at all (not `undefined` for it). */
+  function withoutCancelRequest(order: typeof restingOrder) {
+    const rest: Record<string, unknown> = { ...order };
+    delete rest["cancelRequestedAtNs"];
+    return rest as Omit<typeof restingOrder, "cancelRequestedAtNs">;
+  }
+
+  /**
+   * The two parameterizations the previous, non-derivable post-cancel ordering
+   * REFUSED (round-1 review HIGH-1, probes P1 and Q5). Both are admissible: they
+   * pass `readQueueModelParameters`, and each is a world in which one of the two
+   * opposing forces — a longer effectiveness window, a higher cancellation
+   * ratio — dominates the other. A band is required, not a monotone one.
+   */
+  it("P1: ratios 1/0/0 with delays 10/20/30 ms produce a labelled three-scenario band", () => {
+    const outcome = simulateResting({
+      model,
+      order: { ...restingOrder, queueAheadAtPlacement: "50" },
+      trades: [{ price: "0.5", shares: "50", monotonicNs: 5n * 1_000_000n, atEvent: AT_EVENT }],
+      parameters: {
+        queueModelVersion: "sim/queue/p1",
+        cancellationRatio: { OPTIMISTIC: "1", BASE: "0", CONSERVATIVE: "0" },
+        cancelEffectiveAfterMs: { OPTIMISTIC: 10, BASE: 20, CONSERVATIVE: 30 },
+        placedBehindSameInstantAdditions: { OPTIMISTIC: false, BASE: false, CONSERVATIVE: true },
+        basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+      },
+      feeSnapshot: FEES,
+    });
+    expect(outcome.ok, outcome.ok ? "" : `${outcome.refusal.code}: ${outcome.refusal.message}`).toBe(
+      true,
     );
+    if (!outcome.ok) return;
+    expect(outcome.value.optimistic.scenario).toBe("OPTIMISTIC");
+    expect(outcome.value.base.scenario).toBe("BASE");
+    expect(outcome.value.conservative.scenario).toBe("CONSERVATIVE");
+    // The optimistic world's higher cancellation ratio empties the queue ahead,
+    // so it fills after the cancel request where the others do not. That is the
+    // model working, not a broken band.
+    expect(outcome.value.optimistic.fillsAfterCancelRequest).toBe("50");
+    expect(outcome.value.base.fillsAfterCancelRequest).toBe("0");
+    expect(outcome.value.conservative.fillsAfterCancelRequest).toBe("0");
+  });
+
+  it("Q5: ratios .5/.25/.1 with delays 50/150/300 ms produce a labelled three-scenario band", () => {
+    const outcome = simulateResting({
+      model,
+      order: restingOrder,
+      trades: [{ price: "0.5", shares: "120", monotonicNs: 100n * 1_000_000n, atEvent: AT_EVENT }],
+      parameters: {
+        queueModelVersion: "sim/queue/q5",
+        cancellationRatio: { OPTIMISTIC: "0.5", BASE: "0.25", CONSERVATIVE: "0.1" },
+        cancelEffectiveAfterMs: { OPTIMISTIC: 50, BASE: 150, CONSERVATIVE: 300 },
+        placedBehindSameInstantAdditions: { OPTIMISTIC: false, BASE: false, CONSERVATIVE: false },
+        basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+      },
+      feeSnapshot: FEES,
+    });
+    expect(outcome.ok, outcome.ok ? "" : `${outcome.refusal.code}: ${outcome.refusal.message}`).toBe(
+      true,
+    );
+    if (!outcome.ok) return;
+    // Both forces bind here, in different pairs: the optimistic cancel lands
+    // before the trade (0), the base window admits it and its ratio clears the
+    // queue (50), and the conservative window admits it but its lower ratio
+    // leaves queue ahead (32). Non-monotone, and correct.
+    expect(outcome.value.optimistic.fillsAfterCancelRequest).toBe("0");
+    expect(outcome.value.base.fillsAfterCancelRequest).toBe("50");
+    expect(outcome.value.conservative.fillsAfterCancelRequest).toBe("32");
+  });
+
+  it("keeps the ordering that IS derivable: fills BEFORE the cancel request", () => {
+    // Every scenario walks the same pre-request trades, so only the ratio and
+    // the queue ahead differ — and both are pinned in the same direction by
+    // `readQueueModelParameters`. Here the ordering is STRICT, so the check
+    // below is binding rather than trivially satisfied by three equal numbers.
+    const outcome = simulateResting({
+      model,
+      order: {
+        ...restingOrder,
+        shares: "1000",
+        queueAheadAtPlacement: "100",
+        sameInstantAdditionsShares: "50",
+        cancelRequestedAtNs: 10_000n,
+      },
+      trades: [{ price: "0.5", shares: "100", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(outcome.ok, outcome.ok ? "" : `${outcome.refusal.code}: ${outcome.refusal.message}`).toBe(
+      true,
+    );
+    if (!outcome.ok) return;
+    const preCancel = (scenario: { filledShares: string; fillsAfterCancelRequest: string }) =>
+      Number(scenario.filledShares) - Number(scenario.fillsAfterCancelRequest);
+    expect(preCancel(outcome.value.optimistic)).toBeGreaterThan(preCancel(outcome.value.base));
+    expect(preCancel(outcome.value.base)).toBeGreaterThan(preCancel(outcome.value.conservative));
+  });
+
+  it("REFUSES a band whose pre-cancel fills are ordered the wrong way", () => {
+    // The same strictly-ordered parameterization as above: 50 / 10 / 0 filled,
+    // so swapping two members really does invert the ordering.
+    const built = simulateResting({
+      model,
+      order: {
+        ...withoutCancelRequest(restingOrder),
+        shares: "1000",
+        queueAheadAtPlacement: "100",
+        sameInstantAdditionsShares: "50",
+      },
+      trades: [{ price: "0.5", shares: "100", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    expect(built.value.optimistic.filledShares).not.toBe(built.value.conservative.filledShares);
+    // Swap the optimistic and conservative members: the same three outcomes,
+    // filed under the wrong names.
+    const swapped = {
+      ...built.value,
+      optimistic: { ...built.value.conservative, scenario: "OPTIMISTIC" as const },
+      conservative: { ...built.value.optimistic, scenario: "CONSERVATIVE" as const },
+    };
+    const checked = checkBandOrdering(swapped);
+    expect(checked.ok).toBe(false);
+    if (checked.ok) return;
+    expect(checked.refusal.code).toBe("FILL_MODEL_BAND_INCONSISTENT");
+    expect(checked.refusal.message).toContain("before a cancel");
+  });
+
+  it("REFUSES a band whose members are mislabelled, or whose fills do not add up", () => {
+    const built = simulateResting({
+      model,
+      order: withoutCancelRequest(restingOrder),
+      trades: [{ price: "0.5", shares: "150", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+
+    const mislabelled = checkBandOrdering({
+      ...built.value,
+      base: { ...built.value.base, scenario: "OPTIMISTIC" as never },
+    });
+    expect(mislabelled.ok).toBe(false);
+    if (mislabelled.ok) return;
+    expect(mislabelled.refusal.message).toContain("misleading names");
+
+    const inflated = checkBandOrdering({
+      ...built.value,
+      optimistic: { ...built.value.optimistic, filledShares: "999" },
+    });
+    expect(inflated.ok).toBe(false);
+    if (inflated.ok) return;
+    expect(inflated.refusal.code).toBe("FILL_MODEL_BAND_INCONSISTENT");
+
+    const impossible = checkBandOrdering({
+      ...built.value,
+      base: { ...built.value.base, fillsAfterCancelRequest: "999" },
+    });
+    expect(impossible.ok).toBe(false);
+  });
+
+  it("REFUSES a band whose cancel effectiveness is ordered the wrong way", () => {
+    const built = simulateResting({
+      model,
+      order: restingOrder,
+      trades: [],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const inverted = checkBandOrdering({
+      ...built.value,
+      optimistic: { ...built.value.optimistic, cancelEffectiveAtNs: "999999999" },
+    });
+    expect(inverted.ok).toBe(false);
+    if (inverted.ok) return;
+    expect(inverted.refusal.message).toContain("cancel effectiveness");
+  });
+
+  it("REFUSES a hostile band rather than throwing (ADR-020 §6)", () => {
+    const hostile = checkBandOrdering({
+      model,
+      queueModelVersion: "v",
+      simulatedOrderId: "o-1",
+      marketId: MARKET.marketId,
+      restingPrice: "0.5",
+      optimistic: { scenario: "OPTIMISTIC", filledShares: "1,5" },
+      base: { scenario: "BASE", filledShares: "0" },
+      conservative: { scenario: "CONSERVATIVE", filledShares: "0" },
+      bandBasis: "OPTIMISTIC_BASE_CONSERVATIVE_CANCELLATION_ASSUMPTIONS",
+      quotationRule: "REPORT_THE_BAND_NEVER_ONE_MEMBER",
+    } as never);
+    expect(hostile.ok).toBe(false);
+    if (hostile.ok) return;
+    expect(hostile.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+  });
+});
+
+describe("what may be quoted in a deployment decision (ADR-012 §1)", () => {
+  const tier1 = tier1Model({
+    fillModelVersion: "sim/tier1/v1",
+    fillModelParametersHash: "0".repeat(64),
+  });
+  const tier0 = tier0Model({
+    fillModelVersion: "sim/tier0/v1",
+    fillModelParametersHash: "0".repeat(64),
+  });
+
+  it("REFUSES a Tier-1 result that is a single number wearing a Tier-1 identity", () => {
+    // Round-1 review M7 (probe P2): the gate checked the identity STRING only,
+    // so `{ model, filledShares }` — the exact thing ADR-012 §1 forbids —
+    // passed it.
+    const quoted = quoteForDeploymentDecision({ model: tier1, filledShares: "10" });
+    expect(quoted.ok).toBe(false);
+    if (quoted.ok) return;
+    expect(quoted.refusal.code).toBe("FILL_MODEL_BAND_INCONSISTENT");
+    expect(quoted.refusal.message).toContain("has already violated this ADR");
+  });
+
+  it("ACCEPTS the band itself", () => {
+    const band = simulateResting({
+      model: tier1,
+      order: {
+        simulatedOrderId: "o-1",
+        marketId: MARKET.marketId,
+        tokenId: "1234",
+        side: "YES",
+        action: "BUY",
+        restingPrice: "0.5",
+        shares: "50",
+        queueAheadAtPlacement: "10",
+        sameInstantAdditionsShares: "0",
+        restingFromNs: 0n,
+      },
+      trades: [{ price: "0.5", shares: "30", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(band.ok).toBe(true);
+    if (!band.ok) return;
+    expect(quoteForDeploymentDecision(band.value).ok).toBe(true);
+  });
+
+  it("still REFUSES a Tier-0 result (P2b)", () => {
+    const quoted = quoteForDeploymentDecision({ model: tier0 } as never);
+    expect(quoted.ok).toBe(false);
+    if (quoted.ok) return;
+    expect(quoted.refusal.message).toContain("pipeline-smoke");
+  });
+
+  it("REFUSES a value with no model at all rather than throwing", () => {
+    expect(quoteForDeploymentDecision(null as never).ok).toBe(false);
+    expect(quoteForDeploymentDecision({} as never).ok).toBe(false);
   });
 });

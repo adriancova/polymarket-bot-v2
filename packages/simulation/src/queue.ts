@@ -42,9 +42,9 @@
  * | `CONSERVATIVE` | slowest | latest | yes |
  *
  * {@link readQueueModelParameters} REFUSES parameters that are not ordered that
- * way, which is what makes the band's own ordering a derivable property rather
- * than a coincidence — and {@link checkBandOrdering} then asserts it on the
- * result.
+ * way. {@link checkBandOrdering} then asserts on the RESULT exactly the
+ * properties that follow from that ordering — and nothing else; see its own
+ * comment for the derivation and for the claim that was withdrawn.
  *
  * ADR-012 §7: no execution probe or live-micro observation exists, so none of
  * these numbers is measured. The model records that on its face.
@@ -52,12 +52,12 @@
 
 import { addDecimal, compareDecimal, isCanonicalDecimalString, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
 
-import { computeFee, type FeeScheduleSnapshot } from "./fees.js";
+import { computeFee, readFeeScheduleSnapshot, type FeeScheduleSnapshot } from "./fees.js";
 import { simulatedFill, type FillModelIdentity, type SimulatedFill } from "./fill-model.js";
-import { isNonEmptyString, isNonNegativeInteger } from "./grammar.js";
+import { isNonEmptyString, isNonNegativeInteger, isUnsignedIntegerString } from "./grammar.js";
 import { ownFrozenTree } from "./plain.js";
 import type { RecordedEventIdentity } from "./ports.js";
-import { simulationFailure, simulationOk, type SimulationResult } from "./refusals.js";
+import { simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
 
 /** The three §12.2 scenarios. There is no fourth and no "point estimate". */
 export const QUEUE_SCENARIOS = ["OPTIMISTIC", "BASE", "CONSERVATIVE"] as const;
@@ -85,6 +85,12 @@ export interface QueueModelParameters {
 export function readQueueModelParameters(
   parameters: QueueModelParameters,
 ): SimulationResult<QueueModelParameters> {
+  if (parameters === null || typeof parameters !== "object") {
+    return simulationFailure(
+      "FILL_MODEL_PARAMETERS_UNPINNED",
+      "the queue model parameters are a record; §12.5 pins them per run",
+    );
+  }
   if (!isNonEmptyString(parameters.queueModelVersion)) {
     return simulationFailure(
       "FILL_MODEL_PARAMETERS_UNPINNED",
@@ -180,14 +186,25 @@ export interface RestingOrderInput {
   readonly cancelRequestedAtNs?: bigint;
 }
 
-/** One scenario's outcome. Never reported alone; see {@link RestingFillBand}. */
-export interface RestingScenarioOutcome {
-  readonly scenario: QueueScenario;
+/**
+ * One scenario's outcome. Never reported alone; see {@link RestingFillBand}.
+ *
+ * The scenario label is a TYPE PARAMETER so that a band's `optimistic` member
+ * cannot be typed as, or filled with, the conservative outcome.
+ */
+export interface RestingScenarioOutcome<TScenario extends QueueScenario = QueueScenario> {
+  readonly scenario: TScenario;
   readonly filledShares: string;
   readonly remainingShares: string;
   readonly queueAheadAtPlacement: string;
   readonly queueAheadRemaining: string;
-  /** Shares filled AFTER a cancel was requested. Adverse; monotone the other way. */
+  /**
+   * Shares filled AFTER a cancel was requested.
+   *
+   * NOT monotone across the band: see {@link checkBandOrdering}. It is reported
+   * per scenario because it is the adverse quantity a cancel was supposed to
+   * stop, and a reader needs all three of them.
+   */
   readonly fillsAfterCancelRequest: string;
   readonly cancelEffectiveAtNs: string | null;
   readonly fills: readonly SimulatedFill[];
@@ -199,9 +216,19 @@ export interface RestingScenarioOutcome {
 export interface RestingFillBand {
   readonly model: FillModelIdentity;
   readonly queueModelVersion: string;
-  readonly optimistic: RestingScenarioOutcome;
-  readonly base: RestingScenarioOutcome;
-  readonly conservative: RestingScenarioOutcome;
+  /**
+   * The resting order this band estimates.
+   *
+   * Carried on the band so a serialized band is identified by the order it is
+   * about rather than by whichever fill happened to sort first — the §12.4
+   * ordering key has to be TOTAL and value-derived.
+   */
+  readonly simulatedOrderId: string;
+  readonly marketId: string;
+  readonly restingPrice: string;
+  readonly optimistic: RestingScenarioOutcome<"OPTIMISTIC">;
+  readonly base: RestingScenarioOutcome<"BASE">;
+  readonly conservative: RestingScenarioOutcome<"CONSERVATIVE">;
   readonly bandBasis: "OPTIMISTIC_BASE_CONSERVATIVE_CANCELLATION_ASSUMPTIONS";
   /**
    * Restates ADR-012 §1 on the value itself, so a report that prints one member
@@ -210,7 +237,7 @@ export interface RestingFillBand {
   readonly quotationRule: "REPORT_THE_BAND_NEVER_ONE_MEMBER";
 }
 
-/** Runs all three scenarios and returns the band. */
+/** Runs all three scenarios and returns the band. Total: no throw escapes. */
 export function simulateResting(input: {
   readonly model: FillModelIdentity;
   readonly order: RestingOrderInput;
@@ -218,6 +245,21 @@ export function simulateResting(input: {
   readonly parameters: QueueModelParameters;
   readonly feeSnapshot: FeeScheduleSnapshot;
 }): SimulationResult<RestingFillBand> {
+  return totally("simulating a resting order", () => simulateRestingInner(input));
+}
+
+function simulateRestingInner(input: {
+  readonly model: FillModelIdentity;
+  readonly order: RestingOrderInput;
+  readonly trades: readonly ObservedTrade[];
+  readonly parameters: QueueModelParameters;
+  readonly feeSnapshot: FeeScheduleSnapshot;
+}): SimulationResult<RestingFillBand> {
+  if (input.order === null || typeof input.order !== "object") {
+    return simulationFailure("SIMULATION_INPUT_INVALID", "a resting order must be a record");
+  }
+  const feeSnapshot = readFeeScheduleSnapshot(input.feeSnapshot);
+  if (!feeSnapshot.ok) return feeSnapshot;
   const parameters = readQueueModelParameters(input.parameters);
   if (!parameters.ok) return parameters;
   if (input.model.tier !== "TIER_1") {
@@ -240,35 +282,42 @@ export function simulateResting(input: {
       );
     }
   }
-
-  const outcomes: Partial<Record<QueueScenario, RestingScenarioOutcome>> = {};
-  for (const scenario of QUEUE_SCENARIOS) {
-    const outcome = runScenario({
-      scenario,
-      model: input.model,
-      order: input.order,
-      trades: input.trades,
-      parameters: parameters.value,
-      feeSnapshot: input.feeSnapshot,
-    });
-    if (!outcome.ok) return outcome;
-    outcomes[scenario] = outcome.value;
+  if (!isNonEmptyString(input.order.simulatedOrderId) || !isNonEmptyString(input.order.marketId)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a resting order must name itself and its market; the band is identified by the order it is about",
+    );
   }
 
-  const optimistic = outcomes.OPTIMISTIC;
-  const base = outcomes.BASE;
-  const conservative = outcomes.CONSERVATIVE;
-  /* c8 ignore next 3 -- every scenario was assigned in the loop above. */
-  if (optimistic === undefined || base === undefined || conservative === undefined) {
-    return simulationFailure("SIMULATION_INTERNAL", "a queue scenario produced no outcome");
-  }
+  // Validated BEFORE any scenario runs, and for the WHOLE list: every scenario
+  // walks the same trades, so a malformed or out-of-order trade must be refused
+  // once, not discovered halfway through one scenario's walk.
+  const trades = readObservedTrades(input.trades);
+  if (!trades.ok) return trades;
+
+  const shared = {
+    model: input.model,
+    order: input.order,
+    trades: trades.value,
+    parameters: parameters.value,
+    feeSnapshot: feeSnapshot.value,
+  };
+  const optimistic = runScenario({ ...shared, scenario: "OPTIMISTIC" });
+  if (!optimistic.ok) return optimistic;
+  const base = runScenario({ ...shared, scenario: "BASE" });
+  if (!base.ok) return base;
+  const conservative = runScenario({ ...shared, scenario: "CONSERVATIVE" });
+  if (!conservative.ok) return conservative;
 
   const band = ownFrozenTree<RestingFillBand>({
     model: input.model,
     queueModelVersion: parameters.value.queueModelVersion,
-    optimistic,
-    base,
-    conservative,
+    simulatedOrderId: input.order.simulatedOrderId,
+    marketId: input.order.marketId,
+    restingPrice: input.order.restingPrice,
+    optimistic: optimistic.value,
+    base: base.value,
+    conservative: conservative.value,
     bandBasis: "OPTIMISTIC_BASE_CONSERVATIVE_CANCELLATION_ASSUMPTIONS",
     quotationRule: "REPORT_THE_BAND_NEVER_ONE_MEMBER",
   });
@@ -278,27 +327,197 @@ export function simulateResting(input: {
 }
 
 /**
- * Asserts the band's own ordering.
+ * Checks the band against the properties that FOLLOW from its parameters.
  *
- * A band whose "optimistic" member fills less than its "conservative" one is not
- * a band; it is three numbers with misleading names. This is checked on the
- * RESULT as well as being made derivable from the parameters, because the two
- * checks fail for different reasons.
+ * ## The claim that was withdrawn, and why (round-1 review, HIGH-1)
+ *
+ * An earlier version of this function also required post-cancel fills to satisfy
+ * `OPTIMISTIC <= BASE <= CONSERVATIVE`, on the reasoning that a post-cancel fill
+ * is adverse and so the adverse quantity should be ordered the other way. **That
+ * is not derivable, and it refused valid parameterizations.** Two admissible
+ * parameter axes push post-cancel fills in OPPOSITE directions:
+ *
+ * - a longer effectiveness window (`cancelEffectiveAfterMs`, ordered
+ *   `OPT <= BASE <= CONS`) admits MORE post-request trades, which raises the
+ *   conservative scenario's post-cancel fills; while
+ * - a higher `cancellationRatio` (ordered `OPT >= BASE >= CONS`) drains the
+ *   queue ahead faster, which raises the OPTIMISTIC scenario's fills per trade.
+ *
+ * Either force can dominate for parameters `readQueueModelParameters` accepts.
+ * Two measured examples, both refused by the old check and both correct bands:
+ * ratios `1/0/0` with delays `10/20/30 ms` and one trade 5 ms after the request
+ * gives post-cancel fills `{50, 0, 0}` (the ratio dominates); ratios
+ * `0.5/0.25/0.1` with delays `50/150/300 ms` and one trade at 100 ms gives
+ * `{0, 50, 32}` (both forces bind, in different pairs). §12.2 requires the
+ * result to be REPORTED AS A BAND; it does not say filled shares are monotone
+ * across scenarios, and with opposing forces they are not. A non-derivable
+ * ordering is therefore not an invariant here, and is not refused.
+ *
+ * ## What IS derivable, and is enforced
+ *
+ * 1. **Each scenario is internally consistent**: canonical, non-negative
+ *    quantities; `fillsAfterCancelRequest <= filledShares`; `filledShares` is
+ *    exactly the sum of the scenario's own fills; the scenario's label matches
+ *    the member it is filed under.
+ * 2. **The three scenarios describe ONE order**: `filledShares + remainingShares`
+ *    is identical across them.
+ * 3. **`cancelEffectiveAtNs` is ordered `OPT <= BASE <= CONS`** whenever a cancel
+ *    was requested — this follows directly from the parameter constraint
+ *    `cancelEffectiveAfterMs.OPTIMISTIC <= BASE <= CONSERVATIVE` applied to one
+ *    shared request instant, and it is the axis on which "conservative" means
+ *    "the safety cancel lands latest".
+ * 4. **Fills BEFORE the cancel request are ordered `OPT >= BASE >= CONS`.**
+ *    Proof: a pre-request trade has `monotonicNs < cancelRequestedAtNs <=
+ *    cancelEffectiveAtNs` in every scenario, so the effectiveness window cuts
+ *    none of them and all three scenarios walk the SAME pre-request trades (the
+ *    trade list is validated non-decreasing in `monotonicNs`, so the loop's
+ *    `break` cannot skip an earlier one). Over that shared prefix the per-trade
+ *    step is `q' = max(0, max(0, q - ratio x s) - s)` and the size that reaches
+ *    us is `max(0, s - max(0, q - ratio x s))`: `q` is monotone non-increasing in
+ *    `ratio` and non-decreasing in the starting queue, and the size reaching us
+ *    is monotone the other way, so cumulative fills are non-decreasing in
+ *    `ratio` and non-increasing in the queue ahead at placement. The parameter
+ *    door pins `ratio` at `OPT >= BASE >= CONS` and allows the larger
+ *    (behind-same-instant-additions) queue only in `CONSERVATIVE`, so both
+ *    inputs point the same way and the ordering follows. A trade THROUGH the
+ *    price fills the whole remainder in every scenario, which preserves it.
  */
 export function checkBandOrdering(band: RestingFillBand): SimulationResult<RestingFillBand> {
-  // The band has TWO axes and they point in opposite directions, so the check
-  // is stated per axis rather than on the total:
-  //
-  //   * fills BEFORE a cancel is requested are the thing a resting order wants,
-  //     so more of them is the optimistic world: OPTIMISTIC >= BASE >= CONSERVATIVE;
-  //   * fills AFTER a cancel is requested are adverse — the cancel was supposed
-  //     to stop them — so fewer of them is the optimistic world, and the order
-  //     inverts: OPTIMISTIC <= BASE <= CONSERVATIVE.
-  //
-  // Checking the TOTAL would fail on a correctly-modelled cancel, because a
-  // conservative world's slower cancel produces MORE total fills. That is a real
-  // property of the model, not a defect, and it is exactly why the two axes are
-  // reported separately.
+  return totally("checking a resting band", () => checkBandOrderingInner(band));
+}
+
+function checkBandOrderingInner(band: RestingFillBand): SimulationResult<RestingFillBand> {
+  if (band === null || typeof band !== "object") {
+    return simulationFailure("SIMULATION_INPUT_INVALID", "a band must be a record");
+  }
+  const members: readonly (readonly [string, QueueScenario, RestingScenarioOutcome])[] = [
+    ["optimistic", "OPTIMISTIC", band.optimistic],
+    ["base", "BASE", band.base],
+    ["conservative", "CONSERVATIVE", band.conservative],
+  ];
+
+  for (const [member, expected, outcome] of members) {
+    if (outcome === null || typeof outcome !== "object") {
+      return simulationFailure(
+        "FILL_MODEL_BAND_INCONSISTENT",
+        `the band's ${member} member is not a scenario outcome`,
+        { member },
+      );
+    }
+    if (outcome.scenario !== expected) {
+      return simulationFailure(
+        "FILL_MODEL_BAND_INCONSISTENT",
+        `the band's ${member} member is labelled ${String(outcome.scenario)}; three numbers with misleading names are not a band`,
+        { member, labelled: String(outcome.scenario) },
+      );
+    }
+    for (const [field, value] of [
+      ["filledShares", outcome.filledShares],
+      ["remainingShares", outcome.remainingShares],
+      ["queueAheadAtPlacement", outcome.queueAheadAtPlacement],
+      ["queueAheadRemaining", outcome.queueAheadRemaining],
+      ["fillsAfterCancelRequest", outcome.fillsAfterCancelRequest],
+    ] as const) {
+      if (!isCanonicalDecimalString(value)) {
+        return simulationFailure(
+          "SIMULATION_INPUT_INVALID",
+          `the band's ${member}.${field} is not a canonical decimal string (§6 invariant 1)`,
+          { member, field, offered: String(value) },
+        );
+      }
+      if (compareDecimal(value, "0") < 0) {
+        return simulationFailure(
+          "FILL_MODEL_BAND_INCONSISTENT",
+          `the band's ${member}.${field} is negative`,
+          { member, field, offered: value },
+        );
+      }
+    }
+    if (compareDecimal(outcome.fillsAfterCancelRequest, outcome.filledShares) > 0) {
+      return simulationFailure(
+        "FILL_MODEL_BAND_INCONSISTENT",
+        `the band's ${member} scenario fills more shares after a cancel request than it fills in total`,
+        {
+          member,
+          fillsAfterCancelRequest: outcome.fillsAfterCancelRequest,
+          filledShares: outcome.filledShares,
+        },
+      );
+    }
+    let summed = "0";
+    for (const fill of outcome.fills) {
+      if (!isCanonicalDecimalString(fill.shares)) {
+        return simulationFailure(
+          "SIMULATION_INPUT_INVALID",
+          `a fill in the band's ${member} scenario carries a non-canonical share quantity`,
+          { member, offered: String(fill.shares) },
+        );
+      }
+      summed = addDecimal(summed, fill.shares);
+    }
+    if (compareDecimal(summed, outcome.filledShares) !== 0) {
+      return simulationFailure(
+        "FILL_MODEL_BAND_INCONSISTENT",
+        `the band's ${member} scenario reports ${outcome.filledShares} filled and its own fills sum to ${summed}`,
+        { member, reported: outcome.filledShares, summed },
+      );
+    }
+  }
+
+  const total = (outcome: RestingScenarioOutcome): string =>
+    addDecimal(outcome.filledShares, outcome.remainingShares);
+  for (const [member, , outcome] of members) {
+    if (compareDecimal(total(outcome), total(band.optimistic)) !== 0) {
+      return simulationFailure(
+        "FILL_MODEL_BAND_INCONSISTENT",
+        "the three scenarios do not describe one order: filled + remaining differs between them",
+        { member, total: total(outcome), optimisticTotal: total(band.optimistic) },
+      );
+    }
+  }
+
+  const effective = members.map(([member, , outcome]) => ({
+    member,
+    at: outcome.cancelEffectiveAtNs,
+  }));
+  const stated = effective.filter((entry) => entry.at !== null);
+  if (stated.length !== 0 && stated.length !== effective.length) {
+    return simulationFailure(
+      "FILL_MODEL_BAND_INCONSISTENT",
+      "a cancel is requested in some scenarios of the band and not in others; the request instant is one recorded fact",
+      { stated: stated.length },
+    );
+  }
+  if (stated.length === effective.length && stated.length > 0) {
+    for (const entry of stated) {
+      if (!isUnsignedIntegerString(entry.at ?? "")) {
+        return simulationFailure(
+          "SIMULATION_INPUT_INVALID",
+          `the band's ${entry.member}.cancelEffectiveAtNs is not a canonical unsigned integer string`,
+          { member: entry.member, offered: String(entry.at) },
+        );
+      }
+    }
+    const [optimistic, base, conservative] = stated.map((entry) => BigInt(entry.at ?? "0"));
+    if (
+      optimistic === undefined ||
+      base === undefined ||
+      conservative === undefined ||
+      optimistic > base ||
+      base > conservative
+    ) {
+      return simulationFailure(
+        "FILL_MODEL_BAND_INCONSISTENT",
+        "the band is not ordered on cancel effectiveness: a conservative world is the one where a safety cancel lands latest, so cancelEffectiveAtNs must satisfy OPTIMISTIC <= BASE <= CONSERVATIVE",
+        {
+          optimistic: band.optimistic.cancelEffectiveAtNs,
+          base: band.base.cancelEffectiveAtNs,
+          conservative: band.conservative.cancelEffectiveAtNs,
+        },
+      );
+    }
+  }
+
   const preCancel = (outcome: RestingScenarioOutcome): string =>
     subDecimal(outcome.filledShares, outcome.fillsAfterCancelRequest);
   if (
@@ -307,7 +526,7 @@ export function checkBandOrdering(band: RestingFillBand): SimulationResult<Resti
   ) {
     return simulationFailure(
       "FILL_MODEL_BAND_INCONSISTENT",
-      "the band is not ordered: fills before a cancel must satisfy OPTIMISTIC >= BASE >= CONSERVATIVE",
+      "the band is not ordered: fills before a cancel is requested must satisfy OPTIMISTIC >= BASE >= CONSERVATIVE, which follows from the parameter ordering because every scenario walks the same pre-request trades",
       {
         optimistic: preCancel(band.optimistic),
         base: preCancel(band.base),
@@ -315,33 +534,75 @@ export function checkBandOrdering(band: RestingFillBand): SimulationResult<Resti
       },
     );
   }
-  if (
-    compareDecimal(band.optimistic.fillsAfterCancelRequest, band.base.fillsAfterCancelRequest) > 0 ||
-    compareDecimal(band.base.fillsAfterCancelRequest, band.conservative.fillsAfterCancelRequest) > 0
-  ) {
+  return simulationOk(band);
+}
+
+/**
+ * Validates the observed trades a band is computed from.
+ *
+ * Non-decreasing `monotonicNs` is not a nicety: {@link runScenario} stops at the
+ * first trade at or after its cancel-effectiveness instant, so an out-of-order
+ * list silently truncates the walk and returns a smaller fill as though it were
+ * the answer. The same list, sorted, gives a different number — which means an
+ * unsorted list has no defined answer and is refused rather than answered.
+ */
+function readObservedTrades(
+  trades: readonly ObservedTrade[],
+): SimulationResult<readonly ObservedTrade[]> {
+  if (!Array.isArray(trades)) {
     return simulationFailure(
-      "FILL_MODEL_BAND_INCONSISTENT",
-      "the band is not ordered on post-cancel fills: an adverse quantity must satisfy OPTIMISTIC <= BASE <= CONSERVATIVE",
-      {
-        optimistic: band.optimistic.fillsAfterCancelRequest,
-        base: band.base.fillsAfterCancelRequest,
-        conservative: band.conservative.fillsAfterCancelRequest,
-      },
+      "SIMULATION_INPUT_INVALID",
+      "the observed trades must be an array (possibly empty)",
     );
   }
-  return simulationOk(band);
+  let previous: bigint | undefined;
+  for (let index = 0; index < trades.length; index += 1) {
+    const trade = trades[index];
+    if (trade === undefined || typeof trade !== "object") {
+      return simulationFailure("SIMULATION_INPUT_INVALID", "an observed trade is not a record", {
+        index,
+      });
+    }
+    if (!isCanonicalDecimalString(trade.price) || !isCanonicalDecimalString(trade.shares)) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "an observed trade carries a non-canonical decimal",
+        { index, price: String(trade.price), shares: String(trade.shares) },
+      );
+    }
+    if (typeof trade.monotonicNs !== "bigint" || trade.monotonicNs < 0n) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "an observed trade must carry the recorded monotonic nanoseconds of the event that printed it (§7.1)",
+        { index },
+      );
+    }
+    if (previous !== undefined && trade.monotonicNs < previous) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "the observed trades are not in non-decreasing recorded monotonic order; a queue walk over an unordered list truncates silently and would report a smaller fill as though it were the answer",
+        {
+          index,
+          previousMonotonicNs: previous.toString(),
+          monotonicNs: trade.monotonicNs.toString(),
+        },
+      );
+    }
+    previous = trade.monotonicNs;
+  }
+  return simulationOk(trades);
 }
 
 const NANOSECONDS_PER_MILLISECOND = 1_000_000n;
 
-function runScenario(input: {
-  readonly scenario: QueueScenario;
+function runScenario<TScenario extends QueueScenario>(input: {
+  readonly scenario: TScenario;
   readonly model: FillModelIdentity;
   readonly order: RestingOrderInput;
   readonly trades: readonly ObservedTrade[];
   readonly parameters: QueueModelParameters;
   readonly feeSnapshot: FeeScheduleSnapshot;
-}): SimulationResult<RestingScenarioOutcome> {
+}): SimulationResult<RestingScenarioOutcome<TScenario>> {
   const { scenario, order, parameters } = input;
   const ratio = parameters.cancellationRatio[scenario];
   const behind = parameters.placedBehindSameInstantAdditions[scenario];
@@ -369,13 +630,9 @@ function runScenario(input: {
     if (trade.monotonicNs < order.restingFromNs) continue;
     if (cancelEffectiveAtNs !== null && trade.monotonicNs >= cancelEffectiveAtNs) break;
     if (compareDecimal(remaining, "0") <= 0) break;
-    if (!isCanonicalDecimalString(trade.price) || !isCanonicalDecimalString(trade.shares)) {
-      return simulationFailure(
-        "SIMULATION_INPUT_INVALID",
-        "an observed trade carries a non-canonical decimal",
-        { price: String(trade.price), shares: String(trade.shares) },
-      );
-    }
+    // The trade list was validated as a whole by `readObservedTrades` before any
+    // scenario ran: canonical decimals, and non-decreasing in `monotonicNs`, so
+    // this `break` cannot skip an earlier trade.
 
     const comparison = compareDecimal(trade.price, order.restingPrice);
     // A resting BUY sits on the bid: a trade BELOW its price traded through it.
@@ -438,7 +695,7 @@ function runScenario(input: {
   }
 
   return simulationOk(
-    ownFrozenTree<RestingScenarioOutcome>({
+    ownFrozenTree<RestingScenarioOutcome<TScenario>>({
       scenario,
       filledShares: filled,
       remainingShares: remaining,

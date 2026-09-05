@@ -26,6 +26,8 @@ import {
   type FeeScheduleSnapshot,
   type LatencyModel,
   type PlacementPlanView,
+  type PlannedOrderView,
+  type QueueModelParameters,
   type SimulatedVenueOptions,
 } from "../../../packages/simulation/src/index.js";
 
@@ -51,6 +53,15 @@ const AT_EVENT = {
 const POLICY: ExecutionPolicy = {
   timeInForceFor: () => "GTC",
   statedExpiryNsFor: () => undefined,
+  sameInstantAdditionsSharesFor: () => "0",
+};
+
+const QUEUE: QueueModelParameters = {
+  queueModelVersion: "sim/queue/v1",
+  cancellationRatio: { OPTIMISTIC: "0.5", BASE: "0.1", CONSERVATIVE: "0" },
+  cancelEffectiveAfterMs: { OPTIMISTIC: 10, BASE: 50, CONSERVATIVE: 250 },
+  placedBehindSameInstantAdditions: { OPTIMISTIC: false, BASE: false, CONSERVATIVE: true },
+  basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
 };
 
 const LATENCY: LatencyModel = {
@@ -77,6 +88,19 @@ function book(levels: readonly { price: string; size: string }[]) {
     tokenId: "1234",
     top: () => ({}),
     ladder: () => levels,
+  };
+}
+
+/** A book whose two sides differ, so "crossing" is a real question. */
+function sidedBook(
+  bids: readonly { price: string; size: string }[],
+  asks: readonly { price: string; size: string }[],
+) {
+  return {
+    internalMarketId: MARKET_ID,
+    tokenId: "1234",
+    top: () => ({}),
+    ladder: (side: "BID" | "ASK") => (side === "ASK" ? asks : bids),
   };
 }
 
@@ -451,5 +475,390 @@ describe("the venue's results and account state", () => {
     expect(result.notCancelled).toEqual([
       { simulatedOrderId: "nope", reason: "SIMULATED_VENUE_UNKNOWN_ORDER" },
     ]);
+  });
+
+  it("states whether a rate-limit budget was modelled at all (ADR-012 §5.6)", async () => {
+    const unmodelled = await venue().submit(placement());
+    expect(unmodelled.rateLimitModel).toBe("NOT_MODELED");
+    expect(unmodelled.rateLimitDisclosure).toContain("no venue budget model");
+
+    const modelled = await venue({
+      rateLimits: tokenBucketRateLimits({
+        orderTokensPerWindow: 5,
+        cancelTokensPerWindow: 5,
+        windowMs: 60_000,
+        snapshotVersion: "test/rate-limits/v1",
+      }),
+    }).submit(placement());
+    expect(modelled.rateLimitModel).toBe("MODELED");
+    expect(modelled.rateLimitDisclosure).toContain("test/rate-limits/v1");
+  });
+
+  it("turns an unexpected internal failure into a REFUSED result, not a rejected promise", async () => {
+    // Round-1 review M4: an unvalidated economic field reached layer-0
+    // arithmetic and threw out of `submit`, which documents a typed refusal.
+    const hostile = venue({ startingCash: "1,000" });
+    const result = await hostile.submit(placement());
+    expect(result.accepted).toBe(false);
+    expect(result.refusalCode).toBe("SIMULATION_INPUT_INVALID");
+
+    const badFees = venue({ feeSnapshot: { ...FEES, takerFeeRate: "1,5" } });
+    const feeResult = await badFees.submit(placement());
+    expect(feeResult.accepted).toBe(false);
+    expect(feeResult.refusalCode).toBe("FILL_MODEL_FEE_SNAPSHOT_MISSING");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The §12.1 seam: what `executionStyle` decides
+// ---------------------------------------------------------------------------
+
+/** One planned order, with the fields a routing probe varies. */
+function order(overrides: Partial<PlannedOrderView> = {}): PlannedOrderView {
+  return {
+    plannedOrderId: "order-1",
+    marketId: MARKET_ID,
+    side: "YES",
+    action: "BUY",
+    limitPrice: "0.6",
+    shares: "10",
+    postOnly: false,
+    executionStyle: "MARKETABLE_LIMIT",
+    reservationId: "res-1",
+    ...overrides,
+  };
+}
+
+function planWith(planned: PlannedOrderView, overrides: Partial<PlacementPlanView> = {}) {
+  return placement({
+    groups: [
+      {
+        executionGroupId: "group-1",
+        marketId: MARKET_ID,
+        tickSize: "0.01",
+        minimumOrderSize: "5",
+        orders: [planned],
+      },
+    ],
+    ...overrides,
+  });
+}
+
+const TIER1_MODEL = tier1Model({ fillModelVersion: "t1", fillModelParametersHash: "0".repeat(64) });
+
+/** A Tier-1 venue over a fixed book. Built directly: nothing is defaulted. */
+function tier1Venue(
+  bids: readonly { price: string; size: string }[],
+  asks: readonly { price: string; size: string }[],
+  overrides: Partial<SimulatedVenueOptions> = {},
+): SimulatedVenue {
+  const created = new SimulatedVenue({
+    clock: clock(),
+    runMode: "BACKTEST",
+    model: TIER1_MODEL,
+    feeSnapshot: FEES,
+    rateLimits: unmodeledRateLimits("no venue budget model is wired in this test"),
+    policy: POLICY,
+    startingCash: "1000",
+    timeline: { bookAt: () => ({ book: sidedBook(bids, asks), atEvent: AT_EVENT }) },
+    latencyModel: LATENCY,
+    streams: deriveStreams("42"),
+    marketParameters: () => ({
+      marketId: MARKET_ID,
+      tickSize: "0.01",
+      minimumOrderSize: "5",
+      secondsDelay: 0,
+      parametersVersion: 1,
+    }),
+    queueParameters: QUEUE,
+    ...overrides,
+  });
+  created.observe(AT_EVENT);
+  return created;
+}
+
+/** The same Tier-1 venue with one option deliberately ABSENT. */
+function tier1VenueWithout(
+  bids: readonly { price: string; size: string }[],
+  asks: readonly { price: string; size: string }[],
+  absent: "queueParameters",
+): SimulatedVenue {
+  const options: SimulatedVenueOptions = {
+    clock: clock(),
+    runMode: "BACKTEST",
+    model: TIER1_MODEL,
+    feeSnapshot: FEES,
+    rateLimits: unmodeledRateLimits("no venue budget model is wired in this test"),
+    policy: POLICY,
+    startingCash: "1000",
+    timeline: { bookAt: () => ({ book: sidedBook(bids, asks), atEvent: AT_EVENT }) },
+    latencyModel: LATENCY,
+    streams: deriveStreams("42"),
+    marketParameters: () => ({
+      marketId: MARKET_ID,
+      tickSize: "0.01",
+      minimumOrderSize: "5",
+      secondsDelay: 0,
+      parametersVersion: 1,
+    }),
+    queueParameters: QUEUE,
+  };
+  const without = { ...options };
+  delete (without as Record<string, unknown>)[absent];
+  const created = new SimulatedVenue(without);
+  created.observe(AT_EVENT);
+  return created;
+}
+
+describe("a CROSSING postOnly order is REJECTED, never filled (venue report §2.3, ADR-012 §5.3)", () => {
+  it("Tier 0: books it REJECTED with no fill", async () => {
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]) },
+    });
+    // A BUY at 0.6 crosses an ask of 0.5.
+    const result = await simulated.submit(
+      planWith(order({ executionStyle: "REST", postOnly: true, limitPrice: "0.6" })),
+    );
+    expect(result.accepted).toBe(true);
+    expect(result.fills).toEqual([]);
+    expect(result.orders[0]?.state).toBe("REJECTED");
+    expect(result.orders[0]?.filledShares).toBe("0");
+    const account = await simulated.queryAccountState();
+    expect(account.positions).toEqual([]);
+    expect(account.cashBalance).toBe("1000");
+  });
+
+  it("Tier 1: books it REJECTED with no fill", async () => {
+    const simulated = tier1Venue([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]);
+    const result = await simulated.submit(
+      planWith(order({ executionStyle: "REST", postOnly: true, limitPrice: "0.6" })),
+    );
+    expect(result.accepted).toBe(true);
+    expect(result.fills).toEqual([]);
+    expect(result.orders[0]?.state).toBe("REJECTED");
+  });
+
+  it("a NON-crossing postOnly order is not rejected: it rests", async () => {
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]) },
+    });
+    const result = await simulated.submit(
+      planWith(order({ executionStyle: "REST", postOnly: true, limitPrice: "0.45" })),
+    );
+    expect(result.orders[0]?.state).toBe("RESTING");
+  });
+
+  it("postOnly on a MARKETABLE_LIMIT order is refused, not silently dropped", async () => {
+    const result = await venue().submit(
+      planWith(order({ executionStyle: "MARKETABLE_LIMIT", postOnly: true })),
+    );
+    expect(result.accepted).toBe(false);
+    expect(result.refusalCode).toBe("SIMULATED_VENUE_PLAN_UNSUPPORTED");
+    expect(result.refusalMessage).toContain("resting limit types");
+  });
+});
+
+describe("a resting order fills from SUBSEQUENT observed trades (§12.2 Tier 0)", () => {
+  it("fills on touch, as a MAKER, and moves cash and inventory", async () => {
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]) },
+    });
+    const submitted = await simulated.submit(
+      planWith(order({ executionStyle: "REST", limitPrice: "0.45", shares: "10" })),
+    );
+    expect(submitted.orders[0]?.state).toBe("RESTING");
+    expect(simulated.fills).toEqual([]);
+
+    // A trade AWAY from the price does nothing.
+    const away = simulated.observeTrade({
+      marketId: MARKET_ID,
+      side: "YES",
+      price: "0.46",
+      shares: "5",
+      monotonicNs: 1_000_000_001n,
+      atEvent: AT_EVENT,
+    });
+    expect(away.ok).toBe(true);
+    if (!away.ok) return;
+    expect(away.value.fills).toEqual([]);
+
+    // A trade AT the price fills it.
+    const touch = simulated.observeTrade({
+      marketId: MARKET_ID,
+      side: "YES",
+      price: "0.45",
+      shares: "5",
+      monotonicNs: 1_000_000_002n,
+      atEvent: AT_EVENT,
+    });
+    expect(touch.ok).toBe(true);
+    if (!touch.ok) return;
+    expect(touch.value.fills).toHaveLength(1);
+    expect(touch.value.fills[0]?.liquidityRole).toBe("MAKER");
+    expect(touch.value.fills[0]?.price).toBe("0.45");
+    expect(simulated.ordersSnapshot()[0]?.state).toBe("FILLED");
+
+    const account = await simulated.queryAccountState();
+    // Maker fee is 0 under the 2026-08-24 snapshot: 1000 − 10 × 0.45 = 995.5.
+    expect(account.cashBalance).toBe("995.5");
+    expect(account.positions).toEqual([
+      { marketId: MARKET_ID, tokenId: "1234", side: "YES", shares: "10" },
+    ]);
+  });
+
+  it("REFUSES an observed trade that arrives out of recorded order", async () => {
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]) },
+    });
+    const first = simulated.observeTrade({
+      marketId: MARKET_ID,
+      side: "YES",
+      price: "0.45",
+      shares: "5",
+      monotonicNs: 5_000n,
+      atEvent: AT_EVENT,
+    });
+    expect(first.ok).toBe(true);
+    const backwards = simulated.observeTrade({
+      marketId: MARKET_ID,
+      side: "YES",
+      price: "0.45",
+      shares: "5",
+      monotonicNs: 4_000n,
+      atEvent: AT_EVENT,
+    });
+    expect(backwards.ok).toBe(false);
+    if (backwards.ok) return;
+    expect(backwards.refusal.code).toBe("REPLAY_CLOCK_NOT_MONOTONE");
+  });
+});
+
+describe("a Tier-1 resting order reports the §12.2 BAND through the venue seam", () => {
+  it("the band is on the submit result, with all three labelled scenarios", async () => {
+    const simulated = tier1Venue([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]);
+    const result = await simulated.submit(
+      planWith(order({ executionStyle: "REST", limitPrice: "0.4", shares: "50" })),
+    );
+    expect(result.accepted).toBe(true);
+    expect(result.orders[0]?.state).toBe("RESTING");
+    // ADR-012 §1: a Tier-1 resting order has no honest single number, and the
+    // order says so rather than reporting one.
+    expect(result.orders[0]?.fillEstimateKind).toBe("TIER_1_RESTING_BAND");
+    expect(result.bands).toHaveLength(1);
+    const band = result.bands[0];
+    expect(band?.simulatedOrderId).toBe("order-1");
+    expect(band?.optimistic.scenario).toBe("OPTIMISTIC");
+    expect(band?.base.scenario).toBe("BASE");
+    expect(band?.conservative.scenario).toBe("CONSERVATIVE");
+    expect(band?.quotationRule).toBe("REPORT_THE_BAND_NEVER_ONE_MEMBER");
+    // Queue ahead is the observed aggregate at our price: the 100 on the bid.
+    expect(band?.optimistic.filledShares).toBe("0");
+  });
+
+  it("the band moves with OBSERVED trades, and stays a band", async () => {
+    const simulated = tier1Venue([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]);
+    await simulated.submit(planWith(order({ executionStyle: "REST", limitPrice: "0.4", shares: "50" })));
+    const observed = simulated.observeTrade({
+      marketId: MARKET_ID,
+      side: "YES",
+      price: "0.4",
+      shares: "130",
+      monotonicNs: 2_000_000_000n,
+      atEvent: AT_EVENT,
+    });
+    expect(observed.ok).toBe(true);
+    if (!observed.ok) return;
+    expect(observed.value.bands).toHaveLength(1);
+    const band = observed.value.bands[0];
+    // Hand-computed from the observed facts: queue ahead is the 100 resting at
+    // our price, and 130 trades through it.
+    //   CONSERVATIVE credits no cancellation: 130 − 100 = 30 reaches us.
+    //   BASE cancels 0.1 × 130 = 13 of the queue first: 130 − 87 = 43.
+    //   OPTIMISTIC cancels 0.5 × 130 = 65: 95 reaches us, capped by our 50.
+    expect(band?.conservative.filledShares).toBe("30");
+    expect(band?.base.filledShares).toBe("43");
+    expect(band?.optimistic.filledShares).toBe("50");
+    // No point-precise fill was booked for it: a band is not cash.
+    expect(simulated.fills).toEqual([]);
+    expect(simulated.restingBands()).toHaveLength(1);
+  });
+
+  it("refuses to rest a Tier-1 order with no pinned queue parameters (§12.5)", async () => {
+    const simulated = tier1VenueWithout(
+      [{ price: "0.4", size: "100" }],
+      [{ price: "0.5", size: "100" }],
+      "queueParameters",
+    );
+    const result = await simulated.submit(
+      planWith(order({ executionStyle: "REST", limitPrice: "0.4" })),
+    );
+    expect(result.accepted).toBe(false);
+    expect(result.refusalCode).toBe("FILL_MODEL_PARAMETERS_UNPINNED");
+  });
+
+  it("refuses a Tier-1 order whose latency distribution is empty (ADR-012 §7)", async () => {
+    const simulated = tier1Venue([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }], {
+      latencyModel: { ...LATENCY, network: { samples: [] } },
+    });
+    const result = await simulated.submit(planWith(order({ executionStyle: "REST", limitPrice: "0.4" })));
+    expect(result.accepted).toBe(false);
+    expect(result.refusalCode).toBe("FILL_MODEL_LATENCY_DISTRIBUTION_INVALID");
+  });
+});
+
+describe("a crossing REST order that is NOT postOnly matches, and marketable orders are unchanged", () => {
+  it("a crossing non-postOnly REST order takes the offered depth", async () => {
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]) },
+    });
+    const result = await simulated.submit(
+      planWith(order({ executionStyle: "REST", postOnly: false, limitPrice: "0.6" })),
+    );
+    expect(result.fills).toHaveLength(1);
+    expect(result.fills[0]?.liquidityRole).toBe("TAKER");
+    expect(result.orders[0]?.state).toBe("FILLED");
+  });
+
+  it("a MARKETABLE_LIMIT order still consumes depth immediately", async () => {
+    const result = await venue().submit(planWith(order({ executionStyle: "MARKETABLE_LIMIT" })));
+    expect(result.fills).toHaveLength(1);
+    expect(result.fills[0]?.price).toBe("0.5");
+    expect(result.orders[0]?.fillEstimateKind).toBe("POINT");
+  });
+
+  it("a REST order the policy gives a FAK/FOK time-in-force is refused", async () => {
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]) },
+      policy: { ...POLICY, timeInForceFor: () => "FAK" },
+    });
+    const result = await simulated.submit(planWith(order({ executionStyle: "REST", limitPrice: "0.45" })));
+    expect(result.accepted).toBe(false);
+    expect(result.refusalCode).toBe("SIMULATED_VENUE_PLAN_UNSUPPORTED");
+    expect(result.refusalMessage).toContain("does not rest");
+  });
+});
+
+describe("§6 invariant 13 — a failed SAFETY_CANCEL is never reported as a success", () => {
+  it("a CANCEL plan that cancelled nothing is NOT accepted, and says what it missed", async () => {
+    const result = await venue().submit({
+      ...cancelPlan(),
+      scope: { orderIds: ["never-existed"] },
+    });
+    expect(result.accepted).toBe(false);
+    expect(result.refusalCode).toBe("SIMULATED_VENUE_CANCEL_INCOMPLETE");
+    expect(result.notCancelled).toEqual([
+      { simulatedOrderId: "never-existed", reason: "SIMULATED_VENUE_UNKNOWN_ORDER" },
+    ]);
+  });
+
+  it("a CANCEL plan that cancelled everything it named IS accepted", async () => {
+    const simulated = venue({
+      books: { book: () => sidedBook([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]) },
+    });
+    await simulated.submit(planWith(order({ executionStyle: "REST", limitPrice: "0.45" })));
+    const result = await simulated.submit({ ...cancelPlan(), scope: { orderIds: ["order-1"] } });
+    expect(result.accepted).toBe(true);
+    expect(result.notCancelled).toEqual([]);
+    expect(result.orders[0]?.state).toBe("CANCELLED");
   });
 });

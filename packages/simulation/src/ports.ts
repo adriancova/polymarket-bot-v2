@@ -299,6 +299,19 @@ export interface SimulatedOrder {
   readonly state: SimulatedOrderState;
   readonly postOnly: boolean;
   readonly executionStyle: "REST" | "MARKETABLE_LIMIT";
+  /**
+   * How this order's filled quantity is estimated.
+   *
+   * - `"POINT"` — `filledShares` IS the model's answer.
+   * - `"TIER_1_RESTING_BAND"` — a Tier-1 resting order. §12.2 and ADR-012 §1
+   *   make its estimate a BAND, so there is no honest single number to put in
+   *   `filledShares`: it holds the point-precise quantity actually booked
+   *   against cash and inventory (`"0"` for such an order), and the estimate is
+   *   the band on the {@link ExecutionResult}. A consumer that reads
+   *   `filledShares` for one of these and stops has quoted a band member it was
+   *   never given — this field is how it can tell.
+   */
+  readonly fillEstimateKind: "POINT" | "TIER_1_RESTING_BAND";
   /** The recorded event identity this state was reached at. Never a wall clock. */
   readonly atEvent: RecordedEventIdentity;
 }
@@ -317,12 +330,56 @@ export interface ExecutionResult {
   readonly accepted: boolean;
   readonly orders: readonly SimulatedOrder[];
   readonly fills: readonly SimulatedFillLike[];
+  /**
+   * The Tier-1 RESTING estimates this submission produced (§12.2, ADR-012 §1).
+   *
+   * A resting order under Tier 1 has no point-precise fill: its estimate is the
+   * optimistic/base/conservative BAND, and the band is where it is reported. An
+   * empty array means the submission produced no resting Tier-1 order — never
+   * that a resting estimate was collapsed to a number.
+   */
+  readonly bands: readonly RestingFillBandLike[];
+  /**
+   * Orders a CANCEL plan did not cancel, and why.
+   *
+   * §6 invariant 13 makes safety cancellation the privileged path; a cancel that
+   * cancelled nothing must not read as a success at this seam. `accepted` is
+   * `false` whenever this is non-empty (round-1 review M8).
+   */
+  readonly notCancelled: readonly { readonly simulatedOrderId: string; readonly reason: string }[];
+  /**
+   * Whether a venue rate-limit budget was actually modelled for this result
+   * (§9.13, ADR-012 §5.6). `"NOT_MODELED"` states the absence rather than
+   * implying an unlimited venue; {@link rateLimitDisclosure} says why.
+   */
+  readonly rateLimitModel: "MODELED" | "NOT_MODELED";
+  readonly rateLimitDisclosure: string;
   /** Present when the venue refused; `accepted` is then `false`. */
   readonly refusalCode?: string;
   readonly refusalMessage?: string;
   /** Always `"SIMULATED"`. There is no other value (ADR-012 §2 item 3). */
   readonly venueClass: "SIMULATED";
   readonly planningDepthAwareness: PlanningDepthAwareness;
+}
+
+/**
+ * The part of a Tier-1 resting band an `ExecutionResult` exposes.
+ *
+ * The full record is {@link ../queue.js}'s `RestingFillBand`; it is mirrored
+ * here for the same reason the other shapes are — `ports.ts` is the seam, and
+ * the seam names shapes rather than importing them upward. The three scenarios
+ * are all present, because ADR-012 §1 forbids quoting one of them alone.
+ */
+export interface RestingFillBandLike {
+  readonly simulatedOrderId: string;
+  readonly marketId: string;
+  readonly restingPrice: string;
+  readonly queueModelVersion: string;
+  readonly optimistic: { readonly scenario: "OPTIMISTIC"; readonly filledShares: string };
+  readonly base: { readonly scenario: "BASE"; readonly filledShares: string };
+  readonly conservative: { readonly scenario: "CONSERVATIVE"; readonly filledShares: string };
+  readonly bandBasis: "OPTIMISTIC_BASE_CONSERVATIVE_CANCELLATION_ASSUMPTIONS";
+  readonly quotationRule: "REPORT_THE_BAND_NEVER_ONE_MEMBER";
 }
 
 /** §12.1 `CancelCommand`. */

@@ -34,7 +34,7 @@ chronology).
 | `queue.ts` | §12.2 Tier 1 resting orders — queue-ahead and the BAND |
 | `markout.ts` | §12.3 markouts as diagnostics, and stress scenarios separately |
 | `rate-limit.ts` | The §9.13 budget seam, with absence stated explicitly |
-| `venue.ts` | The §12.1 `ExecutionVenue`, simulated |
+| `venue.ts` | The §12.1 `ExecutionVenue`, simulated — routes on `executionStyle`: a crossing `postOnly` order is REJECTED, a non-crossing `REST` order rests and is filled by observed trades, and everything marketable takes |
 | `replay.ts` | The run driver and the seam the shared core loop plugs into |
 | `serialize.ts` | The §12.4 canonical form a determinism claim is made about |
 
@@ -63,7 +63,17 @@ descriptor literals, `values`, and cold-lazy poisoning:
 2. **A `SAFETY_CANCEL` is byte-identical.** `SimulatedVenue.cancel` produces the
    same JSON bytes clean and under every class.
 3. **No throw escapes.** Every door is total under every class, including on
-   malformed and hostile input.
+   malformed and hostile input. `doors.test.ts` drives every exported DOOR — by
+   reflection, so a door added later is covered automatically — with a battery of
+   hostile arguments (`null`, a non-canonical decimal string, a `Proxy`, a
+   symbol, a null-prototype record) and requires a refusal, never an exception.
+   The exports that are NOT doors are listed there one by one, each naming the
+   door that validated what reaches it, so the boundary is a checkable claim
+   rather than a waiver.
+
+`SimulatedVenue.submit` returns an `ExecutionResult` rather than a
+`SimulationResult`, so it honours the same bound by producing a REFUSED result:
+it never rejects its promise.
 
 The validators are bound to the FROZEN contracts they mirror by
 `test/unit/simulation/grammar-cross.test.ts`, which compares each predicate with
@@ -92,6 +102,15 @@ have been the shape that ruling forecloses.
 - The only Tier-1 resting entry point returns a `RestingFillBand`. There is no
   function in this package that returns a single resting fill and no
   `collapse()` helper, so "one falsely precise fill result" is not constructible.
+- `quoteForDeploymentDecision` checks a Tier-1 result STRUCTURALLY: all three
+  labelled scenarios must be present. A value that merely carries a Tier-1
+  identity — `{ model, filledShares }` — is refused, because that is exactly the
+  "quoted as a single number" ADR-012 §1 forbids.
+- A Tier-1 RESTING order books **no point-precise fill**: the venue reports the
+  band on the `ExecutionResult` and the order carries
+  `fillEstimateKind: "TIER_1_RESTING_BAND"` with `filledShares` holding only what
+  was actually booked against cash and inventory. A band is an estimate, not
+  cash, and the order says so rather than implying a number.
 - §12.3: markouts are `role: "DIAGNOSTIC_ONLY"` with
   `appliedToReplayEconomics: false`; `replayPathEconomics` has no argument
   through which a penalty could arrive and carries `markoutPenaltyApplied: false`
@@ -120,8 +139,10 @@ key.
 1. **The fee rounding DIRECTION is not a documented venue fact.** The venue
    documentation says fees are "rounded to 5 decimal places" and states no
    direction or tie rule (`docs/venue/verified-2026-08-24.md` §6). `FeeScheduleSnapshot`
-   therefore carries a REQUIRED `roundingMode` and `readFeeScheduleSnapshot`
-   refuses a snapshot without one: this package does not choose for the operator.
+   therefore carries a REQUIRED `roundingMode`, and `readFeeScheduleSnapshot`,
+   `computeFee` and `roundDecimal` each REFUSE a mode outside the implemented
+   set: this package does not choose for the operator, and there is no branch
+   that quietly rounds one way when it was never told which way.
 2. **The GTD "around 3 minutes" minimum is not enforced.** ADR-012 §5.2 quotes a
    minimum stated expiration "around 3 minutes in the future". "Around" is not a
    threshold, so only the exactly-stated 60-second early expiry is applied.
@@ -147,3 +168,23 @@ key.
    DEPTH, so every result it produces carries
    `planningDepthAwareness: "TOP_OF_BOOK_ONLY"` so a reader cannot infer that the
    plan participated in depth it never saw.
+7. **A resting order is filled by OBSERVED trades the driver hands over.** The
+   venue has no feed: `SimulatedVenue.observeTrade` is how a recorded trade
+   reaches a resting order (Tier 0 fills on touch/trade-through per §12.2; Tier 1
+   recomputes the band). What is a trade — and which recorded frame carries one —
+   is normalization, which belongs to layer 2, so the composition root decides it
+   and this package never guesses.
+8. **Same-instant queue additions cannot be derived from a book snapshot.** A
+   recorded book carries AGGREGATE size per level, so the venue cannot see what
+   was added at our price in the same instant we placed. `ExecutionPolicy`
+   therefore requires `sameInstantAdditionsSharesFor`, and `"0"` is a legitimate
+   answer meaning "nothing was observed" — stated by the composition root rather
+   than defaulted here. Only the CONSERVATIVE scenario assumes we sit behind it.
+9. **Two different inversion diagnostics, named for what they measure.** The load
+   report counts `receivedAtInversions` — recorded ARRIVAL wall clocks out of
+   order across the dispatch-ordered rows — and the event source counts
+   `venueTimestampInversions` over the DELIVERED envelopes' `venueTimestamp`,
+   which is the §8.4 disagreement (a dataset row carries no venue timestamp).
+   Both compare EPOCH MILLISECONDS, never ISO strings: two §7.1 instants with
+   different UTC offsets do not compare correctly as text. Both are reported and
+   neither reorders anything.

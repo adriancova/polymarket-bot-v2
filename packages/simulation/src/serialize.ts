@@ -25,19 +25,34 @@
 
 import type { ReplayClockObservations } from "./clock.js";
 import type { SimulatedFill } from "./fill-model.js";
-import type { DatasetLoadReport } from "./event-source.js";
+import type { DatasetLoadReport, EventSourceReport } from "./event-source.js";
 import type { ReplayRunPins } from "./manifest.js";
 import type { ReplayPathEconomics } from "./markout.js";
 import type { SimulatedOrder } from "./ports.js";
 import type { RestingFillBand, RestingScenarioOutcome } from "./queue.js";
 
-/** The serialization format id. A grammar change changes this string. */
-export const SIMULATION_RUN_SERIALIZATION_VERSION = "polymarket-bot/simulation-run/v1";
+/**
+ * The serialization format id. A grammar change changes this string.
+ *
+ * `v2`: the round-1 review moved the venue-timestamp diagnostic onto the
+ * delivery line where the normalized envelopes are (the `counts` line's old
+ * `venueTimestampInversions=` measured recorded ARRIVAL order), added the
+ * order's `fillEstimateKind`, and gave the `band` line the identity of the
+ * resting order it is about. Those are grammar changes, so this is a new id.
+ */
+export const SIMULATION_RUN_SERIALIZATION_VERSION = "polymarket-bot/simulation-run/v2";
+
+/** What the delivery path observed, as the serialization records it. */
+export type SerializableDelivery = Pick<
+  EventSourceReport,
+  "envelopesDelivered" | "venueTimestampInversions" | "envelopesWithoutVenueTimestamp"
+>;
 
 /** Everything a serialized run contains. */
 export interface SerializableRun {
   readonly pins: ReplayRunPins;
   readonly load: DatasetLoadReport;
+  readonly delivery: SerializableDelivery;
   readonly clock: ReplayClockObservations;
   readonly orders: readonly SimulatedOrder[];
   readonly fills: readonly SimulatedFill[];
@@ -90,7 +105,15 @@ export function serializeRun(run: SerializableRun): string {
       field("delivered", run.load.rowsDelivered),
       field("excludedIncident", run.load.rowsExcludedByIncident),
       field("excludedDuplicate", run.load.rowsExcludedAsDuplicate),
-      field("venueTimestampInversions", run.load.venueTimestampInversions),
+      field("receivedAtInversions", run.load.receivedAtInversions),
+    ].join(" "),
+  );
+  lines.push(
+    [
+      "delivery",
+      field("envelopes", run.delivery.envelopesDelivered),
+      field("venueTimestampInversions", run.delivery.venueTimestampInversions),
+      field("withoutVenueTimestamp", run.delivery.envelopesWithoutVenueTimestamp),
     ].join(" "),
   );
   lines.push(
@@ -120,6 +143,7 @@ export function serializeRun(run: SerializableRun): string {
         order.filledShares,
         order.state,
         order.executionStyle,
+        order.fillEstimateKind,
         String(order.postOnly),
         order.atEvent.gatewayEpoch,
         order.atEvent.ingestSeq,
@@ -168,11 +192,14 @@ export function serializeRun(run: SerializableRun): string {
     ].join(" "),
   );
 
-  for (const band of [...run.bands].sort((a, b) =>
-    compareStrings(a.optimistic.fills[0]?.simulatedOrderId ?? "", b.optimistic.fills[0]?.simulatedOrderId ?? ""),
-  )) {
-    lines.push(serializeBand(band));
-  }
+  // Ordered by the band's OWN serialized line, which is a total, value-derived
+  // key: two bands that print the same line are the same bytes, and every other
+  // pair has a strict order. The previous key was the order id of whichever fill
+  // happened to sort first in the optimistic scenario — absent for a band with
+  // no fills, and identical for every band of one order, so reversing the input
+  // changed the bytes (round-1 review L2, probe T2).
+  const bandLines = run.bands.map((band) => serializeBand(band)).sort(compareStrings);
+  for (const line of bandLines) lines.push(line);
 
   lines.push("end");
   return lines.join("\n");
@@ -187,6 +214,9 @@ export function serializeRun(run: SerializableRun): string {
 export function serializeBand(band: RestingFillBand): string {
   return [
     "band",
+    field("order", band.simulatedOrderId),
+    field("market", band.marketId),
+    field("price", band.restingPrice),
     field("queueModel", band.queueModelVersion),
     field("fillModel", band.model.fillModelVersion),
     field("basis", band.bandBasis),

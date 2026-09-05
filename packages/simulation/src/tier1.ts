@@ -50,7 +50,7 @@
 import { compareDecimal } from "@polymarket-bot/decimal";
 
 import { addMilliseconds } from "./clock.js";
-import { computeFee, type FeeScheduleSnapshot } from "./fees.js";
+import { computeFee, readFeeScheduleSnapshot, type FeeScheduleSnapshot } from "./fees.js";
 import {
   consumeDepth,
   simulatedFill,
@@ -58,10 +58,11 @@ import {
   type FillModelIdentity,
   type SimulatedFill,
 } from "./fill-model.js";
-import { sampleLatency, type LatencyModel, type SampledLatency } from "./latency.js";
+import { isNonNegativeInteger } from "./grammar.js";
+import { readLatencyModel, sampleLatency, type LatencyModel, type SampledLatency } from "./latency.js";
 import { ownFrozenTree } from "./plain.js";
 import type { BookView, RecordedEventIdentity } from "./ports.js";
-import { simulationFailure, simulationOk, type SimulationResult } from "./refusals.js";
+import { simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
 import type { SeededStreams } from "./seed.js";
 
 /**
@@ -177,6 +178,27 @@ export function tier1Immediate(input: {
   readonly market: MarketExecutionParameters;
   readonly feeSnapshot: FeeScheduleSnapshot;
 }): SimulationResult<Tier1ImmediateOutcome> {
+  return totally("executing a Tier-1 immediate order", () => tier1ImmediateInner(input));
+}
+
+function tier1ImmediateInner(input: {
+  readonly model: FillModelIdentity;
+  readonly timeline: DepthTimeline;
+  readonly latencyModel: LatencyModel;
+  readonly streams: SeededStreams;
+  readonly simulatedOrderId: string;
+  readonly marketId: string;
+  readonly side: "YES" | "NO";
+  readonly action: "BUY" | "SELL";
+  readonly limitPrice: string;
+  readonly shares: string;
+  readonly timeInForce: TimeInForce;
+  readonly postOnly: boolean;
+  readonly submittedAtNs: bigint;
+  readonly statedExpiryNs?: bigint;
+  readonly market: MarketExecutionParameters;
+  readonly feeSnapshot: FeeScheduleSnapshot;
+}): SimulationResult<Tier1ImmediateOutcome> {
   if (input.model.tier !== "TIER_1") {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
@@ -198,7 +220,30 @@ export function tier1Immediate(input: {
     );
   }
 
-  const latency = sampleLatency(input.latencyModel, input.streams);
+  // The latency model is READ here, on the execution path, not merely offered.
+  // `sampleLatencyMs` falls back to `?? 0` on a distribution with nothing to
+  // draw from, so an unvalidated model turns "we have no latency data" into "no
+  // latency" — the Tier-0 assumption §12.2 bounds to wiring use, wearing a
+  // Tier-1 label. Round-1 review probe U2 measured exactly that.
+  const latencyModel = readLatencyModel(input.latencyModel);
+  if (!latencyModel.ok) return latencyModel;
+  const feeSnapshot = readFeeScheduleSnapshot(input.feeSnapshot);
+  if (!feeSnapshot.ok) return feeSnapshot;
+  if (typeof input.submittedAtNs !== "bigint") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "an order is submitted at a recorded monotonic instant (§7.1)",
+    );
+  }
+  if (!isNonNegativeInteger(input.market.secondsDelay)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "market.trading.secondsDelay is a non-negative integer number of seconds (venue report §7)",
+      { offered: String(input.market.secondsDelay) },
+    );
+  }
+
+  const latency = sampleLatency(latencyModel.value, input.streams);
   const arrivesAtNs = addMilliseconds(input.submittedAtNs, latency.totalMs);
   const delayedByMarket = input.market.secondsDelay > 0;
   const matchableAtNs = delayedByMarket
@@ -276,7 +321,7 @@ export function tier1Immediate(input: {
       shares: level.shares,
       price: level.price,
       liquidityRole: "TAKER",
-      snapshot: input.feeSnapshot,
+      snapshot: feeSnapshot.value,
     });
     if (!fee.ok) return fee;
     fills.push(

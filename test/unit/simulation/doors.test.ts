@@ -56,6 +56,8 @@ import {
   createReplayClock,
 } from "../../../packages/simulation/src/index.js";
 
+import * as simulation from "../../../packages/simulation/src/index.js";
+
 import { OUT_OF_ORDER_VENUE_FRAMES, buildDataset, runPins, sha256Hex } from "./fixtures.js";
 
 // ---------------------------------------------------------------------------
@@ -298,6 +300,7 @@ describe("the bound: a SAFETY_CANCEL is byte-identical under pollution", () => {
       policy: {
         timeInForceFor: () => "GTC",
         statedExpiryNsFor: () => undefined,
+        sameInstantAdditionsSharesFor: () => "0",
       },
       startingCash: "1000",
     });
@@ -478,4 +481,234 @@ describe("the strict-JSON reader (ADR-017 §3)", () => {
     }
     expect(escapes).toEqual([]);
   });
+});
+
+// ---------------------------------------------------------------------------
+// The bound, stated over the WHOLE export surface
+// ---------------------------------------------------------------------------
+
+/**
+ * Exports that are NOT doors, and the door that validates what reaches each.
+ *
+ * A door answers `{ ok }` and therefore promises a refusal instead of an
+ * exception (ADR-020 §6). The functions below answer with a VALUE: they are
+ * arithmetic, formatting and construction over inputs a door has already
+ * accepted, and the compiler is what stands between a caller and a wrong
+ * argument. Each entry names where its inputs were validated, so this list is a
+ * claim a reviewer can check rather than a waiver.
+ */
+const PURE_HELPERS: Readonly<Record<string, string>> = Object.freeze({
+  addMilliseconds: "clock.ts — recorded nanoseconds, validated by `createReplayClock`/`advanceTo`",
+  addNanoseconds: "clock.ts — as above",
+  comparePlanPriority: "ports.ts — a closed union WP-190 produced and `readRunPins`-era plans carry",
+  daysInMonth: "grammar.ts — called only by `isIsoTimestamp`, which validates the digits first",
+  defineData: "refusals.ts — an internal emit helper; its target is always a fresh own record",
+  deriveStream: "seed.ts — the run seed is validated as an unsigned integer string by `readRunPins`",
+  deriveStreams: "seed.ts — as above",
+  isCanonicalUuid: "grammar.ts — a total predicate: it answers true/false for any value",
+  isCanonicalUuidV7: "grammar.ts — total predicate",
+  isCodeString: "grammar.ts — total predicate",
+  isDecimalString: "grammar.ts — total predicate",
+  isIsoTimestamp: "grammar.ts — total predicate",
+  isJsonBigNumber: "strict-json.ts — total predicate over the reader's own output",
+  isMemberOf: "grammar.ts — total predicate over a caller-supplied vocabulary array",
+  isNonEmptyString: "grammar.ts — total predicate",
+  isNonNegativeInteger: "grammar.ts — total predicate",
+  isPositiveInteger: "grammar.ts — total predicate",
+  isRecord: "grammar.ts — total predicate",
+  isSha256Hex: "grammar.ts — total predicate",
+  isSimulationRefusalCode: "refusals.ts — total predicate",
+  isTokenId: "grammar.ts — total predicate",
+  isUnsignedIntegerString: "grammar.ts — total predicate",
+  isoToEpochMilliseconds: "grammar.ts — returns `undefined` rather than throwing",
+  describeForRefusal: "refusals.ts — total by construction; it exists so refusals cannot throw",
+  ownDataDescriptor: "refusals.ts — internal emit helper",
+  ownDataDetails: "refusals.ts — already total; it copies own data properties only",
+  ownFrozenTree: "plain.ts — emits values this package BUILT; `materializeInput` is the ingress door",
+  ownPlainCopy: "plain.ts — as above",
+  plainRecord: "refusals.ts — takes no argument",
+  readField: "grammar.ts — reads an own property descriptor; total for records, guarded by `isRecord`",
+  recordKeys: "grammar.ts — total: answers `[]` for a non-record",
+  sampleLatency: "latency.ts — the model is validated by `readLatencyModel` on the execution path",
+  sampleLatencyMs: "latency.ts — as above",
+  serializeBand: "serialize.ts — serializes a band `simulateResting`/`checkBandOrdering` produced",
+  serializeRun: "serialize.ts — serializes a run `runReplay` produced",
+  simulatedFill: "fill-model.ts — the only fill constructor; its callers validate every field first",
+  simulationFailure: "refusals.ts — builds a refusal; `ownDataDetails` is already total",
+  simulationOk: "refusals.ts — wraps a value the caller already produced",
+  simulationRefusal: "refusals.ts — as `simulationFailure`",
+  tier0Model: "tier0.ts — a version/identity constructor, pinned by §12.5 and validated by `readRunPins`",
+  tier1Model: "tier1.ts — as above",
+  toFillFact: "fill-model.ts — converts a fill this package produced into WP-200's shape",
+  tokenBucketRateLimits: "rate-limit.ts — capacities are composition-root configuration",
+  unmodeledRateLimits: "rate-limit.ts — takes a disclosure string",
+});
+
+describe("the bound: no throw escapes any door of this package", () => {
+  /** A venue built with only the options every path needs. */
+  function hostileVenue(): SimulatedVenue {
+    const clock = createReplayClock({
+      receivedAt: "2026-01-01T00:00:00.000Z",
+      receivedMonotonicNs: "1000",
+    });
+    if (!clock.ok) throw new Error("clock refused");
+    const built = new SimulatedVenue({
+      clock: clock.value,
+      runMode: "BACKTEST",
+      model: tier0Model({ fillModelVersion: "sim/tier0/v1", fillModelParametersHash: "0".repeat(64) }),
+      feeSnapshot: {
+        snapshotVersion: "fees/2026-08-24",
+        takerFeeRate: "0.07",
+        makerFeeRate: "0",
+        roundingDecimalPlaces: 5,
+        roundingMode: "HALF_UP",
+        minimumChargedFee: "0.00001",
+        feeCurrency: "USDC",
+      },
+      rateLimits: unmodeledRateLimits("no venue budget model is wired in this test"),
+      policy: {
+        timeInForceFor: () => "GTC",
+        statedExpiryNsFor: () => undefined,
+        sameInstantAdditionsSharesFor: () => "0",
+      },
+      startingCash: "1000",
+      books: {
+        book: () => ({
+          internalMarketId: "m",
+          tokenId: "1234",
+          top: () => ({}),
+          ladder: () => [{ price: "0.5", size: "100" }],
+        }),
+      },
+    });
+    built.observe({
+      gatewayEpoch: "0190a3e0-0000-7000-8000-000000000001",
+      ingestSeq: "1",
+      receivedAt: "2026-01-01T00:00:00.000Z",
+      datasetRowOrdinal: 0,
+    });
+    return built;
+  }
+
+  it("no throw escapes any DOOR, under hostile arguments", () => {
+    // ADR-020 §6's bound is "no throw escapes", and the round-1 review found
+    // five doors plus `SimulatedVenue.submit` that leaked
+    // `InvalidDecimalStringError` when a TYPE-VALID but non-canonical decimal
+    // reached layer-0 arithmetic. This drives every exported DOOR — found by
+    // reflection, so a door added later is covered automatically — with a
+    // battery of hostile arguments, and requires a refusal, never an exception.
+    //
+    // WHAT COUNTS AS A DOOR, and why the boundary is drawn here: a door is an
+    // export whose signature PROMISES a typed refusal, which in this package
+    // means it answers with `{ ok }`. {@link PURE_HELPERS} lists the exports
+    // that do not, each with the door that validates what reaches it — they are
+    // arithmetic and formatting over values a door has already accepted, and
+    // making them "total" would mean inventing an answer for a call the
+    // compiler already refuses.
+    const hostile: readonly unknown[] = [
+      undefined,
+      null,
+      "1,5",
+      "",
+      "NaN",
+      -1,
+      Number.NaN,
+      {},
+      [],
+      Object.create(null),
+      { model: {}, shares: "1,5", price: "x", snapshot: {}, ladder: [{}], trades: [{}] },
+      new Proxy({}, {}),
+      Symbol("hostile"),
+      0n,
+    ];
+
+    const escapes: string[] = [];
+    const drivenDoors: string[] = [];
+    const exported = simulation as unknown as Record<string, unknown>;
+    for (const name of Object.keys(exported).sort()) {
+      const value = exported[name];
+      if (typeof value !== "function") continue;
+      // A class constructor called without `new` throws by language rule, which
+      // is not a door leaking; classes are exercised by their own suites.
+      if (/^class[\s{]/u.test(Function.prototype.toString.call(value))) continue;
+      if (Object.hasOwn(PURE_HELPERS, name)) continue;
+      drivenDoors.push(name);
+      for (const argument of hostile) {
+        for (const argumentList of [[argument], [argument, argument], [argument, argument, argument]]) {
+          try {
+            const outcome = (value as (...args: unknown[]) => unknown)(...argumentList);
+            if (outcome instanceof Promise) outcome.catch(() => undefined);
+          } catch (cause) {
+            escapes.push(`${name}(${String(argumentList.length)}): ${String(cause)}`);
+          }
+        }
+      }
+    }
+    expect(escapes, escapes.join("\n")).toEqual([]);
+    // The probe is not vacuous: it really drove the doors, including every one
+    // the round-1 review named.
+    expect(drivenDoors.length).toBeGreaterThan(20);
+    for (const door of [
+      "computeFee",
+      "checkBandOrdering",
+      "consumeDepth",
+      "markoutStressScenario",
+      "quoteForDeploymentDecision",
+      "readRunPins",
+      "replayPathEconomics",
+      "simulateResting",
+      "sizeAtPrice",
+      "tier0Immediate",
+      "tier0Maker",
+      "tier1Immediate",
+    ]) {
+      expect(drivenDoors, `${door} is not being driven`).toContain(door);
+    }
+  });
+
+  it("every export is either a driven door or a listed pure helper", () => {
+    // The allow-list is exhaustive and CURRENT: an export removed upstream fails
+    // here, and an export added upstream is driven by the probe above unless it
+    // is added here deliberately, with its validating door named.
+    const exported = simulation as unknown as Record<string, unknown>;
+    const functions = Object.keys(exported).filter(
+      (name) =>
+        typeof exported[name] === "function" &&
+        !/^class[\s{]/u.test(Function.prototype.toString.call(exported[name])),
+    );
+    for (const name of Object.keys(PURE_HELPERS)) {
+      expect(functions, `${name} is listed as a pure helper but is not exported`).toContain(name);
+    }
+  });
+
+  it("SimulatedVenue.submit REFUSES rather than rejecting, on every hostile plan", async () => {
+    const plans: readonly unknown[] = [
+      null,
+      undefined,
+      {},
+      { executionPlanId: "p", runMode: "BACKTEST", planKind: "POSITION", priority: "PLACEMENT", groups: null },
+      {
+        executionPlanId: "p",
+        runMode: "BACKTEST",
+        planKind: "POSITION",
+        priority: "PLACEMENT",
+        groups: [{ marketId: "m", orders: [{ plannedOrderId: "o", side: "YES", action: "BUY", limitPrice: "1,5", shares: "10", postOnly: false, executionStyle: "REST" }] }],
+      },
+      {
+        executionPlanId: "p",
+        runMode: "BACKTEST",
+        planKind: "POSITION",
+        priority: "PLACEMENT",
+        groups: [{ marketId: "m", orders: [{ plannedOrderId: "o", side: "SIDEWAYS", action: "BUY", limitPrice: "0.5", shares: "10", postOnly: false, executionStyle: "REST" }] }],
+      },
+    ];
+    for (const plan of plans) {
+      const simulated = hostileVenue();
+      const result = await simulated.submit(plan as never);
+      expect(result.accepted, JSON.stringify(plan)).toBe(false);
+      expect(result.venueClass).toBe("SIMULATED");
+      expect(typeof result.refusalCode).toBe("string");
+    }
+  });
+
 });

@@ -65,7 +65,7 @@ function repinObject(
   return rewritten.value;
 }
 
-async function deliver(fixture: ReturnType<typeof buildDataset>): Promise<readonly EventEnvelope<unknown>[]> {
+async function drain(fixture: ReturnType<typeof buildDataset>) {
   const loaded = await loadDataset({
     dataset: manifestOf(fixture),
     archive: fixture.archive,
@@ -76,7 +76,11 @@ async function deliver(fixture: ReturnType<typeof buildDataset>): Promise<readon
   if (!source.ok) throw new Error(`source refused: ${source.refusal.message}`);
   const drained = await runEventSource(source.value);
   if (!drained.ok) throw new Error(`drain refused: ${drained.refusal.message}`);
-  return drained.value;
+  return { envelopes: drained.value, report: source.value.report() };
+}
+
+async function deliver(fixture: ReturnType<typeof buildDataset>): Promise<readonly EventEnvelope<unknown>[]> {
+  return (await drain(fixture)).envelopes;
 }
 
 describe("acceptance 1 — replay follows dispatch order, not sorted venue time", () => {
@@ -117,10 +121,78 @@ describe("acceptance 1 — replay follows dispatch order, not sorted venue time"
 
     expect(loaded.value.records.map((record) => record.frame.ingestSeq)).toEqual(["1", "2", "3"]);
     // The regression is OBSERVED and reported, never used to reorder.
-    expect(loaded.value.report.venueTimestampInversions).toBe(1);
+    //
+    // ROUND-1 REVIEW (L1). This assertion used to read
+    // `report.venueTimestampInversions`, a field that counted `receivedAt`
+    // inversions under a venue-timestamp name — so it pinned the wrong label.
+    // The counter it wanted is the ARRIVAL wall-clock one, which is what this
+    // fixture actually inverts (05:00 → 01:00 → 09:00), and it is now named for
+    // what it measures. The venue-timestamp count is a separate, delivery-path
+    // diagnostic; see `the two inversion diagnostics measure different things`.
+    expect(loaded.value.report.receivedAtInversions).toBe(1);
 
     const delivered = await deliver(fixture);
     expect(delivered.map((envelope) => envelope.ingestSeq)).toEqual(["1", "2", "3"]);
+  });
+
+  it("the two inversion diagnostics measure different things, and neither reorders", async () => {
+    // Arrival is strictly increasing; the VENUE timestamps are 300ms, 100ms,
+    // 200ms — one inversion. Before the round-1 review fix the reported
+    // "venueTimestampInversions" was computed from `receivedAt` and answered 0
+    // for exactly this dataset.
+    const fixture = buildDataset({ frames: OUT_OF_ORDER_VENUE_FRAMES });
+    const drained = await drain(fixture);
+    expect(drained.envelopes.map((envelope) => envelope.ingestSeq)).toEqual(["1", "2", "3"]);
+    expect(drained.report.load.receivedAtInversions).toBe(0);
+    // The counter's definition is "delivered carrying a venueTimestamp EARLIER
+    // than one already delivered": 300ms, then 100ms (one), then 200ms (two).
+    expect(drained.report.venueTimestampInversions).toBe(2);
+    expect(drained.report.envelopesWithoutVenueTimestamp).toBe(0);
+  });
+
+  it("compares timestamps on EPOCH MILLISECONDS, not as strings", async () => {
+    // `00:00:10+01:00` is 23:00:10Z on the PREVIOUS day — EARLIER than
+    // `00:00:00Z` — and sorts AFTER it lexically. A lexical comparison (the
+    // GOV-1C-deprecated form, and what this counter used to do) reports no
+    // inversion on either axis here; an epoch comparison reports one on each.
+    const frames: readonly FrameSpec[] = [
+      {
+        ingestSeq: "1",
+        receivedAt: "2026-01-01T00:00:00.000Z",
+        receivedMonotonicNs: "1000",
+        payloadUtf8: '{"t":"2026-01-01T00:00:00.000Z"}',
+      },
+      {
+        ingestSeq: "2",
+        receivedAt: "2026-01-01T00:00:10.000+01:00",
+        receivedMonotonicNs: "2000",
+        payloadUtf8: '{"t":"2026-01-01T00:00:10.000+01:00"}',
+      },
+    ];
+    const drained = await drain(buildDataset({ frames }));
+    expect(drained.envelopes.map((envelope) => envelope.ingestSeq)).toEqual(["1", "2"]);
+    expect(drained.report.load.receivedAtInversions).toBe(1);
+    expect(drained.report.venueTimestampInversions).toBe(1);
+  });
+
+  it("reports an ABSENT venue timestamp rather than counting it as ordered", async () => {
+    const frames: readonly FrameSpec[] = [
+      {
+        ingestSeq: "1",
+        receivedAt: "2026-01-01T00:00:00.000Z",
+        receivedMonotonicNs: "1000",
+        payloadUtf8: "not-json",
+      },
+      {
+        ingestSeq: "2",
+        receivedAt: "2026-01-01T00:00:01.000Z",
+        receivedMonotonicNs: "2000",
+        payloadUtf8: '{"t":"2026-01-01T00:00:01.000Z"}',
+      },
+    ];
+    const drained = await drain(buildDataset({ frames }));
+    expect(drained.report.envelopesWithoutVenueTimestamp).toBe(1);
+    expect(drained.report.venueTimestampInversions).toBe(0);
   });
 
   it("refuses a dataset whose eligible rows are not increasing in ingestSeq", async () => {
