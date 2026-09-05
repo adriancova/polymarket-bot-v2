@@ -48,10 +48,10 @@ This package's event source parses RECORDED WIRE DATA, so ADR-020 §3 applies.
 
 | Step | What this package does |
 | --- | --- |
-| **D1 — materialize prototype-free before parsing** | Manifest and pin BYTES go through `strict-json.ts`, which BUILDS the tree with `Object.create(null)` and `Object.defineProperty` as it parses, so there is no intermediate `JSON.parse` result at all. Decoded dataset rows go through `plain.ts`'s `materializeInput`, which reads property DESCRIPTORS (a getter is refused without being invoked), refuses `__proto__` as a name, symbol keys, accessors, cycles, sparse holes and non-plain prototypes. **Every door that takes a caller RECORD does the same**, through `readOwnPlainInput`: `readQueueModelParameters`, `readLatencyDistribution`, `readLatencyModel`, `readFeeScheduleSnapshot` and `readRunPins`. Round-2 review MEDIUM-1: the first four previously reached D4's copier with the caller's own object, which invoked a getter and followed a cycle until the stack ran out. `doors.test.ts` now drives every one of them with cyclic, getter-bearing and over-deep arguments and requires `SIMULATION_INPUT_NOT_DATA` with the getter NEVER invoked. |
+| **D1 — materialize prototype-free before parsing** | Manifest and pin BYTES go through `strict-json.ts`, which BUILDS the tree with `Object.create(null)` and `Object.defineProperty` as it parses, so there is no intermediate `JSON.parse` result at all. Decoded dataset rows go through `plain.ts`'s `materializeInput`, which reads property DESCRIPTORS (a getter is refused without being invoked), refuses `__proto__` as a name, symbol keys, accessors, cycles, sparse holes and non-plain prototypes. **Every door materializes every caller-supplied DATA argument** through `readOwnPlainInput` before it validates or computes, reads only the materialized tree afterwards, and never returns the caller's own object. What is NOT materialized is exactly: a PORT (an object whose contract is its methods — `BookView`, `MidTimeline`, `DepthTimeline`, `DatasetArchiveReader`, a seeded stream), a FUNCTION, BYTES (`strict-json.ts` is itself the D1 reader for those), and a PRIMITIVE. A door's own OPTIONS BAG is a call-site literal and is read ONCE PER FIELD, so one read cannot be made to disagree with a later one. See `plain.ts`'s `readOwnPlainInput` for the table, and §5 item 10 for the one shape this policy refuses that a root might legitimately build. |
 | **D2 — parse through a severed, warmed arena** | **Not applicable, and that is the strongest form of it rather than a waiver.** D2 exists to sever a `zod` node's `_zod` container and force its lazies. This package runs no schema library, and `zod` is absent from its ENTIRE dependency closure: it declares one workspace dependency, `@polymarket-bot/decimal`, which depends on `decimal.js` and `node:crypto` only. There is therefore no `skipChecks` / `optin` / `optout` / `when` / `values` slot to inherit and no lazy build to poison. `test/unit/simulation/purity.test.ts` checks the closure from the manifests; `doors.test.ts` installs those exact keys anyway and measures that nothing moves. |
 | **D3 — take values from the materialized tree** | By construction: there is no library output to take them from. Every field is read with `readField`, an own-property read of the materialized tree. |
-| **D4 — emit prototype-free** | Every emitted record is `ownFrozenTree`: null prototype, deep-frozen, `undefined` members dropped, so an absent optional field cannot be answered by a polluted `Object.prototype` in the consumer. Its copier reads DESCRIPTORS, is cycle-guarded and is bounded at `MAX_INPUT_DEPTH`; because D1 now runs first at every record door, those guards are ASSERTIONS about trees this package built, and a violation raises inside a totality guard rather than producing a partial tree. |
+| **D4 — emit prototype-free** | Every emitted record is `ownFrozenTree`: null prototype, deep-frozen, `undefined` members dropped, so an absent optional field cannot be answered by a polluted `Object.prototype` in the consumer. Its copier reads DESCRIPTORS, is cycle-guarded and is bounded at `MAX_INPUT_DEPTH`; because D1 now runs first at every record door, those guards are ASSERTIONS about trees this package built, and a violation raises inside a totality guard rather than producing a partial tree. Round-3 review MEDIUM-1: `checkBandOrdering`'s OK path returned the CALLER'S OWN band — unfrozen, prototype-bearing — which contradicted this row; `doors.test.ts` now asserts the property for every record door rather than for the five it used to list. |
 
 **The bound (ADR-020 §6), measured in `test/unit/simulation/doors.test.ts` over
 all ten `schema-boundary.md` §2 classes** — adoption (enumerable AND
@@ -67,13 +67,23 @@ descriptor literals, `values`, and cold-lazy poisoning:
    reflection, so a door added later is covered automatically — with a battery of
    hostile arguments (`null`, a non-canonical decimal string, a `Proxy`, a
    symbol, a null-prototype record, a CYCLIC record and array, a getter-bearing
-   record, and a record nested past `MAX_INPUT_DEPTH`) and requires a refusal,
-   never an exception. The cyclic argument is a VALID parameter set with a
-   self-reference, so it reaches the door's copy step rather than being rejected
-   on its first field.
-   The exports that are NOT doors are listed there one by one, each naming the
-   door that validated what reaches it, so the boundary is a checkable claim
-   rather than a waiver.
+   record, a record nested past `MAX_INPUT_DEPTH`, and each of those three
+   classes NESTED inside a record whose keys the doors read) and requires a
+   refusal, never an exception. The cyclic argument is a VALID parameter set with
+   a self-reference, so it reaches the door's copy step rather than being
+   rejected on its first field.
+4. **A caller record is refused, not read.** For every RECORD DOOR the bound is
+   stronger: the cyclic / accessor / over-deep classes are planted at EVERY data
+   position of a VALID argument — positions **derived by walking the fixture**,
+   not listed by hand — and each must come back `SIMULATION_INPUT_NOT_DATA` with
+   the accessor NEVER invoked, and each door's emitted value must be its own
+   frozen prototype-free tree rather than an alias. Round-3 review LOW-1: the
+   previous table named five doors and checked itself by list equality, so
+   nothing detected a sixth. The three lists (record doors, non-record doors with
+   the reason their argument is not data, pure helpers with the door that
+   validated what reaches them) must now PARTITION the export surface exactly, so
+   a new export fails the suite until it is classified — and classifying it as a
+   record door subscribes it to the whole battery.
 
 `SimulatedVenue.submit` returns an `ExecutionResult` rather than a
 `SimulationResult`, so it honours the same bound by producing a REFUSED result:
@@ -124,6 +134,13 @@ have been the shape that ruling forecloses.
   nonsense band from a negative traded size — the queue walk ran backwards — or a
   band-inconsistency refusal that blamed the derivation for an unvalidated input.
   The venue's guards remain; the door no longer depends on them.)
+- The same bound applies to PRICES (round-3 review, NOTE-3): a resting price and
+  an observed trade price must be strictly positive. A price is what the fee is
+  computed on (`fee = C × rate × p × (1 − p)`), what the at-price / through-price
+  comparison turns on, and what the §12.4 `band` line prints — so the door
+  enforces what its own computation assumes rather than inheriting the venue's
+  guard. Before the fix a `restingPrice` of `"-0.5"` produced an ACCEPTED band
+  that serialized as `band … price=-0.5 …`.
 - §12.3: markouts are `role: "DIAGNOSTIC_ONLY"` with
   `appliedToReplayEconomics: false`; `replayPathEconomics` has no argument
   through which a penalty could arrive and carries `markoutPenaltyApplied: false`
@@ -208,3 +225,26 @@ key.
    Both compare EPOCH MILLISECONDS, never ISO strings: two §7.1 instants with
    different UTC offsets do not compare correctly as text. Both are reported and
    neither reorders anything.
+10. **D1 refuses a legitimately-built class instance, and that is a real cost.**
+    The rule is a policy about SHAPE: a value with a non-plain prototype is
+    refused, because an inherited property is state the input does not own and no
+    copy can carry it faithfully. So a composition root that built its fee
+    snapshot, its queue parameters, a recorded instant or a book level as a CLASS
+    INSTANCE rather than a record literal gets `SIMULATION_INPUT_NOT_DATA` naming
+    the prototype. That is typed, documented and — for this package's purposes —
+    correct, but it means the claim "none of these doors can refuse a legitimate
+    argument" is FALSE as stated, and a refusable legitimate construction exists
+    (round-3 review NOTE). The interfaces in `ports.ts` are DATA interfaces
+    (`{ price, size }`, `{ receivedAt, receivedMonotonicNs }`), and
+    `packages/order-book`'s real `levels()` returns object literals, so no CURRENT
+    caller is affected; a future one that is will see a typed refusal naming the
+    prototype rather than a wrong answer.
+11. **A `bigint` is data at the doors whose records carry §7.1 instants, and
+    nowhere else.** `RestingOrderInput.restingFromNs` and
+    `ObservedTrade.monotonicNs` are `bigint`, so `simulateResting` materializes
+    with `bigintIsData`. Every WIRE door keeps the default, which refuses a
+    `bigint`: one cannot come from JSON, so at a wire door its presence means the
+    value was constructed rather than recorded. A `bigint` is a primitive —
+    immutable, identity-free, carrying no prototype and no code — so admitting it
+    adopts nothing and invokes nothing, and every other non-plain value stays
+    refused under both settings.

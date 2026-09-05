@@ -17,8 +17,9 @@
  * - **D1** {@link materializeInput} reads a caller value into a fresh
  *   prototype-free tree, from property DESCRIPTORS rather than property reads,
  *   so a getter is refused without being invoked. {@link readOwnPlainInput} is
- *   the one-line form every door uses, so "a door materializes its caller value
- *   before touching it" is mechanical rather than a habit.
+ *   the one-line form every door uses, so "a door materializes its caller DATA
+ *   argument before touching it" is mechanical rather than a habit — see that
+ *   function for the rule and for the exact list of argument kinds it covers.
  * - **D3** is satisfied by construction, because there is no library output to
  *   take values from: {@link ./grammar.js} validates the materialized tree and
  *   every downstream read is of that tree.
@@ -43,6 +44,15 @@
  * every trap invocation sits inside the totality guard, and everything
  * downstream consumes only the materialized tree — so a `Proxy` can cause a
  * refusal or supply a tree, but it cannot make two reads of one field disagree.
+ *
+ * SECOND DISCLOSED LIMIT (round-3 review): D1 is a policy about SHAPE, so a
+ * legitimate value built in a shape it refuses is refused. A composition root
+ * that constructed its fee snapshot, its queue parameters or a book level as a
+ * CLASS INSTANCE rather than a record literal gets
+ * `SIMULATION_INPUT_NOT_DATA` naming the non-plain prototype: typed, documented
+ * and correct — an inherited property is state the input does not own and no
+ * copy can carry it faithfully — but it means the claim "no door can refuse a
+ * legitimate argument" is FALSE as stated. `README.md` §5 records it.
  */
 
 import {
@@ -65,18 +75,64 @@ export type MaterializedInput =
   | { readonly ok: true; readonly value: unknown }
   | { readonly ok: false; readonly problems: readonly MaterializeProblem[] };
 
+/**
+ * What this door counts as DATA, stated per door rather than assumed.
+ *
+ * There is exactly one setting, and it exists because two different kinds of
+ * value pass through this module:
+ *
+ * - **WIRE data** — decoded dataset rows, manifest bytes. A `bigint` cannot come
+ *   from JSON, so at a wire door its presence means the value was CONSTRUCTED
+ *   rather than recorded, and it is refused. That is the default, unchanged.
+ * - **IN-PROCESS records** — a resting order, an observed trade. §7.1 recorded
+ *   monotonic nanoseconds are `bigint` in this package's own record types
+ *   ({@link ../queue.js#RestingOrderInput}, {@link ../queue.js#ObservedTrade}),
+ *   so a door that takes one must be able to carry a `bigint` or it could not
+ *   read a legitimate argument at all.
+ *
+ * A `bigint` is a PRIMITIVE: immutable, identity-free, carrying no prototype and
+ * no code, so admitting it adopts nothing and invokes nothing. Every other
+ * non-plain value — accessor, symbol key, function, cycle, foreign prototype,
+ * sparse hole, `__proto__` — stays refused under both settings.
+ */
+export interface MaterializePolicy {
+  /**
+   * `true` at a door whose record type carries §7.1 recorded nanoseconds.
+   * Absent or `false` at every wire door, which is the default.
+   */
+  readonly bigintIsData?: boolean;
+}
+
+const WIRE_POLICY: MaterializePolicy = Object.freeze({ bigintIsData: false });
+
 interface ReadState {
   readonly problems: MaterializeProblem[];
   /** Objects on the CURRENT path, so a shared sub-object is not a cycle. */
   readonly ancestors: WeakSet<object>;
+  readonly bigintIsData: boolean;
 }
 
 /**
  * Reads `value` into a fresh prototype-free tree of plain data, or reports
  * every reason it is not one. TOTAL: never throws.
  */
-export function materializeInput(value: unknown, rootPath: string): MaterializedInput {
-  const state: ReadState = { problems: [], ancestors: new WeakSet() };
+export function materializeInput(
+  value: unknown,
+  rootPath: string,
+  policy: MaterializePolicy = WIRE_POLICY,
+): MaterializedInput {
+  // Read defensively, and NOT with a default parameter alone: a default fires
+  // only for `undefined`, so `materializeInput(v, "$", null)` — which the
+  // whole-surface hostile battery drives — would have thrown `TypeError` out of
+  // the door that exists to stop exactly that. Found by that battery, on this
+  // very change.
+  const bigintIsData =
+    policy !== null && typeof policy === "object" && policy.bigintIsData === true;
+  const state: ReadState = {
+    problems: [],
+    ancestors: new WeakSet(),
+    bigintIsData,
+  };
   let read: unknown;
   try {
     read = readInto(value, rootPath, 0, state);
@@ -104,6 +160,7 @@ function readInto(value: unknown, path: string, depth: number, state: ReadState)
   if (kind === "string" || kind === "number" || kind === "boolean" || kind === "undefined") {
     return value;
   }
+  if (kind === "bigint" && state.bigintIsData) return value;
   if (kind !== "object") {
     state.problems.push({ path, problem: `an input carries data, not a ${kind}` });
     return undefined;
@@ -262,23 +319,52 @@ function readArray(container: object, path: string, depth: number, state: ReadSt
 /**
  * Reads a CALLER value at a door, or answers that door's typed refusal.
  *
- * THE RULE THIS EXISTS TO MAKE MECHANICAL (round-2 review, MEDIUM-1): a door
- * that takes a caller record materializes it through {@link materializeInput}
- * FIRST, and validates and emits the materialized tree — never the caller's own
- * object. {@link ownPlainCopy} is D4, an emitter for trees this package BUILT;
- * pointing it at a caller object made it the ingress path for a getter (which it
- * would invoke) and for a cycle (which it would follow until the stack ran out).
+ * ## THE RULE, stated as narrowly as it is actually true (round-3 review)
+ *
+ * > A door materializes every caller-supplied **data** argument through
+ * > {@link materializeInput} before it validates or computes anything, reads
+ * > only the materialized tree afterwards, and never returns the caller's own
+ * > object.
+ *
+ * The round-2 wording said "a door that takes a caller record", and the round-3
+ * hostility drive showed that claim was WIDER than the code: four doors still
+ * took their records raw, and two of them accepted a lying accessor. It is also
+ * wider than any code could be, because not every argument is data:
+ *
+ * | Argument kind | Materialized? | Why |
+ * | --- | --- | --- |
+ * | a data record or array (an order, a band, a fill, a ladder, a snapshot) | YES | it is data, and this is the door for it |
+ * | a PORT (`BookView`, `MidTimeline`, `DatasetArchiveReader`, `Clock`, a seeded stream) | no | its contract IS methods; materializing it would delete the object |
+ * | a FUNCTION (a digest, a core loop) | no | same |
+ * | BYTES (`Uint8Array`) | no | `strict-json.ts` is the D1 reader for wire bytes and BUILDS its tree as it parses |
+ * | a PRIMITIVE (an id, a decimal string, a count) | no | there is nothing to adopt, and the grammar predicates are total |
+ * | the door's own OPTIONS BAG | read ONCE per field | it is a call-site literal; the record each field yields is materialized, so one read cannot be made to disagree with a later one |
+ *
+ * `test/unit/simulation/doors.test.ts` holds that table MECHANICALLY: every
+ * exported function is classified as a record door (driven with the nested
+ * hostility battery), a non-record door (with the reason its argument is not
+ * data), or a pure helper (with the door that validated what reaches it) — and
+ * the three lists are required to partition the export surface exactly, so a
+ * tenth door cannot be added without classifying it.
+ *
+ * {@link ownPlainCopy} is D4, an emitter for trees this package BUILT; pointing
+ * it at a caller object made it the ingress path for a getter (which it would
+ * invoke) and for a cycle (which it would follow until the stack ran out).
  *
  * The refusal is `SIMULATION_INPUT_NOT_DATA`, which
  * {@link ./refusals.js#SIMULATION_REFUSAL_CODES} defines for exactly this class
  * — "a caller value could not be read as plain data (Proxy, accessor, cycle …)"
- * — so it is distinguishable from the door's own domain refusals.
+ * — so it is distinguishable from the door's own domain refusals. A door that
+ * reached D4 with a hostile caller record instead answered `SIMULATION_INTERNAL`
+ * (fail-closed, but blaming this package for the caller's argument), which is
+ * how round 3 found `tier0Immediate`.
  */
 export function readOwnPlainInput<TValue>(
   value: unknown,
   what: string,
+  policy?: MaterializePolicy,
 ): SimulationResult<TValue> {
-  const materialized = materializeInput(value, what);
+  const materialized = materializeInput(value, what, policy);
   if (materialized.ok) return simulationOk(materialized.value as TValue);
   const first = materialized.problems[0];
   return simulationFailure(

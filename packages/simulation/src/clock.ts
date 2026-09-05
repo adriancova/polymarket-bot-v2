@@ -36,7 +36,7 @@
  */
 
 import { isIsoTimestamp, isUnsignedIntegerString, isoToEpochMilliseconds } from "./grammar.js";
-import { ownFrozenTree } from "./plain.js";
+import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import {
   simulationFailure,
   simulationOk,
@@ -119,9 +119,23 @@ export class ReplayClock implements Clock {
    * in dispatch order — the failure §8.4 exists to prevent.
    */
   advanceTo(instant: RecordedInstant): SimulationResult<null> {
-    const validated = validateInstant(instant);
+    // ONE READ PER FIELD (round-3 review, MEDIUM-1's class). This method runs
+    // once per delivered event, so materializing here would copy a record per
+    // event; instead each of the two PRIMITIVE fields is read exactly once,
+    // into a local, and the validation and the state update use that local. No
+    // accessor can answer the monotonicity check with one value and position the
+    // clock with another.
+    if (instant === null || typeof instant !== "object") {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a recorded instant is a record carrying receivedAt and receivedMonotonicNs (§7.1)",
+      );
+    }
+    const receivedAt: unknown = instant.receivedAt;
+    const receivedMonotonicNs: unknown = instant.receivedMonotonicNs;
+    const validated = validateInstantFields(receivedAt, receivedMonotonicNs);
     if (!validated.ok) return validated;
-    const nextNs = BigInt(instant.receivedMonotonicNs);
+    const nextNs = BigInt(validated.value.receivedMonotonicNs);
     if (nextNs < this.#monotonicNs) {
       return simulationFailure(
         "REPLAY_CLOCK_NOT_MONOTONE",
@@ -130,15 +144,15 @@ export class ReplayClock implements Clock {
           "means the stream is not in dispatch order",
         {
           currentMonotonicNs: this.#monotonicNs.toString(),
-          offeredMonotonicNs: instant.receivedMonotonicNs,
+          offeredMonotonicNs: validated.value.receivedMonotonicNs,
         },
       );
     }
-    const nextEpochMs = validated.value;
+    const nextEpochMs = validated.value.epochMilliseconds;
     if (nextEpochMs < this.#epochMilliseconds) {
       this.#wallClockRegressions += 1;
     }
-    this.#at = instant.receivedAt;
+    this.#at = validated.value.receivedAt;
     this.#monotonicNs = nextNs;
     this.#epochMilliseconds = nextEpochMs;
     this.#advances += 1;
@@ -158,41 +172,47 @@ export class ReplayClock implements Clock {
   }
 }
 
-function validateInstant(instant: RecordedInstant): SimulationResult<number> {
-  if (instant === null || typeof instant !== "object") {
-    return simulationFailure(
-      "SIMULATION_INPUT_INVALID",
-      "a recorded instant is a record carrying receivedAt and receivedMonotonicNs (§7.1)",
-    );
-  }
-  if (!isIsoTimestamp(instant.receivedAt)) {
+/**
+ * Validates the two PRIMITIVE fields of a §7.1 instant, already read out of it.
+ *
+ * It takes the VALUES rather than the record so that its caller can guarantee
+ * one read per field: a validator that re-reads the record is a second read,
+ * and two reads of a caller-supplied field are two chances to disagree.
+ */
+function validateInstantFields(
+  receivedAt: unknown,
+  receivedMonotonicNs: unknown,
+): SimulationResult<{
+  readonly receivedAt: string;
+  readonly receivedMonotonicNs: string;
+  readonly epochMilliseconds: number;
+}> {
+  if (!isIsoTimestamp(receivedAt)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "receivedAt is not a §7.1 ISO-8601 timestamp with an explicit UTC designator or offset",
-      { receivedAt: typeof instant.receivedAt === "string" ? instant.receivedAt : "(not a string)" },
+      { receivedAt: typeof receivedAt === "string" ? receivedAt : "(not a string)" },
     );
   }
-  if (!isUnsignedIntegerString(instant.receivedMonotonicNs)) {
+  if (!isUnsignedIntegerString(receivedMonotonicNs)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "receivedMonotonicNs is not a canonical unsigned integer string (§7.1)",
       {
         receivedMonotonicNs:
-          typeof instant.receivedMonotonicNs === "string"
-            ? instant.receivedMonotonicNs
-            : "(not a string)",
+          typeof receivedMonotonicNs === "string" ? receivedMonotonicNs : "(not a string)",
       },
     );
   }
-  const epochMs = isoToEpochMilliseconds(instant.receivedAt);
+  const epochMs = isoToEpochMilliseconds(receivedAt);
   if (epochMs === undefined) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "receivedAt could not be converted to epoch milliseconds arithmetically",
-      { receivedAt: instant.receivedAt },
+      { receivedAt },
     );
   }
-  return simulationOk(epochMs);
+  return simulationOk({ receivedAt, receivedMonotonicNs, epochMilliseconds: epochMs });
 }
 
 /**
@@ -201,11 +221,28 @@ function validateInstant(instant: RecordedInstant): SimulationResult<number> {
  * The start instant comes from the dataset manifest's `eventRange.first`
  * (§12.5 "start/end event identity") or from the first delivered event. There
  * is no other way to position a clock in this package.
+ *
+ * D1 (round-3 review, MEDIUM-1): the start instant is a CALLER RECORD that the
+ * clock keeps — `#startedAt` is printed in the §12.4 `clock` line — so it is
+ * materialized once here rather than validated and then re-read by the
+ * constructor. This runs once per run; {@link ReplayClock.advanceTo} runs once
+ * per event and takes the cheaper one-read-per-field form instead.
  */
-export function createReplayClock(start: RecordedInstant): SimulationResult<ReplayClock> {
-  const validated = validateInstant(start);
+export function createReplayClock(offered: RecordedInstant): SimulationResult<ReplayClock> {
+  const read = readOwnPlainInput<RecordedInstant>(offered, "the recorded start instant");
+  if (!read.ok) return read;
+  const start = read.value;
+  if (start === null || typeof start !== "object") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a recorded instant is a record carrying receivedAt and receivedMonotonicNs (§7.1)",
+    );
+  }
+  const validated = validateInstantFields(start.receivedAt, start.receivedMonotonicNs);
   if (!validated.ok) return validated;
-  return simulationOk(ReplayClock.positionedAt(start, validated.value));
+  return simulationOk(
+    ReplayClock.positionedAt(validated.value, validated.value.epochMilliseconds),
+  );
 }
 
 /** Nanoseconds in one millisecond. Arithmetic constant, not a venue fact. */

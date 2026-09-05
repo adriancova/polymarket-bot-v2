@@ -892,17 +892,66 @@ describe("Tier 1 resting orders — queue-ahead and the band (§12.2)", () => {
     expect(outcome.refusal.message).toContain("non-negative");
   });
 
+  it.each([
+    ["-0.5", "a negative resting price"],
+    ["0", "a zero resting price"],
+  ])("REFUSES %s (round-3 review, NOTE-3): the same bound, applied to PRICE", (price) => {
+    // Round 3 NOTE-3: the sign bound the round-2 fix applied to SIZES was not
+    // applied to PRICES, so `restingPrice: "-0.5"` produced an ACCEPTED band
+    // that serialized as `band … price=-0.5 …`. The price is what the fee is
+    // computed on (`fee = C × rate × p × (1 − p)`) and what the §12.4 `band`
+    // line prints, so the door enforces what its own computation assumes rather
+    // than inheriting the venue's guard.
+    const outcome = simulateResting({
+      model,
+      order: { ...signedOrder, restingPrice: price },
+      // A VALID trade, so the only bound that can fire is the ORDER's own price
+      // bound. (Written the other way first, this test passed with the order
+      // bound deleted, because the trade-price bound answered instead.)
+      trades: [{ price: "0.5", shares: "120", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+    expect(outcome.refusal.message).toContain("a resting order's price is strictly positive");
+    // The refusal names the INPUT, not the band's ordering.
+    expect(outcome.refusal.message).not.toContain("OPTIMISTIC >= BASE");
+  });
+
+  it.each([
+    ["-0.5", "a negative traded price"],
+    ["0", "a zero traded price"],
+  ])("REFUSES an observed trade printed at %s", (price) => {
+    const outcome = simulateResting({
+      model,
+      order: signedOrder,
+      trades: [{ price, shares: "120", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+    expect(outcome.refusal.message).toContain("positive price");
+  });
+
   it("still ACCEPTS the boundary values the bounds admit", () => {
-    // The bounds are the venue's, exactly: quantities >= 0 and traded size > 0.
-    // A zero queue ahead and zero observed additions are ordinary facts.
+    // The bounds are the venue's, exactly: quantities >= 0, traded size > 0 and
+    // prices > 0. A zero queue ahead and zero observed additions are ordinary
+    // facts, and a price may be arbitrarily small without being zero.
     const outcome = simulateResting({
       model,
       order: {
         ...signedOrder,
+        restingPrice: "0.000001",
         queueAheadAtPlacement: "0",
         sameInstantAdditions: { observedShares: "0" },
       },
-      trades: [{ price: "0.5", shares: "0.000001", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      trades: [
+        { price: "0.000001", shares: "0.000001", monotonicNs: 1_000n, atEvent: AT_EVENT },
+      ],
       parameters: QUEUE,
       feeSnapshot: FEES,
     });

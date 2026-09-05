@@ -31,7 +31,7 @@ import {
   type FillModelIdentity,
   type SimulatedFill,
 } from "./fill-model.js";
-import { ownFrozenTree } from "./plain.js";
+import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import type { BookView, RecordedEventIdentity } from "./ports.js";
 import { simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
 
@@ -98,13 +98,38 @@ function tier0ImmediateInner(input: {
   readonly feeSnapshot: FeeScheduleSnapshot;
   readonly atEvent: RecordedEventIdentity;
 }): SimulationResult<Tier0ImmediateOutcome> {
-  const ladder = input.book.ladder(input.action === "BUY" ? "ASK" : "BID");
-  const consumed = consumeDepth({
-    ladder,
-    action: input.action,
-    limitPrice: input.limitPrice,
-    shares: input.shares,
-  });
+  // D1 FIRST, AND ONE READ PER FIELD (round-3 review, MEDIUM-1). `model` and
+  // `atEvent` are CALLER RECORDS that this door copies onto every fill it emits
+  // and onto its outcome. Before the fix they went straight to D4's copier,
+  // which refuses an accessor without invoking it but does so by THROWING — so
+  // a hostile model was contained as `SIMULATION_INTERNAL`, blaming this
+  // package for the caller's argument instead of naming it.
+  //
+  // `book` is a PORT, not data: its contract is `ladder()` / `tokenId`, and
+  // materializing it would delete the methods. What it HANDS BACK is data, and
+  // `consumeDepth` materializes that.
+  const { model: offeredModel, atEvent: offeredAtEvent, book, action, side } = input;
+  const { simulatedOrderId, marketId, limitPrice, shares, feeSnapshot } = input;
+
+  const readModel = readOwnPlainInput<FillModelIdentity>(offeredModel, "the fill model identity");
+  if (!readModel.ok) return readModel;
+  const model = readModel.value;
+  const readAtEvent = readOwnPlainInput<RecordedEventIdentity>(
+    offeredAtEvent,
+    "the recorded event identity",
+  );
+  if (!readAtEvent.ok) return readAtEvent;
+  const atEvent = readAtEvent.value;
+
+  if (typeof book !== "object" || book === null || typeof book.ladder !== "function") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a Tier-0 immediate execution consumes an observed book; the BookView port must supply one",
+    );
+  }
+  const tokenId = book.tokenId;
+  const ladder = book.ladder(action === "BUY" ? "ASK" : "BID");
+  const consumed = consumeDepth({ ladder, action, limitPrice, shares });
   if (!consumed.ok) return consumed;
   const consumption = consumed.value;
 
@@ -119,30 +144,30 @@ function tier0ImmediateInner(input: {
       // §12.2 Tier 0 immediate orders cross the spread, so they are TAKER fills.
       // ADR-012 §5.4: makers pay no fees; the role is recorded, never assumed.
       liquidityRole: "TAKER",
-      snapshot: input.feeSnapshot,
+      snapshot: feeSnapshot,
     });
     if (!fee.ok) return fee;
     fills.push(
       simulatedFill({
-        simulatedFillId: `${input.simulatedOrderId}/t0/${String(index)}`,
-        simulatedOrderId: input.simulatedOrderId,
-        marketId: input.marketId,
-        tokenId: input.book.tokenId,
-        side: input.side,
-        action: input.action,
+        simulatedFillId: `${simulatedOrderId}/t0/${String(index)}`,
+        simulatedOrderId,
+        marketId,
+        tokenId,
+        side,
+        action,
         price: level.price,
         shares: level.shares,
         feeAmount: fee.value.feeAmount,
         liquidityRole: "TAKER",
-        model: input.model,
-        atEvent: input.atEvent,
+        model,
+        atEvent,
       }),
     );
   }
 
   return simulationOk(
     ownFrozenTree<Tier0ImmediateOutcome>({
-      model: input.model,
+      model,
       fills,
       filledShares: consumption.filledShares,
       remainingShares: consumption.remainingShares,
@@ -202,10 +227,33 @@ function tier0MakerInner(input: {
   readonly feeSnapshot: FeeScheduleSnapshot;
   readonly atEvent: RecordedEventIdentity;
 }): SimulationResult<Tier0MakerOutcome> {
+  // The same D1 + one-read-per-field shape as `tier0Immediate` above, for the
+  // same two caller records and the same reason (round-3 review, MEDIUM-1: the
+  // rule is the door's, not one door's).
+  const { model: offeredModel, atEvent: offeredAtEvent, action, side } = input;
+  const { simulatedOrderId, marketId, tokenId, restingPrice, remainingShares } = input;
+  const { observedTradePrice, feeSnapshot } = input;
+
+  const readModel = readOwnPlainInput<FillModelIdentity>(offeredModel, "the fill model identity");
+  if (!readModel.ok) return readModel;
+  const model = readModel.value;
+  const readAtEvent = readOwnPlainInput<RecordedEventIdentity>(
+    offeredAtEvent,
+    "the recorded event identity",
+  );
+  if (!readAtEvent.ok) return readAtEvent;
+  const atEvent = readAtEvent.value;
+  if (atEvent === null || typeof atEvent !== "object") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a simulated fill is anchored to a recorded event identity (§7.1)",
+    );
+  }
+
   // Validated BEFORE any arithmetic: `compareDecimal` THROWS on a non-canonical
   // decimal, and a door that documents typed refusals may not leak an exception
   // (ADR-020 §6's "no throw escapes"). Found by this package's own suite.
-  for (const value of [input.restingPrice, input.observedTradePrice, input.remainingShares]) {
+  for (const value of [restingPrice, observedTradePrice, remainingShares]) {
     if (!isCanonicalDecimalString(value)) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
@@ -214,56 +262,56 @@ function tier0MakerInner(input: {
       );
     }
   }
-  const comparison = compareDecimal(input.observedTradePrice, input.restingPrice);
+  const comparison = compareDecimal(observedTradePrice, restingPrice);
   // A resting BUY sits on the bid: a trade at or BELOW its price consumed it.
   // A resting SELL sits on the ask: a trade at or ABOVE its price consumed it.
-  const throughIt = input.action === "BUY" ? comparison < 0 : comparison > 0;
+  const throughIt = action === "BUY" ? comparison < 0 : comparison > 0;
   const trigger: "TOUCH" | "TRADE_THROUGH" | "NONE" =
     comparison === 0 ? "TOUCH" : throughIt ? "TRADE_THROUGH" : "NONE";
 
-  if (trigger === "NONE" || compareDecimal(input.remainingShares, "0") <= 0) {
+  if (trigger === "NONE" || compareDecimal(remainingShares, "0") <= 0) {
     return simulationOk(
       ownFrozenTree<Tier0MakerOutcome>({
-        model: input.model,
+        model,
         fills: [],
         filledShares: "0",
-        remainingShares: input.remainingShares,
+        remainingShares,
         trigger: "NONE",
       }),
     );
   }
 
   const fee = computeFee({
-    shares: input.remainingShares,
-    price: input.restingPrice,
+    shares: remainingShares,
+    price: restingPrice,
     // ADR-012 §5.4 / venue report §6: "Makers pay no fees; only takers pay."
     // The rate still comes from the snapshot, so a future snapshot with a
     // nonzero maker rate simulates correctly with no edit here.
     liquidityRole: "MAKER",
-    snapshot: input.feeSnapshot,
+    snapshot: feeSnapshot,
   });
   if (!fee.ok) return fee;
 
   return simulationOk(
     ownFrozenTree<Tier0MakerOutcome>({
-      model: input.model,
+      model,
       fills: [
         simulatedFill({
-          simulatedFillId: `${input.simulatedOrderId}/t0m/${input.atEvent.ingestSeq}`,
-          simulatedOrderId: input.simulatedOrderId,
-          marketId: input.marketId,
-          tokenId: input.tokenId,
-          side: input.side,
-          action: input.action,
-          price: input.restingPrice,
-          shares: input.remainingShares,
+          simulatedFillId: `${simulatedOrderId}/t0m/${String(atEvent.ingestSeq)}`,
+          simulatedOrderId,
+          marketId,
+          tokenId,
+          side,
+          action,
+          price: restingPrice,
+          shares: remainingShares,
           feeAmount: fee.value.feeAmount,
           liquidityRole: "MAKER",
-          model: input.model,
-          atEvent: input.atEvent,
+          model,
+          atEvent,
         }),
       ],
-      filledShares: input.remainingShares,
+      filledShares: remainingShares,
       remainingShares: "0",
       trigger,
     }),

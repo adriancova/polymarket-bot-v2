@@ -60,9 +60,9 @@ import {
 } from "./fill-model.js";
 import { isNonNegativeInteger } from "./grammar.js";
 import { readLatencyModel, sampleLatency, type LatencyModel, type SampledLatency } from "./latency.js";
-import { ownFrozenTree } from "./plain.js";
+import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import type { BookView, RecordedEventIdentity } from "./ports.js";
-import { simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
+import { describeForRefusal, simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
 import type { SeededStreams } from "./seed.js";
 
 /**
@@ -199,11 +199,31 @@ function tier1ImmediateInner(input: {
   readonly market: MarketExecutionParameters;
   readonly feeSnapshot: FeeScheduleSnapshot;
 }): SimulationResult<Tier1ImmediateOutcome> {
-  if (input.model.tier !== "TIER_1") {
+  // D1 (round-3 review, MEDIUM-1, the same rule as `tier0.ts`): `model` and
+  // `market` are CALLER RECORDS this door reads repeatedly and copies onto every
+  // fill and outcome. `timeline` is a PORT (`bookAt`) and `streams` holds
+  // `SeededStream` INSTANCES, so neither is data and neither is materialized;
+  // `latencyModel` and `feeSnapshot` are materialized by their own doors below.
+  const readModel = readOwnPlainInput<FillModelIdentity>(input.model, "the fill model identity");
+  if (!readModel.ok) return readModel;
+  const model = readModel.value;
+  const readMarket = readOwnPlainInput<MarketExecutionParameters>(
+    input.market,
+    "the market execution parameters",
+  );
+  if (!readMarket.ok) return readMarket;
+  const market = readMarket.value;
+  if (model === null || typeof model !== "object" || market === null || typeof market !== "object") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a Tier-1 immediate execution needs its model identity and its market parameters as records",
+    );
+  }
+  if (model.tier !== "TIER_1") {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "tier1Immediate requires a Tier-1 model identity; a Tier-0 identity would mislabel a latency-aware result as pipeline smoke",
-      { tier: input.model.tier },
+      { tier: describeForRefusal(model.tier) },
     );
   }
   if (input.postOnly && input.timeInForce !== "GTC" && input.timeInForce !== "GTD") {
@@ -235,19 +255,19 @@ function tier1ImmediateInner(input: {
       "an order is submitted at a recorded monotonic instant (§7.1)",
     );
   }
-  if (!isNonNegativeInteger(input.market.secondsDelay)) {
+  if (!isNonNegativeInteger(market.secondsDelay)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "market.trading.secondsDelay is a non-negative integer number of seconds (venue report §7)",
-      { offered: String(input.market.secondsDelay) },
+      { offered: String(market.secondsDelay) },
     );
   }
 
   const latency = sampleLatency(latencyModel.value, input.streams);
   const arrivesAtNs = addMilliseconds(input.submittedAtNs, latency.totalMs);
-  const delayedByMarket = input.market.secondsDelay > 0;
+  const delayedByMarket = market.secondsDelay > 0;
   const matchableAtNs = delayedByMarket
-    ? addMilliseconds(arrivesAtNs, input.market.secondsDelay * 1000)
+    ? addMilliseconds(arrivesAtNs, market.secondsDelay * 1000)
     : arrivesAtNs;
 
   if (input.timeInForce === "GTD" && input.statedExpiryNs !== undefined) {
@@ -255,7 +275,7 @@ function tier1ImmediateInner(input: {
     if (matchableAtNs >= effectiveExpiryNs) {
       return simulationOk(
         emptyOutcome({
-          model: input.model,
+          model,
           timeInForce: input.timeInForce,
           latency,
           arrivesAtNs,
@@ -298,7 +318,7 @@ function tier1ImmediateInner(input: {
   if (input.timeInForce === "FOK" && compareDecimal(consumption.remainingShares, "0") > 0) {
     return simulationOk(
       emptyOutcome({
-        model: input.model,
+        model,
         timeInForce: input.timeInForce,
         latency,
         arrivesAtNs,
@@ -336,7 +356,7 @@ function tier1ImmediateInner(input: {
         shares: level.shares,
         feeAmount: fee.value.feeAmount,
         liquidityRole: "TAKER",
-        model: input.model,
+        model,
         atEvent: observed.atEvent,
       }),
     );
@@ -351,7 +371,7 @@ function tier1ImmediateInner(input: {
 
   return simulationOk(
     ownFrozenTree<Tier1ImmediateOutcome>({
-      model: input.model,
+      model,
       timeInForce: input.timeInForce,
       latency,
       arrivesAtNs: arrivesAtNs.toString(),

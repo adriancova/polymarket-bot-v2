@@ -215,10 +215,26 @@ export type SameInstantAdditions =
 
 /**
  * Validates a {@link SameInstantAdditions}. Required; never defaulted.
+ *
+ * D1 (round-3 review): the `{ observedShares }` form is a CALLER RECORD, and its
+ * value is carried onto the band and printed in the §12.4 bytes
+ * (`sameInstantAdditions=OBSERVED:<shares>`), so returning the caller's own
+ * object left a lying accessor between the check and the serialization.
  */
 export function readSameInstantAdditions(
   value: SameInstantAdditions,
 ): SimulationResult<SameInstantAdditions> {
+  return totally("reading the same-instant additions", () =>
+    readSameInstantAdditionsInner(value),
+  );
+}
+
+function readSameInstantAdditionsInner(
+  offered: SameInstantAdditions,
+): SimulationResult<SameInstantAdditions> {
+  const read = readOwnPlainInput<SameInstantAdditions>(offered, "the same-instant additions");
+  if (!read.ok) return read;
+  const value = read.value;
   if (value === "NOT_OBSERVED") return simulationOk(value);
   if (value === null || typeof value !== "object") {
     return simulationFailure(
@@ -235,7 +251,7 @@ export function readSameInstantAdditions(
       { offered: describeForRefusal(shares) },
     );
   }
-  return simulationOk(value);
+  return simulationOk(ownFrozenTree(value));
 }
 
 /** The shares a {@link SameInstantAdditions} contributes to the queue ahead. */
@@ -346,6 +362,13 @@ export function simulateResting(input: {
   return totally("simulating a resting order", () => simulateRestingInner(input));
 }
 
+/**
+ * §7.1 recorded monotonic nanoseconds are `bigint` on this door's record types,
+ * so its materializer carries one. See {@link ../plain.js#MaterializePolicy}:
+ * a `bigint` is a primitive, and every other non-plain value stays refused.
+ */
+const RECORDED_INSTANTS_ARE_BIGINTS = Object.freeze({ bigintIsData: true });
+
 function simulateRestingInner(input: {
   readonly model: FillModelIdentity;
   readonly order: RestingOrderInput;
@@ -353,25 +376,69 @@ function simulateRestingInner(input: {
   readonly parameters: QueueModelParameters;
   readonly feeSnapshot: FeeScheduleSnapshot;
 }): SimulationResult<RestingFillBand> {
-  if (input.order === null || typeof input.order !== "object") {
+  // D1 FIRST, AND ONE READ PER FIELD (round-3 review, MEDIUM-1). Every field of
+  // the options bag is taken exactly once, here; every DATA record it yields is
+  // then materialized, and everything below reads the materialized tree.
+  //
+  // What that closes, measured at `b0aeb28`: this door read
+  // `order.queueAheadAtPlacement` FOUR times and `order.restingPrice` ELEVEN,
+  // so an accessor answering `"10"` for the non-negativity check and `"0"`
+  // afterwards produced an ACCEPTED band that serialized as valid v3 bytes with
+  // `queueAhead=0` — the check and the computation saw different orders. It also
+  // passed `input.model` to D4's copier, which fails CLOSED on an accessor but
+  // blamed this package for it (`SIMULATION_INTERNAL`) instead of naming the
+  // argument (`SIMULATION_INPUT_NOT_DATA`).
+  const {
+    model: offeredModel,
+    order: offeredOrder,
+    trades: offeredTrades,
+    parameters: offeredParameters,
+    feeSnapshot: offeredFeeSnapshot,
+  } = input;
+
+  const readModel = readOwnPlainInput<FillModelIdentity>(offeredModel, "the fill model identity");
+  if (!readModel.ok) return readModel;
+  const model = readModel.value;
+  const readOrder = readOwnPlainInput<RestingOrderInput>(
+    offeredOrder,
+    "the resting order",
+    RECORDED_INSTANTS_ARE_BIGINTS,
+  );
+  if (!readOrder.ok) return readOrder;
+  const order = readOrder.value;
+  if (order === null || typeof order !== "object") {
     return simulationFailure("SIMULATION_INPUT_INVALID", "a resting order must be a record");
   }
-  const feeSnapshot = readFeeScheduleSnapshot(input.feeSnapshot);
+
+  const feeSnapshot = readFeeScheduleSnapshot(offeredFeeSnapshot);
   if (!feeSnapshot.ok) return feeSnapshot;
-  const parameters = readQueueModelParameters(input.parameters);
+  const parameters = readQueueModelParameters(offeredParameters);
   if (!parameters.ok) return parameters;
-  if (input.model.tier !== "TIER_1") {
+  const tier: unknown = model === null || typeof model !== "object" ? undefined : model.tier;
+  if (tier !== "TIER_1") {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "the resting queue model is Tier 1; a Tier-0 identity would mislabel a queue-estimated result as pipeline smoke",
-      { tier: input.model.tier },
+      { tier: describeForRefusal(tier) },
     );
   }
-  if (!isCanonicalDecimalString(input.order.restingPrice)) {
+  if (!isCanonicalDecimalString(order.restingPrice)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "resting-order quantities must be canonical decimal strings (§6 invariant 1)",
-      { field: "restingPrice", offered: describeForRefusal(input.order.restingPrice) },
+      { field: "restingPrice", offered: describeForRefusal(order.restingPrice) },
+    );
+  }
+  // The PRICE bound, for the same reason as the size bounds below (round-3
+  // review, NOTE-3): a price is what the fee is computed on
+  // (`fee = C × rate × p × (1 − p)`) and what the §12.4 `band` line prints, and
+  // a negative one is not a price. The venue guards its own inputs; this door
+  // enforces what its own computation assumes rather than inheriting it.
+  if (compareDecimal(order.restingPrice, "0") <= 0) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a resting order's price is strictly positive; a non-positive price is not a price, and the fee this door charges is computed from it",
+      { field: "restingPrice", offered: order.restingPrice },
     );
   }
   // THE HYPOTHESES OF THE DERIVATION, ENFORCED WHERE IT IS CITED (round-2 review,
@@ -383,8 +450,8 @@ function simulateRestingInner(input: {
   // negative additions, a band-inconsistency refusal that blamed the derivation
   // for an input the door never checked. The bounds are the venue's, exactly.
   for (const [field, value] of [
-    ["shares", input.order.shares],
-    ["queueAheadAtPlacement", input.order.queueAheadAtPlacement],
+    ["shares", order.shares],
+    ["queueAheadAtPlacement", order.queueAheadAtPlacement],
   ] as const) {
     if (!isCanonicalDecimalString(value)) {
       return simulationFailure(
@@ -401,24 +468,38 @@ function simulateRestingInner(input: {
       );
     }
   }
-  const additions = readSameInstantAdditions(input.order.sameInstantAdditions);
+  const additions = readSameInstantAdditions(order.sameInstantAdditions);
   if (!additions.ok) return additions;
-  if (!isNonEmptyString(input.order.simulatedOrderId) || !isNonEmptyString(input.order.marketId)) {
+  if (!isNonEmptyString(order.simulatedOrderId) || !isNonEmptyString(order.marketId)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "a resting order must name itself and its market; the band is identified by the order it is about",
+    );
+  }
+  if (typeof order.restingFromNs !== "bigint") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a resting order carries the recorded monotonic instant it rested at (§7.1)",
+      { offered: describeForRefusal(order.restingFromNs) },
+    );
+  }
+  if (order.cancelRequestedAtNs !== undefined && typeof order.cancelRequestedAtNs !== "bigint") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a cancel request is stated as the recorded monotonic instant it was made at (§7.1), or not at all",
+      { offered: describeForRefusal(order.cancelRequestedAtNs) },
     );
   }
 
   // Validated BEFORE any scenario runs, and for the WHOLE list: every scenario
   // walks the same trades, so a malformed or out-of-order trade must be refused
   // once, not discovered halfway through one scenario's walk.
-  const trades = readObservedTrades(input.trades);
+  const trades = readObservedTrades(offeredTrades);
   if (!trades.ok) return trades;
 
   const shared = {
-    model: input.model,
-    order: input.order,
+    model,
+    order,
     additions: additions.value,
     trades: trades.value,
     parameters: parameters.value,
@@ -432,11 +513,11 @@ function simulateRestingInner(input: {
   if (!conservative.ok) return conservative;
 
   const band = ownFrozenTree<RestingFillBand>({
-    model: input.model,
+    model,
     queueModelVersion: parameters.value.queueModelVersion,
-    simulatedOrderId: input.order.simulatedOrderId,
-    marketId: input.order.marketId,
-    restingPrice: input.order.restingPrice,
+    simulatedOrderId: order.simulatedOrderId,
+    marketId: order.marketId,
+    restingPrice: order.restingPrice,
     sameInstantAdditions: additions.value,
     optimistic: optimistic.value,
     base: base.value,
@@ -444,9 +525,8 @@ function simulateRestingInner(input: {
     bandBasis: "OPTIMISTIC_BASE_CONSERVATIVE_CANCELLATION_ASSUMPTIONS",
     quotationRule: "REPORT_THE_BAND_NEVER_ONE_MEMBER",
   });
-  const ordering = checkBandOrdering(band);
-  if (!ordering.ok) return ordering;
-  return simulationOk(band);
+  // The value RETURNED is the value CHECKED — not a sibling of it.
+  return checkBandOrdering(band);
 }
 
 /**
@@ -523,7 +603,19 @@ export function checkBandOrdering(band: RestingFillBand): SimulationResult<Resti
   return totally("checking a resting band", () => checkBandOrderingInner(band));
 }
 
-function checkBandOrderingInner(band: RestingFillBand): SimulationResult<RestingFillBand> {
+function checkBandOrderingInner(offered: RestingFillBand): SimulationResult<RestingFillBand> {
+  // D1 (round-3 review, MEDIUM-1). This door used to validate the CALLER'S OWN
+  // OBJECT and then return it: an unfrozen, prototype-bearing alias. With an
+  // accessor on `conservative` that answered honestly for the check's reads and
+  // differently afterwards, the check ACCEPTED and `serializeBand` on the
+  // RETURNED CHECKED VALUE emitted `conservative[ filled=999 remaining=0 … ]`
+  // for a 50-share order — the exact inconsistency this function exists to
+  // reject, reaching the §12.4 bytes with a passed check in front of it.
+  // Materializing first makes the checked value and the returned value the same
+  // frozen, prototype-free tree, which no caller holds a reference to.
+  const read = readOwnPlainInput<RestingFillBand>(offered, "the resting band");
+  if (!read.ok) return read;
+  const band = read.value;
   if (band === null || typeof band !== "object") {
     return simulationFailure("SIMULATION_INPUT_INVALID", "a band must be a record");
   }
@@ -675,7 +767,10 @@ function checkBandOrderingInner(band: RestingFillBand): SimulationResult<Resting
       },
     );
   }
-  return simulationOk(band);
+  // D4 on the way out: the checked tree, frozen and prototype-free, never the
+  // caller's object. `README.md` §2 D4 states this; before round 3 this one OK
+  // path contradicted it.
+  return simulationOk(ownFrozenTree(band));
 }
 
 /**
@@ -688,8 +783,20 @@ function checkBandOrderingInner(band: RestingFillBand): SimulationResult<Resting
  * unsorted list has no defined answer and is refused rather than answered.
  */
 function readObservedTrades(
-  trades: readonly ObservedTrade[],
+  offered: readonly ObservedTrade[],
 ): SimulationResult<readonly ObservedTrade[]> {
+  // D1 (round-3 review, MEDIUM-1): the trade list is a CALLER ARRAY OF CALLER
+  // RECORDS, and every scenario walks it three times — price, size and instant
+  // are each read again per scenario — so an accessor could answer the
+  // validation and the walk differently. It is materialized once, here, and the
+  // three scenarios walk the materialized tree.
+  const read = readOwnPlainInput<readonly ObservedTrade[]>(
+    offered,
+    "the observed trades",
+    RECORDED_INSTANTS_ARE_BIGINTS,
+  );
+  if (!read.ok) return read;
+  const trades = read.value;
   if (!Array.isArray(trades)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
@@ -722,6 +829,17 @@ function readObservedTrades(
         "SIMULATION_INPUT_INVALID",
         "an observed trade has positive size; a non-positive one is not a trade, and the queue walk's monotonicity in the cancellation ratio is derived over positive traded size",
         { index, shares: trade.shares },
+      );
+    }
+    // The same bound on the PRICE (round-3 review, NOTE-3). The walk compares a
+    // trade price with the resting price to decide "at" from "through", and a
+    // non-positive price is not a price: the door enforces what its own
+    // computation assumes rather than inheriting the venue's guard.
+    if (compareDecimal(trade.price, "0") <= 0) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "an observed trade prints at a strictly positive price; the at-price / through-price comparison this walk turns on is not defined for a non-positive one",
+        { index, price: trade.price },
       );
     }
     if (typeof trade.monotonicNs !== "bigint" || trade.monotonicNs < 0n) {

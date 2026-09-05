@@ -784,28 +784,52 @@ export function readRunPins(offered: unknown): SimulationResult<ReplayRunPins> {
  */
 export function reconcileRunPins(
   dataset: ReplayDataset,
-  run: ReplayRunPins,
+  offeredRun: ReplayRunPins,
 ): SimulationResult<ReplayRunPins> {
-  if (dataset === null || typeof dataset !== "object" || !isRecord(dataset.pins)) {
+  // D1 (round-3 review, MEDIUM-1). Two caller records meet here, each read
+  // twice — once in the comparison and once in the mismatch refusal — and the
+  // OK path returned the caller's own pin set, so a §12.5 pin could be checked
+  // as one value and used as another. The manifest's `pins` sub-record is read
+  // out of the dataset ONCE and materialized; the dataset itself is the output
+  // of `readDatasetManifestText`, which is already a door.
+  if (dataset === null || typeof dataset !== "object") {
     return simulationFailure(
       "REPLAY_MANIFEST_INVALID",
       "run pins are reconciled against a dataset manifest that carries its own pins (§12.5)",
     );
   }
+  const readPins = readOwnPlainInput<ReplayManifestPins>(dataset.pins, "the manifest pins");
+  if (!readPins.ok) return readPins;
+  const pins = readPins.value;
+  if (!isRecord(pins)) {
+    return simulationFailure(
+      "REPLAY_MANIFEST_INVALID",
+      "run pins are reconciled against a dataset manifest that carries its own pins (§12.5)",
+    );
+  }
+  const readRun = readOwnPlainInput<ReplayRunPins>(offeredRun, "the run pin set");
+  if (!readRun.ok) return readRun;
+  const run = readRun.value;
   if (run === null || typeof run !== "object") {
     return simulationFailure(
       "REPLAY_MANIFEST_PIN_MISSING",
       "a run pin set is a record (§12.5)",
     );
   }
+  if (!Array.isArray(pins.settlementSpecVersions) || !Array.isArray(run.settlementSpecVersions)) {
+    return simulationFailure(
+      "REPLAY_MANIFEST_INVALID",
+      "both the manifest and the run state their settlement-spec version set (§12.5)",
+    );
+  }
   const checks: readonly (readonly [string, string | null, string])[] = [
-    ["normalizerVersion", dataset.pins.normalizerVersion, run.normalizerVersion],
-    ["featureSetVersion", dataset.pins.featureSetVersion, run.featureSetVersion],
-    ["runSeed", dataset.pins.runSeed, run.runSeed],
-    ["fillModelVersion", dataset.pins.fillModelVersion, run.fillModelVersion],
-    ["latencyModelVersion", dataset.pins.latencyModelVersion, run.latencyModelVersion],
-    ["feeSnapshotVersion", dataset.pins.feeSnapshotVersion, run.feeSnapshotVersion],
-    ["rewardSnapshotVersion", dataset.pins.rewardSnapshotVersion, run.rewardSnapshotVersion],
+    ["normalizerVersion", pins.normalizerVersion, run.normalizerVersion],
+    ["featureSetVersion", pins.featureSetVersion, run.featureSetVersion],
+    ["runSeed", pins.runSeed, run.runSeed],
+    ["fillModelVersion", pins.fillModelVersion, run.fillModelVersion],
+    ["latencyModelVersion", pins.latencyModelVersion, run.latencyModelVersion],
+    ["feeSnapshotVersion", pins.feeSnapshotVersion, run.feeSnapshotVersion],
+    ["rewardSnapshotVersion", pins.rewardSnapshotVersion, run.rewardSnapshotVersion],
   ];
   for (const [name, pinned, offered] of checks) {
     if (pinned !== null && pinned !== offered) {
@@ -817,8 +841,8 @@ export function reconcileRunPins(
       );
     }
   }
-  if (dataset.pins.settlementSpecVersions.length > 0) {
-    const pinned = [...dataset.pins.settlementSpecVersions].sort();
+  if (pins.settlementSpecVersions.length > 0) {
+    const pinned = [...pins.settlementSpecVersions].sort();
     const offered = [...run.settlementSpecVersions].sort();
     if (pinned.length !== offered.length || pinned.some((value, index) => value !== offered[index])) {
       return simulationFailure(
@@ -828,5 +852,5 @@ export function reconcileRunPins(
       );
     }
   }
-  return simulationOk(run);
+  return simulationOk(ownFrozenTree(run));
 }

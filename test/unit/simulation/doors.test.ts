@@ -42,21 +42,40 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Uuidv7Schema } from "../../../packages/domain/src/index.js";
 import {
   MAX_INPUT_DEPTH,
+  ReplayClock,
+  checkBandOrdering,
+  computeFee,
+  computeMarkouts,
+  consumeDepth,
+  deriveReplayEventId,
+  deriveStreams,
   isCanonicalUuidV7,
   isIsoTimestamp,
   loadDataset,
+  markoutStressScenario,
   materializeInput,
   ownFrozenTree,
   parseStrictJsonText,
+  quoteForDeploymentDecision,
   readDatasetManifestText,
   readFeeScheduleSnapshot,
   readLatencyDistribution,
   readLatencyModel,
   readQueueModelParameters,
   readRunPins,
+  readSameInstantAdditions,
+  reconcileRunPins,
+  replayPathEconomics,
+  serializeBand,
+  simulateResting,
   simulationRefusal,
+  sizeAtPrice,
   SimulatedVenue,
+  tier0Immediate,
+  tier0Maker,
   tier0Model,
+  tier1Immediate,
+  tier1Model,
   unmodeledRateLimits,
   createReplayClock,
   type FeeScheduleSnapshot,
@@ -394,6 +413,46 @@ describe("D1: the materializer refuses what is not data, without running it", ()
     expect(materializeInput(new Custom(), "$").ok).toBe(false);
   });
 
+  it("refuses a bigint by DEFAULT, and carries one only where a door asks", () => {
+    // The `bigintIsData` policy is the one thing round 3 relaxed, so it is
+    // pinned here rather than described. A `bigint` is a PRIMITIVE — immutable,
+    // identity-free, no prototype, no code — so admitting it adopts nothing;
+    // but it cannot come from JSON, so at a WIRE door its presence means the
+    // value was constructed rather than recorded, and the default refuses it.
+    expect(materializeInput({ instant: 1n }, "$").ok).toBe(false);
+    expect(materializeInput({ instant: 1n }, "$", {}).ok).toBe(false);
+    expect(materializeInput({ instant: 1n }, "$", { bigintIsData: false }).ok).toBe(false);
+    const carried = materializeInput({ instant: 1n }, "$", { bigintIsData: true });
+    expect(carried.ok).toBe(true);
+    if (!carried.ok) return;
+    expect((carried.value as Record<string, unknown>)["instant"]).toBe(1n);
+
+    // Relaxing it relaxes NOTHING else: an accessor, a cycle and a foreign
+    // prototype are still refused under the permissive policy.
+    const withAccessor = Object.defineProperty({}, "field", {
+      get: () => "value",
+      enumerable: true,
+      configurable: true,
+    });
+    expect(materializeInput(withAccessor, "$", { bigintIsData: true }).ok).toBe(false);
+    const cyclic: Record<string, unknown> = {};
+    cyclic["self"] = cyclic;
+    expect(materializeInput(cyclic, "$", { bigintIsData: true }).ok).toBe(false);
+    class Custom {
+      readonly a = 1n;
+    }
+    expect(materializeInput(new Custom(), "$", { bigintIsData: true }).ok).toBe(false);
+
+    // …and the WIRE doors keep the default: a pin set carrying a bigint is not
+    // a recorded pin set.
+    const pins = { ...runPins() } as unknown as Record<string, unknown>;
+    pins["runSeed"] = 42n;
+    const outcome = readRunPins(pins as unknown as ReplayRunPins);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("SIMULATION_INPUT_NOT_DATA");
+  });
+
   it("produces a tree with no prototype, so an absent field stays absent", () => {
     const outcome = materializeInput({ present: 1 }, "$");
     expect(outcome.ok).toBe(true);
@@ -625,6 +684,62 @@ function deeplyNestedRecord(depth: number): Record<string, unknown> {
   return node;
 }
 
+// ---------------------------------------------------------------------------
+// The three hostility classes, NESTED (round-3 review, MEDIUM-1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Each class, built at DEPTH rather than at the root.
+ *
+ * Round 2 measured all three at the top level of a door's argument. Round 3's
+ * drive found that a door which reads `input.order` and then computes over the
+ * caller's object is untouched by a root-level probe: the hostility has to sit
+ * INSIDE the record the door actually reads. Everything below is therefore
+ * planted two levels down from the record under test.
+ */
+const HOSTILITY_CLASSES: readonly {
+  readonly name: string;
+  /** Builds the value to plant. `undefined` getters counter means it has none. */
+  readonly build: () => unknown;
+  /** The substring the refusal must name, so a coincidental refusal cannot pass. */
+  readonly named: string;
+}[] = [
+  {
+    name: "a nested cycle",
+    build: () => {
+      const inner: Record<string, unknown> = { deeper: {} };
+      inner["deeper"] = inner;
+      return { nested: inner };
+    },
+    named: "cycle",
+  },
+  {
+    name: "a nested accessor",
+    build: () => {
+      const inner = {} as Record<string, unknown>;
+      Object.defineProperty(inner, "hostile", {
+        get: () => {
+          gettersInvoked += 1;
+          nestedGettersInvoked += 1;
+          return "value";
+        },
+        enumerable: true,
+        configurable: true,
+      });
+      return { nested: { deeper: inner } };
+    },
+    named: "accessor",
+  },
+  {
+    name: "nested past MAX_INPUT_DEPTH",
+    build: () => ({ nested: { deeper: deeplyNestedRecord(MAX_INPUT_DEPTH + 8) } }),
+    named: "",
+  },
+];
+
+/** How many times a NESTED accessor planted by the battery above ran. */
+let nestedGettersInvoked = 0;
+
 describe("the bound: no throw escapes any door of this package", () => {
   /** A venue built with only the options every path needs. */
   function hostileVenue(): SimulatedVenue {
@@ -712,6 +827,27 @@ describe("the bound: no throw escapes any door of this package", () => {
       cyclicArray(),
       getterBearingRecord(),
       deeplyNestedRecord(MAX_INPUT_DEPTH + 8),
+      // Round-3 review, MEDIUM-1 / LOW-1: the same three classes NESTED, driven
+      // by reflection against EVERY export — so an export added later is
+      // covered by construction rather than by anyone remembering to list it.
+      ...HOSTILITY_CLASSES.map((hostility) => hostility.build()),
+      // …and each nested class wrapped in a record whose keys the doors DO read,
+      // so it reaches a field read rather than sitting in a key nobody looks at.
+      ...HOSTILITY_CLASSES.map((hostility) => ({
+        model: hostility.build(),
+        order: hostility.build(),
+        trades: [hostility.build()],
+        fills: [hostility.build()],
+        ladder: [hostility.build()],
+        snapshot: hostility.build(),
+        parameters: hostility.build(),
+        feeSnapshot: hostility.build(),
+        atEvent: hostility.build(),
+        fill: hostility.build(),
+        diagnostics: [hostility.build()],
+        band: hostility.build(),
+        pins: hostility.build(),
+      })),
     ];
 
     const escapes: string[] = [];
@@ -804,75 +940,594 @@ describe("the bound: no throw escapes any door of this package", () => {
   });
 });
 
+
 // ---------------------------------------------------------------------------
-// D1 at the doors that take a CALLER RECORD (round-2 review, MEDIUM-1)
+// D1 at the doors that take a CALLER RECORD (round-2 MEDIUM-1, round-3 MEDIUM-1)
 // ---------------------------------------------------------------------------
 
 /**
- * Every door whose argument is a caller-supplied RECORD, with a VALID example.
+ * A path from a door's argument to one caller DATA RECORD it materializes.
  *
- * The battery above proves no throw escapes; these prove the stronger property
- * the fix is actually about: each of these doors materializes its argument
- * first, so a cycle is REFUSED (typed) rather than followed until the stack runs
- * out, and a getter is REFUSED WITHOUT BEING INVOKED.
- *
- * Measured at `52a058b` before the fix: the first three THREW
- * `RangeError: Maximum call stack size exceeded` on the cyclic argument, and the
- * fee and queue doors answered `ok: true` on the getter-bearing one having run
- * the getter once — `ownPlainCopy` read members with `value[key]`.
+ * `[]` means the argument IS the record. `["order"]` means the argument is an
+ * options bag whose `order` member is one. The battery plants its hostility AT
+ * that record — nested inside it — which is the distinction round 3 turned on:
+ * a root-level probe cannot reach a door that reads `input.order` and then
+ * computes over the caller's object.
  */
-const RECORD_DOORS: readonly {
+type RecordPath = readonly string[];
+
+interface RecordDoor {
+  /** Unique label for this probe; several probes may target one export. */
+  readonly id: string;
+  /** The EXPORT this drives, for the partition check below. */
   readonly name: string;
   readonly valid: () => unknown;
+  /**
+   * Whether the ARGUMENT ITSELF is the caller data record.
+   *
+   * `false` for a door whose argument is an OPTIONS BAG assembled at the call
+   * site: the bag is not materialized (it may carry ports), each of its fields
+   * is read once, and the records it yields are.
+   */
+  readonly argumentIsData: boolean;
+  /**
+   * Members the walker must NOT treat as data, each with the reason.
+   *
+   * Ports (an object with a function member) and class instances (a non-plain
+   * prototype) are detected mechanically; this is for anything neither rule
+   * catches. It is deliberately the ONLY hand-maintained part: a new DATA member
+   * of a fixture is covered by construction, and only a new NON-data one has to
+   * be declared.
+   */
+  readonly notData?: Readonly<Record<string, string>>;
   readonly drive: (value: unknown) => SimulationResult<unknown>;
-}[] = [
+}
+
+/**
+ * Every position inside a door's valid argument that holds caller DATA.
+ *
+ * DERIVED, not listed (round-3 review, LOW-1). The previous table named the
+ * records by hand, so a door could claim one record, be probed at that one, and
+ * quietly read three others raw — which is how round 3's four doors survived
+ * round 2. Here the fixture is WALKED, and every object or array it reaches is
+ * probed, except:
+ *
+ * - a PORT — an object with a function-valued own member; its contract is those
+ *   methods and materializing it would delete them;
+ * - a CLASS INSTANCE — a non-plain prototype; `plain.ts` refuses those as data
+ *   by policy, so a door cannot be asked to materialize one;
+ * - anything the door declares in {@link RecordDoor.notData}, with its reason.
+ *
+ * A data member added to a fixture is therefore probed without anyone
+ * remembering to list it.
+ */
+function deriveRecordPaths(door: RecordDoor): readonly RecordPath[] {
+  const paths: RecordPath[] = [];
+  const notData = door.notData ?? {};
+  const walk = (value: unknown, path: RecordPath): void => {
+    if (value === null || typeof value !== "object") return;
+    if (path.length > 0 && Object.hasOwn(notData, path.join("."))) return;
+    const prototype: unknown = Object.getPrototypeOf(value);
+    const isArray = Array.isArray(value);
+    if (prototype !== null && prototype !== (isArray ? Array.prototype : Object.prototype)) return;
+    for (const key of Object.keys(value)) {
+      if (typeof (value as Record<string, unknown>)[key] === "function") return; // a PORT
+    }
+    if (path.length > 0 || door.argumentIsData) paths.push(path);
+    if (isArray) {
+      // The first element stands for the array: planting into it is nesting.
+      walk((value as unknown[])[0], [...path, "0"]);
+      return;
+    }
+    for (const key of Object.keys(value)) {
+      walk((value as Record<string, unknown>)[key], [...path, key]);
+    }
+  };
+  walk(door.valid(), []);
+  return paths;
+}
+
+// --- fixtures the doors below need -----------------------------------------
+
+const FEE_SNAPSHOT = (): Record<string, unknown> => ({
+  snapshotVersion: "fees/2026-08-24",
+  takerFeeRate: "0.07",
+  makerFeeRate: "0",
+  roundingDecimalPlaces: 5,
+  roundingMode: "HALF_UP",
+  minimumChargedFee: "0.00001",
+  feeCurrency: "USDC",
+});
+
+const QUEUE_PARAMETERS = (): Record<string, unknown> => ({
+  queueModelVersion: "sim/queue/v1",
+  cancellationRatio: { OPTIMISTIC: "0.5", BASE: "0.1", CONSERVATIVE: "0" },
+  cancelEffectiveAfterMs: { OPTIMISTIC: 10, BASE: 50, CONSERVATIVE: 250 },
+  placedBehindSameInstantAdditions: { OPTIMISTIC: false, BASE: false, CONSERVATIVE: true },
+  basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+});
+
+const LATENCY_MODEL = (): Record<string, unknown> => ({
+  latencyModelVersion: "sim/latency/v1",
+  decision: { samples: [{ milliseconds: 1, weight: 1 }] },
+  signing: { samples: [{ milliseconds: 1, weight: 1 }] },
+  network: { samples: [{ milliseconds: 1, weight: 1 }] },
+  venue: { samples: [{ milliseconds: 1, weight: 1 }] },
+  basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+});
+
+const AT_EVENT = (): Record<string, unknown> => ({
+  gatewayEpoch: "0190a3e0-0000-7000-8000-000000000001",
+  ingestSeq: "1",
+  receivedAt: "2026-01-01T00:00:00.000Z",
+  datasetRowOrdinal: 0,
+});
+
+const TIER_0_MODEL = (): Record<string, unknown> => ({
+  ...tier0Model({ fillModelVersion: "sim/tier0/v1", fillModelParametersHash: "0".repeat(64) }),
+});
+
+const TIER_1_MODEL = (): Record<string, unknown> => ({
+  ...tier1Model({ fillModelVersion: "sim/tier1/v1", fillModelParametersHash: "0".repeat(64) }),
+});
+
+const RESTING_ORDER = (): Record<string, unknown> => ({
+  simulatedOrderId: "o-1",
+  marketId: "m-1",
+  tokenId: "1234",
+  side: "YES",
+  action: "BUY",
+  restingPrice: "0.5",
+  shares: "50",
+  queueAheadAtPlacement: "10",
+  sameInstantAdditions: "NOT_OBSERVED",
+  restingFromNs: 1000n,
+});
+
+const OBSERVED_TRADE = (): Record<string, unknown> => ({
+  price: "0.5",
+  shares: "40",
+  monotonicNs: 2000n,
+  atEvent: AT_EVENT(),
+});
+
+const SIMULATED_FILL = (): Record<string, unknown> => ({
+  simulatedFillId: "f-1",
+  simulatedOrderId: "o-1",
+  marketId: "m-1",
+  tokenId: "1234",
+  side: "YES",
+  action: "BUY",
+  price: "0.5",
+  shares: "10",
+  feeAmount: "0",
+  liquidityRole: "TAKER",
+  evidenceClass: "SIMULATED_NOT_REAL_EVIDENCE",
+  fillModelVersion: "sim/tier0/v1",
+  model: TIER_0_MODEL(),
+  planningDepthAwareness: "TOP_OF_BOOK_ONLY",
+  atEvent: AT_EVENT(),
+});
+
+const MARKOUT_DIAGNOSTIC = (): Record<string, unknown> => ({
+  simulatedFillId: "f-1",
+  role: "DIAGNOSTIC_ONLY",
+  appliedToReplayEconomics: false,
+  observations: [
+    { horizon: "1s", referencePrice: "0.4", perShare: "-0.1", total: "-1", atEvent: AT_EVENT() },
+  ],
+  note: "n",
+});
+
+/** A VALID band, built by the door that builds bands. */
+function validBand(): Record<string, unknown> {
+  const built = simulateResting({
+    model: TIER_1_MODEL() as never,
+    order: RESTING_ORDER() as never,
+    trades: [OBSERVED_TRADE()] as never,
+    parameters: QUEUE_PARAMETERS() as never,
+    feeSnapshot: FEE_SNAPSHOT() as never,
+  });
+  if (!built.ok) throw new Error(`the band fixture is not valid: ${built.refusal.message}`);
+  return JSON.parse(JSON.stringify(built.value, bigintSafe)) as Record<string, unknown>;
+}
+
+function bigintSafe(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? value.toString() : value;
+}
+
+const BOOK_PORT = {
+  internalMarketId: "m-1",
+  tokenId: "1234",
+  top: () => ({}),
+  ladder: () => [{ price: "0.5", size: "100" }],
+};
+
+/**
+ * Every door whose argument carries a caller-supplied DATA RECORD, with a VALID
+ * example and the PATH to each record it is claimed to materialize.
+ *
+ * The battery above proves no throw escapes; these prove the stronger property
+ * the fixes are actually about: each of these doors materializes the record
+ * FIRST, so a cycle is REFUSED (typed) rather than followed until the stack runs
+ * out, a getter is REFUSED WITHOUT BEING INVOKED — at any depth — and the value
+ * it hands back is its own frozen tree rather than an alias of the caller's.
+ *
+ * Measured before the fixes: at `52a058b` the read* doors THREW
+ * `RangeError: Maximum call stack size exceeded` on a cyclic argument; at
+ * `b0aeb28` `simulateResting` re-read `order.queueAheadAtPlacement` four times
+ * (an accessor answering `"10"` then `"0"` produced an ACCEPTED band with
+ * `queueAhead=0`), `checkBandOrdering` returned the caller's unfrozen object (an
+ * accessor honest for the check and lying afterwards serialized
+ * `conservative[ filled=999 remaining=0 … ]` on a 50-share order),
+ * `tier0Immediate` answered `SIMULATION_INTERNAL`, and `replayPathEconomics`
+ * ACCEPTED an accessor-bearing fill with the getter invoked.
+ */
+const RECORD_DOORS: readonly RecordDoor[] = [
   {
+    id: "readQueueModelParameters",
     name: "readQueueModelParameters",
-    valid: () => ({
-      queueModelVersion: "sim/queue/v1",
-      cancellationRatio: { OPTIMISTIC: "0.5", BASE: "0.1", CONSERVATIVE: "0" },
-      cancelEffectiveAfterMs: { OPTIMISTIC: 10, BASE: 50, CONSERVATIVE: 250 },
-      placedBehindSameInstantAdditions: { OPTIMISTIC: false, BASE: false, CONSERVATIVE: true },
-      basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
-    }),
+    valid: QUEUE_PARAMETERS,
+    argumentIsData: true,
     drive: (value) => readQueueModelParameters(value as QueueModelParameters),
   },
   {
+    id: "readLatencyDistribution",
     name: "readLatencyDistribution",
     valid: () => ({ samples: [{ milliseconds: 1, weight: 1 }] }),
+    argumentIsData: true,
     drive: (value) => readLatencyDistribution(value as LatencyDistribution, "decision"),
   },
   {
+    id: "readLatencyModel",
     name: "readLatencyModel",
-    valid: () => ({
-      latencyModelVersion: "sim/latency/v1",
-      decision: { samples: [{ milliseconds: 1, weight: 1 }] },
-      signing: { samples: [{ milliseconds: 1, weight: 1 }] },
-      network: { samples: [{ milliseconds: 1, weight: 1 }] },
-      venue: { samples: [{ milliseconds: 1, weight: 1 }] },
-      basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
-    }),
+    valid: LATENCY_MODEL,
+    argumentIsData: true,
     drive: (value) => readLatencyModel(value as LatencyModel),
   },
   {
+    id: "readFeeScheduleSnapshot",
     name: "readFeeScheduleSnapshot",
-    valid: () => ({
-      snapshotVersion: "fees/2026-08-24",
-      takerFeeRate: "0.07",
-      makerFeeRate: "0",
-      roundingDecimalPlaces: 5,
-      roundingMode: "HALF_UP",
-      minimumChargedFee: "0.00001",
-      feeCurrency: "USDC",
-    }),
+    valid: FEE_SNAPSHOT,
+    argumentIsData: true,
     drive: (value) => readFeeScheduleSnapshot(value as FeeScheduleSnapshot),
   },
   {
+    id: "readRunPins",
     name: "readRunPins",
     valid: () => runPins(),
+    argumentIsData: true,
     drive: (value) => readRunPins(value as ReplayRunPins),
   },
+  {
+    id: "readSameInstantAdditions",
+    name: "readSameInstantAdditions",
+    valid: () => ({ observedShares: "0" }),
+    argumentIsData: true,
+    drive: (value) => readSameInstantAdditions(value as never),
+  },
+  {
+    id: "simulateResting",
+    name: "simulateResting",
+    valid: () => ({
+      model: TIER_1_MODEL(),
+      order: RESTING_ORDER(),
+      trades: [OBSERVED_TRADE()],
+      parameters: QUEUE_PARAMETERS(),
+      feeSnapshot: FEE_SNAPSHOT(),
+    }),
+    argumentIsData: false,
+    drive: (value) => simulateResting(value as never),
+  },
+  {
+    id: "checkBandOrdering",
+    name: "checkBandOrdering",
+    valid: validBand,
+    argumentIsData: true,
+    drive: (value) => checkBandOrdering(value as never),
+  },
+  {
+    id: "quoteForDeploymentDecision",
+    name: "quoteForDeploymentDecision",
+    valid: validBand,
+    argumentIsData: true,
+    drive: (value) => quoteForDeploymentDecision(value as never),
+  },
+  {
+    id: "replayPathEconomics",
+    name: "replayPathEconomics",
+    valid: () => [SIMULATED_FILL()],
+    argumentIsData: true,
+    drive: (value) => replayPathEconomics(value as never),
+  },
+  {
+    id: "computeFee",
+    name: "computeFee",
+    valid: () => ({
+      shares: "10",
+      price: "0.5",
+      liquidityRole: "TAKER",
+      snapshot: FEE_SNAPSHOT(),
+    }),
+    argumentIsData: false,
+    drive: (value) => computeFee(value as never),
+  },
+  {
+    id: "consumeDepth",
+    name: "consumeDepth",
+    valid: () => ({
+      ladder: [{ price: "0.5", size: "100" }],
+      action: "BUY",
+      limitPrice: "0.6",
+      shares: "10",
+    }),
+    argumentIsData: false,
+    drive: (value) => consumeDepth(value as never),
+  },
+  {
+    id: "sizeAtPrice",
+    name: "sizeAtPrice",
+    valid: () => [{ price: "0.5", size: "100" }],
+    argumentIsData: true,
+    drive: (value) => sizeAtPrice(value as never, "0.5"),
+  },
+  {
+    id: "tier0Immediate",
+    name: "tier0Immediate",
+    valid: () => ({
+      model: TIER_0_MODEL(),
+      book: BOOK_PORT,
+      simulatedOrderId: "o-1",
+      marketId: "m-1",
+      side: "YES",
+      action: "BUY",
+      limitPrice: "0.6",
+      shares: "10",
+      feeSnapshot: FEE_SNAPSHOT(),
+      atEvent: AT_EVENT(),
+    }),
+    argumentIsData: false,
+    drive: (value) => tier0Immediate(value as never),
+  },
+  {
+    id: "tier0Maker",
+    name: "tier0Maker",
+    valid: () => ({
+      model: TIER_0_MODEL(),
+      simulatedOrderId: "o-1",
+      marketId: "m-1",
+      tokenId: "1234",
+      side: "YES",
+      action: "BUY",
+      restingPrice: "0.5",
+      remainingShares: "10",
+      observedTradePrice: "0.5",
+      feeSnapshot: FEE_SNAPSHOT(),
+      atEvent: AT_EVENT(),
+    }),
+    argumentIsData: false,
+    drive: (value) => tier0Maker(value as never),
+  },
+  {
+    id: "tier1Immediate",
+    name: "tier1Immediate",
+    valid: () => ({
+      model: TIER_1_MODEL(),
+      timeline: {
+        bookAt: () => ({ book: BOOK_PORT, atEvent: AT_EVENT() }),
+      },
+      latencyModel: LATENCY_MODEL(),
+      streams: deriveStreams("42"),
+      simulatedOrderId: "o-1",
+      marketId: "m-1",
+      side: "YES",
+      action: "BUY",
+      limitPrice: "0.6",
+      shares: "10",
+      timeInForce: "GTC",
+      postOnly: false,
+      submittedAtNs: 1000n,
+      market: {
+        marketId: "m-1",
+        tickSize: "0.01",
+        minimumOrderSize: "1",
+        secondsDelay: 0,
+        parametersVersion: 1,
+      },
+      feeSnapshot: FEE_SNAPSHOT(),
+    }),
+    argumentIsData: false,
+    notData: {
+      streams:
+        "SeededStream INSTANCES — a stream is code with state (its position advances), not data",
+    },
+    drive: (value) => tier1Immediate(value as never),
+  },
+  {
+    id: "computeMarkouts",
+    name: "computeMarkouts",
+    valid: () => ({
+      fill: SIMULATED_FILL(),
+      filledAtNs: 1000n,
+      midTimeline: { midAt: () => ({ mid: "0.4", atEvent: AT_EVENT() }) },
+      resolutionValuePerShare: "1",
+      horizons: [{ label: "1s", milliseconds: 1000 }],
+    }),
+    argumentIsData: false,
+    drive: (value) => computeMarkouts(value as never),
+  },
+  {
+    id: "markoutStressScenario",
+    name: "markoutStressScenario",
+    valid: () => ({
+      scenarioName: "s",
+      horizon: "1s",
+      fills: [SIMULATED_FILL()],
+      diagnostics: [MARKOUT_DIAGNOSTIC()],
+    }),
+    argumentIsData: false,
+    drive: (value) => markoutStressScenario(value as never),
+  },
+  {
+    id: "createReplayClock",
+    name: "createReplayClock",
+    valid: () => ({ receivedAt: "2026-01-01T00:00:00.000Z", receivedMonotonicNs: "1000" }),
+    argumentIsData: true,
+    drive: (value) => createReplayClock(value as never),
+  },
+  {
+    id: "deriveReplayEventId",
+    name: "deriveReplayEventId",
+    valid: () => ({
+      gatewayEpoch: "0190a3e0-0000-7000-8000-000000000001",
+      ingestSeq: "1",
+      receivedAt: "2026-01-01T00:00:00.000Z",
+      index: 0,
+    }),
+    argumentIsData: true,
+    drive: (value) => deriveReplayEventId(sha256Hex, value as never),
+  },
+  {
+    id: "reconcileRunPins (the run's pin set)",
+    name: "reconcileRunPins",
+    valid: () => runPins(),
+    argumentIsData: true,
+    drive: (value) => reconcileRunPins(manifestFixture(), value as ReplayRunPins),
+  },
+  {
+    id: "reconcileRunPins (the manifest's pins)",
+    name: "reconcileRunPins",
+    valid: () => ({ pins: manifestPinsFixture() }),
+    argumentIsData: false,
+    drive: (value) => reconcileRunPins(value as never, runPins()),
+  },
 ];
+
+function manifestPinsFixture(): Record<string, unknown> {
+  const pins = runPins();
+  return {
+    normalizerVersion: pins.normalizerVersion,
+    featureSetVersion: pins.featureSetVersion,
+    runSeed: pins.runSeed,
+    fillModelVersion: pins.fillModelVersion,
+    latencyModelVersion: pins.latencyModelVersion,
+    feeSnapshotVersion: pins.feeSnapshotVersion,
+    rewardSnapshotVersion: pins.rewardSnapshotVersion,
+    settlementSpecVersions: [...pins.settlementSpecVersions],
+  };
+}
+
+function manifestFixture(): never {
+  return { pins: manifestPinsFixture() } as never;
+}
+
+/**
+ * Doors that take NO caller data record, and what their argument is instead.
+ *
+ * `plain.ts`'s rule is about DATA. A port's contract IS its methods, a function
+ * cannot be copied, and bytes are read by `strict-json.ts` — which is itself the
+ * D1 reader and builds a prototype-free tree as it parses. Each entry states
+ * which of those it is, so the classification is a claim a reviewer can check
+ * rather than a place to hide a door.
+ */
+const NON_RECORD_DOORS: Readonly<Record<string, string>> = Object.freeze({
+  decodeUtf8Strict: "BYTES — a Uint8Array; there is no record to materialize",
+  encodeUtf8Strict: "a PRIMITIVE string",
+  loadDataset:
+    "an options bag of PORTS and FUNCTIONS (archive reader, SHA-256 digest); its `dataset` is the OUTPUT of `readDatasetManifestText`, and every decoded row goes through `materializeInput` in `event-source.ts`",
+  materializeInput: "IS D1 — the reader every other door's record goes through",
+  parseStrictJsonBytes: "BYTES — the ADR-017 §3 reader; it BUILDS a prototype-free tree as it parses",
+  parseStrictJsonText: "TEXT — as above",
+  readDatasetManifestBytes: "BYTES — read by `parseStrictJsonBytes`, then validated field by field",
+  readDatasetManifestText: "TEXT — as above",
+  readRoundingMode: "a PRIMITIVE — one member of a closed vocabulary",
+  roundDecimal: "PRIMITIVES — a decimal string, a place count and a rounding mode",
+  runEventSource:
+    "an options bag of PORTS (event source, normalizer, clock) and FUNCTIONS; the rows are materialized in `event-source.ts`",
+  runReplay:
+    "an options bag of PORTS and FUNCTIONS (dataset archive, digest, normalizer, core loop); every record it produces is emitted by a door in this table",
+  sumFees: "an array of PRIMITIVE amounts, each read once and validated before it is added",
+  totally: "a label and a FUNCTION — the totality guard itself",
+});
+
+describe("the record-door table is DERIVED, not maintained (round-3 review, LOW-1)", () => {
+  it("partitions the whole export surface: a tenth door cannot be added unclassified", () => {
+    // THE MECHANISM. Round 3: the old table was hand-written and checked by
+    // list equality against five names, so nothing detected a tenth door — the
+    // four the review found were doors nobody had listed. Here the three lists
+    // must PARTITION the exported functions exactly:
+    //
+    //   record doors  ∪  non-record doors  ∪  pure helpers  =  every export
+    //
+    // so a new export fails this test until it is classified, and classifying
+    // it as a record door subscribes it to the whole nested battery below.
+    const exported = simulation as unknown as Record<string, unknown>;
+    const functions = Object.keys(exported)
+      .filter((name) => typeof exported[name] === "function")
+      .filter(
+        (name) => !/^class[\s{]/u.test(Function.prototype.toString.call(exported[name])),
+      )
+      .sort();
+
+    const recordDoorNames = new Set(RECORD_DOORS.map((door) => door.name));
+    const nonRecordDoorNames = new Set(Object.keys(NON_RECORD_DOORS));
+    const pureHelperNames = new Set(Object.keys(PURE_HELPERS));
+
+    const unclassified: string[] = [];
+    const doubleClassified: string[] = [];
+    for (const name of functions) {
+      const memberships = [
+        recordDoorNames.has(name) ? "record door" : undefined,
+        nonRecordDoorNames.has(name) ? "non-record door" : undefined,
+        pureHelperNames.has(name) ? "pure helper" : undefined,
+      ].filter((entry): entry is string => entry !== undefined);
+      if (memberships.length === 0) unclassified.push(name);
+      if (memberships.length > 1) doubleClassified.push(`${name}: ${memberships.join(" and ")}`);
+    }
+    expect(
+      unclassified,
+      `these exports are classified nowhere — add each to RECORD_DOORS with a valid example (which subscribes it to the hostility battery), or to NON_RECORD_DOORS / PURE_HELPERS with the reason:\n${unclassified.join("\n")}`,
+    ).toEqual([]);
+    expect(doubleClassified, doubleClassified.join("\n")).toEqual([]);
+
+    // …and no list carries a name that is no longer exported.
+    const stale: string[] = [];
+    for (const [label, names] of [
+      ["RECORD_DOORS", recordDoorNames],
+      ["NON_RECORD_DOORS", nonRecordDoorNames],
+      ["PURE_HELPERS", pureHelperNames],
+    ] as const) {
+      for (const name of names) {
+        if (!functions.includes(name)) stale.push(`${label} lists ${name}, which is not exported`);
+      }
+    }
+    expect(stale, stale.join("\n")).toEqual([]);
+  });
+
+  it("derives at least one record position for every record door", () => {
+    const faults: string[] = [];
+    for (const door of RECORD_DOORS) {
+      const paths = deriveRecordPaths(door);
+      if (paths.length === 0) faults.push(`${door.id}: the walker found no data position`);
+    }
+    expect(faults, faults.join("\n")).toEqual([]);
+  });
+
+  it("every declared non-data member is a real member, with a reason", () => {
+    // The one hand-maintained part is kept honest: a `notData` entry naming a
+    // member the fixture no longer has would silently stop excluding anything.
+    const faults: string[] = [];
+    for (const door of RECORD_DOORS) {
+      for (const [path, reason] of Object.entries(door.notData ?? {})) {
+        if (reason.trim() === "") faults.push(`${door.id}: ${path} has no reason`);
+        if (navigate(door.valid(), path.split(".")) === undefined) {
+          faults.push(`${door.id}: notData names ${path}, which the fixture does not have`);
+        }
+      }
+    }
+    expect(faults, faults.join("\n")).toEqual([]);
+  });
+});
 
 describe("D1: a door materializes its caller record before it touches it", () => {
   it("every record door ACCEPTS its valid example (the probes below are not vacuous)", () => {
@@ -880,127 +1535,118 @@ describe("D1: a door materializes its caller record before it touches it", () =>
     for (const door of RECORD_DOORS) {
       const outcome = door.drive(door.valid());
       if (!outcome.ok) {
-        faults.push(`${door.name}: ${outcome.refusal.code}: ${outcome.refusal.message}`);
+        faults.push(`${door.id}: ${outcome.refusal.code}: ${outcome.refusal.message}`);
       }
     }
     expect(faults, faults.join("\n")).toEqual([]);
-    // Every door the round-2 review named, plus the fifth instance of the same
-    // pattern it did not, is in the table — so the probes below cover all five.
-    expect(RECORD_DOORS.map((door) => door.name).sort()).toEqual([
-      "readFeeScheduleSnapshot",
-      "readLatencyDistribution",
-      "readLatencyModel",
-      "readQueueModelParameters",
-      "readRunPins",
-    ]);
   });
 
-  it("REFUSES a cyclic argument, typed, instead of exhausting the stack", () => {
+  it("REFUSES every hostility class, at every record it claims, NESTED", () => {
     // Faults are COLLECTED, not asserted inside the loop: a bare `expect` throws
     // on the first door and the remaining ones are never measured, so a
-    // regression in the fifth door would hide behind a regression in the first.
-    // Every door below is driven on every run.
+    // regression in the twentieth door would hide behind one in the first.
     const faults: string[] = [];
+    let probes = 0;
     for (const door of RECORD_DOORS) {
-      const cyclic = door.valid() as Record<string, unknown>;
-      cyclic["self"] = cyclic;
-      let outcome: SimulationResult<unknown> | undefined;
-      let thrown: unknown;
-      try {
-        outcome = door.drive(cyclic);
-      } catch (cause) {
-        thrown = cause;
-      }
-      if (thrown !== undefined) {
-        faults.push(`${door.name}: threw ${String(thrown)}`);
-        continue;
-      }
-      if (outcome === undefined || outcome.ok) {
-        faults.push(`${door.name}: accepted a cyclic record`);
-        continue;
-      }
-      if (outcome.refusal.code !== "SIMULATION_INPUT_NOT_DATA") {
-        faults.push(`${door.name}: refused with ${outcome.refusal.code}`);
-      }
-      if (!outcome.refusal.message.includes("cycle")) {
-        faults.push(`${door.name}: did not name the cycle — ${outcome.refusal.message}`);
+      for (const path of deriveRecordPaths(door)) {
+        for (const hostility of HOSTILITY_CLASSES) {
+          probes += 1;
+          const before = nestedGettersInvoked;
+          const argument = door.valid();
+          const planted = plantAt(argument, path, hostility.build());
+          if (planted !== null) {
+            faults.push(`${door.id} at ${describePath(path)}: ${planted}`);
+            continue;
+          }
+          let outcome: SimulationResult<unknown> | undefined;
+          let thrown: unknown;
+          try {
+            outcome = door.drive(argument);
+          } catch (cause) {
+            thrown = cause;
+          }
+          const where = `${door.id} at ${describePath(path)} with ${hostility.name}`;
+          if (nestedGettersInvoked !== before) {
+            faults.push(`${where}: INVOKED the nested getter`);
+          }
+          if (thrown !== undefined) {
+            faults.push(`${where}: threw ${String(thrown)}`);
+            continue;
+          }
+          if (outcome === undefined || outcome.ok) {
+            faults.push(`${where}: ACCEPTED it`);
+            continue;
+          }
+          if (outcome.refusal.code !== "SIMULATION_INPUT_NOT_DATA") {
+            faults.push(`${where}: refused with ${outcome.refusal.code}`);
+            continue;
+          }
+          if (hostility.named !== "" && !outcome.refusal.message.includes(hostility.named)) {
+            faults.push(`${where}: did not name it — ${outcome.refusal.message}`);
+          }
+        }
       }
     }
     expect(faults, faults.join("\n")).toEqual([]);
+    // Not vacuous: every door × every DERIVED record position × every class
+    // really ran, and the walker found far more positions than the round-2
+    // table listed by hand (5 doors, one position each).
+    expect(probes).toBe(
+      RECORD_DOORS.reduce((total, door) => total + deriveRecordPaths(door).length, 0) *
+        HOSTILITY_CLASSES.length,
+    );
+    expect(probes).toBeGreaterThan(150);
   });
 
-  it("REFUSES a nested cycle — the guard is on the whole tree, not the root", () => {
-    const nested = { samples: [{ milliseconds: 1, weight: 1 }] } as Record<string, unknown>;
-    const inner = { deeper: {} } as Record<string, unknown>;
-    inner["deeper"] = inner;
-    nested["extra"] = inner;
-    const outcome = readLatencyDistribution(nested as unknown as LatencyDistribution, "decision");
-    expect(outcome.ok).toBe(false);
-    if (outcome.ok) return;
-    expect(outcome.refusal.code).toBe("SIMULATION_INPUT_NOT_DATA");
-  });
-
-  it("REFUSES a getter-bearing argument WITHOUT INVOKING the getter", () => {
+  it("REFUSES the same three classes at the ROOT of each record", () => {
+    // The round-2 shape, kept: hostility planted ON the record rather than
+    // inside it. Both are measured because they fail differently — a door that
+    // checks `typeof input.order === "object"` before materializing would pass
+    // one and not the other.
     const faults: string[] = [];
     for (const door of RECORD_DOORS) {
-      let invoked = 0;
-      const hostile = door.valid() as Record<string, unknown>;
-      Object.defineProperty(hostile, "hostile", {
-        get: () => {
-          invoked += 1;
-          return "value";
-        },
-        enumerable: true,
-        configurable: true,
-      });
-      let outcome: SimulationResult<unknown> | undefined;
-      let thrown: unknown;
-      try {
-        outcome = door.drive(hostile);
-      } catch (cause) {
-        thrown = cause;
-      }
-      if (invoked !== 0) faults.push(`${door.name}: INVOKED the getter ${String(invoked)}x`);
-      if (thrown !== undefined) {
-        faults.push(`${door.name}: threw ${String(thrown)}`);
-        continue;
-      }
-      if (outcome === undefined || outcome.ok) {
-        faults.push(`${door.name}: accepted an accessor-bearing record`);
-        continue;
-      }
-      if (outcome.refusal.code !== "SIMULATION_INPUT_NOT_DATA") {
-        faults.push(`${door.name}: refused with ${outcome.refusal.code}`);
-      }
-      if (!outcome.refusal.message.includes("accessor")) {
-        faults.push(`${door.name}: did not name the accessor — ${outcome.refusal.message}`);
-      }
-    }
-    expect(faults, faults.join("\n")).toEqual([]);
-  });
-
-  it("REFUSES an argument nested past MAX_INPUT_DEPTH", () => {
-    const faults: string[] = [];
-    for (const door of RECORD_DOORS) {
-      const deep = door.valid() as Record<string, unknown>;
-      deep["extra"] = deeplyNestedRecord(MAX_INPUT_DEPTH + 8);
-      let outcome: SimulationResult<unknown> | undefined;
-      let thrown: unknown;
-      try {
-        outcome = door.drive(deep);
-      } catch (cause) {
-        thrown = cause;
-      }
-      if (thrown !== undefined) {
-        faults.push(`${door.name}: threw ${String(thrown)}`);
-        continue;
-      }
-      if (outcome === undefined || outcome.ok) {
-        faults.push(`${door.name}: accepted an over-deep record`);
-        continue;
-      }
-      if (outcome.refusal.code !== "SIMULATION_INPUT_NOT_DATA") {
-        faults.push(`${door.name}: refused with ${outcome.refusal.code}`);
+      for (const path of deriveRecordPaths(door)) {
+        for (const hostility of HOSTILITY_CLASSES) {
+          const before = nestedGettersInvoked;
+          const argument = door.valid();
+          const target = navigate(argument, path);
+          if (target === null || typeof target !== "object") {
+            faults.push(`${door.id}: ${describePath(path)} is not reachable`);
+            continue;
+          }
+          // The hostility's own members, spread ONTO the record rather than
+          // planted inside it: `{ nested: … }` becomes the record's own key.
+          const built = hostility.build() as Record<string, unknown>;
+          const host = target as Record<string, unknown>;
+          for (const key of Object.keys(built)) {
+            Object.defineProperty(host, key, {
+              value: built[key],
+              enumerable: true,
+              writable: true,
+              configurable: true,
+            });
+          }
+          let outcome: SimulationResult<unknown> | undefined;
+          let thrown: unknown;
+          try {
+            outcome = door.drive(argument);
+          } catch (cause) {
+            thrown = cause;
+          }
+          const where = `${door.id} at ${describePath(path)} (root) with ${hostility.name}`;
+          if (nestedGettersInvoked !== before) faults.push(`${where}: INVOKED the getter`);
+          if (thrown !== undefined) {
+            faults.push(`${where}: threw ${String(thrown)}`);
+            continue;
+          }
+          if (outcome === undefined || outcome.ok) {
+            faults.push(`${where}: ACCEPTED it`);
+            continue;
+          }
+          if (outcome.refusal.code !== "SIMULATION_INPUT_NOT_DATA") {
+            faults.push(`${where}: refused with ${outcome.refusal.code}`);
+          }
+        }
       }
     }
     expect(faults, faults.join("\n")).toEqual([]);
@@ -1010,21 +1656,84 @@ describe("D1: a door materializes its caller record before it touches it", () =>
     // D4 on the way out, and the reason D1 has to happen on the way in: the
     // emitted value must not be the caller's object, or a later mutation of the
     // caller's object would change a value this package already answered with.
+    // Round-3 review MEDIUM-1 found `checkBandOrdering`'s OK path returning an
+    // unfrozen, prototype-bearing ALIAS — so a band could pass the check and
+    // serialize as something else.
     const faults: string[] = [];
     for (const door of RECORD_DOORS) {
-      const offered = door.valid() as Record<string, unknown>;
+      const offered = door.valid();
       const outcome = door.drive(offered);
       if (!outcome.ok) {
-        faults.push(`${door.name}: ${outcome.refusal.code}: ${outcome.refusal.message}`);
+        faults.push(`${door.id}: ${outcome.refusal.code}: ${outcome.refusal.message}`);
         continue;
       }
-      if (outcome.value === offered) faults.push(`${door.name}: emitted the caller's own object`);
-      if (Object.getPrototypeOf(outcome.value as object) !== null) {
-        faults.push(`${door.name}: emitted a value with a prototype`);
+      const emitted: unknown = outcome.value;
+      if (emitted === offered) faults.push(`${door.id}: emitted the caller's own object`);
+      if (emitted === null || typeof emitted !== "object") continue;
+      // A door that answers a PRIMITIVE (a size, an id) has nothing to alias.
+      if (Object.getPrototypeOf(emitted) !== null && !(emitted instanceof ReplayClock)) {
+        faults.push(`${door.id}: emitted a value with a prototype`);
       }
-      if (!Object.isFrozen(outcome.value)) faults.push(`${door.name}: emitted an unfrozen value`);
+      if (!Object.isFrozen(emitted) && !(emitted instanceof ReplayClock)) {
+        faults.push(`${door.id}: emitted an unfrozen value`);
+      }
     }
     expect(faults, faults.join("\n")).toEqual([]);
+  });
+
+  it("a lying accessor cannot be checked as one value and used as another", () => {
+    // The round-3 probe, kept as a regression: an accessor on the band's
+    // `conservative` member that answers honestly while `checkBandOrdering`
+    // reads it and differently afterwards. At `b0aeb28` the check ACCEPTED and
+    // `serializeBand` on the RETURNED CHECKED VALUE printed
+    // `conservative[ filled=999 remaining=0 … ]` for a 50-share order.
+    const honest = validBand()["conservative"] as Record<string, unknown>;
+    const lying = { ...honest, filledShares: "999", remainingShares: "0", fills: [] };
+    let reads = 0;
+    const hostile = validBand();
+    delete hostile["conservative"];
+    Object.defineProperty(hostile, "conservative", {
+      get: () => {
+        reads += 1;
+        return reads <= 2 ? honest : lying;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const checked = checkBandOrdering(hostile as never);
+    const serialized = checked.ok ? serializeBand(checked.value) : "(refused)";
+    expect(checked.ok).toBe(false);
+    expect(reads).toBe(0);
+    expect(serialized).toBe("(refused)");
+    if (checked.ok) return;
+    expect(checked.refusal.code).toBe("SIMULATION_INPUT_NOT_DATA");
+  });
+
+  it("a lying accessor cannot pass simulateResting's own size check and then be computed over", () => {
+    // The queueAhead TOCTOU, kept as a regression. At `b0aeb28` this produced
+    // an ACCEPTED band serializing as valid v3 bytes with `queueAhead=0`.
+    let reads = 0;
+    const order = RESTING_ORDER();
+    delete order["queueAheadAtPlacement"];
+    Object.defineProperty(order, "queueAheadAtPlacement", {
+      get: () => {
+        reads += 1;
+        return reads <= 1 ? "10" : "0";
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    const outcome = simulateResting({
+      model: TIER_1_MODEL() as never,
+      order: order as never,
+      trades: [OBSERVED_TRADE()] as never,
+      parameters: QUEUE_PARAMETERS() as never,
+      feeSnapshot: FEE_SNAPSHOT() as never,
+    });
+    expect(outcome.ok).toBe(false);
+    expect(reads).toBe(0);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("SIMULATION_INPUT_NOT_DATA");
   });
 
   it("readRunPins is STRICT: an unknown key is refused, never carried (L6)", () => {
@@ -1067,4 +1776,55 @@ describe("D1: a door materializes its caller record before it touches it", () =>
     // escapes". The doors that must not invoke one are pinned above, by name.
     expect(gettersInvoked).toBeGreaterThan(0);
   });
+
+  it("NO nested getter was invoked anywhere in this file", () => {
+    // The stronger claim, over every probe above: a getter planted INSIDE a
+    // caller record was never once run — not by a record door, and not by the
+    // whole-surface reflection battery either.
+    expect(nestedGettersInvoked).toBe(0);
+  });
 });
+
+// ---------------------------------------------------------------------------
+// Planting helpers
+// ---------------------------------------------------------------------------
+
+/** Walks a path into an argument. `undefined` when the path does not exist. */
+function navigate(root: unknown, path: RecordPath): unknown {
+  let node: unknown = root;
+  for (const key of path) {
+    if (node === null || typeof node !== "object") return undefined;
+    node = (node as Record<string, unknown>)[key];
+  }
+  return node;
+}
+
+/**
+ * Plants a hostile value INSIDE the record at `path`. Returns a fault string
+ * when the path could not be reached, so a stale path fails loudly rather than
+ * making a probe vacuous.
+ */
+function plantAt(root: unknown, path: RecordPath, hostile: unknown): string | null {
+  const target = navigate(root, path);
+  if (target === null || typeof target !== "object") {
+    return `${describePath(path)} is not a record or array`;
+  }
+  if (Array.isArray(target)) {
+    // PUSHED, not defined by name: a named property on an array is refused as
+    // "not indexed data", which would refuse for the wrong reason and stop
+    // measuring whether the hostility itself is caught.
+    (target as unknown[]).push(hostile);
+    return null;
+  }
+  Object.defineProperty(target, "plantedByTheBattery", {
+    value: hostile,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+  return null;
+}
+
+function describePath(path: RecordPath): string {
+  return path.length === 0 ? "the argument itself" : path.join(".");
+}

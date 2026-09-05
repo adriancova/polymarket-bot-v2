@@ -35,7 +35,7 @@
 
 import { addDecimal, compareDecimal, isCanonicalDecimalString, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
 
-import { ownFrozenTree } from "./plain.js";
+import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import type {
   BookLevelView,
   FillFactView,
@@ -142,13 +142,23 @@ export function quoteForDeploymentDecision<
   result: TResult["model"]["deploymentDecisionUse"] extends "FORBIDDEN" ? never : TResult,
 ): SimulationResult<TResult> {
   return totally("quoting a simulated result for a deployment decision", () => {
-    if (result === null || typeof result !== "object") {
+    // D1 (round-3 review, MEDIUM-1). This is the EVIDENCE GATE, so it is the
+    // last door that may check one value and hand back another: it reads the
+    // caller's result eleven times (`model`, `deploymentDecisionUse`, and every
+    // field `isThreeScenarioBand` inspects), and it used to return the caller's
+    // own object. A lying accessor could therefore present a band to the check
+    // and a single number to whoever quoted the result — exactly what ADR-012 §1
+    // forbids. The checked tree and the quoted tree are now the same frozen one.
+    const read = readOwnPlainInput<TResult>(result, "the result being quoted");
+    if (!read.ok) return read;
+    const quoted = read.value;
+    if (quoted === null || typeof quoted !== "object") {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "a quotable result must be a record carrying the model that produced it",
       );
     }
-    const model: FillModelIdentity | undefined = result.model;
+    const model: FillModelIdentity | undefined = quoted.model;
     if (model === null || typeof model !== "object") {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
@@ -162,14 +172,14 @@ export function quoteForDeploymentDecision<
         { tier: String(model.tier), permittedUse: String(model.permittedUse) },
       );
     }
-    if (model.tier === "TIER_1" && !isThreeScenarioBand(result)) {
+    if (model.tier === "TIER_1" && !isThreeScenarioBand(quoted)) {
       return simulationFailure(
         "FILL_MODEL_BAND_INCONSISTENT",
         "a Tier-1 result quoted for a deployment decision must BE the band: ADR-012 §1 — 'A Tier 1 result that is quoted as a single number instead of a band has already violated this ADR'",
         { tier: String(model.tier), permittedUse: String(model.permittedUse) },
       );
     }
-    return simulationOk(result);
+    return simulationOk(ownFrozenTree(quoted));
   });
 }
 
@@ -246,7 +256,17 @@ function consumeDepthInner(input: {
   readonly limitPrice: string;
   readonly shares: string;
 }): SimulationResult<DepthConsumption> {
-  const { ladder, action, limitPrice, shares } = input;
+  const { ladder: offeredLadder, action, limitPrice, shares } = input;
+  // D1 (round-3 review, MEDIUM-1, same class): a ladder is the ANSWER of a
+  // `BookView` PORT, but what it hands back is DATA — and the walk below reads
+  // each level's `price` six times (validate, order-check, limit-check, record,
+  // multiply) and its `size` twice. An accessor level could therefore be
+  // validated as one price and BOOKED at another, putting a price no check ever
+  // saw into a fill and into the §12.4 bytes. The port is not materialized; its
+  // answer is.
+  const read = readOwnPlainInput<readonly BookLevelView[]>(offeredLadder, "the ladder");
+  if (!read.ok) return read;
+  const ladder = read.value;
   if (!Array.isArray(ladder)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
@@ -275,39 +295,45 @@ function consumeDepthInner(input: {
   let previousPrice: string | undefined;
 
   for (const level of ladder) {
-    if (!isCanonicalDecimalString(level.price) || !isCanonicalDecimalString(level.size)) {
+    if (level === null || typeof level !== "object") {
+      return simulationFailure("SIMULATION_INPUT_INVALID", "a book level is not a record");
+    }
+    // One read per field, from the materialized tree, for the whole walk.
+    const price = level.price;
+    const size = level.size;
+    if (!isCanonicalDecimalString(price) || !isCanonicalDecimalString(size)) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "a book level carries a non-canonical decimal; a malformed level is refused rather than skipped",
-        { price: String(level.price), size: String(level.size) },
+        { price: String(price), size: String(size) },
       );
     }
-    if (compareDecimal(level.size, "0") <= 0) {
+    if (compareDecimal(size, "0") <= 0) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "a book level carries a non-positive size; an aggregate level of size 0 is a removed level and must not be in the ladder (ADR-013)",
-        { price: level.price, size: level.size },
+        { price, size },
       );
     }
     if (previousPrice !== undefined) {
       const ordered =
         action === "BUY"
-          ? compareDecimal(level.price, previousPrice) > 0
-          : compareDecimal(level.price, previousPrice) < 0;
+          ? compareDecimal(price, previousPrice) > 0
+          : compareDecimal(price, previousPrice) < 0;
       if (!ordered) {
         return simulationFailure(
           "SIMULATION_INPUT_INVALID",
           "the ladder is not strictly best-first; a fill model that consumed an unordered ladder would invent price improvement",
-          { price: level.price, previousPrice },
+          { price, previousPrice },
         );
       }
     }
-    previousPrice = level.price;
+    previousPrice = price;
 
     const withinLimit =
       action === "BUY"
-        ? compareDecimal(level.price, limitPrice) <= 0
-        : compareDecimal(level.price, limitPrice) >= 0;
+        ? compareDecimal(price, limitPrice) <= 0
+        : compareDecimal(price, limitPrice) >= 0;
     // Checked BEFORE the limit test: an order that is already fully filled did
     // not stop at its limit price, it stopped because it was done. The other
     // order round-1 review probe P6 found reports `stoppedAtLimit` on a complete
@@ -318,9 +344,9 @@ function consumeDepthInner(input: {
       break;
     }
 
-    const take = compareDecimal(level.size, remaining) <= 0 ? level.size : remaining;
-    matched.push({ price: level.price, shares: take });
-    notional = addDecimal(notional, mulDecimal(level.price, take));
+    const take = compareDecimal(size, remaining) <= 0 ? size : remaining;
+    matched.push({ price, shares: take });
+    notional = addDecimal(notional, mulDecimal(price, take));
     remaining = subDecimal(remaining, take);
   }
 
@@ -389,9 +415,14 @@ export function toFillFact(
  * invariant 4's traceability chain is supposed to carry.
  */
 export function sizeAtPrice(
-  ladder: readonly BookLevelView[],
+  offeredLadder: readonly BookLevelView[],
   price: string,
 ): SimulationResult<string> {
+  // D1, for the same reason as `consumeDepth` (round-3 review, MEDIUM-1): the
+  // port's ANSWER is data and each level is read twice below.
+  const read = readOwnPlainInput<readonly BookLevelView[]>(offeredLadder, "the ladder");
+  if (!read.ok) return read;
+  const ladder = read.value;
   // `compareDecimal` THROWS on a value that is not a canonical decimal string,
   // so a door that documents typed refusals validates first (ADR-020 §6's "no
   // throw escapes"; the same class the round-1 review found here).
@@ -413,14 +444,16 @@ export function sizeAtPrice(
     if (level === null || typeof level !== "object") {
       return simulationFailure("SIMULATION_INPUT_INVALID", "a book level is not a record");
     }
-    if (!isCanonicalDecimalString(level.price) || !isCanonicalDecimalString(level.size)) {
+    const levelPrice = level.price;
+    const levelSize = level.size;
+    if (!isCanonicalDecimalString(levelPrice) || !isCanonicalDecimalString(levelSize)) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "a book level carries a non-canonical decimal; a malformed level is refused rather than skipped",
-        { price: String(level.price), size: String(level.size) },
+        { price: String(levelPrice), size: String(levelSize) },
       );
     }
-    if (compareDecimal(level.price, price) === 0) total = addDecimal(total, level.size);
+    if (compareDecimal(levelPrice, price) === 0) total = addDecimal(total, levelSize);
   }
   return simulationOk(total);
 }

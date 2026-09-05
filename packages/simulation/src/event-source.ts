@@ -64,7 +64,7 @@ import {
   readField,
 } from "./grammar.js";
 import { createReplayClock, type ReplayClock } from "./clock.js";
-import { materializeInput, ownFrozenTree } from "./plain.js";
+import { materializeInput, ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import type { ReplayDataset } from "./manifest.js";
 import type { EventEnvelope, MarketEventSource, RecordedEventIdentity } from "./ports.js";
 import {
@@ -144,13 +144,25 @@ export interface RecordedFrame {
  */
 export function deriveReplayEventId(
   digest: Sha256HexDigest,
-  input: {
+  offered: {
     readonly gatewayEpoch: string;
     readonly ingestSeq: string;
     readonly receivedAt: string;
     readonly index: number;
   },
 ): SimulationResult<string> {
+  // D1 (round-3 review, MEDIUM-1): the identity is a CALLER RECORD, and every
+  // field is read twice below — once to validate and once to build the seed the
+  // event id is derived FROM. `digest` is a PORT (a function), so it is not
+  // data and is not materialized.
+  const read = readOwnPlainInput<{
+    readonly gatewayEpoch: string;
+    readonly ingestSeq: string;
+    readonly receivedAt: string;
+    readonly index: number;
+  }>(offered, "the recorded identity");
+  if (!read.ok) return read;
+  const input = read.value;
   if (input === null || typeof input !== "object") {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",

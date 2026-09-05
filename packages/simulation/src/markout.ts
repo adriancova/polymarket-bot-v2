@@ -39,7 +39,7 @@
 
 import { addDecimal, compareDecimal, isCanonicalDecimalString, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
 
-import { ownFrozenTree } from "./plain.js";
+import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import type { RecordedEventIdentity } from "./ports.js";
 import type { SimulatedFill } from "./fill-model.js";
 import { simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
@@ -126,7 +126,17 @@ function computeMarkoutsInner(input: {
   readonly resolutionValuePerShare?: string;
   readonly horizons?: readonly MarkoutHorizon[];
 }): SimulationResult<MarkoutDiagnostics> {
-  const fill = input.fill;
+  // D1 + one read per field (round-3 review, MEDIUM-1). `fill` is a CALLER
+  // RECORD whose `price`, `shares`, `marketId`, `tokenId`, `action` and
+  // `simulatedFillId` are each read repeatedly below and again inside
+  // `observationAt`. `midTimeline` is a PORT — its contract is `midAt` — so it
+  // is read once and called, never materialized.
+  const { fill: offeredFill, filledAtNs, midTimeline } = input;
+  const { resolutionValuePerShare, horizons: offeredHorizons } = input;
+
+  const read = readOwnPlainInput<SimulatedFill>(offeredFill, "the fill");
+  if (!read.ok) return read;
+  const fill = read.value;
   if (fill === null || typeof fill !== "object") {
     return simulationFailure("SIMULATION_INPUT_INVALID", "a markout is computed about one fill");
   }
@@ -137,24 +147,47 @@ function computeMarkoutsInner(input: {
       { price: String(fill.price), shares: String(fill.shares) },
     );
   }
-  if (typeof input.filledAtNs !== "bigint") {
+  if (typeof filledAtNs !== "bigint") {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "a markout is anchored to the recorded monotonic instant of the fill (§7.1)",
     );
   }
-  const horizons = input.horizons ?? MARKOUT_HORIZONS;
-  const direction = input.fill.action === "BUY" ? 1 : -1;
+  if (midTimeline === null || typeof midTimeline !== "object" || typeof midTimeline.midAt !== "function") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a markout reads the recorded mid path through a MidTimeline port",
+    );
+  }
+  const readHorizons = readOwnPlainInput<readonly MarkoutHorizon[]>(
+    offeredHorizons ?? MARKOUT_HORIZONS,
+    "the markout horizons",
+  );
+  if (!readHorizons.ok) return readHorizons;
+  const horizons = readHorizons.value;
+  if (!Array.isArray(horizons)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "the §12.3 horizons are an array of `{ label, milliseconds }` records",
+    );
+  }
+  const direction = fill.action === "BUY" ? 1 : -1;
   const observations: MarkoutObservation[] = [];
 
   for (const horizon of horizons) {
+    if (horizon === null || typeof horizon !== "object" || typeof horizon.label !== "string") {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a markout horizon carries a label and its milliseconds (`null` for resolution)",
+      );
+    }
     if (horizon.milliseconds === null) {
-      const settled = input.resolutionValuePerShare;
+      const settled = resolutionValuePerShare;
       if (settled === undefined) {
         return simulationFailure(
           "MARKOUT_HORIZON_UNOBSERVED",
           "the resolution horizon needs the settled value of one share, and none was supplied; a zero markout and an unobservable one are different facts",
-          { horizon: horizon.label, simulatedFillId: input.fill.simulatedFillId },
+          { horizon: horizon.label, simulatedFillId: fill.simulatedFillId },
         );
       }
       if (!isCanonicalDecimalString(settled)) {
@@ -163,37 +196,49 @@ function computeMarkoutsInner(input: {
           "resolutionValuePerShare must be a canonical decimal string",
         );
       }
-      observations.push(observationAt(horizon.label, settled, input.fill, direction, null));
+      observations.push(observationAt(horizon.label, settled, fill, direction, null));
       continue;
     }
-    const atNs = input.filledAtNs + BigInt(horizon.milliseconds) * 1_000_000n;
-    const observed = input.midTimeline.midAt({
-      marketId: input.fill.marketId,
-      tokenId: input.fill.tokenId,
+    if (!Number.isSafeInteger(horizon.milliseconds)) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "a markout horizon's milliseconds is a safe integer, or `null` for the resolution horizon",
+        { horizon: horizon.label },
+      );
+    }
+    const atNs = filledAtNs + BigInt(horizon.milliseconds) * 1_000_000n;
+    const observed = midTimeline.midAt({
+      marketId: fill.marketId,
+      tokenId: fill.tokenId,
       monotonicNs: atNs,
     });
     if (observed === undefined) {
       return simulationFailure(
         "MARKOUT_HORIZON_UNOBSERVED",
         `the recorded path does not reach the ${horizon.label} horizon for this fill; reporting it as zero would state an observation that was never made`,
-        { horizon: horizon.label, simulatedFillId: input.fill.simulatedFillId },
+        { horizon: horizon.label, simulatedFillId: fill.simulatedFillId },
       );
     }
-    if (!isCanonicalDecimalString(observed.mid)) {
+    // The port's ANSWER is data, and it is read once, here.
+    const readObserved = readOwnPlainInput<{
+      readonly mid: string;
+      readonly atEvent: RecordedEventIdentity;
+    }>(observed, "the observed mid");
+    if (!readObserved.ok) return readObserved;
+    const mid = readObserved.value;
+    if (mid === null || typeof mid !== "object" || !isCanonicalDecimalString(mid.mid)) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "the mid timeline returned a non-canonical decimal",
         { horizon: horizon.label },
       );
     }
-    observations.push(
-      observationAt(horizon.label, observed.mid, input.fill, direction, observed.atEvent),
-    );
+    observations.push(observationAt(horizon.label, mid.mid, fill, direction, mid.atEvent));
   }
 
   return simulationOk(
     ownFrozenTree<MarkoutDiagnostics>({
-      simulatedFillId: input.fill.simulatedFillId,
+      simulatedFillId: fill.simulatedFillId,
       role: "DIAGNOSTIC_ONLY",
       appliedToReplayEconomics: false,
       observations,
@@ -276,6 +321,24 @@ export interface ReplayPathEconomics {
 export function replayPathEconomics(
   fills: readonly SimulatedFill[],
 ): SimulationResult<ReplayPathEconomics> {
+  return totally("folding the replay path's economics", () => replayPathEconomicsInner(fills));
+}
+
+function replayPathEconomicsInner(
+  offered: readonly SimulatedFill[],
+): SimulationResult<ReplayPathEconomics> {
+  // D1 (round-3 review, MEDIUM-1): a fill is a CALLER RECORD here — this door is
+  // exported, and the run driver, the CLI and the stress-scenario builder all
+  // call it — and each fill's `price`, `shares`, `feeAmount` and `action` are
+  // read twice: once to validate and once to fold. At `b0aeb28` an accessor
+  // `price` was ACCEPTED with the getter invoked, so the money folded was not
+  // the money checked.
+  const read = readOwnPlainInput<readonly SimulatedFill[]>(
+    offered,
+    "the replay path's fills",
+  );
+  if (!read.ok) return read;
+  const fills = read.value;
   if (!Array.isArray(fills)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
@@ -391,18 +454,35 @@ function markoutStressScenarioInner(input: {
   readonly fills: readonly SimulatedFill[];
   readonly diagnostics: readonly MarkoutDiagnostics[];
 }): SimulationResult<MarkoutStressScenario> {
-  const folded = replayPathEconomics(input.fills);
+  // D1 + one read per field (round-3 review, MEDIUM-1). `fills` is materialized
+  // by `replayPathEconomics`; the DIAGNOSTICS are a second caller array whose
+  // `observations[].total` is read to validate and again to accumulate.
+  const { scenarioName, horizon, fills, diagnostics: offeredDiagnostics } = input;
+
+  const folded = replayPathEconomics(fills);
   if (!folded.ok) return folded;
   const replay = folded.value;
-  if (!Array.isArray(input.diagnostics)) {
+  const read = readOwnPlainInput<readonly MarkoutDiagnostics[]>(
+    offeredDiagnostics,
+    "the markout diagnostics",
+  );
+  if (!read.ok) return read;
+  const diagnostics = read.value;
+  if (!Array.isArray(diagnostics)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
       "a stress scenario is built from an array of markout diagnostics",
     );
   }
+  if (typeof horizon !== "string" || typeof scenarioName !== "string") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "a stress scenario names itself and the §12.3 horizon it applies",
+    );
+  }
   let penalty = "0";
   let matched = 0;
-  for (const diagnostic of input.diagnostics) {
+  for (const diagnostic of diagnostics) {
     if (diagnostic === null || typeof diagnostic !== "object" || !Array.isArray(diagnostic.observations)) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
@@ -410,7 +490,7 @@ function markoutStressScenarioInner(input: {
       );
     }
     const observation = diagnostic.observations.find(
-      (entry: MarkoutObservation) => entry.horizon === input.horizon,
+      (entry: MarkoutObservation) => entry !== null && typeof entry === "object" && entry.horizon === horizon,
     );
     if (observation === undefined) continue;
     matched += 1;
@@ -418,7 +498,7 @@ function markoutStressScenarioInner(input: {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "a markout observation carries a non-canonical total",
-        { horizon: input.horizon, offered: String(observation.total) },
+        { horizon, offered: String(observation.total) },
       );
     }
     if (compareDecimal(observation.total, "0") < 0) {
@@ -428,15 +508,15 @@ function markoutStressScenarioInner(input: {
   if (matched === 0) {
     return simulationFailure(
       "MARKOUT_HORIZON_UNOBSERVED",
-      `no supplied diagnostic carries the ${JSON.stringify(input.horizon)} horizon, so no stress scenario can be built at it`,
-      { horizon: input.horizon },
+      `no supplied diagnostic carries the ${JSON.stringify(horizon)} horizon, so no stress scenario can be built at it`,
+      { horizon },
     );
   }
   return simulationOk(
     ownFrozenTree<MarkoutStressScenario>({
       basis: "STRESS_SCENARIO",
-      scenarioName: input.scenarioName,
-      horizon: input.horizon,
+      scenarioName,
+      horizon,
       replay,
       appliedPenalty: penalty,
       stressedNetCashFlow: subDecimal(replay.netCashFlow, penalty),
