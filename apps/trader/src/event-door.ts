@@ -77,6 +77,7 @@ export const CONSUMED_EVENTS: readonly { readonly eventType: string; readonly sc
     { eventType: "BookSnapshot", schemaVersion: 1 },
     { eventType: "BookLevelChanged", schemaVersion: 1 },
     { eventType: "PublicTradeObserved", schemaVersion: 1 },
+    { eventType: "ReferenceTradeObserved", schemaVersion: 1 },
     { eventType: "DataQualityIncidentOpened", schemaVersion: 1 },
     { eventType: "DataQualityIncidentClosed", schemaVersion: 1 },
   ]);

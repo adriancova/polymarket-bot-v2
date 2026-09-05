@@ -202,6 +202,16 @@ export interface RiskInputContext {
   readonly venueBookAgeMs: number;
   /** Measured feature-snapshot age in milliseconds. */
   readonly featuresAgeMs: number;
+  /**
+   * Measured reference-feed age in milliseconds, or `undefined` when this
+   * process has seen no reference event at all.
+   *
+   * `undefined` is propagated as an OMITTED observation rather than as a large
+   * age: §9.8 tells `STALE` from `UNKNOWN` and both fail closed, but only one
+   * of them is a fact this process can assert. §9.9 row 1 is the consequence —
+   * "External reference feed stale, Polymarket healthy → halt new entries".
+   */
+  readonly referenceFeedAgeMs: number | undefined;
   readonly positions: readonly PortfolioPositionInput[];
   readonly openOrders: readonly PortfolioOpenOrderInput[];
   /** The allocator's exposure snapshot, or `undefined` when it has none. */
@@ -212,8 +222,18 @@ export interface RiskInputContext {
   readonly recentIntentIds: readonly string[];
   /** §9.8 check 19: remaining request headroom, or absent = unknown. */
   readonly availableRequests: number | undefined;
-  readonly feeEstimate: string | undefined;
-  readonly slippageEstimate: string | undefined;
+  /** §9.8 check 9: the versioned parameter set these prices belong to. */
+  readonly parametersVersion: number;
+  /** §9.8 check 6: the §9.2 / §9.3 readiness echo. */
+  readonly modelDependentActivationAllowed: boolean;
+  /** §9.8 check 17: the shock scenarios, with marks measured from the book. */
+  readonly scenarios: readonly {
+    readonly scenarioId: string;
+    readonly kind: "SPOT" | "VOLATILITY" | "TIME" | "LIQUIDITY";
+    readonly marks: readonly { readonly marketId: string; readonly yesPrice: string }[];
+  }[];
+  readonly feeEstimate?: string | undefined;
+  readonly slippageEstimate?: string | undefined;
 }
 
 /**
@@ -231,6 +251,8 @@ export function buildRiskEvaluationInput(context: RiskInputContext): unknown {
     status: marketStatusOf(context.market),
     tickSize: context.marketConfig.tickSize,
     minimumOrderSize: context.marketConfig.minimumOrderSize,
+    parametersVersion: context.parametersVersion,
+    settlement: { modelDependentActivationAllowed: context.modelDependentActivationAllowed },
     bookSynchronized: context.bookSynchronized,
     ...(context.secondsToClose === undefined
       ? {}
@@ -255,6 +277,9 @@ export function buildRiskEvaluationInput(context: RiskInputContext): unknown {
     freshness: [
       { feed: "VENUE_BOOK", marketId: context.marketConfig.marketId, ageMs: context.venueBookAgeMs },
       { feed: "FEATURES", ageMs: context.featuresAgeMs },
+      ...(context.referenceFeedAgeMs === undefined
+        ? []
+        : [{ feed: "REFERENCE_FEED", ageMs: context.referenceFeedAgeMs }]),
     ],
     portfolio: {
       positions: context.positions,
@@ -262,7 +287,7 @@ export function buildRiskEvaluationInput(context: RiskInputContext): unknown {
     },
     ...(context.exposures === undefined ? {} : { exposures: context.exposures }),
     ...(context.allocation === undefined ? {} : { allocation: context.allocation }),
-    scenarios: [],
+    scenarios: context.scenarios,
     guards: { recentIntentIds: context.recentIntentIds },
     rateLimit:
       context.availableRequests === undefined

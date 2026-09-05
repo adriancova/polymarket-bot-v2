@@ -52,8 +52,9 @@
  * gates every evaluation.
  */
 
-import { addDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
+import { addDecimal, compareDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
 import { computeFeatureSnapshot } from "@polymarket-bot/features";
+import { executablePrice } from "@polymarket-bot/order-book";
 import type { Intent } from "@polymarket-bot/domain";
 import type { EvaluationInput, EvaluationOutcome } from "@polymarket-bot/strategy-runtime";
 import type { ExecutionPlan, PlacementPlan } from "@polymarket-bot/execution-planner";
@@ -63,6 +64,12 @@ import type {
   SimulatedOrder,
 } from "@polymarket-bot/simulation";
 import type { RiskPolicy } from "@polymarket-bot/risk";
+import {
+  computePnlSnapshot,
+  foldPnlRecords,
+  type PnlRecord,
+  type PnlStreamIdentity,
+} from "@polymarket-bot/pnl";
 import type {
   RiskBudgetView,
   StrategyFill,
@@ -100,6 +107,7 @@ import type { DecisionRecord, DecisionTelemetry } from "@polymarket-bot/strategy
 import type { StrategyStateCheckpoint } from "@polymarket-bot/strategy-runtime";
 import { buildStrategyFeatureView, projectFeatureValues } from "./projection.js";
 import { BoundedQueue, type QueueMetrics } from "./queue.js";
+import { ReferenceState } from "./reference-state.js";
 import { ReservationBook } from "./reservations.js";
 import { normalizeToStrictUtc } from "./time.js";
 import type { Ledger } from "@polymarket-bot/ledger";
@@ -243,6 +251,7 @@ export class CoreLoop {
   readonly #cancels = new CancelLedger();
   readonly #reservations = new ReservationBook();
   readonly #timeInForce = new OrderTimeInForceBook();
+  readonly #reference: ReferenceState;
 
   /** `venueOrderId -> the trace prefix built when its plan was submitted`. */
   readonly #orderTraces = new Map<string, Omit<TraceLink, "venueFillId" | "ledgerFillId" | "ledgerTransactionIds">>();
@@ -262,6 +271,18 @@ export class CoreLoop {
   #knownFills = 0;
   #seenArrivals = 0;
   #seenUnexplained = 0;
+  /**
+   * The §9.16 record stream per strategy instance, in production order.
+   *
+   * Held rather than folded incrementally because `foldPnlRecords` is a FOLD
+   * over the whole stream: §6 invariant 8's rebuildability is the property that
+   * matters, and a fold from zero over the retained records is exactly the
+   * rebuild. The records themselves come from `buildFillPosting`, so they are
+   * the ledger's own derivation and not a second accounting.
+   */
+  readonly #pnlRecords = new Map<string, PnlRecord[]>();
+  /** Epoch-millisecond instants of this process's own submissions (§9.8 check 19). */
+  #submissionInstants: number[] = [];
 
   constructor(options: CoreLoopOptions) {
     this.#options = options;
@@ -272,6 +293,10 @@ export class CoreLoop {
     this.#ledger = options.ledger;
     this.#cash = options.config.accounting.startingCash;
     this.#lastInstant = options.clock.now();
+    this.#reference = new ReferenceState({
+      windowMs: options.config.features.tradeWindowMs,
+      maximumPoints: 512,
+    });
   }
 
   /** The §6 invariant 4 chains this run produced, in fill order. */
@@ -282,6 +307,11 @@ export class CoreLoop {
   /** Every persisted decision, in evaluation order. */
   decisions(): readonly DecisionTrace[] {
     return Object.freeze([...this.#decisions]);
+  }
+
+  /** The §9.16 records one instance's stream has accumulated, in order. */
+  pnlRecords(instanceId: string): readonly PnlRecord[] {
+    return Object.freeze([...(this.#pnlRecords.get(instanceId) ?? [])]);
   }
 
   ledger(): Ledger {
@@ -376,22 +406,69 @@ export class CoreLoop {
     this.#options.venue.observe(event.identity);
 
     // --- step 2: update local market/account state -------------------------
-    const marketId = readMarketId(envelope.payload);
-    if (marketId === undefined) return;
-    const market = this.#options.markets.get(marketId);
-    if (market === undefined) return;
-    market.observeInstant(instant.instant, instant.epochMs);
+    //
+    // An event names its market DIRECTLY (`internalMarketId`) or, for a
+    // data-quality incident, through `affectedMarketIds` — §7.4 gives an
+    // incident a LIST, because one feed failure affects every market that reads
+    // it. Both forms are handled; an event that names no configured market is
+    // counted and skipped rather than halting, because a gateway legitimately
+    // publishes for markets this trader is not configured for.
+    // A REFERENCE event names a `(venue, symbol)` pair rather than a market —
+    // a BTC print informs every BTC market at once — so it updates the
+    // process-scoped reference state and then evaluates EVERY configured
+    // market, which is §8.1's "update feature snapshots → invoke subscribed
+    // strategies" applied to an input that is not market-keyed.
+    if (envelope.eventType === "ReferenceTradeObserved") {
+      const venue = readString(envelope.payload, "venue");
+      const symbol = readString(envelope.payload, "symbol");
+      const price = readString(envelope.payload, "price");
+      if (
+        (venue === "binance" || venue === "coinbase") &&
+        symbol !== undefined &&
+        price !== undefined
+      ) {
+        this.#reference.observe({
+          venue,
+          symbol,
+          price,
+          observedAt: instant.instant,
+          observedAtEpochMs: instant.epochMs,
+        });
+      }
+      this.#sweepCancels(instant.instant, instant.epochMs);
+      for (const [marketId, market] of this.#options.markets) {
+        if (this.#options.halts.isMarketHalted(marketId)) continue;
+        market.observeInstant(instant.instant, instant.epochMs);
+        await this.#evaluateMarket(
+          market,
+          envelope,
+          { kind: "onFeatures" },
+          instant.instant,
+          instant.epochMs,
+        );
+      }
+      await this.#harvestFills(instant.instant);
+      await this.#flushOutbox();
+      return;
+    }
 
-    const callback = this.#applyEvent(market, envelope, event, instant.instant, instant.epochMs);
-    if (callback === undefined) return;
+    const affected = affectedMarketIds(envelope.payload);
+    const known = affected.filter((marketId) => this.#options.markets.has(marketId));
+    if (known.length === 0) return;
 
     // --- every cancel reaches a terminal fact (WP-220 obligation 10) -------
     this.#sweepCancels(instant.instant, instant.epochMs);
 
-    if (this.#options.halts.isMarketHalted(marketId)) return;
-
-    // --- steps 3-9 ---------------------------------------------------------
-    await this.#evaluateMarket(market, envelope, callback, instant.instant, instant.epochMs);
+    for (const marketId of known) {
+      const market = this.#options.markets.get(marketId);
+      if (market === undefined) continue;
+      market.observeInstant(instant.instant, instant.epochMs);
+      const callback = this.#applyEvent(market, envelope, event, instant.instant, instant.epochMs);
+      if (callback === undefined) continue;
+      if (this.#options.halts.isMarketHalted(marketId)) continue;
+      // --- steps 3-9 -------------------------------------------------------
+      await this.#evaluateMarket(market, envelope, callback, instant.instant, instant.epochMs);
+    }
 
     // --- fills the venue produced, plus their accounting -------------------
     await this.#harvestFills(instant.instant);
@@ -430,8 +507,17 @@ export class CoreLoop {
         return { kind: "onMarketOpen" };
       case "MarketClosing": {
         market.markLifecycle("CLOSING");
-        const seconds = readNumber(envelope.payload, "secondsToClose");
-        return { kind: "onMarketClosing", secondsRemaining: seconds ?? 0 };
+        // §7.4 gives `MarketClosing` a `closesAt` INSTANT, and §9.6 gives
+        // `onMarketClosing` a `secondsRemaining` DURATION. The conversion is the
+        // root's, and it is measured against the event's own instant rather
+        // than a wall clock so replay produces the same number.
+        const closesAt = readString(envelope.payload, "closesAt");
+        const closes = closesAt === undefined ? undefined : normalizeToStrictUtc(closesAt);
+        const seconds =
+          closes !== undefined && closes.ok
+            ? Math.max(0, Math.floor((closes.epochMs - epochMs) / 1000))
+            : 0;
+        return { kind: "onMarketClosing", secondsRemaining: seconds };
       }
       case "MarketResolved": {
         const outcome = readString(envelope.payload, "outcome");
@@ -588,7 +674,7 @@ export class CoreLoop {
             observedAt: trade.observedAt,
           })),
       },
-      reference: {},
+      reference: this.#reference.featureInput(),
       lifecycle: {
         openedAt: market.config.openTime,
         closesAt: market.config.closeTime,
@@ -598,9 +684,10 @@ export class CoreLoop {
     if (!computed.ok) {
       // A snapshot that cannot be computed is state this process does not have,
       // and §4.2's rule is that no decision is made on absent state. The market
-      // is not halted — the next event may compute fine — but this evaluation
-      // does not happen.
-      this.#options.health.countLoop("eventsRefused");
+      // is not halted — the next event may compute fine, and the ordinary case
+      // is simply that no book has arrived yet — but this evaluation does not
+      // happen.
+      this.#options.health.countLoop("snapshotsUnavailable");
       return undefined;
     }
     this.#options.health.countLoop("featureSnapshots");
@@ -629,7 +716,17 @@ export class CoreLoop {
     readonly instant: string;
     readonly snapshotRef: string;
     readonly values: Readonly<Record<string, string | boolean | null>>;
-    readonly eventId: string;
+    /**
+     * The §7.1 identity of the event that triggered this evaluation, when one
+     * did.
+     *
+     * `undefined` for a delivery the loop originates rather than an event —
+     * an `onFill` or an `onOrderUpdate` — and the field is then OMITTED, not
+     * blanked. `SourceEventRef` is "optional as a GROUP", and an empty string
+     * is not a UUID: supplying one made the runtime refuse the evaluation with
+     * `INPUT_INVALID`, so a fill was never delivered to the strategy at all.
+     */
+    readonly eventId: string | undefined;
   }): EvaluationInput {
     const base = {
       evaluatedAt: input.instant,
@@ -649,7 +746,7 @@ export class CoreLoop {
       position: this.#positionView(input.instance, input.instant),
       orders: this.#orderViews_(input.instance, input.instant),
       riskBudget: this.#riskBudgetView(input.instant),
-      sourceEvent: { eventId: input.eventId },
+      ...(input.eventId === undefined ? {} : { sourceEvent: { eventId: input.eventId } }),
     } as const;
     switch (input.callback.kind) {
       case "onMarketOpen":
@@ -834,9 +931,13 @@ export class CoreLoop {
       exposures: undefined,
       allocation: { permitted: true },
       recentIntentIds: Object.freeze([...this.#recentIntentIds]),
-      availableRequests: undefined,
-      feeEstimate: undefined,
-      slippageEstimate: undefined,
+      availableRequests: this.#availableRequests(input.epochMs),
+      parametersVersion: marketConfig.parametersVersion,
+      modelDependentActivationAllowed:
+        marketConfig.settlementReadiness.modelDependentActivationAllowed,
+      scenarios: this.#scenariosFor(input.market, marketConfig),
+      ...this.#economicsFor(input.intent, input.market, marketConfig),
+      referenceFeedAgeMs: this.#reference.ageMs(input.epochMs),
     });
 
     const evaluation = runRiskCheck(this.#options.riskPolicy, riskInput);
@@ -953,6 +1054,7 @@ export class CoreLoop {
       }
     }
 
+    this.#submissionInstants.push(input.epochMs);
     const result = await this.#options.venue.submit(input.plan);
     if (!result.accepted) {
       this.#options.health.countExecution("submissionsRefused");
@@ -1050,6 +1152,21 @@ export class CoreLoop {
       this.#options.health.countAccounting("ledgerTransactions", posted.appended.length);
       this.#options.health.countAccounting("pnlRecords", posted.pnlRecords.length);
       this.#cash = cashAfter(this.#cash, fill);
+      // `buildFillPosting` emits one stream per OWNER — the actual account's
+      // and each claiming instance's — and `applyPnlRecord` refuses a record
+      // whose owner is not the stream's. So the instance's stream keeps the
+      // records that name IT, which is §6 invariant 7's separation applied to
+      // the PnL projection rather than a filter of convenience.
+      const stream = this.#pnlRecords.get(instance.instanceId) ?? [];
+      for (const record of posted.pnlRecords as readonly PnlRecord[]) {
+        if (
+          record.owner.scope === "VIRTUAL_STRATEGY" &&
+          record.owner.instanceId === instance.instanceId
+        ) {
+          stream.push(record);
+        }
+      }
+      this.#pnlRecords.set(instance.instanceId, stream);
 
       for (const appended of posted.appended) {
         const written = await this.#options.store.appendLedgerTransaction(appended);
@@ -1102,6 +1219,12 @@ export class CoreLoop {
         );
       }
 
+      // §9.16: the PnL projection follows the posting, from the SAME records the
+      // ledger derived. A refusal here is not a halt — PnL is a projection, and
+      // §6 invariant 8 makes the append-only ledger the monetary source of
+      // truth — but a store failure IS, on §4.2's terms.
+      await this.#writePnlSnapshot(instance, fill, instant);
+
       // WP-220 obligation 8: the fill is offered even while the instance is
       // PAUSED. The runtime refuses a paused instance without invoking the
       // callback, and that refusal is RECORDED rather than treated as an error —
@@ -1112,6 +1235,52 @@ export class CoreLoop {
     this.#knownFills = fills.length;
 
     await this.#deliverOrderViews(instant);
+  }
+
+  /**
+   * Folds this instance's §9.16 stream and writes the resulting snapshot.
+   *
+   * The MARK is the fill's own price — the last observed transaction in this
+   * token, which is a fact rather than a model. §9.16's other marks (model,
+   * liquidation) need inputs this process does not yet hold, and inventing one
+   * would put a fabricated number into an accounting row.
+   */
+  async #writePnlSnapshot(
+    instance: RegisteredInstance,
+    fill: SimulatedFill,
+    instant: string,
+  ): Promise<void> {
+    const records = this.#pnlRecords.get(instance.instanceId);
+    if (records === undefined || records.length === 0) return;
+    const identity: PnlStreamIdentity = {
+      scope: "VIRTUAL_STRATEGY",
+      environment: this.#options.config.environment,
+      accountRef: this.#options.posting.accountRef,
+      instanceId: instance.instanceId,
+      runId: instance.runId,
+      marketId: instance.marketId,
+    };
+    const folded = foldPnlRecords(identity, records);
+    if (!folded.ok) return;
+    const tokenAssetId =
+      this.#options.tokenAssetIds.get(`${fill.marketId}|${fill.side}`) ?? fill.tokenId;
+    const snapshots = computePnlSnapshot(folded.value, {
+      asOf: instant,
+      marks: { [tokenAssetId]: { midpoint: fill.price } },
+    });
+    if (!snapshots.ok) return;
+    for (const snapshot of snapshots.value) {
+      const written = await this.#options.store.writePnlSnapshot(snapshot);
+      if (!written.ok) {
+        this.#options.halts.halt(
+          { kind: "GLOBAL" },
+          "STORE_UNAVAILABLE",
+          `a PnL snapshot could not be persisted: ${written.failure.detail}`,
+          instant,
+        );
+        return;
+      }
+    }
   }
 
   async #deliverFill(
@@ -1141,17 +1310,10 @@ export class CoreLoop {
         instant,
         snapshotRef: snapshot.snapshotRef,
         values: snapshot.values,
-        eventId: "",
+        eventId: undefined,
       }),
     );
-    await this.#consumeOutcome(
-      instance,
-      market,
-      outcome,
-      "",
-      instant,
-      this.#lastEpochMs,
-    );
+    await this.#consumeOutcome(instance, market, outcome, "", instant, this.#lastEpochMs);
   }
 
   /**
@@ -1191,7 +1353,7 @@ export class CoreLoop {
           instant,
           snapshotRef: snapshot.snapshotRef,
           values: snapshot.values,
-          eventId: "",
+          eventId: undefined,
         }),
       );
       await this.#consumeOutcome(instance, market, outcome, "", instant, this.#lastEpochMs);
@@ -1300,6 +1462,113 @@ export class CoreLoop {
     return Object.freeze(orders);
   }
 
+  /**
+   * The §9.8 check-12 cost inputs, MEASURED rather than assumed.
+   *
+   * §9.8's own refusal text is the rule: "an unsupplied cost is not a zero cost
+   * (fail closed)". Both numbers below are read off state this process already
+   * holds, so neither is an invention:
+   *
+   * - **fee** — the market's CONFIGURED, versioned taker rate (§6 invariant 9)
+   *   times the intent's own notional bound. The taker rate is used rather than
+   *   the maker rate because a fee estimate that assumed the better of the two
+   *   would understate the cost, and check 12 subtracts it from the edge;
+   * - **slippage** — the exact cost of walking the ladder for the intent's own
+   *   size, minus what the top of book alone would have cost:
+   *   `totalCost − bestPrice × shares`. No division, no VWAP, no rounding
+   *   policy: `packages/order-book`'s `executablePrice` sums `price × size` per
+   *   level exactly, and the subtraction is exact.
+   *
+   * When either cannot be measured — an empty ladder, a book too thin for the
+   * size — the field is OMITTED, and §9.8 refuses the entry. That is the
+   * fail-closed direction, and it is the correct one: a size the book cannot
+   * fill has an unknown slippage, not a zero one.
+   */
+  #economicsFor(
+    intent: Intent,
+    market: MarketState,
+    marketConfig: MarketConfig,
+  ): { readonly feeEstimate?: string; readonly slippageEstimate?: string } {
+    if (intent.type !== "POSITION") return {};
+    const shares = intent.targetShares;
+    if (compareDecimal(shares, "0") <= 0) return {};
+    const buying = intent.maximumBuyPrice !== undefined;
+    const bound = buying ? intent.maximumBuyPrice : intent.minimumSellPrice;
+    if (bound === undefined) return {};
+    const book = market.bookFor(intent.direction);
+    const quote = executablePrice(book, { side: buying ? "BUY" : "SELL", shares });
+    if (!quote.ok) {
+      // The book cannot fill this size. An unmeasurable slippage is omitted, and
+      // §9.8 check 12 then refuses — which is the honest outcome for an order
+      // the visible book could not absorb.
+      return { feeEstimate: mulDecimal(marketConfig.takerFeeRate, mulDecimal(bound, shares)) };
+    }
+    const top = buying ? book.topOfBook().bestAskPrice : book.topOfBook().bestBidPrice;
+    if (top === undefined) {
+      return { feeEstimate: mulDecimal(marketConfig.takerFeeRate, mulDecimal(bound, shares)) };
+    }
+    const atTop = mulDecimal(top, shares);
+    const slippage = buying
+      ? subDecimal(quote.totalCost, atTop)
+      : subDecimal(atTop, quote.totalCost);
+    return {
+      feeEstimate: mulDecimal(marketConfig.takerFeeRate, quote.totalCost),
+      slippageEstimate: compareDecimal(slippage, "0") < 0 ? "0" : slippage,
+    };
+  }
+
+  /**
+   * §9.8 check 19's headroom: the operator-stated capacity minus this process's
+   * OWN submissions in the current window.
+   *
+   * Not the venue's published budget — §9.13 forbids hardcoding that and
+   * `WP-310` owns it. What this measures is real all the same: a process that
+   * has spent its stated capacity has no headroom, whatever the venue would
+   * have allowed.
+   */
+  #availableRequests(epochMs: number): number {
+    const budget = this.#options.config.requestBudget;
+    const horizon = epochMs - budget.windowMs;
+    this.#submissionInstants = this.#submissionInstants.filter((at) => at >= horizon);
+    return Math.max(0, budget.capacity - this.#submissionInstants.length);
+  }
+
+  /**
+   * §9.8 check 17's shocked marks: the operator's shock applied to a MEASURED
+   * mark.
+   *
+   * The mark is the YES book's best BID — what the position could actually be
+   * sold into — chosen because it needs no division and therefore no rounding
+   * policy inside a risk input. A market whose bid side is empty produces NO
+   * mark, so the scenario is incomplete and `assessScenarios` refuses the
+   * entry: an unmeasurable scenario is not a passed one.
+   */
+  #scenariosFor(
+    market: MarketState,
+    marketConfig: MarketConfig,
+  ): readonly {
+    readonly scenarioId: string;
+    readonly kind: "SPOT" | "VOLATILITY" | "TIME" | "LIQUIDITY";
+    readonly marks: readonly { readonly marketId: string; readonly yesPrice: string }[];
+  }[] {
+    const mark = market.bookFor("YES").topOfBook().bestBidPrice;
+    return Object.freeze(
+      this.#options.config.scenarios.map((scenario) => ({
+        scenarioId: scenario.scenarioId,
+        kind: scenario.kind,
+        marks:
+          mark === undefined
+            ? Object.freeze([])
+            : Object.freeze([
+                {
+                  marketId: marketConfig.marketId,
+                  yesPrice: clampProbability(addDecimal(mark, scenario.yesPriceShock)),
+                },
+              ]),
+      })),
+    );
+  }
+
   #bookAgeMs(market: MarketState, epochMs: number): number {
     const lastUpdate = market.bookFor("YES").lastUpdate();
     const at = lastUpdate?.receivedAtEpochMs;
@@ -1339,15 +1608,22 @@ function readString(payload: unknown, key: string): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-function readNumber(payload: unknown, key: string): number | undefined {
-  if (typeof payload !== "object" || payload === null) return undefined;
-  if (!Object.hasOwn(payload, key)) return undefined;
-  const value = (payload as Record<string, unknown>)[key];
-  return typeof value === "number" ? value : undefined;
-}
-
-function readMarketId(payload: unknown): string | undefined {
-  return readString(payload, "internalMarketId") ?? readString(payload, "marketId");
+/**
+ * Every market an event affects.
+ *
+ * Most §7.4 events name exactly one (`internalMarketId`). A data-quality
+ * incident names a LIST (`affectedMarketIds`) because one stale feed affects
+ * every market that reads it — and an incident with an EMPTY list affects none,
+ * which is a different statement from "affects all" and is treated as such.
+ */
+function affectedMarketIds(payload: unknown): readonly string[] {
+  const direct = readString(payload, "internalMarketId") ?? readString(payload, "marketId");
+  if (direct !== undefined) return Object.freeze([direct]);
+  if (typeof payload !== "object" || payload === null) return Object.freeze([]);
+  if (!Object.hasOwn(payload, "affectedMarketIds")) return Object.freeze([]);
+  const list = (payload as Record<string, unknown>)["affectedMarketIds"];
+  if (!Array.isArray(list)) return Object.freeze([]);
+  return Object.freeze(list.filter((member): member is string => typeof member === "string"));
 }
 
 function intentIdOf(intent: Intent): string {
@@ -1362,6 +1638,13 @@ function plannedOrderFor(plan: PlacementPlan, reservationId: string): string {
     }
   }
   return reservationId;
+}
+
+/** Clamps an exact decimal into the probability range `[0, 1]` (§7.3). */
+function clampProbability(value: string): string {
+  if (compareDecimal(value, "0") < 0) return "0";
+  if (compareDecimal(value, "1") > 0) return "1";
+  return value;
 }
 
 /** `price × shares`, exactly. Never a JavaScript number (§6 invariant 1). */

@@ -79,10 +79,60 @@ const NonNegativeDecimal = z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d+)?$/u, {
   message: "must be a canonical non-negative decimal string",
 });
 const Identifier = z.string().min(1).max(200);
+/**
+ * The `packages/domain` `CodeString` grammar, restated here as a REFUSAL at the
+ * trader's own door.
+ *
+ * `packages/risk`'s evaluation input types `context.strategyInstanceId` and
+ * every `ScopeAttribution` key as `CodeString` — "must be an alphanumeric code
+ * without whitespace", and the pattern requires a LETTER first
+ * (`^[A-Za-z][A-Za-z0-9_.:-]*$`). A configuration that violates it produces a
+ * `RISK_INPUT_INVALID` refusal on the first intent, mid-run, with no order
+ * placed and nothing to point the operator at. Refusing it HERE turns that into
+ * a startup failure naming the field.
+ *
+ * See `README.md` for the reported cross-package conflict this exposes: a
+ * genuinely-minted UUIDv7 begins with the digit `0` for every timestamp this
+ * century, so it satisfies `packages/ledger`'s `Uuidv7Schema` and FAILS
+ * `packages/risk`'s `CodeStringSchema` — the two doors cannot both be satisfied
+ * by one such identifier.
+ */
+const CodeString = z.string().min(1).max(200).regex(/^[A-Za-z][A-Za-z0-9_.:-]*$/u, {
+  message:
+    "must be a §7 CodeString: a LETTER followed by alphanumerics, '_', '.', ':' or '-' " +
+    "(packages/risk types the scope keys and the strategy instance id this way)",
+});
 const Uuid = z
   .string()
   .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u, {
     message: "must be a canonical LOWERCASE UUID (ADR-016 §2: refused, never case-folded)",
+  });
+
+/**
+ * An identifier that satisfies BOTH merged doors it must pass.
+ *
+ * ONE regex rather than `Uuid.and(CodeString)`, because the arena refuses an
+ * `intersection` node by name — "a node it cannot copy is a parse it cannot
+ * protect" — and a door that fell back to an unprotected assembly to express a
+ * conjunction would be trading D2 for syntax.
+ *
+ * The conjunction is the UUID grammar with a LETTER first hex digit. It is
+ * deliberately NARROWER than either door alone, and the refusal message says so,
+ * because the narrowing is a REPORTED CROSS-PACKAGE CONFLICT and not a
+ * preference: every UUIDv7 minted from a real timestamp this century begins with
+ * `0`, which `packages/ledger` requires and `packages/risk` refuses.
+ */
+const UuidAndCodeString = z
+  .string()
+  .regex(/^[a-f][0-9a-f]{7}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u, {
+    message:
+      "must be a canonical lowercase UUID whose FIRST hex digit is a letter (a-f). Two merged " +
+      "doors constrain this one value and their intersection is this shape: " +
+      "packages/ledger and packages/pnl require Uuidv7Schema, while packages/risk types " +
+      "context.strategyInstanceId as CodeStringSchema, whose pattern requires a leading " +
+      "letter. A UUIDv7 minted from a real timestamp begins with '0' and cannot satisfy both " +
+      "— that is a reported cross-package conflict, and this door refuses at STARTUP rather " +
+      "than letting it surface as a mid-run RISK_INPUT_INVALID with no order placed",
   });
 
 /** §8.3 bounds. Every queue in this process is sized here, explicitly. */
@@ -116,10 +166,43 @@ const MarketConfigSchema = z.strictObject({
   /** Strict-UTC; `time.ts` normalises and refuses an offset form. */
   openTime: z.string().min(1),
   closeTime: z.string().min(1),
-  /** §9.2 scope attribution for the §9.7 exposure dimensions. */
-  seriesKey: Identifier,
-  underlyingKey: Identifier,
-  resolutionWindowKey: Identifier,
+  /**
+   * §6 invariant 9: the version of the trading-parameter set the prices, tick
+   * and minimum size above belong to.
+   *
+   * REQUIRED and operator-stated, because §9.8 check 9 ("current trading
+   * parameters are known") fails closed on its absence — and correctly: a run
+   * whose parameters carry no version cannot claim that "historical runs use
+   * historical parameters".
+   */
+  parametersVersion: z.number().int().min(0).max(1_000_000_000),
+  /**
+   * The structural echo of the §9.2 / §9.3 readiness answer that
+   * `packages/universe`'s `evaluateMarketReadiness` produces.
+   *
+   * REQUIRED, with NO default, and that is the whole point: §9.8 check 6 and
+   * the policy's `requireVerifiedSettlementForEntries` refuse an entry into a
+   * market whose settlement specification is not verified, and a default of
+   * `true` here would silently satisfy a gate that exists to stop exactly that.
+   *
+   * **The authoritative source is not this field.** `packages/universe` and
+   * `packages/settlement` own the answer; wiring them into this process is a
+   * recorded follow-up (`README.md`). Until that lands, an operator states the
+   * reviewed answer explicitly and is accountable for it — which is strictly
+   * better than a composition root that asserts readiness on its own.
+   *
+   * The `btc-15m-updown` caveat applies and is not weakened here: that series
+   * has NO human-reviewed settlement specification in this repository
+   * (`packages/strategies/static-bracket/README.md`), so a truthful
+   * configuration for it states `false` and its entries are refused.
+   */
+  settlementReadiness: z.strictObject({
+    modelDependentActivationAllowed: z.boolean(),
+  }),
+  /** §9.2 scope attribution for the §9.7 exposure dimensions. `CodeString`. */
+  seriesKey: CodeString,
+  underlyingKey: CodeString,
+  resolutionWindowKey: CodeString,
 });
 
 /**
@@ -131,7 +214,17 @@ const MarketConfigSchema = z.strictObject({
  * and §8.2 requires the order to be "stable and recorded in the run manifest".
  */
 const InstanceConfigSchema = z.strictObject({
-  instanceId: Uuid,
+  /**
+   * A canonical lowercase UUIDv7 that ALSO satisfies the `CodeString` grammar.
+   *
+   * Both are required by doors this process must pass: `packages/ledger`'s
+   * `AllocationClaim.instanceId` and `packages/pnl`'s `PnlOwner.instanceId` are
+   * `Uuidv7Schema`, while `packages/risk`'s `context.strategyInstanceId` is
+   * `CodeStringSchema`. The intersection is non-empty — a UUIDv7 whose first
+   * hex digit is a LETTER satisfies both — and it is checked here so the
+   * conflict surfaces at startup rather than as a mid-run risk refusal.
+   */
+  instanceId: UuidAndCodeString,
   runId: Uuid,
   configId: Uuid,
   /** Canonical unsigned integer string (§10.3 `runs.run_seed`). */
@@ -171,6 +264,38 @@ const PlanningConfigSchema = z.strictObject({
   submissionUnknownAfterMs: BoundedMs,
 });
 
+/**
+ * The §9.8 check-19 request budget.
+ *
+ * §9.13's venue rate-limit budget is `WP-310`'s package and does not exist yet;
+ * `packages/simulation`'s venue states `rateLimitModel: "NOT_MODELED"` for the
+ * same reason. What this process CAN measure honestly is its OWN submission
+ * rate against a capacity the operator states — §9.13 forbids hardcoding the
+ * venue's published buckets, and this field does not: the number comes from the
+ * configuration, and the count comes from this process's own submissions.
+ *
+ * Disclosed in `README.md` as an interim measure, replaced when `WP-310` ships.
+ */
+const RequestBudgetSchema = z.strictObject({
+  /** Requests the operator states this process may make per window. */
+  capacity: z.number().int().positive().max(1_000_000),
+  windowMs: BoundedMs,
+});
+
+/**
+ * One §9.8 check-17 shock scenario.
+ *
+ * The SHOCK is operator-stated; the MARK is measured. `yesPriceShock` is a
+ * signed exact decimal added to the market's current YES mark, and the trader
+ * clamps the result into `[0, 1]` — so the scenario a run evaluates is a
+ * function of the book it actually saw, not of a number written months ago.
+ */
+const ScenarioConfigSchema = z.strictObject({
+  scenarioId: CodeString,
+  kind: z.enum(["SPOT", "VOLATILITY", "TIME", "LIQUIDITY"]),
+  yesPriceShock: CanonicalDecimal,
+});
+
 /** The infrastructure endpoints. Names only — no credential is representable. */
 const InfrastructureConfigSchema = z.strictObject({
   /** Redis stream the gateway publishes normalized events to (ADR-003). */
@@ -201,6 +326,16 @@ export const TraderConfigSchema = z.strictObject({
   queues: QueueBoundsSchema,
   features: FeatureConfigSchema,
   planning: PlanningConfigSchema,
+  requestBudget: RequestBudgetSchema,
+  /**
+   * The shock scenarios §9.8 check 17 evaluates.
+   *
+   * REQUIRED and non-empty: `assessScenarios` reports a required kind that was
+   * not supplied as MISSING and the engine refuses the entry — "an unmeasured
+   * scenario is not a passed scenario (fail closed)". A configuration that
+   * omits a kind the policy requires therefore refuses every entry, loudly.
+   */
+  scenarios: z.array(ScenarioConfigSchema).min(1).max(64).readonly(),
   infrastructure: InfrastructureConfigSchema,
   markets: z.array(MarketConfigSchema).min(1).max(1000).readonly(),
   instances: z.array(InstanceConfigSchema).min(1).max(1000).readonly(),

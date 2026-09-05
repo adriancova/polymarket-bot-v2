@@ -98,8 +98,19 @@ export interface ExecutionHealth {
 export interface LoopHealth {
   readonly eventsAccepted: number;
   readonly eventsProcessed: number;
+  /** Events the wire door refused, or whose instant could not be normalised. */
   readonly eventsRefused: number;
   readonly featureSnapshots: number;
+  /**
+   * Evaluations skipped because no feature snapshot could be computed.
+   *
+   * Counted SEPARATELY from `eventsRefused`, because the two are different
+   * facts with different fixes: a refused event is a stream this process cannot
+   * read, while an uncomputable snapshot is ordinary early-run state (no book
+   * has arrived yet). Merging them would make a healthy start look like a feed
+   * problem.
+   */
+  readonly snapshotsUnavailable: number;
   /** Keys the projection could not produce (`projection.ts` rule R5). */
   readonly featureProjectionRefusals: number;
   readonly evaluations: number;
@@ -157,6 +168,7 @@ export class HealthState {
     eventsProcessed: 0,
     eventsRefused: 0,
     featureSnapshots: 0,
+    snapshotsUnavailable: 0,
     featureProjectionRefusals: 0,
     evaluations: 0,
     decisionsPersisted: 0,

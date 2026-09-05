@@ -101,6 +101,16 @@ export interface TraderRefusal {
 export interface PaperTrader {
   readonly loop: CoreLoop;
   readonly registry: InstanceRegistry;
+  /**
+   * The assembled per-market state.
+   *
+   * Published because a composition root's parts are what an operational
+   * surface reads: `WP-240`'s control API and dashboards need the books and the
+   * lifecycle, and a process that hid them would force that package to rebuild
+   * state it does not own. The map is the LIVE one the loop holds, so a reader
+   * sees the current book rather than a stale copy.
+   */
+  readonly markets: ReadonlyMap<string, MarketState>;
   readonly health: HealthState;
   readonly halts: HaltController;
   readonly config: TraderConfig;
@@ -119,6 +129,21 @@ function refuse(
   issues: readonly string[] = [],
 ): CreateTraderResult {
   return { ok: false, refusal: { code, detail, issues } };
+}
+
+/**
+ * The per-field issues a package's refusal carries.
+ *
+ * Pulled out rather than dropped, because a startup refusal whose message says
+ * "failed validation" and nothing else forces an operator to guess which field
+ * was wrong — and guessing at a SAFETY policy's shape is exactly the failure
+ * mode this process exists to prevent.
+ */
+function detailIssues(details: unknown): readonly string[] {
+  if (typeof details !== "object" || details === null) return [];
+  if (!Object.hasOwn(details, "issues")) return [];
+  const issues = (details as Record<string, unknown>)["issues"];
+  return Array.isArray(issues) ? issues.map((issue) => String(issue)) : [];
 }
 
 /**
@@ -152,7 +177,10 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     return refuse(
       "TRADER_RISK_POLICY_REFUSED",
       "the §9.8 risk policy was refused by packages/risk's own door",
-      policy.refusals.map((refusal_) => `${refusal_.code}: ${refusal_.message}`),
+      policy.refusals.flatMap((refusal_) => [
+        `${refusal_.code}: ${refusal_.message}`,
+        ...detailIssues(refusal_.details),
+      ]),
     );
   }
   const caps = parseAllocatorCaps(config.allocatorCaps);
@@ -162,7 +190,10 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
       "the §9.7 allocator caps were refused by packages/capital-allocator's own door — note " +
         "that both live-micro caps are FENCED at 0 there, so a non-zero one is refused by that " +
         "package and not by this one",
-      caps.refusals.map((refusal_) => `${refusal_.code}: ${refusal_.message}`),
+      caps.refusals.flatMap((refusal_) => [
+        `${refusal_.code}: ${refusal_.message}`,
+        ...detailIssues(refusal_.details),
+      ]),
     );
   }
 
@@ -322,6 +353,7 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     trader: {
       loop,
       registry,
+      markets,
       health,
       halts,
       config,
