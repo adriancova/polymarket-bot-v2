@@ -185,10 +185,22 @@ export function ledgerFailure<T>(...refusals: readonly LedgerRefusal[]): LedgerR
  * one more place caller code runs. Copied in FORM (not in body) from
  * `packages/capital-allocator`'s `contained`, which is the WP-180 reference.
  *
- * The two documented THROWS of this package are deliberately outside every
- * guard: `Ledger.empty` and the `LedgerConfigurationError` it raises are a
- * construction-time contract, not a recoverable refusal, and `WP-200`'s tests
- * pin them.
+ * THE DOCUMENTED THROWS OF THIS PACKAGE are deliberately outside every guard,
+ * and they all raise {@link LedgerConfigurationError} — a construction-time
+ * contract violation, not a recoverable refusal. The claim was written as "the
+ * two throws" and is qualified here (`WP-200-FU1` review round 1, finding L1),
+ * because it was never a count of two SITES and the review round that brought
+ * `balance.ts` under D1 added more:
+ *
+ * - `Ledger.empty` (and therefore `Ledger.rebuild`, which constructs through it);
+ * - `balance.ts`'s five DERIVATIONS — `netByAsset`, `attributionBuckets`,
+ *   `legKey`, `legDeltas`, `attributionBucketKey` — which have no refusal
+ *   channel in their signatures, so an input that is not plain own data takes
+ *   this one;
+ * - `balance.ts`'s `isExactNegation`, for an argument that is not a real `Map`.
+ *
+ * Everything else in this package answers in a `LedgerResult` or a refusal list,
+ * and `WP-200`'s and `WP-200-FU1`'s tests pin both halves.
  */
 export function contained<T>(body: () => LedgerResult<T>): LedgerResult<T> {
   try {

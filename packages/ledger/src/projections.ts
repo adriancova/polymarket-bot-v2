@@ -63,7 +63,11 @@
 import type { DecimalString } from "@polymarket-bot/decimal";
 import { addDecimal, isZeroDecimal, subDecimal } from "@polymarket-bot/decimal";
 
-import { attributionBucketKey, attributionBuckets } from "./balance.js";
+// `attributionBucketsOfValidated`, not the D1 door: `appended.transaction` was
+// materialized by `validateTransactionInput` before it was appended, and the
+// door would put a new throw site inside `projectLedger`, which has no
+// containment guard. See `balance.ts`'s header.
+import { attributionBucketKey, attributionBucketsOfValidated } from "./balance.js";
 import { deepFreeze, frozenMap, plainRecord } from "./immutable.js";
 import type { Ledger } from "./ledger.js";
 import type { AppendedLedgerTransaction } from "./transaction.js";
@@ -309,7 +313,7 @@ export function applyTransaction(
   // by the SAME `attributionBuckets` the refusal uses.
   const breachedBuckets = new Set<string>();
   const unexplained: UnexplainedActualMovementRecord[] = [];
-  for (const [bucketKey, bucket] of attributionBuckets(appended.transaction)) {
+  for (const [bucketKey, bucket] of attributionBucketsOfValidated(appended.transaction)) {
     const gap = subDecimal(bucket.actualDelta, bucket.attributedDelta);
     if (isZeroDecimal(gap)) {
       continue;

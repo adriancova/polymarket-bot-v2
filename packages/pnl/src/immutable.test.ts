@@ -10,7 +10,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { deepFreeze } from "./immutable.js";
+import { deepFreeze, plainFrozen } from "./immutable.js";
 import { serializePnlState, serializeRealizedPnl } from "./serialize.js";
 import { computePnlSnapshot } from "./snapshot.js";
 import { applyPnlRecord, emptyPnlState, foldPnlRecords } from "./state.js";
@@ -287,18 +287,42 @@ describe("deepFreeze memoises only what it actually froze", () => {
     expect(Object.isFrozen(node)).toBe(true);
   });
 
+  /**
+   * THE MUTATION THIS TEST EXISTS TO KILL, and why it did not (`WP-200-FU1`
+   * review round 1, finding L2). The twin of the note in
+   * `packages/ledger/src/immutable.test.ts`, kept in both copies because the two
+   * modules are deliberate duplicates (no §2.1 row permits a `ledger` ⇄ `pnl`
+   * edge) and a strengthening applied to one only is a strengthening that rots.
+   *
+   * Round 1 installed an inherited STRING at `Object.prototype.value` and
+   * asserted only "it returned" and "the holder is frozen". Under the mutation —
+   * `"value" in descriptor` for `Object.hasOwn(descriptor, "value")` — the
+   * accessor's descriptor reads as a data descriptor, `descriptor.value` is the
+   * inherited string, and `deepFreeze` returns it untouched at the primitive
+   * guard: identical observable outcome. MEASURED at tip `7d5ac34`, with the
+   * mutation applied in both packages, the whole root suite (229 files, 5354
+   * tests) passed.
+   *
+   * Making the inherited `value` an OBJECT discriminates: the correct
+   * implementation never reaches it, the mutation freezes it.
+   */
   it("reads a descriptor with `Object.hasOwn`, not `in`, so an inherited `value` cannot fool it", () => {
     // The same class as `plain-data.ts` review round 6: `"value" in descriptor`
     // answers for an INHERITED name, so with `Object.prototype.value` defined
     // every ACCESSOR descriptor read as a data descriptor.
+    const inheritedTarget: Record<string, unknown> = { realized: "4" };
     const holder: Record<string, unknown> = {};
+    let getterRuns = 0;
     Object.defineProperty(holder, "computed", {
-      get: () => "never read",
+      get: () => {
+        getterRuns += 1;
+        return "never read";
+      },
       enumerable: true,
       configurable: true,
     });
     Object.defineProperty(Object.prototype, "value", {
-      value: "inherited",
+      value: inheritedTarget,
       writable: true,
       enumerable: false,
       configurable: true,
@@ -314,5 +338,43 @@ describe("deepFreeze memoises only what it actually froze", () => {
     }
     expect(outcome).toBe("FROZE");
     expect(Object.isFrozen(holder)).toBe(true);
+    // THE DISCRIMINATOR. `Object.hasOwn` skips the accessor, so the inherited
+    // object is never reached; `"value" in descriptor` reaches it and freezes it.
+    expect(Object.isFrozen(inheritedTarget)).toBe(false);
+    inheritedTarget["realized"] = "5";
+    expect(inheritedTarget["realized"]).toBe("5");
+    // And the accessor itself is never invoked, under either reading.
+    expect(getterRuns).toBe(0);
+  });
+
+  it("`plainFrozen` reads descriptors the same way: an inherited `value` is not COPIED", () => {
+    // The same mutation on the other `Object.hasOwn` in this module, where it is
+    // worse than an over-freeze: `plainFrozen` builds what this package EMITS, so
+    // reading an accessor's descriptor as a data descriptor would copy the
+    // INHERITED value into a PnL record under the accessor's own key.
+    const source: Record<string, unknown> = { shares: "10" };
+    Object.defineProperty(source, "price", {
+      get: () => "0.99",
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(Object.prototype, "value", {
+      value: "0.01",
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+    let keys: readonly string[];
+    let priceRead: unknown;
+    try {
+      const emitted = plainFrozen(source);
+      keys = Object.getOwnPropertyNames(emitted).sort();
+      priceRead = (emitted as Record<string, unknown>)["price"];
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)["value"];
+    }
+    // The accessor is dropped, not copied: only the own DATA property survives.
+    expect(keys).toEqual(["shares"]);
+    expect(priceRead).toBeUndefined();
   });
 });

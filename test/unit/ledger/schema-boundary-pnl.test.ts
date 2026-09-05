@@ -418,6 +418,12 @@ const KEY_MATERIAL: readonly string[] = candidateKeys(
     "settlementState",
     "reversesRef",
     "costBasis",
+    // `WP-200-FU1` review round 1, finding M2. `candidateKeys` derives an index
+    // name only when one is a string VALUE of an input, so this battery swept
+    // `"10"` and never `"0"` — the index an accumulator reaches FIRST and the
+    // only one under which `emptyPnlState` refuses a legitimate identity. Its
+    // sibling battery carries the same name for the same reason.
+    "0",
   ],
 );
 

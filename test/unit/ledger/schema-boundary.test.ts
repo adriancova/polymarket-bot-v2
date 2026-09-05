@@ -47,6 +47,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   Ledger,
+  LedgerConfigurationError,
   LedgerTransactionInputSchema,
   allocateFill,
   buildFillPosting,
@@ -56,6 +57,7 @@ import {
 } from "../../../packages/ledger/src/index.js";
 import {
   DESCRIPTOR_ATTRIBUTE_NAMES,
+  POLLUTION_SHAPES,
   ZOD_PARSE_STATE_NAMES,
   candidateKeys,
   canonical,
@@ -310,6 +312,32 @@ describe("schema-boundary §3: the doors the census found beyond the audit row",
 // The full measured-class battery
 // ---------------------------------------------------------------------------
 
+/**
+ * `Ledger.empty`'s REFUSAL CHANNEL, in the form the harness can compare.
+ *
+ * `WP-200-FU1` review round 1, finding M2. `Ledger.empty` and `Ledger.rebuild`
+ * answer a mode they cannot bind with a documented THROW
+ * (`LedgerConfigurationError`), not with a `LedgerResult` — the construction-time
+ * contract this package states at `refusals.ts`. So for THESE doors a typed
+ * throw is a refusal, not an ADR-020 §6 escape, and every scenario that
+ * constructs a ledger says so explicitly instead of letting the harness read it
+ * as `ESCAPE`. This is exactly what `schema-boundary-pnl.test.ts` already does
+ * for `emptyPnlState`, and the ledger battery not doing it is why it was
+ * structurally blind to index `"0"`: the ONE name that makes these two throw.
+ *
+ * Note what is NOT caught here: only `LedgerConfigurationError`. An untyped
+ * throw still propagates and is still recorded as `THREW`/`ESCAPE`, so the
+ * totality half of the bound keeps its teeth.
+ */
+function emptyLedgerOrRefusal(environment: string): Ledger | string {
+  try {
+    return Ledger.empty(environment as never);
+  } catch (error) {
+    if (error instanceof LedgerConfigurationError) return "REFUSED LedgerConfigurationError";
+    throw error;
+  }
+}
+
 /** A complete honest scenario: allocate, post, append, project, serialize. */
 function honestFold(): string {
   const allocation = allocateFill(FILL_FACT, [{ instanceId: INSTANCE, shares: "6" }]);
@@ -318,7 +346,9 @@ function honestFold(): string {
   }
   const posting = buildFillPosting(allocation.value, ACCOUNTS, IDS);
   if (!posting.ok) return `REFUSED post:${posting.refusals.map((r) => r.code).join(",")}`;
-  let ledger = Ledger.empty("PAPER");
+  const opened = emptyLedgerOrRefusal("PAPER");
+  if (typeof opened === "string") return opened;
+  let ledger = opened;
   for (const transaction of posting.value.transactions) {
     const appended = ledger.append(transaction);
     if (!appended.ok) {
@@ -368,10 +398,37 @@ const SCENARIOS: readonly Scenario[] = [
     run: () => describeResult(buildFillPosting(ALLOCATION_NO_CLAIMS as never, ACCOUNTS, IDS)),
   },
   {
+    name: "Ledger.empty(valid run mode)",
+    run: () => {
+      const opened = emptyLedgerOrRefusal("PAPER");
+      return typeof opened === "string" ? opened : `OK environment=${opened.environment}`;
+    },
+  },
+  {
+    name: "Ledger.empty(mode that is not a run mode)",
+    run: () => {
+      const opened = emptyLedgerOrRefusal("BANANA");
+      return typeof opened === "string" ? opened : `OK environment=${opened.environment}`;
+    },
+  },
+  {
+    name: "Ledger.rebuild(valid run mode, empty history)",
+    run: () => {
+      try {
+        return describeResult(Ledger.rebuild("PAPER", []));
+      } catch (error) {
+        if (error instanceof LedgerConfigurationError) return "REFUSED LedgerConfigurationError";
+        throw error;
+      }
+    },
+  },
+  {
     name: "Ledger.append(valid deposit)",
-    run: () =>
-      describeResult(
-        Ledger.empty("PAPER").append({
+    run: () => {
+      const opened = emptyLedgerOrRefusal("PAPER");
+      if (typeof opened === "string") return opened;
+      return describeResult(
+        opened.append({
           ledgerTransactionId: TX,
           eventType: "DEPOSIT_OBSERVED",
           environment: "PAPER",
@@ -409,7 +466,8 @@ const SCENARIOS: readonly Scenario[] = [
             },
           ],
         }),
-      ),
+      );
+    },
   },
   { name: "the honest allocate → post → append → project fold", run: honestFold },
 ];
@@ -417,6 +475,14 @@ const SCENARIOS: readonly Scenario[] = [
 /**
  * The key material, DERIVED from the inputs (never hand-listed), plus the
  * library's own consulted state names and the descriptor attributes.
+ *
+ * `"0"` IS IN THE MATERIAL DELIBERATELY (`WP-200-FU1` review round 1, finding
+ * M2). `candidateKeys` derives index names only when one happens to be a string
+ * VALUE in the inputs — `"6"` and `"10"` arrive that way, from `shares` — so
+ * before this round the battery swept indices 6 and 10 and never 0. Index `"0"`
+ * is the one an accumulator reaches FIRST, and it is the only name under which
+ * `Ledger.empty`/`Ledger.rebuild` refuse a legitimate call; a battery that
+ * cannot express the door's smallest failing input is not measuring it.
  */
 const KEY_MATERIAL: readonly string[] = candidateKeys(
   {
@@ -426,7 +492,7 @@ const KEY_MATERIAL: readonly string[] = candidateKeys(
     ids: { ...IDS, feeTransactionId: TX },
     claim: { instanceId: INSTANCE, runId: INSTANCE, shares: "6", feeAmount: "0.01" },
   },
-  [...ZOD_PARSE_STATE_NAMES, ...DESCRIPTOR_ATTRIBUTE_NAMES, "zzUnrelated", "haltRequired"],
+  [...ZOD_PARSE_STATE_NAMES, ...DESCRIPTOR_ATTRIBUTE_NAMES, "zzUnrelated", "haltRequired", "0"],
 );
 
 /**
@@ -436,8 +502,8 @@ const KEY_MATERIAL: readonly string[] = candidateKeys(
  * W2/W3). `packages/risk`'s canonical door accumulates into ordinary arrays
  * (`state.strings`, `state.problems`, and `readArray`'s output) with
  * `Array.prototype.push`, which is `Set` and therefore consults the prototype
- * chain for the INDEX name. An inherited get-only accessor at `"6"` or `"10"`
- * makes that push throw, `readPlainData`'s own outer guard turns it into
+ * chain for the INDEX name. An inherited get-only accessor at `"0"`, `"6"` or
+ * `"10"` makes that push throw, `readPlainData`'s own outer guard turns it into
  * `reading it as data failed unexpectedly … (fail closed)`, and the door
  * REFUSES an honest input.
  *
@@ -448,10 +514,44 @@ const KEY_MATERIAL: readonly string[] = candidateKeys(
  * outside `WP-200-FU1`'s allowed paths, so it is DISCLOSED here and carried as
  * a follow-up rather than fixed in this package. It is enumerated so it cannot
  * grow: any availability divergence at a NON-index name fails the battery.
+ *
+ * THE HONEST WIDTH OF THE CLASS, corrected in review round 1 (finding M2). The
+ * sentence this comment used to carry — that materializing a run mode "is a
+ * pass-through for every legitimate call" — was measurably false, and the
+ * battery could not have caught it, because index `"0"` was not in its material
+ * and the two CONSTRUCTORS answer only at `"0"`:
+ *
+ * ```text
+ * get-only accessor at Object.prototype["0"]     base 761db76   tip 7d5ac34
+ *   Ledger.empty("PAPER")                        OK             LedgerConfigurationError
+ *   Ledger.rebuild("PAPER", [])                  OK             LedgerConfigurationError
+ *   emptyPnlState(valid identity)                bare TypeError PnlConfigurationError
+ * ```
+ *
+ * So the class is TIP-ONLY for the two ledger constructors (base admitted the
+ * honest call; the tip refuses it) and NOT new for `emptyPnlState`, where the
+ * base already threw — untyped, an ADR-020 §6 ESCAPE — and the door converts it
+ * into the documented typed channel. Both directions are fail-closed. The root
+ * cause is one line of `packages/risk`: an append that must use
+ * `CreateDataProperty` semantics instead of `Array.prototype.push`, the same fix
+ * `pollution.ts`'s own `appendData` applies to this harness. That widening is
+ * queued as a separate authorized round; this file's job is to keep the class
+ * VISIBLE and BOUNDED until it lands.
  */
 function isArrayIndexName(property: string): boolean {
   return /^(?:0|[1-9][0-9]*)$/u.test(property);
 }
+
+/**
+ * The `accessor-get-only` shape, taken FROM the shared table rather than
+ * re-declared, so the per-name pin below cannot drift from the battery's own
+ * definition of the class it is pinning.
+ */
+const GET_ONLY_SHAPE = (() => {
+  const shape = POLLUTION_SHAPES.find((candidate) => candidate.name === "accessor-get-only");
+  if (shape === undefined) throw new Error("the accessor-get-only shape is gone");
+  return shape;
+})();
 
 /**
  * Every divergence the bound does NOT allow.
@@ -499,17 +599,95 @@ describe("the measured-class battery over every `packages/ledger` door", () => {
         (property) => !isArrayIndexName(property),
       ),
     ).toEqual([]);
-    // … only ever under an ACCESSOR shape (a DATA property at an index name is
-    // shadowed by the array's own element and changes nothing) …
+    // … under any of the seven measured shapes.
+    //
+    // THIS LIST GREW IN REVIEW ROUND 1 (finding M2), and the sentence it
+    // replaces was the second false claim this test carried: "a DATA property at
+    // an index name is shadowed by the array's own element and changes nothing".
+    // True at `"5"`, `"6"` and `"10"` — the only indices the derived material
+    // happened to contain — and FALSE at `"0"`, because an inherited data
+    // property at `"0"` is not shadowed on an EMPTY array. Measured at this tip
+    // with the battery's own scenarios UNCHANGED, so it is a property of the
+    // door and not of the rows added around it:
+    //
+    //   Ledger.append(valid deposit) | 0 | data-E-1        -> AVAILABILITY
+    //   Ledger.append(valid deposit) | 0 | data-NE-uuid    -> AVAILABILITY
+    //   the honest fold              | 0 | fn-false        -> AVAILABILITY
+    //
+    // Every one of them still lands on a typed refusal (below), so the class is
+    // wider than it was described but no weaker: fail-closed at every shape.
     expect([...new Set(divergences.map((divergence) => divergence.shape))].sort()).toEqual([
       "accessor-get-only",
       "accessor-throws",
+      "data-E-1",
+      "data-NE-optional",
+      "data-NE-true",
+      "data-NE-uuid",
+      "fn-false",
     ]);
-    // … and it always lands on the door's own typed refusal, never a throw.
+    // … and it always lands on a typed refusal, never a throw. The two
+    // `LedgerConfigurationError` entries are the CONSTRUCTORS' refusal channel
+    // (`emptyLedgerOrRefusal`): `Ledger.empty`/`Ledger.rebuild` answer with a
+    // documented typed throw rather than a `LedgerResult`, and only at `"0"`.
     expect([...new Set(divergences.map((divergence) => divergence.polluted))].sort()).toEqual([
       "REFUSED LEDGER_INPUT_INVALID",
+      "REFUSED LEDGER_UNBALANCED_ASSET,LEDGER_ATTRIBUTION_PARITY_BROKEN",
+      "REFUSED LedgerConfigurationError",
       "REFUSED alloc:LEDGER_INPUT_INVALID",
+      "REFUSED append:LEDGER_INPUT_INVALID",
+      "REFUSED append:LEDGER_UNBALANCED_ASSET,LEDGER_ATTRIBUTION_PARITY_BROKEN",
     ]);
+    // Fail-closed, stated once more as a property rather than as a list: no
+    // polluted answer is ever an acceptance, and none is ever a bare throw.
+    for (const divergence of divergences) {
+      expect(divergence.polluted.startsWith("REFUSED"), render([divergence])[0]).toBe(true);
+    }
+  });
+
+  it("the constructors' index-`0` class is EXACTLY as disclosed, and only at `0`", () => {
+    // Non-vacuity for the disclosure at `isArrayIndexName`, pinned per name so
+    // it cannot quietly widen to another index or quietly disappear. This is the
+    // observation review round 1 finding M2 reproduced at this tip; the base
+    // half (`Ledger.empty` OK at `"0"`, `emptyPnlState` a BARE `TypeError`) is
+    // recorded in `ledger.ts` and `packages/pnl/src/state.ts` because it needs
+    // two commits at once and cannot be executed from one tree.
+    const answersAt = (property: string): readonly string[] => {
+      const scenarios: readonly Scenario[] = [
+        {
+          name: "Ledger.empty",
+          run: () => {
+            const opened = emptyLedgerOrRefusal("PAPER");
+            return typeof opened === "string" ? opened : "OK";
+          },
+        },
+        {
+          name: "Ledger.rebuild",
+          run: () => {
+            try {
+              return Ledger.rebuild("PAPER", []).ok ? "OK" : "REFUSED";
+            } catch (error) {
+              if (error instanceof LedgerConfigurationError) {
+                return "REFUSED LedgerConfigurationError";
+              }
+              throw error;
+            }
+          },
+        },
+      ];
+      return sweep(scenarios, [property], [GET_ONLY_SHAPE]).map(
+        (divergence) => `${divergence.scenario} ${divergence.kind} ${divergence.polluted}`,
+      );
+    };
+
+    expect(answersAt("0")).toEqual([
+      "Ledger.empty AVAILABILITY REFUSED LedgerConfigurationError",
+      "Ledger.rebuild AVAILABILITY REFUSED LedgerConfigurationError",
+    ]);
+    // Not at the next index, and not at a non-index name: the class is the FIRST
+    // append the shared door makes, not "any inherited property".
+    expect(answersAt("1")).toEqual([]);
+    expect(answersAt("6")).toEqual([]);
+    expect(answersAt("environment")).toEqual([]);
   });
 
   it("THE BOUND holds for the `optin`/`optout` PAIR (neither name alone flips it)", () => {

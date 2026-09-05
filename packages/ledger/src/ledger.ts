@@ -41,11 +41,16 @@ import type { RunMode } from "@polymarket-bot/domain";
 import { readPlainData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 
+// The `…OfValidated` cores, not the D1 doors: every transaction that reaches
+// these checks has already been materialized by `validateTransactionInput`, and
+// re-walking the whole tree per append would be the only thing the door added
+// here. See `balance.ts`'s header for why the cores exist and why they are not
+// re-exported by `src/index.ts`.
 import {
-  checkAttributionParity,
-  checkPerAssetBalance,
+  checkAttributionParityOfValidated,
+  checkPerAssetBalanceOfValidated,
   isExactNegation,
-  legDeltas,
+  legDeltasOfValidated,
 } from "./balance.js";
 import { plainFrozen } from "./immutable.js";
 import type { LedgerRefusal, LedgerResult } from "./refusals.js";
@@ -110,10 +115,35 @@ export class Ledger {
    * An empty ledger bound to one environment. Throws on a malformed mode.
    *
    * D1 (`readPlainData`) then D2 (the arena copy); D3 is the `read.value` the
-   * constructor is handed, not `parsed.data`. A run mode is a string, so the
-   * materialization is a pass-through for every legitimate call — it is here so
+   * constructor is handed, not `parsed.data`. The materialization is here so
    * that a caller handing an OBJECT to the §10.8 discriminator is refused by a
    * read that runs no getter and no trap, rather than by a schema that does.
+   *
+   * IT IS NOT A PASS-THROUGH, and the comment that used to say it was is
+   * corrected here (`WP-200-FU1` review round 1, finding M2 — measured, not
+   * reasoned). A run mode is a string, but materializing even a string appends
+   * to the shared door's `state.strings` accumulator with `Array.prototype
+   * .push`, which is `Set` and therefore consults the prototype chain for the
+   * INDEX name. So an inherited get-only accessor at `Object.prototype["0"]`
+   * makes that FIRST append throw, and this constructor answers:
+   *
+   * ```text
+   * tip 7d5ac34, get-only accessor at Object.prototype["0"]:
+   *   Ledger.empty("PAPER")       -> THREW LedgerConfigurationError
+   *   Ledger.rebuild("PAPER", []) -> THREW LedgerConfigurationError (cannot construct)
+   * base 761db76, the same probe:
+   *   Ledger.empty("PAPER")       -> OK
+   *   Ledger.rebuild("PAPER", []) -> OK
+   * ```
+   *
+   * That is a TIP-ONLY AVAILABILITY class, and it FAILS CLOSED: nothing is
+   * admitted, nothing is invented, and the answer is this function's own
+   * documented typed error rather than a bare `TypeError`. It is disclosed
+   * rather than fixed because the root cause is `packages/risk`'s
+   * `plain-data.ts` — outside `WP-200-FU1`'s allowed paths — and its widening to
+   * `CreateDataProperty` appends is queued as a separate authorized round. The
+   * ledger battery in `test/unit/ledger/schema-boundary.test.ts` carries `"0"`
+   * in its key material precisely so this class cannot grow unobserved.
    */
   static empty(environment: RunMode): Ledger {
     try {
@@ -233,8 +263,8 @@ export class Ledger {
     }
 
     refusals.push(...this.checkAssetBindings(transaction));
-    refusals.push(...checkPerAssetBalance(transaction));
-    refusals.push(...checkAttributionParity(transaction));
+    refusals.push(...checkPerAssetBalanceOfValidated(transaction));
+    refusals.push(...checkAttributionParityOfValidated(transaction));
     refusals.push(...this.checkReversal(transaction));
 
     if (refusals.length > 0) {
@@ -357,7 +387,12 @@ export class Ledger {
         ),
       ];
     }
-    if (!isExactNegation(legDeltas(target.transaction), legDeltas(transaction))) {
+    if (
+      !isExactNegation(
+        legDeltasOfValidated(target.transaction),
+        legDeltasOfValidated(transaction),
+      )
+    ) {
       return [
         ledgerRefusal(
           "LEDGER_REVERSAL_NOT_COMPENSATING",

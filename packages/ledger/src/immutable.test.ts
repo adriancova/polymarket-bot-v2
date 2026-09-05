@@ -15,7 +15,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { deepFreeze, frozenMap, frozenSet } from "./immutable.js";
+import { deepFreeze, frozenMap, frozenSet, plainFrozen } from "./immutable.js";
 import { Ledger } from "./ledger.js";
 import {
   applyTransaction,
@@ -316,18 +316,48 @@ describe("deepFreeze memoises only what it actually froze", () => {
     expect(Object.isFrozen(node)).toBe(true);
   });
 
+  /**
+   * THE MUTATION THIS TEST EXISTS TO KILL, and why it did not (`WP-200-FU1`
+   * review round 1, finding L2).
+   *
+   * Round 1's version installed `Object.prototype.value = "inherited"`, put an
+   * ACCESSOR on the holder, and asserted only that `deepFreeze` returned
+   * ("FROZE") and that the holder ended up frozen. Under the mutation —
+   * `"value" in descriptor` in place of `Object.hasOwn(descriptor, "value")` —
+   * the accessor's descriptor DOES read as a data descriptor, `descriptor.value`
+   * resolves to the inherited STRING, and `deepFreeze("inherited")` returns it
+   * untouched at the primitive guard. Same return, same frozen holder, same
+   * outcome string: the test could not tell the two implementations apart.
+   *
+   * MEASURED at tip `7d5ac34`: with the mutation applied to `deepFreeze` in BOTH
+   * this package and `@polymarket-bot/pnl`, the whole root suite — 229 files,
+   * 5354 tests — passed.
+   *
+   * What discriminates is making the inherited `value` an OBJECT and then asking
+   * what happened TO IT. The correct implementation never looks at an accessor's
+   * `value`, so the inherited object is untouched; the mutation walks into it and
+   * freezes it. Freezing a value nobody handed to this module is not cosmetic:
+   * `deepFreeze` is how this package makes a monetary record unwritable, and a
+   * version that follows an INHERITED reference freezes whatever the prototype
+   * chain points at — including an object a caller is still filling in.
+   */
   it("reads a descriptor with `Object.hasOwn`, not `in`, so an inherited `value` cannot fool it", () => {
     // The same class as `plain-data.ts` review round 6: `"value" in descriptor`
     // answers for an INHERITED name, so with `Object.prototype.value` defined
     // every ACCESSOR descriptor read as a data descriptor.
+    const inheritedTarget: Record<string, unknown> = { costBasis: "4" };
     const holder: Record<string, unknown> = {};
+    let getterRuns = 0;
     Object.defineProperty(holder, "computed", {
-      get: () => "never read",
+      get: () => {
+        getterRuns += 1;
+        return "never read";
+      },
       enumerable: true,
       configurable: true,
     });
     Object.defineProperty(Object.prototype, "value", {
-      value: "inherited",
+      value: inheritedTarget,
       writable: true,
       enumerable: false,
       configurable: true,
@@ -343,5 +373,43 @@ describe("deepFreeze memoises only what it actually froze", () => {
     }
     expect(outcome).toBe("FROZE");
     expect(Object.isFrozen(holder)).toBe(true);
+    // THE DISCRIMINATOR. `Object.hasOwn` skips the accessor, so the inherited
+    // object is never reached; `"value" in descriptor` reaches it and freezes it.
+    expect(Object.isFrozen(inheritedTarget)).toBe(false);
+    inheritedTarget["costBasis"] = "5";
+    expect(inheritedTarget["costBasis"]).toBe("5");
+    // And the accessor itself is never invoked, under either reading.
+    expect(getterRuns).toBe(0);
+  });
+
+  it("`plainFrozen` reads descriptors the same way: an inherited `value` is not COPIED", () => {
+    // The same mutation on the other `Object.hasOwn` in this module. There it is
+    // worse than an over-freeze: `plainFrozen` builds what this package EMITS, so
+    // reading an accessor's descriptor as a data descriptor would copy the
+    // INHERITED value into a monetary record under the accessor's own key.
+    const source: Record<string, unknown> = { shares: "10" };
+    Object.defineProperty(source, "price", {
+      get: () => "0.99",
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(Object.prototype, "value", {
+      value: "0.01",
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+    let keys: readonly string[];
+    let priceRead: unknown;
+    try {
+      const emitted = plainFrozen(source);
+      keys = Object.getOwnPropertyNames(emitted).sort();
+      priceRead = (emitted as Record<string, unknown>)["price"];
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)["value"];
+    }
+    // The accessor is dropped, not copied: only the own DATA property survives.
+    expect(keys).toEqual(["shares"]);
+    expect(priceRead).toBeUndefined();
   });
 });

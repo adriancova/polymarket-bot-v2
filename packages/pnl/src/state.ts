@@ -165,6 +165,22 @@ export interface PnlState {
  * need: under an inherited get-only accessor at an ARRAY-INDEX name the shared
  * door's own accumulator throws a bare `TypeError`, and that escaped
  * `foldPnlRecords` untyped.
+ *
+ * THE INDEX NAME REACHED FIRST IS `"0"` (`WP-200-FU1` review round 1, finding
+ * M2 — measured both ways rather than reasoned):
+ *
+ * ```text
+ * get-only accessor at Object.prototype["0"], a LEGITIMATE identity:
+ *   base 761db76  emptyPnlState(IDENTITY) -> THREW TypeError (bare, ESCAPED)
+ *   tip  7d5ac34  emptyPnlState(IDENTITY) -> THREW PnlConfigurationError (typed)
+ * ```
+ *
+ * So for THIS function the class is not new — it existed at base and escaped
+ * untyped; the door converts it into the documented channel. It is availability,
+ * not permission: nothing is admitted and nothing is invented. The root cause is
+ * `packages/risk`'s `plain-data.ts` appending with `Array.prototype.push`
+ * instead of `CreateDataProperty`; that module is outside `WP-200-FU1`'s allowed
+ * paths and its widening is queued as a separate authorized round.
  */
 export function emptyPnlState(identity: PnlStreamIdentity): PnlState {
   try {

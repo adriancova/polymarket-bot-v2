@@ -39,11 +39,17 @@
  * 2. **The canonical bodies are unchanged by the collapse.** Their sha256 below
  *    the header markers is pinned to what the three deleted copies carried.
  *    This is the byte-identity claim the collapse rests on, kept mechanical.
- * 3. **Both consumers resolve the modules from `packages/risk`** — the
+ * 3. **Every consumer resolves the modules from `packages/risk`** — the
  *    dependency is declared, the `exports` map publishes exactly the two
  *    subpaths, every consumer import goes through a package specifier that the
  *    map resolves back to the canonical file, and no relative import of a local
- *    copy survives.
+ *    copy survives. *(`WP-200-FU1` review round 1, finding M1: the `CONSUMERS`
+ *    table below grew the **S5** and **S6** rows, so "every consumer" now means
+ *    four rather than two. The property these guards do NOT cover — that the
+ *    edge carries the door and not the risk ENGINE — is pinned for S3 in
+ *    `test/unit/risk/ports.test.ts`, for S4 in
+ *    `test/unit/execution-planner/ports.test.ts`, and for S5/S6 in
+ *    `test/unit/ledger/ports.test.ts`.)*
  */
 
 import { createHash } from "node:crypto";
@@ -92,10 +98,23 @@ const MODULES: readonly Module[] = [
   },
 ];
 
-/** The consumers of the two §2.1 rows, and the edge each row permits. */
+/**
+ * The consumers of the §2.1 door rows, and the edge each row permits.
+ *
+ * `WP-200-FU1` review round 1, finding M1 added **S5** and **S6**. The two
+ * guards below are written over this table, so extending it is the whole
+ * change: `packages/ledger` and `packages/pnl` are now held to the same two
+ * properties as the original pair — they declare the edge the row permits, and
+ * they reach the door only through the package specifier. The DOOR-ONLY half of
+ * those rows (no import of the risk engine ROOT, which neither guard here can
+ * see because a root specifier ends in neither module name) is pinned in
+ * `test/unit/ledger/ports.test.ts`, modelled on `test/unit/risk/ports.test.ts`.
+ */
 const CONSUMERS = [
   { row: "S3", dir: "packages/capital-allocator" },
   { row: "S4", dir: "packages/execution-planner" },
+  { row: "S5", dir: "packages/ledger" },
+  { row: "S6", dir: "packages/pnl" },
 ] as const;
 
 /** The shared scan's reader, under this file's original short name. */
@@ -489,7 +508,7 @@ describe("the collapsed parse door exists in exactly one package (WP-180-FU2)", 
     }
   });
 
-  it("both consumers declare the workspace dependency the §2.1 row permits", () => {
+  it("every consumer declares the workspace dependency the §2.1 row permits", () => {
     for (const consumer of CONSUMERS) {
       const manifest: unknown = JSON.parse(read(`${consumer.dir}/package.json`));
       const dependencies = (manifest as { dependencies?: Record<string, string> }).dependencies;
@@ -500,7 +519,7 @@ describe("the collapsed parse door exists in exactly one package (WP-180-FU2)", 
     }
   });
 
-  it("both consumers import the door ONLY through the package specifier", () => {
+  it("every consumer imports the door ONLY through the package specifier", () => {
     const problems: string[] = [];
 
     for (const consumer of CONSUMERS) {
