@@ -21,8 +21,16 @@
  * STRUCTURAL CONTRACT: `@polymarket-bot/ledger`'s `buildFillPosting` emits
  * objects that parse under `PnlTradeRecordSchema` / `PnlFeeRecordSchema`.
  * There is deliberately no package edge between the two layer-1 packages
- * (no dependency-direction §2.1 row permits one); the agreement is pinned by
- * the cross-package suite in `test/unit/ledger/`.
+ * (no dependency-direction §2.1 row permits one; the `WP-200-FU1` rows **S5**
+ * and **S6** both run to `packages/risk` and carry the parse door only); the
+ * agreement is pinned by the cross-package suite in `test/unit/ledger/`.
+ *
+ * THE DOORS THIS MODULE OWNS (ADR-020 §3 step 2; `WP-200-FU1`, 2026-09-04).
+ * {@link PnlRecordDoor} and {@link PnlStreamIdentityDoor} are the WARMED arena
+ * copies the fold parses through. They are declared here, next to the schemas
+ * they copy, and built at MODULE LOAD — which is what closes the class this
+ * package was measured LIVE on, and the only class in the audit whose damage
+ * outlives the polluted call.
  */
 
 import {
@@ -36,7 +44,10 @@ import {
   RunModeSchema,
   Uuidv7Schema,
 } from "@polymarket-bot/domain";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
+
+import { plainFrozen } from "./immutable.js";
 
 /**
  * The owner of one PnL stream: one state folds exactly one owner.
@@ -106,9 +117,16 @@ export const PnlStreamIdentitySchema = z.discriminatedUnion("scope", [
 
 export type PnlStreamIdentity = Readonly<z.infer<typeof PnlStreamIdentitySchema>>;
 
-/** The owner half of a stream identity — what a record's `owner` must match. */
+/**
+ * The owner half of a stream identity — what a record's `owner` must match.
+ *
+ * **D4** (`WP-200-FU1`): the emitted owner has no prototype, so
+ * `owner.instanceId` on a non-strategy owner is absent for every later read —
+ * including `sameOwner`'s, which decides whether a record belongs to this
+ * stream at all.
+ */
 export function pnlOwnerOf(identity: PnlStreamIdentity): PnlOwner {
-  return Object.freeze(
+  return plainFrozen(
     identity.scope === "VIRTUAL_STRATEGY"
       ? {
           scope: "VIRTUAL_STRATEGY" as const,
@@ -276,3 +294,40 @@ export type PnlFeeRecord = Readonly<z.infer<typeof PnlFeeRecordSchema>>;
 export type PnlRewardPayoutRecord = Readonly<z.infer<typeof PnlRewardPayoutRecordSchema>>;
 export type PnlRewardEstimateRecord = Readonly<z.infer<typeof PnlRewardEstimateRecordSchema>>;
 export type PnlRecord = Readonly<z.infer<typeof PnlRecordSchema>>;
+
+/**
+ * **D2** — the record union's PARSING COPY, built and WARMED at module load.
+ *
+ * THE DEFECT THIS CLOSES, and it is the sharpest one in the `GOV-2A` audit's
+ * `packages/pnl` row because its damage OUTLIVES the polluted call. On the
+ * FIRST parse of a discriminated union the library rebuilds each option's
+ * `shape` as an ordinary spread literal, walks it with `for…in` to compute
+ * `propValues`, and builds the discriminator map from those tables. `for…in`
+ * enumerates INHERITED enumerable names, so ONE enumerable data property on
+ * `Object.prototype` aborted that build — and the half-computed lazy is then
+ * POISONED for the life of the process. Measured at `main` `761db76`, on a
+ * fresh import of `state.js` (probe R; the transcript is quoted in full in the
+ * header of `packages/pnl/src/schema-boundary.test.ts`, which pins it as a
+ * regression):
+ *
+ * ```text
+ * R2 cold first parse, Object.prototype.zzUnrelated = 1 (enumerable)
+ *      → ESCAPED TypeError: Cannot read properties of undefined (reading 'values')
+ * R3 the same call afterwards, prototype CLEAN
+ *      → ESCAPED Error: Invalid discriminated union option at index "0"
+ * ```
+ *
+ * A door that documents typed refusals threw, and then kept throwing on clean
+ * input. `prototypeFreeParser` FORCES every lazy structure at build time —
+ * module load, which is clean by definition — and severs the chains of the
+ * ordinary containers the library rebuilt on the way, so a cold first parse
+ * under pollution answers byte-identically to a clean one. It also severs
+ * every `_zod` container, which is what stops an inherited `skipChecks`,
+ * `optin`/`optout` or `when` from being read on a copy.
+ *
+ * Its ANSWER is used; its OUTPUT is discarded (**D3**).
+ */
+export const PnlRecordDoor = prototypeFreeParser(PnlRecordSchema);
+
+/** **D2** — the stream identity's parsing copy, same mechanism, same reasons. */
+export const PnlStreamIdentityDoor = prototypeFreeParser(PnlStreamIdentitySchema);

@@ -20,18 +20,44 @@
  * The PnL bridge: `pnlRecords` are plain frozen objects shaped to parse
  * under `@polymarket-bot/pnl`'s input schemas. The shape agreement is
  * STRUCTURAL — deliberately no package edge exists between the two layer-1
- * packages (no §2.1 row permits one) — and is pinned by the cross-package
- * suite in `test/unit/ledger/`.
+ * packages (no §2.1 row permits one; the `WP-200-FU1` rows **S5** and **S6**
+ * both run to `packages/risk` and carry the parse door only) — and is pinned by
+ * the cross-package suite in `test/unit/ledger/`.
+ *
+ * THE DOOR (ADR-020 §3; `WP-200-FU1`, 2026-09-04). All THREE arguments of
+ * {@link buildFillPosting} are caller-supplied, including the first — its type
+ * says `FillAllocationResult`, and a type stops a TypeScript caller and nobody
+ * else. Measured at `main` `761db76`, before this change (probe P):
+ *
+ * ```text
+ * P7  an id set with no own tokenTransactionId, clean        → LEDGER_INPUT_INVALID
+ * P8  the same, NE inherited tokenTransactionId              → ACCEPTED, adopted id
+ *                                                              on a REAL transaction
+ * P9  accounts with no own feeExpenseRef, clean              → LEDGER_INPUT_INVALID
+ * P10 the same, NE inherited feeExpenseRef                   → ACCEPTED
+ * ```
+ *
+ * An adopted `tokenTransactionId` is the primary key of a booked movement, and
+ * an adopted account reference is the account the other side of a real posting
+ * lands in.
  */
 
 import type { DecimalString } from "@polymarket-bot/decimal";
 import { isZeroDecimal, mulDecimal, negateDecimal } from "@polymarket-bot/decimal";
 import { NonEmptyStringSchema, Uuidv7Schema } from "@polymarket-bot/domain";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
 import type { FillAllocationResult } from "./allocation.js";
+import { plainFrozen } from "./immutable.js";
 import type { LedgerResult } from "./refusals.js";
-import { ledgerFailure, ledgerOk, ledgerRefusal } from "./refusals.js";
+import {
+  contained,
+  ledgerFailure,
+  ledgerOk,
+  ledgerRefusal,
+  readInputAsData,
+} from "./refusals.js";
 import type { LedgerEntryInput, LedgerTransactionInput } from "./transaction.js";
 
 /**
@@ -57,6 +83,14 @@ export const FillPostingIdsSchema = z.strictObject({
 });
 
 export type FillPostingIds = Readonly<z.infer<typeof FillPostingIdsSchema>>;
+
+/**
+ * **D2** — the two parsing copies, built and WARMED at module load
+ * (`@polymarket-bot/risk/schema-arena`, §2.1 **S5**). Their ANSWERS are used;
+ * their OUTPUTS are discarded (**D3**).
+ */
+const PostingAccountsDoor = prototypeFreeParser(PostingAccountsSchema);
+const FillPostingIdsDoor = prototypeFreeParser(FillPostingIdsSchema);
 
 /**
  * The owner of a PnL stream (mirrored structurally by `@polymarket-bot/pnl`).
@@ -124,13 +158,38 @@ interface OwnerSlice {
  * exact partition, explicit unattributed remainder — are assumed here and
  * re-checked by `Ledger.append`'s balance and parity rules on every
  * transaction this function returns).
+ *
+ * A PROTOTYPE-FREE DOOR (`WP-200-FU1`): **D1** all three arguments are
+ * materialized prototype-free — the allocation too, because `allocation
+ * .unattributed`, `alloc.runId` and `fill.feeAmount` are OPTIONAL reads and an
+ * ordinary object answers an absent optional from `Object.prototype`; **D2**
+ * the two schema parses go through the warmed arena copies; **D3** every value
+ * used below comes from a materialized tree; **D4** every entry, transaction
+ * and PnL record this function emits is built prototype-free and frozen.
+ *
+ * The allocation is materialized rather than re-validated against a schema:
+ * this function's contract is unchanged — the allocation's invariants still
+ * come from `allocateFill` and are still re-checked by `Ledger.append` — and a
+ * new schema here would be a new rule, which this package is not re-ruling.
  */
 export function buildFillPosting(
   allocation: FillAllocationResult,
   accountsInput: unknown,
   idsInput: unknown,
 ): LedgerResult<FillPosting> {
-  const accountsParsed = PostingAccountsSchema.safeParse(accountsInput);
+  return contained(() => buildMaterializedFillPosting(allocation, accountsInput, idsInput));
+}
+
+function buildMaterializedFillPosting(
+  allocationInput: FillAllocationResult,
+  accountsInput: unknown,
+  idsInput: unknown,
+): LedgerResult<FillPosting> {
+  const readAccounts = readInputAsData(accountsInput, "accounts", "posting accounts object");
+  if (!readAccounts.ok) {
+    return ledgerFailure(readAccounts.refusal);
+  }
+  const accountsParsed = PostingAccountsDoor.safeParse(readAccounts.value);
   if (!accountsParsed.success) {
     return ledgerFailure(
       ledgerRefusal("LEDGER_INPUT_INVALID", "the value is not a posting accounts object", {
@@ -138,7 +197,11 @@ export function buildFillPosting(
       }),
     );
   }
-  const idsParsed = FillPostingIdsSchema.safeParse(idsInput);
+  const readIds = readInputAsData(idsInput, "ids", "fill posting id set");
+  if (!readIds.ok) {
+    return ledgerFailure(readIds.refusal);
+  }
+  const idsParsed = FillPostingIdsDoor.safeParse(readIds.value);
   if (!idsParsed.success) {
     return ledgerFailure(
       ledgerRefusal("LEDGER_INPUT_INVALID", "the value is not a fill posting id set", {
@@ -146,8 +209,14 @@ export function buildFillPosting(
       }),
     );
   }
-  const accounts: PostingAccounts = accountsParsed.data;
-  const ids: FillPostingIds = idsParsed.data;
+  const readAllocation = readInputAsData(allocationInput, "allocation", "fill allocation result");
+  if (!readAllocation.ok) {
+    return ledgerFailure(readAllocation.refusal);
+  }
+  // D3 — every value below comes from a materialized tree.
+  const accounts = readAccounts.value as PostingAccounts;
+  const ids = readIds.value as FillPostingIds;
+  const allocation = readAllocation.value as FillAllocationResult;
   const { fill } = allocation;
   const fee = fill.feeAmount ?? ZERO;
 
@@ -163,25 +232,42 @@ export function buildFillPosting(
 
   // The exact per-owner partition. Multiplication over exact decimals is
   // distributive, so per-owner costs sum to price × fill.shares exactly.
-  const slices: OwnerSlice[] = allocation.allocations.map((alloc) => ({
-    owner: {
-      scope: "VIRTUAL_STRATEGY",
-      accountRef: fill.accountRef,
+  //
+  // D4 applies to these INTERNAL slices too, and for a reason that is a
+  // decision rather than a style: `mirrorCollateralEntry` and
+  // `mirrorTokenEntry` choose between the `VIRTUAL_STRATEGY` and
+  // `UNATTRIBUTED` scopes on `slice.instanceId !== undefined`. On an ordinary
+  // object that read is answered by `Object.prototype`, so an inherited
+  // `instanceId` would have turned the explicitly UNATTRIBUTED remainder into
+  // an attributed leg — silently reassigning a share of a real fill to a
+  // strategy instance, which is exactly the "silent absorption path" this
+  // module's header says does not exist.
+  const slices: OwnerSlice[] = allocation.allocations.map((alloc) =>
+    plainFrozen({
+      owner: plainFrozen({
+        scope: "VIRTUAL_STRATEGY" as const,
+        accountRef: fill.accountRef,
+        instanceId: alloc.instanceId,
+      }),
+      shares: alloc.shares,
+      cost: mulDecimal(fill.price, alloc.shares),
+      fee: alloc.feeAmount,
       instanceId: alloc.instanceId,
-    },
-    shares: alloc.shares,
-    cost: mulDecimal(fill.price, alloc.shares),
-    fee: alloc.feeAmount,
-    instanceId: alloc.instanceId,
-    ...(alloc.runId === undefined ? {} : { runId: alloc.runId }),
-  }));
+      ...(alloc.runId === undefined ? {} : { runId: alloc.runId }),
+    }),
+  );
   if (allocation.unattributed !== undefined) {
-    slices.push({
-      owner: { scope: "UNATTRIBUTED", accountRef: fill.accountRef },
-      shares: allocation.unattributed.shares,
-      cost: mulDecimal(fill.price, allocation.unattributed.shares),
-      fee: allocation.unattributed.feeAmount,
-    });
+    slices.push(
+      plainFrozen({
+        owner: plainFrozen({
+          scope: "UNATTRIBUTED" as const,
+          accountRef: fill.accountRef,
+        }),
+        shares: allocation.unattributed.shares,
+        cost: mulDecimal(fill.price, allocation.unattributed.shares),
+        fee: allocation.unattributed.feeAmount,
+      }),
+    );
   }
 
   const totalCost = mulDecimal(fill.price, fill.shares);
@@ -222,12 +308,14 @@ export function buildFillPosting(
         ),
       );
     }
-    transactions.push({
-      ledgerTransactionId: ids.principalTransactionId,
-      eventType: "TRADE_PRINCIPAL",
-      entries,
-      ...shared,
-    });
+    transactions.push(
+      plainFrozen({
+        ledgerTransactionId: ids.principalTransactionId,
+        eventType: "TRADE_PRINCIPAL" as const,
+        entries: Object.freeze(entries),
+        ...shared,
+      }),
+    );
   }
 
   // 2. Token movement. BUY receives tokens, SELL delivers them.
@@ -249,12 +337,14 @@ export function buildFillPosting(
         ),
       );
     }
-    transactions.push({
-      ledgerTransactionId: ids.tokenTransactionId,
-      eventType: buying ? "OUTCOME_TOKEN_RECEIPT" : "OUTCOME_TOKEN_DELIVERY",
-      entries,
-      ...shared,
-    });
+    transactions.push(
+      plainFrozen({
+        ledgerTransactionId: ids.tokenTransactionId,
+        eventType: buying ? ("OUTCOME_TOKEN_RECEIPT" as const) : ("OUTCOME_TOKEN_DELIVERY" as const),
+        entries: Object.freeze(entries),
+        ...shared,
+      }),
+    );
   }
 
   // 3. PLATFORM_FEE — the venue's taker fee, when charged.
@@ -272,28 +362,30 @@ export function buildFillPosting(
         collateralEntry("EXTERNAL_CLEARING", accounts.attributionClearingRef, fill, slice.fee),
       );
     }
-    transactions.push({
-      ledgerTransactionId: ids.feeTransactionId,
-      eventType: "PLATFORM_FEE",
-      entries,
-      ...shared,
-    });
+    transactions.push(
+      plainFrozen({
+        ledgerTransactionId: ids.feeTransactionId,
+        eventType: "PLATFORM_FEE" as const,
+        entries: Object.freeze(entries),
+        ...shared,
+      }),
+    );
   }
 
   // PnL records: the actual-account stream plus one stream per owner slice.
   const tradeRef = ids.tokenTransactionId;
   const owners: readonly OwnerSlice[] = [
-    {
-      owner: { scope: "ACTUAL_ACCOUNT", accountRef: fill.accountRef },
+    plainFrozen({
+      owner: plainFrozen({ scope: "ACTUAL_ACCOUNT" as const, accountRef: fill.accountRef }),
       shares: fill.shares,
       cost: totalCost,
       fee,
-    },
+    }),
     ...slices,
   ];
   for (const slice of owners) {
     pnlRecords.push(
-      Object.freeze({
+      plainFrozen({
         kind: "TRADE" as const,
         ref: tradeRef,
         owner: slice.owner,
@@ -310,7 +402,7 @@ export function buildFillPosting(
     );
     if (!isZeroDecimal(slice.fee) && ids.feeTransactionId !== undefined) {
       pnlRecords.push(
-        Object.freeze({
+        plainFrozen({
           kind: "FEE" as const,
           ref: ids.feeTransactionId,
           owner: slice.owner,
@@ -325,7 +417,7 @@ export function buildFillPosting(
   }
 
   return ledgerOk(
-    Object.freeze({
+    plainFrozen({
       transactions: Object.freeze(transactions),
       pnlRecords: Object.freeze(pnlRecords),
     }),
@@ -340,14 +432,14 @@ function collateralEntry(
   fill: FillLike,
   amount: DecimalString,
 ): LedgerEntryInput {
-  return {
+  return plainFrozen({
     scope,
     accountRef,
     assetId: fill.denominationAssetId,
-    assetKind: "COLLATERAL",
+    assetKind: "COLLATERAL" as const,
     amount,
     marketId: fill.marketId,
-  };
+  });
 }
 
 function tokenEntry(
@@ -356,14 +448,14 @@ function tokenEntry(
   fill: FillLike,
   amount: DecimalString,
 ): LedgerEntryInput {
-  return {
+  return plainFrozen({
     scope,
     accountRef,
     assetId: fill.tokenAssetId,
-    assetKind: "OUTCOME_TOKEN",
+    assetKind: "OUTCOME_TOKEN" as const,
     amount,
     marketId: fill.marketId,
-  };
+  });
 }
 
 function mirrorCollateralEntry(
@@ -372,25 +464,25 @@ function mirrorCollateralEntry(
   amount: DecimalString,
 ): LedgerEntryInput {
   if (slice.instanceId !== undefined) {
-    return {
-      scope: "VIRTUAL_STRATEGY",
+    return plainFrozen({
+      scope: "VIRTUAL_STRATEGY" as const,
       accountRef: fill.accountRef,
       assetId: fill.denominationAssetId,
-      assetKind: "COLLATERAL",
+      assetKind: "COLLATERAL" as const,
       amount,
       instanceId: slice.instanceId,
       ...(slice.runId === undefined ? {} : { runId: slice.runId }),
       marketId: fill.marketId,
-    };
+    });
   }
-  return {
-    scope: "UNATTRIBUTED",
+  return plainFrozen({
+    scope: "UNATTRIBUTED" as const,
     accountRef: fill.accountRef,
     assetId: fill.denominationAssetId,
-    assetKind: "COLLATERAL",
+    assetKind: "COLLATERAL" as const,
     amount,
     marketId: fill.marketId,
-  };
+  });
 }
 
 function mirrorTokenEntry(
@@ -399,23 +491,23 @@ function mirrorTokenEntry(
   amount: DecimalString,
 ): LedgerEntryInput {
   if (slice.instanceId !== undefined) {
-    return {
-      scope: "VIRTUAL_STRATEGY",
+    return plainFrozen({
+      scope: "VIRTUAL_STRATEGY" as const,
       accountRef: fill.accountRef,
       assetId: fill.tokenAssetId,
-      assetKind: "OUTCOME_TOKEN",
+      assetKind: "OUTCOME_TOKEN" as const,
       amount,
       instanceId: slice.instanceId,
       ...(slice.runId === undefined ? {} : { runId: slice.runId }),
       marketId: fill.marketId,
-    };
+    });
   }
-  return {
-    scope: "UNATTRIBUTED",
+  return plainFrozen({
+    scope: "UNATTRIBUTED" as const,
     accountRef: fill.accountRef,
     assetId: fill.tokenAssetId,
-    assetKind: "OUTCOME_TOKEN",
+    assetKind: "OUTCOME_TOKEN" as const,
     amount,
     marketId: fill.marketId,
-  };
+  });
 }

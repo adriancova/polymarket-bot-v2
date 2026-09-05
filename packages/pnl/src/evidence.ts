@@ -56,6 +56,21 @@
  * cross-package suite in `test/unit/ledger/`, which parses real
  * `buildFillPosting` output and a real appended reward posting under these
  * schemas and would fail if either side drifted.
+ *
+ * AND THE DOCUMENT MUST BE A DOCUMENT (`WP-200-FU1`, 2026-09-04). Round 2
+ * closed "the evidence stays the evidence"; this closes "the evidence says only
+ * what its author wrote". Measured at `main` `761db76`, before this change:
+ *
+ * ```text
+ * a booking with no own `environment`, clean         → PNL_INPUT_INVALID
+ * the same, one NON-ENUMERABLE Object.prototype.environment = "PAPER"
+ *                                                    → ACCEPTED into the set
+ * ```
+ *
+ * The environment is check 2 of the six above — the §10.8 rule that a LIVE
+ * booking can never realize into a PAPER stream — and it was satisfiable
+ * without the booking naming an environment at all. `from()` now performs
+ * D1-D4.
  */
 
 import type { DecimalString } from "@polymarket-bot/decimal";
@@ -69,11 +84,20 @@ import {
   RunModeSchema,
   Uuidv7Schema,
 } from "@polymarket-bot/domain";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
+import { plainFrozen } from "./immutable.js";
 import type { PnlOwner } from "./records.js";
 import type { PnlRefusal, PnlResult } from "./refusals.js";
-import { PnlConfigurationError, pnlFailure, pnlOk, pnlRefusal } from "./refusals.js";
+import {
+  PnlConfigurationError,
+  contained,
+  pnlFailure,
+  pnlOk,
+  pnlRefusal,
+  readInputAsData,
+} from "./refusals.js";
 
 const ZERO: DecimalString = "0";
 
@@ -159,6 +183,13 @@ export type PnlEvidenceTransaction = Readonly<
   Omit<z.infer<typeof PnlEvidenceTransactionSchema>, "entries">
 > & { readonly entries: readonly PnlEvidenceEntry[] };
 
+/**
+ * **D2** — the evidence schema's parsing copy, built and WARMED at module load
+ * (`@polymarket-bot/risk/schema-arena`, §2.1 **S6**). Its ANSWER is used; its
+ * OUTPUT is discarded (**D3**).
+ */
+const PnlEvidenceTransactionDoor = prototypeFreeParser(PnlEvidenceTransactionSchema);
+
 /** Only `from()` may construct evidence; a forged instance is not accepted. */
 const CONSTRUCTION_TOKEN: unique symbol = Symbol("polymarket-bot/pnl/settlement-evidence");
 
@@ -182,8 +213,13 @@ const CONSTRUCTION_TOKEN: unique symbol = Symbol("polymarket-bot/pnl/settlement-
  * against would still be untouched.
  */
 function sealedTransaction(transaction: PnlEvidenceTransaction): PnlEvidenceTransaction {
-  const entries = transaction.entries.map((entry) => Object.freeze({ ...entry }));
-  return Object.freeze({ ...transaction, entries: Object.freeze(entries) });
+  // D4 (`WP-200-FU1`): the sealed copy has NO PROTOTYPE at either level. The
+  // checks below read OPTIONAL fields off it — `booked.settlementState`,
+  // `entry.instanceId` — and on an ordinary object those reads are answered by
+  // `Object.prototype`: an inherited `instanceId` would make a leg "credit the
+  // owner" of a stream whose instance the booking never named.
+  const entries = transaction.entries.map((entry) => plainFrozen({ ...entry }));
+  return plainFrozen({ ...transaction, entries: Object.freeze(entries) });
 }
 
 /**
@@ -234,10 +270,33 @@ export class PnlSettlementEvidence {
    * ambiguous.
    */
   static from(transactions: readonly unknown[]): PnlResult<PnlSettlementEvidence> {
+    return contained(() => PnlSettlementEvidence.fromMaterialized(transactions));
+  }
+
+  private static fromMaterialized(
+    transactions: readonly unknown[],
+  ): PnlResult<PnlSettlementEvidence> {
     const byId = new Map<string, PnlEvidenceTransaction>();
     const refusals: PnlRefusal[] = [];
     transactions.forEach((candidate, index) => {
-      const parsed = PnlEvidenceTransactionSchema.safeParse(candidate);
+      // D1.
+      const read = readInputAsData(
+        candidate,
+        `evidence[${index}]`,
+        `booked ledger transaction ${index}`,
+      );
+      if (!read.ok) {
+        refusals.push(
+          pnlRefusal(
+            "PNL_INPUT_INVALID",
+            `settlement evidence ${index} is not a booked ledger transaction`,
+            { index, issues: read.refusal.details["issues"] ?? [] },
+          ),
+        );
+        return;
+      }
+      // D2.
+      const parsed = PnlEvidenceTransactionDoor.safeParse(read.value);
       if (!parsed.success) {
         refusals.push(
           pnlRefusal(
@@ -254,7 +313,8 @@ export class PnlSettlementEvidence {
         );
         return;
       }
-      const transaction: PnlEvidenceTransaction = parsed.data;
+      // D3 — the booking IS the materialized tree.
+      const transaction = read.value as PnlEvidenceTransaction;
       if (byId.has(transaction.ledgerTransactionId)) {
         refusals.push(
           pnlRefusal(

@@ -36,14 +36,26 @@ import {
   NonEmptyStringSchema,
   PriceStringSchema,
 } from "@polymarket-bot/domain";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
+import { plainFrozen } from "./immutable.js";
 import type { PnlResult } from "./refusals.js";
-import { pnlFailure, pnlOk, pnlRefusal } from "./refusals.js";
+import { contained, pnlFailure, pnlOk, pnlRefusal, readInputAsData } from "./refusals.js";
 import type { PnlOwner } from "./records.js";
 import type { PnlState } from "./state.js";
 
 const ZERO: DecimalString = "0";
+
+/**
+ * The empty reserved-capital block: a FROZEN, PROTOTYPE-FREE record.
+ *
+ * See {@link computePnlSnapshot}. `{}` would answer every
+ * `reservedCapital[denomination]` read from `Object.prototype`.
+ */
+const NO_RESERVATIONS: Readonly<Record<string, DecimalString>> = Object.freeze(
+  Object.create(null) as Record<string, DecimalString>,
+);
 
 /** Valuation marks for one token asset. Prices are venue probabilities. */
 export const PnlMarkSchema = z.strictObject({
@@ -61,6 +73,17 @@ export const PnlSnapshotInputSchema = z.strictObject({
 });
 
 export type PnlSnapshotInput = Readonly<z.infer<typeof PnlSnapshotInputSchema>>;
+
+/**
+ * **D2** — the snapshot input's parsing copy, built and WARMED at module load
+ * (`@polymarket-bot/risk/schema-arena`, §2.1 **S6**).
+ *
+ * Measured at `main` `761db76`, before this change: a snapshot input with no
+ * own `asOf`, under one NON-ENUMERABLE `Object.prototype.asOf`, produced rows
+ * stamped `2026-01-01T00:00:00Z` — an `as_of` nobody supplied, and `as_of` is
+ * part of the §10.5 unique key of the rows this function's output binds to.
+ */
+const PnlSnapshotInputDoor = prototypeFreeParser(PnlSnapshotInputSchema);
 
 /**
  * One §10.5 `pnl_snapshots`-shaped row. All measures share one denomination.
@@ -126,11 +149,17 @@ function sortedRecordFromMap(
   map: ReadonlyMap<string, DecimalString>,
   filterKey: (key: string) => boolean,
 ): Readonly<Record<string, DecimalString>> {
-  const record: Record<string, DecimalString> = {};
+  const record: Record<string, DecimalString> = Object.create(null) as Record<
+    string,
+    DecimalString
+  >;
   for (const key of [...map.keys()].sort()) {
     if (filterKey(key)) {
       const value = map.get(key);
       if (value !== undefined) {
+        // D4: a prototype-free target, so this assignment cannot find an
+        // inherited setter and a later `record[k]` read cannot be answered by
+        // `Object.prototype` — these breakdowns are handed to a caller.
         record[key] = value;
       }
     }
@@ -152,12 +181,33 @@ function compositeKeyBelongsTo(denomination: string): (key: string) => boolean {
 /**
  * Computes the §9.16 snapshot rows for every denomination the state has
  * touched. Denominations are NEVER summed together (ADR-006 §7).
+ *
+ * A PROTOTYPE-FREE DOOR (`WP-200-FU1`): **D1** the input is materialized,
+ * **D2** parsed through {@link PnlSnapshotInputDoor}, **D3** `asOf`, `marks`
+ * and `reservedCapital` are taken from the materialized tree — which matters
+ * twice over here, because `marks[tokenAssetId]` and
+ * `reservedCapital[denomination]` are INDEXED reads on caller records: on an
+ * ordinary object an inherited `midpoint` would have valued an unmarked
+ * position instead of refusing it (`PNL_MARK_MISSING` is a required-measure
+ * rule), and an inherited reservation would have entered `capitalCommitted` —
+ * **D4** and every emitted row has no prototype.
  */
 export function computePnlSnapshot(
   state: PnlState,
   input: unknown,
 ): PnlResult<readonly PnlSnapshot[]> {
-  const parsed = PnlSnapshotInputSchema.safeParse(input);
+  return contained(() => computeMaterializedPnlSnapshot(state, input));
+}
+
+function computeMaterializedPnlSnapshot(
+  state: PnlState,
+  input: unknown,
+): PnlResult<readonly PnlSnapshot[]> {
+  const read = readInputAsData(input, "snapshot", "snapshot input");
+  if (!read.ok) {
+    return pnlFailure(read.refusal);
+  }
+  const parsed = PnlSnapshotInputDoor.safeParse(read.value);
   if (!parsed.success) {
     return pnlFailure(
       pnlRefusal("PNL_INPUT_INVALID", "the value is not a snapshot input", {
@@ -165,8 +215,20 @@ export function computePnlSnapshot(
       }),
     );
   }
-  const { asOf, marks } = parsed.data;
-  const reservedCapital = parsed.data.reservedCapital ?? {};
+  // D3 — the validated input IS the materialized tree.
+  const materialized = read.value as PnlSnapshotInput;
+  const { asOf, marks } = materialized;
+  // NOT `?? {}` (`WP-200-FU1`, found by this package's own battery). The
+  // fallback for an ABSENT `reservedCapital` block was an ordinary object
+  // literal, and the read below is `reservedCapital[denomination]` — so a
+  // caller who supplied no reservations at all had every one of them answered
+  // by `Object.prototype`. With `Object.prototype.pUSD = "1000"` on a stream
+  // denominated in pUSD, `capitalCommitted` silently included 1000 of reserved
+  // capital nobody stated. The battery caught it because its injected value was
+  // not a decimal and the addition threw; with a well-formed decimal it would
+  // have been silent. An EMPTY PROTOTYPE-FREE record answers "no reservation"
+  // with `undefined`, which is what absence means.
+  const reservedCapital = materialized.reservedCapital ?? NO_RESERVATIONS;
 
   // Per-denomination unrealized aggregation over open lots.
   const unrealizedMid = new Map<string, DecimalString>();
@@ -238,7 +300,7 @@ export function computePnlSnapshot(
     const belongs = compositeKeyBelongsTo(denomination);
 
     snapshots.push(
-      Object.freeze({
+      plainFrozen({
         scope: state.identity.scope,
         environment: state.identity.environment,
         accountRef: state.identity.accountRef,
@@ -317,28 +379,59 @@ export interface PnlSnapshotRow {
   readonly asOf: string;
 }
 
-/** Binds one snapshot to its `accounting.pnl_snapshots` row, field for field. */
+/**
+ * The own DATA value of one field of a caller-supplied snapshot, or
+ * `undefined`.
+ *
+ * `WP-200-FU1`. {@link toPnlSnapshotRow} is TOTAL by contract — it maps, it
+ * does not refuse — so it cannot answer a hostile value with a typed refusal
+ * the way the parsing doors do. What it can do, and now does, is READ like a
+ * door: descriptors rather than properties, own rather than inherited. A
+ * `PnlSnapshot` handed here is caller-supplied (the type says otherwise, and a
+ * type stops a TypeScript caller and nobody else), every field it reads becomes
+ * a column of a monetary row, and on an ordinary object a field the snapshot
+ * does not carry is answered by `Object.prototype`. An accessor is not invoked;
+ * its field arrives as `undefined`, which is a visible hole in the row rather
+ * than a value somebody's getter chose.
+ */
+function ownField(snapshot: PnlSnapshot, key: keyof PnlSnapshot): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(snapshot, key);
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+    return undefined;
+  }
+  return descriptor.value;
+}
+
+/**
+ * Binds one snapshot to its `accounting.pnl_snapshots` row, field for field.
+ *
+ * **D1-lite / D4** (`WP-200-FU1`): every field is read as OWN DATA
+ * ({@link ownField}) and the emitted row has NO PROTOTYPE, so neither the
+ * mapper's reads nor a composition root's later reads of the row can be
+ * answered from `Object.prototype`. The mapping itself — which columns exist,
+ * which are deliberately absent — is unchanged.
+ */
 export function toPnlSnapshotRow(snapshot: PnlSnapshot): PnlSnapshotRow {
-  return Object.freeze({
-    scope: snapshot.scope,
-    environment: snapshot.environment,
-    accountRef: snapshot.accountRef,
-    instanceId: snapshot.instanceId,
-    runId: snapshot.runId,
-    marketId: snapshot.marketId,
-    denominationAsset: snapshot.denominationAsset,
-    grossTradingPnl: snapshot.grossTradingPnl,
-    coreNetPnl: snapshot.coreNetPnl,
-    allInPnl: snapshot.allInPnl,
-    realizedPnl: snapshot.realizedPnl,
-    unrealizedPnlMidpoint: snapshot.unrealizedPnlMidpoint,
-    unrealizedPnlModel: snapshot.unrealizedPnlModel,
-    unrealizedPnlLiquidation: snapshot.unrealizedPnlLiquidation,
-    worstCaseResolutionPnl: snapshot.worstCaseResolutionPnl,
-    feesPaid: snapshot.feesPaid,
-    rewardEstimateTotal: snapshot.rewardEstimateTotal,
-    realizedRewards: snapshot.realizedRewards,
-    capitalCommitted: snapshot.capitalCommitted,
-    asOf: snapshot.asOf,
-  });
+  return plainFrozen({
+    scope: ownField(snapshot, "scope"),
+    environment: ownField(snapshot, "environment"),
+    accountRef: ownField(snapshot, "accountRef"),
+    instanceId: ownField(snapshot, "instanceId"),
+    runId: ownField(snapshot, "runId"),
+    marketId: ownField(snapshot, "marketId"),
+    denominationAsset: ownField(snapshot, "denominationAsset"),
+    grossTradingPnl: ownField(snapshot, "grossTradingPnl"),
+    coreNetPnl: ownField(snapshot, "coreNetPnl"),
+    allInPnl: ownField(snapshot, "allInPnl"),
+    realizedPnl: ownField(snapshot, "realizedPnl"),
+    unrealizedPnlMidpoint: ownField(snapshot, "unrealizedPnlMidpoint"),
+    unrealizedPnlModel: ownField(snapshot, "unrealizedPnlModel"),
+    unrealizedPnlLiquidation: ownField(snapshot, "unrealizedPnlLiquidation"),
+    worstCaseResolutionPnl: ownField(snapshot, "worstCaseResolutionPnl"),
+    feesPaid: ownField(snapshot, "feesPaid"),
+    rewardEstimateTotal: ownField(snapshot, "rewardEstimateTotal"),
+    realizedRewards: ownField(snapshot, "realizedRewards"),
+    capitalCommitted: ownField(snapshot, "capitalCommitted"),
+    asOf: ownField(snapshot, "asOf"),
+  }) as PnlSnapshotRow;
 }

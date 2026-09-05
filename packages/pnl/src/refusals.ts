@@ -6,7 +6,19 @@
  * never adjusts an input to make it foldable, never guesses a valuation, and
  * never realizes anything an input did not prove. This package is pure; the
  * composition root owns the response to each refusal.
+ *
+ * THE PROTOTYPE-FREE DOOR (`WP-200-FU1`, 2026-09-04). Three of this module's
+ * exports are the shared half of ADR-020 §3's D1-D4 rule:
+ * {@link readInputAsData} performs **D1** (materialize before parsing),
+ * {@link contained} keeps the totality half of ADR-020 §6, and
+ * {@link pnlRefusal} now builds its `details` with `ownDataDetails` so BUILDING
+ * a refusal cannot run caller code either. All three come from
+ * `@polymarket-bot/risk`'s canonical door across the
+ * `docs/contracts/dependency-direction.md` §2.1 **S6** same-layer edge — the
+ * door is consumed, never copied (`WP-180-FU2`'s deletion guard).
  */
+
+import { describeValue, ownDataDetails, readPlainData } from "@polymarket-bot/risk/plain-data";
 
 export type PnlRefusalCode =
   /** The input failed schema validation before any accounting rule ran. */
@@ -82,13 +94,23 @@ export interface PnlRefusal {
   readonly details: PnlRefusalDetails;
 }
 
-/** Builds a refusal. */
+/**
+ * Builds a refusal.
+ *
+ * TOTAL FOR ANY `details` (`WP-200-FU1`). The body was
+ * `Object.freeze({ ...details })`, and a spread is an own-only READ that still
+ * runs a `Proxy`'s traps and INVOKES any getter on the object — so the
+ * constructor whose entire purpose is to say "no" could itself throw.
+ * `ownDataDetails` copies own DATA properties only, records the count of
+ * anything it could not copy under `detailsUnreadable`, and returns a frozen
+ * prototype-free record (**D4**).
+ */
 export function pnlRefusal(
   code: PnlRefusalCode,
   message: string,
   details: PnlRefusalDetails = {},
 ): PnlRefusal {
-  return Object.freeze({ code, message, details: Object.freeze({ ...details }) });
+  return Object.freeze({ code, message, details: ownDataDetails(details) });
 }
 
 /** A successful result, or the refusals that prevented it. */
@@ -104,6 +126,96 @@ export function pnlOk<T>(value: T): PnlResult<T> {
 /** Wraps one or more refusals as a failed result. */
 export function pnlFailure<T>(...refusals: readonly PnlRefusal[]): PnlResult<T> {
   return { ok: false, refusals: Object.freeze([...refusals]) };
+}
+
+/**
+ * THE OUTER CONTAINMENT GUARD (ADR-020 §6, `WP-200-FU1`).
+ *
+ * Every function here that promises a `PnlResult` keeps that promise whatever
+ * the input did. The site fix is **D1** — read the input as data before any
+ * schema touches it ({@link readInputAsData}) — and this is the structural
+ * half. It matters more in this package than anywhere else in the monetary
+ * path, because the cold-first-parse class measured on `PnlRecordSchema`
+ * escaped a `TypeError` out of `applyPnlRecord` at `main` `761db76`:
+ *
+ * ```text
+ * one ENUMERABLE Object.prototype.zzUnrelated = 1, fresh import of state.js
+ *   applyPnlRecord(state, a valid TRADE)  → ESCAPED TypeError:
+ *                                            Cannot read properties of undefined
+ *                                            (reading 'values')
+ *   the SAME call afterwards, prototype clean
+ *                                        → ESCAPED Error: Invalid discriminated
+ *                                            union option at index "0"  ← POISONED
+ * ```
+ *
+ * The site fix for THAT is the warmed arena (`records.ts`); this guard is what
+ * makes the promise structural rather than a list of the throws somebody
+ * thought of.
+ *
+ * The refusal carries only the thrown value's TYPE, never its message and never
+ * a coercion of it. The two documented THROWS of this package —
+ * `emptyPnlState`'s and `PnlSettlementEvidence`'s `PnlConfigurationError` — are
+ * deliberately outside every guard: they are construction-time contracts, and
+ * `WP-200`'s tests pin them.
+ */
+export function contained<T>(body: () => PnlResult<T>): PnlResult<T> {
+  try {
+    return body();
+  } catch (error) {
+    return pnlFailure<T>(
+      pnlRefusal(
+        "PNL_INPUT_INVALID",
+        "the operation could not be completed on this input and is refused rather than " +
+          "throwing; a PnL boundary answers with a typed refusal (ADR-020 §6)",
+        { thrown: describeValue(error) },
+      ),
+    );
+  }
+}
+
+/**
+ * **D1** — reads a caller-supplied `unknown` into plain own data, or refuses.
+ *
+ * THE DOOR IN FRONT OF EVERY SCHEMA IN THIS PACKAGE. `safeParse` reads
+ * properties through the prototype chain, so an inherited value is ADOPTED as
+ * though the caller had supplied it. Measured at `main` `761db76`, on this
+ * package, before this change:
+ *
+ * ```text
+ * a TRADE record with no own `price`
+ *   clean                                      → PNL_INPUT_INVALID
+ *   one NON-ENUMERABLE Object.prototype.price = "0.99"
+ *                                              → ACCEPTED, lot costBasis "9.9"
+ * a REWARD_ESTIMATE with ref "totally-not-a-uuid" and three garbage timestamps
+ *   clean                                      → PNL_INPUT_INVALID
+ *   one NON-ENUMERABLE Object.prototype.skipChecks
+ *                                              → ACCEPTED, folded verbatim
+ * ```
+ *
+ * `readPlainData` takes the value apart with DESCRIPTORS, refuses what is not
+ * data, and hands the schema a materialized tree with **no prototype**.
+ */
+export function readInputAsData(
+  value: unknown,
+  path: string,
+  what: string,
+):
+  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: false; readonly refusal: PnlRefusal } {
+  const read = readPlainData(value, path);
+  if (read.ok) {
+    return { ok: true, value: read.value };
+  }
+  return {
+    ok: false,
+    refusal: pnlRefusal(
+      "PNL_INPUT_INVALID",
+      `the ${what} is not a data record: an input is a finite tree of plain own data, so ` +
+        "hidden, inherited, computed or unreadable state is refused rather than inspected " +
+        "(fail closed)",
+      { issues: read.problems.map((problem) => `${problem.path}: ${problem.problem}`) },
+    ),
+  };
 }
 
 /** A caller error: the value handed to this package is structurally impossible. */

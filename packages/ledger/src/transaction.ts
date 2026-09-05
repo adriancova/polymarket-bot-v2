@@ -13,6 +13,12 @@
  * Identifiers are caller-supplied: a pure layer-1 package reads no clock and
  * no randomness, so it cannot mint UUIDv7 values. It validates them instead —
  * lowercase canonical only, refusal carrying the raw value (ADR-016 §2).
+ *
+ * THE DOOR (ADR-020 §3, `docs/contracts/schema-boundary.md` §1 D1-D4;
+ * `WP-200-FU1`, 2026-09-04). {@link validateTransactionInput} is the package's
+ * primary caller boundary and it performs all four steps — see the function's
+ * own comment for which line does which, and for the two transcripts of what
+ * this door accepted before the change.
  */
 
 import { isZeroDecimal } from "@polymarket-bot/decimal";
@@ -25,10 +31,17 @@ import {
   RunModeSchema,
   Uuidv7Schema,
 } from "@polymarket-bot/domain";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
 import type { LedgerRefusal, LedgerResult } from "./refusals.js";
-import { ledgerFailure, ledgerOk, ledgerRefusal } from "./refusals.js";
+import {
+  contained,
+  ledgerFailure,
+  ledgerOk,
+  ledgerRefusal,
+  readInputAsData,
+} from "./refusals.js";
 import {
   AssetKindSchema,
   LedgerEventTypeSchema,
@@ -96,6 +109,23 @@ export type LedgerTransactionInput = Readonly<
 };
 
 /**
+ * **D2** — the door's PARSING COPY of {@link LedgerTransactionInputSchema},
+ * built and WARMED at module load.
+ *
+ * Same validation, node for node (`@polymarket-bot/risk/schema-arena`), with
+ * every `_zod` container severed from `Object.prototype` and every lazy
+ * structure forced while the process is still clean. That closes three
+ * measured classes at once on this schema: an inherited `skipChecks` can no
+ * longer turn `Uuidv7Schema`'s and `IsoTimestampSchema`'s format checks into
+ * no-ops, an inherited `optin`/`optout` pair can no longer waive a required
+ * key, and an enumerable inherited property during a cold first parse can no
+ * longer abort — and permanently poison — the lazy build.
+ *
+ * Its ANSWER is used; its OUTPUT is discarded (**D3**).
+ */
+const LedgerTransactionInputDoor = prototypeFreeParser(LedgerTransactionInputSchema);
+
+/**
  * A transaction as appended: the validated input, deep-frozen, plus its
  * position in the ledger. `sequence` is the ledger's own append ordinal
  * (0-based); it is derived state, assigned by `Ledger.append`, and exists so
@@ -137,7 +167,14 @@ function uuidRefusal(field: string, raw: string): LedgerRefusal {
   );
 }
 
-/** ADR-016 pre-check: refuse a UUID-shaped, non-canonical id with the raw value. */
+/**
+ * ADR-016 pre-check: refuse a UUID-shaped, non-canonical id with the raw value.
+ *
+ * Runs on the MATERIALIZED tree (`WP-200-FU1`), so `record[field]` is an
+ * own-property read on an object with no prototype chain: an inherited
+ * `marketId` is not seen here any more than it is seen by the schema, and a
+ * getter has already been refused by D1 rather than invoked by this walk.
+ */
 function collectUuidRefusals(value: unknown): readonly LedgerRefusal[] {
   if (typeof value !== "object" || value === null) {
     return [];
@@ -184,16 +221,64 @@ function formatIssues(error: {
  * Balance, parity, and cross-transaction rules live in `balance.ts` and
  * `ledger.ts`; this function refuses what is wrong about ONE transaction in
  * isolation, before any accounting rule runs.
+ *
+ * A PROTOTYPE-FREE DOOR (`WP-200-FU1`, 2026-09-04), performing all four steps
+ * of `docs/contracts/schema-boundary.md` §1:
+ *
+ * - **D1** `readInputAsData` materializes the caller's value into a fresh tree
+ *   of plain own data with NO PROTOTYPE, reading descriptors rather than
+ *   properties;
+ * - **D2** the parse goes through {@link LedgerTransactionInputDoor}, the
+ *   severed, warmed arena copy;
+ * - **D3** every value below comes from the materialized tree, never from
+ *   `parsed.data` — the library ANSWERED, it did not supply;
+ * - **D4** the returned record is that same prototype-free tree, deep-frozen.
+ *
+ * WHAT IT ACCEPTED BEFORE, measured at `main` `761db76` (probe P; the
+ * transcript is quoted in full in the header of
+ * `test/unit/ledger/schema-boundary.test.ts`, which also pins each row as a
+ * regression):
+ *
+ * ```text
+ * P1 fillId, no own marketId, clean            → LEDGER_MARKET_REQUIRED  (F16)
+ * P2 fillId, no own marketId, NE inherited     → ACCEPTED, marketId adopted
+ * P3 "totally-not-a-uuid" / "yesterday-ish"    → LEDGER_INPUT_INVALID
+ * P4 the same, NE inherited skipChecks         → ACCEPTED, both kept verbatim
+ * ```
+ *
+ * P2 defeated `WP-040` obligation **F16** — a fill-booking transaction with no
+ * market — which this function is the only enforcement of.
+ *
+ * ORDER IS UNCHANGED except for D1, which is new and runs first: the ADR-016
+ * canonicality pre-check still precedes the grammar so a UUID-shaped
+ * non-canonical id reports `LEDGER_UUID_NOT_CANONICAL` with its raw value, and
+ * the structural rules still run after the grammar. What changed is that the
+ * pre-check now reads the MATERIALIZED tree, so it can no longer be handed a
+ * getter and can no longer see an inherited value.
  */
 export function validateTransactionInput(
   input: unknown,
 ): LedgerResult<LedgerTransactionInput> {
-  const uuidRefusals = collectUuidRefusals(input);
+  return contained(() => validateMaterializedTransaction(input));
+}
+
+function validateMaterializedTransaction(
+  input: unknown,
+): LedgerResult<LedgerTransactionInput> {
+  // D1.
+  const read = readInputAsData(input, "transaction", "ledger transaction");
+  if (!read.ok) {
+    return ledgerFailure(read.refusal);
+  }
+  const materialized = read.value;
+
+  const uuidRefusals = collectUuidRefusals(materialized);
   if (uuidRefusals.length > 0) {
     return ledgerFailure(...uuidRefusals);
   }
 
-  const parsed = LedgerTransactionInputSchema.safeParse(input);
+  // D2 — the answer is the library's; the output is discarded.
+  const parsed = LedgerTransactionInputDoor.safeParse(materialized);
   if (!parsed.success) {
     return ledgerFailure(
       ledgerRefusal("LEDGER_INPUT_INVALID", "the value is not a ledger transaction", {
@@ -201,7 +286,8 @@ export function validateTransactionInput(
       }),
     );
   }
-  const transaction: LedgerTransactionInput = parsed.data;
+  // D3 — the validated transaction IS the materialized tree.
+  const transaction = materialized as LedgerTransactionInput;
   const refusals: LedgerRefusal[] = [];
 
   if (transaction.entries.length === 0) {
@@ -293,6 +379,14 @@ export function validateTransactionInput(
   return ledgerOk(deepFreezeTransaction(transaction));
 }
 
+/**
+ * **D4** — the emitted record is prototype-free and deep-frozen.
+ *
+ * The prototype-free half is structural: this is the materialized tree, whose
+ * objects were created with `Object.create(null)`, so a later `?? default` read
+ * by a consumer cannot be answered from `Object.prototype`. The freeze is the
+ * `WP-200` property this function already had and keeps.
+ */
 function deepFreezeTransaction(transaction: LedgerTransactionInput): LedgerTransactionInput {
   for (const entry of transaction.entries) {
     Object.freeze(entry);

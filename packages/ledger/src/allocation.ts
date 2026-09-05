@@ -9,6 +9,19 @@
  * record (`haltRequired: true`, §9.15 / §6 invariant 7) — but may never
  * over-cover it. There is no silent absorption path: every share of the fill
  * appears in exactly one returned allocation record.
+ *
+ * THE DOOR (ADR-020 §3; `WP-200-FU1`, 2026-09-04). {@link allocateFill} takes
+ * two caller-supplied values — the fill fact and the claims — and both are
+ * MONETARY. Measured at `main` `761db76`, before this change (probe P):
+ *
+ * ```text
+ * P5 a fill with no own `price`, clean              → LEDGER_INPUT_INVALID
+ * P6 the same, one NON-ENUMERABLE Object.prototype.price = "0.99"
+ *                                                    → ACCEPTED, price "0.99"
+ * ```
+ *
+ * A price nobody supplied then multiplies every share of the fill in
+ * `fill-posting.ts`. The function now performs D1-D4; see its own comment.
  */
 
 import type { DecimalString } from "@polymarket-bot/decimal";
@@ -29,10 +42,18 @@ import {
   RunModeSchema,
   Uuidv7Schema,
 } from "@polymarket-bot/domain";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
+import { plainFrozen } from "./immutable.js";
 import type { LedgerRefusal, LedgerResult } from "./refusals.js";
-import { ledgerFailure, ledgerOk, ledgerRefusal } from "./refusals.js";
+import {
+  contained,
+  ledgerFailure,
+  ledgerOk,
+  ledgerRefusal,
+  readInputAsData,
+} from "./refusals.js";
 import { TradeSettlementStateSchema } from "./vocabulary.js";
 
 /**
@@ -82,6 +103,15 @@ export const AllocationClaimSchema = z.strictObject({
 });
 
 export type AllocationClaim = Readonly<z.infer<typeof AllocationClaimSchema>>;
+
+/**
+ * **D2** — the two parsing copies, built and WARMED at module load.
+ *
+ * `@polymarket-bot/risk/schema-arena` across the §2.1 **S5** edge. Their
+ * ANSWERS are used; their OUTPUTS are discarded (**D3**).
+ */
+const FillFactDoor = prototypeFreeParser(FillFactSchema);
+const AllocationClaimDoor = prototypeFreeParser(AllocationClaimSchema);
 
 /** An attributed slice of the fill. */
 export interface FillAllocation {
@@ -135,12 +165,30 @@ function formatIssues(error: {
  * - a shortfall (or no claims at all) → an explicit `UNATTRIBUTED` record;
  * - fee present with shared owners and no explicit split → refusal;
  * - fee splits not summing exactly to the fee → refusal.
+ *
+ * A PROTOTYPE-FREE DOOR (`WP-200-FU1`): **D1** every caller value —  the fill
+ * and each claim — is materialized prototype-free before it is parsed; **D2**
+ * the parses go through the warmed arena copies above; **D3** the fill and the
+ * claims this function then computes with are the materialized trees, never
+ * `parsed.data`; **D4** every emitted record is built prototype-free and
+ * frozen. Refusal codes, messages, details and ORDER are unchanged.
  */
 export function allocateFill(
   fillInput: unknown,
   claimsInput: readonly unknown[],
 ): LedgerResult<FillAllocationResult> {
-  const parsedFill = FillFactSchema.safeParse(fillInput);
+  return contained(() => allocateMaterializedFill(fillInput, claimsInput));
+}
+
+function allocateMaterializedFill(
+  fillInput: unknown,
+  claimsInput: readonly unknown[],
+): LedgerResult<FillAllocationResult> {
+  const readFill = readInputAsData(fillInput, "fill", "fill fact");
+  if (!readFill.ok) {
+    return ledgerFailure(readFill.refusal);
+  }
+  const parsedFill = FillFactDoor.safeParse(readFill.value);
   if (!parsedFill.success) {
     return ledgerFailure(
       ledgerRefusal("LEDGER_INPUT_INVALID", "the value is not a fill fact", {
@@ -148,12 +196,23 @@ export function allocateFill(
       }),
     );
   }
-  const fill: FillFact = parsedFill.data;
+  // D3 — the validated fill IS the materialized tree.
+  const fill = readFill.value as FillFact;
 
   const claims: AllocationClaim[] = [];
   const refusals: LedgerRefusal[] = [];
   claimsInput.forEach((claimInput, index) => {
-    const parsed = AllocationClaimSchema.safeParse(claimInput);
+    const readClaim = readInputAsData(claimInput, `claims[${index}]`, `allocation claim ${index}`);
+    if (!readClaim.ok) {
+      refusals.push(
+        ledgerRefusal("LEDGER_INPUT_INVALID", `claim ${index} is not an allocation claim`, {
+          claimIndex: index,
+          issues: readClaim.refusal.details["issues"] ?? [],
+        }),
+      );
+      return;
+    }
+    const parsed = AllocationClaimDoor.safeParse(readClaim.value);
     if (!parsed.success) {
       refusals.push(
         ledgerRefusal("LEDGER_INPUT_INVALID", `claim ${index} is not an allocation claim`, {
@@ -162,7 +221,7 @@ export function allocateFill(
         }),
       );
     } else {
-      claims.push(parsed.data);
+      claims.push(readClaim.value as AllocationClaim);
     }
   });
   if (refusals.length > 0) {
@@ -249,8 +308,10 @@ export function allocateFill(
     }
   }
 
+  // D4 — every emitted record has a null prototype, so an absent optional
+  // (`runId`, `unattributed`) is absent for every later read as well.
   const allocations: FillAllocation[] = claims.map((claim, index) =>
-    Object.freeze({
+    plainFrozen({
       fillId: fill.fillId,
       scope: "VIRTUAL_STRATEGY" as const,
       instanceId: claim.instanceId,
@@ -261,15 +322,15 @@ export function allocateFill(
   );
 
   const result: FillAllocationResult = isZeroDecimal(remainder)
-    ? Object.freeze({
+    ? plainFrozen({
         fill,
         allocations: Object.freeze(allocations),
         allocatedShares: fill.shares,
       })
-    : Object.freeze({
+    : plainFrozen({
         fill,
         allocations: Object.freeze(allocations),
-        unattributed: Object.freeze({
+        unattributed: plainFrozen({
           fillId: fill.fillId,
           scope: "UNATTRIBUTED" as const,
           shares: remainder,

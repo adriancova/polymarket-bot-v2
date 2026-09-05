@@ -22,10 +22,24 @@
  *
  * Refusal, never adjustment: no code path modifies an input to make it
  * appendable.
+ *
+ * THE DOOR (ADR-020 §3; `WP-200-FU1`, 2026-09-04). `append` and `rebuild` are
+ * caller boundaries and both delegate their input validation to
+ * `validateTransactionInput`, which performs D1-D4. What this module adds is
+ * the outer containment guard on both (ADR-020 §6: a function that promises a
+ * typed refusal keeps that promise) and the arena copy of `RunModeSchema` that
+ * `Ledger.empty` asks — the environment is the §10.8 PAPER/LIVE discriminator,
+ * so its parse is not a place to leave a raw schema.
+ *
+ * `Ledger.empty`'s THROW is deliberately outside every guard: a malformed run
+ * mode is a construction-time contract violation, not a recoverable refusal,
+ * and `WP-200`'s tests pin `LedgerConfigurationError` there.
  */
 
 import { RunModeSchema } from "@polymarket-bot/domain";
 import type { RunMode } from "@polymarket-bot/domain";
+import { readPlainData } from "@polymarket-bot/risk/plain-data";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 
 import {
   checkAttributionParity,
@@ -33,9 +47,11 @@ import {
   isExactNegation,
   legDeltas,
 } from "./balance.js";
+import { plainFrozen } from "./immutable.js";
 import type { LedgerRefusal, LedgerResult } from "./refusals.js";
 import {
   LedgerConfigurationError,
+  contained,
   ledgerFailure,
   ledgerOk,
   ledgerRefusal,
@@ -65,6 +81,12 @@ function emptyStore(): LedgerStore {
   return { buffer: [], byId: new Map(), assets: new Map(), reversals: new Map() };
 }
 
+/**
+ * **D2** — the parsing copy of the §11 run-mode enum, warmed at module load
+ * (`@polymarket-bot/risk/schema-arena`, §2.1 **S5**).
+ */
+const RunModeDoor = prototypeFreeParser(RunModeSchema);
+
 export interface LedgerAppendSuccess {
   readonly ledger: Ledger;
   readonly appended: AppendedLedgerTransaction;
@@ -84,15 +106,46 @@ export class Ledger {
     Object.freeze(this);
   }
 
-  /** An empty ledger bound to one environment. Throws on a malformed mode. */
+  /**
+   * An empty ledger bound to one environment. Throws on a malformed mode.
+   *
+   * D1 (`readPlainData`) then D2 (the arena copy); D3 is the `read.value` the
+   * constructor is handed, not `parsed.data`. A run mode is a string, so the
+   * materialization is a pass-through for every legitimate call — it is here so
+   * that a caller handing an OBJECT to the §10.8 discriminator is refused by a
+   * read that runs no getter and no trap, rather than by a schema that does.
+   */
   static empty(environment: RunMode): Ledger {
-    const parsed = RunModeSchema.safeParse(environment);
+    try {
+      return Ledger.bindEnvironment(environment);
+    } catch (error) {
+      if (error instanceof LedgerConfigurationError) {
+        throw error;
+      }
+      // The ONLY throw this function can produce (`WP-200-FU1`): the documented
+      // contract is "throws `LedgerConfigurationError`, or returns a ledger",
+      // and it now holds for every input rather than for the ones somebody
+      // thought of. Same measured need as `emptyPnlState`'s guard.
+      throw new LedgerConfigurationError("environment is not a run mode", {
+        raw: environment,
+      });
+    }
+  }
+
+  private static bindEnvironment(environment: RunMode): Ledger {
+    const read = readPlainData(environment, "environment");
+    if (!read.ok) {
+      throw new LedgerConfigurationError("environment is not a run mode", {
+        raw: environment,
+      });
+    }
+    const parsed = RunModeDoor.safeParse(read.value);
     if (!parsed.success) {
       throw new LedgerConfigurationError("environment is not a run mode", {
         raw: environment,
       });
     }
-    return new Ledger(parsed.data, emptyStore(), 0);
+    return new Ledger(read.value as RunMode, emptyStore(), 0);
   }
 
   /** The transactions visible in this snapshot, in append order. */
@@ -141,6 +194,10 @@ export class Ledger {
    * refusal list. The receiver is never modified.
    */
   append(input: unknown): LedgerResult<LedgerAppendSuccess> {
+    return contained(() => this.appendValidated(input));
+  }
+
+  private appendValidated(input: unknown): LedgerResult<LedgerAppendSuccess> {
     const validated = validateTransactionInput(input);
     if (!validated.ok) {
       return ledgerFailure(...validated.refusals);
@@ -196,22 +253,26 @@ export class Ledger {
     environment: RunMode,
     transactions: readonly unknown[],
   ): LedgerResult<Ledger> {
+    // `Ledger.empty` is deliberately OUTSIDE the containment guard: its
+    // `LedgerConfigurationError` is the documented construction-time contract.
     let ledger = Ledger.empty(environment);
-    for (const [index, transaction] of transactions.entries()) {
-      const result = ledger.append(transaction);
-      if (!result.ok) {
-        return ledgerFailure(
-          ledgerRefusal(
-            "LEDGER_INPUT_INVALID",
-            `rebuild refused at recorded transaction index ${index}`,
-            { index, refusals: result.refusals },
-          ),
-          ...result.refusals,
-        );
+    return contained(() => {
+      for (const [index, transaction] of transactions.entries()) {
+        const result = ledger.append(transaction);
+        if (!result.ok) {
+          return ledgerFailure<Ledger>(
+            ledgerRefusal(
+              "LEDGER_INPUT_INVALID",
+              `rebuild refused at recorded transaction index ${index}`,
+              { index, refusals: result.refusals },
+            ),
+            ...result.refusals,
+          );
+        }
+        ledger = result.value.ledger;
       }
-      ledger = result.value.ledger;
-    }
-    return ledgerOk(ledger);
+      return ledgerOk(ledger);
+    });
   }
 
   // --- private helpers ------------------------------------------------------
@@ -316,7 +377,10 @@ export class Ledger {
   private commit(transaction: LedgerTransactionInput): LedgerAppendSuccess {
     const store = this.store.buffer.length === this.length ? this.store : this.branchStore();
     const sequence = this.length;
-    const appended: AppendedLedgerTransaction = Object.freeze({ sequence, transaction });
+    // D4 — the appended record is prototype-free, so a consumer reading
+    // `record.transaction` or `record.sequence` on a value this ledger handed
+    // out cannot be answered from `Object.prototype`.
+    const appended: AppendedLedgerTransaction = plainFrozen({ sequence, transaction });
 
     store.buffer.push(appended);
     store.byId.set(transaction.ledgerTransactionId, sequence);

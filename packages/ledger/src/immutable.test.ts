@@ -15,7 +15,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { frozenMap, frozenSet } from "./immutable.js";
+import { deepFreeze, frozenMap, frozenSet } from "./immutable.js";
 import { Ledger } from "./ledger.js";
 import {
   applyTransaction,
@@ -251,5 +251,97 @@ describe("the guard leaves an ordinary Map/Set otherwise intact", () => {
     expect(() => (guarded as Set<string>).add("b")).toThrow(TypeError);
     expect(() => (guarded as Set<string>).delete("a")).toThrow(TypeError);
     expect(guarded.size).toBe(1);
+  });
+});
+
+
+/**
+ * The deep-freeze MEMO — `WP-200`'s carried LOW residual, closed by
+ * `WP-200-FU1`.
+ *
+ * THE DEFECT. `deepFreeze` added the object to `DEEP_FROZEN` and THEN froze it.
+ * The memo's soundness argument is stated at its own declaration — "a member of
+ * this set is frozen, so its own property values cannot have changed since it
+ * was walked" — and a throwing `Object.freeze` falsified it: the object was
+ * recorded as done while still mutable, and every later `deepFreeze` of it,
+ * including one from a clean caller retrying, returned immediately without
+ * freezing anything. In a package whose whole reason for deep-freezing is that
+ * "a monetary value a consumer can edit is a monetary value a consumer can
+ * invent", a silently-unfrozen memoised value is exactly the outcome the guard
+ * exists to prevent.
+ *
+ * THE REACHABLE TRIGGER, and the reason this is a test rather than a comment: a
+ * `Proxy` whose `preventExtensions` trap throws. `Object.freeze` calls
+ * `[[PreventExtensions]]`, the trap runs, and the throw leaves `deepFreeze`
+ * with the memo already poisoned.
+ *
+ * EVIDENCE CLASS: EXECUTED. The `throw-then-retry` assertion FAILS on the
+ * pre-fix ordering — verified by swapping the two lines back locally — so it is
+ * a regression test, not a restatement.
+ */
+describe("deepFreeze memoises only what it actually froze", () => {
+  it("does not memoise an object whose freeze threw, so a retry still freezes it", () => {
+    let refuse = true;
+    const target: Record<string, unknown> = { costBasis: "4" };
+    const hostile = new Proxy(target, {
+      preventExtensions() {
+        if (refuse) {
+          throw new TypeError("preventExtensions refused");
+        }
+        Object.preventExtensions(target);
+        return true;
+      },
+    });
+
+    // First attempt: the freeze throws out of `deepFreeze`.
+    expect(() => deepFreeze(hostile)).toThrow(TypeError);
+    expect(Object.isFrozen(target)).toBe(false);
+
+    // Second attempt, with the trap cooperating. Under the OLD ordering the
+    // object was already in the memo, so this returned without freezing and
+    // `costBasis` stayed writable.
+    refuse = false;
+    deepFreeze(hostile);
+    expect(Object.isFrozen(target)).toBe(true);
+    expect(() => {
+      target["costBasis"] = "999999";
+    }).toThrow(TypeError);
+    expect(target["costBasis"]).toBe("4");
+  });
+
+  it("still terminates on a cycle (the memo's other job is unchanged)", () => {
+    const node: Record<string, unknown> = { value: "1" };
+    node["self"] = node;
+    expect(() => deepFreeze(node)).not.toThrow();
+    expect(Object.isFrozen(node)).toBe(true);
+  });
+
+  it("reads a descriptor with `Object.hasOwn`, not `in`, so an inherited `value` cannot fool it", () => {
+    // The same class as `plain-data.ts` review round 6: `"value" in descriptor`
+    // answers for an INHERITED name, so with `Object.prototype.value` defined
+    // every ACCESSOR descriptor read as a data descriptor.
+    const holder: Record<string, unknown> = {};
+    Object.defineProperty(holder, "computed", {
+      get: () => "never read",
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(Object.prototype, "value", {
+      value: "inherited",
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+    let outcome: string;
+    try {
+      deepFreeze(holder);
+      outcome = "FROZE";
+    } catch {
+      outcome = "THREW";
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)["value"];
+    }
+    expect(outcome).toBe("FROZE");
+    expect(Object.isFrozen(holder)).toBe(true);
   });
 });
