@@ -22,20 +22,41 @@
  *
  * Refusal, never adjustment: no code path modifies an input to make it
  * appendable.
+ *
+ * THE DOOR (ADR-020 §3; `WP-200-FU1`, 2026-09-04). `append` and `rebuild` are
+ * caller boundaries and both delegate their input validation to
+ * `validateTransactionInput`, which performs D1-D4. What this module adds is
+ * the outer containment guard on both (ADR-020 §6: a function that promises a
+ * typed refusal keeps that promise) and the arena copy of `RunModeSchema` that
+ * `Ledger.empty` asks — the environment is the §10.8 PAPER/LIVE discriminator,
+ * so its parse is not a place to leave a raw schema.
+ *
+ * `Ledger.empty`'s THROW is deliberately outside every guard: a malformed run
+ * mode is a construction-time contract violation, not a recoverable refusal,
+ * and `WP-200`'s tests pin `LedgerConfigurationError` there.
  */
 
 import { RunModeSchema } from "@polymarket-bot/domain";
 import type { RunMode } from "@polymarket-bot/domain";
+import { readPlainData } from "@polymarket-bot/risk/plain-data";
+import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 
+// The `…OfValidated` cores, not the D1 doors: every transaction that reaches
+// these checks has already been materialized by `validateTransactionInput`, and
+// re-walking the whole tree per append would be the only thing the door added
+// here. See `balance.ts`'s header for why the cores exist and why they are not
+// re-exported by `src/index.ts`.
 import {
-  checkAttributionParity,
-  checkPerAssetBalance,
+  checkAttributionParityOfValidated,
+  checkPerAssetBalanceOfValidated,
   isExactNegation,
-  legDeltas,
+  legDeltasOfValidated,
 } from "./balance.js";
+import { plainFrozen } from "./immutable.js";
 import type { LedgerRefusal, LedgerResult } from "./refusals.js";
 import {
   LedgerConfigurationError,
+  contained,
   ledgerFailure,
   ledgerOk,
   ledgerRefusal,
@@ -65,6 +86,12 @@ function emptyStore(): LedgerStore {
   return { buffer: [], byId: new Map(), assets: new Map(), reversals: new Map() };
 }
 
+/**
+ * **D2** — the parsing copy of the §11 run-mode enum, warmed at module load
+ * (`@polymarket-bot/risk/schema-arena`, §2.1 **S5**).
+ */
+const RunModeDoor = prototypeFreeParser(RunModeSchema);
+
 export interface LedgerAppendSuccess {
   readonly ledger: Ledger;
   readonly appended: AppendedLedgerTransaction;
@@ -84,15 +111,71 @@ export class Ledger {
     Object.freeze(this);
   }
 
-  /** An empty ledger bound to one environment. Throws on a malformed mode. */
+  /**
+   * An empty ledger bound to one environment. Throws on a malformed mode.
+   *
+   * D1 (`readPlainData`) then D2 (the arena copy); D3 is the `read.value` the
+   * constructor is handed, not `parsed.data`. The materialization is here so
+   * that a caller handing an OBJECT to the §10.8 discriminator is refused by a
+   * read that runs no getter and no trap, rather than by a schema that does.
+   *
+   * IT IS NOT A PASS-THROUGH, and the comment that used to say it was is
+   * corrected here (`WP-200-FU1` review round 1, finding M2 — measured, not
+   * reasoned). A run mode is a string, but materializing even a string appends
+   * to the shared door's `state.strings` accumulator with `Array.prototype
+   * .push`, which is `Set` and therefore consults the prototype chain for the
+   * INDEX name. So an inherited get-only accessor at `Object.prototype["0"]`
+   * makes that FIRST append throw, and this constructor answers:
+   *
+   * ```text
+   * tip 7d5ac34, get-only accessor at Object.prototype["0"]:
+   *   Ledger.empty("PAPER")       -> THREW LedgerConfigurationError
+   *   Ledger.rebuild("PAPER", []) -> THREW LedgerConfigurationError (cannot construct)
+   * base 761db76, the same probe:
+   *   Ledger.empty("PAPER")       -> OK
+   *   Ledger.rebuild("PAPER", []) -> OK
+   * ```
+   *
+   * That is a TIP-ONLY AVAILABILITY class, and it FAILS CLOSED: nothing is
+   * admitted, nothing is invented, and the answer is this function's own
+   * documented typed error rather than a bare `TypeError`. It is disclosed
+   * rather than fixed because the root cause is `packages/risk`'s
+   * `plain-data.ts` — outside `WP-200-FU1`'s allowed paths — and its widening to
+   * `CreateDataProperty` appends is queued as a separate authorized round. The
+   * ledger battery in `test/unit/ledger/schema-boundary.test.ts` carries `"0"`
+   * in its key material precisely so this class cannot grow unobserved.
+   */
   static empty(environment: RunMode): Ledger {
-    const parsed = RunModeSchema.safeParse(environment);
+    try {
+      return Ledger.bindEnvironment(environment);
+    } catch (error) {
+      if (error instanceof LedgerConfigurationError) {
+        throw error;
+      }
+      // The ONLY throw this function can produce (`WP-200-FU1`): the documented
+      // contract is "throws `LedgerConfigurationError`, or returns a ledger",
+      // and it now holds for every input rather than for the ones somebody
+      // thought of. Same measured need as `emptyPnlState`'s guard.
+      throw new LedgerConfigurationError("environment is not a run mode", {
+        raw: environment,
+      });
+    }
+  }
+
+  private static bindEnvironment(environment: RunMode): Ledger {
+    const read = readPlainData(environment, "environment");
+    if (!read.ok) {
+      throw new LedgerConfigurationError("environment is not a run mode", {
+        raw: environment,
+      });
+    }
+    const parsed = RunModeDoor.safeParse(read.value);
     if (!parsed.success) {
       throw new LedgerConfigurationError("environment is not a run mode", {
         raw: environment,
       });
     }
-    return new Ledger(parsed.data, emptyStore(), 0);
+    return new Ledger(read.value as RunMode, emptyStore(), 0);
   }
 
   /** The transactions visible in this snapshot, in append order. */
@@ -141,6 +224,10 @@ export class Ledger {
    * refusal list. The receiver is never modified.
    */
   append(input: unknown): LedgerResult<LedgerAppendSuccess> {
+    return contained(() => this.appendValidated(input));
+  }
+
+  private appendValidated(input: unknown): LedgerResult<LedgerAppendSuccess> {
     const validated = validateTransactionInput(input);
     if (!validated.ok) {
       return ledgerFailure(...validated.refusals);
@@ -176,8 +263,8 @@ export class Ledger {
     }
 
     refusals.push(...this.checkAssetBindings(transaction));
-    refusals.push(...checkPerAssetBalance(transaction));
-    refusals.push(...checkAttributionParity(transaction));
+    refusals.push(...checkPerAssetBalanceOfValidated(transaction));
+    refusals.push(...checkAttributionParityOfValidated(transaction));
     refusals.push(...this.checkReversal(transaction));
 
     if (refusals.length > 0) {
@@ -196,22 +283,26 @@ export class Ledger {
     environment: RunMode,
     transactions: readonly unknown[],
   ): LedgerResult<Ledger> {
+    // `Ledger.empty` is deliberately OUTSIDE the containment guard: its
+    // `LedgerConfigurationError` is the documented construction-time contract.
     let ledger = Ledger.empty(environment);
-    for (const [index, transaction] of transactions.entries()) {
-      const result = ledger.append(transaction);
-      if (!result.ok) {
-        return ledgerFailure(
-          ledgerRefusal(
-            "LEDGER_INPUT_INVALID",
-            `rebuild refused at recorded transaction index ${index}`,
-            { index, refusals: result.refusals },
-          ),
-          ...result.refusals,
-        );
+    return contained(() => {
+      for (const [index, transaction] of transactions.entries()) {
+        const result = ledger.append(transaction);
+        if (!result.ok) {
+          return ledgerFailure<Ledger>(
+            ledgerRefusal(
+              "LEDGER_INPUT_INVALID",
+              `rebuild refused at recorded transaction index ${index}`,
+              { index, refusals: result.refusals },
+            ),
+            ...result.refusals,
+          );
+        }
+        ledger = result.value.ledger;
       }
-      ledger = result.value.ledger;
-    }
-    return ledgerOk(ledger);
+      return ledgerOk(ledger);
+    });
   }
 
   // --- private helpers ------------------------------------------------------
@@ -296,7 +387,12 @@ export class Ledger {
         ),
       ];
     }
-    if (!isExactNegation(legDeltas(target.transaction), legDeltas(transaction))) {
+    if (
+      !isExactNegation(
+        legDeltasOfValidated(target.transaction),
+        legDeltasOfValidated(transaction),
+      )
+    ) {
       return [
         ledgerRefusal(
           "LEDGER_REVERSAL_NOT_COMPENSATING",
@@ -316,7 +412,10 @@ export class Ledger {
   private commit(transaction: LedgerTransactionInput): LedgerAppendSuccess {
     const store = this.store.buffer.length === this.length ? this.store : this.branchStore();
     const sequence = this.length;
-    const appended: AppendedLedgerTransaction = Object.freeze({ sequence, transaction });
+    // D4 — the appended record is prototype-free, so a consumer reading
+    // `record.transaction` or `record.sequence` on a value this ledger handed
+    // out cannot be answered from `Object.prototype`.
+    const appended: AppendedLedgerTransaction = plainFrozen({ sequence, transaction });
 
     store.buffer.push(appended);
     store.byId.set(transaction.ledgerTransactionId, sequence);

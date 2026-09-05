@@ -12,6 +12,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  attributionBucketKey,
+  attributionBuckets,
   checkAttributionParity,
   checkPerAssetBalance,
   isExactNegation,
@@ -19,7 +21,11 @@ import {
   legKey,
   netByAsset,
 } from "./balance.js";
+// The whole public surface, imported as a namespace, so the last test below can
+// assert what this package does and does NOT re-export.
+import * as index from "./index.js";
 import { Ledger } from "./ledger.js";
+import { LedgerConfigurationError } from "./refusals.js";
 import {
   ACCOUNT,
   ATTRIBUTION_CLEARING,
@@ -311,5 +317,216 @@ describe("legDeltas / isExactNegation (ADR-006 §5.2)", () => {
       transaction({ entries: [collateral("ACTUAL_ACCOUNT", ACCOUNT, "-2.999999")] }),
     );
     expect(isExactNegation(original, near)).toBe(false);
+  });
+});
+
+/**
+ * THE D1 DOOR ON THIS MODULE'S EIGHT EXPORTS (`WP-200-FU1` review round 1,
+ * finding L1).
+ *
+ * Every function here is re-exported by `src/index.ts`, so every one of them is
+ * a caller boundary — and before this round none of them materialized its
+ * argument. Each `it` below REPRODUCES the base behaviour through the raw read
+ * it used to perform, then asserts what the door does instead, so none of them
+ * is a restatement: the negative control is in the same test.
+ */
+describe("the D1 door on the balance helpers (review round 1, L1)", () => {
+  /** Installs one non-enumerable inherited data property and removes it after. */
+  function withInherited<T>(property: string, value: unknown, body: () => T): T {
+    Object.defineProperty(Object.prototype, property, {
+      value,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+    try {
+      return body();
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)[property];
+    }
+  }
+
+  /** Installs one inherited THROWING getter and removes it after. */
+  function withThrowingGetter<T>(property: string, body: () => T): T {
+    Object.defineProperty(Object.prototype, property, {
+      get: () => {
+        throw new Error("hostile getter");
+      },
+      enumerable: false,
+      configurable: true,
+    });
+    try {
+      return body();
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)[property];
+    }
+  }
+
+  /** An ORDINARY (prototype-carrying) UNATTRIBUTED leg with no own instanceId. */
+  function ordinaryLeg(): {
+    readonly scope: string;
+    readonly accountRef: string;
+    readonly assetId: string;
+  } {
+    return { scope: "UNATTRIBUTED", accountRef: ACCOUNT, assetId: PUSD };
+  }
+
+  it("`legKey` no longer ADOPTS an inherited `instanceId` (base: the leg changed identity)", () => {
+    const clean = legKey(ordinaryLeg());
+    expect(clean).toContain("null");
+
+    // The negative control: the raw read this function used to perform still
+    // exhibits the class, so the assertion below measures the DOOR.
+    const rawAdopted = withInherited("instanceId", INSTANCE_A, () => {
+      const entry = ordinaryLeg() as { instanceId?: string };
+      return entry.instanceId;
+    });
+    expect(rawAdopted).toBe(INSTANCE_A);
+
+    // The door: absence stays absence, so the UNATTRIBUTED leg keeps its identity.
+    const polluted = withInherited("instanceId", INSTANCE_A, () => legKey(ordinaryLeg()));
+    expect(polluted).toBe(clean);
+    expect(polluted).not.toContain(INSTANCE_A);
+  });
+
+  it("`legDeltas` keeps EVERY leg's identity under the same pollution", () => {
+    const value = transaction({
+      entries: [
+        collateral("ACTUAL_ACCOUNT", ACCOUNT, "-5"),
+        collateral("UNATTRIBUTED", ACCOUNT, "-5"),
+        collateral("EXTERNAL_CLEARING", VENUE_CLEARING, "5"),
+        collateral("EXTERNAL_CLEARING", ATTRIBUTION_CLEARING, "5"),
+      ],
+    });
+    const clean = [...legDeltas(value).keys()].sort();
+    const polluted = withInherited("instanceId", INSTANCE_A, () =>
+      [...legDeltas(value).keys()].sort(),
+    );
+    expect(polluted).toEqual(clean);
+    expect(polluted.join("")).not.toContain(INSTANCE_A);
+  });
+
+  it("a throwing inherited getter at an ABSENT optional no longer runs at all (base: THREW Error)", () => {
+    // Base behaviour, reproduced: reading the absent optional off an ORDINARY
+    // object runs the inherited getter, and a bare `Error` escapes the helper.
+    expect(() =>
+      withThrowingGetter("instanceId", () => (ordinaryLeg() as { instanceId?: string }).instanceId),
+    ).toThrow(/hostile getter/u);
+
+    // The door: D1 reads OWN descriptors, so the accessor is never reached and
+    // the answer is the clean one — not a throw of any kind.
+    const clean = legKey(ordinaryLeg());
+    expect(withThrowingGetter("instanceId", () => legKey(ordinaryLeg()))).toBe(clean);
+
+    const value = transaction({
+      entries: [
+        collateral("ACTUAL_ACCOUNT", ACCOUNT, "-5"),
+        collateral("UNATTRIBUTED", ACCOUNT, "-5"),
+        collateral("EXTERNAL_CLEARING", VENUE_CLEARING, "5"),
+        collateral("EXTERNAL_CLEARING", ATTRIBUTION_CLEARING, "5"),
+      ],
+    });
+    const cleanKeys = [...legDeltas(value).keys()].sort();
+    expect(withThrowingGetter("instanceId", () => [...legDeltas(value).keys()].sort())).toEqual(
+      cleanKeys,
+    );
+    for (const check of [checkPerAssetBalance, checkAttributionParity]) {
+      expect(withThrowingGetter("instanceId", () => check(value))).toEqual([]);
+    }
+  });
+
+  it("an OWN accessor is refused in each signature's own vocabulary, never thrown out raw", () => {
+    // The other half of D1: a getter the input OWNS. `readPlainData` refuses an
+    // accessor rather than invoking it, so nothing here runs caller code — and
+    // each helper says no in the vocabulary its signature already speaks.
+    const hostile = (): unknown => {
+      const value = transaction({ entries: [collateral("ACTUAL_ACCOUNT", ACCOUNT, "-5")] }) as Record<
+        string,
+        unknown
+      >;
+      const copy: Record<string, unknown> = { ...value };
+      Object.defineProperty(copy, "entries", {
+        get: () => {
+          throw new Error("hostile getter");
+        },
+        enumerable: true,
+        configurable: true,
+      });
+      return copy;
+    };
+    // Base behaviour, reproduced: the raw read runs it.
+    expect(() => (hostile() as { entries: unknown }).entries).toThrow(/hostile getter/u);
+
+    for (const check of [checkPerAssetBalance, checkAttributionParity]) {
+      expect(check(hostile() as never).map((refusal) => refusal.code)).toEqual([
+        "LEDGER_INPUT_INVALID",
+      ]);
+    }
+    for (const derive of [netByAsset, attributionBuckets, legDeltas]) {
+      expect(() => derive(hostile() as never)).toThrow(LedgerConfigurationError);
+    }
+  });
+
+  it("a Proxy argument is refused by every one of the eight, in its own vocabulary", () => {
+    const value = transaction({ entries: [collateral("ACTUAL_ACCOUNT", ACCOUNT, "-5")] });
+    const proxied = new Proxy(value, {}) as typeof value;
+    for (const check of [checkPerAssetBalance, checkAttributionParity]) {
+      expect(check(proxied).map((refusal) => refusal.code)).toEqual(["LEDGER_INPUT_INVALID"]);
+    }
+    expect(() => netByAsset(proxied)).toThrow(LedgerConfigurationError);
+    expect(() => attributionBuckets(proxied)).toThrow(LedgerConfigurationError);
+    expect(() => legDeltas(proxied)).toThrow(LedgerConfigurationError);
+    expect(() => legKey(new Proxy(ordinaryLeg(), {}))).toThrow(LedgerConfigurationError);
+  });
+
+  it("`attributionBucketKey` refuses a value that only RENDERS as a string", () => {
+    // Base behaviour, reproduced: `JSON.stringify` calls `toJSON`, so caller code
+    // ran inside the key and produced a REAL account's bucket.
+    const impostor = { toJSON: () => ACCOUNT };
+    expect(JSON.stringify([impostor, PUSD])).toBe(attributionBucketKey(ACCOUNT, PUSD));
+
+    expect(() => attributionBucketKey(impostor as never, PUSD)).toThrow(LedgerConfigurationError);
+    expect(() => attributionBucketKey(ACCOUNT, impostor as never)).toThrow(
+      LedgerConfigurationError,
+    );
+    // The honest call is untouched.
+    expect(attributionBucketKey(ACCOUNT, PUSD)).toBe(JSON.stringify([ACCOUNT, PUSD]));
+  });
+
+  it("`isExactNegation` refuses a Map LOOKALIKE that would report a false reversal", () => {
+    const original = legDeltas(
+      transaction({ entries: [collateral("ACTUAL_ACCOUNT", ACCOUNT, "3")] }),
+    );
+    const lookalike = { size: 1, get: () => "-3" } as unknown as ReadonlyMap<string, string>;
+    expect(() => isExactNegation(original, lookalike)).toThrow(LedgerConfigurationError);
+    expect(() => isExactNegation(lookalike, original)).toThrow(LedgerConfigurationError);
+
+    // A real negation still answers, and a real non-negation still refuses.
+    const mirror = legDeltas(
+      transaction({ entries: [collateral("ACTUAL_ACCOUNT", ACCOUNT, "-3")] }),
+    );
+    expect(isExactNegation(original, mirror)).toBe(true);
+    expect(isExactNegation(original, original)).toBe(false);
+  });
+
+  it("the `…OfValidated` cores are NOT part of the package's public surface", () => {
+    // The cores exist for `ledger.ts` and `projections.ts`, which reach these
+    // checks with an already-materialized transaction. Re-exporting one would
+    // hand a caller the pre-D1 function back under a new name.
+    const exported = Object.keys(index).sort();
+    expect(exported.filter((name) => name.endsWith("OfValidated"))).toEqual([]);
+    // Non-vacuity: the D1 doors ARE exported.
+    for (const name of [
+      "attributionBucketKey",
+      "attributionBuckets",
+      "checkAttributionParity",
+      "checkPerAssetBalance",
+      "isExactNegation",
+      "legDeltas",
+      "legKey",
+      "netByAsset",
+    ]) {
+      expect(exported).toContain(name);
+    }
   });
 });

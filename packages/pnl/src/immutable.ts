@@ -38,7 +38,12 @@
  * `@polymarket-bot/ledger` carries the same helper: the two packages are the
  * same layer and no `docs/contracts/dependency-direction.md` §2.1 row permits
  * an edge between them, so the duplication is forced, small, and deliberate.
+ * (`WP-200-FU1` added §2.1 **S5** and **S6**, but both run to
+ * `packages/risk` and carry the parse door ONLY — they are not a licence for a
+ * `pnl` ⇄ `ledger` edge, which no row permits and which would be a cycle.)
  */
+
+import { ownDataDescriptor } from "@polymarket-bot/risk/plain-data";
 
 /** The mutators that would rewrite folded state. */
 const MAP_MUTATORS = ["set", "delete", "clear"] as const;
@@ -62,6 +67,26 @@ const DEEP_FROZEN = new WeakSet<object>();
  * Only ENUMERABLE DATA properties are followed: an accessor is never invoked
  * (reading one to freeze it could run caller code), and the non-enumerable
  * mutator guards this module installs are not walked.
+ *
+ * THE MEMO IS ADDED TO ONLY AFTER THE FREEZE SUCCEEDS (`WP-200-FU1`, closing
+ * `WP-200`'s carried LOW residual). The order was `DEEP_FROZEN.add(object)`
+ * then `Object.freeze(object)`, and the whole soundness argument for the memo
+ * is the sentence above it — "a member of this set is frozen, so its own
+ * property values cannot have changed since it was walked". A throwing
+ * `Object.freeze` (a `Proxy` whose `preventExtensions` trap throws is the
+ * reachable case) falsified that: the object was recorded as done while still
+ * mutable, and every LATER `deepFreeze` of it — including one from a clean
+ * caller on a retry — returned immediately without freezing anything. In this
+ * package that value would be a lot, a trade effect or a realized figure.
+ * Swapping the two lines makes the memo mean what it says. Cycle termination is
+ * unaffected: the `add` still happens BEFORE the recursion below, which is the
+ * only thing that can re-enter.
+ *
+ * `Object.hasOwn(descriptor, "value")`, NOT `"value" in descriptor`
+ * (`WP-200-FU1`, the same class and the same fix as `packages/risk`'s
+ * `plain-data.ts` review round 6): a descriptor is an ordinary object, `in`
+ * answers for an INHERITED name, and with `Object.prototype.value` defined
+ * every ACCESSOR descriptor read as a data descriptor here.
  */
 export function deepFreeze<T>(value: T): T {
   if (value === null || typeof value !== "object") {
@@ -71,8 +96,8 @@ export function deepFreeze<T>(value: T): T {
   if (DEEP_FROZEN.has(object)) {
     return value;
   }
-  DEEP_FROZEN.add(object);
   Object.freeze(object);
+  DEEP_FROZEN.add(object);
   if (Array.isArray(object)) {
     for (const item of object) {
       deepFreeze(item);
@@ -81,11 +106,57 @@ export function deepFreeze<T>(value: T): T {
   }
   for (const key of Object.keys(object)) {
     const descriptor = Object.getOwnPropertyDescriptor(object, key);
-    if (descriptor !== undefined && "value" in descriptor) {
+    if (descriptor !== undefined && Object.hasOwn(descriptor, "value")) {
       deepFreeze(descriptor.value);
     }
   }
   return value;
+}
+
+/**
+ * A fresh MUTABLE record with no prototype, for accumulating own data.
+ *
+ * `WP-200-FU1`. An ordinary `{}` accumulator is not a neutral container: the
+ * assignment `record[key] = value` is `Set`, which walks the prototype chain,
+ * so an inherited get-only accessor at that key makes the write THROW and an
+ * inherited setter makes it run caller code. This package's canonical
+ * serializers — the byte oracle `WP-200`'s acceptance tests rest on — did
+ * exactly that, keyed by token asset id and denomination asset, both of which
+ * are caller-chosen strings. On a null-prototype target the same assignment is
+ * a plain `CreateDataProperty`.
+ */
+export function plainRecord<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
+/**
+ * **D4** — a frozen record with NO PROTOTYPE, built from an ordinary literal.
+ *
+ * ADR-020 §3 step 4: "the door's own result has a null prototype", because an
+ * emitted record is read by somebody else's `?? default` and an ordinary object
+ * answers that read from `Object.prototype`. Concretely in this package: a
+ * `PnlSnapshot` row read by a composition root binding it to
+ * `accounting.pnl_snapshots`, and an `OpenLot` whose `marketId` is a nullable
+ * column.
+ *
+ * Reading `fields` is safe: it is always a literal this package just built, and
+ * an object literal's properties are CREATED, never assigned, so no inherited
+ * setter ran while it was made. The DESCRIPTOR comes from
+ * `@polymarket-bot/risk/plain-data`, because a descriptor written as an object
+ * literal is read through the prototype chain and an inherited `get` turns
+ * every `Object.defineProperty` into a `TypeError` (measured — `WP-180` round
+ * 8).
+ */
+export function plainFrozen<T extends object>(fields: T): T {
+  const out = Object.create(null) as Record<string, unknown>;
+  for (const key of Object.keys(fields)) {
+    const descriptor = Object.getOwnPropertyDescriptor(fields, key);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+      continue;
+    }
+    Object.defineProperty(out, key, ownDataDescriptor(descriptor.value));
+  }
+  return Object.freeze(out) as unknown as T;
 }
 
 function refuse(container: string, method: string): () => never {
@@ -97,14 +168,31 @@ function refuse(container: string, method: string): () => never {
   };
 }
 
+/**
+ * The guard's own descriptor, WITH NO PROTOTYPE (`WP-200-FU1`).
+ *
+ * `ownDataDescriptor` cannot be reused: a guard is deliberately non-writable,
+ * non-enumerable and non-configurable, and that one is the door's data-property
+ * shape. The reason it must not be an object LITERAL is the same measured one
+ * (`WP-180` round 8): the specification reads a descriptor's fields with
+ * `HasProperty`, which walks the prototype chain, so one inherited `get` made
+ * every `Object.defineProperty` in the process a `TypeError`. That would have
+ * made this package's containers UNSEALABLE under a name nothing in the schema
+ * material names — which is a varying permission, not a varying refusal
+ * (ADR-020 §6).
+ */
+function guardDescriptor(value: unknown): PropertyDescriptor {
+  const descriptor = Object.create(null) as PropertyDescriptor;
+  descriptor.value = value;
+  descriptor.writable = false;
+  descriptor.enumerable = false;
+  descriptor.configurable = false;
+  return descriptor;
+}
+
 function guard<T extends object>(container: string, target: T, methods: readonly string[]): T {
   for (const method of methods) {
-    Object.defineProperty(target, method, {
-      value: refuse(container, method),
-      writable: false,
-      enumerable: false,
-      configurable: false,
-    });
+    Object.defineProperty(target, method, guardDescriptor(refuse(container, method)));
   }
   return Object.freeze(target);
 }

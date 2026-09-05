@@ -15,7 +15,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { frozenMap, frozenSet } from "./immutable.js";
+import { deepFreeze, frozenMap, frozenSet, plainFrozen } from "./immutable.js";
 import { Ledger } from "./ledger.js";
 import {
   applyTransaction,
@@ -251,5 +251,165 @@ describe("the guard leaves an ordinary Map/Set otherwise intact", () => {
     expect(() => (guarded as Set<string>).add("b")).toThrow(TypeError);
     expect(() => (guarded as Set<string>).delete("a")).toThrow(TypeError);
     expect(guarded.size).toBe(1);
+  });
+});
+
+
+/**
+ * The deep-freeze MEMO — `WP-200`'s carried LOW residual, closed by
+ * `WP-200-FU1`.
+ *
+ * THE DEFECT. `deepFreeze` added the object to `DEEP_FROZEN` and THEN froze it.
+ * The memo's soundness argument is stated at its own declaration — "a member of
+ * this set is frozen, so its own property values cannot have changed since it
+ * was walked" — and a throwing `Object.freeze` falsified it: the object was
+ * recorded as done while still mutable, and every later `deepFreeze` of it,
+ * including one from a clean caller retrying, returned immediately without
+ * freezing anything. In a package whose whole reason for deep-freezing is that
+ * "a monetary value a consumer can edit is a monetary value a consumer can
+ * invent", a silently-unfrozen memoised value is exactly the outcome the guard
+ * exists to prevent.
+ *
+ * THE REACHABLE TRIGGER, and the reason this is a test rather than a comment: a
+ * `Proxy` whose `preventExtensions` trap throws. `Object.freeze` calls
+ * `[[PreventExtensions]]`, the trap runs, and the throw leaves `deepFreeze`
+ * with the memo already poisoned.
+ *
+ * EVIDENCE CLASS: EXECUTED. The `throw-then-retry` assertion FAILS on the
+ * pre-fix ordering — verified by swapping the two lines back locally — so it is
+ * a regression test, not a restatement.
+ */
+describe("deepFreeze memoises only what it actually froze", () => {
+  it("does not memoise an object whose freeze threw, so a retry still freezes it", () => {
+    let refuse = true;
+    const target: Record<string, unknown> = { costBasis: "4" };
+    const hostile = new Proxy(target, {
+      preventExtensions() {
+        if (refuse) {
+          throw new TypeError("preventExtensions refused");
+        }
+        Object.preventExtensions(target);
+        return true;
+      },
+    });
+
+    // First attempt: the freeze throws out of `deepFreeze`.
+    expect(() => deepFreeze(hostile)).toThrow(TypeError);
+    expect(Object.isFrozen(target)).toBe(false);
+
+    // Second attempt, with the trap cooperating. Under the OLD ordering the
+    // object was already in the memo, so this returned without freezing and
+    // `costBasis` stayed writable.
+    refuse = false;
+    deepFreeze(hostile);
+    expect(Object.isFrozen(target)).toBe(true);
+    expect(() => {
+      target["costBasis"] = "999999";
+    }).toThrow(TypeError);
+    expect(target["costBasis"]).toBe("4");
+  });
+
+  it("still terminates on a cycle (the memo's other job is unchanged)", () => {
+    const node: Record<string, unknown> = { value: "1" };
+    node["self"] = node;
+    expect(() => deepFreeze(node)).not.toThrow();
+    expect(Object.isFrozen(node)).toBe(true);
+  });
+
+  /**
+   * THE MUTATION THIS TEST EXISTS TO KILL, and why it did not (`WP-200-FU1`
+   * review round 1, finding L2).
+   *
+   * Round 1's version installed `Object.prototype.value = "inherited"`, put an
+   * ACCESSOR on the holder, and asserted only that `deepFreeze` returned
+   * ("FROZE") and that the holder ended up frozen. Under the mutation —
+   * `"value" in descriptor` in place of `Object.hasOwn(descriptor, "value")` —
+   * the accessor's descriptor DOES read as a data descriptor, `descriptor.value`
+   * resolves to the inherited STRING, and `deepFreeze("inherited")` returns it
+   * untouched at the primitive guard. Same return, same frozen holder, same
+   * outcome string: the test could not tell the two implementations apart.
+   *
+   * MEASURED at tip `7d5ac34`: with the mutation applied to `deepFreeze` in BOTH
+   * this package and `@polymarket-bot/pnl`, the whole root suite — 229 files,
+   * 5354 tests — passed.
+   *
+   * What discriminates is making the inherited `value` an OBJECT and then asking
+   * what happened TO IT. The correct implementation never looks at an accessor's
+   * `value`, so the inherited object is untouched; the mutation walks into it and
+   * freezes it. Freezing a value nobody handed to this module is not cosmetic:
+   * `deepFreeze` is how this package makes a monetary record unwritable, and a
+   * version that follows an INHERITED reference freezes whatever the prototype
+   * chain points at — including an object a caller is still filling in.
+   */
+  it("reads a descriptor with `Object.hasOwn`, not `in`, so an inherited `value` cannot fool it", () => {
+    // The same class as `plain-data.ts` review round 6: `"value" in descriptor`
+    // answers for an INHERITED name, so with `Object.prototype.value` defined
+    // every ACCESSOR descriptor read as a data descriptor.
+    const inheritedTarget: Record<string, unknown> = { costBasis: "4" };
+    const holder: Record<string, unknown> = {};
+    let getterRuns = 0;
+    Object.defineProperty(holder, "computed", {
+      get: () => {
+        getterRuns += 1;
+        return "never read";
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(Object.prototype, "value", {
+      value: inheritedTarget,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+    let outcome: string;
+    try {
+      deepFreeze(holder);
+      outcome = "FROZE";
+    } catch {
+      outcome = "THREW";
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)["value"];
+    }
+    expect(outcome).toBe("FROZE");
+    expect(Object.isFrozen(holder)).toBe(true);
+    // THE DISCRIMINATOR. `Object.hasOwn` skips the accessor, so the inherited
+    // object is never reached; `"value" in descriptor` reaches it and freezes it.
+    expect(Object.isFrozen(inheritedTarget)).toBe(false);
+    inheritedTarget["costBasis"] = "5";
+    expect(inheritedTarget["costBasis"]).toBe("5");
+    // And the accessor itself is never invoked, under either reading.
+    expect(getterRuns).toBe(0);
+  });
+
+  it("`plainFrozen` reads descriptors the same way: an inherited `value` is not COPIED", () => {
+    // The same mutation on the other `Object.hasOwn` in this module. There it is
+    // worse than an over-freeze: `plainFrozen` builds what this package EMITS, so
+    // reading an accessor's descriptor as a data descriptor would copy the
+    // INHERITED value into a monetary record under the accessor's own key.
+    const source: Record<string, unknown> = { shares: "10" };
+    Object.defineProperty(source, "price", {
+      get: () => "0.99",
+      enumerable: true,
+      configurable: true,
+    });
+    Object.defineProperty(Object.prototype, "value", {
+      value: "0.01",
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+    let keys: readonly string[];
+    let priceRead: unknown;
+    try {
+      const emitted = plainFrozen(source);
+      keys = Object.getOwnPropertyNames(emitted).sort();
+      priceRead = (emitted as Record<string, unknown>)["price"];
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)["value"];
+    }
+    // The accessor is dropped, not copied: only the own DATA property survives.
+    expect(keys).toEqual(["shares"]);
+    expect(priceRead).toBeUndefined();
   });
 });

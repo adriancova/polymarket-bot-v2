@@ -9,7 +9,20 @@
  *
  * Nothing here logs, halts a market, or pages anyone: this package is pure,
  * and the composition root owns the response to each refusal.
+ *
+ * THE PROTOTYPE-FREE DOOR (`WP-200-FU1`, 2026-09-04). Three of this module's
+ * exports are the shared half of ADR-020 §3's D1-D4 rule:
+ * {@link readInputAsData} performs **D1** (materialize before parsing),
+ * {@link contained} keeps the totality half of ADR-020 §6 (no throw escapes a
+ * function whose contract is a typed refusal), and {@link ledgerRefusal} now
+ * builds its `details` with `ownDataDetails` so BUILDING a refusal cannot run
+ * caller code either. All three are imported from `@polymarket-bot/risk`'s
+ * canonical door across the `docs/contracts/dependency-direction.md` §2.1
+ * **S5** same-layer edge — the door is consumed, never copied
+ * (`WP-180-FU2`'s deletion guard).
  */
+
+import { describeValue, ownDataDetails, readPlainData } from "@polymarket-bot/risk/plain-data";
 
 export type LedgerRefusalCode =
   // --- input shape ----------------------------------------------------------
@@ -122,13 +135,24 @@ export interface LedgerRefusal {
   readonly details: LedgerRefusalDetails;
 }
 
-/** Builds a refusal. */
+/**
+ * Builds a refusal.
+ *
+ * TOTAL FOR ANY `details` (`WP-200-FU1`). The body was
+ * `Object.freeze({ ...details })`, and a spread is an own-only READ that still
+ * runs a `Proxy`'s traps and INVOKES any getter on the object — so the
+ * constructor whose entire purpose is to say "no" could itself throw. The same
+ * defect and the same fix as `packages/risk`'s `riskRefusal` (review round 6,
+ * BLOCKER 3); `ownDataDetails` copies own DATA properties only, records the
+ * count of anything it could not copy under `detailsUnreadable`, and returns a
+ * frozen prototype-free record (**D4**).
+ */
 export function ledgerRefusal(
   code: LedgerRefusalCode,
   message: string,
   details: LedgerRefusalDetails = {},
 ): LedgerRefusal {
-  return Object.freeze({ code, message, details: Object.freeze({ ...details }) });
+  return Object.freeze({ code, message, details: ownDataDetails(details) });
 }
 
 /** A successful result, or the refusals that prevented it. */
@@ -144,6 +168,101 @@ export function ledgerOk<T>(value: T): LedgerResult<T> {
 /** Wraps one or more refusals as a failed result. */
 export function ledgerFailure<T>(...refusals: readonly LedgerRefusal[]): LedgerResult<T> {
   return { ok: false, refusals: Object.freeze([...refusals]) };
+}
+
+/**
+ * THE OUTER CONTAINMENT GUARD (ADR-020 §6, `WP-200-FU1`).
+ *
+ * Every function here that promises a `LedgerResult` keeps that promise
+ * whatever the input did. The site fix is **D1** — read the input as data
+ * before any schema touches it ({@link readInputAsData}) — and this is the
+ * structural half: a throw from anywhere inside becomes a typed refusal, so
+ * "permission never varies and no throw escapes" is a property of the shape of
+ * the function rather than of a reviewer having thought of every value.
+ *
+ * The refusal carries only the thrown value's TYPE, never its message and never
+ * a coercion of it: reading `.message` off a caller-supplied thrown object is
+ * one more place caller code runs. Copied in FORM (not in body) from
+ * `packages/capital-allocator`'s `contained`, which is the WP-180 reference.
+ *
+ * THE DOCUMENTED THROWS OF THIS PACKAGE are deliberately outside every guard,
+ * and they all raise {@link LedgerConfigurationError} — a construction-time
+ * contract violation, not a recoverable refusal. The claim was written as "the
+ * two throws" and is qualified here (`WP-200-FU1` review round 1, finding L1),
+ * because it was never a count of two SITES and the review round that brought
+ * `balance.ts` under D1 added more:
+ *
+ * - `Ledger.empty` (and therefore `Ledger.rebuild`, which constructs through it);
+ * - `balance.ts`'s five DERIVATIONS — `netByAsset`, `attributionBuckets`,
+ *   `legKey`, `legDeltas`, `attributionBucketKey` — which have no refusal
+ *   channel in their signatures, so an input that is not plain own data takes
+ *   this one;
+ * - `balance.ts`'s `isExactNegation`, for an argument that is not a real `Map`.
+ *
+ * Everything else in this package answers in a `LedgerResult` or a refusal list,
+ * and `WP-200`'s and `WP-200-FU1`'s tests pin both halves.
+ */
+export function contained<T>(body: () => LedgerResult<T>): LedgerResult<T> {
+  try {
+    return body();
+  } catch (error) {
+    return ledgerFailure<T>(
+      ledgerRefusal(
+        "LEDGER_INPUT_INVALID",
+        "the operation could not be completed on this input and is refused rather than " +
+          "throwing; a ledger boundary answers with a typed refusal (ADR-020 §6)",
+        { thrown: describeValue(error) },
+      ),
+    );
+  }
+}
+
+/**
+ * **D1** — reads a caller-supplied `unknown` into plain own data, or refuses.
+ *
+ * THE DOOR IN FRONT OF EVERY SCHEMA IN THIS PACKAGE. `safeParse` is a
+ * validator, not a safe way to LOOK at a caller's object: it reads properties
+ * through the prototype chain, so an inherited value is ADOPTED as though the
+ * caller had supplied it, a getter runs, and a `Proxy` trap runs. Measured at
+ * `main` `761db76`, on this package, before this change:
+ *
+ * ```text
+ * a fill-booking transaction with fillId and NO own marketId
+ *   clean                                    → LEDGER_MARKET_REQUIRED (F16)
+ *   one NON-ENUMERABLE Object.prototype.marketId → ACCEPTED
+ * ledgerTransactionId "totally-not-a-uuid", occurredAt "yesterday-ish"
+ *   clean                                    → LEDGER_INPUT_INVALID
+ *   one NON-ENUMERABLE Object.prototype.skipChecks → ACCEPTED, both values kept
+ * ```
+ *
+ * `readPlainData` takes the value apart with DESCRIPTORS, refuses what is not
+ * data, and hands the schema a materialized tree with **no prototype** —
+ * so absence stays absence, for the schema and for every later read.
+ *
+ * `what` names the value in the refusal message ("ledger transaction"), and
+ * `path` roots the per-problem paths ("transaction.entries[0].amount: …").
+ */
+export function readInputAsData(
+  value: unknown,
+  path: string,
+  what: string,
+):
+  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: false; readonly refusal: LedgerRefusal } {
+  const read = readPlainData(value, path);
+  if (read.ok) {
+    return { ok: true, value: read.value };
+  }
+  return {
+    ok: false,
+    refusal: ledgerRefusal(
+      "LEDGER_INPUT_INVALID",
+      `the ${what} is not a data record: an input is a finite tree of plain own data, so ` +
+        "hidden, inherited, computed or unreadable state is refused rather than inspected " +
+        "(fail closed)",
+      { issues: read.problems.map((problem) => `${problem.path}: ${problem.problem}`) },
+    ),
+  };
 }
 
 /** A caller error: the value handed to this package is structurally impossible. */

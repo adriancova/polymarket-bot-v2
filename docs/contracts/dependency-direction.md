@@ -140,6 +140,8 @@ establishes the edge; "it compiles more easily this way" is not a basis.
 | S2 | `packages/strategies/*` → `packages/strategy-sdk` (each concrete strategy package, e.g. `packages/strategies/static-bracket`) | 1 | A strategy implements the `WP-170` interface and receives `StrategyContext` — which ADR-005 §6 places in `WP-170`, not in `packages/domain` — and ADR-005 §1 forbids it from obtaining any of that by I/O. `WP-220` (`packages/strategies/static-bracket/**`) `depends_on` `WP-170` and is forbidden from modifying it, so it consumes it. If `WP-170` declares the interface in `packages/strategy-runtime` instead, this row must be corrected rather than widened. |
 | S3 | `packages/capital-allocator` → `packages/risk` | 1 | GOV-2A 2026-09-04 mirror-collapse ruling (the subsection below); ADR-020 §3; `docs/contracts/schema-boundary.md` §1. The consumed surface is the prototype-free parse door only — `plain-data.ts` and `schema-arena.ts` — exported through `packages/risk`'s `exports` map (F16). No rule, policy, or evaluation logic may travel this edge; a consumer needing that has found a different problem. |
 | S4 | `packages/execution-planner` → `packages/risk` | 1 | GOV-2A 2026-09-04 mirror-collapse ruling (the subsection below); ADR-020 §3; `docs/contracts/schema-boundary.md` §1. The consumed surface is the prototype-free parse door only — `plain-data.ts` and `schema-arena.ts` — exported through `packages/risk`'s `exports` map (F16). No rule, policy, or evaluation logic may travel this edge; a consumer needing that has found a different problem. |
+| S5 | `packages/ledger` → `packages/risk` | 1 | `docs/contracts/schema-boundary.md` §5 item 1 (the `WP-200-FU1` owner assignment) and §1 (the D1-D4 door rule); ADR-020 §3; the GOV-2A mirror-collapse ruling in the subsection below, whose §5 item 5 states that a later consumer "consumes one implementation instead of copying a fourth". Measured basis for the grant: schema-boundary §3's `packages/ledger` row — a non-enumerable inherited `marketId` defeats `WP-040` obligation **F16**, and a non-enumerable `skipChecks` admits `ledgerTransactionId: "totally-not-a-uuid"`. The consumed surface is the prototype-free parse door only — `plain-data.ts` and `schema-arena.ts` — exported through `packages/risk`'s `exports` map (F16). No rule, policy, or evaluation logic may travel this edge; a consumer needing that has found a different problem. Acyclic: `packages/risk` declares only `@polymarket-bot/decimal` and `@polymarket-bot/domain`, so the reverse edge does not and may not exist. |
+| S6 | `packages/pnl` → `packages/risk` | 1 | `docs/contracts/schema-boundary.md` §5 item 1 (the `WP-200-FU1` owner assignment) and §1 (the D1-D4 door rule); ADR-020 §3; the GOV-2A mirror-collapse ruling in the subsection below. Measured basis for the grant: schema-boundary §3's `packages/pnl` row — the same classes on the record schemas, plus a cold first parse of the discriminated union that throws an escaped `TypeError` and leaves the schema permanently poisoned. The consumed surface is the prototype-free parse door only — `plain-data.ts` and `schema-arena.ts` — exported through `packages/risk`'s `exports` map (F16). No rule, policy, or evaluation logic may travel this edge; a consumer needing that has found a different problem. Acyclic on the same evidence as **S5**. |
 
 #### DONE 2026-09-04: the `plain-data` / `schema-arena` mirror collapse (ruled by `GOV-2A`, executed by `WP-180-FU2`)
 
@@ -345,6 +347,25 @@ to know they were anticipated:
 - `test/unit/risk/schema-arena.test.ts` — the allocator-arena binding is now an
   alias of the canonical one; every differential assertion over the allocator's
   three door schemas, including the `AGENTS.md` live-micro fence, is unchanged.
+
+**2026-09-05, `WP-200-FU1`: two of the four anticipated consumers arrived, and
+they took the edge rather than a copy.** *(Authorised and dispatched 2026-09-04
+off `main` `761db76`, which is also the tip its base measurements were taken
+against; this note was written the following day.)* The paragraph above records that
+`docs/contracts/schema-boundary.md` §5 assigns "four more packages that would
+otherwise copy it a fourth, fifth, sixth and seventh time." The first of those
+assignments — §5 item 1, the monetary path — is executed: `packages/ledger` and
+`packages/pnl` now consume the canonical door across **S5** and **S6** above.
+Neither package contains a copy of either module's body; the deletion guard in
+`test/unit/execution-planner/mirrors.test.ts` covers both `src` trees by the
+same workspace walk it already ran, and it passes unchanged. The graph the
+check now reports is **34 packages / 49 edges** — the 47 of this tip plus S5 and
+S6. The §6.1 item 5 rule was applied again exactly as `WP-180-FU2` applied it:
+the two rows and the pinned allowlist assertion in
+`test/unit/tooling/dependency-direction.test.ts` (`["S0".."S4"]` →
+`["S0".."S6"]`) moved in the **same change**. This note is the evidence that the
+collapse's stated purpose held under its first retrofit consumer: one
+implementation, two more doors, no fourth copy.
 
 Nothing else is enumerated yet, and that is deliberate: the check **fails closed**
 (§6), so the first package that genuinely needs a new same-layer edge adds its

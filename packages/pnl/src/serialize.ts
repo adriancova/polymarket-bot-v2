@@ -18,6 +18,7 @@
  * §10.5 `pnl_snapshots` columns).
  */
 
+import { plainFrozen, plainRecord } from "./immutable.js";
 import type { PnlSnapshot } from "./snapshot.js";
 import type { OpenLot, PnlState } from "./state.js";
 
@@ -53,8 +54,18 @@ function stableStringify(value: unknown): string {
   return `{${parts.join(",")}}`;
 }
 
+/**
+ * A sorted own-data record from a map.
+ *
+ * The accumulator is PROTOTYPE-FREE (`WP-200-FU1`): `record[key] = value` on an
+ * ordinary object is `Set`, which walks the chain, and these keys are
+ * caller-chosen denomination assets and composite `[asset, version]` strings —
+ * so an inherited get-only accessor at one of them made this ORACLE throw out
+ * of `serializePnlState`, which has no refusal channel to turn it into.
+ * Measured by this package's own battery before it was fixed.
+ */
 function sortedRecord<T>(map: ReadonlyMap<string, T>): Readonly<Record<string, T>> {
-  const record: Record<string, T> = {};
+  const record = plainRecord<T>();
   for (const key of [...map.keys()].sort()) {
     const value = map.get(key);
     if (value !== undefined) {
@@ -65,16 +76,16 @@ function sortedRecord<T>(map: ReadonlyMap<string, T>): Readonly<Record<string, T
 }
 
 function lotsRecord(map: ReadonlyMap<string, OpenLot>): Readonly<Record<string, unknown>> {
-  const record: Record<string, unknown> = {};
+  const record = plainRecord<unknown>();
   for (const key of [...map.keys()].sort()) {
     const lot = map.get(key);
     if (lot !== undefined) {
-      record[key] = {
+      record[key] = plainFrozen({
         shares: lot.shares,
         costBasis: lot.costBasis,
         denominationAsset: lot.denominationAsset,
         marketId: lot.marketId,
-      };
+      });
     }
   }
   return record;

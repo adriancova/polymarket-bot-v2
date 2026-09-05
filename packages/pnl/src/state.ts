@@ -43,9 +43,16 @@ import {
 
 import type { PnlSettlementEvidence } from "./evidence.js";
 import { verifyRewardPayoutEvidence } from "./evidence.js";
-import { frozenMap, frozenSet } from "./immutable.js";
+import { frozenMap, frozenSet, plainFrozen } from "./immutable.js";
 import type { PnlRefusal, PnlResult } from "./refusals.js";
-import { PnlConfigurationError, pnlFailure, pnlOk, pnlRefusal } from "./refusals.js";
+import {
+  PnlConfigurationError,
+  contained,
+  pnlFailure,
+  pnlOk,
+  pnlRefusal,
+  readInputAsData,
+} from "./refusals.js";
 import type {
   PnlCostBasisInjectionRecord,
   PnlFeeRecord,
@@ -58,7 +65,7 @@ import type {
   PnlTradeRecord,
   PnlTradeReversalRecord,
 } from "./records.js";
-import { PnlRecordSchema, PnlStreamIdentitySchema, pnlOwnerOf } from "./records.js";
+import { PnlRecordDoor, PnlStreamIdentityDoor, pnlOwnerOf } from "./records.js";
 
 const ZERO: DecimalString = "0";
 
@@ -139,18 +146,75 @@ export interface PnlState {
  * one missing `environment` or `accountRef`, which are NOT NULL columns of
  * `accounting.pnl_snapshots` and are not derivable from a PnL value, so a
  * stream that cannot state them is a stream whose rows cannot be written.
+ *
+ * A PROTOTYPE-FREE DOOR (`WP-200-FU1`): **D1** the identity is materialized
+ * before it is parsed, **D2** through {@link PnlStreamIdentityDoor}, **D3** the
+ * stored identity is the materialized tree, **D4** which has no prototype.
+ * Measured at `main` `761db76`, before this change: an identity with no own
+ * `accountRef`, under one NON-ENUMERABLE `Object.prototype.accountRef`, opened
+ * a stream on an account nobody named — and `accountRef` is a NOT NULL identity
+ * column of the rows this stream produces, so the fabricated value would have
+ * been written.
+ *
+ * The THROW is deliberate and unchanged: a malformed identity is a
+ * construction-time contract violation, not a recoverable refusal. What IS new
+ * is that it is the ONLY throw this function can produce (`WP-200-FU1`): the
+ * outer guard converts anything else into the same typed error, so the
+ * documented contract — "throws `PnlConfigurationError`, or returns a state" —
+ * holds for every input rather than for the ones somebody thought of. Measured
+ * need: under an inherited get-only accessor at an ARRAY-INDEX name the shared
+ * door's own accumulator throws a bare `TypeError`, and that escaped
+ * `foldPnlRecords` untyped.
+ *
+ * THE INDEX NAME REACHED FIRST IS `"0"` (`WP-200-FU1` review round 1, finding
+ * M2 — measured both ways rather than reasoned):
+ *
+ * ```text
+ * get-only accessor at Object.prototype["0"], a LEGITIMATE identity:
+ *   base 761db76  emptyPnlState(IDENTITY) -> THREW TypeError (bare, ESCAPED)
+ *   tip  7d5ac34  emptyPnlState(IDENTITY) -> THREW PnlConfigurationError (typed)
+ * ```
+ *
+ * So for THIS function the class is not new — it existed at base and escaped
+ * untyped; the door converts it into the documented channel. It is availability,
+ * not permission: nothing is admitted and nothing is invented. The root cause is
+ * `packages/risk`'s `plain-data.ts` appending with `Array.prototype.push`
+ * instead of `CreateDataProperty`; that module is outside `WP-200-FU1`'s allowed
+ * paths and its widening is queued as a separate authorized round.
  */
 export function emptyPnlState(identity: PnlStreamIdentity): PnlState {
-  const parsed = PnlStreamIdentitySchema.safeParse(identity);
+  try {
+    return openPnlStream(identity);
+  } catch (error) {
+    if (error instanceof PnlConfigurationError) {
+      throw error;
+    }
+    throw new PnlConfigurationError("a PnL stream could not be opened for this identity", {
+      raw: identity,
+    });
+  }
+}
+
+function openPnlStream(identity: PnlStreamIdentity): PnlState {
+  const read = readInputAsData(identity, "identity", "PnL stream identity");
+  if (!read.ok) {
+    throw new PnlConfigurationError("value is not a PnL stream identity", {
+      raw: identity,
+      issues: read.refusal.details["issues"] ?? [],
+    });
+  }
+  const parsed = PnlStreamIdentityDoor.safeParse(read.value);
   if (!parsed.success) {
     throw new PnlConfigurationError("value is not a PnL stream identity", {
       raw: identity,
       issues: formatIssues(parsed.error),
     });
   }
-  return Object.freeze({
-    identity: Object.freeze(parsed.data),
-    owner: pnlOwnerOf(parsed.data),
+  // D3/D4 — the identity IS the materialized, prototype-free tree.
+  const materialized = deepFreezeIdentity(read.value as PnlStreamIdentity);
+  return plainFrozen({
+    identity: materialized,
+    owner: pnlOwnerOf(materialized),
     recordCount: 0,
     refs: frozenSet(new Set<string>()),
     lots: frozenMap(new Map<string, OpenLot>()),
@@ -165,6 +229,11 @@ export function emptyPnlState(identity: PnlStreamIdentity): PnlState {
     reversedRefs: frozenSet(new Set<string>()),
     consumedRewardEvidence: frozenMap(new Map<string, string>()),
   });
+}
+
+/** Freezes the materialized identity (a flat record of strings). */
+function deepFreezeIdentity(identity: PnlStreamIdentity): PnlStreamIdentity {
+  return Object.freeze(identity);
 }
 
 /**
@@ -191,7 +260,13 @@ const CANONICAL_UUID_V7_PATTERN =
 
 const UUID_FIELDS = ["ref", "reversesRef", "marketId", "ledgerTransactionId"] as const;
 
-/** ADR-016 pre-check: refuse a UUID-shaped, non-canonical id with the raw value. */
+/**
+ * ADR-016 pre-check: refuse a UUID-shaped, non-canonical id with the raw value.
+ *
+ * Runs on the MATERIALIZED tree (`WP-200-FU1`), so `record[field]` and
+ * `owner["instanceId"]` are own-property reads on objects with no prototype
+ * chain, and a getter has already been refused by D1 rather than invoked here.
+ */
 function collectUuidRefusals(value: unknown): readonly PnlRefusal[] {
   if (typeof value !== "object" || value === null) {
     return [];
@@ -282,7 +357,10 @@ function thaw(state: PnlState): MutableState {
  * and the next snapshot reported the 999.
  */
 function freeze(state: MutableState): PnlState {
-  return Object.freeze({
+  // D4 — the folded state has no prototype, so `state.consumedRewardEvidence`
+  // and every other container read on a value this package handed out is
+  // answered by the state or not at all.
+  return plainFrozen({
     identity: state.identity,
     owner: state.owner,
     recordCount: state.recordCount,
@@ -329,17 +407,49 @@ function basisOfRemoval(
  * therefore must be proven against the booked ledger transaction rather than
  * against its identifier (`evidence.ts`). Every other record kind carries its
  * own facts and ignores it.
+ *
+ * A PROTOTYPE-FREE DOOR (`WP-200-FU1`, 2026-09-04), performing all four steps
+ * of `docs/contracts/schema-boundary.md` §1:
+ *
+ * - **D1** `readInputAsData` materializes the record into a fresh tree of plain
+ *   own data with NO PROTOTYPE, reading descriptors rather than properties;
+ * - **D2** the parse goes through {@link PnlRecordDoor}, the severed, warmed
+ *   arena copy — which is also what stops the cold-first-parse `TypeError` from
+ *   escaping and poisoning the union (transcript at that constant);
+ * - **D3** the record folded below is the materialized tree, not `parsed.data`;
+ * - **D4** the state this returns has no prototype, and neither do the lots and
+ *   trade effects inside it.
+ *
+ * ORDER IS UNCHANGED except for D1: the ADR-016 canonicality pre-check still
+ * runs before the grammar, owner and duplicate-ref checks still follow it, and
+ * every refusal code, message and detail is the one `WP-200` shipped.
  */
 export function applyPnlRecord(
   state: PnlState,
   input: unknown,
   evidence?: PnlSettlementEvidence,
 ): PnlResult<PnlState> {
-  const uuidRefusals = collectUuidRefusals(input);
+  return contained(() => applyMaterializedPnlRecord(state, input, evidence));
+}
+
+function applyMaterializedPnlRecord(
+  state: PnlState,
+  input: unknown,
+  evidence: PnlSettlementEvidence | undefined,
+): PnlResult<PnlState> {
+  // D1.
+  const read = readInputAsData(input, "record", "PnL record");
+  if (!read.ok) {
+    return pnlFailure(read.refusal);
+  }
+  const materialized = read.value;
+
+  const uuidRefusals = collectUuidRefusals(materialized);
   if (uuidRefusals.length > 0) {
     return pnlFailure(...uuidRefusals);
   }
-  const parsed = PnlRecordSchema.safeParse(input);
+  // D2 — the answer is the library's; the output is discarded.
+  const parsed = PnlRecordDoor.safeParse(materialized);
   if (!parsed.success) {
     return pnlFailure(
       pnlRefusal("PNL_INPUT_INVALID", "the value is not a PnL record", {
@@ -347,7 +457,8 @@ export function applyPnlRecord(
       }),
     );
   }
-  const record: PnlRecord = parsed.data;
+  // D3 — the folded record IS the materialized tree.
+  const record = materialized as PnlRecord;
 
   if (!sameOwner(record.owner, state.owner)) {
     return pnlFailure(
@@ -389,21 +500,25 @@ export function foldPnlRecords(
   records: readonly unknown[],
   evidence?: PnlSettlementEvidence,
 ): PnlResult<PnlState> {
+  // `emptyPnlState` is deliberately OUTSIDE the containment guard: its
+  // `PnlConfigurationError` is the documented construction-time contract.
   let state = emptyPnlState(identity);
-  for (const [index, record] of records.entries()) {
-    const result = applyPnlRecord(state, record, evidence);
-    if (!result.ok) {
-      return pnlFailure(
-        pnlRefusal("PNL_INPUT_INVALID", `fold refused at record index ${index}`, {
-          index,
-          refusals: result.refusals,
-        }),
-        ...result.refusals,
-      );
+  return contained(() => {
+    for (const [index, record] of records.entries()) {
+      const result = applyPnlRecord(state, record, evidence);
+      if (!result.ok) {
+        return pnlFailure<PnlState>(
+          pnlRefusal("PNL_INPUT_INVALID", `fold refused at record index ${index}`, {
+            index,
+            refusals: result.refusals,
+          }),
+          ...result.refusals,
+        );
+      }
+      state = result.value;
     }
-    state = result.value;
-  }
-  return pnlOk(state);
+    return pnlOk(state);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -449,20 +564,26 @@ function applyTrade(state: PnlState, record: PnlTradeRecord): PnlResult<PnlState
   if (record.side === "BUY") {
     const shares = addDecimal(lot?.shares ?? ZERO, record.shares);
     const costBasis = addDecimal(lot?.costBasis ?? ZERO, notional);
-    next.lots.set(record.tokenAssetId, {
-      shares,
-      costBasis,
-      denominationAsset: record.denominationAsset,
-      marketId: record.marketId,
-    });
-    next.tradeLog.set(record.ref, {
-      side: "BUY",
-      tokenAssetId: record.tokenAssetId,
-      shares: record.shares,
-      basisDelta: notional,
-      realizedDelta: ZERO,
-      denominationAsset: record.denominationAsset,
-    });
+    next.lots.set(
+      record.tokenAssetId,
+      plainFrozen({
+        shares,
+        costBasis,
+        denominationAsset: record.denominationAsset,
+        marketId: record.marketId,
+      }),
+    );
+    next.tradeLog.set(
+      record.ref,
+      plainFrozen({
+        side: "BUY" as const,
+        tokenAssetId: record.tokenAssetId,
+        shares: record.shares,
+        basisDelta: notional,
+        realizedDelta: ZERO,
+        denominationAsset: record.denominationAsset,
+      }),
+    );
   } else {
     const held = lot?.shares ?? ZERO;
     if (lot === undefined || compareDecimal(record.shares, held) > 0) {
@@ -486,17 +607,20 @@ function applyTrade(state: PnlState, record: PnlTradeRecord): PnlResult<PnlState
     if (isZeroDecimal(shares)) {
       next.lots.delete(record.tokenAssetId);
     } else {
-      next.lots.set(record.tokenAssetId, { ...lot, shares, costBasis: remaining });
+      next.lots.set(record.tokenAssetId, plainFrozen({ ...lot, shares, costBasis: remaining }));
     }
     addTo(next.realizedTrading, record.denominationAsset, realizedDelta);
-    next.tradeLog.set(record.ref, {
-      side: "SELL",
-      tokenAssetId: record.tokenAssetId,
-      shares: record.shares,
-      basisDelta: subDecimal(ZERO, removed),
-      realizedDelta,
-      denominationAsset: record.denominationAsset,
-    });
+    next.tradeLog.set(
+      record.ref,
+      plainFrozen({
+        side: "SELL" as const,
+        tokenAssetId: record.tokenAssetId,
+        shares: record.shares,
+        basisDelta: subDecimal(ZERO, removed),
+        realizedDelta,
+        denominationAsset: record.denominationAsset,
+      }),
+    );
   }
 
   next.refs.add(record.ref);
@@ -563,17 +687,20 @@ function applyTradeReversal(
     if (isZeroDecimal(shares) && isZeroDecimal(costBasis)) {
       next.lots.delete(effect.tokenAssetId);
     } else {
-      next.lots.set(effect.tokenAssetId, { ...lot, shares, costBasis });
+      next.lots.set(effect.tokenAssetId, plainFrozen({ ...lot, shares, costBasis }));
     }
   } else {
     // Unwind a sell: restore the shares and basis, take back the realized PnL.
     const restoredBasis = subDecimal(ZERO, effect.basisDelta);
-    next.lots.set(effect.tokenAssetId, {
-      shares: addDecimal(lot?.shares ?? ZERO, effect.shares),
-      costBasis: addDecimal(lot?.costBasis ?? ZERO, restoredBasis),
-      denominationAsset: effect.denominationAsset,
-      marketId: lot?.marketId ?? null,
-    });
+    next.lots.set(
+      effect.tokenAssetId,
+      plainFrozen({
+        shares: addDecimal(lot?.shares ?? ZERO, effect.shares),
+        costBasis: addDecimal(lot?.costBasis ?? ZERO, restoredBasis),
+        denominationAsset: effect.denominationAsset,
+        marketId: lot?.marketId ?? null,
+      }),
+    );
     addTo(next.realizedTrading, effect.denominationAsset, subDecimal(ZERO, effect.realizedDelta));
   }
 
@@ -615,7 +742,7 @@ function applyRealization(
   if (isZeroDecimal(shares)) {
     next.lots.delete(record.tokenAssetId);
   } else {
-    next.lots.set(record.tokenAssetId, { ...lot, shares, costBasis: remaining });
+    next.lots.set(record.tokenAssetId, plainFrozen({ ...lot, shares, costBasis: remaining }));
   }
   next.refs.add(record.ref);
   next.recordCount += 1;
@@ -631,12 +758,15 @@ function applyInjection(
     return pnlFailure(denominationConflict(record, lot, record.tokenAssetId));
   }
   const next = thaw(state);
-  next.lots.set(record.tokenAssetId, {
-    shares: addDecimal(lot?.shares ?? ZERO, record.shares),
-    costBasis: addDecimal(lot?.costBasis ?? ZERO, record.costBasis),
-    denominationAsset: record.denominationAsset,
-    marketId: record.marketId ?? lot?.marketId ?? null,
-  });
+  next.lots.set(
+    record.tokenAssetId,
+    plainFrozen({
+      shares: addDecimal(lot?.shares ?? ZERO, record.shares),
+      costBasis: addDecimal(lot?.costBasis ?? ZERO, record.costBasis),
+      denominationAsset: record.denominationAsset,
+      marketId: record.marketId ?? lot?.marketId ?? null,
+    }),
+  );
   next.refs.add(record.ref);
   next.recordCount += 1;
   return pnlOk(freeze(next));
