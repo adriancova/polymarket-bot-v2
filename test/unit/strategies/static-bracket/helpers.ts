@@ -34,6 +34,7 @@ import type {
 } from "../../../../packages/strategy-runtime/src/index.js";
 import {
   INITIAL_STATE,
+  type OrderTrack,
   type StaticBracketParams,
   type StaticBracketState,
 } from "../../../../packages/strategies/static-bracket/src/index.js";
@@ -178,6 +179,38 @@ export interface BookFixture {
   readonly asOf?: string;
 }
 
+/**
+ * Reads one OPTIONAL fixture key, OWN-PROPERTY ONLY.
+ *
+ * `options.tickSize ?? "0.01"` looks harmless and is not: the option objects the
+ * tests pass are ordinary `{}` literals, so they inherit `Object.prototype`, and
+ * the hostile battery pollutes exactly that. A polluted `tickSize`, `closeTime`
+ * or `yesShares` would be answered by the prototype and the FIXTURE would hand
+ * the strategy a poisoned view — the battery would then be measuring the
+ * helpers, not the package under test. Every optional read below goes through
+ * here, so an absent key is absent.
+ */
+function pick<T extends object, K extends keyof T & string>(
+  options: T,
+  key: K,
+  fallback: NonNullable<T[K]>,
+): NonNullable<T[K]> {
+  if (!Object.hasOwn(options, key)) return fallback;
+  const value = options[key];
+  return value === undefined ? fallback : (value as NonNullable<T[K]>);
+}
+
+/** As {@link pick}, but `null` is a meaningful value the caller chose. */
+function pickNullable<T extends object, K extends keyof T & string>(
+  options: T,
+  key: K,
+  fallback: T[K],
+): T[K] {
+  if (!Object.hasOwn(options, key)) return fallback;
+  const value = options[key];
+  return value === undefined ? fallback : value;
+}
+
 function levels(pairs: readonly (readonly [string, string])[]): { price: string; shares: string }[] {
   return pairs.map(([price, shares]) => ({ price, shares }));
 }
@@ -186,7 +219,7 @@ export function book(fixture: BookFixture, asOf: string): OrderBookView {
   return {
     bids: levels(fixture.bids),
     asks: levels(fixture.asks),
-    asOf: fixture.asOf ?? asOf,
+    asOf: pick(fixture, "asOf", asOf),
   } as OrderBookView;
 }
 
@@ -218,6 +251,8 @@ export interface ViewOptions {
   readonly yes?: BookFixture;
   readonly no?: BookFixture;
   readonly features?: Record<string, string | boolean | null>;
+  /** Keys DELETED from the snapshot, so the strategy sees them truly absent. */
+  readonly omitFeatures?: readonly string[];
   readonly yesShares?: string;
   readonly noShares?: string;
   readonly orders?: readonly StrategyOrderView[];
@@ -227,17 +262,20 @@ export interface ViewOptions {
   readonly openTime?: string | null;
 }
 
-export function features(overrides: Record<string, string | boolean | null> = {}): FeatureSnapshot {
-  return {
-    snapshotRef: SNAPSHOT_REF,
-    asOf: T_NOW,
-    values: {
-      [TRIGGER_KEY]: "0.35",
-      [STOP_KEY]: "0.34",
-      [INCIDENT_KEY]: false,
-      ...overrides,
-    },
-  } as FeatureSnapshot;
+export function features(
+  overrides: Record<string, string | boolean | null> = {},
+  omit: readonly string[] = [],
+): FeatureSnapshot {
+  const values: Record<string, string | boolean | null> = {
+    [TRIGGER_KEY]: "0.35",
+    [STOP_KEY]: "0.34",
+    [INCIDENT_KEY]: false,
+    ...overrides,
+  };
+  for (const key of omit) {
+    delete values[key];
+  }
+  return { snapshotRef: SNAPSHOT_REF, asOf: T_NOW, values } as FeatureSnapshot;
 }
 
 export function marketView(options: ViewOptions = {}): MarketView {
@@ -246,21 +284,21 @@ export function marketView(options: ViewOptions = {}): MarketView {
     conditionId: "0xcondition",
     yesTokenId: YES_TOKEN,
     noTokenId: NO_TOKEN,
-    tickSize: options.tickSize ?? "0.01",
-    minimumOrderSize: options.minimumOrderSize ?? "5",
+    tickSize: pick(options, "tickSize", "0.01"),
+    minimumOrderSize: pick(options, "minimumOrderSize", "5"),
   };
-  const openTime = options.openTime === undefined ? T_OPEN : options.openTime;
+  const openTime = pickNullable(options, "openTime", T_OPEN as string | null);
   if (openTime !== null) view["openTime"] = openTime;
-  const closeTime = options.closeTime === undefined ? T_CLOSE : options.closeTime;
+  const closeTime = pickNullable(options, "closeTime", T_CLOSE as string | null);
   if (closeTime !== null) view["closeTime"] = closeTime;
   return view as unknown as MarketView;
 }
 
 export function position(options: ViewOptions = {}): VirtualPositionView {
   return {
-    yesShares: options.yesShares ?? "0",
-    noShares: options.noShares ?? "0",
-    asOf: options.now ?? T_NOW,
+    yesShares: pick(options, "yesShares", "0"),
+    noShares: pick(options, "noShares", "0"),
+    asOf: pick(options, "now", T_NOW),
   } as VirtualPositionView;
 }
 
@@ -295,13 +333,13 @@ export function context(
   state: unknown,
   options: ViewOptions = {},
 ): StrategyContext {
-  const now = options.now ?? T_NOW;
-  const yesBook = book(options.yes ?? HEALTHY_YES, now);
-  const noBook = book(options.no ?? HEALTHY_NO, now);
-  const snapshot = features(options.features ?? {});
+  const now = pick(options, "now", T_NOW);
+  const yesBook = book(pick(options, "yes", HEALTHY_YES), now);
+  const noBook = book(pick(options, "no", HEALTHY_NO), now);
+  const snapshot = features(pick(options, "features", {}), pick(options, "omitFeatures", []));
   const market = marketView(options);
   const held = position({ ...options, now });
-  const orders = options.orders ?? [];
+  const orders = pick(options, "orders", []);
   let draws = 0;
   const rng: SeededRandom = {
     nextUint32: () => {
@@ -348,6 +386,25 @@ export function stateWith(changes: Partial<StaticBracketState>): StaticBracketSt
   return { ...INITIAL_STATE, ...changes };
 }
 
+/** A tracked order with the named overrides applied to a plain resting entry. */
+export function orderTrack(changes: Partial<OrderTrack> = {}): OrderTrack {
+  return {
+    kind: "ENTRY",
+    intentId: "sb-entry-0",
+    orderId: "order-1",
+    state: "WORKING",
+    outcome: "YES",
+    side: "BUY",
+    limitPrice: "0.35",
+    requestedShares: "50",
+    filledShares: "0",
+    viewFilledShares: "0",
+    placedAtMs: 1,
+    escalated: true,
+    ...changes,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The real WP-170 runtime harness
 // ---------------------------------------------------------------------------
@@ -391,18 +448,18 @@ export function evaluationInput(
   options: ViewOptions = {},
   payload: Record<string, unknown> = {},
 ): EvaluationInput {
-  const now = options.now ?? T_NOW;
+  const now = pick(options, "now", T_NOW);
   return {
     callback,
     evaluatedAt: now,
     market: marketView(options),
     books: {
-      yes: book(options.yes ?? HEALTHY_YES, now),
-      no: book(options.no ?? HEALTHY_NO, now),
+      yes: book(pick(options, "yes", HEALTHY_YES), now),
+      no: book(pick(options, "no", HEALTHY_NO), now),
     },
-    features: features(options.features ?? {}),
+    features: features(pick(options, "features", {}), pick(options, "omitFeatures", [])),
     position: position({ ...options, now }),
-    orders: options.orders ?? [],
+    orders: pick(options, "orders", []),
     riskBudget: riskBudget(),
     ...payload,
   } as EvaluationInput;

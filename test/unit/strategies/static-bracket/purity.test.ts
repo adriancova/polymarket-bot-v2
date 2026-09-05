@@ -182,7 +182,11 @@ describe("the §9.6 interface surface", () => {
   it("presents the four identity members", () => {
     expect(staticBracketStrategy.name).toBe("static-bracket");
     expect(typeof staticBracketStrategy.version).toBe("string");
-    expect(staticBracketStrategy.stateSchemaVersion).toBe(1);
+    // v2: the review-round-1 remediation added `legBaselineShares` and
+    // `OrderTrack.viewFilledShares`, both required. §9.6 makes a state-schema
+    // change a NEW RUN rather than an in-place migration, and this number is how
+    // the runtime tells the two apart.
+    expect(staticBracketStrategy.stateSchemaVersion).toBe(2);
     expect(typeof (staticBracketStrategy.paramsSchema as { safeParse: unknown }).safeParse).toBe(
       "function",
     );

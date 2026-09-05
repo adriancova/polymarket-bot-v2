@@ -35,6 +35,12 @@ export const REASONS = {
   entrySubmissionUnknown: "SB.ENTRY_SUBMISSION_UNKNOWN",
   entryAwaitingReconciliation: "SB.AWAITING_RECONCILIATION",
   entryReconciled: "SB.ENTRY_RECONCILED",
+  /**
+   * An ORDER VIEW reported a filled size the fill stream has not yet delivered
+   * (§8.1 orders neither before the other). The execution is real, so the
+   * instance neither re-enters nor sizes anything from the view: it waits.
+   */
+  awaitingFillAllocation: "SB.AWAITING_FILL_ALLOCATION",
 
   // entry refusals
   refusedCostCap: "SB.REFUSED_MAXIMUM_TOTAL_COST",

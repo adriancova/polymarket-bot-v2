@@ -169,6 +169,199 @@ describe("through the real runtime — the happy path to CLOSED", () => {
   });
 });
 
+/**
+ * RE-ENTRY, DRIVEN TWICE.
+ *
+ * `maximum_entries_per_market` is a §13.3 rule-3 bound on ACTUAL EXECUTIONS, and
+ * it is enforced by a counter that only increments on an entry order's FIRST
+ * confirmed fill. Before the remediation `planRearm` cleared only the two order
+ * tracks, so bracket 2 inherited bracket 1's `allocatedShares` and no fill ever
+ * looked like a first fill again: the counter froze at 1 and the bound stopped
+ * binding. It also inherited `openedAtMs`, so a 180-second bracket was
+ * force-exited seconds after opening, on a clock belonging to a bracket that had
+ * already closed.
+ */
+describe("through the real runtime — re-entry runs a SECOND complete bracket", () => {
+  const twoEntries = (): Record<string, unknown> => {
+    const config = baseConfig();
+    (config["reentry"] as Record<string, unknown>)["maximum_entries_per_market"] = 2;
+    (config["reentry"] as Record<string, unknown>)["cooldown_seconds"] = 0;
+    return config;
+  };
+
+  /** One whole bracket: enter, rest, fill, take profit, exit-fill, close. */
+  function bracket(runtime: StrategyInstanceRuntime, exitOrderId: string): void {
+    step(runtime, "onFeatures", { features: { [TRIGGER_KEY]: "0.35" } });
+    step(runtime, "onOrderUpdate", { orders: [order()] }, { order: order() });
+    step(runtime, "onFill", { yesShares: "50" }, fillPayload());
+    step(
+      runtime,
+      "onFill",
+      { yesShares: "0" },
+      fillPayload({ orderId: exitOrderId, side: "SELL", price: "0.5", shares: "50" }),
+    );
+  }
+
+  it("counts each execution, gives bracket 2 a FRESH holding clock, and refuses a third", () => {
+    const { runtime, store } = harness(twoEntries());
+    step(runtime, "onStart");
+
+    bracket(runtime, "order-2");
+    const afterFirst = currentState(store);
+    expect(afterFirst["instanceState"]).toBe("CLOSED");
+    expect(afterFirst["entriesExecuted"]).toBe(1);
+    expect(afterFirst["exitedShares"]).toBe("50");
+    const firstOpenedAt = afterFirst["openedAtMs"];
+    expect(typeof firstOpenedAt).toBe("number");
+
+    // Re-arm: every PER-BRACKET field is reset, every PER-MARKET field survives.
+    step(runtime, "onFeatures", { yesShares: "0" });
+    const rearmed = currentState(store);
+    expect(rearmed["instanceState"]).toBe("ARMED");
+    expect(rearmed["allocatedShares"]).toBe("0");
+    expect(rearmed["allocatedCost"]).toBe("0");
+    expect(rearmed["exitedShares"]).toBe("0");
+    expect(rearmed["legOutcome"]).toBeNull();
+    expect(rearmed["legBaselineShares"]).toBe("0");
+    expect(rearmed["openedAtMs"]).toBeNull();
+    // Per-market, and carried: the execution count, the cool-down anchor, and
+    // the monotone intent sequence.
+    expect(rearmed["entriesExecuted"]).toBe(1);
+    expect(rearmed["closedAtMs"]).toBe(afterFirst["closedAtMs"]);
+    expect(Number(rearmed["intentSequence"])).toBeGreaterThan(0);
+
+    bracket(runtime, "order-4");
+    const afterSecond = currentState(store);
+    expect(afterSecond["instanceState"]).toBe("CLOSED");
+    // THE COUNTER MOVED. This is the assertion the frozen counter failed.
+    expect(afterSecond["entriesExecuted"]).toBe(2);
+    // And bracket 2's holding clock is its own, not bracket 1's.
+    expect(afterSecond["openedAtMs"]).toBe(firstOpenedAt);
+    expect(afterSecond["allocatedShares"]).toBe("50");
+    expect(afterSecond["exitedShares"]).toBe("50");
+
+    // A third entry is refused: two executions is the configured maximum.
+    const third = step(runtime, "onFeatures", { yesShares: "0" });
+    expect(third.kind === "DECIDED" && third.record.decision.reasonCodes).toContain(
+      "SB.REFUSED_MAXIMUM_ENTRIES",
+    );
+    expect(
+      third.kind === "DECIDED" &&
+        third.record.decision.intents.filter((intent) => intent.type === "POSITION").length,
+    ).toBe(0);
+    expect(currentState(store)["instanceState"]).toBe("CLOSED");
+  });
+
+  it("bracket 2 is not force-exited by bracket 1's holding clock", () => {
+    const { runtime, store } = harness(twoEntries());
+    step(runtime, "onStart");
+    bracket(runtime, "order-2");
+    step(runtime, "onFeatures", { yesShares: "0" });
+
+    // Re-enter and fill: `maximum_holding_seconds` is 180 and no time has
+    // passed on the fixture clock, so the bracket must be MANAGED (a resting
+    // take-profit), never reduced.
+    step(runtime, "onFeatures", { features: { [TRIGGER_KEY]: "0.35" } });
+    step(runtime, "onOrderUpdate", { orders: [order()] }, { order: order() });
+    const filled = step(runtime, "onFill", { yesShares: "50" }, fillPayload());
+    expect(filled.kind === "DECIDED" && filled.record.decision.decisionType).toBe("exit");
+    if (filled.kind === "DECIDED") {
+      expect(filled.record.decision.reasonCodes).not.toContain("SB.HOLDING_TIMEOUT");
+      expect(
+        filled.record.decision.intents.some((intent) => intent.type === "REDUCE_POSITION"),
+      ).toBe(false);
+    }
+    expect(currentState(store)["instanceState"]).toBe("EXIT_PLANNED");
+  });
+});
+
+/**
+ * §8.1 GIVES NO ORDERING between a `StrategyOrderView` and the `StrategyFill` it
+ * describes. A view that reports FILLED before the fill arrives used to be read
+ * as "this order executed nothing": the entry order was discarded, the instance
+ * returned to ARMED, and the very next evaluation entered again — a second real
+ * POSITION intent on a market it had already fully entered.
+ */
+describe("through the real runtime — a FILLED view that outruns its fill", () => {
+  const roomForTwo = (): Record<string, unknown> => {
+    const config = baseConfig();
+    // Deliberately generous, so the position cap is not what saves us: the
+    // question is whether the STRATEGY re-enters, not whether a cap catches it.
+    (config["risk"] as Record<string, unknown>)["maximum_position_shares"] = "500";
+    return config;
+  };
+
+  it("waits for the fill stream instead of re-entering", () => {
+    const { runtime, store } = harness(roomForTwo());
+    step(runtime, "onStart");
+    step(runtime, "onFeatures", { features: { [TRIGGER_KEY]: "0.35" } });
+    step(runtime, "onOrderUpdate", { orders: [order()] }, { order: order() });
+
+    const filledView = order({ status: "FILLED", filledShares: "50" });
+    const seen = step(
+      runtime,
+      "onOrderUpdate",
+      { yesShares: "50", orders: [filledView] },
+      { order: filledView },
+    );
+    expect(seen.kind === "DECIDED" && seen.record.decision.reasonCodes).toContain(
+      "SB.AWAITING_FILL_ALLOCATION",
+    );
+    const waiting = currentState(store);
+    // NOT ARMED, and the execution is not discarded.
+    expect(waiting["instanceState"]).toBe("ENTRY_WORKING");
+    expect((waiting["entryOrder"] as Record<string, unknown>)["viewFilledShares"]).toBe("50");
+    // The fold is still the only writer of the allocation (§13.3 rule 1).
+    expect(waiting["allocatedShares"]).toBe("0");
+
+    // The next evaluation must NOT emit a second entry.
+    const next = step(runtime, "onFeatures", { yesShares: "50" });
+    expect(
+      next.kind === "DECIDED" &&
+        next.record.decision.intents.filter((intent) => intent.type === "POSITION").length,
+    ).toBe(0);
+    expect(next.kind === "DECIDED" && next.record.decision.reasonCodes).toContain(
+      "SB.AWAITING_FILL_ALLOCATION",
+    );
+
+    // When the fill finally lands, the allocation is folded from it and the
+    // exit is sized to the fold — the view's number never became an allocation.
+    const landed = step(runtime, "onFill", { yesShares: "50" }, fillPayload());
+    expect(landed.kind === "DECIDED" && landed.record.decision.decisionType).toBe("exit");
+    const open = currentState(store);
+    expect(open["allocatedShares"]).toBe("50");
+    expect(open["entriesExecuted"]).toBe(1);
+    const exitIntent =
+      landed.kind === "DECIDED"
+        ? landed.record.decision.intents.find((intent) => intent.type === "POSITION")
+        : undefined;
+    expect(exitIntent && "targetShares" in exitIntent ? exitIntent.targetShares : null).toBe("-50");
+  });
+
+  it("never lets the total requested exposure exceed maximum_position_shares", () => {
+    // The coherence rule the packet asks to pin: across the whole sequence, the
+    // sum of entry-side POSITION deltas may never exceed the configured cap.
+    const { runtime, sink } = harness(roomForTwo());
+    step(runtime, "onStart");
+    step(runtime, "onFeatures", { features: { [TRIGGER_KEY]: "0.35" } });
+    step(runtime, "onOrderUpdate", { orders: [order()] }, { order: order() });
+    const filledView = order({ status: "FILLED", filledShares: "50" });
+    step(runtime, "onOrderUpdate", { yesShares: "50", orders: [filledView] }, { order: filledView });
+    step(runtime, "onFeatures", { yesShares: "50" });
+    step(runtime, "onFeatures", { yesShares: "50" });
+
+    let requested = 0;
+    for (const call of sink.calls) {
+      for (const intent of call.record.decision.intents) {
+        if (intent.type !== "POSITION") continue;
+        if (intent.targetShares.startsWith("-")) continue;
+        requested += Number(intent.targetShares);
+      }
+    }
+    expect(requested).toBe(50);
+  });
+});
+
 describe("through the real runtime — the partial-fill path", () => {
   it("allocates each partial and exits only what is actually allocated", () => {
     const { runtime, sink, store } = harness();
@@ -382,6 +575,108 @@ describe("through the real runtime — determinism and safety", () => {
     step(created.runtime, "onFill", { yesShares: "50" }, fillPayload());
     step(created.runtime, "onMarketClosing", { yesShares: "50" }, { secondsRemaining: 19 });
     expect(JSON.stringify(sink.calls.map((call) => call.record.decision))).toBe(first);
+  });
+
+  /**
+   * The same byte-identity property over the two lifecycles the remediation
+   * added: a COMPLEMENT-LEG bracket (whose exits are buy-backs at complemented
+   * prices) and a TWO-BRACKET re-entry (whose second bracket runs on freshly
+   * reset per-bracket state). Both are longer and touch more of the ladder than
+   * the happy path, so both are worth pinning.
+   */
+  it("is byte-identical over a complement-leg bracket and a two-bracket re-entry", () => {
+    const complementConfig = (): Record<string, unknown> => {
+      const config = baseConfig();
+      (config["entry"] as Record<string, unknown>)["economic_leg_policy"] =
+        "PREFER_CHEAPEST_WITH_INVENTORY";
+      (config["reentry"] as Record<string, unknown>)["maximum_entries_per_market"] = 2;
+      (config["reentry"] as Record<string, unknown>)["cooldown_seconds"] = 0;
+      return config;
+    };
+
+    const CHEAP_NO: ViewOptions = {
+      noShares: "100",
+      no: { bids: [["0.7", "2000"]], asks: [["0.72", "2000"]] },
+    };
+    const noEntryOrder = (overrides: Record<string, unknown> = {}) =>
+      order({ orderId: "no-1", outcome: "NO", side: "SELL", price: "0.65", ...overrides });
+    const noExitOrder = (overrides: Record<string, unknown> = {}) =>
+      order({ orderId: "no-2", outcome: "NO", side: "BUY", price: "0.5", ...overrides });
+
+    const script = (runSeed: string): { bytes: string; evaluations: number } => {
+      const clock = new ManualClock();
+      const sink = new RecordingSink();
+      const created = createStrategyInstanceRuntime({
+        strategy: staticBracketStrategy,
+        params: complementConfig(),
+        run: { runId: RUN_ID, instanceId: INSTANCE_ID, configId: CONFIG_ID, runSeed },
+        watchdog: { evaluationBudgetUs: 500_000 },
+        clock,
+        decisionSink: sink,
+        checkpointStore: new RecordingStore(),
+      });
+      if (!created.ok) throw new Error("the runtime must accept the configuration");
+      const runtime = created.runtime;
+
+      // Bracket 1, on the COMPLEMENT leg: sell NO, buy it back.
+      step(runtime, "onStart", CHEAP_NO);
+      step(runtime, "onFeatures", CHEAP_NO);
+      step(
+        runtime,
+        "onOrderUpdate",
+        { ...CHEAP_NO, orders: [noEntryOrder()] },
+        { order: noEntryOrder() },
+      );
+      step(
+        runtime,
+        "onFill",
+        { ...CHEAP_NO, noShares: "50" },
+        fillPayload({ orderId: "no-1", outcome: "NO", side: "SELL", price: "0.7", shares: "50" }),
+      );
+      step(
+        runtime,
+        "onOrderUpdate",
+        { ...CHEAP_NO, noShares: "50", orders: [noExitOrder()] },
+        { order: noExitOrder() },
+      );
+      step(
+        runtime,
+        "onFill",
+        CHEAP_NO,
+        fillPayload({ orderId: "no-2", outcome: "NO", side: "BUY", price: "0.5", shares: "50" }),
+      );
+      // Bracket 2, re-armed and run on the DIRECT leg (no NO inventory left to
+      // beat it once the complement book moves against it).
+      step(runtime, "onFeatures", { noShares: "0" });
+      step(runtime, "onFeatures", { noShares: "0" });
+      step(runtime, "onOrderUpdate", { orders: [order()] }, { order: order() });
+      step(runtime, "onFill", { yesShares: "50" }, fillPayload());
+      step(runtime, "onTimer", { yesShares: "50" });
+      step(
+        runtime,
+        "onFill",
+        { yesShares: "0" },
+        fillPayload({ orderId: "order-2", side: "SELL", price: "0.5", shares: "50" }),
+      );
+      step(runtime, "onFeatures", { yesShares: "0" });
+      step(runtime, "onMarketClosing", { yesShares: "0" }, { secondsRemaining: 19 });
+      return {
+        bytes: JSON.stringify(sink.calls.map((call) => call.record.decision)),
+        evaluations: sink.calls.length,
+      };
+    };
+
+    const first = script(RUN_SEED);
+    expect(first.evaluations).toBe(14);
+    expect(script(RUN_SEED).bytes).toBe(first.bytes);
+    // A different seed changes the RNG stream and nothing else.
+    expect(script("999999999").bytes).toBe(first.bytes);
+
+    // And the lifecycle really did run both legs and both brackets.
+    expect(first.bytes).toContain("sb.leg:NO");
+    expect(first.bytes).toContain("sb.leg:YES");
+    expect(first.bytes).toContain("SB.REARMED");
+    expect(first.bytes).toContain("SB.ENTRY_LEG_COMPLEMENT");
   });
 
   it("emits only intents — never an order, a credential, or a venue call", () => {

@@ -47,6 +47,7 @@ import {
 } from "./economics.js";
 import { readFeatureFlag, readFeatureScalar } from "./features.js";
 import {
+  TERMINAL_ORDER_STATES,
   instanceTransition,
   orderTransition,
   type InstanceTrigger,
@@ -124,6 +125,26 @@ function moveOrder(track: OrderTrack, trigger: OrderTrigger): Outcome<OrderTrack
 }
 
 /**
+ * Folds a CONFIRMED FILL into a tracked order.
+ *
+ * §6 invariant 5 keeps ORDER STATE and SETTLEMENT STATE separate, and this is
+ * where that distinction earns its keep. A fill arriving for an order the venue
+ * has already reported terminal is not a contradiction and is not an illegal
+ * transition: §8.1 gives no ordering between an order view and the fill it
+ * describes, so the ordinary case of an aggressive order is a `FILLED` view and
+ * then its fill. The ALLOCATION is updated; the order's own state is already
+ * final and stays where it is.
+ *
+ * While the order is still live the sub-machine decides, exactly as before.
+ */
+function foldFillIntoOrder(track: OrderTrack, trigger: OrderTrigger): Outcome<OrderTrack> {
+  if (TERMINAL_ORDER_STATES.includes(track.state)) {
+    return ok(Object.freeze({ ...track }));
+  }
+  return moveOrder(track, trigger);
+}
+
+/**
  * Keeps the BRACKET machine in step with the ORDER sub-machine.
  *
  * §13.3 draws `ENTRY_PLANNED -> ENTRY_WORKING` and `EXIT_PLANNED ->
@@ -141,6 +162,7 @@ function syncPlannedToWorking(
   if (track === null || track.state !== "WORKING") return state;
   const expected = kind === "ENTRY" ? "ENTRY_PLANNED" : "EXIT_PLANNED";
   if (state.instanceState !== expected) return state;
+  // MOVE-SITE: syncPlannedToWorking
   const moved = move(state, kind === "ENTRY" ? "ENTRY_ORDER_WORKING" : "EXIT_ORDER_WORKING");
   return moved.ok ? moved.value : state;
 }
@@ -303,6 +325,7 @@ function incidentPlan(
           : withState(next, { exitOrder: moved.value });
     }
   }
+  // MOVE-SITE: incidentPause
   const paused = move(next, "PAUSE", {
     resumeTo: state.instanceState,
     lastIncident: quality.detail,
@@ -340,6 +363,87 @@ export function currentLeg(params: StaticBracketParams, state: StaticBracketStat
 }
 
 /**
+ * How this bracket's exposure is HELD, and therefore how it must be UNWOUND.
+ *
+ * {@link chooseLeg} produces exactly two shapes and no others:
+ *
+ * - the DIRECT leg BUYS the configured `market_selector.direction` token;
+ * - the COMPLEMENT leg SELLS the other token, which the instance already owns.
+ *
+ * The leg is therefore a total function of the traded token: a bracket whose
+ * `legOutcome` is the configured direction was entered by BUYING, and one whose
+ * `legOutcome` is the other token was entered by SELLING. Nothing else has to be
+ * remembered, and there is no state in which the two disagree.
+ *
+ * EVERY exit derives its side and its price from here. A complement-leg bracket
+ * is CLOSED BY BUYING THE SAME TOKEN BACK, and its executable prices are the
+ * complements of the configured, direction-denominated ones — because "one YES
+ * and one NO pay exactly 1 between them" is the only relation this package uses
+ * (`economics.ts`). Emitting the configured price on the complement leg would
+ * sell MORE of the token the instance is already short, which is not an exit at
+ * all: it is a second entry at double the size.
+ */
+export interface LegPosture {
+  /** The outcome token this bracket trades. */
+  readonly leg: Outcome2;
+  /** How the exposure was established. */
+  readonly entrySide: "BUY" | "SELL";
+  /** How it must be unwound: always the opposite of {@link entrySide}. */
+  readonly exitSide: "BUY" | "SELL";
+  /** True when the leg is the configured direction's complement. */
+  readonly complementLeg: boolean;
+}
+
+export function legPosture(params: StaticBracketParams, state: StaticBracketState): LegPosture {
+  const leg = currentLeg(params, state);
+  const complementLeg = leg !== params.market_selector.direction;
+  return Object.freeze({
+    leg,
+    entrySide: complementLeg ? "SELL" : "BUY",
+    exitSide: complementLeg ? "BUY" : "SELL",
+    complementLeg,
+  });
+}
+
+/**
+ * A configured, DIRECTION-denominated exit price, re-expressed as the price the
+ * chosen leg actually executes at.
+ *
+ * `exit.take_profit.price` and `exit.stop.minimum_sell_price` are written in the
+ * configured direction's terms (§13.2's example configures a YES bracket and
+ * names YES prices). On the direct leg that is already the executable price. On
+ * the complement leg the same economic level is `1 - price`, and the intent
+ * carries it as a MAXIMUM BUY price rather than a minimum sell price.
+ */
+function executableExitPrice(posture: LegPosture, configured: string): Outcome<string> {
+  return posture.complementLeg ? complement(configured, "complement exit price") : ok(configured);
+}
+
+/**
+ * This instance's OWN exposure, in shares of the traded leg, signed so that a
+ * larger number always means "more of the bracket is on".
+ *
+ * `legBaselineShares` is what the instance held of the leg token before its
+ * first entry fill, so the subtraction removes inventory this bracket did not
+ * create — §6 invariant 7's separation of actual account state from virtual
+ * strategy attribution, applied at the only place this package compares them.
+ *
+ * For a DIRECT bracket with no prior holding the baseline is zero and this is
+ * exactly the pre-remediation `heldShares(observation, leg)`.
+ */
+function legExposure(
+  params: StaticBracketParams,
+  state: StaticBracketState,
+  observation: Observation,
+): Outcome<string> {
+  const posture = legPosture(params, state);
+  const held = heldShares(observation, posture.leg);
+  return posture.entrySide === "BUY"
+    ? sub(held, state.legBaselineShares, "leg exposure")
+    : sub(state.legBaselineShares, held, "leg exposure");
+}
+
+/**
  * The whole per-evaluation ladder. Used by `onFeatures`, `onTimer`,
  * `onMarketOpen` and `onStart`, so every callback applies the same rules in the
  * same order and no path can skip the data-quality gate.
@@ -361,6 +465,7 @@ export function planTick(input: TickContext): Plan {
   let current = state;
   const resumeReasons: string[] = [];
   if (current.instanceState === "PAUSED") {
+    // MOVE-SITE: resume
     const resumed = move(current, "RESUME", { resumeTo: null, lastIncident: null });
     if (!resumed.ok) {
       return halted(current, resumed.problem, []);
@@ -380,6 +485,7 @@ export function planTick(input: TickContext): Plan {
   // rule 5) and is applied in `planClosing`; here the only question is whether
   // the bracket is finished.
   if (timeToCloseMs !== null && timeToCloseMs <= 0 && !hasAllocation(current)) {
+    // MOVE-SITE: marketClosed
     const closed = move(current, "MARKET_CLOSED", { closedAtMs: observation.nowMs });
     if (closed.ok) {
       return plan(closed.value, "hold", [...resumeReasons, REASONS.marketClosed]);
@@ -389,6 +495,7 @@ export function planTick(input: TickContext): Plan {
 
   switch (current.instanceState) {
     case "DORMANT": {
+      // MOVE-SITE: arm
       const armed = move(current, "ARM");
       if (!armed.ok) return halted(current, armed.problem, []);
       return plan(armed.value, "hold", [...resumeReasons, REASONS.armed]);
@@ -680,9 +787,11 @@ function planEntry(
     limitPrice: quote.limitPrice,
     requestedShares: size,
     filledShares: ZERO,
+    viewFilledShares: ZERO,
     placedAtMs: observation.nowMs,
     escalated: aggressive,
   });
+  // MOVE-SITE: entryTriggerMet
   const moved = move(state, "ENTRY_TRIGGER_MET", {
     entryOrder: track,
     intentSequence: state.intentSequence + 1,
@@ -827,15 +936,18 @@ function slippageMoney(
   quote: LegQuote,
   size: string,
 ): Outcome<string> {
-  // For a BUY leg the reference is the configured trigger threshold; for the
-  // complement SELL leg it is that threshold's complement, so the two legs are
-  // measured against the same economic price.
-  const reference =
-    quote.side === "BUY"
-      ? ok(params.entry.trigger_price_lte)
-      : complement(params.entry.trigger_price_lte, "slippage reference");
-  if (!reference.ok) return reference;
-  const referenceCost = mul(reference.value, size, "slippage reference cost");
+  // ONE reference for BOTH legs: `trigger_price_lte * size`, the money the
+  // configured threshold says this exposure should cost.
+  //
+  // `LegQuote.cost` is already YES-EQUIVALENT money on both legs — `chooseLeg`
+  // records the complement leg's cost as `size - proceeds` precisely so the two
+  // legs are comparable — so complementing the reference for the SELL leg would
+  // measure a direction-denominated cost against a complement-denominated
+  // price. The correct sell-leg measure, `(1 - t) * size - proceeds`, reduces
+  // algebraically to `cost - t * size`: the same expression, with the same
+  // reference. Complementing it made an identically-priced complement leg pass a
+  // cap the direct leg failed.
+  const referenceCost = mul(params.entry.trigger_price_lte, size, "slippage reference cost");
   if (!referenceCost.ok) return referenceCost;
   const excess = sub(quote.cost, referenceCost.value, "slippage");
   if (!excess.ok) return excess;
@@ -887,9 +999,18 @@ function planEntryOrderManagement(
   const reasons = [...carried];
   const track = state.entryOrder;
   if (track === null) {
-    // A planned entry with nothing tracked cannot be managed; abandon it rather
-    // than guess which order is ours.
-    const moved = move(state, "ENTRY_ABANDONED");
+    // A planned entry with nothing tracked cannot be managed. WHICH edge that is
+    // depends on whether anything was allocated: with no confirmed allocation
+    // nothing executed and the entry is abandoned (§13.3 rule 3 does not count
+    // it); with an allocation on the books it is NOT an abandonment, and saying
+    // so would return the instance to ARMED holding a position it could then
+    // enter on top of. The allocation is final at its confirmed size, which is
+    // the ENTRY_ORDER_TERMINAL_PARTIAL edge.
+    const trigger: InstanceTrigger = isZero(openShares(state))
+      ? "ENTRY_ABANDONED"
+      : "ENTRY_ORDER_TERMINAL_PARTIAL";
+    // MOVE-SITE: entryAbandoned
+    const moved = move(state, trigger);
     return moved.ok
       ? plan(moved.value, "hold", [...reasons, REASONS.entryOrderTerminal])
       : halted(state, moved.problem, []);
@@ -897,10 +1018,19 @@ function planEntryOrderManagement(
 
   // Adopt an order id if the OMS has surfaced one for our leg and side.
   const adopted = adoptOrder(state, observation, "ENTRY");
-  let current = syncPlannedToWorking(
+  const current = syncPlannedToWorking(
     adopted === null ? state : withState(state, { entryOrder: adopted }),
     "ENTRY",
   );
+
+  // An order the OMS reports as already terminal is settled HERE, through the
+  // one routine that knows the bracket transition — never left to fall through
+  // to a state the machine has no edge out of.
+  const settled = settleTerminalOrder(current, "ENTRY");
+  if (settled !== null) {
+    return plan(settled.state, "hold", [...reasons, ...settled.reasons]);
+  }
+
   const live = current.entryOrder as OrderTrack;
 
   if (live.state === "PENDING") {
@@ -987,13 +1117,9 @@ function planEntryOrderManagement(
     );
   }
 
-  // Terminal without any confirmed fill: nothing executed (§13.3 rule 3).
-  const moved = move(current, "ENTRY_ORDER_TERMINAL_UNFILLED", { entryOrder: null });
-  if (!moved.ok) {
-    return halted(current, moved.problem, []);
-  }
-  current = moved.value;
-  return plan(current, "hold", [...reasons, REASONS.entryOrderTerminal]);
+  // Every remaining order state is terminal and was settled above, so this is
+  // unreachable in practice; it holds rather than inventing a transition.
+  return plan(current, "hold", [...reasons, REASONS.entryOrderWorking]);
 }
 
 /**
@@ -1035,6 +1161,12 @@ function cancelEntry(
  * Matching is by leg and side, with the lexicographically smallest order id
  * winning a tie, so the choice is deterministic and independent of the order in
  * which the composition root lists orders.
+ *
+ * It records `viewFilledShares` as well as the id and the sub-machine state. An
+ * adopted order may be terminal on arrival, and whether it EXECUTED anything is
+ * the difference between returning the instance to ARMED and waiting for a fill
+ * that is already on its way (§8.1). Adoption is not where that is decided —
+ * {@link settleTerminalOrder} is — but it is where the evidence is captured.
  */
 function adoptOrder(
   state: StaticBracketState,
@@ -1053,9 +1185,108 @@ function adoptOrder(
       ...track,
       orderId: view.orderId,
       state: moved.ok ? moved.to : track.state,
+      viewFilledShares: view.filledShares,
     });
   }
   return null;
+}
+
+/** What settling one terminal tracked order did to the bracket. */
+interface Settlement {
+  readonly state: StaticBracketState;
+  readonly reasons: readonly string[];
+}
+
+/**
+ * The ONE place a tracked order's arrival in a terminal state is turned into a
+ * bracket transition.
+ *
+ * Two callers reach it — the per-evaluation ladder (an order the OMS listed as
+ * already terminal) and `onOrderUpdate` (an order that just became terminal) —
+ * and they must agree, because a terminal order settled on one path and not the
+ * other is how a bracket ends up in a `(bracket state, order state)` pair the
+ * §13.3 machine has no edge out of. Before this existed, an order adopted
+ * straight into `REJECTED` from `ENTRY_PLANNED` reached
+ * `ENTRY_PLANNED --ENTRY_ORDER_TERMINAL_UNFILLED-->`, which the table did not
+ * contain, and the instance HALTED on the §13.2 example's most ordinary failure.
+ *
+ * `null` means the tracked order is absent or still live: nothing to settle.
+ *
+ * THE ENTRY CASE HAS THREE OUTCOMES, not two:
+ *
+ * 1. A fill has been FOLDED (`filledShares > 0`) — the allocation is real and
+ *    final at that size, so the bracket opens at it.
+ * 2. Nothing folded, but an ORDER VIEW reported a filled size
+ *    (`viewFilledShares > 0`) — §8.1 guarantees no ordering between a view and
+ *    its fill, so this is an execution whose fill has not arrived yet. The
+ *    instance does NOT return to ARMED (that would discard a real execution and
+ *    let the very next evaluation enter again, doubling the position): it keeps
+ *    the order tracked and waits for the fill stream. The exit is still sized
+ *    only from the fold when that fill lands — §13.3 rule 1 is not relaxed by
+ *    this, and the view's number never becomes an allocation.
+ * 3. Nothing folded and no evidence — nothing executed (§13.3 rule 3), so the
+ *    instance returns to ARMED under the reentry policy.
+ */
+function settleTerminalOrder(
+  state: StaticBracketState,
+  kind: "ENTRY" | "EXIT",
+): Settlement | null {
+  const track = kind === "ENTRY" ? state.entryOrder : state.exitOrder;
+  if (track === null || isLive(track.state) || track.state === "SUBMISSION_UNKNOWN") {
+    return null;
+  }
+
+  if (kind === "ENTRY") {
+    const folded = !isZero(track.filledShares);
+    if (!folded && !isZero(track.viewFilledShares)) {
+      return {
+        state,
+        reasons: [REASONS.entryOrderTerminal, REASONS.awaitingFillAllocation],
+      };
+    }
+    if (!folded) {
+      // MOVE-SITE: entryTerminalUnfilled
+      const moved = move(state, "ENTRY_ORDER_TERMINAL_UNFILLED", { entryOrder: null });
+      return {
+        state: moved.ok ? moved.value : withState(state, { entryOrder: null }),
+        reasons: [REASONS.entryOrderTerminal],
+      };
+    }
+    if (
+      state.instanceState === "PARTIALLY_OPEN" ||
+      state.instanceState === "ENTRY_PLANNED" ||
+      state.instanceState === "ENTRY_WORKING"
+    ) {
+      // MOVE-SITE: entryTerminalPartial
+      const moved = move(state, "ENTRY_ORDER_TERMINAL_PARTIAL", { entryOrder: null });
+      if (moved.ok) {
+        return { state: moved.value, reasons: [REASONS.entryOrderTerminal] };
+      }
+    }
+    return {
+      state: withState(state, { entryOrder: null }),
+      reasons: [REASONS.entryOrderTerminal],
+    };
+  }
+
+  const cleared = withState(state, { exitOrder: null });
+  const trigger: InstanceTrigger | null =
+    state.instanceState === "EXIT_PLANNED"
+      ? "EXIT_ABANDONED"
+      : state.instanceState === "EXIT_WORKING"
+        ? "EXIT_ORDER_TERMINAL_UNFILLED"
+        : null;
+  if (trigger !== null && !isZero(openShares(state))) {
+    // The exit order is gone and the allocation is not: the position is open
+    // again and re-plannable. The trigger differs by state because the §13.3
+    // table names a different edge out of each.
+    // MOVE-SITE: exitTerminal
+    const moved = move(cleared, trigger);
+    if (moved.ok) {
+      return { state: moved.value, reasons: [REASONS.exitOrderTerminal] };
+    }
+  }
+  return { state: cleared, reasons: [REASONS.exitOrderTerminal] };
 }
 
 /** Maps an SDK order status onto a sub-machine trigger. */
@@ -1090,7 +1321,21 @@ export function statusTrigger(status: string): OrderTrigger {
  * `null` means the question could not be answered (an unusable or absent
  * feature). The caller must treat `null` as "not triggered" for acting, and as
  * meaningful for reporting: a stop that cannot be evaluated is not a stop that
- * did not fire.
+ * did not fire. A stop that cannot be READ MUST NEVER REDUCE: an absent, null
+ * or wrong-typed stop feature answers `null`, never `true`.
+ *
+ * THE TRIGGER IS DIRECTION-DENOMINATED ON BOTH LEGS. INTERPRETATION, and the
+ * reasoning is the same one §13.2 already applies to `entry.trigger_price_lte`:
+ * that threshold is compared against the configured trigger feature and the
+ * economic leg is chosen AFTERWARDS, without re-expressing the threshold, so a
+ * configured price in this grammar means a price in `market_selector.direction`
+ * terms. `exit.stop.trigger_price_lte` is read the same way. The composition
+ * root owns the projection from a structured feature to the configured key
+ * (`features.ts`), and this package refuses to guess which outcome's book a
+ * projected key reads; what it fixes is that whatever the key reports is
+ * compared in the CONFIGURED DIRECTION's terms on both legs. Only the
+ * EXECUTABLE prices — the take-profit limit and the reduction floor — are
+ * re-expressed per leg, by {@link executableExitPrice}.
  */
 export function stopTriggerSatisfied(
   params: StaticBracketParams,
@@ -1114,8 +1359,16 @@ export function stopTriggerSatisfied(
  *   disagrees with the confirmed allocation would either sell shares the
  *   instance never allocated or believe it closed something it did not.
  * - `positionCovers` (AT LEAST) gates the DELTA-sized take-profit, whose size
- *   comes from the instance's own allocation. Selling N of a holding of N or
- *   more is safe; selling N of a holding of less is not.
+ *   comes from the instance's own allocation. Unwinding N of an exposure of N or
+ *   more is safe; unwinding N of an exposure of less is not.
+ *
+ * Both are measured on {@link legExposure} — the instance's OWN exposure, net of
+ * the inventory the bracket started from — and NOT on the raw holding. That is
+ * what makes them mean the same thing on both economic legs: a complement-leg
+ * bracket is SHORT the token it trades against an inventory it did not create,
+ * so "held >= the size we are about to trade" would be answered by that
+ * inventory rather than by the bracket, and would wave through an exit for a
+ * short that does not exist.
  *
  * Both read the position view supplied WITH the evaluation. §8.1 orders the
  * loop "update local market/account state -> update feature snapshots -> invoke
@@ -1125,25 +1378,27 @@ export function stopTriggerSatisfied(
  * stream will see this gate refuse exits it should have allowed.
  */
 function positionAgrees(
+  params: StaticBracketParams,
   state: StaticBracketState,
   observation: Observation,
-  leg: Outcome2,
 ): Outcome<boolean> {
   const expected = openShares(state);
-  const held = heldShares(observation, leg);
-  const ordering = compare(held, expected, "position agreement");
+  const exposure = legExposure(params, state, observation);
+  if (!exposure.ok) return exposure;
+  const ordering = compare(exposure.value, expected, "position agreement");
   if (!ordering.ok) return ordering;
   return ok(ordering.value === 0);
 }
 
 function positionCovers(
+  params: StaticBracketParams,
   state: StaticBracketState,
   observation: Observation,
-  leg: Outcome2,
 ): Outcome<boolean> {
   const expected = openShares(state);
-  const held = heldShares(observation, leg);
-  const ordering = compare(held, expected, "position coverage");
+  const exposure = legExposure(params, state, observation);
+  if (!exposure.ok) return exposure;
+  const ordering = compare(exposure.value, expected, "position coverage");
   if (!ordering.ok) return ordering;
   return ok(ordering.value >= 0);
 }
@@ -1159,10 +1414,18 @@ function planExit(
   // Adopt an exit order the OMS has surfaced, and let the bracket follow the
   // sub-machine into EXIT_WORKING (§13.3's own edge).
   const adopted = adoptOrder(incoming, observation, "EXIT");
-  const state = syncPlannedToWorking(
+  const synced = syncPlannedToWorking(
     adopted === null ? incoming : withState(incoming, { exitOrder: adopted }),
     "EXIT",
   );
+  // An exit order the OMS reports as already terminal is settled BEFORE the
+  // ladder rather than after it, and the ladder then runs on the settled state
+  // in the SAME evaluation. Deferring it to the next evaluation would delay a
+  // stop by a tick; halting on it — which is what an unsettled terminal order
+  // used to do — abandoned the position permanently.
+  const settlement = settleTerminalOrder(synced, "EXIT");
+  const state = settlement === null ? synced : settlement.state;
+  if (settlement !== null) reasons.push(...settlement.reasons);
   const leg = currentLeg(params, state);
   const open = openShares(state);
 
@@ -1173,6 +1436,7 @@ function planExit(
       state.instanceState === "EXIT_PLANNED" || state.instanceState === "EXIT_WORKING"
         ? "EXIT_FILL_COMPLETE"
         : "POSITION_FLAT";
+    // MOVE-SITE: bracketFinished
     const moved = move(state, trigger, {
       closedAtMs: observation.nowMs,
       exitOrder: null,
@@ -1230,6 +1494,12 @@ function planExit(
  * When the allocation GROWS while a take-profit rests, the resting order is
  * canceled first and replaced on a later evaluation. Cancel-then-replace, never
  * both in one decision: §6 invariant 13.
+ *
+ * ITS SIDE IS THE ENTRY'S OPPOSITE. A direct-leg bracket bought the token and
+ * takes profit by SELLING it at `exit.take_profit.price`. A complement-leg
+ * bracket SOLD a token it owned and takes profit by BUYING THAT TOKEN BACK, at
+ * the complement of the same configured price. Both reduce the bracket's
+ * exposure toward zero; neither can enlarge it (see {@link LegPosture}).
  */
 function planTakeProfit(
   params: StaticBracketParams,
@@ -1250,8 +1520,15 @@ function planTakeProfit(
       return plan(state, "hold", [...reasons, REASONS.exitOrderWorking]);
     }
     if (existing.state !== "WORKING") {
-      // A cancel is already in flight, or nothing has been seen yet.
-      return plan(state, "hold", [...reasons, REASONS.exitOrderWorking]);
+      // §6 invariant 13, ON PURPOSE and not as a side effect of a halt: a cancel
+      // is already in flight (CANCEL_PENDING) or the order has never been seen
+      // (PENDING). Either way no replacement may be placed until the withdrawal
+      // is confirmed, so the instance holds and says what it is waiting for.
+      return plan(state, "hold", [
+        ...reasons,
+        REASONS.exitOrderWorking,
+        REASONS.awaitingCancel,
+      ]);
     }
     const moved = moveOrder(existing, "CANCEL_REQUESTED");
     if (!moved.ok) {
@@ -1271,7 +1548,7 @@ function planTakeProfit(
     );
   }
 
-  const covered = positionCovers(state, observation, leg);
+  const covered = positionCovers(params, state, observation);
   if (!covered.ok) {
     return halted(state, covered.problem, []);
   }
@@ -1279,6 +1556,11 @@ function planTakeProfit(
     return reconcilePlan(state, observation, reasons, leg);
   }
 
+  const posture = legPosture(params, state);
+  const limitPrice = executableExitPrice(posture, params.exit.take_profit.price);
+  if (!limitPrice.ok) {
+    return plan(state, "hold", [...reasons, REASONS.internalRefusal]);
+  }
   const validUntil = formatInstantMs(
     observation.nowMs + params.entry.execution.order_validity_ms,
     "validUntil",
@@ -1293,8 +1575,13 @@ function planTakeProfit(
     marketId: observation.market.marketId,
     direction: leg,
     targetMode: "DELTA",
-    targetShares: `-${open}`,
-    minimumSellPrice: params.exit.take_profit.price,
+    // The DELTA's sign is the exit side: a direct bracket sells what it bought,
+    // a complement bracket buys back what it sold. |delta| is the confirmed open
+    // allocation and never more, so an exit can only shrink the exposure.
+    targetShares: posture.exitSide === "SELL" ? `-${open}` : open,
+    ...(posture.exitSide === "SELL"
+      ? { minimumSellPrice: limitPrice.value }
+      : { maximumBuyPrice: limitPrice.value }),
     urgency: "PASSIVE",
     liquidityPreference: params.exit.take_profit.liquidity_preference,
     partialFillPolicy: "ACCEPT_ANY",
@@ -1307,13 +1594,15 @@ function planTakeProfit(
     orderId: null,
     state: "PENDING" as OrderState,
     outcome: leg,
-    side: "SELL",
-    limitPrice: params.exit.take_profit.price,
+    side: posture.exitSide,
+    limitPrice: limitPrice.value,
     requestedShares: open,
     filledShares: ZERO,
+    viewFilledShares: ZERO,
     placedAtMs: observation.nowMs,
     escalated: false,
   });
+  // MOVE-SITE: takeProfitPlaced
   const moved = move(state, "EXIT_TRIGGER_MET", {
     exitOrder: track,
     intentSequence: state.intentSequence + 1,
@@ -1326,7 +1615,12 @@ function planTakeProfit(
     "exit",
     [...reasons, REASONS.takeProfitPlaced, REASONS.exitProportional],
     [intent],
-    { exitShares: open, allocatedShares: state.allocatedShares },
+    {
+      exitShares: open,
+      allocatedShares: state.allocatedShares,
+      exitSide: posture.exitSide,
+      exitLimitPrice: limitPrice.value,
+    },
   );
 }
 
@@ -1340,6 +1634,17 @@ function planTakeProfit(
  * `exit.stop.enabled` switches only the price TRIGGER. That is why those two
  * fields are required even when the stop trigger is disabled: a reduction
  * without a stated floor would be a blind market sale.
+ *
+ * ON THE COMPLEMENT LEG THE REDUCTION IS A BUY-BACK. The instance's attributed
+ * position is the same in both cases — `open` shares of exposure in the
+ * configured direction — and `targetShares: "0"` means the same thing in both:
+ * flatten it. What differs is the executable side, and §7.7 gives
+ * `ReducePositionIntent` both a `minimumSellPrice` and a `maximumBuyPrice` for
+ * exactly that reason. A direct bracket sells its token no cheaper than
+ * `exit.stop.minimum_sell_price`; a complement bracket buys its token back no
+ * dearer than the complement of that floor, which is the same economic level.
+ * Carrying the raw floor as a `minimumSellPrice` on a complement bracket would
+ * describe selling still more of a token the instance is already short.
  */
 function planProtectedReduce(
   params: StaticBracketParams,
@@ -1364,7 +1669,7 @@ function planProtectedReduce(
     return withdrawal;
   }
 
-  const agreed = positionAgrees(state, observation, leg);
+  const agreed = positionAgrees(params, state, observation);
   if (!agreed.ok) {
     return halted(state, agreed.problem, []);
   }
@@ -1372,14 +1677,24 @@ function planProtectedReduce(
     return reconcilePlan(state, observation, reasons, leg);
   }
 
+  const posture = legPosture(params, state);
+  const floor = executableExitPrice(posture, params.exit.stop.minimum_sell_price);
+  if (!floor.ok) {
+    return plan(state, "hold", [...reasons, REASONS.internalRefusal]);
+  }
   const intent: Intent = {
     type: "REDUCE_POSITION",
     marketId: observation.market.marketId,
     targetShares: ZERO,
     urgency: params.exit.stop.urgency,
-    minimumSellPrice: params.exit.stop.minimum_sell_price,
-    reason: `static-bracket protected reduce (${cause}): leg=${leg} allocated=${open}`.slice(0, 2000),
+    ...(posture.exitSide === "SELL"
+      ? { minimumSellPrice: floor.value }
+      : { maximumBuyPrice: floor.value }),
+    reason:
+      `static-bracket protected reduce (${cause}): leg=${leg} side=${posture.exitSide} ` +
+      `allocated=${open}`.slice(0, 2000),
   };
+  // MOVE-SITE: protectedReduce
   const moved = move(state, "EXIT_TRIGGER_MET", { intentSequence: state.intentSequence + 1 });
   if (!moved.ok) {
     return halted(state, moved.problem, []);
@@ -1389,7 +1704,7 @@ function planProtectedReduce(
     "reduce",
     [...reasons, REASONS.exitProportional, REASONS.finalProtectedReduce],
     [intent],
-    { exitShares: open, floor: params.exit.stop.minimum_sell_price },
+    { exitShares: open, floor: floor.value, exitSide: posture.exitSide },
   );
 }
 
@@ -1514,6 +1829,20 @@ function reconcilePlan(
         ? withState(next, { entryOrder: moved.value })
         : withState(next, { exitOrder: moved.value });
   }
+  // An instance that is ALREADY paused does not pause again: §13.3 draws no
+  // PAUSED -> PAUSED edge, and re-recording `resumeTo` as PAUSED would leave the
+  // instance with nowhere legal to resume into. It records the incident and
+  // stays where it is, exactly as the data-quality branch does.
+  if (next.instanceState === "PAUSED") {
+    return plan(
+      withState(next, { lastIncident: "position mismatch" }),
+      intents.length > 0 ? "cancel" : "hold",
+      [...reasons, REASONS.paused],
+      intents,
+      { expectedShares: openShares(state), heldShares: heldShares(observation, leg) },
+    );
+  }
+  // MOVE-SITE: reconcilePause
   const paused = move(next, "PAUSE", {
     resumeTo: state.instanceState,
     lastIncident: "position mismatch",
@@ -1534,6 +1863,25 @@ function reconcilePlan(
 // Re-entry
 // ---------------------------------------------------------------------------
 
+/**
+ * Re-arming after a finished bracket (§13.2 `reentry`).
+ *
+ * WHAT IS PER-BRACKET AND WHAT IS PER-MARKET is the whole content of this
+ * function, and getting it wrong is not a cosmetic error:
+ *
+ * - PER-BRACKET, and therefore RESET: the confirmed allocation and its cost, the
+ *   exited size, the traded leg and the inventory baseline it was measured
+ *   against, the holding clock, and both tracked orders. A bracket that
+ *   inherited the previous one's allocation would never see a "first fill"
+ *   again, so `entriesExecuted` would stop counting and
+ *   `maximum_entries_per_market` would bound nothing (§13.3 rule 3); one that
+ *   inherited `openedAtMs` would be force-exited by
+ *   `maximum_holding_seconds` measured from a bracket that already closed.
+ * - PER-MARKET, and therefore CARRIED: `entriesExecuted` (§13.3 rule 3 counts
+ *   executions per MARKET), `closedAtMs` (the cool-down anchor), and
+ *   `intentSequence` (the id source must stay monotone across the whole
+ *   instance, or two brackets would emit the same intent id).
+ */
 function planRearm(
   params: StaticBracketParams,
   state: StaticBracketState,
@@ -1557,7 +1905,17 @@ function planRearm(
       );
     }
   }
-  const moved = move(state, "REARM", { entryOrder: null, exitOrder: null });
+  // MOVE-SITE: rearm
+  const moved = move(state, "REARM", {
+    entryOrder: null,
+    exitOrder: null,
+    allocatedShares: ZERO,
+    allocatedCost: ZERO,
+    exitedShares: ZERO,
+    legOutcome: null,
+    legBaselineShares: ZERO,
+    openedAtMs: null,
+  });
   if (!moved.ok) {
     return plan(state, "hold", [...reasons, REASONS.idle]);
   }
@@ -1651,7 +2009,7 @@ function applyEntryFill(
   const complete = greaterOrEqual(filled.value, entry.requestedShares, "fill completeness");
   if (!complete.ok) return halted(state, complete.problem, []);
 
-  const orderMoved = moveOrder(
+  const orderMoved = foldFillIntoOrder(
     Object.freeze({
       ...entry,
       orderId: entry.orderId ?? fill.orderId,
@@ -1661,17 +2019,37 @@ function applyEntryFill(
   );
   if (!orderMoved.ok) return refuseTransition(state, observation, fill.outcome);
 
+  // §13.3 rule 3: maximum entries count actual EXECUTIONS. One entry order that
+  // fills in five pieces is one execution, counted at its first fill. The test
+  // is the CURRENT bracket's allocation, which `planRearm` resets — a counter
+  // anchored on an allocation that outlived its bracket would stop counting
+  // after the first one and leave `maximum_entries_per_market` unenforced.
   const firstFill = isZero(state.allocatedShares);
+
+  // The inventory this bracket started from, recorded once, at the first fill.
+  // §8.1 orders "update local market/account state -> ... -> invoke subscribed
+  // strategies", so the position view of a fill evaluation already includes that
+  // fill; subtracting the confirmed allocation from it recovers what was held
+  // before. A composition root that lags the position behind the fill stream
+  // makes this baseline low by the lag, which makes the exit gates REFUSE and
+  // reconcile — the fail-closed direction.
+  const baseline = firstFill
+    ? entry.side === "BUY"
+      ? sub(heldShares(observation, fill.outcome), allocated.value, "leg baseline")
+      : add(heldShares(observation, fill.outcome), allocated.value, "leg baseline")
+    : ok(state.legBaselineShares);
+  if (!baseline.ok) return halted(state, baseline.problem, []);
+
   const changes: Partial<StaticBracketState> = {
     entryOrder: orderMoved.value,
     allocatedShares: allocated.value,
     allocatedCost: cost.value,
     legOutcome: fill.outcome,
+    legBaselineShares: baseline.value,
     openedAtMs: state.openedAtMs ?? observation.nowMs,
-    // §13.3 rule 3: maximum entries count actual EXECUTIONS. One entry order
-    // that fills in five pieces is one execution, counted at its first fill.
     entriesExecuted: firstFill ? state.entriesExecuted + 1 : state.entriesExecuted,
   };
+  // MOVE-SITE: entryFill
   const moved = move(
     state,
     complete.value ? "ENTRY_FILL_COMPLETE" : "ENTRY_PARTIAL_FILL",
@@ -1706,7 +2084,7 @@ function applyExitFill(
   const remaining = sub(state.allocatedShares, exited.value, "open shares");
   if (!remaining.ok) return halted(state, remaining.problem, []);
   const flat = isZero(remaining.value);
-  const orderMoved = moveOrder(
+  const orderMoved = foldFillIntoOrder(
     Object.freeze({
       ...exit,
       orderId: exit.orderId ?? fill.orderId,
@@ -1720,6 +2098,7 @@ function applyExitFill(
     exitedShares: exited.value,
     ...(flat ? { closedAtMs: observation.nowMs } : {}),
   };
+  // MOVE-SITE: exitFill
   const moved = move(state, flat ? "EXIT_FILL_COMPLETE" : "EXIT_PARTIAL_FILL", changes);
   if (!moved.ok) {
     return refuseTransition(state, observation, currentLeg(params, state));
@@ -1746,7 +2125,15 @@ export function planOrderUpdate(
   }
   const track = kind === "ENTRY" ? (state.entryOrder as OrderTrack) : (state.exitOrder as OrderTrack);
   const moved = moveOrder(
-    Object.freeze({ ...track, orderId: track.orderId ?? view.orderId }),
+    // `viewFilledShares` is EVIDENCE, not allocation: it records that the venue
+    // says something executed, so a terminal order can be told apart from one
+    // that executed nothing (§8.1 gives no ordering between a view and its
+    // fill). The exit is still sized from the fold alone (§13.3 rule 1).
+    Object.freeze({
+      ...track,
+      orderId: track.orderId ?? view.orderId,
+      viewFilledShares: view.filledShares,
+    }),
     statusTrigger(view.status),
   );
   if (!moved.ok) {
@@ -1796,47 +2183,22 @@ function attributeOrder(
   return null;
 }
 
-/** Moves the bracket on when a tracked order reaches a terminal state. */
+/**
+ * Moves the bracket on when a tracked order reaches a terminal state.
+ *
+ * It delegates to {@link settleTerminalOrder} so `onOrderUpdate` and the
+ * per-evaluation ladder cannot disagree about what a terminal order means.
+ */
 function finishOrder(
   state: StaticBracketState,
   kind: "ENTRY" | "EXIT",
   carried: readonly string[],
 ): Plan {
-  const reasons = [...carried];
-  if (kind === "ENTRY") {
-    const entry = state.entryOrder as OrderTrack;
-    const anyFill = !isZero(entry.filledShares);
-    if (!anyFill) {
-      const moved = move(state, "ENTRY_ORDER_TERMINAL_UNFILLED", { entryOrder: null });
-      return moved.ok
-        ? plan(moved.value, "hold", [...reasons, REASONS.entryOrderTerminal])
-        : plan(state, "hold", [...reasons, REASONS.entryOrderTerminal]);
-    }
-    if (state.instanceState === "PARTIALLY_OPEN") {
-      const moved = move(state, "ENTRY_ORDER_TERMINAL_PARTIAL", { entryOrder: null });
-      if (moved.ok) {
-        return plan(moved.value, "hold", [...reasons, REASONS.entryOrderTerminal]);
-      }
-    }
-    return plan(withState(state, { entryOrder: null }), "hold", [
-      ...reasons,
-      REASONS.entryOrderTerminal,
-    ]);
+  const settled = settleTerminalOrder(state, kind);
+  if (settled === null) {
+    return plan(state, "hold", [...carried]);
   }
-  const cleared = withState(state, { exitOrder: null });
-  const open = openShares(state);
-  if (!isZero(open)) {
-    // The exit order is gone and the allocation is not: the position is open
-    // again and re-plannable. The trigger differs by state because the §13.3
-    // table names a different edge out of each.
-    const trigger: InstanceTrigger =
-      state.instanceState === "EXIT_PLANNED" ? "EXIT_ABANDONED" : "EXIT_ORDER_TERMINAL_UNFILLED";
-    const moved = move(cleared, trigger);
-    if (moved.ok) {
-      return plan(moved.value, "hold", [...reasons, REASONS.exitOrderTerminal]);
-    }
-  }
-  return plan(cleared, "hold", [...reasons, REASONS.exitOrderTerminal]);
+  return plan(settled.state, "hold", [...carried, ...settled.reasons]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1877,6 +2239,7 @@ export function planResolved(
         : REASONS.resolutionHoldDisallowed,
     );
   }
+  // MOVE-SITE: marketResolved
   const moved = move(state, "MARKET_RESOLVED", {
     closedAtMs: observation.nowMs,
     entryOrder: null,

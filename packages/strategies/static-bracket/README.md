@@ -44,6 +44,30 @@ while `exit.stop.enabled` switches only the price *trigger*. That is why both
 remain required when the stop trigger is off: a reduction without a stated floor
 would be a blind market sale.
 
+### Configured prices are denominated in `market_selector.direction`
+
+`entry.trigger_price_lte`, `exit.take_profit.price`,
+`exit.stop.trigger_price_lte` and `exit.stop.minimum_sell_price` are all written
+in the **configured direction's** terms. That matters as soon as
+`entry.economic_leg_policy` is `PREFER_CHEAPEST_WITH_INVENTORY`, because the
+cheaper route to the same exposure may be to **sell the complement token** the
+instance already owns rather than buy the configured one.
+
+When that route is taken the bracket is *short* the complement token, so:
+
+- the **entry** carries `minimumSellPrice = 1 − maximum_buy_price`;
+- the **take-profit** is a **BUY-BACK** of the same token, carrying
+  `maximumBuyPrice = 1 − take_profit.price`;
+- every **protected reduction** carries `maximumBuyPrice = 1 −
+  stop.minimum_sell_price` (§7.7 gives `ReducePositionIntent` both bounds for
+  exactly this);
+- the **stop trigger** is *not* re-expressed — it is compared in the configured
+  direction's terms on both legs, exactly as the entry trigger already is.
+  This is an INTERPRETATION and is recorded as one in `src/decide.ts`.
+
+An exit therefore always trades the opposite way to its entry and never names
+more than the confirmed open allocation, on either leg.
+
 ## The `btc-15m-updown` caveat (carried from `WP-110`)
 
 §13.2's example binds `market_selector.series_id: btc-15m-updown`. **That series
@@ -89,9 +113,32 @@ here because a wiring that breaks one produces a *quiet* misbehaviour.
    about.** §8.1 orders the loop "update local market/account state → update
    feature snapshots → invoke subscribed strategies". A view that lags the fill
    stream will make the §6 invariant 12 position gate refuse exits it should
-   have allowed.
+   have allowed. The instance records the leg's holding at its **first** entry
+   fill as the baseline its own exposure is measured against, so a lagging view
+   makes that baseline low by the lag — which refuses and reconciles rather than
+   acting, the fail-closed direction.
 4. **Views must be fresh or copied per evaluation** (WP-170 `follow_up` 2), and
    `StrategyContextRevokedError` must not be swallowed.
+5. **`StrategyOrderView.filledShares` is read as EVIDENCE, never as
+   allocation.** §8.1 guarantees no ordering between a view and the fill it
+   describes, so a view reporting a filled size before its fill arrives puts the
+   instance into an *awaiting-the-fill* posture (`SB.AWAITING_FILL_ALLOCATION`)
+   rather than back into `ARMED`. The exit is still sized only from the confirmed
+   fill fold (§13.3 rule 1). A root that reports filled sizes on views it never
+   backs with a fill will leave an instance waiting; a root that never reports
+   them simply loses the evidence and behaves as before.
+
+## Known exposure: numeric-index prototype pollution
+
+Under `Object.prototype["0"]`, `subDecimal` throws whenever its exact result is
+zero, which the order-book walk hits on its ordinary path. This package's guards
+contain the throw, so the observed effect is **fail-closed**: an entry becomes a
+recorded refusal (`SB.REFUSED_BOOK_PARTICIPATION`) and no exit, cancel or
+reduction is affected. The root cause is in `packages/decimal` and is tracked
+there; reaching it requires an already-compromised process. `src/plain.ts` states
+both halves of the claim per ADR-020 §4, and
+`test/unit/strategies/static-bracket/hostile-config.test.ts` carries the probe as
+a documented expectation.
 
 ## Safety
 

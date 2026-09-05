@@ -44,8 +44,23 @@ import {
   type PlainRecord,
 } from "./plain.js";
 
-/** Bumped whenever this document's shape changes (§9.6 `stateSchemaVersion`). */
-export const STATIC_BRACKET_STATE_SCHEMA_VERSION = 1;
+/**
+ * Bumped whenever this document's shape changes (§9.6 `stateSchemaVersion`).
+ *
+ * v2 added two fields, both required by the review-round-1 remediation and both
+ * total (always present, never optional):
+ *
+ * - `legBaselineShares` — the holding of the traded leg token immediately
+ *   BEFORE this bracket's first entry fill. Without it the §6 invariant 12
+ *   position gate is only meaningful for a DIRECT (buy-side) entry: a
+ *   complement-leg bracket establishes exposure by SELLING an owned token, so
+ *   "held >= the size we are about to trade" says nothing about whether the
+ *   short the instance believes in actually exists.
+ * - `OrderTrack.viewFilledShares` — the filled size an ORDER VIEW reported. It
+ *   is EVIDENCE that an execution occurred, and it never sizes an exit; §13.3
+ *   rule 1's fold remains the only writer of `allocatedShares`.
+ */
+export const STATIC_BRACKET_STATE_SCHEMA_VERSION = 2;
 
 export type OrderKind = "ENTRY" | "EXIT";
 export type OrderSide = "BUY" | "SELL";
@@ -62,7 +77,22 @@ export interface OrderTrack {
   readonly side: OrderSide;
   readonly limitPrice: string;
   readonly requestedShares: string;
+  /** Shares CONFIRMED by the fill stream against this order. The fold's number. */
   readonly filledShares: string;
+  /**
+   * Shares an ORDER VIEW reported filled against this order.
+   *
+   * §8.1 guarantees NO ordering between a `StrategyOrderView` and the
+   * `StrategyFill` it describes, so a view may report a filled size before the
+   * corresponding fill arrives. That is EVIDENCE that an execution occurred and
+   * it is recorded here so a terminal order with no folded fill can be told
+   * apart from one that genuinely executed nothing.
+   *
+   * It is never an allocation: §6 invariant 10 and §13.3 rule 1 put the exit
+   * size on confirmed actual allocation, and {@link StaticBracketState.allocatedShares}
+   * is written by the fill fold alone.
+   */
+  readonly viewFilledShares: string;
   readonly placedAtMs: number;
   /** True once the maker-to-aggressive conversion (§13.2) has been applied. */
   readonly escalated: boolean;
@@ -88,6 +118,20 @@ export interface StaticBracketState {
   readonly exitedShares: string;
   /** The outcome token the allocation is held in. */
   readonly legOutcome: Outcome2 | null;
+  /**
+   * The instance's holding of {@link legOutcome} immediately BEFORE this
+   * bracket's first entry fill, reconstructed from the post-fill position view.
+   *
+   * It is what makes §6 invariant 12's position gate exact for BOTH economic
+   * legs: the instance's own exposure is `held - baseline` when the entry
+   * BOUGHT the leg token and `baseline - held` when it SOLD one it owned, so a
+   * complement-leg bracket is measured against the inventory it started from
+   * rather than against an absolute holding it never created.
+   *
+   * Per-BRACKET, not per-market: {@link planRearm} resets it with the rest of
+   * the bracket.
+   */
+  readonly legBaselineShares: string;
   /** Instant of the first confirmed entry fill; drives `maximum_holding_seconds`. */
   readonly openedAtMs: number | null;
   /** Instant the bracket last reached CLOSED; drives `cooldown_seconds`. */
@@ -109,6 +153,7 @@ export const INITIAL_STATE: StaticBracketState = Object.freeze({
   allocatedCost: ZERO,
   exitedShares: ZERO,
   legOutcome: null,
+  legBaselineShares: ZERO,
   openedAtMs: null,
   closedAtMs: null,
   lastIncident: null,
@@ -127,6 +172,7 @@ const STATE_KEYS: readonly string[] = Object.freeze([
   "allocatedCost",
   "exitedShares",
   "legOutcome",
+  "legBaselineShares",
   "openedAtMs",
   "closedAtMs",
   "lastIncident",
@@ -142,6 +188,7 @@ const ORDER_KEYS: readonly string[] = Object.freeze([
   "limitPrice",
   "requestedShares",
   "filledShares",
+  "viewFilledShares",
   "placedAtMs",
   "escalated",
 ]);
@@ -237,6 +284,8 @@ function readOrderTrack(value: PlainJson, path: string): Outcome<OrderTrack | nu
   if (!requestedShares.ok) return requestedShares;
   const filledShares = readDecimalField(value, "filledShares", path);
   if (!filledShares.ok) return filledShares;
+  const viewFilledShares = readDecimalField(value, "viewFilledShares", path);
+  if (!viewFilledShares.ok) return viewFilledShares;
   const placedAtMs = readCount(value, "placedAtMs", path);
   if (!placedAtMs.ok) return placedAtMs;
   const escalated = readOwn(value, "escalated", path);
@@ -255,6 +304,7 @@ function readOrderTrack(value: PlainJson, path: string): Outcome<OrderTrack | nu
       limitPrice: limitPrice.value,
       requestedShares: requestedShares.value,
       filledShares: filledShares.value,
+      viewFilledShares: viewFilledShares.value,
       placedAtMs: placedAtMs.value,
       escalated: escalated.value,
     }),
@@ -329,6 +379,8 @@ export function readState(raw: unknown): Outcome<StaticBracketState> {
   if (!allocatedCost.ok) return allocatedCost;
   const exitedShares = readDecimalField(record, "exitedShares", "state");
   if (!exitedShares.ok) return exitedShares;
+  const legBaselineShares = readDecimalField(record, "legBaselineShares", "state");
+  if (!legBaselineShares.ok) return legBaselineShares;
 
   const legOutcomeValue = readOwn(record, "legOutcome", "state");
   if (!legOutcomeValue.ok) return legOutcomeValue;
@@ -360,6 +412,7 @@ export function readState(raw: unknown): Outcome<StaticBracketState> {
       allocatedCost: allocatedCost.value,
       exitedShares: exitedShares.value,
       legOutcome,
+      legBaselineShares: legBaselineShares.value,
       openedAtMs: openedAtMs.value,
       closedAtMs: closedAtMs.value,
       lastIncident: lastIncident.value,
@@ -379,6 +432,7 @@ function orderToJson(order: OrderTrack | null): PlainJson {
     limitPrice: order.limitPrice,
     requestedShares: order.requestedShares,
     filledShares: order.filledShares,
+    viewFilledShares: order.viewFilledShares,
     placedAtMs: order.placedAtMs,
     escalated: order.escalated,
   });
@@ -402,6 +456,7 @@ export function stateToPatch(state: StaticBracketState): Record<string, unknown>
     allocatedCost: state.allocatedCost,
     exitedShares: state.exitedShares,
     legOutcome: state.legOutcome,
+    legBaselineShares: state.legBaselineShares,
     openedAtMs: state.openedAtMs,
     closedAtMs: state.closedAtMs,
     lastIncident: state.lastIncident,

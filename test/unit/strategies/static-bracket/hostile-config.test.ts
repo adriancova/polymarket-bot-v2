@@ -4,9 +4,18 @@
  * Four families, and the bound each one establishes:
  *
  * 1. **Prototype pollution.** ADR-020 §1's measured classes, applied to the
- *    door and to a running strategy. The bound this package claims is the
- *    ADR-020 §6 bound: PERMISSION never varies with ambient prototype state,
- *    and nothing throws.
+ *    door and to a running strategy. The bound this package claims is narrower
+ *    than "permission never varies with ambient prototype state", and the
+ *    narrowing is measured rather than assumed: for NAMED string keys inherited
+ *    by `Object.prototype` — enumerable and non-enumerable, including a required
+ *    grammar key, an inherited `get`, `_zod` and `toString`, and state/decision
+ *    keys polluted around a running callback — permission does not vary and
+ *    nothing throws. **NUMERIC-INDEX pollution is a measured and OPEN exposure**
+ *    whose root cause is in `packages/decimal`: `subDecimal` throws when its
+ *    result is exactly zero, and this package's guards turn that into a
+ *    fail-closed refusal. The probe below asserts today's fail-closed direction
+ *    as a DOCUMENTED EXPECTATION; `src/plain.ts` states both halves per
+ *    ADR-020 §4.
  * 2. **Wrong shapes.** `Map`, `Set`, `Date`, class instances, accessors,
  *    symbol keys, non-enumerable keys, `Proxy`, cycles, sparse arrays,
  *    `undefined` — refused, never coerced.
@@ -33,6 +42,7 @@ import {
   context,
   parsedParams,
   stateWith,
+  type ViewOptions,
 } from "./helpers.js";
 import { staticBracketParamsSchema } from "../../../../packages/strategies/static-bracket/src/index.js";
 
@@ -135,6 +145,91 @@ describe("hostile battery — prototype pollution (ADR-020 §1)", () => {
         expect(observed.refused, "a refusal must stay a refusal under pollution").toBe(false);
       }
     }
+  });
+
+  /**
+   * DOCUMENTED EXPECTATION, not an endorsement.
+   *
+   * `Object.prototype["0"]` makes `subDecimal` throw whenever its exact result
+   * is zero — which the book walk hits on the ordinary path, when it consumes
+   * exactly the requested size. The throw is contained by `economics.ts`'s
+   * guard, so what the strategy DOES is refuse, with a recorded reason, where a
+   * clean process would have entered.
+   *
+   * This test pins the DIRECTION (fail-closed: an entry becomes a hold, no
+   * intent is emitted, nothing throws out of the callback) and will fail loudly
+   * if it ever changes. It does NOT claim the class is closed: the root cause is
+   * `packages/decimal`, outside WP-220's paths, and is tracked with two sibling
+   * decimal findings. When that round lands, this test should become an ordinary
+   * "permission does not vary" case alongside the named-key ones above.
+   */
+  it("numeric-index pollution fails CLOSED (open exposure; root cause in packages/decimal)", () => {
+    const params = parsedParams(staticBracketParamsSchema);
+    const clean = staticBracketStrategy.onFeatures(context(params, ARMED, {}));
+    expect(clean.decisionType).toBe("enter");
+
+    const polluted = underPollution({ "0": "9" }, { enumerable: false }, () =>
+      staticBracketStrategy.onFeatures(context(params, ARMED, {})),
+    );
+
+    // Fail-closed: a refusal, recorded, with no intent — never a changed order.
+    expect(polluted.decisionType).toBe("hold");
+    expect(polluted.intents).toHaveLength(0);
+    expect(polluted.reasonCodes).toContain(REASONS.refusedParticipation);
+    // And the refusal is a REFUSAL, not a silent success or a thrown callback.
+    expect(polluted.reasonCodes).not.toContain(REASONS.entryIntentEmitted);
+  });
+
+  it("numeric-index pollution never turns a refusal into a permission", () => {
+    // The direction that would actually be dangerous: pollution must not make
+    // the door ACCEPT something it refuses cleanly, and must not make a holding
+    // instance emit a position-changing intent.
+    const params = parsedParams(staticBracketParamsSchema);
+    const observed = underPollution({ "0": "9" }, { enumerable: false }, () => ({
+      refusedConfig: validateStaticBracketParams(configWith({ version: 99 })).ok,
+      openInstant: staticBracketStrategy.onFeatures(
+        context(params, stateWith({ instanceState: "ARMED" }), {
+          features: { [TRIGGER_KEY]: "0.9" },
+        }),
+      ),
+    }));
+    expect(observed.refusedConfig).toBe(false);
+    expect(observed.openInstant.intents).toHaveLength(0);
+  });
+
+  /**
+   * THE HARNESS ITSELF MUST NOT BE THE THING THAT BENDS.
+   *
+   * The fixture builders take ordinary `{}` option objects, so a read written
+   * `options.tickSize ?? "0.01"` is answered by a polluted `Object.prototype`
+   * and the FIXTURE hands the strategy a poisoned view. Every measurement in
+   * this file would then be of the helpers rather than of the package. The
+   * builders read own properties only; this pins that, because a bound measured
+   * through a leaky harness is not a bound.
+   */
+  it("the FIXTURE builders read own properties only, so the battery measures the package", () => {
+    const params = parsedParams(staticBracketParamsSchema);
+    const clean = JSON.stringify(staticBracketStrategy.onFeatures(context(params, ARMED, {})));
+    const polluted = underPollution(
+      {
+        // 0.35 is NOT on a 0.03 grid, so a leaked tick size would turn the
+        // entry into SB.REFUSED_PRICE_OFF_TICK_GRID — a visible flip, which is
+        // what makes this assertion discriminate rather than merely pass.
+        tickSize: "0.03",
+        minimumOrderSize: "9999",
+        yesShares: "9999",
+        noShares: "9999",
+        closeTime: "2026-03-04T12:05:10.000Z",
+        openTime: "2026-03-04T12:04:59.000Z",
+        asOf: "1999-01-01T00:00:00.000Z",
+        now: "1999-01-01T00:00:00.000Z",
+        orders: [{ orderId: "ghost" }],
+        omitFeatures: [TRIGGER_KEY],
+      },
+      { enumerable: true },
+      () => JSON.stringify(staticBracketStrategy.onFeatures(context(params, ARMED, {}))),
+    );
+    expect(polluted).toBe(clean);
   });
 
   it("a running strategy's decision is byte-identical under pollution", () => {
@@ -383,6 +478,49 @@ describe("hostile battery — thresholds are exact, one tick at a time", () => {
       );
       const reduced = decision.intents.some((intent) => intent.type === "REDUCE_POSITION");
       expect(reduced).toBe(testCase.stops);
+    });
+  }
+
+  /**
+   * A stop that cannot be READ must never reduce.
+   *
+   * `stopTriggerSatisfied` answers `boolean | null`, and the three ways of
+   * failing to read the feature — the key is missing from the snapshot
+   * (UNUSABLE), the engine reported the feature absent (`null`), and the value
+   * is the wrong type (UNUSABLE) — must all answer `null`, which the ladder
+   * treats as "not triggered" for ACTING while still recording that the stop was
+   * not evaluated.
+   *
+   * The case below the non-canonical one covered a different branch (a readable
+   * VALUE that is not a canonical price), which left the unreadable branch
+   * untested: mutating `if (read.kind !== "VALUE") return null` to `return true`
+   * survived the whole suite while making the strategy emit a REDUCE_POSITION at
+   * the stop floor on a market it had no stop reading for. These cases kill it.
+   */
+  const unreadableStops: { name: string; views: ViewOptions }[] = [
+    { name: "absent from the snapshot entirely", views: { omitFeatures: [STOP_KEY] } },
+    { name: "reported as null by the engine", views: { features: { [STOP_KEY]: null } } },
+    { name: "a boolean rather than a price", views: { features: { [STOP_KEY]: true } } },
+  ];
+
+  for (const testCase of unreadableStops) {
+    it(`never reduces when the stop feature is ${testCase.name}`, () => {
+      const open = stateWith({
+        instanceState: "OPEN",
+        allocatedShares: "50",
+        allocatedCost: "17.5",
+        legOutcome: "YES",
+        entriesExecuted: 1,
+      });
+      const decision = staticBracketStrategy.onFeatures(
+        context(params(), open, { yesShares: "50", ...testCase.views }),
+      );
+      expect(
+        decision.intents.some((intent) => intent.type === "REDUCE_POSITION"),
+        `an unreadable stop (${testCase.name}) must never reduce`,
+      ).toBe(false);
+      expect(decision.reasonCodes).not.toContain(REASONS.stopTriggered);
+      expect(decision.reasonCodes).not.toContain(REASONS.finalProtectedReduce);
     });
   }
 

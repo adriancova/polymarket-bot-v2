@@ -151,6 +151,7 @@ function workingEntry(filledShares: string): StaticBracketState {
       limitPrice: "0.35",
       requestedShares: "50",
       filledShares,
+      viewFilledShares: filledShares,
       placedAtMs: 1,
       escalated: true,
     },
@@ -300,6 +301,82 @@ describe("the entry economics, oracled", () => {
         intent?.direction,
         `bid ${bid}: direct ${canonical(directCost)} vs complement ${canonical(complementCost)}`,
       ).toBe(complementIsCheaper ? "NO" : "YES");
+    }
+  });
+
+  /**
+   * SLIPPAGE IS MEASURED AGAINST ONE REFERENCE ON BOTH LEGS.
+   *
+   * `LegQuote.cost` is YES-equivalent money on both legs (`size - proceeds` on
+   * the complement), so the reference is `trigger_price_lte * size` for both.
+   * Complementing the reference for the SELL leg mixed a direction-denominated
+   * cost with a complement-denominated price, and made an identically-priced
+   * complement leg pass a cap the direct leg failed.
+   *
+   * The oracle here is the sell-leg measure written out longhand —
+   * `(1 - t) * size - proceeds` — which must equal `cost - t * size` exactly.
+   */
+  it("measures identically-priced legs identically: one refuses ⇒ both refuse", () => {
+    const size = rational("50");
+    const trigger = rational("0.35");
+    const cap = rational("1");
+    const referenceCost = times(trigger, size);
+
+    // maximum_buy_price 0.4 gives a complement floor of 0.6, so a 0.61 bid is
+    // deep enough to clear the participation cap and the walk is a single level.
+    const wide = (leg: string) =>
+      configWith({
+        "entry.economic_leg_policy": leg,
+        "entry.maximum_total_cost": "25",
+        "risk.maximum_contractual_loss": "25",
+        "entry.execution.maximum_buy_price": "0.4",
+        "entry.execution.passive_price": "0.4",
+      });
+
+    for (const bid of ["0.59", "0.6", "0.61", "0.65"]) {
+      const proceeds = times(size, rational(bid));
+      const complementCost = minus(size, proceeds);
+      // The longhand sell-leg measure and the reduced one must agree exactly.
+      const longhand = minus(times(minus(rational("1"), trigger), size), proceeds);
+      const reduced = minus(complementCost, referenceCost);
+      expect(canonical(longhand), `bid ${bid}`).toBe(canonical(reduced));
+
+      const slippage = cmp(reduced, rational("0")) <= 0 ? rational("0") : reduced;
+      const withinCap = cmp(slippage, cap) <= 0;
+
+      // The DIRECT leg priced to the very same cost: a single ask level whose
+      // total is `complementCost` for the same 50 shares.
+      const askPrice = canonical({
+        units: (complementCost.units * 10n ** BigInt(4 - complementCost.scale)) / 50n,
+        scale: 4,
+      });
+      const direct = staticBracketStrategy.onFeatures(
+        context(params(wide("DIRECT_ONLY")), stateWith({ instanceState: "ARMED" }), {
+          yes: { bids: [["0.34", "2000"]], asks: [[askPrice, "2000"]] },
+        }),
+      );
+      const complementLeg = staticBracketStrategy.onFeatures(
+        context(
+          params(wide("PREFER_CHEAPEST_WITH_INVENTORY")),
+          stateWith({ instanceState: "ARMED" }),
+          {
+            noShares: "100",
+            // The direct leg is too thin to fill, so the complement is taken.
+            yes: { bids: [["0.34", "2000"]], asks: [[askPrice, "10"]] },
+            no: { bids: [[bid, "2000"]], asks: [["0.99", "2000"]] },
+          },
+        ),
+      );
+
+      const label = `bid ${bid}: cost ${canonical(complementCost)}, slippage ${canonical(slippage)}`;
+      expect(direct.decisionType, `direct ${label}`).toBe(withinCap ? "enter" : "hold");
+      expect(complementLeg.decisionType, `complement ${label}`).toBe(withinCap ? "enter" : "hold");
+      if (!withinCap) {
+        expect(direct.modelOutputs?.["slippage"], `direct ${label}`).toBe(canonical(slippage));
+        expect(complementLeg.modelOutputs?.["slippage"], `complement ${label}`).toBe(
+          canonical(slippage),
+        );
+      }
     }
   });
 

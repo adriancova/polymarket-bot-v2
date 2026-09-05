@@ -145,6 +145,7 @@ describe("§13.4 — Tick-size change while resting", () => {
         limitPrice: "0.35",
         requestedShares: "50",
         filledShares: "0",
+        viewFilledShares: "0",
         placedAtMs: NOW_MS - 500,
         escalated: true,
       },
@@ -174,6 +175,7 @@ describe("§13.4 — Tick-size change while resting", () => {
         limitPrice: "0.34",
         requestedShares: "50",
         filledShares: "0",
+        viewFilledShares: "0",
         placedAtMs: NOW_MS - 500,
         escalated: true,
       },
@@ -200,6 +202,7 @@ describe("§13.4 — Partial entry and proportional exit", () => {
       limitPrice: "0.35",
       requestedShares: "50",
       filledShares: "0",
+      viewFilledShares: "0",
       placedAtMs: NOW_MS - 500,
       escalated: true,
     },
@@ -273,6 +276,7 @@ describe("§13.4 — Partial entry and proportional exit", () => {
         limitPrice: "0.35",
         requestedShares: "50",
         filledShares: "10",
+        viewFilledShares: "10",
         placedAtMs: NOW_MS - 500,
         escalated: true,
       },
@@ -286,6 +290,7 @@ describe("§13.4 — Partial entry and proportional exit", () => {
         limitPrice: "0.5",
         requestedShares: "10",
         filledShares: "0",
+        viewFilledShares: "0",
         placedAtMs: NOW_MS - 400,
         escalated: false,
       },
@@ -325,6 +330,7 @@ describe("§13.4 — Entry response lost and later reconciled live", () => {
       limitPrice: "0.35",
       requestedShares: "50",
       filledShares: "0",
+      viewFilledShares: "0",
       placedAtMs: NOW_MS - 6000,
       escalated: true,
     },
@@ -440,6 +446,7 @@ describe("§13.4 — Stale-book stop does not blind-flatten", () => {
         limitPrice: "0.5",
         requestedShares: "50",
         filledShares: "0",
+        viewFilledShares: "0",
         placedAtMs: NOW_MS - 400,
         escalated: false,
       },
@@ -643,6 +650,205 @@ describe("§13.4 — YES/NO economic-leg comparison with and without inventory",
   });
 });
 
+/**
+ * A COMPLEMENT-LEG BRACKET, END TO END.
+ *
+ * §13.4's leg-comparison bullet is about ENTRY, and the entry was right. What
+ * had never been driven was the rest of the bracket: a complement-leg entry
+ * establishes YES exposure by SELLING the NO token, so every exit must BUY THAT
+ * TOKEN BACK at the complement of the configured, direction-denominated price.
+ * Emitting the configured price on the configured side sells more of a token the
+ * instance is already short — a second entry at double the size, logged as an
+ * exit.
+ *
+ * Each step asserts the SIDE and the COMPLEMENTED PRICE, and the whole sequence
+ * is checked against the invariant that binds them: AN EXIT MAY NEVER INCREASE
+ * ABSOLUTE EXPOSURE.
+ */
+describe("complement-leg bracket — every exit is a buy-back at the complemented price", () => {
+  const preferring = () =>
+    params(configWith({ "entry.economic_leg_policy": "PREFER_CHEAPEST_WITH_INVENTORY" }));
+
+  /** NO bids at 0.70: selling 50 yields 35, an equivalent cost of 15 < 17.5. */
+  const CHEAP_NO: ViewOptions = {
+    noShares: "100",
+    no: { bids: [["0.7", "2000"]], asks: [["0.72", "2000"]] },
+  };
+
+  /** After the entry filled: 50 of the 100 NO have been sold. */
+  const AFTER_ENTRY: ViewOptions = { ...CHEAP_NO, noShares: "50" };
+
+  const complementFill = {
+    orderId: "order-1",
+    marketId: "018f4a7e-1111-7abc-8def-0123456789ab",
+    outcome: "NO",
+    side: "SELL",
+    price: "0.7",
+    shares: "50",
+    filledAt: T_NOW,
+  };
+
+  /** An OPEN complement bracket, as the fill fold leaves it. */
+  function openComplement(overrides: Partial<StaticBracketState> = {}): StaticBracketState {
+    return stateWith({
+      instanceState: "OPEN",
+      allocatedShares: "50",
+      allocatedCost: "35",
+      exitedShares: "0",
+      legOutcome: "NO",
+      legBaselineShares: "100",
+      entriesExecuted: 1,
+      openedAtMs: NOW_MS - 1000,
+      ...overrides,
+    });
+  }
+
+  /**
+   * The exposure invariant, checked on an emitted intent against the bracket it
+   * belongs to: an exit's DELTA must oppose the entry's and may not exceed the
+   * confirmed open allocation.
+   */
+  function assertReducesExposure(intent: Intent, entryDelta: string, open: string): void {
+    const position = intent as Extract<Intent, { type: "POSITION" }>;
+    const entrySign = entryDelta.startsWith("-") ? -1 : 1;
+    const exitSign = position.targetShares.startsWith("-") ? -1 : 1;
+    expect(exitSign, "an exit must trade the opposite way to its entry").toBe(-entrySign);
+    const magnitude = position.targetShares.replace("-", "");
+    expect(Number(magnitude), "an exit may never exceed the confirmed open allocation").toBeLessThanOrEqual(
+      Number(open),
+    );
+  }
+
+  it("ENTRY sells the complement token at the complemented buy limit", () => {
+    const decision = staticBracketStrategy.onFeatures(context(preferring(), ARMED, CHEAP_NO));
+    const intent = positionIntents(decision)[0] as Extract<Intent, { type: "POSITION" }>;
+    expect(intent.direction).toBe("NO");
+    expect(intent.targetShares).toBe("-50");
+    // complement(maximum_buy_price 0.35) = 0.65.
+    expect(intent.minimumSellPrice).toBe("0.65");
+    expect(intent.maximumBuyPrice).toBeUndefined();
+  });
+
+  it("TAKE-PROFIT buys the same token back at complement(take_profit.price)", () => {
+    const entry = staticBracketStrategy.onFeatures(context(preferring(), ARMED, CHEAP_NO));
+    const entryIntent = positionIntents(entry)[0] as Extract<Intent, { type: "POSITION" }>;
+
+    const filled = staticBracketStrategy.onFill(
+      context(preferring(), entry.statePatch as unknown as StaticBracketState, AFTER_ENTRY),
+      complementFill as never,
+    );
+    expect(filled.decisionType).toBe("exit");
+    expect(filled.reasonCodes).toContain(REASONS.takeProfitPlaced);
+    expect(filled.reasonCodes).toContain(REASONS.exitProportional);
+
+    const exit = positionIntents(filled)[0] as Extract<Intent, { type: "POSITION" }>;
+    expect(exit.direction).toBe("NO");
+    // BUY side, positive DELTA, priced at 1 - 0.50.
+    expect(exit.targetShares).toBe("50");
+    expect(exit.maximumBuyPrice).toBe("0.5");
+    expect(exit.minimumSellPrice).toBeUndefined();
+    expect(filled.modelOutputs?.["exitSide"]).toBe("BUY");
+    assertReducesExposure(exit, entryIntent.targetShares, "50");
+
+    // The baseline the exit gates are measured against is the inventory this
+    // bracket started from, not the raw holding.
+    const patch = filled.statePatch as Record<string, unknown>;
+    expect(patch["legBaselineShares"]).toBe("100");
+    expect(patch["allocatedShares"]).toBe("50");
+  });
+
+  it("STOP reduces with a complemented FLOOR carried as a maximum buy price", () => {
+    const decision = staticBracketStrategy.onFeatures(
+      context(preferring(), openComplement(), {
+        ...AFTER_ENTRY,
+        features: { [STOP_KEY]: "0.2" },
+      }),
+    );
+    expect(decision.decisionType).toBe("reduce");
+    expect(decision.reasonCodes).toContain(REASONS.stopTriggered);
+    const reduce = reduceIntents(decision)[0] as Extract<Intent, { type: "REDUCE_POSITION" }>;
+    // complement(minimum_sell_price 0.26) = 0.74, and it is a BUY bound.
+    expect(reduce.maximumBuyPrice).toBe("0.74");
+    expect(reduce.minimumSellPrice).toBeUndefined();
+    expect(reduce.targetShares).toBe("0");
+    expect(reduce.urgency).toBe("AGGRESSIVE");
+    expect(decision.modelOutputs?.["exitSide"]).toBe("BUY");
+    expect(decision.modelOutputs?.["floor"]).toBe("0.74");
+  });
+
+  it("END-OF-MARKET protected reduce uses the same complemented floor", () => {
+    const decision = staticBracketStrategy.onMarketClosing(
+      context(preferring(), openComplement(), AFTER_ENTRY),
+      19,
+    );
+    expect(decision.decisionType).toBe("reduce");
+    const reduce = reduceIntents(decision)[0] as Extract<Intent, { type: "REDUCE_POSITION" }>;
+    expect(reduce.maximumBuyPrice).toBe("0.74");
+    expect(reduce.minimumSellPrice).toBeUndefined();
+  });
+
+  it("HOLDING TIMEOUT on a complement bracket is a buy-back too", () => {
+    const decision = staticBracketStrategy.onTimer(
+      context(preferring(), openComplement({ openedAtMs: NOW_MS - 200_000 }), AFTER_ENTRY),
+    );
+    expect(decision.reasonCodes).toContain(REASONS.holdingTimeout);
+    const reduce = reduceIntents(decision)[0] as Extract<Intent, { type: "REDUCE_POSITION" }>;
+    expect(reduce.maximumBuyPrice).toBe("0.74");
+  });
+
+  it("the buy-back CLOSES the bracket when it fills", () => {
+    const state = openComplement({
+      instanceState: "EXIT_WORKING",
+      exitOrder: {
+        kind: "EXIT",
+        intentId: "sb-take-profit-1",
+        orderId: "order-2",
+        state: "WORKING",
+        outcome: "NO",
+        side: "BUY",
+        limitPrice: "0.5",
+        requestedShares: "50",
+        filledShares: "0",
+        viewFilledShares: "0",
+        placedAtMs: NOW_MS - 500,
+        escalated: false,
+      },
+    });
+    const decision = staticBracketStrategy.onFill(
+      context(preferring(), state, { ...CHEAP_NO, noShares: "100" }),
+      {
+        orderId: "order-2",
+        marketId: "018f4a7e-1111-7abc-8def-0123456789ab",
+        outcome: "NO",
+        side: "BUY",
+        price: "0.5",
+        shares: "50",
+        filledAt: T_NOW,
+      } as never,
+    );
+    expect(decision.reasonCodes).toContain(REASONS.exitFilled);
+    expect(decision.reasonCodes).toContain(REASONS.closed);
+    const patch = decision.statePatch as Record<string, unknown>;
+    expect(patch["instanceState"]).toBe("CLOSED");
+    expect(patch["exitedShares"]).toBe("50");
+  });
+
+  it("REFUSES the exit when the view says the short does not exist (§6 invariant 12)", () => {
+    // The bracket believes it sold 50 NO out of 100, so it expects to see 50.
+    // A view showing the full 100 means nothing was ever sold: an exit here
+    // would BUY 50 more NO, taking the instance long on a bracket it never
+    // opened. That is the case the raw-holding gate could not see, because 100
+    // is comfortably "at least" the 50 the exit names.
+    const decision = staticBracketStrategy.onFeatures(
+      context(preferring(), openComplement(), { ...CHEAP_NO, noShares: "100" }),
+    );
+    expect(decision.reasonCodes).toContain(REASONS.positionMismatch);
+    expect(decision.reasonCodes).toContain(REASONS.noBlindFlatten);
+    expect(positionIntents(decision)).toHaveLength(0);
+    expect(reduceIntents(decision)).toHaveLength(0);
+  });
+});
+
 describe("§13.4 — Fee-aware rejection when expected edge is insufficient", () => {
   it("refuses the entry when fees eat the expected edge", () => {
     const expensive = params(configWith({ "entry.economics.entry_fee_per_share": "0.2" }));
@@ -671,29 +877,65 @@ describe("§13.4 — Fee-aware rejection when expected edge is insufficient", ()
 });
 
 describe("§13.4 — Deterministic replay", () => {
+  /** A deep copy of a plain tree with every object's KEYS inserted in reverse. */
+  function reverseKeys<T>(value: T): T {
+    if (Array.isArray(value)) {
+      return value.map((element: unknown) => reverseKeys(element)) as unknown as T;
+    }
+    if (typeof value === "object" && value !== null) {
+      const copy: Record<string, unknown> = {};
+      for (const key of Object.keys(value as Record<string, unknown>).reverse()) {
+        copy[key] = reverseKeys((value as Record<string, unknown>)[key]);
+      }
+      return copy as T;
+    }
+    return value;
+  }
+
+  const makeStates: readonly (() => StaticBracketState)[] = [
+    () => stateWith({}),
+    () => ARMED,
+    () => openState(),
+    () => openState({ instanceState: "PAUSED", resumeTo: "OPEN" }),
+    () =>
+      stateWith({ instanceState: "CLOSED", closedAtMs: NOW_MS - 60_000, entriesExecuted: 1 }),
+  ];
+
   function sequence(options: { readonly reverseBuild: boolean }): string[] {
-    // The same five evaluations, with the fixture objects constructed in
-    // opposite orders, so any dependence on object identity or construction
-    // order shows up as a byte difference.
-    const build = (): { params: ReturnType<typeof params>; states: StaticBracketState[] } => {
-      const built = params();
-      const states = [
-        stateWith({}),
-        ARMED,
-        openState(),
-        openState({ instanceState: "PAUSED", resumeTo: "OPEN" }),
-        stateWith({ instanceState: "CLOSED", closedAtMs: NOW_MS - 60_000, entriesExecuted: 1 }),
-      ];
-      return { params: built, states: options.reverseBuild ? [...states].reverse() : states };
-    };
-    const { params: built, states } = build();
-    const ordered = options.reverseBuild ? [...states].reverse() : states;
-    return ordered.map((state) =>
+    // The same five evaluations. Under `reverseBuild` the fixture objects are
+    // genuinely CONSTRUCTED in the opposite order and the configuration tree is
+    // built with every object's keys inserted in the opposite order, while the
+    // sequence that is EVALUATED stays canonical. Any dependence on allocation
+    // order, object identity or key insertion order shows up as a byte
+    // difference.
+    //
+    // (The pre-remediation version reversed the array and then reversed it
+    // again, so both branches built and evaluated the identical list and the
+    // assertion had no content.)
+    const built = params(options.reverseBuild ? reverseKeys(baseConfig()) : baseConfig());
+    const states: StaticBracketState[] = [];
+    const indices = makeStates.map((_, index) => index);
+    for (const index of options.reverseBuild ? [...indices].reverse() : indices) {
+      states[index] = (makeStates[index] as () => StaticBracketState)();
+    }
+    return states.map((state) =>
       canonicalJsonStringify(
         staticBracketStrategy.onFeatures(context(built, state, HELD_50)) as never,
       ),
     );
   }
+
+  it("the two construction orders really do differ, so the comparison has content", () => {
+    // Discrimination check: the reversed fixture is a DIFFERENT object by any
+    // key-order-sensitive measure, and the same one only under a canonical
+    // serializer. Without this, "byte-identical" could be true vacuously.
+    const forward = baseConfig();
+    const reversed = reverseKeys(baseConfig());
+    expect(JSON.stringify(reversed)).not.toBe(JSON.stringify(forward));
+    expect(canonicalJsonStringify(reversed as never)).toBe(
+      canonicalJsonStringify(forward as never),
+    );
+  });
 
   it("produces byte-identical decisions across construction orders", () => {
     expect(sequence({ reverseBuild: false })).toEqual(sequence({ reverseBuild: true }));

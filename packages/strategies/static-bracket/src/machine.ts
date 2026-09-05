@@ -181,6 +181,26 @@ export const INSTANCE_TRANSITIONS: readonly InstanceTransition[] = Object.freeze
   },
   {
     from: "ENTRY_PLANNED",
+    trigger: "ENTRY_ORDER_TERMINAL_UNFILLED",
+    to: "ARMED",
+    basis:
+      "INTERPRETATION: an entry order may reach a terminal venue state before it was ever " +
+      "observed resting — the §13.2 example's own most likely outcome (an aggressive FAK that " +
+      "finds no liquidity never rests, and is REJECTED or EXPIRED straight out of " +
+      "ENTRY_PLANNED). Nothing executed, so §13.3 rule 3 does not count it and the instance " +
+      "returns to ARMED, exactly as it does from ENTRY_WORKING",
+  },
+  {
+    from: "ENTRY_PLANNED",
+    trigger: "ENTRY_ORDER_TERMINAL_PARTIAL",
+    to: "OPEN",
+    basis:
+      "INTERPRETATION: as above for an order that ended having filled part of the requested " +
+      "size without ever being observed resting; §13.3 rule 1 makes the allocated size final, " +
+      "so the position is fully open at that size",
+  },
+  {
+    from: "ENTRY_PLANNED",
     trigger: "ENTRY_PARTIAL_FILL",
     to: "PARTIALLY_OPEN",
     basis: "INTERPRETATION: §8.1 does not guarantee that an order update precedes its fill; a confirmed fill is stronger evidence than a missing order update",
@@ -214,6 +234,28 @@ export const INSTANCE_TRANSITIONS: readonly InstanceTransition[] = Object.freeze
     trigger: "ENTRY_ORDER_TERMINAL_UNFILLED",
     to: "ARMED",
     basis: "INTERPRETATION: an entry order that ended with no fill executed nothing (§13.3 rule 3), so the instance returns to ARMED under the reentry policy",
+  },
+  {
+    from: "ENTRY_WORKING",
+    trigger: "ENTRY_ORDER_TERMINAL_PARTIAL",
+    to: "OPEN",
+    basis:
+      "INTERPRETATION: the entry order is gone and a CONFIRMED allocation is not, so the " +
+      "allocated size is final and the position is fully open at it (§13.3 rule 1) — the same " +
+      "edge PARTIALLY_OPEN has, for the state an instance is in when the fill arrived but the " +
+      "order was never observed resting. Without it an entry order that vanished with a " +
+      "confirmed allocation would take the ENTRY_ABANDONED edge back to ARMED and leave the " +
+      "instance free to enter again on top of a position it already holds",
+  },
+  {
+    from: "ENTRY_WORKING",
+    trigger: "ENTRY_ABANDONED",
+    to: "ARMED",
+    basis:
+      "INTERPRETATION: the same edge §13.3 needs out of ENTRY_PLANNED, for the state where the " +
+      "instance believes an entry order is resting but tracks no order to manage. Nothing is " +
+      "known to have executed, so §13.3 rule 3 does not count it and the instance returns to " +
+      "ARMED rather than halting on a machine that has no way forward",
   },
   {
     from: "ENTRY_WORKING",
@@ -283,6 +325,19 @@ export const INSTANCE_TRANSITIONS: readonly InstanceTransition[] = Object.freeze
   },
   {
     from: "EXIT_PLANNED",
+    trigger: "EXIT_TRIGGER_MET",
+    to: "EXIT_PLANNED",
+    basis:
+      "INTERPRETATION: §13.3 rule 1 makes the exit size a function of the CURRENT allocation, " +
+      "and §13.2 gives three further exit causes (the stop, the holding timeout, the close " +
+      "cutoff) that can supersede a planned take-profit. A bracket must therefore be able to " +
+      "name a NEW exit while an exit is already planned, without leaving the exit states. This " +
+      "edge does NOT license a placement while a cancel is unconfirmed — §6 invariant 13 is " +
+      "enforced in planTakeProfit/planProtectedReduce, which withdraw first and refuse to " +
+      "place until the withdrawal is confirmed",
+  },
+  {
+    from: "EXIT_PLANNED",
     trigger: "ENTRY_PARTIAL_FILL",
     to: "PARTIALLY_OPEN",
     basis: "INTERPRETATION: §13.3 rules 1 and 2 — a further ENTRY fill while a proportional exit rests enlarges the ACTUAL allocation, so the resting exit no longer matches it; the bracket returns to the open state and the exit is re-planned from the new allocation",
@@ -322,6 +377,17 @@ export const INSTANCE_TRANSITIONS: readonly InstanceTransition[] = Object.freeze
     trigger: "EXIT_PARTIAL_FILL",
     to: "EXIT_WORKING",
     basis: "§6 invariant 10: partial fills are first-class on the exit too",
+  },
+  {
+    from: "EXIT_WORKING",
+    trigger: "EXIT_TRIGGER_MET",
+    to: "EXIT_PLANNED",
+    basis:
+      "INTERPRETATION: as for EXIT_PLANNED, a superseding exit cause (stop, holding timeout, " +
+      "close cutoff) or a changed allocation names a new exit. The target is EXIT_PLANNED " +
+      "rather than EXIT_WORKING because the superseding exit is not yet known to be resting. " +
+      "§6 invariant 13 is preserved by the callers, which cancel the resting order first and " +
+      "do not place a replacement in the same decision",
   },
   {
     from: "EXIT_WORKING",

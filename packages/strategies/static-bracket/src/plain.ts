@@ -36,6 +36,32 @@
  * declared key as an own property and no read of it can reach a prototype.
  * `test/unit/strategies/static-bracket/hostile-config.test.ts` measures it.
  *
+ * WHAT THIS PACKAGE CLAIMS, AND WHERE THE CLAIM STOPS (ADR-020 §4 requires both
+ * halves; the second is as load-bearing as the first).
+ *
+ * MEASURED, and holding: for the pollution classes the battery exercises —
+ * NAMED string keys inherited by `Object.prototype`, enumerable and
+ * non-enumerable, including a required grammar key, an inherited `get`, an
+ * inherited `_zod`, an inherited `toString`, and state/decision keys polluted
+ * around a running callback — the door's PERMISSION does not vary, an
+ * acceptance stays an acceptance, a refusal stays a refusal, no callback
+ * throws, and a decision is byte-identical.
+ *
+ * MEASURED AND OPEN, disclosed rather than claimed away: NUMERIC-INDEX
+ * pollution. With `Object.prototype["0"]` defined, `subDecimal` throws whenever
+ * its exact result is zero, which happens inside `observe.ts`'s book walk on the
+ * ordinary path where the walk consumes exactly the requested size. This
+ * package's guards contain the throw (`economics.ts` `guarded`), so the
+ * OBSERVED behaviour is a recorded refusal — `SB.REFUSED_BOOK_PARTICIPATION`
+ * where a clean process would have entered. The DIRECTION is fail-closed: an
+ * entry becomes a hold, and no exit, cancel or reduction is affected. The root
+ * cause is in `packages/decimal`, which is outside this package's paths and is
+ * queued with two sibling decimal findings; nothing here can fix it, and
+ * pretending the class is covered would be worse than naming it. Reaching it at
+ * all requires an already-compromised process. `hostile-config.test.ts` carries
+ * the probe as a DOCUMENTED EXPECTATION: it asserts today's fail-closed refusal
+ * and will fail loudly if the direction ever changes.
+ *
  * Purity: no I/O, no clock, no randomness, no `node:` import, no evaluator, no
  * `.constructor` read (F14).
  */

@@ -56,6 +56,7 @@ describe("the state document reader is total", () => {
         limitPrice: "0.35",
         requestedShares: "50",
         filledShares: "10",
+        viewFilledShares: "10",
         placedAtMs: 1,
         escalated: true,
       },
@@ -77,7 +78,8 @@ describe("the state document reader is total", () => {
     },
     {
       name: "a foreign schema version",
-      value: { ...stateToPatch(INITIAL_STATE), schemaVersion: 2 },
+      // Any version that is not this build's; the document's own is 2.
+      value: { ...stateToPatch(INITIAL_STATE), schemaVersion: 3 },
       expected: /requires a new run for a state-schema change/u,
     },
     {
@@ -109,6 +111,7 @@ describe("the state document reader is total", () => {
           limitPrice: "0.35",
           requestedShares: "50",
           filledShares: "0",
+          viewFilledShares: "0",
           placedAtMs: 1,
           escalated: false,
         },
