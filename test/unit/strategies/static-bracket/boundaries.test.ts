@@ -25,10 +25,26 @@ import {
   observe,
   REASONS,
 } from "../../../../packages/strategies/static-bracket/src/index.js";
-import { context, parsedParams, stateWith, T_NOW, type ViewOptions } from "./helpers.js";
+import type { Intent } from "../../../../packages/domain/src/index.js";
+import type { StaticBracketState } from "../../../../packages/strategies/static-bracket/src/index.js";
+import {
+  context,
+  parsedParams,
+  protectedReductions,
+  stateWith,
+  T_NOW,
+  type ViewOptions,
+} from "./helpers.js";
 import { staticBracketParamsSchema } from "../../../../packages/strategies/static-bracket/src/index.js";
 
 const params = () => parsedParams(staticBracketParamsSchema);
+
+/**
+ * `Date.parse` is used ONCE, here, to derive a fixture constant from the fixed
+ * instant printed in `helpers.ts` — never inside the strategy and never as a
+ * clock (the same discipline `acceptance.test.ts` states).
+ */
+const NOW_MS = Date.parse(T_NOW);
 
 describe("the state document reader is total", () => {
   it("reads an empty document as a fresh instance", () => {
@@ -289,10 +305,10 @@ describe("§6 invariant 12 — no blind flatten", () => {
           features: { "polymarket.executable_sell_price@50": "0.2" },
         }),
       );
-      expect(
-        decision.intents.filter((intent) => intent.type === "REDUCE_POSITION"),
-        `held ${held} must not be flattened`,
-      ).toHaveLength(0);
+      // FORCING FINDING r2-B1: a protected reduction is now a tagged POSITION
+      // delta, so filtering for `REDUCE_POSITION` would assert nothing.
+      expect(protectedReductions(decision), `held ${held} must not be flattened`).toHaveLength(0);
+      expect(decision.intents.filter((intent) => intent.type === "POSITION")).toHaveLength(0);
       expect(decision.reasonCodes).toContain(REASONS.positionMismatch);
       expect(decision.reasonCodes).toContain(REASONS.noBlindFlatten);
       expect((decision.statePatch as Record<string, unknown>)["instanceState"]).toBe("PAUSED");
@@ -306,7 +322,13 @@ describe("§6 invariant 12 — no blind flatten", () => {
         features: { "polymarket.executable_sell_price@50": "0.2" },
       }),
     );
-    expect(decision.intents.some((intent) => intent.type === "REDUCE_POSITION")).toBe(true);
+    expect(protectedReductions(decision)).toHaveLength(1);
+    // FORCING FINDING r2-B1(b): the reduction names this bracket's own leg and
+    // exactly its confirmed open allocation, not a market-wide sell-down level.
+    const reduction = protectedReductions(decision)[0] as Extract<Intent, { type: "POSITION" }>;
+    expect(reduction.direction).toBe("YES");
+    expect(reduction.targetShares).toBe("-50");
+    expect(decision.intents.filter((intent) => intent.type === "REDUCE_POSITION")).toHaveLength(0);
   });
 
   it("pauses on a fill it cannot attribute to one of its own intents (§6 invariant 7)", () => {
@@ -325,6 +347,241 @@ describe("§6 invariant 12 — no blind flatten", () => {
     expect(decision.reasonCodes).toContain(REASONS.unattributedFill);
     expect(decision.intents.filter((intent) => intent.type === "POSITION")).toHaveLength(0);
     expect((decision.statePatch as Record<string, unknown>)["allocatedShares"]).toBe("50");
+  });
+});
+
+/**
+ * A CONFIRMED FILL THAT ARRIVES WHILE THE INSTANCE IS PAUSED (r2-M1).
+ *
+ * §13.3 draws no fill edge out of `PAUSED`, so consulting the machine first
+ * refused the fill and the instance carried on recording an allocation of zero
+ * while it really held the position — §6 invariant 10 and §13.3 rule 1 both
+ * violated, and the very next healthy evaluation would either wait forever for
+ * a fill that had already arrived or re-arm and enter on top of the position.
+ *
+ * The fold is settlement accounting (§6 invariant 5), not a transition: it is
+ * applied, and the instance stays exactly where it was.
+ */
+describe("a fill folds into the allocation even while PAUSED", () => {
+  function pausedEntry(overrides: Partial<StaticBracketState> = {}): StaticBracketState {
+    return stateWith({
+      instanceState: "PAUSED",
+      resumeTo: "ENTRY_WORKING",
+      legOutcome: "YES",
+      lastIncident: "stale book",
+      entryOrder: {
+        kind: "ENTRY",
+        intentId: "sb-entry-0",
+        orderId: "order-1",
+        state: "WORKING",
+        outcome: "YES",
+        side: "BUY",
+        limitPrice: "0.35",
+        requestedShares: "50",
+        filledShares: "0",
+        viewFilledShares: "0",
+        placedAtMs: NOW_MS,
+        escalated: true,
+      },
+      ...overrides,
+    });
+  }
+
+  const entryFill = {
+    orderId: "order-1",
+    marketId: "018f4a7e-1111-7abc-8def-0123456789ab",
+    outcome: "YES",
+    side: "BUY",
+    price: "0.35",
+    shares: "50",
+    filledAt: T_NOW,
+  };
+
+  it("records the allocation, stays PAUSED, and emits nothing", () => {
+    const decision = staticBracketStrategy.onFill(
+      context(params(), pausedEntry(), { yesShares: "50" }),
+      entryFill as never,
+    );
+    expect(decision.decisionType).toBe("hold");
+    expect(decision.intents).toHaveLength(0);
+    expect(decision.reasonCodes).toContain(REASONS.allocated);
+    expect(decision.reasonCodes).toContain(REASONS.fillFoldedWhilePaused);
+    expect(decision.reasonCodes).toContain(REASONS.paused);
+    // The b17d461 route this replaced: an illegal transition read as a position
+    // mismatch, which discarded the fill.
+    expect(decision.reasonCodes).not.toContain(REASONS.illegalTransition);
+    expect(decision.reasonCodes).not.toContain(REASONS.halted);
+
+    const patch = decision.statePatch as Record<string, unknown>;
+    expect(patch["instanceState"]).toBe("PAUSED");
+    expect(patch["resumeTo"]).toBe("ENTRY_WORKING");
+    expect(patch["allocatedShares"]).toBe("50");
+    expect(patch["allocatedCost"]).toBe("17.5");
+    expect(patch["legOutcome"]).toBe("YES");
+    expect(patch["legBaselineShares"]).toBe("0");
+    expect(patch["entriesExecuted"]).toBe(1);
+  });
+
+  it("and the exit that follows the resume is sized from the folded allocation", () => {
+    const folded = staticBracketStrategy.onFill(
+      context(params(), pausedEntry(), { yesShares: "50" }),
+      entryFill as never,
+    );
+    const afterFold = folded.statePatch as unknown as StaticBracketState;
+
+    // Data recovers. The instance resumes into ENTRY_WORKING, settles the
+    // terminal entry order, and exits at the size the fold recorded.
+    const resumed = staticBracketStrategy.onFeatures(
+      context(params(), afterFold, { yesShares: "50" }),
+    );
+    expect(resumed.reasonCodes).toContain(REASONS.resumed);
+    const afterResume = (resumed.statePatch ?? afterFold) as unknown as StaticBracketState;
+    const exiting = staticBracketStrategy.onFeatures(
+      context(params(), afterResume, { yesShares: "50" }),
+    );
+    const exit = [...exiting.intents, ...resumed.intents].filter(
+      (intent) => intent.type === "POSITION",
+    )[0] as Extract<Intent, { type: "POSITION" }>;
+    expect(exit, "an exit is planned from the folded allocation").toBeDefined();
+    expect(exit.direction).toBe("YES");
+    expect(exit.targetShares).toBe("-50");
+  });
+
+  it("folds an EXIT fill too, without starting the cool-down clock early", () => {
+    const paused = stateWith({
+      instanceState: "PAUSED",
+      resumeTo: "EXIT_WORKING",
+      legOutcome: "YES",
+      allocatedShares: "50",
+      allocatedCost: "17.5",
+      entriesExecuted: 1,
+      openedAtMs: NOW_MS - 1000,
+      exitOrder: {
+        kind: "EXIT",
+        intentId: "sb-take-profit-1",
+        orderId: "order-2",
+        state: "WORKING",
+        outcome: "YES",
+        side: "SELL",
+        limitPrice: "0.5",
+        requestedShares: "50",
+        filledShares: "0",
+        viewFilledShares: "0",
+        placedAtMs: NOW_MS - 500,
+        escalated: false,
+      },
+    });
+    const decision = staticBracketStrategy.onFill(context(params(), paused, { yesShares: "0" }), {
+      orderId: "order-2",
+      marketId: "018f4a7e-1111-7abc-8def-0123456789ab",
+      outcome: "YES",
+      side: "SELL",
+      price: "0.5",
+      shares: "50",
+      filledAt: T_NOW,
+    } as never);
+    expect(decision.intents).toHaveLength(0);
+    const patch = decision.statePatch as Record<string, unknown>;
+    expect(patch["instanceState"]).toBe("PAUSED");
+    expect(patch["exitedShares"]).toBe("50");
+    // `closedAtMs` anchors the re-entry cool-down and belongs to the CLOSED
+    // edge, which a paused instance has not taken.
+    expect(patch["closedAtMs"]).toBeNull();
+  });
+
+  it("folds a COMPLEMENT-leg fill on both sides of the bracket", () => {
+    const paused = pausedEntry({
+      resumeTo: "ENTRY_WORKING",
+      legOutcome: "NO",
+      entryOrder: {
+        kind: "ENTRY",
+        intentId: "sb-entry-0",
+        orderId: "order-1",
+        state: "WORKING",
+        outcome: "NO",
+        side: "SELL",
+        limitPrice: "0.65",
+        requestedShares: "50",
+        filledShares: "0",
+        viewFilledShares: "0",
+        placedAtMs: NOW_MS,
+        escalated: true,
+      },
+    });
+    const decision = staticBracketStrategy.onFill(
+      context(params(), paused, { noShares: "50" }),
+      {
+        orderId: "order-1",
+        marketId: "018f4a7e-1111-7abc-8def-0123456789ab",
+        outcome: "NO",
+        side: "SELL",
+        price: "0.7",
+        shares: "50",
+        filledAt: T_NOW,
+      } as never,
+    );
+    const patch = decision.statePatch as Record<string, unknown>;
+    expect(patch["instanceState"]).toBe("PAUSED");
+    expect(patch["allocatedShares"]).toBe("50");
+    expect(patch["allocatedCost"]).toBe("35");
+    expect(patch["legOutcome"]).toBe("NO");
+    // A SELL entry recovers the baseline by ADDING the allocation back.
+    expect(patch["legBaselineShares"]).toBe("100");
+  });
+
+  it("a HALTED instance still refuses the fill outright — that route stays closed", () => {
+    const decision = staticBracketStrategy.onFill(
+      context(params(), pausedEntry({ instanceState: "HALTED", haltReason: "x" }), {
+        yesShares: "50",
+      }),
+      entryFill as never,
+    );
+    expect(decision.decisionType).toBe("hold");
+    expect(decision.reasonCodes).toEqual([REASONS.halted]);
+    expect(decision.intents).toHaveLength(0);
+  });
+});
+
+/**
+ * `planRearm` RESETS `legBaselineShares` (r2-L1).
+ *
+ * It is per-BRACKET state, and a second bracket that inherited the first one's
+ * inventory baseline would measure its own exposure against a number that
+ * belongs to a bracket that already closed. Deleting the field from the reset
+ * list survived all 274 tests at 293a640; the persisted checkpoint is where the
+ * stale value is observable (§6 invariant 8), so that is where it is pinned.
+ */
+describe("re-arming resets the per-bracket fields", () => {
+  it("clears legBaselineShares in the persisted state document", () => {
+    const closed = stateWith({
+      instanceState: "CLOSED",
+      closedAtMs: NOW_MS - 60_000,
+      entriesExecuted: 0,
+      allocatedShares: "50",
+      allocatedCost: "35",
+      exitedShares: "50",
+      legOutcome: "NO",
+      legBaselineShares: "100",
+      openedAtMs: NOW_MS - 120_000,
+    });
+    const decision = staticBracketStrategy.onFeatures(
+      context(params(), closed, { noShares: "100" }),
+    );
+    expect(decision.reasonCodes).toContain(REASONS.rearmed);
+    const patch = decision.statePatch as Record<string, unknown>;
+    expect(patch["instanceState"]).toBe("ARMED");
+    // Every per-bracket field, so a deletion from the reset list dies here.
+    expect(patch["legBaselineShares"]).toBe("0");
+    expect(patch["allocatedShares"]).toBe("0");
+    expect(patch["allocatedCost"]).toBe("0");
+    expect(patch["exitedShares"]).toBe("0");
+    expect(patch["legOutcome"]).toBeNull();
+    expect(patch["openedAtMs"]).toBeNull();
+    expect(patch["entryOrder"]).toBeNull();
+    expect(patch["exitOrder"]).toBeNull();
+    // And what is per-MARKET is carried, not reset.
+    expect(patch["entriesExecuted"]).toBe(0);
+    expect(patch["closedAtMs"]).toBe(NOW_MS - 60_000);
   });
 });
 

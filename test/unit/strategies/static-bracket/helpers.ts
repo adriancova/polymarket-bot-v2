@@ -25,6 +25,7 @@ import type {
   StrategyOrderView,
   VirtualPositionView,
 } from "../../../../packages/strategy-sdk/src/index.js";
+import type { Intent } from "../../../../packages/domain/src/index.js";
 import type {
   DecisionRecord,
   DecisionTelemetry,
@@ -134,6 +135,28 @@ export function baseConfig(): Record<string, unknown> {
       on_incident: "PAUSE_AND_CANCEL",
     },
   };
+}
+
+/** The tag every protected reduction carries (`reasons.ts` `TAGS`). */
+export const PROTECTED_REDUCE_TAG = "sb.protected-reduce";
+
+/**
+ * The PROTECTED-REDUCTION intents of a decision.
+ *
+ * Review round 2's BLOCKER: a §7.7 `REDUCE_POSITION` carries a `targetShares`
+ * that the merged execution planner reads as a per-side SELL-DOWN LEVEL for the
+ * WHOLE market, which cannot express one leg's own allocation and cannot
+ * express a complement-leg buy-back at all. Every exit this strategy emits is
+ * therefore a `POSITION` delta, and a protected reduction is told apart from a
+ * take-profit by the tag it carries — so an assertion that NO reduction was
+ * emitted still has teeth rather than filtering for a type that never occurs.
+ */
+export function protectedReductions(decision: {
+  readonly intents: readonly Intent[];
+}): readonly Intent[] {
+  return decision.intents.filter(
+    (intent) => intent.type === "POSITION" && intent.tags.includes(PROTECTED_REDUCE_TAG),
+  );
 }
 
 /** Deep, own-key clone of a plain fixture tree (no `structuredClone` needed). */

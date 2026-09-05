@@ -41,6 +41,7 @@ import {
   configWith,
   context,
   parsedParams,
+  protectedReductions,
   stateWith,
   type ViewOptions,
 } from "./helpers.js";
@@ -476,7 +477,10 @@ describe("hostile battery — thresholds are exact, one tick at a time", () => {
       const decision = staticBracketStrategy.onFeatures(
         context(params(), open, { yesShares: "50", features: { [STOP_KEY]: testCase.trigger } }),
       );
-      const reduced = decision.intents.some((intent) => intent.type === "REDUCE_POSITION");
+      // FORCING FINDING r2-B1: a protected reduction is a tagged POSITION
+      // delta now; `type === "REDUCE_POSITION"` would never match and the
+      // `stops: true` rows would assert nothing.
+      const reduced = protectedReductions(decision).length > 0;
       expect(reduced).toBe(testCase.stops);
     });
   }
@@ -516,7 +520,7 @@ describe("hostile battery — thresholds are exact, one tick at a time", () => {
         context(params(), open, { yesShares: "50", ...testCase.views }),
       );
       expect(
-        decision.intents.some((intent) => intent.type === "REDUCE_POSITION"),
+        protectedReductions(decision).length > 0,
         `an unreadable stop (${testCase.name}) must never reduce`,
       ).toBe(false);
       expect(decision.reasonCodes).not.toContain(REASONS.stopTriggered);
@@ -538,7 +542,7 @@ describe("hostile battery — thresholds are exact, one tick at a time", () => {
       // than normalizing market data inside a trading decision.
       context(params(), open, { yesShares: "50", features: { [STOP_KEY]: "0.200" } }),
     );
-    expect(decision.intents.some((intent) => intent.type === "REDUCE_POSITION")).toBe(false);
+    expect(protectedReductions(decision).length > 0).toBe(false);
   });
 
   it("refuses a trigger naming a feature the engine does not compute", () => {

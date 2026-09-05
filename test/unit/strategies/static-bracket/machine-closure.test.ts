@@ -14,19 +14,29 @@
  * halted it with an OPEN POSITION and zero intents, so the stop never fired
  * again.
  *
- * This file closes the loop from the other side, three ways:
+ * This file closes the loop from the other side, four ways:
  *
  * 1. **A bounded state sweep** through the SHIPPED callback: every reachable
  *    combination of bracket state, entry-order state, exit-order state,
  *    allocation and economic leg must produce a decision, never a halt.
  * 2. **A call-site inventory**, checked against the source: every `move()` in
- *    `decide.ts` carries a `// MOVE-SITE:` marker, the inventory below names the
- *    triggers and the `from` states each site can reach, and every pair a site
- *    can reach must exist in the table (or be an explicitly declared,
- *    reasoned refusal).
+ *    `decide.ts` carries a `// MOVE-SITE: <name> TRIGGERS: ...` marker, the
+ *    inventory below names the triggers and the `from` states each site can
+ *    reach, and every pair a site can reach must exist in the table (or be an
+ *    explicitly declared, reasoned refusal). Review round 2 showed the census
+ *    could be evaded two ways — an ALIASED call (`const step = move;`) is
+ *    invisible to a textual `move(` count, and the inventory's `required` list
+ *    is a hand-written literal that can be emptied — so the identifier is now
+ *    forbidden to appear anywhere except immediately before a `(`, and the
+ *    trigger list is declared at the call site and cross-checked BOTH against
+ *    the inventory and against the literals the call really passes.
  * 3. **§6 invariant 13**, re-verified over the same sweep now that the exit
  *    states have self-edges: no decision may both cancel and place, and no
  *    replacement may be planned while a cancel is unconfirmed.
+ * 4. **Repeated order views over TERMINAL tracked orders**, which review round 2
+ *    found halting the instance permanently with an open position. Terminal
+ *    states have no outgoing edge and must not gain one; the VIEW is absorbed
+ *    instead.
  */
 
 import { readFileSync } from "node:fs";
@@ -293,6 +303,56 @@ describe("the §13.3 machine is CLOSED over the shapes the code can reach", () =
       ).toBe(true);
     }
   });
+
+  it("an ARMED instance with an order IN FLIGHT refuses structurally, not by arithmetic", () => {
+    // NOTE-2. Before the guard, every ARMED shape carrying a live order was
+    // refused by the §13.2 example's risk and reentry bounds — the position
+    // projection is `held + size` and the entry count is spent. That is an
+    // arithmetic coincidence of one configuration: give both bounds slack and
+    // the instance would have entered on top of an order already in flight.
+    const roomy = configWith({
+      "risk.maximum_position_shares": "10000",
+      "risk.maximum_contractual_loss": "10000",
+      "entry.maximum_total_cost": "10000",
+      "reentry.maximum_entries_per_market": 9,
+    });
+    for (const orderState of ["PENDING", "WORKING", "CANCEL_PENDING"] as const) {
+      for (const kind of ["ENTRY", "EXIT"] as const) {
+        const shape: Shape = {
+          instanceState: "ARMED",
+          entryState: kind === "ENTRY" ? orderState : null,
+          exitState: kind === "EXIT" ? orderState : null,
+          allocated: "0",
+          leg: "YES",
+        };
+        const decision = staticBracketStrategy.onFeatures(
+          context(params(roomy), stateFor(shape), {
+            yesShares: "0",
+            features: { "polymarket.executable_buy_price@50": "0.3" },
+          }),
+        );
+        expect(decision.decisionType, label(shape)).toBe("hold");
+        expect(decision.intents, label(shape)).toHaveLength(0);
+        expect(decision.reasonCodes, label(shape)).toContain(REASONS.refusedOrderInFlight);
+      }
+    }
+    // Discrimination: with NOTHING in flight the same roomy configuration DOES
+    // enter, so the refusal above is the guard and not the fixture.
+    const clear = staticBracketStrategy.onFeatures(
+      context(
+        params(roomy),
+        stateFor({
+          instanceState: "ARMED",
+          entryState: null,
+          exitState: null,
+          allocated: "0",
+          leg: "YES",
+        }),
+        { yesShares: "0", features: { "polymarket.executable_buy_price@50": "0.3" } },
+      ),
+    );
+    expect(clear.decisionType).toBe("enter");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -519,10 +579,86 @@ const MOVE_SITES: readonly MoveSite[] = [
   },
 ];
 
-function markersInSource(): string[] {
-  const source = readFileSync(DECIDE_SOURCE, "utf8");
-  const found = [...source.matchAll(/\/\/ MOVE-SITE: (\w+)/gu)].map((match) => match[1] as string);
+/**
+ * One `// MOVE-SITE: <name> TRIGGERS: <T> <T> ...` marker, as written in the
+ * shipped source, with the line it sits on.
+ *
+ * FORCING FINDING r2-L3: the marker used to carry only a name, so the two
+ * halves of the census — the source and the hand-written {@link MOVE_SITES}
+ * table — could drift apart with nothing to notice it. The trigger list is now
+ * declared AT the call site, checked against the table, AND checked against the
+ * literals the call site actually passes.
+ */
+interface Marker {
+  readonly name: string;
+  readonly triggers: readonly string[];
+  readonly line: number;
+}
+
+function decideSource(): string {
+  return readFileSync(DECIDE_SOURCE, "utf8");
+}
+
+/**
+ * `decide.ts` with every comment blanked out, line count preserved.
+ *
+ * The identifier census below is about CODE: the module's prose says "move"
+ * in the ordinary English sense in several places, and a scan that could not
+ * tell the two apart would either be noisy or would have to be weakened until
+ * it stopped catching the thing it exists to catch. Newlines are preserved so
+ * reported line numbers stay true.
+ *
+ * RESIDUAL, stated rather than hidden: this is a lexical stripper, not a
+ * parser. It does not know about `move` inside a string literal or a template
+ * — which would be an odd way to smuggle a call, since the identifier would
+ * still have to be referenced somewhere to be used — and it does not know
+ * about regular-expression literals. The demonstrated evasion (`const step =
+ * move;` plus an aliased call) is closed; a determined author with commit
+ * access to this file can always evade any test in it.
+ */
+function decideCode(): string {
+  const source = decideSource();
+  let out = "";
+  let index = 0;
+  while (index < source.length) {
+    const two = source.slice(index, index + 2);
+    if (two === "//") {
+      const end = source.indexOf("\n", index);
+      const stop = end === -1 ? source.length : end;
+      out += " ".repeat(stop - index);
+      index = stop;
+      continue;
+    }
+    if (two === "/*") {
+      const end = source.indexOf("*/", index + 2);
+      const stop = end === -1 ? source.length : end + 2;
+      out += source.slice(index, stop).replace(/[^\n]/gu, " ");
+      index = stop;
+      continue;
+    }
+    out += source[index] as string;
+    index += 1;
+  }
+  return out;
+}
+
+function markers(): Marker[] {
+  const lines = decideSource().split("\n");
+  const found: Marker[] = [];
+  for (const [index, text] of lines.entries()) {
+    const match = /\/\/ MOVE-SITE: (\w+) TRIGGERS: ([A-Z_ ]+)$/u.exec(text.trimEnd());
+    if (match === null) continue;
+    found.push({
+      name: match[1] as string,
+      triggers: (match[2] as string).trim().split(/\s+/u),
+      line: index,
+    });
+  }
   return found;
+}
+
+function markersInSource(): string[] {
+  return markers().map((marker) => marker.name);
 }
 
 function tableHas(from: InstanceState, trigger: InstanceTrigger): boolean {
@@ -580,12 +716,77 @@ describe("the shape of the two machines is pinned", () => {
 
 describe("every move() call site names a pair the table contains", () => {
   it("has real source to scan, and a marker for every move() call", () => {
-    const source = readFileSync(DECIDE_SOURCE, "utf8");
+    const source = decideSource();
     expect(source.length).toBeGreaterThan(1000);
     // Count `move(` calls that are not `moveOrder(` and not the definition.
     const calls = [...source.matchAll(/(?<![\w.])move\(/gu)].length;
     const definition = 1;
     expect(markersInSource()).toHaveLength(calls - definition);
+  });
+
+  it("`move` is never ALIASED, passed as a value, or re-exported", () => {
+    // FORCING FINDING r2-L3, the demonstrated evasion. The count above is a
+    // TEXTUAL census of `move(` call sites, so `const step = move;` followed by
+    // `step(state, "PAUSE", ...)` adds a real, unmarked transition to the
+    // shipped strategy and leaves this file entirely green — reproduced at
+    // 293a640 with 21/21 passing.
+    //
+    // The rule that closes it: every whole-word occurrence of the identifier
+    // `move` in `decide.ts` must be immediately followed by `(`. That admits
+    // the declaration and every direct call, and rejects `= move`, `move,`,
+    // `(move)`, `move as`, `export { move }` and `[move]` alike — every way of
+    // getting a reference to the function without calling it by name.
+    const code = decideCode();
+    const offenders: string[] = [];
+    for (const match of code.matchAll(/(?<![\w.$])move(?![\w$])/gu)) {
+      const at = (match.index ?? 0) + "move".length;
+      if (code[at] === "(") continue;
+      const line = code.slice(0, match.index ?? 0).split("\n").length;
+      offenders.push(`line ${String(line)}: ${code.slice(match.index ?? 0, at + 12).trim()}`);
+    }
+    expect(offenders, "move() may only ever be CALLED, by name").toEqual([]);
+    // The check has content: it really does see the code, and it really does
+    // reject the evasion when it is present.
+    expect([...code.matchAll(/(?<![\w.$])move\(/gu)].length).toBeGreaterThan(15);
+    const evaded = `${code}\n  const step = move;\n  step(state, "PAUSE");\n`;
+    const caught = [...evaded.matchAll(/(?<![\w.$])move(?![\w$])/gu)].filter(
+      (match) => evaded[(match.index ?? 0) + "move".length] !== "(",
+    );
+    expect(caught, "the alias evasion is what this check exists to reject").toHaveLength(1);
+  });
+
+  it("every marker DECLARES the triggers its site passes, and the table agrees", () => {
+    // FORCING FINDING r2-L3, the second half: `MOVE_SITES.required` is a
+    // hand-written literal, and emptying one site's list left 21/21 green while
+    // the code could still form the pairs. Two independent checks now bracket
+    // it — the table against the marker, and the marker against the string
+    // literals the call site really passes.
+    const byName = new Map(markers().map((marker) => [marker.name, marker]));
+    const lines = decideSource().split("\n");
+    for (const site of MOVE_SITES) {
+      const marker = byName.get(site.name);
+      expect(marker, `${site.name} has a marker`).toBeDefined();
+      if (marker === undefined) continue;
+
+      // (a) the marker and the inventory name the same trigger set.
+      const declared = [...new Set(marker.triggers)].sort();
+      const tabled = [
+        ...new Set([...site.required, ...site.tolerated].map((pair) => pair.trigger)),
+      ].sort();
+      expect(declared, `${site.name}: marker vs inventory`).toEqual(tabled);
+
+      // (b) every declared trigger really appears as a string literal in the
+      // window around the call — the trigger is either the literal argument or
+      // the ternary/const just above it, so a marker that claims a trigger the
+      // code does not pass fails here.
+      const window = lines.slice(Math.max(0, marker.line - 20), marker.line + 20).join("\n");
+      for (const trigger of declared) {
+        expect(
+          window.includes(`"${trigger}"`),
+          `${site.name}: declares ${trigger}, which no literal near the call site passes`,
+        ).toBe(true);
+      }
+    }
   });
 
   it("the inventory names exactly the markers in the source, with no drift", () => {
@@ -792,6 +993,214 @@ describe("§6 invariant 13 — safety cancellation outranks new placement", () =
     expect(third.decisionType).toBe("reduce");
     expect(places(third)).toBe(1);
     expect(cancels(third)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. Repeated order views over TERMINAL tracked orders (r2-H1)
+// ---------------------------------------------------------------------------
+
+/**
+ * NOTHING PROMISES AT-MOST-ONCE DELIVERY OF AN ORDER VIEW.
+ *
+ * §8.1 orders a view and its fill not at all, §9.6 promises no de-duplication,
+ * and the sub-machine already tolerates a repeated `WORKING` view with its own
+ * self-edge. A repeated TERMINAL view had no such tolerance: asking a terminal
+ * state for an outgoing edge is illegal by construction, `planOrderUpdate`
+ * halted on the refusal, and the instance was left holding the position with
+ * the stop, the holding timeout and the close cutoff all dead behind
+ * `planTick`'s halt short-circuit. Reproduced at 293a640: all 168 shapes below
+ * halted, and the awaiting-fill posture (which deliberately KEEPS a terminal
+ * entry track while it waits for the fill stream) made the window unbounded.
+ */
+const TERMINAL_TRACK_STATES = TERMINAL_ORDER_STATES;
+/** Every status an SDK view can carry, plus one the strategy cannot interpret. */
+const VIEW_STATUSES: readonly string[] = [
+  "OPEN",
+  "PARTIALLY_FILLED",
+  "FILLED",
+  "CANCELED",
+  "REJECTED",
+  "EXPIRED",
+  "SOMETHING_NEW",
+];
+
+function terminalTrack(kind: "ENTRY" | "EXIT", state: OrderState): OrderTrack {
+  return {
+    kind,
+    intentId: kind === "ENTRY" ? "sb-entry-0" : "sb-take-profit-1",
+    orderId: "order-1",
+    state,
+    outcome: "YES",
+    side: kind === "ENTRY" ? "BUY" : "SELL",
+    limitPrice: kind === "ENTRY" ? "0.35" : "0.5",
+    requestedShares: "50",
+    filledShares: "0",
+    viewFilledShares: "50",
+    placedAtMs: NOW_MS,
+    escalated: true,
+  };
+}
+
+describe("a REPEATED view for a terminal tracked order is absorbed, never halted", () => {
+  it("no shape of (kind, terminal state, view status, bracket state, evidence) halts", () => {
+    const halted: string[] = [];
+    const offenders: string[] = [];
+    let evaluated = 0;
+    for (const kind of ["ENTRY", "EXIT"] as const) {
+      for (const trackState of TERMINAL_TRACK_STATES) {
+        for (const status of VIEW_STATUSES) {
+          for (const instanceState of [
+            "ENTRY_PLANNED",
+            "ENTRY_WORKING",
+            "PARTIALLY_OPEN",
+            "OPEN",
+            "EXIT_PLANNED",
+            "EXIT_WORKING",
+          ] as const) {
+            for (const viewFilled of ["0", "25", "50"]) {
+              evaluated += 1;
+              const track = terminalTrack(kind, trackState);
+              const state = stateWith({
+                instanceState,
+                legOutcome: "YES",
+                allocatedShares: "50",
+                allocatedCost: "17.5",
+                entriesExecuted: 1,
+                openedAtMs: NOW_MS - 1000,
+                ...(kind === "ENTRY" ? { entryOrder: track } : { exitOrder: track }),
+              });
+              const decision = staticBracketStrategy.onOrderUpdate(
+                context(params(), state, { yesShares: "50" }),
+                {
+                  orderId: "order-1",
+                  marketId: "018f4a7e-1111-7abc-8def-0123456789ab",
+                  outcome: "YES",
+                  side: kind === "ENTRY" ? "BUY" : "SELL",
+                  price: kind === "ENTRY" ? "0.35" : "0.5",
+                  requestedShares: "50",
+                  filledShares: viewFilled,
+                  status,
+                  placedAt: T_NOW,
+                } as never,
+              );
+              if (decision.reasonCodes.includes(REASONS.halted)) {
+                halted.push(`${kind}/${trackState}/${status}/${instanceState}/${viewFilled}`);
+              }
+              // §6 invariant 13 over the WIDENED surface: absorbing a view may
+              // not become a route to a placement, alone or beside a cancel.
+              if (cancels(decision) > 0 && places(decision) > 0) {
+                offenders.push(`${kind}/${trackState}/${status}/${instanceState}/${viewFilled}`);
+              }
+            }
+          }
+        }
+      }
+    }
+    // 2 kinds x 4 terminal states x 7 statuses x 6 bracket states x 3 evidence.
+    expect(evaluated).toBe(1008);
+    expect(halted).toEqual([]);
+    expect(offenders).toEqual([]);
+  });
+
+  it("absorbs the repeat rather than transitioning, and keeps the better evidence", () => {
+    // The concrete route: a FILLED view, then the SAME view again. The first
+    // moves the track to FILLED and puts the instance into the awaiting-fill
+    // posture; the second used to halt it.
+    const state = stateWith({
+      instanceState: "ENTRY_WORKING",
+      legOutcome: "YES",
+      entryOrder: {
+        kind: "ENTRY",
+        intentId: "sb-entry-0",
+        orderId: "order-1",
+        state: "WORKING",
+        outcome: "YES",
+        side: "BUY",
+        limitPrice: "0.35",
+        requestedShares: "50",
+        filledShares: "0",
+        viewFilledShares: "0",
+        placedAtMs: NOW_MS,
+        escalated: true,
+      },
+    });
+    const view = {
+      orderId: "order-1",
+      marketId: "018f4a7e-1111-7abc-8def-0123456789ab",
+      outcome: "YES",
+      side: "BUY",
+      price: "0.35",
+      requestedShares: "50",
+      filledShares: "50",
+      status: "FILLED",
+      placedAt: T_NOW,
+    };
+    const first = staticBracketStrategy.onOrderUpdate(context(params(), state, {}), view as never);
+    expect(first.reasonCodes).not.toContain(REASONS.halted);
+    const afterFirst = nextState(state, first);
+    expect((afterFirst.entryOrder as OrderTrack).state).toBe("FILLED");
+    expect(first.reasonCodes).toContain(REASONS.awaitingFillAllocation);
+
+    const second = staticBracketStrategy.onOrderUpdate(
+      context(params(), afterFirst, {}),
+      view as never,
+    );
+    expect(second.reasonCodes).not.toContain(REASONS.halted);
+    expect(second.reasonCodes).toContain(REASONS.terminalOrderViewAbsorbed);
+    // Still awaiting the fill, still terminal, still no allocation from a view.
+    expect(second.reasonCodes).toContain(REASONS.awaitingFillAllocation);
+    const afterSecond = nextState(afterFirst, second);
+    expect((afterSecond.entryOrder as OrderTrack).state).toBe("FILLED");
+    expect((afterSecond.entryOrder as OrderTrack).filledShares).toBe("0");
+    expect(afterSecond.allocatedShares).toBe("0");
+    expect(afterSecond.haltReason).toBeNull();
+
+    // A LATER view reporting MORE executed size improves the evidence; one
+    // reporting less never rolls it back.
+    const more = staticBracketStrategy.onOrderUpdate(
+      context(params(), afterSecond, {}),
+      { ...view, filledShares: "50" } as never,
+    );
+    expect((nextState(afterSecond, more).entryOrder as OrderTrack).viewFilledShares).toBe("50");
+    const fewer = staticBracketStrategy.onOrderUpdate(
+      context(params(), afterSecond, {}),
+      { ...view, filledShares: "10" } as never,
+    );
+    expect((nextState(afterSecond, fewer).entryOrder as OrderTrack).viewFilledShares).toBe("50");
+  });
+
+  it("and the exits still work afterwards — the halt's real cost", () => {
+    // What the halt actually did: the position stayed on the books and every
+    // protection was dead. After the absorption the stop still fires.
+    const track = terminalTrack("EXIT", "CANCELED");
+    const state = stateWith({
+      instanceState: "EXIT_WORKING",
+      legOutcome: "YES",
+      allocatedShares: "50",
+      allocatedCost: "17.5",
+      entriesExecuted: 1,
+      openedAtMs: NOW_MS - 1000,
+      exitOrder: track,
+    });
+    const views = { yesShares: "50", features: { [STOP_KEY]: "0.1" } };
+    const repeated = staticBracketStrategy.onOrderUpdate(context(params(), state, views), {
+      orderId: "order-1",
+      marketId: "018f4a7e-1111-7abc-8def-0123456789ab",
+      outcome: "YES",
+      side: "SELL",
+      price: "0.5",
+      requestedShares: "50",
+      filledShares: "0",
+      status: "CANCELED",
+      placedAt: T_NOW,
+    } as never);
+    expect(repeated.reasonCodes).not.toContain(REASONS.halted);
+    const stopped = staticBracketStrategy.onFeatures(
+      context(params(), nextState(state, repeated), views),
+    );
+    expect(stopped.decisionType).toBe("reduce");
+    expect(places(stopped)).toBe(1);
   });
 });
 

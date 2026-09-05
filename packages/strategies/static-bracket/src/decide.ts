@@ -21,7 +21,12 @@
  *  4. **Position agreement before any position-changing exit (§6 invariant
  *     12).** A protected reduction is emitted only when the virtual position
  *     equals the strategy's own confirmed allocation. A disagreement cancels
- *     and reconciles instead of flattening.
+ *     and reconciles instead of flattening. EVERY exit — take-profit and
+ *     protected reduction alike — is a `POSITION` DELTA naming this bracket's
+ *     own leg and no more than its own confirmed open allocation; see
+ *     {@link planProtectedReduce} for why a §7.7 `REDUCE_POSITION`, whose
+ *     `targetShares` is a per-side sell-down level for the WHOLE market, cannot
+ *     express what a strategy that owns a slice of a market means.
  *  5. **End of market**, then **stop**, then **holding timeout**, then
  *     **take-profit maintenance** — the exits, most urgent first.
  *  6. **Entry**, last, and only from ARMED.
@@ -162,7 +167,7 @@ function syncPlannedToWorking(
   if (track === null || track.state !== "WORKING") return state;
   const expected = kind === "ENTRY" ? "ENTRY_PLANNED" : "EXIT_PLANNED";
   if (state.instanceState !== expected) return state;
-  // MOVE-SITE: syncPlannedToWorking
+  // MOVE-SITE: syncPlannedToWorking TRIGGERS: ENTRY_ORDER_WORKING EXIT_ORDER_WORKING
   const moved = move(state, kind === "ENTRY" ? "ENTRY_ORDER_WORKING" : "EXIT_ORDER_WORKING");
   return moved.ok ? moved.value : state;
 }
@@ -325,7 +330,7 @@ function incidentPlan(
           : withState(next, { exitOrder: moved.value });
     }
   }
-  // MOVE-SITE: incidentPause
+  // MOVE-SITE: incidentPause TRIGGERS: PAUSE
   const paused = move(next, "PAUSE", {
     resumeTo: state.instanceState,
     lastIncident: quality.detail,
@@ -465,7 +470,7 @@ export function planTick(input: TickContext): Plan {
   let current = state;
   const resumeReasons: string[] = [];
   if (current.instanceState === "PAUSED") {
-    // MOVE-SITE: resume
+    // MOVE-SITE: resume TRIGGERS: RESUME
     const resumed = move(current, "RESUME", { resumeTo: null, lastIncident: null });
     if (!resumed.ok) {
       return halted(current, resumed.problem, []);
@@ -485,7 +490,7 @@ export function planTick(input: TickContext): Plan {
   // rule 5) and is applied in `planClosing`; here the only question is whether
   // the bracket is finished.
   if (timeToCloseMs !== null && timeToCloseMs <= 0 && !hasAllocation(current)) {
-    // MOVE-SITE: marketClosed
+    // MOVE-SITE: marketClosed TRIGGERS: MARKET_CLOSED
     const closed = move(current, "MARKET_CLOSED", { closedAtMs: observation.nowMs });
     if (closed.ok) {
       return plan(closed.value, "hold", [...resumeReasons, REASONS.marketClosed]);
@@ -495,7 +500,7 @@ export function planTick(input: TickContext): Plan {
 
   switch (current.instanceState) {
     case "DORMANT": {
-      // MOVE-SITE: arm
+      // MOVE-SITE: arm TRIGGERS: ARM
       const armed = move(current, "ARM");
       if (!armed.ok) return halted(current, armed.problem, []);
       return plan(armed.value, "hold", [...resumeReasons, REASONS.armed]);
@@ -640,6 +645,16 @@ function planEntry(
   carried: readonly string[],
 ): Plan {
   const reasons = [...carried];
+
+  // STRUCTURAL, not economic: an instance with an order still in flight has
+  // already asked the venue for something and may not ask again. The §13.2 risk
+  // and reentry bounds happen to refuse these shapes too — the position
+  // projection is `held + size` and the entry count is spent — but that is an
+  // arithmetic coincidence of the example configuration, and a configuration
+  // with slack in both would have entered on top of a live order.
+  if (workingOrders(state).length > 0) {
+    return plan(state, "hold", [...reasons, REASONS.refusedOrderInFlight]);
+  }
 
   if (state.entriesExecuted >= params.reentry.maximum_entries_per_market) {
     return plan(state, "hold", [...reasons, REASONS.refusedMaxEntries]);
@@ -791,7 +806,7 @@ function planEntry(
     placedAtMs: observation.nowMs,
     escalated: aggressive,
   });
-  // MOVE-SITE: entryTriggerMet
+  // MOVE-SITE: entryTriggerMet TRIGGERS: ENTRY_TRIGGER_MET
   const moved = move(state, "ENTRY_TRIGGER_MET", {
     entryOrder: track,
     intentSequence: state.intentSequence + 1,
@@ -1009,7 +1024,7 @@ function planEntryOrderManagement(
     const trigger: InstanceTrigger = isZero(openShares(state))
       ? "ENTRY_ABANDONED"
       : "ENTRY_ORDER_TERMINAL_PARTIAL";
-    // MOVE-SITE: entryAbandoned
+    // MOVE-SITE: entryAbandoned TRIGGERS: ENTRY_ABANDONED ENTRY_ORDER_TERMINAL_PARTIAL
     const moved = move(state, trigger);
     return moved.ok
       ? plan(moved.value, "hold", [...reasons, REASONS.entryOrderTerminal])
@@ -1245,7 +1260,7 @@ function settleTerminalOrder(
       };
     }
     if (!folded) {
-      // MOVE-SITE: entryTerminalUnfilled
+      // MOVE-SITE: entryTerminalUnfilled TRIGGERS: ENTRY_ORDER_TERMINAL_UNFILLED
       const moved = move(state, "ENTRY_ORDER_TERMINAL_UNFILLED", { entryOrder: null });
       return {
         state: moved.ok ? moved.value : withState(state, { entryOrder: null }),
@@ -1257,7 +1272,7 @@ function settleTerminalOrder(
       state.instanceState === "ENTRY_PLANNED" ||
       state.instanceState === "ENTRY_WORKING"
     ) {
-      // MOVE-SITE: entryTerminalPartial
+      // MOVE-SITE: entryTerminalPartial TRIGGERS: ENTRY_ORDER_TERMINAL_PARTIAL
       const moved = move(state, "ENTRY_ORDER_TERMINAL_PARTIAL", { entryOrder: null });
       if (moved.ok) {
         return { state: moved.value, reasons: [REASONS.entryOrderTerminal] };
@@ -1280,7 +1295,7 @@ function settleTerminalOrder(
     // The exit order is gone and the allocation is not: the position is open
     // again and re-plannable. The trigger differs by state because the §13.3
     // table names a different edge out of each.
-    // MOVE-SITE: exitTerminal
+    // MOVE-SITE: exitTerminal TRIGGERS: EXIT_ABANDONED EXIT_ORDER_TERMINAL_UNFILLED
     const moved = move(cleared, trigger);
     if (moved.ok) {
       return { state: moved.value, reasons: [REASONS.exitOrderTerminal] };
@@ -1354,13 +1369,14 @@ export function stopTriggerSatisfied(
  * §6 invariant 12, as a precondition, in two strengths because the two exit
  * shapes need different things to be true:
  *
- * - `positionAgrees` (EQUALITY) gates a REDUCE_POSITION to flat. That intent
- *   acts on the whole position, so flattening while the virtual position
- *   disagrees with the confirmed allocation would either sell shares the
- *   instance never allocated or believe it closed something it did not.
- * - `positionCovers` (AT LEAST) gates the DELTA-sized take-profit, whose size
- *   comes from the instance's own allocation. Unwinding N of an exposure of N or
- *   more is safe; unwinding N of an exposure of less is not.
+ * - `positionAgrees` (EQUALITY) gates the PROTECTED REDUCTION. That exit is the
+ *   last action the bracket takes before abandoning the position, and it is
+ *   taken under duress (a stop, a timeout, a close), so it demands that the
+ *   virtual position and the confirmed allocation say the same number. A
+ *   disagreement cancels and reconciles instead.
+ * - `positionCovers` (AT LEAST) gates the take-profit, whose size comes from the
+ *   instance's own allocation. Unwinding N of an exposure of N or more is safe;
+ *   unwinding N of an exposure of less is not.
  *
  * Both are measured on {@link legExposure} — the instance's OWN exposure, net of
  * the inventory the bracket started from — and NOT on the raw holding. That is
@@ -1370,12 +1386,28 @@ export function stopTriggerSatisfied(
  * inventory rather than by the bracket, and would wave through an exit for a
  * short that does not exist.
  *
- * Both read the position view supplied WITH the evaluation. §8.1 orders the
- * loop "update local market/account state -> update feature snapshots -> invoke
- * subscribed strategies", so the view an `onFill` evaluation sees must already
- * include that fill. That is a composition-root obligation (WP-230), recorded
- * in this package's README: a wiring that lags the position behind the fill
- * stream will see this gate refuse exits it should have allowed.
+ * WHAT A LAGGING POSITION VIEW DOES TO EACH GATE, IN BOTH DIRECTIONS. Both read
+ * the position view supplied WITH the evaluation, and §8.1 orders the loop
+ * "update local market/account state -> update feature snapshots -> invoke
+ * subscribed strategies", so an `onFill` evaluation's view must already include
+ * that fill (a composition-root obligation, WP-230, recorded in this package's
+ * README). When it does not:
+ *
+ * - a view that lags the FIRST entry fill records a LOW `legBaselineShares`,
+ *   which makes every later `legExposure` read HIGH by the lag. `positionAgrees`
+ *   then fails (it wants equality) and refuses — fail-closed. `positionCovers`
+ *   is satisfied by the inflated measurement, which is the OVER-PERMISSIVE
+ *   direction and is why the raw check below exists;
+ * - a view that lags a LATER fill reads `legExposure` LOW, and both gates refuse
+ *   — fail-closed, at the cost of a delayed exit.
+ *
+ * The raw check is the second half of `positionCovers`: a SELL-side exit also
+ * requires the RAW holding of the traded leg to cover the shares it is about to
+ * sell, because no bookkeeping makes it possible to sell shares that are not
+ * there. A BUY-side (complement) exit has no such requirement — it spends
+ * collateral, not shares — so the raw check is not applied to it, and no
+ * legitimate flow is narrowed: a direct bracket that really holds its
+ * allocation passes it by construction.
  */
 function positionAgrees(
   params: StaticBracketParams,
@@ -1400,7 +1432,16 @@ function positionCovers(
   if (!exposure.ok) return exposure;
   const ordering = compare(exposure.value, expected, "position coverage");
   if (!ordering.ok) return ordering;
-  return ok(ordering.value >= 0);
+  if (ordering.value < 0) return ok(false);
+  const posture = legPosture(params, state);
+  if (posture.exitSide !== "SELL") return ok(true);
+  const held = compare(
+    heldShares(observation, posture.leg),
+    expected,
+    "raw holding coverage",
+  );
+  if (!held.ok) return held;
+  return ok(held.value >= 0);
 }
 
 function planExit(
@@ -1436,7 +1477,7 @@ function planExit(
       state.instanceState === "EXIT_PLANNED" || state.instanceState === "EXIT_WORKING"
         ? "EXIT_FILL_COMPLETE"
         : "POSITION_FLAT";
-    // MOVE-SITE: bracketFinished
+    // MOVE-SITE: bracketFinished TRIGGERS: EXIT_FILL_COMPLETE POSITION_FLAT
     const moved = move(state, trigger, {
       closedAtMs: observation.nowMs,
       exitOrder: null,
@@ -1602,7 +1643,7 @@ function planTakeProfit(
     placedAtMs: observation.nowMs,
     escalated: false,
   });
-  // MOVE-SITE: takeProfitPlaced
+  // MOVE-SITE: takeProfitPlaced TRIGGERS: EXIT_TRIGGER_MET
   const moved = move(state, "EXIT_TRIGGER_MET", {
     exitOrder: track,
     intentSequence: state.intentSequence + 1,
@@ -1625,8 +1666,8 @@ function planTakeProfit(
 }
 
 /**
- * A protected reduction (§9.9 `PROTECTED_REDUCE`): flatten this instance's
- * allocation under the configured price floor.
+ * A protected reduction (§9.9 `PROTECTED_REDUCE`): unwind this instance's OWN
+ * allocation, on its OWN leg, under the configured price floor.
  *
  * `exit.stop.minimum_sell_price` and `exit.stop.urgency` are the floor and the
  * urgency of EVERY protected reduction this strategy emits — the stop trigger,
@@ -1635,16 +1676,56 @@ function planTakeProfit(
  * fields are required even when the stop trigger is disabled: a reduction
  * without a stated floor would be a blind market sale.
  *
- * ON THE COMPLEMENT LEG THE REDUCTION IS A BUY-BACK. The instance's attributed
- * position is the same in both cases — `open` shares of exposure in the
- * configured direction — and `targetShares: "0"` means the same thing in both:
- * flatten it. What differs is the executable side, and §7.7 gives
- * `ReducePositionIntent` both a `minimumSellPrice` and a `maximumBuyPrice` for
- * exactly that reason. A direct bracket sells its token no cheaper than
- * `exit.stop.minimum_sell_price`; a complement bracket buys its token back no
- * dearer than the complement of that floor, which is the same economic level.
- * Carrying the raw floor as a `minimumSellPrice` on a complement bracket would
- * describe selling still more of a token the instance is already short.
+ * WHY THIS IS A `POSITION` DELTA AND NOT A `REDUCE_POSITION`. §7.7's
+ * `ReducePositionIntent` carries a `targetShares` that is a per-side SELL-DOWN
+ * LEVEL for the whole market — `packages/execution-planner`'s
+ * `buildReductionPlan` loops BOTH sides, sells the excess over that level on
+ * each, and reads only `minimumSellPrice`. That instrument cannot express what
+ * this strategy means, in two ways that were both reproduced end to end through
+ * the merged planner:
+ *
+ * 1. ON THE COMPLEMENT LEG IT IS THE WRONG DIRECTION. A complement bracket
+ *    established exposure by SELLING a token it owned, so its exit BUYS that
+ *    token back; a reduction to a level can only SELL. The planner turned the
+ *    complement stop into `SELL 50 NO` — a second entry at double the size —
+ *    and silently dropped the `maximumBuyPrice` the intent carried, because
+ *    the reduce path never reads it.
+ * 2. ON EITHER LEG IT NAMES SHARES THIS BRACKET NEVER CREATED. The level
+ *    applies to every side actually held, so a bracket holding inventory it did
+ *    not open — the ordinary case under
+ *    `PREFER_CHEAPEST_WITH_INVENTORY` — had that inventory sold too (a direct
+ *    YES bracket holding 100 NO planned `SELL 50 YES` AND `SELL 100 NO`). §6
+ *    invariant 7 separates actual account state from virtual strategy
+ *    attribution, and §13.3 rule 1 sizes an exit from the confirmed allocation:
+ *    an instance that owns a slice of a market may not act on the whole of it.
+ *
+ * A `POSITION` DELTA says exactly what is meant and nothing more: this leg,
+ * this many shares, this side, this price bound. It is the same shape
+ * {@link planTakeProfit} already emits, so both exits are read the same way.
+ *
+ * INTERPRETATION — the fields `PositionIntent` requires and
+ * `ReducePositionIntent` does not have:
+ *
+ * - `urgency`: carried VERBATIM. §7.7's `ReductionUrgency`
+ *   (`NORMAL | AGGRESSIVE | IMMEDIATE`) is a strict subset of `PositionUrgency`,
+ *   so no value is invented or lost.
+ * - `liquidityPreference`: `TAKER_OK`, chosen because §9.10's posture table
+ *   makes `positionPosture(TAKER_OK, u)` equal `reductionPosture(u)` for every
+ *   one of the three reduction urgencies — the reduction executes exactly as it
+ *   would have. `MAKER_ONLY` would rest a protective exit; `TAKER_ONLY` would
+ *   cross even at `NORMAL`.
+ * - `partialFillPolicy`: `ACCEPT_ANY`, which is the rule the planner states for
+ *   a reduction in its own words — any partial reduction is progress toward the
+ *   target (§6 invariant 10).
+ * - `validUntil`: `entry.execution.order_validity_ms` from now, the same
+ *   horizon every other intent this strategy emits carries.
+ *
+ * WHAT IS LOST: `ReducePositionIntent.reason`, a free-text field with no
+ * counterpart on `PositionIntent`. The cause is preserved where this package
+ * already puts machine-readable causes — the decision's `reasonCodes`
+ * (`SB.STOP_TRIGGERED`, `SB.HOLDING_TIMEOUT`, `SB.EXIT_CUTOFF`) and its
+ * `modelOutputs.reduceCause` — and in the `sb.protected-reduce` tag on the
+ * intent itself.
  */
 function planProtectedReduce(
   params: StaticBracketParams,
@@ -1682,19 +1763,34 @@ function planProtectedReduce(
   if (!floor.ok) {
     return plan(state, "hold", [...reasons, REASONS.internalRefusal]);
   }
+  const validUntil = formatInstantMs(
+    observation.nowMs + params.entry.execution.order_validity_ms,
+    "validUntil",
+  );
+  if (!validUntil.ok) {
+    return plan(state, "hold", [...reasons, REASONS.internalRefusal]);
+  }
+  const id = intentId(state, "protected-reduce", observation.market.marketId);
   const intent: Intent = {
-    type: "REDUCE_POSITION",
+    type: "POSITION",
+    intentId: id,
     marketId: observation.market.marketId,
-    targetShares: ZERO,
-    urgency: params.exit.stop.urgency,
+    direction: leg,
+    targetMode: "DELTA",
+    // The DELTA's sign is the exit side and |delta| is the confirmed open
+    // allocation: a direct bracket sells back what it bought, a complement
+    // bracket buys back what it sold, and neither can name a share more.
+    targetShares: posture.exitSide === "SELL" ? `-${open}` : open,
     ...(posture.exitSide === "SELL"
       ? { minimumSellPrice: floor.value }
       : { maximumBuyPrice: floor.value }),
-    reason:
-      `static-bracket protected reduce (${cause}): leg=${leg} side=${posture.exitSide} ` +
-      `allocated=${open}`.slice(0, 2000),
+    urgency: params.exit.stop.urgency,
+    liquidityPreference: "TAKER_OK",
+    partialFillPolicy: "ACCEPT_ANY",
+    validUntil: validUntil.value,
+    tags: Object.freeze([TAGS.strategy, TAGS.protectedReduce, legTag(leg)]),
   };
-  // MOVE-SITE: protectedReduce
+  // MOVE-SITE: protectedReduce TRIGGERS: EXIT_TRIGGER_MET
   const moved = move(state, "EXIT_TRIGGER_MET", { intentSequence: state.intentSequence + 1 });
   if (!moved.ok) {
     return halted(state, moved.problem, []);
@@ -1704,7 +1800,12 @@ function planProtectedReduce(
     "reduce",
     [...reasons, REASONS.exitProportional, REASONS.finalProtectedReduce],
     [intent],
-    { exitShares: open, floor: floor.value, exitSide: posture.exitSide },
+    {
+      exitShares: open,
+      floor: floor.value,
+      exitSide: posture.exitSide,
+      reduceCause: cause.slice(0, 200),
+    },
   );
 }
 
@@ -1842,7 +1943,7 @@ function reconcilePlan(
       { expectedShares: openShares(state), heldShares: heldShares(observation, leg) },
     );
   }
-  // MOVE-SITE: reconcilePause
+  // MOVE-SITE: reconcilePause TRIGGERS: PAUSE
   const paused = move(next, "PAUSE", {
     resumeTo: state.instanceState,
     lastIncident: "position mismatch",
@@ -1905,7 +2006,7 @@ function planRearm(
       );
     }
   }
-  // MOVE-SITE: rearm
+  // MOVE-SITE: rearm TRIGGERS: REARM
   const moved = move(state, "REARM", {
     entryOrder: null,
     exitOrder: null,
@@ -1990,6 +2091,45 @@ function refuseTransition(
   return reconcilePlan(state, observation, [REASONS.illegalTransition], leg);
 }
 
+/**
+ * A CONFIRMED fill that arrives while the instance is PAUSED.
+ *
+ * THE FOLD IS SETTLEMENT ACCOUNTING, NOT A STATE TRANSITION. §6 invariant 5
+ * keeps order state and settlement state apart, and §6 invariant 10 with §13.3
+ * rule 1 make the confirmed allocation the only thing an exit may be sized
+ * from. §13.3 draws no edge out of `PAUSED` for a fill — correctly, because a
+ * paused instance must take no action — but a fill is not an action: it is a
+ * fact about money that has already moved. Consulting the machine first
+ * therefore refused the fill and left the instance recording an allocation of
+ * zero while it really held the position, which is precisely the state §6
+ * invariant 12 exists to prevent it from acting on.
+ *
+ * So the fold is applied and the instance STAYS PAUSED: same
+ * `instanceState`, same `resumeTo`, no transition, no intent, no exit sizing.
+ * The fold remains the single writer of `allocatedShares` and `exitedShares`,
+ * and replay is deterministic because nothing here depends on when the
+ * evaluation happened. When the data-quality condition clears, {@link planTick}
+ * resumes into `resumeTo` and the ordinary ladder sizes the exit from the
+ * allocation this fold recorded.
+ *
+ * INTERPRETATION: the alternative — holding the fill for replay on resume —
+ * would need a queue in the state document and would make the allocation
+ * depend on the order in which a resume and a fill happened to interleave. One
+ * fold, applied once, at the moment the fill is confirmed, is the version that
+ * keeps §6 invariant 8's rebuildability honest.
+ */
+function pausedFold(
+  state: StaticBracketState,
+  changes: Partial<StaticBracketState>,
+  carried: readonly string[],
+): Plan {
+  return plan(withState(state, changes), "hold", [
+    ...carried,
+    REASONS.fillFoldedWhilePaused,
+    REASONS.paused,
+  ]);
+}
+
 function applyEntryFill(
   params: StaticBracketParams,
   state: StaticBracketState,
@@ -2049,7 +2189,10 @@ function applyEntryFill(
     openedAtMs: state.openedAtMs ?? observation.nowMs,
     entriesExecuted: firstFill ? state.entriesExecuted + 1 : state.entriesExecuted,
   };
-  // MOVE-SITE: entryFill
+  if (state.instanceState === "PAUSED") {
+    return pausedFold(state, changes, [REASONS.allocated]);
+  }
+  // MOVE-SITE: entryFill TRIGGERS: ENTRY_FILL_COMPLETE ENTRY_PARTIAL_FILL
   const moved = move(
     state,
     complete.value ? "ENTRY_FILL_COMPLETE" : "ENTRY_PARTIAL_FILL",
@@ -2098,7 +2241,17 @@ function applyExitFill(
     exitedShares: exited.value,
     ...(flat ? { closedAtMs: observation.nowMs } : {}),
   };
-  // MOVE-SITE: exitFill
+  if (state.instanceState === "PAUSED") {
+    // `closedAtMs` is deliberately NOT recorded here: it is the cool-down
+    // anchor, and a bracket that has not reached CLOSED has not started
+    // cooling down. The resume path sets it when it takes the edge.
+    return pausedFold(
+      state,
+      { exitOrder: changes.exitOrder ?? null, exitedShares: exited.value },
+      [REASONS.exitFilled],
+    );
+  }
+  // MOVE-SITE: exitFill TRIGGERS: EXIT_FILL_COMPLETE EXIT_PARTIAL_FILL
   const moved = move(state, flat ? "EXIT_FILL_COMPLETE" : "EXIT_PARTIAL_FILL", changes);
   if (!moved.ok) {
     return refuseTransition(state, observation, currentLeg(params, state));
@@ -2124,6 +2277,10 @@ export function planOrderUpdate(
     return plan(state, "hold", [REASONS.idle]);
   }
   const track = kind === "ENTRY" ? (state.entryOrder as OrderTrack) : (state.exitOrder as OrderTrack);
+  const absorbed = absorbTerminalView(state, kind, track, view);
+  if (absorbed !== null) {
+    return absorbed;
+  }
   const moved = moveOrder(
     // `viewFilledShares` is EVIDENCE, not allocation: it records that the venue
     // says something executed, so a terminal order can be told apart from one
@@ -2164,6 +2321,56 @@ export function planOrderUpdate(
     return plan(next, "hold", reasons);
   }
   return finishOrder(next, kind, reasons);
+}
+
+/**
+ * A REPEATED view for an order this instance already tracks as TERMINAL.
+ *
+ * §8.1 orders nothing between an order view and the fill it describes, and
+ * nothing in §9.6 or the SDK promises at-most-once delivery of a view; the
+ * sub-machine already tolerates a repeated `WORKING` view with its own
+ * `WORKING --OBSERVED_WORKING--> WORKING` self-edge. A terminal state, by
+ * contrast, correctly has NO outgoing edge — so asking the sub-machine to move
+ * out of one made an ordinary second `FILLED` message HALT the instance, with
+ * the position still on the books and the stop, the timeout and the close
+ * cutoff all dead behind {@link planTick}'s halt short-circuit.
+ *
+ * The answer is to ABSORB the view rather than to widen the machine (which
+ * would make "terminal" mean something weaker for every reader of the table):
+ *
+ * - the sub-machine is NOT consulted, so no illegal move and no halt;
+ * - the view's `filledShares` is folded as EVIDENCE when it reports MORE than
+ *   the evidence already recorded, and never as allocation (§13.3 rule 1 — the
+ *   exit is still sized only from confirmed fills, `foldFillIntoOrder`);
+ * - the terminal order is then settled through the one routine that owns that
+ *   decision, exactly as an evaluation would (it is idempotent: a bracket that
+ *   has already left the entry states neither transitions again nor loses the
+ *   allocation).
+ *
+ * `null` means the track is not terminal and the ordinary path applies.
+ */
+function absorbTerminalView(
+  state: StaticBracketState,
+  kind: "ENTRY" | "EXIT",
+  track: OrderTrack,
+  view: TrackedOrderView,
+): Plan | null {
+  if (!TERMINAL_ORDER_STATES.includes(track.state)) return null;
+  const better = compare(view.filledShares, track.viewFilledShares, "order view evidence");
+  const evidence = better.ok && better.value > 0 ? view.filledShares : track.viewFilledShares;
+  const updated = Object.freeze({
+    ...track,
+    orderId: track.orderId ?? view.orderId,
+    viewFilledShares: evidence,
+  });
+  const next =
+    kind === "ENTRY"
+      ? withState(state, { entryOrder: updated })
+      : withState(state, { exitOrder: updated });
+  return finishOrder(next, kind, [
+    kind === "ENTRY" ? REASONS.entryOrderWorking : REASONS.exitOrderWorking,
+    REASONS.terminalOrderViewAbsorbed,
+  ]);
 }
 
 function attributeOrder(
@@ -2239,7 +2446,7 @@ export function planResolved(
         : REASONS.resolutionHoldDisallowed,
     );
   }
-  // MOVE-SITE: marketResolved
+  // MOVE-SITE: marketResolved TRIGGERS: MARKET_RESOLVED
   const moved = move(state, "MARKET_RESOLVED", {
     closedAtMs: observation.nowMs,
     entryOrder: null,

@@ -41,6 +41,14 @@ export const REASONS = {
    * instance neither re-enters nor sizes anything from the view: it waits.
    */
   awaitingFillAllocation: "SB.AWAITING_FILL_ALLOCATION",
+  /**
+   * A repeated order view for an order this instance already tracks as
+   * TERMINAL. §8.1 promises no at-most-once delivery, so a second `FILLED`
+   * view is ordinary traffic, not a contradiction: the evidence is folded and
+   * the sub-machine is not consulted (a terminal state has no outgoing edge,
+   * and asking it for one used to HALT the instance with an open position).
+   */
+  terminalOrderViewAbsorbed: "SB.TERMINAL_ORDER_VIEW_ABSORBED",
 
   // entry refusals
   refusedCostCap: "SB.REFUSED_MAXIMUM_TOTAL_COST",
@@ -56,9 +64,23 @@ export const REASONS = {
   refusedCooldown: "SB.REFUSED_COOLDOWN",
   refusedTriggerUnusable: "SB.REFUSED_TRIGGER_UNUSABLE",
   refusedTriggerAbsent: "SB.REFUSED_TRIGGER_ABSENT",
+  /**
+   * An entry was refused because this instance still has an order in flight.
+   * Structural, not economic: the risk caps happened to answer these shapes
+   * before, which made the refusal a coincidence rather than a rule.
+   */
+  refusedOrderInFlight: "SB.REFUSED_ORDER_IN_FLIGHT",
 
   // holding and exit
   allocated: "SB.ALLOCATION_CONFIRMED",
+  /**
+   * A CONFIRMED fill folded into the allocation while the instance was PAUSED.
+   * Settlement accounting is not a state transition (§6 invariant 5): the
+   * allocation is updated, the instance stays PAUSED, and no intent is emitted
+   * until it resumes. Discarding the fill instead left the instance believing
+   * it held nothing while it held the position (§6 invariant 10).
+   */
+  fillFoldedWhilePaused: "SB.FILL_FOLDED_WHILE_PAUSED",
   exitProportional: "SB.EXIT_SIZED_TO_ALLOCATION",
   takeProfitPlaced: "SB.TAKE_PROFIT_INTENT",
   takeProfitReplaced: "SB.TAKE_PROFIT_REPLACED",
@@ -108,6 +130,8 @@ export const TAGS = {
   strategy: "static-bracket",
   entry: "sb.entry",
   takeProfit: "sb.take-profit",
+  /** Carried by every protected reduction, whatever triggered it. */
+  protectedReduce: "sb.protected-reduce",
   stop: "sb.stop",
   final: "sb.final",
 } as const;

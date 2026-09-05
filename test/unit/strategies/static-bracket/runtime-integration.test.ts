@@ -39,6 +39,7 @@ import {
   evaluationInput,
   fillPayload,
   order,
+  protectedReductions,
   type ViewOptions,
 } from "./helpers.js";
 
@@ -267,9 +268,8 @@ describe("through the real runtime — re-entry runs a SECOND complete bracket",
     expect(filled.kind === "DECIDED" && filled.record.decision.decisionType).toBe("exit");
     if (filled.kind === "DECIDED") {
       expect(filled.record.decision.reasonCodes).not.toContain("SB.HOLDING_TIMEOUT");
-      expect(
-        filled.record.decision.intents.some((intent) => intent.type === "REDUCE_POSITION"),
-      ).toBe(false);
+      // FORCING FINDING r2-B1: read through the tag, not the intent type.
+      expect(protectedReductions(filled.record.decision)).toHaveLength(0);
     }
     expect(currentState(store)["instanceState"]).toBe("EXIT_PLANNED");
   });
@@ -475,7 +475,11 @@ describe("through the real runtime — the stale-data path", () => {
       expect(decision.reasonCodes).toContain("SB.INCIDENT_POLICY_FIRST");
       expect(decision.reasonCodes).toContain("SB.STOP_SUPPRESSED_STALE_DATA");
       expect(decision.reasonCodes).toContain("SB.NO_BLIND_FLATTEN");
-      expect(decision.intents.filter((intent) => intent.type === "REDUCE_POSITION")).toHaveLength(0);
+      // FORCING FINDING r2-B1: a protected reduction is a tagged POSITION delta
+      // now, so "no reduction was emitted" is asserted on the tag AND on the
+      // absence of any position-changing intent at all.
+      expect(protectedReductions(decision)).toHaveLength(0);
+      expect(decision.intents.filter((intent) => intent.type === "POSITION")).toHaveLength(0);
       expect(decision.intents.filter((intent) => intent.type === "CANCEL")).toHaveLength(1);
     }
     expect(currentState(store)["instanceState"]).toBe("PAUSED");
@@ -487,9 +491,10 @@ describe("through the real runtime — the stale-data path", () => {
       features: { [STOP_KEY]: "0.2" },
     });
     if (stillPaused.kind === "DECIDED") {
-      expect(stillPaused.record.decision.intents.filter((intent) => intent.type === "REDUCE_POSITION")).toHaveLength(
-        0,
-      );
+      expect(protectedReductions(stillPaused.record.decision)).toHaveLength(0);
+      expect(
+        stillPaused.record.decision.intents.filter((intent) => intent.type === "POSITION"),
+      ).toHaveLength(0);
     }
     expect(currentState(store)["instanceState"]).toBe("PAUSED");
 
@@ -525,11 +530,12 @@ describe("through the real runtime — the stale-data path", () => {
     if (stopped.kind === "DECIDED") {
       expect(stopped.record.decision.decisionType).toBe("reduce");
       expect(stopped.record.decision.reasonCodes).toContain("SB.STOP_TRIGGERED");
-      const reduction = stopped.record.decision.intents.find(
-        (intent) => intent.type === "REDUCE_POSITION",
-      );
+      const reduction = protectedReductions(stopped.record.decision)[0];
       expect(reduction).toBeDefined();
-      expect((reduction as { targetShares: string }).targetShares).toBe("0");
+      // FORCING FINDING r2-B1(b): a signed DELTA on this bracket's own leg,
+      // never a market-wide sell-down level of "0".
+      expect((reduction as { direction: string }).direction).toBe("YES");
+      expect((reduction as { targetShares: string }).targetShares).toBe("-50");
       expect((reduction as { minimumSellPrice?: string }).minimumSellPrice).toBe("0.26");
     }
     // Every evaluation produced exactly one STRATEGY-attributed record: no
@@ -677,6 +683,102 @@ describe("through the real runtime — determinism and safety", () => {
     expect(first.bytes).toContain("sb.leg:YES");
     expect(first.bytes).toContain("SB.REARMED");
     expect(first.bytes).toContain("SB.ENTRY_LEG_COMPLEMENT");
+  });
+
+  /**
+   * DETERMINISM OVER THE TWO LIFECYCLES REVIEW ROUND 2 ADDED.
+   *
+   * 1. A COMPLEMENT-LEG PROTECTED REDUCTION (r2-B1): a bracket that established
+   *    YES exposure by SELLING NO, stopped out, and unwound by BUYING that NO
+   *    back. Before the remediation this path emitted a market-scoped
+   *    `REDUCE_POSITION` that the merged planner turned into a further SALE of
+   *    the token the bracket was already short.
+   * 2. A FILL THAT ARRIVES WHILE THE INSTANCE IS PAUSED (r2-M1), followed by a
+   *    resume. Before the remediation the fill was discarded and the instance
+   *    resumed believing it held nothing.
+   *
+   * Both are byte-identical across repeats and across run seeds, because the
+   * fold depends on the fill and not on when the evaluation happened.
+   */
+  it("is byte-identical over a complement-leg REDUCTION and a fill-while-PAUSED episode", () => {
+    const complementConfig = (): Record<string, unknown> => {
+      const config = baseConfig();
+      (config["entry"] as Record<string, unknown>)["economic_leg_policy"] =
+        "PREFER_CHEAPEST_WITH_INVENTORY";
+      return config;
+    };
+    const CHEAP_NO: ViewOptions = {
+      noShares: "100",
+      no: { bids: [["0.7", "2000"]], asks: [["0.72", "2000"]] },
+    };
+    const STALE_NO: ViewOptions = {
+      ...CHEAP_NO,
+      noShares: "100",
+      no: {
+        bids: [["0.7", "2000"]],
+        asks: [["0.72", "2000"]],
+        asOf: "2026-03-04T12:04:50.000Z",
+      },
+    };
+    const noEntryOrder = (overrides: Record<string, unknown> = {}) =>
+      order({ orderId: "no-1", outcome: "NO", side: "SELL", price: "0.65", ...overrides });
+
+    const script = (runSeed: string): { bytes: string; evaluations: number } => {
+      const clock = new ManualClock();
+      const sink = new RecordingSink();
+      const created = createStrategyInstanceRuntime({
+        strategy: staticBracketStrategy,
+        params: complementConfig(),
+        run: { runId: RUN_ID, instanceId: INSTANCE_ID, configId: CONFIG_ID, runSeed },
+        watchdog: { evaluationBudgetUs: 500_000 },
+        clock,
+        decisionSink: sink,
+        checkpointStore: new RecordingStore(),
+      });
+      if (!created.ok) throw new Error("the runtime must accept the configuration");
+      const runtime = created.runtime;
+
+      step(runtime, "onStart", CHEAP_NO);
+      step(runtime, "onFeatures", CHEAP_NO);
+      step(
+        runtime,
+        "onOrderUpdate",
+        { ...CHEAP_NO, orders: [noEntryOrder()] },
+        { order: noEntryOrder() },
+      );
+      // The book goes stale BEFORE the entry fill arrives: the instance pauses,
+      // and the fill lands on a PAUSED instance.
+      step(runtime, "onFeatures", STALE_NO);
+      step(
+        runtime,
+        "onFill",
+        { ...STALE_NO, noShares: "50" },
+        fillPayload({ orderId: "no-1", outcome: "NO", side: "SELL", price: "0.7", shares: "50" }),
+      );
+      // Data recovers with the stop deep in the money: resume, then reduce.
+      step(runtime, "onFeatures", { ...CHEAP_NO, noShares: "50", features: { [STOP_KEY]: "0.1" } });
+      step(runtime, "onFeatures", { ...CHEAP_NO, noShares: "50", features: { [STOP_KEY]: "0.1" } });
+      step(runtime, "onFeatures", { ...CHEAP_NO, noShares: "50", features: { [STOP_KEY]: "0.1" } });
+      return {
+        bytes: JSON.stringify(sink.calls.map((call) => call.record.decision)),
+        evaluations: sink.calls.length,
+      };
+    };
+
+    const first = script(RUN_SEED);
+    expect(first.evaluations).toBe(8);
+    expect(script(RUN_SEED).bytes).toBe(first.bytes);
+    expect(script("999999999").bytes).toBe(first.bytes);
+
+    // The episode really did fold a fill while paused and really did reduce on
+    // the complement leg — a determinism assertion over a lifecycle that never
+    // happened would be worth nothing.
+    expect(first.bytes).toContain("SB.FILL_FOLDED_WHILE_PAUSED");
+    expect(first.bytes).toContain("SB.RESUMED");
+    expect(first.bytes).toContain("SB.STOP_TRIGGERED");
+    expect(first.bytes).toContain("sb.protected-reduce");
+    expect(first.bytes).not.toContain("REDUCE_POSITION");
+    expect(first.bytes).not.toContain("SB.HALTED");
   });
 
   it("emits only intents — never an order, a credential, or a venue call", () => {

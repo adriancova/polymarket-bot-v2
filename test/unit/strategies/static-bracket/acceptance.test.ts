@@ -33,6 +33,7 @@ import {
   context,
   order,
   parsedParams,
+  protectedReductions,
   stateWith,
   type ViewOptions,
 } from "./helpers.js";
@@ -59,7 +60,23 @@ function positionIntents(decision: DecisionResult): Intent[] {
   return [...decision.intents].filter((intent) => intent.type === "POSITION");
 }
 
-function reduceIntents(decision: DecisionResult): Intent[] {
+/**
+ * The protected reductions of a decision.
+ *
+ * FORCING FINDING r2-B1: this used to filter for `type === "REDUCE_POSITION"`.
+ * That intent's `targetShares` is a per-side sell-down level for the whole
+ * market, so the merged planner turned a complement-leg reduction into a SELL
+ * of the token the bracket is already short and sold untraded-side inventory on
+ * either leg. Every exit is now a `POSITION` delta; a protected reduction is
+ * identified by its `sb.protected-reduce` tag, which keeps both the positive
+ * and the NEGATIVE assertions below meaningful.
+ */
+function reduceIntents(decision: DecisionResult): readonly Intent[] {
+  return protectedReductions(decision);
+}
+
+/** Emitting a §7.7 `REDUCE_POSITION` at all is now the regression (r2-B1). */
+function rawReduceIntents(decision: DecisionResult): Intent[] {
   return [...decision.intents].filter((intent) => intent.type === "REDUCE_POSITION");
 }
 
@@ -68,6 +85,43 @@ function cancelIntents(decision: DecisionResult): Intent[] {
 }
 
 const ARMED = stateWith({ instanceState: "ARMED" });
+
+/**
+ * THE EXPOSURE INVARIANT, checked on an emitted exit against the bracket it
+ * belongs to: the exit must trade the OPPOSITE way to the entry, on the SAME
+ * leg, and may never name more than the confirmed open allocation.
+ *
+ * FORCING FINDING r2-B1(d): it used to be applied to the take-profit only —
+ * the shape whose delta it could read. The protected reduction was a
+ * `REDUCE_POSITION`, which has no direction and no delta, so the one exit that
+ * fires under duress was outside the invariant. Every exit now carries a
+ * direction and a signed delta, so every exit is inside it.
+ */
+function assertReducesExposure(
+  intent: Intent,
+  entry: { readonly direction: "YES" | "NO"; readonly targetShares: string },
+  open: string,
+): void {
+  expect(intent.type, "an exit is a POSITION delta, never a market-scoped reduction").toBe(
+    "POSITION",
+  );
+  const position = intent as Extract<Intent, { type: "POSITION" }>;
+  expect(position.direction, "an exit trades the leg the entry established").toBe(entry.direction);
+  expect(position.targetMode).toBe("DELTA");
+  const entrySign = entry.targetShares.startsWith("-") ? -1 : 1;
+  const exitSign = position.targetShares.startsWith("-") ? -1 : 1;
+  expect(exitSign, "an exit must trade the opposite way to its entry").toBe(-entrySign);
+  const magnitude = position.targetShares.replace("-", "");
+  expect(Number(magnitude), "an exit may never exceed the confirmed open allocation").toBeLessThanOrEqual(
+    Number(open),
+  );
+  // A SELL exit is bounded below and a BUY exit above; never both, never neither.
+  const floors = [position.minimumSellPrice, position.maximumBuyPrice].filter(
+    (bound) => bound !== undefined,
+  );
+  expect(floors, "an exit always carries exactly one price bound").toHaveLength(1);
+  expect(exitSign === -1 ? position.minimumSellPrice : position.maximumBuyPrice).toBeDefined();
+}
 
 function openState(overrides: Partial<StaticBracketState> = {}): StaticBracketState {
   return stateWith({
@@ -396,10 +450,24 @@ describe("§13.4 — Stop trigger with healthy book", () => {
     expect(decision.reasonCodes).toContain(REASONS.stopTriggered);
     const intents = reduceIntents(decision);
     expect(intents).toHaveLength(1);
-    const intent = intents[0] as Extract<Intent, { type: "REDUCE_POSITION" }>;
-    expect(intent.targetShares).toBe("0");
+    // FORCING FINDING r2-B1(b)/(d): the reduction names THIS bracket's leg and
+    // exactly its confirmed open allocation as a signed delta. The former
+    // `REDUCE_POSITION { targetShares: "0" }` named a sell-down level for every
+    // side of the market, so it also sold inventory the bracket never created —
+    // `planner-shapes.test.ts` drives both shapes through the real planner.
+    const intent = intents[0] as Extract<Intent, { type: "POSITION" }>;
+    expect(intent.direction).toBe("YES");
+    expect(intent.targetMode).toBe("DELTA");
+    expect(intent.targetShares).toBe("-50");
     expect(intent.minimumSellPrice).toBe("0.26");
+    expect(intent.maximumBuyPrice).toBeUndefined();
+    // §7.7's ReductionUrgency is a subset of PositionUrgency: carried verbatim.
     expect(intent.urgency).toBe("AGGRESSIVE");
+    // The posture mapping that reproduces `reductionPosture` exactly (§9.10).
+    expect(intent.liquidityPreference).toBe("TAKER_OK");
+    expect(intent.partialFillPolicy).toBe("ACCEPT_ANY");
+    // No §7.7 REDUCE_POSITION is emitted on any path any more.
+    expect(rawReduceIntents(decision)).toHaveLength(0);
   });
 
   it("does not stop one tick above the stop threshold", () => {
@@ -407,6 +475,39 @@ describe("§13.4 — Stop trigger with healthy book", () => {
       context(params(), openState(), { ...HELD_50, features: { [STOP_KEY]: "0.28" } }),
     );
     expect(reduceIntents(decision)).toHaveLength(0);
+  });
+
+  it("EVERY exit path on a DIRECT bracket satisfies the exposure invariant", () => {
+    // FORCING FINDING r2-B1(d), the direct-leg half. The entry is replayed so
+    // the invariant compares two real intents.
+    const entry = positionIntents(
+      staticBracketStrategy.onFeatures(context(params(), ARMED, {})),
+    )[0] as Extract<Intent, { type: "POSITION" }>;
+    const exits: readonly [string, DecisionResult][] = [
+      ["take-profit", staticBracketStrategy.onFeatures(context(params(), openState(), HELD_50))],
+      [
+        "stop",
+        staticBracketStrategy.onFeatures(
+          context(params(), openState(), { ...HELD_50, features: { [STOP_KEY]: "0.2" } }),
+        ),
+      ],
+      [
+        "holding timeout",
+        staticBracketStrategy.onTimer(
+          context(params(), openState({ openedAtMs: NOW_MS - 200_000 }), HELD_50),
+        ),
+      ],
+      [
+        "final policy",
+        staticBracketStrategy.onMarketClosing(context(params(), openState(), HELD_50), 19),
+      ],
+    ];
+    for (const [name, decision] of exits) {
+      const emitted = positionIntents(decision);
+      expect(emitted, `${name} emits exactly one exit`).toHaveLength(1);
+      expect(rawReduceIntents(decision), `${name} emits no market-scoped reduction`).toHaveLength(0);
+      assertReducesExposure(emitted[0] as Intent, entry, "50");
+    }
   });
 });
 
@@ -703,22 +804,6 @@ describe("complement-leg bracket — every exit is a buy-back at the complemente
     });
   }
 
-  /**
-   * The exposure invariant, checked on an emitted intent against the bracket it
-   * belongs to: an exit's DELTA must oppose the entry's and may not exceed the
-   * confirmed open allocation.
-   */
-  function assertReducesExposure(intent: Intent, entryDelta: string, open: string): void {
-    const position = intent as Extract<Intent, { type: "POSITION" }>;
-    const entrySign = entryDelta.startsWith("-") ? -1 : 1;
-    const exitSign = position.targetShares.startsWith("-") ? -1 : 1;
-    expect(exitSign, "an exit must trade the opposite way to its entry").toBe(-entrySign);
-    const magnitude = position.targetShares.replace("-", "");
-    expect(Number(magnitude), "an exit may never exceed the confirmed open allocation").toBeLessThanOrEqual(
-      Number(open),
-    );
-  }
-
   it("ENTRY sells the complement token at the complemented buy limit", () => {
     const decision = staticBracketStrategy.onFeatures(context(preferring(), ARMED, CHEAP_NO));
     const intent = positionIntents(decision)[0] as Extract<Intent, { type: "POSITION" }>;
@@ -748,7 +833,7 @@ describe("complement-leg bracket — every exit is a buy-back at the complemente
     expect(exit.maximumBuyPrice).toBe("0.5");
     expect(exit.minimumSellPrice).toBeUndefined();
     expect(filled.modelOutputs?.["exitSide"]).toBe("BUY");
-    assertReducesExposure(exit, entryIntent.targetShares, "50");
+    assertReducesExposure(exit, entryIntent, "50");
 
     // The baseline the exit gates are measured against is the inventory this
     // bracket started from, not the raw holding.
@@ -766,14 +851,25 @@ describe("complement-leg bracket — every exit is a buy-back at the complemente
     );
     expect(decision.decisionType).toBe("reduce");
     expect(decision.reasonCodes).toContain(REASONS.stopTriggered);
-    const reduce = reduceIntents(decision)[0] as Extract<Intent, { type: "REDUCE_POSITION" }>;
-    // complement(minimum_sell_price 0.26) = 0.74, and it is a BUY bound.
+    const reduce = reduceIntents(decision)[0] as Extract<Intent, { type: "POSITION" }>;
+    // FORCING FINDING r2-B1(a): a `REDUCE_POSITION` here was planned as a SELL
+    // of 50 NO — the token this bracket is already short — because the planner's
+    // reduce path only sells and never reads `maximumBuyPrice`. The buy-back is
+    // a POSITIVE delta on the NO leg at complement(0.26) = 0.74.
+    expect(reduce.direction).toBe("NO");
+    expect(reduce.targetMode).toBe("DELTA");
+    expect(reduce.targetShares).toBe("50");
     expect(reduce.maximumBuyPrice).toBe("0.74");
     expect(reduce.minimumSellPrice).toBeUndefined();
-    expect(reduce.targetShares).toBe("0");
     expect(reduce.urgency).toBe("AGGRESSIVE");
+    expect(reduce.liquidityPreference).toBe("TAKER_OK");
+    expect(reduce.partialFillPolicy).toBe("ACCEPT_ANY");
+    expect(rawReduceIntents(decision)).toHaveLength(0);
     expect(decision.modelOutputs?.["exitSide"]).toBe("BUY");
     expect(decision.modelOutputs?.["floor"]).toBe("0.74");
+    // The free-text `reason` a REDUCE_POSITION carried has no counterpart on a
+    // PositionIntent; the cause survives as a reason code and a model output.
+    expect(decision.modelOutputs?.["reduceCause"]).toBe("stop trigger");
   });
 
   it("END-OF-MARKET protected reduce uses the same complemented floor", () => {
@@ -782,9 +878,12 @@ describe("complement-leg bracket — every exit is a buy-back at the complemente
       19,
     );
     expect(decision.decisionType).toBe("reduce");
-    const reduce = reduceIntents(decision)[0] as Extract<Intent, { type: "REDUCE_POSITION" }>;
+    const reduce = reduceIntents(decision)[0] as Extract<Intent, { type: "POSITION" }>;
+    expect(reduce.direction).toBe("NO");
+    expect(reduce.targetShares).toBe("50");
     expect(reduce.maximumBuyPrice).toBe("0.74");
     expect(reduce.minimumSellPrice).toBeUndefined();
+    expect(rawReduceIntents(decision)).toHaveLength(0);
   });
 
   it("HOLDING TIMEOUT on a complement bracket is a buy-back too", () => {
@@ -792,8 +891,54 @@ describe("complement-leg bracket — every exit is a buy-back at the complemente
       context(preferring(), openComplement({ openedAtMs: NOW_MS - 200_000 }), AFTER_ENTRY),
     );
     expect(decision.reasonCodes).toContain(REASONS.holdingTimeout);
-    const reduce = reduceIntents(decision)[0] as Extract<Intent, { type: "REDUCE_POSITION" }>;
+    const reduce = reduceIntents(decision)[0] as Extract<Intent, { type: "POSITION" }>;
+    expect(reduce.direction).toBe("NO");
+    expect(reduce.targetShares).toBe("50");
     expect(reduce.maximumBuyPrice).toBe("0.74");
+    expect(rawReduceIntents(decision)).toHaveLength(0);
+  });
+
+  it("EVERY exit path on this bracket satisfies the exposure invariant", () => {
+    // FORCING FINDING r2-B1(d). The entry that opened this bracket, replayed so
+    // the invariant is checked against a real entry rather than a literal.
+    const entry = positionIntents(
+      staticBracketStrategy.onFeatures(context(preferring(), ARMED, CHEAP_NO)),
+    )[0] as Extract<Intent, { type: "POSITION" }>;
+
+    const exits: readonly [string, DecisionResult][] = [
+      [
+        "take-profit",
+        staticBracketStrategy.onFeatures(context(preferring(), openComplement(), AFTER_ENTRY)),
+      ],
+      [
+        "stop",
+        staticBracketStrategy.onFeatures(
+          context(preferring(), openComplement(), {
+            ...AFTER_ENTRY,
+            features: { [STOP_KEY]: "0.2" },
+          }),
+        ),
+      ],
+      [
+        "holding timeout",
+        staticBracketStrategy.onTimer(
+          context(preferring(), openComplement({ openedAtMs: NOW_MS - 200_000 }), AFTER_ENTRY),
+        ),
+      ],
+      [
+        "final policy",
+        staticBracketStrategy.onMarketClosing(
+          context(preferring(), openComplement(), AFTER_ENTRY),
+          19,
+        ),
+      ],
+    ];
+    for (const [name, decision] of exits) {
+      const emitted = positionIntents(decision);
+      expect(emitted, `${name} emits exactly one exit`).toHaveLength(1);
+      expect(rawReduceIntents(decision), `${name} emits no market-scoped reduction`).toHaveLength(0);
+      assertReducesExposure(emitted[0] as Intent, entry, "50");
+    }
   });
 
   it("the buy-back CLOSES the bracket when it fills", () => {
