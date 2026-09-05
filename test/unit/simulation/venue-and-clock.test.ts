@@ -53,7 +53,9 @@ const AT_EVENT = {
 const POLICY: ExecutionPolicy = {
   timeInForceFor: () => "GTC",
   statedExpiryNsFor: () => undefined,
-  sameInstantAdditionsSharesFor: () => "0",
+  // This root LOOKED and saw nothing added at our price — which is a different
+  // fact from `"NOT_OBSERVED"`, and the band now records which one it was.
+  sameInstantAdditionsFor: () => ({ observedShares: "0" }),
 };
 
 const QUEUE: QueueModelParameters = {
@@ -638,14 +640,36 @@ describe("a CROSSING postOnly order is REJECTED, never filled (venue report §2.
     expect(result.orders[0]?.state).toBe("REJECTED");
   });
 
-  it("a NON-crossing postOnly order is not rejected: it rests", async () => {
+  it("a NON-crossing postOnly order is not rejected: it RESTS, and is registered", async () => {
+    // Round-2 review N1: asserting `state === "RESTING"` alone is satisfiable
+    // WITHOUT registering the order for observation — `#book` sets that state
+    // from the remainder disposition, so a `#rest` that skipped registration
+    // would still pass. What proves registration is that a LATER observed trade
+    // at the order's price actually fills it.
     const simulated = venue({
       books: { book: () => sidedBook([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }]) },
     });
     const result = await simulated.submit(
-      planWith(order({ executionStyle: "REST", postOnly: true, limitPrice: "0.45" })),
+      planWith(order({ executionStyle: "REST", postOnly: true, limitPrice: "0.45", shares: "10" })),
     );
     expect(result.orders[0]?.state).toBe("RESTING");
+    expect(result.fills).toEqual([]);
+
+    const touch = simulated.observeTrade({
+      marketId: MARKET_ID,
+      side: "YES",
+      price: "0.45",
+      shares: "10",
+      monotonicNs: 1_000_000_100n,
+      atEvent: AT_EVENT,
+    });
+    expect(touch.ok).toBe(true);
+    if (!touch.ok) return;
+    expect(touch.value.fills).toHaveLength(1);
+    expect(touch.value.fills[0]?.simulatedOrderId).toBe("order-1");
+    // A postOnly order that rested is a MAKER when it fills, never a taker.
+    expect(touch.value.fills[0]?.liquidityRole).toBe("MAKER");
+    expect(simulated.ordersSnapshot()[0]?.state).toBe("FILLED");
   });
 
   it("postOnly on a MARKETABLE_LIMIT order is refused, not silently dropped", async () => {
@@ -803,6 +827,88 @@ describe("a Tier-1 resting order reports the §12.2 BAND through the venue seam"
     const result = await simulated.submit(planWith(order({ executionStyle: "REST", limitPrice: "0.4" })));
     expect(result.accepted).toBe(false);
     expect(result.refusalCode).toBe("FILL_MODEL_LATENCY_DISTRIBUTION_INVALID");
+  });
+});
+
+describe("an order that never reached a book still names its outcome token (L5)", () => {
+  /** A GTD policy whose stated expiry has already passed at the clock's instant. */
+  const expiredGtd: ExecutionPolicy = {
+    ...POLICY,
+    timeInForceFor: () => "GTD",
+    // The clock is at 1_000_000_000 ns and GTD expires 60 s EARLY, so an expiry
+    // stated at the clock's own instant is already past its effective one.
+    statedExpiryNsFor: () => 1_000_000_000n,
+  };
+
+  it("books the token id the recorded timeline knows, not an empty string", async () => {
+    // Round-2 review L1: `tier1Immediate` answers `tokenId: null` for
+    // `EXPIRED_BEFORE_MATCHING` — the order never reached a book — and the
+    // previous code booked it under `?? ""`, naming no token at all. The
+    // identity comes from the recorded timeline. Reverting to `?? ""` left the
+    // whole suite green, which is why this test exists.
+    const simulated = tier1Venue([{ price: "0.4", size: "100" }], [{ price: "0.5", size: "100" }], {
+      policy: expiredGtd,
+    });
+    const result = await simulated.submit(
+      planWith(order({ executionStyle: "MARKETABLE_LIMIT", limitPrice: "0.6" })),
+    );
+    expect(
+      result.accepted,
+      `${String(result.refusalCode)}: ${String(result.refusalMessage)}`,
+    ).toBe(true);
+    expect(result.orders[0]?.state).toBe("EXPIRED");
+    expect(result.orders[0]?.tokenId).toBe("1234");
+    expect(result.orders[0]?.tokenId).not.toBe("");
+    expect(result.fills).toEqual([]);
+  });
+
+  it("REFUSES rather than inventing one when the timeline knows no book", async () => {
+    const simulated = tier1Venue([], [], {
+      policy: expiredGtd,
+      timeline: { bookAt: () => undefined },
+    });
+    const result = await simulated.submit(
+      planWith(order({ executionStyle: "MARKETABLE_LIMIT", limitPrice: "0.6" })),
+    );
+    expect(result.accepted).toBe(false);
+    expect(result.refusalCode).toBe("SIMULATED_VENUE_NO_BOOK");
+    expect(result.refusalMessage).toContain("cannot name the outcome token");
+  });
+});
+
+describe("a REFUSED result discloses the same rate-limit facts an accepted one does", () => {
+  it("carries the venue's own modelKind and disclosure on the refusal path (M9)", async () => {
+    // Round-2 review L3: `#refuse` was the ONLY place these fields were not
+    // pinned by a test, so faking `rateLimitModel: "MODELED"` there left the
+    // suite green — a refused result could have claimed a budget model that was
+    // never wired, which is exactly what ADR-012 §5.6 says must not happen.
+    const unmodelled = await venue().submit(placement({ runMode: "LIVE" }));
+    expect(unmodelled.accepted).toBe(false);
+    expect(unmodelled.refusalCode).toBe("SIMULATED_VENUE_RUN_MODE_REQUIRES_LIVE_SIGNER");
+    expect(unmodelled.rateLimitModel).toBe("NOT_MODELED");
+    expect(unmodelled.rateLimitDisclosure).toContain("no venue budget model");
+
+    const modelled = await venue({
+      rateLimits: tokenBucketRateLimits({
+        orderTokensPerWindow: 5,
+        cancelTokensPerWindow: 5,
+        windowMs: 60_000,
+        snapshotVersion: "test/rate-limits/v1",
+      }),
+    }).submit(placement({ runMode: "LIVE" }));
+    expect(modelled.accepted).toBe(false);
+    expect(modelled.rateLimitModel).toBe("MODELED");
+    expect(modelled.rateLimitDisclosure).toContain("test/rate-limits/v1");
+  });
+
+  it("also carries them when the refusal comes from an internal containment", async () => {
+    const hostile = venue({ startingCash: "1,000" });
+    const result = await hostile.submit(placement());
+    expect(result.accepted).toBe(false);
+    expect(result.rateLimitModel).toBe("NOT_MODELED");
+    expect(result.rateLimitDisclosure).toContain("no venue budget model");
+    expect(result.venueClass).toBe("SIMULATED");
+    expect(result.planningDepthAwareness).toBe("TOP_OF_BOOK_ONLY");
   });
 });
 

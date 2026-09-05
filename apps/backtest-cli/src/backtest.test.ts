@@ -287,7 +287,7 @@ describe("the CLI, end to end over a real Parquet dataset", () => {
     expect(outcome.result.eventsDelivered).toBe(2);
     expect(outcome.result.load.objectsVerified).toBe(1);
     expect(outcome.result.load.rowsDelivered).toBe(2);
-    expect(outcome.result.serialization).toContain("polymarket-bot/simulation-run/v2");
+    expect(outcome.result.serialization).toContain("polymarket-bot/simulation-run/v3");
     expect(outcome.result.serialization).toContain("counts read=2 delivered=2");
     expect(renderBacktestOutcome(outcome)).toContain("run_mode=BACKTEST");
   });
@@ -386,7 +386,7 @@ describe("the CLI argument surface", () => {
       out: (line) => output.push(line),
       err: (line) => output.push(line),
     });
-    expect(output.join("\n")).toContain("polymarket-bot/simulation-run/v2");
+    expect(output.join("\n")).toContain("polymarket-bot/simulation-run/v3");
     expect(code).toBe(0);
   });
 

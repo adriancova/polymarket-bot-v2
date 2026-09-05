@@ -39,7 +39,7 @@ import {
   readField,
   recordKeys,
 } from "./grammar.js";
-import { ownFrozenTree } from "./plain.js";
+import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import {
   simulationFailure,
   simulationOk,
@@ -718,8 +718,14 @@ const RUN_PIN_KEYS: readonly string[] = [...RUN_PIN_STRING_FIELDS, "runSeed", "s
  * carried an extra field would let a caller believe something was pinned that
  * nothing reads (round-1 review L6).
  */
-export function readRunPins(value: unknown): SimulationResult<ReplayRunPins> {
+export function readRunPins(offered: unknown): SimulationResult<ReplayRunPins> {
   return totally("reading the run pins", () => {
+    // D1 (round-2 review, MEDIUM-1): the pins are a CALLER record and the
+    // emitted pin set is a copy of them, so they are materialized first — the
+    // same rule the fee, latency and queue-parameter doors now follow.
+    const read = readOwnPlainInput<unknown>(offered, "the run pins");
+    if (!read.ok) return read;
+    const value = read.value;
     if (!isRecord(value)) {
       return simulationFailure("SIMULATION_INPUT_INVALID", "the run pins must be a record");
     }

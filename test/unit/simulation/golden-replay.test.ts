@@ -171,7 +171,12 @@ const GOLDEN_QUEUE: QueueModelParameters = {
 const GOLDEN_POLICY: ExecutionPolicy = {
   timeInForceFor: () => "GTC",
   statedExpiryNsFor: () => undefined,
-  sameInstantAdditionsSharesFor: () => "0",
+  // The golden run has one recorded book snapshot and no record of what was
+  // added at `0.08` in the instant the order was placed: it did NOT look. Under
+  // the previous shape that was indistinguishable from "looked and saw nothing",
+  // and it silently became the conservative arm's queue-ahead input. It is now
+  // `NOT_OBSERVED`, and the pinned bytes say so (round-2 review, L4).
+  sameInstantAdditionsFor: () => "NOT_OBSERVED",
 };
 
 function bookView(bids: readonly BookLevelView[], asks: readonly BookLevelView[]): BookView {

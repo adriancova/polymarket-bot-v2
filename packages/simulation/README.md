@@ -48,10 +48,10 @@ This package's event source parses RECORDED WIRE DATA, so ADR-020 §3 applies.
 
 | Step | What this package does |
 | --- | --- |
-| **D1 — materialize prototype-free before parsing** | Manifest and pin BYTES go through `strict-json.ts`, which BUILDS the tree with `Object.create(null)` and `Object.defineProperty` as it parses, so there is no intermediate `JSON.parse` result at all. Decoded dataset rows go through `plain.ts`'s `materializeInput`, which reads property DESCRIPTORS (a getter is refused without being invoked), refuses `__proto__` as a name, symbol keys, accessors, cycles, sparse holes and non-plain prototypes. |
+| **D1 — materialize prototype-free before parsing** | Manifest and pin BYTES go through `strict-json.ts`, which BUILDS the tree with `Object.create(null)` and `Object.defineProperty` as it parses, so there is no intermediate `JSON.parse` result at all. Decoded dataset rows go through `plain.ts`'s `materializeInput`, which reads property DESCRIPTORS (a getter is refused without being invoked), refuses `__proto__` as a name, symbol keys, accessors, cycles, sparse holes and non-plain prototypes. **Every door that takes a caller RECORD does the same**, through `readOwnPlainInput`: `readQueueModelParameters`, `readLatencyDistribution`, `readLatencyModel`, `readFeeScheduleSnapshot` and `readRunPins`. Round-2 review MEDIUM-1: the first four previously reached D4's copier with the caller's own object, which invoked a getter and followed a cycle until the stack ran out. `doors.test.ts` now drives every one of them with cyclic, getter-bearing and over-deep arguments and requires `SIMULATION_INPUT_NOT_DATA` with the getter NEVER invoked. |
 | **D2 — parse through a severed, warmed arena** | **Not applicable, and that is the strongest form of it rather than a waiver.** D2 exists to sever a `zod` node's `_zod` container and force its lazies. This package runs no schema library, and `zod` is absent from its ENTIRE dependency closure: it declares one workspace dependency, `@polymarket-bot/decimal`, which depends on `decimal.js` and `node:crypto` only. There is therefore no `skipChecks` / `optin` / `optout` / `when` / `values` slot to inherit and no lazy build to poison. `test/unit/simulation/purity.test.ts` checks the closure from the manifests; `doors.test.ts` installs those exact keys anyway and measures that nothing moves. |
 | **D3 — take values from the materialized tree** | By construction: there is no library output to take them from. Every field is read with `readField`, an own-property read of the materialized tree. |
-| **D4 — emit prototype-free** | Every emitted record is `ownFrozenTree`: null prototype, deep-frozen, `undefined` members dropped, so an absent optional field cannot be answered by a polluted `Object.prototype` in the consumer. |
+| **D4 — emit prototype-free** | Every emitted record is `ownFrozenTree`: null prototype, deep-frozen, `undefined` members dropped, so an absent optional field cannot be answered by a polluted `Object.prototype` in the consumer. Its copier reads DESCRIPTORS, is cycle-guarded and is bounded at `MAX_INPUT_DEPTH`; because D1 now runs first at every record door, those guards are ASSERTIONS about trees this package built, and a violation raises inside a totality guard rather than producing a partial tree. |
 
 **The bound (ADR-020 §6), measured in `test/unit/simulation/doors.test.ts` over
 all ten `schema-boundary.md` §2 classes** — adoption (enumerable AND
@@ -66,7 +66,11 @@ descriptor literals, `values`, and cold-lazy poisoning:
    malformed and hostile input. `doors.test.ts` drives every exported DOOR — by
    reflection, so a door added later is covered automatically — with a battery of
    hostile arguments (`null`, a non-canonical decimal string, a `Proxy`, a
-   symbol, a null-prototype record) and requires a refusal, never an exception.
+   symbol, a null-prototype record, a CYCLIC record and array, a getter-bearing
+   record, and a record nested past `MAX_INPUT_DEPTH`) and requires a refusal,
+   never an exception. The cyclic argument is a VALID parameter set with a
+   self-reference, so it reaches the door's copy step rather than being rejected
+   on its first field.
    The exports that are NOT doors are listed there one by one, each naming the
    door that validated what reaches it, so the boundary is a checkable claim
    rather than a waiver.
@@ -111,6 +115,15 @@ have been the shape that ruling forecloses.
   `fillEstimateKind: "TIER_1_RESTING_BAND"` with `filledShares` holding only what
   was actually booked against cash and inventory. A band is an estimate, not
   cash, and the order says so rather than implying a number.
+- The band's ordering claim is derived over NON-NEGATIVE quantities, and
+  `simulateResting` enforces exactly that at the door where the derivation is
+  written down: a negative `shares`, `queueAheadAtPlacement` or observed
+  same-instant addition, and a non-positive observed trade size, are refused with
+  `SIMULATION_INPUT_INVALID` naming the field. (Round-2 review MEDIUM-2: the
+  venue guarded its own inputs, but a caller reaching the door directly got a
+  nonsense band from a negative traded size — the queue walk ran backwards — or a
+  band-inconsistency refusal that blamed the derivation for an unvalidated input.
+  The venue's guards remain; the door no longer depends on them.)
 - §12.3: markouts are `role: "DIAGNOSTIC_ONLY"` with
   `appliedToReplayEconomics: false`; `replayPathEconomics` has no argument
   through which a penalty could arrive and carries `markoutPenaltyApplied: false`
@@ -177,9 +190,16 @@ key.
 8. **Same-instant queue additions cannot be derived from a book snapshot.** A
    recorded book carries AGGREGATE size per level, so the venue cannot see what
    was added at our price in the same instant we placed. `ExecutionPolicy`
-   therefore requires `sameInstantAdditionsSharesFor`, and `"0"` is a legitimate
-   answer meaning "nothing was observed" — stated by the composition root rather
-   than defaulted here. Only the CONSERVATIVE scenario assumes we sit behind it.
+   therefore requires `sameInstantAdditionsFor`, and it answers a TAGGED value —
+   `"NOT_OBSERVED"` or `{ observedShares }` — never a bare quantity. A bare `"0"`
+   conflated "we looked and saw nothing added" with "we did not look", and only
+   the first supports calling the CONSERVATIVE arm conservative. The answer is
+   carried on the `RestingFillBand` and printed in the §12.4 bytes
+   (`sameInstantAdditions=NOT_OBSERVED` / `=OBSERVED:<shares>`), so a run whose
+   conservative arm rests on an unmeasured quantity says so in its own artifact.
+   There is still no default: a root that states neither is refused. Only the
+   CONSERVATIVE scenario assumes we sit behind the additions, and an unobserved
+   addition contributes nothing to the queue ahead.
 9. **Two different inversion diagnostics, named for what they measure.** The load
    report counts `receivedAtInversions` — recorded ARRIVAL wall clocks out of
    order across the dispatch-ordered rows — and the event source counts

@@ -13,7 +13,7 @@ acceptance 2: "Same manifest/config/seed is byte-identical."
 | `manifest` | A `polymarket-bot/dataset-manifest/v1` document in `WP-130`'s exact shape and key order |
 | `rows` | The decoded dataset rows (`WP-130` `DecodedDatasetRow`) the manifest's one object contains |
 | `runPins` | The complete §12.5 run-scoped pin set (§12.5's normalizer, feature-set, seed, fill/latency model, fee/reward snapshot, settlement-spec versions, plus the simulator version) |
-| `expected.serialization` | The `polymarket-bot/simulation-run/v2` canonical form, line by line, compared **byte-for-byte** |
+| `expected.serialization` | The `polymarket-bot/simulation-run/v3` canonical form, line by line, compared **byte-for-byte** |
 
 ## Provenance
 
@@ -99,7 +99,7 @@ is the model that ran (§12.5).
 **By hand, from `serializeRun`'s published grammar and this fixture's own
 declared values — not captured from a run.** The derivation, line by line:
 
-1. `polymarket-bot/simulation-run/v2` — the format id constant.
+1. `polymarket-bot/simulation-run/v3` — the format id constant.
 2. `run …` — the five §12.5 model pins, verbatim from `runPins`.
 3. `pins …` — the four remaining §12.5 pins; `settlement=` is empty because the
    fixture pins no settlement-spec version.
@@ -131,13 +131,28 @@ declared values — not captured from a run.** The derivation, line by line:
     `sell = 0`, `fees = 0.05733`, `net = 0 − 0.9 − 0.05733 = −0.95733`,
     `sharesBought = 10`, `fills = 1`. `markoutPenaltyApplied=false` is a literal
     (§12.3). The resting order contributes NOTHING here: a band is not cash.
-11. `band …` — the resting order's estimate. Queue ahead at placement is the
-    aggregate size observed at `0.08`, which is `0` (the recorded book's only bid
-    is at `0.07`), so the observed trade's 5 shares reach the order in every
-    scenario: `filled=5 remaining=45` three times, `postCancelFills=0` because no
-    cancel was requested. The three scenarios agreeing here is a property of THIS
-    book, not a general one.
+11. `band …` — the resting order's estimate. `sameInstantAdditions=NOT_OBSERVED`
+    because `GOLDEN_POLICY` answers `"NOT_OBSERVED"`: the fixture carries ONE
+    recorded book snapshot and no record of what was added at `0.08` in the
+    instant the order was placed, so the run did not look, and
+    `renderSameInstantAdditions` prints the tag verbatim. (A root that had looked
+    and seen nothing would print `OBSERVED:0` — different bytes, because it is a
+    different fact; round-2 review L4.) Queue ahead at placement is the aggregate
+    size observed at `0.08`, which is `0` (the recorded book's only bid is at
+    `0.07`), and an unobserved same-instant addition adds nothing to it, so the
+    observed trade's 5 shares reach the order in every scenario:
+    `filled=5 remaining=45` three times, `postCancelFills=0` because no cancel
+    was requested. The three scenarios agreeing here is a property of THIS book,
+    not a general one.
 12. `end`.
+
+### What moved in round 2, and why
+
+Only two things: the format id (`v2` → `v3`, because the `band` line's grammar
+changed) and the new `sameInstantAdditions=` field on the `band` line. Every
+other byte is unchanged, and the derivations above are the same ones — the
+conservative arm's queue ahead was `0 + 0` before and is `0 + (nothing observed)`
+now, so no quantity moved.
 
 If a change moves these bytes, re-derive them the same way; do not paste the new
 output. The suite additionally asserts that the replay is reproducible and that

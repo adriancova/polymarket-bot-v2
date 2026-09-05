@@ -81,10 +81,12 @@ import {
 } from "./ports.js";
 import {
   readQueueModelParameters,
+  readSameInstantAdditions,
   simulateResting,
   type ObservedTrade,
   type QueueModelParameters,
   type RestingFillBand,
+  type SameInstantAdditions,
 } from "./queue.js";
 import type { RateLimitBudget } from "./rate-limit.js";
 import { simulationRefusal, totally, type SimulationRefusal, type SimulationResult } from "./refusals.js";
@@ -118,15 +120,21 @@ export interface ExecutionPolicy {
   /** The stated GTD expiry, in recorded monotonic nanoseconds, when GTD. */
   statedExpiryNsFor(order: PlannedOrderView): bigint | undefined;
   /**
-   * Size added at the order's price in the same recorded instant it was placed.
+   * What the root OBSERVED about size added at the order's price in the same
+   * recorded instant it was placed.
    *
    * The CONSERVATIVE queue scenario assumes we sit behind it ({@link
    * ./queue.js}). A book snapshot is an AGGREGATE per level, so the venue cannot
-   * derive this from the book alone; the composition root states it, and `"0"`
-   * is a legitimate answer that says "nothing was observed" rather than a
-   * default nobody chose.
+   * derive this from the book alone; the composition root states it.
+   *
+   * It answers a TAGGED value, not a quantity (round-2 review, L4): the previous
+   * `"0"` meant both "we looked and saw nothing added" and "we did not look",
+   * and only the first supports calling the conservative arm conservative. The
+   * answer travels onto the band and into its §12.4 bytes, so a run that never
+   * looked is visible in the artifact. There is still no default: a root that
+   * states neither is refused.
    */
-  sameInstantAdditionsSharesFor(order: PlannedOrderView): string;
+  sameInstantAdditionsFor(order: PlannedOrderView): SameInstantAdditions;
 }
 
 /** Construction inputs. Everything is injected; nothing is defaulted. */
@@ -170,7 +178,7 @@ interface RestingRecord {
   readonly restingFromNs: bigint;
   /** Effective expiry (stated minus GTD's 60 s), when the order is GTD. */
   readonly effectiveExpiryNs: bigint | undefined;
-  readonly sameInstantAdditionsShares: string;
+  readonly sameInstantAdditions: SameInstantAdditions;
   readonly queueAheadAtPlacement: string;
   remainingShares: string;
 }
@@ -900,12 +908,18 @@ export class SimulatedVenue implements ExecutionVenue {
     const ownLadder = input.book.ladder(planned.action === "BUY" ? "BID" : "ASK");
     const queueAhead = sizeAtPrice(ownLadder, planned.limitPrice);
     if (!queueAhead.ok) return queueAhead;
-    const additions = this.#options.policy.sameInstantAdditionsSharesFor(planned);
-    if (!isCanonicalDecimalString(additions) || compareDecimal(additions, "0") < 0) {
+    // KEPT, and now tagged (round-2 review, L4 / MEDIUM-2): the venue validates
+    // what its policy answered before the quantity reaches the queue model, and
+    // the queue model validates it AGAIN at its own door, because that is where
+    // the derivation that depends on it is written down.
+    const additions = readSameInstantAdditions(
+      this.#options.policy.sameInstantAdditionsFor(planned),
+    );
+    if (!additions.ok) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
-        "the execution policy must state the size added at our price in the same recorded instant as a non-negative canonical decimal ('0' is a legitimate answer)",
-        { plannedOrderId: planned.plannedOrderId, offered: String(additions) },
+        `the execution policy must state what it observed about same-instant additions at our price ("NOT_OBSERVED", or { observedShares }): ${additions.refusal.message}`,
+        { plannedOrderId: planned.plannedOrderId },
       );
     }
 
@@ -927,7 +941,7 @@ export class SimulatedVenue implements ExecutionVenue {
       restingPrice: planned.limitPrice,
       restingFromNs: input.restingFromNs,
       effectiveExpiryNs,
-      sameInstantAdditionsShares: additions,
+      sameInstantAdditions: additions.value,
       queueAheadAtPlacement: queueAhead.value,
       remainingShares: input.remainingShares,
     };
@@ -991,7 +1005,7 @@ export class SimulatedVenue implements ExecutionVenue {
         restingPrice: record.restingPrice,
         shares: record.remainingShares,
         queueAheadAtPlacement: record.queueAheadAtPlacement,
-        sameInstantAdditionsShares: record.sameInstantAdditionsShares,
+        sameInstantAdditions: record.sameInstantAdditions,
         restingFromNs: record.restingFromNs,
       },
       trades,

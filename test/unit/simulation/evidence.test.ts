@@ -29,6 +29,8 @@ import {
   checkBandOrdering,
   quoteForDeploymentDecision,
   readQueueModelParameters,
+  readSameInstantAdditions,
+  serializeBand,
   simulateResting,
   simulatedFill,
   tier0Immediate,
@@ -37,6 +39,7 @@ import {
   type FeeScheduleSnapshot,
   type QueueModelParameters,
   type RestingFillBand,
+  type SameInstantAdditions,
 } from "../../../packages/simulation/src/index.js";
 
 const FEES: FeeScheduleSnapshot = {
@@ -199,7 +202,7 @@ describe("a Tier-1 resting result is a BAND, never one falsely precise fill", ()
         restingPrice: "0.5",
         shares: "100",
         queueAheadAtPlacement: "200",
-        sameInstantAdditionsShares: "50",
+        sameInstantAdditions: { observedShares: "50" },
         restingFromNs: 0n,
       },
       trades: [
@@ -303,7 +306,7 @@ describe("a Tier-1 resting result is a BAND, never one falsely precise fill", ()
         restingPrice: "0.5",
         shares: "10",
         queueAheadAtPlacement: "0",
-        sameInstantAdditionsShares: "0",
+        sameInstantAdditions: { observedShares: "0" },
         restingFromNs: 0n,
       },
       trades: [],
@@ -334,5 +337,96 @@ describe("nothing here is calibrated, and it says so", () => {
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
     expect(outcome.refusal.message).toContain("ADR-012 §7");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "Did not look" is a named absence, not a zero (round-2 review, L4)
+// ---------------------------------------------------------------------------
+
+describe("a band says whether its same-instant additions were OBSERVED at all", () => {
+  const model = tier1Model({
+    fillModelVersion: "sim/tier1/v1",
+    fillModelParametersHash: "0".repeat(64),
+  });
+
+  function bandWith(additions: SameInstantAdditions) {
+    return simulateResting({
+      model,
+      order: {
+        simulatedOrderId: "o-1",
+        marketId: "0190a3e0-0000-7000-8000-00000000000a",
+        tokenId: "1234",
+        side: "YES",
+        action: "BUY",
+        restingPrice: "0.5",
+        shares: "100",
+        queueAheadAtPlacement: "200",
+        sameInstantAdditions: additions,
+        restingFromNs: 0n,
+      },
+      trades: [{ price: "0.5", shares: "120", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE_PARAMETERS,
+      feeSnapshot: FEES,
+    });
+  }
+
+  it('carries "NOT_OBSERVED" onto the band and into its §12.4 bytes', () => {
+    const outcome = bandWith("NOT_OBSERVED");
+    expect(outcome.ok, outcome.ok ? "" : outcome.refusal.message).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.value.sameInstantAdditions).toBe("NOT_OBSERVED");
+    expect(serializeBand(outcome.value)).toContain("sameInstantAdditions=NOT_OBSERVED");
+  });
+
+  it("carries an OBSERVED zero as a different fact, with different bytes", () => {
+    // The whole point: a root that looked and saw nothing is not the same claim
+    // as a root that never looked, and the artifact distinguishes them.
+    const looked = bandWith({ observedShares: "0" });
+    const didNot = bandWith("NOT_OBSERVED");
+    expect(looked.ok && didNot.ok).toBe(true);
+    if (!looked.ok || !didNot.ok) return;
+    expect(serializeBand(looked.value)).toContain("sameInstantAdditions=OBSERVED:0");
+    expect(serializeBand(looked.value)).not.toBe(serializeBand(didNot.value));
+    // …and the two agree on every quantity, so the ONLY difference is the
+    // disclosure. An unobserved addition adds nothing to the queue ahead.
+    expect(looked.value.conservative.queueAheadAtPlacement).toBe(
+      didNot.value.conservative.queueAheadAtPlacement,
+    );
+    expect(looked.value.conservative.filledShares).toBe(didNot.value.conservative.filledShares);
+  });
+
+  it("an OBSERVED quantity still moves the CONSERVATIVE arm", () => {
+    const observed = bandWith({ observedShares: "50" });
+    const none = bandWith("NOT_OBSERVED");
+    expect(observed.ok && none.ok).toBe(true);
+    if (!observed.ok || !none.ok) return;
+    expect(observed.value.conservative.queueAheadAtPlacement).toBe("250");
+    expect(none.value.conservative.queueAheadAtPlacement).toBe("200");
+  });
+
+  it("REQUIRES the statement: a bare quantity, or nothing, is refused", () => {
+    for (const offered of [undefined, null, "0", "50", 0, {}, { observedShares: 0 }, "OBSERVED"]) {
+      const outcome = bandWith(offered as never);
+      expect(outcome.ok, JSON.stringify(offered)).toBe(false);
+      if (outcome.ok) continue;
+      expect(outcome.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+    }
+    expect(readSameInstantAdditions("NOT_OBSERVED").ok).toBe(true);
+    expect(readSameInstantAdditions({ observedShares: "0" }).ok).toBe(true);
+    expect(readSameInstantAdditions({ observedShares: "-1" }).ok).toBe(false);
+    expect(readSameInstantAdditions({ observedShares: "1,5" } as never).ok).toBe(false);
+  });
+
+  it("checkBandOrdering REFUSES a band that states neither", () => {
+    const built = bandWith("NOT_OBSERVED");
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const stripped = { ...built.value } as Record<string, unknown>;
+    delete stripped["sameInstantAdditions"];
+    const checked = checkBandOrdering(stripped as unknown as RestingFillBand);
+    expect(checked.ok).toBe(false);
+    if (checked.ok) return;
+    expect(checked.refusal.code).toBe("SIMULATION_INPUT_INVALID");
   });
 });

@@ -246,6 +246,7 @@ export {
   QUEUE_SCENARIOS,
   checkBandOrdering,
   readQueueModelParameters,
+  readSameInstantAdditions,
   simulateResting,
 } from "./queue.js";
 export type {
@@ -255,6 +256,7 @@ export type {
   RestingFillBand,
   RestingOrderInput,
   RestingScenarioOutcome,
+  SameInstantAdditions,
 } from "./queue.js";
 
 // --- markouts (§12.3, ADR-012 §3) -------------------------------------------

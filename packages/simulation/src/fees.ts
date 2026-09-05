@@ -44,7 +44,7 @@ import {
 } from "@polymarket-bot/decimal";
 
 import { isNonNegativeInteger, isNonEmptyString } from "./grammar.js";
-import { ownFrozenTree } from "./plain.js";
+import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import {
   describeForRefusal,
   simulationFailure,
@@ -56,13 +56,42 @@ import {
 /** How the venue's stated "rounded to 5 decimal places" is applied. */
 export type FeeRoundingMode = "HALF_UP" | "HALF_EVEN" | "UP" | "DOWN";
 
-/** Every rounding mode this module implements. */
-export const FEE_ROUNDING_MODES: readonly FeeRoundingMode[] = [
-  "HALF_UP",
-  "HALF_EVEN",
-  "UP",
-  "DOWN",
-];
+/**
+ * What a rounding mode does to the digits it drops.
+ *
+ * Named separately from the MODE so {@link shouldRoundUp} branches on a value
+ * whose every member it handles BY NAME.
+ */
+type FeeRoundingRule =
+  | "ALWAYS_AWAY_FROM_ZERO"
+  | "ALWAYS_TOWARD_ZERO"
+  | "TIE_AWAY_FROM_ZERO"
+  | "TIE_TO_EVEN";
+
+/**
+ * The closed vocabulary, as the single source of truth (round-2 review, N2).
+ *
+ * The previous version's decision function ended in an IMPLICIT `HALF_EVEN` arm:
+ * a mode added to the union without editing that function would silently behave
+ * as `HALF_EVEN` rather than refusing — the same class as the `default`-rounds-
+ * DOWN defect the round-1 review found. Here the mapping is a
+ * `Record<FeeRoundingMode, …>`, so a new mode that is not given a rule is a
+ * COMPILE error; {@link shouldRoundUp} then names every RULE explicitly and
+ * ends in a `never` witness rather than a fallthrough; and a mode string that is
+ * not an own key of this record is REFUSED at the door
+ * ({@link readRoundingMode}), never guessed.
+ */
+const FEE_ROUNDING_RULES: Readonly<Record<FeeRoundingMode, FeeRoundingRule>> = {
+  HALF_UP: "TIE_AWAY_FROM_ZERO",
+  HALF_EVEN: "TIE_TO_EVEN",
+  UP: "ALWAYS_AWAY_FROM_ZERO",
+  DOWN: "ALWAYS_TOWARD_ZERO",
+};
+
+/** Every rounding mode this module implements, derived from the rule table. */
+export const FEE_ROUNDING_MODES: readonly FeeRoundingMode[] = Object.keys(
+  FEE_ROUNDING_RULES,
+) as readonly FeeRoundingMode[];
 
 /**
  * A pinned historical fee schedule.
@@ -91,8 +120,16 @@ export function readFeeScheduleSnapshot(
 }
 
 function readFeeScheduleSnapshotInner(
-  value: FeeScheduleSnapshot,
+  offered: FeeScheduleSnapshot,
 ): SimulationResult<FeeScheduleSnapshot> {
+  // D1 BEFORE anything else (round-2 review, MEDIUM-1): the snapshot is a CALLER
+  // record, so it is materialized into a fresh prototype-free tree — from
+  // descriptors, cycle-guarded, depth-bounded — and everything below reads THAT
+  // tree. Emitting a copy of the caller's own object was how a getter got
+  // invoked and how a cyclic snapshot blew the stack.
+  const read = readOwnPlainInput<FeeScheduleSnapshot>(offered, "the fee schedule snapshot");
+  if (!read.ok) return read;
+  const value = read.value;
   if (value === null || typeof value !== "object") {
     return simulationFailure(
       "FILL_MODEL_FEE_SNAPSHOT_MISSING",
@@ -267,8 +304,8 @@ export function roundDecimal(
       { offered: describeForRefusal(places) },
     );
   }
-  const rounding = readRoundingMode(mode);
-  if (!rounding.ok) return rounding;
+  const rule = roundingRuleFor(mode);
+  if (rule === undefined) return unknownRoundingMode(mode);
 
   const negative = value.startsWith("-");
   const magnitude = negative ? value.slice(1) : value;
@@ -280,7 +317,9 @@ export function roundDecimal(
   }
   const kept = fractionPart.slice(0, places);
   const dropped = fractionPart.slice(places);
-  const roundUp = shouldRoundUp(kept, dropped, rounding.value);
+  const roundUp = shouldRoundUp(kept, dropped, rule);
+  /* c8 ignore next -- unreachable: `rule` is one of four, each named below. */
+  if (roundUp === undefined) return unknownRoundingMode(mode);
   if (!roundUp) return simulationOk(canonical(negative, integerPart, kept));
   const bumped = incrementDigits(`${integerPart}${kept}`);
   const integerLength = bumped.length - kept.length;
@@ -289,34 +328,62 @@ export function roundDecimal(
   );
 }
 
+/**
+ * The rule a mode names, or `undefined` when this module was never told one.
+ *
+ * `Object.hasOwn` first: a bare `FEE_ROUNDING_RULES[mode]` would answer for an
+ * INHERITED name, so `"toString"` would resolve to a function and `"constructor"`
+ * to `Object` — an offered mode must be an OWN key of the table (ADR-020 §1).
+ */
+function roundingRuleFor(mode: FeeRoundingMode): FeeRoundingRule | undefined {
+  if (typeof mode !== "string" || !Object.hasOwn(FEE_ROUNDING_RULES, mode)) return undefined;
+  return FEE_ROUNDING_RULES[mode];
+}
+
+function unknownRoundingMode(mode: FeeRoundingMode): SimulationResult<never> {
+  return simulationFailure(
+    "FILL_MODEL_FEE_SNAPSHOT_MISSING",
+    "the rounding mode must be one this module implements; the venue documentation records the number of decimal places but not the direction, and this simulator does not choose one for the operator",
+    { offered: describeForRefusal(mode), implemented: FEE_ROUNDING_MODES.join(",") },
+  );
+}
+
 /** The closed rounding vocabulary, as a door. An unknown mode is refused. */
 export function readRoundingMode(mode: FeeRoundingMode): SimulationResult<FeeRoundingMode> {
-  if (!FEE_ROUNDING_MODES.includes(mode)) {
-    return simulationFailure(
-      "FILL_MODEL_FEE_SNAPSHOT_MISSING",
-      "the rounding mode must be one this module implements; the venue documentation records the number of decimal places but not the direction, and this simulator does not choose one for the operator",
-      { offered: describeForRefusal(mode), implemented: FEE_ROUNDING_MODES.join(",") },
-    );
-  }
+  if (roundingRuleFor(mode) === undefined) return unknownRoundingMode(mode);
   return simulationOk(mode);
 }
 
-/** Decides the direction. Every branch is a named member of the closed union. */
-function shouldRoundUp(kept: string, dropped: string, mode: FeeRoundingMode): boolean {
+/**
+ * Decides the direction. Every branch is a NAMED member of the closed rule set.
+ *
+ * The `never` witness at the end is the point (round-2 review, N2): a rule added
+ * to {@link FeeRoundingRule} without a branch here fails to compile, and if one
+ * somehow arrives at runtime this answers `undefined`, which
+ * {@link roundDecimal} turns into a refusal. There is no arm that silently
+ * behaves as some other mode.
+ */
+function shouldRoundUp(kept: string, dropped: string, rule: FeeRoundingRule): boolean | undefined {
   if (/^0*$/u.test(dropped)) return false;
-  if (mode === "DOWN") return false;
-  if (mode === "UP") return true;
+  if (rule === "ALWAYS_TOWARD_ZERO") return false;
+  if (rule === "ALWAYS_AWAY_FROM_ZERO") return true;
   const first = dropped.charCodeAt(0) - 0x30;
   if (first > 5) return true;
   if (first < 5) return false;
   const restNonZero = !/^0*$/u.test(dropped.slice(1));
   if (restNonZero) return true;
-  if (mode === "HALF_UP") return true;
-  // HALF_EVEN: round to make the last kept digit even. A negative value rounds
-  // the same way on its magnitude, which is what "half to even" means for a
-  // symmetric mode.
-  const last = kept.length === 0 ? 0 : kept.charCodeAt(kept.length - 1) - 0x30;
-  return last % 2 === 1;
+  if (rule === "TIE_AWAY_FROM_ZERO") return true;
+  if (rule === "TIE_TO_EVEN") {
+    // Round to make the last kept digit even. A negative value rounds the same
+    // way on its magnitude, which is what "half to even" means for a symmetric
+    // mode.
+    const last = kept.length === 0 ? 0 : kept.charCodeAt(kept.length - 1) - 0x30;
+    return last % 2 === 1;
+  }
+  /* c8 ignore next 3 -- unreachable: `rule` is `never` here (compile-time exhaustive). */
+  const unhandled: never = rule;
+  void unhandled;
+  return undefined;
 }
 
 function incrementDigits(digits: string): string {

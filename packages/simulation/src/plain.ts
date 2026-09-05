@@ -16,13 +16,16 @@
  *
  * - **D1** {@link materializeInput} reads a caller value into a fresh
  *   prototype-free tree, from property DESCRIPTORS rather than property reads,
- *   so a getter is refused without being invoked.
+ *   so a getter is refused without being invoked. {@link readOwnPlainInput} is
+ *   the one-line form every door uses, so "a door materializes its caller value
+ *   before touching it" is mechanical rather than a habit.
  * - **D3** is satisfied by construction, because there is no library output to
  *   take values from: {@link ./grammar.js} validates the materialized tree and
  *   every downstream read is of that tree.
  * - **D4** {@link ownPlainCopy} / {@link ownFrozenTree} emit prototype-free, so
  *   an absent optional field of an emitted record can never be answered by a
- *   polluted `Object.prototype` in the consumer.
+ *   polluted `Object.prototype` in the consumer. D4 is an EMIT step: it copies
+ *   trees this package built, and a caller value reaches it only after D1.
  *
  * **D2 does not apply**: D2 is "parse through a severed, warmed arena", and an
  * arena exists to close the library's own `_zod` state reads. There is no
@@ -42,7 +45,12 @@
  * refusal or supply a tree, but it cannot make two reads of one field disagree.
  */
 
-import { ownDataDescriptor } from "./refusals.js";
+import {
+  ownDataDescriptor,
+  simulationFailure,
+  simulationOk,
+  type SimulationResult,
+} from "./refusals.js";
 
 /** Deepest nesting an input may have. A manifest is a record, not a data structure. */
 export const MAX_INPUT_DEPTH = 64;
@@ -252,20 +260,137 @@ function readArray(container: object, path: string, depth: number, state: ReadSt
 }
 
 /**
+ * Reads a CALLER value at a door, or answers that door's typed refusal.
+ *
+ * THE RULE THIS EXISTS TO MAKE MECHANICAL (round-2 review, MEDIUM-1): a door
+ * that takes a caller record materializes it through {@link materializeInput}
+ * FIRST, and validates and emits the materialized tree — never the caller's own
+ * object. {@link ownPlainCopy} is D4, an emitter for trees this package BUILT;
+ * pointing it at a caller object made it the ingress path for a getter (which it
+ * would invoke) and for a cycle (which it would follow until the stack ran out).
+ *
+ * The refusal is `SIMULATION_INPUT_NOT_DATA`, which
+ * {@link ./refusals.js#SIMULATION_REFUSAL_CODES} defines for exactly this class
+ * — "a caller value could not be read as plain data (Proxy, accessor, cycle …)"
+ * — so it is distinguishable from the door's own domain refusals.
+ */
+export function readOwnPlainInput<TValue>(
+  value: unknown,
+  what: string,
+): SimulationResult<TValue> {
+  const materialized = materializeInput(value, what);
+  if (materialized.ok) return simulationOk(materialized.value as TValue);
+  const first = materialized.problems[0];
+  return simulationFailure(
+    "SIMULATION_INPUT_NOT_DATA",
+    `${what} is not plain data and is refused rather than copied: ${first?.problem ?? "it could not be read as data"}`,
+    {
+      at: first?.path ?? what,
+      problems: materialized.problems.length,
+    },
+  );
+}
+
+/**
+ * Thrown when {@link ownPlainCopy} is handed something that is not a finite tree
+ * of own data. Internal: it is an ASSERTION about this package's own emit path.
+ */
+class NotOwnPlainDataError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NotOwnPlainDataError";
+  }
+}
+
+/**
  * A deep, PROTOTYPE-FREE copy of a tree THIS PACKAGE built.
  *
  * Applied to every emitted record (D4). `undefined` members are dropped, so an
  * absent optional field stays absent under any later read whatever sits on
  * `Object.prototype` — the exact adoption route ADR-020 §1 item 1 documents.
+ *
+ * ## Why it reads descriptors, guards cycles and bounds depth (round-2, MEDIUM-1)
+ *
+ * The previous version read members with `value[key]`, which INVOKES a getter —
+ * the exact class {@link materializeInput} exists to prevent — and recursed with
+ * no cycle check and no depth bound, so a cyclic argument raised
+ * `RangeError: Maximum call stack size exceeded` out of the doors that applied
+ * it to caller objects. Those doors now materialize first
+ * ({@link readOwnPlainInput}), so every value reaching here is one this package
+ * built. These guards are therefore ASSERTIONS on that claim rather than input
+ * validation: a violation cannot produce a wrong tree, because it produces no
+ * tree at all. It THROWS rather than returning a partial copy, and every public
+ * seam that can reach it sits inside a totality guard
+ * ({@link ./refusals.js#totally}), which turns the throw into a typed
+ * `SIMULATION_INTERNAL` refusal — measured, door by door, by
+ * `test/unit/simulation/doors.test.ts`.
  */
 export function ownPlainCopy(value: unknown): unknown {
+  return copyOwnPlain(value, 0, new WeakSet<object>());
+}
+
+function copyOwnPlain(value: unknown, depth: number, ancestors: WeakSet<object>): unknown {
   if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((member) => ownPlainCopy(member));
+  const container = value as object;
+  if (ancestors.has(container)) {
+    throw new NotOwnPlainDataError("a cycle: an emitted value is a finite tree of data");
+  }
+  if (depth >= MAX_INPUT_DEPTH) {
+    throw new NotOwnPlainDataError(`nested deeper than ${String(MAX_INPUT_DEPTH)} levels`);
+  }
+  ancestors.add(container);
+  try {
+    return Array.isArray(container)
+      ? copyOwnPlainArray(container, depth, ancestors)
+      : copyOwnPlainObject(container, depth, ancestors);
+  } finally {
+    ancestors.delete(container);
+  }
+}
+
+function copyOwnPlainObject(
+  container: object,
+  depth: number,
+  ancestors: WeakSet<object>,
+): Record<string, unknown> {
   const out = Object.create(null) as Record<string, unknown>;
-  for (const key of Object.keys(value)) {
-    const member = (value as Record<string, unknown>)[key];
+  for (const key of Object.keys(container)) {
+    const descriptor = Object.getOwnPropertyDescriptor(container, key);
+    /* c8 ignore next -- `Object.keys` just reported the key as own and enumerable. */
+    if (descriptor === undefined) continue;
+    // `Object.hasOwn`, not `"value" in descriptor`: with `Object.prototype.value`
+    // defined, `in` reads an accessor descriptor as a data one (WP-180 round 6).
+    if (!Object.hasOwn(descriptor, "value")) {
+      throw new NotOwnPlainDataError(
+        `an accessor property (${key}) is code, not data: it is refused without being invoked`,
+      );
+    }
+    const member = descriptor.value as unknown;
     if (member === undefined) continue;
-    Object.defineProperty(out, key, ownDataDescriptor(ownPlainCopy(member)));
+    Object.defineProperty(out, key, ownDataDescriptor(copyOwnPlain(member, depth + 1, ancestors)));
+  }
+  return out;
+}
+
+function copyOwnPlainArray(
+  container: readonly unknown[],
+  depth: number,
+  ancestors: WeakSet<object>,
+): unknown[] {
+  const out: unknown[] = [];
+  for (let index = 0; index < container.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(container, String(index));
+    if (descriptor === undefined) {
+      // A hole would otherwise be read off `Array.prototype` by any later index
+      // read, which is the adoption class ADR-020 §1 item 1 documents.
+      throw new NotOwnPlainDataError("a sparse array hole is not data");
+    }
+    if (!Object.hasOwn(descriptor, "value")) {
+      throw new NotOwnPlainDataError(
+        `an accessor element ([${String(index)}]) is code, not data: it is refused without being invoked`,
+      );
+    }
+    out.push(copyOwnPlain(descriptor.value as unknown, depth + 1, ancestors));
   }
   return out;
 }

@@ -55,9 +55,15 @@ import { addDecimal, compareDecimal, isCanonicalDecimalString, mulDecimal, subDe
 import { computeFee, readFeeScheduleSnapshot, type FeeScheduleSnapshot } from "./fees.js";
 import { simulatedFill, type FillModelIdentity, type SimulatedFill } from "./fill-model.js";
 import { isNonEmptyString, isNonNegativeInteger, isUnsignedIntegerString } from "./grammar.js";
-import { ownFrozenTree } from "./plain.js";
+import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import type { RecordedEventIdentity } from "./ports.js";
-import { simulationFailure, simulationOk, totally, type SimulationResult } from "./refusals.js";
+import {
+  describeForRefusal,
+  simulationFailure,
+  simulationOk,
+  totally,
+  type SimulationResult,
+} from "./refusals.js";
 
 /** The three §12.2 scenarios. There is no fourth and no "point estimate". */
 export const QUEUE_SCENARIOS = ["OPTIMISTIC", "BASE", "CONSERVATIVE"] as const;
@@ -85,6 +91,20 @@ export interface QueueModelParameters {
 export function readQueueModelParameters(
   parameters: QueueModelParameters,
 ): SimulationResult<QueueModelParameters> {
+  return totally("reading the queue model parameters", () =>
+    readQueueModelParametersInner(parameters),
+  );
+}
+
+function readQueueModelParametersInner(
+  offered: QueueModelParameters,
+): SimulationResult<QueueModelParameters> {
+  // D1 (round-2 review, MEDIUM-1): the parameters are a CALLER record, so they
+  // are materialized — descriptor-based, cycle-guarded, depth-bounded — before
+  // anything reads or copies them.
+  const read = readOwnPlainInput<QueueModelParameters>(offered, "the queue model parameters");
+  if (!read.ok) return read;
+  const parameters = read.value;
   if (parameters === null || typeof parameters !== "object") {
     return simulationFailure(
       "FILL_MODEL_PARAMETERS_UNPINNED",
@@ -102,6 +122,19 @@ export function readQueueModelParameters(
       "FILL_MODEL_PARAMETERS_UNPINNED",
       "the queue model must state its basis; ADR-012 §7 records that no probe or live-micro observation exists to fit one",
     );
+  }
+  for (const [name, table] of [
+    ["cancellationRatio", parameters.cancellationRatio],
+    ["cancelEffectiveAfterMs", parameters.cancelEffectiveAfterMs],
+    ["placedBehindSameInstantAdditions", parameters.placedBehindSameInstantAdditions],
+  ] as const) {
+    if (table === null || typeof table !== "object") {
+      return simulationFailure(
+        "FILL_MODEL_PARAMETERS_UNPINNED",
+        `${name} must state a value for each of the three §12.2 scenarios`,
+        { table: name },
+      );
+    }
   }
   for (const scenario of QUEUE_SCENARIOS) {
     const ratio = parameters.cancellationRatio[scenario];
@@ -158,6 +191,62 @@ export function readQueueModelParameters(
   return simulationOk(ownFrozenTree(parameters));
 }
 
+/**
+ * What was OBSERVED about size added at our price in the same recorded instant
+ * we placed — including the fact that nothing was looked at (round-2 review, L4).
+ *
+ * A bare `"0"` conflated two different facts: "we looked and saw nothing added"
+ * and "we did not look". Only the first supports the CONSERVATIVE scenario's
+ * claim to be conservative; the second means its queue-ahead assumption rests on
+ * an unmeasured quantity, and a reader of the band has to be able to see that.
+ * Every sibling seam in this package already names its absences
+ * (`NOT_MODELED`, `ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS`,
+ * `NOT_AVAILABLE_ARCHIVED_ONLY`); this is the same idiom.
+ *
+ * There is no default: the composition root states one of the two, and
+ * {@link readSameInstantAdditions} refuses anything else — including the bare
+ * decimal string the previous shape took.
+ */
+export type SameInstantAdditions =
+  /** The root did not observe same-instant additions at all. */
+  | "NOT_OBSERVED"
+  /** The root looked, and this is the size it observed (`"0"` is a real answer). */
+  | { readonly observedShares: string };
+
+/**
+ * Validates a {@link SameInstantAdditions}. Required; never defaulted.
+ */
+export function readSameInstantAdditions(
+  value: SameInstantAdditions,
+): SimulationResult<SameInstantAdditions> {
+  if (value === "NOT_OBSERVED") return simulationOk(value);
+  if (value === null || typeof value !== "object") {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      'same-instant additions are stated as `"NOT_OBSERVED"` or `{ observedShares }`; a bare quantity cannot say whether a root looked and saw nothing or never looked',
+      { offered: describeForRefusal(value) },
+    );
+  }
+  const shares = value.observedShares;
+  if (!isCanonicalDecimalString(shares) || compareDecimal(shares, "0") < 0) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "observed same-instant additions must be a non-negative canonical decimal string (§6 invariant 1)",
+      { offered: describeForRefusal(shares) },
+    );
+  }
+  return simulationOk(value);
+}
+
+/** The shares a {@link SameInstantAdditions} contributes to the queue ahead. */
+function additionsShares(value: SameInstantAdditions): string {
+  // A root that did not look observed no additions, so nothing is ADDED to the
+  // queue ahead — and the band carries `NOT_OBSERVED` on its face so a reader
+  // can see that the conservative arm rests on an unmeasured quantity rather
+  // than on a measured zero.
+  return value === "NOT_OBSERVED" ? "0" : value.observedShares;
+}
+
 /** One observed trade at or through the resting price. */
 export interface ObservedTrade {
   readonly price: string;
@@ -178,8 +267,8 @@ export interface RestingOrderInput {
   readonly shares: string;
   /** Aggregate size observed AT the resting price when the order was placed. */
   readonly queueAheadAtPlacement: string;
-  /** Size added at the resting price in the same recorded instant as placement. */
-  readonly sameInstantAdditionsShares: string;
+  /** What was observed about size added at the resting price in the same instant. */
+  readonly sameInstantAdditions: SameInstantAdditions;
   /** Recorded monotonic instant the order rested at. */
   readonly restingFromNs: bigint;
   /** Recorded monotonic instant a cancel was requested, when one was. */
@@ -226,6 +315,15 @@ export interface RestingFillBand {
   readonly simulatedOrderId: string;
   readonly marketId: string;
   readonly restingPrice: string;
+  /**
+   * What the composition root observed about same-instant additions — including
+   * that it did not look ({@link SameInstantAdditions}).
+   *
+   * On the BAND, and in its serialization, because it is an input the
+   * CONSERVATIVE scenario's queue ahead depends on and the other two do not: a
+   * reader comparing the three arms has to know whether that input was measured.
+   */
+  readonly sameInstantAdditions: SameInstantAdditions;
   readonly optimistic: RestingScenarioOutcome<"OPTIMISTIC">;
   readonly base: RestingScenarioOutcome<"BASE">;
   readonly conservative: RestingScenarioOutcome<"CONSERVATIVE">;
@@ -269,19 +367,42 @@ function simulateRestingInner(input: {
       { tier: input.model.tier },
     );
   }
-  for (const value of [
-    input.order.restingPrice,
-    input.order.shares,
-    input.order.queueAheadAtPlacement,
-    input.order.sameInstantAdditionsShares,
-  ]) {
+  if (!isCanonicalDecimalString(input.order.restingPrice)) {
+    return simulationFailure(
+      "SIMULATION_INPUT_INVALID",
+      "resting-order quantities must be canonical decimal strings (§6 invariant 1)",
+      { field: "restingPrice", offered: describeForRefusal(input.order.restingPrice) },
+    );
+  }
+  // THE HYPOTHESES OF THE DERIVATION, ENFORCED WHERE IT IS CITED (round-2 review,
+  // MEDIUM-2). `checkBandOrdering`'s pre-cancel ordering proof reasons over
+  // NON-NEGATIVE quantities: `q' = max(0, max(0, q − ratio × s) − s)` is monotone
+  // in `ratio` and in the starting queue only while `q` and `s` are non-negative.
+  // The venue guards its own inputs (`venue.ts` `#rest` / `observeTrade`), but a
+  // caller reaching this door directly used to get a NONSENSE band — or, for
+  // negative additions, a band-inconsistency refusal that blamed the derivation
+  // for an input the door never checked. The bounds are the venue's, exactly.
+  for (const [field, value] of [
+    ["shares", input.order.shares],
+    ["queueAheadAtPlacement", input.order.queueAheadAtPlacement],
+  ] as const) {
     if (!isCanonicalDecimalString(value)) {
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "resting-order quantities must be canonical decimal strings (§6 invariant 1)",
+        { field, offered: describeForRefusal(value) },
+      );
+    }
+    if (compareDecimal(value, "0") < 0) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        `a resting order's ${field} is non-negative; the band's pre-cancel ordering is derived over non-negative quantities and is not a property of a negative one`,
+        { field, offered: value },
       );
     }
   }
+  const additions = readSameInstantAdditions(input.order.sameInstantAdditions);
+  if (!additions.ok) return additions;
   if (!isNonEmptyString(input.order.simulatedOrderId) || !isNonEmptyString(input.order.marketId)) {
     return simulationFailure(
       "SIMULATION_INPUT_INVALID",
@@ -298,6 +419,7 @@ function simulateRestingInner(input: {
   const shared = {
     model: input.model,
     order: input.order,
+    additions: additions.value,
     trades: trades.value,
     parameters: parameters.value,
     feeSnapshot: feeSnapshot.value,
@@ -315,6 +437,7 @@ function simulateRestingInner(input: {
     simulatedOrderId: input.order.simulatedOrderId,
     marketId: input.order.marketId,
     restingPrice: input.order.restingPrice,
+    sameInstantAdditions: additions.value,
     optimistic: optimistic.value,
     base: base.value,
     conservative: conservative.value,
@@ -381,6 +504,20 @@ function simulateRestingInner(input: {
  *    (behind-same-instant-additions) queue only in `CONSERVATIVE`, so both
  *    inputs point the same way and the ordering follows. A trade THROUGH the
  *    price fills the whole remainder in every scenario, which preserves it.
+ *
+ * ## Where the derivation's HYPOTHESES are enforced (round-2 review, MEDIUM-2)
+ *
+ * Item 4's monotonicity holds for NON-NEGATIVE quantities. It is not a property
+ * of a negative one: with a negative traded size the per-trade step runs
+ * backwards — the queue ahead GROWS — and the scenarios can come out ordered
+ * either way. So the hypotheses are checked at the doors that state them, not
+ * assumed from the venue that happens to be upstream today:
+ * {@link simulateResting} refuses a negative `shares` or `queueAheadAtPlacement`
+ * and a `sameInstantAdditions` that is not a valid
+ * {@link SameInstantAdditions}, and {@link readObservedTrades} refuses a trade
+ * whose size is not positive. Those are the venue's own bounds
+ * (`venue.ts` `#rest` and `observeTrade`), which remain in place; this door no
+ * longer depends on them.
  */
 export function checkBandOrdering(band: RestingFillBand): SimulationResult<RestingFillBand> {
   return totally("checking a resting band", () => checkBandOrderingInner(band));
@@ -390,6 +527,10 @@ function checkBandOrderingInner(band: RestingFillBand): SimulationResult<Resting
   if (band === null || typeof band !== "object") {
     return simulationFailure("SIMULATION_INPUT_INVALID", "a band must be a record");
   }
+  // The band states what it observed about same-instant additions, or that it
+  // did not look; a band that states neither is not readable as a band at all.
+  const additions = readSameInstantAdditions(band.sameInstantAdditions);
+  if (!additions.ok) return additions;
   const members: readonly (readonly [string, QueueScenario, RestingScenarioOutcome])[] = [
     ["optimistic", "OPTIMISTIC", band.optimistic],
     ["base", "BASE", band.base],
@@ -567,7 +708,20 @@ function readObservedTrades(
       return simulationFailure(
         "SIMULATION_INPUT_INVALID",
         "an observed trade carries a non-canonical decimal",
-        { index, price: String(trade.price), shares: String(trade.shares) },
+        { index, price: describeForRefusal(trade.price), shares: describeForRefusal(trade.shares) },
+      );
+    }
+    // The venue's own bound (`venue.ts` `observeTrade`), enforced HERE too
+    // (round-2 review, MEDIUM-2): a negative traded size ran the queue walk
+    // BACKWARDS — `queueAhead` grew — and produced a band whose scenarios could
+    // come out ordered the wrong way, which the derivation above claims cannot
+    // happen. It cannot, for the non-negative sizes the derivation assumes; so
+    // the assumption is checked rather than hoped for.
+    if (compareDecimal(trade.shares, "0") <= 0) {
+      return simulationFailure(
+        "SIMULATION_INPUT_INVALID",
+        "an observed trade has positive size; a non-positive one is not a trade, and the queue walk's monotonicity in the cancellation ratio is derived over positive traded size",
+        { index, shares: trade.shares },
       );
     }
     if (typeof trade.monotonicNs !== "bigint" || trade.monotonicNs < 0n) {
@@ -599,6 +753,7 @@ function runScenario<TScenario extends QueueScenario>(input: {
   readonly scenario: TScenario;
   readonly model: FillModelIdentity;
   readonly order: RestingOrderInput;
+  readonly additions: SameInstantAdditions;
   readonly trades: readonly ObservedTrade[];
   readonly parameters: QueueModelParameters;
   readonly feeSnapshot: FeeScheduleSnapshot;
@@ -608,7 +763,7 @@ function runScenario<TScenario extends QueueScenario>(input: {
   const behind = parameters.placedBehindSameInstantAdditions[scenario];
 
   const queueAheadAtPlacement = behind
-    ? addDecimal(order.queueAheadAtPlacement, order.sameInstantAdditionsShares)
+    ? addDecimal(order.queueAheadAtPlacement, additionsShares(input.additions))
     : order.queueAheadAtPlacement;
 
   const cancelEffectiveAtNs =

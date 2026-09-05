@@ -318,6 +318,21 @@ describe("the fee model (ADR-012 §5.4)", () => {
     expect(roundDecimal("1.005", 2, "SIDEWAYS" as FeeRoundingMode).ok).toBe(false);
   });
 
+  it("REFUSES an INHERITED name offered as a rounding mode", () => {
+    // Round-2 review N2: the closed vocabulary is now a `Record` keyed by mode,
+    // and a bare `TABLE[mode]` answers for a name on `Object.prototype` — so
+    // `"constructor"` would resolve to `Object` and read as a known mode. The
+    // lookup is `Object.hasOwn`-guarded (ADR-020 §1), so it does not.
+    for (const inherited of ["constructor", "toString", "__proto__", "valueOf", "hasOwnProperty"]) {
+      expect(readRoundingMode(inherited as FeeRoundingMode).ok, inherited).toBe(false);
+      expect(roundDecimal("1.005", 2, inherited as FeeRoundingMode).ok, inherited).toBe(false);
+    }
+    // …and the four it does implement are still accepted, so this is not vacuous.
+    for (const mode of ["HALF_UP", "HALF_EVEN", "UP", "DOWN"] as const) {
+      expect(readRoundingMode(mode).ok, mode).toBe(true);
+    }
+  });
+
   it("REFUSES a snapshot whose rate is not a canonical decimal, rather than throwing", () => {
     const hostile = computeFee({
       shares: "100",
@@ -632,7 +647,7 @@ describe("Tier 1 resting orders — queue-ahead and the band (§12.2)", () => {
         restingPrice: "0.5",
         shares: "50",
         queueAheadAtPlacement: "100",
-        sameInstantAdditionsShares: "0",
+        sameInstantAdditions: { observedShares: "0" },
         restingFromNs: 0n,
       },
       trades: [{ price: "0.5", shares: "130", monotonicNs: 1_000n, atEvent: AT_EVENT }],
@@ -659,7 +674,7 @@ describe("Tier 1 resting orders — queue-ahead and the band (§12.2)", () => {
         restingPrice: "0.5",
         shares: "50",
         queueAheadAtPlacement: "1000",
-        sameInstantAdditionsShares: "0",
+        sameInstantAdditions: { observedShares: "0" },
         restingFromNs: 0n,
       },
       trades: [{ price: "0.49", shares: "1", monotonicNs: 1_000n, atEvent: AT_EVENT }],
@@ -683,7 +698,7 @@ describe("Tier 1 resting orders — queue-ahead and the band (§12.2)", () => {
         restingPrice: "0.5",
         shares: "50",
         queueAheadAtPlacement: "100",
-        sameInstantAdditionsShares: "40",
+        sameInstantAdditions: { observedShares: "40" },
         restingFromNs: 0n,
       },
       trades: [{ price: "0.5", shares: "120", monotonicNs: 1_000n, atEvent: AT_EVENT }],
@@ -710,7 +725,7 @@ describe("Tier 1 resting orders — queue-ahead and the band (§12.2)", () => {
         restingPrice: "0.5",
         shares: "50",
         queueAheadAtPlacement: "0",
-        sameInstantAdditionsShares: "0",
+        sameInstantAdditions: { observedShares: "0" },
         restingFromNs: 0n,
         cancelRequestedAtNs: 0n,
       },
@@ -745,7 +760,7 @@ describe("Tier 1 resting orders — queue-ahead and the band (§12.2)", () => {
       restingPrice: "0.5",
       shares: "50",
       queueAheadAtPlacement: "0",
-      sameInstantAdditionsShares: "0",
+      sameInstantAdditions: { observedShares: "0" },
       restingFromNs: 0n,
       cancelRequestedAtNs: 4_000n,
     };
@@ -780,6 +795,121 @@ describe("Tier 1 resting orders — queue-ahead and the band (§12.2)", () => {
     expect(unsorted.refusal.code).toBe("SIMULATION_INPUT_INVALID");
     expect(unsorted.refusal.message).toContain("non-decreasing");
   });
+
+  // -------------------------------------------------------------------------
+  // The derivation's HYPOTHESES, enforced at the door that cites them
+  // (round-2 review, MEDIUM-2)
+  // -------------------------------------------------------------------------
+
+  const signedOrder = {
+    simulatedOrderId: "o-1",
+    marketId: MARKET.marketId,
+    tokenId: "1234",
+    side: "YES" as const,
+    action: "BUY" as const,
+    restingPrice: "0.5",
+    shares: "50",
+    queueAheadAtPlacement: "100",
+    sameInstantAdditions: { observedShares: "0" },
+    restingFromNs: 0n,
+  };
+  const noCancellation: QueueModelParameters = {
+    ...QUEUE,
+    cancellationRatio: { OPTIMISTIC: "0", BASE: "0", CONSERVATIVE: "0" },
+  };
+
+  it("REFUSES a NEGATIVE observed trade size instead of computing a nonsense band", () => {
+    // Reviewer probe: `trade.shares = "-57"` was ACCEPTED at `52a058b` and the
+    // queue ahead GREW (100 -> 185.5 optimistic, 157 conservative) because the
+    // per-trade step ran backwards. `checkBandOrdering`'s pre-cancel ordering is
+    // derived over non-negative sizes, so with a negative one the ordering it
+    // asserts is not a property of the model at all — in 775 of the reviewer's
+    // 200k randomized negative-input trials it actually inverted.
+    const outcome = simulateResting({
+      model,
+      order: signedOrder,
+      trades: [{ price: "0.5", shares: "-57", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+    expect(outcome.refusal.message).toContain("positive size");
+    // The refusal names the TRADE, not the band's ordering.
+    expect(outcome.refusal.message).not.toContain("OPTIMISTIC >= BASE");
+  });
+
+  it("REFUSES a zero-size observed trade too — the venue's own bound, exactly", () => {
+    const outcome = simulateResting({
+      model,
+      order: signedOrder,
+      trades: [{ price: "0.5", shares: "0", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.message).toContain("positive size");
+  });
+
+  it("REFUSES negative same-instant additions, and says WHY — not by blaming the band", () => {
+    // Reviewer probe: `sameInstantAdditionsShares = "-40"` produced a
+    // `FILL_MODEL_BAND_INCONSISTENT` refusal reading "the band is not ordered …
+    // which follows from the parameter ordering", which MISATTRIBUTED an
+    // unvalidated input to the derivation. The input is now refused where the
+    // derivation is written down.
+    const outcome = simulateResting({
+      model,
+      order: { ...signedOrder, sameInstantAdditions: { observedShares: "-40" } },
+      trades: [{ price: "0.5", shares: "120", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: noCancellation,
+      feeSnapshot: FEES,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+    expect(outcome.refusal.message).toContain("non-negative");
+    expect(outcome.refusal.code).not.toBe("FILL_MODEL_BAND_INCONSISTENT");
+    expect(outcome.refusal.message).not.toContain("the band is not ordered");
+  });
+
+  it.each([
+    ["shares", "-50"],
+    ["queueAheadAtPlacement", "-100"],
+  ] as const)("REFUSES a negative %s at the door, naming the field", (field, value) => {
+    const outcome = simulateResting({
+      model,
+      order: { ...signedOrder, [field]: value },
+      trades: [{ price: "0.5", shares: "120", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+    expect(outcome.refusal.message).toContain(field);
+    expect(outcome.refusal.message).toContain("non-negative");
+  });
+
+  it("still ACCEPTS the boundary values the bounds admit", () => {
+    // The bounds are the venue's, exactly: quantities >= 0 and traded size > 0.
+    // A zero queue ahead and zero observed additions are ordinary facts.
+    const outcome = simulateResting({
+      model,
+      order: {
+        ...signedOrder,
+        queueAheadAtPlacement: "0",
+        sameInstantAdditions: { observedShares: "0" },
+      },
+      trades: [{ price: "0.5", shares: "0.000001", monotonicNs: 1_000n, atEvent: AT_EVENT }],
+      parameters: QUEUE,
+      feeSnapshot: FEES,
+    });
+    expect(outcome.ok, outcome.ok ? "" : `${outcome.refusal.code}: ${outcome.refusal.message}`).toBe(
+      true,
+    );
+  });
 });
 
 describe("the band's ordering claim is exactly what the parameters imply (§12.2, ADR-012 §1)", () => {
@@ -797,7 +927,7 @@ describe("the band's ordering claim is exactly what the parameters imply (§12.2
     restingPrice: "0.5",
     shares: "50",
     queueAheadAtPlacement: "100",
-    sameInstantAdditionsShares: "0",
+    sameInstantAdditions: { observedShares: "0" },
     restingFromNs: 0n,
     cancelRequestedAtNs: 0n,
   };
@@ -883,7 +1013,7 @@ describe("the band's ordering claim is exactly what the parameters imply (§12.2
         ...restingOrder,
         shares: "1000",
         queueAheadAtPlacement: "100",
-        sameInstantAdditionsShares: "50",
+        sameInstantAdditions: { observedShares: "50" },
         cancelRequestedAtNs: 10_000n,
       },
       trades: [{ price: "0.5", shares: "100", monotonicNs: 1_000n, atEvent: AT_EVENT }],
@@ -909,7 +1039,7 @@ describe("the band's ordering claim is exactly what the parameters imply (§12.2
         ...withoutCancelRequest(restingOrder),
         shares: "1000",
         queueAheadAtPlacement: "100",
-        sameInstantAdditionsShares: "50",
+        sameInstantAdditions: { observedShares: "50" },
       },
       trades: [{ price: "0.5", shares: "100", monotonicNs: 1_000n, atEvent: AT_EVENT }],
       parameters: QUEUE,
@@ -1037,7 +1167,7 @@ describe("what may be quoted in a deployment decision (ADR-012 §1)", () => {
         restingPrice: "0.5",
         shares: "50",
         queueAheadAtPlacement: "10",
-        sameInstantAdditionsShares: "0",
+        sameInstantAdditions: { observedShares: "0" },
         restingFromNs: 0n,
       },
       trades: [{ price: "0.5", shares: "30", monotonicNs: 1_000n, atEvent: AT_EVENT }],

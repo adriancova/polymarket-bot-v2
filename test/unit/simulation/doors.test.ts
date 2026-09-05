@@ -41,6 +41,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { Uuidv7Schema } from "../../../packages/domain/src/index.js";
 import {
+  MAX_INPUT_DEPTH,
   isCanonicalUuidV7,
   isIsoTimestamp,
   loadDataset,
@@ -48,12 +49,22 @@ import {
   ownFrozenTree,
   parseStrictJsonText,
   readDatasetManifestText,
+  readFeeScheduleSnapshot,
+  readLatencyDistribution,
+  readLatencyModel,
+  readQueueModelParameters,
   readRunPins,
   simulationRefusal,
   SimulatedVenue,
   tier0Model,
   unmodeledRateLimits,
   createReplayClock,
+  type FeeScheduleSnapshot,
+  type LatencyDistribution,
+  type LatencyModel,
+  type QueueModelParameters,
+  type ReplayRunPins,
+  type SimulationResult,
 } from "../../../packages/simulation/src/index.js";
 
 import * as simulation from "../../../packages/simulation/src/index.js";
@@ -300,7 +311,7 @@ describe("the bound: a SAFETY_CANCEL is byte-identical under pollution", () => {
       policy: {
         timeInForceFor: () => "GTC",
         statedExpiryNsFor: () => undefined,
-        sameInstantAdditionsSharesFor: () => "0",
+        sameInstantAdditionsFor: () => "NOT_OBSERVED",
       },
       startingCash: "1000",
     });
@@ -544,6 +555,76 @@ const PURE_HELPERS: Readonly<Record<string, string>> = Object.freeze({
   unmodeledRateLimits: "rate-limit.ts — takes a disclosure string",
 });
 
+// ---------------------------------------------------------------------------
+// The two argument classes the round-2 review found missing from the battery
+// ---------------------------------------------------------------------------
+
+/**
+ * A record that contains itself. Walking it without a cycle guard never ends.
+ *
+ * It is a VALID queue-parameter set with a self-reference added, and that is the
+ * point: a cyclic record that a door rejects on its first field never reaches
+ * the door's copy step, so it would not measure anything. This one passes every
+ * check `readQueueModelParameters` makes and arrives at the emit path with the
+ * cycle intact — which is where `52a058b` raised
+ * `RangeError: Maximum call stack size exceeded`.
+ */
+function cyclicRecord(): Record<string, unknown> {
+  const cyclic: Record<string, unknown> = {
+    queueModelVersion: "sim/queue/v1",
+    cancellationRatio: { OPTIMISTIC: "0.5", BASE: "0.1", CONSERVATIVE: "0" },
+    cancelEffectiveAfterMs: { OPTIMISTIC: 10, BASE: 50, CONSERVATIVE: 250 },
+    placedBehindSameInstantAdditions: { OPTIMISTIC: false, BASE: false, CONSERVATIVE: true },
+    basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+  };
+  cyclic["self"] = cyclic;
+  return cyclic;
+}
+
+/** An array that contains itself. */
+function cyclicArray(): unknown[] {
+  const cyclic: unknown[] = [1];
+  cyclic.push(cyclic);
+  return cyclic;
+}
+
+/** How many times any getter on {@link getterBearingRecord}'s output ran. */
+let gettersInvoked = 0;
+
+/** A record whose members are CODE. A door that reads it by name runs it. */
+function getterBearingRecord(): Record<string, unknown> {
+  const hostile = Object.create(null) as Record<string, unknown>;
+  Object.setPrototypeOf(hostile, Object.prototype);
+  for (const key of [
+    "queueModelVersion",
+    "latencyModelVersion",
+    "snapshotVersion",
+    "samples",
+    "basis",
+    "cancellationRatio",
+    "takerFeeRate",
+    "roundingMode",
+    "shares",
+  ]) {
+    Object.defineProperty(hostile, key, {
+      get: () => {
+        gettersInvoked += 1;
+        return "invoked";
+      },
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  return hostile;
+}
+
+/** A record nested past {@link MAX_INPUT_DEPTH}. */
+function deeplyNestedRecord(depth: number): Record<string, unknown> {
+  let node: Record<string, unknown> = { leaf: true };
+  for (let level = 0; level < depth; level += 1) node = { nested: node };
+  return node;
+}
+
 describe("the bound: no throw escapes any door of this package", () => {
   /** A venue built with only the options every path needs. */
   function hostileVenue(): SimulatedVenue {
@@ -569,7 +650,7 @@ describe("the bound: no throw escapes any door of this package", () => {
       policy: {
         timeInForceFor: () => "GTC",
         statedExpiryNsFor: () => undefined,
-        sameInstantAdditionsSharesFor: () => "0",
+        sameInstantAdditionsFor: () => "NOT_OBSERVED",
       },
       startingCash: "1000",
       books: {
@@ -620,6 +701,17 @@ describe("the bound: no throw escapes any door of this package", () => {
       new Proxy({}, {}),
       Symbol("hostile"),
       0n,
+      // Round-2 review MEDIUM-1: the two classes this battery was MISSING, even
+      // though the same file measures both against `materializeInput` above. A
+      // cyclic argument raised `RangeError: Maximum call stack size exceeded`
+      // out of `readQueueModelParameters`, `readLatencyDistribution` and
+      // `readLatencyModel`, and a getter-bearing one was ACCEPTED with the
+      // getter invoked. Both are driven against EVERY door here, so a door added
+      // later is covered without anyone remembering to add it.
+      cyclicRecord(),
+      cyclicArray(),
+      getterBearingRecord(),
+      deeplyNestedRecord(MAX_INPUT_DEPTH + 8),
     ];
 
     const escapes: string[] = [];
@@ -710,5 +802,269 @@ describe("the bound: no throw escapes any door of this package", () => {
       expect(typeof result.refusalCode).toBe("string");
     }
   });
+});
 
+// ---------------------------------------------------------------------------
+// D1 at the doors that take a CALLER RECORD (round-2 review, MEDIUM-1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every door whose argument is a caller-supplied RECORD, with a VALID example.
+ *
+ * The battery above proves no throw escapes; these prove the stronger property
+ * the fix is actually about: each of these doors materializes its argument
+ * first, so a cycle is REFUSED (typed) rather than followed until the stack runs
+ * out, and a getter is REFUSED WITHOUT BEING INVOKED.
+ *
+ * Measured at `52a058b` before the fix: the first three THREW
+ * `RangeError: Maximum call stack size exceeded` on the cyclic argument, and the
+ * fee and queue doors answered `ok: true` on the getter-bearing one having run
+ * the getter once — `ownPlainCopy` read members with `value[key]`.
+ */
+const RECORD_DOORS: readonly {
+  readonly name: string;
+  readonly valid: () => unknown;
+  readonly drive: (value: unknown) => SimulationResult<unknown>;
+}[] = [
+  {
+    name: "readQueueModelParameters",
+    valid: () => ({
+      queueModelVersion: "sim/queue/v1",
+      cancellationRatio: { OPTIMISTIC: "0.5", BASE: "0.1", CONSERVATIVE: "0" },
+      cancelEffectiveAfterMs: { OPTIMISTIC: 10, BASE: 50, CONSERVATIVE: 250 },
+      placedBehindSameInstantAdditions: { OPTIMISTIC: false, BASE: false, CONSERVATIVE: true },
+      basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+    }),
+    drive: (value) => readQueueModelParameters(value as QueueModelParameters),
+  },
+  {
+    name: "readLatencyDistribution",
+    valid: () => ({ samples: [{ milliseconds: 1, weight: 1 }] }),
+    drive: (value) => readLatencyDistribution(value as LatencyDistribution, "decision"),
+  },
+  {
+    name: "readLatencyModel",
+    valid: () => ({
+      latencyModelVersion: "sim/latency/v1",
+      decision: { samples: [{ milliseconds: 1, weight: 1 }] },
+      signing: { samples: [{ milliseconds: 1, weight: 1 }] },
+      network: { samples: [{ milliseconds: 1, weight: 1 }] },
+      venue: { samples: [{ milliseconds: 1, weight: 1 }] },
+      basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+    }),
+    drive: (value) => readLatencyModel(value as LatencyModel),
+  },
+  {
+    name: "readFeeScheduleSnapshot",
+    valid: () => ({
+      snapshotVersion: "fees/2026-08-24",
+      takerFeeRate: "0.07",
+      makerFeeRate: "0",
+      roundingDecimalPlaces: 5,
+      roundingMode: "HALF_UP",
+      minimumChargedFee: "0.00001",
+      feeCurrency: "USDC",
+    }),
+    drive: (value) => readFeeScheduleSnapshot(value as FeeScheduleSnapshot),
+  },
+  {
+    name: "readRunPins",
+    valid: () => runPins(),
+    drive: (value) => readRunPins(value as ReplayRunPins),
+  },
+];
+
+describe("D1: a door materializes its caller record before it touches it", () => {
+  it("every record door ACCEPTS its valid example (the probes below are not vacuous)", () => {
+    const faults: string[] = [];
+    for (const door of RECORD_DOORS) {
+      const outcome = door.drive(door.valid());
+      if (!outcome.ok) {
+        faults.push(`${door.name}: ${outcome.refusal.code}: ${outcome.refusal.message}`);
+      }
+    }
+    expect(faults, faults.join("\n")).toEqual([]);
+    // Every door the round-2 review named, plus the fifth instance of the same
+    // pattern it did not, is in the table — so the probes below cover all five.
+    expect(RECORD_DOORS.map((door) => door.name).sort()).toEqual([
+      "readFeeScheduleSnapshot",
+      "readLatencyDistribution",
+      "readLatencyModel",
+      "readQueueModelParameters",
+      "readRunPins",
+    ]);
+  });
+
+  it("REFUSES a cyclic argument, typed, instead of exhausting the stack", () => {
+    // Faults are COLLECTED, not asserted inside the loop: a bare `expect` throws
+    // on the first door and the remaining ones are never measured, so a
+    // regression in the fifth door would hide behind a regression in the first.
+    // Every door below is driven on every run.
+    const faults: string[] = [];
+    for (const door of RECORD_DOORS) {
+      const cyclic = door.valid() as Record<string, unknown>;
+      cyclic["self"] = cyclic;
+      let outcome: SimulationResult<unknown> | undefined;
+      let thrown: unknown;
+      try {
+        outcome = door.drive(cyclic);
+      } catch (cause) {
+        thrown = cause;
+      }
+      if (thrown !== undefined) {
+        faults.push(`${door.name}: threw ${String(thrown)}`);
+        continue;
+      }
+      if (outcome === undefined || outcome.ok) {
+        faults.push(`${door.name}: accepted a cyclic record`);
+        continue;
+      }
+      if (outcome.refusal.code !== "SIMULATION_INPUT_NOT_DATA") {
+        faults.push(`${door.name}: refused with ${outcome.refusal.code}`);
+      }
+      if (!outcome.refusal.message.includes("cycle")) {
+        faults.push(`${door.name}: did not name the cycle — ${outcome.refusal.message}`);
+      }
+    }
+    expect(faults, faults.join("\n")).toEqual([]);
+  });
+
+  it("REFUSES a nested cycle — the guard is on the whole tree, not the root", () => {
+    const nested = { samples: [{ milliseconds: 1, weight: 1 }] } as Record<string, unknown>;
+    const inner = { deeper: {} } as Record<string, unknown>;
+    inner["deeper"] = inner;
+    nested["extra"] = inner;
+    const outcome = readLatencyDistribution(nested as unknown as LatencyDistribution, "decision");
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.refusal.code).toBe("SIMULATION_INPUT_NOT_DATA");
+  });
+
+  it("REFUSES a getter-bearing argument WITHOUT INVOKING the getter", () => {
+    const faults: string[] = [];
+    for (const door of RECORD_DOORS) {
+      let invoked = 0;
+      const hostile = door.valid() as Record<string, unknown>;
+      Object.defineProperty(hostile, "hostile", {
+        get: () => {
+          invoked += 1;
+          return "value";
+        },
+        enumerable: true,
+        configurable: true,
+      });
+      let outcome: SimulationResult<unknown> | undefined;
+      let thrown: unknown;
+      try {
+        outcome = door.drive(hostile);
+      } catch (cause) {
+        thrown = cause;
+      }
+      if (invoked !== 0) faults.push(`${door.name}: INVOKED the getter ${String(invoked)}x`);
+      if (thrown !== undefined) {
+        faults.push(`${door.name}: threw ${String(thrown)}`);
+        continue;
+      }
+      if (outcome === undefined || outcome.ok) {
+        faults.push(`${door.name}: accepted an accessor-bearing record`);
+        continue;
+      }
+      if (outcome.refusal.code !== "SIMULATION_INPUT_NOT_DATA") {
+        faults.push(`${door.name}: refused with ${outcome.refusal.code}`);
+      }
+      if (!outcome.refusal.message.includes("accessor")) {
+        faults.push(`${door.name}: did not name the accessor — ${outcome.refusal.message}`);
+      }
+    }
+    expect(faults, faults.join("\n")).toEqual([]);
+  });
+
+  it("REFUSES an argument nested past MAX_INPUT_DEPTH", () => {
+    const faults: string[] = [];
+    for (const door of RECORD_DOORS) {
+      const deep = door.valid() as Record<string, unknown>;
+      deep["extra"] = deeplyNestedRecord(MAX_INPUT_DEPTH + 8);
+      let outcome: SimulationResult<unknown> | undefined;
+      let thrown: unknown;
+      try {
+        outcome = door.drive(deep);
+      } catch (cause) {
+        thrown = cause;
+      }
+      if (thrown !== undefined) {
+        faults.push(`${door.name}: threw ${String(thrown)}`);
+        continue;
+      }
+      if (outcome === undefined || outcome.ok) {
+        faults.push(`${door.name}: accepted an over-deep record`);
+        continue;
+      }
+      if (outcome.refusal.code !== "SIMULATION_INPUT_NOT_DATA") {
+        faults.push(`${door.name}: refused with ${outcome.refusal.code}`);
+      }
+    }
+    expect(faults, faults.join("\n")).toEqual([]);
+  });
+
+  it("emits a tree of its OWN, not an alias of the caller's record", () => {
+    // D4 on the way out, and the reason D1 has to happen on the way in: the
+    // emitted value must not be the caller's object, or a later mutation of the
+    // caller's object would change a value this package already answered with.
+    const faults: string[] = [];
+    for (const door of RECORD_DOORS) {
+      const offered = door.valid() as Record<string, unknown>;
+      const outcome = door.drive(offered);
+      if (!outcome.ok) {
+        faults.push(`${door.name}: ${outcome.refusal.code}: ${outcome.refusal.message}`);
+        continue;
+      }
+      if (outcome.value === offered) faults.push(`${door.name}: emitted the caller's own object`);
+      if (Object.getPrototypeOf(outcome.value as object) !== null) {
+        faults.push(`${door.name}: emitted a value with a prototype`);
+      }
+      if (!Object.isFrozen(outcome.value)) faults.push(`${door.name}: emitted an unfrozen value`);
+    }
+    expect(faults, faults.join("\n")).toEqual([]);
+  });
+
+  it("readRunPins is STRICT: an unknown key is refused, never carried (L6)", () => {
+    // Round-2 review L2: the strictness shipped with no test at all — deleting
+    // the whole unknown-key loop left the suite green. A pin set that quietly
+    // carried an extra field would let an operator believe something was pinned
+    // that nothing reads, and §12.5 fixes what a run pins.
+    const baseline = readRunPins(runPins());
+    expect(baseline.ok).toBe(true);
+
+    const faults: string[] = [];
+    for (const key of ["extraPin", "fillModelVersionn", "runSeeds", "__proto__"]) {
+      const offered = { ...runPins() } as Record<string, unknown>;
+      Object.defineProperty(offered, key, {
+        value: "smuggled",
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+      const outcome = readRunPins(offered as unknown as ReplayRunPins);
+      if (outcome.ok) {
+        faults.push(`accepted an unknown key ${key}`);
+        continue;
+      }
+      if (!["REPLAY_MANIFEST_INVALID", "SIMULATION_INPUT_NOT_DATA"].includes(outcome.refusal.code)) {
+        faults.push(`${key}: refused with ${outcome.refusal.code}`);
+      }
+    }
+    expect(faults, faults.join("\n")).toEqual([]);
+
+    // …and nothing unknown survives onto the emitted pin set.
+    if (!baseline.ok) return;
+    expect(Object.keys(baseline.value).sort()).toEqual(Object.keys(runPins()).sort());
+  });
+
+  it("the shared battery really drove the getter-bearing argument", () => {
+    // `gettersInvoked` is incremented by the battery's own getter-bearing
+    // record. It is NOT asserted to be zero: a door that reads a field by name
+    // legitimately reads it, and the bound this battery states is "no throw
+    // escapes". The doors that must not invoke one are pinned above, by name.
+    expect(gettersInvoked).toBeGreaterThan(0);
+  });
 });

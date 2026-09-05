@@ -21,11 +21,12 @@
  */
 
 import { isNonEmptyString, isNonNegativeInteger, isPositiveInteger } from "./grammar.js";
-import { ownFrozenTree } from "./plain.js";
+import { ownFrozenTree, readOwnPlainInput } from "./plain.js";
 import {
   describeForRefusal,
   simulationFailure,
   simulationOk,
+  totally,
   type SimulationResult,
 } from "./refusals.js";
 import type { SeededStream, SeededStreams } from "./seed.js";
@@ -56,12 +57,27 @@ export interface LatencyModel {
   readonly basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS";
 }
 
-/** Validates a distribution. An empty or zero-weight one is refused. */
+/** Validates a distribution. An empty or zero-weight one is refused. Total. */
 export function readLatencyDistribution(
   distribution: LatencyDistribution,
   what: string,
 ): SimulationResult<LatencyDistribution> {
+  return totally("reading a latency distribution", () =>
+    readLatencyDistributionInner(distribution, what),
+  );
+}
+
+function readLatencyDistributionInner(
+  offered: LatencyDistribution,
+  what: string,
+): SimulationResult<LatencyDistribution> {
   const component = describeForRefusal(what);
+  // D1 (round-2 review, MEDIUM-1): a caller record is materialized before it is
+  // read, so a getter is refused without being invoked and a cycle is refused
+  // rather than followed until the stack runs out.
+  const read = readOwnPlainInput<LatencyDistribution>(offered, `${component}'s latency distribution`);
+  if (!read.ok) return read;
+  const distribution = read.value;
   if (distribution === null || typeof distribution !== "object") {
     return simulationFailure(
       "FILL_MODEL_LATENCY_DISTRIBUTION_INVALID",
@@ -78,6 +94,13 @@ export function readLatencyDistribution(
   }
   let total = 0;
   for (const sample of distribution.samples) {
+    if (sample === null || typeof sample !== "object") {
+      return simulationFailure(
+        "FILL_MODEL_LATENCY_DISTRIBUTION_INVALID",
+        `${component} carries a sample that is not a record`,
+        { component },
+      );
+    }
     if (!isNonNegativeInteger(sample.milliseconds)) {
       return simulationFailure(
         "FILL_MODEL_LATENCY_DISTRIBUTION_INVALID",
@@ -104,8 +127,16 @@ export function readLatencyDistribution(
   return simulationOk(ownFrozenTree(distribution));
 }
 
-/** Validates a whole latency model. */
+/** Validates a whole latency model. Total: no throw escapes. */
 export function readLatencyModel(model: LatencyModel): SimulationResult<LatencyModel> {
+  return totally("reading the latency model", () => readLatencyModelInner(model));
+}
+
+function readLatencyModelInner(offered: LatencyModel): SimulationResult<LatencyModel> {
+  // D1 (round-2 review, MEDIUM-1), as in `readLatencyDistribution`.
+  const read = readOwnPlainInput<LatencyModel>(offered, "the latency model");
+  if (!read.ok) return read;
+  const model = read.value;
   if (model === null || typeof model !== "object") {
     return simulationFailure(
       "FILL_MODEL_PARAMETERS_UNPINNED",

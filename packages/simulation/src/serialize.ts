@@ -29,7 +29,7 @@ import type { DatasetLoadReport, EventSourceReport } from "./event-source.js";
 import type { ReplayRunPins } from "./manifest.js";
 import type { ReplayPathEconomics } from "./markout.js";
 import type { SimulatedOrder } from "./ports.js";
-import type { RestingFillBand, RestingScenarioOutcome } from "./queue.js";
+import type { RestingFillBand, RestingScenarioOutcome, SameInstantAdditions } from "./queue.js";
 
 /**
  * The serialization format id. A grammar change changes this string.
@@ -39,8 +39,14 @@ import type { RestingFillBand, RestingScenarioOutcome } from "./queue.js";
  * `venueTimestampInversions=` measured recorded ARRIVAL order), added the
  * order's `fillEstimateKind`, and gave the `band` line the identity of the
  * resting order it is about. Those are grammar changes, so this is a new id.
+ *
+ * `v3`: the round-2 review (L4) replaced the band's same-instant-additions
+ * input — a bare `"0"` that could not distinguish "looked and saw nothing" from
+ * "did not look" — with a tagged {@link ../queue.js#SameInstantAdditions}, and
+ * the `band` line now prints it. A run whose conservative arm rests on an
+ * unmeasured quantity says so in its own bytes.
  */
-export const SIMULATION_RUN_SERIALIZATION_VERSION = "polymarket-bot/simulation-run/v2";
+export const SIMULATION_RUN_SERIALIZATION_VERSION = "polymarket-bot/simulation-run/v3";
 
 /** What the delivery path observed, as the serialization records it. */
 export type SerializableDelivery = Pick<
@@ -220,10 +226,23 @@ export function serializeBand(band: RestingFillBand): string {
     field("queueModel", band.queueModelVersion),
     field("fillModel", band.model.fillModelVersion),
     field("basis", band.bandBasis),
+    field("sameInstantAdditions", renderSameInstantAdditions(band.sameInstantAdditions)),
     scenarioField("optimistic", band.optimistic),
     scenarioField("base", band.base),
     scenarioField("conservative", band.conservative),
   ].join(" ");
+}
+
+/**
+ * Prints the band's same-instant-additions input (round-2 review, L4).
+ *
+ * `NOT_OBSERVED` and `OBSERVED:0` are different bytes because they are different
+ * facts: the second says a root looked and saw nothing added at our price, and
+ * the first says nobody looked — which is what the CONSERVATIVE scenario's queue
+ * ahead would otherwise silently rest on.
+ */
+function renderSameInstantAdditions(additions: SameInstantAdditions): string {
+  return additions === "NOT_OBSERVED" ? "NOT_OBSERVED" : `OBSERVED:${additions.observedShares}`;
 }
 
 function scenarioField(name: string, outcome: RestingScenarioOutcome): string {

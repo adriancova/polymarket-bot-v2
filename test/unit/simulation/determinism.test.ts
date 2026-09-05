@@ -427,7 +427,7 @@ function restingBand(simulatedOrderId: string, restingPrice: string): RestingFil
       restingPrice,
       shares: "50",
       queueAheadAtPlacement: "10",
-      sameInstantAdditionsShares: "0",
+      sameInstantAdditions: { observedShares: "0" },
       restingFromNs: 0n,
     },
     trades: [{ price: restingPrice, shares: "30", monotonicNs: 1_000n, atEvent: AT_EVENT }],

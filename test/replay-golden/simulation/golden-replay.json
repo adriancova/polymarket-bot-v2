@@ -195,7 +195,7 @@
   },
   "expected": {
     "serialization": [
-      "polymarket-bot/simulation-run/v2",
+      "polymarket-bot/simulation-run/v3",
       "run simulator=wp-210/v1 seed=42 fillModel=sim/tier1/v1 fillModelParams=0000000000000000000000000000000000000000000000000000000000000000 latencyModel=sim/latency/v1 latencyModelParams=1111111111111111111111111111111111111111111111111111111111111111",
       "pins normalizer=golden/market-frame/v1 featureSet=features-v1 fee=fees/2026-08-24 reward=rewards/2026-08-24 settlement=",
       "dataset id=2026-06-29T17-00Z epoch=0190a3e0-0000-7000-8000-000000000001 objects=1 walSegments=NOT_AVAILABLE_ARCHIVED_ONLY",
@@ -206,7 +206,7 @@
       "order golden-order-take golden-plan-1 0x1234 7134526469571836016 YES BUY 0.09 10 10 FILLED MARKETABLE_LIMIT POINT false 0190a3e0-0000-7000-8000-000000000001 1 0",
       "fill golden-order-take/t1/0 golden-order-take 0x1234 7134526469571836016 YES BUY 0.09 10 0.05733 TAKER TIER_1 sim/tier1/v1 SIMULATED_NOT_REAL_EVIDENCE TOP_OF_BOOK_ONLY 0190a3e0-0000-7000-8000-000000000001 1 0",
       "economics basis=REALIZED_IN_REPLAY_PATH buy=0.9 sell=0 fees=0.05733 net=-0.95733 sharesBought=10 sharesSold=0 fills=1 markoutPenaltyApplied=false",
-      "band order=golden-order-rest market=0x1234 price=0.08 queueModel=sim/queue/v1 fillModel=sim/tier1/v1 basis=OPTIMISTIC_BASE_CONSERVATIVE_CANCELLATION_ASSUMPTIONS optimistic[ filled=5 remaining=45 queueAhead=0 queueLeft=0 postCancelFills=0 fills=1 ] base[ filled=5 remaining=45 queueAhead=0 queueLeft=0 postCancelFills=0 fills=1 ] conservative[ filled=5 remaining=45 queueAhead=0 queueLeft=0 postCancelFills=0 fills=1 ]",
+      "band order=golden-order-rest market=0x1234 price=0.08 queueModel=sim/queue/v1 fillModel=sim/tier1/v1 basis=OPTIMISTIC_BASE_CONSERVATIVE_CANCELLATION_ASSUMPTIONS sameInstantAdditions=NOT_OBSERVED optimistic[ filled=5 remaining=45 queueAhead=0 queueLeft=0 postCancelFills=0 fills=1 ] base[ filled=5 remaining=45 queueAhead=0 queueLeft=0 postCancelFills=0 fills=1 ] conservative[ filled=5 remaining=45 queueAhead=0 queueLeft=0 postCancelFills=0 fills=1 ]",
       "end"
     ]
   }
