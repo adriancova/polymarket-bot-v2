@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@polymarket-bot/domain": "workspace:*",
+    "@polymarket-bot/risk": "workspace:*",
     "@polymarket-bot/strategy-sdk": "workspace:*"
   },
   "devDependencies": {

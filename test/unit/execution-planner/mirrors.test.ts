@@ -45,11 +45,13 @@
  *    map resolves back to the canonical file, and no relative import of a local
  *    copy survives. *(`WP-200-FU1` review round 1, finding M1: the `CONSUMERS`
  *    table below grew the **S5** and **S6** rows, so "every consumer" now means
- *    four rather than two. The property these guards do NOT cover — that the
+ *    four rather than two; `WP-170-FU1` then added **S7** and it means five.
+ *    The property these guards do NOT cover — that the
  *    edge carries the door and not the risk ENGINE — is pinned for S3 in
  *    `test/unit/risk/ports.test.ts`, for S4 in
- *    `test/unit/execution-planner/ports.test.ts`, and for S5/S6 in
- *    `test/unit/ledger/ports.test.ts`.)*
+ *    `test/unit/execution-planner/ports.test.ts`, for S5/S6 in
+ *    `test/unit/ledger/ports.test.ts`, and for S7 in
+ *    `test/unit/strategy-runtime/ports.test.ts`.)*
  */
 
 import { createHash } from "node:crypto";
@@ -125,12 +127,17 @@ const MODULES: readonly Module[] = [
  * those rows (no import of the risk engine ROOT, which neither guard here can
  * see because a root specifier ends in neither module name) is pinned in
  * `test/unit/ledger/ports.test.ts`, modelled on `test/unit/risk/ports.test.ts`.
+ *
+ * `WP-170-FU1` (2026-09-05) added **S7**, `packages/strategy-runtime`, on the
+ * same terms — the table grew one row and neither guard below changed. Its
+ * door-only half is pinned in `test/unit/strategy-runtime/ports.test.ts`.
  */
 const CONSUMERS = [
   { row: "S3", dir: "packages/capital-allocator" },
   { row: "S4", dir: "packages/execution-planner" },
   { row: "S5", dir: "packages/ledger" },
   { row: "S6", dir: "packages/pnl" },
+  { row: "S7", dir: "packages/strategy-runtime" },
 ] as const;
 
 /** The shared scan's reader, under this file's original short name. */

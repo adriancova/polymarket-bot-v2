@@ -325,12 +325,21 @@ describe("MEDIUM 2: a statePatch failure is attributed to the statePatch, wherev
       return;
     }
     expect(Reflect.ownKeys(outcome.record.decision)).not.toContain("__proto__");
-    expect(Object.getPrototypeOf(outcome.record.decision)).toBe(Object.prototype);
+    // STRENGTHENED, `WP-170-FU1`: was `toBe(Object.prototype)`. The decision is
+    // now built by the door from the CONTRACT's own field names over the
+    // materialized tree (D3) into a prototype-free container (D4), so it
+    // still drops `__proto__` — asserted on the line above, unchanged — and it
+    // additionally cannot answer an absent optional field from the chain.
+    expect(Object.getPrototypeOf(outcome.record.decision)).toBeNull();
     // The patch keeps its own `__proto__` as an ordinary data property, and the
     // canonical bytes say so.
     expect(outcome.checkpoint.stateJson).toBe('{"nested":{"__proto__":{"alsoPolluted":true}}}');
     const patched = outcome.record.decision.statePatch?.["nested"];
-    expect(Object.getPrototypeOf(patched as object)).toBe(Object.prototype);
+    // STRENGTHENED, `WP-170-FU1`: was `toBe(Object.prototype)`. The claim under
+    // test — `__proto__` is held as DATA and never re-parents the copy — is
+    // unchanged; the materialized copy is now prototype-free (D4), so it also
+    // cannot answer an absent key from `Object.prototype`.
+    expect(Object.getPrototypeOf(patched as object)).toBeNull();
     expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
     expect(({} as Record<string, unknown>)["alsoPolluted"]).toBeUndefined();
   });

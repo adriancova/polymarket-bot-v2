@@ -83,11 +83,10 @@
 
 import {
   DECISION_RESULT_SCHEMA_VERSION,
-  DecisionResultSchema,
   MAX_IDENTIFIER_LENGTH,
-  UnsignedBigIntStringSchema,
   type DecisionResult,
 } from "@polymarket-bot/domain";
+import { ownDataDescriptor } from "@polymarket-bot/risk/plain-data";
 import {
   STRATEGY_CALLBACK_NAMES,
   type Strategy,
@@ -109,8 +108,16 @@ import {
   canonicalJsonStringify,
   deepFreeze,
   materializeCheckpointableJsonAt,
+  materializeDecisionViewAt,
   materializeImmutableParamsAt,
 } from "./json.js";
+import {
+  DECISION_FIELD_NAMES,
+  DoorDecisionWithoutModelOutputsSchema,
+  DoorUnsignedBigIntStringSchema,
+  MODEL_OUTPUTS_KEY,
+  RawModelOutputsSchema,
+} from "./parse-door.js";
 import type {
   ContainedFailure,
   EvaluationOutcome,
@@ -335,7 +342,11 @@ export function createStrategyInstanceRuntime(
       return refuse("RUN_IDENTITY_INVALID", problem);
     }
   }
-  if (typeof runSeed !== "string" || !UnsignedBigIntStringSchema.safeParse(runSeed).success) {
+  // D2: the ARENA copy, not the raw domain schema. `runSeed` is the one thing
+  // that makes a run replayable (§12.4), and at base `53e9f62` a non-enumerable
+  // inherited `skipChecks` made this parse accept `"007"` and `"-1"` — a seed
+  // that is not a canonical unsigned integer string, admitted at creation.
+  if (typeof runSeed !== "string" || !DoorUnsignedBigIntStringSchema.safeParse(runSeed).success) {
     return refuse(
       "RUN_SEED_INVALID",
       "run.runSeed must be a canonical unsigned integer string (§10.3 runs.run_seed)",
@@ -872,6 +883,75 @@ class StrategyInstanceRuntime {
    * and the patch is materialized afterwards under the patch attribution. The
    * patch is read exactly ONCE on the way out, which also removes the double
    * traversal the old order performed (Zod's record walk, then the boundary's).
+   *
+   * -------------------------------------------------------------------------
+   * WP-170-FU1 (2026-09-05) — this region is now a D1-D4 DOOR
+   * -------------------------------------------------------------------------
+   *
+   * `docs/contracts/schema-boundary.md` §5 item 2 assigns this parse. What it
+   * was, and what one non-enumerable inherited `skipChecks` did to it at base
+   * `53e9f62`:
+   *
+   * ```text
+   *   strategy returns { decisionType:"hold", reasonCodes:["not a reason code"],
+   *                      featureSnapshotRef:"snap-1", intents:[],
+   *                      nextWakeupAt:"yesterday" }
+   *     clean    → CONTAINED  attribution=RUNTIME  RUNTIME.DECISION_INVALID
+   *     polluted → DECIDED    attribution=STRATEGY, and that exact object is
+   *                the one persisted decision this evaluation owes
+   *                (§6 invariant 3).
+   *   with an intent:
+   *     polluted → the record carries intentId "018F4A7E-2222-…" (UPPERCASE,
+   *                which ADR-016 says is REFUSED, never case-folded) and
+   *                validUntil "whenever".
+   * ```
+   *
+   * Four changes, in the order the door runs them:
+   *
+   * - **D1** the isolation copy is built PROTOTYPE-FREE with
+   *   `Object.defineProperty` and the prototype-free descriptor from
+   *   `@polymarket-bot/risk/plain-data`, and the isolated decision is then
+   *   MATERIALIZED (`materializeDecisionViewAt`) into the runtime's own inert
+   *   tree before anything parses it. The MATERIALIZATION is what closes an
+   *   AVAILABILITY defeat measured at base — `z.strictObject` finds unknown
+   *   keys with `for…in`, which enumerates INHERITED enumerable names, so ONE
+   *   enumerable `Object.prototype.zzUnrelated = 1` turned a perfectly valid
+   *   decision into `CONTAINED / RUNTIME.DECISION_INVALID`
+   *   (`unrecognized_keys: ["zzUnrelated"]`) on every parse, not only a cold
+   *   one. (Which of the two closes it was established by mutation, not by
+   *   reading: see the note at the isolation copy itself.);
+   * - **D2** the parse is the ARENA copy (`./parse-door.js`), so `skipChecks`,
+   *   `optin`/`optout`, `when` and `values` are read off containers no caller
+   *   can reach;
+   * - **D3** the decision the record carries is taken from the MATERIALIZED
+   *   TREE, never from `parsed.data`. That is not only the §1 rule: the arena
+   *   assembles into prototype-free containers, so an arena `parsed.data` would
+   *   hand this runtime a `reasonCodes` array with no `Array.prototype` — and
+   *   the reserved-code check two lines below calls `.some` on it;
+   * - **D4** the decision handed to `buildRecord` has a null prototype, so a
+   *   consumer's `decision.nextWakeupAt ?? …` cannot be answered by
+   *   `Object.prototype`.
+   *
+   * `modelOutputs` is held aside exactly as `statePatch` is, for the reason
+   * measured in `parse-door.ts`: the arena FAILS CLOSED on the `null` node
+   * inside `ModelOutputValueSchema`, and widening it is a `packages/risk`
+   * change this package's grant does not carry.
+   *
+   * REMEDIATION ROUND 1 (2026-09-06), review round 1's HIGH 1 and MEDIUM 1 —
+   * two corrections to the above, both on the same region:
+   *
+   * - the decision and its `modelOutputs` are materialized under the DECISION
+   *   grammar (`materializeDecisionViewAt`), which drops an own enumerable
+   *   `__proto__` at EVERY level. The pinned `zod@4.4.3` skips that name at
+   *   every level rather than validating it, so base `53e9f62`'s `parsed.data`
+   *   never carried it and a D3 rebuild off the tree would have persisted an
+   *   unvalidated, contract-forbidden value (`json.ts` header for the
+   *   base-vs-tip table);
+   * - the `modelOutputs` `safeParse` is wrapped in the SAME region-attributing
+   *   `try`/`catch` the decision parse has. It is the one parse in this package
+   *   that is not an arena copy, so it is the one that could still throw out of
+   *   `safeParse`; before this round that throw reached `evaluate()`'s outer
+   *   catch, which attributes it to the wrong region.
    */
   private prepareDecision(
     input: EvaluationInput,
@@ -886,7 +966,8 @@ class StrategyInstanceRuntime {
       failure: { reasonCode: RUNTIME_REASON_CODES.statePatchInvalid, detail },
     });
 
-    // REGION 1 — isolate the raw statePatch. Nothing traverses it here.
+    // REGION 1 — isolate the raw statePatch and modelOutputs. Nothing
+    // traverses either here.
     const isolated = isolateStatePatch(returned, input.callback);
     if (!isolated.ok) {
       return isolated.region === "PATCH"
@@ -894,15 +975,37 @@ class StrategyInstanceRuntime {
         : invalid(isolated.problem);
     }
 
-    // REGION 2 — the decision WITHOUT its patch, validated by the domain schema.
-    let parsed: ReturnType<typeof DecisionResultSchema.safeParse>;
+    // REGION 2 — the decision WITHOUT its patch or modelOutputs: D1
+    // materialized, D2 parsed through the arena, D3 read back off the tree.
+    let materializedDecision: unknown;
     try {
-      parsed = DecisionResultSchema.safeParse(isolated.decision);
+      const walked = materializeDecisionViewAt(isolated.decision, "decision");
+      if (!walked.ok) {
+        return invalid(
+          `the value returned by strategy callback ${input.callback} could not be read into ` +
+            `the runtime's own inert copy (${walked.problem}); a decision the runtime cannot ` +
+            "read without executing strategy code is not a decision",
+        );
+      }
+      materializedDecision = walked.value;
+    } catch (cause) {
+      // The walk is total; this is the belt, kept because `prepareDecision`
+      // runs inside the one fallible region and a throw here would otherwise
+      // be attributed by the outer catch rather than by this region.
+      return invalid(
+        `reading the value returned by strategy callback ${input.callback} threw ` +
+          `(${describeCause(cause)}); a decision the runtime cannot read without executing ` +
+          "strategy code is not a decision",
+      );
+    }
+    let parsed: ReturnType<typeof DoorDecisionWithoutModelOutputsSchema.safeParse>;
+    try {
+      parsed = DoorDecisionWithoutModelOutputsSchema.safeParse(materializedDecision);
     } catch (cause) {
       // Zod's `safeParse` catches its own errors, not a trap throw from the
-      // value being parsed. Unreachable for the patch since round 4 — the patch
-      // is not in the value being parsed — and still reachable for any other
-      // field the strategy made hostile, which is what this attributes.
+      // value being parsed. Unreachable since this round — the value parsed is
+      // the runtime's own materialized tree, which holds no getter and no
+      // proxy — and kept as the belt to that claim.
       return invalid(
         `reading the value returned by strategy callback ${input.callback} threw ` +
           `(${describeCause(cause)}); a decision the runtime cannot read without executing ` +
@@ -915,7 +1018,79 @@ class StrategyInstanceRuntime {
           parsed.error.message,
       );
     }
-    const decision = parsed.data;
+    // The `modelOutputs` half, held aside in REGION 1 (see the header): the
+    // arena cannot copy the `null` node inside `ModelOutputValueSchema`, so
+    // this subtree is asked of the RAW picked schema. It carries zero format
+    // checks, so `skipChecks` is a no-op on it — measured and pinned in
+    // `test/unit/strategy-runtime/schema-door.test.ts`, together with the
+    // `values`/availability class that DOES reach it (pre-existing, fail-closed,
+    // base == tip). The value asked is the materialized copy; the answer is used
+    // and the output is discarded (D3).
+    let materializedModelOutputs: unknown;
+    if (isolated.modelOutputs !== undefined) {
+      const walked = materializeDecisionViewAt(isolated.modelOutputs, "modelOutputs");
+      if (!walked.ok) {
+        return invalid(
+          `the modelOutputs returned by strategy callback ${input.callback} could not be read ` +
+            `into the runtime's own inert copy (${walked.problem})`,
+        );
+      }
+      materializedModelOutputs = walked.value;
+      const outputsProbe = ownData({ [MODEL_OUTPUTS_KEY]: materializedModelOutputs });
+      let outputs: ReturnType<typeof RawModelOutputsSchema.safeParse>;
+      try {
+        outputs = RawModelOutputsSchema.safeParse(outputsProbe);
+      } catch (cause) {
+        // The SAME belt the decision parse above carries, and on this parse it
+        // is not merely a belt: this is the one schema in the package that is
+        // NOT an arena copy, so it is the one whose lazy normalization can still
+        // throw out of `safeParse` instead of being returned by it. The schema
+        // is warmed at module load (`parse-door.ts`, review round 1 HIGH 1),
+        // which closes the cold-lazy class — but the catch IS reachable: the
+        // disclosed `values`/availability residual still throws out of this
+        // parse, and the catch converts that escaping TypeError into a
+        // region-attributed refusal instead of `evaluate()`'s outer catch
+        // naming the callback. Defence-in-depth for attribution, not an
+        // unreachable branch (review round 2 LOW 2).
+        return invalid(
+          `reading the modelOutputs returned by strategy callback ${input.callback} threw ` +
+            `(${describeCause(cause)}); a decision the runtime cannot read without executing ` +
+            "strategy code is not a decision",
+        );
+      }
+      if (!outputs.success) {
+        return invalid(
+          `strategy callback ${input.callback} did not return a valid §7.5 DecisionResult: ` +
+            outputs.error.message,
+        );
+      }
+    }
+    // D3 — the decision is built from the MATERIALIZED TREE, never from
+    // `parsed.data`, and from the CONTRACT'S OWN field names, so a key the
+    // library SKIPS rather than validates (`__proto__`; the pinned zod skips it
+    // at every level, `parse-door.ts`) is not emitted at the top level. The
+    // NESTED levels are handled one step earlier, by the decision grammar's
+    // `dropOwnProtoKey` — the field list cannot reach inside `intents[0]` or
+    // `modelOutputs`, and review round 1's MEDIUM 1 is exactly that gap.
+    //
+    // The fields are emitted in the CONTRACT's declaration order, which is the
+    // order the library's own object assembly used. That is not cosmetic: the
+    // first draft appended `modelOutputs` after the loop, and the honest-path
+    // fold diverged from base in exactly one place — the same 7,805 bytes with
+    // `"modelOutputs":{…}` moved from its shape position to the end. Measured
+    // base→tip over a 9-stage run, the fold is byte-identical.
+    const built = Object.create(null) as Record<string, unknown>;
+    const tree = materializedDecision as Record<string, unknown>;
+    for (const field of DECISION_FIELD_NAMES) {
+      if (field === MODEL_OUTPUTS_KEY) {
+        if (isolated.modelOutputs === undefined) continue;
+        Object.defineProperty(built, field, ownDataDescriptor(materializedModelOutputs));
+        continue;
+      }
+      if (!Object.hasOwn(tree, field)) continue;
+      Object.defineProperty(built, field, ownDataDescriptor(tree[field]));
+    }
+    const decision = deepFreeze(built as unknown as DecisionResult);
     if (decision.featureSnapshotRef !== input.features.snapshotRef) {
       return invalid(
         `decision names featureSnapshotRef ${decision.featureSnapshotRef}, but this ` +
@@ -957,7 +1132,13 @@ class StrategyInstanceRuntime {
       return {
         ok: true,
         prepared: {
-          decision: { ...decision, statePatch: patch },
+          // D4: prototype-free, like every other value this door emits. An
+          // object-literal spread would hand the record back an ordinary
+          // container whose absent optional fields answer from
+          // `Object.prototype`.
+          decision: deepFreeze(
+            ownData({ ...decision, [STATE_PATCH_KEY]: patch }) as unknown as DecisionResult,
+          ),
           state,
           stateJson: canonicalJsonStringify(state),
         },
@@ -995,12 +1176,15 @@ class StrategyInstanceRuntime {
   ): EvaluationOutcome {
     this.rng.restore(rngSnapshot);
 
-    const decision: DecisionResult = {
+    // D4: the containment decision is emitted prototype-free like every other
+    // decision this runtime produces, so a consumer's
+    // `decision.statePatch ?? …` cannot be answered by `Object.prototype`.
+    const decision = ownData({
       decisionType: "skip",
       reasonCodes: [failure.reasonCode],
       featureSnapshotRef: input.features.snapshotRef,
       intents: [],
-    };
+    }) as unknown as DecisionResult;
     const record = this.buildRecord(input, "RUNTIME", decision);
     try {
       this.persistRecord(record, telemetry);
@@ -1065,7 +1249,20 @@ class StrategyInstanceRuntime {
     // was exactly this method re-reading `input.market.marketId` from the
     // caller's live object AFTER the callback had run, which could throw or
     // answer differently than the value the callback saw.
-    const base = {
+    //
+    // D4 (`WP-170-FU1`): the record is emitted PROTOTYPE-FREE. The snapshot's
+    // own D4 closed the READ below — `input.sourceEvent` on a prototype-free
+    // snapshot answers `undefined` — but the record was still an object
+    // LITERAL, and the defeat simply moved into it:
+    //
+    //     Object.prototype.sourceEvent = { eventId:"018f4a7e-3333-…", … }  (NE)
+    //       runtime.evaluate(a valid input carrying NO sourceEvent)
+    //       base   → record.sourceEvent = the fabricated event
+    //       tip    → record.sourceEvent = undefined
+    //
+    // The record is what §6 invariant 4's traceability chain IS, so a consumer
+    // reading `record.sourceEvent` must get the answer this evaluation had.
+    const base = ownData({
       decisionContractVersion: DECISION_RESULT_SCHEMA_VERSION,
       runId: this.run.runId,
       instanceId: this.run.instanceId,
@@ -1075,14 +1272,17 @@ class StrategyInstanceRuntime {
       attribution,
       evaluatedAt: input.evaluatedAt,
       decision,
-    };
-    return input.sourceEvent === undefined
-      ? base
-      : { ...base, sourceEvent: input.sourceEvent };
+    }) as unknown as DecisionRecord;
+    if (input.sourceEvent === undefined) {
+      return base;
+    }
+    return ownData({ ...base, sourceEvent: input.sourceEvent }) as unknown as DecisionRecord;
   }
 
   private buildCheckpoint(recordedSeq: number): StrategyStateCheckpoint {
-    return {
+    // D4, for the same reason as the record: a checkpoint is read back by
+    // `restoreCheckpoint` and by the store that hashes its bytes.
+    return ownData({
       checkpointSchemaVersion: STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
       runId: this.run.runId,
       instanceId: this.run.instanceId,
@@ -1097,19 +1297,45 @@ class StrategyInstanceRuntime {
       // The bytes were computed together with the state they describe, before
       // the decision was persisted; nothing is serialized after a persist.
       stateJson: this.stateJson,
-    };
+    }) as unknown as StrategyStateCheckpoint;
   }
 }
 
 const STATE_PATCH_KEY = "statePatch";
 
 /**
- * The result of lifting the raw `statePatch` out of a strategy's returned value
- * before anything traverses it. `decision` is what the domain schema validates;
- * `patch` is the untouched value the patch boundary will materialize.
+ * Rebuilds a record as an OWN-DATA, PROTOTYPE-FREE object (D1/D4).
+ *
+ * `Object.defineProperty` with the prototype-free descriptor from
+ * `@polymarket-bot/risk/plain-data`, never `out[key] = value`: assignment is
+ * `Set` and `Set` consults the chain, and a descriptor written as an object
+ * literal is read with `HasProperty` and consults it too. Both were measured
+ * against this package at base `53e9f62` — see the transcripts in `json.ts`.
+ *
+ * The input is always a value this runtime already owns (a materialized tree or
+ * a spread of one), so the read below cannot run caller code.
+ */
+function ownData(source: Record<string, unknown>): Record<string, unknown> {
+  const out = Object.create(null) as Record<string, unknown>;
+  for (const key of Object.getOwnPropertyNames(source)) {
+    Object.defineProperty(out, key, ownDataDescriptor(source[key]));
+  }
+  return out;
+}
+
+/**
+ * The result of lifting the raw `statePatch` and `modelOutputs` out of a
+ * strategy's returned value before anything traverses them. `decision` is what
+ * the arena schema validates; `patch` and `modelOutputs` are the untouched
+ * values their own boundaries will materialize.
  */
 type IsolatedDecision =
-  | { readonly ok: true; readonly decision: unknown; readonly patch: unknown }
+  | {
+      readonly ok: true;
+      readonly decision: unknown;
+      readonly patch: unknown;
+      readonly modelOutputs: unknown;
+    }
   | { readonly ok: false; readonly region: "DECISION" | "PATCH"; readonly problem: string };
 
 /**
@@ -1137,7 +1363,7 @@ function isolateStatePatch(returned: unknown, callback: StrategyCallbackName): I
   // only one that cannot run caller code. A non-object cannot carry a patch;
   // the schema below rejects it as the invalid decision it is.
   if (typeof returned !== "object" || returned === null) {
-    return { ok: true, decision: returned, patch: undefined };
+    return { ok: true, decision: returned, patch: undefined, modelOutputs: undefined };
   }
   let keys: readonly string[];
   try {
@@ -1152,8 +1378,24 @@ function isolateStatePatch(returned: unknown, callback: StrategyCallbackName): I
         "strategy code is not a decision",
     };
   }
-  const decision: Record<string, unknown> = {};
+  // D1/D4 (`WP-170-FU1`): the isolation copy has NO PROTOTYPE, and the appends
+  // below are `defineProperty` with a prototype-free descriptor, so a declared
+  // key can be neither lost to nor adopted from an inherited accessor on the
+  // way into the copy.
+  //
+  // DEFENCE IN DEPTH, STATED AS SUCH — measured, not assumed. Reverting this
+  // ONE line to `{}` is BEHAVIOURALLY INERT at this tip (mutation M7: the whole
+  // suite stays green), because `prepareDecision` MATERIALIZES this copy before
+  // anything parses it and it is the materialized tree that `z.strictObject`
+  // walks with `for…in`. So the availability defeat measured at base `53e9f62`
+  //   Object.prototype.zzUnrelated = 1   (enumerable)
+  //     → CONTAINED  RUNTIME.DECISION_INVALID  unrecognized_keys:["zzUnrelated"]
+  // is closed by the MATERIALIZATION, not by this line. This line is what makes
+  // the claim survive a future refactor that drops the materialization, and it
+  // is the reason the copy is safe to hand to that walk in the first place.
+  const decision = Object.create(null) as Record<string, unknown>;
   let patch: unknown;
+  let modelOutputs: unknown;
   for (const key of keys) {
     let value: unknown;
     try {
@@ -1175,21 +1417,24 @@ function isolateStatePatch(returned: unknown, callback: StrategyCallbackName): I
       patch = value;
       continue;
     }
-    if (key === "__proto__") {
-      // `defineProperty`, not assignment: an own `__proto__` data property must
-      // land ON the copy (where the strict schema will refuse it as an
-      // unrecognized key) rather than silently re-parenting it.
-      Object.defineProperty(decision, key, {
-        value,
-        writable: true,
-        enumerable: true,
-        configurable: true,
-      });
+    if (key === MODEL_OUTPUTS_KEY) {
+      // Held aside for the same structural reason the patch is, and for one of
+      // its own: the arena FAILS CLOSED on the `null` node inside
+      // `ModelOutputValueSchema`, so this key cannot travel through the door
+      // copy (`parse-door.ts`).
+      modelOutputs = value;
       continue;
     }
-    decision[key] = value;
+    // `defineProperty` with a prototype-free descriptor for EVERY key — it used
+    // to be `__proto__` alone, with plain assignment for the rest. An own
+    // `__proto__` data property must land ON the copy as own data so nothing is
+    // re-parented (the library SKIPS that name at every level — it neither
+    // refuses nor emits it; the drop is `DECISION_FIELD_NAMES` plus the
+    // `dropOwnProtoKey` grammar axis), and every OTHER key needs the same
+    // treatment for the reason `json.ts`'s header transcripts C1-C3 record.
+    Object.defineProperty(decision, key, ownDataDescriptor(value));
   }
-  return { ok: true, decision, patch };
+  return { ok: true, decision, patch, modelOutputs };
 }
 
 /** The one payload a callback takes beyond its context, if it takes one. */

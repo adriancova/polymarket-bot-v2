@@ -62,14 +62,7 @@
  * evaluation's record, checkpoint, or replay.
  */
 
-import {
-  IsoTimestampSchema,
-  TerminalMarketOutcomeStateSchema,
-  UnsignedBigIntStringSchema,
-  Uuidv7Schema,
-  UuidSchema,
-  MAX_IDENTIFIER_LENGTH,
-} from "@polymarket-bot/domain";
+import { MAX_IDENTIFIER_LENGTH } from "@polymarket-bot/domain";
 import type { IsoTimestamp } from "@polymarket-bot/domain";
 import {
   STRATEGY_CALLBACK_NAMES,
@@ -85,6 +78,13 @@ import {
 } from "@polymarket-bot/strategy-sdk";
 
 import { deepFreeze, materializeEvaluationViewAt } from "./json.js";
+import {
+  DoorIsoTimestampSchema,
+  DoorTerminalMarketOutcomeStateSchema,
+  DoorUnsignedBigIntStringSchema,
+  DoorUuidSchema,
+  DoorUuidv7Schema,
+} from "./parse-door.js";
 
 export interface EvaluationViews {
   readonly market: MarketView;
@@ -142,6 +142,39 @@ function isBoundedNonEmptyString(value: unknown): value is string {
 }
 
 /**
+ * Whether the door schema ACCEPTS `value` — and never anything else.
+ *
+ * `safeParse` catches the library's own validation errors; it does not catch a
+ * throw from the library's ISSUE and ERROR CONSTRUCTION, which runs OUTSIDE the
+ * arena's reach (`_safeParse` finalizes issues against its own ordinary context
+ * object, and `$ZodError` defines properties with object-literal descriptors).
+ * Measured at this round's tip, on the REFUSAL path only, one non-enumerable
+ * property on `Object.prototype` each:
+ *
+ * ```text
+ * Object.prototype.error    = true   → TypeError: ctx?.error is not a function
+ * Object.prototype.get      = true   → TypeError: Getter must be a function: true
+ * Object.prototype.set      = true   → TypeError: Setter must be a function: true
+ * Object.prototype.value    = true   → TypeError: Invalid property descriptor…
+ * Object.prototype.writable = true   → TypeError: Invalid property descriptor…
+ * ```
+ *
+ * Each of those escaped out of `validateEvaluationInput`, whose contract is
+ * "Never throws" — ADR-020 §6's no-escape bound, broken by the library's error
+ * path rather than by its parse path. A throw is therefore FAIL-CLOSED here,
+ * and closing it costs nothing in fidelity: this function's callers never read
+ * the library's message. Every refusal below is the door's OWN sentence, so a
+ * refusal caused by a throw is byte-identical to the ordinary one.
+ */
+function accepts(schema: { safeParse: (value: unknown) => { success: boolean } }, value: unknown): boolean {
+  try {
+    return schema.safeParse(value).success;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Takes the runtime's ONE inert snapshot of a caller-supplied evaluation input
  * and validates it. Never throws.
  *
@@ -194,7 +227,25 @@ export function validateEvaluationInput(input: unknown): InputValidationResult {
   return validateSnapshot(materialized.value);
 }
 
-/** The shallow, typed validation — always applied to an inert snapshot. */
+/**
+ * The shallow, typed validation — always applied to an inert snapshot.
+ *
+ * D1/D2/D3 (`docs/contracts/schema-boundary.md` §1), and the order is the whole
+ * point:
+ *
+ * - **D1** the value handed here is the materialized tree, never the caller's
+ *   object, and since `WP-170-FU1` that tree is PROTOTYPE-FREE — so
+ *   `input["sourceEvent"]` on an input that carries no `sourceEvent` answers
+ *   `undefined` rather than whatever a caller put on `Object.prototype`;
+ * - **D2** every schema below is the ARENA copy from `./parse-door.js`, not the
+ *   raw domain schema. Five of these six parses were measured accepting garbage
+ *   under one non-enumerable inherited `skipChecks` at base `53e9f62`
+ *   (transcript in `parse-door.ts`), which is precisely how ADR-016's "a
+ *   UUID-shaped value that is not canonical lowercase is REFUSED, never
+ *   case-folded" stopped being enforced;
+ * - **D3** every value validated is read from that same tree and the tree is
+ *   what the caller gets back — no parse output is consumed anywhere.
+ */
 function validateSnapshot(input: unknown): InputValidationResult {
   if (!isRecord(input)) {
     return bad("input must be an object");
@@ -206,7 +257,7 @@ function validateSnapshot(input: unknown): InputValidationResult {
   ) {
     return bad(`callback must be one of ${STRATEGY_CALLBACK_NAMES.join(", ")}`);
   }
-  if (!IsoTimestampSchema.safeParse(input["evaluatedAt"]).success) {
+  if (!accepts(DoorIsoTimestampSchema, input["evaluatedAt"])) {
     return bad("evaluatedAt must be an ISO-8601 timestamp");
   }
 
@@ -214,7 +265,7 @@ function validateSnapshot(input: unknown): InputValidationResult {
   if (!isRecord(market)) {
     return bad("market view is required");
   }
-  if (!Uuidv7Schema.safeParse(market["marketId"]).success) {
+  if (!accepts(DoorUuidv7Schema, market["marketId"])) {
     return bad(
       "market.marketId must be a canonical lowercase UUIDv7 — a non-canonical UUID-shaped " +
         "identifier is refused, never case-folded (ADR-016)",
@@ -255,15 +306,15 @@ function validateSnapshot(input: unknown): InputValidationResult {
       return bad("sourceEvent must be an object when present");
     }
     const eventId = sourceEvent["eventId"];
-    if (eventId !== undefined && !UuidSchema.safeParse(eventId).success) {
+    if (eventId !== undefined && !accepts(DoorUuidSchema, eventId)) {
       return bad("sourceEvent.eventId must be a canonical lowercase UUID (ADR-016)");
     }
     const gatewayEpoch = sourceEvent["gatewayEpoch"];
-    if (gatewayEpoch !== undefined && !UuidSchema.safeParse(gatewayEpoch).success) {
+    if (gatewayEpoch !== undefined && !accepts(DoorUuidSchema, gatewayEpoch)) {
       return bad("sourceEvent.gatewayEpoch must be a canonical lowercase UUID (ADR-016)");
     }
     const ingestSeq = sourceEvent["ingestSeq"];
-    if (ingestSeq !== undefined && !UnsignedBigIntStringSchema.safeParse(ingestSeq).success) {
+    if (ingestSeq !== undefined && !accepts(DoorUnsignedBigIntStringSchema, ingestSeq)) {
       return bad("sourceEvent.ingestSeq must be a canonical unsigned integer string");
     }
   }
@@ -296,7 +347,7 @@ function validateSnapshot(input: unknown): InputValidationResult {
       if (!isRecord(resolution)) {
         return bad("onMarketResolved requires a resolution payload");
       }
-      if (!TerminalMarketOutcomeStateSchema.safeParse(resolution["outcome"]).success) {
+      if (!accepts(DoorTerminalMarketOutcomeStateSchema, resolution["outcome"])) {
         return bad(
           "resolution.outcome must be a terminal market outcome state " +
             "(YES_WIN, NO_WIN, SPLIT_50_50, CANCELLED) — a dispute is market state, not a resolution",
