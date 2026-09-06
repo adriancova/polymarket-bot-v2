@@ -24,7 +24,11 @@
  *
  * - the core loop makes **no trading decision** for it: no strategy is
  *   evaluated, no intent is risk-checked, no plan is built and nothing is
- *   submitted;
+ *   submitted. A fill or an order view that arrives afterwards — including one
+ *   whose OWN iteration latched the halt — is still BOOKED and is **not**
+ *   delivered to the strategy (`loop.ts` §"No trading decision on stale or
+ *   absent state" lists the four gates, and
+ *   `health.loop.deliveriesSuppressedByHalt` counts what they withheld);
  * - the reason and the instant are retained and reported on the health surface;
  * - only an explicit operator act (a new run) clears it. `release` exists for
  *   the ACCOUNT-scope resync case that §7.1 defines — "a restart or detected

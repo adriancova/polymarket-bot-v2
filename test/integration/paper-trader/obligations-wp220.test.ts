@@ -25,6 +25,7 @@ import {
   isStrictUtcInstant,
   normalizeToStrictUtc,
   projectFeatureValues,
+  projectionOf,
   resolveTimeInForce,
   toStrategyOrderView,
 } from "@polymarket-bot/trader";
@@ -33,6 +34,7 @@ import type { Intent } from "@polymarket-bot/domain";
 
 import {
   INCIDENT_KEY,
+  INSTANCE_ID,
   MARKET_ID,
   STOP_KEY,
   TRIGGER_KEY,
@@ -41,6 +43,8 @@ import {
   T_OPEN,
   ingested,
   recordedEvents,
+  restingEntryConfig,
+  restingEntryTradeEvent,
 } from "./support/fixture.js";
 import { assembleOrThrow, driveRecordedRun } from "./support/run.js";
 
@@ -157,6 +161,36 @@ describe("WP-220 composition-root obligations", () => {
     // The ledger transaction exists BEFORE the onFill evaluation's sequence.
     expect(run.trader.loop.ledger().length).toBeGreaterThan(0);
     expect(onFill.evaluationSeq).toBeGreaterThan(entry.evaluationSeq);
+
+    // --- THE VALUE, not only the ordering (review round 1, L1) -------------
+    // Sequence alone survives a position view that answers ZERO: the reviewer
+    // measured exactly that. What cannot survive it is the STRATEGY'S OWN
+    // RECONCILIATION — `static-bracket` compares the fill it folded against the
+    // position view it was shown, and a mismatch PAUSES it with an incident.
+    // So these three assertions are the view's value, read where it is used.
+    expect(onFill.decisionType).toBe("exit");
+    expect(onFill.reasonCodes).toContain("SB.ALLOCATION_CONFIRMED");
+    expect(onFill.reasonCodes).toContain("SB.EXIT_SIZED_TO_ALLOCATION");
+
+    const afterFill = run.parts.store.checkpoints.find(
+      (checkpoint) => checkpoint.checkpointSeq === onFill.evaluationSeq,
+    );
+    expect(afterFill, "the onFill evaluation's checkpoint reached the store").toBeDefined();
+    const state = JSON.parse(afterFill?.stateJson ?? "{}") as Record<string, unknown>;
+    // 50 shares at 0.34 — the venue's own fill, seen by the strategy as its
+    // CONFIRMED allocation rather than as its requested size (§6 invariant 10).
+    expect(state["allocatedShares"]).toBe("50");
+    expect(state["allocatedCost"]).toBe("17");
+    expect(state["instanceState"]).not.toBe("PAUSED");
+    expect(state["lastIncident"]).toBeNull();
+
+    // And the same 50 shares are what the LEDGER projection holds, which is the
+    // source the view is folded from.
+    const projection = projectionOf(run.trader.loop.ledger());
+    const line = [...projection.virtualPositions.values()].find(
+      (position) => position.instanceId === INSTANCE_ID && position.assetId === `token:${YES_TOKEN}`,
+    );
+    expect(line?.balance).toBe("50");
   });
 
   it("OBLIGATION 4 — adopted orders are delivered through onOrderUpdate, not only ctx.orders()", async () => {
@@ -256,15 +290,55 @@ describe("WP-220 composition-root obligations", () => {
     expect(view.status).toBe("PARTIALLY_FILLED");
   });
 
-  it("OBLIGATION 8 — a confirmed fill is delivered even while the instance is PAUSED", async () => {
+  it("OBLIGATION 8 — a fill is BOOKED and OFFERED to a genuinely PAUSED instance", async () => {
+    // The constant is the loop's own statement of the rule; the rest of this
+    // test is the rule HAPPENING (review round 1, L2 — the previous version
+    // asserted the constant and a ledger length that any successful run has).
     expect(FILLS_ARE_DELIVERED_WHILE_PAUSED).toBe(true);
-    // The accounting half — the half a paused strategy would otherwise lose —
-    // happens regardless of the instance's status, because the ledger posting
-    // precedes the delivery in `#harvestFills`. A run whose ledger holds the
-    // fill has performed it.
-    const run = await driveRecordedRun();
-    expect(run.trader.loop.ledger().length).toBeGreaterThan(0);
+
+    // 1. PAUSE THE INSTANCE FOR REAL. A one-deep outbox cannot take the second
+    //    decision of an iteration, `packages/strategy-runtime` answers HALTED
+    //    and pauses the instance, and the loop latches its halt.
+    const run = assembleOrThrow({
+      config: restingEntryConfig({
+        queues: { ingestMaximumDepth: 1024, outboxMaximumDepth: 1 },
+      }),
+    });
+    for (const event of recordedEvents()) run.trader.loop.ingest(event);
+    await run.trader.loop.drain();
+    const instance = run.trader.registry.get(INSTANCE_ID);
+    expect(instance?.runtime.instanceStatus()).toBe("PAUSED");
+
+    // 2. §4.2 outranks obligation 8 while the scope is HALTED, and
+    //    `RUNTIME_PERSISTENCE_FAILED` halts as well as pauses — so the operator
+    //    reconciles and releases the latch against the §7.1 evidence the
+    //    controller demands. The instance is now PAUSED and NOT halted, which
+    //    is the state this obligation is about.
+    expect(
+      run.trader.halts.release(
+        { kind: "STRATEGY_INSTANCE", instanceId: INSTANCE_ID },
+        { authoritativeSnapshotApplied: true, reason: "decision store reconciled" },
+      ),
+    ).toBe(true);
+    expect(instance?.runtime.instanceStatus()).toBe("PAUSED");
+
+    const ledgerBefore = run.trader.loop.ledger().length;
+    const refusedBefore = run.trader.loop.health().loop.refusedEvaluations;
+
+    // 3. The resting entry fills.
+    run.trader.loop.ingest(restingEntryTradeEvent());
+    await run.trader.loop.drain();
+
+    // BOOKED — "the half a paused strategy would otherwise lose".
+    expect(run.trader.loop.health().execution.fillsObserved).toBe(1);
+    expect(run.trader.loop.ledger().length).toBeGreaterThan(ledgerBefore);
     expect(run.trader.loop.traces()).toHaveLength(1);
+    // OFFERED — and the runtime's `INSTANCE_PAUSED` refusal is RECORDED rather
+    // than treated as an error. No callback ran, so no decision was persisted.
+    expect(run.trader.loop.health().loop.refusedEvaluations).toBeGreaterThan(refusedBefore);
+    expect(
+      run.parts.store.decisions.some((written) => written.record.callback === "onFill"),
+    ).toBe(false);
   });
 
   it("OBLIGATION 9 — a reservation is honoured until its order reaches a terminal state", () => {

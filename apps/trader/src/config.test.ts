@@ -53,7 +53,6 @@ function validConfig(): Record<string, unknown> {
       minimumReplaceIntervalMs: 500,
       cancelDeadlineMs: 5000,
       maxPlanLifetimeMs: 30000,
-      submissionUnknownAfterMs: 5000,
     },
     simulation: {
       fillModelVersion: "tier0.fixture",

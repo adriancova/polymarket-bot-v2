@@ -40,8 +40,13 @@
  * produce identical snapshots.
  */
 
+import type { AllocatorMetrics } from "./allocation.js";
+import type { CancelLedgerMetrics } from "./cancels.js";
+import type { FillDeduplicatorMetrics } from "./fills.js";
 import type { HaltRecord } from "./halt.js";
+import type { OrderViewMetrics } from "./orders.js";
 import type { QueueMetrics } from "./queue.js";
+import type { ReservationMetrics } from "./reservations.js";
 
 /**
  * The disclosure that travels with every health snapshot.
@@ -92,6 +97,23 @@ export interface ExecutionHealth {
   readonly cancelsRejected: number;
   /** Cancels closed by `submission_unknown_after_ms` (§6 invariant 6). */
   readonly cancelsSilenceExceeded: number;
+  /**
+   * Plans the §9.7 allocator refused to reserve capital for.
+   *
+   * Distinct from `submissionsRefused`: nothing was offered to the venue.
+   * §9.10 reserves BEFORE submission, so a refusal here is a plan that never
+   * left this process.
+   */
+  readonly allocationsRefused: number;
+  /**
+   * Reservations returned because the VENUE refused the submission.
+   *
+   * Review round 1, MEDIUM-4: a refused submission produces no order view, so
+   * before the fix nothing ever released what it had reserved. A non-zero
+   * count here is the release happening; `seams.reservations.open` returning to
+   * its prior value is the same fact measured from the book.
+   */
+  readonly reservationsReleasedOnRefusal: number;
 }
 
 /** Counters for the loop itself and the strategy runtime it drives. */
@@ -118,6 +140,15 @@ export interface LoopHealth {
   /** ADR-005 §3 containments: the runtime paused an instance. */
   readonly containedEvaluations: number;
   readonly refusedEvaluations: number;
+  /**
+   * Fill and order-view deliveries the §4.2 halt gate withheld from a strategy.
+   *
+   * The ACCOUNTING for those events still happened — the ledger posting is
+   * unconditional, because the money moved whatever this process's state is —
+   * and this counter is the other half of that sentence: the number of times a
+   * halted scope was not allowed to decide on what it had booked.
+   */
+  readonly deliveriesSuppressedByHalt: number;
 }
 
 /** Counters for the §14.3 `accounting` family. */
@@ -127,6 +158,29 @@ export interface AccountingHealth {
   readonly unattributedActivity: number;
   readonly unexplainedMovements: number;
   readonly pnlRecords: number;
+}
+
+/**
+ * The composition-root SEAMS, as counters an operator can read.
+ *
+ * WHY THIS SECTION EXISTS (review round 1, MEDIUM-2). Each of these seams
+ * already published a `metrics()` — and NOTHING CALLED IT outside its own unit
+ * test. `fills.ts` said "a run that evicts is a run whose bound is too small,
+ * and `evictions > 0` on the health surface says so", and there was no health
+ * surface it appeared on. The claim is now true: every seam that bounds, dedups
+ * or reserves reports here, on the one surface `WP-240` will read.
+ */
+export interface SeamHealth {
+  /** `fills.ts` — the at-most-once gate, and how close it is to its bound. */
+  readonly fills: FillDeduplicatorMetrics;
+  /** `reservations.ts` — `WP-220` obligation 9's inventory book. */
+  readonly reservations: ReservationMetrics;
+  /** `cancels.ts` — obligation 10: every cancel reaches a terminal fact. */
+  readonly cancels: CancelLedgerMetrics;
+  /** `orders.ts` — obligations 4 and 5a: deliveries and labelled repeats. */
+  readonly orderViews: OrderViewMetrics;
+  /** `allocation.ts` — the §9.7 commitment book behind §9.8 checks 14 and 15. */
+  readonly allocator: AllocatorMetrics;
 }
 
 export interface HealthSnapshot {
@@ -140,6 +194,8 @@ export interface HealthSnapshot {
   readonly risk: RiskHealth;
   readonly execution: ExecutionHealth;
   readonly accounting: AccountingHealth;
+  /** The composition-root seams' own counters. See {@link SeamHealth}. */
+  readonly seams: SeamHealth;
   readonly riskSeamCaveat: typeof RISK_SEAM_CAVEAT;
   /** The instant this snapshot was taken, from the injected clock. */
   readonly asOf: string;
@@ -174,6 +230,7 @@ export class HealthState {
     decisionsPersisted: 0,
     containedEvaluations: 0,
     refusedEvaluations: 0,
+    deliveriesSuppressedByHalt: 0,
   };
 
   #risk = { evaluations: 0, approvals: 0, refusals: 0, refusedExits: 0 };
@@ -192,6 +249,8 @@ export class HealthState {
     cancelsConfirmed: 0,
     cancelsRejected: 0,
     cancelsSilenceExceeded: 0,
+    allocationsRefused: 0,
+    reservationsReleasedOnRefusal: 0,
   };
 
   #accounting = {
@@ -258,6 +317,14 @@ export class HealthState {
     readonly asOf: string;
     readonly halts: readonly HaltRecord[];
     readonly queues: readonly QueueMetrics[];
+    /**
+     * The seams' own counters, read from the seams by the caller.
+     *
+     * Passed IN rather than held here, for the same reason `queues` is: these
+     * are the live objects' answers at snapshot time, and a copy this class
+     * kept would be a second version of a number the seam already owns.
+     */
+    readonly seams: SeamHealth;
   }): HealthSnapshot {
     return Object.freeze({
       runMode: this.runMode,
@@ -274,6 +341,13 @@ export class HealthState {
       }),
       execution: Object.freeze({ ...this.#execution }),
       accounting: Object.freeze({ ...this.#accounting }),
+      seams: Object.freeze({
+        fills: input.seams.fills,
+        reservations: input.seams.reservations,
+        cancels: input.seams.cancels,
+        orderViews: input.seams.orderViews,
+        allocator: input.seams.allocator,
+      }),
       riskSeamCaveat: RISK_SEAM_CAVEAT,
       asOf: input.asOf,
     });

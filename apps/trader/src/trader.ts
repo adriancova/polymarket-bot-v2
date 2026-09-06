@@ -51,6 +51,7 @@ import {
 } from "@polymarket-bot/strategy-static-bracket";
 
 import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
+import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
 import { configuredFeatureKeys, parseTraderConfig, type TraderConfig } from "./config.js";
 import { HaltController } from "./halt.js";
 import { HealthState } from "./health.js";
@@ -200,6 +201,7 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
   // --- 4. markets ----------------------------------------------------------
   const markets = new Map<string, MarketState>();
   const tokenAssetIds = new Map<string, string>();
+  const allocationMarkets = new Map<string, AllocationMarket>();
   for (const market of config.markets) {
     // Obligation 1: the configured lifecycle instants are normalised ONCE,
     // here, so every view downstream carries the strict-UTC form the strategy
@@ -229,6 +231,12 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     // and traceable to the market it belongs to.
     tokenAssetIds.set(`${market.marketId}|YES`, `token:${market.yesTokenId}`);
     tokenAssetIds.set(`${market.marketId}|NO`, `token:${market.noTokenId}`);
+    // §9.7's per-series / per-underlying / per-resolution-window scope, taken
+    // from the operator's own market document. A market whose scope the caps
+    // reference but the configuration does not state cannot exist: all three
+    // keys are REQUIRED by `config.ts`, so a configured scope cap always has an
+    // attribution and never falls into `CAPITAL_SCOPE_KEY_MISSING` by accident.
+    allocationMarkets.set(market.marketId, allocationMarketOf(market));
   }
 
   // --- 5. the outbox, the ledger, and the counters -------------------------
@@ -321,9 +329,21 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     feeExpenseRef: config.accounting.feeExpenseRef,
   };
 
+  // The §9.7 allocator, built from the caps this root parsed. It is a
+  // CONSTRUCTOR ARGUMENT of the loop rather than an optional collaborator: §8.1
+  // places "allocate capital" before the risk checks and §9.8 check 14 fails
+  // closed without its verdict, so a loop that could be built without one is a
+  // loop that can fabricate the verdict (review round 1, HIGH-1).
+  const allocator = new AllocatorGate({
+    caps: caps.value,
+    markets: allocationMarkets,
+    tokenAssetIds,
+  });
+
   const loop = new CoreLoop({
     config,
     riskPolicy: policy.value,
+    allocator,
     clock: options.clock,
     venue: options.venue,
     store: options.store,
@@ -342,10 +362,6 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     outbox,
   });
 
-  // Referenced so the caps parse is not dead: the allocator's caps are part of
-  // the run's pinned configuration, and a run whose caps were parsed and then
-  // discarded would be a run that validated a document it never used.
-  void caps.value;
   void staticBracketParamsSchema;
 
   return {

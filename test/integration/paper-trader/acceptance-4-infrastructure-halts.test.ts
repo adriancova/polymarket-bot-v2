@@ -15,7 +15,13 @@
  *    instant;
  * 2. **no trading decision is made afterwards** — the decisive one. Not "fewer
  *    decisions": ZERO. §4.2's whole point is that a process which cannot know
- *    its state must not act on it;
+ *    its state must not act on it. That includes an event ALREADY IN FLIGHT
+ *    when the halt latched: a fill whose own iteration halted is booked and is
+ *    NOT delivered to the strategy, which
+ *    `halts-reservations-and-seams.test.ts` drives (review round 1, MEDIUM-1 —
+ *    at the reviewed tip such a fill was delivered and its `exit` decision
+ *    persisted AFTER a FULL_HALT, so this claim was false in the one case it
+ *    most needed to be true);
  * 3. **nothing is dropped.** §8.3 forbids a silent drop, so a backpressure
  *    refusal halts rather than discarding, and the transport is committed only
  *    AFTER the drain so a crash replays rather than skips;

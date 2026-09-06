@@ -153,6 +153,13 @@ export class MemoryEventFeed implements MarketEventFeed {
  * one-decision-per-callback property and the ledger chain against what actually
  * reached the store rather than against what the loop believes it wrote.
  */
+/** The four writes {@link MemoryTraderStore} can be made to fail, by name. */
+export type TraderStoreWrite =
+  | "persistDecision"
+  | "saveCheckpoint"
+  | "appendLedgerTransaction"
+  | "writePnlSnapshot";
+
 export class MemoryTraderStore implements TraderStore {
   readonly decisions: { record: DecisionRecord; telemetry: DecisionTelemetry }[] = [];
   readonly checkpoints: StrategyStateCheckpoint[] = [];
@@ -161,28 +168,57 @@ export class MemoryTraderStore implements TraderStore {
   readonly transactions: AppendedLedgerTransaction[] = [];
   readonly pnlSnapshots: PnlSnapshot[] = [];
   #failure: { kind: "UNAVAILABLE" | "UNREADABLE"; detail: string } | undefined;
+  /** When set, only these writes fail; the others still succeed. */
+  #failing: ReadonlySet<TraderStoreWrite> | undefined;
   #closed = false;
 
   /** Makes every later write answer the named failure. */
   fail(kind: "UNAVAILABLE" | "UNREADABLE", detail: string): void {
     this.#failure = { kind, detail };
+    this.#failing = undefined;
+  }
+
+  /**
+   * Makes only the NAMED writes fail.
+   *
+   * A real PostgreSQL outage takes every statement down at once, which
+   * {@link fail} models. This narrower injection models the other real case —
+   * one statement failing while the connection is up (a constraint violation, a
+   * table-level lock, a partition that is not there) — and it is what lets a
+   * test place a §4.2 halt at an EXACT point inside one iteration rather than
+   * at the first write of the iteration.
+   */
+  failOnly(
+    writes: readonly TraderStoreWrite[],
+    kind: "UNAVAILABLE" | "UNREADABLE",
+    detail: string,
+  ): void {
+    this.#failure = { kind, detail };
+    this.#failing = new Set(writes);
   }
 
   recover(): void {
     this.#failure = undefined;
+    this.#failing = undefined;
   }
 
   get closed(): boolean {
     return this.#closed;
   }
 
+  #refusalFor(write: TraderStoreWrite): PortResult<null> | undefined {
+    const failure = this.#failure;
+    if (failure === undefined) return undefined;
+    if (this.#failing !== undefined && !this.#failing.has(write)) return undefined;
+    return portFailed(failure.kind, failure.detail);
+  }
+
   async persistDecision(
     record: DecisionRecord,
     telemetry: DecisionTelemetry,
   ): Promise<PortResult<null>> {
-    if (this.#failure !== undefined) {
-      return await Promise.resolve(portFailed(this.#failure.kind, this.#failure.detail));
-    }
+    const refused = this.#refusalFor("persistDecision");
+    if (refused !== undefined) return await Promise.resolve(refused);
     this.decisions.push({ record, telemetry });
     return await Promise.resolve(portOk(null));
   }
@@ -191,9 +227,8 @@ export class MemoryTraderStore implements TraderStore {
     checkpoint: StrategyStateCheckpoint,
     capturedAt: string,
   ): Promise<PortResult<null>> {
-    if (this.#failure !== undefined) {
-      return await Promise.resolve(portFailed(this.#failure.kind, this.#failure.detail));
-    }
+    const refused = this.#refusalFor("saveCheckpoint");
+    if (refused !== undefined) return await Promise.resolve(refused);
     this.checkpoints.push(checkpoint);
     this.checkpointInstants.push(capturedAt);
     return await Promise.resolve(portOk(null));
@@ -202,17 +237,15 @@ export class MemoryTraderStore implements TraderStore {
   async appendLedgerTransaction(
     transaction: AppendedLedgerTransaction,
   ): Promise<PortResult<null>> {
-    if (this.#failure !== undefined) {
-      return await Promise.resolve(portFailed(this.#failure.kind, this.#failure.detail));
-    }
+    const refused = this.#refusalFor("appendLedgerTransaction");
+    if (refused !== undefined) return await Promise.resolve(refused);
     this.transactions.push(transaction);
     return await Promise.resolve(portOk(null));
   }
 
   async writePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>> {
-    if (this.#failure !== undefined) {
-      return await Promise.resolve(portFailed(this.#failure.kind, this.#failure.detail));
-    }
+    const refused = this.#refusalFor("writePnlSnapshot");
+    if (refused !== undefined) return await Promise.resolve(refused);
     this.pnlSnapshots.push(snapshot);
     return await Promise.resolve(portOk(null));
   }

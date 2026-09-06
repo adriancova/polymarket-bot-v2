@@ -49,7 +49,27 @@
  * Every failure that means "this process can no longer know the state it would
  * decide from" latches a halt and the loop makes no further decision for the
  * halted scope. That is not an error path bolted on; it is the same `if` that
- * gates every evaluation.
+ * gates every evaluation — and there are exactly FOUR of them, listed here so
+ * the claim can be checked rather than believed:
+ *
+ * | Gate | Where |
+ * | --- | --- |
+ * | a halted MARKET is not evaluated | `#processEvent`, `#evaluateMarket` |
+ * | a halted INSTANCE is not evaluated | `#evaluateMarket` |
+ * | a halted instance is not delivered a FILL | `#harvestFills` |
+ * | a halted instance is not delivered an ORDER VIEW | `#deliverOrderViews` |
+ *
+ * The ACCOUNTING is not gated and must not be: the ledger posting, the cash
+ * update, the PnL fold and the trace record all happen for a halted scope too,
+ * because the money moved and §6 invariant 8 makes the append-only ledger the
+ * source of truth whatever this process's own state is. The books stay
+ * truthful; the strategy does not act.
+ *
+ * > **Corrected 2026-09-05 (remediation round 1).** The third row was NOT true
+ * > at the reviewed tip: a fill whose own iteration latched a halt — a refused
+ * > ledger projection, a failed PnL write — was still delivered to the
+ * > strategy, and the `exit` decision it produced was persisted AFTER a
+ * > GLOBAL/FULL_HALT (review round 1, MEDIUM-1).
  */
 
 import { addDecimal, compareDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
@@ -85,6 +105,7 @@ import {
   type PostingIdentity,
   type TraceLink,
 } from "./accounting.js";
+import { requestFor, type AllocatorGate } from "./allocation.js";
 import { CancelLedger } from "./cancels.js";
 import type { InstanceConfig, MarketConfig, TraderConfig } from "./config.js";
 import { readEventEnvelope } from "./event-door.js";
@@ -149,6 +170,15 @@ export interface TraderVenue {
 export interface CoreLoopOptions {
   readonly config: TraderConfig;
   readonly riskPolicy: RiskPolicy;
+  /**
+   * The §9.7 capital allocator, assembled by the composition root.
+   *
+   * REQUIRED, and deliberately so (review round 1, HIGH-1): §8.1 puts
+   * "allocate capital" between the persisted decision and the risk checks, and
+   * §9.8 check 14 fails closed without the verdict it produces. A loop that
+   * could be constructed without one is a loop that can fabricate the verdict.
+   */
+  readonly allocator: AllocatorGate;
   readonly clock: Clock;
   readonly venue: TraderVenue;
   readonly store: TraderStore;
@@ -316,6 +346,18 @@ export class CoreLoop {
   }
 
   /**
+   * The exact capital one held position cost — §9.7's "capital already spent".
+   *
+   * Published because it is the number BOTH the §9.7 exposure table and the
+   * §9.8 worst-case builder consume, and an operational surface that could not
+   * read it could not tell a position that consumed nothing from a book that
+   * forgot what it paid.
+   */
+  costBasisOf(instanceId: string, marketId: string, side: "YES" | "NO"): string {
+    return this.#options.allocator.costBasisOf(instanceId, marketId, side);
+  }
+
+  /**
    * The venue's `ExecutionPolicy.timeInForceFor` answer for one planned order.
    *
    * Published because the venue asks the COMPOSITION ROOT for it — "a silently
@@ -336,11 +378,26 @@ export class CoreLoop {
     return Object.freeze([this.#queue.metrics(this.#lastEpochMs)]);
   }
 
+  /**
+   * The whole health surface, including the SEAMS' own counters.
+   *
+   * Review round 1, MEDIUM-2: every seam below already published a `metrics()`
+   * and none of them had a caller outside its own unit test, so the claims that
+   * rested on them ("`evictions > 0` on the health surface says so") were
+   * false. This method is the caller.
+   */
   health(): HealthSnapshot {
     return this.#options.health.snapshot({
       asOf: this.#lastInstant,
       halts: this.#options.halts.records(),
       queues: this.queueMetrics(),
+      seams: {
+        fills: this.#fills.metrics(),
+        reservations: this.#reservations.metrics(),
+        cancels: this.#cancels.metrics(),
+        orderViews: this.#orderViews.metrics(),
+        allocator: this.#options.allocator.metrics(),
+      },
     });
   }
 
@@ -926,6 +983,25 @@ export class CoreLoop {
     const positions = this.#positionsFor(input.instance, marketConfig, projection);
     const bookAgeMs = this.#bookAgeMs(input.market, input.epochMs);
 
+    // --- step 6: ALLOCATE CAPITAL (§8.1, §9.7) ------------------------------
+    // Before the risk checks, exactly where §8.1 puts it, and with the REAL
+    // caps this process parsed at startup. Its verdict is handed to §9.8
+    // check 14 unaltered — the loop does not read it, does not repair it and
+    // has no branch on it.
+    const allocation = this.#options.allocator.evaluate({
+      intent: input.intent,
+      instanceId: input.instance.instanceId,
+      accountingMode: accountingModeFor(input.instance),
+      liveOwners: this.#liveOwners(),
+      projection,
+      availableCollateral: this.#cash,
+      approvedIntentId,
+      heldShares: (marketId, side) =>
+        marketId === marketConfig.marketId
+          ? (positions.find((position) => position.side === side)?.shares ?? "0")
+          : "0",
+    });
+
     const riskInput = buildRiskEvaluationInput({
       intent: input.intent,
       evaluatedAt: input.instant,
@@ -942,8 +1018,8 @@ export class CoreLoop {
       featuresAgeMs: 0,
       positions,
       openOrders: this.#openOrdersFor(input.instance, marketConfig),
-      exposures: undefined,
-      allocation: { permitted: true },
+      exposures: allocation.exposures,
+      allocation: allocation.verdict,
       recentIntentIds: Object.freeze([...this.#recentIntentIds]),
       availableRequests: this.#availableRequests(input.epochMs),
       parametersVersion: marketConfig.parametersVersion,
@@ -1052,8 +1128,44 @@ export class CoreLoop {
           this.#timeInForce.record(order.plannedOrderId, resolved.timeInForce);
         }
       }
-      // WP-220 obligation 9: the reservation an accepted plan takes is recorded
-      // NOW, so the next evaluation's reduction plans against `held − reserved`.
+      // --- §9.10: RESERVE BEFORE SUBMISSION, in BOTH books -----------------
+      // `ReservationBook` holds the inventory the next PLAN may not use
+      // (`WP-220` obligation 9, so the next evaluation's reduction plans
+      // against `held − reserved`); the ALLOCATOR holds the §9.7 commitment
+      // every cap compares against. Both are keyed on the planned order, both
+      // are taken here, and both are released at the same two moments.
+      const allocatorEntries = placement.reservations.map((requirement) => ({
+        plannedOrderId: plannedOrderFor(placement, requirement.reservationId),
+        request: requestFor({
+          reservationId: requirement.reservationId,
+          instanceId: input.instance.instanceId,
+          accountingMode: accountingModeFor(input.instance),
+          leg: {
+            marketId: requirement.marketId,
+            side: requirement.side,
+            action: requirement.action,
+            price: requirement.price,
+            shares: requirement.shares,
+          },
+          market: this.#options.allocator.marketOf(requirement.marketId),
+        }),
+      }));
+      const reserved = this.#options.allocator.applyForPlan({
+        entries: allocatorEntries,
+        liveOwners: this.#liveOwners(),
+        projection: projectionOf(this.#ledger),
+        availableCollateral: this.#cash,
+      });
+      if (!reserved.ok) {
+        // §9.10 is "reserve BEFORE submission", so a reservation the allocator
+        // refuses is a plan that is NOT submitted. Nothing was applied — the
+        // gate applies a plan's legs all or none — so nothing needs releasing.
+        // The refusal CODES are counted by the gate itself
+        // (`seams.allocator.refusalsByCode`), so this process has exactly one
+        // authority on what the allocator said.
+        this.#options.health.countExecution("allocationsRefused");
+        return;
+      }
       for (const requirement of placement.reservations) {
         this.#reservations.take({
           reservationId: requirement.reservationId,
@@ -1080,6 +1192,24 @@ export class CoreLoop {
           input.instant,
         );
         if (resolution !== undefined) this.#options.health.countExecution("cancelsRejected");
+        return;
+      }
+      // --- the refused submission RELEASES what it reserved -----------------
+      // Review round 1, MEDIUM-4. A refused submission produces NO order and
+      // therefore no order view, and the only release path was
+      // `#deliverOrderViews`'s terminal-status arm — so the reservation stayed
+      // taken FOREVER. `reserved` grew monotonically, understating
+      // `availableCollateral` on the planning surface and the unreserved
+      // balance on the strategy's `riskBudget`, until entries starved with no
+      // visible cause. The venue said no; the capacity comes back.
+      for (const group of placement.groups) {
+        for (const order of group.orders) {
+          if (this.#reservations.releaseForOrder(order.plannedOrderId)) {
+            this.#options.health.countExecution("reservationsReleasedOnRefusal");
+          }
+          this.#options.allocator.release(order.plannedOrderId);
+          this.#timeInForce.release(order.plannedOrderId);
+        }
       }
       return;
     }
@@ -1118,13 +1248,15 @@ export class CoreLoop {
    * Books every fill the venue has produced since the last harvest, then
    * delivers the order views and the fills to their instances.
    *
-   * ORDER MATTERS AND IS THE OBLIGATION. The ledger posting happens FIRST, so
-   * that by the time `onFill` runs, the position view already includes the fill
-   * the evaluation is about (`WP-220` obligation 3). The order views are
-   * delivered too, on every harvest and including repeats (obligations 4 and 5).
+   * ORDER MATTERS AND IS THE OBLIGATION. EVERY fill of this harvest is booked
+   * FIRST, so that by the time any `onFill` runs the position view already
+   * includes the fill the evaluation is about (`WP-220` obligation 3) — and, if
+   * two fills arrive together, both of them. The order views are delivered too,
+   * on every harvest and including repeats (obligations 4 and 5).
    */
   async #harvestFills(instant: string): Promise<void> {
     const fills = this.#options.venue.fills;
+    const booked: { instance: RegisteredInstance; fill: SimulatedFill }[] = [];
     for (let index = this.#knownFills; index < fills.length; index += 1) {
       const fill = fills[index];
       if (fill === undefined) continue;
@@ -1166,6 +1298,10 @@ export class CoreLoop {
       this.#options.health.countAccounting("ledgerTransactions", posted.appended.length);
       this.#options.health.countAccounting("pnlRecords", posted.pnlRecords.length);
       this.#cash = cashAfter(this.#cash, fill);
+      // §9.7's position exposure is "capital already spent", and this is the
+      // only place that number can be folded: the ledger projection carries
+      // balances, not lots. FIFO, exact, no division (`allocation.ts`).
+      this.#options.allocator.observeFill(instance.instanceId, fill);
       // `buildFillPosting` emits one stream per OWNER — the actual account's
       // and each claiming instance's — and `applyPnlRecord` refuses a record
       // whose owner is not the stream's. So the instance's stream keeps the
@@ -1239,16 +1375,71 @@ export class CoreLoop {
       // truth — but a store failure IS, on §4.2's terms.
       await this.#writePnlSnapshot(instance, fill, instant);
 
-      // WP-220 obligation 8: the fill is offered even while the instance is
-      // PAUSED. The runtime refuses a paused instance without invoking the
-      // callback, and that refusal is RECORDED rather than treated as an error —
-      // the accounting above already happened, which is the half a paused
-      // strategy would otherwise lose.
-      await this.#deliverFill(instance, fill, instant);
+      booked.push({ instance, fill });
     }
     this.#knownFills = fills.length;
 
+    // --- every order this harvest SETTLED gives its capacity back -----------
+    // Between a fill's posting and its order's terminal release BOTH the new
+    // position and the still-held reservation describe the same capital, and
+    // §9.14 forbids double reservation. Running the release here — after every
+    // fill of this harvest is in the ledger, before any evaluation reads the
+    // account — closes the window in the fail-closed direction at both ends:
+    // nothing is released before the position that replaces it exists.
+    this.#releaseSettledReservations();
+
+    for (const delivery of booked) {
+      // --- WP-220 obligation 8, and the §4.2 gate it stops at ---------------
+      //
+      // The fill is offered even while the instance is PAUSED: the runtime
+      // refuses a paused instance without invoking the callback, and that
+      // refusal is RECORDED rather than treated as an error — the accounting
+      // above already happened, which is the half a paused strategy would
+      // otherwise lose.
+      //
+      // A HALTED SCOPE IS A DIFFERENT FACT (review round 1, MEDIUM-1). The
+      // posting above is unconditional — the money moved, and §6 invariant 8
+      // makes the ledger the source of truth whatever this process's own state
+      // is — but §4.2's rule is that a process which can no longer know its
+      // state MAKES NO TRADING DECISION for the halted scope. At the reviewed
+      // tip a halt latched EARLIER IN THIS SAME ITERATION (a refused ledger
+      // projection, a failed PnL write) did not stop the delivery: the strategy
+      // was evaluated and an `exit` decision was persisted AFTER a
+      // GLOBAL/FULL_HALT. The books stay truthful; the strategy does not act.
+      if (
+        this.#options.halts.isInstanceHalted(
+          delivery.instance.instanceId,
+          delivery.instance.marketId,
+        )
+      ) {
+        this.#options.health.countLoop("deliveriesSuppressedByHalt");
+        continue;
+      }
+      await this.#deliverFill(delivery.instance, delivery.fill, instant);
+    }
+
     await this.#deliverOrderViews(instant);
+  }
+
+  /**
+   * Releases both reservation books for every order that has reached a terminal
+   * state.
+   *
+   * Idempotent: a second call for the same order releases nothing and says so,
+   * which is why `#deliverOrderViews` may keep its own call for orders that go
+   * terminal without producing a fill (a cancel, an expiry, a rejection).
+   */
+  #releaseSettledReservations(): void {
+    for (const order of this.#options.venue.ordersSnapshot()) {
+      const view = toStrategyOrderView(order, {
+        marketId: order.marketId,
+        placedAt: this.#lastInstant,
+      });
+      if (!isTerminalStatus(view.status)) continue;
+      this.#reservations.releaseForOrder(order.plannedOrderId);
+      this.#options.allocator.release(order.plannedOrderId);
+      this.#timeInForce.release(order.plannedOrderId);
+    }
   }
 
   /**
@@ -1351,10 +1542,15 @@ export class CoreLoop {
       });
       this.#orderViews.deliverable(instance.instanceId, view);
       if (isTerminalStatus(view.status)) {
+        // BOTH books, at the same moment and on the same key: the order can
+        // consume no more inventory and commit no more capital (`allocation.ts`
+        // §"The two reservation books").
         this.#reservations.releaseForOrder(order.plannedOrderId);
+        this.#options.allocator.release(order.plannedOrderId);
         this.#timeInForce.release(order.plannedOrderId);
       }
       if (this.#options.halts.isInstanceHalted(instance.instanceId, instance.marketId)) {
+        this.#options.health.countLoop("deliveriesSuppressedByHalt");
         continue;
       }
       const snapshot = this.#computeSnapshot(market, instance, instant, this.#lastEpochMs);
@@ -1446,10 +1642,38 @@ export class CoreLoop {
         marketId: marketConfig.marketId,
         side,
         shares: line.balance,
-        costBasis: "0",
+        // The EXACT capital this position cost, folded FIFO from the fills this
+        // process booked (`allocation.ts`). It was `"0"` at the reviewed tip,
+        // which told `packages/risk`'s worst-case builder that every held
+        // position had consumed nothing — the same understatement review round
+        // 1 found on the allocator side.
+        costBasis: this.#options.allocator.costBasisOf(
+          instance.instanceId,
+          marketConfig.marketId,
+          side,
+        ),
       });
     }
     return Object.freeze(positions);
+  }
+
+  /**
+   * The §9.7 live-ownership table, from the registry that enforces it.
+   *
+   * ADR-011 permits one live owner per market and `InstanceRegistry.register`
+   * refuses a second at startup, so this is a READ of that decision rather than
+   * a second one. A market with no owner is ABSENT, not defaulted: the
+   * allocator refuses a LIVE commitment on an unowned market by name
+   * (`CAPITAL_LIVE_OWNERSHIP_MISSING`), which is the fail-closed direction.
+   */
+  #liveOwners(): readonly { readonly marketId: string; readonly strategyInstanceId: string }[] {
+    const owners: { marketId: string; strategyInstanceId: string }[] = [];
+    for (const marketId of [...this.#options.markets.keys()].sort()) {
+      const owner = this.#options.registry.ownerOf(marketId);
+      if (owner === undefined) continue;
+      owners.push({ marketId, strategyInstanceId: owner });
+    }
+    return Object.freeze(owners);
   }
 
   #openOrdersFor(
@@ -1638,6 +1862,20 @@ function affectedMarketIds(payload: unknown): readonly string[] {
   const list = (payload as Record<string, unknown>)["affectedMarketIds"];
   if (!Array.isArray(list)) return Object.freeze([]);
   return Object.freeze(list.filter((member): member is string => typeof member === "string"));
+}
+
+/**
+ * The §9.7 accounting mode one instance commits under.
+ *
+ * §8.2: "V1 prevents multiple live owners of one market, but shadow instances
+ * may still evaluate after the owner." A SHADOW instance's commitments are kept
+ * in `packages/capital-allocator`'s independent shadow book and never touch
+ * live collateral, inventory or caps — which is §9.7's "preserves independent
+ * shadow accounting", read off the ownership the registry already records
+ * rather than decided again here.
+ */
+function accountingModeFor(instance: RegisteredInstance): "LIVE" | "SHADOW" {
+  return instance.ownership === "OWNER" ? "LIVE" : "SHADOW";
 }
 
 function intentIdOf(intent: Intent): string {

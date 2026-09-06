@@ -7,11 +7,13 @@
  * fill count.
  */
 
+import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
 import { describe, expect, it } from "vitest";
 
+import { AllocatorGate } from "./allocation.js";
 import { CancelLedger } from "./cancels.js";
 import { FILLS_ARE_DELIVERED_WHILE_PAUSED, FillDeduplicator } from "./fills.js";
-import { HealthState, RISK_SEAM_CAVEAT } from "./health.js";
+import { HealthState, RISK_SEAM_CAVEAT, type SeamHealth } from "./health.js";
 import { InstanceRegistry, compareInstances } from "./instances.js";
 import {
   OrderViewTracker,
@@ -49,6 +51,35 @@ function simulatedOrder(overrides: Record<string, unknown> = {}): Parameters<typ
     },
     ...overrides,
   } as Parameters<typeof toStrategyOrderView>[0];
+}
+
+/** A real gate over the fenced caps, for the seam-metric assertions. */
+export function testAllocatorGate(
+  caps: Record<string, unknown> = { globalAccountCap: "1000", perStrategyCap: "1000" },
+): AllocatorGate {
+  const parsed = parseAllocatorCaps(caps);
+  if (!parsed.ok) throw new Error(`the test caps were refused: ${parsed.refusals[0]?.code ?? "?"}`);
+  return new AllocatorGate({
+    caps: parsed.value,
+    markets: new Map(),
+    tokenAssetIds: new Map(),
+  });
+}
+
+/**
+ * The seam counters, read from REAL seams.
+ *
+ * Hand-built numbers here would test the snapshot's plumbing against itself;
+ * these are the same `metrics()` calls `CoreLoop.health()` makes.
+ */
+function seamMetrics(): SeamHealth {
+  return {
+    fills: new FillDeduplicator({ maximumRemembered: 4 }).metrics(),
+    reservations: new ReservationBook().metrics(),
+    cancels: new CancelLedger().metrics(),
+    orderViews: new OrderViewTracker().metrics(),
+    allocator: testAllocatorGate().metrics(),
+  };
 }
 
 describe("obligation 5b — the fill deduplicator", () => {
@@ -406,7 +437,7 @@ describe("the risk-seam caveat's visibility", () => {
     health.countRiskRefusal(["RISK_MARKET_CLOSE_ONLY"], true);
     health.countRiskRefusal(["RISK_BOOK_STALE"], false);
     health.countRiskApproval();
-    const snapshot = health.snapshot({ asOf: AT, halts: [], queues: [] });
+    const snapshot = health.snapshot({ asOf: AT, halts: [], queues: [], seams: seamMetrics() });
     expect(snapshot.risk.evaluations).toBe(4);
     expect(snapshot.risk.approvals).toBe(1);
     expect(snapshot.risk.refusals).toBe(3);
@@ -425,7 +456,7 @@ describe("the risk-seam caveat's visibility", () => {
     health.countRiskRefusal(["Z_CODE"], false);
     health.countRiskRefusal(["A_CODE"], false);
     health.countRiskRefusal(["M_CODE"], false);
-    const snapshot = health.snapshot({ asOf: AT, halts: [], queues: [] });
+    const snapshot = health.snapshot({ asOf: AT, halts: [], queues: [], seams: seamMetrics() });
     expect(Object.keys(snapshot.risk.refusalsByCode)).toEqual(["A_CODE", "M_CODE", "Z_CODE"]);
   });
 });

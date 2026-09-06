@@ -257,11 +257,15 @@ const PlanningConfigSchema = z.strictObject({
   minimumReplaceIntervalMs: z.number().int().min(0).max(86_400_000),
   cancelDeadlineMs: BoundedMs,
   maxPlanLifetimeMs: BoundedMs,
-  /**
-   * §6 invariant 6: how long an unconfirmed cancel may stay unresolved before
-   * the root closes it as `SILENCE_EXCEEDED` (`WP-220` obligation 10).
-   */
-  submissionUnknownAfterMs: BoundedMs,
+  // §6 invariant 6's silence bound — how long an unconfirmed cancel may stay
+  // unresolved before the root closes it `SILENCE_EXCEEDED` — is DELIBERATELY
+  // NOT HERE (review round 1, L4). It is a §13.2 STRATEGY parameter
+  // (`entry.execution.submission_unknown_after_ms`), validated by the
+  // strategy's own validator and read per instance by `loop.ts`'s cancel
+  // sweep, so a process-level copy would be a second authority over the same
+  // bound. At the reviewed tip this schema REQUIRED such a copy and nothing
+  // read it: a required field an operator sets with no effect is worse than an
+  // absent one, because it reads as a control.
 });
 
 /**
@@ -398,7 +402,17 @@ export type InstanceConfig = TraderConfig["instances"][number];
 const TraderConfigDoor = prototypeFreeParser(TraderConfigSchema);
 
 export interface ConfigRefusal {
-  readonly code: "TRADER_CONFIG_NOT_DATA" | "TRADER_CONFIG_INVALID";
+  readonly code:
+    | "TRADER_CONFIG_NOT_DATA"
+    | "TRADER_CONFIG_INVALID"
+    /**
+     * Two fields of this document describe ONE quantity and disagree.
+     *
+     * Its own code because it is not a grammar failure: both values are valid
+     * decimals and the document is well formed. See
+     * {@link crossFieldRefusal}.
+     */
+    | "TRADER_CONFIG_INCONSISTENT";
   readonly detail: string;
   readonly issues: readonly string[];
 }
@@ -495,7 +509,46 @@ function parseTraderConfigInner(input: unknown): ParseConfigResult {
 
   // D3/D4 — the value is the materialized tree, frozen. `readPlainData` already
   // built it prototype-free; freezing makes the answer immutable as well.
-  return { ok: true, config: deepFreeze(materialized) as TraderConfig };
+  const config = deepFreeze(materialized) as TraderConfig;
+
+  const inconsistent = crossFieldRefusal(config);
+  if (inconsistent !== undefined) return { ok: false, refusal: inconsistent };
+
+  return { ok: true, config };
+}
+
+/**
+ * Cross-field consistency, checked after the grammar (review round 1, L5).
+ *
+ * `accounting.startingCash` is the balance the LOOP books against — the number
+ * `#cash` starts at and every §9.7 `availableCollateral` is derived from — and
+ * `simulation.startingCash` is the balance the VENUE opens its own simulated
+ * account with. They describe the same pUSD, from two sides of the §12.1 seam.
+ *
+ * WHY A REFUSAL RATHER THAN A DERIVATION. Deriving one from the other would
+ * pick a winner silently, and the two are read by different components at
+ * different times: an operator who set one and forgot the other would get a run
+ * whose ledger and whose venue disagree about how much money exists, with no
+ * event marking the divergence. §6 invariant 1's discipline is that an economic
+ * value is exact and stated; two statements of one value that differ is a
+ * document nobody can act on, and BOTH PATHS ARE NAMED so the operator does not
+ * have to guess which one to change.
+ */
+function crossFieldRefusal(config: TraderConfig): ConfigRefusal | undefined {
+  if (config.accounting.startingCash === config.simulation.startingCash) return undefined;
+  return {
+    code: "TRADER_CONFIG_INCONSISTENT",
+    detail:
+      "accounting.startingCash and simulation.startingCash state the same opening pUSD balance " +
+      "and disagree; the loop books against the first and the simulated venue opens its account " +
+      "with the second, so a run under this document would have a ledger and a venue that " +
+      "disagree about how much money exists. Refused rather than derived: choosing a winner " +
+      "here would silently discard the value the operator did set",
+    issues: [
+      `accounting.startingCash: ${config.accounting.startingCash}`,
+      `simulation.startingCash: ${config.simulation.startingCash}`,
+    ],
+  };
 }
 
 /**

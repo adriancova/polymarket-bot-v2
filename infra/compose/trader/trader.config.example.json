@@ -48,8 +48,7 @@
     "replaceThresholdTicks": 1,
     "minimumReplaceIntervalMs": 500,
     "cancelDeadlineMs": 5000,
-    "maxPlanLifetimeMs": 30000,
-    "submissionUnknownAfterMs": 5000
+    "maxPlanLifetimeMs": 30000
   },
   "simulation": {
     "fillModelVersion": "tier0.pipeline-smoke",

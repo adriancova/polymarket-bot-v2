@@ -37,6 +37,8 @@ import {
   unmodeledRateLimits,
   type BookView,
   type FeeScheduleSnapshot,
+  type PlannedOrderView,
+  type RateLimitBudget,
   type RecordedEventIdentity,
   type TimeInForce,
 } from "@polymarket-bot/simulation";
@@ -192,7 +194,6 @@ export function traderConfig(overrides: Record<string, unknown> = {}): Record<st
       minimumReplaceIntervalMs: 500,
       cancelDeadlineMs: 5_000,
       maxPlanLifetimeMs: 30_000,
-      submissionUnknownAfterMs: 5_000,
     },
     simulation: {
       fillModelVersion: "tier0.fixture",
@@ -373,6 +374,202 @@ export function recordedEvents(): readonly IngestedEvent[] {
   ]);
 }
 
+/**
+ * The fixture with a RESTING entry: a post-only BUY at `0.30`, below the best
+ * ask, held under `GTC`.
+ *
+ * WHY IT EXISTS. The shipped fixture's entry is a `FAK` taker that fills and
+ * goes terminal in the same instant, so three properties have no observable
+ * moment in it: a reservation RISING on submission, a reservation SURVIVING a
+ * non-terminal order view, and a fill arriving at an instance that is already
+ * PAUSED. Review round 1's L2 and L3 name all three. This variant gives each of
+ * them a moment, and it does so by CONFIGURATION — the strategy, the planner and
+ * the venue are the same merged packages doing what an operator's own settings
+ * ask of them.
+ */
+export function restingEntryConfig(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const base = traderConfig();
+  const instance = (base["instances"] as Record<string, unknown>[])[0];
+  if (instance === undefined) throw new Error("the fixture configuration lost its instance");
+  const params = strategyParams();
+  const entry = params["entry"] as Record<string, unknown>;
+  return {
+    ...base,
+    instances: [
+      {
+        ...instance,
+        params: {
+          ...params,
+          entry: {
+            ...entry,
+            execution: {
+              ...(entry["execution"] as Record<string, unknown>),
+              liquidity_preference: "MAKER_ONLY",
+              passive_price: "0.3",
+              immediate_order_type: "GTC",
+            },
+          },
+        },
+      },
+    ],
+    ...overrides,
+  };
+}
+
+/**
+ * The public trade that TOUCHES the resting entry and fills it.
+ *
+ * §12.2 at Tier 0: "grants the whole remaining size on touch or trade-through".
+ * A partially-filled RESTING order is therefore not representable in a Tier-0
+ * fixture at all — ADR-012 §1 makes a Tier-1 resting result a BAND rather than a
+ * point quantity — so the non-terminal moment this fixture offers is the order
+ * RESTING before the trade arrives, which is what the reservation assertions
+ * use.
+ *
+ * Emitted separately from {@link restingEntryEvents} so a test can drive the run
+ * UP TO the resting order, do something to the process, and then let the fill
+ * arrive.
+ */
+export function restingEntryTradeEvent(): IngestedEvent {
+  return ingested(
+    "PublicTradeObserved",
+    { internalMarketId: MARKET_ID, tokenId: YES_TOKEN, price: "0.32", size: "20" },
+    { receivedAt: "2026-03-04T12:00:05.000Z", ingestSeq: 7 },
+  );
+}
+
+/** {@link recordedEvents} plus the trade that fills the resting entry. */
+export function restingEntryEvents(): readonly IngestedEvent[] {
+  return Object.freeze([...recordedEvents(), restingEntryTradeEvent()]);
+}
+
+export const MARKET_ID_2 = "018f4a7e-7777-7abc-8def-0123456789ab";
+export const YES_TOKEN_2 = "333";
+export const NO_TOKEN_2 = "444";
+export const INSTANCE_ID_2 = "b18f4a7e-8888-7abc-8def-0123456789ab";
+export const RUN_ID_2 = "018f4a7e-9999-7abc-8def-0123456789ab";
+export const CONFIG_ID_2 = "018f4a7e-aaaa-7abc-8def-0123456789ab";
+
+/**
+ * TWO markets, each with its own OWNER instance, and a starting balance that
+ * funds exactly ONE of the two entries.
+ *
+ * This is the shape review round 1's MEDIUM-4 needs: the trader's
+ * {@link ReservationBook} holds COLLATERAL across markets, so a reservation
+ * market 1's refused submission failed to release STARVES market 2's entry —
+ * and the starvation is observable on the health surface (`plansRefused`)
+ * without reaching into a private field.
+ *
+ * `startingCash` is `"18"`: one 50-share entry bounded at `0.35` reserves
+ * `17.5`, leaving `0.5` — less than the second entry needs.
+ */
+export function twoMarketConfig(startingCash = "18"): Record<string, unknown> {
+  const base = traderConfig();
+  const market = (base["markets"] as Record<string, unknown>[])[0];
+  const instance = (base["instances"] as Record<string, unknown>[])[0];
+  if (market === undefined || instance === undefined) {
+    throw new Error("the fixture configuration lost its market or its instance");
+  }
+  return {
+    ...base,
+    accounting: { ...(base["accounting"] as Record<string, unknown>), startingCash },
+    simulation: { ...(base["simulation"] as Record<string, unknown>), startingCash },
+    markets: [
+      market,
+      {
+        ...market,
+        marketId: MARKET_ID_2,
+        yesTokenId: YES_TOKEN_2,
+        noTokenId: NO_TOKEN_2,
+      },
+    ],
+    instances: [
+      instance,
+      {
+        ...instance,
+        instanceId: INSTANCE_ID_2,
+        runId: RUN_ID_2,
+        configId: CONFIG_ID_2,
+        marketId: MARKET_ID_2,
+        evaluationPriority: 1,
+      },
+    ],
+  };
+}
+
+/**
+ * {@link recordedEvents} for both markets, market 1 FIRST and complete before
+ * market 2 opens.
+ *
+ * The order matters: market 1's entry must be planned, submitted and REFUSED
+ * before market 2's entry is planned, or the starvation the probe measures
+ * could not be attributed to the leaked reservation.
+ *
+ * Each market needs TWO book evaluations, because the Static Bracket ARMS on
+ * the first (`SB.ARMED`) and enters on the second.
+ */
+export function twoMarketEvents(): readonly IngestedEvent[] {
+  resetEventIds();
+  let seq = 0;
+  const next = (): number => {
+    seq += 1;
+    return seq;
+  };
+  const at = (): string =>
+    `2026-03-04T12:00:${String(seq).padStart(2, "0")}.000Z`;
+  const reference = [
+    ingested(
+      "ReferenceTradeObserved",
+      { venue: "binance", symbol: "BTCUSDT", price: "100000", size: "0.5" },
+      { receivedAt: (next(), at()), ingestSeq: seq, source: "binance" },
+    ),
+  ];
+  const forMarket = (
+    marketId: string,
+    yesTokenId: string,
+    noTokenId: string,
+  ): readonly IngestedEvent[] => [
+    ingested(
+      "MarketOpened",
+      { internalMarketId: marketId, conditionId: "0xcondition", openedAt: T_OPEN },
+      { receivedAt: (next(), at()), ingestSeq: seq },
+    ),
+    ingested(
+      "BookSnapshot",
+      {
+        internalMarketId: marketId,
+        tokenId: yesTokenId,
+        bids: [
+          { price: "0.32", size: "200" },
+          { price: "0.31", size: "300" },
+        ],
+        asks: [
+          { price: "0.34", size: "200" },
+          { price: "0.35", size: "300" },
+        ],
+      },
+      { receivedAt: (next(), at()), ingestSeq: seq },
+    ),
+    ingested(
+      "BookSnapshot",
+      {
+        internalMarketId: marketId,
+        tokenId: noTokenId,
+        bids: [{ price: "0.65", size: "200" }],
+        asks: [{ price: "0.66", size: "200" }],
+      },
+      { receivedAt: (next(), at()), ingestSeq: seq },
+    ),
+  ];
+  return Object.freeze([
+    ...reference,
+    ...forMarket(MARKET_ID, YES_TOKEN, NO_TOKEN),
+    ...forMarket(MARKET_ID_2, YES_TOKEN_2, NO_TOKEN_2),
+  ]);
+}
+
 /** The 2026-08-24 venue fee snapshot shape, with zero fees for a clean fixture. */
 export function feeSnapshot(): FeeScheduleSnapshot {
   return {
@@ -413,11 +610,21 @@ export function assemble(
     readonly config?: Record<string, unknown>;
     readonly env?: Record<string, string | undefined>;
     readonly idNamespace?: string;
+    /**
+     * The venue's §9.13 rate-limit budget.
+     *
+     * Defaults to `unmodeledRateLimits`, as the shipped process does. A test
+     * that needs the REAL venue to REFUSE a submission supplies a token bucket
+     * with no order tokens: that is a genuine `SIMULATED_VENUE_RATE_LIMITED`
+     * refusal produced by the real venue, not a doubled one.
+     */
+    readonly rateLimits?: RateLimitBudget;
   } = {},
 ): { readonly result: CreateTraderResult; readonly parts: Assembled | undefined } {
   const clock = new ManualClock("2026-03-04T12:00:00.000Z");
   const store = new MemoryTraderStore();
   const feed = new MemoryEventFeed();
+  const document = options.config ?? traderConfig();
 
   const books = new Map<string, BookView>();
   const bookSource: BookSource = {
@@ -429,6 +636,13 @@ export function assemble(
   const fees = readFeeScheduleSnapshot(feeSnapshot());
   if (!fees.ok) throw new Error("the fixture fee snapshot was refused");
 
+  // The two-phase venue wiring `apps/trader/src/main.ts` uses, for the same
+  // reason: the venue asks the COMPOSITION ROOT for the book and for the
+  // time-in-force, and both answers live inside the trader the venue is a
+  // constructor argument to. The fixture holds the trader the same way the
+  // process does, so the seam under test is the shipped one.
+  const wiring: { trader: PaperTrader | undefined } = { trader: undefined };
+
   const venue = new SimulatedVenue({
     clock,
     runMode: "PAPER",
@@ -437,43 +651,81 @@ export function assemble(
       fillModelParametersHash: "a".repeat(64),
     }),
     feeSnapshot: fees.value,
-    rateLimits: unmodeledRateLimits(
-      "the paper fixture models no venue rate limit; §9.13's budget arrives with WP-310",
-    ),
+    rateLimits:
+      options.rateLimits ??
+      unmodeledRateLimits(
+        "the paper fixture models no venue rate limit; §9.13's budget arrives with WP-310",
+      ),
     policy: {
-      // The `immediate_order_type` resolution lives in the trader
-      // (`pipeline.ts`); this fixture policy asks the trader's book through the
-      // hook the venue provides. The fixture's strategy configures `FAK`, so an
-      // unfilled remainder is cancelled rather than rested.
-      timeInForceFor(): TimeInForce {
-        return "FAK";
+      /**
+       * The `immediate_order_type` resolution lives in the TRADER
+       * (`pipeline.ts` records it per planned order at plan time); this policy
+       * asks the trader's own book through the hook the venue provides, exactly
+       * as `main.ts` does.
+       *
+       * A literal here would have been a SECOND authority that agreed with the
+       * trader by coincidence — review round 1, MEDIUM-3: with a literal
+       * `"FAK"`, deleting the trader's recording loop changed nothing any test
+       * could see, so the resolution mechanism was proved nowhere. The throw
+       * below is the same fail-closed answer `main.ts` gives, and it is
+       * contained by `SimulatedVenue.submit`'s own total boundary into a
+       * REFUSED `ExecutionResult` (never a rejected promise).
+       */
+      timeInForceFor(order: PlannedOrderView): TimeInForce {
+        const resolved = wiring.trader?.loop.timeInForceFor(order.plannedOrderId);
+        if (resolved === undefined) {
+          throw new Error(
+            `no time-in-force was recorded for planned order ${order.plannedOrderId}; the ` +
+              "composition root refuses to assume one (§12.1 ExecutionPolicy)",
+          );
+        }
+        return resolved;
       },
       statedExpiryNsFor(): bigint | undefined {
         return undefined;
       },
+      // ALIGNED WITH PRODUCTION (`main.ts`), review round 1 note N7. A book
+      // snapshot is an aggregate per level, so this fixture does not observe
+      // size added at a price in the same recorded instant either — and `"0"`
+      // meant "we looked and saw nothing", which would have been a claim the
+      // fixture never measured.
       sameInstantAdditionsFor() {
-        return { observedShares: "0" } as const;
+        return "NOT_OBSERVED" as const;
       },
     },
-    startingCash: "1000",
+    // The venue's cash comes from the SAME document the trader parses, so the
+    // two `startingCash` fields the configuration carries cannot silently
+    // disagree here (review round 1, L5 — `parseTraderConfig` refuses a
+    // document in which they do).
+    startingCash: simulationStartingCash(document),
     books: bookSource,
   });
 
   const result = createPaperTrader({
     env: options.env ?? safeEnvironment(),
-    config: options.config ?? traderConfig(),
+    config: document,
     clock,
     venue: venue as unknown as Parameters<typeof createPaperTrader>[0]["venue"],
     store,
     idNamespace: options.idNamespace ?? "wp-230-fixture",
   });
   if (!result.ok) return { result, parts: undefined };
+  wiring.trader = result.trader;
 
   // The venue's book provider is bound to the trader's own market state, so the
   // venue executes against exactly the ladder the strategy read.
   bindBooks(result.trader, books);
 
   return { result, parts: { trader: result.trader, venue, store, feed, clock } };
+}
+
+/** `simulation.startingCash` from an UNPARSED document, or the fixture's own. */
+function simulationStartingCash(document: Record<string, unknown>): string {
+  const simulation = document["simulation"];
+  if (typeof simulation !== "object" || simulation === null) return "1000";
+  if (!Object.hasOwn(simulation, "startingCash")) return "1000";
+  const cash = (simulation as Record<string, unknown>)["startingCash"];
+  return typeof cash === "string" ? cash : "1000";
 }
 
 /**

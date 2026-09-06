@@ -45,7 +45,14 @@
  * expected fill count, eviction is oldest-first, and the count of evictions is
  * reported so an operator can see the seam approaching its bound instead of
  * discovering a double-count. A run that evicts is a run whose bound is too
- * small, and `evictions > 0` on the health surface says so.
+ * small, and `evictions > 0` on the health surface says so — literally:
+ * `HealthSnapshot.seams.fills.evictions`, which `CoreLoop.health()` reads from
+ * {@link FillDeduplicator.metrics}.
+ *
+ * > **Corrected 2026-09-05 (remediation round 1).** The last sentence was a
+ * > claim about a surface that did not exist: `metrics()` had no caller outside
+ * > this seam's own unit test, so an eviction was reported NOWHERE an operator
+ * > could see it (review round 1, MEDIUM-2).
  */
 
 import type { StrategyFill } from "@polymarket-bot/strategy-sdk";
@@ -180,5 +187,20 @@ export class FillDeduplicator {
  * - the fill is never withheld and never discarded, because "a root that
  *   withholds fills from a paused instance leaves it believing it holds less
  *   than it does — the one direction this package cannot defend against".
+ *
+ * ## PAUSED is not HALTED, and the difference is the whole of §4.2
+ *
+ * A PAUSED instance is a RUNTIME state: the instance still belongs to a scope
+ * this process can reason about, so it is offered the fill and the runtime's
+ * own refusal is the answer. A HALTED scope is a §4.2 state: this process can
+ * no longer know the state it would decide from, so it makes NO trading
+ * decision for that scope and the offer does not happen at all
+ * (`loop.ts`; `health.loop.deliveriesSuppressedByHalt` counts it).
+ *
+ * The half this obligation exists to protect is untouched either way, because
+ * it is the ACCOUNTING half: the ledger posting, the cash update and the PnL
+ * fold are unconditional. What a halted instance loses is the chance to ACT on
+ * a fill — which is exactly what §4.2 takes away, and it is restored by a new
+ * run rebuilt from the ledger, not by delivering the callback anyway.
  */
 export const FILLS_ARE_DELIVERED_WHILE_PAUSED = true as const;

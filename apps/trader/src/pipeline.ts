@@ -33,6 +33,14 @@
  *    module supplies the real measurement or supplies nothing. Filling a gap
  *    with a plausible number is how a fail-closed gate becomes a fail-open one.
  *
+ *    > **Corrected 2026-09-05 (remediation round 1).** At the reviewed tip this
+ *    > paragraph was FALSE for the two inputs it names first: `loop.ts` passed
+ *    > `exposures: undefined` and a fabricated `allocation: { permitted: true }`,
+ *    > which is precisely "filling a gap with a plausible number" — and the gap
+ *    > it filled was §9.8 check 14, the balance/inventory/reservation gate. Both
+ *    > now carry the §9.7 allocator's real answers (`allocation.ts`); a
+ *    > `permitted` this module could write is a check this module has deleted.
+ *
  * ## Where `immediate_order_type` is consumed (the `WP-220` open question)
  *
  * `WP-220` records the question and does not answer it: the strategy tags its
@@ -214,9 +222,20 @@ export interface RiskInputContext {
   readonly referenceFeedAgeMs: number | undefined;
   readonly positions: readonly PortfolioPositionInput[];
   readonly openOrders: readonly PortfolioOpenOrderInput[];
-  /** The allocator's exposure snapshot, or `undefined` when it has none. */
+  /**
+   * `packages/capital-allocator`'s §9.7 exposure snapshot, covering every scope
+   * this evaluation will query (`allocation.ts`). Absent is a real absence and
+   * §9.8 check 15 fails closed on it; the loop never supplies one.
+   */
   readonly exposures: unknown;
-  /** The allocator's reservation verdict for this intent. */
+  /**
+   * `packages/capital-allocator`'s own reservation verdict for this intent, or
+   * `undefined` for an intent that commits nothing (a `CANCEL`).
+   *
+   * NEVER a value this module or the loop constructs. §9.8 check 14 is
+   * fail-closed by design, so anything written here that is not the allocator's
+   * answer replaces the check rather than satisfying it.
+   */
   readonly allocation: unknown;
   /** §9.8 check 18's duplicate guard: intent ids recently evaluated. */
   readonly recentIntentIds: readonly string[];
@@ -244,6 +263,12 @@ export interface RiskInputContext {
  * fail-closed check into a fail-open one. `secondsToClose`, `availableRequests`,
  * `exposures` and `allocation` are therefore omitted when the loop does not
  * know them, rather than defaulted.
+ *
+ * For `exposures` and `allocation` the loop DOES know them: `allocation.ts`
+ * asks `packages/capital-allocator` before every risk check, and this function
+ * passes its answers through unaltered. The omission arms are still live and
+ * still correct — a `CANCEL` commits nothing, so it carries no verdict — and
+ * they are what a reviewer should read as "the allocator was not asked".
  */
 export function buildRiskEvaluationInput(context: RiskInputContext): unknown {
   const market = {

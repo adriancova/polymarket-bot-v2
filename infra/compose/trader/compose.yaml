@@ -25,9 +25,18 @@
 #     LIVE by name.
 #   * The repository's run-mode defaults — MAX_RUN_MODE=PAPER,
 #     ALLOW_REAL_ORDERS=false, LIVE_MICRO_MAX_ORDER_NOTIONAL=0,
-#     LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 — are set here EXPLICITLY rather than
-#     left to a default, so an operator reading this file sees the boundary
-#     rather than having to know it.
+#     LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 — are NOT set by this fragment, and it
+#     would be wrong to imply otherwise: the fragment declares only the two
+#     dependencies, and the trader itself runs on the HOST (see Usage below), so
+#     its environment is the operator's shell rather than a container's.
+#     Where they are: README.md states all four verbatim, and
+#     `apps/trader/src/safety.ts` ENFORCES them — an absent value is read as the
+#     safe one and any weakened value REFUSES the process at startup, before a
+#     configuration file is opened or a connection attempted. That enforcement,
+#     not a line in a compose file, is what makes them non-weakenable.
+#     (Corrected 2026-09-05, review round 1 note N4: this header previously
+#     claimed the four were "set here EXPLICITLY" while the fragment set no
+#     environment at all.)
 #   * NO PUBLIC NETWORK EXPOSURE (§15): every published port binds to
 #     127.0.0.1.
 #

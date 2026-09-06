@@ -16,7 +16,7 @@ real fill quality (ADR-012 §2, §12.2). Every fill this process observes carrie
 | books | `@polymarket-bot/order-book` | §9.4 per-outcome-token reconstruction under ADR-013 |
 | features | `@polymarket-bot/features` | §9.5 versioned, content-addressed snapshots |
 | strategy | `@polymarket-bot/strategy-runtime` + `@polymarket-bot/strategy-static-bracket` | §9.6 exactly one persisted decision per callback |
-| allocation | `@polymarket-bot/capital-allocator` | §9.7 caps, with both live-micro caps fenced at `0` |
+| allocation | `@polymarket-bot/capital-allocator` | §9.7 caps (both live-micro caps fenced at `0`), asked for a reservation verdict before **every** risk check — `src/allocation.ts` |
 | risk | `@polymarket-bot/risk` | §9.8's twenty pre-trade checks |
 | planning | `@polymarket-bot/execution-planner` | §9.10 immutable execution plans |
 | venue | `@polymarket-bot/simulation` | the §12.1 `ExecutionVenue`, simulated |
@@ -77,8 +77,8 @@ strategy's correctness rests on. Each is implemented here and named by a test in
 | 5 | order views repeat-safe; **fills at most once** | `src/orders.ts`, `src/fills.ts` |
 | 6 | fresh views per evaluation; the revoked-context error is not swallowed | discharged by `packages/strategy-runtime` (see below) |
 | 7 | `filledShares` read as evidence, never as allocation | `src/orders.ts` |
-| 8 | fills delivered while the instance is PAUSED | `src/loop.ts`, `src/fills.ts` |
-| 9 | reservations honoured before the next reduction is planned | `src/reservations.ts`, `src/pipeline.ts` |
+| 8 | fills delivered while the instance is PAUSED — **and withheld from a HALTED scope**, whose books are still posted | `src/loop.ts`, `src/fills.ts` |
+| 9 | reservations honoured before the next reduction is planned | `src/reservations.ts`, `src/allocation.ts`, `src/pipeline.ts` |
 | 10 | every cancel resolved to a terminal fact | `src/cancels.ts` |
 
 **Obligation 6 is discharged by construction upstream**, and this app relies on

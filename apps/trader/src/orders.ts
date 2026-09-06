@@ -126,6 +126,13 @@ export function toStrategyOrderView(
   });
 }
 
+/** The obligation-4/5a counters, named so the health surface can carry them. */
+export interface OrderViewMetrics {
+  readonly emitted: number;
+  readonly repeats: number;
+  readonly tracked: number;
+}
+
 /**
  * Tracks what has been delivered so a repeat can be LABELLED (never dropped).
  *
@@ -153,7 +160,7 @@ export class OrderViewTracker {
     return Object.freeze({ instanceId, view, repeat });
   }
 
-  metrics(): { readonly emitted: number; readonly repeats: number; readonly tracked: number } {
+  metrics(): OrderViewMetrics {
     return Object.freeze({
       emitted: this.#emitted,
       repeats: this.#repeats,

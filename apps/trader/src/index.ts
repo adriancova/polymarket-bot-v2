@@ -16,7 +16,7 @@
  * | books | `@polymarket-bot/order-book` | §9.4 per-outcome-token reconstruction |
  * | features | `@polymarket-bot/features` | §9.5 versioned, content-addressed snapshots |
  * | strategy | `@polymarket-bot/strategy-runtime` + `@polymarket-bot/strategy-static-bracket` | §9.6 one persisted decision per callback |
- * | allocation | `@polymarket-bot/capital-allocator` | §9.7 commitments and caps |
+ * | allocation | `@polymarket-bot/capital-allocator` | §9.7 commitments and caps — `allocation.ts` asks it for a verdict before every risk check |
  * | risk | `@polymarket-bot/risk` | §9.8 twenty pre-trade checks |
  * | planning | `@polymarket-bot/execution-planner` | §9.10 immutable execution plans |
  * | venue | `@polymarket-bot/simulation` | §12.1 `ExecutionVenue`, simulated |
@@ -112,7 +112,22 @@ export {
   type HealthSnapshot,
   type LoopHealth,
   type RiskHealth,
+  type SeamHealth,
 } from "./health.js";
+
+export {
+  AllocatorGate,
+  CostBasisBook,
+  allocationMarketOf,
+  intentLegs,
+  requestFor,
+  type AllocationCoverage,
+  type AllocationMarket,
+  type AllocationOutcome,
+  type AllocationVerdict,
+  type AllocatorMetrics,
+  type IntentLeg,
+} from "./allocation.js";
 
 export {
   portFailed,
@@ -145,6 +160,7 @@ export {
   isTerminalStatus,
   toStrategyOrderView,
   type OrderViewDelivery,
+  type OrderViewMetrics,
 } from "./orders.js";
 
 export {
