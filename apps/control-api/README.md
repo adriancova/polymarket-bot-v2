@@ -66,11 +66,13 @@ stop the mutation (`503 CONTROL_NOT_AUDITABLE`). **The log refuses at its bound
 rather than evicting**: the records an eviction would lose are the ones from the
 incident that filled it.
 
-REFUSALS are audited too — a refused mutation is an operator fact. The one
-documented exception: a request that never authenticated never reaches the
-control plane and writes nothing, because an audit log an anonymous caller can
-fill is an audit log an anonymous caller can exhaust. Those are counted on
-`control_authentication_failures_total`.
+REFUSALS are audited too — a refused mutation is an operator fact. The two
+documented exceptions: a request that never authenticated, and an authenticated
+request whose grants do not cover the route, never reach the control plane and
+write nothing — no mutation was attempted at the plane, and an audit log an
+anonymous caller can fill is an audit log an anonymous caller can exhaust.
+They are counted on `control_authentication_failures_total` and
+`control_authorization_failures_total` respectively.
 
 Durable home: `WP-040`'s §10.6 `ops.kill_switch_events` (engage/release) and
 `ops.config_change_audit` (strategy control, refusals, mode-raise attempts).
@@ -113,8 +115,11 @@ What ships here is the consumer half:
   real in-process `node:http` server (request, size bound, timeout, non-200,
   malformed body). **No claim is made that a trader is on the other end.**
 
-Until a trader serves that document, `control_trader_health_available` reads `0`
-and the operations dashboard's first stat panel says so.
+Until a trader serves that document — AND a composition wires a refresh
+(`main.ts` constructs the `TraderHealthCache` but nothing in the shipped
+process calls `refresh()`; no poller exists yet — both halves are owed by the
+same future wiring) — `control_trader_health_available` reads `0` and the
+operations dashboard's first stat panel says so.
 
 Likewise, engaging a kill switch here changes **this process's** authoritative
 record and writes the §10.6 audit row. Whether a running trader observes it
