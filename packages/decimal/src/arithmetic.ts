@@ -39,16 +39,23 @@
  *
  * ## Ambient prototype state (`WP-020-FU1`)
  *
- * Every operation below runs inside {@link withNeutralIndexNames}. `decimal.js`
- * reads and writes its digit arrays at index names the array does not own, and
- * both operations consult `Object.prototype`; one property at an array-index
- * name there made `addDecimal("100", "-100")` answer `"9"` and
- * `divDecimal("1", "3")` answer `3.3333…` at base. The guard removes that
- * ambient state for the duration of one operation and restores it exactly;
+ * Every operation below runs inside {@link guarded}. `decimal.js` reads and
+ * writes its digit arrays at index names the array does not own, and both
+ * operations consult `Object.prototype`; one property at an array-index name
+ * there made `addDecimal("100", "-100")` answer `"9"` and `divDecimal("1", "3")`
+ * answer `3.3333…` at base. The guard removes that ambient state for the
+ * duration of one operation and restores it exactly;
  * `packages/decimal/src/prototype-guard.ts` carries the full measurement, the
- * root cause in the library, and the residual it does not cover. In an honest
- * process the guard mutates nothing, so results are byte-identical to base by
- * construction rather than by test.
+ * root cause in the library, the measured honest-path cost, and the residual it
+ * does not cover. In an honest process the guard mutates nothing, so results are
+ * byte-identical to base by construction rather than by test.
+ *
+ * ONE STATE IS REFUSED RATHER THAN COMPUTED (round-1 finding M1): a
+ * non-configurable read-only data property or accessor at an index name on
+ * `Array.prototype`, which can be neither redefined nor shadowed. Every function
+ * below can therefore also raise `HostilePrototypeError`
+ * (`DECIMAL_HOSTILE_PROTOTYPE`). It is not an argument error and no argument can
+ * cause it.
  */
 
 // Named import: `decimal.js` ships one `.d.ts` that TypeScript resolves as
@@ -68,7 +75,7 @@ import {
   DecimalInexactError,
   DecimalRangeError,
 } from "./errors.js";
-import { withNeutralIndexNames } from "./prototype-guard.js";
+import { guarded } from "./guarded.js";
 
 /**
  * Working precision for exact operations (`decimal.js` maximum).
@@ -196,21 +203,21 @@ function render(value: Decimal, operation: string): DecimalString {
 
 /** Exact addition. `addDecimal("0.1", "0.2") === "0.3"`. */
 export function addDecimal(a: DecimalString, b: DecimalString): DecimalString {
-  return withNeutralIndexNames(() =>
+  return guarded(() =>
     render(toExact(a, "addDecimal(a)").plus(toExact(b, "addDecimal(b)")), "addDecimal"),
   );
 }
 
 /** Exact subtraction. */
 export function subDecimal(a: DecimalString, b: DecimalString): DecimalString {
-  return withNeutralIndexNames(() =>
+  return guarded(() =>
     render(toExact(a, "subDecimal(a)").minus(toExact(b, "subDecimal(b)")), "subDecimal"),
   );
 }
 
 /** Exact multiplication. */
 export function mulDecimal(a: DecimalString, b: DecimalString): DecimalString {
-  return withNeutralIndexNames(() =>
+  return guarded(() =>
     render(toExact(a, "mulDecimal(a)").times(toExact(b, "mulDecimal(b)")), "mulDecimal"),
   );
 }
@@ -378,7 +385,7 @@ export function divDecimal(
   b: DecimalString,
   options?: DivisionOptions,
 ): DecimalString {
-  return withNeutralIndexNames(() => {
+  return guarded(() => {
     const dividend = assertCanonicalDecimalString(a, undefined, "divDecimal(a)");
     const divisor = assertCanonicalDecimalString(b, undefined, "divDecimal(b)");
     if (new ExactDecimal(divisor).isZero()) {
@@ -405,7 +412,7 @@ export function divDecimal(
  *   {@link EXACT_DIVISION_PROBE_PRECISION} significant digits.
  */
 export function divDecimalExact(a: DecimalString, b: DecimalString): DecimalString {
-  return withNeutralIndexNames(() => {
+  return guarded(() => {
     const dividend = assertCanonicalDecimalString(a, undefined, "divDecimalExact(a)");
     const divisor = assertCanonicalDecimalString(b, undefined, "divDecimalExact(b)");
     if (new ExactDecimal(divisor).isZero()) {
@@ -428,7 +435,7 @@ export function divDecimalExact(a: DecimalString, b: DecimalString): DecimalStri
 
 /** Exact three-way comparison. Returns `-1`, `0`, or `1`. */
 export function compareDecimal(a: DecimalString, b: DecimalString): -1 | 0 | 1 {
-  return withNeutralIndexNames(() => {
+  return guarded(() => {
     const result = toExact(a, "compareDecimal(a)").cmp(toExact(b, "compareDecimal(b)"));
     return result < 0 ? -1 : result > 0 ? 1 : 0;
   });
@@ -446,26 +453,26 @@ export function equalsDecimal(a: DecimalString, b: DecimalString): boolean {
 
 /** Exact negation. `negateDecimal("0")` is `"0"` (canonical zero is unsigned). */
 export function negateDecimal(value: DecimalString): DecimalString {
-  return withNeutralIndexNames(() =>
+  return guarded(() =>
     render(toExact(value, "negateDecimal(value)").negated(), "negateDecimal"),
   );
 }
 
 /** Exact absolute value. */
 export function absDecimal(value: DecimalString): DecimalString {
-  return withNeutralIndexNames(() =>
+  return guarded(() =>
     render(toExact(value, "absDecimal(value)").abs(), "absDecimal"),
   );
 }
 
 /** True when the value is exactly zero. */
 export function isZeroDecimal(value: DecimalString): boolean {
-  return withNeutralIndexNames(() => toExact(value, "isZeroDecimal(value)").isZero());
+  return guarded(() => toExact(value, "isZeroDecimal(value)").isZero());
 }
 
 /** True when the value is strictly negative. */
 export function isNegativeDecimal(value: DecimalString): boolean {
-  return withNeutralIndexNames(() => {
+  return guarded(() => {
     const parsed = toExact(value, "isNegativeDecimal(value)");
     return parsed.isNegative() && !parsed.isZero();
   });

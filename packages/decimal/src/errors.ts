@@ -21,7 +21,8 @@ export type DecimalErrorCode =
   | "DECIMAL_INVALID_OPTIONS"
   | "DECIMAL_DIVISION_BY_ZERO"
   | "DECIMAL_INEXACT"
-  | "DECIMAL_INVALID_TICK";
+  | "DECIMAL_INVALID_TICK"
+  | "DECIMAL_HOSTILE_PROTOTYPE";
 
 /**
  * Which code each subclass may carry.
@@ -40,6 +41,7 @@ export type DecimalErrorCode =
  * | `DecimalDivisionByZeroError` | `DECIMAL_DIVISION_BY_ZERO` |
  * | `DecimalInexactError` | `DECIMAL_INEXACT` |
  * | `InvalidTickSizeError` | `DECIMAL_INVALID_TICK` |
+ * | `HostilePrototypeError` | `DECIMAL_HOSTILE_PROTOTYPE` |
  */
 
 /** Base class for every error raised by `@polymarket-bot/decimal`. */
@@ -110,3 +112,38 @@ export class DecimalInexactError extends DecimalError {}
  * `DECIMAL_INEXACT`).
  */
 export class InvalidTickSizeError extends DecimalError {}
+
+/**
+ * The PROCESS's prototype chain is in a state this package refuses to compute
+ * in. Always carries `DECIMAL_HOSTILE_PROTOTYPE`.
+ *
+ * It says nothing about the caller's arguments. `decimal.js` reads its digit
+ * arrays where they have holes and writes to indices they do not own yet, so an
+ * array-index-named property on `Object.prototype` or `Array.prototype` changes
+ * what arithmetic MEANS (`prototype-guard.ts` carries the measurement).
+ * `withNeutralIndexNames` normally removes that state for the duration of one
+ * operation, but a NON-CONFIGURABLE read-only data property or accessor at an
+ * index name on `Array.prototype` can be neither redefined nor shadowed — there
+ * is no lower link. Round 0 ran the operation anyway; `WP-020-FU1` review round
+ * 1 finding M1 measured what that produced:
+ *
+ * ```text
+ * Array.prototype["0"] = non-configurable get/set pair
+ *   addDecimal("100", "-100")  "0" -> "9"      FABRICATED
+ *   addDecimal("1", "2")       "3" -> "990"    FABRICATED
+ * Array.prototype["0"] = non-configurable set-only accessor
+ *   mulDecimal("2", "3")       "6" -> "0"      FABRICATED
+ *   compareDecimal("5", "4")     1 -> 0        FABRICATED (five equals four)
+ * ```
+ *
+ * This class is that refusal. It is AVAILABILITY, never permission: no value is
+ * produced, nothing is admitted, and the message names the offending intrinsic
+ * and index so an operator can find the code that corrupted the realm.
+ *
+ * It is UNREACHABLE from a clean process by construction — a non-configurable
+ * property cannot be installed by an argument, only by in-process code that has
+ * permanently corrupted an intrinsic — so it is exercised in child processes by
+ * `test/unit/decimal/unneutralizable-shapes.test.ts` rather than in the
+ * in-process taxonomy sweep, which `errors.test.ts` records at its site.
+ */
+export class HostilePrototypeError extends DecimalError {}

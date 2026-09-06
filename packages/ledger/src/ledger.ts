@@ -146,10 +146,14 @@ export class Ledger {
    * WHAT IS STILL TRUE, so this is not a new absolute: a get-only or throwing
    * accessor at an index name still defeats `Array.prototype.push` everywhere
    * else in the process — `zod`'s own `issues: []`, this package's own
-   * accumulators, and the eight `packages/risk` modules outside the door's
-   * file — so other doors in that battery still answer with a typed refusal
-   * under exactly those two shapes. It remains AVAILABILITY, never permission,
-   * and the battery enumerates it per shape and per answer.
+   * accumulators, and the TEN `packages/risk` modules outside the door's file,
+   * which hold 77 `.push(` sites between them (`approved-intent` 8, `engine`
+   * 47, `exposure-limits` 5, `freshness` 3, `inputs` 1, `intent-view` 9,
+   * `lots` 1, `scenario` 1, `schema-arena` 1, `worst-case` 1) — so other doors
+   * in that battery still answer with a typed refusal under exactly those two
+   * shapes. It remains AVAILABILITY, never permission, and the battery
+   * enumerates it per shape and per answer. (The count said "eight" until
+   * `WP-020-FU1` review round 1 finding L2; it was never measured.)
    */
   static empty(environment: RunMode): Ledger {
     try {

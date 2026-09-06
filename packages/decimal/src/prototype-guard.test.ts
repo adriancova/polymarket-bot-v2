@@ -36,6 +36,20 @@ const RAW = Decimal.clone({
   crypto: false,
 });
 
+/**
+ * The refusal `withNeutralIndexNames` takes for a name it cannot neutralize.
+ *
+ * Nothing in this file reaches it — every shape here is CONFIGURABLE, so every
+ * one is neutralized — and that is deliberate: the refusal's own coverage needs
+ * non-configurable shapes, which are permanent and therefore live in child
+ * processes (`test/unit/decimal/unneutralizable-shapes.test.ts`). This one
+ * throws with a recognisable message so a test that reached it by accident says
+ * so instead of passing.
+ */
+function refuse(names: readonly string[]): never {
+  throw new Error(`unexpected index-name refusal in this file: ${names.length} name(s)`);
+}
+
 function quietly(run: () => unknown): string {
   try {
     return String(run());
@@ -132,12 +146,12 @@ describe("NON-VACUITY: the library underneath still has the defect", () => {
 
 describe("`withNeutralIndexNames` itself", () => {
   it("returns the operation's value and propagates its throw", () => {
-    expect(withNeutralIndexNames(() => 41 + 1)).toBe(41 + 1);
+    expect(withNeutralIndexNames(() => 41 + 1, refuse)).toBe(41 + 1);
     const boom = new Error("from the operation");
     expect(() =>
       withNeutralIndexNames(() => {
         throw boom;
-      }),
+      }, refuse),
     ).toThrow(boom);
   });
 
@@ -173,7 +187,7 @@ describe("`withNeutralIndexNames` itself", () => {
           wroteOk = false;
         }
         return 0;
-      });
+      }, refuse);
     } finally {
       Reflect.deleteProperty(Object.prototype, "0");
     }
@@ -200,12 +214,19 @@ describe("`withNeutralIndexNames` itself", () => {
         withNeutralIndexNames(() => {
           inner = ([] as unknown[])[0];
           return 0;
-        });
-        // The inner call found nothing to neutralize and must not have undone
-        // the outer one on its way out.
+        }, refuse);
+        // The inner call RE-NEUTRALIZED the name the outer one had already
+        // neutralized — the outer call left a writable `undefined` OWN property
+        // on `Object.prototype`, and an own property is exactly what the scan
+        // looks for. What matters is that it must not have undone the outer
+        // one on its way out, and it does not: `neutralizeInPlace` REDEFINES
+        // rather than deletes, so the inner restoration puts back what the
+        // outer call had installed. The call count below pins that this is what
+        // happens; the comment here said "found nothing to neutralize" until
+        // round-1 finding L1 measured it.
         afterInner = ([] as unknown[])[0];
         return 0;
-      });
+      }, refuse);
       restored = (([] as unknown[])[0] ?? null) as string | null;
     } finally {
       Reflect.deleteProperty(Object.prototype, "0");
@@ -213,5 +234,53 @@ describe("`withNeutralIndexNames` itself", () => {
     expect(inner).toBeUndefined();
     expect(afterInner).toBeUndefined();
     expect(restored).toBe("9");
+  });
+
+  /**
+   * The nesting cost, counted rather than described (round-1 finding L1).
+   *
+   * TWO `defineProperty` calls on the intrinsics per level — one to neutralize
+   * on the way in, one to restore on the way out — so depth 3 is six. Only calls
+   * whose target IS an intrinsic are counted; the guard's own bookkeeping arrays
+   * are appended with `defineProperty` too (they must be: `push` is `Set`) and
+   * those are not what this measures.
+   */
+  it("re-neutralizes at every nesting level: 2 intrinsic defineProperty calls per level", () => {
+    const original = Object.defineProperty;
+    let intrinsicDefines = 0;
+    let restoredCount: number;
+    try {
+      Object.defineProperty(Object.prototype, "0", {
+        value: "9",
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+      const counting = function counted(
+        target: object,
+        key: PropertyKey,
+        descriptor: PropertyDescriptor & ThisType<unknown>,
+      ): object {
+        if (target === Object.prototype || target === Array.prototype) intrinsicDefines += 1;
+        return original(target, key, descriptor) as object;
+      };
+      Object.defineProperty = counting as typeof Object.defineProperty;
+      try {
+        withNeutralIndexNames(
+          () =>
+            withNeutralIndexNames(
+              () => withNeutralIndexNames(() => 0, refuse),
+              refuse,
+            ),
+          refuse,
+        );
+      } finally {
+        Object.defineProperty = original;
+      }
+      restoredCount = intrinsicDefines;
+    } finally {
+      Reflect.deleteProperty(Object.prototype, "0");
+    }
+    expect(restoredCount).toBe(6);
   });
 });

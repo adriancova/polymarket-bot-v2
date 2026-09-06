@@ -590,7 +590,31 @@ function unexpected(divergences: readonly Divergence[]): readonly Divergence[] {
   });
 }
 
-describe("the measured-class battery over every `packages/ledger` door", () => {
+/**
+ * THE BOUND's wall-clock ceiling, stated rather than defaulted
+ * (`WP-020-FU1` review round 1, finding M2).
+ *
+ * These rows drive every door in the package over every pollution shape, so they
+ * are the slowest tests in the repository and the closest to vitest's 5 s
+ * default. Measured here, in isolation, on the round-1 bench machine:
+ *
+ * ```text
+ *   THE BOUND (isolated)      base b4ce0aa 1791 ms   round 0 2365 ms   round 1 2082 ms
+ *   THE BOUND (full suite, parallel)                                   round 1 4519 ms
+ * ```
+ *
+ * The round-0 index-name guard added ~1450 ns to every decimal operation and
+ * pushed this file's headroom from ~2.8x to ~2.1x; the round-1 fix recovers
+ * about half of that. Either way a GATE MUST NOT BE ONE SCHEDULER HICCUP FROM
+ * RED — the round-1 reviewer saw this file time out at the default, three runs
+ * out of three, in a loaded scratch tree. This ceiling is deliberately far above
+ * the measurement: it exists to convert a hang into a diagnosis, not to police
+ * the runtime. If a change makes these rows approach it, that is a signal about
+ * the change, not a reason to raise the number.
+ */
+const BOUND_TIMEOUT_MS = 60_000;
+
+describe("the measured-class battery over every `packages/ledger` door", { timeout: BOUND_TIMEOUT_MS }, () => {
   it("derives a non-trivial amount of key material from the inputs", () => {
     expect(KEY_MATERIAL.length).toBeGreaterThan(50);
     for (const required of ["marketId", "skipChecks", "optin", "optout", "when", "get", "values"]) {

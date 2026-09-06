@@ -189,10 +189,11 @@ export interface PnlState {
  * `PnlConfigurationError`, or returns a state" true for every input rather than
  * for the ones somebody thought of, and a get-only accessor at an index name
  * still defeats `Array.prototype.push` everywhere ELSE in the process —
- * `zod`'s own `issues: []`, this package's own accumulators, the eight
- * `packages/risk` modules outside the door's file. Where that surfaces it is
- * still availability, never permission: nothing is admitted and nothing is
- * invented.
+ * `zod`'s own `issues: []`, this package's own accumulators, the TEN
+ * `packages/risk` modules outside the door's file and their 77 `.push(` sites
+ * (`WP-020-FU1` review round 1 finding L2: this said "eight", unmeasured).
+ * Where that surfaces it is still availability, never permission: nothing is
+ * admitted and nothing is invented.
  */
 export function emptyPnlState(identity: PnlStreamIdentity): PnlState {
   try {
