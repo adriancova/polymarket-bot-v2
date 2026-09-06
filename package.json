@@ -10,7 +10,8 @@
     "pnpm": ">=11"
   },
   "scripts": {
-    "typecheck": "pnpm -r run typecheck && tsc -p test/tsconfig.json --noEmit && pnpm --dir test/soak/recorder run typecheck",
+    "typecheck": "pnpm -r run typecheck && tsc -p test/tsconfig.json --noEmit && tsc -p test/e2e/tsconfig.json --noEmit && pnpm --dir test/soak/recorder run typecheck",
+    "test:e2e": "vitest run --config test/e2e/vitest.config.ts",
     "lint": "eslint .",
     "check:deps": "node tools/check-dependency-direction.mjs",
     "test": "vitest run --config test/vitest.config.ts",
