@@ -1,0 +1,30 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": "../..",
+    "paths": {
+      "@polymarket-bot/trader": ["apps/trader/src/index.ts"],
+      "@polymarket-bot/trader/testing": ["apps/trader/src/testing/index.ts"],
+      "@polymarket-bot/domain": ["packages/domain/src/index.ts"],
+      "@polymarket-bot/decimal": ["packages/decimal/src/index.ts"],
+      "@polymarket-bot/order-book": ["packages/order-book/src/index.ts"],
+      "@polymarket-bot/features": ["packages/features/src/index.ts"],
+      "@polymarket-bot/strategy-sdk": ["packages/strategy-sdk/src/index.ts"],
+      "@polymarket-bot/strategy-runtime": ["packages/strategy-runtime/src/index.ts"],
+      "@polymarket-bot/strategy-static-bracket": [
+        "packages/strategies/static-bracket/src/index.ts"
+      ],
+      "@polymarket-bot/capital-allocator": ["packages/capital-allocator/src/index.ts"],
+      "@polymarket-bot/risk": ["packages/risk/src/index.ts"],
+      "@polymarket-bot/risk/plain-data": ["packages/risk/src/plain-data.ts"],
+      "@polymarket-bot/risk/schema-arena": ["packages/risk/src/schema-arena.ts"],
+      "@polymarket-bot/execution-planner": ["packages/execution-planner/src/index.ts"],
+      "@polymarket-bot/simulation": ["packages/simulation/src/index.ts"],
+      "@polymarket-bot/ledger": ["packages/ledger/src/index.ts"],
+      "@polymarket-bot/pnl": ["packages/pnl/src/index.ts"]
+    }
+  },
+  "include": ["."]
+}
