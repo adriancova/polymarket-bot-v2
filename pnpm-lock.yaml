@@ -56,10 +56,35 @@ importers:
         version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   apps/control-api:
+    dependencies:
+      '@polymarket-bot/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
+      '@polymarket-bot/observability':
+        specifier: workspace:*
+        version: link:../../packages/observability
+      '@polymarket-bot/risk':
+        specifier: workspace:*
+        version: link:../../packages/risk
+      '@polymarket-bot/storage-postgres':
+        specifier: workspace:*
+        version: link:../../packages/storage-postgres
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
     devDependencies:
+      '@types/node':
+        specifier: ^24.13.3
+        version: 24.13.3
+      esbuild:
+        specifier: ^0.28.2
+        version: 0.28.2
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   apps/data-gateway:
     dependencies:

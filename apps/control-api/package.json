@@ -3,15 +3,29 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder application scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Control API (WP-240): the §4.1 layer-3 process that owns authenticated operational controls and read APIs, and NEVER has the signing key. PAPER only — strategy pause/resume, §14.1 kill-switch scopes, run-state reads, an append-only audit of every mutation, and the Prometheus surface the operations/trading/fidelity dashboards read. No signer, no venue connection, no order path, and no request that can raise a run mode.",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./testing": "./src/testing/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/integration/control-api/tsconfig.json",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/main.mjs",
+    "start": "pnpm run typecheck && pnpm run build && node ./dist/main.mjs",
+    "test:integration": "vitest run --config ../../test/integration/control-api/vitest.config.ts"
+  },
+  "dependencies": {
+    "@polymarket-bot/domain": "workspace:*",
+    "@polymarket-bot/observability": "workspace:*",
+    "@polymarket-bot/risk": "workspace:*",
+    "@polymarket-bot/storage-postgres": "workspace:*",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }

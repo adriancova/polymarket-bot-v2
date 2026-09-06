@@ -1,6 +1,91 @@
 /**
- * Placeholder scaffold created by WP-010 (monorepo baseline).
- * Implementation arrives with its owning work package.
- * No contracts, APIs, or business logic are defined here.
+ * `@polymarket-bot/control-api` — the §4.1 process that owns authenticated
+ * operational controls and read APIs, and **never has the signing key**.
+ *
+ * PAPER only. There is no venue connection, no order path, no wallet
+ * operation, and no request that names a run mode: §11's ceiling is a startup
+ * value read by `safety.ts` and exposed read-only.
+ *
+ * The composition root is `main.ts`; the Postgres audit binding is under
+ * `adapters/` and is imported only there, so nothing in this entry point loads
+ * a database client.
  */
-export const workspacePackageName = "@polymarket-bot/control-api" as const;
+
+export {
+  CONTROL_API_RUN_MODE,
+  REPOSITORY_MAXIMUM_RUN_MODE,
+  checkControlApiSafety,
+} from "./safety.js";
+export type {
+  ControlSafetyOutcome,
+  ControlSafetyViolation,
+  ControlSafetyViolationCode,
+  Environment,
+} from "./safety.js";
+
+export {
+  LOOPBACK_HOSTS,
+  MINIMUM_TOKEN_LENGTH,
+  parseControlApiConfig,
+} from "./config.js";
+export type {
+  ConfigRefusal,
+  ConfigRefusalCode,
+  ControlApiConfig,
+  ControlApiOperatorConfig,
+  ParseConfigResult,
+} from "./config.js";
+
+export { OPERATOR_GRANTS, OperatorRegistry, hasGrant } from "./auth.js";
+export type {
+  AuthenticationFailureReason,
+  AuthenticationResult,
+  OperatorCredential,
+  OperatorGrant,
+} from "./auth.js";
+
+export {
+  CONTROL_ACTOR_KIND,
+  CONTROL_KILL_SWITCH_ACTIONS,
+  CONTROL_KILL_SWITCH_SCOPES,
+  FORBIDDEN_CONTROL_KEYS,
+  forbiddenControlKeysIn,
+} from "./vocabulary.js";
+export type { ControlKillSwitchAction, ControlKillSwitchScope } from "./vocabulary.js";
+
+export { buildDoor, deepFreeze, ownBoolean, ownNumber, ownRecord, ownString } from "./doors.js";
+export type { DoorRefusal, DoorRefusalCode, DoorResult } from "./doors.js";
+
+export { ControlPlane } from "./control-plane.js";
+export type {
+  ControlPlaneOptions,
+  KillSwitchRelease,
+  KillSwitchState,
+  MutationContext,
+  MutationRefusalCode,
+  MutationResult,
+  RunStateView,
+  StrategyInstanceState,
+  StrategyRunState,
+} from "./control-plane.js";
+
+export { readTraderHealthReport } from "./health-door.js";
+
+export {
+  AbsentTraderHealthSource,
+  HttpTraderHealthSource,
+  InMemoryTraderHealthSource,
+  TraderHealthCache,
+} from "./health-source.js";
+export type {
+  HealthReadOutcome,
+  HealthReadResult,
+  HttpTraderHealthSourceOptions,
+  TraderHealthSource,
+} from "./health-source.js";
+
+export { CONTROL_API_ROUTES, ControlApi } from "./api.js";
+export type { ApiEnvironment, ApiRequest, ApiResponse, ControlApiOptions } from "./api.js";
+
+export { startControlHttpServer } from "./http.js";
+export type { ControlHttpServerOptions, RunningControlHttpServer } from "./http.js";

@@ -1,0 +1,183 @@
+/**
+ * The trader health document's door — ADR-020 D1-D4 (see `doors.ts`).
+ *
+ * ## Why a health report is caller/wire input, and is treated as such
+ *
+ * `apps/control-api` cannot import `apps/trader`: layer 3 depends on nothing at
+ * layer 3, and `docs/contracts/dependency-direction.md` F10 makes "any package
+ * depending on an `apps/*` package" a violation. So the health surface
+ * `WP-230` shipped reaches this process as a JSON DOCUMENT over a wire, which
+ * is the exposure class ADR-020 §4 ranks highest, and it gets the full door.
+ *
+ * That is not a workaround. The dashboards' numbers come from here, an operator
+ * makes decisions from those numbers, and a report this process could not fully
+ * read is a report it must not half-read. Every counter below is REQUIRED: a
+ * report that omits one is refused rather than defaulted to zero, because a
+ * counter that silently reads 0 for "the producer stopped sending this" is
+ * worse than no metric at all.
+ *
+ * ## The shape is `WP-230`'s, and the pin is executable
+ *
+ * The schema mirrors `apps/trader/src/health.ts`'s `HealthSnapshot` field for
+ * field — the five seam sections, `observeOnlyIntents`, `halts`, the risk
+ * refusal counts and `riskSeamCaveat` (`docs/handoffs/WP-230.md` follow-up 4).
+ * `test/integration/control-api/trader-health-shape.test.ts` builds a snapshot
+ * with the REAL `HealthState` class and drives it through this door, so a
+ * rename in the trader fails a suite rather than emptying a dashboard.
+ */
+
+import { z } from "zod";
+import type { TraderHealthReportInput } from "@polymarket-bot/observability";
+
+import { buildDoor, type DoorResult } from "./doors.js";
+
+/** A counter: a non-negative safe integer. Never defaulted, never optional. */
+const Counter = z.number().int().min(0);
+
+/**
+ * An economic value on this surface, as an EXACT decimal string.
+ *
+ * Checked as a string with a decimal shape and NEVER converted to a number
+ * anywhere in this process (§6 invariant 1). The grammar is deliberately
+ * permissive about scale — this door's job is to refuse a value that is not a
+ * decimal at all, not to re-adjudicate `packages/decimal`'s canonical form for
+ * a value another process already computed.
+ */
+const DecimalText = z.string().regex(/^-?\d+(?:\.\d+)?$/u);
+
+const HaltScope = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("GLOBAL") }),
+  z.strictObject({ kind: z.literal("MARKET"), marketId: z.string().min(1).max(256) }),
+  z.strictObject({
+    kind: z.literal("STRATEGY_INSTANCE"),
+    instanceId: z.string().min(1).max(256),
+  }),
+]);
+
+const Halt = z.strictObject({
+  scope: HaltScope,
+  code: z.string().min(1).max(128),
+  detail: z.string().max(4096),
+  at: z.string().min(1).max(64),
+  action: z.string().min(1).max(64),
+});
+
+const Queue = z.strictObject({
+  name: z.string().min(1).max(128),
+  currentDepth: Counter,
+  maximumDepth: Counter,
+  oldestMessageAgeMs: z.union([Counter, z.literal(null)]),
+  messagesDropped: Counter,
+  producerBlockedMs: Counter,
+  consumerLag: z.number().int(),
+  accepted: Counter,
+  consumed: Counter,
+});
+
+const CountsByKey = z.record(z.string().min(1).max(256), Counter);
+
+const TraderHealthSchema = z.strictObject({
+  runMode: z.string().min(1).max(64),
+  maximumRunMode: z.string().min(1).max(64),
+  healthy: z.boolean(),
+  halts: z.array(Halt).max(4096),
+  queues: z.array(Queue).max(256),
+  loop: z.strictObject({
+    eventsAccepted: Counter,
+    eventsProcessed: Counter,
+    eventsRefused: Counter,
+    featureSnapshots: Counter,
+    snapshotsUnavailable: Counter,
+    featureProjectionRefusals: Counter,
+    evaluations: Counter,
+    decisionsPersisted: Counter,
+    containedEvaluations: Counter,
+    refusedEvaluations: Counter,
+    deliveriesSuppressedByHalt: Counter,
+  }),
+  risk: z.strictObject({
+    evaluations: Counter,
+    approvals: Counter,
+    refusals: Counter,
+    refusalsByCode: CountsByKey,
+    refusedExits: Counter,
+    refusedExitsByCode: CountsByKey,
+    recommendationsByAction: CountsByKey,
+  }),
+  execution: z.strictObject({
+    plansBuilt: Counter,
+    plansRefused: Counter,
+    submissionsAccepted: Counter,
+    submissionsRefused: Counter,
+    fillsObserved: Counter,
+    duplicateFillsRefused: Counter,
+    cancelsRequested: Counter,
+    cancelsConfirmed: Counter,
+    cancelsRejected: Counter,
+    cancelsSilenceExceeded: Counter,
+    allocationsRefused: Counter,
+    reservationsReleasedOnRefusal: Counter,
+    observeOnlyIntents: Counter,
+  }),
+  accounting: z.strictObject({
+    ledgerTransactions: Counter,
+    ledgerRefusals: Counter,
+    unattributedActivity: Counter,
+    unexplainedMovements: Counter,
+    pnlRecords: Counter,
+  }),
+  seams: z.strictObject({
+    fills: z.strictObject({
+      remembered: Counter,
+      maximumRemembered: Counter,
+      admitted: Counter,
+      refused: Counter,
+      evictions: Counter,
+    }),
+    reservations: z.strictObject({
+      open: Counter,
+      taken: Counter,
+      released: Counter,
+      reservedCollateral: DecimalText,
+    }),
+    cancels: z.strictObject({
+      pending: Counter,
+      requested: Counter,
+      confirmed: Counter,
+      rejected: Counter,
+      silenceExceeded: Counter,
+    }),
+    orderViews: z.strictObject({
+      emitted: Counter,
+      repeats: Counter,
+      tracked: Counter,
+    }),
+    allocator: z.strictObject({
+      open: Counter,
+      applied: Counter,
+      released: Counter,
+      reservedCollateral: DecimalText,
+      refusalsByCode: CountsByKey,
+    }),
+  }),
+  riskSeamCaveat: z.string().min(1).max(8192),
+  asOf: z.string().min(1).max(64),
+});
+
+/**
+ * D3: the value returned is read from the MATERIALIZED tree.
+ *
+ * The tree is already prototype-free and structurally correct — the schema said
+ * so — so this cast is the D3 step, not a shortcut around it: the schema's own
+ * output object is discarded and never reaches a caller.
+ */
+const TraderHealthDoor = buildDoor(
+  TraderHealthSchema,
+  "trader health report",
+  (materialized): TraderHealthReportInput => materialized as TraderHealthReportInput,
+);
+
+/** Reads one trader health document through the door. TOTAL: never throws. */
+export function readTraderHealthReport(input: unknown): DoorResult<TraderHealthReportInput> {
+  return TraderHealthDoor(input);
+}

@@ -1,0 +1,186 @@
+{
+  "uid": "pmb-control-trading",
+  "title": "Polymarket bot — trading (paper)",
+  "description": "WP-240 trading view: decisions, risk vetoes (including the WP-220 risk-seam residual), execution, fills and accounting record counts. PAPER deployment: execution is simulated, and this dashboard exposes no control of any kind.",
+  "tags": ["polymarket-bot", "wp-240", "paper"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Decisions persisted",
+      "description": "§6 invariant 3: every strategy callback produces exactly one persisted DecisionResult. This series and 'Evaluations' should move together; a divergence is a persistence problem, not a strategy one.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "rate(trader_decisions_persisted_total[5m])", "legendFormat": "decisions/s" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Evaluations and containments",
+      "description": "A containment is ADR-005 §3: the runtime paused an instance. A refused evaluation never ran.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "rate(trader_evaluations_total[5m])", "legendFormat": "evaluations/s" },
+        { "refId": "B", "expr": "increase(trader_contained_evaluations_total[5m])", "legendFormat": "containments" },
+        { "refId": "C", "expr": "increase(trader_refused_evaluations_total[5m])", "legendFormat": "refused" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Risk approvals and refusals",
+      "description": "§9.8 pre-trade gate. Every intent that reaches submission passed through here; a refusal is a trade that did not happen.",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "rate(trader_risk_evaluations_total[5m])", "legendFormat": "evaluations/s" },
+        { "refId": "B", "expr": "increase(trader_risk_approvals_total[5m])", "legendFormat": "approvals" },
+        { "refId": "C", "expr": "increase(trader_risk_refusals_total[5m])", "legendFormat": "refusals" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Risk vetoes by reason code",
+      "description": "§14.3 risk: vetoes by reason. The code is the risk engine's own structured reason, not a message.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_risk_refusals_by_code_total[5m])", "legendFormat": "{{code}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Refused protective exits by reason code",
+      "description": "The WP-220 risk-seam residual, counted. These are refusals of intents the emitting strategy tagged PROTECTIVE. Read this panel together with the caveat text beside it: a non-zero series is the accepted fail-closed posture (a refused exit, never a wrong order), not a bug in the strategy.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_risk_refused_exits_total[5m])", "legendFormat": "refused exits" },
+        { "refId": "B", "expr": "increase(trader_risk_refused_exits_by_code_total[5m])", "legendFormat": "{{code}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "The WP-220 risk-seam caveat",
+      "description": "1 while at least one protective exit has been refused in this run, so the residual is ACTIVE rather than merely documented. Every exit the static-bracket strategy emits is a §7.7 POSITION intent, and packages/risk derives disposition from the intent TYPE alone, so a protective reduction is classified ENTRY — and is therefore refused inside the entry cutoff, on CLOSE_ONLY markets, with the entry-shaped staleness code, and under the default requirePositiveNetEdgeForEntries for want of an expectedNetEdge. This is the ACCEPTED posture until the risk-side follow-up lands. The trader does not weaken risk policy, re-tag intents or bypass the engine to compensate; it counts the refusals, and this dashboard shows them.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_risk_seam_caveat_active", "legendFormat": "caveat active" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Execution plans and submissions",
+      "description": "§9.10 reserves capital BEFORE submission, so an allocation refusal is a plan that never left the process, while a submission refusal reached the (simulated) venue and returned its reservation.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_plans_built_total[5m])", "legendFormat": "plans built" },
+        { "refId": "B", "expr": "increase(trader_plans_refused_total[5m])", "legendFormat": "plans refused" },
+        { "refId": "C", "expr": "increase(trader_submissions_accepted_total[5m])", "legendFormat": "submissions accepted" },
+        { "refId": "D", "expr": "increase(trader_submissions_refused_total[5m])", "legendFormat": "submissions refused" },
+        { "refId": "E", "expr": "increase(trader_allocations_refused_total[5m])", "legendFormat": "allocations refused" },
+        { "refId": "F", "expr": "increase(trader_reservations_released_on_refusal_total[5m])", "legendFormat": "reservations released on refusal" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Fills",
+      "description": "Fills observed and redeliveries the dedup seam refused. §6 invariant 10 makes partial fills first class; a redelivery refused here is the at-most-once gate working, not a lost fill.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_fills_observed_total[5m])", "legendFormat": "fills" },
+        { "refId": "B", "expr": "increase(trader_duplicate_fills_refused_total[5m])", "legendFormat": "duplicates refused" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Cancels",
+      "description": "§6 invariant 13: safety cancellation outranks new order placement. A cancel whose silence bound elapsed is NOT a rejection (§6 invariant 6) and is counted separately.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_cancels_requested_total[5m])", "legendFormat": "requested" },
+        { "refId": "B", "expr": "increase(trader_cancels_confirmed_total[5m])", "legendFormat": "confirmed" },
+        { "refId": "C", "expr": "increase(trader_cancels_rejected_total[5m])", "legendFormat": "rejected" },
+        { "refId": "D", "expr": "increase(trader_cancels_silence_exceeded_total[5m])", "legendFormat": "silence exceeded" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Ledger and PnL record counts",
+      "description": "COUNTS, not amounts. Unattributed activity and unexplained movements each halt the affected market (§6 invariant 7, §9.15); a ledger refusal means an accounting record is incomplete.",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_ledger_transactions_total[5m])", "legendFormat": "ledger transactions" },
+        { "refId": "B", "expr": "increase(trader_ledger_refusals_total[5m])", "legendFormat": "ledger refusals" },
+        { "refId": "C", "expr": "increase(trader_unattributed_activity_total[5m])", "legendFormat": "unattributed activity" },
+        { "refId": "D", "expr": "increase(trader_unexplained_movements_total[5m])", "legendFormat": "unexplained movements" },
+        { "refId": "E", "expr": "increase(trader_pnl_records_total[5m])", "legendFormat": "PnL records" }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "text",
+      "title": "Realized PnL",
+      "description": "This panel is intentionally not bound to a metric. See its content.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 28 },
+      "options": {
+        "mode": "markdown",
+        "content": "PENDING PRODUCER: an exact-decimal PnL value on the trader's health surface; today it carries only accounting.pnlRecords (a COUNT), and packages/pnl's snapshot values never reach an exporter — OWNER: a future apps/trader grant (the health surface is apps/trader-owned; WP-240 is read-only there)\n\nWP-240 will not invent a `trader_pnl` gauge: a PnL amount is an exact decimal (§6 invariant 1) and a float64 sample value is the representation that invariant forbids. When a producer exists it will arrive as an `_info` label carrying the exact decimal string, the way reserved collateral already does — see 'Reserved collateral (exact decimals)' on this dashboard for the shape."
+      }
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Reserved collateral (exact decimals)",
+      "description": "The only economic amounts on this dashboard, and they are LABELS. The value column is always 1; read the exact_decimal label. Nothing here is charted, summed, or rate()'d — arithmetic on these would reintroduce binary floating point into economics (§6 invariant 1). The control API's JSON read surface returns the same strings.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_seam_reservations_reserved_collateral_info", "instant": true, "legendFormat": "inventory reserved: {{exact_decimal}}" },
+        { "refId": "B", "expr": "trader_seam_allocator_reserved_collateral_info", "instant": true, "legendFormat": "allocator reserved: {{exact_decimal}}" }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Incident recommendations (§9.9)",
+      "description": "§9.9 actions the risk engine RECOMMENDED, by action. A recommendation is not an action: the Incident Controller and the operator act, and the trader's own act is only to stop deciding for a halted scope.",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 35 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_risk_incident_recommendations_total[5m])", "legendFormat": "{{action}}" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,281 @@
+{
+  "uid": "pmb-control-operations",
+  "title": "Polymarket bot — operations (paper)",
+  "description": "WP-240 operations view. Every panel is bound to a metric the control API genuinely exports (packages/observability PLATFORM_METRIC_FAMILIES). PAPER deployment: this dashboard exposes no live-mode control, no run-mode change and no credential.",
+  "tags": ["polymarket-bot", "wp-240", "paper"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "table",
+      "title": "Run mode and ceiling",
+      "description": "The control API's run mode, its process maximum and the repository ceiling, beside the reported trader's. The ceiling is NOT writable through this API — there is no request that names a run mode — so a change here means a process was restarted with different configuration. control_allow_real_orders is structurally 0.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "control_run_mode_info", "legendFormat": "control-api", "instant": true },
+        { "refId": "B", "expr": "trader_run_mode_info", "legendFormat": "trader", "instant": true },
+        { "refId": "C", "expr": "control_allow_real_orders", "legendFormat": "allow real orders", "instant": true }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Trader health report available",
+      "description": "READ THIS FIRST. 0 means the control API holds no trader health report that passed its door, so every trader_* panel below is stale or empty — that is a control-plane fact, not a quiet trading day.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "control_trader_health_available", "legendFormat": "available" },
+        { "refId": "B", "expr": "rate(control_trader_health_reads_total[5m])", "legendFormat": "reads {{outcome}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Latched halts",
+      "description": "A halt is a LATCH: once raised, the trader makes no trading decision for the scope until an operator act clears it. trader_healthy is 1 only while no scope is halted.",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_halt_count", "legendFormat": "latched halts" },
+        { "refId": "B", "expr": "trader_healthy", "legendFormat": "healthy" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Halt detail",
+      "description": "One row per latched halt: the §14.1 scope, the reason code that raised it and the §9.9 action it selects. An action is what the process recommends; only the scope-level latch is what it enforces.",
+      "gridPos": { "h": 6, "w": 16, "x": 8, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_halt_info", "instant": true, "legendFormat": "{{scope}} {{scope_ref}} {{code}} {{action}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Queue depth",
+      "description": "§8.3 bounded queues. Depth approaching the bound is backpressure building; the trader's queues REFUSE at the bound and never drop.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_queue_depth", "legendFormat": "{{queue}} depth" },
+        { "refId": "B", "expr": "trader_queue_max_depth", "legendFormat": "{{queue}} bound" },
+        { "refId": "C", "expr": "trader_queue_consumer_lag", "legendFormat": "{{queue}} consumer lag" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Queue oldest message age",
+      "description": "Age of the oldest queued message. A GAP in this series means the queue was empty — the exporter omits the sample rather than reporting 0, because an empty queue has no oldest message.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_queue_oldest_message_age_ms", "legendFormat": "{{queue}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Queue backpressure",
+      "description": "Milliseconds producers spent refused at a full queue, plus accepted/consumed totals so the lag can be audited. trader_queue_messages_dropped_total must stay flat at 0; any increase is a contract break, not a load symptom.",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "rate(trader_queue_producer_blocked_ms_total[5m])", "legendFormat": "{{queue}} blocked ms/s" },
+        { "refId": "B", "expr": "increase(trader_queue_messages_dropped_total[5m])", "legendFormat": "{{queue}} DROPPED" },
+        { "refId": "C", "expr": "rate(trader_queue_accepted_total[5m])", "legendFormat": "{{queue}} accepted/s" },
+        { "refId": "D", "expr": "rate(trader_queue_consumed_total[5m])", "legendFormat": "{{queue}} consumed/s" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Seam: fill deduplication",
+      "description": "The at-most-once gate. trader_seam_fills_evictions_total above 0 means the seam can no longer prove at-most-once for the whole run — the bound is too small, and the number says so rather than hiding it.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 19 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_seam_fills_remembered", "legendFormat": "remembered" },
+        { "refId": "B", "expr": "trader_seam_fills_maximum_remembered", "legendFormat": "bound" },
+        { "refId": "C", "expr": "increase(trader_seam_fills_admitted_total[5m])", "legendFormat": "admitted" },
+        { "refId": "D", "expr": "increase(trader_seam_fills_refused_total[5m])", "legendFormat": "refused redeliveries" },
+        { "refId": "E", "expr": "increase(trader_seam_fills_evictions_total[5m])", "legendFormat": "EVICTIONS" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Seam: inventory reservations",
+      "description": "WP-220 obligation 9's inventory book. The reserved amount is an EXACT decimal carried as a label on an info gauge; it is displayed, never charted, because a float64 sample value is the representation §6 invariant 1 forbids for economics.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 19 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_seam_reservations_open", "legendFormat": "open" },
+        { "refId": "B", "expr": "increase(trader_seam_reservations_taken_total[5m])", "legendFormat": "taken" },
+        { "refId": "C", "expr": "increase(trader_seam_reservations_released_total[5m])", "legendFormat": "released" },
+        { "refId": "D", "expr": "trader_seam_reservations_reserved_collateral_info", "legendFormat": "reserved: {{exact_decimal}}", "instant": true }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Seam: cancels",
+      "description": "Obligation 10: every cancel reaches a terminal fact. trader_seam_cancels_silence_exceeded_total counts cancels closed by their silence bound — §6 invariant 6 forbids treating that as a rejection.",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 19 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_seam_cancels_pending", "legendFormat": "pending" },
+        { "refId": "B", "expr": "increase(trader_seam_cancels_requested_total[5m])", "legendFormat": "requested" },
+        { "refId": "C", "expr": "increase(trader_seam_cancels_confirmed_total[5m])", "legendFormat": "confirmed" },
+        { "refId": "D", "expr": "increase(trader_seam_cancels_rejected_total[5m])", "legendFormat": "rejected" },
+        { "refId": "E", "expr": "increase(trader_seam_cancels_silence_exceeded_total[5m])", "legendFormat": "silence exceeded" }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Seam: order views",
+      "description": "Obligations 4 and 5a. A repeat is LABELLED and delivered, never dropped, so repeats rising is information rather than loss.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_seam_order_views_emitted_total[5m])", "legendFormat": "emitted" },
+        { "refId": "B", "expr": "increase(trader_seam_order_views_repeats_total[5m])", "legendFormat": "labelled repeats" },
+        { "refId": "C", "expr": "trader_seam_order_views_tracked", "legendFormat": "tracked orders" }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Seam: capital allocator",
+      "description": "The §9.7 commitment book behind §9.8 checks 14 and 15. Refusals are broken out by the allocator's own code; the reserved pUSD is an exact decimal carried as a label.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_seam_allocator_open", "legendFormat": "open" },
+        { "refId": "B", "expr": "increase(trader_seam_allocator_applied_total[5m])", "legendFormat": "applied" },
+        { "refId": "C", "expr": "increase(trader_seam_allocator_released_total[5m])", "legendFormat": "released" },
+        { "refId": "D", "expr": "increase(trader_seam_allocator_refusals_by_code_total[5m])", "legendFormat": "refused {{code}}" },
+        { "refId": "E", "expr": "trader_seam_allocator_reserved_collateral_info", "legendFormat": "reserved: {{exact_decimal}}", "instant": true }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Observe-only intents (shadow instances)",
+      "description": "Intents a NON-OWNER instance emitted that were never routed (§6 invariant 11, ADR-011 §5: a shadow instance submits nothing). A non-zero rate with no fills is the process declining to route what a strategy emitted — not the strategy emitting nothing.",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_observe_only_intents_total[5m])", "legendFormat": "observe-only intents" }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "table",
+      "title": "Kill switches engaged",
+      "description": "§14.1 kill switches latched through the control API, by scope and action. Engaging one is an operator act and is audited; so is releasing one, which additionally requires evidence.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "control_kill_switches_active", "legendFormat": "engaged" },
+        { "refId": "B", "expr": "control_kill_switch_active", "instant": true, "legendFormat": "{{scope}} {{scope_ref}} {{action}}" }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Strategy instances by run state",
+      "description": "Instances the control plane knows, by run state, plus one series per instance an operator has paused.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "control_strategy_instances", "legendFormat": "{{state}}" },
+        { "refId": "B", "expr": "control_strategy_paused", "legendFormat": "paused: {{instance_id}}" }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Control-plane refusals",
+      "description": "Authentication failures never reach the control plane and therefore write no audit record; this counter is where they become visible. Authorization failures are authenticated callers lacking an explicit grant (§15). Mode-raise refusals are requests that tried to raise a run mode, enable real orders, raise a live-micro cap or name a signer — each refused by name AND audited.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(control_authentication_failures_total[5m])", "legendFormat": "auth: {{reason}}" },
+        { "refId": "B", "expr": "increase(control_authorization_failures_total[5m])", "legendFormat": "grant: {{grant}}" },
+        { "refId": "C", "expr": "increase(control_mode_raise_attempts_refused_total[5m])", "legendFormat": "mode-raise attempts refused" }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Audit log",
+      "description": "Acceptance 2 made observable. The control plane audits BEFORE it applies, so control_audit_append_failures_total counts mutations that did NOT happen, and records reaching capacity stops the control plane from mutating anything rather than evicting evidence.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "control_audit_records", "legendFormat": "records" },
+        { "refId": "B", "expr": "control_audit_capacity", "legendFormat": "capacity" },
+        { "refId": "C", "expr": "increase(control_audit_append_failures_total[5m])", "legendFormat": "append failures" },
+        { "refId": "D", "expr": "increase(control_mutations_total[5m])", "legendFormat": "{{action}} {{outcome}}" }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Event loop throughput",
+      "description": "§8.1 core loop. Refused events are events the wire door would not read, or whose instant could not be normalised — a feed or contract problem, not load.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "rate(trader_events_accepted_total[5m])", "legendFormat": "accepted/s" },
+        { "refId": "B", "expr": "rate(trader_events_processed_total[5m])", "legendFormat": "processed/s" },
+        { "refId": "C", "expr": "increase(trader_events_refused_total[5m])", "legendFormat": "refused" }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Feature engine",
+      "description": "Snapshots computed, evaluations skipped for want of one, and projection refusals. 'Unavailable' is ordinary early-run state (no book has arrived yet) and is counted separately from a refused event on purpose — merging them would make a healthy start look like a feed problem.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "rate(trader_feature_snapshots_total[5m])", "legendFormat": "snapshots/s" },
+        { "refId": "B", "expr": "increase(trader_snapshots_unavailable_total[5m])", "legendFormat": "unavailable" },
+        { "refId": "C", "expr": "increase(trader_feature_projection_refusals_total[5m])", "legendFormat": "projection refusals" }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Deliveries suppressed by halt",
+      "description": "Fill and order-view deliveries the §4.2 halt gate withheld from a strategy. The ACCOUNTING for those events still happened — the money moved whatever this process's state is — and this is the other half of that sentence.",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(trader_deliveries_suppressed_by_halt_total[5m])", "legendFormat": "suppressed deliveries" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+{
+  "uid": "pmb-control-fidelity",
+  "title": "Polymarket bot — fidelity (paper)",
+  "description": "WP-240 fidelity view: how trustworthy the data and the simulation are. The dataset and staleness half is bound to WP-140's recorder exporter, which is a real producer running today. The replay/determinism and simulation-fidelity half has NO producer in this repository, and each such panel says so, names what would produce it, and names the owner — rather than binding to an invented metric that would read blank forever.",
+  "tags": ["polymarket-bot", "wp-240", "paper"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Dataset validation",
+      "description": "§12.5 dataset manifests. recorder_validation_ok is 0 when the last validation run found anything; recorder_validation_findings counts them. A replay run against a dataset whose validation is not clean is a replay whose result means less than it looks.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_validation_ok", "legendFormat": "validation ok" },
+        { "refId": "B", "expr": "recorder_validation_findings", "legendFormat": "findings" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Feed staleness and gaps",
+      "description": "§14.3 feed: staleness by source, resyncs, data-quality incidents. Every series here is a reason a downstream feature, decision or fill is less trustworthy than it appears.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "increase(recorder_feed_stalls_observed_total[15m])", "legendFormat": "feed stalls" },
+        { "refId": "B", "expr": "increase(recorder_rtds_freshness_failures_total[15m])", "legendFormat": "RTDS freshness failures" },
+        { "refId": "C", "expr": "increase(recorder_rtds_coverage_breaks_total[15m])", "legendFormat": "RTDS coverage breaks" },
+        { "refId": "D", "expr": "increase(recorder_polymarket_resync_rejections_total[15m])", "legendFormat": "Polymarket resync rejections" },
+        { "refId": "E", "expr": "increase(recorder_incidents_opened_total[15m])", "legendFormat": "data-quality incidents" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Recorder WAL data-loss bound",
+      "description": "The recorder's own honesty metric: the maximum window of frames that are accepted but not yet proven durable. A replay of a window in which this was large is a replay over data that might be incomplete.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_wal_data_loss_bound_ms", "legendFormat": "data-loss bound (ms)" },
+        { "refId": "B", "expr": "recorder_wal_unproven_frame_count", "legendFormat": "unproven frames" },
+        { "refId": "C", "expr": "recorder_wal_unmanifested_faulted_segments", "legendFormat": "unmanifested faulted segments" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Compaction lag",
+      "description": "How far Parquet/manifest production trails the WAL. A large lag means the dataset a replay would read does not yet include recent live behaviour.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "recorder_compaction_lag_ms", "legendFormat": "compaction lag (ms)" },
+        { "refId": "B", "expr": "increase(recorder_compaction_cycles_failed_total[1h])", "legendFormat": "failed cycles" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "text",
+      "title": "Replay determinism",
+      "description": "This panel is intentionally not bound to a metric. See its content.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
+      "options": {
+        "mode": "markdown",
+        "content": "PENDING PRODUCER: a determinism indicator emitted by whatever executes a replay; §12.4 determinism is proven today by `pnpm test:replay` and test/replay-golden, which emit no metric at all — OWNER: a future packages/simulation or apps/backtest-cli grant (WP-250 verifies determinism but its allowed paths forbid packages/** and apps/**, so it cannot add a producer)\n\nUntil then, determinism evidence is a GATE, not a dashboard: `pnpm test:replay` must pass and the golden output must be byte-identical across runs. Do not read the absence of a red panel here as evidence that a replay was deterministic."
+      }
+    },
+    {
+      "id": 6,
+      "type": "text",
+      "title": "Predicted versus actual fills",
+      "description": "This panel is intentionally not bound to a metric. See its content.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
+      "options": {
+        "mode": "markdown",
+        "content": "PENDING PRODUCER: §12.2's execution-calibration model, which compares simulated fills against observed ones. It requires EXECUTION_PROBE data that does not and may not exist under MAX_RUN_MODE=PAPER — OWNER: WP-290 / phase-4 execution probes (out of scope for phase 2 by the phase plan)\n\nThe simulated venue currently runs the Tier 0 pipeline smoke model. Its fills are a property of the model, not a prediction to score, so a 'predicted versus actual' chart drawn from them would compare the model with itself."
+      }
+    },
+    {
+      "id": 7,
+      "type": "text",
+      "title": "Markout",
+      "description": "This panel is intentionally not bound to a metric. See its content.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "options": {
+        "mode": "markdown",
+        "content": "PENDING PRODUCER: §12.3 markout computation over fills; packages/simulation computes markouts for research output, and nothing exports them as a time series — OWNER: a future packages/simulation or apps/research-worker grant\n\nWhen it lands, note that a markout is an exact decimal: it belongs on this surface as an `_info` label carrying the decimal string, not as a float64 gauge (§6 invariant 1)."
+      }
+    }
+  ]
+}

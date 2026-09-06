@@ -1,0 +1,373 @@
+/**
+ * The control plane — acceptance 2 proven at the level where it is TRUE BY
+ * CONSTRUCTION, plus the §14.1 semantics.
+ *
+ * The central test is "a refusing audit sink stops the mutation": the state
+ * must not move. Everything else in this suite is the vocabulary around it.
+ */
+
+import { describe, expect, it } from "vitest";
+
+import {
+  InMemoryControlAuditLog,
+  type AuditAppendResult,
+  type ControlAuditRecord,
+  type ControlAuditSink,
+} from "@polymarket-bot/observability";
+
+import { ControlPlane, type MutationContext } from "./control-plane.js";
+
+function plane(audit: ControlAuditSink): ControlPlane {
+  return new ControlPlane({
+    audit,
+    runMode: "PAPER",
+    maximumRunMode: "PAPER",
+    repositoryMaximumRunMode: "PAPER",
+  });
+}
+
+let sequence = 0;
+function context(overrides: Partial<MutationContext> = {}): MutationContext {
+  sequence += 1;
+  return {
+    actor: "operator-a",
+    at: `2026-09-05T00:00:${String(sequence).padStart(2, "0")}.000Z`,
+    auditRecordId: `01930000-0000-7000-8000-${String(sequence).padStart(12, "0")}`,
+    reason: "a stated reason",
+    ...overrides,
+  };
+}
+
+/** A sink that refuses everything. Nothing may be applied through it. */
+class RefusingSink implements ControlAuditSink {
+  readonly seen: ControlAuditRecord[] = [];
+  append(record: ControlAuditRecord): Promise<AuditAppendResult> {
+    this.seen.push(record);
+    return Promise.resolve({
+      ok: false,
+      code: "AUDIT_SINK_UNAVAILABLE",
+      detail: "the durable sink is unreachable in this test",
+    });
+  }
+}
+
+describe("run state", () => {
+  it("reports the ceiling and states, on the wire, that it is not writable", () => {
+    expect(plane(new InMemoryControlAuditLog(8)).runState()).toEqual({
+      runMode: "PAPER",
+      maximumRunMode: "PAPER",
+      repositoryMaximumRunMode: "PAPER",
+      allowRealOrders: false,
+      runModeIsWritable: false,
+      signerLoaded: false,
+    });
+  });
+
+  it("exposes NO method that changes a run mode", () => {
+    // A structural assertion: the class's own surface. A future method named
+    // for a run mode fails here before it reaches a reviewer.
+    const surface = [
+      ...Object.getOwnPropertyNames(ControlPlane.prototype),
+      ...Object.getOwnPropertyNames(plane(new InMemoryControlAuditLog(8))),
+    ].map((name) => name.toLowerCase());
+    for (const forbidden of ["setrunmode", "raisemode", "setmaximumrunmode", "allowrealorders"]) {
+      expect(surface, forbidden).not.toContain(forbidden);
+    }
+  });
+});
+
+describe("ACCEPTANCE 2: audit first, then apply", () => {
+  it("writes an audit record for an APPLIED pause, carrying all five §14.1 fields", async () => {
+    const audit = new InMemoryControlAuditLog(8);
+    const control = plane(audit);
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+
+    const result = await control.pauseStrategy("sb-1", context({ reason: "maintenance" }));
+    expect(result.ok).toBe(true);
+
+    expect(audit.records()).toHaveLength(1);
+    const record = audit.records()[0];
+    expect(record).toMatchObject({
+      action: "STRATEGY_PAUSE",
+      outcome: "APPLIED",
+      actor: "operator-a",
+      actorKind: "HUMAN",
+      scope: "STRATEGY_INSTANCE",
+      scopeRef: "sb-1",
+      reason: "maintenance",
+    });
+    expect(record?.priorState).toMatchObject({ state: "RUNNING" });
+    expect(record?.resultingState).toMatchObject({ state: "PAUSED" });
+    expect(record?.at).toMatch(/^2026-09-05T/u);
+  });
+
+  it("A REFUSING SINK STOPS THE MUTATION: the state does not move", async () => {
+    const sink = new RefusingSink();
+    const control = plane(sink);
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+
+    const result = await control.pauseStrategy("sb-1", context());
+    expect(result).toMatchObject({ ok: false, code: "CONTROL_NOT_AUDITABLE" });
+    // The state is unchanged — this is the whole property.
+    expect(control.strategies()[0]?.state).toBe("RUNNING");
+    // …and the attempt was OFFERED to the sink before being abandoned.
+    expect(sink.seen).toHaveLength(1);
+    expect(control.auditAppendFailures).toBe(1);
+  });
+
+  it("A FULL AUDIT LOG STOPS THE MUTATION, and does not evict evidence", async () => {
+    const audit = new InMemoryControlAuditLog(1);
+    const control = plane(audit);
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+    control.register("sb-2", "2026-09-05T00:00:00.000Z");
+
+    expect((await control.pauseStrategy("sb-1", context())).ok).toBe(true);
+    const second = await control.pauseStrategy("sb-2", context());
+    expect(second).toMatchObject({ ok: false, code: "CONTROL_NOT_AUDITABLE" });
+
+    expect(control.strategies().find((entry) => entry.instanceId === "sb-2")?.state).toBe(
+      "RUNNING",
+    );
+    // The FIRST record — the one an evicting log would have lost — is still here.
+    expect(audit.records()).toHaveLength(1);
+    expect(audit.records()[0]?.scopeRef).toBe("sb-1");
+  });
+
+  it("audits a REFUSED mutation too", async () => {
+    const audit = new InMemoryControlAuditLog(8);
+    const control = plane(audit);
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+
+    // Already RUNNING; a resume is a no-op and is refused.
+    const result = await control.resumeStrategy("sb-1", context());
+    expect(result).toMatchObject({ ok: false, code: "CONTROL_ALREADY_IN_STATE" });
+    expect(audit.records()).toHaveLength(1);
+    expect(audit.records()[0]).toMatchObject({
+      action: "STRATEGY_RESUME",
+      outcome: "REFUSED",
+    });
+    expect(audit.records()[0]?.resultingState).toMatchObject({
+      refusalCode: "CONTROL_ALREADY_IN_STATE",
+    });
+  });
+
+  it("audits EVERY mutating method — none has an unaudited path", async () => {
+    const audit = new InMemoryControlAuditLog(32);
+    const control = plane(audit);
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+
+    await control.pauseStrategy("sb-1", context());
+    await control.resumeStrategy("sb-1", context());
+    await control.engageKillSwitch(
+      { scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" },
+      context(),
+    );
+    await control.releaseKillSwitch(
+      {
+        scope: "GLOBAL",
+        scopeRef: null,
+        release: { authoritativeSnapshotApplied: true, reason: "reconciled" },
+      },
+      context(),
+    );
+    await control.refuseModeRaise(["runMode"], context());
+
+    expect(audit.records().map((record) => `${record.action}|${record.outcome}`)).toEqual([
+      "STRATEGY_PAUSE|APPLIED",
+      "STRATEGY_RESUME|APPLIED",
+      "KILL_SWITCH_ENGAGE|APPLIED",
+      "KILL_SWITCH_RELEASE|APPLIED",
+      "MODE_RAISE_ATTEMPT|REFUSED",
+    ]);
+  });
+
+  it("registration is NOT a mutation and writes nothing", async () => {
+    const audit = new InMemoryControlAuditLog(8);
+    const control = plane(audit);
+    control.register("sb-1", "2026-09-05T00:00:00.000Z");
+    control.register("sb-2", "2026-09-05T00:00:00.000Z");
+    control.register("sb-1", "2026-09-05T00:00:05.000Z");
+    expect(audit.records()).toEqual([]);
+    expect(control.strategies().map((entry) => entry.instanceId)).toEqual(["sb-1", "sb-2"]);
+    // A repeat registration does not reset the instance's own record.
+    expect(control.strategies()[0]?.since).toBe("2026-09-05T00:00:00.000Z");
+    await Promise.resolve();
+  });
+});
+
+describe("ACCEPTANCE 1: a mode-raise attempt is recorded and changes nothing", () => {
+  it("records the attempt, names the keys, and leaves the ceiling alone", async () => {
+    const audit = new InMemoryControlAuditLog(8);
+    const control = plane(audit);
+    const before = control.runState();
+
+    await control.refuseModeRaise(["runMode", "allowRealOrders"], context());
+
+    expect(control.runState()).toEqual(before);
+    expect(control.modeRaiseAttemptsRefused).toBe(1);
+    const record = audit.records()[0];
+    expect(record).toMatchObject({
+      action: "MODE_RAISE_ATTEMPT",
+      outcome: "REFUSED",
+      scope: "CONTROL_PLANE",
+      scopeRef: null,
+    });
+    expect(record?.resultingState).toMatchObject({
+      maximumRunMode: "PAPER",
+      attemptedKeys: ["runMode", "allowRealOrders"],
+    });
+    // The prior and resulting ceilings are identical: nothing changed.
+    expect(record?.priorState).toMatchObject({ maximumRunMode: "PAPER" });
+  });
+});
+
+describe("§14.1 kill-switch semantics", () => {
+  it("engages, lists and releases a scoped switch", async () => {
+    const audit = new InMemoryControlAuditLog(16);
+    const control = plane(audit);
+
+    const engaged = await control.engageKillSwitch(
+      { scope: "MARKET", scopeRef: "market-1", action: "CANCEL_MARKET" },
+      context({ reason: "book desynchronised" }),
+    );
+    expect(engaged.ok).toBe(true);
+    expect(control.killSwitches()).toEqual([
+      {
+        scope: "MARKET",
+        scopeRef: "market-1",
+        action: "CANCEL_MARKET",
+        reason: "book desynchronised",
+        since: expect.any(String) as unknown as string,
+        actor: "operator-a",
+      },
+    ]);
+
+    const released = await control.releaseKillSwitch(
+      {
+        scope: "MARKET",
+        scopeRef: "market-1",
+        release: { authoritativeSnapshotApplied: true, reason: "reconciled" },
+      },
+      context(),
+    );
+    expect(released.ok).toBe(true);
+    expect(control.killSwitches()).toEqual([]);
+  });
+
+  it("REFUSES a GLOBAL switch that names a scope reference (§10.6 CHECK)", async () => {
+    const control = plane(new InMemoryControlAuditLog(8));
+    const result = await control.engageKillSwitch(
+      { scope: "GLOBAL", scopeRef: "market-1", action: "FULL_HALT" },
+      context(),
+    );
+    expect(result).toMatchObject({ ok: false, code: "CONTROL_SCOPE_REF_MISMATCH" });
+    expect(control.killSwitches()).toEqual([]);
+  });
+
+  it.each(["ACCOUNT", "MARKET", "STRATEGY_INSTANCE"] as const)(
+    "REFUSES a %s switch with no scope reference",
+    async (scope) => {
+      const control = plane(new InMemoryControlAuditLog(8));
+      const result = await control.engageKillSwitch(
+        { scope, scopeRef: null, action: "HALT_NEW_ENTRIES" },
+        context(),
+      );
+      expect(result).toMatchObject({ ok: false, code: "CONTROL_SCOPE_REF_MISMATCH" });
+    },
+  );
+
+  it("REFUSES a release with no evidence — and audits the attempt", async () => {
+    const audit = new InMemoryControlAuditLog(8);
+    const control = plane(audit);
+    await control.engageKillSwitch(
+      { scope: "GLOBAL", scopeRef: null, action: "FULL_HALT" },
+      context(),
+    );
+    const result = await control.releaseKillSwitch(
+      {
+        scope: "GLOBAL",
+        scopeRef: null,
+        release: { authoritativeSnapshotApplied: false as unknown as true, reason: "just do it" },
+      },
+      context(),
+    );
+    expect(result).toMatchObject({ ok: false, code: "CONTROL_RELEASE_EVIDENCE_MISSING" });
+    // Still engaged: a release without evidence releases nothing.
+    expect(control.killSwitches()).toHaveLength(1);
+    expect(audit.records().at(-1)).toMatchObject({
+      action: "KILL_SWITCH_RELEASE",
+      outcome: "REFUSED",
+    });
+  });
+
+  it("REFUSES releasing a switch that is not engaged", async () => {
+    const control = plane(new InMemoryControlAuditLog(8));
+    const result = await control.releaseKillSwitch(
+      {
+        scope: "ACCOUNT",
+        scopeRef: "account-1",
+        release: { authoritativeSnapshotApplied: true, reason: "reconciled" },
+      },
+      context(),
+    );
+    expect(result).toMatchObject({ ok: false, code: "CONTROL_NOT_ENGAGED" });
+  });
+
+  it("keeps two switches at different scopes independent", async () => {
+    const control = plane(new InMemoryControlAuditLog(16));
+    await control.engageKillSwitch(
+      { scope: "MARKET", scopeRef: "market-1", action: "CANCEL_MARKET" },
+      context(),
+    );
+    await control.engageKillSwitch(
+      { scope: "MARKET", scopeRef: "market-2", action: "HALT_NEW_ENTRIES" },
+      context(),
+    );
+    expect(control.killSwitches()).toHaveLength(2);
+    await control.releaseKillSwitch(
+      {
+        scope: "MARKET",
+        scopeRef: "market-1",
+        release: { authoritativeSnapshotApplied: true, reason: "reconciled" },
+      },
+      context(),
+    );
+    expect(control.killSwitches().map((entry) => entry.scopeRef)).toEqual(["market-2"]);
+  });
+});
+
+describe("determinism", () => {
+  it("two identical sequences produce identical audit logs", async () => {
+    const run = async (): Promise<readonly ControlAuditRecord[]> => {
+      const audit = new InMemoryControlAuditLog(16);
+      const control = plane(audit);
+      control.register("sb-1", "2026-09-05T00:00:00.000Z");
+      const fixed: MutationContext = {
+        actor: "operator-a",
+        at: "2026-09-05T00:00:01.000Z",
+        auditRecordId: "01930000-0000-7000-8000-000000000001",
+        reason: "fixed",
+      };
+      await control.pauseStrategy("sb-1", fixed);
+      return audit.records();
+    };
+    expect(JSON.stringify(await run())).toBe(JSON.stringify(await run()));
+  });
+
+  it("sorts strategies and kill switches so a snapshot is stable", async () => {
+    const control = plane(new InMemoryControlAuditLog(16));
+    control.register("sb-z", "2026-09-05T00:00:00.000Z");
+    control.register("sb-a", "2026-09-05T00:00:00.000Z");
+    expect(control.strategies().map((entry) => entry.instanceId)).toEqual(["sb-a", "sb-z"]);
+
+    await control.engageKillSwitch(
+      { scope: "MARKET", scopeRef: "z", action: "CANCEL_MARKET" },
+      context(),
+    );
+    await control.engageKillSwitch(
+      { scope: "ACCOUNT", scopeRef: "a", action: "FULL_HALT" },
+      context(),
+    );
+    expect(control.killSwitches().map((entry) => entry.scope)).toEqual(["ACCOUNT", "MARKET"]);
+  });
+});
