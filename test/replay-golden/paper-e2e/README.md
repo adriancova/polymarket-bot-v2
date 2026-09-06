@@ -24,7 +24,7 @@ over a different subject — the paper-core end-to-end surface `WP-230` and
 | Key | What it is |
 | --- | --- |
 | `scenario` | the identities, sizes, prices and fee schedule `test/e2e/support/scenario.ts` states |
-| `events` | the seven recorded §7.1 events, by id and ingest sequence |
+| `events` | the eight recorded §7.1 events, by id and ingest sequence |
 | `decisions` | every PERSISTED `DecisionRecord`, as it reached the durable-store port |
 | `checkpointInstants` | one per persisted decision, at the evaluation's own instant |
 | `traces` | the §6 invariant 4 chains the run produced |

@@ -68,7 +68,8 @@ root for the value it recorded at plan time and refuses rather than assuming one
 ### 1.2 The scenario
 
 `test/e2e/support/scenario.ts` — one simulated market (`wp250-paper-sim`), one
-`OWNER` Static Bracket instance, seven recorded §7.1 events, no wall clock and no
+`OWNER` Static Bracket instance, eight recorded §7.1 events (seven scenario
+beats plus the book-refresh event deviation D5 discloses), no wall clock and no
 entropy. Every constant's reason is stated in the module header. Two choices
 matter for what follows:
 
@@ -108,7 +109,13 @@ outside the document is a broken hop, because there is nowhere else to look.
 **Hops walked (12):** `event`, `feature`, `decision`, `intent`,
 `approved-intent`, `plan`, `submission`, `order`, `fill`, `ledger-posting`,
 `pnl-record`, `pnl-snapshot`. The last two continue past §6 invariant 4's own end
-to the two artefacts the packet asks for.
+to the two artefacts the packet asks for. Precision (review round 1, LOW-1):
+ten of the twelve hops are genuine id lookups against a captured collection;
+the `approved-intent` and `submission` hops are non-empty-plus-distinctness
+checks, because the artifact document carries no approved-intent or
+submission-attempt collection to resolve against — both remain falsifiable
+(setting `approvedIntentId = executionPlanId` breaks exactly
+`["approved-intent"]`).
 
 **Bidirectional.** Forward resolution proves the chain reaches PnL. Seven
 document-level checks prove nothing was persisted that no chain accounts for —
@@ -116,7 +123,12 @@ document-level checks prove nothing was persisted that no chain accounts for —
 `DANGLING_DECISION_SOURCE_EVENT`, `NON_PAPER_LEDGER_TRANSACTION`,
 `LEDGER_TRANSACTION_CLAIMED_TWICE`, `DECISION_KEY_NOT_UNIQUE`, plus id-uniqueness
 per collection and a `NO_CHAIN` guard so an empty walk can never pass as a clean
-one.
+one. Scope precision (review round 1, LOW-2): the closed world covers ledger
+transactions and fills as orphan classes; PnL records are closed only via
+`DANGLING_PNL_REF` — the loop exposes the `VIRTUAL_STRATEGY`-scope stream
+per instance (4 of the 8 records health counts; the other four are
+account-scope records the loop never exposes per-instance, correct behavior),
+so the orphan closure does not extend to them.
 
 **Falsifiability, measured.** `traceability-chain-negative.test.ts` mutates the
 golden one link at a time and requires the walk to break EXACTLY the expected set
@@ -145,7 +157,7 @@ arithmetic does not close leaves a non-zero residual and the row is UNEXPLAINED,
 and a mechanism outside the closed set makes the row unexplained whatever its
 arithmetic says.
 
-**The table: 16 rows, 0 unexplained.** Eleven rows are exact equalities; four
+**The table: 17 rows, 0 unexplained.** Twelve rows are exact equalities; four
 carry a difference; one has no realized value at all.
 
 | Row | Projected | Realized | Difference | Mechanism |
@@ -413,7 +425,7 @@ remains explicitly pending until observed.*
 
 | Evidence | Status | Owner |
 | --- | --- | --- |
-| **Time-based paper soak** (a paper trader running for a sustained period against a live feed) | **PENDING. Never observed. Not claimed anywhere in this package.** Every run in `test/e2e/**` is a fixed seven-event scenario that completes in milliseconds against in-memory ports. | operator action, per runbook §1F/§7 |
+| **Time-based paper soak** (a paper trader running for a sustained period against a live feed) | **PENDING. Never observed. Not claimed anywhere in this package.** Every run in `test/e2e/**` is a fixed eight-event scenario that completes in milliseconds against in-memory ports. | operator action, per runbook §1F/§7 |
 | **`WP-140` external recorder soak evidence** | **PENDING**, machine-readably (`recorder_soak_status_info{status="PENDING"}`). Stands entirely apart from `WP-250` and is untouched by it. | operator action, per runbook §1F/§7 |
 | **Execution probe / live gate** | **NOT PERFORMED, NOT PERMITTED.** `MAX_RUN_MODE=PAPER`, `ALLOW_REAL_ORDERS=false` and both live-micro caps at `0` are unweakened; the only `ExecutionVenue` this package can construct is the simulated one, which refuses `EXECUTION_PROBE`, `LIVE_MICRO` and `LIVE` by name. | phase-4 governance |
 | **Fill-quality evidence** | **NONE EXISTS AND NONE IS CLAIMED.** Every fill here is Tier 0 — `deploymentDecisionUse: "FORBIDDEN"`, `calibration: "UNCALIBRATED_NO_PROBE_DATA_EXISTS"`. ADR-012 §2: "the simulator says it fills" is not a promotion argument. | ADR-012, phase-4 |
