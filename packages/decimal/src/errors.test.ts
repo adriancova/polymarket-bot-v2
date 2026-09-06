@@ -14,6 +14,10 @@
  * No arithmetic result, canonical grammar, or hash digest is affected by either
  * fix; this file asserts the taxonomy only.
  */
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import { divDecimal, divDecimalExact, mulDecimal } from "./arithmetic.js";
@@ -23,6 +27,7 @@ import {
   DecimalError,
   DecimalInexactError,
   DecimalRangeError,
+  HostilePrototypeError,
   InvalidDecimalStringError,
   InvalidTickSizeError,
   type DecimalErrorCode,
@@ -47,12 +52,40 @@ const PERMITTED_CODES: ReadonlyMap<string, readonly DecimalErrorCode[]> = new Ma
   ],
   [
     DecimalRangeError.name,
-    ["DECIMAL_OUT_OF_RANGE", "DECIMAL_INVALID_PRECISION"] satisfies DecimalErrorCode[],
+    [
+      "DECIMAL_OUT_OF_RANGE",
+      "DECIMAL_INVALID_PRECISION",
+      "DECIMAL_INVALID_OPTIONS",
+    ] satisfies DecimalErrorCode[],
   ],
   [DecimalDivisionByZeroError.name, ["DECIMAL_DIVISION_BY_ZERO"] satisfies DecimalErrorCode[]],
   [DecimalInexactError.name, ["DECIMAL_INEXACT"] satisfies DecimalErrorCode[]],
   [InvalidTickSizeError.name, ["DECIMAL_INVALID_TICK"] satisfies DecimalErrorCode[]],
+  [HostilePrototypeError.name, ["DECIMAL_HOSTILE_PROTOTYPE"] satisfies DecimalErrorCode[]],
 ]);
+
+/**
+ * Classes no THROW_SITE below can reach IN THIS PROCESS, and where each is
+ * reached instead.
+ *
+ * `HostilePrototypeError` is raised when an array-index name on
+ * `Array.prototype` can be neither redefined nor shadowed. "Cannot be
+ * redefined" means NON-CONFIGURABLE, and a non-configurable property is
+ * permanent: a row here would corrupt the worker for every file after it, and
+ * `WP-020-FU1` review round 1 recorded that vitest's own machinery breaks under
+ * exactly those shapes. So it is exercised where it can be — one child process
+ * per shape — and this map records the debt rather than letting the coverage
+ * sweep quietly stop meaning anything.
+ *
+ * The map is CHECKED, not merely written: the coverage test below reads the
+ * named file and requires it to name the class and the code. An exemption whose
+ * evidence file was deleted or renamed fails here.
+ */
+const UNREACHABLE_IN_PROCESS: ReadonlyMap<string, string> = new Map([
+  [HostilePrototypeError.name, "../../../test/unit/decimal/unneutralizable-shapes.test.ts"],
+]);
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 function captured(operation: () => unknown): DecimalError {
   try {
@@ -87,6 +120,23 @@ const THROW_SITES: ReadonlyArray<readonly [string, () => unknown]> = [
   ["divDecimalExact by zero", () => divDecimalExact("1", "0")],
   ["divDecimalExact non-terminating", () => divDecimalExact("1", "3")],
   ["divDecimal bad precision", () => divDecimal("1", "3", { precision: 0 })],
+  // `WP-020-FU1` / `GOV-2A` follow-up 5: at base each of these escaped the
+  // taxonomy — the first two as `decimal.js`'s own untyped
+  // `Error("[DecimalError] Invalid argument: rounding: …")`, the third as
+  // whatever the caller's getter threw, the fourth as a silent fall-back to the
+  // defaults. All four are now this package's typed refusal.
+  ["divDecimal bad rounding (out of range)", () => divDecimal("1", "3", { rounding: 99 as never })],
+  ["divDecimal bad rounding (not a number)", () => divDecimal("1", "3", { rounding: "x" as never })],
+  [
+    "divDecimal accessor option",
+    () =>
+      divDecimal("1", "3", {
+        get precision(): number {
+          throw new Error("a division option must never be able to run caller code");
+        },
+      }),
+  ],
+  ["divDecimal non-object options", () => divDecimal("1", "3", 4 as never)],
   ["mulDecimal overlong result", () => mulDecimal(`1${"0".repeat(600)}`, `1${"0".repeat(600)}`)],
   ["isTickConformant zero tick", () => isTickConformant("0.5", "0")],
   ["assertTickConformant off grid", () => assertTickConformant("0.075", "0.01")],
@@ -107,7 +157,28 @@ describe("typed-error taxonomy (handoff §21)", () => {
       THROW_SITES.map(([, operation]) => captured(operation).constructor.name),
     );
     for (const className of PERMITTED_CODES.keys()) {
-      expect(seen).toContain(className);
+      const elsewhere = UNREACHABLE_IN_PROCESS.get(className);
+      if (elsewhere === undefined) {
+        expect(seen).toContain(className);
+        continue;
+      }
+      // Exempt, but not unpinned: the file that reaches it must exist and must
+      // name both the class and its code.
+      const source = readFileSync(resolve(HERE, elsewhere), "utf8");
+      const codes = PERMITTED_CODES.get(className) ?? [];
+      expect(source, `${elsewhere} does not name ${className}`).toContain(className);
+      for (const code of codes) {
+        expect(source, `${elsewhere} does not name ${code}`).toContain(code);
+      }
+    }
+  });
+
+  it("exempts exactly the classes that no argument can reach", () => {
+    // A second exemption must be argued for, not slipped in: this pins the size
+    // and the membership of the escape hatch added by round-1 finding M1.
+    expect([...UNREACHABLE_IN_PROCESS.keys()]).toStrictEqual(["HostilePrototypeError"]);
+    for (const className of UNREACHABLE_IN_PROCESS.keys()) {
+      expect(PERMITTED_CODES.has(className)).toBe(true);
     }
   });
 });

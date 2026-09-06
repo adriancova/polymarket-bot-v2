@@ -4,18 +4,20 @@
  * Four families, and the bound each one establishes:
  *
  * 1. **Prototype pollution.** ADR-020 §1's measured classes, applied to the
- *    door and to a running strategy. The bound this package claims is narrower
- *    than "permission never varies with ambient prototype state", and the
- *    narrowing is measured rather than assumed: for NAMED string keys inherited
- *    by `Object.prototype` — enumerable and non-enumerable, including a required
+ *    door and to a running strategy. For NAMED string keys inherited by
+ *    `Object.prototype` — enumerable and non-enumerable, including a required
  *    grammar key, an inherited `get`, `_zod` and `toString`, and state/decision
  *    keys polluted around a running callback — permission does not vary and
- *    nothing throws. **NUMERIC-INDEX pollution is a measured and OPEN exposure**
- *    whose root cause is in `packages/decimal`: `subDecimal` throws when its
- *    result is exactly zero, and this package's guards turn that into a
- *    fail-closed refusal. The probe below asserts today's fail-closed direction
- *    as a DOCUMENTED EXPECTATION; `src/plain.ts` states both halves per
- *    ADR-020 §4.
+ *    nothing throws. **NUMERIC-INDEX pollution was a measured and OPEN exposure
+ *    and is now CLOSED** (`WP-020-FU1`): its root cause was in
+ *    `packages/decimal`, where one property at an index name reached
+ *    `decimal.js`'s digit arrays and made `subDecimal` throw on an exactly-zero
+ *    result — which this package's guards turned into a fail-closed refusal on
+ *    the ORDINARY entry path. The two probes below were promoted in that round
+ *    from DOCUMENTED EXPECTATIONS to ordinary permission-does-not-vary cases,
+ *    widened past the one index name `WP-220` measured, and they now assert
+ *    byte-identity of the decision rather than the direction of a refusal.
+ *    `src/plain.ts` states both halves per ADR-020 §4.
  * 2. **Wrong shapes.** `Map`, `Set`, `Date`, class instances, accessors,
  *    symbol keys, non-enumerable keys, `Proxy`, cycles, sparse arrays,
  *    `undefined` — refused, never coerced.
@@ -149,42 +151,51 @@ describe("hostile battery — prototype pollution (ADR-020 §1)", () => {
   });
 
   /**
-   * DOCUMENTED EXPECTATION, not an endorsement.
+   * PROMOTED (`WP-020-FU1`) — this used to be a DOCUMENTED EXPECTATION.
    *
-   * `Object.prototype["0"]` makes `subDecimal` throw whenever its exact result
-   * is zero — which the book walk hits on the ordinary path, when it consumes
-   * exactly the requested size. The throw is contained by `economics.ts`'s
-   * guard, so what the strategy DOES is refuse, with a recorded reason, where a
-   * clean process would have entered.
+   * WHAT IT USED TO SAY, and why it said it. `Object.prototype["0"]` made
+   * `subDecimal` throw whenever its exact result was zero — which the book walk
+   * hits on the ORDINARY path, when it consumes exactly the requested size —
+   * and `economics.ts`'s guard contained the throw, so the strategy REFUSED
+   * (`SB.REFUSED_BOOK_PARTICIPATION`) where a clean process would have entered.
+   * The test pinned that direction, said out loud that the class was open, and
+   * named the round that would close it (`WP-220` review round 1, M2).
    *
-   * This test pins the DIRECTION (fail-closed: an entry becomes a hold, no
-   * intent is emitted, nothing throws out of the callback) and will fail loudly
-   * if it ever changes. It does NOT claim the class is closed: the root cause is
-   * `packages/decimal`, outside WP-220's paths, and is tracked with two sibling
-   * decimal findings. When that round lands, this test should become an ordinary
-   * "permission does not vary" case alongside the named-key ones above.
+   * That round landed. `packages/decimal` no longer lets an index-named
+   * property on either prototype reach `decimal.js`'s digit arrays — the
+   * measurement, the root cause in the library, and the residual are in
+   * `packages/decimal/src/prototype-guard.ts` — so this is now an ordinary
+   * "permission does not vary" case: the strategy ENTERS, and the decision is
+   * BYTE-IDENTICAL to the clean one rather than merely fail-closed.
+   *
+   * The `"9"` value is kept deliberately: it is the digit the base defect
+   * fabricated, so a revert of the decimal fix turns this back into a refusal
+   * and fails here by name.
    */
-  it("numeric-index pollution fails CLOSED (open exposure; root cause in packages/decimal)", () => {
+  it("numeric-index pollution changes NOTHING: the entry is byte-identical", () => {
     const params = parsedParams(staticBracketParamsSchema);
     const clean = staticBracketStrategy.onFeatures(context(params, ARMED, {}));
     expect(clean.decisionType).toBe("enter");
 
-    const polluted = underPollution({ "0": "9" }, { enumerable: false }, () =>
-      staticBracketStrategy.onFeatures(context(params, ARMED, {})),
-    );
-
-    // Fail-closed: a refusal, recorded, with no intent — never a changed order.
-    expect(polluted.decisionType).toBe("hold");
-    expect(polluted.intents).toHaveLength(0);
-    expect(polluted.reasonCodes).toContain(REASONS.refusedParticipation);
-    // And the refusal is a REFUSAL, not a silent success or a thrown callback.
-    expect(polluted.reasonCodes).not.toContain(REASONS.entryIntentEmitted);
+    for (const enumerable of [true, false]) {
+      const polluted = underPollution({ "0": "9" }, { enumerable }, () =>
+        staticBracketStrategy.onFeatures(context(params, ARMED, {})),
+      );
+      expect(polluted.decisionType, `enumerable=${String(enumerable)}`).toBe("enter");
+      expect(polluted.intents).toHaveLength(clean.intents.length);
+      expect(polluted.reasonCodes).not.toContain(REASONS.refusedParticipation);
+      expect(polluted.reasonCodes).toContain(REASONS.entryIntentEmitted);
+      // Byte-identity, not just the same shape: the sized exit and the entry
+      // price are decimal results, and one fabricated digit would move them.
+      expect(JSON.stringify(polluted)).toBe(JSON.stringify(clean));
+    }
   });
 
   it("numeric-index pollution never turns a refusal into a permission", () => {
     // The direction that would actually be dangerous: pollution must not make
     // the door ACCEPT something it refuses cleanly, and must not make a holding
-    // instance emit a position-changing intent.
+    // instance emit a position-changing intent. Unchanged by the promotion
+    // above — it was true when the class was open and it is true now.
     const params = parsedParams(staticBracketParamsSchema);
     const observed = underPollution({ "0": "9" }, { enumerable: false }, () => ({
       refusedConfig: validateStaticBracketParams(configWith({ version: 99 })).ok,
@@ -196,6 +207,31 @@ describe("hostile battery — prototype pollution (ADR-020 §1)", () => {
     }));
     expect(observed.refusedConfig).toBe(false);
     expect(observed.openInstant.intents).toHaveLength(0);
+  });
+
+  it("the index-name class is closed at every index the walk can reach", () => {
+    // The promotion, widened past the one name `WP-220` measured: the book walk
+    // subtracts and compares at every level, so a battery pinned to `"0"` would
+    // not have seen the `"1"`/`"2"` fabrications the decimal round found.
+    const params = parsedParams(staticBracketParamsSchema);
+    const clean = JSON.stringify(staticBracketStrategy.onFeatures(context(params, ARMED, {})));
+    const moved: string[] = [];
+    for (const index of ["0", "1", "2", "3"]) {
+      for (const enumerable of [true, false]) {
+        const polluted = underPollution({ [index]: "9" }, { enumerable }, () =>
+          JSON.stringify(staticBracketStrategy.onFeatures(context(params, ARMED, {}))),
+        );
+        if (polluted !== clean) {
+          Object.defineProperty(moved, `${moved.length}`, {
+            value: `${index} | enumerable=${String(enumerable)}`,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
+        }
+      }
+    }
+    expect(moved).toEqual([]);
   });
 
   /**

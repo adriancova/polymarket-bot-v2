@@ -363,6 +363,24 @@ function candidateKeys(material: unknown, extra: readonly string[] = []): string
  * files), so the exclusion removes noise about third-party array machinery
  * without hiding a site of ours. It is recorded as a residual in
  * `docs/handoffs/WP-180.md`.
+ *
+ * WHAT `WP-020-FU1` CHANGED, and why this exclusion nevertheless stays. The
+ * SECOND reason above is now false for CONFIGURABLE shapes: `packages/decimal`
+ * neutralizes index names on both prototypes for the duration of every
+ * operation, so an inherited property no longer changes any arithmetic result.
+ * (It is not an absolute — a NON-CONFIGURABLE index name on `Array.prototype`
+ * can be neither redefined nor shadowed, and round 1 made that state a typed
+ * `HostilePrototypeError` refusal rather than a computed answer;
+ * `test/unit/decimal/unneutralizable-shapes.test.ts` measures all five shapes in
+ * child processes.) The FIRST is still true — `Array.prototype.push` remains
+ * `Set` — and `packages/risk` still accumulates with `push` in the TEN modules
+ * OUTSIDE `plain-data.ts`, across 77 `.push(` sites, while `plain-data.ts`'s own
+ * 23 appends were converted to `CreateDataProperty`. (That count said "eight"
+ * until round-1 finding L2; it had never been measured.) So the exclusion still
+ * removes real third-party and out-of-file noise from THIS sweep, and the class
+ * it excludes is measured directly instead, per shape and per index, in
+ * `test/unit/risk/index-name-pollution.test.ts` — including the remainder this
+ * file would otherwise be silently carrying.
  */
 const ARRAY_INDEX = /^(?:0|[1-9][0-9]*)$/u;
 
@@ -962,7 +980,20 @@ const SCENARIOS: readonly Scenario[] = [
   },
 ];
 
-describe("THE MECHANISM: an inherited property changes no public answer", () => {
+/**
+ * Wall-clock ceiling for the sweep, stated rather than defaulted
+ * (`WP-020-FU1` review round 1, finding M2).
+ *
+ * Each row below drives a whole risk door over every pollution shape and every
+ * key in its material, and the slowest measured 2862 ms under full-suite
+ * parallelism at the round-1 tip — 57% of vitest's 5 s default. That is close
+ * enough that a scheduler hiccup, not a defect, could turn this gate red, which
+ * is exactly what finding M2 caught happening to the ledger battery. The number
+ * is a ceiling that turns a hang into a diagnosis, not a runtime target.
+ */
+const SWEEP_TIMEOUT_MS = 60_000;
+
+describe("THE MECHANISM: an inherited property changes no public answer", { timeout: SWEEP_TIMEOUT_MS }, () => {
   for (const scenario of SCENARIOS) {
     it(`is unmoved by anything on Object.prototype: ${scenario.name}`, () => {
       expect(sweep(scenario)).toEqual([]);

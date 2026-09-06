@@ -61,6 +61,7 @@ export {
   DecimalError,
   DecimalInexactError,
   DecimalRangeError,
+  HostilePrototypeError,
   InvalidDecimalStringError,
   InvalidTickSizeError,
 } from "./errors.js";

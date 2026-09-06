@@ -86,8 +86,24 @@ const MODULES: readonly Module[] = [
     subpath: "./plain-data",
     file: "packages/risk/src/plain-data.ts",
     marker: /^import \{ types \} from "node:util";$/mu,
-    bodySha256: "a318a50100758ba968f0360795655d78dbb3ec86beebb861e0b1006793dc7826",
-    bodyBytes: 30_179,
+    // RE-DERIVED IN `WP-020-FU1`, the ONE change since the collapse.
+    //
+    // The collapse's claim was that the body is byte for byte what review
+    // rounds 4-9 left in the three deleted copies, and it held from
+    // `WP-180-FU2` through `WP-200-FU1`. `WP-200-FU1`'s review round 1 then
+    // ruled the module's whole APPEND surface in scope (GRANT-AND-WIDEN): 23
+    // `Array.prototype.push` sites became `CreateDataProperty` appends through
+    // the new `appendData`, because `push` is `Set` and `Set` consults the
+    // prototype chain for the INDEX name. So the pin moves ONCE, deliberately,
+    // in the round that was authorized to move it — from
+    // `a318a501…dc7826` / 30,179 bytes to the values below.
+    //
+    // Nothing else about this file's guards changed: the fingerprints below,
+    // the match thresholds, the alpha-rename replay, the recursive
+    // no-fourth-copy scan and the `exports`/consumer pins are all untouched,
+    // and all of them are re-run green in that round's transcript.
+    bodySha256: "1ddba9cd86beb12cf70ef2b5c22160f94085abca111c8a7f59c1a028fa26b3a9",
+    bodyBytes: 32_765,
   },
   {
     subpath: "./schema-arena",

@@ -66,6 +66,7 @@ import {
   sweep,
   sweepRequiredKeyWaiver,
   type Divergence,
+  type PollutionShape,
   type Scenario,
 } from "./pollution.js";
 
@@ -515,11 +516,14 @@ const KEY_MATERIAL: readonly string[] = candidateKeys(
  * a follow-up rather than fixed in this package. It is enumerated so it cannot
  * grow: any availability divergence at a NON-index name fails the battery.
  *
- * THE HONEST WIDTH OF THE CLASS, corrected in review round 1 (finding M2). The
+ * THE HONEST WIDTH OF THE CLASS, corrected in review round 1 (finding M2) and
+ * then SHRUNK in `WP-020-FU1` when the root cause was fixed.
+ *
+ * HISTORY, kept because it is the measurement that justified the follow-up. The
  * sentence this comment used to carry — that materializing a run mode "is a
  * pass-through for every legitimate call" — was measurably false, and the
  * battery could not have caught it, because index `"0"` was not in its material
- * and the two CONSTRUCTORS answer only at `"0"`:
+ * and the two CONSTRUCTORS answered only at `"0"`:
  *
  * ```text
  * get-only accessor at Object.prototype["0"]     base 761db76   tip 7d5ac34
@@ -528,15 +532,34 @@ const KEY_MATERIAL: readonly string[] = candidateKeys(
  *   emptyPnlState(valid identity)                bare TypeError PnlConfigurationError
  * ```
  *
- * So the class is TIP-ONLY for the two ledger constructors (base admitted the
- * honest call; the tip refuses it) and NOT new for `emptyPnlState`, where the
- * base already threw — untyped, an ADR-020 §6 ESCAPE — and the door converts it
- * into the documented typed channel. Both directions are fail-closed. The root
- * cause is one line of `packages/risk`: an append that must use
- * `CreateDataProperty` semantics instead of `Array.prototype.push`, the same fix
- * `pollution.ts`'s own `appendData` applies to this harness. That widening is
- * queued as a separate authorized round; this file's job is to keep the class
- * VISIBLE and BOUNDED until it lands.
+ * WHERE IT STANDS NOW (`WP-020-FU1`, measured by re-running this battery's own
+ * census with its scenarios and material UNCHANGED). That round converted
+ * `packages/risk/src/plain-data.ts`'s whole append surface — 23 sites — to
+ * `CreateDataProperty` appends, the same fix `pollution.ts`'s own `appendData`
+ * applies to this harness, and closed the sibling `packages/decimal` class in
+ * which one index-named property fabricated an arithmetic result. The class
+ * here shrank in three directions at once:
+ *
+ * ```text
+ *                              WP-200-FU1 tip 57bf5d3      WP-020-FU1 tip
+ *   shapes that move           7 (every measured shape)    2 (accessor-get-only,
+ *                                                             accessor-throws)
+ *   Ledger.empty / rebuild     REFUSED at "0"              OK — no answer moves
+ *   emptyPnlState              typed refusal at "0"        OK — no answer moves
+ * ```
+ *
+ * So EVERY DATA SHAPE is gone (an inherited data property at an index name no
+ * longer changes any answer, at any name, at any door), and the two
+ * constructors and `emptyPnlState` construct exactly as they do in a clean
+ * process. What REMAINS, and why it is not this repository's to close: the two
+ * shapes under which `Set` at an absent index CANNOT COMPLETE — a get-only
+ * accessor and a throwing one. Those still make an `Array.prototype.push`
+ * throw, and `zod` pushes into its own `issues: []` on every parse, as do the
+ * eight `packages/risk` modules outside the door's file and this package's own
+ * accumulators. The door catches it and answers with its own typed refusal, so
+ * the direction is unchanged: **availability, never permission, never an
+ * escape.** Enumerated below per shape, per property and per answer, so it
+ * cannot grow back.
  */
 function isArrayIndexName(property: string): boolean {
   return /^(?:0|[1-9][0-9]*)$/u.test(property);
@@ -567,7 +590,31 @@ function unexpected(divergences: readonly Divergence[]): readonly Divergence[] {
   });
 }
 
-describe("the measured-class battery over every `packages/ledger` door", () => {
+/**
+ * THE BOUND's wall-clock ceiling, stated rather than defaulted
+ * (`WP-020-FU1` review round 1, finding M2).
+ *
+ * These rows drive every door in the package over every pollution shape, so they
+ * are the slowest tests in the repository and the closest to vitest's 5 s
+ * default. Measured here, in isolation, on the round-1 bench machine:
+ *
+ * ```text
+ *   THE BOUND (isolated)      base b4ce0aa 1791 ms   round 0 2365 ms   round 1 2082 ms
+ *   THE BOUND (full suite, parallel)                                   round 1 4519 ms
+ * ```
+ *
+ * The round-0 index-name guard added ~1450 ns to every decimal operation and
+ * pushed this file's headroom from ~2.8x to ~2.1x; the round-1 fix recovers
+ * about half of that. Either way a GATE MUST NOT BE ONE SCHEDULER HICCUP FROM
+ * RED — the round-1 reviewer saw this file time out at the default, three runs
+ * out of three, in a loaded scratch tree. This ceiling is deliberately far above
+ * the measurement: it exists to convert a hang into a diagnosis, not to police
+ * the runtime. If a change makes these rows approach it, that is a signal about
+ * the change, not a reason to raise the number.
+ */
+const BOUND_TIMEOUT_MS = 60_000;
+
+describe("the measured-class battery over every `packages/ledger` door", { timeout: BOUND_TIMEOUT_MS }, () => {
   it("derives a non-trivial amount of key material from the inputs", () => {
     expect(KEY_MATERIAL.length).toBeGreaterThan(50);
     for (const required of ["marketId", "skipChecks", "optin", "optout", "when", "get", "values"]) {
@@ -599,43 +646,42 @@ describe("the measured-class battery over every `packages/ledger` door", () => {
         (property) => !isArrayIndexName(property),
       ),
     ).toEqual([]);
-    // … under any of the seven measured shapes.
+    // … under exactly TWO of the seven measured shapes.
     //
-    // THIS LIST GREW IN REVIEW ROUND 1 (finding M2), and the sentence it
-    // replaces was the second false claim this test carried: "a DATA property at
-    // an index name is shadowed by the array's own element and changes nothing".
-    // True at `"5"`, `"6"` and `"10"` — the only indices the derived material
-    // happened to contain — and FALSE at `"0"`, because an inherited data
-    // property at `"0"` is not shadowed on an EMPTY array. Measured at this tip
-    // with the battery's own scenarios UNCHANGED, so it is a property of the
-    // door and not of the rows added around it:
+    // THIS LIST GREW IN REVIEW ROUND 1 (finding M2) and SHRANK IN `WP-020-FU1`,
+    // and both movements were measured with the battery's own scenarios and key
+    // material UNCHANGED, so both are properties of the doors rather than of
+    // the rows added around them.
+    //
+    // What round 1 added, and what the sentence it replaced claimed falsely
+    // ("a DATA property at an index name is shadowed by the array's own element
+    // and changes nothing" — true at `"5"`, `"6"` and `"10"`, false at `"0"` on
+    // an EMPTY array):
     //
     //   Ledger.append(valid deposit) | 0 | data-E-1        -> AVAILABILITY
     //   Ledger.append(valid deposit) | 0 | data-NE-uuid    -> AVAILABILITY
     //   the honest fold              | 0 | fn-false        -> AVAILABILITY
     //
-    // Every one of them still lands on a typed refusal (below), so the class is
-    // wider than it was described but no weaker: fail-closed at every shape.
+    // Every one of those is GONE at this tip: `packages/risk`'s door no longer
+    // appends with `Set`, and `packages/decimal` no longer lets an index-named
+    // property reach `decimal.js`'s digit arrays. What remains is only the two
+    // shapes under which `Set` at an absent index CANNOT COMPLETE — a get-only
+    // accessor and a throwing one — which still defeat every
+    // `Array.prototype.push` in the process, `zod`'s `issues: []` included.
     expect([...new Set(divergences.map((divergence) => divergence.shape))].sort()).toEqual([
       "accessor-get-only",
       "accessor-throws",
-      "data-E-1",
-      "data-NE-optional",
-      "data-NE-true",
-      "data-NE-uuid",
-      "fn-false",
     ]);
-    // … and it always lands on a typed refusal, never a throw. The two
-    // `LedgerConfigurationError` entries are the CONSTRUCTORS' refusal channel
-    // (`emptyLedgerOrRefusal`): `Ledger.empty`/`Ledger.rebuild` answer with a
-    // documented typed throw rather than a `LedgerResult`, and only at `"0"`.
+    // … and it always lands on a typed refusal, never a throw.
+    //
+    // THE `REFUSED LedgerConfigurationError` ROW IS GONE TOO: it was the
+    // CONSTRUCTORS' refusal channel (`emptyLedgerOrRefusal`), and
+    // `Ledger.empty`/`Ledger.rebuild` now open exactly as they do in a clean
+    // process at every index name and every shape (pinned separately below).
     expect([...new Set(divergences.map((divergence) => divergence.polluted))].sort()).toEqual([
       "REFUSED LEDGER_INPUT_INVALID",
-      "REFUSED LEDGER_UNBALANCED_ASSET,LEDGER_ATTRIBUTION_PARITY_BROKEN",
-      "REFUSED LedgerConfigurationError",
       "REFUSED alloc:LEDGER_INPUT_INVALID",
-      "REFUSED append:LEDGER_INPUT_INVALID",
-      "REFUSED append:LEDGER_UNBALANCED_ASSET,LEDGER_ATTRIBUTION_PARITY_BROKEN",
+      "REFUSED post:LEDGER_INPUT_INVALID",
     ]);
     // Fail-closed, stated once more as a property rather than as a list: no
     // polluted answer is ever an acceptance, and none is ever a bare throw.
@@ -644,14 +690,23 @@ describe("the measured-class battery over every `packages/ledger` door", () => {
     }
   });
 
-  it("the constructors' index-`0` class is EXACTLY as disclosed, and only at `0`", () => {
-    // Non-vacuity for the disclosure at `isArrayIndexName`, pinned per name so
-    // it cannot quietly widen to another index or quietly disappear. This is the
-    // observation review round 1 finding M2 reproduced at this tip; the base
-    // half (`Ledger.empty` OK at `"0"`, `emptyPnlState` a BARE `TypeError`) is
-    // recorded in `ledger.ts` and `packages/pnl/src/state.ts` because it needs
-    // two commits at once and cannot be executed from one tree.
-    const answersAt = (property: string): readonly string[] => {
+  it("the constructors' index-`0` class is CLOSED: they open as in a clean process", () => {
+    // WAS: "EXACTLY as disclosed, and only at `0`", pinning the two
+    // `LedgerConfigurationError` refusals `WP-200-FU1` review round 1 (finding
+    // M2) measured. `WP-020-FU1` fixed the root cause — `packages/risk`'s door
+    // appended with `Array.prototype.push`, which is `Set`, which consults the
+    // chain for the index name — and the two refusals are gone, so the
+    // assertion is INVERTED rather than deleted: the constructors must now
+    // answer identically at `"0"`, which is the strongest form of this claim
+    // and the one that fails if the fix is reverted.
+    //
+    // The historical base/tip pairs stay in `ledger.ts` and
+    // `packages/pnl/src/state.ts` as history; what those comments CLAIM about
+    // the current state is updated in the same commit.
+    const answersAt = (
+      property: string,
+      shapes: readonly PollutionShape[],
+    ): readonly string[] => {
       const scenarios: readonly Scenario[] = [
         {
           name: "Ledger.empty",
@@ -674,20 +729,22 @@ describe("the measured-class battery over every `packages/ledger` door", () => {
           },
         },
       ];
-      return sweep(scenarios, [property], [GET_ONLY_SHAPE]).map(
+      return sweep(scenarios, [property], shapes).map(
         (divergence) => `${divergence.scenario} ${divergence.kind} ${divergence.polluted}`,
       );
     };
 
-    expect(answersAt("0")).toEqual([
-      "Ledger.empty AVAILABILITY REFUSED LedgerConfigurationError",
-      "Ledger.rebuild AVAILABILITY REFUSED LedgerConfigurationError",
-    ]);
-    // Not at the next index, and not at a non-index name: the class is the FIRST
-    // append the shared door makes, not "any inherited property".
-    expect(answersAt("1")).toEqual([]);
-    expect(answersAt("6")).toEqual([]);
-    expect(answersAt("environment")).toEqual([]);
+    // The name and shape the class lived at: nothing moves any more.
+    expect(answersAt("0", [GET_ONLY_SHAPE])).toEqual([]);
+    // And not under ANY measured shape, at any index or non-index name — the
+    // widened claim, which the narrow one could not have made.
+    for (const property of ["0", "1", "5", "6", "10", "environment"]) {
+      expect(answersAt(property, POLLUTION_SHAPES), property).toEqual([]);
+    }
+    // NON-VACUITY: the scenarios really do open a ledger, so the loop above is
+    // not passing because it measured nothing.
+    expect(emptyLedgerOrRefusal("PAPER")).not.toBe("REFUSED LedgerConfigurationError");
+    expect(Ledger.rebuild("PAPER", []).ok).toBe(true);
   });
 
   it("THE BOUND holds for the `optin`/`optout` PAIR (neither name alone flips it)", () => {

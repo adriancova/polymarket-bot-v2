@@ -439,7 +439,31 @@ function unexpected(divergences: readonly Divergence[]): readonly Divergence[] {
   });
 }
 
-describe("the measured-class battery over every `packages/pnl` door", () => {
+/**
+ * THE BOUND's wall-clock ceiling, stated rather than defaulted
+ * (`WP-020-FU1` review round 1, finding M2).
+ *
+ * THIS IS NOT A PRECAUTION — it is a fix for an observed red gate. Round 1 found
+ * that the round-0 index-name guard added ~1450 ns to every `packages/decimal`
+ * operation, and that its sibling `schema-boundary.test.ts` timed out at
+ * vitest's 5 s default in the reviewer's tree. Round 1 cut that overhead to
+ * ~340 ns and gave the sibling a ceiling; on the very next full-suite run THIS
+ * file's THE BOUND row failed instead:
+ *
+ * ```text
+ *   THE BOUND, packages/pnl        isolated 2196 ms … 3779 ms
+ *                                  full suite, parallel  > 5000 ms  TIMED OUT
+ * ```
+ *
+ * The row drives every `packages/pnl` door over every pollution shape, so its
+ * cost tracks the whole battery and its headroom at the default was never more
+ * than a scheduler hiccup. A gate that fails for a scheduling reason teaches
+ * everyone to ignore it. The ceiling is deliberately far above the measurement:
+ * it converts a hang into a diagnosis, not a runtime target.
+ */
+const BOUND_TIMEOUT_MS = 60_000;
+
+describe("the measured-class battery over every `packages/pnl` door", { timeout: BOUND_TIMEOUT_MS }, () => {
   it("derives a non-trivial amount of key material from the inputs", () => {
     expect(KEY_MATERIAL.length).toBeGreaterThan(50);
     for (const required of [

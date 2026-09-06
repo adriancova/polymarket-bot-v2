@@ -10,6 +10,23 @@
  * Tick *rounding* is intentionally not implemented here: which direction to
  * round is an execution-policy decision owned by the components that place
  * orders, not by the decimal foundation.
+ *
+ * Like `arithmetic.ts`, the two public entry points run inside {@link guarded}:
+ * `times`, `pow`, `modulo` and the comparison below all read and write
+ * `decimal.js` digit arrays at index names the array does not own, and at base
+ * one property at such a name on `Object.prototype` could make a value that is
+ * NOT on the tick grid look as though it were (see `prototype-guard.ts` for the
+ * measurement). A tick check is a §16.2 safety gate, so it is guarded for the
+ * same reason the arithmetic is.
+ *
+ * The same round-1 measurement found this module's worst shape: with a
+ * non-configurable SET-ONLY accessor at `Array.prototype["0"]`,
+ * `isTickConformant("0.37", "0.01")` answered `InvalidTickSizeError: tick size
+ * must be strictly positive, received "0.01"` — a WRONG-TYPED refusal about a
+ * tick size that is strictly positive, because the comparison itself had been
+ * corrupted. That state is now refused with `HostilePrototypeError`
+ * (`DECIMAL_HOSTILE_PROTOTYPE`) instead, so a tick verdict is never derived from
+ * a corrupted comparison.
  */
 
 import { Decimal } from "decimal.js";
@@ -20,6 +37,7 @@ import {
   type DecimalString,
 } from "./canonical.js";
 import { InvalidTickSizeError } from "./errors.js";
+import { guarded } from "./guarded.js";
 
 const IntegerDecimal = Decimal.clone({
   defaults: true,
@@ -60,16 +78,18 @@ function scaleToInteger(value: DecimalString, scale: number): Decimal {
  * @throws {InvalidTickSizeError} when `tickSize` is not strictly positive.
  */
 export function isTickConformant(value: DecimalString, tickSize: DecimalString): boolean {
-  const amount = assertCanonicalDecimalString(value, undefined, "isTickConformant(value)");
-  const tick = assertCanonicalDecimalString(tickSize, undefined, "isTickConformant(tickSize)");
-  if (new IntegerDecimal(tick).lessThanOrEqualTo(0)) {
-    throw new InvalidTickSizeError(
-      "DECIMAL_INVALID_TICK",
-      `tick size must be strictly positive, received "${tick}"`,
-    );
-  }
-  const scale = Math.max(decimalPlaces(amount), decimalPlaces(tick));
-  return scaleToInteger(amount, scale).modulo(scaleToInteger(tick, scale)).isZero();
+  return guarded(() => {
+    const amount = assertCanonicalDecimalString(value, undefined, "isTickConformant(value)");
+    const tick = assertCanonicalDecimalString(tickSize, undefined, "isTickConformant(tickSize)");
+    if (new IntegerDecimal(tick).lessThanOrEqualTo(0)) {
+      throw new InvalidTickSizeError(
+        "DECIMAL_INVALID_TICK",
+        `tick size must be strictly positive, received "${tick}"`,
+      );
+    }
+    const scale = Math.max(decimalPlaces(amount), decimalPlaces(tick));
+    return scaleToInteger(amount, scale).modulo(scaleToInteger(tick, scale)).isZero();
+  });
 }
 
 /**
