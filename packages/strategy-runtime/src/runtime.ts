@@ -1045,10 +1045,13 @@ class StrategyInstanceRuntime {
         // is not merely a belt: this is the one schema in the package that is
         // NOT an arena copy, so it is the one whose lazy normalization can still
         // throw out of `safeParse` instead of being returned by it. The schema
-        // is warmed at module load (`parse-door.ts`, review round 1 HIGH 1) so
-        // no measured input reaches this; the `catch` is what keeps a future
-        // throw attributed to THIS region instead of to `evaluate()`'s outer
-        // catch, which would name the callback rather than the parse.
+        // is warmed at module load (`parse-door.ts`, review round 1 HIGH 1),
+        // which closes the cold-lazy class — but the catch IS reachable: the
+        // disclosed `values`/availability residual still throws out of this
+        // parse, and the catch converts that escaping TypeError into a
+        // region-attributed refusal instead of `evaluate()`'s outer catch
+        // naming the callback. Defence-in-depth for attribution, not an
+        // unreachable branch (review round 2 LOW 2).
         return invalid(
           `reading the modelOutputs returned by strategy callback ${input.callback} threw ` +
             `(${describeCause(cause)}); a decision the runtime cannot read without executing ` +
@@ -1424,10 +1427,11 @@ function isolateStatePatch(returned: unknown, callback: StrategyCallbackName): I
     }
     // `defineProperty` with a prototype-free descriptor for EVERY key — it used
     // to be `__proto__` alone, with plain assignment for the rest. An own
-    // `__proto__` data property must land ON the copy (where the strict schema
-    // refuses it as an unrecognized key) rather than re-parenting it, and every
-    // OTHER key needs the same treatment for the reason `json.ts`'s header
-    // transcripts C1-C3 record.
+    // `__proto__` data property must land ON the copy as own data so nothing is
+    // re-parented (the library SKIPS that name at every level — it neither
+    // refuses nor emits it; the drop is `DECISION_FIELD_NAMES` plus the
+    // `dropOwnProtoKey` grammar axis), and every OTHER key needs the same
+    // treatment for the reason `json.ts`'s header transcripts C1-C3 record.
     Object.defineProperty(decision, key, ownDataDescriptor(value));
   }
   return { ok: true, decision, patch, modelOutputs };
