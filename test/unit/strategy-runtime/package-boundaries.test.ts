@@ -83,11 +83,20 @@ describe("acceptance 2: strategies cannot reach venue/storage adapters through p
     }
   });
 
-  it("the runtime's manifest dependency surface is EXACTLY domain + strategy-sdk (the pre-listed S1 edge)", () => {
+  it("the runtime's manifest dependency surface is EXACTLY domain + strategy-sdk (S1) + risk (S7)", () => {
+    // WIDENED 2026-09-05 by `WP-170-FU1`, and the widening is the ruling this
+    // assertion used to predate rather than a relaxation of it. §2.1 row **S7**
+    // (`packages/strategy-runtime` → `packages/risk`) exists so this package
+    // consumes the ONE canonical prototype-free parse door instead of copying
+    // it a fifth time (`schema-boundary.md` §5 items 2 and 5). The list stays
+    // EXACT — three names and no more — and the half this file cannot see, that
+    // the S7 edge carries the two door subpaths and never the risk ENGINE, is
+    // pinned by `./ports.test.ts`.
     const manifest = readManifest("packages/strategy-runtime/package.json");
     expect(manifest.name).toBe("@polymarket-bot/strategy-runtime");
     expect(Object.keys(manifest.dependencies ?? {}).sort()).toEqual([
       "@polymarket-bot/domain",
+      "@polymarket-bot/risk",
       "@polymarket-bot/strategy-sdk",
     ]);
     for (const dep of Object.keys(manifest.devDependencies ?? {})) {
@@ -137,10 +146,20 @@ describe("acceptance 2: strategies cannot reach venue/storage adapters through p
     }
   });
 
-  it("every runtime source import is relative, the domain entry point, or the SDK entry point", () => {
+  it("every runtime source import is relative, the domain/SDK entry point, or one of the two S7 door subpaths", () => {
+    // WIDENED 2026-09-05 by `WP-170-FU1`, exactly as far as §2.1 **S7** goes and
+    // no further: the two `packages/risk` DOOR SUBPATHS, enumerated one by one
+    // rather than by prefix (the `WP-180-FU2` idiom), so a bare
+    // `@polymarket-bot/risk` import of the engine root — or any future third
+    // subpath — still fails here as well as in `./ports.test.ts`.
     const files = sourceFiles("packages/strategy-runtime/src");
     expect(files.length).toBeGreaterThan(0);
-    const entryPoints = new Set(["@polymarket-bot/domain", "@polymarket-bot/strategy-sdk"]);
+    const entryPoints = new Set([
+      "@polymarket-bot/domain",
+      "@polymarket-bot/strategy-sdk",
+      "@polymarket-bot/risk/plain-data",
+      "@polymarket-bot/risk/schema-arena",
+    ]);
     for (const file of files) {
       for (const specifier of importSpecifiers(file)) {
         const allowed = specifier.startsWith("./") || entryPoints.has(specifier);

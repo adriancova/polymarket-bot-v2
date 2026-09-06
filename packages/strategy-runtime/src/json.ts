@@ -169,7 +169,63 @@
  * a flag). ECONOMIC values inside strategy state must be canonical decimal
  * strings by §6 invariant 1 — that is a strategy-discipline rule reviewed with
  * the strategy (the domain deliberately types `statePatch` as opaque).
+ *
+ * ---------------------------------------------------------------------------
+ * WP-170-FU1 (2026-09-05) — D1 IS NOW A PROTOTYPE-FREE MATERIALIZATION (D4)
+ * ---------------------------------------------------------------------------
+ *
+ * `docs/contracts/schema-boundary.md` §1 D1/D4. This walk always COPIED, which
+ * defeated adoption and loss on the value it read. What it did not do was build
+ * the copy safely or emit it safely, and three defeats were reproduced at base
+ * `53e9f62` against exactly this module:
+ *
+ * ```text
+ * C1  Object.prototype.marketId = { get(){…} }        (NE, get-only)
+ *       validateEvaluationInput(valid input)
+ *       clean → ok:true    polluted → THREW TypeError:
+ *         "Cannot set property marketId of #<Object> which has only a getter"
+ *       — an ESCAPED throw out of a function whose contract is "Never throws".
+ * C2  Object.prototype.marketId = { get(){…}, set(){…} }  (NE, accepting)
+ *       materializeEvaluationViewAt({ marketId:"x", other:1 })
+ *       clean → {"marketId":"x","other":1}
+ *       polluted → {"other":1}   setterCalls=1
+ *       — the copy LOST a property the input carried, and caller code ran
+ *         inside the door.
+ * C3  Object.prototype.get = 1                         (NE data)
+ *       materializeEvaluationViewAt(JSON.parse('{"__proto__":{"a":1}}'))
+ *       clean → ok:true    polluted → THREW TypeError: "Getter must be a
+ *         function: 1"  — the object-literal DESCRIPTOR is read with
+ *         HasProperty, so it walks the chain (`plain-data.ts`, round 8).
+ * D1  Object.prototype.sourceEvent = {…}               (NE data)
+ *       runtime.evaluate(valid input with NO sourceEvent)
+ *       clean → record.sourceEvent = undefined
+ *       polluted → the persisted record names an event that never existed
+ *       — the OUTPUT side: `buildRecord` reads `input.sourceEvent` off the
+ *         emitted snapshot, and an ordinary snapshot answers from the chain.
+ *         §6 invariant 4's traceability chain, fabricated.
+ * ```
+ *
+ * All four are one cause: the copy was an ORDINARY container, appended to by
+ * ASSIGNMENT, with descriptors written as object literals. Since this round
+ * every object copy is `Object.create(null)`, every append is
+ * `Object.defineProperty` with the prototype-free descriptor from
+ * `@polymarket-bot/risk/plain-data` (the §2.1 **S7** edge), and the emitted
+ * tree therefore answers an absent key `undefined` whatever a caller has put on
+ * `Object.prototype`.
+ *
+ * ARRAYS KEEP `Array.prototype`, deliberately and with the residual stated. A
+ * severed array is still an array exotic object, but it has no `map`, `filter`
+ * or `forEach` — and these copies are handed to STRATEGY code, which iterates
+ * them. So an array copy keeps its prototype and only its APPEND is changed
+ * from `push` (which is `Set`, and `Set` consults the chain for the INDEX name
+ * — the `WP-020-FU1`/`WP-200-FU1` index-`"0"` family) to `defineProperty` on
+ * the index name. What remains open, and is not this package's to close, is an
+ * inherited property at an index name being visible through an EMPTY array copy
+ * (`copy[0]`): that is the same index-name family the queued `packages/risk`
+ * grant-and-widen round owns.
  */
+
+import { ownDataDescriptor } from "@polymarket-bot/risk/plain-data";
 
 import { describeCause, describeLabel } from "./describe.js";
 
@@ -402,6 +458,53 @@ function attempt<T>(
   }
 }
 
+/**
+ * Appends `value` to `target` as an OWN DATA property at the index name.
+ *
+ * `Object.defineProperty`, never `target.push(value)` — WP-170-FU1, and it is
+ * the walks' OWN bookkeeping arrays this is about, not only the copies they
+ * build. `push` is `Set`, and `Set` consults the prototype chain for the INDEX
+ * NAME. Measured at base `53e9f62` with ONE non-enumerable accessor at `"0"` on
+ * `Object.prototype`:
+ *
+ * ```text
+ * Object.prototype["0"] = { get: () => "X", set() {} }
+ *   materializeEvaluationViewAt({})              → THREW TypeError:
+ *     "Cannot read properties of undefined (reading 'length')"
+ *   materializeEvaluationViewAt({ a: 1 })        → the same
+ *   materializeEvaluationViewAt([])              → the same
+ *   materializeEvaluationViewAt({ list:["a"] })  → the same
+ * ```
+ *
+ * The mechanism, because "an index name" sounds harmless: `stack.push(frame)`
+ * found the inherited SETTER, so no own `"0"` was created — while `length`
+ * still became 1 — and the very next `stack[stack.length - 1]` was answered by
+ * the inherited GETTER with the string `"X"`. The walk then read `frame.keys`
+ * off a string and threw out of a boundary whose whole contract is that it does
+ * not throw. Every container shape was affected, `{}` included.
+ *
+ * `defineProperty` has `CreateDataProperty` semantics: it defines on the object
+ * itself and consults no setter, inherited or otherwise. The array keeps
+ * `Array.prototype` — `pop`, `join` and `length` maintenance are all still the
+ * ordinary ones — and the descriptor is the prototype-free one from
+ * `plain-data.ts` for the reason recorded there.
+ */
+function appendOwn<T>(target: T[], value: T): void {
+  Object.defineProperty(target, String(target.length), ownDataDescriptor(value));
+}
+
+/**
+ * The top of a work stack, or `undefined` when it is empty.
+ *
+ * The length is checked FIRST. `stack[stack.length - 1]` on an empty array is a
+ * property read of `"-1"`, which walks the chain exactly like an index name
+ * does; an inherited `"-1"` would have been read as a frame. Cheap, total, and
+ * it removes a name from the reachable key material rather than pinning it.
+ */
+function topOf<T>(stack: readonly T[]): T | undefined {
+  return stack.length === 0 ? undefined : stack[stack.length - 1];
+}
+
 /** One open container in the iterative walk. */
 type Frame =
   | {
@@ -463,13 +566,13 @@ function materializeWith(root: unknown, rootPath: string, grammar: Grammar): Mat
         hasCompleted = true;
       } else {
         ancestors.add(step.frame.container);
-        stack.push(step.frame);
+        appendOwn(stack, step.frame);
         hasCompleted = false;
         continue;
       }
     }
 
-    const frame = stack[stack.length - 1];
+    const frame = topOf(stack);
     if (frame === undefined) {
       return { ok: true, value: completed };
     }
@@ -630,7 +733,10 @@ function openObjectFrame(source: object, path: string, grammar: Grammar): BeginR
       source: source as Record<PropertyKey, unknown>,
       keys: walked,
       path,
-      copy: {},
+      // D1/D4: the assembly target has NO PROTOTYPE, so no append can consult
+      // an inherited accessor and no consumer of the emitted copy can be
+      // answered from `Object.prototype` (transcripts C1/C2/D1 in the header).
+      copy: Object.create(null) as Record<PropertyKey, unknown>,
       index: 0,
     },
   };
@@ -669,29 +775,33 @@ function hiddenOwnPropertyProblem(
 
 function attachChild(frame: Frame, value: unknown): void {
   if (frame.kind === "array") {
-    frame.copy.push(value);
+    // `defineProperty` on the index name, never `push` — see {@link appendOwn}
+    // for the measurement. Defining an index property on an array still
+    // maintains `length`, so the copy is unchanged in every other respect.
+    appendOwn(frame.copy, value);
     return;
   }
   const key = frame.keys[frame.index - 1];
   if (key === undefined) {
     return;
   }
-  if (key === "__proto__") {
-    // `defineProperty`, not assignment: an own `__proto__` data property (which
-    // `JSON.parse` can produce and JSON serialization does emit) would trigger
-    // the inherited setter under `copy[key] = …` and silently move the property
-    // into the prototype instead of the copy. Every other key takes the plain
-    // assignment, which produces exactly the same writable/enumerable/
-    // configurable data property on a fresh object at a fraction of the cost.
-    Object.defineProperty(frame.copy, key, {
-      value,
-      writable: true,
-      enumerable: true,
-      configurable: true,
-    });
-    return;
-  }
-  frame.copy[key] = value;
+  // `defineProperty` with a PROTOTYPE-FREE descriptor, for EVERY key — not for
+  // `__proto__` alone, which is what this used to special-case (WP-170-FU1).
+  // Assignment is `Set`: on a prototype-bearing copy it invoked an inherited
+  // setter (transcript C2: the copy LOST `marketId` and caller code ran) or
+  // threw on a get-only one (C1: an escaped `TypeError` out of a "never
+  // throws" boundary). The DESCRIPTOR comes from `plain-data.ts` rather than
+  // being written as an object literal here, because a literal descriptor is
+  // read with `HasProperty` and walks the chain too (C3: an inherited `get`
+  // turned this very call into `TypeError: Getter must be a function`).
+  //
+  // DEFENCE IN DEPTH, and measured as such: reverting THIS line alone to
+  // `frame.copy[key] = value` is behaviourally inert at this tip (mutation M4:
+  // the suite stays green), because `openObjectFrame` now hands it a container
+  // with no chain for `Set` to walk. C1/C2/C3 are closed by the pair; either
+  // half alone is what a future edit would quietly remove, so both are here and
+  // the redundancy is stated rather than discovered.
+  Object.defineProperty(frame.copy, key, ownDataDescriptor(value));
 }
 
 function nextChild(frame: Frame, grammar: Grammar): NextChildResult {
@@ -904,22 +1014,25 @@ export function canonicalJsonStringify(value: unknown): string {
           );
         }
         ancestors.add(current);
-        stack.push(openSerializeFrame(current));
+        appendOwn(stack, openSerializeFrame(current));
         hasCompleted = false;
         continue;
       }
     }
 
-    const frame = stack[stack.length - 1];
+    // Length-checked, and appended by `defineProperty`, for the reason
+    // {@link appendOwn} records: an inherited accessor at an INDEX name
+    // defeated `push` on this walk's own stack and parts arrays too.
+    const frame = topOf(stack);
     if (frame === undefined) {
       return completed;
     }
     if (hasCompleted) {
       if (frame.kind === "array") {
-        frame.parts.push(completed);
+        appendOwn(frame.parts, completed);
       } else {
         const key = frame.keys[frame.index - 1] ?? "";
-        frame.parts.push(`${JSON.stringify(key)}:${completed}`);
+        appendOwn(frame.parts, `${JSON.stringify(key)}:${completed}`);
       }
       hasCompleted = false;
     }
@@ -940,7 +1053,7 @@ export function canonicalJsonStringify(value: unknown): string {
         // invalid text `[1,,3]` reaches a caller that skipped validation. That
         // behavior is preserved deliberately: the tests pin it as the reason
         // holes must be refused upstream.
-        frame.parts.push("");
+        appendOwn(frame.parts, "");
         continue;
       }
       cursor = { value: frame.source[index] };
@@ -991,6 +1104,9 @@ function openSerializeFrame(value: object): SerializeFrame {
  */
 export function deepFreeze<T>(value: T): T {
   const seen = new Set<object>();
+  // `[value]` is an array LITERAL, which creates its own index `"0"` and is
+  // therefore safe; every later append goes through {@link appendOwn} for the
+  // reason measured there.
   const stack: unknown[] = [value];
   while (stack.length > 0) {
     const current = stack.pop();
@@ -1004,7 +1120,7 @@ export function deepFreeze<T>(value: T): T {
     seen.add(asObject);
     Object.freeze(asObject);
     for (const key of Reflect.ownKeys(asObject)) {
-      stack.push((asObject as Record<PropertyKey, unknown>)[key]);
+      appendOwn(stack, (asObject as Record<PropertyKey, unknown>)[key]);
     }
   }
   return value;

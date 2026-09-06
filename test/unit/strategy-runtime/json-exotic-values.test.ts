@@ -185,7 +185,12 @@ describe("the checkpointable-state boundary materializes rather than trusting an
     // 1. What comes back is a COPY, not the caller's object.
     expect(copy.nested).not.toBe(proxy);
     expect(copy.nested).not.toBe(target);
-    expect(Object.getPrototypeOf(copy.nested)).toBe(Object.prototype);
+    // STRENGTHENED, `WP-170-FU1` (2026-09-05): this read `toBe(Object.prototype)`
+    // — the copy was an ordinary object. It is now prototype-FREE (D4,
+    // `schema-boundary.md` §1), which is the same claim ("what comes back is
+    // the runtime's own plain data, not the caller's object") made stronger:
+    // the copy can no longer answer an absent key from `Object.prototype`.
+    expect(Object.getPrototypeOf(copy.nested)).toBeNull();
 
     // 2. Freezing the copy — which is what the runtime does at commit — no
     //    longer touches the original at all, so the trap that used to throw
@@ -362,7 +367,11 @@ describe("the checkpointable-state boundary materializes rather than trusting an
       return;
     }
     const copy = result.value as object;
-    expect(Object.getPrototypeOf(copy)).toBe(Object.prototype);
+    // STRENGTHENED, `WP-170-FU1`: was `toBe(Object.prototype)`. The property
+    // this test exists for — `__proto__` lands as an OWN DATA property and
+    // nothing is re-parented — is unchanged and still asserted on the next
+    // line; what changed is that the copy now has no chain at all (D4).
+    expect(Object.getPrototypeOf(copy)).toBeNull();
     expect(Object.prototype.hasOwnProperty.call(copy, "__proto__")).toBe(true);
     expect(canonicalJsonStringify(copy)).toBe(canonicalJsonStringify(source));
     expect((({}) as Record<string, unknown>)["polluted"]).toBeUndefined();

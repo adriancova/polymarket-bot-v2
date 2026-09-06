@@ -806,6 +806,7 @@ describe("dependency-direction check — round-1 review regressions", () => {
         "S4",
         "S5",
         "S6",
+        "S7",
       ]);
       for (const row of report.allowlist) expect(row.layer).not.toBeNull();
     });
