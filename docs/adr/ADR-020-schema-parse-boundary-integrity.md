@@ -189,6 +189,20 @@ process. That is a superseding-ADR decision, not a package-level one.
 - It does **not** change `packages/domain`. The frozen schemas are correct as
   schemas; §1 is a statement about the library that runs them.
 
+**Amendment 2026-09-06 (measured scope correction; append-only).** The warmed
+arena protects the PARSE, not zod's ERROR CONSTRUCTION. A refusal is built
+lazily per call even on a warm schema, and that construction path reads
+through the prototype chain: under the descriptor-literal class (inherited
+`get`), `safeParse(INVALID)` can **throw** while assembling its issues,
+converting a clean refusal into an escaped exception. Measured at `WP-230`
+review round 1 on the trader's doors and independently confirmed by that
+round's reviewer. A CONFORMING door must therefore contain not only its parse
+but its refusal construction — inside `contained(...)` or equivalent
+exception containment; boundaries not yet through a door retain their
+`schema-boundary.md` §3 audit status, and this amendment adds an obligation
+to the door definition, not a claim about un-doored code. The class is
+recorded as a `docs/contracts/schema-boundary.md` §2 row (2026-09-06).
+
 ---
 
 ## Evidence

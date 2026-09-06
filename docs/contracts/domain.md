@@ -21,6 +21,7 @@ value, and how is it computed without binary floating point?*
 | `hash.ts` | Deterministic SHA-256 over the canonical form |
 | `tick.ts` | Exact tick conformance by integer modulo |
 | `errors.ts` | Typed errors with stable `code` values |
+| `prototype-guard.ts`, `guarded.ts` | Per-operation index-name neutralization and the `DECIMAL_HOSTILE_PROTOTYPE` refusal (§3.6; `WP-020-FU1`) |
 
 Dependencies: `decimal.js` and `node:crypto` only. `node:crypto` is used for a
 pure, synchronous SHA-256 computation; the package performs no I/O.
@@ -211,6 +212,29 @@ the larger of their decimal-place counts and takes an integer modulo. No
 floating point and no division rounding is involved, so `"0.07"` on a `"0.01"`
 grid is conformant, where `0.07 % 0.01` in IEEE-754 is not. A non-positive tick
 size throws `InvalidTickSizeError`.
+
+### 3.6 Hostile-prototype refusals (`prototype-guard.ts`) *(added 2026-09-06, `WP-020-FU1`, merged `edf6b1d`)*
+
+`decimal.js` (pinned exactly `10.6.0`) builds its results through JavaScript
+array operations that consult the prototype chain, so an array-index-named
+property planted on `Object.prototype` or `Array.prototype` (`"0"`, `"1"`,
+`"2"`, …) can corrupt or abort an otherwise-exact computation — part of the
+broader numeric-name pollution family measured across `WP-200-FU1`,
+`WP-020-FU1` and `WP-170-FU1` (`schema-boundary.md` §2). Every arithmetic and
+tick door in this package therefore runs inside
+`withNeutralIndexNames(operation, refuse)`: array-index-named own properties
+of both prototypes are neutralized for the duration of the operation and
+restored EXACTLY in a `finally` (an `Array.prototype` shadow fallback covers
+the non-writable case; an O(1) `Array.prototype.length === 0` pre-check keeps
+the clean path cheap). A shape the guard cannot neutralize — a
+non-configurable hostile descriptor — is refused with the typed
+`HostilePrototypeError`, code `DECIMAL_HOSTILE_PROTOTYPE`, never computed
+through: a wrong exact-decimal is worse than no answer. An operation with
+unneutralizable array-index pollution is refused before computation
+(availability-only, fail-closed). This guard covers **array-index names**;
+negative numeric names such as `"-1"` are not array indices, sit outside its
+regex, and are the separate walker-sentinel hazard `WP-170-FU1` guards
+per-site in `packages/strategy-runtime` (`topOf`).
 
 ---
 

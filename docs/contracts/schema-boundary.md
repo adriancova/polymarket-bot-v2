@@ -69,6 +69,14 @@ At the pinned `zod@4.4.3`. Every row was executed by `GOV-2A` against a
 | Descriptor literals | inherited `get` | every `Object.defineProperty` with an object-literal descriptor throws | no |
 | `values` | inherited `values` | fails **closed** (availability, not permission) | no |
 
+Two further classes were measured after `GOV-2A`, by the named work packages
+rather than by the `2d7e7da` transcripts, and bind the same way:
+
+| Class | Pollution | Effect | Warm-safe? |
+| --- | --- | --- | --- |
+| Numeric-name family *(measured by `WP-200-FU1`, `WP-020-FU1`, `WP-170-FU1`)* | a numeric-named property (`"0"`, `"1"`, …, and the non-index `"-1"`) on `Object.prototype` or `Array.prototype`, enumerable or not | not a zod-lazy class — it hits ANY code path that consults the prototype chain through array reads: `decimal.js` result assembly corrupts or aborts (array-index names — covered by `withNeutralIndexNames`, `domain.md` §3.6), iterative walkers throw or hang (`WP-170-FU1`'s walk-stack escape; its `topOf` `"-1"` hang — a NEGATIVE name outside the decimal guard's index regex, guarded per-site), constructors refuse (`WP-200-FU1`'s index-`0` interference). Guarded code fails closed (`DECIMAL_HOSTILE_PROTOTYPE`; typed refusals); unguarded code ESCAPES with bare `TypeError`s or hangs | n/a — schema warmth is irrelevant; the defense is prototype-free structures, `withNeutralIndexNames` for array-index names, or guards written per site |
+| Error construction *(measured by `WP-230` review r1; independently confirmed)* | any class above, present when a REFUSAL is being built | **the warmed arena protects the parse, not zod's error construction**: `safeParse(INVALID)` can THROW out of the refusal path (e.g. under inherited `get` — the descriptor-literal class — while zod assembles its issues), converting a clean refusal into an escaped exception | no — a warm schema still constructs errors lazily per refusal. A CONFORMING door must contain its refusal construction inside `contained(...)` or equivalent exception containment (ADR-020 amendment 2026-09-06); boundaries not yet through a door retain their §3 audit status |
+
 **The non-enumerable variant is the one to design against.** Enumerable
 pollution is loud: it breaks `for…in`, it trips `strictObject`, and it poisons
 cold lazies noisily. Non-enumerable pollution is read by every property read the
@@ -89,7 +97,7 @@ exists but the package's own structure keeps it off a decision;
 | `packages/domain` (frozen) | `Uuidv7Schema`, `IsoTimestampSchema`, `DecisionResultSchema` | caller/wire (every package parses through these) | **LIVE** — `skipChecks` makes both primitives accept `"NOT-A-UUID"` / `"yesterday"`; every required `DecisionResult` key is satisfiable from the prototype | **HIGH** (root cause; frozen path, so the fix is at the doors) | contract owner — closed by ADR-020 §3 at each door, **not** by editing the frozen package |
 | `packages/ledger` (`WP-200`, `7e75f9a`; door: `WP-200-FU1`, `a30fec8`) | every door (`validateTransactionInput`, `Ledger.empty/append/rebuild`, `allocateFill`, `buildFillPosting`, the eight `balance.ts` exports) | caller | **CLOSED** (2026-09-05) — D1–D4 through the canonical `packages/risk` door over §2.1 row S5, door-only pinned by `test/unit/ledger/ports.test.ts`. The original LIVE ×2 measurement (the non-enumerable `marketId` F16 defeat; non-enumerable `skipChecks` admitting garbage ids) reproduced at base `761db76` and refused at the tip; verified by two review rounds (r2: independent divergence census — zero PERMISSION, zero ESCAPE; honest fold byte-identical base→tip). Disclosed residual: a fail-closed availability class at index `"0"` (constructors refuse under inherited index-`0` interference; widening owned by the `packages/risk` grant-and-widen round) — `docs/handoffs/WP-200-FU1.md` | — | — |
 | `packages/pnl` (`WP-200`; door: `WP-200-FU1`, `a30fec8`) | every door (`applyPnlRecord`, `emptyPnlState`, `foldPnlRecords`, `computePnlSnapshot`, `PnlSettlementEvidence.from`, `toPnlSnapshotRow`) | caller | **CLOSED** (2026-09-05) — D1–D4 through the canonical `packages/risk` door over §2.1 row S6, same pins. The original LIVE classes reproduced at base and refused at the tip, including the cold-first-parse escaped `TypeError` and its permanent poisoning (the base also threw a bare `TypeError` from `emptyPnlState` under inherited index-`0` interference — a pre-existing escape the door converts into the typed `PnlConfigurationError` channel, measured in `WP-200-FU1` remediation r1 and confirmed in r2) | — | — |
-| `packages/strategy-runtime` (`WP-170`, `9d0971b`) | `validateEvaluationInput` / `acquireEvaluationInput`; the `DecisionResult` parse at `runtime.ts:918` | caller (strategy code) | **LIVE** — D1 is present (materialize-first) and defeats adoption/loss, but the format checks flow through raw domain schemas: under `skipChecks` an input with `evaluatedAt: "yesterday"` and a non-canonical uppercase `marketId` is **accepted**, so ADR-016's "refused, never case-folded" stops being enforced | **HIGH** — §6 invariant 3's one persisted decision, §6 invariant 4's traceability chain | **WP-170-FU1** (bounded, add D2/D3 to the existing materializer) |
+| `packages/strategy-runtime` (`WP-170`, `9d0971b`; door: `WP-170-FU1`, `d89841d`) | `validateEvaluationInput` / `acquireEvaluationInput`; the `DecisionResult` parse (now through `parse-door.ts`); the run-seed door; the raw `modelOutputs` parse | caller (strategy code) | **CLOSED** (2026-09-06) — D1–D4 through the canonical `packages/risk` door over `dependency-direction.md` §2.1 row S7, door-only pinned by `test/unit/strategy-runtime/ports.test.ts`. The original LIVE measurement (`skipChecks` admitting `evaluatedAt: "yesterday"` + an uppercase `marketId`) reproduced at base `53e9f62` and refused at the tip, along with ten further measured base defeats (five format-bearing scalars, the garbage-`DecisionResult` persistence, the run-seed door, the walk-stack index-name escape, 19 escaped zod error-construction TypeErrors) and a twelfth (enumerable-key availability) confirmed in review; two review rounds, r2 ACCEPT (the r1 HIGH cold-lazy poison on the `.pick` split and the r1 MEDIUM nested-`__proto__` emission both closed in remediation and verified by independent reproduction at base/candidate/tip). Disclosed residuals: a fail-closed availability class — non-enumerable inherited `values` CONTAINS an honest `modelOutputs` decision (closes with the queued `packages/risk` `ARENA_NODE_TYPES` widening, which also collapses the `modelOutputs` split); an own `__proto__` inside the input's `sourceEvent` persists verbatim (producer-side, base-identical, its own future round) — `docs/handoffs/WP-170-FU1.md` | — | — |
 | `apps/data-gateway` | `parseGatewayConfig` | caller (operator config) | **LIVE** ×2 — a get-only inherited `tickIntervalMs` defeats its `.default()` and the `dataLossBoundMs` startup check silently passes; an inherited `binance` block satisfies "at least one feed must be configured" | **MEDIUM** — startup-time, operator-supplied, unattended process | **WP-120-FU1** / the next bounded grant on `apps/data-gateway/**` |
 | `packages/event-bus` | `validateEnvelope` (Redis wire) | wire | **LIVE** — clean throws `EventBusEnvelopeError`; under non-enumerable `skipChecks` an envelope with `eventId: "not-a-uuid"`, `receivedAt: "yesterday"` is accepted. Returns the caller's own object, so adoption/loss do not apply to the output | **MEDIUM** — the trader's consumption boundary; ordering/dedup keys off these fields | **WP-060-FU1** / the next bounded grant on `packages/event-bus/**` |
 | `packages/features` (`WP-160`, `3d49946`) | `computeFeatureSnapshot` (no `zod`); `selectIndexedValues` | caller in, **caller out** | **LIVE (output side only)** — the package carries no runtime schema library and materializes inputs, but `selectIndexedValues` members are ordinary literals: under a non-enumerable inherited `reason` **both** members gain `reason`, and an `ABSENT` member gains a `value` | **MEDIUM** — these values are destined for PostgreSQL indexing next to decisions | **WP-160-FU1** (already carried as `WP-160` R1-L3; this round measured it independently) |
@@ -102,16 +110,18 @@ exists but the package's own structure keeps it off a decision;
 | `packages/risk`, `packages/capital-allocator` (`WP-180`, `98a6cc1`) | every door | caller | **CLOSED** — D1–D4. Probe K3 confirms the arena copy of a domain schema still refuses what the raw schema accepts under `skipChecks` | — | — |
 | `packages/execution-planner` (`WP-190`, `5aa11e3`) | every door | caller | **CLOSED** — same mechanism *(originally the third mirror; since the `WP-180-FU2` collapse, `625c83b`, it consumes the one canonical `packages/risk` door over §2.1 row S4 — corrected 2026-09-05)* | — | — |
 | `packages/storage-postgres`, `storage-wal`, `storage-parquet`, `observability` | *(none — there is no `zod` door in any of the four)* | — | **n/a — outside this class, measured.** None of the four declares `zod` in its `package.json` or imports it anywhere in `src/`, and none contains a schema parse. Every `.parse(` in their sources is `JSON.parse` or `Date.parse`: `storage-postgres/src/timestamps.ts:63`, `storage-wal/src/raw-frame.ts:149`, four sites in `storage-parquet` (`compactor.ts:759`, `wal-format.ts:517`, `testing/index.ts:43`, `compactor.test.ts:582`), six in `observability` (`soak-evidence.ts:290,293,525,526`, `soak-evidence.test.ts:17`, `render.test.ts:271`). **Corrected 2026-09-04 (`GOV-2A` remediation round 1)**: the original row asserted "one `.parse` each, on internally-constructed values" and a CONTAINED verdict for doors that do not exist — a measured-sounding verdict that was never measured. These packages **do** validate hand-written structures (`parseDatasetManifest`, the WAL frame validators, `parseSoakWindowEvidence`); that is a different class, is not what ADR-020 rules on, and was **not** measured here | — | none; recorded |
-| `packages/decimal` | no `zod` | — | n/a — but see `dependency-direction.md` §2.2 and `GOV-2A` `follow_up` 5 for the `divDecimal` explicit-options hazard | — | — |
+| `packages/decimal` | no `zod` | — | n/a — outside the zod class. *(Updated 2026-09-06: `GOV-2A` `follow_up` 5's `divDecimal` explicit-options hazard and the index-name family were both closed by `WP-020-FU1`, merged `edf6b1d` — every arithmetic/tick door now runs inside `withNeutralIndexNames` with exact `finally` restoration, and an unneutralizable non-configurable shape is refused typed (`HostilePrototypeError` / `DECIMAL_HOSTILE_PROTOTYPE`), never computed through; `decimal.js` pinned exactly `10.6.0`; `domain.md` §3.6)* | — | — |
 
 **The tally, and it is the number every other document must quote.** The table
-above carries **LIVE for ten merged packages and one app**:
-`packages/{domain,strategy-runtime,event-bus,features,order-book,
+above carries **LIVE for nine merged packages and one app**:
+`packages/{domain,event-bus,features,order-book,
 binance-adapter,coinbase-adapter,polymarket-public,universe,settlement}` and
-`apps/data-gateway`. Five packages are **CLOSED** (`risk`,
-`capital-allocator`, `execution-planner`, `ledger`, `pnl`), and five are
-**outside the class** (`decimal`, `storage-postgres`, `storage-wal`,
-`storage-parquet`, `observability` — no `zod` door). *(Recounted 2026-09-05:
+`apps/data-gateway`. Six packages are **CLOSED** (`risk`,
+`capital-allocator`, `execution-planner`, `ledger`, `pnl`,
+`strategy-runtime`), and five are **outside the class** (`decimal`,
+`storage-postgres`, `storage-wal`, `storage-parquet`, `observability` — no
+`zod` door). *(Recounted 2026-09-06: `strategy-runtime` flipped LIVE→CLOSED
+when `WP-170-FU1` merged (`d89841d`). Previously recounted 2026-09-05:
 `ledger` and `pnl` flipped LIVE→CLOSED when `WP-200-FU1` merged (`a30fec8`).
 Previously recounted 2026-09-04 in `GOV-2A` remediation round 1, whose
 round-1 headline said "five merged packages and one app" — it counted neither
@@ -162,9 +172,20 @@ statement of conformance.
    `packages/decimal` round (the invented `Object.prototype["0"]` on
    exactly-zero results; the `subDecimal` index-`0` throw; `follow_up` 5's
    `divDecimal` hazard).
-2. **`WP-170-FU1`** — `packages/strategy-runtime/**`: D2/D3 added to the
-   existing materializer, covering the `DecisionResult` parse at
-   `runtime.ts:918` and the six scalar identifier parses in `input.ts`.
+2. **`WP-170-FU1` — EXECUTED** (merged `d89841d`, 2026-09-06; two review
+   rounds, r2 ACCEPT; `docs/handoffs/WP-170-FU1.md`): D2/D3 through the
+   canonical `packages/risk` door over the new `dependency-direction.md`
+   §2.1 row S7, covering the
+   `DecisionResult` parse, the six scalar identifier parses, the run-seed
+   door and the `modelOutputs` split; eleven measured base defeats flipped
+   refused plus a twelfth confirmed in review; the r1 cold-lazy poison and
+   nested-`__proto__` emission closed in remediation. Successor obligations
+   it spawned: the `packages/risk` remainder round grows `ARENA_NODE_TYPES`
+   (`"null"`) — closing the `values` availability residual and collapsing
+   the `modelOutputs` split — and per ADR-021 re-types
+   `context.strategyInstanceId` to the arena `Uuidv7Schema`; the
+   input-snapshot `sourceEvent` `__proto__` question is its own future
+   measured round.
 3. **Recorder-pipeline hardening round** — `packages/{polymarket-public,
    binance-adapter,coinbase-adapter}/**` and `apps/data-gateway/**`: the routing
    adoptions (rtds `type`, coinbase `channel`), **binance's trade-payload
