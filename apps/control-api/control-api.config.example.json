@@ -1,0 +1,14 @@
+{
+  "bindHost": "127.0.0.1",
+  "bindPort": 9465,
+  "maxRequestBodyBytes": 65536,
+  "auditCapacity": 65536,
+  "traderHealth": { "kind": "none" },
+  "operators": [
+    {
+      "operatorId": "local-operator",
+      "token": "EXAMPLE-NOT-A-CREDENTIAL-replace-before-any-real-use-0000",
+      "grants": ["READ", "STRATEGY_CONTROL", "KILL_SWITCH"]
+    }
+  ]
+}

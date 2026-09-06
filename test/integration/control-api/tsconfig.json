@@ -1,0 +1,21 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": "../../..",
+    "paths": {
+      "@polymarket-bot/control-api": ["apps/control-api/src/index.ts"],
+      "@polymarket-bot/control-api/testing": ["apps/control-api/src/testing/index.ts"],
+      "@polymarket-bot/trader": ["apps/trader/src/index.ts"],
+      "@polymarket-bot/observability": ["packages/observability/src/index.ts"],
+      "@polymarket-bot/domain": ["packages/domain/src/index.ts"],
+      "@polymarket-bot/decimal": ["packages/decimal/src/index.ts"],
+      "@polymarket-bot/risk": ["packages/risk/src/index.ts"],
+      "@polymarket-bot/risk/plain-data": ["packages/risk/src/plain-data.ts"],
+      "@polymarket-bot/risk/schema-arena": ["packages/risk/src/schema-arena.ts"],
+      "@polymarket-bot/storage-postgres": ["packages/storage-postgres/src/index.ts"]
+    }
+  },
+  "include": ["."]
+}
