@@ -1,0 +1,1378 @@
+{
+  "checkpointInstants": [
+    "2026-05-01T09:00:01Z",
+    "2026-05-01T09:00:02Z",
+    "2026-05-01T09:00:02Z",
+    "2026-05-01T09:00:02Z",
+    "2026-05-01T09:00:02Z",
+    "2026-05-01T09:00:03Z",
+    "2026-05-01T09:00:03Z",
+    "2026-05-01T09:14:49Z",
+    "2026-05-01T09:14:49Z",
+    "2026-05-01T09:14:50Z",
+    "2026-05-01T09:14:50Z"
+  ],
+  "decisions": [
+    {
+      "attribution": "STRATEGY",
+      "callback": "onFeatures",
+      "decisionType": "hold",
+      "evaluatedAt": "2026-05-01T09:00:01Z",
+      "evaluationSeq": 0,
+      "featureSnapshotRef": "11d3a2502b9313b6c8a1f19460b6cf60748b82ac3ea82de3fe2e885563aa0de2",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {},
+      "reasonCodes": [
+        "SB.ARMED"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000004"
+    },
+    {
+      "attribution": "STRATEGY",
+      "callback": "onFeatures",
+      "decisionType": "enter",
+      "evaluatedAt": "2026-05-01T09:00:02Z",
+      "evaluationSeq": 1,
+      "featureSnapshotRef": "5cbfa9ddf504761d2e0cb0030bef4ace0e02505b6a7ae7e1763e292a41ee5079",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [
+        {
+          "expectedNetEdge": "7.7",
+          "intentId": "sb-entry-0-018f5c20-1000-7a10-8b00-000000000001",
+          "liquidityPreference": "TAKER_OK",
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "maximumBuyPrice": "0.35",
+          "maximumTotalCost": "18",
+          "tags": [
+            "static-bracket",
+            "sb.entry",
+            "sb.leg:YES",
+            "sb.order-type:FAK"
+          ],
+          "targetShares": "50",
+          "type": "POSITION",
+          "urgency": "IMMEDIATE",
+          "validUntil": "2026-05-01T09:00:32.000Z"
+        }
+      ],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {
+        "entryCost": "17.2",
+        "expectedNetEdge": "7.7",
+        "trigger": "0.344",
+        "worstPrice": "0.35"
+      },
+      "reasonCodes": [
+        "SB.ENTRY_TRIGGER_MET",
+        "SB.ENTRY_LEG_DIRECT",
+        "SB.ENTRY_INTENT_EMITTED"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000005"
+    },
+    {
+      "attribution": "STRATEGY",
+      "callback": "onFill",
+      "decisionType": "exit",
+      "evaluatedAt": "2026-05-01T09:00:02Z",
+      "evaluationSeq": 2,
+      "featureSnapshotRef": "5cbfa9ddf504761d2e0cb0030bef4ace0e02505b6a7ae7e1763e292a41ee5079",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [
+        {
+          "intentId": "sb-take-profit-1-018f5c20-1000-7a10-8b00-000000000001",
+          "liquidityPreference": "MAKER_ONLY",
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "minimumSellPrice": "0.5",
+          "tags": [
+            "static-bracket",
+            "sb.take-profit",
+            "sb.leg:YES"
+          ],
+          "targetShares": "-30",
+          "type": "POSITION",
+          "urgency": "PASSIVE",
+          "validUntil": "2026-05-01T09:00:32.000Z"
+        }
+      ],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {
+        "allocatedShares": "30",
+        "exitLimitPrice": "0.5",
+        "exitShares": "30",
+        "exitSide": "SELL"
+      },
+      "reasonCodes": [
+        "SB.ALLOCATION_CONFIRMED",
+        "SB.TAKE_PROFIT_INTENT",
+        "SB.EXIT_SIZED_TO_ALLOCATION"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": null
+    },
+    {
+      "attribution": "STRATEGY",
+      "callback": "onFill",
+      "decisionType": "hold",
+      "evaluatedAt": "2026-05-01T09:00:02Z",
+      "evaluationSeq": 3,
+      "featureSnapshotRef": "5cbfa9ddf504761d2e0cb0030bef4ace0e02505b6a7ae7e1763e292a41ee5079",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {},
+      "reasonCodes": [
+        "SB.ALLOCATION_CONFIRMED",
+        "SB.EXIT_ORDER_WORKING",
+        "SB.AWAITING_CANCEL_CONFIRMATION"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": null
+    },
+    {
+      "attribution": "STRATEGY",
+      "callback": "onOrderUpdate",
+      "decisionType": "hold",
+      "evaluatedAt": "2026-05-01T09:00:02Z",
+      "evaluationSeq": 4,
+      "featureSnapshotRef": "5cbfa9ddf504761d2e0cb0030bef4ace0e02505b6a7ae7e1763e292a41ee5079",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {},
+      "reasonCodes": [
+        "SB.ENTRY_ORDER_WORKING",
+        "SB.TERMINAL_ORDER_VIEW_ABSORBED",
+        "SB.ENTRY_ORDER_TERMINAL"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": null
+    },
+    {
+      "attribution": "STRATEGY",
+      "callback": "onFeatures",
+      "decisionType": "hold",
+      "evaluatedAt": "2026-05-01T09:00:03Z",
+      "evaluationSeq": 5,
+      "featureSnapshotRef": "83890e801124ec1753f04f43c4ecc0d2377ac2ba6e569de8b6a7436458cce683",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {},
+      "reasonCodes": [
+        "SB.EXIT_ORDER_WORKING",
+        "SB.AWAITING_CANCEL_CONFIRMATION"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000006"
+    },
+    {
+      "attribution": "STRATEGY",
+      "callback": "onOrderUpdate",
+      "decisionType": "hold",
+      "evaluatedAt": "2026-05-01T09:00:03Z",
+      "evaluationSeq": 6,
+      "featureSnapshotRef": "83890e801124ec1753f04f43c4ecc0d2377ac2ba6e569de8b6a7436458cce683",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {},
+      "reasonCodes": [
+        "SB.IDLE"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": null
+    },
+    {
+      "attribution": "STRATEGY",
+      "callback": "onFeatures",
+      "decisionType": "hold",
+      "evaluatedAt": "2026-05-01T09:14:49Z",
+      "evaluationSeq": 7,
+      "featureSnapshotRef": "d41741be3c424fcef584a99af1fab1285410bd25c5b845ee331590cae3adcb33",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {},
+      "reasonCodes": [
+        "SB.EXIT_CUTOFF",
+        "SB.RESOLUTION_HOLD_DISALLOWED",
+        "SB.AWAITING_CANCEL_CONFIRMATION"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000007"
+    },
+    {
+      "attribution": "STRATEGY",
+      "callback": "onOrderUpdate",
+      "decisionType": "hold",
+      "evaluatedAt": "2026-05-01T09:14:49Z",
+      "evaluationSeq": 8,
+      "featureSnapshotRef": "d41741be3c424fcef584a99af1fab1285410bd25c5b845ee331590cae3adcb33",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {},
+      "reasonCodes": [
+        "SB.IDLE"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": null
+    },
+    {
+      "attribution": "STRATEGY",
+      "callback": "onMarketClosing",
+      "decisionType": "hold",
+      "evaluatedAt": "2026-05-01T09:14:50Z",
+      "evaluationSeq": 9,
+      "featureSnapshotRef": "eba016864cc0a02898113787aa20874b505840244ec85d32162af7aee0eeb35d",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {},
+      "reasonCodes": [
+        "SB.EXIT_CUTOFF",
+        "SB.RESOLUTION_HOLD_DISALLOWED",
+        "SB.AWAITING_CANCEL_CONFIRMATION"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000008"
+    },
+    {
+      "attribution": "STRATEGY",
+      "callback": "onOrderUpdate",
+      "decisionType": "hold",
+      "evaluatedAt": "2026-05-01T09:14:50Z",
+      "evaluationSeq": 10,
+      "featureSnapshotRef": "eba016864cc0a02898113787aa20874b505840244ec85d32162af7aee0eeb35d",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "intents": [],
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelOutputs": {},
+      "reasonCodes": [
+        "SB.IDLE"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": null
+    }
+  ],
+  "events": [
+    {
+      "datasetRowOrdinal": 1,
+      "eventId": "018f5c20-9000-7a90-8b00-000000000001",
+      "eventType": "ReferenceTradeObserved",
+      "ingestSeq": "1",
+      "receivedAt": "2026-05-01T08:59:58.000Z",
+      "source": "binance"
+    },
+    {
+      "datasetRowOrdinal": 2,
+      "eventId": "018f5c20-9000-7a90-8b00-000000000002",
+      "eventType": "ReferenceTradeObserved",
+      "ingestSeq": "2",
+      "receivedAt": "2026-05-01T08:59:59.000Z",
+      "source": "binance"
+    },
+    {
+      "datasetRowOrdinal": 3,
+      "eventId": "018f5c20-9000-7a90-8b00-000000000003",
+      "eventType": "MarketOpened",
+      "ingestSeq": "3",
+      "receivedAt": "2026-05-01T09:00:00.000Z",
+      "source": "polymarket"
+    },
+    {
+      "datasetRowOrdinal": 4,
+      "eventId": "018f5c20-9000-7a90-8b00-000000000004",
+      "eventType": "BookSnapshot",
+      "ingestSeq": "4",
+      "receivedAt": "2026-05-01T09:00:01.000Z",
+      "source": "polymarket"
+    },
+    {
+      "datasetRowOrdinal": 5,
+      "eventId": "018f5c20-9000-7a90-8b00-000000000005",
+      "eventType": "BookSnapshot",
+      "ingestSeq": "5",
+      "receivedAt": "2026-05-01T09:00:02.000Z",
+      "source": "polymarket"
+    },
+    {
+      "datasetRowOrdinal": 6,
+      "eventId": "018f5c20-9000-7a90-8b00-000000000006",
+      "eventType": "BookLevelChanged",
+      "ingestSeq": "6",
+      "receivedAt": "2026-05-01T09:00:03.000Z",
+      "source": "polymarket"
+    },
+    {
+      "datasetRowOrdinal": 7,
+      "eventId": "018f5c20-9000-7a90-8b00-000000000007",
+      "eventType": "BookSnapshot",
+      "ingestSeq": "7",
+      "receivedAt": "2026-05-01T09:14:49.000Z",
+      "source": "polymarket"
+    },
+    {
+      "datasetRowOrdinal": 8,
+      "eventId": "018f5c20-9000-7a90-8b00-000000000008",
+      "eventType": "MarketClosing",
+      "ingestSeq": "8",
+      "receivedAt": "2026-05-01T09:14:50.000Z",
+      "source": "polymarket"
+    }
+  ],
+  "fills": [
+    {
+      "action": "BUY",
+      "atEventIngestSeq": "5",
+      "deploymentDecisionUse": "FORBIDDEN",
+      "evidenceClass": "SIMULATED_NOT_REAL_EVIDENCE",
+      "feeAmount": "0.131",
+      "fillModelVersion": "tier0.wp250",
+      "liquidityRole": "TAKER",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelTier": "TIER_0",
+      "planningDepthAwareness": "TOP_OF_BOOK_ONLY",
+      "price": "0.34",
+      "shares": "30",
+      "side": "YES",
+      "simulatedFillId": "9280f970-9280-7000-8000-000000002000:g0:o0/t0/0",
+      "simulatedOrderId": "9280f970-9280-7000-8000-000000002000:g0:o0",
+      "tokenId": "9001"
+    },
+    {
+      "action": "BUY",
+      "atEventIngestSeq": "5",
+      "deploymentDecisionUse": "FORBIDDEN",
+      "evidenceClass": "SIMULATED_NOT_REAL_EVIDENCE",
+      "feeAmount": "0.089",
+      "fillModelVersion": "tier0.wp250",
+      "liquidityRole": "TAKER",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "modelTier": "TIER_0",
+      "planningDepthAwareness": "TOP_OF_BOOK_ONLY",
+      "price": "0.35",
+      "shares": "20",
+      "side": "YES",
+      "simulatedFillId": "9280f970-9280-7000-8000-000000002000:g0:o0/t0/1",
+      "simulatedOrderId": "9280f970-9280-7000-8000-000000002000:g0:o0",
+      "tokenId": "9001"
+    }
+  ],
+  "goldenFormatVersion": 1,
+  "health": {
+    "accounting": {
+      "ledgerRefusals": 0,
+      "ledgerTransactions": 6,
+      "pnlRecords": 8,
+      "unattributedActivity": 0,
+      "unexplainedMovements": 0
+    },
+    "asOf": "2026-05-01T09:14:50Z",
+    "execution": {
+      "allocationsRefused": 0,
+      "cancelsConfirmed": 0,
+      "cancelsRejected": 0,
+      "cancelsRequested": 0,
+      "cancelsSilenceExceeded": 0,
+      "duplicateFillsRefused": 0,
+      "fillsObserved": 2,
+      "observeOnlyIntents": 0,
+      "plansBuilt": 1,
+      "plansRefused": 0,
+      "reservationsReleasedOnRefusal": 0,
+      "submissionsAccepted": 1,
+      "submissionsRefused": 0
+    },
+    "halts": [],
+    "healthy": true,
+    "loop": {
+      "containedEvaluations": 0,
+      "decisionsPersisted": 11,
+      "deliveriesSuppressedByHalt": 0,
+      "evaluations": 11,
+      "eventsAccepted": 8,
+      "eventsProcessed": 8,
+      "eventsRefused": 0,
+      "featureProjectionRefusals": 0,
+      "featureSnapshots": 11,
+      "refusedEvaluations": 0,
+      "snapshotsUnavailable": 3
+    },
+    "maximumRunMode": "PAPER",
+    "risk": {
+      "approvals": 1,
+      "evaluations": 2,
+      "recommendationsByAction": {},
+      "refusals": 1,
+      "refusalsByCode": {
+        "RISK_EDGE_INPUTS_MISSING": 1
+      },
+      "refusedExits": 1,
+      "refusedExitsByCode": {
+        "RISK_EDGE_INPUTS_MISSING": 1
+      }
+    },
+    "runMode": "PAPER",
+    "seams": {
+      "allocator": {
+        "applied": 1,
+        "open": 0,
+        "refusalsByCode": {},
+        "released": 1,
+        "reservedCollateral": "0"
+      },
+      "cancels": {
+        "confirmed": 0,
+        "pending": 0,
+        "rejected": 0,
+        "requested": 0,
+        "silenceExceeded": 0
+      },
+      "fills": {
+        "admitted": 2,
+        "evictions": 0,
+        "maximumRemembered": 100000,
+        "refused": 0,
+        "remembered": 2
+      },
+      "orderViews": {
+        "emitted": 4,
+        "repeats": 3,
+        "tracked": 1
+      },
+      "reservations": {
+        "open": 0,
+        "released": 1,
+        "reservedCollateral": "0",
+        "taken": 1
+      }
+    }
+  },
+  "ledgerProjection": {
+    "balances": [
+      {
+        "accountRef": "wp250-paper-account",
+        "assetId": "pUSD",
+        "assetKind": "COLLATERAL",
+        "balance": "-17.42",
+        "scope": "ACTUAL_ACCOUNT"
+      },
+      {
+        "accountRef": "wp250-paper-account",
+        "assetId": "token:9001",
+        "assetKind": "OUTCOME_TOKEN",
+        "balance": "50",
+        "scope": "ACTUAL_ACCOUNT"
+      },
+      {
+        "accountRef": "wp250-attribution-clearing",
+        "assetId": "pUSD",
+        "assetKind": "COLLATERAL",
+        "balance": "17.42",
+        "scope": "EXTERNAL_CLEARING"
+      },
+      {
+        "accountRef": "wp250-attribution-clearing",
+        "assetId": "token:9001",
+        "assetKind": "OUTCOME_TOKEN",
+        "balance": "-50",
+        "scope": "EXTERNAL_CLEARING"
+      },
+      {
+        "accountRef": "wp250-venue-clearing",
+        "assetId": "pUSD",
+        "assetKind": "COLLATERAL",
+        "balance": "17.2",
+        "scope": "EXTERNAL_CLEARING"
+      },
+      {
+        "accountRef": "wp250-venue-clearing",
+        "assetId": "token:9001",
+        "assetKind": "OUTCOME_TOKEN",
+        "balance": "-50",
+        "scope": "EXTERNAL_CLEARING"
+      },
+      {
+        "accountRef": "wp250-fee-expense",
+        "assetId": "pUSD",
+        "assetKind": "COLLATERAL",
+        "balance": "0.22",
+        "scope": "FEE_EXPENSE"
+      },
+      {
+        "accountRef": "wp250-paper-account",
+        "assetId": "pUSD",
+        "assetKind": "COLLATERAL",
+        "balance": "-17.42",
+        "scope": "VIRTUAL_STRATEGY"
+      },
+      {
+        "accountRef": "wp250-paper-account",
+        "assetId": "token:9001",
+        "assetKind": "OUTCOME_TOKEN",
+        "balance": "50",
+        "scope": "VIRTUAL_STRATEGY"
+      }
+    ],
+    "transactionCount": 6,
+    "unattributedActivity": 0,
+    "unexplainedMovements": 0,
+    "virtualPositions": [
+      {
+        "assetId": "pUSD",
+        "assetKind": "COLLATERAL",
+        "balance": "-17.42",
+        "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+        "marketId": "018f5c20-1000-7a10-8b00-000000000001"
+      },
+      {
+        "assetId": "token:9001",
+        "assetKind": "OUTCOME_TOKEN",
+        "balance": "50",
+        "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+        "marketId": "018f5c20-1000-7a10-8b00-000000000001"
+      }
+    ]
+  },
+  "ledgerTransactions": [
+    {
+      "accountRef": "wp250-paper-account",
+      "entries": [
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "-10.2",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "ACTUAL_ACCOUNT"
+        },
+        {
+          "accountRef": "wp250-venue-clearing",
+          "amount": "10.2",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "EXTERNAL_CLEARING"
+        },
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "-10.2",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": "018f5c20-3000-7a30-8b00-000000000003",
+          "scope": "VIRTUAL_STRATEGY"
+        },
+        {
+          "accountRef": "wp250-attribution-clearing",
+          "amount": "10.2",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "EXTERNAL_CLEARING"
+        }
+      ],
+      "environment": "PAPER",
+      "eventType": "TRADE_PRINCIPAL",
+      "fillId": "9280f970-9280-7000-8000-000000004000",
+      "ledgerTransactionId": "9280f970-9280-7000-8000-000000005000",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "occurredAt": "2026-05-01T09:00:02.000Z",
+      "sequence": 0,
+      "source": "internal"
+    },
+    {
+      "accountRef": "wp250-paper-account",
+      "entries": [
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "30",
+          "assetId": "token:9001",
+          "assetKind": "OUTCOME_TOKEN",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "ACTUAL_ACCOUNT"
+        },
+        {
+          "accountRef": "wp250-venue-clearing",
+          "amount": "-30",
+          "assetId": "token:9001",
+          "assetKind": "OUTCOME_TOKEN",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "EXTERNAL_CLEARING"
+        },
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "30",
+          "assetId": "token:9001",
+          "assetKind": "OUTCOME_TOKEN",
+          "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": "018f5c20-3000-7a30-8b00-000000000003",
+          "scope": "VIRTUAL_STRATEGY"
+        },
+        {
+          "accountRef": "wp250-attribution-clearing",
+          "amount": "-30",
+          "assetId": "token:9001",
+          "assetKind": "OUTCOME_TOKEN",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "EXTERNAL_CLEARING"
+        }
+      ],
+      "environment": "PAPER",
+      "eventType": "OUTCOME_TOKEN_RECEIPT",
+      "fillId": "9280f970-9280-7000-8000-000000004000",
+      "ledgerTransactionId": "9280f970-9280-7000-8000-000000006000",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "occurredAt": "2026-05-01T09:00:02.000Z",
+      "sequence": 1,
+      "source": "internal"
+    },
+    {
+      "accountRef": "wp250-paper-account",
+      "entries": [
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "-0.131",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "ACTUAL_ACCOUNT"
+        },
+        {
+          "accountRef": "wp250-fee-expense",
+          "amount": "0.131",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "FEE_EXPENSE"
+        },
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "-0.131",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": "018f5c20-3000-7a30-8b00-000000000003",
+          "scope": "VIRTUAL_STRATEGY"
+        },
+        {
+          "accountRef": "wp250-attribution-clearing",
+          "amount": "0.131",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "EXTERNAL_CLEARING"
+        }
+      ],
+      "environment": "PAPER",
+      "eventType": "PLATFORM_FEE",
+      "fillId": "9280f970-9280-7000-8000-000000004000",
+      "ledgerTransactionId": "9280f970-9280-7000-8000-000000007000",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "occurredAt": "2026-05-01T09:00:02.000Z",
+      "sequence": 2,
+      "source": "internal"
+    },
+    {
+      "accountRef": "wp250-paper-account",
+      "entries": [
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "-7",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "ACTUAL_ACCOUNT"
+        },
+        {
+          "accountRef": "wp250-venue-clearing",
+          "amount": "7",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "EXTERNAL_CLEARING"
+        },
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "-7",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": "018f5c20-3000-7a30-8b00-000000000003",
+          "scope": "VIRTUAL_STRATEGY"
+        },
+        {
+          "accountRef": "wp250-attribution-clearing",
+          "amount": "7",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "EXTERNAL_CLEARING"
+        }
+      ],
+      "environment": "PAPER",
+      "eventType": "TRADE_PRINCIPAL",
+      "fillId": "9280f970-9280-7000-8000-000000008000",
+      "ledgerTransactionId": "9280f970-9280-7000-8000-000000009000",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "occurredAt": "2026-05-01T09:00:02.000Z",
+      "sequence": 3,
+      "source": "internal"
+    },
+    {
+      "accountRef": "wp250-paper-account",
+      "entries": [
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "20",
+          "assetId": "token:9001",
+          "assetKind": "OUTCOME_TOKEN",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "ACTUAL_ACCOUNT"
+        },
+        {
+          "accountRef": "wp250-venue-clearing",
+          "amount": "-20",
+          "assetId": "token:9001",
+          "assetKind": "OUTCOME_TOKEN",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "EXTERNAL_CLEARING"
+        },
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "20",
+          "assetId": "token:9001",
+          "assetKind": "OUTCOME_TOKEN",
+          "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": "018f5c20-3000-7a30-8b00-000000000003",
+          "scope": "VIRTUAL_STRATEGY"
+        },
+        {
+          "accountRef": "wp250-attribution-clearing",
+          "amount": "-20",
+          "assetId": "token:9001",
+          "assetKind": "OUTCOME_TOKEN",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "EXTERNAL_CLEARING"
+        }
+      ],
+      "environment": "PAPER",
+      "eventType": "OUTCOME_TOKEN_RECEIPT",
+      "fillId": "9280f970-9280-7000-8000-000000008000",
+      "ledgerTransactionId": "9280f970-9280-7000-8000-00000000a000",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "occurredAt": "2026-05-01T09:00:02.000Z",
+      "sequence": 4,
+      "source": "internal"
+    },
+    {
+      "accountRef": "wp250-paper-account",
+      "entries": [
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "-0.089",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "ACTUAL_ACCOUNT"
+        },
+        {
+          "accountRef": "wp250-fee-expense",
+          "amount": "0.089",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "FEE_EXPENSE"
+        },
+        {
+          "accountRef": "wp250-paper-account",
+          "amount": "-0.089",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": "018f5c20-3000-7a30-8b00-000000000003",
+          "scope": "VIRTUAL_STRATEGY"
+        },
+        {
+          "accountRef": "wp250-attribution-clearing",
+          "amount": "0.089",
+          "assetId": "pUSD",
+          "assetKind": "COLLATERAL",
+          "instanceId": null,
+          "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+          "runId": null,
+          "scope": "EXTERNAL_CLEARING"
+        }
+      ],
+      "environment": "PAPER",
+      "eventType": "PLATFORM_FEE",
+      "fillId": "9280f970-9280-7000-8000-000000008000",
+      "ledgerTransactionId": "9280f970-9280-7000-8000-00000000b000",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "occurredAt": "2026-05-01T09:00:02.000Z",
+      "sequence": 5,
+      "source": "internal"
+    }
+  ],
+  "orders": [
+    {
+      "action": "BUY",
+      "atEventIngestSeq": "5",
+      "executionPlanId": "9280f970-9280-7000-8000-000000002000",
+      "executionStyle": "MARKETABLE_LIMIT",
+      "fillEstimateKind": "POINT",
+      "filledShares": "50",
+      "limitPrice": "0.35",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "plannedOrderId": "9280f970-9280-7000-8000-000000002000:g0:o0",
+      "postOnly": false,
+      "requestedShares": "50",
+      "side": "YES",
+      "simulatedOrderId": "9280f970-9280-7000-8000-000000002000:g0:o0",
+      "state": "FILLED",
+      "tokenId": "9001"
+    }
+  ],
+  "pnlRecords": [
+    {
+      "amount": null,
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "kind": "TRADE",
+      "price": "0.34",
+      "ref": "9280f970-9280-7000-8000-000000006000",
+      "scope": "VIRTUAL_STRATEGY",
+      "shares": "30",
+      "side": "BUY",
+      "tokenAssetId": "token:9001"
+    },
+    {
+      "amount": "0.131",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "kind": "FEE",
+      "price": null,
+      "ref": "9280f970-9280-7000-8000-000000007000",
+      "scope": "VIRTUAL_STRATEGY",
+      "shares": null,
+      "side": null,
+      "tokenAssetId": null
+    },
+    {
+      "amount": null,
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "kind": "TRADE",
+      "price": "0.35",
+      "ref": "9280f970-9280-7000-8000-00000000a000",
+      "scope": "VIRTUAL_STRATEGY",
+      "shares": "20",
+      "side": "BUY",
+      "tokenAssetId": "token:9001"
+    },
+    {
+      "amount": "0.089",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "kind": "FEE",
+      "price": null,
+      "ref": "9280f970-9280-7000-8000-00000000b000",
+      "scope": "VIRTUAL_STRATEGY",
+      "shares": null,
+      "side": null,
+      "tokenAssetId": null
+    }
+  ],
+  "pnlSnapshots": [
+    {
+      "accountRef": "wp250-paper-account",
+      "allInPnl": "-0.131",
+      "asOf": "2026-05-01T09:00:02Z",
+      "capitalCommitted": "10.2",
+      "coreNetPnl": "-0.131",
+      "denominationAsset": "pUSD",
+      "environment": "PAPER",
+      "estimatesByProgram": {},
+      "feesByScheduleVersion": {
+        "[\"pUSD\",\"\"]": "0.131"
+      },
+      "feesPaid": "0.131",
+      "grossTradingPnl": "0",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "realizedPnl": "0",
+      "realizedRewards": "0",
+      "rewardEstimateTotal": "0",
+      "rewardsByProgram": {},
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "scope": "VIRTUAL_STRATEGY",
+      "unrealizedPnlLiquidation": null,
+      "unrealizedPnlMidpoint": "0",
+      "unrealizedPnlModel": null,
+      "worstCaseResolutionPnl": "-10.2"
+    },
+    {
+      "accountRef": "wp250-paper-account",
+      "allInPnl": "0.08",
+      "asOf": "2026-05-01T09:00:02Z",
+      "capitalCommitted": "17.2",
+      "coreNetPnl": "0.08",
+      "denominationAsset": "pUSD",
+      "environment": "PAPER",
+      "estimatesByProgram": {},
+      "feesByScheduleVersion": {
+        "[\"pUSD\",\"\"]": "0.22"
+      },
+      "feesPaid": "0.22",
+      "grossTradingPnl": "0.3",
+      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+      "realizedPnl": "0",
+      "realizedRewards": "0",
+      "rewardEstimateTotal": "0",
+      "rewardsByProgram": {},
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "scope": "VIRTUAL_STRATEGY",
+      "unrealizedPnlLiquidation": null,
+      "unrealizedPnlMidpoint": "0.3",
+      "unrealizedPnlModel": null,
+      "worstCaseResolutionPnl": "-17.2"
+    }
+  ],
+  "reconciliation": [
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "entry.executable_price_notional",
+      "projected": "17.2",
+      "projectedSource": "persisted decision (runId 018f5c20-3000-7a30-8b00-000000000003, evaluationSeq 1) modelOutputs.trigger = 0.344, times the shares actually filled",
+      "quantity": "the notional the §9.5 executable-buy-price feature projected for the configured size",
+      "realized": "17.2",
+      "realizedSource": "Σ over the venue's fills of price × shares",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "entry.projected_cost",
+      "projected": "17.2",
+      "projectedSource": "persisted decision modelOutputs.entryCost",
+      "quantity": "the entry cost the strategy quoted before emitting the intent",
+      "realized": "17.2",
+      "realizedSource": "Σ over the venue's fills of price × shares",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "entry.shares",
+      "projected": "50",
+      "projectedSource": "the §7.7 POSITION intent's targetShares, as persisted with the decision",
+      "quantity": "the position size",
+      "realized": "50",
+      "realizedSource": "Σ over the venue's fills of shares",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "entry.worst_price",
+      "projected": "0.35",
+      "projectedSource": "persisted decision modelOutputs.worstPrice",
+      "quantity": "the worst per-share price the entry would pay",
+      "realized": "0.35",
+      "realizedSource": "the highest price among the venue's fills for this order",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "-0.8",
+          "mechanism": "COST_CAP_HEADROOM",
+          "note": "the cap was not reached: 17.2 of 18 was spent, leaving 0.8 of headroom. A cap is a bound, not a forecast."
+        }
+      ],
+      "difference": "-0.8",
+      "explained": true,
+      "id": "entry.cost_cap",
+      "projected": "18",
+      "projectedSource": "the POSITION intent's maximumTotalCost",
+      "quantity": "the §7.7 cost cap against what the entry actually cost",
+      "realized": "17.2",
+      "realizedSource": "Σ over the venue's fills of price × shares",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "entry.expected_net_edge_formula",
+      "projected": "7.7",
+      "projectedSource": "takeProfitPrice × shares − entryCost − (entryFeePerShare + exitFeePerShare) × shares, recomputed by this suite from the scenario's own configuration",
+      "quantity": "the strategy's expected net edge, recomputed from its documented formula",
+      "realized": "7.7",
+      "realizedSource": "the POSITION intent's expectedNetEdge, as persisted with the decision",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "-0.000274",
+          "mechanism": "FEE_ROUNDING_HALF_UP",
+          "note": "HALF_UP to 3 decimal places moved the exact 0.131274 to 0.131, a change of -0.000274, within the half-unit bound 0.0005"
+        }
+      ],
+      "difference": "-0.000274",
+      "explained": true,
+      "id": "fee.fill.9280f970-9280-7000-8000-000000002000:g0:o0/t0/0",
+      "projected": "0.131274",
+      "projectedSource": "recomputed exactly from the schedule formula shares × 0.0195 × price × (1 − price)",
+      "quantity": "the venue fee on 30 shares at 0.34",
+      "realized": "0.131",
+      "realizedSource": "the feeAmount the venue charged on this fill",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0.000275",
+          "mechanism": "FEE_ROUNDING_HALF_UP",
+          "note": "HALF_UP to 3 decimal places moved the exact 0.088725 to 0.089, a change of 0.000275, within the half-unit bound 0.0005"
+        }
+      ],
+      "difference": "0.000275",
+      "explained": true,
+      "id": "fee.fill.9280f970-9280-7000-8000-000000002000:g0:o0/t0/1",
+      "projected": "0.088725",
+      "projectedSource": "recomputed exactly from the schedule formula shares × 0.0195 × price × (1 − price)",
+      "quantity": "the venue fee on 20 shares at 0.35",
+      "realized": "0.089",
+      "realizedSource": "the feeAmount the venue charged on this fill",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0.169999",
+          "mechanism": "FEE_MODEL_BASIS",
+          "note": "the ad-valorem schedule's exact total is 0.219999; the per-share model's total is 0.05"
+        },
+        {
+          "amount": "0.000001",
+          "mechanism": "FEE_ROUNDING_HALF_UP",
+          "note": "rounding each fill HALF_UP to 3 places moved the exact total 0.219999 to 0.22"
+        }
+      ],
+      "difference": "0.17",
+      "explained": true,
+      "id": "fee.total_model_vs_venue",
+      "projected": "0.05",
+      "projectedSource": "entry.economics.entry_fee_per_share × shares — the strategy's configured constant",
+      "quantity": "the strategy's per-share fee model against what the venue actually charged",
+      "realized": "0.22",
+      "realizedSource": "Σ over the venue's fills of feeAmount",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "ledger.virtual_cash_delta",
+      "projected": "-17.42",
+      "projectedSource": "−(Σ fill notional + Σ charged fees), from the venue's own fills",
+      "quantity": "the instance's collateral movement",
+      "realized": "-17.42",
+      "realizedSource": "the §6 invariant 8 projection's VIRTUAL_STRATEGY collateral line, folded from the append-only ledger",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "ledger.virtual_token_balance",
+      "projected": "50",
+      "projectedSource": "Σ over the venue's fills of shares",
+      "quantity": "the instance's outcome-token position",
+      "realized": "50",
+      "realizedSource": "the §6 invariant 8 projection's VIRTUAL_STRATEGY outcome-token line",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "pnl.fees_paid",
+      "projected": "0.22",
+      "projectedSource": "Σ over the venue's fills of feeAmount",
+      "quantity": "fees, as the PnL engine folded them",
+      "realized": "0.22",
+      "realizedSource": "the last persisted PnL snapshot's feesPaid",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "pnl.capital_committed",
+      "projected": "17.2",
+      "projectedSource": "Σ over the venue's fills of price × shares",
+      "quantity": "capital committed to the open position",
+      "realized": "17.2",
+      "realizedSource": "the last persisted PnL snapshot's capitalCommitted",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "pnl.gross_trading",
+      "projected": "0.3",
+      "projectedSource": "realizedPnl + unrealizedPnlMidpoint, from the snapshot's own components",
+      "quantity": "§9.16's gross trading PnL identity",
+      "realized": "0.3",
+      "realizedSource": "the last persisted PnL snapshot's grossTradingPnl",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "pnl.core_net",
+      "projected": "0.08",
+      "projectedSource": "grossTradingPnl − feesPaid, from the snapshot's own components (rewards excluded entirely, and this run has none)",
+      "quantity": "§6 invariant 14's core net PnL identity",
+      "realized": "0.08",
+      "realizedSource": "the last persisted PnL snapshot's coreNetPnl",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "EXACT_NO_DIFFERENCE",
+          "note": "the two values agree exactly"
+        }
+      ],
+      "difference": "0",
+      "explained": true,
+      "id": "pnl.worst_case_resolution",
+      "projected": "-17.2",
+      "projectedSource": "realizedPnl − Σ open cost basis, the formula packages/pnl states, with the cost basis taken from the venue's fills",
+      "quantity": "the documented worst-case-resolution identity",
+      "realized": "-17.2",
+      "realizedSource": "the last persisted PnL snapshot's worstCaseResolutionPnl",
+      "residual": "0",
+      "unexplainedReasons": []
+    },
+    {
+      "contributions": [
+        {
+          "amount": "0",
+          "mechanism": "PROTECTIVE_EXIT_REFUSED_AT_RISK_SEAM",
+          "note": "the run's 1 refused protective exit(s) carry reason code(s) RISK_EDGE_INPUTS_MISSING, counted on the health surface. No exit order was ever submitted, so the projection has no realized counterpart and this row states an ABSENCE rather than a zero."
+        }
+      ],
+      "difference": null,
+      "explained": true,
+      "id": "exit.expected_net_edge",
+      "projected": "7.7",
+      "projectedSource": "the entry POSITION intent's expectedNetEdge, as persisted with the decision",
+      "quantity": "the round trip's expected net edge",
+      "realized": null,
+      "realizedSource": "no exit fill exists in this run",
+      "residual": null,
+      "unexplainedReasons": []
+    }
+  ],
+  "scenario": {
+    "accountRef": "wp250-paper-account",
+    "denominationAssetId": "pUSD",
+    "entryFeePerShare": "0.001",
+    "entryShares": "50",
+    "exitFeePerShare": "0.001",
+    "feeSchedule": {
+      "feeCurrency": "pUSD",
+      "makerFeeRate": "0",
+      "minimumChargedFee": "0",
+      "roundingDecimalPlaces": 3,
+      "roundingMode": "HALF_UP",
+      "snapshotVersion": "wp250.sim.2026-05-01",
+      "takerFeeRate": "0.0195"
+    },
+    "idNamespace": "wp-250-paper-e2e",
+    "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
+    "marketId": "018f5c20-1000-7a10-8b00-000000000001",
+    "maximumBuyPrice": "0.35",
+    "maximumTotalCost": "18",
+    "noTokenId": "9002",
+    "runId": "018f5c20-3000-7a30-8b00-000000000003",
+    "startingCash": "1000",
+    "takeProfitPrice": "0.5",
+    "triggerPriceLte": "0.35",
+    "yesTokenId": "9001"
+  },
+  "traces": [
+    {
+      "approvedIntentId": "9280f970-9280-7000-8000-000000001000",
+      "evaluationSeq": 1,
+      "executionPlanId": "9280f970-9280-7000-8000-000000002000",
+      "featureSnapshotRef": "5cbfa9ddf504761d2e0cb0030bef4ace0e02505b6a7ae7e1763e292a41ee5079",
+      "intentId": "sb-entry-0-018f5c20-1000-7a10-8b00-000000000001",
+      "ledgerFillId": "9280f970-9280-7000-8000-000000004000",
+      "ledgerTransactionIds": [
+        "9280f970-9280-7000-8000-000000005000",
+        "9280f970-9280-7000-8000-000000006000",
+        "9280f970-9280-7000-8000-000000007000"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000005",
+      "submissionAttemptId": "9280f970-9280-7000-8000-000000003000",
+      "venueFillId": "9280f970-9280-7000-8000-000000002000:g0:o0/t0/0",
+      "venueOrderId": "9280f970-9280-7000-8000-000000002000:g0:o0"
+    },
+    {
+      "approvedIntentId": "9280f970-9280-7000-8000-000000001000",
+      "evaluationSeq": 1,
+      "executionPlanId": "9280f970-9280-7000-8000-000000002000",
+      "featureSnapshotRef": "5cbfa9ddf504761d2e0cb0030bef4ace0e02505b6a7ae7e1763e292a41ee5079",
+      "intentId": "sb-entry-0-018f5c20-1000-7a10-8b00-000000000001",
+      "ledgerFillId": "9280f970-9280-7000-8000-000000008000",
+      "ledgerTransactionIds": [
+        "9280f970-9280-7000-8000-000000009000",
+        "9280f970-9280-7000-8000-00000000a000",
+        "9280f970-9280-7000-8000-00000000b000"
+      ],
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000005",
+      "submissionAttemptId": "9280f970-9280-7000-8000-000000003000",
+      "venueFillId": "9280f970-9280-7000-8000-000000002000:g0:o0/t0/1",
+      "venueOrderId": "9280f970-9280-7000-8000-000000002000:g0:o0"
+    }
+  ]
+}
