@@ -214,6 +214,109 @@ describe("parseTraderConfig", () => {
     expect(parsed.refusal.issues.join("\n")).toContain("cross-package conflict");
   });
 
+  /**
+   * Review round 2, MEDIUM-2 — the door's decimal grammar vs. the arithmetic's.
+   *
+   * At the r1 tip both decimal fields were hand-written regexes WIDER than
+   * `@polymarket-bot/decimal`'s canonical form, and the gap was measured end to
+   * end: `startingCash: "1000.00"` parsed `ok: true`, and the first fill threw
+   * `InvalidDecimalStringError: subDecimal(a): "1000.00" is not a canonical
+   * decimal string` out of `loop.drain()`, which has no `try`/`catch`. Fail-STOP
+   * rather than a wrong number — the decimal package refuses instead of coercing
+   * — but a refusal that names no field and arrives mid-run is not a door.
+   */
+  describe("economic fields are CANONICAL decimals, refused at the door", () => {
+    it("REFUSES a non-canonical `accounting.startingCash`, naming the field", () => {
+      const config = validConfig();
+      (config["accounting"] as Record<string, unknown>)["startingCash"] = "1000.00";
+      (config["simulation"] as Record<string, unknown>)["startingCash"] = "1000.00";
+      const parsed = parseTraderConfig(config);
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) return;
+      expect(parsed.refusal.code).toBe("TRADER_CONFIG_INVALID");
+      const issues = parsed.refusal.issues.join("\n");
+      expect(issues).toContain("accounting.startingCash");
+      expect(issues).toContain("simulation.startingCash");
+      // The message is the DECIMAL package's own, so the door and the
+      // arithmetic cannot state different rules.
+      expect(issues).toContain("canonical");
+    });
+
+    it("REFUSES the other non-canonical spellings the regex admitted", () => {
+      // Leading zeros, a trailing decimal point, a redundant fractional zero,
+      // a leading `+`, and `-0` for the SIGNED field.
+      const cases: readonly (readonly [string, string])[] = [
+        ["01000", "leading zero"],
+        ["1000.", "trailing point"],
+        ["0.0", "redundant fractional zero"],
+        ["+1000", "leading plus"],
+      ];
+      for (const [value] of cases) {
+        const config = validConfig();
+        (config["accounting"] as Record<string, unknown>)["startingCash"] = value;
+        (config["simulation"] as Record<string, unknown>)["startingCash"] = value;
+        expect(parseTraderConfig(config).ok).toBe(false);
+      }
+      const negativeZero = validConfig();
+      const scenarios = negativeZero["scenarios"] as Record<string, unknown>[];
+      if (scenarios[0] !== undefined) scenarios[0]["yesPriceShock"] = "-0";
+      expect(parseTraderConfig(negativeZero).ok).toBe(false);
+    });
+
+    it("REFUSES a NEGATIVE value where the field is non-negative", () => {
+      const config = validConfig();
+      (config["accounting"] as Record<string, unknown>)["startingCash"] = "-1";
+      (config["simulation"] as Record<string, unknown>)["startingCash"] = "-1";
+      const parsed = parseTraderConfig(config);
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) return;
+      expect(parsed.refusal.issues.join("\n")).toContain(">= 0");
+    });
+
+    it("ACCEPTS a canonical negative shock — the signed field is still signed", () => {
+      const config = validConfig();
+      const scenarios = config["scenarios"] as Record<string, unknown>[];
+      if (scenarios[0] !== undefined) scenarios[0]["yesPriceShock"] = "-0.1";
+      expect(parseTraderConfig(config).ok).toBe(true);
+    });
+
+    it("the canonical door is what makes the cross-field `===` sound", () => {
+      // Two spellings of ONE number can no longer reach `crossFieldRefusal`: the
+      // grammar refuses the non-canonical one first, so a document that passes
+      // it compares two strings that are equal exactly when the numbers are.
+      const config = validConfig();
+      (config["accounting"] as Record<string, unknown>)["startingCash"] = "1000";
+      (config["simulation"] as Record<string, unknown>)["startingCash"] = "1000.00";
+      const parsed = parseTraderConfig(config);
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) return;
+      // Refused by the GRAMMAR, not by the cross-field check — the two values
+      // are numerically equal, and calling that "inconsistent" would be wrong.
+      expect(parsed.refusal.code).toBe("TRADER_CONFIG_INVALID");
+    });
+
+    it("still REFUSES two genuinely different balances as INCONSISTENT", () => {
+      const config = validConfig();
+      (config["simulation"] as Record<string, unknown>)["startingCash"] = "999";
+      const parsed = parseTraderConfig(config);
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) return;
+      expect(parsed.refusal.code).toBe("TRADER_CONFIG_INCONSISTENT");
+    });
+
+    it("the canonical check is a CUSTOM check, and pollution does not skip it", () => {
+      // The rule now lives in a `superRefine`, which is exactly the class
+      // `schema-arena` records as having been silently disabled by an inherited
+      // `when: () => false`. Permission must not vary.
+      const config = validConfig();
+      (config["accounting"] as Record<string, unknown>)["startingCash"] = "1000.00";
+      (config["simulation"] as Record<string, unknown>)["startingCash"] = "1000.00";
+      expect(parseTraderConfig(config).ok).toBe(false);
+      cleanups.push(pollute("when", () => false));
+      expect(parseTraderConfig(config).ok).toBe(false);
+    });
+  });
+
   it("D1 — REFUSES a value that is not plain own data", () => {
     const config = validConfig();
     Object.defineProperty(config, "accounting", {

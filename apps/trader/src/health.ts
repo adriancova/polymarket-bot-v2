@@ -114,6 +114,18 @@ export interface ExecutionHealth {
    * its prior value is the same fact measured from the book.
    */
   readonly reservationsReleasedOnRefusal: number;
+  /**
+   * Intents a NON-OWNER instance emitted, which were never routed (§6 invariant
+   * 11, ADR-011 §5: a shadow instance "submits nothing").
+   *
+   * Review round 2, HIGH-1. Counted rather than dropped silently: an operator
+   * who configured `ownership: "SHADOW"` and sees no fills is entitled to tell
+   * "the strategy emitted nothing" from "the process declined to route what it
+   * emitted", and those two states are otherwise identical on this surface. The
+   * decisions themselves are still persisted, so the intents are also visible
+   * on the decision log — this counter is the routing side of the same fact.
+   */
+  readonly observeOnlyIntents: number;
 }
 
 /** Counters for the loop itself and the strategy runtime it drives. */
@@ -251,6 +263,7 @@ export class HealthState {
     cancelsSilenceExceeded: 0,
     allocationsRefused: 0,
     reservationsReleasedOnRefusal: 0,
+    observeOnlyIntents: 0,
   };
 
   #accounting = {

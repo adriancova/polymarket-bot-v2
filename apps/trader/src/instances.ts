@@ -31,6 +31,19 @@
  *    ownership too, and a process that started with two owners would be a
  *    process whose §8.2 order is the only thing keeping them apart.
  *
+ * ## What `SHADOW` means in THIS process (review round 2, HIGH-1)
+ *
+ * **Observe-only.** A `SHADOW` instance is registered, ordered, evaluated in its
+ * §8.2 position and its `DecisionResult`s are persisted — ADR-011 §5's "they
+ * evaluate, produce decisions, and write records" — and `loop.ts` routes NONE of
+ * its intents: no allocator commitment, no plan, no order, no fill. That is the
+ * other half of the same sentence ("they do not consume venue rate limits,
+ * because they submit nothing") and the only honest reading available here,
+ * because this process holds ONE cash balance, ONE ledger and ONE venue. ADR-011
+ * §1's "independent accounting" needs a second book, and there is not one; a
+ * non-owner routed into the shared one is a live trade wearing a shadow label,
+ * which is precisely the defect that made this paragraph necessary.
+ *
  * The registry holds no clock, no I/O and no venue surface. It owns the
  * `StrategyInstanceRuntime` handle each instance evaluates through and the
  * instance's configured identity, and nothing else.
@@ -38,6 +51,12 @@
 
 import type { StrategyInstanceRuntime } from "@polymarket-bot/strategy-runtime";
 
+/**
+ * `OWNER` trades; `SHADOW` observes.
+ *
+ * See the module header: a `SHADOW` instance evaluates and persists decisions,
+ * and `loop.ts` routes none of its intents (§6 invariant 11, ADR-011 §5).
+ */
 export type Ownership = "OWNER" | "SHADOW";
 
 export interface RegisteredInstance {

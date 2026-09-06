@@ -131,6 +131,7 @@ import { buildStrategyFeatureView, projectFeatureValues } from "./projection.js"
 import { BoundedQueue, type QueueMetrics } from "./queue.js";
 import { ReferenceState } from "./reference-state.js";
 import { ReservationBook } from "./reservations.js";
+import { TRADER_RUN_MODE } from "./safety.js";
 import { normalizeToStrictUtc } from "./time.js";
 import type { Ledger } from "@polymarket-bot/ledger";
 
@@ -966,7 +967,43 @@ export class CoreLoop {
     );
   }
 
-  /** §8.1 steps 6-9 for one intent. */
+  /**
+   * §8.1 steps 6-9 for one intent.
+   *
+   * ## The ownership gate (review round 2, HIGH-1)
+   *
+   * §6 invariant 11: "One active live strategy owns a market in v1. **Other
+   * strategies may observe or run in shadow mode.**" ADR-011 §1 spells out what
+   * the second half means for a process, and §5 spells out its observable
+   * consequence:
+   *
+   * > "Shadow instances still consume resources. They evaluate, produce
+   * > decisions, and write records; **they do not consume venue rate limits,
+   * > because they submit nothing.**"
+   *
+   * A non-`OWNER` instance therefore stops HERE, before an approved-intent id
+   * is minted. Everything §8.1 puts BEFORE this point still happens for it — it
+   * is evaluated in its §8.2 position, its `DecisionResult` is persisted, its
+   * intents are recorded on the decision — and everything after it does not: no
+   * allocator commitment, no risk approval, no plan, no order, no fill, no
+   * ledger posting, no cash movement.
+   *
+   * WHY OBSERVE-ONLY RATHER THAN A SHADOW BOOK. ADR-011 §1 describes `SHADOW`
+   * as "live data, simulated execution, **independent accounting**", and this
+   * process has no second book to be independent of the first: one `#cash`, one
+   * `Ledger`, one `SimulatedVenue`, shared by every instance. Routing a
+   * non-owner's intent into them and calling the result "shadow" is what
+   * produced HIGH-1 — the caps, the collateral check and ADR-011's own
+   * ownership gate were all evaluated against a book the order did not execute
+   * against. Until a genuinely separate book exists, the truthful reading of
+   * invariant 11 with the machinery this process has is the one ADR-011 §5
+   * already states: a shadow instance submits nothing.
+   *
+   * The counted refusal is deliberate. A silently dropped intent is
+   * indistinguishable from a strategy that emitted none, and an operator who
+   * configured `ownership: "SHADOW"` expecting fills is entitled to see the
+   * number of intents this process declined to route.
+   */
   async #routeIntent(input: {
     readonly instance: RegisteredInstance;
     readonly market: MarketState;
@@ -977,6 +1014,10 @@ export class CoreLoop {
     readonly instant: string;
     readonly epochMs: number;
   }): Promise<void> {
+    if (input.instance.ownership !== "OWNER") {
+      this.#options.health.countExecution("observeOnlyIntents");
+      return;
+    }
     const approvedIntentId = this.#options.ids.next();
     const marketConfig = input.market.config;
     const projection = projectionOf(this.#ledger);
@@ -991,7 +1032,7 @@ export class CoreLoop {
     const allocation = this.#options.allocator.evaluate({
       intent: input.intent,
       instanceId: input.instance.instanceId,
-      accountingMode: accountingModeFor(input.instance),
+      accountingMode: SHARED_BOOK_ACCOUNTING_MODE,
       liveOwners: this.#liveOwners(),
       projection,
       availableCollateral: this.#cash,
@@ -1006,7 +1047,11 @@ export class CoreLoop {
       intent: input.intent,
       evaluatedAt: input.instant,
       approvedIntentId,
-      runMode: "PAPER",
+      // §11 / ADR-010: the ONE mode `safety.ts` lets this process start in. The
+      // constant rather than a literal (review round 2, note N4) so the mode the
+      // risk engine judges against and the mode the startup gate enforced are
+      // the same symbol — a literal here could drift from the gate silently.
+      runMode: TRADER_RUN_MODE,
       strategyInstanceId: input.instance.instanceId,
       runStatePermitsIntent: !this.#options.halts.anyHalt,
       strategyStatePermitsIntent: input.instance.runtime.instanceStatus() === "ACTIVE",
@@ -1139,7 +1184,7 @@ export class CoreLoop {
         request: requestFor({
           reservationId: requirement.reservationId,
           instanceId: input.instance.instanceId,
-          accountingMode: accountingModeFor(input.instance),
+          accountingMode: SHARED_BOOK_ACCOUNTING_MODE,
           leg: {
             marketId: requirement.marketId,
             side: requirement.side,
@@ -1865,18 +1910,37 @@ function affectedMarketIds(payload: unknown): readonly string[] {
 }
 
 /**
- * The §9.7 accounting mode one instance commits under.
+ * The §9.7 accounting mode every commitment this process makes is booked under.
  *
- * §8.2: "V1 prevents multiple live owners of one market, but shadow instances
- * may still evaluate after the owner." A SHADOW instance's commitments are kept
- * in `packages/capital-allocator`'s independent shadow book and never touch
- * live collateral, inventory or caps — which is §9.7's "preserves independent
- * shadow accounting", read off the ownership the registry already records
- * rather than decided again here.
+ * **A CONSTANT, and review round 2's HIGH-1 is why.** At the r1 tip this was a
+ * function of the emitting instance's ownership — `OWNER → LIVE`,
+ * `SHADOW → SHADOW` — with a docstring claiming a SHADOW instance's commitments
+ * "never touch live collateral, inventory or caps". That claim was MEASURED
+ * FALSE on all three: `packages/capital-allocator`'s SHADOW arm skips the entire
+ * LIVE block (the ADR-011 ownership gate, the live-micro fence and the
+ * collateral/inventory sufficiency checks) and compares caps against that
+ * instance's own shadow book, while THIS process went on to plan the order
+ * (`pipeline.ts` states `accountingMode: "LIVE"` for the planner), submit it to
+ * the one `SimulatedVenue`, debit the one `#cash` and book it to the one
+ * `Ledger`. With `globalAccountCap: "20"` and two markets, an OWNER pair filled
+ * once and refused the second `CAPITAL_GLOBAL_CAP_EXCEEDED`; flipping the second
+ * instance to `SHADOW` filled BOTH — 34 pUSD committed, zero allocator refusals,
+ * on a market whose `ownerOf` was `undefined`.
+ *
+ * This process has exactly ONE book. `#cash`, the `Ledger` and the venue are
+ * shared by every instance, so a commitment that reaches them is a real
+ * commitment against the real account whatever instance it is ATTRIBUTED to,
+ * and it is evaluated as one. `SHADOW` is the allocator's independent-shadow-
+ * accounting arm (§9.7) and belongs to a caller that HAS a separate book; this
+ * one does not, so it never asks for it. The instances that would have used it
+ * do not reach here at all — see `CoreLoop`'s `#routeIntent` ownership
+ * gate, which is the primary remedy; this constant is the SECOND layer ADR-011
+ * §1 asks for ("Enforcement is layered, so a bug in one layer does not create
+ * real exposure"): anything that does reach the allocator is judged LIVE, so a
+ * non-owner commitment meets `CAPITAL_LIVE_OWNERSHIP_MISSING` or
+ * `CAPITAL_LIVE_OWNERSHIP_CONFLICT` rather than a book of its own.
  */
-function accountingModeFor(instance: RegisteredInstance): "LIVE" | "SHADOW" {
-  return instance.ownership === "OWNER" ? "LIVE" : "SHADOW";
-}
+const SHARED_BOOK_ACCOUNTING_MODE = "LIVE" as const;
 
 function intentIdOf(intent: Intent): string {
   return "intentId" in intent && typeof intent.intentId === "string" ? intent.intentId : "";

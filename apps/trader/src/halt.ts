@@ -148,13 +148,21 @@ function scopeKey(scope: HaltScope): string {
 }
 
 /**
- * Evidence a caller must produce to release an ACCOUNT-level halt.
+ * Evidence a caller must produce to release a halt — at ANY scope.
  *
  * The literal `true` is the point, and it is the same shape
  * `packages/event-bus` demands for a hard-resync acknowledgement: §7.1 makes an
  * authoritative snapshot mandatory after a gap, so a release that could be
  * requested without one would be a release that permits the silent catch-up
  * ADR-003 §3.3 forbids.
+ *
+ * SCOPE (review round 2, note N1). This paragraph used to say "an ACCOUNT-level
+ * halt" while {@link HaltController.release} accepted any {@link HaltScope} —
+ * `GLOBAL`, `MARKET` and `STRATEGY_INSTANCE` — and demanded the same evidence
+ * for each. The implementation is the correct one and the sentence was the
+ * stale half: §9.17 requires reconciliation before resuming whatever the halt's
+ * scope, and a market-scoped halt released without an authoritative snapshot is
+ * the same silent catch-up on a smaller surface. Documented as it behaves.
  */
 export interface HaltRelease {
   readonly authoritativeSnapshotApplied: true;

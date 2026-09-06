@@ -66,18 +66,66 @@
 
 import { z } from "zod";
 
+import { explainCanonicalDecimalString } from "@polymarket-bot/decimal";
 import { readPlainData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 
 /** A positive integer bound in milliseconds, small enough to be a real bound. */
 const BoundedMs = z.number().int().positive().max(86_400_000);
 const BoundedDepth = z.number().int().positive().max(1_000_000);
-const CanonicalDecimal = z.string().regex(/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/u, {
-  message: "must be a canonical decimal string (§6 invariant 1; no exponent, no leading +)",
-});
-const NonNegativeDecimal = z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d+)?$/u, {
-  message: "must be a canonical non-negative decimal string",
-});
+
+/**
+ * An economic field, checked by the DOMAIN's own canonical-decimal validator.
+ *
+ * ## Why not a regex (review round 2, MEDIUM-2 — MEASURED)
+ *
+ * Both decimal fields here used to be hand-written regexes, and both were
+ * WIDER than the canonical form `@polymarket-bot/decimal` defines: canonical
+ * form has no leading zeros, no trailing fractional zeros and no `-0`, and
+ * `/^(?:0|[1-9]\d*)(?:\.\d+)?$/` admits `"1000.00"`, `"0.0"` and (in the signed
+ * variant) `"-0"`. The consequence was measured end to end at the r1 tip:
+ *
+ * ```text
+ * parseTraderConfig({ …startingCash: "1000.00" })  -> ok: true
+ * loop.drain()  -> UNCAUGHT InvalidDecimalStringError:
+ *                  subDecimal(a): "1000.00" is not a canonical decimal string
+ * ```
+ *
+ * A door whose grammar is broader than the arithmetic behind it does not fail
+ * closed — it defers, and the deferral surfaces as a throw out of the event loop
+ * on the first fill, with no refusal naming the field. (It is fail-STOP, not a
+ * wrong number: `@polymarket-bot/decimal` refuses rather than coercing, which is
+ * why this is a MEDIUM and not a HIGH.) Delegating to
+ * {@link explainCanonicalDecimalString} makes the door and the arithmetic the
+ * SAME authority, exactly as `packages/domain`'s `decimalStringSchema` and
+ * `packages/execution-planner`'s `validate.ts` already do.
+ *
+ * A second property falls out of it, and {@link crossFieldRefusal} depends on
+ * it: two canonical spellings of one value are the same STRING, so comparing
+ * `accounting.startingCash` with `simulation.startingCash` by `===` is exact.
+ * Under the old regex `"1000"` and `"1000.00"` were both accepted and compared
+ * UNEQUAL, so a document stating one value twice could be refused as
+ * inconsistent — or, worse, accepted as consistent in the `"1000.00"`/`"1000.00"`
+ * case and then thrown out of `drain()`.
+ *
+ * Layer note: `@polymarket-bot/decimal` is layer 0 and `apps/trader` is layer 3
+ * (`docs/contracts/dependency-direction.md` §2), so the edge is downward and
+ * permitted; the package is already a declared dependency of this app.
+ */
+function canonicalDecimalSchema(range?: "NON_NEGATIVE"): z.ZodType<string, string> {
+  return z.string().superRefine((value, ctx) => {
+    const problem = explainCanonicalDecimalString(
+      value,
+      range === undefined ? undefined : { range },
+    );
+    if (problem !== null) ctx.addIssue({ code: "custom", message: problem });
+  });
+}
+
+/** A canonical decimal of either sign (§6 invariant 1; no exponent, no `+`). */
+const CanonicalDecimal = canonicalDecimalSchema();
+/** A canonical decimal that is `>= 0`. */
+const NonNegativeDecimal = canonicalDecimalSchema("NON_NEGATIVE");
 const Identifier = z.string().min(1).max(200);
 /**
  * The `packages/domain` `CodeString` grammar, restated here as a REFUSAL at the
@@ -230,7 +278,24 @@ const InstanceConfigSchema = z.strictObject({
   /** Canonical unsigned integer string (§10.3 `runs.run_seed`). */
   runSeed: z.string().regex(/^(?:0|[1-9]\d*)$/u),
   marketId: Uuid,
-  /** §6 invariant 11: exactly one `OWNER` per market in v1. */
+  /**
+   * §6 invariant 11: exactly one `OWNER` per market in v1.
+   *
+   * `OWNER` trades. `SHADOW` is **observe-only in this process**: the instance
+   * is evaluated in its §8.2 position and its `DecisionResult`s are persisted,
+   * and none of its intents is allocated, planned or submitted (ADR-011 §5 —
+   * shadow instances "evaluate, produce decisions, and write records; they do
+   * not consume venue rate limits, because they submit nothing").
+   *
+   * It is stated here because it is the operator's expectation that is at
+   * stake: ADR-011 §1 also describes `SHADOW` as "simulated execution,
+   * independent accounting", and this process has no second book to keep that
+   * accounting in — one cash balance, one ledger, one simulated venue, shared.
+   * A shadow instance whose orders executed on the shared book would be a live
+   * instance with a shadow label, which is exactly the defect review round 2
+   * found. Independent shadow execution is a design, not a setting; until it
+   * exists, `SHADOW` here means observe.
+   */
   ownership: z.enum(["OWNER", "SHADOW"]),
   evaluationPriority: z.number().int().min(0).max(1_000_000),
   /** §9.6's evaluation-time watchdog. */
@@ -533,6 +598,15 @@ function parseTraderConfigInner(input: unknown): ParseConfigResult {
  * value is exact and stated; two statements of one value that differ is a
  * document nobody can act on, and BOTH PATHS ARE NAMED so the operator does not
  * have to guess which one to change.
+ *
+ * WHY `===` IS THE RIGHT COMPARISON, and what makes it so. Both fields are
+ * parsed through {@link canonicalDecimalSchema}, and the canonical form is
+ * UNIQUE: two canonical strings denoting the same number are identical strings.
+ * So `===` here is numeric equality, not a spelling comparison — no
+ * `compareDecimal` is needed and none is hidden. That was NOT true at the r1
+ * tip, where the grammar was a wider regex: `"1000"` and `"1000.00"` were both
+ * accepted, and this function called them inconsistent (review round 2,
+ * MEDIUM-2). The canonical door is what makes the cheap comparison sound.
  */
 function crossFieldRefusal(config: TraderConfig): ConfigRefusal | undefined {
   if (config.accounting.startingCash === config.simulation.startingCash) return undefined;

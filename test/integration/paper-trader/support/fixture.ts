@@ -464,8 +464,18 @@ export const CONFIG_ID_2 = "018f4a7e-aaaa-7abc-8def-0123456789ab";
  *
  * `startingCash` is `"18"`: one 50-share entry bounded at `0.35` reserves
  * `17.5`, leaving `0.5` — less than the second entry needs.
+ *
+ * `secondOwnership` makes the SECOND instance a `SHADOW` observer instead of an
+ * owner (review round 2, HIGH-1). Both markets share one account, one series and
+ * one underlying, so the pair is exactly the shape that shows whether ownership
+ * changes what the SHARED books do: an account-wide cap that binds for two
+ * owners must bind identically when the second instance is labelled `SHADOW`,
+ * because a label is not a second balance.
  */
-export function twoMarketConfig(startingCash = "18"): Record<string, unknown> {
+export function twoMarketConfig(
+  startingCash = "18",
+  options: { readonly secondOwnership?: "OWNER" | "SHADOW" } = {},
+): Record<string, unknown> {
   const base = traderConfig();
   const market = (base["markets"] as Record<string, unknown>[])[0];
   const instance = (base["instances"] as Record<string, unknown>[])[0];
@@ -493,6 +503,7 @@ export function twoMarketConfig(startingCash = "18"): Record<string, unknown> {
         runId: RUN_ID_2,
         configId: CONFIG_ID_2,
         marketId: MARKET_ID_2,
+        ownership: options.secondOwnership ?? "OWNER",
         evaluationPriority: 1,
       },
     ],

@@ -78,6 +78,7 @@ import type { LedgerProjection } from "@polymarket-bot/ledger";
 import type { SimulatedFill } from "@polymarket-bot/simulation";
 
 import type { MarketConfig } from "./config.js";
+import { TRADER_RUN_MODE } from "./safety.js";
 
 /** The §9.8 check-14 verdict, in the shape `packages/risk` reads structurally. */
 export interface AllocationVerdict {
@@ -302,6 +303,22 @@ export class AllocatorGate {
   evaluate(input: {
     readonly intent: Intent;
     readonly instanceId: string;
+    /**
+     * The §9.7 accounting mode the commitment is judged under.
+     *
+     * `apps/trader` always passes `LIVE`, and review round 2's HIGH-1 is why:
+     * the trader has ONE book — one cash balance, one ledger, one venue — so a
+     * commitment that reaches it is a live commitment however it is attributed.
+     * `SHADOW` selects the allocator's independent-shadow-accounting arm, which
+     * skips the ADR-011 ownership gate, the live-micro fence and the collateral
+     * and inventory sufficiency checks, and compares caps against the
+     * instance's OWN shadow book. That is correct for a caller holding a
+     * separate book and catastrophic for one that is not: at the r1 tip a
+     * `SHADOW` instance was evaluated on the shadow arm and then executed on the
+     * shared venue, bypassing every one of those gates. The parameter stays
+     * because the package's contract has both arms; the trader's answer to it
+     * is a constant (`loop.ts`'s `SHARED_BOOK_ACCOUNTING_MODE`).
+     */
     readonly accountingMode: "LIVE" | "SHADOW";
     readonly liveOwners: readonly {
       readonly marketId: string;
@@ -652,8 +669,10 @@ export function requestFor(input: {
     strategyInstanceId: input.instanceId,
     // §11: this process serves exactly ONE run mode, and `safety.ts` refuses to
     // start under any other. Stated rather than threaded so a request cannot
-    // name a mode the process is not in.
-    runMode: "PAPER",
+    // name a mode the process is not in — and stated as `safety.ts`'s OWN
+    // constant (review round 2, note N4), so the mode the allocator's
+    // real-order fence reads is the same symbol the startup gate enforced.
+    runMode: TRADER_RUN_MODE,
     accountingMode: input.accountingMode,
     marketId: input.leg.marketId,
     side: input.leg.side,

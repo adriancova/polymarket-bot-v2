@@ -62,6 +62,39 @@ rather than conventional:
    discards; a refusal latches a `QUEUE_BACKPRESSURE` halt, and
    `messagesDropped` is reported as `0` because nothing can move it.
 
+## `ownership: "SHADOW"` means OBSERVE here
+
+§6 invariant 11: "One active live strategy owns a market in v1. Other strategies
+may observe or run in shadow mode." In this process a `SHADOW` instance is
+**observe-only**:
+
+| It does | It does not |
+| --- | --- |
+| evaluate, in its §8.2 position after the owner | reach `allocate capital` (§8.1 step 6) |
+| produce `DecisionResult`s, which are persisted | reach the risk gate, the planner or the venue |
+| appear in the run manifest | move cash, inventory or the ledger |
+
+The intents it emits are counted on the health surface as
+`execution.observeOnlyIntents` — not dropped silently, so "the strategy emitted
+nothing" and "the process declined to route what it emitted" stay
+distinguishable.
+
+**Why not simulated shadow execution.** ADR-011 §1 describes `SHADOW` as "live
+data, simulated execution, independent accounting", and §5 states the observable
+consequence: shadow instances "evaluate, produce decisions, and write records;
+they do not consume venue rate limits, **because they submit nothing**". This
+process holds ONE book — one cash balance, one `Ledger`, one `SimulatedVenue`,
+shared by every instance — so there is nothing for a shadow's accounting to be
+independent *of*. Review round 2 measured what the alternative costs: with the
+allocator asked on its SHADOW arm (which skips the ADR-011 ownership gate, the
+live-micro fence and the collateral and inventory checks) and the order still
+submitted to the shared venue, a `globalAccountCap` of `"20"` bound for two
+owners and evaporated for a shadow — two fills, 34 pUSD committed, zero allocator
+refusals, on a market with no recorded owner. Independent shadow execution is a
+design (a second book, a second attribution stream, a second PnL surface), not a
+configuration value; until it exists, `SHADOW` here means observe. Recorded as a
+follow-up below.
+
 ## The `WP-220` composition-root obligations
 
 `packages/strategies/static-bracket/README.md` states ten conditions the
@@ -254,15 +287,26 @@ and none is claimed.
    `settlementReadiness` comes from `evaluateMarketReadiness` rather than from
    configuration. Until then the operator asserts it and is accountable for it.
 2. **The `strategyInstanceId` conflict** (above) needs a contract-owner ruling.
-3. **`packages/risk`'s exposure snapshot is not supplied.** The trader passes no
-   `exposures`, so a configured exposure cap fails closed. Wiring
-   `packages/capital-allocator`'s `exposureSnapshotCovering` is the next step and
-   is not done here.
-4. **`WP-310`'s rate-limit budget** replaces the interim `requestBudget`.
-5. **A live integration suite** against real Redis and PostgreSQL, when an
+3. ~~**`packages/risk`'s exposure snapshot is not supplied.**~~ **DONE in
+   remediation round 1** and the entry was left stale; corrected in round 2.
+   `src/allocation.ts` builds the §9.8 check-15 snapshot with
+   `packages/capital-allocator`'s own `exposureSnapshotCovering`, and
+   `src/loop.ts` passes it unaltered. A configured exposure cap is now a real
+   comparison — `test/integration/paper-trader/capital-allocation.test.ts` drives
+   both directions, including a per-underlying cap that binds only because a
+   HELD position consumes it.
+4. **Independent SHADOW execution** (review round 2, HIGH-1). ADR-011 §1's
+   "simulated execution, independent accounting" needs a second book: a separate
+   cash balance, a separate ledger stream and a separate PnL surface, so a shadow
+   instance's simulated fills never touch the owner's. Until that exists,
+   `ownership: "SHADOW"` is observe-only here (see above) and the process says so
+   in the configuration schema, the registry and this README rather than
+   implying an execution mode it does not have.
+5. **`WP-310`'s rate-limit budget** replaces the interim `requestBudget`.
+6. **A live integration suite** against real Redis and PostgreSQL, when an
    environment with Docker exists.
-6. **Root-script wiring** for `pnpm test:integration` (orchestrator-owned at
+7. **Root-script wiring** for `pnpm test:integration` (orchestrator-owned at
    merge; `package.json` is a protected path). The suite runs today through
    `pnpm --filter @polymarket-bot/trader test:integration`.
-7. **`packages/observability`** is still a placeholder, so the health state is a
+8. **`packages/observability`** is still a placeholder, so the health state is a
    value rather than a metrics endpoint. `WP-240` owns the surface that reads it.
