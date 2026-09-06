@@ -16,7 +16,7 @@
     "test": "vitest run --config test/vitest.config.ts",
     "test:fault": "pnpm --filter @polymarket-bot/storage-wal test:fault",
     "test:soak-smoke": "pnpm --dir test/soak/recorder run soak:smoke",
-    "test:integration": "pnpm --filter @polymarket-bot/storage-postgres test:integration && pnpm --filter @polymarket-bot/event-bus test:integration && pnpm --filter @polymarket-bot/research-worker test:integration && pnpm --filter @polymarket-bot/data-gateway test:integration",
+    "test:integration": "pnpm --filter @polymarket-bot/storage-postgres test:integration && pnpm --filter @polymarket-bot/event-bus test:integration && pnpm --filter @polymarket-bot/research-worker test:integration && pnpm --filter @polymarket-bot/data-gateway test:integration && pnpm --filter @polymarket-bot/trader test:integration",
     "test:contract": "pnpm --filter @polymarket-bot/polymarket-public test:contract && pnpm --filter @polymarket-bot/polymarket-public test:contract:rtds && pnpm --filter @polymarket-bot/binance-adapter test:contract && pnpm --filter @polymarket-bot/coinbase-adapter test:contract",
     "test:compose": "docker compose config --quiet && docker compose up -d --wait && docker compose exec -T postgres pg_isready -U devlocal -d polymarket_bot_dev && docker compose exec -T redis redis-cli ping && docker compose down",
     "audit": "pnpm audit --audit-level high",
@@ -24,7 +24,7 @@
     "db:migrate": "pnpm --filter @polymarket-bot/storage-postgres db:migrate",
     "dev:infra": "docker compose up -d",
     "dev:gateway": "pnpm --filter @polymarket-bot/data-gateway start",
-    "dev:paper": "node -e \"console.error('NOT IMPLEMENTED: the paper trader arrives with its owning work package.'); process.exit(1)\"",
+    "dev:paper": "pnpm --filter @polymarket-bot/trader start",
     "ops:verify-venue": "pnpm --filter @polymarket-bot/ops-cli run verify-venue",
     "ops:validate-dataset": "cd python && uv run python -m research.compaction"
   },
