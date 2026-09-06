@@ -25,7 +25,11 @@ import {
   acquireEvaluationInput,
   validateEvaluationInput,
 } from "../../../packages/strategy-runtime/src/input.js";
-import { materializeEvaluationViewAt } from "../../../packages/strategy-runtime/src/json.js";
+import {
+  canonicalJsonStringify,
+  materializeDecisionViewAt,
+  materializeEvaluationViewAt,
+} from "../../../packages/strategy-runtime/src/json.js";
 import {
   DECISION_FIELD_NAMES,
   DoorDecisionWithoutModelOutputsSchema,
@@ -414,6 +418,58 @@ describe("D1: the materializer's copy cannot be reached through Object.prototype
     }
   });
 
+  it("MUTATION PIN (review round 1, LOW 1): `topOf`'s empty-stack length check is load-bearing", () => {
+    // The mutation this kills — reviewer mutation F6 — is reverting `topOf` in
+    // `json.ts` to `stack[stack.length - 1]`. It SURVIVED the entire package
+    // suite at `4c1bcde`. `stack[-1]` on an EMPTY array is a property read of
+    // the name `"-1"`, which walks the prototype chain exactly like an index
+    // name does, so one inherited `"-1"` is read back as a work FRAME the
+    // moment the stack drains — which is every completed walk, on every value.
+    //
+    // THE SHAPE OF THE PIN IS DELIBERATE. With a FRAME-SHAPED inherited value
+    // the mutant loops forever (the reviewer measured >120s); a synchronous
+    // infinite loop cannot be interrupted by a `testTimeout`, so pinning that
+    // shape would HANG the suite instead of failing it. With any other value
+    // the mutant reads `frame.kind` / `frame.keys` off a non-frame and throws a
+    // `TypeError` in microseconds — out of a walk whose whole contract is that
+    // it does not throw. This pins the fast shape.
+    const scalars: readonly unknown[] = ["a scalar", 1, true, null];
+    for (const inherited of ["X", 1, true] as const) {
+      for (const shape of ["data", "getOnly"] as const) {
+        for (const value of scalars) {
+          const clean = verdict(() =>
+            JSON.stringify(materializeEvaluationViewAt(value, "input") ?? null),
+          );
+          const polluted = verdict(() =>
+            under({ name: "-1", shape, value: inherited }, () =>
+              JSON.stringify(materializeEvaluationViewAt(value, "input") ?? null),
+            ),
+          );
+          expect(clean, `${JSON.stringify(value)} must materialize cleanly`).toBe(
+            JSON.stringify({ ok: true, value }),
+          );
+          expect(polluted, `"-1"/${shape}=${String(inherited)} on ${JSON.stringify(value)}`).toBe(
+            clean,
+          );
+        }
+      }
+    }
+    // The same guard on the serializer's own stack, which is the second
+    // `topOf` call site (`canonicalJsonStringify`).
+    const clean = verdict(() => canonicalJsonStringify({ a: [1, 2], b: "x" }));
+    expect(clean).toBe('{"a":[1,2],"b":"x"}');
+    for (const inherited of ["X", 1, true] as const) {
+      expect(
+        verdict(() =>
+          under({ name: "-1", shape: "data", value: inherited }, () =>
+            canonicalJsonStringify({ a: [1, 2], b: "x" }),
+          ),
+        ),
+        `serializer under "-1"=${String(inherited)}`,
+      ).toBe(clean);
+    }
+  });
+
   it("an inherited index name no longer intercepts an array append", () => {
     // `push` is `Set`, and `Set` consults the chain for the INDEX name — the
     // index-`"0"` family `WP-020-FU1` and `WP-200-FU1` measured. The append is
@@ -508,6 +564,186 @@ describe("D4: everything this door emits has a null prototype", () => {
     expect(Object.getPrototypeOf(containedOutcome.record)).toBeNull();
     expect(Object.getPrototypeOf(containedOutcome.record.decision)).toBeNull();
     expect(Object.getPrototypeOf(containedOutcome.checkpoint)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D2 — the key the LIBRARY skips rather than validates (review round 1, MEDIUM 1)
+// ---------------------------------------------------------------------------
+
+describe("D3 emits no key the library skipped: an own `__proto__` at any depth", () => {
+  /**
+   * MECHANISM, read out of the pinned `zod@4.4.3` rather than inferred:
+   * `v4/core/schemas.cjs:798-801` (the strict object's unknown-key walk) and
+   * `:1527` (the record walk) each open with `if (key === "__proto__")
+   * continue;`. The library SKIPS that name at EVERY level — neither refused as
+   * unrecognized nor validated against a value schema — so it never reached
+   * `parsed.data`.
+   *
+   * Base `53e9f62` emitted `parsed.data` and the key vanished. `WP-170-FU1`'s
+   * D3 rebuild emits the MATERIALIZED TREE (which is the §1 D3 rule and is
+   * right), and at `4c1bcde` that put the key back into the persisted decision.
+   * No pollution is needed: `JSON.parse` of a model's output produces exactly
+   * this shape. MEASURED at both SHAs, one strategy return at a time:
+   *
+   * ```text
+   *                                  base 53e9f62   tip 4c1bcde   remediated
+   *   modelOutputs.__proto__ = {…}   DROPPED        EMITTED       DROPPED
+   *   modelOutputs.__proto__ = 1.5   DROPPED        EMITTED       DROPPED
+   *   intents[0].__proto__   = {…}   DROPPED        EMITTED       DROPPED
+   *   decision.__proto__     = {…}   DROPPED        DROPPED       DROPPED
+   *   statePatch.__proto__   = {…}   KEPT           KEPT          KEPT
+   * ```
+   *
+   * The last row is why the drop is a grammar axis on the DECISION view alone
+   * and not a change to every materialization: base kept the key in
+   * `statePatch` (it never travelled through a parse output), and
+   * `state-patch-attribution.test.ts` and `json-exotic-values.test.ts` pin
+   * that. Dropping it everywhere would have broken parity in the other
+   * direction.
+   *
+   * The `1.5` row is the one that shows why this is not cosmetic: a JS NUMBER
+   * reached persisted `modelOutputs`, whose value schema is
+   * `string | boolean | null` precisely to keep numbers out — and on `main`
+   * the `decisions_model_outputs_decimal_safe` DB constraint turns that into a
+   * write failure instead of a decision.
+   */
+  function decisionBytes(returned: unknown): string {
+    const harness = makeHarness({
+      strategy: makeStrategy({ onFeatures: () => returned as never }),
+    });
+    const outcome = harness.runtime.evaluate(makeInput("onFeatures"));
+    const record = harness.sink.calls[0]?.record;
+    return `${outcome.kind} ${JSON.stringify(record?.decision)}`;
+  }
+
+  /** An object with an OWN enumerable `__proto__` data property. */
+  function withOwnProto(body: Record<string, unknown>, value: unknown): unknown {
+    const source = JSON.parse(
+      `{"__proto__":${JSON.stringify(value)},${JSON.stringify(body).slice(1)}`,
+    ) as Record<string, unknown>;
+    // Non-vacuity: the vector really does carry the key as OWN DATA, and the
+    // literal it was built from really is what `JSON.parse` produces.
+    expect(Object.hasOwn(source, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(source)).toBe(Object.prototype);
+    return source;
+  }
+
+  const VALID_INTENT: Record<string, unknown> = {
+    type: "POSITION",
+    intentId: "018f4a7e-2222-7abc-8def-0123456789ab",
+    marketId: MARKET_ID,
+    direction: "YES",
+    targetMode: "ABSOLUTE",
+    targetShares: "10",
+    urgency: "NORMAL",
+    liquidityPreference: "MAKER_ONLY",
+    partialFillPolicy: "ACCEPT_ANY",
+    validUntil: T0,
+    tags: [],
+  };
+
+  it("REPRODUCED-THEN-FLIPPED: `modelOutputs.__proto__`, object AND number values", () => {
+    // BASE `53e9f62`: the persisted decision is
+    //   "modelOutputs":{"edge":"0.03"}
+    // TIP `4c1bcde`:  "modelOutputs":{"edge":"0.03","__proto__":{"polluted":true}}
+    //            and  "modelOutputs":{"edge":"0.03","__proto__":1.5}
+    const base = (outputs: unknown): unknown => ({
+      decisionType: "hold",
+      reasonCodes: ["TEST.HOLD"],
+      featureSnapshotRef: SNAPSHOT_REF,
+      intents: [],
+      modelOutputs: outputs,
+    });
+    const expected =
+      'DECIDED {"decisionType":"hold","reasonCodes":["TEST.HOLD"],"featureSnapshotRef":"snap-1"' +
+      ',"modelOutputs":{"edge":"0.03"},"intents":[]}';
+    expect(decisionBytes(base({ edge: "0.03" }))).toBe(expected);
+    for (const value of [{ polluted: true }, 1.5, "0.5", null, [1]] as const) {
+      expect(
+        decisionBytes(base(withOwnProto({ edge: "0.03" }, value))),
+        `modelOutputs.__proto__ = ${JSON.stringify(value)}`,
+      ).toBe(expected);
+    }
+    // …and nothing was re-parented on the way through.
+    expect((({}) as Record<string, unknown>)["polluted"]).toBeUndefined();
+  });
+
+  it("REPRODUCED-THEN-FLIPPED: `intents[0].__proto__` is not forwarded either", () => {
+    // BASE `53e9f62`: the intent is persisted without the key.
+    // TIP `4c1bcde`:  "intents":[{"__proto__":{"polluted":true},"type":"POSITION",…}]
+    //                 — and that intent object is what the runtime forwards.
+    const build = (intent: unknown): unknown => ({
+      decisionType: "enter",
+      reasonCodes: ["TEST.ENTER"],
+      featureSnapshotRef: SNAPSHOT_REF,
+      intents: [intent],
+    });
+    const clean = decisionBytes(build({ ...VALID_INTENT }));
+    expect(clean).toContain('"intents":[{"type":"POSITION"');
+    expect(clean.startsWith("DECIDED ")).toBe(true);
+    for (const value of [{ polluted: true }, 1.5] as const) {
+      expect(
+        decisionBytes(build(withOwnProto({ ...VALID_INTENT }, value))),
+        `intents[0].__proto__ = ${JSON.stringify(value)}`,
+      ).toBe(clean);
+    }
+    expect((({}) as Record<string, unknown>)["polluted"]).toBeUndefined();
+  });
+
+  it("the TOP-LEVEL drop (WP-170 round 4) and the statePatch KEEP are both unchanged", () => {
+    // Two rows of the table above, asserted together because the fix would be
+    // wrong if it moved either of them.
+    const topLevel = decisionBytes(
+      withOwnProto(
+        {
+          decisionType: "hold",
+          reasonCodes: ["TEST.HOLD"],
+          featureSnapshotRef: SNAPSHOT_REF,
+          intents: [],
+        },
+        { polluted: true },
+      ),
+    );
+    expect(topLevel).toBe(
+      'DECIDED {"decisionType":"hold","reasonCodes":["TEST.HOLD"],"featureSnapshotRef":"snap-1"' +
+        ',"intents":[]}',
+    );
+    // `statePatch` is NOT parsed by the library and base emitted it from the
+    // checkpointable walk, so base KEPT the key — and so does this tip. Its
+    // grammar does not carry the drop.
+    const withPatch = decisionBytes({
+      decisionType: "hold",
+      reasonCodes: ["TEST.HOLD"],
+      featureSnapshotRef: SNAPSHOT_REF,
+      intents: [],
+      statePatch: withOwnProto({ a: 1 }, { alsoPolluted: true }),
+    });
+    expect(withPatch).toContain('"statePatch":{"__proto__":{"alsoPolluted":true},"a":1}');
+  });
+
+  it("the drop is the DECISION grammar's alone, and a NON-ENUMERABLE `__proto__` is still refused", () => {
+    // The two grammars, side by side on the same value: the decision view drops
+    // the key, the evaluation view (the input snapshot) copies it exactly as
+    // base did. A future edit that moves the drop into the shared grammar
+    // fails here.
+    const source = JSON.parse('{"__proto__":{"polluted":true},"safe":1}') as unknown;
+    const asView = materializeEvaluationViewAt(source, "input");
+    const asDecision = materializeDecisionViewAt(source, "decision");
+    expect(asView.ok && JSON.stringify(asView.value)).toBe('{"__proto__":{"polluted":true},"safe":1}');
+    expect(asDecision.ok && JSON.stringify(asDecision.value)).toBe('{"safe":1}');
+
+    // A NON-ENUMERABLE own `__proto__` is REFUSED by the loss rule, not
+    // silently dropped: the drop is applied to the enumerable walked list, and
+    // it is applied AFTER the hidden-own-property check.
+    const hidden = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(hidden, "safe", { value: 1, enumerable: true, configurable: true });
+    Object.defineProperty(hidden, "__proto__", { value: 2, enumerable: false, configurable: true });
+    const refused = materializeDecisionViewAt(hidden, "decision");
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.problem).toContain("non-enumerable property");
+    expect(refused.problem).toContain("__proto__");
   });
 });
 
@@ -685,6 +921,21 @@ describe("the `modelOutputs` split: equivalent on a clean process, and no format
     { decisionType: "hold", reasonCodes: [], featureSnapshotRef: "s", intents: [], surprise: 1 },
     // both halves wrong at once
     { decisionType: "HOLD", reasonCodes: [], featureSnapshotRef: "s", intents: [], modelOutputs: { n: 1 } },
+    // an own `__proto__` at each level — the key `zod@4.4.3` SKIPS rather than
+    // validates (review round 1, MEDIUM 1). Verdict equality has to hold on
+    // these too, or the split would disagree with the contract about a value
+    // the contract silently tolerates.
+    JSON.parse(
+      '{"__proto__":{"polluted":true},"decisionType":"hold","reasonCodes":[],' +
+        '"featureSnapshotRef":"s","intents":[]}',
+    ) as unknown,
+    {
+      decisionType: "hold",
+      reasonCodes: [],
+      featureSnapshotRef: "s",
+      intents: [],
+      modelOutputs: JSON.parse('{"__proto__":1.5,"edge":"0.03"}') as unknown,
+    },
   ];
 
   /** The door's composed verdict: the omitted parse AND the picked parse. */
@@ -696,7 +947,16 @@ describe("the `modelOutputs` split: equivalent on a clean process, and no format
     const rest: Record<string, unknown> = {};
     for (const key of Object.getOwnPropertyNames(record)) {
       if (key === MODEL_OUTPUTS_KEY) continue;
-      rest[key] = record[key];
+      // `defineProperty`, never `rest[key] = …` — the door itself builds its
+      // copies this way (`ownData`), and on an ordinary target an assignment to
+      // `__proto__` RE-PARENTS the object instead of storing a key, which would
+      // make this helper measure something other than the door.
+      Object.defineProperty(rest, key, {
+        value: record[key],
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
     }
     if (!DoorDecisionWithoutModelOutputsSchema.safeParse(rest).success) return false;
     if (!Object.hasOwn(record, MODEL_OUTPUTS_KEY)) return true;
@@ -711,18 +971,27 @@ describe("the `modelOutputs` split: equivalent on a clean process, and no format
         DecisionResultSchema.safeParse(value).success,
       );
     }
-    // Non-vacuity: the corpus is not all-true or all-false.
+    // Non-vacuity: the corpus is not all-true or all-false, and it is the size
+    // review round 1 verified (13 + the two `__proto__` vectors that round
+    // added). A corpus that silently shrinks is a differential that silently
+    // stops differentiating.
+    expect(CORPUS).toHaveLength(15);
     const verdicts = CORPUS.map((value) => doorVerdict(value));
     expect(verdicts).toContain(true);
     expect(verdicts).toContain(false);
   });
 
-  it("THE RESIDUAL, BOUNDED: `skipChecks` cannot move the raw `modelOutputs` parse", () => {
+  it("THE RESIDUAL, BOUNDED — the `skipChecks` HALF: it cannot move the raw parse", () => {
+    // RESTATED 2026-09-06, remediation round 1 (review round 1, LOW 2). This
+    // test used to be titled "THE RESIDUAL, BOUNDED", which overstated what it
+    // measures. It measures the `skipChecks` HALF of the bound and nothing
+    // else; the next test states the half it does NOT cover.
+    //
     // The disclosed residual (`parse-door.ts` header) is that this ONE subtree
     // is asked of the raw schema, because the arena fails closed on the `null`
-    // node inside `ModelOutputValueSchema`. The bound is measured rather than
-    // argued: the subtree carries zero format checks, so the class that
-    // defeats every other parse in this package is a no-op on it.
+    // node inside `ModelOutputValueSchema`. This half of the bound is measured
+    // rather than argued: the subtree carries zero format checks, so the class
+    // that defeats every other parse in this package is a no-op on it.
     for (const value of CORPUS) {
       const probe =
         value !== null && typeof value === "object" && Object.hasOwn(value, MODEL_OUTPUTS_KEY)
@@ -731,6 +1000,62 @@ describe("the `modelOutputs` split: equivalent on a clean process, and no format
       const clean = RawModelOutputsSchema.safeParse(probe).success;
       const polluted = under(SKIP_CHECKS, () => RawModelOutputsSchema.safeParse(probe).success);
       expect(polluted, JSON.stringify(probe)).toBe(clean);
+    }
+  });
+
+  it("THE HALF THE BOUND DOES NOT COVER: `values` reaches this parse, at base and at tip alike", () => {
+    // Review round 1, LOW 2. The `values`/AVAILABILITY class DOES reach the one
+    // parse that is not an arena copy. MEASURED at base `53e9f62` and at tip,
+    // one non-enumerable property at a time, an honest decision:
+    //
+    //   Object.prototype.<name> = true   (non-enumerable)   base       tip
+    //     skipChecks   with modelOutputs                    DECIDED    DECIDED
+    //     optin/optout/propValues/pattern                   DECIDED    DECIDED
+    //     values       with modelOutputs                    CONTAINED  CONTAINED
+    //     values       WITHOUT modelOutputs                 DECIDED    DECIDED
+    //     when         with modelOutputs                    ESCAPED    DECIDED
+    //                                                       TypeError
+    //
+    // Three properties, and this test asserts all three:
+    //  1. `values` is PRE-EXISTING and IDENTICAL base→tip — the door neither
+    //     opened nor closed it — and it is FAIL-CLOSED, which ADR-020 §6
+    //     permits. It is closed by the queued `packages/risk`
+    //     `ARENA_NODE_TYPES` widening, after which this subtree goes through
+    //     the arena like everything else;
+    //  2. it reaches the decision ONLY through `modelOutputs`: the same
+    //     pollution leaves a decision without that field DECIDED, which is what
+    //     localizes the residual to the one unprotected parse;
+    //  3. `when` was an ESCAPED TypeError at base and is a typed outcome now,
+    //     because the rest of the decision parses through the arena.
+    const honest = (withOutputs: boolean): unknown => ({
+      decisionType: "hold",
+      reasonCodes: ["TEST.HOLD"],
+      featureSnapshotRef: SNAPSHOT_REF,
+      intents: [],
+      ...(withOutputs ? { modelOutputs: { edge: "0.03" } } : {}),
+    });
+    const run = (withOutputs: boolean): string => {
+      const harness = makeHarness({
+        strategy: makeStrategy({ onFeatures: () => honest(withOutputs) as never }),
+      });
+      const outcome = harness.runtime.evaluate(makeInput("onFeatures"));
+      return `${outcome.kind}/${String(harness.sink.calls[0]?.record.attribution)}`;
+    };
+    expect(verdict(() => run(true))).toBe("DECIDED/STRATEGY");
+    expect(verdict(() => run(false))).toBe("DECIDED/STRATEGY");
+
+    const values: Pollution = { name: "values", shape: "data", value: true };
+    // 1 — the residual: fail-CLOSED, and it does move.
+    expect(verdict(() => under(values, () => run(true)))).toBe("CONTAINED/RUNTIME");
+    // 2 — and only through `modelOutputs`.
+    expect(verdict(() => under(values, () => run(false)))).toBe("DECIDED/STRATEGY");
+    // 3 — the classes the door DID close on this same decision stay closed, so
+    // this test cannot be read as "the door does nothing here".
+    for (const name of ["skipChecks", "optin", "optout", "when", "propValues", "pattern"]) {
+      expect(
+        verdict(() => under({ name, shape: "data", value: true }, () => run(true))),
+        `${name} must leave an honest decision alone`,
+      ).toBe("DECIDED/STRATEGY");
     }
   });
 });

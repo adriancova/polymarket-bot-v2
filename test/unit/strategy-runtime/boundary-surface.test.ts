@@ -410,6 +410,17 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
     totality: "TOTAL",
     note: "the pathed form; the path is normalized through describeLabel",
   },
+  materializeDecisionViewAt: {
+    params: ["value", "path"],
+    visibility: "PACKAGE",
+    shape: "function",
+    totality: "TOTAL",
+    note:
+      "remediation round 1, MEDIUM 1: the evaluation-view grammar plus one axis — an own " +
+      "enumerable `__proto__` is dropped, because the pinned zod SKIPS that key at every level " +
+      "and a D3 rebuild off the tree would emit a value nothing validated. Same path " +
+      "normalization; still never throws",
+  },
   materializeEvaluationViewAt: {
     params: ["value", "path"],
     visibility: "PACKAGE",

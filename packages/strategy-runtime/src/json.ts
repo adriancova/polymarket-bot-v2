@@ -223,6 +223,56 @@
  * inherited property at an index name being visible through an EMPTY array copy
  * (`copy[0]`): that is the same index-name family the queued `packages/risk`
  * grant-and-widen round owns.
+ *
+ * ---------------------------------------------------------------------------
+ * WP-170-FU1 REMEDIATION ROUND 1 (2026-09-06) — THE DECISION GRAMMAR DROPS AN
+ * OWN `__proto__` KEY, BECAUSE THE LIBRARY NEVER VALIDATED ONE
+ * ---------------------------------------------------------------------------
+ *
+ * Review round 1, MEDIUM 1. `WP-170-FU1`'s D3 rebuild takes the decision the
+ * record carries from the MATERIALIZED TREE instead of from `parsed.data`. That
+ * is the §1 D3 rule and it is right — but it silently changed what happens to a
+ * key the LIBRARY skips rather than validates.
+ *
+ * MECHANISM, read out of the pinned `zod@4.4.3` rather than inferred:
+ * `v4/core/schemas.cjs:798-801` (the strict object's unknown-key walk) and
+ * `:1527` (the record walk) each begin with `if (key === "__proto__") continue;`
+ * — the library SKIPS that name at EVERY level, in objects and records alike.
+ * It is neither refused as an unrecognized key nor validated against a value
+ * schema, and `parsed.data` therefore never carried it. Base `53e9f62` emitted
+ * `parsed.data`, so the key vanished; the tip emitted the materialized tree, so
+ * it landed in the persisted `record.decision`.
+ *
+ * Reproduced at tip `4c1bcde`, no pollution needed — a strategy return with an
+ * own enumerable `__proto__` data property, which is exactly what `JSON.parse`
+ * of a model's output produces:
+ *
+ * ```text
+ *                                 base 53e9f62        tip 4c1bcde
+ *   modelOutputs.__proto__ = {…}   DROPPED             EMITTED into the record
+ *   modelOutputs.__proto__ = 1.5   DROPPED             EMITTED — a NUMBER, in a
+ *                                                      field whose value schema
+ *                                                      is string|boolean|null
+ *   intents[0].__proto__   = {…}   DROPPED             EMITTED, and forwarded
+ *   decision.__proto__     = {…}   DROPPED             DROPPED (DECISION_FIELD_NAMES)
+ *   statePatch.__proto__   = {…}   KEPT                KEPT   (base == tip)
+ * ```
+ *
+ * The fix is the reviewer's recommended option (a) — drop the own key in the
+ * materializer's object frames — SCOPED BY THAT LAST ROW. Base parity is what
+ * option (a) is for, and base did NOT drop the key from `statePatch` (it never
+ * travelled through `parsed.data`; the checkpointable walk emitted it as data,
+ * which `test/unit/strategy-runtime/state-patch-attribution.test.ts` and
+ * `json-exotic-values.test.ts` both pin). Dropping it in every grammar would
+ * therefore have RE-BROKEN parity in the other direction and required weakening
+ * two existing pins. So the drop is one GRAMMAR AXIS (`dropOwnProtoKey`), true
+ * on the new {@link DECISION_VIEW} grammar alone — the grammar the decision and
+ * its `modelOutputs` are materialized under — and false everywhere else.
+ *
+ * A NON-ENUMERABLE own `__proto__` is still REFUSED rather than dropped: the
+ * drop is applied to the walked (enumerable) key list only, after the
+ * hidden-own-property check, so the loss rule that refuses every invisible own
+ * property is untouched. Base refused it there too, one step earlier.
  */
 
 import { ownDataDescriptor } from "@polymarket-bot/risk/plain-data";
@@ -295,11 +345,33 @@ interface Grammar {
    */
   readonly perKeyDescriptor: boolean;
   readonly maxDepth: number;
+  /**
+   * Drop an own ENUMERABLE `__proto__` data property instead of copying it.
+   *
+   * True for {@link DECISION_VIEW} only, and for one measured reason (module
+   * header, remediation round 1): `zod@4.4.3` SKIPS that key at every level
+   * (`v4/core/schemas.cjs:798-801` and `:1527`), so a decision's `__proto__` was
+   * never validated by anything and never reached base `53e9f62`'s
+   * `parsed.data`. A D3 rebuild that emits the materialized tree would emit it,
+   * which is an unvalidated, contract-forbidden value in the persisted record.
+   * Dropping it here restores exact base byte-parity for the decision subtree.
+   *
+   * FALSE for the other three grammars, also by measurement: base KEPT the key
+   * in `statePatch` (it never travelled through a parse output), and both the
+   * checkpoint bytes and the direct materializer contract pin that.
+   */
+  readonly dropOwnProtoKey: boolean;
   /** Tail of the refusal a throwing caller-supplied operation produces. */
   readonly exoticTail: string;
   /** The "this is not a plain object" refusal, in this grammar's words. */
   readonly plainObjectRule: string;
 }
+
+/**
+ * The one own key name {@link Grammar.dropOwnProtoKey} is about. Named once so
+ * the drop and the tests that pin it cannot drift apart.
+ */
+const PROTO_KEY = "__proto__";
 
 const CHECKPOINTABLE_JSON: Grammar = {
   acceptUndefined: false,
@@ -307,6 +379,7 @@ const CHECKPOINTABLE_JSON: Grammar = {
   acceptAccessors: false,
   perKeyDescriptor: true,
   maxDepth: MAX_MATERIALIZED_DEPTH,
+  dropOwnProtoKey: false,
   exoticTail:
     "a value whose property access executes code (a Proxy or other exotic object) is not checkpointable",
   plainObjectRule: "only plain objects are checkpointable",
@@ -318,11 +391,30 @@ const EVALUATION_VIEW: Grammar = {
   acceptAccessors: true,
   perKeyDescriptor: false,
   maxDepth: MAX_MATERIALIZED_DEPTH,
+  dropOwnProtoKey: false,
   exoticTail:
     "a view whose property access executes code that throws cannot be read into the inert " +
     "snapshot the runtime evaluates against",
   plainObjectRule:
     "only plain objects and arrays can be read into an evaluation-input snapshot",
+};
+
+/**
+ * The evaluation-view grammar as the RETURNED DECISION is read under: identical
+ * on every value axis, and different on exactly one property axis — an own
+ * enumerable `__proto__` is DROPPED rather than copied.
+ *
+ * Why a separate grammar rather than a flag on the view one: the input snapshot
+ * and the decision are read by the same walk but land in different places. The
+ * decision is what §6 invariant 3 persists, and the library that validates it
+ * skips `__proto__` at every level, so copying the key emits a value nothing
+ * checked. The INPUT snapshot's handling of the same key is base behaviour this
+ * round did not measure a defect in, and changing it would be an unmeasured
+ * permission change on the producer side. One axis, two grammars, both stated.
+ */
+const DECISION_VIEW: Grammar = {
+  ...EVALUATION_VIEW,
+  dropOwnProtoKey: true,
 };
 
 /**
@@ -357,6 +449,7 @@ const IMMUTABLE_PARAMS: Grammar = {
   acceptAccessors: false,
   perKeyDescriptor: true,
   maxDepth: MAX_MATERIALIZED_DEPTH,
+  dropOwnProtoKey: false,
   exoticTail:
     "params whose property access executes code cannot be taken into runtime ownership as " +
     "the run's immutable configuration (§9.6)",
@@ -421,6 +514,22 @@ export function materializeCheckpointableJsonAt(
  */
 export function materializeEvaluationViewAt(value: unknown, path: string): MaterializeResult {
   return materializeWith(value, describeLabel(path), EVALUATION_VIEW);
+}
+
+/**
+ * The same walk under the DECISION grammar: the inert copy the runtime takes of
+ * the value a strategy callback returned, before the door parses it and before
+ * D3 reads the persisted decision back off it.
+ *
+ * Identical to {@link materializeEvaluationViewAt} except that an own
+ * enumerable `__proto__` is dropped rather than copied — the key the pinned
+ * `zod@4.4.3` skips at every level, so nothing ever validated it and base
+ * `53e9f62` never emitted it (module header, remediation round 1).
+ *
+ * Internal to the package (not re-exported from `index.ts`). **Never throws.**
+ */
+export function materializeDecisionViewAt(value: unknown, path: string): MaterializeResult {
+  return materializeWith(value, describeLabel(path), DECISION_VIEW);
 }
 
 /**
@@ -500,6 +609,17 @@ function appendOwn<T>(target: T[], value: T): void {
  * property read of `"-1"`, which walks the chain exactly like an index name
  * does; an inherited `"-1"` would have been read as a frame. Cheap, total, and
  * it removes a name from the reachable key material rather than pinning it.
+ *
+ * LOAD-BEARING, AND PINNED SINCE REMEDIATION ROUND 1 (review round 1, LOW 1).
+ * Reverting this to `stack[stack.length - 1]` SURVIVED the whole package suite
+ * at tip `4c1bcde`. Under one non-enumerable `Object.prototype["-1"]` the
+ * mutant reads the inherited value as a frame the moment the stack drains —
+ * with a FRAME-SHAPED value it then loops forever (the reviewer measured >120s,
+ * a hang no `testTimeout` can interrupt because the loop is synchronous), and
+ * with any other value it throws a `TypeError` out of a walk whose whole
+ * contract is that it does not throw. `schema-door.test.ts` pins the SECOND
+ * shape on purpose: the mutant fails in milliseconds there, where pinning the
+ * first would have hung the suite instead of failing it.
  */
 function topOf<T>(stack: readonly T[]): T | undefined {
   return stack.length === 0 ? undefined : stack[stack.length - 1];
@@ -725,6 +845,24 @@ function openObjectFrame(source: object, path: string, grammar: Grammar): BeginR
     }
     walked = enumerable.value;
   }
+  if (grammar.dropOwnProtoKey) {
+    // MEDIUM 1, remediation round 1. Dropped HERE rather than in
+    // `attachChild`, so the key's VALUE is never read either: the walk performs
+    // one caller-supplied read per key it keeps, and a key nothing will ever
+    // validate is not a key worth reading.
+    //
+    // `enumerableWalked` is the point: the list filtered is the one
+    // `Object.keys` produced, so a NON-ENUMERABLE own `__proto__` is still
+    // REFUSED by the hidden-own-property check above rather than dropped here.
+    // A grammar that read per-key descriptors instead would be filtering the
+    // full `Reflect.ownKeys` list and would skip that refusal, so the drop is
+    // deliberately confined to the branch where the two agree — and the only
+    // grammar that sets the flag ({@link DECISION_VIEW}) is in that branch.
+    const enumerableWalked = grammar.perKeyDescriptor ? null : walked;
+    if (enumerableWalked !== null && enumerableWalked.includes(PROTO_KEY)) {
+      walked = enumerableWalked.filter((key) => key !== PROTO_KEY);
+    }
+  }
   return {
     ok: true,
     frame: {
@@ -801,6 +939,11 @@ function attachChild(frame: Frame, value: unknown): void {
   // with no chain for `Set` to walk. C1/C2/C3 are closed by the pair; either
   // half alone is what a future edit would quietly remove, so both are here and
   // the redundancy is stated rather than discovered.
+  //
+  // The `dropOwnProtoKey` drop is NOT here: it is applied to the key LIST in
+  // `openObjectFrame`, so under the decision grammar this function is never
+  // reached with `__proto__` and the key's value is never read at all
+  // (remediation round 1, MEDIUM 1).
   Object.defineProperty(frame.copy, key, ownDataDescriptor(value));
 }
 

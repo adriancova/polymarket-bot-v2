@@ -108,7 +108,7 @@ import {
   canonicalJsonStringify,
   deepFreeze,
   materializeCheckpointableJsonAt,
-  materializeEvaluationViewAt,
+  materializeDecisionViewAt,
   materializeImmutableParamsAt,
 } from "./json.js";
 import {
@@ -911,7 +911,7 @@ class StrategyInstanceRuntime {
    * - **D1** the isolation copy is built PROTOTYPE-FREE with
    *   `Object.defineProperty` and the prototype-free descriptor from
    *   `@polymarket-bot/risk/plain-data`, and the isolated decision is then
-   *   MATERIALIZED (`materializeEvaluationViewAt`) into the runtime's own inert
+   *   MATERIALIZED (`materializeDecisionViewAt`) into the runtime's own inert
    *   tree before anything parses it. The MATERIALIZATION is what closes an
    *   AVAILABILITY defeat measured at base — `z.strictObject` finds unknown
    *   keys with `for…in`, which enumerates INHERITED enumerable names, so ONE
@@ -936,6 +936,22 @@ class StrategyInstanceRuntime {
    * measured in `parse-door.ts`: the arena FAILS CLOSED on the `null` node
    * inside `ModelOutputValueSchema`, and widening it is a `packages/risk`
    * change this package's grant does not carry.
+   *
+   * REMEDIATION ROUND 1 (2026-09-06), review round 1's HIGH 1 and MEDIUM 1 —
+   * two corrections to the above, both on the same region:
+   *
+   * - the decision and its `modelOutputs` are materialized under the DECISION
+   *   grammar (`materializeDecisionViewAt`), which drops an own enumerable
+   *   `__proto__` at EVERY level. The pinned `zod@4.4.3` skips that name at
+   *   every level rather than validating it, so base `53e9f62`'s `parsed.data`
+   *   never carried it and a D3 rebuild off the tree would have persisted an
+   *   unvalidated, contract-forbidden value (`json.ts` header for the
+   *   base-vs-tip table);
+   * - the `modelOutputs` `safeParse` is wrapped in the SAME region-attributing
+   *   `try`/`catch` the decision parse has. It is the one parse in this package
+   *   that is not an arena copy, so it is the one that could still throw out of
+   *   `safeParse`; before this round that throw reached `evaluate()`'s outer
+   *   catch, which attributes it to the wrong region.
    */
   private prepareDecision(
     input: EvaluationInput,
@@ -963,7 +979,7 @@ class StrategyInstanceRuntime {
     // materialized, D2 parsed through the arena, D3 read back off the tree.
     let materializedDecision: unknown;
     try {
-      const walked = materializeEvaluationViewAt(isolated.decision, "decision");
+      const walked = materializeDecisionViewAt(isolated.decision, "decision");
       if (!walked.ok) {
         return invalid(
           `the value returned by strategy callback ${input.callback} could not be read into ` +
@@ -1006,11 +1022,13 @@ class StrategyInstanceRuntime {
     // arena cannot copy the `null` node inside `ModelOutputValueSchema`, so
     // this subtree is asked of the RAW picked schema. It carries zero format
     // checks, so `skipChecks` is a no-op on it — measured and pinned in
-    // `test/unit/strategy-runtime/schema-door.test.ts`. The value asked is the
-    // materialized copy; the answer is used and the output is discarded (D3).
+    // `test/unit/strategy-runtime/schema-door.test.ts`, together with the
+    // `values`/availability class that DOES reach it (pre-existing, fail-closed,
+    // base == tip). The value asked is the materialized copy; the answer is used
+    // and the output is discarded (D3).
     let materializedModelOutputs: unknown;
     if (isolated.modelOutputs !== undefined) {
-      const walked = materializeEvaluationViewAt(isolated.modelOutputs, "modelOutputs");
+      const walked = materializeDecisionViewAt(isolated.modelOutputs, "modelOutputs");
       if (!walked.ok) {
         return invalid(
           `the modelOutputs returned by strategy callback ${input.callback} could not be read ` +
@@ -1019,7 +1037,24 @@ class StrategyInstanceRuntime {
       }
       materializedModelOutputs = walked.value;
       const outputsProbe = ownData({ [MODEL_OUTPUTS_KEY]: materializedModelOutputs });
-      const outputs = RawModelOutputsSchema.safeParse(outputsProbe);
+      let outputs: ReturnType<typeof RawModelOutputsSchema.safeParse>;
+      try {
+        outputs = RawModelOutputsSchema.safeParse(outputsProbe);
+      } catch (cause) {
+        // The SAME belt the decision parse above carries, and on this parse it
+        // is not merely a belt: this is the one schema in the package that is
+        // NOT an arena copy, so it is the one whose lazy normalization can still
+        // throw out of `safeParse` instead of being returned by it. The schema
+        // is warmed at module load (`parse-door.ts`, review round 1 HIGH 1) so
+        // no measured input reaches this; the `catch` is what keeps a future
+        // throw attributed to THIS region instead of to `evaluate()`'s outer
+        // catch, which would name the callback rather than the parse.
+        return invalid(
+          `reading the modelOutputs returned by strategy callback ${input.callback} threw ` +
+            `(${describeCause(cause)}); a decision the runtime cannot read without executing ` +
+            "strategy code is not a decision",
+        );
+      }
       if (!outputs.success) {
         return invalid(
           `strategy callback ${input.callback} did not return a valid §7.5 DecisionResult: ` +
@@ -1029,8 +1064,11 @@ class StrategyInstanceRuntime {
     }
     // D3 — the decision is built from the MATERIALIZED TREE, never from
     // `parsed.data`, and from the CONTRACT'S OWN field names, so a key the
-    // library's unknown-key walk tolerates (`__proto__`, which reads back as
-    // `Object.prototype` off an ordinary `shape`) is not emitted.
+    // library SKIPS rather than validates (`__proto__`; the pinned zod skips it
+    // at every level, `parse-door.ts`) is not emitted at the top level. The
+    // NESTED levels are handled one step earlier, by the decision grammar's
+    // `dropOwnProtoKey` — the field list cannot reach inside `intents[0]` or
+    // `modelOutputs`, and review round 1's MEDIUM 1 is exactly that gap.
     //
     // The fields are emitted in the CONTRACT's declaration order, which is the
     // order the library's own object assembly used. That is not cosmetic: the
