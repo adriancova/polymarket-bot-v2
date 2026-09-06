@@ -107,6 +107,15 @@ interface Mutations {
   readonly addOptionalDependencies?: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /** Package directories whose manifest is removed from the fixture workspace. */
   readonly removePackages?: readonly string[];
+  /**
+   * Workspace dependencies removed from a surviving manifest: package
+   * directory → dependency names dropped. Exists so `removePackages` cases
+   * stay realistic once real consumers exist — removing
+   * `packages/strategies/static-bracket` alone leaves `apps/trader`'s real
+   * dependency on it dangling, and the checker rightly reports `CHK`
+   * (`WP-230` integration, 2026-09-05).
+   */
+  readonly removeDependencies?: Readonly<Record<string, readonly string[]>>;
   /** Brand-new workspace members: package directory → package name. */
   readonly addPackages?: Readonly<Record<string, string>>;
   /** Extra files: repository-relative POSIX path → contents. */
@@ -175,10 +184,11 @@ function buildFixture(mutations: Mutations = {}): string {
       dependencies?: Record<string, string>;
       devDependencies?: Record<string, string>;
     };
+    const dropped = new Set(mutations.removeDependencies?.[posixDir] ?? []);
     const workspaceOnly = (block: Record<string, string> | undefined): Record<string, string> => {
       const kept: Record<string, string> = {};
       for (const [name, specifier] of Object.entries(block ?? {})) {
-        if (specifier.startsWith("workspace:")) kept[name] = specifier;
+        if (specifier.startsWith("workspace:") && !dropped.has(name)) kept[name] = specifier;
       }
       return kept;
     };
@@ -438,7 +448,12 @@ describe("dependency-direction check on fixture graphs", () => {
   });
 
   it("does not treat a strategy class entry matching zero packages as an error", () => {
-    const run = runChecker(buildFixture({ removePackages: ["packages/strategies/static-bracket"] }));
+    const run = runChecker(
+      buildFixture({
+        removePackages: ["packages/strategies/static-bracket"],
+        removeDependencies: { "apps/trader": ["@polymarket-bot/strategy-static-bracket"] },
+      }),
+    );
     expect(run.output).toContain("PASS");
     expect(run.status).toBe(0);
   });

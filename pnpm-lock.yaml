@@ -139,10 +139,68 @@ importers:
         version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   apps/trader:
+    dependencies:
+      '@polymarket-bot/capital-allocator':
+        specifier: workspace:*
+        version: link:../../packages/capital-allocator
+      '@polymarket-bot/decimal':
+        specifier: workspace:*
+        version: link:../../packages/decimal
+      '@polymarket-bot/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
+      '@polymarket-bot/event-bus':
+        specifier: workspace:*
+        version: link:../../packages/event-bus
+      '@polymarket-bot/execution-planner':
+        specifier: workspace:*
+        version: link:../../packages/execution-planner
+      '@polymarket-bot/features':
+        specifier: workspace:*
+        version: link:../../packages/features
+      '@polymarket-bot/ledger':
+        specifier: workspace:*
+        version: link:../../packages/ledger
+      '@polymarket-bot/order-book':
+        specifier: workspace:*
+        version: link:../../packages/order-book
+      '@polymarket-bot/pnl':
+        specifier: workspace:*
+        version: link:../../packages/pnl
+      '@polymarket-bot/risk':
+        specifier: workspace:*
+        version: link:../../packages/risk
+      '@polymarket-bot/simulation':
+        specifier: workspace:*
+        version: link:../../packages/simulation
+      '@polymarket-bot/storage-postgres':
+        specifier: workspace:*
+        version: link:../../packages/storage-postgres
+      '@polymarket-bot/strategy-runtime':
+        specifier: workspace:*
+        version: link:../../packages/strategy-runtime
+      '@polymarket-bot/strategy-sdk':
+        specifier: workspace:*
+        version: link:../../packages/strategy-sdk
+      '@polymarket-bot/strategy-static-bracket':
+        specifier: workspace:*
+        version: link:../../packages/strategies/static-bracket
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
     devDependencies:
+      '@types/node':
+        specifier: ^24.13.3
+        version: 24.13.3
+      esbuild:
+        specifier: ^0.28.2
+        version: 0.28.2
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   packages/binance-adapter:
     dependencies:

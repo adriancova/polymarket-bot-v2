@@ -3,15 +3,40 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Placeholder application scaffold created by WP-010. Implementation arrives with its owning work package.",
+  "description": "Paper trader (WP-230): the layer-3 composition root that assembles local books, the feature engine, the strategy runtime, capital allocation, the risk engine, the execution planner, the simulated venue, the ledger and the PnL engine into one deterministic core event loop. PAPER only — simulated execution, no credential, no signer, no venue connection, no real order.",
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./testing": "./src/testing/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/integration/paper-trader/tsconfig.json",
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/main.mjs",
+    "start": "pnpm run typecheck && pnpm run build && node ./dist/main.mjs",
+    "test:integration": "vitest run --config ../../test/integration/paper-trader/vitest.config.ts"
+  },
+  "dependencies": {
+    "@polymarket-bot/capital-allocator": "workspace:*",
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*",
+    "@polymarket-bot/event-bus": "workspace:*",
+    "@polymarket-bot/execution-planner": "workspace:*",
+    "@polymarket-bot/features": "workspace:*",
+    "@polymarket-bot/ledger": "workspace:*",
+    "@polymarket-bot/order-book": "workspace:*",
+    "@polymarket-bot/pnl": "workspace:*",
+    "@polymarket-bot/risk": "workspace:*",
+    "@polymarket-bot/simulation": "workspace:*",
+    "@polymarket-bot/storage-postgres": "workspace:*",
+    "@polymarket-bot/strategy-static-bracket": "workspace:*",
+    "@polymarket-bot/strategy-runtime": "workspace:*",
+    "@polymarket-bot/strategy-sdk": "workspace:*",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "typescript": "^5.9.2"
+    "@types/node": "^24.13.3",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }
