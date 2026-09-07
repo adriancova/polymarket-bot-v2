@@ -140,7 +140,18 @@ export type OwnPayloadRead =
 /** Internal signal: this value is not plain data and the read stops here. */
 class NotPlainData extends Error {}
 
-function dataDescriptor(value: unknown): PropertyDescriptor {
+/**
+ * The one descriptor every record this package emits is built from.
+ *
+ * Exported (`UNIV-2`) so the registration and envelope doors in
+ * `./caller-door.ts` define their own properties with the SAME prototype-free
+ * descriptor rather than re-deriving it: a second, near-identical copy of this
+ * six-line defence inside one package is exactly the drift
+ * `docs/contracts/schema-boundary.md` §1 warns about. The behaviour is
+ * unchanged from `UNIV-1` — this is a rename plus an export, and
+ * `./lifecycle-door.test.ts` still passes unmodified.
+ */
+export function ownDataDescriptor(value: unknown): PropertyDescriptor {
   // The descriptor itself is prototype-free: an inherited `get` makes every
   // object-literal descriptor throw (ADR-020 §1 class 8), and a door that
   // cannot define its own properties is a door that fails open by crashing.
@@ -227,7 +238,7 @@ function readObjectInto(container: object, depth: number): OwnRecord {
     // An `undefined` member is materialized as ABSENT, so "present but
     // undefined" and "absent" cannot diverge under any later read.
     if (read !== undefined) {
-      Object.defineProperty(out, key, dataDescriptor(read));
+      Object.defineProperty(out, key, ownDataDescriptor(read));
     }
   }
   return out;
@@ -245,7 +256,7 @@ function readArrayInto(container: object, depth: number): readonly unknown[] {
     if (!member.present) {
       throw new NotPlainData("a sparse array: event data has no holes");
     }
-    Object.defineProperty(out, String(index), dataDescriptor(readMember(member.value, depth + 1)));
+    Object.defineProperty(out, String(index), ownDataDescriptor(readMember(member.value, depth + 1)));
   }
   return out;
 }
@@ -281,7 +292,7 @@ export function readOwnPayload(value: unknown): OwnPayloadRead {
 export function ownEmit<T>(fields: Readonly<Record<string, unknown>>): T {
   const out = Object.create(null) as Record<string, unknown>;
   for (const key of Object.keys(fields)) {
-    Object.defineProperty(out, key, dataDescriptor(fields[key]));
+    Object.defineProperty(out, key, ownDataDescriptor(fields[key]));
   }
   return out as T;
 }
@@ -523,7 +534,7 @@ function readList(
     if (read === undefined) {
       return undefined;
     }
-    Object.defineProperty(out, String(out.length), dataDescriptor(read));
+    Object.defineProperty(out, String(out.length), ownDataDescriptor(read));
   }
   return out;
 }
@@ -583,7 +594,7 @@ export function readDeclaredPayload(
       );
       continue;
     }
-    Object.defineProperty(out, entry.key, dataDescriptor(read));
+    Object.defineProperty(out, entry.key, ownDataDescriptor(read));
   }
   if (issues.length > 0) {
     return { ok: false, issues };
