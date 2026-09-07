@@ -68,13 +68,19 @@ export const NO_TOKEN = "9002";
 /**
  * The strategy instance id.
  *
- * A canonical lowercase UUIDv7 whose FIRST hex digit is a LETTER. That is not
- * decoration: `packages/ledger` and `packages/pnl` require `Uuidv7Schema` while
- * `packages/risk` types `context.strategyInstanceId` as a `CodeString` (leading
- * letter). The intersection is this shape, `apps/trader`'s config door refuses
- * anything else AT STARTUP, and the conflict itself is a reported contract
- * question owned elsewhere. This scenario OBSERVES the residual by configuring
- * inside it, exactly as `WP-230`'s fixture does.
+ * A canonical lowercase UUIDv7 whose FIRST hex digit is a LETTER. That WAS the
+ * intersection of two conflicting doors: `packages/ledger` and `packages/pnl`
+ * required `Uuidv7Schema` while `packages/risk` typed
+ * `context.strategyInstanceId` as a `CodeString` (leading letter), so
+ * `apps/trader`'s config door refused anything else AT STARTUP and this
+ * scenario observed the residual by configuring inside it, exactly as
+ * `WP-230`'s fixture did.
+ *
+ * ADR-021 resolved the conflict — the field is an identity, typed
+ * `Uuidv7Schema` at every door — so the letter lead is no longer required. The
+ * value is UNCHANGED: it is still valid, the golden is frozen against it, and
+ * `residuals-observed.test.ts` now pins it as the COMPATIBILITY half of the
+ * ruling rather than as the only shape that works.
  */
 export const INSTANCE_ID = "e18f5c20-2000-7a20-8b00-000000000002";
 export const RUN_ID = "018f5c20-3000-7a30-8b00-000000000003";
