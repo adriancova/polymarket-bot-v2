@@ -67,6 +67,7 @@ import { addDecimal, isZeroDecimal, subDecimal } from "@polymarket-bot/decimal";
 // materialized by `validateTransactionInput` before it was appended, and the
 // door would put a new throw site inside `projectLedger`, which has no
 // containment guard. See `balance.ts`'s header.
+import { appendData } from "@polymarket-bot/risk/plain-data";
 import { attributionBucketKey, attributionBucketsOfValidated } from "./balance.js";
 import { deepFreeze, frozenMap, plainRecord } from "./immutable.js";
 import type { Ledger } from "./ledger.js";
@@ -319,7 +320,8 @@ export function applyTransaction(
       continue;
     }
     breachedBuckets.add(bucketKey);
-    unexplained.push(
+    appendData(
+      unexplained,
       Object.freeze({
         ledgerTransactionId: appended.transaction.ledgerTransactionId,
         sequence: appended.sequence,
@@ -384,7 +386,8 @@ export function applyTransaction(
       const touchedActual = actualBuckets.has(
         attributionBucketKey(entry.accountRef, entry.assetId),
       );
-      unattributed.push(
+      appendData(
+        unattributed,
         touchedActual || partitionBroken
           ? Object.freeze({ ...base, activityKind: "ACTUAL_ARRIVAL" as const, haltRequired: true as const })
           : Object.freeze({ ...base, activityKind: "REATTRIBUTION" as const, haltRequired: false as const }),
@@ -648,7 +651,8 @@ export function auditAttributionPartition(
     const actualNet = actual.get(key) ?? ZERO;
     const attributedNet = attributed.get(key) ?? ZERO;
     if (!isZeroDecimal(subDecimal(actualNet, attributedNet))) {
-      violations.push(
+      appendData(
+        violations,
         Object.freeze({
           accountRef: bucket.accountRef,
           assetId: bucket.assetId,

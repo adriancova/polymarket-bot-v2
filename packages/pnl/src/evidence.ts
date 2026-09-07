@@ -84,6 +84,7 @@ import {
   RunModeSchema,
   Uuidv7Schema,
 } from "@polymarket-bot/domain";
+import { appendData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
@@ -286,7 +287,8 @@ export class PnlSettlementEvidence {
         `booked ledger transaction ${index}`,
       );
       if (!read.ok) {
-        refusals.push(
+        appendData(
+          refusals,
           pnlRefusal(
             "PNL_INPUT_INVALID",
             `settlement evidence ${index} is not a booked ledger transaction`,
@@ -298,7 +300,8 @@ export class PnlSettlementEvidence {
       // D2.
       const parsed = PnlEvidenceTransactionDoor.safeParse(read.value);
       if (!parsed.success) {
-        refusals.push(
+        appendData(
+          refusals,
           pnlRefusal(
             "PNL_INPUT_INVALID",
             `settlement evidence ${index} is not a booked ledger transaction`,
@@ -316,7 +319,8 @@ export class PnlSettlementEvidence {
       // D3 — the booking IS the materialized tree.
       const transaction = read.value as PnlEvidenceTransaction;
       if (byId.has(transaction.ledgerTransactionId)) {
-        refusals.push(
+        appendData(
+          refusals,
           pnlRefusal(
             "PNL_INPUT_INVALID",
             `settlement evidence ${index} repeats ledger transaction ` +
@@ -421,7 +425,8 @@ export function verifyRewardPayoutEvidence(
 
   const refusals: PnlRefusal[] = [];
   const mismatch = (message: string, details: Readonly<Record<string, unknown>>): void => {
-    refusals.push(
+    appendData(
+      refusals,
       pnlRefusal("PNL_REWARD_EVIDENCE_MISMATCH", message, {
         ref: claim.ref,
         ledgerTransactionId: claim.ledgerTransactionId,
