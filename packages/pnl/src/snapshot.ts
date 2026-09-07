@@ -36,6 +36,7 @@ import {
   NonEmptyStringSchema,
   PriceStringSchema,
 } from "@polymarket-bot/domain";
+import { appendData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
@@ -299,7 +300,8 @@ function computeMaterializedPnlSnapshot(
     const allInPnl = addDecimal(coreNetPnl, realizedRewards);
     const belongs = compositeKeyBelongsTo(denomination);
 
-    snapshots.push(
+    appendData(
+      snapshots,
       plainFrozen({
         scope: state.identity.scope,
         environment: state.identity.environment,

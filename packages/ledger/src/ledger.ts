@@ -38,7 +38,7 @@
 
 import { RunModeSchema } from "@polymarket-bot/domain";
 import type { RunMode } from "@polymarket-bot/domain";
-import { readPlainData } from "@polymarket-bot/risk/plain-data";
+import { appendData, readPlainData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 
 // The `…OfValidated` cores, not the D1 doors: every transaction that reaches
@@ -246,7 +246,8 @@ export class Ledger {
     const refusals: LedgerRefusal[] = [];
 
     if (transaction.environment !== this.environment) {
-      refusals.push(
+      appendData(
+        refusals,
         ledgerRefusal(
           "LEDGER_ENVIRONMENT_MISMATCH",
           `this ledger records ${this.environment} transactions; refused a ` +
@@ -262,7 +263,8 @@ export class Ledger {
 
     const existingIndex = this.store.byId.get(transaction.ledgerTransactionId);
     if (existingIndex !== undefined && existingIndex < this.length) {
-      refusals.push(
+      appendData(
+        refusals,
         ledgerRefusal(
           "LEDGER_DUPLICATE_TRANSACTION_ID",
           `transaction ${transaction.ledgerTransactionId} was already appended; ` +
@@ -272,10 +274,10 @@ export class Ledger {
       );
     }
 
-    refusals.push(...this.checkAssetBindings(transaction));
-    refusals.push(...checkPerAssetBalanceOfValidated(transaction));
-    refusals.push(...checkAttributionParityOfValidated(transaction));
-    refusals.push(...this.checkReversal(transaction));
+    for (const refusal of this.checkAssetBindings(transaction)) appendData(refusals, refusal);
+    for (const refusal of checkPerAssetBalanceOfValidated(transaction)) appendData(refusals, refusal);
+    for (const refusal of checkAttributionParityOfValidated(transaction)) appendData(refusals, refusal);
+    for (const refusal of this.checkReversal(transaction)) appendData(refusals, refusal);
 
     if (refusals.length > 0) {
       return ledgerFailure(...refusals);
@@ -325,7 +327,8 @@ export class Ledger {
         checkedKinds.add(entry.assetId);
         const boundKind = this.assetKindOf(entry.assetId);
         if (boundKind !== undefined && boundKind !== entry.assetKind) {
-          refusals.push(
+          appendData(
+            refusals,
             ledgerRefusal(
               "LEDGER_ASSET_KIND_CONFLICT",
               `asset ${entry.assetId} is already recorded as ${boundKind}; ` +
@@ -343,7 +346,8 @@ export class Ledger {
       if (entry.assetKind === "OUTCOME_TOKEN" && entry.marketId !== undefined) {
         const boundMarket = this.assetMarketOf(entry.assetId);
         if (boundMarket !== undefined && boundMarket !== entry.marketId) {
-          refusals.push(
+          appendData(
+            refusals,
             ledgerRefusal(
               "LEDGER_ASSET_MARKET_CONFLICT",
               `outcome token ${entry.assetId} is already bound to market ` +
@@ -427,7 +431,7 @@ export class Ledger {
     // out cannot be answered from `Object.prototype`.
     const appended: AppendedLedgerTransaction = plainFrozen({ sequence, transaction });
 
-    store.buffer.push(appended);
+    appendData(store.buffer, appended);
     store.byId.set(transaction.ledgerTransactionId, sequence);
     if (transaction.reversesLedgerTransactionId !== undefined) {
       store.reversals.set(transaction.reversesLedgerTransactionId, sequence);
@@ -449,7 +453,7 @@ export class Ledger {
         if (bindings === undefined) {
           store.assets.set(entry.assetId, [binding]);
         } else {
-          bindings.push(binding);
+          appendData(bindings, binding);
         }
       }
     }

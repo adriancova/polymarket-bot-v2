@@ -82,6 +82,7 @@
 import type { DecimalString } from "@polymarket-bot/decimal";
 import { addDecimal, isZeroDecimal, subDecimal } from "@polymarket-bot/decimal";
 
+import { appendData } from "@polymarket-bot/risk/plain-data";
 import type { LedgerRefusal } from "./refusals.js";
 import { LedgerConfigurationError, ledgerRefusal, readInputAsData } from "./refusals.js";
 import type { LedgerTransactionInput } from "./transaction.js";
@@ -227,7 +228,8 @@ export function checkPerAssetBalanceOfValidated(
   const refusals: LedgerRefusal[] = [];
   for (const [assetId, net] of netByAssetOfValidated(transaction)) {
     if (!isZeroDecimal(net)) {
-      refusals.push(
+      appendData(
+        refusals,
         ledgerRefusal(
           "LEDGER_UNBALANCED_ASSET",
           `transaction ${transaction.ledgerTransactionId} does not balance for asset ` +
@@ -377,7 +379,8 @@ export function checkAttributionParityOfValidated(
   const refusals: LedgerRefusal[] = [];
   for (const bucket of attributionBucketsOfValidated(transaction).values()) {
     if (!isZeroDecimal(subDecimal(bucket.actualDelta, bucket.attributedDelta))) {
-      refusals.push(
+      appendData(
+        refusals,
         ledgerRefusal(
           "LEDGER_ATTRIBUTION_PARITY_BROKEN",
           `transaction ${transaction.ledgerTransactionId} moves asset ${bucket.assetId} by ` +

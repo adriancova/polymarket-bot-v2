@@ -680,8 +680,7 @@ describe("the measured-class battery over every `packages/ledger` door", { timeo
     // process at every index name and every shape (pinned separately below).
     expect([...new Set(divergences.map((divergence) => divergence.polluted))].sort()).toEqual([
       "REFUSED LEDGER_INPUT_INVALID",
-      "REFUSED alloc:LEDGER_INPUT_INVALID",
-      "REFUSED post:LEDGER_INPUT_INVALID",
+      "REFUSED append:LEDGER_INPUT_INVALID",
     ]);
     // Fail-closed, stated once more as a property rather than as a list: no
     // polluted answer is ever an acceptance, and none is ever a bare throw.

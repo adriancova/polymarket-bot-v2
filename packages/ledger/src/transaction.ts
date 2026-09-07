@@ -31,6 +31,7 @@ import {
   RunModeSchema,
   Uuidv7Schema,
 } from "@polymarket-bot/domain";
+import { appendData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
@@ -187,7 +188,7 @@ function collectUuidRefusals(value: unknown): readonly LedgerRefusal[] {
       UUID_SHAPED_PATTERN.test(candidate) &&
       !CANONICAL_UUID_V7_PATTERN.test(candidate)
     ) {
-      refusals.push(uuidRefusal(field, candidate));
+      appendData(refusals, uuidRefusal(field, candidate));
     }
   };
   for (const field of UUID_FIELDS) {
@@ -291,7 +292,8 @@ function validateMaterializedTransaction(
   const refusals: LedgerRefusal[] = [];
 
   if (transaction.entries.length === 0) {
-    refusals.push(
+    appendData(
+      refusals,
       ledgerRefusal(
         "LEDGER_TRANSACTION_EMPTY",
         "a ledger transaction records at least one balanced pair of entries (§9.15)",
@@ -304,7 +306,8 @@ function validateMaterializedTransaction(
     (transaction.fillId !== undefined || transaction.orderId !== undefined) &&
     transaction.marketId === undefined
   ) {
-    refusals.push(
+    appendData(
+      refusals,
       ledgerRefusal(
         "LEDGER_MARKET_REQUIRED",
         "a transaction that books an order or a fill must name its market " +
@@ -320,7 +323,8 @@ function validateMaterializedTransaction(
 
   transaction.entries.forEach((entry, index) => {
     if (isZeroDecimal(entry.amount)) {
-      refusals.push(
+      appendData(
+        refusals,
         ledgerRefusal(
           "LEDGER_ENTRY_AMOUNT_ZERO",
           "an entry amount of zero moves nothing and records nothing",
@@ -331,7 +335,8 @@ function validateMaterializedTransaction(
     const isVirtual = entry.scope === "VIRTUAL_STRATEGY";
     const hasInstance = entry.instanceId !== undefined;
     if (isVirtual !== hasInstance) {
-      refusals.push(
+      appendData(
+        refusals,
         ledgerRefusal(
           "LEDGER_INSTANCE_SCOPE_MISMATCH",
           isVirtual
@@ -356,7 +361,8 @@ function validateMaterializedTransaction(
     if (seen === undefined) {
       kinds.set(entry.assetId, { kind: entry.assetKind, entryIndex: index });
     } else if (seen.kind !== entry.assetKind) {
-      refusals.push(
+      appendData(
+        refusals,
         ledgerRefusal(
           "LEDGER_ASSET_KIND_CONFLICT",
           "one asset id was declared with two different asset kinds in one transaction",

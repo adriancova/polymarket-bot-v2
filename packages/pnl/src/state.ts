@@ -41,6 +41,7 @@ import {
   subDecimal,
 } from "@polymarket-bot/decimal";
 
+import { appendData } from "@polymarket-bot/risk/plain-data";
 import type { PnlSettlementEvidence } from "./evidence.js";
 import { verifyRewardPayoutEvidence } from "./evidence.js";
 import { frozenMap, frozenSet, plainFrozen } from "./immutable.js";
@@ -292,7 +293,8 @@ function collectUuidRefusals(value: unknown): readonly PnlRefusal[] {
       UUID_SHAPED_PATTERN.test(candidate) &&
       !CANONICAL_UUID_V7_PATTERN.test(candidate)
     ) {
-      refusals.push(
+      appendData(
+        refusals,
         pnlRefusal(
           "PNL_UUID_NOT_CANONICAL",
           `${field} is UUID-shaped but not the canonical lowercase UUIDv7 spelling; ` +

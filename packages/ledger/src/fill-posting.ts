@@ -45,6 +45,7 @@
 import type { DecimalString } from "@polymarket-bot/decimal";
 import { isZeroDecimal, mulDecimal, negateDecimal } from "@polymarket-bot/decimal";
 import { NonEmptyStringSchema, Uuidv7Schema } from "@polymarket-bot/domain";
+import { appendData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
@@ -257,7 +258,8 @@ function buildMaterializedFillPosting(
     }),
   );
   if (allocation.unattributed !== undefined) {
-    slices.push(
+    appendData(
+      slices,
       plainFrozen({
         owner: plainFrozen({
           scope: "UNATTRIBUTED" as const,
@@ -298,7 +300,7 @@ function buildMaterializedFillPosting(
         continue;
       }
       const sliceDelta = buying ? negateDecimal(slice.cost) : slice.cost;
-      entries.push(
+      for (const entry of [
         mirrorCollateralEntry(slice, fill, sliceDelta),
         collateralEntry(
           "EXTERNAL_CLEARING",
@@ -306,9 +308,10 @@ function buildMaterializedFillPosting(
           fill,
           negateDecimal(sliceDelta),
         ),
-      );
+      ]) appendData(entries, entry);
     }
-    transactions.push(
+    appendData(
+      transactions,
       plainFrozen({
         ledgerTransactionId: ids.principalTransactionId,
         eventType: "TRADE_PRINCIPAL" as const,
@@ -327,7 +330,7 @@ function buildMaterializedFillPosting(
     ];
     for (const slice of slices) {
       const sliceDelta = buying ? slice.shares : negateDecimal(slice.shares);
-      entries.push(
+      for (const entry of [
         mirrorTokenEntry(slice, fill, sliceDelta),
         tokenEntry(
           "EXTERNAL_CLEARING",
@@ -335,9 +338,10 @@ function buildMaterializedFillPosting(
           fill,
           negateDecimal(sliceDelta),
         ),
-      );
+      ]) appendData(entries, entry);
     }
-    transactions.push(
+    appendData(
+      transactions,
       plainFrozen({
         ledgerTransactionId: ids.tokenTransactionId,
         eventType: buying ? ("OUTCOME_TOKEN_RECEIPT" as const) : ("OUTCOME_TOKEN_DELIVERY" as const),
@@ -357,12 +361,13 @@ function buildMaterializedFillPosting(
       if (isZeroDecimal(slice.fee)) {
         continue;
       }
-      entries.push(
+      for (const entry of [
         mirrorCollateralEntry(slice, fill, negateDecimal(slice.fee)),
         collateralEntry("EXTERNAL_CLEARING", accounts.attributionClearingRef, fill, slice.fee),
-      );
+      ]) appendData(entries, entry);
     }
-    transactions.push(
+    appendData(
+      transactions,
       plainFrozen({
         ledgerTransactionId: ids.feeTransactionId,
         eventType: "PLATFORM_FEE" as const,
@@ -384,7 +389,8 @@ function buildMaterializedFillPosting(
     ...slices,
   ];
   for (const slice of owners) {
-    pnlRecords.push(
+    appendData(
+      pnlRecords,
       plainFrozen({
         kind: "TRADE" as const,
         ref: tradeRef,
@@ -401,7 +407,8 @@ function buildMaterializedFillPosting(
       }),
     );
     if (!isZeroDecimal(slice.fee) && ids.feeTransactionId !== undefined) {
-      pnlRecords.push(
+      appendData(
+        pnlRecords,
         plainFrozen({
           kind: "FEE" as const,
           ref: ids.feeTransactionId,

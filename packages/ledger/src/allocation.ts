@@ -42,6 +42,7 @@ import {
   RunModeSchema,
   Uuidv7Schema,
 } from "@polymarket-bot/domain";
+import { appendData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
 
@@ -204,7 +205,8 @@ function allocateMaterializedFill(
   claimsInput.forEach((claimInput, index) => {
     const readClaim = readInputAsData(claimInput, `claims[${index}]`, `allocation claim ${index}`);
     if (!readClaim.ok) {
-      refusals.push(
+      appendData(
+        refusals,
         ledgerRefusal("LEDGER_INPUT_INVALID", `claim ${index} is not an allocation claim`, {
           claimIndex: index,
           issues: readClaim.refusal.details["issues"] ?? [],
@@ -214,14 +216,15 @@ function allocateMaterializedFill(
     }
     const parsed = AllocationClaimDoor.safeParse(readClaim.value);
     if (!parsed.success) {
-      refusals.push(
+      appendData(
+        refusals,
         ledgerRefusal("LEDGER_INPUT_INVALID", `claim ${index} is not an allocation claim`, {
           claimIndex: index,
           issues: formatIssues(parsed.error),
         }),
       );
     } else {
-      claims.push(readClaim.value as AllocationClaim);
+      appendData(claims, readClaim.value as AllocationClaim);
     }
   });
   if (refusals.length > 0) {
@@ -231,7 +234,8 @@ function allocateMaterializedFill(
   const seenInstances = new Set<string>();
   for (const claim of claims) {
     if (seenInstances.has(claim.instanceId)) {
-      refusals.push(
+      appendData(
+        refusals,
         ledgerRefusal(
           "LEDGER_ALLOCATION_DUPLICATE_INSTANCE",
           `instance ${claim.instanceId} appears in more than one claim for fill ${fill.fillId}`,
@@ -247,7 +251,8 @@ function allocateMaterializedFill(
     ZERO,
   );
   if (compareDecimal(claimedShares, fill.shares) > 0) {
-    refusals.push(
+    appendData(
+      refusals,
       ledgerRefusal(
         "LEDGER_ALLOCATION_EXCEEDS_FILL",
         `claims total ${claimedShares} shares but fill ${fill.fillId} filled only ` +
