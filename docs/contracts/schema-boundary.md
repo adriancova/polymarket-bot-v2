@@ -69,13 +69,14 @@ At the pinned `zod@4.4.3`. Every row was executed by `GOV-2A` against a
 | Descriptor literals | inherited `get` | every `Object.defineProperty` with an object-literal descriptor throws | no |
 | `values` | inherited `values` | fails **closed** (availability, not permission) | no |
 
-Two further classes were measured after `GOV-2A`, by the named work packages
-rather than by the `2d7e7da` transcripts, and bind the same way:
+Further classes and refinements were measured after `GOV-2A`, by the named
+work packages rather than by the `2d7e7da` transcripts, and bind the same way:
 
 | Class | Pollution | Effect | Warm-safe? |
 | --- | --- | --- | --- |
 | Numeric-name family *(measured by `WP-200-FU1`, `WP-020-FU1`, `WP-170-FU1`)* | a numeric-named property (`"0"`, `"1"`, …, and the non-index `"-1"`) on `Object.prototype` or `Array.prototype`, enumerable or not | not a zod-lazy class — it hits ANY code path that consults the prototype chain through array reads: `decimal.js` result assembly corrupts or aborts (array-index names — covered by `withNeutralIndexNames`, `domain.md` §3.6), iterative walkers throw or hang (`WP-170-FU1`'s walk-stack escape; its `topOf` `"-1"` hang — a NEGATIVE name outside the decimal guard's index regex, guarded per-site), constructors refuse (`WP-200-FU1`'s index-`0` interference). Guarded code fails closed (`DECIMAL_HOSTILE_PROTOTYPE`; typed refusals); unguarded code ESCAPES with bare `TypeError`s or hangs | n/a — schema warmth is irrelevant; the defense is prototype-free structures, `withNeutralIndexNames` for array-index names, or guards written per site |
 | Error construction *(measured by `WP-230` review r1; independently confirmed)* | any class above, present when a REFUSAL is being built | **the warmed arena protects the parse, not zod's error construction**: `safeParse(INVALID)` can THROW out of the refusal path (e.g. under inherited `get` — the descriptor-literal class — while zod assembles its issues), converting a clean refusal into an escaped exception | no — a warm schema still constructs errors lazily per refusal. A CONFORMING door must contain its refusal construction inside `contained(...)` or equivalent exception containment (ADR-020 amendment 2026-09-06); boundaries not yet through a door retain their §3 audit status |
+| Waiver reach + durability; the `status` trigger *(measured by `SETL-1`, confirmed by its review's own cold-isolated probes)* | inherited `optin` **and** `optout` present during a schema's COLD first parse; separately, an inherited `status` during a cold `discriminatedUnion` parse | Two refinements of the rows above. (1) The required-key waiver DOES reach a `.superRefine`-carrying `strictObject` (`SettlementSpecSchema`) — **cold parses only, and DURABLY**: a schema whose first parse ran under the pair stays waived after the pollution is removed; a schema warmed on one honest parse first is immune. (An earlier `SETL-1` round-1 claim that superRefine schemas were unreachable was retracted — its probe harness warmed first; the reversal was review-adjudicated correct.) (2) The cold-`discriminatedUnion` lazy build throws `propValues[key].add is not a function` under an inherited **`status`** — the same key a verification-cell attack sets, so the poisoning trigger and the attack key coincide on this schema family | cold-only for both; the waiver damage and the poisoning both persist for the process |
 
 **The non-enumerable variant is the one to design against.** Enumerable
 pollution is loud: it breaks `for…in`, it trips `strictObject`, and it poisons
@@ -104,8 +105,8 @@ exists but the package's own structure keeps it off a decision;
 | `packages/binance-adapter` (door: `REC-1`, `327cae7`) | `decodeFrame` (through `wire-door.ts`), `BinanceTradePayloadSchema` | wire | **CLOSED (measured class, 2026-09-06)** — the declared-key adoption row reproduced at base byte-for-byte (a `trade` frame with `q` deleted refused clean; under a non-enumerable inherited `q` decoding as `kind=TRADE` with `quantityRaw="999999"` and `unknownFields=[]`, flowing to the normalized `size` AND the dedup fingerprint) and refused at the tip for ALL EIGHT declared trade keys, the bookTicker/serverShutdown/controlError shapes and the combined-stream wrapper `stream`, in both the non-enumerable and enumerable variants (both pinned; review-reproduced with an independent primitive, zero prototype reads at tip). `unknownFields` still records genuine drift; honest-input digests byte-identical. Disclosed residuals (`docs/handoffs/REC-1.md`): D2 not performed (the door restates the schema's presence/bounds checks on its own reads — holds under inherited `skipChecks`); 1 downstream uncontained `.safeParse` in `emission.ts`; `ownControlId` absent/malformed conflation (pollution-only, control-frame correlation value) | — | — |
 | `packages/coinbase-adapter` (door: `REC-1`, `327cae7`) | `classifyFrame` (through `wire-door.ts`), `CoinbaseFrameEnvelopeSchema` | wire | **CLOSED (measured class, 2026-09-06)** — the routing adoption reproduced at base (inherited `channel` routes as TICKER; audit also found inherited `sequence_num`/`timestamp` routed with the key missing from the recorded frame, and a market-trades `size` adoptable into `venueDetail.rawSize`) and refused at the tip in both pollution variants (pinned; review-reproduced independently). The emitted frame is a projection onto the declared keys in schema order (byte-identity verified by two independent digests). Disclosed residuals (`docs/handoffs/REC-1.md`): nested per-channel `.min(1)` checks remain library-dependent under `skipChecks` (base-identical; not reopenable into the measured row — presence reads the same materialized tree); 6 downstream uncontained `.safeParse` in `normalize.ts`/`stream-processor.ts`; no door-level input byte cap | — | — |
 | `packages/polymarket-public` | rtds: `normalizeRtdsFrame` (through `rtds/wire-door.ts`, `REC-1` `327cae7`); CLOB: `parseMarketEvent` (`venue/market-events.ts:248`), `parseVenueOrderBook` (`venue/order-book.ts:123`) | wire | **SPLIT — rtds CLOSED (2026-09-06), CLOB LIVE (newly measured 2026-09-06)**. rtds: the routing adoption (inherited `type` → "update") plus every other envelope/payload cell — including a fabricated ECONOMIC value (inherited `full_accuracy_value` → published `value:"999000"`) and an invented `feedId` (from `topic`) — reproduced at base and refused at the tip, both variants pinned; the TWAP payload's numeric checks still hold under `skipChecks` (unregressed). CLOB (REC-1 measured it and deliberately did NOT close it — not among the authorized rows; review-verified verbatim, unchanged at tip): under a non-enumerable inherited `event_type`, `parseMarketEvent` **THROWS an escaping `TypeError`** (`propValues[key].add is not a function`) from a function documented total; `parseVenueOrderBook` refuses a deleted `hash` clean yet parses an inherited `hash` (`"INVENTED"`) and an inherited `tick_size` (`"0.99"` — an economic parameter) into the recorded book | **MEDIUM** — unattended recorder; the CLOB escape is availability, the `hash`/`tick_size` adoption corrupts recorded books | **bounded grant on the CLOB doors** (§5 item 8; evidence in `docs/handoffs/REC-1.md`) |
-| `packages/universe` | `applyMarketLifecycleEvent` (`lifecycle.ts:269`; `parsed.data` consumed at nine sites (the eight dispatch arms plus the identity check)) | wire (gateway-published lifecycle payloads) | **LIVE** — measured, not assumed (probe O). A `MarketResolved` payload with `outcome` deleted is refused clean (`UNIVERSE_INPUT_INVALID`) and, under a non-enumerable inherited `outcome`, **resolves the market**: `lifecycleState=RESOLVED`, `outcomeState=YES_WIN`. The same holds for `resolvedAt` (a market resolves at `2099-01-01T00:00:00Z`, an instant no event carried) and for `conditionId` — the identity key `checkIdentity` exists to refuse an event naming a different market, and it is satisfiable from the prototype. **Corrected 2026-09-04 (`GOV-2A` remediation round 1)**: the original row read the structure and declined to measure it, which its own rule forbids | **HIGH** — a terminal outcome is the projection's one irreversible transition, restricted by the frozen contract to `MarketResolved` (`domain.md` §6.2, `lifecycle.ts` rule 1), and it is reachable from the prototype; the market's resolved state gates settlement and eligibility | next bounded grant on `packages/universe/**` |
-| `packages/settlement` | `safeParseSettlementSpec` (`spec.ts:1429`; `z.strictObject` + `superRefine`) | caller | **LIVE** — measured by a required-key sweep (probe N). Of the 16 own keys of `terminalSpotSpecSample()`, **14 are required** (deleting any one is refused clean) and **all 14 adopt from `Object.prototype`**: `settlementSpecId`, `seriesId`, `specVersion`, `referenceSymbol`, `observationType`, `resolutionSource`, `comparison`, `strikeSource`, `timestampBoundary`, `roundingRule`, `fallbackSource`, `disputePolicy`, `clarificationPolicy`, `verification`. What that means concretely: an adopted `resolutionSource` is a spec that settles against a source **its own text never named**; an adopted `verification` is sharper still — a spec carrying no verification key at all parses as `{status:"VERIFIED"}` and `isReviewedSettlementSpec` returns `true` — the adopted `VERIFIED` clears both activation gates (`activation.ts:145,159`) and sets `reviewed` at its one non-test call site (`registry.ts:252`). **Corrected 2026-09-04 (`GOV-2A` remediation round 1)**: "refused on type/shape before any format check ran" answered a *format-check* question; adoption is a different class and is reached by a ~30-line sweep | **HIGH** — settlement-spec integrity decides payouts; §6 invariant 9 (a change is a new version, never an edit) and ADR-009 §5.4's stated-policy rule both rest on this door, and the review gate is itself adoptable | next bounded grant on `packages/settlement/**` |
+| `packages/universe` | lifecycle: `applyMarketLifecycleEvent` (through `lifecycle-door.ts`, `UNIV-1` `4d7443b`); registration: `registerSeries` (`registry.ts:168`), `registerMarket` (`registry.ts:294`) | wire (gateway-published lifecycle payloads); caller (registration) | **SPLIT — lifecycle CLOSED (2026-09-07), registration LIVE (newly measured 2026-09-07)**. Lifecycle: all three probe-O rows (inherited `outcome` resolving YES_WIN; `resolvedAt` at an instant no event carried; `conditionId` satisfying the identity guard) reproduced at base in both variants — including all three at once — and refused at tip end-to-end; the 40-key declared sweep closed 40/40 adopting cells with the census re-derived from the frozen schemas; nine `skipChecks` defeats closed by the D2 compensation (proven not-stricter over 40,000 fuzzed instants; a 160,000-payload strictness fuzz drift-free). Disclosed residuals (`docs/handoffs/UNIV-1.md`): the PROJECTION-side dot-read class (five optional `MarketProjection` fields; a rules-hole advance under pollution — base-identical, the state-side analogue of the features output round); the instant-FORMAT residual reaching the terminal transition under `skipChecks` (base-identical, header-disclosed); the un-doored envelope layer (`envelope.ts:44` — adoption arrives as genuine OWN keys the door provably cannot see). Registration (review-reproduced, deliberately not closed — outside the grant's rows): `registerSeries` adopts five keys including a fabricated `{approved:true}` binding — a series approved by a review that never happened; `registerMarket` adopts all four identity keys (the binding `WP-040`'s `markets_immutable_identity` trigger protects) | **HIGH** (lifecycle half now closed; the registration half carries the approved-binding fabrication) | **bounded grants: universe registration doors + envelope door; the universe state-side follow-up** (§5 item 9) |
+| `packages/settlement` (door: `SETL-1`, `af991ee`) | `safeParseSettlementSpec`/`parseSettlementSpec` (through `spec-door.ts`) + the activation path (`activation.ts`, `registry.ts:252`) | caller | **CLOSED (the measured probe-N class, 2026-09-07)** — all 14 required-key adoptions (census corrected: 12 shape-required + 2 cross-field — `comparison`/`strikeSource` via the payoff-model compatibility rule) refused at tip in all three pollution variants; the VERIFIED-from-nothing route closed END-TO-END through `isReviewedSettlementSpec`, both activation gates and the registry call site (narration corrected: the row's former literal shape refuses at base for missing reviewer fields; the two landing shapes are closed); four base throw triggers contained; the D2 compensation held to the schema's own verdict by a six-grammar DIFFERENTIAL sweep (its review arc found and fixed the one gap in BOTH directions — a fail-open offset bound and a clean-process fail-closed half — with the reviewer's 897-row digest byte-identical between true base and tip). Disclosed residuals (`docs/handoffs/SETL-1.md`): the observation/evaluation surface (`evaluateSettlement`/`selectPayoffModel` dot-reads; `SettlementObservationSchema` has no door — same class one layer down, not yet probed end-to-end); cold-lazy poisoning contained-not-cured (fail-closed availability; needs D2) | — | **settlement observation/evaluation grant** (§5 item 10) |
 | `packages/order-book` | `validateIngestMeta` (scalar parses only) | wire meta | **LIVE (inherited from `packages/domain`)** — scalar `safeParse` on `UuidSchema` / `IsoTimestampSchema` / `UnsignedBigIntStringSchema`; no object parse, so no adoption/loss | LOW–MEDIUM | next bounded grant on `packages/order-book/**` |
 | `packages/risk`, `packages/capital-allocator` (`WP-180`, `98a6cc1`) | every door | caller | **CLOSED** — D1–D4. Probe K3 confirms the arena copy of a domain schema still refuses what the raw schema accepts under `skipChecks`. *(Updated 2026-09-06, `WP-180-FU3` `8c14b47`: all 77 remaining `Array.prototype.push` sites across risk's ten other modules are `CreateDataProperty` appends through the one exported `appendData`, and direct-door index-name divergence measured 37→0 per intrinsic. The index-name availability residual shrinks to zod's own array assembly — warm `handleArrayResult` (`schemas.js:678`), cold `Doc.write` via `generateFastpass` — ACCEPT→REFUSE only, owned by a designed `isFreshOrdinaryContainer` round with the four arena consumers in scope. ADR-021: risk types `context.strategyInstanceId` as the arena `Uuidv7Schema`, and the allocator's four identity doors followed on 2026-09-06 (`ALLOC-1`, merged `d9f70a6` — which also closed a measured base cap-evasion surface: a re-cased id kept its own `byStrategyInstance` exposure bucket). Updated 2026-09-07: `TRDR-1` merged at `65ae56c`, replacing the trader's interim intersection grammar with the real `Uuidv7Schema`; startup now admits 0-leading UUIDv7s and enforces version/variant bits. ADR-021 is discharged end to end.)* | — | — |
 | `packages/execution-planner` (`WP-190`, `5aa11e3`) | every door | caller | **CLOSED** — same mechanism *(originally the third mirror; since the `WP-180-FU2` collapse, `625c83b`, it consumes the one canonical `packages/risk` door over §2.1 row S4 — corrected 2026-09-05)* | — | — |
@@ -113,16 +114,24 @@ exists but the package's own structure keeps it off a decision;
 | `packages/decimal` | no `zod` | — | n/a — outside the zod class. *(Updated 2026-09-06: `GOV-2A` `follow_up` 5's `divDecimal` explicit-options hazard and the index-name family were both closed by `WP-020-FU1`, merged `edf6b1d` — every arithmetic/tick door now runs inside `withNeutralIndexNames` with exact `finally` restoration, and an unneutralizable non-configurable shape is refused typed (`HostilePrototypeError` / `DECIMAL_HOSTILE_PROTOTYPE`), never computed through; `decimal.js` pinned exactly `10.6.0`; `domain.md` §3.6)* | — | — |
 
 **The tally, and it is the number every other document must quote.** The table
-above carries **LIVE for five merged packages, plus one split package**:
-`packages/{domain,event-bus,order-book,universe,settlement}` fully LIVE, and
-`packages/polymarket-public` SPLIT (rtds closed, CLOB newly measured LIVE).
-Nine packages are **CLOSED** (`risk`, `capital-allocator`,
+above carries **LIVE for three merged packages, plus two split packages**:
+`packages/{domain,event-bus,order-book}` fully LIVE;
+`packages/polymarket-public` SPLIT (rtds closed, CLOB newly measured LIVE)
+and `packages/universe` SPLIT (lifecycle closed, registration newly
+measured LIVE). Ten packages are **CLOSED** (`risk`, `capital-allocator`,
 `execution-planner`, `features` (output side — its input-side records carry
 an owned residual, not a zod door), `ledger`, `pnl`, `strategy-runtime`,
-and, for their measured classes, `binance-adapter` and `coinbase-adapter`),
+`settlement` (the measured probe-N class), and, for their measured classes,
+`binance-adapter` and `coinbase-adapter`),
 `apps/data-gateway`'s two measured rows are closed, and five packages are
 **outside the class** (`decimal`, `storage-postgres`, `storage-wal`,
 `storage-parquet`, `observability` — no `zod` door). *(Recounted
+2026-09-07: `universe` SPLIT (lifecycle closed) and `settlement`
+closed-for-the-measured-class when `UNIV-1` (`4d7443b`) and `SETL-1`
+(`af991ee`) merged — `UNIV-1` also measured LIVE registration-door adoptions;
+`SETL-1` identified an observation/evaluation surface not yet probed
+end-to-end. These are newly recorded successor obligations outside the
+closed measured classes. Recounted
 2026-09-06, third recount that day: `binance-adapter`, `coinbase-adapter`
 and the `apps/data-gateway` rows closed and `polymarket-public` split when
 `REC-1` merged (`327cae7`) — its CLOB half was measured LIVE in the same
@@ -227,16 +236,19 @@ statement of conformance.
    **Deliberately last**, and deliberately not a CI gate today: a gate every
    merged package fails is a gate that gets waived wholesale
    (`dependency-direction.md` §6.1 item 1).
-7. **`packages/settlement` and `packages/universe`** *(added 2026-09-04 when
-   both rows became LIVE on measurement — §3)*. Two bounded grants, one per
-   package, each owing the D1-D4 door plus a regression test per measured row:
-   `safeParseSettlementSpec` / `parseSettlementSpec` and the activation path that
-   consumes them (`activation.ts:128`), and `applyMarketLifecycleEvent`'s
-   `parsed.data` consumption at all nine sites. **Settlement ranks with the
-   monetary follow-ups** (item 1): an adoptable `verification` means the review
-   gate on model-dependent activation is not load-bearing. Each owner must probe
-   the doors this audit did **not** reach — the other seven lifecycle folds, the
-   series-binding doors, and specs other than the sampled one.
+7. **`packages/settlement` and `packages/universe` — EXECUTED**
+   (2026-09-07): the two bounded grants landed as `SETL-1` (merged
+   `af991ee`; review r1 CHANGES REQUIRED — a fail-open offset bound and
+   three unpinned defences — then a both-directions remediation and a
+   confirming-pass ACCEPT with the reviewer's independent digest
+   byte-identical between true base and tip; `docs/handoffs/SETL-1.md`)
+   and `UNIV-1` (merged `4d7443b`; review r1 ACCEPT, 0 blockers;
+   `docs/handoffs/UNIV-1.md`). The D1–D4 doors stand on
+   `safeParseSettlementSpec`/the activation path and on
+   `applyMarketLifecycleEvent`'s nine consumption sites, each with a
+   regression per measured row in both pollution variants. Successor
+   obligations they spawned: items 9 and 10.
+
 8. **`packages/polymarket-public` CLOB doors** *(added 2026-09-06 when
    `REC-1` measured them LIVE — §3)*: a bounded grant on
    `parseMarketEvent` (`venue/market-events.ts:248` — an escaping
@@ -245,6 +257,21 @@ statement of conformance.
    (`venue/order-book.ts:123` — inherited `hash` and `tick_size` parse
    into the recorded book). Evidence: `docs/handoffs/REC-1.md`. The grant
    must not touch the frozen e2e golden.
+
+9. **`packages/universe` follow-ups** *(added 2026-09-07 from `UNIV-1`'s
+   review — evidence in `docs/handoffs/UNIV-1.md`)*: (a) the
+   registration doors — `registerSeries` adopts five keys including a
+   fabricated approved binding, `registerMarket` adopts all four
+   identity keys (review-reproduced); (b) the envelope door
+   (`envelope.ts:44` — an envelope-layer adoption arrives as genuine own
+   keys downstream); (c) the state-side follow-up (the projection-side
+   dot-read class + the instant-format residual + the unpinned
+   fail-closed drifts).
+10. **`packages/settlement` observation/evaluation grant** *(added
+    2026-09-07 from `SETL-1` — evidence in `docs/handoffs/SETL-1.md`)*:
+    `evaluateSettlement`/`selectPayoffModel` dot-read caller-supplied
+    views and `SettlementObservationSchema` has no door — the same class
+    one layer below the closed spec door.
 
 ---
 
