@@ -35,6 +35,19 @@
  * fact (§1.2) that `docs/contracts/domain.md` §6.4 deliberately leaves to the
  * catalog, so this snapshot carries the opaque handle of the
  * `catalog.fee_schedule_snapshots` row.
+ *
+ * AND EVERY SNAPSHOT THIS MODULE COMPARES OR STORES IS OWN DATA
+ * (`./parameters-door.ts`, `UNIV-3`). `UNIV-2`'s review measured that the
+ * comparison below read `previous[field]` / `next[field]` on `zod`'s ordinary
+ * `Object.prototype`-bearing output, so an absent optional was answered by the
+ * prototype: three categories nobody observed entered an IMMUTABLE recorded
+ * version, a real change was answered `UNIVERSE_PARAMETERS_UNCHANGED`, and the
+ * emitted §7.4 payload lost a category that really changed. The door re-states
+ * the frozen schema on its own reads — so an inherited `skipChecks`, which
+ * admitted `tickSize:"-9"` into a recorded version at base, no longer does —
+ * and emits the snapshot prototype-free, which is what closes the comparison.
+ * The documented `UniverseValidationError` throw contract is unchanged: the
+ * re-statement raises exactly that error, with the same issue rendering.
  */
 
 import { equalsDecimal } from "@polymarket-bot/decimal";
@@ -54,6 +67,7 @@ import {
 } from "@polymarket-bot/domain";
 import { z } from "zod";
 
+import { ownRecord } from "./caller-door.js";
 import {
   UniverseValidationError,
   universeFailure,
@@ -62,6 +76,7 @@ import {
   type UniverseResult,
 } from "./errors.js";
 import { MarketLifecycleStateSchema } from "./lifecycle-state.js";
+import { ownSnapshotField, restateObservation } from "./parameters-door.js";
 import { instantMilliseconds, isSameInstant } from "./time.js";
 
 /** One versioned snapshot of a market's trading parameters (§9.2, §10.1). */
@@ -156,8 +171,13 @@ function fieldChanged(
   previous: MarketParameters,
   next: MarketParameters,
 ): boolean {
-  const before = previous[field];
-  const after = next[field];
+  // OWN reads (`UNIV-2` r1 MED-1). This is the row: `next` used to be `zod`'s
+  // ordinary output, so "does the new snapshot carry an `openTime`?" was
+  // answered by `Object.prototype`, and the answer decided what
+  // `changedParameters` recorded, what the §7.4 payload announced, and whether
+  // the whole change was refused as a no-op.
+  const before = ownSnapshotField(previous, field);
+  const after = ownSnapshotField(next, field);
   if (before === undefined || after === undefined) {
     return before !== after;
   }
@@ -192,7 +212,10 @@ function establishedParameterKinds(
 ): readonly TradingParameterKind[] {
   const established: TradingParameterKind[] = [];
   for (const [field, kind] of PARAMETER_FIELDS) {
-    if (parameters[field] !== undefined) {
+    // OWN, for the same reason the comparison is: at base an inherited
+    // `openTime`/`closeTime`/`feeScheduleRef` put three categories nobody
+    // observed into version 1's immutable `changedParameters`.
+    if (ownSnapshotField(parameters, field) !== undefined) {
       established.push(kind);
     }
   }
@@ -206,17 +229,38 @@ function parameterVersionRef(
   return `${internalMarketId}/v${String(parametersVersion)}`;
 }
 
+/**
+ * D4. One recorded version, emitted prototype-free and frozen.
+ *
+ * A version is read by someone else's `version.previousParametersVersion ===
+ * undefined` (`apps/data-gateway/src/directory.ts` does exactly that), and an
+ * ordinary object answers that question from `Object.prototype`. `ownRecord`
+ * preserves the literal's key order, so the recorded JSON does not move.
+ */
 function freezeVersion(version: MarketParameterVersion): MarketParameterVersion {
-  Object.freeze(version.parameters);
   Object.freeze(version.changedParameters);
-  return Object.freeze(version);
+  return ownRecord<MarketParameterVersion>(version as unknown as Record<string, unknown>);
 }
 
+/** D4 for the history record; its `versions` list stays a frozen array. */
 function freezeHistory(history: MarketParameterHistory): MarketParameterHistory {
   Object.freeze(history.versions);
-  return Object.freeze(history);
+  return ownRecord<MarketParameterHistory>(history as unknown as Record<string, unknown>);
 }
 
+/**
+ * Judges an observation and reads it as OWN data.
+ *
+ * Two steps, in this order and for the reason every door in this package gives:
+ * the frozen schema judges FIRST, so an honest-but-wrong observation keeps its
+ * own message byte for byte, and `./parameters-door.ts` then re-states the same
+ * declarations on its own reads — which is what survives an inherited
+ * `skipChecks` (`UNIV-2` r1 MED-2: `tickSize:"-9"` recorded at base). Both
+ * failures raise the SAME documented `UniverseValidationError`, so no caller
+ * sees a new verdict class.
+ *
+ * @throws {UniverseValidationError} when the observation is not valid.
+ */
 function parseObservation(value: unknown): ParameterObservation {
   const result = ParameterObservationSchema.safeParse(value);
   if (!result.success) {
@@ -229,7 +273,15 @@ function parseObservation(value: unknown): ParameterObservation {
       issues,
     );
   }
-  return result.data;
+  const read = restateObservation(value);
+  if (!read.ok) {
+    throw new UniverseValidationError(
+      `market parameter observation is invalid: ${read.issues.join("; ")}`,
+      read.issues,
+    );
+  }
+  // D3: the stored values come from the own read, never from `result.data`.
+  return read.value as unknown as ParameterObservation;
 }
 
 /**
@@ -350,7 +402,12 @@ export function appendParameterVersion(
       versions: [...history.versions, version],
     }),
     version,
-    event: {
+    // D4: the §7.4 payload this package emits is prototype-free, so a
+    // consumer's `event.tickSize === undefined` — the frozen schema makes both
+    // economic fields optional — cannot be answered by `Object.prototype`.
+    // `ownRecord` preserves the literal's key order, so the published bytes do
+    // not move.
+    event: ownRecord<TradingParametersChangedPayload>({
       internalMarketId: history.internalMarketId,
       conditionId,
       parametersVersion,
@@ -359,7 +416,7 @@ export function appendParameterVersion(
       changedParameters: changed,
       tickSize: parsed.parameters.tickSize,
       minimumOrderSize: parsed.parameters.minimumOrderSize,
-    },
+    }),
   });
 }
 

@@ -71,6 +71,7 @@ import { MarketIdentitySchema, type MarketIdentity } from "./identity.js";
 import { containedParse, type OwnRecord } from "./lifecycle-door.js";
 import type { EventOrder, MarketLifecycleEventType, MarketLifecycleInput } from "./lifecycle.js";
 import { SeriesDefinitionSchema, type SeriesDefinition } from "./series.js";
+import { EVENT_ORDER_FIELDS, openEventOrder } from "./state-door.js";
 
 // ---------------------------------------------------------------------------
 // The declared tables. `./registration-door.test.ts` derives each one from the
@@ -148,8 +149,15 @@ export const LIFECYCLE_INPUT_KEYS: readonly string[] = Object.freeze([
   "order",
 ]);
 
-/** `EventOrder` (§7.1 ordering; `ingestSeq` is compared with `BigInt`). */
-export const EVENT_ORDER_KEYS: readonly string[] = Object.freeze(["gatewayEpoch", "ingestSeq"]);
+/**
+ * `EventOrder` (§7.1 ordering; `ingestSeq` is compared with `BigInt`).
+ *
+ * DERIVED from `./state-door.ts`'s declared table rather than retyped, so the
+ * key list and the re-stated shapes are the same declaration (`UNIV-3`).
+ */
+export const EVENT_ORDER_KEYS: readonly string[] = Object.freeze(
+  EVENT_ORDER_FIELDS.map((field) => field.key),
+);
 
 /** `ObservedOutcomeStateInput`. */
 export const OBSERVED_OUTCOME_STATE_KEYS: readonly string[] = Object.freeze([
@@ -368,18 +376,22 @@ export function openLifecycleEventInput(value: unknown): DoorRead<MarketLifecycl
   const rawOrder = read.value["order"];
   let order: EventOrder | undefined;
   if (rawOrder !== undefined) {
-    const own = openOwnValue(rawOrder);
-    if (!own.ok) {
-      return { ok: false, issues: own.issues };
+    // The SHAPE is re-stated here as well as read (`UNIV-2` r1, the `ingestSeq`
+    // asymmetry the reviewer flagged as unowned): `./envelope-door.ts` already
+    // re-states the canonical unsigned-integer grammar for the same two §7.1
+    // keys, because `./lifecycle.ts`'s replay guard hands `ingestSeq` to
+    // `BigInt(...)`. This door rebuilt `order` without it, so at base — with no
+    // pollution at all — a missing `ingestSeq` threw `TypeError: Cannot convert
+    // undefined to a BigInt` and a fractional one threw a `RangeError`, both
+    // straight OUT of `applyMarketEvent`, which returns a typed result and which
+    // no caller in this repository wraps. `"0x10"` was accepted and ordered as
+    // 16, and an absent `gatewayEpoch` read as a NEW gateway epoch, skipping the
+    // replay guard entirely. All four become one typed refusal, fail-closed.
+    const opened = openEventOrder(rawOrder);
+    if (!opened.ok) {
+      return { ok: false, issues: opened.issues };
     }
-    const fields = readOwnFields(asOwnRecord(own.value), EVENT_ORDER_KEYS, "an event order");
-    if (!fields.ok) {
-      return { ok: false, issues: fields.issues };
-    }
-    order = ownRecord<EventOrder>({
-      gatewayEpoch: fields.value["gatewayEpoch"],
-      ingestSeq: fields.value["ingestSeq"],
-    });
+    order = opened.value;
   }
   // D4 as well: the record `./lifecycle.ts` receives is prototype-free, so its
   // own `input.order === undefined` test cannot be answered by the prototype

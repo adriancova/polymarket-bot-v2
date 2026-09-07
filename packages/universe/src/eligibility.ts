@@ -32,6 +32,7 @@ import {
 import type { MarketLifecycleState } from "./lifecycle-state.js";
 import { currentParameterVersion } from "./parameters.js";
 import { isApprovedSeriesBinding, type SeriesDefinition } from "./series.js";
+import { ownProjectionField } from "./state-door.js";
 import {
   ACTIVATION_PERMITTED_STATUS,
   isConsistentSettlementActivation,
@@ -379,7 +380,14 @@ export function evaluateMarketReadiness(
       // §6 invariant 9: a review of superseded rules is not a review of what
       // is trading now. Both sides are REQUIRED: an unknown market rules
       // version cannot confirm the review applies, so it fails closed.
-      if (projection.rulesVersionId === undefined) {
+      // An OWN read (`./state-door.ts`, `UNIV-3`). This is the SHARPEST cell of
+      // the projection-side class: at base, in BOTH pollution variants, an
+      // inherited `rulesVersionId` equal to the reviewed spec's turned
+      // `modelDependentActivationAllowed: false` plus this very refusal into
+      // `true` with NO refusals at all — §9.2's model-dependent activation
+      // gate, opened by a value the projection never recorded.
+      const marketRulesVersionId = ownProjectionField(projection, "rulesVersionId");
+      if (marketRulesVersionId === undefined) {
         refusals.push(
           universeRefusal(
             "UNIVERSE_SETTLEMENT_RULES_VERSION_DRIFT",
@@ -387,14 +395,14 @@ export function evaluateMarketReadiness(
             { internalMarketId, specRulesVersionId: settlement.rulesVersionId },
           ),
         );
-      } else if (settlement.rulesVersionId !== projection.rulesVersionId) {
+      } else if (settlement.rulesVersionId !== marketRulesVersionId) {
         refusals.push(
           universeRefusal(
             "UNIVERSE_SETTLEMENT_RULES_VERSION_DRIFT",
             "the reviewed settlement spec names a different market rules version than the market is trading under",
             {
               internalMarketId,
-              marketRulesVersionId: projection.rulesVersionId,
+              marketRulesVersionId,
               specRulesVersionId: settlement.rulesVersionId,
             },
           ),

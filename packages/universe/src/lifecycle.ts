@@ -34,6 +34,21 @@
  *    a `MarketClosing` that moves the close is a legitimate reschedule (§9.2
  *    versions `close_time`) and is applied.
  *
+ * AND THE PROJECTION ENTERS THROUGH `./state-door.ts` (`UNIV-3`). A payload
+ * door is only worth as much as the STATE it folds the payload into, and
+ * `UNIV-1`'s review measured that this module read the projection with `.`: all
+ * five of `MarketProjection`'s optional fields were answerable from
+ * `Object.prototype`. At base `c2c0733`, in BOTH pollution variants, an
+ * inherited `rulesVersionId` made {@link applyRulesChanged} APPLY over a rules
+ * hole that clean input refuses `UNIVERSE_RULES_VERSION_MISMATCH`; an inherited
+ * `openedAt` swallowed a `MarketOpened` as idempotent so the market never left
+ * `DISCOVERED`; an inherited `resolvedAt` accepted a SECOND resolution that
+ * clean input refuses `UNIVERSE_TERMINAL_OUTCOME_CONFLICT`; an inherited
+ * `lastEventOrder` dropped every fresh event as `UNIVERSE_EVENT_REPLAYED`. The
+ * arms below therefore read a null-prototype record built from the projection's
+ * OWN enumerable data — own-ENUMERABLE because that is exactly what the
+ * `{...projection}` spread already propagated, so an honest fold is unchanged.
+ *
  * AND EVERY PAYLOAD ENTERS THROUGH `./lifecycle-door.ts`. Rule 1 is only worth
  * as much as the reading of the event that carries the terminal outcome, and
  * `docs/contracts/schema-boundary.md` §3 (probe O) measured that a `zod` parse
@@ -78,6 +93,14 @@ import {
 } from "./lifecycle-state.js";
 import { parameterVersion, type MarketParameterHistory } from "./parameters.js";
 import type { MarketSeriesBinding } from "./series.js";
+import {
+  openEventOrder,
+  openOwnProjection,
+  ownProjectionField,
+  ownProjectionRecord,
+  restateDeclaredFormats,
+  withOwnField,
+} from "./state-door.js";
 import { instantMilliseconds, isSameInstant } from "./time.js";
 
 /** A clarification observed for a market (`catalog.market_clarifications`). */
@@ -174,6 +197,21 @@ function invalidPayload(
   );
 }
 
+/**
+ * The projection under a fold, in its two readings.
+ *
+ * `own` is what every GUARD reads — a null-prototype record of the projection's
+ * own enumerable data, so an absent optional answers `undefined` rather than
+ * whatever `Object.prototype` holds. `carrier` is the object an UNCHANGED fold
+ * returns: the caller's own projection, untouched, so an idempotent
+ * re-application keeps object identity exactly as it did before this door
+ * existed.
+ */
+interface FoldState {
+  readonly carrier: MarketProjection;
+  readonly own: MarketProjection;
+}
+
 interface MarketReference {
   readonly internalMarketId: string;
   readonly conditionId: string;
@@ -234,19 +272,38 @@ function checkOrder(
   );
 }
 
-function withOrder(
-  projection: MarketProjection,
-  order: EventOrder | undefined,
-): MarketProjection {
-  return order === undefined ? projection : { ...projection, lastEventOrder: order };
+function withOrder(state: FoldState, order: EventOrder | undefined): FoldState {
+  if (order === undefined) {
+    return state;
+  }
+  return {
+    carrier: { ...state.own, lastEventOrder: order },
+    own: withOwnField(state.own, "lastEventOrder", order),
+  };
 }
 
-function applied(
-  projection: MarketProjection,
-  changed: boolean,
-  idempotent = false,
-): UniverseResult<ProjectionApplied> {
-  return universeOk({ projection: Object.freeze(projection), changed, idempotent });
+/**
+ * A fold that BUILT a new projection. D4: the emitted projection is
+ * prototype-free, so a consumer's `projection.resolvedAt === undefined` cannot
+ * be answered by `Object.prototype` either.
+ */
+function applied(projection: MarketProjection, changed: boolean): UniverseResult<ProjectionApplied> {
+  return universeOk({ projection: ownProjectionRecord(projection), changed, idempotent: false });
+}
+
+/**
+ * A fold that changed nothing.
+ *
+ * The projection is STILL emitted prototype-free. Handing the caller's own
+ * object back would keep object identity — which is what base did, and what an
+ * earlier draft of this door did — but it would also mean that whether
+ * `projection.resolvedAt === undefined` can be answered by `Object.prototype`
+ * depends on whether the last event happened to change anything. A door with a
+ * condition on it is not a door. The registry re-stores the result either way,
+ * so no caller in this repository observes the identity.
+ */
+function unchanged(carrier: MarketProjection): UniverseResult<ProjectionApplied> {
+  return universeOk({ projection: ownProjectionRecord(carrier), changed: false, idempotent: true });
 }
 
 function regression(
@@ -289,17 +346,61 @@ export function applyMarketLifecycleEvent(
   }
   const payload = door.value;
 
-  const identityRefusal = checkIdentity(projection, payload as MarketReference, input.eventType);
+  // The two FORMATS `./lifecycle-door.ts` discloses it does not re-state
+  // (`UNIV-1` r1 MED-2 and NOTE-2). Under an inherited `skipChecks` a
+  // `MarketResolved` carrying `resolvedAt: "Aug 28 2026"` RESOLVED the market at
+  // base, and a `tickSize: "1.50"` threw `InvalidDecimalStringError` out of this
+  // function. With `zod`'s checks intact this refuses nothing new.
+  const formatIssues = restateDeclaredFormats(input.eventType, payload);
+  if (formatIssues.length > 0) {
+    return universeFailure(invalidPayload(input.eventType, formatIssues));
+  }
+
+  // The §7.1 ordering record, re-stated to the same grammar `./envelope-door.ts`
+  // already uses (`UNIV-2` r1): base handed `order.ingestSeq` straight to
+  // `BigInt(...)`, so a missing or fractional one threw OUT of a function that
+  // returns a typed result, and an absent `gatewayEpoch` skipped the replay
+  // guard altogether.
+  let order: EventOrder | undefined;
+  if (input.order !== undefined) {
+    const opened = openEventOrder(input.order);
+    if (!opened.ok) {
+      return universeFailure(
+        universeRefusal(
+          "UNIVERSE_INPUT_INVALID",
+          `${input.eventType} event order is invalid: ${opened.issues.join("; ")}`,
+          { eventType: input.eventType, issues: opened.issues },
+        ),
+      );
+    }
+    order = opened.value;
+  }
+
+  // D1 on the STATE (`./state-door.ts`): the guards below read a null-prototype
+  // record of the projection's OWN enumerable data.
+  const opened = openOwnProjection(projection);
+  if (!opened.ok) {
+    return universeFailure(
+      universeRefusal(
+        "UNIVERSE_INPUT_INVALID",
+        `${input.eventType} was applied to an invalid projection: ${opened.issues.join("; ")}`,
+        { eventType: input.eventType, issues: opened.issues },
+      ),
+    );
+  }
+  const state: FoldState = { carrier: projection, own: opened.value };
+
+  const identityRefusal = checkIdentity(state.own, payload as MarketReference, input.eventType);
   if (identityRefusal !== undefined) {
     return universeFailure(identityRefusal);
   }
 
-  const orderRefusal = checkOrder(projection, input.order, input.eventType);
+  const orderRefusal = checkOrder(state.own, order, input.eventType);
   if (orderRefusal !== undefined) {
     return universeFailure(orderRefusal);
   }
 
-  const next = withOrder(projection, input.order);
+  const next = withOrder(state, order);
 
   switch (input.eventType) {
     case "MarketDiscovered":
@@ -331,7 +432,7 @@ export function applyMarketLifecycleEvent(
 }
 
 function applyDiscovered(
-  projection: MarketProjection,
+  { carrier, own: projection }: FoldState,
   payload: z.infer<typeof MarketDiscoveredPayloadSchema>,
 ): UniverseResult<ProjectionApplied> {
   // Registration carries the parameter set the event does not (§9.2 lists tick
@@ -368,17 +469,17 @@ function applyDiscovered(
     );
   }
   if (payload.metadataVersion === projection.metadataVersion) {
-    return applied(projection, false, true);
+    return unchanged(carrier);
   }
   return applied({ ...projection, metadataVersion: payload.metadataVersion }, true);
 }
 
 function applyMetadataChanged(
-  projection: MarketProjection,
+  { carrier, own: projection }: FoldState,
   payload: z.infer<typeof MarketMetadataChangedPayloadSchema>,
 ): UniverseResult<ProjectionApplied> {
   if (payload.metadataVersion === projection.metadataVersion) {
-    return applied(projection, false, true);
+    return unchanged(carrier);
   }
   if (payload.metadataVersion < projection.metadataVersion) {
     return universeFailure(
@@ -411,7 +512,7 @@ function applyMetadataChanged(
 }
 
 function applyRulesChanged(
-  projection: MarketProjection,
+  { carrier, own: projection }: FoldState,
   payload: z.infer<typeof MarketRulesChangedPayloadSchema>,
 ): UniverseResult<ProjectionApplied> {
   if (
@@ -432,18 +533,18 @@ function applyRulesChanged(
     );
   }
   if (payload.rulesVersionId === projection.rulesVersionId) {
-    return applied(projection, false, true);
+    return unchanged(carrier);
   }
   return applied({ ...projection, rulesVersionId: payload.rulesVersionId }, true);
 }
 
 function applyOpened(
-  projection: MarketProjection,
+  { carrier, own: projection }: FoldState,
   payload: z.infer<typeof MarketOpenedPayloadSchema>,
 ): UniverseResult<ProjectionApplied> {
   if (projection.openedAt !== undefined) {
     if (isSameInstant(projection.openedAt, payload.openedAt)) {
-      return applied(projection, false, true);
+      return unchanged(carrier);
     }
     // An open instant is a fact about the past: it happened once.
     return universeFailure(
@@ -461,7 +562,7 @@ function applyOpened(
 }
 
 function applyClosing(
-  projection: MarketProjection,
+  { carrier, own: projection }: FoldState,
   payload: z.infer<typeof MarketClosingPayloadSchema>,
 ): UniverseResult<ProjectionApplied> {
   if (projection.lifecycleState === "RESOLVED") {
@@ -472,7 +573,7 @@ function applyClosing(
     projection.closesAt !== undefined &&
     isSameInstant(projection.closesAt, payload.closesAt)
   ) {
-    return applied(projection, false, true);
+    return unchanged(carrier);
   }
   // A close instant is a SCHEDULE, and §9.2 versions `close_time`: a
   // reschedule is applied rather than refused, and the new instant is what
@@ -481,7 +582,7 @@ function applyClosing(
 }
 
 function applyResolved(
-  projection: MarketProjection,
+  { carrier, own: projection }: FoldState,
   payload: z.infer<typeof MarketResolvedPayloadSchema>,
 ): UniverseResult<ProjectionApplied> {
   if (projection.lifecycleState === "RESOLVED") {
@@ -490,7 +591,7 @@ function applyResolved(
       projection.resolvedAt !== undefined &&
       isSameInstant(projection.resolvedAt, payload.resolvedAt)
     ) {
-      return applied(projection, false, true);
+      return unchanged(carrier);
     }
     return universeFailure(
       universeRefusal(
@@ -520,7 +621,7 @@ function applyResolved(
 }
 
 function applyClarification(
-  projection: MarketProjection,
+  { carrier, own: projection }: FoldState,
   payload: z.infer<typeof MarketClarificationObservedPayloadSchema>,
 ): UniverseResult<ProjectionApplied> {
   const existing = projection.clarifications.find(
@@ -528,7 +629,7 @@ function applyClarification(
   );
   if (existing !== undefined) {
     if (isSameInstant(existing.observedAt, payload.observedAt)) {
-      return applied(projection, false, true);
+      return unchanged(carrier);
     }
     return universeFailure(
       universeRefusal(
@@ -600,7 +701,7 @@ function applyClarification(
 }
 
 function applyParametersChanged(
-  projection: MarketProjection,
+  { carrier, own: projection }: FoldState,
   payload: z.infer<typeof TradingParametersChangedPayloadSchema>,
 ): UniverseResult<ProjectionApplied> {
   // The authoritative parameter history is written by `recordMarketParameters`,
@@ -653,7 +754,7 @@ function applyParametersChanged(
     );
   }
 
-  return applied(projection, false, true);
+  return unchanged(carrier);
 }
 
 /** An outcome state observed outside the §7.4 event set. */
@@ -682,6 +783,17 @@ export function recordObservedOutcomeState(
   projection: MarketProjection,
   input: ObservedOutcomeStateInput,
 ): UniverseResult<ProjectionApplied> {
+  const opened = openOwnProjection(projection);
+  if (!opened.ok) {
+    return universeFailure(
+      universeRefusal(
+        "UNIVERSE_INPUT_INVALID",
+        `an outcome state was recorded against an invalid projection: ${opened.issues.join("; ")}`,
+        { issues: opened.issues },
+      ),
+    );
+  }
+  const own = opened.value;
   const parsed = MarketOutcomeStateSchema.safeParse(input.outcomeState);
   if (!parsed.success) {
     return universeFailure(
@@ -699,19 +811,19 @@ export function recordObservedOutcomeState(
       ),
     );
   }
-  if (projection.lifecycleState === "RESOLVED") {
+  if (own.lifecycleState === "RESOLVED") {
     return universeFailure(
       universeRefusal(
         "UNIVERSE_TERMINAL_OUTCOME_CONFLICT",
         "the market has already resolved; its outcome cannot be moved back to a non-terminal state",
-        { recordedOutcome: projection.outcomeState, proposed: parsed.data },
+        { recordedOutcome: own.outcomeState, proposed: parsed.data },
       ),
     );
   }
-  if (projection.outcomeState === parsed.data) {
-    return applied(projection, false, true);
+  if (own.outcomeState === parsed.data) {
+    return unchanged(projection);
   }
-  return applied({ ...projection, outcomeState: parsed.data }, true);
+  return applied({ ...own, outcomeState: parsed.data }, true);
 }
 
 /**
@@ -735,19 +847,27 @@ export function effectiveLifecycleState(
   projection: MarketProjection,
   asOf: IsoTimestamp,
 ): MarketLifecycleState {
-  if (projection.lifecycleState === "RESOLVED") {
+  // OWN reads (`./state-door.ts`). This function answers a question rather than
+  // returning a result, so it cannot refuse — but it can decline to read the
+  // prototype: at base an inherited `closesAt` derived `CLOSED` for a market
+  // whose schedule nobody had announced.
+  const stored = ownProjectionField(projection, "lifecycleState") as
+    | EventDrivenLifecycleState
+    | undefined;
+  const lifecycleState = stored ?? "DISCOVERED";
+  if (lifecycleState === "RESOLVED") {
     return "RESOLVED";
   }
   const closeInstant = effectiveCloseInstant(projection);
   if (closeInstant === undefined) {
-    return projection.lifecycleState;
+    return lifecycleState;
   }
   const closeMs = instantMilliseconds(closeInstant);
   const asOfMs = instantMilliseconds(asOf);
   if (closeMs === undefined || asOfMs === undefined) {
-    return projection.lifecycleState;
+    return lifecycleState;
   }
-  return asOfMs >= closeMs ? "CLOSED" : projection.lifecycleState;
+  return asOfMs >= closeMs ? "CLOSED" : lifecycleState;
 }
 
 /**
@@ -758,16 +878,41 @@ export function effectiveLifecycleState(
  * exist, because it is the later statement about the same fact.
  */
 export function effectiveCloseInstant(projection: MarketProjection): IsoTimestamp | undefined {
-  if (projection.closesAt !== undefined) {
-    return projection.closesAt;
+  const closesAt = ownProjectionField(projection, "closesAt");
+  if (typeof closesAt === "string") {
+    return closesAt;
   }
-  const current = projection.parameters.versions[projection.parameters.versions.length - 1];
+  const history = ownProjectionField(projection, "parameters") as
+    | MarketParameterHistory
+    | undefined;
+  const versions = history?.versions;
+  if (!Array.isArray(versions)) {
+    return undefined;
+  }
+  // The stored snapshot is itself prototype-free (`./parameters-door.ts`), so
+  // this last read cannot inherit either: at base an absent `closeTime` on the
+  // recorded parameters answered `2000-01-01T00:00:00Z` from the prototype, in
+  // BOTH variants.
+  const current = versions[versions.length - 1];
   return current?.parameters.closeTime;
 }
 
-/** Clarifications that arrived after the market opened, in observation order. */
+/**
+ * Clarifications that arrived after the market opened, in observation order.
+ *
+ * FROZEN (`UNIV-1` r1 LOW-3): this was the one list this package handed back
+ * with a writable `length`. No consumer in the repository mutates it (grepped:
+ * the two call sites read `.length` and `.filter`), so freezing it costs
+ * nothing and closes the last mutable emission.
+ */
 export function clarificationsAfterOpen(
   projection: MarketProjection,
 ): readonly MarketClarificationRecord[] {
-  return projection.clarifications.filter((record) => record.afterOpen);
+  const clarifications = ownProjectionField(projection, "clarifications");
+  if (!Array.isArray(clarifications)) {
+    return Object.freeze([]);
+  }
+  return Object.freeze(
+    (clarifications as readonly MarketClarificationRecord[]).filter((record) => record.afterOpen),
+  );
 }

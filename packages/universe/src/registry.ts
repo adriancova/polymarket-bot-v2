@@ -70,6 +70,7 @@ import {
   openSeriesDefinition,
   ownDiscoveredEvent,
 } from "./registration-door.js";
+import { openMetadataVersion, ownProjectionRecord } from "./state-door.js";
 import {
   UNBOUND_SERIES_BINDING,
   approvedSeriesBinding,
@@ -153,7 +154,13 @@ function withMarket(
   projection: MarketProjection,
 ): UniverseRegistry {
   const markets = new Map(registry.markets);
-  markets.set(projection.identity.internalMarketId, deepFreeze(projection));
+  // D4 (`UNIV-3`): every projection the registry STORES is prototype-free, so a
+  // consumer's `projection.rulesVersionId === undefined` — the §9.2 activation
+  // gate asks exactly that — cannot be answered by `Object.prototype`. The
+  // helper returns an already-prototype-free record unchanged, so an idempotent
+  // fold does not replace the stored object with a copy.
+  const stored = ownProjectionRecord(projection);
+  markets.set(stored.identity.internalMarketId, deepFreeze(stored));
   return Object.freeze({ ...registry, markets: immutableMap(markets) });
 }
 
@@ -367,7 +374,21 @@ export function registerMarket(
     return universeFailure(invalid("market identity", identityRead.issues));
   }
   const identity: MarketIdentity = identityRead.value;
-  const metadataVersion = (opened.value.metadataVersion as number | undefined) ?? 1;
+  // `metadataVersion` is judged by the schema that will have to CARRY it
+  // (`UNIV-2` r1, unjudged review fact). This value flows into the projection
+  // and, unchanged, into the `MarketDiscovered` payload `discoveredEvent`
+  // emits — where `MarketDiscoveredPayloadSchema`'s own `metadataVersion`
+  // field (§7.4's `VersionSchema`) refuses `0`, `-1`, `1.5`, `"3"` and an
+  // unsafe integer. Base passed all of those through into an event the frozen
+  // contract would reject, which is not a NEW validation: it is the emitted
+  // payload's own verdict, applied where the value enters. Re-stated on an own
+  // read of the number as well, so an inherited `skipChecks` cannot switch it
+  // off.
+  const metadataVersionRead = openMetadataVersion(opened.value.metadataVersion);
+  if (!metadataVersionRead.ok) {
+    return universeFailure(invalid("market registration", metadataVersionRead.issues));
+  }
+  const metadataVersion = metadataVersionRead.value;
 
   const existing = registry.markets.get(identity.internalMarketId);
   if (existing !== undefined) {
@@ -417,15 +438,17 @@ export function registerMarket(
     return universeFailure(invalid("market parameter observation", history.issues));
   }
   const parameters = history.value;
-  const projection: MarketProjection = deepFreeze({
-    identity,
-    seriesBinding: UNBOUND_SERIES_BINDING,
-    lifecycleState: "DISCOVERED",
-    outcomeState: "PENDING",
-    metadataVersion,
-    clarifications: [],
-    parameters,
-  });
+  const projection: MarketProjection = deepFreeze(
+    ownProjectionRecord({
+      identity,
+      seriesBinding: UNBOUND_SERIES_BINDING,
+      lifecycleState: "DISCOVERED",
+      outcomeState: "PENDING",
+      metadataVersion,
+      clarifications: [],
+      parameters,
+    }),
+  );
 
   const markets = new Map(registry.markets);
   markets.set(identity.internalMarketId, projection);
@@ -539,13 +562,35 @@ export function bindMarketToSeries(
     );
   }
 
+  // THE TWO APPROVAL PATHS NOW AGREE (`UNIV-2` r1, unjudged review fact).
+  // `approveSeries` round-trips the candidate through the frozen
+  // `SeriesDefinitionSchema`, so its `approvedBy`/`approvedAt` are the two review
+  // facts `SeriesBindingApprovalSchema` declares. This function stored
+  // `opened.value.approvedBy as string` unguarded, so `123` and `{a: 1}` became
+  // the human who approved a market's membership in a series. It is the SAME
+  // door, reused: no new validation is invented here, and the refusal is the
+  // one the other path already produced.
+  const approval = openApprovedSeriesDefinition(
+    series,
+    opened.value.approvedBy,
+    opened.value.approvedAt,
+  );
+  if (!approval.ok) {
+    return universeFailure(invalid("series binding", approval.issues));
+  }
+  const binding = approval.value.binding;
+  /* c8 ignore next 3 -- unreachable: the door builds the approved arm itself. */
+  if (!binding.approved) {
+    return universeFailure(invalid("series binding", ["binding: the approval was not recorded"]));
+  }
+
   return universeOk(
     withMarket(registry, {
       ...market.value,
       seriesBinding: approvedSeriesBinding(
         series.seriesId,
-        opened.value.approvedBy as string,
-        opened.value.approvedAt as string,
+        binding.approvedBy,
+        binding.approvedAt,
       ),
     }),
   );
