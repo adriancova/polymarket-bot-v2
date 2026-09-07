@@ -81,6 +81,14 @@ import {
   shiftInstant,
 } from "./values.js";
 import { RtdsEnvelopeSchema, RtdsTwapUpdatePayloadSchema } from "./venue.js";
+import {
+  containedParse,
+  isOwnRecord,
+  ownInstantField,
+  ownNumberField,
+  ownStringField,
+  readOwnEnvelope,
+} from "./wire-door.js";
 
 /** The domain's bound on identifier-like strings, which `symbol` is one of. */
 const MAX_SYMBOL_LENGTH = 200;
@@ -143,6 +151,16 @@ function normalizeEnvelope(
   observedIndex: number,
   context: RtdsNormalizationContext,
 ): EnvelopeOutcome {
+  // D1. Before a schema runs and before any property is read: rebuild the
+  // envelope as own data with no prototype. Every DECISION below reads that
+  // tree.
+  //
+  // A problem's `raw` stays the value AS RECEIVED, deliberately: it is
+  // evidence, not a door output, and §8.3 requires the incident to carry what
+  // arrived rather than this module's reading of it. Nothing decides anything
+  // from it.
+  const read = readOwnEnvelope(value);
+
   const problem = (
     code: RtdsProblemCode,
     detail: string,
@@ -160,14 +178,29 @@ function normalizeEnvelope(
     },
   });
 
-  const envelope = RtdsEnvelopeSchema.safeParse(value);
-  if (!envelope.success) {
+  if (!read.ok) {
     return problem(
       "RTDS_INVALID_ENVELOPE",
-      `envelope did not match the documented {topic, type, timestamp, payload} shape: ${describeIssues(envelope.error)}`,
+      `envelope could not be read as JSON data: ${read.detail}`,
     );
   }
-  const { topic, type } = envelope.data;
+  const raw: unknown = read.value;
+
+  const envelope = containedParse(RtdsEnvelopeSchema, raw);
+  if (!envelope.ok) {
+    return problem(
+      "RTDS_INVALID_ENVELOPE",
+      `envelope did not match the documented {topic, type, timestamp, payload} shape: ${envelope.detail}`,
+    );
+  }
+  // D3, AND the routing decision itself: `topic` and `type` are what put an
+  // update into a recorded series, and they are read from the materialized
+  // tree rather than taken from `parsed.data`.
+  const topic = isOwnRecord(raw) ? ownStringField(raw, "topic") : undefined;
+  const type = isOwnRecord(raw) ? ownStringField(raw, "type") : undefined;
+  if (!isOwnRecord(raw) || topic === undefined || type === undefined) {
+    return problem("RTDS_INVALID_ENVELOPE", ENVELOPE_NOT_OWNED);
+  }
 
   if (!isTwapTopic(topic)) {
     // The base channel and a truncated topic: an unknown topic is an untrusted
@@ -195,15 +228,23 @@ function normalizeEnvelope(
     );
   }
 
-  const parsed = RtdsTwapUpdatePayloadSchema.safeParse(envelope.data.payload);
-  if (!parsed.success) {
+  const rawPayload: unknown = raw["payload"];
+  const parsed = containedParse(RtdsTwapUpdatePayloadSchema, rawPayload);
+  if (!parsed.ok) {
     return problem(
       "RTDS_INVALID_TWAP_PAYLOAD",
-      `payload did not match the documented {symbol, value, full_accuracy_value, timestamp, window_s} shape: ${describeIssues(parsed.error)}`,
+      `payload did not match the documented {symbol, value, full_accuracy_value, timestamp, window_s} shape: ${parsed.detail}`,
       { topic, channel },
     );
   }
-  const payload = parsed.data;
+  // D3. Every payload field is taken from the materialized tree, and each read
+  // restates the SHAPE the schema declares — so the exact E18 value, the
+  // observation instant and the window this event is built from are the ones
+  // the frame carried, never ones assembled by the library.
+  const payload = isOwnRecord(rawPayload) ? ownTwapPayload(rawPayload) : undefined;
+  if (payload === undefined) {
+    return problem("RTDS_INVALID_TWAP_PAYLOAD", PAYLOAD_NOT_OWNED, { topic, channel });
+  }
 
   if (payload.symbol === "" || payload.symbol.length > MAX_SYMBOL_LENGTH) {
     return problem(
@@ -300,16 +341,21 @@ function normalizeEnvelope(
     windowStartAt: windowStart.value.iso,
     windowEndAt: observation.value.iso,
   };
-  const validated = ReferenceTwapObservedContract.payloadSchema.safeParse(domainPayload);
-  if (!validated.success) {
+  // Contained like every other parse in this chain: the payload is internally
+  // constructed, so this is a defensive assertion rather than an admitted lie
+  // (ADR-020 §4) — but a refusal's issue construction can still THROW under
+  // pollution (the 2026-09-06 amendment), and nothing in a message loop may
+  // throw.
+  const validated = containedParse(ReferenceTwapObservedContract.payloadSchema, domainPayload);
+  if (!validated.ok) {
     return problem(
       "RTDS_PAYLOAD_CONTRACT_VIOLATION",
-      `the normalized payload was rejected by ReferenceTwapObserved: ${describeIssues(validated.error)}`,
+      `the normalized payload was rejected by ReferenceTwapObserved: ${validated.detail}`,
       { topic, symbol: payload.symbol, channel },
     );
   }
 
-  const publisher = normalizeRtdsPublisherInstant(envelope.data.timestamp);
+  const publisher = normalizeRtdsPublisherInstant(ownInstantField(raw, "timestamp"));
   const provenance: RtdsEventProvenance = {
     source: "rtds",
     sourceChannel: channel,
@@ -337,12 +383,47 @@ function normalizeEnvelope(
   };
 }
 
-function describeIssues(error: {
-  readonly issues: readonly { readonly path: readonly PropertyKey[]; readonly message: string }[];
-}): string {
-  return error.issues
-    .map((issue) => `${issue.path.join(".") || "<root>"}: ${issue.message}`)
-    .join("; ");
+/**
+ * The detail an envelope gets when the schema accepted a shape the envelope
+ * does not itself carry. Reachable only under prototype pollution, and
+ * fail-closed: a frame is never routed by a topic or a type it did not declare.
+ */
+const ENVELOPE_NOT_OWNED =
+  "envelope did not match the documented {topic, type, timestamp, payload} shape: it does not carry `topic` and `type` as its own values, and a frame is never routed by a type it never declared";
+
+/** The same statement for the payload's own fields. */
+const PAYLOAD_NOT_OWNED =
+  "payload did not match the documented {symbol, value, full_accuracy_value, timestamp, window_s} shape: it does not carry every documented field as its own value";
+
+/** D3: what the PAYLOAD carries, read from the materialized tree. */
+function ownTwapPayload(record: {
+  readonly [key: string]: unknown;
+}):
+  | {
+      readonly symbol: string;
+      readonly full_accuracy_value: string;
+      readonly timestamp: number | string;
+      readonly window_s: number;
+    }
+  | undefined {
+  const symbol = ownStringField(record, "symbol");
+  const fullAccuracyValue = ownStringField(record, "full_accuracy_value");
+  const timestamp = ownInstantField(record, "timestamp");
+  const windowSeconds = ownNumberField(record, "window_s");
+  if (
+    symbol === undefined ||
+    fullAccuracyValue === undefined ||
+    timestamp === undefined ||
+    windowSeconds === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    symbol,
+    full_accuracy_value: fullAccuracyValue,
+    timestamp,
+    window_s: windowSeconds,
+  };
 }
 
 function truncate(value: string): string {
