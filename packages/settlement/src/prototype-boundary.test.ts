@@ -853,6 +853,23 @@ describe("the settlement spec door: no declared field comes from the prototype",
           [
             "01936f00-0000-7000-8000-00000000c001",
             "01936F00-0000-7000-8000-00000000C001",
+            // SETL-1's confirming pass left ONE residual here: two single-group
+            // case-widening drifts of `UUID_V7_FORM` survived the corpus. SETL-2
+            // MEASURED the gap at base `c2c0733` and it is SIX, not two — the
+            // uppercase row above is uppercase in groups 1 AND 5 at once, so
+            // widening either group alone still refuses it and only the
+            // all-groups drift (the `i` flag) is killed. A drift is killed only
+            // by a spelling that is uppercase in EXACTLY the widened group, so
+            // the gap needs one row per group. These six are each schema-
+            // REJECTED and each kills exactly one drift: group 1, group 2,
+            // group 3's hex tail, the `[89ab]` variant nibble, group 4's tail,
+            // group 5.
+            "01936F00-0000-7000-8000-00000000c001",
+            "01936f00-000A-7000-8000-00000000c001",
+            "01936f00-0000-700A-8000-00000000c001",
+            "01936f00-0000-7000-A000-00000000c001",
+            "01936f00-0000-7000-8A00-00000000c001",
+            "01936f00-0000-7000-8000-00000000C001",
             "01936f00-0000-4000-8000-00000000c001",
             "01936f00-0000-7000-c000-00000000c001",
             "01936f00-0000-7000-8000-00000000c00",

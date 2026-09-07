@@ -41,10 +41,17 @@ import type {
   TerminalSpotObservation,
   TwapObservation,
 } from "../observation.js";
+import {
+  buildOwnObservation,
+  observationOwnIssues,
+  readOwnObservation,
+} from "../observation-door.js";
 import { payoutPerShare, type OutcomePayoutPerShare } from "../payout.js";
+import { ownEmit, ownField } from "../spec-door.js";
 import { isReviewedSettlementSpec, type SettlementSpec } from "../spec.js";
 import { instantMilliseconds } from "../time.js";
 import type { ComparisonOperator, MarketOutcomeState, PayoffModelId } from "../vocabulary.js";
+import { COMPARISON_OPERATORS, PAYOFF_MODEL_IDS } from "../vocabulary.js";
 import { checkPayoffModelCompatibility } from "./compatibility.js";
 
 /** The comparison a model actually performed, so a settlement can be audited. */
@@ -104,8 +111,15 @@ export function selectPayoffModel(spec: SettlementSpec): SettlementResult<Payoff
   if (refusals.length > 0) {
     return settlementFailure(...refusals);
   }
-  /* c8 ignore next 3 -- unreachable: an empty refusal list implies a declared model. */
-  if (spec.payoffModel === undefined) {
+  // D3: the selected model is the one the SPEC states. `spec.payoffModel` is a
+  // dot read on a caller-supplied document, and at base it was answered by
+  // `Object.prototype` — a spec declaring no model at all selected
+  // `TerminalSpotBinaryModel` and settled markets with it.
+  const payoffModel: unknown = ownField(spec, "payoffModel");
+  /* c8 ignore next 9 -- second line: unreachable through the compatibility check
+     above, which refuses on its own own-read both an absent model and one
+     outside the vocabulary. */
+  if (typeof payoffModel !== "string" || !PAYOFF_MODEL_IDS.includes(payoffModel as PayoffModelId)) {
     return settlementFailure(
       settlementRefusal(
         "SETTLEMENT_SPEC_FIELD_REQUIRED",
@@ -114,7 +128,7 @@ export function selectPayoffModel(spec: SettlementSpec): SettlementResult<Payoff
       ),
     );
   }
-  return settlementOk(spec.payoffModel);
+  return settlementOk(payoffModel as PayoffModelId);
 }
 
 function timestampRefusal(field: string, value: string): SettlementRefusal {
@@ -174,14 +188,19 @@ function checkTwapWindow(
     readonly windowEndAt: string;
   },
 ): SettlementResult<void> {
-  if (window.windowSeconds !== spec.windowSeconds) {
+  // D3: the reviewed window is the one the SPEC states, read from the document
+  // itself. A dot read here is answered by `Object.prototype` for a spec that
+  // states none, and this comparison is the only thing standing between a
+  // reviewed 30s average and a reading of something else.
+  const specWindowSeconds: unknown = ownField(spec, "windowSeconds");
+  if (window.windowSeconds !== specWindowSeconds) {
     return settlementFailure(
       settlementRefusal(
         "SETTLEMENT_OBSERVATION_WINDOW_MISMATCH",
-        `observation averages ${String(window.windowSeconds)}s but the spec settles on ${String(spec.windowSeconds)}s`,
+        `observation averages ${String(window.windowSeconds)}s but the spec settles on ${String(specWindowSeconds)}s`,
         {
           observationWindowSeconds: window.windowSeconds,
-          specWindowSeconds: spec.windowSeconds,
+          specWindowSeconds,
         },
       ),
     );
@@ -223,9 +242,26 @@ function checkTwapWindow(
   return settlementOk(undefined);
 }
 
+/**
+ * The comparison the SPEC states, or the refusal that it states none.
+ *
+ * D3: an own read, and the operator is checked against the vocabulary rather
+ * than trusted, because this value decides the DIRECTION of every settlement.
+ * Measured at base: with `comparison` inherited, a `GTE` market settled `NO_WIN`
+ * under an inherited `LT` — the spec's own text was never consulted.
+ *
+ * SECOND LINE, and disclosed as such: every cell of the compatibility matrix
+ * REQUIRES `comparison`, and that check is itself an own read, so a spec that
+ * states none has already been refused before this runs (pinned by "the first
+ * gate answers before the second-line reads are reached").
+ */
 function requireComparison(spec: SettlementSpec): SettlementResult<ComparisonOperator> {
-  /* c8 ignore next 9 -- unreachable through a validated spec: every model requires `comparison`. */
-  if (spec.comparison === undefined) {
+  const comparison: unknown = ownField(spec, "comparison");
+  /* c8 ignore next 12 -- second line; see the note above. */
+  if (
+    typeof comparison !== "string" ||
+    !COMPARISON_OPERATORS.includes(comparison as ComparisonOperator)
+  ) {
     return settlementFailure(
       settlementRefusal(
         "SETTLEMENT_SPEC_FIELD_REQUIRED",
@@ -234,14 +270,41 @@ function requireComparison(spec: SettlementSpec): SettlementResult<ComparisonOpe
       ),
     );
   }
-  return settlementOk(spec.comparison);
+  return settlementOk(comparison as ComparisonOperator);
 }
 
 function binaryOutcome(satisfied: boolean): MarketOutcomeState {
   return satisfied ? "YES_WIN" : "NO_WIN";
 }
 
-/** Builds an evaluation, attaching the payout for a terminal outcome. */
+/**
+ * D4. The audited comparison, emitted with a null prototype and frozen.
+ *
+ * It is the record of what actually settled a market, so a consumer reading a
+ * field it does not carry must read nothing — not `Object.prototype`.
+ */
+function comparisonRecord(
+  operator: ComparisonOperator,
+  left: DecimalString,
+  right: DecimalString,
+  satisfied: boolean,
+): ComparisonEvaluation {
+  return ownEmit<ComparisonEvaluation>([
+    ["operator", operator],
+    ["left", left],
+    ["right", right],
+    ["satisfied", satisfied],
+  ]);
+}
+
+/**
+ * Builds an evaluation, attaching the payout for a terminal outcome.
+ *
+ * D4 (ADR-020 §3): emitted with a NULL PROTOTYPE and frozen. Measured at base —
+ * `payoutPerShare` is ABSENT on a `PENDING` settlement, and
+ * `evaluation.payoutPerShare` then read an inherited `{yes:"1", no:"1"}`, i.e. a
+ * redemption value for a market that has determined none (ADR-009 §4).
+ */
 function evaluation(
   spec: SettlementSpec,
   model: PayoffModelId,
@@ -250,9 +313,16 @@ function evaluation(
 ): SettlementEvaluation {
   const payout = payoutPerShare(outcomeState);
   const reviewed = isReviewedSettlementSpec(spec);
-  return payout.ok
-    ? { model, outcomeState, comparison, reviewed, payoutPerShare: payout.value }
-    : { model, outcomeState, comparison, reviewed };
+  const fields: (readonly [string, unknown])[] = [
+    ["model", model],
+    ["outcomeState", outcomeState],
+    ["comparison", comparison],
+    ["reviewed", reviewed],
+  ];
+  if (payout.ok) {
+    fields.push(["payoutPerShare", payout.value]);
+  }
+  return ownEmit<SettlementEvaluation>(fields);
 }
 
 function evaluateTerminalSpot(
@@ -265,12 +335,12 @@ function evaluateTerminalSpot(
   }
   const satisfied = satisfiesComparison(observation.observedValue, observation.strike, operator.value);
   return settlementOk(
-    evaluation(spec, "TerminalSpotBinaryModel", binaryOutcome(satisfied), {
-      operator: operator.value,
-      left: observation.observedValue,
-      right: observation.strike,
-      satisfied,
-    }),
+    evaluation(
+      spec,
+      "TerminalSpotBinaryModel",
+      binaryOutcome(satisfied),
+      comparisonRecord(operator.value, observation.observedValue, observation.strike, satisfied),
+    ),
   );
 }
 
@@ -294,12 +364,12 @@ function evaluateTwap(
   }
   const satisfied = satisfiesComparison(observation.twapValue, observation.strike, operator.value);
   return settlementOk(
-    evaluation(spec, "TwapBinaryModel", binaryOutcome(satisfied), {
-      operator: operator.value,
-      left: observation.twapValue,
-      right: observation.strike,
-      satisfied,
-    }),
+    evaluation(
+      spec,
+      "TwapBinaryModel",
+      binaryOutcome(satisfied),
+      comparisonRecord(operator.value, observation.twapValue, observation.strike, satisfied),
+    ),
   );
 }
 
@@ -313,8 +383,10 @@ function evaluateReferenceOpenUpDown(
   }
 
   // The spec decides whether this series settles on a spot reading or on a
-  // TWAP; the observation must be the one the spec was reviewed for.
-  if (spec.observationType === "TWAP") {
+  // TWAP; the observation must be the one the spec was reviewed for. D3: which
+  // of the two it is comes from the document's own field.
+  const observationType: unknown = ownField(spec, "observationType");
+  if (observationType === "TWAP") {
     if (
       observation.windowSeconds === undefined ||
       observation.windowStartAt === undefined ||
@@ -324,7 +396,7 @@ function evaluateReferenceOpenUpDown(
         settlementRefusal(
           "SETTLEMENT_OBSERVATION_WINDOW_MISMATCH",
           "the spec settles this series on a TWAP observation, but the observation carries no window",
-          { specWindowSeconds: spec.windowSeconds },
+          { specWindowSeconds: ownField(spec, "windowSeconds") },
         ),
       );
     }
@@ -348,8 +420,8 @@ function evaluateReferenceOpenUpDown(
     return settlementFailure(
       settlementRefusal(
         "SETTLEMENT_OBSERVATION_WINDOW_MISMATCH",
-        `the spec settles this series on a ${spec.observationType} observation, but the observation carries an averaging window`,
-        { observationType: spec.observationType },
+        `the spec settles this series on a ${String(observationType)} observation, but the observation carries an averaging window`,
+        { observationType },
       ),
     );
   }
@@ -382,12 +454,12 @@ function evaluateReferenceOpenUpDown(
     operator.value,
   );
   return settlementOk(
-    evaluation(spec, "ReferenceOpenUpDownModel", binaryOutcome(satisfied), {
-      operator: operator.value,
-      left: observation.observedValue,
-      right: observation.referenceOpen,
-      satisfied,
-    }),
+    evaluation(
+      spec,
+      "ReferenceOpenUpDownModel",
+      binaryOutcome(satisfied),
+      comparisonRecord(operator.value, observation.observedValue, observation.referenceOpen, satisfied),
+    ),
   );
 }
 
@@ -471,12 +543,12 @@ function evaluateThresholdByDate(
     observation.threshold,
     operator.value,
   );
-  const comparison: ComparisonEvaluation = {
-    operator: operator.value,
-    left: observation.extremeValue,
-    right: observation.threshold,
+  const comparison: ComparisonEvaluation = comparisonRecord(
+    operator.value,
+    observation.extremeValue,
+    observation.threshold,
     satisfied,
-  };
+  );
 
   // A met threshold settles the question early — it cannot be un-met later.
   if (satisfied) {
@@ -490,9 +562,34 @@ function evaluateThresholdByDate(
   return settlementOk(evaluation(spec, "ThresholdByDateModel", "PENDING", comparison));
 }
 
+/** The observation door's refusal, composed the way this package composes one. */
+function observationInvalid(issues: readonly string[]): SettlementRefusal {
+  return settlementRefusal(
+    "SETTLEMENT_OBSERVATION_INVALID",
+    `settlement observation is invalid: ${issues.join("; ")}`,
+    { issues },
+  );
+}
+
 /**
- * Settles one market: selects the spec's model, checks that the observation
- * belongs to it, and evaluates.
+ * Settles one market THROUGH THE OBSERVATION DOOR (`../observation-door.ts`;
+ * ADR-020 §3): selects the spec's model, reads the observation into plain own
+ * data, checks that the reading belongs to that model and states what the model
+ * settles on, and evaluates FROM THE READ TREE.
+ *
+ * The steps, in the order they run:
+ *
+ * 1. the spec selects a model, or the spec's own refusals come back (unchanged:
+ *    a spec problem is reported before a reading is even looked at);
+ * 2. **D1** — {@link readOwnObservation} materializes the reading prototype-free
+ *    from its own descriptors, so an accessor, a symbol key, a `__proto__` key
+ *    or a foreign prototype is refused rather than settled on;
+ * 3. the two mismatch gates, on OWN reads of both documents — at base each was
+ *    answerable by `Object.prototype` from either side;
+ * 4. {@link observationOwnIssues} — every field the model settles on must be the
+ *    reading's OWN, and nothing else may ride along;
+ * 5. **D3/D4** — {@link buildOwnObservation} projects the reading, and the
+ *    evaluators settle on that projection.
  *
  * The result carries `reviewed` (§9.2). Evaluation is NOT gated on review,
  * because backtests and research legitimately settle unverified specs; what is
@@ -506,33 +603,59 @@ export function evaluateSettlement(
   if (!selected.ok) {
     return selected;
   }
-  if (observation.model !== selected.value) {
+
+  const read = readOwnObservation(observation);
+  if (!read.ok) {
+    return settlementFailure(
+      observationInvalid([`(root): the value is not observation data: ${read.detail}`]),
+    );
+  }
+  const tree = read.value;
+
+  const observationModel: unknown = ownField(tree, "model");
+  if (observationModel !== selected.value) {
     return settlementFailure(
       settlementRefusal(
         "SETTLEMENT_OBSERVATION_MODEL_MISMATCH",
-        `the spec selects ${selected.value} but the observation is a ${observation.model} reading`,
-        { selectedModel: selected.value, observationModel: observation.model },
+        `the spec selects ${selected.value} but the observation is a ${String(observationModel)} reading`,
+        { selectedModel: selected.value, observationModel },
       ),
     );
   }
-  if (observation.referenceSymbol !== spec.referenceSymbol) {
+  const observationSymbol: unknown = ownField(tree, "referenceSymbol");
+  const specSymbol: unknown = ownField(spec, "referenceSymbol");
+  if (observationSymbol !== specSymbol) {
     return settlementFailure(
       settlementRefusal(
         "SETTLEMENT_OBSERVATION_SYMBOL_MISMATCH",
-        `the spec settles ${spec.referenceSymbol} but the observation is of ${observation.referenceSymbol}`,
-        { specSymbol: spec.referenceSymbol, observationSymbol: observation.referenceSymbol },
+        `the spec settles ${String(specSymbol)} but the observation is of ${String(observationSymbol)}`,
+        { specSymbol, observationSymbol },
       ),
     );
   }
 
-  switch (observation.model) {
+  const issues = observationOwnIssues(selected.value, tree);
+  if (issues.length > 0) {
+    return settlementFailure(observationInvalid(issues));
+  }
+
+  switch (selected.value) {
     case "TerminalSpotBinaryModel":
-      return evaluateTerminalSpot(spec, observation);
+      return evaluateTerminalSpot(
+        spec,
+        buildOwnObservation<TerminalSpotObservation>(selected.value, tree),
+      );
     case "TwapBinaryModel":
-      return evaluateTwap(spec, observation);
+      return evaluateTwap(spec, buildOwnObservation<TwapObservation>(selected.value, tree));
     case "ReferenceOpenUpDownModel":
-      return evaluateReferenceOpenUpDown(spec, observation);
+      return evaluateReferenceOpenUpDown(
+        spec,
+        buildOwnObservation<ReferenceOpenUpDownObservation>(selected.value, tree),
+      );
     case "ThresholdByDateModel":
-      return evaluateThresholdByDate(spec, observation);
+      return evaluateThresholdByDate(
+        spec,
+        buildOwnObservation<ThresholdByDateObservation>(selected.value, tree),
+      );
   }
 }

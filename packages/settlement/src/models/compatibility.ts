@@ -28,6 +28,7 @@
  */
 
 import { settlementRefusal, type SettlementRefusal } from "../errors.js";
+import { ownField } from "../spec-door.js";
 import type { ComparisonOperator, ObservationType, PayoffModelId } from "../vocabulary.js";
 import { OBSERVATION_TYPES, PAYOFF_MODEL_IDS } from "../vocabulary.js";
 
@@ -135,11 +136,47 @@ const COMPATIBILITY: Readonly<
   },
 });
 
+/**
+ * The cell for one (model, observation type) pair, by OWN reads of the matrix.
+ *
+ * ADR-020 §3 D3, and a defect measured at this package's base `c2c0733`:
+ * {@link COMPATIBILITY} is an ordinary object literal, so `COMPATIBILITY[model]`
+ * and its inner lookup consulted `Object.prototype` the moment the key was not a
+ * declared one. `isCompatiblePayoffModel("toString", …)` returned `true`,
+ * {@link payoffModelRequirements} returned a FUNCTION, and
+ * {@link checkPayoffModelCompatibility} threw
+ * `TypeError: requirements.required is not iterable` out of a function this
+ * package documents as returning a list — reachable with no cast at all, from
+ * one inherited `observationType` on a view that does not state its own.
+ *
+ * Both arguments are `unknown` because both reach here from a caller-supplied
+ * view: a table that decides which models may settle which readings must judge
+ * what it was actually handed, not what the types promise.
+ */
+function compatibilityCell(
+  model: unknown,
+  observationType: unknown,
+): PayoffModelFieldRequirements | undefined {
+  if (typeof model !== "string" || typeof observationType !== "string") {
+    return undefined;
+  }
+  return ownField(ownField(COMPATIBILITY, model), observationType) as
+    | PayoffModelFieldRequirements
+    | undefined;
+}
+
 /** The models permitted for an observation type, in §9.3 order. Possibly empty. */
 export function payoffModelsForObservationType(
   observationType: ObservationType,
 ): readonly PayoffModelId[] {
-  return PAYOFF_MODEL_IDS.filter((model) => COMPATIBILITY[model][observationType] !== undefined);
+  return candidatePayoffModels(observationType);
+}
+
+/** {@link payoffModelsForObservationType} on a value read off a caller's view. */
+function candidatePayoffModels(observationType: unknown): readonly PayoffModelId[] {
+  return PAYOFF_MODEL_IDS.filter(
+    (model) => compatibilityCell(model, observationType) !== undefined,
+  );
 }
 
 /** The observation types a model may settle, in §9.3 order. Never empty. */
@@ -147,7 +184,7 @@ export function observationTypesForPayoffModel(
   model: PayoffModelId,
 ): readonly ObservationType[] {
   return OBSERVATION_TYPES.filter(
-    (observationType) => COMPATIBILITY[model][observationType] !== undefined,
+    (observationType) => compatibilityCell(model, observationType) !== undefined,
   );
 }
 
@@ -156,7 +193,7 @@ export function isCompatiblePayoffModel(
   observationType: ObservationType,
   model: PayoffModelId,
 ): boolean {
-  return COMPATIBILITY[model][observationType] !== undefined;
+  return compatibilityCell(model, observationType) !== undefined;
 }
 
 /**
@@ -166,11 +203,21 @@ export function payoffModelRequirements(
   observationType: ObservationType,
   model: PayoffModelId,
 ): PayoffModelFieldRequirements | undefined {
-  return COMPATIBILITY[model][observationType];
+  return compatibilityCell(model, observationType);
 }
 
+/**
+ * Whether the view STATES the field itself.
+ *
+ * `ownField`, never `view[field]`: the view is caller-supplied, and a dot read
+ * asks the prototype chain the moment the own property is absent. Measured at
+ * base: under six inherited spec fields a view stating only
+ * `observationType: "TWAP"` collected ZERO refusals — a spec that declares
+ * nothing was judged fully compatible with `TwapBinaryModel`. An accessor is
+ * read as ABSENT and never invoked, for `spec-door.ts`'s stated reason.
+ */
 function fieldIsPresent(view: PayoffModelSpecView, field: ConstrainedSpecField): boolean {
-  return view[field] !== undefined;
+  return ownField(view, field) !== undefined;
 }
 
 /**
@@ -183,30 +230,33 @@ function fieldIsPresent(view: PayoffModelSpecView, field: ConstrainedSpecField):
 export function checkPayoffModelCompatibility(
   view: PayoffModelSpecView,
 ): readonly SettlementRefusal[] {
-  const { observationType, payoffModel } = view;
+  // D3. An OWN read of each, rather than the destructuring this function used
+  // to open with: see {@link fieldIsPresent} for what the chain answered here.
+  const observationType: unknown = ownField(view, "observationType");
+  const payoffModel: unknown = ownField(view, "payoffModel");
   const refusals: SettlementRefusal[] = [];
 
   if (payoffModel === undefined) {
-    const candidates = payoffModelsForObservationType(observationType);
+    const candidates = candidatePayoffModels(observationType);
     refusals.push(
       candidates.length === 0
         ? settlementRefusal(
             "SETTLEMENT_OBSERVATION_TYPE_HAS_NO_MODEL",
-            `observation type ${observationType} has no implementing payoff model (§9.3 lists four models; ADR-009 §2 forbids approximating with the nearest one)`,
+            `observation type ${String(observationType)} has no implementing payoff model (§9.3 lists four models; ADR-009 §2 forbids approximating with the nearest one)`,
             { observationType },
           )
         : settlementRefusal(
             "SETTLEMENT_SPEC_FIELD_REQUIRED",
-            `settlement spec declares no payoff model; observation type ${observationType} permits ${candidates.join(", ")}`,
+            `settlement spec declares no payoff model; observation type ${String(observationType)} permits ${candidates.join(", ")}`,
             { field: "payoffModel", observationType, candidates },
           ),
     );
     return Object.freeze(refusals);
   }
 
-  const requirements = payoffModelRequirements(observationType, payoffModel);
+  const requirements = compatibilityCell(payoffModel, observationType);
   if (requirements === undefined) {
-    const candidates = payoffModelsForObservationType(observationType);
+    const candidates = candidatePayoffModels(observationType);
     if (observationType === "TWAP" && payoffModel === "TerminalSpotBinaryModel") {
       refusals.push(
         settlementRefusal(
@@ -223,8 +273,8 @@ export function checkPayoffModelCompatibility(
           ? "SETTLEMENT_OBSERVATION_TYPE_HAS_NO_MODEL"
           : "SETTLEMENT_MODEL_OBSERVATION_INCOMPATIBLE",
         candidates.length === 0
-          ? `observation type ${observationType} has no implementing payoff model, so ${payoffModel} cannot settle it (ADR-009 §2)`
-          : `payoff model ${payoffModel} cannot settle a ${observationType} observation; permitted: ${candidates.join(", ")}`,
+          ? `observation type ${String(observationType)} has no implementing payoff model, so ${String(payoffModel)} cannot settle it (ADR-009 §2)`
+          : `payoff model ${String(payoffModel)} cannot settle a ${String(observationType)} observation; permitted: ${candidates.join(", ")}`,
         { observationType, payoffModel, candidates },
       ),
     );
@@ -236,7 +286,7 @@ export function checkPayoffModelCompatibility(
       refusals.push(
         settlementRefusal(
           "SETTLEMENT_SPEC_FIELD_REQUIRED",
-          `payoff model ${payoffModel} on a ${observationType} observation requires \`${field}\``,
+          `payoff model ${String(payoffModel)} on a ${String(observationType)} observation requires \`${field}\``,
           { field, observationType, payoffModel },
         ),
       );
@@ -248,7 +298,7 @@ export function checkPayoffModelCompatibility(
       refusals.push(
         settlementRefusal(
           "SETTLEMENT_SPEC_FIELD_FORBIDDEN",
-          `payoff model ${payoffModel} on a ${observationType} observation must not declare \`${field}\`; it would leave the settlement value ambiguous`,
+          `payoff model ${String(payoffModel)} on a ${String(observationType)} observation must not declare \`${field}\`; it would leave the settlement value ambiguous`,
           { field, observationType, payoffModel },
         ),
       );
