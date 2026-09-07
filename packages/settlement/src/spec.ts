@@ -52,7 +52,9 @@
 import {
   CodeStringSchema,
   IsoTimestampSchema,
+  MAX_CODE_LENGTH,
   MAX_DETAIL_LENGTH,
+  MAX_IDENTIFIER_LENGTH,
   NonEmptyStringSchema,
   PositiveIntegerSchema,
   Uuidv7Schema,
@@ -66,9 +68,23 @@ import {
 } from "./errors.js";
 import { checkPayoffModelCompatibility } from "./models/compatibility.js";
 import {
+  containedSpecParse,
+  hasOwnField,
+  isOwnRecord,
+  ownEmit,
+  ownField,
+  readOwnSpec,
+  type OwnRecord,
+} from "./spec-door.js";
+import {
+  COMPARISON_OPERATORS,
   ComparisonOperatorSchema,
+  OBSERVATION_TYPES,
   ObservationTypeSchema,
+  PAYOFF_MODEL_IDS,
   PayoffModelIdSchema,
+  VerificationStatusSchema,
+  type VerificationStatus,
 } from "./vocabulary.js";
 
 /**
@@ -1302,7 +1318,15 @@ export const SettlementVerificationSchema = z.discriminatedUnion("status", [
 ]);
 export type SettlementVerification = z.infer<typeof SettlementVerificationSchema>;
 
-const settlementSpecShape = {
+/**
+ * The §9.3 field shape.
+ *
+ * Exported (module-internally consumed and read by `./prototype-boundary.test.ts`)
+ * so the door's own required-key table can be checked AGAINST the schema rather
+ * than trusted: the test derives optionality from these entries and fails if
+ * {@link REQUIRED_SETTLEMENT_SPEC_KEYS} disagrees.
+ */
+export const settlementSpecShape = {
   settlementSpecId: Uuidv7Schema,
   seriesId: Uuidv7Schema,
   /** §6 invariant 9: a change creates a new version, never an edit. */
@@ -1400,56 +1424,496 @@ export const SettlementSpecSchema = z
 
 export type SettlementSpec = z.infer<typeof SettlementSpecSchema>;
 
-/** Formats Zod issues the way the domain registry does. */
-function formatIssues(error: z.ZodError): readonly string[] {
-  return error.issues.map((issue) => {
-    const path = issue.path.map((segment) => String(segment)).join(".");
-    return `${path === "" ? "(root)" : path}: ${issue.message}`;
-  });
+// ---------------------------------------------------------------------------
+// THE DOOR (ADR-020 §3; `docs/contracts/schema-boundary.md` §3 probe N)
+//
+// `./spec-door.ts` carries the mechanism and states which of D1-D4 this
+// boundary performs and why D2 is disclosed rather than claimed. What lives
+// HERE is the part that must sit next to the schema it restates: the
+// per-field and cross-field rules the door judges by on its OWN reads, so the
+// measured adoptions stay refused with every `zod` check switched off.
+// ---------------------------------------------------------------------------
+
+/** Every key {@link settlementSpecShape} declares, in schema order. */
+export const SETTLEMENT_SPEC_KEYS: readonly string[] = Object.freeze(
+  Object.keys(settlementSpecShape),
+);
+
+/**
+ * The keys a spec MUST carry as its own — the door's own presence check.
+ *
+ * `docs/contracts/schema-boundary.md` §3 (probe N) measured FOURTEEN of the
+ * sixteen own keys of `terminalSpotSpecSample()` as required-and-adoptable.
+ * Twelve of them are required by the SHAPE and are listed here; the other two —
+ * `comparison` and `strikeSource` — are optional in the shape and required of
+ * THAT spec by the payoff-model compatibility rule, so the door refuses them
+ * missing through {@link ownCrossFieldIssues} instead. All fourteen cells are
+ * swept, both ways, in `./prototype-boundary.test.ts`.
+ *
+ * WRITTEN OUT rather than derived at module load, because deriving it would
+ * mean running a `zod` parse per key while this module initializes — the one
+ * moment ADR-020 §1 class 7 (cold-lazy poisoning) and class 5 (the
+ * `optin`/`optout` waiver on a COLD parse) are at their most dangerous, and a
+ * door whose notion of "required" is itself computed by the library it is
+ * containing has no independence at all. `./prototype-boundary.test.ts` derives
+ * the same list FROM the shape and fails if the two disagree, so a field that
+ * becomes required without a row here fails the suite rather than slipping
+ * through the door.
+ */
+export const REQUIRED_SETTLEMENT_SPEC_KEYS: readonly string[] = Object.freeze([
+  "settlementSpecId",
+  "seriesId",
+  "specVersion",
+  "resolutionSource",
+  "referenceSymbol",
+  "observationType",
+  "timestampBoundary",
+  "roundingRule",
+  "fallbackSource",
+  "disputePolicy",
+  "clarificationPolicy",
+  "verification",
+]);
+
+/** The three review outcomes, taken from the vocabulary rather than retyped. */
+const VERIFICATION_STATUSES: readonly string[] = VerificationStatusSchema.options;
+
+/**
+ * The own keys each verification variant may carry, in emission order.
+ *
+ * A `Map`, not an object literal: a lookup on a plain object consults
+ * `Object.prototype` when the key is absent, and this table decides which
+ * reviewer fields a review outcome is allowed to carry.
+ */
+const VERIFICATION_VARIANT_KEYS: ReadonlyMap<string, readonly string[]> = new Map([
+  ["UNVERIFIED", ["status"]],
+  ["REJECTED", ["status"]],
+  ["VERIFIED", ["status", "verifiedBy", "verifiedAt"]],
+]);
+
+const UUID_V7_FORM = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const CODE_STRING_FORM = /^[A-Za-z][A-Za-z0-9_.:-]*$/u;
+/**
+ * `z.iso.datetime({ offset: true })`, restated field for field.
+ *
+ * REVIEW ROUND 1, FINDING B1 — and the reason this is composed from the
+ * schema's own parts rather than hand-written. The first version of this form
+ * read `(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})`
+ * with the field ranges checked afterwards in code, and it was wrong in BOTH
+ * directions:
+ *
+ * - FAIL-OPEN (the reviewer's finding, 9 of 51 measured cases): the OFFSET's
+ *   hour and minute were never bounded, so under an inherited `skipChecks` the
+ *   door ADMITTED a `verifiedAt` of `"2026-08-28T00:00:00+24:00"` — also
+ *   `±99:99`, `+00:60`, `+00:99`, `+25:00`, `-00:60`, `+90:00` — that the
+ *   schema refuses, and the spec activated `REVIEWED_MODEL_BACKED` with
+ *   `modelDependentActivationAllowed: true`.
+ * - FAIL-CLOSED (found by the corrected sweep, 5 of 51, and live in a CLEAN
+ *   process): seconds are OPTIONAL in the schema, so `"2026-08-28T00:00Z"` and
+ *   `"2026-08-28T00:00+02:00"` are valid and the door refused them; and the
+ *   `Date.UTC` calendar round-trip maps years 0-99 to 1900+, so `0000-01-01`,
+ *   `0050-06-15` and `0099-12-31` were refused as impossible dates. A
+ *   restatement that is STRICTER than the schema refuses a document the
+ *   contract accepts, which is the same defect wearing the other hat.
+ *
+ * The sub-patterns below are the ones `zod@4.4.3` builds this schema from
+ * (`zod/v4/core/regexes.cjs`, `datetime({ offset: true })`): a calendar-exact
+ * date (leap years included, so no round-trip is needed and none is done), a
+ * time whose seconds and fraction are optional, and `Z` or a BOUNDED offset.
+ * `prototype-boundary.test.ts` holds the two of them to a differential sweep —
+ * the door's verdict must equal the schema's on every case, in both directions
+ * — so this restatement cannot drift from the schema silently, and a `zod`
+ * upgrade that moves the grammar fails the suite (ADR-020 §7).
+ */
+const ISO_DATE_FORM_SOURCE =
+  "(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29" +
+  "|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])" +
+  "|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)" +
+  "|(?:02)-(?:0[1-9]|1\\d|2[0-8])))";
+const ISO_TIME_FORM_SOURCE = "(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?";
+const ISO_OFFSET_FORM_SOURCE = "(?:Z|[+-](?:[01]\\d|2[0-3]):[0-5]\\d)";
+const ISO_INSTANT_FORM = new RegExp(
+  `^${ISO_DATE_FORM_SOURCE}T${ISO_TIME_FORM_SOURCE}${ISO_OFFSET_FORM_SOURCE}$`,
+  "u",
+);
+
+/** `Uuidv7Schema`, restated on an own read. */
+function isUuidv7(value: unknown): boolean {
+  return typeof value === "string" && UUID_V7_FORM.test(value);
+}
+
+/** `CodeStringSchema` (1..64, alphanumeric code), restated on an own read. */
+function isCodeString(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= MAX_CODE_LENGTH &&
+    CODE_STRING_FORM.test(value)
+  );
+}
+
+/** `PositiveIntegerSchema` (`z.int().positive()`), restated on an own read. */
+function isPositiveInteger(value: unknown): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+/** `NonEmptyStringSchema` (1..200), restated on an own read. */
+function isNonEmptyString(value: unknown): boolean {
+  return typeof value === "string" && value.length >= 1 && value.length <= MAX_IDENTIFIER_LENGTH;
 }
 
 /**
- * Parses a settlement spec.
+ * `IsoTimestampSchema` (`z.iso.datetime({ offset: true })`), restated on an own
+ * read.
+ *
+ * The whole judgment is {@link ISO_INSTANT_FORM}, whose header records what the
+ * hand-written version got wrong in each direction and what holds the two
+ * grammars together now. `2026-02-30T00:00:00Z` and `2026-02-29T00:00:00Z` are
+ * refused by the date pattern itself, `2024-02-29T00:00:00Z` is accepted, and
+ * the offset is bounded at `±23:59` exactly as the schema bounds it.
+ */
+function isIsoInstant(value: unknown): boolean {
+  return typeof value === "string" && ISO_INSTANT_FORM.test(value);
+}
+
+/**
+ * `SettlementRuleTextSchema`, restated on an own read: bounded, whitespace
+ * canonical, and a stated rule rather than a placeholder.
+ *
+ * The placeholder half calls {@link placeholderRuleTextReason} itself — the
+ * SAME matcher the schema's refinement calls — so ADR-009 §5.4's stated-policy
+ * rule is enforced by this package's own code rather than by a `zod` check that
+ * one inherited `skipChecks` turns off process-wide (measured at base: with
+ * `skipChecks` inherited, `roundingRule: "TBD"` parses).
+ */
+function ruleTextIssue(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return "must be a settlement rule stated as text";
+  }
+  if (value.length < MINIMUM_RULE_TEXT_LENGTH || value.length > MAX_DETAIL_LENGTH) {
+    return `must be between ${String(MINIMUM_RULE_TEXT_LENGTH)} and ${String(MAX_DETAIL_LENGTH)} characters`;
+  }
+  if (value.trim() !== value) {
+    return "must not have leading or trailing whitespace";
+  }
+  const placeholderReason = placeholderRuleTextReason(value);
+  if (placeholderReason !== undefined) {
+    return `states a placeholder rather than a rule (${placeholderReason}); ADR-009 §5.4 requires a stated policy`;
+  }
+  return undefined;
+}
+
+/** One of a closed vocabulary, restated on an own read. */
+function enumIssue(value: unknown, members: readonly string[], what: string): string | undefined {
+  return typeof value === "string" && members.includes(value)
+    ? undefined
+    : `must be one of the ${what} (${members.join(", ")})`;
+}
+
+/**
+ * The door's own per-field judgment of one declared key.
+ *
+ * Every entry restates what the schema declares for that key. A `Map` rather
+ * than an object literal, for the same reason as
+ * {@link VERIFICATION_VARIANT_KEYS}: a missing-key lookup on a plain object is
+ * answered by `Object.prototype`, and this table decides how a field is judged.
+ * {@link settlementSpecOwnIssues} fails closed on a key with no entry, so a field added
+ * to {@link settlementSpecShape} without a rule here is refused rather than
+ * waved through.
+ */
+const OWN_FIELD_ISSUE: ReadonlyMap<string, (value: unknown) => string | undefined> = new Map<
+  string,
+  (value: unknown) => string | undefined
+>([
+  ["settlementSpecId", (value) => (isUuidv7(value) ? undefined : "must be a lowercase canonical UUIDv7")],
+  ["seriesId", (value) => (isUuidv7(value) ? undefined : "must be a lowercase canonical UUIDv7")],
+  ["rulesVersionId", (value) => (isUuidv7(value) ? undefined : "must be a lowercase canonical UUIDv7")],
+  ["specVersion", (value) => (isPositiveInteger(value) ? undefined : "must be a positive integer")],
+  ["windowSeconds", (value) => (isPositiveInteger(value) ? undefined : "must be a positive integer")],
+  [
+    "referenceSymbol",
+    (value) => (isCodeString(value) ? undefined : "must be an alphanumeric code without whitespace"),
+  ],
+  ["observationType", (value) => enumIssue(value, OBSERVATION_TYPES, "§9.3 observation types")],
+  ["comparison", (value) => enumIssue(value, COMPARISON_OPERATORS, "§9.3 comparison operators")],
+  ["payoffModel", (value) => enumIssue(value, PAYOFF_MODEL_IDS, "§9.3 payoff models")],
+  ["resolutionSource", ruleTextIssue],
+  ["windowStartRule", ruleTextIssue],
+  ["windowEndRule", ruleTextIssue],
+  ["strikeSource", ruleTextIssue],
+  ["referenceOpenSource", ruleTextIssue],
+  ["timestampBoundary", ruleTextIssue],
+  ["roundingRule", ruleTextIssue],
+  ["fallbackSource", ruleTextIssue],
+  ["disputePolicy", ruleTextIssue],
+  ["clarificationPolicy", ruleTextIssue],
+  // `verification` is a union and is judged by `verificationIssues`.
+  ["verification", () => undefined],
+]);
+
+/**
+ * The door's own judgment of the `verification` block — the sharpest cell of
+ * the §3 row, so it is judged key by key rather than by shape.
+ *
+ * The block must be a record the CALLER owns, its `status` must be one of the
+ * three review outcomes, and a `VERIFIED` block must carry exactly the reviewer
+ * fields WP-040's `settlement_specs_verification_complete` constraint permits.
+ * Nothing here is reachable from a prototype: every read is
+ * {@link ownField} on the materialized tree.
+ */
+function verificationIssues(block: unknown): readonly string[] {
+  if (!isOwnRecord(block)) {
+    return ["verification: a spec states its review outcome as a verification block"];
+  }
+  const status = ownField(block, "status");
+  if (typeof status !== "string" || !VERIFICATION_STATUSES.includes(status)) {
+    return [
+      `verification.status: must be one of the review outcomes (${VERIFICATION_STATUSES.join(", ")})`,
+    ];
+  }
+  const permitted = VERIFICATION_VARIANT_KEYS.get(status) ?? ["status"];
+  const issues: string[] = [];
+  for (const key of Object.keys(block)) {
+    if (!permitted.includes(key)) {
+      issues.push(`verification: Unrecognized key: "${key}"`);
+    }
+  }
+  if (status === "VERIFIED") {
+    if (!isNonEmptyString(ownField(block, "verifiedBy"))) {
+      issues.push("verification.verifiedBy: a verified spec must name the reviewer accountable for it");
+    }
+    if (!isIsoInstant(ownField(block, "verifiedAt"))) {
+      issues.push("verification.verifiedAt: a verified spec must name the instant it was reviewed");
+    }
+  }
+  return issues;
+}
+
+/**
+ * D2 COMPENSATION. Every reason the materialized tree is not a settlement spec,
+ * judged entirely on the door's own reads.
+ *
+ * This is what the door has INSTEAD of a severed warmed arena (see
+ * `./spec-door.ts`): one inherited `skipChecks` turns every `.regex()`,
+ * `.min()`, `.max()` and custom check in the process into a no-op (ADR-020 §1
+ * class 4), and at this package's base that alone admits a malformed
+ * `settlementSpecId`, a placeholder `roundingRule`, an untrimmed rule, a
+ * `specVersion` of `0`, an empty `referenceSymbol`, an empty `verifiedBy` and a
+ * `verifiedAt` of `"not-a-time"`. None of those checks are switchable off here.
+ *
+ * In an unpolluted process this is a RESTATEMENT, not a second opinion: the
+ * schema has already refused everything below, so these issues can only ever be
+ * reached when the library has been defeated. That is what keeps honest-input
+ * verdicts byte-identical.
+ *
+ * EXPORTED so its PRESENCE half can also be measured directly, key by key.
+ *
+ * CORRECTED IN REMEDIATION (round-1 record repair): this comment previously
+ * said the `optin`/`optout` required-key waiver (ADR-020 §1 class 5) "does NOT
+ * reach this schema". It does. The round-1 measurement used a probe that
+ * deleted its pollution before the awaited cold parse ran; with an
+ * async-correct harness, a COLD `SettlementSpecSchema` under an inherited
+ * `optin`/`optout` pair ACCEPTS a spec with `roundingRule` deleted, and one
+ * with `verification` deleted. The presence check below is what refuses both,
+ * end to end through `classifySettlementActivation`, and
+ * `./prototype-boundary.test.ts` pins exactly that — so this restatement is
+ * load-bearing in a way round 1 understated rather than overstated.
+ */
+export function settlementSpecOwnIssues(tree: unknown): readonly string[] {
+  if (!isOwnRecord(tree)) {
+    return ["(root): a settlement spec is a document with fields"];
+  }
+  const issues: string[] = [];
+  for (const key of Object.keys(tree)) {
+    if (!SETTLEMENT_SPEC_KEYS.includes(key)) {
+      issues.push(`(root): Unrecognized key: "${key}"`);
+    }
+  }
+  for (const key of SETTLEMENT_SPEC_KEYS) {
+    if (!hasOwnField(tree, key)) {
+      if (REQUIRED_SETTLEMENT_SPEC_KEYS.includes(key)) {
+        issues.push(`${key}: the spec does not state it, and no other document may state it for it`);
+      }
+      continue;
+    }
+    if (key === "verification") {
+      issues.push(...verificationIssues(ownField(tree, key)));
+      continue;
+    }
+    const judge = OWN_FIELD_ISSUE.get(key);
+    if (judge === undefined) {
+      // Fails closed: a shape key with no restated rule is refused rather than
+      // accepted on the library's word alone.
+      issues.push(`${key}: this door states no rule for the field, so it cannot admit it`);
+      continue;
+    }
+    const issue = judge(ownField(tree, key));
+    if (issue !== undefined) {
+      issues.push(`${key}: ${issue}`);
+    }
+  }
+  return issues;
+}
+
+/**
+ * D2 COMPENSATION, the cross-field half: the three rules
+ * {@link SettlementSpecSchema}'s own `superRefine` states, re-run on the record
+ * the door built. Measured at base: with `skipChecks` inherited, a TWAP spec
+ * naming `TerminalSpotBinaryModel` — the one rule §9.3 states by name — parses.
+ */
+function ownCrossFieldIssues(spec: SettlementSpec): readonly string[] {
+  const issues: string[] = [];
+  const observationType = ownField(spec, "observationType");
+  const windowSeconds = ownField(spec, "windowSeconds");
+  if ((observationType === "TWAP" || observationType === "VWAP") && windowSeconds === undefined) {
+    issues.push(`windowSeconds: a ${String(observationType)} observation requires window_seconds (§9.3)`);
+  }
+  if (windowSeconds !== undefined) {
+    for (const field of ["windowStartRule", "windowEndRule"] as const) {
+      if (ownField(spec, field) === undefined) {
+        issues.push(
+          `${field}: a spec that declares window_seconds must state its window boundary rules`,
+        );
+      }
+    }
+  }
+  for (const refusal of checkPayoffModelCompatibility(spec)) {
+    if (refusal.code === "SETTLEMENT_OBSERVATION_TYPE_HAS_NO_MODEL") {
+      continue;
+    }
+    if (
+      refusal.code === "SETTLEMENT_SPEC_FIELD_REQUIRED" &&
+      refusal.details["field"] === "payoffModel"
+    ) {
+      continue;
+    }
+    const path = typeof refusal.details["field"] === "string" ? refusal.details["field"] : "(root)";
+    issues.push(`${path}: ${refusal.code}: ${refusal.message}`);
+  }
+  return issues;
+}
+
+/**
+ * D3 + D4. Projects the spec the CALLER handed over out of the materialized
+ * tree, in schema order, with a null prototype.
+ *
+ * Never `result.data`: the library's output is the value ADR-020 §1 class 1
+ * says may carry a field the input never had. Unknown keys cannot appear (both
+ * the schema and {@link settlementSpecOwnIssues} refuse them), so this projection is the
+ * whole document.
+ */
+function buildOwnSpec(tree: OwnRecord): SettlementSpec {
+  const fields: (readonly [string, unknown])[] = [];
+  for (const key of SETTLEMENT_SPEC_KEYS) {
+    if (!hasOwnField(tree, key)) {
+      continue;
+    }
+    const value = ownField(tree, key);
+    if (key === "verification") {
+      const status = ownField(value, "status");
+      const permitted =
+        VERIFICATION_VARIANT_KEYS.get(typeof status === "string" ? status : "") ?? ["status"];
+      fields.push([
+        key,
+        ownEmit<SettlementVerification>(
+          permitted.map((name) => [name, ownField(value, name)] as const),
+        ),
+      ]);
+      continue;
+    }
+    fields.push([key, value]);
+  }
+  return ownEmit<SettlementSpec>(fields);
+}
+
+/** The refusal every door route returns, composed the way this package always has. */
+function specInvalid(issues: readonly string[]): SettlementRefusal {
+  return settlementRefusal(
+    "SETTLEMENT_SPEC_INVALID",
+    `settlement spec is invalid: ${issues.join("; ")}`,
+    { issues },
+  );
+}
+
+/**
+ * Parses a settlement spec THROUGH THE DOOR (`./spec-door.ts`; ADR-020 §3).
  *
  * @throws {SettlementSpecValidationError} when the value is not a valid spec.
  */
 export function parseSettlementSpec(value: unknown): SettlementSpec {
-  const result = SettlementSpecSchema.safeParse(value);
-  if (!result.success) {
-    const issues = formatIssues(result.error);
-    throw new SettlementSpecValidationError(
-      `settlement spec is invalid: ${issues.join("; ")}`,
-      issues,
-    );
+  const result = safeParseSettlementSpec(value);
+  if (!result.ok) {
+    const issues = result.refusal.details["issues"];
+    const list = Array.isArray(issues) ? (issues as readonly string[]) : [result.refusal.message];
+    throw new SettlementSpecValidationError(result.refusal.message, list);
   }
-  return result.data;
+  return result.spec;
 }
 
-/** Non-throwing {@link parseSettlementSpec}. */
+/**
+ * Non-throwing {@link parseSettlementSpec}, and the package's conforming door.
+ *
+ * The four steps, in the order they run:
+ *
+ * 1. **D1** — {@link readOwnSpec} materializes the candidate prototype-free
+ *    from its own descriptors. A non-object passes through so the schema keeps
+ *    composing the refusal it always composed for one.
+ * 2. The schema judges the MATERIALIZED tree inside {@link containedSpecParse},
+ *    so an honest refusal is byte-identical to the one this function has always
+ *    returned, and a refusal `zod` cannot CONSTRUCT is still a refusal.
+ * 3. **D2 compensation** — {@link settlementSpecOwnIssues} and {@link ownCrossFieldIssues}
+ *    re-state every rule the schema declares on the door's own reads, so a
+ *    process where the library has been switched off still refuses.
+ * 4. **D3/D4** — {@link buildOwnSpec} projects the emitted spec out of the tree
+ *    with a null prototype.
+ */
 export function safeParseSettlementSpec(
   value: unknown,
 ): { readonly ok: true; readonly spec: SettlementSpec } | {
   readonly ok: false;
   readonly refusal: SettlementRefusal;
 } {
-  const result = SettlementSpecSchema.safeParse(value);
-  if (result.success) {
-    return { ok: true, spec: result.data };
+  const read = readOwnSpec(value);
+  if (!read.ok) {
+    return { ok: false, refusal: specInvalid([`(root): the value is not spec data: ${read.detail}`]) };
   }
-  const issues = formatIssues(result.error);
-  return {
-    ok: false,
-    refusal: settlementRefusal(
-      "SETTLEMENT_SPEC_INVALID",
-      `settlement spec is invalid: ${issues.join("; ")}`,
-      { issues },
-    ),
-  };
+  const parsed = containedSpecParse(SettlementSpecSchema, read.value);
+  if (!parsed.ok) {
+    return { ok: false, refusal: specInvalid(parsed.issues) };
+  }
+  const ownIssues = settlementSpecOwnIssues(read.value);
+  if (ownIssues.length > 0) {
+    return { ok: false, refusal: specInvalid(ownIssues) };
+  }
+  const spec = buildOwnSpec(read.value as OwnRecord);
+  const crossFieldIssues = ownCrossFieldIssues(spec);
+  if (crossFieldIssues.length > 0) {
+    return { ok: false, refusal: specInvalid(crossFieldIssues) };
+  }
+  return { ok: true, spec };
+}
+
+/**
+ * The review outcome the spec ITSELF states, or `undefined` when it states
+ * none.
+ *
+ * The one read of `verification` in this package, and it is an OWN read
+ * ({@link ownField}) rather than `spec.verification.status`. That dot access is
+ * the measured defeat: a spec carrying no verification key at all answers
+ * `"VERIFIED"` from `Object.prototype`, which clears both activation gates and
+ * stamps `reviewed: true` on the settlement. A document that does not state its
+ * own review outcome has none.
+ */
+export function settlementVerificationStatus(spec: SettlementSpec): VerificationStatus | undefined {
+  const status = ownField(ownField(spec, "verification"), "status");
+  return typeof status === "string" && VERIFICATION_STATUSES.includes(status)
+    ? (status as VerificationStatus)
+    : undefined;
 }
 
 /** Whether the spec has been reviewed and may back model-dependent activation. */
 export function isReviewedSettlementSpec(spec: SettlementSpec): boolean {
-  return spec.verification.status === "VERIFIED";
+  return settlementVerificationStatus(spec) === "VERIFIED";
 }
 
 /**
@@ -1489,19 +1953,33 @@ export const RTDS_TWAP_WINDOW_SECONDS_VERIFIED_2026_08_24: readonly number[] = O
   30, 60,
 ]);
 
-/** Every reason `spec` must not carry a `VERIFIED` verification, in a stable order. */
+/**
+ * Every reason `spec` must not carry a `VERIFIED` verification, in a stable
+ * order.
+ *
+ * PROTOTYPE-SAFE READS (ADR-020 §3 D3): every field this function branches on
+ * is taken with {@link ownField} from the document itself and from the caller's
+ * own context object. `spec.rulesVersionId === undefined` is a review GATE —
+ * §6 invariant 9's "a review that does not name the rules it reviewed" — and a
+ * dot read answers it from `Object.prototype` the moment the spec omits the
+ * key. So does `context.publishedWindowSeconds`, which decides whether a
+ * declared window is one the feed publishes.
+ */
 export function settlementSpecReviewBlockers(
   spec: SettlementSpec,
   context: SettlementReviewContext = {},
 ): readonly SettlementRefusal[] {
   const blockers: SettlementRefusal[] = [];
+  const rulesVersionId = ownField(spec, "rulesVersionId");
+  const windowSeconds = ownField(spec, "windowSeconds");
+  const resolutionSource = ownField(spec, "resolutionSource");
 
-  if (spec.rulesVersionId === undefined) {
+  if (rulesVersionId === undefined) {
     blockers.push(
       settlementRefusal(
         "SETTLEMENT_RULES_VERSION_REQUIRED",
         "a verified spec must name the market rules version it was reviewed against (§6 invariant 9)",
-        { settlementSpecId: spec.settlementSpecId },
+        { settlementSpecId: ownField(spec, "settlementSpecId") },
       ),
     );
   }
@@ -1510,22 +1988,22 @@ export function settlementSpecReviewBlockers(
     blockers.push(refusal);
   }
 
-  if (spec.windowSeconds !== undefined) {
-    const published = context.publishedWindowSeconds;
+  if (windowSeconds !== undefined) {
+    const published = ownField(context, "publishedWindowSeconds") as readonly number[] | undefined;
     if (published === undefined) {
       blockers.push(
         settlementRefusal(
           "SETTLEMENT_PUBLISHED_WINDOWS_UNKNOWN",
-          `spec declares a ${String(spec.windowSeconds)}s window but the caller stated no published windows for ${spec.resolutionSource}; ADR-009 §6 requires the window to be one the feed publishes`,
-          { windowSeconds: spec.windowSeconds, resolutionSource: spec.resolutionSource },
+          `spec declares a ${String(windowSeconds)}s window but the caller stated no published windows for ${String(resolutionSource)}; ADR-009 §6 requires the window to be one the feed publishes`,
+          { windowSeconds, resolutionSource },
         ),
       );
-    } else if (!published.includes(spec.windowSeconds)) {
+    } else if (!published.includes(windowSeconds as number)) {
       blockers.push(
         settlementRefusal(
           "SETTLEMENT_WINDOW_NOT_PUBLISHED",
-          `spec declares a ${String(spec.windowSeconds)}s window; the resolution feed publishes ${published.join(", ")}s, so nothing would produce the observation (ADR-009 §6)`,
-          { windowSeconds: spec.windowSeconds, publishedWindowSeconds: [...published] },
+          `spec declares a ${String(windowSeconds)}s window; the resolution feed publishes ${published.join(", ")}s, so nothing would produce the observation (ADR-009 §6)`,
+          { windowSeconds, publishedWindowSeconds: [...published] },
         ),
       );
     }

@@ -104,6 +104,57 @@ repeating here:
   in remediation round 1 (finding M1). It also refuses leading/trailing
   whitespace so one rule has one representation.
 
+### 3.1 The parse door (ADR-020 §3; `schema-boundary.md` §3, probe N)
+
+A `zod` parse result is not clean data. `docs/contracts/schema-boundary.md` §3
+measured this package's boundary as **LIVE, HIGH**: of the sixteen own keys of
+`terminalSpotSpecSample()`, fourteen are required and all fourteen were
+supplied from `Object.prototype` when the input lacked them — including
+`resolutionSource` (a spec settling against a source its own text never named)
+and `verification`, where a spec carrying **no verification key at all** parsed
+as reviewed, cleared both activation gates, and had `evaluateSettlement` stamp
+`reviewed: true` on the number it produced.
+
+`spec-door.ts` is this package's door and its header states what it performs:
+
+- **D1** materialize prototype-free from own DESCRIPTORS before any parse;
+- **D2 NOT performed, disclosed** — a severed warmed arena lives in
+  `packages/risk` and reaching it needs an edge `dependency-direction.md` does
+  not permit, while copying it is forbidden by the repository-wide deletion
+  guard. The compensation is measured: `settlementSpecOwnIssues` and
+  `ownCrossFieldIssues` in `spec.ts` re-state **every** rule the schema
+  declares — presence, type, bounds, vocabulary, UUID/ISO form, the ADR-009
+  §5.4 placeholder matcher and the §9.3 model-compatibility rules — on the
+  door's own reads, so the boundary still refuses with every `zod` check
+  switched off by an inherited `skipChecks`, and still refuses a spec with a
+  required key deleted when a COLD schema's required-key enforcement is waived
+  by an inherited `optin`/`optout` pair. The re-implemented grammars (UUIDv7,
+  the code string, the ISO instant, the integer and length bounds) are held to
+  the schema by a DIFFERENTIAL sweep — the door's verdict must equal the
+  schema's on every case, in both directions — because review round 1 found the
+  hand-written `verifiedAt` grammar wrong both ways at once: it admitted an
+  offset of `+24:00` under `skipChecks` (activating `REVIEWED_MODEL_BACKED`)
+  and refused the schema-valid `2026-08-28T00:00Z` and `0050-06-15T…` in a
+  clean process;
+- **D3** every emitted value comes from the materialized tree, and every
+  decision-bearing read in the activation path (`input.spec`,
+  `input.reviewContext`, `verification.status`, `rulesVersionId`,
+  `publishedWindowSeconds`) is an OWN read rather than a dot access;
+- **D4** the spec, its `verification` block, every refusal and the activation
+  verdict are emitted with a null prototype.
+- The refusal CONSTRUCTION is contained (ADR-020's 2026-09-06 amendment):
+  before the door, an inherited `_zod`, `path` or `value` made
+  `safeParseSettlementSpec` — documented not to throw — throw a `TypeError`.
+
+`prototype-boundary.test.ts` is the regression net: the fourteen-key sweep in
+both pollution variants, over all four sample specs; the VERIFIED-from-nothing
+route pinned end to end through `isReviewedSettlementSpec`, both activation
+gates and the `registry.ts` call site; the containment; D4; and the
+`skipChecks` census. **Deployment reading:** nothing on the wire can write
+`Object.prototype` — every one of these needs code already executing in the
+process. The row says the check is not load-bearing against an attacker already
+inside the process, not that a caller can turn it off.
+
 ## 4. Model selection (§9.3, acceptance 1)
 
 The matrix in `models/compatibility.ts` is total over 5 observation types × 4
