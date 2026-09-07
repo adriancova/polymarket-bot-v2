@@ -80,6 +80,13 @@
  * those are enforced by the frozen schemas; under an inherited `skipChecks`
  * they are not, and the verdict is then base-identical rather than improved,
  * except where the identity guard or a bound already fails the event closed.
+ * Be precise about the sharpest cell of that residual (review round 1,
+ * MED-2): the instant-FORMAT half REACHES THE IRREVERSIBLE TRANSITION —
+ * under an inherited `skipChecks`, a `MarketResolved` carrying
+ * `resolvedAt: "Aug 28 2026"` or an offsetless `"2026-08-28T12:15:30"`
+ * still RESOLVES the market and writes that string into
+ * `projection.resolvedAt`, exactly as at base. Base-identical, not a
+ * regression — but it is the transition this door exists to protect.
  * Owner: a `packages/universe` follow-up, or D2 when a severed arena becomes
  * reachable without a forbidden edge.
  *
