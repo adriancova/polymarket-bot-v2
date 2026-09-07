@@ -2,9 +2,9 @@
  * Own-data boundary (ADR-020), following polymarket-public's wire-door.
  * D1/D3/D4: copy own enumerable data in key order, judge the copy, emit it frozen.
  * D2's shared arena is not importable on this package's dependency edges. The
- * measured ordering formats are therefore re-derived from the frozen schema;
- * other library checks/refinements remain library-dependent under ambient
- * control-field pollution. Containment covers parsing AND refusal rendering.
+ * field constraints are therefore re-derived from the frozen schema, and its
+ * provenance refinement is enforced on own data independently of parse flags.
+ * Containment covers parsing AND refusal rendering.
  * Arrays retain Array.prototype, as in the reference door (a separate class).
  */
 import { UnknownPayloadEventEnvelopeSchema } from "@polymarket-bot/domain";
@@ -103,42 +103,104 @@ function definition(schema: unknown): unknown {
 export const ORDERING_FORMAT_KEYS = ["eventId", "receivedAt", "gatewayEpoch", "ingestSeq"] as const;
 type OrderingFormatKey = typeof ORDERING_FORMAT_KEYS[number];
 
-/** Pattern and length bounds come ONLY from the schema's own definitions. */
-function deriveFormat(schema: unknown): (value: unknown) => boolean {
-  const def = definition(schema);
-  const checks = ownMemberOf(def, "checks");
-  const definitions: unknown[] = [def];
-  if (Array.isArray(checks)) {
-    for (const key of Object.keys(checks)) {
-      definitions.push(definition(ownMemberOf(checks, key)));
-    }
-  }
-  const patterns: RegExp[] = [];
-  let minimum = 0;
-  let maximum = Infinity;
-  for (const entry of definitions) {
-    const pattern = ownMemberOf(entry, "pattern");
-    if (pattern instanceof RegExp) {
-      patterns.push(new RegExp(pattern.source, pattern.flags.replace(/[gy]/gu, "")));
-    }
-    const check = ownMemberOf(entry, "check");
-    const min = ownMemberOf(entry, "minimum");
-    const max = ownMemberOf(entry, "maximum");
-    if (check === "min_length" && typeof min === "number") minimum = min;
-    if (check === "max_length" && typeof max === "number") maximum = max;
-  }
-  // A moved library definition fails closed; the differential test pins that
-  // each grammar is derivable, with non-vacuous positive and negative cases.
-  return (value) => typeof value === "string" && patterns.length > 0 &&
-    value.length >= minimum && value.length <= maximum &&
-    patterns.every((pattern) => pattern.test(value));
+type Predicate = (value: unknown) => boolean;
+
+function unsupported(): never {
+  throw new Error("unsupported envelope schema definition; review the own-data derivation");
 }
 
-const formats = Object.create(null) as Record<OrderingFormatKey, (value: unknown) => boolean>;
-for (const key of ORDERING_FORMAT_KEYS) {
-  formats[key] = deriveFormat(ownMemberOf(UnknownPayloadEventEnvelopeSchema.shape, key));
+/** All constraint parameters come from own definitions, never mirrored literals. */
+function deriveField(schema: unknown): Predicate {
+  const def = definition(schema);
+  const type = ownMemberOf(def, "type");
+  if (type === "optional") {
+    const inner = deriveField(ownMemberOf(def, "innerType"));
+    return value => value === undefined || inner(value);
+  }
+  const predicates: Predicate[] = [];
+  if (type === "string") predicates.push(value => typeof value === "string");
+  else if (type === "number") predicates.push(value => typeof value === "number" && Number.isFinite(value));
+  else if (type === "enum") {
+    const entries = ownMemberOf(def, "entries");
+    if (typeof entries !== "object" || entries === null) unsupported();
+    const values = Object.keys(entries).map(key => ownMemberOf(entries, key));
+    predicates.push(value => values.includes(value));
+  } else if (type !== "unknown") unsupported();
+
+  const definitions: unknown[] = [def];
+  const checks = ownMemberOf(def, "checks");
+  if (checks !== undefined && !Array.isArray(checks)) unsupported();
+  if (Array.isArray(checks)) {
+    for (const key of Object.keys(checks)) definitions.push(definition(ownMemberOf(checks, key)));
+  }
+  for (const entry of definitions) {
+    const check = ownMemberOf(entry, "check");
+    if (check === undefined && entry === def) continue;
+    if (check === "string_format") {
+      const pattern = ownMemberOf(entry, "pattern");
+      if (!(pattern instanceof RegExp)) unsupported();
+      const copy = new RegExp(pattern.source, pattern.flags.replace(/[gy]/gu, ""));
+      predicates.push(value => typeof value === "string" && copy.test(value));
+    } else if (check === "min_length" || check === "max_length") {
+      const bound = ownMemberOf(entry, check === "min_length" ? "minimum" : "maximum");
+      if (typeof bound !== "number") unsupported();
+      predicates.push(value => typeof value === "string" &&
+        (check === "min_length" ? value.length >= bound : value.length <= bound));
+    } else if (check === "greater_than" || check === "less_than") {
+      const bound = ownMemberOf(entry, "value");
+      const inclusive = ownMemberOf(entry, "inclusive");
+      if (typeof bound !== "number" || typeof inclusive !== "boolean") unsupported();
+      predicates.push(value => typeof value === "number" && (check === "greater_than"
+        ? (inclusive ? value >= bound : value > bound)
+        : (inclusive ? value <= bound : value < bound)));
+    } else if (check === "number_format" && ownMemberOf(entry, "format") === "safeint") {
+      // safeint carries the safe-integer bounds by format, not numeric literals.
+      predicates.push(value => Number.isSafeInteger(value));
+    } else unsupported();
+  }
+  return value => predicates.every(predicate => predicate(value));
+}
+
+const envelopeDefinition = definition(UnknownPayloadEventEnvelopeSchema);
+const shape = ownMemberOf(envelopeDefinition, "shape");
+if (typeof shape !== "object" || shape === null) unsupported();
+export const ENVELOPE_FIELD_KEYS = Object.freeze(Object.keys(shape));
+const fields = Object.create(null) as Record<string, Predicate>;
+for (const key of ENVELOPE_FIELD_KEYS) fields[key] = deriveField(ownMemberOf(shape, key));
+Object.freeze(fields);
+
+// The pinned schema has exactly one superRefine: envelopeProvenanceRefinement.
+// A changed refinement inventory requires explicit review, not silent omission.
+const refinements = ownMemberOf(envelopeDefinition, "checks");
+if (!Array.isArray(refinements) || refinements.length !== 1 ||
+    ownMemberOf(definition(ownMemberOf(refinements, "0")), "check") !== "custom" ||
+    ownMemberOf(definition(ownMemberOf(envelopeDefinition, "catchall")), "type") !== "never") unsupported();
+
+export function matchesEnvelopeField(key: string, value: unknown): boolean {
+  return Object.hasOwn(fields, key) && fields[key]!(value);
 }
 
 export function matchesOrderingFormat(key: OrderingFormatKey, value: unknown): boolean {
-  return formats[key](value);
+  return matchesEnvelopeField(key, value);
+}
+
+/** Exact restatement of the schema's sole refinement, on materialized data. */
+export function matchesEnvelopeProvenance(own: Readonly<Record<string, unknown>>): boolean {
+  const venue = ownMemberOf(ownMemberOf(own, "payload"), "venue");
+  return venue === undefined || (typeof venue === "string" && venue === ownMemberOf(own, "source"));
+}
+
+export function enforceEnvelopeConstraints(own: Readonly<Record<string, unknown>>): void {
+  for (const key of ENVELOPE_FIELD_KEYS) {
+    if (!matchesEnvelopeField(key, ownMemberOf(own, key))) {
+      throw new EventBusEnvelopeError("value is not a valid §7.1 event envelope", {
+        issues: [{ path: key, message: "the own field does not match its schema constraints" }],
+      });
+    }
+  }
+  if (Object.keys(own).some(key => !Object.hasOwn(fields, key)) || !matchesEnvelopeProvenance(own)) {
+    throw new EventBusEnvelopeError("value is not a valid §7.1 event envelope", {
+      issues: [{ path: "", message: "the own envelope does not match its schema constraints" }],
+    });
+  }
 }

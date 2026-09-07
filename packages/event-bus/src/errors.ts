@@ -51,7 +51,7 @@ export class EventBusError extends Error {
     details: EventBusErrorDetails = {},
     options: { readonly cause?: unknown } = {},
   ) {
-    super(message, "cause" in options ? { cause: options.cause } : undefined);
+    super(message, Object.hasOwn(options, "cause") ? { cause: options.cause } : undefined);
     this.name = new.target.name;
     this.code = code;
     this.details = details;

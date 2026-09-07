@@ -10,8 +10,7 @@ import type { EventEnvelope } from "@polymarket-bot/domain";
 
 import {
   containedJudgement,
-  matchesOrderingFormat,
-  ORDERING_FORMAT_KEYS,
+  enforceEnvelopeConstraints,
   readOwnWireValue,
 } from "./envelope-door.js";
 import { EventBusEnvelopeError } from "./errors.js";
@@ -40,13 +39,7 @@ export function validateEnvelope(value: unknown): EventEnvelope<unknown> {
         })),
       });
     }
-    for (const key of ORDERING_FORMAT_KEYS) {
-      if (!matchesOrderingFormat(key, own[key])) {
-        throw new EventBusEnvelopeError("value is not a valid §7.1 event envelope", {
-          issues: [{ path: key, message: "the own ordering field does not match its schema format" }],
-        });
-      }
-    }
+    enforceEnvelopeConstraints(own);
     return own as EventEnvelope<unknown>;
   });
 }
