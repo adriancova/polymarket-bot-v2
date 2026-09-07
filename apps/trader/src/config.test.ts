@@ -199,19 +199,108 @@ describe("parseTraderConfig", () => {
     expect(parsed.refusal.issues.join("\n")).toContain("CodeString");
   });
 
-  it("REFUSES an instance id that cannot satisfy BOTH merged doors, and says why", () => {
-    const config = validConfig();
-    const instances = config["instances"] as Record<string, unknown>[];
-    // A genuinely-minted UUIDv7 begins with `0`: satisfies `packages/ledger`,
-    // fails `packages/risk`'s CodeString. Refused at STARTUP with the conflict
-    // named, rather than as a mid-run RISK_INPUT_INVALID.
-    if (instances[0] !== undefined) {
-      instances[0]["instanceId"] = "018f4a7e-2222-7abc-8def-0123456789ab";
+  /**
+   * ADR-021's final step, measured (`TRDR-1`).
+   *
+   * `instanceId` used to be `UuidAndCodeString` — the UUID shape whose first
+   * hex digit had to be a LETTER — because `packages/risk` and
+   * `packages/capital-allocator` typed the same value `CodeStringSchema` while
+   * `packages/ledger` and `packages/pnl` required `Uuidv7Schema`. Both of those
+   * doors were re-typed (`WP-180-FU3` `8c14b47`, `ALLOC-1` `d9f70a6`), so this
+   * door now delegates to `packages/domain`'s `Uuidv7Schema` itself.
+   *
+   * THE CHANGE MOVES IN TWO DIRECTIONS AND BOTH ARE PINNED HERE. It ADMITS the
+   * `0`-leading population every honest mint produces, and it REFUSES the
+   * wrong-version and wrong-variant UUIDs the old regex was blind to — measured
+   * at the base of this change: `a18f4a7e-2222-4abc-8def-0123456789ab`, a
+   * lowercase **v4**, was ACCEPTED at startup and refused only mid-run by the
+   * risk door (ALLOC-1 review r1 L1). A startup door that defers a refusal to
+   * the first intent is not a startup door.
+   */
+  describe("the instance id is an IDENTITY — a canonical UUIDv7 (ADR-021)", () => {
+    function withInstanceId(value: string): Record<string, unknown> {
+      const config = validConfig();
+      const instances = config["instances"] as Record<string, unknown>[];
+      if (instances[0] !== undefined) instances[0]["instanceId"] = value;
+      return config;
     }
-    const parsed = parseTraderConfig(config);
-    expect(parsed.ok).toBe(false);
-    if (parsed.ok) return;
-    expect(parsed.refusal.issues.join("\n")).toContain("cross-package conflict");
+
+    it("ACCEPTS a minted `0`-leading UUIDv7 — the population the old door refused", () => {
+      // A UUIDv7's first hex digit is the top nibble of its 48-bit millisecond
+      // timestamp, which is `0` for every instant before ~2527. This is the id
+      // a real generator produces, and it was refused at STARTUP until now.
+      const parsed = parseTraderConfig(withInstanceId("018f4a7e-2222-7abc-8def-0123456789ab"));
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) return;
+      expect(parsed.config.instances[0]?.instanceId).toBe(
+        "018f4a7e-2222-7abc-8def-0123456789ab",
+      );
+    });
+
+    it("ACCEPTS the letter-leading UUIDv7 the interim door minted — compatibility", () => {
+      // ADR-021 Consequences: "Existing letter-leading UUIDv7 configurations
+      // remain valid." The shipped example configuration and the e2e run both
+      // use one, so this row is not hypothetical.
+      expect(parseTraderConfig(withInstanceId("a18f4a7e-2222-7abc-8def-0123456789ab")).ok).toBe(
+        true,
+      );
+    });
+
+    it("REFUSES a letter-leading lowercase v4 — the version-blind hole, now closed", () => {
+      const parsed = parseTraderConfig(withInstanceId("a18f4a7e-2222-4abc-8def-0123456789ab"));
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) return;
+      expect(parsed.refusal.code).toBe("TRADER_CONFIG_INVALID");
+      expect(parsed.refusal.issues.join("\n")).toContain("instances.0.instanceId");
+      expect(parsed.refusal.issues.join("\n")).toContain("UUIDv7");
+    });
+
+    it("REFUSES a UUIDv7 whose VARIANT nibble is not RFC 9562's — also blind before", () => {
+      // Version 7, letter lead, but the variant nibble is `c` rather than one
+      // of `8`/`9`/`a`/`b`. The old regex saw only the shape.
+      expect(parseTraderConfig(withInstanceId("a18f4a7e-2222-7abc-cdef-0123456789ab")).ok).toBe(
+        false,
+      );
+    });
+
+    it("REFUSES a non-UUID code string — no other door ever admitted one", () => {
+      const parsed = parseTraderConfig(withInstanceId("strat-a"));
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) return;
+      expect(parsed.refusal.issues.join("\n")).toContain("instances.0.instanceId");
+    });
+
+    it("REFUSES an UPPERCASE UUIDv7 — ADR-016 §2: refused, never case-folded", () => {
+      expect(parseTraderConfig(withInstanceId("018F4A7E-2222-7ABC-8DEF-0123456789AB")).ok).toBe(
+        false,
+      );
+    });
+
+    it("the refusal makes NO stale cross-package claim (ALLOC-1 r1 L2)", () => {
+      // The old message said "packages/risk types context.strategyInstanceId as
+      // CodeStringSchema" and called the narrowing "a reported cross-package
+      // conflict". Both were true when they were written and are false now;
+      // an operator reading them would go and fix a package that is correct.
+      const parsed = parseTraderConfig(withInstanceId("strat-a"));
+      expect(parsed.ok).toBe(false);
+      if (parsed.ok) return;
+      const issues = parsed.refusal.issues.join("\n");
+      expect(issues).not.toContain("cross-package conflict");
+      expect(issues).not.toContain("CodeStringSchema");
+      expect(issues).not.toContain("FIRST hex digit is a letter");
+      expect(issues).toContain("UUIDv7");
+    });
+
+    it("SKIPCHECKS: the IMPORTED format check stays on under pollution", () => {
+      // The grammar now comes from `@polymarket-bot/domain` rather than from a
+      // literal in this file, so what the arena copies is another package's
+      // node. `schema-arena` records `skipChecks` as the class that silently
+      // disables exactly this kind of check; permission must not vary.
+      const config = withInstanceId("a18f4a7e-2222-4abc-8def-0123456789ab");
+      expect(parseTraderConfig(config).ok).toBe(false);
+      cleanups.push(pollute("skipChecks", true));
+      expect(parseTraderConfig(config).ok).toBe(false);
+    });
   });
 
   /**

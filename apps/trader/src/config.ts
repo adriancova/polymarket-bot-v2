@@ -67,6 +67,7 @@
 import { z } from "zod";
 
 import { explainCanonicalDecimalString } from "@polymarket-bot/decimal";
+import { Uuidv7Schema } from "@polymarket-bot/domain";
 import { readPlainData } from "@polymarket-bot/risk/plain-data";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 
@@ -131,24 +132,24 @@ const Identifier = z.string().min(1).max(200);
  * The `packages/domain` `CodeString` grammar, restated here as a REFUSAL at the
  * trader's own door.
  *
- * `packages/risk`'s evaluation input types `context.strategyInstanceId` and
- * every `ScopeAttribution` key as `CodeString` — "must be an alphanumeric code
- * without whitespace", and the pattern requires a LETTER first
- * (`^[A-Za-z][A-Za-z0-9_.:-]*$`). A configuration that violates it produces a
- * `RISK_INPUT_INVALID` refusal on the first intent, mid-run, with no order
- * placed and nothing to point the operator at. Refusing it HERE turns that into
- * a startup failure naming the field.
+ * `packages/risk`'s evaluation input types every `ScopeAttribution` key as
+ * `CodeString` — "must be an alphanumeric code without whitespace", and the
+ * pattern requires a LETTER first (`^[A-Za-z][A-Za-z0-9_.:-]*$`). A
+ * configuration that violates it produces a `RISK_INPUT_INVALID` refusal on the
+ * first intent, mid-run, with no order placed and nothing to point the operator
+ * at. Refusing it HERE turns that into a startup failure naming the field.
  *
- * See `README.md` for the reported cross-package conflict this exposes: a
- * genuinely-minted UUIDv7 begins with the digit `0` for every timestamp this
- * century, so it satisfies `packages/ledger`'s `Uuidv7Schema` and FAILS
- * `packages/risk`'s `CodeStringSchema` — the two doors cannot both be satisfied
- * by one such identifier.
+ * SCOPE KEYS ONLY. `context.strategyInstanceId` was typed this way too until
+ * ADR-021 ruled it an identity and `WP-180-FU3` re-typed it; see
+ * {@link Uuidv7}. A scope key really is what `CodeString` documents itself for
+ * — "a stable machine vocabulary token: reason codes, tags, feed identifiers,
+ * channel names" — which is why this grammar stays for these fields and only
+ * for them.
  */
 const CodeString = z.string().min(1).max(200).regex(/^[A-Za-z][A-Za-z0-9_.:-]*$/u, {
   message:
     "must be a §7 CodeString: a LETTER followed by alphanumerics, '_', '.', ':' or '-' " +
-    "(packages/risk types the scope keys and the strategy instance id this way)",
+    "(packages/risk types the scope keys this way)",
 });
 const Uuid = z
   .string()
@@ -157,31 +158,31 @@ const Uuid = z
   });
 
 /**
- * An identifier that satisfies BOTH merged doors it must pass.
+ * `packages/domain`'s OWN `Uuidv7Schema` — the identity grammar, not a copy.
  *
- * ONE regex rather than `Uuid.and(CodeString)`, because the arena refuses an
- * `intersection` node by name — "a node it cannot copy is a parse it cannot
- * protect" — and a door that fell back to an unprotected assembly to express a
- * conjunction would be trading D2 for syntax.
+ * ADR-021 (accepted 2026-09-06, amended the same day) ruled `strategyInstanceId`
+ * an identity rather than a code token, and every door that constrains it now
+ * says so: `packages/risk` (`WP-180-FU3`, `8c14b47`) and
+ * `packages/capital-allocator` (`ALLOC-1`, `d9f70a6`) were re-typed to
+ * `Uuidv7Schema`, which `packages/ledger`'s `AllocationClaim.instanceId` and
+ * `packages/pnl`'s `PnlOwner.instanceId` always were. Four merged doors, one
+ * grammar — so `WP-230`'s interim intersection (`UuidAndCodeString`: a UUID
+ * shape whose first hex digit had to be a LETTER, shipped while the doors
+ * disagreed) is deleted rather than kept as a local narrowing.
  *
- * The conjunction is the UUID grammar with a LETTER first hex digit. It is
- * deliberately NARROWER than either door alone, and the refusal message says so,
- * because the narrowing is a REPORTED CROSS-PACKAGE CONFLICT and not a
- * preference: every UUIDv7 minted from a real timestamp this century begins with
- * `0`, which `packages/ledger` requires and `packages/risk` refuses.
+ * Deleting it is NOT a pure relaxation, and that is the point. The interim
+ * regex was version- and variant-BLIND: a lowercase **v4** with a letter lead
+ * passed THIS door at startup and was refused only mid-run by the risk door.
+ * The domain schema admits the `0`-leading population every real mint produces
+ * AND enforces the version and variant nibbles, so the admitted and refused
+ * populations move in opposite directions. Both directions are pinned in
+ * `config.test.ts`.
+ *
+ * Imported rather than restated for the reason {@link canonicalDecimalSchema}
+ * gives: a second copy of a grammar here can drift from the doors this value
+ * must actually pass, and then the startup answer and the runtime answer differ.
  */
-const UuidAndCodeString = z
-  .string()
-  .regex(/^[a-f][0-9a-f]{7}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u, {
-    message:
-      "must be a canonical lowercase UUID whose FIRST hex digit is a letter (a-f). Two merged " +
-      "doors constrain this one value and their intersection is this shape: " +
-      "packages/ledger and packages/pnl require Uuidv7Schema, while packages/risk types " +
-      "context.strategyInstanceId as CodeStringSchema, whose pattern requires a leading " +
-      "letter. A UUIDv7 minted from a real timestamp begins with '0' and cannot satisfy both " +
-      "— that is a reported cross-package conflict, and this door refuses at STARTUP rather " +
-      "than letting it surface as a mid-run RISK_INPUT_INVALID with no order placed",
-  });
+const Uuidv7 = Uuidv7Schema;
 
 /** §8.3 bounds. Every queue in this process is sized here, explicitly. */
 const QueueBoundsSchema = z.strictObject({
@@ -263,16 +264,17 @@ const MarketConfigSchema = z.strictObject({
  */
 const InstanceConfigSchema = z.strictObject({
   /**
-   * A canonical lowercase UUIDv7 that ALSO satisfies the `CodeString` grammar.
+   * The instance's IDENTITY: a canonical lowercase UUIDv7 ({@link Uuidv7}).
    *
-   * Both are required by doors this process must pass: `packages/ledger`'s
-   * `AllocationClaim.instanceId` and `packages/pnl`'s `PnlOwner.instanceId` are
-   * `Uuidv7Schema`, while `packages/risk`'s `context.strategyInstanceId` is
-   * `CodeStringSchema`. The intersection is non-empty — a UUIDv7 whose first
-   * hex digit is a LETTER satisfies both — and it is checked here so the
-   * conflict surfaces at startup rather than as a mid-run risk refusal.
+   * Every door this value must pass types it that way — `packages/risk`'s
+   * `context.strategyInstanceId`, `packages/capital-allocator`'s reservation
+   * and state surfaces, `packages/ledger`'s `AllocationClaim.instanceId` and
+   * `packages/pnl`'s `PnlOwner.instanceId` — so the check here is the same
+   * check, made at startup, on the field an operator can point at. A letter-
+   * leading UUIDv7 (what `WP-230`'s interim grammar minted) is still valid; a
+   * wrong-version or wrong-variant UUID no longer is.
    */
-  instanceId: UuidAndCodeString,
+  instanceId: Uuidv7,
   runId: Uuid,
   configId: Uuid,
   /** Canonical unsigned integer string (§10.3 `runs.run_seed`). */
