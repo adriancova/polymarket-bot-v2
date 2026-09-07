@@ -12,10 +12,17 @@ function without(key: string): Record<string, unknown> {
 }
 
 describe("validateEnvelope", () => {
-  it("accepts a §7.1 envelope and returns the caller's own object", () => {
+  it("accepts a §7.1 envelope as a fresh frozen own-data record", () => {
     const envelope = createTestEnvelope();
 
-    expect(validateEnvelope(envelope)).toBe(envelope);
+    const result = validateEnvelope(envelope);
+    expect(result).toEqual(envelope);
+    expect(result).not.toBe(envelope);
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(Object.getPrototypeOf(result)).toBe(null);
+    for (const key of ["eventId", "receivedAt", "gatewayEpoch", "ingestSeq"] as const) {
+      expect(result[key]).toBe(envelope[key]);
+    }
   });
 
   it("rejects a non-object", () => {
@@ -70,7 +77,7 @@ describe("encodeEnvelope / decodeEnvelope", () => {
 
     const decoded = decodeEnvelope(encodeEnvelope(envelope));
 
-    expect(decoded).toStrictEqual(envelope);
+    expect(decoded).toEqual(envelope);
     expect(decoded.ingestSeq).toBe("9007199254740993");
     expect(decoded.receivedMonotonicNs).toBe("1758000000123456789");
   });
@@ -85,7 +92,7 @@ describe("encodeEnvelope / decodeEnvelope", () => {
 
     const decoded = decodeEnvelope(encodeEnvelope(createTestEnvelope({ payload })));
 
-    expect(decoded.payload).toStrictEqual(payload);
+    expect(decoded.payload).toEqual(payload);
     for (const value of Object.values(decoded.payload as Record<string, unknown>)) {
       expect(typeof value).toBe("string");
     }
@@ -99,7 +106,7 @@ describe("encodeEnvelope / decodeEnvelope", () => {
       explicitNull: null,
     };
 
-    expect(decodeEnvelope(encodeEnvelope(createTestEnvelope({ payload }))).payload).toStrictEqual(
+    expect(decodeEnvelope(encodeEnvelope(createTestEnvelope({ payload }))).payload).toEqual(
       payload,
     );
   });
