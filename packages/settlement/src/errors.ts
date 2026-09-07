@@ -81,6 +81,18 @@ export type SettlementRefusalCode =
   | "SETTLEMENT_PUBLISHED_WINDOWS_UNKNOWN"
 
   // --- observation ----------------------------------------------------------
+  /**
+   * The value is not a settlement observation: it is not plain own data, or it
+   * does not STATE a field the selected model settles on.
+   *
+   * The observation door's refusal (`observation-door.ts`; ADR-020 §3 D1/D3).
+   * Distinct from the value-level codes below, which judge a field the reading
+   * does carry: this one says the reading did not carry it at all, or carried it
+   * as something no document can (an accessor, a symbol key, a foreign
+   * prototype). At this package's base every declared observation field could be
+   * supplied by `Object.prototype` instead, and the settlement completed.
+   */
+  | "SETTLEMENT_OBSERVATION_INVALID"
   /** The observation belongs to a different payoff model than the spec selects. */
   | "SETTLEMENT_OBSERVATION_MODEL_MISMATCH"
   /** The observation's averaging window is not the window the spec declares. */

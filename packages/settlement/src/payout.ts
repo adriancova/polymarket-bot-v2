@@ -40,8 +40,10 @@ import {
   settlementFailure,
   settlementOk,
   settlementRefusal,
+  type SettlementRefusalDetails,
   type SettlementResult,
 } from "./errors.js";
+import { ownEmit } from "./spec-door.js";
 import { isTerminalMarketOutcomeState, type MarketOutcomeState } from "./vocabulary.js";
 
 /** "Winning tokens become redeemable for $1.00 each" (resolution doc, 2026-08-28). */
@@ -59,20 +61,54 @@ export interface OutcomePayoutPerShare {
   readonly no: DecimalString;
 }
 
-const YES_WIN_PAYOUT: OutcomePayoutPerShare = Object.freeze({
-  yes: WINNING_TOKEN_PAYOUT_PER_SHARE,
-  no: LOSING_TOKEN_PAYOUT_PER_SHARE,
-});
+/**
+ * D4 (ADR-020 §3): the three payout records are emitted with a NULL PROTOTYPE
+ * and frozen.
+ *
+ * These are redemption values per share. A consumer reading a side this record
+ * does not carry must read nothing rather than whatever `Object.prototype` says,
+ * and the same record is attached to every {@link SettlementEvaluation}, where
+ * an inherited `payoutPerShare` was measured answering for a `PENDING` market.
+ */
+const YES_WIN_PAYOUT: OutcomePayoutPerShare = ownEmit<OutcomePayoutPerShare>([
+  ["yes", WINNING_TOKEN_PAYOUT_PER_SHARE],
+  ["no", LOSING_TOKEN_PAYOUT_PER_SHARE],
+]);
 
-const NO_WIN_PAYOUT: OutcomePayoutPerShare = Object.freeze({
-  yes: LOSING_TOKEN_PAYOUT_PER_SHARE,
-  no: WINNING_TOKEN_PAYOUT_PER_SHARE,
-});
+const NO_WIN_PAYOUT: OutcomePayoutPerShare = ownEmit<OutcomePayoutPerShare>([
+  ["yes", LOSING_TOKEN_PAYOUT_PER_SHARE],
+  ["no", WINNING_TOKEN_PAYOUT_PER_SHARE],
+]);
 
-const SPLIT_PAYOUT: OutcomePayoutPerShare = Object.freeze({
-  yes: SPLIT_50_50_PAYOUT_PER_SHARE,
-  no: SPLIT_50_50_PAYOUT_PER_SHARE,
-});
+const SPLIT_PAYOUT: OutcomePayoutPerShare = ownEmit<OutcomePayoutPerShare>([
+  ["yes", SPLIT_50_50_PAYOUT_PER_SHARE],
+  ["no", SPLIT_50_50_PAYOUT_PER_SHARE],
+]);
+
+/**
+ * The non-terminal refusal's details, COMPOSED INSIDE A CONTAINMENT.
+ *
+ * ADR-020's 2026-09-06 amendment, measured on this function at base `c2c0733`:
+ * {@link isTerminalMarketOutcomeState} is a `zod` parse, and `zod`'s issue
+ * construction reads through the prototype chain. An inherited `_zod` made this
+ * DETAIL throw `TypeError: Cannot read properties of undefined (reading 'has')`,
+ * and an inherited `value` or `get` threw `Invalid property descriptor` (ADR-020
+ * §1 class 8) — under either pollution variant, out of a function documented to
+ * RETURN a refusal, and taking `evaluateSettlement` with it for every `PENDING`
+ * threshold-by-date market.
+ *
+ * The refusal's CODE never depended on this call — the switch below already
+ * decided — so a detail that cannot be computed is omitted rather than thrown.
+ * ADR-020 §6 permits refusal COMPOSITION to vary; what may not vary is that a
+ * verdict comes back at all.
+ */
+function nonTerminalDetails(outcome: MarketOutcomeState): SettlementRefusalDetails {
+  try {
+    return { outcome, terminal: isTerminalMarketOutcomeState(outcome) };
+  } catch {
+    return { outcome };
+  }
+}
 
 /**
  * Per-share payout of a settled market, or the reason there is none.
@@ -105,7 +141,7 @@ export function payoutPerShare(
         settlementRefusal(
           "SETTLEMENT_OUTCOME_NOT_TERMINAL",
           `outcome state ${outcome} determines no payoff (ADR-009 §4: a dispute is an in-flight process, not an outcome)`,
-          { outcome, terminal: isTerminalMarketOutcomeState(outcome) },
+          nonTerminalDetails(outcome),
         ),
       );
   }
