@@ -28,10 +28,30 @@
  * JavaScript safe-integer range, so a venue id or epoch that `JSON.parse` could
  * only represent approximately fails to parse instead of being carried as a
  * rounded value that would then be printed as a wrong `venueTradeId`.
+ *
+ * THE PARSE IS NOT THE DOOR (`REC-1`, ADR-020 §3, `schema-boundary.md` §3).
+ * `zod` reads a schema's DECLARED keys through the prototype chain, so a
+ * successful parse is not evidence that the frame carried them. Every frame is
+ * therefore materialized prototype-free by `./wire-door.ts` before any schema
+ * runs, every emitted value is taken from that materialized tree rather than
+ * from `result.data`, every parse and every refusal RENDERING happens inside a
+ * containment, and every decoded frame is emitted with a null prototype. See
+ * that module's header for which of D1–D4 this door performs and which it
+ * does not.
  */
 
 import { z } from "zod";
 
+import {
+  containedParse,
+  isOwnRecord,
+  ownBoolean,
+  ownBoundedString,
+  ownEmit,
+  ownSafeInt,
+  readOwnWire,
+  type OwnRecord,
+} from "./wire-door.js";
 import {
   BINANCE_BOOK_TICKER_STREAM_SUFFIX,
   BINANCE_SERVER_SHUTDOWN_EVENT_TYPE,
@@ -414,31 +434,49 @@ export function decodeFrame(raw: string, options: DecodeFrameOptions = {}): Deco
     });
   }
 
-  if (!isPlainObject(parsed)) {
+  // D1. Before a schema runs and before any property is read: rebuild the
+  // frame as own data with no prototype. Everything below reads that tree.
+  const read = readOwnWire(parsed);
+  if (!read.ok) {
+    return malformed(raw, undefined, "NONE", "SCHEMA_MISMATCH", {
+      detail: `frame could not be read as JSON data: ${read.detail}`,
+    });
+  }
+  const frame: unknown = read.value;
+
+  if (!isOwnRecord(frame)) {
     return malformed(raw, undefined, "NONE", "NOT_AN_OBJECT", {
-      detail: `top-level value is ${describeJsonType(parsed)}; every documented frame is a JSON object`,
+      detail: `top-level value is ${describeJsonType(frame)}; every documented frame is a JSON object`,
     });
   }
 
   // The combined-stream wrapper states the originating stream. It is a CLAIM
-  // until the payload agrees with it — see `resolveChannel`.
-  const wrapper = BinanceCombinedEnvelopeSchema.safeParse(parsed);
-  if (wrapper.success && "data" in parsed) {
-    const inner: unknown = wrapper.data.data;
-    if (!isPlainObject(inner)) {
-      return malformed(raw, wrapper.data.stream, "UNVERIFIED_WRAPPER", "NOT_AN_OBJECT", {
+  // until the payload agrees with it — see `resolveChannel`. Both halves of
+  // "is this a wrapper" are answered from what the frame OWNS: `Object.hasOwn`
+  // rather than `in`, and the stream name read from the tree.
+  const stream = ownBoundedString(frame, "stream", 1, 128);
+  if (stream !== undefined && Object.hasOwn(frame, "data")) {
+    const wrapper = containedParse(BinanceCombinedEnvelopeSchema, frame);
+    if (!wrapper.ok) {
+      return malformed(raw, stream, "UNVERIFIED_WRAPPER", "SCHEMA_MISMATCH", {
+        detail: `combined-stream wrapper: ${wrapper.detail}`,
+      });
+    }
+    const inner: unknown = frame["data"];
+    if (!isOwnRecord(inner)) {
+      return malformed(raw, stream, "UNVERIFIED_WRAPPER", "NOT_AN_OBJECT", {
         detail: `combined-stream \`data\` is ${describeJsonType(inner)}; a wrapped payload is a JSON object`,
       });
     }
-    return decodePayload(raw, inner, wrapper.data.stream, options);
+    return decodePayload(raw, inner, stream, options);
   }
 
-  return decodePayload(raw, parsed, undefined, options);
+  return decodePayload(raw, frame, undefined, options);
 }
 
 function decodePayload(
   raw: string,
-  payload: Record<string, unknown>,
+  payload: OwnRecord,
   streamName: string | undefined,
   options: DecodeFrameOptions,
 ): DecodedFrame {
@@ -449,52 +487,63 @@ function decodePayload(
   const declaredEventType = typeof payload["e"] === "string" ? payload["e"] : undefined;
 
   if (declaredEventType === BINANCE_TRADE_EVENT_TYPE) {
-    const result = BinanceTradePayloadSchema.safeParse(payload);
-    if (!result.success) {
+    const result = containedParse(BinanceTradePayloadSchema, payload);
+    if (!result.ok) {
       return malformed(raw, streamName, channelSource, "SCHEMA_MISMATCH", {
-        detail: `\`${BINANCE_TRADE_EVENT_TYPE}\` payload: ${formatIssues(result.error)}`,
+        detail: `\`${BINANCE_TRADE_EVENT_TYPE}\` payload: ${result.detail}`,
       });
     }
-    const trade = result.data;
-    const channel = resolveChannel(streamName, trade.s, BINANCE_TRADE_STREAM_SUFFIX, options);
+    // D3. THE MEASURED ROW. Every field is taken from the materialized tree —
+    // never from `result.data` — and each read restates the presence and the
+    // bound the schema declares, so a frame that did not carry `q` is refused
+    // whatever the library was persuaded to accept.
+    const trade = ownTradeFields(payload);
+    if (trade === undefined) {
+      return malformed(raw, streamName, channelSource, "SCHEMA_MISMATCH", { detail: TAKE_FAILED });
+    }
+    const channel = resolveChannel(streamName, trade.symbol, BINANCE_TRADE_STREAM_SUFFIX, options);
     if (!channel.ok) {
       return malformed(raw, streamName, channelSource, channel.reason, { detail: channel.detail });
     }
-    return {
+    return ownEmit<DecodedTradeFrame>({
       kind: "TRADE",
       raw,
       streamName: channel.streamName,
       channelSource: channel.channelSource,
       unknownFields: unknownKeysOf(payload, TRADE_KNOWN_KEYS),
-      symbol: trade.s,
-      tradeId: trade.t,
-      priceRaw: trade.p,
-      quantityRaw: trade.q,
-      eventTimeEpoch: trade.E,
-      tradeTimeEpoch: trade.T,
-      buyerIsMaker: trade.m,
-    };
+      symbol: trade.symbol,
+      tradeId: trade.tradeId,
+      priceRaw: trade.priceRaw,
+      quantityRaw: trade.quantityRaw,
+      eventTimeEpoch: trade.eventTimeEpoch,
+      tradeTimeEpoch: trade.tradeTimeEpoch,
+      buyerIsMaker: trade.buyerIsMaker,
+    });
   }
 
   if (declaredEventType === BINANCE_SERVER_SHUTDOWN_EVENT_TYPE) {
-    const result = BinanceServerShutdownPayloadSchema.safeParse(payload);
-    if (!result.success) {
+    const result = containedParse(BinanceServerShutdownPayloadSchema, payload);
+    if (!result.ok) {
       return malformed(raw, streamName, channelSource, "SCHEMA_MISMATCH", {
-        detail: `\`${BINANCE_SERVER_SHUTDOWN_EVENT_TYPE}\` payload: ${formatIssues(result.error)}`,
+        detail: `\`${BINANCE_SERVER_SHUTDOWN_EVENT_TYPE}\` payload: ${result.detail}`,
       });
     }
-    return {
+    const eventTimeEpoch = ownSafeInt(payload, "E");
+    if (eventTimeEpoch === undefined) {
+      return malformed(raw, streamName, channelSource, "SCHEMA_MISMATCH", { detail: TAKE_FAILED });
+    }
+    return ownEmit<DecodedServerShutdownFrame>({
       kind: "SERVER_SHUTDOWN",
       raw,
       streamName,
       channelSource,
-      unknownFields: unknownKeysOf(payload, new Set(["e", "E"])),
-      eventTimeEpoch: result.data.E,
-    };
+      unknownFields: unknownKeysOf(payload, SHUTDOWN_KNOWN_KEYS),
+      eventTimeEpoch,
+    });
   }
 
   if (declaredEventType !== undefined) {
-    return {
+    return ownEmit<DecodedUnknownFrame>({
       kind: "UNKNOWN",
       raw,
       streamName,
@@ -502,79 +551,91 @@ function decodePayload(
       unknownFields: [],
       declaredEventType,
       detail: `event type ${JSON.stringify(declaredEventType)} is not one this package models (in scope: ${BINANCE_TRADE_EVENT_TYPE}, ${BINANCE_SERVER_SHUTDOWN_EVENT_TYPE}, and the untyped bookTicker payload)`,
-    };
+    });
   }
 
   // `bookTicker` is the one in-scope payload with no `e` field, so it is
   // recognised by its documented key set rather than by a discriminator.
   if (looksLikeBookTicker(payload)) {
-    const result = BinanceBookTickerPayloadSchema.safeParse(payload);
-    if (!result.success) {
+    const result = containedParse(BinanceBookTickerPayloadSchema, payload);
+    if (!result.ok) {
       return malformed(raw, streamName, channelSource, "SCHEMA_MISMATCH", {
-        detail: `\`${BINANCE_BOOK_TICKER_STREAM_SUFFIX}\` payload: ${formatIssues(result.error)}`,
+        detail: `\`${BINANCE_BOOK_TICKER_STREAM_SUFFIX}\` payload: ${result.detail}`,
       });
     }
-    const ticker = result.data;
+    const ticker = ownBookTickerFields(payload);
+    if (ticker === undefined) {
+      return malformed(raw, streamName, channelSource, "SCHEMA_MISMATCH", { detail: TAKE_FAILED });
+    }
     const channel = resolveChannel(
       streamName,
-      ticker.s,
+      ticker.symbol,
       BINANCE_BOOK_TICKER_STREAM_SUFFIX,
       options,
     );
     if (!channel.ok) {
       return malformed(raw, streamName, channelSource, channel.reason, { detail: channel.detail });
     }
-    return {
+    return ownEmit<DecodedBookTickerFrame>({
       kind: "BOOK_TICKER",
       raw,
       streamName: channel.streamName,
       channelSource: channel.channelSource,
       unknownFields: unknownKeysOf(payload, BOOK_TICKER_KNOWN_KEYS),
-      symbol: ticker.s,
-      updateId: ticker.u,
-      bidPriceRaw: ticker.b,
-      bidQuantityRaw: ticker.B,
-      askPriceRaw: ticker.a,
-      askQuantityRaw: ticker.A,
-    };
+      symbol: ticker.symbol,
+      updateId: ticker.updateId,
+      bidPriceRaw: ticker.bidPriceRaw,
+      bidQuantityRaw: ticker.bidQuantityRaw,
+      askPriceRaw: ticker.askPriceRaw,
+      askQuantityRaw: ticker.askQuantityRaw,
+    });
   }
 
-  if ("code" in payload && "msg" in payload) {
-    const result = BinanceControlErrorSchema.safeParse(payload);
-    if (!result.success) {
+  if (Object.hasOwn(payload, "code") && Object.hasOwn(payload, "msg")) {
+    const result = containedParse(BinanceControlErrorSchema, payload);
+    if (!result.ok) {
       return malformed(raw, streamName, channelSource, "SCHEMA_MISMATCH", {
-        detail: `control error payload: ${formatIssues(result.error)}`,
+        detail: `control error payload: ${result.detail}`,
       });
     }
-    return {
+    const venueCode = ownSafeInt(payload, "code");
+    const message = ownBoundedString(payload, "msg", 0, 1024);
+    if (venueCode === undefined || message === undefined) {
+      return malformed(raw, streamName, channelSource, "SCHEMA_MISMATCH", { detail: TAKE_FAILED });
+    }
+    return ownEmit<DecodedControlErrorFrame>({
       kind: "CONTROL_ERROR",
       raw,
       streamName,
       channelSource,
-      unknownFields: unknownKeysOf(payload, new Set(["code", "msg", "id"])),
-      venueCode: result.data.code,
-      message: result.data.msg,
-    };
+      unknownFields: unknownKeysOf(payload, CONTROL_ERROR_KNOWN_KEYS),
+      venueCode,
+      message,
+    });
   }
 
-  if ("result" in payload) {
-    const result = BinanceControlResponseSchema.safeParse(payload);
-    if (!result.success) {
+  if (Object.hasOwn(payload, "result")) {
+    const result = containedParse(BinanceControlResponseSchema, payload);
+    if (!result.ok) {
       return malformed(raw, streamName, channelSource, "SCHEMA_MISMATCH", {
-        detail: `control response payload: ${formatIssues(result.error)}`,
+        detail: `control response payload: ${result.detail}`,
       });
     }
-    return {
+    return ownEmit<DecodedControlResponseFrame>({
       kind: "CONTROL_RESPONSE",
       raw,
       streamName,
       channelSource,
-      unknownFields: unknownKeysOf(payload, new Set(["result", "id"])),
-      id: result.data.id ?? null,
-    };
+      unknownFields: unknownKeysOf(payload, CONTROL_RESPONSE_KNOWN_KEYS),
+      // `id` is documented optional and nullable, so ABSENCE is a documented
+      // value here rather than a missing field. It is still read from the
+      // materialized tree: an absent `id` reads `undefined` from a
+      // prototype-free record whatever `Object.prototype` carries.
+      id: ownControlId(payload) ?? null,
+    });
   }
 
-  return {
+  return ownEmit<DecodedUnknownFrame>({
     kind: "UNKNOWN",
     raw,
     streamName,
@@ -582,12 +643,103 @@ function decodePayload(
     unknownFields: [],
     declaredEventType: undefined,
     detail: `frame declares no \`e\` and matches no documented in-scope shape; keys: ${JSON.stringify(Object.keys(payload).slice(0, 20))}`,
+  });
+}
+
+/** The detail a take-from-the-tree refusal carries. */
+const TAKE_FAILED =
+  "the schema accepted this frame but the frame itself does not carry every documented field as its own value; a field that is not in the frame is never taken from anywhere else";
+
+const SHUTDOWN_KNOWN_KEYS = new Set(["e", "E"]);
+const CONTROL_ERROR_KNOWN_KEYS = new Set(["code", "msg", "id"]);
+const CONTROL_RESPONSE_KNOWN_KEYS = new Set(["result", "id"]);
+
+/** D3 for `<symbol>@trade`: what the FRAME carries, or nothing. */
+function ownTradeFields(payload: OwnRecord):
+  | {
+      readonly symbol: string;
+      readonly tradeId: number;
+      readonly priceRaw: string;
+      readonly quantityRaw: string;
+      readonly eventTimeEpoch: number;
+      readonly tradeTimeEpoch: number;
+      readonly buyerIsMaker: boolean;
+    }
+  | undefined {
+  const symbol = ownBoundedString(payload, "s", 1, 64);
+  const priceRaw = ownBoundedString(payload, "p", 1, 64);
+  const quantityRaw = ownBoundedString(payload, "q", 1, 64);
+  const tradeId = ownSafeInt(payload, "t");
+  const eventTimeEpoch = ownSafeInt(payload, "E");
+  const tradeTimeEpoch = ownSafeInt(payload, "T");
+  const buyerIsMaker = ownBoolean(payload, "m");
+  if (
+    symbol === undefined ||
+    priceRaw === undefined ||
+    quantityRaw === undefined ||
+    tradeId === undefined ||
+    eventTimeEpoch === undefined ||
+    tradeTimeEpoch === undefined ||
+    buyerIsMaker === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    symbol,
+    tradeId,
+    priceRaw,
+    quantityRaw,
+    eventTimeEpoch,
+    tradeTimeEpoch,
+    buyerIsMaker,
   };
 }
 
-function looksLikeBookTicker(payload: Record<string, unknown>): boolean {
+/** D3 for `<symbol>@bookTicker`. */
+function ownBookTickerFields(payload: OwnRecord):
+  | {
+      readonly symbol: string;
+      readonly updateId: number;
+      readonly bidPriceRaw: string;
+      readonly bidQuantityRaw: string;
+      readonly askPriceRaw: string;
+      readonly askQuantityRaw: string;
+    }
+  | undefined {
+  const symbol = ownBoundedString(payload, "s", 1, 64);
+  const updateId = ownSafeInt(payload, "u");
+  const bidPriceRaw = ownBoundedString(payload, "b", 1, 64);
+  const bidQuantityRaw = ownBoundedString(payload, "B", 1, 64);
+  const askPriceRaw = ownBoundedString(payload, "a", 1, 64);
+  const askQuantityRaw = ownBoundedString(payload, "A", 1, 64);
+  if (
+    symbol === undefined ||
+    updateId === undefined ||
+    bidPriceRaw === undefined ||
+    bidQuantityRaw === undefined ||
+    askPriceRaw === undefined ||
+    askQuantityRaw === undefined
+  ) {
+    return undefined;
+  }
+  return { symbol, updateId, bidPriceRaw, bidQuantityRaw, askPriceRaw, askQuantityRaw };
+}
+
+/** D3 for the control frames' `id`: an int, a bounded string, or nothing. */
+function ownControlId(payload: OwnRecord): number | string | null | undefined {
+  const value = payload["id"];
+  if (value === null) {
+    return null;
+  }
+  if (typeof value === "string") {
+    return value.length <= 36 ? value : undefined;
+  }
+  return ownSafeInt(payload, "id");
+}
+
+function looksLikeBookTicker(payload: OwnRecord): boolean {
   for (const key of BOOK_TICKER_KNOWN_KEYS) {
-    if (!(key in payload)) {
+    if (!Object.hasOwn(payload, key)) {
       return false;
     }
   }
@@ -658,7 +810,7 @@ function malformed(
   reason: MalformedFrameReason,
   extra: { readonly detail: string },
 ): DecodedMalformedFrame {
-  return {
+  return ownEmit<DecodedMalformedFrame>({
     kind: "MALFORMED",
     raw,
     streamName,
@@ -666,15 +818,18 @@ function malformed(
     unknownFields: [],
     reason,
     detail: extra.detail,
-  };
+  });
 }
 
-function unknownKeysOf(payload: Record<string, unknown>, known: ReadonlySet<string>): string[] {
+/**
+ * Keys the venue sent that its documentation does not describe.
+ *
+ * Reads the MATERIALIZED tree, so this list is exactly what the frame carried:
+ * `unknownFields` is a feature (ADR-002 §7 — venue schema drift is visible as
+ * data), and closing declared-key adoption must not cost it.
+ */
+function unknownKeysOf(payload: OwnRecord, known: ReadonlySet<string>): string[] {
   return Object.keys(payload).filter((key) => !known.has(key));
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function describeJsonType(value: unknown): string {
@@ -685,11 +840,4 @@ function describeJsonType(value: unknown): string {
     return "an array";
   }
   return `a ${typeof value}`;
-}
-
-function formatIssues(error: z.ZodError): string {
-  return error.issues
-    .slice(0, 8)
-    .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
-    .join("; ");
 }
