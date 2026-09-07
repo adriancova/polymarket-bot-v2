@@ -101,11 +101,12 @@ base and tip).
 
 ## Follow-ups (owned)
 
-1. **TRDR-1 (now dispatchable):** the bounded `apps/trader` touch —
-   `InstanceConfigSchema.instanceId` → the real `Uuidv7Schema` (which
-   both admits 0-leading AND enforces version/variant — closing L1),
-   delete `UuidAndCodeString`, update the refusal text (L2). All four
-   merged doors then agree.
+1. **TRDR-1 — EXECUTED** (merged `65ae56c`, 2026-09-07):
+   `InstanceConfigSchema.instanceId` now uses the real `Uuidv7Schema`,
+   admitting 0-leading UUIDv7s and enforcing version/variant bits
+   (closing r1 L1). `UuidAndCodeString` was deleted and the conflict
+   refusal text replaced (closing r1 L2). All four merged doors and the
+   trader startup door now agree; ADR-021 is discharged.
 2. Docs round: ADR-021 second amendment (allocator door corrected by
    this merge; the evidence-shape NON-change; the cap-evasion finding);
    WP-180-FU3 handoff follow-up 1 marked done.

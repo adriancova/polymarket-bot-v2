@@ -154,3 +154,26 @@ Append-only; nothing above this line changed.
    the real `Uuidv7Schema` is a simultaneous widening (0-leading
    admitted) and tightening (version/variant enforced), and the round is
    accountable for BOTH directions.
+
+## Closing note (2026-09-07): the "After it lands" step is executed — this ADR is discharged
+
+Append-only; nothing above this line changed.
+
+`TRDR-1` (merged `65ae56c`) deleted `apps/trader`'s `UuidAndCodeString`
+intersection grammar and typed `InstanceConfigSchema.instanceId` as
+`packages/domain`'s own `Uuidv7Schema`, parsed through the trader's
+existing prototype-free door; the refusal text naming the conflict was
+rewritten in the same change. Per the second amendment's obligation the
+step was accountable in BOTH directions and both were review-verified:
+the minted `0`-leading population is admitted (a full end-to-end
+scenario run on a `0`-leading id produced results identical to the
+letter-leading baseline), and the door now enforces version and variant
+bits the interim regex never checked (a letter-leading v4 and a
+bad-variant v7 — both accepted at startup before — are refused at
+startup). The letter-first workaround of Consequences item 1 is retired;
+existing letter-leading UUIDv7 configurations remain valid (pinned as
+a compatibility row). All four merged doors and the trader startup door
+now agree. One asymmetry is deliberately left open, in the WP-180-FU3 r1 N4
+class: the trader's local `Uuid` for `runId`/`configId`/`marketId`
+remains version-blind — the five-identity-fields decision is its own
+future round.

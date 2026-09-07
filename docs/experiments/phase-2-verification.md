@@ -455,3 +455,41 @@ pnpm vitest run --config test/e2e/vitest.config.ts
 
 The last command is the one this report is about. Nothing in it requires a
 network, a container, a credential or an environment variable.
+
+---
+
+## Addendum (2026-09-07): §2 R1 is RESOLVED; the tripwire fired and was retired
+
+Append-only; nothing above this line changed — including §2 R1's frozen
+"Status: OPEN", which was true when written.
+
+The ruling R1 queued was made by ADR-021 (2026-09-06:
+`strategyInstanceId` is a `Uuidv7Schema` identity; risk's `CodeString`
+typing ruled a mis-typing), and the resolution chain landed in three
+merges: `packages/risk` re-typed by `WP-180-FU3` (`8c14b47`);
+`packages/capital-allocator` — a fourth door ADR-021's original text
+missed, found and measured by WP-180-FU3's review — by `ALLOC-1`
+(`d9f70a6`); and `apps/trader`'s startup door by `TRDR-1` (`65ae56c`),
+which deleted the `UuidAndCodeString` intersection and types
+`instanceId` as the real `Uuidv7Schema` — simultaneously admitting the
+timestamp-shaped (`0`-leading) population every honest mint produces and
+TIGHTENING to version/variant enforcement (the interim regex checked
+neither; a letter-leading v4 passed startup and was refused only
+mid-run).
+
+`test/e2e/residuals-observed.test.ts` fired on the first candidate
+carrying the trader change — exactly as §2's design sentence promised —
+and its R1 block was retired COUNT-NEUTRALLY in the same reviewed round
+(still two rows; the file still carries 13 tests and the suite 75, so
+§1's counts remain true): row 1 now pins that the letter-leading id this
+scenario was written around STILL works (ADR-021's compatibility
+promise, non-vacuous against this run), and row 2 pins the inversion —
+the timestamp-shaped id the frozen body above records as REFUSED now
+STARTS (and, review-verified end to end, runs the full scenario with
+results identical to the baseline), while a wrong-version id is refused
+at startup instead, with a message that names no cross-package conflict.
+The frozen golden was byte-identical (`dd6893bf…263d95`) throughout the
+chain.
+
+R2, R3 and R4 remain OPEN and their rows are byte-untouched
+(sha256-verified in TRDR-1's review).
