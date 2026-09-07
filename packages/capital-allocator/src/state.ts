@@ -33,6 +33,7 @@ import {
   OutcomeSideSchema,
   PositiveDecimalStringSchema,
   PriceStringSchema,
+  Uuidv7Schema,
   type MoneyString,
   // Referenced only as `typeof RunModeSchema` below; the runtime validation of
   // a run mode happens in `reserve.ts`, where the schema is a value.
@@ -53,7 +54,15 @@ import {
   type CapitalResult,
 } from "./refusals.js";
 
-/** Optional scope attribution for the §9.7 exposure dimensions. */
+/**
+ * Optional scope attribution for the §9.7 exposure dimensions.
+ *
+ * THESE THREE STAY `CodeStringSchema` (`ALLOC-1`, ADR-021's 2026-09-06
+ * amendment). A series, an underlying and a resolution window are machine
+ * VOCABULARY — "reason codes, tags, feed identifiers, channel names", the
+ * primitive's own stated purpose — not minted identities. The re-typing in
+ * this round is confined to `strategyInstanceId`, which is one.
+ */
 export const ScopeAttributionSchema = z.strictObject({
   seriesKey: CodeStringSchema.optional(),
   underlyingKey: CodeStringSchema.optional(),
@@ -65,7 +74,8 @@ export type ScopeAttribution = z.infer<typeof ScopeAttributionSchema>;
 export const PositionHoldingSchema = z.strictObject({
   positionId: NonEmptyStringSchema,
   marketId: InternalMarketIdSchema,
-  strategyInstanceId: CodeStringSchema,
+  /** An IDENTITY (ADR-021); see `reserve.ts`'s `ReservationRequestSchema`. */
+  strategyInstanceId: Uuidv7Schema,
   side: OutcomeSideSchema,
   shares: NonNegativeSharesStringSchema,
   /** Exact pUSD paid for the holding (the committed capital it represents). */
@@ -78,7 +88,8 @@ export type PositionHolding = z.infer<typeof PositionHoldingSchema>;
 export const OpenOrderCommitmentSchema = z.strictObject({
   orderId: NonEmptyStringSchema,
   marketId: InternalMarketIdSchema,
-  strategyInstanceId: CodeStringSchema,
+  /** An IDENTITY (ADR-021); see `reserve.ts`'s `ReservationRequestSchema`. */
+  strategyInstanceId: Uuidv7Schema,
   side: OutcomeSideSchema,
   action: z.enum(["BUY", "SELL"]),
   price: PriceStringSchema,
@@ -89,7 +100,8 @@ export type OpenOrderCommitment = z.infer<typeof OpenOrderCommitmentSchema>;
 
 export const LiveOwnerSchema = z.strictObject({
   marketId: InternalMarketIdSchema,
-  strategyInstanceId: CodeStringSchema,
+  /** An IDENTITY (ADR-021); see `reserve.ts`'s `ReservationRequestSchema`. */
+  strategyInstanceId: Uuidv7Schema,
 });
 export type LiveOwner = z.infer<typeof LiveOwnerSchema>;
 
