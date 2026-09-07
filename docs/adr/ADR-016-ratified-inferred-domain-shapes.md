@@ -259,3 +259,26 @@ ADR-002 §3 (version per emitted-field-set change), §5 (reserved `venue` key), 
 applies to `TokenId`).
 
 **Safety:** this ADR changes no run-mode default (ADR-010).
+
+## Amendment (2026-09-06): refusal-evidence shape for `context.strategyInstanceId`
+
+Append-only; nothing above this line changed. Since `WP-180-FU3`
+(`8c14b47`) re-typed `context.strategyInstanceId` to the arena
+`Uuidv7Schema` (ADR-021), a refusal of that ONE field carries schema
+`issues` (path + message) rather than the identity pass's
+`details.{field,value}` — the raw value no longer rides back out in the
+refusal evidence for this field. Consumer consequences: `apps/trader`'s
+`detailIssues` (`trader.ts:143`) and `readIssues` (`accounting.ts:289`)
+extract only `details.issues`, so the identity pass's `{field,value}`
+shape yields no additional issue strings. Their current call sites handle
+policy/caps and ledger refusals, respectively, not this evaluation-input
+refusal. The live risk-evaluation path records refusal codes
+(`loop.ts:1088–1091`) without reading `details`. The new shape provides
+path-and-message evidence to callers that inspect `details.issues`; it
+does not establish richer live trader logging. Direction and
+door are unchanged; refuse-not-fold still holds (§2's canonicality rule
+is enforced by the schema's own lowercase-canonical grammar). The
+`internalIdentityFields` entry for this field remains as defence in depth
+for direct callers and is unreachable through `validateEvaluationInput`
+(the schema answers first); it stays live for the other three identity
+fields.

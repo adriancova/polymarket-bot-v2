@@ -94,3 +94,33 @@ Consequently:
   intersection math verified.
 - Handoff §10.3 (id discipline); `db/migrations` `internal.uuid_v7`
   domains.
+
+## Amendment (2026-09-06): the risk re-typing landed; a fourth door was measured; sequencing is amended
+
+Append-only; nothing above this line changed.
+
+1. **The `packages/risk` correction is EXECUTED** (`WP-180-FU3`, merged
+   `8c14b47`): `context.strategyInstanceId` is the arena `Uuidv7Schema`,
+   with the regression tests this ADR demanded (a minted `0`-leading
+   UUIDv7 accepted; a non-UUID code string refused; the letter-leading
+   compatibility row green at base and tip).
+2. **This ADR's context missed a door.** `packages/capital-allocator`
+   types the same value `CodeStringSchema` at four sites:
+   `src/reserve.ts:69`, `src/state.ts:68`, `src/state.ts:81`,
+   `src/state.ts:92`. Measured, not assumed (WP-180-FU3, confirmed by its
+   review round 1): with a `0`-leading instance id, exactly seven
+   `test/unit/risk/ports.test.ts` tests fail with
+   `CAPITAL_INPUT_INVALID … must be an alphanumeric code without
+   whitespace`. So the value passes **four** merged doors, not three, and
+   the letter-leading-UUIDv7 intersection remains the only shape every
+   merged door accepts today.
+3. **The "After it lands" step is re-conditioned.** The bounded
+   `apps/trader` relaxation to plain `Uuidv7Schema` MUST NOT land until a
+   `packages/capital-allocator` re-typing round corrects the four sites
+   above. Ordering: allocator re-typing round → then the trader
+   relaxation (which also updates the refusal text naming this
+   conflict). Until then `apps/trader`'s `UuidAndCodeString` startup
+   refusal stays exactly as shipped.
+4. The interim state is fail-closed in the safe direction: the risk door
+   now accepts `0`-leading UUIDv7s that the allocator door refuses —
+   a cross-package narrowing that rejects, never admits.
