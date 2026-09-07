@@ -126,7 +126,16 @@ as reviewed, cleared both activation gates, and had `evaluateSettlement` stamp
   declares — presence, type, bounds, vocabulary, UUID/ISO form, the ADR-009
   §5.4 placeholder matcher and the §9.3 model-compatibility rules — on the
   door's own reads, so the boundary still refuses with every `zod` check
-  switched off by an inherited `skipChecks`;
+  switched off by an inherited `skipChecks`, and still refuses a spec with a
+  required key deleted when a COLD schema's required-key enforcement is waived
+  by an inherited `optin`/`optout` pair. The re-implemented grammars (UUIDv7,
+  the code string, the ISO instant, the integer and length bounds) are held to
+  the schema by a DIFFERENTIAL sweep — the door's verdict must equal the
+  schema's on every case, in both directions — because review round 1 found the
+  hand-written `verifiedAt` grammar wrong both ways at once: it admitted an
+  offset of `+24:00` under `skipChecks` (activating `REVIEWED_MODEL_BACKED`)
+  and refused the schema-valid `2026-08-28T00:00Z` and `0050-06-15T…` in a
+  clean process;
 - **D3** every emitted value comes from the materialized tree, and every
   decision-bearing read in the activation path (`input.spec`,
   `input.reviewContext`, `verification.status`, `rulesVersionId`,

@@ -52,10 +52,11 @@
  * rest on it.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import { classifySettlementActivation } from "./activation.js";
+import type * as ActivationModule from "./activation.js";
 import { settlementRefusal } from "./errors.js";
 import { evaluateSettlement } from "./models/registry.js";
 import { readOwnSpec } from "./spec-door.js";
@@ -68,9 +69,11 @@ import {
   settlementSpecOwnIssues,
   settlementSpecReviewBlockers,
   settlementSpecShape,
+  SettlementSpecSchema,
   settlementVerificationStatus,
   type SettlementSpec,
 } from "./spec.js";
+import type * as SpecModule from "./spec.js";
 import {
   referenceOpenUpDownSpecSample,
   terminalSpotObservationSample,
@@ -110,6 +113,34 @@ function withInherited<T>(entries: readonly (readonly [string, unknown])[], body
   }
 }
 
+/**
+ * The ASYNC-CORRECT form, for the cold-module rows.
+ *
+ * REMEDIATION NOTE: {@link withInherited} takes a synchronous body. Handing it
+ * an `async` one installs the pollution, receives a PROMISE, and deletes the
+ * pollution in `finally` before the awaited work has run — which is exactly how
+ * round 1 concluded, wrongly, that the `optin`/`optout` waiver does not reach
+ * this schema. This version awaits inside the `try`.
+ */
+async function withInheritedAsync<T>(
+  entries: readonly (readonly [string, unknown])[],
+  body: () => Promise<T>,
+): Promise<T> {
+  for (const [key, value] of entries) {
+    Object.defineProperty(Object.prototype, key, {
+      value,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
+  try {
+    return await body();
+  } finally {
+    for (const [key] of entries) Reflect.deleteProperty(Object.prototype, key);
+  }
+}
+
 /** The ENUMERABLE variant of the same class (REC-1 review round 1, finding F1). */
 function withInheritedEnumerable<T>(entries: readonly (readonly [string, unknown])[], body: () => T): T {
   warm();
@@ -137,6 +168,72 @@ function without(spec: SettlementSpec, key: string): Record<string, unknown> {
   delete copy[key];
   return copy;
 }
+
+/**
+ * The `verifiedAt` corpus for the B1 differential sweep: every offset and time
+ * spelling that distinguishes the schema's grammar from a hand-written one.
+ * Both verdicts are represented (19 of the 51 are accepted by the schema), so
+ * the equality assertion cannot pass vacuously.
+ */
+const ISO_INSTANT_CASES: readonly string[] = [
+  // Accepted by `z.iso.datetime({ offset: true })`.
+  "2026-08-28T00:00:00Z",
+  "2026-08-28T00:00:00.123Z",
+  "2026-08-28T00:00:00.123456789Z",
+  "2026-08-28T00:00Z",
+  "2026-08-28T00:00+02:00",
+  "2026-08-28T00:00:00+00:00",
+  "2026-08-28T00:00:00-00:00",
+  "2026-08-28T00:00:00+23:59",
+  "2026-08-28T00:00:00-23:59",
+  "2026-08-28T00:00:00+05:30",
+  "2026-08-28T00:00:00+14:00",
+  "2026-08-28T00:00:00-12:45",
+  "2026-08-28T23:59:59Z",
+  "2024-02-29T00:00:00Z",
+  "2000-02-29T00:00:00Z",
+  "0000-01-01T00:00:00Z",
+  "0050-06-15T00:00:00Z",
+  "0099-12-31T00:00:00Z",
+  "1900-01-01T00:00:00Z",
+  // The B1 fail-open set: offsets the schema bounds at ±23:59.
+  "2026-08-28T00:00:00+24:00",
+  "2026-08-28T00:00:00-24:00",
+  "2026-08-28T00:00:00+99:99",
+  "2026-08-28T00:00:00-99:99",
+  "2026-08-28T00:00:00+00:60",
+  "2026-08-28T00:00:00+00:99",
+  "2026-08-28T00:00:00+25:00",
+  "2026-08-28T00:00:00-00:60",
+  "2026-08-28T00:00:00+90:00",
+  // Malformed offsets.
+  "2026-08-28T00:00:00+2:00",
+  "2026-08-28T00:00:00+02:0",
+  "2026-08-28T00:00:00+0200",
+  "2026-08-28T00:00:00Z+01:00",
+  "2026-08-28T00:00:00+02:00Z",
+  "2026-08-28T00:00:00",
+  "2026-08-28T00:00:00z",
+  // Time-field bounds.
+  "2026-08-28T24:00:00Z",
+  "2026-08-28T23:60:00Z",
+  "2026-08-28T23:59:60Z",
+  "2026-08-28T99:99:99Z",
+  // Calendar.
+  "2026-02-30T00:00:00Z",
+  "2026-02-29T00:00:00Z",
+  "2026-04-31T00:00:00Z",
+  "2026-13-01T00:00:00Z",
+  "2026-00-10T00:00:00Z",
+  "2026-01-00T00:00:00Z",
+  "2026-1-01T00:00:00Z",
+  // Shape.
+  "not-a-time",
+  "",
+  " 2026-08-28T00:00:00Z",
+  "2026-08-28T00:00:00Z ",
+  "2026-08-28 00:00:00Z",
+];
 
 /** The four §9.3 sample specs: the audit reached one, this file sweeps all four. */
 const SAMPLE_SPECS: readonly (readonly [string, () => SettlementSpec])[] = [
@@ -404,6 +501,66 @@ describe("the settlement spec door: no declared field comes from the prototype",
         "SETTLEMENT_PUBLISHED_WINDOWS_UNKNOWN",
       );
     });
+
+    // REVIEW ROUND 1, FINDING B3 (MEDIUM). The row above pins the INNER read
+    // (`context.publishedWindowSeconds`) and left the OUTER one exposed:
+    // reverting `ownField(input, "reviewContext")` to `input.reviewContext`
+    // kept the suite green while `Object.prototype.reviewContext =
+    // {publishedWindowSeconds:[30]}` moved a verified 30s TWAP spec from
+    // SPEC_VERIFICATION_UNSOUND to REVIEWED_MODEL_BACKED / allowed:true. A
+    // caller that states no feed context has stated none: "we do not know" may
+    // not read as "it is fine" (the rule this function's own header states).
+    it("an inherited `reviewContext` cannot supply a context the caller never stated (B3)", () => {
+      const spec = verifiedSpec(twapSpecSample());
+      for (const [variant, pollute] of [
+        ["non-enumerable", withInherited],
+        ["enumerable", withInheritedEnumerable],
+      ] as const) {
+        const verdict = pollute([["reviewContext", { publishedWindowSeconds: [30] }]], () =>
+          classifySettlementActivation({ spec }),
+        );
+        expect(verdict.status, variant).toBe("SPEC_VERIFICATION_UNSOUND");
+        expect(verdict.modelDependentActivationAllowed, variant).toBe(false);
+        expect(verdict.refusals.map((refusal) => refusal.code), variant).toContain(
+          "SETTLEMENT_PUBLISHED_WINDOWS_UNKNOWN",
+        );
+      }
+      // …and a context the caller DOES state is still honoured.
+      expect(
+        classifySettlementActivation({ spec, reviewContext: publishedWindows }).status,
+      ).toBe("REVIEWED_MODEL_BACKED");
+    });
+
+    // REVIEW ROUND 1, FINDING N1 (LOW). `settlementSpecReviewBlockers` is a
+    // public `index.ts` export and takes a CALLER-SUPPLIED spec, which need not
+    // be this door's prototype-free emission. The existing row above passes the
+    // door's own output, so a dot read survives it — a null-prototype object
+    // has no chain to answer from. This one hands the function an ORDINARY
+    // object, which is what an external caller has.
+    it("the review blockers read a caller-built spec's own fields (N1)", () => {
+      const callerBuilt = without(
+        verifiedSpec(terminalSpotSpecSample()),
+        "rulesVersionId",
+      ) as unknown as SettlementSpec;
+      expect(Object.getPrototypeOf(callerBuilt)).toBe(Object.prototype);
+      for (const [variant, pollute] of [
+        ["non-enumerable", withInherited],
+        ["enumerable", withInheritedEnumerable],
+      ] as const) {
+        expect(
+          pollute([["rulesVersionId", "01936f00-0000-7000-8000-00000000b001"]], () =>
+            settlementSpecReviewBlockers(callerBuilt).map((blocker) => blocker.code),
+          ),
+          variant,
+        ).toContain("SETTLEMENT_RULES_VERSION_REQUIRED");
+      }
+      // A caller-built spec that DOES name its rules version still passes.
+      expect(
+        settlementSpecReviewBlockers(
+          verifiedSpec(terminalSpotSpecSample()),
+        ).map((blocker) => blocker.code),
+      ).toEqual([]);
+    });
   });
 
   // ---------------------------------------------------------------------
@@ -573,19 +730,22 @@ describe("the settlement spec door: no declared field comes from the prototype",
       expect(survivors).toEqual([]);
     });
 
-    // THE PRESENCE HALF, measured on the door's own contract.
+    // THE PRESENCE HALF.
     //
-    // Every other restated rule above is reachable through the door under an
-    // inherited `skipChecks`. The required-key half is NOT, and the reason is
-    // worth recording: at `zod@4.4.3` the `optin`/`optout` waiver (ADR-020 §1
-    // class 5) is live — a `strictObject` of two required strings, built while
-    // the pair is inherited, ACCEPTS a value missing one of them — but it does
-    // not reach `SettlementSpecSchema`, cold or warm (measured four ways:
-    // repeated cold parses through the door, repeated cold parses of the raw
-    // schema, a schema warmed under the pollution, and a fresh two-key
-    // control which IS waived). So the restatement is pinned on its own
-    // contract, as REC-1 pinned `readOwnConfig`'s: a compensation nobody
-    // measures is a claim, not a defence.
+    // CORRECTED IN REMEDIATION (round-1 record repair). This row previously
+    // carried the claim that the `optin`/`optout` waiver (ADR-020 §1 class 5)
+    // "does not reach `SettlementSpecSchema`, cold or warm", and pinned the
+    // restatement on its own contract for that reason. THE CLAIM WAS AN
+    // ARTIFACT OF A BROKEN PROBE: the harness installed the pollution, called
+    // an ASYNC body, and deleted the pollution when the body returned its
+    // PROMISE — that is, before the dynamic import and the cold parse ever ran.
+    // With an async-correct harness the waiver DOES reach this schema: see the
+    // end-to-end cold row below, where the raw schema accepts a spec with
+    // `roundingRule` deleted and another with `verification` deleted.
+    //
+    // The contract-level assertion is kept anyway — it names WHICH key is
+    // reported, which the end-to-end row cannot — but it is no longer the only
+    // measurement, and it is no longer the justification.
     it("the required-key restatement refuses on its own, and the waiver it answers is REAL", () => {
       const waiver = [
         ["optin", "optional"],
@@ -598,14 +758,6 @@ describe("the settlement spec door: no declared field comes from the prototype",
         return control.safeParse({ kept: "here" }).success;
       });
       expect(waived, "the optin/optout waiver is no longer live at this zod version").toBe(true);
-
-      // …and this schema, which the waiver does NOT reach — stated as measured,
-      // not assumed, because it is the reason for the pin below.
-      expect(
-        withInherited(waiver, () =>
-          safeParseSettlementSpec(without(terminalSpotSpecSample(), "roundingRule")).ok,
-        ),
-      ).toBe(false);
 
       // The door's own presence check, on the materialized tree.
       const sample = terminalSpotSpecSample();
@@ -623,6 +775,251 @@ describe("the settlement spec door: no declared field comes from the prototype",
       expect(honest.ok).toBe(true);
       if (!honest.ok) throw new Error("unreachable");
       expect(settlementSpecOwnIssues(honest.value)).toEqual([]);
+    });
+
+    // REVIEW ROUND 1, FINDING B1 (HIGH). The restated `verifiedAt` grammar was
+    // wrong in BOTH directions, and only a DIFFERENTIAL sweep catches both:
+    //
+    // - FAIL-OPEN, the reviewer's finding: the offset's hour and minute were
+    //   unbounded, so under an inherited `skipChecks` the door admitted
+    //   `"…+24:00"` (and `±99:99`, `+00:60`, `+00:99`, `+25:00`, `-00:60`,
+    //   `+90:00`) and the spec activated REVIEWED_MODEL_BACKED / allowed:true.
+    // - FAIL-CLOSED, found by this sweep: the schema's seconds are OPTIONAL and
+    //   its years may be `0000`-`0099`, and the door refused
+    //   `"2026-08-28T00:00Z"`, `"2026-08-28T00:00+02:00"`, `"0000-01-01T…"`,
+    //   `"0050-06-15T…"` and `"0099-12-31T…"` in a CLEAN process — refusing a
+    //   document the contract accepts.
+    //
+    // Measured at `e0fab62`: schema accepts 19 of 51, door admitted 14 clean
+    // and 23 polluted. The assertion is EQUALITY, not "refuses the bad ones",
+    // so a restatement can never again be looser OR stricter than the schema.
+    it("the restated `verifiedAt` grammar equals the schema's, in both directions (B1)", () => {
+      const disagreements: string[] = [];
+      let schemaAccepts = 0;
+      for (const stamp of ISO_INSTANT_CASES) {
+        const spec = {
+          ...asRecord(verifiedSpec(terminalSpotSpecSample())),
+          verification: { status: "VERIFIED", verifiedBy: "reviewer", verifiedAt: stamp },
+        };
+        // The schema, clean, is the authority this door restates.
+        const schema = SettlementSpecSchema.safeParse(spec).success;
+        if (schema) schemaAccepts += 1;
+        const clean = safeParseSettlementSpec(spec).ok;
+        const polluted = withInherited([["skipChecks", true]], () =>
+          safeParseSettlementSpec(spec).ok,
+        );
+        if (clean !== schema) disagreements.push(`clean ${JSON.stringify(stamp)}: ${String(clean)}`);
+        if (polluted !== schema) {
+          disagreements.push(`skipChecks ${JSON.stringify(stamp)}: ${String(polluted)}`);
+        }
+      }
+      expect(disagreements).toEqual([]);
+      // Non-vacuity: the corpus must contain both verdicts, or the equality
+      // above would hold for a door that accepts (or refuses) everything.
+      expect(schemaAccepts).toBeGreaterThan(0);
+      expect(schemaAccepts).toBeLessThan(ISO_INSTANT_CASES.length);
+
+      // …and the reviewer's end-to-end row, spelled out: the admitted offset
+      // reached REVIEWED_MODEL_BACKED / allowed:true at `e0fab62`.
+      const verdict = withInherited([["skipChecks", true]], () =>
+        classifySettlementActivation({
+          spec: {
+            ...asRecord(verifiedSpec(terminalSpotSpecSample())),
+            verification: {
+              status: "VERIFIED",
+              verifiedBy: "reviewer",
+              verifiedAt: "2026-08-28T00:00:00+24:00",
+            },
+          },
+        }),
+      );
+      expect(verdict.status).toBe("SPEC_INVALID");
+      expect(verdict.modelDependentActivationAllowed).toBe(false);
+    });
+
+    // B1's LESSON, GENERALIZED. Three of the door's restatements are
+    // RE-IMPLEMENTATIONS of a pattern (UUIDv7, the code string, the ISO
+    // instant) and two are re-implementations of a bound (`z.int().positive()`,
+    // `NonEmptyString`). B1 was one of them measured wrong in both directions,
+    // so the same differential is run over all of them rather than trusting
+    // that the others were written more carefully. The placeholder matcher
+    // needs no row here: the door calls the SAME function the schema's
+    // refinement calls.
+    it("every re-implemented grammar equals the schema's, in both directions", () => {
+      const sample = asRecord(verifiedSpec(terminalSpotSpecSample()));
+      const cases: readonly (readonly [string, readonly unknown[], (value: unknown) => unknown])[] = [
+        [
+          "settlementSpecId",
+          [
+            "01936f00-0000-7000-8000-00000000c001",
+            "01936F00-0000-7000-8000-00000000C001",
+            "01936f00-0000-4000-8000-00000000c001",
+            "01936f00-0000-7000-c000-00000000c001",
+            "01936f00-0000-7000-8000-00000000c00",
+            "01936f00-0000-7000-8000-00000000c0011",
+            "01936f00000070008000 00000000c001",
+            "",
+            "not-a-uuid",
+            42,
+            null,
+          ],
+          (value) => ({ ...sample, settlementSpecId: value }),
+        ],
+        [
+          "referenceSymbol",
+          [
+            "btc.usd",
+            "b",
+            "B",
+            "a".repeat(64),
+            "a".repeat(65),
+            "btc usd",
+            "1btc",
+            ".btc",
+            "btc-usd_x:y",
+            "btc/usd",
+            "btcusd\n",
+            "",
+            "btc€usd",
+            7,
+          ],
+          (value) => ({ ...sample, referenceSymbol: value }),
+        ],
+        [
+          "specVersion",
+          [1, 2, 0, -1, -3.5, 1.5, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER + 2, Number.NaN,
+            Number.POSITIVE_INFINITY, "1", null],
+          (value) => ({ ...sample, specVersion: value }),
+        ],
+        [
+          "roundingRule",
+          [
+            "No rounding: the exact decimal observation is compared as published.",
+            "abc",
+            "ab",
+            "",
+            " padded rule ",
+            "x".repeat(2000),
+            "x".repeat(2001),
+            7,
+          ],
+          (value) => ({ ...sample, roundingRule: value }),
+        ],
+        [
+          "verifiedBy",
+          ["reviewer", "r", "", "x".repeat(200), "x".repeat(201), 7, null],
+          (value) => ({
+            ...sample,
+            verification: { status: "VERIFIED", verifiedBy: value, verifiedAt: "2026-08-28T00:00:00Z" },
+          }),
+        ],
+      ];
+
+      const disagreements: string[] = [];
+      for (const [field, corpus, build] of cases) {
+        let accepted = 0;
+        for (const value of corpus) {
+          const spec = build(value);
+          const schema = SettlementSpecSchema.safeParse(spec).success;
+          if (schema) accepted += 1;
+          const clean = safeParseSettlementSpec(spec).ok;
+          const polluted = withInherited([["skipChecks", true]], () =>
+            safeParseSettlementSpec(spec).ok,
+          );
+          if (clean !== schema) {
+            disagreements.push(`${field} clean ${JSON.stringify(value)}: ${String(clean)}`);
+          }
+          if (polluted !== schema) {
+            disagreements.push(`${field} skipChecks ${JSON.stringify(value)}: ${String(polluted)}`);
+          }
+        }
+        // Non-vacuity per field: the corpus must split, or equality is free.
+        expect(accepted, `${field}: corpus accepts nothing`).toBeGreaterThan(0);
+        expect(accepted, `${field}: corpus refuses nothing`).toBeLessThan(corpus.length);
+      }
+      expect(disagreements).toEqual([]);
+    });
+
+    // THE COLD PROCESS. Everything above pollutes a schema this file has
+    // already warmed. A real process's FIRST parse can be the hostile one, and
+    // two of ADR-020 §1's classes only exist there. `vi.resetModules()` plus a
+    // dynamic import gives a genuinely cold module; the harness is
+    // async-correct (the pollution outlives the awaited import — the bug that
+    // produced round 1's wrong "the waiver does not reach this schema" claim).
+    it("a COLD first parse: the required-key waiver reaches the schema and not the door", async () => {
+      const waiver = [
+        ["optin", "optional"],
+        ["optout", "optional"],
+      ] as const;
+
+      for (const missing of ["roundingRule", "verification"] as const) {
+        vi.resetModules();
+        const measured = await withInheritedAsync(
+          [
+            ...waiver,
+            [
+              "verification",
+              { status: "VERIFIED", verifiedBy: "attacker", verifiedAt: "2026-08-28T00:00:00Z" },
+            ],
+          ],
+          async () => {
+            const specModule = (await import("./spec.js")) as typeof SpecModule;
+            const activationModule = (await import("./activation.js")) as typeof ActivationModule;
+            const raw = without(terminalSpotSpecSample(), missing);
+            return {
+              // The library, cold and waived: this is what `base` answered,
+              // because at base this call WAS `safeParseSettlementSpec`.
+              schema: specModule.SettlementSpecSchema.safeParse(raw).success,
+              door: specModule.safeParseSettlementSpec(raw).ok,
+              verdict: activationModule.classifySettlementActivation({ spec: raw }),
+            };
+          },
+        );
+        // Non-vacuity: the waiver must actually be defeating the library here,
+        // or this row proves nothing about the door.
+        expect(measured.schema, `${missing}: the cold waiver no longer defeats the schema`).toBe(
+          true,
+        );
+        expect(measured.door, missing).toBe(false);
+        expect(measured.verdict.status, missing).toBe("SPEC_INVALID");
+        expect(measured.verdict.modelDependentActivationAllowed, missing).toBe(false);
+      }
+    });
+
+    // The FOURTH refusal-construction trigger, confirmed by measurement rather
+    // than by report (review round 1 named it): a COLD discriminated union
+    // whose `propValues` map is built while a truthy `status` is inherited
+    // throws `TypeError: propValues[key].add is not a function` out of
+    // `SettlementVerificationSchema` — and `status` is precisely the key an
+    // attack on the verification cell sets. The door contains it.
+    it("a COLD discriminated union under an inherited `status` refuses instead of throwing", async () => {
+      for (const value of ["VERIFIED", true, 1]) {
+        vi.resetModules();
+        const measured = await withInheritedAsync([["status", value]], async () => {
+          const specModule = (await import("./spec.js")) as typeof SpecModule;
+          const honest = verifiedSpec(terminalSpotSpecSample());
+          let schema: string;
+          try {
+            schema = specModule.SettlementSpecSchema.safeParse(honest).success
+              ? "parsed"
+              : "refused";
+          } catch (error: unknown) {
+            schema = `threw ${(error as Error).name}`;
+          }
+          let door: string;
+          try {
+            const parsed = specModule.safeParseSettlementSpec(honest);
+            door = parsed.ok ? "parsed" : "refused";
+          } catch (error: unknown) {
+            door = `threw ${(error as Error).name}`;
+          }
+          return { schema, door };
+        });
+        // Non-vacuity: the library really does throw here.
+        expect(measured.schema, `status=${String(value)}`).toBe("threw TypeError");
+        // The door's contract holds: a verdict comes back, and it is not a throw.
+        expect(measured.door, `status=${String(value)}`).toBe("refused");
+      }
     });
 
     it("the door's required-key table is the schema's own (derived, not trusted)", () => {
@@ -733,11 +1130,82 @@ describe("the settlement spec door: no declared field comes from the prototype",
     }
 
     // An own `__proto__` field: the one name a copy cannot carry faithfully.
+    // (The accessor row above is deliberately joined by the B2 row below: an
+    // accessor ALONE does not exercise the guard that refuses it.)
     const withProtoKey = JSON.parse(
       `{"__proto__":{"polluted":true},${JSON.stringify(sample).slice(1)}`,
     ) as unknown;
     expect(safeParseSettlementSpec(withProtoKey).ok).toBe(false);
     expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+  });
+
+  // REVIEW ROUND 1, FINDING B2 (HIGH). The `Object.hasOwn(descriptor, "value")`
+  // test in `spec-door.ts`'s `ownMember` is load-bearing and was UNPINNED:
+  // relaxing that one token to `"value" in descriptor` kept all 543 tests green
+  // while reopening the sharpest cell of the row.
+  //
+  // WHY the accessor row above does not reach it: with no inherited `value`,
+  // an accessor descriptor's `.value` reads `undefined`, the member is copied
+  // as absent, and the spec is refused for a MISSING key — the right verdict
+  // for the wrong reason. The guard only does work when a `value` is inherited,
+  // and then the mutant reads the PROTOTYPE's `value` as if the property were
+  // data: an own-accessor `verification` plus
+  // `Object.prototype.value = {status:"VERIFIED", …}` restores
+  // REVIEWED_MODEL_BACKED / allowed:true.
+  it("an own ACCESSOR whose `value` is inherited is refused, and never invoked (B2)", () => {
+    const stolen = {
+      status: "VERIFIED",
+      verifiedBy: "attacker",
+      verifiedAt: "2026-08-28T00:00:00Z",
+    };
+    for (const [variant, pollute] of [
+      ["non-enumerable", withInherited],
+      ["enumerable", withInheritedEnumerable],
+    ] as const) {
+      let invocations = 0;
+      const hostile = asRecord(terminalSpotSpecSample());
+      Object.defineProperty(hostile, "verification", {
+        get: () => {
+          invocations += 1;
+          return { status: "UNVERIFIED" };
+        },
+        enumerable: true,
+        configurable: true,
+      });
+
+      const parsed = pollute([["value", stolen]], () => safeParseSettlementSpec(hostile));
+      expect(parsed.ok, variant).toBe(false);
+
+      const verdict = pollute([["value", stolen]], () =>
+        classifySettlementActivation({ spec: hostile, reviewContext: publishedWindows }),
+      );
+      expect(verdict.status, variant).toBe("SPEC_INVALID");
+      expect(verdict.modelDependentActivationAllowed, variant).toBe(false);
+
+      // A getter is code, and this door refuses it WITHOUT running it: a
+      // property that answers differently on a second read cannot be a field of
+      // a reviewed document.
+      expect(invocations, `${variant}: the getter was invoked`).toBe(0);
+    }
+
+    // The same guard on a NON-verification field, so the row is about the
+    // mechanism rather than about one cell.
+    let ruleInvocations = 0;
+    const hostileRule = asRecord(terminalSpotSpecSample());
+    Object.defineProperty(hostileRule, "roundingRule", {
+      get: () => {
+        ruleInvocations += 1;
+        return "Round half up.";
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    expect(
+      withInherited([["value", "No rounding: the exact decimal is compared."]], () =>
+        safeParseSettlementSpec(hostileRule).ok,
+      ),
+    ).toBe(false);
+    expect(ruleInvocations).toBe(0);
   });
 
   // ---------------------------------------------------------------------

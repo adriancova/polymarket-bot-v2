@@ -1493,8 +1493,49 @@ const VERIFICATION_VARIANT_KEYS: ReadonlyMap<string, readonly string[]> = new Ma
 
 const UUID_V7_FORM = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const CODE_STRING_FORM = /^[A-Za-z][A-Za-z0-9_.:-]*$/u;
-const ISO_INSTANT_FORM =
-  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
+/**
+ * `z.iso.datetime({ offset: true })`, restated field for field.
+ *
+ * REVIEW ROUND 1, FINDING B1 — and the reason this is composed from the
+ * schema's own parts rather than hand-written. The first version of this form
+ * read `(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})`
+ * with the field ranges checked afterwards in code, and it was wrong in BOTH
+ * directions:
+ *
+ * - FAIL-OPEN (the reviewer's finding, 9 of 51 measured cases): the OFFSET's
+ *   hour and minute were never bounded, so under an inherited `skipChecks` the
+ *   door ADMITTED a `verifiedAt` of `"2026-08-28T00:00:00+24:00"` — also
+ *   `±99:99`, `+00:60`, `+00:99`, `+25:00`, `-00:60`, `+90:00` — that the
+ *   schema refuses, and the spec activated `REVIEWED_MODEL_BACKED` with
+ *   `modelDependentActivationAllowed: true`.
+ * - FAIL-CLOSED (found by the corrected sweep, 5 of 51, and live in a CLEAN
+ *   process): seconds are OPTIONAL in the schema, so `"2026-08-28T00:00Z"` and
+ *   `"2026-08-28T00:00+02:00"` are valid and the door refused them; and the
+ *   `Date.UTC` calendar round-trip maps years 0-99 to 1900+, so `0000-01-01`,
+ *   `0050-06-15` and `0099-12-31` were refused as impossible dates. A
+ *   restatement that is STRICTER than the schema refuses a document the
+ *   contract accepts, which is the same defect wearing the other hat.
+ *
+ * The sub-patterns below are the ones `zod@4.4.3` builds this schema from
+ * (`zod/v4/core/regexes.cjs`, `datetime({ offset: true })`): a calendar-exact
+ * date (leap years included, so no round-trip is needed and none is done), a
+ * time whose seconds and fraction are optional, and `Z` or a BOUNDED offset.
+ * `prototype-boundary.test.ts` holds the two of them to a differential sweep —
+ * the door's verdict must equal the schema's on every case, in both directions
+ * — so this restatement cannot drift from the schema silently, and a `zod`
+ * upgrade that moves the grammar fails the suite (ADR-020 §7).
+ */
+const ISO_DATE_FORM_SOURCE =
+  "(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29" +
+  "|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])" +
+  "|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)" +
+  "|(?:02)-(?:0[1-9]|1\\d|2[0-8])))";
+const ISO_TIME_FORM_SOURCE = "(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?";
+const ISO_OFFSET_FORM_SOURCE = "(?:Z|[+-](?:[01]\\d|2[0-3]):[0-5]\\d)";
+const ISO_INSTANT_FORM = new RegExp(
+  `^${ISO_DATE_FORM_SOURCE}T${ISO_TIME_FORM_SOURCE}${ISO_OFFSET_FORM_SOURCE}$`,
+  "u",
+);
 
 /** `Uuidv7Schema`, restated on an own read. */
 function isUuidv7(value: unknown): boolean {
@@ -1523,28 +1564,16 @@ function isNonEmptyString(value: unknown): boolean {
 
 /**
  * `IsoTimestampSchema` (`z.iso.datetime({ offset: true })`), restated on an own
- * read: the shape, the field ranges, and a calendar round-trip so
- * `2026-02-30T00:00:00Z` is refused here exactly as the schema refuses it.
+ * read.
+ *
+ * The whole judgment is {@link ISO_INSTANT_FORM}, whose header records what the
+ * hand-written version got wrong in each direction and what holds the two
+ * grammars together now. `2026-02-30T00:00:00Z` and `2026-02-29T00:00:00Z` are
+ * refused by the date pattern itself, `2024-02-29T00:00:00Z` is accepted, and
+ * the offset is bounded at `±23:59` exactly as the schema bounds it.
  */
 function isIsoInstant(value: unknown): boolean {
-  if (typeof value !== "string") {
-    return false;
-  }
-  const match = ISO_INSTANT_FORM.exec(value);
-  if (match === null) {
-    return false;
-  }
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
-  if (month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59) {
-    return false;
-  }
-  const utc = new Date(Date.UTC(year, month - 1, day));
-  return utc.getUTCFullYear() === year && utc.getUTCMonth() === month - 1 && utc.getUTCDate() === day;
+  return typeof value === "string" && ISO_INSTANT_FORM.test(value);
 }
 
 /**
@@ -1677,15 +1706,18 @@ function verificationIssues(block: unknown): readonly string[] {
  * reached when the library has been defeated. That is what keeps honest-input
  * verdicts byte-identical.
  *
- * EXPORTED so its PRESENCE half can be measured directly. Every other rule
- * here is reachable through the door under an inherited `skipChecks` and is
- * pinned that way; the required-key half is not, because at `zod@4.4.3` the
- * `optin`/`optout` waiver (ADR-020 §1 class 5) does NOT reach this schema —
- * measured in `./prototype-boundary.test.ts`, where a freshly built
- * `z.strictObject` of two required strings IS waived by the same pollution
- * that leaves {@link SettlementSpecSchema} refusing. A restatement that cannot
- * be measured through the door is measured on its own contract instead
- * (REC-1's `readOwnConfig` precedent), rather than left as an untested claim.
+ * EXPORTED so its PRESENCE half can also be measured directly, key by key.
+ *
+ * CORRECTED IN REMEDIATION (round-1 record repair): this comment previously
+ * said the `optin`/`optout` required-key waiver (ADR-020 §1 class 5) "does NOT
+ * reach this schema". It does. The round-1 measurement used a probe that
+ * deleted its pollution before the awaited cold parse ran; with an
+ * async-correct harness, a COLD `SettlementSpecSchema` under an inherited
+ * `optin`/`optout` pair ACCEPTS a spec with `roundingRule` deleted, and one
+ * with `verification` deleted. The presence check below is what refuses both,
+ * end to end through `classifySettlementActivation`, and
+ * `./prototype-boundary.test.ts` pins exactly that — so this restatement is
+ * load-bearing in a way round 1 understated rather than overstated.
  */
 export function settlementSpecOwnIssues(tree: unknown): readonly string[] {
   if (!isOwnRecord(tree)) {
