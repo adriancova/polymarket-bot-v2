@@ -2,6 +2,14 @@
  * `./state-door.ts` — the projection-side class, the two re-stated formats, the
  * §7.1 order re-statement, and the two bounded tightenings.
  *
+ * Equivalent survivors (not claimed killed):
+ * M6b establishedParameterKinds bracket revert: internally emitted own snapshots.
+ * M9 bind approvedBy revert: the preceding approval guard fixes the same value.
+ * openEventOrder D3 revert read.value[k] to own.value[k]: accepted own values coincide.
+ * effectiveCloseInstant string guard to !== undefined: accepted close values are strings.
+ * binding.approvedAt to opened.value.approvedAt: the binding copies the accepted value.
+ *
+ * Historical rows below (before the F1-F6 remediation additions):
  * EVERY ROW HERE WAS MEASURED AT BASE `c2c0733` FIRST, in BOTH pollution
  * variants, and the base verdict is quoted in the test that closes it. The
  * pollution is installed with `Object.defineProperty` on `Object.prototype`, the
@@ -1055,7 +1063,7 @@ describe("metadataVersion is judged by the payload that will carry it", () => {
     [Number.MAX_SAFE_INTEGER + 1, false],
     [Number.NaN, false],
     [Number.POSITIVE_INFINITY, false],
-    [null, false],
+    [null, true],
     [{}, false],
     [true, false],
   ];
@@ -1071,7 +1079,7 @@ describe("metadataVersion is judged by the payload that will carry it", () => {
       expect(openMetadataVersion(value).ok, JSON.stringify(value) ?? "undefined").toBe(accepted);
       if (value !== undefined) {
         // The door's verdict IS the payload schema's verdict, cell for cell.
-        expect(field?.safeParse(value).success, JSON.stringify(value)).toBe(accepted);
+        expect(field?.safeParse(value ?? 1).success, JSON.stringify(value)).toBe(accepted);
       }
     }
   });
@@ -1144,5 +1152,103 @@ describe("every list this package hands back is frozen (UNIV-1 r1 LOW-3)", () =>
     // And it is still the right list.
     expect(clarificationsAfterOpen(projection)).toHaveLength(1);
     expect(clarificationsAfterOpen({ ...projection, clarifications: [] })).toHaveLength(0);
+  });
+});
+
+describe("F1-F6 required projection structure", () => {
+  const input = {
+    asOf: "2026-08-28T12:05:00Z",
+    settlement: permittingSettlementView(),
+    series: {
+      ...seriesDefinitionSample(),
+      binding: { approved: true, approvedBy: "reviewer-1", approvedAt: "2026-08-28T10:00:00Z" },
+    },
+  };
+  function ready(): MarketProjection {
+    return {
+      ...SEEDED, lifecycleState: "OPEN", rulesVersionId: SAMPLE_RULES_VERSION_ID,
+      seriesBinding: {
+        kind: "APPROVED", seriesId: SAMPLE_SERIES_ID,
+        approvedBy: "reviewer-1", approvedAt: "2026-08-28T10:00:00Z",
+      },
+    };
+  }
+  function answers(projection: MarketProjection) {
+    const readiness = evaluateMarketReadiness(projection, input as never);
+    const outcome = recordObservedOutcomeState(projection, {
+      outcomeState: "DISPUTED", observedBy: "reviewer-1", observedAt: input.asOf,
+    });
+    return {
+      activation: readiness.modelDependentActivationAllowed,
+      state: readiness.effectiveLifecycleState,
+      readinessCodes: readiness.refusals.map((r) => r.code),
+      outcomeCodes: outcome.ok ? [] : outcome.refusals.map((r) => r.code),
+    };
+  }
+  it("keeps a fully ready own-data control active and resolved data terminal", () => {
+    expect(answers(ready()).activation).toBe(true);
+    const resolved = answers({ ...ready(), lifecycleState: "RESOLVED" });
+    expect(resolved.readinessCodes).toEqual(["UNIVERSE_MARKET_RESOLVED"]);
+    expect(resolved.outcomeCodes).toEqual(["UNIVERSE_TERMINAL_OUTCOME_CONFLICT"]);
+  });
+  for (const mode of ["accessor", "inherited non-enumerable", "inherited enumerable"] as const) {
+    it(`refuses lifecycleState ${mode} for activation and outcome writes`, () => {
+      const projection = ready();
+      Reflect.deleteProperty(projection, "lifecycleState");
+      let calls = 0;
+      const run = () => answers(projection);
+      const result = mode === "accessor"
+        ? (() => {
+            Object.defineProperty(projection, "lifecycleState", {
+              enumerable: true, get: () => { calls += 1; return "RESOLVED"; },
+            });
+            return run();
+          })()
+        : withInherited("lifecycleState", inherited("RESOLVED", mode === "inherited enumerable"), run);
+      expect(result.activation).toBe(false);
+      expect(result.readinessCodes).toEqual(["UNIVERSE_INPUT_INVALID"]);
+      expect(result.outcomeCodes).toEqual(["UNIVERSE_INPUT_INVALID"]);
+      expect(calls).toBe(0);
+    });
+  }
+  for (const key of ["lifecycleState", "outcomeState", "metadataVersion", "seriesBinding"] as const) {
+    it(`requires own enumerable data for ${key}`, () => {
+      for (const mode of ["missing", "accessor", "non-enumerable", "undefined", "null"]) {
+        const projection = ready();
+        const value = projection[key];
+        Reflect.deleteProperty(projection, key);
+        if (mode === "accessor") {
+          Object.defineProperty(projection, key, { enumerable: true, get: () => { throw Error("getter invoked"); } });
+        } else if (mode !== "missing") {
+          Object.defineProperty(projection, key, {
+            enumerable: mode !== "non-enumerable",
+            value: mode === "null" ? null : mode === "undefined" ? undefined : value,
+          });
+        }
+        expect(openOwnProjection(projection).ok, mode).toBe(false);
+        expect(answers(projection).readinessCodes, mode).toEqual(["UNIVERSE_INPUT_INVALID"]);
+      }
+    });
+  }
+  it("refuses parameters null with a typed readiness result (F6)", () => {
+    expect(answers({ ...ready(), parameters: null } as never).readinessCodes)
+      .toEqual(["UNIVERSE_INPUT_INVALID"]);
+  });
+  it("never silently defaults missing lifecycleState in the derived reader", () => {
+    const projection = ready();
+    Reflect.deleteProperty(projection, "lifecycleState");
+    expect(() => effectiveLifecycleState(projection, input.asOf))
+      .toThrowError(expect.objectContaining({ name: "UniverseValidationError", code: "UNIVERSE_INPUT_INVALID" }));
+  });
+  it("defaults null metadataVersion to one in state and the emitted payload (F2)", () => {
+    const result = registerMarket(createUniverseRegistry(), {
+      identity: marketIdentitySample(), parameters: parameterObservationSample(),
+      metadataVersion: null as never,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.projection.metadataVersion).toBe(1);
+      expect(result.value.event.metadataVersion).toBe(1);
+    }
   });
 });

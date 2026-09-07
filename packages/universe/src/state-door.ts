@@ -72,7 +72,7 @@
  * gate, and the §7.1 replay guard.
  */
 
-import { MarketDiscoveredPayloadSchema } from "@polymarket-bot/domain";
+import { MarketOutcomeStateSchema, MarketDiscoveredPayloadSchema } from "@polymarket-bot/domain";
 
 import {
   IDENTIFIER,
@@ -86,6 +86,7 @@ import {
 } from "./caller-door.js";
 import { isIsoTimestamp, isPositiveDecimalString } from "./grammar.js";
 import { declaredKeysOf, ownDataDescriptor } from "./lifecycle-door.js";
+import { EVENT_DRIVEN_LIFECYCLE_STATES } from "./lifecycle-state.js";
 import type { EventOrder, MarketLifecycleEventType, MarketProjection } from "./lifecycle.js";
 
 // ---------------------------------------------------------------------------
@@ -103,6 +104,10 @@ export type OwnProjection = MarketProjection;
 
 /** The keys a fold cannot proceed without, and the shape each must have. */
 const REQUIRED_STRUCTURE: readonly (readonly [string, (value: unknown) => boolean])[] = [
+  ["lifecycleState", (value) => EVENT_DRIVEN_LIFECYCLE_STATES.includes(value as never)],
+  ["outcomeState", (value) => MarketOutcomeStateSchema.options.includes(value as never)],
+  ["metadataVersion", (value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0],
+  ["seriesBinding", (value) => isRecord(value)],
   ["identity", (value) => typeof value === "object" && value !== null],
   ["clarifications", (value) => Array.isArray(value)],
   ["parameters", (value) => typeof value === "object" && value !== null],
@@ -343,7 +348,7 @@ const METADATA_VERSION_SCHEMA: { readonly safeParse: (value: unknown) => { succe
  * off and an integer test is not.
  */
 export function openMetadataVersion(value: unknown): DoorRead<number> {
-  if (value === undefined) {
+  if (value === undefined || value === null) {
     return { ok: true, value: 1 };
   }
   const refusal: DoorRead<number> = {

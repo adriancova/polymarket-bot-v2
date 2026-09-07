@@ -518,3 +518,15 @@ describe("what the module emits, and the verdict it keeps", () => {
     }
   });
 });
+
+it("refuses an own accessor tickSize even when its value validates (F3)", () => {
+  const sample = parameterObservationSample();
+  const parameters = { ...sample.parameters };
+  Object.defineProperty(parameters, "tickSize", { enumerable: true, get: () => "0.01" });
+  const candidate = { ...sample, parameters };
+  expect(ParameterObservationSchema.safeParse(candidate).success).toBe(true);
+  expect(() => createParameterHistory(SAMPLE_MARKET_ID as never, candidate))
+    .toThrowError(UniverseValidationError);
+  expect(() => createParameterHistory(SAMPLE_MARKET_ID as never, candidate))
+    .toThrowError(/accessor property/);
+});

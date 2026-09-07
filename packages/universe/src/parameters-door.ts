@@ -292,9 +292,10 @@ export type ObservationRead =
  * D2 + D3 + D4. Re-states the frozen observation schema on own reads and emits
  * the observation prototype-free.
  *
- * Runs AFTER `ParameterObservationSchema` has accepted the value, so with
- * `zod`'s checks intact it refuses nothing: `./parameters-door.test.ts` proves
- * that differentially over a corpus, and proves per-field non-vacuity under an
+ * Runs AFTER `ParameterObservationSchema` has accepted the value. For own
+ * data-shaped values, intact checks agree with the schema. Accessor-shaped
+ * members are refused even when their getter value would validate. The suite
+ * pins this distinction and proves per-field non-vacuity under an
  * inherited `skipChecks`.
  */
 export function restateObservation(value: unknown): ObservationRead {

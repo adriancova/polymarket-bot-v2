@@ -78,6 +78,7 @@ import { equalsDecimal } from "@polymarket-bot/decimal";
 import type { z } from "zod";
 
 import {
+  UniverseValidationError,
   universeFailure,
   universeOk,
   universeRefusal,
@@ -360,7 +361,9 @@ export function applyMarketLifecycleEvent(
   // already uses (`UNIV-2` r1): base handed `order.ingestSeq` straight to
   // `BigInt(...)`, so a missing or fractional one threw OUT of a function that
   // returns a typed result, and an absent `gatewayEpoch` skipped the replay
-  // guard altogether.
+  // guard altogether. Shape is closed on both paths; presence is closed only
+  // on the doored registry path. The direct-export presence read below is
+  // base-identical; owner: a future direct-export caller-input round.
   let order: EventOrder | undefined;
   if (input.order !== undefined) {
     const opened = openEventOrder(input.order);
@@ -811,7 +814,7 @@ export function recordObservedOutcomeState(
       ),
     );
   }
-  if (own.lifecycleState === "RESOLVED") {
+  if (ownProjectionField(own, "lifecycleState") === "RESOLVED") {
     return universeFailure(
       universeRefusal(
         "UNIVERSE_TERMINAL_OUTCOME_CONFLICT",
@@ -848,13 +851,19 @@ export function effectiveLifecycleState(
   asOf: IsoTimestamp,
 ): MarketLifecycleState {
   // OWN reads (`./state-door.ts`). This function answers a question rather than
-  // returning a result, so it cannot refuse — but it can decline to read the
+  // returning a result; missing state throws typed UniverseValidationError.
+  // Composed callers validate structure first. It declines to read the
   // prototype: at base an inherited `closesAt` derived `CLOSED` for a market
   // whose schedule nobody had announced.
   const stored = ownProjectionField(projection, "lifecycleState") as
     | EventDrivenLifecycleState
     | undefined;
-  const lifecycleState = stored ?? "DISCOVERED";
+  if (stored === undefined) {
+    throw new UniverseValidationError("lifecycleState requires own enumerable data", [
+      "lifecycleState: missing or accessor",
+    ]);
+  }
+  const lifecycleState = stored;
   if (lifecycleState === "RESOLVED") {
     return "RESOLVED";
   }
