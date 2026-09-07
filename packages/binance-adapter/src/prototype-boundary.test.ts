@@ -85,6 +85,34 @@ function withInherited<T>(key: string, value: unknown, body: () => T): T {
   }
 }
 
+/**
+ * The ENUMERABLE variant of the same class.
+ *
+ * Review round 1, finding F1: a door that copied inherited ENUMERABLE keys
+ * after its own-key loop passed every test this file carried, and the §3 row
+ * fully reopened under an enumerable `Object.prototype.q = "888888"`. The
+ * non-enumerable variant is the one to DESIGN against (`schema-boundary.md`
+ * §2), but it is not the only one to TEST against.
+ *
+ * Every caller warms the schemas with an honest decode FIRST: enumerable
+ * pollution present during a schema's first parse aborts its lazy build and
+ * permanently poisons it (ADR-020 §1 class 7), which would make this file
+ * measure the poisoning instead of the adoption.
+ */
+function withInheritedEnumerable<T>(key: string, value: unknown, body: () => T): T {
+  Object.defineProperty(Object.prototype, key, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+  try {
+    return body();
+  } finally {
+    Reflect.deleteProperty(Object.prototype, key);
+  }
+}
+
 describe("binance declared-key adoption is closed at the wire door", () => {
   it("honest traffic is unchanged: the documented trade still decodes", () => {
     const decoded = decodeFrame(JSON.stringify(TRADE));
@@ -211,5 +239,83 @@ describe("binance declared-key adoption is closed at the wire door", () => {
     const clean = decodeFrame(raw);
     const polluted = withInherited("q", "999999", () => decodeFrame(raw));
     expect(JSON.stringify(polluted)).toBe(JSON.stringify(clean));
+  });
+
+  // REVIEW ROUND 1, FINDING F1. The ENUMERABLE variant of the whole row: a
+  // door that copied inherited enumerable keys after its own-key loop kept
+  // every other test in this file green while `Object.prototype.q = "888888"`
+  // put a fabricated quantity back into `quantityRaw`. Both variants are now
+  // measured, on every declared key.
+  it("an ENUMERABLE inherited declared key is not adopted either", () => {
+    decodeFrame(JSON.stringify(TRADE)); // warm: enumerable pollution poisons cold lazies
+    const survivors: string[] = [];
+    for (const key of DECLARED_TRADE_KEYS) {
+      const raw = withoutKey(TRADE, key);
+      const decoded = withInheritedEnumerable(key, INHERITED_VALUE[key], () => decodeFrame(raw));
+      if (decoded.kind === "TRADE") survivors.push(key);
+    }
+    expect(survivors).toEqual([]);
+
+    // The §3 row's own shape, spelled out: the fabricated quantity never
+    // becomes `quantityRaw`.
+    const decoded = withInheritedEnumerable("q", "888888", () =>
+      decodeFrame(withoutKey(TRADE, "q")),
+    );
+    expect(decoded.kind).toBe("MALFORMED");
+    expect((decoded as { quantityRaw?: string }).quantityRaw).toBeUndefined();
+  });
+
+  it("an honest frame is unchanged by ENUMERABLE pollution, unknownFields included", () => {
+    const raw = JSON.stringify(TRADE);
+    const clean = decodeFrame(raw);
+    const polluted = withInheritedEnumerable("q", "888888", () => decodeFrame(raw));
+    expect(JSON.stringify(polluted)).toBe(JSON.stringify(clean));
+    // An inherited enumerable key the venue never sent is not venue drift.
+    const drift = withInheritedEnumerable("brandNew", "v2", () => decodeFrame(raw));
+    expect(drift.unknownFields).toEqual([]);
+  });
+
+  // REVIEW ROUND 1, FINDING F2. The ADR-020 2026-09-06 amendment: a warm schema
+  // still builds its issues lazily per refusal and that path reads through the
+  // prototype chain. With `./wire-door.ts`'s containment deleted, an inherited
+  // non-enumerable `_zod` makes this exact call THROW
+  // `TypeError: Cannot read properties of undefined (reading 'has')`, and an
+  // inherited `value` throws `TypeError: Invalid property descriptor…` —
+  // turning a documented-total decoder into one that escapes. Both are pinned.
+  it("a refusal that cannot be CONSTRUCTED is still a refusal, not a throw", () => {
+    const raw = withoutKey(TRADE, "q");
+    decodeFrame(JSON.stringify(TRADE)); // warm
+    for (const key of ["_zod", "value"] as const) {
+      const decoded = withInherited(key, {}, () => decodeFrame(raw));
+      expect(decoded.kind, key).toBe("MALFORMED");
+      if (decoded.kind !== "MALFORMED") throw new Error("unreachable");
+      expect(decoded.reason, key).toBe("SCHEMA_MISMATCH");
+      // The detail may VARY (ADR-020 §6: composition may vary, permission may
+      // not); what may not vary is that a value came back at all.
+      expect(typeof decoded.detail, key).toBe("string");
+    }
+  });
+
+  // REVIEW ROUND 1, FINDING F7. D4: the door emits prototype-free, so a
+  // consumer's `?? default` on an absent field cannot be answered by
+  // `Object.prototype`.
+  it("every emitted frame has a null prototype (D4)", () => {
+    for (const raw of [
+      JSON.stringify(TRADE),
+      JSON.stringify(BOOK_TICKER),
+      withoutKey(TRADE, "q"),
+      JSON.stringify({ e: "serverShutdown", E: 1_770_123_456_789 }),
+      JSON.stringify({ code: 2, msg: "Invalid request" }),
+      JSON.stringify({ result: null, id: 1 }),
+      JSON.stringify({ e: "somethingNew" }),
+      "not json",
+    ]) {
+      const decoded = decodeFrame(raw);
+      expect(Object.getPrototypeOf(decoded), `${decoded.kind}: ${raw.slice(0, 24)}`).toBeNull();
+    }
+    // …and an absent optional field reads as absent whatever the prototype says.
+    const shutdown = decodeFrame(JSON.stringify({ e: "serverShutdown", E: 1 }));
+    expect(withInherited("symbol", "INVENTED", () => (shutdown as { symbol?: string }).symbol))
+      .toBeUndefined();
   });
 });

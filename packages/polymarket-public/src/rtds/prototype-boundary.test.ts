@@ -82,6 +82,41 @@ function withInherited<T>(key: string, value: unknown, body: () => T): T {
   }
 }
 
+/**
+ * The ENUMERABLE variant of the same class (review round 1, finding F1).
+ *
+ * A door that copied inherited enumerable keys after its own-key loop passed
+ * every test this file carried. Callers warm the schemas with an honest
+ * normalization FIRST: enumerable pollution during a schema's first parse
+ * permanently poisons it (ADR-020 §1 class 7).
+ */
+function withInheritedEnumerable<T>(key: string, value: unknown, body: () => T): T {
+  Object.defineProperty(Object.prototype, key, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+  try {
+    return body();
+  } finally {
+    Reflect.deleteProperty(Object.prototype, key);
+  }
+}
+
+/** The documented frame with one key removed, from the envelope or the payload. */
+function without(key: string, from: "envelope" | "payload"): unknown {
+  const envelope: Record<string, unknown> = { ...THIRTY_UPDATE };
+  if (from === "envelope") {
+    delete envelope[key];
+    return envelope;
+  }
+  const payload: Record<string, unknown> = { ...THIRTY_UPDATE.payload };
+  delete payload[key];
+  envelope["payload"] = payload;
+  return envelope;
+}
+
 describe("rtds routing is decided by what the frame OWNS", () => {
   it("honest traffic is unchanged: the documented example still normalizes", () => {
     const { events, problems } = normalizeOne(THIRTY_UPDATE);
@@ -122,6 +157,114 @@ describe("rtds routing is decided by what the frame OWNS", () => {
     const { events, problems } = withInherited("skipChecks", true, () => normalizeOne(badWindow));
     expect(events).toEqual([]);
     expect(problems.map((problem) => problem.code)).toEqual(["RTDS_INVALID_TWAP_PAYLOAD"]);
+  });
+
+  // REVIEW ROUND 1, FINDING F4 — THE SHARPEST CELLS OF THIS ROW, which the
+  // first pass left unpinned. Measured at base `5128d6c`:
+  //
+  //   * an inherited `full_accuracy_value` published a `ReferenceTwapObserved`
+  //     carrying `value:"999000"` — a FABRICATED ECONOMIC VALUE, the one field
+  //     ADR-001 §8.3 lets this adapter read for exact decimals;
+  //   * an inherited `topic` produced `feedId:"crypto_prices_twap_thirty"` on a
+  //     frame that declared no topic at all — a recorded series identity for an
+  //     update that never named one.
+  //
+  // Both are now refused, and so are `symbol`, the observation instant and the
+  // whole payload.
+  it("no ECONOMIC value and no feedId can be supplied from the prototype", () => {
+    normalizeOne(THIRTY_UPDATE); // warm
+
+    // The economic cell. `999000000000000000000` is E18 for 999.
+    const noValue = without("full_accuracy_value", "payload");
+    expect(normalizeOne(noValue).problems.map((p) => p.code)).toEqual([
+      "RTDS_INVALID_TWAP_PAYLOAD",
+    ]);
+    const injected = withInherited("full_accuracy_value", "999000000000000000000", () =>
+      normalizeOne(noValue),
+    );
+    expect(injected.events).toEqual([]);
+    expect(injected.problems.map((p) => p.code)).toEqual(["RTDS_INVALID_TWAP_PAYLOAD"]);
+
+    // The identity cell: no topic, therefore no feedId.
+    const noTopic = without("topic", "envelope");
+    const routed = withInherited("topic", "crypto_prices_twap_thirty", () =>
+      normalizeOne(noTopic),
+    );
+    expect(routed.events).toEqual([]);
+    expect(routed.problems.map((p) => p.code)).toEqual(["RTDS_INVALID_ENVELOPE"]);
+  });
+
+  it("every declared envelope and payload key is refused when only the prototype supplies it", () => {
+    normalizeOne(THIRTY_UPDATE); // warm
+    const survivors: string[] = [];
+    const cells: readonly (readonly [string, "envelope" | "payload", unknown])[] = [
+      ["topic", "envelope", "crypto_prices_twap_thirty"],
+      ["type", "envelope", "update"],
+      ["payload", "envelope", THIRTY_UPDATE.payload],
+      ["symbol", "payload", "btc/usd"],
+      ["full_accuracy_value", "payload", "999000000000000000000"],
+      ["timestamp", "payload", 1_785_178_800_000],
+      ["window_s", "payload", 30],
+    ];
+    for (const [key, from, value] of cells) {
+      const frame = without(key, from);
+      // Clean: the frame is refused with the key genuinely gone.
+      if (normalizeOne(frame).events.length > 0) survivors.push(`${key} (clean)`);
+      for (const install of [withInherited, withInheritedEnumerable]) {
+        const outcome = install(key, value, () => normalizeOne(frame));
+        if (outcome.events.length > 0) {
+          survivors.push(`${key} (${install === withInherited ? "inherited" : "enumerable"})`);
+        }
+      }
+    }
+    expect(survivors).toEqual([]);
+  });
+
+  // REVIEW ROUND 1, FINDING F1. The ENUMERABLE variant of the routing cell,
+  // spelled out separately so the row's own shape stays legible.
+  it("an ENUMERABLE inherited `type` does not route a frame either", () => {
+    normalizeOne(THIRTY_UPDATE); // warm
+    const outcome = withInheritedEnumerable("type", "update", () => normalizeOne(NO_TYPE));
+    expect(outcome.events).toEqual([]);
+    expect(outcome.problems.map((problem) => problem.code)).toEqual(["RTDS_INVALID_ENVELOPE"]);
+
+    // AND WHAT ENUMERABLE POLLUTION DOES TO AN HONEST FRAME HERE, stated
+    // rather than assumed: it is refused, by the FROZEN domain contract, and
+    // this is base-identical because `packages/domain` is untouched by this
+    // round. `ReferenceTwapObservedContract.payloadSchema` is a strict object,
+    // and `z.strictObject` DOES see an enumerable inherited unknown key
+    // (`schema-boundary.md` §2 — it is blind only to a non-enumerable one), so
+    // every enumerable key on `Object.prototype` becomes an
+    // `unrecognized_keys` issue on the normalized payload.
+    //
+    // That is an AVAILABILITY class, never a permission one: the observation is
+    // refused and reported with its raw evidence, never published wrong. It is
+    // recorded here so the difference between the two variants is measured
+    // rather than discovered later.
+    const polluted = withInheritedEnumerable("type", "update", () => normalizeOne(THIRTY_UPDATE));
+    expect(polluted.events).toEqual([]);
+    expect(polluted.problems.map((problem) => problem.code)).toEqual([
+      "RTDS_PAYLOAD_CONTRACT_VIOLATION",
+    ]);
+    // …and it is the pollution, not the door: with it gone the same frame
+    // publishes.
+    expect(normalizeOne(THIRTY_UPDATE).events).toHaveLength(1);
+  });
+
+  // REVIEW ROUND 1, FINDING F2. ADR-020's 2026-09-06 amendment: a warm schema
+  // still builds its issues lazily per refusal, and that path reads through the
+  // prototype chain. With `./wire-door.ts`'s containment deleted, an inherited
+  // non-enumerable `_zod` turns this refusal into a bare `TypeError` — a throw
+  // in a message loop, which is how an event gets dropped.
+  it("a refusal that cannot be CONSTRUCTED is still a problem, not a throw", () => {
+    normalizeOne(THIRTY_UPDATE); // warm
+    for (const key of ["_zod", "value"] as const) {
+      const outcome = withInherited(key, {}, () => normalizeOne(NO_TYPE));
+      expect(outcome.events, key).toEqual([]);
+      expect(outcome.problems.map((problem) => problem.code), key).toEqual([
+        "RTDS_INVALID_ENVELOPE",
+      ]);
+    }
   });
 
   // The schema itself is unchanged and still says what it said: this round

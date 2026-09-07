@@ -63,6 +63,31 @@ function withInherited<T>(key: string, value: unknown, body: () => T): T {
   }
 }
 
+/**
+ * The ENUMERABLE variant of the same class (review round 1, finding F1).
+ *
+ * A door that copied inherited enumerable keys after its own-key loop passed
+ * every test this file carried. Non-enumerable is the variant to DESIGN
+ * against; it is not the only one to TEST against.
+ *
+ * Callers warm the schemas with an honest classification FIRST: enumerable
+ * pollution during a schema's first parse permanently poisons it (ADR-020 §1
+ * class 7), which would measure the poisoning rather than the adoption.
+ */
+function withInheritedEnumerable<T>(key: string, value: unknown, body: () => T): T {
+  Object.defineProperty(Object.prototype, key, {
+    value,
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+  try {
+    return body();
+  } finally {
+    Reflect.deleteProperty(Object.prototype, key);
+  }
+}
+
 describe("coinbase routing is decided by what the frame OWNS", () => {
   it("honest traffic is unchanged: a documented ticker frame still classifies", () => {
     const classified = classifyFrame(HONEST_TICKER);
@@ -155,5 +180,76 @@ describe("coinbase routing is decided by what the frame OWNS", () => {
     });
     const classified = withInherited("size", "999999", () => classifyFrame(noSize));
     expect(classified.kind).toBe("REJECTED");
+  });
+
+  // REVIEW ROUND 1, FINDING F1. The ENUMERABLE variant of the routing row.
+  it("an ENUMERABLE inherited `channel` does not route a frame either", () => {
+    classifyFrame(HONEST_TICKER); // warm: enumerable pollution poisons cold lazies
+    const survivors: string[] = [];
+    for (const [key, value] of [
+      ["channel", "ticker"],
+      ["sequence_num", 7],
+      ["timestamp", "2023-02-09T20:19:35.39625135Z"],
+    ] as const) {
+      const frame = JSON.stringify(
+        Object.fromEntries(
+          Object.entries({
+            channel: "ticker",
+            timestamp: "2023-02-09T20:19:35.39625135Z",
+            sequence_num: 7,
+            events: TICKER_EVENTS,
+          }).filter(([name]) => name !== key),
+        ),
+      );
+      const classified = withInheritedEnumerable(key, value, () => classifyFrame(frame));
+      if (classified.kind !== "REJECTED") survivors.push(key);
+    }
+    expect(survivors).toEqual([]);
+  });
+
+  it("an honest frame is unchanged by ENUMERABLE pollution", () => {
+    classifyFrame(HONEST_TICKER); // warm
+    const clean = classifyFrame(HONEST_TICKER);
+    const polluted = withInheritedEnumerable("channel", "market_trades", () =>
+      classifyFrame(HONEST_TICKER),
+    );
+    expect(JSON.stringify(polluted)).toBe(JSON.stringify(clean));
+  });
+
+  // REVIEW ROUND 1, FINDING F2. ADR-020's 2026-09-06 amendment: a warm schema
+  // still builds its issues lazily per refusal, and that path reads through the
+  // prototype chain. With `./wire-door.ts`'s containment deleted, an inherited
+  // non-enumerable `_zod` drives the refusal into a bare `TypeError` instead of
+  // a classification, and `classifyFrame` is documented never to throw.
+  it("a refusal that cannot be CONSTRUCTED is still a classification, not a throw", () => {
+    classifyFrame(HONEST_TICKER); // warm
+    for (const key of ["_zod", "value"] as const) {
+      const classified = withInherited(key, {}, () => classifyFrame(NO_CHANNEL));
+      expect(classified.kind, key).toBe("REJECTED");
+      if (classified.kind !== "REJECTED") throw new Error("unreachable");
+      expect(classified.rejection, key).toBe("SHAPE");
+      expect(typeof classified.detail, key).toBe("string");
+    }
+  });
+
+  // REVIEW ROUND 1, FINDING F7. D4: the classification and the frame it carries
+  // are emitted prototype-free.
+  it("every emitted classification has a null prototype (D4)", () => {
+    for (const raw of [HONEST_TICKER, NO_CHANNEL, "not json"]) {
+      const classified = classifyFrame(raw);
+      expect(Object.getPrototypeOf(classified), raw.slice(0, 24)).toBeNull();
+    }
+    const ticker = classifyFrame(HONEST_TICKER);
+    if (ticker.kind !== "TICKER") throw new Error("unreachable");
+    expect(Object.getPrototypeOf(ticker.frame)).toBeNull();
+    // …so an absent optional field reads as absent whatever the prototype says.
+    const entry = ticker.frame.events[0]?.tickers[0];
+    expect(Object.getPrototypeOf(entry)).toBeNull();
+    expect(
+      withInherited("best_ask", "999999", () => classifyFrame(HONEST_TICKER)),
+    ).toBeDefined();
+    const binary = classifyFrame(new Uint8Array([1, 2, 3]));
+    expect(withInherited("text", "INVENTED", () => (binary as { text?: string }).text))
+      .toBeUndefined();
   });
 });
