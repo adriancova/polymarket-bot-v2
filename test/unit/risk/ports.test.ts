@@ -156,9 +156,19 @@ describe("runtime parse pin", () => {
     expect(AllocationVerdictViewSchema.safeParse(permitted).success).toBe(true);
     expect(permitted.permitted).toBe(true);
 
+    // A DIFFERENT instance, and a VALID one. This value was `"someone-else"`
+    // until `ALLOC-1`, when ADR-021 re-typed the allocator's
+    // `strategyInstanceId` to `Uuidv7Schema`: the row kept passing, but it had
+    // silently stopped measuring what it was written for. The refusal became
+    // `CAPITAL_INPUT_INVALID` (a schema rejection of the id itself) where the
+    // row's subject is `CAPITAL_LIVE_OWNERSHIP_CONFLICT` — a real allocator
+    // POLICY refusal, carried across the structural port. The letter-leading
+    // spelling is admissible under both the old and the new grammar, so the
+    // row measures the port rather than the re-typing, and the code is now
+    // PINNED so the same decay cannot recur unnoticed.
     const refused = evaluateReservation(state, caps, {
       reservationId: "res-2",
-      strategyInstanceId: "someone-else",
+      strategyInstanceId: "b1890000-0000-7000-8000-00000000000b",
       runMode: "PAPER",
       accountingMode: "LIVE",
       marketId: MARKET_A,
@@ -170,6 +180,9 @@ describe("runtime parse pin", () => {
     const parsedRefused = AllocationVerdictViewSchema.safeParse(refused);
     expect(parsedRefused.success).toBe(true);
     expect(refused.permitted).toBe(false);
+    expect(refused.refusals.map((refusal) => refusal.code)).toEqual([
+      "CAPITAL_LIVE_OWNERSHIP_CONFLICT",
+    ]);
   });
 });
 

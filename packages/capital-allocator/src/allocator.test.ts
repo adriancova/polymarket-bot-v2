@@ -41,8 +41,21 @@ import { createAllocatorState, withLiveOwner, type AllocatorState } from "./stat
 
 const MARKET_A = "01890000-0000-7000-8000-000000000001";
 const MARKET_B = "01890000-0000-7000-8000-000000000002";
-const INSTANCE = "strat-a";
-const OTHER_INSTANCE = "strat-b";
+/**
+ * MINTED, `0`-LEADING UUIDv7s (`ALLOC-1`, ADR-021's 2026-09-06 amendment).
+ *
+ * These were `"strat-a"` and `"strat-b"` until this round, because
+ * `strategyInstanceId` was typed `CodeStringSchema` at the four doors
+ * `reserve.ts:69` and `state.ts:68,:81,:92`. ADR-021 ruled that a mis-typing:
+ * the field is a minted IDENTITY, and `CodeStringSchema`'s leading-letter rule
+ * refused every UUIDv7 an honest generator produces before ~2527. The whole
+ * suite therefore now runs on exactly the population the old typing refused —
+ * the strongest available spelling, since a letter-leading UUIDv7 would have
+ * passed both grammars and left the widening unexercised here.
+ * `adr-021-instance-identity.test.ts` holds the door-by-door transcript.
+ */
+const INSTANCE = "018f4a7e-2222-7abc-8def-0123456789ab";
+const OTHER_INSTANCE = "018f4a7e-3333-7abc-8def-0123456789ab";
 
 function caps(overrides: Partial<AllocatorCaps> = {}): AllocatorCaps {
   const parsed = parseAllocatorCaps({
@@ -1054,21 +1067,33 @@ describe("a hostile value at the input doors — review round 5", () => {
   });
 
   it("an INHERITED member is never an exposure entry, and never a write target", () => {
-    // `strategyInstanceId` is a `CodeString`, so `"constructor"` is admissible.
-    // With `table[key] ??= …` the accumulator read the `Object` constructor as
-    // an existing entry and then wrote this package's commitment components
-    // onto the intrinsic itself.
+    // `seriesKey` is a `CodeString`, so `"constructor"` is admissible. With
+    // `table[key] ??= …` the accumulator read the `Object` constructor as an
+    // existing entry and then wrote this package's commitment components onto
+    // the intrinsic itself.
+    //
+    // THE VECTOR MOVED FROM `strategyInstanceId` TO `seriesKey` in `ALLOC-1`,
+    // and the probe moved with it rather than being deleted. ADR-021 re-typed
+    // the instance id to `Uuidv7Schema`, whose grammar admits no
+    // `Object.prototype` member name, so that field can no longer carry this
+    // input at all. The three SCOPE keys (`state.ts:58-60`) stay
+    // `CodeStringSchema` — vocabulary, not identity — so a caller-derived
+    // inherited NAME still reaches the same `bump`/`ownEntry`/`setOwn` path in
+    // `exposure.ts`, on the same tables, through a live door. The defect class
+    // this test was written for is therefore still measured, not merely
+    // asserted to be unreachable.
     const built = createAllocatorState({
       accountEquity: "1000",
       availableCollateral: "1000",
       positions: [
         {
           positionId: "pos-1",
-          strategyInstanceId: "constructor",
+          strategyInstanceId: INSTANCE,
           marketId: MARKET_A,
           side: "YES",
           shares: "100",
           costBasis: "40",
+          scope: { seriesKey: "constructor" },
         },
       ],
       openOrders: [],
@@ -1078,8 +1103,8 @@ describe("a hostile value at the input doors — review round 5", () => {
     if (!built.ok) return;
 
     const snapshot = exposureSnapshot(built.value);
-    expect(Object.hasOwn(snapshot.byStrategyInstance, "constructor")).toBe(true);
-    expect(snapshot.byStrategyInstance["constructor"]?.combined).toBe("40");
+    expect(Object.hasOwn(snapshot.bySeries, "constructor")).toBe(true);
+    expect(snapshot.bySeries["constructor"]?.combined).toBe("40");
     // The intrinsic is clean: no commitment component was written to it.
     expect(Object.hasOwn(Object.prototype, "openOrderCommitted")).toBe(false);
     expect(Object.hasOwn(Object.prototype, "positionCommitted")).toBe(false);

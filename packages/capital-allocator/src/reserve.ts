@@ -31,7 +31,6 @@
 
 import { addDecimal, compareDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
 import {
-  CodeStringSchema,
   InternalMarketIdSchema,
   NonEmptyStringSchema,
   OutcomeSideSchema,
@@ -39,6 +38,7 @@ import {
   PriceStringSchema,
   RUN_MODE_PLACES_REAL_ORDERS,
   RunModeSchema,
+  Uuidv7Schema,
 } from "@polymarket-bot/domain";
 import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { z } from "zod";
@@ -66,7 +66,30 @@ import {
 
 export const ReservationRequestSchema = z.strictObject({
   reservationId: NonEmptyStringSchema,
-  strategyInstanceId: CodeStringSchema,
+  /**
+   * The strategy instance this reservation is for — an IDENTITY, not a code
+   * token (ADR-021, accepted 2026-09-06; amended 2026-09-06 to name this door).
+   *
+   * IT WAS `CodeStringSchema` UNTIL `ALLOC-1`, and that was the same mis-typing
+   * `WP-180-FU3` corrected in `packages/risk`. `CodeStringSchema`'s grammar
+   * requires a LEADING LETTER; a UUIDv7's first hex digit is the top nibble of
+   * its 48-bit millisecond timestamp, and that nibble is `0` for every instant
+   * before ~2527 — so no honestly-minted UUIDv7 could pass this door, while
+   * `packages/ledger`'s `AllocationClaim.instanceId` and `packages/pnl`'s
+   * `PnlOwner.instanceId` — the same value, one layer down — require exactly
+   * one. The ADR's amendment measured the consequence: with a `0`-leading
+   * instance id the risk door accepted what THIS package refused.
+   *
+   * The change is a WIDENING on the honest population and a narrowing only on
+   * code-shaped strings no other merged door ever admitted. The SCOPE keys in
+   * `state.ts` stay `CodeStringSchema`: they are machine vocabulary, which is
+   * what that primitive documents itself for.
+   *
+   * `Uuidv7Schema` carries its format as a CHECK, so the arena copies it with
+   * the rest of this schema and the format survives a polluted `skipChecks`
+   * (`@polymarket-bot/risk`'s `schema-arena.ts` header measures that class).
+   */
+  strategyInstanceId: Uuidv7Schema,
   runMode: RunModeSchema,
   accountingMode: z.enum(["LIVE", "SHADOW"]),
   marketId: InternalMarketIdSchema,
