@@ -7,9 +7,14 @@
  * CONSEQUENCE so that the day it is fixed, this file fails and says which
  * residual moved.
  *
+ * THAT HAPPENED. Residual 1 is RESOLVED, and this file is how it was noticed:
+ * the row that pinned the startup refusal failed on the very commit that
+ * relaxed the door, naming the residual that moved. Its two rows below now pin
+ * the RESOLUTION — the mechanism is unchanged, only its subject is.
+ *
  * | Residual | Owner of the fix | Observed here as |
  * | --- | --- | --- |
- * | `strategyInstanceId` must satisfy two conflicting doors | the contract owner (queued elsewhere) | a STARTUP refusal naming the field, and a scenario configured inside the intersection |
+ * | `strategyInstanceId` must satisfy two conflicting doors — **RESOLVED 2026-09-06** (ADR-021: risk `8c14b47`, allocator `d9f70a6`, trader `TRDR-1`) | the contract owner — ruled and executed | a minted `0`-leading UUIDv7 now STARTS, the letter-leading one still does, and the startup refusal that replaced the conflict names the field without the conflict text |
  * | a protective reduction is typed `ENTRY` at the risk seam | the risk-side follow-up (`WP-220` accepted residual) | `risk.refusedExits` / `refusedExitsByCode`, and the strategy state that follows from it |
  * | `SHADOW` is observe-only in this process | a design, not a setting (ADR-011 §5) | `execution.observeOnlyIntents`, with the shadow instance's decisions still persisted |
  * | the interim §9.8 operator inputs are required and undefaulted | `packages/universe` + `packages/settlement` wiring | each omission is a startup refusal naming the field |
@@ -49,26 +54,55 @@ function refusalOf(config: Record<string, unknown>): { code: string; issues: str
   };
 }
 
-describe("residual 1 — the strategyInstanceId contract conflict", () => {
-  it("the working shape is a UUIDv7 whose first hex digit is a LETTER", async () => {
+/**
+ * Residual 1, RESOLVED — the rows now pin the resolution.
+ *
+ * ADR-021 ruled `strategyInstanceId` an IDENTITY and `CodeStringSchema` the
+ * mis-typing; `packages/risk` (`8c14b47`) and `packages/capital-allocator`
+ * (`d9f70a6`) were re-typed, and `TRDR-1` then deleted `apps/trader`'s interim
+ * intersection grammar in favour of `packages/domain`'s `Uuidv7Schema`. Two
+ * rows, as before: the scenario's own id still starts (compatibility), and the
+ * id that used to be refused now starts while a genuinely malformed one does
+ * not (the resolution, and the refusal that replaced the conflict).
+ */
+describe("residual 1 — the strategyInstanceId contract conflict, RESOLVED", () => {
+  it("the letter-leading UUIDv7 this scenario was written around STILL works", async () => {
     const run = await driveScenario();
+    // Not because a letter lead is required — it no longer is — but because
+    // ADR-021's Consequences promise that "existing letter-leading UUIDv7
+    // configurations remain valid". This scenario IS one of them, so the row
+    // is a compatibility statement and the regex is what makes it non-vacuous.
     expect(INSTANCE_ID).toMatch(/^[a-f][0-9a-f]{7}-[0-9a-f]{4}-7/u);
     expect(run.trader.manifest.map((row) => row.instanceId)).toContain(INSTANCE_ID);
   });
 
-  it("a timestamp-shaped UUIDv7 is REFUSED AT STARTUP, naming the field", () => {
-    const config = document();
-    const instances = config["instances"] as Record<string, unknown>[];
-    const instance = instances[0];
-    if (instance === undefined) throw new Error("the scenario lost its instance");
-    // A real UUIDv7 minted from a 2026 timestamp begins with '0'.
-    instance["instanceId"] = "018f5c20-2000-7a20-8b00-000000000002";
-    const refusal = refusalOf(config);
+  it("a timestamp-shaped UUIDv7 now STARTS, and a wrong-version one is refused instead", () => {
+    const started = document();
+    const startedInstances = started["instances"] as Record<string, unknown>[];
+    const startedInstance = startedInstances[0];
+    if (startedInstance === undefined) throw new Error("the scenario lost its instance");
+    // A real UUIDv7 minted from a 2026 timestamp begins with '0'. This exact
+    // document was refused at startup until TRDR-1; it is the population every
+    // honest generator produces, and the composition root now accepts it.
+    startedInstance["instanceId"] = "018f5c20-2000-7a20-8b00-000000000002";
+    const { result } = assemble({ config: started, env: paperEnvironment() });
+    expect(result.ok).toBe(true);
+
+    // The relaxation is not a widening only. The interim grammar was version-
+    // and variant-BLIND, so this v4 — letter lead, canonical shape — used to
+    // pass STARTUP and be refused mid-run by the risk door. It is refused here
+    // now, and the refusal no longer narrates a conflict that is resolved.
+    const refused = document();
+    const refusedInstances = refused["instances"] as Record<string, unknown>[];
+    const refusedInstance = refusedInstances[0];
+    if (refusedInstance === undefined) throw new Error("the scenario lost its instance");
+    refusedInstance["instanceId"] = "e18f5c20-2000-4a20-8b00-000000000002";
+    const refusal = refusalOf(refused);
     expect(refusal.code).toBe("TRADER_CONFIG_REFUSED");
     expect(refusal.issues).toContain("instanceId");
-    // The refusal EXPLAINS the conflict rather than merely rejecting: two
-    // merged doors constrain one value, and it names both.
-    expect(refusal.issues).toContain("packages/risk");
+    expect(refusal.issues).toContain("UUIDv7");
+    expect(refusal.issues).not.toContain("CodeStringSchema");
+    expect(refusal.issues).not.toContain("cross-package conflict");
   });
 });
 

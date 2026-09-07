@@ -208,27 +208,36 @@ recorded R8-1 tooling residual independently.
 Wiring the merged engines together surfaced four frictions. **None was patched
 around by editing a package.** Each is handled by making the trader's own door
 refuse at STARTUP, with the conflict named in the refusal, and each is reported
-here.
+here. Friction 1 has since been RESOLVED — by a contract-owner ruling that
+corrected the packages it named, which is the outcome reporting a conflict is
+for.
 
-### 1. `strategyInstanceId` cannot satisfy both merged doors (BLOCKING for a real deployment)
+### 1. `strategyInstanceId` cannot satisfy both merged doors — RESOLVED 2026-09-06 (ADR-021)
 
-- `packages/ledger`'s `AllocationClaim.instanceId` and `packages/pnl`'s
-  `PnlOwner.instanceId` are `Uuidv7Schema`;
-- `packages/risk`'s `RiskEvaluationInput.context.strategyInstanceId` is
-  `CodeStringSchema`, whose pattern is `^[A-Za-z][A-Za-z0-9_.:-]*$` — a **letter
-  first**.
+As reported: `packages/ledger`'s `AllocationClaim.instanceId` and
+`packages/pnl`'s `PnlOwner.instanceId` are `Uuidv7Schema`, while
+`packages/risk`'s `RiskEvaluationInput.context.strategyInstanceId` was
+`CodeStringSchema`, whose pattern is `^[A-Za-z][A-Za-z0-9_.:-]*$` — a **letter
+first**. A UUIDv7's first 48 bits are a Unix-millisecond timestamp, so every
+genuinely minted one begins with the digit `0` for every instant this century:
+such an identifier satisfied the ledger and **failed** the risk engine. This
+door refused anything outside the intersection (a UUID shape whose first hex
+digit is `a`–`f`) at startup, with the conflict named, rather than letting it
+appear mid-run as a `RISK_INPUT_INVALID` with no order placed.
 
-A UUIDv7's first 48 bits are a Unix-millisecond timestamp, so every genuinely
-minted one begins with the digit `0` for every instant this century. Such an
-identifier satisfies the ledger and **fails** the risk engine, and the two
-cannot both be satisfied. The intersection is non-empty only for a UUID whose
-first hex digit is `a`–`f`, which no timestamp produces.
+**The contract owner ruled** (ADR-021, accepted 2026-09-06 and amended the same
+day): `strategyInstanceId` is an IDENTITY, and `CodeStringSchema` was the
+mis-typing. The amendment measured a FOURTH door — `packages/capital-allocator`
+typed the same value `CodeStringSchema` at four sites — and fixed the ordering.
+Both were re-typed to `Uuidv7Schema` (`WP-180-FU3` `8c14b47`; `ALLOC-1`
+`d9f70a6`), so this door now uses `packages/domain`'s `Uuidv7Schema` itself and
+the interim intersection grammar is deleted (`TRDR-1`).
 
-The trader's door refuses anything outside that intersection at startup, naming
-the conflict, rather than letting it appear mid-run as a `RISK_INPUT_INVALID`
-with no order placed. **The real fix is a contract-owner decision** — widen
-`CodeStringSchema` for this field, or type it as an identifier rather than a
-code — and it belongs to whoever owns `packages/risk`'s input surface.
+Two consequences worth stating, because the change is not a pure relaxation:
+existing **letter-leading** UUIDv7 configurations — including the shipped
+example and the e2e run — remain valid; and the version and variant nibbles are
+now enforced at startup, where the interim regex was blind to both (a lowercase
+**v4** used to pass this door and be refused only mid-run).
 
 ### 2. §9.8's fail-closed inputs have no upstream producer yet
 
