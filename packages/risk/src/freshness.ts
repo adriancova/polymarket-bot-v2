@@ -37,6 +37,8 @@ import { z } from "zod";
 
 import { InternalMarketIdSchema, NonNegativeIntegerSchema } from "@polymarket-bot/domain";
 
+import { appendData } from "./plain-data.js";
+
 /** The feed kinds this package classifies. */
 export const FRESHNESS_FEEDS = ["VENUE_BOOK", "REFERENCE_FEED", "FEATURES"] as const;
 export type FreshnessFeed = (typeof FRESHNESS_FEEDS)[number];
@@ -102,15 +104,15 @@ export function assessFreshness(
   for (const observation of observations) {
     if (observation.feed === "VENUE_BOOK") {
       if (observation.marketId === marketId) {
-        bookAges.push(observation.ageMs);
+        appendData(bookAges, observation.ageMs);
       }
       continue;
     }
     if (observation.feed === "REFERENCE_FEED") {
-      referenceAges.push(observation.ageMs);
+      appendData(referenceAges, observation.ageMs);
       continue;
     }
-    featureAges.push(observation.ageMs);
+    appendData(featureAges, observation.ageMs);
   }
   return Object.freeze({
     venueBook: classify("VENUE_BOOK", bookAges, policy.venueBookMaxAgeMs),

@@ -74,6 +74,7 @@ import {
 import { buildIntentView, heldShares, type IntentLeg } from "./intent-view.js";
 import { buildWorstCaseLots } from "./lots.js";
 import type { RiskPolicy } from "./policy.js";
+import { appendData } from "./plain-data.js";
 import type { RiskReasonCode } from "./reasons.js";
 import {
   recommendIncidentActions,
@@ -133,7 +134,7 @@ function recommend(
         existing.ordersScope === addition.ordersScope &&
         existing.marketId === addition.marketId,
     );
-    if (!duplicate) accumulator.recommendations.push(addition);
+    if (!duplicate) appendData(accumulator.recommendations, addition);
   }
 }
 
@@ -220,7 +221,7 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   // `inputs.ts`, NOT in the pipeline.
   const validated = validateEvaluationInput(input);
   if (!validated.ok) {
-    accumulator.refusals.push(...validated.refusals);
+    for (const refusal of validated.refusals) appendData(accumulator.refusals, refusal);
     return rejected(accumulator, undefined, undefined, undefined);
   }
   const data = validated.data;
@@ -228,7 +229,7 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   // --- pre-check on the intent's deadline ----------------------------------
   const built = buildIntentView(data.intent, data.portfolio);
   const view = built.view;
-  accumulator.refusals.push(...built.refusals);
+  for (const refusal of built.refusals) appendData(accumulator.refusals, refusal);
 
   const isEntry = view.disposition === "ENTRY";
   const isCancel = view.disposition === "CANCEL";
@@ -237,7 +238,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   if (view.validUntil !== undefined) {
     const expired = isExpired(view.validUntil, data.evaluatedAt);
     if (expired !== false) {
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_INTENT_EXPIRED",
           expired === undefined
@@ -251,14 +253,16 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
 
   // --- §9.8 check 1: run and strategy state --------------------------------
   if (placesOrders && !data.context.runStatePermitsIntent) {
-    accumulator.refusals.push(
+    appendData(
+      accumulator.refusals,
       riskRefusal("RISK_RUN_STATE_BLOCKS", "the run state does not permit this intent", {
         disposition: view.disposition,
       }),
     );
   }
   if (placesOrders && !data.context.strategyStatePermitsIntent) {
-    accumulator.refusals.push(
+    appendData(
+      accumulator.refusals,
       riskRefusal(
         "RISK_STRATEGY_STATE_BLOCKS",
         "the strategy instance state does not permit this intent",
@@ -269,7 +273,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
 
   // --- §9.8 check 2: run mode within the process maximum -------------------
   if (runModeExceeds(data.context.runMode, policy.maxRunMode)) {
-    accumulator.refusals.push(
+    appendData(
+      accumulator.refusals,
       riskRefusal(
         "RISK_RUN_MODE_EXCEEDS_MAXIMUM",
         "the requested run mode exceeds the configured process maximum (§11: a maximum cannot be raised at evaluation time)",
@@ -287,7 +292,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   // OWN read of the frozen domain table (review round 6): a run mode the table
   // does not own is not a real-order mode because `Object.prototype` says so.
   if (placesOrders && ownFlag(RUN_MODE_PLACES_REAL_ORDERS, data.context.runMode)) {
-    accumulator.refusals.push(
+    appendData(
+      accumulator.refusals,
       riskRefusal(
         "RISK_REAL_ORDER_SURFACE_UNSUPPORTED",
         "this package cannot verify real-order enablement or writer fencing (§6 invariants 16 and 17); a real-order-mode intent is refused here by construction",
@@ -300,7 +306,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     // prevents new live entries. Absent = unverified = blocked.
     const eligibility = data.context.venueEligibility;
     if (eligibility !== "ELIGIBLE" && !(eligibility === "CLOSE_ONLY" && !isEntry)) {
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_VENUE_ELIGIBILITY_UNVERIFIED",
           "venue eligibility is not a verified ELIGIBLE result (§6 invariant 18)",
@@ -318,7 +325,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   for (const marketId of view.marketIds) {
     const context = marketById.get(marketId);
     if (context === undefined) {
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_MARKET_CONTEXT_MISSING",
           "no market context was supplied for a market this intent touches (fail closed)",
@@ -327,7 +335,7 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
       );
       continue;
     }
-    contexts.push(context);
+    appendData(contexts, context);
   }
 
   const scopeByMarket = new Map<string, ScopeAttribution | undefined>(
@@ -338,7 +346,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     // --- §9.8 check 5: market active and accepting orders ------------------
     if (placesOrders) {
       if (context.status === "UNKNOWN") {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_MARKET_STATUS_UNKNOWN",
             "the market status is UNKNOWN; acting on an unknown market is a blind action (§6 invariant 12)",
@@ -347,14 +356,16 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
         );
         recommend(accumulator, recommendIncidentActions("POSITION_STATE_UNKNOWN", context.marketId));
       } else if (context.status === "HALTED") {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal("RISK_MARKET_NOT_ACCEPTING", "the market is halted and accepts no orders", {
             marketId: context.marketId,
             status: context.status,
           }),
         );
       } else if (context.status === "CLOSE_ONLY" && isEntry) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_MARKET_CLOSE_ONLY",
             "the market is close-only; new entries are blocked while reductions remain permitted",
@@ -367,7 +378,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     // --- §9.8 check 6: settlement spec verified for the strategy type ------
     if (isEntry && policy.requireVerifiedSettlementForEntries) {
       if (context.settlement?.modelDependentActivationAllowed !== true) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_SETTLEMENT_UNVERIFIED",
             "the market's settlement readiness does not permit model-dependent activation (§9.3, WP-110 readiness); absent = unverified = blocked",
@@ -403,7 +415,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
           : assessment.venueBook.status === "UNKNOWN"
             ? "RISK_FRESHNESS_UNKNOWN"
             : "RISK_BOOK_STALE";
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             bookCode,
             isEntry
@@ -439,7 +452,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
               : finding.feed === "FEATURES"
                 ? "RISK_FEATURES_STALE"
                 : "RISK_REFERENCE_FEED_STALE";
-          accumulator.refusals.push(
+          appendData(
+            accumulator.refusals,
             riskRefusal(
               code,
               "a required signal feed is stale or unmeasured; new entries are halted (§9.8 check 7, §9.9 row 1)",
@@ -467,7 +481,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   if (placesOrders) {
     for (const context of contexts) {
       if (context.bookSynchronized !== true) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_BOOK_NOT_SYNCHRONIZED",
             "the local book is not confirmed synchronized for this market (absent = unknown = blocked)",
@@ -495,7 +510,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
         .filter(([, value]) => value === undefined)
         .map(([name]) => name);
       if (missing.length > 0) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_TRADING_PARAMETERS_UNKNOWN",
             "current trading parameters are not fully known for this market (§6 invariant 9: parameters are versioned; an unknown version is not a known one)",
@@ -510,7 +526,7 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   for (const leg of view.legs) {
     const existing = legsByMarket.get(leg.marketId);
     if (existing === undefined) legsByMarket.set(leg.marketId, [leg]);
-    else existing.push(leg);
+    else appendData(existing, leg);
   }
 
   // --- §9.8 check 10: price conforms to tick and configured bounds ---------
@@ -521,7 +537,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
       for (const leg of legsByMarket.get(context.marketId) ?? []) {
         if (leg.limitPrice === undefined) continue;
         if (!isTickConformant(leg.limitPrice, tickSize)) {
-          accumulator.refusals.push(
+          appendData(
+            accumulator.refusals,
             riskRefusal(
               "RISK_PRICE_NOT_TICK_CONFORMANT",
               "a leg price is not an exact multiple of the market's tick size",
@@ -540,7 +557,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
       if (minimumOrderSize === undefined) continue;
       for (const leg of legsByMarket.get(context.marketId) ?? []) {
         if (compareDecimal(leg.shares, minimumOrderSize) < 0) {
-          accumulator.refusals.push(
+          appendData(
+            accumulator.refusals,
             riskRefusal("RISK_SIZE_BELOW_MINIMUM", "a leg size is below the market minimum", {
               marketId: context.marketId,
               shares: leg.shares,
@@ -557,7 +575,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   if (isEntry && policy.economics.minOrderNotional !== undefined) {
     if (view.boundedCost !== undefined) {
       if (compareDecimal(view.boundedCost, policy.economics.minOrderNotional) < 0) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_NOTIONAL_BELOW_ECONOMIC_FLOOR",
             "the intent's bounded notional is below the configured economic floor",
@@ -587,7 +606,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
       ...(slippage === undefined ? ["slippageEstimate"] : []),
     ];
     if (missingInputs.length > 0) {
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_EDGE_INPUTS_MISSING",
           "the expected-net-edge check requires a declared edge and exact fee and slippage estimates; an unsupplied cost is not a zero cost (fail closed)",
@@ -600,7 +620,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
         policy.economics.riskBuffer,
       );
       if (compareDecimal(net, "0") <= 0) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_NET_EDGE_NOT_POSITIVE",
             "expected net edge is not strictly positive after fees, slippage, and the risk buffer",
@@ -620,7 +641,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   // --- §9.8 check 13: participation limits ---------------------------------
   if (isEntry && policy.participation.maxOrderShares !== undefined) {
     if (compareDecimal(view.buyShares, policy.participation.maxOrderShares) > 0) {
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_PARTICIPATION_LIMIT_EXCEEDED",
           "the intent's bought share count exceeds the configured per-intent participation limit",
@@ -636,7 +658,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   // trap a position the account already holds.
   if (data.allocation === undefined) {
     if (isEntry) {
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_ALLOCATION_VERDICT_MISSING",
           "no capital-allocator verdict was supplied for an entry; balance, inventory, and reservations are therefore unproven (fail closed)",
@@ -645,7 +668,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
       );
     }
   } else if (!data.allocation.permitted) {
-    accumulator.refusals.push(
+    appendData(
+      accumulator.refusals,
       riskRefusal(
         "RISK_ALLOCATION_REFUSED",
         "the capital allocator refused this commitment",
@@ -661,7 +685,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     if (leg.action !== "SELL" || leg.side === undefined) continue;
     const held = heldShares(data.portfolio, leg.marketId, leg.side);
     if (compareDecimal(leg.shares, held) > 0) {
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_SELL_EXCEEDS_INVENTORY",
           "a sell leg exceeds the confirmed holding (§6 invariant 10: exit quantity is based on confirmed actual allocation, never requested entry size)",
@@ -677,7 +702,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     for (const marketId of view.marketIds) {
       const held = heldBothSides(data, marketId);
       if (compareDecimal(held.yes, "0") === 0 && compareDecimal(held.no, "0") === 0) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_POSITION_STATE_UNKNOWN",
             "a reduction was requested for a market the supplied portfolio holds no position in; §6 invariant 12 requires cancel and reconciliation before any protected reduction",
@@ -698,7 +724,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     }
     const projected = addDecimal(worseSide, bidShares);
     if (compareDecimal(projected, data.intent.maximumInventory) > 0) {
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_QUOTE_MAX_INVENTORY_EXCEEDED",
           "the quote's fully-filled bid ladder would carry inventory above the intent's own maximumInventory",
@@ -740,7 +767,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     }
     if (policy.limits.maxOrderNotional !== undefined) {
       if (compareDecimal(view.boundedCost, policy.limits.maxOrderNotional) > 0) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_PER_ORDER_NOTIONAL_EXCEEDED",
             "the intent's bounded notional exceeds the per-order notional limit",
@@ -749,21 +777,21 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
         );
       }
     }
-    accumulator.refusals.push(
-      ...checkExposureLimits(policy.limits, data.exposures, {
-        strategyInstanceId: data.context.strategyInstanceId,
-        perMarketContribution,
-        scopeByMarket,
-        totalContribution: view.boundedCost,
-      }),
-    );
+    const exposureRefusals = checkExposureLimits(policy.limits, data.exposures, {
+      strategyInstanceId: data.context.strategyInstanceId,
+      perMarketContribution,
+      scopeByMarket,
+      totalContribution: view.boundedCost,
+    });
+    for (const refusal of exposureRefusals) appendData(accumulator.refusals, refusal);
   }
 
   // --- §9.8 check 16: worst-case contractual loss — PRIMARY ----------------
   const lots = buildWorstCaseLots(data.portfolio, view);
   let worstCase: WorstCaseAssessment | undefined;
   if (lots === undefined) {
-    accumulator.refusals.push(
+    appendData(
+      accumulator.refusals,
       riskRefusal(
         "RISK_WORST_CASE_UNBOUNDED",
         "the intent bounds no maximum cost (no maximumBuyPrice and no maximumTotalCost), so its worst-case contractual loss is unbounded and cannot be shown to pass the primary limit",
@@ -780,7 +808,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
         compareDecimal(worstCase.maximumContractualLoss, policy.limits.maxWorstCaseContractualLoss) >
         0
       ) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_WORST_CASE_LOSS_EXCEEDED",
             "projected maximum contractual loss exceeds the primary limit (§9.8: maximum contractual loss is a primary risk measure; the unverified CANCELLED outcome is bounded by a zero-redemption floor, never valued — WP-110 register row U-10)",
@@ -805,7 +834,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
             policy.limits.maxWorstCaseResolutionLoss,
           ) > 0
         ) {
-          accumulator.refusals.push(
+          appendData(
+            accumulator.refusals,
             riskRefusal(
               "RISK_WORST_CASE_RESOLUTION_LOSS_EXCEEDED",
               "projected worst-case resolution loss over the three VERIFIED terminal outcomes exceeds its limit",
@@ -826,7 +856,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     scenario = assessScenarios(data.scenarios, lots, policy.scenario.requiredKinds);
     if (isEntry) {
       if (scenario.missingKinds.length > 0) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_SCENARIO_MISSING",
             "a required shock scenario was not supplied; an unmeasured scenario is not a passed scenario (fail closed)",
@@ -838,7 +869,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
         );
       }
       if (scenario.incompleteScenarioIds.length > 0) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_SCENARIO_MARKS_INCOMPLETE",
             "a supplied scenario does not mark every market the account holds; a partially-marked portfolio understates the loss",
@@ -850,7 +882,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
         scenario.worstLoss !== undefined &&
         compareDecimal(scenario.worstLoss, policy.scenario.maxScenarioLoss) > 0
       ) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal("RISK_SCENARIO_LOSS_EXCEEDED", "worst scenario loss exceeds its limit", {
             worstLoss: scenario.worstLoss,
             worstScenarioId: scenario.worstScenarioId,
@@ -863,7 +896,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
 
   // --- §9.8 check 18: self-trade and duplicate-intent guards ---------------
   if (view.intentId !== undefined && data.guards.recentIntentIds.includes(view.intentId)) {
-    accumulator.refusals.push(
+    appendData(
+      accumulator.refusals,
       riskRefusal("RISK_DUPLICATE_INTENT", "this intentId was already evaluated", {
         intentId: view.intentId,
       }),
@@ -880,7 +914,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
             ? resting.action === "SELL" && compareDecimal(leg.limitPrice, resting.price) >= 0
             : resting.action === "BUY" && compareDecimal(resting.price, leg.limitPrice) >= 0;
         if (crosses) {
-          accumulator.refusals.push(
+          appendData(
+            accumulator.refusals,
             riskRefusal(
               "RISK_SELF_TRADE",
               "the intent would cross the account's own resting order on the same market and token",
@@ -905,7 +940,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
   if (isEntry) {
     const available = data.rateLimit.availableRequests;
     if (available === undefined) {
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_RATE_LIMIT_UNKNOWN",
           "rate-limit headroom was not supplied; unknown headroom is not sufficient headroom (fail closed)",
@@ -913,7 +949,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
         ),
       );
     } else if (available <= policy.rateLimit.safetyReserveRequests) {
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_RATE_LIMIT_HEADROOM_INSUFFICIENT",
           "remaining rate-limit headroom is at or below the safety reserve (§6 invariant 13: safety cancellation outranks new order placement)",
@@ -931,7 +968,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
     for (const context of contexts) {
       const secondsToClose = context.secondsToClose;
       if (secondsToClose === undefined) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_TIME_TO_CLOSE_UNKNOWN",
             "time to close was not supplied for this market; unknown is not permitted (fail closed)",
@@ -941,7 +979,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
         continue;
       }
       if (secondsToClose <= policy.timeToClose.entryCutoffSeconds) {
-        accumulator.refusals.push(
+        appendData(
+          accumulator.refusals,
           riskRefusal(
             "RISK_TIME_TO_CLOSE_ENTRY_BLOCKED",
             "the market is inside the configured entry cutoff before close",
@@ -1051,7 +1090,8 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
       // Unreachable: an undefined assessment always pushes
       // RISK_WORST_CASE_UNBOUNDED above. Kept as a fail-closed backstop so a
       // future edit cannot approve without a worst-case measure.
-      accumulator.refusals.push(
+      appendData(
+        accumulator.refusals,
         riskRefusal(
           "RISK_WORST_CASE_UNBOUNDED",
           "no worst-case assessment was produced; approval without the primary measure is not available",
@@ -1064,7 +1104,7 @@ function evaluateIntentInner(policy: RiskPolicy, input: unknown): RiskEvaluation
 
   // A `CANCEL` returned at the choke point above and never reaches here.
   const reasons: RiskReasonCode[] = ["RISK_APPROVED"];
-  if (view.disposition === "EXIT") reasons.push("RISK_EXIT_CAPACITY_CHECKS_INAPPLICABLE");
+  if (view.disposition === "EXIT") appendData(reasons, "RISK_EXIT_CAPACITY_CHECKS_INAPPLICABLE");
 
   // THE EMISSION BOUNDARY, as above: no path in this package returns a record
   // it has not walked.

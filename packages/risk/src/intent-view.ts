@@ -53,6 +53,7 @@ import type {
 
 import { deepFreeze } from "./guards.js";
 import type { PortfolioView } from "./inputs.js";
+import { appendData } from "./plain-data.js";
 import { riskRefusal, type RiskRefusal } from "./result.js";
 
 /** How the pipeline treats this intent. See the module header table. */
@@ -164,7 +165,7 @@ export function buildIntentView(
         const held = heldShares(portfolio, intent.marketId, side);
         const excess = subtractFloorZero(held, absDecimal(intent.targetShares));
         if (compareDecimal(excess, "0") > 0) {
-          legs.push(sellLeg(intent.marketId, side, excess, intent.minimumSellPrice));
+          appendData(legs, sellLeg(intent.marketId, side, excess, intent.minimumSellPrice));
         }
       }
       break;
@@ -179,7 +180,8 @@ export function buildIntentView(
           ? intent.targetShares
           : subDecimal(intent.targetShares, held);
       if (compareDecimal(delta, "0") === 0) {
-        refusals.push(
+        appendData(
+          refusals,
           riskRefusal(
             "RISK_ZERO_DELTA",
             "the position intent resolves to a zero share delta; there is nothing to execute",
@@ -194,7 +196,7 @@ export function buildIntentView(
           intent.maximumBuyPrice === undefined
             ? undefined
             : mulDecimal(intent.maximumBuyPrice, shares);
-        legs.push({
+        appendData(legs, {
           marketId: intent.marketId,
           side: intent.direction,
           action: "BUY",
@@ -203,7 +205,10 @@ export function buildIntentView(
           boundedCost: tightest(byPrice, intent.maximumTotalCost),
         });
       } else {
-        legs.push(sellLeg(intent.marketId, intent.direction, shares, intent.minimumSellPrice));
+        appendData(
+          legs,
+          sellLeg(intent.marketId, intent.direction, shares, intent.minimumSellPrice),
+        );
       }
       break;
     }
@@ -212,7 +217,7 @@ export function buildIntentView(
       marketIds = [intent.marketId];
       for (const bid of intent.bids) {
         if (compareDecimal(bid.shares, "0") === 0) continue;
-        legs.push({
+        appendData(legs, {
           marketId: intent.marketId,
           // §7.7's `QuoteLevel` names no outcome token — see the module header.
           side: undefined,
@@ -224,7 +229,7 @@ export function buildIntentView(
       }
       for (const ask of intent.asks) {
         if (compareDecimal(ask.shares, "0") === 0) continue;
-        legs.push(sellLeg(intent.marketId, undefined, ask.shares, ask.price));
+        appendData(legs, sellLeg(intent.marketId, undefined, ask.shares, ask.price));
       }
       break;
     }
@@ -237,7 +242,8 @@ export function buildIntentView(
         if (compareDecimal(shares, "0") === 0) continue;
         if (compareDecimal(leg.targetShares, "0") > 0) {
           if (leg.maximumBuyPrice === undefined) {
-            refusals.push(
+            appendData(
+              refusals,
               riskRefusal(
                 "RISK_BASKET_LEG_UNBOUNDED",
                 "a buying basket leg carries no maximumBuyPrice, so its contractual cost is unbounded (§9.10: a coordinated basket is not atomic — each leg's own risk must be bounded)",
@@ -246,7 +252,7 @@ export function buildIntentView(
             );
             continue;
           }
-          legs.push({
+          appendData(legs, {
             marketId: leg.marketId,
             side: leg.direction,
             action: "BUY",
@@ -256,7 +262,7 @@ export function buildIntentView(
           });
           continue;
         }
-        legs.push(sellLeg(leg.marketId, leg.direction, shares, leg.minimumSellPrice));
+        appendData(legs, sellLeg(leg.marketId, leg.direction, shares, leg.minimumSellPrice));
       }
       break;
     }

@@ -53,6 +53,7 @@ import {
 import { z } from "zod";
 
 import { deepFreeze } from "./guards.js";
+import { appendData } from "./plain-data.js";
 
 /**
  * Verified per-share payouts, mirroring `packages/settlement/src/payout.ts`
@@ -219,7 +220,7 @@ export function assessWorstCase(lots: readonly MarketHoldingLot[]): WorstCaseAss
       }
     }
     worstVerifiedTotal = addDecimal(worstVerifiedTotal, worstValue);
-    perMarket.push({
+    appendData(perMarket, {
       marketId: lot.marketId,
       yesShares: lot.yesShares,
       noShares: lot.noShares,

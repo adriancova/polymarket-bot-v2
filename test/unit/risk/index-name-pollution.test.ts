@@ -40,14 +40,41 @@
  */
 import { describe, expect, it } from "vitest";
 
+import { resizeApprovedIntent } from "../../../packages/risk/src/approved-intent.js";
+import { checkExposureLimits } from "../../../packages/risk/src/exposure-limits.js";
+import { assessFreshness } from "../../../packages/risk/src/freshness.js";
+import {
+  RiskEvaluationInputSchema,
+  validateEvaluationInput,
+} from "../../../packages/risk/src/inputs.js";
+import { buildIntentView } from "../../../packages/risk/src/intent-view.js";
+import { buildWorstCaseLots } from "../../../packages/risk/src/lots.js";
 import {
   MAX_DEPTH,
   ownDataDetails,
   readPlainData,
   withSchemaDefaults,
 } from "../../../packages/risk/src/plain-data.js";
+import { assessScenarios } from "../../../packages/risk/src/scenario.js";
+import { prototypeFreeParser } from "../../../packages/risk/src/schema-arena.js";
+import {
+  assessWorstCase,
+  type MarketHoldingLot,
+} from "../../../packages/risk/src/worst-case.js";
 import { evaluateIntent } from "../../../packages/risk/src/index.js";
-import { entryInput, exitInput, riskPolicy } from "./fixtures.js";
+import {
+  INSTANCE,
+  MARKET_A,
+  MARKET_B,
+  allScenarios,
+  entryInput,
+  exitInput,
+  exposureSnapshot,
+  freshObservations,
+  position,
+  positionIntent,
+  riskPolicy,
+} from "./fixtures.js";
 
 /** Appends with `CreateDataProperty` semantics — never `push`. See the header. */
 function appendData<T>(target: T[], value: T): void {
@@ -111,6 +138,17 @@ const INDEX_NAMES: readonly string[] = ["0", "1", "2", "6"];
 
 interface Door {
   readonly name: string;
+  /**
+   * The door's accumulator is CONSUMED rather than returned, so its answer
+   * carries no populated array and the shape-based non-vacuity check below
+   * cannot see it. Declared per door rather than inferred, because "the answer
+   * has no array" is exactly what a vacuous row looks like too. Exactly one
+   * door is like this (`assessFreshness` folds `bookAges`/`referenceAges`/
+   * `featureAges` into three findings), and its appends are proved by the base
+   * measurement instead: it diverges at `88e3a5b` under all three
+   * `Set`-defeating shapes at `"0"`.
+   */
+  readonly internalAccumulator?: true;
   /** Any value: {@link quietly} encodes it, so a door may answer in its own shape. */
   readonly run: () => unknown;
 }
@@ -217,19 +255,205 @@ const DOORS: readonly Door[] = [
 ];
 
 /**
- * The package's PUBLIC composite door, measured SEPARATELY and to a weaker
- * claim — because that is what is true, and this round's grant is one file.
+ * THE OTHER TEN MODULES, EACH CALLED DIRECTLY (`WP-180-FU3`).
  *
- * `evaluateIntent` runs `plain-data.ts` and then eight other modules
- * (`engine.ts`, `exposure-limits.ts`, `guards.ts`, `intent-view.ts`,
- * `lots.ts`, `recommendations.ts`, `scenario.ts`, `worst-case.ts`) and the
- * `zod` arena, and every one of those still accumulates with
- * `Array.prototype.push` — including `zod`'s own `issues: []`. So the composite
- * still MOVES at an index name. What is asserted here is ADR-020 §6's bound
- * rather than byte-identity: **no PERMISSION move and no ESCAPE**, and the
- * moves that remain are enumerated by class so they cannot grow silently.
- * `packages/risk/src/plain-data.ts` is this round's only `packages/risk` path;
- * the rest of the append surface is a named follow-up.
+ * `WP-020-FU1` closed `plain-data.ts` and left this as its named successor
+ * obligation: **77** further `.push(` sites, in ten modules the composite probe
+ * below can only reach through `evaluateIntent`, where one refusal hides every
+ * accumulator behind it. These doors are called directly instead, so each
+ * module's own accumulator is the thing under test, and every module with a
+ * converted site is represented — the mapping is stated per row so a module
+ * that loses its coverage loses it visibly:
+ *
+ * ```text
+ *   freshness        3 sites   assessFreshness            bookAges/referenceAges/featureAges
+ *   intent-view      9         buildIntentView            legs, refusals
+ *   lots             1         buildWorstCaseLots         built
+ *   worst-case       1         assessWorstCase            perMarket
+ *   scenario         1         assessScenarios            unmarkedMarketIds
+ *   exposure-limits  5         checkExposureLimits        refusals
+ *   inputs           1         validateEvaluationInput    refusals
+ *   approved-intent  8         resizeApprovedIntent       refusals
+ *   schema-arena     1         prototypeFreeParser        items (a def slot's array)
+ *   engine          47         evaluateIntent             refusals, recommendations, contexts, reasons, legs
+ * ```
+ *
+ * WHICH ROWS ARE HELD TO BYTE-IDENTITY, AND WHY THE OTHERS ARE NOT. The first
+ * six modules compute with nothing but their own accumulators and
+ * `packages/decimal` (itself closed by `WP-020-FU1`), so they are held to
+ * BYTE-IDENTITY: {@link MODULE_DOORS}. The last four reach `zod` — whose OWN
+ * arrays are the residual this round does not own, measured in two places:
+ * `payload.issues.push(…)` and `handleArrayResult`'s `final.value[index] = …`
+ * into a `payload.value = Array(input.length)` container. They are held to the
+ * §6 BOUND instead: {@link ZOD_BOUNDED_DOORS}. `schema-arena`'s single site is
+ * BUILD-TIME ONLY (`arenaSlot` runs while `prototypeFreeParser` constructs a
+ * copy, which every door in this repository does at module load, in a clean
+ * process, by that module's own design) and has no runtime route at all, so it
+ * is stated rather than swept — see the test that says so.
+ *
+ * REPRODUCE-FIRST. At base `88e3a5b` the byte-identity table below is NOT
+ * empty; at this tip it is. The engine row is the composite and keeps its own
+ * weaker claim (see `COMPOSITE_PROBES`), for the same `zod` reason.
+ */
+const MODULE_DOORS: readonly Door[] = [
+  {
+    name: "freshness.assessFreshness",
+    internalAccumulator: true,
+    run: () =>
+      assessFreshness(freshObservations(MARKET_A) as never, riskPolicy().freshness, MARKET_A),
+  },
+  {
+    name: "intent-view.buildIntentView(position)",
+    run: () => buildIntentView(positionIntent() as never, { positions: [], openOrders: [] } as never),
+  },
+  {
+    name: "intent-view.buildIntentView(refusing)",
+    run: () =>
+      buildIntentView(positionIntent({ targetShares: "0" }) as never, {
+        positions: [],
+        openOrders: [],
+      } as never),
+  },
+  { name: "lots.buildWorstCaseLots", run: () => lotsFixture() },
+  { name: "worst-case.assessWorstCase", run: () => assessWorstCase(lotsFixture()) },
+  {
+    name: "scenario.assessScenarios",
+    run: () => assessScenarios(allScenarios() as never, lotsFixture(), []),
+  },
+  {
+    // A SPARSE snapshot, deliberately: the absent-snapshot arm returns an array
+    // LITERAL and never touches the accumulator, so a probe built on it would
+    // measure nothing. A snapshot that is present but does not measure the
+    // queried scopes drives `entryMissing` through the module's own `push`
+    // helper — the five converted sites.
+    name: "exposure-limits.checkExposureLimits(sparse snapshot)",
+    run: () =>
+      checkExposureLimits(
+        riskPolicy({
+          limits: {
+            maxWorstCaseContractualLoss: "10000",
+            globalExposureCap: "500",
+            perInstanceExposureCap: "500",
+            perMarketExposureCap: "500",
+            perSeriesExposureCap: "500",
+          },
+        }).limits,
+        exposureSnapshot() as never,
+        {
+          strategyInstanceId: INSTANCE,
+          perMarketContribution: new Map([
+            [MARKET_A, "10" as never],
+            [MARKET_B, "10" as never],
+          ]),
+          scopeByMarket: new Map([[MARKET_A, { seriesKey: "btc-15m" } as never]]),
+          totalContribution: "20" as never,
+        },
+      ),
+  },
+];
+
+/**
+ * The three doors whose accumulators are closed but whose PARSE is `zod`'s.
+ *
+ * Their own `.push(` sites are converted like every other module's; what still
+ * moves under them is the library's array handling (module comment above). They
+ * are therefore held to ADR-020 §6's bound — no PERMISSION move, no ESCAPE —
+ * exactly as the composite is, and NOT to byte-identity, because that claim
+ * would be false and this file's whole discipline is not to make one.
+ */
+const ZOD_BOUNDED_DOORS: readonly Door[] = [
+  { name: "inputs.validateEvaluationInput(valid)", run: () => validateEvaluationInput(entryInput()) },
+  {
+    name: "inputs.validateEvaluationInput(refusing)",
+    run: () => validateEvaluationInput({ intent: 1 }),
+  },
+  { name: "approved-intent.resizeApprovedIntent(refusing)", run: () => resizeFixture() },
+];
+
+/** `buildWorstCaseLots` on a portfolio that holds both markets. */
+function lotsFixture(): readonly MarketHoldingLot[] {
+  const portfolio = {
+    positions: [position(), position({ marketId: MARKET_B })],
+    openOrders: [],
+  };
+  const view = buildIntentView(positionIntent() as never, portfolio as never).view;
+  const built = buildWorstCaseLots(portfolio as never, view);
+  // `undefined` means "the view is not one this module can build lots for",
+  // which would make every row that consumes this vacuous — so it is a failure
+  // of the FIXTURE, stated here rather than absorbed by a `?? []`.
+  if (built === undefined) throw new Error("the lots fixture built no lots");
+  return built;
+}
+
+/**
+ * `resizeApprovedIntent` on a HAND-BUILT record that refuses — the shape that
+ * drives `approved-intent.ts`'s refusal accumulator without needing the engine
+ * to approve first (which would make the row a composite probe again).
+ */
+function resizeFixture(): unknown {
+  return resizeApprovedIntent({ lineage: "ORIGINAL" } as never, {
+    approvedIntentId: "01890000-0000-7000-8000-0000000000ab",
+    resizedAt: "2026-09-03T12:00:01.000Z",
+    newTargetShares: "50",
+    reason: "shrink",
+  });
+}
+
+/**
+ * The arena's own append: `arenaSlot` copies a definition slot that is an ARRAY
+ * (a `checks` list) one element at a time. Building a copy is what exercises
+ * it, and building is the only thing that does.
+ */
+function arenaBuild(): unknown {
+  return prototypeFreeParser(RiskEvaluationInputSchema) !== undefined;
+}
+
+/**
+ * The package's PUBLIC composite door, measured SEPARATELY and to a weaker
+ * claim — because that is what is still true.
+ *
+ * `WP-020-FU1` wrote here that `evaluateIntent` "runs `plain-data.ts` and then
+ * eight other modules … and every one of those still accumulates with
+ * `Array.prototype.push`". `WP-180-FU3` closed that: all **77** `.push(` sites
+ * in the other TEN modules are `CreateDataProperty` appends through the one
+ * exported `appendData` primitive `plain-data.ts` already used, and the
+ * divergence census moved from **21 rows to 18** on EACH intrinsic (the three
+ * killed rows are
+ * quoted at the battery below, and they are the ones that were corrupting a
+ * refusal vocabulary rather than merely refusing).
+ *
+ * WHAT REMAINS IS NOT THIS PACKAGE'S, AND IT IS NAMED. The 18 survivors are
+ * the library's own array assembly — TWO sites, not one, both in the same
+ * fail-closed direction (the second measured by review round 1): a WARMED
+ * schema's `handleArrayResult` does `final.value[index] =
+ * result.value` (`zod@4.4.3`, `v4/core/schemas.js:678`) into the container
+ * `$ZodArray` allocated one line earlier as `payload.value = Array(input.length)`
+ * — a SPARSE ordinary array. `schema-arena.ts` substitutes a prototype-free
+ * container only for a FRESH EMPTY one (`isFreshOrdinaryContainer` requires
+ * `length === 0`, deliberately: it replaces the assembly container and nothing
+ * else), so a non-empty array's assembly still writes through
+ * `Array.prototype`. Measured, with the stack, at this tip:
+ *
+ * ```text
+ * TypeError: Cannot set property 0 of #<Object> which has only a getter
+ *   at handleArrayResult (zod/v4/core/schemas.js:678:24)
+ *   at inst._zod.parse   (zod/v4/core/schemas.js:705:17)   ← $ZodArray
+ *   at copy._zod.run     (packages/risk/src/schema-arena.ts)
+ * ```
+ *
+ * A COLD schema (first parse) throws one stop earlier instead: `Doc.write`
+ * (`zod/v4/core/doc.js:24:26`) reached via `generateFastpass`
+ * (`schemas.js:878`), before `handleArrayResult` runs. Same class, same
+ * fail-closed direction; the enumeration was corrected from "one line" to
+ * these two sites by review round 1 (its own stack capture).
+ *
+ * Widening the predicate would make every parsed ARRAY OUTPUT prototype-free
+ * for every consumer of the shared arena (`capital-allocator`, `ledger`, `pnl`,
+ * `strategy-runtime`), which is a behaviour change to four merged packages and
+ * not this round's grant. It is reported as a follow-up instead. So what is
+ * asserted here is still ADR-020 §6's bound rather than byte-identity: **no
+ * PERMISSION move and no ESCAPE**, with the surviving class enumerated so it
+ * cannot grow silently.
  */
 const COMPOSITE_PROBES: readonly Door[] = [
   { name: "evaluateIntent(entry)", run: () => evaluateIntent(POLICY, entryInput()) },
@@ -271,9 +495,9 @@ interface Divergence {
   readonly polluted: string;
 }
 
-function sweep(target: object): readonly Divergence[] {
+function sweep(target: object, doors: readonly Door[] = DOORS): readonly Divergence[] {
   const baseline = new Map<string, string>();
-  for (const door of DOORS) baseline.set(door.name, quietly(door.run));
+  for (const door of doors) baseline.set(door.name, quietly(door.run));
   const moved: Divergence[] = [];
   for (const property of INDEX_NAMES) {
     for (const shape of SHAPES) {
@@ -281,7 +505,7 @@ function sweep(target: object): readonly Divergence[] {
       try {
         Object.defineProperty(target, property, shape.descriptor());
         installed = true;
-        for (const door of DOORS) {
+        for (const door of doors) {
           const polluted = quietly(door.run);
           const clean = baseline.get(door.name) ?? "";
           if (polluted !== clean) {
@@ -301,6 +525,21 @@ function sweep(target: object): readonly Divergence[] {
   return moved;
 }
 
+/** How many NON-EMPTY arrays a door's answer carries, at any depth. */
+function populatedArrays(value: unknown, depth = 0): number {
+  if (depth > 8 || value === null || typeof value !== "object") return 0;
+  let found = 0;
+  if (Array.isArray(value)) {
+    if (value.length > 0) found += 1;
+    for (const member of value) found += populatedArrays(member, depth + 1);
+    return found;
+  }
+  for (const member of Object.values(value as Record<string, unknown>)) {
+    found += populatedArrays(member, depth + 1);
+  }
+  return found;
+}
+
 function render(moved: readonly Divergence[]): readonly string[] {
   return moved.map(
     (one) =>
@@ -318,16 +557,104 @@ describe("THE BOUND at an index name: neither permission nor availability varies
     // found before `Object.prototype` is consulted at all.
     expect(render(sweep(Array.prototype))).toEqual([]);
   });
+
+  it("every SELF-CONTAINED module's own door is byte-identical too (`Object.prototype`)", () => {
+    // `WP-180-FU3`: the 77-site conversion, measured where it lives rather than
+    // only through `evaluateIntent`, where one refusal hides every accumulator
+    // behind it. At base `88e3a5b` this list is NOT empty.
+    expect(render(sweep(Object.prototype, MODULE_DOORS))).toEqual([]);
+  });
+
+  it("every SELF-CONTAINED module's own door is byte-identical too (`Array.prototype`)", () => {
+    expect(render(sweep(Array.prototype, MODULE_DOORS))).toEqual([]);
+  });
+
+  it("NON-VACUITY of the module table: every door really runs, and none is a no-op", () => {
+    // A door that throws in a CLEAN process would make its row trivially
+    // "identical" (the same throw, polluted or not) and measure nothing; a door
+    // whose answer carries NO populated array never reached an append, which is
+    // the same vacuity one level down (it is how the first draft of the
+    // `exposure-limits` row was caught: its absent-snapshot arm returns an
+    // array literal and never touches the accumulator).
+    for (const door of [...MODULE_DOORS, ...ZOD_BOUNDED_DOORS]) {
+      const clean = quietly(door.run);
+      expect(clean.startsWith("THREW"), `${door.name} throws in a clean process: ${clean}`).toBe(
+        false,
+      );
+      if (door.internalAccumulator === true) continue;
+      expect(populatedArrays(door.run()), `${door.name} appended nothing`).toBeGreaterThan(0);
+    }
+    // The exemption is CLOSED: exactly one door claims it, by name.
+    expect(
+      [...MODULE_DOORS, ...ZOD_BOUNDED_DOORS]
+        .filter((door) => door.internalAccumulator === true)
+        .map((door) => door.name),
+    ).toEqual(["freshness.assessFreshness"]);
+    // …and the modules the two tables claim to cover are all named in them, so
+    // a module that silently loses its row fails HERE.
+    const named = [...MODULE_DOORS, ...ZOD_BOUNDED_DOORS].map((door) => door.name.split(".")[0]);
+    expect([...new Set(named)].sort()).toEqual([
+      "approved-intent",
+      "exposure-limits",
+      "freshness",
+      "inputs",
+      "intent-view",
+      "lots",
+      "scenario",
+      "worst-case",
+    ]);
+  });
+});
+
+describe("the `zod`-bounded doors: the §6 bound, and the library's arrays named", () => {
+  it("never moves PERMISSION and never lets a throw escape, on either intrinsic", () => {
+    for (const target of [Object.prototype, Array.prototype]) {
+      for (const row of render(sweep(target, ZOD_BOUNDED_DOORS))) {
+        // Every survivor is a refusal turning into another refusal, or an
+        // acceptance turning into a refusal. Never the other direction, and
+        // never an escape: `quietly` renders a throw as `THREW …`, and the
+        // package's own containment means one never reaches it.
+        expect(row, row).not.toContain("-> THREW");
+        expect(row, row).not.toMatch(/: \{"ok":false.* -> \{"ok":true/u);
+      }
+    }
+  });
+
+  it("NON-VACUITY: the class is real here — these doors DO still move", () => {
+    // If the library is ever fixed (or the arena's container substitution is
+    // widened, the named follow-up), this fails and the rows above should be
+    // promoted to byte-identity rather than left describing a fiction.
+    expect(render(sweep(Object.prototype, ZOD_BOUNDED_DOORS)).length).toBeGreaterThan(0);
+  });
+});
+
+describe("`schema-arena`'s single site is BUILD-TIME, and building is clean by design", () => {
+  it("a copy built in a clean process is what every door in this repository holds", () => {
+    // The arena's contract (module header): a schema it cannot copy is a BUILD
+    // failure rather than an unprotected parse, and every consumer builds its
+    // copy at module load. `arenaSlot`'s converted append therefore has no
+    // runtime route — there is no caller that can reach it under pollution
+    // without first having polluted the intrinsics before this module loaded,
+    // at which point `warmNode` has already failed the build loudly.
+    expect(arenaBuild()).toBe(true);
+    // Non-vacuity of the claim that building is the only route: a BUILT copy
+    // parses without ever appending through `arenaSlot` again.
+    const copy = prototypeFreeParser(RiskEvaluationInputSchema) as unknown as {
+      safeParse: (value: unknown) => { success: boolean };
+    };
+    expect(copy.safeParse({}).success).toBe(false);
+  });
 });
 
 /**
  * The composite door, measured to ADR-020 §6's bound and its remainder
  * ENUMERATED.
  *
- * This is the honest edge of the round. `plain-data.ts` is closed; the rest of
- * the package is not, and pretending otherwise would repeat exactly the mistake
- * `WP-200-FU1` review round 1 found ("a pass-through for every legitimate
- * call", measurably false at `"0"`). What holds is the bound.
+ * This is the honest edge of the round. `packages/risk` is closed — all eleven
+ * modules — and `zod`'s array assembly is not, and pretending otherwise would
+ * repeat exactly the mistake `WP-200-FU1` review round 1 found ("a pass-through
+ * for every legitimate call", measurably false at `"0"`). What holds is the
+ * bound.
  */
 describe("the composite door: the §6 bound holds, and the remainder is stated", () => {
   const compositeSweep = (): { readonly permission: string[]; readonly kinds: Set<string> } => {
@@ -377,31 +704,36 @@ describe("the composite door: the §6 bound holds, and the remainder is stated",
     expect([...kinds].sort()).not.toContain("NONDETERMINISTIC");
   });
 
-  it("the remainder is exactly AVAILABILITY, and it is NOT empty", () => {
-    // Non-vacuity in the other direction: this class is REAL and OPEN, and the
-    // day the rest of the package's append surface is widened this test must be
-    // deleted rather than left describing a fiction.
+  it("the remainder is exactly AVAILABILITY, and it is THIRD-PARTY (`WP-180-FU3`)", () => {
+    // THE ROW THIS REPLACES, AND WHY IT WAS DELETED. `WP-020-FU1` wrote a row
+    // here titled "the remainder is exactly AVAILABILITY, and it is NOT empty",
+    // whose own comment said: "the day the rest of the package's append surface
+    // is widened this test must be deleted rather than left describing a
+    // fiction". That day is this round. The row enumerated THREE refusal
+    // vocabularies; two of them were `packages/risk` accumulators corrupting
+    // under the get/set shape (where every ordinary array in the process shares
+    // one backing slot) and they are GONE:
     //
-    // MEASURED at this tip, and narrower than the class was before the fix: an
-    // already-refused evaluation keeps its refusal CODES (so there is no
-    // COMPOSITION move left at all), and what remains is only that an APPROVED
-    // evaluation becomes a refused one — fail-closed, at an index name, from
-    // the eight modules and the `zod` arena this round's grant does not reach.
+    //   deleted  REFUSED RISK_TIME_TO_CLOSE_UNKNOWN,RISK_TRADING_PARAMETERS_UNKNOWN,undefined
+    //   deleted  REFUSED RISK_TRADING_PARAMETERS_UNKNOWN,undefined
+    //
+    // A refusal list containing the literal `undefined` was never a refusal
+    // this package can emit — it was an accumulator reading a polluted slot —
+    // so those two rows are the measured behaviour change, not a count.
+    //
+    // WHAT IS LEFT is one vocabulary and one cause, both named in the block
+    // comment above `COMPOSITE_PROBES`: `zod`'s own `handleArrayResult` writing
+    // into `Array(input.length)`. It is still AVAILABILITY (an APPROVED
+    // evaluation becomes a refused one, fail-closed), still no COMPOSITION move
+    // at all, and it is NOT empty — asserted in both directions so neither a
+    // silent regrowth nor a silent library fix passes unnoticed.
     const { kinds, permission } = compositeSweep();
     expect(permission.length).toBeGreaterThan(0);
     expect([...kinds].sort()).toEqual(["AVAILABILITY"]);
     for (const row of permission) expect(row, row).toContain("APPROVED -> REFUSED");
-    // The refusal vocabulary the remainder can produce, ENUMERATED so a new one
-    // fails here. The third row is the get/set shape, where every array in the
-    // process shares one backing slot, so the failure surfaces as the two
-    // "unknown" market facts plus one refusal that is not a refusal at all.
     expect(
       [...new Set(permission.map((row) => row.slice(row.indexOf("-> ") + 3)))].sort(),
-    ).toEqual([
-      "REFUSED RISK_INPUT_INVALID",
-      "REFUSED RISK_TIME_TO_CLOSE_UNKNOWN,RISK_TRADING_PARAMETERS_UNKNOWN,undefined",
-      "REFUSED RISK_TRADING_PARAMETERS_UNKNOWN,undefined",
-    ]);
+    ).toEqual(["REFUSED RISK_INPUT_INVALID"]);
   });
 });
 

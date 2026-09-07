@@ -18,9 +18,13 @@
  *    worse defect than the one being fixed. Asserted by showing that the
  *    ORIGINAL schema still has the library's behaviour under pollution while the
  *    copy does not.
- * 3. **THE WALK IS CLOSED.** `ARENA_NODE_TYPES` must be exactly the set of node
- *    types the door schemas contain — in both directions — and a schema
- *    carrying anything else must fail the build rather than parse unprotected.
+ * 3. **THE WALK IS CLOSED.** `ARENA_NODE_TYPES` must cover every node type the
+ *    door schemas contain, and carry nothing else except the FORWARD-DECLARED
+ *    set named below; a schema carrying an unknown type must fail the build
+ *    rather than parse unprotected. The measurement each forward-declared entry
+ *    owes lives in `packages/risk/src/schema-arena-null.test.ts`, colocated
+ *    with the module because `zod` is a dependency of that PACKAGE and is
+ *    deliberately not resolvable from this shared test tree (`WP-180-FU3`).
  *
  * The behavioural property itself ("an inherited setter changes no answer") is
  * enforced door by door in `inherited-state.test.ts`; this file is about the
@@ -392,18 +396,50 @@ describe("the arena's walk is closed, and fails the build rather than parsing un
     return [...found].sort();
   }
 
-  it("ARENA_NODE_TYPES is exactly what the door schemas contain, in both directions", () => {
-    const present = nodeTypesOf([
-      RiskEvaluationInputSchema,
-      RiskPolicySchema,
-      ApprovedIntentRecordSchema,
-      ResizeRequestSchema,
-      AllocatorStateInputSchema,
-      ReservationRequestSchema,
-      AllocatorCapsSchema,
-    ]);
+  /**
+   * Types the arena declares BEFORE a door uses one — closed, and each owing a
+   * measurement in this file (`WP-180-FU3`).
+   *
+   * The list used to be asserted EQUAL to the set the door schemas contain,
+   * which is the right guard in one direction (a type a door contains and the
+   * arena cannot copy must fail the build) and too strong in the other: two
+   * merged packages carry workarounds — `packages/strategy-runtime`'s
+   * `modelOutputs` split and `apps/control-api`'s `z.literal(null)` (WP-240 D6)
+   * — that exist ONLY because `"null"` was absent, and neither can be retired
+   * until it is present. So the second direction is now "present in a door, OR
+   * named here" and this set is asserted to be exactly `["null"]`: the list
+   * still cannot drift into aspiration one entry at a time, because growing it
+   * means editing this line and adding the measurement the entry owes.
+   */
+  const FORWARD_DECLARED: readonly string[] = ["null"];
+
+  const DOOR_SCHEMAS: readonly unknown[] = [
+    RiskEvaluationInputSchema,
+    RiskPolicySchema,
+    ApprovedIntentRecordSchema,
+    ResizeRequestSchema,
+    AllocatorStateInputSchema,
+    ReservationRequestSchema,
+    AllocatorCapsSchema,
+  ];
+
+  it("ARENA_NODE_TYPES covers every type the door schemas contain", () => {
+    const present = nodeTypesOf(DOOR_SCHEMAS);
     expect(present.length).toBeGreaterThan(8);
-    expect([...ARENA_NODE_TYPES].sort()).toEqual(present);
+    for (const type of present) {
+      expect(ARENA_NODE_TYPES, `a door contains "${type}" and the arena cannot copy it`).toContain(
+        type,
+      );
+    }
+  });
+
+  it("…and carries nothing a door does not contain, except the forward-declared set", () => {
+    const present = new Set(nodeTypesOf(DOOR_SCHEMAS));
+    const unused = [...ARENA_NODE_TYPES].filter((type) => !present.has(type)).sort();
+    expect(unused).toEqual([...FORWARD_DECLARED].sort());
+    // The forward-declared set is CLOSED, by name, so a second entry is a
+    // deliberate edit here rather than a quiet addition to the source list.
+    expect(FORWARD_DECLARED).toEqual(["null"]);
   });
 
   it("a node type the arena cannot copy is a BUILD failure, not a silent parse", () => {

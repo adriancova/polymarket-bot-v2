@@ -52,6 +52,9 @@
  * `Array.prototype` fallback, `Array.prototype` itself fail-closed — is
  * recorded at `packages/decimal/src/prototype-guard.ts`.
  */
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -515,5 +518,234 @@ describe("`divDecimal` explicit options: own data only, typed refusals (GOV-2A f
     }
     expect(clean).toBe("0.6667");
     expect(polluted).toBe("0.6667");
+  });
+});
+
+/**
+ * THE REFUSAL PATH'S RESTORATION, UNDER MIXED DUAL-INTRINSIC POLLUTION.
+ *
+ * `WP-020-FU1` review round 2, residual **LOW-1**: "the refusal path's
+ * restoration is unpinned under dual-intrinsic pollution (shipped code verified
+ * correct by direct state observation; one probe mode + one battery row owed —
+ * fold into the risk remainder round)". This is that probe mode and that row.
+ *
+ * WHAT WAS UNPINNED, PRECISELY. The battery above pins restoration on the two
+ * paths that RETURN — success and throw — and it can only use CONFIGURABLE
+ * shapes, because a non-configurable one cannot be removed and would poison the
+ * worker (this file's SCOPE note). But the REFUSAL path is reachable ONLY from
+ * a non-configurable shape: `withNeutralIndexNames` calls `refuse` exactly when
+ * a name can be neither redefined in place nor shadowed one link down. So the
+ * one path that runs `undoAll` and then does NOT run the operation had no
+ * coverage of its own — and the states that reach it are the states where the
+ * guard has done the MOST work, because it may have neutralized names in place
+ * on one intrinsic and CREATED a shadow on the other before discovering that a
+ * third name is hopeless. Every one of those has to come back exactly.
+ *
+ * WHY A CHILD PROCESS, AND WHY ITS SOURCE IS HERE. Same reason as
+ * `unneutralizable-shapes.test.ts`: the shapes are permanent. That file's probe
+ * (`prototype-shape-probe.ts`) installs ONE property on ONE intrinsic, which is
+ * exactly what a DUAL-intrinsic state is not, so this row carries its own probe
+ * source and runs it with `node --input-type=module --eval`. No file is added,
+ * and the sibling probe is not changed; the child resolves the package's
+ * `./x.js` specifiers onto its `./x.ts` sources with the same `registerHooks`
+ * shim, because `packages/decimal` has no build step.
+ *
+ * WHAT EACH MODE PUTS THE GUARD THROUGH — all four reach
+ * `DECIMAL_HOSTILE_PROTOTYPE`, which is asserted first, so no mode can decay
+ * into a measurement of the ordinary path:
+ *
+ * ```text
+ * A  Object.prototype["0"]  writable data, CONFIGURABLE      neutralized IN PLACE
+ *    Array.prototype["1"]   read-only data, non-configurable unneutralizable
+ * B  Object.prototype["0"]  read-only data, non-configurable SHADOWED on Array
+ *    Array.prototype["1"]   get-only accessor, non-config.   unneutralizable
+ * C  Object.prototype["1"]  get-only accessor, CONFIGURABLE  the SAME NAME on
+ *    Array.prototype["1"]   get/set pair, non-configurable   both intrinsics
+ * D  Object.prototype["5"]  read-only data, non-configurable the shadow RAISES
+ *    Array.prototype["1"]   read-only data, non-configurable Array.prototype
+ *                                                            .length 2 → 6, and
+ *                                                            the `arrayLength`
+ *                                                            undo must put it
+ *                                                            back
+ * ```
+ *
+ * Mode B is the one where a shadow exists at the moment the refusal is decided;
+ * mode D is the one that exercises the `arrayLength` undo (`WP-020-FU1` review
+ * round 1's reviewer mutation MF) on the REFUSAL path rather than only on the
+ * paths that return.
+ */
+describe("the refusal path restores BOTH intrinsics exactly (r2 LOW-1)", () => {
+  /**
+   * The child probe, as source.
+   *
+   * Written with NO template interpolation on purpose: it is embedded in this
+   * file, and a `$` followed by a brace inside it would be evaluated HERE
+   * instead of by the child. Everything variable arrives on `argv`.
+   */
+  const PROBE_SOURCE = [
+    'import { existsSync } from "node:fs";',
+    'import { registerHooks } from "node:module";',
+    'import { fileURLToPath } from "node:url";',
+    "registerHooks({",
+    "  resolve(specifier, context, nextResolve) {",
+    '    if ((specifier.startsWith("./") || specifier.startsWith("../")) && specifier.endsWith(".js")) {',
+    "      const parent = context.parentURL;",
+    '      if (parent !== undefined && parent.startsWith("file:")) {',
+    '        const candidate = new URL(specifier.slice(0, -3) + ".ts", parent);',
+    "        if (existsSync(fileURLToPath(candidate)))",
+    "          return { url: candidate.href, shortCircuit: true };",
+    "      }",
+    "    }",
+    "    return nextResolve(specifier, context);",
+    "  },",
+    "});",
+    "const args = process.argv.slice(-2);",
+    "const source = args[0];",
+    "const mode = args[1];",
+    'const arithmetic = await import(source + "/arithmetic.ts");',
+    // The descriptor is built with NO PROTOTYPE for the reason `plain-data.ts`
+    // records: a descriptor literal is read with `HasProperty`, and this is a
+    // process where the chain is the thing that is broken.
+    "function shape(kind, configurable) {",
+    "  const d = Object.create(null);",
+    '  d["enumerable"] = false;',
+    '  d["configurable"] = configurable;',
+    '  if (kind === "data-writable") { d["value"] = "9"; d["writable"] = true; }',
+    '  else if (kind === "data-readonly") { d["value"] = "9"; d["writable"] = false; }',
+    '  else if (kind === "get-only") { d["get"] = () => "9"; }',
+    '  else if (kind === "get-set") { d["get"] = () => "9"; d["set"] = () => undefined; }',
+    "  return d;",
+    "}",
+    // `push` is `Set`, and `Set` at an index name is exactly what is broken
+    // here — the sibling probe was defeated by this once while measuring it.
+    "function appendData(list, value) {",
+    "  const d = Object.create(null);",
+    '  d["value"] = value; d["writable"] = true; d["enumerable"] = true; d["configurable"] = true;',
+    "  Object.defineProperty(list, String(list.length), d);",
+    "}",
+    "function render(target, name) {",
+    "  const d = Object.getOwnPropertyDescriptor(target, name);",
+    '  if (d === undefined) return "absent";',
+    "  const fields = [];",
+    '  for (const field of ["value", "writable", "get", "set", "enumerable", "configurable"]) {',
+    "    if (!Object.hasOwn(d, field)) continue;",
+    "    const held = d[field];",
+    '    appendData(fields, field + "=" + (typeof held === "function" ? "<fn>" : String(held)));',
+    "  }",
+    '  let rendered = "";',
+    '  for (const field of fields) rendered = rendered === "" ? field : rendered + " " + field;',
+    "  return rendered;",
+    "}",
+    "const MODES = Object.create(null);",
+    'MODES["A"] = [["Object", "0", "data-writable", true], ["Array", "1", "data-readonly", false]];',
+    'MODES["B"] = [["Object", "0", "data-readonly", false], ["Array", "1", "get-only", false]];',
+    'MODES["C"] = [["Object", "1", "get-only", true], ["Array", "1", "get-set", false]];',
+    'MODES["D"] = [["Object", "5", "data-readonly", false], ["Array", "1", "data-readonly", false]];',
+    'const NAMES = ["0", "1", "2", "5"];',
+    "for (const row of MODES[mode]) {",
+    '  const target = row[0] === "Array" ? Array.prototype : Object.prototype;',
+    "  Object.defineProperty(target, row[1], shape(row[2], row[3]));",
+    "}",
+    "function snapshot() {",
+    "  const rows = Object.create(null);",
+    "  for (const name of NAMES) {",
+    '    rows["Object." + name] = render(Object.prototype, name);',
+    '    rows["Array." + name] = render(Array.prototype, name);',
+    "  }",
+    '  rows["Array.length"] = String(Array.prototype.length);',
+    '  rows["Object.names"] = Object.getOwnPropertyNames(Object.prototype).join(",");',
+    '  rows["Array.names"] = Object.getOwnPropertyNames(Array.prototype).join(",");',
+    "  return rows;",
+    "}",
+    "const before = snapshot();",
+    "let answer;",
+    "try {",
+    '  answer = "OK " + String(arithmetic.addDecimal("100", "-100"));',
+    "} catch (error) {",
+    '  answer = "THREW " + error.constructor.name + "(" +',
+    '    (typeof error.code === "string" ? error.code : "") + ")";',
+    "}",
+    "const after = snapshot();",
+    'process.stdout.write(JSON.stringify({ mode: mode, answer: answer, before: before, after: after }) + "\\n");',
+  ].join("\n");
+
+  interface ProbeAnswer {
+    readonly mode: string;
+    readonly answer: string;
+    readonly before: Record<string, string>;
+    readonly after: Record<string, string>;
+  }
+
+  const DECIMAL_SRC = fileURLToPath(new URL("../../../packages/decimal/src", import.meta.url));
+
+  const MODES = ["A", "B", "C", "D"] as const;
+
+  /** One spawn per mode, memoized: four processes for the whole block. */
+  const answers = new Map<string, ProbeAnswer>();
+  function probe(mode: string): ProbeAnswer {
+    const held = answers.get(mode);
+    if (held !== undefined) return held;
+    const printed = execFileSync(
+      process.execPath,
+      ["--input-type=module", "--eval", PROBE_SOURCE, DECIMAL_SRC, mode],
+      // The ceiling exists for the reason `WP-020-FU1` review round 1 M2 gives:
+      // a spawn that hangs under a hostile prototype must fail the gate loudly
+      // rather than sit at vitest's default.
+      { encoding: "utf8", timeout: 20_000, maxBuffer: 4 * 1024 * 1024 },
+    );
+    const parsed = JSON.parse(printed.trim()) as ProbeAnswer;
+    answers.set(mode, parsed);
+    return parsed;
+  }
+
+  it("every mode REFUSES with the typed code — no value is computed", () => {
+    for (const mode of MODES) {
+      expect(probe(mode).answer, mode).toBe(
+        "THREW HostilePrototypeError(DECIMAL_HOSTILE_PROTOTYPE)",
+      );
+    }
+  });
+
+  it("…and both intrinsics come back EXACTLY, descriptor for descriptor", () => {
+    for (const mode of MODES) {
+      const answer = probe(mode);
+      // Descriptor identity at every name the snapshot covers, on BOTH
+      // intrinsics — including names the mode does not touch, so a shadow left
+      // behind at a name nobody polluted fails here as well.
+      expect(answer.after, `mode ${mode}`).toEqual(answer.before);
+    }
+  });
+
+  it("…including `Array.prototype.length` and both own-name lists", () => {
+    // Stated separately from the deep equality above so a future rewrite of the
+    // snapshot cannot quietly drop these three. The length is the `arrayLength`
+    // undo entry; the name lists are how a leftover shadow becomes visible.
+    for (const mode of MODES) {
+      const { before, after } = probe(mode);
+      expect(after["Array.length"], `mode ${mode} length`).toBe(before["Array.length"]);
+      expect(after["Array.names"], `mode ${mode} Array names`).toBe(before["Array.names"]);
+      expect(after["Object.names"], `mode ${mode} Object names`).toBe(before["Object.names"]);
+    }
+  });
+
+  it("NON-VACUITY: the modes really are DUAL, and they are four distinct states", () => {
+    // A mode that polluted only one intrinsic, or four modes that installed the
+    // same state, would satisfy everything above while measuring one case.
+    const states: string[] = [];
+    for (const mode of MODES) {
+      const { before } = probe(mode);
+      const polluted = (prefix: string): string[] =>
+        Object.keys(before)
+          .filter((key) => key.startsWith(prefix) && !key.endsWith("names"))
+          .filter((key) => key !== "Array.length" && before[key] !== "absent");
+      const object = polluted("Object.");
+      const array = polluted("Array.");
+      expect(object.length, `mode ${mode} pollutes Object.prototype`).toBeGreaterThan(0);
+      expect(array.length, `mode ${mode} pollutes Array.prototype`).toBeGreaterThan(0);
+      states.push(
+        [...object, ...array].map((key) => `${key}=${String(before[key])}`).join(" | "),
+      );
+    }
+    expect(new Set(states).size, "the four modes are four distinct states").toBe(MODES.length);
   });
 });
