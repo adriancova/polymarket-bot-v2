@@ -8,13 +8,22 @@
  * provenance agreement. Re-implementing that routing here would give the
  * universe layer a second, drifting opinion about what a valid event is.
  *
+ * It does NOT hand on the library's output. `./envelope-door.ts` (`UNIV-2`,
+ * `schema-boundary.md` §5 item 9b) materializes the envelope prototype-free
+ * first, contains the contract's routing and refusal construction, re-states
+ * what §7.1 declares, and emits prototype-free — because an envelope-layer
+ * adoption arrives at `applyMarketLifecycleEvent` as a GENUINE OWN KEY that its
+ * own door provably cannot see. Measured at base: under a non-enumerable
+ * inherited `outcome`, an envelope whose payload carried none RESOLVED the
+ * market through the doored fold.
+ *
  * Non-lifecycle events (book, reference, feed) are refused rather than ignored:
  * a caller handing a `BookSnapshot` to the universe projection has made a wiring
  * mistake, and silence would hide it.
  */
 
-import { DOMAIN_EVENT_REGISTRY } from "@polymarket-bot/domain";
-
+import { ownRecord } from "./caller-door.js";
+import { openLifecycleEnvelope } from "./envelope-door.js";
 import { universeFailure, universeOk, universeRefusal, type UniverseResult } from "./errors.js";
 import {
   MARKET_LIFECYCLE_EVENT_TYPES,
@@ -41,18 +50,26 @@ export interface EnvelopeLifecycleInput extends MarketLifecycleInput {
 export function marketLifecycleInputFromEnvelope(
   value: unknown,
 ): UniverseResult<EnvelopeLifecycleInput> {
-  const parsed = DOMAIN_EVENT_REGISTRY.safeParseEnvelope(value);
-  if (!parsed.ok) {
+  const opened = openLifecycleEnvelope(value);
+  if (!opened.ok) {
+    if (opened.contractError !== undefined) {
+      return universeFailure(
+        universeRefusal(
+          "UNIVERSE_INPUT_INVALID",
+          `envelope failed the frozen domain contract: ${opened.contractError.message}`,
+          { errorName: opened.contractError.name },
+        ),
+      );
+    }
+    const issues = opened.issues ?? [];
     return universeFailure(
-      universeRefusal(
-        "UNIVERSE_INPUT_INVALID",
-        `envelope failed the frozen domain contract: ${parsed.error.message}`,
-        { errorName: parsed.error.name },
-      ),
+      universeRefusal("UNIVERSE_INPUT_INVALID", `envelope is invalid: ${issues.join("; ")}`, {
+        issues,
+      }),
     );
   }
 
-  const envelope = parsed.envelope;
+  const envelope = opened.value;
   if (!LIFECYCLE_EVENT_TYPES.has(envelope.eventType)) {
     return universeFailure(
       universeRefusal(
@@ -63,9 +80,14 @@ export function marketLifecycleInputFromEnvelope(
     );
   }
 
-  const payload = envelope.payload as { readonly internalMarketId?: unknown };
+  // An OWN read of the materialized payload: the door already guaranteed there
+  // is no chain here, and this keeps that guarantee visible at the call site.
+  const payload = envelope.payload as object;
+  const internalMarketId = Object.hasOwn(payload, "internalMarketId")
+    ? (payload as { readonly internalMarketId?: unknown }).internalMarketId
+    : undefined;
   /* c8 ignore next 10 -- unreachable: every lifecycle contract requires the field. */
-  if (typeof payload.internalMarketId !== "string") {
+  if (typeof internalMarketId !== "string") {
     return universeFailure(
       universeRefusal(
         "UNIVERSE_INPUT_INVALID",
@@ -75,10 +97,12 @@ export function marketLifecycleInputFromEnvelope(
     );
   }
 
-  return universeOk({
-    eventType: envelope.eventType as MarketLifecycleEventType,
-    payload: envelope.payload,
-    order: { gatewayEpoch: envelope.gatewayEpoch, ingestSeq: envelope.ingestSeq },
-    internalMarketId: payload.internalMarketId,
-  });
+  return universeOk(
+    ownRecord<EnvelopeLifecycleInput>({
+      eventType: envelope.eventType as MarketLifecycleEventType,
+      payload: envelope.payload,
+      order: envelope.order,
+      internalMarketId,
+    }),
+  );
 }

@@ -34,13 +34,15 @@ import {
 } from "@polymarket-bot/domain";
 
 import {
+  UniverseValidationError,
   universeFailure,
   universeOk,
   universeRefusal,
   type UniverseRefusal,
   type UniverseResult,
 } from "./errors.js";
-import { MarketIdentitySchema, isSameMarketIdentity, type MarketIdentity } from "./identity.js";
+import { isSameMarketIdentity, type MarketIdentity } from "./identity.js";
+import { containedParse } from "./lifecycle-door.js";
 import {
   applyMarketLifecycleEvent,
   type MarketLifecycleInput,
@@ -56,7 +58,19 @@ import {
   type ParameterObservation,
 } from "./parameters.js";
 import {
-  SeriesDefinitionSchema,
+  SERIES_APPROVAL_KEYS,
+  SERIES_BINDING_KEYS,
+  openApprovalInput,
+  openApprovedSeriesDefinition,
+  openLifecycleEventInput,
+  openMarketIdentity,
+  openMarketRegistrationInput,
+  openObservedOutcomeStateInput,
+  openParameterObservation,
+  openSeriesDefinition,
+  ownDiscoveredEvent,
+} from "./registration-door.js";
+import {
   UNBOUND_SERIES_BINDING,
   approvedSeriesBinding,
   isApprovedSeriesBinding,
@@ -143,33 +157,65 @@ function withMarket(
   return Object.freeze({ ...registry, markets: immutableMap(markets) });
 }
 
-function issuesOf(error: { readonly issues: readonly { readonly path: readonly PropertyKey[]; readonly message: string }[] }): readonly string[] {
-  return error.issues.map((issue) => {
-    const path = issue.path.map((segment) => String(segment)).join(".");
-    return `${path === "" ? "(root)" : path}: ${issue.message}`;
-  });
-}
-
 function invalid(what: string, issues: readonly string[]): UniverseRefusal {
   return universeRefusal("UNIVERSE_INPUT_INVALID", `${what} is invalid: ${issues.join("; ")}`, {
     issues,
   });
 }
 
+/**
+ * Runs `./parameters.ts` with its own throw contract intact, and nothing else.
+ *
+ * `parseObservation` is DOCUMENTED to throw `UniverseValidationError` on an
+ * invalid observation, and that verdict is preserved here — it is what every
+ * existing caller sees. What is NOT part of any contract is `zod`'s refusal
+ * CONSTRUCTION escaping as a bare `TypeError`: measured at base and at the
+ * candidate, an inherited `get`, `value`, `_zod` or `message` turned
+ * `recordMarketParameters`' clean `UniverseValidationError` into
+ * `TypeError: Invalid property descriptor …` / `Cannot read properties of
+ * undefined (reading 'has')`. Those become a typed refusal (ADR-020 amendment
+ * 2026-09-06); the observation schema itself stays where it belongs.
+ */
+function containedParameters<T>(
+  run: () => T,
+): { readonly ok: true; readonly value: T } | { readonly ok: false; readonly issues: readonly string[] } {
+  try {
+    return { ok: true, value: run() };
+  } catch (error: unknown) {
+    if (error instanceof UniverseValidationError) {
+      throw error;
+    }
+    return {
+      ok: false,
+      issues: [
+        "(root): the parameter observation could not be judged (its refusal could not be constructed); refused",
+      ],
+    };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Series
 // ---------------------------------------------------------------------------
 
-/** Registers a series definition. Re-registering the identical definition is a no-op. */
+/**
+ * Registers a series definition. Re-registering the identical definition is a no-op.
+ *
+ * The definition arrives through `./registration-door.ts` (`UNIV-2`): at base
+ * all NINE declared keys were satisfiable from `Object.prototype`, including a
+ * fabricated `{approved: true, approvedBy: "ghost", approvedAt: …}` binding
+ * that `bindMarketToSeries` then accepted — the §9.2 review gate, granted by a
+ * review that never happened.
+ */
 export function registerSeries(
   registry: UniverseRegistry,
   definition: unknown,
 ): UniverseResult<UniverseRegistry> {
-  const parsed = SeriesDefinitionSchema.safeParse(definition);
-  if (!parsed.success) {
-    return universeFailure(invalid("series definition", issuesOf(parsed.error)));
+  const opened = openSeriesDefinition(definition);
+  if (!opened.ok) {
+    return universeFailure(invalid("series definition", opened.issues));
   }
-  const series = parsed.data;
+  const series = opened.value;
 
   const existing = registry.series.get(series.seriesId);
   if (existing !== undefined) {
@@ -212,27 +258,39 @@ export function registerSeries(
   );
 }
 
-/** Records the human approval that makes a series usable for live binding (§9.2). */
+/**
+ * Records the human approval that makes a series usable for live binding (§9.2).
+ *
+ * Both review facts, and the `seriesId` being approved, are read as OWN
+ * properties of the caller's record: at base an inherited `approvedBy`/
+ * `approvedAt` stored `{"approved":true,"approvedBy":"ghost",…}`, and an
+ * inherited `seriesId` approved a series the caller never named.
+ */
 export function approveSeries(
   registry: UniverseRegistry,
   input: { readonly seriesId: string; readonly approvedBy: string; readonly approvedAt: IsoTimestamp },
 ): UniverseResult<UniverseRegistry> {
-  const series = registry.series.get(input.seriesId);
+  const opened = openApprovalInput(input, SERIES_APPROVAL_KEYS);
+  if (!opened.ok) {
+    return universeFailure(invalid("series approval", opened.issues));
+  }
+  const seriesId = opened.value.seriesId;
+  const series = typeof seriesId === "string" ? registry.series.get(seriesId) : undefined;
   if (series === undefined) {
     return universeFailure(
-      universeRefusal("UNIVERSE_SERIES_UNKNOWN", "no such series", { seriesId: input.seriesId }),
+      universeRefusal("UNIVERSE_SERIES_UNKNOWN", "no such series", { seriesId }),
     );
   }
-  const approved: SeriesDefinition = {
-    ...series,
-    binding: { approved: true, approvedBy: input.approvedBy, approvedAt: input.approvedAt },
-  };
-  const parsed = SeriesDefinitionSchema.safeParse(approved);
-  if (!parsed.success) {
-    return universeFailure(invalid("series approval", issuesOf(parsed.error)));
+  const approved = openApprovedSeriesDefinition(
+    series,
+    opened.value.approvedBy,
+    opened.value.approvedAt,
+  );
+  if (!approved.ok) {
+    return universeFailure(invalid("series approval", approved.issues));
   }
   const seriesMap = new Map(registry.series);
-  seriesMap.set(series.seriesId, deepFreeze(parsed.data));
+  seriesMap.set(series.seriesId, deepFreeze(approved.value));
   return universeOk(Object.freeze({ ...registry, series: immutableMap(seriesMap) }));
 }
 
@@ -271,14 +329,17 @@ function discoveredEvent(
   const seriesKey = isApprovedSeriesBinding(binding)
     ? registry.series.get(binding.seriesId)?.seriesKey
     : undefined;
-  return {
+  // D4: the emitted payload is prototype-free, so a consumer's
+  // `event.seriesId === undefined` — "does this market have an APPROVED series
+  // binding?" — cannot be answered by `Object.prototype`.
+  return ownDiscoveredEvent({
     internalMarketId: projection.identity.internalMarketId,
     conditionId: projection.identity.conditionId,
     yesTokenId: projection.identity.yesTokenId,
     noTokenId: projection.identity.noTokenId,
     ...(seriesKey === undefined ? {} : { seriesId: seriesKey }),
     metadataVersion: projection.metadataVersion,
-  };
+  });
 }
 
 /**
@@ -291,12 +352,22 @@ export function registerMarket(
   registry: UniverseRegistry,
   input: MarketRegistrationInput,
 ): UniverseResult<MarketRegistered> {
-  const parsed = MarketIdentitySchema.safeParse(input.identity);
-  if (!parsed.success) {
-    return universeFailure(invalid("market identity", issuesOf(parsed.error)));
+  // The input RECORD first: at base `registerMarket(registry, {})` registered a
+  // market whose identity and parameter observation both came from
+  // `Object.prototype`, and an inherited `metadataVersion` landed in the
+  // projection. The materialized `parameters` subtree is what
+  // `createParameterHistory` is handed below, so the frozen observation schema
+  // has no chain to read either.
+  const opened = openMarketRegistrationInput(input);
+  if (!opened.ok) {
+    return universeFailure(invalid("market registration", opened.issues));
   }
-  const identity: MarketIdentity = parsed.data;
-  const metadataVersion = input.metadataVersion ?? 1;
+  const identityRead = openMarketIdentity(opened.value.identity);
+  if (!identityRead.ok) {
+    return universeFailure(invalid("market identity", identityRead.issues));
+  }
+  const identity: MarketIdentity = identityRead.value;
+  const metadataVersion = (opened.value.metadataVersion as number | undefined) ?? 1;
 
   const existing = registry.markets.get(identity.internalMarketId);
   if (existing !== undefined) {
@@ -339,7 +410,13 @@ export function registerMarket(
     }
   }
 
-  const parameters = createParameterHistory(identity.internalMarketId, input.parameters);
+  const history = containedParameters(() =>
+    createParameterHistory(identity.internalMarketId, opened.value.parameters as ParameterObservation),
+  );
+  if (!history.ok) {
+    return universeFailure(invalid("market parameter observation", history.issues));
+  }
+  const parameters = history.value;
   const projection: MarketProjection = deepFreeze({
     identity,
     seriesBinding: UNBOUND_SERIES_BINDING,
@@ -371,11 +448,15 @@ function requireMarket(
   registry: UniverseRegistry,
   internalMarketId: string,
 ): UniverseResult<MarketProjection> {
-  const parsed = InternalMarketIdSchema.safeParse(internalMarketId);
-  if (!parsed.success) {
-    return universeFailure(invalid("internal market id", issuesOf(parsed.error)));
+  // Contained (ADR-020 amendment): the id is a scalar, so nothing is adoptable
+  // here — but rendering the REFUSAL reads through the prototype chain, and at
+  // base an inherited `get`/`value`/`_zod`/`message` turned this function's
+  // clean refusal into an escaping `TypeError`.
+  const parsed = containedParse(InternalMarketIdSchema, internalMarketId);
+  if (!parsed.ok) {
+    return universeFailure(invalid("internal market id", parsed.issues));
   }
-  const projection = registry.markets.get(parsed.data);
+  const projection = registry.markets.get(internalMarketId);
   if (projection === undefined) {
     return universeFailure(
       universeRefusal("UNIVERSE_MARKET_UNKNOWN", "no such market", { internalMarketId }),
@@ -422,14 +503,23 @@ export function bindMarketToSeries(
     readonly approvedAt: IsoTimestamp;
   },
 ): UniverseResult<UniverseRegistry> {
-  const market = requireMarket(registry, input.internalMarketId);
+  // Every one of the four keys adopted at base, in BOTH pollution variants:
+  // no schema stands between this record and the stored APPROVED binding, so
+  // `strictObject` could not even fail it closed. An inherited `approvedBy`
+  // recorded `"ghost"` as the human who approved the membership.
+  const opened = openApprovalInput(input, SERIES_BINDING_KEYS);
+  if (!opened.ok) {
+    return universeFailure(invalid("series binding", opened.issues));
+  }
+  const market = requireMarket(registry, opened.value.internalMarketId as string);
   if (!market.ok) {
     return market;
   }
-  const series = registry.series.get(input.seriesId);
+  const seriesId = opened.value.seriesId;
+  const series = typeof seriesId === "string" ? registry.series.get(seriesId) : undefined;
   if (series === undefined) {
     return universeFailure(
-      universeRefusal("UNIVERSE_SERIES_UNKNOWN", "no such series", { seriesId: input.seriesId }),
+      universeRefusal("UNIVERSE_SERIES_UNKNOWN", "no such series", { seriesId }),
     );
   }
   if (!series.binding.approved) {
@@ -454,8 +544,8 @@ export function bindMarketToSeries(
       ...market.value,
       seriesBinding: approvedSeriesBinding(
         series.seriesId,
-        input.approvedBy,
-        input.approvedAt,
+        opened.value.approvedBy as string,
+        opened.value.approvedAt as string,
       ),
     }),
   );
@@ -539,11 +629,26 @@ export function recordMarketParameters(
   if (!market.ok) {
     return market;
   }
-  const appended = appendParameterVersion(
-    market.value.parameters,
-    observation,
-    market.value.identity.conditionId,
+  // D1 only, and deliberately (see `./registration-door.ts`): the materialized
+  // observation goes to `./parameters.ts` exactly as the caller's value did, so
+  // its documented THROW contract and every message are unchanged — while the
+  // adoption class is closed, including the ECONOMIC members. At base an
+  // inherited `tickSize` recorded `"0.99"` into an immutable parameter version.
+  const observed = openParameterObservation(observation);
+  if (!observed.ok) {
+    return universeFailure(invalid("market parameter observation", observed.issues));
+  }
+  const contained = containedParameters(() =>
+    appendParameterVersion(
+      market.value.parameters,
+      observed.value as ParameterObservation,
+      market.value.identity.conditionId,
+    ),
   );
+  if (!contained.ok) {
+    return universeFailure(invalid("market parameter observation", contained.issues));
+  }
+  const appended = contained.value;
   if (!appended.ok) {
     return appended;
   }
@@ -562,7 +667,15 @@ export interface MarketEventApplied extends ProjectionApplied {
   readonly registry: UniverseRegistry;
 }
 
-/** Folds a §7.4 market event into the registry. */
+/**
+ * Folds a §7.4 market event into the registry.
+ *
+ * The input RECORD is read as own data before the fold: at base
+ * `applyMarketEvent(registry, id, {})` OPENED a market — `eventType` and the
+ * whole `payload` came from `Object.prototype`, in BOTH variants — and an
+ * inherited `order` supplied the §7.1 ordering the replay guard compares. The
+ * PAYLOAD itself is handed on untouched: `./lifecycle-door.ts` owns it.
+ */
 export function applyMarketEvent(
   registry: UniverseRegistry,
   internalMarketId: string,
@@ -572,7 +685,11 @@ export function applyMarketEvent(
   if (!market.ok) {
     return market;
   }
-  const result = applyMarketLifecycleEvent(market.value, input);
+  const opened = openLifecycleEventInput(input);
+  if (!opened.ok) {
+    return universeFailure(invalid("market lifecycle input", opened.issues));
+  }
+  const result = applyMarketLifecycleEvent(market.value, opened.value);
   if (!result.ok) {
     return result;
   }
@@ -582,7 +699,13 @@ export function applyMarketEvent(
   });
 }
 
-/** Records a non-terminal observed outcome state (see `lifecycle.ts`). */
+/**
+ * Records a non-terminal observed outcome state (see `lifecycle.ts`).
+ *
+ * At base `recordMarketOutcomeState(registry, id, {})` recorded `DISPUTED` in
+ * BOTH pollution variants — the one settlement state §9.3 lets an operator
+ * assert, asserted by nobody.
+ */
 export function recordMarketOutcomeState(
   registry: UniverseRegistry,
   internalMarketId: string,
@@ -592,7 +715,14 @@ export function recordMarketOutcomeState(
   if (!market.ok) {
     return market;
   }
-  const result = recordObservedOutcomeState(market.value, input);
+  const opened = openObservedOutcomeStateInput(input);
+  if (!opened.ok) {
+    return universeFailure(invalid("observed outcome state", opened.issues));
+  }
+  const result = recordObservedOutcomeState(
+    market.value,
+    opened.value as unknown as ObservedOutcomeStateInput,
+  );
   if (!result.ok) {
     return result;
   }
