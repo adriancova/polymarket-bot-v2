@@ -27,6 +27,7 @@ import type { MoneyString } from "@polymarket-bot/domain";
 
 import { deepFreeze } from "./guards.js";
 import type { ScenarioView } from "./inputs.js";
+import { appendData } from "./plain-data.js";
 import type { ScenarioKind } from "./policy.js";
 import type { MarketHoldingLot } from "./worst-case.js";
 
@@ -64,7 +65,7 @@ function evaluateScenario(
     committedCost = addDecimal(committedCost, lot.committedCost);
     const yesMark = marks.get(lot.marketId);
     if (yesMark === undefined) {
-      unmarkedMarketIds.push(lot.marketId);
+      appendData(unmarkedMarketIds, lot.marketId);
       continue;
     }
     const noMark = subDecimal("1", yesMark);

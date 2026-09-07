@@ -199,7 +199,7 @@
 
 // ---- shared body: byte-identical with the mirrored copy ---------------------
 
-import { ownAccessorDescriptor, ownDataDescriptor } from "./plain-data.js";
+import { appendData, ownAccessorDescriptor, ownDataDescriptor } from "./plain-data.js";
 
 /** The prefix every arena build failure carries, so a test can bind to it. */
 export const SCHEMA_ARENA_ERROR = "schema arena";
@@ -209,10 +209,40 @@ export const SCHEMA_ARENA_ERROR = "schema arena";
  *
  * FAIL CLOSED, AND MEASURED IN BOTH DIRECTIONS. This list is not aspirational:
  * `schema-arena.test.ts` walks every door schema of both packages and requires
- * the set of types it finds to be EXACTLY this list, so a type that disappears
- * is removed and a type that appears is either added deliberately or fails the
- * build. A node type absent from it cannot be copied, and an uncopyable node is
- * an unprotected assembly — the state this module exists to make unreachable.
+ * every type it finds to be in this list, so a type that appears is either
+ * added deliberately or fails the build. A node type absent from it cannot be
+ * copied, and an uncopyable node is an unprotected assembly — the state this
+ * module exists to make unreachable. In the other direction, an entry no door
+ * uses must be FORWARD-DECLARED by name in that test, with a measurement; the
+ * list may not drift into aspiration.
+ *
+ * `"null"` IS THE ONE FORWARD-DECLARED ENTRY (`WP-180-FU3`), and here is the
+ * measurement this comment has demanded of every addition since round 8. A
+ * `z.null()` node assembles NOTHING — it is the smallest node the library has:
+ *
+ * ```text
+ * z.null()._zod.def   own slots: type = "null"          (one string, no checks,
+ *                                                        no nested schema)
+ * z.null()._zod       own slots: def, constr (ZodNull), traits (Set),
+ *                     bag ({}), version, deferred (Array 0), pattern
+ *                     (/^null$/i), values (Set { null }), parse,
+ *                     processJSONSchema, run
+ * ```
+ *
+ * So {@link arenaSlot} copies one string, {@link arenaNode} hands it to the
+ * library's own `ZodNull` constructor, and the library recomputes `values` and
+ * `pattern` on the copy from that one slot — there is no caller-reachable
+ * container in the node at all, which is why the copy cannot differ from the
+ * original. Asserted rather than argued: `schema-arena.test.ts` parses `null`,
+ * `1`, `false`, `undefined` and `"null"` through both the raw schema and the
+ * arena copy and requires identical `safeParse` shapes, including inside an
+ * object door and under `skipChecks`/`jitless` pollution.
+ *
+ * WHY IT IS DECLARED BEFORE A DOOR USES IT. Two merged workarounds exist only
+ * because this list refused `"null"`: `packages/strategy-runtime`'s
+ * `modelOutputs` split and `apps/control-api`'s `z.literal(null)` (WP-240 D6).
+ * Retiring either is a touch in its own package; this entry is what makes those
+ * touches possible without a second arena round.
  */
 export const ARENA_NODE_TYPES: readonly string[] = [
   "array",
@@ -221,6 +251,7 @@ export const ARENA_NODE_TYPES: readonly string[] = [
   "enum",
   "literal",
   "never",
+  "null",
   "number",
   "object",
   "optional",
@@ -507,7 +538,7 @@ function arenaSlot(value: unknown, memo: ArenaMemo): unknown {
   if (isArenaCheck(value)) return arenaCheck(value, memo);
   if (Array.isArray(value)) {
     const items: unknown[] = [];
-    for (const item of value as readonly unknown[]) items.push(arenaSlot(item, memo));
+    for (const item of value as readonly unknown[]) appendData(items, arenaSlot(item, memo));
     return items;
   }
   if (value === null || typeof value !== "object") return value;

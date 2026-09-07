@@ -33,6 +33,7 @@ import {
 import { readPlainData } from "../../../packages/risk/src/plain-data.js";
 import {
   FIXTURE_MEASURING,
+  INSTANCE,
   MARKET_A,
   MARKET_B,
   VALID_UNTIL,
@@ -1310,7 +1311,13 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
   const NON_CANONICAL = "01890000-0000-7000-8000-0000000000AB";
   /** The same value canonically spelled. It must never be PRODUCED from it. */
   const CANONICAL = "01890000-0000-7000-8000-0000000000ab";
-  /** `CodeString` must start with a letter, so a code-shaped UUID starts at `f`. */
+  /**
+   * The instance-id spellings. `f`-leading for the reason recorded at
+   * `fixtures.ts`'s `INSTANCE`: `packages/capital-allocator` still types the
+   * same value `CodeStringSchema`, so the letter-leading UUIDv7 intersection is
+   * still what every merged door accepts. The uppercase tail is what makes the
+   * hostile spelling hostile, under BOTH typings.
+   */
   const NON_CANONICAL_CODE = "f1890000-0000-7000-8000-0000000000AB";
   const CANONICAL_CODE = "f1890000-0000-7000-8000-0000000000ab";
 
@@ -1341,8 +1348,28 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
    */
   const VENUE_ID_PATH = /^intent\.orderIds\[\d+\]$/u;
 
+  /**
+   * WHICH LAYER ANSWERS FOR THIS FIELD (`WP-180-FU3`, ADR-021).
+   *
+   * `identity` — the field's own schema admits the non-canonical spelling, so
+   * the ADR-016 §2 pass in `validateEvaluationInput` is what refuses it, with
+   * `RISK_UUID_NOT_CANONICAL` and the RAW value on `details.value`.
+   *
+   * `schema` — ADR-021 re-typed `context.strategyInstanceId` from
+   * `CodeStringSchema` to `Uuidv7Schema`, and `Uuidv7Schema`'s pattern is
+   * lowercase-only. So the SCHEMA now refuses a non-canonical spelling of that
+   * field first, as `RISK_INPUT_INVALID`, and the identity pass below it never
+   * runs (`validateEvaluationInputInner` returns on `!parsed.success`). The
+   * ADR-016 §2 outcome is unchanged in every respect that matters — refused at
+   * an input surface, never case-folded, no record emitted — but the EVIDENCE
+   * shape differs: a schema refusal carries `issues` (path + message) and not
+   * `details.value`, which is measured rather than assumed by the branch below.
+   */
+  type AnsweredBy = "identity" | "schema";
+
   interface IdentityCase {
     readonly field: string;
+    readonly answeredBy: AnsweredBy;
     readonly hostile: (input: EvaluationInputFixture) => void;
     readonly valid: (input: EvaluationInputFixture) => void;
   }
@@ -1350,6 +1377,7 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
   const IDENTITY_FIELDS: readonly IdentityCase[] = [
     {
       field: "identifiers.approvedIntentId",
+      answeredBy: "identity",
       hostile: (input) => {
         input.identifiers.approvedIntentId = NON_CANONICAL;
       },
@@ -1359,6 +1387,7 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
     },
     {
       field: "context.strategyInstanceId",
+      answeredBy: "schema",
       hostile: (input) => {
         input.context.strategyInstanceId = NON_CANONICAL_CODE;
       },
@@ -1368,6 +1397,7 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
     },
     {
       field: "intent.intentId",
+      answeredBy: "identity",
       hostile: (input) => {
         input.intent = { ...input.intent, intentId: NON_CANONICAL };
       },
@@ -1377,6 +1407,7 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
     },
     {
       field: "guards.recentIntentIds[0]",
+      answeredBy: "identity",
       hostile: (input) => {
         input.guards.recentIntentIds = [NON_CANONICAL];
       },
@@ -1385,6 +1416,18 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
       },
     },
   ];
+
+  /** The fields the ADR-016 §2 pass itself answers for. */
+  const IDENTITY_ANSWERED = IDENTITY_FIELDS.filter((one) => one.answeredBy === "identity");
+  const SCHEMA_ANSWERED = IDENTITY_FIELDS.filter((one) => one.answeredBy === "schema");
+
+  it("NON-VACUITY: both layers are represented, so neither branch below is dead", () => {
+    // If a later re-typing moves every field to one layer, the branch that lost
+    // its cases fails HERE rather than passing vacuously for the rest of time.
+    expect(IDENTITY_ANSWERED.length).toBeGreaterThan(0);
+    expect(SCHEMA_ANSWERED.length).toBeGreaterThan(0);
+    expect(SCHEMA_ANSWERED.map((one) => one.field)).toEqual(["context.strategyInstanceId"]);
+  });
 
   it("REVIEWER'S PROBE: a CANCEL with a non-canonical approvedIntentId is REFUSED, with no record", () => {
     const input = entryInput();
@@ -1400,7 +1443,7 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
     expect(result).not.toHaveProperty("cancelPriorityOverrides");
   });
 
-  for (const identity of IDENTITY_FIELDS) {
+  for (const identity of IDENTITY_ANSWERED) {
     it(`refuses ${identity.field}, naming the field and carrying the RAW value`, () => {
       const input = entryInput();
       identity.hostile(input);
@@ -1412,6 +1455,29 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
       const refusal = result.refusals[0];
       expect(refusal?.details["field"]).toBe(identity.field);
       expect(nonCanonicalUuid(String(refusal?.details["value"]))).toBe(true);
+    });
+  }
+
+  for (const identity of SCHEMA_ANSWERED) {
+    it(`refuses ${identity.field} AT THE SCHEMA, naming the field and folding nothing`, () => {
+      const input = entryInput();
+      identity.hostile(input);
+
+      const result = evaluateIntent(riskPolicy(), input);
+
+      // Same door, same direction, one layer earlier: ADR-016 §2's requirement
+      // is a typed refusal at an INPUT SURFACE and no case-fold, and both hold.
+      expect(result.approved).toBe(false);
+      expect(codesOf(result)).toEqual(["RISK_INPUT_INVALID"]);
+      const issues = result.refusals[0]?.details["issues"];
+      expect(Array.isArray(issues)).toBe(true);
+      expect((issues as readonly string[]).join(" | ")).toContain(
+        `${identity.field}: must be a lowercase canonical UUIDv7`,
+      );
+      // No approved arm, and no lowercased spelling of the raw value anywhere.
+      expect(result).not.toHaveProperty("record");
+      const seen = stringsIn(result).map((one) => one.value);
+      expect(seen.some((one) => one.includes(CANONICAL_CODE))).toBe(false);
     });
   }
 
@@ -1427,15 +1493,34 @@ describe("ADR-016 §2 — record identity is INPUT VALIDATION, never a cancel ov
 
   it("reports EVERY identity violation at once — the door does not short-circuit", () => {
     const input = entryInput();
+    for (const identity of IDENTITY_ANSWERED) identity.hostile(input);
+
+    const result = evaluateIntent(riskPolicy(), input);
+
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toEqual(IDENTITY_ANSWERED.map(() => "RISK_UUID_NOT_CANONICAL"));
+    expect(result.refusals.map((r) => r.details["field"])).toEqual(
+      IDENTITY_ANSWERED.map((identity) => identity.field),
+    );
+  });
+
+  it("the SCHEMA layer answers before the identity pass, and reports its own field", () => {
+    // The ordering `validateEvaluationInputInner` has always had, now visible
+    // because ADR-021 put one identity field under the schema: `safeParse`
+    // returns first, so a mixed input answers with the schema's refusal and the
+    // identity pass never runs. Fail-closed either way; this pins WHICH.
+    const input = entryInput();
     for (const identity of IDENTITY_FIELDS) identity.hostile(input);
 
     const result = evaluateIntent(riskPolicy(), input);
 
     expect(result.approved).toBe(false);
-    expect(codesOf(result)).toEqual(IDENTITY_FIELDS.map(() => "RISK_UUID_NOT_CANONICAL"));
-    expect(result.refusals.map((r) => r.details["field"])).toEqual(
-      IDENTITY_FIELDS.map((identity) => identity.field),
-    );
+    expect(codesOf(result)).toEqual(["RISK_INPUT_INVALID"]);
+    const issues = (result.refusals[0]?.details["issues"] ?? []) as readonly string[];
+    expect(issues.join(" | ")).toContain("context.strategyInstanceId");
+    // …and the identity-answered fields are NOT reported in the same breath,
+    // which is the honest statement of the ordering rather than a wish.
+    expect(codesOf(result)).not.toContain("RISK_UUID_NOT_CANONICAL");
   });
 
   it("NEVER case-folds: no canonical form of the id appears anywhere in the result", () => {
@@ -2644,18 +2729,39 @@ describe("a hostile value at the boundary — review round 5", () => {
     expect(traps).toBe(0);
   });
 
+  // WHICH SCOPE KEY CARRIES THIS PAIR, AND WHY IT MOVED (`WP-180-FU3`).
+  //
+  // Both tests used `context.strategyInstanceId = "constructor"` until ADR-021
+  // re-typed that field `Uuidv7Schema`, which makes `"constructor"` inadmissible
+  // AT THE DOOR — the hazard would have been "tested" through an input the door
+  // now refuses before any lookup happens, which is a vacuous test, not a
+  // stronger one. The class itself is untouched and still reachable: the OTHER
+  // scope dimensions take their keys from `MarketContext.scope`, whose three
+  // members are `CodeStringSchema` (`inputs.ts` `ScopeAttributionSchema`), and
+  // `"constructor"` is an admissible `CodeString`. So the pair now runs on
+  // `bySeries["constructor"]`, which answers the `Object` CONSTRUCTOR — not
+  // `undefined` — exactly as `byStrategyInstance["constructor"]` did.
+  //
+  // Reproduced before it was moved: at this tip, with the series key polluted
+  // and no `bySeries` measurement, `checkExposureLimits` reads the intrinsic
+  // unless `ownEntry` refuses it.
+
   it("an INHERITED scope entry is not a measurement — RISK_EXPOSURE_ENTRY_MISSING still fires", () => {
-    // `strategyInstanceId` is a `CodeString`, so `"constructor"` is admissible
-    // input. `exposures.byStrategyInstance["constructor"]` answers the `Object`
+    // `MarketContext.scope.seriesKey` is a `CodeString`, so `"constructor"` is
+    // admissible input. `exposures.bySeries["constructor"]` answers the `Object`
     // constructor — not `undefined` — so the round-1 BLOCKER-2 fix ("an omitted
     // entry is unknown exposure, not zero") read an intrinsic as a measurement
     // and then fed `undefined` to decimal arithmetic.
     const input = entryInput();
-    input.context.strategyInstanceId = "constructor";
-    input.exposures = exposureSnapshot({ measuring: { marketIds: [MARKET_A, MARKET_B] } });
+    input.markets = [
+      market({ scope: { seriesKey: "constructor", underlyingKey: "BTC", resolutionWindowKey: "w1" } }),
+    ];
+    input.exposures = exposureSnapshot({
+      measuring: { strategyInstanceIds: [INSTANCE], marketIds: [MARKET_A, MARKET_B] },
+    });
 
     const result = evaluateIntent(
-      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perInstanceExposureCap: "500" } }),
+      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perSeriesExposureCap: "500" } }),
       input,
     );
 
@@ -2669,13 +2775,19 @@ describe("a hostile value at the boundary — review round 5", () => {
     // The mirror case: the snapshot genuinely measures `"constructor"` at zero,
     // so the evaluation must proceed and compare against that zero.
     const input = entryInput();
-    input.context.strategyInstanceId = "constructor";
+    input.markets = [
+      market({ scope: { seriesKey: "constructor", underlyingKey: "BTC", resolutionWindowKey: "w1" } }),
+    ];
     input.exposures = exposureSnapshot({
-      measuring: { strategyInstanceIds: ["constructor"], marketIds: [MARKET_A, MARKET_B] },
+      measuring: {
+        strategyInstanceIds: [INSTANCE],
+        marketIds: [MARKET_A, MARKET_B],
+        seriesKeys: ["constructor"],
+      },
     });
 
     const result = evaluateIntent(
-      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perInstanceExposureCap: "500" } }),
+      riskPolicy({ limits: { maxWorstCaseContractualLoss: "10000", perSeriesExposureCap: "500" } }),
       input,
     );
 

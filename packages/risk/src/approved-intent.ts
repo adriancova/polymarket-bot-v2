@@ -103,7 +103,7 @@ import { z } from "zod";
 
 import { deepFreeze } from "./guards.js";
 import { identityRefusals } from "./inputs.js";
-import { readPlainData, type PlainDataString } from "./plain-data.js";
+import { appendData, readPlainData, type PlainDataString } from "./plain-data.js";
 import { RISK_REASON_CODES, type RiskReasonCode } from "./reasons.js";
 import {
   IncidentActionRecommendationSchema,
@@ -351,7 +351,8 @@ export function sealApprovedIntentRecord(
       const refusals: RiskRefusal[] = [...identityRefusalsFor(data.strings)];
       const shape = ApprovedIntentRecordParser.safeParse(data.value);
       if (!shape.success) {
-        refusals.push(
+        appendData(
+          refusals,
           riskRefusal(
             "RISK_INPUT_INVALID",
             "the record being emitted does not satisfy the approved-intent record contract (fail closed)",
@@ -514,8 +515,8 @@ function resizeApprovedIntentInner(
   const inherited = inheritedValue as ApprovedIntentRecord;
 
   // Refuse, never case-fold; the raw value rides out on the refusal.
-  refusals.push(...identityRefusalsFor(inheritedData.strings));
-  refusals.push(...identityRefusalsFor(requestData.strings));
+  for (const refusal of identityRefusalsFor(inheritedData.strings)) appendData(refusals, refusal);
+  for (const refusal of identityRefusalsFor(requestData.strings)) appendData(refusals, refusal);
 
   // THE INHERITED RECORD IS PARSED IN FULL, not just walked. Round 3 parsed
   // only `record.intent`, because that is what the arithmetic below reads.
@@ -534,7 +535,8 @@ function resizeApprovedIntentInner(
   // read, so nothing can be normalized on the way through.
   const parsedRecord = ApprovedIntentRecordParser.safeParse(inherited);
   if (!parsedRecord.success) {
-    refusals.push(
+    appendData(
+      refusals,
       riskRefusal(
         "RISK_INPUT_INVALID",
         "the record to resize does not satisfy the approved-intent record contract; a resize computes on it and copies most of it forward, so it is parsed before it is used (fail closed)",
@@ -554,7 +556,8 @@ function resizeApprovedIntentInner(
     req.approvedIntentId === inherited.approvedIntentId ||
     req.approvedIntentId === inherited.rootApprovedIntentId
   ) {
-    refusals.push(
+    appendData(
+      refusals,
       riskRefusal(
         "RISK_RESIZE_ID_REUSED",
         "a resize must create a NEW approved-intent record; reusing an id in the lineage would edit the original in storage (§7.7)",
@@ -569,7 +572,8 @@ function resizeApprovedIntentInner(
 
   const originalShares = resizableTargetShares(inherited.intent);
   if (originalShares === undefined) {
-    refusals.push(
+    appendData(
+      refusals,
       riskRefusal(
         "RISK_RESIZE_UNSUPPORTED_TYPE",
         "only POSITION and REDUCE_POSITION intents carry a single resizable targetShares; a QUOTE ladder or BASKET leg set is re-proposed by the strategy, not resized here (fail closed)",
@@ -580,7 +584,8 @@ function resizeApprovedIntentInner(
     const originalSign = signOf(originalShares);
     const newSign = signOf(req.newTargetShares);
     if (newSign !== 0 && originalSign !== 0 && newSign !== originalSign) {
-      refusals.push(
+      appendData(
+        refusals,
         riskRefusal(
           "RISK_RESIZE_INCOHERENT",
           "a resize may not flip the side of the original intent; risk shrinks exposure, it does not re-aim a strategy's decision (§7.7)",
@@ -589,7 +594,8 @@ function resizeApprovedIntentInner(
       );
     }
     if (compareDecimal(absDecimal(req.newTargetShares), absDecimal(originalShares)) >= 0) {
-      refusals.push(
+      appendData(
+        refusals,
         riskRefusal(
           "RISK_RESIZE_NOT_A_REDUCTION",
           "a risk resize must strictly reduce the magnitude of targetShares",

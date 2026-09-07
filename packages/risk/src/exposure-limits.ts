@@ -37,6 +37,7 @@ import type { MoneyString } from "@polymarket-bot/domain";
 import { ownEntry } from "./guards.js";
 import type { ExposureEntryView, ExposureSnapshotView, ScopeAttribution } from "./inputs.js";
 import type { RiskPolicy } from "./policy.js";
+import { appendData } from "./plain-data.js";
 import type { RiskReasonCode } from "./reasons.js";
 import { riskRefusal, type RiskRefusal } from "./result.js";
 
@@ -136,7 +137,7 @@ export function checkExposureLimits(
 
   const refusals: RiskRefusal[] = [];
   const push = (refusal: RiskRefusal | undefined): void => {
-    if (refusal !== undefined) refusals.push(refusal);
+    if (refusal !== undefined) appendData(refusals, refusal);
   };
 
   // `global` is a REQUIRED field of `ExposureSnapshotViewSchema`, so a snapshot
@@ -160,7 +161,8 @@ export function checkExposureLimits(
     // inherited member must not be mistaken for a measured scope.
     const entry = ownEntry(exposures.byStrategyInstance, probe.strategyInstanceId);
     if (entry === undefined) {
-      refusals.push(
+      appendData(
+        refusals,
         entryMissing(
           "strategy-instance",
           probe.strategyInstanceId,
@@ -185,7 +187,7 @@ export function checkExposureLimits(
     for (const [marketId, contribution] of probe.perMarketContribution) {
       const entry = ownEntry(exposures.byMarket, marketId);
       if (entry === undefined) {
-        refusals.push(entryMissing("market", marketId, limits.perMarketExposureCap));
+        appendData(refusals, entryMissing("market", marketId, limits.perMarketExposureCap));
         continue;
       }
       push(
@@ -248,7 +250,8 @@ export function checkExposureLimits(
         check.field,
       );
       if (key === undefined) {
-        refusals.push(
+        appendData(
+          refusals,
           riskRefusal(
             "RISK_SCOPE_KEY_MISSING",
             `a ${check.label} exposure limit is configured but market ${marketId} carries no ${check.label} attribution (fail closed)`,
@@ -270,7 +273,7 @@ export function checkExposureLimits(
     for (const [key, contribution] of contributionByKey) {
       const entry = ownEntry(table, key);
       if (entry === undefined) {
-        refusals.push(entryMissing(check.label, key, cap));
+        appendData(refusals, entryMissing(check.label, key, cap));
         continue;
       }
       push(breach(check.code, check.label, key, committed(entry), contribution, cap));

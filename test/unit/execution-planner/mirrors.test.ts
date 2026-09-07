@@ -88,31 +88,52 @@ const MODULES: readonly Module[] = [
     subpath: "./plain-data",
     file: "packages/risk/src/plain-data.ts",
     marker: /^import \{ types \} from "node:util";$/mu,
-    // RE-DERIVED IN `WP-020-FU1`, the ONE change since the collapse.
+    // RE-DERIVED TWICE SINCE THE COLLAPSE, both times in a round authorized to
+    // move it, and each time for a reason recorded here.
     //
     // The collapse's claim was that the body is byte for byte what review
     // rounds 4-9 left in the three deleted copies, and it held from
-    // `WP-180-FU2` through `WP-200-FU1`. `WP-200-FU1`'s review round 1 then
-    // ruled the module's whole APPEND surface in scope (GRANT-AND-WIDEN): 23
-    // `Array.prototype.push` sites became `CreateDataProperty` appends through
-    // the new `appendData`, because `push` is `Set` and `Set` consults the
-    // prototype chain for the INDEX name. So the pin moves ONCE, deliberately,
-    // in the round that was authorized to move it — from
-    // `a318a501…dc7826` / 30,179 bytes to the values below.
+    // `WP-180-FU2` through `WP-200-FU1`. Then:
     //
-    // Nothing else about this file's guards changed: the fingerprints below,
-    // the match thresholds, the alpha-rename replay, the recursive
-    // no-fourth-copy scan and the `exports`/consumer pins are all untouched,
-    // and all of them are re-run green in that round's transcript.
-    bodySha256: "1ddba9cd86beb12cf70ef2b5c22160f94085abca111c8a7f59c1a028fa26b3a9",
-    bodyBytes: 32_765,
+    //   `a318a501…dc7826` / 30,179 bytes  the collapse
+    //   `1ddba9cd…26b3a9` / 32,765 bytes  `WP-020-FU1`: `WP-200-FU1`'s review
+    //                                     round 1 ruled the module's whole
+    //                                     APPEND surface in scope
+    //                                     (GRANT-AND-WIDEN), and 23
+    //                                     `Array.prototype.push` sites became
+    //                                     `CreateDataProperty` appends through
+    //                                     the new `appendData`, because `push`
+    //                                     is `Set` and `Set` consults the
+    //                                     prototype chain for the INDEX name
+    //   the values below                  `WP-180-FU3`: that round's named
+    //                                     successor obligation — the other TEN
+    //                                     modules' 77 push sites — is executed
+    //                                     through the SAME primitive rather
+    //                                     than a second copy of it, so
+    //                                     `appendData` is now EXPORTED. The
+    //                                     diff is the `export` keyword and the
+    //                                     doc comment that records the census.
+    //
+    // Nothing else about this file's guards changed in either round: the
+    // fingerprints below, the match thresholds, the alpha-rename replay, the
+    // recursive no-fourth-copy scan and the `exports`/consumer pins are all
+    // untouched, and all of them are re-run green in each round's transcript.
+    bodySha256: "5761359d12a3b858c9bbfa4f28cf709d2cf365f424679e8efed6c8560ea4d4b6",
+    bodyBytes: 33_840,
   },
   {
     subpath: "./schema-arena",
     file: "packages/risk/src/schema-arena.ts",
     marker: /^\/\/ ---- shared body: byte-identical with the mirrored copy -+$/mu,
-    bodySha256: "35aaf0b907ccda16567eb7e7b920df8bb29175102e72ff99d524dc1363dccc53",
-    bodyBytes: 21_379,
+    // RE-DERIVED ONCE, in `WP-180-FU3`, from `35aaf0b9…3dccc53` / 21,379 bytes.
+    // Two changes, both inside that round's grant and both recorded where they
+    // live: `ARENA_NODE_TYPES` gains `"null"` with the measurement its own
+    // comment demands (`packages/risk/src/schema-arena-null.test.ts`), and
+    // `arenaSlot`'s one `Array.prototype.push` becomes a `CreateDataProperty`
+    // append through the exported `appendData` — the 77-site conversion's
+    // `schema-arena` row. No guard in this file changed.
+    bodySha256: "7795b4314eec6ed1c07aaf98f0de609ce14dc69262aab0caa411e51b04e3d36a",
+    bodyBytes: 23_159,
   },
 ];
 
@@ -313,7 +334,12 @@ const FINGERPRINTS: Readonly<Record<string, readonly string[]>> = {
     // Strings fixed by the LIBRARY, not by this module's vocabulary.
     "the _zod container of a check copy",
     ": the value handed to the arena is not a schema node (no _zod.def/constr/run)",
-    '"array", "boolean", "default", "enum", "literal", "never", "number", "object", "optional", "readonly", "record", "string", "union", "unknown",',
+    // `"null"` was inserted by `WP-180-FU3` (the arena gained the type, with
+    // the measurement `ARENA_NODE_TYPES`' own comment demands). The ANCHOR
+    // moves with the list it quotes — it is key material, not an assertion, and
+    // its property is unchanged: a copy of this module cannot rename a list of
+    // the LIBRARY's own type names and keep working.
+    '"array", "boolean", "default", "enum", "literal", "never", "null", "number", "object", "optional", "readonly", "record", "string", "union", "unknown",',
     // Identifier-free expressions over `zod`'s own internal slot names.
     "._zod.run({ value: {}, issues: [] }, ",
     "{ def?: unknown; constr?: unknown; check?: unknown; run?: unknown }",

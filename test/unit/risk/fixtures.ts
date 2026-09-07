@@ -19,7 +19,30 @@ import { ownDataDescriptor } from "../../../packages/risk/src/plain-data.js";
 /** Canonical lowercase UUIDv7 market ids (§7.2 / ADR-016). */
 export const MARKET_A = "01890000-0000-7000-8000-000000000001";
 export const MARKET_B = "01890000-0000-7000-8000-000000000002";
-export const INSTANCE = "strat-a";
+/**
+ * The strategy instance id — a canonical lowercase UUIDv7 (ADR-021,
+ * `WP-180-FU3`). It was `"strat-a"` until this round.
+ *
+ * WHY IT LEADS WITH A LETTER, AND WHAT THAT MEASURES. `inputs.ts` now types the
+ * field `Uuidv7Schema`, so a `0`-leading minted id is ACCEPTED there — that is
+ * the ruling, and it is pinned directly, on the door, in
+ * `adr-021-instance-identity.test.ts`. This shared constant nevertheless carries
+ * a LETTER-LEADING UUIDv7, because it also crosses `packages/capital-allocator`
+ * in `ports.test.ts` (the two packages' real end-to-end port), and that package
+ * still types the same value `CodeStringSchema` at four sites —
+ * `src/reserve.ts:69` and `src/state.ts:68,81,92`. Measured, not assumed: with a
+ * `0`-leading id those seven port tests fail with
+ * `CAPITAL_INPUT_INVALID … positions.0.strategyInstanceId: must be an
+ * alphanumeric code without whitespace`.
+ *
+ * So the INTERSECTION `apps/trader`'s `UuidAndCodeString` door mints — a
+ * canonical lowercase UUIDv7 whose first hex digit is a letter — is still the
+ * only shape every merged door in this repository accepts, and ADR-021's
+ * "relax the trader to plain `Uuidv7Schema`" follow-up cannot land until
+ * `packages/capital-allocator` is re-typed too. That is recorded as this
+ * round's reported conflict rather than silently worked around here.
+ */
+export const INSTANCE = "a1890000-0000-7000-8000-00000000000a";
 
 export const EVALUATED_AT = "2026-09-02T12:00:00.000Z";
 export const VALID_UNTIL = "2026-09-02T13:00:00.000Z";

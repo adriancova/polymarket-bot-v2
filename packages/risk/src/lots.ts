@@ -31,6 +31,7 @@ import type { MoneyString, SharesString } from "@polymarket-bot/domain";
 
 import type { IntentView } from "./intent-view.js";
 import type { PortfolioView } from "./inputs.js";
+import { appendData } from "./plain-data.js";
 import {
   settlementValueUnderOutcome,
   VERIFIED_TERMINAL_OUTCOMES,
@@ -138,7 +139,7 @@ export function buildWorstCaseLots(
   const built: MarketHoldingLot[] = [];
   for (const [marketId, lot] of lots) {
     const assigned = assignUnassigned(lot);
-    built.push({
+    appendData(built, {
       marketId,
       yesShares: assigned.yesShares,
       noShares: assigned.noShares,

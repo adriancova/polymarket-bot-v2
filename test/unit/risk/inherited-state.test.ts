@@ -364,23 +364,48 @@ function candidateKeys(material: unknown, extra: readonly string[] = []): string
  * without hiding a site of ours. It is recorded as a residual in
  * `docs/handoffs/WP-180.md`.
  *
- * WHAT `WP-020-FU1` CHANGED, and why this exclusion nevertheless stays. The
- * SECOND reason above is now false for CONFIGURABLE shapes: `packages/decimal`
- * neutralizes index names on both prototypes for the duration of every
- * operation, so an inherited property no longer changes any arithmetic result.
- * (It is not an absolute — a NON-CONFIGURABLE index name on `Array.prototype`
- * can be neither redefined nor shadowed, and round 1 made that state a typed
- * `HostilePrototypeError` refusal rather than a computed answer;
+ * WHAT `WP-020-FU1` CHANGED. The SECOND reason above is now false for
+ * CONFIGURABLE shapes: `packages/decimal` neutralizes index names on both
+ * prototypes for the duration of every operation, so an inherited property no
+ * longer changes any arithmetic result. (It is not an absolute — a
+ * NON-CONFIGURABLE index name on `Array.prototype` can be neither redefined nor
+ * shadowed, and round 1 made that state a typed `HostilePrototypeError` refusal
+ * rather than a computed answer;
  * `test/unit/decimal/unneutralizable-shapes.test.ts` measures all five shapes in
- * child processes.) The FIRST is still true — `Array.prototype.push` remains
- * `Set` — and `packages/risk` still accumulates with `push` in the TEN modules
- * OUTSIDE `plain-data.ts`, across 77 `.push(` sites, while `plain-data.ts`'s own
- * 23 appends were converted to `CreateDataProperty`. (That count said "eight"
- * until round-1 finding L2; it had never been measured.) So the exclusion still
- * removes real third-party and out-of-file noise from THIS sweep, and the class
- * it excludes is measured directly instead, per shape and per index, in
- * `test/unit/risk/index-name-pollution.test.ts` — including the remainder this
- * file would otherwise be silently carrying.
+ * child processes.)
+ *
+ * WHAT `WP-180-FU3` CHANGED, AND WHY THE EXCLUSION NEVERTHELESS STAYS.
+ * `WP-020-FU1` also wrote here that "`packages/risk` still accumulates with
+ * `push` in the TEN modules OUTSIDE `plain-data.ts`, across 77 `.push(` sites".
+ * That is no longer true: all 77 are `CreateDataProperty` appends, the package
+ * contains zero `.push(` and zero computed index WRITES in product code, and
+ * the six modules that compute without `zod` are now held to BYTE-IDENTITY
+ * under every shape at every index in
+ * `test/unit/risk/index-name-pollution.test.ts` (37 divergences at `88e3a5b` on
+ * each intrinsic, 0 here).
+ *
+ * The exclusion was nevertheless RE-MEASURED rather than deleted, by removing
+ * it and running this file. NINE tests fail, and every failure names a cause
+ * outside this package:
+ *
+ * ```text
+ * evaluateIntent — a fully passing ENTRY | accepting-setter on "0"
+ *     an inherited SETTER was INVOKED 9×
+ * evaluateIntent — a CANCEL (§6 invariant 13) | two-answer-getter on "0"
+ *     ANSWER CHANGED (permissive → refusal)
+ * ```
+ *
+ * Those setter invocations and answer changes are `zod`'s own arrays —
+ * `payload.issues.push(…)` and `handleArrayResult`'s
+ * `final.value[index] = …` into a `payload.value = Array(input.length)`
+ * container that `schema-arena.ts`'s `isFreshOrdinaryContainer` deliberately
+ * does not substitute (it requires `length === 0`). Admitting index names here
+ * would therefore make this file's every scenario report the SAME third-party
+ * class over and over, in a sweep whose subject is this repository's own
+ * inherited-state discipline — while the class itself is already measured
+ * directly, per shape and per index, in the file named above, where its cause
+ * is named and its residual is stated. The exclusion stays for the FIRST reason
+ * only, and it is now third-party noise rather than a hidden remainder of ours.
  */
 const ARRAY_INDEX = /^(?:0|[1-9][0-9]*)$/u;
 

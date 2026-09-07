@@ -36,12 +36,13 @@ import {
   PositiveDecimalStringSchema,
   PriceStringSchema,
   RunModeSchema,
+  Uuidv7Schema,
   type Intent,
 } from "@polymarket-bot/domain";
 
 import { FreshnessObservationSchema } from "./freshness.js";
 import { ownProperty, uuidShapedNotCanonical } from "./guards.js";
-import { readPlainData } from "./plain-data.js";
+import { appendData, readPlainData } from "./plain-data.js";
 import { SCENARIO_KINDS } from "./policy.js";
 import { contained, riskRefusal, type RiskRefusal } from "./result.js";
 import { prototypeFreeParser } from "./schema-arena.js";
@@ -191,7 +192,33 @@ export const RiskEvaluationInputSchema = z.strictObject({
 
   context: z.strictObject({
     runMode: RunModeSchema,
-    strategyInstanceId: CodeStringSchema,
+    /**
+     * The strategy instance this evaluation is for — an IDENTITY, not a code
+     * token (ADR-021, accepted 2026-09-06).
+     *
+     * IT WAS `CodeStringSchema` UNTIL `WP-180-FU3`, and that was a mis-typing
+     * with a measured consequence. `CodeStringSchema`'s grammar requires a
+     * LEADING LETTER; a UUIDv7's first hex digit is the top nibble of its
+     * 48-bit millisecond timestamp, and that nibble is `0` for every instant
+     * before ~2527. So NO honestly-minted UUIDv7 could pass this door, while
+     * `packages/ledger`'s `AllocationClaim.instanceId` and `packages/pnl`'s
+     * `PnlOwner.instanceId` — the same value, one layer down — require exactly
+     * one. `apps/trader` shipped an intersection grammar (a UUID shape whose
+     * first digit happens to be a letter) to keep the three doors satisfiable
+     * at all, and ADR-021 ruled THIS door the wrong one: an instance id is a
+     * minted identity like `runId`, `configId` and `marketId`, all of which are
+     * UUIDs, and nothing depends on the letter-first property.
+     *
+     * The change is a WIDENING on the honest population — every id the trader
+     * can mint today — and a narrowing only on code-shaped strings that no
+     * other door in this repository ever admitted.
+     *
+     * `Uuidv7Schema` carries its format as a CHECK, so the arena copies it with
+     * the rest of this schema and the format survives a polluted `skipChecks`
+     * (`schema-arena.ts`'s header measures that class; the pin for THIS field
+     * is `test/unit/risk/schema-arena.test.ts`).
+     */
+    strategyInstanceId: Uuidv7Schema,
     /** §9.8 check 1, caller-computed for THIS intent. */
     runStatePermitsIntent: z.boolean(),
     strategyStatePermitsIntent: z.boolean(),
@@ -343,7 +370,8 @@ export function identityRefusals(
   const refusals: RiskRefusal[] = [];
   for (const { field, value } of fields) {
     if (typeof value !== "string" || !uuidShapedNotCanonical(value)) continue;
-    refusals.push(
+    appendData(
+      refusals,
       riskRefusal(
         "RISK_UUID_NOT_CANONICAL",
         "a repository identifier is UUID-shaped but not canonical lowercase (ADR-016 §2: refuse at the input surface, never case-fold)",

@@ -496,6 +496,15 @@ const TEST_FILE_BUDGET: readonly { readonly file: string; readonly sites: number
   // handler) and its `Object.keys` assertions; 54 once round 8's detector also
   // sees its one `Object.getPrototypeOf` assertion (line 1130).
   { file: "packages/capital-allocator/src/allocator.test.ts", sites: 54 },
+  // `WP-180-FU3`: the `"null"` node measurement, colocated with the module
+  // because `zod` is a dependency of the PACKAGE and is deliberately not
+  // resolvable from the shared test tree (the file's own header records why).
+  // Its ten sites are the measurement ITSELF — `Object.getOwnPropertyNames` and
+  // `Object.getPrototypeOf` over `z.null()._zod` and its `def`, plus the
+  // pollution-name table and one `def["type"]` read. A file whose subject is
+  // "what does this node own" cannot avoid asking what it owns; the count is
+  // pinned so that adding an eleventh is a deliberate act with a visible diff.
+  { file: "packages/risk/src/schema-arena-null.test.ts", sites: 10 },
 ];
 
 function keyOf(site: { file: string; enclosing: string; kind: string; text: string }): string {

@@ -578,8 +578,23 @@ function defineDataProperty(out: object, key: string, value: unknown): void {
  * for the round-8 reason recorded there. (The same fix, and the same reasoning,
  * as `test/unit/ledger/pollution.ts`'s own `appendData` — a harness that was
  * defeated by this class while measuring it.)
+ *
+ * IT IS EXPORTED SINCE `WP-180-FU3`, and that is the whole shape of that
+ * round's fix. `WP-020-FU1` closed this module and named the rest of the
+ * package as its successor obligation: **77 further `.push(` sites across the
+ * other TEN modules** (`approved-intent` 8, `engine` 47, `exposure-limits` 5,
+ * `freshness` 3, `inputs` 1, `intent-view` 9, `lots` 1, `scenario` 1,
+ * `schema-arena` 1, `worst-case` 1 — re-derived, counted both by line and by
+ * occurrence, and agreeing with the census settled at that round's review round
+ * 2). Every one of them now calls THIS function. A second copy of the primitive
+ * was deliberately not written: one appending primitive, one measurement, one
+ * place to fix — the same reasoning `GOV-2A` applied to this module itself. The
+ * export widens the `./plain-data` door subpath by one function; it is a
+ * two-line prototype-safety primitive, not door logic, and the
+ * `test/unit/execution-planner/mirrors.test.ts` deletion guard is unaffected by
+ * a package IMPORTING it (only by a package copying this body).
  */
-function appendData<T>(target: T[], value: T): void {
+export function appendData<T>(target: T[], value: T): void {
   Object.defineProperty(target, `${target.length}`, ownDataDescriptor(value));
 }
 
