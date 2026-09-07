@@ -258,7 +258,12 @@ describe("the measured rows of schema-boundary §3 (the registration half)", () 
 
   it("records no approver a bindMarketToSeries call did not carry", () => {
     // BASE, BOTH variants: `binding.approvedBy` became `"ghost"` — the human
-    // identity §9.2 requires, supplied by `Object.prototype`.
+    // identity §9.2 requires, supplied by `Object.prototype`. `UNIV-2` closed the
+    // ADOPTION and left the value UNGUARDED, so the call still succeeded and
+    // stored an APPROVED binding with no approver at all; `UNIV-3` item 9(c)
+    // aligns it with `approveSeries`' existing `SeriesDefinitionSchema` guard, so
+    // the same call is now REFUSED. Both halves are pinned: no ghost is adopted,
+    // and no approver-less approval is recorded either.
     for (const variant of VARIANTS) {
       const outcome = withInherited("approvedBy", inheritedValue("ghost", variant.enumerable), () =>
         attempt(() =>
@@ -269,8 +274,9 @@ describe("the measured rows of schema-boundary §3 (the registration half)", () 
           } as never),
         ),
       );
-      const registry = valueOf(outcome);
-      const binding = registry.markets.get(SAMPLE_MARKET_ID)?.seriesBinding as object;
+      expect(codesOf(outcome), variant.label).toEqual(["UNIVERSE_INPUT_INVALID"]);
+      // And the registry it was applied to is untouched: no binding was stored.
+      const binding = APPROVED.markets.get(SAMPLE_MARKET_ID)?.seriesBinding as object;
       expect(ownValue(binding, "approvedBy"), variant.label).toBeUndefined();
     }
   });
@@ -1615,19 +1621,34 @@ const HONEST_CASES: readonly (readonly [string, () => unknown])[] = [
 ];
 
 describe("honest inputs are unchanged by the doors", () => {
-  it("produces the VALUE digest measured at base 989d41d", () => {
+  it("produces the VALUE digest measured at base 989d41d, moved by UNIV-3's ONE mandated row", () => {
     // MEASURED, not asserted: this exact 87-case battery was run against the
     // REAL base code (`git stash` of `./registry.ts`, `./envelope.ts` and
     // `./lifecycle-door.ts`, so the raw `safeParse` path ran) and then against
     // the tip, and both produced `64d84df5…`. A change to any honest verdict —
     // refusal code, message, issue ORDER, thrown error, or any stored field —
     // moves this digest.
+    //
+    // `UNIV-3` MOVED IT, IN EXACTLY ONE ROW OF 87, AND THE MOVE WAS MEASURED THE
+    // SAME WAY (`git stash` of the five edited modules at base `c2c0733`, both
+    // transcripts dumped and diffed):
+    //
+    //   bind/noApprover
+    //     base: OK — an APPROVED `seriesBinding` was stored with NO `approvedBy`
+    //     tip : REFUSED UNIVERSE_INPUT_INVALID
+    //           "binding.approvedBy: Invalid input: expected string, received undefined"
+    //
+    // That is `schema-boundary.md` §5 item 9(c)'s bounded tightening: the two
+    // approval paths must agree, and `approveSeries` already round-tripped the
+    // candidate through the frozen `SeriesDefinitionSchema`. The refusal message
+    // is that schema's OWN — no new grammar is asserted here. The other 86 rows
+    // are byte-identical to base.
     expect(HONEST_CASES).toHaveLength(87);
     const transcript = HONEST_CASES.map(
       ([label, run]) => `${label}\n${verdict(run, true)}`,
     ).join("\n");
     expect(createHash("sha256").update(transcript).digest("hex")).toBe(
-      "64d84df53cd96cfdadc031546e76ac8c0903995f1f07751e1b704acb878d45bb",
+      "f59037b546edb90dfb9062b42be73e119147037128b2bcc8bdb89c6eadc6b407",
     );
   });
 
@@ -1640,11 +1661,15 @@ describe("honest inputs are unchanged by the doors", () => {
     // reader sees is identical — `undefined` either way, on a null-prototype
     // record — and `JSON.stringify` omits both, which is what the registry's own
     // re-registration comparison uses.
+    //
+    // `UNIV-3` moved this digest too, and the diff against base `c2c0733` is the
+    // SAME single row (`bind/noApprover`) and no other: measured by dumping both
+    // strict transcripts and diffing them, 1 of 87 lines changed.
     const transcript = HONEST_CASES.map(
       ([label, run]) => `${label}\n${verdict(run, false)}`,
     ).join("\n");
     expect(createHash("sha256").update(transcript).digest("hex")).toBe(
-      "fa7f69ab5eace97c3c43ea0128521826deab2200f8717f0794fdbb178646a5f8",
+      "2a3b787be5fc12d3a2af6097092fd2be6623e125a7fa6e0281ca188f1551370d",
     );
 
     const stored = expectOk(

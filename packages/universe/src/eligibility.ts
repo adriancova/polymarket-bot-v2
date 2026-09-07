@@ -16,6 +16,10 @@
  * EVERY refusal is returned, not the first, and each carries a stable code so an
  * operator sees the full list and a metric can label on it (§14.3).
  *
+ * The full projection structure enters through openOwnProjection; parameters:
+ * null is refused as UNIVERSE_INPUT_INVALID (F6), before nested reads. Nested
+ * caller-built records are still outside this shallow door.
+ *
  * PURE: the "as of" instant is an argument. This module reads no clock, so the
  * same market and the same instant always produce the same verdict — the
  * property a replay depends on (§12.4).
@@ -32,6 +36,7 @@ import {
 import type { MarketLifecycleState } from "./lifecycle-state.js";
 import { currentParameterVersion } from "./parameters.js";
 import { isApprovedSeriesBinding, type SeriesDefinition } from "./series.js";
+import { openOwnProjection, ownProjectionField } from "./state-door.js";
 import {
   ACTIVATION_PERMITTED_STATUS,
   isConsistentSettlementActivation,
@@ -85,6 +90,22 @@ export function evaluateMarketReadiness(
   projection: MarketProjection,
   input: MarketReadinessInput,
 ): MarketReadiness {
+  const opened = openOwnProjection(projection);
+  if (!opened.ok) {
+    return Object.freeze({
+      internalMarketId: "",
+      observationReady: false,
+      modelDependentActivationAllowed: false,
+      // A display sentinel on an invalid result, never an adopted state.
+      effectiveLifecycleState: "DISCOVERED",
+      refusals: Object.freeze([universeRefusal(
+        "UNIVERSE_INPUT_INVALID", "readiness requires a valid own-data projection",
+        { issues: opened.issues },
+      )]),
+    });
+  }
+  projection = opened.value;
+  const storedLifecycle = ownProjectionField(projection, "lifecycleState") as MarketProjection["lifecycleState"];
   const refusals: UniverseRefusal[] = [];
   const internalMarketId = projection.identity.internalMarketId;
 
@@ -99,7 +120,7 @@ export function evaluateMarketReadiness(
       internalMarketId,
       observationReady: false,
       modelDependentActivationAllowed: false,
-      effectiveLifecycleState: projection.lifecycleState,
+      effectiveLifecycleState: storedLifecycle,
       refusals: Object.freeze([
         universeRefusal(
           "UNIVERSE_TIMESTAMP_INVALID",
@@ -121,11 +142,11 @@ export function evaluateMarketReadiness(
       }),
     );
   } else {
-    if (projection.lifecycleState === "DISCOVERED") {
+    if (storedLifecycle === "DISCOVERED") {
       refusals.push(
         universeRefusal("UNIVERSE_MARKET_NOT_OPEN", "the market has not opened", {
           internalMarketId,
-          lifecycleState: projection.lifecycleState,
+          lifecycleState: storedLifecycle,
         }),
       );
     }
@@ -153,7 +174,7 @@ export function evaluateMarketReadiness(
   // The venue documents that trading stops at RESOLUTION; nothing observed
   // asserts it stopped at the schedule.
   const observationReady =
-    projection.lifecycleState === "OPEN" || projection.lifecycleState === "CLOSING";
+    storedLifecycle === "OPEN" || storedLifecycle === "CLOSING";
 
   // --- settlement state ---------------------------------------------------
   if (projection.outcomeState !== "PENDING") {
@@ -379,7 +400,14 @@ export function evaluateMarketReadiness(
       // §6 invariant 9: a review of superseded rules is not a review of what
       // is trading now. Both sides are REQUIRED: an unknown market rules
       // version cannot confirm the review applies, so it fails closed.
-      if (projection.rulesVersionId === undefined) {
+      // An OWN read (`./state-door.ts`, `UNIV-3`). This is the SHARPEST cell of
+      // the projection-side class: at base, in BOTH pollution variants, an
+      // inherited `rulesVersionId` equal to the reviewed spec's turned
+      // `modelDependentActivationAllowed: false` plus this very refusal into
+      // `true` with NO refusals at all — §9.2's model-dependent activation
+      // gate, opened by a value the projection never recorded.
+      const marketRulesVersionId = ownProjectionField(projection, "rulesVersionId");
+      if (marketRulesVersionId === undefined) {
         refusals.push(
           universeRefusal(
             "UNIVERSE_SETTLEMENT_RULES_VERSION_DRIFT",
@@ -387,14 +415,14 @@ export function evaluateMarketReadiness(
             { internalMarketId, specRulesVersionId: settlement.rulesVersionId },
           ),
         );
-      } else if (settlement.rulesVersionId !== projection.rulesVersionId) {
+      } else if (settlement.rulesVersionId !== marketRulesVersionId) {
         refusals.push(
           universeRefusal(
             "UNIVERSE_SETTLEMENT_RULES_VERSION_DRIFT",
             "the reviewed settlement spec names a different market rules version than the market is trading under",
             {
               internalMarketId,
-              marketRulesVersionId: projection.rulesVersionId,
+              marketRulesVersionId,
               specRulesVersionId: settlement.rulesVersionId,
             },
           ),
