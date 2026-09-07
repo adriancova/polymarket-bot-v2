@@ -422,8 +422,10 @@ function arenaBuild(): unknown {
  * quoted at the battery below, and they are the ones that were corrupting a
  * refusal vocabulary rather than merely refusing).
  *
- * WHAT REMAINS IS NOT THIS PACKAGE'S, AND IT IS NAMED. The 18 survivors are one
- * library line: `zod`'s `handleArrayResult` does `final.value[index] =
+ * WHAT REMAINS IS NOT THIS PACKAGE'S, AND IT IS NAMED. The 18 survivors are
+ * the library's own array assembly — TWO sites, not one, both in the same
+ * fail-closed direction (the second measured by review round 1): a WARMED
+ * schema's `handleArrayResult` does `final.value[index] =
  * result.value` (`zod@4.4.3`, `v4/core/schemas.js:678`) into the container
  * `$ZodArray` allocated one line earlier as `payload.value = Array(input.length)`
  * — a SPARSE ordinary array. `schema-arena.ts` substitutes a prototype-free
@@ -438,6 +440,12 @@ function arenaBuild(): unknown {
  *   at inst._zod.parse   (zod/v4/core/schemas.js:705:17)   ← $ZodArray
  *   at copy._zod.run     (packages/risk/src/schema-arena.ts)
  * ```
+ *
+ * A COLD schema (first parse) throws one stop earlier instead: `Doc.write`
+ * (`zod/v4/core/doc.js:24:26`) reached via `generateFastpass`
+ * (`schemas.js:878`), before `handleArrayResult` runs. Same class, same
+ * fail-closed direction; the enumeration was corrected from "one line" to
+ * these two sites by review round 1 (its own stack capture).
  *
  * Widening the predicate would make every parsed ARRAY OUTPUT prototype-free
  * for every consumer of the shared arena (`capital-allocator`, `ledger`, `pnl`,

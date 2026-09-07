@@ -2742,9 +2742,13 @@ describe("a hostile value at the boundary — review round 5", () => {
   // `bySeries["constructor"]`, which answers the `Object` CONSTRUCTOR — not
   // `undefined` — exactly as `byStrategyInstance["constructor"]` did.
   //
-  // Reproduced before it was moved: at this tip, with the series key polluted
-  // and no `bySeries` measurement, `checkExposureLimits` reads the intrinsic
-  // unless `ownEntry` refuses it.
+  // Reproduced before it was moved. What these two rows actually exercise
+  // (review round 1 correction): they go through `evaluateIntent`, whose
+  // arena-parsed input is prototype-free BEFORE `checkExposureLimits` runs, so
+  // on this path the intrinsic never reaches the lookup at all. `ownEntry`'s
+  // own-property refusal is defence in depth for direct callers of
+  // `checkExposureLimits` — it is not what these rows pin, and it currently
+  // has no test of its own (review r1 N1, owned by the risk package).
 
   it("an INHERITED scope entry is not a measurement — RISK_EXPOSURE_ENTRY_MISSING still fires", () => {
     // `MarketContext.scope.seriesKey` is a `CodeString`, so `"constructor"` is
