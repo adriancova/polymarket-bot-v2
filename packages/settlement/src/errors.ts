@@ -120,13 +120,31 @@ export interface SettlementRefusal {
   readonly details: SettlementRefusalDetails;
 }
 
-/** Builds a refusal. Kept as a function so every refusal has the same shape. */
+/**
+ * Builds a refusal. Kept as a function so every refusal has the same shape.
+ *
+ * D4 (ADR-020 §3): the refusal and its `details` are emitted with a NULL
+ * PROTOTYPE, so a consumer branching on `refusal.details["field"]` — the
+ * schema's own refinement does exactly that — reads what this package put
+ * there, or nothing. `details` is copied key by key from the caller's OWN
+ * properties, so an inherited key cannot ride into a refusal either.
+ */
 export function settlementRefusal(
   code: SettlementRefusalCode,
   message: string,
   details: SettlementRefusalDetails = {},
 ): SettlementRefusal {
-  return Object.freeze({ code, message, details: Object.freeze({ ...details }) });
+  const copied = Object.create(null) as Record<string, unknown>;
+  for (const key of Object.keys(details)) {
+    if (key !== "__proto__" && Object.hasOwn(details, key)) {
+      copied[key] = details[key];
+    }
+  }
+  const refusal = Object.create(null) as { code: SettlementRefusalCode; message: string; details: SettlementRefusalDetails };
+  refusal.code = code;
+  refusal.message = message;
+  refusal.details = Object.freeze(copied);
+  return Object.freeze(refusal);
 }
 
 /** A successful result, or the refusals that prevented it. */

@@ -23,9 +23,11 @@ import {
   type SettlementRefusal,
 } from "./errors.js";
 import { selectPayoffModel } from "./models/registry.js";
+import { ownEmit, ownField } from "./spec-door.js";
 import {
   safeParseSettlementSpec,
   settlementSpecReviewBlockers,
+  settlementVerificationStatus,
   type SettlementReviewContext,
   type SettlementSpec,
 } from "./spec.js";
@@ -89,6 +91,16 @@ export interface SettlementActivationInput {
   readonly reviewContext?: SettlementReviewContext;
 }
 
+/**
+ * D4 (ADR-020 §3): the verdict is emitted with a NULL PROTOTYPE, frozen, in the
+ * declared key order.
+ *
+ * The consumer of this record is `@polymarket-bot/universe`'s eligibility
+ * check, and the question it asks is whether activation is allowed. An emitted
+ * record with an ordinary prototype answers `verdict.payoffModel` — or any
+ * field a future consumer reads with `?? default` — out of `Object.prototype`
+ * when the verdict does not carry it.
+ */
 function verdict(
   status: SettlementActivationStatus,
   refusals: readonly SettlementRefusal[],
@@ -99,12 +111,18 @@ function verdict(
     readonly payoffModel?: PayoffModelId;
   } = {},
 ): SettlementActivationVerdict {
-  return Object.freeze({
-    status,
-    modelDependentActivationAllowed: status === ACTIVATION_PERMITTED_STATUS,
-    ...detail,
-    refusals: Object.freeze([...refusals]),
-  });
+  const fields: (readonly [string, unknown])[] = [
+    ["status", status],
+    ["modelDependentActivationAllowed", status === ACTIVATION_PERMITTED_STATUS],
+  ];
+  for (const key of ["settlementSpecId", "seriesId", "rulesVersionId", "payoffModel"] as const) {
+    const value = ownField(detail, key);
+    if (value !== undefined) {
+      fields.push([key, value]);
+    }
+  }
+  fields.push(["refusals", Object.freeze([...refusals])]);
+  return ownEmit<SettlementActivationVerdict>(fields);
 }
 
 /**
@@ -112,11 +130,28 @@ function verdict(
  *
  * Every branch that is not `REVIEWED_MODEL_BACKED` carries at least one
  * refusal, so an operator always has a reason and a metric always has a label.
+ *
+ * PROTOTYPE-SAFE READS (ADR-020 §3 D3; `docs/contracts/schema-boundary.md` §3,
+ * probe N). Three reads on this path decide activation and all three are own
+ * reads:
+ *
+ * 1. `input.spec` — a dot read answers "is a spec bound to this series?" out of
+ *    `Object.prototype`, so a series with NO binding could be classified
+ *    against a document nobody bound to it;
+ * 2. `input.reviewContext` — it carries the published-window list the
+ *    `SPEC_VERIFICATION_UNSOUND` gate consults;
+ * 3. the spec's own `verification.status`, at both gates below, through
+ *    {@link settlementVerificationStatus}.
+ *
+ * The spec itself is the door's own prototype-free emission
+ * ({@link safeParseSettlementSpec}), so every later read of it is answered by
+ * the document and by nothing else.
  */
 export function classifySettlementActivation(
   input: SettlementActivationInput = {},
 ): SettlementActivationVerdict {
-  if (input.spec === undefined || input.spec === null) {
+  const candidate = ownField(input, "spec");
+  if (candidate === undefined || candidate === null) {
     return verdict("SPEC_MISSING", [
       settlementRefusal(
         "SETTLEMENT_SPEC_MISSING",
@@ -125,15 +160,16 @@ export function classifySettlementActivation(
     ]);
   }
 
-  const parsed = safeParseSettlementSpec(input.spec);
+  const parsed = safeParseSettlementSpec(candidate);
   if (!parsed.ok) {
     return verdict("SPEC_INVALID", [parsed.refusal]);
   }
   const spec: SettlementSpec = parsed.spec;
+  const rulesVersionId = ownField(spec, "rulesVersionId");
   const identity = {
     settlementSpecId: spec.settlementSpecId,
     seriesId: spec.seriesId,
-    ...(spec.rulesVersionId === undefined ? {} : { rulesVersionId: spec.rulesVersionId }),
+    ...(rulesVersionId === undefined ? {} : { rulesVersionId: rulesVersionId as string }),
   };
 
   const selected = selectPayoffModel(spec);
@@ -141,8 +177,9 @@ export function classifySettlementActivation(
     return verdict("SPEC_NO_PAYOFF_MODEL", selected.refusals, identity);
   }
   const withModel = { ...identity, payoffModel: selected.value };
+  const verificationStatus = settlementVerificationStatus(spec);
 
-  if (spec.verification.status === "REJECTED") {
+  if (verificationStatus === "REJECTED") {
     return verdict(
       "SPEC_REJECTED",
       [
@@ -156,7 +193,13 @@ export function classifySettlementActivation(
     );
   }
 
-  if (spec.verification.status === "UNVERIFIED") {
+  // `!== "VERIFIED"` rather than `=== "UNVERIFIED"`, and an OWN read rather
+  // than `spec.verification.status`: a document that states no review outcome
+  // of its own has none, whatever `Object.prototype` says, and it falls on the
+  // blocking side of the gate rather than through it. The measured cell is
+  // exactly this one — a spec carrying no `verification` key at all cleared
+  // both gates and activated as `REVIEWED_MODEL_BACKED`.
+  if (verificationStatus !== "VERIFIED") {
     return verdict(
       "SPEC_UNVERIFIED",
       [
@@ -173,7 +216,11 @@ export function classifySettlementActivation(
   // The spec claims a review. A claim is not evidence: re-check the conditions
   // that must have held when it was made, because the world (a feed's published
   // windows) can move underneath a spec that was correct when signed.
-  const blockers = settlementSpecReviewBlockers(spec, input.reviewContext ?? {});
+  const reviewContext = ownField(input, "reviewContext");
+  const blockers = settlementSpecReviewBlockers(
+    spec,
+    (reviewContext as SettlementReviewContext | undefined) ?? {},
+  );
   if (blockers.length > 0) {
     return verdict("SPEC_VERIFICATION_UNSOUND", blockers, withModel);
   }
