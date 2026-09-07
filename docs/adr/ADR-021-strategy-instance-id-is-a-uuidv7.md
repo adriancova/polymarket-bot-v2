@@ -124,3 +124,33 @@ Append-only; nothing above this line changed.
 4. The interim state is fail-closed in the safe direction: the risk door
    now accepts `0`-leading UUIDv7s that the allocator door refuses —
    a cross-package narrowing that rejects, never admits.
+
+## Second amendment (2026-09-06, later the same day): the allocator door is corrected
+
+Append-only; nothing above this line changed.
+
+1. **The `packages/capital-allocator` re-typing is EXECUTED** (`ALLOC-1`,
+   merged `d9f70a6`; review round 1 ACCEPT, 0 blockers): all four
+   identity sites named in the first amendment now type
+   `strategyInstanceId` as `Uuidv7Schema`; the three scope keys remain
+   `CodeStringSchema` (vocabulary, not identity), and that boundary is
+   mutation-pinned in both directions.
+2. **What the base state actually permitted, measured in review:** the
+   old typing accepted a re-cased instance id verbatim into the
+   commitment tables AND gave it its own `byStrategyInstance` exposure
+   key — two spellings of one instance held SEPARATE per-strategy cap
+   buckets, a cap-evasion surface. Non-UUID code strings likewise
+   reached the tables and exposure keys verbatim. Both are closed
+   fail-closed.
+3. **The allocator's refusal-evidence shape did NOT change** (unlike the
+   risk door's, recorded in ADR-016's 2026-09-06 amendment): the
+   allocator already reported `CAPITAL_INPUT_INVALID` with
+   `details.issues` on both sides; only the message string moved.
+4. **The trader step is dispatched** (`TRDR-1`) with a review-added
+   obligation beyond this ADR's original text: the interim
+   `UuidAndCodeString` regex is version- AND variant-blind (a
+   letter-leading lowercase v4 passes startup and is refused only
+   mid-run by the risk door — fail-closed today), so replacing it with
+   the real `Uuidv7Schema` is a simultaneous widening (0-leading
+   admitted) and tightening (version/variant enforced), and the round is
+   accountable for BOTH directions.
