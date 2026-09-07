@@ -65,17 +65,25 @@
  * | payout containment-delete (the `terminal` detail) | 1 |
  * | each of the SIX `UUID_V7_FORM` single-group case drifts | 1 each |
  *
- * THREE MUTANTS SURVIVE, and they are named rather than hidden. Reverting
- * `requireComparison`, `selectPayoffModel`'s returned model or
- * `checkTwapWindow`'s `windowSeconds` to a dot read leaves this suite green —
- * and so does handing the caller's object to the TERMINAL-SPOT evaluator. Both
- * facts have the same cause: those reads are SECOND-LINE. Every cell of the
- * compatibility matrix requires the spec field the second line would read, and
- * every key those three evaluators read is in the door's required table, so with
- * the field missing the first gate has already refused. The first gate's own
- * reads are the ones that carry the property, and they are killed above. See
- * "the first gate answers before the second-line reads are reached", which pins
- * that ordering rather than assuming it.
+ * EIGHT MUTANTS SURVIVE, and they are named rather than hidden (the SETL-2
+ * review measured eight where this header originally said three; corrected
+ * pre-merge with the reviewer's enumeration). Reverting `requireComparison`,
+ * `selectPayoffModel`'s returned model, `checkTwapWindow`'s `windowSeconds`,
+ * or `evaluateReferenceOpenUpDown`'s `ownField(spec, "observationType")` to a
+ * dot read leaves this suite green — and so does handing the caller's object
+ * to the TERMINAL-SPOT, TWAP or THRESHOLD evaluator, or making
+ * `observationOwnIssues`' no-table branch return `[]`. All eight facts have
+ * the same cause: those reads are SECOND-LINE. Every cell of the
+ * compatibility matrix requires the spec field the second line would read,
+ * every key those evaluators read is in the door's REQUIRED table (the
+ * up/down evaluator's D1-identity mutant IS killed, 3 kills, precisely
+ * because its three window fields are optional), the up/down
+ * `observationType` read is refused earlier by `candidatePayoffModels`, and
+ * the no-table branch only ever receives a `PAYOFF_MODEL_IDS`-validated
+ * model. The first gate's own reads are the ones that carry the property,
+ * and they are killed above. See "the first gate answers before the
+ * second-line reads are reached", which pins that ordering rather than
+ * assuming it.
  *
  * DEPLOYMENT READING, required whenever the §3 row is quoted: nothing on the
  * wire can write `Object.prototype`; every prototype class above needs code
