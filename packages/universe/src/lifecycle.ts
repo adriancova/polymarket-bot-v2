@@ -33,19 +33,29 @@
  *    `MarketOpened` with a different instant is a contradiction and is refused;
  *    a `MarketClosing` that moves the close is a legitimate reschedule (§9.2
  *    versions `close_time`) and is applied.
+ *
+ * AND EVERY PAYLOAD ENTERS THROUGH `./lifecycle-door.ts`. Rule 1 is only worth
+ * as much as the reading of the event that carries the terminal outcome, and
+ * `docs/contracts/schema-boundary.md` §3 (probe O) measured that a `zod` parse
+ * does not give it: at the pinned `zod@4.4.3` a declared key the payload does
+ * NOT carry is read off `Object.prototype`, so a `MarketResolved` without an
+ * `outcome` resolved the market anyway. The door materializes the payload
+ * prototype-free before the parse and hands the arms below a null-prototype
+ * record built from the event's OWN properties (ADR-020 §3 D1/D3/D4); nothing
+ * in this module reads `zod`'s output.
  */
 
 import {
-  MarketClarificationObservedPayloadSchema,
-  MarketClosingPayloadSchema,
-  MarketDiscoveredPayloadSchema,
-  MarketMetadataChangedPayloadSchema,
-  MarketOpenedPayloadSchema,
-  MarketResolvedPayloadSchema,
-  MarketRulesChangedPayloadSchema,
-  TradingParametersChangedPayloadSchema,
   MarketOutcomeStateSchema,
   isTerminalMarketOutcomeState,
+  type MarketClarificationObservedPayloadSchema,
+  type MarketClosingPayloadSchema,
+  type MarketDiscoveredPayloadSchema,
+  type MarketMetadataChangedPayloadSchema,
+  type MarketOpenedPayloadSchema,
+  type MarketResolvedPayloadSchema,
+  type MarketRulesChangedPayloadSchema,
+  type TradingParametersChangedPayloadSchema,
   type IsoTimestamp,
   type MarketOutcomeState,
 } from "@polymarket-bot/domain";
@@ -60,6 +70,7 @@ import {
   type UniverseResult,
 } from "./errors.js";
 import type { MarketIdentity } from "./identity.js";
+import { openLifecyclePayload, ownEmit } from "./lifecycle-door.js";
 import {
   lifecycleRank,
   type EventDrivenLifecycleState,
@@ -120,23 +131,15 @@ export const MARKET_LIFECYCLE_EVENT_TYPES = [
 
 export type MarketLifecycleEventType = (typeof MARKET_LIFECYCLE_EVENT_TYPES)[number];
 
-const PAYLOAD_SCHEMAS: Readonly<Record<MarketLifecycleEventType, z.ZodType>> = Object.freeze({
-  MarketDiscovered: MarketDiscoveredPayloadSchema,
-  MarketMetadataChanged: MarketMetadataChangedPayloadSchema,
-  MarketRulesChanged: MarketRulesChangedPayloadSchema,
-  MarketOpened: MarketOpenedPayloadSchema,
-  MarketClosing: MarketClosingPayloadSchema,
-  MarketResolved: MarketResolvedPayloadSchema,
-  MarketClarificationObserved: MarketClarificationObservedPayloadSchema,
-  TradingParametersChanged: TradingParametersChangedPayloadSchema,
-});
-
 /**
  * One event to fold.
  *
  * The payload is `unknown` and is validated against the FROZEN domain schema
- * inside this module. A caller cannot skip validation by handing over a
- * pre-shaped object, and this package never defines its own copy of a payload.
+ * inside this module — through `./lifecycle-door.ts`, which materializes it
+ * prototype-free first and takes every folded value from that materialized
+ * tree (ADR-020 §3, D1/D3/D4). A caller cannot skip validation by handing over
+ * a pre-shaped object, and this package never defines its own copy of a
+ * payload.
  */
 export interface MarketLifecycleInput {
   readonly eventType: MarketLifecycleEventType;
@@ -152,14 +155,18 @@ export interface ProjectionApplied {
   readonly idempotent: boolean;
 }
 
+/**
+ * The one refusal every door rejection carries.
+ *
+ * The issues arrive already rendered from `./lifecycle-door.ts`, because
+ * `zod`'s issue rendering is itself a prototype-reading path that must run
+ * inside the door's containment (ADR-020 amendment 2026-09-06). The message and
+ * details are byte-identical to what the raw parse produced.
+ */
 function invalidPayload(
   eventType: MarketLifecycleEventType,
-  error: z.ZodError,
+  issues: readonly string[],
 ): UniverseRefusal {
-  const issues = error.issues.map((issue) => {
-    const path = issue.path.map((segment) => String(segment)).join(".");
-    return `${path === "" ? "(root)" : path}: ${issue.message}`;
-  });
   return universeRefusal(
     "UNIVERSE_INPUT_INVALID",
     `${eventType} payload is invalid: ${issues.join("; ")}`,
@@ -260,22 +267,29 @@ function regression(
  * Refuses rather than guesses: an event that contradicts a recorded fact, names
  * a different market, or repeats one already folded produces a typed refusal and
  * leaves the projection untouched.
+ *
+ * THE PAYLOAD IS READ THROUGH THE DOOR (`./lifecycle-door.ts`), never from
+ * `zod`'s output. The nine sites that used to consume `parsed.data` — the
+ * identity check and the eight dispatch arms — consume `payload`, a
+ * null-prototype record built from the caller's OWN properties, because a
+ * declared key the payload does not carry is otherwise supplied by
+ * `Object.prototype` (`docs/contracts/schema-boundary.md` §3, probe O:
+ * `outcome`, `resolvedAt` and `conditionId` measured, all 32 required keys of
+ * the eight arms measured by `UNIV-1`). The `payload as ...` casts below are
+ * the door's statement that it read exactly the keys the frozen schema
+ * declares, in the shapes it declares.
  */
 export function applyMarketLifecycleEvent(
   projection: MarketProjection,
   input: MarketLifecycleInput,
 ): UniverseResult<ProjectionApplied> {
-  const schema = PAYLOAD_SCHEMAS[input.eventType];
-  const parsed = schema.safeParse(input.payload);
-  if (!parsed.success) {
-    return universeFailure(invalidPayload(input.eventType, parsed.error));
+  const door = openLifecyclePayload(input.eventType, input.payload);
+  if (!door.ok) {
+    return universeFailure(invalidPayload(input.eventType, door.issues));
   }
+  const payload = door.value;
 
-  const identityRefusal = checkIdentity(
-    projection,
-    parsed.data as MarketReference,
-    input.eventType,
-  );
+  const identityRefusal = checkIdentity(projection, payload as MarketReference, input.eventType);
   if (identityRefusal !== undefined) {
     return universeFailure(identityRefusal);
   }
@@ -289,32 +303,29 @@ export function applyMarketLifecycleEvent(
 
   switch (input.eventType) {
     case "MarketDiscovered":
-      return applyDiscovered(next, parsed.data as z.infer<typeof MarketDiscoveredPayloadSchema>);
+      return applyDiscovered(next, payload as z.infer<typeof MarketDiscoveredPayloadSchema>);
     case "MarketMetadataChanged":
       return applyMetadataChanged(
         next,
-        parsed.data as z.infer<typeof MarketMetadataChangedPayloadSchema>,
+        payload as z.infer<typeof MarketMetadataChangedPayloadSchema>,
       );
     case "MarketRulesChanged":
-      return applyRulesChanged(
-        next,
-        parsed.data as z.infer<typeof MarketRulesChangedPayloadSchema>,
-      );
+      return applyRulesChanged(next, payload as z.infer<typeof MarketRulesChangedPayloadSchema>);
     case "MarketOpened":
-      return applyOpened(next, parsed.data as z.infer<typeof MarketOpenedPayloadSchema>);
+      return applyOpened(next, payload as z.infer<typeof MarketOpenedPayloadSchema>);
     case "MarketClosing":
-      return applyClosing(next, parsed.data as z.infer<typeof MarketClosingPayloadSchema>);
+      return applyClosing(next, payload as z.infer<typeof MarketClosingPayloadSchema>);
     case "MarketResolved":
-      return applyResolved(next, parsed.data as z.infer<typeof MarketResolvedPayloadSchema>);
+      return applyResolved(next, payload as z.infer<typeof MarketResolvedPayloadSchema>);
     case "MarketClarificationObserved":
       return applyClarification(
         next,
-        parsed.data as z.infer<typeof MarketClarificationObservedPayloadSchema>,
+        payload as z.infer<typeof MarketClarificationObservedPayloadSchema>,
       );
     case "TradingParametersChanged":
       return applyParametersChanged(
         next,
-        parsed.data as z.infer<typeof TradingParametersChangedPayloadSchema>,
+        payload as z.infer<typeof TradingParametersChangedPayloadSchema>,
       );
   }
 }
@@ -547,15 +558,21 @@ function applyClarification(
         projection.lifecycleState === "CLOSING" ||
         afterResolution;
 
-  const record: MarketClarificationRecord = Object.freeze({
-    clarificationId: payload.clarificationId,
-    observedAt: payload.observedAt,
-    ...(payload.rulesVersionId === undefined
-      ? {}
-      : { rulesVersionId: payload.rulesVersionId }),
-    afterOpen,
-    afterResolution,
-  });
+  // D4: the record this module EMITS is prototype-free. A consumer asking a
+  // clarification for a `rulesVersionId` it does not carry must get
+  // `undefined`, not whatever `Object.prototype` holds — the output-side half
+  // of the same class the door closes on the input side.
+  const record: MarketClarificationRecord = Object.freeze(
+    ownEmit<MarketClarificationRecord>({
+      clarificationId: payload.clarificationId,
+      observedAt: payload.observedAt,
+      ...(payload.rulesVersionId === undefined
+        ? {}
+        : { rulesVersionId: payload.rulesVersionId }),
+      afterOpen,
+      afterResolution,
+    }),
+  );
 
   // EVERY unresolved clarification moves the market to
   // `PENDING_CLARIFICATION`, including one observed before the open: a
