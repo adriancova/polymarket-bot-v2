@@ -51,6 +51,8 @@
 
 import { z } from "zod";
 
+import type { WireFields } from "./wire-door.js";
+
 /**
  * `isHexString` from the SDK's `@polymarket/types`, verbatim:
  * `/^0x[a-fA-F0-9]+$/`.
@@ -170,6 +172,20 @@ export const VenueBookLevelSchema = z.object({
   price: VenueDecimalStringSchema,
   size: VenueDecimalStringSchema,
 });
+
+/**
+ * {@link VenueBookLevelSchema}'s declared fields, for `./wire-door.ts`'s D3
+ * projection.
+ *
+ * Every table like this one is checked against its schema by
+ * `./venue-fields.test.ts` — key list, key ORDER, requiredness and the two
+ * transform rules are all re-derived from the schema object itself, so this is
+ * a projection of the schema rather than a second copy of it.
+ */
+export const VENUE_BOOK_LEVEL_FIELDS: WireFields = [
+  { key: "price", required: true, rule: "verbatim" },
+  { key: "size", required: true, rule: "verbatim" },
+];
 
 export type VenueBookLevel = z.infer<typeof VenueBookLevelSchema>;
 
