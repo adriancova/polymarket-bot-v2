@@ -149,7 +149,13 @@ const STATE_VALUE = {
 
 const RESERVATION_VALUE = {
   reservationId: "res-1",
-  strategyInstanceId: "strat-a",
+  // `ALLOC-1`: `strategyInstanceId` is a `Uuidv7Schema` identity at the
+  // allocator's four doors (ADR-021's 2026-09-06 amendment), so `"strat-a"`
+  // stopped parsing and this corpus lost its only ACCEPTING row — the
+  // non-vacuity guard below, not the differential one, is what said so. The
+  // letter-leading intersection spelling is used because it is accepting under
+  // BOTH grammars, so the row measures the arena rather than the round.
+  strategyInstanceId: "a1890000-0000-7000-8000-00000000000a",
   runMode: "PAPER",
   accountingMode: "LIVE",
   marketId: "01890000-0000-7000-8000-000000000001",
