@@ -28,6 +28,12 @@
  * it, and an absent field of it stays absent under every read (the WP-180
  * lessons, applied to the OUTPUT side).
  *
+ * The §9.5 storage helpers below — {@link snapshotReference} and
+ * {@link selectIndexedValues} — are emitted through the SAME
+ * {@link ownFrozenTree} machinery, so the values a decision row is built from
+ * carry the property the snapshot carries (`WP-160-FU1`, closing `WP-160`
+ * R1-L3 / the `GOV-2A` schema-boundary row for this package).
+ *
  * ## Storage guidance (§9.5)
  *
  * High-frequency snapshots may live in the event archive — `serialization` is
@@ -406,9 +412,16 @@ function ownFrozenTree(value: unknown): unknown {
 // Storage helpers (§9.5)
 // ---------------------------------------------------------------------------
 
-/** The durable reference an action decision stores alongside indexed values. */
+/**
+ * The durable reference an action decision stores alongside indexed values.
+ *
+ * Emitted through {@link ownFrozenTree}, the same machinery the snapshot
+ * itself is built with: the reference is destined for the same PostgreSQL row
+ * as the indexed values, and a prototype-bearing row object answers EVERY name
+ * a writer asks it for — including names this contract does not declare.
+ */
 export function snapshotReference(snapshot: FeatureSnapshot): FeatureSnapshotReference {
-  return Object.freeze({
+  return ownFrozenTree({
     contentAddress: snapshot.contentAddress,
     format: snapshot.format,
     featureSet: snapshot.featureSet,
@@ -417,7 +430,7 @@ export function snapshotReference(snapshot: FeatureSnapshot): FeatureSnapshotRef
     asOf: snapshot.asOf,
     triggerGatewayEpoch: snapshot.trigger.gatewayEpoch,
     triggerIngestSeq: snapshot.trigger.ingestSeq,
-  });
+  }) as FeatureSnapshotReference;
 }
 
 /**
@@ -426,6 +439,15 @@ export function snapshotReference(snapshot: FeatureSnapshot): FeatureSnapshotRef
  * `INPUT_MISSING` is NOT fabricated — an unknown id is simply not returned,
  * and the caller can compare lengths; a snapshot always carries every
  * registered id, so an unknown id is a caller typo, not a data condition.
+ *
+ * Every member is emitted through {@link ownFrozenTree} — the SAME machinery
+ * the snapshot itself is built with (`computeGuarded` step 5). Ordinary
+ * literals were the `WP-160` R1-L3 defect that `GOV-2A` re-measured: an OK
+ * member has no own `reason` and an ABSENT member has no own `value`, so with
+ * a prototype a polluted `Object.prototype.reason` answered for BOTH returned
+ * members and a polluted `Object.prototype.value` gave an ABSENT member a
+ * value. These rows are indexed next to decisions in PostgreSQL, so a name
+ * this contract leaves absent must read as absent for every consumer.
  */
 export function selectIndexedValues(snapshot: FeatureSnapshot, ids: readonly string[]): readonly IndexedFeatureValue[] {
   const wanted = new Set(ids);
@@ -438,7 +460,7 @@ export function selectIndexedValues(snapshot: FeatureSnapshot, ids: readonly str
         : { id: entry.id, version: entry.version, status: "ABSENT", ...(entry.reason === undefined ? {} : { reason: entry.reason }) },
     );
   }
-  return Object.freeze(selected);
+  return ownFrozenTree(selected) as readonly IndexedFeatureValue[];
 }
 
 /**
