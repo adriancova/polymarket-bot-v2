@@ -50,9 +50,11 @@ deletion guard's own matcher scores every new module 0/14).
    defeat (the `dataLossBoundMs` check silently passing) and the
    inherited feed-block adoption both refused; four defeated defaults and
    two further adoptable feed blocks found by audit and closed. The door
-   applies the schema's defaults itself; the 12-entry `.default()` census
-   is derived FROM the schema, so a new `.default()` without a table row
-   fails (demonstrated live with a 13th).
+   applies the schema's defaults itself; the 13-entry `.default()` census
+   (11 nested + the root `tickIntervalMs` + the `publisher` block —
+   corrected from the round-1 figure of 12 in the docs round) is derived
+   FROM the schema, so a new `.default()` without a table row fails
+   (demonstrated live by adding one more).
 
 **Honest-input preservation:** verdict digests at base (git-stashed real
 base code) and tip over every fixture — adapters byte-identical under raw
