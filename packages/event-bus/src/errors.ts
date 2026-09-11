@@ -11,6 +11,8 @@
  * `resync-required` result from `receive` — never a quietly discarded event.
  */
 
+import { brandOwn, ENVELOPE_REFUSAL_BRAND } from "./brand.js";
+
 export type EventBusErrorCode =
   /** Transport or subscription options are self-contradictory or out of range. */
   | "EVENT_BUS_CONFIGURATION"
@@ -51,7 +53,7 @@ export class EventBusError extends Error {
     details: EventBusErrorDetails = {},
     options: { readonly cause?: unknown } = {},
   ) {
-    super(message, "cause" in options ? { cause: options.cause } : undefined);
+    super(message, Object.hasOwn(options, "cause") ? { cause: options.cause } : undefined);
     this.name = new.target.name;
     this.code = code;
     this.details = details;
@@ -72,10 +74,20 @@ export class EventBusConfigurationError extends EventBusError {
  * than a dropped event: the caller still holds the envelope and decides what to
  * do with it (§8.3, ADR-002 §2.5 — route it to `DataQualityIncidentOpened`
  * with the raw frame preserved).
+ *
+ * BRANDED at construction (`./brand.ts`). The envelope door's containment has
+ * to decide "is this refusal already mine?" about a value a caller may have
+ * thrown, and `instanceof` cannot answer that question safely — it walks the
+ * prototype chain, so a `Proxy` with a throwing `getPrototypeOf` trap makes the
+ * classification itself throw a bare error out of the boundary. The brand is an
+ * own non-enumerable data property, so it is read with one descriptor lookup and
+ * changes nothing observable about the error: message, `code`, `details`,
+ * `cause`, `name`, `instanceof` and structural equality are all as before.
  */
 export class EventBusEnvelopeError extends EventBusError {
   constructor(message: string, details: EventBusErrorDetails = {}) {
     super("EVENT_BUS_ENVELOPE_INVALID", message, details);
+    brandOwn(this, ENVELOPE_REFUSAL_BRAND);
   }
 }
 
