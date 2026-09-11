@@ -1,8 +1,35 @@
 /**
- * §7.1 envelope validation and JSON encoding. Payload semantics remain opaque;
- * its own enumerable data is deep-copied in key order without normalization.
- * Honest JSON bytes are preserved, while callers receive a fresh frozen
- * null-prototype tree rather than the live object or the schema output.
+ * Envelope validation and wire encoding for the transport.
+ *
+ * ## The payload is opaque
+ *
+ * This module validates the §7.1 envelope and nothing else. The payload is
+ * carried through untouched: it is never parsed against an event contract,
+ * never normalized, never re-serialized field by field, and a decimal string in
+ * it is never converted to a JavaScript `number`. Deciding what a payload
+ * *means* belongs to the producer that built it and the consumer that handles
+ * it; the transport is not a validation checkpoint for either.
+ *
+ * ## Round-trip fidelity
+ *
+ * What a consumer receives must be value-equivalent to what was published. The
+ * wire form is `JSON.stringify` of the materialized own-data copy of the
+ * caller's input — never of the schema's parse output. That copy is the caller's
+ * own enumerable data, deep-copied in key order without normalization, so it is
+ * value-equal to the input and encodes to byte-identical JSON; encoding the
+ * checked *input* rather than the parse *output* means no future schema
+ * refinement can quietly rewrite a value in transit. Zod strips nothing here
+ * either (the envelope schema is strict, so an unknown key is rejected rather
+ * than removed).
+ *
+ * A payload must therefore be JSON-representable. A `bigint` value raises a
+ * typed refusal on encode, and an object property explicitly set to `undefined`
+ * is absent after the round trip — which is the same fact ADR-002 §7 records,
+ * that absence and `null` are different and a domain value carries absence as
+ * absence.
+ *
+ * What the caller gets back is that fresh frozen null-prototype tree, not the
+ * live object it passed in and not the schema output (see `./envelope-door.ts`).
  */
 
 import { UnknownPayloadEventEnvelopeSchema } from "@polymarket-bot/domain";

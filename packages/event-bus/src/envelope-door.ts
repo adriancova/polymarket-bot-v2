@@ -109,14 +109,32 @@ function unsupported(): never {
   throw new Error("unsupported envelope schema definition; review the own-data derivation");
 }
 
+/**
+ * String formats whose own `pattern` IS the validator zod runs.
+ *
+ * `$ZodCheckStringFormat` only installs the pattern test when no constructor
+ * replaced `_zod.check` first; `ipv6`, `cidrv6`, `base64` and `base64url` do
+ * replace it, leaving `pattern` decorative. Deriving from a decorative pattern
+ * would be fail-open, so any format outside this allowlist fails the load.
+ */
+const DERIVABLE_STRING_FORMATS: readonly string[] = Object.freeze(["regex", "datetime"]);
+
 /** All constraint parameters come from own definitions, never mirrored literals. */
 function deriveField(schema: unknown): Predicate {
   const def = definition(schema);
   const type = ownMemberOf(def, "type");
   if (type === "optional") {
+    // The wrapper's own checks are never read below, so `.optional().refine(…)`
+    // would derive fail-open. Only a bare wrapper may be unwrapped.
+    const wrapping = ownMemberOf(def, "checks");
+    if (wrapping !== undefined && (!Array.isArray(wrapping) || wrapping.length > 0)) unsupported();
     const inner = deriveField(ownMemberOf(def, "innerType"));
     return value => value === undefined || inner(value);
   }
+  // The derivation never coerces, so a coercing def would make it stricter than
+  // the schema it claims to restate.
+  const coerce = ownMemberOf(def, "coerce");
+  if (coerce !== undefined && coerce !== false) unsupported();
   const predicates: Predicate[] = [];
   if (type === "string") predicates.push(value => typeof value === "string");
   else if (type === "number") predicates.push(value => typeof value === "number" && Number.isFinite(value));
@@ -124,6 +142,9 @@ function deriveField(schema: unknown): Predicate {
     const entries = ownMemberOf(def, "entries");
     if (typeof entries !== "object" || entries === null) unsupported();
     const values = Object.keys(entries).map(key => ownMemberOf(entries, key));
+    // A numeric native enum also carries reverse-mapping keys, whose values are
+    // the member names; accepting those would widen the derived membership.
+    if (values.some(value => typeof value !== "string")) unsupported();
     predicates.push(value => values.includes(value));
   } else if (type !== "unknown") unsupported();
 
@@ -137,9 +158,14 @@ function deriveField(schema: unknown): Predicate {
     const check = ownMemberOf(entry, "check");
     if (check === undefined && entry === def) continue;
     if (check === "string_format") {
+      const format = ownMemberOf(entry, "format");
+      if (typeof format !== "string" || !DERIVABLE_STRING_FORMATS.includes(format)) unsupported();
       const pattern = ownMemberOf(entry, "pattern");
       if (!(pattern instanceof RegExp)) unsupported();
-      const copy = new RegExp(pattern.source, pattern.flags.replace(/[gy]/gu, ""));
+      // `g`/`y` change what `test` matches, so dropping them to get a reusable
+      // copy would be fail-open (`/abc/y` would start accepting "xabc").
+      if (/[gy]/u.test(pattern.flags)) unsupported();
+      const copy = new RegExp(pattern.source, pattern.flags);
       predicates.push(value => typeof value === "string" && copy.test(value));
     } else if (check === "min_length" || check === "max_length") {
       const bound = ownMemberOf(entry, check === "min_length" ? "minimum" : "maximum");
@@ -198,6 +224,13 @@ export function enforceEnvelopeConstraints(own: Readonly<Record<string, unknown>
       });
     }
   }
+  // DELIBERATE, SANCTIONED TIGHTENING — do not "fix" this back to the schema's
+  // verdict. zod's strict-object unknown-key scan skips a top-level own
+  // `__proto__` member (`handleCatchall`: `if (key === "__proto__") continue`),
+  // so the schema ACCEPTS a wire envelope carrying `"__proto__": …` and silently
+  // drops it. Silent dropping on the recording path is exactly what §8.3
+  // forbids, so this restatement — the only layer that still sees the member —
+  // refuses it. Pinned by envelope-data-refusals.test.ts.
   if (Object.keys(own).some(key => !Object.hasOwn(fields, key)) || !matchesEnvelopeProvenance(own)) {
     throw new EventBusEnvelopeError("value is not a valid §7.1 event envelope", {
       issues: [{ path: "", message: "the own envelope does not match its schema constraints" }],
