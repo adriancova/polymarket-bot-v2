@@ -6,6 +6,13 @@
  * the consumer that reads them, so what comes out must be what went in —
  * decimal strings unrounded and unre-spelled, bigint-like fields still strings,
  * and no field quietly added or removed.
+ *
+ * What comes out is value-equal and byte-identical to what went in, but it is
+ * not the published object: the envelope door
+ * (`packages/event-bus/src/envelope-codec.ts`, ADR-020) delivers a fresh frozen
+ * prototype-free record at every object level, so these tests assert value
+ * equality and that contract instead of object identity or prototype-sensitive
+ * strict equality.
  */
 
 import { createTestEnvelope } from "@polymarket-bot/event-bus/testing";
@@ -43,7 +50,13 @@ describe("round-trip fidelity", () => {
       ingestSeq: "9007199254740993",
     };
 
-    expect(await roundTrip(published)).toStrictEqual(published);
+    const delivered = await roundTrip(published);
+
+    expect(delivered).toEqual(published);
+    expect(JSON.stringify(delivered)).toBe(JSON.stringify(published));
+    expect(delivered).not.toBe(published);
+    expect(Object.isFrozen(delivered)).toBe(true);
+    expect(Object.getPrototypeOf(delivered)).toBe(null);
   });
 
   it("does not touch decimal strings in the payload", async () => {
@@ -59,7 +72,9 @@ describe("round-trip fidelity", () => {
 
     const delivered = await roundTrip(createTestEnvelope({ payload }));
 
-    expect(delivered.payload).toStrictEqual(payload);
+    expect(delivered.payload).toEqual(payload);
+    expect(Object.isFrozen(delivered.payload)).toBe(true);
+    expect(Object.getPrototypeOf(delivered.payload)).toBe(null);
     for (const value of Object.values(delivered.payload as Record<string, unknown>)) {
       expect(typeof value).toBe("string");
     }
@@ -92,7 +107,7 @@ describe("round-trip fidelity", () => {
       emptyObject: {},
     };
 
-    expect((await roundTrip(createTestEnvelope({ payload }))).payload).toStrictEqual(payload);
+    expect((await roundTrip(createTestEnvelope({ payload }))).payload).toEqual(payload);
   });
 
   it("preserves provenance and the epoch identity a consumer orders by", async () => {
@@ -110,6 +125,6 @@ describe("round-trip fidelity", () => {
     expect(delivered.gatewayEpoch).toBe(gatewayEpoch);
     expect(delivered.source).toBe("binance");
     expect(delivered.eventType).toBe("ReferenceTradeObserved");
-    expect(delivered.payload).toStrictEqual({ venue: "binance", price: "63000.10" });
+    expect(delivered.payload).toEqual({ venue: "binance", price: "63000.10" });
   });
 });
