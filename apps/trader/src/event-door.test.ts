@@ -1,8 +1,9 @@
 /**
  * The WIRE door's ADR-020 conformance battery.
  *
- * `docs/contracts/schema-boundary.md` §3 records the two rows that meet at this
- * door as **LIVE**, and both are measured here as REGRESSIONS:
+ * `docs/contracts/schema-boundary.md` §3 records two rows that meet at this
+ * door: `packages/domain` remains LIVE; `packages/event-bus` is CLOSED.
+ * Both classes remain pinned here as regressions at the trader's own boundary:
  *
  * - `packages/domain` (frozen): "`skipChecks` makes both primitives accept
  *   `"NOT-A-UUID"` / `"yesterday"`". The row's own owner assignment is "closed
@@ -10,9 +11,10 @@
  *   is one of those doors;
  * - `packages/event-bus`: "under non-enumerable `skipChecks` an envelope with
  *   `eventId: "not-a-uuid"`, `receivedAt: "yesterday"` is accepted. Returns the
- *   caller's own object". Its own fix is `WP-060-FU1`; until then the value
- *   reaching this process is the transport's caller object, and this door is
- *   what stands between it and the loop.
+ *   caller's own object" — CLOSED by `WP-060-FU1` (`d869868`, 2026-09-11), so
+ *   the transport now hands over a frozen prototype-free record. The cases
+ *   below still run against this door, which is the trader's own boundary and
+ *   does not assume a well-behaved sender.
  */
 
 import { afterEach, describe, expect, it } from "vitest";

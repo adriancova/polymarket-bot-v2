@@ -9,11 +9,14 @@
  *   accept `"NOT-A-UUID"` / `"yesterday"`; every required `DecisionResult` key
  *   is satisfiable from the prototype". Owner: "contract owner — closed by
  *   ADR-020 §3 **at each door**, not by editing the frozen package";
- * - `packages/event-bus` — **LIVE**: "under non-enumerable `skipChecks` an
- *   envelope with `eventId: "not-a-uuid"`, `receivedAt: "yesterday"` is
- *   accepted. **Returns the caller's own object**". Its own fix is
- *   `WP-060-FU1`; until then the value that reaches this process is the
- *   transport's caller object, unvalidated in that class.
+ * - `packages/event-bus` — **CLOSED** since `WP-060-FU1` merged (`d869868`,
+ *   2026-09-11): that row's two defeats (the `skipChecks` acceptance of
+ *   `eventId: "not-a-uuid"` / `receivedAt: "yesterday"`, and returning the
+ *   caller's own object) are gone, and what now reaches this process is a
+ *   frozen prototype-free record the transport built from own data. This door
+ *   still stands: it is the trader's own boundary, it is what closes the
+ *   `packages/domain` row above on this side, and §6 rule 1 binds it
+ *   regardless of how well the sender behaves.
  *
  * This door is the trader's half of both, and it is a NEW boundary, so §6 rule
  * 1 binds it to conform on arrival.

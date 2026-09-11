@@ -178,10 +178,12 @@ neither pastes a copy — `WP-180-FU2`'s deletion guard walks `apps/*` precisely
 because "a verbatim `cp` of the door into `apps/trader/src/pasted-door.ts`
 passed this file 7/7".
 
-The wire door is the trader's half of two rows `docs/contracts/schema-boundary.md`
-§3 records as **LIVE** — `packages/domain`'s `skipChecks` class (whose owner
-assignment is "closed by ADR-020 §3 **at each door**") and `packages/event-bus`'s
-— and both are pinned as regressions in `src/event-door.test.ts`.
+The wire door is the trader's own boundary for two classes recorded in
+`docs/contracts/schema-boundary.md` §3. `packages/domain` remains **LIVE**,
+with closure required by ADR-020 §3 **at each door**; `packages/event-bus`
+is **CLOSED** by `WP-060-FU1` (`d869868`, 2026-09-11). The trader's door
+still closes the domain class on this side, and both classes remain pinned
+as regressions in `src/event-door.test.ts`.
 
 ### A measured finding: the arena protects the parse, not the ERROR construction
 
