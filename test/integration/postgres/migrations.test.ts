@@ -24,6 +24,25 @@ import { captureRejection, useEmptyDatabase } from "./context.js";
 
 const SEMANTIC_SCHEMAS = ["catalog", "data", "strategy", "execution", "accounting", "ops"] as const;
 
+/**
+ * The newest migration on disk.
+ *
+ * Derived, never written down. These assertions are about "the migration the
+ * rollback reaches first", which is whichever one is newest today — so a new
+ * `db/migrations` file must not make them fail. It did once: `0009` landed with
+ * `WP-210` (`303a057`) while three assertions here still named `0008`, and
+ * because this suite needs Docker the break stayed invisible until it was next
+ * run.
+ */
+async function latestMigrationVersion(): Promise<string> {
+  const onDisk = await readMigrations();
+  const latest = onDisk.at(-1)?.version;
+  if (latest === undefined) {
+    throw new Error("expected at least one migration on disk");
+  }
+  return latest;
+}
+
 const getConnectionString = useEmptyDatabase("migrations");
 const getRollbackConnectionString = useEmptyDatabase("migrations_rollback");
 
@@ -403,14 +422,18 @@ describe("migrations", () => {
     expect((error as MigrationChecksumMismatchError).direction).toBe("down");
     expect((error as MigrationChecksumMismatchError).version).toBe("0008");
 
-    // Nothing was rolled back: the refusal happens before any rollback runs.
+    // Nothing was rolled back: the refusal happens before any rollback runs, so
+    // the applied set still ends where it did — at the newest migration, which
+    // is not necessarily the one whose rollback script was edited.
+    const latest = await latestMigrationVersion();
     const applied = await getAppliedMigrations(pool);
-    expect(applied.at(-1)?.version).toBe("0008");
+    expect(applied.at(-1)?.version).toBe(latest);
 
     // Restored, so the rollback is verified to work once the file matches again.
+    // One step rolls back the newest migration.
     await writeFile(downPath, original, "utf8");
     const rolledBack = await migrateDown(pool, { directory, steps: 1 });
-    expect(rolledBack.applied[0]?.version).toBe("0008");
+    expect(rolledBack.applied[0]?.version).toBe(latest);
   });
 
   it("roll back cleanly, leaving no semantic schema behind", async () => {
@@ -419,7 +442,7 @@ describe("migrations", () => {
     const result = await migrateDown(pool, { steps: "all" });
     expect(result.applied.length).toBeGreaterThanOrEqual(8);
     // Newest first.
-    expect(result.applied[0]?.version).toBe("0008");
+    expect(result.applied[0]?.version).toBe(await latestMigrationVersion());
 
     expect(await listSchemas(pool)).toEqual(["migrations"]);
     expect(await getAppliedMigrations(pool)).toEqual([]);
