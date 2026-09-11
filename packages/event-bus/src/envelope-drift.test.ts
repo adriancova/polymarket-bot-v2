@@ -172,11 +172,31 @@ describe("envelope schema drift fails the door closed", () => {
     })))).rejects.toThrow(UNSUPPORTED);
   });
 
-  // C4 — zod installs some string formats whose real validator is a function
-  // that replaces `_zod.check`; their `pattern` is decorative, so deriving from
-  // it is fail-open. Only formats whose pattern IS the validator are derivable.
+  // C4 — the allowlist is a list of formats whose `pattern` has been VERIFIED to
+  // be the validator zod runs. Everything else fails the load because it has NOT
+  // been verified — NOT because it is necessarily replaced. Round 4 corrected an
+  // earlier blanket claim that "excluded means replaced", which is false:
+  //
+  //   - `ipv6` and `cidrv6` DO replace `_zod.check` after
+  //     `$ZodStringFormat.init` installed the pattern test, and then never
+  //     consult the pattern (zod's source comments `regexes.cidrv6` "not used
+  //     for validation"). `base64` replaces it with `isValidBase64`, which does
+  //     not consult `regexes.base64` either. For these three the pattern really
+  //     is decorative;
+  //   - `base64url` replaces it too, but the replacement `isValidBase64URL`
+  //     DOES test `regexes.base64url` and then requires a valid base64 decode
+  //     as well, so its pattern is consulted and is strictly WEAKER than the
+  //     validator — which is exactly why deriving from it would be fail-open;
+  //   - `email` ($ZodEmail) adds no replacement at all, so its pattern IS its
+  //     validator. It is refused anyway, and deliberately: the pinned schema
+  //     uses no `email`, nothing here has verified it in context, and an
+  //     unverified format must re-enter the analysis rather than inherit a
+  //     permission from a blanket claim.
+  //
+  // What every row below asserts is therefore the same thing: a format outside
+  // the verified allowlist fails the load rather than deriving a predicate.
   it.each(["ipv6", "cidrv6", "base64", "base64url", "email"])(
-    "refuses the %s string format, whose pattern is not its validator", async format => {
+    "refuses the unverified %s string format rather than deriving from its pattern", async format => {
       await expect(importDoorWith(standIn("eventId", node({
         type: "string",
         checks: [node({ check: "string_format", format, pattern: /^.*$/u })],

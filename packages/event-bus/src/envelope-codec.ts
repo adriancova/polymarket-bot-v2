@@ -13,14 +13,19 @@
  * ## Round-trip fidelity
  *
  * What a consumer receives must be value-equivalent to what was published. The
- * wire form is `JSON.stringify` of the materialized own-data copy of the
- * caller's input — never of the schema's parse output. That copy is the caller's
- * own enumerable data, deep-copied in key order without normalization, so it is
+ * wire form is the JSON of the materialized own-data copy of the caller's input
+ * — never of the schema's parse output. That copy is the caller's own
+ * enumerable data, deep-copied in key order without normalization, so it is
  * value-equal to the input and encodes to byte-identical JSON; encoding the
  * checked *input* rather than the parse *output* means no future schema
  * refinement can quietly rewrite a value in transit. Zod strips nothing here
  * either (the envelope schema is strict, so an unknown key is rejected rather
  * than removed).
+ *
+ * The bytes are emitted by `encodeWireJson` rather than by `JSON.stringify`,
+ * which consults the prototype chain for `toJSON` and could therefore be made
+ * to write a different value for the same accepted envelope; the two measured
+ * routes are recorded at that function.
  *
  * A payload must therefore be JSON-representable. A `bigint` value raises a
  * typed refusal on encode, and an object property explicitly set to `undefined`
@@ -37,6 +42,7 @@ import type { EventEnvelope } from "@polymarket-bot/domain";
 
 import {
   containedJudgement,
+  encodeWireJson,
   enforceEnvelopeConstraints,
   readOwnWireValue,
 } from "./envelope-door.js";
@@ -75,7 +81,7 @@ export function validateEnvelope(value: unknown): EventEnvelope<unknown> {
 export function encodeEnvelope(envelope: EventEnvelope<unknown>): string {
   const validated = validateEnvelope(envelope);
   try {
-    return JSON.stringify(validated);
+    return encodeWireJson(validated);
   } catch {
     throw new EventBusEnvelopeError(
       "event envelope could not be encoded as JSON; payload values must be JSON-representable",
@@ -86,6 +92,15 @@ export function encodeEnvelope(envelope: EventEnvelope<unknown>): string {
 
 /** Decodes a wire value back into a validated envelope. */
 export function decodeEnvelope(encoded: string): EventEnvelope<unknown> {
+  // The declared parameter is `string` and the only in-repo caller passes one
+  // read back from the transport, but this boundary's promise is that ONLY an
+  // `EventBusEnvelopeError` leaves it, and a non-string used to reach the
+  // refusal path below and throw a bare `TypeError` from `encoded.length`.
+  if (typeof (encoded as unknown) !== "string") {
+    throw new EventBusEnvelopeError("a stored entry must be a string", {
+      received: typeof (encoded as unknown),
+    });
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(encoded);
