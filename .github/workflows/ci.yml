@@ -45,6 +45,24 @@ jobs:
       - name: Unit tests
         run: pnpm test
 
+      # GATE-1 (GOV-2B B6): the six `test/e2e/**` suites are the Phase-2
+      # evidence for four Wave 2 checklist items and previously ran in NO gate —
+      # they passed only because auditors invoked them by hand. They keep their
+      # own runner (`test/e2e/vitest.config.ts`) rather than joining the root
+      # runner's include list, because that config's `resolve.alias` block is
+      # load-bearing: `test/e2e/**` sits outside every workspace package, so the
+      # bare `@polymarket-bot/*` specifiers do not resolve under the root runner
+      # (5 of the 6 suites fail to load there). In-process PAPER throughout: no
+      # Docker, no network, no credential, no signer.
+      - name: Paper end-to-end verification suite (in-process PAPER; no Docker, no network)
+        run: pnpm test:e2e
+
+      # GATE-1 (GOV-2B N4): §12.4 determinism is a GATE, not a dashboard. The
+      # fidelity dashboard's "Replay determinism" panel tells readers this
+      # script must pass, so it has to actually run here.
+      - name: Replay determinism goldens (order-book and simulation)
+        run: pnpm test:replay
+
       - name: WAL fault-injection tests
         run: pnpm test:fault
 
@@ -54,10 +72,20 @@ jobs:
       - name: Recorder soak-harness smoke (bounded, loopback-only; no elapsed-evidence claim)
         run: pnpm test:soak-smoke
 
-      - name: Dependency vulnerability scan (pnpm lockfile)
+      # GATE-1 (GOV-2B N5): the threshold is `--audit-level high`, so moderate
+      # and low advisories do NOT fail this step. The previous label implied an
+      # unqualified scan.
+      - name: Dependency vulnerability scan (pnpm lockfile; fails on high and critical only)
         run: pnpm audit --audit-level high
 
-      - name: Integration tests (Testcontainers - PostgreSQL and Redis)
+      # GATE-1 (GOV-2B N5): the previous label credited all six chained suites
+      # as "Testcontainers - PostgreSQL and Redis". Only two are container
+      # backed: `test/integration/postgres` (14 files, PostgreSQL) and
+      # `test/integration/event-bus` (8 files, Redis) are the only suites whose
+      # vitest config declares a `globalSetup` that starts a container. The other
+      # four — data-gateway (11), paper-trader (9), control-api (8), parquet (4),
+      # i.e. 32 of the 54 files — start no container.
+      - name: Integration tests (six workspace suites; Testcontainers PostgreSQL and Redis in two of them)
         run: pnpm test:integration
 
   compose:
