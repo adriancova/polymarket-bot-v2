@@ -152,6 +152,12 @@ async function booksBodiesFor(tokenIds: readonly string[]): Promise<readonly str
     bodies.push(typeof init?.body === "string" ? init.body : `non-string body: ${typeof init?.body}`);
     // A 200 whose payload is not the documented batch shape: the read fails
     // AFTER the request was built, which is the only part under test here.
+    // DELIBERATE, and KEPT at round 2 (N2): this helper's caller passes two
+    // token ids under the DEFAULT batch bound, so the fetcher issues exactly
+    // ONE request either way, and the refusal is what shows the body was built
+    // before the answer could matter. The test that crosses the batch bound
+    // must NOT stop after the first chunk, and answers `"[]"` instead — see
+    // `booksChunksFor` below.
     return Promise.resolve({ status: 200, text: () => Promise.resolve("{}") });
   }) as unknown as typeof fetch;
   try {
@@ -167,6 +173,49 @@ async function booksBodiesFor(tokenIds: readonly string[]): Promise<readonly str
     globalThis.fetch = previous;
   }
   return bodies;
+}
+
+/**
+ * Runs the real batch read to COMPLETION across several chunks.
+ *
+ * Answers every request with the documented EMPTY BATCH (`[]`), which
+ * `parseVenueOrderBooks` accepts — so the loop continues to the next chunk
+ * instead of throwing after the first. Returns both what LEFT the process (the
+ * encoded body strings, captured at the global `fetch`) and what each body was
+ * encoded FROM (the `jsonBody` container, captured at the HTTP port, which is
+ * where a caller's species would be observable).
+ */
+async function booksChunksFor(
+  tokenIds: readonly string[],
+  maximumBooksPerRequest: number,
+): Promise<{ readonly bodies: readonly string[]; readonly containers: readonly unknown[] }> {
+  const bodies: string[] = [];
+  const containers: unknown[] = [];
+  const previous = globalThis.fetch;
+  globalThis.fetch = ((_input: unknown, init?: { readonly body?: unknown }): Promise<unknown> => {
+    bodies.push(typeof init?.body === "string" ? init.body : `non-string body: ${typeof init?.body}`);
+    return Promise.resolve({ status: 200, text: () => Promise.resolve("[]") });
+  }) as unknown as typeof fetch;
+  const transport = globalHttpClient();
+  try {
+    const fetcher = new PublicBookSnapshotFetcher({
+      http: (request) => {
+        containers.push(request.jsonBody);
+        return transport(request);
+      },
+      directory: staticMarketDirectory({ known: [MARKET, OTHER] }),
+      baseUrl: "https://clob.example.invalid",
+      maximumBooksPerRequest,
+    });
+    // The read SUCCEEDS: an empty batch is a valid answer, so nothing here
+    // depends on a refusal and every chunk is issued.
+    const normalization = await fetcher.fetchSnapshots(tokenIds);
+    expect(normalization.events).toEqual([]);
+    expect(normalization.problems).toEqual([]);
+  } finally {
+    globalThis.fetch = previous;
+  }
+  return { bodies, containers };
 }
 
 describe("RTDS: a subscription collection that is an Array SUBCLASS is accepted (the M2 regression)", () => {
@@ -281,29 +330,29 @@ describe("the M2 sweep: the market frames and the REST body accept a caller's ar
     ]);
   });
 
-  it("REST: the same holds across the documented batch bound, one body per chunk", async () => {
-    const tokenIds = new TokenIds(...Array.from({ length: 3 }, (_, index) => `token-${String(index)}`));
-    const bodies: string[] = [];
-    const previous = globalThis.fetch;
-    globalThis.fetch = ((_input: unknown, init?: { readonly body?: unknown }): Promise<unknown> => {
-      bodies.push(typeof init?.body === "string" ? init.body : "non-string");
-      return Promise.resolve({ status: 200, text: () => Promise.resolve("{}") });
-    }) as unknown as typeof fetch;
-    try {
-      const fetcher = new PublicBookSnapshotFetcher({
-        http: globalHttpClient(),
-        directory: staticMarketDirectory({ known: [MARKET, OTHER] }),
-        baseUrl: "https://clob.example.invalid",
-        maximumBooksPerRequest: 2,
-      });
-      await expect(fetcher.fetchSnapshots(tokenIds)).rejects.toBeInstanceOf(
-        PublicMarketSnapshotInvalidError,
-      );
-    } finally {
-      globalThis.fetch = previous;
-    }
+  it("REST: the same holds across the documented batch bound, EVERY chunk", async () => {
+    // Round 2 (N2): the first spelling of this test answered `"{}"`, which
+    // `parseVenueOrderBooks` refuses — so `fetchSnapshots` threw after the
+    // FIRST chunk and the test asserted one body while its name claimed to
+    // cross the batch bound. It now answers the documented EMPTY BATCH, the
+    // read runs to completion, and every chunk is asserted.
+    const tokenIds = new TokenIds(...Array.from({ length: 5 }, (_, index) => `token-${String(index)}`));
+    const { bodies, containers } = await booksChunksFor(tokenIds, 2);
+
+    // Base's bytes, chunk for chunk: 5 ids at 2 per request is 2 + 2 + 1.
     expect(bodies).toEqual([
       JSON.stringify([{ token_id: "token-0" }, { token_id: "token-1" }]),
+      JSON.stringify([{ token_id: "token-2" }, { token_id: "token-3" }]),
+      JSON.stringify([{ token_id: "token-4" }]),
     ]);
+    // And the container each body was encoded FROM is this package's own, for
+    // EVERY chunk and not merely the first: `[...new Set(tokenIds)]` severs the
+    // species once, and `.filter`/`.slice`/`.map` on an ordinary array stay
+    // ordinary.
+    expect(containers).toHaveLength(3);
+    for (const container of containers) {
+      expect(Array.isArray(container)).toBe(true);
+      expect(Object.getPrototypeOf(container)).toBe(Array.prototype);
+    }
   });
 });

@@ -111,12 +111,29 @@ export interface PostgresAuditSinkOptions {
  * instance, an accessor and a function are all outside `AuditStateDocument`'s
  * type; ONE refusable shape is not, and is named rather than left implicit
  * (`SER-3` review round 1, the container sweep): an `Array` SUBCLASS satisfies
- * `readonly AuditStateDocument[]`, and `pg` would have serialized it. Every
- * document this sink writes comes from `ControlPlane`, a concrete class with
- * `#` private fields — so it is nominally typed, no foreign implementation can
- * be substituted, and its documents are frozen object literals over ordinary
- * containers. The residual is a caller that drives this sink directly with a
- * hand-built record.
+ * `readonly AuditStateDocument[]`, and `pg` would have serialized it.
+ *
+ * Every document this sink writes comes from `ControlPlane`, a concrete class
+ * with `#` private fields — so it is nominally typed and no foreign
+ * implementation can be substituted. Its documents' containers are ordinary
+ * BECAUSE EACH PRODUCER MAKES THEM SO, which is a property of those producers
+ * rather than of the type: `runStateDocument`, `strategyDocument`,
+ * `killSwitchDocument` and `killSwitchAbsent` are object literals over strings,
+ * and `refuseModeRaise` — the ONE place a caller's container reaches a document
+ * — rebuilds it with `[...keys]`. Round 1 stated the property without
+ * establishing it there, and it did not hold: that site built `attemptedKeys`
+ * with `keys.map(...)`, which preserves a caller's `Array` subclass, so this
+ * sink refused (`NON_PLAIN` at `value.attemptedKeys`) a record `pg` wrote.
+ * Fixed in round 2 (N1) and pinned by
+ * `test/unit/control-api/outbound-container-species.test.ts`.
+ *
+ * THE RESIDUAL, precisely: a caller that drives this sink DIRECTLY with a
+ * hand-built record whose state document carries a foreign container (an
+ * `Array` subclass, the one refusable shape inside `AuditStateDocument`'s
+ * type). Nothing in this repository does — `ControlPlane` is the only producer
+ * — and no deep re-materialization is available here that would not also decide
+ * what a `Date` or a `Map` means, which is the decision the own-data encoder
+ * exists to refuse. So it is stated rather than hidden.
  *
  * NOTE ON DECIMALS: `AuditStateDocument` excludes `number` at every depth by
  * construction, which is the same property `packages/storage-postgres`'s

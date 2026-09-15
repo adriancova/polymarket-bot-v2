@@ -122,14 +122,45 @@ describe("the package source", () => {
       "@polymarket-bot/storage-wal",
       "dotenv",
     ];
+    // Read from the SYNTAX TREE rather than from text (`SER-3` review round 2,
+    // N3). The first spelling was `text.includes('"' + specifier)` —
+    // DOUBLE-QUOTE ONLY — so a single-quoted import, a backtick dynamic
+    // `import(\`…\`)` or a unicode-escaped specifier of a forbidden package
+    // passed it. `moduleSpecifiersIn` is the walk `L2` added for the `risk`
+    // subpath check, and it sees a specifier wherever the grammar puts one, in
+    // any quoting style, while text inside comments and string data is inert.
+    // A SUBPATH counts as its package (`dotenv/config`), which is what the
+    // prefix-shaped text scan got right and what this keeps.
+    const offendingPackage = (specifier: string): string | undefined =>
+      forbidden.find((name) => specifier === name || specifier.startsWith(`${name}/`));
     for (const file of FILES) {
-      const text = read(file);
-      for (const specifier of forbidden) {
-        expect(text.includes(`"${specifier}`), `${relative(repoRoot, file)} imports ${specifier}`).toBe(
-          false,
-        );
+      for (const specifier of moduleSpecifiersIn(read(file), file)) {
+        expect(
+          offendingPackage(specifier),
+          `${relative(repoRoot, file)} imports ${specifier}`,
+        ).toBe(undefined);
       }
     }
+
+    // Negative fixture: source TEXT, not files in the package. The first two
+    // lines are exactly the spellings the text scan could not see, and the last
+    // is text that merely MENTIONS a forbidden package — which an AST cannot
+    // mistake for an import and a text scan cannot tell apart from one.
+    const fixture = [
+      `import { load } from '@polymarket-bot/config';`,
+      `import '@polymarket-bot/strategy-runtime';`,
+      `const injected = await import(\`dotenv/config\`);`,
+      `// a comment naming "@polymarket-bot/observability"`,
+      `const mention = "@polymarket-bot/event-bus is not imported here";`,
+    ].join("\n");
+    const caught = moduleSpecifiersIn(fixture, "fixture.ts")
+      .map((specifier) => offendingPackage(specifier))
+      .filter((name): name is string => name !== undefined);
+    expect(caught).toEqual([
+      "@polymarket-bot/config",
+      "@polymarket-bot/strategy-runtime",
+      "dotenv",
+    ]);
   });
 
   it("declares only downward workspace dependencies", () => {
