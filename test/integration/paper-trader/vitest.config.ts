@@ -7,15 +7,25 @@
  * package-level script `pnpm --filter @polymarket-bot/trader test:integration`.
  * Root-script wiring is orchestrator-owned at merge.
  *
- * **No Docker, no network, no credential.** The trader's three infrastructure
- * seams — the §12.1 `Clock`, the event transport and the durable store — are
- * exercised through in-memory implementations with failure injection
+ * **No network, no credential.** The trader's three infrastructure seams — the
+ * §12.1 `Clock`, the event transport and the durable store — are exercised
+ * through in-memory implementations with failure injection
  * (`apps/trader/src/testing/`), which is exactly how `WP-120`'s suite exercises
  * §4.2's Redis boundary. **Everything else is the REAL merged package**: the
  * order books, the feature engine, the strategy runtime, the Static Bracket
  * strategy, the risk engine, the execution planner, the simulated venue, the
  * ledger and the PnL engine. No subject behaviour is doubled anywhere in this
  * tree.
+ *
+ * **Docker, for one file only.** `GOV-2B` blocker B1 was a defect in the
+ * durable store that only a real database could see: every existing test of
+ * `writePnlSnapshot` used the in-memory double, and the double could not
+ * reject a column name. `durable-pnl-snapshot-postgres.test.ts` (`TRDR-2`)
+ * therefore drives the real `PostgresTraderStore` against a Testcontainers
+ * PostgreSQL. It starts that container in its OWN `beforeAll` rather than in a
+ * `globalSetup`, so it is the only file in this suite that needs Docker; the
+ * rest of the tree stays in-memory. Testcontainers' credentials are throwaway
+ * and live only as long as the run (§0.2, ADR-010).
  *
  * Files under `test/` sit outside every workspace package, so bare workspace
  * imports have no `node_modules` to resolve through; the aliases below map each
@@ -57,6 +67,10 @@ export default defineConfig({
       pkg("simulation", "packages/simulation/src/index.ts"),
       pkg("ledger", "packages/ledger/src/index.ts"),
       pkg("pnl", "packages/pnl/src/index.ts"),
+      // `TRDR-2`: the durable store's own suite. The `/testing` subpath must
+      // precede the bare one, as `risk/plain-data` does above.
+      pkg("storage-postgres/testing", "packages/storage-postgres/src/testing/index.ts"),
+      pkg("storage-postgres", "packages/storage-postgres/src/index.ts"),
     ],
   },
   test: {
