@@ -120,6 +120,18 @@ function decodeFrameData(data: unknown): string {
  * bytes. A body the encoder refuses is a `PublicMarketConfigurationError`
  * BEFORE `fetch` runs — nothing is sent, and the fetcher wraps the rejection as
  * `PUBLIC_MARKET_SNAPSHOT_UNAVAILABLE` with this error as its cause.
+ *
+ * THE BODY IS THE CALLER'S VALUE, AT THE ROOT (`SER-3` review round 1, the M2
+ * sweep). `request.jsonBody` is encoded by reference — nothing here rebuilds
+ * it, and nothing here could, since a deep rebuild of an arbitrary `unknown`
+ * would have to decide what a `Date` or a `Map` means and that is precisely
+ * the decision the own-data encoder refuses to make. So the accepted domain is
+ * stated on the port instead (`./ports.ts`, `PublicHttpRequest.jsonBody`):
+ * plain JSON data. This package's only producer satisfies it independently of
+ * ITS caller's containers — `snapshot/fetcher.ts` rebuilds the token list
+ * through `[...new Set(tokenIds)]`, so an `Array` subclass passed to
+ * `fetchSnapshots` cannot reach here — which is what the review asked to be
+ * established rather than assumed.
  */
 export function globalHttpClient(): PublicHttpClient {
   return async (request) => {

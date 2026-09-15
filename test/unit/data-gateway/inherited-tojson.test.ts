@@ -31,10 +31,14 @@ import { describe, expect, it } from "vitest";
 import type { EventEnvelope } from "../../../packages/domain/src/index.js";
 
 import { encodeEnvelope } from "../../../packages/event-bus/src/index.js";
+import { GatewayDispatcher } from "../../../apps/data-gateway/src/dispatcher.js";
 import { completeEnvelope } from "../../../apps/data-gateway/src/envelope.js";
+import type { EnvelopeDraft } from "../../../apps/data-gateway/src/envelope.js";
+import { IncidentRegistry } from "../../../apps/data-gateway/src/incidents.js";
 import { GatewayPublisher } from "../../../apps/data-gateway/src/publisher.js";
 import type { PublicationHalt, PublishOutcome } from "../../../apps/data-gateway/src/publisher.js";
-import { ManualGatewayClock } from "../../../apps/data-gateway/src/testing/index.js";
+import { IngestSequencer } from "../../../apps/data-gateway/src/sequencer.js";
+import { deterministicIdSource, ManualGatewayClock } from "../../../apps/data-gateway/src/testing/index.js";
 import { MemoryEventTransport } from "../../../apps/data-gateway/src/testing/memory-transport.js";
 import { renderDivergences, sweepInheritedToJson, TOJSON_CONTEXTS } from "../ledger/inherited-tojson.js";
 
@@ -193,18 +197,43 @@ describe("an envelope with no own-data JSON text is refused at admission, never 
  *    `.passthrough()` (the domain's only `z.unknown()` is
  *    `UnknownPayloadEventEnvelopeSchema`, `envelope.ts:175`, which the gateway
  *    does not use for completion), so the deepest venue payload is a handful
- *    of levels and a deep or non-plain one is REFUSED BEFORE assignment.
+ *    of levels and a deep or non-plain one is REFUSED BEFORE PUBLICATION.
+ *
+ *    NOT before the sequence is assigned (`SER-3` review round 1, L1: this
+ *    file claimed that, and it is false). `dispatch` evaluates
+ *    `ingestSeq: this.#sequencer.next()` as an ARGUMENT to `completeEnvelope`
+ *    (`dispatcher.ts:118`), so the refused draft CONSUMES its sequence and the
+ *    incident publishes at the next one — which `dispatcher.ts`'s own comment
+ *    states ("A validation failure between the assignment and the submission
+ *    consumes the sequence and publishes nothing") and which the test below
+ *    now measures by driving the REAL dispatcher rather than asserting it in
+ *    prose: `{outcome: "transport-rejected", sequences: ["2"], rejections: 1}`
+ *    — the reviewer's measurement at the revisions it ran, and this file's at
+ *    this tip. Nothing in this round touches `dispatcher.ts`, so the ordering
+ *    is the same before and after it.
  * 2. THE NESTED-DOOR BOUND. Should such an envelope reach `enqueue` anyway
  *    (the class is exported), every value this admission encoder refuses is a
  *    value the transport's own door refuses: `encodeWireJson`
  *    (`packages/event-bus/src/envelope-door.ts:199`) IS `encodePlainJson` at
  *    `maxDepth: 16`, and `validateEnvelope` materializes through
  *    `readOwnWireValue` at the same bound, both tighter than the default 64
- *    used here. So the terminal verdict is the one base reached — a
+ *    used here. So WHERE BASE'S SERIALIZATION COMPLETED AND THE TRANSPORT THEN
+ *    APPLIED ITS WIRE DOOR, the terminal verdict is the one base reached — a
  *    `GATEWAY_PUBLISH_REJECTED` halt — and only the step and the detail text
  *    differ. The looser bound is deliberate: measuring at 16 would move the
  *    transport's depth refusal earlier, and `JSON.parse` accepts far deeper
  *    trees than any door here, so the ceiling is never the place to fix this.
+ *
+ *    THE SCOPE OF THAT EQUIVALENCE, measured by the review (round 1, L1) and
+ *    pinned below: it is an equivalence only while base could serialize at all.
+ *    `JSON.stringify` has no depth bound but it does have the JS STACK, and an
+ *    envelope admitted DIRECTLY at 5,000 levels made base's `envelopeByteSize`
+ *    throw a native `RangeError: Maximum call stack size exceeded`
+ *    SYNCHRONOUSLY out of `enqueue`, into whatever callback called it — no
+ *    outcome, no halt, no incident. At this tip the same envelope refuses at
+ *    the encoder's bound and halts terminally with an outcome. That is a
+ *    genuine DIFFERENCE, and a better one; it is not an equivalence, and this
+ *    file does not claim it is.
  */
 describe("the admission byte bound may not refuse where base encoded (SER-2 cross-round rule)", () => {
   /** A payload nested `levels` deep: `{ nest: { nest: … } }`. */
@@ -214,7 +243,7 @@ describe("the admission byte bound may not refuse where base encoded (SER-2 cros
     return node;
   }
 
-  it("BOUND 1: the domain contract refuses a payload past the bound before it can be assigned a sequence", () => {
+  it("BOUND 1: the domain contract refuses a payload past the bound before PUBLICATION (the sequence IS consumed)", () => {
     // 200 levels: past this encoder's default (64) AND past the transport's
     // (16), and well inside what `JSON.parse` would accept off a socket.
     const completed = completeEnvelope(
@@ -305,5 +334,158 @@ describe("the admission byte bound may not refuse where base encoded (SER-2 cros
     );
     // And the real transport's door is the one that refuses it, as at base.
     expect(() => encodeEnvelope(envelope)).toThrow();
+  });
+});
+
+/**
+ * THE ORDERING THE REFUSAL ACTUALLY HAS, exercised on the REAL dispatcher
+ * (`SER-3` review round 1, L1).
+ *
+ * The claim this file used to make in prose — "refused before it can be
+ * assigned a sequence" — was false, and prose is exactly where it could stay
+ * false. `GatewayDispatcher.dispatch` takes a sequence FIRST
+ * (`dispatcher.ts:118`, an argument expression) and completes the envelope
+ * afterwards, so a refused draft consumes its number and the incident it opens
+ * publishes at the next one. That is the gateway's documented behaviour and it
+ * is independent of `SER-3`, which changes no line of `dispatcher.ts`: the
+ * reviewer measured this shape at the revisions it ran, and the test below
+ * measures it here.
+ */
+describe("the refusal's real ordering through the dispatcher (SER-3 review L1)", () => {
+  const EPOCH_2 = "00000000-0000-4000-8000-000000000002";
+
+  function dispatcherHarness(): {
+    readonly transport: MemoryEventTransport;
+    readonly dispatcher: GatewayDispatcher;
+    readonly publisher: GatewayPublisher;
+    readonly rejections: string[];
+  } {
+    const clock = new ManualGatewayClock();
+    const transport = new MemoryEventTransport();
+    const publisher = new GatewayPublisher({ transport, stream: "market", clock });
+    const rejections: string[] = [];
+    const dispatcher = new GatewayDispatcher({
+      clock,
+      ids: deterministicIdSource(),
+      sequencer: new IngestSequencer(EPOCH_2),
+      publisher,
+      incidents: new IncidentRegistry(),
+      observer: { onEnvelopeRejected: () => rejections.push("envelope-rejected") },
+    });
+    return { transport, dispatcher, publisher, rejections };
+  }
+
+  function draftWith(payload: unknown): EnvelopeDraft {
+    return {
+      eventType: "FeedStale",
+      schemaVersion: 1,
+      source: "binance",
+      sourceChannel: "binance:stream-connection",
+      payload,
+    };
+  }
+
+  it("a payload past the bound consumes sequence 1 and publishes only the incident, at 2", async () => {
+    const { transport, dispatcher, publisher, rejections } = dispatcherHarness();
+    let node: Record<string, unknown> = { feedId: "binance-reference", stalenessMs: 1 };
+    for (let index = 0; index < 200; index += 1) node = { nest: node };
+
+    const outcome = await dispatcher.dispatch(draftWith(node));
+    await publisher.settle();
+
+    expect(outcome.published).toBe(false);
+    if (outcome.published) return;
+    expect(outcome.reason).toBe("transport-rejected");
+    // The reviewer's measurement, verbatim:
+    // {"outcome":"transport-rejected","sequences":["2"],"rejections":1}
+    expect(transport.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["2"]);
+    expect(rejections).toHaveLength(1);
+    // Nothing carrying the refused payload reached the transport; what did is
+    // the incident the dispatcher opened for it.
+    expect(transport.published("market").map((envelope) => envelope.eventType)).not.toContain(
+      "FeedStale",
+    );
+    expect(dispatcher.metrics().envelopeRejections).toBe(1);
+  });
+
+  it("the accepted draft that follows takes 3, so the consumed number is really gone", async () => {
+    const { transport, dispatcher, publisher } = dispatcherHarness();
+    await dispatcher.dispatch(draftWith({ feedId: "x" }));
+    const accepted = await dispatcher.dispatch(
+      draftWith({
+        feedId: "binance-reference",
+        detectedAt: "2026-08-30T12:00:00.000Z",
+        stalenessMs: 45_000,
+      }),
+    );
+    await publisher.settle();
+    expect(accepted.published).toBe(true);
+    expect(transport.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["2", "3"]);
+  });
+});
+
+/**
+ * WHERE THE ADMISSION ENCODER AND BASE DIVERGE, AND WHERE THEY DO NOT
+ * (`SER-3` review round 1, L1's second half, and the M2 container sweep).
+ */
+describe("the admission encoder against base, measured rather than asserted", () => {
+  function envelopeWithPayload(payload: unknown): EventEnvelope<unknown> {
+    return envelopeAt("1", payload);
+  }
+
+  it("5,000 levels: base threw a native RangeError synchronously; this tip halts terminally with an outcome", async () => {
+    let node: unknown = { feedId: "binance-reference", stalenessMs: 1 };
+    for (let index = 0; index < 5_000; index += 1) node = { nest: node };
+    const envelope = envelopeWithPayload(node);
+
+    // What base's `envelopeByteSize` did, still measurable in this process:
+    // `JSON.stringify(envelope)` overflows the stack. At base that `RangeError`
+    // escaped `enqueue` synchronously into the caller's socket callback.
+    expect(() => JSON.stringify(envelope)).toThrow(RangeError);
+
+    const halts: PublicationHalt[] = [];
+    const transport = new MemoryEventTransport();
+    const publisher = new GatewayPublisher({
+      transport,
+      stream: "market",
+      clock: new ManualGatewayClock(),
+      onPublicationHalted: (halt) => halts.push(halt),
+    });
+    let outcome: PublishOutcome | undefined;
+    expect(() => {
+      void publisher.enqueue(envelope).then((resolved) => {
+        outcome = resolved;
+      });
+    }).not.toThrow();
+    await publisher.settle();
+    expect(outcome?.published).toBe(false);
+    expect(halts.map((halt) => halt.cause)).toEqual(["GATEWAY_PUBLISH_REJECTED"]);
+    expect(transport.publishCalls).toBe(0);
+  });
+
+  it("a payload carrying an Array SUBCLASS reaches the SAME terminal verdict the transport gives it", async () => {
+    // The M2 container sweep, at this site: `enqueue` takes the envelope by
+    // reference and nothing here rebuilds it, so a caller's container type CAN
+    // reach the admission encoder — but the transport's own door refuses the
+    // same value, so the verdict base reached is the verdict here, and only
+    // the step differs. (Through the dispatcher it is unreachable: the domain
+    // registry's parse output is a materialized plain tree.)
+    class Prices extends Array<number> {}
+    const envelope = envelopeWithPayload({ feedId: "x", stalenessMs: 1, prices: new Prices(1, 2) });
+    // Base: `JSON.stringify` serialized it, and the transport's door then
+    // refused it — the same terminal halt, one step later.
+    expect(() => JSON.stringify(envelope)).not.toThrow();
+    expect(() => encodeEnvelope(envelope)).toThrow();
+
+    const halts: PublicationHalt[] = [];
+    const publisher = new GatewayPublisher({
+      transport: new MemoryEventTransport(),
+      stream: "market",
+      clock: new ManualGatewayClock(),
+      onPublicationHalted: (halt) => halts.push(halt),
+    });
+    const outcome = await publisher.enqueue(envelope);
+    expect(outcome.published).toBe(false);
+    expect(halts.map((halt) => halt.cause)).toEqual(["GATEWAY_PUBLISH_REJECTED"]);
   });
 });

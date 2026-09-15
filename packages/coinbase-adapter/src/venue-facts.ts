@@ -451,6 +451,19 @@ export function buildUnsubscribeFrame(
  * edge `packages/coinbase-adapter` (layer 2) → `packages/risk` (layer 1) is
  * downward.
  *
+ * `[...productIds]` IS LOAD-BEARING, NOT A DEFENSIVE COPY (`SER-3` review
+ * round 1, M2 sweep). An array-literal spread always produces an ORDINARY
+ * array whatever the argument's species is, where `productIds.map(…)` or
+ * `.slice(…)` would have preserved an `Array` SUBCLASS the caller passed
+ * (ECMA-262 `ArraySpeciesCreate`) — and this encoder refuses a container whose
+ * prototype is neither `Array.prototype` nor `null`, so a caller's array TYPE
+ * reaching the frame would be a refusal where `JSON.stringify` serialized.
+ * That is the defect the review found in `polymarket-public`'s RTDS frame
+ * builder; this spelling already excluded it here, and
+ * `test/unit/coinbase-adapter/outbound-container-species.test.ts` pins it with
+ * a subclass. The frame itself is an object literal, so its prototype is this
+ * module's.
+ *
  * A refusal is restated in this package's vocabulary: the frame is a pure
  * function of the channel (closed vocabulary) and the caller's `productIds`
  * option, so a value the encoder cannot represent is a malformed option —

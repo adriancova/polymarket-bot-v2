@@ -20,6 +20,21 @@
  * and its default, and nothing about what the three levels mean; sending a
  * value whose effect is unknown would be a guess about venue behaviour. The
  * server default applies.
+ *
+ * ## `[...assetsIds]` IS LOAD-BEARING, NOT A DEFENSIVE COPY
+ *
+ * Every builder below rebuilds `assets_ids` with an array-literal spread, which
+ * always produces an ORDINARY array whatever the argument's species is — where
+ * `assetsIds.map(…)` or `.slice(…)` would have preserved an `Array` SUBCLASS
+ * the caller passed (ECMA-262 `ArraySpeciesCreate`). Since `SER-3` these frames
+ * are serialized by the own-data encoder (`../outbound-json.ts`), which refuses
+ * a container whose prototype is neither `Array.prototype` nor `null`, so a
+ * caller's array TYPE reaching a frame would be a refusal where
+ * `JSON.stringify` serialized — the defect the `SER-3` review found in
+ * `../rtds/frames.ts` (round 1, M2), which this spelling already excluded here.
+ * The frames themselves are object literals, so their prototype is this
+ * module's too. `test/unit/polymarket-public/outbound-container-species.test.ts`
+ * pins it with a subclass.
  */
 
 /** The `type` discriminator of the initial market subscription frame. */

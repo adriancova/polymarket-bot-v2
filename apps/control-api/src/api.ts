@@ -204,11 +204,32 @@ const releaseDoor = buildDoor(
  *
  * `encodePlainJson` (`@polymarket-bot/risk/plain-json`) is byte-identical to
  * the clean `JSON.stringify` for plain data and never consults `toJSON`.
- * Every value handed here is plain: the control plane's frozen literals, the
- * health cache's materialized report, the problem records built here. A
- * value it refuses is a defect in this process, and `handle()`'s outer guard
- * turns the throw into the `CONTROL_INTERNAL_ERROR` refusal — whose own body
- * is a plain record this encoder cannot refuse.
+ * Every value handed here is plain: the control plane's frozen literals (built
+ * from `[...map.values()]`, so ordinary containers whatever a caller holds),
+ * the null-prototype counter records `sortedCounts`/`readCounts` return —
+ * which this encoder accepts for the same reason `JSON.stringify` serializes
+ * them, there being no inherited meaning to consult — the health cache's
+ * door-materialized report, and the problem records built here. A value it
+ * refuses is a defect in this process, and `handle()`'s outer guard turns the
+ * throw into the `CONTROL_INTERNAL_ERROR` refusal — whose own body is a plain
+ * record this encoder cannot refuse.
+ *
+ * TWO QUALIFICATIONS THE `SER-3` REVIEW MEASURED (round 1), both pinned in
+ * `test/unit/control-api/response-encoder-bound.test.ts`:
+ *
+ * - The door bound and the encoder bound (both `MAX_DEPTH`, 64) compose at the
+ *   ROOT depth only. `#health()` embeds the report one level down, so a tree
+ *   the door accepts at exactly 64 is refused here; today's fixed health
+ *   schema — a handful of levels — is what makes that unreachable, not the
+ *   alignment of the two constants.
+ * - `ControlPlane` and `TraderHealthCache` are nominal (they carry `#` private
+ *   fields), so no foreign IMPLEMENTATION is assignable to `ControlApiOptions`
+ *   and no caller's container type arrives through them. (A subclass could
+ *   override a method; this repository has none, and a subclass is code in
+ *   this process rather than a caller's value.) The one seam that is an
+ *   INTERFACE is `TraderHealthSource`; its contract — an `OK` report is the
+ *   door's materialized output — is stated where it is implemented
+ *   (`health-source.ts`).
  */
 function json(status: number, value: unknown): ApiResponse {
   return {

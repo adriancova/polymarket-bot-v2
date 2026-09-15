@@ -341,6 +341,16 @@ export class GatewayPublisher {
       // is the one the transport's refusal produces, with the detail stating
       // what happened. Unreachable through the dispatcher today: every
       // envelope it hands here is the frozen domain registry's parse output.
+      //
+      // "The same verdict base reached" is bounded, and the bound is stated
+      // rather than glossed (`SER-3` review round 1, L1): it holds where base's
+      // serialization COMPLETED and the transport then applied its own door.
+      // Where base could not serialize at all — an envelope admitted directly
+      // at 5,000 levels, where `JSON.stringify` overflows the stack — base
+      // threw a native `RangeError` synchronously out of this method with no
+      // outcome and no halt, and this path halts terminally instead. That is a
+      // genuine difference, and a better one; it is not an equivalence.
+      // `test/unit/data-gateway/inherited-tojson.test.ts` measures both.
       return Promise.resolve(
         this.#rejectAndHalt(
           envelope,

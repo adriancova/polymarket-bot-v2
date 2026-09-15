@@ -89,9 +89,20 @@ const bundlePath = resolve(repoRoot, "apps/data-gateway/dist/main.cjs");
  * `./plain-data.js`. The synchronous hook below (`module.registerHooks`,
  * Node ≥ 23.5) rewrites exactly that case: a RELATIVE `.js` specifier whose
  * importer is a `.ts` file, where the `.js` target is absent and the `.ts`
- * sibling exists. Nothing else is touched, and the primitive is loaded with a
- * dynamic import so the hook is registered first (a static import would be
- * hoisted above it).
+ * sibling exists. The primitive is loaded with a dynamic import so the hook is
+ * registered first (a static import would be hoisted above it).
+ *
+ * THE SCOPE OF THE HOOK, stated precisely (`SER-3` review round 1): it is
+ * registered PROCESS-WIDE in this runner, so EVERY resolution in this process
+ * passes through it — it is not restricted to the risk filename, and a
+ * narrower predicate keyed to that one path would be the honest alternative if
+ * anything else here ever imported `.ts`. What bounds it is the predicate, not
+ * the registration: a specifier that does not both end in `.js` and start with
+ * `./` or `../`, or whose importer is not a `.ts` file, or whose `.js` target
+ * exists, is handed to `nextResolve` unchanged. Nothing outside this process
+ * sees it either — the gateway is SPAWNED (`spawn(process.execPath, …)`), a
+ * separate process that does not inherit module hooks — so no byte the gateway
+ * writes and no module it loads is affected by anything here.
  */
 registerHooks({
   resolve(specifier, context, nextResolve) {

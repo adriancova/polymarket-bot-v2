@@ -121,6 +121,18 @@ export class PublicBookSnapshotFetcher {
     tokenIds: readonly string[],
     context: { readonly subscriptionGeneration?: number; readonly signal?: AbortSignal } = {},
   ): Promise<PublicMarketNormalization> {
+    // `[...new Set(tokenIds)]` is an ORDINARY array whatever `tokenIds`'
+    // species is, and `.filter`/`.slice`/`.map` on an ordinary array stay
+    // ordinary — so the `POST /books` body below is this module's own
+    // container, never the caller's type. That matters since `SER-3`: the body
+    // is serialized by the own-data encoder (`../outbound-json.ts`), which
+    // refuses a container whose prototype is neither `Array.prototype` nor
+    // `null`, and `fetchSnapshots(tokenIds)` takes `readonly string[]` — which
+    // an `Array` SUBCLASS satisfies with no cast. A `map` over the argument
+    // would have preserved that subclass (`ArraySpeciesCreate`) and refused a
+    // request `JSON.stringify` sent; that is the `SER-3` review's M2 defect,
+    // found in `../rtds/frames.ts` and swept for here.
+    // `test/unit/polymarket-public/outbound-container-species.test.ts` pins it.
     const unique = [...new Set(tokenIds)].filter((tokenId) => tokenId !== "");
     if (unique.length === 0) {
       return { events: [], problems: [] };

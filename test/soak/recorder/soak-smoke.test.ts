@@ -278,15 +278,20 @@ describe("soak-smoke: the evidence machinery, end to end", () => {
      *
      * The `SER-2` review's HIGH, audited here: an encoder that refuses where
      * base encoded is a worse regression than the byte hijack it closes, and
-     * the usual way in is a value PARSED FROM DISK. `run-soak.mjs`'s `scanWal`
-     * is this harness's only disk-parsed input, so every window below reads a
-     * manifest whose `recordCount`/`byteSize` are a 300-level chain and a
-     * `Date`-shaped object — past the encoder's bound and past what the record
-     * could ever carry. The record must still be written, parse, and evaluate:
-     * the two `Number.isSafeInteger` guards (`run-soak.mjs`, `scanWal`) mean
-     * nothing parsed from disk ever enters the encoded tree — only two
-     * integers do, and a value that is not one is skipped while the segment is
-     * still counted.
+     * the usual way in is a value PARSED FROM DISK. `run-soak.mjs` parses two
+     * files — the gateway CONFIG (`JSON.parse` at `run-soak.mjs:259`, from
+     * which it takes one validated STRING, `wal.rootPath`, and uses it as a
+     * path) and every segment MANIFEST (`scanWal`) — and `scanWal` is the only
+     * one whose values are carried toward the evidence record. (`SER-3` review
+     * round 1: this comment used to say `scanWal` was the harness's only disk
+     * parse, which is imprecise.) So every window below reads a manifest whose
+     * `recordCount`/`byteSize` are a 300-level chain and a `Date`-shaped
+     * object — past the encoder's bound and past what the record could ever
+     * carry. The record must still be written, parse, and evaluate: the two
+     * `Number.isSafeInteger` guards (`run-soak.mjs`, `scanWal`) mean nothing
+     * parsed from disk ever enters the encoded tree — only two integers do,
+     * and a value that is not one is skipped while the segment is still
+     * counted.
      */
     const plantCorruptManifest = async (workDir: string): Promise<void> => {
       const epochDir = join(workDir, "wal", "corrupt-epoch");

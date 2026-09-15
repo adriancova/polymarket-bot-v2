@@ -82,13 +82,49 @@ export function buildSubscriptionEntry(
  * One frame carrying every window, which is the shape the page demonstrates for
  * a two-window subscription. A reconnect re-sends exactly this frame: "Direct
  * clients must reconnect and resubscribe after a disconnect."
+ *
+ * EVERY CONTAINER IN THE FRAME IS THIS MODULE'S OWN, AND ORDINARY (`SER-3`
+ * review round 1, finding M2). The `subscriptions` member used to be
+ * `subscriptions.map(buildSubscriptionEntry)`, and `Array.prototype.map`
+ * PRESERVES THE SPECIES of the array it is called on (ECMA-262
+ * `ArraySpeciesCreate`). So a caller that passed an `Array` SUBCLASS of
+ * perfectly valid subscriptions — which `RtdsTwapFeedOptions.subscriptions`
+ * (`readonly RtdsTwapWindowSubscription[]`) accepts with no cast, which
+ * `resolveRtdsTwapFeedOptions` carries through by object spread, and which
+ * `validateSubscriptions` accepts — got a frame whose `subscriptions` member
+ * WAS that subclass. `JSON.stringify` serialized it normally; the own-data
+ * encoder refuses a container whose prototype is neither `Array.prototype` nor
+ * `null` (`NON_PLAIN`), so the feed REFUSED AT CONSTRUCTION where base
+ * connected and subscribed:
+ * `{"stage":"construct","code":"PUBLIC_MARKET_CONFIGURATION","kind":"NON_PLAIN","path":"value.subscriptions"}`.
+ * The encoder is right to refuse an object whose meaning lives on a prototype;
+ * the defect was letting a caller's array TYPE reach it at all.
+ *
+ * The array is therefore built here, ordinary, by an index walk: no `map`
+ * (species), and no `for…of` (a subclass may override `Symbol.iterator`) —
+ * which is also how `SerializeJSONArray` itself reads an array, by own
+ * `length` then own indices. Each entry is a fresh object literal from
+ * {@link buildSubscriptionEntry}, so a subscription that is a class instance or
+ * a null-prototype object does not reach the encoder either.
+ *
+ * ONE OUT-OF-TYPE DIVERGENCE, stated rather than hidden: a HOLE in the input
+ * (`[, x]`) was left a hole by `map` and would have serialized as `null`;
+ * reading it by index yields `undefined` and {@link buildSubscriptionEntry}
+ * throws a `TypeError` on it, as `map` already did for an explicit `undefined`
+ * element. Neither form is in the parameter's type, and `validateSubscriptions`
+ * (`./config.ts`) throws on both before the feed ever builds a frame.
  */
 export function buildSubscribeFrame(
   subscriptions: readonly RtdsTwapWindowSubscription[],
 ): RtdsFrame {
+  const entries: RtdsSubscriptionEntry[] = [];
+  const count = subscriptions.length;
+  for (let index = 0; index < count; index += 1) {
+    entries.push(buildSubscriptionEntry(subscriptions[index] as RtdsTwapWindowSubscription));
+  }
   return {
     action: RTDS_SUBSCRIBE_ACTION,
-    subscriptions: subscriptions.map(buildSubscriptionEntry),
+    subscriptions: entries,
   };
 }
 

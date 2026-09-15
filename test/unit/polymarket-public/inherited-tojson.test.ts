@@ -34,6 +34,16 @@
  * demanded unchanged in the other five, and pinned AS the domain refusal in
  * that one so a future change there is visible.
  *
+ * SO THE ZERO-CALL CLAIM IS ABOUT THE CHANGED SERIALIZATION SITES, NOT ABOUT
+ * THE WHOLE FEED LIFECYCLE (`SER-3` review round 1, a correction the reviewer
+ * measured and this file now pins). In that one context the domain's REFUSAL
+ * DIAGNOSTICS still call the injected hook AFTER the frames have been sent —
+ * 2 calls in the RTDS scenario, 3 in the market scenario, one per refused
+ * payload — because building a refusal message runs `JSON.stringify` on
+ * this-round-unrelated ground. `pinFeedRun` now demands those exact counts
+ * rather than passing over the context, so "zero at the sites this round
+ * changed" is what is claimed and what is checked, in all six contexts.
+ *
  * NON-VACUITY: the clean bytes are also compared with `JSON.stringify` of the
  * same frame computed OUTSIDE any window, so the pin says "the bytes sent are
  * the clean-process bytes", not merely "the bytes did not move".
@@ -189,12 +199,20 @@ function booksRequestBody(): string {
 /**
  * Runs a feed scenario clean and under each context: the BYTES must be the
  * clean bytes everywhere; the decisions must be the clean decisions with the
- * injected `toJSON` never run, except in the one context where the domain
- * contract refuses the payloads (its error-path formatting runs
- * `JSON.stringify`, so a whole-window zero count cannot be demanded there),
- * where the decisions are pinned as that refusal.
+ * injected `toJSON` never run — except in the one context where the domain
+ * contract refuses the payloads, where the decisions are pinned as that
+ * refusal and the hook's call count is pinned at the EXACT number the
+ * pre-existing refusal diagnostics make (one `JSON.stringify` per refused
+ * payload, after the frames were sent).
+ *
+ * `refusedCalls` is MEASURED, not budgeted: the review measured 2 and 3, this
+ * file demands exactly those, and the path that makes them — the domain
+ * contract's refusal diagnostics — is untouched by this round. Demanding the
+ * number rather than skipping the context is the `SER-3` review's correction:
+ * the round may not claim "zero for the whole feed lifecycle", and the honest
+ * claim is stronger when the residual is pinned than when it is excused.
  */
-function pinFeedRun(run: () => FeedRun, refused: FeedRun): FeedRun {
+function pinFeedRun(run: () => FeedRun, refused: FeedRun, refusedCalls: number): FeedRun {
   const clean = run();
   for (const context of TOJSON_CONTEXTS) {
     const polluted = withInheritedToJson(context, run);
@@ -205,6 +223,7 @@ function pinFeedRun(run: () => FeedRun, refused: FeedRun): FeedRun {
       // the clean-process frame.
       expect(polluted.result.sent, `${context.name}: bytes`).toBe(refused.sent);
       expect(polluted.result.decisions, context.name).toBe(refused.decisions);
+      expect(polluted.calls, `${context.name}: the domain's refusal diagnostics`).toBe(refusedCalls);
     } else {
       expect(polluted.result.sent, `${context.name}: bytes`).toBe(clean.sent);
       expect(polluted.result.decisions, context.name).toBe(clean.decisions);
@@ -227,12 +246,17 @@ describe("polymarket-public outbound bytes under an inherited toJSON (SER-3)", (
       buildSubscribeFrame([{ windowSeconds: 30, symbols: ["btc/usd"] }, { windowSeconds: 60 }]),
     );
     expect(expected).toContain('"filters":"{\\"symbol\\":\\"btc/usd\\"}"');
-    const clean = pinFeedRun(rtdsRun, {
-      // The domain refuses FeedConnected, then FeedDisconnected on the drop; no
-      // reconnect is armed after that, so one frame — the clean one — was sent.
-      sent: expected,
-      decisions: [REFUSED("FeedConnected"), REFUSED("FeedDisconnected")].join(","),
-    });
+    const clean = pinFeedRun(
+      rtdsRun,
+      {
+        // The domain refuses FeedConnected, then FeedDisconnected on the drop; no
+        // reconnect is armed after that, so one frame — the clean one — was sent.
+        sent: expected,
+        decisions: [REFUSED("FeedConnected"), REFUSED("FeedDisconnected")].join(","),
+      },
+      // Two refused payloads, two refusal diagnostics, AFTER the frame left.
+      2,
+    );
     expect(clean.sent).toBe(joinBytes([expected, expected]));
     expect(clean.decisions).toBe("FeedConnected,FeedDisconnected,FeedConnected,FeedGapDetected,FeedDisconnected");
   });
@@ -246,12 +270,17 @@ describe("polymarket-public outbound bytes under an inherited toJSON (SER-3)", (
       JSON.stringify(buildMarketUnsubscribeUpdateFrame([MARKET.yesTokenId])),
     ];
     expect(expected[0]).toContain(`"assets_ids":["${MARKET.yesTokenId}"]`);
-    const clean = pinFeedRun(marketRun, {
-      // Every frame is written before the publish the domain refuses, so all
-      // three — the clean ones — were sent.
-      sent: joinBytes(expected),
-      decisions: [REFUSED("FeedConnected"), REFUSED("FeedGapDetected"), REFUSED("FeedDisconnected")].join(","),
-    });
+    const clean = pinFeedRun(
+      marketRun,
+      {
+        // Every frame is written before the publish the domain refuses, so all
+        // three — the clean ones — were sent.
+        sent: joinBytes(expected),
+        decisions: [REFUSED("FeedConnected"), REFUSED("FeedGapDetected"), REFUSED("FeedDisconnected")].join(","),
+      },
+      // Three refused payloads, three refusal diagnostics, AFTER the frames left.
+      3,
+    );
     expect(clean.sent).toBe(joinBytes(expected));
     expect(clean.decisions).toBe("FeedConnected,FeedGapDetected,FeedDisconnected");
   });
@@ -262,10 +291,14 @@ describe("polymarket-public outbound bytes under an inherited toJSON (SER-3)", (
     expect(sweep.clean.get("books-body")).toBe(`ok:1|${JSON.stringify(BOOKS_BODY)}`);
   });
 
-  it("the injected toJSON never ran on any path, in any context (a control that the windows were live)", () => {
+  it("every window really was live: the injected toJSON IS reached by an ordinary JSON.stringify", () => {
     // The `calls` accounting the pins above rely on: the same windows DO see a
     // `JSON.stringify` of an object, so a zero count is evidence rather than
-    // an idle counter.
+    // an idle counter. The count is zero at the CHANGED SERIALIZATION SITES,
+    // in every context; it is NOT zero for the whole feed lifecycle in the
+    // enumerable-`Object.prototype` context, where the domain's pre-existing
+    // refusal diagnostics run after the frames are sent — the exact residual
+    // `pinFeedRun` demands (2 and 3).
     for (const context of TOJSON_CONTEXTS) {
       const probe = withInheritedToJson(context, () => JSON.stringify({ a: [true] }));
       const hijacked = context.target === BigInt.prototype ? 0 : 1;

@@ -106,9 +106,17 @@ export interface PostgresAuditSinkOptions {
  * `null` document still lands as the JSON object `{"value":null}` in a
  * NOT NULL column rather than as SQL `NULL`.
  *
- * A document the encoder refuses (a class instance, an accessor, a function —
- * none is an `AuditStateDocument` by type) throws, which `append` reports as
- * `AUDIT_SINK_UNAVAILABLE`: the mutation does not happen. Fail closed.
+ * A document the encoder refuses throws, which `append` reports as
+ * `AUDIT_SINK_UNAVAILABLE`: the mutation does not happen. Fail closed. A class
+ * instance, an accessor and a function are all outside `AuditStateDocument`'s
+ * type; ONE refusable shape is not, and is named rather than left implicit
+ * (`SER-3` review round 1, the container sweep): an `Array` SUBCLASS satisfies
+ * `readonly AuditStateDocument[]`, and `pg` would have serialized it. Every
+ * document this sink writes comes from `ControlPlane`, a concrete class with
+ * `#` private fields — so it is nominally typed, no foreign implementation can
+ * be substituted, and its documents are frozen object literals over ordinary
+ * containers. The residual is a caller that drives this sink directly with a
+ * hand-built record.
  *
  * NOTE ON DECIMALS: `AuditStateDocument` excludes `number` at every depth by
  * construction, which is the same property `packages/storage-postgres`'s

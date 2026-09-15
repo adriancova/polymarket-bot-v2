@@ -16,6 +16,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -48,6 +49,47 @@ const IMPLEMENTATION_FILES = FILES.filter((file) => !file.endsWith(".test.ts"));
 
 function read(file: string): string {
   return readFileSync(file, "utf8");
+}
+
+/**
+ * Every MODULE SPECIFIER `text` declares, read from its syntax tree.
+ *
+ * `ImportDeclaration` and `ExportDeclaration` module specifiers (so a
+ * side-effect import and `export * from` count), `import x = require("…")`
+ * external module references, `import("…")` type nodes, and dynamic
+ * `import(…)` — the same five positions
+ * `tools/check-dependency-direction.mjs` collects, and for its stated reason:
+ * "Comments and string data are inert in an AST, so text that merely *mentions*
+ * a specifier is structurally incapable of producing a finding, and a specifier
+ * is recognised wherever the grammar puts one regardless of intervening
+ * trivia." A dynamic `import()` whose argument is not a literal is reported as
+ * `<computed>` so it can never be mistaken for "no specifier here".
+ */
+function moduleSpecifiersIn(text: string, fileName: string): readonly string[] {
+  const source = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const specifiers: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      const moduleSpecifier = node.moduleSpecifier;
+      if (moduleSpecifier !== undefined && ts.isStringLiteralLike(moduleSpecifier)) {
+        specifiers.push(moduleSpecifier.text);
+      }
+    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
+      const expression = node.moduleReference.expression;
+      specifiers.push(ts.isStringLiteralLike(expression) ? expression.text : "<computed>");
+    } else if (ts.isImportTypeNode(node)) {
+      const argument = node.argument;
+      if (ts.isLiteralTypeNode(argument) && ts.isStringLiteralLike(argument.literal)) {
+        specifiers.push(argument.literal.text);
+      }
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const [first] = node.arguments;
+      specifiers.push(first !== undefined && ts.isStringLiteralLike(first) ? first.text : "<computed>");
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(source, visit);
+  return specifiers;
 }
 
 describe("the package source", () => {
@@ -115,13 +157,71 @@ describe("the package source", () => {
       "@polymarket-bot/domain",
       "@polymarket-bot/risk",
     ]);
+    // WHICH `risk` SUBPATH, read from the SYNTAX TREE rather than from text
+    // (`SER-3` review round 1, L2). The first spelling of this check was a
+    // regular expression for a double-quoted `from "…"` or `import("…")`,
+    // which misses a single-quoted import and a SIDE-EFFECT import
+    // (`import '@polymarket-bot/risk';`) entirely — so it could not support
+    // the claim "this is the only specifier anywhere". The compiler API sees a
+    // specifier wherever the grammar puts one, in any quoting style, and
+    // ignores text inside comments and string data, which is what
+    // `tools/check-dependency-direction.mjs` does for the same reason.
+    // `typescript` is already a root devDependency and this suite runs after
+    // install; the negative fixtures below prove the walk sees the spellings
+    // the regular expression missed.
     const riskSpecifiers = new Set<string>();
     for (const file of FILES) {
-      for (const match of read(file).matchAll(/(?:from|import\()\s*"(@polymarket-bot\/risk[^"]*)"/gu)) {
-        riskSpecifiers.add(match[1] ?? "");
+      for (const specifier of moduleSpecifiersIn(read(file), file)) {
+        if (specifier === "@polymarket-bot/risk" || specifier.startsWith("@polymarket-bot/risk/")) {
+          riskSpecifiers.add(specifier);
+        }
       }
     }
     expect([...riskSpecifiers].sort()).toEqual(["@polymarket-bot/risk/plain-json"]);
+  });
+
+  it("the specifier walk sees every import spelling, including the ones a regex missed", () => {
+    // Negative fixtures: source TEXT, not files in the package. Each line is a
+    // spelling that WOULD be a violation of the subpath rule above, and each
+    // must be visible to the walk. The two marked ones are exactly what the
+    // round-1 regular expression could not see.
+    const fixture = [
+      `import '@polymarket-bot/risk';`, // side-effect import — MISSED by the regex
+      `import { a } from '@polymarket-bot/risk/engine';`, // single-quoted — MISSED
+      `import { b } from "@polymarket-bot/risk/plain-data";`,
+      `import type { C } from '@polymarket-bot/risk/policy';`,
+      `export * from "@polymarket-bot/risk/lots";`,
+      `export { d } from '@polymarket-bot/risk/guards';`,
+      `const e = await import('@polymarket-bot/risk/scenario');`,
+      `type F = import("@polymarket-bot/risk/inputs").F;`,
+      `import g = require("@polymarket-bot/risk/result");`,
+      `// a comment naming "@polymarket-bot/risk/not-an-import"`,
+      `const h = "@polymarket-bot/risk/not-an-import-either";`,
+    ].join("\n");
+
+    const seen = moduleSpecifiersIn(fixture, "fixture.ts").filter(
+      (specifier) => specifier === "@polymarket-bot/risk" || specifier.startsWith("@polymarket-bot/risk/"),
+    );
+    expect([...new Set(seen)].sort()).toEqual([
+      "@polymarket-bot/risk",
+      "@polymarket-bot/risk/engine",
+      "@polymarket-bot/risk/guards",
+      "@polymarket-bot/risk/inputs",
+      "@polymarket-bot/risk/lots",
+      "@polymarket-bot/risk/plain-data",
+      "@polymarket-bot/risk/policy",
+      "@polymarket-bot/risk/result",
+      "@polymarket-bot/risk/scenario",
+    ]);
+    // Text that merely MENTIONS the package is inert in a syntax tree, which a
+    // text scan cannot tell apart from an import.
+    expect(seen).not.toContain("@polymarket-bot/risk/not-an-import");
+    expect(seen).not.toContain("@polymarket-bot/risk/not-an-import-either");
+
+    // And the check that consumes this walk really would fail on one of them:
+    // the package's own answer plus a side-effect import is two specifiers.
+    const violating = [...new Set([...seen, "@polymarket-bot/risk/plain-json"])].sort();
+    expect(violating).not.toEqual(["@polymarket-bot/risk/plain-json"]);
   });
 
   it("holds no credential, signer, or authentication material", () => {
