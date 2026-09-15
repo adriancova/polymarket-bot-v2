@@ -96,12 +96,37 @@
  *   (`MAX_DEPTH` from `./plain-data.ts`, 64, by default; the event-bus passes
  *   16). A cyclic structure therefore terminates at the bound instead of
  *   recursing — a cycle is data with no finite JSON text, so a refusal is the
- *   honest answer.
+ *   honest answer. The bound is only a bound while the walk can REACH it: the
+ *   walk is recursive (`serializeValue` ↔ `serializeObject`/`serializeArray`,
+ *   two frames per level), so a `maxDepth` the JS stack cannot honour would
+ *   let a deep chain or a cycle escape as an untyped `RangeError: Maximum call
+ *   stack size exceeded` before the typed refusal — the `SER-1` review measured
+ *   exactly that with `maxDepth: 100000`. The supported domain therefore has a
+ *   CEILING, {@link MAX_PLAIN_JSON_DEPTH} (256), refused at option validation.
+ *   Measured on Node 24 with the default stack: a chain of 1,000 containers
+ *   encodes and 2,000 overflow in the reviewer's harness; ~2,550 is the first
+ *   overflow inside this repository's vitest worker. 256 sits at about a
+ *   quarter of the shallowest depth measured to encode, and every consumer's
+ *   bound is at most `MAX_DEPTH` (64), a quarter of the ceiling again.
  *
  * Two `JSON.stringify` behaviours are KEPT, stated so they are not mistaken for
  * omissions: a non-enumerable own property is not a member (that is
  * `EnumerableOwnProperties`), and an array's non-index own properties are not
  * elements (that is `SerializeJSONArray`). Neither consults a prototype.
+ *
+ * ## Options are not data
+ *
+ * The two claims above — byte-identity on plain data, and a typed
+ * {@link NotPlainJson} for every difference — are stated WITHIN the supported
+ * option domain: `indent` an integer from 0 to 10, `maxDepth` an integer from 1
+ * to {@link MAX_PLAIN_JSON_DEPTH}. An option outside its domain is a
+ * `RangeError` thrown before any traversal, not a refusal: an option is the
+ * caller's own literal, so a wrong one is a programming error, and there is no
+ * `path` in the VALUE to name. `JSON.stringify` would have answered an
+ * out-of-domain `indent` anyway — it clamps 11 to 10 and truncates 1.5 to 1 —
+ * and silently honouring a clamped literal is the kind of quiet substitution
+ * this module exists to refuse. `test/unit/risk/plain-json.test.ts` pins both
+ * sides of each domain.
  *
  * ## What this module does not claim
  *
@@ -164,9 +189,23 @@ export class NotPlainJson extends Error {
   }
 }
 
-/** Options of {@link encodePlainJson}. */
+/**
+ * The CEILING of the supported `maxDepth` domain (the default stays
+ * {@link MAX_DEPTH}, 64). The walk is recursive, two frames per level, so a
+ * bound the stack cannot reach is not a bound: the header's Depth entry records
+ * the measurement (1,000 levels encode, 2,000 overflow on Node 24's default
+ * stack) and why 256 — about a quarter of the shallowest depth measured to
+ * encode, four times the deepest bound any consumer passes — is the ceiling.
+ * A larger `maxDepth` is a `RangeError` at option validation.
+ */
+export const MAX_PLAIN_JSON_DEPTH = 256;
+
+/** Options of {@link encodePlainJson}. Domains: see "Options are not data" in the header. */
 export interface PlainJsonOptions {
-  /** Deepest container nesting accepted; the root container is depth 0. Default {@link MAX_DEPTH}. */
+  /**
+   * Deepest container nesting accepted; the root container is depth 0. An
+   * integer from 1 to {@link MAX_PLAIN_JSON_DEPTH}; default {@link MAX_DEPTH}.
+   */
   readonly maxDepth?: number;
   /** `0` (default) is compact; `1`–`10` is the `JSON.stringify(value, null, indent)` gap. */
   readonly indent?: number;
@@ -189,15 +228,20 @@ function ownOption(options: PlainJsonOptions | undefined, key: keyof PlainJsonOp
  * Returns exactly the bytes `JSON.stringify(value, null, indent)` returns in a
  * clean process for plain data, and throws {@link NotPlainJson} for everything
  * the module header lists. Throws a `RangeError` for an option outside its
- * domain — an option is the caller's own literal, not a value to refuse.
+ * domain (`indent` 0–10, `maxDepth` 1–{@link MAX_PLAIN_JSON_DEPTH}) BEFORE
+ * `value` is touched — an option is the caller's own literal, not a value to
+ * refuse.
  */
 export function encodePlainJson(value: unknown, options?: PlainJsonOptions): string {
   const maxDepthOption = ownOption(options, "maxDepth");
   const indentOption = ownOption(options, "indent");
   const maxDepth = maxDepthOption === undefined ? MAX_DEPTH : maxDepthOption;
   const indent = indentOption === undefined ? 0 : indentOption;
-  if (typeof maxDepth !== "number" || !Number.isSafeInteger(maxDepth) || maxDepth < 1) {
-    throw new RangeError("encodePlainJson: maxDepth must be a positive safe integer");
+  if (
+    typeof maxDepth !== "number" || !Number.isSafeInteger(maxDepth) ||
+    maxDepth < 1 || maxDepth > MAX_PLAIN_JSON_DEPTH
+  ) {
+    throw new RangeError(`encodePlainJson: maxDepth must be an integer from 1 to ${String(MAX_PLAIN_JSON_DEPTH)}`);
   }
   if (typeof indent !== "number" || !Number.isSafeInteger(indent) || indent < 0 || indent > MAX_INDENT) {
     throw new RangeError(`encodePlainJson: indent must be an integer from 0 to ${String(MAX_INDENT)}`);

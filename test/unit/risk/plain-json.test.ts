@@ -17,7 +17,11 @@
  *    primitive never consults `toJSON`, so neither encoder moves there.
  * 3. REFUSAL. Everything the module header lists as a deliberate difference is
  *    a typed `NotPlainJson` with its `kind` and its `path`, never a different
- *    byte string and never a bare `TypeError`.
+ *    byte string and never a bare `TypeError`. The depth bound is a bound only
+ *    while the recursive walk can reach it, so the supported `maxDepth` domain
+ *    has a ceiling (`MAX_PLAIN_JSON_DEPTH`): at the ceiling a chain and a cycle
+ *    are still TYPED refusals, and one past it is a `RangeError` at option
+ *    validation before the value is touched (`SER-1` review, M1).
  *
  * NON-VACUITY (the `REC-1` lesson: a fence that kills no mutant is not a
  * fence). The handoff records the count of tests here that FAIL when the
@@ -36,7 +40,7 @@
 import { describe, expect, it } from "vitest";
 
 import { MAX_DEPTH } from "../../../packages/risk/src/plain-data.js";
-import { encodePlainJson, NotPlainJson } from "../../../packages/risk/src/plain-json.js";
+import { encodePlainJson, MAX_PLAIN_JSON_DEPTH, NotPlainJson } from "../../../packages/risk/src/plain-json.js";
 import type { PlainJsonOptions } from "../../../packages/risk/src/plain-json.js";
 
 /** The encoder under test. The mutant for the non-vacuity proof is a one-line swap HERE. */
@@ -476,7 +480,7 @@ describe("everything that is not plain JSON data is a typed refusal naming its p
   });
 
   it("refuses at EXACTLY maxDepth: a chain of maxDepth containers encodes, one more is refused", () => {
-    for (const maxDepth of [1, 2, 3, 16, MAX_DEPTH]) {
+    for (const maxDepth of [1, 2, 3, 16, MAX_DEPTH, MAX_PLAIN_JSON_DEPTH]) {
       // `nest(n, leaf)` builds n containers; the root is depth 0, so the
       // deepest sits at depth n-1 and is allowed while n <= maxDepth.
       expect(encode(nest(maxDepth, "leaf"), { maxDepth })).toBe(JSON.stringify(nest(maxDepth, "leaf")));
@@ -507,6 +511,113 @@ describe("everything that is not plain JSON data is a typed refusal naming its p
     expect((caught(() => encode(list, { maxDepth: 4 })) as NotPlainJson).path).toBe("value[0][0][0][0]");
     // `JSON.stringify` would have thrown a TypeError here; the refusal is typed.
     expect(() => JSON.stringify(cycle)).toThrow(TypeError);
+  });
+
+  // -------------------------------------------------------------------------
+  // The ceiling of the maxDepth domain (SER-1 review, M1). The walk is
+  // recursive, so a bound the stack cannot reach is not a bound: with
+  // `maxDepth: 100000` a long enough chain, and every cycle, escaped as an
+  // untyped `RangeError: Maximum call stack size exceeded`. The domain now ends
+  // at MAX_PLAIN_JSON_DEPTH, where both are still typed refusals.
+  // -------------------------------------------------------------------------
+
+  it("pins the ceiling, and the ceiling is above every bound a consumer passes", () => {
+    expect(MAX_PLAIN_JSON_DEPTH).toBe(256);
+    expect(MAX_DEPTH).toBeLessThanOrEqual(MAX_PLAIN_JSON_DEPTH);
+  });
+
+  it("encodes a chain of exactly MAX_PLAIN_JSON_DEPTH containers at the ceiling, byte-identically to JSON.stringify", () => {
+    const maxDepth = MAX_PLAIN_JSON_DEPTH;
+    // Scalar leaves, so the chain is EXACTLY maxDepth containers (the deepest
+    // sits at depth maxDepth - 1, the last depth the bound allows).
+    for (const leaf of ["leaf", 0, null, true]) {
+      const chain = nest(maxDepth, leaf);
+      expect(encode(chain, { maxDepth })).toBe(JSON.stringify(chain));
+      expect(encode(chain, { maxDepth, indent: 2 })).toBe(JSON.stringify(chain, null, 2));
+    }
+    // A container leaf two levels up fills the same bound exactly.
+    const filled = nest(maxDepth - 2, { a: [1] });
+    expect(encode(filled, { maxDepth })).toBe(JSON.stringify(filled));
+    let arrays: unknown = "leaf";
+    for (let level = 0; level < maxDepth; level += 1) arrays = [arrays];
+    expect(encode(arrays, { maxDepth })).toBe(JSON.stringify(arrays));
+  });
+
+  it("refuses one container past the ceiling as a typed DEPTH refusal at the right path, never a RangeError", () => {
+    const maxDepth = MAX_PLAIN_JSON_DEPTH;
+    const refusal = caught(() => encode(nest(maxDepth + 1, "leaf"), { maxDepth }));
+    expect(refusal).toBeInstanceOf(NotPlainJson);
+    const typed = refusal as NotPlainJson;
+    expect(typed.kind).toBe("DEPTH");
+    expect(typed.path).toBe(`value${".child".repeat(maxDepth)}`);
+    expect(typed.problem).toBe(`nested deeper than ${String(maxDepth)} levels`);
+    // The reviewer's probe shape: a chain of ordinary `{x: child}` containers
+    // ending in `0`, far deeper than the ceiling. Typed, with the path cut at
+    // the bound — the walk never went deeper than the ceiling.
+    let deep: unknown = 0;
+    for (let level = 0; level < 3000; level += 1) deep = { x: deep };
+    const deepRefusal = caught(() => encode(deep, { maxDepth }));
+    expect(deepRefusal).toBeInstanceOf(NotPlainJson);
+    expect((deepRefusal as NotPlainJson).kind).toBe("DEPTH");
+    expect((deepRefusal as NotPlainJson).path).toBe(`value${".x".repeat(maxDepth)}`);
+  });
+
+  it("terminates on a cycle at the ceiling as a typed DEPTH refusal, never a RangeError", () => {
+    const maxDepth = MAX_PLAIN_JSON_DEPTH;
+    const cycle: Record<string, unknown> = {};
+    cycle["self"] = cycle;
+    const refusal = caught(() => encode(cycle, { maxDepth }));
+    expect(refusal).toBeInstanceOf(NotPlainJson);
+    expect((refusal as NotPlainJson).kind).toBe("DEPTH");
+    expect((refusal as NotPlainJson).path).toBe(`value${".self".repeat(maxDepth)}`);
+    const list: unknown[] = [];
+    list.push(list);
+    const listRefusal = caught(() => encode(list, { maxDepth }));
+    expect(listRefusal).toBeInstanceOf(NotPlainJson);
+    expect((listRefusal as NotPlainJson).kind).toBe("DEPTH");
+    expect((listRefusal as NotPlainJson).path).toBe(`value${"[0]".repeat(maxDepth)}`);
+    // A two-node cycle through an array and an object, at the ceiling and indented.
+    const a: Record<string, unknown> = {};
+    const b: unknown[] = [a];
+    a["b"] = b;
+    expect((caught(() => encode(a, { maxDepth, indent: 2 })) as NotPlainJson).kind).toBe("DEPTH");
+  });
+
+  it("refuses a maxDepth past the ceiling as a RangeError at option validation, before the value is consulted", () => {
+    // A counting Proxy: every reflective operation the walk performs is a trap
+    // here, so a walk that started would be counted. `Array.isArray` and
+    // `typeof` do not trap, which is why the count is exact.
+    let consulted = 0;
+    const counting = new Proxy({ a: 1 }, {
+      getPrototypeOf(target) {
+        consulted += 1;
+        return Reflect.getPrototypeOf(target);
+      },
+      ownKeys(target) {
+        consulted += 1;
+        return Reflect.ownKeys(target);
+      },
+      getOwnPropertyDescriptor(target, key) {
+        consulted += 1;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    const outOfDomain = [
+      MAX_PLAIN_JSON_DEPTH + 1, 1000, 100000, Number.MAX_SAFE_INTEGER, 2 ** 53, Infinity, 256.5,
+    ];
+    for (const maxDepth of outOfDomain) {
+      const thrown = caught(() => encode(counting, { maxDepth }));
+      expect(thrown, String(maxDepth)).toBeInstanceOf(RangeError);
+      expect(thrown, String(maxDepth)).not.toBeInstanceOf(NotPlainJson);
+      expect((thrown as RangeError).message, String(maxDepth)).toBe(
+        `encodePlainJson: maxDepth must be an integer from 1 to ${String(MAX_PLAIN_JSON_DEPTH)}`,
+      );
+    }
+    expect(consulted).toBe(0);
+    // Control: the same value under an in-domain bound IS walked, so the
+    // counter measures what it claims to.
+    expect(encode(counting, { maxDepth: MAX_PLAIN_JSON_DEPTH })).toBe("{\"a\":1}");
+    expect(consulted).toBeGreaterThan(0);
   });
 
   it("refuses a bigint BEFORE any prototype is consulted, where JSON.stringify consults one first", () => {

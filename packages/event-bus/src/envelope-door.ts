@@ -201,11 +201,33 @@ export function encodeWireJson(value: unknown): string {
     return encodePlainJson(value, { maxDepth: MAX_WIRE_DEPTH });
   } catch (error) {
     // The canonical encoder's refusal, restated in this module's vocabulary.
-    // Classified by an OWN-data read of its `kind`, not by `instanceof` — the
-    // round-4 lesson `./brand.ts` records: `instanceof` walks the thrown
-    // value's prototype chain, so a hostile thrown value could make the
-    // classification itself throw. Anything that is not the encoder's own
-    // refusal is re-thrown untouched for `encodeEnvelope`'s containment.
+    //
+    // The classification is STRUCTURAL, not by identity: a thrown value is
+    // "the encoder's refusal" when it carries an own string-valued `kind` from
+    // the closed `PLAIN_JSON_REFUSAL_KINDS` vocabulary, and nothing else about
+    // it is examined. That is forgeable — a value thrown from INSIDE the
+    // encoder with such a `kind` (a null-prototype `{ kind: "BIGINT" }`, say)
+    // is restated as the matching `NotWireData` rather than re-thrown as
+    // itself. The only code that can throw from inside the encoder is a
+    // `Proxy` trap on the value being encoded, and the precondition of this
+    // function excludes one: its sole caller, `encodeEnvelope`, hands it the
+    // tree `readOwnWireValue` materialized (null-prototype objects, ordinary
+    // arrays, primitives), on which the encoder runs no caller code at all.
+    // The forgery is therefore reachable only by calling this function
+    // directly with an unmaterialized value, which is not a production route;
+    // `envelope-door-classifier.test.ts` pins that residual as measured.
+    //
+    // Why not `instanceof NotPlainJson`, which would be exact for a genuine
+    // refusal: the round-4 lesson `./brand.ts` records. `instanceof` walks the
+    // thrown value's prototype chain, so a hostile thrown `Proxy` (the same
+    // unmaterialized route) would make the CLASSIFICATION throw and let an
+    // arbitrary value replace the original. The own-data read below is total:
+    // one wrapped descriptor read, no prototype walk. A brand would not help
+    // either — the forgery and the brand are both answered by the
+    // precondition, not by a stronger test here.
+    //
+    // A thrown value that does not classify is re-thrown AS ITSELF for
+    // `encodeEnvelope`'s containment.
     switch (plainJsonRefusalKind(error)) {
       case "UNDEFINED_ROOT":
         // Unreachable through `encodeEnvelope`, whose argument is always the
@@ -246,6 +268,13 @@ export function encodeWireJson(value: unknown): string {
  * The `kind` of the canonical encoder's refusal, read as OWN DATA. TOTAL: a
  * value that is not an object, carries no own data `kind`, or throws from the
  * descriptor read (a `Proxy` trap, a revoked `Proxy`) is `undefined`.
+ *
+ * STRUCTURAL, as `encodeWireJson` states: an own string `kind` in the closed
+ * vocabulary is the whole test, so a lookalike thrown from inside the encoder
+ * classifies as a refusal. The one descriptor read runs a thrown `Proxy`'s
+ * `getOwnPropertyDescriptor` trap and nothing else — never `getPrototypeOf`,
+ * never a getter — and its throw is caught here. Pinned, with the `instanceof`
+ * mutant it exists to exclude, by `envelope-door-classifier.test.ts`.
  */
 function plainJsonRefusalKind(error: unknown): PlainJsonRefusalKind | undefined {
   if (typeof error !== "object" || error === null) {
