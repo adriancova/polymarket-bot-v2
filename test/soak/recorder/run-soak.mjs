@@ -50,16 +50,66 @@
 
 import { spawn } from "node:child_process";
 import console from "node:console";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { setTimeout as delayTimeout } from "node:timers";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, URL } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
 const bundlePath = resolve(repoRoot, "apps/data-gateway/dist/main.cjs");
+
+/**
+ * The evidence record is encoded from OWN DATA (`SER-3`, 2026-09-15).
+ *
+ * This repository's safety rule treats `soak-window-*.json` as REAL evidence,
+ * and at base it was written with `JSON.stringify(record, null, 2)`, which
+ * resolves `toJSON` through the prototype chain: under an inherited
+ * `Object.prototype.toJSON` a window's evidence — however long — was the bare
+ * string `"POLLUTED"` at write time, refused only later by the evaluator
+ * (`docs/handoffs/SER-0-sweep.md`, `extra-soak-record-writer-object-proto`,
+ * HIGH). `encodePlainJson` (`packages/risk/src/plain-json.ts`) is
+ * byte-identical to the clean `JSON.stringify` for plain data and never
+ * consults `toJSON`; the record is plain by construction. The generated
+ * loopback config takes the same route for uniformity — a config the gateway
+ * could not read would make a smoke window fail for a reason that is not the
+ * recorder's.
+ *
+ * WHY A RESOLVE HOOK. This is a plain `.mjs` run by `node` (the smoke spawns
+ * `process.execPath run-soak.mjs`), and it consumes the primitive FROM SOURCE
+ * by relative path: there is no runtime build of workspace TypeScript outside
+ * the esbuild-bundled apps. Node 24 type-strips a `.ts` module natively, but
+ * it does NOT rewrite the `.js` specifier convention TypeScript sources use
+ * (`plain-json.ts` imports `./plain-data.js`, which does not exist on disk) —
+ * measured: `import("…/plain-json.ts")` fails with `ERR_MODULE_NOT_FOUND` for
+ * `./plain-data.js`. The synchronous hook below (`module.registerHooks`,
+ * Node ≥ 23.5) rewrites exactly that case: a RELATIVE `.js` specifier whose
+ * importer is a `.ts` file, where the `.js` target is absent and the `.ts`
+ * sibling exists. Nothing else is touched, and the primitive is loaded with a
+ * dynamic import so the hook is registered first (a static import would be
+ * hoisted above it).
+ */
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (
+      specifier.endsWith(".js") &&
+      (specifier.startsWith("./") || specifier.startsWith("../")) &&
+      typeof context.parentURL === "string" &&
+      context.parentURL.endsWith(".ts")
+    ) {
+      const target = fileURLToPath(new URL(specifier, context.parentURL));
+      if (!existsSync(target) && existsSync(`${target.slice(0, -3)}.ts`)) {
+        return nextResolve(`${specifier.slice(0, -3)}.ts`, context);
+      }
+    }
+    return nextResolve(specifier, context);
+  },
+});
+const { encodePlainJson } = await import("../../../packages/risk/src/plain-json.ts");
 
 const RUNNING_BANNER = "data-gateway running:";
 const RECORDING_ONLY = "PUBLICATION HALTED, RECORDING ONLY";
@@ -183,7 +233,7 @@ async function main() {
     configPath = join(workDir, "gateway.loopback.json");
     await writeFile(
       configPath,
-      JSON.stringify(
+      encodePlainJson(
         {
           streamName: "market-events",
           wal: { rootPath: join(workDir, "wal"), fsyncIntervalMs: 100 },
@@ -191,8 +241,7 @@ async function main() {
           markets: [],
           coinbase: { productIds: ["BTC-USD"], endpoint: "wss://127.0.0.1:1" },
         },
-        null,
-        2,
+        { indent: 2 },
       ),
     );
   }
@@ -350,7 +399,7 @@ async function main() {
     evidenceDir,
     `soak-window-${record.startedAt.replaceAll(":", "-")}.json`,
   );
-  await writeFile(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+  await writeFile(recordPath, `${encodePlainJson(record, { indent: 2 })}\n`);
   console.error(`run-soak: evidence written to ${recordPath}`);
   console.error(
     `run-soak: window ${String(elapsedMs)} ms; records ${String(wal.records)}; clean shutdown ${String(cleanShutdown)} (derived, not recorded). Status is decided ONLY by soak:evaluate — a short window is honestly PENDING, and the best any evidence can reach is QUALIFYING_WINDOW_FOUND, a candidate for human provenance review.`,

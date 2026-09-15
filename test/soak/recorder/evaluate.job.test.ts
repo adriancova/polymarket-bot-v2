@@ -35,6 +35,7 @@ import {
   renderExposition,
   soakMetricSamples,
 } from "../../../packages/observability/src/recorder/index.js";
+import { renderSoakStatusArtifact } from "./src/status-artifact.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const evidenceDir = process.env["SOAK_EVIDENCE_DIR"] ?? resolve(here, "evidence");
@@ -60,19 +61,17 @@ describe("soak evidence evaluation job", () => {
 
     const evaluation = evaluateSoakEvidence(records, Date.now());
 
+    // Encoded from own data (`./src/status-artifact.ts`, `SER-3`): this file
+    // is evidence, and `JSON.stringify` consulted an inherited `toJSON` for it.
     const statusPath = join(evidenceDir, "soak-status.json");
     writeFileSync(
       statusPath,
-      `${JSON.stringify(
-        {
-          generatedAt: new Date().toISOString(),
-          evidenceDir,
-          recordFiles,
-          evaluation,
-        },
-        null,
-        2,
-      )}\n`,
+      renderSoakStatusArtifact({
+        generatedAt: new Date().toISOString(),
+        evidenceDir,
+        recordFiles,
+        evaluation,
+      }),
     );
     const promPath = join(evidenceDir, "soak-status.prom");
     writeFileSync(promPath, renderExposition(soakMetricSamples(evaluation)));

@@ -16,6 +16,7 @@
  * SAFETY: no credential, header, signer, or wallet appears on any path here.
  */
 
+import { encodeOutboundJson } from "./outbound-json.js";
 import type {
   PublicHttpClient,
   PublicMarketClock,
@@ -111,17 +112,27 @@ function decodeFrameData(data: unknown): string {
  * It sends exactly two headers and neither of them authenticates anything:
  * `accept` and, on a POST, `content-type`. There is no code path here that can
  * carry a credential.
+ *
+ * The body is encoded from OWN DATA (`./outbound-json.ts`, `SER-3`): the
+ * fetcher's `POST /books` body is an array literal, and `JSON.stringify`
+ * consulted an inherited `toJSON` for it, so under a polluted
+ * `Object.prototype` or `Array.prototype` the whole body left as substituted
+ * bytes. A body the encoder refuses is a `PublicMarketConfigurationError`
+ * BEFORE `fetch` runs — nothing is sent, and the fetcher wraps the rejection as
+ * `PUBLIC_MARKET_SNAPSHOT_UNAVAILABLE` with this error as its cause.
  */
 export function globalHttpClient(): PublicHttpClient {
   return async (request) => {
     const headers: Record<string, string> = { accept: "application/json" };
+    let body: string | undefined;
     if (request.jsonBody !== undefined) {
       headers["content-type"] = "application/json";
+      body = encodeOutboundJson(request.jsonBody, "REST request body");
     }
     const response = await fetch(request.url, {
       method: request.method,
       headers,
-      ...(request.jsonBody === undefined ? {} : { body: JSON.stringify(request.jsonBody) }),
+      ...(body === undefined ? {} : { body }),
       ...(request.signal === undefined ? {} : { signal: request.signal }),
     });
     return { status: response.status, body: await response.text() };

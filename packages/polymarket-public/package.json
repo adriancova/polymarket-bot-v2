@@ -18,6 +18,7 @@
   "dependencies": {
     "@polymarket-bot/decimal": "workspace:*",
     "@polymarket-bot/domain": "workspace:*",
+    "@polymarket-bot/risk": "workspace:*",
     "zod": "^4.4.3"
   },
   "devDependencies": {

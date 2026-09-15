@@ -102,9 +102,26 @@ describe("the package source", () => {
       .filter(([, version]) => version.startsWith("workspace:"))
       .map(([name]) => name)
       .sort();
-    // Layer 0 only: `docs/contracts/dependency-direction.md` §2 puts this
+    // Downward only: `docs/contracts/dependency-direction.md` §2 puts this
     // package at layer 2 and permits no same-layer edge that is not enumerated.
-    expect(workspaceDeps).toEqual(["@polymarket-bot/decimal", "@polymarket-bot/domain"]);
+    // The two layer-0 contracts, plus — since `SER-3` (2026-09-15) — the
+    // layer-1 own-data JSON encoder `@polymarket-bot/risk/plain-json`, which
+    // `venue-facts.ts` consumes to build the subscribe/unsubscribe frame bytes
+    // (`docs/handoffs/SER-0-sweep.md`, `coinbase-subscribe-unsubscribe-frames`).
+    // Still no same-layer edge, and no engine, policy or evaluation logic
+    // travels the risk edge: the package root is never imported.
+    expect(workspaceDeps).toEqual([
+      "@polymarket-bot/decimal",
+      "@polymarket-bot/domain",
+      "@polymarket-bot/risk",
+    ]);
+    const riskSpecifiers = new Set<string>();
+    for (const file of FILES) {
+      for (const match of read(file).matchAll(/(?:from|import\()\s*"(@polymarket-bot\/risk[^"]*)"/gu)) {
+        riskSpecifiers.add(match[1] ?? "");
+      }
+    }
+    expect([...riskSpecifiers].sort()).toEqual(["@polymarket-bot/risk/plain-json"]);
   });
 
   it("holds no credential, signer, or authentication material", () => {

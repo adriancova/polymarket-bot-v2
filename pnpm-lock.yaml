@@ -103,6 +103,9 @@ importers:
       '@polymarket-bot/polymarket-public':
         specifier: workspace:*
         version: link:../../packages/polymarket-public
+      '@polymarket-bot/risk':
+        specifier: workspace:*
+        version: link:../../packages/risk
       '@polymarket-bot/storage-wal':
         specifier: workspace:*
         version: link:../../packages/storage-wal
@@ -282,6 +285,9 @@ importers:
       '@polymarket-bot/domain':
         specifier: workspace:*
         version: link:../domain
+      '@polymarket-bot/risk':
+        specifier: workspace:*
+        version: link:../risk
       zod:
         specifier: ^4.4.3
         version: 4.4.3
@@ -501,6 +507,9 @@ importers:
       '@polymarket-bot/domain':
         specifier: workspace:*
         version: link:../domain
+      '@polymarket-bot/risk':
+        specifier: workspace:*
+        version: link:../risk
       zod:
         specifier: ^4.4.3
         version: 4.4.3

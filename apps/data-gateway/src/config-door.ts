@@ -33,12 +33,20 @@
  *   every level. A get-only inherited accessor is not read; an inherited block
  *   is not present.
  * - **D2 — NOT PERFORMED, and disclosed.** The severed, warmed arena lives in
- *   `packages/risk`; this app may not import it (a gateway → `risk` edge is
- *   forbidden by `docs/contracts/dependency-direction.md`) and may not paste it
- *   (the deletion guard in `test/unit/execution-planner/mirrors.test.ts`). The
- *   library's own state reads therefore remain defeatable here. The door
- *   answers that for the two classes this round owns by never taking a value
- *   from the library at all: see D3.
+ *   `packages/risk`, and this door does not consume it. *(Corrected by `SER-3`,
+ *   2026-09-15: this sentence used to say a gateway → `risk` edge was forbidden
+ *   outright. That is not what the contract says — the edge is layer 3 → layer
+ *   1, DOWNWARD, so §2.1's same-layer rules do not apply and `check:deps`
+ *   accepts it; `apps/control-api` has declared the same edge since `WP-240`.
+ *   `SER-3` added `@polymarket-bot/risk` to this app for ONE subpath, the
+ *   own-data JSON encoder `./plain-json`, consumed by `publisher.ts` alone.
+ *   What has NOT changed is D2: the arena is still not consumed here, and
+ *   pasting either door module is still forbidden by the deletion guard in
+ *   `test/unit/execution-planner/mirrors.test.ts`. Adopting the arena is a
+ *   decision for a round that owns this door, not a side effect of an encoder
+ *   round.)* The library's own state reads therefore remain defeatable here.
+ *   The door answers that for the two classes this round owns by never taking a
+ *   value from the library at all: see D3.
  * - **D3 — take values from the materialized tree.** {@link ownGatewayConfig}
  *   builds the configuration from the tree, never from `parsed.data`, and
  *   applies the schema's `.default()`s itself for keys the operator genuinely

@@ -75,6 +75,7 @@
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import type { EventStreamName, MarketEventTransport } from "@polymarket-bot/event-bus";
 import { EventBusPublishQueueFullError, EventBusUnavailableError } from "@polymarket-bot/event-bus";
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 
 import type { GatewayClock } from "./ports.js";
 
@@ -235,9 +236,30 @@ function utf8ByteLength(value: string): number {
  * REAL byte bound rather than a guessed one; the transport serializes the same
  * envelope moments later, so the work is duplicated but not asymptotically
  * different, and an unbounded queue is the failure this is here to prevent.
+ *
+ * The bytes are the envelope's OWN DATA (`SER-3`, 2026-09-15). This is a
+ * DECISION site — the number gates admission — and at base it was
+ * `JSON.stringify`, which resolves `toJSON` through the prototype chain.
+ * Measured at `main` `d6e05bf` and reproduced independently
+ * (`docs/handoffs/SER-0-sweep.md`, `publisher-admission-byte-bound`): under an
+ * inherited `Object.prototype`/`Array.prototype` `toJSON` every envelope
+ * measured as the bytes of the injected string, so a queue of book snapshots
+ * was ADMITTED past the byte bound (shrink) or a queue of `FeedStale`s was
+ * HALTED under it (grow); only the transport's own-data door, one step later,
+ * still refused over-deep envelopes. `encodePlainJson` is the same encoder the
+ * transport's `encodeWireJson` is an adapter over (`packages/event-bus/src/
+ * envelope-door.ts`), so the count here is the count of the bytes the
+ * transport will write for every envelope it accepts. The depth bound here is
+ * the encoder's default (64), looser than the transport's 16, so every
+ * refusal here is one the transport would also make, and the transport's
+ * tighter depth check still runs one step later exactly as it did at base.
+ *
+ * A refusal (a bigint, a function, an accessor, a `Date`, a cycle) throws:
+ * the envelope has no own-data JSON text, exactly as `JSON.stringify` threw a
+ * `TypeError` for a bigint or a cycle at base. `enqueue` contains it.
  */
 function envelopeByteSize(envelope: EventEnvelope<unknown>): number {
-  return utf8ByteLength(JSON.stringify(envelope));
+  return utf8ByteLength(encodePlainJson(envelope));
 }
 
 export class GatewayPublisher {
@@ -306,7 +328,27 @@ export class GatewayPublisher {
       return Promise.resolve(this.#suppress(this.#halt));
     }
 
-    const bytes = envelopeByteSize(envelope);
+    let bytes: number;
+    try {
+      bytes = envelopeByteSize(envelope);
+    } catch (error) {
+      // No own-data JSON text, so there is nothing to submit: the transport's
+      // door (`encodeEnvelope`) refuses the same value one step later, and
+      // round-1 H3 says every unsuccessful submission halts. Halting HERE keeps
+      // this method's promise that the caller's socket callback is never blown
+      // up — at base `JSON.stringify`'s `TypeError` for a bigint escaped
+      // synchronously through `dispatch()` into the feed driver — and the halt
+      // is the one the transport's refusal produces, with the detail stating
+      // what happened. Unreachable through the dispatcher today: every
+      // envelope it hands here is the frozen domain registry's parse output.
+      return Promise.resolve(
+        this.#rejectAndHalt(
+          envelope,
+          error,
+          `the envelope has no own-data JSON text and was refused before submission (${envelope.ingestSeq})`,
+        ),
+      );
+    }
     const depth = this.queueDepth;
     if (depth + 1 > this.#maxQueueDepth || this.#queueBytes + bytes > this.#maxQueueBytes) {
       this.#admissionRefusals += 1;
@@ -484,12 +526,25 @@ export class GatewayPublisher {
     }
     // Round-1 H3: a non-outage refusal used to be counted and stepped over,
     // which loses the event and resumes mid-epoch. It halts now.
+    return this.#rejectAndHalt(envelope, error, `the transport refused (${envelope.ingestSeq})`);
+  }
+
+  /**
+   * A non-outage refusal of ONE envelope halts publication terminally
+   * (round-1 H3) — whether the transport refused it, or the admission
+   * encoder refused it before the transport saw it (`SER-3`; the same
+   * encoder, so the transport would have). `what` states which, for the
+   * operator; the outcome vocabulary and the metric are the closed ones every
+   * dashboard already reads, and `GATEWAY_PUBLISH_REJECTED` is documented as
+   * exactly this class ("a bad envelope").
+   */
+  #rejectAndHalt(envelope: EventEnvelope<unknown>, error: unknown, what: string): PublishOutcome {
     this.#rejectedByTransport += 1;
     const detail = error instanceof Error ? error.message : String(error);
     this.#options.onPublishRejected?.({ ingestSeq: envelope.ingestSeq, detail });
     this.#haltNow({
       cause: "GATEWAY_PUBLISH_REJECTED",
-      detail: `the transport refused (${envelope.ingestSeq}): ${detail}`,
+      detail: `${what}: ${detail}`,
       haltedAtIngestSeq: envelope.ingestSeq,
     });
     return { published: false, reason: "transport-rejected", detail };

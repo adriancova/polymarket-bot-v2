@@ -18,8 +18,19 @@
  * `config.ts` refuses a non-loopback `bindHost` at startup (§15). This module
  * binds what it is given; a check here would be a second, weaker copy of a rule
  * that has already been applied to a value nobody can change afterwards.
+ *
+ * ## Every byte this server writes is encoded from own data
+ *
+ * The two refusal bodies written here (`413`, `400`) are built by
+ * `encodePlainJson` for the same reason `api.ts`'s `json()` is (`SER-3`,
+ * `docs/handoffs/SER-0-sweep.md` `control-http-refusal-bodies`): they are
+ * message-only at base, but a server whose ordinary bodies are own-data
+ * encoded and whose refusal bodies are not would have two answers to "what
+ * does `JSON.stringify` consult" — so it has one. The literals are plain
+ * records the encoder cannot refuse.
  */
 
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 import type { ApiRequest, ControlApi } from "./api.js";
@@ -70,6 +81,25 @@ function readBody(
   });
 }
 
+/**
+ * The body of a transport-level refusal, encoded from OWN DATA (`SER-3`).
+ *
+ * Exported so the six-context pin drives THIS function rather than a copy of
+ * its literal: a polluted window may not span socket I/O (an inherited
+ * `toJSON` installed across a macrotask corrupts vitest's own worker IPC —
+ * measured), so the wire-level suites cannot hold one open across a request.
+ * The two call sites below are its only callers.
+ *
+ * The record is plain, so the encoder cannot refuse it.
+ */
+export function controlRefusalBody(
+  code: string,
+  detail: string,
+  issues: readonly string[],
+): string {
+  return `${encodePlainJson({ code, detail, issues })}\n`;
+}
+
 function send(
   response: ServerResponse,
   status: number,
@@ -105,11 +135,11 @@ export function startControlHttpServer(
           response,
           413,
           "application/json; charset=utf-8",
-          `${JSON.stringify({
-            code: "CONTROL_BODY_TOO_LARGE",
-            detail: `a request body may not exceed ${String(options.maxRequestBodyBytes)} bytes`,
-            issues: [],
-          })}\n`,
+          controlRefusalBody(
+            "CONTROL_BODY_TOO_LARGE",
+            `a request body may not exceed ${String(options.maxRequestBodyBytes)} bytes`,
+            [],
+          ),
           true,
         );
         return;
@@ -124,11 +154,9 @@ export function startControlHttpServer(
             response,
             400,
             "application/json; charset=utf-8",
-            `${JSON.stringify({
-              code: "CONTROL_BODY_NOT_JSON",
-              detail: "the request body is not JSON",
-              issues: [cause instanceof Error ? cause.message : String(cause)],
-            })}\n`,
+            controlRefusalBody("CONTROL_BODY_NOT_JSON", "the request body is not JSON", [
+              cause instanceof Error ? cause.message : String(cause),
+            ]),
           );
           return;
         }

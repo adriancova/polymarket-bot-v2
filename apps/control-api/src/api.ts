@@ -50,6 +50,7 @@ import {
   PLATFORM_METRIC_FAMILIES,
   type PlatformMetricSample,
 } from "@polymarket-bot/observability";
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 
 import { hasGrant, type OperatorCredential, type OperatorGrant, type OperatorRegistry } from "./auth.js";
 import type { ControlPlane, KillSwitchRelease, MutationContext } from "./control-plane.js";
@@ -188,11 +189,32 @@ const releaseDoor = buildDoor(
 
 // --- responses --------------------------------------------------------------
 
+/**
+ * One JSON response, its body encoded from OWN DATA (`SER-3`, 2026-09-15).
+ *
+ * Every body this API answers with — the run-state read, the kill-switch
+ * list, a mutation receipt carrying its `auditRecordId`, a refusal — went
+ * through `JSON.stringify(value, null, 2)` at base, which resolves `toJSON`
+ * through the prototype chain. Measured at `main` `d6e05bf` and reproduced
+ * independently (`docs/handoffs/SER-0-sweep.md`, `control-api-response-body`):
+ * under an inherited `Object.prototype.toJSON` every body was the bare string
+ * `"POLLUTED"`; under `Array.prototype` the kill-switch list read
+ * `{"killSwitches": "POLLUTED"}` while a switch was engaged. An operator
+ * reads these bodies to decide whether a halt is in force.
+ *
+ * `encodePlainJson` (`@polymarket-bot/risk/plain-json`) is byte-identical to
+ * the clean `JSON.stringify` for plain data and never consults `toJSON`.
+ * Every value handed here is plain: the control plane's frozen literals, the
+ * health cache's materialized report, the problem records built here. A
+ * value it refuses is a defect in this process, and `handle()`'s outer guard
+ * turns the throw into the `CONTROL_INTERNAL_ERROR` refusal — whose own body
+ * is a plain record this encoder cannot refuse.
+ */
 function json(status: number, value: unknown): ApiResponse {
   return {
     status,
     contentType: "application/json; charset=utf-8",
-    body: `${JSON.stringify(value, null, 2)}\n`,
+    body: `${encodePlainJson(value, { indent: 2 })}\n`,
   };
 }
 

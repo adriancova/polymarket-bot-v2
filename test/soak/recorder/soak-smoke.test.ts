@@ -18,7 +18,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +29,8 @@ import {
   evaluateSoakEvidence,
   parseSoakWindowEvidence,
 } from "../../../packages/observability/src/recorder/index.js";
+import { renderDivergences, sweepInheritedToJson } from "../../unit/ledger/inherited-tojson.js";
+import { renderSoakStatusArtifact } from "./src/status-artifact.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
@@ -39,9 +41,9 @@ interface RunnerOutcome {
   readonly stderr: string;
 }
 
-function runRunner(env: Record<string, string>): Promise<RunnerOutcome> {
+function runRunner(env: Record<string, string>, nodeArgs: readonly string[] = []): Promise<RunnerOutcome> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(process.execPath, [runnerPath], {
+    const child = spawn(process.execPath, [...nodeArgs, runnerPath], {
       cwd: repoRoot,
       env: { ...process.env, ...env },
       stdio: ["ignore", "pipe", "pipe"],
@@ -228,5 +230,171 @@ describe("soak-smoke: the evidence machinery, end to end", () => {
     });
     expect(absurd.code).toBe(1);
     expect(absurd.stderr).toContain(">= 1000");
+  });
+
+  /**
+   * THE EVIDENCE RECORD DOES NOT DEPEND ON AN INHERITED `toJSON` (`SER-3`).
+   *
+   * MEASURED AT `main` `d6e05bf` (`SER-0`, `extra-soak-record-writer-object-proto`,
+   * HIGH): `run-soak.mjs` wrote the record with `JSON.stringify(record, null, 2)`,
+   * which resolves `toJSON` through the prototype chain — so under an
+   * inherited `Object.prototype.toJSON` a window's evidence, however long,
+   * was the bare string `"POLLUTED"` on disk, and under `Array.prototype` any
+   * array in it was. This repository's safety rule treats these files as REAL
+   * evidence.
+   *
+   * The pin runs the REAL runner as a subprocess under each of the six
+   * contexts (`./inherited-tojson.preload.mjs`, `--import`ed into the RUNNER
+   * only — the gateway it spawns is untouched) and requires the file bytes,
+   * with the per-run timing values normalized, to equal the clean run's, and
+   * the record to parse and evaluate exactly as the clean one does. The
+   * normalization is named and narrow: `startedAt`, `endedAt`, `elapsedMs`,
+   * the `notes` line and the epoch directory count are the only values a
+   * second window may legitimately differ in.
+   *
+   * NOT A SOAK. Each window is the 1-second minimum against closed loopback
+   * ports; nothing here is evidence that a soak ran.
+   */
+  it("SER-3: the evidence record is written from own data, byte-identical under all six inherited-toJSON contexts", async () => {
+    const contexts = [
+      "Object.prototype/enumerable",
+      "Object.prototype/non-enumerable",
+      "Array.prototype/enumerable",
+      "Array.prototype/non-enumerable",
+      "BigInt.prototype/enumerable",
+      "BigInt.prototype/non-enumerable",
+    ] as const;
+    const preload = resolve(here, "inherited-tojson.preload.mjs");
+
+    /** The file's bytes with the per-run timing values replaced by fixed markers. */
+    const normalize = (bytes: string): string =>
+      bytes
+        .replaceAll(/"(startedAt|endedAt)": "[^"]*"/gu, '"$1": "<instant>"')
+        .replaceAll(/"elapsedMs": \d+/gu, '"elapsedMs": <ms>')
+        .replaceAll(/"notes": "[^"]*"/gu, '"notes": "<notes>"');
+
+    /**
+     * A CORRUPT segment manifest, planted in the WAL root every window scans.
+     *
+     * The `SER-2` review's HIGH, audited here: an encoder that refuses where
+     * base encoded is a worse regression than the byte hijack it closes, and
+     * the usual way in is a value PARSED FROM DISK. `run-soak.mjs`'s `scanWal`
+     * is this harness's only disk-parsed input, so every window below reads a
+     * manifest whose `recordCount`/`byteSize` are a 300-level chain and a
+     * `Date`-shaped object — past the encoder's bound and past what the record
+     * could ever carry. The record must still be written, parse, and evaluate:
+     * the two `Number.isSafeInteger` guards (`run-soak.mjs`, `scanWal`) mean
+     * nothing parsed from disk ever enters the encoded tree — only two
+     * integers do, and a value that is not one is skipped while the segment is
+     * still counted.
+     */
+    const plantCorruptManifest = async (workDir: string): Promise<void> => {
+      const epochDir = join(workDir, "wal", "corrupt-epoch");
+      await mkdir(epochDir, { recursive: true });
+      let deep: unknown = "leaf";
+      for (let index = 0; index < 300; index += 1) deep = { nest: deep };
+      await writeFile(
+        join(epochDir, "corrupt.wal.manifest.json"),
+        JSON.stringify({ recordCount: deep, byteSize: { __proto__: null, toJSON: "not a number" } }),
+      );
+    };
+
+    const runWindow = async (
+      label: string,
+      context: string | undefined,
+    ): Promise<{ readonly bytes: string; readonly status: string }> => {
+      const evidenceDir = join(scratch, `evidence-tojson-${label}`);
+      const workDir = join(scratch, `work-tojson-${label}`);
+      await plantCorruptManifest(workDir);
+      const outcome = await runRunner(
+        {
+          SOAK_DURATION_MS: "1000",
+          SOAK_EVIDENCE_DIR: evidenceDir,
+          SOAK_WORK_DIR: workDir,
+          SOAK_SKIP_BUILD: "1",
+          ...(context === undefined ? {} : { SOAK_TOJSON_CONTEXT: context }),
+        },
+        context === undefined ? [] : ["--import", preload],
+      );
+      expect(outcome.code, `${label} stderr:\n${outcome.stderr}`).toBe(0);
+      const files = (await readdir(evidenceDir)).filter(
+        (name) => name.startsWith("soak-window-") && name.endsWith(".json"),
+      );
+      expect(files, label).toHaveLength(1);
+      const bytes = await readFile(join(evidenceDir, files[0] ?? ""), "utf8");
+      // The record still parses under the fail-closed exact-key schema and
+      // evaluates to the honest PENDING — the DECISION, not just the bytes.
+      const parsed = parseSoakWindowEvidence(JSON.parse(bytes));
+      expect(parsed.ok, `${label}: ${bytes}`).toBe(true);
+      const evaluation = evaluateSoakEvidence([JSON.parse(bytes)], Date.now());
+      return {
+        bytes: normalize(bytes),
+        status: `${evaluation.status}|${String(evaluation.validWindows)}|${String(
+          evaluation.longestQualifyingWindowMs,
+        )}`,
+      };
+    };
+
+    const clean = await runWindow("clean", undefined);
+    expect(clean.status).toBe("PENDING|1|0");
+    // Non-vacuity: the clean bytes ARE a pretty-printed record with the arrays
+    // and objects the pollution would have replaced.
+    expect(clean.bytes).toContain('"kind": "recorder-soak-window"');
+    expect(clean.bytes).toContain('"observed": {');
+    expect(clean.bytes).not.toContain("INJECTED");
+    // The corrupt manifest was really read, and nothing it carried entered the
+    // record: the segment is COUNTED (evidence that the scan saw it) while its
+    // 300-level `recordCount` and non-numeric `byteSize` are skipped by the
+    // `Number.isSafeInteger` guards, so the totals stay 0. An encoder refusal
+    // here — the `SER-2` failure shape — would have failed the run above.
+    expect(clean.bytes).toContain('"segments": 1');
+    expect(clean.bytes).toContain('"records": 0');
+    expect(clean.bytes).toContain('"bytes": 0');
+    expect(clean.bytes).not.toContain('"nest"');
+
+    for (const context of contexts) {
+      const polluted = await runWindow(context.replaceAll(/[^a-z]/giu, "-"), context);
+      expect(polluted.bytes, context).toBe(clean.bytes);
+      expect(polluted.status, context).toBe(clean.status);
+    }
+  }, 180_000);
+});
+
+/**
+ * THE `soak-status.json` ARTIFACT DOES NOT DEPEND ON AN INHERITED `toJSON` (`SER-3`).
+ *
+ * MEASURED AT `main` `d6e05bf` (`SER-0`, `extra-soak-status-artifact-arrays`,
+ * HIGH): the `soak:evaluate` job wrote the artifact with
+ * `JSON.stringify(…, null, 2)`, so under an inherited `Object.prototype.toJSON`
+ * the whole file was the bare injected string and under `Array.prototype` the
+ * `recordFiles` and `reasons` arrays were — the status the job COMPUTED was
+ * right, the status it WROTE was not.
+ *
+ * The job now writes through `./src/status-artifact.ts`, which this pins
+ * directly (the job body is one `writeFileSync` of its return value): run
+ * clean, then under all six contexts, with the injected `toJSON` counted at
+ * zero. Lives here rather than beside the job because `soak:evaluate` runs the
+ * job for its ARTIFACTS, not as a test of anything (see `evaluate.job.test.ts`),
+ * and `soak:smoke` is the gate a suite belongs in.
+ */
+describe("SER-3: the soak-status artifact is written from own data", () => {
+  it("is byte-identical to the clean-process artifact in all six contexts, with the injected toJSON never run", () => {
+    const evaluation = evaluateSoakEvidence([], Date.parse("2026-09-15T00:00:00.000Z"));
+    const artifact = {
+      generatedAt: "2026-09-15T00:00:00.000Z",
+      evidenceDir: "/evidence",
+      recordFiles: ["soak-window-a.json", "soak-window-b.json"],
+      evaluation,
+    };
+    const sweep = sweepInheritedToJson([
+      { name: "soak-status", render: () => renderSoakStatusArtifact(artifact) },
+    ]);
+    expect(renderDivergences(sweep.divergences)).toEqual([]);
+    // Outside every window: the clean bytes ARE `JSON.stringify(…, null, 2)` + "\n",
+    // and they carry the arrays the pollution would have replaced.
+    expect(sweep.clean.get("soak-status")).toBe(`ok:${JSON.stringify(artifact, null, 2)}\n`);
+    expect(evaluation.status).toBe("PENDING");
+    expect(evaluation.reasons.length).toBeGreaterThan(0);
+    expect(renderSoakStatusArtifact(artifact)).toContain('"soak-window-a.json"');
   });
 });

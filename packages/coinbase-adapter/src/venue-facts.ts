@@ -32,6 +32,11 @@
  * these were read; it is data, not a claim about today.
  */
 
+import { encodePlainJson, PLAIN_JSON_REFUSAL_KINDS } from "@polymarket-bot/risk/plain-json";
+import type { PlainJsonRefusalKind } from "@polymarket-bot/risk/plain-json";
+
+import { CoinbaseConfigurationError } from "./errors.js";
+
 /**
  * The date every citation below was fetched and read (ISO date, UTC).
  *
@@ -387,6 +392,9 @@ export type CoinbaseEventType = (typeof COINBASE_EVENT_TYPES)[number];
  * and no code path that adds one. Cited by `subscribe-without-keys`.
  *
  * One channel per message, per `subscribe-within-5s`.
+ *
+ * @throws {CoinbaseConfigurationError} when the frame is not plain JSON data
+ *   (see {@link encodeFrame}).
  */
 export function buildSubscribeFrame(
   channel: CoinbaseChannel,
@@ -399,13 +407,16 @@ export function buildSubscribeFrame(
     productIds.length === 0
       ? { type: "subscribe", channel }
       : { type: "subscribe", channel, product_ids: [...productIds] };
-  return JSON.stringify(frame);
+  return encodeFrame(frame, "subscribe");
 }
 
 /**
  * Builds the documented public unsubscribe frame — same structure as subscribe.
  *
  * Cited by `subscribe-without-keys`.
+ *
+ * @throws {CoinbaseConfigurationError} when the frame is not plain JSON data
+ *   (see {@link encodeFrame}).
  */
 export function buildUnsubscribeFrame(
   channel: CoinbaseChannel,
@@ -415,7 +426,76 @@ export function buildUnsubscribeFrame(
     productIds.length === 0
       ? { type: "unsubscribe", channel }
       : { type: "unsubscribe", channel, product_ids: [...productIds] };
-  return JSON.stringify(frame);
+  return encodeFrame(frame, "unsubscribe");
+}
+
+/**
+ * The bytes of one outbound frame, encoded from OWN DATA (`SER-3`, 2026-09-15).
+ *
+ * `JSON.stringify` resolves `toJSON` through the value's PROTOTYPE CHAIN, so
+ * an inherited `toJSON` on `Object.prototype` or `Array.prototype` (plain
+ * assignment or a non-enumerable `defineProperty`) replaced the bytes of the
+ * frame literal above and of its `product_ids` copy. Measured at `main`
+ * `d6e05bf` and reproduced independently (`docs/handoffs/SER-0-sweep.md`,
+ * `coinbase-subscribe-unsubscribe-frames`): under `Object.prototype` every
+ * frame left as the bare string `"POLLUTED"`; under `Array.prototype` the
+ * heartbeats frame (no array) survived, so the connection LOOKED healthy —
+ * heartbeats acknowledged — while `market_trades` and `ticker` were
+ * subscribed to `"product_ids":"POLLUTED"`, i.e. to nothing. The manager
+ * sends these verbatim on every connect and reconnect.
+ *
+ * `@polymarket-bot/risk/plain-json`'s `encodePlainJson` is the canonical
+ * own-data restatement of ECMA-262 25.5.2: byte-identical to a clean
+ * `JSON.stringify` for plain data (the contract fixtures under
+ * `test/contract/coinbase` pin the bytes), and it never consults `toJSON`. The
+ * edge `packages/coinbase-adapter` (layer 2) → `packages/risk` (layer 1) is
+ * downward.
+ *
+ * A refusal is restated in this package's vocabulary: the frame is a pure
+ * function of the channel (closed vocabulary) and the caller's `productIds`
+ * option, so a value the encoder cannot represent is a malformed option —
+ * `COINBASE_CONFIGURATION` — thrown to the caller with nothing sent, never a
+ * frame silently not built. The refusal is classified by an own-data read of
+ * its `kind` (never `instanceof`, which walks the thrown value's prototype
+ * chain); a thrown value that does not classify is re-thrown as itself.
+ */
+function encodeFrame(frame: Readonly<Record<string, unknown>>, what: string): string {
+  try {
+    return encodePlainJson(frame);
+  } catch (error) {
+    const kind = plainJsonRefusalKind(error);
+    if (kind === undefined) throw error;
+    throw new CoinbaseConfigurationError(
+      `the ${what} frame is not plain JSON data and was not built`,
+      { what, kind, path: ownString(error, "path"), problem: ownString(error, "problem") },
+    );
+  }
+}
+
+/** The `kind` of the canonical encoder's refusal, read as OWN DATA; TOTAL. */
+function plainJsonRefusalKind(error: unknown): PlainJsonRefusalKind | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, "kind");
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return undefined;
+    const kind: unknown = descriptor.value;
+    return typeof kind === "string" && PLAIN_JSON_REFUSAL_KINDS.includes(kind as PlainJsonRefusalKind)
+      ? (kind as PlainJsonRefusalKind)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** An own string-valued data property of `error`, or `undefined`. */
+function ownString(error: unknown, key: string): string | undefined {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return undefined;
+    return typeof descriptor.value === "string" ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Looks up a citation by id, for doc comments and tests that assert coverage. */

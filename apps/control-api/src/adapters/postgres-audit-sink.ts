@@ -53,6 +53,7 @@ import type {
   ControlAuditRecord,
   ControlAuditSink,
 } from "@polymarket-bot/observability";
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 import type {
   JsonInput,
   KillSwitchActionValue,
@@ -76,14 +77,38 @@ export interface PostgresAuditSinkOptions {
 }
 
 /**
- * Presents an audit state document as a `jsonb` INPUT.
+ * Presents an audit state document as a `jsonb` INPUT: the document's JSON
+ * TEXT, encoded from its own data.
  *
- * The columns take an object (or a pre-serialized string) — `internal`'s
- * `JsonInput` — while an {@link AuditStateDocument} may also be a bare string,
- * boolean, `null` or array. Every document this package writes IS an object;
- * the wrap exists so that a future one which is not still lands as a row rather
- * than as a type error at the call site, and it labels what it wrapped instead
- * of stringifying it.
+ * The columns take an object or a pre-serialized string — `internal`'s
+ * `JsonInput` — and this hands `pg` the STRING (`SER-3`, 2026-09-15). Handed
+ * an object, `pg@8.23.0`'s `prepareValue` → `prepareObject` first consults an
+ * inherited `toPostgres` and then `JSON.stringify`s through the prototype
+ * chain, so an inherited `Object.prototype`/`Array.prototype` `toJSON`
+ * replaced the §14.1 `prior_state`/`resulting_state` and
+ * `previous_value`/`new_value` documents with substituted bytes — measured at
+ * `main` `d6e05bf` and reproduced independently
+ * (`docs/handoffs/SER-0-sweep.md`, `pg-ops-audit-state-documents`; the chain
+ * was cut at the driver's bind-time `valueMapper`, the last transformation
+ * before the wire). A string primitive never reaches `prepareObject`, which
+ * closes both lookups; the parameter's type is inferred from the column, so
+ * PostgreSQL parses the text as `jsonb` on insert (the `SER-2` TEXT rule the
+ * `storage-postgres` repositories follow; like the rest of this file, not
+ * executed against a live database here).
+ * `encodePlainJson` (`@polymarket-bot/risk/plain-json`) is byte-identical to a
+ * clean `JSON.stringify` for plain data — the same document the driver would
+ * have produced in a clean process — and never consults `toJSON`.
+ *
+ * An {@link AuditStateDocument} may also be a bare string, boolean, `null` or
+ * array. Every document this package writes IS an object; the `{ value }`
+ * wrap is KEPT for one that is not, so the stored document is the same one
+ * the object route stored (a labelled wrap rather than a bare scalar), and a
+ * `null` document still lands as the JSON object `{"value":null}` in a
+ * NOT NULL column rather than as SQL `NULL`.
+ *
+ * A document the encoder refuses (a class instance, an accessor, a function —
+ * none is an `AuditStateDocument` by type) throws, which `append` reports as
+ * `AUDIT_SINK_UNAVAILABLE`: the mutation does not happen. Fail closed.
  *
  * NOTE ON DECIMALS: `AuditStateDocument` excludes `number` at every depth by
  * construction, which is the same property `packages/storage-postgres`'s
@@ -92,10 +117,11 @@ export interface PostgresAuditSinkOptions {
  * this package's own discipline rather than the database's.
  */
 function asJsonInput(document: AuditStateDocument): JsonInput {
-  if (typeof document === "object" && document !== null && !Array.isArray(document)) {
-    return document as JsonInput;
-  }
-  return { value: document } as unknown as JsonInput;
+  const wrapped: unknown =
+    typeof document === "object" && document !== null && !Array.isArray(document)
+      ? document
+      : { value: document };
+  return encodePlainJson(wrapped);
 }
 
 function isKillSwitchScope(value: string): value is KillSwitchScopeValue {
