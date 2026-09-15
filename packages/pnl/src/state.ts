@@ -42,6 +42,7 @@ import {
 } from "@polymarket-bot/decimal";
 
 import { appendData } from "@polymarket-bot/risk/plain-data";
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 import type { PnlSettlementEvidence } from "./evidence.js";
 import { verifyRewardPayoutEvidence } from "./evidence.js";
 import { frozenMap, frozenSet, plainFrozen } from "./immutable.js";
@@ -90,9 +91,21 @@ interface AppliedTradeEffect {
   readonly denominationAsset: string;
 }
 
-/** Composite map key, collision-free for arbitrary identifier content. */
+/**
+ * Composite map key, collision-free for arbitrary identifier content.
+ *
+ * ENCODED BY `encodePlainJson`, NOT `JSON.stringify` (`SER-1`; measured by
+ * `SER-0` at `d6e05bf`). `JSON.stringify` resolves `toJSON` through the
+ * prototype chain of the array literal built here, so under an inherited
+ * `Object.prototype`/`Array.prototype` `toJSON` the schedule-versioned fee
+ * buckets and the per-program reward/estimate buckets merged into one key;
+ * `computePnlSnapshot` re-parses the key as a JSON array and the §9.16
+ * breakdown fields came back EMPTY, and `serializePnlState` bytes changed. The
+ * own-data encoder consults no `toJSON` and produces the same bytes for every
+ * string input, so the FORMAT the snapshot re-parses is unchanged.
+ */
 function key2(a: string, b: string): string {
-  return JSON.stringify([a, b]);
+  return encodePlainJson([a, b]);
 }
 
 export interface PnlState {

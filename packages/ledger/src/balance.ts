@@ -83,6 +83,7 @@ import type { DecimalString } from "@polymarket-bot/decimal";
 import { addDecimal, isZeroDecimal, subDecimal } from "@polymarket-bot/decimal";
 
 import { appendData } from "@polymarket-bot/risk/plain-data";
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 import type { LedgerRefusal } from "./refusals.js";
 import { LedgerConfigurationError, ledgerRefusal, readInputAsData } from "./refusals.js";
 import type { LedgerTransactionInput } from "./transaction.js";
@@ -255,13 +256,31 @@ export function checkPerAssetBalanceOfValidated(
  * precedent). Exported so the projection classifies unattributed activity
  * against exactly the buckets this check enforces — one key rule, one place.
  *
- * **D1**, in the only form two string parameters admit: both arguments must BE
- * strings. `JSON.stringify` invokes a `toJSON` method if the value has one, so
- * before this check `attributionBucketKey({ toJSON: () => "acct-1" }, "pUSD")`
- * ran caller code inside a bucket key and produced the key of a real account
- * (`WP-200-FU1` review round 1, finding L1 — measured). A non-string here is a
- * structurally impossible input, so it takes this package's documented
- * construction-time channel.
+ * **D1**, in two halves, because the key has two routes to caller or ambient
+ * code and the `typeof` check closes only one of them:
+ *
+ * - the OWN route: both arguments must BE strings. `JSON.stringify` invokes a
+ *   `toJSON` method if the value has one, so before this check
+ *   `attributionBucketKey({ toJSON: () => "acct-1" }, "pUSD")` ran caller code
+ *   inside a bucket key and produced the key of a real account (`WP-200-FU1`
+ *   review round 1, finding L1 — measured). A non-string here is a
+ *   structurally impossible input, so it takes this package's documented
+ *   construction-time channel;
+ * - the INHERITED route (`SER-0`, measured at `d6e05bf`; closed by `SER-1`):
+ *   `JSON.stringify` resolves `toJSON` through the PROTOTYPE CHAIN of the
+ *   ARRAY LITERAL THIS FUNCTION BUILDS, so with an inherited `toJSON` on
+ *   `Object.prototype` or `Array.prototype` (assigned or defined
+ *   non-enumerably) every `(account, asset)` bucket collapsed to ONE constant
+ *   key — and a cross-account parity breach (A -5 unattributed, B +5) was
+ *   ACCEPTED by `Ledger.append` where a clean process refuses
+ *   `LEDGER_ATTRIBUTION_PARITY_BROKEN`, with `auditAttributionPartition`
+ *   reporting nothing. No caller supplied anything; the precondition was
+ *   ambient prototype state, which ADR-020 §6 binds this door against. The key
+ *   bytes are therefore produced by `encodePlainJson`, the own-data restatement
+ *   of `JSON.stringify` (`@polymarket-bot/risk/plain-json`), which consults no
+ *   `toJSON` anywhere and is byte-identical for every string input — the key
+ *   FORMAT is unchanged, because it is re-parsed as a JSON array elsewhere (the
+ *   `pnlCompositeKey` precedent).
  */
 export function attributionBucketKey(accountRef: string, assetId: string): string {
   if (typeof accountRef !== "string" || typeof assetId !== "string") {
@@ -271,7 +290,7 @@ export function attributionBucketKey(accountRef: string, assetId: string): strin
       { accountRef: typeof accountRef, assetId: typeof assetId },
     );
   }
-  return JSON.stringify([accountRef, assetId]);
+  return encodePlainJson([accountRef, assetId]);
 }
 
 /** One `(accountRef, assetId)` bucket's actual and attributed movement. */
@@ -414,6 +433,16 @@ export function checkAttributionParityOfValidated(
  * `Object.prototype`: one inherited `instanceId` used to rewrite an
  * `UNATTRIBUTED` leg's identity into an attributed one, on every leg at once.
  * Throws `LedgerConfigurationError` on a value that is not plain own data.
+ *
+ * The KEY BYTES have a second route, closed by `SER-1` (measured in `SER-0` at
+ * `d6e05bf`): under an inherited `Object.prototype`/`Array.prototype` `toJSON`,
+ * `JSON.stringify` of the array literal built below collapsed EVERY leg to one
+ * key, so a transaction's legs netted to zero under that one key and
+ * `isExactNegation(empty, empty)` was true — ANY balanced transaction was
+ * accepted as an exact compensating reversal of ANY target (wrong account,
+ * partial amount), and the target was then marked reversed. The core below
+ * therefore encodes through `encodePlainJson`; same bytes for every string
+ * input, no `toJSON` lookup anywhere.
  */
 export function legKey(entry: {
   readonly scope: string;
@@ -435,7 +464,7 @@ export function legKeyOfValidated(entry: {
   readonly instanceId?: string | undefined;
   readonly assetId: string;
 }): string {
-  return JSON.stringify([entry.scope, entry.accountRef, entry.instanceId ?? null, entry.assetId]);
+  return encodePlainJson([entry.scope, entry.accountRef, entry.instanceId ?? null, entry.assetId]);
 }
 
 /**

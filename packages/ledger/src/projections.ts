@@ -68,6 +68,7 @@ import { addDecimal, isZeroDecimal, subDecimal } from "@polymarket-bot/decimal";
 // door would put a new throw site inside `projectLedger`, which has no
 // containment guard. See `balance.ts`'s header.
 import { appendData } from "@polymarket-bot/risk/plain-data";
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 import { attributionBucketKey, attributionBucketsOfValidated } from "./balance.js";
 import { deepFreeze, frozenMap, plainRecord } from "./immutable.js";
 import type { Ledger } from "./ledger.js";
@@ -257,18 +258,35 @@ export function emptyProjection(): LedgerProjection {
  * before the fold. Exported so callers and tests read a line by asking for
  * its key rather than by re-deriving the format (remediation round 1,
  * 2026-09-02; the `pnlCompositeKey` precedent).
+ *
+ * ENCODED BY `encodePlainJson`, NOT `JSON.stringify` (`SER-1`; measured by
+ * `SER-0` at `d6e05bf`). `JSON.stringify` resolves `toJSON` through the
+ * prototype chain of the array literal built here, so under an inherited
+ * `Object.prototype`/`Array.prototype` `toJSON` every entry of every
+ * transaction landed under ONE key; each transaction is zero-sum, so the single
+ * line netted to zero and the zero-drop below deleted it — the projection's
+ * balance book was EMPTY for any history, with no throw and an honest
+ * `transactionCount`. The own-data encoder consults no `toJSON` and produces
+ * the same bytes for every string input, so the FORMAT callers re-parse is
+ * unchanged.
  */
 export function balanceLineKey(
   scope: LedgerScope,
   accountRef: string,
   assetId: string,
 ): string {
-  return JSON.stringify([scope, accountRef, assetId]);
+  return encodePlainJson([scope, accountRef, assetId]);
 }
 
-/** The key of one virtual position line, collision-free for the same reason. */
+/**
+ * The key of one virtual position line, collision-free for the same reason —
+ * and own-data-encoded for the same reason: under the inherited route every
+ * instance's every asset position folded into one line attributed to
+ * whichever entry wrote last, its balance the arithmetic sum of collateral and
+ * tokens across instances (`SER-0`; `apps/trader` reads this projection).
+ */
 export function virtualPositionKey(instanceId: string, assetId: string): string {
-  return JSON.stringify([instanceId, assetId]);
+  return encodePlainJson([instanceId, assetId]);
 }
 
 /**
@@ -705,16 +723,28 @@ function sortedRecord<T>(map: ReadonlyMap<string, T>): Readonly<Record<string, T
   return record;
 }
 
+/**
+ * Scalars and keys are encoded by `encodePlainJson` (`SER-1`), for uniformity
+ * with every other byte this package emits: a string, number, boolean or null
+ * never consulted `toJSON`, so the bytes are identical, but an OUT-OF-TYPE
+ * bigint planted in the tree flipped from a `TypeError` to accepted
+ * `"INJECTED"` bytes under an inherited `Object.prototype`/`BigInt.prototype`
+ * `toJSON` (`SER-0`, oracle-only). `undefined` is the one scalar kept exactly
+ * as `JSON.stringify` rendered it through the template below — the word
+ * `undefined` — because a materialized record may carry an own optional field
+ * explicitly set to `undefined`, and this oracle's bytes for that input are
+ * pinned by byte-identity, not redesigned here.
+ */
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
+    return value === undefined ? "undefined" : encodePlainJson(value);
   }
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableStringify(item)).join(",")}]`;
   }
   const record = value as Readonly<Record<string, unknown>>;
   const keys = Object.keys(record).sort();
-  const parts = keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`);
+  const parts = keys.map((key) => `${encodePlainJson(key)}:${stableStringify(record[key])}`);
   return `{${parts.join(",")}}`;
 }
 

@@ -112,8 +112,13 @@
  *    computed specifier. None appears in either package; the repository-wide
  *    `check:deps` scanner is the mechanism that reports them.
  * 7. **CLASS SYNTAX** — `super.x`, `extends`, `instanceof`. Neither package
- *    declares a class or uses `instanceof`; every object either is a literal,
- *    is materialized with a `null` prototype, or comes from a library.
+ *    uses `instanceof`, and the ONE class either declares is
+ *    `packages/risk/src/plain-json.ts`'s `NotPlainJson` (`SER-1`, 2026-09-15):
+ *    a typed refusal that `extends Error` and defines its own fields through
+ *    `Object.defineProperty` with a prototype-free descriptor rather than by
+ *    assignment, so constructing it consults no chain. Every other object
+ *    either is a literal, is materialized with a `null` prototype, or comes
+ *    from a library.
  *    (`Object.create` is NO LONGER excluded here — review round 8 classifies it
  *    as `prototype-write`, because `Object.create(null)` and `Object.create(p)`
  *    differ by exactly the thing this census is about, and a registration makes

@@ -544,10 +544,14 @@ describe("the collapsed parse door exists in exactly one package (WP-180-FU2)", 
     expect(offenders).toEqual([]);
   });
 
-  it("packages/risk publishes exactly the two door subpaths, and nothing else new", () => {
+  it("packages/risk publishes exactly the two door subpaths plus the SER-1 encoder, and nothing else new", () => {
     const manifest: unknown = JSON.parse(read(`${CANONICAL}/package.json`));
     const exportsMap = (manifest as { exports: Record<string, string> }).exports;
-    expect(Object.keys(exportsMap).sort()).toEqual([".", "./plain-data", "./schema-arena"]);
+    // `./plain-json` (`SER-1`, 2026-09-15): the own-data JSON encoder, a sibling
+    // of the two door modules in the same canonical home, exported as a subpath
+    // only. It is not a mirror candidate (no fingerprint above) and adds no
+    // consumer row; the §2.1 S5/S6 clauses name it as consumed surface.
+    expect(Object.keys(exportsMap).sort()).toEqual([".", "./plain-data", "./plain-json", "./schema-arena"]);
     for (const module of MODULES) {
       const target = exportsMap[module.subpath];
       expect(target, `${module.subpath} is not exported`).toBeDefined();

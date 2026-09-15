@@ -18,6 +18,8 @@
  * §10.5 `pnl_snapshots` columns).
  */
 
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
+
 import { plainFrozen, plainRecord } from "./immutable.js";
 import type { PnlSnapshot } from "./snapshot.js";
 import type { OpenLot, PnlState } from "./state.js";
@@ -41,16 +43,28 @@ export const PNL_STATE_SERIALIZATION_DOMAIN = "polymarket-bot/pnl-state/v3";
 /** Serialization domain for snapshot rows (v2; the row shape is unchanged). */
 export const PNL_SNAPSHOT_SERIALIZATION_DOMAIN = "polymarket-bot/pnl-snapshot/v2";
 
+/**
+ * Scalars and keys are encoded by `encodePlainJson` (`SER-1`), for uniformity
+ * with every other byte this package emits: a string, number, boolean or null
+ * never consulted `toJSON`, so the bytes are identical, but an OUT-OF-TYPE
+ * bigint planted in the tree flipped from a `TypeError` to accepted
+ * `"INJECTED"` bytes under an inherited `Object.prototype`/`BigInt.prototype`
+ * `toJSON` (`SER-0`, oracle-only). `undefined` is the one scalar kept exactly
+ * as `JSON.stringify` rendered it through the template below — the word
+ * `undefined` — because a stream identity may carry an own `runId`/`marketId`
+ * explicitly set to `undefined` (the schema admits it), and this oracle's bytes
+ * for that input are pinned by byte-identity, not redesigned here.
+ */
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
+    return value === undefined ? "undefined" : encodePlainJson(value);
   }
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableStringify(item)).join(",")}]`;
   }
   const record = value as Readonly<Record<string, unknown>>;
   const keys = Object.keys(record).sort();
-  const parts = keys.map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`);
+  const parts = keys.map((key) => `${encodePlainJson(key)}:${stableStringify(record[key])}`);
   return `{${parts.join(",")}}`;
 }
 

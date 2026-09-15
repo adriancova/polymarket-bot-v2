@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./plain-data": "./src/plain-data.ts",
+    "./plain-json": "./src/plain-json.ts",
     "./schema-arena": "./src/schema-arena.ts"
   },
   "scripts": {
