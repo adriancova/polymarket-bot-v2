@@ -804,6 +804,21 @@ them across §2.1 **S3** / **S4**, and
 `test/unit/execution-planner/mirrors.test.ts` is the deletion guard that fails
 if a fourth copy appears under any workspace member's `src`.
 
+**A third subpath, `./plain-json`, joined them on 2026-09-15 (`SER-1`).**
+`src/plain-json.ts` is `JSON.stringify` restated over OWN DATA — the encoder
+`packages/event-bus` wrote at `WP-060-FU1` round 4 after measuring that
+`JSON.stringify` resolves `toJSON` through the prototype chain, moved here
+because `docs/handoffs/SER-0-sweep.md` then measured the same route at every
+`JSON.stringify` site in the repository (the ledger and PnL Map keys among
+them). It consults no `toJSON`, reads members from own data descriptors, refuses
+a container whose prototype is not `Object.prototype`/`Array.prototype`/`null`,
+and is byte-identical to `JSON.stringify` on plain data (differentially pinned
+by `test/unit/risk/plain-json.test.ts`). Like the two door modules it is
+reachable only through the `exports` map and is not part of this package's
+root surface; `packages/ledger` and `packages/pnl` consume it across **S5** /
+**S6** (clause widened), `packages/event-bus` downward, and the storage and
+outbound rounds (`SER-2`, `SER-3`) follow.
+
 **One Node built-in is imported, and it is audited.** `src/plain-data.ts` holds
 `import { types } from "node:util";` and uses it only as `types.isProxy` (§4.5,
 proposition 1). **It is on layer 1's enumerated allowlist** — `GOV-2A` ruled one

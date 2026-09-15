@@ -11,9 +11,14 @@
  * which walks the materialized tree and reads only own data. `JSON.stringify`
  * could not be used for that, because it consults the PROTOTYPE CHAIN for
  * `toJSON` — see that function's header for the two measured routes by which an
- * inherited `toJSON` changed the bytes of an accepted envelope.
+ * inherited `toJSON` changed the bytes of an accepted envelope. Since `SER-1`
+ * the walk itself is `@polymarket-bot/risk/plain-json`'s `encodePlainJson` (the
+ * canonical own-data home); this module keeps the depth bound, the refusal
+ * vocabulary and the measured history.
  */
 import { UnknownPayloadEventEnvelopeSchema } from "@polymarket-bot/domain";
+import { encodePlainJson, PLAIN_JSON_REFUSAL_KINDS } from "@polymarket-bot/risk/plain-json";
+import type { PlainJsonRefusalKind } from "@polymarket-bot/risk/plain-json";
 
 import { brandOwn, ENVELOPE_REFUSAL_BRAND, hasOwnBrand } from "./brand.js";
 import { EventBusEnvelopeError } from "./errors.js";
@@ -122,7 +127,8 @@ export function containedJudgement<T>(judge: () => T): T {
 }
 
 /**
- * THE WIRE BYTES — `JSON.stringify` restated over own data only (round 4).
+ * THE WIRE BYTES — `JSON.stringify` restated over own data only (round 4),
+ * CONSUMED FROM ITS CANONICAL HOME since `SER-1` (2026-09-15).
  *
  * ## The route this closes
  *
@@ -154,12 +160,29 @@ export function containedJudgement<T>(judge: () => T): T {
  * Shadowing the hijack point with an own `toJSON` on each materialized array was
  * the cheaper fix and was REJECTED for two reasons: it leaves the bigint route
  * open, and it is consumer-visible — `readPlainData` (`@polymarket-bot/risk`),
- * which the trader's event door runs on exactly this record, refuses a non-index
- * own property on an array, so the shadowed record came back
+ * which the trader's event door runs on exactly this record, refuses a
+ * non-index own property on an array, so the shadowed record came back
  * `EVENT_NOT_DATA: event.payload.list.toJSON: a non-index property on an array
- * is not record data`. The serializer below changes nothing about the delivered
+ * is not record data`. The serializer changes nothing about the delivered
  * record, and the same trader probe on an ordinary decoded envelope with array
  * payloads still returns `ok: true`.
+ *
+ * ## Where the implementation lives now
+ *
+ * Round 4 (`d99c2ac`) wrote the own-data restatement of ECMA-262 25.5.2 HERE:
+ * `quoteWireString`, `serializeWireValue`, `serializeWireObject`,
+ * `serializeWireArray`, `ownWireMember`, `unicodeEscape`. `SER-0` then measured
+ * the same route at every `JSON.stringify` site in the repository, and `SER-1`
+ * moved that body — unchanged in what it reproduces — to
+ * `packages/risk/src/plain-json.ts` (`encodePlainJson`), the canonical own-data
+ * home named by the `GOV-2A` ruling, so that the accounting keys, the durable
+ * bytes and the outbound frames consume ONE implementation instead of copying a
+ * fourth (`dependency-direction.md` §2.1 mirror-collapse subsection, §5 item 5).
+ * This function is the adapter: it passes this door's depth bound and maps the
+ * typed refusal back into this module's own vocabulary, so every refusal
+ * message the round-4 tests pin is still produced here. The edge is
+ * `packages/event-bus` (layer 2) → `packages/risk` (layer 1), downward, so no
+ * §2.1 row is involved.
  *
  * ## What it must reproduce
  *
@@ -170,141 +193,105 @@ export function containedJudgement<T>(judge: () => T): T {
  * `bigint`. `envelope-wire-bytes.test.ts` asserts byte-identity against
  * `JSON.stringify` of the same materialized tree over a generated corpus, in a
  * clean environment, and identity of the result with and without an inherited
- * `toJSON` on `Object.prototype` and on `Array.prototype`.
+ * `toJSON` on `Object.prototype` and on `Array.prototype` — UNMODIFIED by the
+ * `SER-1` move, which is the byte-identity claim that move rests on.
  */
 export function encodeWireJson(value: unknown): string {
-  const encoded = serializeWireValue(value, 0);
-  if (encoded === undefined) {
-    // Unreachable through `encodeEnvelope`, whose argument is always the
-    // materialized envelope record. `JSON.stringify` answers `undefined` here,
-    // which a function returning `string` may not do.
-    throw new NotWireData("the value has no JSON representation");
+  try {
+    return encodePlainJson(value, { maxDepth: MAX_WIRE_DEPTH });
+  } catch (error) {
+    // The canonical encoder's refusal, restated in this module's vocabulary.
+    //
+    // The classification is STRUCTURAL, not by identity: a thrown value is
+    // "the encoder's refusal" when it carries an own string-valued `kind` from
+    // the closed `PLAIN_JSON_REFUSAL_KINDS` vocabulary, and nothing else about
+    // it is examined. That is forgeable — a value thrown from INSIDE the
+    // encoder with such a `kind` (a null-prototype `{ kind: "BIGINT" }`, say)
+    // is restated as the matching `NotWireData` rather than re-thrown as
+    // itself. The only code that can throw from inside the encoder is a
+    // `Proxy` trap on the value being encoded, and the precondition of this
+    // function excludes one: its sole caller, `encodeEnvelope`, hands it the
+    // tree `readOwnWireValue` materialized (null-prototype objects, ordinary
+    // arrays, primitives), on which the encoder runs no caller code at all.
+    // The forgery is therefore reachable only by calling this function
+    // directly with an unmaterialized value, which is not a production route;
+    // `envelope-door-classifier.test.ts` pins that residual as measured.
+    //
+    // Why not `instanceof NotPlainJson`, which would be exact for a genuine
+    // refusal: the round-4 lesson `./brand.ts` records. `instanceof` walks the
+    // thrown value's prototype chain, so a hostile thrown `Proxy` (the same
+    // unmaterialized route) would make the CLASSIFICATION throw and let an
+    // arbitrary value replace the original. The own-data read below is total:
+    // one wrapped descriptor read, no prototype walk. A brand would not help
+    // either — the forgery and the brand are both answered by the
+    // precondition, not by a stronger test here.
+    //
+    // A thrown value that does not classify is re-thrown AS ITSELF for
+    // `encodeEnvelope`'s containment.
+    switch (plainJsonRefusalKind(error)) {
+      case "UNDEFINED_ROOT":
+        // Unreachable through `encodeEnvelope`, whose argument is always the
+        // materialized envelope record. `JSON.stringify` answers `undefined`
+        // here, which a function returning `string` may not do.
+        throw new NotWireData("the value has no JSON representation");
+      case "BIGINT":
+        // The existing typed refusal (`encodeEnvelope` renders it); `JSON.stringify`
+        // reaches the same outcome by throwing a `TypeError`, but only AFTER
+        // consulting `Object.prototype.toJSON` through `BigInt.prototype`.
+        throw new NotWireData("a bigint has no JSON representation");
+      case "EXECUTABLE":
+        // `JSON.stringify` OMITS a function or a symbol; `copyMember` refuses one
+        // before it can reach here, and dropping recorded data silently is what
+        // §8.3 forbids, so this restates the refusal rather than the omission.
+        throw new NotWireData("an envelope must contain data, not executable or symbolic values");
+      case "ACCESSOR":
+        // Unreachable on a materialized tree, which `copyMember` built from data
+        // descriptors only; refused rather than read, so it stays unreachable.
+        throw new NotWireData("an accessor property is code rather than envelope data");
+      case "NON_PLAIN":
+        // Unreachable on a materialized tree for the same reason; `copyMember`
+        // says this in the same words.
+        throw new NotWireData("a non-plain prototype is not envelope data");
+      case "DEPTH":
+        // The same bound and the same comparison as `copyMember`, so every tree
+        // the door materializes is a tree this encoder can emit, and a cycle in a
+        // value that never went through the door terminates here instead of
+        // recursing.
+        throw new NotWireData(`nested deeper than ${String(MAX_WIRE_DEPTH)} levels`);
+      default:
+        throw error;
+    }
   }
-  return encoded;
-}
-
-/** `\uXXXX`, lowercase, as `UnicodeEscape` specifies. */
-function unicodeEscape(code: number): string {
-  return `\\u${code.toString(16).padStart(4, "0")}`;
 }
 
 /**
- * `QuoteJSONString` (ECMA-262 25.5.2.2), for keys and string values alike.
+ * The `kind` of the canonical encoder's refusal, read as OWN DATA. TOTAL: a
+ * value that is not an object, carries no own data `kind`, or throws from the
+ * descriptor read (a `Proxy` trap, a revoked `Proxy`) is `undefined`.
  *
- * A well-formed surrogate PAIR is one code point and is emitted raw; a LONE
- * surrogate is escaped (the ES2019 well-formed-`JSON.stringify` rule). Runs of
- * unescaped code units are copied with one `slice`, so the common case does no
- * per-character concatenation.
+ * STRUCTURAL, as `encodeWireJson` states: an own string `kind` in the closed
+ * vocabulary is the whole test, so a lookalike thrown from inside the encoder
+ * classifies as a refusal. The one descriptor read runs a thrown `Proxy`'s
+ * `getOwnPropertyDescriptor` trap and nothing else — never `getPrototypeOf`,
+ * never a getter — and its throw is caught here. Pinned, with the `instanceof`
+ * mutant it exists to exclude, by `envelope-door-classifier.test.ts`.
  */
-function quoteWireString(value: string): string {
-  let out = "\"";
-  let plainFrom = 0;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    let escape: string;
-    if (code === 0x22) escape = "\\\"";
-    else if (code === 0x5c) escape = "\\\\";
-    else if (code === 0x08) escape = "\\b";
-    else if (code === 0x09) escape = "\\t";
-    else if (code === 0x0a) escape = "\\n";
-    else if (code === 0x0c) escape = "\\f";
-    else if (code === 0x0d) escape = "\\r";
-    else if (code < 0x20) escape = unicodeEscape(code);
-    else if (code >= 0xd800 && code <= 0xdfff) {
-      if (code <= 0xdbff && index + 1 < value.length) {
-        const trailing = value.charCodeAt(index + 1);
-        if (trailing >= 0xdc00 && trailing <= 0xdfff) {
-          index += 1;
-          continue;
-        }
-      }
-      escape = unicodeEscape(code);
-    } else continue;
-    out += value.slice(plainFrom, index) + escape;
-    plainFrom = index + 1;
+function plainJsonRefusalKind(error: unknown): PlainJsonRefusalKind | undefined {
+  if (typeof error !== "object" || error === null) {
+    return undefined;
   }
-  return `${out}${value.slice(plainFrom)}"`;
-}
-
-/** The own DATA value of one property, or absence. Never invokes an accessor. */
-function ownWireMember(container: object, key: string): { present: boolean; value: unknown } {
-  const descriptor = Object.getOwnPropertyDescriptor(container, key);
-  if (descriptor === undefined) {
-    return { present: false, value: undefined };
-  }
-  if (!Object.hasOwn(descriptor, "value")) {
-    // Unreachable on a materialized tree, which `copyMember` built from data
-    // descriptors only; refused rather than read, so it stays unreachable.
-    throw new NotWireData("an accessor property is code rather than envelope data");
-  }
-  return { present: true, value: descriptor.value };
-}
-
-/** `SerializeJSONProperty`: the text of one value, or `undefined` for "no text". */
-function serializeWireValue(value: unknown, depth: number): string | undefined {
-  if (value === null) return "null";
-  switch (typeof value) {
-    case "undefined":
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, "kind");
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
       return undefined;
-    case "boolean":
-      return value ? "true" : "false";
-    case "number":
-      // `String(number)` is `Number::toString`, a specification operation on
-      // the value itself — no method lookup, so no prototype is consulted.
-      // A non-finite number is `null`, exactly as `SerializeJSONNumber` says.
-      return Number.isFinite(value) ? String(value) : "null";
-    case "string":
-      return quoteWireString(value);
-    case "bigint":
-      // The existing typed refusal (`encodeEnvelope` renders it); `JSON.stringify`
-      // reaches the same outcome by throwing a `TypeError`, but only AFTER
-      // consulting `Object.prototype.toJSON` through `BigInt.prototype`.
-      throw new NotWireData("a bigint has no JSON representation");
-    case "object":
-      break;
-    default:
-      // `JSON.stringify` OMITS a function or a symbol; `copyMember` refuses one
-      // before it can reach here, and dropping recorded data silently is what
-      // §8.3 forbids, so this restates the refusal rather than the omission.
-      throw new NotWireData("an envelope must contain data, not executable or symbolic values");
+    }
+    const kind: unknown = descriptor.value;
+    return typeof kind === "string" && PLAIN_JSON_REFUSAL_KINDS.includes(kind as PlainJsonRefusalKind)
+      ? (kind as PlainJsonRefusalKind)
+      : undefined;
+  } catch {
+    return undefined;
   }
-  if (depth >= MAX_WIRE_DEPTH) {
-    // The same bound and the same comparison as `copyMember`, so every tree the
-    // door materializes is a tree this encoder can emit, and a cycle in a value
-    // that never went through the door terminates here instead of recursing.
-    throw new NotWireData(`nested deeper than ${String(MAX_WIRE_DEPTH)} levels`);
-  }
-  const container = value as object;
-  return Array.isArray(container)
-    ? serializeWireArray(container, depth)
-    : serializeWireObject(container, depth);
-}
-
-/** `SerializeJSONObject`: own enumerable string keys in order; `undefined` omitted. */
-function serializeWireObject(container: object, depth: number): string {
-  let out = "";
-  for (const key of Object.keys(container)) {
-    const member = ownWireMember(container, key);
-    if (!member.present) continue;
-    const encoded = serializeWireValue(member.value, depth + 1);
-    if (encoded === undefined) continue;
-    if (out !== "") out += ",";
-    out += `${quoteWireString(key)}:${encoded}`;
-  }
-  return `{${out}}`;
-}
-
-/** `SerializeJSONArray`: `length` elements; a hole or `undefined` is `null`. */
-function serializeWireArray(container: unknown[], depth: number): string {
-  const length = Object.getOwnPropertyDescriptor(container, "length")?.value as number;
-  let out = "";
-  for (let index = 0; index < length; index += 1) {
-    const member = ownWireMember(container, String(index));
-    const encoded = member.present ? serializeWireValue(member.value, depth + 1) : undefined;
-    if (index > 0) out += ",";
-    out += encoded ?? "null";
-  }
-  return `[${out}]`;
 }
 
 function ownMemberOf(value: unknown, key: string): unknown {

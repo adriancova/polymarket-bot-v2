@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@polymarket-bot/domain": "workspace:*",
+    "@polymarket-bot/risk": "workspace:*",
     "ioredis": "^6.0.0"
   },
   "devDependencies": {

@@ -306,6 +306,37 @@ const REGISTERED: readonly Registration[] = [
       ),
     ];
   }),
+  // --- the own-data JSON encoder (`SER-1`, 2026-09-15) -----------------------
+  // `plain-json.ts` is `JSON.stringify` restated over own data: it consults no
+  // `toJSON` anywhere, reads members from own DATA descriptors, and refuses a
+  // container whose prototype is not `Object.prototype` / `Array.prototype` /
+  // `null`. Its two census sites are the key enumeration and the refusing
+  // prototype read — the same two shapes `plain-data.ts` registers above.
+  {
+    file: "packages/risk/src/plain-json.ts",
+    enclosing: "serializeObject",
+    kind: "own-enumeration",
+    text: "Object.keys(container)",
+    count: 1,
+    reason:
+      `${OWN_ENUMERATION_PRIMITIVE} — and here it is also the SPECIFICATION's own choice: ` +
+      "`Object.keys` is `EnumerableOwnProperties(value, key)`, the exact key list " +
+      "`SerializeJSONObject` iterates, so using it is what makes the bytes identical to " +
+      "`JSON.stringify` in a clean process (the differential pin in `plain-json.test.ts`)",
+  },
+  {
+    file: "packages/risk/src/plain-json.ts",
+    enclosing: "serializeValue",
+    kind: "prototype-read",
+    text: "Object.getPrototypeOf(container)",
+    count: 1,
+    reason:
+      `${PROTOTYPE_READ_TO_REFUSE} — the plain-container rule of \`SER-1\`: a Date, Map, class ` +
+      "instance or wrapper object has no own-data meaning to emit, and `JSON.stringify` would " +
+      "have emitted a method's answer or `{}` silently. Not wrapped: the encoder's consumers hand " +
+      "it containers they built or trees already materialized, and the module header states the " +
+      "`Proxy` residual rather than claiming totality",
+  },
   {
     file: "packages/capital-allocator/src/caps.ts",
     enclosing: "reachableThroughPrototype",

@@ -60,8 +60,19 @@ import {
 /** The canonical package both rows run INTO. */
 const CANONICAL = "packages/risk";
 
-/** The two subpaths §2.1 S5 and S6 permit, and the only ones. */
-const DOOR_SUBPATHS = ["@polymarket-bot/risk/plain-data", "@polymarket-bot/risk/schema-arena"];
+/**
+ * The subpaths §2.1 S5 and S6 permit, and the only ones. Two at `WP-200-FU1`;
+ * `SER-1` (2026-09-15) widened both rows' consumed-surface clause by the
+ * own-data JSON encoder, `plain-json.ts`, which the five accounting Map keys
+ * and the two `stableStringify` oracles now consume — the measured basis is
+ * `docs/handoffs/SER-0-sweep.md` (an inherited `toJSON` collapsed every key).
+ * Still door subpaths only: no rule, policy or evaluation logic.
+ */
+const DOOR_SUBPATHS = [
+  "@polymarket-bot/risk/plain-data",
+  "@polymarket-bot/risk/plain-json",
+  "@polymarket-bot/risk/schema-arena",
+];
 
 /** The two rows `WP-200-FU1` added, as (row, consumer) pairs. */
 const ROWS = [
@@ -152,9 +163,11 @@ describe("the S5/S6 edges exist, run one way, and carry the door only", () => {
 
   /**
    * THE FINDING-M1 GUARD. Every `@polymarket-bot/risk` specifier in either
-   * tree is one of the two door subpaths. A bare `from "@polymarket-bot/risk"`
+   * tree is one of the door subpaths above. A bare `from "@polymarket-bot/risk"`
    * — the package ROOT, which exports the engine, the policy and the
-   * recommendations — is a violation, and so is any future third subpath.
+   * recommendations — is a violation, and so is any subpath the list does not
+   * name. (The list grew from two to three at `SER-1`, with the §2.1 S5/S6
+   * clause widened in the same change.)
    */
   for (const { row, dir } of ROWS) {
     it(`the ${row} edge carries the parse door and NOTHING ELSE — not the package root`, () => {
