@@ -12,6 +12,9 @@
  * `docs/contracts/wal-format.md`; this module is its implementation.
  */
 
+import { encodePlainJson, PLAIN_JSON_REFUSAL_KINDS } from "@polymarket-bot/risk/plain-json";
+import type { PlainJsonRefusalKind } from "@polymarket-bot/risk/plain-json";
+
 import { WAL_FORMAT_ID, WAL_SCHEMA_VERSION } from "./constants.js";
 import { WalSegmentIntegrityError } from "./errors.js";
 import type { WalCloseReason } from "./ports.js";
@@ -70,13 +73,82 @@ const CLOSE_REASONS: readonly WalCloseReason[] = [
 
 const LOWERCASE_SHA256_HEX = /^[0-9a-f]{64}$/u;
 
+/**
+ * The `kind` of the own-data encoder's refusal, read as OWN DATA, or
+ * `undefined` for anything else that was thrown.
+ *
+ * Not `instanceof NotPlainJson`: the encoder's refusal is classified by the
+ * closed vocabulary it carries, so the classification consults no prototype
+ * (`packages/event-bus/src/envelope-door.ts` records why that matters at a
+ * containment boundary). A thrown value that is not an object, carries no own
+ * data `kind`, or whose descriptor read throws, is "not the encoder's refusal".
+ */
+function plainJsonRefusalKind(error: unknown): PlainJsonRefusalKind | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(error, "kind");
+  } catch {
+    return undefined;
+  }
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return undefined;
+  const kind: unknown = descriptor.value;
+  return typeof kind === "string" && PLAIN_JSON_REFUSAL_KINDS.includes(kind as PlainJsonRefusalKind)
+    ? (kind as PlainJsonRefusalKind)
+    : undefined;
+}
+
+/** An own string data property of `error`, or `undefined`. */
+function ownStringOf(error: object, key: string): string | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(error, key);
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return undefined;
+  return typeof descriptor.value === "string" ? descriptor.value : undefined;
+}
+
+/**
+ * The ONE encoder for every line this package persists: header, frame, footer.
+ *
+ * The bytes are `@polymarket-bot/risk/plain-json`'s `encodePlainJson`, the
+ * ECMA-262 25.5.2 restatement over OWN DATA — never `JSON.stringify`, which
+ * resolves `toJSON` through the value's prototype chain. `SER-0`
+ * (`docs/handoffs/SER-0-sweep.md`) measured this site under an inherited
+ * `toJSON` on `Object.prototype`: the frame line persisted was the bytes the
+ * injected function answered, fed to the running SHA-256, attested by the
+ * footer and the manifest, reported durable and cleared from `pendingFrames()`
+ * — and the evidence existed nowhere else. Header and footer lines, HIGH by
+ * the same route. The primitive reads own data descriptors only, so the bytes
+ * of a line are a function of the record and of nothing ambient; for every
+ * in-type input they are byte-identical to what a clean process's
+ * `JSON.stringify` produced (`docs/contracts/wal-format.md` is unchanged).
+ *
+ * A value the encoder refuses — `undefined` at the root, a `bigint`, a
+ * function or symbol member, an accessor, a non-plain container, a container
+ * nested past the default depth — is a `WalSegmentIntegrityError` with the
+ * refusal's `kind`, `path` and `problem` in its details. Before this round
+ * only a root `JSON.stringify` has no text for (`undefined`, a function, a
+ * symbol) reached that error; a bigint was an untyped `TypeError`, and a
+ * function member, a `Date` or a `Map` were silently omitted or substituted
+ * by `JSON.stringify`. Every record type this module
+ * encodes is a literal it builds from primitives, so the refusal is
+ * unreachable for a well-formed record and exists so a malformed one fails
+ * loudly instead of persisting bytes that are not the record.
+ */
 function encodeLine(value: unknown): Uint8Array {
-  const json = JSON.stringify(value);
-  if (json === undefined) {
-    throw new WalSegmentIntegrityError("record is not JSON-serializable");
+  let json: string;
+  try {
+    json = encodePlainJson(value);
+  } catch (error) {
+    const kind = plainJsonRefusalKind(error);
+    if (kind === undefined) throw error;
+    const refusal = error as object;
+    throw new WalSegmentIntegrityError("record is not JSON-serializable", {
+      kind,
+      path: ownStringOf(refusal, "path"),
+      problem: ownStringOf(refusal, "problem"),
+    });
   }
   if (json.includes("\n")) {
-    // JSON.stringify escapes literal newlines inside strings, so this is
+    // The encoder escapes literal newlines inside strings, so this is
     // unreachable for well-formed input; it exists so a future change that
     // introduces pretty-printing fails loudly instead of corrupting framing.
     throw new WalSegmentIntegrityError("encoded record contains a line feed");

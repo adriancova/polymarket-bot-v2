@@ -37,7 +37,43 @@
  *
  * Everything else that can hold a price, a size, a fee, or a balance goes
  * through `assertDecimalSafeJson()`.
+ *
+ * ## The guard JUDGES, the repository ENCODES, `pg` receives TEXT (`SER-2`)
+ *
+ * The guard above returns the SAME object reference it judged. Until `SER-2`
+ * every repository then handed that object to Kysely, and `pg@8.23.0`
+ * (`lib/utils.js` `prepareObject`) serialized it at bind time: a plain
+ * `val.toPostgres` property GET (an inherited-lookup route of its own) and
+ * then `JSON.stringify`, which resolves `toJSON` through the value's
+ * PROTOTYPE CHAIN. `docs/handoffs/SER-0-sweep.md` measured that end to end
+ * through real Kysely → `pg` `prepareValue`, in six contexts
+ * ({`Object.prototype`, `Array.prototype`, `BigInt.prototype`} × {enumerable
+ * assignment, non-enumerable `defineProperty`}): a document the guard PASSED
+ * was stored as the injected `toJSON`'s answer, and a `bigint` inside an
+ * unguarded document — refused by `JSON.stringify` with a `TypeError` in a
+ * clean process — became accepted bytes. A STRING parameter never reaches
+ * `prepareObject` (measured invariant in all six contexts), which closes both
+ * routes at once.
+ *
+ * So the rule, one sentence: **every `jsonb` write hands `pg` text.** The
+ * guard stays exactly where it is and keeps judging the object; the
+ * repository then calls {@link encodeJsonbText}, which produces the bytes with
+ * `@polymarket-bot/risk/plain-json`'s `encodePlainJson` — ECMA-262 25.5.2
+ * over OWN DATA only, byte-identical to a clean `JSON.stringify` for plain
+ * data — and binds the string. The column input types
+ * (`schema/columns.ts` `JsonInput`, `DecimalSafeJsonInput`) admit `string`
+ * for exactly this reason. A document the encoder refuses (a `bigint`, a
+ * function or symbol, an accessor, a `Date`/`Map`/class instance, a container
+ * nested past the default depth, `undefined` at the root) is a
+ * {@link DecimalSafeJsonError} — the package's existing "not storable"
+ * vocabulary — never a driver `TypeError` and never silently substituted
+ * bytes: `BIGINT` maps to `ECONOMIC_JSON_NUMBER` (what `walk()` already says
+ * of a bigint) and every other refusal kind to `ECONOMIC_JSON_MALFORMED`
+ * (what `walk()` already says of a value JSON cannot represent).
  */
+
+import { encodePlainJson, PLAIN_JSON_REFUSAL_KINDS } from "@polymarket-bot/risk/plain-json";
+import type { PlainJsonRefusalKind } from "@polymarket-bot/risk/plain-json";
 
 import { DecimalSafeJsonError } from "./errors.js";
 import type { DecimalSafeJsonInput } from "./schema/columns.js";
@@ -140,4 +176,105 @@ export function decimalSafeJson(
 ): DecimalSafeJsonInput {
   assertDecimalSafeJson(value, field);
   return value;
+}
+
+/**
+ * The `kind` of the own-data encoder's refusal, read as OWN DATA, or
+ * `undefined` for anything else that was thrown.
+ *
+ * Not `instanceof NotPlainJson`: the refusal is classified by the closed
+ * vocabulary it carries, so the classification consults no prototype
+ * (`packages/event-bus/src/envelope-door.ts` records why that matters at a
+ * containment boundary). A thrown value that is not an object, carries no own
+ * data `kind`, or whose descriptor read throws, is "not the encoder's
+ * refusal" and is re-thrown untouched by the caller.
+ */
+function plainJsonRefusalKind(error: unknown): PlainJsonRefusalKind | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(error, "kind");
+  } catch {
+    return undefined;
+  }
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return undefined;
+  const kind: unknown = descriptor.value;
+  return typeof kind === "string" && PLAIN_JSON_REFUSAL_KINDS.includes(kind as PlainJsonRefusalKind)
+    ? (kind as PlainJsonRefusalKind)
+    : undefined;
+}
+
+/** An own string data property of `error`, or the empty string. */
+function ownStringOf(error: object, key: string): string {
+  const descriptor = Object.getOwnPropertyDescriptor(error, key);
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) return "";
+  return typeof descriptor.value === "string" ? descriptor.value : "";
+}
+
+/**
+ * The encoder names the root `value` and a member `value.a[0].b`; this
+ * package's `walk()` names the root `` (empty) and a member `.a[0].b`, with
+ * the column in `field`. One convention for the operator.
+ */
+function repositoryPath(encoderPath: string): string {
+  return encoderPath.startsWith("value") ? encoderPath.slice("value".length) : encoderPath;
+}
+
+/**
+ * The TEXT a `jsonb` column receives for `document`: the bytes of its own
+ * data, or `null` for `null`, or the caller's own bytes for a string.
+ *
+ * This is the "repository ENCODES" half of the header's rule. Call it AFTER
+ * the guard (where the column has one) and hand its answer to Kysely in place
+ * of the object, so `pg` binds a string and never serializes through the
+ * prototype chain. A string is passed through untouched — it is already the
+ * bytes the caller chose to store, and `assertDecimalSafeJson` has parsed and
+ * judged it where the column is guarded.
+ *
+ * @param document - The object, pre-serialized text, or `null`.
+ * @param field - The column, named in the refusal.
+ * @throws {DecimalSafeJsonError} `ECONOMIC_JSON_NUMBER` for a `bigint` at any
+ *   depth; `ECONOMIC_JSON_MALFORMED` for every other refusal of the own-data
+ *   encoder (`undefined` root, function or symbol, accessor, non-plain
+ *   container, depth).
+ */
+export function encodeJsonbText(
+  document: string | Readonly<Record<string, unknown>>,
+  field: string,
+): string;
+export function encodeJsonbText(
+  document: string | Readonly<Record<string, unknown>> | null,
+  field: string,
+): string | null;
+export function encodeJsonbText(
+  document: string | Readonly<Record<string, unknown>> | null,
+  field: string,
+): string | null {
+  if (document === null) return null;
+  if (typeof document === "string") return document;
+  try {
+    return encodePlainJson(document);
+  } catch (error) {
+    const kind = plainJsonRefusalKind(error);
+    if (kind === undefined) throw error;
+    const refusal = error as object;
+    const path = repositoryPath(ownStringOf(refusal, "path"));
+    const problem = ownStringOf(refusal, "problem");
+    if (kind === "BIGINT") {
+      throw new DecimalSafeJsonError(
+        "ECONOMIC_JSON_NUMBER",
+        `${field}${path} is a bigint, which JSON cannot represent. Use a decimal string.`,
+        field,
+        path,
+        { cause: error },
+      );
+    }
+    throw new DecimalSafeJsonError(
+      "ECONOMIC_JSON_MALFORMED",
+      `${field}${path} is not representable in JSON (${kind}): ${problem}`,
+      field,
+      path,
+      { cause: error },
+    );
+  }
 }

@@ -51,6 +51,7 @@ import type { AppendedLedgerTransaction } from "@polymarket-bot/ledger";
 import { toPnlSnapshotRow, type PnlSnapshot } from "@polymarket-bot/pnl";
 import {
   createLedgerRepository,
+  encodeJsonbText,
   type PolymarketBotDatabase,
 } from "@polymarket-bot/storage-postgres";
 
@@ -85,12 +86,32 @@ export class PostgresTraderStore implements TraderStore {
    * one" enforceable at the database rather than only in the runtime — a
    * duplicate is a constraint violation, which arrives here as a failure the
    * loop halts on rather than as a second row.
+   *
+   * `model_outputs` and `state_patch` are bound as TEXT — the documents' own
+   * bytes from `packages/storage-postgres`'s `encodeJsonbText` (the own-data
+   * encoder of `@polymarket-bot/risk/plain-json`), `null` staying `null` — so
+   * `pg` never serializes an object through the prototype chain. The
+   * repository rule is one sentence: every `jsonb` write hands `pg` text
+   * (`packages/storage-postgres/src/json.ts`, `SER-2`). The runtime's
+   * materializer emits null-prototype objects, whose arrays keep
+   * `Array.prototype`; the encoder reads own data only, so neither is
+   * consulted for a `toJSON`. A document the encoder refuses is the storage
+   * package's typed error, which `#contained` turns into `UNAVAILABLE` like
+   * every other failure here.
    */
   async persistDecision(
     record: DecisionRecord,
     telemetry: DecisionTelemetry,
   ): Promise<PortResult<null>> {
     return await this.#contained("persist a decision", async () => {
+      const modelOutputs = encodeJsonbText(
+        record.decision.modelOutputs ?? null,
+        "decisions.model_outputs",
+      );
+      const statePatch = encodeJsonbText(
+        record.decision.statePatch ?? null,
+        "decisions.state_patch",
+      );
       await this.#db
         .insertInto("strategy.decisions")
         .values({
@@ -104,8 +125,8 @@ export class PostgresTraderStore implements TraderStore {
           reason_codes: [...record.decision.reasonCodes],
           feature_snapshot_ref: record.decision.featureSnapshotRef,
           feature_snapshot_id: null,
-          model_outputs: (record.decision.modelOutputs ?? null) as never,
-          state_patch: (record.decision.statePatch ?? null) as never,
+          model_outputs: modelOutputs,
+          state_patch: statePatch,
           next_wakeup_at: record.decision.nextWakeupAt ?? null,
           source_event_id: record.sourceEvent?.eventId ?? null,
           gateway_epoch: record.sourceEvent?.gatewayEpoch ?? null,

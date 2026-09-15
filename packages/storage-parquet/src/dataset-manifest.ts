@@ -50,6 +50,8 @@
  * ({@link ./retention-receipt.js}).
  */
 
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
+
 import {
   DATASET_MANIFEST_FORMAT_ID,
   DATASET_MANIFEST_VERSION,
@@ -396,7 +398,14 @@ export function encodeDatasetManifest(manifest: DatasetManifest): Uint8Array {
     })),
     walRetentionPolicy: manifest.walRetentionPolicy,
   };
-  return Buffer.from(`${JSON.stringify(ordered, null, 2)}\n`, "utf8");
+  // The own-data encoder with the same two-space gap, byte for byte. This
+  // document is persisted to the immutable object store with a digest computed
+  // from these bytes; `SER-0` measured `JSON.stringify` under an inherited
+  // `toJSON` producing a manifest whose digest was self-consistent with the
+  // WRONG bytes, which retention then refused. `ordered` is built above from
+  // primitives and this module's own literals, so the encoder's typed refusal
+  // is unreachable for a well-formed manifest.
+  return Buffer.from(`${encodePlainJson(ordered, { indent: 2 })}\n`, "utf8");
 }
 
 /** SHA-256 of a manifest's canonical bytes. */

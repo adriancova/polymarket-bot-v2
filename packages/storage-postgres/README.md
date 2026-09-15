@@ -112,6 +112,18 @@ sizing and the risk thresholds are computed from, and the database rejects a
 JSON number there as well (`decisions_model_outputs_decimal_safe`, built on
 `internal.jsonb_contains_number()`).
 
+The guard judges; the repository encodes; `pg` receives text (`SER-2`). No
+repository hands the driver a document object for a `jsonb` column — exempt or
+guarded — because `pg` would serialize it at bind time with `JSON.stringify`,
+which resolves `toJSON` through the prototype chain
+(`docs/handoffs/SER-0-sweep.md` measured a guard-passed document stored as an
+inherited `toJSON`'s answer). Every `jsonb` write binds the string
+`encodeJsonbText()` (`src/json.ts`) produces from the document's own data,
+byte-identical to a clean `JSON.stringify`; a document that has no own-data
+JSON text (a `bigint`, a function, an accessor, a `Date`/`Map`/class instance)
+is a `DecimalSafeJsonError` rather than a driver `TypeError` or substituted
+bytes.
+
 Timestamps cross the boundary as ISO-8601 strings, never as `Date`: connections
 run with `TimeZone=UTC` and `DateStyle=ISO`, and `src/timestamps.ts` converts
 exactly, throwing rather than guessing if a session was configured otherwise.

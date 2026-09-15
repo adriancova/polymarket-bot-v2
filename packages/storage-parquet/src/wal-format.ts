@@ -35,6 +35,8 @@
 
 import { createHash } from "node:crypto";
 
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
+
 import {
   DEFAULT_MAX_RECORD_BYTES,
   LINE_FEED,
@@ -310,7 +312,12 @@ export function compareUnsignedIntegerStrings(left: string, right: string): numb
  * encoding.
  */
 export function encodeFrameLine(record: RawFrameRecord): Uint8Array {
-  const json = JSON.stringify({
+  // The own-data encoder, not `JSON.stringify`: the latter resolves `toJSON`
+  // through the prototype chain, and `SER-0` measured an inherited one
+  // replacing this literal wholesale, so `rowReproducesItsSourceLine` flipped
+  // false and replay consumers received the wrong bytes. Byte-identical to a
+  // clean `JSON.stringify` for every record the grammar admits.
+  const json = encodePlainJson({
     gatewayEpoch: record.gatewayEpoch,
     ingestSeq: record.ingestSeq,
     source: record.source,

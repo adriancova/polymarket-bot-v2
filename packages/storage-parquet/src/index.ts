@@ -12,8 +12,15 @@
  * which is **binding** for the format, durability, and compaction decisions.
  *
  * Layer: adapters/infrastructure (`docs/contracts/dependency-direction.md` §2,
- * layer 2). It declares **no workspace dependency at all** — in particular not
- * `packages/storage-wal`, which is the same layer and would be an unlisted
+ * layer 2). It declares exactly one workspace dependency, downward:
+ * `@polymarket-bot/risk/plain-json` (layer 1), the own-data JSON encoder that
+ * produces every byte this package persists — the re-encoded frame line, the
+ * dataset manifest and the retention receipt — since `SER-2`
+ * (`docs/handoffs/SER-0-sweep.md` measured all three replaced by a `toJSON`
+ * inherited through the prototype chain, the manifest's digest self-consistent
+ * with the wrong bytes). A layer-2 → layer-1 edge is the §2 direction and
+ * needs no §2.1 row. It still declares **no dependency on
+ * `packages/storage-wal`**, which is the same layer and would be an unlisted
  * same-layer edge (F13). It consumes the WAL's published on-disk format
  * (`docs/contracts/wal-format.md`) through its own reader; see
  * {@link ./wal-format.js} for the full reasoning.

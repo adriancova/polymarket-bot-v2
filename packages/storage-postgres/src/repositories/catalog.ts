@@ -14,6 +14,7 @@ import type { PolymarketBotDatabase } from "../database.js";
 import { inTransaction } from "../database.js";
 import { withMappedErrors } from "../errors.js";
 import { uuidV7 } from "../ids.js";
+import { encodeJsonbText } from "../json.js";
 import type {
   EventSourceValue,
   MarketLifecycleStateValue,
@@ -80,6 +81,10 @@ export function createCatalogRepository(db: PolymarketBotDatabase) {
      */
     async registerMarket(input: RegisterMarketInput): Promise<UuidV7Column> {
       const marketId = uuidV7();
+      // Venue metadata, recorded as observed and not decimal-guarded — but
+      // ENCODED here, default included, so `pg` receives its own bytes rather
+      // than a driver serialization through the prototype chain (`SER-2`).
+      const rawMetadata = encodeJsonbText(input.rawMetadata ?? {}, "markets.raw_metadata");
 
       await inTransaction(db, async (trx) => {
         await trx
@@ -99,7 +104,7 @@ export function createCatalogRepository(db: PolymarketBotDatabase) {
             trading_delay_seconds: input.parameters.tradingDelaySeconds,
             open_time: input.parameters.openTime ?? null,
             close_time: input.parameters.closeTime ?? null,
-            raw_metadata: input.rawMetadata ?? {},
+            raw_metadata: rawMetadata,
           })
           .execute();
 

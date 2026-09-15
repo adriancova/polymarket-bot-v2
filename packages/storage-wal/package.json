@@ -13,6 +13,9 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p ../../test/fault-injection/wal/tsconfig.json",
     "test:fault": "vitest run --config ../../test/fault-injection/wal/vitest.config.ts"
   },
+  "dependencies": {
+    "@polymarket-bot/risk": "workspace:*"
+  },
   "devDependencies": {
     "@types/node": "^24.13.3",
     "typescript": "^5.9.2",
