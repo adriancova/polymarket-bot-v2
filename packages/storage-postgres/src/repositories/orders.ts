@@ -28,7 +28,7 @@ import type { PolymarketBotDatabase } from "../database.js";
 import { inTransaction } from "../database.js";
 import { withMappedErrors } from "../errors.js";
 import { uuidV7 } from "../ids.js";
-import { assertDecimalSafeJson } from "../json.js";
+import { assertDecimalSafeJson, encodeJsonbText } from "../json.js";
 import type {
   Code,
   DecimalSafeJsonInput,
@@ -124,6 +124,11 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
     async recordSubmissionAttempt(input: RecordSubmissionAttemptInput): Promise<UuidV7Column> {
       const submissionAttemptId = uuidV7();
       assertDecimalSafeJson(input.signedPayload, "submission_attempts.signed_payload");
+      // The guard judged the object; the row binds its TEXT (`json.ts`, `SER-2`).
+      const signedPayload = encodeJsonbText(
+        input.signedPayload,
+        "submission_attempts.signed_payload",
+      );
 
       await withMappedErrors(async () =>
         db
@@ -137,7 +142,7 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
             attempt_ordinal: input.attemptOrdinal ?? 1,
             fencing_lease_id: input.fencing?.fencingLeaseId ?? null,
             fencing_token: input.fencing?.fencingToken ?? null,
-            signed_payload: input.signedPayload,
+            signed_payload: signedPayload,
             salt: input.salt,
             expected_order_hash: input.expectedOrderHash ?? null,
             state: input.state ?? "SIGNED",
@@ -156,6 +161,14 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
      * and re-encoding it would make the record no longer what the venue sent.
      * Nothing reads an economic value out of it — economics come from the fill
      * and ledger tables, whose columns are canonical decimal text.
+     *
+     * Not decimal-guarded, but ENCODED here all the same: the bytes `pg`
+     * receives are the response's own data, produced by the own-data encoder,
+     * never the driver's `JSON.stringify` through the prototype chain
+     * (`json.ts`, `SER-2`). A response carrying a `bigint` is refused as
+     * `DecimalSafeJsonError` in every process, where the driver used to throw
+     * an untyped `TypeError` in a clean one and accept substituted bytes under
+     * an inherited `BigInt.prototype.toJSON`.
      */
     async recordSubmissionResponse(input: {
       readonly submissionAttemptId: UuidV7Column;
@@ -166,6 +179,10 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
       readonly errorCode?: Code | null;
       readonly errorDetail?: Detail | null;
     }): Promise<void> {
+      const responsePayload = encodeJsonbText(
+        input.responsePayload ?? null,
+        "submission_attempts.response_payload",
+      );
       await withMappedErrors(async () =>
         db
           .updateTable("execution.submission_attempts")
@@ -173,7 +190,7 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
             state: input.state,
             response_received_at: sql<string>`now()`,
             response_status: input.responseStatus ?? null,
-            response_payload: input.responsePayload ?? null,
+            response_payload: responsePayload,
             venue_order_id: input.venueOrderId ?? null,
             error_code: input.errorCode ?? null,
             error_detail: input.errorDetail ?? null,
@@ -232,6 +249,8 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
     async appendOrderEvent(input: AppendOrderEventInput): Promise<UuidV7Column> {
       const orderEventId = uuidV7();
       assertDecimalSafeJson(input.payload, "order_events.payload");
+      // The guard judged the object; the row binds its TEXT (`json.ts`, `SER-2`).
+      const payload = encodeJsonbText(input.payload ?? null, "order_events.payload");
 
       await inTransaction(db, async (trx) => {
         const current = await trx
@@ -267,7 +286,7 @@ export function createOrderRepository(db: PolymarketBotDatabase) {
             remaining_shares: input.remainingShares ?? null,
             reason_code: input.reasonCode ?? null,
             detail: input.detail ?? null,
-            payload: input.payload ?? null,
+            payload,
             source: input.source,
             occurred_at: input.occurredAt,
           })

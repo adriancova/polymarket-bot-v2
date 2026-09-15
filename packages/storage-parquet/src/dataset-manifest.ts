@@ -50,6 +50,8 @@
  * ({@link ./retention-receipt.js}).
  */
 
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
+
 import {
   DATASET_MANIFEST_FORMAT_ID,
   DATASET_MANIFEST_VERSION,
@@ -396,7 +398,26 @@ export function encodeDatasetManifest(manifest: DatasetManifest): Uint8Array {
     })),
     walRetentionPolicy: manifest.walRetentionPolicy,
   };
-  return Buffer.from(`${JSON.stringify(ordered, null, 2)}\n`, "utf8");
+  // The own-data encoder with the same two-space gap, byte for byte. This
+  // document is persisted to the immutable object store with a digest computed
+  // from these bytes; `SER-0` measured `JSON.stringify` under an inherited
+  // `toJSON` producing a manifest whose digest was self-consistent with the
+  // WRONG bytes, which retention then refused.
+  //
+  // WHAT `ordered` CONTAINS (`SER-2` review, H1). Everything above is a
+  // primitive or this module's own literal EXCEPT one field: an excluded
+  // segment's `issue.details`, which is passed through from the reader. The
+  // first `SER-2` candidate's claim that the encoder's refusal is therefore
+  // "unreachable" was FALSE — `wal-format.ts` copied a corrupt line's parsed
+  // `record` discriminator into that bag, so a segment holding 65 nested
+  // objects made this call throw `DEPTH` and killed a whole compaction batch
+  // that base had completed by excluding the bad segment. The reader now bounds
+  // every diagnostic where it captures it, and `WalSegmentIssueDetail` narrows
+  // the bag to bounded plain data at every producer, so the refusal is
+  // unreachable for a manifest this package builds — from any bytes on disk.
+  // It stays a typed refusal rather than silent substitution for the case no
+  // type can exclude: a caller that constructed a `DatasetManifest` itself.
+  return Buffer.from(`${encodePlainJson(ordered, { indent: 2 })}\n`, "utf8");
 }
 
 /** SHA-256 of a manifest's canonical bytes. */

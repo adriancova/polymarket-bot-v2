@@ -213,7 +213,19 @@ const SEGMENT_OVERHEAD_SLACK_BYTES = 64;
  */
 const WIDEST_INJECTED_SEGMENT_ID = "a".repeat(MAX_SEGMENT_ID_ENCODED_BYTES - 2);
 
-/** Bytes `JSON.stringify` produces for a segment id — what a line pays for it. */
+/**
+ * Bytes `JSON.stringify` produces for a segment id — what a line pays for it.
+ *
+ * Deliberately still `JSON.stringify`, unlike every container this package
+ * encodes (`segment-format.ts`, `manifest.ts`, routed through the own-data
+ * encoder by `SER-2`): the argument is a STRING PRIMITIVE, and ECMA-262 25.5.2
+ * `SerializeJSONProperty` looks `toJSON` up only on a value of type Object or
+ * BigInt, so no inherited `toJSON` can reach it (`SER-0` measured the string
+ * route immune in all six contexts). `MAX_SEGMENT_ID_ENCODED_BYTES` and
+ * `docs/contracts/wal-format.md` §11.2 state the bound on
+ * `JSON.stringify(segmentId)` by name, and the primitive is byte-identical
+ * here, so the wording stays true either way.
+ */
 function encodedSegmentIdBytes(segmentId: string): number {
   return Buffer.byteLength(JSON.stringify(segmentId), "utf8");
 }

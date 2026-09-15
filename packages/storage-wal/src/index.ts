@@ -8,9 +8,15 @@
  * specified in `docs/contracts/wal-format.md`; this package implements it.
  *
  * Layer: adapters/infrastructure (`docs/contracts/dependency-direction.md` §2,
- * layer 2). It imports Node built-ins and nothing from this workspace — in
- * particular not `packages/domain`, which is frozen and holds no storage type
- * (ADR-004 §1).
+ * layer 2). It imports Node built-ins and exactly one workspace package,
+ * downward: `@polymarket-bot/risk/plain-json` (layer 1), the own-data JSON
+ * encoder every persisted line and manifest is encoded by since `SER-2` —
+ * `JSON.stringify` resolves `toJSON` through the prototype chain, and
+ * `docs/handoffs/SER-0-sweep.md` measured the frame line this package
+ * persists, checksums and attests being replaced by an inherited one. A
+ * layer-2 → layer-1 edge is the §2 direction and needs no §2.1 row. Nothing
+ * else from this workspace — in particular not `packages/domain`, which is
+ * frozen and holds no storage type (ADR-004 §1).
  *
  * Typical use from a composition root:
  *

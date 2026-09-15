@@ -12,6 +12,8 @@
  * verifies **before** it may delete (ADR-004 §5).
  */
 
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
+
 import {
   MANIFEST_FILE_SUFFIX,
   SEGMENT_FILE_SUFFIX,
@@ -213,7 +215,20 @@ function readBoolean(
   return value;
 }
 
-/** Serialize a manifest. Pretty-printed: an operator reads this during an incident. */
+/**
+ * Serialize a manifest. Pretty-printed: an operator reads this during an incident.
+ *
+ * Encoded by `@polymarket-bot/risk/plain-json`'s own-data encoder with the same
+ * two-space gap `JSON.stringify(ordered, null, 2)` produced, byte for byte,
+ * for the same reason `segment-format.ts`'s `encodeLine` is: `JSON.stringify`
+ * resolves `toJSON` through the prototype chain, and the document below is an
+ * object literal any inherited `toJSON` would replace wholesale (`SER-0`;
+ * every reader of this artifact fails closed on such bytes, so the reach was
+ * refuted at that measurement — the site is routed for uniformity with the
+ * lines it attests). `ordered` is built here from primitives, so the encoder's
+ * refusal is unreachable for a well-formed manifest and propagates as its own
+ * typed error otherwise.
+ */
 export function encodeSegmentManifest(manifest: WalSegmentManifest): Uint8Array {
   const ordered = {
     manifestVersion: manifest.manifestVersion,
@@ -240,7 +255,7 @@ export function encodeSegmentManifest(manifest: WalSegmentManifest): Uint8Array 
     footerPresent: manifest.footerPresent,
     truncatedTailBytes: manifest.truncatedTailBytes,
   };
-  return Buffer.from(`${JSON.stringify(ordered, null, 2)}\n`, "utf8");
+  return Buffer.from(`${encodePlainJson(ordered, { indent: 2 })}\n`, "utf8");
 }
 
 /** Parse and validate a manifest document. */

@@ -14,7 +14,7 @@ import type { PolymarketBotDatabase } from "../database.js";
 import { inTransaction } from "../database.js";
 import { withMappedErrors } from "../errors.js";
 import { uuidV7 } from "../ids.js";
-import { assertDecimalSafeJson } from "../json.js";
+import { assertDecimalSafeJson, encodeJsonbText } from "../json.js";
 import type {
   Code,
   DecimalSafeJsonInput,
@@ -79,6 +79,10 @@ export function createStrategyRepository(db: PolymarketBotDatabase) {
   return {
     async createDefinition(input: CreateDefinitionInput): Promise<UuidV7Column> {
       const definitionId = uuidV7();
+      // Not decimal-guarded (a JSON Schema's numbers are keywords; `json.ts`
+      // allowlist) but ENCODED here: `pg` receives the schema's own bytes, not
+      // a driver serialization through the prototype chain (`SER-2`).
+      const paramsSchema = encodeJsonbText(input.paramsSchema, "definitions.params_schema");
       await withMappedErrors(async () =>
         db
           .insertInto("strategy.definitions")
@@ -86,7 +90,7 @@ export function createStrategyRepository(db: PolymarketBotDatabase) {
             definition_id: definitionId,
             strategy_name: input.strategyName,
             code_version: input.codeVersion,
-            params_schema: input.paramsSchema,
+            params_schema: paramsSchema,
             state_schema_version: input.stateSchemaVersion,
             decision_contract_version: input.decisionContractVersion,
             description: input.description ?? null,
@@ -108,6 +112,8 @@ export function createStrategyRepository(db: PolymarketBotDatabase) {
       readonly configVersion: number;
     }> {
       assertDecimalSafeJson(input.parameters, "configs.parameters");
+      // The guard judged the object; the row binds its TEXT (`json.ts`, `SER-2`).
+      const parameters = encodeJsonbText(input.parameters, "configs.parameters");
 
       return inTransaction(db, async (trx) => {
         const previous = await trx
@@ -127,7 +133,7 @@ export function createStrategyRepository(db: PolymarketBotDatabase) {
             config_id: configId,
             definition_id: input.definitionId,
             config_version: configVersion,
-            parameters: input.parameters,
+            parameters,
             parameters_hash: input.parametersHash,
             validated_at: input.validatedAt,
             created_by: input.createdBy,

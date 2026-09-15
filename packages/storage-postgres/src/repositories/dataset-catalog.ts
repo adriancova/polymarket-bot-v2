@@ -61,6 +61,7 @@ import type { PolymarketBotDatabase } from "../database.js";
 import { inTransaction } from "../database.js";
 import { withMappedErrors } from "../errors.js";
 import { uuidV7 } from "../ids.js";
+import { encodeJsonbText } from "../json.js";
 import type { Detail, Sha256Hex, UuidV7Column } from "../schema/columns.js";
 import type { EventSourceValue, SegmentFormatValue } from "../schema/enums.js";
 
@@ -175,6 +176,23 @@ export function createDatasetCatalogRepository(db: PolymarketBotDatabase) {
           );
         }
       }
+      // The three identity documents were already bound as TEXT; since `SER-2`
+      // that text is the documents' OWN bytes (`json.ts`), never
+      // `JSON.stringify`'s answer through the prototype chain. Encoded after
+      // the data refusals above and before the transaction opens, so an
+      // unencodable document costs no round trip.
+      const startEventIdentity = encodeJsonbText(
+        input.startEventIdentity,
+        "dataset_manifests.start_event_identity",
+      );
+      const endEventIdentity = encodeJsonbText(
+        input.endEventIdentity,
+        "dataset_manifests.end_event_identity",
+      );
+      const pinnedVersions = encodeJsonbText(
+        input.pinnedVersions,
+        "dataset_manifests.pinned_versions",
+      );
       return await withMappedErrors(async () =>
         inTransaction(db, async (trx) => {
           const segmentIds = new Map<string, UuidV7Column>();
@@ -297,9 +315,9 @@ export function createDatasetCatalogRepository(db: PolymarketBotDatabase) {
               fill_model_parameters: null,
               latency_model_version: null,
               latency_model_parameters: null,
-              start_event_identity: JSON.stringify(input.startEventIdentity),
-              end_event_identity: JSON.stringify(input.endEventIdentity),
-              pinned_versions: JSON.stringify(input.pinnedVersions),
+              start_event_identity: startEventIdentity,
+              end_event_identity: endEventIdentity,
+              pinned_versions: pinnedVersions,
               manifest_hash: input.manifestSha256,
             })
             .execute();

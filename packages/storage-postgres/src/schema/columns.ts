@@ -62,10 +62,20 @@ export type AppendOnlyTable<TColumns> = {
 /**
  * A `jsonb` column.
  *
- * `pg` parses `jsonb` into JavaScript values on read and serializes an object on
- * write. `JsonValue` is the *read* shape and admits `number`, because a `jsonb`
- * document may contain one and pretending otherwise would be a lie about what
- * comes back.
+ * `pg` parses `jsonb` into JavaScript values on read. `JsonValue` is the *read*
+ * shape and admits `number`, because a `jsonb` document may contain one and
+ * pretending otherwise would be a lie about what comes back.
+ *
+ * On WRITE the rule is one sentence (`src/json.ts`, `SER-2`): **the guard
+ * judges, the repository encodes, `pg` receives text.** `JsonInput` admits an
+ * object so a caller can hand a repository the document it holds, and admits a
+ * `string` so the repository can bind the bytes it produced from that
+ * document's OWN data (`encodeJsonbText`, over
+ * `@polymarket-bot/risk/plain-json`). No repository hands `pg` an object: the
+ * driver would serialize it through the prototype chain (`JSON.stringify`
+ * resolves `toJSON` there, and `docs/handoffs/SER-0-sweep.md` measured a
+ * guard-passed document stored as an inherited `toJSON`'s answer), whereas a
+ * string parameter never reaches the driver's object path at all.
  *
  * Write a JSON array as a pre-serialized string: `pg` renders a JavaScript array
  * as a PostgreSQL array literal, not as JSON.

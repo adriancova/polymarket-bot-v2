@@ -22,6 +22,8 @@
  * every deleted record is in a verified object it pins.
  */
 
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
+
 import { RETENTION_RECEIPT_FORMAT_ID, RETENTION_RECEIPT_VERSION } from "./constants.js";
 import { sha256Hex } from "./wal-format.js";
 
@@ -76,7 +78,8 @@ export function encodeRetentionReceipt(receipt: RetentionReceipt): Uint8Array {
       detail: failure.detail,
     })),
   };
-  return Buffer.from(`${JSON.stringify(ordered, null, 2)}\n`, "utf8");
+  // The own-data encoder, as for the dataset manifest (`SER-0`, `SER-2`).
+  return Buffer.from(`${encodePlainJson(ordered, { indent: 2 })}\n`, "utf8");
 }
 
 /** SHA-256 of a receipt's canonical bytes. */
