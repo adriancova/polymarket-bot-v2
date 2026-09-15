@@ -591,6 +591,29 @@ describe("a fill folds into the allocation even while PAUSED", () => {
     expect(patch["closedAtMs"]).toBeNull();
   });
 
+  /**
+   * CORRECTED BY `RISK-2` (2026-09-15). The last row of this test read
+   *
+   *     // A SELL entry recovers the baseline by ADDING the allocation back.
+   *     expect(patch["legBaselineShares"]).toBe("100");
+   *
+   * and pinned a DERIVATION that has since been deleted, because it was a
+   * defect. `legBaselineShares` was written at the first `onFill` as
+   * `held ∓ allocated`; `WP-220` obligation 3 lets the position view of a
+   * BATCHED harvest hold the whole batch while `allocated` counts only the fill
+   * being delivered, so the recovered baseline came out wrong by the rest of the
+   * batch and permanently understated `legExposure` — which trapped the position
+   * behind `positionAgrees` and PAUSED the instance. The baseline is now
+   * OBSERVED at entry-plan time (`planEntry`), the last instant at which the
+   * bracket is guaranteed to have filled nothing, and the fill fold no longer
+   * writes it at all. `risk-2-exit-reachability.test.ts` pins the new rule and
+   * the batched-harvest case the old one got wrong.
+   *
+   * What this test measures is otherwise unchanged, and is why it is kept: a
+   * COMPLEMENT-leg fill folds into BOTH sides of the bracket. The baseline row
+   * now pins that the fold LEAVES IT ALONE — this fixture's state carries `"0"`,
+   * so a fold that still rewrote it would read `"100"` here.
+   */
   it("folds a COMPLEMENT-leg fill on both sides of the bracket", () => {
     const paused = pausedEntry({
       resumeTo: "ENTRY_WORKING",
@@ -627,8 +650,8 @@ describe("a fill folds into the allocation even while PAUSED", () => {
     expect(patch["allocatedShares"]).toBe("50");
     expect(patch["allocatedCost"]).toBe("35");
     expect(patch["legOutcome"]).toBe("NO");
-    // A SELL entry recovers the baseline by ADDING the allocation back.
-    expect(patch["legBaselineShares"]).toBe("100");
+    // The fold does NOT touch the baseline. See the note above this test.
+    expect(patch["legBaselineShares"]).toBe("0");
   });
 
   it("a HALTED instance still refuses the fill outright — that route stays closed", () => {

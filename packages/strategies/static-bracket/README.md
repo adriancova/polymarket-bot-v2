@@ -101,7 +101,47 @@ posture is unchanged, `partialFillPolicy: ACCEPT_ANY`, `validUntil`) as a marked
 INTERPRETATION, and states what is lost: the reduction's free-text `reason`,
 which survives as reason codes and `modelOutputs.reduceCause`.
 
-### What that costs at the risk seam: **every exit arrives as an `ENTRY`**
+### What that cost at the risk seam — **RESOLVED 2026-09-15 by `RISK-2`**
+
+> **This section is kept, unedited below the line, as the record of a residual
+> that has been closed.** It described the disclosed price of the decision above:
+> every exit this strategy emits arrived at `packages/risk` as an `ENTRY`, so
+> §9.8 check 12 demanded an `expectedNetEdge` no exit carries and **every
+> protective exit was refused** `RISK_EDGE_INPUTS_MISSING`. GOV-2B raised that as
+> blocker **B2** — "no realized round trip is reachable in the merged paper
+> core" — and `RISK-2` fixed it.
+>
+> **How, and what it settles.** The last bullet below asked "whether the risk
+> engine may read intent TAGS is a contract question for that round". The answer
+> is **no, and it does not need to.** `packages/risk` now derives the disposition
+> of a `POSITION` from its EFFECT ON THE SUPPLIED PORTFOLIO: an intent that
+> resolves to a SELL fully covered by the confirmed holding of the same
+> `(marketId, side)` is an `EXIT`; anything with a BUY leg, an over-held sell, and
+> every `QUOTE` and `BASKET` stays an `ENTRY`. No tag is read, so
+> `apps/trader/src/pipeline.ts`'s rule that a composition root may never
+> re-derive disposition from tags is untouched. The reasoning is in
+> `packages/risk/src/intent-view.ts`'s header and `packages/risk/README.md` §4.
+>
+> **What did NOT change.** This strategy still emits every exit as a `POSITION`
+> delta — the alternative in the other bullet (`buildReductionPlan` honouring
+> `maximumBuyPrice` and not acting on unnamed sides, or a domain ADR adding a
+> `direction` to §7.7's `ReducePositionIntent`) was **rejected**, for exactly the
+> reasons this file already reproduced end to end. The four-row table below is
+> therefore obsolete as a description of current behaviour: a covered protective
+> reduction now gets reduction treatment in all four situations, including
+> `RISK_BOOK_STALE_NO_BLIND_REDUCTION` and the `POSITION_STATE_UNKNOWN`
+> recommendation.
+>
+> **What `RISK-2` had to fix here to make it reachable.** Two further defects in
+> this package, both masked by B2 because nothing downstream of the risk engine
+> had ever executed an exit: the exits named no venue order type (so a `REST`-
+> planned take-profit inherited the entry's `FAK` and the venue refused it), and
+> `legBaselineShares` was derived at the first fill from a position view that
+> `WP-220` obligation 3 allows to LEAD the fill stream. Both are recorded at
+> their sites in `decide.ts` and pinned by
+> `test/unit/strategies/static-bracket/risk-2-exit-reachability.test.ts`.
+
+---
 
 This is the disclosed price of the decision above, and it is stated here rather
 than left for someone to discover in an incident.

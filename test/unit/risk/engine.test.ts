@@ -902,6 +902,177 @@ describe("disposition matrix", () => {
 });
 
 /**
+ * `RISK-2` — GOV-2B blocker B2, and the gate that must NOT have moved with it.
+ *
+ * The closeout established that no protective exit could clear this seam:
+ * `static-bracket` emits its protective legs as `POSITION`, `intent-view.ts`
+ * classified every `POSITION` as `ENTRY`, and the entry-only positive-net-edge
+ * gate then refused the exit for an `expectedNetEdge` an exit can never
+ * declare. `refusedExits 1`, `RISK_EDGE_INPUTS_MISSING`, `realizedPnl "0"`.
+ *
+ * Both halves are pinned here, because only the pair is the fix: the exit now
+ * clears the seam, AND a genuine entry that omits the same field is still
+ * refused by the same gate, at exactly its old strength.
+ */
+describe("RISK-2 — a covered reduction clears the seam; the entry gate does not move", () => {
+  /**
+   * The protective reduction `static-bracket`'s `planProtectedReduce` emits,
+   * copied field for field: a negative `DELTA` on the traded leg, a
+   * `minimumSellPrice` floor, no `maximumBuyPrice`, and NO `expectedNetEdge` —
+   * the field this shape has nothing truthful to put in.
+   */
+  function protectiveReduceInput(): EvaluationInputFixture {
+    const input = entryInput();
+    const intent = positionIntent({
+      intentId: "01890000-0000-7000-8000-0000000000a1",
+      targetShares: "-100",
+      minimumSellPrice: "0.26",
+      urgency: "AGGRESSIVE",
+      liquidityPreference: "TAKER_OK",
+      partialFillPolicy: "ACCEPT_ANY",
+      tags: ["static-bracket", "sb.protected-reduce", "sb.leg:YES", "sb.order-type:GTC"],
+    });
+    delete intent["maximumBuyPrice"];
+    delete intent["expectedNetEdge"];
+    input.intent = intent;
+    input.portfolio.positions = [position()];
+    return input;
+  }
+
+  it("the protective reduction is APPROVED — the B2 refusal is gone", () => {
+    const result = evaluateIntent(riskPolicy(), protectiveReduceInput());
+
+    // The exact code the committed golden recorded, by name.
+    expect(codesOf(result)).not.toContain("RISK_EDGE_INPUTS_MISSING");
+    expect(codesOf(result)).toEqual([]);
+    expect(result.approved).toBe(true);
+    if (!result.approved) return;
+    expect(result.record.reasons).toContain("RISK_EXIT_CAPACITY_CHECKS_INAPPLICABLE");
+  });
+
+  it("it is approved because it REDUCES, not because it is a protective shape", () => {
+    // Same intent, same policy, no confirmed holding: the sale is uncovered, so
+    // it is an ENTRY again and the edge gate refuses it exactly as before. The
+    // portfolio is the only thing that moved.
+    const input = protectiveReduceInput();
+    input.portfolio.positions = [];
+    const result = evaluateIntent(riskPolicy(), input);
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toContain("RISK_EDGE_INPUTS_MISSING");
+    // …and §6 invariant 10 refuses the uncovered sale on its own terms too.
+    expect(codesOf(result)).toContain("RISK_SELL_EXCEEDS_INVENTORY");
+  });
+
+  it("THE ENTRY GATE IS UNMOVED: a genuine entry with no expectedNetEdge is still refused", () => {
+    const input = entryInput();
+    const intent = positionIntent();
+    delete intent["expectedNetEdge"];
+    input.intent = intent;
+    // A holding big enough to have covered a sale of the same size — so the
+    // ONLY thing keeping this an entry is that it BUYS.
+    input.portfolio.positions = [position({ shares: "1000" })];
+
+    const result = evaluateIntent(riskPolicy(), input);
+
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toContain("RISK_EDGE_INPUTS_MISSING");
+  });
+
+  it("the entry gate keeps its OTHER two failure modes, at their old strength", () => {
+    // The other two `missingInputs`, and a declared edge that does not survive
+    // fees, slippage and the buffer.
+    const missing = entryInput();
+    missing.economics = {};
+    missing.portfolio.positions = [position({ shares: "1000" })];
+    expect(codesOf(evaluateIntent(riskPolicy(), missing))).toContain("RISK_EDGE_INPUTS_MISSING");
+
+    const thin = entryInput();
+    thin.intent = positionIntent({ expectedNetEdge: "0.2" });
+    thin.economics = { feeEstimate: "0.1", slippageEstimate: "0.1" };
+    thin.portfolio.positions = [position({ shares: "1000" })];
+    expect(codesOf(evaluateIntent(riskPolicy(), thin))).toContain("RISK_NET_EDGE_NOT_POSITIVE");
+  });
+
+  it("a BUY is never reclassified, whatever it is tagged and whatever is held", () => {
+    const input = entryInput();
+    const intent = positionIntent({
+      tags: ["static-bracket", "sb.protected-reduce", "sb.take-profit"],
+    });
+    delete intent["expectedNetEdge"];
+    input.intent = intent;
+    input.portfolio.positions = [position({ shares: "1000" })];
+
+    const result = evaluateIntent(riskPolicy(), input);
+
+    // If disposition ever became a tag, this row goes green and the
+    // composition-root rule `apps/trader/src/pipeline.ts` states has been moved
+    // into this package instead of respected.
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toContain("RISK_EDGE_INPUTS_MISSING");
+  });
+
+  it("the reduction is not exempt from §6 invariant 12: a stale book still blocks it", () => {
+    // The point of the fix is that a protective exit can be APPROVED, not that
+    // it is ungated. "No blind flatten" is the gate that must survive.
+    const input = protectiveReduceInput();
+    input.freshness = [
+      { feed: "VENUE_BOOK", marketId: MARKET_A, ageMs: 10_000_000 },
+      { feed: "REFERENCE_FEED", ageMs: 100 },
+      { feed: "FEATURES", ageMs: 100 },
+    ];
+
+    const result = evaluateIntent(riskPolicy(), input);
+
+    expect(result.approved).toBe(false);
+    // The EXIT-shaped stale-book refusal, by name: §6 invariant 12's "no blind
+    // flatten" is the gate a reduction must still meet.
+    expect(codesOf(result)).toContain("RISK_BOOK_STALE_NO_BLIND_REDUCTION");
+  });
+
+  /**
+   * THE NEXT BLOCKER ON THIS PATH, PINNED AS A CONTRACT RATHER THAN FIXED.
+   *
+   * `RISK-2` fixed B2 and the two `static-bracket` defects B2 had been masking,
+   * and the paper end-to-end run then reached its protective reduction — where
+   * it is refused `RISK_INPUT_INVALID`, at this door, for
+   * `guards.recentIntentIds.2: Too small: expected string to have >=1
+   * characters`.
+   *
+   * The empty string is the CALLER's. `apps/trader/src/loop.ts` remembers
+   * `intentIdOf(intent)` after every approval, and `intentIdOf` answers `""`
+   * for a `CANCEL` — which §7.7 gives no `intentId`. So the first approved
+   * safety cancellation poisons the list and EVERY later evaluation in that
+   * process is refused here, whatever it is.
+   *
+   * THIS DOOR IS RIGHT AND IS NOT BEING RELAXED. An empty id in the
+   * duplicate-guard list is not a harmless spare entry: §9.8 check 18 compares
+   * it against `intent.intentId`, so admitting it would make the guard match
+   * id-less intents against each other — and the id-less intents are the
+   * CANCELs, which §6 invariant 13 says may never be blocked. Widening
+   * `NonEmptyStringSchema` here to absorb a caller's bug would trade a visible
+   * refusal for an invisible one in the worst possible place.
+   *
+   * `apps/trader/src/loop.ts` is outside `RISK-2`'s allowed paths, so the fix —
+   * do not remember an id a `CANCEL` does not have — is reported, not made.
+   * This row is the contract it violates, stated where the contract lives.
+   */
+  it("the duplicate-guard list refuses an EMPTY id — the caller has nothing to remember", () => {
+    const input = protectiveReduceInput();
+    input.guards.recentIntentIds = ["01890000-0000-7000-8000-0000000000b1", ""];
+
+    const result = evaluateIntent(riskPolicy(), input);
+
+    expect(result.approved).toBe(false);
+    expect(codesOf(result)).toEqual(["RISK_INPUT_INVALID"]);
+    // The same intent with the empty entry removed is approved, so the refusal
+    // is about the LIST and not about the reduction.
+    const clean = protectiveReduceInput();
+    clean.guards.recentIntentIds = ["01890000-0000-7000-8000-0000000000b1"];
+    expect(evaluateIntent(riskPolicy(), clean).approved).toBe(true);
+  });
+});
+
+/**
  * §6 INVARIANT 13, gate by gate.
  *
  * Remediation round 1 audited EVERY gate in `evaluateIntent` for the

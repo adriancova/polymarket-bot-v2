@@ -7,21 +7,96 @@
  * the pipeline in `engine.ts` from re-deriving "how much does this cost" five
  * times with five slightly different answers.
  *
- * DISPOSITION is derived from the intent TYPE alone:
+ * DISPOSITION is derived from the intent TYPE and, for a `POSITION`, from its
+ * EFFECT ON THE SUPPLIED PORTFOLIO — never from a tag, a label, or anything
+ * else the producer says about itself:
  *
  * | Type | Disposition | Why |
  * | --- | --- | --- |
  * | `CANCEL` | `CANCEL` | §6 invariant 13: "Safety cancellation outranks new order placement" |
  * | `REDUCE_POSITION` | `EXIT` | §7.7's dedicated reduction intent |
- * | `POSITION`, `QUOTE`, `BASKET` | `ENTRY` | everything else is treated as new risk |
+ * | `POSITION` resolving to a FULLY-COVERED SELL | `EXIT` | see {@link coveredReduction} — it commits nothing and can only shrink a confirmed holding |
+ * | every other `POSITION`, and every `QUOTE` / `BASKET` | `ENTRY` | new risk, or risk this view cannot prove is not new |
  *
- * A `POSITION` intent whose delta happens to reduce a holding is therefore
- * still classified `ENTRY` and gets the STRICTER treatment. That is deliberate
- * and fails closed: entry treatment can only refuse more, and refusing to place
- * a new order is the safe direction (§6 invariant 12 — the mandated response to
- * unknown state is cancel-and-reconcile, not act). A strategy that means "exit"
- * has `REDUCE_POSITION` for it. Recorded as an assumption in
- * `docs/handoffs/WP-180.md`.
+ * ## Why a covered reducing `POSITION` is an EXIT (RISK-2, GOV-2B blocker B2)
+ *
+ * THIS PARAGRAPH REPLACES ITS OWN OPPOSITE. It used to read: "A `POSITION`
+ * intent whose delta happens to reduce a holding is therefore still classified
+ * `ENTRY` and gets the STRICTER treatment. That is deliberate and fails closed
+ * … A strategy that means 'exit' has `REDUCE_POSITION` for it." The GOV-2B
+ * closeout audit established that the reasoning was wrong in both halves, and
+ * the original text is quoted here rather than quietly deleted.
+ *
+ * 1. IT DID NOT FAIL CLOSED; IT FAILED SHUT. Entry treatment applies §9.8
+ *    check 12, which needs an `expectedNetEdge` that a sale of tokens already
+ *    held can never declare — so EVERY protective exit shaped as a `POSITION`
+ *    was refused `RISK_EDGE_INPUTS_MISSING`, no realized round trip was
+ *    reachable in the paper core, and a stop-loss could never execute. Refusing
+ *    to place a NEW order is the safe direction; refusing to let a position OUT
+ *    is the trap §6 invariant 12 and §9.9's `PROTECTED_REDUCE` ladder exist to
+ *    prevent. (Entry treatment is perverse here in a second way: check 11b
+ *    compares a pure sell's `boundedCost`, which is exactly `"0"` by the rule
+ *    below, against `minOrderNotional` — so a configured economic floor refused
+ *    every pure-sell `POSITION` unconditionally.)
+ * 2. "A STRATEGY THAT MEANS EXIT HAS `REDUCE_POSITION`" IS NOT TRUE OF §7.7.
+ *    `ReducePositionIntent.targetShares` is a per-market SELL-DOWN LEVEL:
+ *    `packages/execution-planner`'s `buildReductionPlan` loops BOTH sides,
+ *    sells the excess over that level on each, and reads only
+ *    `minimumSellPrice`. It therefore cannot express a single-leg exit that
+ *    BUYS (a complement-leg bracket closes by buying the token back), and it
+ *    acts on inventory the emitting instance never created — which §6
+ *    invariant 7 and ADR-006 §4 forbid. `REDUCE_POSITION` is the ACCOUNT-level
+ *    instrument §9.9's incident controller reaches for; it is not the general
+ *    spelling of "exit".
+ *
+ * WHAT THE RULE IS, EXACTLY. A `POSITION` is an `EXIT` when it resolves to a
+ * SELL (a negative delta, in either `targetMode`) whose magnitude is FULLY
+ * COVERED by the portfolio's confirmed holding of the same `(marketId, side)`.
+ * Nothing else qualifies:
+ *
+ * - any BUY leg → `ENTRY`; a BUY commits new pUSD by definition;
+ * - a SELL larger than the confirmed holding → `ENTRY`, and it also refuses
+ *   with `RISK_SELL_EXCEEDS_INVENTORY` (§6 invariant 10);
+ * - a zero delta → refused `RISK_ZERO_DELTA` before a disposition matters;
+ * - `QUOTE` and `BASKET` are untouched. A `QUOTE` level names no outcome token
+ *   (§7.7), so coverage is unprovable there; a `BASKET` is §7.7's coordinated
+ *   OPENING instrument and declares its own `minimumLockedEdge`.
+ *
+ * WHY THAT RULE IS SOUND, in this package's OWN measures rather than by
+ * appeal to the producer's narrative. A fully-covered SELL leg has
+ * `boundedCost === "0"` and contributes no `buyShares`, and the worst case
+ * assumes it does NOT fill (see CONSERVATIVE BOUNDING below), so the lot set
+ * and `maximumContractualLoss` it is measured against are IDENTICAL to doing
+ * nothing. Every check the `isEntry` guard skips — 11b economic floor, 12 net
+ * edge, 13 participation, 14a allocator-verdict-present, 15 capacity, 19
+ * rate-limit headroom, 20 time-to-close entry cutoff — is a check on NEW
+ * COMMITTED RISK, and this intent commits none. The README's own stated
+ * principle for those cells is "an exit REDUCES exposure", not "an exit is
+ * typed `REDUCE_POSITION`"; deriving the disposition from the exposure effect
+ * is that principle, applied directly.
+ *
+ * WHAT STILL APPLIES TO IT, and is the whole reason this is not a bypass:
+ * checks 1–5 and 7b–11a, `RISK_SELL_EXCEEDS_INVENTORY`, an EXPLICIT allocator
+ * refusal, the duplicate-intent guard, and — the one that matters most — §6
+ * invariant 12's "no blind flatten": an exit into a stale or unsynchronized
+ * book is still BLOCKED, with cancel-and-reconcile recommendations.
+ *
+ * DISCLOSED CONSEQUENCE, stated where the rule is made. The portfolio view is
+ * the only positional input this package has, and it cannot distinguish a
+ * bracket's protective SELL of a token it opened from a strategy ESTABLISHING
+ * exposure by selling a token it already held (`static-bracket`'s complement
+ * leg, under `PREFER_CHEAPEST_WITH_INVENTORY`, does exactly that). Both are
+ * fully-covered sells, so both are now `EXIT`. That is deliberate: by the
+ * measures §9.8 actually defines they ARE the same act, and a rule that
+ * separated them could only do so by reading the producer's self-declaration —
+ * the move `apps/trader/src/pipeline.ts` forbids. Gating a covered sale on its
+ * DIRECTIONAL effect would need a net-directional-exposure measure §9.8 does
+ * not define today; that is a contract-owner follow-up, not a disposition hack.
+ *
+ * WHAT IS NOT DERIVED FROM ANYTHING THE PRODUCER SAYS. Not `tags`, not the
+ * presence or absence of `expectedNetEdge` (keying on that would hand any
+ * entry exit treatment by omitting a field), not `urgency`, not
+ * `liquidityPreference`. Only the parsed shape and the supplied portfolio.
  *
  * CONSERVATIVE BOUNDING (each choice overstates risk, never understates):
  *
@@ -95,6 +170,23 @@ export interface IntentView {
   readonly boundedCost: MoneyString | undefined;
   /** Σ of every BUY leg's shares (the size the participation limit sees). */
   readonly buyShares: SharesString;
+}
+
+/**
+ * Is this SELL magnitude fully covered by the confirmed holding?
+ *
+ * The ONE predicate behind the `EXIT` disposition of a reducing `POSITION`
+ * (see the module header). `shares` is always a positive magnitude here — a
+ * zero delta is refused `RISK_ZERO_DELTA` before this is reached — so a `true`
+ * answer also implies `held > 0`, and the "reduction on a market the portfolio
+ * does not describe" case (`RISK_POSITION_STATE_UNKNOWN`, §6 invariant 12)
+ * cannot be reached through this door.
+ *
+ * `<=`, not `<`: selling the entire confirmed holding is the ordinary close of
+ * a position, and it leaves strictly less risk than holding it.
+ */
+function coveredReduction(shares: SharesString, held: SharesString): boolean {
+  return compareDecimal(shares, held) <= 0;
 }
 
 /** Total shares this portfolio holds of one market's token. */
@@ -205,6 +297,13 @@ export function buildIntentView(
           boundedCost: tightest(byPrice, intent.maximumTotalCost),
         });
       } else {
+        // THE DISPOSITION RULE (module header, "Why a covered reducing
+        // POSITION is an EXIT"). Derived from the parsed shape and the
+        // supplied portfolio only. An uncovered sell stays `ENTRY` and is
+        // refused `RISK_SELL_EXCEEDS_INVENTORY` besides.
+        if (coveredReduction(shares, held)) {
+          disposition = "EXIT";
+        }
         appendData(
           legs,
           sellLeg(intent.marketId, intent.direction, shares, intent.minimumSellPrice),
