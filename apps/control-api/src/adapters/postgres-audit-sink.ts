@@ -53,6 +53,7 @@ import type {
   ControlAuditRecord,
   ControlAuditSink,
 } from "@polymarket-bot/observability";
+import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 import type {
   JsonInput,
   KillSwitchActionValue,
@@ -76,14 +77,63 @@ export interface PostgresAuditSinkOptions {
 }
 
 /**
- * Presents an audit state document as a `jsonb` INPUT.
+ * Presents an audit state document as a `jsonb` INPUT: the document's JSON
+ * TEXT, encoded from its own data.
  *
- * The columns take an object (or a pre-serialized string) — `internal`'s
- * `JsonInput` — while an {@link AuditStateDocument} may also be a bare string,
- * boolean, `null` or array. Every document this package writes IS an object;
- * the wrap exists so that a future one which is not still lands as a row rather
- * than as a type error at the call site, and it labels what it wrapped instead
- * of stringifying it.
+ * The columns take an object or a pre-serialized string — `internal`'s
+ * `JsonInput` — and this hands `pg` the STRING (`SER-3`, 2026-09-15). Handed
+ * an object, `pg@8.23.0`'s `prepareValue` → `prepareObject` first consults an
+ * inherited `toPostgres` and then `JSON.stringify`s through the prototype
+ * chain, so an inherited `Object.prototype`/`Array.prototype` `toJSON`
+ * replaced the §14.1 `prior_state`/`resulting_state` and
+ * `previous_value`/`new_value` documents with substituted bytes — measured at
+ * `main` `d6e05bf` and reproduced independently
+ * (`docs/handoffs/SER-0-sweep.md`, `pg-ops-audit-state-documents`; the chain
+ * was cut at the driver's bind-time `valueMapper`, the last transformation
+ * before the wire). A string primitive never reaches `prepareObject`, which
+ * closes both lookups; the parameter's type is inferred from the column, so
+ * PostgreSQL parses the text as `jsonb` on insert (the `SER-2` TEXT rule the
+ * `storage-postgres` repositories follow; like the rest of this file, not
+ * executed against a live database here).
+ * `encodePlainJson` (`@polymarket-bot/risk/plain-json`) is byte-identical to a
+ * clean `JSON.stringify` for plain data — the same document the driver would
+ * have produced in a clean process — and never consults `toJSON`.
+ *
+ * An {@link AuditStateDocument} may also be a bare string, boolean, `null` or
+ * array. Every document this package writes IS an object; the `{ value }`
+ * wrap is KEPT for one that is not, so the stored document is the same one
+ * the object route stored (a labelled wrap rather than a bare scalar), and a
+ * `null` document still lands as the JSON object `{"value":null}` in a
+ * NOT NULL column rather than as SQL `NULL`.
+ *
+ * A document the encoder refuses throws, which `append` reports as
+ * `AUDIT_SINK_UNAVAILABLE`: the mutation does not happen. Fail closed. A class
+ * instance, an accessor and a function are all outside `AuditStateDocument`'s
+ * type; ONE refusable shape is not, and is named rather than left implicit
+ * (`SER-3` review round 1, the container sweep): an `Array` SUBCLASS satisfies
+ * `readonly AuditStateDocument[]`, and `pg` would have serialized it.
+ *
+ * Every document this sink writes comes from `ControlPlane`, a concrete class
+ * with `#` private fields — so it is nominally typed and no foreign
+ * implementation can be substituted. Its documents' containers are ordinary
+ * BECAUSE EACH PRODUCER MAKES THEM SO, which is a property of those producers
+ * rather than of the type: `runStateDocument`, `strategyDocument`,
+ * `killSwitchDocument` and `killSwitchAbsent` are object literals over strings,
+ * and `refuseModeRaise` — the ONE place a caller's container reaches a document
+ * — rebuilds it with `[...keys]`. Round 1 stated the property without
+ * establishing it there, and it did not hold: that site built `attemptedKeys`
+ * with `keys.map(...)`, which preserves a caller's `Array` subclass, so this
+ * sink refused (`NON_PLAIN` at `value.attemptedKeys`) a record `pg` wrote.
+ * Fixed in round 2 (N1) and pinned by
+ * `test/unit/control-api/outbound-container-species.test.ts`.
+ *
+ * THE RESIDUAL, precisely: a caller that drives this sink DIRECTLY with a
+ * hand-built record whose state document carries a foreign container (an
+ * `Array` subclass, the one refusable shape inside `AuditStateDocument`'s
+ * type). Nothing in this repository does — `ControlPlane` is the only producer
+ * — and no deep re-materialization is available here that would not also decide
+ * what a `Date` or a `Map` means, which is the decision the own-data encoder
+ * exists to refuse. So it is stated rather than hidden.
  *
  * NOTE ON DECIMALS: `AuditStateDocument` excludes `number` at every depth by
  * construction, which is the same property `packages/storage-postgres`'s
@@ -92,10 +142,11 @@ export interface PostgresAuditSinkOptions {
  * this package's own discipline rather than the database's.
  */
 function asJsonInput(document: AuditStateDocument): JsonInput {
-  if (typeof document === "object" && document !== null && !Array.isArray(document)) {
-    return document as JsonInput;
-  }
-  return { value: document } as unknown as JsonInput;
+  const wrapped: unknown =
+    typeof document === "object" && document !== null && !Array.isArray(document)
+      ? document
+      : { value: document };
+  return encodePlainJson(wrapped);
 }
 
 function isKillSwitchScope(value: string): value is KillSwitchScopeValue {

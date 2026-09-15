@@ -86,6 +86,20 @@ export interface PublicHttpResponse {
 export interface PublicHttpRequest {
   readonly url: string;
   readonly method: "GET" | "POST";
+  /**
+   * The request body, as PLAIN JSON DATA the client serializes itself.
+   *
+   * Since `SER-3` the bundled client (`../runtime.ts`, `globalHttpClient`)
+   * encodes this from OWN DATA, so what it will accept is stated here rather
+   * than discovered: objects with `Object.prototype` or a null prototype,
+   * arrays with `Array.prototype` or a null prototype, and JSON scalars. A
+   * `Date`, a `Map`, a class instance, an `Array` SUBCLASS, a bigint, a
+   * function or an accessor is refused with `PUBLIC_MARKET_CONFIGURATION`
+   * before `fetch` runs, where `JSON.stringify` would have coerced or
+   * hijacked it. This package's own producer — `snapshot/fetcher.ts`'s
+   * `POST /books` body — satisfies that by construction and independently of
+   * its caller's containers; see the comment at its `chunk`.
+   */
   readonly jsonBody?: unknown;
   readonly signal?: AbortSignal;
 }

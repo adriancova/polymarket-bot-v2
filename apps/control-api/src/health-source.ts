@@ -56,7 +56,28 @@ export type HealthReadResult =
   | { readonly outcome: "REFUSED"; readonly detail: string; readonly issues: readonly string[] }
   | { readonly outcome: "UNAVAILABLE"; readonly detail: string };
 
-/** The seam. TOTAL: an implementation reports failure as data, never by throwing. */
+/**
+ * The seam. TOTAL: an implementation reports failure as data, never by throwing.
+ *
+ * AN `OK` REPORT MUST BE THE DOOR'S OUTPUT (`SER-3` review round 1, the M2
+ * sweep). `TraderHealthCache` retains the report and `ControlApi.#health()`
+ * embeds it in a response body that is serialized from OWN DATA since `SER-3`,
+ * which refuses a container whose prototype is neither the plain one nor
+ * `null`. Every implementation here obtains its report from {@link parse} —
+ * i.e. from `readTraderHealthReport`, whose `readPlainData` materialization
+ * builds a FRESH plain tree — so no container the source document supplied
+ * reaches a response body: a null-prototype one is materialized into an
+ * ordinary container, and a foreign-prototype one (an `Array` subclass, a
+ * class instance) is refused AT THE DOOR, counted as a `REFUSED` read with the
+ * last good report retained. That refusal is pre-existing; `doors.ts` is
+ * untouched by `SER-3`. A FOREIGN implementation that skipped the door and answered with
+ * such a container would make the response encoder refuse a body
+ * `JSON.stringify` would have written; the cache does not re-materialize,
+ * because re-running a door over a value the source already vouched for would
+ * turn that source's `OK` into this cache's `REFUSED` and change what the read
+ * counters mean. `test/unit/control-api/response-encoder-bound.test.ts` pins
+ * the documented route.
+ */
 export interface TraderHealthSource {
   read(): Promise<HealthReadResult>;
 }

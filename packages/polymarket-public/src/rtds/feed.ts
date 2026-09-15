@@ -97,6 +97,7 @@
 import { computeReconnectDelayMs } from "../feed/connection.js";
 import { PublicMarketConfigurationError, PublicMarketStateError } from "../errors.js";
 import { boundDetail } from "../normalize/result.js";
+import { encodeOutboundJson } from "../outbound-json.js";
 import type {
   CancelScheduled,
   PublicMarketClock,
@@ -302,6 +303,18 @@ export class RtdsTwapFeed {
   readonly #handlers: RtdsTwapFeedHandlers;
   readonly #tracker: TwapObservationTracker;
   readonly #subscribedTopics: ReadonlySet<string>;
+  /**
+   * The subscribe frame's bytes, encoded ONCE from own data at construction
+   * (`../outbound-json.ts`, `SER-3`). The frame is a pure function of the
+   * validated options and "a reconnect re-sends exactly this frame", so the
+   * same bytes go out on every open; encoding here means a frame the encoder
+   * refuses is a configuration error at construction, never mid-stream, and
+   * `#handleOpen` has no encoding step that could vary with ambient
+   * prototype state. At base this was `JSON.stringify` at the send site, and
+   * under an inherited `Object.prototype.toJSON` the bytes sent were the bare
+   * string `"POLLUTED"` (`docs/handoffs/SER-0-sweep.md`).
+   */
+  readonly #subscribeFrame: string;
 
   #status: FeedStatus = "idle";
   #session: RtdsSocketSession | undefined;
@@ -344,6 +357,10 @@ export class RtdsTwapFeed {
       this.#options.subscriptions.map(
         (subscription) => RTDS_TWAP_TOPIC_BY_WINDOW[subscription.windowSeconds],
       ),
+    );
+    this.#subscribeFrame = encodeOutboundJson(
+      buildSubscribeFrame(this.#options.subscriptions),
+      "RTDS subscribe frame",
     );
   }
 
@@ -617,7 +634,7 @@ export class RtdsTwapFeed {
     this.#generation += 1;
     session.generation = this.#generation;
     this.#withSocket(session, (socket) => {
-      socket.send(JSON.stringify(buildSubscribeFrame(this.#options.subscriptions)));
+      socket.send(this.#subscribeFrame);
     });
     // From here the session holds a subscription, so a frame arriving on it is
     // subscription data. Before here it was not, whatever the transport chose to

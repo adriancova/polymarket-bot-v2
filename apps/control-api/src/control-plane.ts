@@ -437,7 +437,19 @@ export class ControlPlane {
       null,
       ceiling,
       ceiling,
-      { attemptedKeys: keys.map((key) => key) },
+      // `[...keys]`, NOT `keys.map(...)`: an array-literal spread is an
+      // ORDINARY array whatever species the caller passed, where
+      // `Array.prototype.map` PRESERVES it (ECMA-262 `ArraySpeciesCreate`) —
+      // and `readonly string[]` is satisfied by an `Array` SUBCLASS with no
+      // cast. This container goes into the §14.1 audit record, which
+      // `adapters/postgres-audit-sink.ts` serializes with the own-data
+      // encoder; that encoder refuses a container whose prototype is neither
+      // `Array.prototype` nor `null`, and this control plane AUDITS BEFORE IT
+      // APPLIES — so a foreign species here would refuse a record `pg` wrote.
+      // (`SER-3` review round 2, N1: the same spelling and the same reason as
+      // `packages/polymarket-public/src/venue/frames.ts`'s `assets_ids`.)
+      // `test/unit/control-api/outbound-container-species.test.ts` pins it.
+      { attemptedKeys: [...keys] },
     );
   }
 

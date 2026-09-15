@@ -118,6 +118,7 @@ import {
   resolvePublicMarketFeedOptions,
 } from "../config.js";
 import { PublicMarketConfigurationError, PublicMarketStateError } from "../errors.js";
+import { encodeOutboundJson } from "../outbound-json.js";
 import type {
   CancelScheduled,
   PublicMarketClock,
@@ -1016,15 +1017,25 @@ export class PublicMarketFeed {
    * reason every callback carries one, and the write goes through
    * {@link PublicMarketFeed.#withSocket} so a frame is never dropped merely
    * because the factory call had not returned the handle yet (round-2 H1).
+   *
+   * The bytes are encoded from OWN DATA (`../outbound-json.ts`, `SER-3`), and
+   * EVERY frame is encoded before ANY is written: a refusal is a
+   * `PublicMarketConfigurationError` thrown to the caller with nothing sent,
+   * never a partial batch. At base this was `JSON.stringify` per frame, and
+   * under an inherited `Object.prototype`/`Array.prototype` `toJSON` the
+   * initial subscription, the dynamic subscribe and the unsubscribe all left
+   * as substituted bytes while the feed reported itself connected
+   * (`docs/handoffs/SER-0-sweep.md`).
    */
   #sendFrames(
     session: FeedSocketSession,
     frames: readonly Readonly<Record<string, unknown>>[],
   ): void {
     if (frames.length === 0) return;
+    const encoded = frames.map((frame) => encodeOutboundJson(frame, "market subscription frame"));
     this.#withSocket(session, (socket) => {
-      for (const frame of frames) {
-        socket.send(JSON.stringify(frame));
+      for (const bytes of encoded) {
+        socket.send(bytes);
       }
     });
   }
