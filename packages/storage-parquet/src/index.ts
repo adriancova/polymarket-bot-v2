@@ -117,6 +117,7 @@ export {
   type WalSegmentIdKind,
   type WalSegmentIssue,
   type WalSegmentIssueCode,
+  type WalSegmentIssueDetail,
   type WalSegmentManifest,
   type WalSegmentReadResult,
 } from "./wal-format.js";

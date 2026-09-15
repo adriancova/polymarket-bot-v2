@@ -198,10 +198,24 @@ export type WalSegmentIssueCode =
   | "MANIFEST_INCONSISTENT"
   | "UNSUPPORTED_FORMAT";
 
+/**
+ * One value a diagnostic may carry.
+ *
+ * Deliberately NOT `unknown` (`SER-2` review, H1). A refusal's `details` is
+ * copied verbatim into the dataset manifest, which is persisted, digested and
+ * read back — so whatever can appear here is part of a durable document's
+ * domain. Restricting it to bounded plain data makes "a corrupt segment cannot
+ * choose the shape of a manifest" a fact the compiler checks at every producer,
+ * instead of a claim a future `details: { record: parsedValue }` could quietly
+ * break. Parsed input is rendered through `describeDiscriminator` /
+ * `boundedDiagnosticText` before it reaches one of these fields.
+ */
+export type WalSegmentIssueDetail = string | number | boolean | null | readonly string[];
+
 export type WalSegmentIssue = {
   readonly code: WalSegmentIssueCode;
   readonly message: string;
-  readonly details?: Readonly<Record<string, unknown>>;
+  readonly details?: Readonly<Record<string, WalSegmentIssueDetail>>;
 };
 
 /**
@@ -247,6 +261,114 @@ const ISO_8601_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-
 const MAX_BIGINT_STRING_DIGITS = 40;
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_ENDPOINT_LENGTH = 2048;
+
+/**
+ * Longest text a diagnostic in this module carries out of a file it read.
+ *
+ * Every issue this module reports — its `message` and every value in its
+ * `details` — is copied into a dataset manifest, which is persisted, digested
+ * and read back. A diagnostic's job is to NAME a defect, so the text it takes
+ * from the file is capped here rather than at whatever `maxRecordBytes` allows
+ * (16 MiB by default). `MAX_IDENTIFIER_LENGTH` is the bound §5 already places
+ * on every identifier the frame grammar admits, so a well-formed value never
+ * reaches this cap and no legitimate diagnostic changes; past it the text is
+ * truncated with its full length stated, and `lineIndex`/`byteOffset` still
+ * point at the untouched line on disk.
+ */
+const MAX_DIAGNOSTIC_TEXT_LENGTH = MAX_IDENTIFIER_LENGTH;
+
+/**
+ * `text` capped at {@link MAX_DIAGNOSTIC_TEXT_LENGTH}, with the cap marked.
+ *
+ * The prefix never ends on a lone high surrogate: splitting a surrogate pair
+ * leaves a code unit that is well-formed JSON only because the encoder escapes
+ * it, and a lone escaped surrogate in a persisted manifest would be a defect of
+ * this reader rather than of the file it is describing.
+ */
+function boundedDiagnosticText(text: string): string {
+  if (text.length <= MAX_DIAGNOSTIC_TEXT_LENGTH) {
+    return text;
+  }
+  let head = text.slice(0, MAX_DIAGNOSTIC_TEXT_LENGTH);
+  const lastUnit = head.charCodeAt(head.length - 1);
+  if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) {
+    head = head.slice(0, -1);
+  }
+  return `${head}... (truncated from ${String(text.length)} characters)`;
+}
+
+/**
+ * A caught parse failure's message, capped, or `fallback` for a non-`Error`.
+ *
+ * A `ParseFailure` from this module interpolates file content into its text —
+ * an unknown `formatId`, the unknown keys of a frame record — and the message
+ * of every issue is carried into the dataset manifest next to its `details`.
+ * The cap is the same one for the same reason (`SER-2` review, H1): a corrupt
+ * segment describes itself within a bound this module chooses, or not at all.
+ */
+function boundedDiagnosticMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? boundedDiagnosticText(error.message) : fallback;
+}
+
+/**
+ * What an unknown `record` discriminator WAS, as bounded plain text.
+ *
+ * ## Why the value itself is not carried (`SER-2` review, H1)
+ *
+ * The discriminator is whatever `JSON.parse` returned for the `record` member
+ * of a corrupt line: any JSON value, of any depth and any size, bounded only
+ * by `maxRecordBytes`. It used to be copied into the issue's `details`
+ * verbatim, and `dataset-manifest.ts` carries `details` into the dataset
+ * manifest unchanged — so a corrupt segment decided the shape of a document
+ * this package persists. Under `JSON.stringify` that only bloated the
+ * manifest; under the own-data encoder (`SER-2`) a discriminator nested past
+ * the encoder's depth bound made `encodeDatasetManifest` REFUSE, and the whole
+ * compaction batch died before manifest publication and retention instead of
+ * excluding the one bad segment and continuing. Exclusion-and-continue is what
+ * ADR-004 §3 requires of arbitrary corrupt input, so the diagnostic is bounded
+ * HERE, where it is captured: what reaches a manifest from this module is
+ * plain, shallow, length-capped text BY CONSTRUCTION, and no byte sequence a
+ * segment file can hold can make a persisted document refuse. (Raising the
+ * encoder's `maxDepth` would not close it: `JSON.parse` accepts thousands of
+ * levels, the encoder's ceiling is `MAX_PLAIN_JSON_DEPTH`, and depth is not
+ * the only unbounded dimension.)
+ *
+ * The rendering is `packages/risk/src/plain-data.ts`'s `describeValue`
+ * vocabulary — a shape, not a transcription — with a string kept verbatim up
+ * to the cap, because the discriminator's text is the one thing an operator
+ * needs to see. Nothing is lost by the bound: the same `details` states
+ * `lineIndex` and `byteOffset`, and this module repairs nothing, so the line
+ * is still on disk exactly as found.
+ *
+ * FORMAT NOTE: this changes the bytes — and therefore the digest — of a
+ * manifest that excludes a segment with an unknown discriminator, relative to
+ * base and to `SER-2`'s first candidate. No golden, fixture, committed
+ * manifest or Python validator fixture pins an
+ * `excludedSegments[].issues[].details` shape (every one of them excludes no
+ * segment), so nothing else moves.
+ */
+function describeDiscriminator(value: unknown): string {
+  switch (typeof value) {
+    case "string":
+      return boundedDiagnosticText(value);
+    case "number":
+      return "a number";
+    case "boolean":
+      return "a boolean";
+    case "bigint":
+      return "a bigint";
+    case "symbol":
+      return "a symbol";
+    case "function":
+      return "a function";
+    case "undefined":
+      return "undefined";
+    default:
+      // `JSON.parse` produces only the six JSON shapes; the cases above exist
+      // so this function is total over any value a future caller hands it.
+      return value === null ? "null" : Array.isArray(value) ? "an array" : "an object";
+  }
+}
 
 /** SHA-256 of bytes or of a UTF-8 string, lowercase hex. */
 export function sha256Hex(value: string | Uint8Array): string {
@@ -638,7 +760,7 @@ function scanSegmentBytes(bytes: Uint8Array, maxRecordBytes: number): ScanOutcom
     } catch (error) {
       issues.push({
         code: "RECORD_INVALID",
-        message: error instanceof Error ? error.message : "segment line is not a JSON object",
+        message: boundedDiagnosticMessage(error, "segment line is not a JSON object"),
         details: { lineIndex, byteOffset: offset },
       });
       break;
@@ -658,7 +780,7 @@ function scanSegmentBytes(bytes: Uint8Array, maxRecordBytes: number): ScanOutcom
       } catch (error) {
         issues.push({
           code: error instanceof ParseFailure ? "UNSUPPORTED_FORMAT" : "RECORD_INVALID",
-          message: error instanceof Error ? error.message : "segment header is invalid",
+          message: boundedDiagnosticMessage(error, "segment header is invalid"),
           details: { lineIndex, byteOffset: offset },
         });
         break;
@@ -679,7 +801,7 @@ function scanSegmentBytes(bytes: Uint8Array, maxRecordBytes: number): ScanOutcom
       } catch (error) {
         issues.push({
           code: "RECORD_INVALID",
-          message: error instanceof Error ? error.message : "segment footer is invalid",
+          message: boundedDiagnosticMessage(error, "segment footer is invalid"),
           details: { lineIndex, byteOffset: offset },
         });
         break;
@@ -690,7 +812,10 @@ function scanSegmentBytes(bytes: Uint8Array, maxRecordBytes: number): ScanOutcom
       issues.push({
         code: "RECORD_INVALID",
         message: "segment line has an unknown record discriminator",
-        details: { lineIndex, byteOffset: offset, record: discriminator },
+        // Bounded plain text, NEVER the parsed value — see
+        // `describeDiscriminator`. This is the one detail in this module whose
+        // SHAPE a corrupt segment could otherwise choose.
+        details: { lineIndex, byteOffset: offset, record: describeDiscriminator(discriminator) },
       });
       break;
     } else {
@@ -708,7 +833,7 @@ function scanSegmentBytes(bytes: Uint8Array, maxRecordBytes: number): ScanOutcom
       } catch (error) {
         issues.push({
           code: "RECORD_INVALID",
-          message: error instanceof Error ? error.message : "segment line is not a valid frame",
+          message: boundedDiagnosticMessage(error, "segment line is not a valid frame"),
           details: { lineIndex, byteOffset: offset },
         });
         break;
@@ -768,7 +893,11 @@ function crossCheckManifest(
     issues.push({
       code: "MANIFEST_INCONSISTENT",
       message: "segmentFileName does not follow from segmentId",
-      details: { segmentFileName: manifest.segmentFileName, segmentId: manifest.segmentId },
+      // Sidecar strings: `readString` bounds neither of these in length.
+      details: {
+        segmentFileName: boundedDiagnosticText(manifest.segmentFileName),
+        segmentId: boundedDiagnosticText(manifest.segmentId),
+      },
     });
   }
   if (manifest.footerPresent && manifest.truncatedTailBytes !== 0) {
@@ -924,7 +1053,9 @@ function crossCheckManifest(
         message: "a frame record carries a different gateway epoch than its segment",
         details: {
           recordIndex: entry.recordIndex,
-          declared: manifest.gatewayEpoch,
+          // The sidecar's epoch is a `readString` with no length bound; the
+          // record's is bounded by the §5 grammar.
+          declared: boundedDiagnosticText(manifest.gatewayEpoch),
           observed: entry.record.gatewayEpoch,
         },
       });
@@ -995,7 +1126,7 @@ export async function readWalSegment(
       issues: [
         {
           code: "MANIFEST_UNREADABLE",
-          message: error instanceof Error ? error.message : "manifest could not be parsed",
+          message: boundedDiagnosticMessage(error, "manifest could not be parsed"),
         },
       ],
     };
@@ -1010,7 +1141,10 @@ export async function readWalSegment(
         {
           code: "SEGMENT_ID_MISMATCH",
           message: "manifest segment id does not match its file name",
-          details: { declared: manifest.segmentId, fileName: walManifestFileName(segmentId) },
+          details: {
+            declared: boundedDiagnosticText(manifest.segmentId),
+            fileName: walManifestFileName(segmentId),
+          },
         },
       ],
     };
