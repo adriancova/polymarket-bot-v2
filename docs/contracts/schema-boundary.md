@@ -87,7 +87,21 @@ library performs and is invisible to every enumeration-based guard.
 
 ---
 
-## 3. Per-package audit, `main` `2d7e7da` (2026-09-04)
+## 3. Per-package audit — measured at `main` `2d7e7da` (2026-09-04); rows current through `main` `1aa2238` (2026-09-15)
+
+*(Repinned 2026-09-15 by `GOV-2C`, discharging `GOV-2B` N10's "pinned to a
+commit four merges old". The heading previously read "Per-package audit,
+`main` `2d7e7da` (2026-09-04)". The measurement pin is KEPT because the
+transcripts in `docs/handoffs/GOV-2A.md` were taken there and a row's original
+LIVE verdict is only reproducible against that tree; what the old heading did
+not say is that every row has since been rewritten in place by the door that
+closed it, so the table's CURRENT state is a composite: base measurements at
+`2d7e7da`, closures dated per row (2026-09-05 through 2026-09-11), and no
+whole-table re-measurement since. The last row change before this round was
+`event-bus` on 2026-09-11 (`d869868`); this round changes the `order-book`
+row's basis sentence only. A reader who needs the table re-measured as a whole
+against today's `main` has no record saying that was done, because it was
+not.)*
 
 Exposure column: **caller/wire** = the values parsed arrive from outside the
 package; **internal** = the package parses values it built.
@@ -109,7 +123,7 @@ exists but the package's own structure keeps it off a decision;
 | `packages/polymarket-public` | rtds: `normalizeRtdsFrame` (through `rtds/wire-door.ts`, `REC-1` `327cae7`); CLOB: `parseMarketEvent`/`parseVenueOrderBook`/`parseVenueOrderBooks` (through `venue/wire-door.ts`, `CLOB-1` `eb0c586`) | wire | **CLOSED (both halves: rtds 2026-09-06, CLOB 2026-09-07)**. rtds: the routing adoption (inherited `type` → "update") plus every other envelope/payload cell — including a fabricated ECONOMIC value (inherited `full_accuracy_value` → published `value:"999000"`) and an invented `feedId` (from `topic`) — reproduced at base and refused at the tip, both variants pinned; the TWAP payload's numeric checks still hold under `skipChecks` (unregressed). CLOB (`CLOB-1`, review r1 ACCEPT, 0 blockers): `parseMarketEvent` no longer parses through the `discriminatedUnion` (an own `event_type` read routes to the member schema, so the escaping cold-lazy `propValues[key].add` TypeError is off the door's path and contained to the documented verdict shape), and the book parsers close the inherited `hash`/`tick_size` adoption with D1/D3/D4 doors and schema-DERIVED field tables (desync fails the suite); the review's independent 106-cell census matched exactly (base 212/212 measurements diverged, tip 0/424 across four variants), a 940-call hostile battery escaped 0, and REFUSE→ACCEPT and wrong-bytes were 0 across a 6448-row corpus and two 20,000-payload fuzzers. Disclosed residuals (`docs/handoffs/CLOB-1.md`): arrays keep `Array.prototype` (a hostile array iterator mis-keys the door's own result record — availability-only, fail-closed); exotic-shape ACCEPT→REFUSE drifts including the JSON-REACHABLE own `__proto__` (review-corrected label) and the 16-deep root depth cap; the `timestamp: 1.5`-under-`skipChecks` non-restatement (base-identical); cold-lazy poisoning contained-not-cured | — | **residual owners recorded** (`docs/handoffs/CLOB-1.md`): the shared-materializer collapse question → ADR-020 governance (six near-parallel doors); follow-up test hardening; normalizer diagnostics; package-surface tidy-up |
 | `packages/universe` | lifecycle: `applyMarketLifecycleEvent` (through `lifecycle-door.ts`, `UNIV-1` `4d7443b`); registration + envelope: the nine registry/envelope surfaces (through `caller-door.ts`/`registration-door.ts`/`envelope-door.ts`, `UNIV-2` `f90ff05`); state side: the projection/observation/eligibility readers (through `state-door.ts`/`parameters-door.ts`/`grammar.ts`, `UNIV-3` `cbc1ed3`) | wire (gateway-published lifecycle payloads); caller (registration, state) | **CLOSED (the measured classes: lifecycle, registration + envelope, and state side — all 2026-09-07)**. Lifecycle: the three probe-O rows and the 40-key sweep closed (census re-derived from the frozen schemas); nine `skipChecks` defeats closed by the D2 compensation. Registration + envelope: the ghost-approval route, `registerMarket`'s 7 identity keys, the whole-market-from-`{}` route, and the envelope→lifecycle composition closed end-to-end. State side (`UNIV-3`, r1 CHANGES REQUIRED → remediation → CONFIRMED ACCEPT): the projection dot-read class closed (sharpest cell BEYOND the packet — an inherited `rulesVersionId` flipped §9.2 model-dependent activation from DRIFT-refused to permitted-with-no-refusals); the instant-format residual CLOSED via a pattern derived from the schema's own regex (differential 1128 rows drift 0; never-stricter mutation-pinned; the review's cold-load derivation attack failed 0/7); the `parameters.ts` output-side adoption and the `skipChecks` observation defeat (13 cells) closed with the documented `UniverseValidationError` contract preserved; two SANCTIONED tightenings (`bindMarketToSeries` aligned with `approveSeries`' existing guard — exactly ONE row of the 87-case digests moved, independently verified twice; `metadataVersion` held to the payload schema's own verdict, null→default-1 restored in remediation); the `ingestSeq` re-statement (base ordered `"0x10"` as 16 and skipped the replay guard on a missing `gatewayEpoch`); required scalar projection fields must be own enumerable DATA properties (the r1 fail-open regression — an invented `?? "DISCOVERED"` default — closed fail-closed and pinned in all three mutant directions). Disclosed residuals (`docs/handoffs/UNIV-3.md`): the DIRECT-export caller-input reads (`input.eventType`/`payload`, order-presence — base-identical; the registry path is doored); nested values of hand-built projections carried by reference; the identifier grammars (UUIDv7/token-id/condition-id/CodeString) unstated under `skipChecks`; D2 not performed; PERMANENT cold-union poisoning (fail-closed, base-parity) | — | **a bounded direct-export caller-input round** (opportunistic); the D2/permanent-poisoning and door-consolidation questions → ADR-020 governance |
 | `packages/settlement` (doors: `SETL-1` `af991ee`, `SETL-2` `6142e66`) | `safeParseSettlementSpec`/`parseSettlementSpec` (through `spec-door.ts`) + the activation path (`activation.ts`, `registry.ts:252`); `evaluateSettlement`/`selectPayoffModel`/`checkPayoffModelCompatibility`/`payoutPerShare` (through `observation-door.ts`) | caller | **CLOSED (both measured layers: the probe-N spec class and the observation/evaluation class — 2026-09-07)**. Spec layer (`SETL-1`): all 14 required-key adoptions refused in all three variants; VERIFIED-from-nothing closed end-to-end; the D2 compensation held to the schema's own verdict by the six-grammar differential (B1 fixed in both directions; the reviewer's 897-row digest byte-identical). Observation/evaluation layer (`SETL-2`, r1 ACCEPT 0 blockers): the base class was TOTAL — `evaluateSettlement` never parsed an observation, and inherited `strike`/`observedValue`/`comparison` landed WRONG VALUES on the payout surface (strike hole + inherited `"0"` → YES_WIN `{yes:"1",no:"0"}`; a btc spec settled by an eth.usd reading); closed by `observation-door.ts` REUSING `spec-door.ts`'s primitives (spec-door byte-unchanged). D2 declared VACUOUS and measured (the review's 40-key × 2-variant battery: zero zod-defeat divergence at tip; base had four escaping TypeError classes, tip zero). Two beyond-premise throw closures (the compatibility matrix object-literal lookup; `payoutPerShare`'s zod-backed refusal detail) and one review-surfaced IMPROVEMENT: `comparison:"BOGUS"` settled NO_WIN at base with NO pollution — a live cash-surface defect — and now refuses. Six corpus values closed SETL-1's case-drift gap (measured six survivors, not the residual's two). Disclosed residuals (`docs/handoffs/SETL-2.md`): the spec is never MATERIALIZED on the evaluation path (a caller-supplied Proxy descriptor trap can answer gates differently across reads — base-identical; emitted records stay self-consistent); the `SettlementResult` envelope keeps `Object.prototype` and is unfrozen (refusals and D4 records are null-proto/frozen); the ordering-pin `comparison` case is gate-ambiguous; two value gates depend on `Array.prototype.includes`; eight surviving mutants all verified dead-by-ordering (enumerated in the suite header) | — | **SETL-2 follow-up hardening** (ordering pin, catch value, intrinsic gates); the spec multi-read → the `spec-door.ts` line; the result-envelope D4 → an `errors.ts` follow-up; an observation parse entry only if a wire caller ever appears |
-| `packages/order-book` | `validateIngestMeta` (scalar parses only) | wire meta | **LIVE (inherited from `packages/domain`)** — scalar `safeParse` on `UuidSchema` / `IsoTimestampSchema` / `UnsignedBigIntStringSchema`; no object parse, so no adoption/loss | LOW–MEDIUM | next bounded grant on `packages/order-book/**` |
+| `packages/order-book` | `validateIngestMeta` (scalar parses); **and** `applySnapshot` / `applyLevelChange` (OBJECT parses of caller-supplied `input.payload`) | wire meta; **wire payload** | **LIVE (inherited from `packages/domain`)** — scalar `safeParse` on `UuidSchema` / `IsoTimestampSchema` / `UnsignedBigIntStringSchema` (`ingest.ts:73,92,108,116`) and on `InternalMarketIdSchema` / `TokenIdSchema` / `PositiveDecimalStringSchema` (`book.ts:161,168,350`; `executable-price.ts:61`; `price-helper.ts:104`), **and two object parses**: `book.ts:191` `BookSnapshotPayloadSchema.safeParse(input.payload)` and `book.ts:265` `BookLevelChangedPayloadSchema.safeParse(input.payload)`, each reading `parsed.data` afterwards — the library's constructed output, not a materialized tree (D1 and D3 both absent). Adoption/loss therefore DO apply to this package on the two book-mutating doors. *(Corrected 2026-09-15 by `GOV-2C`, `GOV-2B` finding N2. The basis sentence previously read: "scalar `safeParse` on `UuidSchema` / `IsoTimestampSchema` / `UnsignedBigIntStringSchema`; no object parse, so no adoption/loss" — false when written, by grep. **The severity grade is deliberately NOT changed**: no probe has been run against these two doors, so whether a pollution class reaches a real outcome (a wrong level, a wrong freshness identity, an accepted snapshot that should have been refused) has NOT been measured; the grade below is inherited from the old, wrong basis and a measurement is what would move it either way.)* | LOW–MEDIUM (unmeasured on the object doors — see the correction) | next bounded grant on `packages/order-book/**`, which now owes a measurement of the two object doors before anything else |
 | `packages/risk`, `packages/capital-allocator` (`WP-180`, `98a6cc1`) | every door | caller | **CLOSED** — D1–D4. Probe K3 confirms the arena copy of a domain schema still refuses what the raw schema accepts under `skipChecks`. *(Updated 2026-09-06, `WP-180-FU3` `8c14b47`: all 77 remaining `Array.prototype.push` sites across risk's ten other modules are `CreateDataProperty` appends through the one exported `appendData`, and direct-door index-name divergence measured 37→0 per intrinsic. The index-name availability residual shrinks to zod's own array assembly — warm `handleArrayResult` (`schemas.js:678`), cold `Doc.write` via `generateFastpass` — ACCEPT→REFUSE only, owned by a designed `isFreshOrdinaryContainer` round with the four arena consumers in scope. ADR-021: risk types `context.strategyInstanceId` as the arena `Uuidv7Schema`, and the allocator's four identity doors followed on 2026-09-06 (`ALLOC-1`, merged `d9f70a6` — which also closed a measured base cap-evasion surface: a re-cased id kept its own `byStrategyInstance` exposure bucket). Updated 2026-09-07: `TRDR-1` merged at `65ae56c`, replacing the trader's interim intersection grammar with the real `Uuidv7Schema`; startup now admits 0-leading UUIDv7s and enforces version/variant bits. ADR-021 is discharged end to end.)* | — | — |
 | `packages/execution-planner` (`WP-190`, `5aa11e3`) | every door | caller | **CLOSED** — same mechanism *(originally the third mirror; since the `WP-180-FU2` collapse, `625c83b`, it consumes the one canonical `packages/risk` door over §2.1 row S4 — corrected 2026-09-05)* | — | — |
 | `packages/storage-postgres`, `storage-wal`, `storage-parquet`, `observability` | *(none — there is no `zod` door in any of the four)* | — | **n/a — outside this class, measured.** None of the four declares `zod` in its `package.json` or imports it anywhere in `src/`, and none contains a schema parse. Every `.parse(` in their sources is `JSON.parse` or `Date.parse`: `storage-postgres/src/timestamps.ts:63`, `storage-wal/src/raw-frame.ts:149`, four sites in `storage-parquet` (`compactor.ts:759`, `wal-format.ts:517`, `testing/index.ts:43`, `compactor.test.ts:582`), six in `observability` (`soak-evidence.ts:290,293,525,526`, `soak-evidence.test.ts:17`, `render.test.ts:271`). **Corrected 2026-09-04 (`GOV-2A` remediation round 1)**: the original row asserted "one `.parse` each, on internally-constructed values" and a CONTAINED verdict for doors that do not exist — a measured-sounding verdict that was never measured. These packages **do** validate hand-written structures (`parseDatasetManifest`, the WAL frame validators, `parseSoakWindowEvidence`); that is a different class, is not what ADR-020 rules on, and was **not** measured here | — | none; recorded |
@@ -141,7 +155,35 @@ from any array a door leaves `Array.prototype` on, and from a `bigint`
 through `BigInt.prototype`, where it turned a typed refusal into an
 acceptance. Every other door that ends in `JSON.stringify` of a materialized
 tree should be measured for the same route; that is an OPEN successor
-obligation. Recounted
+obligation. *[DISCHARGED 2026-09-15 — recorded by `GOV-2C`; the sentence is
+kept because it is the obligation the sweep was dispatched to meet. The
+measurement is `SER-0` (`docs/handoffs/SER-0-sweep.md`, committed in
+`9a44167`): every `JSON.stringify(` site in non-test source — 113 sites in
+54 files plus the indirect routes (`pg`'s `prepareValue`, socket `send`,
+`fetch` bodies, Redis arguments, digest inputs) — probed in six pollution
+contexts at `main` `d6e05bf`; 48 material findings, all 48 reproduced by a
+second agent. The remediation is three merged rounds, each with an
+independent review: `SER-1` (`docs/handoffs/SER-1.md`, merged `c065d63`) —
+the own-data encoder `packages/risk/src/plain-json.ts` (`encodePlainJson`,
+exported as `@polymarket-bot/risk/plain-json`), `encodeWireJson` reduced to an
+adapter over it, and the five ledger/pnl accounting Map keys rebuilt by it;
+`SER-2` (`docs/handoffs/SER-2.md`, merged `0d8b6a0`) — the WAL header/frame/
+footer lines and segment manifest, the Parquet frame line, dataset manifest
+and retention receipt, and every object-typed `jsonb` parameter bound as
+TEXT through `storage-postgres`'s `encodeJsonbText` (seven sites; the guard
+judges, the repository encodes, `pg` receives a string, so neither
+`prepareObject` nor a `toPostgres` lookup runs); `SER-3`
+(`docs/handoffs/SER-3.md`, merged `603a49c`) — the RTDS and market
+subscribe/dynamic/unsubscribe frames, the POST `/books` body, both Coinbase
+frame builders, the gateway's §8.3 admission byte bound, every control-api
+response body and its two transport refusals, the control audit sink, and
+both soak-evidence writers. What the discharge does NOT claim: `SER-0`'s
+named non-measurements stand (PostgreSQL's acceptance of substituted bytes
+was inferred from the DDL and cut at `pg`'s bind-time mapper — `SER-2` later
+ran one live round-trip; venue-side reaction to a hijacked frame needs a
+network exchange and was not attempted), and `encodePlainJson`'s own residual
+carries (a `Proxy` handed to it runs its traps; the refusal classifiers are
+pinned against whatever such a trap throws — `SER-1` residual 1).]* Recounted
 2026-09-07, third recount that day: the category counts are UNCHANGED
 (3 LIVE / 12 CLOSED / 5 outside) while two closures deepened —
 `settlement` closed its second measured layer when `SETL-2` merged
@@ -319,6 +361,60 @@ statement of conformance.
     landing on the payout surface; the review additionally surfaced and
     the round closed a NO-pollution base cash-surface defect
     (`comparison:"BOGUS"` settled NO_WIN).
+11. **The inherited-`toJSON` route — EXECUTED** (`SER-0` measurement
+    `9a44167` → `SER-1` `c065d63`, `SER-2` `0d8b6a0`, `SER-3` `603a49c`;
+    all four on 2026-09-15) *(row added 2026-09-15 by `GOV-2C`, `GOV-2B`
+    N10: the sweep was invisible to this document until now — the
+    obligation it discharged lived only in §3's tally paragraph and had no
+    §5 row, so no owner list carried it)*. Scope and evidence: the
+    bracketed discharge note in §3's tally paragraph. Shape: one primitive
+    (`packages/risk/src/plain-json.ts`, own data only, byte-identical to
+    `JSON.stringify` for every in-type input, typed `NotPlainJson` refusals,
+    depth-bounded at `MAX_PLAIN_JSON_DEPTH` 256) consumed downward by six
+    layer-2 packages and three apps — the seven new workspace edges are
+    recorded in `dependency-direction.md` §6 ("The graph as of 2026-09-15"),
+    which `check:deps` now reports as 34 packages / 78 edges. Successor
+    obligations it spawned (owned in the three records): brand
+    `TraderHealthReportInput` in `observability` (`SER-3` residual 2);
+    `excludedSegments[].gatewayEpoch` bounding and `parseDatasetManifest`'s
+    cast (`SER-2` residuals 2-3, `packages/storage-parquet`); factor the
+    six-context harness (`test/unit/ledger/inherited-tojson.ts`) into one
+    shared home; and the `instanceof`-classifier mutant that survived every
+    round until pinned — a class rule for the next encoder, not a defect.
+12. **R8-1 — the repo-wide descriptor-literal follow-up — OPEN, owner
+    named** *(row added 2026-09-15 by `GOV-2C`; `GOV-2B` N10 recorded that
+    this item "lacks a §5 row")*. The class (§2, "Descriptor literals"): an
+    inherited `get` makes every `Object.defineProperty` written with an
+    object-literal descriptor throw `TypeError`. `WP-180` closed its own
+    sites (WP-180 round 8); `IMPLEMENTATION_STATUS.md`'s cross-package
+    record states that "every other `Object.defineProperty` in the
+    repository still passes an ordinary descriptor literal" and `GOV-2A`
+    reaffirmed the owner as "the repo-wide descriptor-literal follow-up
+    (R8-1)" without naming a round. **Owner: the detector/tooling round
+    (item 6)**, because the fix is a mechanical census (every
+    `defineProperty`/`defineProperties` call site, each descriptor built
+    prototype-free) and item 6 is the round that builds the census
+    machinery; it is bounded so that it may land before item 6's CI gate
+    if a package needs it first. Not measured since `GOV-2A`; no claim
+    is made here about the current site count.
+13. **The `WP-190` R1-L1 totality-claim ruling — HALF DISCHARGED, and its
+    compliance mechanism failed once** *(row added 2026-09-15 by `GOV-2C`,
+    `GOV-2B` N3)*. `GOV-2A` ruled on 2026-09-04 that two claims must be
+    "corrected in text or guarded in code by the next bounded round touching
+    each package". `packages/features/src/inputs.ts` — **corrected 2026-09-15
+    by `GOV-2C`** (comment only; the superseded text is quoted at the site);
+    the trigger had fired unmet when `WP-160-FU1` (merged `5faf16b`,
+    2026-09-06) touched the package and left it.
+    `packages/execution-planner/src/refusals.ts:178-187` — **STILL
+    OUTSTANDING**: `WP-180-FU2` (merged `625c83b`, 2026-09-04 16:58, two
+    hours after `GOV-2A` merged at `b4b720a`) edited that very file (the
+    `plain-data` import at `:17`) and left the claim, so this trigger fired
+    unmet as well. `GOV-2C` has no grant on the package. Owner: the next
+    bounded grant on `packages/execution-planner/**`, and this time the
+    ruling is ALSO recorded in `IMPLEMENTATION_STATUS.md` `## Open
+    blockers`, which every round's task packet is required to read — the
+    ruling failed because nothing checked it, and the only in-repo record
+    of it was one paragraph inside a 219-line subsection.
 
 ---
 
@@ -333,3 +429,20 @@ Staging (§5) is about **retrofit**. Two things bind from 2026-09-04:
 2. **A `zod` upgrade is a contract change** (ADR-020 §7): re-run
    `WP-180`'s slot-name derivation, re-measure §2, and record the result. It is
    never a lockfile-only edit.
+3. **Bytes that are stored, sent, hashed, compared, decided on, or used as a
+   key are encoded from OWN DATA, never by native `JSON.stringify` of a
+   repo-built container** *(recorded 2026-09-15 by `GOV-2C` as the standard
+   the merged rounds already apply — not a new rule invented here)*. The
+   standard was set by `WP-060-FU1` review round 4 (`d99c2ac`: an own-data
+   encoder is the closure for the inherited-`toJSON` route), stated as the
+   membership rule of `SER-0` ("every site whose REPO-BUILT container
+   reaches `JSON.stringify` and whose bytes are stored, sent, hashed,
+   compared, decided on, or used as a key is in scope, whatever the caller
+   could or could not supply today"), and implemented by `SER-1/2/3` (§5
+   item 11). The primitive is `@polymarket-bot/risk/plain-json`
+   (`encodePlainJson`); the `pg` rule is `storage-postgres`'s
+   `encodeJsonbText` — an object-typed `jsonb` parameter is bound as TEXT,
+   so the driver's `prepareObject` never serializes a repo container. A new
+   outbound frame, persisted artifact, `jsonb` write or Map key that uses
+   native `JSON.stringify` on a container is a review finding under this
+   item; refusal-message text is out of scope (`SER-0`'s dismissed class).

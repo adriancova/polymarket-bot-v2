@@ -449,6 +449,16 @@ export class ControlPlane {
       // (`SER-3` review round 2, N1: the same spelling and the same reason as
       // `packages/polymarket-public/src/venue/frames.ts`'s `assets_ids`.)
       // `test/unit/control-api/outbound-container-species.test.ts` pins it.
+      // The trade-off (`SER-3` residual 6 / N4, recorded 2026-09-15 by
+      // `GOV-2C`): the spread reads the caller's ITERATOR where base's
+      // `.map()` read INDICES, so an `Array` subclass overriding
+      // `Symbol.iterator` changes the recorded VALUES — never the species, so
+      // the encoder is satisfied and nothing refuses — accepted because this
+      // list is §14.1 audit DIAGNOSTICS rather than a decision (the 403 is
+      // decided by `forbiddenControlKeysIn` walking the body), whereas
+      // `packages/polymarket-public/src/rtds/frames.ts` went the other way
+      // with an index walk because its values are load-bearing for an
+      // outbound protocol frame.
       { attemptedKeys: [...keys] },
     );
   }
