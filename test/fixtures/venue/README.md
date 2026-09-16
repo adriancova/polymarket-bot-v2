@@ -156,13 +156,14 @@ Wire-type conventions preserved by these fixtures and enforced by
 - All numeric limits and program parameters are configuration snapshots
   effective 2026-08-24 and must be re-verified each phase (handoff §1.2).
 
-## Re-verification 2026-09-15 (VENUE-2, the phase-2 venue gate)
+## Re-verification 2026-09-16 (VENUE-2, the phase-2 venue gate)
 
 Added by `VENUE-2`; everything above this heading is the frozen WP-000 text
 and is unchanged. Full evidence, drift rows and source digests are in
-[`docs/venue/verified-2026-09-15.md`](../../../docs/venue/verified-2026-09-15.md)
-(fetches performed 2026-09-16 UTC; the file carries the round's
-authorization date).
+[`docs/venue/verified-2026-09-16.md`](../../../docs/venue/verified-2026-09-16.md)
+(round authorized 2026-09-15; fetches performed 2026-09-16 UTC; the file is
+named by its verification date — it was `verified-2026-09-15.md` in the r0
+record and was renamed in remediation round 1).
 
 **Outcome: every fixture payload in this tree is unchanged.** Each was
 re-checked against the current official page it cites and against the
@@ -192,9 +193,14 @@ payloads were captured.
 - The "Caveats" bullet on `market-ws/price-change.json` (C-1 UNVERIFIED,
   "WP-070 must confirm") is historical: C-1/U-1 was **CLOSED 2026-08-28 by
   ADR-013** and re-verified documentarily on 2026-09-02 and 2026-09-16. The
-  example name `level-removed-absolute-zero-UNVERIFIED` is kept only because
-  `apps/ops-cli/src/verify-venue/fixtures.test.ts` asserts it; renaming is a
-  fixture-plus-validator change for the `apps/ops-cli` owner.
+  example name `level-removed-absolute-zero-UNVERIFIED` **stays by ruling**:
+  ADR-013 Consequences (`docs/adr/ADR-013-book-price-change-absolute-size-confirmed.md:153-156`)
+  — "keeps its name … Renaming it, if ever wanted, is a fixture-owning
+  package's change under its own review." The assertion that pins the name is
+  `test/contract/polymarket-public/market-ws-fixtures.test.ts:144` (plus the
+  note at `test/replay-golden/order-book/replay-two-token-books.json:71`),
+  not `apps/ops-cli` (the r0 text said so; corrected in remediation round 1,
+  L-1). No rename is queued.
 - "All numeric limits and program parameters are configuration snapshots
   effective 2026-08-24" — re-verified unchanged as of 2026-09-16; they remain
   volatile and are re-verified at each phase gate.

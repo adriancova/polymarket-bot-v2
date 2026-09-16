@@ -6,12 +6,34 @@ commit `f8c5065`). Branch `venue-2`, base `f8c5065`, worktree
 The first run was killed by an API session limit before any fetch was saved;
 this record is from the resumed run, which started from a clean worktree and
 an empty scratch directory. **All fetches are dated 2026-09-16 UTC**; the
-report file carries the packet's name `verified-2026-09-15.md` (see
-`deviations` 1).
+report file is `docs/venue/verified-2026-09-16.md`, named by verification
+date per remediation-round-1 ruling L-4 (r0 had used the packet's name
+`verified-2026-09-15.md`; see `deviations` 1).
+
+**Remediation round 1 (2026-09-16).** The adversarial review of `719455d`
+returned ACCEPT (0 HIGH, 1 MEDIUM, 4 LOW, 4 INFO; all 62 §14 digests, all
+29 r0 D-rows and every repository cite reproduced). This round fixes the
+MEDIUM and LOWs in the record: **M-1** — U-12/§7/§10.5 now record the
+documented **polled** market-state surface (`MarketState` fields, the
+`isTradeReady` predicate, the Gamma OpenAPI and SDK properties, the
+`new_market` event's `active`/`game_start_time`) as **D-30**, with the
+consequence that a `MarketOpened`/`MarketClosing` producer (ledger blocker
+B10) must poll/derive — nothing pushes them; **L-1** — the
+`level-removed-absolute-zero-UNVERIFIED` rename is withdrawn (name stays per
+ADR-013 Consequences `:153-156`; the pinning assertion is
+`test/contract/polymarket-public/market-ws-fixtures.test.ts:144`, not
+`apps/ops-cli`); **L-2** — D-19 owner corrected to the universe/data-gateway
+line (B10), not `WP-150`/`WP-160`; **L-3** — new **D-31**: `expiration` is a
+key inside `order`, not top-level as the frozen §2.1 lists; **L-4** — file
+renamed to the fetch date; **I-1** — D-04 notes the SDK `RoundingConfig`
+dropped its `price` key; **I-2** — `fixtures.ts` cites corrected to
+`:167-170` and `:241-252`. Every line number was re-checked against the saved
+bodies before writing. No new fetch; no `packages/**`/`apps/**`; frozen
+report untouched.
 
 ## summary
 
-- Wrote `docs/venue/verified-2026-09-15.md`: the **full** handoff-§1.2
+- Wrote `docs/venue/verified-2026-09-16.md` (r0 name `verified-2026-09-15.md`): the **full** handoff-§1.2
   twelve-item re-verification for phase 2, in the frozen report's structure
   and numbering, plus the two pages `verified-2026-09-02.md` §7 queued (the
   resolution page and the market-by-id surface) and the two gaps
@@ -31,7 +53,7 @@ report file carries the packet's name `verified-2026-09-15.md` (see
   `983a10a7579c95043d4099f60873ff7ea817e5a0`** (`main`, 2026-09-14), diffed
   file-by-file against the frozen commit `7fdbed42484b5d279c71aa36d3757d18968260da`.
 - Verdicts: 4 items UNCHANGED (order types/expiration; heartbeat; geoblock;
-  RTDS), 8 items DRIFT with 29 numbered drift rows
+  RTDS), 8 items DRIFT with 31 numbered drift rows (29 in r0; D-30, D-31 added in r1)
   (D-01…D-29), each quoting the frozen and current texts, the source, and the
   concrete repository consequence. No item is wholly UNVERIFIED; the
   documentary-only limits are stated per item.
@@ -48,9 +70,10 @@ report file carries the packet's name `verified-2026-09-15.md` (see
 
 ## files_changed
 
-- `docs/venue/verified-2026-09-15.md` — new (the report).
+- `docs/venue/verified-2026-09-16.md` — new (the report; created as
+  `verified-2026-09-15.md` in `25a0794`, renamed with `git mv` in r1).
 - `test/fixtures/venue/README.md` — appended section "Re-verification
-  2026-09-15 (VENUE-2, the phase-2 venue gate)"; frozen text above it
+  2026-09-16 (VENUE-2, the phase-2 venue gate)"; frozen text above it
   unchanged.
 - `docs/handoffs/VENUE-2.md` — new (this record).
 
@@ -110,11 +133,12 @@ Python check that every fixture `market` is a 66-character hex string
 
 1. **Dates.** The packet names the deliverable `verified-2026-09-15.md` and
    the round was authorized 2026-09-15, but the resumed run performed every
-   fetch on **2026-09-16** (17:18:29–17:31:29 UTC). The report says so in its
-   header and every source row carries its own timestamp; the file name
-   follows the packet. If the orchestrator prefers the file named by fetch
-   date, it is a rename plus the `IMPLEMENTATION_STATUS.md` row (not this
-   round's path).
+   fetch on **2026-09-16** (17:18:29–17:31:29 UTC). r0 kept the packet's
+   name; **r1 renamed the file to `verified-2026-09-16.md`** per the
+   coordinator's ruling L-4 (the prior dated reports are named by fetch date;
+   §1.2's convention is the verification date). The header still states the
+   authorization date. The `IMPLEMENTATION_STATUS.md` row (which names
+   `verified-2026-09-15.md`) is the orchestrator's to update at merge.
 2. **No fixture payload was updated**, although the packet anticipated
    fixture updates "where drift changes a wire shape". None did. The
    contract suites therefore prove the *unchanged* claim rather than a
@@ -186,8 +210,10 @@ Python check that every fixture `market` is a 66-character hex string
    numbers in the report are there to be re-derived.
 3. **`apps/ops-cli` owner (`WP-330` or an earlier authorized packet)** —
    report §15 items 1–4: admit dated snapshots, validate every dated report,
-   add specs for `feeSchedule` / batch responses / closed-only / `itode`,
-   and rename `level-removed-absolute-zero-UNVERIFIED` with its test.
+   add specs for `feeSchedule` / batch responses / closed-only / `itode`.
+   (r0 also queued a rename of `level-removed-absolute-zero-UNVERIFIED`;
+   **withdrawn in r1 (L-1)** — the name stays per ADR-013 Consequences, and
+   the assertion that pins it is `test/contract/polymarket-public/market-ws-fixtures.test.ts:144`.)
 4. **`packages/simulation` (ADR-012) and fee/reward accounting** — model the
    per-market `feeSchedule` (D-13) once the general-exponent formula is
    documented; keep `roundingMode` caller-declared (U-16).
@@ -205,6 +231,11 @@ Python check that every fixture `market` is a 66-character hex string
 9. **`WP-300`** — take the CTF Exchange / Neg Risk CTF Exchange addresses
    from report D-26 with source; read `market.version` before choosing a
    split/merge/redeem path (D-27, U-15).
+11. **B10 round (`MarketOpened`/`MarketClosing` producer; data-gateway/
+    universe line)** — derive from the documented polled surface (D-30):
+    `active && !closed && acceptingOrders`, `startDate`/`endDate`/`closedTime`,
+    `gameStartTime`; never present a poll as an observed venue event; the
+    Gamma `version` field (D-19) is read by the same line.
 10. **Phase-3 start gate** — a new full twelve-item report; this one does not
     pre-pay it.
 
@@ -230,7 +261,7 @@ Python check that every fixture `market` is a 66-character hex string
 | D-16 | §7 tick sizes | "0.1 down to 0.0001, with special 0.0025" | closed six-row table incl. `0.005`; SDK `TickSizeValueSchema` same six at both commits | no code site; SDK union is closed (volatility note) | WP-260 |
 | D-17 | §7 min order size unit | unit unstated | market-details "minimum USDC notional"; place-orders "minimum number of shares" | C-7; `static-bracket/src/decide.ts:771` compares shares | static-bracket, universe |
 | D-18 | §7 delays | `secondsDelay` only | 250 ms taker delay on selected crypto/finance markets, `itode: true` on `GET /clob-markets/{condition_id}`; "During either delay, the order is pending and cannot be canceled" | OMS/cancel path must expect a `not_canceled` inside the window | WP-270, WP-310 |
-| D-19 | §7.1 Gamma SDK schema | `marketMakerAddress: z.string()` required; AMM fields | removed (`0.9.0`); added `version` (`v1`/`v2`), `comboStatus` | parse loosened; `version` is the protocol discriminator | catalog work (WP-150/160), WP-260 |
+| D-19 | §7.1 Gamma SDK schema | `marketMakerAddress: z.string()` required; AMM fields | removed (`0.9.0`); added `version` (`v1`/`v2`), `comboStatus` | parse loosened; `version` is the protocol discriminator | universe/data-gateway line (WP-110/WP-120 successors, the B10 round; r1 L-2 corrected from "WP-150/160"), WP-260 |
 | D-20 | U-11 `umaResolutionStatus` | register: "no documented value set … do not parse" | Gamma OpenAPI unchanged (nullable string); SDK closed enum `disputed/proposed/requested/resolved/settled` at both commits | register may re-scope by dated amendment; until then "do not parse" | register / ADR-009 owner |
 | D-21 | §8 cancel buckets | "1 + one per order actually canceled" | "Negative Cancel Balance" Yes for Standard–Gold, No for Platinum–Elite; debt blocks future cancels | WP-310 scheduler; kill-switch after a large sweep | WP-310 |
 | D-22 | §8 tiers | "30-day maker volume" | tier keyed to the **maker wallet** even if ≠ signer; "refresh every three hours" | read `Poly-RateLimit-Tier` from responses | WP-310 |
@@ -241,6 +272,8 @@ Python check that every fixture `market` is a 66-character hex string
 | D-27 | §10.2 protocols | CTF v1 split/merge/redeem via the two adapters | SDK routes Protocol V2 positions through Router/"Exchange V3"; V2 position id = module byte + 31-byte condition id + outcome byte; docs pages silent | U-15; WP-300/WP-260 read `market.version` | WP-260, WP-300 |
 | D-28 | §16 credential names | catalog without relayer names | `POLYMARKET_RELAYER_API_KEY`, `POLYMARKET_RELAYER_API_KEY_ADDRESS`, headers `RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS` | scanner already matches by `apikey` pattern; names only, no values | none |
 | D-29 | resolution page | not covered by the frozen report | redemption "receives the released USDC.e collateral, wraps it into pUSD"; UmaCtfAdapter v1/v2/v3 address table | one of the D-15 sources; C-8 label conflict | settlement (informational) |
+| D-30 (r1 M-1) | §7 / U-12 polled market state | frozen §7 lists no state fields; U-12 "undocumented" (push) | S-D23 `MarketState {active, closed, archived, acceptingOrders, enableOrderBook, negRisk, startDate, endDate, closedTime}` (199–209), `isTradeReady = active && !closed && acceptingOrders` (227–231), field table (302–307), `gameStartTime` (876); S-D34 OpenAPI properties (20 named with lines); SDK `gamma/market.ts` parses them; `new_market` WS carries `active`/`game_start_time` at both commits | nothing pushes them; `acceptingOrders` 0 hits in packages/apps; `MarketOpened`/`MarketClosing` consumed but produced nowhere (B10) — producer must poll/derive | B10 round (data-gateway/universe) |
+| D-31 (r1 L-3) | §2.1 `expiration` placement | frozen lists `expiration` among top-level body keys (`:75-77`) | inside `order` (S-D12 545–562, 575–592; SDK `post.ts:157-172`) | no fixture/code consequence; WP-260 uses the SDK | WP-260 |
 
 ## UNVERIFIED list (with reasons)
 
@@ -253,7 +286,7 @@ Python check that every fixture `market` is a 66-character hex string
 | U-9 | HTTP 425 body | only status + backoff documented; SDK keys on status alone |
 | U-10 | cancellation/void payout | resolution page has three outcomes only; no refund path |
 | U-11 | `umaResolutionStatus` vocabulary | docs: nullable string, no enum; SDK: closed 5-value enum — register decision needed (D-20) |
-| U-12 | `MarketClosed` venue signal | lifecycle events are `new_market`/`market_resolved` only |
+| U-12 | `MarketClosed` venue signal | still undocumented as a **push** signal (lifecycle events are `new_market`/`market_resolved` only); the **polled** state surface is now recorded as D-30 (r1 M-1) |
 | U-13 (new) | wire lexeme of a Protocol V2 position id | SDK accepts any string, emits decimal; no documented V2 example |
 | U-14 (new) | per-signer live enforcement started? | page still describes the 2026-07-24 warning-mode start; announcement or `429` observation needed |
 | U-15 (new) | Protocol V2 / "Exchange V3" scope and settlement | documented only in SDK source and changelog; no docs page |
@@ -268,6 +301,12 @@ Python check that every fixture `market` is a 66-character hex string
 
 ## commit_sha
 
-`25a0794` (the report, the fixtures README section and this record) on branch
-`venue-2`, base `f8c5065`; followed by one docs-only commit recording this
-SHA. Not merged, not pushed.
+- r0: `25a0794` (the report, the fixtures README section and this record),
+  then `719455d` (docs-only, recorded the SHA) — the state the adversarial
+  review ACCEPTed.
+- r1: the **single** commit on top of `719455d` (this remediation: `git mv`
+  to `verified-2026-09-16.md`, D-30, D-31, L-1/L-2/I-1/I-2 corrections,
+  README and handoff updates), on branch `venue-2`, base `f8c5065`. Its SHA
+  is reported in the hand-back message rather than here, because a commit
+  cannot contain its own hash and the coordinator asked for one commit, not a
+  chain. Not merged, not pushed.
