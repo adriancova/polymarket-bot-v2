@@ -21,7 +21,7 @@ function view(intent: unknown, portfolio: unknown = emptyPortfolio) {
   );
 }
 
-describe("disposition is derived from the intent TYPE", () => {
+describe("disposition is derived from the intent TYPE and its portfolio effect", () => {
   it("REDUCE_POSITION is an EXIT", () => {
     const built = view(
       { type: "REDUCE_POSITION", marketId: MARKET_A, targetShares: "0", urgency: "NORMAL", reason: "r" },
@@ -34,13 +34,96 @@ describe("disposition is derived from the intent TYPE", () => {
     expect(view({ type: "CANCEL", reason: "r" }).view.disposition).toBe("CANCEL");
   });
 
-  it("a POSITION that happens to reduce is still an ENTRY — the stricter treatment", () => {
-    const built = view(positionIntent({ targetShares: "-10" }), {
-      positions: [{ marketId: MARKET_A, side: "YES", shares: "100", costBasis: "40" }],
-      openOrders: [],
-    });
+  /**
+   * `RISK-2`, GOV-2B blocker B2.
+   *
+   * THIS BLOCK REPLACES ITS OWN OPPOSITE. It used to hold one row — "a POSITION
+   * that happens to reduce is still an ENTRY — the stricter treatment" — which
+   * pinned the defect as the contract. Entry treatment applies §9.8 check 12,
+   * which needs an `expectedNetEdge` that a sale of held tokens can never
+   * declare, so every protective exit shaped as a `POSITION` was refused and no
+   * realized round trip was reachable. The rule and its reasoning are in
+   * `intent-view.ts`'s header; these rows pin its BOUNDARY, which is what stops
+   * it from being a bypass.
+   */
+  const holding = (shares: string) => ({
+    positions: [{ marketId: MARKET_A, side: "YES", shares, costBasis: "40" }],
+    openOrders: [],
+  });
+
+  it("a POSITION whose sell is FULLY COVERED by the holding is an EXIT", () => {
+    const built = view(positionIntent({ targetShares: "-10" }), holding("100"));
+    expect(built.view.disposition).toBe("EXIT");
+    expect(built.view.legs[0]?.action).toBe("SELL");
+    // The measures the skipped entry checks would have read are exactly zero,
+    // which is WHY skipping them measures nothing away.
+    expect(built.view.boundedCost).toBe("0");
+    expect(built.view.buyShares).toBe("0");
+  });
+
+  it("selling the WHOLE confirmed holding is an EXIT — the ordinary close", () => {
+    expect(view(positionIntent({ targetShares: "-100" }), holding("100")).view.disposition).toBe(
+      "EXIT",
+    );
+  });
+
+  it("an ABSOLUTE target below the holding is an EXIT too — the rule is the EFFECT, not the mode", () => {
+    const built = view(
+      positionIntent({ targetMode: "ABSOLUTE", targetShares: "40" }),
+      holding("100"),
+    );
+    expect(built.view.disposition).toBe("EXIT");
+    expect(built.view.legs[0]?.action).toBe("SELL");
+    expect(built.view.legs[0]?.shares).toBe("60");
+  });
+
+  it("a sell LARGER than the confirmed holding stays an ENTRY — fail closed", () => {
+    const built = view(positionIntent({ targetShares: "-101" }), holding("100"));
     expect(built.view.disposition).toBe("ENTRY");
     expect(built.view.legs[0]?.action).toBe("SELL");
+  });
+
+  it("a sell against NO holding at all stays an ENTRY", () => {
+    expect(view(positionIntent({ targetShares: "-10" })).view.disposition).toBe("ENTRY");
+  });
+
+  it("a sell covered on the OTHER side does not count — coverage is per (market, side)", () => {
+    const built = view(positionIntent({ targetShares: "-10", direction: "NO" }), holding("100"));
+    expect(built.view.disposition).toBe("ENTRY");
+  });
+
+  it("a BUY is an ENTRY however much is already held — a BUY commits new pUSD", () => {
+    expect(view(positionIntent({ targetShares: "10" }), holding("100")).view.disposition).toBe(
+      "ENTRY",
+    );
+  });
+
+  it("the disposition is NOT read off the intent's self-declaration", () => {
+    // Same covered sell, once tagged as an entry and carrying an edge, once
+    // tagged as a protective exit and carrying none. `packages/risk` answers
+    // the same thing both times: it reads the portfolio, never the producer.
+    const tagged = view(
+      positionIntent({
+        targetShares: "-10",
+        tags: ["sb.entry", "definitely-an-entry"],
+        expectedNetEdge: "99",
+      }),
+      holding("100"),
+    );
+    const untagged = view(
+      positionIntent({ targetShares: "-10", tags: ["sb.protected-reduce"] }),
+      holding("100"),
+    );
+    expect(tagged.view.disposition).toBe("EXIT");
+    expect(untagged.view.disposition).toBe("EXIT");
+
+    // …and the converse: a BUY that calls itself a protective reduction is
+    // still an ENTRY. If this ever flips, disposition has become a tag.
+    const lying = view(
+      positionIntent({ targetShares: "10", tags: ["sb.protected-reduce", "sb.take-profit"] }),
+      holding("100"),
+    );
+    expect(lying.view.disposition).toBe("ENTRY");
   });
 });
 

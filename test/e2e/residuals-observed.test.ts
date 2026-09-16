@@ -7,15 +7,16 @@
  * CONSEQUENCE so that the day it is fixed, this file fails and says which
  * residual moved.
  *
- * THAT HAPPENED. Residual 1 is RESOLVED, and this file is how it was noticed:
- * the row that pinned the startup refusal failed on the very commit that
- * relaxed the door, naming the residual that moved. Its two rows below now pin
- * the RESOLUTION — the mechanism is unchanged, only its subject is.
+ * THAT HAPPENED — TWICE. Residuals 1 and 2 are both RESOLVED, and this file is
+ * how each was noticed: the row that pinned the behaviour failed on the very
+ * commit that changed it, naming the residual that moved. Their rows below now
+ * pin the RESOLUTION — the mechanism is unchanged, only its subject is.
  *
  * | Residual | Owner of the fix | Observed here as |
  * | --- | --- | --- |
  * | `strategyInstanceId` must satisfy two conflicting doors — **RESOLVED 2026-09-06** (ADR-021: risk `8c14b47`, allocator `d9f70a6`, trader `TRDR-1`) | the contract owner — ruled and executed | a minted `0`-leading UUIDv7 now STARTS, the letter-leading one still does, and the startup refusal that replaced the conflict names the field without the conflict text |
- * | a protective reduction is typed `ENTRY` at the risk seam | the risk-side follow-up (`WP-220` accepted residual) | `risk.refusedExits` / `refusedExitsByCode`, and the strategy state that follows from it |
+ * | a protective reduction is typed `ENTRY` at the risk seam — **RESOLVED 2026-09-15** (GOV-2B blocker B2, `RISK-2`) | the risk-side follow-up, executed | `risk.refusedExits` is `0`, the exits are planned and submitted, and the instance ends FLAT instead of trapped |
+ * | **NEW (residual 5)** — a protective reduction creates no order track, so its own fill reads `SB.UNATTRIBUTED_FILL` and pauses the instance. Reachable only now that a reduction can execute at all | `packages/strategies/static-bracket`'s state machine | the decision reason codes, against a ledger that is nonetheless clean |
  * | `SHADOW` is observe-only in this process | a design, not a setting (ADR-011 §5) | `execution.observeOnlyIntents`, with the shadow instance's decisions still persisted |
  * | the interim §9.8 operator inputs are required and undefaulted | `packages/universe` + `packages/settlement` wiring | each omission is a startup refusal naming the field |
  *
@@ -32,6 +33,7 @@ import { describe, expect, it } from "vitest";
 
 import { RISK_SEAM_CAVEAT } from "@polymarket-bot/trader";
 
+import { captureArtifact } from "./support/artifact.js";
 import { assemble, driveScenario } from "./support/harness.js";
 import {
   INSTANCE_ID,
@@ -106,17 +108,41 @@ describe("residual 1 — the strategyInstanceId contract conflict, RESOLVED", ()
   });
 });
 
-describe("residual 2 — a protective reduction is typed ENTRY at the risk seam", () => {
+/**
+ * Residual 2, RESOLVED — the rows now pin the resolution.
+ *
+ * GOV-2B blocker B2: `static-bracket` emits its protective exits as §7.7
+ * `POSITION`s, `packages/risk` classified every `POSITION` as an `ENTRY`, and
+ * the entry-only positive-net-edge gate then refused the exit for an
+ * `expectedNetEdge` an exit can never declare. No realized round trip was
+ * reachable in the merged paper core. `RISK-2` fixed it CONSUMER-SIDE: the
+ * disposition of a `POSITION` is derived from its effect on the supplied
+ * portfolio, so a sell fully covered by the confirmed holding is an `EXIT`. No
+ * tag is read, and the strategy still emits `POSITION`.
+ *
+ * Each row below is the same assertion as before with its expectation moved,
+ * so the diff shows exactly what the fix changed on the health surface.
+ */
+describe("residual 2 — a protective reduction at the risk seam, RESOLVED", () => {
   it("the refusal is COUNTED, by code, on the health surface", async () => {
     const run = await driveScenario();
     const health = run.trader.loop.health();
-    expect(health.risk.refusedExits).toBe(1);
-    expect(health.risk.refusedExitsByCode).toEqual({ RISK_EDGE_INPUTS_MISSING: 1 });
-    // The refused-exit count is a SUBSET of the total refusal count, per code.
+    // WAS: `refusedExits 1`, `{ RISK_EDGE_INPUTS_MISSING: 1 }`. The seam no
+    // longer refuses a protective exit, so the counter that measured the
+    // residual reads ZERO — and the counter itself is unchanged and still
+    // wired, which is what the rest of this row proves.
+    expect(health.risk.refusedExits).toBe(0);
+    expect(health.risk.refusedExitsByCode).toEqual({});
+    expect(health.risk.refusals).toBe(0);
+    // The mechanism is still live: the refused-exit count remains a SUBSET of
+    // the total refusal count, per code, and both are still counted.
     for (const [code, count] of Object.entries(health.risk.refusedExitsByCode)) {
       expect(health.risk.refusalsByCode[code] ?? 0).toBeGreaterThanOrEqual(count);
     }
     expect(health.risk.refusals).toBeGreaterThanOrEqual(health.risk.refusedExits);
+    // …and the exits it used to refuse were EVALUATED and APPROVED instead.
+    expect(health.risk.evaluations).toBe(4);
+    expect(health.risk.approvals).toBe(4);
   });
 
   it("the caveat travels with the snapshot, and is the trader's own constant", async () => {
@@ -124,38 +150,65 @@ describe("residual 2 — a protective reduction is typed ENTRY at the risk seam"
     // Pinned BY IDENTITY against the exported constant, not by copying its
     // text: a wording improvement upstream must not read as a failure here.
     expect(run.trader.loop.health().riskSeamCaveat).toBe(RISK_SEAM_CAVEAT);
+    // NOTE (`RISK-2`): the constant's TEXT is now stale — it still describes the
+    // WP-220 residual as accepted, and `apps/trader/src/health.ts` is outside
+    // this round's grant. The identity pin above is what this row measures and
+    // it is unaffected; the wording is carried as a follow-up.
     expect(RISK_SEAM_CAVEAT).toContain("WP-220 accepted residual");
   });
 
-  it("fail-closed: a refused exit is a refused exit, never a re-tagged order", async () => {
+  it("the exit is EXECUTED, and it is the intent the strategy emitted — not a re-tag", async () => {
     const run = await driveScenario();
     const health = run.trader.loop.health();
-    // ONE plan, ONE submission, TWO fills — all of them the ENTRY. Nothing was
-    // planned or submitted for the refused take-profit.
-    expect(health.execution.plansBuilt).toBe(1);
-    expect(health.execution.submissionsAccepted).toBe(1);
-    expect(run.orders).toHaveLength(1);
-    expect(run.orders[0]?.action).toBe("BUY");
-    expect(run.fills.every((fill) => fill.action === "BUY")).toBe(true);
+    // WAS: ONE plan, ONE submission, one BUY order, every fill a BUY — because
+    // nothing was ever planned for the refused take-profit. Now the exits are
+    // planned and submitted like any other intent.
+    expect(health.execution.plansBuilt).toBe(4);
+    expect(health.execution.submissionsAccepted).toBe(4);
+    expect(run.orders).toHaveLength(3);
+    expect(run.orders.map((order) => order.action)).toEqual(["BUY", "SELL", "SELL"]);
+    expect(run.fills.map((fill) => fill.action)).toEqual(["BUY", "BUY", "SELL"]);
+
+    // THE FAIL-CLOSED PROPERTY THE OLD ROW GUARDED IS STILL GUARDED. The exit
+    // reached the venue because `packages/risk` APPROVED it, not because the
+    // composition root re-derived a disposition from its tags. The intents the
+    // strategy emitted are still §7.7 `POSITION`s, still carrying their
+    // protective tags — the very tags a re-tagging fix would have had to change.
+    const artifact = captureArtifact(run);
+    const exitIntents = artifact.decisions
+      .filter((decision) => decision.decisionType === "exit" || decision.decisionType === "reduce")
+      .flatMap((decision) => decision.intents);
+    expect(exitIntents.length).toBeGreaterThan(0);
+    for (const intent of exitIntents) {
+      expect(intent.type).toBe("POSITION");
+      // Still wearing the protective tags a re-tagging fix would have removed.
+      expect(intent.tags?.some((tag) => tag.startsWith("sb."))).toBe(true);
+    }
   });
 
-  it("the CONSEQUENCE is visible too: the instance ends holding what it cannot exit", async () => {
+  it("the CONSEQUENCE is gone too: the instance ends FLAT, not trapped", async () => {
     const run = await driveScenario();
     const decisions = run.trader.loop.decisions();
-    // The strategy emitted its take-profit, the seam refused it, and the
-    // strategy's own state machine then waits for a cancel confirmation that no
-    // order will ever produce. That is the residual's blast radius, and it is
-    // recorded rather than papered over.
+    // WAS: "the instance ends holding what it cannot exit" — the strategy
+    // emitted its take-profit, the seam refused it, and the state machine then
+    // waited forever for a cancel confirmation no order would ever produce.
+    // It now reaches its §13.3 `final_policy: PROTECTED_REDUCE` and closes.
     expect(decisions.some((decision) => decision.decisionType === "exit")).toBe(true);
-    const last = decisions.at(-1);
-    expect(last?.decisionType).toBe("hold");
+    expect(decisions.some((decision) => decision.decisionType === "reduce")).toBe(true);
     expect(
       decisions.some((decision) =>
-        decision.reasonCodes.includes("SB.AWAITING_CANCEL_CONFIRMATION"),
+        decision.reasonCodes.includes("SB.FINAL_PROTECTED_REDUCE"),
       ),
     ).toBe(true);
-    // The position is still open at the end of the run.
-    expect(run.trader.loop.costBasisOf(INSTANCE_ID, run.trader.config.markets[0]?.marketId ?? "", "YES")).not.toBe("0");
+    // The position is CLOSED at the end of the run — the fact the whole of B2
+    // made unreachable.
+    expect(
+      run.trader.loop.costBasisOf(
+        INSTANCE_ID,
+        run.trader.config.markets[0]?.marketId ?? "",
+        "YES",
+      ),
+    ).toBe("0");
   });
 });
 
@@ -250,5 +303,64 @@ describe("residual 4 — the interim §9.8 operator inputs are required and unde
     // `false` and whose entries are therefore all refused.
     expect(market?.["seriesKey"]).not.toBe("btc-15m-updown");
     expect(market?.["settlementReadiness"]).toEqual({ modelDependentActivationAllowed: true });
+  });
+});
+
+/**
+ * Residual 5 — NEW, and reachable only because `RISK-2` fixed B2.
+ *
+ * `planProtectedReduce` creates NO order track. The package says so at the site
+ * and gives its reason — "a reduction creates no order track, because there is
+ * no venue order id to track until the OMS answers" — and, until the exits
+ * could reach the venue at all, nothing could observe the consequence.
+ *
+ * The consequence is this: when the protective reduction FILLS, the strategy's
+ * own state machine finds no order of its own that the fill belongs to, calls it
+ * `SB.UNATTRIBUTED_FILL`, and reconciles — `SB.POSITION_MISMATCH`,
+ * `SB.NO_BLIND_FLATTEN`, `SB.PAUSED`. The instance therefore ends its run PAUSED
+ * rather than cleanly closed.
+ *
+ * WHAT IT IS NOT. It is not §6 invariant 7's unattributed ACTIVITY: the LEDGER
+ * attributes the fill correctly, `unattributedActivity` is `0`, every PnL record
+ * is `VIRTUAL_STRATEGY`, no market is halted and the process stays healthy. The
+ * money is right; it is the strategy's own bookkeeping that cannot name the
+ * fill. And the direction is fail-closed — it pauses rather than acting.
+ *
+ * Fixing it means tracking a reduction through the OMS, which is a change to
+ * this strategy's state machine that the package deliberately deferred, so
+ * `RISK-2` REPORTS it rather than redesigning the machine at the end of an
+ * unrelated round. The day it is fixed, this block fails and names it.
+ */
+describe("residual 5 — a protective reduction's own fill is UNATTRIBUTED to the strategy", () => {
+  it("the instance ends PAUSED on its own reduction's fill", async () => {
+    const run = await driveScenario();
+    const artifact = captureArtifact(run);
+    const codes = artifact.decisions.flatMap((decision) => decision.reasonCodes);
+    // The reduction was emitted and it FILLED — otherwise this residual would
+    // not be reachable and this test would be vacuous.
+    expect(codes).toContain("SB.FINAL_PROTECTED_REDUCE");
+    expect(run.fills.some((fill) => fill.action === "SELL")).toBe(true);
+    // …and the strategy could not name the fill it had just caused.
+    expect(codes).toContain("SB.UNATTRIBUTED_FILL");
+    expect(codes).toContain("SB.PAUSED");
+  });
+
+  it("but the BOOKS are right: nothing is unattributed where it would matter", async () => {
+    const run = await driveScenario();
+    const artifact = captureArtifact(run);
+    // §6 invariant 7 is about the LEDGER, and the ledger is clean.
+    expect(artifact.ledgerProjection.unattributedActivity).toBe(0);
+    expect(artifact.ledgerProjection.unexplainedMovements).toBe(0);
+    for (const record of artifact.pnlRecords) expect(record.scope).toBe("VIRTUAL_STRATEGY");
+    // No market halted, and the process is still answerable.
+    expect(artifact.health.halts).toEqual([]);
+    expect(artifact.health.healthy).toBe(true);
+    // The position really did close, which is the fact that matters most here:
+    // the pause happens AFTER the exit is complete, not instead of it.
+    expect(
+      artifact.ledgerProjection.virtualPositions.some(
+        (line) => line.assetKind === "OUTCOME_TOKEN",
+      ),
+    ).toBe(false);
   });
 });

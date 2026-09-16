@@ -83,12 +83,46 @@ whichever token settles **worse**.
 
 ## 4. Which checks apply to which intent
 
-Disposition is derived from the intent **type**. A `POSITION` intent that happens
-to reduce a holding is still an `ENTRY` and gets the stricter treatment — refusing
-to place a new order is the safe direction, and a strategy that means "exit" has
-`REDUCE_POSITION`.
+Disposition is derived from the intent **type** and, for a `POSITION`, from its
+**effect on the supplied portfolio**. It is never derived from a tag, a label, or
+anything else the producer says about itself.
 
-| §9.8 check | ENTRY | EXIT (`REDUCE_POSITION`) | CANCEL |
+- `CANCEL` → `CANCEL`.
+- `REDUCE_POSITION` → `EXIT`.
+- a `POSITION` that resolves to a **fully covered SELL** — a negative delta, in
+  either `targetMode`, whose magnitude is at most the portfolio's confirmed
+  holding of the same `(marketId, side)` — → `EXIT`.
+- everything else, including any `POSITION` with a BUY leg, an over-held sell,
+  and every `QUOTE` and `BASKET`, → `ENTRY`.
+
+> **Corrected 2026-09-15 (`RISK-2`, GOV-2B blocker B2).** This section previously
+> read "Disposition is derived from the intent **type**. A `POSITION` intent that
+> happens to reduce a holding is still an `ENTRY` and gets the stricter treatment
+> — refusing to place a new order is the safe direction, and a strategy that means
+> 'exit' has `REDUCE_POSITION`." **That was wrong and the code matched it.** Entry
+> treatment applies check 12, which needs an `expectedNetEdge` a sale of held
+> tokens can never declare, so *every* protective exit shaped as a `POSITION` was
+> refused `RISK_EDGE_INPUTS_MISSING` and no realized round trip was reachable in
+> the paper core. The second half was wrong too: §7.7's `ReducePositionIntent`
+> `targetShares` is a per-market **sell-down level** that `buildReductionPlan`
+> applies to *both* sides, so it cannot express a single-leg exit that buys, and
+> it acts on inventory the emitting instance never created (§6 invariant 7,
+> ADR-006 §4). The original wording is preserved here rather than quietly
+> replaced. The rule above is stated in this package's own measures: a fully
+> covered SELL has `boundedCost "0"`, contributes no `buyShares`, and is assumed
+> not to fill, so the worst case it is measured against is identical to doing
+> nothing — every check the "—" cells drop is a check on *new committed risk*.
+>
+> **Disclosed consequence.** The portfolio view is the only positional input this
+> package has, so it cannot separate a bracket's protective sell from a strategy
+> that *establishes* exposure by selling a token it already holds
+> (`static-bracket`'s complement leg). Both are covered sells; both are now
+> `EXIT`. Separating them could only be done by reading the producer's
+> self-declaration, which `apps/trader/src/pipeline.ts` forbids; gating a covered
+> sale on its *directional* effect needs a net-directional-exposure measure §9.8
+> does not define today.
+
+| §9.8 check | ENTRY | EXIT (`REDUCE_POSITION`, or a covered reducing `POSITION`) | CANCEL |
 | --- | :---: | :---: | :---: |
 | 1. run / strategy state | ✔ | ✔ | — (§6 inv. 13) |
 | 2. run mode within process maximum | ✔ | ✔ | — |

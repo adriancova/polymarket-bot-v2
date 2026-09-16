@@ -15,10 +15,17 @@
  * whatever its arithmetic says. That is the whole point of the criterion: it
  * has to be possible to FAIL it.
  *
- * A row may also have NO realized value — `exit.expected_net_edge` in this
- * scenario does not, because the protective exit never reached the venue. Such a
- * row is explained only by a mechanism declared `noRealizedValue`, and the
- * verification report states it as an absence rather than as a zero.
+ * A row may also have NO realized value. In this scenario the rows that do not
+ * are the `exit.cancelled_proceeds.*` ones: the bracket's first take-profit
+ * rested and was withdrawn unfilled under §6 invariant 13's cancel-before-
+ * replace, so the proceeds it projected have no counterpart. Such a row is
+ * explained only by a mechanism declared `noRealizedValue`, and the verification
+ * report states it as an absence rather than as a zero.
+ *
+ * `RISK-2` changed which row that is. It used to be `exit.expected_net_edge`,
+ * "because the protective exit never reached the venue" — GOV-2B blocker B2.
+ * The exit now reaches the venue and fills, so that row reconciles against a
+ * real round trip.
  *
  * ## Independence
  *
@@ -80,17 +87,43 @@ export const MECHANISMS = {
       "last place, and this module checks that bound rather than assuming it.",
     noRealizedValue: false,
   },
-  PROTECTIVE_EXIT_REFUSED_AT_RISK_SEAM: {
+  EXIT_BELOW_TAKE_PROFIT: {
     detail:
-      "no realized value exists. The WP-220 accepted residual: every exit the Static Bracket " +
-      "emits is a §7.7 POSITION intent, packages/risk derives the disposition from the intent " +
-      "TYPE alone, so a protective reduction is classified ENTRY and is refused under the " +
-      "default requirePositiveNetEdgeForEntries for want of an expectedNetEdge. The refusal " +
-      "is counted on the health surface (risk.refusedExits / refusedExitsByCode) and is NOT " +
-      "worked around here: the projection therefore has no realized counterpart in this run.",
+      "the strategy's edge projection assumes the bracket closes at the configured " +
+      "exit.take_profit.price. This run's bracket did not: the market reached " +
+      "exit_cutoff_before_close_seconds first, so §13.3's final_policy PROTECTED_REDUCE closed " +
+      "it by crossing the book under exit.stop.minimum_sell_price instead. The contribution is " +
+      "(realized exit proceeds − take_profit price × shares exited), exact in decimal, and is " +
+      "NEGATIVE whenever the protective exit sold below the take-profit target.",
+    noRealizedValue: false,
+  },
+  RESTING_EXIT_CANCELLED_UNFILLED: {
+    detail:
+      "no realized value exists. The bracket's first take-profit was placed, rested, and was " +
+      "then WITHDRAWN unfilled — §6 invariant 13's cancel-before-replace, because the confirmed " +
+      "allocation grew after that exit had been sized. A cancelled order produces no fill, so " +
+      "the proceeds it projected have no realized counterpart and this row states an ABSENCE " +
+      "rather than a zero. The cancel is counted on the health surface " +
+      "(execution.cancelsRequested / cancelsConfirmed).",
     noRealizedValue: true,
   },
 } as const;
+
+/**
+ * RETIRED 2026-09-15 by `RISK-2`: `PROTECTIVE_EXIT_REFUSED_AT_RISK_SEAM`.
+ *
+ * It read "no realized value exists. The WP-220 accepted residual: every exit
+ * the Static Bracket emits is a §7.7 POSITION intent, packages/risk derives the
+ * disposition from the intent TYPE alone, so a protective reduction is
+ * classified ENTRY and is refused under the default
+ * requirePositiveNetEdgeForEntries for want of an expectedNetEdge." That is
+ * GOV-2B blocker B2, and it is fixed: `packages/risk` now derives a `POSITION`'s
+ * disposition from its effect on the supplied portfolio, the protective exit is
+ * approved, and it FILLS. `exit.expected_net_edge` therefore has a realized
+ * counterpart and is reconciled as one rather than stated as an absence. The
+ * mechanism is deleted rather than reworded because its every clause is now
+ * false, and a named mechanism is a claim.
+ */
 
 export type MechanismName = keyof typeof MECHANISMS;
 
@@ -277,15 +310,80 @@ export function buildReconciliation(
     throw new Error("the run produced no fill; there is nothing realized to reconcile against");
   }
 
-  const notionals = fills.map((fill) => mulDecimal(fill.price, fill.shares));
-  const realizedNotional = sum(notionals);
-  const realizedShares = sum(fills.map((fill) => fill.shares));
-  const chargedFees = sum(fills.map((fill) => fill.feeAmount));
-  const unroundedFees = sum(fills.map((fill) => unroundedVenueFee(fill, schedule)));
-  const worstRealizedPrice = fills.reduce(
-    (worst, fill) => (compareDecimal(fill.price, worst) > 0 ? fill.price : worst),
-    fills[0]?.price ?? "0",
+  /**
+   * THE ENTRY'S OWN FILLS, SEPARATED FROM EVERY OTHER FILL (`RISK-2`).
+   *
+   * Until B2 was fixed no exit of this scenario ever reached the venue, so
+   * `artifact.fills` WAS the entry's fills and this module read the whole array
+   * for every `entry.*` row. That is no longer true — the run now closes its
+   * position — and reading the whole array would have silently reported
+   * Σ(BUY 50 + SELL 50) = 100 shares and Σ notional = 33.2 as the ENTRY's, then
+   * labelled the resulting rows "explained". A row that is arithmetically wrong
+   * and wearing `EXACT_NO_DIFFERENCE` is worse than a row that fails.
+   *
+   * The attribution is by ID, down the artefact's own §6 invariant 4 chain —
+   * intent → trace → execution plan → order → fill — never by `action`, which
+   * would break on the complement leg where an entry SELLS and its exit BUYS.
+   */
+  const entryPlanIds = new Set(
+    artifact.traces
+      .filter((trace) => trace.intentId === entryIntent.intentId)
+      .map((trace) => trace.executionPlanId),
   );
+  const entryOrderIds = new Set(
+    artifact.orders
+      .filter((order) => entryPlanIds.has(order.executionPlanId))
+      .map((order) => order.simulatedOrderId),
+  );
+  const entryFills = fills.filter((fill) => entryOrderIds.has(fill.simulatedOrderId));
+  const exitFills = fills.filter((fill) => !entryOrderIds.has(fill.simulatedOrderId));
+  if (entryFills.length === 0) {
+    throw new Error(
+      "no fill could be attributed to the entry intent through the trace chain; the entry rows " +
+        "would compare against an empty set and are refused rather than reported as reconciled",
+    );
+  }
+
+  const notionals = entryFills.map((fill) => mulDecimal(fill.price, fill.shares));
+  const realizedNotional = sum(notionals);
+  const realizedShares = sum(entryFills.map((fill) => fill.shares));
+  const chargedFees = sum(entryFills.map((fill) => fill.feeAmount));
+  const unroundedFees = sum(entryFills.map((fill) => unroundedVenueFee(fill, schedule)));
+  const worstRealizedPrice = entryFills.reduce(
+    (worst, fill) => (compareDecimal(fill.price, worst) > 0 ? fill.price : worst),
+    entryFills[0]?.price ?? "0",
+  );
+
+  /** The EXIT side, on the same id-based attribution. */
+  const exitProceeds = sum(exitFills.map((fill) => mulDecimal(fill.price, fill.shares)));
+  const exitShares = sum(exitFills.map((fill) => fill.shares));
+  const allChargedFees = sum(fills.map((fill) => fill.feeAmount));
+  const allUnroundedFees = sum(fills.map((fill) => unroundedVenueFee(fill, schedule)));
+
+  /**
+   * The cost basis of the entry fills an exit has NOT yet retired, folded FIFO.
+   *
+   * `packages/pnl`'s open cost basis, computed the way `apps/trader`'s loop
+   * describes it ("folded FIFO from the fills"), in exact decimal and with NO
+   * DIVISION — an average price would not be exactly representable and §6
+   * invariant 1 forbids reaching for a float to get one. It collapses to the
+   * whole entry notional while the bracket is open and to exactly `"0"` once it
+   * has closed, so the two PnL rows below hold in both states rather than only
+   * in the open one they were written for.
+   */
+  let unretired = exitShares;
+  let openCostBasis = "0";
+  for (const fill of entryFills) {
+    if (compareDecimal(unretired, fill.shares) >= 0) {
+      unretired = subDecimal(unretired, fill.shares);
+      continue;
+    }
+    openCostBasis = addDecimal(
+      openCostBasis,
+      mulDecimal(fill.price, subDecimal(fill.shares, unretired)),
+    );
+    unretired = "0";
+  }
 
   // --- the strategy's own projections, from the PERSISTED decision ----------
 
@@ -430,7 +528,8 @@ export function buildReconciliation(
       mulDecimal(scenario.entryFeePerShare, realizedShares),
       "entry.economics.entry_fee_per_share × shares — the strategy's configured constant",
       chargedFees,
-      "Σ over the venue's fills of feeAmount",
+      "Σ over the ENTRY's own fills of feeAmount — the model this row compares against is " +
+        "`entry.economics.entry_fee_per_share`, so the exit's fees are not in scope here",
       [
         {
           mechanism: "FEE_MODEL_BASIS",
@@ -452,7 +551,9 @@ export function buildReconciliation(
       ],
       compareDecimal(
         absDecimal(subDecimal(chargedFees, unroundedFees)),
-        mulDecimal(bound, String(fills.length)),
+        // The ENTRY's fills, matching the two totals above: a bound counted over
+        // fills this row does not sum would be slack rather than a bound.
+        mulDecimal(bound, String(entryFills.length)),
       ) <= 0
         ? []
         : [
@@ -471,13 +572,47 @@ export function buildReconciliation(
     (line) => line.assetKind === "OUTCOME_TOKEN",
   );
 
+  /**
+   * A projection line's balance, with an ABSENT line read as `"0"` (`RISK-2`).
+   *
+   * Both call sites used to write `line?.balance ?? ""`, and the empty string
+   * reached `subDecimal`, which threw `InvalidDecimalStringError`. It never
+   * fired while B2 kept every exit off the venue, because the position stayed
+   * open and both lines were always present. The completed round trip closes the
+   * outcome-token position, and this projection CARRIES NO LINE FOR A ZERO
+   * BALANCE — verified by reading `virtualPositions` from a completed run, which
+   * returns the collateral line alone.
+   *
+   * SO ABSENT IS READ AS `"0"`, NOT AS AN UNEXPLAINED ROW. The choice is between
+   * two claims about the same fact. "Unexplained" would say the projection
+   * failed to state a balance it owes; that is false — a zero balance is
+   * faithfully represented here by the absence of a line, which is this
+   * projection's own convention. Reading `"0"` states the convention, and the
+   * row STAYS FALSIFIABLE either way: a ledger that was actually wrong carries a
+   * PRESENT line with a non-zero balance, and `projection-reconciliation.test.ts`
+   * tampers with exactly that to prove the row can fail.
+   *
+   * What it cannot distinguish is a correct zero from a line that never existed
+   * — which is why `buildReconciliation` refuses a run with no fills at all, and
+   * why the entry attribution above refuses a run whose entry fills cannot be
+   * found. An absent line is only ever read here for an asset the same run
+   * demonstrably traded.
+   */
+  const balanceOf = (line: { readonly balance: string } | undefined): string =>
+    line?.balance ?? "0";
+
   rows.push(
     exact(
       "ledger.virtual_cash_delta",
       "the instance's collateral movement",
-      negateDecimal(addDecimal(realizedNotional, chargedFees)),
-      "−(Σ fill notional + Σ charged fees), from the venue's own fills",
-      cashLine?.balance ?? "",
+      // SIGNED over every fill: a BUY pays out, a SELL takes in, and fees are
+      // paid on both. Before the round trip existed this read
+      // `−(Σ notional + Σ fees)`, which is the same number only while every
+      // fill is a BUY.
+      subDecimal(subDecimal(exitProceeds, realizedNotional), allChargedFees),
+      "(Σ exit fill notional − Σ entry fill notional − Σ charged fees on every fill), from " +
+        "the venue's own fills",
+      balanceOf(cashLine),
       "the §6 invariant 8 projection's VIRTUAL_STRATEGY collateral line, folded from the " +
         "append-only ledger",
     ),
@@ -487,10 +622,13 @@ export function buildReconciliation(
     exact(
       "ledger.virtual_token_balance",
       "the instance's outcome-token position",
-      realizedShares,
-      "Σ over the venue's fills of shares",
-      tokenLine?.balance ?? "",
-      "the §6 invariant 8 projection's VIRTUAL_STRATEGY outcome-token line",
+      // The NET position, not the gross traded quantity. Identical while the
+      // bracket is open; zero once it has closed.
+      subDecimal(realizedShares, exitShares),
+      "Σ entry fill shares − Σ exit fill shares, from the venue's own fills",
+      balanceOf(tokenLine),
+      "the §6 invariant 8 projection's VIRTUAL_STRATEGY outcome-token line; an absent line is " +
+        "a zero balance, which is how this projection represents a closed position",
     ),
   );
 
@@ -506,8 +644,9 @@ export function buildReconciliation(
     exact(
       "pnl.fees_paid",
       "fees, as the PnL engine folded them",
-      chargedFees,
-      "Σ over the venue's fills of feeAmount",
+      allChargedFees,
+      "Σ over EVERY one of the venue's fills of feeAmount — the engine folds the exit's fees " +
+        "as well as the entry's",
       field("feesPaid"),
       "the last persisted PnL snapshot's feesPaid",
     ),
@@ -516,9 +655,11 @@ export function buildReconciliation(
   rows.push(
     exact(
       "pnl.capital_committed",
-      "capital committed to the open position",
-      realizedNotional,
-      "Σ over the venue's fills of price × shares",
+      "capital committed to the STILL-OPEN position",
+      openCostBasis,
+      "the FIFO cost basis of the entry fills not yet retired by an exit fill — Σ price × " +
+        "shares over the unretired remainder, which is the whole entry notional while the " +
+        "bracket is open and exactly zero once it has closed",
       field("capitalCommitted"),
       "the last persisted PnL snapshot's capitalCommitted",
     ),
@@ -551,35 +692,100 @@ export function buildReconciliation(
     exact(
       "pnl.worst_case_resolution",
       "the documented worst-case-resolution identity",
-      subDecimal(field("realizedPnl"), realizedNotional),
-      "realizedPnl − Σ open cost basis, the formula packages/pnl states, with the cost basis " +
-        "taken from the venue's fills",
+      subDecimal(field("realizedPnl"), openCostBasis),
+      "realizedPnl − Σ OPEN cost basis, the formula packages/pnl states, with the cost basis " +
+        "folded FIFO from the venue's fills (zero once the bracket has closed)",
       field("worstCaseResolutionPnl"),
       "the last persisted PnL snapshot's worstCaseResolutionPnl",
     ),
   );
 
-  // --- the projection with NO realized counterpart --------------------------
+  // --- the round trip, now that one exists ----------------------------------
 
-  const refusalCodes = Object.keys(artifact.health.risk.refusedExitsByCode).sort();
+  /**
+   * `RISK-2`: this row USED TO BE AN ABSENCE. It carried
+   * `PROTECTIVE_EXIT_REFUSED_AT_RISK_SEAM` and said "no exit fill exists in this
+   * run", which was true only because GOV-2B blocker B2 refused every
+   * protective exit at the risk seam. The exit now fills, so the projection has
+   * a realized counterpart and is reconciled against it.
+   *
+   * The difference is large and is stated as two exact contributions:
+   * the exit did not happen at the take-profit price (the bracket ran out of
+   * time and closed under §13.3's `final_policy`), and the venue's ad-valorem
+   * fees are not the strategy's per-share constant.
+   */
+  const realizedRoundTrip = subDecimal(
+    subDecimal(exitProceeds, realizedNotional),
+    allChargedFees,
+  );
+  const targetProceeds = mulDecimal(scenario.takeProfitPrice, exitShares);
+  const modelledFees = mulDecimal(
+    addDecimal(scenario.entryFeePerShare, scenario.exitFeePerShare),
+    realizedShares,
+  );
   rows.push(
-    absent(
+    finish(
       "exit.expected_net_edge",
-      "the round trip's expected net edge",
+      "the round trip's expected net edge against what the round trip actually returned",
       projectedEdge,
       "the entry POSITION intent's expectedNetEdge, as persisted with the decision",
-      "no exit fill exists in this run",
-      {
-        mechanism: "PROTECTIVE_EXIT_REFUSED_AT_RISK_SEAM",
-        amount: "0",
-        note:
-          `the run's ${String(artifact.health.risk.refusedExits)} refused protective exit(s) ` +
-          `carry reason code(s) ${refusalCodes.join(", ")}, counted on the health surface. No ` +
-          "exit order was ever submitted, so the projection has no realized counterpart and " +
-          "this row states an ABSENCE rather than a zero.",
-      },
+      realizedRoundTrip,
+      "Σ exit fill notional − Σ entry fill notional − Σ charged fees on every fill",
+      [
+        {
+          mechanism: "EXIT_BELOW_TAKE_PROFIT",
+          amount: subDecimal(exitProceeds, targetProceeds),
+          note:
+            `the projection assumed ${exitShares} shares would leave at ` +
+            `${scenario.takeProfitPrice} for ${targetProceeds}; the protective reduction ` +
+            `realized ${exitProceeds}`,
+        },
+        {
+          mechanism: "FEE_MODEL_BASIS",
+          amount: negateDecimal(subDecimal(allUnroundedFees, modelledFees)),
+          note:
+            `the strategy modelled (entry_fee_per_share + exit_fee_per_share) × shares = ` +
+            `${modelledFees}; the schedule's exact ad-valorem total over every fill is ` +
+            `${allUnroundedFees}`,
+        },
+        {
+          mechanism: "FEE_ROUNDING_HALF_UP",
+          amount: negateDecimal(subDecimal(allChargedFees, allUnroundedFees)),
+          note:
+            `rounding each fill HALF_UP to ${String(schedule.roundingDecimalPlaces)} places ` +
+            `moved the exact total ${allUnroundedFees} to ${allChargedFees}`,
+        },
+      ],
     ),
   );
+
+  // --- the projection with NO realized counterpart --------------------------
+
+  const cancelledExits = artifact.orders.filter(
+    (order) =>
+      !entryOrderIds.has(order.simulatedOrderId) &&
+      order.state === "CANCELLED" &&
+      compareDecimal(order.filledShares, "0") === 0,
+  );
+  for (const order of cancelledExits) {
+    rows.push(
+      absent(
+        `exit.cancelled_proceeds.${order.simulatedOrderId}`,
+        "the proceeds a withdrawn take-profit projected",
+        mulDecimal(order.limitPrice, order.requestedShares),
+        "the cancelled order's own limitPrice × requestedShares",
+        "no fill exists for this order",
+        {
+          mechanism: "RESTING_EXIT_CANCELLED_UNFILLED",
+          amount: "0",
+          note:
+            `order ${order.simulatedOrderId} rested ${order.requestedShares} shares at ` +
+            `${order.limitPrice} and was withdrawn with ${order.filledShares} filled; the run ` +
+            `confirmed ${String(artifact.health.execution["cancelsConfirmed"] ?? 0)} cancel(s)`,
+        },
+      ),
+    );
+  }
 
   return Object.freeze(rows);
 }

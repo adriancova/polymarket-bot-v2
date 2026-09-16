@@ -203,6 +203,70 @@ function intentId(state: StaticBracketState, kind: string, marketId: string): st
   return `sb-${kind}-${String(state.intentSequence)}-${marketId}`.slice(0, 200);
 }
 
+/**
+ * The venue order type EVERY exit this strategy emits states for itself
+ * (`RISK-2`, found only once GOV-2B blocker B2 stopped refusing these intents).
+ *
+ * THIS IS NOT THE DISPOSITION FIX, AND IT IS NOT A DISPOSITION SIGNAL.
+ * `RISK-2` chose design (b): a protective reduction is recognized as an EXIT
+ * CONSUMER-SIDE, inside `packages/risk`, from the parsed intent shape and the
+ * supplied portfolio view (`intent-view.ts`, "Why a covered reducing POSITION
+ * is an EXIT"). This strategy still emits `POSITION`, exactly as before —
+ * design (a) was REJECTED, for the reasons {@link planProtectedReduce}'s header
+ * already reproduced end to end. `packages/risk` never reads a tag's CONTENT —
+ * the single place the word occurs there is `approved-intent.ts`'s
+ * `NON_IDENTITY_KEYS`, a key-NAME exclusion from ADR-016 §2 identity checking —
+ * so nothing below can make an intent an exit, and adding or removing this tag
+ * changes no risk verdict. Its ONLY reader is a composition root's
+ * `resolveTimeInForce`, which maps
+ * `sb.order-type:` to a venue TIME-IN-FORCE and nothing else;
+ * `apps/trader/src/pipeline.ts`'s rule that a composition root may never
+ * re-derive DISPOSITION from tags is untouched and still right.
+ *
+ * It is here because clearing B2 exposed a SECOND, independent defect that B2
+ * had been masking. With the exits finally reaching the venue, the venue
+ * refused them for an unrelated reason — the wrong order type — so no exit
+ * could be submitted either. The two fixes live in different packages because
+ * the two defects do.
+ *
+ * WHY AN EXIT HAS TO SAY THIS AT ALL. A composition root resolves an intent's
+ * time-in-force from the `sb.order-type:` tag FIRST and the instance's
+ * configured `immediate_order_type` second. Until now only the ENTRY carried
+ * the tag, so both exits fell through to the entry's `immediate_order_type` —
+ * and §13.2's own example configures that `FAK`. §9.10's posture table makes a
+ * `MAKER_ONLY` take-profit `REST`, and a `FAK` order cannot rest (venue report
+ * §2.3: it cancels its remainder), so the simulated venue refused the
+ * take-profit's submission outright with `SIMULATED_VENUE_PLAN_UNSUPPORTED`.
+ * The same collision hits a `PROTECTED_REDUCE` configured `exit.stop.urgency:
+ * NORMAL`, which §9.10 also plans `REST`. An order type the ENTRY configured
+ * for an IMMEDIATE crossing is not a fact about an exit, and the intent is the
+ * only place that can say so.
+ *
+ * WHY `GTC`, AND WHY THAT NEEDS NO POSTURE TEST HERE. `GTC` is correct under
+ * BOTH postures, so this file does not replicate §9.10's table to pick one:
+ *
+ * - planned `REST` (the take-profit; a `NORMAL` reduction): the order rests,
+ *   which only `GTC` and `GTD` can do. `GTD` is not available — it must state
+ *   an expiration (venue report §2.3, ADR-012 §5.2's one-minute early expiry)
+ *   and no composition root in this repository supplies one.
+ * - planned `MARKETABLE_LIMIT` (an `AGGRESSIVE` or `IMMEDIATE` reduction): the
+ *   order crosses what it can and the REMAINDER RESTS instead of being
+ *   abandoned. For a protective reduction that is strictly better than `FAK`:
+ *   §6 invariant 10 sizes the exit from the confirmed allocation and
+ *   `partialFillPolicy: ACCEPT_ANY` treats any partial as progress, so an
+ *   unfilled remainder should keep working rather than leave the position open.
+ *   It stays BOUNDED without this file doing anything: the plan carries the
+ *   intent's `validUntil` as its deadline, under `escalation.atDeadline:
+ *   CANCEL_REMAINING`.
+ *
+ * NOT IN SCOPE, AND REPORTED RATHER THAN FIXED HERE: {@link planEntry} tags
+ * `immediate_order_type` unconditionally, so a PASSIVE entry
+ * (`convert_to_aggressive_after_ms > 0`, planned `REST`) collides the same way.
+ * That path is not the one B2 blocked, and choosing a passive entry's order
+ * type is an entry-side decision this round does not own.
+ */
+const EXIT_ORDER_TYPE = "GTC";
+
 function cancelIntent(marketId: string, orderIds: readonly string[], reason: string): Intent {
   const known = orderIds.filter((id) => id.length > 0);
   const base = { type: "CANCEL" as const, marketId, reason: reason.slice(0, 2000) };
@@ -811,6 +875,12 @@ function planEntry(
     entryOrder: track,
     intentSequence: state.intentSequence + 1,
     legOutcome: quote.leg,
+    // THE INVENTORY THIS BRACKET STARTS FROM, OBSERVED — not derived later.
+    // See {@link legExposure}. This bracket has filled nothing yet (a plan is
+    // refused while any order of this instance is live, and `planRearm` resets
+    // the state), so whatever the instance's OWN virtual view holds of this leg
+    // right now is exactly the inventory the bracket did not create.
+    legBaselineShares: heldShares(observation, quote.leg),
   });
   if (!moved.ok) {
     return halted(state, moved.problem, []);
@@ -1627,7 +1697,12 @@ function planTakeProfit(
     liquidityPreference: params.exit.take_profit.liquidity_preference,
     partialFillPolicy: "ACCEPT_ANY",
     validUntil: validUntil.value,
-    tags: Object.freeze([TAGS.strategy, TAGS.takeProfit, legTag(leg)]),
+    tags: Object.freeze([
+      TAGS.strategy,
+      TAGS.takeProfit,
+      legTag(leg),
+      orderTypeTag(EXIT_ORDER_TYPE),
+    ]),
   };
   const track: OrderTrack = Object.freeze({
     kind: "EXIT",
@@ -1811,7 +1886,12 @@ function planProtectedReduce(
     liquidityPreference: "TAKER_OK",
     partialFillPolicy: "ACCEPT_ANY",
     validUntil: validUntil.value,
-    tags: Object.freeze([TAGS.strategy, TAGS.protectedReduce, legTag(leg)]),
+    tags: Object.freeze([
+      TAGS.strategy,
+      TAGS.protectedReduce,
+      legTag(leg),
+      orderTypeTag(EXIT_ORDER_TYPE),
+    ]),
   };
   // MOVE-SITE: protectedReduce TRIGGERS: EXIT_TRIGGER_MET
   const moved = move(state, "EXIT_TRIGGER_MET", { intentSequence: state.intentSequence + 1 });
@@ -2189,26 +2269,48 @@ function applyEntryFill(
   // after the first one and leave `maximum_entries_per_market` unenforced.
   const firstFill = isZero(state.allocatedShares);
 
-  // The inventory this bracket started from, recorded once, at the first fill.
-  // §8.1 orders "update local market/account state -> ... -> invoke subscribed
-  // strategies", so the position view of a fill evaluation already includes that
-  // fill; subtracting the confirmed allocation from it recovers what was held
-  // before. A composition root that lags the position behind the fill stream
-  // makes this baseline low by the lag, which makes the exit gates REFUSE and
-  // reconcile — the fail-closed direction.
-  const baseline = firstFill
-    ? entry.side === "BUY"
-      ? sub(heldShares(observation, fill.outcome), allocated.value, "leg baseline")
-      : add(heldShares(observation, fill.outcome), allocated.value, "leg baseline")
-    : ok(state.legBaselineShares);
-  if (!baseline.ok) return halted(state, baseline.problem, []);
-
+  // `legBaselineShares` IS NOT WRITTEN HERE. It is OBSERVED when the entry is
+  // planned ({@link planEntry}), which is the last instant at which this
+  // bracket is guaranteed to have filled nothing.
+  //
+  // IT USED TO BE DERIVED HERE, AND THAT WAS THE DEFECT (`RISK-2`; found only
+  // once the exits could reach the venue at all). The code read:
+  //
+  //     const baseline = firstFill
+  //       ? entry.side === "BUY"
+  //         ? sub(heldShares(observation, fill.outcome), allocated.value, …)
+  //         : add(heldShares(observation, fill.outcome), allocated.value, …)
+  //       : ok(state.legBaselineShares);
+  //
+  // and its comment justified the subtraction by §8.1's "update local
+  // market/account state -> … -> invoke subscribed strategies", concluding that
+  // a composition root which LAGGED the position behind the fill stream would
+  // only make the baseline low "which makes the exit gates REFUSE and reconcile
+  // — the fail-closed direction". It considered one direction and missed the
+  // one the contract actually mandates. `WP-220` obligation 3 requires the view
+  // to include the fill an `onFill` is about "AND, IF TWO FILLS ARRIVE
+  // TOGETHER, BOTH OF THEM" (`apps/trader/src/loop.ts` `#harvestFills`, which
+  // books every fill of a harvest before delivering any of them). So at the
+  // FIRST `onFill` of a batched harvest the view LEADS: it already holds the
+  // whole batch, while `allocated` counts only the fill being delivered.
+  //
+  // Measured, in the paper end-to-end scenario: one 50-share entry filled
+  // 30 @ 0.34 then 20 @ 0.35 in a single harvest, so the first `onFill` saw a
+  // view of 50 and subtracted 30, recording `legBaselineShares "20"` for a
+  // bracket that started from nothing. `legExposure` was then understated by 20
+  // FOREVER — 30 against an `openShares` of 50 — and `positionAgrees`, which
+  // demands equality, refused the protective reduction as `SB.POSITION_MISMATCH`
+  // / `SB.NO_BLIND_FLATTEN` and PAUSED the instance holding a position it could
+  // no longer exit. That is not the fail-closed direction; it is the trap.
+  //
+  // Observing the baseline instead of deriving it removes the dependence on
+  // fill-delivery batching entirely, and it needs no subtraction to be correct
+  // on either leg.
   const changes: Partial<StaticBracketState> = {
     entryOrder: orderMoved.value,
     allocatedShares: allocated.value,
     allocatedCost: cost.value,
     legOutcome: fill.outcome,
-    legBaselineShares: baseline.value,
     openedAtMs: state.openedAtMs ?? observation.nowMs,
     entriesExecuted: firstFill ? state.entriesExecuted + 1 : state.entriesExecuted,
   };

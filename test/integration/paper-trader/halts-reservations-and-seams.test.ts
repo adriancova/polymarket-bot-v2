@@ -205,10 +205,25 @@ describe("L3 — the reservation books, taken and released on the RIGHT events",
 
     expect(run.parts.venue.ordersSnapshot()[0]?.state).toBe("FILLED");
     const health = run.trader.loop.health();
-    expect(health.seams.reservations.open).toBe(0);
+    // EXACTLY ONCE is the claim, and it is unchanged: the entry order's terminal
+    // view released one reservation in each book.
     expect(health.seams.reservations.released).toBe(1);
-    expect(health.seams.allocator.open).toBe(0);
     expect(health.seams.allocator.released).toBe(1);
+    // `RISK-2`: both `open` counts read `0`, because the entry was the only
+    // order that ever existed — the take-profit was refused at the risk seam
+    // (GOV-2B blocker B2). It is now placed and RESTS, so one reservation of
+    // each kind is legitimately still held. The identity below is what makes
+    // that a statement rather than an excuse: taken − released = open.
+    expect(health.seams.reservations.taken).toBe(2);
+    expect(health.seams.reservations.open).toBe(1);
+    expect(health.seams.allocator.applied).toBe(2);
+    expect(health.seams.allocator.open).toBe(1);
+    // …and the reservation still open belongs to a LIVE order, not to a leak.
+    const live = run.parts.venue
+      .ordersSnapshot()
+      .filter((order) => order.state !== "FILLED" && order.state !== "CANCELLED");
+    expect(live).toHaveLength(1);
+    expect(live[0]?.action).toBe("SELL");
   });
 });
 
@@ -286,9 +301,16 @@ describe("MEDIUM-2 — every seam reports on the health surface", () => {
     expect(seams.fills.admitted).toBe(1);
     expect(seams.fills.maximumRemembered).toBe(100_000);
     expect(seams.orderViews.emitted).toBeGreaterThan(0);
-    expect(seams.reservations.taken).toBe(1);
+    // `RISK-2`: `taken` and `applied` read `1`. The take-profit that used to be
+    // refused at the risk seam (GOV-2B blocker B2) is now placed, so both books
+    // are taken TWICE — once for the entry, once for the resting exit — and
+    // released once, when the entry order goes terminal. The exit is still live
+    // when this fixture's events run out, which is why one of each stays open.
+    expect(seams.reservations.taken).toBe(2);
     expect(seams.reservations.released).toBe(1);
-    expect(seams.allocator.applied).toBe(1);
+    expect(seams.reservations.open).toBe(1);
+    expect(seams.allocator.applied).toBe(2);
+    expect(seams.allocator.released).toBe(1);
     expect(seams.cancels.requested).toBe(0);
   });
 
