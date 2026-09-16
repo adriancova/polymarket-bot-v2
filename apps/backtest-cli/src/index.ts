@@ -30,12 +30,23 @@ export {
 } from "./archive.js";
 
 export {
+  NORMALIZED_ENVELOPE_NORMALIZER_VERSION,
   POLYMARKET_MARKET_NORMALIZER_VERSION,
   RECORDED_FRAME_NORMALIZER_VERSION,
+  normalizedEnvelopeNormalizer,
   polymarketMarketNormalizer,
   recordedFrameNormalizer,
 } from "./normalizer.js";
 export type { PolymarketNormalizerOptions } from "./normalizer.js";
+
+export { replayDrivenCoreLoop } from "./core-loop.js";
+export type {
+  ReplayDriverObservations,
+  ReplayDrivenCoreLoop,
+  ReplayDrivenCoreLoopOptions,
+  ReplayDrivenLoop,
+  ReplayIngestedEvent,
+} from "./core-loop.js";
 
 export {
   DATASET_MANIFEST_OBJECT_NAME,

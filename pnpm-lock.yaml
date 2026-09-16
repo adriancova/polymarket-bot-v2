@@ -32,9 +32,15 @@ importers:
 
   apps/backtest-cli:
     dependencies:
+      '@polymarket-bot/domain':
+        specifier: workspace:*
+        version: link:../../packages/domain
       '@polymarket-bot/polymarket-public':
         specifier: workspace:*
         version: link:../../packages/polymarket-public
+      '@polymarket-bot/risk':
+        specifier: workspace:*
+        version: link:../../packages/risk
       '@polymarket-bot/simulation':
         specifier: workspace:*
         version: link:../../packages/simulation

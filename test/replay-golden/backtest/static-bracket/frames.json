@@ -1,0 +1,209 @@
+{
+  "fixture": "backtest/static-bracket",
+  "gatewayEpoch": "019b1e00-0000-7000-8000-000000000005",
+  "segmentId": "019b1e00-0000-7000-8000-000000000005-000000",
+  "objectKey": "part-00000.parquet",
+  "frames": [
+    {
+      "ingestSeq": "1",
+      "source": "binance",
+      "endpoint": "stream://polymarket.normalized",
+      "connectionId": "conn-1",
+      "subscriptionGeneration": 1,
+      "receivedAt": "2026-05-01T08:59:58.000Z",
+      "receivedMonotonicNs": "1000000",
+      "envelope": {
+        "eventType": "ReferenceTradeObserved",
+        "schemaVersion": 1,
+        "sourceChannel": "trade",
+        "payload": {
+          "venue": "binance",
+          "symbol": "BTCUSDT",
+          "price": "64000",
+          "size": "0.5"
+        }
+      }
+    },
+    {
+      "ingestSeq": "2",
+      "source": "binance",
+      "endpoint": "stream://polymarket.normalized",
+      "connectionId": "conn-1",
+      "subscriptionGeneration": 1,
+      "receivedAt": "2026-05-01T08:59:59.000Z",
+      "receivedMonotonicNs": "2000000",
+      "envelope": {
+        "eventType": "ReferenceTradeObserved",
+        "schemaVersion": 1,
+        "sourceChannel": "trade",
+        "payload": {
+          "venue": "binance",
+          "symbol": "BTCUSDT",
+          "price": "64100",
+          "size": "0.25"
+        }
+      }
+    },
+    {
+      "ingestSeq": "3",
+      "source": "polymarket",
+      "endpoint": "stream://polymarket.normalized",
+      "connectionId": "conn-1",
+      "subscriptionGeneration": 1,
+      "receivedAt": "2026-05-01T09:00:00.000Z",
+      "receivedMonotonicNs": "3000000",
+      "envelope": {
+        "eventType": "MarketOpened",
+        "schemaVersion": 1,
+        "sourceChannel": "market",
+        "payload": {
+          "internalMarketId": "019b1e00-0000-7000-8000-000000000001",
+          "conditionId": "0xbacktest1condition",
+          "openedAt": "2026-05-01T09:00:00.000Z"
+        }
+      }
+    },
+    {
+      "ingestSeq": "4",
+      "source": "polymarket",
+      "endpoint": "stream://polymarket.normalized",
+      "connectionId": "conn-1",
+      "subscriptionGeneration": 1,
+      "receivedAt": "2026-05-01T09:00:01.000Z",
+      "receivedMonotonicNs": "4000000",
+      "envelope": {
+        "eventType": "BookSnapshot",
+        "schemaVersion": 1,
+        "sourceChannel": "market",
+        "payload": {
+          "internalMarketId": "019b1e00-0000-7000-8000-000000000001",
+          "tokenId": "9101",
+          "bids": [
+            {
+              "price": "0.32",
+              "size": "200"
+            },
+            {
+              "price": "0.31",
+              "size": "300"
+            }
+          ],
+          "asks": [
+            {
+              "price": "0.34",
+              "size": "30"
+            },
+            {
+              "price": "0.35",
+              "size": "40"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "ingestSeq": "5",
+      "source": "polymarket",
+      "endpoint": "stream://polymarket.normalized",
+      "connectionId": "conn-1",
+      "subscriptionGeneration": 1,
+      "receivedAt": "2026-05-01T09:00:02.000Z",
+      "receivedMonotonicNs": "5000000",
+      "envelope": {
+        "eventType": "BookSnapshot",
+        "schemaVersion": 1,
+        "sourceChannel": "market",
+        "payload": {
+          "internalMarketId": "019b1e00-0000-7000-8000-000000000001",
+          "tokenId": "9102",
+          "bids": [
+            {
+              "price": "0.65",
+              "size": "200"
+            }
+          ],
+          "asks": [
+            {
+              "price": "0.66",
+              "size": "200"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "ingestSeq": "6",
+      "source": "polymarket",
+      "endpoint": "stream://polymarket.normalized",
+      "connectionId": "conn-1",
+      "subscriptionGeneration": 1,
+      "receivedAt": "2026-05-01T09:00:03.000Z",
+      "receivedMonotonicNs": "6000000",
+      "envelope": {
+        "eventType": "BookLevelChanged",
+        "schemaVersion": 1,
+        "sourceChannel": "market",
+        "payload": {
+          "internalMarketId": "019b1e00-0000-7000-8000-000000000001",
+          "tokenId": "9101",
+          "side": "BID",
+          "price": "0.31",
+          "size": "250"
+        }
+      }
+    },
+    {
+      "ingestSeq": "7",
+      "source": "polymarket",
+      "endpoint": "stream://polymarket.normalized",
+      "connectionId": "conn-1",
+      "subscriptionGeneration": 1,
+      "receivedAt": "2026-05-01T09:14:49.000Z",
+      "receivedMonotonicNs": "7000000",
+      "envelope": {
+        "eventType": "BookSnapshot",
+        "schemaVersion": 1,
+        "sourceChannel": "market",
+        "payload": {
+          "internalMarketId": "019b1e00-0000-7000-8000-000000000001",
+          "tokenId": "9101",
+          "bids": [
+            {
+              "price": "0.32",
+              "size": "200"
+            },
+            {
+              "price": "0.31",
+              "size": "300"
+            }
+          ],
+          "asks": [
+            {
+              "price": "0.36",
+              "size": "40"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "ingestSeq": "8",
+      "source": "polymarket",
+      "endpoint": "stream://polymarket.normalized",
+      "connectionId": "conn-1",
+      "subscriptionGeneration": 1,
+      "receivedAt": "2026-05-01T09:14:50.000Z",
+      "receivedMonotonicNs": "8000000",
+      "envelope": {
+        "eventType": "MarketClosing",
+        "schemaVersion": 1,
+        "sourceChannel": "market",
+        "payload": {
+          "internalMarketId": "019b1e00-0000-7000-8000-000000000001",
+          "conditionId": "0xbacktest1condition",
+          "closesAt": "2026-05-01T09:15:00.000Z"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+{
+  "datasetManifestFormatId": "polymarket-bot/dataset-manifest/v1",
+  "datasetManifestVersion": 1,
+  "datasetId": "2026-05-01T09-00Z",
+  "createdAt": "2026-05-01T09:30:00.000Z",
+  "schemaVersions": {
+    "walFormatId": "polymarket-bot/wal/v1",
+    "walSchemaVersion": 1,
+    "walManifestVersion": 1,
+    "parquetLayoutId": "polymarket-bot/parquet-raw-frames/v1",
+    "parquetLayoutVersion": 1,
+    "datasetManifestFormatId": "polymarket-bot/dataset-manifest/v1",
+    "datasetManifestVersion": 1
+  },
+  "writer": {
+    "library": "hyparquet-writer",
+    "libraryVersion": "0.16.6",
+    "codec": "UNCOMPRESSED",
+    "rowGroupSize": 10000
+  },
+  "columns": [
+    {
+      "name": "datasetRowOrdinal",
+      "physicalType": "INT64",
+      "nullable": false
+    }
+  ],
+  "replayPins": {
+    "normalizerVersion": "backtest-cli/normalized-envelope/v1",
+    "featureSetVersion": null,
+    "runSeed": null,
+    "fillModelVersion": null,
+    "latencyModelVersion": null,
+    "feeSnapshotVersion": null,
+    "rewardSnapshotVersion": null,
+    "settlementSpecVersions": [],
+    "note": "This recording is the NORMALIZED stream (BACKTEST-1), so the normalizer is pinned by the dataset; the remaining entries are run-scoped handoff SS12.5 pins a compactor cannot know."
+  },
+  "gatewayEpochs": [
+    "019b1e00-0000-7000-8000-000000000005"
+  ],
+  "eventRange": {
+    "first": {
+      "gatewayEpoch": "019b1e00-0000-7000-8000-000000000005",
+      "ingestSeq": "1",
+      "receivedAt": "2026-05-01T08:59:58.000Z",
+      "datasetRowOrdinal": 0
+    },
+    "last": {
+      "gatewayEpoch": "019b1e00-0000-7000-8000-000000000005",
+      "ingestSeq": "8",
+      "receivedAt": "2026-05-01T09:14:50.000Z",
+      "datasetRowOrdinal": 7
+    }
+  },
+  "recordCounts": {
+    "segmentDeclared": 8,
+    "segmentRead": 8,
+    "written": 8,
+    "replayEligible": 8,
+    "excludedByIncident": 0,
+    "excludedAsDuplicate": 0
+  },
+  "deduplication": {
+    "policy": "first-wins-in-dispatch-order",
+    "duplicateRecordCount": 0,
+    "duplicateKeys": [],
+    "duplicateKeysTruncated": false
+  },
+  "segments": [
+    {
+      "segmentId": "019b1e00-0000-7000-8000-000000000005-000000",
+      "gatewayEpoch": "019b1e00-0000-7000-8000-000000000005",
+      "segmentIndex": 0,
+      "segmentSha256": "b7aacd2a218815c08f2ca7a79260a08fb6c74097471e3abdd84119e52ea55783",
+      "checksummedByteLength": 4910,
+      "byteSize": 4974,
+      "segmentFileSha256": "de491e21bddbe968079af18d6023e06d629ad3e7dd94ec3c5c2afb6db2a0a151",
+      "recordCount": 8,
+      "firstIngestSeq": "1",
+      "lastIngestSeq": "8",
+      "firstReceivedAt": "2026-05-01T08:59:58.000Z",
+      "lastReceivedAt": "2026-05-01T09:14:50.000Z",
+      "closeReason": "shutdown",
+      "footerPresent": true,
+      "truncatedTailBytes": 0,
+      "objectKey": "part-00000.parquet",
+      "firstDatasetRowOrdinal": 0,
+      "lastDatasetRowOrdinal": 7
+    }
+  ],
+  "objects": [
+    {
+      "objectKey": "part-00000.parquet",
+      "byteLength": 6169,
+      "sha256": "cab30bd0291761371ef63a149aa06b3e4540aad6896f2ead25a434a0cf680cf3",
+      "rowCount": 8,
+      "replayEligibleRowCount": 8,
+      "firstDatasetRowOrdinal": 0,
+      "lastDatasetRowOrdinal": 7,
+      "segmentIds": [
+        "019b1e00-0000-7000-8000-000000000005-000000"
+      ]
+    }
+  ],
+  "excludedSegments": [],
+  "excludedIncidentWindows": [],
+  "walRetentionPolicy": "retain-all"
+}
