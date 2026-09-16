@@ -27,25 +27,30 @@
  * a typecheck pin is only as strong as the weakest cast under it, and an
  * in-memory double cannot reject a column name.
  *
- * `writePnlSnapshot` is now executed against a real PostgreSQL —
+ * `writePnlSnapshot` is executed against a real PostgreSQL —
  * `test/integration/paper-trader/durable-pnl-snapshot-postgres.test.ts`
  * (`TRDR-2`) inserts through this class and reads every column back from a
  * Testcontainers database — **into a database a TEST FIXTURE seeded**. That
  * file establishes the column binding and NOT the assembled trader's survival,
  * for the reason set out on {@link PostgresTraderStore.writePnlSnapshot} and in
  * that file's own header: this table's three foreign keys need rows in
- * `strategy.instances`, `strategy.runs` and `catalog.markets` that nothing in
- * `apps/trader` creates. **The other three methods still have no such
- * evidence**: `persistDecision`, `saveCheckpoint` and `appendLedgerTransaction`
- * remain typecheck-pinned (their bindings are explicit and uncast, and
- * `appendLedgerTransaction` goes through `WP-040`'s own repository, which the
- * storage suite does exercise against a container), plus the `SER-2` unit pin
- * on the decision's `jsonb` text binding. `apps/trader`'s acceptance evidence
- * for §4.2's halt BEHAVIOUR is at the PORT, with failure injection
- * (`test/integration/paper-trader/acceptance-4-infrastructure-halts.test.ts`),
- * which is the `WP-120` precedent for that class of claim — but it is evidence
- * about the loop's response to a failure, never about whether a statement is
- * valid SQL. Only a database answers that.
+ * `strategy.instances`, `strategy.runs` and `catalog.markets`.
+ *
+ * **All four methods now have a round trip through the ASSEMBLED trader**
+ * (`BOOT-1`, `test/integration/paper-trader/durable-trader-first-fill-postgres.test.ts`):
+ * the process's own startup path against a migrated database whose market,
+ * instance and run were registered through `WP-040`'s repositories, one
+ * decision and one fill, and every row read back. The sentence this header
+ * used to carry — "**The other three methods still have no such evidence**:
+ * `persistDecision`, `saveCheckpoint` and `appendLedgerTransaction` remain
+ * typecheck-pinned" — is superseded by that file. What it found on the way is
+ * recorded on {@link PostgresTraderStore.appendLedgerTransaction}: the durable
+ * ledger header cannot yet carry its fill link. `apps/trader`'s acceptance
+ * evidence for §4.2's halt BEHAVIOUR remains at the PORT, with failure
+ * injection (`test/integration/paper-trader/acceptance-4-infrastructure-halts.test.ts`),
+ * which is the `WP-120` precedent for that class of claim — evidence about the
+ * loop's response to a failure, never about whether a statement is valid SQL.
+ * Only a database answers that, and now one does for each statement here.
  *
  * ## `strategy.decisions` has no repository, and that is not an omission here
  *
@@ -243,6 +248,37 @@ export class PostgresTraderStore implements TraderStore {
    * The repository — not a hand-written insert — because it writes the header
    * and every entry inside ONE database transaction, so the per-asset zero-sum
    * constraint answers this call rather than a later one.
+   *
+   * ## The execution link is bound NULL, and why (`BOOT-1`, measured)
+   *
+   * This method used to forward `transaction.fillId` and `transaction.orderId`
+   * into the header. `accounting.ledger_transactions.fill_id` is a foreign key
+   * into `execution.fills` (and `order_id` into `execution.orders`), and this
+   * process writes NEITHER table — nor `strategy.intents`,
+   * `strategy.approved_intents`, `execution.plans` or `execution.groups`, the
+   * chain those rows require (`execution.fills.order_id` and
+   * `execution.orders.plan_id` are NOT NULL). The fill identity the postings
+   * carry is `DeterministicIdFactory`'s (`accounting.ts`), a value no row holds.
+   * So the first time the ASSEMBLED trader reached a fill against a real
+   * database — the moment `BOOT-1`'s registration check let it past its first
+   * decision — this call answered
+   *
+   * ```text
+   * STORE_UNAVAILABLE: the ledger transaction could not be persisted: … violates
+   *   foreign key constraint "ledger_transactions_fill_id_fkey"
+   * ```
+   *
+   * and `loop.ts` GLOBAL-halted, one write later than B9. A durable transaction
+   * cannot name a fill row that does not exist, so the header carries NULL for
+   * both links until the execution chain is persisted — which is its own round
+   * (the "trader read path" `GOV-2B` names as R10), not something to half-do
+   * from an accounting adapter. What is NOT lost: every entry still names its
+   * `instance_id`, `run_id` and `market_id`, the header its `market_id`, and
+   * the in-memory ledger (§6 invariant 8's in-process authority) and
+   * `CoreLoop.traces()` still carry `ledgerFillId` and the transaction ids.
+   * The durable row is honest about what the durable schema holds: no fill.
+   * `durable-trader-first-fill-postgres.test.ts` PINS the NULL so the day the
+   * chain lands this binding fails loudly and gets its link back.
    */
   async appendLedgerTransaction(
     appended: AppendedLedgerTransaction,
@@ -270,20 +306,21 @@ export class PostgresTraderStore implements TraderStore {
         settlementState: transaction.settlementState ?? null,
         referenceHash: transaction.referenceHash ?? null,
         detail: transaction.detail ?? null,
+        // The execution link, NULL on purpose — see the method doc. NOT
+        // `transaction.orderId ?? null` / `transaction.fillId ?? null`: those
+        // name rows this process never writes.
+        orderId: null,
+        fillId: null,
       };
-      // `WP-040` F16, expressed in the input TYPE: a transaction naming an order
-      // or a fill must name its market, so the two shapes are distinguished
-      // here rather than merged and hoped over.
+      // `WP-040` F16, expressed in the input TYPE: a market-bound transaction
+      // and a standalone one are distinguished here rather than merged and
+      // hoped over — the fill postings are market-bound, and their `market_id`
+      // is a foreign key `BOOT-1`'s registration check has already verified.
       if (transaction.marketId !== undefined) {
-        await this.#ledger.postTransaction({
-          ...header,
-          marketId: transaction.marketId,
-          orderId: transaction.orderId ?? null,
-          fillId: transaction.fillId ?? null,
-        });
+        await this.#ledger.postTransaction({ ...header, marketId: transaction.marketId });
         return;
       }
-      await this.#ledger.postTransaction({ ...header, marketId: null, orderId: null, fillId: null });
+      await this.#ledger.postTransaction({ ...header, marketId: null });
     });
   }
 
@@ -363,7 +400,7 @@ export class PostgresTraderStore implements TraderStore {
    *    `test/integration/paper-trader/durable-pnl-snapshot-postgres.test.ts` —
    *    and they are load-bearing for exactly this reason.
    *
-   * ## What the round trip proves, and what it does not (review R1)
+   * ## What the round trip proves, and what it does not (review R1; `BOOT-1`)
    *
    * The Testcontainers file above inserts through THIS class and reads every
    * column back, so the binding is established against the real schema. It does
@@ -371,17 +408,21 @@ export class PostgresTraderStore implements TraderStore {
    * `run_id` and `market_id` are foreign keys into `strategy.instances`,
    * `strategy.runs` and `catalog.markets`, and the rows satisfying them are
    * created by `createTradingChain`, a `@polymarket-bot/storage-postgres/testing`
-   * FIXTURE. **No code in `apps/trader` creates those rows**: this class's three
-   * inserts are `strategy.decisions`, `strategy.state_checkpoints` and
-   * `accounting.pnl_snapshots`, and nothing else in the app writes SQL at all.
-   * Against the migrated-but-unseeded database `main.ts` builds, this method
-   * therefore still fails — `violates foreign key constraint
-   * "pnl_snapshots_instance_id_fkey"`, measured by the adversarial review of
-   * `TRDR-2` round 1 — and `persistDecision` fails earlier still, because
-   * `strategy.decisions.run_id` and `.instance_id` are NOT NULL foreign keys and
-   * `loop.ts:1645-1656` halts on a failed decision write. The missing piece is a
-   * BOOTSTRAP path that registers the market, the instance and the run; it is a
-   * separate closeout blocker and is deliberately not invented here.
+   * FIXTURE. This doc used to continue: "**No code in `apps/trader` creates
+   * those rows** … The missing piece is a BOOTSTRAP path that registers the
+   * market, the instance and the run; it is a separate closeout blocker and is
+   * deliberately not invented here." That blocker (B9) is closed by `BOOT-1`,
+   * and STILL no code in `apps/trader` creates those rows — by decision, not
+   * omission: `adapters/postgres-registration.ts` VERIFIES at startup that the
+   * rows the configuration names exist and agree with it, and the process
+   * refuses to start otherwise, for the per-table reasons set out there. The
+   * assembled trader's survival through its first decision and first fill is
+   * established by `durable-trader-first-fill-postgres.test.ts`, which runs the
+   * process's own startup path against rows registered through `WP-040`'s
+   * repositories and reads this table back. (The earlier sentence "nothing else
+   * in the app writes SQL at all" was also too strong — `TRDR-2` review R9 —
+   * since `appendLedgerTransaction` causes SQL through `WP-040`'s ledger
+   * repository; the conclusion it served is unchanged.)
    */
   async writePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>> {
     return await this.#contained("write a PnL snapshot", async () => {

@@ -37,12 +37,17 @@
  * `other` is counted rather than banned because banning it would be a claim
  * this round cannot honestly make about twenty-five sites in files it does not
  * own — and because a rule that forces `@ts-expect-error` to get work done buys
- * nothing. Measured at this commit: 27 production modules, 34 outermost
- * assertions, spread over 12 files. One is REGISTERED (`main.ts:292`), so the
- * remaining **33** are 25 `other`, 7 `as const` and 1 `as unknown` widening;
- * none is `never` or `any`, and none is at a query boundary. (The commit
- * message of the first round said "the remaining 27", which was the module
- * count reused by mistake; 34 − 1 = 33.)
+ * nothing. Measured at `TRDR-2`'s commit: 27 production modules, 34 outermost
+ * assertions, spread over 12 files. One was REGISTERED (`main.ts:292`), so the
+ * remaining **33** were 25 `other`, 7 `as const` and 1 `as unknown` widening;
+ * none `never` or `any`, and none at a query boundary. (The commit message of
+ * the first round said "the remaining 27", which was the module count reused
+ * by mistake; 34 − 1 = 33.) `BOOT-1` then DELETED the registered cast while
+ * factoring `main.ts`'s assembly — `venue` is handed to `createPaperTrader`
+ * uncast and `pnpm typecheck` exits 0, confirming TRDR-2's measurement — and
+ * added `adapters/postgres-registration.ts` with no assertion at all, so the
+ * registry is EMPTY and every laundering assertion in `apps/trader` is now
+ * simply forbidden.
  *
  * ## Two evasions the adversarial review reproduced, and what closes them
  *
@@ -72,7 +77,11 @@
  * - an alias IMPORTED from another module (`import type { X } from "./x.js"`,
  *   `x as X`): the alias table is per-file, and following the import needs a
  *   `TypeChecker`. Closing this is the one open item that genuinely requires
- *   `ts.Program`;
+ *   `ts.Program`. (A PARENTHESIZED alias — `type X = (never)` — used to evade
+ *   the census the same way, and `eslint` and `tsc` alike, because the
+ *   resolver compared the text `(never)` to `never`; `TRDR-2` residual R8,
+ *   closed by `BOOT-1`: balanced surrounding parentheses are stripped before
+ *   every comparison, and a self-test below pins it);
  * - an alias whose right-hand side must be EVALUATED to reach `never`
  *   (`type X<T> = T extends string ? never : T`) — likewise checker-only;
  * - an assertion bound to a variable first (`const bound = row as Wrong;
@@ -134,19 +143,14 @@ const REGISTERED: readonly {
   readonly text: string;
   readonly reason: string;
 }[] = [
-  {
-    file: "main.ts",
-    text: 'venue as unknown as Parameters<typeof createPaperTrader>[0]["venue"]',
-    reason:
-      "`TRDR-2` MEASURED this one rather than reading it: with the cast replaced by " +
-      "`venue: venue`, `pnpm --filter @polymarket-bot/trader typecheck` exits 0 — the " +
-      "`SimulatedVenue` satisfies the port as written, so the cast hides NO mismatch " +
-      "today. It is registered rather than deleted only because `apps/trader/src/main.ts` " +
-      "is outside TRDR-2's allowed paths (`apps/trader/src/adapters/**`). It remains a " +
-      "live instance of B1's class — it disables the check permanently, so the FIRST " +
-      "drift between the venue and the port will be silent — and TRDR-2's handoff carries " +
-      "its removal as follow-up 1. Delete the cast, delete this entry.",
-  },
+  // EMPTY since `BOOT-1`. The one entry this held — `main.ts:292`,
+  // `venue as unknown as Parameters<typeof createPaperTrader>[0]["venue"]`,
+  // registered by `TRDR-2` with the measurement that `venue: venue` typechecks
+  // clean and the instruction "Delete the cast, delete this entry" — was
+  // deleted when `BOOT-1` factored that call into `assembleDurableTrader`.
+  // The shape of an entry (file, text, reason ≥ 80 chars) and the rule that a
+  // stale entry FAILS the suite are unchanged; a future entry pays the same
+  // price of a measurement.
 ];
 
 interface Assertion {
@@ -218,7 +222,7 @@ function typeAliases(sf: ts.SourceFile): ReadonlyMap<string, string> {
  * `TypeChecker` and is listed in this file's header as open.
  */
 function resolveTypeText(text: string, aliases: ReadonlyMap<string, string>): string {
-  let current = text.trim();
+  let current = unparenthesized(text);
   const seen = new Set<string>();
   while (!seen.has(current)) {
     seen.add(current);
@@ -230,9 +234,34 @@ function resolveTypeText(text: string, aliases: ReadonlyMap<string, string>): st
     if (next === undefined) {
       return current;
     }
-    current = next.trim();
+    current = unparenthesized(next);
   }
   return current;
+}
+
+/**
+ * `(never)` reads as `never` (`TRDR-2` R8, closed by `BOOT-1`): balanced
+ * surrounding parentheses are stripped, repeatedly, before any comparison.
+ * Only a pair that encloses the WHOLE text is removed — `(A) | (B)` keeps both.
+ */
+function unparenthesized(text: string): string {
+  let current = text.trim();
+  while (current.startsWith("(") && current.endsWith(")") && enclosesWhole(current)) {
+    current = current.slice(1, -1).trim();
+  }
+  return current;
+}
+
+function enclosesWhole(text: string): boolean {
+  let depth = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === "(") depth += 1;
+    if (text[index] === ")") {
+      depth -= 1;
+      if (depth === 0 && index < text.length - 1) return false;
+    }
+  }
+  return depth === 0;
 }
 
 /** The RELATIONSHIP axis. */
@@ -418,8 +447,9 @@ describe("no cast disables a check at a query boundary in apps/trader (GOV-2B B1
       expect(`${exception.file}: ${String(matches.length)}`).toBe(`${exception.file}: 1`);
       expect(exception.reason.length).toBeGreaterThan(80);
     }
-    // Exactly one site is excused today; the handoff carries its removal.
-    expect(REGISTERED).toHaveLength(1);
+    // No site is excused today (`BOOT-1` deleted the last one). A new entry
+    // changes this number and must carry its measurement.
+    expect(REGISTERED).toHaveLength(0);
   });
 
   it("uses no `@ts-expect-error`, `@ts-ignore` or `eslint-disable` to get past the compiler", () => {
@@ -490,6 +520,29 @@ describe("the census itself is not evadable (TRDR-2 r1)", () => {
       export const bound = row as Loose;
     `);
     expect(loose.classification).toBe("laundering");
+  });
+
+  it("sees through a PARENTHESIZED alias of `never` (TRDR-2 R8, closed by BOOT-1)", () => {
+    const direct = only(`
+      declare const row: SnapshotRow;
+      export const bound = row as (never);
+    `);
+    expect(direct.classification).toBe("laundering");
+
+    const aliased = only(`
+      type Wrapped = (never);
+      declare const row: SnapshotRow;
+      export const bound = row as ((Wrapped));
+    `);
+    expect(aliased.classification).toBe("laundering");
+
+    // A pair that does not enclose the whole text is NOT stripped: this is a
+    // union, and neither arm is erasing.
+    const union = only(`
+      declare const row: SnapshotRow;
+      export const bound = row as (SnapshotRow) | (Other);
+    `);
+    expect(union.classification).toBe("other");
   });
 
   it("sees a double assertion whose FIRST half is an aliased `unknown`", () => {

@@ -98,9 +98,12 @@ const TIME_IN_FORCE_VALUES: readonly string[] = Object.freeze(["GTC", "GTD", "FA
  *
  * Used ONLY for the health surface's `refusedExits` counter. It is not read by
  * any gate, and it must never be: `packages/risk` decides disposition from the
- * intent TYPE, and a composition root that re-derived a different disposition
- * from tags would be the "mis-tag intents to compensate" move the packet
- * forbids and the strategy's README warns against.
+ * intent SHAPE and the supplied portfolio, never from a tag (`RISK-2`,
+ * `133eac1`, superseding this sentence's earlier premise "`packages/risk`
+ * decides disposition from the intent TYPE"), and a composition root that
+ * re-derived a different disposition from tags would be the "mis-tag intents
+ * to compensate" move the packet forbids and the strategy's README warns
+ * against.
  */
 export function isProtectiveExitIntent(intent: Intent): boolean {
   if (!("tags" in intent) || !Array.isArray(intent.tags)) return false;

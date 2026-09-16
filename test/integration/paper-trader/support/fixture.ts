@@ -315,8 +315,13 @@ export function resetEventIds(): void {
  * buy price for 50 shares at exactly `0.34` — under the configured `0.35`
  * trigger — so the Static Bracket's entry fires on the snapshot's own
  * evaluation.
+ *
+ * `marketId` defaults to the fixture's constant. `BOOT-1`'s Testcontainers file
+ * passes the identity `catalog.markets` MINTED for the registered market, because
+ * the durable trader's configuration must name a row that exists rather than a
+ * constant — the same six events, addressed to that market.
  */
-export function recordedEvents(): readonly IngestedEvent[] {
+export function recordedEvents(marketId: string = MARKET_ID): readonly IngestedEvent[] {
   resetEventIds();
   return Object.freeze([
     ingested(
@@ -331,13 +336,13 @@ export function recordedEvents(): readonly IngestedEvent[] {
     ),
     ingested(
       "MarketOpened",
-      { internalMarketId: MARKET_ID, conditionId: "0xcondition", openedAt: T_OPEN },
+      { internalMarketId: marketId, conditionId: "0xcondition", openedAt: T_OPEN },
       { receivedAt: "2026-03-04T12:00:00.000Z", ingestSeq: 3 },
     ),
     ingested(
       "BookSnapshot",
       {
-        internalMarketId: MARKET_ID,
+        internalMarketId: marketId,
         tokenId: YES_TOKEN,
         bids: [
           { price: "0.32", size: "200" },
@@ -353,7 +358,7 @@ export function recordedEvents(): readonly IngestedEvent[] {
     ingested(
       "BookSnapshot",
       {
-        internalMarketId: MARKET_ID,
+        internalMarketId: marketId,
         tokenId: NO_TOKEN,
         bids: [{ price: "0.65", size: "200" }],
         asks: [{ price: "0.66", size: "200" }],
@@ -363,7 +368,7 @@ export function recordedEvents(): readonly IngestedEvent[] {
     ingested(
       "BookLevelChanged",
       {
-        internalMarketId: MARKET_ID,
+        internalMarketId: marketId,
         tokenId: YES_TOKEN,
         side: "ASK",
         price: "0.34",

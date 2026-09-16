@@ -72,15 +72,18 @@ export default defineConfig({
       pkg("simulation", "packages/simulation/src/index.ts"),
       pkg("ledger", "packages/ledger/src/index.ts"),
       pkg("pnl", "packages/pnl/src/index.ts"),
-      // `TRDR-2`: the Testcontainers fixtures the durable-store file uses. ONLY
-      // the `/testing` subpath is aliased, because only it is imported — the
-      // suite was measured with the bare `@polymarket-bot/storage-postgres`
-      // entry removed and passed unchanged, so carrying one would be dead
-      // configuration. Order is irrelevant here, and an earlier comment
-      // claiming otherwise was wrong: `pkg()` builds the ANCHORED
-      // `^@polymarket-bot/storage-postgres$`, which cannot match a `/testing`
-      // specifier at all. (`risk/plain-data` above is ordered out of habit, not
-      // necessity, and is not this suite's to change.)
+      // `TRDR-2`: the Testcontainers fixtures the durable-store files use. The
+      // `/testing` subpath was the only one aliased then ("the suite was
+      // measured with the bare `@polymarket-bot/storage-postgres` entry removed
+      // and passed unchanged, so carrying one would be dead configuration");
+      // `BOOT-1`'s `durable-trader-first-fill-postgres.test.ts` now imports a
+      // TYPE from the bare entry, and the sibling `tsconfig.json` maps it for
+      // `tsc`, so the alias is carried here too for the two to agree. Order is
+      // irrelevant: `pkg()` builds the ANCHORED `^@polymarket-bot/storage-postgres$`,
+      // which cannot match a `/testing` specifier at all. (`risk/plain-data`
+      // above is ordered out of habit, not necessity, and is not this suite's
+      // to change.)
+      pkg("storage-postgres", "packages/storage-postgres/src/index.ts"),
       pkg("storage-postgres/testing", "packages/storage-postgres/src/testing/index.ts"),
     ],
   },
