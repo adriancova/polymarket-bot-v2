@@ -155,3 +155,59 @@ Wire-type conventions preserved by these fixtures and enforced by
   order-book package relies on it.
 - All numeric limits and program parameters are configuration snapshots
   effective 2026-08-24 and must be re-verified each phase (handoff §1.2).
+
+## Re-verification 2026-09-15 (VENUE-2, the phase-2 venue gate)
+
+Added by `VENUE-2`; everything above this heading is the frozen WP-000 text
+and is unchanged. Full evidence, drift rows and source digests are in
+[`docs/venue/verified-2026-09-15.md`](../../../docs/venue/verified-2026-09-15.md)
+(fetches performed 2026-09-16 UTC; the file carries the round's
+authorization date).
+
+**Outcome: every fixture payload in this tree is unchanged.** Each was
+re-checked against the current official page it cites and against the
+official SDK at commit `983a10a7579c95043d4099f60873ff7ea817e5a0` (`main`,
+2026-09-14) as well as the frozen commit `7fdbed42484b5d279c71aa36d3757d18968260da`.
+No drift found by the round alters a wire shape a fixture encodes, so the
+`retrieved: "2026-08-24"` envelopes and `effective_date: "2026-08-24"`
+snapshots stay as they are — they remain true statements about when the
+payloads were captured.
+
+| Fixture | Verdict | Note (report row) |
+| --- | --- | --- |
+| `market-ws/*.json` (6 files) | valid, unchanged | The cited `source` URL is a standing **HTTP 308** to `market-data/realtime-data#market-stream` (report D-07); the AsyncAPI page `api-reference/wss/market` was re-fetched byte-identical to 2026-08-28/2026-09-02. Every `market` value is a 66-char hex condition id, which the SDK now requires (`market: ConditionIdSchema`, D-08); `asset_id` is now `ClobAssetIdSchema` (still an unconstrained string, D-09). |
+| `user-ws/order-lifecycle.json`, `user-ws/trade-settlement.json` | valid, unchanged | `market-data/websocket/user-channel` is now also a **308** (→ `trading/realtime-order-updates`, D-11); the cited sources are unaffected. The five plain trade statuses are re-confirmed by the user AsyncAPI page and the order-lifecycle page (C-3 evidence widened). |
+| `orders/order-responses.json` | valid, unchanged | `order-response.ts` byte-identical across commits. The `unmatched` status now has two official definitions (C-6); the frozen example's wording is one of them. |
+| `orders/rest-trades.json` | valid, unchanged | **Provenance-note correction:** the sentence above, "The documentation does not publish a full REST trade body", is no longer true — `trading/manage-orders` now publishes a `Trade Type` and `Trade Example` for `GET /data/trades`, and that raw example carries a **plain** `"status": "MATCHED"` while the same page's SDK tab prints `"TRADE_STATUS_MATCHED"` (report C-5). The fixture keeps the SDK's prefixed form because the SDK controls venue facts (handoff §1.1) and `TradeStatusSchema` accepts both. The examples remain synthetic completed placeholders. |
+| `orders/restricted-modes.json` | valid, unchanged | — |
+| `heartbeat/heartbeat.json` | valid, unchanged | All five examples re-confirmed verbatim. |
+| `fees/fee-reward-parameters.json` | valid, unchanged | Every rate, share, tier and reward parameter re-confirmed. The venue now also publishes a **per-market** `feeSchedule { rate, exponent, takerOnly, rebateRate }` (D-13) that this fixture does not model. |
+| `rate-limits/rate-limits.json` | valid, unchanged | All eight tiers and every IP limit re-confirmed; a **negative cancel balance** rule is now documented for Standard–Gold tiers (D-21) and is not modelled here. |
+| `geoblock/geoblock.json` | valid, unchanged | — |
+| `positions/split-merge-redeem.json` | valid, unchanged | The four addresses re-confirmed on two pages; `trading/ctf/overview` is now a **308** to `trading/positions/how-positions-work` (D-25); the contracts page now publishes the CTF Exchange and Neg Risk CTF Exchange addresses (D-26) — not added here (see the validator note). |
+| `rtds/twap-update.json` | valid, unchanged | Page byte-identical to 2026-09-02. |
+
+**Caveat corrections to the frozen text above (dated, not edited in place):**
+
+- The "Caveats" bullet on `market-ws/price-change.json` (C-1 UNVERIFIED,
+  "WP-070 must confirm") is historical: C-1/U-1 was **CLOSED 2026-08-28 by
+  ADR-013** and re-verified documentarily on 2026-09-02 and 2026-09-16. The
+  example name `level-removed-absolute-zero-UNVERIFIED` is kept only because
+  `apps/ops-cli/src/verify-venue/fixtures.test.ts` asserts it; renaming is a
+  fixture-plus-validator change for the `apps/ops-cli` owner.
+- "All numeric limits and program parameters are configuration snapshots
+  effective 2026-08-24" — re-verified unchanged as of 2026-09-16; they remain
+  volatile and are re-verified at each phase gate.
+
+**Why nothing new was frozen this round (validator constraints, reported to
+the `apps/ops-cli` owner in the report's §15):**
+`apps/ops-cli/src/verify-venue/checks.ts` pins `effective_date` to the single
+value `2026-08-24`, pins the report path to `verified-2026-08-24.md`, pins the
+SDK permalink prefix to `7fdbed4…`, and has no spec for `feeSchedule`, the
+batch `POST /orders` response array, `GET /clob-markets/{condition_id}`
+(`itode`) or `GET /auth/ban-status/closed-only`. A phase-2 snapshot of any
+newly documented parameter therefore cannot pass `verify-venue` without an
+`apps/ops-cli` change, which is outside `VENUE-2`'s paths. The documented
+values are recorded in the dated report instead, with their sources and
+digests, so the owning packages can freeze them once the validator admits
+dated snapshots.
