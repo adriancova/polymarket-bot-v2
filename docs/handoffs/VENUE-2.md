@@ -268,4 +268,6 @@ Python check that every fixture `market` is a 66-character hex string
 
 ## commit_sha
 
-__COMMIT_SHA__ on branch `venue-2` (base `f8c5065`). Not merged, not pushed.
+`25a0794` (the report, the fixtures README section and this record) on branch
+`venue-2`, base `f8c5065`; followed by one docs-only commit recording this
+SHA. Not merged, not pushed.
