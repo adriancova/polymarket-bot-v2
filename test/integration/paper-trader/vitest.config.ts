@@ -7,9 +7,14 @@
  * package-level script `pnpm --filter @polymarket-bot/trader test:integration`.
  * Root-script wiring is orchestrator-owned at merge.
  *
- * **No network, no credential.** The trader's three infrastructure seams — the
- * §12.1 `Clock`, the event transport and the durable store — are exercised
- * through in-memory implementations with failure injection
+ * **No venue, no credential — but no longer no network.** ONE file in this
+ * suite opens a TCP socket to a container on `localhost`, and on a cold image
+ * cache Testcontainers pulls `postgres:16.6-alpine` — and its own reaper image
+ * — from a public registry before it can (see the Docker paragraph below).
+ * Nothing here reaches a VENUE, a wallet, a signer or any real credential, and
+ * nothing outside that one file leaves the process. The trader's three
+ * infrastructure seams — the §12.1 `Clock`, the event transport and the durable
+ * store — are exercised through in-memory implementations with failure injection
  * (`apps/trader/src/testing/`), which is exactly how `WP-120`'s suite exercises
  * §4.2's Redis boundary. **Everything else is the REAL merged package**: the
  * order books, the feature engine, the strategy runtime, the Static Bracket
@@ -67,10 +72,16 @@ export default defineConfig({
       pkg("simulation", "packages/simulation/src/index.ts"),
       pkg("ledger", "packages/ledger/src/index.ts"),
       pkg("pnl", "packages/pnl/src/index.ts"),
-      // `TRDR-2`: the durable store's own suite. The `/testing` subpath must
-      // precede the bare one, as `risk/plain-data` does above.
+      // `TRDR-2`: the Testcontainers fixtures the durable-store file uses. ONLY
+      // the `/testing` subpath is aliased, because only it is imported — the
+      // suite was measured with the bare `@polymarket-bot/storage-postgres`
+      // entry removed and passed unchanged, so carrying one would be dead
+      // configuration. Order is irrelevant here, and an earlier comment
+      // claiming otherwise was wrong: `pkg()` builds the ANCHORED
+      // `^@polymarket-bot/storage-postgres$`, which cannot match a `/testing`
+      // specifier at all. (`risk/plain-data` above is ordered out of habit, not
+      // necessity, and is not this suite's to change.)
       pkg("storage-postgres/testing", "packages/storage-postgres/src/testing/index.ts"),
-      pkg("storage-postgres", "packages/storage-postgres/src/index.ts"),
     ],
   },
   test: {

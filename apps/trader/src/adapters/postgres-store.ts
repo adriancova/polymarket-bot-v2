@@ -30,7 +30,12 @@
  * `writePnlSnapshot` is now executed against a real PostgreSQL —
  * `test/integration/paper-trader/durable-pnl-snapshot-postgres.test.ts`
  * (`TRDR-2`) inserts through this class and reads every column back from a
- * Testcontainers database. **The other three methods still have no such
+ * Testcontainers database — **into a database a TEST FIXTURE seeded**. That
+ * file establishes the column binding and NOT the assembled trader's survival,
+ * for the reason set out on {@link PostgresTraderStore.writePnlSnapshot} and in
+ * that file's own header: this table's three foreign keys need rows in
+ * `strategy.instances`, `strategy.runs` and `catalog.markets` that nothing in
+ * `apps/trader` creates. **The other three methods still have no such
  * evidence**: `persistDecision`, `saveCheckpoint` and `appendLedgerTransaction`
  * remain typecheck-pinned (their bindings are explicit and uncast, and
  * `appendLedgerTransaction` goes through `WP-040`'s own repository, which the
@@ -316,19 +321,67 @@ export class PostgresTraderStore implements TraderStore {
    * they name are every column of the table except the three the DATABASE owns
    * — `pnl_snapshot_id` (`default internal.uuid_generate_v7()`), `computed_at`
    * (`default now()`) and `rebuilt_at` (nullable, set by a rebuild and never by
-   * a computation), which is why the row deliberately carries none of them and
-   * why none is named here: Kysely makes a defaulted or nullable column
-   * optional on insert, so their absence is checked, not assumed. The
-   * mapping is the one pinned at
+   * a computation) — which is why the row deliberately carries none of them and
+   * why none is named here. The mapping is the one pinned at
    * `test/unit/ledger/wp040-persistence-shape.test.ts:265-284`; with the cast
    * gone, `pnpm typecheck` now fails here if a column is renamed, retyped,
-   * added as required or dropped.
+   * added as REQUIRED, or dropped.
    *
    * The row — not `snapshot` — is the source of every value, because
    * `toPnlSnapshotRow` is the WP-200-FU1 own-data read: it takes each field
    * from an own DATA property and returns a prototype-free record, so no value
    * bound below can have been answered by `Object.prototype` or produced by a
    * caller's getter.
+   *
+   * ## What the compiler still does NOT check here (`TRDR-2` r1, review R7)
+   *
+   * The pin is real and it is NARROW. Two gaps, so that it is not over-read:
+   *
+   * 1. **The column DOMAINS are invisible to it.** `fees_paid`,
+   *    `reward_estimate_total`, `realized_rewards` and `capital_committed` are
+   *    `internal.non_negative_decimal_string`; `instance_id`, `run_id` and
+   *    `market_id` are `internal.uuid_v7`, whose CHECK constraints demand the
+   *    version nibble `7` and a variant nibble in `8/9/a/b`; `account_ref` and
+   *    `denomination_asset` are `internal.identifier`, bounded at 200
+   *    characters (`db/migrations/0001_foundation.up.sql`). In TypeScript every
+   *    one of those is `string` — `DecimalString` is an ALIAS of `string`
+   *    (`packages/decimal/src/canonical.ts:59`) — so a NEGATIVE fee, a
+   *    non-version-7 uuid or a 201-character account reference typechecks
+   *    perfectly, reaches the database, and comes back as a runtime
+   *    `UNAVAILABLE` that `loop.ts:1523-1530` escalates to a GLOBAL halt. The
+   *    compiler checks the SHAPE of this statement; only PostgreSQL checks its
+   *    VALUES. The upstream refusals in `packages/pnl` are what keep those
+   *    values canonical, not anything written here.
+   * 2. **A MISSING column is not always a compile error.** Kysely makes a
+   *    nullable or defaulted column OPTIONAL on insert, so deleting
+   *    `instance_id`, `run_id`, `market_id`, `unrealized_pnl_model`,
+   *    `unrealized_pnl_liquidation` or `worst_case_resolution_pnl` from the
+   *    object below would compile and write silent NULLs into a monetary row.
+   *    What forbids that is the TESTS — the emitted statement's column set in
+   *    `test/unit/trader/pnl-snapshot-column-binding.test.ts` and the read-back
+   *    of every column in
+   *    `test/integration/paper-trader/durable-pnl-snapshot-postgres.test.ts` —
+   *    and they are load-bearing for exactly this reason.
+   *
+   * ## What the round trip proves, and what it does not (review R1)
+   *
+   * The Testcontainers file above inserts through THIS class and reads every
+   * column back, so the binding is established against the real schema. It does
+   * NOT establish that the assembled trader survives. This table's `instance_id`,
+   * `run_id` and `market_id` are foreign keys into `strategy.instances`,
+   * `strategy.runs` and `catalog.markets`, and the rows satisfying them are
+   * created by `createTradingChain`, a `@polymarket-bot/storage-postgres/testing`
+   * FIXTURE. **No code in `apps/trader` creates those rows**: this class's three
+   * inserts are `strategy.decisions`, `strategy.state_checkpoints` and
+   * `accounting.pnl_snapshots`, and nothing else in the app writes SQL at all.
+   * Against the migrated-but-unseeded database `main.ts` builds, this method
+   * therefore still fails — `violates foreign key constraint
+   * "pnl_snapshots_instance_id_fkey"`, measured by the adversarial review of
+   * `TRDR-2` round 1 — and `persistDecision` fails earlier still, because
+   * `strategy.decisions.run_id` and `.instance_id` are NOT NULL foreign keys and
+   * `loop.ts:1645-1656` halts on a failed decision write. The missing piece is a
+   * BOOTSTRAP path that registers the market, the instance and the run; it is a
+   * separate closeout blocker and is deliberately not invented here.
    */
   async writePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>> {
     return await this.#contained("write a PnL snapshot", async () => {

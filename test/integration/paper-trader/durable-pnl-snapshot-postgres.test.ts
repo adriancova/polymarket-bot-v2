@@ -23,6 +23,44 @@
  * failure; they hid it. Only a real database can answer whether a column
  * binding is real, so this file uses one.
  *
+ * ## WHAT THIS FILE DOES NOT PROVE (`TRDR-2` r1, review finding R1)
+ *
+ * It proves the COLUMN BINDING. It does **not** prove that the assembled
+ * trader survives, and the difference is a live blocker rather than a caveat.
+ *
+ * `accounting.pnl_snapshots` carries three foreign keys —
+ * `instance_id → strategy.instances`, `run_id → strategy.runs`,
+ * `market_id → catalog.markets` (`db/migrations/0006_accounting.up.sql`). The
+ * rows that satisfy them here are created by `createTradingChain`, a fixture in
+ * `@polymarket-bot/storage-postgres/testing`, which seeds
+ * `catalog.series` → `catalog.markets` → `strategy.definitions` →
+ * `strategy.configs` → `strategy.instances` → `strategy.runs` before the first
+ * write below. **Nothing in `apps/trader/src` ever creates those rows**: the
+ * app's only production inserts are `strategy.decisions`,
+ * `strategy.state_checkpoints` and `accounting.pnl_snapshots`
+ * (`apps/trader/src/adapters/postgres-store.ts:176`, `:225`, `:390`), and the
+ * three parent tables appear in `apps/trader` only in prose.
+ *
+ * So against the database `apps/trader/src/main.ts` actually builds — migrated
+ * and UNSEEDED — this adapter still answers, as the adversarial review of the
+ * first `TRDR-2` round measured with the fixed adapter in place:
+ *
+ * ```
+ * {"ok":false,"failure":{"kind":"UNAVAILABLE","detail":"… violates foreign key
+ *   constraint \"pnl_snapshots_instance_id_fkey\""}}
+ * ```
+ *
+ * which `loop.ts:1523-1530` escalates to the same GLOBAL `STORE_UNAVAILABLE`
+ * halt B1 produced. It is worse for decisions: `strategy.decisions.run_id` and
+ * `.instance_id` are NOT NULL foreign keys and `loop.ts:1645-1656` halts on a
+ * failed `persistDecision`, so an assembled durable trader would halt on its
+ * FIRST DECISION, before any fill. Fixing the column binding was necessary and
+ * is not sufficient; the missing piece is a BOOTSTRAP path that registers the
+ * market, the strategy instance and the run, which no round has built and which
+ * is carried as a separate closeout blocker. Read this file as: the statement
+ * this adapter sends is valid SQL against the real schema, and every value
+ * lands in the column it belongs to.
+ *
  * ## Docker
  *
  * This is the FIRST file in the paper-trader suite that needs Docker
@@ -96,9 +134,14 @@ beforeAll(async () => {
     "trader-pnl-snapshot",
   );
   context = await createMigratedContext(connectionString);
+  // The DATABASE STATE is a fixture's: `createTradingChain` seeds the market,
+  // the strategy instance and the run that this table's three foreign keys
+  // require, and no code in `apps/trader` creates any of them (see "WHAT THIS
+  // FILE DOES NOT PROVE" above).
   chain = await createTradingChain(context, { label: "trdr2", accountRef: ACCOUNT });
-  // The composition root's own construction (`apps/trader/src/main.ts:212`),
-  // on the handle `createDatabase` builds — no test-only wrapper anywhere.
+  // The STORE, by contrast, is the composition root's own construction
+  // (`apps/trader/src/main.ts:212`) on the handle `createDatabase` builds —
+  // no test-only wrapper stands between this suite and the adapter.
   store = new PostgresTraderStore({ db: context.db, decisionContractVersion: 1 });
 }, 300_000);
 
@@ -117,8 +160,20 @@ afterAll(async () => {
  *
  * A buy, a partial sell and a fee give a NON-ZERO realized PnL, a non-zero
  * remaining position and a non-zero fee, and the model and liquidation marks
- * make the two nullable measures non-null — so no two of the twenty columns
- * carry the same value by accident, and a transposed binding cannot pass.
+ * make the two nullable measures non-null — so most of the twenty columns carry
+ * distinct values and a transposition between any two of THOSE cannot pass.
+ *
+ * It does not follow, and the first round of this file wrongly said it did,
+ * that NO transposition can pass: this pipeline makes `coreNetPnl === allInPnl`
+ * (§6 invariant 14 — they differ by REALIZED rewards, which need settlement
+ * evidence no fixture may forge) and `rewardEstimateTotal === realizedRewards`
+ * (both `"0"`), and a swap inside either pair is invisible to every assertion
+ * here. The adversarial review demonstrated it: with
+ * `core_net_pnl: row.allInPnl, all_in_pnl: row.coreNetPnl` planted in the
+ * adapter, this file passed 3/3. That gap is closed in the Docker-free
+ * companion — `test/unit/trader/pnl-snapshot-column-binding.test.ts` binds a
+ * hand-built snapshot of twenty DISTINCT sentinels, where no permutation
+ * survives — and it is closed THERE because it needs no database at all.
  */
 function snapshotAt(asOf: string, marks: Record<string, Record<string, string>>): PnlSnapshot {
   const owner = {
@@ -248,12 +303,15 @@ describe("PostgresTraderStore.writePnlSnapshot against a real PostgreSQL (TRDR-2
       expect(typeof row[column]).not.toBe("number");
     }
 
-    // The measures are genuinely distinct, so the assertions above could not
-    // have been satisfied by a transposed binding of equal values. `allInPnl`
-    // is deliberately NOT in this list: §6 invariant 14 makes it differ from
-    // `coreNetPnl` by REALIZED rewards only, and a realized reward needs
-    // settlement evidence this fixture does not forge — so the two are equal
-    // here by the invariant, and that equality is asserted rather than hidden.
+    // These nine measures are distinct, so a transposition among THEM could not
+    // have satisfied the assertions above. `allInPnl` and `realizedRewards` are
+    // deliberately NOT in this list: §6 invariant 14 makes `allInPnl` differ
+    // from `coreNetPnl` by REALIZED rewards only, and a realized reward needs
+    // settlement evidence this fixture does not forge — so those two pairs are
+    // EQUAL here, and a swap inside either is invisible to this file. The
+    // equality is asserted rather than hidden, and the transposition pin that
+    // does cover the pairs lives in the Docker-free companion (see this file's
+    // `snapshotAt` doc).
     const measures = [
       snapshot.grossTradingPnl,
       snapshot.coreNetPnl,

@@ -3,9 +3,11 @@
  * actually emits.
  *
  * The companion of `test/integration/paper-trader/durable-pnl-snapshot-postgres.test.ts`:
- * that file proves the row LANDS in a real PostgreSQL, this one proves WHICH
- * STATEMENT was sent, without Docker, so the property runs in `pnpm test` on
- * every machine and in every CI step the unit suite reaches.
+ * that file proves the row LANDS in a real PostgreSQL — into a database whose
+ * three parent tables a TEST FIXTURE seeded, which is a caveat stated in full
+ * there — and this one proves WHICH STATEMENT was sent, without Docker, so the
+ * property runs in `pnpm test` on every machine and in every CI step the unit
+ * suite reaches.
  *
  * The defect it pins, measured at `f41fb8d` before the fix: the adapter passed
  * `toPnlSnapshotRow`'s camelCase record to `.values(row as never)`, and since
@@ -38,6 +40,29 @@
  * property here is the statement, and the property there is the round trip.
  * `test/unit/storage-postgres/support/capturing-db.ts` is the precedent for
  * the stand-in, and captures one step earlier (the bound row, not the SQL).
+ *
+ * ## Why a second, synthetic snapshot (`TRDR-2` r1, review finding R2)
+ *
+ * The first round of this file drove every case from the REAL `packages/pnl`
+ * pipeline and claimed that the measures it produces are "mutually distinct, so
+ * a transposed binding could not pass". That claim is FALSE for two pairs, and
+ * the adversarial review measured it: in that fixture
+ * `coreNetPnl === allInPnl` (§6 invariant 14 — they differ by REALIZED rewards
+ * only, and a realized reward needs settlement evidence no unit fixture may
+ * forge) and `rewardEstimateTotal === realizedRewards === "0"`. With
+ * `core_net_pnl: row.allInPnl, all_in_pnl: row.coreNetPnl` planted in the
+ * adapter — a transposition of exactly the pair that invariant exists to keep
+ * apart — EVERY test in the repository passed, this file's five included.
+ * Equal values make a column-to-value zip blind, and the pipeline cannot be
+ * asked to produce unequal ones here.
+ *
+ * So the transposition case below binds a HAND-BUILT `PnlSnapshot` whose twenty
+ * persisted fields are twenty DISTINCT sentinels (`DecimalString` is `string`,
+ * `packages/decimal/src/canonical.ts:59`, so a sentinel needs no cast; `scope`
+ * and `environment` stay legal members of `internal.ledger_scope` and
+ * `internal.run_mode`, because the adapter narrows them by SEARCHING those
+ * lists). Its premise — that the twenty are distinct — is asserted in the test
+ * rather than assumed, and with it any permutation of the binding fails.
  */
 
 import { readFileSync } from "node:fs";
@@ -195,7 +220,51 @@ function snapshot(): PnlSnapshot {
   return value;
 }
 
-async function emitted(): Promise<{
+/**
+ * Twenty DISTINCT sentinel values, one per persisted field — the transposition
+ * probe (review finding R2).
+ *
+ * Not a plausible snapshot and not meant to be: the point is that no two bound
+ * values are equal, so the column-to-value zip refuses EVERY permutation of the
+ * binding, including the two pairs the real pipeline makes equal
+ * (`coreNetPnl`/`allInPnl` and `rewardEstimateTotal`/`realizedRewards`). The
+ * twelve measures are the distinct integers 1-12 IN BINDING ORDER, so a failure
+ * reads as a permutation of `1 … 12` rather than as a wall of decimals.
+ *
+ * `scope` and `environment` are legal members of the columns' enumerations
+ * (`VIRTUAL_STRATEGY`, `PAPER`) because the adapter refuses anything else
+ * before a statement is built — and `PAPER` is the only run mode this
+ * repository operates in. The three §9.16 breakdowns are empty: they have no
+ * columns, `toPnlSnapshotRow` drops them, and this file asserts that the
+ * statement names exactly the twenty.
+ */
+const SENTINELS: PnlSnapshot = {
+  scope: "VIRTUAL_STRATEGY",
+  environment: "PAPER",
+  accountRef: "sentinel-account-ref",
+  instanceId: "018f3a5c-0000-7000-8000-00000000000a",
+  runId: "018f3a5c-0000-7000-8000-00000000000b",
+  marketId: "018f3a5c-0000-7000-8000-00000000000c",
+  denominationAsset: "sentinel-denomination",
+  grossTradingPnl: "1",
+  coreNetPnl: "2",
+  allInPnl: "3",
+  realizedPnl: "4",
+  unrealizedPnlMidpoint: "5",
+  unrealizedPnlModel: "6",
+  unrealizedPnlLiquidation: "7",
+  worstCaseResolutionPnl: "8",
+  feesPaid: "9",
+  rewardEstimateTotal: "10",
+  realizedRewards: "11",
+  capitalCommitted: "12",
+  asOf: "2026-09-02T12:00:00.000001Z",
+  feesByScheduleVersion: {},
+  rewardsByProgram: {},
+  estimatesByProgram: {},
+};
+
+async function emitted(source: PnlSnapshot = snapshot()): Promise<{
   readonly result: string;
   readonly sql: string;
   readonly parameters: readonly unknown[];
@@ -206,7 +275,6 @@ async function emitted(): Promise<{
     db: createDatabase(capture.pool),
     decisionContractVersion: 1,
   });
-  const source = snapshot();
   const outcome = await store.writePnlSnapshot(source);
   const statement = capture.statements[0];
   return {
@@ -248,8 +316,11 @@ describe("writePnlSnapshot emits an INSERT naming the table's own columns (TRDR-
   it("binds each column the snapshot field it belongs to", async () => {
     const { sql, parameters, source } = await emitted();
     // COLUMN-to-VALUE pairs, not merely the value order: each identifier is
-    // zipped with the parameter it carries, so neither a camelCase identifier
-    // (B1) nor two same-typed fields swapped can satisfy this.
+    // zipped with the parameter it carries, so a camelCase identifier (B1)
+    // cannot satisfy it. It catches a TRANSPOSITION only between two fields
+    // this pipeline gives DIFFERENT values — `coreNetPnl` and `allInPnl` are
+    // equal here by §6 invariant 14, and the next case is the one that covers
+    // them.
     const columns = quotedIdentifiers(sql).filter(
       (identifier) => identifier !== "accounting" && identifier !== "pnl_snapshots",
     );
@@ -258,6 +329,31 @@ describe("writePnlSnapshot emits an INSERT naming the table's own columns (TRDR-
     );
     // Not all-null and not all-equal: the assertion above has content.
     expect(new Set(parameters).size).toBeGreaterThan(10);
+  });
+
+  it("binds twenty DISTINCT sentinels, so NO transposition of the twenty can pass", async () => {
+    // The premise, asserted rather than assumed: if two sentinels were ever
+    // made equal, this case would go as blind as the one above and the failure
+    // would be silent.
+    const expected = BINDING.map(([, field]) => SENTINELS[field]);
+    expect(new Set(expected).size).toBe(BINDING.length);
+
+    const { result, sql, parameters } = await emitted(SENTINELS);
+    expect(result).toBe("ok");
+
+    const columns = quotedIdentifiers(sql).filter(
+      (identifier) => identifier !== "accounting" && identifier !== "pnl_snapshots",
+    );
+    // Every column carries ITS OWN field. Because the twenty values are
+    // pairwise distinct, this holds if and only if the binding is the identity
+    // — a swap of ANY two fields, same-typed or not, moves a sentinel.
+    expect(columns.map((column, index) => [column, parameters[index]])).toEqual(
+      BINDING.map(([column, field]) => [column, SENTINELS[field]]),
+    );
+    // Stated once more as the property itself, so the reason this case exists
+    // survives a future rewrite of the zip: the parameters are a set of twenty.
+    expect(new Set(parameters).size).toBe(BINDING.length);
+    expect([...parameters].sort()).toEqual([...expected].sort());
   });
 
   it("binds every column of the table except the three the database owns", async () => {
