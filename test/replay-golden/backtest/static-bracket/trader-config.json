@@ -1,0 +1,210 @@
+{
+  "environment": "PAPER",
+  "riskPolicy": {
+    "freshness": {
+      "venueBookMaxAgeMs": 600000,
+      "referenceFeedMaxAgeMs": 600000,
+      "featuresMaxAgeMs": 600000
+    },
+    "limits": {
+      "maxWorstCaseContractualLoss": "1000"
+    },
+    "scenario": {
+      "maxScenarioLoss": "1000"
+    },
+    "economics": {},
+    "participation": {},
+    "rateLimit": {
+      "safetyReserveRequests": 0
+    },
+    "timeToClose": {
+      "entryCutoffSeconds": 30
+    }
+  },
+  "allocatorCaps": {
+    "globalAccountCap": "10000",
+    "perStrategyCap": "1000",
+    "liveMicroMaxOrderNotional": "0",
+    "liveMicroMaxAccountExposure": "0"
+  },
+  "accounting": {
+    "accountRef": "backtest1-replay-account",
+    "denominationAssetId": "pUSD",
+    "venueClearingRef": "backtest1-venue-clearing",
+    "attributionClearingRef": "backtest1-attribution-clearing",
+    "feeExpenseRef": "backtest1-fee-expense",
+    "startingCash": "1000"
+  },
+  "queues": {
+    "ingestMaximumDepth": 1024,
+    "outboxMaximumDepth": 1024
+  },
+  "features": {
+    "depthLevels": [
+      1,
+      2,
+      5
+    ],
+    "executableShares": [
+      "50"
+    ],
+    "tradeWindowMs": 60000,
+    "ewmaLambda": "0.94",
+    "primaryReferenceVenue": "binance"
+  },
+  "planning": {
+    "maxSliceShares": "100",
+    "marketableSlippageTicks": 2,
+    "replaceThresholdTicks": 1,
+    "minimumReplaceIntervalMs": 500,
+    "cancelDeadlineMs": 5000,
+    "maxPlanLifetimeMs": 30000
+  },
+  "simulation": {
+    "fillModelVersion": "tier0.backtest1",
+    "fillModelParametersHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "feeSchedule": {
+      "snapshotVersion": "backtest1.sim.2026-05-01",
+      "takerFeeRate": "0.0195",
+      "makerFeeRate": "0",
+      "roundingDecimalPlaces": 3,
+      "roundingMode": "HALF_UP",
+      "minimumChargedFee": "0",
+      "feeCurrency": "pUSD"
+    },
+    "startingCash": "1000"
+  },
+  "requestBudget": {
+    "capacity": 100,
+    "windowMs": 60000
+  },
+  "scenarios": [
+    {
+      "scenarioId": "spot.down",
+      "kind": "SPOT",
+      "yesPriceShock": "-0.1"
+    },
+    {
+      "scenarioId": "vol.up",
+      "kind": "VOLATILITY",
+      "yesPriceShock": "-0.05"
+    },
+    {
+      "scenarioId": "time.decay",
+      "kind": "TIME",
+      "yesPriceShock": "-0.02"
+    },
+    {
+      "scenarioId": "liq.thin",
+      "kind": "LIQUIDITY",
+      "yesPriceShock": "-0.03"
+    }
+  ],
+  "infrastructure": {
+    "eventStream": "polymarket.normalized",
+    "consumerId": "backtest1-replay",
+    "receiveBatchSize": 128,
+    "retentionMaxEvents": 100000
+  },
+  "markets": [
+    {
+      "marketId": "019b1e00-0000-7000-8000-000000000001",
+      "conditionId": "0xbacktest1condition",
+      "yesTokenId": "9101",
+      "noTokenId": "9102",
+      "tickSize": "0.01",
+      "minimumOrderSize": "5",
+      "makerFeeRate": "0",
+      "takerFeeRate": "0.0195",
+      "parametersVersion": 1,
+      "settlementReadiness": {
+        "modelDependentActivationAllowed": true
+      },
+      "openTime": "2026-05-01T09:00:00.000Z",
+      "closeTime": "2026-05-01T09:15:00.000Z",
+      "seriesKey": "backtest1-replay-sim",
+      "underlyingKey": "SIMBTC",
+      "resolutionWindowKey": "w2026-05-01T09.15"
+    }
+  ],
+  "instances": [
+    {
+      "instanceId": "019b1e00-0000-7000-8000-000000000002",
+      "runId": "019b1e00-0000-7000-8000-000000000003",
+      "configId": "019b1e00-0000-7000-8000-000000000004",
+      "runSeed": "250250",
+      "marketId": "019b1e00-0000-7000-8000-000000000001",
+      "ownership": "OWNER",
+      "evaluationPriority": 0,
+      "evaluationBudgetUs": 5000000,
+      "params": {
+        "strategy": "static-bracket",
+        "version": 1,
+        "market_selector": {
+          "series_id": "backtest1-replay-sim",
+          "direction": "YES"
+        },
+        "entry": {
+          "trigger_basis": "executable_ask",
+          "trigger_feature_key": "polymarket.executable_buy_price@50",
+          "trigger_price_lte": "0.35",
+          "size_shares": "50",
+          "maximum_total_cost": "18",
+          "economic_leg_policy": "DIRECT_ONLY",
+          "execution": {
+            "liquidity_preference": "TAKER_OK",
+            "passive_price": "0.34",
+            "convert_to_aggressive_after_ms": 0,
+            "maximum_buy_price": "0.35",
+            "immediate_order_type": "FAK",
+            "partial_fill_policy": "ACCEPT_ANY",
+            "minimum_fill_shares": "10",
+            "submission_unknown_after_ms": 5000,
+            "order_validity_ms": 30000
+          },
+          "economics": {
+            "entry_fee_per_share": "0.001",
+            "exit_fee_per_share": "0.001",
+            "minimum_expected_net_edge": "1"
+          }
+        },
+        "exit": {
+          "take_profit": {
+            "price": "0.5",
+            "liquidity_preference": "MAKER_ONLY",
+            "post_only": true
+          },
+          "stop": {
+            "enabled": true,
+            "trigger_basis": "executable_bid",
+            "trigger_feature_key": "polymarket.executable_sell_price@50",
+            "trigger_price_lte": "0.27",
+            "minimum_sell_price": "0.26",
+            "urgency": "AGGRESSIVE"
+          },
+          "maximum_holding_seconds": 180,
+          "entry_cutoff_before_close_seconds": 45,
+          "exit_cutoff_before_close_seconds": 20,
+          "final_policy": "PROTECTED_REDUCE",
+          "allow_resolution_hold": false
+        },
+        "reentry": {
+          "maximum_entries_per_market": 1,
+          "cooldown_seconds": 30
+        },
+        "risk": {
+          "maximum_position_shares": "50",
+          "maximum_contractual_loss": "18",
+          "maximum_slippage": "1",
+          "maximum_book_participation": "0.9"
+        },
+        "data_quality": {
+          "maximum_book_age_ms": 600000,
+          "incident_feature_key": "quality.active_incidents@any",
+          "on_stale_book": "PAUSE_AND_CANCEL",
+          "on_incident": "PAUSE_AND_CANCEL"
+        }
+      }
+    }
+  ]
+}

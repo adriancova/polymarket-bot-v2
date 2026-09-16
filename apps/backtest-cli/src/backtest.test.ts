@@ -16,13 +16,14 @@
 
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { writeParquetObject, type DatasetRow } from "@polymarket-bot/storage-parquet";
 import { describe, expect, it } from "vitest";
 
 import { readManifestBytes, resolveWithinRoot, sha256Hex } from "./archive.js";
-import { EXIT_REFUSED, EXIT_USAGE, main, parseArguments } from "./main.js";
+import { EXIT_REFUSED, EXIT_USAGE, main, normalizerFor, parseArguments } from "./main.js";
 import {
   RECORDED_FRAME_NORMALIZER_VERSION,
   recordedFrameNormalizer,
@@ -403,5 +404,36 @@ describe("the CLI argument surface", () => {
     });
     expect(code).toBe(EXIT_REFUSED);
     expect(errors.join("\n")).toContain("duplicate object key");
+  });
+
+  it("selects the shipped normalizer the pins name: verify over the committed BACKTEST-1 fixture (no core)", async () => {
+    // The executable drives NO core (`run.ts` header): over the
+    // normalized-stream recording it verifies, replays and reports a
+    // venue-free run — eight envelopes delivered, zero fills — which is the
+    // measured shape of every replay at base 1aa2238. The core-driven run over
+    // the SAME fixture is `test/unit/simulation/backtest-static-bracket-replay.test.ts`.
+    const fixture = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../../test/replay-golden/backtest/static-bracket",
+    );
+    const output: string[] = [];
+    const code = await main({
+      argv: ["verify", "--dataset", fixture, "--pins", join(fixture, "run-pins.json")],
+      environment: {},
+      out: (line) => output.push(line),
+      err: (line) => output.push(line),
+    });
+    const rendered = output.join("\n");
+    expect(rendered, rendered).toContain("run_mode=BACKTEST");
+    expect(rendered).toContain("events_delivered=8");
+    expect(rendered).toContain("pins normalizer=backtest-cli/normalized-envelope/v1");
+    expect(rendered).toContain("fills=0");
+    expect(rendered).not.toMatch(/^order /mu);
+    expect(code).toBe(0);
+    // A pin set naming a version this executable does not ship still falls to
+    // the passthrough, and the pin door refuses the disagreement by name.
+    expect(normalizerFor({ ...pins(), normalizerVersion: "someone-else/v9" }).normalizerVersion).toBe(
+      RECORDED_FRAME_NORMALIZER_VERSION,
+    );
   });
 });

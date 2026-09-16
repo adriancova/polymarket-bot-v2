@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Backtest CLI (WP-210): verifies a WP-130 dataset against its manifest and replays it deterministically through the simulation package. BACKTEST mode, simulated venue, no credential, no venue connection, no signer, no order.",
+  "description": "Backtest CLI (WP-210, BACKTEST-1): verifies a WP-130 dataset against its manifest, replays it deterministically through the simulation package, and drives the shared paper core through the replay hook. BACKTEST mode, simulated venue, no credential, no venue connection, no signer, no order.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
@@ -14,7 +14,9 @@
     "start": "pnpm run typecheck && pnpm run build && node ./dist/main.mjs"
   },
   "dependencies": {
+    "@polymarket-bot/domain": "workspace:*",
     "@polymarket-bot/polymarket-public": "workspace:*",
+    "@polymarket-bot/risk": "workspace:*",
     "@polymarket-bot/simulation": "workspace:*",
     "@polymarket-bot/storage-parquet": "workspace:*"
   },

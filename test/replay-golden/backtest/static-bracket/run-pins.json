@@ -1,0 +1,13 @@
+{
+  "normalizerVersion": "backtest-cli/normalized-envelope/v1",
+  "featureSetVersion": "features-v1",
+  "runSeed": "250250",
+  "fillModelVersion": "tier0.backtest1",
+  "fillModelParametersHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "latencyModelVersion": "sim/latency/immediate/v1",
+  "latencyModelParametersHash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "feeSnapshotVersion": "backtest1.sim.2026-05-01",
+  "rewardSnapshotVersion": "rewards/none",
+  "settlementSpecVersions": [],
+  "simulatorVersion": "wp-210/v1"
+}

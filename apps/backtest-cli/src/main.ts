@@ -16,18 +16,49 @@
  *
  * `verify` reads the dataset manifest, verifies every pinned object's checksum,
  * reconciles the dispatch ordinals, counts and exclusions against the manifest's
- * own numbers, replays every recorded frame through the verification-only
- * normalizer, and prints the §12.4 canonical serialization.
+ * own numbers, replays every recorded frame through the normalizer the run
+ * pins name ({@link normalizerFor}), and prints the §12.4 canonical
+ * serialization. It drives NO core: this executable cannot construct the
+ * shared paper core (`run.ts`'s header says why), so `verify` is exactly that
+ * — verification and the venue-free replay — over any dataset, including the
+ * normalized-stream recording `test/replay-golden/backtest/static-bracket/`.
  */
 
 import { readFile } from "node:fs/promises";
 import process from "node:process";
 
-import { parseStrictJsonBytes, readRunPins, type ReplayRunPins } from "@polymarket-bot/simulation";
+import {
+  parseStrictJsonBytes,
+  readRunPins,
+  type ReplayNormalizer,
+  type ReplayRunPins,
+} from "@polymarket-bot/simulation";
 
 import { sha256Hex } from "./archive.js";
-import { recordedFrameNormalizer } from "./normalizer.js";
+import {
+  NORMALIZED_ENVELOPE_NORMALIZER_VERSION,
+  normalizedEnvelopeNormalizer,
+  recordedFrameNormalizer,
+} from "./normalizer.js";
 import { renderBacktestOutcome, runBacktest } from "./run.js";
+
+/**
+ * The shipped normalizer the run pins name, or the verification-only one.
+ *
+ * The pin is what a dataset and a run agree on (§6 invariant 9), and the
+ * replay's pin door refuses a disagreement by name — so an unrecognised
+ * version is NOT an error here: it falls to the passthrough, whose own
+ * version then fails the pin reconciliation with both values printed, which
+ * is the base-`1aa2238` behaviour for every dataset that pins something
+ * else. `polymarketMarketNormalizer` is not selectable from the executable
+ * because it needs a market directory this command has no option for.
+ */
+export function normalizerFor(pins: ReplayRunPins): ReplayNormalizer {
+  if (pins.normalizerVersion === NORMALIZED_ENVELOPE_NORMALIZER_VERSION) {
+    return normalizedEnvelopeNormalizer(sha256Hex);
+  }
+  return recordedFrameNormalizer(sha256Hex);
+}
 
 /** Exit codes, so an operator's script can branch. */
 export const EXIT_OK = 0;
@@ -102,7 +133,7 @@ export async function main(input: {
 
   const outcome = await runBacktest({
     datasetDirectory,
-    normalizer: recordedFrameNormalizer(sha256Hex),
+    normalizer: normalizerFor(pins),
     runPins: pins,
     environment: input.environment,
   });
