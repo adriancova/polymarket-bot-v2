@@ -18,14 +18,15 @@
  *
  * ## The risk-refusal counts are the risk-seam caveat made visible
  *
- * `WP-220`'s accepted residual: every exit the static-bracket strategy emits is
- * a `POSITION` intent, and `packages/risk` derives its disposition from the
- * intent TYPE alone, so a protective reduction is classified `ENTRY`. Under the
- * default `economics.requirePositiveNetEdgeForEntries` it is then refused for
- * want of an `expectedNetEdge` — and inside the entry cutoff, and on a
- * `CLOSE_ONLY` market. That is the accepted posture (a refused exit, never a
- * wrong order) until the risk-side follow-up lands, and this process must NOT
- * weaken risk policy, re-tag the intent or bypass the engine to compensate.
+ * This section used to open: "`WP-220`'s accepted residual: every exit the
+ * static-bracket strategy emits is a `POSITION` intent, and `packages/risk`
+ * derives its disposition from the intent TYPE alone, so a protective
+ * reduction is classified `ENTRY` … That is the accepted posture … until the
+ * risk-side follow-up lands" — and that follow-up landed as `RISK-2`
+ * (`133eac1`), so the sentence is superseded: the current caveat, what it
+ * says and why, is {@link RISK_SEAM_CAVEAT} below. What has not changed is the
+ * rule: this process must NOT weaken risk policy, re-tag the intent or bypass
+ * the engine to compensate for anything the seam does.
  *
  * What it CAN do — and does — is refuse to let the consequence be invisible.
  * `refusedExits` counts refusals of intents the emitting strategy tagged as
@@ -54,16 +55,28 @@ import type { ReservationMetrics } from "./reservations.js";
  * It is a constant rather than prose in a comment because an operator reading
  * the health surface is exactly the person who needs it, and a caveat that only
  * exists in a README is a caveat nobody reads during an incident.
+ *
+ * CORRECTED by `BOOT-1` (`RISK-2` residual R2). Until then this constant
+ * shipped, on every `HealthSnapshot.riskSeamCaveat` and through the control
+ * API, the text quoted in its first sentence below — a statement `RISK-2`
+ * (`133eac1`) made false. The superseded wording is kept inside the constant,
+ * quoted, so an operator who saw the old caveat can recognise what changed.
  */
 export const RISK_SEAM_CAVEAT =
-  "WP-220 accepted residual: every exit the static-bracket strategy emits is a §7.7 POSITION " +
-  "intent, and packages/risk derives the disposition from the intent TYPE alone, so a " +
-  "protective reduction is classified ENTRY. Protective reductions are therefore refused " +
-  "inside the entry cutoff, on CLOSE_ONLY markets, with the entry-shaped staleness code, and " +
-  "— under the default requirePositiveNetEdgeForEntries — for want of expectedNetEdge. This " +
-  "is fail-closed (a refused exit, never a wrong order) and is the ACCEPTED posture until the " +
-  "risk-side follow-up lands. The trader does not weaken risk policy, re-tag intents or " +
-  "bypass the engine to compensate; it counts the refusals here.";
+  'SUPERSEDED (RISK-2, 133eac1): this caveat used to read "WP-220 accepted residual: every ' +
+  "exit the static-bracket strategy emits is a §7.7 POSITION intent, and packages/risk derives " +
+  "the disposition from the intent TYPE alone, so a protective reduction is classified ENTRY. " +
+  'Protective reductions are therefore refused …" — that is no longer true: packages/risk ' +
+  "decides disposition from the intent SHAPE and the supplied portfolio, never from a tag — " +
+  "a POSITION resolving to a SELL fully covered by the instance's confirmed holding is an " +
+  "EXIT and clears the seam; anything with a BUY leg, an over-held sell and every QUOTE/BASKET " +
+  "stays ENTRY — so refusedExits reads 0 in a healthy run. THE CAVEAT NOW: RISK-2 residual 5 — " +
+  "planProtectedReduce creates no order track, so when the instance's own exit FILLS the " +
+  "strategy cannot attribute it (SB.UNATTRIBUTED_FILL → SB.POSITION_MISMATCH → " +
+  "SB.NO_BLIND_FLATTEN → SB.PAUSED) and the instance ends PAUSED after its round trip; the " +
+  "money is right and the pause is strictly after the exit is booked, but a paused instance " +
+  "opens no second bracket. The trader does not weaken risk policy, re-tag intents or bypass " +
+  "the engine to compensate; it counts refusals here.";
 
 /** Counters for the §14.3 `risk` family plus the seam's own visibility. */
 export interface RiskHealth {

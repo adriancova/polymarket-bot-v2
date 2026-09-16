@@ -145,5 +145,7 @@ describe("the process entry point's execution policy", () => {
     expect(EXIT_CODES.unsafeEnvironment).toBe(78);
     expect(EXIT_CODES.configurationRefused).toBe(78);
     expect(EXIT_CODES.halted).toBe(75);
+    // `BOOT-1`: the database could not answer the registration check.
+    expect(EXIT_CODES.infrastructureUnavailable).toBe(69);
   });
 });

@@ -51,6 +51,8 @@ import {
 import { ManualClock, MemoryEventFeed, MemoryTraderStore } from "@polymarket-bot/trader/testing";
 
 export const MARKET_ID = "018f4a7e-1111-7abc-8def-0123456789ab";
+/** The fixture market's venue condition id, as the configuration and the events state it. */
+export const CONDITION_ID = "0xcondition";
 export const YES_TOKEN = "111";
 export const NO_TOKEN = "222";
 export const INSTANCE_ID = "a18f4a7e-2222-7abc-8def-0123456789ab";
@@ -225,7 +227,7 @@ export function traderConfig(overrides: Record<string, unknown> = {}): Record<st
     markets: [
       {
         marketId: MARKET_ID,
-        conditionId: "0xcondition",
+        conditionId: CONDITION_ID,
         yesTokenId: YES_TOKEN,
         noTokenId: NO_TOKEN,
         tickSize: "0.01",
@@ -315,8 +317,19 @@ export function resetEventIds(): void {
  * buy price for 50 shares at exactly `0.34` — under the configured `0.35`
  * trigger — so the Static Bracket's entry fires on the snapshot's own
  * evaluation.
+ *
+ * `marketId` and `conditionId` default to the fixture's constants. `BOOT-1`'s
+ * Testcontainers file passes the identity `catalog.markets` MINTED for the
+ * registered market AND the condition id it was registered under, because the
+ * durable trader's configuration must name a row that exists rather than a
+ * constant — the same six events, addressed to that market. (Review R10: the
+ * first round threaded only the market id, so `MarketOpened` still said
+ * `"0xcondition"` while the registered market carried `0xcondition-first-fill`.)
  */
-export function recordedEvents(): readonly IngestedEvent[] {
+export function recordedEvents(
+  marketId: string = MARKET_ID,
+  conditionId: string = CONDITION_ID,
+): readonly IngestedEvent[] {
   resetEventIds();
   return Object.freeze([
     ingested(
@@ -331,13 +344,13 @@ export function recordedEvents(): readonly IngestedEvent[] {
     ),
     ingested(
       "MarketOpened",
-      { internalMarketId: MARKET_ID, conditionId: "0xcondition", openedAt: T_OPEN },
+      { internalMarketId: marketId, conditionId, openedAt: T_OPEN },
       { receivedAt: "2026-03-04T12:00:00.000Z", ingestSeq: 3 },
     ),
     ingested(
       "BookSnapshot",
       {
-        internalMarketId: MARKET_ID,
+        internalMarketId: marketId,
         tokenId: YES_TOKEN,
         bids: [
           { price: "0.32", size: "200" },
@@ -353,7 +366,7 @@ export function recordedEvents(): readonly IngestedEvent[] {
     ingested(
       "BookSnapshot",
       {
-        internalMarketId: MARKET_ID,
+        internalMarketId: marketId,
         tokenId: NO_TOKEN,
         bids: [{ price: "0.65", size: "200" }],
         asks: [{ price: "0.66", size: "200" }],
@@ -363,7 +376,7 @@ export function recordedEvents(): readonly IngestedEvent[] {
     ingested(
       "BookLevelChanged",
       {
-        internalMarketId: MARKET_ID,
+        internalMarketId: marketId,
         tokenId: YES_TOKEN,
         side: "ASK",
         price: "0.34",
@@ -544,7 +557,7 @@ export function twoMarketEvents(): readonly IngestedEvent[] {
   ): readonly IngestedEvent[] => [
     ingested(
       "MarketOpened",
-      { internalMarketId: marketId, conditionId: "0xcondition", openedAt: T_OPEN },
+      { internalMarketId: marketId, conditionId: CONDITION_ID, openedAt: T_OPEN },
       { receivedAt: (next(), at()), ingestSeq: seq },
     ),
     ingested(

@@ -12,8 +12,10 @@
  * ```text
  * 1. checkPaperTraderSafety(env)        ← §6 invariant 17, §15, ADR-010
  * 2. read and parse the configuration    ← ADR-020 D1-D4
- * 3. construct the infrastructure        ← Redis, PostgreSQL, the simulated venue
- * 4. createPaperTrader(...)              ← the composition root
+ * 3. construct the infrastructure        ← Redis, PostgreSQL
+ * 3b. verifyRegisteredRows(db, config)   ← BOOT-1: the rows every durable write references
+ * 4. the simulated venue, then
+ *    createPaperTrader(...)              ← the composition root
  * 5. pump                                ← §8.1's outer loop
  * ```
  *
@@ -22,6 +24,26 @@
  * invariant 17 says "startup validation rejects this configuration", and a
  * process that had already connected to something would have moved before the
  * validation it is subject to.
+ *
+ * ## Step 3b, and why the process refuses rather than registers (`BOOT-1`, B9)
+ *
+ * Steps 3b and 4 are {@link assembleDurableTrader}, which `startup` calls and
+ * which the Testcontainers acceptance test
+ * (`test/integration/paper-trader/durable-trader-first-fill-postgres.test.ts`)
+ * calls with a real database — the factoring exists because `startup()` as
+ * written pumps until a halt and needs a Redis stream, so a test that must
+ * regain control after a fill cannot invoke it as-is. Everything from the
+ * durable store to the wired trader is the SAME function on both paths.
+ *
+ * Before `BOOT-1` this file built the pool and the store and nothing else, and
+ * the assembled trader GLOBAL-halted on its first decision against the
+ * migrated-but-unseeded database it had just connected to:
+ * `strategy.decisions.run_id` is a NOT NULL foreign key into a table nothing in
+ * this app writes. The check reads the `catalog.markets`, `strategy.instances`
+ * and `strategy.runs` rows the configuration names and REFUSES TO START if any
+ * is absent or disagrees with the configuration; it creates none of them, for
+ * the per-table reasons set out in `adapters/postgres-registration.ts`. The
+ * refusal is a logged list and an exit code, never a degraded start.
  *
  * ## The two-phase venue wiring, and why it is not a smell
  *
@@ -61,9 +83,11 @@ import {
 } from "@polymarket-bot/simulation";
 import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
 
+import { verifyRegisteredRows } from "./adapters/postgres-registration.js";
 import { PostgresTraderStore } from "./adapters/postgres-store.js";
 import { RedisMarketEventFeed } from "./adapters/redis-feed.js";
 import { parseTraderConfig, type TraderConfig } from "./config.js";
+import type { Clock } from "./ports.js";
 import { pump } from "./pump.js";
 import { checkPaperTraderSafety } from "./safety.js";
 import { createPaperTrader, type PaperTrader } from "./trader.js";
@@ -77,6 +101,15 @@ export const EXIT_CODES = Object.freeze({
   configurationRefused: 78,
   /** A halt latched: no further trading decision will be made (§4.2). */
   halted: 75,
+  /**
+   * The database could not answer the startup registration check (`BOOT-1`).
+   *
+   * `sysexits` EX_UNAVAILABLE. Distinct from `configurationRefused` because
+   * the operator's remedy differs — nothing in the document is wrong, the
+   * store is unreachable — and distinct from `halted` because no halt latched:
+   * the process never started.
+   */
+  infrastructureUnavailable: 69,
 });
 
 export interface StartupPorts {
@@ -208,12 +241,145 @@ export async function startup(ports: StartupPorts): Promise<number> {
     connection: { url: redisUrl },
     retention: { maxEvents: config.infrastructure.retentionMaxEvents },
   });
-  const database = createDatabase(createPostgresPool({ connectionString: postgresUrl }));
+
+  // --- 3b + 4. the durable store, the registration check, the venue, the root
+  const assembled = await assembleDurableTrader({
+    env: ports.env,
+    config,
+    document: configured.document,
+    postgresUrl,
+    clock: new SystemPaperClock(),
+    log: ports.log,
+  });
+  if (!assembled.ok) {
+    await transport.close();
+    return assembled.code;
+  }
+  const { store, trader } = assembled;
+
+  // --- 5. the pump ----------------------------------------------------------
+  const subscription = await transport.subscribe({
+    stream: config.infrastructure.eventStream,
+    consumerId: config.infrastructure.consumerId,
+  });
+  const feed = new RedisMarketEventFeed({
+    subscription,
+    maxEvents: config.infrastructure.receiveBatchSize,
+  });
+
+  const result = await pump({
+    loop: trader.loop,
+    feed,
+    halts: trader.halts,
+    maxPolls: Number.MAX_SAFE_INTEGER,
+  });
+
+  const health = trader.loop.health();
+  ports.log(`pump stopped: ${result.stopped} after ${String(result.polls)} poll(s)`);
+  for (const halt of health.halts) {
+    ports.log(`HALT ${halt.scope.kind} ${halt.code} (${halt.action}): ${halt.detail}`);
+  }
+  ports.log(`health: ${JSON.stringify(health)}`);
+
+  await feed.close();
+  await store.close();
+  await transport.close();
+  return result.stopped === "HALTED" ? EXIT_CODES.halted : EXIT_CODES.ok;
+}
+
+export interface DurableTraderOptions {
+  readonly env: Readonly<Record<string, string | undefined>>;
+  /** The configuration, already through its door (`readConfiguration`). */
+  readonly config: TraderConfig;
+  /** The same configuration, unparsed — `createPaperTrader` runs the door itself. */
+  readonly document: unknown;
+  /** `DATABASE_URL`. The pool is built here, exactly as the process builds it. */
+  readonly postgresUrl: string;
+  /** The §12.1 clock: {@link SystemPaperClock} for the process, a port for a test. */
+  readonly clock: Clock;
+  readonly log: (line: string) => void;
+}
+
+export type DurableTraderResult =
+  | {
+      readonly ok: true;
+      readonly trader: PaperTrader;
+      /** The store the trader writes through. The caller closes it. */
+      readonly store: PostgresTraderStore;
+    }
+  | { readonly ok: false; readonly code: number };
+
+/**
+ * Steps 3b and 4 of the startup sequence: the durable store, the `BOOT-1`
+ * registration check, the simulated venue and the composition root. Never
+ * throws; a refusal is a logged list and an {@link EXIT_CODES} value.
+ *
+ * Called by {@link startup} with the process's clock and by the Testcontainers
+ * acceptance test with a real database, so the path a test proves survives
+ * its first fill is the path the process runs (see the module header).
+ *
+ * OWNERSHIP. This function opens the database handle from `postgresUrl` and
+ * hands it back inside `store` on success; on a refusal it closes what it
+ * opened before returning, so a caller that receives `ok: false` holds nothing.
+ *
+ * THE ORDER IS THE POINT. The safety posture is checked FIRST, in this
+ * function, before a pool exists — not only in `startup`. The first round of
+ * `BOOT-1` relied on `startup()` having run `checkPaperTraderSafety` before
+ * calling here, and the adversarial review (R4) measured what that was worth
+ * for the EXPORTED seam: with `MAX_RUN_MODE=LIVE, RUN_MODE=LIVE,
+ * ALLOW_REAL_ORDERS=true` against an unseeded database, this function logged
+ * `TRADER_REGISTRATION_MISSING` — the `select`s had run — rather than refusing
+ * the environment. The module header's own principle ("a process that had
+ * already connected to something would have moved before the validation it is
+ * subject to") therefore applies to every caller of this function, and the
+ * check is pure and cheap, so it runs here too; `createPaperTrader` runs it a
+ * third time on the same record. Then the registration check runs BEFORE the
+ * venue and the trader exist — nothing that could write has been constructed
+ * when the database is asked whether the writes would land.
+ */
+export async function assembleDurableTrader(
+  options: DurableTraderOptions,
+): Promise<DurableTraderResult> {
+  const { config, log } = options;
+
+  // --- 1 (again). SAFETY, before a pool exists (BOOT-1 r1, review R4) ------
+  const safety = checkPaperTraderSafety(options.env);
+  if (!safety.ok) {
+    log(
+      "REFUSING TO START: TRADER_UNSAFE_ENVIRONMENT: the environment is not safe for a PAPER " +
+        "trader (§6 invariant 17, §15, ADR-010 §1); no database connection was attempted " +
+        "and no row was read",
+    );
+    for (const violation of safety.violations) log(`  ${violation.code}: ${violation.detail}`);
+    return { ok: false, code: EXIT_CODES.unsafeEnvironment };
+  }
+
+  const database = createDatabase(createPostgresPool({ connectionString: options.postgresUrl }));
   const store = new PostgresTraderStore({
     db: database,
     // §7.5's contract version, as `strategy.definitions` pins it.
     decisionContractVersion: 1,
   });
+
+  // --- 3b. the registration check (BOOT-1) ---------------------------------
+  const registered = await verifyRegisteredRows(database, config);
+  if (!registered.ok) {
+    log(`REFUSING TO START: ${registered.refusal.code}: ${registered.refusal.detail}`);
+    for (const issue of registered.refusal.issues) log(`  ${issue}`);
+    await store.close();
+    return {
+      ok: false,
+      code:
+        registered.refusal.code === "TRADER_REGISTRATION_UNREADABLE"
+          ? EXIT_CODES.infrastructureUnavailable
+          : EXIT_CODES.configurationRefused,
+    };
+  }
+  log(
+    `registration: OK — ${String(config.markets.length)} market(s), ` +
+      `${String(config.instances.length)} instance(s) and their run(s) exist and agree with ` +
+      "the configuration",
+  );
 
   const fees = readFeeScheduleSnapshot({
     snapshotVersion: config.simulation.feeSchedule.snapshotVersion,
@@ -225,12 +391,13 @@ export async function startup(ports: StartupPorts): Promise<number> {
     feeCurrency: config.simulation.feeSchedule.feeCurrency,
   });
   if (!fees.ok) {
-    ports.log(
+    log(
       `REFUSING TO START: the configured fee snapshot was refused by the simulator ` +
         `(${fees.refusal.code}: ${fees.refusal.message}); a run without a valid fee snapshot ` +
         "cannot charge a fee (§6 invariant 9)",
     );
-    return EXIT_CODES.configurationRefused;
+    await store.close();
+    return { ok: false, code: EXIT_CODES.configurationRefused };
   }
 
   // The holder the venue's policy reads. Filled the instant the trader exists;
@@ -238,9 +405,8 @@ export async function startup(ports: StartupPorts): Promise<number> {
   // itself.
   const wiring: VenueWiring = { trader: undefined };
 
-  const clock = new SystemPaperClock();
   const venue = new SimulatedVenue({
-    clock,
+    clock: options.clock,
     runMode: "PAPER",
     model: tier0Model({
       fillModelVersion: config.simulation.fillModelVersion,
@@ -252,7 +418,7 @@ export async function startup(ports: StartupPorts): Promise<number> {
         "not exist yet. The trader's own §9.8 check-19 headroom is measured against the " +
         "operator-stated requestBudget and is NOT the venue's published bucket.",
     ),
-    policy: createExecutionPolicy(wiring, ports.log),
+    policy: createExecutionPolicy(wiring, log),
     startingCash: config.simulation.startingCash,
     books: {
       book(input): BookView | undefined {
@@ -285,57 +451,33 @@ export async function startup(ports: StartupPorts): Promise<number> {
   });
 
   // --- 4. the composition root ---------------------------------------------
+  // `venue` is handed over UNCAST (`BOOT-1`): `TRDR-2` measured that
+  // `SimulatedVenue` satisfies the `TraderVenue` port as written, and registered
+  // the `as unknown as` this line used to carry only because `main.ts` was
+  // outside its grant. The compiler now checks the seam, so the first drift
+  // between the venue and the port is a typecheck failure rather than silence.
   const created = createPaperTrader({
-    env: ports.env,
-    config: configured.document,
-    clock,
-    venue: venue as unknown as Parameters<typeof createPaperTrader>[0]["venue"],
+    env: options.env,
+    config: options.document,
+    clock: options.clock,
+    venue,
     store,
     idNamespace: config.instances.map((instance) => instance.runId).join("|"),
   });
   if (!created.ok) {
-    ports.log(`REFUSING TO START: ${created.refusal.code}: ${created.refusal.detail}`);
-    for (const issue of created.refusal.issues) ports.log(`  ${issue}`);
+    log(`REFUSING TO START: ${created.refusal.code}: ${created.refusal.detail}`);
+    for (const issue of created.refusal.issues) log(`  ${issue}`);
     await store.close();
-    await transport.close();
-    return EXIT_CODES.configurationRefused;
+    return { ok: false, code: EXIT_CODES.configurationRefused };
   }
   wiring.trader = created.trader;
   for (const row of created.trader.manifest) {
-    ports.log(
+    log(
       `manifest: ${String(row.position)} ${row.instanceId} ${row.ownership} ` +
         `priority=${String(row.evaluationPriority)} market=${row.marketId}`,
     );
   }
-
-  // --- 5. the pump ----------------------------------------------------------
-  const subscription = await transport.subscribe({
-    stream: config.infrastructure.eventStream,
-    consumerId: config.infrastructure.consumerId,
-  });
-  const feed = new RedisMarketEventFeed({
-    subscription,
-    maxEvents: config.infrastructure.receiveBatchSize,
-  });
-
-  const result = await pump({
-    loop: created.trader.loop,
-    feed,
-    halts: created.trader.halts,
-    maxPolls: Number.MAX_SAFE_INTEGER,
-  });
-
-  const health = created.trader.loop.health();
-  ports.log(`pump stopped: ${result.stopped} after ${String(result.polls)} poll(s)`);
-  for (const halt of health.halts) {
-    ports.log(`HALT ${halt.scope.kind} ${halt.code} (${halt.action}): ${halt.detail}`);
-  }
-  ports.log(`health: ${JSON.stringify(health)}`);
-
-  await feed.close();
-  await store.close();
-  await transport.close();
-  return result.stopped === "HALTED" ? EXIT_CODES.halted : EXIT_CODES.ok;
+  return { ok: true, trader: created.trader, store };
 }
 
 type ReadConfigurationResult =
@@ -392,7 +534,7 @@ async function readConfiguration(ports: StartupPorts): Promise<ReadConfiguration
  * `now()` answers the canonical strict-UTC form the strategy requires
  * (`time.ts`), so no conversion happens downstream.
  */
-class SystemPaperClock {
+export class SystemPaperClock implements Clock {
   now(): string {
     return new Date().toISOString().replace(/\.000Z$/u, "Z");
   }

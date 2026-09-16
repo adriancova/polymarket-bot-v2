@@ -150,11 +150,18 @@ describe("residual 2 — a protective reduction at the risk seam, RESOLVED", () 
     // Pinned BY IDENTITY against the exported constant, not by copying its
     // text: a wording improvement upstream must not read as a failure here.
     expect(run.trader.loop.health().riskSeamCaveat).toBe(RISK_SEAM_CAVEAT);
-    // NOTE (`RISK-2`): the constant's TEXT is now stale — it still describes the
-    // WP-220 residual as accepted, and `apps/trader/src/health.ts` is outside
-    // this round's grant. The identity pin above is what this row measures and
-    // it is unaffected; the wording is carried as a follow-up.
-    expect(RISK_SEAM_CAVEAT).toContain("WP-220 accepted residual");
+    // `BOOT-1` corrected the constant's TEXT (`RISK-2` residual R2). This pin
+    // used to read `expect(RISK_SEAM_CAVEAT).toContain("WP-220 accepted
+    // residual")` with a note that the wording was stale; the caveat now says
+    // what is true — the seam no longer classifies a covered sell as ENTRY, and
+    // the caveat an operator needs is residual 5 — and QUOTES the superseded
+    // text rather than deleting it, which is why the old phrase is still found.
+    expect(RISK_SEAM_CAVEAT).toContain("SUPERSEDED (RISK-2, 133eac1)");
+    expect(RISK_SEAM_CAVEAT).toContain('used to read "WP-220 accepted residual');
+    expect(RISK_SEAM_CAVEAT).toContain("never from a tag");
+    expect(RISK_SEAM_CAVEAT).toContain("residual 5");
+    expect(RISK_SEAM_CAVEAT).toContain("ends PAUSED");
+    expect(RISK_SEAM_CAVEAT).not.toMatch(/^WP-220 accepted residual/u);
   });
 
   it("the exit is EXECUTED, and it is the intent the strategy emitted — not a re-tag", async () => {
