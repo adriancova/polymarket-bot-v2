@@ -56,8 +56,29 @@
  * `approved_intents` → `execution.plans` → `orders` → `fills`), which is its
  * own round — so a durable transaction cannot name the fill it books and the
  * adapter binds `NULL` there (`adapters/postgres-store.ts`,
- * `appendLedgerTransaction`). The pin fails the day the chain lands, which is
- * the day this file must start asserting the link instead.
+ * `appendLedgerTransaction`, which also says what that severs: the fill id is
+ * carried nowhere else, so the durable transactions of one fill share only
+ * `occurred_at`/market/account and a rebuild from the durable rows cannot
+ * reproduce per-fill economics).
+ *
+ * TWO pins, measuring two different things (review R5 — the first round said
+ * the NULL pin "fails the day the chain lands", which it would not): the
+ * `fill_id IS NULL` assertion measures the ADAPTER's binding and stays green
+ * whatever the chain does; the `execution.fills` row count of ZERO measures the
+ * CHAIN'S ABSENCE, and is what fails when a round persists fills — at which
+ * point the NULL binding must be deleted and this file must assert the link.
+ *
+ * ## The restart case (review R1)
+ *
+ * `status = 'RUNNING'` does not mean a run accepts decisions. A run that
+ * persisted decisions and then stopped without `stopRun` — a crash, an
+ * operator kill — is still RUNNING; the first round's check let it through and
+ * the restarted trader GLOBAL-halted at its first decision on
+ * `decisions_evaluation_unique` (measured by the review). The check now reads
+ * `strategy.decisions` and refuses such a run as
+ * `TRADER_REGISTRATION_RUN_NOT_RESUMABLE` with the remedy (a new run). Pinned
+ * below by doing exactly that: register, decide through the real assembly,
+ * stop, start again.
  *
  * ## Docker
  *
@@ -185,6 +206,7 @@ function decimalSafeDocument(value: Record<string, unknown>): {
 async function registerThroughTheRepositories(
   context: TestContext,
   label: string,
+  options: { readonly accountRef?: string } = {},
 ): Promise<Registered> {
   const { catalog, strategy } = context.repositories;
 
@@ -233,7 +255,7 @@ async function registerThroughTheRepositories(
     definitionId,
     configId,
     environment: "PAPER",
-    accountRef: ACCOUNT,
+    accountRef: options.accountRef ?? ACCOUNT,
     defaultOwnershipMode: "LIVE_OWNER",
     evaluationPriority: 0,
   });
@@ -258,7 +280,13 @@ async function registerThroughTheRepositories(
 function documentFor(
   registered: Registered,
   label: string,
-  overrides: { readonly conditionId?: string; readonly runSeed?: string } = {},
+  overrides: {
+    readonly conditionId?: string;
+    readonly runSeed?: string;
+    readonly instanceId?: string;
+    readonly runId?: string;
+    readonly configId?: string;
+  } = {},
 ): Record<string, unknown> {
   const base = traderConfig();
   const market = (base["markets"] as Record<string, unknown>[])[0];
@@ -277,9 +305,9 @@ function documentFor(
     instances: [
       {
         ...instance,
-        instanceId: registered.instanceId,
-        runId: registered.runId,
-        configId: registered.configId,
+        instanceId: overrides.instanceId ?? registered.instanceId,
+        runId: overrides.runId ?? registered.runId,
+        configId: overrides.configId ?? registered.configId,
         runSeed: overrides.runSeed ?? RUN_SEED,
         marketId: registered.marketId,
       },
@@ -288,14 +316,18 @@ function documentFor(
 }
 
 /** Runs the process's assembly on a document, capturing what it logged. */
-async function assemble(document: Record<string, unknown>, postgresUrl: string) {
+async function assemble(
+  document: Record<string, unknown>,
+  postgresUrl: string,
+  env: Record<string, string | undefined> = safeEnvironment(),
+) {
   const parsed = parseTraderConfig(document);
   if (!parsed.ok) {
     throw new Error(`${parsed.refusal.code}: ${parsed.refusal.issues.join("; ")}`);
   }
   const lines: string[] = [];
   const result = await assembleDurableTrader({
-    env: safeEnvironment(),
+    env,
     config: parsed.config,
     document,
     postgresUrl,
@@ -368,6 +400,214 @@ describe("the startup registration check refuses what the database does not hold
     });
   }, 120_000);
 
+  it("REFUSES each of the four cross-checks the first round left unpinned (review R3)", async () => {
+    await withFreshDatabase("boot1-cross-checks", async ({ connectionString, context }) => {
+      // The PAPER instance P with its RUNNING run rP under config A.
+      const primary = await registerThroughTheRepositories(context, "cross");
+      const { strategy } = context.repositories;
+      // A second immutable config B of the same definition.
+      const { configId: configB } = await strategy.createConfig({
+        definitionId: primary.definitionId,
+        parameters: { note: "config B, never run" },
+        parametersHash: hashOf("config-b"),
+        validatedAt: fixtureTimestamp(1),
+        createdBy: "boot-1-acceptance",
+      });
+      // A SHADOW instance S with its own RUNNING run rS — the composite key
+      // `runs_instance_environment_fk` makes a run's environment its
+      // instance's, so a run in another environment is always a run of an
+      // instance in that environment.
+      const shadowInstance = await strategy.createInstance({
+        instanceName: "static-bracket-cross-shadow",
+        definitionId: primary.definitionId,
+        configId: primary.configId,
+        environment: "SHADOW",
+        accountRef: ACCOUNT,
+        defaultOwnershipMode: "SHADOW",
+        evaluationPriority: 1,
+      });
+      const shadowRun = await strategy.startRun({
+        instanceId: shadowInstance,
+        definitionId: primary.definitionId,
+        configId: primary.configId,
+        environment: "SHADOW",
+        codeCommit: "boot-1-acceptance-test",
+        stateSchemaVersion: 1,
+        runSeed: RUN_SEED,
+      });
+
+      // (1) instances.environment: the PAPER trader names the SHADOW instance.
+      const x = await assemble(
+        documentFor(primary, "cross", { instanceId: shadowInstance, runId: shadowRun }),
+        connectionString,
+      );
+      expect(x.result.ok).toBe(false);
+      expect(x.log).toContain("REFUSING TO START: TRADER_REGISTRATION_MISMATCH");
+      expect(x.log).toContain(
+        `strategy.instances ${shadowInstance}: the row's environment is SHADOW but this is a PAPER trader`,
+      );
+
+      // (2) runs.instance_id and (3) runs.environment: the PAPER instance P
+      // names S's run as its own.
+      const y = await assemble(documentFor(primary, "cross", { runId: shadowRun }), connectionString);
+      expect(y.result.ok).toBe(false);
+      expect(y.log).toContain("REFUSING TO START: TRADER_REGISTRATION_MISMATCH");
+      expect(y.log).toContain(
+        `strategy.runs ${shadowRun}: the row belongs to instance ${shadowInstance} but the ` +
+          `configuration names it as instance ${primary.instanceId}'s run`,
+      );
+      expect(y.log).toContain(
+        `strategy.runs ${shadowRun}: the row's environment is SHADOW but this is a PAPER trader`,
+      );
+
+      // (4) runs.config_id: rP pins config A; the configuration states B.
+      const z = await assemble(documentFor(primary, "cross", { configId: configB }), connectionString);
+      expect(z.result.ok).toBe(false);
+      expect(z.log).toContain("REFUSING TO START: TRADER_REGISTRATION_MISMATCH");
+      expect(z.log).toContain(
+        `strategy.runs ${primary.runId}: the row pins config ${primary.configId} but the ` +
+          `configuration states configId ${configB}`,
+      );
+
+      // The control: the rows as registered assemble.
+      const ok = await assemble(documentFor(primary, "cross"), connectionString);
+      expect(ok.result.ok ? "ok" : ok.log).toBe("ok");
+      if (ok.result.ok) await ok.result.store.close();
+    });
+  }, 120_000);
+
+  it("REFUSES an instance registered under another account — every ledger entry would be booked to it (review R8)", async () => {
+    await withFreshDatabase("boot1-account", async ({ connectionString, context }) => {
+      const registered = await registerThroughTheRepositories(context, "account", {
+        accountRef: "someone-elses-account",
+      });
+      const { result, log } = await assemble(documentFor(registered, "account"), connectionString);
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("an instance under another account assembled");
+      expect(result.code).toBe(EXIT_CODES.configurationRefused);
+      expect(log).toContain("REFUSING TO START: TRADER_REGISTRATION_MISMATCH");
+      expect(log).toContain(
+        `strategy.instances ${registered.instanceId}: the row's account_ref is ` +
+          `"someone-elses-account" but the configuration books every ledger entry and PnL row ` +
+          `to accounting.accountRef "${ACCOUNT}"`,
+      );
+    });
+  }, 120_000);
+
+  it("REFUSES to restart a run that already holds decisions, and names the remedy (review R1)", async () => {
+    await withFreshDatabase("boot1-restart", async ({ connectionString, context }) => {
+      const registered = await registerThroughTheRepositories(context, "restart");
+      const document = documentFor(registered, "restart");
+
+      // First start: the production assembly, one decision at least.
+      const first = await assemble(document, connectionString);
+      expect(first.result.ok ? "ok" : first.log).toBe("ok");
+      if (!first.result.ok) throw new Error("unreachable");
+      for (const event of recordedEvents(registered.marketId, `${CONDITION_ID}-restart`)) {
+        expect(first.result.trader.loop.ingest(event)).toBe(true);
+      }
+      await first.result.trader.loop.drain();
+      expect(first.result.trader.loop.health().halts).toEqual([]);
+      const before = {
+        decisions: await context.db.selectFrom("strategy.decisions").selectAll().execute(),
+        checkpoints: await context.db.selectFrom("strategy.state_checkpoints").selectAll().execute(),
+        snapshots: await context.db.selectFrom("accounting.pnl_snapshots").selectAll().execute(),
+      };
+      expect(before.decisions.length).toBeGreaterThanOrEqual(1);
+      // Stop — without `stopRun`, as a crash or an operator kill would. The run
+      // row is still RUNNING.
+      await first.result.store.close();
+      const run = await context.db
+        .selectFrom("strategy.runs")
+        .select("status")
+        .where("run_id", "=", registered.runId)
+        .executeTakeFirstOrThrow();
+      expect(run.status).toBe("RUNNING");
+
+      // Second start against the same run: REFUSED, typed, with the remedy.
+      // (At the first round's tip this assembled, and the first decision
+      // GLOBAL-halted on `decisions_evaluation_unique`.)
+      const second = await assemble(document, connectionString);
+      expect(second.result.ok).toBe(false);
+      if (second.result.ok) throw new Error("a run holding decisions was resumed");
+      expect(second.result.code).toBe(EXIT_CODES.configurationRefused);
+      expect(second.log).toContain("REFUSING TO START: TRADER_REGISTRATION_RUN_NOT_RESUMABLE");
+      expect(second.log).toContain(
+        `strategy.runs ${registered.runId}: the run already holds persisted decisions`,
+      );
+      expect(second.log).toContain("decisions_evaluation_unique");
+      expect(second.log).toContain("Start a NEW run");
+      expect(second.log).toContain("startRun");
+      // Zero new rows: the refusal wrote nothing and the old run's rows stand.
+      const after = {
+        decisions: await context.db.selectFrom("strategy.decisions").selectAll().execute(),
+        checkpoints: await context.db.selectFrom("strategy.state_checkpoints").selectAll().execute(),
+        snapshots: await context.db.selectFrom("accounting.pnl_snapshots").selectAll().execute(),
+      };
+      expect(after.decisions).toEqual(before.decisions);
+      expect(after.checkpoints).toEqual(before.checkpoints);
+      expect(after.snapshots).toEqual(before.snapshots);
+
+      // The remedy works: a NEW run for the same instance and config, and the
+      // configuration pointed at it, assembles.
+      const newRunId = await context.repositories.strategy.startRun({
+        instanceId: registered.instanceId,
+        definitionId: registered.definitionId,
+        configId: registered.configId,
+        environment: "PAPER",
+        codeCommit: "boot-1-acceptance-test",
+        stateSchemaVersion: 1,
+        runSeed: RUN_SEED,
+      });
+      const third = await assemble(documentFor(registered, "restart", { runId: newRunId }), connectionString);
+      expect(third.result.ok ? "ok" : third.log).toBe("ok");
+      if (third.result.ok) await third.result.store.close();
+    });
+  }, 120_000);
+
+  it("checks the safety posture BEFORE any database read — an unsafe environment never reaches a SELECT (review R4)", async () => {
+    const unsafe = {
+      ...safeEnvironment(),
+      MAX_RUN_MODE: "LIVE",
+      RUN_MODE: "LIVE",
+      ALLOW_REAL_ORDERS: "true",
+    };
+    // An UNREACHABLE database: had a query run, the answer would have been
+    // `TRADER_REGISTRATION_UNREADABLE`. It is not, because no pool was built.
+    const unreachable = await assemble(
+      traderConfig(),
+      "postgres://nobody:nothing@127.0.0.1:1/nowhere",
+      unsafe,
+    );
+    expect(unreachable.result.ok).toBe(false);
+    if (unreachable.result.ok) throw new Error("an unsafe environment assembled");
+    expect(unreachable.result.code).toBe(EXIT_CODES.unsafeEnvironment);
+    expect(unreachable.log).toContain("REFUSING TO START: TRADER_UNSAFE_ENVIRONMENT");
+    expect(unreachable.log).not.toContain("TRADER_REGISTRATION");
+    expect(unreachable.log).toContain("PAPER_RUN_MODE_CEILING_RAISED");
+
+    // And against a real, unseeded database — where the first round's seam
+    // answered `TRADER_REGISTRATION_MISSING` (the SELECTs had run) — the
+    // answer is the environment, and nothing was read.
+    await withFreshDatabase("boot1-unsafe", async ({ connectionString, context }) => {
+      const { result, log } = await assemble(traderConfig(), connectionString, unsafe);
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("an unsafe environment assembled");
+      expect(result.code).toBe(EXIT_CODES.unsafeEnvironment);
+      expect(log).toContain("REFUSING TO START: TRADER_UNSAFE_ENVIRONMENT");
+      expect(log).not.toContain("TRADER_REGISTRATION");
+      // Nothing was written either. (This read also matters mechanically:
+      // `createMigratedContext.close()` is Kysely's `destroy()`, which returns
+      // EARLY when no query ever initialised the driver, leaving the raw pool
+      // `migrateUp` used open — `BOOT-1` r1 measured two `57P01 terminating
+      // connection` uncaught errors at container stop from exactly this
+      // scenario. A storage-testing fixture defect, reported, not this file's
+      // to fix; one query through `context.db` makes `close()` real.)
+      const decisions = await context.db.selectFrom("strategy.decisions").selectAll().execute();
+      expect(decisions).toHaveLength(0);
+    });
+  }, 120_000);
+
   it("REFUSES TO START, with the infrastructure exit code, when the database cannot answer", async () => {
     // A closed port on the loopback: the pool is lazy, so the first statement
     // the registration check issues is where the process learns the answer —
@@ -400,7 +640,9 @@ describe("the assembled durable trader survives its first decision AND its first
 
     try {
       // --- the pump's per-batch work, on the real loop --------------------------
-      for (const event of recordedEvents(registered.marketId)) {
+      // The same six events, addressed to the REGISTERED market: its minted id
+      // and the condition id it was registered under (review R10).
+      for (const event of recordedEvents(registered.marketId, `${CONDITION_ID}-first-fill`)) {
         expect(trader.loop.ingest(event)).toBe(true);
       }
       await trader.loop.drain();
@@ -459,11 +701,19 @@ describe("the assembled durable trader survives its first decision AND its first
         expect(row.environment).toBe("PAPER");
         expect(row.account_ref).toBe(ACCOUNT);
         // DISCLOSED, not hidden: the trader persists no `execution.fills` row, so
-        // the fill link is NULL here (module header). When the execution chain
-        // is persisted this pin must flip to assert the fill id.
+        // the fill link is NULL here (module header). This pair pins the
+        // ADAPTER's binding only.
         expect(row.fill_id).toBeNull();
         expect(row.order_id).toBeNull();
       }
+      // …and THIS pins the chain's absence (review R5): the fill was observed,
+      // booked and snapshotted, and `execution.fills` holds NOTHING. When a
+      // round persists fills, this assertion FAILS — that failure is the
+      // instruction to delete the NULL binding in `appendLedgerTransaction` and
+      // to flip the pair above to assert the fill link.
+      const persistedFills = await context.db.selectFrom("execution.fills").selectAll().execute();
+      expect(health.execution.fillsObserved).toBeGreaterThanOrEqual(1);
+      expect(persistedFills).toHaveLength(0);
       const transactionIds = transactions.map((row) => row.ledger_transaction_id);
       const entries = await context.db
         .selectFrom("accounting.ledger_entries")

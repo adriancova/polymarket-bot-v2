@@ -272,13 +272,34 @@ export class PostgresTraderStore implements TraderStore {
    * cannot name a fill row that does not exist, so the header carries NULL for
    * both links until the execution chain is persisted — which is its own round
    * (the "trader read path" `GOV-2B` names as R10), not something to half-do
-   * from an accounting adapter. What is NOT lost: every entry still names its
-   * `instance_id`, `run_id` and `market_id`, the header its `market_id`, and
-   * the in-memory ledger (§6 invariant 8's in-process authority) and
-   * `CoreLoop.traces()` still carry `ledgerFillId` and the transaction ids.
-   * The durable row is honest about what the durable schema holds: no fill.
-   * `durable-trader-first-fill-postgres.test.ts` PINS the NULL so the day the
-   * chain lands this binding fails loudly and gets its link back.
+   * from an accounting adapter.
+   *
+   * **What this SEVERS, said plainly (`BOOT-1` r1, review R5).** This is a
+   * severing disclosed as a binding, not a cosmetic NULL.
+   * `packages/ledger/src/fill-posting.ts` puts the fill identity NOWHERE but
+   * the header's `fillId` (the `shared` header at `:278-286`; no entry
+   * `detail`, no `referenceHash` carries it), so once it is dropped here the
+   * durable transactions of ONE fill — principal, token, and fee when charged
+   * — share only `occurred_at`, `market_id`, `account_ref` and `environment`.
+   * Two fills at one instant in one market are indistinguishable in the
+   * durable ledger, and §6 invariant 8's rebuild FROM THE DURABLE ROWS cannot
+   * reproduce per-fill economics (cost basis per lot, per-fill fees, the
+   * `TraceLink` chain) until the execution chain lands and this binding gets
+   * its link back. What is NOT lost: per-asset balances and per-instance
+   * attribution — every entry still names its `instance_id`, `run_id` and
+   * `market_id`, the header its `market_id` — and the in-memory ledger (§6
+   * invariant 8's in-process authority) and `CoreLoop.traces()` still carry
+   * `ledgerFillId` and the transaction ids. The durable row is honest about
+   * what the durable schema holds: no fill.
+   *
+   * WHAT THE TESTS PIN, precisely. The first round said the NULL pin "fails
+   * the day the chain lands"; it did not — `fill_id IS NULL` measures THIS
+   * adapter's binding, and would stay green with a persisted chain and a
+   * stale binding. `durable-trader-first-fill-postgres.test.ts` therefore pins
+   * BOTH: `fill_id`/`order_id` NULL on every durable transaction (the
+   * binding), AND `execution.fills` EMPTY after the fill (the chain's
+   * absence). The second is what fails when a round persists fills; that
+   * failure is the instruction to delete the NULL binding above.
    */
   async appendLedgerTransaction(
     appended: AppendedLedgerTransaction,

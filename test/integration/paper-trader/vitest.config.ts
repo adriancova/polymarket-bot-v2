@@ -7,12 +7,14 @@
  * package-level script `pnpm --filter @polymarket-bot/trader test:integration`.
  * Root-script wiring is orchestrator-owned at merge.
  *
- * **No venue, no credential — but no longer no network.** ONE file in this
- * suite opens a TCP socket to a container on `localhost`, and on a cold image
- * cache Testcontainers pulls `postgres:16.6-alpine` — and its own reaper image
- * — from a public registry before it can (see the Docker paragraph below).
- * Nothing here reaches a VENUE, a wallet, a signer or any real credential, and
- * nothing outside that one file leaves the process. The trader's three
+ * **No venue, no credential — but no longer no network.** TWO files in this
+ * suite open a TCP socket to a container on `localhost` (this paragraph used
+ * to say "ONE file … nothing outside that one file leaves the process";
+ * `BOOT-1` added the second), and on a cold image cache Testcontainers pulls
+ * `postgres:16.6-alpine` — and its own reaper image — from a public registry
+ * before it can (see the Docker paragraph below). Nothing here reaches a
+ * VENUE, a wallet, a signer or any real credential, and nothing outside those
+ * two files leaves the process. In the rest of the tree the trader's three
  * infrastructure seams — the §12.1 `Clock`, the event transport and the durable
  * store — are exercised through in-memory implementations with failure injection
  * (`apps/trader/src/testing/`), which is exactly how `WP-120`'s suite exercises
@@ -22,15 +24,20 @@
  * ledger and the PnL engine. No subject behaviour is doubled anywhere in this
  * tree.
  *
- * **Docker, for one file only.** `GOV-2B` blocker B1 was a defect in the
- * durable store that only a real database could see: every existing test of
+ * **Docker, for two files.** `GOV-2B` blocker B1 was a defect in the durable
+ * store that only a real database could see: every existing test of
  * `writePnlSnapshot` used the in-memory double, and the double could not
  * reject a column name. `durable-pnl-snapshot-postgres.test.ts` (`TRDR-2`)
  * therefore drives the real `PostgresTraderStore` against a Testcontainers
- * PostgreSQL. It starts that container in its OWN `beforeAll` rather than in a
- * `globalSetup`, so it is the only file in this suite that needs Docker; the
- * rest of the tree stays in-memory. Testcontainers' credentials are throwaway
- * and live only as long as the run (§0.2, ADR-010).
+ * PostgreSQL, and `durable-trader-first-fill-postgres.test.ts` (`BOOT-1`)
+ * drives the ASSEMBLED trader through the process's own startup path against
+ * one — the file that proves the durable trader survives its first decision
+ * and first fill. This paragraph used to read "**Docker, for one file only.**
+ * … it is the only file in this suite that needs Docker". Each starts its
+ * container in its OWN `beforeAll` rather than in a `globalSetup`, so no other
+ * file in the suite acquires a Docker dependency; the rest of the tree stays
+ * in-memory. Testcontainers' credentials are throwaway and live only as long
+ * as the run (§0.2, ADR-010).
  *
  * Files under `test/` sit outside every workspace package, so bare workspace
  * imports have no `node_modules` to resolve through; the aliases below map each

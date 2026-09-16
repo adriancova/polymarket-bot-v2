@@ -79,11 +79,48 @@
  * | --- | --- | --- |
  * | `catalog.markets` by `market_id` | `markets[].conditionId` | `condition_id` — a configuration naming market X while stating condition Y points at the wrong market |
  * | `strategy.instances` by `instance_id` | `environment` | `environment` — `runs_instance_environment_fk` binds a run to its instance's environment, and every PnL row this run writes is stamped `PAPER` |
+ * | | `accounting.accountRef` | `account_ref` — every ledger entry and PnL row this run writes is attributed to the configured account; an instance registered under another account (or under none) would have its history booked to the wrong one, silently (`BOOT-1` r1, review R8) |
  * | `strategy.runs` by `run_id` | `instances[].instanceId` | `instance_id` — the run must be a run OF the configured instance |
  * | | `environment` | `environment` |
  * | | `instances[].configId` | `config_id` — §9.6's pin: the run executes the config it was started with |
  * | | `instances[].runSeed` | `run_seed` — §12.4's pin: the seed the runtime is handed is the one the run row records |
  * | | (implicit) | `status = 'RUNNING'` — `runs_end_consistent` makes a stopped run a closed record; no decision may be appended to it |
+ * | `strategy.decisions` by `run_id` | (implicit) | NO ROW — see "A run that already has decisions" below |
+ *
+ * Shared facts this check does NOT yet compare (`BOOT-1` r1, review R8; each a
+ * candidate for the same treatment, none load-bearing for a foreign key):
+ * `strategy.instances.status` (a `PAUSED`/`STOPPED` instance still passes),
+ * `default_ownership_mode` and `evaluation_priority` (the configuration's
+ * `ownership`/`evaluationPriority` are what the manifest records; the row's
+ * are not consulted), `catalog.market_tokens` (the configured
+ * `yesTokenId`/`noTokenId` are not compared to the registered tokens) and
+ * `catalog.markets.current_parameters_version` / `market_parameter_history`
+ * (the configured `parametersVersion` is not checked to exist).
+ *
+ * ## A run that already has decisions is REFUSED (`BOOT-1` r1, review R1)
+ *
+ * `status = 'RUNNING'` is not "accepts decisions". A run that persisted
+ * decisions and then crashed, or was stopped by an operator without
+ * `stopRun`, is still `RUNNING`, passed the first round of this check, and
+ * the restarted trader GLOBAL-halted at its FIRST decision — measured by the
+ * adversarial review through the real assembly:
+ *
+ * ```text
+ * STORE_UNAVAILABLE: … duplicate key value violates unique constraint
+ *   "decisions_evaluation_unique"
+ * ```
+ *
+ * because `packages/strategy-runtime` restarts `evaluation_seq` at its
+ * origin on every construction and NO READ PATH exists to resume a run from
+ * its checkpoints (`GOV-2B` R10, the trader read path) — the exact "learn the
+ * answer at its first durable write" this module exists to prevent. So one
+ * more read: a run that has ANY row in `strategy.decisions` is refused with
+ * `TRADER_REGISTRATION_RUN_NOT_RESUMABLE`. The remedy is configuration, which
+ * is why it exits `configurationRefused` (78) like `_MISSING`/`_MISMATCH`:
+ * start a NEW run (`startRun`; §9.6 — a restart of a pinned run is a new run
+ * until a read path can continue the old one) and point the configuration's
+ * `runId` at it. The old run's decisions, checkpoints, ledger entries and PnL
+ * rows stay where they are, under the old `run_id`.
  *
  * Everything is READ. This module issues `select` statements through the typed
  * builder — the same "composition root binds them to the tables" arrangement
@@ -96,7 +133,8 @@
  * A database that cannot answer is `TRADER_REGISTRATION_UNREADABLE`, and the
  * process refuses to start — it does not start degraded and discover the
  * outage at its first write. A row that is absent is `_MISSING`; a row that
- * disagrees is `_MISMATCH`. Every problem found is reported together, so an
+ * disagrees is `_MISMATCH`; a run that already holds decisions is
+ * `_RUN_NOT_RESUMABLE`. Every problem found is reported together, so an
  * operator fixing a configuration sees the whole list once rather than one item
  * per restart. Nothing here throws.
  */
@@ -111,6 +149,11 @@ export interface RegistrationRefusal {
     | "TRADER_REGISTRATION_MISSING"
     /** A row exists and disagrees with the configuration about a shared fact. */
     | "TRADER_REGISTRATION_MISMATCH"
+    /**
+     * The run exists, is RUNNING, agrees with the configuration — and already
+     * holds decisions, which this process cannot continue (no read path).
+     */
+    | "TRADER_REGISTRATION_RUN_NOT_RESUMABLE"
     /** The database could not answer; the process refuses rather than guesses. */
     | "TRADER_REGISTRATION_UNREADABLE";
   readonly detail: string;
@@ -184,7 +227,7 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
   const instanceIds = config.instances.map((instance) => instance.instanceId);
   const instanceRows = await db
     .selectFrom("strategy.instances")
-    .select(["instance_id", "environment"])
+    .select(["instance_id", "environment", "account_ref"])
     .where("instance_id", "in", instanceIds)
     .execute();
   const instancesById = new Map(instanceRows.map((row) => [row.instance_id, row]));
@@ -198,6 +241,14 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
       mismatched.push(
         `strategy.instances ${instance.instanceId}: the row's environment is ${row.environment} ` +
           `but this is a ${config.environment} trader`,
+      );
+    }
+    if (row.account_ref !== config.accounting.accountRef) {
+      mismatched.push(
+        `strategy.instances ${instance.instanceId}: the row's account_ref is ` +
+          `${row.account_ref === null ? "NULL (no account)" : JSON.stringify(row.account_ref)} ` +
+          `but the configuration books every ledger entry and PnL row to accounting.accountRef ` +
+          `${JSON.stringify(config.accounting.accountRef)}`,
       );
     }
   }
@@ -248,6 +299,33 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
     }
   }
 
+  // --- strategy.decisions: a run that already has any is not resumable --------
+  // One read over the runs that exist (an absent run has no decisions to find).
+  // `distinct` over the set rather than `limit 1` per run: one statement, and
+  // the answer is per run, so every non-resumable run is named at once.
+  const notResumable: string[] = [];
+  const existingRunIds = [...runsById.keys()];
+  if (existingRunIds.length > 0) {
+    const decided = await db
+      .selectFrom("strategy.decisions")
+      .select("run_id")
+      .distinct()
+      .where("run_id", "in", existingRunIds)
+      .execute();
+    const decidedRunIds = new Set(decided.map((row) => row.run_id));
+    for (const instance of config.instances) {
+      if (!decidedRunIds.has(instance.runId)) continue;
+      notResumable.push(
+        `strategy.runs ${instance.runId}: the run already holds persisted decisions, and this ` +
+          "process cannot continue it — packages/strategy-runtime restarts evaluation_seq on " +
+          "every construction and no read path resumes a run from its checkpoints (GOV-2B " +
+          "R10), so the first decision would violate decisions_evaluation_unique and halt " +
+          "the process. Start a NEW run for this instance and config (startRun; §9.6) and " +
+          "point the configuration's runId at it; the old run's rows stay under the old run_id",
+      );
+    }
+  }
+
   if (missing.length > 0) {
     return {
       ok: false,
@@ -258,7 +336,7 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
           "database, so every durable write this run would make — decisions, checkpoints, " +
           "ledger entries, PnL snapshots — would violate a foreign key and halt the process " +
           `at its first decision. ${HOW_TO_REGISTER}`,
-        issues: [...missing, ...mismatched],
+        issues: [...missing, ...mismatched, ...notResumable],
       },
     };
   }
@@ -271,7 +349,22 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
           `${String(mismatched.length)} row(s) the configuration names exist but disagree ` +
           "with it about a fact both state; refused rather than resolved, because choosing " +
           "a winner here would silently discard a value the operator did set",
-        issues: mismatched,
+        issues: [...mismatched, ...notResumable],
+      },
+    };
+  }
+  if (notResumable.length > 0) {
+    return {
+      ok: false,
+      refusal: {
+        code: "TRADER_REGISTRATION_RUN_NOT_RESUMABLE",
+        detail:
+          `${String(notResumable.length)} run(s) the configuration names already hold ` +
+          "persisted decisions. A RUNNING status is not the same as accepting decisions: " +
+          "this process has no read path to resume a run, so starting against one would " +
+          "halt at the first decision on decisions_evaluation_unique (measured). Refused " +
+          "here instead, with the remedy: a new run",
+        issues: notResumable,
       },
     };
   }

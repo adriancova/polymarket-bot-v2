@@ -322,16 +322,38 @@ export type DurableTraderResult =
  * hands it back inside `store` on success; on a refusal it closes what it
  * opened before returning, so a caller that receives `ok: false` holds nothing.
  *
- * THE ORDER IS THE POINT. The registration check runs BEFORE the venue and the
- * trader exist — nothing that could write has been constructed when the
- * database is asked whether the writes would land — and after the safety check
- * and the configuration door, which `startup` ran before calling this and
- * which `createPaperTrader` runs again on the document it is given.
+ * THE ORDER IS THE POINT. The safety posture is checked FIRST, in this
+ * function, before a pool exists — not only in `startup`. The first round of
+ * `BOOT-1` relied on `startup()` having run `checkPaperTraderSafety` before
+ * calling here, and the adversarial review (R4) measured what that was worth
+ * for the EXPORTED seam: with `MAX_RUN_MODE=LIVE, RUN_MODE=LIVE,
+ * ALLOW_REAL_ORDERS=true` against an unseeded database, this function logged
+ * `TRADER_REGISTRATION_MISSING` — the `select`s had run — rather than refusing
+ * the environment. The module header's own principle ("a process that had
+ * already connected to something would have moved before the validation it is
+ * subject to") therefore applies to every caller of this function, and the
+ * check is pure and cheap, so it runs here too; `createPaperTrader` runs it a
+ * third time on the same record. Then the registration check runs BEFORE the
+ * venue and the trader exist — nothing that could write has been constructed
+ * when the database is asked whether the writes would land.
  */
 export async function assembleDurableTrader(
   options: DurableTraderOptions,
 ): Promise<DurableTraderResult> {
   const { config, log } = options;
+
+  // --- 1 (again). SAFETY, before a pool exists (BOOT-1 r1, review R4) ------
+  const safety = checkPaperTraderSafety(options.env);
+  if (!safety.ok) {
+    log(
+      "REFUSING TO START: TRADER_UNSAFE_ENVIRONMENT: the environment is not safe for a PAPER " +
+        "trader (§6 invariant 17, §15, ADR-010 §1); no database connection was attempted " +
+        "and no row was read",
+    );
+    for (const violation of safety.violations) log(`  ${violation.code}: ${violation.detail}`);
+    return { ok: false, code: EXIT_CODES.unsafeEnvironment };
+  }
+
   const database = createDatabase(createPostgresPool({ connectionString: options.postgresUrl }));
   const store = new PostgresTraderStore({
     db: database,
