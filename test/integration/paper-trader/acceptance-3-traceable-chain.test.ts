@@ -35,9 +35,16 @@ describe("acceptance 3 — the end-to-end paper fixture emits a traceable fill a
     const health = run.trader.loop.health();
 
     expect(health.halts).toEqual([]);
-    expect(health.risk.approvals).toBe(1);
-    expect(health.execution.plansBuilt).toBe(1);
-    expect(health.execution.submissionsAccepted).toBe(1);
+    // `RISK-2`: these three read `1`. The fixture's take-profit used to be
+    // refused at the risk seam (GOV-2B blocker B2), so the ENTRY was the only
+    // intent ever approved, planned or submitted. The exit now clears the seam
+    // and is placed too — it RESTS at its take-profit price, and this fixture's
+    // events end before anything can lift it, which is why `fillsObserved` is
+    // unchanged at 1.
+    expect(health.risk.approvals).toBe(2);
+    expect(health.risk.refusals).toBe(0);
+    expect(health.execution.plansBuilt).toBe(2);
+    expect(health.execution.submissionsAccepted).toBe(2);
     expect(health.execution.fillsObserved).toBe(1);
     expect(health.accounting.ledgerTransactions).toBeGreaterThan(0);
   });

@@ -1092,7 +1092,25 @@ export class CoreLoop {
       return;
     }
     this.#options.health.countRiskApproval();
-    this.#rememberIntentId(intentIdOf(input.intent));
+    // §9.8 check 18's duplicate guard remembers the ids it can. A `CANCEL` has
+    // NO `intentId` — §7.7 gives it none — so `intentIdOf` answers `""` for one,
+    // and there is nothing to remember.
+    //
+    // RISK-2: this line used to push that `""` unconditionally.
+    // `packages/risk` types `guards.recentIntentIds` as an array of NON-EMPTY
+    // strings, so the FIRST approved safety cancellation poisoned the list and
+    // every later evaluation in the process — entry, exit, cancel alike — was
+    // refused `RISK_INPUT_INVALID` at the input door. It stayed invisible until
+    // RISK-2 let a protective exit through the risk seam at all: only then did
+    // this process reach a cancel-then-replace and evaluate anything after it.
+    //
+    // FIXED AT THE CALLER, DELIBERATELY. The door is right and must not widen:
+    // the guard compares this list against `intent.intentId`, so admitting `""`
+    // would make check 18 match ID-LESS intents against each other — and the
+    // id-less intents are the CANCELs, which §6 invariant 13 says may never be
+    // blocked. `test/unit/risk/engine.test.ts` pins the door's refusal.
+    const rememberableIntentId = intentIdOf(input.intent);
+    if (rememberableIntentId !== "") this.#rememberIntentId(rememberableIntentId);
 
     // --- step 8: create execution plans -----------------------------------
     const executionPlanId = this.#options.ids.next();

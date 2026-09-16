@@ -17,6 +17,8 @@
 
 import { describe, expect, it } from "vitest";
 
+import { addDecimal } from "@polymarket-bot/decimal";
+
 import { captureArtifact, serializeArtifact, type PaperRunArtifact } from "./support/artifact.js";
 import { explainWalk, walkChains, HOPS } from "./support/chain-walk.js";
 import { goldenBytes } from "./support/golden.js";
@@ -27,18 +29,34 @@ function parseGolden(): PaperRunArtifact {
 }
 
 describe("acceptance 1 — the traceability chain is complete, walked from the outside", () => {
-  it("the run trades: an entry reached the venue, filled, and was booked", async () => {
+  /**
+   * `RISK-2` widened this from an entry to a ROUND TRIP.
+   *
+   * It used to read `approvals 1`, `plansBuilt 1`, `submissionsAccepted 1`,
+   * `fillsObserved 2`, `ledgerTransactions 6` — an entry, and nothing after it,
+   * because GOV-2B blocker B2 refused every protective exit at the risk seam.
+   * The counters are now 4/4/4 and 3: the entry, the take-profit, the cancel
+   * that replaced it when the confirmed allocation grew, and the protective
+   * reduction that closed the position.
+   */
+  it("the run trades a ROUND TRIP: an entry and an exit both reached the venue", async () => {
     const run = await driveScenario();
     const health = run.trader.loop.health();
     expect(health.halts).toEqual([]);
     expect(health.healthy).toBe(true);
-    expect(health.risk.approvals).toBe(1);
-    expect(health.execution.plansBuilt).toBe(1);
-    expect(health.execution.submissionsAccepted).toBe(1);
-    // TWO fills: the 50-share entry walked two ask levels, and §12.2's Tier-0
-    // immediate model emits one fill per consumed level.
-    expect(health.execution.fillsObserved).toBe(2);
-    expect(health.accounting.ledgerTransactions).toBe(6);
+    expect(health.risk.approvals).toBe(4);
+    expect(health.risk.refusals).toBe(0);
+    expect(health.execution.plansBuilt).toBe(4);
+    expect(health.execution.submissionsAccepted).toBe(4);
+    // THREE fills: the 50-share entry walked two ask levels (§12.2's Tier-0
+    // immediate model emits one fill per consumed level), and the protective
+    // reduction closed all 50 against the resting bid in one.
+    expect(health.execution.fillsObserved).toBe(3);
+    // The position really is closed — the property those counters exist to show.
+    expect(run.fills.filter((fill) => fill.action === "BUY")).toHaveLength(2);
+    expect(run.fills.filter((fill) => fill.action === "SELL")).toHaveLength(1);
+    // Three postings per fill: principal, token movement, fee.
+    expect(health.accounting.ledgerTransactions).toBe(9);
     expect(health.accounting.unattributedActivity).toBe(0);
     expect(health.accounting.unexplainedMovements).toBe(0);
   });
@@ -51,10 +69,13 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
     expect(report.ok).toBe(true);
     expect(report.brokenHops).toEqual([]);
     expect(report.findings).toEqual([]);
-    // The chain FANS OUT: one decision, one intent, one plan, one order, TWO
-    // fills, and therefore two complete chains — which is what makes the
-    // one-posting-per-fill and no-orphan checks non-trivial here.
-    expect(report.chains).toHaveLength(2);
+    // The chain FANS OUT and now also BRANCHES. The entry decision produced one
+    // intent, one plan, one order and TWO fills; the protective reduction that
+    // closed the position produced a third. Three complete chains, from two
+    // different decisions — which is what makes the one-posting-per-fill and
+    // no-orphan checks non-trivial here. (`RISK-2`: this was 2 while B2 kept
+    // every exit off the venue.)
+    expect(report.chains).toHaveLength(3);
     for (const chain of report.chains) {
       expect(chain.hops.map((result) => result.hop)).toEqual([...HOPS]);
       expect(chain.ok).toBe(true);
@@ -65,7 +86,7 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
     const report = walkChains(parseGolden());
     expect(explainWalk(report)).toBe("the walk found nothing");
     expect(report.ok).toBe(true);
-    expect(report.chains).toHaveLength(2);
+    expect(report.chains).toHaveLength(3);
   });
 
   it("the chain is anchored in the RECORDED event, not in a clock", async () => {
@@ -74,10 +95,18 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
     for (const trace of artifact.traces) {
       expect(eventIds.has(trace.sourceEventId)).toBe(true);
     }
-    // Both chains descend from the SAME source event and the SAME decision:
-    // the fan-out happens at the venue, not upstream of it.
-    expect(new Set(artifact.traces.map((trace) => trace.sourceEventId)).size).toBe(1);
-    expect(new Set(artifact.traces.map((trace) => trace.evaluationSeq)).size).toBe(1);
+    // TWO source events and TWO evaluations, not one: the entry's two chains
+    // descend from the same event and the same decision — the fan-out happens
+    // at the venue — and the protective reduction's chain descends from the
+    // book refresh just before the close. (`RISK-2`: both were 1 while B2 kept
+    // every exit off the venue. What the row still asserts is that the traces
+    // are anchored in RECORDED events, which is checked exhaustively above.)
+    expect(new Set(artifact.traces.map((trace) => trace.sourceEventId)).size).toBe(2);
+    expect(new Set(artifact.traces.map((trace) => trace.evaluationSeq)).size).toBe(2);
+    // The entry's chains still share one event and one evaluation between them.
+    const entryTraces = artifact.traces.filter((trace) => trace.intentId.includes("sb-entry"));
+    expect(entryTraces).toHaveLength(2);
+    expect(new Set(entryTraces.map((trace) => trace.evaluationSeq)).size).toBe(1);
     // Every simulated outcome is anchored to a recorded ingest sequence, never
     // to a wall clock (§6 invariant 15).
     const ingestSeqs = new Set(artifact.events.map((event) => event.ingestSeq));
@@ -88,13 +117,16 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
   it("the two ends of the chain agree on the money: fills, postings and PnL", async () => {
     const artifact = captureArtifact(await driveScenario());
 
-    // Each fill produced exactly three postings — principal, token receipt and
-    // fee — and every posting is claimed by exactly one chain.
-    expect(artifact.fills).toHaveLength(2);
-    expect(artifact.ledgerTransactions).toHaveLength(6);
+    // Each fill produced exactly three postings — principal, token movement and
+    // fee — and every posting is claimed by exactly one chain. (`RISK-2`: two
+    // fills and six postings became three and nine when the exit began to
+    // execute. The INVARIANT — three per fill, each claimed once — is unchanged,
+    // and is what this row measures.)
+    expect(artifact.fills).toHaveLength(3);
+    expect(artifact.ledgerTransactions).toHaveLength(9);
     const claimed = artifact.traces.flatMap((trace) => trace.ledgerTransactionIds);
-    expect(claimed).toHaveLength(6);
-    expect(new Set(claimed).size).toBe(6);
+    expect(claimed).toHaveLength(9);
+    expect(new Set(claimed).size).toBe(9);
     expect(new Set(claimed)).toEqual(
       new Set(artifact.ledgerTransactions.map((entry) => entry.ledgerTransactionId)),
     );
@@ -123,8 +155,9 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
       expect(record.scope).toBe("VIRTUAL_STRATEGY");
     }
 
-    // …and the run ends in PERSISTED PnL rows, one per posting round.
-    expect(artifact.pnlSnapshots).toHaveLength(2);
+    // …and the run ends in PERSISTED PnL rows, one per posting round (three,
+    // now that the exit posts one of its own).
+    expect(artifact.pnlSnapshots).toHaveLength(3);
     for (const snapshot of artifact.pnlSnapshots) {
       expect(snapshot["environment"]).toBe("PAPER");
       expect(snapshot["instanceId"]).toBe(artifact.scenario.instanceId);
@@ -153,10 +186,31 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
     expect(artifact.ledgerProjection.transactionCount).toBe(
       artifact.ledgerTransactions.length,
     );
+    // `RISK-2`: this used to read
+    //     expect(token?.instanceId).toBe(artifact.scenario.instanceId);
+    //     expect(token?.balance).toBe("50");
+    // — the position the run could not exit. The bracket now closes, and this
+    // projection carries no line for a zero balance, so the outcome-token line
+    // is ABSENT. The two things worth asserting survive the change and are
+    // asserted directly: every line the projection does carry is attributed to
+    // this instance, and the token position is FLAT — cross-checked against the
+    // venue's own fills rather than inferred from the absence.
+    for (const line of artifact.ledgerProjection.virtualPositions) {
+      expect(line.instanceId).toBe(artifact.scenario.instanceId);
+    }
     const token = artifact.ledgerProjection.virtualPositions.find(
       (line) => line.assetKind === "OUTCOME_TOKEN",
     );
-    expect(token?.instanceId).toBe(artifact.scenario.instanceId);
-    expect(token?.balance).toBe("50");
+    expect(token).toBeUndefined();
+    const bought = artifact.fills.filter((fill) => fill.action === "BUY");
+    const sold = artifact.fills.filter((fill) => fill.action === "SELL");
+    expect(bought.reduce((total, fill) => addDecimal(total, fill.shares), "0")).toBe(
+      sold.reduce((total, fill) => addDecimal(total, fill.shares), "0"),
+    );
+    // The collateral line is what remains, and it is the round trip's result.
+    const cash = artifact.ledgerProjection.virtualPositions.find(
+      (line) => line.assetKind === "COLLATERAL",
+    );
+    expect(cash?.balance).toBe("-1.632");
   });
 });

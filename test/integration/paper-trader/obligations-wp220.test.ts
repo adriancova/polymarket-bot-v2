@@ -441,23 +441,57 @@ describe("WP-220 composition-root obligations", () => {
     expect(neither.detail).toContain("a silently assumed FAK would");
   });
 
-  it("the RISK-SEAM CAVEAT is wired honestly: the exit is REFUSED, counted, and not compensated for", async () => {
+  /**
+   * RESOLVED 2026-09-15 by `RISK-2` (GOV-2B blocker B2).
+   *
+   * This test was "the RISK-SEAM CAVEAT is wired honestly: the exit is REFUSED,
+   * counted, and not compensated for", and asserted `refusedExits > 0`,
+   * `RISK_EDGE_INPUTS_MISSING` among the codes, and `plansBuilt === 1` /
+   * `submissionsAccepted === 1`. The Static Bracket emitted a take-profit after
+   * its entry filled, `packages/risk` classified it ENTRY, and the
+   * positive-net-edge gate refused it for an `expectedNetEdge` an exit can never
+   * declare.
+   *
+   * `packages/risk` now derives a `POSITION`'s disposition from its effect on
+   * the supplied portfolio, so the take-profit is an EXIT and is approved. The
+   * property this test actually guards is unchanged and still asserted: THE
+   * TRADER DOES NOT COMPENSATE. It never re-tagged the intent, and it does not
+   * now — the exit reaches the venue because the risk engine approved it, not
+   * because the composition root decided it knew better.
+   */
+  it("the risk seam is wired honestly: the exit is APPROVED, and nothing compensated for it", async () => {
     const run = await driveRecordedRun();
     const health = run.trader.loop.health();
 
-    // The Static Bracket emitted a take-profit after its entry filled, and the
-    // merged risk engine classified it ENTRY and refused it for want of an
-    // `expectedNetEdge`. That is WP-220's accepted posture, OBSERVED here.
-    expect(health.risk.refusedExits).toBeGreaterThan(0);
-    expect(Object.keys(health.risk.refusedExitsByCode)).toContain(
-      "RISK_EDGE_INPUTS_MISSING",
-    );
+    expect(health.risk.refusedExits).toBe(0);
+    expect(health.risk.refusedExitsByCode).toEqual({});
+    expect(health.risk.refusals).toBe(0);
+    expect(health.risk.approvals).toBe(2);
 
-    // The trader did NOT compensate: no plan, no submission followed the
-    // refusal, and the refusal is visible rather than swallowed.
-    expect(health.execution.plansBuilt).toBe(1);
-    expect(health.execution.submissionsAccepted).toBe(1);
-    expect(health.riskSeamCaveat).toContain("ACCEPTED posture");
+    // The exit reached the venue through the ordinary path: one plan and one
+    // submission for the entry, one of each for the take-profit.
+    expect(health.execution.plansBuilt).toBe(2);
+    expect(health.execution.submissionsAccepted).toBe(2);
+    expect(health.execution.plansRefused).toBe(0);
+    expect(health.execution.submissionsRefused).toBe(0);
+
+    // NOT COMPENSATED FOR — the part that must never change. The intent the
+    // strategy emitted is still a §7.7 `POSITION` wearing its protective tag; a
+    // composition root that had "fixed" this by re-tagging would show a
+    // different type or a different tag here.
+    const exit = run.parts.store.decisions
+      .flatMap((written) => written.record.decision.intents)
+      .find(
+        (intent) => intent.type === "POSITION" && intent.tags.includes("sb.take-profit"),
+      );
+    expect(exit).toBeDefined();
+    expect(exit?.type).toBe("POSITION");
+
+    // The caveat constant is still carried on the snapshot. Its TEXT is now
+    // stale — `apps/trader/src/health.ts` is outside `RISK-2`'s grant and the
+    // wording is carried as a follow-up — so this asserts the WIRING, which is
+    // what this test owns, rather than the sentence.
+    expect(health.riskSeamCaveat.length).toBeGreaterThan(0);
   });
 
   it("WP-210 residual — observeTrade is wired from the normalized event stream", async () => {

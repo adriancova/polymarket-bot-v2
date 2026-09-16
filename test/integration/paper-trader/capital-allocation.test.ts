@@ -86,15 +86,21 @@ describe("§9.7 capital allocation — the caps decide", () => {
   it("the SHIPPED generous caps still trade end to end (acceptance 3, with the real allocator)", async () => {
     const run = await driveRecordedRun();
     const health = run.trader.loop.health();
-    expect(health.risk.approvals).toBe(1);
-    expect(health.execution.submissionsAccepted).toBe(1);
+    // `RISK-2`: `approvals`, `submissionsAccepted` and `applied` each read `1`
+    // while the take-profit was refused at the risk seam (GOV-2B blocker B2).
+    // The exit is now approved and placed, so each counts the entry AND the
+    // exit. `fillsObserved` is unchanged: the exit RESTS at its take-profit
+    // price and this fixture's events end before anything lifts it.
+    expect(health.risk.approvals).toBe(2);
+    expect(health.execution.submissionsAccepted).toBe(2);
     expect(health.execution.fillsObserved).toBe(1);
-    // The allocator was ASKED and it permitted: one reservation applied before
-    // submission (§9.10) and released when the order reached its terminal
-    // state, leaving nothing held.
-    expect(health.seams.allocator.applied).toBe(1);
+    // The allocator was ASKED and it permitted BOTH: two reservations applied
+    // before submission (§9.10), one released when the entry order reached its
+    // terminal state, one still held for the live exit.
+    expect(health.seams.allocator.applied).toBe(2);
     expect(health.seams.allocator.released).toBe(1);
-    expect(health.seams.allocator.open).toBe(0);
+    expect(health.seams.allocator.open).toBe(1);
+    // THE POINT OF THIS TEST IS UNCHANGED: the generous caps refused nothing.
     expect(health.seams.allocator.refusalsByCode).toEqual({});
   });
 
@@ -103,7 +109,9 @@ describe("§9.7 capital allocation — the caps decide", () => {
       config: withCaps({ perStrategyCap: ENTRY_COST }),
     });
     const health = run.trader.loop.health();
-    expect(health.risk.approvals).toBe(1);
+    // `RISK-2`: was `1` — the take-profit is approved now too. The BOUNDARY this
+    // test measures is the allocator's, and it is asserted below, unchanged.
+    expect(health.risk.approvals).toBe(2);
     expect(health.execution.fillsObserved).toBe(1);
     expect(Object.keys(health.seams.allocator.refusalsByCode)).not.toContain(
       "CAPITAL_STRATEGY_CAP_EXCEEDED",
@@ -225,7 +233,10 @@ describe("§9.7 / §9.8 check 15 — a HELD POSITION consumes the caps", () => {
     // Cash is not the binding constraint here: `"1000"` funds both entries, and
     // the unchanged two-owner run fills twice.
     expect(health.execution.fillsObserved).toBe(1);
-    expect(health.execution.submissionsAccepted).toBe(1);
+    // `RISK-2`: was `1`. Market 1's entry filled and its take-profit is now
+    // approved and submitted as well; market 2's entry is still the one the
+    // UNDERLYING cap refuses, which is what this test measures.
+    expect(health.execution.submissionsAccepted).toBe(2);
     expect(Object.keys(health.seams.allocator.refusalsByCode)).toContain(
       "CAPITAL_UNDERLYING_CAP_EXCEEDED",
     );
@@ -320,11 +331,15 @@ describe("ADR-011 — a SHADOW instance observes; it does not trade", () => {
     );
     const health = shadowed.trader.loop.health();
 
-    // THE REGRESSION. At the r1 tip this was 2: the cap bound for an owner and
-    // evaporated for a shadow, on the same account, in the same process.
+    // THE REGRESSION. At the r1 tip `fillsObserved` was 2: the cap bound for an
+    // owner and evaporated for a shadow, on the same account, in the same
+    // process. ONE FILL is still the property under test, and it still holds.
     expect(health.execution.fillsObserved).toBe(1);
-    expect(health.execution.submissionsAccepted).toBe(1);
-    expect(health.execution.plansBuilt).toBe(1);
+    // `RISK-2`: these two were `1`. The owner's take-profit is now approved and
+    // submitted alongside its entry; nothing here belongs to the SHADOW, which
+    // is what the three assertions below establish.
+    expect(health.execution.submissionsAccepted).toBe(2);
+    expect(health.execution.plansBuilt).toBe(2);
     // The shadow instance's market is unowned and untouched: no trace carries
     // its run, and it holds nothing.
     expect(shadowed.trader.registry.ownerOf(MARKET_ID_2)).toBeUndefined();
@@ -350,7 +365,10 @@ describe("ADR-011 — a SHADOW instance observes; it does not trade", () => {
     // COUNTED as unrouted rather than dropped silently.
     expect(health.execution.observeOnlyIntents).toBe(entered?.intentIds.length);
     expect(health.execution.fillsObserved).toBe(1);
-    expect(health.seams.allocator.applied).toBe(1);
+    // `RISK-2`: was `1`. Both applications belong to the OWNER — its entry and
+    // its now-approved take-profit. The assertion that matters is the next one:
+    // nothing the SHADOW emitted reached a trace.
+    expect(health.seams.allocator.applied).toBe(2);
     expect(run.trader.loop.traces().some((trace) => trace.runId === RUN_ID_2)).toBe(false);
   });
 
@@ -367,10 +385,20 @@ describe("ADR-011 — a SHADOW instance observes; it does not trade", () => {
     const shadowed = await driveTwoMarketRun(twoMarketConfig("18", { secondOwnership: "SHADOW" }));
     const health = shadowed.trader.loop.health();
     expect(health.execution.fillsObserved).toBe(1);
-    expect(health.execution.submissionsAccepted).toBe(1);
+    // `RISK-2`: these three were `1`. The OWNER's take-profit is now approved
+    // and placed alongside its entry, so each counts two — both the owner's.
+    // "Nothing was reserved for the SHADOW" is the claim, and it is asserted
+    // directly below rather than inferred from a count of one.
+    expect(health.execution.submissionsAccepted).toBe(2);
     expect(health.execution.observeOnlyIntents).toBeGreaterThan(0);
-    // Nothing was reserved for the shadow instance in EITHER book.
-    expect(health.seams.allocator.applied).toBe(1);
-    expect(health.seams.reservations.taken).toBe(1);
+    expect(health.seams.allocator.applied).toBe(2);
+    expect(health.seams.reservations.taken).toBe(2);
+    // Nothing was reserved for the shadow instance in EITHER book: it owns no
+    // market, no trace carries its run, and it holds nothing.
+    expect(shadowed.trader.registry.ownerOf(MARKET_ID_2)).toBeUndefined();
+    expect(shadowed.trader.loop.traces().some((trace) => trace.runId === RUN_ID_2)).toBe(
+      false,
+    );
+    expect(shadowed.trader.loop.costBasisOf(INSTANCE_ID_2, MARKET_ID_2, "YES")).toBe("0");
   });
 });
