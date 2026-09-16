@@ -664,6 +664,42 @@ edges", which the check now contradicts by direct count. Corrected in place per
 holds and is worth keeping: the spec was written before the graph got
 interesting, and it did not have to change when it did.)*
 
+**The graph as of 2026-09-15** (recorded by `GOV-2C`, discharging the
+`SER-3` follow-up that asked this document to "record the six new downward
+`risk` edges and the consumed subpath `./plain-json`"; verified by running the
+check at `main` `1aa2238`): **34 workspace packages, 78 declared workspace
+edges**, and it passes. The 2026-08-28 table above is left as history; the
+intermediate counts this document already carries (43 after `WP-180-FU2`, 49
+after `WP-200-FU1`, both in §2.1) are likewise history. What the
+inherited-`toJSON` sweep added is **seven ordinary downward edges**, each a
+consumer of one export — the own-data JSON encoder
+`packages/risk/src/plain-json.ts`, exported from `packages/risk`'s `exports`
+map as `./plain-json` (the map now carries exactly `.`, `./plain-data`,
+`./plain-json`, `./schema-arena`) — and none of them is a §2.1 row because
+none is same-layer:
+
+| Edge | Layers | Verdict | Added by |
+| --- | --- | --- | --- |
+| `packages/event-bus` → `packages/risk` | 2 → 1 | downward | `SER-1` (merged `c065d63`; `check:deps` 34/71 → 34/72) |
+| `packages/storage-wal`, `packages/storage-parquet`, `packages/storage-postgres` → `packages/risk` | 2 → 1 | downward (3 edges) | `SER-2` (merged `0d8b6a0`; 34/72 → 34/75) |
+| `packages/polymarket-public`, `packages/coinbase-adapter` → `packages/risk` | 2 → 1 | downward (2 edges) | `SER-3` (merged `603a49c`; 34/75 → 34/78, with the row below) |
+| `apps/data-gateway` → `packages/risk` | 3 → 1 | downward | `SER-3` (`apps/control-api` and `apps/trader` already declared `packages/risk` since `WP-240` `0e7227d` and `WP-230` `8425e03`) |
+
+Two things this table is NOT. It is not a widening of S3/S4/S7: those rows'
+"consumed surface is the prototype-free parse door only" clauses are unchanged
+and true — `packages/capital-allocator`, `packages/execution-planner` and
+`packages/strategy-runtime` do not import `./plain-json` (grep at `1aa2238`);
+S5 and S6 were widened in place by `SER-1` and say so. And it is not a
+statement that every layer-2 package now depends on `packages/risk`:
+`packages/binance-adapter` and `packages/polymarket-secure` do not. The
+direction question a reader might raise — a layer-2 adapter depending on a
+layer-1 *risk* package for a JSON encoder — is the same one the 2026-09-04
+mirror-collapse ruling answered for the parse door: `packages/risk` is the
+canonical home of the own-data machinery (`schema-boundary.md` §1, §5 items
+5 and 11), the edge is downward, and no rule, policy or evaluation logic
+travels it. If that home ever moves to a lower layer, every row in this table
+moves with it and the count is re-recorded here.
+
 1. **Cycle detection.** Fail on any cycle in that graph. Non-zero exit, named
    cycle in the output. This is the rule §5.2 states literally, and it is what
    makes same-layer edges safe to permit at all (F9).

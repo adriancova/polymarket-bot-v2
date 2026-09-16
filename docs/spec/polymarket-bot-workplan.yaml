@@ -33,6 +33,23 @@ protected_paths:
 # with the minimal registration needed to run its own declared test tree; the
 # registration diff is part of that package's reviewed candidate.
 
+# Ratified 2026-09-15 (GOV-2C, closing GOV-2B N6): this seven-field list and
+# AGENTS.md's "Required work-package handoff" list DISAGREE — AGENTS.md adds
+# an eighth field, commit_sha, which this list has never carried (nor has the
+# handoff's §18.2 packet template, of which this list is the snake_case
+# transcription). Resolution: AGENTS.md CONTROLS. Its list is a strict
+# superset, it is the repository operating rule that binds every agent, and
+# commit_sha is the one field the §18.4 merge protocol cannot verify a record
+# without; docs/contracts/protected-contracts.md §6 already reads the two as
+# a union of eight. The list below is deliberately NOT edited (a governance
+# round writes ratification entries, not plan data); a handoff is complete
+# when it carries all eight labelled fields, and a reader of this list must
+# add commit_sha. The four Wave 2 completion records that carry none of the
+# eight as labelled sections (WP-220, WP-230, WP-240, WP-250) — and, as
+# measured there, every follow-up and non-governance bounded round since
+# 2026-09-05 — are recorded as a dated deviation in IMPLEMENTATION_STATUS.md,
+# not rewritten; whether that form is sanctioned with a field mapping is the
+# orchestrator's H7 ruling, not this entry's.
 required_handoff_fields:
   - summary
   - files_changed
@@ -576,6 +593,18 @@ work_packages:
       - packages/order-book/**
       - test/unit/order-book/**
       - test/replay-golden/order-book/**
+      # Ratified 2026-09-15, RETROACTIVELY (GOV-2C, closing GOV-2B N7; the
+      # WP-220 precedent below, itself on the WP-020 precedent): declaring the
+      # package's own workspace:* and dev dependencies mechanically updated
+      # the root lockfile's importer block. Measured at main 1aa2238: the
+      # merge 70c7f1f touched pnpm-lock.yaml with 13 insertions and 0 deletions,
+      # every hunk inside the `importers:` section. Permitted for that purpose
+      # only. This entry was NOT in the grant when the package ran: the touch
+      # was disclosed in the package's handoff and verified in its
+      # IMPLEMENTATION_STATUS.md row, but protected-contracts.md §5 step 2 —
+      # this dated entry — was skipped for thirteen days; recorded as a dated
+      # deviation in IMPLEMENTATION_STATUS.md "Deviations from specification".
+      - pnpm-lock.yaml
     forbidden_paths:
       - packages/domain/**
     deliverables:
@@ -597,6 +626,18 @@ work_packages:
       - packages/features/**
       - test/unit/features/**
       - docs/contracts/features-v1.md
+      # Ratified 2026-09-15, RETROACTIVELY (GOV-2C, closing GOV-2B N7; the
+      # WP-220 precedent below, itself on the WP-020 precedent): declaring the
+      # package's own workspace:* and dev dependencies mechanically updated
+      # the root lockfile's importer block. Measured at main 1aa2238: the
+      # merge 3d49946 touched pnpm-lock.yaml with 13 insertions and 0 deletions,
+      # every hunk inside the `importers:` section. Permitted for that purpose
+      # only. This entry was NOT in the grant when the package ran: the touch
+      # was disclosed in the package's handoff and verified in its
+      # IMPLEMENTATION_STATUS.md row, but protected-contracts.md §5 step 2 —
+      # this dated entry — was skipped for eleven days; recorded as a dated
+      # deviation in IMPLEMENTATION_STATUS.md "Deviations from specification".
+      - pnpm-lock.yaml
     forbidden_paths:
       - packages/domain/**
       - packages/strategies/**
@@ -619,6 +660,18 @@ work_packages:
       - packages/strategy-sdk/**
       - packages/strategy-runtime/**
       - test/unit/strategy-runtime/**
+      # Ratified 2026-09-15, RETROACTIVELY (GOV-2C, closing GOV-2B N7; the
+      # WP-220 precedent below, itself on the WP-020 precedent): declaring the
+      # package's own workspace:* and dev dependencies mechanically updated
+      # the root lockfile's importer block. Measured at main 1aa2238: the
+      # merge 9d0971b touched pnpm-lock.yaml with 11 insertions and 0 deletions,
+      # every hunk inside the `importers:` section. Permitted for that purpose
+      # only. This entry was NOT in the grant when the package ran: the touch
+      # was disclosed in the package's handoff and verified in its
+      # IMPLEMENTATION_STATUS.md row, but protected-contracts.md §5 step 2 —
+      # this dated entry — was skipped for twelve days; recorded as a dated
+      # deviation in IMPLEMENTATION_STATUS.md "Deviations from specification".
+      - pnpm-lock.yaml
     forbidden_paths:
       - packages/domain/**
       - packages/strategies/static-bracket/**
@@ -642,6 +695,18 @@ work_packages:
       - packages/capital-allocator/**
       - packages/risk/**
       - test/unit/risk/**
+      # Ratified 2026-09-15, RETROACTIVELY (GOV-2C, closing GOV-2B N7; the
+      # WP-220 precedent below, itself on the WP-020 precedent): declaring the
+      # package's own workspace:* and dev dependencies mechanically updated
+      # the root lockfile's importer block. Measured at main 1aa2238: the
+      # merge 98a6cc1 touched pnpm-lock.yaml with 32 insertions and 0 deletions,
+      # every hunk inside the `importers:` section. Permitted for that purpose
+      # only. This entry was NOT in the grant when the package ran: the touch
+      # was disclosed in the package's handoff and verified in its
+      # IMPLEMENTATION_STATUS.md row, but protected-contracts.md §5 step 2 —
+      # this dated entry — was skipped for eleven days; recorded as a dated
+      # deviation in IMPLEMENTATION_STATUS.md "Deviations from specification".
+      - pnpm-lock.yaml
     forbidden_paths:
       - packages/domain/**
       - packages/oms/**
@@ -665,6 +730,18 @@ work_packages:
     allowed_paths:
       - packages/execution-planner/**
       - test/unit/execution-planner/**
+      # Ratified 2026-09-15, RETROACTIVELY (GOV-2C, closing GOV-2B N7; the
+      # WP-220 precedent below, itself on the WP-020 precedent): declaring the
+      # package's own workspace:* and dev dependencies mechanically updated
+      # the root lockfile's importer block. Measured at main 1aa2238: the
+      # merge 5aa11e3 touched pnpm-lock.yaml with 7 insertions and 0 deletions,
+      # every hunk inside the `importers:` section. Permitted for that purpose
+      # only. This entry was NOT in the grant when the package ran: the touch
+      # was disclosed in the package's handoff and verified in its
+      # IMPLEMENTATION_STATUS.md row, but protected-contracts.md §5 step 2 —
+      # this dated entry — was skipped for eleven days; recorded as a dated
+      # deviation in IMPLEMENTATION_STATUS.md "Deviations from specification".
+      - pnpm-lock.yaml
     forbidden_paths:
       - packages/domain/**
       - packages/polymarket-secure/**
@@ -689,7 +766,25 @@ work_packages:
       - packages/ledger/**
       - packages/pnl/**
       - test/unit/ledger/**
+      # Recorded 2026-09-15 (GOV-2C, closing GOV-2B N9): this path has never
+      # existed — WP-200 (merged 7e75f9a) wrote no test/integration/ledger
+      # tree, and none exists at main 1aa2238 (test/integration/ holds
+      # control-api, data-gateway, event-bus, paper-trader, parquet,
+      # postgres). The entry is kept as the grant that was written; it
+      # authorizes nothing today and is not a deviation.
       - test/integration/ledger/**
+      # Ratified 2026-09-15, RETROACTIVELY (GOV-2C, closing GOV-2B N7; the
+      # WP-220 precedent below, itself on the WP-020 precedent): declaring the
+      # package's own workspace:* and dev dependencies mechanically updated
+      # the root lockfile's importer block. Measured at main 1aa2238: the
+      # merge 7e75f9a touched pnpm-lock.yaml with 38 insertions and 0 deletions,
+      # every hunk inside the `importers:` section. Permitted for that purpose
+      # only. This entry was NOT in the grant when the package ran: the touch
+      # was disclosed in the package's handoff and verified in its
+      # IMPLEMENTATION_STATUS.md row, but protected-contracts.md §5 step 2 —
+      # this dated entry — was skipped for twelve days; recorded as a dated
+      # deviation in IMPLEMENTATION_STATUS.md "Deviations from specification".
+      - pnpm-lock.yaml
     forbidden_paths:
       - packages/domain/**
       - packages/oms/**
@@ -726,6 +821,18 @@ work_packages:
       - apps/backtest-cli/**
       - test/replay-golden/**
       - test/unit/simulation/**
+      # Ratified 2026-09-15, RETROACTIVELY (GOV-2C, closing GOV-2B N7; the
+      # WP-220 precedent below, itself on the WP-020 precedent): declaring the
+      # package's own workspace:* and dev dependencies mechanically updated
+      # the root lockfile's importer block. Measured at main 1aa2238: the
+      # merge bebdd85 touched pnpm-lock.yaml with 23 insertions and 0 deletions,
+      # every hunk inside the `importers:` section. Permitted for that purpose
+      # only. This entry was NOT in the grant when the package ran: the touch
+      # was disclosed in the package's handoff and verified in its
+      # IMPLEMENTATION_STATUS.md row, but protected-contracts.md §5 step 2 —
+      # this dated entry — was skipped for eleven days; recorded as a dated
+      # deviation in IMPLEMENTATION_STATUS.md "Deviations from specification".
+      - pnpm-lock.yaml
     forbidden_paths:
       - packages/domain/**
       - packages/polymarket-secure/**
@@ -779,6 +886,18 @@ work_packages:
       - apps/trader/**
       - test/integration/paper-trader/**
       - infra/compose/trader/**
+      # Ratified 2026-09-15, RETROACTIVELY (GOV-2C, closing GOV-2B N7; the
+      # WP-220 precedent below, itself on the WP-020 precedent): declaring the
+      # package's own workspace:* and dev dependencies mechanically updated
+      # the root lockfile's importer block. Measured at main 1aa2238: the
+      # merge 8425e03 touched pnpm-lock.yaml with 58 insertions and 0 deletions,
+      # every hunk inside the `importers:` section. Permitted for that purpose
+      # only. This entry was NOT in the grant when the package ran: the touch
+      # was disclosed in the package's handoff and verified in its
+      # IMPLEMENTATION_STATUS.md row, but protected-contracts.md §5 step 2 —
+      # this dated entry — was skipped for ten days; recorded as a dated
+      # deviation in IMPLEMENTATION_STATUS.md "Deviations from specification".
+      - pnpm-lock.yaml
     forbidden_paths:
       - packages/domain/**
       - packages/polymarket-secure/**
@@ -803,6 +922,18 @@ work_packages:
       - packages/observability/**
       - infra/grafana/**
       - test/integration/control-api/**
+      # Ratified 2026-09-15, RETROACTIVELY (GOV-2C, closing GOV-2B N7; the
+      # WP-220 precedent below, itself on the WP-020 precedent): declaring the
+      # package's own workspace:* and dev dependencies mechanically updated
+      # the root lockfile's importer block. Measured at main 1aa2238: the
+      # merge 0e7227d touched pnpm-lock.yaml with 25 insertions and 0 deletions,
+      # every hunk inside the `importers:` section. Permitted for that purpose
+      # only. This entry was NOT in the grant when the package ran: the touch
+      # was disclosed in the package's handoff and verified in its
+      # IMPLEMENTATION_STATUS.md row, but protected-contracts.md §5 step 2 —
+      # this dated entry — was skipped for nine days; recorded as a dated
+      # deviation in IMPLEMENTATION_STATUS.md "Deviations from specification".
+      - pnpm-lock.yaml
     forbidden_paths:
       - packages/polymarket-secure/**
       - packages/domain/**

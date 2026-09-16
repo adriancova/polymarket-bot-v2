@@ -2,7 +2,7 @@
 
 Last updated: 2026-09-15  
 Specification version: 2.0.0  
-Current phase: `phase-2` — deterministic paper core (Wave 2 package work COMPLETE: batches 2A-2G, i.e. WP-150/WP-170/WP-200/WP-180, WP-160/WP-190, WP-210, WP-220, WP-230, WP-240 and WP-250, all merged and verified as ancestors of `main`. The cross-cutting hardening track that grew alongside Wave 2 is also complete: the inherited-`toJSON` sweep `SER-0` (`9a44167`) and its three remediation rounds `SER-1` (`c065d63`), `SER-2` (`0d8b6a0`) and `SER-3` (`603a49c`). **Wave 2 is NOT closed out**: the runbook §10 read-only closeout audit has not been run, and its conditions on the live-data paper run, the realized round trip (the `packages/risk` ENTRY-disposition residual), the dashboards, a real CI run and the §5 detector/tooling owner assignment are outstanding — see `docs/handoffs/SER-0-sweep.md` and the closeout discussion. WP-260 and the eight remaining phase-3 packages stay deferred to Wave 3.)  
+Current phase: `phase-2` — deterministic paper core (Wave 2 package work COMPLETE: batches 2A-2G, i.e. WP-150/WP-170/WP-200/WP-180, WP-160/WP-190, WP-210, WP-220, WP-230, WP-240 and WP-250, all merged and verified as ancestors of `main`. The cross-cutting hardening track that grew alongside Wave 2 is also complete: the inherited-`toJSON` sweep `SER-0` (`9a44167`) and its three remediation rounds `SER-1` (`c065d63`), `SER-2` (`0d8b6a0`) and `SER-3` (`603a49c`). **Wave 2 is NOT closed out**: ~~the runbook §10 read-only closeout audit has not been run~~ *(struck 2026-09-15 by `GOV-2C`, G-13 — written at 12:48 that day in `27ac802` and false by the afternoon: the audit WAS run on 2026-09-15 as `GOV-2B` (authorized 13:07, `b9bacc1`), verdict **WAVE 2 IS NOT CLOSED** — `docs/handoffs/GOV-2B-wave-2-closeout.md`)*, and its conditions on the live-data paper run, ~~the realized round trip (the `packages/risk` ENTRY-disposition residual)~~ *(struck the same day: reached by `RISK-2` `133eac1`, ending PAUSED — §7 item 1 stays open on RISK-2 residual 5, not on the disposition)*, the dashboards, a real CI run and the §5 detector/tooling owner assignment are outstanding — see `docs/handoffs/SER-0-sweep.md` and the closeout discussion. *(GOV-2C remediation r1, review finding GOV2C-3: the first correction struck all five conditions where only two had become false; the other three stand and are enumerated in `## Open blockers` as B4/H1, B5 and H2, and §5 item 6 remains unassigned.)* What "COMPLETE" in this sentence means and does not mean is stated in `## Wave 2 qualification` below; what is open is enumerated in `## Open blockers`, which no longer says "None.". WP-260 and the eight remaining phase-3 packages stay deferred to Wave 3.)  
 Maximum permitted run mode: `PAPER`
 
 ## Safety state
@@ -1634,9 +1634,184 @@ no signer or credentials. Wave 1 authorized per the package table.
 
 - WP-010 automated gate: install/typecheck/lint/test pass on `main` at `12ce0ab` (2026-08-22), reproduced independently by the adversarial reviewer at `1bca7cf`.
 
+## Wave 2 qualification (recorded 2026-09-15 by `GOV-2C` — `GOV-2B` G-13)
+
+Eleven rows in the table above — `WP-150`, `WP-160`, `WP-170`, `WP-180`,
+`WP-190`, `WP-200`, `WP-210`, `WP-220`, `WP-230`, `WP-240`, `WP-250` — read
+**Complete** without qualification, and the header sentence says "Wave 2
+package work COMPLETE". Both are true of exactly one thing: **each package met
+its OWN acceptance criteria**, which `GOV-2B` re-verified on 2026-09-15 against
+a named, currently-passing test per criterion, with every merge SHA an ancestor
+of `main`. A reader who takes those rows to mean "the paper core works end to
+end" will be wrong, and the closeout found that no row says so. The
+qualification is placed here, where the wave is met as a whole, rather than in
+eleven rows the orchestrator edits for governance (and which this round may not
+touch). Three facts qualify every one of those rows:
+
+1. **The §7 exit checklist is NOT met** (`docs/handoffs/GOV-2B-wave-2-closeout.md`,
+   read-only audit on `main` `b9bacc1`, verdict **WAVE 2 IS NOT CLOSED**).
+   Items 6 (no signer) and 7 (`MAX_RUN_MODE=PAPER`) MET; items 2 (replay
+   identity) and 3 (rebuild equals projections) MET WITH QUALIFICATION — the
+   committed record gives the verdict without spelling the qualification out,
+   and the blockers it lists that bear on them are **B3** (the shipped replay
+   root `apps/backtest-cli` cannot reach the strategy at all) and **B6** (the
+   evidence ran in no gate); items 1 (full paper pipeline end to end), 4
+   (Static Bracket in replay AND live-data paper through the same code) and
+   5 (dashboards) **NOT MET**. Wave 2's checklist carries no "or explicitly
+   pending" carve-out, so an unevidenced item is NOT MET, not deferred. Movement
+   since the audit, all on 2026-09-15: **B1**'s cause closed (`TRDR-2`,
+   `f3da220`) and its symptom re-raised as **B9** (`BOOT-1`, in flight —
+   the assembled durable trader still halts on its first DECISION against a
+   migrated-but-unseeded database); **B2** closed (`RISK-2`, `133eac1`: the
+   golden reaches a realized round trip, `realizedPnl "-1.2"`), but the
+   instance ends **PAUSED** after its own exit (RISK-2 residual 5) and **no
+   take-profit has ever filled in any recorded run** (`RISK2-R6`), so item 1
+   stays open; **B6** and **B7** closed (`GATE-1`, `0434c82`); **B3** in
+   flight (`BACKTEST-1`); **B4**, **B5** and **G-01** open (the list below).
+   The honest one-line statement of what the paper core has demonstrated is
+   RISK-2's: *one bracket, one round trip, closed by the cutoff reduce, ending
+   PAUSED* — in an all-doubles harness, never against a durable store.
+
+2. **The evidence tree ran in no gate until GATE-1.** `WP-250`'s six
+   `test/e2e/**` suites — the Phase-2 evidence for four of the seven checklist
+   items — were absent from `test/vitest.config.ts`'s include list and from
+   every CI step from their merge (`ce7fbe0`, 2026-09-06) until `GATE-1`
+   (`0434c82`, 2026-09-15); for nine days they passed only because auditors
+   invoked them by hand, and `test:replay`'s positional matched ZERO files
+   (`GOV-2B` N4). `GATE-1` gated the six suites by an explicit CI step and
+   pointed `test:replay` at real files. What remains: `GATE1-M1` — the
+   `test:replay` list is hand-maintained and can silently shrink back to the
+   N4 defect (below).
+
+3. **No gate has ever run anywhere but one laptop.** `git remote -v` is EMPTY
+   across the whole history (re-verified 2026-09-15 by this round);
+   `.github/workflows/ci.yml` has never executed once; every gate claimed in
+   every row of this file — Wave 0, Wave 1 and Wave 2 — was run locally by the
+   orchestrator, an implementer or a reviewer on one machine. "Post-merge gates
+   green" in any row means exactly that and nothing more (`GOV-2B` H2; also
+   `## Pending external evidence`). The Testcontainers-backed integration
+   suites ran only in the sessions where Docker was available.
+
+Two further facts a reader should carry: Wave 2's completion **unblocks nothing
+new**. *(Restated 2026-09-15 in GOV-2C remediation r1, review finding GOV2C-1.
+The sentence previously read: "`GOV-2B` parsed the `depends_on` graph and no
+package depends on `WP-150`…`WP-250` except `WP-250` itself and `WP-360`" —
+copied from the closeout and FALSE as a literal claim: re-parsing
+`docs/spec/polymarket-bot-workplan.yaml` at `1aa2238`, `WP-270` depends on
+`[WP-190, WP-200, WP-260]`, `WP-290` on `[WP-200, WP-270, WP-280]`, `WP-300`
+on `[WP-000, WP-200, WP-260]` and `WP-360` on `[WP-210, WP-350]`, besides the
+intra-wave edges.)* The true statement, and the one the conclusion rests on:
+exactly four packages outside Wave 2 depend directly on a Wave 2 package —
+`WP-270`, `WP-290`, `WP-300` (phase-3) and `WP-360` (phase-4) — and **every one
+of them also depends on `WP-260`**, directly (`WP-270`, `WP-300`) or
+transitively (`WP-290` via `WP-270`; `WP-360` via `WP-350` → `WP-340` → the
+phase-3 chain), so closing Wave 2 releases none of them; `WP-260` itself is
+held by wave ordering and the signer boundary, not by any Wave 2 row. And the four
+completion records `WP-220`, `WP-230`, `WP-240` and `WP-250` do not carry the
+eight required handoff fields as labelled sections (`## Deviations from
+specification`, N6), so a reader looking for a `known_risks` heading in them
+will not find one — their residuals are under "Accepted disclosed residuals"
+and "Follow-ups (owned)".
+
 ## Open blockers
 
-None.
+*(Corrected 2026-09-15 by `GOV-2C` — `GOV-2B` **B8**. This section previously
+read, in full: "None." It was seeded on 2026-08-21 (`58fe7ee`) before any package
+had been dispatched and was never revisited, so on 2026-09-15 it sat directly
+above a 219-line record whose own closing sentence says "**The record stays
+open**: it is discharged as an *audit* and remains open as a *remediation*,
+since every finding it names is still live on `main`". The word was true of
+nothing; the closeout had to read it as authority; it is quoted here rather
+than deleted, per `docs/contracts/protected-contracts.md` §4.)*
+
+What is open is of three kinds — closeout blockers, a residual queue that the
+last five rounds left with owners, and the cross-package record's findings
+reconciled against what has since merged. Each item names its evidence.
+
+### Closeout blockers still open (from `GOV-2B`, 2026-09-15)
+
+| Id | What | State on `main` `1aa2238` | Owner |
+| --- | --- | --- | --- |
+| **B3** | CHECK-4's replay half does not exist — `apps/backtest-cli/package.json` declares only `polymarket-public`, `simulation`, `storage-parquet`; `coreLoop` is never supplied (five grep hits, all declaration/pass-through) | OPEN, **in flight** as `BACKTEST-1` (authorized 2026-09-15, row above) | `BACKTEST-1` |
+| **B4** | CHECK-4's live-data half has never been run — `RedisMarketEventFeed` has no test; no database was ever reached from the shipped root | OPEN; depends on B9 closing first (a run today halts on its first decision) | human **H1** after `BOOT-1` |
+| **B5** | Dashboards: "Realized PnL" is a `type: text` panel with an empty targets list; no `trader_*` series has a runtime producer; `apps/trader` serves no HTTP; nothing provisions a Grafana | OPEN; nothing dispatched | `GOV-2B` rounds R4 (trader health endpoint + exact-decimal PnL producer) and R5 (scrape job, provisioned Grafana, real import — human **H3**) |
+| **B9** | The assembled durable trader halts on its first DECISION: `strategy.decisions.run_id`/`.instance_id` are NOT NULL FKs (`db/migrations/0004_strategy.up.sql:260-261`) to rows nothing in `apps/trader/src` creates; `loop.ts:1663-1674` halts on a failed `persistDecision` (the call at `:1663`, the GLOBAL `STORE_UNAVAILABLE` halt at `:1667`; *corrected in GOV-2C remediation r1, GOV2C-4 — the first version cited `:1645-1656`, inherited from the `BOOT-1`/`TRDR-2` rows, which is where the block sat before `RISK-2` shifted `loop.ts` by 18 lines*). `TRDR-2` closed B1's CAUSE (the column binding) and raised this as B1's SYMPTOM | OPEN, **in flight** as `BOOT-1` (authorized 2026-09-15; grant extended the same day to correct `health.ts`'s `RISK_SEAM_CAVEAT` and `pipeline.ts`'s premise sentence) | `BOOT-1` |
+| **G-01** | The handoff §1.2 twelve-item venue phase gate was never run for phase-2: the only full report is `docs/venue/verified-2026-08-24.md` (phase-0); `verified-2026-09-02.md` §7 item 3 records the full re-verification as owed "at the next phase gate" | OPEN; nothing dispatched; a human-plus-agent venue round | orchestrator (authorization) |
+| **H5** | The runbook:509-vs-514 ordering tension — whether one demonstrated live-data run discharges :509 or sustained accumulation is the post-closeout activity :514 describes | OPEN, a governance ruling | human |
+| **H7** | Ratification of four process deviations the closeout surfaced: the four handoffs' field format (**recorded here** as a dated deviation with its measured extent and the field-list conflict resolved, `## Deviations` N6 — the ruling on whether the form is sanctioned stays the human's); the lockfile touches (**done here**, N7 — the ten importer-block touches ratified as a pattern, `GATE-1`'s substitution recorded); the four Wave 2 orchestrator root-wiring commits without recorded reviewer sign-off (`5b73461` WP-210, `af059d7` WP-230, `80126e8` WP-240, `da37a0c` WP-250 — each disclosed as an orchestrator step in its row; NOT ratified by this round: outside its packet, and a reviewer-sign-off question is the orchestrator's to answer); the two SER confirming reviews run as Claude reviewers after Codex's content filter refused the packet (disclosed in the `SER-2`/`SER-3` rows and records; NOT ratified by this round — a model-policy decision, not a docs one) | PARTLY DONE | human/orchestrator for the form ruling, the root-wiring sign-off question and the reviewer-model question |
+
+Closed since the audit, so a reader does not re-open them: **B1** cause
+(`TRDR-2` `f3da220`), **B2** (`RISK-2` `133eac1`), **B6** and **B7** and
+N4 (`GATE-1` `0434c82`), **B8** and N2/N3(features)/N6/N7/N9/N10/G-13
+(this round). *(GOV-2C remediation r1, GOV2C-2: this list previously also
+named "N5" as closed by `GATE-1`. It is not — `GATE-1` corrected the CI label
+to "two of them" and `TRDR-2`, merged forty-five minutes later, made that
+wrong again; N5 is in the residual queue below.)*
+
+### Residual queue (owned; recorded here so a reader finds them without opening five handoffs)
+
+| Id | Residual | Evidence | Owner |
+| --- | --- | --- | --- |
+| **RISK-2 residual 5** | The round trip ends PAUSED: `planProtectedReduce` creates no order track, so when the reduction fills the strategy cannot name it (`SB.UNATTRIBUTED_FILL` → `SB.POSITION_MISMATCH` → `SB.NO_BLIND_FLATTEN` → `SB.PAUSED`); the money is right (`unattributedActivity 0`, no halts) and the pause follows the booking, but an instance that pauses on its own exit cannot open a second bracket. **§7 checklist item 1 stays OPEN.** Pinned so it fails the day it is fixed | `docs/handoffs/RISK-2.md` residual 1 | `packages/strategies/static-bracket/**` — in-grant for the next static-bracket round |
+| **RISK2-R6** | No take-profit has ever FILLED in any recorded run — the golden's take-profit is cancelled and never re-emitted (a scenario limit, honestly named) | `docs/handoffs/RISK-2.md` residual 6 | the round that extends the e2e scenario |
+| **RISK2-R2** | `RISK_SEAM_CAVEAT` (`apps/trader/src/health.ts:58-66`) is a FALSE statement published on every `HealthSnapshot` and through the control API — it still says `packages/risk` classifies a protective reduction as ENTRY and that such reductions "are therefore refused" | `docs/handoffs/RISK-2.md` residual 2 | **`BOOT-1` is fixing it** — its grant was extended 2026-09-15 to carry this correction and the `test/e2e/residuals-observed.test.ts` pin the text moves |
+| **RISK2-R1** | `apps/trader/src/pipeline.ts:99-103`'s RULE stands (the composition root may not re-derive disposition from tags) but its premise sentence "`packages/risk` decides disposition from the intent TYPE" is superseded | `docs/handoffs/RISK-2.md` residual 3 | `BOOT-1` (same grant extension) |
+| **RISK2-R3** | The e2e reconciler's exit set is the COMPLEMENT of the entry set and only the first `enter` decision is read — exact for one bracket; a second entry's fills would be summed into `exitProceeds` | `docs/handoffs/RISK-2.md` residual 4 | the next `test/e2e/**` round |
+| **RISK2-R4** | The reconciler's FIFO fold relies on ARRAY ORDER, not `atEventIngestSeq` — vacuous today (`openCostBasis` exactly `"0"`); a partial exit would make `pnl.capital_committed` order-dependent | `docs/handoffs/RISK-2.md` residual 5 | the next `test/e2e/**` round |
+| **TRDR2-R8** | A parenthesized type alias (`type X = (never); value as X`) evades the trader cast census, `eslint` AND `tsc` — `resolveTypeText` does not strip parentheses; one-line fix plus a self-test | `docs/handoffs/TRDR-2.md` residual 2 | the next round touching `test/unit/trader/**` |
+| **N5 (stale again)** | The CI step label at `.github/workflows/ci.yml:88` says "Testcontainers PostgreSQL and Redis in two of them"; `GATE-1` (`0434c82`, 17:37) wrote it correctly for its base, and `TRDR-2` (`f3da220`, 18:22) then added `test/integration/paper-trader/durable-pnl-snapshot-postgres.test.ts`, so THREE of the six chained suites (`postgres`, `event-bus`, `paper-trader`) now need a host Docker daemon and the label and its comment (`ci.yml:84-87`, "the other four … start no container") are wrong on `main`. Not closed by `GATE-1`; the same file's `TRDR-2` row says so | `docs/handoffs/TRDR-2.md` residual 6; `IMPLEMENTATION_STATUS.md` `TRDR-2` row | the next round granted `.github/workflows/ci.yml` (`BOOT-1` adds a fourth Docker-backed run and is the natural carrier if its grant is extended; otherwise a one-line label round) |
+| **TRDR2 residual 7** | `persistDecision`, `saveCheckpoint` and `appendLedgerTransaction` remain typecheck-pinned with no round trip of their own — `GOV-2B` R8 (real-infrastructure integration for the trader's adapters) is HALF discharged: `TRDR-2` round-tripped `writePnlSnapshot` only. Plus `TRDR2-R9` (a sentence claiming "nothing else in the app writes SQL at all" while `appendLedgerTransaction` does, through WP-040's ledger repository) and `TRDR2-R10` (eleven paper-trader harness aliases with no importer), both INFO | `docs/handoffs/TRDR-2.md` residual 7 | `BOOT-1`'s acceptance (a decision AND a fill end to end with every durable write landing) covers the first two round trips if it lands as specified; `appendLedgerTransaction` and the two INFOs to the next `apps/trader` round |
+| **GATE1-M1** | `test:replay` is a hand-maintained positional list; vitest fails only when the TOTAL filtered set is empty, so if ONE named file is renamed or moved the gate drops it and still exits 0 — the N4 defect can silently return. Proven by the reviewer | `docs/handoffs/GATE-1.md` residual 1 | a round granted `test/unit/**` (a guard test asserting both golden files exist by path, or one directory named in the script) |
+| **N3 (execution-planner half)** | `GOV-2A`'s 2026-09-04 ruling: `packages/execution-planner/src/refusals.ts:178-187` claims "every public entry point of this package promises a typed result" while `buyLimitPrice`/`sellLimitPrice` (`src/price.ts`) throw `InvalidDecimalStringError` on non-canonical input; to be "corrected in text or guarded in code by the next bounded round touching each package". The trigger fired unmet: `WP-180-FU2` (`625c83b`, 2026-09-04 16:58, two hours after `GOV-2A` merged) edited `refusals.ts` itself (the import at `:17`) and left the claim. The `features` half is corrected by this round (`packages/features/src/inputs.ts`, comment only, superseded text quoted at the site). **The ruling's compliance mechanism failed because nothing checks it**: it lived in one paragraph of the record below and in `docs/handoffs/GOV-2A.md` `follow_up` 8, and no packet, gate or review checklist reads either | `docs/handoffs/GOV-2A.md` `follow_up` 8; `docs/handoffs/WP-190.md` R1-L1; `docs/contracts/schema-boundary.md` §5 item 13 | the next bounded grant on `packages/execution-planner/**` — and every packet dispatched for that package must now quote this row |
+| **N2 (order-book)** | `docs/contracts/schema-boundary.md` §3's `packages/order-book` row said "scalar parses only … no object parse, so no adoption/loss"; `book.ts:191` and `:265` both `safeParse` caller-supplied `input.payload` against object schemas and read `parsed.data`. Corrected in the contract by this round; the severity is unchanged because the reachability of a defeat on those two doors has NOT been measured | `docs/contracts/schema-boundary.md` §3 (the corrected row) | the next bounded grant on `packages/order-book/**`, which owes the measurement first |
+| **R8-1** | Every `Object.defineProperty` outside `packages/risk`/`capital-allocator` still passes an ordinary descriptor literal, which throws under an inherited `get` | the record below; `docs/contracts/schema-boundary.md` §5 item 12 (owner now named) | the detector/tooling round (§5 item 6) |
+| **§5 item 6** | The detector/tooling round — a `.safeParse`-on-unmaterialized-value detector and alias/cast/indirection hardening for the census and source scans (`WP-160` R1-N3, `WP-180` R9-1, R8-2 folded), plus the F15/F16/F17 checker implementation — deliberately last and deliberately not a CI gate today | `docs/contracts/schema-boundary.md` §5 item 6; `dependency-direction.md` §3 F15–F17 | unassigned; the orchestrator authorizes it |
+| **N1 (closeout, still open)** | The frozen golden's `pnlRecords` counter and array disagree by exactly 2×: at `1aa2238`, `test/replay-golden/paper-e2e/paper-e2e-run.json` has `health.accounting.pnlRecords` **12** against a top-level `pnlRecords` array of length **6** — still present after `RISK-2`'s recapture. `GOV-2B` graded it NOT ESTABLISHED as a defect (a counter may legitimately count what the array does not carry) and owes ONE bounded check: state what the counter counts, and either pin the ratio with its reason or fix the counter | `docs/handoffs/GOV-2B-wave-2-closeout.md` N1; the golden itself | the next `test/e2e/**` round (with RISK2-R3/R4) |
+| **N8 (WP-240 r1 M-1/M-2/M-3)** | Three review-round-1 findings on the control API, live and untested: **M-1** pausing an instance the control plane has never known answers `200 PAUSED` (the shipped composition never calls `register()`; a prior is synthesized), contradicting its own `CONTROL_NOT_ENGAGED` release rule; **M-2** `TraderHealthCache.refresh()` is never called by the shipped process, so an `http` health source is accepted, validated and dead; **M-3** an authenticated READ-only operator can exhaust the audit log through pre-authorization forbidden-key refusal records and thereby disable every mutation **including the §14.1 kill switch** (fail-closed; demonstrated at capacity 3 in five requests). Nine LOWs (L-1…L-9) and N-4 sit behind them | `docs/handoffs/WP-240.md` "Accepted findings → owned follow-ups" | M-1, M-3 and the LOWs: the next bounded `apps/control-api` round; M-2: the wiring grant that gives `apps/trader` its HTTP health endpoint (`GOV-2B` R4) |
+| **G-03 (soak job specs)** | `test/soak/recorder` ships four job scripts — `soak:run`, `soak:smoke`, `soak:evaluate`, `soak:compare-books` — and only `soak:smoke` is gated (`ci.yml:72-73`, `test:soak-smoke`); `soak:evaluate` and `soak:compare-books` are evidence-producing jobs that run nowhere until an operator runs them, and `soak:evaluate` is PENDING in every record that names it (no evidence windows exist) | `docs/handoffs/GOV-2B-wave-2-closeout.md` G-03; `test/soak/recorder/package.json` | the elapsed-soak human item H4 (`WP-140` row); gating the two jobs is a `ci.yml` decision for the orchestrator |
+| **GATE1-R3** | `js-yaml 4.3.2` has never executed here: the bump was lockfile-only, local `node_modules` still holds 4.3.1, and every gate run so far used it; CI's frozen install will materialize 4.3.2 on the first real run — attribute any lint/typecheck surprise there to the bump | `docs/handoffs/GATE-1.md` residual 3 | H2 (the first real CI run) |
+| **GATE1-R4** | B7's STRUCTURAL cause survives its instance: the `node` job is one fail-fast chain with no `if:` anywhere, so a failing `test:e2e` hides five downstream steps exactly as the failing audit step did; candidate remedy `if: ${{ !cancelled() }}` on independent steps or parallel jobs | `docs/handoffs/GATE-1.md` residual 4 | the next round granted `.github/workflows/ci.yml` |
+| **RISK-2 item 7 (three members)** | (i) `RISK2-R5` — an obsolete four-row table retained in `packages/strategies/static-bracket/README.md`; (ii) the complement-leg reclassification — a strategy that establishes exposure by SELLING a token it holds is now also an EXIT, sound within §9.8's own measures but disclosed at the site and not exercised end to end (the contract-owner question it raises: gating a covered sale on its DIRECTIONAL effect needs a net-directional-exposure measure §9.8 does not define); (iii) `planEntry` tags `immediate_order_type` unconditionally, so a PASSIVE entry hits the same order-type collision the exits just escaped | `docs/handoffs/RISK-2.md` residual 7 | (i) and (iii) the next `packages/strategies/static-bracket/**` round; (ii) the contract owner, as a §9.8 question |
+| **Human items** | **H1** a live-data paper run (after `BOOT-1`); **H2** a real GitHub Actions run (see `## Pending external evidence`); **H3** a real Grafana import; **H4** elapsed soak evidence (Wave 1's carry-over, `WP-140` row); **H6** the authorization rows and round order (the orchestrator's, ongoing) | `docs/handoffs/GOV-2B-wave-2-closeout.md` "What only the human can discharge" | human |
+
+### The cross-package record below, reconciled (2026-09-15)
+
+The record's closing sentence — "every finding it names is still live on
+`main`" — was written on 2026-09-04 and is now mostly false in the direction a
+reader would hope: most of what it names has been closed by a merged door with
+an independent review. It is kept verbatim as the evidence of what was found;
+this list says what has happened to each named finding since. **Still live:**
+`packages/domain` (frozen root cause — closed at each door per ADR-020 §3,
+never itself edited, by design); `packages/order-book` (LIVE by inheritance,
+and N2 above); the `features` INPUT-side records (prototype-bearing, no live
+consumer route, `WP-160-FU1` review r1 N2); R8-1; §5 item 6; the two totality
+claims (one corrected here, one open above); and every closed door's own
+disclosed residuals, each owned in its handoff (`REC-1`'s D2-not-performed on
+its doors and the `config-door` format-check follow-up; `CLOB-1`'s
+`Array.prototype` arrays and the shared-materializer question → ADR-020
+governance; `UNIV-3`'s direct-export caller-input round; `SETL-2`'s follow-up
+hardening; `WP-060-FU1`'s `redis/transport.ts` epoch-cursor follow-up; the
+`isFreshOrdinaryContainer` round for zod's own array assembly; the
+strategy-runtime `modelOutputs` split collapse). **Closed, by which merge:**
+`packages/ledger` and `packages/pnl` → `WP-200-FU1` `a30fec8` (2026-09-05);
+`packages/strategy-runtime` → `WP-170-FU1` `d89841d` (2026-09-06);
+`apps/data-gateway`'s two measured rows, `packages/binance-adapter`,
+`packages/coinbase-adapter` and `packages/polymarket-public` rtds → `REC-1`
+`327cae7` (2026-09-06); `packages/features` output side → `WP-160-FU1`
+`5faf16b` (2026-09-06); `packages/polymarket-public` CLOB → `CLOB-1` `eb0c586`
+(2026-09-07); `packages/settlement` → `SETL-1` `af991ee` + `SETL-2` `6142e66`
+(2026-09-07); `packages/universe` → `UNIV-1` `4d7443b` + `UNIV-2` `f90ff05` +
+`UNIV-3` `cbc1ed3` (2026-09-07); `packages/event-bus` → `WP-060-FU1` `d869868`
+(2026-09-11); the `divDecimal` explicit-options hazard and the index-name
+family → `WP-020-FU1` `edf6b1d` (2026-09-05); the mirror collapse →
+`WP-180-FU2` `625c83b` (2026-09-04); ADR-021 end to end → `WP-180-FU3`
+`8c14b47`, `ALLOC-1` `d9f70a6`, `TRDR-1` `65ae56c`; the inherited-`toJSON`
+route the tally paragraph of `schema-boundary.md` §3 recorded as an OPEN
+successor obligation → `SER-0` `9a44167` (measurement) and `SER-1` `c065d63`,
+`SER-2` `0d8b6a0`, `SER-3` `603a49c` (2026-09-15; `schema-boundary.md` §5
+item 11). The authoritative per-row state remains `docs/contracts/schema-boundary.md`
+§3 (2 LIVE / 13 CLOSED / 5 outside, recounted 2026-09-11, unchanged by this
+round).
 
 ### Cross-package risk (recorded 2026-09-03): a schema parse output is not clean data
 
@@ -1863,10 +2038,14 @@ are staged.)*
 - Root `eslint.config.mjs` was outside WP-010's literal `allowed_paths`; ratified into WP-010 ownership (see completion record).
 - Node 24 pin is `engines: ">=24"` + CI `node-version: 24` + runtime smoke assertion, not an exact `.nvmrc` pin; acceptable for WP-010, tighten later if needed.
 - WP-000 verification report filename: workplan literally names `docs/venue/verified-2026-08-18.md` (plan-generation date), but handoff §1.2 requires `verified-YYYY-MM-DD.md` dated to the actual verification. **Ratified by orchestrator 2026-08-24**: the report is `docs/venue/verified-2026-08-24.md`; the workplan literal is treated as a template dated at plan generation. Flagged by independent review (M2) as requiring explicit ratification — recorded here.
+- **N6 — four Wave 2 completion records carry none of the required handoff fields as labelled sections (recorded 2026-09-15 by `GOV-2C`; `GOV-2B` N6).** `docs/handoffs/WP-220.md`, `WP-230.md`, `WP-240.md` and `WP-250.md` are written as "completion records" with the sections Lifecycle / Gates / Accepted disclosed residuals / Follow-ups (owned) (WP-250: "The acceptance criteria, as frozen" / "Key findings recorded" / "Accepted residuals / notes"), whereas every primary record from `WP-000` through `WP-210` carries `summary`, `files_changed`, `tests_run`, `assumptions`, `deviations`, `known_risks`, `follow_up`, `commit_sha` as headings. **Measured extent, wider than the closeout's four** (a heading grep over `docs/handoffs/` at `1aa2238`): the completion-record form is also used by every follow-up record except `WP-180-FU2` (which carries seven of eight, lacking `assumptions`) — `WP-020-FU1`, `WP-060-FU1`, `WP-160-FU1`, `WP-170-FU1`, `WP-180-FU3`, `WP-200-FU1`, `WP-200-FU2` — and by every bounded round since 2026-09-06 that is not a governance round: `REC-1`, `ALLOC-1`, `TRDR-1`, `TRDR-2`, `UNIV-1/2/3`, `SETL-1/2`, `CLOB-1`, `SER-0/1/2/3`, `GATE-1`, `RISK-2`. Only `GOV-1B/1C/1D/2A` carry the eight; `GOV-2B` is an audit report. So the four are not outliers; the form became the de facto standard for bounded rounds from 2026-09-05. The content is present under other names (residuals, gates, the merge and candidate SHAs in the header) and each record was the input to an independent review that accepted it, so this is recorded as a **dated deviation from `protected-contracts.md` §6's form**, not rewritten — the records are history and are the evidence their reviews were run against. Also resolved here, because the deviation cannot be graded without it: the two controlling documents DISAGREE on the field list — `docs/spec/polymarket-bot-workplan.yaml` `required_handoff_fields` lists seven (it transcribes handoff §18.2's packet template) and `AGENTS.md` "Required work-package handoff" lists eight (adding `commit_sha`). **`AGENTS.md` controls** — it is the repository operating rule that binds every agent, it is a strict superset, `commit_sha` is the one field the §18.4 merge protocol cannot verify a record without, and `protected-contracts.md` §6 already reads the two as a union of eight. The resolution is recorded as a dated comment above `required_handoff_fields` in the work plan (the list itself is not edited: a governance round writes ratification entries, not plan data). What this round does NOT decide, because it is the human's H7 item and the measured extent makes it a practice change rather than four exceptions: whether the completion-record form is sanctioned as an alternative with a stated mapping onto the eight fields (Lifecycle → `commit_sha`/`files_changed`; Gates → `tests_run`; Accepted disclosed residuals → `known_risks`; Follow-ups (owned) → `follow_up`; with `assumptions` and `deviations` the two fields the form most often leaves implicit), or whether the eight labelled sections are required again from the next dispatch. Until the orchestrator rules, the eight-field list in `AGENTS.md` is the requirement as written, and a record in the other form is a disclosed deviation, not a compliant record.
+- **N7 — ten Wave 2 merges and `GATE-1` touched the protected `pnpm-lock.yaml`; one was ratified in the work plan (recorded and ratified 2026-09-15 by `GOV-2C`; `GOV-2B` N7).** Measured at `main` `1aa2238` by `git log --first-parent main -- pnpm-lock.yaml` and a per-merge diff against each merge's first parent: **ten of the eleven Wave 2 merges** touched the lockfile — `WP-150` `70c7f1f` (+13), `WP-200` `7e75f9a` (+38), `WP-170` `9d0971b` (+11), `WP-180` `98a6cc1` (+32), `WP-190` `5aa11e3` (+7), `WP-160` `3d49946` (+13), `WP-210` `bebdd85` (+23), `WP-220` `b8f7864` (+7), `WP-230` `8425e03` (+58), `WP-240` `0e7227d` (+25) — every one insertions-only with every hunk inside the `importers:` section (workspace `link:` entries and already-pinned dev-tool references; no new `packages:`/`snapshots:` entry); `WP-250` `ce7fbe0` did not touch it. *(The closeout wrote "nine of eleven"; the measurement says ten — the closeout undercounted by one, and the packet's "ten Wave 2-era merges (nine plus GATE-1)" carried the undercount. Recorded so the number quoted is the measured one.)* Each touch was disclosed in the package's handoff and verified in its row here (the `WP-230` and `WP-240` rows say RATIFIED outright), but `protected-contracts.md` §5 step 2 — the dated entry inside the package's `allowed_paths` — was written only for `WP-220` (2026-09-05). **Ratified retroactively**, on the `WP-220` precedent (itself on `WP-020`'s): nine dated entries now sit in the work plan's `WP-150`…`WP-240` `allowed_paths`, each quoting the measured insertion count and stating the entry was absent when the package ran. The pattern is ratified as a PATTERN: a package declaring its own workspace and dev dependencies may update its own importer block, and future packages cite this entry instead of re-litigating. **`GATE-1` `0434c82` is different and is recorded, not ratified here**: its touch is a 4+/4− SUBSTITUTION in the `packages:` and `snapshots:` sections (`js-yaml 4.3.1 → 4.3.2`, clearing `GHSA-2883-xcg3-v3hh`), not an importer block; it was authorized for exactly that purpose in its `IMPLEMENTATION_STATUS.md` row, reviewed (all 405 lockfile keys diffed, the integrity hash checked against the registry, `--frozen-lockfile` proven to accept the pin), and `GATE-1` has no work-plan entry to carry a §5 step-2 comment — the ledger row is its ratification. A version bump of a transitive dependency is a different shape from an importer-block addition and does not fall under the pattern ratified above. *(Coverage limit, GOV-2C remediation r1, GOV2C-9: seven further Wave 2-era first-parent lockfile touches were made by rounds that have NO work-plan entry to carry a §5 step-2 comment — `WP-180-FU2` `625c83b`, `WP-200-FU1` `a30fec8`, `WP-020-FU1` `edf6b1d`, `WP-170-FU1` `d89841d`, `SER-1` `c065d63`, `SER-2` `0d8b6a0`, `SER-3` `603a49c` — each disclosed and importer-block-only (measured: six insertions-only; `WP-020-FU1`'s is the one-line exact pin of `decimal.js`, `^10.6.0` → `10.6.0`, in `packages/decimal`'s importer block), and `WP-180-FU2`'s is additionally ratified in `dependency-direction.md` §2.1's mirror-collapse subsection); the pattern ratified here covers them by precedent, but the work-plan entry that would record it does not exist for them, and this ledger row is the only place that says so.)*
+- **N9 — `WP-200` declares an `allowed_path` that does not exist (recorded 2026-09-15 by `GOV-2C`; `GOV-2B` N9).** `docs/spec/polymarket-bot-workplan.yaml` `WP-200` `allowed_paths` names `test/integration/ledger/**`; `WP-200` (merged `7e75f9a`) wrote no such tree and none exists at `main` `1aa2238` (`test/integration/` holds `control-api`, `data-gateway`, `event-bus`, `paper-trader`, `parquet`, `postgres`). A grant that authorizes nothing is not a deviation; it is recorded by a dated comment at the entry and here so a later reader does not go looking for the tree.
+- **N3 — a ruling's compliance mechanism failed, twice (recorded 2026-09-15 by `GOV-2C`; `GOV-2B` N3).** `GOV-2A` ruled on 2026-09-04 that two totality claims be corrected or guarded "by the next bounded round touching each package". Both triggers fired unmet: `WP-180-FU2` (`625c83b`, 2026-09-04 16:58) touched `packages/execution-planner/src/refusals.ts` two hours after the ruling merged and left the claim at `:178-187`; `WP-160-FU1` (`5faf16b`, 2026-09-06) touched `packages/features` and left `inputs.ts`'s "never throws" — its own record, `docs/handoffs/WP-160-FU1.md` follow-up 3, states only that R1-L1 and R1-L2 "remain open, untouched here" and gives no reason; `inputs.ts` WAS inside that round's grant (`packages/features/**`), so this was not a path constraint. *(GOV-2C remediation r1, GOV2C-7: the first version spliced that sentence with follow-up 1's "Doc paths were outside this round's grant", which refers to the contract-document flips, not to `inputs.ts`, and so implied a justification the record does not offer.)* The mechanism failed because **nothing checks a ruling expressed as "by the next round touching X"**: it is not in any packet template, gate or review checklist, and its only records were one paragraph in this file's cross-package subsection and `GOV-2A`'s `follow_up` 8. This round corrects the `features` claim (comment only, superseded text quoted at the site) and records the `execution-planner` claim in `## Open blockers` with the instruction that every packet for that package quote the row. The systemic fix — a ruling with a "next round touching X" trigger must ALSO be written into that package's work-plan entry as a dated comment, where a packet author reads it — is proposed, not applied: `GOV-2C`'s grant on the work plan is ratification entries only, and `packages/execution-planner` has no open package entry to carry it.
 
 ## Pending external evidence
 
-- `.github/workflows/ci.yml`: YAML-validated only — a real GitHub Actions run is pending.
+- `.github/workflows/ci.yml`: YAML-validated only — a real GitHub Actions run is pending. *(Strengthened 2026-09-15 by `GOV-2C`, `GOV-2B` H2: this is not merely pending — `git remote -v` is EMPTY across the whole history, so the workflow has never executed once, and every gate claimed in every row of this file was run on one laptop. `GATE-1` made `pnpm run audit` exit 0 and gated `test/e2e/**` by a CI step, so a first real run is no longer known to fail at `ci.yml:58`; whether it passes is unknown until it runs.)*
 
 ## Resolved evidence items
 

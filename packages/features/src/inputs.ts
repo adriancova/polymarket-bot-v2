@@ -685,7 +685,25 @@ const TOP_LEVEL_KEYS = [
 
 /**
  * Validates the materialized input tree against the v1 contract. Pure; reads
- * only the tree it is given; reports refusal paths, never throws.
+ * only the tree it is given; reports refusal paths, and never throws ON ITS
+ * PRECONDITION — a MATERIALIZED tree (own data, no accessors, no prototype
+ * chain), which is what `materializeInput` produces and what the composed
+ * entry `computeFeatureSnapshot` hands it, inside that entry's own
+ * `try`/`catch` (`snapshot.ts`, `computeGuarded` step 1 then 2). On a raw
+ * caller object the claim is false: a throwing enumerable getter escapes this
+ * function as an exception (`WP-160` review finding R1-L2, measured). The
+ * composed entry is the total surface; this export is a helper below the
+ * line `GOV-2A` drew on 2026-09-04 (`docs/handoffs/GOV-2A.md`, the `WP-190`
+ * R1-L1 ruling: totality claims scope to COMPOSED entries, and a helper may
+ * throw on precondition violation provided its claim text says so).
+ *
+ * Corrected 2026-09-15 by `GOV-2C` (comment only). The superseded text read:
+ * "Pure; reads only the tree it is given; reports refusal paths, never
+ * throws." It was written by `WP-160`, and the ruling required it corrected
+ * "by the next bounded round touching each package" — `WP-160-FU1` (merged
+ * `5faf16b`, 2026-09-06) touched this package and left it, because nothing
+ * checks the ruling; this is the correction, not a guard, so a direct caller
+ * still owns materializing first.
  */
 export function validateFeatureInput(tree: unknown): InputValidation {
   const ctx = new Ctx();
