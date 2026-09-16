@@ -23,7 +23,10 @@
       "@polymarket-bot/execution-planner": ["packages/execution-planner/src/index.ts"],
       "@polymarket-bot/simulation": ["packages/simulation/src/index.ts"],
       "@polymarket-bot/ledger": ["packages/ledger/src/index.ts"],
-      "@polymarket-bot/pnl": ["packages/pnl/src/index.ts"]
+      "@polymarket-bot/pnl": ["packages/pnl/src/index.ts"],
+      "@polymarket-bot/storage-postgres/testing": [
+        "packages/storage-postgres/src/testing/index.ts"
+      ]
     }
   },
   "include": ["."]

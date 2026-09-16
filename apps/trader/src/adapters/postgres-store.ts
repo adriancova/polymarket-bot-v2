@@ -15,19 +15,37 @@
  * DATA so §4.2's "a PostgreSQL outage stops new trading decisions" is a halt
  * the loop can act on rather than an exception it cannot.
  *
- * ## NO POSTGRESQL WAS REACHED (disclosed)
+ * ## WHAT HAS AND HAS NOT REACHED A DATABASE (disclosed)
  *
- * Docker is absent from the development environment this package was built in,
- * exactly as `WP-210` recorded for its own migration work ("NO PostgreSQL was
- * reached… NO integration evidence is claimed"). This binding is therefore
- * **typecheck-pinned only**: the column names and types come from
- * `packages/storage-postgres`'s shipped table types and its
- * `createLedgerRepository`, so a rename upstream fails `pnpm typecheck` — but
- * nothing here has been executed against a live database, and no integration
- * evidence is claimed for it. `apps/trader`'s acceptance evidence for §4.2's
- * PostgreSQL boundary is at the PORT, with failure injection
+ * This module was written where Docker was absent and was therefore shipped
+ * **typecheck-pinned only** — and `GOV-2B` measured what that was worth. The
+ * one method whose binding the compiler could not check, because a cast
+ * disabled it, was the one that was wrong: `writePnlSnapshot` inserted
+ * camelCase keys into snake_case columns and would have GLOBAL-halted the
+ * assembled trader on its first fill (blocker **B1**; the whole story is on
+ * that method). Two lessons are recorded here rather than relearned:
+ * a typecheck pin is only as strong as the weakest cast under it, and an
+ * in-memory double cannot reject a column name.
+ *
+ * `writePnlSnapshot` is now executed against a real PostgreSQL —
+ * `test/integration/paper-trader/durable-pnl-snapshot-postgres.test.ts`
+ * (`TRDR-2`) inserts through this class and reads every column back from a
+ * Testcontainers database — **into a database a TEST FIXTURE seeded**. That
+ * file establishes the column binding and NOT the assembled trader's survival,
+ * for the reason set out on {@link PostgresTraderStore.writePnlSnapshot} and in
+ * that file's own header: this table's three foreign keys need rows in
+ * `strategy.instances`, `strategy.runs` and `catalog.markets` that nothing in
+ * `apps/trader` creates. **The other three methods still have no such
+ * evidence**: `persistDecision`, `saveCheckpoint` and `appendLedgerTransaction`
+ * remain typecheck-pinned (their bindings are explicit and uncast, and
+ * `appendLedgerTransaction` goes through `WP-040`'s own repository, which the
+ * storage suite does exercise against a container), plus the `SER-2` unit pin
+ * on the decision's `jsonb` text binding. `apps/trader`'s acceptance evidence
+ * for §4.2's halt BEHAVIOUR is at the PORT, with failure injection
  * (`test/integration/paper-trader/acceptance-4-infrastructure-halts.test.ts`),
- * which is the `WP-120` precedent for the same class of claim.
+ * which is the `WP-120` precedent for that class of claim — but it is evidence
+ * about the loop's response to a failure, never about whether a statement is
+ * valid SQL. Only a database answers that.
  *
  * ## `strategy.decisions` has no repository, and that is not an omission here
  *
@@ -52,7 +70,11 @@ import { toPnlSnapshotRow, type PnlSnapshot } from "@polymarket-bot/pnl";
 import {
   createLedgerRepository,
   encodeJsonbText,
+  LEDGER_SCOPES,
+  RUN_MODES,
+  type LedgerScopeValue,
   type PolymarketBotDatabase,
+  type RunModeValue,
 } from "@polymarket-bot/storage-postgres";
 
 import {
@@ -61,6 +83,44 @@ import {
   type PortResult,
   type TraderStore,
 } from "../ports.js";
+
+/**
+ * Narrows `scope` from the row's `string` to the column's enumeration.
+ *
+ * `packages/pnl`'s `PnlSnapshotRow` types `scope` as `string`; the column is
+ * `internal.ledger_scope`, whose TypeScript mirror is a union of the six
+ * literals. The narrowing is done by SEARCHING the shipped list rather than by
+ * asserting the type, so the compiler proves the result belongs to the column's
+ * union rather than being told to believe it — a `as LedgerScopeValue` here
+ * would be the same class of suppressed check that `GOV-2B` B1 was.
+ *
+ * A value outside the list is a value PostgreSQL's enum would reject, so this
+ * refuses it identically — by throwing into {@link PostgresTraderStore.#contained},
+ * which turns it into the same `UNAVAILABLE` port data the driver's rejection
+ * would have produced, one step earlier and naming the field.
+ */
+function toLedgerScope(value: string): LedgerScopeValue {
+  const scope = LEDGER_SCOPES.find((candidate) => candidate === value);
+  if (scope === undefined) {
+    throw new Error(
+      `pnl_snapshots.scope: ${JSON.stringify(value)} is not one of ` +
+        `${LEDGER_SCOPES.join(", ")} (internal.ledger_scope)`,
+    );
+  }
+  return scope;
+}
+
+/** As {@link toLedgerScope}, for `environment` and `internal.run_mode`. */
+function toRunMode(value: string): RunModeValue {
+  const mode = RUN_MODES.find((candidate) => candidate === value);
+  if (mode === undefined) {
+    throw new Error(
+      `pnl_snapshots.environment: ${JSON.stringify(value)} is not one of ` +
+        `${RUN_MODES.join(", ")} (internal.run_mode)`,
+    );
+  }
+  return mode;
+}
 
 export interface PostgresTraderStoreOptions {
   readonly db: PolymarketBotDatabase;
@@ -227,13 +287,129 @@ export class PostgresTraderStore implements TraderStore {
     });
   }
 
-  /** §9.16's snapshot row, bound by `packages/pnl`'s own total binding. */
+  /**
+   * §9.16's snapshot row — bound COLUMN BY COLUMN, with no cast, so the
+   * compiler checks the binding.
+   *
+   * ## What was here before, and why it could not work (`GOV-2B` B1, `TRDR-2`)
+   *
+   * This method used to hand `toPnlSnapshotRow`'s record to the builder behind
+   * `.values(row as never)`. That record is `packages/pnl`'s camelCase mirror
+   * of the columns (`accountRef`, `grossTradingPnl`, `asOf`, …); the table is
+   * snake_case (`packages/storage-postgres/src/schema/accounting.ts`,
+   * `db/migrations/0006_accounting.up.sql`), and `createDatabase` registers no
+   * `CamelCasePlugin` (`packages/storage-postgres/src/database.ts`). Kysely
+   * quotes the keys it is given, so the emitted SQL was
+   *
+   * ```sql
+   * insert into "accounting"."pnl_snapshots"
+   *   ("scope", "environment", "accountRef", "instanceId", … , "asOf")
+   *   values ($1, … , $20)
+   * ```
+   *
+   * — eighteen of the twenty identifiers naming columns that do not exist.
+   * PostgreSQL answers `column "accountRef" of relation "pnl_snapshots" does
+   * not exist`; `#contained` turns that into `UNAVAILABLE`; `loop.ts:1523-1530`
+   * escalates it to a GLOBAL `STORE_UNAVAILABLE` halt, and `loop.ts:1421` runs
+   * this after EVERY fill — so the assembled durable trader halted on its
+   * first fill. **The `as never` is what suppressed the compile error that
+   * would have caught it**: the two sibling inserts above write explicit
+   * snake_case and need no cast, and now so does this one. The escalation is
+   * NOT the defect and is unchanged: a store failure SHOULD halt the loop.
+   *
+   * The twenty fields below are the whole of `PnlSnapshotRow`, and the columns
+   * they name are every column of the table except the three the DATABASE owns
+   * — `pnl_snapshot_id` (`default internal.uuid_generate_v7()`), `computed_at`
+   * (`default now()`) and `rebuilt_at` (nullable, set by a rebuild and never by
+   * a computation) — which is why the row deliberately carries none of them and
+   * why none is named here. The mapping is the one pinned at
+   * `test/unit/ledger/wp040-persistence-shape.test.ts:265-284`; with the cast
+   * gone, `pnpm typecheck` now fails here if a column is renamed, retyped,
+   * added as REQUIRED, or dropped.
+   *
+   * The row — not `snapshot` — is the source of every value, because
+   * `toPnlSnapshotRow` is the WP-200-FU1 own-data read: it takes each field
+   * from an own DATA property and returns a prototype-free record, so no value
+   * bound below can have been answered by `Object.prototype` or produced by a
+   * caller's getter.
+   *
+   * ## What the compiler still does NOT check here (`TRDR-2` r1, review R7)
+   *
+   * The pin is real and it is NARROW. Two gaps, so that it is not over-read:
+   *
+   * 1. **The column DOMAINS are invisible to it.** `fees_paid`,
+   *    `reward_estimate_total`, `realized_rewards` and `capital_committed` are
+   *    `internal.non_negative_decimal_string`; `instance_id`, `run_id` and
+   *    `market_id` are `internal.uuid_v7`, whose CHECK constraints demand the
+   *    version nibble `7` and a variant nibble in `8/9/a/b`; `account_ref` and
+   *    `denomination_asset` are `internal.identifier`, bounded at 200
+   *    characters (`db/migrations/0001_foundation.up.sql`). In TypeScript every
+   *    one of those is `string` — `DecimalString` is an ALIAS of `string`
+   *    (`packages/decimal/src/canonical.ts:59`) — so a NEGATIVE fee, a
+   *    non-version-7 uuid or a 201-character account reference typechecks
+   *    perfectly, reaches the database, and comes back as a runtime
+   *    `UNAVAILABLE` that `loop.ts:1523-1530` escalates to a GLOBAL halt. The
+   *    compiler checks the SHAPE of this statement; only PostgreSQL checks its
+   *    VALUES. The upstream refusals in `packages/pnl` are what keep those
+   *    values canonical, not anything written here.
+   * 2. **A MISSING column is not always a compile error.** Kysely makes a
+   *    nullable or defaulted column OPTIONAL on insert, so deleting
+   *    `instance_id`, `run_id`, `market_id`, `unrealized_pnl_model`,
+   *    `unrealized_pnl_liquidation` or `worst_case_resolution_pnl` from the
+   *    object below would compile and write silent NULLs into a monetary row.
+   *    What forbids that is the TESTS — the emitted statement's column set in
+   *    `test/unit/trader/pnl-snapshot-column-binding.test.ts` and the read-back
+   *    of every column in
+   *    `test/integration/paper-trader/durable-pnl-snapshot-postgres.test.ts` —
+   *    and they are load-bearing for exactly this reason.
+   *
+   * ## What the round trip proves, and what it does not (review R1)
+   *
+   * The Testcontainers file above inserts through THIS class and reads every
+   * column back, so the binding is established against the real schema. It does
+   * NOT establish that the assembled trader survives. This table's `instance_id`,
+   * `run_id` and `market_id` are foreign keys into `strategy.instances`,
+   * `strategy.runs` and `catalog.markets`, and the rows satisfying them are
+   * created by `createTradingChain`, a `@polymarket-bot/storage-postgres/testing`
+   * FIXTURE. **No code in `apps/trader` creates those rows**: this class's three
+   * inserts are `strategy.decisions`, `strategy.state_checkpoints` and
+   * `accounting.pnl_snapshots`, and nothing else in the app writes SQL at all.
+   * Against the migrated-but-unseeded database `main.ts` builds, this method
+   * therefore still fails — `violates foreign key constraint
+   * "pnl_snapshots_instance_id_fkey"`, measured by the adversarial review of
+   * `TRDR-2` round 1 — and `persistDecision` fails earlier still, because
+   * `strategy.decisions.run_id` and `.instance_id` are NOT NULL foreign keys and
+   * `loop.ts:1645-1656` halts on a failed decision write. The missing piece is a
+   * BOOTSTRAP path that registers the market, the instance and the run; it is a
+   * separate closeout blocker and is deliberately not invented here.
+   */
   async writePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>> {
     return await this.#contained("write a PnL snapshot", async () => {
       const row = toPnlSnapshotRow(snapshot);
       await this.#db
         .insertInto("accounting.pnl_snapshots")
-        .values(row as never)
+        .values({
+          scope: toLedgerScope(row.scope),
+          environment: toRunMode(row.environment),
+          account_ref: row.accountRef,
+          instance_id: row.instanceId,
+          run_id: row.runId,
+          market_id: row.marketId,
+          denomination_asset: row.denominationAsset,
+          gross_trading_pnl: row.grossTradingPnl,
+          core_net_pnl: row.coreNetPnl,
+          all_in_pnl: row.allInPnl,
+          realized_pnl: row.realizedPnl,
+          unrealized_pnl_midpoint: row.unrealizedPnlMidpoint,
+          unrealized_pnl_model: row.unrealizedPnlModel,
+          unrealized_pnl_liquidation: row.unrealizedPnlLiquidation,
+          worst_case_resolution_pnl: row.worstCaseResolutionPnl,
+          fees_paid: row.feesPaid,
+          reward_estimate_total: row.rewardEstimateTotal,
+          realized_rewards: row.realizedRewards,
+          capital_committed: row.capitalCommitted,
+          as_of: row.asOf,
+        })
         .execute();
     });
   }
