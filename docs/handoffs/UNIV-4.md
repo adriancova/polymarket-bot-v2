@@ -8,7 +8,9 @@ Branch `univ-4`, rebased onto `main` `da9c58e` (VENUE-2 `d6aedee` + TRDR-3
 | `f687513` | the reproduction pin at base: the published stream never carries `MarketOpened` / `MarketClosing`; the documented polled surface is never consulted (data-gateway integration 12 / 59 at the original base; the pin then flips) |
 | `bc7871d` | the round: `packages/polymarket-public/src/market-state/`, the gateway's `lifecycle` feed, its ledger, its configuration door, the contract fixture and tests, acceptance (a)/(b)/(d) |
 | `615cabb` | part (c): the trader opens a market from the gateway's REAL `MarketOpened`, over Redis (Testcontainers) and in memory |
-| this file's commit | the handoff |
+| `6788e26` | this handoff |
+| `acc122a` | the ledger record built as its own type (a forbidden `as unknown as` removed; behaviour unchanged) |
+| the tip | this file's commit-SHA table updated |
 
 ## summary
 
@@ -155,7 +157,7 @@ Not touched: `packages/domain/**`, `packages/universe/**`, `apps/trader/src/**`,
 
 ## tests_run
 
-Gates at tip `615cabb` (baseline: `main` `da9c58e` after TRDR-3):
+Gates at tip (re-run at the final tip after `acc122a`; baseline: `main` `da9c58e` after TRDR-3):
 
 | Gate | Baseline | Tip |
 | --- | --- | --- |
@@ -271,4 +273,6 @@ Repository assumptions: the fold's contract (`packages/universe/src/lifecycle.ts
 - reproduction pin: `f687513`
 - round: `bc7871d`
 - part (c): `615cabb`
-- handoff: the commit carrying this file (recorded in the hand-back message)
+- handoff: `6788e26`
+- the `as unknown as` removal: `acc122a`
+- tip: the commit carrying this table (recorded in the hand-back message)
