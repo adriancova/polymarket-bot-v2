@@ -183,6 +183,9 @@ export function healthDocument(
       unattributedActivity: 0,
       unexplainedMovements: 0,
       pnlRecords: 3,
+      // `TRDR-3`: exact decimal strings, as the trader's health surface
+      // carries them; `account` is the trader's exact sum.
+      realizedPnl: { byInstance: { "sb-1": "-1.2" }, account: "-1.2" },
     },
     seams: {
       fills: { remembered: 3, maximumRemembered: 4096, admitted: 3, refused: 1, evictions: 0 },

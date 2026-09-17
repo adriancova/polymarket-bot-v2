@@ -1,19 +1,37 @@
 /**
- * `TRDR-3` REPRODUCTION — the shipped control API never reads its `http`
- * trader-health source (`WP-240` r1 M-2, `GOV-2B` N8).
+ * `TRDR-3` — the shipped control API reads its `http` trader-health source.
  *
- * At base `b3a829c` the control API ACCEPTS an `http` trader health source,
- * VALIDATES its URL as loopback, constructs `TraderHealthCache` around it
- * (`main.ts:174`) — and nothing ever calls `refresh()`: the only occurrence of
- * `refresh()` in `apps/control-api/src` outside a test is its own declaration
- * (`health-source.ts:242`). This file drives the SHIPPED `startup()` with
- * `serve: true` against a counting stub on the loopback and asserts the defect
- * as it stands: ZERO requests to the stub over 1.5 s of serving and two
- * authorized reads, and `control_trader_health_available 0` on `/v1/metrics`.
+ * ## The reproduction this file started as (`WP-240` r1 M-2, `GOV-2B` N8)
  *
- * THIS IS THE PIN THAT FLIPS. The round that wires the refresh rewrites the
- * assertions below to the wired behaviour; a reader of the history sees the
- * same drive measure both states.
+ * At base `b3a829c` the control API ACCEPTED an `http` trader health source,
+ * VALIDATED its URL as loopback, constructed `TraderHealthCache` around it
+ * (`main.ts:174`) — and nothing ever called `refresh()`: the only occurrence
+ * of `refresh()` in `apps/control-api/src` outside a test was its own
+ * declaration (`health-source.ts:242`). The first commit of this file
+ * (`5742c4d`) drove the SHIPPED `startup()` with `serve: true` against a
+ * counting stub on the loopback and measured ZERO requests over 1.5 s of
+ * serving plus two authorized reads, `control_trader_health_available 0`, no
+ * `control_trader_health_reads_total` line and no `trader_*` family on
+ * `/v1/metrics`.
+ *
+ * ## What it pins now — the same drive, the assertions flipped
+ *
+ * The source is read on an authorized `/v1/metrics` and `/v1/health`
+ * (refresh-on-read, `api.ts` header) and NOT unprompted; the trader families
+ * have producer lines; and when the stub goes away the read is COUNTED as
+ * `UNAVAILABLE` while the last good report is RETAINED — `health-source.ts`'s
+ * documented semantics, unchanged, so `control_trader_health_available` STAYS
+ * 1 and the freshness signal is `control_trader_health_current`, which drops
+ * to 0. An anonymous caller never causes a trader request.
+ *
+ * ## Why a stub, here
+ *
+ * This file is about the control API's own wiring, and a stub whose request
+ * count is the instrument is the honest way to measure "did the shipped
+ * process ask". The trader's REAL health server is on the other end of the
+ * REAL `HttpTraderHealthSource` in `trader-health-http-source.test.ts` (this
+ * directory) and of the real composition root in
+ * `test/integration/paper-trader/trader-health-endpoint-postgres.test.ts`.
  *
  * ## Shutdown
  *
@@ -83,19 +101,28 @@ function startStub(): Promise<Stub> {
         close: () =>
           new Promise<void>((done) => {
             server.close(() => done());
+            server.closeAllConnections();
           }),
       });
     });
   });
 }
 
+/** `token: null` sends no credential at all (a default parameter would re-admit `TOKEN` on `undefined`). */
 function get(
   port: number,
   path: string,
+  token: string | null = TOKEN,
 ): Promise<{ readonly status: number; readonly body: string }> {
   return new Promise((resolve, reject) => {
     const req = httpRequest(
-      { host: "127.0.0.1", port, path, method: "GET", headers: { authorization: `Bearer ${TOKEN}` } },
+      {
+        host: "127.0.0.1",
+        port,
+        path,
+        method: "GET",
+        headers: token === null ? {} : { authorization: `Bearer ${token}` },
+      },
       (response) => {
         const chunks: Buffer[] = [];
         response.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -112,7 +139,10 @@ function get(
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Starts the SHIPPED process on a written configuration; returns its port. */
-async function startShipped(stubPort: number, directory: string): Promise<{ port: number; lines: string[] }> {
+async function startShipped(
+  stubPort: number,
+  directory: string,
+): Promise<{ port: number; lines: string[] }> {
   const configPath = join(directory, "control-api.json");
   await writeFile(
     configPath,
@@ -159,33 +189,87 @@ async function stopShipped(lines: string[]): Promise<void> {
   expect(lines).toContain("control API stopped.");
 }
 
-describe("REPRODUCTION at base: the shipped control API never reads its `http` health source", () => {
+describe("the SHIPPED control API reads its `http` trader health source (TRDR-3; the WP-240 M-2 pin, flipped)", () => {
   let directory = "";
   afterEach(async () => {
     if (directory !== "") await rm(directory, { recursive: true, force: true });
     directory = "";
   });
 
-  it("serves for 1.5 s, answers two authorized reads, and the stub receives ZERO requests; available stays 0", async () => {
+  it("reads on an authorized metrics read, never unprompted; counts the source going away and RETAINS the last good report", async () => {
     directory = await mkdtemp(join(tmpdir(), "trdr3-control-api-"));
     const stub = await startStub();
     const { port, lines } = await startShipped(stub.port, directory);
     try {
-      expect(lines.join("\n")).toContain("trader health source http");
-      await sleep(1500);
+      expect(lines.join("\n")).toContain("is read on every authorized /v1/health and /v1/metrics request");
+
+      // Nothing is read unprompted (no timer): 300 ms of serving, zero asks.
+      await sleep(300);
       expect(stub.hits()).toBe(0);
 
-      const metrics = await get(port, "/v1/metrics");
-      expect(metrics.status).toBe(200);
-      expect(metrics.body).toContain("control_trader_health_available 0");
-      expect(metrics.body).not.toContain("control_trader_health_reads_total");
-      expect(metrics.body).not.toContain("trader_events_accepted_total");
+      // An authorized READ of the metrics surface refreshes the cache first.
+      const first = await get(port, "/v1/metrics");
+      expect(first.status).toBe(200);
+      expect(stub.hits()).toBe(1);
+      expect(first.body).toContain("control_trader_health_available 1");
+      expect(first.body).toContain("control_trader_health_current 1");
+      expect(first.body).toContain('control_trader_health_reads_total{outcome="OK"} 1');
+      // …and the trader families the dashboards name now have producer lines.
+      expect(first.body).toContain("trader_events_accepted_total 3");
+      expect(first.body).toContain("trader_pnl_records_total 1");
 
+      // The health read refreshes too, and answers the door's output.
       const health = await get(port, "/v1/health");
       expect(health.status).toBe(200);
-      expect((JSON.parse(health.body) as { available: boolean }).available).toBe(false);
+      expect(stub.hits()).toBe(2);
+      const parsed = JSON.parse(health.body) as {
+        available: boolean;
+        current: boolean;
+        reads: Record<string, number>;
+        report: { asOf: string; accounting: { realizedPnl: { account: string | null } } };
+        note: string;
+      };
+      expect(parsed.available).toBe(true);
+      expect(parsed.current).toBe(true);
+      expect(parsed.reads).toEqual({ OK: 2 });
+      expect(parsed.report.asOf).toBe("2026-09-16T00:00:10Z");
+      // The real `HealthState` with no book attached says "no snapshot observed".
+      expect(parsed.report.accounting.realizedPnl.account).toBeNull();
+      expect(parsed.note).toContain("this read refreshed it");
 
-      // Two reads later, still nothing asked the trader.
+      // The source goes away. The read is COUNTED, the last good report is
+      // RETAINED (documented semantics, unchanged), `available` stays 1, and
+      // `current` says the retained report is no longer the latest answer.
+      await stub.close();
+      const after = await get(port, "/v1/metrics");
+      expect(after.status).toBe(200);
+      expect(after.body).toContain("control_trader_health_available 1");
+      expect(after.body).toContain("control_trader_health_current 0");
+      expect(after.body).toContain('control_trader_health_reads_total{outcome="OK"} 2');
+      expect(after.body).toContain('control_trader_health_reads_total{outcome="UNAVAILABLE"} 1');
+      expect(after.body).toContain("trader_events_accepted_total 3");
+      const stale = JSON.parse((await get(port, "/v1/health")).body) as {
+        available: boolean;
+        current: boolean;
+        report: { asOf: string };
+        note: string;
+      };
+      expect(stale.available).toBe(true);
+      expect(stale.current).toBe(false);
+      expect(stale.report.asOf).toBe("2026-09-16T00:00:10Z");
+      expect(stale.note).toContain("retained from an earlier one");
+    } finally {
+      await stopShipped(lines);
+    }
+  }, 30_000);
+
+  it("an UNAUTHENTICATED request never reaches the source", async () => {
+    directory = await mkdtemp(join(tmpdir(), "trdr3-control-api-"));
+    const stub = await startStub();
+    const { port, lines } = await startShipped(stub.port, directory);
+    try {
+      expect((await get(port, "/v1/metrics", null)).status).toBe(401);
+      expect((await get(port, "/v1/health", "not-the-token-and-not-a-credential-0000000000")).status).toBe(401);
       expect(stub.hits()).toBe(0);
     } finally {
       await stopShipped(lines);

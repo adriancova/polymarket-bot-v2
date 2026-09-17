@@ -20,15 +20,22 @@
  *
  * ## What it does NOT claim
  *
- * It does not claim `apps/trader` serves this document over HTTP. It does not.
- * See `apps/control-api/src/health-source.ts` — the endpoint is a documented
- * composition obligation on a future `apps/trader` grant. What this pins is the
- * SHAPE, which is the half `WP-240` can own.
+ * It does not claim anything about a wire: what this pins is the SHAPE, the
+ * half `WP-240` could own. (This paragraph used to say "`apps/trader` does not
+ * serve this document over HTTP … a documented composition obligation on a
+ * future `apps/trader` grant"; `TRDR-3` discharged that — the served bytes are
+ * pinned in `trader-health-http-source.test.ts` beside this file, through the
+ * REAL `HttpTraderHealthSource` against the REAL `startTraderHealthServer`.)
  */
 
 import { describe, expect, it } from "vitest";
 
-import { HealthState, RISK_SEAM_CAVEAT, type HealthSnapshot } from "@polymarket-bot/trader";
+import {
+  HealthState,
+  RISK_SEAM_CAVEAT,
+  RealizedPnlBook,
+  type HealthSnapshot,
+} from "@polymarket-bot/trader";
 import { readTraderHealthReport } from "@polymarket-bot/control-api";
 import {
   PLATFORM_METRIC_FAMILIES,
@@ -38,10 +45,16 @@ import {
 
 /**
  * Builds a snapshot from the REAL `HealthState`, exercising every counter it
- * has a mutator for, so the pin covers the whole surface rather than a corner.
+ * has a mutator for — and, since `TRDR-3`, the attached `RealizedPnlBook`
+ * (`accounting.realizedPnl`, exact decimal strings) — so the pin covers the
+ * whole surface rather than a corner.
  */
 function realSnapshot(): HealthSnapshot {
   const state = new HealthState({ runMode: "PAPER", maximumRunMode: "PAPER" });
+  const realizedPnl = new RealizedPnlBook();
+  realizedPnl.record({ instanceId: "sb-1", realizedPnl: "-1.2" });
+  realizedPnl.record({ instanceId: "sb-2", realizedPnl: "0.3" });
+  state.attachRealizedPnl(realizedPnl);
 
   state.countLoop("eventsAccepted", 40);
   state.countLoop("eventsProcessed", 39);
@@ -158,6 +171,31 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
     expect(report.risk.refusedExits).toBe(1);
     expect(report.risk.refusedExitsByCode).toEqual({ RISK_NO_NET_EDGE: 1 });
     expect(report.seams.allocator.refusalsByCode).toEqual({ CAPITAL_CAP_EXCEEDED: 1 });
+    // `TRDR-3`: the exact decimals and the trader's exact sum, through the door.
+    expect(report.accounting.realizedPnl).toEqual({
+      byInstance: { "sb-1": "-1.2", "sb-2": "0.3" },
+      account: "-0.9",
+    });
+  });
+
+  it("accepts the 'no snapshot observed' form — account null, no instances — that a fresh trader serves", () => {
+    const state = new HealthState({ runMode: "PAPER", maximumRunMode: "PAPER" });
+    const fresh = state.snapshot({
+      asOf: "2026-09-16T00:00:00Z",
+      halts: [],
+      queues: [],
+      seams: realSnapshot().seams,
+    });
+    expect(fresh.accounting.realizedPnl).toEqual({ byInstance: {}, account: null });
+    const result = readTraderHealthReport(overTheWire(fresh));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.accounting.realizedPnl.account).toBeNull();
+    // …and the samples then OMIT both PnL families rather than rendering a 0.
+    const exposition = renderExpositionFor(PLATFORM_METRIC_FAMILIES, traderHealthSamples(result.value));
+    expect(exposition).not.toContain("trader_realized_pnl_info{");
+    expect(exposition).not.toContain("trader_account_realized_pnl_info{");
+    expect(exposition).toContain("trader_pnl_records_total 0");
   });
 
   it("carries WP-230's riskSeamCaveat through verbatim", () => {

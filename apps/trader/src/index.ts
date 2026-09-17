@@ -107,13 +107,35 @@ export {
 export {
   HealthState,
   RISK_SEAM_CAVEAT,
+  RealizedPnlBook,
+  type AccountingCounters,
   type AccountingHealth,
   type ExecutionHealth,
   type HealthSnapshot,
   type LoopHealth,
+  type RealizedPnlHealth,
+  type RealizedPnlObservation,
   type RiskHealth,
   type SeamHealth,
 } from "./health.js";
+
+export {
+  TRADER_HEALTH_BOUNDS,
+  TRADER_HEALTH_LOOPBACK_HOSTS,
+  TRADER_HEALTH_PATH,
+  classifyHealthFailure,
+  healthResponseBody,
+  readHealthServerEnv,
+  startTraderHealthServer,
+  type HealthListen,
+  type HealthServerEnvResult,
+  type HealthServerRefusal,
+  type HealthServerRefusalCode,
+  type RunningTraderHealthServer,
+  type TraderHealthServerOptions,
+} from "./health-server.js";
+
+export { observeRealizedPnl } from "./pnl-observation.js";
 
 export {
   AllocatorGate,

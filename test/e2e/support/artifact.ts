@@ -230,7 +230,19 @@ export interface ArtifactHealth {
     readonly recommendationsByAction: Readonly<Record<string, number>>;
   };
   readonly execution: Readonly<Record<string, number>>;
-  readonly accounting: Readonly<Record<string, number>>;
+  /**
+   * The accounting counters plus, since `TRDR-3`, `realizedPnl` — exact
+   * decimal STRINGS per instance and their exact sum, or `null` while the
+   * composition observed no PnL snapshot (this harness attaches no
+   * `RealizedPnlBook`; see `test/replay-golden/paper-e2e/README.md`).
+   */
+  readonly accounting: Readonly<
+    Record<
+      string,
+      | number
+      | { readonly byInstance: Readonly<Record<string, string>>; readonly account: string | null }
+    >
+  >;
   readonly seams: {
     readonly fills: MetricGroup;
     readonly reservations: MetricGroup;

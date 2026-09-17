@@ -3,9 +3,11 @@
  * health state", shaped by handoff §14.3's metric families.
  *
  * What this module is NOT: a dashboard, an HTTP endpoint or a Prometheus
- * exporter. Those are `WP-240` (control API and paper dashboards) and
- * `packages/observability`. This is the STATE those will read — one value,
- * snapshot-able, deterministic, with no clock of its own.
+ * exporter. Those are `WP-240` (control API and paper dashboards),
+ * `packages/observability`, and — since `TRDR-3` — this app's own
+ * `health-server.ts`, which serves the snapshot below over the loopback. This
+ * is the STATE those read — one value, snapshot-able, deterministic, with no
+ * clock of its own.
  *
  * ## What the packet requires this to expose, and where each lives
  *
@@ -39,7 +41,33 @@
  * DETERMINISM. Counters are integers, maps are emitted in sorted key order, and
  * no method reads a clock: every instant is supplied. Two identical runs
  * produce identical snapshots.
+ *
+ * ## Realized PnL, as an EXACT decimal (`TRDR-3`, `GOV-2B` B5)
+ *
+ * `accounting.realizedPnl` carries the PnL engine's OWN value — the
+ * `realizedPnl` of the latest `PnlSnapshot` the durable store accepted, per
+ * strategy instance, plus their exact sum — as decimal STRINGS. It is not a
+ * second accounting: nothing here multiplies a price by a size. The value is
+ * observed at the store port ({@link RealizedPnlBook}, fed by
+ * `pnl-observation.ts` from the same `writePnlSnapshot` call that persists
+ * the row), so the health surface reports what the database holds and never a
+ * number computed on the way. `Number(...)` does not appear in this file; the
+ * sum is `@polymarket-bot/decimal`'s `addDecimal`, and
+ * `test/unit/trader/health-realized-pnl.test.ts` proves the round trip on a
+ * value float64 cannot represent.
+ *
+ * WHY A BOOK THE ROOT ATTACHES, rather than a counter the loop increments: the
+ * loop hands `writePnlSnapshot` its snapshot and reads back only `ok`; the
+ * composition root (`main.ts`) is the one place that holds the store BEFORE
+ * the trader exists and the health state AFTER, so it wraps the store and
+ * attaches the book — {@link HealthState.attachRealizedPnl}. Until a book is
+ * attached (a composition that does not observe its store —
+ * `test/e2e/support/harness.ts` today) the field reads `byInstance: {}` and
+ * `account: null`: "no snapshot observed", stated as such rather than as a
+ * zero nobody measured.
  */
+
+import { addDecimal } from "@polymarket-bot/decimal";
 
 import type { AllocatorMetrics } from "./allocation.js";
 import type { CancelLedgerMetrics } from "./cancels.js";
@@ -176,13 +204,97 @@ export interface LoopHealth {
   readonly deliveriesSuppressedByHalt: number;
 }
 
-/** Counters for the §14.3 `accounting` family. */
-export interface AccountingHealth {
+/** The integer counters of the §14.3 `accounting` family — what {@link HealthState.countAccounting} moves. */
+export interface AccountingCounters {
   readonly ledgerTransactions: number;
   readonly ledgerRefusals: number;
   readonly unattributedActivity: number;
   readonly unexplainedMovements: number;
   readonly pnlRecords: number;
+}
+
+/**
+ * Realized PnL on the health surface, as EXACT decimal strings (`TRDR-3`).
+ *
+ * Every value is a `PnlSnapshot.realizedPnl` the store accepted, or the exact
+ * `addDecimal` fold of those values. See the module header.
+ */
+export interface RealizedPnlHealth {
+  /**
+   * The latest persisted snapshot's `realizedPnl` per strategy instance,
+   * keyed by instance id, in sorted key order.
+   */
+  readonly byInstance: Readonly<Record<string, string>>;
+  /**
+   * The exact sum over `byInstance`, or `null` while NO snapshot has been
+   * observed — a composition that attached no book, or a run that has not
+   * produced a snapshot yet. Never a defaulted `"0"`: an absent measurement
+   * and a flat account are different facts.
+   */
+  readonly account: string | null;
+}
+
+/** The §14.3 `accounting` family: the counters plus the exact realized PnL. */
+export interface AccountingHealth extends AccountingCounters {
+  readonly realizedPnl: RealizedPnlHealth;
+}
+
+/** The shape {@link RealizedPnlBook.record} reads — `PnlSnapshot`'s two relevant fields. */
+export interface RealizedPnlObservation {
+  readonly instanceId: string | null;
+  readonly realizedPnl: string;
+}
+
+/** The "nothing observed" view, frozen once. */
+const NO_REALIZED_PNL: RealizedPnlHealth = Object.freeze({
+  byInstance: Object.freeze(Object.create(null) as Record<string, string>),
+  account: null,
+});
+
+/**
+ * The latest realized PnL per instance, as the store accepted it.
+ *
+ * Owned by the composition root, written by `pnl-observation.ts`'s store
+ * decorator AFTER a successful `writePnlSnapshot`, read by
+ * {@link HealthState.snapshot} once attached. Holding the values here rather
+ * than inside `HealthState` is what lets the root wrap the store before the
+ * trader (and therefore the health state) exists, without losing a write that
+ * happened in between — there is none today, and the design does not rely on
+ * that.
+ */
+export class RealizedPnlBook {
+  readonly #byInstance = new Map<string, string>();
+  #observed = 0;
+
+  /**
+   * Records one accepted snapshot. A snapshot with no instance id (a
+   * non-strategy stream) is not per-instance and is NOT recorded: the trader
+   * writes only `VIRTUAL_STRATEGY` streams today, and a future account-scope
+   * stream would need its own field rather than being folded into this one.
+   */
+  record(snapshot: RealizedPnlObservation): void {
+    if (snapshot.instanceId === null) return;
+    this.#byInstance.set(snapshot.instanceId, snapshot.realizedPnl);
+    this.#observed += 1;
+  }
+
+  /** How many snapshots were recorded. */
+  get observed(): number {
+    return this.#observed;
+  }
+
+  /** The frozen, sorted view with the exact account sum. */
+  view(): RealizedPnlHealth {
+    if (this.#byInstance.size === 0) return NO_REALIZED_PNL;
+    const byInstance: Record<string, string> = Object.create(null) as Record<string, string>;
+    let account = "0";
+    for (const instanceId of [...this.#byInstance.keys()].sort()) {
+      const value = this.#byInstance.get(instanceId) ?? "0";
+      byInstance[instanceId] = value;
+      account = addDecimal(account, value);
+    }
+    return Object.freeze({ byInstance: Object.freeze(byInstance), account });
+  }
 }
 
 /**
@@ -287,6 +399,9 @@ export class HealthState {
     pnlRecords: 0,
   };
 
+  /** The realized-PnL book, once the composition root attaches one. */
+  #realizedPnl: RealizedPnlBook | undefined;
+
   constructor(options: { readonly runMode: string; readonly maximumRunMode: string }) {
     this.runMode = options.runMode;
     this.maximumRunMode = options.maximumRunMode;
@@ -300,8 +415,20 @@ export class HealthState {
     this.#execution[field] += by;
   }
 
-  countAccounting(field: keyof AccountingHealth, by = 1): void {
+  countAccounting(field: keyof AccountingCounters, by = 1): void {
     this.#accounting[field] += by;
+  }
+
+  /**
+   * Attaches the book `accounting.realizedPnl` is read from (`TRDR-3`).
+   *
+   * Called once by the composition root, after `createPaperTrader` returns and
+   * before the first event is pumped (`main.ts`, `assembleDurableTrader`). A
+   * snapshot taken before this call reports "no snapshot observed"; a second
+   * call replaces the book, which no composition does.
+   */
+  attachRealizedPnl(book: RealizedPnlBook): void {
+    this.#realizedPnl = book;
   }
 
   countRiskApproval(): void {
@@ -366,7 +493,10 @@ export class HealthState {
         recommendationsByAction: sortedCounts(this.#recommendationsByAction),
       }),
       execution: Object.freeze({ ...this.#execution }),
-      accounting: Object.freeze({ ...this.#accounting }),
+      accounting: Object.freeze({
+        ...this.#accounting,
+        realizedPnl: this.#realizedPnl?.view() ?? NO_REALIZED_PNL,
+      }),
       seams: Object.freeze({
         fills: input.seams.fills,
         reservations: input.seams.reservations,

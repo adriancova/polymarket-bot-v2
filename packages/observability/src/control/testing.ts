@@ -122,6 +122,17 @@ export function fullTraderHealthReport(
       unattributedActivity: 403,
       unexplainedMovements: 404,
       pnlRecords: 405,
+      realizedPnl: {
+        // Two instances, keyed out of order so sorting is observable; each
+        // value is one a float64 cannot represent (37 significant digits, and
+        // 20). The account line is a fixture string too — this package never
+        // adds decimals, it carries what the trader computed.
+        byInstance: {
+          "sb-2": "-0.1000000000000000055511151231257827",
+          "sb-1": "12345678901234567890.12345",
+        },
+        account: "12345678901234567890.0234499999999999944488848768742173",
+      },
     },
     seams: {
       fills: {
@@ -173,6 +184,7 @@ export function fullControlPlaneInput(
     allowRealOrders: false,
     modeRaiseAttemptsRefused: 2,
     traderHealthAvailable: true,
+    traderHealthCurrent: false,
     traderHealthReadsByOutcome: { OK: 11, REFUSED: 1, UNAVAILABLE: 3 },
     strategyInstancesByState: { PAUSED: 1, RUNNING: 2 },
     pausedInstanceIds: ["sb-2"],

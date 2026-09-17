@@ -32,8 +32,39 @@ over a different subject — the paper-core end-to-end surface `WP-230` and
 | `ledgerTransactions` | the append-only postings, entry by entry |
 | `pnlRecords` / `pnlSnapshots` | the §9.16 stream and the rows written to the store |
 | `ledgerProjection` | the §6 invariant 8 fold: balances, virtual positions, and the two "nothing unexplained" counts |
-| `health` | every §14.3-shaped counter the run moved |
+| `health` | every §14.3-shaped counter the run moved, plus `accounting.realizedPnl` (below) |
 | `reconciliation` | the projected-vs-realized table, with each difference's named mechanism |
+
+### `health.accounting.realizedPnl` reads "no snapshot observed" here — deliberately, and why
+
+`TRDR-3` (2026-09-17) gave the trader's health surface `accounting.realizedPnl`:
+`byInstance` (the latest `PnlSnapshot.realizedPnl` the durable store accepted,
+per instance, EXACT decimal strings) and `account` (their exact
+`@polymarket-bot/decimal` sum, or `null` while no snapshot has been observed).
+The value is observed at the STORE PORT: `apps/trader/src/main.ts`'s
+`assembleDurableTrader` wraps the store with `observeRealizedPnl` and attaches
+the resulting `RealizedPnlBook` to the health state. `test/e2e/support/harness.ts`
+calls `createPaperTrader` directly with a bare `MemoryTraderStore` and attaches
+no book, so this golden carries
+
+```json
+"realizedPnl": { "account": null, "byInstance": {} }
+```
+
+— an ABSENT measurement, stated as such, not a `"0"`. The regeneration that
+added it moved exactly these four lines and nothing else. The same run's
+`pnlSnapshots[2].realizedPnl` is `"-1.2"`, so a harness that attached the book
+the way the composition root does (or a `createPaperTrader` that wrapped its
+own store — the follow-up `TRDR-3`'s handoff names) would make the field read
+
+```json
+"realizedPnl": { "account": "-1.2", "byInstance": { "e18f5c20-2000-7a20-8b00-000000000002": "-1.2" } }
+```
+
+and nothing else. Until then, the composed value is proven where the composition
+root runs: `test/integration/paper-trader/trader-health-endpoint-postgres.test.ts`
+(real PostgreSQL, `GET /health` serving `-1` after `BUY 50 @ 0.34` /
+`SELL 50 @ 0.32`, equal to the persisted `realized_pnl` column).
 
 ## What the bytes deliberately do NOT contain
 

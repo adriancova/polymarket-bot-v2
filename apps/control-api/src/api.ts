@@ -41,6 +41,36 @@
  * wallet operation, an order, or a cancel. §4.1: this process "never has the
  * signing key". §15's four action classes are answered in `auth.ts`'s
  * INTERPRETATION §5.
+ *
+ * ## Refresh-on-read, and why not a timer (`TRDR-3`, `WP-240` r1 M-2)
+ *
+ * The trader health cache was constructed and NEVER refreshed by the shipped
+ * process (measured: `test/integration/control-api/health-refresh-wiring.test.ts`).
+ * Two ways to wire it were weighed:
+ *
+ * - **A bounded interval** — a `setInterval` on an `unref`'d timer. It makes
+ *   reads instant and polls the trader at a fixed rate whoever is reading.
+ *   Against it: this process does nothing unprompted — `ApiEnvironment`
+ *   supplies the clock and the ids so no behaviour is a function of wall time
+ *   the audit cannot see (`WP-240`'s posture); a timer makes the report an
+ *   operator gets "the state as of the last tick", which a `15 s` Prometheus
+ *   scrape then samples on a second, unrelated cadence; it needs a floor, a
+ *   config field and a shutdown path; and it polls a trader nobody is reading.
+ * - **Refresh-on-read** (chosen) — an AUTHORIZED `GET /v1/health` or
+ *   `GET /v1/metrics` refreshes the cache FIRST, bounded by the source's own
+ *   timeout, then answers. The report an operator or a scrape receives is the
+ *   trader's answer AT THAT REQUEST, `control_trader_health_current` means "the
+ *   read this scrape just did passed", and nothing runs between requests. The
+ *   cost is one loopback round trip per read, bounded by `traderHealth.timeoutMs`;
+ *   a burst of reads is a burst of loopback GETs, which is why the refresh is
+ *   SINGLE-FLIGHT (concurrent reads await one in-flight refresh) and why it
+ *   runs only AFTER authentication and authorization — an anonymous or
+ *   unauthorized caller can make this process ask the trader nothing.
+ *
+ * The mechanism is enabled by `main.ts` for an `http` source only
+ * (`refreshHealthOnRead`); a `none` source is never read, so its metrics body
+ * is byte-identical to `WP-240`'s (no `control_trader_health_reads_total`
+ * line, `control_trader_health_available 0`).
  */
 
 import {
@@ -103,6 +133,13 @@ export interface ControlApiOptions {
   readonly auditCapacity: number;
   /** How many records the audit sink currently holds, if it can say. */
   auditSize(): number;
+  /**
+   * `TRDR-3`: refresh the trader health cache before an authorized
+   * `GET /v1/health` / `GET /v1/metrics` answers (module header,
+   * "Refresh-on-read"). Absent or `false` — every `WP-240` harness — reads
+   * the cache as it stands, byte-identical to before this round.
+   */
+  readonly refreshHealthOnRead?: boolean;
 }
 
 // --- the request doors ------------------------------------------------------
@@ -249,6 +286,8 @@ export class ControlApi {
   readonly #options: ControlApiOptions;
   readonly #authenticationFailures = new Map<string, number>();
   readonly #authorizationFailures = new Map<string, number>();
+  /** The one refresh in flight, shared by concurrent authorized reads (`#readFresh`). */
+  #refreshInFlight: Promise<unknown> | undefined;
 
   constructor(options: ControlApiOptions) {
     this.#options = options;
@@ -340,10 +379,10 @@ export class ControlApi {
         );
 
       case "GET /v1/health":
-        return this.#read(operator, () => this.#health());
+        return await this.#readFresh(operator, () => this.#health());
 
       case "GET /v1/metrics":
-        return this.#read(operator, () => this.#metrics());
+        return await this.#readFresh(operator, () => this.#metrics());
 
       case "POST /v1/kill-switch":
         return this.#engage(operator, request);
@@ -372,6 +411,26 @@ export class ControlApi {
   #read(operator: OperatorCredential, produce: () => ApiResponse): ApiResponse {
     const refusal = this.#authorize(operator, "READ");
     return refusal ?? produce();
+  }
+
+  /**
+   * An authorized read that REFRESHES the trader health cache first when the
+   * composition asked for it (module header, "Refresh-on-read"). The refusal
+   * path is `#read`'s: an unauthorized operator triggers no trader request.
+   * Single-flight: concurrent reads share one in-flight refresh, so a burst of
+   * scrapes is one loopback GET. A refresh never throws — the cache answers
+   * every failure as data and counts it — so `produce` always runs.
+   */
+  async #readFresh(operator: OperatorCredential, produce: () => ApiResponse): Promise<ApiResponse> {
+    const refusal = this.#authorize(operator, "READ");
+    if (refusal !== undefined) return refusal;
+    if (this.#options.refreshHealthOnRead === true) {
+      this.#refreshInFlight ??= this.#options.health.refresh().finally(() => {
+        this.#refreshInFlight = undefined;
+      });
+      await this.#refreshInFlight;
+    }
+    return produce();
   }
 
   #authorize(operator: OperatorCredential, grant: OperatorGrant): ApiResponse | undefined {
@@ -454,17 +513,31 @@ export class ControlApi {
 
   #health(): ApiResponse {
     const report = this.#options.health.last();
+    const refreshing = this.#options.refreshHealthOnRead === true;
     return json(200, {
       available: this.#options.health.available,
+      current: this.#options.health.current,
       reads: this.#options.health.readCounts(),
       report: report ?? null,
       note:
         report === undefined
-          ? "No trader health report has passed this API's door. apps/trader does not expose an " +
-            "HTTP health endpoint today; wiring one is a documented composition obligation, not a " +
-            "claim this deployment has discharged."
-          : "The report's asOf field states how old it is. Economic values in it are EXACT " +
-            "decimal strings and are never converted to numbers by this process.",
+          ? "No trader health report has passed this API's door. " +
+            (refreshing
+              ? "This read asked the configured trader health endpoint and got no usable report " +
+                "(see reads); the trader serves GET /health on the loopback when its " +
+                "TRADER_HEALTH_BIND/TRADER_HEALTH_PORT are set, and pointing traderHealth.http at " +
+                "it is this deployment's composition obligation."
+              : "This deployment configured traderHealth.kind = none, so nothing is read; wiring " +
+                "the trader's loopback GET /health as an http source is the composition obligation " +
+                "this configuration has not discharged.")
+          : `The report's asOf field states how old it is${
+              this.#options.health.current
+                ? refreshing
+                  ? " (this read refreshed it)"
+                  : ""
+                : "; the most recent read FAILED and this report is retained from an earlier one"
+            }. Economic values in it are EXACT decimal strings and are never converted to numbers ` +
+            "by this process.",
     });
   }
 
@@ -475,6 +548,7 @@ export class ControlApi {
         allowRealOrders: false,
         modeRaiseAttemptsRefused: this.#options.controlPlane.modeRaiseAttemptsRefused,
         traderHealthAvailable: this.#options.health.available,
+        traderHealthCurrent: this.#options.health.current,
         traderHealthReadsByOutcome: this.#options.health.readCounts(),
         strategyInstancesByState: countStates(this.#options.controlPlane),
         pausedInstanceIds: this.#options.controlPlane

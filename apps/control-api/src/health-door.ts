@@ -125,6 +125,17 @@ const TraderHealthSchema = z.strictObject({
     unattributedActivity: Counter,
     unexplainedMovements: Counter,
     pnlRecords: Counter,
+    /**
+     * `TRDR-3`: realized PnL as EXACT decimal strings — the trader's
+     * `RealizedPnlHealth`. `byInstance` is keyed by instance id; `account` is
+     * the trader's exact sum, or `null` while it has observed no snapshot
+     * (a union with `null`, never an optional key — ADR-020 §1's adoptable
+     * class). Bounded: at most 4096 instances, ids up to 256 characters.
+     */
+    realizedPnl: z.strictObject({
+      byInstance: z.record(z.string().min(1).max(256), DecimalText),
+      account: z.union([DecimalText, z.literal(null)]),
+    }),
   }),
   seams: z.strictObject({
     fills: z.strictObject({

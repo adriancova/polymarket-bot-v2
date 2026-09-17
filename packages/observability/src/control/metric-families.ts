@@ -372,6 +372,22 @@ export const PLATFORM_METRIC_FAMILIES: readonly PlatformMetricFamily[] = [
     "Actual movements no appended transaction explains.",
   ),
   family("trader_pnl_records_total", "counter", "accounting", "PnL records produced."),
+  family(
+    "trader_realized_pnl_info",
+    "gauge",
+    "accounting",
+    "Realized PnL of one strategy instance, as the latest PnL snapshot the durable store accepted states it (packages/pnl's own value). Value is always 1; the EXACT decimal is the exact_decimal label and is never parsed to a float (§6 invariant 1). Absent until the instance's first snapshot.",
+    ["instance_id", "exact_decimal"],
+    true,
+  ),
+  family(
+    "trader_account_realized_pnl_info",
+    "gauge",
+    "accounting",
+    "Realized PnL summed exactly over every instance above (@polymarket-bot/decimal, never float64). Value is always 1; read the exact_decimal label. Absent while the trader has observed no PnL snapshot — an absent measurement is not a zero.",
+    ["exact_decimal"],
+    true,
+  ),
 
   // --- the composition-root seams -------------------------------------------
   family(
@@ -473,6 +489,12 @@ export const PLATFORM_METRIC_FAMILIES: readonly PlatformMetricFamily[] = [
     "gauge",
     "control-plane",
     "1 when the control API currently holds a trader health report that passed its door. 0 means the trader panels below are stale or empty — read this first.",
+  ),
+  family(
+    "control_trader_health_current",
+    "gauge",
+    "control-plane",
+    "1 when the MOST RECENT read of the trader health source passed the door, so the trader panels show the trader's latest answer. 0 with control_trader_health_available 1 means the held report is RETAINED from an earlier read and the source has since failed — the trader panels are stale; the report's asOf says how stale.",
   ),
   family(
     "control_trader_health_reads_total",
