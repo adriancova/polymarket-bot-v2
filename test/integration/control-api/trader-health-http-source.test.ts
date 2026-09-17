@@ -256,4 +256,38 @@ describe("the REAL HttpTraderHealthSource against the trader's REAL health serve
     expect(server.counts.failed).toBe(2);
     expect(server.counts.served).toBe(1);
   });
+
+  it("survives a snapshot that THROWS a hostile Proxy (every trap throws) — 500 'unclassified', still serving", async () => {
+    const lines: string[] = [];
+    let hostile = false;
+    const { snapshot } = realSnapshot();
+    const trap = (name: string) => () => {
+      throw new Error(`${name} trap`);
+    };
+    const thrown: unknown = new Proxy(new Error("hostile"), {
+      getPrototypeOf: trap("getPrototypeOf"),
+      getOwnPropertyDescriptor: trap("getOwnPropertyDescriptor"),
+      get: trap("get"),
+      has: trap("has"),
+      ownKeys: trap("ownKeys"),
+    });
+    server = await startTraderHealthServer({
+      listen: { host: "127.0.0.1", port: 0 },
+      snapshot: () => {
+        if (hostile) throw thrown;
+        return snapshot();
+      },
+      log: (line) => lines.push(line),
+    });
+    hostile = true;
+    const failed = await raw(server.port, { method: "GET", path: "/health" });
+    expect(failed.status).toBe(500);
+    expect(failed.body).toBe(
+      '{"code":"TRADER_HEALTH_UNAVAILABLE","detail":"the health snapshot could not be produced or encoded (unclassified)"}\n',
+    );
+    expect(lines).toEqual(["health endpoint: the snapshot could not be served (unclassified)"]);
+    hostile = false;
+    expect((await raw(server.port, { method: "GET", path: "/health" })).status).toBe(200);
+    expect(server.counts).toEqual({ served: 1, refused: 0, failed: 1 });
+  });
 });
