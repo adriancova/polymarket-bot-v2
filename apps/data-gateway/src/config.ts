@@ -34,6 +34,7 @@
  * performs and which it does not.
  */
 
+import { IsoTimestampSchema } from "@polymarket-bot/domain";
 import { DEFAULT_FSYNC_INTERVAL_MS } from "@polymarket-bot/storage-wal";
 import { z } from "zod";
 
@@ -75,6 +76,44 @@ const DEFAULT_BINANCE_UNAUTHORIZED_ESCALATION = 3;
 const DEFAULT_COINBASE_FEED_ID = "coinbase-reference";
 const DEFAULT_COINBASE_SNAPSHOT_FAILURE_ESCALATION = 3;
 const DEFAULT_COINBASE_RECONNECT_LOOP_ESCALATION = 5;
+const DEFAULT_LIFECYCLE_FEED_ID = "polymarket-lifecycle";
+const DEFAULT_LIFECYCLE_POLL_INTERVAL_MS = 10_000;
+const DEFAULT_LIFECYCLE_FAILURE_ESCALATION = 3;
+
+/**
+ * The market lifecycle feed's request budget (`UNIV-4`), as a configuration
+ * snapshot with its source (handoff §9.13): the venue's published IP-level
+ * rate limit for Gamma `/markets` is **300 requests / 10 s** (the general
+ * Gamma limit is 4,000 / 10 s; `docs/venue/verified-2026-09-16.md` §8, S-D24,
+ * accessed 2026-09-16; `test/fixtures/venue/rate-limits/rate-limits.json`
+ * `gamma_markets`). The STRICTER of the two figures is the one the door
+ * budgets against, because `GET /markets/{id}` is under the `/markets` path
+ * and the report does not say the per-endpoint figure excludes it. The feed
+ * may use at most {@link LIFECYCLE_MAX_BUDGET_SHARE_PERCENT} of it, so that a
+ * lifecycle poll can never crowd out the same IP's snapshot recovery reads or
+ * a second gateway on the same host: 5 % of 300 / 10 s is 15 requests per
+ * 10 s, i.e. 1.5 requests per second across every configured market.
+ *
+ * The arithmetic the door pins: `N markets × (10 000 ms / pollIntervalMs)`
+ * requests per 10 s must be ≤ 15. At the default 10 s interval that admits
+ * 15 markets; at 60 s, 90; at the 1 s floor, exactly one.
+ */
+export const GAMMA_MARKETS_RATE_LIMIT_PER_10S = 300;
+export const LIFECYCLE_MAX_BUDGET_SHARE_PERCENT = 5;
+
+/**
+ * Floor on the lifecycle poll cadence (`UNIV-4`): 1 s.
+ *
+ * The venue documents no cadence for the polled surface, so the floor is the
+ * gateway's own reasoning, stated: (1) below one request per second a single
+ * market alone exceeds the 1.5 req/s budget above; (2) the lifecycle is a
+ * slow-moving catalog fact — a market that closes between two polls is seen
+ * late by at most one interval, and no interval makes a poll an observed
+ * event (register U-12); (3) the market WebSocket already delivers the
+ * fast-moving data. Faster polling buys nothing the design can use and
+ * spends a shared IP budget.
+ */
+export const MIN_LIFECYCLE_POLL_INTERVAL_MS = 1_000;
 
 const FeedIdSchema = z
   .string()
@@ -98,6 +137,17 @@ export const MarketConfigSchema = z.strictObject({
   yesTokenId: z.string().min(1).max(200),
   noTokenId: z.string().min(1).max(200),
   seriesId: z.string().min(1).max(200).optional(),
+  /**
+   * The `{id}` path value of the documented polled market-state surface,
+   * `GET https://gamma-api.polymarket.com/markets/{id}` (`UNIV-4`, D-30),
+   * exactly as the operator verified it for this market. The repository
+   * does not assert whether that identifier is the numeric Gamma id or the
+   * condition id (`packages/polymarket-public/src/market-state/fetcher.ts`
+   * records why), so it is configuration, not derivation. Optional here;
+   * REQUIRED by the door for every market when the `lifecycle` feed is
+   * configured.
+   */
+  gammaMarketId: z.string().min(1).max(200).optional(),
   /** The first parameter version (§9.2's stored set), from the same review. */
   parameters: z.strictObject({
     tickSize: z.string().min(1),
@@ -207,6 +257,26 @@ export const CoinbaseFeedConfigSchema = z.strictObject({
 });
 
 /**
+ * The market lifecycle feed (`UNIV-4`, closeout blocker B10): the producer
+ * of `MarketOpened` / `MarketClosing` from the venue's documented polled
+ * market-state surface. See `feeds/market-lifecycle.ts` for the derivation
+ * rules and the venue licence.
+ */
+export const LifecycleFeedConfigSchema = z.strictObject({
+  feedId: FeedIdSchema.default(DEFAULT_LIFECYCLE_FEED_ID),
+  /** Defaults to the documented Gamma origin. Overridable for a local stub. */
+  baseUrl: z.string().min(1).optional(),
+  /** ≥ {@link MIN_LIFECYCLE_POLL_INTERVAL_MS}; budgeted by the door (module constants above). */
+  pollIntervalMs: z.number().int().positive().default(DEFAULT_LIFECYCLE_POLL_INTERVAL_MS),
+  /**
+   * Consecutive failed polls (transport, non-2xx, undocumented body) after
+   * which the feed is a STALL: `FeedStale` is published and the gateway's
+   * `GATEWAY_FEED_STALL` incident opens, exactly as for a silent socket.
+   */
+  consecutiveFailureThreshold: z.number().int().positive().default(DEFAULT_LIFECYCLE_FAILURE_ESCALATION),
+});
+
+/**
  * Bounds on the publisher's admission queue (§8.3: every queue is bounded).
  *
  * Safety parameters, not throughput knobs. Raising either one buys tolerance
@@ -246,6 +316,7 @@ export const GatewayConfigSchema = z.strictObject({
   rtds: RtdsFeedConfigSchema.optional(),
   binance: BinanceFeedConfigSchema.optional(),
   coinbase: CoinbaseFeedConfigSchema.optional(),
+  lifecycle: LifecycleFeedConfigSchema.optional(),
 });
 export type GatewayConfig = z.infer<typeof GatewayConfigSchema>;
 
@@ -291,6 +362,14 @@ export const DEFAULTED_KEYS: BlockDefaults = new Map<
       ["reconnectLoopEscalationThreshold", DEFAULT_COINBASE_RECONNECT_LOOP_ESCALATION],
     ],
   ],
+  [
+    "lifecycle",
+    [
+      ["feedId", DEFAULT_LIFECYCLE_FEED_ID],
+      ["pollIntervalMs", DEFAULT_LIFECYCLE_POLL_INTERVAL_MS],
+      ["consecutiveFailureThreshold", DEFAULT_LIFECYCLE_FAILURE_ESCALATION],
+    ],
+  ],
 ]);
 
 /** Top-level keys with a scalar `.default()`. */
@@ -300,7 +379,7 @@ export const DEFAULTED_ROOT_KEYS: readonly (readonly [string, unknown])[] = [
 
 /**
  * Blocks whose WHOLE object the schema defaults, so they exist even when the
- * operator wrote nothing. `publisher` is the only one: the four feed blocks are
+ * operator wrote nothing. `publisher` is the only one: the five feed blocks are
  * `.optional()`, and materializing an absent feed would invent a subscription.
  */
 export const DEFAULTED_BLOCKS: readonly string[] = ["publisher"];
@@ -344,7 +423,8 @@ export function parseGatewayConfig(value: unknown): GatewayConfig {
     config.polymarket === undefined &&
     config.rtds === undefined &&
     config.binance === undefined &&
-    config.coinbase === undefined
+    config.coinbase === undefined &&
+    config.lifecycle === undefined
   ) {
     throw new GatewayConfigurationError(
       "at least one feed must be configured; a gateway recording nothing is a deployment error",
@@ -371,14 +451,96 @@ export function parseGatewayConfig(value: unknown): GatewayConfig {
       },
     );
   }
+  if (config.lifecycle !== undefined) {
+    checkLifecycleConfiguration(config, config.lifecycle);
+  }
   const feedIds = [
     config.polymarket?.feedId,
     config.rtds?.feedId,
     config.binance?.feedId,
     config.coinbase?.feedId,
+    config.lifecycle?.feedId,
   ].filter((id): id is string => id !== undefined);
   if (new Set(feedIds).size !== feedIds.length) {
     throw new GatewayConfigurationError("feed ids must be distinct", { feedIds });
   }
   return config;
+}
+
+/** Requests per 10 s the lifecycle feed may issue: the budgeted share of the venue's figure. */
+export function lifecycleRequestBudgetPer10s(): number {
+  return (GAMMA_MARKETS_RATE_LIMIT_PER_10S * LIFECYCLE_MAX_BUDGET_SHARE_PERCENT) / 100;
+}
+
+/** Requests per 10 s a configuration would issue: one per market per interval. */
+export function lifecycleRequestsPer10s(marketCount: number, pollIntervalMs: number): number {
+  return (marketCount * 10_000) / pollIntervalMs;
+}
+
+/**
+ * The lifecycle feed's own startup checks (`UNIV-4`), each a configuration
+ * defect that fails closed at startup rather than an hour later:
+ *
+ * 1. at least one market — a lifecycle feed with nothing to poll is the same
+ *    deployment error as a Polymarket feed with no markets (§9.2);
+ * 2. every market names its `gammaMarketId` — the `{id}` the documented
+ *    surface takes is configuration, and a market without one cannot be
+ *    polled, so the feed would silently never open it;
+ * 3. every configured `openTime` / `closeTime` is an ISO-8601 instant — the
+ *    frozen `MarketOpened.openedAt` / `MarketClosing.closesAt` contracts
+ *    require one, and a string that fails there fails at publish time as an
+ *    envelope rejection, which is the wrong time to learn it;
+ * 4. the cadence floor {@link MIN_LIFECYCLE_POLL_INTERVAL_MS};
+ * 5. the request budget: `markets × 10 000 / pollIntervalMs` per 10 s must
+ *    not exceed {@link LIFECYCLE_MAX_BUDGET_SHARE_PERCENT} % of
+ *    {@link GAMMA_MARKETS_RATE_LIMIT_PER_10S} — the arithmetic is in the
+ *    refusal so an operator can size the interval from the message.
+ */
+function checkLifecycleConfiguration(
+  config: GatewayConfig,
+  lifecycle: NonNullable<GatewayConfig["lifecycle"]>,
+): void {
+  if (config.markets.length === 0) {
+    throw new GatewayConfigurationError(
+      "the lifecycle feed requires at least one configured market: subscriptions and the universe directory are configuration, not discovery (§9.2)",
+    );
+  }
+  for (const market of config.markets) {
+    if (market.gammaMarketId === undefined) {
+      throw new GatewayConfigurationError(
+        "the lifecycle feed requires gammaMarketId on every configured market: GET /markets/{id} takes a path value the repository does not derive (UNIV-4)",
+        { internalMarketId: market.internalMarketId },
+      );
+    }
+    for (const key of ["openTime", "closeTime"] as const) {
+      const value = market.parameters[key];
+      if (value !== undefined && !IsoTimestampSchema.safeParse(value).success) {
+        throw new GatewayConfigurationError(
+          `the lifecycle feed requires parameters.${key} to be an ISO-8601 instant when present: it becomes a frozen lifecycle event instant`,
+          { internalMarketId: market.internalMarketId, [key]: value },
+        );
+      }
+    }
+  }
+  if (lifecycle.pollIntervalMs < MIN_LIFECYCLE_POLL_INTERVAL_MS) {
+    throw new GatewayConfigurationError(
+      `lifecycle.pollIntervalMs must be at least ${String(MIN_LIFECYCLE_POLL_INTERVAL_MS)} ms: the venue documents no cadence, and below one request per second a single market alone exceeds the feed's request budget`,
+      { pollIntervalMs: lifecycle.pollIntervalMs, minimumMs: MIN_LIFECYCLE_POLL_INTERVAL_MS },
+    );
+  }
+  const requestsPer10s = lifecycleRequestsPer10s(config.markets.length, lifecycle.pollIntervalMs);
+  const budgetPer10s = lifecycleRequestBudgetPer10s();
+  if (requestsPer10s > budgetPer10s) {
+    throw new GatewayConfigurationError(
+      `the lifecycle feed would issue ${String(config.markets.length)} markets × (10000 ms / ${String(lifecycle.pollIntervalMs)} ms) = ${String(requestsPer10s)} requests per 10 s, over its budget of ${String(budgetPer10s)} per 10 s (${String(LIFECYCLE_MAX_BUDGET_SHARE_PERCENT)} % of the venue's documented ${String(GAMMA_MARKETS_RATE_LIMIT_PER_10S)} / 10 s for Gamma /markets); raise pollIntervalMs or configure fewer markets`,
+      {
+        markets: config.markets.length,
+        pollIntervalMs: lifecycle.pollIntervalMs,
+        requestsPer10s,
+        budgetPer10s,
+        venueRequestsPer10s: GAMMA_MARKETS_RATE_LIMIT_PER_10S,
+        budgetSharePercent: LIFECYCLE_MAX_BUDGET_SHARE_PERCENT,
+      },
+    );
+  }
 }

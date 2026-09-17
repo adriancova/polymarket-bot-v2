@@ -50,6 +50,8 @@ import type { BinanceFeedDriverMetrics } from "./feeds/binance.js";
 import { BinanceFeedDriver } from "./feeds/binance.js";
 import type { CoinbaseFeedDriverMetrics } from "./feeds/coinbase.js";
 import { CoinbaseFeedDriver } from "./feeds/coinbase.js";
+import type { MarketLifecycleDriverMetrics } from "./feeds/market-lifecycle.js";
+import { MarketLifecycleFeedDriver } from "./feeds/market-lifecycle.js";
 import type { PolymarketFeedDriverMetrics } from "./feeds/polymarket.js";
 import { PolymarketFeedDriver } from "./feeds/polymarket.js";
 import type { RtdsFeedDriverMetrics } from "./feeds/rtds.js";
@@ -57,6 +59,7 @@ import { RtdsFeedDriver } from "./feeds/rtds.js";
 import type { IncidentRegistryMetrics } from "./incidents.js";
 import { IncidentRegistry } from "./incidents.js";
 import { GatewayJournal } from "./journal.js";
+import { LifecycleLedger } from "./lifecycle-ledger.js";
 import type {
   CancelScheduled,
   CleanupDeadline,
@@ -165,6 +168,8 @@ export interface GatewayMetrics {
   readonly rtds: RtdsFeedDriverMetrics | undefined;
   readonly binance: BinanceFeedDriverMetrics | undefined;
   readonly coinbase: CoinbaseFeedDriverMetrics | undefined;
+  /** The market lifecycle feed (`UNIV-4`), when configured. */
+  readonly lifecycle: MarketLifecycleDriverMetrics | undefined;
 }
 
 type GatewayState = "created" | "running" | "stopped";
@@ -178,7 +183,9 @@ export class DataGateway {
   readonly #dispatcher: GatewayDispatcher;
   readonly #plan: SubscriptionPlan;
   readonly #directory: UniverseMarketDirectory | undefined;
+  readonly #lifecycleLedger: LifecycleLedger | undefined;
 
+  #lifecycleDriver: MarketLifecycleFeedDriver | undefined;
   #polymarketFeed: PublicMarketFeed | undefined;
   #polymarketDriver: PolymarketFeedDriver | undefined;
   #rtdsFeed: RtdsTwapFeed | undefined;
@@ -206,6 +213,7 @@ export class DataGateway {
     dispatcher: GatewayDispatcher;
     plan: SubscriptionPlan;
     directory: UniverseMarketDirectory | undefined;
+    lifecycleLedger: LifecycleLedger | undefined;
   }) {
     this.#config = args.config;
     this.#ports = args.ports;
@@ -215,6 +223,7 @@ export class DataGateway {
     this.#dispatcher = args.dispatcher;
     this.#plan = args.plan;
     this.#directory = args.directory;
+    this.#lifecycleLedger = args.lifecycleLedger;
     this.#buildFeeds();
   }
 
@@ -349,6 +358,19 @@ export class DataGateway {
           ? undefined
           : new UniverseMarketDirectory(config.markets, ports.clock);
 
+      // UNIV-4: the lifecycle ledger is read BEFORE any feed is built, so the
+      // lifecycle driver seeds every market's phase from what a previous
+      // epoch emitted. It opens on the same filesystem port as the journal;
+      // an unreadable ledger throws here and is handled by the transactional
+      // path below (the journal is closed before the error escapes).
+      const lifecycleLedger =
+        config.lifecycle === undefined
+          ? undefined
+          : await LifecycleLedger.open({
+              fileSystem: ports.walFileSystem,
+              walRootPath: config.wal.rootPath,
+            });
+
       return new DataGateway({
         config,
         ports,
@@ -358,6 +380,7 @@ export class DataGateway {
         dispatcher,
         plan: planSubscriptions(config),
         directory,
+        lifecycleLedger,
       });
     } catch (error) {
       const cancelDeadline = options.cleanupDeadline?.arm();
@@ -459,6 +482,31 @@ export class DataGateway {
       driver.bind(feed);
       this.#polymarketFeed = feed;
       this.#polymarketDriver = driver;
+    }
+
+    if (config.lifecycle !== undefined) {
+      if (ports.polymarketHttpClient === undefined) {
+        throw new GatewayStateError(
+          "the market lifecycle feed is configured but the Polymarket HTTP client port is missing",
+        );
+      }
+      if (this.#lifecycleLedger === undefined) {
+        throw new GatewayStateError("the market lifecycle feed requires its ledger");
+      }
+      const feedConfig = config.lifecycle;
+      this.#lifecycleDriver = new MarketLifecycleFeedDriver({
+        feedId: feedConfig.feedId,
+        baseUrl: feedConfig.baseUrl,
+        pollIntervalMs: feedConfig.pollIntervalMs,
+        consecutiveFailureThreshold: feedConfig.consecutiveFailureThreshold,
+        markets: config.markets,
+        http: ports.polymarketHttpClient,
+        journal: this.#journal,
+        dispatcher: this.#dispatcher,
+        clock: ports.clock,
+        timers: ports.timers,
+        ledger: this.#lifecycleLedger,
+      });
     }
 
     if (config.rtds !== undefined) {
@@ -646,6 +694,7 @@ export class DataGateway {
       this.#rtdsFeed?.start();
       this.#binanceDriver?.start();
       this.#coinbaseManager?.start();
+      this.#lifecycleDriver?.start();
       this.#scheduleTick();
     } catch (error) {
       // A start that throws must not leave a referenced handle behind: the
@@ -677,6 +726,9 @@ export class DataGateway {
 
   /** Waits for in-flight publications and WAL drains to settle (tests, shutdown). */
   async settle(): Promise<void> {
+    // An in-flight lifecycle poll may still journal and dispatch; it settles
+    // first so the publisher and journal settles below see its work.
+    await this.#lifecycleDriver?.settle();
     await this.#publisher.settle();
     await this.#journal.settle();
   }
@@ -750,6 +802,7 @@ export class DataGateway {
       attempt("rtds-feed", () => this.#rtdsFeed?.stop());
       attempt("binance-driver", () => this.#binanceDriver?.stop());
       attempt("coinbase-manager", () => this.#coinbaseManager?.stop());
+      attempt("lifecycle-driver", () => this.#lifecycleDriver?.stop());
       // Round 6 (M-1): the awaited disposals span exactly TWO independent
       // resource families, and BOTH are initiated here before anything is
       // awaited, so a never-settling disposal in one family cannot prevent
@@ -771,7 +824,15 @@ export class DataGateway {
       // reported above), and a family that hangs stalls only stop()'s
       // completion — bounded by the caller's cleanup deadline — never a
       // sibling.
-      const walFamily = attemptAsync("wal-journal", () => this.#journal.close());
+      // UNIV-4: the ledger's pending rewrites belong to the WAL family (same
+      // filesystem, no ordering with the transport); they settle before the
+      // journal closes so a lifecycle fact emitted this epoch is on disk.
+      const walFamily = (async () => {
+        await attemptAsync("lifecycle-ledger", async () => {
+          await this.#lifecycleDriver?.settle();
+        });
+        await attemptAsync("wal-journal", () => this.#journal.close());
+      })();
       const transportFamily = (async () => {
         await attemptAsync("publisher-settle", () => this.#publisher.settle());
         await attemptAsync("event-bus-transport", () => this.#ports.transport.close());
@@ -805,6 +866,7 @@ export class DataGateway {
       rtds: this.#rtdsDriver?.metrics(),
       binance: this.#binanceDriver?.metrics(),
       coinbase: this.#coinbaseDriver?.metrics(),
+      lifecycle: this.#lifecycleDriver?.metrics(),
     };
   }
 }

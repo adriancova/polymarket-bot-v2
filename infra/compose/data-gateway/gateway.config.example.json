@@ -13,16 +13,24 @@
       "conditionId": "0xabababababababababababababababababababababababababababababababab",
       "yesTokenId": "11111",
       "noTokenId": "22222",
+      "gammaMarketId": "900001",
       "parameters": {
         "tickSize": "0.01",
         "minimumOrderSize": "5",
         "negRisk": false,
         "tradingDelaySeconds": 0,
-        "status": "OPEN"
+        "status": "OPEN",
+        "openTime": "2026-09-01T00:00:00.000Z",
+        "closeTime": "2026-12-31T00:00:00.000Z"
       },
       "observedAt": "2026-09-01T00:00:00.000Z"
     }
   ],
+  "lifecycle": {
+    "feedId": "polymarket-lifecycle",
+    "pollIntervalMs": 10000,
+    "consecutiveFailureThreshold": 3
+  },
   "binance": {
     "feedId": "binance-reference",
     "symbols": ["BTCUSDT"],

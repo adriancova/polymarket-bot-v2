@@ -84,6 +84,30 @@ such values are refused before any resource is acquired.
   writer schedules nothing: an idle recorder is fsynced only by this tick, so a
   slower tick would make the `dataLossBoundMs` the writer publishes a false
   claim.
+- `lifecycle` (`UNIV-4`) is the **market lifecycle feed**, the only producer
+  of `MarketOpened` / `MarketClosing`. It polls the venue's documented
+  market-state surface `GET https://gamma-api.polymarket.com/markets/{id}`
+  for every configured market every `pollIntervalMs` (default `10000`, floor
+  `1000`), journals each raw response before deriving anything, and derives
+  the two events from the documented readiness predicate
+  `active && !closed && acceptingOrders` and the reviewed `openTime` /
+  `closeTime` — never from configuration alone: `MarketOpened` once, when the
+  venue is first observed trade-ready (`openedAt` = the past `openTime`, else
+  the observation instant); the scheduled `MarketClosing` when `closeTime` is
+  reached; an observed `MarketClosing` when the venue shows `closed` or
+  `acceptingOrders: false`. When it is configured, every
+  market **must** carry `gammaMarketId` (the `{id}` the surface takes, as the
+  operator verified it) and any `openTime` / `closeTime` must be an ISO-8601
+  instant. The configuration door budgets the feed at 5 % of the venue's
+  documented Gamma `/markets` limit (300 requests / 10 s): `markets ×
+  10000 / pollIntervalMs` must be ≤ 15 per 10 s, so the default cadence admits
+  15 markets and a 60 s cadence admits 90; a configuration over budget is
+  refused with the arithmetic in the message. `consecutiveFailureThreshold`
+  (default `3`) failed polls in a row publish `FeedStale` and open a
+  `GATEWAY_FEED_STALL` incident. The feed keeps a small ledger,
+  `<walRoot>/market-lifecycle-ledger.json`, of the instants it has emitted so
+  a restart never re-mints a market's `openedAt`; an unreadable ledger fails
+  the start and must be repaired or removed by an operator.
 - `publisher.maxQueueDepth` (default `1024`) and `publisher.maxQueueBytes`
   (default `8388608`) bound how much unpublished work the gateway will hold in
   memory while the transport is slow. They are **safety parameters, not

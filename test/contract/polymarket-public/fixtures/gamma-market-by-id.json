@@ -1,0 +1,163 @@
+{
+  "fixture": "polymarket-public/gamma-market-by-id",
+  "source": "https://docs.polymarket.com/api-reference/markets/get-market-by-id.md",
+  "retrieved": "2026-09-16",
+  "sanitized": true,
+  "notes": "The documented polled market-state surface, GET https://gamma-api.polymarket.com/markets/{id} (the Gamma OpenAPI, source index S-D34 of docs/venue/verified-2026-09-16.md, fetched read-only and unauthenticated 2026-09-16T17:19:25Z, sha256 8da3b4b2…; the same fields on the market-details page S-D23). Owned by UNIV-4, NOT part of the frozen WP-000 catalogue under test/fixtures/venue/ (the WP-070 precedent, ./clob-book-rest.json): the ops-cli validator claims every file in that tree and rejects an explicit null outside four documented fields, while every field here is documented nullable. RECONSTRUCTED FROM THE DOCUMENTED PROPERTY LIST, NOT FROM A CAPTURED BODY: the repository holds D-30's property list with OpenAPI line numbers (endDate 90, startDate 106, active 146, closed 161, closedTime 178, archived 193, restricted 199, enableOrderBook 217, gameStartTime 268, acceptingOrders 322, all nullable) and S-D23's MarketState type (lines 199–209: active, closed, archived, acceptingOrders, enableOrderBook, negRisk as boolean | null; startDate, endDate, closedTime as IsoDateTimeString | null), but not S-D34's published example body, so every value is synthetic and only the FIELD NAMES and NULLABILITY are evidence. Fields whose wire type D-30 does not record (id, slug, clobTokenIds, acceptingOrdersTimestamp, ready, funded, automaticallyActive, clearBookOnStart, manualActivation, new, umaEndDate, startDateIso, endDateIso) are deliberately omitted; conditionId is a synthetic full-length 66-character hex string in the form the SDK's ConditionIdSchema requires (D-08); question is a synthetic string. The documented readiness predicate is isTradeReady = active && !closed && acceptingOrders (S-D23 lines 227–231); the package's door evaluates it fail-closed (a null in any of the three is not ready). Six fields carry documented semantics (active, closed, acceptingOrders, restricted, archived, gameStartTime); every other property is recorded, never interpreted. The extra-undocumented-keys example carries version and comboStatus (properties D-19 records the SDK adding) and umaResolutionStatus: null (documented nullable string, register U-11 do-not-parse) to pin that an unknown top-level key is admitted, not refused. Nothing here was produced by placing an order or calling an authenticated endpoint; no credential existed in the environment.",
+  "examples": [
+    {
+      "name": "trade-ready",
+      "payload": {
+        "conditionId": "0xab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01ab01",
+        "question": "Synthetic question: will the synthetic index close above the synthetic strike?",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "acceptingOrders": true,
+        "restricted": false,
+        "enableOrderBook": true,
+        "negRisk": false,
+        "startDate": "2026-09-01T00:00:00Z",
+        "endDate": "2026-12-31T00:00:00Z",
+        "closedTime": null,
+        "gameStartTime": null
+      }
+    },
+    {
+      "name": "not-yet-accepting-orders",
+      "payload": {
+        "conditionId": "0xab02ab02ab02ab02ab02ab02ab02ab02ab02ab02ab02ab02ab02ab02ab02ab02",
+        "question": "Synthetic question: deployed, order book not yet open",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "acceptingOrders": false,
+        "restricted": false,
+        "enableOrderBook": true,
+        "negRisk": false,
+        "startDate": "2026-09-01T00:00:00Z",
+        "endDate": "2026-12-31T00:00:00Z",
+        "closedTime": null,
+        "gameStartTime": null
+      }
+    },
+    {
+      "name": "closed",
+      "payload": {
+        "conditionId": "0xab03ab03ab03ab03ab03ab03ab03ab03ab03ab03ab03ab03ab03ab03ab03ab03",
+        "question": "Synthetic question: resolved or closed, no further trading",
+        "active": true,
+        "closed": true,
+        "archived": false,
+        "acceptingOrders": false,
+        "restricted": false,
+        "enableOrderBook": true,
+        "negRisk": false,
+        "startDate": "2026-09-01T00:00:00Z",
+        "endDate": "2026-09-15T00:00:00Z",
+        "closedTime": "2026-09-15T00:03:12Z",
+        "gameStartTime": null
+      }
+    },
+    {
+      "name": "archived",
+      "payload": {
+        "conditionId": "0xab04ab04ab04ab04ab04ab04ab04ab04ab04ab04ab04ab04ab04ab04ab04ab04",
+        "question": "Synthetic question: archived and read-only",
+        "active": false,
+        "closed": true,
+        "archived": true,
+        "acceptingOrders": false,
+        "restricted": false,
+        "enableOrderBook": false,
+        "negRisk": false,
+        "startDate": "2026-06-01T00:00:00Z",
+        "endDate": "2026-07-01T00:00:00Z",
+        "closedTime": "2026-07-01T00:00:00Z",
+        "gameStartTime": null
+      }
+    },
+    {
+      "name": "all-state-fields-null",
+      "payload": {
+        "conditionId": "0xab05ab05ab05ab05ab05ab05ab05ab05ab05ab05ab05ab05ab05ab05ab05ab05",
+        "question": "Synthetic question: every documented nullable state field explicitly null",
+        "active": null,
+        "closed": null,
+        "archived": null,
+        "acceptingOrders": null,
+        "restricted": null,
+        "enableOrderBook": null,
+        "negRisk": null,
+        "startDate": null,
+        "endDate": null,
+        "closedTime": null,
+        "gameStartTime": null
+      }
+    },
+    {
+      "name": "state-fields-absent",
+      "payload": {
+        "conditionId": "0xab06ab06ab06ab06ab06ab06ab06ab06ab06ab06ab06ab06ab06ab06ab06ab06",
+        "question": "Synthetic question: every optional state field omitted"
+      }
+    },
+    {
+      "name": "restricted-but-trade-ready",
+      "payload": {
+        "conditionId": "0xab07ab07ab07ab07ab07ab07ab07ab07ab07ab07ab07ab07ab07ab07ab07ab07",
+        "question": "Synthetic question: geo-restricted for some jurisdictions, order book open",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "acceptingOrders": true,
+        "restricted": true,
+        "enableOrderBook": true,
+        "negRisk": false,
+        "startDate": "2026-09-01T00:00:00Z",
+        "endDate": "2026-12-31T00:00:00Z",
+        "closedTime": null,
+        "gameStartTime": null
+      }
+    },
+    {
+      "name": "sports-with-game-start-time",
+      "payload": {
+        "conditionId": "0xab08ab08ab08ab08ab08ab08ab08ab08ab08ab08ab08ab08ab08ab08ab08ab08",
+        "question": "Synthetic question: a sports market with a scheduled game start",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "acceptingOrders": true,
+        "restricted": false,
+        "enableOrderBook": true,
+        "negRisk": true,
+        "startDate": "2026-09-20T00:00:00Z",
+        "endDate": "2026-10-02T00:00:00Z",
+        "closedTime": null,
+        "gameStartTime": "2026-10-01T18:00:00Z"
+      }
+    },
+    {
+      "name": "extra-undocumented-keys",
+      "payload": {
+        "conditionId": "0xab09ab09ab09ab09ab09ab09ab09ab09ab09ab09ab09ab09ab09ab09ab09ab09",
+        "question": "Synthetic question: carries properties the OpenAPI does not list",
+        "active": true,
+        "closed": false,
+        "archived": false,
+        "acceptingOrders": true,
+        "restricted": false,
+        "enableOrderBook": true,
+        "negRisk": false,
+        "startDate": "2026-09-01T00:00:00Z",
+        "endDate": "2026-12-31T00:00:00Z",
+        "closedTime": null,
+        "gameStartTime": null,
+        "version": "v2",
+        "comboStatus": "enabled",
+        "umaResolutionStatus": null
+      }
+    }
+  ]
+}
