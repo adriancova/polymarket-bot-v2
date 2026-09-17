@@ -364,3 +364,41 @@ suites):
 `5742c4d` (reproduction pin), `8b7fd48` (the work), and the final commit
 carrying the hostile-throw pin, the Prometheus fragment and this record —
 its SHA is reported in the hand-back message, since this file is part of it.
+
+---
+
+## Merge record (orchestrator, 2026-09-17)
+
+**Merged:** `da9c58e` (`--no-ff`). Chain `5742c4d` → `8b7fd48` → `ac2f577` on base
+`b3a829c`. Review round 1 **ACCEPT** (0 HIGH, 0 MEDIUM, 4 LOW, 9 INFO); reviewer
+independent of the implementer. Post-merge gates on `main`: test 330 files / 7177,
+trader integration 12/125 (real PostgreSQL), control-api integration 10/85,
+e2e 6/78, replay 3/17, check:deps 34 packages / 80 edges, typecheck 0, lint 0.
+
+**Rulings recorded at merge.** Deviation 1 (the e2e golden's `realizedPnl` is
+`null`): ACCEPT-with-residual — acceptance (a) is met in substance (the assembled
+durable trader's health surface reports the value the ledger holds, proven end
+to end against a real database and equal to the persisted column) and narrowed
+in letter (no test sees `-1.2` through the wire; the e2e harness composes the
+trader on a path the observer is not wired into; the one-line fix is in
+`trader.ts`, outside this grant, so reporting rather than working around was
+right). Deviation 3 (a second gauge `control_trader_health_current` rather than
+changing `available`'s semantics): the second gauge is right — `available` (the
+cache HOLDS a door-passed report) and `current` (the MOST RECENT read passed)
+are two facts, the retention promise is a documented WP-240 contract, and the
+two together give the operator never-read / fresh / stale-retained.
+
+**Review findings not in the implementer's residual list**, now in the ledger's
+residual queue: TRDR3-R2 (`connectionsCheckingInterval` left at Node's 30 s
+default, so the stated 5 s timeouts enforce at ~30 s — slowloris window measured
+33 s; loopback-only, no dashboard lies; one line); TRDR3-R3 adds
+`apps/control-api/README.md:118-120`, `infra/grafana/control/README.md:88` and
+`apps/trader/README.md:322-323` to the stale-doc list; TRDR3-R7 (`health-door.ts:133`
+claims a 4096-instance bound the schema does not enforce); INFO-9 (the http
+source's `timeout` is a socket IDLE timeout, so a slow-drip body can hold a
+control-API read for up to `maxBodyBytes × timeoutMs` — pre-existing WP-240
+behaviour, now on the request path, beside L-9).
+
+**What B5 still lacks (R5 / H3):** a real Prometheus loading
+`infra/prometheus/control-api-scrape.yaml`, a provisioned Grafana, a real
+dashboard import with a running trader. None is claimed here.
