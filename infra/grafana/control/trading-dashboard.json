@@ -150,20 +150,32 @@
     },
     {
       "id": 11,
-      "type": "text",
+      "type": "table",
       "title": "Realized PnL",
-      "description": "This panel is intentionally not bound to a metric. See its content.",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 28 },
-      "options": {
-        "mode": "markdown",
-        "content": "PENDING PRODUCER: an exact-decimal PnL value on the trader's health surface; today it carries only accounting.pnlRecords (a COUNT), and packages/pnl's snapshot values never reach an exporter — OWNER: a future apps/trader grant (the health surface is apps/trader-owned; WP-240 is read-only there)\n\nWP-240 will not invent a `trader_pnl` gauge: a PnL amount is an exact decimal (§6 invariant 1) and a float64 sample value is the representation that invariant forbids. When a producer exists it will arrive as an `_info` label carrying the exact decimal string, the way reserved collateral already does — see 'Reserved collateral (exact decimals)' on this dashboard for the shape."
-      }
+      "description": "Realized PnL as EXACT decimal LABELS (TRDR-3): one row per strategy instance from the latest PnL snapshot the trader's durable store accepted (packages/pnl's own realizedPnl), and one row for the account, summed exactly by @polymarket-bot/decimal in the trader. The value column is always 1; read the exact_decimal label. Nothing here is charted, summed, or rate()'d — arithmetic on these would reintroduce binary floating point into economics (§6 invariant 1). No row until the first PnL snapshot: an absent measurement is not a zero. If 'Trader health report current' reads 0, these rows are retained from an earlier read.",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_realized_pnl_info", "instant": true, "legendFormat": "{{instance_id}} realized: {{exact_decimal}}" },
+        { "refId": "B", "expr": "trader_account_realized_pnl_info", "instant": true, "legendFormat": "account realized: {{exact_decimal}}" }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Trader health report current",
+      "description": "1 when the control API's MOST RECENT read of the trader's health endpoint passed its door, so every trader_* row on this dashboard is the trader's latest answer. 0 while 'Trader health report available' (operations dashboard) still reads 1 means the control API is serving a RETAINED report — the trader stopped answering — and the Realized PnL rows are as old as that report's asOf. TRDR-3 wired the read: the control API refreshes on every authorized /v1/health and /v1/metrics request.",
+      "gridPos": { "h": 7, "w": 4, "x": 8, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "control_trader_health_current", "instant": true, "legendFormat": "current" }
+      ]
     },
     {
       "id": 12,
       "type": "table",
       "title": "Reserved collateral (exact decimals)",
-      "description": "The only economic amounts on this dashboard, and they are LABELS. The value column is always 1; read the exact_decimal label. Nothing here is charted, summed, or rate()'d — arithmetic on these would reintroduce binary floating point into economics (§6 invariant 1). The control API's JSON read surface returns the same strings.",
+      "description": "Economic amounts as LABELS. The value column is always 1; read the exact_decimal label. Nothing here is charted, summed, or rate()'d — arithmetic on these would reintroduce binary floating point into economics (§6 invariant 1). The control API's JSON read surface returns the same strings.",
       "gridPos": { "h": 7, "w": 12, "x": 12, "y": 28 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [

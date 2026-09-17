@@ -2,13 +2,19 @@
  * Where a trader health report comes from — the seam, and the honest statement
  * of what is and is not wired.
  *
- * ## THE COMPOSITION OBLIGATION, STATED BEFORE ANYTHING ELSE
+ * ## THE COMPOSITION, STATED BEFORE ANYTHING ELSE
  *
- * **`apps/trader` does not expose an HTTP health endpoint today.** Its health
- * state is an in-process value (`apps/trader/src/health.ts`, whose own header
- * says "What this module is NOT: a dashboard, an HTTP endpoint or a Prometheus
- * exporter"), and `apps/trader/**` is outside `WP-240`'s grant, so this package
- * could not add one and did not.
+ * This header used to open "**`apps/trader` does not expose an HTTP health
+ * endpoint today**" and called wiring one "a documented obligation on a future
+ * `apps/trader` grant". `TRDR-3` discharged both halves of that obligation:
+ * `apps/trader/src/health-server.ts` serves `GET /health` on the loopback when
+ * `TRADER_HEALTH_BIND`/`TRADER_HEALTH_PORT` are set, and this process READS it
+ * — `TraderHealthCache.refresh()` was never called by the shipped process
+ * before that round (`WP-240` r1 M-2; reproduced by
+ * `test/integration/control-api/health-refresh-wiring.test.ts`: zero requests
+ * over 1.5 s of serving). It is now called by `ControlApi` on every authorized
+ * `GET /v1/health` and `GET /v1/metrics` when `main.ts` enables it for an
+ * `http` source (`api.ts`, "Refresh-on-read"). A `none` source is never read.
  *
  * What ships here is the CONSUMER half:
  *
@@ -16,16 +22,15 @@
  *   already holds. Used by the suites, and usable by any process that can hand
  *   one over;
  * - {@link HttpTraderHealthSource} — a loopback `GET` returning a JSON health
- *   document. **This is genuinely executed**, against a real in-process
- *   `node:http` server in `health-source.test.ts`: the request, the size bound,
- *   the timeout, the non-200 path and the malformed-body path are all exercised.
- *   No claim is made that a trader is on the other end of it.
+ *   document. Executed against a real in-process `node:http` server in
+ *   `health-source.test.ts` (the request, the size bound, the timeout, the
+ *   non-200 path and the malformed-body path) and, since `TRDR-3`, against the
+ *   trader's REAL health server in
+ *   `test/integration/control-api/trader-health-http-source.test.ts`.
  *
- * Wiring the second to a running trader requires the trader to serve that
- * document. That is a documented obligation on a future `apps/trader` grant.
- * `control_trader_health_available` reads `0` until it is discharged, and the
- * operations dashboard puts that stat above every `trader_*` panel so an
- * operator cannot read blank charts as a quiet market.
+ * `control_trader_health_available` reads `0` until a report has passed the
+ * door; the operations dashboard puts that stat above every `trader_*` panel
+ * so an operator cannot read blank charts as a quiet market.
  *
  * ## Every read is bounded
  *
@@ -229,10 +234,21 @@ function parse(document: unknown): HealthReadResult {
  * counted — so an operator sees "the last report I have is from 00:04:11 and
  * the last three reads failed" rather than an empty dashboard that looks like
  * a stopped market. `asOf` on the retained report is what says how old it is.
+ *
+ * Two booleans, deliberately (`TRDR-3`): {@link available} is "this cache
+ * HOLDS a report that passed the door" and stays `true` across a failed read
+ * — the retention semantics above, pinned by `health-source.test.ts` and
+ * unchanged. {@link current} is "the MOST RECENT read passed the door" and
+ * drops to `false` the moment the source goes away, so the operations gauge
+ * (`control_trader_health_available`) keeps its meaning and a second gauge
+ * (`control_trader_health_current`) says whether the retained report is the
+ * trader's latest answer. Changing `available` to mean the second would have
+ * broken the first's documented promise.
  */
 export class TraderHealthCache {
   readonly #source: TraderHealthSource;
   #last: TraderHealthReportInput | undefined;
+  #current = false;
   readonly #reads = new Map<HealthReadOutcome, number>();
 
   constructor(source: TraderHealthSource) {
@@ -242,6 +258,7 @@ export class TraderHealthCache {
   async refresh(): Promise<HealthReadResult> {
     const result = await this.#source.read();
     this.#reads.set(result.outcome, (this.#reads.get(result.outcome) ?? 0) + 1);
+    this.#current = result.outcome === "OK";
     if (result.outcome === "OK") this.#last = result.report;
     return result;
   }
@@ -251,8 +268,14 @@ export class TraderHealthCache {
     return this.#last;
   }
 
+  /** A report that passed the door is held — possibly retained from an earlier read. */
   get available(): boolean {
     return this.#last !== undefined;
+  }
+
+  /** The most recent `refresh()` produced the held report; `false` before the first read and after a failed one. */
+  get current(): boolean {
+    return this.#current;
   }
 
   /** Reads by outcome, sorted, for the metrics surface. */

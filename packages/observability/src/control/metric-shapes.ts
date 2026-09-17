@@ -99,6 +99,20 @@ export interface TraderExecutionHealthInput {
   readonly observeOnlyIntents: number;
 }
 
+/**
+ * Mirrors `apps/trader/src/health.ts` `RealizedPnlHealth` (`TRDR-3`).
+ *
+ * EXACT decimal strings (§6 invariant 1): the PnL engine's own
+ * `PnlSnapshot.realizedPnl` per instance and their exact sum. Never parsed to
+ * a number here; `samples.ts` carries each as an `_info` label. `account` is
+ * `null` while the trader has observed no snapshot — an absent measurement,
+ * which the samples then OMIT rather than render as `"0"`.
+ */
+export interface TraderRealizedPnlInput {
+  readonly byInstance: Readonly<Record<string, string>>;
+  readonly account: string | null;
+}
+
 /** Mirrors `apps/trader/src/health.ts` `AccountingHealth`. */
 export interface TraderAccountingHealthInput {
   readonly ledgerTransactions: number;
@@ -106,6 +120,7 @@ export interface TraderAccountingHealthInput {
   readonly unattributedActivity: number;
   readonly unexplainedMovements: number;
   readonly pnlRecords: number;
+  readonly realizedPnl: TraderRealizedPnlInput;
 }
 
 /** Mirrors `apps/trader/src/health.ts` `SeamHealth`. */
@@ -178,7 +193,14 @@ export interface ControlPlaneMetricsInput {
   /** Structurally false. There is no request that can set it. */
   readonly allowRealOrders: boolean;
   readonly modeRaiseAttemptsRefused: number;
+  /** The control API HOLDS a report that passed its door (possibly retained from an earlier read). */
   readonly traderHealthAvailable: boolean;
+  /**
+   * The MOST RECENT read of the source passed the door (`TRDR-3`). `false`
+   * with `traderHealthAvailable: true` is the stale-report state: the last
+   * good report is retained and the last read failed.
+   */
+  readonly traderHealthCurrent: boolean;
   readonly traderHealthReadsByOutcome: Readonly<Record<string, number>>;
   readonly strategyInstancesByState: Readonly<Record<string, number>>;
   readonly pausedInstanceIds: readonly string[];

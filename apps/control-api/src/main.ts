@@ -186,6 +186,10 @@ export async function startup(
     environment,
     auditCapacity: config.auditCapacity,
     auditSize: () => audit.size,
+    // `TRDR-3`: an `http` source is READ — on every authorized health/metrics
+    // request (`api.ts`, "Refresh-on-read"). A `none` source has nothing to
+    // read and its surface stays byte-identical to `WP-240`'s.
+    refreshHealthOnRead: config.traderHealth.kind === "http",
   });
 
   const server = await startControlHttpServer({
@@ -198,6 +202,14 @@ export async function startup(
   ports.log(
     `control API listening on ${config.bindHost}:${String(server.port)} — PAPER, no signer, ` +
       "no venue connection, no route that raises a run mode",
+  );
+  ports.log(
+    config.traderHealth.kind === "http"
+      ? `trader health: ${config.traderHealth.url} is read on every authorized /v1/health and ` +
+          `/v1/metrics request (timeout ${String(config.traderHealth.timeoutMs)}ms); ` +
+          "control_trader_health_current says whether the last read passed"
+      : "trader health: none configured; the trader_* families have no producer and " +
+          "control_trader_health_available reads 0",
   );
 
   const shutdown = (): void => {

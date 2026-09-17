@@ -137,6 +137,12 @@ export const CONTROL_DASHBOARDS: readonly ControlDashboardSpec[] = Object.freeze
  * **None of these is a metric `WP-240` could have produced.** Each names a
  * signal whose producer lives in a tree this package does not own, and inventing
  * a family for it would put a name in the exporter with nothing behind it.
+ *
+ * "Realized PnL" (trading) LEFT this list with `TRDR-3`: the trader's health
+ * surface now carries `accounting.realizedPnl` as exact decimal strings, the
+ * families `trader_realized_pnl_info` / `trader_account_realized_pnl_info`
+ * have a producer line in `samples.ts`, and the panel binds them as a table
+ * over the `exact_decimal` label — the shape the pending text promised.
  */
 export const PENDING_PRODUCER_PANELS: readonly {
   readonly dashboard: ControlDashboardId;
@@ -144,14 +150,6 @@ export const PENDING_PRODUCER_PANELS: readonly {
   readonly producer: string;
   readonly owner: string;
 }[] = Object.freeze([
-  Object.freeze({
-    dashboard: "trading",
-    panel: "Realized PnL",
-    producer:
-      "an exact-decimal PnL value on the trader's health surface; today it carries only " +
-      "accounting.pnlRecords (a COUNT), and packages/pnl's snapshot values never reach an exporter",
-    owner: "a future apps/trader grant (the health surface is apps/trader-owned; WP-240 is read-only there)",
-  }),
   Object.freeze({
     dashboard: "fidelity",
     panel: "Replay determinism",

@@ -81,6 +81,54 @@ describe("traderHealthSamples", () => {
     );
   });
 
+  it("carries realized PnL as EXACT decimal labels, per instance in sorted order and for the account (TRDR-3)", () => {
+    const perInstance = traderHealthSamples(fullTraderHealthReport()).filter(
+      (entry) => entry.name === "trader_realized_pnl_info",
+    );
+    expect(perInstance.map((entry) => entry.value)).toEqual([1, 1]);
+    expect(perInstance.map((entry) => entry.labels)).toEqual([
+      { instance_id: "sb-1", exact_decimal: "12345678901234567890.12345" },
+      { instance_id: "sb-2", exact_decimal: "-0.1000000000000000055511151231257827" },
+    ]);
+    const account = sample("trader_account_realized_pnl_info");
+    expect(account?.value).toBe(1);
+    expect(account?.labels).toEqual({
+      exact_decimal: "12345678901234567890.0234499999999999944488848768742173",
+    });
+    // Both fixture values are ones float64 cannot hold; the labels are the
+    // bytes the trader wrote, untouched.
+    expect(String(Number("-0.1000000000000000055511151231257827"))).not.toBe(
+      "-0.1000000000000000055511151231257827",
+    );
+    const rendered = renderExpositionFor(
+      PLATFORM_METRIC_FAMILIES,
+      traderHealthSamples(fullTraderHealthReport()),
+    );
+    expect(rendered).toContain(
+      'trader_realized_pnl_info{instance_id="sb-2",exact_decimal="-0.1000000000000000055511151231257827"} 1',
+    );
+    expect(rendered).toContain(
+      'trader_account_realized_pnl_info{exact_decimal="12345678901234567890.0234499999999999944488848768742173"} 1',
+    );
+  });
+
+  it("OMITS the account realized-PnL series while no snapshot has been observed, rather than reporting 0", () => {
+    const unobserved = traderHealthSamples(
+      fullTraderHealthReport({
+        accounting: {
+          ...fullTraderHealthReport().accounting,
+          realizedPnl: { byInstance: {}, account: null },
+        },
+      }),
+    );
+    expect(unobserved.find((entry) => entry.name === "trader_realized_pnl_info")).toBeUndefined();
+    expect(
+      unobserved.find((entry) => entry.name === "trader_account_realized_pnl_info"),
+    ).toBeUndefined();
+    // …while the count families of the same section ARE reported.
+    expect(unobserved.find((entry) => entry.name === "trader_pnl_records_total")?.value).toBe(405);
+  });
+
   it("raises the risk-seam caveat flag exactly when a protective exit was refused", () => {
     expect(sample("trader_risk_seam_caveat_active")?.value).toBe(1);
     const clean = traderHealthSamples(

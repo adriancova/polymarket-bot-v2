@@ -52,12 +52,15 @@ describe("PLATFORM_METRIC_FAMILIES", () => {
 
   it("carries NO family whose value would be an economic decimal (§6 invariant 1)", () => {
     // An economics-bearing family would have to name an amount. The exact
-    // decimals this surface carries travel as `_info` labels, and the two
-    // families that do so are named here so a third one cannot appear quietly.
+    // decimals this surface carries travel as `_info` labels, and the four
+    // families that do so are named here so a fifth one cannot appear quietly
+    // (`TRDR-3` added the two realized-PnL families to `WP-240`'s two).
     const decimalBearing = PLATFORM_METRIC_FAMILIES.filter((family) =>
       (family.labels ?? []).includes("exact_decimal"),
     ).map((family) => family.name);
     expect(decimalBearing).toEqual([
+      "trader_realized_pnl_info",
+      "trader_account_realized_pnl_info",
       "trader_seam_reservations_reserved_collateral_info",
       "trader_seam_allocator_reserved_collateral_info",
     ]);

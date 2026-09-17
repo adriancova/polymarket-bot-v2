@@ -555,6 +555,10 @@
       "ledgerRefusals": 0,
       "ledgerTransactions": 9,
       "pnlRecords": 12,
+      "realizedPnl": {
+        "account": null,
+        "byInstance": {}
+      },
       "unattributedActivity": 0,
       "unexplainedMovements": 0
     },

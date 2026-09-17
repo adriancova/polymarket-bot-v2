@@ -12,10 +12,11 @@
  * bytes, which is what makes a dashboard diff meaningful and what
  * `samples.test.ts` asserts.
  *
- * EXACT DECIMALS (§6 invariant 1). `reservedCollateral` is a decimal STRING and
- * is emitted as an `_info` label, never as a sample value. `Number(...)` does
- * not appear in this file, and `samples.test.ts` proves the point on a value
- * float64 cannot represent.
+ * EXACT DECIMALS (§6 invariant 1). `reservedCollateral` and, since `TRDR-3`,
+ * `accounting.realizedPnl` (per instance and the account sum) are decimal
+ * STRINGS and are emitted as `_info` labels, never as sample values.
+ * `Number(...)` does not appear in this file, and `samples.test.ts` proves the
+ * point on a value float64 cannot represent.
  */
 
 import type { MetricSample } from "./exposition.js";
@@ -33,6 +34,15 @@ function sortedEntries(
   return Object.keys(counts)
     .sort()
     .map((key) => [key, counts[key] ?? 0] as const);
+}
+
+/** Own string-valued entries in sorted key order; the values are exact decimals and are never parsed. */
+function sortedDecimalEntries(
+  values: Readonly<Record<string, string>>,
+): readonly (readonly [string, string])[] {
+  return Object.entries(values)
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
 }
 
 function scopeLabels(scope: TraderHaltInput["scope"]): {
@@ -149,6 +159,17 @@ export function traderHealthSamples(
   add("trader_unattributed_activity_total", accounting.unattributedActivity);
   add("trader_unexplained_movements_total", accounting.unexplainedMovements);
   add("trader_pnl_records_total", accounting.pnlRecords);
+  // Realized PnL (`TRDR-3`): EXACT decimals as `_info` labels, one series per
+  // instance in sorted order and one for the account sum. `account: null` is
+  // "no snapshot observed" and is OMITTED, exactly as an empty queue's age is —
+  // a `"0"` here would be a number nobody measured.
+  const realizedPnl = accounting.realizedPnl;
+  for (const [instanceId, exactDecimal] of sortedDecimalEntries(realizedPnl.byInstance)) {
+    add("trader_realized_pnl_info", 1, { instance_id: instanceId, exact_decimal: exactDecimal });
+  }
+  if (realizedPnl.account !== null) {
+    add("trader_account_realized_pnl_info", 1, { exact_decimal: realizedPnl.account });
+  }
 
   const seams = report.seams;
   add("trader_seam_fills_remembered", seams.fills.remembered);
@@ -205,6 +226,7 @@ export function controlPlaneSamples(
   add("control_mode_raise_attempts_refused_total", input.modeRaiseAttemptsRefused);
 
   add("control_trader_health_available", bool(input.traderHealthAvailable));
+  add("control_trader_health_current", bool(input.traderHealthCurrent));
   for (const [outcome, count] of sortedEntries(input.traderHealthReadsByOutcome)) {
     add("control_trader_health_reads_total", count, { outcome });
   }

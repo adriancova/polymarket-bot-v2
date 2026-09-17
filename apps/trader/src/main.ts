@@ -12,10 +12,12 @@
  * ```text
  * 1. checkPaperTraderSafety(env)        ← §6 invariant 17, §15, ADR-010
  * 2. read and parse the configuration    ← ADR-020 D1-D4
+ * 2b. readHealthServerEnv(env)           ← TRDR-3: loopback-only, or no endpoint, stated
  * 3. construct the infrastructure        ← Redis, PostgreSQL
  * 3b. verifyRegisteredRows(db, config)   ← BOOT-1: the rows every durable write references
  * 4. the simulated venue, then
  *    createPaperTrader(...)              ← the composition root
+ * 4b. startTraderHealthServer(...)       ← TRDR-3: GET /health over the loopback, if configured
  * 5. pump                                ← §8.1's outer loop
  * ```
  *
@@ -44,6 +46,29 @@
  * is absent or disagrees with the configuration; it creates none of them, for
  * the per-table reasons set out in `adapters/postgres-registration.ts`. The
  * refusal is a logged list and an exit code, never a degraded start.
+ *
+ * ## Step 4b, and why the health endpoint listens exactly there (`TRDR-3`)
+ *
+ * The health endpoint (`health-server.ts`) is started INSIDE
+ * {@link assembleDurableTrader}, after `createPaperTrader` has returned and
+ * before this function pumps. Not earlier: a process that is about to refuse —
+ * an unsafe environment, an unregistered run, a refused fee snapshot — has
+ * nothing to report and must not leave a port open while it says so, and the
+ * snapshot function it serves does not exist until the trader does. Not later:
+ * `pump` returns only at a halt, and an operator reads health DURING the run.
+ * The endpoint is optional — both `TRADER_HEALTH_BIND` and `TRADER_HEALTH_PORT`
+ * unset is "no endpoint", logged as such at step 2b — and when configured it
+ * binds loopback only, serves `GET /health` only, and is closed on every path
+ * out of this function.
+ *
+ * Step 2b runs BEFORE any infrastructure is opened: a refused bind host is a
+ * configuration refusal (exit 78), and a process that had already connected
+ * to Redis would have moved before the validation it is subject to.
+ *
+ * The same assembly wraps the durable store with `pnl-observation.ts` and
+ * attaches the resulting `RealizedPnlBook` to the trader's health state, so
+ * the snapshot the endpoint serves carries `accounting.realizedPnl` — the PnL
+ * engine's own value, observed at the store port.
  *
  * ## The two-phase venue wiring, and why it is not a smell
  *
@@ -87,6 +112,14 @@ import { verifyRegisteredRows } from "./adapters/postgres-registration.js";
 import { PostgresTraderStore } from "./adapters/postgres-store.js";
 import { RedisMarketEventFeed } from "./adapters/redis-feed.js";
 import { parseTraderConfig, type TraderConfig } from "./config.js";
+import { RealizedPnlBook } from "./health.js";
+import {
+  readHealthServerEnv,
+  startTraderHealthServer,
+  type HealthListen,
+  type RunningTraderHealthServer,
+} from "./health-server.js";
+import { observeRealizedPnl } from "./pnl-observation.js";
 import type { Clock } from "./ports.js";
 import { pump } from "./pump.js";
 import { checkPaperTraderSafety } from "./safety.js";
@@ -221,6 +254,22 @@ export async function startup(ports: StartupPorts): Promise<number> {
       `${String(config.instances.length)} instance(s), environment ${config.environment}`,
   );
 
+  // --- 2b. the health endpoint's bind, before anything is opened -----------
+  const healthEnv = readHealthServerEnv(ports.env);
+  if (!healthEnv.ok) {
+    ports.log(`REFUSING TO START: ${healthEnv.refusal.code}: ${healthEnv.refusal.detail}`);
+    for (const issue of healthEnv.refusal.issues) ports.log(`  ${issue}`);
+    return EXIT_CODES.configurationRefused;
+  }
+  const healthListen = healthEnv.listen;
+  ports.log(
+    healthListen === undefined
+      ? "health endpoint: NOT configured (TRADER_HEALTH_BIND and TRADER_HEALTH_PORT are unset); " +
+          "no HTTP surface will be bound and a control API's http health source has nothing to read"
+      : `health endpoint: will serve GET /health on ${healthListen.host}:${String(healthListen.port)} ` +
+          "(loopback only, read only) once the trader is assembled",
+  );
+
   // --- 3. infrastructure ----------------------------------------------------
   const redisUrl = ports.env["REDIS_URL"];
   const postgresUrl = ports.env["DATABASE_URL"];
@@ -250,12 +299,13 @@ export async function startup(ports: StartupPorts): Promise<number> {
     postgresUrl,
     clock: new SystemPaperClock(),
     log: ports.log,
+    ...(healthListen === undefined ? {} : { healthListen }),
   });
   if (!assembled.ok) {
     await transport.close();
     return assembled.code;
   }
-  const { store, trader } = assembled;
+  const { store, trader, healthServer } = assembled;
 
   // --- 5. the pump ----------------------------------------------------------
   const subscription = await transport.subscribe({
@@ -281,6 +331,7 @@ export async function startup(ports: StartupPorts): Promise<number> {
   }
   ports.log(`health: ${JSON.stringify(health)}`);
 
+  await healthServer?.close();
   await feed.close();
   await store.close();
   await transport.close();
@@ -298,6 +349,11 @@ export interface DurableTraderOptions {
   /** The §12.1 clock: {@link SystemPaperClock} for the process, a port for a test. */
   readonly clock: Clock;
   readonly log: (line: string) => void;
+  /**
+   * Where the health endpoint listens, as {@link readHealthServerEnv} accepted
+   * it. Absent means no endpoint (`TRDR-3`).
+   */
+  readonly healthListen?: HealthListen;
 }
 
 export type DurableTraderResult =
@@ -306,6 +362,8 @@ export type DurableTraderResult =
       readonly trader: PaperTrader;
       /** The store the trader writes through. The caller closes it. */
       readonly store: PostgresTraderStore;
+      /** The health endpoint, when one was asked for. The caller closes it. */
+      readonly healthServer: RunningTraderHealthServer | undefined;
     }
   | { readonly ok: false; readonly code: number };
 
@@ -360,6 +418,12 @@ export async function assembleDurableTrader(
     // §7.5's contract version, as `strategy.definitions` pins it.
     decisionContractVersion: 1,
   });
+  // The realized-PnL book the health surface reads (`TRDR-3`): every PnL
+  // snapshot the store ACCEPTS is recorded here by the decorator the trader is
+  // handed below, and the book is attached to the health state once the
+  // trader exists. `store` itself stays the handle the caller closes.
+  const realizedPnl = new RealizedPnlBook();
+  const observedStore = observeRealizedPnl(store, realizedPnl);
 
   // --- 3b. the registration check (BOOT-1) ---------------------------------
   const registered = await verifyRegisteredRows(database, config);
@@ -461,7 +525,7 @@ export async function assembleDurableTrader(
     config: options.document,
     clock: options.clock,
     venue,
-    store,
+    store: observedStore,
     idNamespace: config.instances.map((instance) => instance.runId).join("|"),
   });
   if (!created.ok) {
@@ -471,13 +535,40 @@ export async function assembleDurableTrader(
     return { ok: false, code: EXIT_CODES.configurationRefused };
   }
   wiring.trader = created.trader;
+  created.trader.health.attachRealizedPnl(realizedPnl);
   for (const row of created.trader.manifest) {
     log(
       `manifest: ${String(row.position)} ${row.instanceId} ${row.ownership} ` +
         `priority=${String(row.evaluationPriority)} market=${row.marketId}`,
     );
   }
-  return { ok: true, trader: created.trader, store };
+
+  // --- 4b. the health endpoint, last: nothing listens until the process has
+  // proven it may run, and nothing it serves exists before this line.
+  let healthServer: RunningTraderHealthServer | undefined;
+  if (options.healthListen !== undefined) {
+    try {
+      healthServer = await startTraderHealthServer({
+        listen: options.healthListen,
+        snapshot: () => created.trader.loop.health(),
+        log,
+      });
+    } catch (cause) {
+      log(
+        "REFUSING TO START: TRADER_HEALTH_LISTEN_FAILED: the health endpoint could not bind " +
+          `${options.healthListen.host}:${String(options.healthListen.port)} ` +
+          `(${cause instanceof Error ? cause.message : String(cause)}); a configured endpoint ` +
+          "that cannot listen is a configuration this process refuses rather than a feature it drops",
+      );
+      await store.close();
+      return { ok: false, code: EXIT_CODES.configurationRefused };
+    }
+    log(
+      `health endpoint: listening on ${healthServer.url} — GET only, loopback only, no mutation; ` +
+        "point a control API's traderHealth.http at this URL",
+    );
+  }
+  return { ok: true, trader: created.trader, store, healthServer };
 }
 
 type ReadConfigurationResult =

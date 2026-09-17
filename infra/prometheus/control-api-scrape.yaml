@@ -1,0 +1,51 @@
+# Control API scrape configuration fragment (TRDR-3).
+#
+# Merge the `scrape_configs` entry below into the deployment's prometheus.yml
+# beside `recorder-scrape.yaml`'s. This is the ONE job that produces the
+# `trader_*` and `control_*` families the three dashboards under
+# `infra/grafana/control/` bind: `apps/control-api` renders them on
+# `GET /v1/metrics` from the trader health report it reads, on that same
+# request, from `apps/trader`'s loopback `GET /health`
+# (`TRADER_HEALTH_BIND`/`TRADER_HEALTH_PORT`; the control API's
+# `traderHealth.http.url` names it).
+#
+# WIRING STATUS, disclosed: this fragment has never been loaded by a real
+# Prometheus and no Grafana has imported the dashboards — that is GOV-2B
+# round R5 and the human item H3, not this file. What IS proven is the
+# exposition itself: `pnpm --filter @polymarket-bot/control-api
+# test:integration` drives the shipped process over real HTTP and reads
+# `control_trader_health_available 1` and `trader_realized_pnl_info{...} 1`
+# off `/v1/metrics`.
+#
+# The read is AUTHENTICATED: `/v1/metrics` needs an operator credential with
+# the READ grant (§15 — an unauthenticated scrape is refused 401 and is
+# never forwarded to the trader). The credential lives in a file the
+# deployment provides and is NEVER written here or anywhere in this
+# repository; the placeholder path below is a path, not a value. Targets
+# must stay loopback/private (handoff §15).
+#
+# `bindPort` in `apps/control-api/control-api.config.example.json` is 9465,
+# which `recorder-scrape.yaml` already names for the compaction worker's
+# future exporter; a deployment running both must give the control API its
+# own port and point this target at it. Disclosed, not resolved here.
+#
+# Safety: scraping is read-only. No venue credential exists or may be added
+# here. MAX_RUN_MODE=PAPER, ALLOW_REAL_ORDERS=false,
+# LIVE_MICRO_MAX_ORDER_NOTIONAL=0, LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 are
+# untouched by observability, and no route the scrape reaches can change
+# them.
+
+scrape_configs:
+  # The control API (WP-240) — the producer of every trader_* / control_* series.
+  - job_name: "control-api"
+    scrape_interval: 15s
+    metrics_path: "/v1/metrics"
+    authorization:
+      type: "Bearer"
+      # A READ-grant operator token for the PAPER control API, supplied by the
+      # deployment. Not a venue credential; not committed.
+      credentials_file: "/run/secrets/control-api-read-operator-token"
+    static_configs:
+      - targets: ["127.0.0.1:9466"]
+        labels:
+          service: "control-api"
