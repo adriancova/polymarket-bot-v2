@@ -163,7 +163,10 @@ function readRecord(value: unknown, internalMarketId: string): LifecycleLedgerRe
  * `record.openedAt !== undefined` cannot be answered by `Object.prototype`.
  */
 function ownLedgerRecord(record: LifecycleLedgerRecord): LifecycleLedgerRecord {
-  const built = Object.create(null) as Record<string, unknown>;
+  // Built as the record type itself on a null prototype: the keys are the
+  // declared ones, read by own-descriptor so an inherited value is never
+  // copied, and the result is frozen.
+  const built = Object.create(null) as LifecycleLedgerRecord;
   for (const key of RECORD_KEYS) {
     const descriptor = Object.getOwnPropertyDescriptor(record, key);
     if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) continue;
@@ -178,7 +181,7 @@ function ownLedgerRecord(record: LifecycleLedgerRecord): LifecycleLedgerRecord {
     data.configurable = false;
     Object.defineProperty(built, key, data);
   }
-  return Object.freeze(built) as unknown as LifecycleLedgerRecord;
+  return Object.freeze(built);
 }
 
 export interface LifecycleLedgerOptions {
