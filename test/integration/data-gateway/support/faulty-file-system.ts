@@ -16,11 +16,19 @@ export interface FaultyWalFileSystem extends MemoryFileSystem {
   failWrites(reason?: string): void;
   /** Writes succeed again. */
   healWrites(): void;
+  /**
+   * Every WHOLE-FILE write from now on rejects while appends keep working
+   * (`UNIV-4` r1: the lifecycle ledger is written whole; the WAL segments are
+   * appended — this fault isolates the ledger).
+   */
+  failWholeFileWrites(reason?: string): void;
+  healWholeFileWrites(): void;
 }
 
 export function createFaultyWalFileSystem(): FaultyWalFileSystem {
   const inner = createMemoryFileSystem();
   let failure: string | undefined;
+  let wholeFileFailure: string | undefined;
 
   const wrapped: FaultyWalFileSystem = {
     ...inner,
@@ -43,6 +51,7 @@ export function createFaultyWalFileSystem(): FaultyWalFileSystem {
     truncate: (path, byteLength) => inner.truncate(path, byteLength),
     writeWholeFile: async (path, bytes) => {
       if (failure !== undefined) throw new Error(failure);
+      if (wholeFileFailure !== undefined) throw new Error(wholeFileFailure);
       await inner.writeWholeFile(path, bytes);
     },
     openAppend: async (path) => {
@@ -64,6 +73,12 @@ export function createFaultyWalFileSystem(): FaultyWalFileSystem {
     },
     healWrites: () => {
       failure = undefined;
+    },
+    failWholeFileWrites: (reason = "injected whole-file write failure") => {
+      wholeFileFailure = reason;
+    },
+    healWholeFileWrites: () => {
+      wholeFileFailure = undefined;
     },
   };
   return wrapped;

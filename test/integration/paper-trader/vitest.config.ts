@@ -39,6 +39,20 @@
  * in-memory. Testcontainers' credentials are throwaway and live only as long
  * as the run (§0.2, ADR-010).
  *
+ * **Dated correction (`UNIV-4`, 2026-09-17): FOUR files, and one of them also
+ * needs Redis.** `TRDR-3` added `trader-health-endpoint-postgres.test.ts`
+ * (PostgreSQL) and `UNIV-4` added `univ-4-gateway-opens-trader-redis.test.ts`,
+ * which starts a PostgreSQL AND a `redis:7.4.2-alpine` container in its own
+ * `beforeAll`: it runs the REAL gateway composition with the REAL
+ * `RedisStreamsEventTransport` beside the REAL trader composition root, so the
+ * `MarketOpened` the trader consumes is the one the gateway's lifecycle feed
+ * produced from a venue-shaped stub response, over the same Redis stream the
+ * process's own `RedisMarketEventFeed` reads (closeout blocker B10, part (c)).
+ * "Two files" above is therefore historical. The rule is unchanged: each
+ * container file starts its own containers, and no other file acquires a
+ * Docker dependency — `univ-4-gateway-opens-trader.test.ts` proves the same
+ * claim in memory.
+ *
  * Files under `test/` sit outside every workspace package, so bare workspace
  * imports have no `node_modules` to resolve through; the aliases below map each
  * package this suite uses to its source.
@@ -92,6 +106,21 @@ export default defineConfig({
       // to change.)
       pkg("storage-postgres", "packages/storage-postgres/src/index.ts"),
       pkg("storage-postgres/testing", "packages/storage-postgres/src/testing/index.ts"),
+      // `UNIV-4` acceptance (c): `univ-4-gateway-opens-trader-redis.test.ts`
+      // drives the REAL gateway composition (with the real Redis transport)
+      // beside the real trader, and `univ-4-gateway-opens-trader.test.ts`
+      // the same claim on the data-gateway suite's in-memory harness; both
+      // reuse that suite's support files. The same rows are carried in
+      // `tsconfig.json`.
+      pkg("data-gateway/testing", "apps/data-gateway/src/testing/index.ts"),
+      pkg("data-gateway", "apps/data-gateway/src/index.ts"),
+      pkg("event-bus/testing", "packages/event-bus/src/testing/index.ts"),
+      pkg("event-bus", "packages/event-bus/src/index.ts"),
+      pkg("storage-wal/testing", "packages/storage-wal/src/testing/index.ts"),
+      pkg("storage-wal", "packages/storage-wal/src/index.ts"),
+      pkg("polymarket-public", "packages/polymarket-public/src/index.ts"),
+      pkg("binance-adapter", "packages/binance-adapter/src/index.ts"),
+      pkg("coinbase-adapter/testing", "packages/coinbase-adapter/src/testing/index.ts"),
     ],
   },
   test: {

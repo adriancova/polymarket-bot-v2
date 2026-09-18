@@ -23,7 +23,11 @@ export type PolymarketPublicErrorCode =
   /** A REST snapshot read failed at the transport or HTTP-status level. */
   | "PUBLIC_MARKET_SNAPSHOT_UNAVAILABLE"
   /** A REST snapshot response body did not match the documented venue shape. */
-  | "PUBLIC_MARKET_SNAPSHOT_INVALID";
+  | "PUBLIC_MARKET_SNAPSHOT_INVALID"
+  /** A Gamma `GET /markets/{id}` read failed at the transport or HTTP-status level (`UNIV-4`). */
+  | "PUBLIC_MARKET_STATE_UNAVAILABLE"
+  /** A Gamma `GET /markets/{id}` body did not match the documented `Market` shape (`UNIV-4`). */
+  | "PUBLIC_MARKET_STATE_INVALID";
 
 export type PolymarketPublicErrorDetails = Readonly<Record<string, unknown>>;
 
@@ -103,5 +107,34 @@ export class PublicMarketSnapshotUnavailableError extends PolymarketPublicError 
 export class PublicMarketSnapshotInvalidError extends PolymarketPublicError {
   constructor(message: string, details: PolymarketPublicErrorDetails = {}) {
     super("PUBLIC_MARKET_SNAPSHOT_INVALID", message, details);
+  }
+}
+
+/**
+ * A Gamma market-state read could not be obtained (`UNIV-4`).
+ *
+ * A failed poll is NOT an observation: the caller must derive nothing from it
+ * and report it (the gateway opens a data-quality incident), never treat the
+ * absence of an answer as a statement about the market.
+ */
+export class GammaMarketStateUnavailableError extends PolymarketPublicError {
+  constructor(
+    message: string,
+    details: PolymarketPublicErrorDetails = {},
+    cause?: unknown,
+  ) {
+    super(
+      "PUBLIC_MARKET_STATE_UNAVAILABLE",
+      message,
+      details,
+      cause === undefined ? {} : { cause },
+    );
+  }
+}
+
+/** A Gamma market-state body could not be read as the documented `Market` shape (`UNIV-4`). */
+export class GammaMarketStateInvalidError extends PolymarketPublicError {
+  constructor(message: string, details: PolymarketPublicErrorDetails = {}) {
+    super("PUBLIC_MARKET_STATE_INVALID", message, details);
   }
 }

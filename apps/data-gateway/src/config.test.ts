@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { parseGatewayConfig } from "./config.js";
+import {
+  GAMMA_MARKETS_RATE_LIMIT_PER_10S,
+  LIFECYCLE_MAX_BUDGET_SHARE_PERCENT,
+  lifecycleRequestBudgetPer10s,
+  lifecycleRequestsPer10s,
+  MIN_LIFECYCLE_POLL_INTERVAL_MS,
+  parseGatewayConfig,
+} from "./config.js";
 import { GatewayConfigurationError } from "./errors.js";
 
 const MARKET = {
@@ -172,6 +179,201 @@ describe("parseGatewayConfig", () => {
     ).toThrow(GatewayConfigurationError);
     expect(() =>
       parseGatewayConfig({ ...BASE, publisher: { unboundedQueue: true } }),
+    ).toThrow(GatewayConfigurationError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// UNIV-4 — the market lifecycle feed's configuration door.
+// ---------------------------------------------------------------------------
+
+const LIFECYCLE_MARKET = {
+  ...MARKET,
+  gammaMarketId: "900001",
+  parameters: {
+    ...MARKET.parameters,
+    openTime: "2026-09-01T00:00:00.000Z",
+    closeTime: "2026-12-31T00:00:00.000Z",
+  },
+};
+
+function lifecycleMarkets(count: number): (typeof LIFECYCLE_MARKET)[] {
+  return Array.from({ length: count }, (_unused, index) => ({
+    ...LIFECYCLE_MARKET,
+    internalMarketId: `01990000-0000-7000-8000-${String(index + 1).padStart(12, "0")}`,
+    conditionId: `0x${String(index + 1).padStart(64, "0")}`,
+    yesTokenId: String(100_000 + index * 2),
+    noTokenId: String(100_001 + index * 2),
+    gammaMarketId: String(900_000 + index),
+  }));
+}
+
+describe("parseGatewayConfig — the lifecycle feed (UNIV-4)", () => {
+  it("applies the documented defaults: feed id, 10 s cadence, three-failure stall threshold", () => {
+    const config = parseGatewayConfig({
+      streamName: "market-events",
+      wal: { rootPath: "/wal" },
+      markets: [LIFECYCLE_MARKET],
+      lifecycle: {},
+    });
+    expect(config.lifecycle).toEqual({
+      feedId: "polymarket-lifecycle",
+      pollIntervalMs: 10_000,
+      consecutiveFailureThreshold: 3,
+    });
+    expect(config.markets[0]?.gammaMarketId).toBe("900001");
+  });
+
+  it("the lifecycle feed alone satisfies 'at least one feed must be configured'", () => {
+    expect(
+      parseGatewayConfig({
+        streamName: "market-events",
+        wal: { rootPath: "/wal" },
+        markets: [LIFECYCLE_MARKET],
+        lifecycle: { feedId: "polymarket-lifecycle" },
+      }).lifecycle?.feedId,
+    ).toBe("polymarket-lifecycle");
+  });
+
+  it("requires at least one configured market (§9.2: configuration, not discovery)", () => {
+    expect(() =>
+      parseGatewayConfig({
+        streamName: "market-events",
+        wal: { rootPath: "/wal" },
+        markets: [],
+        lifecycle: {},
+      }),
+    ).toThrow(GatewayConfigurationError);
+  });
+
+  it("refuses a market without gammaMarketId: the {id} the documented surface takes is not derived", () => {
+    expect(() =>
+      parseGatewayConfig({ ...BASE, markets: [MARKET], lifecycle: {} }),
+    ).toThrow(/gammaMarketId/u);
+    // Without the lifecycle feed the field stays optional (existing configurations are untouched).
+    expect(parseGatewayConfig(BASE).markets[0]?.gammaMarketId).toBeUndefined();
+  });
+
+  it("refuses an openTime or closeTime that is not an ISO-8601 instant, only when the feed is configured", () => {
+    const bad = {
+      ...LIFECYCLE_MARKET,
+      parameters: { ...LIFECYCLE_MARKET.parameters, closeTime: "tomorrow" },
+    };
+    expect(() =>
+      parseGatewayConfig({ ...BASE, markets: [bad], lifecycle: {} }),
+    ).toThrow(/parameters\.closeTime/u);
+    expect(() =>
+      parseGatewayConfig({
+        ...BASE,
+        markets: [{ ...bad, parameters: { ...bad.parameters, closeTime: undefined, openTime: "09/01/2026" } }],
+        lifecycle: {},
+      }),
+    ).toThrow(/parameters\.openTime/u);
+    // The same market parses without the lifecycle feed: the check belongs to the producer.
+    expect(parseGatewayConfig({ ...BASE, markets: [bad] }).markets).toHaveLength(1);
+  });
+
+  it("refuses a cadence under the 1 s floor", () => {
+    expect(() =>
+      parseGatewayConfig({
+        ...BASE,
+        markets: [LIFECYCLE_MARKET],
+        lifecycle: { pollIntervalMs: MIN_LIFECYCLE_POLL_INTERVAL_MS - 1 },
+      }),
+    ).toThrow(/pollIntervalMs must be at least 1000 ms/u);
+    expect(
+      parseGatewayConfig({
+        ...BASE,
+        markets: [LIFECYCLE_MARKET],
+        lifecycle: { pollIntervalMs: MIN_LIFECYCLE_POLL_INTERVAL_MS },
+      }).lifecycle?.pollIntervalMs,
+    ).toBe(1_000);
+  });
+
+  // Acceptance (d): the rate-limit arithmetic, pinned. The venue's documented
+  // Gamma /markets limit is 300 requests / 10 s (the general Gamma limit is
+  // 4,000 / 10 s; the stricter figure is budgeted against); the feed may use
+  // 5 % of it, 15 requests / 10 s. N markets × (10 000 / pollIntervalMs) ≤ 15.
+  it("pins the request budget: 5 % of the venue's documented 300 / 10 s for Gamma /markets", () => {
+    expect(GAMMA_MARKETS_RATE_LIMIT_PER_10S).toBe(300);
+    expect(LIFECYCLE_MAX_BUDGET_SHARE_PERCENT).toBe(5);
+    expect(lifecycleRequestBudgetPer10s()).toBe(15);
+    expect(lifecycleRequestsPer10s(15, 10_000)).toBe(15);
+    expect(lifecycleRequestsPer10s(16, 10_000)).toBe(16);
+    expect(lifecycleRequestsPer10s(1, 1_000)).toBe(10);
+    expect(lifecycleRequestsPer10s(2, 1_000)).toBe(20);
+    expect(lifecycleRequestsPer10s(90, 60_000)).toBe(15);
+  });
+
+  it.each([
+    [15, 10_000, true],
+    [16, 10_000, false],
+    [1, 1_000, true],
+    [2, 1_000, false],
+    [90, 60_000, true],
+    [91, 60_000, false],
+    [150, 100_000, true],
+  ])(
+    "%s markets at %s ms: admitted=%s (the door's arithmetic)",
+    (markets, pollIntervalMs, admitted) => {
+      const parse = (): unknown =>
+        parseGatewayConfig({
+          streamName: "market-events",
+          wal: { rootPath: "/wal" },
+          markets: lifecycleMarkets(markets),
+          lifecycle: { pollIntervalMs },
+        });
+      if (admitted) {
+        expect(parse).not.toThrow();
+      } else {
+        expect(parse).toThrow(/requests per 10 s, over its budget of 15 per 10 s/u);
+      }
+    },
+  );
+
+  it("the refusal states the arithmetic an operator sizes the interval from", () => {
+    let thrown: unknown;
+    try {
+      parseGatewayConfig({
+        streamName: "market-events",
+        wal: { rootPath: "/wal" },
+        markets: lifecycleMarkets(20),
+        lifecycle: { pollIntervalMs: 10_000 },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(GatewayConfigurationError);
+    expect((thrown as GatewayConfigurationError).message).toContain(
+      "20 markets × (10000 ms / 10000 ms) = 20 requests per 10 s",
+    );
+    expect((thrown as GatewayConfigurationError).details).toMatchObject({
+      markets: 20,
+      pollIntervalMs: 10_000,
+      requestsPer10s: 20,
+      budgetPer10s: 15,
+      venueRequestsPer10s: 300,
+      budgetSharePercent: 5,
+    });
+  });
+
+  it("refuses a lifecycle feed id that collides with another feed's", () => {
+    expect(() =>
+      parseGatewayConfig({
+        ...BASE,
+        markets: [LIFECYCLE_MARKET],
+        lifecycle: { feedId: "binance-reference" },
+      }),
+    ).toThrow(/feed ids must be distinct/u);
+  });
+
+  it("is strict: no credential-shaped key can ride on the lifecycle block", () => {
+    expect(() =>
+      parseGatewayConfig({
+        ...BASE,
+        markets: [LIFECYCLE_MARKET],
+        lifecycle: { apiKey: "sk-something" },
+      }),
     ).toThrow(GatewayConfigurationError);
   });
 });

@@ -72,3 +72,5 @@ export * from "./feed/subscriptions.js";
 export * from "./feed/connection.js";
 
 export * from "./snapshot/fetcher.js";
+
+export * from "./market-state/index.js";

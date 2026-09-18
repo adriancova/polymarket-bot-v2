@@ -22,7 +22,16 @@ export type {
   GatewayPorts,
 } from "./gateway.js";
 
-export { GatewayConfigSchema, parseGatewayConfig } from "./config.js";
+export {
+  GAMMA_MARKETS_RATE_LIMIT_PER_10S,
+  GatewayConfigSchema,
+  LIFECYCLE_MAX_BUDGET_SHARE_PERCENT,
+  LifecycleFeedConfigSchema,
+  lifecycleRequestBudgetPer10s,
+  lifecycleRequestsPer10s,
+  MIN_LIFECYCLE_POLL_INTERVAL_MS,
+  parseGatewayConfig,
+} from "./config.js";
 export type { GatewayConfig, MarketConfig } from "./config.js";
 
 export { planSubscriptions } from "./subscription-plan.js";
@@ -61,6 +70,14 @@ export { BinanceFeedDriver } from "./feeds/binance.js";
 export type { BinanceFeedDriverMetrics } from "./feeds/binance.js";
 export { CoinbaseFeedDriver, RecordingCoinbaseSocketFactory } from "./feeds/coinbase.js";
 export type { CoinbaseFeedDriverMetrics } from "./feeds/coinbase.js";
+export { MarketLifecycleFeedDriver } from "./feeds/market-lifecycle.js";
+export type { LifecyclePhase, MarketLifecycleDriverMetrics } from "./feeds/market-lifecycle.js";
+export {
+  LIFECYCLE_LEDGER_FILE_NAME,
+  LIFECYCLE_LEDGER_SCHEMA_VERSION,
+  LifecycleLedger,
+} from "./lifecycle-ledger.js";
+export type { LifecycleLedgerRecord, OpenedAtOrigin } from "./lifecycle-ledger.js";
 
 export {
   GatewayConfigurationError,

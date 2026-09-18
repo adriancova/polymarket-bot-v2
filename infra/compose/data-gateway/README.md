@@ -84,6 +84,52 @@ such values are refused before any resource is acquired.
   writer schedules nothing: an idle recorder is fsynced only by this tick, so a
   slower tick would make the `dataLossBoundMs` the writer publishes a false
   claim.
+- `lifecycle` (`UNIV-4`) is the **market lifecycle feed**, the only producer
+  of `MarketOpened` / `MarketClosing`. It polls the venue's documented
+  market-state surface `GET https://gamma-api.polymarket.com/markets/{id}`
+  for every configured market every `pollIntervalMs` (default `10000`, floor
+  `1000`), journals each raw response before deriving anything, and derives
+  the two events from the documented readiness predicate
+  `active && !closed && acceptingOrders` and the reviewed `openTime` /
+  `closeTime` — never from configuration alone: `MarketOpened` once, when the
+  venue is first observed trade-ready (`openedAt` = the past `openTime`, else
+  the observation instant); the scheduled `MarketClosing` when `closeTime` is
+  reached; an observed `MarketClosing` when the venue shows `closed` or
+  `acceptingOrders: false`. When it is configured, every
+  market **must** carry `gammaMarketId` (the `{id}` the surface takes, as the
+  operator verified it) and any `openTime` / `closeTime` must be an ISO-8601
+  instant. The configuration door budgets the feed at 5 % of the venue's
+  documented Gamma `/markets` limit (300 requests / 10 s): `markets ×
+  10000 / pollIntervalMs` must be ≤ 15 per 10 s, so the default cadence admits
+  15 markets and a 60 s cadence admits 90; a configuration over budget is
+  refused with the arithmetic in the message. `consecutiveFailureThreshold`
+  (default `3`) failed polls in a row publish `FeedStale` and open a
+  `GATEWAY_FEED_STALL` incident. The feed keeps a small ledger,
+  `<walRoot>/market-lifecycle-ledger.json`, of the instants it has CHOSEN
+  (intents, written before an event is dispatched) and which of them the
+  publisher CONFIRMED, so a restart never re-mints a market's `openedAt` and
+  an event that could not be published — a Redis outage, including the
+  recording-only startup mode above — is re-emitted with the same instant
+  by the next start (`GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED` is the PAGE
+  incident that says one is owed; `GATEWAY_LIFECYCLE_LEDGER_WRITE_FAILED`
+  says the disk refused the intent and the event was held back). An
+  unreadable ledger, or one whose record for a market carries a different
+  `conditionId`/`gammaMarketId` than the configuration, fails the start and
+  must be repaired or removed by an operator; a record for a market no
+  longer configured is carried and named (`GATEWAY_LIFECYCLE_LEDGER_FOREIGN_RECORD`);
+  a market the venue contradicted (`GATEWAY_LIFECYCLE_CONFIG_CONTRADICTED`)
+  is named again at every start until its record is removed.
+  **`gammaMarketId` is an operator obligation:** the venue's documented
+  response fields do not include a documented `conditionId` this repository
+  may interpret (`docs/venue/verified-2026-09-16.md` D-30), so a response is
+  attributed to the configured market by the REQUEST alone — a mis-pointed
+  `gammaMarketId` opens THIS market on ANOTHER market's readiness, silently.
+  Verify it against the venue's market page before enabling the feed.
+- A gateway with `polymarket` markets and **no** `lifecycle` block records
+  books but produces no `MarketOpened`: every consumer stays `PENDING` and
+  every paper entry is refused (§9.8). That configuration is accepted (the
+  feed is opt-in) but announced at start as a NOTIFY incident,
+  `GATEWAY_LIFECYCLE_FEED_ABSENT`, in the stream and in the `[incident]` log.
 - `publisher.maxQueueDepth` (default `1024`) and `publisher.maxQueueBytes`
   (default `8388608`) bound how much unpublished work the gateway will hold in
   memory while the transport is slow. They are **safety parameters, not
