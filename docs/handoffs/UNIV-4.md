@@ -434,3 +434,40 @@ Repository assumptions: the fold's contract (`packages/universe/src/lifecycle.ts
 - the r0 tip the review examined: `7564db6`
 - r1 code: `9e9f154`; r1 tip (the confirming review's input): `29b2e9d`
 - r2 code: `5109a88`; r2 tip: the commit carrying this table (recorded in the hand-back message)
+
+---
+
+## Merge record (orchestrator, 2026-09-17)
+
+**Merged:** `7c08af7` (`--no-ff`). Chain `f687513` → `bc7871d` → `615cabb` → `6788e26` →
+`acc122a` → `7564db6` (r0) → `9e9f154` → `29b2e9d` (r1) → `5109a88` → `d52bbe8` (r2),
+rebased onto `da9c58e`. Review r0 **CHANGES REQUIRED** (1 HIGH, 2 MEDIUM, 6 LOW,
+2 INFO) → r1 **ACCEPT** (1 MEDIUM, 3 LOW) → r2 **ACCEPT** (2 LOW, INFO). Reviewer
+independent of the implementer; it re-ran its own reproductions against each fix.
+Post-merge gates on `main`: test 331 files / 7217, data-gateway integration 12/94,
+trader integration 14/129 (real PostgreSQL + Redis), contract 637/65/158/95,
+control-api 10/85, e2e 6/78, replay 3/17, check:deps 34/80, audit 0, typecheck 0,
+lint 0.
+
+**Rulings recorded at merge.** Deviation 4 (R3 timing — `MarketClosing` at the first
+poll at/past `closeTime`, not at the open): JUSTIFIED; the packet's wording was wrong
+for this consumer (`loop.ts:579-580` flips CLOSING on receipt regardless of
+`closesAt`; `pipeline.ts:340-341` → `CLOSE_ONLY`). Deviations 1-3 and 5 (fixture
+location and provenance; `{id}` as configuration; the hand-written door): HONEST /
+ACCEPTABLE, as the review found. The r2 hold-back of a fresh closing behind an owed
+earlier event (`#emitBehind`, beyond the asked fix): correct by construction — it
+uses the same `owedReplays` set the next epoch replays, so nothing waits behind an
+event that will never be replayed (probed). `publisher.ts:461`'s wording left to its
+owner: acceptable for this round.
+
+**Why the HIGH mattered.** The round exists so a live-data paper run can leave
+`PENDING`. Its first persistence design would have re-introduced exactly that
+failure in the gateway's own designed recording-only startup mode, silently and
+permanently. The ledger is now write-ahead: publication, not dispatch, seals an
+event; unconfirmed intents are re-emitted with their persisted instant; a replay
+stops at the first event that does not land. Residuals UNIV4-R1..R5 are in the
+ledger's residual queue with owners.
+
+**What this does NOT claim.** No live venue was contacted; part (c)'s venue was a
+loopback stub answering the documented shape. The live-data paper run (H1) is now
+attemptable and has not been attempted.
