@@ -129,6 +129,9 @@ describe("LifecycleLedger", () => {
     ["openedAt without its origin", entry({ openedAt: "2026-09-01T00:00:00.000Z" })],
     ["an unknown origin", entry({ openedAt: "2026-09-01T00:00:00.000Z", openedAtOrigin: "guess" })],
     ["a non-string instant", entry({ contradictedAt: 1_760_000_000_000 })],
+    ["a malformed openedAt (r2)", entry({ openedAt: "yesterday", openedAtOrigin: "observation" })],
+    ["a malformed confirmation instant (r2)", entry({ openedAt: "2026-09-01T00:00:00.000Z", openedAtOrigin: "observation", openedConfirmedAt: "2026-09-01" })],
+    ["a malformed closesAt (r2)", entry({ scheduledClosesAt: "12:15" })],
     ["a confirmation without its intent (opened)", entry({ openedConfirmedAt: "2026-09-01T00:00:00.000Z" })],
     [
       "a confirmation without its intent (scheduled closing)",
@@ -147,6 +150,25 @@ describe("LifecycleLedger", () => {
     );
     // Untouched: the refusal did not rewrite the file.
     expect(fileSystem.snapshot()[`/wal/${LIFECYCLE_LEDGER_FILE_NAME}`]).toBe(text);
+  });
+
+  it("names the malformed field in the typed refusal (r2, MEDIUM-R1)", () => {
+    let thrown: unknown;
+    try {
+      LifecycleLedger.decode(entry({ openedAt: "not-an-instant", openedAtOrigin: "observation" }));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(GatewayStateError);
+    expect((thrown as GatewayStateError).message).toContain("openedAt");
+    expect((thrown as GatewayStateError).message).toContain("ISO-8601");
+    expect((thrown as GatewayStateError).details).toMatchObject({ key: "openedAt", value: "not-an-instant" });
+    // Every instant grammar the frozen contract accepts is accepted here too.
+    expect(
+      LifecycleLedger.decode(
+        entry({ openedAt: "2026-09-01T00:00:00+02:00", openedAtOrigin: "observation", contradictedAt: "2026-09-01T00:00:00Z" }),
+      ),
+    ).toHaveLength(1);
   });
 
   it("reads the document as own data: an inherited openedAt is not adopted", () => {

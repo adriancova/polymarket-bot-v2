@@ -168,11 +168,34 @@
  * closing — and NEVER past a confirmed later event: an OPEN is not re-emitted
  * for a market whose CLOSING is confirmed (the one regression the trader's
  * unguarded `markLifecycle` cannot absorb); a same-instant `MarketOpened`
- * replay is idempotent for the universe fold. A terminal market with an
- * unconfirmed closing is polled until the replay is attempted. The first
- * round wrote the ledger once, after a fire-and-forget dispatch, so a halt
- * sealed an instant nobody received and the next epoch skipped the market
- * forever (the review's reproduction); this section is what closed it.
+ * replay is idempotent for the universe fold. **The replay STOPS at the
+ * first event that is not confirmed** (r2, MEDIUM-R1): an intent write that
+ * failed, or a dispatch the publisher did not publish, ends the poll's
+ * replay before any LATER event is attempted — after a halt nothing later
+ * could publish anyway, and after a non-halting rejection a later event
+ * must not overtake an earlier one, because a confirmed later CLOSING would
+ * make the guard above (correctly) refuse the OPEN forever. The order the
+ * header promises — `MarketOpened` before every `MarketClosing` — is kept by
+ * refusing to emit out of order, not by hoping the earlier event lands. The
+ * same rule governs a FRESH derivation: a closing derived while the
+ * market's open (or its scheduled closing) is unconfirmed has its intent
+ * persisted and is NOT dispatched (`eventsHeldBack`); the next epoch
+ * replays it behind the event it follows. A
+ * terminal market with an unconfirmed closing is polled every interval
+ * until that closing is CONFIRMED (budget-bounded: one request per
+ * interval). The first round wrote the ledger once, after a fire-and-forget
+ * dispatch, so a halt sealed an instant nobody received and the next epoch
+ * skipped the market forever (the review's reproduction); this section is
+ * what closed it.
+ *
+ * The `GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED` incident is raised at the END of
+ * a poll that left anything unpublished, and its detail lists EVERY
+ * unconfirmed intent the ledger then holds for the market (event kind and
+ * instant), so an open followed by its scheduled closing in one halted poll
+ * is one incident naming both (r2, LOW-R1). The incident registry dedups
+ * the key while it is open; when a later poll leaves a DIFFERENT set of
+ * intents unconfirmed, the standing incident is closed and a fresh one
+ * names the whole set.
  *
  * ## Raw before derived, and nothing silent (acceptances 1–4 inherited)
  *
@@ -313,6 +336,10 @@ export interface MarketLifecycleDriverMetrics {
   readonly replaysEmitted: number;
   /** Dispatches the publisher did not publish (halted, suppressed, refused, rejected). */
   readonly eventsUnpublished: number;
+  /** The publisher's reason for the most recent unpublished dispatch, verbatim. */
+  readonly lastUnpublishedReason: string | undefined;
+  /** Intents persisted but NOT dispatched because an earlier event is unconfirmed (r2). */
+  readonly eventsHeldBack: number;
   /** Dispatches the publisher confirmed. */
   readonly eventsConfirmed: number;
   readonly contradictions: number;
@@ -329,6 +356,10 @@ interface MarketState {
   phase: LifecyclePhase;
   /** Unconfirmed intents from an earlier epoch still to be re-emitted this epoch. */
   replayOwed: boolean;
+  /** Set by `#emit` when a dispatch of this poll went unpublished; reported once per poll. */
+  unpublishedThisPoll: boolean;
+  /** The set of unconfirmed intents the standing incident names, so a grown set re-raises. */
+  reportedUnconfirmed: string | undefined;
 }
 
 /** The phase a ledger record puts a market in at start. */
@@ -397,6 +428,8 @@ export class MarketLifecycleFeedDriver {
   #contradictions = 0;
   #stallsObserved = 0;
   #ledgerWriteFailures = 0;
+  #lastUnpublishedReason: string | undefined;
+  #eventsHeldBack = 0;
 
   constructor(options: MarketLifecycleDriverOptions) {
     this.#options = options;
@@ -432,6 +465,8 @@ export class MarketLifecycleFeedDriver {
         gammaMarketId,
         phase: phaseFromLedger(record),
         replayOwed: record !== undefined && owedReplays(record).length > 0,
+        unpublishedThisPoll: false,
+        reportedUnconfirmed: undefined,
       };
     });
     this.#foreignRecords = options.ledger
@@ -585,22 +620,81 @@ export class MarketLifecycleFeedDriver {
     this.#pollSucceeded(receipt);
     const frame: CitedFrame = { receipt, rawFrameIngestSeq: outcome.ingestSeq, connectionId };
     if (market.replayOwed) {
-      await this.#replay(market, frame);
+      const replayed = await this.#replay(market, frame);
+      if (!replayed) {
+        // r2 (MEDIUM-R1): an owed event did not land; nothing derived from
+        // this poll may overtake it. The poll is reported and ends here.
+        this.#reportUnpublished(market);
+        return;
+      }
     }
     await this.#derive(market, verdict.state, frame);
+    this.#reportUnpublished(market);
   }
 
-  /** Re-emits the unconfirmed intents an earlier epoch left, citing this epoch's journaled response. */
-  async #replay(market: MarketState, frame: CitedFrame): Promise<void> {
-    // Attempted once per epoch whatever the outcome: a publication halt is
+  /**
+   * Raises `GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED` once per poll that left a
+   * dispatch unpublished, naming EVERY unconfirmed intent the ledger holds
+   * for the market (r2, LOW-R1). A standing incident is closed and re-raised
+   * when the set it named has changed.
+   */
+  #reportUnpublished(market: MarketState): void {
+    if (!market.unpublishedThisPoll) return;
+    market.unpublishedThisPoll = false;
+    const owed = this.#unconfirmedIntents(market);
+    const signature = owed.join("|");
+    if (market.reportedUnconfirmed === signature) {
+      return; // the standing incident already names exactly this set
+    }
+    if (market.reportedUnconfirmed !== undefined) {
+      this.#options.dispatcher.markIncidentClosed(
+        `${this.#options.feedId}:${market.config.internalMarketId}`,
+        "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED",
+      );
+    }
+    market.reportedUnconfirmed = signature;
+    this.#openMarketIncident(
+      market,
+      "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED",
+      "PAGE",
+      `${String(owed.length)} lifecycle event(s) for market ${market.config.internalMarketId} are owed to the stream — dispatched but not published (${this.#lastUnpublishedReason ?? "no publisher reason recorded"}), or held back behind an unconfirmed earlier event: ${owed.join("; ")}. Each intent is persisted in the lifecycle ledger and will be re-emitted with the same instant, in order, at the next start — the publisher's "remains in the WAL" describes raw frames, not these derived events`,
+    );
+  }
+
+  /** Every unconfirmed intent the ledger holds for the market, in lifecycle order, rendered. */
+  #unconfirmedIntents(market: MarketState): readonly string[] {
+    const record = this.#record(market);
+    if (record === undefined) return [];
+    const owed: string[] = [];
+    if (record.openedAt !== undefined && record.openedConfirmedAt === undefined) {
+      owed.push(`MarketOpened openedAt ${record.openedAt}`);
+    }
+    if (record.scheduledClosesAt !== undefined && record.scheduledClosingConfirmedAt === undefined) {
+      owed.push(`MarketClosing (scheduled) closesAt ${record.scheduledClosesAt}`);
+    }
+    if (record.observedClosesAt !== undefined && record.observedClosingConfirmedAt === undefined) {
+      owed.push(`MarketClosing (observed) closesAt ${record.observedClosesAt}`);
+    }
+    return owed;
+  }
+
+  /**
+   * Re-emits the unconfirmed intents an earlier epoch left, citing this
+   * epoch's journaled response. Returns `true` when every owed event was
+   * confirmed; `false` the moment one was not — and STOPS there (r2,
+   * MEDIUM-R1): a later event must never overtake an earlier one.
+   */
+  async #replay(market: MarketState, frame: CitedFrame): Promise<boolean> {
+    // Attempted once per epoch when DISPATCHED: a publication halt is
     // terminal for the epoch, and the ledger's confirmations carry the truth
-    // to the next one.
+    // to the next one. Re-owed below only when the intent write itself
+    // failed and nothing was dispatched.
     market.replayOwed = false;
     const record = this.#record(market);
-    if (record === undefined) return;
+    if (record === undefined) return true;
     for (const kind of owedReplays(record)) {
       const current = this.#record(market);
-      if (current === undefined) return;
+      if (current === undefined) return false;
       let payload: MarketOpenedPayload | MarketClosingPayload;
       if (kind === "opened") {
         if (current.openedAt === undefined) continue;
@@ -613,8 +707,20 @@ export class MarketLifecycleFeedDriver {
         payload = this.#closingPayload(market, current.observedClosesAt);
       }
       this.#replaysEmitted += 1;
-      await this.#emit(market, kind, payload, current, frame);
+      const outcome = await this.#emit(market, kind, payload, current, frame);
+      if (!outcome.intentPersisted) {
+        // The disk refused the intent's (idempotent) write: nothing was
+        // dispatched, so the replay is still owed and the next poll retries.
+        market.replayOwed = true;
+        return false;
+      }
+      if (!outcome.published) {
+        // Dispatched, not published: terminal for this epoch; the ledger's
+        // confirmations carry the debt to the next one.
+        return false;
+      }
     }
+    return true;
   }
 
   async #derive(market: MarketState, state: GammaMarketState, frame: CitedFrame): Promise<void> {
@@ -675,10 +781,11 @@ export class MarketLifecycleFeedDriver {
       market.phase = "OPEN";
       // R3, when the schedule is already reached at the open: the market is
       // opening into its own close, so the scheduled closing follows on the
-      // same poll, after the open.
+      // same poll, after the open — DISPATCHED only behind a published open
+      // (r2, MEDIUM-R1); otherwise its intent is persisted and owed.
       const closeTime = config.parameters.closeTime;
       if (closeTime !== undefined && Date.parse(closeTime) <= frame.receipt.nowMs) {
-        const scheduled = await this.#emit(
+        const scheduled = await this.#emitBehind(
           market,
           "scheduledClosing",
           this.#closingPayload(market, closeTime),
@@ -695,14 +802,17 @@ export class MarketLifecycleFeedDriver {
       return;
     }
 
-    // market.phase === "OPEN"
+    // market.phase === "OPEN". Every closing is dispatched only behind
+    // CONFIRMED earlier events (r2, MEDIUM-R1); otherwise its intent is
+    // persisted and owed, and the next epoch replays in order.
+    const earlier = this.#baseRecord(market);
     if (state.closed === true || state.acceptingOrders === false) {
       // R4: the observed closing, at the observation instant.
-      const closing = await this.#emit(
+      const closing = await this.#emitBehind(
         market,
         "observedClosing",
         this.#closingPayload(market, observedAt),
-        { ...this.#baseRecord(market), observedClosesAt: observedAt },
+        { ...earlier, observedClosesAt: observedAt },
         frame,
       );
       if (!closing.intentPersisted) return;
@@ -711,20 +821,19 @@ export class MarketLifecycleFeedDriver {
       return;
     }
     const closeTime = config.parameters.closeTime;
-    const record = this.#baseRecord(market);
     if (
-      record.scheduledClosesAt === undefined &&
+      earlier.scheduledClosesAt === undefined &&
       closeTime !== undefined &&
       Date.parse(closeTime) <= frame.receipt.nowMs
     ) {
       // R3: the reviewed schedule is reached and the venue has not shown its
       // own close first. Once per market, ledger-recorded, so a restart after
       // it never re-announces a confirmed one.
-      const scheduled = await this.#emit(
+      const scheduled = await this.#emitBehind(
         market,
         "scheduledClosing",
         this.#closingPayload(market, closeTime),
-        { ...record, scheduledClosesAt: closeTime },
+        { ...earlier, scheduledClosesAt: closeTime },
         frame,
       );
       if (scheduled.intentPersisted) this.#scheduledClosingEmitted += 1;
@@ -802,16 +911,36 @@ export class MarketLifecycleFeedDriver {
       return { intentPersisted: true, published: true };
     }
     this.#eventsUnpublished += 1;
-    const instant =
-      kind === "opened"
-        ? `openedAt ${(payload as MarketOpenedPayload).openedAt}`
-        : `closesAt ${(payload as MarketClosingPayload).closesAt}`;
-    this.#openMarketIncident(
-      market,
-      "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED",
-      "PAGE",
-      `${eventType} for market ${market.config.internalMarketId} was dispatched but NOT published (${outcome.reason}: ${outcome.detail}); its intent (${instant}) is persisted in the lifecycle ledger and will be re-emitted with the same instant at the next start — the publisher's "remains in the WAL" describes raw frames, not this derived event`,
-    );
+    this.#lastUnpublishedReason = `${outcome.reason}: ${outcome.detail}`;
+    // Reported at the end of the poll, naming every owed intent (LOW-R1).
+    market.unpublishedThisPoll = true;
+    return { intentPersisted: true, published: false };
+  }
+
+  /**
+   * `#emit` when nothing earlier is still owed for the market (the ledger's
+   * `owedReplays` of the current record is empty — the same rule the
+   * next epoch's replay applies, so a closing behind a permanently
+   * unreplayable open still goes out); otherwise the intent alone is
+   * persisted (owed, named in the incident, replayed in order by the next
+   * epoch) and nothing is dispatched — a later event never overtakes an
+   * unconfirmed earlier one (r2, MEDIUM-R1).
+   */
+  async #emitBehind(
+    market: MarketState,
+    kind: LifecycleEventKind,
+    payload: MarketOpenedPayload | MarketClosingPayload,
+    intent: LifecycleLedgerRecord,
+    frame: CitedFrame,
+  ): Promise<{ readonly intentPersisted: boolean; readonly published: boolean }> {
+    if (owedReplays(this.#baseRecord(market)).length === 0) {
+      return await this.#emit(market, kind, payload, intent, frame);
+    }
+    if (!(await this.#persist(intent))) {
+      return { intentPersisted: false, published: false };
+    }
+    this.#eventsHeldBack += 1;
+    market.unpublishedThisPoll = true;
     return { intentPersisted: true, published: false };
   }
 
@@ -960,6 +1089,8 @@ export class MarketLifecycleFeedDriver {
       marketClosingObservedEmitted: this.#observedClosingEmitted,
       replaysEmitted: this.#replaysEmitted,
       eventsUnpublished: this.#eventsUnpublished,
+      lastUnpublishedReason: this.#lastUnpublishedReason,
+      eventsHeldBack: this.#eventsHeldBack,
       eventsConfirmed: this.#eventsConfirmed,
       contradictions: this.#contradictions,
       stallsObserved: this.#stallsObserved,

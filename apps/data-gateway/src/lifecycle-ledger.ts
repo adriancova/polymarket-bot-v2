@@ -79,6 +79,7 @@
  * contradiction.
  */
 
+import { IsoTimestampSchema } from "@polymarket-bot/domain";
 import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 import type { WalFileSystem } from "@polymarket-bot/storage-wal";
 
@@ -141,6 +142,19 @@ const RECORD_KEYS = [
   "contradictedAt",
 ] as const;
 
+/** The keys that carry an instant: every one must be an ISO-8601 instant at load (r2, MEDIUM-R1). */
+const INSTANT_KEYS = [
+  "firstReadyObservedAt",
+  "notReadyAfterOpenTimeAt",
+  "openedAt",
+  "openedConfirmedAt",
+  "scheduledClosesAt",
+  "scheduledClosingConfirmedAt",
+  "observedClosesAt",
+  "observedClosingConfirmedAt",
+  "contradictedAt",
+] as const;
+
 /** Each confirmation names the intent it confirms; a confirmation without its intent is refused. */
 const CONFIRMATIONS = [
   ["openedConfirmedAt", "openedAt"],
@@ -195,14 +209,18 @@ function readRecord(value: unknown, internalMarketId: string): LifecycleLedgerRe
       { internalMarketId },
     );
   }
-  for (const key of RECORD_KEYS) {
-    if (key === "internalMarketId") continue;
+  for (const key of INSTANT_KEYS) {
     const raw = value[key];
-    if (raw !== undefined && typeof raw !== "string") {
-      throw new GatewayStateError("the lifecycle ledger holds a non-string instant", {
-        internalMarketId,
-        key,
-      });
+    if (raw === undefined) continue;
+    // r2 (MEDIUM-R1): an instant that is not an ISO-8601 instant would reach
+    // the publisher inside a replayed event and be REJECTED there — a
+    // non-halting rejection a later event could overtake. Refused at load,
+    // where it names the field and fails the start.
+    if (typeof raw !== "string" || !IsoTimestampSchema.safeParse(raw).success) {
+      throw new GatewayStateError(
+        `the lifecycle ledger holds ${key} that is not an ISO-8601 instant; a replayed event would be refused by the frozen contract, so the record is refused here — repair or remove it before starting`,
+        { internalMarketId, key, value: typeof raw === "string" ? raw : typeof raw },
+      );
     }
   }
   for (const [confirmation, intent] of CONFIRMATIONS) {
