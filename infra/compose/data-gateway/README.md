@@ -105,9 +105,31 @@ such values are refused before any resource is acquired.
   refused with the arithmetic in the message. `consecutiveFailureThreshold`
   (default `3`) failed polls in a row publish `FeedStale` and open a
   `GATEWAY_FEED_STALL` incident. The feed keeps a small ledger,
-  `<walRoot>/market-lifecycle-ledger.json`, of the instants it has emitted so
-  a restart never re-mints a market's `openedAt`; an unreadable ledger fails
-  the start and must be repaired or removed by an operator.
+  `<walRoot>/market-lifecycle-ledger.json`, of the instants it has CHOSEN
+  (intents, written before an event is dispatched) and which of them the
+  publisher CONFIRMED, so a restart never re-mints a market's `openedAt` and
+  an event that could not be published — a Redis outage, including the
+  recording-only startup mode above — is re-emitted with the same instant
+  by the next start (`GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED` is the PAGE
+  incident that says one is owed; `GATEWAY_LIFECYCLE_LEDGER_WRITE_FAILED`
+  says the disk refused the intent and the event was held back). An
+  unreadable ledger, or one whose record for a market carries a different
+  `conditionId`/`gammaMarketId` than the configuration, fails the start and
+  must be repaired or removed by an operator; a record for a market no
+  longer configured is carried and named (`GATEWAY_LIFECYCLE_LEDGER_FOREIGN_RECORD`);
+  a market the venue contradicted (`GATEWAY_LIFECYCLE_CONFIG_CONTRADICTED`)
+  is named again at every start until its record is removed.
+  **`gammaMarketId` is an operator obligation:** the venue's documented
+  response fields do not include a documented `conditionId` this repository
+  may interpret (`docs/venue/verified-2026-09-16.md` D-30), so a response is
+  attributed to the configured market by the REQUEST alone — a mis-pointed
+  `gammaMarketId` opens THIS market on ANOTHER market's readiness, silently.
+  Verify it against the venue's market page before enabling the feed.
+- A gateway with `polymarket` markets and **no** `lifecycle` block records
+  books but produces no `MarketOpened`: every consumer stays `PENDING` and
+  every paper entry is refused (§9.8). That configuration is accepted (the
+  feed is opt-in) but announced at start as a NOTIFY incident,
+  `GATEWAY_LIFECYCLE_FEED_ABSENT`, in the stream and in the `[incident]` log.
 - `publisher.maxQueueDepth` (default `1024`) and `publisher.maxQueueBytes`
   (default `8388608`) bound how much unpublished work the gateway will hold in
   memory while the transport is slow. They are **safety parameters, not

@@ -687,6 +687,20 @@ export class DataGateway {
     this.#state = "running";
     this.#releaseLifetime = this.#ports.lifetime?.acquire();
     try {
+      if (this.#config.polymarket !== undefined && this.#config.lifecycle === undefined) {
+        // UNIV-4 r1 (LOW-1): the lifecycle feed is opt-in, and a gateway that
+        // records Polymarket markets without it reproduces closeout blocker
+        // B10 — no `MarketOpened` is ever produced, every consumer stays
+        // PENDING and §9.8 refuses every entry — with no signal at all. This
+        // is that signal: a NOTIFY incident at start, in the stream and in the
+        // operator's log, naming the block to configure.
+        this.#dispatcher.openIncident({
+          scope: "lifecycle",
+          reasonCode: "GATEWAY_LIFECYCLE_FEED_ABSENT",
+          severity: "NOTIFY",
+          detail: `${String(this.#config.markets.length)} Polymarket market(s) are configured but no \`lifecycle\` feed is: MarketOpened/MarketClosing will never be produced, every consumer stays PENDING and every paper entry is refused (§9.8) — configure the \`lifecycle\` block (UNIV-4)`,
+        });
+      }
       if (this.#polymarketFeed !== undefined) {
         this.#polymarketFeed.subscribe(this.#plan.polymarketTokenIds);
         this.#polymarketFeed.start();

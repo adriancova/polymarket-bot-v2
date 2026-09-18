@@ -1,58 +1,72 @@
 /**
  * UNIV-4 — the market lifecycle producer (closeout blocker B10): acceptance
- * (a), and the pin that FLIPPED.
+ * (a), the pin, and the r1 remediation pins.
  *
- * At base `df1b346` this file asserted the absence: a configured OPEN market
- * with a trade-ready venue never produced `MarketOpened` / `MarketClosing`,
- * and nothing consulted the documented polled surface (`8937f69`). The round
- * added the lifecycle feed; the first test below is that pin inverted.
+ * At base `df1b346` this file asserted the absence (`f687513`): a configured
+ * OPEN market with a trade-ready venue never produced `MarketOpened` /
+ * `MarketClosing`, and nothing consulted the documented polled surface. The
+ * round added the lifecycle feed as an OPT-IN block, so that base file, kept
+ * verbatim, would still pass (no `lifecycle` block, no producer) — it was
+ * rewritten into THIS file, whose first test is the real pin: 19 of the
+ * round's 20 tests failed with the wiring reverted, and the absence the base
+ * file measured is now pinned as a startup incident (`GATEWAY_LIFECYCLE_FEED_ABSENT`,
+ * r1 LOW-1) rather than as silence.
  *
  * What is proven, against a stub of the documented `GET /markets/{id}`
  * surface (D-30) on the gateway's injected HTTP port — the repository's
  * established REST double; no socket, no network:
  *
- * 1. The pin, flipped: not-ready → ready → (closeTime reached) → closed
- *    across polls produces EXACTLY one `MarketOpened`, then the scheduled
- *    `MarketClosing` (`closesAt = closeTime`, emitted by the first poll at or
- *    past `closeTime` — NOT at the open, which would put the trader into
+ * 1. The pin: not-ready → ready → (closeTime reached) → closed across polls
+ *    produces EXACTLY one `MarketOpened`, then the scheduled `MarketClosing`
+ *    (`closesAt = closeTime`, emitted by the first poll at or past
+ *    `closeTime` — NOT at the open, which would put the trader into
  *    `CLOSE_ONLY` before it could enter), then the observed `MarketClosing`
  *    (`closesAt` = the poll's receipt instant), in that sequence; every raw
  *    response was journaled BEFORE its derived events (acceptance 1's three
  *    assertions: publish-time WAL count, ingestSeq order, `causationId`);
  *    the not-ready poll and the ready-before-closeTime poll emitted nothing;
- *    the closed market is not polled again.
- * 2. Restart mid-run, `openedAt` from configuration: the second epoch emits
- *    no second `MarketOpened`; the one emitted carries the configured
- *    `openTime`; the universe fold accepts the two epochs' events in order,
- *    accepts a same-instant replay as idempotent and REFUSES a fresh instant.
- * 3. Restart mid-run, `openedAt` from the first observation (no `openTime`):
- *    the ledger under the WAL root holds the instant; the second epoch emits
- *    no second `MarketOpened`; the fold proof as in 2. (Mutation reported in
- *    `docs/handoffs/UNIV-4.md`: with the ledger read removed, 2 and 3 fail
- *    with a second `MarketOpened` in the second epoch.)
- * 4. The rules' other cells: R5 contradiction (closed before ever open →
- *    incident, nothing derived, not polled again); R6 (readiness lost through
- *    `active`/`archived` alone → incident, nothing derived); ready before the
- *    configured `openTime` → observation instant; no `closeTime` → no
- *    scheduled closing; `restricted` recorded, not acted on.
- * 5. Failure paths: transport error, non-2xx and an undocumented body each
- *    open a market-scoped incident and derive nothing (the non-2xx and the
- *    undocumented body are still journaled); N consecutive failures publish
- *    `FeedStale` and open `GATEWAY_FEED_STALL` (the acceptance-2 machinery),
- *    a success closes the episode, a later run opens a fresh one; a WAL
- *    refusal suppresses derivation with a PAGE incident; an unreadable
- *    ledger fails the start; overlapping cycles are skipped, never stacked.
+ *    the closed market is not polled again; every intent is CONFIRMED in the
+ *    ledger.
+ * 2. `openedAt` is stable across restarts, from configuration and from the
+ *    first observation (R2), with the LOW-2 refinement: a NOT-ready poll
+ *    journaled at or after `openTime` makes `openTime` dishonest, so the
+ *    first-ready instant is used — and that history survives a restart
+ *    mid-wait. The universe fold accepts the two epochs' events in order,
+ *    accepts a same-instant replay as idempotent and REFUSES a fresh
+ *    instant. (Mutation, `docs/handoffs/UNIV-4.md`: with the ledger read
+ *    removed, the restart tests fail with a second `MarketOpened`.)
+ * 3. HIGH-1, intent → confirmation: an event dispatched while publication
+ *    is HALTED — the gateway's designed recording-only startup mode, and a
+ *    mid-run halt — is NOT sealed: the intent is persisted unconfirmed, a
+ *    PAGE incident opens, and the NEXT epoch re-emits it WITH THE PERSISTED
+ *    INSTANT on its first successful poll; a crash between intent and
+ *    confirmation (a seeded unconfirmed record) replays the same instant; an
+ *    unconfirmed OPEN is never replayed past a confirmed CLOSING.
+ * 4. MEDIUM-1: a ledger write failure is a PAGE incident, counted, and —
+ *    because the intent comes first — NO event is dispatched; the next poll
+ *    after the disk heals emits.
+ * 5. LOW-5: a ledger record under a different `conditionId`/`gammaMarketId`
+ *    pair refuses the start; a CONTRADICTED record raises its incident at
+ *    every start; a record for a market the configuration no longer names
+ *    is named at start and carried.
+ * 6. The rules' other cells: R5, R6 (naming the null field, LOW-6), ready
+ *    before `openTime`, no `closeTime`, `restricted` recorded not acted on,
+ *    all-null; failure paths: transport error, non-2xx, undocumented body,
+ *    the stall machinery, a WAL refusal, an unreadable ledger, overlapping
+ *    cycles, a response arriving after `stop()` (journaled, not derived —
+ *    LOW-3).
  */
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
-import type { GatewayStateError } from "@polymarket-bot/data-gateway";
+import type { GatewayConfigurationError, GatewayStateError } from "@polymarket-bot/data-gateway";
 import { LIFECYCLE_LEDGER_FILE_NAME } from "@polymarket-bot/data-gateway";
 import type { PublicHttpRequest, PublicHttpResponse } from "@polymarket-bot/polymarket-public";
-import { createMemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
+import { createMemoryFileSystem, type MemoryFileSystem } from "@polymarket-bot/storage-wal/testing";
 import { applyMarketEvent, createUniverseRegistry, registerMarket } from "@polymarket-bot/universe";
 import type { UniverseRegistry } from "@polymarket-bot/universe";
 import { describe, expect, it } from "vitest";
 
+import { createFaultyWalFileSystem } from "./support/faulty-file-system.js";
 import {
   buildHarness,
   polymarketBookFrame,
@@ -69,6 +83,7 @@ const CLOSE_TIME = "2025-10-09T08:53:45.000Z"; // 25 s after it: reached by the 
 const GAMMA_MARKET_ID = "900001";
 const GAMMA_BASE = "http://gamma.stub";
 const GAMMA_URL = `${GAMMA_BASE}/markets/${GAMMA_MARKET_ID}`;
+const LEDGER_PATH = `/wal/${LIFECYCLE_LEDGER_FILE_NAME}`;
 
 const LIFECYCLE_MARKET = {
   ...MARKET,
@@ -79,6 +94,18 @@ const LIFECYCLE_MARKET = {
     openTime: OPEN_TIME,
     closeTime: CLOSE_TIME,
   },
+} as const;
+
+/** The same market with NO reviewed `openTime`: `openedAt` is then the first observation. */
+const UNSCHEDULED_MARKET = {
+  ...LIFECYCLE_MARKET,
+  parameters: { ...MARKET.parameters, status: "DISCOVERED", closeTime: CLOSE_TIME },
+} as const;
+
+const IDENTITY = {
+  internalMarketId: MARKET.internalMarketId,
+  conditionId: MARKET.conditionId,
+  gammaMarketId: GAMMA_MARKET_ID,
 } as const;
 
 /** A `Market` body in the documented D-30 shape (every documented field present). */
@@ -170,6 +197,29 @@ function payloadOf(envelope: EventEnvelope<unknown>): Record<string, unknown> {
   return envelope.payload as Record<string, unknown>;
 }
 
+function reasonCodes(harness: Harness): readonly string[] {
+  return harness.incidents.map((incident) => incident.reasonCode);
+}
+
+function ledgerRecord(fileSystem: MemoryFileSystem): Record<string, unknown> | undefined {
+  const text = fileSystem.snapshot()[LEDGER_PATH];
+  if (text === undefined) return undefined;
+  const parsed = JSON.parse(text) as { markets: Record<string, Record<string, unknown>> };
+  return parsed.markets[MARKET.internalMarketId];
+}
+
+/** Writes a ledger file directly: the state an earlier epoch (or a crash) left behind. */
+async function seedLedger(
+  fileSystem: MemoryFileSystem,
+  markets: Record<string, Record<string, unknown>>,
+): Promise<void> {
+  await fileSystem.ensureDirectory("/wal");
+  await fileSystem.writeWholeFile(
+    LEDGER_PATH,
+    Buffer.from(JSON.stringify({ schemaVersion: 1, markets }), "utf8"),
+  );
+}
+
 /** The universe registry the trader would fold into, seeded exactly as the gateway seeds its own. */
 function seededRegistry(): UniverseRegistry {
   const result = registerMarket(createUniverseRegistry(), {
@@ -215,8 +265,8 @@ async function pollOnce(harness: Harness): Promise<void> {
   await harness.settle();
 }
 
-describe("UNIV-4 acceptance (a) — the pin that flipped", () => {
-  it("not-ready → ready → closeTime → closed: exactly one MarketOpened, the scheduled and the observed MarketClosing, raw journaled first", async () => {
+describe("UNIV-4 acceptance (a) — the pin", () => {
+  it("not-ready → ready → closeTime → closed: exactly one MarketOpened, the scheduled and the observed MarketClosing, raw journaled first, every intent confirmed", async () => {
     const stub = gammaStub([
       { body: NOT_READY },
       { body: READY },
@@ -246,22 +296,37 @@ describe("UNIV-4 acceptance (a) — the pin that flipped", () => {
     socket.message(polymarketBookFrame(MARKET.yesTokenId, MARKET.conditionId));
     await harness.settle();
 
-    // Poll 1 (at start): not ready. Configuration said OPEN; the venue did not.
+    // Poll 1 (at start): not ready. Configuration said OPEN; the venue did
+    // not — and the venue said so AFTER the reviewed openTime, which the
+    // ledger records (R2, LOW-2).
     expect(stub.requests).toEqual([GAMMA_URL]);
     expect(lifecycleEvents(harness)).toHaveLength(0);
     expect(harness.gateway.metrics().lifecycle?.phases[MARKET.internalMarketId]).toBe("PENDING");
+    expect(ledgerRecord(harness.walFileSystem)).toEqual({
+      ...IDENTITY,
+      notReadyAfterOpenTimeAt: new Date(CLOCK_START_MS).toISOString(),
+    });
 
     // Poll 2 (+10 s): ready → MarketOpened, and ONLY MarketOpened: the
     // reviewed closeTime (+25 s) is not reached, so no closing is announced.
+    // openedAt is the OBSERVATION instant, not openTime: the venue was seen
+    // not ready after openTime (LOW-2).
+    const readyAtMs = CLOCK_START_MS + 10_000;
     await pollOnce(harness);
     const afterOpen = lifecycleEvents(harness);
     expect(afterOpen.map((envelope) => envelope.eventType)).toEqual(["MarketOpened"]);
     expect(payloadOf(afterOpen[0]!)).toEqual({
       internalMarketId: MARKET.internalMarketId,
       conditionId: MARKET.conditionId,
-      openedAt: OPEN_TIME,
+      openedAt: new Date(readyAtMs).toISOString(),
     });
     expect(harness.gateway.metrics().lifecycle?.phases[MARKET.internalMarketId]).toBe("OPEN");
+    expect(ledgerRecord(harness.walFileSystem)).toMatchObject({
+      openedAt: new Date(readyAtMs).toISOString(),
+      openedAtOrigin: "observation",
+      firstReadyObservedAt: new Date(readyAtMs).toISOString(),
+      openedConfirmedAt: new Date(readyAtMs).toISOString(),
+    });
 
     // Poll 3 (+20 s): still ready, still before closeTime → nothing.
     await pollOnce(harness);
@@ -299,6 +364,17 @@ describe("UNIV-4 acceptance (a) — the pin that flipped", () => {
 
     await harness.gateway.stop();
 
+    // Every intent is confirmed: nothing is owed to a later epoch.
+    const record = ledgerRecord(harness.walFileSystem);
+    expect(record).toMatchObject({
+      ...IDENTITY,
+      scheduledClosesAt: CLOSE_TIME,
+      observedClosesAt: new Date(closedObservedAtMs).toISOString(),
+    });
+    for (const key of ["openedConfirmedAt", "scheduledClosingConfirmedAt", "observedClosingConfirmedAt"]) {
+      expect(typeof record?.[key], key).toBe("string");
+    }
+
     // Acceptance 1, assertions 2 and 3: identities and causation.
     const epoch = harness.gateway.gatewayEpoch;
     const frames = recordedFrames(harness.walFileSystem, epoch);
@@ -331,7 +407,7 @@ describe("UNIV-4 acceptance (a) — the pin that flipped", () => {
       (entry) => entry.eventType === "MarketOpened" || entry.eventType === "MarketClosing",
     );
     expect(lifecyclePublishes.map((entry) => entry.frames)).toEqual([3, 5, 6]);
-    // Nothing dropped, nothing refused.
+    // Nothing dropped, nothing refused, everything confirmed.
     const metrics = harness.gateway.metrics();
     expect(metrics.wal.queue.messagesDropped).toBe(0);
     expect(metrics.lifecycle).toMatchObject({
@@ -342,21 +418,64 @@ describe("UNIV-4 acceptance (a) — the pin that flipped", () => {
       marketOpenedEmitted: 1,
       marketClosingScheduledEmitted: 1,
       marketClosingObservedEmitted: 1,
+      replaysEmitted: 0,
+      eventsUnpublished: 0,
+      eventsConfirmed: 3,
       contradictions: 0,
       stallsObserved: 0,
+      ledgerWriteFailures: 0,
     });
     // The lifecycle feed opened no incident. (The scripted market socket never
     // answers PING, so the MARKET feed's own heartbeat stall fires after 40 s of
     // manual time — acceptance 2's machinery, not this feed's.)
     expect(harness.incidents.filter((incident) => incident.feedId === "polymarket-lifecycle")).toEqual([]);
-    expect(harness.incidents.map((incident) => incident.reasonCode)).toEqual(["GATEWAY_FEED_STALL"]);
+    expect(reasonCodes(harness)).toEqual(["GATEWAY_FEED_STALL"]);
+  });
+
+  it("LOW-1: Polymarket markets configured WITHOUT the lifecycle feed is a NOTIFY incident at start; with it, or without Polymarket, none", async () => {
+    const absent = await buildHarness({ config: { polymarket: { feedId: "polymarket-market" } } });
+    absent.gateway.start();
+    await absent.settle();
+    await absent.gateway.stop();
+    const incident = absent.incidents.find(
+      (candidate) => candidate.reasonCode === "GATEWAY_LIFECYCLE_FEED_ABSENT",
+    );
+    expect(incident?.severity).toBe("NOTIFY");
+    expect(incident?.detail).toContain("MarketOpened/MarketClosing will never be produced");
+    expect(incident?.detail).toContain("lifecycle");
+    // In the stream too, for a consumer that watches incidents.
+    expect(
+      absent
+        .publishedOfType("DataQualityIncidentOpened")
+        .map(payloadOf)
+        .filter((payload) => payload["reasonCode"] === "GATEWAY_LIFECYCLE_FEED_ABSENT"),
+    ).toHaveLength(1);
+
+    const present = await buildHarness({
+      config: lifecycleConfig({ polymarket: { feedId: "polymarket-market" } }),
+      http: gammaStub([{ body: NOT_READY }]).route,
+    });
+    present.gateway.start();
+    await present.settle();
+    await present.gateway.stop();
+    expect(reasonCodes(present)).not.toContain("GATEWAY_LIFECYCLE_FEED_ABSENT");
+
+    const noPolymarket = await buildHarness({
+      config: {
+        binance: { feedId: "binance-reference", symbols: ["BTCUSDT"], stalenessThresholdMs: 30_000 },
+      },
+    });
+    noPolymarket.gateway.start();
+    await noPolymarket.settle();
+    await noPolymarket.gateway.stop();
+    expect(reasonCodes(noPolymarket)).not.toContain("GATEWAY_LIFECYCLE_FEED_ABSENT");
   });
 });
 
-describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart", () => {
-  it("configured openTime: the second epoch emits no second MarketOpened, and the fold accepts the whole stream", async () => {
+describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart (R2)", () => {
+  it("configured openTime, ready on the first poll after it: openedAt = openTime; the second epoch emits no second MarketOpened, and the fold accepts the whole stream", async () => {
     const walFileSystem = createMemoryFileSystem();
-    const stubA = gammaStub([{ body: NOT_READY }, { body: READY }]);
+    const stubA = gammaStub([{ body: READY }]);
     const first = await buildHarness({
       config: lifecycleConfig(),
       http: stubA.route,
@@ -365,8 +484,9 @@ describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart"
     });
     first.gateway.start();
     await first.settle();
-    await pollOnce(first);
     expect(lifecycleEvents(first).map((envelope) => envelope.eventType)).toEqual(["MarketOpened"]);
+    expect(payloadOf(lifecycleEvents(first)[0]!)["openedAt"]).toBe(OPEN_TIME);
+    expect(ledgerRecord(walFileSystem)).toMatchObject({ openedAt: OPEN_TIME, openedAtOrigin: "configuration" });
     await first.gateway.stop();
 
     // The restart: a new epoch, the same WAL root (the harness clock starts
@@ -384,9 +504,10 @@ describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart"
     await second.settle();
     await pollOnce(second);
     await pollOnce(second);
-    // Three ready polls in the new epoch: no second MarketOpened.
+    // Three ready polls in the new epoch: no second MarketOpened (the open is CONFIRMED).
     expect(lifecycleEvents(second)).toHaveLength(0);
     expect(second.gateway.metrics().lifecycle?.phases[MARKET.internalMarketId]).toBe("OPEN");
+    expect(second.gateway.metrics().lifecycle?.replaysEmitted).toBe(0);
     await pollOnce(second); // +30 s: closeTime reached → the scheduled closing
     expect(lifecycleEvents(second).map((envelope) => envelope.eventType)).toEqual(["MarketClosing"]);
     const closedAtMs = second.clock.nowMs() + 10_000;
@@ -399,7 +520,6 @@ describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart"
       "MarketClosing",
       "MarketClosing",
     ]);
-    expect(payloadOf(combined[0]!)["openedAt"]).toBe(OPEN_TIME);
     expect(payloadOf(combined[2]!)["closesAt"]).toBe(new Date(closedAtMs).toISOString());
     expect(
       [...first.publishedOfType("MarketOpened"), ...second.publishedOfType("MarketOpened")],
@@ -432,13 +552,9 @@ describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart"
 
   it("no configured openTime: the first observation instant is persisted in the ledger and re-read, never re-minted", async () => {
     const walFileSystem = createMemoryFileSystem();
-    const market = {
-      ...LIFECYCLE_MARKET,
-      parameters: { ...MARKET.parameters, status: "DISCOVERED", closeTime: CLOSE_TIME },
-    };
     const stubA = gammaStub([{ body: NOT_READY }, { body: NOT_READY }, { body: READY }]);
     const first = await buildHarness({
-      config: lifecycleConfig({ markets: [market] }),
+      config: lifecycleConfig({ markets: [UNSCHEDULED_MARKET] }),
       http: stubA.route,
       walFileSystem,
       idSeed: 0,
@@ -447,6 +563,8 @@ describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart"
     await first.settle();
     await pollOnce(first);
     expect(lifecycleEvents(first)).toHaveLength(0);
+    // No openTime → no "not ready after openTime" to record; the ledger is untouched.
+    expect(ledgerRecord(walFileSystem)).toBeUndefined();
     const readyObservedAtMs = first.clock.nowMs() + 10_000;
     await pollOnce(first);
     const opened = first.publishedOfType("MarketOpened");
@@ -456,19 +574,12 @@ describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart"
     await first.gateway.stop();
 
     // The ledger is on disk, under the WAL root, beside the epoch directory.
-    const ledgerPath = `/wal/${LIFECYCLE_LEDGER_FILE_NAME}`;
-    const ledgerText = walFileSystem.snapshot()[ledgerPath];
-    expect(ledgerText).toBeDefined();
-    const ledger = JSON.parse(ledgerText ?? "{}") as {
-      schemaVersion: number;
-      markets: Record<string, Record<string, unknown>>;
-    };
-    expect(ledger.schemaVersion).toBe(1);
-    expect(ledger.markets[MARKET.internalMarketId]).toEqual({
-      internalMarketId: MARKET.internalMarketId,
+    expect(ledgerRecord(walFileSystem)).toEqual({
+      ...IDENTITY,
+      firstReadyObservedAt: expectedOpenedAt,
       openedAt: expectedOpenedAt,
       openedAtOrigin: "observation",
-      firstReadyObservedAt: expectedOpenedAt,
+      openedConfirmedAt: expectedOpenedAt,
     });
 
     // The restart, an hour later (closeTime long passed): the venue is still
@@ -477,7 +588,7 @@ describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart"
     // closing the first epoch never reached.
     const stubB = gammaStub([{ body: READY }, { body: CLOSED }]);
     const second = await buildHarness({
-      config: lifecycleConfig({ markets: [market] }),
+      config: lifecycleConfig({ markets: [UNSCHEDULED_MARKET] }),
       http: stubB.route,
       walFileSystem,
       idSeed: 1,
@@ -500,8 +611,8 @@ describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart"
     ]);
     const folded = foldAll(seededRegistry(), combined);
     expect(folded.markets.get(MARKET.internalMarketId)?.openedAt).toBe(expectedOpenedAt);
-    // What the mutation would have published: a MarketOpened at the restart's
-    // first poll instant. The fold refuses it.
+    // What a re-minted open would have published: a MarketOpened at the
+    // restart's first poll instant. The fold refuses it.
     const minted = applyMarketEvent(folded, MARKET.internalMarketId, {
       eventType: "MarketOpened",
       payload: {
@@ -511,17 +622,52 @@ describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart"
       },
     });
     expect(minted.ok).toBe(false);
-    // And the ledger now also records the observed close.
-    const after = JSON.parse(walFileSystem.snapshot()[ledgerPath] ?? "{}") as {
-      markets: Record<string, Record<string, unknown>>;
-    };
-    expect(after.markets[MARKET.internalMarketId]?.["scheduledClosesAt"]).toBe(CLOSE_TIME);
-    expect(after.markets[MARKET.internalMarketId]?.["observedClosesAt"]).toBe(
-      payloadOf(combined[2]!)["closesAt"],
-    );
+    // And the ledger now also records and confirms both closings.
+    const after = ledgerRecord(walFileSystem);
+    expect(after?.["scheduledClosesAt"]).toBe(CLOSE_TIME);
+    expect(typeof after?.["scheduledClosingConfirmedAt"]).toBe("string");
+    expect(after?.["observedClosesAt"]).toBe(payloadOf(combined[2]!)["closesAt"]);
+    expect(typeof after?.["observedClosingConfirmedAt"]).toBe("string");
   });
 
-  it("a restart after the observed close polls nothing and emits nothing", async () => {
+  it("LOW-2: a NOT-ready poll after openTime survives a restart mid-wait, so the later open is the observation instant, not openTime", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const first = await buildHarness({
+      config: lifecycleConfig(),
+      http: gammaStub([{ body: NOT_READY }]).route,
+      walFileSystem,
+      idSeed: 0,
+    });
+    first.gateway.start();
+    await first.settle();
+    expect(lifecycleEvents(first)).toHaveLength(0);
+    expect(ledgerRecord(walFileSystem)).toEqual({
+      ...IDENTITY,
+      notReadyAfterOpenTimeAt: new Date(CLOCK_START_MS).toISOString(),
+    });
+    await first.gateway.stop();
+
+    const second = await buildHarness({
+      config: lifecycleConfig(),
+      http: gammaStub([{ body: READY }]).route,
+      walFileSystem,
+      idSeed: 1,
+    });
+    second.timers.advance(5_000);
+    second.gateway.start();
+    await second.settle();
+    await second.gateway.stop();
+    const opened = second.publishedOfType("MarketOpened");
+    expect(opened).toHaveLength(1);
+    expect(payloadOf(opened[0]!)["openedAt"]).toBe(new Date(CLOCK_START_MS + 5_000).toISOString());
+    expect(ledgerRecord(walFileSystem)).toMatchObject({
+      notReadyAfterOpenTimeAt: new Date(CLOCK_START_MS).toISOString(),
+      openedAt: new Date(CLOCK_START_MS + 5_000).toISOString(),
+      openedAtOrigin: "observation",
+    });
+  });
+
+  it("a restart after a CONFIRMED observed close polls nothing and emits nothing", async () => {
     const walFileSystem = createMemoryFileSystem();
     const first = await buildHarness({
       config: lifecycleConfig(),
@@ -556,6 +702,402 @@ describe("UNIV-4 acceptance (a) — openedAt is stable across a gateway restart"
   });
 });
 
+describe("UNIV-4 r1 HIGH-1 — an unpublished event is an unconfirmed intent, re-emitted with its instant by the next epoch", () => {
+  it("recording-only startup (transport unreachable): the open is NOT sealed; the next epoch publishes the ONE MarketOpened with the first epoch's instant", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const first = await buildHarness({
+      config: lifecycleConfig({ markets: [UNSCHEDULED_MARKET] }),
+      http: gammaStub([{ body: READY }]).route,
+      walFileSystem,
+      idSeed: 0,
+      startupTransportFailure: "redis unreachable at startup",
+    });
+    first.gateway.start();
+    await first.settle();
+    // Nothing published (the transport was never reachable), but the derivation
+    // happened, its intent is durable, and it is LOUD.
+    expect(first.published()).toHaveLength(0);
+    const chosenOpenedAt = new Date(CLOCK_START_MS).toISOString();
+    expect(first.gateway.metrics().lifecycle).toMatchObject({
+      marketOpenedEmitted: 1,
+      eventsUnpublished: 1,
+      eventsConfirmed: 0,
+      ledgerWriteFailures: 0,
+    });
+    const unpublished = first.incidents.filter(
+      (incident) => incident.reasonCode === "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED",
+    );
+    expect(unpublished).toHaveLength(1);
+    expect(unpublished[0]?.severity).toBe("PAGE");
+    expect(unpublished[0]?.detail).toContain("MarketOpened");
+    expect(unpublished[0]?.detail).toContain(`openedAt ${chosenOpenedAt}`);
+    expect(unpublished[0]?.detail).toContain("re-emitted with the same instant at the next start");
+    expect(ledgerRecord(walFileSystem)).toEqual({
+      ...IDENTITY,
+      firstReadyObservedAt: chosenOpenedAt,
+      openedAt: chosenOpenedAt,
+      openedAtOrigin: "observation",
+    });
+    await pollOnce(first); // still halted: no second attempt in this epoch
+    expect(first.gateway.metrics().lifecycle?.eventsUnpublished).toBe(1);
+    await first.gateway.stop();
+
+    // The bus is back; the restart replays the unconfirmed open on its first
+    // successful poll — an hour later, so a re-minted instant would differ.
+    const stub = gammaStub([{ body: READY }]);
+    const second = await buildHarness({
+      config: lifecycleConfig({ markets: [UNSCHEDULED_MARKET] }),
+      http: stub.route,
+      walFileSystem,
+      idSeed: 1,
+    });
+    second.timers.advance(3_600_000);
+    second.gateway.start();
+    await second.settle();
+    const opened = second.publishedOfType("MarketOpened");
+    expect(opened).toHaveLength(1);
+    expect(payloadOf(opened[0]!)["openedAt"]).toBe(chosenOpenedAt);
+    expect(opened[0]?.gatewayEpoch).toBe(second.gateway.gatewayEpoch);
+    // It cites the NEW epoch's journaled response.
+    const frames = recordedFrames(walFileSystem, second.gateway.gatewayEpoch).filter(
+      (frame) => frame.endpoint === GAMMA_URL,
+    );
+    expect(frames).toHaveLength(1);
+    expect(opened[0]?.causationId).toBe(`raw:${second.gateway.gatewayEpoch}:${frames[0]!.ingestSeq}`);
+    // The replayed open is confirmed; an hour on, the reviewed closeTime is
+    // also past, so the scheduled closing follows it on the same poll — two
+    // confirmations, one replay, no fresh open.
+    expect(second.gateway.metrics().lifecycle).toMatchObject({
+      replaysEmitted: 1,
+      marketOpenedEmitted: 0,
+      marketClosingScheduledEmitted: 1,
+      eventsConfirmed: 2,
+      eventsUnpublished: 0,
+    });
+    expect(lifecycleEvents(second).map((envelope) => envelope.eventType)).toEqual([
+      "MarketOpened",
+      "MarketClosing",
+    ]);
+    expect(ledgerRecord(walFileSystem)).toMatchObject({
+      openedAt: chosenOpenedAt,
+      openedConfirmedAt: new Date(CLOCK_START_MS + 3_600_000).toISOString(),
+    });
+    // Not again: a confirmed open is never re-announced.
+    await pollOnce(second);
+    expect(second.publishedOfType("MarketOpened")).toHaveLength(1);
+    await second.gateway.stop();
+    // And the fold accepts what the consumers actually received.
+    expect(foldAll(seededRegistry(), lifecycleEvents(second)).markets.get(MARKET.internalMarketId)?.openedAt).toBe(
+      chosenOpenedAt,
+    );
+  });
+
+  it("mid-run halt: the observed MarketClosing is NOT sealed; the next epoch publishes it with the persisted instant, then the market is terminal", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const first = await buildHarness({
+      config: lifecycleConfig(),
+      http: gammaStub([{ body: READY }, { body: CLOSED }]).route,
+      walFileSystem,
+      idSeed: 0,
+    });
+    first.gateway.start();
+    await first.settle();
+    expect(first.publishedOfType("MarketOpened")).toHaveLength(1);
+    // The bus goes away, terminally for this epoch.
+    first.gateway.haltPublication("EVENT_BUS_UNAVAILABLE", "redis gone mid-run");
+    const closedAtMs = first.clock.nowMs() + 10_000;
+    await pollOnce(first);
+    expect(first.publishedOfType("MarketClosing")).toHaveLength(0);
+    expect(first.gateway.metrics().lifecycle).toMatchObject({
+      marketClosingObservedEmitted: 1,
+      eventsUnpublished: 1,
+      eventsConfirmed: 1,
+    });
+    expect(
+      first.incidents.filter((incident) => incident.reasonCode === "GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED"),
+    ).toHaveLength(1);
+    const closesAt = new Date(closedAtMs).toISOString();
+    expect(ledgerRecord(walFileSystem)).toMatchObject({ observedClosesAt: closesAt });
+    expect(ledgerRecord(walFileSystem)?.["observedClosingConfirmedAt"]).toBeUndefined();
+    await first.gateway.stop();
+
+    // The restart: the market is terminal but owes its closing, so it is
+    // polled ONCE more (to cite a fresh response), the replay is published
+    // with the persisted instant, and it is never polled again.
+    const stub = gammaStub([{ body: CLOSED }]);
+    const second = await buildHarness({ config: lifecycleConfig(), http: stub.route, walFileSystem, idSeed: 1 });
+    second.timers.advance(600_000);
+    second.gateway.start();
+    await second.settle();
+    const closing = second.publishedOfType("MarketClosing");
+    expect(closing).toHaveLength(1);
+    expect(payloadOf(closing[0]!)["closesAt"]).toBe(closesAt);
+    expect(second.publishedOfType("MarketOpened")).toHaveLength(0); // the open was confirmed
+    expect(second.gateway.metrics().lifecycle).toMatchObject({ replaysEmitted: 1, eventsConfirmed: 1 });
+    expect(typeof ledgerRecord(walFileSystem)?.["observedClosingConfirmedAt"]).toBe("string");
+    await pollOnce(second);
+    await pollOnce(second);
+    expect(stub.requests).toHaveLength(1);
+    await second.gateway.stop();
+    // The consumers' stream, across both epochs: open, then the one closing.
+    const combined = [...lifecycleEvents(first), ...lifecycleEvents(second)];
+    expect(combined.map((envelope) => envelope.eventType)).toEqual(["MarketOpened", "MarketClosing"]);
+    expect(foldAll(seededRegistry(), combined).markets.get(MARKET.internalMarketId)?.closesAt).toBe(closesAt);
+  });
+
+  it("a crash between intent and confirmation (a seeded unconfirmed open): the same instant is re-emitted, never a fresh one", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const chosen = "2025-10-09T08:00:00.000Z";
+    await seedLedger(walFileSystem, {
+      [MARKET.internalMarketId]: {
+        ...IDENTITY,
+        firstReadyObservedAt: chosen,
+        openedAt: chosen,
+        openedAtOrigin: "observation",
+      },
+    });
+    const harness = await buildHarness({
+      config: lifecycleConfig({ markets: [UNSCHEDULED_MARKET] }),
+      http: gammaStub([{ body: READY }]).route,
+      walFileSystem,
+    });
+    harness.gateway.start();
+    await harness.settle();
+    await harness.gateway.stop();
+    const opened = harness.publishedOfType("MarketOpened");
+    expect(opened).toHaveLength(1);
+    expect(payloadOf(opened[0]!)["openedAt"]).toBe(chosen);
+    expect(harness.gateway.metrics().lifecycle).toMatchObject({ replaysEmitted: 1, marketOpenedEmitted: 0 });
+    expect(ledgerRecord(walFileSystem)).toMatchObject({ openedAt: chosen, openedConfirmedAt: new Date(CLOCK_START_MS).toISOString() });
+  });
+
+  it("a replayed open followed by a fresh close on the same poll: open first, then the observed closing", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const chosen = "2025-10-09T08:00:00.000Z";
+    await seedLedger(walFileSystem, {
+      [MARKET.internalMarketId]: { ...IDENTITY, firstReadyObservedAt: chosen, openedAt: chosen, openedAtOrigin: "observation" },
+    });
+    const harness = await buildHarness({
+      config: lifecycleConfig({ markets: [UNSCHEDULED_MARKET] }),
+      http: gammaStub([{ body: CLOSED }]).route,
+      walFileSystem,
+    });
+    harness.gateway.start();
+    await harness.settle();
+    await harness.gateway.stop();
+    const events = lifecycleEvents(harness);
+    expect(events.map((envelope) => envelope.eventType)).toEqual(["MarketOpened", "MarketClosing"]);
+    expect(payloadOf(events[0]!)["openedAt"]).toBe(chosen);
+    expect(payloadOf(events[1]!)["closesAt"]).toBe(new Date(CLOCK_START_MS).toISOString());
+    expect(events[0]!.causationId).toBe(events[1]!.causationId);
+    expect(foldAll(seededRegistry(), events).markets.get(MARKET.internalMarketId)?.lifecycleState).toBe("CLOSING");
+  });
+
+  it("the guard: an unconfirmed OPEN is never replayed past a CONFIRMED closing", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    // The observed closing was confirmed; the open's confirmation write was lost.
+    await seedLedger(walFileSystem, {
+      [MARKET.internalMarketId]: {
+        ...IDENTITY,
+        firstReadyObservedAt: "2025-10-09T08:00:00.000Z",
+        openedAt: "2025-10-09T08:00:00.000Z",
+        openedAtOrigin: "observation",
+        observedClosesAt: "2025-10-09T08:30:00.000Z",
+        observedClosingConfirmedAt: "2025-10-09T08:30:00.000Z",
+      },
+    });
+    const stub = gammaStub([{ body: READY }]);
+    const harness = await buildHarness({ config: lifecycleConfig(), http: stub.route, walFileSystem });
+    harness.gateway.start();
+    await harness.settle();
+    await pollOnce(harness);
+    await harness.gateway.stop();
+    expect(stub.requests).toHaveLength(0);
+    expect(lifecycleEvents(harness)).toHaveLength(0);
+    expect(harness.gateway.metrics().lifecycle?.phases[MARKET.internalMarketId]).toBe("CLOSED_OBSERVED");
+
+    // The scheduled closing confirmed, the open not: the open is not replayed
+    // either (a confirmed CLOSING precedes nothing), and the market is still
+    // polled for the venue's own close.
+    const other = createMemoryFileSystem();
+    await seedLedger(other, {
+      [MARKET.internalMarketId]: {
+        ...IDENTITY,
+        firstReadyObservedAt: "2025-10-09T08:00:00.000Z",
+        openedAt: "2025-10-09T08:00:00.000Z",
+        openedAtOrigin: "observation",
+        scheduledClosesAt: CLOSE_TIME,
+        scheduledClosingConfirmedAt: "2025-10-09T08:53:50.000Z",
+      },
+    });
+    const stub2 = gammaStub([{ body: READY }, { body: CLOSED }]);
+    const later = await buildHarness({ config: lifecycleConfig(), http: stub2.route, walFileSystem: other });
+    later.gateway.start();
+    await later.settle();
+    expect(lifecycleEvents(later)).toHaveLength(0);
+    await pollOnce(later);
+    await later.gateway.stop();
+    expect(lifecycleEvents(later).map((envelope) => envelope.eventType)).toEqual(["MarketClosing"]);
+    expect(stub2.requests).toHaveLength(2);
+  });
+});
+
+describe("UNIV-4 r1 MEDIUM-1 — a ledger write failure holds the derivation back", () => {
+  it("the intent cannot be written → PAGE incident, counted, NO event dispatched, phase unchanged; the poll after the disk heals emits", async () => {
+    const walFileSystem = createFaultyWalFileSystem();
+    const harness = await buildHarness({
+      config: lifecycleConfig(),
+      http: gammaStub([{ body: READY }]).route,
+      walFileSystem,
+    });
+    // The WAL segments append; only the whole-file ledger write fails. The
+    // order chosen: intent BEFORE dispatch — an event whose instant is not
+    // durable could contradict itself after a restart, so it is held back and
+    // re-derived by the next poll rather than emitted unrecorded.
+    walFileSystem.failWholeFileWrites("EIO: ledger");
+    harness.gateway.start();
+    await harness.settle();
+    expect(harness.publishedOfType("MarketOpened")).toHaveLength(0);
+    expect(harness.gateway.metrics().lifecycle).toMatchObject({
+      ledgerWriteFailures: 1,
+      marketOpenedEmitted: 0,
+      eventsUnpublished: 0,
+      framesRecorded: 1,
+      phases: { [MARKET.internalMarketId]: "PENDING" },
+    });
+    const failures = harness.incidents.filter(
+      (incident) => incident.reasonCode === "GATEWAY_LIFECYCLE_LEDGER_WRITE_FAILED",
+    );
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.severity).toBe("PAGE");
+    expect(failures[0]?.detail).toContain("EIO: ledger");
+    expect(failures[0]?.detail).toContain("held back");
+    expect(walFileSystem.snapshot()[LEDGER_PATH]).toBeUndefined();
+    // The raw response was still journaled (acceptance 1 is independent of the ledger).
+    expect(harness.recordingFailures).toEqual([]);
+
+    await pollOnce(harness); // still failing: a repeat, deduped, still nothing emitted
+    expect(harness.gateway.metrics().lifecycle?.ledgerWriteFailures).toBe(2);
+    expect(harness.publishedOfType("MarketOpened")).toHaveLength(0);
+
+    walFileSystem.healWholeFileWrites();
+    const healedAtMs = harness.clock.nowMs() + 10_000;
+    await pollOnce(harness);
+    await harness.gateway.stop();
+    const opened = harness.publishedOfType("MarketOpened");
+    expect(opened).toHaveLength(1);
+    // openTime is past but the venue was never seen NOT ready: openTime it is.
+    expect(payloadOf(opened[0]!)["openedAt"]).toBe(OPEN_TIME);
+    expect(harness.gateway.metrics().lifecycle).toMatchObject({
+      ledgerWriteFailures: 2,
+      marketOpenedEmitted: 1,
+      eventsConfirmed: 1,
+    });
+    expect(ledgerRecord(walFileSystem)).toMatchObject({
+      openedAt: OPEN_TIME,
+      openedConfirmedAt: new Date(healedAtMs).toISOString(),
+    });
+  });
+});
+
+describe("UNIV-4 r1 LOW-5 — the ledger's identity checks", () => {
+  it("a record under a different conditionId/gammaMarketId pair for the same internalMarketId REFUSES the start", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    await seedLedger(walFileSystem, {
+      [MARKET.internalMarketId]: {
+        ...IDENTITY,
+        gammaMarketId: "777777",
+        firstReadyObservedAt: "2025-10-09T08:00:00.000Z",
+        openedAt: "2025-10-09T08:00:00.000Z",
+        openedAtOrigin: "observation",
+        openedConfirmedAt: "2025-10-09T08:00:00.000Z",
+      },
+    });
+    let thrown: unknown;
+    try {
+      await buildHarness({ config: lifecycleConfig(), http: gammaStub([{ body: READY }]).route, walFileSystem });
+    } catch (error) {
+      thrown = error;
+    }
+    expect((thrown as GatewayConfigurationError | undefined)?.name).toBe("GatewayConfigurationError");
+    expect(String((thrown as Error | undefined)?.message)).toContain("different conditionId/gammaMarketId pair");
+    expect((thrown as GatewayConfigurationError).details).toMatchObject({
+      internalMarketId: MARKET.internalMarketId,
+      configured: { gammaMarketId: GAMMA_MARKET_ID },
+      recorded: { gammaMarketId: "777777" },
+    });
+    // The same with the condition id moved.
+    const other = createMemoryFileSystem();
+    await seedLedger(other, {
+      [MARKET.internalMarketId]: { ...IDENTITY, conditionId: "0x" + "ff".repeat(31), contradictedAt: "2025-10-09T08:00:00.000Z" },
+    });
+    await expect(
+      buildHarness({ config: lifecycleConfig(), http: gammaStub([{ body: READY }]).route, walFileSystem: other }),
+    ).rejects.toMatchObject({ name: "GatewayConfigurationError" });
+  });
+
+  it("a CONTRADICTED record raises its incident at EVERY start it is skipped", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const first = await buildHarness({
+      config: lifecycleConfig(),
+      http: gammaStub([{ body: CLOSED }]).route,
+      walFileSystem,
+      idSeed: 0,
+    });
+    first.gateway.start();
+    await first.settle();
+    expect(reasonCodes(first)).toEqual(["GATEWAY_LIFECYCLE_CONFIG_CONTRADICTED"]);
+    await first.gateway.stop();
+
+    for (const seed of [1, 2]) {
+      const stub = gammaStub([{ body: READY }]);
+      const again = await buildHarness({ config: lifecycleConfig(), http: stub.route, walFileSystem, idSeed: seed });
+      again.gateway.start();
+      await again.settle();
+      await pollOnce(again);
+      await again.gateway.stop();
+      const contradicted = again.incidents.filter(
+        (incident) => incident.reasonCode === "GATEWAY_LIFECYCLE_CONFIG_CONTRADICTED",
+      );
+      expect(contradicted).toHaveLength(1);
+      expect(contradicted[0]?.detail).toContain("remove the record once corrected");
+      expect(stub.requests).toHaveLength(0);
+      expect(lifecycleEvents(again)).toHaveLength(0);
+    }
+  });
+
+  it("a record for a market the configuration no longer names is named at start, counted, and carried", async () => {
+    const walFileSystem = createMemoryFileSystem();
+    const foreign = "01990000-0000-7000-8000-00000000ffff";
+    await seedLedger(walFileSystem, {
+      [foreign]: {
+        internalMarketId: foreign,
+        conditionId: "0x" + "ee".repeat(31),
+        gammaMarketId: "123456",
+        contradictedAt: "2025-10-09T08:00:00.000Z",
+      },
+    });
+    const harness = await buildHarness({ config: lifecycleConfig(), http: gammaStub([{ body: READY }]).route, walFileSystem });
+    harness.gateway.start();
+    await harness.settle();
+    await harness.gateway.stop();
+    const named = harness.incidents.filter(
+      (incident) => incident.reasonCode === "GATEWAY_LIFECYCLE_LEDGER_FOREIGN_RECORD",
+    );
+    expect(named).toHaveLength(1);
+    expect(named[0]?.severity).toBe("NOTIFY");
+    expect(named[0]?.detail).toContain(foreign);
+    expect(named[0]?.detail).toContain("123456");
+    expect(harness.gateway.metrics().lifecycle?.ledgerForeignRecords).toBe(1);
+    // The configured market opened normally, and the foreign record survived the rewrite.
+    expect(harness.publishedOfType("MarketOpened")).toHaveLength(1);
+    const document = JSON.parse(walFileSystem.snapshot()[LEDGER_PATH] ?? "{}") as {
+      markets: Record<string, unknown>;
+    };
+    expect(Object.keys(document.markets).sort()).toEqual([MARKET.internalMarketId, foreign].sort());
+  });
+});
+
 describe("UNIV-4 — the derivation rules' other cells", () => {
   it("R5: a market observed closed before it was ever open emits nothing, opens an incident, and is not polled again", async () => {
     const stub = gammaStub([{ body: CLOSED }]);
@@ -581,6 +1123,10 @@ describe("UNIV-4 — the derivation rules' other cells", () => {
     expect(published).toHaveLength(1);
     expect(published[0]?.["affectedMarketIds"]).toEqual([MARKET.internalMarketId]);
     expect(harness.gateway.metrics().lifecycle?.phases[MARKET.internalMarketId]).toBe("CONTRADICTED");
+    expect(ledgerRecord(harness.walFileSystem)).toEqual({
+      ...IDENTITY,
+      contradictedAt: new Date(CLOCK_START_MS).toISOString(),
+    });
     // The response was still journaled: the contradiction is evidence.
     const frames = recordedFrames(harness.walFileSystem, harness.gateway.gatewayEpoch);
     expect(frames.filter((frame) => frame.endpoint === GAMMA_URL)).toHaveLength(1);
@@ -593,24 +1139,43 @@ describe("UNIV-4 — the derivation rules' other cells", () => {
     await harness.settle();
     await harness.gateway.stop();
     expect(lifecycleEvents(harness)).toHaveLength(0);
-    expect(harness.incidents.map((incident) => incident.reasonCode)).toEqual([
-      "GATEWAY_LIFECYCLE_CONFIG_CONTRADICTED",
-    ]);
+    expect(reasonCodes(harness)).toEqual(["GATEWAY_LIFECYCLE_CONFIG_CONTRADICTED"]);
   });
 
-  it("R6: readiness lost through active/archived alone while OPEN emits nothing and opens an incident", async () => {
-    const stub = gammaStub([{ body: READY }, { body: gammaMarket({ active: false }) }, { body: READY }]);
+  it("R6: readiness lost through active/archived alone while OPEN emits nothing and opens an incident naming the fields (LOW-6)", async () => {
+    const stub = gammaStub([
+      { body: READY },
+      { body: gammaMarket({ active: false }) },
+      { body: gammaMarket({ acceptingOrders: null }) },
+      { body: READY },
+    ]);
     const harness = await buildHarness({ config: lifecycleConfig(), http: stub.route });
     harness.gateway.start();
     await harness.settle();
     await pollOnce(harness);
+    const first = harness.incidents.filter((incident) => incident.reasonCode === "GATEWAY_LIFECYCLE_STATE_UNEXPECTED");
+    expect(first).toHaveLength(1);
+    expect(first[0]?.detail).toContain("made false by active=false");
+    // The incident stays open (deduped) across the next cell; its detail is
+    // the first one's, so the null case is pinned on a fresh harness below.
     await pollOnce(harness);
     await harness.gateway.stop();
     expect(lifecycleEvents(harness).map((envelope) => envelope.eventType)).toEqual(["MarketOpened"]);
-    expect(harness.incidents.map((incident) => incident.reasonCode)).toEqual([
-      "GATEWAY_LIFECYCLE_STATE_UNEXPECTED",
-    ]);
+    expect(reasonCodes(harness)).toEqual(["GATEWAY_LIFECYCLE_STATE_UNEXPECTED"]);
     expect(harness.gateway.metrics().lifecycle?.phases[MARKET.internalMarketId]).toBe("OPEN");
+
+    const nullCase = await buildHarness({
+      config: lifecycleConfig(),
+      http: gammaStub([{ body: READY }, { body: gammaMarket({ acceptingOrders: null }) }]).route,
+    });
+    nullCase.gateway.start();
+    await nullCase.settle();
+    await pollOnce(nullCase);
+    await nullCase.gateway.stop();
+    const named = nullCase.incidents.filter((incident) => incident.reasonCode === "GATEWAY_LIFECYCLE_STATE_UNEXPECTED");
+    expect(named).toHaveLength(1);
+    expect(named[0]?.detail).toContain("made false by acceptingOrders=null");
+    expect(lifecycleEvents(nullCase).map((envelope) => envelope.eventType)).toEqual(["MarketOpened"]);
   });
 
   it("R4: acceptingOrders false alone while OPEN is the observed closing", async () => {
@@ -684,10 +1249,7 @@ describe("UNIV-4 — the derivation rules' other cells", () => {
     const opened = harness.publishedOfType("MarketOpened");
     expect(opened).toHaveLength(1);
     expect(payloadOf(opened[0]!)["openedAt"]).toBe(new Date(CLOCK_START_MS).toISOString());
-    const ledger = JSON.parse(
-      harness.walFileSystem.snapshot()[`/wal/${LIFECYCLE_LEDGER_FILE_NAME}`] ?? "{}",
-    ) as { markets: Record<string, Record<string, unknown>> };
-    expect(ledger.markets[MARKET.internalMarketId]?.["openedAtOrigin"]).toBe("observation");
+    expect(ledgerRecord(harness.walFileSystem)?.["openedAtOrigin"]).toBe("observation");
   });
 
   it("R3: no configured closeTime → no scheduled MarketClosing; only the observed one", async () => {
@@ -772,9 +1334,7 @@ describe("UNIV-4 — failure paths inherit the gateway's invariants", () => {
     harness.gateway.start();
     await harness.settle();
     await pollOnce(harness);
-    expect(harness.incidents.map((incident) => incident.reasonCode)).toEqual([
-      "GATEWAY_LIFECYCLE_POLL_FAILED",
-    ]);
+    expect(reasonCodes(harness)).toEqual(["GATEWAY_LIFECYCLE_POLL_FAILED"]);
     expect(harness.publishedOfType("FeedStale")).toHaveLength(0);
 
     await pollOnce(harness); // third failure: the stall
@@ -819,7 +1379,7 @@ describe("UNIV-4 — failure paths inherit the gateway's invariants", () => {
     expect(lifecycleEvents(harness)).toHaveLength(0);
     await pollOnce(harness);
     expect(lifecycleEvents(harness)).toHaveLength(0);
-    expect(harness.incidents.map((incident) => incident.reasonCode)).toEqual([
+    expect(reasonCodes(harness)).toEqual([
       "GATEWAY_LIFECYCLE_POLL_FAILED",
       "GATEWAY_LIFECYCLE_STATE_INVALID",
     ]);
@@ -858,15 +1418,13 @@ describe("UNIV-4 — failure paths inherit the gateway's invariants", () => {
       derivationsSuppressedUnrecorded: 1,
       marketOpenedEmitted: 0,
     });
+    expect(ledgerRecord(harness.walFileSystem)).toBeUndefined();
   });
 
   it("an unreadable ledger fails the start rather than being replaced", async () => {
     const walFileSystem = createMemoryFileSystem();
     await walFileSystem.ensureDirectory("/wal");
-    await walFileSystem.writeWholeFile(
-      `/wal/${LIFECYCLE_LEDGER_FILE_NAME}`,
-      Buffer.from("{ not the ledger", "utf8"),
-    );
+    await walFileSystem.writeWholeFile(LEDGER_PATH, Buffer.from("{ not the ledger", "utf8"));
     let thrown: unknown;
     try {
       await buildHarness({ config: lifecycleConfig(), http: gammaStub([{ body: READY }]).route, walFileSystem });
@@ -889,6 +1447,28 @@ describe("UNIV-4 — failure paths inherit the gateway's invariants", () => {
     await harness.settle();
     expect(harness.publishedOfType("MarketOpened")).toHaveLength(1);
     await harness.gateway.stop();
+  });
+
+  it("LOW-3: a response that arrives after stop() is journaled and counted, and NOT derived from", async () => {
+    const stub = gammaStub([{ hang: true }]);
+    const harness = await buildHarness({ config: lifecycleConfig(), http: stub.route });
+    harness.gateway.start();
+    expect(stub.requests).toHaveLength(1);
+    const stopping = harness.gateway.stop(); // waits for the in-flight cycle before closing the journal
+    stub.release();
+    await stopping;
+    expect(harness.gateway.metrics().lifecycle).toMatchObject({
+      framesRecorded: 1,
+      framesJournaledAfterStop: 1,
+      marketOpenedEmitted: 0,
+    });
+    expect(harness.publishedOfType("MarketOpened")).toHaveLength(0);
+    const frames = recordedFrames(harness.walFileSystem, harness.gateway.gatewayEpoch).filter(
+      (frame) => frame.endpoint === GAMMA_URL,
+    );
+    expect(frames).toHaveLength(1);
+    expect(JSON.parse(frames[0]!.payloadUtf8)).toEqual(READY);
+    expect(ledgerRecord(harness.walFileSystem)).toBeUndefined();
   });
 
   it("the lifecycle feed alone is a valid gateway, and it never touches the WebSocket", async () => {

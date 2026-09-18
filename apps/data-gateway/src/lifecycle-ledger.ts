@@ -15,10 +15,36 @@
  * market would never open again for any consumer holding the first one.
  *
  * This ledger is the journal of the DERIVED facts: per market, the `openedAt`
- * the feed emitted and where it came from, whether the scheduled
- * `MarketClosing` was emitted, whether the observed one was, and whether the
- * venue contradicted the configuration before the market ever opened. The
- * feed reads it at start and never mints an instant the ledger already holds.
+ * the feed chose and where it came from, the `closesAt` of the scheduled and
+ * the observed `MarketClosing`, and whether the venue contradicted the
+ * configuration before the market ever opened. The feed reads it at start
+ * and never mints an instant the ledger already holds.
+ *
+ * ## Intent, then confirmation (`UNIV-4` r1, HIGH-1)
+ *
+ * Every event instant is written TWICE: first as an INTENT — before the
+ * event is dispatched, so the instant is fixed whatever happens next — and
+ * then, once the publisher reports `published: true`, as a CONFIRMATION
+ * (`*ConfirmedAt`). An intent without its confirmation means "chosen, not
+ * known to have reached the stream": the feed re-emits it, WITH THE PERSISTED
+ * INSTANT, on the first successful poll of a later epoch. The first round
+ * wrote the ledger once, after a fire-and-forget dispatch, so a publication
+ * halt (including the gateway's designed recording-only startup mode, §4.2)
+ * sealed an instant nobody received and the next epoch never re-emitted it —
+ * the market stayed `PENDING` for every consumer, forever. The two writes
+ * close both windows: a halt (intent persisted, unconfirmed → replayed) and a
+ * crash between dispatch and write (intent persisted first → the same
+ * instant is reused, so the universe fold sees an idempotent replay, never a
+ * contradiction).
+ *
+ * ## The identity pair (`UNIV-4` r1, LOW-5)
+ *
+ * Each record carries the `conditionId` and `gammaMarketId` it was derived
+ * under. The feed REFUSES TO START when a loaded record's pair disagrees
+ * with the configuration for the same `internalMarketId` — a re-used
+ * internal id must not inherit another market's phase — and reports records
+ * whose `internalMarketId` the configuration no longer names (carried, never
+ * deleted, named in a NOTIFY incident).
  *
  * ## Where it lives, and how it is written
  *
@@ -68,30 +94,58 @@ export const LIFECYCLE_LEDGER_SCHEMA_VERSION = 1;
 /** Where a market's `openedAt` came from (the derivation rule in `feeds/market-lifecycle.ts`). */
 export type OpenedAtOrigin = "configuration" | "observation";
 
-/** Everything the feed has emitted for one market. */
+/**
+ * Everything the feed has derived for one market: the instants it CHOSE
+ * (intents) and which of them the publisher CONFIRMED.
+ */
 export interface LifecycleLedgerRecord {
   readonly internalMarketId: string;
-  /** The `openedAt` the emitted `MarketOpened` carried. Absent until emitted. */
-  readonly openedAt?: string;
-  readonly openedAtOrigin?: OpenedAtOrigin;
+  /** The identity pair the record was derived under (LOW-5). */
+  readonly conditionId: string;
+  readonly gammaMarketId: string;
   /** The receipt instant of the poll whose response first showed the market trade-ready. */
   readonly firstReadyObservedAt?: string;
-  /** The `closesAt` of the emitted scheduled `MarketClosing` (the configured `closeTime`). */
+  /**
+   * The receipt instant of the first NOT-ready poll observed at or after the
+   * configured `openTime` (R2, LOW-2): once set, `openTime` can no longer be
+   * the honest open instant.
+   */
+  readonly notReadyAfterOpenTimeAt?: string;
+  /** The `openedAt` the `MarketOpened` carries. An intent until `openedConfirmedAt`. */
+  readonly openedAt?: string;
+  readonly openedAtOrigin?: OpenedAtOrigin;
+  readonly openedConfirmedAt?: string;
+  /** The `closesAt` of the scheduled `MarketClosing` (the configured `closeTime`). */
   readonly scheduledClosesAt?: string;
-  /** The `closesAt` of the emitted observed `MarketClosing` (an observation instant). */
+  readonly scheduledClosingConfirmedAt?: string;
+  /** The `closesAt` of the observed `MarketClosing` (a receipt instant). */
   readonly observedClosesAt?: string;
+  readonly observedClosingConfirmedAt?: string;
   /** The instant a poll showed `closed`/`archived` before the market ever opened. */
   readonly contradictedAt?: string;
 }
 
 const RECORD_KEYS = [
   "internalMarketId",
+  "conditionId",
+  "gammaMarketId",
+  "firstReadyObservedAt",
+  "notReadyAfterOpenTimeAt",
   "openedAt",
   "openedAtOrigin",
-  "firstReadyObservedAt",
+  "openedConfirmedAt",
   "scheduledClosesAt",
+  "scheduledClosingConfirmedAt",
   "observedClosesAt",
+  "observedClosingConfirmedAt",
   "contradictedAt",
+] as const;
+
+/** Each confirmation names the intent it confirms; a confirmation without its intent is refused. */
+const CONFIRMATIONS = [
+  ["openedConfirmedAt", "openedAt"],
+  ["scheduledClosingConfirmedAt", "scheduledClosesAt"],
+  ["observedClosingConfirmedAt", "observedClosesAt"],
 ] as const;
 
 function ownString(record: OwnRecord, key: string): string | undefined {
@@ -119,6 +173,14 @@ function readRecord(value: unknown, internalMarketId: string): LifecycleLedgerRe
       { internalMarketId },
     );
   }
+  const conditionId = ownString(value, "conditionId");
+  const gammaMarketId = ownString(value, "gammaMarketId");
+  if (conditionId === undefined || gammaMarketId === undefined) {
+    throw new GatewayStateError(
+      "the lifecycle ledger holds a market entry without its conditionId and gammaMarketId; the record cannot be attributed",
+      { internalMarketId },
+    );
+  }
   const openedAt = ownString(value, "openedAt");
   const origin = ownString(value, "openedAtOrigin");
   if (origin !== undefined && origin !== "configuration" && origin !== "observation") {
@@ -143,18 +205,32 @@ function readRecord(value: unknown, internalMarketId: string): LifecycleLedgerRe
       });
     }
   }
-  const firstReadyObservedAt = ownString(value, "firstReadyObservedAt");
-  const scheduledClosesAt = ownString(value, "scheduledClosesAt");
-  const observedClosesAt = ownString(value, "observedClosesAt");
-  const contradictedAt = ownString(value, "contradictedAt");
+  for (const [confirmation, intent] of CONFIRMATIONS) {
+    if (ownString(value, confirmation) !== undefined && ownString(value, intent) === undefined) {
+      throw new GatewayStateError(
+        `the lifecycle ledger holds ${confirmation} without its ${intent}; a confirmation of nothing cannot be trusted`,
+        { internalMarketId },
+      );
+    }
+  }
+  const optional = (key: (typeof RECORD_KEYS)[number]): Record<string, string> => {
+    const read = ownString(value, key);
+    return read === undefined ? {} : { [key]: read };
+  };
   return ownLedgerRecord({
     internalMarketId,
+    conditionId,
+    gammaMarketId,
+    ...optional("firstReadyObservedAt"),
+    ...optional("notReadyAfterOpenTimeAt"),
     ...(openedAt === undefined ? {} : { openedAt }),
     ...(origin === undefined ? {} : { openedAtOrigin: origin }),
-    ...(firstReadyObservedAt === undefined ? {} : { firstReadyObservedAt }),
-    ...(scheduledClosesAt === undefined ? {} : { scheduledClosesAt }),
-    ...(observedClosesAt === undefined ? {} : { observedClosesAt }),
-    ...(contradictedAt === undefined ? {} : { contradictedAt }),
+    ...optional("openedConfirmedAt"),
+    ...optional("scheduledClosesAt"),
+    ...optional("scheduledClosingConfirmedAt"),
+    ...optional("observedClosesAt"),
+    ...optional("observedClosingConfirmedAt"),
+    ...optional("contradictedAt"),
   });
 }
 
@@ -280,14 +356,27 @@ export class LifecycleLedger {
 
   /**
    * Replaces one market's record and rewrites the file durably. Resolves when
-   * the rewrite has completed (or rejects with the filesystem's error, which
-   * the feed reports as a recording failure).
+   * the rewrite has completed; rejects with the filesystem's error, in which
+   * case the in-memory record is ROLLED BACK to what the file still holds —
+   * a caller that reads the ledger after a failed put sees the durable truth,
+   * not the intent that never landed (r1: the feed's intent-before-dispatch
+   * rule depends on this).
    */
   put(record: LifecycleLedgerRecord): Promise<void> {
     const own = ownLedgerRecord(record);
-    this.#records.set(own.internalMarketId, own);
     const write = this.#chain.then(async () => {
-      await this.#fileSystem.writeWholeFile(this.#path, Buffer.from(this.encode(), "utf8"));
+      const previous = this.#records.get(own.internalMarketId);
+      this.#records.set(own.internalMarketId, own);
+      try {
+        await this.#fileSystem.writeWholeFile(this.#path, Buffer.from(this.encode(), "utf8"));
+      } catch (error) {
+        if (previous === undefined) {
+          this.#records.delete(own.internalMarketId);
+        } else {
+          this.#records.set(own.internalMarketId, previous);
+        }
+        throw error;
+      }
       this.#writes += 1;
     });
     // The chain itself must not stay rejected forever: a failed write is the

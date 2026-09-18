@@ -62,6 +62,20 @@
  * suite pins both halves (an extra key is admitted and lands in `recorded`; a
  * non-boolean `active` is refused).
  *
+ * ## One refusal the venue could trigger, disclosed (r1, LOW-4)
+ *
+ * The materializer this door shares with the CLOB door, `readOwnWireValue`,
+ * refuses a value nested deeper than `MAX_WIRE_DEPTH` (16) levels — the
+ * whole body, not the deep member. A `Market` whose nested metadata (an
+ * `events[]` entry, a `feeSchedule`, anything the OpenAPI lists as an
+ * object) ever exceeds that depth would be refused as `invalid`, the poll
+ * would fail loudly (`GATEWAY_LIFECYCLE_STATE_INVALID`), and nothing would be
+ * derived — a fail-closed drift refusal, the same residual the CLOB door
+ * records in `docs/handoffs/CLOB-1.md`. Every documented value sits at the
+ * top level, so the cap is far from anything the venue publishes today; it
+ * is stated here because a depth cap is a door that can refuse what the
+ * venue sends.
+ *
  * ## The readiness predicate fails closed on `null`
  *
  * The venue's snippet, evaluated in JavaScript on a body whose `closed` is
