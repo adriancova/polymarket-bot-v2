@@ -5,12 +5,14 @@ Branch `univ-4`, rebased onto `main` `da9c58e` (VENUE-2 `d6aedee` + TRDR-3
 
 | Commit | Content |
 | --- | --- |
-| `f687513` | the reproduction pin at base: the published stream never carries `MarketOpened` / `MarketClosing`; the documented polled surface is never consulted (data-gateway integration 12 / 59 at the original base; the pin then flips) |
+| `f687513` | the reproduction at base: the published stream never carries `MarketOpened` / `MarketClosing`; the documented polled surface is never consulted (data-gateway integration 12 / 59 at the original base). **It does not flip** (r1 LOW-1): the feed is opt-in and that test never configured `lifecycle`, so its absence assertions pass against the tip too; it was REWRITTEN into the round's test file, whose first test is the real pin (19 of the round's 20 tests fail with the wiring reverted), and the absence it measured is now announced at start as `GATEWAY_LIFECYCLE_FEED_ABSENT` |
 | `bc7871d` | the round: `packages/polymarket-public/src/market-state/`, the gateway's `lifecycle` feed, its ledger, its configuration door, the contract fixture and tests, acceptance (a)/(b)/(d) |
 | `615cabb` | part (c): the trader opens a market from the gateway's REAL `MarketOpened`, over Redis (Testcontainers) and in memory |
 | `6788e26` | this handoff |
 | `acc122a` | the ledger record built as its own type (a forbidden `as unknown as` removed; behaviour unchanged) |
-| the tip | this file's commit-SHA table updated |
+| `7564db6` | this file's commit-SHA table updated — the commit the adversarial review examined |
+| `9e9f154` | **r1**: intent-before-dispatch / confirmation-after-publication in the ledger, replay of unconfirmed intents by the next epoch, the ledger write-failure pin, LOW-1…LOW-6, the MEDIUM-2 disclosure |
+| the r1 tip | this file, updated for r1 |
 
 ## summary
 
@@ -62,21 +64,59 @@ readiness predicate `active && !closed && acceptingOrders`. This round:
    process's own `RedisMarketEventFeed` and `pump`, leaves `PENDING`, and
    admits an entry that lands in `strategy.decisions`. An in-memory sibling
    proves the same claim without Docker.
+6. **r1 (`9e9f154`), the review's HIGH-1**: the first round wrote the ledger
+   ONCE, after a fire-and-forget dispatch — so a publication halt (including
+   the gateway's designed recording-only startup mode, `run.ts`) sealed an
+   instant nobody received, and every later epoch, seeding its phase from the
+   ledger, skipped the market forever (the reviewer's reproduction: 0
+   `MarketOpened` in both epochs, 0 lifecycle incidents in the second). Now
+   every event goes through one path (`#emit`): the chosen instant is
+   persisted as an INTENT before dispatch; the dispatch outcome is AWAITED;
+   `published: true` writes the CONFIRMATION; `published: false` opens a
+   PAGE incident (`GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED`) and leaves the intent
+   unconfirmed. At the next start an unconfirmed intent is RE-EMITTED with
+   the persisted instant on the market's first successful poll (citing that
+   epoch's journaled response), in lifecycle order, never past a confirmed
+   later event (an unconfirmed OPEN is not replayed past a confirmed CLOSING —
+   the one regression the trader's unguarded `markLifecycle` cannot absorb);
+   a terminal market with an unconfirmed closing is polled until the replay
+   is attempted. The ledger rolls its in-memory record back when a write
+   fails, so the feed never acts on an intent that did not land. The design
+   closes both windows: a halt (intent persisted, unconfirmed → replayed)
+   and a crash between dispatch and write (intent persisted first → the same
+   instant is reused; the fold sees an idempotent replay). Plus MEDIUM-1
+   (the ledger-write-failure PAGE pinned: intent first, so NO event is
+   dispatched and the next poll re-derives), MEDIUM-2 (disclosure: a
+   mis-pointed `gammaMarketId` opens this market on another's readiness,
+   silently — D-30 licenses no interpretation of the response's
+   `conditionId`), LOW-1 (`GATEWAY_LIFECYCLE_FEED_ABSENT` at start; the base
+   pin's story corrected), LOW-2 (R2 refined below), LOW-3 (a response after
+   `stop()` is journaled, counted, not derived), LOW-4 (the `MAX_WIRE_DEPTH`
+   16 refusal disclosed), LOW-5 (records carry `conditionId` +
+   `gammaMarketId`; a pair mismatch refuses the start; a CONTRADICTED record
+   raises its incident every start; a foreign record is named and carried),
+   LOW-6 (R6 names the null field).
 
 ### The derivation rules (the module header's text, condensed)
 
 - **R1** `MarketOpened` once per configured market, when the documented
   predicate is observed TRUE at poll time — never from configuration alone,
   never for an unconfigured market; `restricted` recorded, not acted on.
-- **R2** `openedAt` stable across restarts: the configured `openTime` when
-  present and already past at the observation (stable by construction, and
-  the reviewed instant; the venue's `startDate` has no documented
-  semantics), otherwise the first observation's receipt instant persisted in
-  the ledger and re-read. Venue ready BEFORE the configured `openTime` → the
+- **R2** `openedAt` stable across restarts, and honest (r1): the configured
+  `openTime` when present, already past at the observation, AND no NOT-ready
+  poll was journaled for the market at or after it (LOW-2 — a market the
+  venue reported not ready after `openTime` demonstrably did not open then;
+  the ledger records the first such observation, `notReadyAfterOpenTimeAt`,
+  so a restart mid-wait keeps the history); otherwise the first ready
+  observation's receipt instant. BOTH branches are persisted as an intent
+  BEFORE dispatch, so a restart re-reads the instant whether the first
+  emission was published, halted, or lost to a crash between dispatch and
+  confirmation. Venue ready BEFORE the configured `openTime` → the
   observation instant (the venue's state wins over the schedule). On restart
-  a ledger-recorded open is NOT re-emitted: the trader's `markLifecycle` is
-  unguarded, so a replay after a `MarketClosing` would regress it to OPEN
-  (the universe fold would accept the same-instant replay as unchanged).
+  a CONFIRMED open is not re-announced (the trader's `markLifecycle` is
+  unguarded, so a replay after a `MarketClosing` would regress it to OPEN);
+  an UNCONFIRMED open is re-emitted with the persisted instant (the fold
+  accepts a same-instant replay as idempotent).
 - **R3** the scheduled `MarketClosing` (`closesAt = closeTime`) is emitted by
   the first poll at or past `closeTime` while OPEN — **not at the open**. The
   packet's wording ("emitted from the configured `closeTime` … once the
@@ -148,6 +188,15 @@ Round (`bc7871d`):
 - `test/contract/polymarket-public/fixtures/gamma-market-by-id.json` (new), `gamma-market-state.test.ts` (new, 54)
 - `test/integration/data-gateway/univ-4-market-lifecycle.test.ts` (the pin, flipped; 20 tests)
 
+r1 (`9e9f154`):
+
+- `apps/data-gateway/src/feeds/market-lifecycle.ts` (the `#emit` path: intent → awaited dispatch → confirmation / PAGE; `#replay`; `owedReplays`; the LOW-5 start checks; LOW-2/LOW-3/LOW-6; the MEDIUM-2 and HIGH-1 header sections)
+- `apps/data-gateway/src/lifecycle-ledger.ts` (`conditionId`, `gammaMarketId`, `notReadyAfterOpenTimeAt`, the three `*ConfirmedAt` fields; confirmation-without-intent refused; rollback on a failed write), `lifecycle-ledger.test.ts` (+4)
+- `apps/data-gateway/src/gateway.ts` (`GATEWAY_LIFECYCLE_FEED_ABSENT` at `start()`)
+- `packages/polymarket-public/src/market-state/door.ts` (header only: the LOW-4 disclosure)
+- `test/integration/data-gateway/support/faulty-file-system.ts` (`failWholeFileWrites` / `healWholeFileWrites`), `univ-4-market-lifecycle.test.ts` (20 → 32 tests; the header's pin story corrected)
+- `infra/compose/data-gateway/README.md` (the ledger's intents/confirmations and incidents; the `gammaMarketId` obligation; the feed-absent incident)
+
 Part (c) (`615cabb`):
 
 - `test/integration/paper-trader/univ-4-gateway-opens-trader-redis.test.ts` (new, 2), `univ-4-gateway-opens-trader.test.ts` (new, 2)
@@ -157,20 +206,21 @@ Not touched: `packages/domain/**`, `packages/universe/**`, `apps/trader/src/**`,
 
 ## tests_run
 
-Gates at tip (re-run at the final tip after `acc122a`; baseline: `main` `da9c58e` after TRDR-3):
+Gates at the r1 tip (baseline: `main` `da9c58e` after TRDR-3; the reviewed
+tip `7564db6` in the middle column):
 
-| Gate | Baseline | Tip |
-| --- | --- | --- |
-| `pnpm run typecheck` | 0 | 0 |
-| `pnpm run lint` | 0 | 0 |
-| `pnpm run check:deps` | 34 packages / 80 edges | 34 / 80 (no new edge: `apps/data-gateway → packages/polymarket-public` already existed) |
-| `pnpm run test` | 330 files / 7177 | **331 / 7209** (+`lifecycle-ledger.test.ts` 15, +config door 17) |
-| `pnpm test:contract` | 583 / 65 / 158 / 95 | **637** / 65 / 158 / 95 (+54) |
-| data-gateway integration | 11 / 58 | **12 / 78** (+1 file: the pin 1 test → 20) |
-| trader integration | 12 / 125 | **14 / 129** |
-| control-api integration | 10 / 85 | 10 / 85 |
-| `pnpm test:e2e` | 6 / 78 | 6 / 78 |
-| `pnpm run test:replay` | 3 / 17 | 3 / 17 |
+| Gate | Baseline | `7564db6` | r1 tip |
+| --- | --- | --- | --- |
+| `pnpm run typecheck` | 0 | 0 | 0 |
+| `pnpm run lint` | 0 | 0 | 0 |
+| `pnpm run check:deps` | 34 packages / 80 edges | 34 / 80 | 34 / 80 (no new edge) |
+| `pnpm run test` | 330 files / 7177 | 331 / 7209 | **331 / 7213** (+4: the ledger's identity pair, confirmation-without-intent refusals, the rollback pin) |
+| `pnpm test:contract` | 583 / 65 / 158 / 95 | 637 / 65 / 158 / 95 | 637 / 65 / 158 / 95 |
+| data-gateway integration | 11 / 58 | 12 / 78 | **12 / 90** (+12: HIGH-1 ×5, MEDIUM-1, LOW-1, LOW-2, LOW-3, LOW-5 ×3) |
+| trader integration | 12 / 125 | 14 / 129 | 14 / 129 |
+| control-api integration | 10 / 85 | 10 / 85 | 10 / 85 |
+| `pnpm test:e2e` | 6 / 78 | 6 / 78 | 6 / 78 |
+| `pnpm run test:replay` | 3 / 17 | 3 / 17 | 3 / 17 |
 
 The reproduction at the original base `df1b346`: 12 files / 59 tests, the
 pin passing on the absence (`f687513`, then rebased).
@@ -179,23 +229,35 @@ pin passing on the absence (`f687513`, then rebased).
 lifecycle integration file run, the source restored (the runner is outside
 the tree; every mutation killed):
 
-| Mutation | Failing pins |
+| Mutation (r1 table; every one killed against `9e9f154`) | Failing pins |
 | --- | --- |
-| ledger read removed (`options.ledger.get` → `undefined`) | 3: both restart proofs (a second `MarketOpened` in the second epoch), the after-close restart (polls again) |
-| R1: open from configuration alone (`status: "OPEN"` opens when not ready) | 3: the flipped pin, all-null, the stall test |
-| R2: `openedAt` minted fresh (observation instant even with a past `openTime`) | 3: the flipped pin, the configured-`openTime` restart proof, the after-closeTime R3 cell |
+| ledger read removed (`options.ledger.get` → `undefined`) | 10: both restart proofs, the after-close restart, all five HIGH-1 pins, both LOW-5 start checks |
+| **HIGH-1: seal on dispatch** — an unpublished outcome treated as confirmed | 2: recording-only startup, mid-run halt (the second epoch publishes nothing) |
+| **HIGH-1: replay removed** (`owedReplays` → `[]`) | 4: recording-only startup, mid-run halt, the seeded crash case, the replay-then-close case |
+| **HIGH-1: an unconfirmed OPEN replayed past a confirmed CLOSING** | 1: the guard |
+| **HIGH-1 / MEDIUM-1: intent after dispatch** (`void this.#persist(intent)`, not awaited) | 1: the write-failure pin (an event is dispatched with no durable intent) |
+| **MEDIUM-1: write failure not held back** (`await persist` without honouring `false`) | 1: the write-failure pin |
+| R1: open from configuration alone (`status: "OPEN"` opens when not ready) | 4: the pin, LOW-2, all-null, the stall test |
+| R2: `openedAt` minted fresh (observation instant even with a past `openTime`) | 3: the configured-`openTime` restart proof, the write-failure pin, the after-closeTime R3 cell |
+| **LOW-2: `openTime` used despite a not-ready poll after it** | 2: the pin, the LOW-2 restart-mid-wait test |
 | R3: scheduled closing never emitted | 5 |
-| R3: scheduled closing at the open, not at `closeTime` | 4: the flipped pin, the configured-`openTime` restart proof, R6, the exactly-once R3 cell |
-| R4: observed closing deleted | 6 |
-| R4: `closesAt` from the venue's `closedTime` instead of the receipt instant | 3 |
-| R5: contradiction opens anyway | 2 |
+| R3: scheduled closing at the open, not at `closeTime` | 5 |
+| R4: observed closing deleted | 9 |
+| R4: `closesAt` from the venue's `closedTime` instead of the receipt instant | 4 |
+| R5: contradiction opens anyway | 3 |
+| **LOW-5: CONTRADICTED incident not raised at start** | 1 |
+| **LOW-5: pair mismatch not refused** | 1 |
+| **LOW-5: foreign record not named** | 1 |
 | R6: incident deleted | 1 |
+| **LOW-6: the null field not named** | 1 |
 | `restricted` gated | 1 |
 | derivation proceeds on a WAL-refused frame | 1 |
+| **LOW-3: the `stop()` check before the journal write** | 1 |
 | stall never opened | 1 |
-| terminal market still polled | 3 |
+| terminal market still polled | 6 |
 | overlapping cycles stacked | 1 |
-| door: readiness as the literal `active && !closed && acceptingOrders` | 1 (`closed: null` is NOT ready) |
+| **LOW-1: the feed-absent incident removed** (`gateway.ts`) | 1 |
+| door: readiness as the literal `active && !closed && acceptingOrders` | 1 (`closed: null` is NOT ready; unchanged from r0) |
 
 **The restart mutation, as the packet asked:** with the ledger read removed,
 `configured openTime: the second epoch emits no second MarketOpened` and
@@ -205,6 +267,38 @@ assertion shows what that second event would have done — the universe fold
 refuses a `MarketOpened` minted at the restart's first poll with
 `UNIVERSE_LIFECYCLE_CONFLICT`, while it accepts the same-instant replay as
 idempotent.
+
+**The r1 HIGH-1 pins, on the harness:** (1) `startupTransportFailure` +
+ready stub → 0 published, `marketOpenedEmitted 1`, `eventsUnpublished 1`,
+the PAGE `GATEWAY_LIFECYCLE_EVENT_UNPUBLISHED` naming `MarketOpened` and its
+`openedAt`, the ledger holding the unconfirmed intent, no second attempt in
+the halted epoch; a second harness over the same WAL fs with a working
+transport, an hour later → exactly ONE `MarketOpened`, the FIRST epoch's
+instant, published in the SECOND epoch, citing the second epoch's journaled
+response, `replaysEmitted 1`, the ledger confirmed, not re-announced by the
+next poll, the fold accepting the stream; (2) `haltPublication("EVENT_BUS_UNAVAILABLE")`
+after a published open, then a CLOSED poll → 0 `MarketClosing`, the intent
+persisted unconfirmed, the PAGE incident; restart → the market is polled
+ONCE more, the observed `MarketClosing` is published with the persisted
+instant, the open is NOT re-announced (confirmed), then no further request;
+(3) a seeded unconfirmed open → the same instant re-emitted, `replaysEmitted 1`,
+`marketOpenedEmitted 0`; (4) a seeded unconfirmed open + a fresh CLOSED poll →
+open then closing on the same poll, same `causationId`, the fold reaching
+CLOSING; (5) the guard: an unconfirmed open beside a confirmed observed
+closing → not polled, nothing emitted; beside a confirmed scheduled closing →
+not replayed, the market still polled for the venue's own close. Reverting
+to seal-on-dispatch (the mutation row above) fails (1) and (2).
+
+**MEDIUM-1, on the harness** with `support/faulty-file-system.ts`'s new
+`failWholeFileWrites` (appends keep working, so the WAL is unaffected and
+the fault isolates the ledger): the intent write fails → PAGE
+`GATEWAY_LIFECYCLE_LEDGER_WRITE_FAILED`, `ledgerWriteFailures 1`, NO
+`MarketOpened` dispatched, phase `PENDING`, the raw response still
+journaled, no ledger file; a repeat on the next poll (counter 2); after
+`healWholeFileWrites` the next poll emits and confirms. The order chosen is
+intent BEFORE dispatch: an event whose instant is not durable could
+contradict itself after a restart, so it is held back and re-derived by the
+next poll rather than emitted unrecorded.
 
 **Part (c) evidence:** `univ-4-gateway-opens-trader-redis.test.ts` ran
 against `postgres:16.6-alpine` and `redis:7.4.2-alpine` Testcontainers
@@ -251,12 +345,14 @@ Repository assumptions: the fold's contract (`packages/universe/src/lifecycle.ts
 ## known_risks
 
 1. **A poll cannot tell an operator when the venue closed.** A market closed between two polls is seen late by up to one interval (default 10 s); a market that closed and reopened inside one interval is not seen at all. The venue's `endDate` was NOT used — it has no documented semantics and is a schedule, not an observation; the reviewed `closeTime` carries the schedule. The observed `MarketClosing`'s `closesAt` is the poll's receipt instant, which is the honest statement and is up to one interval late.
-2. **The crash window between dispatch and ledger write** (dispatch first, then persist — chosen because the reverse leaves a market silently stuck PENDING after a crash). If the process dies after `MarketOpened` reached the transport but before the ledger write completed, the next epoch re-derives: with a past configured `openTime` the replay is the same instant (accepted as idempotent); with an observation-derived instant it is a fresh one, which the universe fold REFUSES loudly (`UNIVERSE_LIFECYCLE_CONFLICT`) — and the trader's unguarded `markLifecycle` would mark OPEN regardless. A ledger write failure opens a PAGE incident (`GATEWAY_LIFECYCLE_LEDGER_WRITE_FAILED`) so the operator repairs it before a restart.
+2. **What the ledger's two writes leave open (r1; the r0 text here was inaccurate — persistence did not depend on the publish outcome, so the loss was open on EVERY halt, not only a crash race).** With intent-before-dispatch and confirmation-after-publication, an event is never sealed unpublished and never re-minted; what remains: (a) a CONFIRMATION write that fails after a successful publish leaves the intent unconfirmed (PAGE `GATEWAY_LIFECYCLE_LEDGER_WRITE_FAILED`), so the next epoch re-emits a same-instant duplicate — idempotent for the universe fold; the trader's unguarded `markLifecycle` re-marks OPEN (harmless while no CLOSING was confirmed, and the guard never replays an OPEN past a confirmed CLOSING); (b) a process killed between the publisher's acknowledgement and the confirmation write is case (a); (c) an INTENT write that fails holds the derivation back — the market stays PENDING, loudly, until the disk accepts the write; a venue that closes meanwhile is then seen as R5 (contradicted) rather than opened-then-closed, which is the fail-closed reading. Within one epoch no retry is attempted after `published: false`: every publication halt is terminal for the epoch by design, and the restart is the recovery.
 3. **The budget figure is a documentary snapshot.** If a later venue round establishes that `GET /markets/{id}` is not under the 300 / 10 s `/markets` bucket, `GAMMA_MARKETS_RATE_LIMIT_PER_10S` is a one-line change with its source; the 5 % share stays. Enforcement status of the limiter itself is UNVERIFIED (U-14).
 4. **The lifecycle ledger is a second persisted derived-state file** beside the WAL. It records only what THIS gateway emitted; two gateways sharing a WAL root would share it, which the single-writer-per-directory invariant already forbids for the WAL.
 5. **R6 is a reporting rule, not a venue rule**: readiness lost through `active`/`archived` alone opens an incident and derives nothing, because no documented transition reads that way. If the venue documents one, that cell changes.
 6. **`gameStartTime` is carried verbatim, no format asserted** — a door that refused a non-ISO string on a field no derivation reads would be the refuse-what-the-venue-sends class.
-7. **Consumers that join a later epoch** (a trader started fresh after the gateway's open) receive no re-announcement; they must obtain the lifecycle state from the stream's history (the default subscription starts at the oldest retained event) or a durable projection. Re-announcing was rejected because of the trader's unguarded `markLifecycle` (R2).
+6a. **The response is attributed by REQUEST, not by content (r1, MEDIUM-2).** D-30 does not record the response's `conditionId`, so the feed may not interpret it and does not: a MIS-POINTED `gammaMarketId` opens THIS market on ANOTHER market's readiness, silently, and nothing in the gateway can notice — until the next venue round establishes the response's `conditionId`, at which point a mismatch must refuse the poll with an incident. Stated in the feed header and the README; verifying `gammaMarketId` before enabling the feed is an operator obligation.
+6b. **The door refuses a body nested deeper than `MAX_WIRE_DEPTH` (16) as a whole (r1, LOW-4)** — the CLOB door's residual, inherited through the shared materializer: a `Market` whose nested metadata ever exceeded that depth would fail the poll loudly (`GATEWAY_LIFECYCLE_STATE_INVALID`) rather than open the market. Every documented value is top-level, so the cap is far from what the venue publishes today.
+7. **Consumers that join a later epoch** (a trader started fresh after the gateway's open) receive no re-announcement of a CONFIRMED event; they must obtain the lifecycle state from the stream's history (the default subscription starts at the oldest retained event) or a durable projection. Re-announcing confirmed events was rejected because of the trader's unguarded `markLifecycle` (R2); only UNCONFIRMED intents are re-emitted (r1).
 8. The part (c) Redis file adds a second container image to the trader suite's cold-cache pull.
 
 ## follow_up
@@ -267,6 +363,8 @@ Repository assumptions: the fold's contract (`packages/universe/src/lifecycle.ts
 4. **`apps/trader`** (its owner): `markLifecycle` is unguarded against a `MarketOpened` after `MarketClosing`; the trader's `lifecycle` feature input reads `openedAt`/`closesAt` from CONFIGURATION, not from the events — if the reviewed schedule and the venue disagree, the strategy's cutoff follows the schedule while the market status follows the events.
 5. **Operator runbook**: how to repair or remove `market-lifecycle-ledger.json` (an unreadable ledger fails the start by design), and that a market's `gammaMarketId` must be verified before the feed is enabled.
 6. `MarketResolved` remains the WebSocket's; the strategy's cutoff and `packages/universe`'s fold are untouched, as scoped.
+7. **(r1) The response's `conditionId`** — for the next venue round: once D-30's successor records it, the feed must refuse a poll whose body names a different market (MEDIUM-2's residual; today a disclosure).
+8. **(r1) `publisher.ts`'s halt detail** ("the event remains in the WAL", `publisher.ts:461`) is true of raw frames and false of this feed's derived events; the feed's own incident detail states the truth and the outcome text is consumed nowhere else, so the publisher was left untouched (its owner's wording).
 
 ## commit_sha
 
@@ -275,4 +373,6 @@ Repository assumptions: the fold's contract (`packages/universe/src/lifecycle.ts
 - part (c): `615cabb`
 - handoff: `6788e26`
 - the `as unknown as` removal: `acc122a`
-- tip: the commit carrying this table (recorded in the hand-back message)
+- the r0 tip the review examined: `7564db6`
+- r1 code: `9e9f154`
+- r1 tip: the commit carrying this table (recorded in the hand-back message)
