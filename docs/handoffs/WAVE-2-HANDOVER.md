@@ -66,6 +66,17 @@ materializes on the fresh install (`GATE1-R3`, already exercised locally); the
 when four do (`N5`). None of those is a code risk; all three are one-line fixes
 for whoever next owns `ci.yml`.
 
+*(DISCHARGED 2026-09-26 by `CI-1`, merged `7248073`; record
+`docs/handoffs/CI-1.md`.) You pushed to `adriancova/polymarket-bot-v2`. The
+first run (`36279491795`) failed at "Unit tests" with every test passing: a
+synchronous child process held the test worker past vitest's 60 s RPC
+timeout, which no laptop run had hit. The fail-fast chain then skipped seven
+gates, as `GATE1-R4` predicted. `CI-1` fixed both. PR #1 run `36282501033`
+passed every gate on GitHub, the six integration suites included. Correction
+to the paragraph above: THREE suites need Docker (postgres, event-bus,
+paper-trader). "Four" counted the container-starting files inside
+paper-trader, not suites.*
+
 ### H1 — the live-data paper run (now attemptable, never attempted)
 Every agent-closable precondition is closed. What the run needs from you:
 1. **Register the rows** (BOOT-1 refuses to start otherwise): one `catalog.markets`,
