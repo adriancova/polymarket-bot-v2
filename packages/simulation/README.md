@@ -299,3 +299,70 @@ key.
     front of, because `submit` refuses it by name and this method cannot. The
     cost is real and is stated here rather than hidden: an operator reading that
     snapshot learns the venue could not answer, not what its positions were.
+13. **A plan's outcome is reported PER ORDER, and a partial plan is not
+    atomic** (SIM-1, the user's ruling R3). `ExecutionResult` carries
+    `outcome: "ACCEPTED" | "PARTIAL" | "REFUSED"` and `notPlaced` beside
+    `orders`: whatever the venue BOOKED is listed, on every path including a
+    contained internal fault, and every planned order it did not place is named
+    with its own refusal. Three rules decide what a plan books. (a) The whole
+    plan's LOCAL checks — its shape, every planned order's validity, duplicate
+    ids within the plan and against the book, and the order type the policy
+    states — run before anything is booked; a plan that fails them books
+    nothing and spends no token. (b) Placements are admitted per BATCH of at
+    most 15 orders (D-05: `POST /orders` takes 1 to 15), one `admit(count)` per
+    batch, all-or-nothing (venue report §8; ADR-012 §5.6). (c) Inside an
+    admitted batch each entry executes on its own, as the venue's per-entry
+    batch response does; after a batch with any failure, or a refused batch,
+    the plan's LATER batches are not sent and their orders are refused
+    `SIMULATED_VENUE_ORDER_NOT_SUBMITTED`. Rule (c)'s stop is this simulator's
+    choice, NOT a venue fact: whether a live OMS keeps sending a plan's later
+    batches after a failed entry is the OMS's decision, and whether an entry of
+    an ADMITTED batch can fail for a reason other than post-only mode is
+    inferred from the per-entry response shape rather than stated by the venue
+    documentation. A submission attempt is still one per PLAN (`SIM-ATTEMPT`).
+    PLACED IS NOT EXECUTED (SIM-1 r2, `SIM1-R2-1`): `accepted` / `"ACCEPTED"`
+    says every planned order was BOOKED, not that each executed. A booked FOK
+    that cannot fill whole is `REJECTED` with nothing filled (O2), a FAK's
+    remainder is `CANCELLED` (O1), and a DELAYED order reaches its outcome only
+    at `matchableAtNs` (O5); a consumer that needs every order EXECUTED — a
+    basket — reads each order's `state` and `filledShares`, as the trader does.
+14. **DELAYED is a pending window, resolved from recorded time** (SIM-1, O5;
+    ADR-012 §5.1, D-18). On a delayed market (Tier 1, `secondsDelay > 0`) a
+    marketable order is booked `DELAYED` with nothing filled and no fill
+    applied; its disposition is computed at submission (against the recorded
+    book at `matchableAtNs`, as before) and APPLIED only when the venue's
+    recorded time reaches `matchableAtNs`: on `observe()` (read from the venue's
+    `Clock`), on `observeTrade()` (the trade's recorded instant, before the
+    trade is walked) and before a cancel. Inside the window a cancel is refused
+    (`notCancelled`: "cannot be canceled", D-18). A composition root whose clock
+    does not advance therefore never resolves a DELAYED order through
+    `observe()` alone; the shipped trader runs Tier 0, which never delays.
+    A disposition that cannot be APPLIED at `matchableAtNs` (its fill
+    accounting refuses an operand; SIM-1 r1, `SIM1-R1-1`) is not retried and
+    not lost: the order becomes `REJECTED` with nothing filled and nothing
+    booked (D-18: an order whose checks fail when the delay expires "is
+    rejected instead of matching"), and the next `observe()` or
+    `observeTrade()` answers `ok: false`,
+    `SIMULATED_VENUE_DISPOSITION_NOT_APPLIED`, naming it — once. A cancel's
+    own sweep holds such a failure for that next answer, because a
+    `CancelResult` has no refusal channel.
+15. **GTD expiry is swept on every recorded event, and a partly filled GTD
+    EXPIRES** (SIM-1, O4). Expiry used to be checked only when a trade printed
+    in the order's own market and side, so a GTD in a quiet market never
+    expired and held its capital. It is now also applied on `observe()` (venue
+    clock) and on every `observeTrade()` (any market). A partly filled GTD
+    becomes `EXPIRED` keeping its `filledShares`. The live venue's status for
+    that case is UNVERIFIED: the recorded order statuses contain no EXPIRED
+    (`docs/venue/verified-2026-09-16.md` §2.2), so a live adapter must map
+    whatever the venue reports; this simulator's answer is a modelling choice.
+16. **Every order the venue cannot work any more is TERMINAL, and every one it
+    can is registered to rest** (SIM-1, O1-O3, O6-O8). A FAK remainder is
+    `CANCELLED` keeping what it filled; a Tier-0 FOK that cannot fill whole is
+    `REJECTED` with nothing filled (Tier 1 already was); a GTC/GTD remainder
+    RESTS whatever the planned style, and under Tier 0 a later trade at or
+    through its limit fills the whole remaining size as a MAKER at the limit
+    price. `RESTING`/`PARTIALLY_FILLED` mean the venue holds the order's resting
+    record. A market-scoped cancel targets live orders only and charges only
+    those; with no live target it is a successful no-op charging nothing. A
+    `REJECTED` order is not cancellable. A cancel re-stamps `atEvent`. The
+    simulator version pin moved `wp-210/v1` → `wp-210/v2` with these changes.

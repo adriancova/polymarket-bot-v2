@@ -554,6 +554,7 @@ describe("a deterministic long synthetic run (NOT a soak — §16.7)", () => {
         settleMismatches: 0,
       });
       expect(loop.retainedOrderState()).toEqual({
+        basketWatches: 0,
         owners: 0,
         instanceOrderSets: 0,
         instanceOrderIds: 0,

@@ -1,37 +1,90 @@
 /**
- * `TRDR-4` round 1, finding TRDR4-R1 — a plan the venue PARTLY EXECUTED and
- * then refused keeps what its still-held orders reserved, and halts its market
- * for reconciliation.
+ * A plan the venue did not WHOLLY accept — `TRDR-4` round 1 (finding
+ * TRDR4-R1), re-pinned by SIM-1 under the user's ruling R3 (per-order
+ * results).
  *
- * The state: the planner slices a 50-share resting BUY into ten 5-share orders
- * (`planning.maxSliceShares: "5"`), and the REAL `SimulatedVenue`'s §9.13
- * budget admits ONE placement per window. The venue books the first slice —
- * it RESTS, well below the ask — refuses the second on its budget, and
- * answers `accepted: false, orders: []` for the WHOLE plan, while the first
- * slice stays working in its book (`venue.ts` `#submitSync` / `#refuse`).
+ * THE REAL VENUE (SIM-1, R3). `SimulatedVenue` now reports each planned order's
+ * outcome: what it BOOKED is listed in `result.orders` on a partial outcome as
+ * on a full one, and the rest in `result.notPlaced`. It admits placements per
+ * BATCH of at most 15 orders, all-or-nothing (D-05, ADR-012 §5.6). So:
  *
- * At `ed6d656` the loop's refusal branch released every planned order's
- * reservation, allocator commitment and time-in-force — including the RESTING
- * one's — which ADR-006 §9 forbids (never released before terminal), and
- * raised nothing: `reservations.open 0`, `allocator.open 0`,
- * `timeInForceFor(slice 1) undefined`, `halts []`. Pinned here:
+ * 1. a 20-slice resting BUY against a 15-token budget books its FIRST batch
+ *    (15 slices, RESTING) and not its second (5 slices, rate-limited). The
+ *    booked slices are OWNED — owner, trace prefix, provenance — delivered
+ *    through `onOrderUpdate` and `ctx.orders()`, and keep their entries until
+ *    terminal; the 5 refused slices are released, counted; a POSITION partial
+ *    raises NO halt; when an observed trade fills the booked slices the fills
+ *    are ATTRIBUTED (never UNATTRIBUTED), and the orders are released, retired
+ *    and settled like any other;
+ * 2. a 10-slice plan (one batch) against a ONE-token budget books NOTHING —
+ *    the batch is admitted all-or-nothing — and every slice is released with
+ *    no halt (this was `TRDR-4`'s partial state; the venue no longer produces
+ *    it);
+ * 3. an outright refusal (NO token) releases every planned order and raises no
+ *    halt — MEDIUM-4, unchanged;
+ * 4. a BASKET the venue executed only IN PART (its NO leg finds no book) keeps
+ *    the booked leg owned and attributed, releases the refused leg, and HALTS
+ *    the basket's market `BASKET_PARTIALLY_EXECUTED`, because nothing in the
+ *    trader consumes the basket's `failurePolicy` yet. The loop supplies §9.8
+ *    check 12's fee/slippage estimates for POSITION intents only, so this one
+ *    case supplies them for the basket through a pass-through `vi.mock` of the
+ *    risk-input builder; risk, allocator, planner and venue stay real.
  *
- * 1. the nine slices the venue never booked are released, counted;
- * 2. the RESTING slice keeps all three entries, across later harvests, while
+ * A BASKET IS JUDGED FROM EACH ORDER'S OUTCOME (SIM-1 r2, `SIM1-R2-1`). The
+ * venue's `accepted` says every planned order was PLACED, not that each
+ * EXECUTED, so the same basket (same seam) halts when:
+ *
+ * 4a. it was ACCEPTED under FOK and its NO slices were REJECTED 0/5 while its
+ *     YES slices FILLED (the verifier's reproduction) — at the answer, before
+ *     anything was delivered to the strategy;
+ * 4b. it was ACCEPTED under FAK and its NO slices were CANCELLED short (1/5);
+ * 4c. its legs were DELAYED (a Tier-1 venue on a 5 s delayed market) and
+ *     resolved FILLED / REJECTED at `matchableAtNs` — reached by `observe()`,
+ *     or first by a TRADE when the venue's clock lags — and the halt lands
+ *     before that event's evaluation;
+ * 4d. it was ACCEPTED under GTC with its NO slices RESTING partly filled
+ *     (watched, no halt), and the strategy's own market cancel then left them
+ *     CANCELLED 1/5 beside a FILLED YES leg — judged in that event's harvest,
+ *     before its deliveries.
+ *
+ *     Controls: every leg FILLED, or every leg REJECTED 0/5 (nothing executed),
+ *     raise no halt; no basket watch remains in either.
+ *
+ * 4e. SIM-1 r3 (`SIM1-R3-1`): the same GTC basket, cancelled by the strategy
+ *     from a DELIVERY callback (`onFill`, `onOrderUpdate`) of the harvest that
+ *     delivers its fills — the halt is raised at the CANCEL's answer (accepted
+ *     or PARTIAL), so the next delivery (which would BUY) is suppressed and the
+ *     next intent of the same decision is refused at the risk seam
+ *     (`RISK_RUN_STATE_BLOCKS`); nothing else reaches the venue. Control: a
+ *     COMPLETE basket, where the same cancel-then-BUY raises no halt. And the
+ *     harvest's own judgement, now a BACKSTOP, through a scripted venue whose
+ *     order state moves BETWEEN the loop's calls (a venue-side cancel).
+ *
+ * THE DEFENSIVE PATH (a scripted `TraderVenue` double). A venue that REFUSES a
+ * plan while still HOLDING part of it — a live adapter whose answer is
+ * incomplete — is what `TRDR-4`'s orphan halt exists for, and the real
+ * simulator no longer produces it. The double books the plan's FIRST slice at a
+ * real `SimulatedVenue` and answers the whole plan REFUSED, listing nothing:
+ *
+ * 5. the nine slices the venue never booked are released, counted;
+ * 6. the RESTING slice keeps all three entries, across later harvests, while
  *    it is working;
- * 3. its market is halted `UNATTRIBUTED_ACTIVITY` / `RECONCILE_ACCOUNT` at the
+ * 7. its market is halted `UNATTRIBUTED_ACTIVITY` / `RECONCILE_ACCOUNT` at the
  *    refusal, naming the plan, the order and its state;
- * 4. no instance owns it: never delivered, never in `ctx.orders()`;
- * 5. when an OBSERVED trade fills it (terminal evidence), the fill is booked
+ * 8. no instance owns it: never delivered, never in `ctx.orders()`;
+ * 9. when an OBSERVED trade fills it (terminal evidence), the fill is booked
  *    UNATTRIBUTED and counted, and only then are the three entries released.
  *
  * WHAT IS REAL: the `CoreLoop`, strategy runtime, feature engine, books,
- * allocator, risk engine, execution planner, `SimulatedVenue` (Tier 0) and
- * ledger. WHAT IS DOUBLED: the clock and the store (the trader's own in-memory
- * doubles) and the STRATEGY — a one-shot double that emits the same §7.7
- * resting-entry intent shape Static Bracket emits (Static Bracket's passive
- * entry is not needed to reach the loop's refusal branch). PAPER only; no
- * network, credential, signer or real order.
+ * allocator, risk engine, execution planner, `SimulatedVenue` (Tier 0; Tier 1
+ * on a delayed market in 4c) and ledger. WHAT IS DOUBLED: the clock and the
+ * store (the trader's own in-memory doubles), the STRATEGY — a one-shot
+ * double that emits the same §7.7 resting-entry intent shape Static Bracket
+ * emits (Static Bracket's passive entry is not needed to reach the loop's
+ * refusal branch), plus one follow-up cancel in 4d and the scripted delivery
+ * callbacks of 4e — and, in the defensive
+ * cases only, the venue's ANSWER (in 4e's backstop case, WHEN its order state
+ * moves). PAPER only; no network, credential, signer or real order.
  */
 
 import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
@@ -40,16 +93,50 @@ import { Ledger } from "@polymarket-bot/ledger";
 import { parseRiskPolicy } from "@polymarket-bot/risk";
 import {
   SimulatedVenue,
+  deriveStreams,
   readFeeScheduleSnapshot,
   tier0Model,
+  tier1Model,
   tokenBucketRateLimits,
+  unmodeledRateLimits,
   type BookView,
+  type ExecutionResult,
   type FeeScheduleSnapshot,
+  type LatencyModel,
+  type MarketBookProvider,
+  type PlacementPlanView,
+  type QueueModelParameters,
+  type RateLimitBudget,
+  type SimulatedOrder,
 } from "@polymarket-bot/simulation";
 import { createStrategyInstanceRuntime, type EvaluationInput } from "@polymarket-bot/strategy-runtime";
 import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type * as Pipeline from "./pipeline.js";
 import { z } from "zod";
+
+// THE ONE SEAM DOUBLED FOR THE BASKET CASE, and only for a BASKET intent. The
+// loop supplies §9.8 check 12's fee and slippage estimates for a POSITION
+// intent only (`CoreLoop.#economicsFor`), so the REAL risk engine refuses every
+// basket `RISK_EDGE_INPUTS_MISSING` and no basket plan can reach the venue
+// through the shipped pipeline today. The wrapper states those two estimates
+// for a BASKET intent — the risk engine, allocator, planner and venue all stay
+// real — so the loop's partial-basket branch is reached with a REAL basket
+// plan. Every other intent passes through untouched.
+vi.mock("./pipeline.js", async (importOriginal) => {
+  const original = await importOriginal<typeof Pipeline>();
+  return {
+    ...original,
+    buildRiskEvaluationInput(context: Parameters<typeof original.buildRiskEvaluationInput>[0]) {
+      return original.buildRiskEvaluationInput(
+        context.intent.type === "BASKET"
+          ? { ...context, feeEstimate: "0.1", slippageEstimate: "0" }
+          : context,
+      );
+    },
+  };
+});
 
 import { DeterministicIdFactory, projectionOf, type PostingIdentity } from "./accounting.js";
 import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
@@ -57,7 +144,7 @@ import { configuredFeatureKeys, parseTraderConfig } from "./config.js";
 import { HaltController } from "./halt.js";
 import { HealthState } from "./health.js";
 import { InstanceRegistry } from "./instances.js";
-import { CoreLoop, DecisionOutboxBuffer } from "./loop.js";
+import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
 import { MarketState } from "./market-state.js";
 import type { IngestedEvent } from "./ports.js";
 import { REPOSITORY_MAXIMUM_RUN_MODE, TRADER_RUN_MODE } from "./safety.js";
@@ -75,6 +162,25 @@ const T_START_MS = Date.parse("2026-05-01T09:00:00.000Z");
 const T_OPEN = "2026-05-01T09:00:00.000Z";
 const T_CLOSE = "2026-05-02T09:00:00.000Z";
 const STEP_MS = 100;
+
+type Level = { readonly price: string; readonly size: string };
+
+/** Tier-1 inputs for the SIM1-R2-1 DELAYED basket: no latency, and the §12.2 queue arms. */
+const ZERO_LATENCY: LatencyModel = {
+  latencyModelVersion: "sim1-r2/latency/zero",
+  decision: { samples: [{ milliseconds: 0, weight: 1 }] },
+  signing: { samples: [{ milliseconds: 0, weight: 1 }] },
+  network: { samples: [{ milliseconds: 0, weight: 1 }] },
+  venue: { samples: [{ milliseconds: 0, weight: 1 }] },
+  basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+};
+const QUEUE_PARAMETERS: QueueModelParameters = {
+  queueModelVersion: "sim1-r2/queue/v1",
+  cancellationRatio: { OPTIMISTIC: "0.5", BASE: "0.1", CONSERVATIVE: "0" },
+  cancelEffectiveAfterMs: { OPTIMISTIC: 10, BASE: 50, CONSERVATIVE: 250 },
+  placedBehindSameInstantAdditions: { OPTIMISTIC: false, BASE: false, CONSERVATIVE: true },
+  basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+};
 
 function feeSnapshot(): FeeScheduleSnapshot {
   return {
@@ -187,64 +293,253 @@ function traderConfig(): Record<string, unknown> {
   };
 }
 
-type OneShotState = { readonly placed?: boolean };
+type OneShotState = { readonly placed?: boolean; readonly followed?: boolean };
+
+/**
+ * SIM1-R3-1: what the one-shot double emits from a DELIVERY callback — the
+ * `delivery`-th invocation (from 1) of `onFill` or of `onOrderUpdate` — as ONE
+ * decision carrying every listed intent, in order. An empty list holds.
+ */
+type DeliveryScript = (
+  callback: "onFill" | "onOrderUpdate",
+  delivery: number,
+  ctx: StrategyContext,
+) => readonly Intent[];
 
 function hold(ctx: StrategyContext): DecisionResult {
   return { decisionType: "hold", reasonCodes: ["TRDR4R1.HOLD"], featureSnapshotRef: ctx.features().snapshotRef, intents: [] };
 }
 
-/** Emits ONE resting BUY of 50 at 0.2 (`MAKER_ONLY`, `PASSIVE`, `GTC`), then holds. */
-const oneShotStrategy: Strategy<unknown, OneShotState> = {
-  name: "trdr4r1-one-shot-double",
-  version: "1.0.0",
-  paramsSchema: z.strictObject({}),
-  stateSchemaVersion: 1,
-  onStart: hold,
-  onMarketOpen: hold,
-  onTimer: hold,
-  onFill: (ctx: StrategyContext) => hold(ctx),
-  onOrderUpdate: (ctx: StrategyContext) => hold(ctx),
-  onMarketClosing: (ctx: StrategyContext) => hold(ctx),
-  onMarketResolved: (ctx: StrategyContext) => hold(ctx),
-  onStop: (ctx: StrategyContext) => hold(ctx),
-  onFeatures(ctx: StrategyContext): DecisionResult {
-    if (ctx.state<OneShotState>().placed === true) return hold(ctx);
-    const buy: Intent = {
-      type: "POSITION",
-      intentId: "trdr4r1-resting-buy",
-      marketId: MARKET_ID,
-      direction: "YES",
-      targetMode: "DELTA",
-      targetShares: "50",
-      maximumBuyPrice: "0.2",
-      maximumTotalCost: "18",
-      urgency: "PASSIVE",
-      liquidityPreference: "MAKER_ONLY",
-      partialFillPolicy: "ACCEPT_ANY",
-      validUntil: new Date(Date.parse(ctx.now()) + 3_600_000).toISOString(),
-      expectedNetEdge: "5",
-      tags: ["trdr4r1.entry", "sb.order-type:GTC"],
-    };
+/**
+ * Emits ONE resting BUY at 0.2 (`MAKER_ONLY`, `PASSIVE`, `GTC`) of `entry`'s
+ * size, then holds. `planning.maxSliceShares` 5 cuts it into 5-share slices:
+ * 50 shares are 10 slices (one venue batch), 100 are 20 (two batches, 15 + 5).
+ */
+function oneShotStrategy(entry: {
+  readonly targetShares: string;
+  readonly maximumTotalCost: string;
+  /** Replaces the resting BUY with another intent (the BASKET case). */
+  readonly intent?: (ctx: StrategyContext) => Intent;
+  /** SIM1-R2-1: ONE follow-up intent (a cancel), emitted on the next `onFeatures` after the entry. */
+  readonly followUp?: (ctx: StrategyContext) => Intent;
+  /** SIM1-R3-1: the intents a DELIVERY callback emits (none: hold); see {@link DeliveryScript}. */
+  readonly onDelivery?: DeliveryScript;
+}): Strategy<unknown, OneShotState> {
+  // How many times each delivery callback has been INVOKED (a suppressed
+  // delivery is not an invocation), counted from 1.
+  const invoked = { onFill: 0, onOrderUpdate: 0 };
+  const deliver = (callback: "onFill" | "onOrderUpdate", ctx: StrategyContext): DecisionResult => {
+    invoked[callback] += 1;
+    const intents = entry.onDelivery?.(callback, invoked[callback], ctx) ?? [];
+    if (intents.length === 0) return hold(ctx);
     return {
-      decisionType: "enter",
-      reasonCodes: ["TRDR4R1.ENTER"],
+      decisionType: intents[0]?.type === "CANCEL" ? "cancel" : "enter",
+      reasonCodes: ["SIM1R3.DELIVERY"],
       featureSnapshotRef: ctx.features().snapshotRef,
-      statePatch: { placed: true },
-      intents: [buy],
+      intents: [...intents],
     };
-  },
-};
+  };
+  return {
+    name: "trdr4r1-one-shot-double",
+    version: "1.0.0",
+    paramsSchema: z.strictObject({}),
+    stateSchemaVersion: 1,
+    onStart: hold,
+    onMarketOpen: hold,
+    onTimer: hold,
+    onFill: (ctx: StrategyContext) => deliver("onFill", ctx),
+    onOrderUpdate: (ctx: StrategyContext) => deliver("onOrderUpdate", ctx),
+    onMarketClosing: (ctx: StrategyContext) => hold(ctx),
+    onMarketResolved: (ctx: StrategyContext) => hold(ctx),
+    onStop: (ctx: StrategyContext) => hold(ctx),
+    onFeatures(ctx: StrategyContext): DecisionResult {
+      const state = ctx.state<OneShotState>();
+      if (state.placed === true && entry.followUp !== undefined && state.followed !== true) {
+        return {
+          decisionType: "cancel",
+          reasonCodes: ["SIM1R2.FOLLOW_UP"],
+          featureSnapshotRef: ctx.features().snapshotRef,
+          statePatch: { followed: true },
+          intents: [entry.followUp(ctx)],
+        };
+      }
+      if (state.placed === true) return hold(ctx);
+      const buy: Intent = {
+        type: "POSITION",
+        intentId: "trdr4r1-resting-buy",
+        marketId: MARKET_ID,
+        direction: "YES",
+        targetMode: "DELTA",
+        targetShares: entry.targetShares,
+        maximumBuyPrice: "0.2",
+        maximumTotalCost: entry.maximumTotalCost,
+        urgency: "PASSIVE",
+        liquidityPreference: "MAKER_ONLY",
+        partialFillPolicy: "ACCEPT_ANY",
+        validUntil: new Date(Date.parse(ctx.now()) + 3_600_000).toISOString(),
+        expectedNetEdge: "5",
+        tags: ["trdr4r1.entry", "sb.order-type:GTC"],
+      };
+      return {
+        decisionType: "enter",
+        reasonCodes: ["TRDR4R1.ENTER"],
+        featureSnapshotRef: ctx.features().snapshotRef,
+        statePatch: { placed: true },
+        intents: [entry.intent?.(ctx) ?? buy],
+      };
+    },
+  };
+}
+
+/**
+ * The DEFENSIVE-path double: a `TraderVenue` that REFUSES a plan while still
+ * HOLDING part of it.
+ *
+ * It books the plan's FIRST planned order — alone, as a one-order plan — at a
+ * REAL `SimulatedVenue`, and answers the loop as if the whole plan had been
+ * refused: `accepted: false`, nothing listed as booked. Everything else
+ * (positioning, observed trades, the order state, the fills) is the real
+ * venue's. This is the state `TRDR-4`'s orphan halt exists for — a live
+ * adapter's incomplete answer — which the real simulator no longer produces
+ * (it lists what it booked, R3).
+ */
+class RefusesWhileHoldingVenue implements TraderVenue {
+  readonly inner: SimulatedVenue;
+
+  constructor(inner: SimulatedVenue) {
+    this.inner = inner;
+  }
+
+  observe(identity: Parameters<TraderVenue["observe"]>[0]): { readonly ok: boolean } {
+    return this.inner.observe(identity);
+  }
+
+  observeTrade(input: Parameters<TraderVenue["observeTrade"]>[0]): ReturnType<TraderVenue["observeTrade"]> {
+    return this.inner.observeTrade(input);
+  }
+
+  async submit(plan: unknown): Promise<ExecutionResult> {
+    const offered = plan as PlacementPlanView;
+    const group = offered.groups[0];
+    const first = group?.orders[0];
+    if (group === undefined || first === undefined) throw new Error("the double expects a placement plan");
+    const booked = await this.inner.submit({ ...offered, groups: [{ ...group, orders: [first] }] });
+    if (!booked.accepted) throw new Error(`the double's first order was refused: ${String(booked.refusalCode)}`);
+    return {
+      ...booked,
+      accepted: false,
+      outcome: "REFUSED",
+      orders: [],
+      fills: [],
+      bands: [],
+      notPlaced: [],
+      refusalCode: "SIMULATED_VENUE_RATE_LIMITED",
+      refusalMessage: "the venue refused the plan (test double: it still holds the plan's first order)",
+    };
+  }
+
+  ordersSnapshot(): ReturnType<TraderVenue["ordersSnapshot"]> {
+    return this.inner.ordersSnapshot();
+  }
+
+  get fills(): TraderVenue["fills"] {
+    return this.inner.fills;
+  }
+}
+
+/**
+ * SIM1-R3-1's BACKSTOP case: a `TraderVenue` whose order state MOVES BETWEEN
+ * the loop's calls, as a live venue's does when its user channel reports a
+ * venue-side cancel. Armed with an action, it runs it — once — when the loop
+ * next reads `fills`, which is the first thing a harvest does; everything else
+ * is the real venue's. The real simulator's state moves only inside
+ * `observe()`, `observeTrade()` and `submit()`, each of which the loop judges
+ * at its answer; this double is what the harvest's own judgement exists for.
+ */
+class MovesBetweenCallsVenue implements TraderVenue {
+  readonly inner: SimulatedVenue;
+  #armed: (() => void) | undefined;
+
+  constructor(inner: SimulatedVenue) {
+    this.inner = inner;
+  }
+
+  arm(action: () => void): void {
+    this.#armed = action;
+  }
+
+  observe(identity: Parameters<TraderVenue["observe"]>[0]): { readonly ok: boolean } {
+    return this.inner.observe(identity);
+  }
+
+  observeTrade(input: Parameters<TraderVenue["observeTrade"]>[0]): ReturnType<TraderVenue["observeTrade"]> {
+    return this.inner.observeTrade(input);
+  }
+
+  async submit(plan: unknown): Promise<ExecutionResult> {
+    return await this.inner.submit(plan as Parameters<SimulatedVenue["submit"]>[0]);
+  }
+
+  ordersSnapshot(): ReturnType<TraderVenue["ordersSnapshot"]> {
+    return this.inner.ordersSnapshot();
+  }
+
+  get fills(): TraderVenue["fills"] {
+    const armed = this.#armed;
+    this.#armed = undefined;
+    armed?.();
+    return this.inner.fills;
+  }
+}
 
 interface Harness {
   readonly loop: CoreLoop;
+  /** The loop's clock (and the venue's, unless a Tier-1 case gives it its own). */
+  readonly clock: ManualClock;
+  /** The REAL venue (behind the double, when one is used). */
   readonly venue: SimulatedVenue;
   readonly evaluations: EvaluationInput[];
   /** Every plan the loop offered the venue, as offered. */
   readonly submitted: unknown[];
+  /** Every answer the loop received, in order. */
+  readonly answers: ExecutionResult[];
 }
 
 /** `createPaperTrader`'s assembly, with the one-shot double's runtime registered. */
-function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harness {
+function assemble(
+  input: {
+    readonly rateLimits?: RateLimitBudget;
+    /** The entry's size; 50 by default (10 slices, one batch). */
+    readonly targetShares?: string;
+    readonly maximumTotalCost?: string;
+    /** Wraps the real venue in a scripted `TraderVenue` (the defensive path). */
+    readonly venueDouble?: (inner: SimulatedVenue) => TraderVenue;
+    /** Replaces the one-shot's resting BUY (the BASKET case). */
+    readonly intent?: (ctx: StrategyContext) => Intent;
+    /** SIM1-R2-1: the one-shot's ONE follow-up intent (a cancel), on the next `onFeatures`. */
+    readonly followUp?: (ctx: StrategyContext) => Intent;
+    /** SIM1-R3-1: what the one-shot emits from its `onFill` / `onOrderUpdate` deliveries. */
+    readonly onDelivery?: DeliveryScript;
+    /** Which outcome sides the VENUE sees a book for (the loop's books are untouched). */
+    readonly venueBookSides?: readonly ("YES" | "NO")[];
+    /**
+     * SIM1-R2-1: rewrites the VENUE's ladders only (the loop's books are
+     * untouched) — e.g. one share per NO ask level, so a NO leg cannot fill.
+     */
+    readonly venueLadder?: (side: "YES" | "NO", ladderSide: "BID" | "ASK", levels: readonly Level[]) => readonly Level[];
+    /**
+     * SIM1-R2-1: the instance's `immediate_order_type` (FAK by default). A
+     * BASKET intent carries no order-type tag, so its legs take this one.
+     */
+    readonly immediateOrderType?: "FAK" | "FOK" | "GTC";
+    /**
+     * SIM1-R2-1: a TIER-1 venue on a DELAYED market (`secondsDelay`, zero
+     * latency) over the same books, optionally on its OWN clock (default: the
+     * loop's). The shipped trader runs Tier 0, which never delays.
+     */
+    readonly tier1?: { readonly secondsDelay: number; readonly venueClock?: ManualClock };
+  } = {},
+): Harness {
   const parsed = parseTraderConfig(traderConfig());
   if (!parsed.ok) throw new Error(`config refused: ${parsed.refusal.detail} ${parsed.refusal.issues.join("; ")}`);
   const config = parsed.config;
@@ -264,7 +559,13 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
   }
   const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
   const created = createStrategyInstanceRuntime({
-    strategy: oneShotStrategy,
+    strategy: oneShotStrategy({
+      targetShares: input.targetShares ?? "50",
+      maximumTotalCost: input.maximumTotalCost ?? "18",
+      ...(input.intent === undefined ? {} : { intent: input.intent }),
+      ...(input.followUp === undefined ? {} : { followUp: input.followUp }),
+      ...(input.onDelivery === undefined ? {} : { onDelivery: input.onDelivery }),
+    }),
     params: {},
     run: { runId: RUN_ID, instanceId: INSTANCE_ID, configId: CONFIG_ID, runSeed: "41" },
     watchdog: { evaluationBudgetUs: 5_000_000 },
@@ -284,7 +585,7 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
     runtime: created.runtime,
     direction: "YES",
     params: {},
-    immediateOrderType: "FAK",
+    immediateOrderType: input.immediateOrderType ?? "FAK",
     submissionUnknownAfterMs: 5_000,
   });
   if (!registered.ok) throw new Error(registered.detail);
@@ -292,23 +593,39 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
   const fees = readFeeScheduleSnapshot(feeSnapshot());
   if (!fees.ok) throw new Error("fees refused");
   const wiring: { loop: CoreLoop | undefined } = { loop: undefined };
-  const venue = new SimulatedVenue({
-    clock,
-    runMode: "PAPER",
-    model: tier0Model({ fillModelVersion: "tier0.trdr4r1", fillModelParametersHash: "d".repeat(64) }),
+  const books: MarketBookProvider = {
+    book(request): BookView | undefined {
+      const market = markets.get(request.marketId);
+      if (market === undefined) return undefined;
+      if (input.venueBookSides !== undefined && !input.venueBookSides.includes(request.side)) return undefined;
+      return {
+        internalMarketId: request.marketId,
+        tokenId: request.side === "YES" ? market.config.yesTokenId : market.config.noTokenId,
+        top() {
+          const top = market.bookFor(request.side).topOfBook();
+          return {
+            ...(top.bestBidPrice === undefined ? {} : { bestBidPrice: top.bestBidPrice }),
+            ...(top.bestBidSize === undefined ? {} : { bestBidSize: top.bestBidSize }),
+            ...(top.bestAskPrice === undefined ? {} : { bestAskPrice: top.bestAskPrice }),
+            ...(top.bestAskSize === undefined ? {} : { bestAskSize: top.bestAskSize }),
+            ...(top.spread === undefined ? {} : { spread: top.spread }),
+          };
+        },
+        ladder(side) {
+          const levels = market.bookFor(request.side).levels(side).map((level) => ({ price: level.price, size: level.size }));
+          return input.venueLadder === undefined ? levels : input.venueLadder(request.side, side, levels);
+        },
+      };
+    },
+  };
+  const common = {
+    runMode: "PAPER" as const,
     feeSnapshot: fees.value,
-    // ONE placement per (hour-long) window: the first slice is booked, the
-    // second is refused on the venue's own budget, and so is the whole plan.
-    rateLimits: tokenBucketRateLimits({
-      orderTokensPerWindow: input.orderTokensPerWindow ?? 1,
-      cancelTokensPerWindow: 10,
-      windowMs: 3_600_000,
-      snapshotVersion: "trdr-4-r1-refused-plan",
-    }),
+    rateLimits: input.rateLimits ?? unmodeledRateLimits("no venue budget is modelled for this case"),
     // `main.ts`'s `createExecutionPolicy` semantics: the loop's recorded
     // time-in-force, and a refusal (throw, contained by the venue) otherwise.
     policy: {
-      timeInForceFor(order) {
+      timeInForceFor(order: { readonly plannedOrderId: string }) {
         const resolved = wiring.loop?.timeInForceFor(order.plannedOrderId);
         if (resolved === undefined) throw new Error(`no time-in-force for ${order.plannedOrderId}`);
         return resolved;
@@ -317,30 +634,41 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
       sameInstantAdditionsFor: () => "NOT_OBSERVED" as const,
     },
     startingCash: "1000",
-    books: {
-      book(request): BookView | undefined {
-        const market = markets.get(request.marketId);
-        if (market === undefined) return undefined;
-        return {
-          internalMarketId: request.marketId,
-          tokenId: request.side === "YES" ? market.config.yesTokenId : market.config.noTokenId,
-          top() {
-            const top = market.bookFor(request.side).topOfBook();
-            return {
-              ...(top.bestBidPrice === undefined ? {} : { bestBidPrice: top.bestBidPrice }),
-              ...(top.bestBidSize === undefined ? {} : { bestBidSize: top.bestBidSize }),
-              ...(top.bestAskPrice === undefined ? {} : { bestAskPrice: top.bestAskPrice }),
-              ...(top.bestAskSize === undefined ? {} : { bestAskSize: top.bestAskSize }),
-              ...(top.spread === undefined ? {} : { spread: top.spread }),
-            };
+  };
+  const tier1 = input.tier1;
+  // The Tier-1 venue, once built: its timeline anchors a book to the event it is at.
+  const built: { venue?: SimulatedVenue } = {};
+  const venue =
+    tier1 === undefined
+      ? new SimulatedVenue({
+          ...common,
+          clock,
+          model: tier0Model({ fillModelVersion: "tier0.trdr4r1", fillModelParametersHash: "d".repeat(64) }),
+          books,
+        })
+      : new SimulatedVenue({
+          ...common,
+          clock: tier1.venueClock ?? clock,
+          model: tier1Model({ fillModelVersion: "tier1.sim1-r2", fillModelParametersHash: "e".repeat(64) }),
+          timeline: {
+            bookAt(request) {
+              const book = books.book(request);
+              const atEvent = built.venue?.atEvent;
+              return book === undefined || atEvent === undefined ? undefined : { book, atEvent };
+            },
           },
-          ladder(side) {
-            return market.bookFor(request.side).levels(side).map((level) => ({ price: level.price, size: level.size }));
-          },
-        };
-      },
-    },
-  });
+          latencyModel: ZERO_LATENCY,
+          streams: deriveStreams("41"),
+          marketParameters: () => ({
+            marketId: MARKET_ID,
+            tickSize: "0.01",
+            minimumOrderSize: "5",
+            secondsDelay: tier1.secondsDelay,
+            parametersVersion: 1,
+          }),
+          queueParameters: QUEUE_PARAMETERS,
+        });
+  built.venue = venue;
   const posting: PostingIdentity = {
     environment: config.environment,
     accountRef: config.accounting.accountRef,
@@ -349,12 +677,13 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
     attributionClearingRef: config.accounting.attributionClearingRef,
     feeExpenseRef: config.accounting.feeExpenseRef,
   };
+  const traderVenue: TraderVenue = input.venueDouble?.(venue) ?? venue;
   const loop = new CoreLoop({
     config,
     riskPolicy: policy.value,
     allocator: new AllocatorGate({ caps: caps.value, markets: allocationMarkets, tokenAssetIds }),
     clock,
-    venue,
+    venue: traderVenue,
     store: new MemoryTraderStore(),
     registry,
     markets,
@@ -370,16 +699,18 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
   });
   wiring.loop = loop;
 
-  const harness: Harness = { loop, venue, evaluations: [], submitted: [] };
+  const harness: Harness = { loop, clock, venue, evaluations: [], submitted: [], answers: [] };
   const evaluate = created.runtime.evaluate.bind(created.runtime);
   vi.spyOn(created.runtime, "evaluate").mockImplementation((input: EvaluationInput) => {
     harness.evaluations.push(input);
     return evaluate(input);
   });
-  const submit = venue.submit.bind(venue);
-  vi.spyOn(venue, "submit").mockImplementation(async (plan) => {
+  const submit = traderVenue.submit.bind(traderVenue);
+  vi.spyOn(traderVenue, "submit").mockImplementation(async (plan: unknown) => {
     harness.submitted.push(plan);
-    return await submit(plan);
+    const answer = await submit(plan);
+    harness.answers.push(answer);
+    return answer;
   });
   return harness;
 }
@@ -446,13 +777,797 @@ function plannedOrderIds(harness: Harness): readonly string[] {
   return plan.groups.flatMap((group) => group.orders.map((order) => order.plannedOrderId));
 }
 
+/** A modelled per-signer order budget of `orderTokensPerWindow` per hour. */
+function orderBudget(orderTokensPerWindow: number): RateLimitBudget {
+  return tokenBucketRateLimits({
+    orderTokensPerWindow,
+    cancelTokensPerWindow: 10,
+    windowMs: 3_600_000,
+    snapshotVersion: "sim-1-refused-plan",
+  });
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("TRDR4-R1 — a refused plan the venue PARTLY executed keeps what its working order reserved", () => {
+describe("SIM-1 R3 — the REAL venue reports what it booked, and the loop OWNS it", () => {
+  it("a 20-slice POSITION plan whose SECOND batch is refused: the 15 booked slices are owned, traced and delivered, the 5 refused are released, and nothing halts", async () => {
+    // 100 shares at 0.2 in 5-share slices = 20 orders = two venue batches
+    // (15 + 5). A 15-token budget admits the first batch and refuses the
+    // second, all-or-nothing.
+    const harness = assemble({ rateLimits: orderBudget(15), targetShares: "100", maximumTotalCost: "25" });
+    await open(harness);
+    const loop = harness.loop;
+    const planned = plannedOrderIds(harness);
+    expect(planned).toHaveLength(20);
+    const bookedIds = planned.slice(0, 15);
+    const refusedIds = planned.slice(15);
+
+    // --- the venue's per-order answer ---------------------------------------
+    expect(harness.answers).toHaveLength(1);
+    const answer = harness.answers[0];
+    if (answer === undefined) throw new Error("no answer was recorded");
+    expect(answer).toMatchObject({ accepted: false, outcome: "PARTIAL", refusalCode: "SIMULATED_VENUE_RATE_LIMITED" });
+    expect(answer.orders.map((order) => order.plannedOrderId)).toEqual(bookedIds);
+    expect(answer.orders.every((order) => order.state === "RESTING")).toBe(true);
+    expect(answer.notPlaced.map((entry) => entry.plannedOrderId)).toEqual(refusedIds);
+    expect(answer.notPlaced.every((entry) => entry.refusalCode === "SIMULATED_VENUE_RATE_LIMITED")).toBe(true);
+    expect(harness.venue.ordersSnapshot().map((order) => order.plannedOrderId).sort()).toEqual([...bookedIds].sort());
+
+    let health = loop.health();
+    expect(health.execution.submissionsRefused).toBe(1);
+    expect(health.execution.submissionsAccepted).toBe(0);
+
+    // --- the REFUSED slices are released, counted --------------------------
+    expect(health.execution.reservationsReleasedOnRefusal).toBe(5);
+    for (const plannedOrderId of refusedIds) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
+
+    // --- the BOOKED slices keep theirs — 15 × 5 × 0.2 = 15 pUSD ---------------
+    for (const plannedOrderId of bookedIds) expect(loop.timeInForceFor(plannedOrderId)).toBe("GTC");
+    expect(health.seams.reservations).toMatchObject({ open: 15, taken: 20, released: 5, reservedCollateral: "15" });
+    expect(health.seams.allocator).toMatchObject({ open: 15, applied: 20, released: 5, reservedCollateral: "15" });
+
+    // --- and are OWNED: owner, trace prefix, provenance ---------------------
+    expect(health.seams.orders.tracked).toBe(15);
+    expect(loop.retainedOrderState()).toMatchObject({ owners: 15, instanceOrderIds: 15, traceLookup: 15 });
+    const plan = harness.submitted[0] as { readonly executionPlanId: string };
+    const provenance = loop.orderProvenance();
+    expect(provenance.map((record) => record.venueOrderId)).toEqual(answer.orders.map((order) => order.simulatedOrderId));
+    expect(new Set(provenance.map((record) => record.executionPlanId))).toEqual(new Set([plan.executionPlanId]));
+    expect(new Set(provenance.map((record) => record.submissionAttemptId)).size).toBe(1);
+    expect(provenance.every((record) => record.intentId === "trdr4r1-resting-buy")).toBe(true);
+
+    // --- a POSITION partial raises NO halt ----------------------------------
+    expect(health.halts).toEqual([]);
+
+    // --- delivered: the strategy sees its orders and can re-plan ------------
+    const before = harness.evaluations.length;
+    await feed(harness, yesBook(5));
+    const later = harness.evaluations.slice(before);
+    const updates = later.flatMap((evaluation) =>
+      evaluation.callback === "onOrderUpdate" ? [evaluation.order] : [],
+    );
+    expect(updates.map((view) => view.orderId).sort()).toEqual([...bookedIds].sort());
+    expect(updates.every((view) => view.status === "OPEN")).toBe(true);
+    for (const evaluation of later) {
+      expect(evaluation.orders.map((view) => view.orderId).sort()).toEqual([...bookedIds].sort());
+    }
+
+    // --- an OBSERVED trade fills them: ATTRIBUTED, released, retired, settled -
+    await feed(
+      harness,
+      envelope(6, "PublicTradeObserved", {
+        internalMarketId: MARKET_ID,
+        tokenId: YES_TOKEN,
+        price: "0.2",
+        size: "75",
+        takerSide: "ASK",
+      }),
+    );
+    expect(harness.venue.ordersSnapshot().every((order) => order.state === "FILLED")).toBe(true);
+    health = loop.health();
+    expect(health.execution.fillsObserved).toBe(15);
+    expect(health.seams.orders).toMatchObject({ tracked: 0, settled: 15, unownedFills: 0, settleMismatches: 0 });
+    expect(health.accounting.unattributedActivity).toBe(0);
+    expect(loop.traces().map((trace) => trace.venueOrderId).sort()).toEqual(
+      answer.orders.map((order) => order.simulatedOrderId).sort(),
+    );
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 20, released: 20, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 20, released: 20, reservedCollateral: "0" });
+    for (const plannedOrderId of bookedIds) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
+    expect(health.halts).toEqual([]);
+  });
+
+  it("a plan of at most 15 orders against a budget SMALLER than it books NOTHING — the batch is admitted all-or-nothing (D-05, ADR-012 §5.6)", async () => {
+    // TRDR-4's partial state (10 slices, ONE token: one slice booked, the plan
+    // refused) — which the venue no longer produces.
+    const harness = assemble({ rateLimits: orderBudget(1) });
+    await open(harness);
+    const loop = harness.loop;
+    const planned = plannedOrderIds(harness);
+    expect(planned).toHaveLength(10);
+    expect(harness.venue.ordersSnapshot()).toEqual([]);
+    expect(harness.answers[0]).toMatchObject({
+      accepted: false,
+      outcome: "REFUSED",
+      orders: [],
+      fills: [],
+      refusalCode: "SIMULATED_VENUE_RATE_LIMITED",
+    });
+    expect(harness.answers[0]?.notPlaced.map((entry) => entry.plannedOrderId)).toEqual(planned);
+    const health = loop.health();
+    expect(health.execution.submissionsRefused).toBe(1);
+    expect(health.execution.reservationsReleasedOnRefusal).toBe(10);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
+    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
+    expect(health.seams.orders.tracked).toBe(0);
+    expect(health.halts).toEqual([]);
+  });
+
+  it("a plan the venue refused OUTRIGHT (it booked nothing) releases every planned order and raises no halt — MEDIUM-4 unchanged", async () => {
+    // NO placement token: the first batch is refused, so nothing is booked.
+    const harness = assemble({ rateLimits: orderBudget(0) });
+    await open(harness);
+    const loop = harness.loop;
+    const planned = plannedOrderIds(harness);
+    expect(planned).toHaveLength(10);
+    expect(harness.venue.ordersSnapshot()).toEqual([]);
+    const health = loop.health();
+    expect(health.execution.submissionsRefused).toBe(1);
+    expect(health.execution.reservationsReleasedOnRefusal).toBe(10);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
+    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
+    expect(health.halts).toEqual([]);
+  });
+});
+
+describe("SIM-1 R3 — a BASKET the venue executed only IN PART halts its markets (nothing consumes failurePolicy yet)", () => {
+  it("the booked YES leg is owned and attributed; the refused NO leg is released; the market halts BASKET_PARTIALLY_EXECUTED", async () => {
+    // A two-leg basket in ONE market — BUY 10 YES (≤ 0.35) and BUY 10 NO
+    // (≤ 0.67), planned as two groups of two 5-share slices — against a venue
+    // that sees NO book for the NO side: the YES leg fills, the NO leg is
+    // refused NO_BOOK. Risk, allocator, planner and venue are real; only the
+    // basket's fee/slippage estimates are supplied (see the `vi.mock` above).
+    const harness = assemble({
+      venueBookSides: ["YES"],
+      intent: (ctx) => ({
+        type: "BASKET",
+        intentId: "sim1-basket",
+        legs: [
+          { marketId: MARKET_ID, direction: "YES", targetShares: "10", maximumBuyPrice: "0.35" },
+          { marketId: MARKET_ID, direction: "NO", targetShares: "10", maximumBuyPrice: "0.67" },
+        ],
+        maximumCombinedCost: "11",
+        minimumLockedEdge: "1",
+        legRiskLimit: "7",
+        failurePolicy: "HOLD_FILLED_LEGS",
+        validUntil: new Date(Date.parse(ctx.now()) + 3_600_000).toISOString(),
+      }),
+    });
+    await open(harness);
+    const loop = harness.loop;
+    const plan = harness.submitted[0] as { readonly planKind: string; readonly executionPlanId: string };
+    expect(plan.planKind).toBe("BASKET");
+    const planned = plannedOrderIds(harness);
+    expect(planned).toHaveLength(4);
+
+    const answer = harness.answers[0];
+    if (answer === undefined) throw new Error("no answer was recorded");
+    expect(answer).toMatchObject({ accepted: false, outcome: "PARTIAL", refusalCode: "SIMULATED_VENUE_NO_BOOK" });
+    expect(answer.orders.map((order) => `${order.side} ${order.state} ${order.filledShares}/${order.requestedShares}`)).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+    ]);
+    expect(answer.notPlaced.map((entry) => entry.refusalCode)).toEqual([
+      "SIMULATED_VENUE_NO_BOOK",
+      "SIMULATED_VENUE_NO_BOOK",
+    ]);
+
+    const health = loop.health();
+    // The booked leg is OWNED — its fills are attributed, never UNATTRIBUTED.
+    expect(health.seams.orders).toMatchObject({ tracked: 2, unownedFills: 0 });
+    expect(health.accounting.unattributedActivity).toBe(0);
+    expect(loop.orderProvenance().map((record) => record.venueOrderId)).toEqual(
+      answer.orders.map((order) => order.simulatedOrderId),
+    );
+    expect(loop.traces().map((trace) => trace.venueOrderId)).toEqual(
+      answer.orders.map((order) => order.simulatedOrderId),
+    );
+    // The refused leg is released at the refusal; the booked (FILLED) leg at
+    // the harvest that saw it terminal.
+    expect(health.execution.reservationsReleasedOnRefusal).toBe(2);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 4, released: 4, reservedCollateral: "0" });
+
+    // …and the market HALTS, naming the basket, what was booked and what was not.
+    expect(health.halts).toHaveLength(1);
+    const halt = health.halts[0];
+    expect(halt?.scope).toEqual({ kind: "MARKET", marketId: MARKET_ID });
+    expect(halt?.code).toBe("BASKET_PARTIALLY_EXECUTED");
+    expect(halt?.action).toBe("MANAGE_KNOWN_POSITIONS_ONLY");
+    expect(halt?.detail).toContain(`basket plan ${plan.executionPlanId} (failurePolicy HOLD_FILLED_LEGS)`);
+    expect(halt?.detail).toContain("booked 2 of its 4 planned orders");
+    expect(halt?.detail).toContain("(SIMULATED_VENUE_NO_BOOK)");
+  });
+});
+
+/**
+ * The R3 basket, as the SIM1-R2-1 cases submit it: BUY 10 YES (≤ 0.35) and
+ * BUY 10 NO (≤ 0.67) in ONE market, planned as two groups of two 5-share
+ * slices. A basket intent carries no order-type tag, so its slices take the
+ * instance's `immediate_order_type`.
+ */
+function twoLegBasket(ctx: StrategyContext): Intent {
+  return {
+    type: "BASKET",
+    intentId: "sim1-r2-basket",
+    legs: [
+      { marketId: MARKET_ID, direction: "YES", targetShares: "10", maximumBuyPrice: "0.35" },
+      { marketId: MARKET_ID, direction: "NO", targetShares: "10", maximumBuyPrice: "0.67" },
+    ],
+    maximumCombinedCost: "11",
+    minimumLockedEdge: "1",
+    legRiskLimit: "7",
+    failurePolicy: "HOLD_FILLED_LEGS",
+    validUntil: new Date(Date.parse(ctx.now()) + 3_600_000).toISOString(),
+  };
+}
+
+/** One share per ask level, at the VENUE only, for the named sides: a 5-share slice there cannot fill whole. */
+function oneShareAsks(sides: readonly ("YES" | "NO")[]) {
+  return (side: "YES" | "NO", ladderSide: "BID" | "ASK", levels: readonly Level[]): readonly Level[] =>
+    sides.includes(side) && ladderSide === "ASK" ? levels.map((level) => ({ price: level.price, size: "1" })) : levels;
+}
+
+function legs(orders: readonly SimulatedOrder[]): readonly string[] {
+  return orders.map((order) => `${order.side} ${order.state} ${order.filledShares}/${order.requestedShares}`);
+}
+
+function basketHalts(harness: Harness): ReturnType<CoreLoop["health"]>["halts"] {
+  return harness.loop.health().halts.filter((record) => record.code === "BASKET_PARTIALLY_EXECUTED");
+}
+
+/** The basket's recorded 5 s delay window, from the submission at recorded monotonic 0. */
+const MATCHABLE_NS = 5_000_000_000n;
+
+describe("SIM1-R2-1 — a BASKET is judged from EACH ORDER'S outcome, not from the venue's `accepted`", () => {
+  it("the verifier's reproduction: an ACCEPTED FOK basket — YES FILLED, NO REJECTED 0/5 — halts BASKET_PARTIALLY_EXECUTED at submission; its legs stay owned and are released at terminal", async () => {
+    const harness = assemble({ immediateOrderType: "FOK", venueLadder: oneShareAsks(["NO"]), intent: twoLegBasket });
+    await open(harness);
+    const loop = harness.loop;
+    const plan = harness.submitted[0] as { readonly planKind: string; readonly executionPlanId: string };
+    expect(plan.planKind).toBe("BASKET");
+    const planned = plannedOrderIds(harness);
+    expect(planned).toHaveLength(4);
+
+    // The venue PLACED every order — `accepted` is true — and two of them
+    // executed nothing (O2: a FOK that cannot fill whole is REJECTED 0/n).
+    const answer = harness.answers[0];
+    if (answer === undefined) throw new Error("no answer was recorded");
+    expect(answer).toMatchObject({ accepted: true, outcome: "ACCEPTED", notPlaced: [] });
+    expect(answer.refusalCode).toBeUndefined();
+    expect(legs(answer.orders)).toEqual(["YES FILLED 5/5", "YES FILLED 5/5", "NO REJECTED 0/5", "NO REJECTED 0/5"]);
+
+    const health = loop.health();
+    // The market HALTS, naming the basket and each leg's outcome.
+    const halts = basketHalts(harness);
+    expect(health.halts).toHaveLength(1);
+    expect(halts).toHaveLength(1);
+    const halt = halts[0];
+    expect(halt?.scope).toEqual({ kind: "MARKET", marketId: MARKET_ID });
+    expect(halt?.action).toBe("MANAGE_KNOWN_POSITIONS_ONLY");
+    expect(halt?.detail).toContain(`basket plan ${plan.executionPlanId} (failurePolicy HOLD_FILLED_LEGS)`);
+    expect(halt?.detail).toContain("booked 4 of its 4 planned orders");
+    expect(halt?.detail).toContain("2 booked order(s) ended short of their size");
+    for (const order of answer.orders) {
+      expect(halt?.detail).toContain(
+        `${order.simulatedOrderId} (planned ${order.plannedOrderId}) ${order.state} ${order.filledShares}/5`,
+      );
+    }
+
+    // Every leg is OWNED — the YES fills are attributed, never UNATTRIBUTED.
+    expect(health.execution.submissionsAccepted).toBe(1);
+    expect(health.seams.orders).toMatchObject({ unownedFills: 0 });
+    expect(health.execution.fillsObserved).toBe(2);
+    expect(health.accounting.unattributedActivity).toBe(0);
+    expect(loop.orderProvenance().map((record) => record.venueOrderId)).toEqual(
+      answer.orders.map((order) => order.simulatedOrderId),
+    );
+    expect(loop.traces().map((trace) => trace.venueOrderId)).toEqual(
+      answer.orders.filter((order) => order.side === "YES").map((order) => order.simulatedOrderId),
+    );
+    // Nothing was refused, so nothing was released AT the answer; every leg
+    // is terminal, so all four came back at the harvest that saw it terminal.
+    expect(health.execution.reservationsReleasedOnRefusal).toBe(0);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 4, released: 4, reservedCollateral: "0" });
+    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
+
+    // The halt was raised AT the answer — before the harvest delivered
+    // anything — so the strategy was never handed the half-built basket.
+    expect(harness.evaluations.filter((evaluation) => evaluation.callback === "onFill")).toEqual([]);
+    expect(harness.evaluations.filter((evaluation) => evaluation.callback === "onOrderUpdate")).toEqual([]);
+    expect(health.loop.deliveriesSuppressedByHalt).toBeGreaterThan(0);
+    // The watch ended with the halt; nothing about the basket is retained.
+    expect(loop.retainedOrderState().basketWatches).toBe(0);
+
+    const before = harness.evaluations.length;
+    await feed(harness, yesBook(5));
+    expect(harness.evaluations.slice(before)).toEqual([]);
+  });
+
+  it("a FAK basket whose NO slices are CANCELLED short (1 of 5 filled each) halts the same way (O1: a FAK remainder is CANCELLED)", async () => {
+    const harness = assemble({ immediateOrderType: "FAK", venueLadder: oneShareAsks(["NO"]), intent: twoLegBasket });
+    await open(harness);
+    const answer = harness.answers[0];
+    if (answer === undefined) throw new Error("no answer was recorded");
+    expect(answer).toMatchObject({ accepted: true, outcome: "ACCEPTED", notPlaced: [] });
+    expect(legs(answer.orders)).toEqual(["YES FILLED 5/5", "YES FILLED 5/5", "NO CANCELLED 1/5", "NO CANCELLED 1/5"]);
+    const halts = basketHalts(harness);
+    expect(halts).toHaveLength(1);
+    expect(halts[0]?.detail).toContain("2 booked order(s) ended short of their size");
+    expect(halts[0]?.detail).toContain("CANCELLED 1/5");
+    const health = harness.loop.health();
+    expect(health.seams.orders).toMatchObject({ unownedFills: 0 });
+    expect(health.execution.fillsObserved).toBe(4);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+    expect(harness.loop.retainedOrderState().basketWatches).toBe(0);
+  });
+
+  it("a DELAYED basket (Tier 1, 5 s delayed market): no halt inside the window; at matchableAtNs its NO slices resolve REJECTED while YES fills, and the market halts BEFORE the strategy is evaluated at that event", async () => {
+    const harness = assemble({
+      immediateOrderType: "FOK",
+      venueLadder: oneShareAsks(["NO"]),
+      intent: twoLegBasket,
+      tier1: { secondsDelay: 5 },
+    });
+    await open(harness);
+    const loop = harness.loop;
+    const planned = plannedOrderIds(harness);
+    const answer = harness.answers[0];
+    if (answer === undefined) throw new Error("no answer was recorded");
+    expect(answer).toMatchObject({ accepted: true, outcome: "ACCEPTED", notPlaced: [] });
+    expect(legs(answer.orders)).toEqual(["YES DELAYED 0/5", "YES DELAYED 0/5", "NO DELAYED 0/5", "NO DELAYED 0/5"]);
+
+    // Inside the window every leg can still execute: WATCHED, not halted,
+    // and every entry is still held (ADR-006 §9).
+    expect(loop.health().halts).toEqual([]);
+    expect(loop.retainedOrderState().basketWatches).toBe(1);
+    expect(loop.health().seams.reservations).toMatchObject({ open: 4, taken: 4, released: 0 });
+    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBe("FOK");
+    await feed(harness, yesBook(5));
+    expect(loop.health().halts).toEqual([]);
+    expect(loop.retainedOrderState().basketWatches).toBe(1);
+
+    // The recorded clock reaches matchableAtNs; the next event's observe()
+    // applies each leg's disposition.
+    harness.clock.positionAt(new Date(T_START_MS + 6 * STEP_MS).toISOString(), MATCHABLE_NS);
+    const before = harness.evaluations.length;
+    await feed(harness, yesBook(6));
+    expect(legs(harness.venue.ordersSnapshot())).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO REJECTED 0/5",
+      "NO REJECTED 0/5",
+    ]);
+    const halts = basketHalts(harness);
+    expect(halts).toHaveLength(1);
+    expect(halts[0]?.scope).toEqual({ kind: "MARKET", marketId: MARKET_ID });
+    expect(halts[0]?.detail).toContain("REJECTED 0/5");
+    // Judged right after observe(): the event's own evaluation, the fill
+    // deliveries and the order views were all withheld from the strategy.
+    expect(harness.evaluations.slice(before)).toEqual([]);
+    const health = loop.health();
+    expect(health.seams.orders).toMatchObject({ unownedFills: 0 });
+    expect(health.execution.fillsObserved).toBe(2);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 4, released: 4, reservedCollateral: "0" });
+    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
+    expect(loop.retainedOrderState().basketWatches).toBe(0);
+  });
+
+  it("the same DELAYED basket reached first by a TRADE (the venue's clock lags the loop's): judged right after observeTrade(), before the trade event's evaluation", async () => {
+    const venueClock = new ManualClock(T_OPEN);
+    const harness = assemble({
+      immediateOrderType: "FOK",
+      venueLadder: oneShareAsks(["NO"]),
+      intent: twoLegBasket,
+      tier1: { secondsDelay: 5, venueClock },
+    });
+    await open(harness);
+    expect(legs(harness.venue.ordersSnapshot())).toEqual([
+      "YES DELAYED 0/5",
+      "YES DELAYED 0/5",
+      "NO DELAYED 0/5",
+      "NO DELAYED 0/5",
+    ]);
+    harness.clock.positionAt(new Date(T_START_MS + 5 * STEP_MS).toISOString(), MATCHABLE_NS);
+    // observe() at the VENUE's clock (0): still pending, nothing said.
+    await feed(harness, yesBook(5));
+    expect(harness.venue.ordersSnapshot().every((order) => order.state === "DELAYED")).toBe(true);
+    expect(harness.loop.health().halts).toEqual([]);
+
+    const before = harness.evaluations.length;
+    await feed(
+      harness,
+      envelope(6, "PublicTradeObserved", {
+        internalMarketId: MARKET_ID,
+        tokenId: YES_TOKEN,
+        price: "0.32",
+        size: "5",
+        takerSide: "ASK",
+      }),
+    );
+    expect(legs(harness.venue.ordersSnapshot())).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO REJECTED 0/5",
+      "NO REJECTED 0/5",
+    ]);
+    expect(basketHalts(harness)).toHaveLength(1);
+    expect(harness.evaluations.slice(before)).toEqual([]);
+    expect(harness.loop.health().seams.reservations).toMatchObject({ open: 0, released: 4, reservedCollateral: "0" });
+    expect(harness.loop.retainedOrderState().basketWatches).toBe(0);
+  });
+
+  it("a GTC basket whose NO slices REST partly filled is WATCHED, not halted; the strategy's own market cancel leaves them CANCELLED 1/5 beside a FILLED YES leg, and the market halts at THAT event (at the cancel's answer since r3), before its harvest's deliveries", async () => {
+    const harness = assemble({
+      immediateOrderType: "GTC",
+      venueLadder: oneShareAsks(["NO"]),
+      intent: twoLegBasket,
+      followUp: () => ({ type: "CANCEL", marketId: MARKET_ID, reason: "sim1-r2: cancel the basket's working legs" }),
+    });
+    await open(harness);
+    const loop = harness.loop;
+    const answer = harness.answers[0];
+    if (answer === undefined) throw new Error("no answer was recorded");
+    expect(answer).toMatchObject({ accepted: true, outcome: "ACCEPTED", notPlaced: [] });
+    // O3: a MARKETABLE_LIMIT GTC remainder RESTS — the NO slices can still fill.
+    expect(legs(answer.orders)).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO PARTIALLY_FILLED 1/5",
+      "NO PARTIALLY_FILLED 1/5",
+    ]);
+    expect(loop.health().halts).toEqual([]);
+    expect(loop.retainedOrderState().basketWatches).toBe(1);
+
+    // Event 5: the strategy cancels its market's working orders — the NO slices.
+    const before = harness.evaluations.length;
+    await feed(harness, yesBook(5));
+    expect(legs(harness.venue.ordersSnapshot())).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO CANCELLED 1/5",
+      "NO CANCELLED 1/5",
+    ]);
+    const halts = basketHalts(harness);
+    expect(halts).toHaveLength(1);
+    expect(halts[0]?.at).toBe(new Date(T_START_MS + 5 * STEP_MS).toISOString());
+    expect(halts[0]?.detail).toContain("2 booked order(s) ended short of their size");
+    // Judged at the cancel's answer (r3, `SIM1-R3-1`; r2 judged it in the
+    // harvest), so BEFORE the harvest's deliveries: the only evaluation of
+    // event 5 is the one that cancelled; the CANCELLED views were withheld.
+    expect(harness.evaluations.slice(before).map((evaluation) => evaluation.callback)).toEqual(["onFeatures"]);
+    const health = loop.health();
+    expect(health.execution.cancelsConfirmed).toBe(1);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+    expect(health.seams.orders).toMatchObject({ unownedFills: 0 });
+    expect(loop.retainedOrderState().basketWatches).toBe(0);
+  });
+
+  it("the controls: a basket whose every leg FILLED, and one that executed NOTHING (every leg REJECTED 0/5), raise no halt; both are released, delivered and retired, and no watch remains", async () => {
+    for (const control of [
+      { cap: [] as ("YES" | "NO")[], expected: ["YES FILLED 5/5", "YES FILLED 5/5", "NO FILLED 5/5", "NO FILLED 5/5"], fills: 4 },
+      {
+        cap: ["YES", "NO"] as ("YES" | "NO")[],
+        expected: ["YES REJECTED 0/5", "YES REJECTED 0/5", "NO REJECTED 0/5", "NO REJECTED 0/5"],
+        fills: 0,
+      },
+    ]) {
+      const harness = assemble({ immediateOrderType: "FOK", venueLadder: oneShareAsks(control.cap), intent: twoLegBasket });
+      await open(harness);
+      const answer = harness.answers[0];
+      if (answer === undefined) throw new Error("no answer was recorded");
+      expect(answer).toMatchObject({ accepted: true, outcome: "ACCEPTED", notPlaced: [] });
+      expect(legs(answer.orders)).toEqual(control.expected);
+      const health = harness.loop.health();
+      expect(health.halts).toEqual([]);
+      expect(health.execution.fillsObserved).toBe(control.fills);
+      expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+      expect(health.seams.allocator).toMatchObject({ open: 0, applied: 4, released: 4, reservedCollateral: "0" });
+      expect(harness.loop.retainedOrderState()).toMatchObject({ basketWatches: 0, owners: 0 });
+      expect(health.seams.orders).toMatchObject({ tracked: 0, settled: 4, unownedFills: 0 });
+      const delivered = harness.evaluations.flatMap((evaluation) =>
+        evaluation.callback === "onOrderUpdate" ? [evaluation.order.orderId] : [],
+      );
+      expect([...delivered].sort()).toEqual(answer.orders.map((order) => order.simulatedOrderId).sort());
+    }
+  });
+});
+
+/**
+ * SIM1-R3-1's follow-on: an AGGRESSIVE 5-share YES BUY (≤ 0.35) that the
+ * venue's full YES book fills whole at once — the "another order" a strategy
+ * must not be able to execute once its basket has gone short.
+ */
+function followOnBuy(ctx: StrategyContext): Intent {
+  return {
+    type: "POSITION",
+    intentId: "sim1-r3-follow-on-buy",
+    marketId: MARKET_ID,
+    direction: "YES",
+    targetMode: "DELTA",
+    targetShares: "5",
+    maximumBuyPrice: "0.35",
+    maximumTotalCost: "2",
+    urgency: "IMMEDIATE",
+    liquidityPreference: "TAKER_OK",
+    partialFillPolicy: "ACCEPT_ANY",
+    validUntil: new Date(Date.parse(ctx.now()) + 3_600_000).toISOString(),
+    expectedNetEdge: "5",
+    tags: ["sim1r3.follow-on", "sb.order-type:FAK"],
+  };
+}
+
+const MARKET_CANCEL: Intent = { type: "CANCEL", marketId: MARKET_ID, reason: "sim1-r3: cancel the basket's working legs" };
+
+function planKinds(harness: Harness): readonly string[] {
+  return harness.submitted.map((plan) => (plan as { readonly planKind: string }).planKind);
+}
+
+function callbacks(harness: Harness, from = 0): readonly string[] {
+  return harness.evaluations.slice(from).map((evaluation) => evaluation.callback);
+}
+
+/** Event 4's instant: the basket is submitted, and its fills harvested and delivered, at it. */
+const T_EVENT_4 = new Date(T_START_MS + 4 * STEP_MS).toISOString();
+
+describe("SIM1-R3-1 — a basket a DELIVERY callback leaves short halts at the venue's answer, before any other intent or callback executes", () => {
+  it("onFill: the first fill delivery cancels the basket's working NO legs (CANCELLED 1/5 beside FILLED YES); the halt is raised at the cancel's answer, and the second onFill — which would BUY — is never delivered", async () => {
+    const harness = assemble({
+      immediateOrderType: "GTC",
+      venueLadder: oneShareAsks(["NO"]),
+      intent: twoLegBasket,
+      onDelivery: (callback, delivery, ctx) =>
+        callback !== "onFill" ? [] : delivery === 1 ? [MARKET_CANCEL] : delivery === 2 ? [followOnBuy(ctx)] : [],
+    });
+    await open(harness);
+    const loop = harness.loop;
+    const answer = harness.answers[0];
+    if (answer === undefined) throw new Error("no answer was recorded");
+    // O3: the NO slices RESTED partly filled at the answer — the basket was WORKING.
+    expect(legs(answer.orders)).toEqual(["YES FILLED 5/5", "YES FILLED 5/5", "NO PARTIALLY_FILLED 1/5", "NO PARTIALLY_FILLED 1/5"]);
+
+    // The cancel was submitted and nothing after it: no POSITION reached the venue.
+    expect(planKinds(harness)).toEqual(["BASKET", "CANCEL"]);
+    expect(legs(harness.venue.ordersSnapshot())).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO CANCELLED 1/5",
+      "NO CANCELLED 1/5",
+    ]);
+    const halts = basketHalts(harness);
+    expect(loop.health().halts).toHaveLength(1);
+    expect(halts).toHaveLength(1);
+    expect(halts[0]?.scope).toEqual({ kind: "MARKET", marketId: MARKET_ID });
+    expect(halts[0]?.at).toBe(T_EVENT_4);
+    expect(halts[0]?.detail).toContain("2 booked order(s) ended short of their size");
+    expect(halts[0]?.detail).toContain("CANCELLED 1/5");
+    // The ONE onFill that cancelled was the last evaluation: the three other
+    // fill deliveries and every order view of this harvest were suppressed.
+    expect(callbacks(harness)).toEqual(["onFeatures", "onFill"]);
+    const health = loop.health();
+    expect(health.execution.cancelsConfirmed).toBe(1);
+    expect(health.loop.deliveriesSuppressedByHalt).toBeGreaterThanOrEqual(3);
+    expect(health.seams.orders).toMatchObject({ unownedFills: 0 });
+    expect(loop.retainedOrderState().basketWatches).toBe(0);
+    // Every leg is terminal, so every entry came back — the halt stops
+    // decisions, not the capital path (ADR-006 §9: none before terminal).
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 4, released: 4, reservedCollateral: "0" });
+
+    // The next event is not evaluated either.
+    const before = harness.evaluations.length;
+    await feed(harness, yesBook(5));
+    expect(harness.evaluations.slice(before)).toEqual([]);
+    expect(planKinds(harness)).toEqual(["BASKET", "CANCEL"]);
+  });
+
+  it("onOrderUpdate: the first order view's evaluation cancels the NO legs; the halt is raised at the cancel's answer, and the next view — which would BUY — is never delivered", async () => {
+    const harness = assemble({
+      immediateOrderType: "GTC",
+      venueLadder: oneShareAsks(["NO"]),
+      intent: twoLegBasket,
+      onDelivery: (callback, delivery, ctx) =>
+        callback !== "onOrderUpdate" ? [] : delivery === 1 ? [MARKET_CANCEL] : delivery === 2 ? [followOnBuy(ctx)] : [],
+    });
+    await open(harness);
+    const loop = harness.loop;
+    expect(planKinds(harness)).toEqual(["BASKET", "CANCEL"]);
+    expect(legs(harness.venue.ordersSnapshot())).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO CANCELLED 1/5",
+      "NO CANCELLED 1/5",
+    ]);
+    const halts = basketHalts(harness);
+    expect(loop.health().halts).toHaveLength(1);
+    expect(halts).toHaveLength(1);
+    expect(halts[0]?.at).toBe(T_EVENT_4);
+    expect(halts[0]?.detail).toContain("CANCELLED 1/5");
+    // Four fill deliveries (held), then ONE order view — the one that cancelled.
+    expect(callbacks(harness)).toEqual(["onFeatures", "onFill", "onFill", "onFill", "onFill", "onOrderUpdate"]);
+    expect(loop.health().execution.cancelsConfirmed).toBe(1);
+    expect(loop.retainedOrderState().basketWatches).toBe(0);
+
+    // The NO legs' views in this harvest's boundary predate the cancel; their
+    // entries come back at the next harvest that SEES them terminal, still
+    // with no evaluation.
+    const before = harness.evaluations.length;
+    await feed(harness, yesBook(5));
+    expect(harness.evaluations.slice(before)).toEqual([]);
+    expect(planKinds(harness)).toEqual(["BASKET", "CANCEL"]);
+    expect(loop.health().seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+    expect(loop.health().seams.allocator).toMatchObject({ open: 0, applied: 4, released: 4, reservedCollateral: "0" });
+  });
+
+  it("ONE decision [CANCEL, POSITION]: the cancel leaves the basket short and halts at its answer, so the decision's next intent is refused at the risk seam (RISK_RUN_STATE_BLOCKS) and never reaches the venue", async () => {
+    const harness = assemble({
+      immediateOrderType: "GTC",
+      venueLadder: oneShareAsks(["NO"]),
+      intent: twoLegBasket,
+      onDelivery: (callback, delivery, ctx) =>
+        callback === "onFill" && delivery === 1 ? [MARKET_CANCEL, followOnBuy(ctx)] : [],
+    });
+    await open(harness);
+    const loop = harness.loop;
+    expect(planKinds(harness)).toEqual(["BASKET", "CANCEL"]);
+    expect(legs(harness.venue.ordersSnapshot())).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO CANCELLED 1/5",
+      "NO CANCELLED 1/5",
+    ]);
+    expect(basketHalts(harness)).toHaveLength(1);
+    expect(basketHalts(harness)[0]?.at).toBe(T_EVENT_4);
+    const health = loop.health();
+    expect(health.risk.refusalsByCode["RISK_RUN_STATE_BLOCKS"]).toBe(1);
+    expect(health.execution.cancelsConfirmed).toBe(1);
+    expect(callbacks(harness)).toEqual(["onFeatures", "onFill"]);
+    expect(loop.retainedOrderState().basketWatches).toBe(0);
+  });
+
+  it("a PARTIAL cancel answer (orderIds: a working NO leg and a FILLED YES leg — one cancelled, one 'already FILLED', accepted: false) is judged too: the halt is raised at that answer and the next onFill — which would BUY — is never delivered", async () => {
+    // The basket's answer, read by the strategy double through the harness
+    // (it is recorded before the harvest delivers anything).
+    const wired: { harness?: Harness } = {};
+    const harness = assemble({
+      immediateOrderType: "GTC",
+      venueLadder: oneShareAsks(["NO"]),
+      intent: twoLegBasket,
+      onDelivery: (callback, delivery, ctx) => {
+        if (callback !== "onFill") return [];
+        if (delivery === 1) {
+          const booked = wired.harness?.answers[0]?.orders ?? [];
+          const yes = booked.find((order) => order.side === "YES");
+          const no = booked.find((order) => order.side === "NO");
+          if (yes === undefined || no === undefined) throw new Error("the basket's answer was not recorded");
+          return [
+            {
+              type: "CANCEL",
+              marketId: MARKET_ID,
+              orderIds: [no.simulatedOrderId, yes.simulatedOrderId],
+              reason: "sim1-r3: cancel one NO leg, and a YES leg that already FILLED",
+            },
+          ];
+        }
+        return delivery === 2 ? [followOnBuy(ctx)] : [];
+      },
+    });
+    wired.harness = harness;
+    await open(harness);
+    const loop = harness.loop;
+    expect(planKinds(harness)).toEqual(["BASKET", "CANCEL"]);
+    const cancelAnswer = harness.answers[1];
+    if (cancelAnswer === undefined) throw new Error("no cancel answer was recorded");
+    expect(cancelAnswer).toMatchObject({ accepted: false, outcome: "PARTIAL", refusalCode: "SIMULATED_VENUE_CANCEL_INCOMPLETE" });
+    expect(cancelAnswer.notCancelled.map((entry) => entry.reason)).toEqual(["already FILLED"]);
+    // One NO leg CANCELLED short, the other still working — beside FILLED YES.
+    expect(legs(harness.venue.ordersSnapshot())).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO CANCELLED 1/5",
+      "NO PARTIALLY_FILLED 1/5",
+    ]);
+    const halts = basketHalts(harness);
+    expect(loop.health().halts).toHaveLength(1);
+    expect(halts).toHaveLength(1);
+    expect(halts[0]?.at).toBe(T_EVENT_4);
+    expect(halts[0]?.detail).toContain("1 booked order(s) ended short of their size");
+    expect(callbacks(harness)).toEqual(["onFeatures", "onFill"]);
+    const health = loop.health();
+    expect(health.execution.cancelsRejected).toBe(1);
+    expect(loop.retainedOrderState().basketWatches).toBe(0);
+    // The working NO leg keeps its entries while it can still fill (ADR-006 §9).
+    expect(health.seams.reservations).toMatchObject({ open: 1, taken: 4, released: 3 });
+  });
+
+  it("the harvest's BACKSTOP: a venue whose order state moves BETWEEN the loop's calls (scripted double — a venue-side cancel of the NO legs, first seen by the harvest) halts before that harvest's deliveries", async () => {
+    const doubled: { venue?: MovesBetweenCallsVenue } = {};
+    const harness = assemble({
+      immediateOrderType: "GTC",
+      venueLadder: oneShareAsks(["NO"]),
+      intent: twoLegBasket,
+      venueDouble: (inner) => {
+        const venue = new MovesBetweenCallsVenue(inner);
+        doubled.venue = venue;
+        return venue;
+      },
+    });
+    await open(harness);
+    expect(legs(harness.venue.ordersSnapshot())).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO PARTIALLY_FILLED 1/5",
+      "NO PARTIALLY_FILLED 1/5",
+    ]);
+    expect(harness.loop.health().halts).toEqual([]);
+    expect(harness.loop.retainedOrderState().basketWatches).toBe(1);
+
+    const noLegs = harness.venue
+      .ordersSnapshot()
+      .filter((order) => order.side === "NO")
+      .map((order) => order.simulatedOrderId);
+    doubled.venue?.arm(() => {
+      void harness.venue.cancel({
+        executionPlanId: "sim1-r3-venue-side",
+        reason: "sim1-r3: a venue-side cancel the loop did not ask for",
+        scope: { orderIds: noLegs },
+        priority: "SAFETY_CANCEL",
+      });
+    });
+    const before = harness.evaluations.length;
+    await feed(harness, yesBook(5));
+    expect(legs(harness.venue.ordersSnapshot())).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO CANCELLED 1/5",
+      "NO CANCELLED 1/5",
+    ]);
+    const halts = basketHalts(harness);
+    expect(halts).toHaveLength(1);
+    expect(halts[0]?.at).toBe(new Date(T_START_MS + 5 * STEP_MS).toISOString());
+    // Event 5's own evaluation ran before the venue moved; the harvest then
+    // judged the basket before delivering the CANCELLED views.
+    expect(callbacks(harness, before)).toEqual(["onFeatures"]);
+    expect(planKinds(harness)).toEqual(["BASKET"]);
+    expect(harness.loop.retainedOrderState().basketWatches).toBe(0);
+    expect(harness.loop.health().seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+  });
+
+  it("the control: a COMPLETE basket (every leg FILLED, nothing watched) — the same callback cancel then BUY raises no halt, and the BUY is placed: the judgement after an answer halts only a basket that went short", async () => {
+    const harness = assemble({
+      immediateOrderType: "GTC",
+      intent: twoLegBasket,
+      onDelivery: (callback, delivery, ctx) =>
+        callback !== "onFill" ? [] : delivery === 1 ? [MARKET_CANCEL] : delivery === 2 ? [followOnBuy(ctx)] : [],
+    });
+    await open(harness);
+    expect(legs(harness.answers[0]?.orders ?? [])).toEqual(["YES FILLED 5/5", "YES FILLED 5/5", "NO FILLED 5/5", "NO FILLED 5/5"]);
+    expect(planKinds(harness)).toEqual(["BASKET", "CANCEL", "POSITION"]);
+    expect(harness.loop.health().halts).toEqual([]);
+    expect(legs(harness.venue.ordersSnapshot()).slice(4)).toEqual(["YES FILLED 5/5"]);
+    expect(harness.loop.retainedOrderState().basketWatches).toBe(0);
+  });
+});
+
+describe("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOLDING part of it (scripted double)", () => {
   it("the RESTING first slice keeps its reservation, allocator commitment and time-in-force until it is terminal; the market halts for reconciliation", async () => {
-    const harness = assemble();
+    const harness = assemble({ venueDouble: (inner) => new RefusesWhileHoldingVenue(inner) });
     await open(harness);
     const loop = harness.loop;
 
@@ -539,21 +1654,4 @@ describe("TRDR4-R1 — a refused plan the venue PARTLY executed keeps what its w
     }
   });
 
-  it("a plan the venue refused OUTRIGHT (it booked nothing) releases every planned order and raises no halt — MEDIUM-4 unchanged", async () => {
-    // NO placement token: the FIRST slice is refused, so nothing is booked.
-    const harness = assemble({ orderTokensPerWindow: 0 });
-    await open(harness);
-    const loop = harness.loop;
-    const planned = plannedOrderIds(harness);
-    expect(planned).toHaveLength(10);
-    expect(harness.venue.ordersSnapshot()).toEqual([]);
-    const health = loop.health();
-    expect(health.execution.submissionsRefused).toBe(1);
-    expect(health.execution.reservationsReleasedOnRefusal).toBe(10);
-    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
-    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
-    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
-    expect(health.halts).toEqual([]);
-  });
 });
-

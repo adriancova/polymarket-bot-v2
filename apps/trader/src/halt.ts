@@ -80,6 +80,22 @@ export type HaltReasonCode =
   | "LEDGER_POSTING_REFUSED"
   /** §6 invariant 6: a cancel never reached a terminal fact within its bound. */
   | "CANCEL_UNRESOLVED"
+  /**
+   * §7.7 / SIM-1 ruling R3: the venue executed a BASKET plan only in part, and
+   * nothing in this process consumes the basket's `failurePolicy` yet. The
+   * booked legs are owned and known; what to do with them is the decision.
+   * Judged from each booked order's own outcome, an ACCEPTED plan included
+   * (SIM-1 r2, `SIM1-R2-1`; `basket-execution.ts`).
+   */
+  | "BASKET_PARTIALLY_EXECUTED"
+  /**
+   * SIM-1 r1 (`SIM1-R1-1`): the execution venue refused to be positioned at a
+   * recorded event, or could not APPLY what recorded time settled (a DELAYED
+   * order's disposition, `SIMULATED_VENUE_DISPOSITION_NOT_APPLIED`). Its
+   * account no longer answers for what the venue model says happened, so the
+   * account state is unknown — §9.9's `RECONCILE_ACCOUNT` rung.
+   */
+  | "VENUE_OBSERVATION_FAILED"
   /** The strategy runtime could not persist a decision or its checkpoint. */
   | "RUNTIME_PERSISTENCE_FAILED"
   /** An event arrived that the trader cannot read as a §7.1 envelope. */
@@ -130,6 +146,8 @@ const ACTION_FOR: Readonly<Record<HaltReasonCode, HaltRecord["action"]>> = Objec
   UNEXPLAINED_ACTUAL_MOVEMENT: "RECONCILE_ACCOUNT",
   LEDGER_POSTING_REFUSED: "FULL_HALT",
   CANCEL_UNRESOLVED: "MANAGE_KNOWN_POSITIONS_ONLY",
+  BASKET_PARTIALLY_EXECUTED: "MANAGE_KNOWN_POSITIONS_ONLY",
+  VENUE_OBSERVATION_FAILED: "RECONCILE_ACCOUNT",
   RUNTIME_PERSISTENCE_FAILED: "FULL_HALT",
   EVENT_UNREADABLE: "FULL_HALT",
   BOOK_DESYNCHRONIZED: "CANCEL_RESTING_ORDERS",

@@ -136,6 +136,7 @@ export type {
   ExecutionVenue,
   FillFactView,
   MarketEventSource,
+  NotPlacedOrder,
   PartialFillHandlingView,
   PlacementPlanView,
   PlanPriority,
