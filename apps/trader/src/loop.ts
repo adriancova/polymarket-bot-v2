@@ -336,6 +336,26 @@ export class CoreLoop {
     return Object.freeze([...this.#traces]);
   }
 
+  /**
+   * Every order's §6 invariant 4 trace PREFIX — event, feature snapshot,
+   * decision, intent, approved intent, plan, submission attempt and venue order
+   * — as recorded at SUBMISSION, in submission order, whether the order later
+   * filled or not.
+   *
+   * Published because {@link traces} holds a chain only once a FILL completes
+   * it, so an order that rested and was withdrawn unfilled appears there not at
+   * all; this is the record that names such an order's origin by id
+   * (`RECON-2`). Read-only: each entry is a fresh frozen copy in a fresh frozen
+   * list, so nothing a caller does to the answer reaches the loop.
+   */
+  orderProvenance(): readonly Readonly<
+    Omit<TraceLink, "venueFillId" | "ledgerFillId" | "ledgerTransactionIds">
+  >[] {
+    return Object.freeze(
+      [...this.#orderTraces.values()].map((prefix) => Object.freeze({ ...prefix })),
+    );
+  }
+
   /** Every persisted decision, in evaluation order. */
   decisions(): readonly DecisionTrace[] {
     return Object.freeze([...this.#decisions]);

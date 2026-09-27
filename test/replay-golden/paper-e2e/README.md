@@ -2,8 +2,9 @@
 
 Consumed by `test/e2e/determinism-golden.test.ts`, and read as a document by
 `test/e2e/traceability-chain.test.ts`,
-`test/e2e/traceability-chain-negative.test.ts` and
-`test/e2e/projection-reconciliation.test.ts`.
+`test/e2e/traceability-chain-negative.test.ts`,
+`test/e2e/projection-reconciliation.test.ts` and
+`test/e2e/reconciliation-attribution.test.ts`.
 
 `paper-e2e-run.json` is the canonical byte form of ONE deterministic paper run
 of the merged core — `apps/trader`'s composition root driving the real books,
@@ -16,8 +17,9 @@ None. §12.4's replay gate is `test/replay-golden/order-book/` (`WP-090`) and
 `test/replay-golden/simulation/` (`WP-210`), run by `pnpm test:replay`, and
 `WP-250` does not touch it. This golden is a THIRD artefact of the same kind,
 over a different subject — the paper-core end-to-end surface `WP-230` and
-`WP-240` assembled — and it is compared by `WP-250`'s own suite. Wiring a root
-`pnpm test:e2e` script is a protected-path edit and is orchestrator-owned.
+`WP-240` assembled — and it is compared by `WP-250`'s own suite, which the root
+`pnpm test:e2e` script runs (orchestrator-wired in `da37a0c`; the root
+`package.json` is a protected path).
 
 ## What the bytes contain
 
@@ -27,7 +29,8 @@ over a different subject — the paper-core end-to-end surface `WP-230` and
 | `events` | the eight recorded §7.1 events, by id and ingest sequence |
 | `decisions` | every PERSISTED `DecisionRecord`, as it reached the durable-store port |
 | `checkpointInstants` | one per persisted decision, at the evaluation's own instant |
-| `traces` | the §6 invariant 4 chains the run produced |
+| `traces` | the §6 invariant 4 chains the run produced — one per FILL, so an order that never filled is on none |
+| `orderProvenance` | every order's §6 invariant 4 trace PREFIX as the loop recorded it at SUBMISSION (`CoreLoop.orderProvenance()`), filled or not, in submission order — golden format 2 (`RECON-2`) |
 | `orders` / `fills` | what the simulated venue booked and produced |
 | `ledgerTransactions` | the append-only postings, entry by entry |
 | `pnlRecords` / `pnlSnapshots` | the §9.16 stream and the rows written to the store |
@@ -99,7 +102,10 @@ the fixture depends on no rounding policy to fire.
 **The fills.** §12.2's Tier-0 immediate model consumes the observed depth and
 emits ONE FILL PER CONSUMED LEVEL, so the 50-share entry produces two fills,
 `30 @ 0.34` and `20 @ 0.35`, and therefore TWO complete §6 invariant 4 chains
-from one decision.
+from one decision. The protective reduction at the exit cutoff sells all 50
+against the resting bid in one fill, `50 @ 0.32` — the THIRD chain. The
+take-profit rested and never filled, so it is on no chain; its origin is its
+`orderProvenance` record, which names the `exit` decision at `evaluationSeq 2`.
 
 **The fees.** The schedule is taker `0.0195`, maker `0`, HALF_UP at 3 decimal
 places, minimum `0`. The formula is `shares × rate × price × (1 − price)`:
@@ -108,25 +114,50 @@ places, minimum `0`. The formula is `shares × rate × price × (1 − price)`:
 | --- | --- | --- | --- |
 | `30 @ 0.34` | `30 × 0.0195 × 0.34 × 0.66 = 0.131274` | `0.131` | DOWN |
 | `20 @ 0.35` | `20 × 0.0195 × 0.35 × 0.65 = 0.088725` | `0.089` | UP |
+| `50 @ 0.32` (exit) | `50 × 0.0195 × 0.32 × 0.68 = 0.21216` | `0.212` | DOWN |
 
-The two round in OPPOSITE directions on purpose: a rounding rule observed only
-downward is a rule half observed. Totals: exact `0.219999`, charged `0.22`.
+The two entry fills round in OPPOSITE directions on purpose: a rounding rule
+observed only downward is a rule half observed. Entry totals: exact `0.219999`,
+charged `0.22`. With the exit: exact `0.432159`, charged `0.432`.
 
-**The ledger.** Principal `10.2 + 7 = 17.2`, fees `0.22`, so the instance's
-collateral line is `−17.42` and its outcome-token line is `50`. Six
-transactions — principal, token receipt and fee, once per fill.
+**The ledger.** Entry principal `10.2 + 7 = 17.2`, exit proceeds
+`50 × 0.32 = 16`, fees `0.432`, so the instance's collateral line is
+`16 − 17.2 − 0.432 = −1.632`. The position is flat, and the projection carries
+NO outcome-token line for a zero balance. Nine transactions — principal, token
+movement and fee, once per fill.
 
-**The PnL.** At the final snapshot: `capitalCommitted = 17.2`,
-`feesPaid = 0.22`, `unrealizedPnlMidpoint = 0.3`, so
-`grossTradingPnl = 0 + 0.3 = 0.3` and `coreNetPnl = 0.3 − 0.22 = 0.08`.
+**The PnL.** Three snapshots, one per fill. After the entry's two fills (the
+second snapshot): `capitalCommitted = 17.2`, `feesPaid = 0.22`,
+`unrealizedPnlMidpoint = 0.3`, so `grossTradingPnl = 0 + 0.3 = 0.3`,
+`coreNetPnl = 0.3 − 0.22 = 0.08` and
 `worstCaseResolutionPnl = realizedPnl − Σ open cost basis = 0 − 17.2 = −17.2`.
+After the exit (the final snapshot): the whole average-cost basis `17.2` leaves
+with the 50 shares, so `realizedPnl = 16 − 17.2 = −1.2`,
+`capitalCommitted = 0`, `unrealizedPnlMidpoint = 0`, `feesPaid = 0.432`,
+`grossTradingPnl = −1.2`, `coreNetPnl = −1.2 − 0.432 = −1.632` and
+`worstCaseResolutionPnl = −1.2 − 0 = −1.2`.
 
-**The projection with no realized value.** The entry intent carries
+**The round trip against its projection.** The entry intent carries
 `expectedNetEdge = 0.5 × 50 − 17.2 − (0.001 + 0.001) × 50 = 25 − 17.2 − 0.1 =
-7.7`. It is never realized: the take-profit exit is a §7.7 `POSITION` intent,
-`packages/risk` types the disposition from the intent TYPE alone, and the
-refusal (`RISK_EDGE_INPUTS_MISSING`) is counted in `risk.refusedExits`. That is
-the accepted `WP-220` residual, observed and not worked around.
+7.7`. The realized round trip is `16 − 17.2 − 0.432 = −1.632`, and the
+difference `−9.332` is named in full on `exit.expected_net_edge`:
+`EXIT_BELOW_TAKE_PROFIT` `16 − 0.5 × 50 = −9` (the protective reduction sold at
+`0.32`, not the take-profit `0.5`), `FEE_MODEL_BASIS`
+`−(0.432159 − (0.001 × 50 + 0.001 × 50)) = −0.332159` and
+`FEE_ROUNDING_HALF_UP` `−(0.432 − 0.432159) = +0.000159`. The position is
+closed at run end, so `POSITION_OPEN_AT_RUN_END` (`RECON-2`, present only when
+shares are still open) does not appear. (Before `RISK-2` this paragraph was
+"the projection with no realized value": the exit was refused at the risk seam
+as the accepted `WP-220` residual. That residual is fixed and
+`risk.refusedExits` is `0`.)
+
+**The projection with no realized value.** The take-profit, `30 @ 0.5`, rested
+and was withdrawn unfilled (§6 invariant 13's cancel-before-replace, because
+the confirmed allocation grew after it had been sized). `exit.cancelled_proceeds.…d000:g0:o0`
+projects `0.5 × 30 = 15`, and its realized value is an ABSENCE, not a zero
+(`RESTING_EXIT_CANCELLED_UNFILLED`). The row names what was withdrawn — the
+take-profit the `exit` decision at `evaluationSeq 2` placed — from the order's
+provenance record, because no trace names an order that never filled.
 
 ## Regenerating
 

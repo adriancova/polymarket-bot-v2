@@ -36,9 +36,46 @@ import {
 } from "@polymarket-bot/trader";
 
 import { assemble, driveScenario } from "./support/harness.js";
+import { COMPUTED_SPECIFIER, moduleSpecifiersIn } from "./support/module-specifiers.js";
 import { paperEnvironment } from "./support/scenario.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The module specifiers this package's files may name. Relative specifiers
+ * (`./`, `../`) are this package's own files and are always permitted.
+ */
+const PERMITTED_MODULES: ReadonlySet<string> = new Set([
+  "node:fs",
+  "node:path",
+  "node:url",
+  "vitest",
+  "@polymarket-bot/decimal",
+  "@polymarket-bot/domain",
+  // `RECON-1` r1: `reconciliation-attribution.test.ts` folds synthetic fills
+  // through the REAL PnL engine to establish the value the reconciler must
+  // agree with. A layer-1 accounting package — no I/O, signer, order path or
+  // network surface — already aliased by this suite's runner and tsconfig.
+  // `support/reconcile.ts` itself must never import it.
+  "@polymarket-bot/pnl",
+  "@polymarket-bot/simulation",
+  "@polymarket-bot/trader",
+  "@polymarket-bot/trader/testing",
+  // `RECON-1` r2, `RECON-2`: `support/module-specifiers.ts` reads imports from
+  // a PARSED source, as `test/contract/coinbase/isolation.test.ts` does. The
+  // compiler (a root devDependency) is used only to parse text — no network,
+  // signer or order path — and a line regex let a trailing comment hide an
+  // import.
+  "typescript",
+  "vitest/config",
+]);
+
+/** The specifiers in `names` that are neither relative nor permitted. */
+function notPermitted(names: readonly string[]): readonly string[] {
+  return names.filter(
+    (name) => !name.startsWith("./") && !name.startsWith("../") && !PERMITTED_MODULES.has(name),
+  );
+}
 
 /** Every file this package owns: its own tree plus the golden it commits. */
 const OWNED_TREES = [here, resolve(here, "../replay-golden/paper-e2e")] as const;
@@ -180,61 +217,84 @@ describe("this package's own files carry no credential and no signer", () => {
   it("no signing library, wallet library or secure-SDK entry point is imported", () => {
     // MODULE SPECIFIERS, not prose. A scan for the bare word `ethers` would
     // match this test's own list and the sentence explaining it, which is how a
-    // scanner passes by finding itself. Only what an `import`/`require`
-    // actually resolves is checked, and the permitted set is enumerated: a NEW
-    // dependency in this tree fails here even if it is not on any deny list.
-    const permitted = new Set([
-      "node:fs",
-      "node:path",
-      "node:url",
-      "vitest",
-      "@polymarket-bot/decimal",
-      "@polymarket-bot/domain",
-      // `RECON-1` r1: `reconciliation-attribution.test.ts` folds synthetic fills
-      // through the REAL PnL engine to establish the value the reconciler must
-      // agree with. A layer-1 accounting package — no I/O, signer, order path
-      // or network surface — already aliased by this suite's runner and
-      // tsconfig. `support/reconcile.ts` itself must never import it.
-      "@polymarket-bot/pnl",
-      "@polymarket-bot/simulation",
-      "@polymarket-bot/trader",
-      "@polymarket-bot/trader/testing",
-      // `RECON-1` r2: `reconciliation-attribution.test.ts` reads
-      // `support/reconcile.ts`'s imports from its PARSED source, as
-      // `test/contract/coinbase/isolation.test.ts` does. The compiler (a root
-      // devDependency) is used only to parse text — no network, signer or order
-      // path — and a line regex let a trailing comment hide an import.
-      "typescript",
-      "vitest/config",
-    ]);
-    // Anchored at END OF LINE, and the specifier may not contain a newline: a
-    // loose `from\s*["']` also matches the word "from" in a sentence that runs
-    // into a quoted string on a later line, which is how the first version of
-    // this scan flagged a doc comment.
-    const patterns = [
-      /\bfrom\s*["']([^"'\n]+)["']\s*;?\s*$/u,
-      /^\s*import\s+["']([^"'\n]+)["']\s*;?\s*$/u,
-      /\b(?:require|import)\s*\(\s*["']([^"'\n]+)["']\s*\)/u,
-    ];
+    // scanner passes by finding itself. Only what an import actually names is
+    // checked — read from each file's PARSED syntax tree by the helper
+    // `reconciliation-attribution.test.ts`'s independence pin also uses
+    // (`RECON-2`, closing `RECON1-SCAN`) — and the permitted set is enumerated:
+    // a NEW dependency in this tree fails here even if it is not on any deny
+    // list.
     const hits: string[] = [];
     let found = 0;
     for (const path of ownedFiles()) {
       if (!path.endsWith(".ts")) continue;
-      const text = readFileSync(path, "utf8");
-      for (const line of text.split("\n")) {
-        for (const pattern of patterns) {
-          const name = pattern.exec(line)?.[1];
-          if (name === undefined) continue;
-          found += 1;
-          if (name.startsWith("./") || name.startsWith("../")) continue;
-          if (!permitted.has(name)) hits.push(`${path}: ${name}`);
-        }
-      }
+      const names = moduleSpecifiersIn(readFileSync(path, "utf8"), path);
+      found += names.length;
+      hits.push(...notPermitted(names).map((name) => `${path}: ${name}`));
     }
     expect(hits).toEqual([]);
-    // A regex that matched nothing would pass the assertion above while proving
+    // A scan that found nothing would pass the assertion above while proving
     // nothing at all.
     expect(found).toBeGreaterThanOrEqual(20);
+  });
+
+  /**
+   * `RECON1-SCAN`. The scan above used to match LINES, anchored at end of line,
+   * so a trailing comment hid an import: the `RECON-1` r2 review planted the
+   * first shape below in an e2e file and this suite passed. Every shape the
+   * grammar allows is now a node the parse reports, wherever it sits, and a
+   * MENTION — in a comment, in string data — is inert.
+   */
+  it("the scan reads the parse: every import shape is caught, and a mention is not an import", () => {
+    const plants = [
+      `import { strict as reviewAssert } from "node:assert"; // review plant`,
+      `import "node:assert";`,
+      `import type { AssertionError } from "node:assert";`,
+      `export { strict } from "node:assert";`,
+      `export * from "node:assert";`,
+      `import assertion = require("node:assert");`,
+      `const assertion = await import("node:assert");`,
+      `type Assertion = typeof import("node:assert");`,
+      `const assertion = require("node:assert");`,
+    ];
+    for (const plant of plants) {
+      expect(notPermitted(moduleSpecifiersIn(`${plant}\n`)), plant).toEqual(["node:assert"]);
+    }
+    // A specifier the parse cannot read is a violation, not a pass.
+    expect(
+      notPermitted(moduleSpecifiersIn(`const where = "node:assert";\nawait import(where);\n`)),
+    ).toEqual([COMPUTED_SPECIFIER]);
+    expect(
+      notPermitted(moduleSpecifiersIn(`const assertion = require("node:" + "assert");\n`)),
+    ).toEqual([COMPUTED_SPECIFIER]);
+    // Comments, strings and prose that runs "from" into a quoted word name
+    // nothing.
+    const mentions = [
+      `// import { strict } from "node:assert";`,
+      `/* const assertion = require("node:assert"); */`,
+      `const note = 'import "node:assert"';`,
+      "const prose = `read from \"node:assert\" at run time`;",
+      `/**\n * The helper is imported from\n * "node:assert" in prose only.\n */`,
+    ];
+    for (const mention of mentions) {
+      expect(moduleSpecifiersIn(`${mention}\n`), mention).toEqual([]);
+    }
+    // …and a permitted specifier is not reported, trailing comment or not.
+    expect(
+      notPermitted(moduleSpecifiersIn(`import { readFileSync } from "node:fs"; // permitted\n`)),
+    ).toEqual([]);
+  });
+
+  it("both of this tree's import scans run on the ONE shared parse helper", () => {
+    // The allowlist scan here and the oracle-independence pin in
+    // `reconciliation-attribution.test.ts` import the same module, read from
+    // their own parsed sources, so the two cannot drift back into two readers.
+    for (const file of ["safety-posture.test.ts", "reconciliation-attribution.test.ts"]) {
+      const names = moduleSpecifiersIn(readFileSync(join(here, file), "utf8"), file);
+      expect(names, file).toContain("./support/module-specifiers.js");
+      // …and neither parses on its own: the compiler is imported by the
+      // helper alone.
+      expect(names, file).not.toContain("typescript");
+    }
   });
 
   it("no file reads host entropy or a wall clock", () => {

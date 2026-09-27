@@ -549,7 +549,7 @@
       "tokenId": "9001"
     }
   ],
-  "goldenFormatVersion": 1,
+  "goldenFormatVersion": 2,
   "health": {
     "accounting": {
       "ledgerRefusals": 0,
@@ -1169,6 +1169,41 @@
       "source": "internal"
     }
   ],
+  "orderProvenance": [
+    {
+      "approvedIntentId": "9280f970-9280-7000-8000-000000001000",
+      "evaluationSeq": 1,
+      "executionPlanId": "9280f970-9280-7000-8000-000000002000",
+      "featureSnapshotRef": "5cbfa9ddf504761d2e0cb0030bef4ace0e02505b6a7ae7e1763e292a41ee5079",
+      "intentId": "sb-entry-0-018f5c20-1000-7a10-8b00-000000000001",
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000005",
+      "submissionAttemptId": "9280f970-9280-7000-8000-000000003000",
+      "venueOrderId": "9280f970-9280-7000-8000-000000002000:g0:o0"
+    },
+    {
+      "approvedIntentId": "9280f970-9280-7000-8000-00000000c000",
+      "evaluationSeq": 2,
+      "executionPlanId": "9280f970-9280-7000-8000-00000000d000",
+      "featureSnapshotRef": "5cbfa9ddf504761d2e0cb0030bef4ace0e02505b6a7ae7e1763e292a41ee5079",
+      "intentId": "sb-take-profit-1-018f5c20-1000-7a10-8b00-000000000001",
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": "",
+      "submissionAttemptId": "9280f970-9280-7000-8000-00000000e000",
+      "venueOrderId": "9280f970-9280-7000-8000-00000000d000:g0:o0"
+    },
+    {
+      "approvedIntentId": "9280f970-9280-7000-8000-000000012000",
+      "evaluationSeq": 9,
+      "executionPlanId": "9280f970-9280-7000-8000-000000013000",
+      "featureSnapshotRef": "d41741be3c424fcef584a99af1fab1285410bd25c5b845ee331590cae3adcb33",
+      "intentId": "sb-protected-reduce-2-018f5c20-1000-7a10-8b00-000000000001",
+      "runId": "018f5c20-3000-7a30-8b00-000000000003",
+      "sourceEventId": "018f5c20-9000-7a90-8b00-000000000007",
+      "submissionAttemptId": "9280f970-9280-7000-8000-000000014000",
+      "venueOrderId": "9280f970-9280-7000-8000-000000013000:g0:o0"
+    }
+  ],
   "orders": [
     {
       "action": "BUY",
@@ -1638,7 +1673,7 @@
       "explained": true,
       "id": "pnl.capital_committed",
       "projected": "0",
-      "projectedSource": "the FIFO cost basis of the entry fills not yet retired by an exit fill — Σ price × shares over the unretired remainder, which is the whole entry notional while the bracket is open and exactly zero once it has closed",
+      "projectedSource": "the AVERAGE-COST basis packages/pnl holds for the still-open position, restated from its specification: each entry fill adds price × shares, each exit fill removes basis × q / Q (34 significant digits, ROUND_HALF_EVEN; the remainder by exact subtraction), folded in atEventIngestSeq order — the whole entry notional while the bracket is open and exactly zero once it has closed",
       "quantity": "capital committed to the STILL-OPEN position",
       "realized": "0",
       "realizedSource": "the last persisted PnL snapshot's capitalCommitted",
@@ -1695,7 +1730,7 @@
       "explained": true,
       "id": "pnl.worst_case_resolution",
       "projected": "-1.2",
-      "projectedSource": "realizedPnl − Σ OPEN cost basis, the formula packages/pnl states, with the cost basis folded FIFO from the venue's fills (zero once the bracket has closed)",
+      "projectedSource": "realizedPnl − Σ OPEN cost basis, the formula packages/pnl states, with the cost basis folded from the venue's fills by packages/pnl's own average-cost method (zero once the bracket has closed)",
       "quantity": "the documented worst-case-resolution identity",
       "realized": "-1.2",
       "realizedSource": "the last persisted PnL snapshot's worstCaseResolutionPnl",
@@ -1736,7 +1771,7 @@
         {
           "amount": "0",
           "mechanism": "RESTING_EXIT_CANCELLED_UNFILLED",
-          "note": "order 9280f970-9280-7000-8000-00000000d000:g0:o0 rested 30 shares at 0.5 and was withdrawn with 0 filled; the run confirmed 1 cancel(s)"
+          "note": "order 9280f970-9280-7000-8000-00000000d000:g0:o0 — the take-profit the `exit` decision at evaluationSeq 2 placed (intent sb-take-profit-1-018f5c20-1000-7a10-8b00-000000000001), by its provenance record — rested 30 shares at 0.5 and was withdrawn with 0 filled; the run confirmed 1 cancel(s)"
         }
       ],
       "difference": null,

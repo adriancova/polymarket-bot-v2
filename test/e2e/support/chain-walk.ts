@@ -23,6 +23,19 @@
  *   `traceability-chain-negative.test.ts` mutates one id per hop and asserts
  *   that THAT hop, by name, is the one that breaks.
  *
+ * ## Order provenance (`RECON-2`)
+ *
+ * A trace exists only once a FILL completes a chain, so an order withdrawn
+ * unfilled is on no chain. The document's `orderProvenance` section holds, for
+ * EVERY order the loop placed, the prefix the loop recorded at SUBMISSION —
+ * event, feature snapshot, decision, intent, approved intent, plan, submission
+ * attempt, order. The walk treats each record as a node with the same closure
+ * as a chain: every record must RESOLVE (its decision, intent, feature
+ * snapshot and event, and the booked order under the plan it names), none may
+ * be an ORPHAN (a record for an order the venue never booked), no booked order
+ * may be WITHOUT one, and every trace must AGREE with its order's record,
+ * field for field. Each is a document-level finding with a stable code.
+ *
  * The hop vocabulary is §6 invariant 4's own, read in production order and then
  * continued past the invariant's end to the two artefacts the packet asks for:
  * the ledger posting and the PnL that follows from it.
@@ -80,6 +93,18 @@ export interface WalkableDocument {
     readonly ledgerFillId: string;
     readonly ledgerTransactionIds: readonly string[];
   }[];
+  /** Every order's submission-time trace prefix (`RECON-2`, golden format 2). */
+  readonly orderProvenance: readonly {
+    readonly sourceEventId: string;
+    readonly featureSnapshotRef: string;
+    readonly runId: string;
+    readonly evaluationSeq: number;
+    readonly intentId: string;
+    readonly approvedIntentId: string;
+    readonly executionPlanId: string;
+    readonly submissionAttemptId: string;
+    readonly venueOrderId: string;
+  }[];
   readonly orders: readonly {
     readonly simulatedOrderId: string;
     readonly executionPlanId: string;
@@ -125,6 +150,19 @@ export interface WalkReport {
 }
 
 const CONTENT_ADDRESS = /^[0-9a-f]{64}$/u;
+
+/** The fields an order's provenance record and each of its chains share. */
+const PROVENANCE_FIELDS = [
+  "sourceEventId",
+  "featureSnapshotRef",
+  "runId",
+  "evaluationSeq",
+  "intentId",
+  "approvedIntentId",
+  "executionPlanId",
+  "submissionAttemptId",
+  "venueOrderId",
+] as const;
 
 function hop(name: Hop, ok: boolean, detail: string): HopResult {
   return { hop: name, ok, detail };
@@ -464,6 +502,128 @@ export function walkChains(document: WalkableDocument): WalkReport {
       `DANGLING_PNL_REF: ${danglingRecords.join(", ")} are §9.16 record references with no ` +
         "ledger transaction behind them",
     );
+  }
+
+  // --- order provenance: every record a resolved node, nothing orphaned -----
+
+  // TOTAL here too: a format-1 document has no section at all, and that is a
+  // finding — every booked order then also reports ORDER_WITHOUT_PROVENANCE.
+  const section: unknown = document.orderProvenance;
+  const provenance: WalkableDocument["orderProvenance"] = Array.isArray(section)
+    ? document.orderProvenance
+    : [];
+  if (!Array.isArray(section)) {
+    findings.push(
+      "PROVENANCE_SECTION_MISSING: the document has no orderProvenance section (golden format " +
+        "2 added it), so no order's origin can be resolved by id",
+    );
+  }
+  const provenanceIds = provenance.map((record) => record.venueOrderId);
+  const repeatedProvenance = duplicates(provenanceIds);
+  if (repeatedProvenance.length > 0) {
+    findings.push(
+      `PROVENANCE_ORDER_NOT_UNIQUE: ${repeatedProvenance.join(", ")} carry more than one ` +
+        "provenance record; the loop records one per order, at submission",
+    );
+  }
+  const provenanceByOrder = new Map(provenance.map((record) => [record.venueOrderId, record]));
+
+  for (const record of provenance) {
+    const order = ordersById.get(record.venueOrderId);
+    if (order === undefined) {
+      findings.push(
+        `ORPHAN_PROVENANCE: ${record.venueOrderId} has a provenance record but the venue never ` +
+          "booked it, so no order accounts for the record",
+      );
+    }
+    const problems: string[] = [];
+    const key = `${record.runId}|${String(record.evaluationSeq)}`;
+    const decision = decisionsByKey.get(key);
+    if (decision === undefined) {
+      problems.push(`no persisted decision has key (runId, evaluationSeq) = ${key}`);
+    } else {
+      // The loop records `""` for an evaluation it ORIGINATED (`onFill`,
+      // `onOrderUpdate`), whose persisted decision states no source event.
+      const eventOk =
+        decision.sourceEventId === null
+          ? record.sourceEventId === ""
+          : record.sourceEventId === decision.sourceEventId && eventIds.has(record.sourceEventId);
+      if (!eventOk) {
+        problems.push(
+          `the record names source event ${JSON.stringify(record.sourceEventId)}, the persisted ` +
+            `decision ${decision.sourceEventId ?? "none"}` +
+            (decision.sourceEventId !== null && !eventIds.has(decision.sourceEventId)
+              ? ", which is not in the recorded event list"
+              : ""),
+        );
+      }
+      if (
+        !CONTENT_ADDRESS.test(record.featureSnapshotRef) ||
+        record.featureSnapshotRef !== decision.featureSnapshotRef
+      ) {
+        problems.push(
+          `the record names feature snapshot ${record.featureSnapshotRef}, the persisted ` +
+            `decision ${decision.featureSnapshotRef}`,
+        );
+      }
+      const emitted = decision.intents
+        .map((intent) => intent.intentId)
+        .filter((id): id is string => typeof id === "string");
+      if (!emitted.includes(record.intentId)) {
+        problems.push(
+          `intent ${record.intentId} is not among the persisted decision's intents ` +
+            `(${emitted.join(", ") || "none"})`,
+        );
+      }
+    }
+    // All three non-empty (`RECON2-R2`: the plan id too — the chain's own plan
+    // hop refuses an empty one, and an unfilled order's record is on no chain)
+    // and pairwise distinct.
+    if (
+      record.approvedIntentId === "" ||
+      record.executionPlanId === "" ||
+      record.approvedIntentId === record.executionPlanId ||
+      record.submissionAttemptId === "" ||
+      record.submissionAttemptId === record.executionPlanId ||
+      record.submissionAttemptId === record.approvedIntentId
+    ) {
+      problems.push(
+        "the approved-intent, plan and submission-attempt ids are not three distinct, non-empty " +
+          "identities",
+      );
+    }
+    if (order !== undefined && order.executionPlanId !== record.executionPlanId) {
+      problems.push(
+        `the record names plan ${record.executionPlanId}, the booked order plan ` +
+          order.executionPlanId,
+      );
+    }
+    if (problems.length > 0) {
+      findings.push(`PROVENANCE_UNRESOLVED: ${record.venueOrderId}: ${problems.join("; ")}`);
+    }
+  }
+
+  const unprovenanced = document.orders
+    .map((order) => order.simulatedOrderId)
+    .filter((id) => !provenanceByOrder.has(id));
+  if (unprovenanced.length > 0) {
+    findings.push(
+      `ORDER_WITHOUT_PROVENANCE: ${unprovenanced.join(", ")} were booked by the venue but carry ` +
+        "no provenance record, so nothing names the intent that placed them",
+    );
+  }
+
+  for (const trace of document.traces) {
+    const record = provenanceByOrder.get(trace.venueOrderId);
+    if (record === undefined) continue; // the chain's own "order" hop, or ORDER_WITHOUT_PROVENANCE
+    const differing = PROVENANCE_FIELDS.filter((field) => trace[field] !== record[field]);
+    if (differing.length > 0) {
+      findings.push(
+        `PROVENANCE_TRACE_MISMATCH: the chain of fill ${trace.venueFillId} disagrees with order ` +
+          `${trace.venueOrderId}'s provenance record on ${differing.join(", ")}; the loop builds ` +
+          "the chain FROM that record",
+      );
+    }
   }
 
   for (const decision of document.decisions) {

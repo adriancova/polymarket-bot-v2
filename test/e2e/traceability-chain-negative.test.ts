@@ -11,7 +11,8 @@
  *
  * The document-level integrity checks (orphans, duplicates, dangling
  * references, non-PAPER bookings) get the same treatment at the bottom of the
- * file: each is provoked by a mutation and matched by its finding code.
+ * file: each is provoked by a mutation and matched by its finding code. The
+ * `orderProvenance` section (`RECON-2`) is last, asserted by EXACT finding set.
  */
 
 import { describe, expect, it } from "vitest";
@@ -305,6 +306,7 @@ describe("the document-level integrity checks are falsifiable too", () => {
       "events",
       "decisions",
       "traces",
+      "orderProvenance",
       "orders",
       "fills",
       "ledgerTransactions",
@@ -317,5 +319,215 @@ describe("the document-level integrity checks are falsifiable too", () => {
       // crashed", and only one of those says where to look.
       expect(() => walkChains(asDocument(document))).not.toThrow();
     }
+    // `RECON-2`: a format-1 document has no provenance section at all.
+    const formatOne = mutableGolden();
+    delete formatOne["orderProvenance"];
+    expect(() => walkChains(asDocument(formatOne))).not.toThrow();
+  });
+});
+
+/** The provenance record of the order the venue booked with `state`. */
+function recordOfOrderIn(document: Record<string, unknown>, state: string): Record<string, unknown> {
+  const orders = document["orders"] as Record<string, unknown>[];
+  const order = orders.find((candidate) => candidate["state"] === state);
+  if (order === undefined) throw new Error(`the golden has no ${state} order`);
+  const records = document["orderProvenance"] as Record<string, unknown>[];
+  const record = records.find(
+    (candidate) => candidate["venueOrderId"] === order["simulatedOrderId"],
+  );
+  if (record === undefined) throw new Error(`the ${state} order has no provenance record`);
+  return record;
+}
+
+/** The withdrawn take-profit's record: the one node that NO chain shares. */
+function takeProfitRecord(document: Record<string, unknown>): Record<string, unknown> {
+  return recordOfOrderIn(document, "CANCELLED");
+}
+
+/** The entry's record, which the entry's two chains complete. */
+function entryRecord(document: Record<string, unknown>): Record<string, unknown> {
+  const records = document["orderProvenance"] as Record<string, unknown>[];
+  const record = records.find((candidate) => String(candidate["intentId"]).startsWith("sb-entry-"));
+  if (record === undefined) throw new Error("the golden has no entry provenance record");
+  return record;
+}
+
+/**
+ * `RECON2-R2`: blanks the withdrawn take-profit's plan id on its booked order
+ * AND on its record, so the two still agree and only the identity rule can see
+ * it. The chain's own plan hop refuses an empty plan, but this order is on no
+ * chain. Returns the order's id.
+ */
+function emptyTakeProfitPlan(document: Record<string, unknown>): string {
+  const record = takeProfitRecord(document);
+  const orders = document["orders"] as Record<string, unknown>[];
+  const order = orders.find(
+    (candidate) => candidate["simulatedOrderId"] === record["venueOrderId"],
+  );
+  if (order === undefined) throw new Error("the take-profit's record names no booked order");
+  order["executionPlanId"] = "";
+  record["executionPlanId"] = "";
+  return String(record["venueOrderId"]);
+}
+
+interface ProvenanceMutation {
+  readonly what: string;
+  readonly mutate: (document: Record<string, unknown>) => void;
+  /** The EXACT set of finding codes the mutation must produce, sorted. */
+  readonly codes: readonly string[];
+}
+
+/**
+ * `RECON-2`: the `orderProvenance` section, walked as NODES of the closed-world
+ * graph. Each record must resolve, none may be an orphan, no booked order may be
+ * without one, and a chain must agree with its order's record.
+ *
+ * Asserted EXACTLY — the full set of finding codes, and no broken hop — so a
+ * mutation cannot pass by tripping some other check. Most mutations aim at the
+ * withdrawn take-profit's record because no chain shares it: a change there is
+ * visible ONLY to the provenance walk, which a trace-only walk could never see.
+ */
+const PROVENANCE_MUTATIONS: readonly ProvenanceMutation[] = [
+  {
+    what: "the withdrawn take-profit — on no chain — loses its record",
+    codes: ["ORDER_WITHOUT_PROVENANCE"],
+    mutate: (document) => {
+      const doomed = takeProfitRecord(document);
+      const records = document["orderProvenance"] as Record<string, unknown>[];
+      document["orderProvenance"] = records.filter((record) => record !== doomed);
+    },
+  },
+  {
+    what: "a record names an order the venue never booked",
+    codes: ["ORPHAN_PROVENANCE"],
+    mutate: (document) => {
+      const records = document["orderProvenance"] as Record<string, unknown>[];
+      records.push({ ...takeProfitRecord(document), venueOrderId: "no-such-order:g0:o0" });
+    },
+  },
+  {
+    what: "one order carries two records",
+    codes: ["PROVENANCE_ORDER_NOT_UNIQUE"],
+    mutate: (document) => {
+      const records = document["orderProvenance"] as Record<string, unknown>[];
+      records.push({ ...takeProfitRecord(document) });
+    },
+  },
+  {
+    what: "a record names an evaluation no persisted decision has",
+    codes: ["PROVENANCE_UNRESOLVED"],
+    mutate: (document) => {
+      takeProfitRecord(document)["evaluationSeq"] = 9999;
+    },
+  },
+  {
+    what: "a record names an intent its decision never emitted",
+    codes: ["PROVENANCE_UNRESOLVED"],
+    mutate: (document) => {
+      takeProfitRecord(document)["intentId"] = "sb-take-profit-9-not-a-real-intent";
+    },
+  },
+  {
+    what: "a record names a feature snapshot its decision did not use",
+    codes: ["PROVENANCE_UNRESOLVED"],
+    mutate: (document) => {
+      takeProfitRecord(document)["featureSnapshotRef"] = "f".repeat(64);
+    },
+  },
+  {
+    what: "a record names a source event where its decision names none",
+    codes: ["PROVENANCE_UNRESOLVED"],
+    mutate: (document) => {
+      // The take-profit was placed by an `onFill` evaluation, which the loop
+      // ORIGINATED: its decision has no source event and its record says "".
+      takeProfitRecord(document)["sourceEventId"] = entryRecord(document)["sourceEventId"];
+    },
+  },
+  {
+    what: "a record says \"\" where its decision names a recorded event (its chains disagree too)",
+    codes: ["PROVENANCE_TRACE_MISMATCH", "PROVENANCE_UNRESOLVED"],
+    mutate: (document) => {
+      entryRecord(document)["sourceEventId"] = "";
+    },
+  },
+  {
+    what: "a record's approved-intent id repeats its plan id",
+    codes: ["PROVENANCE_UNRESOLVED"],
+    mutate: (document) => {
+      const record = takeProfitRecord(document);
+      record["approvedIntentId"] = record["executionPlanId"];
+    },
+  },
+  {
+    what:
+      "the withdrawn take-profit's order AND its record carry an empty plan id, so the record " +
+      "still names the booked order's plan (RECON2-R2)",
+    codes: ["PROVENANCE_UNRESOLVED"],
+    mutate: (document) => {
+      emptyTakeProfitPlan(document);
+    },
+  },
+  {
+    what: "a record names a plan the booked order was not placed under",
+    codes: ["PROVENANCE_UNRESOLVED"],
+    mutate: (document) => {
+      takeProfitRecord(document)["executionPlanId"] = "9280f970-9280-7000-8000-00000000ffff";
+    },
+  },
+  {
+    what: "a chain disagrees with its order's record on a field no hop reads twice",
+    codes: ["PROVENANCE_TRACE_MISMATCH"],
+    mutate: (document) => {
+      // A distinct, non-empty approval id satisfies the chain's own
+      // approved-intent and submission hops; only the record contradicts it.
+      row(document, "traces", 0)["approvedIntentId"] = "9280f970-9280-7000-8000-00000000a0a0";
+    },
+  },
+  {
+    what: "the section is absent altogether (a format-1 document)",
+    codes: ["ORDER_WITHOUT_PROVENANCE", "PROVENANCE_SECTION_MISSING"],
+    mutate: (document) => {
+      delete document["orderProvenance"];
+    },
+  },
+];
+
+describe("RECON-2 — every provenance record is a resolved node, and none is an orphan", () => {
+  it("the unmutated golden carries one record per booked order, and they all resolve", () => {
+    const document = mutableGolden();
+    const records = document["orderProvenance"] as Record<string, unknown>[];
+    const orders = document["orders"] as Record<string, unknown>[];
+    expect(records.map((record) => record["venueOrderId"])).toEqual(
+      orders.map((order) => order["simulatedOrderId"]),
+    );
+    expect(walkChains(asDocument(document)).findings).toEqual([]);
+  });
+
+  for (const mutation of PROVENANCE_MUTATIONS) {
+    it(`${mutation.codes.join(" + ")} — and nothing else — when ${mutation.what}`, () => {
+      const document = mutableGolden();
+      mutation.mutate(document);
+      const report = walkChains(asDocument(document));
+      expect(report.ok).toBe(false);
+      const codes = [
+        ...new Set(report.findings.map((finding) => finding.split(":")[0] ?? "")),
+      ].sort();
+      expect(codes, explainWalk(report)).toEqual([...mutation.codes]);
+      expect(report.brokenHops, explainWalk(report)).toEqual([]);
+    });
+  }
+
+  it("RECON2-R2: an unfilled order's record with an empty plan id is refused by the identity rule alone", () => {
+    const document = mutableGolden();
+    const orderId = emptyTakeProfitPlan(document);
+    // Non-vacuous: the order really is on no chain, so no hop could see it.
+    const traces = document["traces"] as Record<string, unknown>[];
+    expect(traces.some((trace) => trace["venueOrderId"] === orderId)).toBe(false);
+    const report = walkChains(asDocument(document));
+    expect(report.findings).toEqual([
+      `PROVENANCE_UNRESOLVED: ${orderId}: the approved-intent, plan and submission-attempt ids ` +
+        "are not three distinct, non-empty identities",
+    ]);
+    expect(report.brokenHops).toEqual([]);
   });
 });
