@@ -11,13 +11,24 @@
  * not a hand-written mock of it) and keeps this file free of a private copy of
  * the §2 layer table, which `docs/contracts/dependency-direction.md` §6 names
  * as the way coverage drifts.
+ *
+ * EVERY CHILD PROCESS HERE IS AWAITED, NEVER SYNCHRONOUS (`CI-1`). Nearly
+ * every one of the 187 tests launches the checker. While each launch blocked
+ * the vitest worker, the worker's event loop did not turn once for the whole
+ * file (measured on a laptop: zero 10 ms timer ticks in 38.7 s; awaited, ~2900
+ * ticks in ~31.5 s and a longest gap under 0.25 s), so the reply to vitest's own
+ * `onTaskUpdate` RPC sat unread; birpc's 60 s call timeout then fired, and
+ * the repository's first GitHub Actions run (36279491795, where this file
+ * took 82 s) failed with every test passing. `spawnNode` below yields to the
+ * event loop while each child runs. `no-synchronous-spawn.test.ts` keeps the
+ * synchronous form out of every test file.
  */
-import { spawnSync } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const checkerPath = path.join(repoRoot, "tools", "check-dependency-direction.mjs");
@@ -28,11 +39,87 @@ const workspaceParents = ["apps", "packages", path.join("packages", "strategies"
 
 const temporaryRoots: string[] = [];
 
+/**
+ * Children still running. A synchronous launch could never outlive its test;
+ * an awaited one can, when its test times out first, so any left over when
+ * the file ends is killed here rather than orphaned (`CI-1`).
+ */
+const liveChildren = new Set<ChildProcess>();
+
 afterAll(() => {
+  for (const child of liveChildren) child.kill();
   for (const root of temporaryRoots) {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/**
+ * What a finished child reported — the fields of the synchronous spawn result
+ * this file read before `CI-1`, with the same meanings: `status` is the exit
+ * code, or `null` when a signal ended the child; `error` is set when the child
+ * could not be started or overflowed `MAX_CHILD_OUTPUT_BYTES`.
+ */
+interface SpawnResult {
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly error: Error | undefined;
+}
+
+/**
+ * Per-stream output ceiling: the synchronous spawn's default `maxBuffer`, kept
+ * so a runaway child still fails its test (the child is killed and `error` is
+ * set, as the synchronous form did with `ENOBUFS`) instead of filling memory.
+ * The largest real output is the full-repository `--json` report, ~16.5 KB.
+ */
+const MAX_CHILD_OUTPUT_BYTES = 1024 * 1024;
+
+/**
+ * Runs `node <args>` in `cwd` and resolves once the child has exited and both
+ * of its output pipes have closed — without blocking this worker's event loop.
+ *
+ * It NEVER rejects on a non-zero exit. Most tests here expect the checker to
+ * exit 1 (or 2) and assert on that status and on the output that came with
+ * it, so a non-zero exit is data, not an error. That is why this is `spawn`
+ * with collected streams rather than `promisify(execFile)`: `execFile` rejects
+ * on any non-zero exit and reports the status through an `error.code` that is a
+ * number for an exit but a string for a spawn failure. Here `close` hands over
+ * the exit code and `error` the spawn failure, each through its own channel.
+ */
+function spawnNode(args: readonly string[], cwd: string): Promise<SpawnResult> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    liveChildren.add(child);
+    const chunks: { stdout: Buffer[]; stderr: Buffer[] } = { stdout: [], stderr: [] };
+    const bytes = { stdout: 0, stderr: 0 };
+    let error: Error | undefined;
+    const text = (stream: "stdout" | "stderr"): string => Buffer.concat(chunks[stream]).toString("utf8");
+    const collect =
+      (stream: "stdout" | "stderr") =>
+      (chunk: Buffer): void => {
+        if (bytes[stream] + chunk.length > MAX_CHILD_OUTPUT_BYTES) {
+          if (error === undefined) {
+            error = new Error(`child ${stream} exceeded ${MAX_CHILD_OUTPUT_BYTES} bytes (node ${args.join(" ")})`);
+            child.kill();
+          }
+          return;
+        }
+        bytes[stream] += chunk.length;
+        chunks[stream].push(chunk);
+      };
+    child.stdout.on("data", collect("stdout"));
+    child.stderr.on("data", collect("stderr"));
+    // A child that could not be started may never emit `close`; settle now.
+    child.on("error", (cause) => {
+      liveChildren.delete(child);
+      resolve({ status: null, stdout: text("stdout"), stderr: text("stderr"), error: error ?? cause });
+    });
+    child.on("close", (code) => {
+      liveChildren.delete(child);
+      resolve({ status: code, stdout: text("stdout"), stderr: text("stderr"), error });
+    });
+  });
+}
 
 interface CheckerRun {
   readonly status: number;
@@ -41,14 +128,10 @@ interface CheckerRun {
   readonly output: string;
 }
 
-function runChecker(root: string, extraArgs: readonly string[] = []): CheckerRun {
-  const result = spawnSync(process.execPath, [checkerPath, "--root", root, ...extraArgs], {
-    encoding: "utf8",
-    cwd: repoRoot,
-  });
+async function runChecker(root: string, extraArgs: readonly string[] = []): Promise<CheckerRun> {
+  const result = await spawnNode([checkerPath, "--root", root, ...extraArgs], repoRoot);
   if (result.error) throw result.error;
-  const stdout = result.stdout ?? "";
-  const stderr = result.stderr ?? "";
+  const { stdout, stderr } = result;
   return { status: result.status ?? -1, stdout, stderr, output: `${stdout}${stderr}` };
 }
 
@@ -86,9 +169,12 @@ interface CheckerJson {
   readonly allowlist: readonly ReportedAllowlistRow[];
 }
 
-function runCheckerJson(root: string): CheckerJson {
-  const run = runChecker(root, ["--json"]);
+function parseCheckerJson(run: CheckerRun): CheckerJson {
   return JSON.parse(run.stdout) as CheckerJson;
+}
+
+async function runCheckerJson(root: string): Promise<CheckerJson> {
+  return parseCheckerJson(await runChecker(root, ["--json"]));
 }
 
 /**
@@ -228,15 +314,63 @@ function addAllowlistRow(contract: string, row: string): string {
   return `${contract.slice(0, endOfRow + 1)}${row}\n${contract.slice(endOfRow + 1)}`;
 }
 
+/**
+ * The checker's two runs over THIS repository, each made once and shared
+ * (`CI-1`).
+ *
+ * Five tests assert on the unmodified repository: two on the text run
+ * (`passes, and reports the S0 same-layer edge as permitted`; round 6's
+ * `keeps this repository passing`) and three on the `--json` report
+ * (`classifies every workspace package…`, `builds the §6 graph…`, round 1's
+ * `keeps the shipping contract valid under all of the above`). Each used to
+ * launch its own identical run, and a full-repository run is the slowest thing
+ * in this file (~1.2 s alone on a laptop, ~2.5 s under the full suite, 3.6-3.8 s
+ * on the GitHub runner — against vitest's 5 s per-test default). Sharing is
+ * exact rather than approximate: the command and arguments are unchanged, no
+ * test in this file writes inside the repository (every mutation goes to a
+ * `mkdtemp` fixture root), and the checker reads only what is on disk — so a
+ * second run in the same file could only reproduce the first. "Under all of
+ * the above" and "keeps … passing" were never about ordering: the fixtures
+ * they follow are copies, and the shipping contract they protect is the one
+ * this run reads.
+ *
+ * The runs are made in this `beforeAll`, concurrently, under an explicit hook
+ * timeout, so their cost no longer lands on the first reading test's 5 s. A
+ * failed run does not fail the hook: `allSettled` only waits, and each reading
+ * test awaits the same promise and reports the failure as its own.
+ */
+/**
+ * The hook's ceiling, from measurement: both runs together took 1.2 s alone
+ * and 2.7 s under the full suite on a 24-thread laptop. On the GitHub runner
+ * one run took up to 3.8 s, so even fully serialized the pair needs ~7.6 s —
+ * too close to vitest's 10 s hook default. 30 s is ~4x that worst case.
+ */
+const REPOSITORY_RUNS_TIMEOUT_MS = 30_000;
+
+const repositoryRuns = new Map<"text" | "json", Promise<CheckerRun>>();
+
+function repositoryRun(mode: "text" | "json"): Promise<CheckerRun> {
+  let run = repositoryRuns.get(mode);
+  if (run === undefined) {
+    run = runChecker(repoRoot, mode === "json" ? ["--json"] : []);
+    repositoryRuns.set(mode, run);
+  }
+  return run;
+}
+
+beforeAll(async () => {
+  await Promise.allSettled([repositoryRun("text"), repositoryRun("json")]);
+}, REPOSITORY_RUNS_TIMEOUT_MS);
+
 describe("dependency-direction check on this repository", () => {
-  it("passes, and reports the S0 same-layer edge as permitted", () => {
-    const run = runChecker(repoRoot);
+  it("passes, and reports the S0 same-layer edge as permitted", async () => {
+    const run = await repositoryRun("text");
     expect(run.output).toContain("PASS");
     expect(run.status).toBe(0);
   });
 
-  it("classifies every workspace package into exactly one §2 layer", () => {
-    const report = runCheckerJson(repoRoot);
+  it("classifies every workspace package into exactly one §2 layer", async () => {
+    const report = parseCheckerJson(await repositoryRun("json"));
     expect(report.ok).toBe(true);
     expect(report.violations).toHaveLength(0);
     expect(report.packages.length).toBeGreaterThanOrEqual(34);
@@ -253,8 +387,8 @@ describe("dependency-direction check on this repository", () => {
     expect(layerOf("apps/ops-cli")).toBe(3);
   });
 
-  it("builds the §6 graph from declared workspace edges and excludes the root manifest", () => {
-    const report = runCheckerJson(repoRoot);
+  it("builds the §6 graph from declared workspace edges and excludes the root manifest", async () => {
+    const report = parseCheckerJson(await repositoryRun("json"));
     const edgeKeys = report.edges.map((edge) => `${edge.from} -> ${edge.to}`);
     expect(edgeKeys).toContain("packages/domain -> packages/decimal");
     expect(edgeKeys.some((key) => key.startsWith("."))).toBe(false);
@@ -265,20 +399,20 @@ describe("dependency-direction check on this repository", () => {
 });
 
 describe("dependency-direction check on fixture graphs", () => {
-  it("passes on an unmutated mirror of this repository's manifests", () => {
-    const run = runChecker(buildFixture());
+  it("passes on an unmutated mirror of this repository's manifests", async () => {
+    const run = await runChecker(buildFixture());
     expect(run.output).toContain("PASS");
     expect(run.status).toBe(0);
   });
 
-  it("fails on a cycle (F9)", () => {
+  it("fails on a cycle (F9)", async () => {
     const root = buildFixture({
       // Both directions are §2.1-listed in this fixture, so only F9 can fire.
       patchContract: (contract) =>
         addAllowlistRow(contract, "| SX | `packages/decimal` → `packages/domain` | 0 | fixture-only row |"),
       addDependencies: { "packages/decimal": { "@polymarket-bot/domain": "workspace:*" } },
     });
-    const run = runChecker(root);
+    const run = await runChecker(root);
     expect(run.status).toBe(1);
     expect(run.output).toContain("FAIL [F9]");
     expect(run.output).toContain("circular package dependency");
@@ -287,8 +421,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("dependency-direction.md");
   });
 
-  it("fails on an upward edge (F12)", () => {
-    const run = runChecker(
+  it("fails on an upward edge (F12)", async () => {
+    const run = await runChecker(
       buildFixture({
         addDependencies: { "packages/domain": { "@polymarket-bot/storage-postgres": "workspace:*" } },
       }),
@@ -299,8 +433,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("§3 (F12)");
   });
 
-  it("fails on a same-layer edge missing from §2.1 (F13)", () => {
-    const run = runChecker(
+  it("fails on a same-layer edge missing from §2.1 (F13)", async () => {
+    const run = await runChecker(
       buildFixture({ addDependencies: { "packages/oms": { "@polymarket-bot/risk": "workspace:*" } } }),
     );
     expect(run.status).toBe(1);
@@ -309,8 +443,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("add a cited §2.1 row");
   });
 
-  it("permits a listed same-layer edge (S2) once a strategy declares it", () => {
-    const run = runChecker(
+  it("permits a listed same-layer edge (S2) once a strategy declares it", async () => {
+    const run = await runChecker(
       buildFixture({
         addDependencies: {
           "packages/strategies/static-bracket": { "@polymarket-bot/strategy-sdk": "workspace:*" },
@@ -321,8 +455,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.status).toBe(0);
   });
 
-  it("fails on forbidden specifiers inside a strategy (F3, F7, F11)", () => {
-    const run = runChecker(
+  it("fails on forbidden specifiers inside a strategy (F3, F7, F11)", async () => {
+    const run = await runChecker(
       buildFixture({
         files: {
           "packages/strategies/static-bracket/src/leak.ts": [
@@ -344,8 +478,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("clock (`Date.now()`)");
   });
 
-  it("fails when a package other than polymarket-secure imports the venue SDK (F6)", () => {
-    const run = runChecker(
+  it("fails when a package other than polymarket-secure imports the venue SDK (F6)", async () => {
+    const run = await runChecker(
       buildFixture({
         files: { "packages/oms/src/venue.ts": 'import { Client } from "@polymarket/client";\nexport const c = Client;\n' },
       }),
@@ -356,8 +490,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("packages/oms/src/venue.ts:1");
   });
 
-  it("allows the venue SDK inside polymarket-secure and Redis inside event-bus (F6, F8 boundaries)", () => {
-    const run = runChecker(
+  it("allows the venue SDK inside polymarket-secure and Redis inside event-bus (F6, F8 boundaries)", async () => {
+    const run = await runChecker(
       buildFixture({
         files: {
           "packages/polymarket-secure/src/sdk.ts": 'import { Client } from "@polymarket/client";\nexport const c = Client;\n',
@@ -369,8 +503,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.status).toBe(0);
   });
 
-  it("fails when a Redis client is imported outside event-bus (F8)", () => {
-    const run = runChecker(
+  it("fails when a Redis client is imported outside event-bus (F8)", async () => {
+    const run = await runChecker(
       buildFixture({
         files: { "packages/oms/src/bus.ts": 'import { createClient } from "ioredis";\nexport const c = createClient;\n' },
       }),
@@ -380,8 +514,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("Redis is owned by `packages/event-bus`");
   });
 
-  it("fails when packages/domain imports a Node built-in or reads a process global (F1, F2)", () => {
-    const run = runChecker(
+  it("fails when packages/domain imports a Node built-in or reads a process global (F1, F2)", async () => {
+    const run = await runChecker(
       buildFixture({
         files: {
           "packages/domain/src/leak.ts": [
@@ -399,8 +533,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("process global (`process.*`)");
   });
 
-  it("fails when packages/ledger imports a strategy implementation (F4)", () => {
-    const run = runChecker(
+  it("fails when packages/ledger imports a strategy implementation (F4)", async () => {
+    const run = await runChecker(
       buildFixture({
         files: {
           "packages/ledger/src/leak.ts":
@@ -413,8 +547,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("imports strategy implementation `packages/strategies/static-bracket`");
   });
 
-  it("fails when packages/simulation reaches a live signer (F5)", () => {
-    const run = runChecker(
+  it("fails when packages/simulation reaches a live signer (F5)", async () => {
+    const run = await runChecker(
       buildFixture({
         files: {
           "packages/simulation/src/leak.ts": 'import { Wallet } from "ethers";\nexport const w = Wallet;\n',
@@ -429,8 +563,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("live signer surface: packages/polymarket-secure");
   });
 
-  it("fails closed on a workspace package absent from the §2 layer table", () => {
-    const run = runChecker(
+  it("fails closed on a workspace package absent from the §2 layer table", async () => {
+    const run = await runChecker(
       buildFixture({ addPackages: { "packages/brand-new": "@polymarket-bot/brand-new" } }),
     );
     expect(run.status).toBe(1);
@@ -440,15 +574,15 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("fails closed on an unclassified package");
   });
 
-  it("fails closed on a named §2 entry with no manifest", () => {
-    const run = runChecker(buildFixture({ removePackages: ["packages/pnl"] }));
+  it("fails closed on a named §2 entry with no manifest", async () => {
+    const run = await runChecker(buildFixture({ removePackages: ["packages/pnl"] }));
     expect(run.status).toBe(1);
     expect(run.output).toContain("FAIL [F-CLOSED]");
     expect(run.output).toContain("classifies `packages/pnl` in layer 1, but that path has no workspace `package.json`");
   });
 
-  it("does not treat a strategy class entry matching zero packages as an error", () => {
-    const run = runChecker(
+  it("does not treat a strategy class entry matching zero packages as an error", async () => {
+    const run = await runChecker(
       buildFixture({
         removePackages: ["packages/strategies/static-bracket"],
         removeDependencies: { "apps/trader": ["@polymarket-bot/strategy-static-bracket"] },
@@ -458,8 +592,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.status).toBe(0);
   });
 
-  it("fails closed when the §2.1 allowlist cannot be parsed", () => {
-    const run = runChecker(
+  it("fails closed when the §2.1 allowlist cannot be parsed", async () => {
+    const run = await runChecker(
       buildFixture({
         patchContract: (contract) => contract.replace(/^### 2\.1 .*$/m, "### 2.1 (heading renamed by the fixture)").replace(/→/g, "to"),
       }),
@@ -469,8 +603,8 @@ describe("dependency-direction check on fixture graphs", () => {
     expect(run.output).toContain("no permitted same-layer edge rows parsed");
   });
 
-  it("ignores forbidden specifiers that appear only in comments or string literals", () => {
-    const run = runChecker(
+  it("ignores forbidden specifiers that appear only in comments or string literals", async () => {
+    const run = await runChecker(
       buildFixture({
         files: {
           "packages/strategies/static-bracket/src/prose.ts": [
@@ -493,8 +627,8 @@ describe("dependency-direction check on fixture graphs", () => {
  */
 describe("dependency-direction check — round-1 review regressions", () => {
   describe("HIGH: rule-3 scanner bypasses", () => {
-    it("catches a template-literal dynamic import specifier (HIGH a)", () => {
-      const run = runChecker(
+    it("catches a template-literal dynamic import specifier (HIGH a)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/leak.ts":
@@ -508,8 +642,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("packages/strategies/static-bracket/src/leak.ts:1");
     });
 
-    it("catches a bare `Date()` clock read (HIGH b)", () => {
-      const run = runChecker(
+    it("catches a bare `Date()` clock read (HIGH b)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { "packages/strategies/static-bracket/src/leak.ts": "export const t = () => Date();\n" },
         }),
@@ -519,8 +653,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("clock (`Date()`)");
     });
 
-    it("does not report `new Date(<argument>)`, which is deterministic", () => {
-      const run = runChecker(
+    it("does not report `new Date(<argument>)`, which is deterministic", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/ok.ts":
@@ -532,8 +666,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.status).toBe(0);
     });
 
-    it("applies environment and network globals to a strategy (HIGH c)", () => {
-      const run = runChecker(
+    it("applies environment and network globals to a strategy (HIGH c)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/leak.ts": [
@@ -556,8 +690,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("a strategy performs no I/O and reads no environment");
     });
 
-    it("catches a filesystem library that never names `node:fs` (HIGH d)", () => {
-      const run = runChecker(
+    it("catches a filesystem library that never names `node:fs` (HIGH d)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/leak.ts":
@@ -570,8 +704,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("imports `fs-extra` (filesystem library)");
     });
 
-    it("reports a dynamic import whose specifier is not statically readable", () => {
-      const interpolated = runChecker(
+    it("reports a dynamic import whose specifier is not statically readable", async () => {
+      const interpolated = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/leak.ts":
@@ -583,7 +717,7 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(interpolated.output).toContain("FAIL [F-OPAQUE]");
       expect(interpolated.output).toContain("an interpolated template literal");
 
-      const variable = runChecker(
+      const variable = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/leak.ts":
@@ -596,8 +730,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(variable.output).toContain("a non-literal expression");
     });
 
-    it("permits an opaque dynamic import in a composition root, which is not purity-restricted", () => {
-      const run = runChecker(
+    it("permits an opaque dynamic import in a composition root, which is not purity-restricted", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { "apps/trader/src/plugin.ts": "export const f = async (n: string) => import(n);\n" },
         }),
@@ -608,8 +742,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
   });
 
   describe("MEDIUM-1: graph completeness", () => {
-    it("treats `optionalDependencies` as a workspace edge", () => {
-      const run = runChecker(
+    it("treats `optionalDependencies` as a workspace edge", async () => {
+      const run = await runChecker(
         buildFixture({
           addOptionalDependencies: {
             "packages/domain": { "@polymarket-bot/storage-postgres": "workspace:*" },
@@ -623,8 +757,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       );
     });
 
-    it("reports a package that declares itself as a cycle (F9)", () => {
-      const run = runChecker(
+    it("reports a package that declares itself as a cycle (F9)", async () => {
+      const run = await runChecker(
         buildFixture({ addDependencies: { "packages/oms": { "@polymarket-bot/oms": "workspace:*" } } }),
       );
       expect(run.status).toBe(1);
@@ -636,8 +770,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
   });
 
   describe("MEDIUM-2: literal contents are data, not code", () => {
-    it("does not report forbidden-looking text in strings, templates, or comments", () => {
-      const run = runChecker(
+    it("does not report forbidden-looking text in strings, templates, or comments", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/data.ts": [
@@ -658,8 +792,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.status).toBe(0);
     });
 
-    it("still reports genuine imports in the same file as harmless look-alike text", () => {
-      const run = runChecker(
+    it("still reports genuine imports in the same file as harmless look-alike text", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/mixed.ts": [
@@ -680,8 +814,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).not.toContain("src/mixed.ts:1");
     });
 
-    it("still scans code inside a template literal's `${...}` interpolation", () => {
-      const run = runChecker(
+    it("still scans code inside a template literal's `${...}` interpolation", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/interp.ts":
@@ -694,8 +828,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("unseeded randomness (`Math.random()`)");
     });
 
-    it("is not confused by a regular-expression literal containing quotes", () => {
-      const run = runChecker(
+    it("is not confused by a regular-expression literal containing quotes", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/regex.ts": [
@@ -714,8 +848,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
   });
 
   describe("LOW: the parsed contract is validated eagerly", () => {
-    it("fails on a §2.1 row whose edge cannot be parsed", () => {
-      const run = runChecker(
+    it("fails on a §2.1 row whose edge cannot be parsed", async () => {
+      const run = await runChecker(
         buildFixture({
           patchContract: (contract) =>
             contract.replace(
@@ -730,8 +864,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("not silently skipped");
     });
 
-    it("fails on a §2.1 row whose stated layer contradicts §2", () => {
-      const run = runChecker(
+    it("fails on a §2.1 row whose stated layer contradicts §2", async () => {
+      const run = await runChecker(
         buildFixture({
           patchContract: (contract) =>
             contract.replace(
@@ -746,8 +880,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("states layer 2, but §2 classifies its `from` endpoint");
     });
 
-    it("fails on a §2.1 row naming a package §2 does not classify", () => {
-      const run = runChecker(
+    it("fails on a §2.1 row naming a package §2 does not classify", async () => {
+      const run = await runChecker(
         buildFixture({
           patchContract: (contract) =>
             contract.replace(
@@ -762,8 +896,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("§2 classifies no package or class matching it");
     });
 
-    it("fails on a non-numeric §2.1 layer cell", () => {
-      const run = runChecker(
+    it("fails on a non-numeric §2.1 layer cell", async () => {
+      const run = await runChecker(
         buildFixture({
           patchContract: (contract) =>
             contract.replace(
@@ -779,8 +913,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("FAIL [F13]");
     });
 
-    it("fails when §2 assigns the same package twice, even within one layer", () => {
-      const run = runChecker(
+    it("fails when §2 assigns the same package twice, even within one layer", async () => {
+      const run = await runChecker(
         buildFixture({
           patchContract: (contract) =>
             contract.replace(
@@ -795,8 +929,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("no package appear twice");
     });
 
-    it("still fails when §2 assigns the same package to two different layers", () => {
-      const run = runChecker(
+    it("still fails when §2 assigns the same package to two different layers", async () => {
+      const run = await runChecker(
         buildFixture({
           patchContract: (contract) =>
             contract.replace(
@@ -810,8 +944,8 @@ describe("dependency-direction check — round-1 review regressions", () => {
       expect(run.output).toContain("exactly one layer per package");
     });
 
-    it("keeps the shipping contract valid under all of the above", () => {
-      const report = runCheckerJson(repoRoot);
+    it("keeps the shipping contract valid under all of the above", async () => {
+      const report = parseCheckerJson(await repositoryRun("json"));
       expect(report.ok).toBe(true);
       expect(report.allowlist.map((row) => row.id)).toEqual([
         "S0",
@@ -845,8 +979,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
   const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
 
   describe("HIGH-1: the regex/division heuristic blanked executable code", () => {
-    it("reports `Math.random()` between two division operators", () => {
-      const run = runChecker(
+    it("reports `Math.random()` between two division operators", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: "export const x = (value: number | null) => value! / Math.random() / 2;\n",
@@ -859,8 +993,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.output).toContain("src/probe.ts:1");
     });
 
-    it("still ignores an actual regular-expression literal that looks like a violation", () => {
-      const run = runChecker(
+    it("still ignores an actual regular-expression literal that looks like a violation", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -876,8 +1010,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
   });
 
   describe("HIGH-2: specifier recognition is positional, not proximity-based", () => {
-    it("catches a dynamic import whose specifier follows a long comment", () => {
-      const run = runChecker(
+    it("catches a dynamic import whose specifier follows a long comment", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: `export const f = async () => import(${longComment} "node:fs");\n` },
         }),
@@ -888,8 +1022,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.output).toContain("src/probe.ts:1");
     });
 
-    it("catches `export * from` whose specifier follows a long comment", () => {
-      const run = runChecker(
+    it("catches `export * from` whose specifier follows a long comment", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: `export * from ${longComment} "node:fs";\n` },
         }),
@@ -899,8 +1033,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
     });
 
-    it("catches a static `require()` specifier in a `.cjs` file", () => {
-      const run = runChecker(
+    it("catches a static `require()` specifier in a `.cjs` file", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/probe.cjs": 'module.exports = require("node:fs");\n',
@@ -913,8 +1047,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.output).toContain("src/probe.cjs:1");
     });
 
-    it("reports a computed `require()` in a restricted package instead of accepting it", () => {
-      const run = runChecker(
+    it("reports a computed `require()` in a restricted package instead of accepting it", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/probe.cjs":
@@ -928,8 +1062,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.output).toContain("src/probe.cjs:2");
     });
 
-    it("does not treat a locally declared `require` as a module load", () => {
-      const run = runChecker(
+    it("does not treat a locally declared `require` as a module load", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -943,8 +1077,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.status).toBe(0);
     });
 
-    it("catches `import x = require(...)` and a type-only import", () => {
-      const run = runChecker(
+    it("catches `import x = require(...)` and a type-only import", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/strategies/static-bracket/src/equals.ts":
@@ -961,8 +1095,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
   });
 
   describe("HIGH-3: impure globals are detected by reference, not by call spelling", () => {
-    it("catches `window.Date()`", () => {
-      const run = runChecker(
+    it("catches `window.Date()`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: "export const t = () => window.Date();\n" },
         }),
@@ -974,8 +1108,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.output).toContain("process global (`window`)");
     });
 
-    it("catches a `Date` alias created as a value", () => {
-      const run = runChecker(
+    it("catches a `Date` alias created as a value", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: "const D = Date;\nexport const t = () => D();\n" },
         }),
@@ -986,8 +1120,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.output).toContain("src/probe.ts:1");
     });
 
-    it("catches a global reached through `globalThis[\"...\"]`", () => {
-      const run = runChecker(
+    it("catches a global reached through `globalThis[\"...\"]`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: 'export const r = () => globalThis["Math"].random();\n' },
         }),
@@ -996,8 +1130,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.output).toContain("unseeded randomness (`Math.random()`)");
     });
 
-    it("sees through parentheses, `as` assertions, and non-null assertions", () => {
-      const run = runChecker(
+    it("sees through parentheses, `as` assertions, and non-null assertions", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1012,8 +1146,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.output).toContain("clock (`Date()`)");
     });
 
-    it("catches a scheduled timer, which is neither deterministic nor synchronous", () => {
-      const run = runChecker(
+    it("catches a scheduled timer, which is neither deterministic nor synchronous", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: "export const later = (f: () => void) => setTimeout(f, 10);\n" },
         }),
@@ -1025,8 +1159,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
   });
 
   describe("AST semantics: shadowing, type positions, and the `new Date(argument)` allowance", () => {
-    it("does not report a parameter that shadows a global", () => {
-      const run = runChecker(
+    it("does not report a parameter that shadows a global", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1041,8 +1175,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.status).toBe(0);
     });
 
-    it("does not report an imported or locally declared binding that shadows a global", () => {
-      const run = runChecker(
+    it("does not report an imported or locally declared binding that shadows a global", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1056,8 +1190,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.status).toBe(0);
     });
 
-    it("does not report a global name used only in a type position", () => {
-      const run = runChecker(
+    it("does not report a global name used only in a type position", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1072,8 +1206,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.status).toBe(0);
     });
 
-    it("does not report a method or property merely named like a global", () => {
-      const run = runChecker(
+    it("does not report a method or property merely named like a global", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1089,8 +1223,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.status).toBe(0);
     });
 
-    it("allows `new Date(argument)` and reports `new Date()`", () => {
-      const allowed = runChecker(
+    it("allows `new Date(argument)` and reports `new Date()`", async () => {
+      const allowed = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: "export const at = (ms: number) => new Date(ms).toISOString();\n",
@@ -1100,7 +1234,7 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(allowed.output).toContain("PASS");
       expect(allowed.status).toBe(0);
 
-      const flagged = runChecker(
+      const flagged = await runChecker(
         buildFixture({ files: { [strategyFile]: "export const now = () => new Date();\n" } }),
       );
       expect(flagged.status).toBe(1);
@@ -1108,8 +1242,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(flagged.output).toContain("clock (`new Date()`)");
     });
 
-    it("allows pure `Math` members but reports a bare `Math` value reference", () => {
-      const pure = runChecker(
+    it("allows pure `Math` members but reports a bare `Math` value reference", async () => {
+      const pure = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: "export const clamp = (a: number, b: number) => Math.min(Math.max(a, 0), b);\n",
@@ -1119,7 +1253,7 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(pure.output).toContain("PASS");
       expect(pure.status).toBe(0);
 
-      const aliased = runChecker(
+      const aliased = await runChecker(
         buildFixture({ files: { [strategyFile]: "const M = Math;\nexport const r = () => M.random();\n" } }),
       );
       expect(aliased.status).toBe(1);
@@ -1127,8 +1261,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(aliased.output).toContain("`Math` reference");
     });
 
-    it("applies the same reference semantics to packages/domain (F1)", () => {
-      const run = runChecker(
+    it("applies the same reference semantics to packages/domain (F1)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/domain/src/probe.ts": [
@@ -1148,8 +1282,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
   });
 
   describe("constructs that make the rules unevaluable are findings, not passes", () => {
-    it("reports `eval` and `new Function(...)` in a restricted package", () => {
-      const run = runChecker(
+    it("reports `eval` and `new Function(...)` in a restricted package", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1166,8 +1300,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       expect(run.output).toContain("evaluates code no static check can read");
     });
 
-    it("does not report `instanceof Function`, which evaluates nothing", () => {
-      const run = runChecker(
+    it("does not report `instanceof Function`, which evaluates nothing", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: "export const isFn = (v: unknown) => v instanceof Function;\n" },
         }),
@@ -1178,8 +1312,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
   });
 
   describe("the scanner fails closed on input it cannot read", () => {
-    it("reports an unparseable source file instead of scanning a partial tree", () => {
-      const run = runChecker(
+    it("reports an unparseable source file instead of scanning a partial tree", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: 'export const broken = ;\nimport { readFileSync } from "node:fs";\n' },
         }),
@@ -1193,7 +1327,7 @@ describe("dependency-direction check — round-2 review regressions", () => {
   });
 
   describe("the scanner fails closed when the compiler API is unavailable", () => {
-    it("reports a CHK error instead of scanning nothing", () => {
+    it("reports a CHK error instead of scanning nothing", async () => {
       const root = buildFixture();
       // A stub `typescript` that resolves but exports no compiler API. Both
       // resolution candidates (the checker's own location and the scanned root)
@@ -1203,8 +1337,8 @@ describe("dependency-direction check — round-2 review regressions", () => {
       writeFixtureFile(root, path.join("tools", "check-dependency-direction.mjs"), readFileSync(checkerPath, "utf8"));
 
       const copied = path.join(root, "tools", "check-dependency-direction.mjs");
-      const result = spawnSync(process.execPath, [copied, "--root", root], { encoding: "utf8", cwd: root });
-      const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+      const result = await spawnNode([copied, "--root", root], root);
+      const output = `${result.stdout}${result.stderr}`;
       expect(result.status).toBe(1);
       expect(output).toContain("FAIL [CHK]");
       expect(output).toContain("TypeScript compiler API could not be loaded");
@@ -1228,8 +1362,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
   const simulationFile = "packages/simulation/src/probe.ts";
 
   describe("the require callee is unwrapped and resolved, not matched literally", () => {
-    it("catches a parenthesized require callee `(require)(...)`", () => {
-      const run = runChecker(
+    it("catches a parenthesized require callee `(require)(...)`", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [strategyFile]: 'export const fs = (require)("node:fs");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -1238,8 +1372,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
       expect(run.output).toContain("src/probe.ts:1");
     });
 
-    it("catches a require callee behind `as`/non-null wrappers", () => {
-      const run = runChecker(
+    it("catches a require callee behind `as`/non-null wrappers", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: 'export const fs = (require as (m: string) => unknown)!("node:fs");\n' },
         }),
@@ -1249,8 +1383,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
       expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
     });
 
-    it("catches a require alias `const r = require; r(...)`", () => {
-      const run = runChecker(
+    it("catches a require alias `const r = require; r(...)`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: 'const r = require;\nexport const fs = r("node:fs");\n' },
         }),
@@ -1261,8 +1395,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("catches a chained alias `const a = require; const b = a; b(...)`", () => {
-      const run = runChecker(
+    it("catches a chained alias `const a = require; const b = a; b(...)`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: ["const a = require;", "const b = a;", 'export const fs = b("node:fs");'].join("\n"),
@@ -1274,8 +1408,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
       expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
     });
 
-    it("catches property-access require `module.require(...)`", () => {
-      const run = runChecker(
+    it("catches property-access require `module.require(...)`", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [strategyFile]: 'export const fs = module.require("node:fs");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -1283,8 +1417,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
       expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
     });
 
-    it("catches a `const { require: r } = module` destructure", () => {
-      const run = runChecker(
+    it("catches a `const { require: r } = module` destructure", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: "const { require: r } = module;\nexport const fs = r(\"node:fs\");\n" },
         }),
@@ -1296,8 +1430,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
   });
 
   describe("reflection over the require capability", () => {
-    it("catches `require.call(thisArg, spec)` with the specifier at index 1", () => {
-      const run = runChecker(
+    it("catches `require.call(thisArg, spec)` with the specifier at index 1", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [strategyFile]: 'export const fs = require.call(null, "node:fs");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -1305,8 +1439,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
       expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
     });
 
-    it("fails closed on `require.apply(thisArg, [...])`, whose specifier is not statically readable", () => {
-      const run = runChecker(
+    it("fails closed on `require.apply(thisArg, [...])`, whose specifier is not statically readable", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [strategyFile]: 'export const fs = require.apply(null, ["node:fs"]);\n' } }),
       );
       expect(run.status).toBe(1);
@@ -1316,8 +1450,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
   });
 
   describe("ambient `declare const require` does not suppress the finding", () => {
-    it("catches a call to an ambient-declared require", () => {
-      const run = runChecker(
+    it("catches a call to an ambient-declared require", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1335,8 +1469,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
   });
 
   describe("node:module / createRequire route", () => {
-    it("flags importing `node:module` into a strategy", () => {
-      const run = runChecker(
+    it("flags importing `node:module` into a strategy", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: 'import { createRequire } from "node:module";\nexport const make = createRequire;\n' },
         }),
@@ -1346,10 +1480,10 @@ describe("dependency-direction check — round-3 require-family regressions", ()
       expect(run.output).toContain("imports `node:module` (process/environment built-in)");
     });
 
-    it("catches a directly-invoked `createRequire(...)(spec)`", () => {
+    it("catches a directly-invoked `createRequire(...)(spec)`", async () => {
       // `createRequire` is ambient here so the probe isolates the direct-invoke
       // route (importing it from node:module is its own F3, tested above).
-      const run = runChecker(
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1367,8 +1501,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
   });
 
   describe("the require family reaches a live signer in simulation (F5)", () => {
-    it("catches `require(\"ethers\")` through an alias in packages/simulation", () => {
-      const run = runChecker(
+    it("catches `require(\"ethers\")` through an alias in packages/simulation", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [simulationFile]: 'const r = require;\nexport const signer = r("ethers");\n' },
         }),
@@ -1381,8 +1515,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
   });
 
   describe("genuine locals and property methods stay clean", () => {
-    it("does not flag `registry.require(eventType, version)` on a non-require object", () => {
-      const run = runChecker(
+    it("does not flag `registry.require(eventType, version)` on a non-require object", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1396,8 +1530,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
       expect(run.status).toBe(0);
     });
 
-    it("does not flag a parameter named `require` that is not the global", () => {
-      const run = runChecker(
+    it("does not flag a parameter named `require` that is not the global", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1412,8 +1546,8 @@ describe("dependency-direction check — round-3 require-family regressions", ()
       expect(run.status).toBe(0);
     });
 
-    it("does not flag `module` when it is a genuine non-CommonJS local", () => {
-      const run = runChecker(
+    it("does not flag `module` when it is a genuine non-CommonJS local", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1480,8 +1614,8 @@ describe("dependency-direction check — round-4 capability-escape regressions",
 
   describe("an unconsumed reference to the require capability is itself a finding", () => {
     for (const probe of escapes) {
-      it(`reports the capability escaping into ${probe.label}`, () => {
-        const run = runChecker(buildFixture({ files: { [strategyFile]: probe.source } }));
+      it(`reports the capability escaping into ${probe.label}`, async () => {
+        const run = await runChecker(buildFixture({ files: { [strategyFile]: probe.source } }));
         expect(run.status).toBe(1);
         expect(run.output).toContain("FAIL [F-OPAQUE]");
         expect(run.output).toContain("the CommonJS `require` capability");
@@ -1490,8 +1624,8 @@ describe("dependency-direction check — round-4 capability-escape regressions",
       });
     }
 
-    it("propagates the rule to an alias reference that itself escapes", () => {
-      const run = runChecker(
+    it("propagates the rule to an alias reference that itself escapes", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: "const r = require;\nexport const holder = { r };\n" },
         }),
@@ -1502,11 +1636,11 @@ describe("dependency-direction check — round-4 capability-escape regressions",
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("resolves `globalThis.require(...)` in a package that runs no globals rule", () => {
+    it("resolves `globalThis.require(...)` in a package that runs no globals rule", async () => {
       // The globals rule (which reports the `globalThis` reference itself) runs
       // only for packages/domain and packages/strategies/**, so in
       // packages/simulation this construct was silent until round 4.
-      const run = runChecker(
+      const run = await runChecker(
         buildFixture({
           files: { "packages/simulation/src/probe.ts": 'export const signer = globalThis.require("ethers");\n' },
         }),
@@ -1516,8 +1650,8 @@ describe("dependency-direction check — round-4 capability-escape regressions",
       expect(run.output).toContain("live signer surface");
     });
 
-    it("follows a `const m = module` alias, so `m.require(...)` is still read as a load", () => {
-      const run = runChecker(
+    it("follows a `const m = module` alias, so `m.require(...)` is still read as a load", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: 'const m = module;\nexport const fs = m.require("node:fs");\n' },
         }),
@@ -1529,8 +1663,8 @@ describe("dependency-direction check — round-4 capability-escape regressions",
   });
 
   describe("the analysed positions do not additionally flag", () => {
-    it("reads the specifier of a tracked alias call without reporting an escape", () => {
-      const run = runChecker(
+    it("reads the specifier of a tracked alias call without reporting an escape", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [strategyFile]: 'const r = require;\nexport const fs = r("node:fs");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -1539,8 +1673,8 @@ describe("dependency-direction check — round-4 capability-escape regressions",
       expect(run.output).not.toContain("F-OPAQUE");
     });
 
-    it("does not report `typeof require`, a shadow-safe test that loads nothing", () => {
-      const run = runChecker(
+    it("does not report `typeof require`, a shadow-safe test that loads nothing", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [strategyFile]: 'export const isCjs = typeof require === "function";\n' } }),
       );
       expect(run.output).toContain("PASS");
@@ -1549,8 +1683,8 @@ describe("dependency-direction check — round-4 capability-escape regressions",
   });
 
   describe("a genuine local binding is not a reference to the ambient capability", () => {
-    it("does not flag a genuine local function named `require`", () => {
-      const run = runChecker(
+    it("does not flag a genuine local function named `require`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1564,8 +1698,8 @@ describe("dependency-direction check — round-4 capability-escape regressions",
       expect(run.status).toBe(0);
     });
 
-    it("keeps the round-3 negatives clean under the escape rule", () => {
-      const run = runChecker(
+    it("keeps the round-3 negatives clean under the escape rule", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1607,8 +1741,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
   const simulationFile = "packages/simulation/src/probe.ts";
 
   describe("a computed member read on a capability fails closed", () => {
-    it("closes the review's `getBuiltinModule(...)[\"create\"+\"Require\"]` acquisition", () => {
-      const run = runChecker(
+    it("closes the review's `getBuiltinModule(...)[\"create\"+\"Require\"]` acquisition", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/simulation/src/probe.cjs": [
@@ -1625,8 +1759,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("src/probe.cjs:1");
     });
 
-    it("closes the same acquisition through `require(\"node:module\")`", () => {
-      const run = runChecker(
+    it("closes the same acquisition through `require(\"node:module\")`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/simulation/src/probe.cjs": [
@@ -1641,8 +1775,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("is read with a computed member expression");
     });
 
-    it("closes it through a namespace import of `node:module`", () => {
-      const run = runChecker(
+    it("closes it through a namespace import of `node:module`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -1659,8 +1793,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("closes it through `await import(\"node:module\")`", () => {
-      const run = runChecker(
+    it("closes it through `await import(\"node:module\")`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -1677,8 +1811,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("is read with a computed member expression");
     });
 
-    it("closes a computed member on the `process` carrier itself", () => {
-      const run = runChecker(
+    it("closes a computed member on the `process` carrier itself", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -1694,8 +1828,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("reports a computed member on `require` itself", () => {
-      const run = runChecker(
+    it("reports a computed member on `require` itself", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: ["declare const k: string;", "export const anything = (require as never)[k];"].join("\n"),
@@ -1710,8 +1844,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
   });
 
   describe("`process.getBuiltinModule` is classified exactly like an import", () => {
-    it("reports `process.getBuiltinModule(\"node:fs\")` in a strategy as F3", () => {
-      const run = runChecker(
+    it("reports `process.getBuiltinModule(\"node:fs\")` in a strategy as F3", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [strategyFile]: 'export const fs = process.getBuiltinModule("node:fs");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -1720,8 +1854,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("src/probe.ts:1");
     });
 
-    it("reports a computed `getBuiltinModule` specifier as F-OPAQUE", () => {
-      const run = runChecker(
+    it("reports a computed `getBuiltinModule` specifier as F-OPAQUE", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: ["declare const target: string;", "export const mod = process.getBuiltinModule(target);"].join(
@@ -1735,8 +1869,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("calls `process.getBuiltinModule()` whose specifier is a non-literal expression");
     });
 
-    it("reads the whole static `getBuiltinModule(...).createRequire(...)` chain", () => {
-      const run = runChecker(
+    it("reads the whole static `getBuiltinModule(...).createRequire(...)` chain", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]:
@@ -1749,8 +1883,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("live signer surface");
     });
 
-    it("follows a `const g = process.getBuiltinModule` alias without reporting an escape", () => {
-      const run = runChecker(
+    it("follows a `const g = process.getBuiltinModule` alias without reporting an escape", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -1765,8 +1899,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).not.toContain("F-OPAQUE");
     });
 
-    it("follows a `const { getBuiltinModule } = process` destructure", () => {
-      const run = runChecker(
+    it("follows a `const { getBuiltinModule } = process` destructure", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -1780,8 +1914,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("FAIL [F5]");
     });
 
-    it("resolves `globalThis.process.getBuiltinModule` in a package that runs no globals rule", () => {
-      const run = runChecker(
+    it("resolves `globalThis.process.getBuiltinModule` in a package that runs no globals rule", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/ledger/src/probe.ts": [
@@ -1796,8 +1930,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("packages/ledger");
     });
 
-    it("reads `process.getBuiltinModule.call(thisArg, specifier)` reflection", () => {
-      const run = runChecker(
+    it("reads `process.getBuiltinModule.call(thisArg, specifier)` reflection", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [strategyFile]: 'export const fs = process.getBuiltinModule.call(null, "node:fs");\n' },
         }),
@@ -1807,8 +1941,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.output).toContain("imports `node:fs` (filesystem built-in)");
     });
 
-    it("reports the builtin loader escaping into a call argument", () => {
-      const run = runChecker(
+    it("reports the builtin loader escaping into a call argument", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -1826,8 +1960,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
   });
 
   describe("negatives: the new rules add no noise outside their scope", () => {
-    it("leaves `process.getBuiltinModule` alone in an unrestricted package", () => {
-      const run = runChecker(
+    it("leaves `process.getBuiltinModule` alone in an unrestricted package", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "apps/ops-cli/src/probe.ts": [
@@ -1843,8 +1977,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.status).toBe(0);
     });
 
-    it("leaves computed access on ordinary objects alone", () => {
-      const run = runChecker(
+    it("leaves computed access on ordinary objects alone", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1867,12 +2001,12 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.status).toBe(0);
     });
 
-    it("keeps `process` itself a carrier, not a loader, where no globals rule runs", () => {
+    it("keeps `process` itself a carrier, not a loader, where no globals rule runs", async () => {
       // packages/simulation and packages/ledger are not fully purity-restricted:
       // the contract's F5/F4 rows constrain what they *load*, not whether they
       // may read the environment. Making `process` a capability must therefore
       // not turn an ordinary `process.env` read into a finding.
-      const run = runChecker(
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -1893,8 +2027,8 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.status).toBe(0);
     });
 
-    it("lets a genuine local named `process` shadow the carrier", () => {
-      const run = runChecker(
+    it("lets a genuine local named `process` shadow the carrier", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -1909,14 +2043,14 @@ describe("dependency-direction check — round-5 builtin-loader regressions", ()
       expect(run.status).toBe(0);
     });
 
-    it("is deliberately noisy for an unrelated member named `getBuiltinModule`", () => {
+    it("is deliberately noisy for an unrelated member named `getBuiltinModule`", async () => {
       // The same disclosure round 3 made for `createRequire`: the member is
       // matched by name without the shadow test, because the ordinary ways to
       // hold the loader (`const { getBuiltinModule } = process`, an imported
       // `node:process`) all bind genuine declarations. The cost is a finding on
       // an unrelated member of that name — noisy, never silent — and this test
       // pins it so the trade is visible rather than discovered later.
-      const run = runChecker(
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -1973,8 +2107,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
   const acquisitionMessage = "on any function-valued expression that property IS the `Function` constructor";
 
   describe("acquiring the `Function` constructor through `.constructor` fails closed", () => {
-    it("closes the review's `(function(){}).constructor(...)()` in simulation", () => {
-      const run = runChecker(
+    it("closes the review's `(function(){}).constructor(...)()` in simulation", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]:
@@ -1990,8 +2124,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.output).toContain("src/probe.ts:1");
     });
 
-    it("closes `queueMicrotask.constructor(...)()`, which reconstitutes `require`", () => {
-      const run = runChecker(
+    it("closes `queueMicrotask.constructor(...)()`, which reconstitutes `require`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2009,8 +2143,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.output).toContain("can reconstitute `require`");
     });
 
-    it("closes `constructor(\"return require\")()` in a strategy", () => {
-      const run = runChecker(
+    it("closes `constructor(\"return require\")()` in a strategy", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -2028,8 +2162,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("closes the computed `x[\"constructor\"](...)()` spelling in the ledger", () => {
-      const run = runChecker(
+    it("closes the computed `x[\"constructor\"](...)()` spelling in the ledger", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [ledgerFile]: [
@@ -2046,8 +2180,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("closes a bare acquisition (no call) in packages/domain", () => {
-      const run = runChecker(
+    it("closes a bare acquisition (no call) in packages/domain", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [domainFile]: "export const F = (function () {}).constructor;\n" } }),
       );
       expect(run.status).toBe(1);
@@ -2056,11 +2190,11 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.output).toContain("reads the `constructor` property");
     });
 
-    it("flags `[].constructor` too — the boundary refuses a non-function exemption", () => {
+    it("flags `[].constructor` too — the boundary refuses a non-function exemption", async () => {
       // `[].constructor` is `Array`, not `Function`. It is flagged anyway: this
       // pins the deliberate fail-closed choice so a reviewer can argue with it
       // rather than discover it. `(() => {}).constructor` IS `Function`.
-      const run = runChecker(
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: ["export const A = [].constructor;", "export const F = (() => {}).constructor;"].join(
@@ -2070,7 +2204,7 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
         }),
       );
       expect(run.status).toBe(1);
-      const report = runCheckerJson(
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [simulationFile]: ["export const A = [].constructor;", "export const F = (() => {}).constructor;"].join(
@@ -2089,8 +2223,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
   });
 
   describe("the property name is resolved, not matched literally", () => {
-    it("folds a literal concatenation: `f['constr' + 'uctor']`", () => {
-      const run = runChecker(
+    it("folds a literal concatenation: `f['constr' + 'uctor']`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2104,8 +2238,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.output).toContain("a `[...]` member read that resolves to `constructor`");
     });
 
-    it("folds a file-level string constant: `const k = 'constructor'; f[k]`", () => {
-      const run = runChecker(
+    it("folds a file-level string constant: `const k = 'constructor'; f[k]`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -2121,8 +2255,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.output).toContain("src/probe.ts:3");
     });
 
-    it("folds a template literal whose every span is constant", () => {
-      const run = runChecker(
+    it("folds a template literal whose every span is constant", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [domainFile]: ["declare const f: Record<string, unknown>;", "export const out = f[`constr${'uctor'}`];"].join("\n") },
         }),
@@ -2131,8 +2265,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.output).toContain("a `[...]` member read that resolves to `constructor`");
     });
 
-    it("reads the destructured spellings", () => {
-      const report = runCheckerJson(
+    it("reads the destructured spellings", async () => {
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [ledgerFile]: [
@@ -2156,11 +2290,11 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       ]);
     });
 
-    it("reports the construct exactly once when it is also a computed capability read", () => {
+    it("reports the construct exactly once when it is also a computed capability read", async () => {
       // `const k = "constructor"; require[k]` would fire the round-5
       // computed-capability rule as well; the round-6 finding is the more
       // specific one, so the round-5 rule stands down and there is one finding.
-      const report = runCheckerJson(
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [strategyFile]: ["const k = 'constructor';", "export const F = (require as never)[k];"].join("\n"),
@@ -2175,8 +2309,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
   });
 
   describe("the direct evaluator identifiers still flag (pre-existing behaviour)", () => {
-    it("keeps `eval(...)`, `Function(...)` and `new Function(...)` findings", () => {
-      const report = runCheckerJson(
+    it("keeps `eval(...)`, `Function(...)` and `new Function(...)` findings", async () => {
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2199,8 +2333,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
   });
 
   describe("negatives: the rule stays inside its boundary", () => {
-    it("leaves every `.constructor` spelling alone in an unrestricted package", () => {
-      const run = runChecker(
+    it("leaves every `.constructor` spelling alone in an unrestricted package", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "apps/ops-cli/src/probe.ts": [
@@ -2220,10 +2354,10 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.status).toBe(0);
     });
 
-    it("leaves `constructor` DECLARATIONS alone in restricted packages", () => {
+    it("leaves `constructor` DECLARATIONS alone in restricted packages", async () => {
       // This is what keeps the shipping `packages/domain/src/errors.ts` clean:
       // it declares seven class constructors and reads none.
-      const run = runChecker(
+      const run = await runChecker(
         buildFixture({
           files: {
             [domainFile]: [
@@ -2246,8 +2380,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.status).toBe(0);
     });
 
-    it("keeps the round-5 computed-access negatives clean", () => {
-      const run = runChecker(
+    it("keeps the round-5 computed-access negatives clean", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -2270,8 +2404,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.status).toBe(0);
     });
 
-    it("does not read a type position as a value", () => {
-      const run = runChecker(
+    it("does not read a type position as a value", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [domainFile]: [
@@ -2288,22 +2422,22 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(run.status).toBe(0);
     });
 
-    it("keeps this repository passing", () => {
-      const run = runChecker(repoRoot);
+    it("keeps this repository passing", async () => {
+      const run = await repositoryRun("text");
       expect(run.output).toContain("PASS");
       expect(run.status).toBe(0);
     });
   });
 
   describe("the noise the refused exemption lands on future package owners", () => {
-    it("flags ordinary reflective idioms, and pins that the trade is visible", () => {
+    it("flags ordinary reflective idioms, and pins that the trade is visible", async () => {
       // `this.constructor.name` and `v.constructor === Object` load nothing and
       // evaluate nothing. They fail the gate anyway, because the object's type
       // is exactly what this rule refuses to guess. Pinned here so `WP-220` and
       // later owners meet the trade in a test rather than in CI, and so a
       // reviewer who thinks it is the wrong call has something concrete to
       // point at (`docs/handoffs/WP-015.md` known_risks 10).
-      const report = runCheckerJson(
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [ledgerFile]: [
@@ -2320,8 +2454,8 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       expect(locationsMatching(report, acquisitionMessage)).toEqual([`${ledgerFile}:3`, `${ledgerFile}:6`]);
     });
 
-    it("keeps the documented replacements clean", () => {
-      const run = runChecker(
+    it("keeps the documented replacements clean", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [ledgerFile]: [
@@ -2385,8 +2519,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
   const strategyPackageName = "@polymarket-bot/strategy-static-bracket";
 
   describe("`process.mainModule.require(...)` is a require-load, closing follow_up 10", () => {
-    it("closes the review's `process.mainModule.require(\"ethers\")` in simulation (.cjs)", () => {
-      const run = runChecker(
+    it("closes the review's `process.mainModule.require(\"ethers\")` in simulation (.cjs)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { "packages/simulation/src/probe.cjs": 'exports.signer = process.mainModule.require("ethers");\n' },
         }),
@@ -2397,8 +2531,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("src/probe.cjs:1");
     });
 
-    it("closes the same load in a `.ts` compiled to CommonJS", () => {
-      const run = runChecker(
+    it("closes the same load in a `.ts` compiled to CommonJS", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [simulationFile]: 'export const signer = process.mainModule.require("ethers");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -2407,8 +2541,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("src/probe.ts:1");
     });
 
-    it("classifies the signer load in a strategy as F3 (beside the incidental `process` read)", () => {
-      const run = runChecker(
+    it("classifies the signer load in a strategy as F3 (beside the incidental `process` read)", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [strategyFile]: 'export const signer = process.mainModule.require("ethers");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -2418,8 +2552,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("process global (`process.*`)");
     });
 
-    it("classifies the built-in load in packages/domain as F2 (beside the F1 `process` read)", () => {
-      const run = runChecker(
+    it("classifies the built-in load in packages/domain as F2 (beside the F1 `process` read)", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [domainFile]: 'export const fs = process.mainModule.require("node:fs");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -2429,8 +2563,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
   });
 
   describe("`require.main` is the same `Module` object", () => {
-    it("reads `require.main.require(\"node:fs\")` in a strategy as the precise F3 (was an escape)", () => {
-      const run = runChecker(
+    it("reads `require.main.require(\"node:fs\")` in a strategy as the precise F3 (was an escape)", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [strategyFile]: 'export const fs = require.main.require("node:fs");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -2440,8 +2574,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
   });
 
   describe("the whole carrier chain resolves", () => {
-    it("resolves `globalThis.process.mainModule.require(\"ethers\")` in simulation", () => {
-      const run = runChecker(
+    it("resolves `globalThis.process.mainModule.require(\"ethers\")` in simulation", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [simulationFile]: 'export const signer = globalThis.process.mainModule.require("ethers");\n' },
         }),
@@ -2451,8 +2585,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("live signer surface");
     });
 
-    it("follows a tracked `const p = process; p.mainModule.require(\"ethers\")`", () => {
-      const run = runChecker(
+    it("follows a tracked `const p = process; p.mainModule.require(\"ethers\")`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: ["const p = process;", 'export const signer = p.mainModule.require("ethers");'].join("\n"),
@@ -2464,8 +2598,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("follows a `const { mainModule } = process` destructure", () => {
-      const run = runChecker(
+    it("follows a `const { mainModule } = process` destructure", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: ["const { mainModule } = process;", 'export const signer = mainModule.require("ethers");'].join(
@@ -2479,8 +2613,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("follows an aliased `const m = process.mainModule; m.require(\"ethers\")`", () => {
-      const run = runChecker(
+    it("follows an aliased `const m = process.mainModule; m.require(\"ethers\")`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: ["const m = process.mainModule;", 'export const signer = m.require("ethers");'].join("\n"),
@@ -2494,8 +2628,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
   });
 
   describe("computed forms fail closed", () => {
-    it("reports a computed `process.mainModule.require(x)` specifier as F-OPAQUE", () => {
-      const run = runChecker(
+    it("reports a computed `process.mainModule.require(x)` specifier as F-OPAQUE", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: ["declare const x: string;", "export const mod = process.mainModule.require(x);"].join("\n"),
@@ -2507,8 +2641,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("calls `require()` whose specifier is a non-literal expression");
     });
 
-    it("reports a computed member `process.mainModule[\"req\"+\"uire\"](\"node:fs\")` as fail-closed", () => {
-      const run = runChecker(
+    it("reports a computed member `process.mainModule[\"req\"+\"uire\"](\"node:fs\")` as fail-closed", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [simulationFile]: 'export const fs = process.mainModule["req" + "uire"]("node:fs");\n' },
         }),
@@ -2519,8 +2653,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("a CommonJS `Module` object");
     });
 
-    it("reports `process.mainModule` escaping into a call argument as F-OPAQUE", () => {
-      const run = runChecker(
+    it("reports `process.mainModule` escaping into a call argument as F-OPAQUE", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: ["declare function wire(mod: unknown): void;", "export const done = wire(process.mainModule);"].join(
@@ -2537,8 +2671,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
   });
 
   describe("the ledger forbids the routes it forbids, and no more", () => {
-    it("closes the F4 strategy-import route through `process.mainModule.require(...)`", () => {
-      const run = runChecker(
+    it("closes the F4 strategy-import route through `process.mainModule.require(...)`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [ledgerFile]: `export const strat = process.mainModule.require("${strategyPackageName}");\n` },
         }),
@@ -2548,8 +2682,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("imports strategy implementation `packages/strategies/static-bracket`");
     });
 
-    it("closes the same F4 route through `require.main.require(...)`", () => {
-      const run = runChecker(
+    it("closes the same F4 route through `require.main.require(...)`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: { [ledgerFile]: `export const strat = require.main.require("${strategyPackageName}");\n` },
         }),
@@ -2558,8 +2692,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("FAIL [F4]");
     });
 
-    it("reports a computed `process.mainModule.require(x)` in the ledger as F-OPAQUE", () => {
-      const run = runChecker(
+    it("reports a computed `process.mainModule.require(x)` in the ledger as F-OPAQUE", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [ledgerFile]: ["declare const x: string;", "export const mod = process.mainModule.require(x);"].join("\n"),
@@ -2571,8 +2705,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("packages/ledger");
     });
 
-    it("leaves `process.mainModule.require(\"ethers\")` in the ledger clean — the ledger may import a signer (F4 is its only specifier rule)", () => {
-      const run = runChecker(
+    it("leaves `process.mainModule.require(\"ethers\")` in the ledger clean — the ledger may import a signer (F4 is its only specifier rule)", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [ledgerFile]: 'export const signer = process.mainModule.require("ethers");\n' } }),
       );
       expect(run.output).toContain("PASS");
@@ -2581,8 +2715,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
   });
 
   describe("self-audit: the other ambient module-graph routes remain findings", () => {
-    it("keeps `module.parent.require(...)` an F-OPAQUE escape (bare `module` is a loader capability)", () => {
-      const run = runChecker(
+    it("keeps `module.parent.require(...)` an F-OPAQUE escape (bare `module` is a loader capability)", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [simulationFile]: 'export const signer = module.parent.require("ethers");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -2590,8 +2724,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.output).toContain("a CommonJS `Module` object");
     });
 
-    it("keeps `module.children[0].require(...)` an F-OPAQUE escape", () => {
-      const run = runChecker(
+    it("keeps `module.children[0].require(...)` an F-OPAQUE escape", async () => {
+      const run = await runChecker(
         buildFixture({ files: { [simulationFile]: 'export const signer = module.children[0].require("ethers");\n' } }),
       );
       expect(run.status).toBe(1);
@@ -2600,8 +2734,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
   });
 
   describe("negatives: the new branch adds no noise outside its scope", () => {
-    it("leaves `process.mainModule` alone in an unrestricted package", () => {
-      const run = runChecker(
+    it("leaves `process.mainModule` alone in an unrestricted package", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "apps/ops-cli/src/probe.ts": [
@@ -2616,8 +2750,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.status).toBe(0);
     });
 
-    it("leaves a legitimately-named local `mainModule` that is not process's alone", () => {
-      const run = runChecker(
+    it("leaves a legitimately-named local `mainModule` that is not process's alone", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2631,8 +2765,8 @@ describe("dependency-direction check — round-7 mainModule-loader regressions",
       expect(run.status).toBe(0);
     });
 
-    it("keeps this repository passing", () => {
-      const run = runChecker(buildFixture());
+    it("keeps this repository passing", async () => {
+      const run = await runChecker(buildFixture());
       expect(run.output).toContain("PASS");
       expect(run.status).toBe(0);
     });
@@ -2671,8 +2805,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
   const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
 
   describe("the four review probe spellings load a signer in simulation (F5)", () => {
-    it("catches a renamed `createRequire as cr`: `cr(import.meta.url)(\"ethers\")`", () => {
-      const run = runChecker(
+    it("catches a renamed `createRequire as cr`: `cr(import.meta.url)(\"ethers\")`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2689,8 +2823,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("catches `M._load(\"ethers\", new M(import.meta.url), false)`", () => {
-      const run = runChecker(
+    it("catches `M._load(\"ethers\", new M(import.meta.url), false)`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2706,8 +2840,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("catches `new M(import.meta.url).require(\"ethers\")`", () => {
-      const run = runChecker(
+    it("catches `new M(import.meta.url).require(\"ethers\")`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2723,8 +2857,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("catches `M.prototype.require.call(new M(import.meta.url), \"ethers\")`", () => {
-      const run = runChecker(
+    it("catches `M.prototype.require.call(new M(import.meta.url), \"ethers\")`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2742,8 +2876,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
   });
 
   describe("the unrenamed named forms and the CJS destructure mirror", () => {
-    it("catches an unrenamed `import { Module }` then `Module._load(\"ethers\", ...)`", () => {
-      const run = runChecker(
+    it("catches an unrenamed `import { Module }` then `Module._load(\"ethers\", ...)`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2759,8 +2893,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("catches the default-style `import { createRequire }` then `createRequire(...)(\"ethers\")`", () => {
-      const run = runChecker(
+    it("catches the default-style `import { createRequire }` then `createRequire(...)(\"ethers\")`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2775,8 +2909,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("live signer surface");
     });
 
-    it("catches the `.cjs` destructure `const { Module } = require(\"node:module\")`", () => {
-      const run = runChecker(
+    it("catches the `.cjs` destructure `const { Module } = require(\"node:module\")`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/simulation/src/probe.cjs": [
@@ -2792,8 +2926,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("src/probe.cjs:2");
     });
 
-    it("catches the renamed CJS destructure `const { createRequire: cr } = require(\"node:module\")`", () => {
-      const run = runChecker(
+    it("catches the renamed CJS destructure `const { createRequire: cr } = require(\"node:module\")`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "packages/simulation/src/probe.cjs": [
@@ -2811,8 +2945,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
   });
 
   describe("the named `register` export is a dynamic-import loader", () => {
-    it("classifies `register(\"ethers\")` in simulation as an F5 load", () => {
-      const run = runChecker(
+    it("classifies `register(\"ethers\")` in simulation as an F5 load", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2828,8 +2962,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("reports a computed `register(spec)` specifier as F-OPAQUE", () => {
-      const run = runChecker(
+    it("reports a computed `register(spec)` specifier as F-OPAQUE", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2847,8 +2981,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
   });
 
   describe("computed and escaping forms of a named `Module` import fail closed", () => {
-    it("reports a computed `M[\"_lo\"+\"ad\"](\"ethers\")` as fail-closed", () => {
-      const run = runChecker(
+    it("reports a computed `M[\"_lo\"+\"ad\"](\"ethers\")` as fail-closed", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2864,8 +2998,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("the `node:module` `Module` class");
     });
 
-    it("reports a computed `M._load(x)` specifier as F-OPAQUE", () => {
-      const run = runChecker(
+    it("reports a computed `M._load(x)` specifier as F-OPAQUE", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2881,8 +3015,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("calls `Module._load()` whose specifier is a non-literal expression");
     });
 
-    it("reports a bare `Module` escaping into a call argument as F-OPAQUE", () => {
-      const run = runChecker(
+    it("reports a bare `Module` escaping into a call argument as F-OPAQUE", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2901,8 +3035,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
   });
 
   describe("named imports classify in a strategy (F3), and namespace/default forms do not regress", () => {
-    it("classifies a named `Module._load(\"node:fs\")` in a strategy as F3, plus the F3 on the import", () => {
-      const run = runChecker(
+    it("classifies a named `Module._load(\"node:fs\")` in a strategy as F3, plus the F3 on the import", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -2919,8 +3053,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("src/probe.ts:2");
     });
 
-    it("keeps a namespace `mod.Module._load(\"ethers\")` flagging (no regression)", () => {
-      const run = runChecker(
+    it("keeps a namespace `mod.Module._load(\"ethers\")` flagging (no regression)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2935,8 +3069,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.output).toContain("live signer surface");
     });
 
-    it("keeps a namespace `mod.createRequire(...)(\"ethers\")` flagging (no regression)", () => {
-      const run = runChecker(
+    it("keeps a namespace `mod.createRequire(...)(\"ethers\")` flagging (no regression)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2953,8 +3087,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
   });
 
   describe("negatives: inert exports and unrestricted packages add no noise", () => {
-    it("leaves inert `import { builtinModules, isBuiltin }` used inertly clean in simulation", () => {
-      const run = runChecker(
+    it("leaves inert `import { builtinModules, isBuiltin }` used inertly clean in simulation", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -2969,8 +3103,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.status).toBe(0);
     });
 
-    it("leaves the named loader imports alone in an unrestricted package (apps/ops-cli)", () => {
-      const run = runChecker(
+    it("leaves the named loader imports alone in an unrestricted package (apps/ops-cli)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "apps/ops-cli/src/probe.ts": [
@@ -2987,8 +3121,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.status).toBe(0);
     });
 
-    it("leaves a genuine local `Module` unrelated to node:module clean", () => {
-      const run = runChecker(
+    it("leaves a genuine local `Module` unrelated to node:module clean", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -3006,8 +3140,8 @@ describe("dependency-direction check — round-8 named-node:module-import regres
       expect(run.status).toBe(0);
     });
 
-    it("keeps this repository passing", () => {
-      const run = runChecker(buildFixture());
+    it("keeps this repository passing", async () => {
+      const run = await runChecker(buildFixture());
       expect(run.output).toContain("PASS");
       expect(run.status).toBe(0);
     });
@@ -3046,8 +3180,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
   const strategyFile = "packages/strategies/static-bracket/src/probe.ts";
 
   describe("a capability-bearing `new` result that escapes is a finding", () => {
-    it("closes the review probe `load(new M(__filename))` (the helper param is untracked)", () => {
-      const run = runChecker(
+    it("closes the review probe `load(new M(__filename))` (the helper param is untracked)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -3065,7 +3199,7 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
       // The escape is the `new M(...)` argument on line 3, not the untracked
       // `mod.require("ethers")` on line 2 (which stays invisible until the
       // positive rule lands) nor the `const { Module: M }` binding on line 1.
-      const report = runCheckerJson(
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -3079,8 +3213,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
       expect(locationsMatching(report, "escapes into")).toEqual(["packages/simulation/src/probe.ts:3"]);
     });
 
-    it("flags the same escape in a strategy, beside the F3 on the `node:module` import", () => {
-      const run = runChecker(
+    it("flags the same escape in a strategy, beside the F3 on the `node:module` import", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -3099,8 +3233,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
       expect(run.output).toContain("src/probe.ts:3");
     });
 
-    it("reports `[new M(url)]` as an array-literal-element escape", () => {
-      const report = runCheckerJson(
+    it("reports `[new M(url)]` as an array-literal-element escape", async () => {
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -3118,8 +3252,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
       expect(escapes.every((entry) => entry.message.includes("escapes into an array-literal element"))).toBe(true);
     });
 
-    it("reports `return new M(url)` as a return-value escape", () => {
-      const report = runCheckerJson(
+    it("reports `return new M(url)` as a return-value escape", async () => {
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -3136,11 +3270,11 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
       expect(escapes.every((entry) => entry.message.includes("escapes into a return value"))).toBe(true);
     });
 
-    it("consumes the `new M(url)` initializer but flags the tracked alias that escapes (round-4)", () => {
+    it("consumes the `new M(url)` initializer but flags the tracked alias that escapes (round-4)", async () => {
       // `const x = new M(url)` binds a tracked `CAP_MODULE` alias: the
       // initializer is consumed (no escape on line 3), and it is the alias
       // reference `x` leaving as a call argument on line 4 that is the finding.
-      const report = runCheckerJson(
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -3161,8 +3295,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
   });
 
   describe("the analysed `new`-result positions stay the precise F5 and are not double-reported", () => {
-    it("keeps the direct chain `new M(url).require(\"ethers\")` a single F5 (the `new` result is absorbed)", () => {
-      const report = runCheckerJson(
+    it("keeps the direct chain `new M(url).require(\"ethers\")` a single F5 (the `new` result is absorbed)", async () => {
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -3177,8 +3311,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
       expect(locationsMatching(report, "escapes into")).toEqual([]);
     });
 
-    it("keeps `M.prototype.require.call(new M(url), \"ethers\")` a single F5 (the `new` result is the analysed thisArg)", () => {
-      const report = runCheckerJson(
+    it("keeps `M.prototype.require.call(new M(url), \"ethers\")` a single F5 (the `new` result is the analysed thisArg)", async () => {
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -3193,8 +3327,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
       expect(locationsMatching(report, "escapes into")).toEqual([]);
     });
 
-    it("keeps `M._load(\"ethers\", new M(url), false)` a single F5 (the `new` result is the analysed parent arg)", () => {
-      const report = runCheckerJson(
+    it("keeps `M._load(\"ethers\", new M(url), false)` a single F5 (the `new` result is the analysed parent arg)", async () => {
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -3211,8 +3345,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
   });
 
   describe("negatives: the `new`-escape rule stays inside its boundary", () => {
-    it("leaves a `new Module(...)` that escapes alone in an unrestricted package (apps/ops-cli)", () => {
-      const run = runChecker(
+    it("leaves a `new Module(...)` that escapes alone in an unrestricted package (apps/ops-cli)", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             "apps/ops-cli/src/probe.ts": [
@@ -3228,8 +3362,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
       expect(run.status).toBe(0);
     });
 
-    it("leaves a genuine local `class Module {}` instance clean — the capability must come from `node:module`", () => {
-      const run = runChecker(
+    it("leaves a genuine local `class Module {}` instance clean — the capability must come from `node:module`", async () => {
+      const run = await runChecker(
         buildFixture({
           files: {
             [simulationFile]: [
@@ -3252,8 +3386,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
   });
 
   describe("symmetry: a `require`-capability CALL result that escapes was already a finding", () => {
-    it("pins that `pass(createRequire(url))` (no intervening binding) is an F-OPAQUE call-result escape", () => {
-      const report = runCheckerJson(
+    it("pins that `pass(createRequire(url))` (no intervening binding) is an F-OPAQUE call-result escape", async () => {
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -3272,8 +3406,8 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
       expect(escapes.every((entry) => entry.message.includes("escapes into a call argument"))).toBe(true);
     });
 
-    it("pins that a `const r = createRequire(url)` alias escaping is an F-OPAQUE finding (round-4)", () => {
-      const report = runCheckerJson(
+    it("pins that a `const r = createRequire(url)` alias escaping is an F-OPAQUE finding (round-4)", async () => {
+      const report = await runCheckerJson(
         buildFixture({
           files: {
             [strategyFile]: [
@@ -3295,22 +3429,22 @@ describe("dependency-direction check — round-9 new-result-escape regressions",
 });
 
 describe("dependency-direction check CLI", () => {
-  it("prints usage and exits 0 for --help", () => {
-    const result = spawnSync(process.execPath, [checkerPath, "--help"], { encoding: "utf8", cwd: repoRoot });
+  it("prints usage and exits 0 for --help", async () => {
+    const result = await spawnNode([checkerPath, "--help"], repoRoot);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("Usage: node tools/check-dependency-direction.mjs");
   });
 
-  it("exits 2 on an unknown argument", () => {
-    const result = spawnSync(process.execPath, [checkerPath, "--nope"], { encoding: "utf8", cwd: repoRoot });
+  it("exits 2 on an unknown argument", async () => {
+    const result = await spawnNode([checkerPath, "--nope"], repoRoot);
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("unknown argument: --nope");
   });
 
-  it("reports the missing contract instead of passing silently", () => {
+  it("reports the missing contract instead of passing silently", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "wp015-empty-"));
     temporaryRoots.push(root);
-    const run = runChecker(root);
+    const run = await runChecker(root);
     expect(run.status).toBe(1);
     expect(run.output).toContain("FAIL [CHK]");
     expect(run.output).toContain("could not be read");

@@ -52,8 +52,9 @@
  * `Array.prototype` fallback, `Array.prototype` itself fail-closed — is
  * recorded at `packages/decimal/src/prototype-guard.ts`.
  */
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
@@ -680,60 +681,80 @@ describe("the refusal path restores BOTH intrinsics exactly (r2 LOW-1)", () => {
 
   const MODES = ["A", "B", "C", "D"] as const;
 
+  /**
+   * Awaited, never synchronous (`CI-1`): a worker blocked on a child cannot
+   * read vitest's own RPC replies (`test/unit/tooling/no-synchronous-spawn.test.ts`
+   * says why that fails a run). Like the synchronous form, it rejects on a
+   * non-zero exit, on the timeout and on an output overflow.
+   */
+  const execFileAsync = promisify(execFile);
+
+  /** The per-spawn ceiling: the bound that ENDS a hung probe (see `probe`). */
+  const PROBE_CEILING_MS = 20_000;
+
+  /**
+   * Each probe test's timeout, set above the ceiling (`CI-1`). While the spawn
+   * was synchronous nothing could interrupt it, so the ceiling always fired
+   * first: it killed the child and the test failed with the spawn's own error.
+   * Awaited, vitest's 5 s default would fire first instead and leave the child
+   * running past its test. This keeps the original order.
+   */
+  const PROBE_TEST_TIMEOUT_MS = PROBE_CEILING_MS + 10_000;
+
   /** One spawn per mode, memoized: four processes for the whole block. */
   const answers = new Map<string, ProbeAnswer>();
-  function probe(mode: string): ProbeAnswer {
+  async function probe(mode: string): Promise<ProbeAnswer> {
     const held = answers.get(mode);
     if (held !== undefined) return held;
-    const printed = execFileSync(
+    const { stdout: printed } = await execFileAsync(
       process.execPath,
       ["--input-type=module", "--eval", PROBE_SOURCE, DECIMAL_SRC, mode],
       // The ceiling exists for the reason `WP-020-FU1` review round 1 M2 gives:
       // a spawn that hangs under a hostile prototype must fail the gate loudly
       // rather than sit at vitest's default.
-      { encoding: "utf8", timeout: 20_000, maxBuffer: 4 * 1024 * 1024 },
+      { encoding: "utf8", timeout: PROBE_CEILING_MS, maxBuffer: 4 * 1024 * 1024 },
     );
     const parsed = JSON.parse(printed.trim()) as ProbeAnswer;
     answers.set(mode, parsed);
     return parsed;
   }
 
-  it("every mode REFUSES with the typed code — no value is computed", () => {
+  it("every mode REFUSES with the typed code — no value is computed", async () => {
     for (const mode of MODES) {
-      expect(probe(mode).answer, mode).toBe(
+      expect((await probe(mode)).answer, mode).toBe(
         "THREW HostilePrototypeError(DECIMAL_HOSTILE_PROTOTYPE)",
       );
     }
-  });
+  }, PROBE_TEST_TIMEOUT_MS);
 
-  it("…and both intrinsics come back EXACTLY, descriptor for descriptor", () => {
+  it("…and both intrinsics come back EXACTLY, descriptor for descriptor", async () => {
     for (const mode of MODES) {
-      const answer = probe(mode);
+      const answer = await probe(mode);
       // Descriptor identity at every name the snapshot covers, on BOTH
       // intrinsics — including names the mode does not touch, so a shadow left
       // behind at a name nobody polluted fails here as well.
       expect(answer.after, `mode ${mode}`).toEqual(answer.before);
     }
-  });
+  }, PROBE_TEST_TIMEOUT_MS);
 
-  it("…including `Array.prototype.length` and both own-name lists", () => {
+  it("…including `Array.prototype.length` and both own-name lists", async () => {
     // Stated separately from the deep equality above so a future rewrite of the
     // snapshot cannot quietly drop these three. The length is the `arrayLength`
     // undo entry; the name lists are how a leftover shadow becomes visible.
     for (const mode of MODES) {
-      const { before, after } = probe(mode);
+      const { before, after } = await probe(mode);
       expect(after["Array.length"], `mode ${mode} length`).toBe(before["Array.length"]);
       expect(after["Array.names"], `mode ${mode} Array names`).toBe(before["Array.names"]);
       expect(after["Object.names"], `mode ${mode} Object names`).toBe(before["Object.names"]);
     }
-  });
+  }, PROBE_TEST_TIMEOUT_MS);
 
-  it("NON-VACUITY: the modes really are DUAL, and they are four distinct states", () => {
+  it("NON-VACUITY: the modes really are DUAL, and they are four distinct states", async () => {
     // A mode that polluted only one intrinsic, or four modes that installed the
     // same state, would satisfy everything above while measuring one case.
     const states: string[] = [];
     for (const mode of MODES) {
-      const { before } = probe(mode);
+      const { before } = await probe(mode);
       const polluted = (prefix: string): string[] =>
         Object.keys(before)
           .filter((key) => key.startsWith(prefix) && !key.endsWith("names"))
@@ -747,5 +768,5 @@ describe("the refusal path restores BOTH intrinsics exactly (r2 LOW-1)", () => {
       );
     }
     expect(new Set(states).size, "the four modes are four distinct states").toBe(MODES.length);
-  });
+  }, PROBE_TEST_TIMEOUT_MS);
 });

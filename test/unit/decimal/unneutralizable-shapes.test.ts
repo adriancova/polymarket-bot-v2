@@ -46,11 +46,20 @@
  * (`Array.prototype.length` back where it was, descriptors deep-equal).
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
+
+/**
+ * Awaited, never synchronous (`CI-1`): a worker blocked on a child cannot read
+ * vitest's own RPC replies (`test/unit/tooling/no-synchronous-spawn.test.ts`
+ * says why that fails a run). Like the synchronous form, it rejects on a
+ * non-zero exit, on the timeout and on an output overflow.
+ */
+const execFileAsync = promisify(execFile);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PROBE = resolve(HERE, "prototype-shape-probe.ts");
@@ -100,16 +109,18 @@ interface ProbeResult {
   readonly after: ProbeState;
 }
 
-function probe(
+async function probe(
   intrinsic: "Array" | "Object",
   name: string,
   shape: Shape,
   configurable: boolean,
-): ProbeResult {
-  const stdout = execFileSync(
+): Promise<ProbeResult> {
+  // `execFile` takes no `stdio` option (its stdin is always a pipe); the probe
+  // never reads stdin, so the former `"ignore"` changed nothing observable.
+  const { stdout } = await execFileAsync(
     process.execPath,
     [PROBE, intrinsic, name, shape, String(configurable)],
-    { encoding: "utf8", timeout: PROBE_TIMEOUT_MS, stdio: ["ignore", "pipe", "pipe"] },
+    { encoding: "utf8", timeout: PROBE_TIMEOUT_MS },
   );
   return JSON.parse(stdout) as ProbeResult;
 }
@@ -164,8 +175,8 @@ describe(
      * `set-only` and `get-set` into `refused` at this tip — and into
      * FABRICATION at round 0's tip, where there was no refusal to fall into.
      */
-    it.each(SHAPES)('Object.prototype["0"] non-configurable %s answers as a clean process', (shape) => {
-      const result = probe("Object", "0", shape, false);
+    it.each(SHAPES)('Object.prototype["0"] non-configurable %s answers as a clean process', async (shape) => {
+      const result = await probe("Object", "0", shape, false);
       expect(verdictSet(result)).toStrictEqual(["byte-identical"]);
       expectIntrinsicsRestored(result);
       // The shadow is created on Array.prototype and must be gone afterwards,
@@ -174,8 +185,8 @@ describe(
       expect(result.after.onArray).toBe("absent");
     });
 
-    it("still answers as a clean process at a non-zero index", () => {
-      const result = probe("Object", "3", "get-set", false);
+    it("still answers as a clean process at a non-zero index", async () => {
+      const result = await probe("Object", "3", "get-set", false);
       expect(verdictSet(result)).toStrictEqual(["byte-identical"]);
       expectIntrinsicsRestored(result);
       expect(result.after.arrayLength).toBe(0);
@@ -193,8 +204,8 @@ describe(
      * non-configurable property that is still writable, so the guard does — and
      * at BASE this same shape made `addDecimal("100","-100")` answer `"9"`.
      */
-    it('Array.prototype["0"] non-configurable data-writable is neutralized in place', () => {
-      const result = probe("Array", "0", "data-writable", false);
+    it('Array.prototype["0"] non-configurable data-writable is neutralized in place', async () => {
+      const result = await probe("Array", "0", "data-writable", false);
       expect(verdictSet(result)).toStrictEqual(["byte-identical"]);
       expectIntrinsicsRestored(result);
       expect(result.after.onArray).toBe(
@@ -209,8 +220,8 @@ describe(
      */
     it.each(["data-readonly", "get-only", "set-only", "get-set"] as const)(
       'Array.prototype["0"] non-configurable %s is refused, never computed',
-      (shape) => {
-        const result = probe("Array", "0", shape, false);
+      async (shape) => {
+        const result = await probe("Array", "0", shape, false);
         expect(verdictSet(result)).toStrictEqual(["refused"]);
         expectIntrinsicsRestored(result);
         // The refusal names the intrinsic and the index, so an operator can find
@@ -221,8 +232,8 @@ describe(
       },
     );
 
-    it("refuses at a non-zero index too", () => {
-      const result = probe("Array", "2", "get-only", false);
+    it("refuses at a non-zero index too", async () => {
+      const result = await probe("Array", "2", "get-only", false);
       expect(verdictSet(result)).toStrictEqual(["refused"]);
       for (const answer of Object.values(result.polluted)) {
         expect(answer).toContain('Array.prototype["2"]');
@@ -241,8 +252,8 @@ describe(
      * neutralized and NOWHERE ELSE. A guard that refused on every polluted
      * process would pass the block above and be useless.
      */
-    it.each(SHAPES)('Array.prototype["0"] configurable %s answers as a clean process', (shape) => {
-      const result = probe("Array", "0", shape, true);
+    it.each(SHAPES)('Array.prototype["0"] configurable %s answers as a clean process', async (shape) => {
+      const result = await probe("Array", "0", shape, true);
       expect(verdictSet(result)).toStrictEqual(["byte-identical"]);
       expectIntrinsicsRestored(result);
     });
