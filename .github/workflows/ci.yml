@@ -9,10 +9,22 @@ on:
 permissions:
   contents: read
 
+# CI-2 (CI1-L5): every job sets `timeout-minutes`. Without it a hung step runs
+# to GitHub's 360-minute default, and since GATE1-R4 every gate runs even after
+# an earlier one failed, so any gate can hang. Each timeout below is based on
+# run 36284366946 (push of de8116d, the latest green push run on `main` when
+# CI-2 was cut; job durations from `gh run view 36284366946 --json jobs`). The
+# rule: 6x the measured job duration, rounded up to a whole 5 minutes, and never
+# under 10 minutes. The floor is for the two short jobs, which are mostly runner
+# setup, downloads and image pulls, and one run does not measure how much those
+# vary.
 jobs:
   node:
     name: TypeScript quality gates
     runs-on: ubuntu-latest
+    # Measured 277 s; 6x = 27.7 min -> 30 min (6.5x). The slowest green run of
+    # this job so far, PR run 36282501033, took 420 s; 30 min is 4.3x that.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -43,9 +55,34 @@ jobs:
       # are independent of one another: each reads only the checkout and
       # node_modules (every typecheck is `--noEmit`; the suites that need a
       # bundle build it inside their own tests).
-      - name: Typecheck
+      #
+      # CI-2 (CI1-L5): GATE1-R4 holds per STEP, so a script that is an `&&`
+      # chain in the root package.json (`typecheck`, `test:contract`,
+      # `test:integration`) runs here as one step per chained command, in the
+      # chain's order. Otherwise the chain's first failure would hide the rest
+      # of it. Each step runs its command exactly as the chain spells it. The
+      # one exception is a bare binary: `tsc` in a package script resolves
+      # through the `node_modules/.bin` that `pnpm run` puts on PATH, and a
+      # step's shell has no such PATH, so the step runs it through `pnpm exec`.
+      # test/unit/tooling/ci-step-split.test.ts fails when these steps and the
+      # chains diverge, or when a gate loses its `if:`. It also fails when any
+      # other gate runs an `&&` chain as one step: a root script it runs, or
+      # its own `run`.
+      - name: Typecheck 1/4 - every workspace package (pnpm -r run typecheck)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: pnpm typecheck
+        run: pnpm -r run typecheck
+
+      - name: Typecheck 2/4 - unit tests and their helpers (test/tsconfig.json)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm exec tsc -p test/tsconfig.json --noEmit
+
+      - name: Typecheck 3/4 - paper end-to-end suites (test/e2e/tsconfig.json)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm exec tsc -p test/e2e/tsconfig.json --noEmit
+
+      - name: Typecheck 4/4 - recorder soak harness (test/soak/recorder)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --dir test/soak/recorder run typecheck
 
       - name: Lint
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
@@ -86,9 +123,23 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test:fault
 
-      - name: Venue contract tests (offline fixtures)
+      # CI-2 (CI1-L5): the four `test:contract` suites, one step each (see
+      # the note above the typecheck steps). All four read offline fixtures.
+      - name: Venue contract tests 1/4 - Polymarket public market feed and REST (offline fixtures)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: pnpm test:contract
+        run: pnpm --filter @polymarket-bot/polymarket-public test:contract
+
+      - name: Venue contract tests 2/4 - Polymarket RTDS (offline fixtures)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/polymarket-public test:contract:rtds
+
+      - name: Venue contract tests 3/4 - Binance (offline fixtures)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/binance-adapter test:contract
+
+      - name: Venue contract tests 4/4 - Coinbase (offline fixtures)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/coinbase-adapter test:contract
 
       - name: Recorder soak-harness smoke (bounded, loopback-only; no elapsed-evidence claim)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
@@ -101,26 +152,53 @@ jobs:
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm audit --audit-level high
 
+      # CI-2 (CI1-L5): the six `test:integration` suites, one step each (see
+      # the note above the typecheck steps).
+      #
       # N5, recounted by CI-1 from each chained suite's vitest config and test
-      # sources: THREE of the six suites start Testcontainers, so this step
-      # needs a host Docker daemon. `test/integration/postgres` (14 files,
-      # PostgreSQL) and `test/integration/event-bus` (8 files, Redis) start
-      # theirs in the config's `globalSetup`. `test/integration/paper-trader`
-      # has no `globalSetup`; 4 of its 14 files start their own in `beforeAll`
-      # (`durable-pnl-snapshot-postgres`, `durable-trader-first-fill-postgres`,
-      # `trader-health-endpoint-postgres`: PostgreSQL;
-      # `univ-4-gateway-opens-trader-redis`: PostgreSQL and Redis). The other
-      # three suites — data-gateway (12), control-api (10), parquet (4) — start
-      # none; with paper-trader's 10 in-memory files, 36 of the 62 files start
-      # no container. GATE-1 (GOV-2B N5) wrote "two of them", true at its base;
-      # TRDR-2, BOOT-1, TRDR-3 and UNIV-4 then added the four paper-trader files.
-      - name: Integration tests (six workspace suites; Testcontainers PostgreSQL and Redis in three of them - postgres, event-bus, paper-trader)
+      # sources, and re-checked by CI-2: THREE of the six suites start
+      # Testcontainers, so their steps need a host Docker daemon.
+      # `test/integration/postgres` (14 files, PostgreSQL) and
+      # `test/integration/event-bus` (8 files, Redis) start theirs in the
+      # config's `globalSetup`. `test/integration/paper-trader` (the trader's
+      # suite) has no `globalSetup`; 4 of its 14 files start their own in
+      # `beforeAll` (`durable-pnl-snapshot-postgres`,
+      # `durable-trader-first-fill-postgres`, `trader-health-endpoint-postgres`:
+      # PostgreSQL; `univ-4-gateway-opens-trader-redis`: PostgreSQL and Redis).
+      # The other three suites — parquet (4 files, research-worker), data-gateway
+      # (12), control-api (10) — start none; with paper-trader's 10 in-memory
+      # files, 36 of the 62 files start no container. GATE-1 (GOV-2B N5) wrote
+      # "two of them", true at its base; TRDR-2, BOOT-1, TRDR-3 and UNIV-4 then
+      # added the four paper-trader files.
+      - name: Integration tests 1/6 - storage-postgres (Testcontainers PostgreSQL)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        run: pnpm test:integration
+        run: pnpm --filter @polymarket-bot/storage-postgres test:integration
+
+      - name: Integration tests 2/6 - event-bus (Testcontainers Redis)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/event-bus test:integration
+
+      - name: Integration tests 3/6 - research-worker parquet (no container)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/research-worker test:integration
+
+      - name: Integration tests 4/6 - data-gateway (no container)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/data-gateway test:integration
+
+      - name: Integration tests 5/6 - trader paper-trader (Testcontainers PostgreSQL and Redis in 4 of its 14 files)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/trader test:integration
+
+      - name: Integration tests 6/6 - control-api (no container)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: pnpm --filter @polymarket-bot/control-api test:integration
 
   compose:
     name: Local infrastructure compose health
     runs-on: ubuntu-latest
+    # Measured 16 s; 6x = 1.6 min -> the 10 min floor (37.5x).
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -135,6 +213,8 @@ jobs:
   python:
     name: Python research workspace
     runs-on: ubuntu-latest
+    # Measured 26 s; 6x = 2.6 min -> the 10 min floor (23x).
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: python
@@ -152,6 +232,8 @@ jobs:
 
       # CI-1 (GATE1-R4), as in the `node` job: both gates run whenever the
       # frozen sync succeeded, so a failing Pytest no longer hides the scan.
+      # CI-2 r1: test/unit/tooling/ci-step-split.test.ts pins this `if:` on
+      # every step after `id: sync`.
       - name: Pytest
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run pytest
