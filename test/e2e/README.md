@@ -67,11 +67,12 @@ persisted that no chain accounts for, which forward resolution can never show.
 | `support/artifact.ts` | captures what the run PERSISTED into one plain document |
 | `support/canonical-json.ts` | the canonical byte form, with a §6-invariant-1 float guard |
 | `support/chain-walk.ts` | the outside-in, closed-world traceability walk |
-| `support/reconcile.ts` | projected-vs-realized rows with named mechanisms and exact residuals |
+| `support/reconcile.ts` | projected-vs-realized rows with named mechanisms and exact residuals; every fill and order attributed to the entry or an exit by id or refused, and the open cost basis restated from `packages/pnl`'s average-cost specification, folded in `atEventIngestSeq` order (`RECON-1`) |
 | `support/golden.ts` | the committed golden's path, reader and deliberately-fatal regenerator |
 | `traceability-chain.test.ts` | acceptance 1, over the run's bytes AND over the committed golden |
 | `traceability-chain-negative.test.ts` | one mutation per hop, plus one per document-level finding: the walk must be falsifiable |
 | `projection-reconciliation.test.ts` | acceptance 2, with four falsifiability probes |
+| `reconciliation-attribution.test.ts` | `RECON-1`: synthetic artefacts built from the golden that pin the reconciler's by-id exit attribution and refusals (`RISK2-R3`), its sequence-ordered fold (`RISK2-R4`), and its agreement with the real `packages/pnl` engine on partial exits |
 | `determinism-golden.test.ts` | two fresh runs byte-identical to each other and to the committed golden |
 | `residuals-observed.test.ts` | the four known residuals, observed and never fought |
 | `safety-posture.test.ts` | the four repository floors, refused not clamped, plus a scan of this package's own files |
@@ -91,5 +92,5 @@ permitted set.
 | Criterion | Named by |
 | --- | --- |
 | 1 — the traceability chain is complete | `traceability-chain.test.ts` ("every hop resolves by id, in every chain, over the run's own bytes" and the golden twin), made falsifiable by `traceability-chain-negative.test.ts` |
-| 2 — zero unexplained projection difference | `projection-reconciliation.test.ts` ("every row is explained…"), made falsifiable by the four probes in the same file |
+| 2 — zero unexplained projection difference | `projection-reconciliation.test.ts` ("every row is explained…"), made falsifiable by the four probes in the same file; the reconciler's own attribution and cost method are pinned by `reconciliation-attribution.test.ts` |
 | 3 — time-based paper evidence remains explicitly pending | an HONESTY criterion, discharged in `docs/experiments/phase-2-verification.md`. **No soak, execution probe or live gate has occurred, and this suite claims none.** |
