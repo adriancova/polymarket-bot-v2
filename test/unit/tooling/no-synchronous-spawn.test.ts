@@ -245,10 +245,12 @@ describe("no synchronous child-process API in any test helper module under test/
 
   it("scans a real file list: the Git index's helper modules under test/", async () => {
     const files = await listTrackedHelperModules();
-    // Non-vacuity, as above: 80 helper modules were tracked when CI-2 added
-    // this scan.
+    // Non-vacuity, as above: 81 helper modules were tracked at the commit that
+    // added this scan. That is the 80 of CI-2's base, plus CI-2's own
+    // `ci-workflow.ts`, which the list below names.
     expect(files.length).toBeGreaterThan(50);
     for (const expected of [
+      "test/unit/tooling/ci-workflow.ts",
       "test/unit/decimal/arithmetic-fold.ts",
       "test/unit/decimal/prototype-shape-probe.ts",
       "test/e2e/support/harness.ts",

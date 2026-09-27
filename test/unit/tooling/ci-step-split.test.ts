@@ -17,9 +17,16 @@
  * - split steps out of the chain's order, or named for the wrong position;
  * - a step that looks like a split step (by its name or its command) but runs
  *   no chained command, including the old one-step `pnpm typecheck`;
- * - a gate after the install step without
+ * - a gate after the node job's install step without
  *   `if: ${{ !cancelled() && steps.install.outcome == 'success' }}`, or with a
  *   key a gate may not have (`continue-on-error`, `env`, …);
+ * - the same for the python job's gates after its sync step, which need
+ *   `if: ${{ !cancelled() && steps.sync.outcome == 'success' }}` (`CI-2` r1);
+ * - a gate that runs an `&&` chain as ONE step outside the split steps: a
+ *   root script it runs (`pnpm <script>`, directly or through other root
+ *   scripts) is a chain other than the three split ones, or its own `run`
+ *   holds `&&` (`CI-2` r1, L5-1). Without this, the `CI1-L5` hazard could
+ *   return through any other script, such as `test:fault`;
  * - a job without a `timeout-minutes` below GitHub's 360-minute default.
  *
  * HOW. `ci-workflow.ts` reads the workflow with a conservative YAML-subset
@@ -37,6 +44,7 @@ import { describe, expect, it } from "vitest";
 import {
   GATE_IF,
   SPLIT_CHAINS,
+  type YamlValue,
   chainCommands,
   jobTimeoutFindings,
   nodeJobSteps,
@@ -138,6 +146,56 @@ function withScript(packageJson: string, script: string, text: string): string {
   if (typeof parsed.scripts[script] !== "string") throw new Error(`mutant: no script ${script}`);
   parsed.scripts[script] = text;
   return `${JSON.stringify(parsed, null, 2)}\n`;
+}
+
+/** A copy of `package.json` text with a NEW script `script` added. */
+function withAddedScript(packageJson: string, script: string, text: string): string {
+  const parsed = JSON.parse(packageJson) as { scripts: Record<string, string> };
+  if (script in parsed.scripts) throw new Error(`mutant: script ${script} already exists`);
+  parsed.scripts[script] = text;
+  return `${JSON.stringify(parsed, null, 2)}\n`;
+}
+
+/** The root `package.json` scripts, by name. */
+function scriptsOf(packageJson: string): Readonly<Record<string, string>> {
+  return (JSON.parse(packageJson) as { readonly scripts: Readonly<Record<string, string>> }).scripts;
+}
+
+/**
+ * The gating `if:` of the python job, spelled out here rather than imported,
+ * so the pin states the condition itself (`CI-2` r1, RES-PY).
+ */
+const SYNC_GATE_IF = "${{ !cancelled() && steps.sync.outcome == 'success' }}";
+
+function isYamlMapping(value: YamlValue | undefined): value is ReadonlyMap<string, YamlValue> {
+  return value instanceof Map;
+}
+
+interface ListedGate {
+  /** 1-based position of the step in its job, as the drift check's labels count it. */
+  readonly number: number;
+  readonly name: string;
+  readonly condition: YamlValue | undefined;
+}
+
+/**
+ * The steps of `job` after the step whose `id` is `setupId`, read with the
+ * YAML reader alone, not with the drift check under test.
+ */
+function gatesAfter(workflow: string, job: string, setupId: string): ListedGate[] {
+  const root = parseWorkflowYaml(workflow);
+  const jobs = isYamlMapping(root) ? root.get("jobs") : undefined;
+  const jobValue = isYamlMapping(jobs) ? jobs.get(job) : undefined;
+  const steps = isYamlMapping(jobValue) ? jobValue.get("steps") : undefined;
+  if (!Array.isArray(steps)) throw new Error(`fixture: jobs.${job}.steps is not a sequence`);
+  const list = steps as readonly YamlValue[];
+  const setup = list.findIndex((step) => isYamlMapping(step) && step.get("id") === setupId);
+  if (setup < 0) throw new Error(`fixture: jobs.${job} has no step with id ${setupId}`);
+  return list.slice(setup + 1).map((step, offset) => {
+    const name = isYamlMapping(step) ? step.get("name") : undefined;
+    if (!isYamlMapping(step) || typeof name !== "string") throw new Error(`fixture: a jobs.${job} gate has no name`);
+    return { number: setup + offset + 2, name, condition: step.get("if") };
+  });
 }
 
 /** The gate steps after install, as the drift check sees them. */
@@ -381,6 +439,125 @@ describe("the drift pin fails on each way the steps and the chains can diverge (
     expect(splitStepDrift(workflow, withScript(packageJson, "test:integration", swapped.join(" && ")))).toContainEqual(
       expect.stringContaining("comes before"),
     );
+  });
+
+  it("L5-1: the root script a non-split gate runs becomes an && chain — each such gate in turn", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const scripts = scriptsOf(packageJson);
+    const split = new Set<string>(SPLIT_CHAINS.map(({ script }) => script));
+    const scriptGates = gates(workflow).flatMap((gate) => {
+      const script = /^pnpm (?:run )?([^\s-]\S*)(?:\s|$)/u.exec(gate.run ?? "")?.[1];
+      return script !== undefined && script in scripts && !split.has(script) ? [{ gate, script }] : [];
+    });
+    // Non-vacuity: every node gate that runs a root script other than a split
+    // chain. `pnpm audit --audit-level high` runs pnpm's built-in `audit`,
+    // which the check (like this list) takes for the root script of that name:
+    // it can only over-report (see ci-workflow.ts).
+    expect(scriptGates.map(({ script }) => script)).toEqual([
+      "lint",
+      "check:deps",
+      "test",
+      "test:e2e",
+      "test:replay",
+      "test:fault",
+      "test:soak-smoke",
+      "audit",
+    ]);
+    for (const { gate, script } of scriptGates) {
+      expect(scripts[script], script).not.toContain("&&");
+      const copy = withScript(packageJson, script, `${scripts[script] ?? ""} && node tools/another-check.mjs`);
+      expect(splitStepDrift(workflow, copy), script).toEqual([
+        expect.stringContaining(
+          `${gate.label} runs the root script \`${script}\` as one step, and \`${script}\` is an \`&&\` chain`,
+        ),
+      ]);
+    }
+  });
+
+  it("L5-1: the review's two cases, test:fault and test:e2e each becoming a two-command chain", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const cases: readonly (readonly [string, string])[] = [
+      [
+        "test:fault",
+        "pnpm --filter @polymarket-bot/storage-wal test:fault && pnpm --filter @polymarket-bot/storage-postgres test:fault",
+      ],
+      ["test:e2e", "vitest run --config test/e2e/vitest.config.ts && vitest run --config test/e2e/other.config.ts"],
+    ];
+    for (const [script, chain] of cases) {
+      expect(splitStepDrift(workflow, withScript(packageJson, script, chain)), script).toEqual([
+        expect.stringContaining(`runs the root script \`${script}\` as one step`),
+      ]);
+    }
+  });
+
+  it("L5-1: a chain reached through another root script, or written into the step itself", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    // `test:fault` runs a new root script that is a chain.
+    const through = withAddedScript(
+      withScript(packageJson, "test:fault", "pnpm run test:fault:all"),
+      "test:fault:all",
+      "pnpm --filter @polymarket-bot/storage-wal test:fault && pnpm --filter @polymarket-bot/storage-postgres test:fault",
+    );
+    expect(splitStepDrift(workflow, through)).toEqual([
+      expect.stringContaining("runs the root script `test:fault` -> `test:fault:all` as one step"),
+    ]);
+    // `test:fault` runs a split chain under its own name, which the look-alike
+    // check (by name or command) cannot see from the step.
+    expect(splitStepDrift(workflow, withScript(packageJson, "test:fault", "pnpm typecheck"))).toEqual([
+      expect.stringContaining("runs the root script `test:fault` -> `typecheck` as one step"),
+    ]);
+    // The chain written into a step's own `run`.
+    expect(splitStepDrift(setStepKey(workflow, "Lint", "run", "pnpm lint && pnpm check:deps"), packageJson)).toEqual([
+      expect.stringContaining('"Lint" chains commands with `&&` in its own `run`'),
+    ]);
+  });
+
+  it("RES-PY: a python gate after sync that loses its if: — each in turn", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const pythonGates = gatesAfter(workflow, "python", "sync");
+    // Non-vacuity, and the real file's state: both gates carry the sync condition.
+    expect(pythonGates.map(({ name, condition }) => [name, condition])).toEqual([
+      ["Pytest", SYNC_GATE_IF],
+      ["Dependency vulnerability scan (uv lockfile)", SYNC_GATE_IF],
+    ]);
+    for (const { number, name } of pythonGates) {
+      expect(splitStepDrift(setStepKey(workflow, name, "if", undefined), packageJson), name).toEqual([
+        `jobs.python step ${number} "${name}" runs after sync without the gate condition: its \`if:\` is missing, ` +
+          `not ${JSON.stringify(SYNC_GATE_IF)}`,
+      ]);
+    }
+  });
+
+  it("RES-PY: a python gate whose if: requires the install instead of the sync, or no longer survives a failure", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const conditions = [
+      // The node job's condition: it names a step the python job does not have.
+      GATE_IF,
+      "${{ !cancelled() }}",
+      "${{ success() }}",
+      "${{ always() && steps.sync.outcome == 'success' }}",
+    ];
+    for (const condition of conditions) {
+      expect(splitStepDrift(setStepKey(workflow, "Pytest", "if", condition), packageJson), condition).toEqual([
+        expect.stringContaining(
+          `"Pytest" runs after sync without the gate condition: its \`if:\` is ${JSON.stringify(condition)}`,
+        ),
+      ]);
+    }
+  });
+
+  it("RES-PY: a python gate with continue-on-error, and the sync step losing its id", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const audit = "Dependency vulnerability scan (uv lockfile)";
+    const withKey = edit(workflow, (lines) => {
+      lines.splice(stepStart(lines, audit) + 1, 0, `${STEP_KEY}continue-on-error: true`);
+    });
+    expect(splitStepDrift(withKey, packageJson)).toEqual([
+      expect.stringContaining(`"${audit}" has the key \`continue-on-error\`, which a gate step may not have`),
+    ]);
+    expect(splitStepDrift(setStepKey(workflow, "Sync (frozen lockfile)", "id", "frozen"), packageJson)).toEqual([
+      expect.stringContaining("the python job has 0 steps with `id: sync`"),
+    ]);
   });
 
   it("a job without timeout-minutes, or with one that bounds nothing", async () => {

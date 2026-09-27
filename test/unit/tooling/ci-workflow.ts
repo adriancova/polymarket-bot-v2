@@ -30,8 +30,30 @@
  * - a chained command that no step runs, or that more than one step runs;
  * - split steps out of the chain's order, or named for the wrong position;
  * - a step that looks like a split step but runs no chained command;
- * - a gate after the install step without the gating `if:`, or with a key the
- *   check does not expect (for example `continue-on-error`).
+ * - in each gated job (`GATED_JOBS`: `node` after its `id: install` step,
+ *   `python` after its `id: sync` step), a gate without that job's gating
+ *   `if:`, or with a key the check does not expect (for example
+ *   `continue-on-error`);
+ * - a gate that runs an `&&` chain as ONE step, other than through the split
+ *   steps (`CI-2` r1, L5-1). Either its own `run` holds `&&`, or it runs a root
+ *   script that is an `&&` chain other than the three split ones. A gate runs a
+ *   root script when its `run` is `pnpm <script>` or `pnpm run <script>`,
+ *   with or without arguments, and `<script>` is in the root `package.json`;
+ *   a root script of that same form is followed to the script it runs.
+ *
+ * NOT CHECKED by the one-step-chain rule, on purpose:
+ * - the lines of a `run: |` block are not taken as a chain; only the first
+ *   line is read, for `pnpm <script>`. Such lines may depend on one another,
+ *   as in the python job's audit step, which writes the file its next line
+ *   reads;
+ * - `;` or `||` inside a script;
+ * - chains inside workspace packages' own scripts, which a `pnpm -r`,
+ *   `--filter` or `--dir` step runs (every package's `typecheck` is a
+ *   `tsc … && tsc …` chain today). Those manifests are outside this check;
+ * - root scripts that no gate runs (`test:compose`, `ops:validate-dataset`).
+ * A `pnpm <name>` step is taken to run the root script `<name>` whenever one
+ * exists, even where pnpm runs its own built-in command of that name (`pnpm
+ * audit`). That can only over-report, never hide a chain.
  *
  * THE ONE NORMALIZATION. A step must run each chained command exactly as the
  * chain spells it, with one exception. A command that does not start with
@@ -237,8 +259,24 @@ function stringAt(mapping: ReadonlyMap<string, YamlValue>, key: string, where: s
   return value;
 }
 
-/** The `if:` every gate after the install step carries (`CI-1`, GATE1-R4). */
-export const GATE_IF = "${{ !cancelled() && steps.install.outcome == 'success' }}";
+/** The `if:` of a gate that runs after the setup step with this `id` (`CI-1`, GATE1-R4). */
+function gateCondition(setupId: string): string {
+  return `\${{ !cancelled() && steps.${setupId}.outcome == 'success' }}`;
+}
+
+/** The `if:` every gate after the node job's install step carries (`CI-1`, GATE1-R4). */
+export const GATE_IF = gateCondition("install");
+
+/**
+ * The jobs whose steps after a setup step are gates (`CI-1`, GATE1-R4), and the
+ * `id` of that setup step. Every such gate must carry `gateCondition(setup)`:
+ * it runs even after an earlier gate failed, but never when the setup did not
+ * succeed. The `compose` job has a single step and so no gates.
+ */
+export const GATED_JOBS = [
+  { job: "node", setup: "install" },
+  { job: "python", setup: "sync" },
+] as const;
 
 /** The root scripts that are `&&` chains, and the label their split steps' names begin with. */
 export const SPLIT_CHAINS = [
@@ -254,20 +292,33 @@ export const SPLIT_CHAINS = [
  */
 const PLAIN_COMMAND = /^[A-Za-z0-9@%+=:,./_-]+(?: [A-Za-z0-9@%+=:,./_-]+)*$/u;
 
+/** Every script of the root `package.json`, by name. Throws unless `scripts` is an object of strings. */
+function rootScripts(packageJsonText: string): ReadonlyMap<string, string> {
+  const parsed: unknown = JSON.parse(packageJsonText);
+  const scripts =
+    typeof parsed === "object" && parsed !== null ? (parsed as { readonly scripts?: unknown }).scripts : undefined;
+  if (typeof scripts !== "object" || scripts === null || Array.isArray(scripts)) {
+    throw new Error("package.json: no `scripts` object");
+  }
+  const byName = new Map<string, string>();
+  for (const [name, text] of Object.entries(scripts as Readonly<Record<string, unknown>>)) {
+    if (typeof text !== "string") throw new Error(`package.json: script \`${name}\` is not a string`);
+    byName.set(name, text);
+  }
+  return byName;
+}
+
 /**
  * Every chain's commands, in order, read from `package.json` text. Throws when a
  * chain is missing or is anything but plain commands joined by ` && `.
  */
 export function chainCommands(packageJsonText: string): ReadonlyMap<string, readonly string[]> {
-  const parsed: unknown = JSON.parse(packageJsonText);
-  const scripts =
-    typeof parsed === "object" && parsed !== null ? (parsed as { readonly scripts?: unknown }).scripts : undefined;
-  if (typeof scripts !== "object" || scripts === null) throw new Error("package.json: no `scripts` object");
+  const scripts = rootScripts(packageJsonText);
   const chains = new Map<string, readonly string[]>();
   const seen = new Map<string, string>();
   for (const { script } of SPLIT_CHAINS) {
-    const text: unknown = (scripts as Readonly<Record<string, unknown>>)[script];
-    if (typeof text !== "string") throw new Error(`package.json: script \`${script}\` is missing or not a string`);
+    const text = scripts.get(script);
+    if (text === undefined) throw new Error(`package.json: script \`${script}\` is missing or not a string`);
     const commands = text.split(" && ");
     for (const command of commands) {
       if (!PLAIN_COMMAND.test(command)) {
@@ -295,13 +346,43 @@ export function stepRunFor(command: string): string {
   return command.startsWith("pnpm ") ? command : `pnpm exec ${command}`;
 }
 
+/**
+ * `pnpm <name>` or `pnpm run <name>`, with or without arguments: the form in
+ * which a command runs a script of the package in its working directory, which
+ * for every gate is the root `package.json`. A flag before the name
+ * (`--filter`, `--dir`, `-r`) runs workspace packages' scripts instead, so it
+ * never matches.
+ */
+const PNPM_SCRIPT_RUN = /^pnpm (?:run )?([^\s-]\S*)(?:\s|$)/u;
+
+/** The root script `command` runs, if it is `pnpm [run] <script>` for a script that exists. */
+function rootScriptRun(command: string, scripts: ReadonlyMap<string, string>): string | undefined {
+  const name = PNPM_SCRIPT_RUN.exec(command)?.[1];
+  return name !== undefined && scripts.has(name) ? name : undefined;
+}
+
+/**
+ * The root scripts `command` runs, the first one it names, then each script
+ * the previous one runs in the same form. Stops at a script it has already
+ * visited, such as `audit` (`pnpm audit --audit-level high`), which names itself.
+ */
+function rootScriptPath(command: string, scripts: ReadonlyMap<string, string>): readonly string[] {
+  const visited: string[] = [];
+  let name = rootScriptRun(command, scripts);
+  while (name !== undefined && !visited.includes(name)) {
+    visited.push(name);
+    name = rootScriptRun(scripts.get(name) ?? "", scripts);
+  }
+  return visited;
+}
+
 /** Words that mark a step as running one of the chains, split or not. */
 const CHAIN_WORD = /\b(?:typecheck|tsc|test:contract|test:integration)\b/u;
 
 /** The keys a gate step may have. Anything else is reported. */
 const GATE_KEYS = new Set(["name", "if", "run"]);
 
-interface NodeStep {
+interface WorkflowStep {
   readonly index: number;
   readonly label: string;
   readonly keys: readonly string[];
@@ -311,20 +392,20 @@ interface NodeStep {
   readonly run: string | undefined;
 }
 
-/** The `node` job's steps, read from workflow text. Throws on an unexpected shape. */
-export function nodeJobSteps(workflowText: string): readonly NodeStep[] {
+/** The steps of the workflow's job `job`, read from workflow text. Throws on an unexpected shape. */
+export function jobSteps(workflowText: string, job: string): readonly WorkflowStep[] {
   const root = mappingAt(parseWorkflowYaml(workflowText), "the document");
   const jobs = mappingAt(root.get("jobs"), "jobs");
-  const node = mappingAt(jobs.get("node"), "jobs.node");
-  return sequenceAt(node.get("steps"), "jobs.node.steps").map((value, index) => {
-    const where = `jobs.node.steps[${index}]`;
+  const steps = mappingAt(jobs.get(job), `jobs.${job}`);
+  return sequenceAt(steps.get("steps"), `jobs.${job}.steps`).map((value, index) => {
+    const where = `jobs.${job}.steps[${index}]`;
     const step = mappingAt(value, where);
     const name = stringAt(step, "name", where);
     const run = stringAt(step, "run", where);
     const uses = stringAt(step, "uses", where);
     return {
       index,
-      label: `step ${index + 1} "${name ?? uses ?? run ?? "?"}"`,
+      label: `jobs.${job} step ${index + 1} "${name ?? uses ?? run ?? "?"}"`,
       keys: [...step.keys()],
       name,
       id: stringAt(step, "id", where),
@@ -334,28 +415,37 @@ export function nodeJobSteps(workflowText: string): readonly NodeStep[] {
   });
 }
 
+/** The `node` job's steps, read from workflow text. Throws on an unexpected shape. */
+export function nodeJobSteps(workflowText: string): readonly WorkflowStep[] {
+  return jobSteps(workflowText, "node");
+}
+
 /**
- * Every way the `node` job's steps and the root `package.json` chains have
- * drifted apart. An empty list means they agree. Throws, rather than
- * reporting, when either text is outside what the check can read.
+ * The gates of one gated job, the steps after its setup step, and every way
+ * they break GATE1-R4. `gates` is undefined when the setup step is not there
+ * exactly once, since then no step is known to be a gate.
  */
-export function splitStepDrift(workflowText: string, packageJsonText: string): string[] {
-  const chains = chainCommands(packageJsonText);
-  const steps = nodeJobSteps(workflowText);
-  const findings: string[] = [];
-
-  const installs = steps.filter((step) => step.id === "install");
-  if (installs.length !== 1) {
-    findings.push(`the node job has ${installs.length} steps with \`id: install\`; the gates' \`if:\` needs exactly one`);
-    return findings;
+function gateFindings(
+  workflowText: string,
+  job: string,
+  setup: string,
+): { readonly gates: readonly WorkflowStep[] | undefined; readonly findings: readonly string[] } {
+  const steps = jobSteps(workflowText, job);
+  const setups = steps.filter((step) => step.id === setup);
+  if (setups.length !== 1) {
+    return {
+      gates: undefined,
+      findings: [`the ${job} job has ${setups.length} steps with \`id: ${setup}\`; the gates' \`if:\` needs exactly one`],
+    };
   }
-  const gates = steps.slice((installs[0]?.index ?? 0) + 1);
-
+  const gates = steps.slice((setups[0]?.index ?? 0) + 1);
+  const condition = gateCondition(setup);
+  const findings: string[] = [];
   for (const gate of gates) {
-    if (gate.condition !== GATE_IF) {
+    if (gate.condition !== condition) {
       findings.push(
-        `${gate.label} runs after install without the gate condition: its \`if:\` is ` +
-          `${gate.condition === undefined ? "missing" : JSON.stringify(gate.condition)}, not ${JSON.stringify(GATE_IF)}`,
+        `${gate.label} runs after ${setup} without the gate condition: its \`if:\` is ` +
+          `${gate.condition === undefined ? "missing" : JSON.stringify(gate.condition)}, not ${JSON.stringify(condition)}`,
       );
     }
     for (const key of gate.keys) {
@@ -363,11 +453,84 @@ export function splitStepDrift(workflowText: string, packageJsonText: string): s
     }
     if (gate.name === undefined || gate.run === undefined) findings.push(`${gate.label} needs both a \`name\` and a \`run\``);
   }
+  return { gates, findings };
+}
 
+/**
+ * How `gate` runs an `&&` chain as one step, or undefined when it does not
+ * (L5-1; see THE DRIFT CHECK above).
+ */
+function oneStepChain(gate: WorkflowStep, scripts: ReadonlyMap<string, string>): string | undefined {
+  const run = gate.run;
+  if (run === undefined) return undefined;
+  if (run.includes("&&")) {
+    return (
+      `${gate.label} chains commands with \`&&\` in its own \`run\`, so its first failure hides the rest of ` +
+      `the step; give each command its own gated step: ${JSON.stringify(run)}`
+    );
+  }
+  const path = rootScriptPath(run, scripts);
+  const chained = path.find((name) => (scripts.get(name) ?? "").includes("&&"));
+  if (chained === undefined) return undefined;
+  return (
+    `${gate.label} runs the root script ${path.map((name) => `\`${name}\``).join(" -> ")} as one step, and ` +
+    `\`${chained}\` is an \`&&\` chain (${JSON.stringify(scripts.get(chained))}), so its first failure hides the ` +
+    "rest; run each of its commands as its own gated step and add the script to SPLIT_CHAINS in " +
+    "test/unit/tooling/ci-workflow.ts"
+  );
+}
+
+/**
+ * Every way the workflow's gates and the root `package.json` chains have
+ * drifted apart (see THE DRIFT CHECK above). An empty list means they agree.
+ * Throws, rather than reporting, when either text is outside what the check
+ * can read.
+ */
+export function splitStepDrift(workflowText: string, packageJsonText: string): string[] {
+  const scripts = rootScripts(packageJsonText);
+  const chains = chainCommands(packageJsonText);
+  const findings: string[] = [];
+
+  const gatesByJob = new Map<string, readonly WorkflowStep[]>();
+  for (const { job, setup } of GATED_JOBS) {
+    const checked = gateFindings(workflowText, job, setup);
+    findings.push(...checked.findings);
+    if (checked.gates !== undefined) gatesByJob.set(job, checked.gates);
+  }
+  // Without exactly one install step no node step is known to be a gate, and
+  // the split checks are skipped; the one-step-chain rule still runs below for
+  // every job whose gates are known.
+  const lookAlikes = new Set<WorkflowStep>();
+  const gates = gatesByJob.get("node");
+  if (gates !== undefined) findings.push(...splitFindings(gates, chains, lookAlikes));
+
+  for (const jobGates of gatesByJob.values()) {
+    for (const gate of jobGates) {
+      if (lookAlikes.has(gate)) continue;
+      const finding = oneStepChain(gate, scripts);
+      if (finding !== undefined) findings.push(finding);
+    }
+  }
+  return findings;
+}
+
+/**
+ * The split checks on the node job's gates: each chained command is run by
+ * exactly one gate, in chain order and named for its position, and no other
+ * gate looks like a split step. Every look-alike is added to `lookAlikes`, so
+ * the one-step-chain rule does not report it a second time (`pnpm typecheck`
+ * would be both).
+ */
+function splitFindings(
+  gates: readonly WorkflowStep[],
+  chains: ReadonlyMap<string, readonly string[]>,
+  lookAlikes: Set<WorkflowStep>,
+): string[] {
+  const findings: string[] = [];
   const chainRuns = new Set<string>();
   for (const { script, label } of SPLIT_CHAINS) {
     const commands = chains.get(script) ?? [];
-    let previous: NodeStep | undefined;
+    let previous: WorkflowStep | undefined;
     commands.forEach((command, position) => {
       const run = stepRunFor(command);
       chainRuns.add(run);
@@ -399,6 +562,7 @@ export function splitStepDrift(workflowText: string, packageJsonText: string): s
     const byName = SPLIT_CHAINS.some(({ label }) => (gate.name ?? "").startsWith(label));
     const byRun = gate.run !== undefined && CHAIN_WORD.test(gate.run);
     if (byName || byRun) {
+      lookAlikes.add(gate);
       findings.push(
         `${gate.label} looks like a split step (${byName ? "its name" : "its command"}) but runs no command of ` +
           `the ${SPLIT_CHAINS.map(({ script }) => `\`${script}\``).join(", ")} chains in package.json: ` +

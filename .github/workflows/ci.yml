@@ -65,7 +65,9 @@ jobs:
       # through the `node_modules/.bin` that `pnpm run` puts on PATH, and a
       # step's shell has no such PATH, so the step runs it through `pnpm exec`.
       # test/unit/tooling/ci-step-split.test.ts fails when these steps and the
-      # chains diverge, or when a gate loses its `if:`.
+      # chains diverge, or when a gate loses its `if:`. It also fails when any
+      # other gate runs an `&&` chain as one step: a root script it runs, or
+      # its own `run`.
       - name: Typecheck 1/4 - every workspace package (pnpm -r run typecheck)
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm -r run typecheck
@@ -230,6 +232,8 @@ jobs:
 
       # CI-1 (GATE1-R4), as in the `node` job: both gates run whenever the
       # frozen sync succeeded, so a failing Pytest no longer hides the scan.
+      # CI-2 r1: test/unit/tooling/ci-step-split.test.ts pins this `if:` on
+      # every step after `id: sync`.
       - name: Pytest
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run pytest
