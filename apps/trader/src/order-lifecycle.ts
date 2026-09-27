@@ -27,10 +27,13 @@
  *
  * `CoreLoop.#pnlRecords` (re-folded from zero on every fill by design) and the
  * in-memory `Ledger` (append-only, the §6 invariant 8 authority) still grow
- * without bound — they are the queued `LOOPMEM-FOLD` item — and so does the
- * injected `SimulatedVenue` (`LOOPMEM-SIM`, `packages/simulation`). The trader
- * process is therefore NOT memory-bounded after this round; what is bounded is
- * the loop's own per-order maps and its three audit logs.
+ * without bound — they are the queued `LOOPMEM-FOLD` item. The injected
+ * `SimulatedVenue` grew too when this was written (`LOOPMEM-SIM`); SIM-2
+ * bounded it (live orders plus bounded, counted history; Tier-1 trades are
+ * still unbounded, `SIM2-TIER1-TRADES`) and the loop no longer reads its
+ * history. The trader process is therefore still NOT memory-bounded; what is
+ * bounded is the loop's own per-order maps, its three audit logs and the
+ * venue.
  */
 
 import { compareDecimal, isCanonicalDecimalString } from "@polymarket-bot/decimal";

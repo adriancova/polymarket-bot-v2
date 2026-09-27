@@ -111,8 +111,9 @@ describe("acceptance 1 — MAX_RUN_MODE=PAPER is enforced", () => {
         submit: async () => {
           throw new Error("unreachable: startup must refuse before any venue call");
         },
-        ordersSnapshot: () => [],
-        fills: [],
+        fillsSince: () => ({ ok: true, value: { fills: [], next: 0 } }),
+        orderById: () => undefined,
+        orderByPlannedId: () => undefined,
       },
       store: {
         persistDecision: async () => ({ ok: true, value: null }),

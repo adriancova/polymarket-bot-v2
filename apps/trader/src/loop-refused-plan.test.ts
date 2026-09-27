@@ -438,12 +438,16 @@ class RefusesWhileHoldingVenue implements TraderVenue {
     };
   }
 
-  ordersSnapshot(): ReturnType<TraderVenue["ordersSnapshot"]> {
-    return this.inner.ordersSnapshot();
+  fillsSince(sequence: number): ReturnType<TraderVenue["fillsSince"]> {
+    return this.inner.fillsSince(sequence);
   }
 
-  get fills(): TraderVenue["fills"] {
-    return this.inner.fills;
+  orderById(venueOrderId: string): ReturnType<TraderVenue["orderById"]> {
+    return this.inner.orderById(venueOrderId);
+  }
+
+  orderByPlannedId(plannedOrderId: string): ReturnType<TraderVenue["orderByPlannedId"]> {
+    return this.inner.orderByPlannedId(plannedOrderId);
   }
 }
 
@@ -451,7 +455,8 @@ class RefusesWhileHoldingVenue implements TraderVenue {
  * SIM1-R3-1's BACKSTOP case: a `TraderVenue` whose order state MOVES BETWEEN
  * the loop's calls, as a live venue's does when its user channel reports a
  * venue-side cancel. Armed with an action, it runs it — once — when the loop
- * next reads `fills`, which is the first thing a harvest does; everything else
+ * next reads its fills (SIM-2: `fillsSince`), which is the first thing a
+ * harvest does; everything else
  * is the real venue's. The real simulator's state moves only inside
  * `observe()`, `observeTrade()` and `submit()`, each of which the loop judges
  * at its answer; this double is what the harvest's own judgement exists for.
@@ -480,15 +485,19 @@ class MovesBetweenCallsVenue implements TraderVenue {
     return await this.inner.submit(plan as Parameters<SimulatedVenue["submit"]>[0]);
   }
 
-  ordersSnapshot(): ReturnType<TraderVenue["ordersSnapshot"]> {
-    return this.inner.ordersSnapshot();
-  }
-
-  get fills(): TraderVenue["fills"] {
+  fillsSince(sequence: number): ReturnType<TraderVenue["fillsSince"]> {
     const armed = this.#armed;
     this.#armed = undefined;
     armed?.();
-    return this.inner.fills;
+    return this.inner.fillsSince(sequence);
+  }
+
+  orderById(venueOrderId: string): ReturnType<TraderVenue["orderById"]> {
+    return this.inner.orderById(venueOrderId);
+  }
+
+  orderByPlannedId(plannedOrderId: string): ReturnType<TraderVenue["orderByPlannedId"]> {
+    return this.inner.orderByPlannedId(plannedOrderId);
   }
 }
 
@@ -1605,9 +1614,11 @@ describe("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOL
     expect(halt?.detail).toContain("1 of its 10 planned orders");
     expect(halt?.detail).toContain("SIMULATED_VENUE_RATE_LIMITED");
 
-    // (4) No instance owns it.
+    // (4) No instance owns it — and (SIM-2) the loop TRACKS it, because its
+    // harvest no longer scans every venue order to find what to release.
     expect(health.seams.orders.tracked).toBe(0);
     expect(loop.retainedOrderState().owners).toBe(0);
+    expect(loop.retainedOrderState().heldUnowned).toBe(1);
 
     // --- still WORKING across later harvests: nothing is released ---------
     await feed(harness, yesBook(5));
@@ -1617,6 +1628,7 @@ describe("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOL
     expect(loop.timeInForceFor(resting.plannedOrderId)).toBe("GTC");
     expect(health.seams.reservations).toMatchObject({ open: 1, released: 9, reservedCollateral: "1" });
     expect(health.seams.allocator).toMatchObject({ open: 1, released: 9, reservedCollateral: "1" });
+    expect(loop.retainedOrderState().heldUnowned).toBe(1);
 
     // --- (5) terminal evidence: an OBSERVED trade fills it ----------------
     await feed(
@@ -1646,6 +1658,8 @@ describe("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOL
     expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
     expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
     expect(health.execution.reservationsReleasedOnRefusal).toBe(9);
+    // SIM-2: released, so no longer tracked.
+    expect(loop.retainedOrderState().heldUnowned).toBe(0);
 
     // The strategy never saw the orphan: no delivery, no ctx.orders() view.
     for (const evaluation of harness.evaluations) {

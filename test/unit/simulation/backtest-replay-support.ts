@@ -323,10 +323,12 @@ export function assembleSharedCore(fixture: Fixture): SharedCore {
     env: paperEnvironment(),
     config: fixture.traderConfig,
     clock: clock.value,
-    // `SimulatedVenue.observe` answers a `SimulationResult<null>`, which is
-    // structurally the `{ ok: boolean }` the loop's `TraderVenue` declares;
-    // the cast is the one `apps/trader/src/main.ts` and the e2e harness make.
-    venue: venue as unknown as Parameters<typeof createPaperTrader>[0]["venue"],
+    // UNCAST (SIM-2, `IF-19`): `SimulatedVenue` satisfies the loop's
+    // `TraderVenue` port as written — `apps/trader/src/main.ts` passes it
+    // uncast too — so a port change is a typecheck failure here, not a
+    // runtime surprise. (This comment used to say main.ts cast it; it had
+    // stopped doing so.)
+    venue,
     store,
     idNamespace: ID_NAMESPACE,
   });

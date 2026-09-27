@@ -110,6 +110,14 @@ export const SIMULATION_REFUSAL_CODES = [
    * seam rather than being lost behind `accepted: true`.
    */
   "SIMULATED_VENUE_CANCEL_INCOMPLETE",
+  /**
+   * SIM-2: an answer needs history this venue has EVICTED from its bounded,
+   * counted retention — a fill cursor older than the oldest retained fill, or
+   * a run whose orders, fills or bands were evicted asked to be serialized.
+   * Answering from what is left would report a short history as a complete
+   * one, so it is refused instead (§6 invariant 7, §12.4).
+   */
+  "SIMULATED_VENUE_HISTORY_EVICTED",
 
   // --- fill models ---------------------------------------------------------
   /** The fill-model parameters are absent or not pinned (§12.5, ADR-012 §4). */

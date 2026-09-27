@@ -282,8 +282,15 @@ export { tokenBucketRateLimits, unmodeledRateLimits } from "./rate-limit.js";
 export type { RateLimitBudget, RateLimitDecision, RateLimitRequest } from "./rate-limit.js";
 
 // --- the simulated venue (§12.1) --------------------------------------------
-export { SimulatedVenue } from "./venue.js";
-export type { ExecutionPolicy, MarketBookProvider, SimulatedVenueOptions } from "./venue.js";
+export { DEFAULT_VENUE_RETENTION, SimulatedVenue } from "./venue.js";
+export type {
+  ExecutionPolicy,
+  MarketBookProvider,
+  SimulatedVenueOptions,
+  VenueRetention,
+  VenueRetentionBounds,
+} from "./venue.js";
+export type { RetentionCounters } from "./retention.js";
 
 // --- the run driver and its canonical serialization (§12.4) -----------------
 export { runReplay } from "./replay.js";

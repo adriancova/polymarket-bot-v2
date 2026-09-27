@@ -16,9 +16,17 @@
  *
  * "Everything between event input and the `ExecutionVenue` interface is shared"
  * — so this file is the seam between the live and simulated paths, and the
- * simulated venue implements exactly this interface with nothing added to it.
- * **No method here can carry a credential, a signer, a venue URL, or a network
- * handle**, and none of the implementations in this package has one.
+ * simulated venue implements this interface. It is NOT all the simulated venue
+ * exposes, and this paragraph used to say it was ("with nothing added to it";
+ * SIM-2, `IF-02`): `SimulatedVenue` also takes the recorded stream it is TOLD
+ * about (`observe`, `observeTrade`), and the trader's `TraderVenue` port reads
+ * venue state between events through a fill cursor and order lookups
+ * (`fillsSince`, `orderById`, `orderByPlannedId`) — members a live adapter
+ * will have to answer from its own user channel and order store. The rest of
+ * the class (`submitAll`, the history accessors, `retention`) is
+ * simulator-only. **No method here can carry a credential, a signer, a venue
+ * URL, or a network handle**, and none of the implementations in this package
+ * has one.
  *
  * ## Why the plan/book/ledger shapes are mirrored rather than imported
  *
@@ -504,7 +512,10 @@ export interface AccountSnapshot {
  *
  * The simulated implementation of this interface holds no credential, opens no
  * socket, signs nothing, and places no order. A live implementation arrives in
- * a later work package behind the SAME three methods.
+ * a later work package behind the SAME three methods — and, because the trader
+ * drives its venue through `apps/trader`'s `TraderVenue` port rather than this
+ * interface alone, it will also answer that port's observation, fill-cursor
+ * and order-lookup members (see this file's header; SIM-2, `IF-02`).
  */
 export interface ExecutionVenue {
   submit(plan: ExecutionPlanView): Promise<ExecutionResult>;

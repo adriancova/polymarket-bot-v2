@@ -34,7 +34,8 @@ chronology).
 | `queue.ts` | §12.2 Tier 1 resting orders — queue-ahead and the BAND |
 | `markout.ts` | §12.3 markouts as diagnostics, and stress scenarios separately |
 | `rate-limit.ts` | The §9.13 budget seam, with absence stated explicitly |
-| `venue.ts` | The §12.1 `ExecutionVenue`, simulated — routes on `executionStyle`: a crossing `postOnly` order is REJECTED, a non-crossing `REST` order rests and is filled by observed trades, and everything marketable takes |
+| `venue.ts` | The §12.1 `ExecutionVenue`, simulated — routes on `executionStyle`: a crossing `postOnly` order is REJECTED, a non-crossing `REST` order rests and is filled by observed trades, and everything marketable takes. It exposes MORE than the three §12.1 methods (§5 item 17) |
+| `retention.ts` | SIM-2: the venue's bounded, counted history — a sequenced fill log, a keyed terminal-order/band log, and the duplicate guard's tombstones |
 | `replay.ts` | The run driver and the seam the shared core loop plugs into |
 | `serialize.ts` | The §12.4 canonical form a determinism claim is made about |
 
@@ -366,3 +367,56 @@ key.
     those; with no live target it is a successful no-op charging nothing. A
     `REJECTED` order is not cancellable. A cancel re-stamps `atEvent`. The
     simulator version pin moved `wp-210/v1` → `wp-210/v2` with these changes.
+17. **The venue holds LIVE state plus a BOUNDED, COUNTED history, and exposes
+    more than §12.1's three methods** (SIM-2, LOOPMEM-SIM part 2). An order
+    the venue can still work (RESTING, PARTIALLY_FILLED, DELAYED) is in a live
+    index; an order that reaches a terminal state moves to a retention log,
+    and so do produced fills and the last band of a terminal Tier-1 order.
+    Every bound defaults far above every fixture (`DEFAULT_VENUE_RETENTION`:
+    50 000 terminal orders, 50 000 fills, 10 000 bands, 100 000 tombstoned ids
+    — about 190 MB of Tier-0 history at the bounds, from measured entry sizes)
+    and is a `SimulatedVenueOptions.retention` override; `retention()` reports the
+    live sizes and, per log, what is retained, the bound and what was EVICTED.
+    What each reader gets:
+    - **The trader's port** (`apps/trader`'s `TraderVenue`): `fillsSince(sequence)`
+      — a NON-destructive cursor over an absolute fill sequence, which REFUSES
+      (`SIMULATED_VENUE_HISTORY_EVICTED`) a sequence older than the retained
+      window rather than answering short — and `orderById` / `orderByPlannedId`,
+      which fall back to the retained history. With `observe`/`observeTrade`/
+      `submit`, that is what a live adapter will have to answer too: the
+      "adds nothing to §12.1" claim this package used to make (`ports.ts`,
+      `venue.ts`) was already false and is withdrawn (`IF-02`).
+    - **End-of-run consumers** (`runReplay`, artifact capture, tests):
+      `ordersSnapshot()`, `fills` and `bandHistory()` answer the retained
+      history — every order, fill and band while nothing was evicted, which is
+      every run in this repository. `runReplay` REFUSES
+      (`SIMULATED_VENUE_HISTORY_EVICTED`) to serialize a run whose venue
+      evicted any of them: a truncated §12.4 artifact would present a short
+      run as complete. A harness that reads the accessors itself should check
+      `retention().historyEvicted`.
+    - **`restingBands()` is LIVE**: the bands of orders resting now. It used to
+      keep a CANCELLED or EXPIRED order's band for ever, contradicting its own
+      docstring; the run's band history is `bandHistory()`.
+    - **The duplicate-`plannedOrderId` guard** (§6 invariant 6) remembers
+      every live, retained and TOMBSTONED id. A tombstone set is bounded and
+      counted rather than unbounded because an unbounded id set is the
+      per-order growth this round removes; the trader's ids are unique by
+      construction, so the guard is defence in depth, and `tombstones.evicted
+      > 0` says when an id could be reused unnoticed. A cancel naming a
+      forgotten id is refused as already terminal (only terminal orders are
+      ever evicted), never as unknown.
+    - **Observed trades.** Tier 0 reads nothing about a past trade but its
+      instant, so it keeps one per (market, side) — previously every trade,
+      about 760 B each, for the life of the process (`VS-03`). Tier 1 keeps
+      every trade (`SIM2-TIER1-TRADES`, queued): a resting order's band walks
+      the trades at or after its `restingFromNs`, and a LATER order can rest
+      at an instant the venue already holds a trade for (pinned in
+      `venue-sim2.test.ts`), so trimming to the earliest LIVE `restingFromNs`
+      would change a later band; the only lower bound on a future order's
+      `restingFromNs` is the venue clock, and trimming by the clock needs the
+      `Clock` port's monotonicity settled first (`IF-15`). A resting GTC's
+      window would grow anyway until the band walk is incremental (`IF-15b`).
+      Tier 1 is not the shipped trader's model.
+    - **No health seam** carries these counters yet (queued with
+      `TRDR4-GAUGES`): a counter on an object the paper-e2e artifact copies
+      wholesale would change that golden.

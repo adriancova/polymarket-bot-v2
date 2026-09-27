@@ -173,6 +173,27 @@ import type { Ledger } from "@polymarket-bot/ledger";
  * disposition — says so with `ok: false` and a `refusal`, and the loop halts
  * (`#haltOnVenueObservation`). The refusal is optional in the type so a venue
  * that has nothing to say beyond `ok` still satisfies the port.
+ *
+ * SIM-2: THE LOOP READS NO HISTORY. It used to read the venue through
+ * `ordersSnapshot()` — every order ever placed, copied and sorted — several
+ * times per event, and through a `fills` index into a copy of every fill ever
+ * produced; that made the venue unboundable and each event's cost grow with
+ * the run. The port now carries exactly what the loop needs:
+ *
+ * - `fillsSince(sequence)`: the fills at or after an ABSOLUTE sequence, and
+ *   the next one — a NON-destructive cursor, so a harvest that stops early (a
+ *   store failure) re-reads the same batch (`IF-06`). A refusal (the cursor
+ *   is older than the venue's retained window) HALTS the process;
+ * - `orderById` / `orderByPlannedId`: one order, O(1). The loop iterates its
+ *   OWN sets — the orders it owns, and the ones it knows the venue holds
+ *   without owning them (`#heldUnowned`) — sorted with the order the venue's
+ *   snapshot used (`compareVenueOrderIds`), and looks each one up. An order
+ *   this process owns or holds that the venue no longer answers for is a
+ *   LOUD miss (`#haltOnVenueMiss`).
+ *
+ * The end-of-run HISTORY accessors (`ordersSnapshot()`, `fills`) stay on
+ * `SimulatedVenue` for the harnesses that report a run; they are not on this
+ * port, so the loop cannot drift back to them.
  */
 export interface TraderVenue {
   observe(identity: {
@@ -199,8 +220,34 @@ export interface TraderVenue {
     readonly refusal?: VenueObservationRefusal;
   };
   submit(plan: unknown): Promise<ExecutionResult>;
-  ordersSnapshot(): readonly SimulatedOrder[];
-  readonly fills: readonly SimulatedFill[];
+  /** SIM-2: the fills at or after an absolute sequence, and the next sequence. Non-destructive. */
+  fillsSince(sequence: number):
+    | {
+        readonly ok: true;
+        readonly value: { readonly fills: readonly SimulatedFill[]; readonly next: number };
+      }
+    | { readonly ok: false; readonly refusal: VenueObservationRefusal };
+  /** SIM-2: one order by the VENUE's id — working or terminal — or `undefined`. */
+  orderById(venueOrderId: string): SimulatedOrder | undefined;
+  /** SIM-2: one order by the PLANNER's id, or `undefined` when the venue holds none. */
+  orderByPlannedId(plannedOrderId: string): SimulatedOrder | undefined;
+}
+
+/**
+ * The order the venue's `ordersSnapshot()` used — `SimulatedVenue`'s
+ * `compareStrings`: UTF-16 code units, locale-free — so iterating the loop's
+ * OWN id sets visits orders in exactly the order the snapshot scans did
+ * (`IF-07`). Insertion order is NOT that order: a plan of 11 or more slices
+ * has ids `…:o0, …:o1, …:o10, …:o11, …:o2`, and evaluation order decides the
+ * decision sequence, `ctx.orders()` and risk's `openOrders`.
+ */
+function compareVenueOrderIds(left: string, right: string): -1 | 0 | 1 {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/** A fresh array of `ids`, in venue order (see {@link compareVenueOrderIds}). */
+function inVenueOrder(ids: Iterable<string>): string[] {
+  return [...ids].sort(compareVenueOrderIds);
 }
 
 /** What a venue says when `observe` / `observeTrade` could not do what it was asked. */
@@ -319,6 +366,15 @@ export interface RetainedOrderState {
   readonly orderViews: number;
   /** The settled-order tombstone map (bounded). */
   readonly tombstones: number;
+  /**
+   * SIM-2: planned orders the venue may HOLD that no instance owns — a refused
+   * plan's held-but-unlisted orders, and the planned orders of a placement
+   * whose answer never arrived — kept until each is seen terminal and
+   * released. Keyed by the PLANNED order id.
+   */
+  readonly heldUnowned: number;
+  /** SIM-2: owned orders whose TERMINAL record the loop keeps until they settle. */
+  readonly terminalSeen: number;
 }
 
 /**
@@ -441,6 +497,37 @@ export class CoreLoop {
    * working baskets, as the maps above are by the working orders.
    */
   readonly #basketWatches = new Map<string, BasketWatch>();
+  /**
+   * SIM-2: `plannedOrderId -> the VENUE's order id (when known)` for orders
+   * the venue may hold that NO instance owns. The loop no longer scans every
+   * venue order at each harvest, so these — which `#releaseSettledReservations`
+   * used to find by that scan, and which own nothing `#deliverOrderViews`
+   * visits — are tracked here and released at the first harvest that sees
+   * each one terminal. Two sources:
+   *
+   * - `#releaseRefusedPlacement`'s DEFENSIVE path (`TRDR-4`): a refused plan
+   *   whose orders the venue holds without listing them as booked (venue id
+   *   known);
+   * - a placement whose `submit` THREW (`#submitPlan`): the venue may have
+   *   booked any of its planned orders, and no answer said which (venue id
+   *   unknown; looked up by planned id).
+   *
+   * An entry leaves when its order is seen terminal. It is bounded by those
+   * orders; a planned order the venue never booked stays, which is what the
+   * old scan did too (it found nothing to release, for ever).
+   */
+  readonly #heldUnowned = new Map<string, string | undefined>();
+  /**
+   * SIM-2 — SIM-1's carried requirement, "a terminal order stays visible to
+   * the loop until the loop has seen it": `venueOrderId -> the TERMINAL record`
+   * of an order this process owns, read terminal from the venue and not yet
+   * settled. A terminal record never changes, so this is exactly what the
+   * venue would answer; it is consulted only when the venue no longer can
+   * (its bounded history evicted the order while, say, a halted instance kept
+   * the order from being delivered, retired and settled). Deleted at
+   * settlement, so bounded by the owned orders, as every map above is.
+   */
+  readonly #terminalSeen = new Map<string, SimulatedOrder>();
   #settled = 0;
   #unownedFills = 0;
   #lateFillsAfterSettlement = 0;
@@ -464,6 +551,11 @@ export class CoreLoop {
   readonly #provenance: RetentionLog<
     Readonly<Omit<TraceLink, "venueFillId" | "ledgerFillId" | "ledgerTransactionIds">>
   >;
+  /**
+   * SIM-2: the venue fill SEQUENCE the next harvest reads from (`fillsSince`)
+   * — an absolute position in the venue's fill stream, not an index into a
+   * copy of it. Advanced only after a whole batch was booked.
+   */
   #knownFills = 0;
   #seenArrivals = 0;
   #seenUnexplained = 0;
@@ -582,6 +674,8 @@ export class CoreLoop {
       retiredUnsettled: this.#retired.size,
       orderViews: this.#orderViews.metrics().tracked,
       tombstones: this.#tombstones.size,
+      heldUnowned: this.#heldUnowned.size,
+      terminalSeen: this.#terminalSeen.size,
     });
   }
 
@@ -846,6 +940,59 @@ export class CoreLoop {
       refusal === undefined
         ? `the venue's ${door} answered ok: false with no refusal`
         : `the venue's ${door} refused: ${refusal.code}: ${refusal.message}`,
+      instant,
+    );
+  }
+
+  /**
+   * SIM-2: one order this process OWNS, looked up at the venue — or LOUD.
+   *
+   * An owned order was booked by the venue (`#ownBookedOrders` takes the
+   * ids from its answer), so a venue that cannot answer for it has lost
+   * state this process relies on: a bounded history that evicted a terminal
+   * order the loop has not yet settled, or an adapter whose order store
+   * dropped it. That is never skipped silently (the old full-venue scans
+   * would have skipped it without a word): the process HALTS, GLOBAL,
+   * `VENUE_OBSERVATION_FAILED` (§9.9 `RECONCILE_ACCOUNT`), and the caller
+   * treats the order as absent — nothing is released for it (fail closed).
+   *
+   * Not a miss: an order the loop has already READ TERMINAL, whose record it
+   * keeps until settlement (`#terminalSeen`) — the venue's answer for it can
+   * no longer change.
+   */
+  #ownedOrder(venueOrderId: string, instant: string): SimulatedOrder | undefined {
+    const order = this.#lookupOwned(venueOrderId);
+    if (order === undefined) {
+      this.#haltOnVenueMiss(
+        `order ${venueOrderId}, which instance ${this.#orderOwners.get(venueOrderId) ?? "(none)"} owns`,
+        instant,
+      );
+    }
+    return order;
+  }
+
+  /**
+   * SIM-2: one owned order — the venue's answer, or, when the venue no longer
+   * answers, the TERMINAL record the loop read earlier (`#terminalSeen`), or
+   * `undefined`. Records a terminal answer for later. Never halts.
+   */
+  #lookupOwned(venueOrderId: string): SimulatedOrder | undefined {
+    const order = this.#options.venue.orderById(venueOrderId);
+    if (order === undefined) return this.#terminalSeen.get(venueOrderId);
+    if (!this.#terminalSeen.has(venueOrderId) && this.#isTerminalOrder(order)) {
+      this.#terminalSeen.set(venueOrderId, order);
+    }
+    return order;
+  }
+
+  /** SIM-2: the venue no longer answers for state this process reads from it (see `#ownedOrder`). */
+  #haltOnVenueMiss(what: string, instant: string): void {
+    this.#options.halts.halt(
+      { kind: "GLOBAL" },
+      "VENUE_OBSERVATION_FAILED",
+      `the venue no longer answers for ${what}: evicted from its bounded history, or never held. ` +
+        "This process reads no venue history, so it cannot rebuild the state it is missing; " +
+        "reconcile the account (SIM-2)",
       instant,
     );
   }
@@ -1195,14 +1342,18 @@ export class CoreLoop {
    * before any tick is still seen), and is excluded from then on. Until R1 this
    * returned every order the instance had ever placed, terminal ones included,
    * contradicting the SDK's "one of this instance's own working orders".
+   *
+   * SIM-2: built from the instance's OWN order set, in venue order, one lookup
+   * per order — O(its orders), not O(every order the venue ever held).
    */
   #orderViews_(instance: RegisteredInstance, instant: string): readonly StrategyOrderView[] {
     const owned = this.#instanceOrders.get(instance.instanceId);
     if (owned === undefined) return Object.freeze([]);
     const views: StrategyOrderView[] = [];
-    for (const order of this.#options.venue.ordersSnapshot()) {
-      if (!owned.has(order.simulatedOrderId)) continue;
-      if (this.#retired.has(order.simulatedOrderId)) continue;
+    for (const venueOrderId of inVenueOrder(owned)) {
+      if (this.#retired.has(venueOrderId)) continue;
+      const order = this.#ownedOrder(venueOrderId, instant);
+      if (order === undefined) continue;
       views.push(
         toStrategyOrderView(order, { marketId: instance.marketId, placedAt: instant }),
       );
@@ -1578,7 +1729,25 @@ export class CoreLoop {
     }
 
     this.#submissionInstants.push(input.epochMs);
-    const result = await this.#options.venue.submit(input.plan);
+    let result: ExecutionResult;
+    try {
+      result = await this.#options.venue.submit(input.plan);
+    } catch (cause) {
+      // SIM-2: a placement whose answer never arrived may have been booked in
+      // whole or in part, and no answer says which. The harvest used to find
+      // such orders by scanning every venue order and release them once
+      // terminal; it scans nothing now, so they are TRACKED by planned id
+      // (`#heldUnowned`) and released the same way. The failure itself still
+      // propagates exactly as before.
+      if (input.plan.planKind !== "CANCEL") {
+        for (const group of placement.groups) {
+          for (const order of group.orders) {
+            if (!this.#heldUnowned.has(order.plannedOrderId)) this.#heldUnowned.set(order.plannedOrderId, undefined);
+          }
+        }
+      }
+      throw cause;
+    }
     this.#absorbVenueAnswer(input, result, submissionAttemptId);
     // SIM-1 r3 (`SIM1-R3-1`): `submit` is one of the three doors through which
     // the venue's order state changes (with `observe()` and `observeTrade()`),
@@ -1734,10 +1903,12 @@ export class CoreLoop {
    *   while still holding orders — a live adapter whose answer is incomplete —
    *   can. Such an order is a reconciliation question (§6 invariant 6: an
    *   unknown submission is never a silent retry): no instance owns it, its
-   *   entries are KEPT (released by `#releaseSettledReservations`, which walks
-   *   every venue order, at the harvest that sees it terminal), a fill of its
-   *   is booked UNATTRIBUTED (`#bookUnownedFill`), and its market is halted
-   *   NOW — `UNATTRIBUTED_ACTIVITY`, whose §9.9 action is `RECONCILE_ACCOUNT`.
+   *   entries are KEPT (released by `#releaseSettledReservations` at the
+   *   harvest that sees it terminal — SIM-2: it is TRACKED in `#heldUnowned`
+   *   for that, because the harvest no longer walks every venue order), a
+   *   fill of its is booked UNATTRIBUTED (`#bookUnownedFill`), and its market
+   *   is halted NOW — `UNATTRIBUTED_ACTIVITY`, whose §9.9 action is
+   *   `RECONCILE_ACCOUNT`.
    * - NEITHER: the venue did not place it (it is in `notPlaced`, or the venue
    *   holds nothing under its id). Its reservation, allocator commitment and
    *   time-in-force are released NOW and counted
@@ -1771,13 +1942,16 @@ export class CoreLoop {
       if (planned.has(order.plannedOrderId)) booked.add(order.plannedOrderId);
     }
     // The DEFENSIVE path: what the venue's own order state holds for this plan
-    // that its answer did not list as booked.
+    // that its answer did not list as booked. SIM-2: one lookup per planned
+    // order the answer did not book, instead of a scan of every venue order.
     const venueHeld = new Map<string, SimulatedOrder>();
-    for (const order of this.#options.venue.ordersSnapshot()) {
-      if (planned.has(order.plannedOrderId) && !booked.has(order.plannedOrderId)) {
-        venueHeld.set(order.plannedOrderId, order);
-      }
+    for (const plannedOrderId of plannedOrderIds) {
+      if (booked.has(plannedOrderId)) continue;
+      const order = this.#options.venue.orderByPlannedId(plannedOrderId);
+      if (order !== undefined && order.plannedOrderId === plannedOrderId) venueHeld.set(plannedOrderId, order);
     }
+    // …and TRACKED, so the harvest that sees each one terminal releases it.
+    for (const order of venueHeld.values()) this.#heldUnowned.set(order.plannedOrderId, order.simulatedOrderId);
     const held = plannedOrderIds.flatMap((plannedOrderId) => {
       const order = venueHeld.get(plannedOrderId);
       return order === undefined ? [] : [order];
@@ -1890,8 +2064,21 @@ export class CoreLoop {
    */
   #judgeBasketWatches(instant: string): void {
     if (this.#basketWatches.size === 0) return;
+    // SIM-2: the watched baskets' own booked (so OWNED) orders, one lookup
+    // each — not a scan of every order the venue ever held — with the loop's
+    // own terminal records behind the venue (`#lookupOwned`). An id neither
+    // can answer for is absent from the map, which `judgeBasketExecution`
+    // reads as "not in the venue's order state" (still working: fail closed),
+    // exactly as a missing snapshot entry was; the harvest's own lookups halt
+    // on that miss.
     const orders = new Map<string, SimulatedOrder>();
-    for (const order of this.#options.venue.ordersSnapshot()) orders.set(order.simulatedOrderId, order);
+    for (const watch of this.#basketWatches.values()) {
+      for (const venueOrderId of watch.venueOrderIds) {
+        if (orders.has(venueOrderId)) continue;
+        const order = this.#lookupOwned(venueOrderId);
+        if (order !== undefined) orders.set(venueOrderId, order);
+      }
+    }
     for (const watch of [...this.#basketWatches.values()]) this.#judgeBasket(watch, orders, instant);
   }
 
@@ -1963,13 +2150,33 @@ export class CoreLoop {
    * projection (`#bookUnownedFill`). It used to be dropped here with a bare
    * `continue`, AFTER the deduplicator had spent its id: no posting, no
    * counter, no halt.
+   *
+   * SIM-2: the fills come from the venue's NON-destructive cursor
+   * (`fillsSince`), read from `#knownFills`, which advances only where it
+   * always did — after the whole batch — so a store failure's early return
+   * re-reads the same batch next harvest (`IF-06`; the first fill is then
+   * refused as a duplicate and the unbooked tail is booked). A cursor the
+   * venue refuses — older than its retained window, so fills this process
+   * never read are gone — HALTS the process and ends the harvest BEFORE any
+   * release: nothing is given back while the fills that would replace it
+   * with a position are unknown.
    */
   async #harvestFills(instant: string): Promise<void> {
-    const fills = this.#options.venue.fills;
+    const page = this.#options.venue.fillsSince(this.#knownFills);
+    if (!page.ok) {
+      this.#options.halts.halt(
+        { kind: "GLOBAL" },
+        "VENUE_OBSERVATION_FAILED",
+        `the venue could not answer the fills since sequence ${String(this.#knownFills)}: ` +
+          `${page.refusal.code}: ${page.refusal.message}. Fills this process never read may be ` +
+          "gone, so no reservation is released and the account must be reconciled (SIM-2, §6 invariant 7)",
+        instant,
+      );
+      return;
+    }
+    const fills = page.value.fills;
     const booked: { instance: RegisteredInstance; fill: SimulatedFill }[] = [];
-    for (let index = this.#knownFills; index < fills.length; index += 1) {
-      const fill = fills[index];
-      if (fill === undefined) continue;
+    for (const fill of fills) {
       this.#options.health.countExecution("fillsObserved");
 
       // WP-220 obligation 5: at most once, keyed on the VENUE's own identity.
@@ -2060,7 +2267,7 @@ export class CoreLoop {
 
       booked.push({ instance, fill });
     }
-    this.#knownFills = fills.length;
+    this.#knownFills = page.value.next;
 
     // --- every order this harvest SETTLED gives its capacity back -----------
     // Between a fill's posting and its order's terminal release BOTH the new
@@ -2269,26 +2476,66 @@ export class CoreLoop {
    * Releases both reservation books for every order that has reached a terminal
    * state.
    *
-   * EVERY venue order, owned or not — and that is load-bearing (`TRDR-4` round
-   * 1): it is the only release of the entries `#releaseRefusedPlacement` KEPT
-   * for an order a refused plan nonetheless left at the venue, which no
-   * instance owns and `#deliverOrderViews` therefore never visits.
+   * Owned or not — and that is load-bearing (`TRDR-4` round 1): it is the only
+   * release of the entries `#releaseRefusedPlacement` KEPT for an order a
+   * refused plan nonetheless left at the venue, which no instance owns and
+   * `#deliverOrderViews` therefore never visits.
+   *
+   * SIM-2: it used to walk EVERY venue order ever placed, on every harvest —
+   * O(history) per event, re-releasing every settled order as a no-op. It
+   * now walks what this process can hold capital for: the orders it OWNS
+   * (settled orders were released at their terminal harvest and are no
+   * longer owned) and the ones it knows the venue holds WITHOUT an owner
+   * (`#heldUnowned`: the TRDR-4 defensive path, and a placement whose answer
+   * was lost), each looked up by id. A held entry is forgotten once its order
+   * is seen terminal and released. Releases are idempotent and order-free,
+   * and every counter counts effective releases only, so the numbers are the
+   * ones the full scan produced.
    *
    * Idempotent: a second call for the same order releases nothing and says so,
    * which is why `#deliverOrderViews` may keep its own call for orders that go
    * terminal without producing a fill (a cancel, an expiry, a rejection).
    */
   #releaseSettledReservations(): void {
-    for (const order of this.#options.venue.ordersSnapshot()) {
-      const view = toStrategyOrderView(order, {
-        marketId: order.marketId,
-        placedAt: this.#lastInstant,
-      });
-      if (!isTerminalStatus(view.status)) continue;
+    for (const venueOrderId of inVenueOrder(this.#orderOwners.keys())) {
+      const order = this.#ownedOrder(venueOrderId, this.#lastInstant);
+      if (order === undefined || !this.#isTerminalOrder(order)) continue;
       this.#reservations.releaseForOrder(order.plannedOrderId);
       this.#options.allocator.release(order.plannedOrderId);
       this.#timeInForce.release(order.plannedOrderId);
     }
+    for (const plannedOrderId of inVenueOrder(this.#heldUnowned.keys())) {
+      const venueOrderId = this.#heldUnowned.get(plannedOrderId);
+      const order =
+        venueOrderId === undefined
+          ? this.#options.venue.orderByPlannedId(plannedOrderId)
+          : this.#options.venue.orderById(venueOrderId);
+      if (order === undefined) {
+        // A HELD order the venue listed a moment ago and now cannot answer
+        // for is a history miss, and loud. A planned order of a LOST answer
+        // may never have been booked at all, so its absence is not evidence
+        // of anything: it is kept, and released if the venue ever shows it.
+        if (venueOrderId !== undefined) {
+          this.#haltOnVenueMiss(
+            `order ${venueOrderId} (planned ${plannedOrderId}), which it held for a refused plan without an owner`,
+            this.#lastInstant,
+          );
+        }
+        continue;
+      }
+      if (!this.#isTerminalOrder(order)) continue;
+      this.#reservations.releaseForOrder(order.plannedOrderId);
+      this.#options.allocator.release(order.plannedOrderId);
+      this.#timeInForce.release(order.plannedOrderId);
+      this.#heldUnowned.delete(plannedOrderId);
+    }
+  }
+
+  /** The trader's ONE terminal predicate, over a venue order (the SDK's terminal set). */
+  #isTerminalOrder(order: SimulatedOrder): boolean {
+    return isTerminalStatus(
+      toStrategyOrderView(order, { marketId: order.marketId, placedAt: this.#lastInstant }).status,
+    );
   }
 
   /**
@@ -2394,13 +2641,25 @@ export class CoreLoop {
    *   (obligation 9: the reservation stands until the order can consume no
    *   more inventory) — unchanged, and never before terminal (ADR-006 §9).
    *
-   * Every view is read from ONE `ordersSnapshot()` taken here, at the harvest
-   * boundary — after every fill of this harvest was booked — and every retired
-   * order is offered to `#settle` only after every delivery of the harvest has
-   * run, so a cancel a delivery registered is visible to condition (d).
+   * Every view is read from ONE boundary taken here, at the harvest boundary —
+   * after every fill of this harvest was booked — and every retired order is
+   * offered to `#settle` only after every delivery of the harvest has run, so
+   * a cancel a delivery registered is visible to condition (d).
+   *
+   * SIM-2: the boundary is the orders this process OWNS — the only ones the
+   * loop below ever delivered from the old `ordersSnapshot()` — read once
+   * each, BEFORE any delivery runs (a delivery can submit or cancel, and the
+   * boundary must not move under the loop), in venue order (`IF-07`: the
+   * order the snapshot scan visited them in, so the evaluation order, the
+   * decision sequence and `ctx.orders()` are unchanged). An order submitted
+   * by a delivery is not in it, exactly as it was not in the snapshot.
    */
   async #deliverOrderViews(instant: string): Promise<void> {
-    const boundary = this.#options.venue.ordersSnapshot();
+    const boundary: SimulatedOrder[] = [];
+    for (const venueOrderId of inVenueOrder(this.#orderOwners.keys())) {
+      const order = this.#ownedOrder(venueOrderId, instant);
+      if (order !== undefined) boundary.push(order);
+    }
     for (const order of boundary) {
       const instanceId = this.#orderOwners.get(order.simulatedOrderId);
       if (instanceId === undefined) continue;
@@ -2467,7 +2726,8 @@ export class CoreLoop {
    * What is deleted, each by its own key (the VENUE order id): the owner
    * entry, the fill-join LOOKUP entry (never the provenance log), the id in the
    * instance's order set (and the set when empty), the order-view tracker's
-   * entry, the booked-shares counter, and the retired flag. What remains is a
+   * entry, the booked-shares counter, the retired flag, and (SIM-2) the
+   * terminal record kept for it (`#terminalSeen`). What remains is a
    * bounded tombstone naming the probable owner, so a fill that still arrives
    * is classified as late rather than unknown — and is booked UNATTRIBUTED
    * either way.
@@ -2504,6 +2764,7 @@ export class CoreLoop {
     this.#bookedShares.delete(venueOrderId);
     this.#retired.delete(venueOrderId);
     this.#mismatched.delete(venueOrderId);
+    this.#terminalSeen.delete(venueOrderId);
     this.#tombstones.remember(venueOrderId, instanceId);
     this.#settled += 1;
   }
@@ -2640,8 +2901,11 @@ export class CoreLoop {
     const owned = this.#instanceOrders.get(instance.instanceId);
     if (owned === undefined) return Object.freeze([]);
     const orders: { orderId: string; marketId: string; side: "YES" | "NO"; action: "BUY" | "SELL"; price: string; shares: string }[] = [];
-    for (const order of this.#options.venue.ordersSnapshot()) {
-      if (!owned.has(order.simulatedOrderId)) continue;
+    // SIM-2: the instance's OWN orders, in venue order (`IF-07`: risk's
+    // `openOrders` keep the order the snapshot scan gave them), one lookup each.
+    for (const venueOrderId of inVenueOrder(owned)) {
+      const order = this.#ownedOrder(venueOrderId, this.#lastInstant);
+      if (order === undefined) continue;
       if (order.state === "FILLED" || order.state === "CANCELLED" || order.state === "EXPIRED" || order.state === "REJECTED") {
         continue;
       }
