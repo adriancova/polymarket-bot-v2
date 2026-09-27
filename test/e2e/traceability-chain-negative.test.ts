@@ -352,6 +352,24 @@ function entryRecord(document: Record<string, unknown>): Record<string, unknown>
   return record;
 }
 
+/**
+ * `RECON2-R2`: blanks the withdrawn take-profit's plan id on its booked order
+ * AND on its record, so the two still agree and only the identity rule can see
+ * it. The chain's own plan hop refuses an empty plan, but this order is on no
+ * chain. Returns the order's id.
+ */
+function emptyTakeProfitPlan(document: Record<string, unknown>): string {
+  const record = takeProfitRecord(document);
+  const orders = document["orders"] as Record<string, unknown>[];
+  const order = orders.find(
+    (candidate) => candidate["simulatedOrderId"] === record["venueOrderId"],
+  );
+  if (order === undefined) throw new Error("the take-profit's record names no booked order");
+  order["executionPlanId"] = "";
+  record["executionPlanId"] = "";
+  return String(record["venueOrderId"]);
+}
+
 interface ProvenanceMutation {
   readonly what: string;
   readonly mutate: (document: Record<string, unknown>) => void;
@@ -441,6 +459,15 @@ const PROVENANCE_MUTATIONS: readonly ProvenanceMutation[] = [
     },
   },
   {
+    what:
+      "the withdrawn take-profit's order AND its record carry an empty plan id, so the record " +
+      "still names the booked order's plan (RECON2-R2)",
+    codes: ["PROVENANCE_UNRESOLVED"],
+    mutate: (document) => {
+      emptyTakeProfitPlan(document);
+    },
+  },
+  {
     what: "a record names a plan the booked order was not placed under",
     codes: ["PROVENANCE_UNRESOLVED"],
     mutate: (document) => {
@@ -489,4 +516,18 @@ describe("RECON-2 — every provenance record is a resolved node, and none is an
       expect(report.brokenHops, explainWalk(report)).toEqual([]);
     });
   }
+
+  it("RECON2-R2: an unfilled order's record with an empty plan id is refused by the identity rule alone", () => {
+    const document = mutableGolden();
+    const orderId = emptyTakeProfitPlan(document);
+    // Non-vacuous: the order really is on no chain, so no hop could see it.
+    const traces = document["traces"] as Record<string, unknown>[];
+    expect(traces.some((trace) => trace["venueOrderId"] === orderId)).toBe(false);
+    const report = walkChains(asDocument(document));
+    expect(report.findings).toEqual([
+      `PROVENANCE_UNRESOLVED: ${orderId}: the approved-intent, plan and submission-attempt ids ` +
+        "are not three distinct, non-empty identities",
+    ]);
+    expect(report.brokenHops).toEqual([]);
+  });
 });

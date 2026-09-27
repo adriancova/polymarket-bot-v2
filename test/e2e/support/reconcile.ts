@@ -480,6 +480,10 @@ const PROVENANCE_FIELDS = [
  * - one plan whose orders name two emissions, or one emission claimed by two
  *   plans (below);
  * - a fill whose order the venue never booked;
+ * - a trace that is not bound to its own fill (`RECON2-R1`): the fill id it
+ *   carries names no fill, or names more than one, or names a fill that
+ *   belongs to ANOTHER order than the one the trace names. The loop completes
+ *   an order's record into a trace only with a fill of that order;
  * - a trace that DISAGREES with its order's provenance record on any shared
  *   field (`RECON1-ORIGIN`): the loop completes the trace FROM the record;
  * - an order that reports filled shares while no trace names it: the loop
@@ -730,7 +734,8 @@ function attributeByProvenance(artifact: Omit<PaperRunArtifact, "reconciliation"
     );
   }
 
-  // --- every trace agrees with its order's provenance record ----------------
+  // --- every trace is bound to its own fill, and agrees with that fill's
+  // order's provenance record ------------------------------------------------
   for (const trace of artifact.traces) {
     const record = provenance.get(trace.venueOrderId);
     if (record === undefined) {
@@ -738,6 +743,37 @@ function attributeByProvenance(artifact: Omit<PaperRunArtifact, "reconciliation"
         `the trace of fill ${trace.venueFillId} names order ${trace.venueOrderId}, which has no ` +
           "provenance record; a trace is its order's submission-time record completed by a " +
           "fill, so a trace without one is not the run's",
+      );
+    }
+    // `RECON2-R1`: a trace names its fill AND its order, and the two must be
+    // one link. The loop looks the prefix up by the fill's OWN order id
+    // (`#harvestFills`: `#orderTraces.get(fill.simulatedOrderId)`), so a trace
+    // whose fill belongs to another order — two traces that swapped their
+    // prefixes, or a fill re-pointed at another order — is not the run's.
+    // Without this join every filled order could still show "a" trace, and
+    // every trace "a" matching record, while the fills sat under the wrong
+    // orders. Once it holds, the record compared below is the record of the
+    // fill's own order.
+    const produced = fills.filter((fill) => fill.simulatedFillId === trace.venueFillId);
+    const own = produced[0];
+    if (own === undefined || produced.length > 1) {
+      throw new Error(
+        own === undefined
+          ? `the trace of fill ${trace.venueFillId} (order ${trace.venueOrderId}) names a fill ` +
+              "the venue never produced; a trace is completed BY its fill, so a trace without " +
+              "one is not the run's and its order is not attributed by it"
+          : `fill id ${trace.venueFillId}, which the trace of order ${trace.venueOrderId} ` +
+              `names, is carried by ${String(produced.length)} fills (orders ` +
+              `${produced.map((fill) => fill.simulatedOrderId).join(", ")}); a trace binds ONE ` +
+              "fill, so which one it traces is ambiguous and neither is attributed by it",
+      );
+    }
+    if (own.simulatedOrderId !== trace.venueOrderId) {
+      throw new Error(
+        `the trace of fill ${trace.venueFillId} names order ${trace.venueOrderId}, but fill ` +
+          `${trace.venueFillId} belongs to order ${own.simulatedOrderId}; the loop completes an ` +
+          "order's provenance record into a trace only with a fill OF THAT ORDER, so this trace " +
+          "is not the run's and the fill is not attributed by it",
       );
     }
     const disagreements = PROVENANCE_FIELDS.filter((field) => trace[field] !== record[field]);
@@ -759,6 +795,9 @@ function attributeByProvenance(artifact: Omit<PaperRunArtifact, "reconciliation"
   }
 
   // --- an order that reports fills has traces --------------------------------
+  // After the join above, a trace that names an order is bound to one of that
+  // order's OWN fills, so a trace borrowed from another order's fill cannot
+  // satisfy this check.
   const tracedOrders = new Set(artifact.traces.map((trace) => trace.venueOrderId));
   const untracedFilled = artifact.orders.filter(
     (order) =>

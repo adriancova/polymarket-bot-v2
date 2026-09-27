@@ -576,8 +576,12 @@ export function walkChains(document: WalkableDocument): WalkReport {
         );
       }
     }
+    // All three non-empty (`RECON2-R2`: the plan id too — the chain's own plan
+    // hop refuses an empty one, and an unfilled order's record is on no chain)
+    // and pairwise distinct.
     if (
       record.approvedIntentId === "" ||
+      record.executionPlanId === "" ||
       record.approvedIntentId === record.executionPlanId ||
       record.submissionAttemptId === "" ||
       record.submissionAttemptId === record.executionPlanId ||

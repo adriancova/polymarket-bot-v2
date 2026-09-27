@@ -77,6 +77,7 @@ import {
   type ArtifactTrace,
   type PaperRunArtifact,
 } from "./support/artifact.js";
+import { walkChains } from "./support/chain-walk.js";
 import { goldenBytes } from "./support/golden.js";
 import { driveScenario } from "./support/harness.js";
 import { COMPUTED_SPECIFIER, moduleSpecifiersIn } from "./support/module-specifiers.js";
@@ -1035,7 +1036,9 @@ describe("RECON-2 — an order without a record, or a record a trace contradicts
    * The loop builds a trace FROM the record — `{ ...prefix, venueFillId, … }`
    * (`apps/trader/src/loop.ts` `#harvestFills`) — so the two share eight fields
    * that can disagree (the ninth, `venueOrderId`, is how the record is found;
-   * the probe above for a trace naming an order with no record covers it).
+   * the probe above for a trace naming an order with no record covers it, and
+   * a trace naming ANOTHER booked order than its own fill's is `RECON2-R1`'s,
+   * pinned in the next block).
    * Each field of the exit fill's trace is changed on its own, to a value that
    * leaves every other rule satisfied, and each is refused by name.
    */
@@ -1079,6 +1082,168 @@ describe("RECON-2 — an order without a record, or a record a trace contradicts
     );
     expect(() => buildReconciliation(tampered)).toThrow(
       /disagrees with order .+'s provenance record on evaluationSeq \(trace 9, provenance 18\)/u,
+    );
+  });
+});
+
+/**
+ * Every trace in `artifact` names a booked order whose record it agrees with
+ * field for field, and every order reporting filled shares is named by some
+ * trace: the conditions the reconciler checked before `RECON2-R1`. A probe
+ * that satisfies them shows its refusal is the fill-to-trace join's alone.
+ */
+function tracesAgreeWithTheirOrdersRecords(artifact: PaperRunArtifact): void {
+  const fields = [
+    "sourceEventId",
+    "featureSnapshotRef",
+    "runId",
+    "evaluationSeq",
+    "intentId",
+    "approvedIntentId",
+    "executionPlanId",
+    "submissionAttemptId",
+    "venueOrderId",
+  ] as const satisfies readonly (keyof ArtifactOrderProvenance)[];
+  for (const trace of artifact.traces) {
+    const record = recordOf(artifact, trace.venueOrderId);
+    for (const field of fields) expect(trace[field], field).toBe(record[field]);
+  }
+  const traced = new Set(artifact.traces.map((trace) => trace.venueOrderId));
+  for (const order of artifact.orders) {
+    if (compareDecimal(order.filledShares, "0") !== 0) {
+      expect(traced.has(order.simulatedOrderId), order.simulatedOrderId).toBe(true);
+    }
+  }
+}
+
+/**
+ * `RECON2-R1` (RECON-2 r1 review, MEDIUM): a trace names a fill AND an order,
+ * and the reconciler selected the record by the trace's order without asking
+ * whether the trace's FILL belongs to that order. The loop builds a trace by
+ * looking the submission-time prefix up under the fill's OWN order id
+ * (`#orderTraces.get(fill.simulatedOrderId)`), so the two cannot differ in a
+ * run. Each probe below passes every pre-join check
+ * ({@link tracesAgreeWithTheirOrdersRecords}), and was accepted by the r0
+ * reconciler.
+ */
+describe("RECON2-R1 — a trace is bound to the fill whose id it carries", () => {
+  /**
+   * The review's reproduction 1: the first entry fill's trace and the exit
+   * fill's trace SWAP their nine-field submission prefixes and keep their own
+   * fill and ledger ids. Every trace then agrees with the record of the order
+   * it names, and both filled orders still carry a trace. The r0 reconciler
+   * returned the golden's table unchanged and fully explained; the chain walk
+   * already reported the `fill` hop broken.
+   */
+  it("two traces that swap their orders' prefixes, keeping their own fill ids, are refused", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const entryFillId = marks.entryTrace.venueFillId;
+    const exitFillId = marks.exitFill.simulatedFillId;
+    const tampered: PaperRunArtifact = {
+      ...artifact,
+      traces: artifact.traces.map((trace) =>
+        trace.venueFillId === entryFillId
+          ? { ...trace, ...marks.exitRecord }
+          : trace.venueFillId === exitFillId
+            ? { ...trace, ...marks.entryRecord }
+            : trace,
+      ),
+    };
+    // Non-vacuous: both swapped traces still carry their own fill ids, and
+    // every pre-join rule is satisfied.
+    expect(tampered.traces.map((trace) => trace.venueFillId)).toEqual(
+      artifact.traces.map((trace) => trace.venueFillId),
+    );
+    expect(
+      tampered.traces.find((trace) => trace.venueFillId === entryFillId)?.venueOrderId,
+    ).toBe(marks.exitOrder.simulatedOrderId);
+    tracesAgreeWithTheirOrdersRecords(tampered);
+    expect(walkChains(tampered).brokenHops).toEqual(["fill"]);
+
+    expect(() => buildReconciliation(tampered)).toThrow(
+      `the trace of fill ${entryFillId} names order ${marks.exitOrder.simulatedOrderId}, but ` +
+        `fill ${entryFillId} belongs to order ${marks.entryOrder.simulatedOrderId}`,
+    );
+  });
+
+  /**
+   * The review's reproduction 2: the exit fill is re-pointed at the ENTRY
+   * order while its trace still names the exit order. The r0 reconciler
+   * counted the exit fill as an entry purchase (`entry.shares.realized` 100,
+   * `exit.expected_net_edge.realized` −33.632) instead of refusing.
+   */
+  it("a fill re-pointed at another order, while its trace names the order that placed it, is refused", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const exitFillId = marks.exitFill.simulatedFillId;
+    const tampered: PaperRunArtifact = {
+      ...artifact,
+      fills: artifact.fills.map((fill) =>
+        fill.simulatedFillId === exitFillId
+          ? { ...fill, simulatedOrderId: marks.entryOrder.simulatedOrderId }
+          : fill,
+      ),
+    };
+    // Non-vacuous: the traces are the golden's own, and the re-pointed fill
+    // lands on a booked order whose record resolves to the entry.
+    expect(tampered.traces).toEqual(artifact.traces);
+    tracesAgreeWithTheirOrdersRecords(tampered);
+
+    expect(() => buildReconciliation(tampered)).toThrow(
+      `the trace of fill ${exitFillId} names order ${marks.exitOrder.simulatedOrderId}, but ` +
+        `fill ${exitFillId} belongs to order ${marks.entryOrder.simulatedOrderId}`,
+    );
+  });
+
+  it("a trace naming a fill the venue never produced is refused", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const ghost = `${marks.exitOrder.simulatedOrderId}/t0/9`;
+    // A second trace of the exit order, its prefix the exit's own record, for a
+    // fill no venue produced.
+    const tampered: PaperRunArtifact = {
+      ...artifact,
+      traces: [
+        ...artifact.traces,
+        { ...marks.exitTrace, venueFillId: ghost, ledgerFillId: `${ghost}-ledger` },
+      ],
+    };
+    expect(tampered.fills.some((fill) => fill.simulatedFillId === ghost)).toBe(false);
+    tracesAgreeWithTheirOrdersRecords(tampered);
+
+    expect(() => buildReconciliation(tampered)).toThrow(
+      `the trace of fill ${ghost} (order ${marks.exitOrder.simulatedOrderId}) names a fill the ` +
+        "venue never produced",
+    );
+  });
+
+  it("a fill id carried by two fills, under two orders, is refused as ambiguous", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const exitFillId = marks.exitFill.simulatedFillId;
+    // The exit fill, and a copy of it under the ENTRY order with the same id.
+    const tampered: PaperRunArtifact = {
+      ...artifact,
+      fills: [
+        ...artifact.fills,
+        { ...marks.exitFill, simulatedOrderId: marks.entryOrder.simulatedOrderId },
+      ],
+    };
+    // Non-vacuous: the exit trace's own fill is still there, under its order.
+    tracesAgreeWithTheirOrdersRecords(tampered);
+    expect(
+      tampered.fills.filter(
+        (fill) =>
+          fill.simulatedFillId === exitFillId &&
+          fill.simulatedOrderId === marks.exitOrder.simulatedOrderId,
+      ),
+    ).toHaveLength(1);
+
+    expect(() => buildReconciliation(tampered)).toThrow(
+      `fill id ${exitFillId}, which the trace of order ${marks.exitOrder.simulatedOrderId} ` +
+        `names, is carried by 2 fills (orders ${marks.exitOrder.simulatedOrderId}, ` +
+        `${marks.entryOrder.simulatedOrderId})`,
     );
   });
 });
@@ -1283,8 +1448,23 @@ describe("RECON-1 r2 — the review's silent mis-attributions are refused", () =
     const marks = landmarks(artifact);
     const [lot] = marks.entryFills;
     if (lot === undefined) throw new Error("an entry lot expected");
-    const fills = [{ ...lot, atEventIngestSeq: "05" }];
-    expect(() => buildReconciliation({ ...artifact, fills })).toThrow(
+    // `RECON2-R1`: the ONE fill keeps its own trace, and the fills it replaces
+    // take theirs with them (the reduction withdrawn unfilled, the second entry
+    // lot dropped). Before r1 this probe left three traces naming fills the
+    // document no longer held, which the fill-to-trace join now refuses first;
+    // the synthetic is made well formed so that the refusal is still the
+    // sequence check's, reached through a fold with ONE element.
+    const withdrawn = withReductionWithdrawn(artifact);
+    const single = (atEventIngestSeq: string): PaperRunArtifact => ({
+      ...withdrawn,
+      fills: [{ ...lot, atEventIngestSeq }],
+      traces: withdrawn.traces.filter((trace) => trace.venueFillId === lot.simulatedFillId),
+    });
+    expect(single("05").fills).toHaveLength(1);
+    expect(single("05").traces).toHaveLength(1);
+    // Control: the same document with the canonical spelling is folded.
+    expect(() => buildReconciliation(single("5"))).not.toThrow();
+    expect(() => buildReconciliation(single("05"))).toThrow(
       /not a canonical unsigned integer string/u,
     );
   });
@@ -1741,10 +1921,13 @@ describe("RECON-1 r1 — PnL reconciles against packages/pnl's own cost method (
     // Fully CLOSED — the golden itself: nothing is left open.
     expect(openBasis(artifact).capital).toBe("0");
     // Fully OPEN — the exit fill removed: the whole entry notional is open.
-    const open = {
-      ...artifact,
-      fills: artifact.fills.filter((fill) => fill.simulatedFillId !== marks.exitFill.simulatedFillId),
-    };
+    // `RECON2-R1`: the fill goes WITH its trace, and its order reports nothing
+    // filled (`withReductionWithdrawn`); a trace left naming a fill the
+    // document no longer holds is now refused, which is not this pin's subject.
+    const open = withReductionWithdrawn(artifact);
+    expect(open.fills.some((fill) => fill.simulatedFillId === marks.exitFill.simulatedFillId)).toBe(
+      false,
+    );
     expect(openBasis(open).capital).toBe(
       marks.entryFills.reduce(
         (total, fill) => addDecimal(total, mulDecimal(fill.price, fill.shares)),
