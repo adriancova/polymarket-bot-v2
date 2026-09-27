@@ -1006,6 +1006,12 @@ describe("an ownerless fill is never skipped — UNATTRIBUTED, halted, counted (
     // no owner — and the executed slice's fills reach the next harvest
     // ownerless. Before TRDR-4 they were skipped with no posting, counter or
     // halt.
+    //
+    // TRDR-4 round 1 (TRDR4-R1): the refusal itself now halts the market,
+    // naming the slice the venue holds, and releases ONLY the slice the venue
+    // never booked; the held slice's entries are released by the harvest that
+    // sees it terminal (here the same iteration's, after its fills are booked).
+    // `loop-refused-plan.test.ts` pins the RESTING variant.
     const parts = assemble({
       maxSliceShares: "30",
       rateLimits: tokenBucketRateLimits({
@@ -1031,6 +1037,16 @@ describe("an ownerless fill is never skipped — UNATTRIBUTED, halted, counted (
     const halt = health.halts.find((record) => record.code === "UNATTRIBUTED_ACTIVITY");
     expect(halt?.scope).toEqual({ kind: "MARKET", marketId: MARKET_ID });
     expect(halt?.detail).toContain("partly executed and then refused");
+    const held = orphaned[0];
+    if (held === undefined) throw new Error("the venue holds no order");
+    expect(halt?.detail).toContain("1 of its 2 planned orders");
+    expect(halt?.detail).toContain(`${held.simulatedOrderId} (planned ${held.plannedOrderId}) FILLED 30/30`);
+    // Only the slice the venue never booked was released AT the refusal; the
+    // held (FILLED) slice's entries came back at the terminal harvest.
+    expect(health.execution.reservationsReleasedOnRefusal).toBe(1);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 2, released: 2, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 2, released: 2, reservedCollateral: "0" });
+    expect(loop.timeInForceFor(held.plannedOrderId)).toBeUndefined();
     // The account side follows the venue: the ledger holds the shares, all of
     // them UNATTRIBUTED; no instance holds any.
     expect(virtualYes(loop)).toBe("0");

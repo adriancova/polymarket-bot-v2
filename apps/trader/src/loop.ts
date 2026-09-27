@@ -1479,23 +1479,7 @@ export class CoreLoop {
         if (resolution !== undefined) this.#options.health.countExecution("cancelsRejected");
         return;
       }
-      // --- the refused submission RELEASES what it reserved -----------------
-      // Review round 1, MEDIUM-4. A refused submission produces NO order and
-      // therefore no order view, and the only release path was
-      // `#deliverOrderViews`'s terminal-status arm — so the reservation stayed
-      // taken FOREVER. `reserved` grew monotonically, understating
-      // `availableCollateral` on the planning surface and the unreserved
-      // balance on the strategy's `riskBudget`, until entries starved with no
-      // visible cause. The venue said no; the capacity comes back.
-      for (const group of placement.groups) {
-        for (const order of group.orders) {
-          if (this.#reservations.releaseForOrder(order.plannedOrderId)) {
-            this.#options.health.countExecution("reservationsReleasedOnRefusal");
-          }
-          this.#options.allocator.release(order.plannedOrderId);
-          this.#timeInForce.release(order.plannedOrderId);
-        }
-      }
+      this.#releaseRefusedPlacement(placement, result, input.instant);
       return;
     }
     this.#options.health.countExecution("submissionsAccepted");
@@ -1533,6 +1517,107 @@ export class CoreLoop {
       // same prefix, two lifetimes (`TRDR-4`).
       this.#orderTraces.set(order.simulatedOrderId, prefix);
       this.#provenance.append(prefix);
+    }
+  }
+
+  /**
+   * A REFUSED placement returns what it reserved — for every planned order the
+   * venue does NOT hold — and keeps it for every order the venue DOES hold.
+   *
+   * Review round 1, MEDIUM-4: the only release path used to be
+   * `#deliverOrderViews`'s terminal-status arm, and a refused plan has no owned
+   * order to deliver, so its reservation stayed taken FOREVER — `reserved` grew
+   * monotonically, understating `availableCollateral` on the planning surface
+   * and the unreserved balance on the strategy's `riskBudget`, until entries
+   * starved with no visible cause. The venue said no; the capacity comes back.
+   *
+   * `TRDR-4` round 1 (finding TRDR4-R1): a refusal is NOT proof that nothing
+   * was placed, and releasing EVERY planned order's entries freed the capital,
+   * the inventory and the time-in-force of an order still WORKING at the venue
+   * — which ADR-006 §9 forbids (never released before terminal). The
+   * simulator books a plan's orders one at a time and, when a later one fails
+   * (its rate-limit budget, a duplicate id, an execution refusal —
+   * `SimulatedVenue`'s `#submitSync`), refuses the WHOLE plan with
+   * `orders: []` while the earlier orders stay in its book: RESTING,
+   * PARTIALLY_FILLED, or already terminal. A real venue can answer the same
+   * way. So each planned order is looked up in the venue's OWN order state (and
+   * in the refused answer's `orders`), by its PLANNED order id — the key all
+   * three books use:
+   *
+   * - the venue holds NO order under that id: it was never placed, and its
+   *   reservation, allocator commitment and time-in-force are released now;
+   * - the venue HOLDS one, in any state: all three are KEPT. The harvest-
+   *   boundary release (`#releaseSettledReservations`, which walks every venue
+   *   order, owned or not) returns them at the first harvest that sees the
+   *   order terminal, after that harvest's fills are booked — the same rule
+   *   and the same moment as for an owned order, so nothing is released before
+   *   terminal and nothing before the position that replaces it exists.
+   *
+   * And a plan the venue PARTLY EXECUTED is a reconciliation question (§6
+   * invariant 6: an unknown submission is never a silent retry). The answer
+   * named no order, so no instance owns the held ones: no owner entry, no
+   * `onOrderUpdate`, no `ctx.orders()` view, and a fill of theirs is booked
+   * UNATTRIBUTED (`#bookUnownedFill`). The market each held order trades is
+   * halted NOW — `UNATTRIBUTED_ACTIVITY`, whose §9.9 action is
+   * `RECONCILE_ACCOUNT` — before any later decision of this iteration can plan
+   * against it, rather than waiting for a fill that a resting order may never
+   * produce. Nothing is dropped and nothing is attributed.
+   */
+  #releaseRefusedPlacement(
+    placement: PlacementPlan,
+    result: ExecutionResult,
+    instant: string,
+  ): void {
+    const plannedOrderIds: string[] = [];
+    for (const group of placement.groups) {
+      for (const order of group.orders) plannedOrderIds.push(order.plannedOrderId);
+    }
+    const planned = new Set(plannedOrderIds);
+    // Keyed by the PLANNED order id: the venue's `simulatedOrderId` is its own
+    // id for the order and is only coincidentally equal in the simulator. Both
+    // sources count as evidence the venue holds an order — the refused answer's
+    // own `orders` (empty from the simulator's `#refuse`, but a venue may list
+    // what it did book) and the venue's order state, which is read last so its
+    // fresher view wins — because keeping an entry is the fail-closed side.
+    const venueHeld = new Map<string, SimulatedOrder>();
+    for (const order of [...result.orders, ...this.#options.venue.ordersSnapshot()]) {
+      if (planned.has(order.plannedOrderId)) venueHeld.set(order.plannedOrderId, order);
+    }
+    const held = plannedOrderIds.flatMap((plannedOrderId) => {
+      const order = venueHeld.get(plannedOrderId);
+      return order === undefined ? [] : [order];
+    });
+
+    for (const plannedOrderId of plannedOrderIds) {
+      if (venueHeld.has(plannedOrderId)) continue;
+      if (this.#reservations.releaseForOrder(plannedOrderId)) {
+        this.#options.health.countExecution("reservationsReleasedOnRefusal");
+      }
+      this.#options.allocator.release(plannedOrderId);
+      this.#timeInForce.release(plannedOrderId);
+    }
+    if (held.length === 0) return;
+
+    const described = held
+      .map(
+        (order) =>
+          `${order.simulatedOrderId} (planned ${order.plannedOrderId}) ${order.state} ` +
+          `${order.filledShares}/${order.requestedShares}`,
+      )
+      .join(", ");
+    const refusal = `${result.refusalCode ?? "VENUE_REFUSED"}: ${result.refusalMessage ?? "the venue refused the plan"}`;
+    for (const marketId of [...new Set(held.map((order) => order.marketId))].sort()) {
+      this.#options.halts.halt(
+        { kind: "MARKET", marketId },
+        "UNATTRIBUTED_ACTIVITY",
+        `plan ${placement.executionPlanId} was refused (${refusal}), yet the venue holds ` +
+          `${String(held.length)} of its ${String(plannedOrderIds.length)} planned orders — ` +
+          `partly executed and then refused: ${described}. No instance owns them; their ` +
+          "reservations, allocator commitments and time-in-force are KEPT until each is " +
+          "terminal, and any fill of theirs is booked UNATTRIBUTED; reconcile the account " +
+          "(§6 invariant 6, TRDR-4)",
+        instant,
+      );
     }
   }
 
@@ -1853,6 +1938,11 @@ export class CoreLoop {
   /**
    * Releases both reservation books for every order that has reached a terminal
    * state.
+   *
+   * EVERY venue order, owned or not — and that is load-bearing (`TRDR-4` round
+   * 1): it is the only release of the entries `#releaseRefusedPlacement` KEPT
+   * for an order a refused plan nonetheless left at the venue, which no
+   * instance owns and `#deliverOrderViews` therefore never visits.
    *
    * Idempotent: a second call for the same order releases nothing and says so,
    * which is why `#deliverOrderViews` may keep its own call for orders that go

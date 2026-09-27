@@ -154,6 +154,11 @@ export interface ExecutionHealth {
    * before the fix nothing ever released what it had reserved. A non-zero
    * count here is the release happening; `seams.reservations.open` returning to
    * its prior value is the same fact measured from the book.
+   *
+   * `TRDR-4` round 1: only a planned order the venue does NOT hold is released
+   * here. An order a refused plan nonetheless left at the venue keeps its
+   * reservation until it is terminal (ADR-006 §9), and its market is halted
+   * `UNATTRIBUTED_ACTIVITY` for reconciliation.
    */
   readonly reservationsReleasedOnRefusal: number;
   /**
