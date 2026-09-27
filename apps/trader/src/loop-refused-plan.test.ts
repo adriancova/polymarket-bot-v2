@@ -108,6 +108,7 @@ import {
   type QueueModelParameters,
   type RateLimitBudget,
   type SimulatedOrder,
+  type VenueRetentionBounds,
 } from "@polymarket-bot/simulation";
 import { createStrategyInstanceRuntime, type EvaluationInput } from "@polymarket-bot/strategy-runtime";
 import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
@@ -449,6 +450,10 @@ class RefusesWhileHoldingVenue implements TraderVenue {
   orderByPlannedId(plannedOrderId: string): ReturnType<TraderVenue["orderByPlannedId"]> {
     return this.inner.orderByPlannedId(plannedOrderId);
   }
+
+  acknowledgeTerminal(venueOrderId: string): boolean {
+    return this.inner.acknowledgeTerminal(venueOrderId);
+  }
 }
 
 /**
@@ -499,6 +504,10 @@ class MovesBetweenCallsVenue implements TraderVenue {
   orderByPlannedId(plannedOrderId: string): ReturnType<TraderVenue["orderByPlannedId"]> {
     return this.inner.orderByPlannedId(plannedOrderId);
   }
+
+  acknowledgeTerminal(venueOrderId: string): boolean {
+    return this.inner.acknowledgeTerminal(venueOrderId);
+  }
 }
 
 interface Harness {
@@ -547,6 +556,8 @@ function assemble(
      * loop's). The shipped trader runs Tier 0, which never delays.
      */
     readonly tier1?: { readonly secondsDelay: number; readonly venueClock?: ManualClock };
+    /** SIM-2 r1: the venue's history bounds (its defaults when absent). */
+    readonly venueRetention?: VenueRetentionBounds;
   } = {},
 ): Harness {
   const parsed = parseTraderConfig(traderConfig());
@@ -643,6 +654,7 @@ function assemble(
       sameInstantAdditionsFor: () => "NOT_OBSERVED" as const,
     },
     startingCash: "1000",
+    ...(input.venueRetention === undefined ? {} : { retention: input.venueRetention }),
   };
   const tier1 = input.tier1;
   // The Tier-1 venue, once built: its timeline anchors a book to the event it is at.
@@ -1658,8 +1670,10 @@ describe("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOL
     expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
     expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
     expect(health.execution.reservationsReleasedOnRefusal).toBe(9);
-    // SIM-2: released, so no longer tracked.
+    // SIM-2: released, so no longer tracked — and (r1) the venue is told it
+    // may forget the order now, and not before.
     expect(loop.retainedOrderState().heldUnowned).toBe(0);
+    expect(harness.venue.retention().awaitingAcknowledgment).toBe(0);
 
     // The strategy never saw the orphan: no delivery, no ctx.orders() view.
     for (const evaluation of harness.evaluations) {
@@ -1668,4 +1682,65 @@ describe("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOL
     }
   });
 
+});
+
+describe("SIM-2 r1 — a WATCHED basket's settled leg stays answerable until the watch concludes (the venue retains ONE acknowledged order)", () => {
+  it("a GTC basket: the YES legs FILL and SETTLE at once while the NO legs rest; a later trade fills the NO legs — the watch still finds every leg, concludes COMPLETE, and only then are the YES legs acknowledged", async () => {
+    const harness = assemble({
+      immediateOrderType: "GTC",
+      venueLadder: oneShareAsks(["NO"]),
+      intent: twoLegBasket,
+      venueRetention: { orders: 1, tombstones: 1 },
+    });
+    await open(harness);
+    const loop = harness.loop;
+    const answer = harness.answers[0];
+    if (answer === undefined) throw new Error("no answer was recorded");
+    expect(legs(answer.orders)).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+      "NO PARTIALLY_FILLED 1/5",
+      "NO PARTIALLY_FILLED 1/5",
+    ]);
+    const yesLegs = answer.orders.filter((order) => order.side === "YES").map((order) => order.simulatedOrderId);
+    // The YES legs were delivered, retired and SETTLED at event 4's harvest —
+    // yet the venue still HOLDS them: a watched basket reads them.
+    expect(loop.health().halts).toEqual([]);
+    expect(loop.health().seams.orders.settled).toBe(2);
+    expect(loop.retainedOrderState()).toMatchObject({ basketWatches: 1, owners: 2, watchedOrders: 4 });
+    expect(harness.venue.retention()).toMatchObject({ awaitingAcknowledgment: 2, orders: { retained: 0, evicted: 0 } });
+    for (const id of yesLegs) expect(harness.venue.orderById(id)?.state).toBe("FILLED");
+
+    // Event 5: a public NO trade through the resting NO legs fills them.
+    await feed(
+      harness,
+      envelope(5, "PublicTradeObserved", {
+        internalMarketId: MARKET_ID,
+        tokenId: NO_TOKEN,
+        price: "0.6",
+        size: "20",
+        takerSide: "ASK",
+      }),
+    );
+    // Every leg ended FILLED — read from the deliveries, because the venue's
+    // history, bounded at ONE acknowledged order, now keeps only the last.
+    const noLegs = answer.orders.filter((order) => order.side === "NO").map((order) => order.simulatedOrderId);
+    const terminalViews = harness.evaluations.flatMap((evaluation) =>
+      evaluation.callback === "onOrderUpdate" && evaluation.order.status === "FILLED" ? [evaluation.order.orderId] : [],
+    );
+    expect([...terminalViews].sort()).toEqual([...yesLegs, ...noLegs].sort());
+    // COMPLETE: no halt of any kind, no watch left behind (at 7c570ed a
+    // forgotten leg read as "still working" kept it for ever — or, there, the
+    // first leg's eviction inside the submission halted GLOBAL).
+    const health = loop.health();
+    expect(health.halts).toEqual([]);
+    expect(loop.retainedOrderState()).toMatchObject({ basketWatches: 0, watchedOrders: 0, owners: 0 });
+    expect(health.seams.orders).toMatchObject({ settled: 4, unownedFills: 0 });
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+    // Every leg acknowledged once the watch let go of it; the bound applies now.
+    expect(harness.venue.retention()).toMatchObject({
+      awaitingAcknowledgment: 0,
+      orders: { retained: 1, maximumRetained: 1, evicted: 3 },
+    });
+  });
 });

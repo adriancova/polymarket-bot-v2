@@ -35,7 +35,7 @@ chronology).
 | `markout.ts` | §12.3 markouts as diagnostics, and stress scenarios separately |
 | `rate-limit.ts` | The §9.13 budget seam, with absence stated explicitly |
 | `venue.ts` | The §12.1 `ExecutionVenue`, simulated — routes on `executionStyle`: a crossing `postOnly` order is REJECTED, a non-crossing `REST` order rests and is filled by observed trades, and everything marketable takes. It exposes MORE than the three §12.1 methods (§5 item 17) |
-| `retention.ts` | SIM-2: the venue's bounded, counted history — a sequenced fill log, a keyed terminal-order/band log, and the duplicate guard's tombstones |
+| `retention.ts` | SIM-2: the venue's bounded, counted history — a sequenced fill log, a keyed terminal-order/band log, and the duplicate guard's tombstones and evicted-id filter |
 | `replay.ts` | The run driver and the seam the shared core loop plugs into |
 | `serialize.ts` | The §12.4 canonical form a determinism claim is made about |
 
@@ -370,41 +370,68 @@ key.
 17. **The venue holds LIVE state plus a BOUNDED, COUNTED history, and exposes
     more than §12.1's three methods** (SIM-2, LOOPMEM-SIM part 2). An order
     the venue can still work (RESTING, PARTIALLY_FILLED, DELAYED) is in a live
-    index; an order that reaches a terminal state moves to a retention log,
-    and so do produced fills and the last band of a terminal Tier-1 order.
-    Every bound defaults far above every fixture (`DEFAULT_VENUE_RETENTION`:
-    50 000 terminal orders, 50 000 fills, 10 000 bands, 100 000 tombstoned ids
-    — about 190 MB of Tier-0 history at the bounds, from measured entry sizes)
-    and is a `SimulatedVenueOptions.retention` override; `retention()` reports the
-    live sizes and, per log, what is retained, the bound and what was EVICTED.
-    What each reader gets:
+    index. An order that reaches a terminal state is HELD — answered by every
+    lookup, never evicted, outside every bound — until its consumer
+    ACKNOWLEDGES it (`acknowledgeTerminal`); only then does it enter the
+    bounded order history (SIM-2 r1, `SIM2-R1-1`: one submission, cancel,
+    expiry sweep or DELAYED batch can end more orders than any bound, and none
+    of them may vanish before the process that placed it has read it). The
+    trader loop acknowledges an order once it has settled it (a basket leg once
+    its basket's watch has concluded; a held-but-unowned order once released),
+    so what the venue holds for it is bounded by the loop's own unsettled
+    orders. A venue NOBODY acknowledges — a `runReplay` driver without the
+    trader loop, a test — keeps every terminal order, as before SIM-2; its
+    §12.4 history is all of them anyway. Produced fills and the last band of a
+    terminal Tier-1 order go to their own bounded logs at once. Every bound
+    defaults far above every fixture, golden and backtest in the repository
+    and the TRDR-4 synthetic run (`DEFAULT_VENUE_RETENTION`: 50 000
+    acknowledged terminal orders, 50 000 fills, 10 000 bands, 100 000
+    tombstoned ids, a 2^24-bit evicted-id filter — about 190 MB of Tier-0
+    history at the bounds, from measured entry sizes; none of those runs
+    evicts anything, which is pinned; the SIM-2 synthetic runs that set small
+    bounds evict on purpose) and is a `SimulatedVenueOptions.retention`
+    override; `retention()` reports the live sizes, the orders awaiting
+    acknowledgment and, per log, what is retained, the bound and what was
+    EVICTED. What each reader gets:
     - **The trader's port** (`apps/trader`'s `TraderVenue`): `fillsSince(sequence)`
       — a NON-destructive cursor over an absolute fill sequence, which REFUSES
       (`SIMULATED_VENUE_HISTORY_EVICTED`) a sequence older than the retained
-      window rather than answering short — and `orderById` / `orderByPlannedId`,
-      which fall back to the retained history. With `observe`/`observeTrade`/
-      `submit`, that is what a live adapter will have to answer too: the
-      "adds nothing to §12.1" claim this package used to make (`ports.ts`,
-      `venue.ts`) was already false and is withdrawn (`IF-02`).
+      window rather than answering short — `orderById` / `orderByPlannedId`,
+      which fall back to the held and retained orders, and
+      `acknowledgeTerminal`. With `observe`/`observeTrade`/`submit`, that is
+      what a live adapter will have to answer too: the "adds nothing to §12.1"
+      claim this package used to make (`ports.ts`, `venue.ts`) was already
+      false and is withdrawn (`IF-02`).
     - **End-of-run consumers** (`runReplay`, artifact capture, tests):
       `ordersSnapshot()`, `fills` and `bandHistory()` answer the retained
       history — every order, fill and band while nothing was evicted, which is
-      every run in this repository. `runReplay` REFUSES
-      (`SIMULATED_VENUE_HISTORY_EVICTED`) to serialize a run whose venue
-      evicted any of them: a truncated §12.4 artifact would present a short
-      run as complete. A harness that reads the accessors itself should check
-      `retention().historyEvicted`.
+      every fixture, golden and backtest here at the default bounds.
+      `runReplay` REFUSES (`SIMULATED_VENUE_HISTORY_EVICTED`) to serialize a
+      run whose venue evicted any of them: a truncated §12.4 artifact would
+      present a short run as complete. A harness that reads the accessors
+      itself should check `retention().historyEvicted`.
+    - **A CANCEL plan's answer** lists every order it cancelled, from the
+      record written at each transition — never re-read from a history that
+      may have moved on (`SIM2-R1-3`).
     - **`restingBands()` is LIVE**: the bands of orders resting now. It used to
       keep a CANCELLED or EXPIRED order's band for ever, contradicting its own
       docstring; the run's band history is `bandHistory()`.
-    - **The duplicate-`plannedOrderId` guard** (§6 invariant 6) remembers
-      every live, retained and TOMBSTONED id. A tombstone set is bounded and
-      counted rather than unbounded because an unbounded id set is the
-      per-order growth this round removes; the trader's ids are unique by
-      construction, so the guard is defence in depth, and `tombstones.evicted
-      > 0` says when an id could be reused unnoticed. A cancel naming a
-      forgotten id is refused as already terminal (only terminal orders are
-      ever evicted), never as unknown.
+    - **The duplicate-`plannedOrderId` guard** (§6 invariant 6) never lets a
+      reused id execute twice (`SIM2-R1-2`). It knows every live, held and
+      retained id and, EXACTLY, every TOMBSTONED one (the ids of orders the
+      bounded history forgot: bounded, counted); an id whose tombstone is
+      evicted too is folded into a bounded Bloom filter, which never forgets
+      an id but can match one it never saw. A planned id the filter matches is
+      refused `SIMULATED_VENUE_ORDER_ID_NOT_PROVABLY_UNIQUE` — the venue cannot
+      prove it new, so it does not assume it — and counted
+      (`retention().evictedIds.refused`). At the default size the chance that
+      a NEW id is refused this way reaches about 1% after some 1.75 million
+      folded ids (about 1.9 million acknowledged terminal orders), and grows
+      from there: an honest, loud limit rather than a silent one. A cancel
+      naming a forgotten id answers "already terminal" (tombstoned), "not
+      retained … most likely terminal" (the filter matches), and
+      `SIMULATED_VENUE_UNKNOWN_ORDER` only when no memory matches it — which,
+      for an id the venue did book, cannot happen.
     - **Observed trades.** Tier 0 reads nothing about a past trade but its
       instant, so it keeps one per (market, side) — previously every trade,
       about 760 B each, for the life of the process (`VS-03`). Tier 1 keeps

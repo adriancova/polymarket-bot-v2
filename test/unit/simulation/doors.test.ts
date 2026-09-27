@@ -1842,6 +1842,8 @@ const CLASS_MEMBERS: Readonly<Record<string, Readonly<Record<string, string>>>> 
       "NON-RECORD DOOR — a PRIMITIVE id; a non-string answers undefined; answers the stored frozen order this package built (SIM-2)",
     orderByPlannedId:
       "NON-RECORD DOOR — a PRIMITIVE id; a non-string answers undefined; answers the stored frozen order this package built (SIM-2)",
+    acknowledgeTerminal:
+      "NON-RECORD DOOR — a PRIMITIVE id; a non-string, live, unknown or already-acknowledged id answers false and changes nothing; answers a boolean (SIM-2 r1)",
     observe: "RECORD DOOR",
     observeTrade: "RECORD DOOR",
     submit: "RECORD DOOR",

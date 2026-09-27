@@ -45,6 +45,7 @@ import type { DecisionResult, EventEnvelope, Intent } from "@polymarket-bot/doma
 import { Ledger } from "@polymarket-bot/ledger";
 import { parseRiskPolicy } from "@polymarket-bot/risk";
 import {
+  DEFAULT_VENUE_RETENTION,
   SimulatedVenue,
   readFeeScheduleSnapshot,
   tier0Model,
@@ -595,7 +596,7 @@ describe("a deterministic long synthetic run (NOT a soak — §16.7)", () => {
         orderViews: 0,
         tombstones: bounds.tombstones,
         heldUnowned: 0,
-        terminalSeen: 0,
+        watchedOrders: 0,
       });
 
       // Per-event onOrderUpdate deliveries do NOT grow with history: at most
@@ -659,6 +660,10 @@ describe("a deterministic long synthetic run (NOT a soak — §16.7)", () => {
       expect(venueRetention.historyEvicted).toBe(false);
       expect(venueRetention.orders.evicted + venueRetention.fills.evicted + venueRetention.tombstones.evicted).toBe(0);
       expect(venueRetention.orders.retained + venueRetention.live.orders).toBe(placed);
+      // SIM-2 r1: every order the loop settled was acknowledged, so nothing is
+      // left held for it; and nothing reached the duplicate guard's filter.
+      expect(venueRetention.awaitingAcknowledgment).toBe(0);
+      expect(venueRetention.evictedIds).toMatchObject({ folded: 0, bitsSet: 0, refused: 0 });
     },
     60_000,
   );
@@ -695,7 +700,15 @@ function countVenueCalls(venue: SimulatedVenue): { counting: boolean; readonly c
     if (probe.counting) probe.calls.set(name, (probe.calls.get(name) ?? 0) + 1);
   };
   const target = venue as unknown as Record<string, unknown>;
-  for (const name of ["ordersSnapshot", "fillsSince", "orderById", "orderByPlannedId", "restingBands", "bandHistory"]) {
+  for (const name of [
+    "ordersSnapshot",
+    "fillsSince",
+    "orderById",
+    "orderByPlannedId",
+    "restingBands",
+    "bandHistory",
+    "acknowledgeTerminal",
+  ]) {
     const original = target[name];
     if (typeof original !== "function") throw new Error(`SimulatedVenue has no ${name}`);
     target[name] = (...args: unknown[]): unknown => {
@@ -746,11 +759,15 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
       let trades = 0;
       const placed = (): number => {
         const retention = harness.venue.retention();
-        return retention.live.orders + retention.orders.retained + retention.orders.evicted;
+        return (
+          retention.live.orders + retention.awaitingAcknowledgment + retention.orders.retained + retention.orders.evicted
+        );
       };
+      let acknowledged = 0;
       const step = async (event: IngestedEvent): Promise<void> => {
         ordinal += 1;
         const fillsBefore = harness.venue.retention().fills.nextSequence;
+        const settledBefore = harness.loop.health().seams.orders.settled;
         probe.calls.clear();
         probe.counting = true;
         await feed(harness, event, ordinal);
@@ -773,8 +790,13 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
         const retention = harness.venue.retention();
         const sizes = harness.loop.retainedOrderState();
         expect(retention.live.orders).toBe(sizes.owners);
-        // The loop's own terminal records exist only for owned, unsettled orders.
-        expect(sizes.terminalSeen).toBeLessThanOrEqual(sizes.owners);
+        // SIM-2 r1: the loop ACKNOWLEDGED exactly the orders it settled this
+        // event — once each, O(1) apiece — so nothing is left held for it.
+        const settled = harness.loop.health().seams.orders.settled - settledBefore;
+        expect(probe.calls.get("acknowledgeTerminal") ?? 0).toBe(settled);
+        acknowledged += settled;
+        expect(retention.awaitingAcknowledgment).toBe(0);
+        expect(sizes.watchedOrders).toBe(0);
         expect(retention.live.orders).toBeLessThanOrEqual(10);
         expect(retention.live.resting).toBe(retention.live.orders);
         expect(retention.live.bands).toBe(0);
@@ -782,10 +804,15 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
         expect(retention.orders.retained).toBeLessThanOrEqual(venueBounds.orders);
         expect(retention.fills.retained).toBeLessThanOrEqual(venueBounds.fills);
         expect(retention.tombstones.retained).toBeLessThanOrEqual(venueBounds.tombstones);
-        // Everything the venue holds about orders: live + retained + tombstoned.
-        expect(retention.live.orders + retention.orders.retained + retention.tombstones.retained).toBeLessThanOrEqual(
-          10 + venueBounds.orders + venueBounds.tombstones,
-        );
+        // Everything the venue holds about orders: live + held for acknowledgment
+        // (none, above) + retained + tombstoned, and a filter of FIXED size.
+        expect(
+          retention.live.orders +
+            retention.awaitingAcknowledgment +
+            retention.orders.retained +
+            retention.tombstones.retained,
+        ).toBeLessThanOrEqual(10 + venueBounds.orders + venueBounds.tombstones);
+        expect(retention.evictedIds.bits).toBe(DEFAULT_VENUE_RETENTION.evictedIdFilterBits);
         // Tier 0 holds one instant per (market, side), never the trades.
         expect(retention.trades.retained).toBe(0);
         expect(retention.trades.keys).toBeLessThanOrEqual(1);
@@ -831,6 +858,11 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
         maximumRetained: venueBounds.tombstones,
         evicted: retention.orders.evicted - venueBounds.tombstones,
       });
+      // SIM-2 r1: every id past its tombstone is folded into the duplicate
+      // guard's filter — counted — and no placement was refused by it.
+      expect(retention.evictedIds).toMatchObject({ folded: retention.tombstones.evicted, refused: 0 });
+      expect(retention.awaitingAcknowledgment).toBe(0);
+      expect(acknowledged).toBe(total - retention.live.orders);
       expect(retention.fills.retained).toBe(venueBounds.fills);
       expect(retention.fills.evicted).toBe(retention.fills.nextSequence - venueBounds.fills);
       expect(retention.fills.evicted).toBeGreaterThan(0);
@@ -845,7 +877,7 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
       expect(health.execution.fillsObserved).toBe(retention.fills.nextSequence);
       expect(health.execution.duplicateFillsRefused).toBe(0);
       expect(health.seams.orders).toMatchObject({ tracked: retention.live.orders, unownedFills: 0, settleMismatches: 0 });
-      expect(harness.loop.retainedOrderState()).toMatchObject({ heldUnowned: 0, terminalSeen: 0 });
+      expect(harness.loop.retainedOrderState()).toMatchObject({ heldUnowned: 0, watchedOrders: 0 });
 
       // Per-event lookups are bounded by the WORKING orders and the event's own
       // deliveries, not by history: among events that produced no fill (a fill
@@ -923,6 +955,77 @@ describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and 
     await feed(harness, tick(ordinal), ordinal);
     expect(harness.loop.health().execution.fillsObserved).toBe(0);
     expect(harness.loop.health().seams.reservations).toMatchObject({ open: 10, released: 0 });
+  });
+
+  it("SIM2-R1-1, a SUBMISSION batch: ten slices FILLED in ONE submission against a venue that retains ONE acknowledged order — no halt; all ten read, released, settled, and only then acknowledged", async () => {
+    // The verifier's probe: at 7c570ed nine of the ten terminal orders were
+    // evicted inside the submission itself, and the harvest halted GLOBAL
+    // with nine reservations still open.
+    const harness = assemble(
+      {},
+      {
+        venueRetention: { orders: 1, tombstones: 1 },
+        strategy: cyclingStrategyWith({ immediate: (step) => step === 0, targetShares: "50" }),
+      },
+    );
+    let ordinal = 0;
+    for (const event of openingEvents()) {
+      ordinal += 1;
+      await feed(harness, event, ordinal);
+    }
+    const probe = countVenueCalls(harness.venue);
+    probe.counting = true;
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    probe.counting = false;
+    const health = harness.loop.health();
+    expect(health.halts).toEqual([]);
+    expect(health.execution.fillsObserved).toBe(10);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10 });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10 });
+    expect(health.seams.orders).toMatchObject({ tracked: 0, settled: 10, unownedFills: 0 });
+    expect(harness.loop.retainedOrderState()).toMatchObject({ owners: 0, heldUnowned: 0, watchedOrders: 0 });
+    // Acknowledged once each, after settlement; the bound applies only now.
+    expect(probe.calls.get("acknowledgeTerminal")).toBe(10);
+    expect(harness.venue.retention()).toMatchObject({
+      awaitingAcknowledgment: 0,
+      orders: { retained: 1, maximumRetained: 1, evicted: 9 },
+      tombstones: { retained: 1, maximumRetained: 1, evicted: 8 },
+      evictedIds: { folded: 8, refused: 0 },
+    });
+  });
+
+  it("SIM2-R1-1, a CANCELLATION batch: ten resting slices CANCELLED by ONE plan against a venue that retains ONE acknowledged order — no halt; all ten released and settled", async () => {
+    const harness = assemble(
+      {},
+      {
+        venueRetention: { orders: 1, tombstones: 1 },
+        strategy: cyclingStrategyWith({ immediate: () => false, targetShares: "50" }),
+      },
+    );
+    let ordinal = 0;
+    for (const event of openingEvents()) {
+      ordinal += 1;
+      await feed(harness, event, ordinal);
+    }
+    // Step 0: ten passive 5-share BUY slices rest.
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    expect(harness.venue.retention().live.orders).toBe(10);
+    expect(harness.loop.retainedOrderState().owners).toBe(10);
+    // Step 1: ONE cancel plan names all ten; the venue cancels them in one call.
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    const health = harness.loop.health();
+    expect(health.halts).toEqual([]);
+    expect(health.execution.cancelsConfirmed).toBe(1);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10 });
+    expect(health.seams.orders).toMatchObject({ tracked: 0, settled: 10 });
+    expect(harness.venue.retention()).toMatchObject({
+      live: { orders: 0 },
+      awaitingAcknowledgment: 0,
+      orders: { retained: 1, evicted: 9 },
+    });
   });
 
   it("the cursor is NON-destructive: a store failure's early return re-reads the same batch (IF-06: 1, then 11 observed, 1 duplicate)", async () => {

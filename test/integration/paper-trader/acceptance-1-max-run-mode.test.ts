@@ -114,6 +114,7 @@ describe("acceptance 1 — MAX_RUN_MODE=PAPER is enforced", () => {
         fillsSince: () => ({ ok: true, value: { fills: [], next: 0 } }),
         orderById: () => undefined,
         orderByPlannedId: () => undefined,
+        acknowledgeTerminal: () => false,
       },
       store: {
         persistDecision: async () => ({ ok: true, value: null }),

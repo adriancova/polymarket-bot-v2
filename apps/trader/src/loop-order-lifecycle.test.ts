@@ -70,6 +70,7 @@ import {
   type RateLimitBudget,
   type SimulatedFill,
   type SimulatedOrder,
+  type VenueRetentionBounds,
 } from "@polymarket-bot/simulation";
 import type { EvaluationInput, EvaluationOutcome } from "@polymarket-bot/strategy-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -451,7 +452,9 @@ function quietEvent(ordinal: number, receivedAt: string): IngestedEvent {
  *   untouched): how a test states a venue that refuses a plan while still
  *   holding part of it.
  * - `forget(orderId)` (SIM-2): the venue stops answering for an order — a
- *   bounded history that evicted it, or an adapter whose order store lost it.
+ *   venue that evicted it though the loop never acknowledged it, or an
+ *   adapter whose order store lost it.
+ * - `acknowledged` (SIM-2 r1): every id the loop acknowledged, in order.
  */
 class WrappedVenue implements TraderVenue {
   readonly inner: SimulatedVenue;
@@ -459,6 +462,7 @@ class WrappedVenue implements TraderVenue {
   #innerSeen = 0;
   readonly #misreported = new Map<string, string>();
   readonly #forgotten = new Set<string>();
+  readonly acknowledged: string[] = [];
   afterSubmit: ((plan: unknown, result: ExecutionResult) => "LOSE_ANSWER" | undefined) | undefined;
   rewriteAnswer: ((result: ExecutionResult) => ExecutionResult) | undefined;
 
@@ -523,6 +527,11 @@ class WrappedVenue implements TraderVenue {
   forget(orderId: string): void {
     this.#forgotten.add(orderId);
   }
+
+  acknowledgeTerminal(venueOrderId: string): boolean {
+    this.acknowledged.push(venueOrderId);
+    return this.inner.acknowledgeTerminal(venueOrderId);
+  }
 }
 
 interface Evaluation {
@@ -560,6 +569,8 @@ function assemble(
     readonly immediateOrderType?: string;
     /** A stated GTD expiry the venue's policy answers (the trader's own states none). */
     readonly statedExpiryNs?: bigint;
+    /** SIM-2 r1: the venue's history bounds (its defaults when absent). */
+    readonly venueRetention?: VenueRetentionBounds;
     /**
      * SIM1-R1-1: a TIER-1 venue on a DELAYED market (`secondsDelay`, zero
      * latency) over the same books, with its own starting cash. The shipped
@@ -610,6 +621,7 @@ function assemble(
     feeSnapshot: fees.value,
     rateLimits:
       input.rateLimits ?? unmodeledRateLimits("no venue rate-limit budget is modelled in this unit test"),
+    ...(input.venueRetention === undefined ? {} : { retention: input.venueRetention }),
     policy: {
       ...createExecutionPolicy(wiring, () => undefined),
       ...(input.statedExpiryNs === undefined ? {} : { statedExpiryNsFor: () => input.statedExpiryNs }),
@@ -803,7 +815,7 @@ describe("R1 — a terminal order is delivered until ONE evaluated delivery, the
       orderViews: 0,
       tombstones: 3,
       heldUnowned: 0,
-      terminalSeen: 0,
+      watchedOrders: 0,
     });
     const health = loop.health();
     expect(health.seams.orders).toEqual({
@@ -1669,11 +1681,15 @@ describe("SIM-2 — the loop reads the venue by id: what it may hold is TRACKED,
     expect(health.halts.map((halt) => halt.code)).toContain("UNATTRIBUTED_ACTIVITY");
   });
 
-  it("SIM-1's requirement: a TERMINAL order the loop has read stays visible until it settles, even after the venue's history evicted it — no halt", async () => {
-    // The HALTED-instance case: the entry fills on submission, its instance is
-    // halted, so the terminal view is suppressed and the order is neither
-    // retired nor settled. Then the venue's bounded history forgets it.
-    const parts = assemble();
+  it("SIM-1's requirement (SIM2-R1-1): a TERMINAL order stays answerable until the loop has SETTLED it, whatever the venue's bound — a halted instance's two FILLED slices at a bound of ONE", async () => {
+    // The HALTED-instance case: the entry fills on submission in TWO slices —
+    // both terminal inside ONE venue call — and its instance is halted, so
+    // their terminal views are suppressed and neither is retired nor settled
+    // for as long as the halt lasts. The venue retains ONE acknowledged
+    // terminal order; it must still answer for both, because the loop has
+    // acknowledged neither. (At 7c570ed the first slice was evicted inside
+    // the submission itself, and the next harvest halted GLOBAL.)
+    const parts = assemble({ maxSliceShares: "25", venueRetention: { orders: 1, tombstones: 1 } });
     const scope = { kind: "STRATEGY_INSTANCE" as const, instanceId: INSTANCE_ID };
     parts.venue.afterSubmit = () => {
       parts.trader.halts.halt(scope, "RUNTIME_PERSISTENCE_FAILED", "SIM-2 test: halted after submit", T_OPEN);
@@ -1681,19 +1697,29 @@ describe("SIM-2 — the loop reads the venue by id: what it may hold is TRACKED,
       return undefined;
     };
     await drive(parts, 1, 5);
-    const { entry } = ordersByRole(parts);
     const loop = parts.trader.loop;
-    expect(entry.state).toBe("FILLED");
-    expect(deliveriesOf(parts, entry.simulatedOrderId)).toEqual([]);
-    expect(loop.retainedOrderState()).toMatchObject({ owners: 1, terminalSeen: 1 });
-
-    parts.venue.forget(entry.simulatedOrderId);
-    await driveOne(parts, quietEvent(6, "2026-05-01T09:00:03.000Z"), 6);
-    // No GLOBAL halt: the loop answers from the terminal record it read.
+    // No GLOBAL halt: nothing this process owns went missing.
     expect(loop.health().halts.map((halt) => halt.scope.kind)).toEqual(["STRATEGY_INSTANCE"]);
+    const slices = parts.venue.inner.ordersSnapshot().filter((order) => order.action === "BUY");
+    expect(slices.map((order) => `${order.state} ${order.filledShares}/${order.requestedShares}`)).toEqual([
+      "FILLED 25/25",
+      "FILLED 25/25",
+    ]);
+    const ids = slices.map((order) => order.simulatedOrderId);
+    await driveOne(parts, quietEvent(6, "2026-05-01T09:00:03.000Z"), 6);
+    expect(loop.health().halts.map((halt) => halt.scope.kind)).toEqual(["STRATEGY_INSTANCE"]);
+    expect(loop.retainedOrderState()).toMatchObject({ owners: 2, retiredUnsettled: 0 });
+    for (const id of ids) expect(deliveriesOf(parts, id)).toEqual([]);
+    // Held by the venue, outside its bound, and never acknowledged.
+    expect(parts.venue.acknowledged).toEqual([]);
+    expect(parts.venue.inner.retention()).toMatchObject({
+      awaitingAcknowledgment: 2,
+      orders: { retained: 0, maximumRetained: 1, evicted: 0 },
+    });
+    for (const id of ids) expect(parts.venue.orderById(id)?.state).toBe("FILLED");
 
-    // Release the instance: the terminal view is delivered from that record,
-    // evaluated, retired and settled — and the record is dropped.
+    // Release the instance: each terminal view is delivered, evaluated,
+    // retired and settled — and only THEN acknowledged, in venue order.
     expect(
       parts.trader.halts.release(scope, {
         authoritativeSnapshotApplied: true,
@@ -1701,13 +1727,67 @@ describe("SIM-2 — the loop reads the venue by id: what it may hold is TRACKED,
       }),
     ).toBe(true);
     await driveOne(parts, quietEvent(7, "2026-05-01T09:00:04.000Z"), 7);
-    expect(deliveriesOf(parts, entry.simulatedOrderId).map((d) => [d.orderStatus, d.outcome, d.event])).toEqual([
-      ["FILLED", "DECIDED", 7],
-    ]);
+    for (const id of ids) {
+      expect(deliveriesOf(parts, id).map((d) => [d.orderStatus, d.outcome, d.event])).toEqual([["FILLED", "DECIDED", 7]]);
+      expectRetiredAfterFirstEvaluatedTerminalDelivery(parts, id);
+    }
     expect(loop.health().halts).toEqual([]);
-    expect(loop.health().seams.orders.settled).toBeGreaterThanOrEqual(1);
-    expect(loop.retainedOrderState()).toMatchObject({ terminalSeen: 0 });
-    expectRetiredAfterFirstEvaluatedTerminalDelivery(parts, entry.simulatedOrderId);
+    expect(loop.health().seams.orders.settled).toBe(2);
+    expect(parts.venue.acknowledged).toEqual(ids);
+    // Now — and not before — the venue's bound applies: one kept, one evicted,
+    // the evicted one tombstoned.
+    expect(parts.venue.inner.retention()).toMatchObject({
+      awaitingAcknowledgment: 0,
+      orders: { retained: 1, maximumRetained: 1, evicted: 1 },
+      tombstones: { retained: 1, evicted: 0 },
+    });
+  });
+
+  it("SIM2-R1-4: a LOST answer's order, once the venue has SHOWN it, is held by its venue id — its later disappearance HALTS, and the hold is kept", async () => {
+    // Event 5: the entry's answer arrives; its fill's onFill places the
+    // RESTING take-profit, and THAT answer is lost after the venue booked it.
+    const parts = assemble();
+    await drive(parts, 1, 4);
+    const lost: string[] = [];
+    parts.venue.afterSubmit = (plan) => {
+      const offered = plan as { planKind?: string; groups?: readonly { orders: readonly { plannedOrderId: string; action: string }[] }[] };
+      const sells = (offered.groups ?? []).flatMap((group) => group.orders).filter((order) => order.action === "SELL");
+      if (offered.planKind === "CANCEL" || sells.length === 0) return undefined;
+      for (const order of sells) lost.push(order.plannedOrderId);
+      parts.venue.afterSubmit = undefined;
+      return "LOSE_ANSWER";
+    };
+    parts.event = 5;
+    const recorded = RECORDED[4];
+    if (recorded === undefined) throw new Error("no event 5");
+    expect(parts.trader.loop.ingest(ingested(recorded, 5))).toBe(true);
+    await expect(parts.trader.loop.drain()).rejects.toThrow(/answer was lost/u);
+    const loop = parts.trader.loop;
+    const { takeProfit } = ordersByRole(parts);
+    if (takeProfit === undefined) throw new Error("no take-profit was booked");
+    expect(lost).toEqual([takeProfit.plannedOrderId]);
+    expect(takeProfit.state).toBe("RESTING");
+    expect(loop.retainedOrderState().heldUnowned).toBe(1);
+
+    // Event 6: the harvest finds it RESTING by its planned id — so it EXISTS.
+    await driveOne(parts, quietEvent(6, "2026-05-01T09:00:03.000Z"), 6);
+    expect(loop.health().halts.filter((halt) => halt.scope.kind === "GLOBAL")).toEqual([]);
+    expect(loop.retainedOrderState().heldUnowned).toBe(1);
+    expect(loop.timeInForceFor(takeProfit.plannedOrderId)).toBeDefined();
+
+    // Event 7: the venue stops answering for it. Not "possibly never booked"
+    // any more: a LOUD miss, and nothing is released.
+    parts.venue.forget(takeProfit.simulatedOrderId);
+    const reserved = loop.health().seams.reservations;
+    await driveOne(parts, quietEvent(7, "2026-05-01T09:00:04.000Z"), 7);
+    const halt = loop.health().halts.find((record) => record.scope.kind === "GLOBAL");
+    expect(halt?.code).toBe("VENUE_OBSERVATION_FAILED");
+    expect(halt?.detail).toContain(
+      `order ${takeProfit.simulatedOrderId} (planned ${takeProfit.plannedOrderId}), which it holds without an owner`,
+    );
+    expect(loop.retainedOrderState().heldUnowned).toBe(1);
+    expect(loop.timeInForceFor(takeProfit.plannedOrderId)).toBeDefined();
+    expect(loop.health().seams.reservations).toMatchObject({ open: reserved.open, released: reserved.released });
   });
 
   it("an order the loop OWNS that the venue no longer answers for HALTS the process, and nothing is released for it", async () => {
@@ -1728,7 +1808,7 @@ describe("SIM-2 — the loop reads the venue by id: what it may hold is TRACKED,
     expect(halt?.code).toBe("VENUE_OBSERVATION_FAILED");
     expect(halt?.action).toBe("RECONCILE_ACCOUNT");
     expect(halt?.detail).toContain(`order ${takeProfit.simulatedOrderId}, which instance ${INSTANCE_ID} owns`);
-    expect(halt?.detail).toContain("evicted from its bounded history, or never held");
+    expect(halt?.detail).toContain("which this process has not acknowledged: evicted from its bounded history regardless, or never held");
     // Still owned, still reserved: a miss never releases anything.
     expect(loop.retainedOrderState().owners).toBe(1);
     expect(health.seams.reservations).toMatchObject({ open: before.open, released: before.released });

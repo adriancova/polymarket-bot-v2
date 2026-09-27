@@ -4,12 +4,14 @@
  * - (1) A NON-destructive fill cursor over an ABSOLUTE sequence
  *   (`fillsSince`); a cursor older than the retained window is REFUSED
  *   (`SIMULATED_VENUE_HISTORY_EVICTED`), never answered short.
- * - (2) LIVE orders in a live index; terminal orders in a bounded, counted
- *   retention log that every lookup falls back to; `runReplay` refuses a run
- *   whose history was evicted.
+ * - (2) LIVE orders in a live index; a terminal order HELD, never evicted,
+ *   until its consumer acknowledges it (SIM-2 r1, `SIM2-R1-1`), then in a
+ *   bounded, counted retention log that every lookup falls back to;
+ *   `runReplay` refuses a run whose history was evicted; a CANCEL plan lists
+ *   every order it cancelled (`SIM2-R1-3`).
  * - (3) The duplicate-`plannedOrderId` guard after an order left the live
- *   index — through the retained log, then through bounded, counted
- *   tombstones.
+ *   index — through the retained log, then bounded, counted tombstones, then
+ *   a bounded filter that never forgets an id (`SIM2-R1-2`).
  * - (5) Tier 0 keeps ONE last instant per (market, side), not every trade;
  *   Tier 1 keeps its list (queued `SIM2-TIER1-TRADES`), with the evidence pin
  *   for why it is not trimmed to the earliest live `restingFromNs`.
@@ -254,12 +256,17 @@ function cancelPlan(scope: CancelPlanView["scope"], executionPlanId = "plan-canc
   };
 }
 
-/** Books `count` one-share marketable BUYs, each FILLED on arrival (one fill each). */
+/**
+ * Books `count` one-share marketable BUYs, each FILLED on arrival (one fill
+ * each), and — as a consumer that is done with them does — ACKNOWLEDGES each,
+ * so the venue's bounded order history may take it (SIM-2 r1).
+ */
 async function fillMany(venue: SimulatedVenue, prefix: string, count: number): Promise<void> {
   for (let index = 0; index < count; index += 1) {
     const id = `${prefix}${String(index).padStart(4, "0")}`;
     const result = await venue.submit(plan([order(id)], `plan-${id}`));
     if (!result.accepted) throw new Error(`${id} refused: ${String(result.refusalCode)}`);
+    if (!venue.acknowledgeTerminal(id)) throw new Error(`${id} was not held for acknowledgment`);
   }
 }
 
@@ -353,9 +360,10 @@ describe("SIM-2 (2): live orders in the live index, terminal orders in a bounded
   it("a terminal order leaves the live index and is still found by lookup and listed by the history", async () => {
     const { venue } = tier0();
     await venue.submit(plan([order("filled"), resting("rest")]));
-    // FILLED on arrival goes straight to the history; the resting order is live.
+    // FILLED on arrival leaves the live index, HELD until acknowledged; the resting order is live.
     expect(venue.retention().live).toEqual({ orders: 1, resting: 1, bands: 0, pendingDelayed: 0 });
-    expect(venue.retention().orders).toEqual({ retained: 1, maximumRetained: DEFAULT_VENUE_RETENTION.orders, evicted: 0 });
+    expect(venue.retention().awaitingAcknowledgment).toBe(1);
+    expect(venue.retention().orders).toEqual({ retained: 0, maximumRetained: DEFAULT_VENUE_RETENTION.orders, evicted: 0 });
     expect(venue.orderById("filled")?.state).toBe("FILLED");
     expect(venue.orderByPlannedId("filled")?.state).toBe("FILLED");
     expect(venue.orderById("rest")?.state).toBe("RESTING");
@@ -364,6 +372,11 @@ describe("SIM-2 (2): live orders in the live index, terminal orders in a bounded
     expect(cancelled.cancelled).toEqual(["rest"]);
     // The cancelled order LEFT the live index…
     expect(venue.retention().live).toEqual({ orders: 0, resting: 0, bands: 0, pendingDelayed: 0 });
+    expect(venue.retention().awaitingAcknowledgment).toBe(2);
+    // …and acknowledging moves each into the bounded, retained history.
+    expect(venue.acknowledgeTerminal("filled")).toBe(true);
+    expect(venue.acknowledgeTerminal("rest")).toBe(true);
+    expect(venue.retention().awaitingAcknowledgment).toBe(0);
     expect(venue.retention().orders.retained).toBe(2);
     // …and every read that needs it still finds it.
     expect(venue.orderById("rest")?.state).toBe("CANCELLED");
@@ -432,13 +445,21 @@ describe("SIM-2 (2): live orders in the live index, terminal orders in a bounded
       ["fills", -1],
       ["bands", 1.5],
       ["tombstones", Number.NaN],
+      ["evictedIdFilterBits", 0],
+      ["evictedIdFilterBits", 2 ** 31 + 1],
     ] as const) {
       expect(() => tier0({ retention: { [name]: bound } })).toThrow(new RegExp(`retention\\.${name}`, "u"));
     }
   });
 
   it("DEFAULTS are far above every fixture and golden in the repository (none of them evicts)", () => {
-    expect(DEFAULT_VENUE_RETENTION).toEqual({ orders: 50_000, fills: 50_000, bands: 10_000, tombstones: 100_000 });
+    expect(DEFAULT_VENUE_RETENTION).toEqual({
+      orders: 50_000,
+      fills: 50_000,
+      bands: 10_000,
+      tombstones: 100_000,
+      evictedIdFilterBits: 16_777_216,
+    });
     const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
     const paper = JSON.parse(readFileSync(join(root, "test/replay-golden/paper-e2e/paper-e2e-run.json"), "utf8")) as {
       orders: unknown[];
@@ -519,15 +540,20 @@ describe("SIM-2 (2): runReplay REFUSES to serialize a run whose venue evicted hi
         seen += 1;
         // Tier 0: one FILLED order (one fill) per event. Tier 1: one resting
         // band order per event, cancelled at once (its band enters history).
+        // Each order is ACKNOWLEDGED once terminal, as the trader loop does
+        // once it has settled one (SIM-2 r1), so the bounded history applies.
         if (tier === "TIER_0") {
-          const booked = await venue.submit(plan([order(`o${String(seen)}`)], `p${String(seen)}`));
+          const id = `o${String(seen)}`;
+          const booked = await venue.submit(plan([order(id)], `p${String(seen)}`));
           if (!booked.accepted) throw new Error(String(booked.refusalCode));
+          venue.acknowledgeTerminal(id);
           return simulationOk(null);
         }
         const id = `r${String(seen)}`;
         const booked = await venue.submit(plan([resting(id)], `p${String(seen)}`));
         if (!booked.accepted) throw new Error(String(booked.refusalCode));
         await venue.cancel({ executionPlanId: `c${String(seen)}`, reason: "r", scope: { orderIds: [id] }, priority: "SAFETY_CANCEL" });
+        venue.acknowledgeTerminal(id);
         return simulationOk(null);
       },
     });
@@ -569,35 +595,212 @@ describe("SIM-2 (2): runReplay REFUSES to serialize a run whose venue evicted hi
 // (3) the duplicate-plannedOrderId guard (§6 invariant 6)
 // ---------------------------------------------------------------------------
 
-describe("SIM-2 (3): a reused plannedOrderId is refused after its order left the live index", () => {
-  it("refused through the retained history, then through a tombstone, and accepted — COUNTED — only once both forgot it", async () => {
+describe("SIM-2 (3): a reused plannedOrderId is refused after its order left the live index — for ever (SIM2-R1-2)", () => {
+  it("refused through the retained history, then a tombstone, then the evicted-id FILTER once both forgot it — never executed twice", async () => {
+    // The verifier's probe: bounds orders = 1, tombstones = 1; submit dup,
+    // x, y — each acknowledged — then dup again. At 7c570ed the last one was
+    // ACCEPTED and executed again under the same fill identity.
     const { venue } = tier0({ retention: { orders: 1, tombstones: 1 } });
     await venue.submit(plan([order("dup")], "plan-dup-1"));
+    expect(venue.acknowledgeTerminal("dup")).toBe(true);
     expect(venue.retention().live.orders).toBe(0);
     const viaHistory = await venue.submit(plan([order("dup")], "plan-dup-2"));
     expect(viaHistory).toMatchObject({ accepted: false, outcome: "REFUSED", refusalCode: "SIMULATED_VENUE_DUPLICATE_ORDER" });
 
     // One more terminal order: "dup" leaves the retained history for a tombstone.
-    await venue.submit(plan([order("next-1")], "plan-next-1"));
+    await fillMany(venue, "x", 1);
     expect(venue.orderById("dup")).toBeUndefined();
     expect(venue.retention().tombstones).toEqual({ retained: 1, maximumRetained: 1, evicted: 0 });
     const viaTombstone = await venue.submit(plan([order("dup")], "plan-dup-3"));
     expect(viaTombstone).toMatchObject({ accepted: false, refusalCode: "SIMULATED_VENUE_DUPLICATE_ORDER" });
 
-    // Another: "dup"'s tombstone is evicted, and the eviction is COUNTED.
-    await venue.submit(plan([order("next-2")], "plan-next-2"));
+    // Another: "dup"'s tombstone is evicted — COUNTED — and the id folded into the filter.
+    await fillMany(venue, "y", 1);
     expect(venue.retention().tombstones).toEqual({ retained: 1, maximumRetained: 1, evicted: 1 });
-    const forgotten = await venue.submit(plan([order("dup")], "plan-dup-4"));
-    expect(forgotten.accepted).toBe(true);
+    const fillsBefore = venue.retention().fills.nextSequence;
+    const again = await venue.submit(plan([order("dup")], "plan-dup-4"));
+    expect(again).toMatchObject({
+      accepted: false,
+      outcome: "REFUSED",
+      refusalCode: "SIMULATED_VENUE_ORDER_ID_NOT_PROVABLY_UNIQUE",
+      orders: [],
+      fills: [],
+    });
+    expect(again.notPlaced.map((entry) => `${entry.plannedOrderId} ${entry.refusalCode}`)).toEqual([
+      "dup SIMULATED_VENUE_ORDER_ID_NOT_PROVABLY_UNIQUE",
+    ]);
+    // Nothing executed: no fill, no order, no cash moved — and the refusal is counted.
+    expect(venue.retention().fills.nextSequence).toBe(fillsBefore);
+    expect(venue.orderById("dup")).toBeUndefined();
+    expect(venue.retention().evictedIds).toMatchObject({ folded: 1, refused: 1, hashes: 7 });
   });
 
-  it("with the default bounds a reused id is refused however many orders ended since", async () => {
-    const { venue } = tier0();
-    await venue.submit(plan([order("dup")], "plan-dup-1"));
-    await fillMany(venue, "t", 200);
-    const reused = await venue.submit(plan([order("dup")], "plan-dup-2"));
-    expect(reused).toMatchObject({ accepted: false, refusalCode: "SIMULATED_VENUE_DUPLICATE_ORDER" });
-    expect(venue.retention().orders.evicted).toBe(0);
+  it("a reused id is refused however many orders ended since: 300 acknowledged orders past it, bounds 2 / 2", async () => {
+    const { venue } = tier0({ retention: { orders: 2, tombstones: 2 } });
+    await fillMany(venue, "dup", 1);
+    await fillMany(venue, "t", 300);
+    const retention = venue.retention();
+    // Really forgotten by the exact memory — order and tombstone evicted, counted.
+    expect(retention.orders).toEqual({ retained: 2, maximumRetained: 2, evicted: 299 });
+    expect(retention.tombstones).toEqual({ retained: 2, maximumRetained: 2, evicted: 297 });
+    expect(venue.orderById("dup0000")).toBeUndefined();
+    const reused = await venue.submit(plan([order("dup0000")], "plan-dup-again"));
+    expect(reused).toMatchObject({ accepted: false, refusalCode: "SIMULATED_VENUE_ORDER_ID_NOT_PROVABLY_UNIQUE" });
+    expect(retention.evictedIds.folded).toBe(297);
+    // Every one of the 300 is refused just the same: through the filter
+    // (t0000-t0295), a tombstone (t0296, t0297) or the retained history
+    // (t0298, t0299).
+    for (const index of [0, 1, 150, 295]) {
+      const id = `t${String(index).padStart(4, "0")}`;
+      const again = await venue.submit(plan([order(id)], `plan-again-${id}`));
+      expect(again.refusalCode, id).toBe("SIMULATED_VENUE_ORDER_ID_NOT_PROVABLY_UNIQUE");
+    }
+    for (const index of [296, 297, 298, 299]) {
+      const id = `t${String(index).padStart(4, "0")}`;
+      const again = await venue.submit(plan([order(id)], `plan-again-${id}`));
+      expect(again.refusalCode, id).toBe("SIMULATED_VENUE_DUPLICATE_ORDER");
+    }
+    // …while a fresh id is still placed: at 297 ids in 2^24 bits the filter's
+    // false-positive rate is negligible.
+    const fresh = await venue.submit(plan([order("fresh-id")], "plan-fresh"));
+    expect(fresh.accepted).toBe(true);
+  });
+
+  it("an id the filter cannot PROVE new is refused, counted — even one never used (a false positive), never assumed unique", async () => {
+    // A deliberately tiny filter (8 bits, 7 positions per id) fills within a
+    // few folded ids; place fresh ids until one is refused.
+    const { venue } = tier0({ retention: { orders: 1, tombstones: 1, evictedIdFilterBits: 8 } });
+    let refused: Awaited<ReturnType<SimulatedVenue["submit"]>> | undefined;
+    let placed = 0;
+    while (refused === undefined) {
+      expect(placed, "an 8-bit filter never refused anything").toBeLessThan(50);
+      const id = `fresh-${String(placed)}`;
+      const result = await venue.submit(plan([order(id)], `plan-${id}`));
+      if (result.accepted) {
+        venue.acknowledgeTerminal(id);
+        placed += 1;
+      } else {
+        refused = result;
+      }
+    }
+    // The refused id was NEVER used — a false positive — and it was refused,
+    // loudly and counted, with nothing booked; never assumed unique.
+    expect(refused).toMatchObject({
+      accepted: false,
+      outcome: "REFUSED",
+      refusalCode: "SIMULATED_VENUE_ORDER_ID_NOT_PROVABLY_UNIQUE",
+      orders: [],
+      fills: [],
+    });
+    expect(refused.notPlaced.map((entry) => entry.plannedOrderId)).toEqual([`fresh-${String(placed)}`]);
+    expect(refused.refusalMessage).toContain("A never-used id can match too");
+    expect(venue.retention().evictedIds).toMatchObject({ bits: 8, refused: 1 });
+    expect(venue.retention().evictedIds.folded).toBeGreaterThan(0);
+    expect(venue.retention().evictedIds.folded).toBe(placed - 2);
+    // With NOTHING folded in, the filter never refuses anything (every golden).
+    const { venue: clean } = tier0({ retention: { evictedIdFilterBits: 8 } });
+    await fillMany(clean, "c", 20);
+    expect(clean.retention().evictedIds).toMatchObject({ bitsSet: 0, folded: 0, refused: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SIM2-R1-1 / R1-3 / R1-5: a terminal order is HELD until acknowledged
+// ---------------------------------------------------------------------------
+
+describe("SIM2-R1-1: a terminal order is HELD — answered, never evicted — until its consumer acknowledges it, whatever the bound", () => {
+  it("a SUBMISSION batch: ten orders FILLED by one plan, bound 1 — all ten answer; acknowledging applies the bound, counted", async () => {
+    const { venue } = tier0({ retention: { orders: 1, tombstones: 1 } });
+    const ids = Array.from({ length: 10 }, (_, index) => `s${String(index).padStart(2, "0")}`);
+    const result = await venue.submit(plan(ids.map((id) => order(id))));
+    expect(result.accepted).toBe(true);
+    expect(result.orders.map((entry) => entry.state)).toEqual(Array.from({ length: 10 }, () => "FILLED"));
+    // At 7c570ed nine of these were already evicted here.
+    for (const id of ids) expect(venue.orderById(id)?.state, id).toBe("FILLED");
+    expect(venue.ordersSnapshot()).toHaveLength(10);
+    expect(venue.retention()).toMatchObject({
+      awaitingAcknowledgment: 10,
+      orders: { retained: 0, maximumRetained: 1, evicted: 0 },
+      historyEvicted: false,
+    });
+    for (const id of ids) expect(venue.acknowledgeTerminal(id)).toBe(true);
+    expect(venue.retention()).toMatchObject({
+      awaitingAcknowledgment: 0,
+      orders: { retained: 1, evicted: 9 },
+      tombstones: { retained: 1, evicted: 8 },
+      evictedIds: { folded: 8 },
+      historyEvicted: true,
+    });
+    // Acknowledging again, a live order, an unknown id or a non-string: false, and nothing moves.
+    await venue.submit(plan([resting("live")], "plan-live"));
+    expect(venue.acknowledgeTerminal("s09")).toBe(false);
+    expect(venue.acknowledgeTerminal("live")).toBe(false);
+    expect(venue.acknowledgeTerminal("never")).toBe(false);
+    expect(venue.acknowledgeTerminal(7 as unknown as string)).toBe(false);
+    expect(venue.orderById("live")?.state).toBe("RESTING");
+    expect(venue.retention()).toMatchObject({ awaitingAcknowledgment: 0, live: { orders: 1 }, orders: { evicted: 9 } });
+  });
+
+  it("a CANCELLATION batch (SIM2-R1-3): a market-scoped CANCEL plan over three resting orders, bound 1, lists ALL THREE cancelled records", async () => {
+    const { venue } = tier0({ retention: { orders: 1, tombstones: 1 } });
+    await venue.submit(plan([resting("a"), resting("b"), resting("c")]));
+    const cancelled = await venue.submit(cancelPlan({ marketId: MARKET_A }));
+    expect(cancelled).toMatchObject({ accepted: true, outcome: "ACCEPTED", notCancelled: [] });
+    // At 7c570ed this answer listed only "c": "a" and "b" had been evicted by
+    // the time the answer re-read them.
+    expect(cancelled.orders.map((entry) => `${entry.simulatedOrderId} ${entry.state}`)).toEqual([
+      "a CANCELLED",
+      "b CANCELLED",
+      "c CANCELLED",
+    ]);
+    for (const id of ["a", "b", "c"]) expect(venue.orderById(id)?.state).toBe("CANCELLED");
+    expect(venue.retention()).toMatchObject({ awaitingAcknowledgment: 3, orders: { evicted: 0 } });
+    // The ExecutionVenue cancel door, the same way.
+    const { venue: direct } = tier0({ retention: { orders: 1, tombstones: 1 } });
+    await direct.submit(plan([resting("a"), resting("b"), resting("c")]));
+    const answer = await direct.cancel({ executionPlanId: "c", reason: "r", scope: { marketId: MARKET_A }, priority: "SAFETY_CANCEL" });
+    expect(answer).toMatchObject({ cancelled: ["a", "b", "c"], notCancelled: [] });
+    for (const id of ["a", "b", "c"]) expect(direct.orderById(id)?.state).toBe("CANCELLED");
+  });
+
+  it("an EXPIRY batch: three GTD orders expire in one sweep, bound 1 — all three answer until acknowledged", async () => {
+    const { venue, clock } = tier1(0, {
+      retention: { orders: 1, tombstones: 1 },
+      policy: policy({
+        timeInForceFor: () => "GTD",
+        statedExpiryNsFor: () => START_NS + 120n * SECOND_NS,
+      }),
+    });
+    await venue.submit(plan([resting("g1"), resting("g2"), resting("g3")]));
+    expect(venue.retention().live.orders).toBe(3);
+    advance(clock, 61);
+    expect(venue.observe(event(3)).ok).toBe(true);
+    for (const id of ["g1", "g2", "g3"]) expect(venue.orderById(id)?.state).toBe("EXPIRED");
+    expect(venue.retention()).toMatchObject({
+      live: { orders: 0 },
+      awaitingAcknowledgment: 3,
+      orders: { retained: 0, evicted: 0 },
+    });
+  });
+
+  it("SIM2-R1-5: a cancel naming a FORGOTTEN id answers what the venue can know — already terminal (tombstone), probably terminal (filter) — and UNKNOWN only when no memory matches", async () => {
+    const { venue } = tier0({ retention: { orders: 1, tombstones: 1 } });
+    await fillMany(venue, "t", 4);
+    // t0000, t0001: record AND tombstone evicted (in the filter); t0002: tombstoned; t0003: retained.
+    expect(venue.retention()).toMatchObject({ orders: { evicted: 3 }, tombstones: { evicted: 2 } });
+    const answer = await venue.cancel({
+      executionPlanId: "c",
+      reason: "r",
+      scope: { orderIds: ["t0000", "t0002", "t0003", "never"] },
+      priority: "SAFETY_CANCEL",
+    });
+    expect(answer.cancelled).toEqual([]);
+    const reasons = new Map(answer.notCancelled.map((entry) => [entry.simulatedOrderId, entry.reason]));
+    expect(reasons.get("t0000")).toContain("matches the venue's filter of FORGOTTEN terminal-order ids");
+    expect(reasons.get("t0002")).toContain("already terminal: its record was evicted");
+    expect(reasons.get("t0003")).toBe("already FILLED");
+    expect(reasons.get("never")).toBe("SIMULATED_VENUE_UNKNOWN_ORDER");
+    expect(venue.retention().evictedIds.folded).toBe(2);
   });
 });
 
@@ -703,9 +906,8 @@ describe("SIM-2 (6): restingBands() is live; bandHistory() is the run's history"
 // ---------------------------------------------------------------------------
 
 describe("SIM-2 (7): the DELAYED sweep and the expiry sweep read LIVE state only", () => {
-  it("a DELAYED order resolves at matchableAtNs with the history full and evicting; pending and resting drain to zero", async () => {
+  it("a DELAYED batch resolves at matchableAtNs over LIVE state; every resolved order is HELD until acknowledged (SIM2-R1-1), then the bound applies", async () => {
     const { venue, clock } = tier1(5, { retention: { orders: 2, tombstones: 4 } });
-    // Fill the retained history past its bound first (terminal orders only).
     const booked = await venue.submit(plan([order("fak-1", { shares: "1" })], "plan-f1"));
     expect(booked.orders[0]?.state).toBe("DELAYED");
     expect(venue.retention().live).toMatchObject({ orders: 1, pendingDelayed: 1 });
@@ -715,9 +917,16 @@ describe("SIM-2 (7): the DELAYED sweep and the expiry sweep read LIVE state only
     advance(clock, 5);
     const positioned = venue.observe(event(2));
     expect(positioned.ok).toBe(true);
-    const retention = venue.retention();
+    let retention = venue.retention();
     expect(retention.live).toEqual({ orders: 0, resting: 0, bands: 0, pendingDelayed: 0 });
-    // Four terminal orders against a bound of two: two retained, two tombstoned.
+    // Four terminal orders in ONE sweep against a bound of two: all four HELD —
+    // none evicted, every one answered — until the consumer acknowledges them.
+    for (const id of ["fak-1", "fak-2", "fak-3", "fak-4"]) expect(venue.orderById(id)?.state, id).toBe("FILLED");
+    expect(retention.orders).toEqual({ retained: 0, maximumRetained: 2, evicted: 0 });
+    expect(retention.awaitingAcknowledgment).toBe(4);
+    for (const id of ["fak-1", "fak-2", "fak-3", "fak-4"]) expect(venue.acknowledgeTerminal(id)).toBe(true);
+    retention = venue.retention();
+    expect(retention.awaitingAcknowledgment).toBe(0);
     expect(retention.orders).toEqual({ retained: 2, maximumRetained: 2, evicted: 2 });
     expect(retention.tombstones.retained).toBe(2);
     expect(venue.orderById("fak-4")?.state).toBe("FILLED");

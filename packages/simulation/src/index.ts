@@ -290,7 +290,7 @@ export type {
   VenueRetention,
   VenueRetentionBounds,
 } from "./venue.js";
-export type { RetentionCounters } from "./retention.js";
+export type { EvictedIdFilterCounters, RetentionCounters } from "./retention.js";
 
 // --- the run driver and its canonical serialization (§12.4) -----------------
 export { runReplay } from "./replay.js";

@@ -21,8 +21,10 @@
  * SIM-2, `IF-02`): `SimulatedVenue` also takes the recorded stream it is TOLD
  * about (`observe`, `observeTrade`), and the trader's `TraderVenue` port reads
  * venue state between events through a fill cursor and order lookups
- * (`fillsSince`, `orderById`, `orderByPlannedId`) — members a live adapter
- * will have to answer from its own user channel and order store. The rest of
+ * (`fillsSince`, `orderById`, `orderByPlannedId`), and tells it when it is
+ * done with a terminal order (`acknowledgeTerminal`, SIM-2 r1) — members a
+ * live adapter will have to answer from its own user channel and order store
+ * (the last may be a no-op for a venue that forgets nothing). The rest of
  * the class (`submitAll`, the history accessors, `retention`) is
  * simulator-only. **No method here can carry a credential, a signer, a venue
  * URL, or a network handle**, and none of the implementations in this package

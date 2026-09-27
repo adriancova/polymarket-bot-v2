@@ -86,6 +86,15 @@ export const SIMULATION_REFUSAL_CODES = [
   /** A submission was attempted for an order the venue already knows. */
   "SIMULATED_VENUE_DUPLICATE_ORDER",
   /**
+   * SIM-2 r1 (`SIM2-R1-2`): a planned order id the venue cannot PROVE it
+   * never booked. Its exact memory of old order ids is bounded, and past it
+   * the ids live on in a bounded filter that never forgets one — so a reused
+   * id is always caught — but can also match an id never used. Either way
+   * the id's uniqueness cannot be established, and it is refused rather than
+   * risk executing an order twice (§6 invariant 6). Nothing is booked.
+   */
+  "SIMULATED_VENUE_ORDER_ID_NOT_PROVABLY_UNIQUE",
+  /**
    * A planned order was never sent, because another part of its plan failed
    * first — the plan's pre-flight, or an earlier batch (SIM-1, ruling R3).
    * Nothing was booked for it.

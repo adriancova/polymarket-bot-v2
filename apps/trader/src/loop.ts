@@ -189,7 +189,14 @@ import type { Ledger } from "@polymarket-bot/ledger";
  *   without owning them (`#heldUnowned`) — sorted with the order the venue's
  *   snapshot used (`compareVenueOrderIds`), and looks each one up. An order
  *   this process owns or holds that the venue no longer answers for is a
- *   LOUD miss (`#haltOnVenueMiss`).
+ *   LOUD miss (`#haltOnVenueMiss`);
+ * - `acknowledgeTerminal(venueOrderId)` (SIM-2 r1, `SIM2-R1-1`): the loop is
+ *   DONE with a terminal order — settled it, released it, and no basket watch
+ *   still reads it. Until then the venue must keep answering for it, however
+ *   many other orders end meanwhile: the loop keeps no copy of a terminal
+ *   order of its own, and a venue that bounds its history may evict an order
+ *   only after this call. SIM-1's carried requirement ("a terminal order stays
+ *   visible to the loop until the loop has seen it") is this contract.
  *
  * The end-of-run HISTORY accessors (`ordersSnapshot()`, `fills`) stay on
  * `SimulatedVenue` for the harnesses that report a run; they are not on this
@@ -231,6 +238,11 @@ export interface TraderVenue {
   orderById(venueOrderId: string): SimulatedOrder | undefined;
   /** SIM-2: one order by the PLANNER's id, or `undefined` when the venue holds none. */
   orderByPlannedId(plannedOrderId: string): SimulatedOrder | undefined;
+  /**
+   * SIM-2 r1: the loop is done with this TERMINAL order; the venue may now
+   * forget it (see this port's header). The answer, if any, is not read.
+   */
+  acknowledgeTerminal(venueOrderId: string): unknown;
 }
 
 /**
@@ -373,8 +385,13 @@ export interface RetainedOrderState {
    * released. Keyed by the PLANNED order id.
    */
   readonly heldUnowned: number;
-  /** SIM-2: owned orders whose TERMINAL record the loop keeps until they settle. */
-  readonly terminalSeen: number;
+  /**
+   * SIM-2 r1: venue orders a WATCHED basket still reads. The loop does not
+   * acknowledge such an order to the venue — even once it is settled — until
+   * its watch concludes, so the watch always finds every leg. Bounded by the
+   * working baskets' orders.
+   */
+  readonly watchedOrders: number;
 }
 
 /**
@@ -512,22 +529,22 @@ export class CoreLoop {
    *   booked any of its planned orders, and no answer said which (venue id
    *   unknown; looked up by planned id).
    *
-   * An entry leaves when its order is seen terminal. It is bounded by those
+   * An entry whose venue id is unknown is PROMOTED to the id the first lookup
+   * that finds it answers (SIM-2 r1, `SIM2-R1-4`), so from then on a miss is
+   * LOUD like any held order's. An entry leaves when its order is seen
+   * terminal (and the venue is told it may forget it). It is bounded by those
    * orders; a planned order the venue never booked stays, which is what the
    * old scan did too (it found nothing to release, for ever).
    */
   readonly #heldUnowned = new Map<string, string | undefined>();
   /**
-   * SIM-2 — SIM-1's carried requirement, "a terminal order stays visible to
-   * the loop until the loop has seen it": `venueOrderId -> the TERMINAL record`
-   * of an order this process owns, read terminal from the venue and not yet
-   * settled. A terminal record never changes, so this is exactly what the
-   * venue would answer; it is consulted only when the venue no longer can
-   * (its bounded history evicted the order while, say, a halted instance kept
-   * the order from being delivered, retired and settled). Deleted at
-   * settlement, so bounded by the owned orders, as every map above is.
+   * SIM-2 r1: the venue ids of every order a WATCHED basket still reads
+   * (`#basketWatches`). A settled order in this set is NOT acknowledged to the
+   * venue until its watch concludes (`#forgetWatch`): the watch must go on
+   * finding every leg's terminal record, or it would read a forgotten leg as
+   * "still working" and never conclude.
    */
-  readonly #terminalSeen = new Map<string, SimulatedOrder>();
+  readonly #watchedOrders = new Set<string>();
   #settled = 0;
   #unownedFills = 0;
   #lateFillsAfterSettlement = 0;
@@ -675,7 +692,7 @@ export class CoreLoop {
       orderViews: this.#orderViews.metrics().tracked,
       tombstones: this.#tombstones.size,
       heldUnowned: this.#heldUnowned.size,
-      terminalSeen: this.#terminalSeen.size,
+      watchedOrders: this.#watchedOrders.size,
     });
   }
 
@@ -948,20 +965,18 @@ export class CoreLoop {
    * SIM-2: one order this process OWNS, looked up at the venue — or LOUD.
    *
    * An owned order was booked by the venue (`#ownBookedOrders` takes the
-   * ids from its answer), so a venue that cannot answer for it has lost
-   * state this process relies on: a bounded history that evicted a terminal
-   * order the loop has not yet settled, or an adapter whose order store
+   * ids from its answer), and the loop has not ACKNOWLEDGED it (it does so
+   * only after settling it), so the venue must still answer for it — a
+   * venue that bounds its history holds every unacknowledged terminal order
+   * (SIM-2 r1, `SIM2-R1-1`). One that cannot answer has lost state this
+   * process relies on: it evicted the order anyway, or its order store
    * dropped it. That is never skipped silently (the old full-venue scans
    * would have skipped it without a word): the process HALTS, GLOBAL,
    * `VENUE_OBSERVATION_FAILED` (§9.9 `RECONCILE_ACCOUNT`), and the caller
    * treats the order as absent — nothing is released for it (fail closed).
-   *
-   * Not a miss: an order the loop has already READ TERMINAL, whose record it
-   * keeps until settlement (`#terminalSeen`) — the venue's answer for it can
-   * no longer change.
    */
   #ownedOrder(venueOrderId: string, instant: string): SimulatedOrder | undefined {
-    const order = this.#lookupOwned(venueOrderId);
+    const order = this.#options.venue.orderById(venueOrderId);
     if (order === undefined) {
       this.#haltOnVenueMiss(
         `order ${venueOrderId}, which instance ${this.#orderOwners.get(venueOrderId) ?? "(none)"} owns`,
@@ -971,30 +986,29 @@ export class CoreLoop {
     return order;
   }
 
-  /**
-   * SIM-2: one owned order — the venue's answer, or, when the venue no longer
-   * answers, the TERMINAL record the loop read earlier (`#terminalSeen`), or
-   * `undefined`. Records a terminal answer for later. Never halts.
-   */
-  #lookupOwned(venueOrderId: string): SimulatedOrder | undefined {
-    const order = this.#options.venue.orderById(venueOrderId);
-    if (order === undefined) return this.#terminalSeen.get(venueOrderId);
-    if (!this.#terminalSeen.has(venueOrderId) && this.#isTerminalOrder(order)) {
-      this.#terminalSeen.set(venueOrderId, order);
-    }
-    return order;
-  }
-
   /** SIM-2: the venue no longer answers for state this process reads from it (see `#ownedOrder`). */
   #haltOnVenueMiss(what: string, instant: string): void {
     this.#options.halts.halt(
       { kind: "GLOBAL" },
       "VENUE_OBSERVATION_FAILED",
-      `the venue no longer answers for ${what}: evicted from its bounded history, or never held. ` +
+      `the venue no longer answers for ${what}, which this process has not acknowledged: ` +
+        "evicted from its bounded history regardless, or never held. " +
         "This process reads no venue history, so it cannot rebuild the state it is missing; " +
         "reconcile the account (SIM-2)",
       instant,
     );
+  }
+
+  /**
+   * SIM-2 r1 (`SIM2-R1-1`): tells the venue this process is DONE with a
+   * terminal order — unless a watched basket still reads it, in which case
+   * `#forgetWatch` acknowledges it when the watch concludes. The one place the
+   * loop acknowledges: after `#settle`, after a held order's release, and at
+   * a watch's end.
+   */
+  #acknowledgeIfDone(venueOrderId: string): void {
+    if (this.#watchedOrders.has(venueOrderId)) return;
+    this.#options.venue.acknowledgeTerminal(venueOrderId);
   }
 
   /**
@@ -2064,19 +2078,23 @@ export class CoreLoop {
    */
   #judgeBasketWatches(instant: string): void {
     if (this.#basketWatches.size === 0) return;
-    // SIM-2: the watched baskets' own booked (so OWNED) orders, one lookup
-    // each — not a scan of every order the venue ever held — with the loop's
-    // own terminal records behind the venue (`#lookupOwned`). An id neither
-    // can answer for is absent from the map, which `judgeBasketExecution`
-    // reads as "not in the venue's order state" (still working: fail closed),
-    // exactly as a missing snapshot entry was; the harvest's own lookups halt
-    // on that miss.
+    // SIM-2: the watched baskets' own booked orders, one lookup each — not a
+    // scan of every order the venue ever held. Every one is still answered:
+    // the loop acknowledges a watched order to the venue only after its
+    // watch concludes (`#watchedOrders`, SIM-2 r1), even when it has settled
+    // it. An id the venue cannot answer for anyway is a LOUD miss, and is
+    // absent from the map, which `judgeBasketExecution` reads as "not in the
+    // venue's order state" (still working: fail closed).
     const orders = new Map<string, SimulatedOrder>();
     for (const watch of this.#basketWatches.values()) {
       for (const venueOrderId of watch.venueOrderIds) {
         if (orders.has(venueOrderId)) continue;
-        const order = this.#lookupOwned(venueOrderId);
-        if (order !== undefined) orders.set(venueOrderId, order);
+        const order = this.#options.venue.orderById(venueOrderId);
+        if (order === undefined) {
+          this.#haltOnVenueMiss(`order ${venueOrderId}, which basket plan ${watch.executionPlanId} watches`, instant);
+          continue;
+        }
+        orders.set(venueOrderId, order);
       }
     }
     for (const watch of [...this.#basketWatches.values()]) this.#judgeBasket(watch, orders, instant);
@@ -2093,9 +2111,11 @@ export class CoreLoop {
     const verdict = judgeBasketExecution({ booked, notPlaced: watch.notPlacedCount });
     if (verdict.kind === "WORKING") {
       this.#basketWatches.set(watch.executionPlanId, watch);
+      for (const venueOrderId of watch.venueOrderIds) this.#watchedOrders.add(venueOrderId);
       return;
     }
     this.#basketWatches.delete(watch.executionPlanId);
+    this.#forgetWatch(watch);
     if (verdict.kind === "COMPLETE") return;
 
     const why: string[] = [];
@@ -2128,6 +2148,19 @@ export class CoreLoop {
           "decision (§7.7 coordinated, not atomic; SIM-1 R3, SIM1-R2-1)",
         instant,
       );
+    }
+  }
+
+  /**
+   * SIM-2 r1: a watch has concluded, so its orders are no longer read for it.
+   * An order this process has already SETTLED (no owner left) was held back
+   * from acknowledgment for the watch (`#acknowledgeIfDone`), and is
+   * acknowledged now; one still owned is acknowledged at its own settlement.
+   */
+  #forgetWatch(watch: BasketWatch): void {
+    for (const venueOrderId of watch.venueOrderIds) {
+      this.#watchedOrders.delete(venueOrderId);
+      if (!this.#orderOwners.has(venueOrderId)) this.#acknowledgeIfDone(venueOrderId);
     }
   }
 
@@ -2488,9 +2521,10 @@ export class CoreLoop {
    * longer owned) and the ones it knows the venue holds WITHOUT an owner
    * (`#heldUnowned`: the TRDR-4 defensive path, and a placement whose answer
    * was lost), each looked up by id. A held entry is forgotten once its order
-   * is seen terminal and released. Releases are idempotent and order-free,
-   * and every counter counts effective releases only, so the numbers are the
-   * ones the full scan produced.
+   * is seen terminal and released — and the venue is told it may forget the
+   * order too (`acknowledgeTerminal`, SIM-2 r1). Releases are idempotent and
+   * order-free, and every counter counts effective releases only, so the
+   * numbers are the ones the full scan produced.
    *
    * Idempotent: a second call for the same order releases nothing and says so,
    * which is why `#deliverOrderViews` may keep its own call for orders that go
@@ -2511,23 +2545,30 @@ export class CoreLoop {
           ? this.#options.venue.orderByPlannedId(plannedOrderId)
           : this.#options.venue.orderById(venueOrderId);
       if (order === undefined) {
-        // A HELD order the venue listed a moment ago and now cannot answer
-        // for is a history miss, and loud. A planned order of a LOST answer
-        // may never have been booked at all, so its absence is not evidence
-        // of anything: it is kept, and released if the venue ever shows it.
+        // A HELD order the venue has answered for — listed for a refused
+        // plan, or found once for a lost answer — and now cannot is a miss,
+        // and loud; the hold is kept. A planned order of a LOST answer the
+        // venue has never shown may never have been booked at all, so its
+        // absence is not evidence of anything: it is kept, and released if the
+        // venue ever shows it.
         if (venueOrderId !== undefined) {
           this.#haltOnVenueMiss(
-            `order ${venueOrderId} (planned ${plannedOrderId}), which it held for a refused plan without an owner`,
+            `order ${venueOrderId} (planned ${plannedOrderId}), which it holds without an owner`,
             this.#lastInstant,
           );
         }
         continue;
       }
+      // SIM-2 r1 (`SIM2-R1-4`): the venue has now SHOWN this order, so it is
+      // no longer "possibly never booked": the entry is promoted to its venue
+      // id, and from here on its disappearance halts like any held order's.
+      if (venueOrderId === undefined) this.#heldUnowned.set(plannedOrderId, order.simulatedOrderId);
       if (!this.#isTerminalOrder(order)) continue;
       this.#reservations.releaseForOrder(order.plannedOrderId);
       this.#options.allocator.release(order.plannedOrderId);
       this.#timeInForce.release(order.plannedOrderId);
       this.#heldUnowned.delete(plannedOrderId);
+      this.#acknowledgeIfDone(order.simulatedOrderId);
     }
   }
 
@@ -2726,11 +2767,12 @@ export class CoreLoop {
    * What is deleted, each by its own key (the VENUE order id): the owner
    * entry, the fill-join LOOKUP entry (never the provenance log), the id in the
    * instance's order set (and the set when empty), the order-view tracker's
-   * entry, the booked-shares counter, the retired flag, and (SIM-2) the
-   * terminal record kept for it (`#terminalSeen`). What remains is a
+   * entry, the booked-shares counter and the retired flag. What remains is a
    * bounded tombstone naming the probable owner, so a fill that still arrives
    * is classified as late rather than unknown — and is booked UNATTRIBUTED
-   * either way.
+   * either way. SIM-2 r1: the venue is then told this process is done with
+   * the order (`#acknowledgeIfDone` — unless a watched basket still reads it),
+   * so a venue that bounds its history may now forget it, and not before.
    */
   #settle(order: SimulatedOrder): void {
     const venueOrderId = order.simulatedOrderId;
@@ -2764,9 +2806,9 @@ export class CoreLoop {
     this.#bookedShares.delete(venueOrderId);
     this.#retired.delete(venueOrderId);
     this.#mismatched.delete(venueOrderId);
-    this.#terminalSeen.delete(venueOrderId);
     this.#tombstones.remember(venueOrderId, instanceId);
     this.#settled += 1;
+    this.#acknowledgeIfDone(venueOrderId);
   }
 
   /**
