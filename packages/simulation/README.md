@@ -320,6 +320,12 @@ key.
     an ADMITTED batch can fail for a reason other than post-only mode is
     inferred from the per-entry response shape rather than stated by the venue
     documentation. A submission attempt is still one per PLAN (`SIM-ATTEMPT`).
+    PLACED IS NOT EXECUTED (SIM-1 r2, `SIM1-R2-1`): `accepted` / `"ACCEPTED"`
+    says every planned order was BOOKED, not that each executed. A booked FOK
+    that cannot fill whole is `REJECTED` with nothing filled (O2), a FAK's
+    remainder is `CANCELLED` (O1), and a DELAYED order reaches its outcome only
+    at `matchableAtNs` (O5); a consumer that needs every order EXECUTED — a
+    basket — reads each order's `state` and `filledShares`, as the trader does.
 14. **DELAYED is a pending window, resolved from recorded time** (SIM-1, O5;
     ADR-012 §5.1, D-18). On a delayed market (Tier 1, `secondsDelay > 0`) a
     marketable order is booked `DELAYED` with nothing filled and no fill

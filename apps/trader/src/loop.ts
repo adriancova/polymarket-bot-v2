@@ -112,6 +112,7 @@ import {
   type TraceLink,
 } from "./accounting.js";
 import { requestFor, type AllocatorGate } from "./allocation.js";
+import { judgeBasketExecution } from "./basket-execution.js";
 import { CancelLedger } from "./cancels.js";
 import type { InstanceConfig, MarketConfig, TraderConfig } from "./config.js";
 import { readEventEnvelope } from "./event-door.js";
@@ -215,6 +216,22 @@ export interface VenueObservationRefusal {
  */
 const DISPOSITION_NOT_APPLIED = "SIMULATED_VENUE_DISPOSITION_NOT_APPLIED";
 
+/** One BASKET plan the loop is still judging (SIM-1 r2, `SIM1-R2-1`; see `#watchBasket`). */
+interface BasketWatch {
+  readonly executionPlanId: string;
+  readonly failurePolicy: string;
+  /** Every market the basket's groups name, sorted: the halt's scopes. */
+  readonly marketIds: readonly string[];
+  readonly plannedCount: number;
+  /** The VENUE's ids of the orders it BOOKED for the plan, in the answer's order. */
+  readonly venueOrderIds: readonly string[];
+  /** How many planned orders the venue did NOT place, and their description. */
+  readonly notPlacedCount: number;
+  readonly notPlacedDescribed: string;
+  /** `"code: message"` when the venue's answer was not a whole acceptance. */
+  readonly refusal: string | undefined;
+}
+
 export interface CoreLoopOptions {
   readonly config: TraderConfig;
   readonly riskPolicy: RiskPolicy;
@@ -277,9 +294,15 @@ export type LoopHealthSnapshot = HealthSnapshot & {
 /**
  * The per-order state `CoreLoop` holds, as sizes — `TRDR-4`'s observation
  * surface for the bounded-state claim. Every map is keyed by the VENUE's order
- * id.
+ * id, except `basketWatches` (keyed by execution plan id).
  */
 export interface RetainedOrderState {
+  /**
+   * SIM-1 r2 (`SIM1-R2-1`): BASKET plans still WATCHED — some booked order
+   * can still execute and none has ended short yet. A watch ends when its
+   * basket halts or when every booked order is terminal.
+   */
+  readonly basketWatches: number;
   /** `#orderOwners` — venue order id → owning instance. */
   readonly owners: number;
   /** `#instanceOrders` — how many instances still hold an order set. */
@@ -411,6 +434,13 @@ export class CoreLoop {
   readonly #mismatched = new Set<string>();
   /** `venueOrderId -> instanceId` for SETTLED orders, bounded. */
   readonly #tombstones: OrderTombstones;
+  /**
+   * `executionPlanId -> the BASKET plan still WATCHED` (SIM-1 r2, `SIM1-R2-1`;
+   * see `#watchBasket`). Holds a basket only while one of its booked orders
+   * can still execute and none has ended short, so it is bounded by the
+   * working baskets, as the maps above are by the working orders.
+   */
+  readonly #basketWatches = new Map<string, BasketWatch>();
   #settled = 0;
   #unownedFills = 0;
   #lateFillsAfterSettlement = 0;
@@ -543,6 +573,7 @@ export class CoreLoop {
     let instanceOrderIds = 0;
     for (const owned of this.#instanceOrders.values()) instanceOrderIds += owned.size;
     return Object.freeze({
+      basketWatches: this.#basketWatches.size,
       owners: this.#orderOwners.size,
       instanceOrderSets: this.#instanceOrders.size,
       instanceOrderIds,
@@ -711,6 +742,10 @@ export class CoreLoop {
     // allocator commitment and time-in-force held — with nothing said.
     const positioned = this.#options.venue.observe(event.identity);
     if (!positioned.ok) this.#haltOnVenueObservation("observe", positioned.refusal, instant.instant);
+    // SIM-1 r2 (`SIM1-R2-1`): `observe()` is where recorded time applies a
+    // DELAYED order's disposition and a GTD's expiry, so a watched basket is
+    // judged here — before this event evaluates any strategy.
+    this.#judgeBasketWatches(instant.instant);
 
     // --- step 2: update local market/account state -------------------------
     //
@@ -921,6 +956,10 @@ export class CoreLoop {
         if (!traded.ok && traded.refusal?.code === DISPOSITION_NOT_APPLIED) {
           this.#haltOnVenueObservation("observeTrade", traded.refusal, instant);
         }
+        // SIM-1 r2 (`SIM1-R2-1`): the trade's instant can resolve a DELAYED
+        // order too (a venue clock that lags the loop's), so a watched basket
+        // is judged before the caller evaluates this market.
+        this.#judgeBasketWatches(instant);
         return { kind: "onFeatures" };
       }
       case "DataQualityIncidentOpened": {
@@ -1558,6 +1597,7 @@ export class CoreLoop {
       // Only then is the rest of the plan settled.
       this.#ownBookedOrders(result.orders, input, submissionAttemptId);
       this.#releaseRefusedPlacement(input.plan, result, input.instant);
+      this.#watchBasket(input.plan, result, input.instant);
       return;
     }
     this.#options.health.countExecution("submissionsAccepted");
@@ -1573,6 +1613,11 @@ export class CoreLoop {
     }
 
     this.#ownBookedOrders(result.orders, input, submissionAttemptId);
+    // SIM-1 r2 (`SIM1-R2-1`): `accepted` says every planned order was PLACED,
+    // not that each EXECUTED — a booked FOK can be REJECTED, a FAK CANCELLED
+    // short, a DELAYED order still pending — so an accepted basket is judged
+    // from its orders' own outcomes too.
+    this.#watchBasket(input.plan, result, input.instant);
   }
 
   /**
@@ -1670,14 +1715,10 @@ export class CoreLoop {
    * delivery (`onOrderUpdate`, `ctx.orders()`) and re-plans from there.
    *
    * A BASKET plan that was partly booked HALTS every market it names
-   * (`BASKET_PARTIALLY_EXECUTED`, `MANAGE_KNOWN_POSITIONS_ONLY`). This is
-   * where "basket" is detected: `plan.planKind === "BASKET"` on the plan this
-   * process built. §7.7 makes basket execution "coordinated, not assumed
-   * atomic", and the basket carries a `failurePolicy` (ABANDON /
-   * PROTECTED_UNWIND / HOLD_FILLED_LEGS) for exactly this state — but nothing
-   * in this process consumes it yet, so the process stops deciding for those
-   * markets rather than leave a half-built basket for the strategy to re-plan
-   * as if it were a single position.
+   * (`BASKET_PARTIALLY_EXECUTED`, `MANAGE_KNOWN_POSITIONS_ONLY`) — no longer
+   * here but in `#watchBasket`, which the caller runs next and which judges an
+   * ACCEPTED basket too (SIM-1 r2, `SIM1-R2-1`): a basket every order of which
+   * was booked can still have executed only in part.
    */
   #releaseRefusedPlacement(
     plan: Exclude<ExecutionPlan, { readonly planKind: "CANCEL" }>,
@@ -1740,34 +1781,126 @@ export class CoreLoop {
         );
       }
     }
+  }
 
-    if (plan.planKind === "BASKET" && booked.size > 0) {
-      const bookedDescribed = result.orders
-        .filter((order) => planned.has(order.plannedOrderId))
-        .map(
-          (order) =>
-            `${order.simulatedOrderId} (planned ${order.plannedOrderId}) ${order.state} ` +
-            `${order.filledShares}/${order.requestedShares}`,
-        )
-        .join(", ");
-      const notPlacedDescribed = result.notPlaced
+  /**
+   * Starts judging a BASKET plan the venue booked anything of — SIM-1 r2
+   * (`SIM1-R2-1`), the trader's side of the user's ruling R3 for baskets.
+   *
+   * THIS IS WHERE "BASKET" IS DETECTED: `plan.planKind === "BASKET"` on the
+   * plan this process built. §7.7 makes basket execution "coordinated, not
+   * assumed atomic", and the basket carries a `failurePolicy` (ABANDON /
+   * PROTECTED_UNWIND / HOLD_FILLED_LEGS) for exactly the state in which its
+   * legs did not all execute — but nothing in this process consumes it yet, so
+   * the process stops deciding for the basket's markets rather than leave a
+   * half-built basket for the strategy to re-plan as if it were a single
+   * position: `BASKET_PARTIALLY_EXECUTED`, `MANAGE_KNOWN_POSITIONS_ONLY`.
+   *
+   * WHY NOT FROM `result.accepted` ALONE (the finding). `accepted` says every
+   * planned order was PLACED. An order the venue booked can still end without
+   * executing — a FOK that cannot fill whole is REJECTED (SIM-1 O2), a FAK's
+   * remainder CANCELLED (O1) — or reach its outcome only later (a DELAYED
+   * order at `matchableAtNs`, O5; a GTD at its expiry, O4). The basket is
+   * therefore judged from EACH ORDER'S OWN outcome
+   * ({@link judgeBasketExecution}): now, from the venue's answer; and, while
+   * any of its orders can still execute, again wherever an order's outcome can
+   * change before a decision reads it — right after `observe()` and after
+   * `observeTrade()` (where DELAYED dispositions and expiries are applied) and
+   * in the harvest before anything is delivered (cancels, fills). So the halt
+   * lands BEFORE the strategy is evaluated for a market whose basket has just
+   * gone short.
+   *
+   * WHAT THIS DOES NOT TOUCH. Ownership (`#ownBookedOrders` ran first) and the
+   * release rules: a booked order keeps its reservation, allocator commitment
+   * and time-in-force until the harvest that sees it terminal (ADR-006 §9), as
+   * every order does; a halted market's deliveries are suppressed and its
+   * terminal orders retired after the halt is released, as for every halt.
+   */
+  #watchBasket(plan: ExecutionPlan, result: ExecutionResult, instant: string): void {
+    if (plan.planKind !== "BASKET") return;
+    const planned = new Set<string>();
+    for (const group of plan.groups) {
+      for (const order of group.orders) planned.add(order.plannedOrderId);
+    }
+    const booked = result.orders.filter((order) => planned.has(order.plannedOrderId));
+    // A basket the venue booked NOTHING of was released whole by
+    // `#releaseRefusedPlacement` (or its orders are the defensive path's):
+    // nothing of it is owned, so nothing is left to judge.
+    if (booked.length === 0) return;
+    const watch: BasketWatch = Object.freeze({
+      executionPlanId: plan.executionPlanId,
+      failurePolicy: plan.failurePolicy,
+      marketIds: Object.freeze([...new Set(plan.groups.map((group) => group.marketId))].sort()),
+      plannedCount: planned.size,
+      venueOrderIds: Object.freeze(booked.map((order) => order.simulatedOrderId)),
+      notPlacedCount: result.notPlaced.length,
+      notPlacedDescribed: result.notPlaced
         .map((entry) => `${entry.plannedOrderId} (${entry.refusalCode})`)
-        .join(", ");
-      const markets = [...new Set(plan.groups.map((group) => group.marketId))].sort();
-      for (const marketId of markets) {
-        this.#options.halts.halt(
-          { kind: "MARKET", marketId },
-          "BASKET_PARTIALLY_EXECUTED",
-          `basket plan ${plan.executionPlanId} (failurePolicy ${plan.failurePolicy}) was executed ` +
-            `only IN PART (${refusal}): the venue booked ${String(booked.size)} of its ` +
-            `${String(plannedOrderIds.length)} planned orders — ${bookedDescribed}; not placed: ` +
-            `${notPlacedDescribed === "" ? "(none listed)" : notPlacedDescribed}. The booked orders ` +
-            "are OWNED and tracked, and keep their reservations until terminal; nothing in this " +
-            "process consumes the basket's failurePolicy yet, so its markets halt for an operator " +
-            "decision (§7.7 coordinated, not atomic; SIM-1 R3)",
-          instant,
-        );
-      }
+        .join(", "),
+      refusal: result.accepted
+        ? undefined
+        : `${result.refusalCode ?? "VENUE_REFUSED"}: ${result.refusalMessage ?? "the venue refused the plan"}`,
+    });
+    this.#judgeBasket(watch, new Map(booked.map((order) => [order.simulatedOrderId, order])), instant);
+  }
+
+  /**
+   * Judges every WATCHED basket against the venue's order state now (see
+   * `#watchBasket` for where and why this runs). Free when nothing is watched.
+   */
+  #judgeBasketWatches(instant: string): void {
+    if (this.#basketWatches.size === 0) return;
+    const orders = new Map<string, SimulatedOrder>();
+    for (const order of this.#options.venue.ordersSnapshot()) orders.set(order.simulatedOrderId, order);
+    for (const watch of [...this.#basketWatches.values()]) this.#judgeBasket(watch, orders, instant);
+  }
+
+  /**
+   * One basket, one judgement: keep watching it while it can still execute
+   * and nothing ended short; forget it once every booked order is terminal
+   * with no halt needed (all FILLED, or nothing executed at all); HALT its
+   * markets — once — when it executed only IN PART.
+   */
+  #judgeBasket(watch: BasketWatch, orders: ReadonlyMap<string, SimulatedOrder>, instant: string): void {
+    const booked = watch.venueOrderIds.map((venueOrderId) => orders.get(venueOrderId));
+    const verdict = judgeBasketExecution({ booked, notPlaced: watch.notPlacedCount });
+    if (verdict.kind === "WORKING") {
+      this.#basketWatches.set(watch.executionPlanId, watch);
+      return;
+    }
+    this.#basketWatches.delete(watch.executionPlanId);
+    if (verdict.kind === "COMPLETE") return;
+
+    const why: string[] = [];
+    if (verdict.notAllPlaced) why.push(watch.refusal ?? "the venue did not place every planned order");
+    if (verdict.endedShort.length > 0) {
+      why.push(
+        `${String(verdict.endedShort.length)} booked order(s) ended short of their size while part ` +
+          "of the basket executed or can still execute",
+      );
+    }
+    const bookedDescribed = watch.venueOrderIds
+      .map((venueOrderId, index) => {
+        const order = booked[index];
+        return order === undefined
+          ? `${venueOrderId} (not in the venue's order state)`
+          : `${order.simulatedOrderId} (planned ${order.plannedOrderId}) ${order.state} ` +
+              `${order.filledShares}/${order.requestedShares}`;
+      })
+      .join(", ");
+    for (const marketId of watch.marketIds) {
+      this.#options.halts.halt(
+        { kind: "MARKET", marketId },
+        "BASKET_PARTIALLY_EXECUTED",
+        `basket plan ${watch.executionPlanId} (failurePolicy ${watch.failurePolicy}) was executed ` +
+          `only IN PART (${why.join("; ")}): the venue booked ${String(watch.venueOrderIds.length)} ` +
+          `of its ${String(watch.plannedCount)} planned orders — ${bookedDescribed}; not placed: ` +
+          `${watch.notPlacedDescribed === "" ? "(none listed)" : watch.notPlacedDescribed}. The booked ` +
+          "orders are OWNED and tracked, and keep their reservations until terminal; nothing in this " +
+          "process consumes the basket's failurePolicy yet, so its markets halt for an operator " +
+          "decision (§7.7 coordinated, not atomic; SIM-1 R3, SIM1-R2-1)",
+        instant,
+      );
     }
   }
 
@@ -1897,6 +2030,9 @@ export class CoreLoop {
     // account — closes the window in the fail-closed direction at both ends:
     // nothing is released before the position that replaces it exists.
     this.#releaseSettledReservations();
+    // SIM-1 r2 (`SIM1-R2-1`): a cancel or a fill of this iteration can leave a
+    // watched basket short; judged before anything below is delivered.
+    this.#judgeBasketWatches(instant);
 
     for (const delivery of booked) {
       // --- WP-220 obligation 8, and the §4.2 gate it stops at ---------------

@@ -84,6 +84,8 @@ export type HaltReasonCode =
    * §7.7 / SIM-1 ruling R3: the venue executed a BASKET plan only in part, and
    * nothing in this process consumes the basket's `failurePolicy` yet. The
    * booked legs are owned and known; what to do with them is the decision.
+   * Judged from each booked order's own outcome, an ACCEPTED plan included
+   * (SIM-1 r2, `SIM1-R2-1`; `basket-execution.ts`).
    */
   | "BASKET_PARTIALLY_EXECUTED"
   /**

@@ -371,12 +371,27 @@ export interface NotPlacedOrder {
  * always had, plus the two new fields. For a CANCEL plan `notPlaced` is `[]`;
  * `outcome` is `"PARTIAL"` when it cancelled some of its targets and not
  * others (`orders` lists the cancelled ones, `notCancelled` the rest).
+ *
+ * PLACED IS NOT EXECUTED (SIM-1 r2, `SIM1-R2-1`). For a placement plan,
+ * `accepted` / `"ACCEPTED"` says every planned order was PLACED — booked at
+ * this venue — and NOTHING about how each one then executed. A booked order
+ * can end at once without executing (O2: a FOK that cannot fill whole is
+ * booked `REJECTED` with nothing filled; O1: a FAK's unfilled remainder is
+ * `CANCELLED`), and on a delayed market it is booked `DELAYED` and reaches its
+ * outcome only at `matchableAtNs` (O5). A consumer that needs every order to
+ * have EXECUTED — a basket, whose legs are coordinated but not atomic (§7.7)
+ * — must read each listed order's `state` and `filledShares`, now and as they
+ * change, not this flag (the trader does: `apps/trader/src/basket-execution.ts`).
  */
 export interface ExecutionResult {
   readonly executionPlanId: string;
-  /** `true` only when the WHOLE plan took effect. */
+  /**
+   * `true` only when the WHOLE plan was placed: for a placement plan, every
+   * planned order was BOOKED (each order's own `state` says whether it then
+   * executed); for a CANCEL plan, every target was cancelled.
+   */
   readonly accepted: boolean;
-  /** Whether the plan took effect wholly, in part, or not at all (R3). */
+  /** Whether the plan was placed wholly, in part, or not at all (R3); see `accepted`. */
   readonly outcome: "ACCEPTED" | "PARTIAL" | "REFUSED";
   /**
    * The orders this submission BOOKED — on every outcome, including a partial
@@ -416,9 +431,10 @@ export interface ExecutionResult {
   readonly rateLimitModel: "MODELED" | "NOT_MODELED";
   readonly rateLimitDisclosure: string;
   /**
-   * Present when the plan did not WHOLLY take effect; `accepted` is then
+   * Present when the plan was not WHOLLY placed; `accepted` is then
    * `false`. On a `"PARTIAL"` outcome it is the first failure's code, and
-   * `orders` still lists what was booked.
+   * `orders` still lists what was booked. Absent for a wholly placed plan even
+   * when a booked order then executed nothing (see `accepted`).
    */
   readonly refusalCode?: string;
   readonly refusalMessage?: string;

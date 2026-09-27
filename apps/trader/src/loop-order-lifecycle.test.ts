@@ -777,6 +777,7 @@ describe("R1 — a terminal order is delivered until ONE evaluated delivery, the
     // empty, three tombstones remain, and nothing arrived unowned.
     const loop = parts.trader.loop;
     expect(loop.retainedOrderState()).toEqual({
+      basketWatches: 0,
       owners: 0,
       instanceOrderSets: 0,
       instanceOrderIds: 0,
