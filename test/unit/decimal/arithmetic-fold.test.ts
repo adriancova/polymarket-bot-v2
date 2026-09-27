@@ -33,17 +33,35 @@
  * never a reason to edit the constant without saying which.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
+
+/**
+ * Awaited, never synchronous (`CI-1`): a worker blocked on a child cannot read
+ * vitest's own RPC replies (`test/unit/tooling/no-synchronous-spawn.test.ts`
+ * says why that fails a run). Like the synchronous form, it rejects on a
+ * non-zero exit, on the timeout and on an output overflow.
+ */
+const execFileAsync = promisify(execFile);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FOLD = resolve(HERE, "arithmetic-fold.ts");
 
 /** Generous against the measured ~110 ms, for the reason in finding M2. */
 const FOLD_TIMEOUT_MS = 60_000;
+
+/**
+ * The test's own timeout, set above the spawn's (`CI-1`). While the spawn was
+ * synchronous nothing could interrupt it, so its timeout always fired first:
+ * it killed the child and the test failed with the spawn's own error. Awaited,
+ * an equal test timeout could fire first and leave the child running past its
+ * test. This keeps the original order.
+ */
+const FOLD_TEST_TIMEOUT_MS = FOLD_TIMEOUT_MS + 10_000;
 
 /** Answers only; a throw folds in as the bare token `THREW`. */
 const VALUES_DIGEST = "e2a7ac26377be56ea3f1e5d9af045a4dc155c3613ed785553c824b28253fc411";
@@ -59,12 +77,13 @@ interface FoldResult {
   readonly fullDigest: string;
 }
 
-describe("the honest-path fold", { timeout: FOLD_TIMEOUT_MS }, () => {
-  it("answers the pinned digests over the whole corpus", () => {
-    const stdout = execFileSync(process.execPath, [FOLD], {
+describe("the honest-path fold", { timeout: FOLD_TEST_TIMEOUT_MS }, () => {
+  it("answers the pinned digests over the whole corpus", async () => {
+    // `execFile` takes no `stdio` option (its stdin is always a pipe); the fold
+    // never reads stdin, so the former `"ignore"` changed nothing observable.
+    const { stdout } = await execFileAsync(process.execPath, [FOLD], {
       encoding: "utf8",
       timeout: FOLD_TIMEOUT_MS,
-      stdio: ["ignore", "pipe", "pipe"],
     });
     const result = JSON.parse(stdout) as FoldResult;
     // The shape of the fold, so a corpus that quietly shrank cannot pass by

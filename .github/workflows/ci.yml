@@ -28,21 +28,38 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies (frozen lockfile)
+        id: install
         run: pnpm install --frozen-lockfile
 
+      # CI-1 (GATE1-R4): every gate below runs whenever setup succeeded, even
+      # after an earlier gate failed, so one red step no longer hides the
+      # others' evidence. (The repository's first run, 36279491795, failed at
+      # "Unit tests" and skipped all seven gates after it.) `!cancelled()`
+      # replaces the implicit `success()`; `steps.install.outcome` keeps every
+      # gate off when checkout, the toolchain or the frozen install failed —
+      # the install step is itself skipped after an earlier setup failure, so
+      # its outcome is then 'skipped', not 'success'. No step sets
+      # `continue-on-error`, so any failed gate still fails the job. The gates
+      # are independent of one another: each reads only the checkout and
+      # node_modules (every typecheck is `--noEmit`; the suites that need a
+      # bundle build it inside their own tests).
       - name: Typecheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm typecheck
 
       - name: Lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm lint
 
       # WP-015: enforces docs/contracts/dependency-direction.md §6 (cycles F9,
       # layer conformance F12/F13, forbidden specifiers F1-F8/F11). No secrets,
       # no network.
       - name: Dependency direction and package boundaries
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm check:deps
 
       - name: Unit tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test
 
       # GATE-1 (GOV-2B B6): the six `test/e2e/**` suites are the Phase-2
@@ -55,37 +72,50 @@ jobs:
       # (5 of the 6 suites fail to load there). In-process PAPER throughout: no
       # Docker, no network, no credential, no signer.
       - name: Paper end-to-end verification suite (in-process PAPER; no Docker, no network)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test:e2e
 
       # GATE-1 (GOV-2B N4): §12.4 determinism is a GATE, not a dashboard. The
       # fidelity dashboard's "Replay determinism" panel tells readers this
       # script must pass, so it has to actually run here.
       - name: Replay determinism goldens (order-book and simulation)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test:replay
 
       - name: WAL fault-injection tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test:fault
 
       - name: Venue contract tests (offline fixtures)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test:contract
 
       - name: Recorder soak-harness smoke (bounded, loopback-only; no elapsed-evidence claim)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test:soak-smoke
 
       # GATE-1 (GOV-2B N5): the threshold is `--audit-level high`, so moderate
       # and low advisories do NOT fail this step. The previous label implied an
       # unqualified scan.
       - name: Dependency vulnerability scan (pnpm lockfile; fails on high and critical only)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm audit --audit-level high
 
-      # GATE-1 (GOV-2B N5): the previous label credited all six chained suites
-      # as "Testcontainers - PostgreSQL and Redis". Only two are container
-      # backed: `test/integration/postgres` (14 files, PostgreSQL) and
-      # `test/integration/event-bus` (8 files, Redis) are the only suites whose
-      # vitest config declares a `globalSetup` that starts a container. The other
-      # four — data-gateway (11), paper-trader (9), control-api (8), parquet (4),
-      # i.e. 32 of the 54 files — start no container.
-      - name: Integration tests (six workspace suites; Testcontainers PostgreSQL and Redis in two of them)
+      # N5, recounted by CI-1 from each chained suite's vitest config and test
+      # sources: THREE of the six suites start Testcontainers, so this step
+      # needs a host Docker daemon. `test/integration/postgres` (14 files,
+      # PostgreSQL) and `test/integration/event-bus` (8 files, Redis) start
+      # theirs in the config's `globalSetup`. `test/integration/paper-trader`
+      # has no `globalSetup`; 4 of its 14 files start their own in `beforeAll`
+      # (`durable-pnl-snapshot-postgres`, `durable-trader-first-fill-postgres`,
+      # `trader-health-endpoint-postgres`: PostgreSQL;
+      # `univ-4-gateway-opens-trader-redis`: PostgreSQL and Redis). The other
+      # three suites — data-gateway (12), control-api (10), parquet (4) — start
+      # none; with paper-trader's 10 in-memory files, 36 of the 62 files start
+      # no container. GATE-1 (GOV-2B N5) wrote "two of them", true at its base;
+      # TRDR-2, BOOT-1, TRDR-3 and UNIV-4 then added the four paper-trader files.
+      - name: Integration tests (six workspace suites; Testcontainers PostgreSQL and Redis in three of them - postgres, event-bus, paper-trader)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: pnpm test:integration
 
   compose:
@@ -117,12 +147,17 @@ jobs:
           version: "0.10.2"
 
       - name: Sync (frozen lockfile)
+        id: sync
         run: uv sync --frozen
 
+      # CI-1 (GATE1-R4), as in the `node` job: both gates run whenever the
+      # frozen sync succeeded, so a failing Pytest no longer hides the scan.
       - name: Pytest
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run pytest
 
       - name: Dependency vulnerability scan (uv lockfile)
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: |
           uv export --frozen --no-emit-project --format requirements-txt > /tmp/requirements-audit.txt
           uvx pip-audit --strict -r /tmp/requirements-audit.txt
