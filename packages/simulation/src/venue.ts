@@ -250,6 +250,17 @@ interface PendingDelayed {
 }
 
 /**
+ * A DELAYED order whose disposition could not be applied at `matchableAtNs`
+ * (SIM-1 r1, `SIM1-R1-1`), held until a door that answers for recorded time
+ * reports it — see `SimulatedVenue.#reportUnapplied`.
+ */
+interface UnappliedDisposition {
+  readonly simulatedOrderId: string;
+  readonly marketId: string;
+  readonly cause: SimulationRefusal;
+}
+
+/**
  * One order's execution, STAGED. Staging reads the book, the policy, the
  * model, the observed trades and (Tier 1) draws the seeded latency ONCE; it
  * writes none of the venue's state. `#commit` applies it.
@@ -284,6 +295,16 @@ function newProgress(): PlacementProgress {
 
 function notPlacedFrom(plannedOrderId: string, refusal: SimulationRefusal): NotPlacedOrder {
   return { plannedOrderId, refusalCode: refusal.code, refusalMessage: refusal.message };
+}
+
+/**
+ * The contained failure's class name a `SIMULATION_INTERNAL` refusal carries
+ * in `details.failure` (`refusals.ts`'s `containedFailure`), as a suffix for a
+ * refusal message; empty when there is none. Reads own data this package built.
+ */
+function describeCauseFailure(cause: SimulationRefusal): string {
+  const failure: unknown = cause.details["failure"];
+  return typeof failure === "string" ? ` [${failure}]` : "";
 }
 
 /**
@@ -359,6 +380,12 @@ export class SimulatedVenue implements ExecutionVenue {
   readonly #trades = new Map<string, ObservedTrade[]>();
   /** O5: DELAYED orders awaiting `matchableAtNs`, by order id. */
   readonly #pending = new Map<string, PendingDelayed>();
+  /**
+   * `SIM1-R1-1`: DELAYED dispositions that could not be applied, not yet
+   * reported. Bounded by the DELAYED orders that failed since the last
+   * `observe()` / `observeTrade()` answer, which drains it.
+   */
+  readonly #unapplied: UnappliedDisposition[] = [];
   #cash: string;
   #atEvent: RecordedEventIdentity | undefined;
 
@@ -435,6 +462,14 @@ export class SimulatedVenue implements ExecutionVenue {
    * window has closed takes its already-computed disposition (O5) and every
    * resting GTD order past its effective expiry expires (O4) — see `#sweep`.
    * Both are stamped with the event the venue has just been positioned at.
+   *
+   * SIM-1 r1 (`SIM1-R1-1`): a DELAYED disposition the venue could not APPLY
+   * (its fill accounting failed) leaves that order REJECTED with nothing
+   * booked, and this door then answers `ok: false`,
+   * `SIMULATED_VENUE_DISPOSITION_NOT_APPLIED`, naming it — AFTER positioning
+   * the venue and sweeping everything else, so the venue's state is whole and
+   * the caller is told. The answer also carries a failure an earlier cancel's
+   * own sweep found and could not report (`#reportUnapplied`).
    */
   observe(identity: RecordedEventIdentity): SimulationResult<null> {
     return totally("positioning the simulated venue at a recorded event", () => {
@@ -453,7 +488,7 @@ export class SimulatedVenue implements ExecutionVenue {
       const atEvent = ownFrozenTree<RecordedEventIdentity>(materialized);
       this.#atEvent = atEvent;
       this.#sweep(this.#options.clock.monotonicNs(), atEvent);
-      return simulationOk(null);
+      return this.#reportUnapplied() ?? simulationOk(null);
     });
   }
 
@@ -1663,7 +1698,10 @@ export class SimulatedVenue implements ExecutionVenue {
    *    already-computed disposition — its fills are booked NOW (never before
    *    that instant: `TERM-D`), and its remainder is settled or registered to
    *    rest. In `(matchableAtNs, order id)` order, so a replay produces its
-   *    fills in the same order every time (§12.4).
+   *    fills in the same order every time (§12.4). A disposition that cannot
+   *    be APPLIED leaves its order REJECTED with nothing booked, and is held
+   *    for `#reportUnapplied` (SIM-1 r1, `SIM1-R1-1`); one order's failure
+   *    does not stop the others.
    * 2. O4: every resting GTD order whose effective expiry has been reached
    *    EXPIRES — on ANY recorded event, not only on a trade in its own market
    *    and side (`VS-05b`): the venue expires a GTD order at its time whether
@@ -1692,26 +1730,68 @@ export class SimulatedVenue implements ExecutionVenue {
               : compareStrings(left.simulatedOrderId, right.simulatedOrderId),
         );
       for (const pending of due) {
-        this.#pending.delete(pending.simulatedOrderId);
         const existing = this.#orders.get(pending.simulatedOrderId);
-        if (existing === undefined || existing.state !== "DELAYED") continue;
+        if (existing === undefined || existing.state !== "DELAYED") {
+          // Unreachable: a pending entry exists exactly while its order is
+          // DELAYED, and only this loop moves a DELAYED order. Dropped so a
+          // stale entry cannot be applied over an order that moved on.
+          this.#pending.delete(pending.simulatedOrderId);
+          continue;
+        }
         const settled = pending.disposition;
         const rest = settled.kind === "RESTS" ? settled.rest : undefined;
-        const order = ownFrozenTree<SimulatedOrder>({
-          ...existing,
-          filledShares: pending.filledShares,
-          state:
-            settled.kind === "TERMINAL"
-              ? settled.state
-              : compareDecimal(pending.filledShares, "0") > 0
-                ? "PARTIALLY_FILLED"
-                : "RESTING",
-          fillEstimateKind: rest?.band !== undefined ? "TIER_1_RESTING_BAND" : existing.fillEstimateKind,
-          atEvent,
+        // SIM-1 r1 (`SIM1-R1-1`): the pending entry is removed only once the
+        // order has a FINAL answer. It used to be deleted BEFORE the commit,
+        // so a commit that threw (its fill accounting refused an operand)
+        // left the order DELAYED for ever — with nothing left to resolve it,
+        // every cancel refused as "inside the window", and the trader's
+        // reservation, allocator commitment and time-in-force held with it.
+        const committed = totally("applying a DELAYED order's disposition at matchableAtNs", () => {
+          const order = ownFrozenTree<SimulatedOrder>({
+            ...existing,
+            filledShares: pending.filledShares,
+            state:
+              settled.kind === "TERMINAL"
+                ? settled.state
+                : compareDecimal(pending.filledShares, "0") > 0
+                  ? "PARTIALLY_FILLED"
+                  : "RESTING",
+            fillEstimateKind: rest?.band !== undefined ? "TIER_1_RESTING_BAND" : existing.fillEstimateKind,
+            atEvent,
+          });
+          // All-or-nothing: `#applyFills` computes cash and positions into
+          // locals and assigns last, and everything after it is a `Map.set`.
+          this.#commit({ order, fills: pending.fills, rest, pending: undefined });
+          return simulationOk(null);
         });
-        this.#commit({ order, fills: pending.fills, rest, pending: undefined });
-        for (const fill of pending.fills) fills.push(fill);
-        if (rest?.band !== undefined) bands.push(rest.band);
+        if (committed.ok) {
+          this.#pending.delete(pending.simulatedOrderId);
+          for (const fill of pending.fills) fills.push(fill);
+          if (rest?.band !== undefined) bands.push(rest.band);
+          continue;
+        }
+        // The disposition cannot be applied, and the failure is handled HERE,
+        // once, at `matchableAtNs` — never retried, because the venue decides
+        // a delayed order at the end of its window, and an order kept DELAYED
+        // past it is exactly the uncancellable, capital-holding state this
+        // closes. D-18 (`docs/venue/verified-2026-09-16.md`): "If the market,
+        // balance, allowance, or risk checks fail when the delay expires, the
+        // order is rejected instead of matching." So: REJECTED, nothing
+        // filled, and — the commit being all-or-nothing — no fill, no cash,
+        // no position, no resting record and no band. The REJECTED state is
+        // written BEFORE the entry is deleted, so a throw here leaves the
+        // entry to be swept again rather than lost. Reported, not silent:
+        // `#reportUnapplied`.
+        this.#orders.set(
+          pending.simulatedOrderId,
+          ownFrozenTree<SimulatedOrder>({ ...existing, state: "REJECTED", filledShares: "0", atEvent }),
+        );
+        this.#pending.delete(pending.simulatedOrderId);
+        this.#unapplied.push({
+          simulatedOrderId: pending.simulatedOrderId,
+          marketId: existing.marketId,
+          cause: committed.refusal,
+        });
       }
     }
     const expired = [...this.#resting.values()]
@@ -1900,7 +1980,42 @@ export class SimulatedVenue implements ExecutionVenue {
       updated.push(band.value);
     }
 
-    return simulationOk(ownFrozenTree({ fills: produced, bands: updated }));
+    // `SIM1-R1-1`: a DELAYED disposition this instant could not apply is
+    // reported AFTER the trade was walked — the resting orders still fill
+    // from it, and the fills it produced are in the venue's fill list.
+    return this.#reportUnapplied() ?? simulationOk(ownFrozenTree({ fills: produced, bands: updated }));
+  }
+
+  /**
+   * `SIM1-R1-1`: the answer for every DELAYED disposition the venue could not
+   * apply and has not reported yet, or `undefined` when there is none. Drains
+   * the list, so each failure is reported exactly once.
+   *
+   * Only `observe()` and `observeTrade()` report — the doors that answer for
+   * recorded time and whose `SimulationResult` has a refusal channel. A
+   * cancel's own sweep (`#cancelSync`) cannot report on a `CancelResult`, so a
+   * failure it finds waits here for the next of those two doors; the order
+   * itself reads REJECTED in every snapshot from the moment it failed.
+   */
+  #reportUnapplied<TValue>(): SimulationResult<TValue> | undefined {
+    if (this.#unapplied.length === 0) return undefined;
+    const failed = this.#unapplied.splice(0, this.#unapplied.length);
+    return simulationFailure(
+      "SIMULATED_VENUE_DISPOSITION_NOT_APPLIED",
+      `the already-computed disposition of ${String(failed.length)} DELAYED order(s) could not be applied when the recorded clock reached matchableAtNs; each is REJECTED with nothing filled and nothing booked (venue report D-18: an order whose checks fail when the delay expires is rejected instead of matching): ` +
+        failed
+          .map(
+            (entry) =>
+              `${entry.simulatedOrderId} (market ${entry.marketId}): ${entry.cause.code} — ${entry.cause.message}` +
+              describeCauseFailure(entry.cause),
+          )
+          .join("; "),
+      {
+        simulatedOrderIds: failed.map((entry) => entry.simulatedOrderId).join(","),
+        marketIds: failed.map((entry) => entry.marketId).join(","),
+        causes: failed.map((entry) => entry.cause.code).join(","),
+      },
+    );
   }
 
   /**
@@ -2008,7 +2123,10 @@ export class SimulatedVenue implements ExecutionVenue {
       });
     }
     // A cancel never acts on a state the recorded clock has already moved past:
-    // a DELAYED order whose window has closed takes its disposition first.
+    // a DELAYED order whose window has closed takes its disposition first. A
+    // disposition that cannot be applied leaves its order REJECTED (so it is
+    // "already REJECTED" below) and waits in `#unapplied` for the next
+    // `observe()` / `observeTrade()` to report it (`SIM1-R1-1`).
     const atEvent = this.#atEvent;
     if (atEvent !== undefined) this.#sweep(this.#options.clock.monotonicNs(), atEvent);
 

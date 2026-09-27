@@ -331,6 +331,15 @@ key.
     (`notCancelled`: "cannot be canceled", D-18). A composition root whose clock
     does not advance therefore never resolves a DELAYED order through
     `observe()` alone; the shipped trader runs Tier 0, which never delays.
+    A disposition that cannot be APPLIED at `matchableAtNs` (its fill
+    accounting refuses an operand; SIM-1 r1, `SIM1-R1-1`) is not retried and
+    not lost: the order becomes `REJECTED` with nothing filled and nothing
+    booked (D-18: an order whose checks fail when the delay expires "is
+    rejected instead of matching"), and the next `observe()` or
+    `observeTrade()` answers `ok: false`,
+    `SIMULATED_VENUE_DISPOSITION_NOT_APPLIED`, naming it — once. A cancel's
+    own sweep holds such a failure for that next answer, because a
+    `CancelResult` has no refusal channel.
 15. **GTD expiry is swept on every recorded event, and a partly filled GTD
     EXPIRES** (SIM-1, O4). Expiry used to be checked only when a trade printed
     in the order's own market and side, so a GTD in a quiet market never

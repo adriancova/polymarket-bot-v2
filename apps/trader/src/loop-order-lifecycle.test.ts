@@ -38,6 +38,13 @@
  *    risk stops counting it as an open order. Only the VENUE's view of the
  *    book is clipped (the book moving between decision and execution), and a
  *    pass-through observer records the open orders risk is handed.
+ * 7. SIM-1 r1 (`SIM1-R1-1`): through a TIER-1 venue on a delayed market, a
+ *    DELAYED entry whose disposition the venue cannot APPLY at
+ *    `matchableAtNs` (a balance its fill accounting cannot carry) is REJECTED
+ *    with nothing booked, released, and the loop — reading `observe()`'s (or
+ *    `observeTrade()`'s) answer — halts GLOBAL `VENUE_OBSERVATION_FAILED`;
+ *    it never stays DELAYED and open. The control, an ordinary balance,
+ *    resolves CANCELLED 30/50 with no halt.
  *
  * The scenario is `test/e2e/support/scenario.ts`'s WP-250 run, restated
  * compactly (as `order-provenance.test.ts` does, because this package's
@@ -49,13 +56,17 @@ import { addDecimal } from "@polymarket-bot/decimal";
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import {
   SimulatedVenue,
+  deriveStreams,
   readFeeScheduleSnapshot,
   tier0Model,
+  tier1Model,
   unmodeledRateLimits,
   type BookView,
   type ExecutionResult,
   type FeeScheduleSnapshot,
+  type LatencyModel,
   type MarketBookProvider,
+  type QueueModelParameters,
   type RateLimitBudget,
   type SimulatedFill,
   type SimulatedOrder,
@@ -110,6 +121,23 @@ const YES_BIDS = [
   { price: "0.32", size: "200" },
   { price: "0.31", size: "300" },
 ];
+
+/** Tier-1 inputs for the SIM1-R1-1 cases: no latency, and the §12.2 queue arms. */
+const ZERO_LATENCY: LatencyModel = {
+  latencyModelVersion: "sim1-r1/latency/zero",
+  decision: { samples: [{ milliseconds: 0, weight: 1 }] },
+  signing: { samples: [{ milliseconds: 0, weight: 1 }] },
+  network: { samples: [{ milliseconds: 0, weight: 1 }] },
+  venue: { samples: [{ milliseconds: 0, weight: 1 }] },
+  basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+};
+const QUEUE_PARAMETERS: QueueModelParameters = {
+  queueModelVersion: "sim1-r1/queue/v1",
+  cancellationRatio: { OPTIMISTIC: "0.5", BASE: "0.1", CONSERVATIVE: "0" },
+  cancelEffectiveAfterMs: { OPTIMISTIC: 10, BASE: 50, CONSERVATIVE: 250 },
+  placedBehindSameInstantAdditions: { OPTIMISTIC: false, BASE: false, CONSERVATIVE: true },
+  basis: "ASSUMED_NOT_MEASURED_NO_PROBE_DATA_EXISTS",
+};
 
 function paperEnvironment(): Record<string, string | undefined> {
   return {
@@ -516,16 +544,53 @@ function assemble(
     readonly immediateOrderType?: string;
     /** A stated GTD expiry the venue's policy answers (the trader's own states none). */
     readonly statedExpiryNs?: bigint;
+    /**
+     * SIM1-R1-1: a TIER-1 venue on a DELAYED market (`secondsDelay`, zero
+     * latency) over the same books, with its own starting cash. The shipped
+     * trader runs Tier 0, which never delays; this is how a test reaches
+     * DELAYED through the real loop.
+     */
+    readonly tier1?: {
+      readonly secondsDelay: number;
+      readonly startingCash: string;
+      /** The VENUE's own clock, when it is not the loop's (default: the loop's). */
+      readonly venueClock?: ManualClock;
+    };
   } = {},
 ): Assembled {
   const fees = readFeeScheduleSnapshot(feeSnapshot());
   if (!fees.ok) throw new Error(`the scenario's fee snapshot was refused: ${fees.refusal.code}`);
   const wiring: VenueWiring = { trader: undefined };
   const clock = new ManualClock(T_OPEN);
-  const inner = new SimulatedVenue({
+  const books = (input.books ?? ((base: MarketBookProvider) => base))({
+    book(request): BookView | undefined {
+      const market = wiring.trader?.markets.get(request.marketId);
+      if (market === undefined) return undefined;
+      return {
+        internalMarketId: request.marketId,
+        tokenId: request.side === "YES" ? market.config.yesTokenId : market.config.noTokenId,
+        top() {
+          const top = market.bookFor(request.side).topOfBook();
+          return {
+            ...(top.bestBidPrice === undefined ? {} : { bestBidPrice: top.bestBidPrice }),
+            ...(top.bestBidSize === undefined ? {} : { bestBidSize: top.bestBidSize }),
+            ...(top.bestAskPrice === undefined ? {} : { bestAskPrice: top.bestAskPrice }),
+            ...(top.bestAskSize === undefined ? {} : { bestAskSize: top.bestAskSize }),
+            ...(top.spread === undefined ? {} : { spread: top.spread }),
+          };
+        },
+        ladder(side) {
+          return market
+            .bookFor(request.side)
+            .levels(side)
+            .map((level) => ({ price: level.price, size: level.size }));
+        },
+      };
+    },
+  });
+  const common = {
     clock,
-    runMode: "PAPER",
-    model: tier0Model({ fillModelVersion: "tier0.wp250", fillModelParametersHash: "b".repeat(64) }),
+    runMode: "PAPER" as const,
     feeSnapshot: fees.value,
     rateLimits:
       input.rateLimits ?? unmodeledRateLimits("no venue rate-limit budget is modelled in this unit test"),
@@ -533,34 +598,43 @@ function assemble(
       ...createExecutionPolicy(wiring, () => undefined),
       ...(input.statedExpiryNs === undefined ? {} : { statedExpiryNsFor: () => input.statedExpiryNs }),
     },
-    startingCash: "1000",
-    books: (input.books ?? ((base: MarketBookProvider) => base))({
-      book(request): BookView | undefined {
-        const market = wiring.trader?.markets.get(request.marketId);
-        if (market === undefined) return undefined;
-        return {
-          internalMarketId: request.marketId,
-          tokenId: request.side === "YES" ? market.config.yesTokenId : market.config.noTokenId,
-          top() {
-            const top = market.bookFor(request.side).topOfBook();
-            return {
-              ...(top.bestBidPrice === undefined ? {} : { bestBidPrice: top.bestBidPrice }),
-              ...(top.bestBidSize === undefined ? {} : { bestBidSize: top.bestBidSize }),
-              ...(top.bestAskPrice === undefined ? {} : { bestAskPrice: top.bestAskPrice }),
-              ...(top.bestAskSize === undefined ? {} : { bestAskSize: top.bestAskSize }),
-              ...(top.spread === undefined ? {} : { spread: top.spread }),
-            };
+  };
+  const tier1 = input.tier1;
+  // The venue, once built: the timeline anchors a book to the event it is at.
+  const built: { venue?: SimulatedVenue } = {};
+  const inner =
+    tier1 === undefined
+      ? new SimulatedVenue({
+          ...common,
+          model: tier0Model({ fillModelVersion: "tier0.wp250", fillModelParametersHash: "b".repeat(64) }),
+          startingCash: "1000",
+          books,
+        })
+      : new SimulatedVenue({
+          ...common,
+          clock: tier1.venueClock ?? clock,
+          model: tier1Model({ fillModelVersion: "tier1.sim1-r1", fillModelParametersHash: "c".repeat(64) }),
+          startingCash: tier1.startingCash,
+          // The loop's own books, anchored to the event the venue is at.
+          timeline: {
+            bookAt(request) {
+              const book = books.book(request);
+              const atEvent = built.venue?.atEvent;
+              return book === undefined || atEvent === undefined ? undefined : { book, atEvent };
+            },
           },
-          ladder(side) {
-            return market
-              .bookFor(request.side)
-              .levels(side)
-              .map((level) => ({ price: level.price, size: level.size }));
-          },
-        };
-      },
-    }),
-  });
+          latencyModel: ZERO_LATENCY,
+          streams: deriveStreams("250"),
+          marketParameters: () => ({
+            marketId: MARKET_ID,
+            tickSize: "0.01",
+            minimumOrderSize: "5",
+            secondsDelay: tier1.secondsDelay,
+            parametersVersion: 1,
+          }),
+          queueParameters: QUEUE_PARAMETERS,
+        });
+  built.venue = inner;
   const venue = new WrappedVenue(inner);
   const store = new MemoryTraderStore();
   const result = createPaperTrader({
@@ -1301,6 +1375,126 @@ describe("SIM-1 (O1-O4) — a remainder the venue can no longer work is terminal
     await drive(parts, 7, 8);
     expectTerminalReleasedRetiredSettled(parts, entry.simulatedOrderId, "EXPIRED", 6);
     expectNeverCountedOpenAfter(entry.simulatedOrderId, 6);
+  });
+});
+
+describe("SIM1-R1-1 — a DELAYED entry whose disposition the venue cannot APPLY is REJECTED, released, and HALTS; it never stays open", () => {
+  // A Tier-1 venue on a 5 s delayed market, zero latency: the FAK entry placed
+  // at event 5 (recorded monotonic 0) is matchable at 5 s. The venue sees only
+  // the best YES ask level (30 @ 0.34), so its already-computed disposition is
+  // 30 filled, the rest cancelled.
+  const DELAY_S = 5;
+  const MATCHABLE_NS = 5_000_000_000n;
+
+  it("a venue balance the fill accounting cannot carry: REJECTED 0/50 at matchableAtNs, every entry released, a GLOBAL VENUE_OBSERVATION_FAILED halt, nothing counted open", async () => {
+    const clip: Clip = { apply: (side, ladderSide, levels) => (side === "YES" && ladderSide === "ASK" ? levels.slice(0, 1) : levels) };
+    // A canonical 1,024-character balance: 30 × 0.34 = 10.2 plus a fractional
+    // fee makes the post-fill balance longer than the decimal package's
+    // 1,024-character limit, so the venue's fill accounting refuses.
+    const parts = assemble({ books: clipped(clip), tier1: { secondsDelay: DELAY_S, startingCash: "9".repeat(1024) } });
+    await drive(parts, 1, 5);
+    const { entry } = ordersByRole(parts);
+    expect(`${entry.state} ${entry.filledShares}/${entry.requestedShares}`).toBe("DELAYED 0/50");
+    const loop = parts.trader.loop;
+    // WORKING inside the window: the entry's 50 × 0.35 = 17.5 stays reserved.
+    expect(loop.timeInForceFor(entry.plannedOrderId)).toBe("FAK");
+    expect(loop.health().seams.reservations).toMatchObject({ open: 1, taken: 1, released: 0, reservedCollateral: "17.5" });
+    expect(loop.health().seams.allocator).toMatchObject({ open: 1, applied: 1, released: 0, reservedCollateral: "17.5" });
+    expect(loop.health().halts).toEqual([]);
+
+    // The recorded clock reaches matchableAtNs; the next event's observe()
+    // resolves the entry — and its fill accounting fails.
+    parts.clock.positionAt("2026-05-01T09:00:03.000Z", MATCHABLE_NS);
+    await drive(parts, 6, 6);
+    clip.apply = undefined;
+    const resolved = parts.venue.inner.ordersSnapshot().find((order) => order.simulatedOrderId === entry.simulatedOrderId);
+    expect(`${String(resolved?.state)} ${String(resolved?.filledShares)}/50`).toBe("REJECTED 0/50");
+    expect(parts.venue.inner.fills).toEqual([]);
+    expect((await parts.venue.inner.queryAccountState()).openOrders).toEqual([]);
+
+    // The failure is not silent: the loop read observe()'s answer and halted.
+    const halts = loop.health().halts;
+    expect(halts.map((halt) => `${halt.scope.kind} ${halt.code} ${halt.action}`)).toEqual([
+      "GLOBAL VENUE_OBSERVATION_FAILED RECONCILE_ACCOUNT",
+    ]);
+    expect(halts[0]?.detail).toContain("SIMULATED_VENUE_DISPOSITION_NOT_APPLIED");
+    expect(halts[0]?.detail).toContain(entry.simulatedOrderId);
+
+    // The capital path is not halted: released at the harvest that saw it
+    // REJECTED — reservation, allocator commitment and time-in-force.
+    expect(loop.timeInForceFor(entry.plannedOrderId)).toBeUndefined();
+    expect(loop.health().seams.reservations).toMatchObject({ open: 0, taken: 1, released: 1, reservedCollateral: "0" });
+    expect(loop.health().seams.allocator).toMatchObject({ open: 0, applied: 1, released: 1, reservedCollateral: "0" });
+    // Its terminal view is SUPPRESSED by the halt (not an evaluation), so it
+    // is retired only after an operator releases the halt — the halt rule for
+    // every order (R1); it is never delivered as DELAYED again.
+    expect(loop.health().loop.deliveriesSuppressedByHalt).toBeGreaterThanOrEqual(1);
+    expect(deliveriesOf(parts, entry.simulatedOrderId).map((delivery) => `${String(delivery.event)} ${String(delivery.orderStatus)}`)).toEqual([
+      "5 OPEN",
+    ]);
+
+    await drive(parts, 7, 8);
+    // Nothing re-opened, nothing reached risk while halted, and the venue
+    // lists no open order.
+    expect(loop.health().seams.reservations).toMatchObject({ open: 0, reservedCollateral: "0" });
+    expect(riskInputs.calls.filter((call) => call.event >= 6)).toEqual([]);
+    expect((await parts.venue.inner.queryAccountState()).openOrders).toEqual([]);
+  });
+
+  it("reached first by a TRADE (the venue's clock lags the loop's): observeTrade()'s answer halts the same way", async () => {
+    const clip: Clip = { apply: (side, ladderSide, levels) => (side === "YES" && ladderSide === "ASK" ? levels.slice(0, 1) : levels) };
+    // The venue's own clock stays at recorded 0, so observe() never reaches
+    // matchableAtNs; the loop hands observeTrade() ITS clock's instant.
+    const venueClock = new ManualClock(T_OPEN);
+    const parts = assemble({
+      books: clipped(clip),
+      tier1: { secondsDelay: DELAY_S, startingCash: "9".repeat(1024), venueClock },
+    });
+    await drive(parts, 1, 5);
+    const { entry } = ordersByRole(parts);
+    expect(entry.state).toBe("DELAYED");
+    parts.clock.positionAt("2026-05-01T09:00:03.000Z", MATCHABLE_NS);
+    await drive(parts, 6, 6);
+    // observe() at the venue's clock (0): still pending, nothing said.
+    expect(parts.venue.inner.ordersSnapshot().find((order) => order.simulatedOrderId === entry.simulatedOrderId)?.state).toBe("DELAYED");
+    expect(parts.trader.loop.health().halts).toEqual([]);
+    await driveOne(
+      parts,
+      ingested(
+        {
+          eventType: "PublicTradeObserved",
+          payload: { internalMarketId: MARKET_ID, tokenId: YES_TOKEN, price: "0.32", size: "5", takerSide: "ASK" },
+          receivedAt: "2026-05-01T09:00:04.000Z",
+        },
+        7,
+      ),
+      7,
+    );
+    clip.apply = undefined;
+    const resolved = parts.venue.inner.ordersSnapshot().find((order) => order.simulatedOrderId === entry.simulatedOrderId);
+    expect(`${String(resolved?.state)} ${String(resolved?.filledShares)}/50`).toBe("REJECTED 0/50");
+    const halts = parts.trader.loop.health().halts;
+    expect(halts.map((halt) => `${halt.scope.kind} ${halt.code}`)).toEqual(["GLOBAL VENUE_OBSERVATION_FAILED"]);
+    expect(halts[0]?.detail).toContain("observeTrade refused: SIMULATED_VENUE_DISPOSITION_NOT_APPLIED");
+    expect(parts.trader.loop.timeInForceFor(entry.plannedOrderId)).toBeUndefined();
+    expect(parts.trader.loop.health().seams.reservations).toMatchObject({ open: 0, released: 1, reservedCollateral: "0" });
+  });
+
+  it("the control: the same DELAYED entry with an ordinary balance resolves CANCELLED 30/50 at matchableAtNs — released, retired, settled, and nothing halts", async () => {
+    const clip: Clip = { apply: (side, ladderSide, levels) => (side === "YES" && ladderSide === "ASK" ? levels.slice(0, 1) : levels) };
+    const parts = assemble({ books: clipped(clip), tier1: { secondsDelay: DELAY_S, startingCash: "1000" } });
+    await drive(parts, 1, 5);
+    const { entry } = ordersByRole(parts);
+    expect(`${entry.state} ${entry.filledShares}/${entry.requestedShares}`).toBe("DELAYED 0/50");
+    parts.clock.positionAt("2026-05-01T09:00:03.000Z", MATCHABLE_NS);
+    await drive(parts, 6, 6);
+    clip.apply = undefined;
+    const resolved = parts.venue.inner.ordersSnapshot().find((order) => order.simulatedOrderId === entry.simulatedOrderId);
+    expect(`${String(resolved?.state)} ${String(resolved?.filledShares)}/50`).toBe("CANCELLED 30/50");
+    expect(parts.trader.loop.health().halts).toEqual([]);
+    await drive(parts, 7, 8);
+    expectTerminalReleasedRetiredSettled(parts, entry.simulatedOrderId, "CANCELED", 6);
+    expect(parts.trader.loop.health().halts).toEqual([]);
   });
 });
 

@@ -91,6 +91,15 @@ export const SIMULATION_REFUSAL_CODES = [
    * Nothing was booked for it.
    */
   "SIMULATED_VENUE_ORDER_NOT_SUBMITTED",
+  /**
+   * A DELAYED order's already-computed disposition could not be applied when
+   * the recorded clock reached `matchableAtNs` (SIM-1 r1, `SIM1-R1-1`). The
+   * order is REJECTED with nothing filled and nothing booked — venue report
+   * D-18: an order whose checks fail when the delay expires "is rejected
+   * instead of matching" — and this refusal is how the venue reports that it
+   * could not do what its model says happened.
+   */
+  "SIMULATED_VENUE_DISPOSITION_NOT_APPLIED",
   /** A cancel names an order this venue never accepted. */
   "SIMULATED_VENUE_UNKNOWN_ORDER",
   /**

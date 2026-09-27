@@ -13,6 +13,10 @@
  *   until `matchableAtNs` (O5); a market-scoped cancel targets LIVE orders only
  *   (O6); REJECTED is not cancellable (O7); a cancel re-stamps `atEvent` (O8);
  *   and a throw while resting an order leaves no orphan resting record (O10).
+ * - SIM-1 r1 (`SIM1-R1-1`): a DELAYED disposition the venue cannot APPLY at
+ *   `matchableAtNs` leaves its order REJECTED with nothing booked — never
+ *   DELAYED for ever — and the next `observe()` / `observeTrade()` reports it,
+ *   once, as `SIMULATED_VENUE_DISPOSITION_NOT_APPLIED`.
  *
  * Every economic value asserted here is derived in the comment beside it.
  * PAPER/BACKTEST only: no network, credential, signer or real order.
@@ -688,6 +692,132 @@ describe("O5 — a DELAYED order is pending until matchableAtNs, then takes its 
     advance(clock, 5);
     venue.observe(event(2));
     expect(states(venue)).toEqual(["fak FILLED 20/20"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SIM1-R1-1 — a DELAYED disposition that cannot be APPLIED
+// ---------------------------------------------------------------------------
+
+describe("SIM1-R1-1 — a DELAYED disposition the venue cannot APPLY is REJECTED once, reported, and never left DELAYED", () => {
+  // The verifier's reproduction. A canonical 1,024-character starting balance
+  // is accepted, and the FAK's 30 × 0.5 = 15 plus its 0.525 taker fee makes
+  // the balance 1,028 characters long — past the decimal package's 1,024
+  // limit — so the fill accounting REFUSES at `matchableAtNs`. Before this
+  // round the pending entry was deleted before that commit: the order stayed
+  // DELAYED for ever, every cancel was refused "inside the window", and it
+  // stayed an open order.
+  const HUGE = "9".repeat(1024);
+  const FAK = policy({ timeInForceFor: () => "FAK" });
+
+  it("observe() at matchableAtNs: REJECTED 0/50, nothing booked, the failure answered ONCE, then cancel says 'already REJECTED'", async () => {
+    const { venue, clock } = tier1(5, { startingCash: HUGE, policy: FAK });
+    const submitted = await venue.submit(plan([order("dead", { shares: "50" })]));
+    expect(submitted.outcome).toBe("ACCEPTED");
+    expect(states(venue)).toEqual(["dead DELAYED 0/50"]);
+
+    advance(clock, 5);
+    const first = venue.observe(event(2));
+    expect(first.ok).toBe(false);
+    if (first.ok) return;
+    expect(first.refusal.code).toBe("SIMULATED_VENUE_DISPOSITION_NOT_APPLIED");
+    expect(first.refusal.details).toMatchObject({
+      simulatedOrderIds: "dead",
+      marketIds: MARKET_A,
+      causes: "SIMULATION_INTERNAL",
+    });
+    expect(first.refusal.message).toContain("DecimalInexactError");
+    // The venue WAS positioned, and the order has its final answer, stamped
+    // with the event it was decided at.
+    expect(venue.atEvent).toEqual(event(2));
+    expect(states(venue)).toEqual(["dead REJECTED 0/50"]);
+    expect(venue.ordersSnapshot()[0]?.atEvent).toEqual(event(2));
+    // All-or-nothing: no fill, no cash, no position, no resting band.
+    expect(venue.fills).toEqual([]);
+    expect(venue.restingBands()).toEqual([]);
+    const account = await venue.queryAccountState();
+    expect(account.cashBalance).toBe(HUGE);
+    expect(account.positions).toEqual([]);
+    expect(account.openOrders).toEqual([]);
+
+    // Reported once: the next positioning is clean, and nothing moved.
+    advance(clock, 6);
+    expect(venue.observe(event(3)).ok).toBe(true);
+    expect(states(venue)).toEqual(["dead REJECTED 0/50"]);
+
+    // Terminal, not "inside the delay window": every cancel path says so.
+    const byId = await venue.cancel({ executionPlanId: "c1", reason: "r", scope: { orderIds: ["dead"] }, priority: "SAFETY_CANCEL" });
+    expect(byId.notCancelled).toEqual([{ simulatedOrderId: "dead", reason: "already REJECTED" }]);
+    const asPlan = await venue.submit(cancelPlan({ orderIds: ["dead"] }));
+    expect(asPlan.notCancelled).toEqual([{ simulatedOrderId: "dead", reason: "already REJECTED" }]);
+    // By market scope it is not a target at all: a successful no-op.
+    const byMarket = await venue.cancel({ executionPlanId: "c2", reason: "r", scope: { marketId: MARKET_A }, priority: "SAFETY_CANCEL" });
+    expect(byMarket).toMatchObject({ cancelled: [], notCancelled: [] });
+    expect(states(venue)).toEqual(["dead REJECTED 0/50"]);
+  });
+
+  it("one order's failure does not stop the sweep: a later DELAYED GTC due at the same instant still RESTS", async () => {
+    const { venue, clock } = tier1(5, {
+      startingCash: HUGE,
+      policy: policy({ timeInForceFor: (planned) => (planned.plannedOrderId === "a-dead" ? "FAK" : "GTC") }),
+    });
+    // "a-dead" sorts first and fails; "b-gtc" at 0.45 crosses nothing, so its
+    // disposition books no fill and RESTS.
+    await venue.submit(plan([order("a-dead", { shares: "50" }), order("b-gtc", { shares: "50", limitPrice: "0.45" })]));
+    expect(states(venue)).toEqual(["a-dead DELAYED 0/50", "b-gtc DELAYED 0/50"]);
+    advance(clock, 5);
+    const resolved = venue.observe(event(2));
+    expect(resolved.ok).toBe(false);
+    if (resolved.ok) return;
+    expect(resolved.refusal.details).toMatchObject({ simulatedOrderIds: "a-dead" });
+    expect(states(venue)).toEqual(["a-dead REJECTED 0/50", "b-gtc RESTING 0/50"]);
+    expect(venue.restingBands().map((band) => band.simulatedOrderId)).toEqual(["b-gtc"]);
+    expect((await venue.queryAccountState()).openOrders.map((open) => open.simulatedOrderId)).toEqual(["b-gtc"]);
+  });
+
+  it("observeTrade() at matchableAtNs reports it too — after walking the trade — and only once", async () => {
+    const { venue } = tier1(5, {
+      startingCash: HUGE,
+      policy: policy({ timeInForceFor: (planned) => (planned.plannedOrderId === "dead" ? "FAK" : "GTC") }),
+    });
+    await venue.submit(plan([order("dead", { shares: "50" }), order("gtc", { shares: "50", limitPrice: "0.45" })]));
+    const traded = venue.observeTrade({ marketId: MARKET_A, side: "YES", price: "0.45", shares: "5", monotonicNs: START_NS + 5n * SECOND_NS, atEvent: event(2) });
+    expect(traded.ok).toBe(false);
+    if (traded.ok) return;
+    expect(traded.refusal.code).toBe("SIMULATED_VENUE_DISPOSITION_NOT_APPLIED");
+    expect(traded.refusal.details).toMatchObject({ simulatedOrderIds: "dead" });
+    expect(states(venue)).toEqual(["dead REJECTED 0/50", "gtc RESTING 0/50"]);
+    expect(venue.ordersSnapshot()[0]?.atEvent).toEqual(event(2));
+    // The trade WAS walked: "gtc" came to rest at this instant with nothing
+    // ahead of it at 0.45, so the optimistic arm of its band holds the 5
+    // shares that printed there.
+    expect(venue.restingBands().map((band) => `${band.simulatedOrderId} ${band.optimistic.filledShares}`)).toEqual(["gtc 5"]);
+    const again = venue.observeTrade({ marketId: MARKET_A, side: "YES", price: "0.45", shares: "5", monotonicNs: START_NS + 6n * SECOND_NS, atEvent: event(3) });
+    expect(again.ok).toBe(true);
+  });
+
+  it("a cancel's OWN sweep finds it: the order is 'already REJECTED' at once, and the next observe() reports the failure", async () => {
+    const { venue, clock } = tier1(5, { startingCash: HUGE, policy: FAK });
+    await venue.submit(plan([order("dead", { shares: "50" })]));
+    advance(clock, 5);
+    // No observe() yet: the cancel is the first door to reach matchableAtNs.
+    const byId = await venue.cancel({ executionPlanId: "c1", reason: "r", scope: { orderIds: ["dead"] }, priority: "SAFETY_CANCEL" });
+    expect(byId.notCancelled).toEqual([{ simulatedOrderId: "dead", reason: "already REJECTED" }]);
+    expect(states(venue)).toEqual(["dead REJECTED 0/50"]);
+    const next = venue.observe(event(2));
+    expect(next.ok).toBe(false);
+    if (next.ok) return;
+    expect(next.refusal.code).toBe("SIMULATED_VENUE_DISPOSITION_NOT_APPLIED");
+    expect(next.refusal.details).toMatchObject({ simulatedOrderIds: "dead" });
+    expect(venue.observe(event(3)).ok).toBe(true);
+  });
+
+  it("the control: the same order with an ordinary balance resolves CANCELLED 30/50 and observe() answers ok", async () => {
+    const { venue, clock } = tier1(5, { policy: FAK });
+    await venue.submit(plan([order("fak", { shares: "50" })]));
+    advance(clock, 5);
+    expect(venue.observe(event(2)).ok).toBe(true);
+    expect(states(venue)).toEqual(["fak CANCELLED 30/50"]);
   });
 });
 

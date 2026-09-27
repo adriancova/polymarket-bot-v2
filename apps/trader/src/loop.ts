@@ -165,6 +165,13 @@ import type { Ledger } from "@polymarket-bot/ledger";
  * owns the first and releases the second (`#releaseRefusedPlacement`); an
  * order the venue holds that its answer did not list is the defensive
  * reconciliation path there.
+ *
+ * `observe` and `observeTrade` ANSWER, and the loop reads the answer (SIM-1
+ * r1, `SIM1-R1-1`): a venue that could not be positioned at a recorded event,
+ * or could not apply what recorded time settled — a DELAYED order's
+ * disposition — says so with `ok: false` and a `refusal`, and the loop halts
+ * (`#haltOnVenueObservation`). The refusal is optional in the type so a venue
+ * that has nothing to say beyond `ok` still satisfies the port.
  */
 export interface TraderVenue {
   observe(identity: {
@@ -172,7 +179,7 @@ export interface TraderVenue {
     readonly ingestSeq: string;
     readonly receivedAt: string;
     readonly datasetRowOrdinal: number;
-  }): { readonly ok: boolean };
+  }): { readonly ok: boolean; readonly refusal?: VenueObservationRefusal };
   observeTrade(input: {
     readonly marketId: string;
     readonly side: "YES" | "NO";
@@ -185,11 +192,28 @@ export interface TraderVenue {
       readonly receivedAt: string;
       readonly datasetRowOrdinal: number;
     };
-  }): { readonly ok: boolean; readonly value?: { readonly fills: readonly SimulatedFill[] } };
+  }): {
+    readonly ok: boolean;
+    readonly value?: { readonly fills: readonly SimulatedFill[] };
+    readonly refusal?: VenueObservationRefusal;
+  };
   submit(plan: unknown): Promise<ExecutionResult>;
   ordersSnapshot(): readonly SimulatedOrder[];
   readonly fills: readonly SimulatedFill[];
 }
+
+/** What a venue says when `observe` / `observeTrade` could not do what it was asked. */
+export interface VenueObservationRefusal {
+  readonly code: string;
+  readonly message: string;
+}
+
+/**
+ * The venue's refusal code for a DELAYED disposition it could not apply at
+ * `matchableAtNs` (`packages/simulation`, SIM-1 r1). Named here as the one
+ * `observeTrade` refusal the loop halts on; see `#haltOnVenueObservation`.
+ */
+const DISPOSITION_NOT_APPLIED = "SIMULATED_VENUE_DISPOSITION_NOT_APPLIED";
 
 export interface CoreLoopOptions {
   readonly config: TraderConfig;
@@ -681,8 +705,12 @@ export class CoreLoop {
     this.#options.health.countLoop("eventsProcessed");
 
     // The venue is positioned at the recorded event before anything it produces
-    // can be anchored (§6 invariant 15: no future venue timestamp).
-    this.#options.venue.observe(event.identity);
+    // can be anchored (§6 invariant 15: no future venue timestamp). Its answer
+    // is READ (SIM-1 r1, `SIM1-R1-1`): it used to be dropped, so a DELAYED
+    // order the venue could not resolve stayed open — its reservation,
+    // allocator commitment and time-in-force held — with nothing said.
+    const positioned = this.#options.venue.observe(event.identity);
+    if (!positioned.ok) this.#haltOnVenueObservation("observe", positioned.refusal, instant.instant);
 
     // --- step 2: update local market/account state -------------------------
     //
@@ -754,6 +782,37 @@ export class CoreLoop {
 
     // --- persist decisions and checkpoints (§4.2 halts on a store failure) --
     await this.#flushOutbox();
+  }
+
+  /**
+   * SIM-1 r1 (`SIM1-R1-1`): the venue could not do what recorded time asked of
+   * it — `observe` refused to position it, or a DELAYED order's disposition
+   * could not be applied — so the process HALTS, GLOBAL, `VENUE_OBSERVATION_FAILED`
+   * (§9.9 `RECONCILE_ACCOUNT`: the venue's account no longer answers for what
+   * its model says happened). GLOBAL because the venue is ONE account: cash
+   * every market draws on is exactly what a failed fill accounting could not
+   * book.
+   *
+   * What the halt does NOT stop is the capital path. The venue reports such a
+   * DELAYED order REJECTED with nothing booked, and `#deliverOrderViews`
+   * releases a terminal order's reservation, allocator commitment and
+   * time-in-force BEFORE its halt gate, so they come back at this event's
+   * harvest; the view itself is suppressed — not an evaluation — and the order
+   * is retired after the halt is released, as for every halt (R1).
+   */
+  #haltOnVenueObservation(
+    door: "observe" | "observeTrade",
+    refusal: VenueObservationRefusal | undefined,
+    instant: string,
+  ): void {
+    this.#options.halts.halt(
+      { kind: "GLOBAL" },
+      "VENUE_OBSERVATION_FAILED",
+      refusal === undefined
+        ? `the venue's ${door} answered ok: false with no refusal`
+        : `the venue's ${door} refused: ${refusal.code}: ${refusal.message}`,
+      instant,
+    );
   }
 
   /**
@@ -847,7 +906,7 @@ export class CoreLoop {
         // WP-210 follow-up 1: the simulated venue's resting orders fill from
         // OBSERVED trades, and this is where the normalized stream reaches them.
         // Without this wiring a resting order would never fill in a paper run.
-        this.#options.venue.observeTrade({
+        const traded = this.#options.venue.observeTrade({
           marketId: market.config.marketId,
           side: tokenId === market.config.yesTokenId ? "YES" : "NO",
           price,
@@ -855,6 +914,13 @@ export class CoreLoop {
           monotonicNs: this.#options.clock.monotonicNs(),
           atEvent: event.identity,
         });
+        // SIM-1 r1: the one refusal read here is a DELAYED disposition the
+        // venue could not apply at this trade's instant — the same failure
+        // `observe()` reports, reached first by the trade. Every OTHER
+        // `observeTrade` refusal is still unread (`VS-20`, not this package).
+        if (!traded.ok && traded.refusal?.code === DISPOSITION_NOT_APPLIED) {
+          this.#haltOnVenueObservation("observeTrade", traded.refusal, instant);
+        }
         return { kind: "onFeatures" };
       }
       case "DataQualityIncidentOpened": {
