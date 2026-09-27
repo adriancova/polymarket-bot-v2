@@ -130,6 +130,9 @@ integration 10 / 113 (Docker); storage-postgres integration 14 / 215.
 5. **`RISK2-R4`** — the reconciler's FIFO fold relies on array order, not on
    `atEventIngestSeq`. Vacuous today (`openCostBasis` is exactly `"0"`); a partial
    exit would make `pnl.capital_committed` order-dependent.
+   *(Items 4 and 5 CLOSED 2026-09-26 by `RECON-1`, merged `de58d83`; record
+   `docs/handoffs/RECON-1.md`. That round also found the fold was FIFO while
+   `packages/pnl` is average cost, and aligned it.)*
 6. **`RISK2-R6`** — the golden's take-profit is cancelled and never re-emitted
    (the scenario delivers no further `onFeatures` before the exit cutoff), so
    **the repository still has no evidence that a take-profit can FILL.** A
