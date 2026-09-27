@@ -94,7 +94,7 @@ only on these values and the wall clock never regresses
   safety cancel (`seq=6`) when the second fill arrives and the exit is
   re-sized. It never fills — `RISK-2` residual `RISK2-R6`, unchanged: the
   repository still has no evidence a take-profit can FILL.
-- **Cutoff reduce** (`seq=9`, `reduce`, `SB.FINAL_PROTECTED_REDUCE`): sells
+- **Cutoff reduce** (`seq=8`, `reduce`, `SB.FINAL_PROTECTED_REDUCE`): sells
   all 50 into the `0.32` bid at limit `0.3`; fee `50 × 0.0195 × 0.32 × 0.68 =
   0.2121 → 0.212`.
 - **Realized**: `16 − 17.2 = −1.2`; fees `0.131 + 0.089 + 0.212 = 0.432`;
@@ -102,14 +102,15 @@ only on these values and the wall clock never regresses
   `−1.632`); `capitalCommitted 0`; no `OUTCOME_TOKEN` position remains.
 - **Risk**: 4 evaluations, 4 approvals, 0 refusals, 0 refused exits —
   `RISK-2`'s B2 fix, observed through the replay root.
-- **Counts**: 18 decisions persisted (one per callback), 4 plans, 4 accepted
+- **Counts**: 12 decisions persisted (one per callback), 4 plans, 4 accepted
   submissions, 3 fills, 1 cancel confirmed, 9 ledger transactions, 12 PnL
-  records, 3 PnL snapshots; `halts=[]`, `healthy=true`.
+  records, 3 PnL snapshots; `halts=[]`, `healthy=true`. (18 decisions before
+  `TRDR-4` — see "How `expected-artifact.txt` was produced" below.)
 
 ## Residual 5 (`docs/handoffs/RISK-2.md`), observed here and pinned
 
-`seq=10` (`onFill`, the reduction's own fill): `SB.UNATTRIBUTED_FILL →
-SB.POSITION_MISMATCH → SB.NO_BLIND_FLATTEN → SB.PAUSED`; `seq=14`
+`seq=9` (`onFill`, the reduction's own fill): `SB.UNATTRIBUTED_FILL →
+SB.POSITION_MISMATCH → SB.NO_BLIND_FLATTEN → SB.PAUSED`; `seq=11`
 (`onMarketClosing`): `SB.RESUMED, …, SB.PAUSED` again. The pause is the
 strategy's own state — the runtime's `instanceStatus()` stays `ACTIVE` — and
 the ledger is clean (`unattributedActivity 0`, `unexplainedMovements 0`). The
@@ -131,6 +132,22 @@ id from `DeterministicIdFactory` under the namespace
 content address). If a change moves these bytes, re-derive the economics the
 same way and re-capture; do not paste an output whose numbers you have not
 checked.
+
+**Re-captured by `TRDR-4` (2026-09-26), the same way** (a scratch probe calling
+`renderArtifact(await replayThroughShippedRoot({ withCore: true }))` twice,
+byte-equal, written once), because the user's ruling R1 changed the core
+loop's delivery rule: a TERMINAL order's view is delivered through
+`onOrderUpdate` until one delivery has been EVALUATED, and then the order is
+retired — it is no longer re-delivered on every later harvest. The six
+decisions that were those re-deliveries (old `seq=7, 11, 12, 15, 16, 17`, every
+one an `onOrderUpdate` `hold` with reason `SB.IDLE` and no intent) are gone;
+the later decisions renumber (the reduce `9 → 8`, its fill's `onFill` `10 → 9`,
+the reduce order's own terminal view `13 → 10`, `onMarketClosing` `14 → 11`),
+and so do the reduce trace's `evaluationSeq`, the health line's `evaluations`
+and `decisionsPersisted` and the store line's `decisions` and `checkpoints`
+(`18 → 12`). Every order, fill, economics, ledger and PnL line is
+byte-identical — proven line by line, with the removed decisions identified
+by the order each delivered, in the round's handoff.
 
 ## Relationship to the other goldens
 

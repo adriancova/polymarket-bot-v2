@@ -8,15 +8,9 @@
     "2026-05-01T09:00:02Z",
     "2026-05-01T09:00:03Z",
     "2026-05-01T09:00:03Z",
-    "2026-05-01T09:00:03Z",
     "2026-05-01T09:14:49Z",
     "2026-05-01T09:14:49Z",
     "2026-05-01T09:14:49Z",
-    "2026-05-01T09:14:49Z",
-    "2026-05-01T09:14:49Z",
-    "2026-05-01T09:14:50Z",
-    "2026-05-01T09:14:50Z",
-    "2026-05-01T09:14:50Z",
     "2026-05-01T09:14:50Z"
   ],
   "decisions": [
@@ -211,23 +205,6 @@
       "marketId": "018f5c20-1000-7a10-8b00-000000000001",
       "modelOutputs": {},
       "reasonCodes": [
-        "SB.IDLE"
-      ],
-      "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
-    },
-    {
-      "attribution": "STRATEGY",
-      "callback": "onOrderUpdate",
-      "decisionType": "hold",
-      "evaluatedAt": "2026-05-01T09:00:03Z",
-      "evaluationSeq": 8,
-      "featureSnapshotRef": "83890e801124ec1753f04f43c4ecc0d2377ac2ba6e569de8b6a7436458cce683",
-      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
-      "intents": [],
-      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
-      "modelOutputs": {},
-      "reasonCodes": [
         "SB.EXIT_ORDER_WORKING",
         "SB.EXIT_ORDER_TERMINAL"
       ],
@@ -239,7 +216,7 @@
       "callback": "onFeatures",
       "decisionType": "reduce",
       "evaluatedAt": "2026-05-01T09:14:49Z",
-      "evaluationSeq": 9,
+      "evaluationSeq": 8,
       "featureSnapshotRef": "d41741be3c424fcef584a99af1fab1285410bd25c5b845ee331590cae3adcb33",
       "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
       "intents": [
@@ -281,7 +258,7 @@
       "callback": "onFill",
       "decisionType": "hold",
       "evaluatedAt": "2026-05-01T09:14:49Z",
-      "evaluationSeq": 10,
+      "evaluationSeq": 9,
       "featureSnapshotRef": "d41741be3c424fcef584a99af1fab1285410bd25c5b845ee331590cae3adcb33",
       "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
       "intents": [],
@@ -304,41 +281,7 @@
       "callback": "onOrderUpdate",
       "decisionType": "hold",
       "evaluatedAt": "2026-05-01T09:14:49Z",
-      "evaluationSeq": 11,
-      "featureSnapshotRef": "d41741be3c424fcef584a99af1fab1285410bd25c5b845ee331590cae3adcb33",
-      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
-      "intents": [],
-      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
-      "modelOutputs": {},
-      "reasonCodes": [
-        "SB.IDLE"
-      ],
-      "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
-    },
-    {
-      "attribution": "STRATEGY",
-      "callback": "onOrderUpdate",
-      "decisionType": "hold",
-      "evaluatedAt": "2026-05-01T09:14:49Z",
-      "evaluationSeq": 12,
-      "featureSnapshotRef": "d41741be3c424fcef584a99af1fab1285410bd25c5b845ee331590cae3adcb33",
-      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
-      "intents": [],
-      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
-      "modelOutputs": {},
-      "reasonCodes": [
-        "SB.IDLE"
-      ],
-      "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
-    },
-    {
-      "attribution": "STRATEGY",
-      "callback": "onOrderUpdate",
-      "decisionType": "hold",
-      "evaluatedAt": "2026-05-01T09:14:49Z",
-      "evaluationSeq": 13,
+      "evaluationSeq": 10,
       "featureSnapshotRef": "d41741be3c424fcef584a99af1fab1285410bd25c5b845ee331590cae3adcb33",
       "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
       "intents": [],
@@ -355,7 +298,7 @@
       "callback": "onMarketClosing",
       "decisionType": "hold",
       "evaluatedAt": "2026-05-01T09:14:50Z",
-      "evaluationSeq": 14,
+      "evaluationSeq": 11,
       "featureSnapshotRef": "eba016864cc0a02898113787aa20874b505840244ec85d32162af7aee0eeb35d",
       "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
       "intents": [],
@@ -374,57 +317,6 @@
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
       "sourceEventId": "018f5c20-9000-7a90-8b00-000000000008"
-    },
-    {
-      "attribution": "STRATEGY",
-      "callback": "onOrderUpdate",
-      "decisionType": "hold",
-      "evaluatedAt": "2026-05-01T09:14:50Z",
-      "evaluationSeq": 15,
-      "featureSnapshotRef": "eba016864cc0a02898113787aa20874b505840244ec85d32162af7aee0eeb35d",
-      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
-      "intents": [],
-      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
-      "modelOutputs": {},
-      "reasonCodes": [
-        "SB.IDLE"
-      ],
-      "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
-    },
-    {
-      "attribution": "STRATEGY",
-      "callback": "onOrderUpdate",
-      "decisionType": "hold",
-      "evaluatedAt": "2026-05-01T09:14:50Z",
-      "evaluationSeq": 16,
-      "featureSnapshotRef": "eba016864cc0a02898113787aa20874b505840244ec85d32162af7aee0eeb35d",
-      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
-      "intents": [],
-      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
-      "modelOutputs": {},
-      "reasonCodes": [
-        "SB.IDLE"
-      ],
-      "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
-    },
-    {
-      "attribution": "STRATEGY",
-      "callback": "onOrderUpdate",
-      "decisionType": "hold",
-      "evaluatedAt": "2026-05-01T09:14:50Z",
-      "evaluationSeq": 17,
-      "featureSnapshotRef": "eba016864cc0a02898113787aa20874b505840244ec85d32162af7aee0eeb35d",
-      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
-      "intents": [],
-      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
-      "modelOutputs": {},
-      "reasonCodes": [
-        "SB.IDLE"
-      ],
-      "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "sourceEventId": null
     }
   ],
   "events": [
@@ -549,7 +441,7 @@
       "tokenId": "9001"
     }
   ],
-  "goldenFormatVersion": 2,
+  "goldenFormatVersion": 3,
   "health": {
     "accounting": {
       "ledgerRefusals": 0,
@@ -582,14 +474,14 @@
     "healthy": true,
     "loop": {
       "containedEvaluations": 0,
-      "decisionsPersisted": 18,
+      "decisionsPersisted": 12,
       "deliveriesSuppressedByHalt": 0,
-      "evaluations": 18,
+      "evaluations": 12,
       "eventsAccepted": 8,
       "eventsProcessed": 8,
       "eventsRefused": 0,
       "featureProjectionRefusals": 0,
-      "featureSnapshots": 18,
+      "featureSnapshots": 12,
       "refusedEvaluations": 0,
       "snapshotsUnavailable": 3
     },
@@ -627,15 +519,42 @@
         "remembered": 3
       },
       "orderViews": {
-        "emitted": 10,
-        "repeats": 6,
-        "tracked": 3
+        "emitted": 4,
+        "repeats": 0,
+        "tracked": 0
+      },
+      "orders": {
+        "lateFillsAfterSettlement": 0,
+        "maximumTombstones": 100000,
+        "settleMismatches": 0,
+        "settled": 3,
+        "tombstoneEvictions": 0,
+        "tombstones": 3,
+        "tracked": 0,
+        "unownedFills": 0
       },
       "reservations": {
         "open": 0,
         "released": 3,
         "reservedCollateral": "0",
         "taken": 3
+      },
+      "retention": {
+        "decisions": {
+          "evicted": 0,
+          "maximumRetained": 100000,
+          "retained": 12
+        },
+        "provenance": {
+          "evicted": 0,
+          "maximumRetained": 50000,
+          "retained": 3
+        },
+        "traces": {
+          "evicted": 0,
+          "maximumRetained": 50000,
+          "retained": 3
+        }
       }
     }
   },
@@ -1194,7 +1113,7 @@
     },
     {
       "approvedIntentId": "9280f970-9280-7000-8000-000000012000",
-      "evaluationSeq": 9,
+      "evaluationSeq": 8,
       "executionPlanId": "9280f970-9280-7000-8000-000000013000",
       "featureSnapshotRef": "d41741be3c424fcef584a99af1fab1285410bd25c5b845ee331590cae3adcb33",
       "intentId": "sb-protected-reduce-2-018f5c20-1000-7a10-8b00-000000000001",
@@ -1852,7 +1771,7 @@
     },
     {
       "approvedIntentId": "9280f970-9280-7000-8000-000000012000",
-      "evaluationSeq": 9,
+      "evaluationSeq": 8,
       "executionPlanId": "9280f970-9280-7000-8000-000000013000",
       "featureSnapshotRef": "d41741be3c424fcef584a99af1fab1285410bd25c5b845ee331590cae3adcb33",
       "intentId": "sb-protected-reduce-2-018f5c20-1000-7a10-8b00-000000000001",

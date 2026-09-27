@@ -236,8 +236,10 @@ describe("residual 5 — the instance ends PAUSED after its own exit fills (repo
     expect(codes).toContain("SB.NO_BLIND_FLATTEN");
     expect(codes).toContain("SB.PAUSED");
     // The LAST decision the strategy itself reasoned about (the onMarketClosing
-    // callback) still carries the pause; the trailing onOrderUpdate holds are
-    // SB.IDLE deliveries to a paused machine.
+    // callback) still carries the pause. (`TRDR-4`: the SB.IDLE onOrderUpdate
+    // holds that used to trail it were re-deliveries of already-evaluated
+    // terminal views; under R1 a terminal view is delivered until one delivery
+    // is evaluated, so onMarketClosing is now the run's last decision.)
     const closing = decisions.find((decision) => decision.callback === "onMarketClosing");
     expect(closing?.reasonCodes).toContain("SB.PAUSED");
     // The runtime-level status is NOT paused: the pause is the strategy's own.

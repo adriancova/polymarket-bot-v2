@@ -186,6 +186,21 @@ export {
 } from "./orders.js";
 
 export {
+  DEFAULT_RETENTION,
+  OrderTombstones,
+  RetentionLog,
+  UNREADABLE_BOOKED_SHARES,
+  retentionBoundsProblem,
+  settlementBlocker,
+  type OrderLifecycleMetrics,
+  type OrderTombstoneMetrics,
+  type RetentionBounds,
+  type RetentionHealth,
+  type RetentionMetrics,
+  type SettlementBlocker,
+} from "./order-lifecycle.js";
+
+export {
   CancelLedger,
   type CancelLedgerMetrics,
   type CancelResolution,
@@ -246,6 +261,8 @@ export {
   DecisionOutboxBuffer,
   type CoreLoopOptions,
   type DecisionTrace,
+  type LoopHealthSnapshot,
+  type RetainedOrderState,
   type TraderVenue,
 } from "./loop.js";
 

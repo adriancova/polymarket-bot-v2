@@ -95,7 +95,7 @@ describe("no counter is defaulted", () => {
     expect(readTraderHealthReport(mutate([section, field], undefined)).ok).toBe(false);
   });
 
-  it.each(["fills", "reservations", "cancels", "orderViews", "allocator"])(
+  it.each(["fills", "reservations", "cancels", "orderViews", "allocator", "orders", "retention"])(
     "REFUSES a report missing the %s seam section",
     (seam) => {
       expect(readTraderHealthReport(mutate(["seams", seam], undefined)).ok).toBe(false);
@@ -138,6 +138,65 @@ describe("no counter is defaulted", () => {
           [{ scope: { kind: "ACCOUNT" }, code: "X", detail: "", at: "t", action: "FULL_HALT" }],
         ),
       ).ok,
+    ).toBe(false);
+  });
+});
+
+describe("the TRDR-4 seams — the trader loop's per-order state and audit-log retention", () => {
+  it("are read through the door, every counter as published", () => {
+    const result = readTraderHealthReport(healthDocument());
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const seams = result.value.seams as unknown as Record<string, unknown>;
+    expect(seams["orders"]).toEqual({
+      tracked: 1,
+      settled: 3,
+      tombstones: 3,
+      maximumTombstones: 100_000,
+      tombstoneEvictions: 0,
+      unownedFills: 0,
+      lateFillsAfterSettlement: 0,
+      settleMismatches: 0,
+    });
+    expect(seams["retention"]).toEqual({
+      decisions: { retained: 12, maximumRetained: 100_000, evicted: 0 },
+      traces: { retained: 3, maximumRetained: 50_000, evicted: 0 },
+      provenance: { retained: 4, maximumRetained: 50_000, evicted: 0 },
+    });
+  });
+
+  it.each([
+    "tracked",
+    "settled",
+    "tombstones",
+    "maximumTombstones",
+    "tombstoneEvictions",
+    "unownedFills",
+    "lateFillsAfterSettlement",
+    "settleMismatches",
+  ])("REFUSES a report missing seams.orders.%s rather than reading it as 0", (field) => {
+    expect(readTraderHealthReport(mutate(["seams", "orders", field], undefined)).ok).toBe(false);
+  });
+
+  it.each(["decisions", "traces", "provenance"])(
+    "REFUSES a report missing seams.retention.%s, or any of its three counters",
+    (log) => {
+      expect(readTraderHealthReport(mutate(["seams", "retention", log], undefined)).ok).toBe(false);
+      for (const counter of ["retained", "maximumRetained", "evicted"]) {
+        expect(
+          readTraderHealthReport(mutate(["seams", "retention", log, counter], undefined)).ok,
+          `${log}.${counter}`,
+        ).toBe(false);
+      }
+    },
+  );
+
+  it("REFUSES an unknown key, a negative and a fractional counter inside them", () => {
+    expect(readTraderHealthReport(mutate(["seams", "orders", "unexpected"], 1)).ok).toBe(false);
+    expect(readTraderHealthReport(mutate(["seams", "retention", "unexpected"], {})).ok).toBe(false);
+    expect(readTraderHealthReport(mutate(["seams", "orders", "unownedFills"], -1)).ok).toBe(false);
+    expect(
+      readTraderHealthReport(mutate(["seams", "retention", "traces", "evicted"], 0.5)).ok,
     ).toBe(false);
   });
 });

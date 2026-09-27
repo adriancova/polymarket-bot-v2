@@ -58,6 +58,7 @@ import { HealthState } from "./health.js";
 import { InstanceRegistry } from "./instances.js";
 import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
 import { MarketState } from "./market-state.js";
+import { retentionBoundsProblem, type RetentionBounds } from "./order-lifecycle.js";
 import type { Clock, TraderStore } from "./ports.js";
 import {
   checkPaperTraderSafety,
@@ -84,6 +85,13 @@ export interface CreateTraderOptions {
   readonly idNamespace: string;
   /** Maximum trades kept per market for the feature window. */
   readonly maximumTradesPerMarket?: number;
+  /**
+   * `TRDR-4` — the core loop's retention bounds (decisions, traces,
+   * provenance, tombstones). Omitted fields take `DEFAULT_RETENTION`
+   * (`order-lifecycle.ts`), which sits far above every fixture; a caller sets
+   * one only to exercise eviction.
+   */
+  readonly retention?: RetentionBounds;
 }
 
 export interface TraderRefusal {
@@ -239,6 +247,20 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     allocationMarkets.set(market.marketId, allocationMarketOf(market));
   }
 
+  // `TRDR-4`: the loop's retention bounds are a programmatic option, not part
+  // of the configuration document, but this function is TOTAL — so a bound the
+  // loop's constructor would throw on is refused here, by name.
+  const retentionProblem =
+    options.retention === undefined ? undefined : retentionBoundsProblem(options.retention);
+  if (retentionProblem !== undefined) {
+    return refuse(
+      "TRADER_CONFIG_REFUSED",
+      "the core loop's retention bounds were refused; an unbounded or zero-sized audit log is " +
+        "not a bound",
+      [retentionProblem],
+    );
+  }
+
   // --- 5. the outbox, the ledger, and the counters -------------------------
   const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
   const ledger = Ledger.empty(config.environment);
@@ -360,6 +382,7 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     posting,
     tokenAssetIds,
     outbox,
+    ...(options.retention === undefined ? {} : { retention: options.retention }),
   });
 
   void staticBracketParamsSchema;

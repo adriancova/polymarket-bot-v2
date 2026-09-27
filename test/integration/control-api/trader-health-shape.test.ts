@@ -32,9 +32,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   HealthState,
+  OrderTombstones,
   RISK_SEAM_CAVEAT,
   RealizedPnlBook,
+  RetentionLog,
   type HealthSnapshot,
+  type OrderLifecycleMetrics,
+  type RetentionHealth,
 } from "@polymarket-bot/trader";
 import { readTraderHealthReport } from "@polymarket-bot/control-api";
 import {
@@ -42,6 +46,40 @@ import {
   renderExpositionFor,
   traderHealthSamples,
 } from "@polymarket-bot/observability";
+
+/**
+ * `TRDR-4`: the two seams `CoreLoop.health()` always publishes, built from the
+ * REAL producers — `OrderTombstones.metrics()` and `RetentionLog.metrics()` —
+ * so a rename in `apps/trader/src/order-lifecycle.ts` fails here too. One log
+ * is driven past its bound so `evicted` is a measured non-zero.
+ */
+function loopSeams(): { readonly orders: OrderLifecycleMetrics; readonly retention: RetentionHealth } {
+  const tombstones = new OrderTombstones({ maximumRemembered: 2 });
+  tombstones.remember("order-1", "sb-1");
+  tombstones.remember("order-2", "sb-1");
+  tombstones.remember("order-3", "sb-1");
+  const decisions = new RetentionLog<number>({ name: "decision", maximumRetained: 2 });
+  for (const value of [1, 2, 3]) decisions.append(value);
+  const traces = new RetentionLog<number>({ name: "trace", maximumRetained: 50_000 });
+  traces.append(1);
+  const provenance = new RetentionLog<number>({ name: "order provenance", maximumRetained: 50_000 });
+  provenance.append(1);
+  return {
+    orders: {
+      tracked: 1,
+      settled: 3,
+      ...tombstones.metrics(),
+      unownedFills: 1,
+      lateFillsAfterSettlement: 1,
+      settleMismatches: 0,
+    },
+    retention: {
+      decisions: decisions.metrics(),
+      traces: traces.metrics(),
+      provenance: provenance.metrics(),
+    },
+  };
+}
 
 /**
  * Builds a snapshot from the REAL `HealthState`, exercising every counter it
@@ -141,6 +179,7 @@ function realSnapshot(): HealthSnapshot {
         reservedCollateral: "12.50",
         refusalsByCode: { CAPITAL_CAP_EXCEEDED: 1 },
       },
+      ...loopSeams(),
     },
   });
 }
@@ -176,6 +215,42 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
       byInstance: { "sb-1": "-1.2", "sb-2": "0.3" },
       account: "-0.9",
     });
+    // `TRDR-4`: the loop's per-order state and audit-log retention, through the
+    // door, as the real producers measured them.
+    const seams = report.seams as unknown as Record<string, unknown>;
+    expect(seams["orders"]).toEqual({
+      tracked: 1,
+      settled: 3,
+      tombstones: 2,
+      maximumTombstones: 2,
+      tombstoneEvictions: 1,
+      unownedFills: 1,
+      lateFillsAfterSettlement: 1,
+      settleMismatches: 0,
+    });
+    expect(seams["retention"]).toEqual({
+      decisions: { retained: 2, maximumRetained: 2, evicted: 1 },
+      traces: { retained: 1, maximumRetained: 50_000, evicted: 0 },
+      provenance: { retained: 1, maximumRetained: 50_000, evicted: 0 },
+    });
+  });
+
+  it("the door REFUSES a snapshot whose producer supplied no TRDR-4 seams — absent is never read as zero", () => {
+    // `HealthState.snapshot` carries `orders` / `retention` only when its caller
+    // measured them (`CoreLoop.health()` always does). A holder of no loop that
+    // omits them produces a document the door must refuse, not default.
+    const state = new HealthState({ runMode: "PAPER", maximumRunMode: "PAPER" });
+    const { orders: _orders, retention: _retention, ...fiveSeams } = realSnapshot().seams;
+    void _orders;
+    void _retention;
+    const without = state.snapshot({ asOf: "2026-09-26T00:00:00Z", halts: [], queues: [], seams: fiveSeams });
+    expect(Object.keys(without.seams)).toEqual(["fills", "reservations", "cancels", "orderViews", "allocator"]);
+    const result = readTraderHealthReport(overTheWire(without));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    const issues = result.refusal.issues.join(" ");
+    expect(issues).toContain("orders");
+    expect(issues).toContain("retention");
   });
 
   it("accepts the 'no snapshot observed' form — account null, no instances — that a fresh trader serves", () => {
@@ -263,6 +338,7 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
           reservedCollateral: "0.30",
           refusalsByCode: {},
         },
+        ...loopSeams(),
       },
     });
     const result = readTraderHealthReport(overTheWire(snapshot));

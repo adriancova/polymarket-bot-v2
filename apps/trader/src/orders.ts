@@ -19,10 +19,11 @@
  *
  * ## What this module does, in one sentence
  *
- * It turns the venue's order state into `StrategyOrderView`s and delivers EVERY
- * change — and every repeat of a terminal state — through `onOrderUpdate`, while
- * also keeping `ctx.orders()` populated, so neither half of obligation 4's
- * failure mode is reachable.
+ * It turns the venue's order state into `StrategyOrderView`s and delivers every
+ * WORKING order's view, and a TERMINAL order's view until one delivery of it
+ * has been evaluated, through `onOrderUpdate`, while also keeping
+ * `ctx.orders()` populated with the same orders, so neither half of
+ * obligation 4's failure mode is reachable.
  *
  * ## The three rules, and why each is not merely a preference
  *
@@ -32,13 +33,34 @@
  *    root that used it as one would freeze every adopted order's tracked state.
  *    The effect is fail-safe (a frozen live order blocks new entries) but it is
  *    still a wiring fault, and it is one nothing would report.
- * 2. **Repeats are ordinary traffic, and this seam emits them on purpose.** The
- *    strategy absorbs a repeated terminal view and absorbs an `OPEN` view during
- *    a cancel race (its round-3 self-edge). Suppressing repeats here would make
- *    the trader depend on a de-duplication the strategy explicitly does not need
- *    — and would hide exactly the redelivery the strategy was hardened for. So
- *    `deliverable()` emits a view whenever the venue's order state was READ,
- *    including when nothing about it changed, and the emission is counted.
+ * 2. **A working order is re-delivered on every harvest; a terminal one until it
+ *    has been EVALUATED once, then it is RETIRED** (`TRDR-4`, the user's ruling
+ *    R1 of 2026-09-26). This module's rule used to be "repeats are ordinary
+ *    traffic, and this seam emits them on purpose": every order the process had
+ *    ever placed was re-delivered on every harvest, terminal ones included,
+ *    forever — so per-event evaluations, persisted decisions and checkpoints
+ *    grew with every order ever placed, and `ctx.orders()` carried the whole
+ *    history. The strategy's README PERMITS that ("Roots may redeliver views
+ *    freely") but does not require it, and R1 stops it for terminal orders:
+ *    - a WORKING view is still re-delivered on every harvest, so an `OPEN`
+ *      view during a cancel race still reaches the strategy's round-3
+ *      self-edge, and repeats of it are still labelled and counted here;
+ *    - a TERMINAL view is delivered until ONE delivery was actually EVALUATED
+ *      by the strategy (the runtime answered `DECIDED`). A delivery the §4.2
+ *      halt gate suppressed, or one the runtime refused because the instance
+ *      is PAUSED, is not an evaluation and does not count — obligation 4's
+ *      "a root that stops delivering … leaves that order's tracked state
+ *      frozen" is exactly the failure a premature retirement would cause;
+ *    - after that the order is RETIRED: no further `onOrderUpdate`, and it
+ *      leaves `ctx.orders()`, which then holds the instance's working orders
+ *      plus its terminal-not-yet-retired ones. That matches the SDK contract
+ *      ("one of this instance's own working orders") and closes the latent
+ *      stale-adoption path in which a new bracket's unadopted track could bind
+ *      to an earlier cycle's terminal order (the scoping's
+ *      `decide.ts` adoptOrder / attributeOrder reading).
+ *    An IMMEDIATE order that is already terminal before any tick still reaches
+ *    the strategy — through that first evaluated delivery, which is where the
+ *    strategy adopts it.
  * 3. **`filledShares` is the venue's confirmed quantity and nothing else.** It
  *    is never the requested size and never a projection of one; when the venue
  *    reports a Tier-1 resting BAND rather than a point, `filledShares` carries
@@ -93,6 +115,10 @@ export interface OrderViewDelivery {
    * Carried rather than suppressed: obligation 5 makes a repeat ordinary
    * traffic, and a seam that hid repeats would be hiding the very case the
    * strategy's absorb path exists for. It is counted on the health surface.
+   * Since `TRDR-4` (R1) a repeat is a WORKING order's view re-delivered on a
+   * later harvest, or a terminal view whose earlier delivery was not evaluated
+   * (a halt suppressed it, or a PAUSED runtime refused it); a terminal view is
+   * never delivered again once one delivery of it was evaluated.
    */
   readonly repeat: boolean;
 }
@@ -138,6 +164,10 @@ export interface OrderViewMetrics {
  *
  * The tracker is deliberately not a filter. Its only output is the `repeat`
  * flag and the counters behind it; every view it is shown is deliverable.
+ * WHICH views are shown to it is the loop's R1 rule (module header, rule 2):
+ * a retired order is never shown again, and when the loop SETTLES an order it
+ * {@link OrderViewTracker.forget}s it, so `tracked` counts orders the loop
+ * still delivers rather than every order ever placed.
  */
 export class OrderViewTracker {
   /** orderId -> the last `(status, filledShares)` delivered for it. */
@@ -158,6 +188,17 @@ export class OrderViewTracker {
     this.#emitted += 1;
     if (repeat) this.#repeats += 1;
     return Object.freeze({ instanceId, view, repeat });
+  }
+
+  /**
+   * Drops one SETTLED order's last-delivered signature (`TRDR-4`).
+   *
+   * Only the loop's settlement calls this, and only after the order was
+   * retired — so no later delivery of it exists that could be mislabelled as
+   * a non-repeat. Answers whether an entry was held.
+   */
+  forget(orderId: string): boolean {
+    return this.#delivered.delete(orderId);
   }
 
   metrics(): OrderViewMetrics {

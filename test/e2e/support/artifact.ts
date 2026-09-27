@@ -58,8 +58,14 @@ import type { Run } from "./harness.js";
  * `2` (`RECON-2`): the `orderProvenance` section — every order's trace prefix
  * as the loop recorded it at SUBMISSION — so that an order that never filled is
  * attributed to its intent by id rather than by inference.
+ *
+ * `3` (`TRDR-4`): `health.seams.orders` (the loop's per-order state: live
+ * owned orders, settled ones, the tombstone map, unowned and late fills,
+ * settlement mismatches) and `health.seams.retention` (the three audit logs'
+ * `retained / maximumRetained / evicted`). The golden therefore also PINS that
+ * this fixture evicts nothing from any audit log.
  */
-export const GOLDEN_FORMAT_VERSION = 2;
+export const GOLDEN_FORMAT_VERSION = 3;
 
 export interface ArtifactEvent {
   readonly eventId: string;
@@ -281,6 +287,14 @@ export interface ArtifactHealth {
     readonly cancels: MetricGroup;
     readonly orderViews: MetricGroup;
     readonly allocator: MetricGroup;
+    /** `TRDR-4`: the loop's per-order state (`seams.orders`). */
+    readonly orders: MetricGroup;
+    /** `TRDR-4`: the audit logs' bounded retention, one group per log. */
+    readonly retention: {
+      readonly decisions: MetricGroup;
+      readonly traces: MetricGroup;
+      readonly provenance: MetricGroup;
+    };
   };
 }
 
@@ -569,6 +583,12 @@ export function captureArtifact(run: Run): PaperRunArtifact {
       cancels: { ...health.seams.cancels },
       orderViews: { ...health.seams.orderViews },
       allocator: { ...health.seams.allocator },
+      orders: { ...health.seams.orders },
+      retention: {
+        decisions: { ...health.seams.retention.decisions },
+        traces: { ...health.seams.retention.traces },
+        provenance: { ...health.seams.retention.provenance },
+      },
     },
   };
 

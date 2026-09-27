@@ -285,17 +285,45 @@ describe("L2 — a GENUINELY PAUSED instance is offered its fill", () => {
 });
 
 describe("MEDIUM-2 — every seam reports on the health surface", () => {
-  it("all five seam sections are present, with the values their seams hold", async () => {
+  it("all seven seam sections are present, with the values their seams hold", async () => {
     const run = await driveRecordedRun();
     const seams = run.trader.loop.health().seams;
 
+    // `TRDR-4` added `orders` and `retention` (additions only; nothing renamed).
     expect(Object.keys(seams).sort()).toEqual([
       "allocator",
       "cancels",
       "fills",
       "orderViews",
+      "orders",
       "reservations",
+      "retention",
     ]);
+    // `TRDR-4`, live values: the entry order filled, was delivered and
+    // evaluated once, and SETTLED (one tombstone); the take-profit still rests,
+    // so it is the one order still tracked. Nothing arrived unowned.
+    expect(seams.orders).toEqual({
+      tracked: 1,
+      settled: 1,
+      tombstones: 1,
+      maximumTombstones: 100_000,
+      tombstoneEvictions: 0,
+      unownedFills: 0,
+      lateFillsAfterSettlement: 0,
+      settleMismatches: 0,
+    });
+    // No audit log evicts in this fixture: every decision, trace and provenance
+    // record of the run is still returned by its accessor.
+    expect(seams.retention).toEqual({
+      decisions: {
+        retained: run.trader.loop.decisions().length,
+        maximumRetained: 100_000,
+        evicted: 0,
+      },
+      traces: { retained: 1, maximumRetained: 50_000, evicted: 0 },
+      provenance: { retained: 2, maximumRetained: 50_000, evicted: 0 },
+    });
+    expect(run.parts.store.decisions).toHaveLength(run.trader.loop.decisions().length);
     // LIVE values, not zeroed placeholders: this run admitted one fill,
     // delivered order views, took and released one reservation of each kind.
     expect(seams.fills.admitted).toBe(1);

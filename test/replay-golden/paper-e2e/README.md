@@ -35,8 +35,32 @@ over a different subject — the paper-core end-to-end surface `WP-230` and
 | `ledgerTransactions` | the append-only postings, entry by entry |
 | `pnlRecords` / `pnlSnapshots` | the §9.16 stream and the rows written to the store |
 | `ledgerProjection` | the §6 invariant 8 fold: balances, virtual positions, and the two "nothing unexplained" counts |
-| `health` | every §14.3-shaped counter the run moved, plus `accounting.realizedPnl` (below) |
+| `health` | every §14.3-shaped counter the run moved, plus `accounting.realizedPnl` (below), and — golden format 3 (`TRDR-4`) — `seams.orders` (the loop's per-order state: `tracked`, `settled`, the settled-order tombstones, `unownedFills`, `lateFillsAfterSettlement`, `settleMismatches`) and `seams.retention` (`retained / maximumRetained / evicted` for the decision, trace and provenance logs — all `evicted: 0` here, which PINS that this fixture evicts nothing) |
 | `reconciliation` | the projected-vs-realized table, with each difference's named mechanism |
+
+### The `TRDR-4` regeneration (golden format 3): terminal order views are evaluated once
+
+The user's ruling R1 (2026-09-26) changed the core loop's delivery rule. A
+WORKING order's view is still delivered through `onOrderUpdate` on every
+harvest; a TERMINAL order's view is delivered until ONE delivery has been
+evaluated by the strategy, and then the order is RETIRED — no further
+delivery, and out of `ctx.orders()`. Before R1 every order ever placed was
+re-delivered on every harvest. This run's six re-deliveries of already
+evaluated terminal views — old `evaluationSeq` 7 (the entry, at 09:00:03),
+11 and 12 (the entry and the withdrawn take-profit, at 09:14:49), and 15, 16
+and 17 (all three orders, at 09:14:50), each an `onOrderUpdate` `hold` with
+reason `SB.IDLE` and no intent — are gone, so `decisions` has 12 records, not
+18, and `checkpointInstants` 12 entries. Later records renumber: the reduce
+decision `9 → 8` (and with it the reduce's `traces` and `orderProvenance`
+`evaluationSeq`), its fill's `onFill` `10 → 9`, the reduce order's own
+terminal view `13 → 10`, `onMarketClosing` `14 → 11`. The health counters
+follow (`loop.evaluations`, `decisionsPersisted`, `featureSnapshots` `18 → 12`;
+`seams.orderViews` `emitted 10 → 4`, `repeats 6 → 0`, `tracked 3 → 0`), and the
+two new seams appear. Every order, fill, ledger transaction, PnL record, PnL
+snapshot, projection line and reconciliation row is identical — proven
+section by section, with the removed decisions identified by the order each
+one delivered, in the round's handoff. The take-profit's placing `exit`
+decision is still `evaluationSeq 2`.
 
 ### `health.accounting.realizedPnl` reads "no snapshot observed" here — deliberately, and why
 

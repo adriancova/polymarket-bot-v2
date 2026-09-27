@@ -255,11 +255,20 @@ export class HaltController {
  *
  * Returns the halts it raised so the caller can report them; the controller has
  * already latched them.
+ *
+ * `notes` (`TRDR-4`, optional) maps a `ledgerTransactionId` to a sentence the
+ * caller knows and the projection does not — the loop passes one for a fill
+ * whose owner lookup MISSED (an unknown order, or a settled one whose tombstone
+ * names a PROBABLE owner). The note is appended to the `UNATTRIBUTED_ACTIVITY`
+ * detail of the record that transaction produced; it changes no scope, code or
+ * action, and a halt latched earlier for the same scope keeps its first record,
+ * as every repeat does.
  */
 export function haltOnLedgerProjection(
   controller: HaltController,
   projection: LedgerProjection,
   at: string,
+  notes?: ReadonlyMap<string, string>,
 ): readonly HaltRecord[] {
   const raised: HaltRecord[] = [];
 
@@ -276,7 +285,8 @@ export function haltOnLedgerProjection(
         "UNATTRIBUTED_ACTIVITY",
         `unattributed actual activity on ${record.assetId} (${record.amount}) in ` +
           `transaction ${record.ledgerTransactionId}; §9.15 halts the affected market and ` +
-          "§6 invariant 7 keeps actual and virtual separate until it is reconciled",
+          "§6 invariant 7 keeps actual and virtual separate until it is reconciled" +
+          noteFor(notes, record.ledgerTransactionId),
         at,
       ),
     );
@@ -298,4 +308,9 @@ export function haltOnLedgerProjection(
   }
 
   return Object.freeze(raised);
+}
+
+function noteFor(notes: ReadonlyMap<string, string> | undefined, ledgerTransactionId: string): string {
+  const note = notes?.get(ledgerTransactionId);
+  return note === undefined ? "" : ` — ${note}`;
 }

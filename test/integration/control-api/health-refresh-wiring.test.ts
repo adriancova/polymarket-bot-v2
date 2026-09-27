@@ -69,6 +69,23 @@ function realHealthDocument(): unknown {
           cancels: { pending: 0, requested: 0, confirmed: 0, rejected: 0, silenceExceeded: 0 },
           orderViews: { emitted: 0, repeats: 0, tracked: 0 },
           allocator: { open: 0, applied: 0, released: 0, reservedCollateral: "0", refusalsByCode: {} },
+          // `TRDR-4`: the two seams `CoreLoop.health()` always publishes, which the
+          // control API's door requires.
+          orders: {
+            tracked: 0,
+            settled: 0,
+            tombstones: 0,
+            maximumTombstones: 100_000,
+            tombstoneEvictions: 0,
+            unownedFills: 0,
+            lateFillsAfterSettlement: 0,
+            settleMismatches: 0,
+          },
+          retention: {
+            decisions: { retained: 0, maximumRetained: 100_000, evicted: 0 },
+            traces: { retained: 0, maximumRetained: 50_000, evicted: 0 },
+            provenance: { retained: 0, maximumRetained: 50_000, evicted: 0 },
+          },
         },
       }),
     ),
