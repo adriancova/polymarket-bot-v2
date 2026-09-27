@@ -15,6 +15,11 @@
  *   partial exit would have made `pnl.capital_committed` depend on how the
  *   document happened to be serialised.
  *
+ * `RECON-1` r1 then replaced that FIFO fold with `packages/pnl`'s own cost
+ * method, average cost, restated from its specification: a FIFO oracle flagged
+ * a correct partial-exit run as unexplained. The sequence ordering stays —
+ * average cost is order-sensitive across interleaved purchases and sales.
+ *
  * Every probe here follows `projection-reconciliation.test.ts`'s falsifiability
  * pattern: the COMMITTED GOLDEN is parsed afresh (a deep copy), changed in one
  * deliberate way, and handed to `buildReconciliation`. Each synthetic artefact
@@ -28,25 +33,48 @@
  * (`determinism-golden.test.ts`).
  */
 
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
-import { addDecimal, compareDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
+import {
+  DIVISION_PRECISION,
+  DIVISION_ROUNDING,
+  addDecimal,
+  compareDecimal,
+  divDecimalExact,
+  mulDecimal,
+  subDecimal,
+} from "@polymarket-bot/decimal";
+import {
+  computePnlSnapshot,
+  foldPnlRecords,
+  type PnlFeeRecord,
+  type PnlRecord,
+  type PnlSnapshot,
+  type PnlStreamIdentity,
+  type PnlTradeRecord,
+} from "@polymarket-bot/pnl";
 
-import type {
-  ArtifactDecision,
-  ArtifactFill,
-  ArtifactIntent,
-  ArtifactOrder,
-  ArtifactTrace,
-  PaperRunArtifact,
+import {
+  captureArtifact,
+  type ArtifactDecision,
+  type ArtifactFill,
+  type ArtifactIntent,
+  type ArtifactOrder,
+  type ArtifactTrace,
+  type PaperRunArtifact,
 } from "./support/artifact.js";
 import { goldenBytes } from "./support/golden.js";
+import { driveScenario } from "./support/harness.js";
 import {
+  PNL_COST_DIVISION,
   buildReconciliation,
   compareFillIds,
   compareIngestSeq,
   type ReconciliationRow,
 } from "./support/reconcile.js";
+import { INSTANCE_ID } from "./support/scenario.js";
 
 // --- the golden, and its landmarks, found by id ------------------------------
 
@@ -702,9 +730,9 @@ function permutations<T>(values: readonly T[]): T[][] {
 }
 
 /**
- * FIFO over the lots in the order GIVEN — the fold `RISK2-R4` described. Used
- * only to prove a permutation genuinely changes the answer, so the invariance
- * asserted against the reconciler is not vacuous.
+ * FIFO over the lots in the order GIVEN — the fold `RECON-1` r1 replaced. Used
+ * only to show that the replaced model would have answered differently on a
+ * synthetic, so an agreement asserted against the engine is not vacuous.
  */
 function fifoInGivenOrder(lots: readonly ArtifactFill[], retired: string): string {
   let unretired = retired;
@@ -728,71 +756,206 @@ function openBasis(artifact: PaperRunArtifact): { capital: string; worstCase: st
   };
 }
 
-describe("RISK2-R4 — the FIFO fold follows atEventIngestSeq, not array order", () => {
-  it("a partial exit's open cost basis is the same for EVERY order the fills are written in", () => {
-    const partial = withPartialExit(golden());
-    const marks = landmarks(partial);
-    // Non-vacuous: the two entry lots have DIFFERENT prices (30 @ 0.34, 20 @
-    // 0.35), so a fold in array order gives two different answers.
-    expect(marks.entryFills.map((fill) => `${fill.shares}@${fill.price}`)).toEqual([
-      "30@0.34",
-      "20@0.35",
-    ]);
-    expect(
-      [...new Set(permutations(marks.entryFills).map((lots) => fifoInGivenOrder(lots, "25")))].sort(),
-    ).toEqual(["8.5", "8.7"]);
+// --- the ENGINE's own answer for the same fills (test side only) --------------
 
-    // Both lots were consumed at the same event, so the fill id breaks the tie:
-    // `…/t0/0` (the 0.34 level, walked first) is retired first, leaving
-    // 5 × 0.34 + 20 × 0.35 = 8.7 open — whatever order the array holds.
-    const orders = permutations(partial.fills);
-    expect(orders).toHaveLength(6);
+/** The PnL records the real run booked for one fill: its trade and its fee. */
+interface Booking {
+  readonly trade: PnlTradeRecord;
+  readonly fee: PnlFeeRecord;
+}
+
+function isTrade(record: PnlRecord): record is PnlTradeRecord {
+  return record.kind === "TRADE";
+}
+
+function isFee(record: PnlRecord): record is PnlFeeRecord {
+  return record.kind === "FEE";
+}
+
+/**
+ * The real run, and the PnL records it booked for each fill — found by id,
+ * through the fill's trace and the ledger transactions it names.
+ *
+ * `packages/pnl` is called HERE, in the test, to establish what the engine
+ * returns. `support/reconcile.ts` never calls it: the oracle must not run the
+ * system it checks.
+ */
+async function bookedRun(): Promise<{
+  readonly artifact: PaperRunArtifact;
+  readonly booking: (fill: ArtifactFill) => Booking;
+}> {
+  const run = await driveScenario();
+  const artifact = captureArtifact(run);
+  const byRef = new Map(
+    run.trader.loop.pnlRecords(INSTANCE_ID).map((record) => [record.ref, record] as const),
+  );
+  return {
+    artifact,
+    booking: (fill) => {
+      const trace = only(
+        artifact.traces.filter((candidate) => candidate.venueFillId === fill.simulatedFillId),
+        `trace of fill ${fill.simulatedFillId}`,
+      );
+      const records = trace.ledgerTransactionIds.flatMap((id) => {
+        const record = byRef.get(id);
+        return record === undefined ? [] : [record];
+      });
+      return {
+        trade: only(records.filter(isTrade), "trade record"),
+        fee: only(records.filter(isFee), "fee record"),
+      };
+    },
+  };
+}
+
+/** A booking re-sized for a synthetic fill, optionally under fresh refs. */
+function resized(
+  booking: Booking,
+  shares: string,
+  feeAmount: string,
+  refs?: { readonly trade: string; readonly fee: string },
+): Booking {
+  return {
+    trade: { ...booking.trade, shares, ...(refs === undefined ? {} : { ref: refs.trade }) },
+    fee: { ...booking.fee, amount: feeAmount, ...(refs === undefined ? {} : { ref: refs.fee }) },
+  };
+}
+
+/** What `packages/pnl` itself reports after folding these bookings, in this order. */
+function engineSnapshot(artifact: PaperRunArtifact, bookings: readonly Booking[]): PnlSnapshot {
+  const scenario = artifact.scenario;
+  const identity: PnlStreamIdentity = {
+    scope: "VIRTUAL_STRATEGY",
+    environment: "PAPER",
+    accountRef: scenario.accountRef,
+    instanceId: scenario.instanceId,
+    runId: scenario.runId,
+    marketId: scenario.marketId,
+  };
+  const folded = foldPnlRecords(
+    identity,
+    bookings.flatMap((booking) => [booking.trade, booking.fee]),
+  );
+  if (!folded.ok) throw new Error(`packages/pnl refused the records: ${JSON.stringify(folded)}`);
+  const token = bookings[0]?.trade.tokenAssetId ?? "";
+  const snapshots = computePnlSnapshot(folded.value, {
+    asOf: "2026-05-01T09:14:49Z",
+    marks: { [token]: { midpoint: "0.32" } },
+  });
+  if (!snapshots.ok) throw new Error(`packages/pnl refused the snapshot: ${JSON.stringify(snapshots)}`);
+  return only(snapshots.value, "snapshot");
+}
+
+/** The artefact, with the engine's snapshot as the LAST one — the one the table reads. */
+function withSnapshot(artifact: PaperRunArtifact, snapshot: PnlSnapshot): PaperRunArtifact {
+  return {
+    ...artifact,
+    pnlSnapshots: [...artifact.pnlSnapshots, Object.fromEntries(Object.entries(snapshot))],
+  };
+}
+
+/**
+ * Purchases and sales INTERLEAVED: buy 30 @ 0.34 (event 5), sell 5 (event 6),
+ * buy 20 @ 0.35 (event 7), sell 25 (event 8). The second sale removes 25 of 45
+ * shares from a lot whose basis is 15.5, and 15.5 × 25 / 45 = 8.61… does not
+ * terminate, so `divDecimal`'s rounding is exercised.
+ */
+function interleaved(artifact: PaperRunArtifact, sequences: readonly string[]): PaperRunArtifact {
+  const marks = landmarks(artifact);
+  const [a, b] = marks.entryFills;
+  if (a === undefined || b === undefined) throw new Error("two entry lots expected");
+  const [sa = "5", s1 = "6", sb = "7", s2 = "8"] = sequences;
+  return {
+    ...artifact,
+    orders: artifact.orders.map((order) =>
+      order.simulatedOrderId === marks.exitOrder.simulatedOrderId
+        ? { ...order, filledShares: "30", state: "PARTIALLY_FILLED" }
+        : order,
+    ),
+    fills: [
+      { ...a, atEventIngestSeq: sa },
+      // 5 × 0.0195 × 0.32 × 0.68 = 0.021216, HALF_UP to 3 places.
+      { ...marks.exitFill, shares: "5", feeAmount: "0.021", atEventIngestSeq: s1 },
+      { ...b, atEventIngestSeq: sb },
+      {
+        ...marks.exitFill,
+        simulatedFillId: `${marks.exitOrder.simulatedOrderId}/t0/1`,
+        shares: "25",
+        feeAmount: "0.106",
+        atEventIngestSeq: s2,
+      },
+    ],
+  };
+}
+
+/** The interleaved fills' bookings, in the order the ENGINE is to fold them. */
+function interleavedBookings(
+  booking: (fill: ArtifactFill) => Booking,
+  marks: Landmarks,
+  order: "INTERLEAVED" | "PURCHASES_FIRST",
+): readonly Booking[] {
+  const [a, b] = marks.entryFills;
+  if (a === undefined || b === undefined) throw new Error("two entry lots expected");
+  const x1 = resized(booking(marks.exitFill), "5", "0.021");
+  const x2 = resized(booking(marks.exitFill), "25", "0.106", {
+    trade: "9280f970-9280-7000-8000-0000000f1000",
+    fee: "9280f970-9280-7000-8000-0000000f2000",
+  });
+  return order === "INTERLEAVED"
+    ? [booking(a), x1, booking(b), x2]
+    : [booking(a), booking(b), x1, x2];
+}
+
+/** Hand-derived from the specification; see the test that pins it. */
+const INTERLEAVED_OPEN_BASIS = "6.888888888888888888888888888888889";
+const INTERLEAVED_REALIZED = "-0.711111111111111111111111111111111";
+
+describe("RISK2-R4 — the fold follows atEventIngestSeq, not array order", () => {
+  it("interleaved purchases and sales: all 24 array orders give the ENGINE's open basis", async () => {
+    const { artifact, booking } = await bookedRun();
+    const marks = landmarks(artifact);
+    // Non-vacuous: the ENGINE itself answers differently when the same fills
+    // are folded purchases-first, so the order genuinely matters here.
+    expect(
+      engineSnapshot(artifact, interleavedBookings(booking, marks, "PURCHASES_FIRST"))
+        .capitalCommitted,
+    ).toBe("6.88");
+    const engine = engineSnapshot(artifact, interleavedBookings(booking, marks, "INTERLEAVED"));
+    expect(engine.capitalCommitted).toBe(INTERLEAVED_OPEN_BASIS);
+
+    const synthetic = withSnapshot(interleaved(artifact, []), engine);
+    const orders = permutations(synthetic.fills);
+    expect(orders).toHaveLength(24);
     for (const fills of orders) {
-      const basis = openBasis({ ...partial, fills });
-      expect(basis.capital).toBe("8.7");
-      // realizedPnl − Σ open cost basis, against the golden snapshot's −1.2.
-      expect(basis.worstCase).toBe("-9.9");
+      const basis = openBasis({ ...synthetic, fills });
+      expect(basis.capital).toBe(INTERLEAVED_OPEN_BASIS);
+      expect(basis.worstCase).toBe(engine.worstCaseResolutionPnl);
     }
   });
 
   it("the sequence is compared as an INTEGER: event 9 is consumed before event 10", () => {
-    const partial = withPartialExit(golden());
-    const marks = landmarks(partial);
-    const [first, second] = marks.entryFills;
-    if (first === undefined || second === undefined) throw new Error("two entry lots expected");
-    // The 0.34 lot at event "10", the 0.35 lot at event "9". Compared as text,
-    // "10" sorts before "9" and the 0.34 lot would be retired first (8.7).
-    // Compared as integers the 0.35 lot is first: 25 × 0.34 = 8.5 stays open.
-    const resequenced = partial.fills.map((fill) =>
-      fill.simulatedFillId === first.simulatedFillId
-        ? { ...fill, atEventIngestSeq: "10" }
-        : fill.simulatedFillId === second.simulatedFillId
-          ? { ...fill, atEventIngestSeq: "9" }
-          : fill,
-    );
-    for (const fills of permutations(resequenced)) {
-      expect(openBasis({ ...partial, fills }).capital).toBe("8.5");
+    const artifact = golden();
+    // Events 9, 10, 11, 12. Compared as text, "10" sorts before "9", so the
+    // first SALE would be folded before the first PURCHASE and refused as an
+    // oversell; compared as integers the fold is the interleaved one above.
+    const resequenced = interleaved(artifact, ["9", "10", "11", "12"]);
+    for (const fills of permutations(resequenced.fills)) {
+      expect(openBasis({ ...resequenced, fills }).capital).toBe(INTERLEAVED_OPEN_BASIS);
     }
   });
 
-  it("inside one event, the fill index is compared as an INTEGER: …/t0/9 before …/t0/10", () => {
-    const partial = withPartialExit(golden());
-    const marks = landmarks(partial);
-    const [first, second] = marks.entryFills;
-    if (first === undefined || second === undefined) throw new Error("two entry lots expected");
-    // The ids a crossing of eleven levels produces. As text, "…/t0/10" sorts
-    // before "…/t0/9"; by index, level 9 (the 0.34 lot) was walked first.
-    const order = marks.entryOrder.simulatedOrderId;
-    const renamed = partial.fills.map((fill) =>
-      fill.simulatedFillId === first.simulatedFillId
-        ? { ...fill, simulatedFillId: `${order}/t0/9` }
-        : fill.simulatedFillId === second.simulatedFillId
-          ? { ...fill, simulatedFillId: `${order}/t0/10` }
-          : fill,
+  it("a sale sequenced before the purchase it would draw on is refused, as the engine refuses it", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const fills = artifact.fills.map((fill) =>
+      fill.simulatedFillId === marks.exitFill.simulatedFillId
+        ? { ...fill, atEventIngestSeq: "4" }
+        : fill,
     );
-    for (const fills of permutations(renamed)) {
-      expect(openBasis({ ...partial, fills }).capital).toBe("8.7");
-    }
+    expect(() => buildReconciliation({ ...artifact, fills })).toThrow(/PNL_OVERSELL/u);
+    expect(() => buildReconciliation({ ...artifact, fills })).toThrow(
+      marks.exitFill.simulatedFillId,
+    );
   });
 
   it("a non-canonical sequence is refused rather than ordered", () => {
@@ -852,43 +1015,153 @@ describe("the two comparators the fold sorts by", () => {
 });
 
 /**
- * A `RECON-1` FINDING, PINNED — reported, NOT fixed in this round.
+ * `RECON-1` r1 — the PnL rows reconcile against the ENGINE'S OWN COST METHOD.
  *
- * The fold above is FIFO. The PnL snapshot the two rows compare against is
- * `packages/pnl`'s, and `packages/pnl/src/state.ts` documents "Cost method:
- * average cost per token asset": removing q of Q shares removes B·q/Q of the
- * lot's basis. The two methods agree EXACTLY in the two states any run has
- * reached, and diverge on a partial exit whenever the entry lots differ in
- * price. The divergence is LOUD — the row compares with `EXACT_NO_DIFFERENCE`,
- * so it is unexplained rather than falsely passed — but it means a correct run
- * with a partial exit would fail acceptance 2 for a modelling reason. The day
- * the reconciler's model is aligned with the engine's, this test fails and
- * names the finding.
+ * `packages/pnl/src/state.ts` specifies average cost: "Removing q shares from a
+ * lot of Q shares with basis B removes basis B·q/Q — computed exactly when
+ * q = Q, otherwise via `divDecimal`'s documented policy (34 significant
+ * digits, ROUND_HALF_EVEN), with the REMAINING basis derived by exact
+ * subtraction". `support/reconcile.ts` restates that rule without calling the
+ * engine; each test below derives the expected numbers BY HAND from the
+ * specification, confirms them against what the real `packages/pnl` fold
+ * returns for the same fills, and then requires the table to agree.
+ *
+ * These replace the `RECON-1` finding pin, which asserted the FIFO fold's
+ * DISAGREEMENT with the engine (8.7 against 8.6) and was built to fail the day
+ * the model was aligned.
  */
-describe("RECON-1 finding — the reconciler's FIFO is not packages/pnl's average cost", () => {
-  it("they agree fully open and fully closed, and diverge on this partial exit", () => {
+describe("RECON-1 r1 — PnL reconciles against packages/pnl's own cost method (average cost)", () => {
+  const PNL_ROWS = [
+    "pnl.fees_paid",
+    "pnl.capital_committed",
+    "pnl.gross_trading",
+    "pnl.core_net",
+    "pnl.worst_case_resolution",
+  ] as const;
+
+  /**
+   * Sell 25 of the 50 shares bought as 30 @ 0.34 and 20 @ 0.35.
+   *
+   *   lot before the sale:  Q = 50, B = 30 × 0.34 + 20 × 0.35 = 10.2 + 7 = 17.2
+   *   removed (q = 25 ≠ Q): B·q/Q = 17.2 × 25 / 50 = 430 / 50 = 8.6
+   *   remaining basis:      17.2 − 8.6 = 8.6            → capitalCommitted  8.6
+   *   realized:             25 × 0.32 − 8.6 = 8 − 8.6   → realizedPnl      −0.6
+   *   worst case:           realized − open = −0.6 − 8.6 → worstCase       −9.2
+   *
+   * FIFO would have left 5 × 0.34 + 20 × 0.35 = 8.7 open, and flagged this
+   * correct run as unexplained.
+   */
+  it("a partial exit (25 of 50): both rows reconcile to the engine's own snapshot", async () => {
+    const { artifact, booking } = await bookedRun();
+    const marks = landmarks(artifact);
+    const [a, b] = marks.entryFills;
+    if (a === undefined || b === undefined) throw new Error("two entry lots expected");
+
+    const engine = engineSnapshot(artifact, [
+      booking(a),
+      booking(b),
+      resized(booking(marks.exitFill), "25", "0.106"),
+    ]);
+    // The hand derivation above, confirmed against the real engine.
+    expect(engine.capitalCommitted).toBe("8.6");
+    expect(engine.realizedPnl).toBe("-0.6");
+    expect(engine.worstCaseResolutionPnl).toBe("-9.2");
+    // Non-vacuous: the fold this replaces answers differently here.
+    expect(fifoInGivenOrder(marks.entryFills, "25")).toBe("8.7");
+
+    const rows = buildReconciliation(withSnapshot(withPartialExit(artifact), engine));
+    for (const id of PNL_ROWS) {
+      expect(row(rows, id).unexplainedReasons).toEqual([]);
+      expect(row(rows, id).explained).toBe(true);
+    }
+    expect(row(rows, "pnl.capital_committed").projected).toBe("8.6");
+    expect(row(rows, "pnl.capital_committed").realized).toBe("8.6");
+    expect(row(rows, "pnl.worst_case_resolution").projected).toBe("-9.2");
+    expect(row(rows, "pnl.worst_case_resolution").realized).toBe("-9.2");
+  });
+
+  /**
+   * The split that does NOT divide evenly — `divDecimal`'s rounding, tested.
+   *
+   *   buy 30 @ 0.34:  Q = 30, B = 10.2
+   *   sell 5:         removed 10.2 × 5 / 30 = 51 / 30 = 1.7        (terminates)
+   *                   Q = 25, B = 8.5;   realized 5 × 0.32 − 1.7 = −0.1
+   *   buy 20 @ 0.35:  Q = 45, B = 8.5 + 7 = 15.5
+   *   sell 25:        removed 15.5 × 25 / 45 = 387.5 / 45 = 8.6111…  (DOES NOT)
+   *                   → 34 significant digits, ROUND_HALF_EVEN (the 35th digit
+   *                     is 1, so it rounds down):
+   *                     8.611111111111111111111111111111111
+   *                   remaining B = 15.5 − 8.611111111111111111111111111111111
+   *                               = 6.888888888888888888888888888888889
+   *                   realized 25 × 0.32 − 8.611111111111111111111111111111111
+   *                               = −0.611111111111111111111111111111111
+   *   capitalCommitted  6.888888888888888888888888888888889
+   *   realizedPnl      −0.1 − 0.611111111111111111111111111111111
+   *                               = −0.711111111111111111111111111111111
+   *   worstCase        −0.711111111111111111111111111111111
+   *                    − 6.888888888888888888888888888888889 = −7.6 exactly,
+   *                    because the remainder was DERIVED by subtraction, so the
+   *                    basis is conserved across the rounded split.
+   */
+  it("an uneven split exercises divDecimal's rounding, and still reconciles exactly", async () => {
+    const { artifact, booking } = await bookedRun();
+    const marks = landmarks(artifact);
+    // The quotient genuinely does not terminate: this is the rounding branch.
+    expect(() => divDecimalExact("387.5", "45")).toThrow();
+
+    const engine = engineSnapshot(artifact, interleavedBookings(booking, marks, "INTERLEAVED"));
+    expect(engine.capitalCommitted).toBe(INTERLEAVED_OPEN_BASIS);
+    expect(engine.realizedPnl).toBe(INTERLEAVED_REALIZED);
+    expect(engine.worstCaseResolutionPnl).toBe("-7.6");
+    // Non-vacuous: FIFO would retire the whole 0.34 lot and leave 20 × 0.35.
+    expect(fifoInGivenOrder(marks.entryFills, "30")).toBe("7");
+
+    const rows = buildReconciliation(withSnapshot(interleaved(artifact, []), engine));
+    for (const id of PNL_ROWS) {
+      expect(row(rows, id).unexplainedReasons).toEqual([]);
+      expect(row(rows, id).explained).toBe(true);
+    }
+    expect(row(rows, "pnl.capital_committed").projected).toBe(INTERLEAVED_OPEN_BASIS);
+    expect(row(rows, "pnl.worst_case_resolution").projected).toBe("-7.6");
+  });
+
+  it("fully open and fully closed — the golden's only states — are unchanged", () => {
     const artifact = golden();
     const marks = landmarks(artifact);
-    const notional = marks.entryFills.reduce(
-      (total, fill) => addDecimal(total, mulDecimal(fill.price, fill.shares)),
-      "0",
-    );
-    expect(notional).toBe("17.2");
-
-    // Fully CLOSED — the golden: both methods leave nothing open.
+    // Fully CLOSED — the golden itself: nothing is left open.
     expect(openBasis(artifact).capital).toBe("0");
-    // Fully OPEN — the exit fill removed: both leave the whole notional open.
+    // Fully OPEN — the exit fill removed: the whole entry notional is open.
     const open = {
       ...artifact,
       fills: artifact.fills.filter((fill) => fill.simulatedFillId !== marks.exitFill.simulatedFillId),
     };
-    expect(openBasis(open).capital).toBe(notional);
+    expect(openBasis(open).capital).toBe(
+      marks.entryFills.reduce(
+        (total, fill) => addDecimal(total, mulDecimal(fill.price, fill.shares)),
+        "0",
+      ),
+    );
+    expect(openBasis(open).capital).toBe("17.2");
+  });
 
-    // PARTIAL — 25 of 50 retired. Average cost leaves B − B·25/50 = B × 0.5.
-    const averageCost = subDecimal(notional, mulDecimal(notional, "0.5"));
-    expect(averageCost).toBe("8.6");
-    const fifo = openBasis(withPartialExit(artifact)).capital;
-    expect(fifo).toBe("8.7");
-    expect(fifo).not.toBe(averageCost);
+  it("the oracle does not run the engine: support/reconcile.ts imports only the decimal arithmetic", () => {
+    const source = readFileSync(new URL("./support/reconcile.ts", import.meta.url), "utf8");
+    const specifiers = source
+      .split("\n")
+      .map((line) => /\bfrom\s*["']([^"'\n]+)["']\s*;?\s*$/u.exec(line)?.[1])
+      .filter((specifier): specifier is string => specifier !== undefined);
+    expect(specifiers).toEqual(["@polymarket-bot/decimal", "./artifact.js"]);
+    expect(source).not.toMatch(/\b(?:require|import)\s*\(/u);
+  });
+
+  it("the restated division policy is the decimal package's default, which packages/pnl relies on", () => {
+    // `packages/pnl` calls `divDecimal` with no options. The reconciler states
+    // 34 / ROUND_HALF_EVEN explicitly; if the package default ever moves, the
+    // engine moves with it and this pin names the drift.
+    expect(PNL_COST_DIVISION).toEqual({
+      precision: DIVISION_PRECISION,
+      rounding: DIVISION_ROUNDING,
+    });
+    expect(DIVISION_PRECISION).toBe(34);
   });
 });

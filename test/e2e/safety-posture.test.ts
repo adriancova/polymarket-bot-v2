@@ -190,6 +190,12 @@ describe("this package's own files carry no credential and no signer", () => {
       "vitest",
       "@polymarket-bot/decimal",
       "@polymarket-bot/domain",
+      // `RECON-1` r1: `reconciliation-attribution.test.ts` folds synthetic fills
+      // through the REAL PnL engine to establish the value the reconciler must
+      // agree with. A layer-1 accounting package — no I/O, signer, order path
+      // or network surface — already aliased by this suite's runner and
+      // tsconfig. `support/reconcile.ts` itself must never import it.
+      "@polymarket-bot/pnl",
       "@polymarket-bot/simulation",
       "@polymarket-bot/trader",
       "@polymarket-bot/trader/testing",

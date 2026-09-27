@@ -48,9 +48,11 @@ import {
   absDecimal,
   addDecimal,
   compareDecimal,
+  divDecimal,
   mulDecimal,
   negateDecimal,
   subDecimal,
+  type DivisionOptions,
 } from "@polymarket-bot/decimal";
 
 import type {
@@ -650,13 +652,20 @@ export function compareIngestSeq(left: string, right: string): -1 | 0 | 1 {
 /**
  * Two fill ids, with every embedded run of digits compared as an integer.
  *
- * The tiebreak inside one `atEventIngestSeq`. `packages/simulation` numbers the
- * fills of one crossing `${orderId}/t0/${index}` in the order it walked the
- * book, so a plain code-unit comparison would put `…/t0/10` before `…/t0/9` —
- * the error `compareIngestSeq` exists to avoid, one field later. Digit runs
- * compare by value (leading zeros stripped, then length, then code units),
- * everything else by code units, and a full tie falls back to the raw strings,
- * so the order is total and never consults a locale or a float.
+ * The tiebreak inside one `atEventIngestSeq`, so the fold's order is TOTAL and
+ * independent of the array. `packages/simulation` numbers the fills of one
+ * crossing `${orderId}/t0/${index}` in the order it walked the book, so a plain
+ * code-unit comparison would put `…/t0/10` before `…/t0/9` — the error
+ * `compareIngestSeq` exists to avoid, one field later. Digit runs compare by
+ * value (leading zeros stripped, then length, then code units), everything else
+ * by code units, and a full tie falls back to the raw strings, so the order is
+ * total and never consults a locale or a float.
+ *
+ * Under average cost (`RECON-1` r1) the tiebreak rarely moves the result:
+ * consecutive fills on the same side commute up to the last rounded digit of a
+ * partial removal, and a purchase and a sale that share one event are ordered
+ * by their ORDER ids — a convention, not the venue's booking order, which the
+ * artefact does not state beyond the array itself.
  */
 export function compareFillIds(left: string, right: string): -1 | 0 | 1 {
   const leftRuns = left.match(RUNS) ?? [];
@@ -683,6 +692,97 @@ export function compareFillIds(left: string, right: string): -1 | 0 | 1 {
 function inConsumptionOrder(left: ArtifactFill, right: ArtifactFill): number {
   const bySequence = compareIngestSeq(left.atEventIngestSeq, right.atEventIngestSeq);
   return bySequence !== 0 ? bySequence : compareFillIds(left.simulatedFillId, right.simulatedFillId);
+}
+
+// --- the open cost basis, by the engine's own cost method --------------------
+
+/**
+ * `packages/pnl`'s division policy for a PARTIAL removal, restated rather than
+ * inherited: 34 significant digits, ROUND_HALF_EVEN (`decimal.js` rounding mode
+ * 6). `packages/pnl/src/state.ts` calls `divDecimal` with NO options and so
+ * relies on the decimal package's documented defaults; writing the numbers
+ * down here means a change to those defaults would move the engine and NOT this
+ * oracle, and `reconciliation-attribution.test.ts` pins that the two still
+ * agree.
+ */
+export const PNL_COST_DIVISION: DivisionOptions = Object.freeze({
+  precision: 34,
+  rounding: 6,
+});
+
+/**
+ * The open cost basis `packages/pnl` holds after these fills, computed here from
+ * its SPECIFICATION and not by calling it (`RECON-1` r1).
+ *
+ * The specification (`packages/pnl/src/state.ts`, header and `applyTrade`):
+ * "Cost method: average cost per token asset. Removing q shares from a lot of Q
+ * shares with basis B removes basis B·q/Q — computed exactly when q = Q,
+ * otherwise via `divDecimal`'s documented policy (34 significant digits,
+ * ROUND_HALF_EVEN), with the REMAINING basis derived by exact subtraction so
+ * total basis is conserved to the penny across any split." A purchase adds its
+ * shares and `price × shares` to the lot; a lot sold down to zero is removed;
+ * a sale larger than the lot is refused (`PNL_OVERSELL`).
+ *
+ * WHY NOT CALL IT. This module is the oracle the engine is checked against; an
+ * oracle that ran the engine's fold would agree with it by construction. The
+ * decimal primitives are the arithmetic, not the system under test, so they
+ * are used; `PNL_COST_DIVISION` states the rounding policy explicitly.
+ *
+ * WHY IN SEQUENCE ORDER (`RISK2-R4`). Average cost is indifferent to the order
+ * of consecutive purchases but NOT to how purchases and sales interleave — a
+ * sale removes a share of the basis the lot holds AT THAT POINT — so the entry
+ * and exit fills are folded together, in {@link inConsumptionOrder}, never in
+ * the order the capture wrote them.
+ *
+ * THE SIGN CONVENTION IS THE TABLE'S, NOT `action`. The entry's fills add to
+ * the lot and the exit's fills remove from it, attributed by id exactly as
+ * every other row is. For this strategy's direct leg that is where the
+ * engine's BUY/SELL lands; it is also the convention the `ledger.*` and `exit.*`
+ * rows already use (the entry pays out, the exit takes in).
+ */
+function openCostBasisOf(
+  entryFills: readonly ArtifactFill[],
+  exitFills: readonly ArtifactFill[],
+): string {
+  const sequence = [
+    ...entryFills.map((fill) => ({ fill, opens: true })),
+    ...exitFills.map((fill) => ({ fill, opens: false })),
+  ].sort((left, right) => inConsumptionOrder(left.fill, right.fill));
+
+  const lots = new Map<string, { readonly shares: string; readonly costBasis: string }>();
+  for (const { fill, opens } of sequence) {
+    const lot = lots.get(fill.tokenId);
+    if (opens) {
+      lots.set(fill.tokenId, {
+        shares: addDecimal(lot?.shares ?? "0", fill.shares),
+        costBasis: addDecimal(lot?.costBasis ?? "0", mulDecimal(fill.price, fill.shares)),
+      });
+      continue;
+    }
+    if (lot === undefined || compareDecimal(fill.shares, lot.shares) > 0) {
+      throw new Error(
+        `exit fill ${fill.simulatedFillId} removes ${fill.shares} shares of token ` +
+          `${fill.tokenId} when, at that point in the sequence, the position holds ` +
+          `${lot?.shares ?? "0"}; packages/pnl refuses an oversell (PNL_OVERSELL), so there is ` +
+          "no engine cost basis to reconcile against",
+      );
+    }
+    if (compareDecimal(fill.shares, lot.shares) === 0) {
+      // q = Q: the whole basis leaves, exactly, and the lot closes.
+      lots.delete(fill.tokenId);
+      continue;
+    }
+    const removed = divDecimal(
+      mulDecimal(lot.costBasis, fill.shares),
+      lot.shares,
+      PNL_COST_DIVISION,
+    );
+    lots.set(fill.tokenId, {
+      shares: subDecimal(lot.shares, fill.shares),
+      costBasis: subDecimal(lot.costBasis, removed),
+    });
+  }
+  return sum([...lots.values()].map((lot) => lot.costBasis));
 }
 
 /**
@@ -736,49 +836,28 @@ export function buildReconciliation(
   const allUnroundedFees = sum(fills.map((fill) => unroundedVenueFee(fill, schedule)));
 
   /**
-   * The cost basis of the entry fills an exit has NOT yet retired, folded FIFO.
+   * The cost basis the position still holds, by `packages/pnl`'s OWN cost
+   * method — average cost — restated in {@link openCostBasisOf} (`RECON-1` r1).
    *
-   * Exact decimal and NO DIVISION: an average price would not be exactly
-   * representable, and §6 invariant 1 forbids reaching for a float to get one.
-   * It collapses to the whole entry notional while the bracket is open and to
-   * exactly `"0"` once it has closed.
+   * THIS USED TO BE A FIFO FOLD, and that was the wrong oracle. `RISK-2` wrote
+   * it FIFO to avoid a division (§6 invariant 1), describing it as
+   * "`packages/pnl`'s open cost basis … folded FIFO" — but `packages/pnl` is
+   * average cost (`state.ts`: "Cost method: average cost per token asset") and
+   * the persisted snapshot these rows compare against comes from it; FIFO is
+   * `apps/trader`'s allocator book (`allocation.ts`), a different number. The
+   * division concern is answered by the engine's own specification, which
+   * states an exact-decimal policy for it. The two methods agree in the only
+   * two states the committed golden holds — fully open (the whole notional) and
+   * fully closed (`"0"`) — so the golden is unchanged; on a PARTIAL exit at
+   * mixed lot prices FIFO flagged a correct run as unexplained.
    *
-   * IN THE ORDER THE RUN CONSUMED THE FILLS, NOT ARRAY ORDER (`RECON-1`, closing
-   * `RISK2-R4`). "First in" is a claim about time, and the artefact states time
-   * on every fill as `atEventIngestSeq`; the array is only the order the capture
-   * happened to write. Folding in array order left the unretired remainder —
-   * and so `pnl.capital_committed` and `pnl.worst_case_resolution` — dependent
-   * on how the document was serialised whenever an exit retires PART of the
-   * entry. The fold sorts by {@link inConsumptionOrder} instead.
-   *
-   * THE COST METHOD IS NOT `packages/pnl`'s (a `RECON-1` finding, reported and
-   * NOT changed here). This comment used to call the fold "`packages/pnl`'s open
-   * cost basis … folded FIFO", which is false: `packages/pnl/src/state.ts`
-   * states "Cost method: average cost per token asset", and the persisted
-   * snapshot these rows compare against comes from it; the FIFO book is
-   * `apps/trader`'s allocator (`allocation.ts`), a different number. The two
-   * methods agree EXACTLY in the only two states this suite's scenario has
-   * reached — fully open (the whole notional) and fully closed (`"0"`) — and in
-   * general diverge on a partial exit whenever the entry lots have different
-   * prices. Both PnL rows are then UNEXPLAINED — a loud failure, not a silent
-   * misstatement, because `EXACT_NO_DIFFERENCE` over a non-zero difference is a
-   * failure.
-   * `reconciliation-attribution.test.ts` pins the divergence so the day the
-   * model is aligned it fails and says so.
+   * RESIDUAL, FROZEN IN THE GOLDEN: the `projectedSource` text of
+   * `pnl.capital_committed` and `pnl.worst_case_resolution` below still says
+   * "FIFO". It is golden bytes, and this round may not change the golden; the
+   * NUMBERS are identical for every state the golden contains. Correcting the
+   * text is a golden regeneration, recorded as a `RECON-1` follow-up.
    */
-  let unretired = exitShares;
-  let openCostBasis = "0";
-  for (const fill of [...entryFills].sort(inConsumptionOrder)) {
-    if (compareDecimal(unretired, fill.shares) >= 0) {
-      unretired = subDecimal(unretired, fill.shares);
-      continue;
-    }
-    openCostBasis = addDecimal(
-      openCostBasis,
-      mulDecimal(fill.price, subDecimal(fill.shares, unretired)),
-    );
-    unretired = "0";
-  }
+  const openCostBasis = openCostBasisOf(entryFills, exitFills);
 
   // --- the strategy's own projections, from the PERSISTED decision ----------
 
