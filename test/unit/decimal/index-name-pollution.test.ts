@@ -693,15 +693,45 @@ describe("the refusal path restores BOTH intrinsics exactly (r2 LOW-1)", () => {
   const PROBE_CEILING_MS = 20_000;
 
   /**
-   * Each probe test's timeout, set above the ceiling (`CI-1`). While the spawn
-   * was synchronous nothing could interrupt it, so the ceiling always fired
-   * first: it killed the child and the test failed with the spawn's own error.
-   * Awaited, vitest's 5 s default would fire first instead and leave the child
-   * running past its test. This keeps the original order.
+   * Each probe test's timeout, set above the WORST CASE of spawns one test can
+   * wait on (`CI-1`; corrected by `CI-2` for `CI1-L4`).
+   *
+   * While the spawn was synchronous nothing could interrupt it, so the ceiling
+   * always fired first: it killed the child and the test failed with the
+   * spawn's own error. Awaited, the test's own timeout can fire first instead,
+   * and then the child outlives its test. This file has no kill-on-teardown, and
+   * vitest does not stop a timed-out test's loop, which goes on spawning.
+   *
+   * Why `MODES.length` ceilings:
+   * - `probe` memoizes an ANSWER, not a failure and not a spawn in flight.
+   * - Each test walks the modes in order and awaits one probe at a time, so it
+   *   spawns once for every mode not yet answered, one after another, until
+   *   its first failure. The first test to run can therefore spawn once per
+   *   mode.
+   * - No test therefore waits on more than `MODES.length` spawns in sequence.
+   * - Each spawn ends at the ceiling at the latest: `execFile` sends the child
+   *   SIGTERM, which the probe child does not handle, and rejects.
+   *
+   * The 10 s margin covers settling after each kill and the parse. So this
+   * timeout cannot fire while a spawn its test waits on is still running:
+   * - children that are slow but finish: the first test can wait on four spawns
+   *   of just under 20 s each, and passes;
+   * - children that hang: each test fails at its first unanswered mode, when
+   *   the ceiling kills that child after 20 s.
+   * A probe test therefore passes, or fails with the spawn's own error, and no
+   * probe child outlives its test.
+   *
+   * The `CI-1` value covered ONE ceiling (30 s). Measured in `CI-2`, with the
+   * first three children slowed to 9 s and the fourth hung: under 30 s the first
+   * test failed with `Test timed out in 30000ms` while the fourth child was
+   * still alive; under this timeout it fails through the ceiling instead.
    */
-  const PROBE_TEST_TIMEOUT_MS = PROBE_CEILING_MS + 10_000;
+  const PROBE_TEST_TIMEOUT_MS = MODES.length * PROBE_CEILING_MS + 10_000;
 
-  /** One spawn per mode, memoized: four processes for the whole block. */
+  /**
+   * One spawn per mode, memoized: four processes for the whole block when every
+   * spawn succeeds.
+   */
   const answers = new Map<string, ProbeAnswer>();
   async function probe(mode: string): Promise<ProbeAnswer> {
     const held = answers.get(mode);

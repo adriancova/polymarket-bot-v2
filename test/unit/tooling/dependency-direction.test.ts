@@ -85,14 +85,28 @@ const MAX_CHILD_OUTPUT_BYTES = 1024 * 1024;
  * on any non-zero exit and reports the status through an `error.code` that is a
  * number for an exit but a string for a spawn failure. Here `close` hands over
  * the exit code and `error` the spawn failure, each through its own channel.
+ *
+ * `deadlineMs` is optional, and only the two shared repository runs pass it
+ * (`CI-2`). When it expires, the child is killed with SIGKILL, because a run
+ * past its deadline is abandoned and nothing reads what it would still print.
+ * The promise then settles at once with `error` set; it does not wait for
+ * `close`, so a child that will not die cannot hold its readers either. If the
+ * child is still alive, it stays in `liveChildren` for `afterAll`. Without a
+ * deadline a child runs until it ends or its test's timeout fires, as it did
+ * before `CI-2`.
  */
-function spawnNode(args: readonly string[], cwd: string): Promise<SpawnResult> {
+function spawnNode(args: readonly string[], cwd: string, deadlineMs?: number): Promise<SpawnResult> {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     liveChildren.add(child);
     const chunks: { stdout: Buffer[]; stderr: Buffer[] } = { stdout: [], stderr: [] };
     const bytes = { stdout: 0, stderr: 0 };
     let error: Error | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const settle = (result: SpawnResult): void => {
+      if (deadline !== undefined) clearTimeout(deadline);
+      resolve(result);
+    };
     const text = (stream: "stdout" | "stderr"): string => Buffer.concat(chunks[stream]).toString("utf8");
     const collect =
       (stream: "stdout" | "stderr") =>
@@ -112,12 +126,21 @@ function spawnNode(args: readonly string[], cwd: string): Promise<SpawnResult> {
     // A child that could not be started may never emit `close`; settle now.
     child.on("error", (cause) => {
       liveChildren.delete(child);
-      resolve({ status: null, stdout: text("stdout"), stderr: text("stderr"), error: error ?? cause });
+      settle({ status: null, stdout: text("stdout"), stderr: text("stderr"), error: error ?? cause });
     });
     child.on("close", (code) => {
       liveChildren.delete(child);
-      resolve({ status: code, stdout: text("stdout"), stderr: text("stderr"), error });
+      settle({ status: code, stdout: text("stdout"), stderr: text("stderr"), error });
     });
+    if (deadlineMs !== undefined) {
+      deadline = setTimeout(() => {
+        error ??= new Error(
+          `child did not finish within its ${deadlineMs} ms deadline and was killed (node ${args.join(" ")})`,
+        );
+        child.kill("SIGKILL");
+        settle({ status: null, stdout: text("stdout"), stderr: text("stderr"), error });
+      }, deadlineMs);
+    }
   });
 }
 
@@ -128,8 +151,12 @@ interface CheckerRun {
   readonly output: string;
 }
 
-async function runChecker(root: string, extraArgs: readonly string[] = []): Promise<CheckerRun> {
-  const result = await spawnNode([checkerPath, "--root", root, ...extraArgs], repoRoot);
+async function runChecker(
+  root: string,
+  extraArgs: readonly string[] = [],
+  deadlineMs?: number,
+): Promise<CheckerRun> {
+  const result = await spawnNode([checkerPath, "--root", root, ...extraArgs], repoRoot, deadlineMs);
   if (result.error) throw result.error;
   const { stdout, stderr } = result;
   return { status: result.status ?? -1, stdout, stderr, output: `${stdout}${stderr}` };
@@ -334,40 +361,83 @@ function addAllowlistRow(contract: string, row: string): string {
  * they follow are copies, and the shipping contract they protect is the one
  * this run reads.
  *
- * The runs are made in this `beforeAll`, concurrently, under an explicit hook
- * timeout, so their cost no longer lands on the first reading test's 5 s. A
- * failed run does not fail the hook: `allSettled` only waits, and each reading
- * test awaits the same promise and reports the failure as its own.
+ * HOW A BAD RUN FAILS, AND WHAT IT MAY NOT TAKE WITH IT (`CI-2`, `CI1-L1`).
+ * A slow, hung or broken shared run fails exactly the five tests that read it.
+ * The other 182 still run.
+ *
+ * Under `CI-1`, the `beforeAll` hook AWAITED both runs under a 30 s hook
+ * timeout. A run that merely rejected already failed only its five readers.
+ * A SLOW run did not: the `CI-1` review made the two runs sleep 45 s, and the
+ * hook itself timed out (`Hook timed out in 30000ms`), which skipped all 187
+ * tests in the file.
+ *
+ * Now:
+ * - `beforeAll` STARTS both runs and returns without awaiting them, so no hook
+ *   waits on a child.
+ * - Each run carries its own deadline, `REPOSITORY_RUN_DEADLINE_MS`, counted
+ *   from its start. At the deadline the child is killed, and the run rejects
+ *   with an error that names the deadline.
+ * - The deadline sits on the RUN, not on each reader, so the verdict does not
+ *   depend on when a reader starts. Consider per-reader timeouts under a 45 s
+ *   run: the first reader times out at 30 s; the second starts then, finds the
+ *   run finishing at 45 s, and passes. A run over budget would fail one reader
+ *   and pass the rest. With the deadline on the run, a run over budget fails
+ *   all five, every time.
+ * - A no-op `.catch` is attached to each stored promise when it is made. A run
+ *   that rejects before any reader awaits it is therefore not an unhandled
+ *   rejection. Each reader still awaits the stored promise itself, and fails
+ *   with the run's own error.
+ * - Each reader has an explicit timeout, `REPOSITORY_READER_TIMEOUT_MS`, set
+ *   above the deadline. Both runs start before any test does, so the deadline
+ *   always settles a run before a reader's timeout fires.
  */
 /**
- * The hook's ceiling, from measurement: both runs together took 1.2 s alone
- * and 2.7 s under the full suite on a 24-thread laptop. On the GitHub runner
- * one run took up to 3.8 s, so even fully serialized the pair needs ~7.6 s —
- * too close to vitest's 10 s hook default. 30 s is ~4x that worst case.
+ * Each shared run's deadline, from measurement. Under `CI-1` it was the ceiling
+ * of the hook that awaited both runs:
+ * - both runs together took 1.2 s alone and 2.7 s under the full suite, on a
+ *   24-thread laptop;
+ * - on the GitHub runner one run took up to 3.8 s, so even run one after the
+ *   other the pair needs about 7.6 s, too close to vitest's 10 s hook default.
+ * 30 s is about 4x that worst case, and about 8x one run, which is now what
+ * the deadline bounds.
  */
-const REPOSITORY_RUNS_TIMEOUT_MS = 30_000;
+const REPOSITORY_RUN_DEADLINE_MS = 30_000;
+
+/**
+ * Each reader's test timeout: the deadline plus a margin, so the run's own
+ * deadline always settles it first. A reader then fails with the run's error,
+ * not with vitest's timeout.
+ */
+const REPOSITORY_READER_TIMEOUT_MS = REPOSITORY_RUN_DEADLINE_MS + 10_000;
 
 const repositoryRuns = new Map<"text" | "json", Promise<CheckerRun>>();
 
 function repositoryRun(mode: "text" | "json"): Promise<CheckerRun> {
   let run = repositoryRuns.get(mode);
   if (run === undefined) {
-    run = runChecker(repoRoot, mode === "json" ? ["--json"] : []);
+    run = runChecker(repoRoot, mode === "json" ? ["--json"] : [], REPOSITORY_RUN_DEADLINE_MS);
+    // Marks an early rejection as handled. The readers await `run` itself, not
+    // this derived promise, so they still see the rejection.
+    run.catch(() => undefined);
     repositoryRuns.set(mode, run);
   }
   return run;
 }
 
-beforeAll(async () => {
-  await Promise.allSettled([repositoryRun("text"), repositoryRun("json")]);
-}, REPOSITORY_RUNS_TIMEOUT_MS);
+beforeAll(() => {
+  // Started, NOT awaited: a slow run must not time out a hook that every test
+  // in this file depends on. The deadline and the `.catch` live in
+  // `repositoryRun`.
+  void repositoryRun("text");
+  void repositoryRun("json");
+});
 
 describe("dependency-direction check on this repository", () => {
   it("passes, and reports the S0 same-layer edge as permitted", async () => {
     const run = await repositoryRun("text");
     expect(run.output).toContain("PASS");
     expect(run.status).toBe(0);
-  });
+  }, REPOSITORY_READER_TIMEOUT_MS);
 
   it("classifies every workspace package into exactly one §2 layer", async () => {
     const report = parseCheckerJson(await repositoryRun("json"));
@@ -385,7 +455,7 @@ describe("dependency-direction check on this repository", () => {
     expect(layerOf("packages/strategies/static-bracket")).toBe(1);
     expect(layerOf("packages/event-bus")).toBe(2);
     expect(layerOf("apps/ops-cli")).toBe(3);
-  });
+  }, REPOSITORY_READER_TIMEOUT_MS);
 
   it("builds the §6 graph from declared workspace edges and excludes the root manifest", async () => {
     const report = parseCheckerJson(await repositoryRun("json"));
@@ -395,7 +465,7 @@ describe("dependency-direction check on this repository", () => {
     expect(report.packages.some((entry) => entry.dir === "")).toBe(false);
     const s0 = report.allowlist.find((row) => row.id === "S0");
     expect(s0).toEqual({ id: "S0", from: "packages/domain", to: "packages/decimal", layer: 0 });
-  });
+  }, REPOSITORY_READER_TIMEOUT_MS);
 });
 
 describe("dependency-direction check on fixture graphs", () => {
@@ -958,7 +1028,7 @@ describe("dependency-direction check — round-1 review regressions", () => {
         "S7",
       ]);
       for (const row of report.allowlist) expect(row.layer).not.toBeNull();
-    });
+    }, REPOSITORY_READER_TIMEOUT_MS);
   });
 });
 
@@ -2426,7 +2496,7 @@ describe("dependency-direction check — round-6 evaluator-acquisition regressio
       const run = await repositoryRun("text");
       expect(run.output).toContain("PASS");
       expect(run.status).toBe(0);
-    });
+    }, REPOSITORY_READER_TIMEOUT_MS);
   });
 
   describe("the noise the refused exemption lands on future package owners", () => {
