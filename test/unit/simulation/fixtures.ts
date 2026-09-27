@@ -321,7 +321,7 @@ export function runPins(overrides: Partial<ReplayRunPins> = {}): ReplayRunPins {
     feeSnapshotVersion: "fees/2026-08-24",
     rewardSnapshotVersion: "rewards/2026-08-24",
     settlementSpecVersions: [],
-    simulatorVersion: "wp-210/v1",
+    simulatorVersion: "wp-210/v2",
     ...overrides,
   };
 }

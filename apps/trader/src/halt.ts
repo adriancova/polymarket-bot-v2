@@ -80,6 +80,12 @@ export type HaltReasonCode =
   | "LEDGER_POSTING_REFUSED"
   /** §6 invariant 6: a cancel never reached a terminal fact within its bound. */
   | "CANCEL_UNRESOLVED"
+  /**
+   * §7.7 / SIM-1 ruling R3: the venue executed a BASKET plan only in part, and
+   * nothing in this process consumes the basket's `failurePolicy` yet. The
+   * booked legs are owned and known; what to do with them is the decision.
+   */
+  | "BASKET_PARTIALLY_EXECUTED"
   /** The strategy runtime could not persist a decision or its checkpoint. */
   | "RUNTIME_PERSISTENCE_FAILED"
   /** An event arrived that the trader cannot read as a §7.1 envelope. */
@@ -130,6 +136,7 @@ const ACTION_FOR: Readonly<Record<HaltReasonCode, HaltRecord["action"]>> = Objec
   UNEXPLAINED_ACTUAL_MOVEMENT: "RECONCILE_ACCOUNT",
   LEDGER_POSTING_REFUSED: "FULL_HALT",
   CANCEL_UNRESOLVED: "MANAGE_KNOWN_POSITIONS_ONLY",
+  BASKET_PARTIALLY_EXECUTED: "MANAGE_KNOWN_POSITIONS_ONLY",
   RUNTIME_PERSISTENCE_FAILED: "FULL_HALT",
   EVENT_UNREADABLE: "FULL_HALT",
   BOOK_DESYNCHRONIZED: "CANCEL_RESTING_ORDERS",

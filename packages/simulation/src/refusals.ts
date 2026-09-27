@@ -85,6 +85,12 @@ export const SIMULATION_REFUSAL_CODES = [
   "SIMULATED_VENUE_RATE_LIMITED",
   /** A submission was attempted for an order the venue already knows. */
   "SIMULATED_VENUE_DUPLICATE_ORDER",
+  /**
+   * A planned order was never sent, because another part of its plan failed
+   * first — the plan's pre-flight, or an earlier batch (SIM-1, ruling R3).
+   * Nothing was booked for it.
+   */
+  "SIMULATED_VENUE_ORDER_NOT_SUBMITTED",
   /** A cancel names an order this venue never accepted. */
   "SIMULATED_VENUE_UNKNOWN_ORDER",
   /**

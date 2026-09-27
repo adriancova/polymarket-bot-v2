@@ -149,6 +149,17 @@ and `decisionsPersisted` and the store line's `decisions` and `checkpoints`
 byte-identical — proven line by line, with the removed decisions identified
 by the order each delivered, in the round's handoff.
 
+**Re-captured by `SIM-1` (2026-09-27), the same way** (the scratch capture
+rendering the artifact twice, byte-equal, written once). Two lines moved and
+nothing else — proven line by line in the round's handoff: the `run` line's
+`simulator=wp-210/v1 → wp-210/v2` (O9: `run-pins.json`'s simulator version
+pin, bumped because the venue's behaviour changed), and the CANCELLED
+take-profit's `order` line, whose trailing recorded event moves `5 4 → 6 5`
+(O8: a cancel re-stamps the order's `atEvent` with the event it was cancelled
+at — event 6 — instead of keeping the one it was placed at). Every other
+order, fill, economics, decision, trace, ledger, position, PnL, health, store
+and driver line is byte-identical.
+
 ## Relationship to the other goldens
 
 `test/replay-golden/simulation/` (`WP-210`) pins the replay driver and the

@@ -46,6 +46,16 @@
  * | `REST` | no | either | **RESTS**: Tier 0 fills on touch/trade-through, Tier 1 reports the BAND |
  * | `MARKETABLE_LIMIT` | — | must be false | the immediate path (FAK/FOK/limit semantics) |
  *
+ * What the immediate path leaves (SIM-1): FILLED when nothing remains; a FAK
+ * remainder CANCELLED, keeping what filled (O1); a FOK that cannot fill whole
+ * REJECTED with nothing filled, under both tiers (O2); a GTC or GTD remainder
+ * REGISTERED to rest at its limit, whatever the planned style (O3). On a
+ * delayed market the order is DELAYED — nothing filled — until the recorded
+ * clock reaches `matchableAtNs`, when that same disposition applies (O5). So
+ * every order this venue holds is TERMINAL or can still change: RESTING and
+ * PARTIALLY_FILLED exactly when a resting record exists, DELAYED exactly when
+ * a pending disposition does.
+ *
  * A resting order is filled by OBSERVED trades, handed to
  * {@link SimulatedVenue.observeTrade} by the run driver — the same recorded
  * events that move the clock. Tier 0 grants the whole remaining size on touch or
@@ -74,6 +84,8 @@ import {
   type ExecutionPlanView,
   type ExecutionResult,
   type ExecutionVenue,
+  type NotPlacedOrder,
+  type PlacementPlanView,
   type PlannedOrderView,
   type RecordedEventIdentity,
   type SimulatedOrder,
@@ -88,7 +100,7 @@ import {
   type RestingFillBand,
   type SameInstantAdditions,
 } from "./queue.js";
-import type { RateLimitBudget } from "./rate-limit.js";
+import type { RateLimitBudget, RateLimitDecision } from "./rate-limit.js";
 import {
   defineData,
   describeForRefusal,
@@ -193,6 +205,123 @@ interface RestingRecord {
 }
 
 /**
+ * D-05 (`docs/venue/verified-2026-09-16.md`): "`post_orders` accepts between 1
+ * and 15 signed orders per call", and the per-signer bucket admits a batch
+ * all-or-nothing (venue report §8). A plan larger than this is several batches.
+ * A VENUE FACT with a date; re-verify each phase (§1.2).
+ */
+const PLACE_BATCH_MAXIMUM_ORDERS = 15;
+
+/** One planned order that passed the whole-plan pre-flight, with the policy's answers. */
+interface PreflightedOrder {
+  /** The execution group's market, exactly as the group names it. */
+  readonly marketId: string;
+  readonly planned: PlannedOrderView;
+  readonly timeInForce: TimeInForce;
+  readonly statedExpiryNs: bigint | undefined;
+}
+
+/** A resting registration, staged: it reaches `#resting` / `#bands` only at commit. */
+interface StagedRest {
+  readonly record: RestingRecord;
+  /** The Tier-1 band; `undefined` under Tier 0. */
+  readonly band: RestingFillBand | undefined;
+}
+
+/** The states an order can be TERMINAL in the moment it executes. */
+type TerminalOnArrival = "FILLED" | "CANCELLED" | "REJECTED" | "EXPIRED";
+
+/** What happens to an executed order: it is terminal, or its remainder rests. */
+type Disposition =
+  | { readonly kind: "TERMINAL"; readonly state: TerminalOnArrival }
+  | { readonly kind: "RESTS"; readonly rest: StagedRest };
+
+/**
+ * A DELAYED order's already-computed outcome (O5; ADR-012 §5.1, D-18), applied
+ * when the venue's recorded clock reaches `matchableAtNs` and not before.
+ */
+interface PendingDelayed {
+  readonly simulatedOrderId: string;
+  readonly matchableAtNs: bigint;
+  /** Computed at submission against the book at `matchableAtNs`; booked at resolution. */
+  readonly fills: readonly SimulatedFill[];
+  readonly filledShares: string;
+  readonly disposition: Disposition;
+}
+
+/**
+ * One order's execution, STAGED. Staging reads the book, the policy, the
+ * model, the observed trades and (Tier 1) draws the seeded latency ONCE; it
+ * writes none of the venue's state. `#commit` applies it.
+ */
+interface StagedOrder {
+  readonly order: SimulatedOrder;
+  /** Fills booked at commit. Empty for a DELAYED order, whose fills wait. */
+  readonly fills: readonly SimulatedFill[];
+  readonly rest: StagedRest | undefined;
+  readonly pending: PendingDelayed | undefined;
+}
+
+/**
+ * What one `submit` has done so far — kept OUTSIDE `#submitSync` so the
+ * containment path can still report what a plan BOOKED before a throw (`PP-3`).
+ */
+interface PlacementProgress {
+  planId: string;
+  /** Every planned order id the plan let the venue read, in plan order, once. */
+  plannedIds: readonly string[];
+  readonly orders: SimulatedOrder[];
+  readonly fills: SimulatedFill[];
+  readonly bands: RestingFillBand[];
+  readonly notPlaced: NotPlacedOrder[];
+  /** The FIRST failure; `undefined` while everything has been placed. */
+  cause: SimulationRefusal | undefined;
+}
+
+function newProgress(): PlacementProgress {
+  return { planId: "", plannedIds: [], orders: [], fills: [], bands: [], notPlaced: [], cause: undefined };
+}
+
+function notPlacedFrom(plannedOrderId: string, refusal: SimulationRefusal): NotPlacedOrder {
+  return { plannedOrderId, refusalCode: refusal.code, refusalMessage: refusal.message };
+}
+
+/**
+ * A non-terminal order state: the order can still fill, expire, or be
+ * cancelled (or, DELAYED, take its disposition). Shared by the market-scoped
+ * cancel's targets and the account's open orders, so the two cannot disagree.
+ */
+function isLiveState(state: SimulatedOrder["state"]): boolean {
+  return state === "ACCEPTED" || state === "DELAYED" || state === "RESTING" || state === "PARTIALLY_FILLED";
+}
+
+/**
+ * Every planned order id a MATERIALIZED placement plan lets the venue read, in
+ * plan order, each once — so a refusal can name what it did not place without
+ * trusting the plan's shape (which the pre-flight has not validated yet).
+ */
+function readablePlannedOrderIds(plan: ExecutionPlanView): readonly string[] {
+  if (plan.planKind === "CANCEL") return [];
+  const groups: unknown = plan.groups;
+  if (!Array.isArray(groups)) return [];
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const group of groups as readonly unknown[]) {
+    if (group === null || typeof group !== "object") continue;
+    const orders: unknown = (group as { readonly orders?: unknown }).orders;
+    if (!Array.isArray(orders)) continue;
+    for (const planned of orders as readonly unknown[]) {
+      if (planned === null || typeof planned !== "object") continue;
+      const id: unknown = (planned as { readonly plannedOrderId?: unknown }).plannedOrderId;
+      if (!isNonEmptyString(id) || seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
+/**
  * A total, locale-independent string comparison.
  *
  * `localeCompare` depends on the host's ICU data, which is exactly the kind of
@@ -228,6 +357,8 @@ export class SimulatedVenue implements ExecutionVenue {
   readonly #resting = new Map<string, RestingRecord>();
   readonly #bands = new Map<string, RestingFillBand>();
   readonly #trades = new Map<string, ObservedTrade[]>();
+  /** O5: DELAYED orders awaiting `matchableAtNs`, by order id. */
+  readonly #pending = new Map<string, PendingDelayed>();
   #cash: string;
   #atEvent: RecordedEventIdentity | undefined;
 
@@ -298,22 +429,32 @@ export class SimulatedVenue implements ExecutionVenue {
    *
    * It ANSWERS now rather than returning `void`, because a refusal a caller
    * cannot see is not a refusal: `replay.ts` stops the run on one.
+   *
+   * SIM-1: positioning is also where recorded TIME reaches the venue's own
+   * bookkeeping. At the venue clock's instant, every DELAYED order whose
+   * window has closed takes its already-computed disposition (O5) and every
+   * resting GTD order past its effective expiry expires (O4) — see `#sweep`.
+   * Both are stamped with the event the venue has just been positioned at.
    */
   observe(identity: RecordedEventIdentity): SimulationResult<null> {
-    const read = readOwnPlainInput<RecordedEventIdentity>(
-      identity,
-      "the recorded event identity the venue is positioned at",
-    );
-    if (!read.ok) return read;
-    const materialized = read.value;
-    if (materialized === null || typeof materialized !== "object") {
-      return simulationFailure(
-        "SIMULATION_INPUT_INVALID",
-        "a recorded event identity is a record (§7.1: gatewayEpoch, ingestSeq, receivedAt, datasetRowOrdinal)",
+    return totally("positioning the simulated venue at a recorded event", () => {
+      const read = readOwnPlainInput<RecordedEventIdentity>(
+        identity,
+        "the recorded event identity the venue is positioned at",
       );
-    }
-    this.#atEvent = ownFrozenTree<RecordedEventIdentity>(materialized);
-    return simulationOk(null);
+      if (!read.ok) return read;
+      const materialized = read.value;
+      if (materialized === null || typeof materialized !== "object") {
+        return simulationFailure(
+          "SIMULATION_INPUT_INVALID",
+          "a recorded event identity is a record (§7.1: gatewayEpoch, ingestSeq, receivedAt, datasetRowOrdinal)",
+        );
+      }
+      const atEvent = ownFrozenTree<RecordedEventIdentity>(materialized);
+      this.#atEvent = atEvent;
+      this.#sweep(this.#options.clock.monotonicNs(), atEvent);
+      return simulationOk(null);
+    });
   }
 
   /**
@@ -360,12 +501,23 @@ export class SimulatedVenue implements ExecutionVenue {
    * rather than the plan, and a plan that is not data is refused
    * `SIMULATION_INPUT_NOT_DATA` under an id of `""` — a plan whose id cannot be
    * read as data has no id this venue may quote.
+   *
+   * SIM-1, the user's ruling R3 — PER-ORDER RESULTS. A placement plan is
+   * pre-flighted whole (nothing booked, no token spent, when it fails), then
+   * admitted per batch of at most 15 orders all-or-nothing, and every order
+   * that was booked is REPORTED, whatever happened to the rest: a plan that
+   * books some orders and not others answers `accepted: false`,
+   * `outcome: "PARTIAL"`, the booked orders (with their fills and bands) in
+   * `orders`/`fills`/`bands`, and every other planned order in `notPlaced`
+   * with its own refusal. That includes the containment path: a throw after
+   * booking started still reports what was booked (`PP-3`).
    */
   async submit(plan: ExecutionPlanView): Promise<ExecutionResult> {
+    const progress = newProgress();
     return await Promise.resolve(
       totallyResult(
-        () => this.#submitSync(plan),
-        (refusal) => this.#refuse("", refusal),
+        () => this.#submitSync(plan, progress),
+        (refusal) => this.#refuseInProgress(progress, refusal),
       ),
     );
   }
@@ -475,14 +627,28 @@ export class SimulatedVenue implements ExecutionVenue {
 
   // -------------------------------------------------------------------------
 
-  #refuse(executionPlanId: string, refusal: SimulationRefusal): ExecutionResult {
+  /**
+   * A refusal that booked NOTHING (R3's fully refused shape).
+   *
+   * `notPlaced` names every planned order the caller's plan let this venue
+   * read, each with the refusal, so a consumer never has to infer "nothing
+   * was placed" from an empty list. A plan whose orders cannot be read at all
+   * (not data, no groups) is refused with `notPlaced: []`.
+   */
+  #refuse(
+    executionPlanId: string,
+    refusal: SimulationRefusal,
+    notPlaced: readonly NotPlacedOrder[] = [],
+  ): ExecutionResult {
     return ownFrozenTree<ExecutionResult>({
       executionPlanId: typeof executionPlanId === "string" ? executionPlanId : "",
       accepted: false,
+      outcome: "REFUSED",
       orders: [],
       fills: [],
       bands: [],
       notCancelled: [],
+      notPlaced,
       rateLimitModel: this.#options.rateLimits.modelKind,
       rateLimitDisclosure: this.#options.rateLimits.disclosure,
       refusalCode: refusal.code,
@@ -492,7 +658,89 @@ export class SimulatedVenue implements ExecutionVenue {
     });
   }
 
-  #submitSync(offered: ExecutionPlanView): ExecutionResult {
+  /**
+   * A placement plan's answer (R3), from what was BOOKED and what was NOT.
+   *
+   * - nothing refused: `accepted: true`, `outcome: "ACCEPTED"`;
+   * - something booked and something refused: `accepted: false`,
+   *   `outcome: "PARTIAL"`, `orders`/`fills`/`bands` list what WAS booked (it
+   *   is working or done at this venue, and cash and positions already moved
+   *   for its fills), `notPlaced` lists the rest, each with its own refusal;
+   * - nothing booked: `accepted: false`, `outcome: "REFUSED"`.
+   *
+   * `refusalCode` is the FIRST failure's code — the cause — so a consumer that
+   * reads only the code keeps reading the same codes a whole refusal always
+   * carried.
+   */
+  #placementResult(progress: PlacementProgress): ExecutionResult {
+    const cause = progress.cause;
+    if (cause === undefined && progress.notPlaced.length === 0) {
+      return ownFrozenTree<ExecutionResult>({
+        executionPlanId: progress.planId,
+        accepted: true,
+        outcome: "ACCEPTED",
+        orders: progress.orders,
+        fills: progress.fills,
+        bands: progress.bands,
+        notCancelled: [],
+        notPlaced: [],
+        rateLimitModel: this.#options.rateLimits.modelKind,
+        rateLimitDisclosure: this.#options.rateLimits.disclosure,
+        venueClass: "SIMULATED",
+        planningDepthAwareness: PLANNING_DEPTH_AWARENESS,
+      });
+    }
+    // Every path that lists a planned order as not placed records the cause
+    // first; the fallback is the first listed refusal, never an invented one.
+    const first = progress.notPlaced[0];
+    const code = cause?.code ?? first?.refusalCode ?? "SIMULATION_INTERNAL";
+    const message = cause?.message ?? first?.refusalMessage ?? "the plan was not fully placed";
+    const partial = progress.orders.length > 0;
+    return ownFrozenTree<ExecutionResult>({
+      executionPlanId: progress.planId,
+      accepted: false,
+      outcome: partial ? "PARTIAL" : "REFUSED",
+      orders: progress.orders,
+      fills: progress.fills,
+      bands: progress.bands,
+      notCancelled: [],
+      notPlaced: progress.notPlaced,
+      rateLimitModel: this.#options.rateLimits.modelKind,
+      rateLimitDisclosure: this.#options.rateLimits.disclosure,
+      refusalCode: code,
+      refusalMessage: partial
+        ? `${String(progress.orders.length)} of ${String(progress.orders.length + progress.notPlaced.length)} planned order(s) were BOOKED and are listed in orders; the rest were not placed and are listed in notPlaced (R3). First failure: ${message}`
+        : message,
+      venueClass: "SIMULATED",
+      planningDepthAwareness: PLANNING_DEPTH_AWARENESS,
+    });
+  }
+
+  /**
+   * The containment answer for a throw that escaped `#submitSync` (`PP-3`).
+   *
+   * Everything the plan had BOOKED before the throw is still listed — the
+   * orders are in this venue's book and their fills already moved cash — and
+   * every planned order not booked is listed as not placed with the contained
+   * refusal. A throw before the plan could be read keeps the old shape: an
+   * empty refusal under the id `""`.
+   */
+  #refuseInProgress(progress: PlacementProgress, refusal: SimulationRefusal): ExecutionResult {
+    const listed = new Set<string>(progress.notPlaced.map((entry) => entry.plannedOrderId));
+    for (const order of progress.orders) listed.add(order.plannedOrderId);
+    for (const plannedOrderId of progress.plannedIds) {
+      if (listed.has(plannedOrderId)) continue;
+      listed.add(plannedOrderId);
+      progress.notPlaced.push(notPlacedFrom(plannedOrderId, refusal));
+    }
+    if (progress.cause === undefined) progress.cause = refusal;
+    if (progress.orders.length === 0) {
+      return this.#refuse(progress.planId, refusal, progress.notPlaced);
+    }
+    return this.#placementResult(progress);
+  }
+
+  #submitSync(offered: ExecutionPlanView, progress: PlacementProgress): ExecutionResult {
     // D1 FIRST: see {@link SimulatedVenue.submit}. Everything below reads the
     // MATERIALIZED plan, so the order this venue books is the order it validated.
     const read = readOwnPlainInput<ExecutionPlanView>(offered, "the execution plan");
@@ -504,9 +752,16 @@ export class SimulatedVenue implements ExecutionVenue {
     // Read ONCE, from the materialized tree, so every refusal below quotes the
     // same id the accepted result would have carried.
     const planId: string = typeof plan.executionPlanId === "string" ? plan.executionPlanId : "";
-    if (!(SIMULATED_RUN_MODES as readonly string[]).includes(plan.runMode)) {
-      return this.#refuse(
+    progress.planId = planId;
+    progress.plannedIds = readablePlannedOrderIds(plan);
+    const refuseWhole = (refusal: SimulationRefusal): ExecutionResult =>
+      this.#refuse(
         planId,
+        refusal,
+        progress.plannedIds.map((plannedOrderId) => notPlacedFrom(plannedOrderId, refusal)),
+      );
+    if (!(SIMULATED_RUN_MODES as readonly string[]).includes(plan.runMode)) {
+      return refuseWhole(
         simulationRefusal(
           "SIMULATED_VENUE_RUN_MODE_REQUIRES_LIVE_SIGNER",
           `run mode ${String(plan.runMode)} requires a live signer and real orders (§11); a simulated venue may not serve it`,
@@ -515,8 +770,7 @@ export class SimulatedVenue implements ExecutionVenue {
       );
     }
     if (plan.runMode !== this.#options.runMode) {
-      return this.#refuse(
-        planId,
+      return refuseWhole(
         simulationRefusal(
           "SIMULATED_VENUE_PLAN_UNSUPPORTED",
           `this venue serves ${this.#options.runMode} and the plan names ${plan.runMode}`,
@@ -525,8 +779,7 @@ export class SimulatedVenue implements ExecutionVenue {
       );
     }
     if (!isCanonicalDecimalString(this.#cash)) {
-      return this.#refuse(
-        planId,
+      return refuseWhole(
         simulationRefusal(
           "SIMULATION_INPUT_INVALID",
           "the venue's cash balance is not a canonical decimal string; every economic value it books is exact (§6 invariant 1)",
@@ -535,11 +788,10 @@ export class SimulatedVenue implements ExecutionVenue {
       );
     }
     const fees = readFeeScheduleSnapshot(this.#options.feeSnapshot);
-    if (!fees.ok) return this.#refuse(planId, fees.refusal);
+    if (!fees.ok) return refuseWhole(fees.refusal);
     const atEvent = this.#atEvent;
     if (atEvent === undefined) {
-      return this.#refuse(
-        planId,
+      return refuseWhole(
         simulationRefusal(
           "SIMULATED_VENUE_NO_BOOK",
           "the venue has not been positioned at any recorded event, so nothing it produced could be anchored to one",
@@ -561,12 +813,14 @@ export class SimulatedVenue implements ExecutionVenue {
       return ownFrozenTree<ExecutionResult>({
         executionPlanId: plan.executionPlanId,
         accepted: !failed,
+        outcome: !failed ? "ACCEPTED" : result.cancelled.length > 0 ? "PARTIAL" : "REFUSED",
         orders: result.cancelled
           .map((id) => this.#orders.get(id))
           .filter((order): order is SimulatedOrder => order !== undefined),
         fills: [],
         bands: [],
         notCancelled: result.notCancelled,
+        notPlaced: [],
         rateLimitModel: this.#options.rateLimits.modelKind,
         rateLimitDisclosure: this.#options.rateLimits.disclosure,
         ...(failed
@@ -580,87 +834,194 @@ export class SimulatedVenue implements ExecutionVenue {
       });
     }
 
-    if (!Array.isArray(plan.groups)) {
+    // --- R3 (1): the whole plan's LOCAL checks, before anything is booked ----
+    //
+    // Everything a live OMS can decide without the venue — the plan's shape,
+    // every planned order's own validity, duplicate ids (within the plan and
+    // against this venue's book), and the order type the policy states — is
+    // decided for the WHOLE plan first. A plan that fails here spends no rate-
+    // limit token and books nothing: nothing of it was ever sent.
+    const preflight = this.#preflight(plan);
+    if (!preflight.ok) {
+      const failedAt = preflight.failedAt;
+      const refusal = preflight.refusal;
       return this.#refuse(
         planId,
-        simulationRefusal("SIMULATION_INPUT_INVALID", "a placement plan carries execution groups"),
+        refusal,
+        progress.plannedIds.map((plannedOrderId) =>
+          plannedOrderId === failedAt
+            ? notPlacedFrom(plannedOrderId, refusal)
+            : notPlacedFrom(
+                plannedOrderId,
+                simulationRefusal(
+                  "SIMULATED_VENUE_ORDER_NOT_SUBMITTED",
+                  `the plan failed its pre-flight check (${refusal.code}${failedAt === undefined ? "" : ` at planned order ${failedAt}`}), so none of its orders was sent: ${refusal.message}`,
+                  { cause: refusal.code },
+                ),
+              ),
+        ),
       );
     }
 
-    const orders: SimulatedOrder[] = [];
-    const fills: SimulatedFill[] = [];
-    const bands: RestingFillBand[] = [];
+    // --- R3 (2): admission per BATCH of at most 15, all-or-nothing ----------
+    //
+    // D-05: `POST /orders` accepts 1 to 15 signed orders; the per-signer
+    // bucket admits a batch "only when the bucket contains enough tokens for
+    // every entry. Otherwise, the entire request is rejected and no entries are
+    // processed" (venue report §8; ADR-012 §5.6: the simulator applies the same
+    // budget model). So the plan is cut into batches in plan order and each
+    // batch is admitted with ONE `admit(count)`.
+    //
+    // Inside an admitted batch every entry executes on its own — the venue's
+    // batch response is per entry — so a failed entry refuses that entry only.
+    // Once a batch had a failure (or was refused), the LATER batches are not
+    // sent. That stop is this simulator's choice for a plan it cannot finish,
+    // not a venue fact, and README §5 item 13 discloses it.
+    for (let start = 0; start < preflight.entries.length; start += PLACE_BATCH_MAXIMUM_ORDERS) {
+      const batch = preflight.entries.slice(start, start + PLACE_BATCH_MAXIMUM_ORDERS);
+      const cause = progress.cause;
+      if (cause !== undefined) {
+        for (const entry of batch) {
+          progress.notPlaced.push(
+            notPlacedFrom(
+              entry.planned.plannedOrderId,
+              simulationRefusal(
+                "SIMULATED_VENUE_ORDER_NOT_SUBMITTED",
+                `not sent: an earlier batch of this plan failed (${cause.code}), and the venue sends no later batch of a plan it could not place whole`,
+                { cause: cause.code },
+              ),
+            ),
+          );
+        }
+        continue;
+      }
+      const admitted = totally("admitting a batch against the rate-limit budget", () =>
+        simulationOk(
+          this.#options.rateLimits.admit({
+            kind: "PLACE",
+            priority: "PLACEMENT",
+            count: batch.length,
+            atNs: this.#options.clock.monotonicNs(),
+          }),
+        ),
+      );
+      if (!admitted.ok || !admitted.value.admitted) {
+        const refusal = !admitted.ok
+          ? admitted.refusal
+          : simulationRefusal(
+              "SIMULATED_VENUE_RATE_LIMITED",
+              admitted.value.reason ??
+                "the rate-limit budget refused the placement (§9.13, ADR-012 §5.6)",
+              { batchSize: batch.length, firstPlannedOrderId: batch[0]?.planned.plannedOrderId ?? "" },
+            );
+        for (const entry of batch) {
+          progress.notPlaced.push(notPlacedFrom(entry.planned.plannedOrderId, refusal));
+        }
+        progress.cause = refusal;
+        continue;
+      }
+      let batchFailure: SimulationRefusal | undefined;
+      for (const entry of batch) {
+        // STAGE, then COMMIT. Nothing a stage does touches this venue's book,
+        // cash, positions or resting set, so a refusal OR a throw while
+        // staging one order (contained here, per order: `PP-3`, `PP-17`)
+        // leaves no trace of it, and the orders already committed stand.
+        const staged = totally("executing one planned order at the simulated venue", () =>
+          this.#stageOne(plan, entry, atEvent, fees.value),
+        );
+        if (!staged.ok) {
+          progress.notPlaced.push(notPlacedFrom(entry.planned.plannedOrderId, staged.refusal));
+          batchFailure ??= staged.refusal;
+          continue;
+        }
+        this.#commit(staged.value);
+        progress.orders.push(staged.value.order);
+        for (const fill of staged.value.fills) progress.fills.push(fill);
+        const band = staged.value.rest?.band;
+        if (band !== undefined) progress.bands.push(band);
+      }
+      if (batchFailure !== undefined) progress.cause = batchFailure;
+    }
+
+    return this.#placementResult(progress);
+  }
+
+  /**
+   * R3's pre-flight: the whole plan's LOCAL checks, in plan order.
+   *
+   * Reads the execution policy ONCE per planned order (its time-in-force and
+   * its stated expiry) and hands both to the execution step, so a policy is
+   * never asked the same question twice for one submission. A policy that
+   * THROWS is contained here, per order: the plan fails pre-flight and nothing
+   * is booked.
+   */
+  #preflight(
+    plan: PlacementPlanView,
+  ):
+    | { readonly ok: true; readonly entries: readonly PreflightedOrder[] }
+    | { readonly ok: false; readonly refusal: SimulationRefusal; readonly failedAt?: string } {
+    if (!Array.isArray(plan.groups)) {
+      return {
+        ok: false,
+        refusal: simulationRefusal("SIMULATION_INPUT_INVALID", "a placement plan carries execution groups"),
+      };
+    }
+    const entries: PreflightedOrder[] = [];
+    const inPlan = new Set<string>();
     for (const group of plan.groups) {
       if (group === null || typeof group !== "object" || !Array.isArray(group.orders)) {
-        return this.#refuse(
-          planId,
-          simulationRefusal("SIMULATION_INPUT_INVALID", "an execution group carries planned orders"),
-        );
+        return {
+          ok: false,
+          refusal: simulationRefusal("SIMULATION_INPUT_INVALID", "an execution group carries planned orders"),
+        };
       }
       for (const planned of group.orders) {
         const validated = validatePlannedOrder(planned);
-        if (!validated.ok) return this.#refuse(planId, validated.refusal);
-        if (this.#orders.has(planned.plannedOrderId)) {
-          return this.#refuse(
-            planId,
-            simulationRefusal(
+        if (!validated.ok) {
+          const named: unknown =
+            planned !== null && typeof planned === "object" ? planned.plannedOrderId : undefined;
+          return {
+            ok: false,
+            refusal: validated.refusal,
+            ...(isNonEmptyString(named) ? { failedAt: named } : {}),
+          };
+        }
+        const plannedOrderId = planned.plannedOrderId;
+        if (inPlan.has(plannedOrderId) || this.#orders.has(plannedOrderId)) {
+          return {
+            ok: false,
+            failedAt: plannedOrderId,
+            refusal: simulationRefusal(
               "SIMULATED_VENUE_DUPLICATE_ORDER",
               "a planned order id was submitted twice; §6 invariant 6 makes an unknown submission a reconciliation question, never a silent retry",
-              { plannedOrderId: planned.plannedOrderId },
+              { plannedOrderId },
             ),
-          );
+          };
         }
-        const admitted = this.#options.rateLimits.admit({
-          kind: "PLACE",
-          priority: "PLACEMENT",
-          count: 1,
-          atNs: this.#options.clock.monotonicNs(),
+        inPlan.add(plannedOrderId);
+        const policy = totally("reading the execution policy for one planned order", () =>
+          simulationOk(this.#policyFor(planned)),
+        );
+        if (!policy.ok) return { ok: false, failedAt: plannedOrderId, refusal: policy.refusal };
+        if ("refusal" in policy.value) {
+          return { ok: false, failedAt: plannedOrderId, refusal: policy.value.refusal };
+        }
+        entries.push({
+          marketId: group.marketId,
+          planned,
+          timeInForce: policy.value.timeInForce,
+          statedExpiryNs: policy.value.statedExpiryNs,
         });
-        if (!admitted.admitted) {
-          return this.#refuse(
-            planId,
-            simulationRefusal(
-              "SIMULATED_VENUE_RATE_LIMITED",
-              admitted.reason ??
-                "the rate-limit budget refused the placement (§9.13, ADR-012 §5.6)",
-              { plannedOrderId: planned.plannedOrderId },
-            ),
-          );
-        }
-        const executed = this.#executeOne(plan, group.marketId, planned, atEvent, fees.value);
-        if ("refusal" in executed) return this.#refuse(planId, executed.refusal);
-        orders.push(executed.order);
-        for (const fill of executed.fills) fills.push(fill);
-        if (executed.band !== undefined) bands.push(executed.band);
       }
     }
-
-    return ownFrozenTree<ExecutionResult>({
-      executionPlanId: plan.executionPlanId,
-      accepted: true,
-      orders,
-      fills,
-      bands,
-      notCancelled: [],
-      rateLimitModel: this.#options.rateLimits.modelKind,
-      rateLimitDisclosure: this.#options.rateLimits.disclosure,
-      venueClass: "SIMULATED",
-      planningDepthAwareness: PLANNING_DEPTH_AWARENESS,
-    });
+    return { ok: true, entries };
   }
 
-  #executeOne(
-    plan: ExecutionPlanView,
-    marketId: string,
+  /** The order-type checks a live OMS makes before it sends anything. */
+  #policyFor(
     planned: PlannedOrderView,
-    atEvent: RecordedEventIdentity,
-    feeSnapshot: FeeScheduleSnapshot,
   ):
-    | {
-        readonly order: SimulatedOrder;
-        readonly fills: readonly SimulatedFill[];
-        readonly band?: RestingFillBand;
-      }
+    | { readonly timeInForce: TimeInForce; readonly statedExpiryNs: bigint | undefined }
     | { readonly refusal: SimulationRefusal } {
     const timeInForce = this.#options.policy.timeInForceFor(planned);
     if (timeInForce !== "GTC" && timeInForce !== "GTD" && timeInForce !== "FAK" && timeInForce !== "FOK") {
@@ -690,7 +1051,6 @@ export class SimulatedVenue implements ExecutionVenue {
         ),
       };
     }
-
     const statedExpiryNs = this.#options.policy.statedExpiryNsFor(planned);
     if (timeInForce === "GTD" && typeof statedExpiryNs !== "bigint") {
       return {
@@ -701,70 +1061,82 @@ export class SimulatedVenue implements ExecutionVenue {
         ),
       };
     }
+    return { timeInForce, statedExpiryNs: typeof statedExpiryNs === "bigint" ? statedExpiryNs : undefined };
+  }
 
+  /** Stages one pre-flighted order under the venue's tier. Touches no venue state. */
+  #stageOne(
+    plan: PlacementPlanView,
+    entry: PreflightedOrder,
+    atEvent: RecordedEventIdentity,
+    feeSnapshot: FeeScheduleSnapshot,
+  ): SimulationResult<StagedOrder> {
     return this.#options.model.tier === "TIER_0"
-      ? this.#executeTier0(plan, marketId, planned, atEvent, feeSnapshot, timeInForce, statedExpiryNs)
-      : this.#executeTier1(plan, marketId, planned, atEvent, feeSnapshot, timeInForce, statedExpiryNs);
+      ? this.#stageTier0(plan, entry, atEvent, feeSnapshot)
+      : this.#stageTier1(plan, entry, atEvent, feeSnapshot);
   }
 
   // --- Tier 0 ---------------------------------------------------------------
 
-  #executeTier0(
-    plan: ExecutionPlanView,
-    marketId: string,
-    planned: PlannedOrderView,
+  #stageTier0(
+    plan: PlacementPlanView,
+    entry: PreflightedOrder,
     atEvent: RecordedEventIdentity,
     feeSnapshot: FeeScheduleSnapshot,
-    timeInForce: TimeInForce,
-    statedExpiryNs: bigint | undefined,
-  ):
-    | { readonly order: SimulatedOrder; readonly fills: readonly SimulatedFill[] }
-    | { readonly refusal: SimulationRefusal } {
+  ): SimulationResult<StagedOrder> {
+    const { planned, marketId, timeInForce, statedExpiryNs } = entry;
     const books = this.#options.books;
     if (books === undefined) {
-      return {
-        refusal: simulationRefusal(
-          "SIMULATED_VENUE_PLAN_UNSUPPORTED",
-          "a Tier-0 venue needs a book provider",
-        ),
-      };
+      return simulationFailure(
+        "SIMULATED_VENUE_PLAN_UNSUPPORTED",
+        "a Tier-0 venue needs a book provider",
+      );
     }
     const book = books.book({ marketId, side: planned.side });
     if (book === undefined) {
-      return {
-        refusal: simulationRefusal(
-          "SIMULATED_VENUE_NO_BOOK",
-          "no book state exists for the market and side the plan names; §6 invariant 12 refuses to act on unknown book state",
-          { marketId, side: planned.side },
-        ),
-      };
+      return simulationFailure(
+        "SIMULATED_VENUE_NO_BOOK",
+        "no book state exists for the market and side the plan names; §6 invariant 12 refuses to act on unknown book state",
+        { marketId, side: planned.side },
+      );
     }
 
     const crossing = isCrossing(book, planned);
-    if (!crossing.ok) return { refusal: crossing.refusal };
+    if (!crossing.ok) return crossing;
 
     if (planned.executionStyle === "REST" && crossing.value && planned.postOnly) {
-      return this.#rejectCrossingPostOnly(plan, planned, marketId, book.tokenId, atEvent);
+      return simulationOk(
+        this.#stagedImmediate({
+          plan,
+          planned,
+          marketId,
+          tokenId: book.tokenId,
+          fills: [],
+          filledShares: "0",
+          state: "REJECTED",
+          atEvent,
+        }),
+      );
     }
 
+    const restingFromNs = this.#options.clock.monotonicNs();
     if (planned.executionStyle === "REST" && !crossing.value) {
-      const registered = this.#rest({
+      const rest = this.#stageRest({
         plan,
         planned,
         marketId,
         tokenId: book.tokenId,
         book,
-        restingFromNs: this.#options.clock.monotonicNs(),
+        restingFromNs,
         remainingShares: planned.shares,
-        filledShares: "0",
         timeInForce,
         statedExpiryNs,
-        atEvent,
         feeSnapshot,
-        previousFills: [],
       });
-      if (!registered.ok) return { refusal: registered.refusal };
-      return registered.value;
+      if (!rest.ok) return rest;
+      return simulationOk(
+        this.#stagedResting({ plan, planned, marketId, tokenId: book.tokenId, filledShares: "0", fills: [], rest: rest.value, atEvent }),
+      );
     }
 
     // Marketable: the immediate path, either because the plan said so or because
@@ -781,87 +1153,90 @@ export class SimulatedVenue implements ExecutionVenue {
       feeSnapshot,
       atEvent,
     });
-    if (!outcome.ok) return { refusal: outcome.refusal };
-    if (
-      planned.executionStyle === "REST" &&
-      compareDecimal(outcome.value.remainingShares, "0") > 0
-    ) {
-      const registered = this.#rest({
-        plan,
-        planned,
-        marketId,
-        tokenId: book.tokenId,
-        book,
-        restingFromNs: this.#options.clock.monotonicNs(),
-        remainingShares: outcome.value.remainingShares,
-        filledShares: outcome.value.filledShares,
-        timeInForce,
-        statedExpiryNs,
-        atEvent,
-        feeSnapshot,
-        previousFills: outcome.value.fills,
-      });
-      if (!registered.ok) return { refusal: registered.refusal };
-      return registered.value;
+    if (!outcome.ok) return outcome;
+    const { fills, filledShares, remainingShares } = outcome.value;
+    if (compareDecimal(remainingShares, "0") === 0) {
+      return simulationOk(
+        this.#stagedImmediate({ plan, planned, marketId, tokenId: book.tokenId, fills, filledShares, state: "FILLED", atEvent }),
+      );
     }
-    return this.#book({
+    if (timeInForce === "FOK") {
+      // O2 (`TERM-G`). FOK "Fills the entire order immediately or does not
+      // fill any of it" (venue report §2.3; ADR-012 §5.3) — the same rule
+      // `tier1Immediate` applies. The depth this order consumed is NOT booked:
+      // no fill, no cash, no position, and the order is REJECTED with nothing
+      // filled.
+      return simulationOk(
+        this.#stagedImmediate({ plan, planned, marketId, tokenId: book.tokenId, fills: [], filledShares: "0", state: "REJECTED", atEvent }),
+      );
+    }
+    if (timeInForce === "FAK") {
+      // O1 (`TERM-A`). FAK "Fills against the available liquidity immediately
+      // and cancels any unfilled remainder" (venue report §2.3): the order is
+      // TERMINAL — CANCELLED — and keeps the size it did fill. It used to be
+      // left PARTIALLY_FILLED, which nothing ever moved again.
+      return simulationOk(
+        this.#stagedImmediate({ plan, planned, marketId, tokenId: book.tokenId, fills, filledShares, state: "CANCELLED", atEvent }),
+      );
+    }
+    // O3 (`TERM-B`). A GTC or GTD remainder "remains active until it fills or
+    // you cancel it" (GTD: until its expiration) — whatever the planned style.
+    // It is REGISTERED to rest at its limit price, so it can fill from later
+    // observed trades and can expire. Under Tier 0 a registered remainder fills
+    // exactly as a REST order does (`tier0Maker`): on the first observed trade
+    // at or through its limit, its WHOLE remaining size fills at the limit
+    // price as a MAKER fill (maker fee from the snapshot), and the order becomes
+    // FILLED with `filledShares` = what it took on arrival + that remainder.
+    const rest = this.#stageRest({
       plan,
       planned,
       marketId,
       tokenId: book.tokenId,
-      fills: outcome.value.fills,
-      filledShares: outcome.value.filledShares,
-      remainingShares: outcome.value.remainingShares,
-      atEvent,
-      remainderState: timeInForce === "FAK" ? "CANCELLED" : "RESTS",
-      fillEstimateKind: "POINT",
+      book,
+      restingFromNs,
+      remainingShares,
+      timeInForce,
+      statedExpiryNs,
+      feeSnapshot,
     });
+    if (!rest.ok) return rest;
+    return simulationOk(
+      this.#stagedResting({ plan, planned, marketId, tokenId: book.tokenId, filledShares, fills, rest: rest.value, atEvent }),
+    );
   }
 
   // --- Tier 1 ---------------------------------------------------------------
 
-  #executeTier1(
-    plan: ExecutionPlanView,
-    marketId: string,
-    planned: PlannedOrderView,
+  #stageTier1(
+    plan: PlacementPlanView,
+    entry: PreflightedOrder,
     atEvent: RecordedEventIdentity,
     feeSnapshot: FeeScheduleSnapshot,
-    timeInForce: TimeInForce,
-    statedExpiryNs: bigint | undefined,
-  ):
-    | {
-        readonly order: SimulatedOrder;
-        readonly fills: readonly SimulatedFill[];
-        readonly band?: RestingFillBand;
-      }
-    | { readonly refusal: SimulationRefusal } {
+  ): SimulationResult<StagedOrder> {
+    const { planned, marketId, timeInForce, statedExpiryNs } = entry;
     const timeline = this.#options.timeline;
     const latencyModel = this.#options.latencyModel;
     const streams = this.#options.streams;
     const marketParameters = this.#options.marketParameters;
     if (timeline === undefined || latencyModel === undefined || streams === undefined || marketParameters === undefined) {
-      return {
-        refusal: simulationRefusal(
-          "SIMULATED_VENUE_PLAN_UNSUPPORTED",
-          "a Tier-1 venue needs a depth timeline, a latency model, seeded streams, and versioned market parameters",
-        ),
-      };
+      return simulationFailure(
+        "SIMULATED_VENUE_PLAN_UNSUPPORTED",
+        "a Tier-1 venue needs a depth timeline, a latency model, seeded streams, and versioned market parameters",
+      );
     }
     const market = marketParameters(marketId);
     if (market === undefined) {
-      return {
-        refusal: simulationRefusal(
-          "SIMULATED_VENUE_PLAN_UNSUPPORTED",
-          "no versioned market parameters are known for the instant being replayed; §6 invariant 9 requires historical runs to use historical parameters",
-          { marketId },
-        ),
-      };
+      return simulationFailure(
+        "SIMULATED_VENUE_PLAN_UNSUPPORTED",
+        "no versioned market parameters are known for the instant being replayed; §6 invariant 9 requires historical runs to use historical parameters",
+        { marketId },
+      );
     }
     // Validated on the execution path, not merely offered: an empty distribution
     // must refuse here exactly as `readLatencyModel` intends, or "no latency
     // data" silently becomes "no latency" (round-1 review M6).
     const validatedLatency = readLatencyModel(latencyModel);
-    if (!validatedLatency.ok) return { refusal: validatedLatency.refusal };
+    if (!validatedLatency.ok) return validatedLatency;
 
     if (planned.executionStyle === "REST") {
       const latency = sampleLatency(validatedLatency.value, streams);
@@ -872,27 +1247,30 @@ export class SimulatedVenue implements ExecutionVenue {
         monotonicNs: restingFromNs,
       });
       if (observed === undefined) {
-        return {
-          refusal: simulationRefusal(
-            "SIMULATED_VENUE_NO_BOOK",
-            "no recorded book state is known at the instant the order would rest; §6 invariant 12 refuses to act on unknown book state rather than resting against a stale one",
-            { marketId, restingFromNs: restingFromNs.toString() },
-          ),
-        };
+        return simulationFailure(
+          "SIMULATED_VENUE_NO_BOOK",
+          "no recorded book state is known at the instant the order would rest; §6 invariant 12 refuses to act on unknown book state rather than resting against a stale one",
+          { marketId, restingFromNs: restingFromNs.toString() },
+        );
       }
       const crossing = isCrossing(observed.book, planned);
-      if (!crossing.ok) return { refusal: crossing.refusal };
+      if (!crossing.ok) return crossing;
       if (crossing.value && planned.postOnly) {
-        return this.#rejectCrossingPostOnly(
-          plan,
-          planned,
-          marketId,
-          observed.book.tokenId,
-          observed.atEvent,
+        return simulationOk(
+          this.#stagedImmediate({
+            plan,
+            planned,
+            marketId,
+            tokenId: observed.book.tokenId,
+            fills: [],
+            filledShares: "0",
+            state: "REJECTED",
+            atEvent: observed.atEvent,
+          }),
         );
       }
       if (!crossing.value) {
-        const registered = this.#rest({
+        const rest = this.#stageRest({
           plan,
           planned,
           marketId,
@@ -900,15 +1278,23 @@ export class SimulatedVenue implements ExecutionVenue {
           book: observed.book,
           restingFromNs,
           remainingShares: planned.shares,
-          filledShares: "0",
           timeInForce,
           statedExpiryNs,
-          atEvent: observed.atEvent,
           feeSnapshot,
-          previousFills: [],
         });
-        if (!registered.ok) return { refusal: registered.refusal };
-        return registered.value;
+        if (!rest.ok) return rest;
+        return simulationOk(
+          this.#stagedResting({
+            plan,
+            planned,
+            marketId,
+            tokenId: observed.book.tokenId,
+            filledShares: "0",
+            fills: [],
+            rest: rest.value,
+            atEvent: observed.atEvent,
+          }),
+        );
       }
       // A crossing, non-postOnly limit order matches on arrival: it is
       // marketable in fact, whatever the plan intended, and falls through to the
@@ -933,7 +1319,7 @@ export class SimulatedVenue implements ExecutionVenue {
       market,
       feeSnapshot,
     });
-    if (!outcome.ok) return { refusal: outcome.refusal };
+    if (!outcome.ok) return outcome;
 
     // L5: an order that never reached a book (a GTD past its effective expiry)
     // still belongs to an outcome token, and booking it under `""` names no
@@ -950,119 +1336,218 @@ export class SimulatedVenue implements ExecutionVenue {
       tokenId = known?.book.tokenId ?? null;
     }
     if (tokenId === null || !isNonEmptyString(tokenId)) {
-      return {
-        refusal: simulationRefusal(
-          "SIMULATED_VENUE_NO_BOOK",
-          "the venue cannot name the outcome token this order was for; the recorded timeline knows no book for the market and side, and an order booked under an empty token id names nothing",
-          { marketId, side: planned.side },
-        ),
-      };
+      return simulationFailure(
+        "SIMULATED_VENUE_NO_BOOK",
+        "the venue cannot name the outcome token this order was for; the recorded timeline knows no book for the market and side, and an order booked under an empty token id names nothing",
+        { marketId, side: planned.side },
+      );
     }
 
+    const executedAt = outcome.value.atEvent ?? atEvent;
+    const matchableAtNs = BigInt(outcome.value.matchableAtNs);
     const disposition = outcome.value.remainderDisposition;
-    if (
-      planned.executionStyle === "REST" &&
-      disposition === "RESTS" &&
-      compareDecimal(outcome.value.remainingShares, "0") > 0
-    ) {
-      const observed = timeline.bookAt({
-        marketId,
-        side: planned.side,
-        monotonicNs: BigInt(outcome.value.matchableAtNs),
-      });
-      if (observed !== undefined) {
-        const registered = this.#rest({
-          plan,
-          planned,
-          marketId,
-          tokenId,
-          book: observed.book,
-          restingFromNs: BigInt(outcome.value.matchableAtNs),
-          remainingShares: outcome.value.remainingShares,
-          filledShares: outcome.value.filledShares,
-          timeInForce,
-          statedExpiryNs,
-          atEvent: outcome.value.atEvent ?? atEvent,
-          feeSnapshot,
-          previousFills: outcome.value.fills,
-        });
-        if (!registered.ok) return { refusal: registered.refusal };
-        return registered.value;
+    const terminalState: TerminalOnArrival | undefined =
+      disposition === "CANCELLED_BY_FAK"
+        ? "CANCELLED"
+        : disposition === "REJECTED_BY_FOK"
+          ? "REJECTED"
+          : disposition === "EXPIRED_BEFORE_MATCHING"
+            ? "EXPIRED"
+            : disposition === "RESTS" && compareDecimal(outcome.value.remainingShares, "0") > 0
+              ? undefined
+              : "FILLED";
+
+    // O3: a GTC/GTD remainder rests at the instant it could match, whatever
+    // the planned style (it used to rest only for a REST order).
+    let settled: Disposition;
+    if (terminalState === undefined) {
+      const observed = timeline.bookAt({ marketId, side: planned.side, monotonicNs: matchableAtNs });
+      if (observed === undefined) {
+        return simulationFailure(
+          "SIMULATED_VENUE_NO_BOOK",
+          "no recorded book state is known at the instant the order's remainder would rest; §6 invariant 12 refuses to rest it against an unknown book",
+          { marketId, matchableAtNs: matchableAtNs.toString() },
+        );
       }
+      const staged = this.#stageRest({
+        plan,
+        planned,
+        marketId,
+        tokenId,
+        book: observed.book,
+        restingFromNs: matchableAtNs,
+        remainingShares: outcome.value.remainingShares,
+        timeInForce,
+        statedExpiryNs,
+        feeSnapshot,
+      });
+      if (!staged.ok) return staged;
+      settled = { kind: "RESTS", rest: staged.value };
+    } else {
+      settled = { kind: "TERMINAL", state: terminalState };
     }
 
-    return this.#book({
+    if (!outcome.value.delayedByMarket) {
+      return simulationOk(
+        settled.kind === "RESTS"
+          ? this.#stagedResting({
+              plan,
+              planned,
+              marketId,
+              tokenId,
+              filledShares: outcome.value.filledShares,
+              fills: outcome.value.fills,
+              rest: settled.rest,
+              atEvent: executedAt,
+            })
+          : this.#stagedImmediate({
+              plan,
+              planned,
+              marketId,
+              tokenId,
+              fills: outcome.value.fills,
+              filledShares: outcome.value.filledShares,
+              state: settled.state,
+              atEvent: executedAt,
+            }),
+      );
+    }
+
+    // O5 (`TERM-D`), ADR-012 §5.1 / D-18: on a delayed market a marketable
+    // order "is accepted but has not matched yet … no fills exist yet. Treat it
+    // as a pending order rather than a fill". It is booked DELAYED with NOTHING
+    // filled and NO fill applied, and its already-computed disposition waits
+    // in `#pending` until this venue's clock reaches `matchableAtNs`
+    // (`#sweep`): only then are its fills booked and its remainder settled
+    // (CANCELLED for FAK, REJECTED for FOK, EXPIRED for a GTD past expiry,
+    // registered to rest for GTC/GTD). Its state is anchored to the event it
+    // was SUBMITTED at, not to the later book it will execute against.
+    const delayed = this.#orderRecord({
       plan,
       planned,
       marketId,
       tokenId,
-      fills: outcome.value.fills,
-      filledShares: outcome.value.filledShares,
-      remainingShares: outcome.value.remainingShares,
-      atEvent: outcome.value.atEvent ?? atEvent,
-      remainderState:
-        disposition === "CANCELLED_BY_FAK"
-          ? "CANCELLED"
-          : disposition === "REJECTED_BY_FOK"
-            ? "REJECTED"
-            : disposition === "EXPIRED_BEFORE_MATCHING"
-              ? "EXPIRED"
-              : "RESTS",
-      delayedByMarket: outcome.value.delayedByMarket,
+      filledShares: "0",
+      state: "DELAYED",
       fillEstimateKind: "POINT",
+      atEvent,
+    });
+    return simulationOk({
+      order: delayed,
+      fills: [],
+      rest: undefined,
+      pending: {
+        simulatedOrderId: delayed.simulatedOrderId,
+        matchableAtNs,
+        fills: outcome.value.fills,
+        filledShares: outcome.value.filledShares,
+        disposition: settled,
+      },
     });
   }
 
-  // --- resting --------------------------------------------------------------
+  // --- staged records ---------------------------------------------------------
+
+  #orderRecord(input: {
+    readonly plan: PlacementPlanView;
+    readonly planned: PlannedOrderView;
+    readonly marketId: string;
+    readonly tokenId: string;
+    readonly filledShares: string;
+    readonly state: SimulatedOrder["state"];
+    readonly fillEstimateKind: SimulatedOrder["fillEstimateKind"];
+    readonly atEvent: RecordedEventIdentity;
+  }): SimulatedOrder {
+    return ownFrozenTree<SimulatedOrder>({
+      simulatedOrderId: input.planned.plannedOrderId,
+      plannedOrderId: input.planned.plannedOrderId,
+      executionPlanId: input.plan.executionPlanId,
+      marketId: input.marketId,
+      tokenId: input.tokenId,
+      side: input.planned.side,
+      action: input.planned.action,
+      limitPrice: input.planned.limitPrice,
+      requestedShares: input.planned.shares,
+      filledShares: input.filledShares,
+      state: input.state,
+      postOnly: input.planned.postOnly,
+      executionStyle: input.planned.executionStyle,
+      fillEstimateKind: input.fillEstimateKind,
+      atEvent: input.atEvent,
+    });
+  }
 
   /**
-   * A crossing `postOnly` order is REJECTED, unfilled.
-   *
-   * `docs/venue/verified-2026-08-24.md` §2.3 / ADR-012 §5.3: `postOnly` applies
-   * only to resting limit types, and its whole purpose is that the order never
-   * takes. Filling one — which this venue used to do — reports liquidity the
-   * venue would have refused to give.
+   * An order that is TERMINAL the moment it is booked: FILLED, CANCELLED (a
+   * FAK remainder, keeping what it filled), REJECTED (a crossing postOnly, or
+   * a FOK that could not fill whole — nothing filled), or EXPIRED (a GTD past
+   * its effective expiry before it could match).
    */
-  #rejectCrossingPostOnly(
-    plan: ExecutionPlanView,
-    planned: PlannedOrderView,
-    marketId: string,
-    tokenId: string,
-    atEvent: RecordedEventIdentity,
-  ): { readonly order: SimulatedOrder; readonly fills: readonly SimulatedFill[] } {
-    return this.#book({
-      plan,
-      planned,
-      marketId,
-      tokenId,
-      fills: [],
-      filledShares: "0",
-      remainingShares: planned.shares,
-      atEvent,
-      remainderState: "REJECTED",
-      fillEstimateKind: "POINT",
-    });
+  #stagedImmediate(input: {
+    readonly plan: PlacementPlanView;
+    readonly planned: PlannedOrderView;
+    readonly marketId: string;
+    readonly tokenId: string;
+    readonly fills: readonly SimulatedFill[];
+    readonly filledShares: string;
+    readonly state: "FILLED" | "CANCELLED" | "REJECTED" | "EXPIRED";
+    readonly atEvent: RecordedEventIdentity;
+  }): StagedOrder {
+    return {
+      order: this.#orderRecord({ ...input, fillEstimateKind: "POINT" }),
+      fills: input.fills,
+      rest: undefined,
+      pending: undefined,
+    };
   }
 
-  #rest(input: {
-    readonly plan: ExecutionPlanView;
+  /**
+   * An order whose remainder RESTS, registered at commit. The resting rule:
+   * an order is RESTING or PARTIALLY_FILLED exactly when this venue holds its
+   * resting record (it can still fill, expire, or be cancelled).
+   */
+  #stagedResting(input: {
+    readonly plan: PlacementPlanView;
+    readonly planned: PlannedOrderView;
+    readonly marketId: string;
+    readonly tokenId: string;
+    readonly filledShares: string;
+    readonly fills: readonly SimulatedFill[];
+    readonly rest: StagedRest;
+    readonly atEvent: RecordedEventIdentity;
+  }): StagedOrder {
+    return {
+      order: this.#orderRecord({
+        ...input,
+        state: compareDecimal(input.filledShares, "0") > 0 ? "PARTIALLY_FILLED" : "RESTING",
+        fillEstimateKind: input.rest.band === undefined ? "POINT" : "TIER_1_RESTING_BAND",
+      }),
+      fills: input.fills,
+      rest: input.rest,
+      pending: undefined,
+    };
+  }
+
+  /**
+   * Stages a resting registration: the queue ahead at placement, the stated
+   * same-instant additions, the effective expiry and — under Tier 1 — the
+   * §12.2 band. Reads the book, the policy, the queue parameters and the trades
+   * already observed; WRITES NOTHING. The record reaches `#resting` only at
+   * commit (O10, `PP-17`: a throw here can no longer leave a resting record
+   * that no booked order owns).
+   */
+  #stageRest(input: {
+    readonly plan: PlacementPlanView;
     readonly planned: PlannedOrderView;
     readonly marketId: string;
     readonly tokenId: string;
     readonly book: BookView;
     readonly restingFromNs: bigint;
     readonly remainingShares: string;
-    readonly filledShares: string;
     readonly timeInForce: TimeInForce;
     readonly statedExpiryNs: bigint | undefined;
-    readonly atEvent: RecordedEventIdentity;
     readonly feeSnapshot: FeeScheduleSnapshot;
-    readonly previousFills: readonly SimulatedFill[];
-  }): SimulationResult<{
-    readonly order: SimulatedOrder;
-    readonly fills: readonly SimulatedFill[];
-    readonly band?: RestingFillBand;
-  }> {
+  }): SimulationResult<StagedRest> {
     const { planned } = input;
     // §12.2 "estimate quantity ahead at placement": the AGGREGATE size observed
     // at our price, which is a recorded fact (ADR-013), never a queue-position
@@ -1107,33 +1592,28 @@ export class SimulatedVenue implements ExecutionVenue {
       queueAheadAtPlacement: queueAhead.value,
       remainingShares: input.remainingShares,
     };
-    this.#resting.set(record.simulatedOrderId, record);
 
-    const isTier1 = this.#options.model.tier === "TIER_1";
-    let band: RestingFillBand | undefined;
-    if (isTier1) {
-      const computed = this.#bandFor(record, input.feeSnapshot);
-      if (!computed.ok) {
-        this.#resting.delete(record.simulatedOrderId);
-        return computed;
-      }
-      band = computed.value;
-      this.#bands.set(record.simulatedOrderId, band);
+    if (this.#options.model.tier !== "TIER_1") return simulationOk({ record, band: undefined });
+    const band = this.#bandFor(record, input.feeSnapshot);
+    if (!band.ok) return band;
+    return simulationOk({ record, band: band.value });
+  }
+
+  /**
+   * Applies one staged order to the venue: its fills (cash, positions, the
+   * fill list), the order itself, its resting record and band, or its pending
+   * DELAYED disposition. Every value was computed while staging, and the cash
+   * and position arithmetic is done into locals before anything is assigned
+   * (`#applyFills`), so there is nothing left here that can fail half-way.
+   */
+  #commit(staged: StagedOrder): void {
+    this.#applyFills(staged.fills);
+    this.#orders.set(staged.order.simulatedOrderId, staged.order);
+    if (staged.rest !== undefined) {
+      this.#resting.set(staged.rest.record.simulatedOrderId, staged.rest.record);
+      if (staged.rest.band !== undefined) this.#bands.set(staged.rest.record.simulatedOrderId, staged.rest.band);
     }
-
-    const booked = this.#book({
-      plan: input.plan,
-      planned,
-      marketId: input.marketId,
-      tokenId: input.tokenId,
-      fills: input.previousFills,
-      filledShares: input.filledShares,
-      remainingShares: input.remainingShares,
-      atEvent: input.atEvent,
-      remainderState: "RESTS",
-      fillEstimateKind: isTier1 ? "TIER_1_RESTING_BAND" : "POINT",
-    });
-    return simulationOk(band === undefined ? booked : { ...booked, band });
+    if (staged.pending !== undefined) this.#pending.set(staged.pending.simulatedOrderId, staged.pending);
   }
 
   /** Recomputes one resting order's §12.2 band from the trades observed so far. */
@@ -1174,6 +1654,71 @@ export class SimulatedVenue implements ExecutionVenue {
       parameters: read.value,
       feeSnapshot,
     });
+  }
+
+  /**
+   * What the recorded clock reaching `nowNs` settles, at the event `atEvent`.
+   *
+   * 1. O5: every DELAYED order whose `matchableAtNs` has been reached takes its
+   *    already-computed disposition — its fills are booked NOW (never before
+   *    that instant: `TERM-D`), and its remainder is settled or registered to
+   *    rest. In `(matchableAtNs, order id)` order, so a replay produces its
+   *    fills in the same order every time (§12.4).
+   * 2. O4: every resting GTD order whose effective expiry has been reached
+   *    EXPIRES — on ANY recorded event, not only on a trade in its own market
+   *    and side (`VS-05b`): the venue expires a GTD order at its time whether
+   *    or not anything trades, and a quiet market used to keep one working —
+   *    and its capital held — for ever.
+   *
+   * Run from `observe()` (at the venue clock), from `observeTrade()` (at the
+   * trade's recorded instant, BEFORE the trade is walked, so a remainder that
+   * came to rest at this instant can fill from it) and before a cancel (so a
+   * cancel never acts on a state the clock has already moved past).
+   */
+  #sweep(
+    nowNs: bigint,
+    atEvent: RecordedEventIdentity,
+  ): { readonly fills: readonly SimulatedFill[]; readonly bands: readonly RestingFillBand[] } {
+    const fills: SimulatedFill[] = [];
+    const bands: RestingFillBand[] = [];
+    if (this.#pending.size > 0) {
+      const due = [...this.#pending.values()]
+        .filter((pending) => pending.matchableAtNs <= nowNs)
+        .sort((left, right) =>
+          left.matchableAtNs < right.matchableAtNs
+            ? -1
+            : left.matchableAtNs > right.matchableAtNs
+              ? 1
+              : compareStrings(left.simulatedOrderId, right.simulatedOrderId),
+        );
+      for (const pending of due) {
+        this.#pending.delete(pending.simulatedOrderId);
+        const existing = this.#orders.get(pending.simulatedOrderId);
+        if (existing === undefined || existing.state !== "DELAYED") continue;
+        const settled = pending.disposition;
+        const rest = settled.kind === "RESTS" ? settled.rest : undefined;
+        const order = ownFrozenTree<SimulatedOrder>({
+          ...existing,
+          filledShares: pending.filledShares,
+          state:
+            settled.kind === "TERMINAL"
+              ? settled.state
+              : compareDecimal(pending.filledShares, "0") > 0
+                ? "PARTIALLY_FILLED"
+                : "RESTING",
+          fillEstimateKind: rest?.band !== undefined ? "TIER_1_RESTING_BAND" : existing.fillEstimateKind,
+          atEvent,
+        });
+        this.#commit({ order, fills: pending.fills, rest, pending: undefined });
+        for (const fill of pending.fills) fills.push(fill);
+        if (rest?.band !== undefined) bands.push(rest.band);
+      }
+    }
+    const expired = [...this.#resting.values()]
+      .filter((record) => record.effectiveExpiryNs !== undefined && nowNs >= record.effectiveExpiryNs)
+      .sort((left, right) => compareStrings(left.simulatedOrderId, right.simulatedOrderId));
+    for (const record of expired) this.#expire(record, atEvent);
+    return { fills, bands };
   }
 
   #observeTradeSync(offered: {
@@ -1294,6 +1839,13 @@ export class SimulatedVenue implements ExecutionVenue {
 
     const produced: SimulatedFill[] = [];
     const updated: RestingFillBand[] = [];
+    // O4 / O5: what this recorded instant settles — DELAYED orders whose
+    // window has closed, GTD orders past their expiry — BEFORE the trade is
+    // walked, so a remainder that came to rest at or before this instant can
+    // fill from it.
+    const swept = this.#sweep(monotonicNs, atEvent);
+    for (const fill of swept.fills) produced.push(fill);
+    for (const band of swept.bands) updated.push(band);
     // Ordered by a value-derived key: two resting orders must be visited in the
     // same order on every replay of the same dataset (§12.4).
     const records = [...this.#resting.values()]
@@ -1302,6 +1854,8 @@ export class SimulatedVenue implements ExecutionVenue {
 
     for (const record of records) {
       if (monotonicNs < record.restingFromNs) continue;
+      // Kept although the sweep above already expired every record due at
+      // this instant: an expiry is never skipped because of how it was reached.
       if (record.effectiveExpiryNs !== undefined && monotonicNs >= record.effectiveExpiryNs) {
         this.#expire(record, atEvent);
         continue;
@@ -1322,11 +1876,8 @@ export class SimulatedVenue implements ExecutionVenue {
         });
         if (!outcome.ok) return outcome;
         if (outcome.value.trigger === "NONE") continue;
-        for (const fill of outcome.value.fills) {
-          this.#applyFill(fill);
-          this.#fills.push(fill);
-          produced.push(fill);
-        }
+        this.#applyFills(outcome.value.fills);
+        for (const fill of outcome.value.fills) produced.push(fill);
         const existing = this.#orders.get(record.simulatedOrderId);
         if (existing !== undefined) {
           this.#orders.set(
@@ -1352,9 +1903,25 @@ export class SimulatedVenue implements ExecutionVenue {
     return simulationOk(ownFrozenTree({ fills: produced, bands: updated }));
   }
 
+  /**
+   * O4 (`TERM-C`): a resting GTD order past its effective expiry EXPIRES,
+   * keeping the size it already filled. It used to move only a RESTING order,
+   * so a GTD that partly filled on arrival was dropped from the resting set
+   * but left PARTIALLY_FILLED — never able to fill again, never terminal.
+   *
+   * UNVERIFIED for the live adapter: the recorded venue order statuses
+   * (`live`, `matched`, `delayed`, `unmatched`, and `CANCELED` on the user
+   * channel; `docs/venue/verified-2026-09-16.md` §2.2) contain no EXPIRED, so
+   * what the live venue reports for a partly filled GTD at its expiry is not
+   * recorded. This simulator's state is EXPIRED with `filledShares` kept, the
+   * same state it gives an unfilled GTD at expiry.
+   */
   #expire(record: RestingRecord, atEvent: RecordedEventIdentity): void {
     const existing = this.#orders.get(record.simulatedOrderId);
-    if (existing !== undefined && existing.state === "RESTING") {
+    if (
+      existing !== undefined &&
+      (existing.state === "RESTING" || existing.state === "PARTIALLY_FILLED")
+    ) {
       this.#orders.set(
         record.simulatedOrderId,
         ownFrozenTree<SimulatedOrder>({ ...existing, state: "EXPIRED", atEvent }),
@@ -1363,81 +1930,38 @@ export class SimulatedVenue implements ExecutionVenue {
     this.#resting.delete(record.simulatedOrderId);
   }
 
-  #book(input: {
-    readonly plan: ExecutionPlanView;
-    readonly planned: PlannedOrderView;
-    readonly marketId: string;
-    readonly tokenId: string;
-    readonly fills: readonly SimulatedFill[];
-    readonly filledShares: string;
-    readonly remainingShares: string;
-    readonly atEvent: RecordedEventIdentity;
-    readonly remainderState: "RESTS" | "CANCELLED" | "REJECTED" | "EXPIRED";
-    readonly fillEstimateKind: SimulatedOrder["fillEstimateKind"];
-    readonly delayedByMarket?: boolean;
-  }): { readonly order: SimulatedOrder; readonly fills: readonly SimulatedFill[] } {
-    for (const fill of input.fills) {
-      this.#applyFill(fill);
-      this.#fills.push(fill);
+  /**
+   * Books fills against cash and positions and appends them to the fill list.
+   *
+   * The arithmetic is done into LOCALS first and assigned last, so a failure
+   * part-way through leaves the venue's cash, positions and fill list exactly
+   * as they were (O10's all-or-nothing commit). The order of the arithmetic is
+   * the order it always was — one fill after another — so every balance is the
+   * same exact decimal.
+   */
+  #applyFills(fills: readonly SimulatedFill[]): void {
+    if (fills.length === 0) return;
+    let cash = this.#cash;
+    const touched = new Map<string, { marketId: string; tokenId: string; side: "YES" | "NO"; shares: string }>();
+    for (const fill of fills) {
+      const notional = mulDecimal(fill.price, fill.shares);
+      cash =
+        fill.action === "BUY"
+          ? subDecimal(subDecimal(cash, notional), fill.feeAmount)
+          : subDecimal(addDecimal(cash, notional), fill.feeAmount);
+      const key = positionKey({ marketId: fill.marketId, side: fill.side });
+      const current = touched.get(key) ?? this.#positions.get(key);
+      const delta = fill.action === "BUY" ? fill.shares : subDecimal("0", fill.shares);
+      touched.set(
+        key,
+        current === undefined
+          ? { marketId: fill.marketId, tokenId: fill.tokenId, side: fill.side, shares: delta }
+          : { ...current, shares: addDecimal(current.shares, delta) },
+      );
     }
-    const complete = compareDecimal(input.remainingShares, "0") === 0;
-    // ADR-012 §5.1 / venue report §2.2: on a delayed market a marketable order
-    // "is accepted but has not matched yet … Treat it as a pending order rather
-    // than a fill", so an unfilled order on such a market is DELAYED, not
-    // REJECTED and not RESTING.
-    const state: SimulatedOrder["state"] =
-      input.remainderState === "REJECTED" && compareDecimal(input.filledShares, "0") === 0
-        ? "REJECTED"
-        : complete
-          ? "FILLED"
-          : compareDecimal(input.filledShares, "0") > 0
-            ? "PARTIALLY_FILLED"
-            : input.delayedByMarket === true
-              ? "DELAYED"
-              : input.remainderState === "RESTS"
-                ? "RESTING"
-                : input.remainderState;
-
-    const order = ownFrozenTree<SimulatedOrder>({
-      simulatedOrderId: input.planned.plannedOrderId,
-      plannedOrderId: input.planned.plannedOrderId,
-      executionPlanId: input.plan.executionPlanId,
-      marketId: input.marketId,
-      tokenId: input.tokenId,
-      side: input.planned.side,
-      action: input.planned.action,
-      limitPrice: input.planned.limitPrice,
-      requestedShares: input.planned.shares,
-      filledShares: input.filledShares,
-      state,
-      postOnly: input.planned.postOnly,
-      executionStyle: input.planned.executionStyle,
-      fillEstimateKind: input.fillEstimateKind,
-      atEvent: input.atEvent,
-    });
-    this.#orders.set(order.simulatedOrderId, order);
-    return { order, fills: input.fills };
-  }
-
-  #applyFill(fill: SimulatedFill): void {
-    const notional = mulDecimal(fill.price, fill.shares);
-    this.#cash =
-      fill.action === "BUY"
-        ? subDecimal(subDecimal(this.#cash, notional), fill.feeAmount)
-        : subDecimal(addDecimal(this.#cash, notional), fill.feeAmount);
-    const key = positionKey({ marketId: fill.marketId, side: fill.side });
-    const current = this.#positions.get(key);
-    const delta = fill.action === "BUY" ? fill.shares : subDecimal("0", fill.shares);
-    if (current === undefined) {
-      this.#positions.set(key, {
-        marketId: fill.marketId,
-        tokenId: fill.tokenId,
-        side: fill.side,
-        shares: delta,
-      });
-      return;
-    }
-    current.shares = addDecimal(current.shares, delta);
+    this.#cash = cash;
+    for (const [key, position] of touched) this.#positions.set(key, position);
+    for (const fill of fills) this.#fills.push(fill);
   }
 
   /**
@@ -1450,6 +1974,19 @@ export class SimulatedVenue implements ExecutionVenue {
    * defensively, because a materialized record can still be the wrong SHAPE and
    * `CancelResult` reports that the way §6 invariant 13 requires: nothing
    * cancelled, and the reason travelling with the result.
+   *
+   * What each scope targets, and what it is charged:
+   *
+   * - BY ID (`scope.orderIds`): exactly the ids named, charged one cancel token
+   *   per id submitted (venue report §8: `DELETE /orders` costs "Number of
+   *   submitted order IDs"). An id that is unknown, terminal, or DELAYED is
+   *   named in `notCancelled` with its reason.
+   * - BY MARKET (no `orderIds`), O6 (`VS-13`/`TERM-H`): the LIVE orders only —
+   *   RESTING, PARTIALLY_FILLED, DELAYED — in the market named (every market
+   *   when none is). Terminal history is not a target and is not charged: a
+   *   sweep that cancelled every live order is a success whatever filled
+   *   before it. With NO live target the cancel is a successful no-op: nothing
+   *   is charged and it answers `cancelled: []`, `notCancelled: []`.
    */
   #cancelSync(command: CancelCommand): CancelResult {
     const cancelled: string[] = [];
@@ -1470,6 +2007,11 @@ export class SimulatedVenue implements ExecutionVenue {
         venueClass: "SIMULATED",
       });
     }
+    // A cancel never acts on a state the recorded clock has already moved past:
+    // a DELAYED order whose window has closed takes its disposition first.
+    const atEvent = this.#atEvent;
+    if (atEvent !== undefined) this.#sweep(this.#options.clock.monotonicNs(), atEvent);
+
     const scope = offeredScope as { readonly marketId?: string; readonly orderIds?: readonly string[] };
     const scopedOrderIds = scope.orderIds;
     const scopedMarketId = scope.marketId;
@@ -1477,16 +2019,20 @@ export class SimulatedVenue implements ExecutionVenue {
       scopedOrderIds ??
       [...this.#orders.values()]
         .filter((order) => (scopedMarketId === undefined ? true : order.marketId === scopedMarketId))
+        .filter((order) => isLiveState(order.state))
         .map((order) => order.simulatedOrderId);
 
-    const admitted = this.#options.rateLimits.admit({
-      kind: "CANCEL",
-      // §6 invariant 13: a cancel is always SAFETY_CANCEL at this venue, and it
-      // draws on the cancel bucket, so placement traffic cannot starve it.
-      priority: "SAFETY_CANCEL",
-      count: targets.length,
-      atNs: this.#options.clock.monotonicNs(),
-    });
+    const admitted: RateLimitDecision =
+      targets.length === 0
+        ? { admitted: true }
+        : this.#options.rateLimits.admit({
+            kind: "CANCEL",
+            // §6 invariant 13: a cancel is always SAFETY_CANCEL at this venue, and it
+            // draws on the cancel bucket, so placement traffic cannot starve it.
+            priority: "SAFETY_CANCEL",
+            count: targets.length,
+            atNs: this.#options.clock.monotonicNs(),
+          });
 
     for (const id of [...targets].sort()) {
       const order = this.#orders.get(id);
@@ -1501,13 +2047,34 @@ export class SimulatedVenue implements ExecutionVenue {
         });
         continue;
       }
-      if (order.state === "FILLED" || order.state === "CANCELLED" || order.state === "EXPIRED") {
+      // O7 (`TERM-E`): every terminal state is final, REJECTED included. A
+      // REJECTED order was never working; rewriting it CANCELLED rewrote the
+      // run's history and reported a cancel that cancelled nothing.
+      if (
+        order.state === "FILLED" ||
+        order.state === "CANCELLED" ||
+        order.state === "EXPIRED" ||
+        order.state === "REJECTED"
+      ) {
         notCancelled.push({ simulatedOrderId: id, reason: `already ${order.state}` });
         continue;
       }
+      // O5 / D-18: "During either delay, the order is pending and cannot be
+      // canceled." The cancel is refused and the order is unchanged.
+      if (order.state === "DELAYED") {
+        notCancelled.push({
+          simulatedOrderId: id,
+          reason:
+            "DELAYED: the order is pending in the market's trading-delay window and cannot be canceled (venue report D-18); it takes its disposition when the window closes",
+        });
+        continue;
+      }
+      // O8 (`TERM-I`): the order's `atEvent` is "the recorded event identity
+      // this state was reached at", so a cancel re-stamps it with the event the
+      // venue is positioned at — the one the cancel happened at.
       this.#orders.set(
         id,
-        ownFrozenTree<SimulatedOrder>({ ...order, state: "CANCELLED" }),
+        ownFrozenTree<SimulatedOrder>({ ...order, state: "CANCELLED", atEvent: atEvent ?? order.atEvent }),
       );
       this.#resting.delete(id);
       cancelled.push(id);
@@ -1533,10 +2100,7 @@ export class SimulatedVenue implements ExecutionVenue {
         shares: position.shares,
       }));
     const openOrders = [...this.#orders.values()]
-      .filter(
-        (order) =>
-          order.state === "RESTING" || order.state === "PARTIALLY_FILLED" || order.state === "DELAYED",
-      )
+      .filter((order) => isLiveState(order.state))
       .sort((left, right) => compareStrings(left.simulatedOrderId, right.simulatedOrderId));
     return ownFrozenTree<AccountSnapshot>({
       venueClass: "SIMULATED",

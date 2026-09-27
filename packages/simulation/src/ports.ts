@@ -273,7 +273,17 @@ export interface FillFactView {
 // Execution venue (§12.1)
 // ---------------------------------------------------------------------------
 
-/** A simulated order's lifecycle state. */
+/**
+ * A simulated order's lifecycle state.
+ *
+ * TERMINAL: `FILLED`, `CANCELLED`, `EXPIRED`, `REJECTED` — no transition
+ * leaves one (a cancel of one answers `notCancelled: "already <state>"`).
+ * LIVE: `RESTING` and `PARTIALLY_FILLED` exactly when the venue holds the
+ * order's resting record (it can still fill, expire or be cancelled), and
+ * `DELAYED` while a marketable order waits out its market's trading delay
+ * (ADR-012 §5.1, D-18: pending, not cancellable, nothing filled yet).
+ * `ACCEPTED` is part of the vocabulary and is not produced by this venue.
+ */
 export type SimulatedOrderState =
   | "ACCEPTED"
   | "DELAYED"
@@ -312,7 +322,11 @@ export interface SimulatedOrder {
    *   never given — this field is how it can tell.
    */
   readonly fillEstimateKind: "POINT" | "TIER_1_RESTING_BAND";
-  /** The recorded event identity this state was reached at. Never a wall clock. */
+  /**
+   * The recorded event identity this state was reached at. Never a wall clock.
+   * Re-stamped on every transition: a maker fill, an expiry, a DELAYED order's
+   * resolution, and (SIM-1, O8) a cancel.
+   */
   readonly atEvent: RecordedEventIdentity;
 }
 
@@ -324,10 +338,51 @@ export interface RecordedEventIdentity {
   readonly datasetRowOrdinal: number;
 }
 
-/** §12.1 `ExecutionResult`. */
+/**
+ * One planned order a PLACEMENT plan did NOT place, and why (SIM-1, ruling R3).
+ *
+ * Mirrors {@link ExecutionResult.notCancelled} for the placement side, and the
+ * venue's own per-entry batch response (`POST /orders` answers one entry per
+ * signed order; venue report §2.2 / §9). The refusal is the ORDER's own: the
+ * cause for the order that failed, and `SIMULATED_VENUE_ORDER_NOT_SUBMITTED`
+ * for one that was never sent because another part of its plan failed first.
+ */
+export interface NotPlacedOrder {
+  readonly plannedOrderId: string;
+  readonly refusalCode: string;
+  readonly refusalMessage: string;
+}
+
+/**
+ * §12.1 `ExecutionResult`.
+ *
+ * SIM-1, the user's ruling R3 — PER-ORDER RESULTS. A multi-order plan can take
+ * effect IN PART (§7.7: "Basket execution is coordinated, not assumed
+ * atomic"; a plan of more than 15 orders is several venue batches, D-05), so
+ * the answer reports each planned order's outcome:
+ *
+ * | `outcome` | `accepted` | `orders` / `fills` / `bands` | `notPlaced` | `refusalCode` |
+ * | --- | --- | --- | --- | --- |
+ * | `"ACCEPTED"` | `true` | every order booked | `[]` | absent |
+ * | `"PARTIAL"` | `false` | the orders that WERE booked — working or done at the venue, their fills already applied | every other planned order, each with its own refusal | the FIRST failure's code |
+ * | `"REFUSED"` | `false` | `[]` | every planned order the plan let the venue read | the cause |
+ *
+ * The fully accepted and fully refused shapes are the ones this interface
+ * always had, plus the two new fields. For a CANCEL plan `notPlaced` is `[]`;
+ * `outcome` is `"PARTIAL"` when it cancelled some of its targets and not
+ * others (`orders` lists the cancelled ones, `notCancelled` the rest).
+ */
 export interface ExecutionResult {
   readonly executionPlanId: string;
+  /** `true` only when the WHOLE plan took effect. */
   readonly accepted: boolean;
+  /** Whether the plan took effect wholly, in part, or not at all (R3). */
+  readonly outcome: "ACCEPTED" | "PARTIAL" | "REFUSED";
+  /**
+   * The orders this submission BOOKED — on every outcome, including a partial
+   * one and a contained internal fault. An order listed here exists at the
+   * venue; a consumer that owns orders must own these.
+   */
   readonly orders: readonly SimulatedOrder[];
   readonly fills: readonly SimulatedFillLike[];
   /**
@@ -348,13 +403,23 @@ export interface ExecutionResult {
    */
   readonly notCancelled: readonly { readonly simulatedOrderId: string; readonly reason: string }[];
   /**
+   * The planned orders a PLACEMENT plan did not place, each with its own
+   * refusal (R3). `[]` exactly when every planned order was booked, and always
+   * `[]` for a CANCEL plan.
+   */
+  readonly notPlaced: readonly NotPlacedOrder[];
+  /**
    * Whether a venue rate-limit budget was actually modelled for this result
    * (§9.13, ADR-012 §5.6). `"NOT_MODELED"` states the absence rather than
    * implying an unlimited venue; {@link rateLimitDisclosure} says why.
    */
   readonly rateLimitModel: "MODELED" | "NOT_MODELED";
   readonly rateLimitDisclosure: string;
-  /** Present when the venue refused; `accepted` is then `false`. */
+  /**
+   * Present when the plan did not WHOLLY take effect; `accepted` is then
+   * `false`. On a `"PARTIAL"` outcome it is the first failure's code, and
+   * `orders` still lists what was booked.
+   */
   readonly refusalCode?: string;
   readonly refusalMessage?: string;
   /** Always `"SIMULATED"`. There is no other value (ADR-012 §2 item 3). */

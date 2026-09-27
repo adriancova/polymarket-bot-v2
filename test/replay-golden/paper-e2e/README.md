@@ -62,6 +62,19 @@ section by section, with the removed decisions identified by the order each
 one delivered, in the round's handoff. The take-profit's placing `exit`
 decision is still `evaluationSeq 2`.
 
+### The `SIM-1` regeneration: a cancel re-stamps the order's recorded event
+
+`SIM-1` (O8) made the simulated venue re-stamp an order's `atEvent` when it
+is CANCELLED — "the recorded event identity this state was reached at" —
+instead of leaving the event it was PLACED at. The withdrawn take-profit
+(`…d000:g0:o0`, placed at event 5) is cancelled by id at event 6, so its
+`orders[1].atEventIngestSeq` moves `"5" → "6"`. That is the ONLY change: every
+other order, fill, ledger transaction, PnL record, PnL snapshot, projection
+line, reconciliation row, decision, trace and health counter is identical —
+proven by a structural diff of the whole document in the round's handoff. The
+run contains no partial plan, no FAK/FOK partial, no DELAYED order and no
+market-scoped cancel, so SIM-1's other venue changes move nothing here.
+
 ### `health.accounting.realizedPnl` reads "no snapshot observed" here — deliberately, and why
 
 `TRDR-3` (2026-09-17) gave the trader's health surface `accounting.realizedPnl`:

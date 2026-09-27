@@ -158,6 +158,13 @@ import type { Ledger } from "@polymarket-bot/ledger";
  * the loop calls. Declared here rather than imported as the class so a live
  * adapter can satisfy it without inheriting from a simulator — which is the
  * whole point of §12.1.
+ *
+ * `submit` answers PER ORDER (SIM-1, the user's ruling R3): `orders` lists
+ * every order the venue BOOKED for the plan — on a partial outcome as on a
+ * full one — and `notPlaced` the planned orders it did not place. The loop
+ * owns the first and releases the second (`#releaseRefusedPlacement`); an
+ * order the venue holds that its answer did not list is the defensive
+ * reconciliation path there.
  */
 export interface TraderVenue {
   observe(identity: {
@@ -1479,7 +1486,12 @@ export class CoreLoop {
         if (resolution !== undefined) this.#options.health.countExecution("cancelsRejected");
         return;
       }
-      this.#releaseRefusedPlacement(placement, result, input.instant);
+      // SIM-1, ruling R3 (2): whatever the venue says it BOOKED for this plan
+      // is OWNED, exactly as on the accepted path below — owner, trace prefix,
+      // provenance — so its fills are attributed and its views are delivered.
+      // Only then is the rest of the plan settled.
+      this.#ownBookedOrders(result.orders, input, submissionAttemptId);
+      this.#releaseRefusedPlacement(input.plan, result, input.instant);
       return;
     }
     this.#options.health.countExecution("submissionsAccepted");
@@ -1494,7 +1506,34 @@ export class CoreLoop {
       return;
     }
 
-    for (const order of result.orders) {
+    this.#ownBookedOrders(result.orders, input, submissionAttemptId);
+  }
+
+  /**
+   * Registers ownership of orders the venue BOOKED for a plan: the owner, the
+   * instance's order set, the booked-shares counter, the trace prefix (the
+   * prunable fill-join lookup) and the append-only provenance record.
+   *
+   * ONE path for an accepted plan and for the booked part of a partly
+   * executed one (SIM-1, ruling R3): an order the venue says it booked is an
+   * order this process placed, whatever happened to the rest of its plan, so
+   * it is owned the same way — its fills are attributed, its views delivered,
+   * and it is retired and settled under `TRDR-4`'s rules like any other.
+   */
+  #ownBookedOrders(
+    orders: readonly SimulatedOrder[],
+    input: {
+      readonly plan: ExecutionPlan;
+      readonly instance: RegisteredInstance;
+      readonly intent: Intent;
+      readonly approvedIntentId: string;
+      readonly evaluationSeq: number;
+      readonly featureSnapshotRef: string;
+      readonly eventId: string;
+    },
+    submissionAttemptId: string,
+  ): void {
+    for (const order of orders) {
       // Every per-order entry is keyed by the VENUE's order id (see the field
       // comments), created here and deleted only by `#settle`.
       this.#orderOwners.set(order.simulatedOrderId, input.instance.instanceId);
@@ -1521,8 +1560,9 @@ export class CoreLoop {
   }
 
   /**
-   * A REFUSED placement returns what it reserved — for every planned order the
-   * venue does NOT hold — and keeps it for every order the venue DOES hold.
+   * A placement the venue did not WHOLLY accept: release what its REFUSED
+   * orders reserved, keep what its BOOKED and HELD orders reserved, and halt
+   * where nothing in this process can finish the plan.
    *
    * Review round 1, MEDIUM-4: the only release path used to be
    * `#deliverOrderViews`'s terminal-status arm, and a refused plan has no owned
@@ -1531,57 +1571,71 @@ export class CoreLoop {
    * and the unreserved balance on the strategy's `riskBudget`, until entries
    * starved with no visible cause. The venue said no; the capacity comes back.
    *
-   * `TRDR-4` round 1 (finding TRDR4-R1): a refusal is NOT proof that nothing
-   * was placed, and releasing EVERY planned order's entries freed the capital,
-   * the inventory and the time-in-force of an order still WORKING at the venue
-   * — which ADR-006 §9 forbids (never released before terminal). The
-   * simulator books a plan's orders one at a time and, when a later one fails
-   * (its rate-limit budget, a duplicate id, an execution refusal —
-   * `SimulatedVenue`'s `#submitSync`), refuses the WHOLE plan with
-   * `orders: []` while the earlier orders stay in its book: RESTING,
-   * PARTIALLY_FILLED, or already terminal. A real venue can answer the same
-   * way. So each planned order is looked up in the venue's OWN order state (and
-   * in the refused answer's `orders`), by its PLANNED order id — the key all
-   * three books use:
+   * SIM-1, the user's ruling R3 — PER-ORDER RESULTS. The venue now reports
+   * each planned order's outcome: `result.orders` lists what it BOOKED (on a
+   * partial outcome as on a full one) and `result.notPlaced` what it did not.
+   * The booked orders were made OWNED by the caller (`#ownBookedOrders`)
+   * before this runs. Each planned order is then settled by its PLANNED order
+   * id — the key the three release books use — in one of three ways:
    *
-   * - the venue holds NO order under that id: it was never placed, and its
-   *   reservation, allocator commitment and time-in-force are released now;
-   * - the venue HOLDS one, in any state: all three are KEPT. The harvest-
-   *   boundary release (`#releaseSettledReservations`, which walks every venue
-   *   order, owned or not) returns them at the first harvest that sees the
-   *   order terminal, after that harvest's fills are booked — the same rule
-   *   and the same moment as for an owned order, so nothing is released before
-   *   terminal and nothing before the position that replaces it exists.
+   * - BOOKED (listed in `result.orders`): owned and tracked like any accepted
+   *   order. Its reservation, allocator commitment and time-in-force are KEPT
+   *   and come back at the first harvest that sees it terminal (ADR-006 §9:
+   *   never released before terminal).
+   * - HELD but NOT LISTED — the venue's own order state holds an order under
+   *   the id although its answer did not book it. `TRDR-4` round 1
+   *   (TRDR4-R1), kept as the DEFENSIVE path: the real simulator no longer
+   *   answers this way (it lists what it booked), but a venue that refuses
+   *   while still holding orders — a live adapter whose answer is incomplete —
+   *   can. Such an order is a reconciliation question (§6 invariant 6: an
+   *   unknown submission is never a silent retry): no instance owns it, its
+   *   entries are KEPT (released by `#releaseSettledReservations`, which walks
+   *   every venue order, at the harvest that sees it terminal), a fill of its
+   *   is booked UNATTRIBUTED (`#bookUnownedFill`), and its market is halted
+   *   NOW — `UNATTRIBUTED_ACTIVITY`, whose §9.9 action is `RECONCILE_ACCOUNT`.
+   * - NEITHER: the venue did not place it (it is in `notPlaced`, or the venue
+   *   holds nothing under its id). Its reservation, allocator commitment and
+   *   time-in-force are released NOW and counted
+   *   (`reservationsReleasedOnRefusal`).
    *
-   * And a plan the venue PARTLY EXECUTED is a reconciliation question (§6
-   * invariant 6: an unknown submission is never a silent retry). The answer
-   * named no order, so no instance owns the held ones: no owner entry, no
-   * `onOrderUpdate`, no `ctx.orders()` view, and a fill of theirs is booked
-   * UNATTRIBUTED (`#bookUnownedFill`). The market each held order trades is
-   * halted NOW — `UNATTRIBUTED_ACTIVITY`, whose §9.9 action is
-   * `RECONCILE_ACCOUNT` — before any later decision of this iteration can plan
-   * against it, rather than waiting for a fill that a resting order may never
-   * produce. Nothing is dropped and nothing is attributed.
+   * A POSITION or REDUCE_POSITION plan that was partly booked raises NO halt:
+   * every one of its orders is accounted for — booked and owned, or refused
+   * and released — and the strategy sees the booked ones through the normal
+   * delivery (`onOrderUpdate`, `ctx.orders()`) and re-plans from there.
+   *
+   * A BASKET plan that was partly booked HALTS every market it names
+   * (`BASKET_PARTIALLY_EXECUTED`, `MANAGE_KNOWN_POSITIONS_ONLY`). This is
+   * where "basket" is detected: `plan.planKind === "BASKET"` on the plan this
+   * process built. §7.7 makes basket execution "coordinated, not assumed
+   * atomic", and the basket carries a `failurePolicy` (ABANDON /
+   * PROTECTED_UNWIND / HOLD_FILLED_LEGS) for exactly this state — but nothing
+   * in this process consumes it yet, so the process stops deciding for those
+   * markets rather than leave a half-built basket for the strategy to re-plan
+   * as if it were a single position.
    */
   #releaseRefusedPlacement(
-    placement: PlacementPlan,
+    plan: Exclude<ExecutionPlan, { readonly planKind: "CANCEL" }>,
     result: ExecutionResult,
     instant: string,
   ): void {
     const plannedOrderIds: string[] = [];
-    for (const group of placement.groups) {
+    for (const group of plan.groups) {
       for (const order of group.orders) plannedOrderIds.push(order.plannedOrderId);
     }
     const planned = new Set(plannedOrderIds);
     // Keyed by the PLANNED order id: the venue's `simulatedOrderId` is its own
-    // id for the order and is only coincidentally equal in the simulator. Both
-    // sources count as evidence the venue holds an order — the refused answer's
-    // own `orders` (empty from the simulator's `#refuse`, but a venue may list
-    // what it did book) and the venue's order state, which is read last so its
-    // fresher view wins — because keeping an entry is the fail-closed side.
+    // id for the order and is only coincidentally equal in the simulator.
+    const booked = new Set<string>();
+    for (const order of result.orders) {
+      if (planned.has(order.plannedOrderId)) booked.add(order.plannedOrderId);
+    }
+    // The DEFENSIVE path: what the venue's own order state holds for this plan
+    // that its answer did not list as booked.
     const venueHeld = new Map<string, SimulatedOrder>();
-    for (const order of [...result.orders, ...this.#options.venue.ordersSnapshot()]) {
-      if (planned.has(order.plannedOrderId)) venueHeld.set(order.plannedOrderId, order);
+    for (const order of this.#options.venue.ordersSnapshot()) {
+      if (planned.has(order.plannedOrderId) && !booked.has(order.plannedOrderId)) {
+        venueHeld.set(order.plannedOrderId, order);
+      }
     }
     const held = plannedOrderIds.flatMap((plannedOrderId) => {
       const order = venueHeld.get(plannedOrderId);
@@ -1589,35 +1643,65 @@ export class CoreLoop {
     });
 
     for (const plannedOrderId of plannedOrderIds) {
-      if (venueHeld.has(plannedOrderId)) continue;
+      if (booked.has(plannedOrderId) || venueHeld.has(plannedOrderId)) continue;
       if (this.#reservations.releaseForOrder(plannedOrderId)) {
         this.#options.health.countExecution("reservationsReleasedOnRefusal");
       }
       this.#options.allocator.release(plannedOrderId);
       this.#timeInForce.release(plannedOrderId);
     }
-    if (held.length === 0) return;
 
-    const described = held
-      .map(
-        (order) =>
-          `${order.simulatedOrderId} (planned ${order.plannedOrderId}) ${order.state} ` +
-          `${order.filledShares}/${order.requestedShares}`,
-      )
-      .join(", ");
     const refusal = `${result.refusalCode ?? "VENUE_REFUSED"}: ${result.refusalMessage ?? "the venue refused the plan"}`;
-    for (const marketId of [...new Set(held.map((order) => order.marketId))].sort()) {
-      this.#options.halts.halt(
-        { kind: "MARKET", marketId },
-        "UNATTRIBUTED_ACTIVITY",
-        `plan ${placement.executionPlanId} was refused (${refusal}), yet the venue holds ` +
-          `${String(held.length)} of its ${String(plannedOrderIds.length)} planned orders — ` +
-          `partly executed and then refused: ${described}. No instance owns them; their ` +
-          "reservations, allocator commitments and time-in-force are KEPT until each is " +
-          "terminal, and any fill of theirs is booked UNATTRIBUTED; reconcile the account " +
-          "(§6 invariant 6, TRDR-4)",
-        instant,
-      );
+    if (held.length > 0) {
+      const described = held
+        .map(
+          (order) =>
+            `${order.simulatedOrderId} (planned ${order.plannedOrderId}) ${order.state} ` +
+            `${order.filledShares}/${order.requestedShares}`,
+        )
+        .join(", ");
+      for (const marketId of [...new Set(held.map((order) => order.marketId))].sort()) {
+        this.#options.halts.halt(
+          { kind: "MARKET", marketId },
+          "UNATTRIBUTED_ACTIVITY",
+          `plan ${plan.executionPlanId} was refused (${refusal}), yet the venue holds ` +
+            `${String(held.length)} of its ${String(plannedOrderIds.length)} planned orders that ` +
+            `its answer did not list as booked — partly executed and then refused: ${described}. ` +
+            "No instance owns them; their reservations, allocator commitments and time-in-force " +
+            "are KEPT until each is terminal, and any fill of theirs is booked UNATTRIBUTED; " +
+            "reconcile the account (§6 invariant 6, TRDR-4)",
+          instant,
+        );
+      }
+    }
+
+    if (plan.planKind === "BASKET" && booked.size > 0) {
+      const bookedDescribed = result.orders
+        .filter((order) => planned.has(order.plannedOrderId))
+        .map(
+          (order) =>
+            `${order.simulatedOrderId} (planned ${order.plannedOrderId}) ${order.state} ` +
+            `${order.filledShares}/${order.requestedShares}`,
+        )
+        .join(", ");
+      const notPlacedDescribed = result.notPlaced
+        .map((entry) => `${entry.plannedOrderId} (${entry.refusalCode})`)
+        .join(", ");
+      const markets = [...new Set(plan.groups.map((group) => group.marketId))].sort();
+      for (const marketId of markets) {
+        this.#options.halts.halt(
+          { kind: "MARKET", marketId },
+          "BASKET_PARTIALLY_EXECUTED",
+          `basket plan ${plan.executionPlanId} (failurePolicy ${plan.failurePolicy}) was executed ` +
+            `only IN PART (${refusal}): the venue booked ${String(booked.size)} of its ` +
+            `${String(plannedOrderIds.length)} planned orders — ${bookedDescribed}; not placed: ` +
+            `${notPlacedDescribed === "" ? "(none listed)" : notPlacedDescribed}. The booked orders ` +
+            "are OWNED and tracked, and keep their reservations until terminal; nothing in this " +
+            "process consumes the basket's failurePolicy yet, so its markets halt for an operator " +
+            "decision (§7.7 coordinated, not atomic; SIM-1 R3)",
+          instant,
+        );
+      }
     }
   }
 
@@ -1632,8 +1716,9 @@ export class CoreLoop {
    * last, under ruling R1 (obligations 4 and 5; see `#deliverOrderViews`).
    *
    * A FILL IS NEVER SKIPPED (`TRDR-4`, §6 invariant 7). A fill whose owner
-   * lookup misses — an order this process never placed (for example the early
-   * order of a plan the venue partly executed and then refused), a SETTLED
+   * lookup misses — an order this process never placed (for example one a
+   * venue HOLDS for a plan its answer called refused: `#releaseRefusedPlacement`'s
+   * defensive path), a SETTLED
    * order, one evicted from the tombstone map, or an owner the registry does
    * not hold — is posted UNATTRIBUTED and halts its market through the ledger
    * projection (`#bookUnownedFill`). It used to be dropped here with a bare
@@ -1819,8 +1904,8 @@ export class CoreLoop {
             `settled; its tombstone names instance ${probableOwner} as the PROBABLE owner, and ` +
             "the fill is NOT attributed to it; posted UNATTRIBUTED (TRDR-4)"
           : `fill ${fill.simulatedFillId} names order ${fill.simulatedOrderId}, which this ` +
-            "process does not own — never placed by it (for example the early order of a plan " +
-            "the venue partly executed and then refused), or settled and since evicted from " +
+            "process does not own — never placed by it (for example an order a venue holds for a " +
+            "plan its answer called refused, without listing it as booked), or settled and since evicted from " +
             "the tombstone map; posted UNATTRIBUTED (TRDR-4)";
 
     const posted = postFill({

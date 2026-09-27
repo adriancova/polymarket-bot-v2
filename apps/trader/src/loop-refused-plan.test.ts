@@ -1,37 +1,58 @@
 /**
- * `TRDR-4` round 1, finding TRDR4-R1 — a plan the venue PARTLY EXECUTED and
- * then refused keeps what its still-held orders reserved, and halts its market
- * for reconciliation.
+ * A plan the venue did not WHOLLY accept — `TRDR-4` round 1 (finding
+ * TRDR4-R1), re-pinned by SIM-1 under the user's ruling R3 (per-order
+ * results).
  *
- * The state: the planner slices a 50-share resting BUY into ten 5-share orders
- * (`planning.maxSliceShares: "5"`), and the REAL `SimulatedVenue`'s §9.13
- * budget admits ONE placement per window. The venue books the first slice —
- * it RESTS, well below the ask — refuses the second on its budget, and
- * answers `accepted: false, orders: []` for the WHOLE plan, while the first
- * slice stays working in its book (`venue.ts` `#submitSync` / `#refuse`).
+ * THE REAL VENUE (SIM-1, R3). `SimulatedVenue` now reports each planned order's
+ * outcome: what it BOOKED is listed in `result.orders` on a partial outcome as
+ * on a full one, and the rest in `result.notPlaced`. It admits placements per
+ * BATCH of at most 15 orders, all-or-nothing (D-05, ADR-012 §5.6). So:
  *
- * At `ed6d656` the loop's refusal branch released every planned order's
- * reservation, allocator commitment and time-in-force — including the RESTING
- * one's — which ADR-006 §9 forbids (never released before terminal), and
- * raised nothing: `reservations.open 0`, `allocator.open 0`,
- * `timeInForceFor(slice 1) undefined`, `halts []`. Pinned here:
+ * 1. a 20-slice resting BUY against a 15-token budget books its FIRST batch
+ *    (15 slices, RESTING) and not its second (5 slices, rate-limited). The
+ *    booked slices are OWNED — owner, trace prefix, provenance — delivered
+ *    through `onOrderUpdate` and `ctx.orders()`, and keep their entries until
+ *    terminal; the 5 refused slices are released, counted; a POSITION partial
+ *    raises NO halt; when an observed trade fills the booked slices the fills
+ *    are ATTRIBUTED (never UNATTRIBUTED), and the orders are released, retired
+ *    and settled like any other;
+ * 2. a 10-slice plan (one batch) against a ONE-token budget books NOTHING —
+ *    the batch is admitted all-or-nothing — and every slice is released with
+ *    no halt (this was `TRDR-4`'s partial state; the venue no longer produces
+ *    it);
+ * 3. an outright refusal (NO token) releases every planned order and raises no
+ *    halt — MEDIUM-4, unchanged;
+ * 4. a BASKET the venue executed only IN PART (its NO leg finds no book) keeps
+ *    the booked leg owned and attributed, releases the refused leg, and HALTS
+ *    the basket's market `BASKET_PARTIALLY_EXECUTED`, because nothing in the
+ *    trader consumes the basket's `failurePolicy` yet. The loop supplies §9.8
+ *    check 12's fee/slippage estimates for POSITION intents only, so this one
+ *    case supplies them for the basket through a pass-through `vi.mock` of the
+ *    risk-input builder; risk, allocator, planner and venue stay real.
  *
- * 1. the nine slices the venue never booked are released, counted;
- * 2. the RESTING slice keeps all three entries, across later harvests, while
+ * THE DEFENSIVE PATH (a scripted `TraderVenue` double). A venue that REFUSES a
+ * plan while still HOLDING part of it — a live adapter whose answer is
+ * incomplete — is what `TRDR-4`'s orphan halt exists for, and the real
+ * simulator no longer produces it. The double books the plan's FIRST slice at a
+ * real `SimulatedVenue` and answers the whole plan REFUSED, listing nothing:
+ *
+ * 5. the nine slices the venue never booked are released, counted;
+ * 6. the RESTING slice keeps all three entries, across later harvests, while
  *    it is working;
- * 3. its market is halted `UNATTRIBUTED_ACTIVITY` / `RECONCILE_ACCOUNT` at the
+ * 7. its market is halted `UNATTRIBUTED_ACTIVITY` / `RECONCILE_ACCOUNT` at the
  *    refusal, naming the plan, the order and its state;
- * 4. no instance owns it: never delivered, never in `ctx.orders()`;
- * 5. when an OBSERVED trade fills it (terminal evidence), the fill is booked
+ * 8. no instance owns it: never delivered, never in `ctx.orders()`;
+ * 9. when an OBSERVED trade fills it (terminal evidence), the fill is booked
  *    UNATTRIBUTED and counted, and only then are the three entries released.
  *
  * WHAT IS REAL: the `CoreLoop`, strategy runtime, feature engine, books,
  * allocator, risk engine, execution planner, `SimulatedVenue` (Tier 0) and
  * ledger. WHAT IS DOUBLED: the clock and the store (the trader's own in-memory
- * doubles) and the STRATEGY — a one-shot double that emits the same §7.7
+ * doubles), the STRATEGY — a one-shot double that emits the same §7.7
  * resting-entry intent shape Static Bracket emits (Static Bracket's passive
- * entry is not needed to reach the loop's refusal branch). PAPER only; no
- * network, credential, signer or real order.
+ * entry is not needed to reach the loop's refusal branch) — and, in the
+ * defensive cases only, the venue's ANSWER. PAPER only; no network,
+ * credential, signer or real order.
  */
 
 import { parseAllocatorCaps } from "@polymarket-bot/capital-allocator";
@@ -43,13 +64,41 @@ import {
   readFeeScheduleSnapshot,
   tier0Model,
   tokenBucketRateLimits,
+  unmodeledRateLimits,
   type BookView,
+  type ExecutionResult,
   type FeeScheduleSnapshot,
+  type PlacementPlanView,
+  type RateLimitBudget,
 } from "@polymarket-bot/simulation";
 import { createStrategyInstanceRuntime, type EvaluationInput } from "@polymarket-bot/strategy-runtime";
 import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type * as Pipeline from "./pipeline.js";
 import { z } from "zod";
+
+// THE ONE SEAM DOUBLED FOR THE BASKET CASE, and only for a BASKET intent. The
+// loop supplies §9.8 check 12's fee and slippage estimates for a POSITION
+// intent only (`CoreLoop.#economicsFor`), so the REAL risk engine refuses every
+// basket `RISK_EDGE_INPUTS_MISSING` and no basket plan can reach the venue
+// through the shipped pipeline today. The wrapper states those two estimates
+// for a BASKET intent — the risk engine, allocator, planner and venue all stay
+// real — so the loop's partial-basket branch is reached with a REAL basket
+// plan. Every other intent passes through untouched.
+vi.mock("./pipeline.js", async (importOriginal) => {
+  const original = await importOriginal<typeof Pipeline>();
+  return {
+    ...original,
+    buildRiskEvaluationInput(context: Parameters<typeof original.buildRiskEvaluationInput>[0]) {
+      return original.buildRiskEvaluationInput(
+        context.intent.type === "BASKET"
+          ? { ...context, feeEstimate: "0.1", slippageEstimate: "0" }
+          : context,
+      );
+    },
+  };
+});
 
 import { DeterministicIdFactory, projectionOf, type PostingIdentity } from "./accounting.js";
 import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
@@ -57,7 +106,7 @@ import { configuredFeatureKeys, parseTraderConfig } from "./config.js";
 import { HaltController } from "./halt.js";
 import { HealthState } from "./health.js";
 import { InstanceRegistry } from "./instances.js";
-import { CoreLoop, DecisionOutboxBuffer } from "./loop.js";
+import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
 import { MarketState } from "./market-state.js";
 import type { IngestedEvent } from "./ports.js";
 import { REPOSITORY_MAXIMUM_RUN_MODE, TRADER_RUN_MODE } from "./safety.js";
@@ -193,58 +242,141 @@ function hold(ctx: StrategyContext): DecisionResult {
   return { decisionType: "hold", reasonCodes: ["TRDR4R1.HOLD"], featureSnapshotRef: ctx.features().snapshotRef, intents: [] };
 }
 
-/** Emits ONE resting BUY of 50 at 0.2 (`MAKER_ONLY`, `PASSIVE`, `GTC`), then holds. */
-const oneShotStrategy: Strategy<unknown, OneShotState> = {
-  name: "trdr4r1-one-shot-double",
-  version: "1.0.0",
-  paramsSchema: z.strictObject({}),
-  stateSchemaVersion: 1,
-  onStart: hold,
-  onMarketOpen: hold,
-  onTimer: hold,
-  onFill: (ctx: StrategyContext) => hold(ctx),
-  onOrderUpdate: (ctx: StrategyContext) => hold(ctx),
-  onMarketClosing: (ctx: StrategyContext) => hold(ctx),
-  onMarketResolved: (ctx: StrategyContext) => hold(ctx),
-  onStop: (ctx: StrategyContext) => hold(ctx),
-  onFeatures(ctx: StrategyContext): DecisionResult {
-    if (ctx.state<OneShotState>().placed === true) return hold(ctx);
-    const buy: Intent = {
-      type: "POSITION",
-      intentId: "trdr4r1-resting-buy",
-      marketId: MARKET_ID,
-      direction: "YES",
-      targetMode: "DELTA",
-      targetShares: "50",
-      maximumBuyPrice: "0.2",
-      maximumTotalCost: "18",
-      urgency: "PASSIVE",
-      liquidityPreference: "MAKER_ONLY",
-      partialFillPolicy: "ACCEPT_ANY",
-      validUntil: new Date(Date.parse(ctx.now()) + 3_600_000).toISOString(),
-      expectedNetEdge: "5",
-      tags: ["trdr4r1.entry", "sb.order-type:GTC"],
-    };
+/**
+ * Emits ONE resting BUY at 0.2 (`MAKER_ONLY`, `PASSIVE`, `GTC`) of `entry`'s
+ * size, then holds. `planning.maxSliceShares` 5 cuts it into 5-share slices:
+ * 50 shares are 10 slices (one venue batch), 100 are 20 (two batches, 15 + 5).
+ */
+function oneShotStrategy(entry: {
+  readonly targetShares: string;
+  readonly maximumTotalCost: string;
+  /** Replaces the resting BUY with another intent (the BASKET case). */
+  readonly intent?: (ctx: StrategyContext) => Intent;
+}): Strategy<unknown, OneShotState> {
+  return {
+    name: "trdr4r1-one-shot-double",
+    version: "1.0.0",
+    paramsSchema: z.strictObject({}),
+    stateSchemaVersion: 1,
+    onStart: hold,
+    onMarketOpen: hold,
+    onTimer: hold,
+    onFill: (ctx: StrategyContext) => hold(ctx),
+    onOrderUpdate: (ctx: StrategyContext) => hold(ctx),
+    onMarketClosing: (ctx: StrategyContext) => hold(ctx),
+    onMarketResolved: (ctx: StrategyContext) => hold(ctx),
+    onStop: (ctx: StrategyContext) => hold(ctx),
+    onFeatures(ctx: StrategyContext): DecisionResult {
+      if (ctx.state<OneShotState>().placed === true) return hold(ctx);
+      const buy: Intent = {
+        type: "POSITION",
+        intentId: "trdr4r1-resting-buy",
+        marketId: MARKET_ID,
+        direction: "YES",
+        targetMode: "DELTA",
+        targetShares: entry.targetShares,
+        maximumBuyPrice: "0.2",
+        maximumTotalCost: entry.maximumTotalCost,
+        urgency: "PASSIVE",
+        liquidityPreference: "MAKER_ONLY",
+        partialFillPolicy: "ACCEPT_ANY",
+        validUntil: new Date(Date.parse(ctx.now()) + 3_600_000).toISOString(),
+        expectedNetEdge: "5",
+        tags: ["trdr4r1.entry", "sb.order-type:GTC"],
+      };
+      return {
+        decisionType: "enter",
+        reasonCodes: ["TRDR4R1.ENTER"],
+        featureSnapshotRef: ctx.features().snapshotRef,
+        statePatch: { placed: true },
+        intents: [entry.intent?.(ctx) ?? buy],
+      };
+    },
+  };
+}
+
+/**
+ * The DEFENSIVE-path double: a `TraderVenue` that REFUSES a plan while still
+ * HOLDING part of it.
+ *
+ * It books the plan's FIRST planned order — alone, as a one-order plan — at a
+ * REAL `SimulatedVenue`, and answers the loop as if the whole plan had been
+ * refused: `accepted: false`, nothing listed as booked. Everything else
+ * (positioning, observed trades, the order state, the fills) is the real
+ * venue's. This is the state `TRDR-4`'s orphan halt exists for — a live
+ * adapter's incomplete answer — which the real simulator no longer produces
+ * (it lists what it booked, R3).
+ */
+class RefusesWhileHoldingVenue implements TraderVenue {
+  readonly inner: SimulatedVenue;
+
+  constructor(inner: SimulatedVenue) {
+    this.inner = inner;
+  }
+
+  observe(identity: Parameters<TraderVenue["observe"]>[0]): { readonly ok: boolean } {
+    return this.inner.observe(identity);
+  }
+
+  observeTrade(input: Parameters<TraderVenue["observeTrade"]>[0]): ReturnType<TraderVenue["observeTrade"]> {
+    return this.inner.observeTrade(input);
+  }
+
+  async submit(plan: unknown): Promise<ExecutionResult> {
+    const offered = plan as PlacementPlanView;
+    const group = offered.groups[0];
+    const first = group?.orders[0];
+    if (group === undefined || first === undefined) throw new Error("the double expects a placement plan");
+    const booked = await this.inner.submit({ ...offered, groups: [{ ...group, orders: [first] }] });
+    if (!booked.accepted) throw new Error(`the double's first order was refused: ${String(booked.refusalCode)}`);
     return {
-      decisionType: "enter",
-      reasonCodes: ["TRDR4R1.ENTER"],
-      featureSnapshotRef: ctx.features().snapshotRef,
-      statePatch: { placed: true },
-      intents: [buy],
+      ...booked,
+      accepted: false,
+      outcome: "REFUSED",
+      orders: [],
+      fills: [],
+      bands: [],
+      notPlaced: [],
+      refusalCode: "SIMULATED_VENUE_RATE_LIMITED",
+      refusalMessage: "the venue refused the plan (test double: it still holds the plan's first order)",
     };
-  },
-};
+  }
+
+  ordersSnapshot(): ReturnType<TraderVenue["ordersSnapshot"]> {
+    return this.inner.ordersSnapshot();
+  }
+
+  get fills(): TraderVenue["fills"] {
+    return this.inner.fills;
+  }
+}
 
 interface Harness {
   readonly loop: CoreLoop;
+  /** The REAL venue (behind the double, when one is used). */
   readonly venue: SimulatedVenue;
   readonly evaluations: EvaluationInput[];
   /** Every plan the loop offered the venue, as offered. */
   readonly submitted: unknown[];
+  /** Every answer the loop received, in order. */
+  readonly answers: ExecutionResult[];
 }
 
 /** `createPaperTrader`'s assembly, with the one-shot double's runtime registered. */
-function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harness {
+function assemble(
+  input: {
+    readonly rateLimits?: RateLimitBudget;
+    /** The entry's size; 50 by default (10 slices, one batch). */
+    readonly targetShares?: string;
+    readonly maximumTotalCost?: string;
+    /** Wraps the real venue in a scripted `TraderVenue` (the defensive path). */
+    readonly venueDouble?: (inner: SimulatedVenue) => TraderVenue;
+    /** Replaces the one-shot's resting BUY (the BASKET case). */
+    readonly intent?: (ctx: StrategyContext) => Intent;
+    /** Which outcome sides the VENUE sees a book for (the loop's books are untouched). */
+    readonly venueBookSides?: readonly ("YES" | "NO")[];
+  } = {},
+): Harness {
   const parsed = parseTraderConfig(traderConfig());
   if (!parsed.ok) throw new Error(`config refused: ${parsed.refusal.detail} ${parsed.refusal.issues.join("; ")}`);
   const config = parsed.config;
@@ -264,7 +396,11 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
   }
   const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
   const created = createStrategyInstanceRuntime({
-    strategy: oneShotStrategy,
+    strategy: oneShotStrategy({
+      targetShares: input.targetShares ?? "50",
+      maximumTotalCost: input.maximumTotalCost ?? "18",
+      ...(input.intent === undefined ? {} : { intent: input.intent }),
+    }),
     params: {},
     run: { runId: RUN_ID, instanceId: INSTANCE_ID, configId: CONFIG_ID, runSeed: "41" },
     watchdog: { evaluationBudgetUs: 5_000_000 },
@@ -297,14 +433,7 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
     runMode: "PAPER",
     model: tier0Model({ fillModelVersion: "tier0.trdr4r1", fillModelParametersHash: "d".repeat(64) }),
     feeSnapshot: fees.value,
-    // ONE placement per (hour-long) window: the first slice is booked, the
-    // second is refused on the venue's own budget, and so is the whole plan.
-    rateLimits: tokenBucketRateLimits({
-      orderTokensPerWindow: input.orderTokensPerWindow ?? 1,
-      cancelTokensPerWindow: 10,
-      windowMs: 3_600_000,
-      snapshotVersion: "trdr-4-r1-refused-plan",
-    }),
+    rateLimits: input.rateLimits ?? unmodeledRateLimits("no venue budget is modelled for this case"),
     // `main.ts`'s `createExecutionPolicy` semantics: the loop's recorded
     // time-in-force, and a refusal (throw, contained by the venue) otherwise.
     policy: {
@@ -321,6 +450,7 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
       book(request): BookView | undefined {
         const market = markets.get(request.marketId);
         if (market === undefined) return undefined;
+        if (input.venueBookSides !== undefined && !input.venueBookSides.includes(request.side)) return undefined;
         return {
           internalMarketId: request.marketId,
           tokenId: request.side === "YES" ? market.config.yesTokenId : market.config.noTokenId,
@@ -349,12 +479,13 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
     attributionClearingRef: config.accounting.attributionClearingRef,
     feeExpenseRef: config.accounting.feeExpenseRef,
   };
+  const traderVenue: TraderVenue = input.venueDouble?.(venue) ?? venue;
   const loop = new CoreLoop({
     config,
     riskPolicy: policy.value,
     allocator: new AllocatorGate({ caps: caps.value, markets: allocationMarkets, tokenAssetIds }),
     clock,
-    venue,
+    venue: traderVenue,
     store: new MemoryTraderStore(),
     registry,
     markets,
@@ -370,16 +501,18 @@ function assemble(input: { readonly orderTokensPerWindow?: number } = {}): Harne
   });
   wiring.loop = loop;
 
-  const harness: Harness = { loop, venue, evaluations: [], submitted: [] };
+  const harness: Harness = { loop, venue, evaluations: [], submitted: [], answers: [] };
   const evaluate = created.runtime.evaluate.bind(created.runtime);
   vi.spyOn(created.runtime, "evaluate").mockImplementation((input: EvaluationInput) => {
     harness.evaluations.push(input);
     return evaluate(input);
   });
-  const submit = venue.submit.bind(venue);
-  vi.spyOn(venue, "submit").mockImplementation(async (plan) => {
+  const submit = traderVenue.submit.bind(traderVenue);
+  vi.spyOn(traderVenue, "submit").mockImplementation(async (plan: unknown) => {
     harness.submitted.push(plan);
-    return await submit(plan);
+    const answer = await submit(plan);
+    harness.answers.push(answer);
+    return answer;
   });
   return harness;
 }
@@ -446,13 +579,226 @@ function plannedOrderIds(harness: Harness): readonly string[] {
   return plan.groups.flatMap((group) => group.orders.map((order) => order.plannedOrderId));
 }
 
+/** A modelled per-signer order budget of `orderTokensPerWindow` per hour. */
+function orderBudget(orderTokensPerWindow: number): RateLimitBudget {
+  return tokenBucketRateLimits({
+    orderTokensPerWindow,
+    cancelTokensPerWindow: 10,
+    windowMs: 3_600_000,
+    snapshotVersion: "sim-1-refused-plan",
+  });
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("TRDR4-R1 — a refused plan the venue PARTLY executed keeps what its working order reserved", () => {
+describe("SIM-1 R3 — the REAL venue reports what it booked, and the loop OWNS it", () => {
+  it("a 20-slice POSITION plan whose SECOND batch is refused: the 15 booked slices are owned, traced and delivered, the 5 refused are released, and nothing halts", async () => {
+    // 100 shares at 0.2 in 5-share slices = 20 orders = two venue batches
+    // (15 + 5). A 15-token budget admits the first batch and refuses the
+    // second, all-or-nothing.
+    const harness = assemble({ rateLimits: orderBudget(15), targetShares: "100", maximumTotalCost: "25" });
+    await open(harness);
+    const loop = harness.loop;
+    const planned = plannedOrderIds(harness);
+    expect(planned).toHaveLength(20);
+    const bookedIds = planned.slice(0, 15);
+    const refusedIds = planned.slice(15);
+
+    // --- the venue's per-order answer ---------------------------------------
+    expect(harness.answers).toHaveLength(1);
+    const answer = harness.answers[0];
+    if (answer === undefined) throw new Error("no answer was recorded");
+    expect(answer).toMatchObject({ accepted: false, outcome: "PARTIAL", refusalCode: "SIMULATED_VENUE_RATE_LIMITED" });
+    expect(answer.orders.map((order) => order.plannedOrderId)).toEqual(bookedIds);
+    expect(answer.orders.every((order) => order.state === "RESTING")).toBe(true);
+    expect(answer.notPlaced.map((entry) => entry.plannedOrderId)).toEqual(refusedIds);
+    expect(answer.notPlaced.every((entry) => entry.refusalCode === "SIMULATED_VENUE_RATE_LIMITED")).toBe(true);
+    expect(harness.venue.ordersSnapshot().map((order) => order.plannedOrderId).sort()).toEqual([...bookedIds].sort());
+
+    let health = loop.health();
+    expect(health.execution.submissionsRefused).toBe(1);
+    expect(health.execution.submissionsAccepted).toBe(0);
+
+    // --- the REFUSED slices are released, counted --------------------------
+    expect(health.execution.reservationsReleasedOnRefusal).toBe(5);
+    for (const plannedOrderId of refusedIds) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
+
+    // --- the BOOKED slices keep theirs — 15 × 5 × 0.2 = 15 pUSD ---------------
+    for (const plannedOrderId of bookedIds) expect(loop.timeInForceFor(plannedOrderId)).toBe("GTC");
+    expect(health.seams.reservations).toMatchObject({ open: 15, taken: 20, released: 5, reservedCollateral: "15" });
+    expect(health.seams.allocator).toMatchObject({ open: 15, applied: 20, released: 5, reservedCollateral: "15" });
+
+    // --- and are OWNED: owner, trace prefix, provenance ---------------------
+    expect(health.seams.orders.tracked).toBe(15);
+    expect(loop.retainedOrderState()).toMatchObject({ owners: 15, instanceOrderIds: 15, traceLookup: 15 });
+    const plan = harness.submitted[0] as { readonly executionPlanId: string };
+    const provenance = loop.orderProvenance();
+    expect(provenance.map((record) => record.venueOrderId)).toEqual(answer.orders.map((order) => order.simulatedOrderId));
+    expect(new Set(provenance.map((record) => record.executionPlanId))).toEqual(new Set([plan.executionPlanId]));
+    expect(new Set(provenance.map((record) => record.submissionAttemptId)).size).toBe(1);
+    expect(provenance.every((record) => record.intentId === "trdr4r1-resting-buy")).toBe(true);
+
+    // --- a POSITION partial raises NO halt ----------------------------------
+    expect(health.halts).toEqual([]);
+
+    // --- delivered: the strategy sees its orders and can re-plan ------------
+    const before = harness.evaluations.length;
+    await feed(harness, yesBook(5));
+    const later = harness.evaluations.slice(before);
+    const updates = later.flatMap((evaluation) =>
+      evaluation.callback === "onOrderUpdate" ? [evaluation.order] : [],
+    );
+    expect(updates.map((view) => view.orderId).sort()).toEqual([...bookedIds].sort());
+    expect(updates.every((view) => view.status === "OPEN")).toBe(true);
+    for (const evaluation of later) {
+      expect(evaluation.orders.map((view) => view.orderId).sort()).toEqual([...bookedIds].sort());
+    }
+
+    // --- an OBSERVED trade fills them: ATTRIBUTED, released, retired, settled -
+    await feed(
+      harness,
+      envelope(6, "PublicTradeObserved", {
+        internalMarketId: MARKET_ID,
+        tokenId: YES_TOKEN,
+        price: "0.2",
+        size: "75",
+        takerSide: "ASK",
+      }),
+    );
+    expect(harness.venue.ordersSnapshot().every((order) => order.state === "FILLED")).toBe(true);
+    health = loop.health();
+    expect(health.execution.fillsObserved).toBe(15);
+    expect(health.seams.orders).toMatchObject({ tracked: 0, settled: 15, unownedFills: 0, settleMismatches: 0 });
+    expect(health.accounting.unattributedActivity).toBe(0);
+    expect(loop.traces().map((trace) => trace.venueOrderId).sort()).toEqual(
+      answer.orders.map((order) => order.simulatedOrderId).sort(),
+    );
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 20, released: 20, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 20, released: 20, reservedCollateral: "0" });
+    for (const plannedOrderId of bookedIds) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
+    expect(health.halts).toEqual([]);
+  });
+
+  it("a plan of at most 15 orders against a budget SMALLER than it books NOTHING — the batch is admitted all-or-nothing (D-05, ADR-012 §5.6)", async () => {
+    // TRDR-4's partial state (10 slices, ONE token: one slice booked, the plan
+    // refused) — which the venue no longer produces.
+    const harness = assemble({ rateLimits: orderBudget(1) });
+    await open(harness);
+    const loop = harness.loop;
+    const planned = plannedOrderIds(harness);
+    expect(planned).toHaveLength(10);
+    expect(harness.venue.ordersSnapshot()).toEqual([]);
+    expect(harness.answers[0]).toMatchObject({
+      accepted: false,
+      outcome: "REFUSED",
+      orders: [],
+      fills: [],
+      refusalCode: "SIMULATED_VENUE_RATE_LIMITED",
+    });
+    expect(harness.answers[0]?.notPlaced.map((entry) => entry.plannedOrderId)).toEqual(planned);
+    const health = loop.health();
+    expect(health.execution.submissionsRefused).toBe(1);
+    expect(health.execution.reservationsReleasedOnRefusal).toBe(10);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
+    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
+    expect(health.seams.orders.tracked).toBe(0);
+    expect(health.halts).toEqual([]);
+  });
+
+  it("a plan the venue refused OUTRIGHT (it booked nothing) releases every planned order and raises no halt — MEDIUM-4 unchanged", async () => {
+    // NO placement token: the first batch is refused, so nothing is booked.
+    const harness = assemble({ rateLimits: orderBudget(0) });
+    await open(harness);
+    const loop = harness.loop;
+    const planned = plannedOrderIds(harness);
+    expect(planned).toHaveLength(10);
+    expect(harness.venue.ordersSnapshot()).toEqual([]);
+    const health = loop.health();
+    expect(health.execution.submissionsRefused).toBe(1);
+    expect(health.execution.reservationsReleasedOnRefusal).toBe(10);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
+    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
+    expect(health.halts).toEqual([]);
+  });
+});
+
+describe("SIM-1 R3 — a BASKET the venue executed only IN PART halts its markets (nothing consumes failurePolicy yet)", () => {
+  it("the booked YES leg is owned and attributed; the refused NO leg is released; the market halts BASKET_PARTIALLY_EXECUTED", async () => {
+    // A two-leg basket in ONE market — BUY 10 YES (≤ 0.35) and BUY 10 NO
+    // (≤ 0.67), planned as two groups of two 5-share slices — against a venue
+    // that sees NO book for the NO side: the YES leg fills, the NO leg is
+    // refused NO_BOOK. Risk, allocator, planner and venue are real; only the
+    // basket's fee/slippage estimates are supplied (see the `vi.mock` above).
+    const harness = assemble({
+      venueBookSides: ["YES"],
+      intent: (ctx) => ({
+        type: "BASKET",
+        intentId: "sim1-basket",
+        legs: [
+          { marketId: MARKET_ID, direction: "YES", targetShares: "10", maximumBuyPrice: "0.35" },
+          { marketId: MARKET_ID, direction: "NO", targetShares: "10", maximumBuyPrice: "0.67" },
+        ],
+        maximumCombinedCost: "11",
+        minimumLockedEdge: "1",
+        legRiskLimit: "7",
+        failurePolicy: "HOLD_FILLED_LEGS",
+        validUntil: new Date(Date.parse(ctx.now()) + 3_600_000).toISOString(),
+      }),
+    });
+    await open(harness);
+    const loop = harness.loop;
+    const plan = harness.submitted[0] as { readonly planKind: string; readonly executionPlanId: string };
+    expect(plan.planKind).toBe("BASKET");
+    const planned = plannedOrderIds(harness);
+    expect(planned).toHaveLength(4);
+
+    const answer = harness.answers[0];
+    if (answer === undefined) throw new Error("no answer was recorded");
+    expect(answer).toMatchObject({ accepted: false, outcome: "PARTIAL", refusalCode: "SIMULATED_VENUE_NO_BOOK" });
+    expect(answer.orders.map((order) => `${order.side} ${order.state} ${order.filledShares}/${order.requestedShares}`)).toEqual([
+      "YES FILLED 5/5",
+      "YES FILLED 5/5",
+    ]);
+    expect(answer.notPlaced.map((entry) => entry.refusalCode)).toEqual([
+      "SIMULATED_VENUE_NO_BOOK",
+      "SIMULATED_VENUE_NO_BOOK",
+    ]);
+
+    const health = loop.health();
+    // The booked leg is OWNED — its fills are attributed, never UNATTRIBUTED.
+    expect(health.seams.orders).toMatchObject({ tracked: 2, unownedFills: 0 });
+    expect(health.accounting.unattributedActivity).toBe(0);
+    expect(loop.orderProvenance().map((record) => record.venueOrderId)).toEqual(
+      answer.orders.map((order) => order.simulatedOrderId),
+    );
+    expect(loop.traces().map((trace) => trace.venueOrderId)).toEqual(
+      answer.orders.map((order) => order.simulatedOrderId),
+    );
+    // The refused leg is released at the refusal; the booked (FILLED) leg at
+    // the harvest that saw it terminal.
+    expect(health.execution.reservationsReleasedOnRefusal).toBe(2);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 4, released: 4, reservedCollateral: "0" });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 4, released: 4, reservedCollateral: "0" });
+
+    // …and the market HALTS, naming the basket, what was booked and what was not.
+    expect(health.halts).toHaveLength(1);
+    const halt = health.halts[0];
+    expect(halt?.scope).toEqual({ kind: "MARKET", marketId: MARKET_ID });
+    expect(halt?.code).toBe("BASKET_PARTIALLY_EXECUTED");
+    expect(halt?.action).toBe("MANAGE_KNOWN_POSITIONS_ONLY");
+    expect(halt?.detail).toContain(`basket plan ${plan.executionPlanId} (failurePolicy HOLD_FILLED_LEGS)`);
+    expect(halt?.detail).toContain("booked 2 of its 4 planned orders");
+    expect(halt?.detail).toContain("(SIMULATED_VENUE_NO_BOOK)");
+  });
+});
+
+describe("TRDR4-R1, the DEFENSIVE path — a venue that REFUSES a plan while HOLDING part of it (scripted double)", () => {
   it("the RESTING first slice keeps its reservation, allocator commitment and time-in-force until it is terminal; the market halts for reconciliation", async () => {
-    const harness = assemble();
+    const harness = assemble({ venueDouble: (inner) => new RefusesWhileHoldingVenue(inner) });
     await open(harness);
     const loop = harness.loop;
 
@@ -539,21 +885,4 @@ describe("TRDR4-R1 — a refused plan the venue PARTLY executed keeps what its w
     }
   });
 
-  it("a plan the venue refused OUTRIGHT (it booked nothing) releases every planned order and raises no halt — MEDIUM-4 unchanged", async () => {
-    // NO placement token: the FIRST slice is refused, so nothing is booked.
-    const harness = assemble({ orderTokensPerWindow: 0 });
-    await open(harness);
-    const loop = harness.loop;
-    const planned = plannedOrderIds(harness);
-    expect(planned).toHaveLength(10);
-    expect(harness.venue.ordersSnapshot()).toEqual([]);
-    const health = loop.health();
-    expect(health.execution.submissionsRefused).toBe(1);
-    expect(health.execution.reservationsReleasedOnRefusal).toBe(10);
-    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10, reservedCollateral: "0" });
-    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10, reservedCollateral: "0" });
-    for (const plannedOrderId of planned) expect(loop.timeInForceFor(plannedOrderId)).toBeUndefined();
-    expect(health.halts).toEqual([]);
-  });
 });
-

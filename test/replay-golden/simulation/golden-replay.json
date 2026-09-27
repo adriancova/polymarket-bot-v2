@@ -191,12 +191,12 @@
     "feeSnapshotVersion": "fees/2026-08-24",
     "rewardSnapshotVersion": "rewards/2026-08-24",
     "settlementSpecVersions": [],
-    "simulatorVersion": "wp-210/v1"
+    "simulatorVersion": "wp-210/v2"
   },
   "expected": {
     "serialization": [
       "polymarket-bot/simulation-run/v3",
-      "run simulator=wp-210/v1 seed=42 fillModel=sim/tier1/v1 fillModelParams=0000000000000000000000000000000000000000000000000000000000000000 latencyModel=sim/latency/v1 latencyModelParams=1111111111111111111111111111111111111111111111111111111111111111",
+      "run simulator=wp-210/v2 seed=42 fillModel=sim/tier1/v1 fillModelParams=0000000000000000000000000000000000000000000000000000000000000000 latencyModel=sim/latency/v1 latencyModelParams=1111111111111111111111111111111111111111111111111111111111111111",
       "pins normalizer=golden/market-frame/v1 featureSet=features-v1 fee=fees/2026-08-24 reward=rewards/2026-08-24 settlement=",
       "dataset id=2026-06-29T17-00Z epoch=0190a3e0-0000-7000-8000-000000000001 objects=1 walSegments=NOT_AVAILABLE_ARCHIVED_ONLY",
       "counts read=3 delivered=3 excludedIncident=0 excludedDuplicate=0 receivedAtInversions=1",

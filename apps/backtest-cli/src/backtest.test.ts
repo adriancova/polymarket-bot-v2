@@ -202,7 +202,7 @@ function pins() {
     feeSnapshotVersion: "fees/2026-08-24",
     rewardSnapshotVersion: "rewards/2026-08-24",
     settlementSpecVersions: [] as readonly string[],
-    simulatorVersion: "wp-210/v1",
+    simulatorVersion: "wp-210/v2",
   };
 }
 
