@@ -310,16 +310,39 @@ interface ChainAttribution {
   readonly exitOrderIds: ReadonlySet<string>;
 }
 
+/** The side of the bracket an emission's DECISION puts it on. */
+type EmissionSide = "ENTRY" | "EXIT" | "NEITHER";
+
+/**
+ * One intent EMISSION: an intent as one persisted decision emitted it.
+ *
+ * Its identity is `(runId, evaluationSeq, intentId)` — the decision's §10.3
+ * primary key plus the intent's id — which is exactly the triple a trace
+ * carries (`RECON-1` r2). An `intentId` alone is not an identity: §9.8 check
+ * 18's duplicate guard remembers only the last 256 ids, so one id can be
+ * emitted by two decisions, and the decision that emitted it decides its side.
+ */
+interface Emission {
+  readonly key: string;
+  readonly decision: ArtifactDecision;
+  readonly intent: ArtifactIntent;
+  readonly side: EmissionSide;
+  /** False for a CANCEL: its plan withdraws orders and places none. */
+  readonly placesOrders: boolean;
+}
+
+function emissionKey(runId: string, evaluationSeq: number, intentId: string): string {
+  return JSON.stringify([runId, evaluationSeq, intentId]);
+}
+
 function describeIntent(intent: ArtifactIntent): string {
   return `${intent.type} ${intent.intentId ?? "(no intentId)"}`;
 }
 
-function describeCandidates(
-  candidates: readonly { readonly decision: ArtifactDecision; readonly intent: ArtifactIntent }[],
-): string {
-  return candidates.length === 0
+function describeEmissions(emissions: readonly Emission[]): string {
+  return emissions.length === 0
     ? "none"
-    : candidates
+    : emissions
         .map(
           ({ decision, intent }) =>
             `${describeIntent(intent)} of the \`${decision.decisionType}\` decision at ` +
@@ -329,21 +352,84 @@ function describeCandidates(
 }
 
 /**
+ * Every emission the artefact holds, indexed by identity — or a refusal.
+ *
+ * A duplicate identity is a MALFORMED artefact, refused outright (`RECON-1`
+ * r2): two persisted decisions sharing `(runId, evaluationSeq)` — §10.3's
+ * primary key — or one decision emitting the same `intentId` twice would give
+ * one identity two meanings, and a copy of an existing decision would
+ * otherwise count as a second possible origin for an order it never placed.
+ * An intent with no `intentId` (a CANCEL, a REDUCE_POSITION) is indexed by its
+ * position instead: no trace can name it, and it is still one emission.
+ */
+function emissionsOf(artifact: Omit<PaperRunArtifact, "reconciliation">): {
+  readonly byKey: ReadonlyMap<string, Emission>;
+  readonly all: readonly Emission[];
+} {
+  const decisionKeys = new Set<string>();
+  const byKey = new Map<string, Emission>();
+  const all: Emission[] = [];
+  for (const decision of artifact.decisions) {
+    const decisionKey = JSON.stringify([decision.runId, decision.evaluationSeq]);
+    if (decisionKeys.has(decisionKey)) {
+      throw new Error(
+        `two persisted decisions share (runId, evaluationSeq) = (${decision.runId}, ` +
+          `${String(decision.evaluationSeq)}), §10.3's primary key; every intent they emit ` +
+          "would have two origins, so the artefact is malformed and nothing in it is attributed",
+      );
+    }
+    decisionKeys.add(decisionKey);
+    const side: EmissionSide =
+      decision.decisionType === "enter"
+        ? "ENTRY"
+        : EXIT_DECISION_TYPES.has(decision.decisionType)
+          ? "EXIT"
+          : "NEITHER";
+    for (const [index, intent] of decision.intents.entries()) {
+      const key =
+        intent.intentId === undefined
+          ? JSON.stringify([decision.runId, decision.evaluationSeq, null, index])
+          : emissionKey(decision.runId, decision.evaluationSeq, intent.intentId);
+      if (byKey.has(key)) {
+        throw new Error(
+          `the decision at (${decision.runId}, ${String(decision.evaluationSeq)}) emits intent ` +
+            `${intent.intentId ?? ""} twice; one emission identity may name one intent`,
+        );
+      }
+      const emission: Emission = {
+        key,
+        decision,
+        intent,
+        side,
+        placesOrders: intent.type !== "CANCEL",
+      };
+      byKey.set(key, emission);
+      all.push(emission);
+    }
+  }
+  return { byKey, all };
+}
+
+/**
  * Attributes EVERY fill and EVERY order of the run to the entry or to an exit,
  * positively and by id, or throws (`RECON-1`, closing `RISK2-R3`).
  *
- * ## The chain, on both sides
+ * ## The chain, on both sides, resolved by EMISSION
  *
  * `RISK-2` attributed the ENTRY by id down the artefact's own §6 invariant 4
  * chain — intent → trace → execution plan → order → fill — and then defined the
  * EXIT as everything else. The complement is exact for a run whose only fills
  * are one entry's and its exits', and wrong for anything more: a second entry's
  * purchase, or a fill no chain accounts for at all, would have been summed into
- * `exitProceeds` and reconciled as a sale. The exit is now walked down the SAME
- * chain from the intents of the `exit` and `reduce` decisions, and a fill that
- * neither walk reaches is REFUSED, by name. It is never assigned to a side for
- * not being the other one. The walk never reads `action`, which would break on
- * the complement leg where an entry SELLS and its exit BUYS.
+ * `exitProceeds` and reconciled as a sale. Every trace is now resolved to the
+ * EMISSION it names — `(runId, evaluationSeq, intentId)`, never the id alone
+ * (`RECON-1` r2) — and the decision found at that key decides the side: the
+ * entry emission, an order-placing intent of an `exit` or `reduce` decision,
+ * or neither. A fill that neither side reaches is REFUSED, by name; a plan
+ * whose traces resolve to two different emissions is refused; nothing is
+ * assigned to a side for not being the other one. The walk never reads
+ * `action`, which would break on the complement leg where an entry SELLS and
+ * its exit BUYS.
  *
  * ## One bracket, and why a second one is refused rather than reconciled
  *
@@ -368,18 +454,8 @@ function describeCandidates(
  * `apps/trader/src/loop.ts` records a trace per FILL (`#harvestFills`), so an
  * order that never filled has no trace, and nothing in the artefact links it to
  * its intent by id. The golden's withdrawn take-profit is exactly such an order.
- * Such an order is attributed by a CLOSED-WORLD rule rather than by complement:
- * the loop mints ONE execution plan per approved intent evaluation (§8.1 step
- * 8, in `#routeIntent`), and a trace names the evaluation it came from —
- * `(runId, evaluationSeq, intentId)` — so an order under a plan that no trace
- * names can only have been placed by an order-placing intent EMISSION that no
- * trace names. (Emissions, not ids: §9.8 check 18's duplicate guard remembers
- * only the last 256 ids, so an id alone does not prove a single plan.) It is an
- * EXIT order when EVERY such emission belongs to an `exit` or `reduce` decision
- * AND there are at least as many of them as there are untraced plans. Otherwise its side cannot be established from this
- * document, and the reconciliation refuses rather than guess — which is what
- * keeps an ENTRY order cancelled unfilled from being reported under
- * `exit.cancelled_proceeds.*`. An untraced order that reports filled shares is
+ * Such an order is attributed by a CLOSED-WORLD rule, never by complement — see
+ * {@link untracedExitOrders}. An untraced order that reports filled shares is
  * refused outright: its fills should have traces.
  */
 function attributeByChain(
@@ -429,53 +505,43 @@ function attributeByChain(
     throw new Error("the run produced no fill; there is nothing realized to reconcile against");
   }
 
-  // --- the exit intents, by the decision that emitted them ------------------
-  const exitIntentIds = new Set(
-    artifact.decisions
-      .filter((decision) => EXIT_DECISION_TYPES.has(decision.decisionType))
-      .flatMap((decision) => decision.intents)
-      .flatMap((intent) => (intent.intentId === undefined ? [] : [intent.intentId])),
-  );
-  if (exitIntentIds.has(entryIntentId)) {
-    throw new Error(
-      `intent ${entryIntentId} is emitted by the entry decision AND by an exit or reduce ` +
-        "decision, so its fills would count on both sides",
-    );
-  }
+  const emissions = emissionsOf(artifact);
+  const entryKey = emissionKey(entry.runId, entry.evaluationSeq, entryIntentId);
 
-  // --- plan → intent, from the traces ---------------------------------------
-  const intentOfPlan = new Map<string, string>();
+  // --- plan → emission, from the traces, by the FULL key ---------------------
+  const originOfPlan = new Map<string, string>();
   for (const trace of artifact.traces) {
-    const known = intentOfPlan.get(trace.executionPlanId);
-    if (known !== undefined && known !== trace.intentId) {
+    const key = emissionKey(trace.runId, trace.evaluationSeq, trace.intentId);
+    const known = originOfPlan.get(trace.executionPlanId);
+    if (known !== undefined && known !== key) {
       throw new Error(
-        `execution plan ${trace.executionPlanId} is traced to two intents, ${known} and ` +
-          `${trace.intentId}; one plan serves one approved intent, so its orders cannot be ` +
+        `execution plan ${trace.executionPlanId} is traced to two intents — emissions ${known} ` +
+          `and ${key}; one plan serves one approved intent evaluation, so its orders cannot be ` +
           "attributed to a single side",
       );
     }
-    intentOfPlan.set(trace.executionPlanId, trace.intentId);
+    originOfPlan.set(trace.executionPlanId, key);
   }
-  const ordersUnder = (plans: ReadonlySet<string>): Set<string> =>
+  /** What a TRACED plan's emission makes it; `undefined` for a plan no trace names. */
+  const sideOfPlan = (plan: string): EmissionSide | undefined => {
+    const key = originOfPlan.get(plan);
+    if (key === undefined) return undefined;
+    if (key === entryKey) return "ENTRY";
+    const emission = emissions.byKey.get(key);
+    // A trace naming no emission, or a CANCEL's, or a decision that is neither
+    // the entry nor an exit: nothing this table can own.
+    return emission !== undefined && emission.placesOrders && emission.side === "EXIT"
+      ? "EXIT"
+      : "NEITHER";
+  };
+  const ordersOn = (side: EmissionSide): Set<string> =>
     new Set(
       artifact.orders
-        .filter((order) => plans.has(order.executionPlanId))
+        .filter((order) => sideOfPlan(order.executionPlanId) === side)
         .map((order) => order.simulatedOrderId),
     );
-  const entryOrderIds = ordersUnder(
-    new Set(
-      artifact.traces
-        .filter((trace) => trace.intentId === entryIntentId)
-        .map((trace) => trace.executionPlanId),
-    ),
-  );
-  const exitOrderIds = ordersUnder(
-    new Set(
-      artifact.traces
-        .filter((trace) => exitIntentIds.has(trace.intentId))
-        .map((trace) => trace.executionPlanId),
-    ),
-  );
+  const entryOrderIds = ordersOn("ENTRY");
+  const exitOrderIds = ordersOn("EXIT");
   const onBothSides = [...entryOrderIds].filter((orderId) => exitOrderIds.has(orderId));
   if (onBothSides.length > 0) {
     throw new Error(
@@ -495,9 +561,10 @@ function attributeByChain(
     throw new Error(
       `fill ${unattributed.map((fill) => fill.simulatedFillId).join(", ")} (order ` +
         `${unattributed.map((fill) => fill.simulatedOrderId).join(", ")}) belongs to neither ` +
-        "the entry's chain nor any exit's: no trace from the entry intent or from an exit or " +
-        "reduce decision's intent reaches its order. Counting it as exit proceeds because it " +
-        "is not the entry's is the error this refusal exists to prevent",
+        "the entry's chain nor any exit's: no trace resolves its order's plan to the entry " +
+        "emission or to an order-placing emission of an exit or reduce decision. Counting it " +
+        "as exit proceeds because it is not the entry's is the error this refusal exists to " +
+        "prevent",
     );
   }
   if (entryFills.length === 0) {
@@ -509,10 +576,7 @@ function attributeByChain(
 
   // --- every order: the entry's, an exit's, or refused ----------------------
   const tracedElsewhere = artifact.orders.filter(
-    (order) =>
-      intentOfPlan.has(order.executionPlanId) &&
-      !entryOrderIds.has(order.simulatedOrderId) &&
-      !exitOrderIds.has(order.simulatedOrderId),
+    (order) => sideOfPlan(order.executionPlanId) === "NEITHER",
   );
   if (tracedElsewhere.length > 0) {
     throw new Error(
@@ -520,21 +584,20 @@ function attributeByChain(
         .map(
           (order) =>
             `order ${order.simulatedOrderId} was placed under plan ${order.executionPlanId}, ` +
-            `which traces to intent ${intentOfPlan.get(order.executionPlanId) ?? ""} — neither ` +
+            `which traces to emission ${originOfPlan.get(order.executionPlanId) ?? ""} — neither ` +
             "the entry intent nor one an exit or reduce decision emitted",
         )
         .join("; "),
     );
   }
-  const untraced = artifact.orders.filter((order) => !intentOfPlan.has(order.executionPlanId));
+  const untraced = artifact.orders.filter(
+    (order) => sideOfPlan(order.executionPlanId) === undefined,
+  );
   const deduced = untracedExitOrders(
     artifact,
     untraced,
-    new Set(
-      artifact.traces.map((trace) =>
-        emissionKey(trace.runId, trace.evaluationSeq, trace.intentId),
-      ),
-    ),
+    emissions.all,
+    new Set(originOfPlan.values()),
   );
 
   return {
@@ -546,22 +609,94 @@ function attributeByChain(
   };
 }
 
-/** One intent EMISSION: the evaluation that emitted it, and its id. */
-function emissionKey(runId: string, evaluationSeq: number, intentId: string): string {
-  return JSON.stringify([runId, evaluationSeq, intentId]);
+/**
+ * Whether an emission could have placed `order`, by what the artefact can
+ * ESTABLISH (`RECON-1` r2).
+ *
+ * An intent places orders only in its own market (§7.7 `marketId`), and on
+ * either outcome token of that market: `execution-planner` may express an
+ * exposure increase as BUY-direction or SELL-opposite (`leg.ts`
+ * `selectIncreaseLeg`), and a reduction acts on both sides (`build.ts`), so the
+ * token alone does not reveal the intent's `direction` — which the artefact
+ * does not carry anyway. The artefact names outcome tokens for the SCENARIO
+ * market only, so an order in any other market, on a token that is not one of
+ * the scenario's two, or labelled with the other token's side, has no origin
+ * this document can establish. A BASKET carries no top-level `marketId` here,
+ * and so establishes none either.
+ */
+function couldHavePlaced(
+  emission: Emission,
+  order: ArtifactOrder,
+  scenario: PaperRunArtifact["scenario"],
+): boolean {
+  if (emission.intent.marketId === undefined) return false;
+  if (emission.intent.marketId !== order.marketId || order.marketId !== scenario.marketId) {
+    return false;
+  }
+  return (
+    (order.tokenId === scenario.yesTokenId && order.side === "YES") ||
+    (order.tokenId === scenario.noTokenId && order.side === "NO")
+  );
 }
 
 /**
- * The closed-world rule for orders with NO trace — see {@link attributeByChain}.
- * Returns the ids it proves are exits, and throws for any it cannot.
+ * The size of a maximum one-to-one assignment of plans to DISTINCT compatible
+ * emissions (augmenting paths; the sets are tiny).
+ */
+function assignableCount(compatible: ReadonlyMap<string, readonly Emission[]>): number {
+  const holderOf = new Map<string, string>();
+  const place = (plan: string, visited: Set<string>): boolean => {
+    for (const emission of compatible.get(plan) ?? []) {
+      if (visited.has(emission.key)) continue;
+      visited.add(emission.key);
+      const holder = holderOf.get(emission.key);
+      if (holder === undefined || place(holder, visited)) {
+        holderOf.set(emission.key, plan);
+        return true;
+      }
+    }
+    return false;
+  };
+  let assigned = 0;
+  for (const plan of compatible.keys()) {
+    if (place(plan, new Set<string>())) assigned += 1;
+  }
+  return assigned;
+}
+
+/**
+ * The closed-world rule for orders with NO trace. Returns the ids it proves are
+ * exits, and throws for any it cannot.
+ *
+ * The loop mints ONE execution plan per approved intent evaluation (§8.1 step
+ * 8, in `#routeIntent`), and a filled plan is named by its traces, so an
+ * untraced plan can only have come from an order-placing emission that no
+ * trace names. Among THOSE, only the ones that {@link couldHavePlaced} every
+ * order under the plan are its possible origins. The plan's orders are EXIT
+ * orders when:
+ *
+ * 1. it has at least one possible origin (otherwise nothing in the document
+ *    could have placed it);
+ * 2. EVERY possible origin is an emission of an `exit` or `reduce` decision
+ *    (otherwise its side is ambiguous, and it is refused rather than guessed);
+ * 3. the untraced plans can be given DISTINCT possible origins, all at once —
+ *    one plan per evaluation — which is Hall's condition, checked by
+ *    {@link assignableCount}. `RECON-1` r2: counting the candidates globally
+ *    let a copied decision, or a candidate in another market, stand in for an
+ *    origin no plan actually had.
+ *
+ * WHICH exit emission placed which plan is not needed by any row — the
+ * `exit.cancelled_proceeds.*` row reads the order alone — so an assignment
+ * that is not unique does not change the attribution: under (2) every
+ * assignment puts every plan on the exit side.
  */
 function untracedExitOrders(
   artifact: Omit<PaperRunArtifact, "reconciliation">,
   untraced: readonly ArtifactOrder[],
-  tracedEmissions: ReadonlySet<string>,
+  emissions: readonly Emission[],
+  tracedKeys: ReadonlySet<string>,
 ): readonly string[] {
   if (untraced.length === 0) return [];
-  const named = untraced.map((order) => order.simulatedOrderId).join(", ");
 
   const filled = untraced.filter((order) => compareDecimal(order.filledShares, "0") !== 0);
   if (filled.length > 0) {
@@ -577,41 +712,51 @@ function untracedExitOrders(
     );
   }
 
-  // Every order-placing intent EMISSION that no trace names. A CANCEL places no
-  // order (its plan withdraws one), so it cannot be an origin; an id-less
-  // intent can never be named by a trace, so it is always a candidate.
-  const candidates = artifact.decisions.flatMap((decision) =>
-    decision.intents
-      .filter(
-        (intent) =>
-          intent.type !== "CANCEL" &&
-          (intent.intentId === undefined ||
-            !tracedEmissions.has(
-              emissionKey(decision.runId, decision.evaluationSeq, intent.intentId),
-            )),
-      )
-      .map((intent) => ({ decision, intent })),
+  const candidates = emissions.filter(
+    (emission) => emission.placesOrders && !tracedKeys.has(emission.key),
   );
-  const notExits = candidates.filter(
-    (candidate) => !EXIT_DECISION_TYPES.has(candidate.decision.decisionType),
-  );
-  if (notExits.length > 0) {
-    throw new Error(
-      `order ${named} has no trace, and the untraced intent emissions that could have placed ` +
-        "it include " +
-        `${describeCandidates(notExits)} — not an exit. An unfilled order's side cannot be read ` +
-        "from this document by id, so the reconciliation refuses rather than report it as an " +
-        "exit cancellation",
-    );
+  const plans = new Map<string, ArtifactOrder[]>();
+  for (const order of untraced) {
+    const orders = plans.get(order.executionPlanId) ?? [];
+    orders.push(order);
+    plans.set(order.executionPlanId, orders);
   }
-  const plans = new Set(untraced.map((order) => order.executionPlanId));
-  if (plans.size > candidates.length) {
+
+  const compatible = new Map<string, readonly Emission[]>();
+  for (const [plan, orders] of plans) {
+    const named = orders.map((order) => order.simulatedOrderId).join(", ");
+    const origins = candidates.filter((candidate) =>
+      orders.every((order) => couldHavePlaced(candidate, order, artifact.scenario)),
+    );
+    if (origins.length === 0) {
+      throw new Error(
+        `order ${named} (plan ${plan}) has no trace, and no order-placing emission without a ` +
+          `trace could have placed it — the untraced emissions are ${describeEmissions(candidates)}, ` +
+          "and an emission places orders only in its own market, on an outcome token this " +
+          "document names for it. The order has no possible origin in this document, so it is " +
+          "not attributed to either side",
+      );
+    }
+    const notExits = origins.filter((origin) => origin.side !== "EXIT");
+    if (notExits.length > 0) {
+      throw new Error(
+        `order ${named} has no trace, and the untraced intent emissions that could have placed ` +
+          `it include ${describeEmissions(notExits)} — not an exit. An unfilled order's side ` +
+          "cannot be read from this document by id, so the reconciliation refuses rather than " +
+          "report it as an exit cancellation",
+      );
+    }
+    compatible.set(plan, origins);
+  }
+
+  if (assignableCount(compatible) < plans.size) {
     throw new Error(
-      `${String(plans.size)} execution plans have no trace (${[...plans].join(", ")}; orders ` +
-        `${named}), but only ${String(candidates.length)} order-placing intent emission(s) ` +
-        `without a trace exist to have produced them (${describeCandidates(candidates)}). The ` +
-        "loop mints ONE plan per approved intent evaluation, so at least one of these orders " +
-        "has no possible origin in this document and none of them can be attributed",
+      `${String(plans.size)} execution plans have no trace (${[...plans.keys()].join(", ")}; ` +
+        `orders ${untraced.map((order) => order.simulatedOrderId).join(", ")}), but they cannot ` +
+        "each be given a DISTINCT order-placing emission that could have placed them — the " +
+        `untraced emissions are ${describeEmissions(candidates)}. The loop mints ONE plan per ` +
+        "approved intent evaluation, so at least one of these orders has no possible origin in " +
+        "this document and none of them can be attributed",
     );
   }
   return untraced.map((order) => order.simulatedOrderId);
@@ -628,6 +773,22 @@ function compareCodeUnits(left: string, right: string): -1 | 0 | 1 {
 }
 
 /**
+ * Refuses an `atEventIngestSeq` that is not a canonical unsigned integer string.
+ *
+ * Called for EVERY fill before the fold sorts (`RECON-1` r2): inside the sort
+ * comparator alone it never ran for a single fill, which a one-element array
+ * never compares, so a lone `"05"` was folded without a word.
+ */
+function assertCanonicalIngestSeq(value: string): void {
+  if (!CANONICAL_UNSIGNED_INTEGER.test(value)) {
+    throw new Error(
+      `atEventIngestSeq ${JSON.stringify(value)} is not a canonical unsigned integer string, ` +
+        "so the order in which the run consumed its fills cannot be established",
+    );
+  }
+}
+
+/**
  * Two canonical unsigned integer strings (§7.1's `ingestSeq`), compared EXACTLY.
  *
  * Length first, then code units — the repository's own rule
@@ -637,14 +798,8 @@ function compareCodeUnits(left: string, right: string): -1 | 0 | 1 {
  * non-canonical value is refused rather than ordered.
  */
 export function compareIngestSeq(left: string, right: string): -1 | 0 | 1 {
-  for (const value of [left, right]) {
-    if (!CANONICAL_UNSIGNED_INTEGER.test(value)) {
-      throw new Error(
-        `atEventIngestSeq ${JSON.stringify(value)} is not a canonical unsigned integer string, ` +
-          "so the order in which the run consumed its fills cannot be established",
-      );
-    }
-  }
+  assertCanonicalIngestSeq(left);
+  assertCanonicalIngestSeq(right);
   if (left.length !== right.length) return left.length < right.length ? -1 : 1;
   return compareCodeUnits(left, right);
 }
@@ -744,10 +899,12 @@ function openCostBasisOf(
   entryFills: readonly ArtifactFill[],
   exitFills: readonly ArtifactFill[],
 ): string {
-  const sequence = [
+  const unsorted = [
     ...entryFills.map((fill) => ({ fill, opens: true })),
     ...exitFills.map((fill) => ({ fill, opens: false })),
-  ].sort((left, right) => inConsumptionOrder(left.fill, right.fill));
+  ];
+  for (const { fill } of unsorted) assertCanonicalIngestSeq(fill.atEventIngestSeq);
+  const sequence = unsorted.sort((left, right) => inConsumptionOrder(left.fill, right.fill));
 
   const lots = new Map<string, { readonly shares: string; readonly costBasis: string }>();
   for (const { fill, opens } of sequence) {

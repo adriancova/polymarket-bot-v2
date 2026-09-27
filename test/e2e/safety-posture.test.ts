@@ -199,6 +199,12 @@ describe("this package's own files carry no credential and no signer", () => {
       "@polymarket-bot/simulation",
       "@polymarket-bot/trader",
       "@polymarket-bot/trader/testing",
+      // `RECON-1` r2: `reconciliation-attribution.test.ts` reads
+      // `support/reconcile.ts`'s imports from its PARSED source, as
+      // `test/contract/coinbase/isolation.test.ts` does. The compiler (a root
+      // devDependency) is used only to parse text — no network, signer or order
+      // path — and a line regex let a trailing comment hide an import.
+      "typescript",
       "vitest/config",
     ]);
     // Anchored at END OF LINE, and the specifier may not contain a newline: a

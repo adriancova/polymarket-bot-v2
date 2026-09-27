@@ -35,6 +35,7 @@
 
 import { readFileSync } from "node:fs";
 
+import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -585,6 +586,25 @@ describe("RECON-1 — the unfilled-order rule counts EMISSIONS, and every broken
     ]);
   });
 
+  /**
+   * `RECON-1` r2 RELAXED one refusal, deliberately. The first commit refused an
+   * artefact in which the entry's `intentId` also appeared in an exit or reduce
+   * decision, because it classified traces by id and the fills would have
+   * counted twice. Traces now resolve by EMISSION, so the entry's fills stay
+   * the entry's — the trace names the enter decision's evaluation — and the
+   * second emission of the id is just another untraced exit emission.
+   */
+  it("the entry's intent id re-emitted by a reduce decision leaves the entry's fills the entry's", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const decisions = artifact.decisions.map((decision) =>
+      decision.evaluationSeq === marks.reduce.evaluationSeq
+        ? { ...decision, intents: [...decision.intents, marks.entryIntent] }
+        : decision,
+    );
+    expect(buildReconciliation({ ...artifact, decisions })).toEqual(artifact.reconciliation);
+  });
+
   const broken: readonly {
     readonly name: string;
     readonly refusal: RegExp;
@@ -602,13 +622,28 @@ describe("RECON-1 — the unfilled-order rule counts EMISSIONS, and every broken
       }),
     },
     {
-      name: "the entry's intent also emitted by a reduce decision",
-      refusal: /emitted by the entry decision AND by an exit or reduce decision/u,
+      name: "a filled plan traced to an emission that is a CANCEL, which places no order",
+      refusal: /belongs to neither the entry's chain nor any exit's/u,
       tamper: (artifact, marks) => ({
         ...artifact,
         decisions: artifact.decisions.map((decision) =>
           decision.evaluationSeq === marks.reduce.evaluationSeq
-            ? { ...decision, intents: [...decision.intents, marks.entryIntent] }
+            ? {
+                ...decision,
+                intents: decision.intents.map((intent) => ({ ...intent, type: "CANCEL" })),
+              }
+            : decision,
+        ),
+      }),
+    },
+    {
+      name: "one decision emitting the same intent id twice",
+      refusal: /emits intent .+ twice; one emission identity may name one intent/u,
+      tamper: (artifact, marks) => ({
+        ...artifact,
+        decisions: artifact.decisions.map((decision) =>
+          decision.evaluationSeq === marks.exitDecision.evaluationSeq
+            ? { ...decision, intents: [...decision.intents, ...decision.intents] }
             : decision,
         ),
       }),
@@ -696,6 +731,137 @@ describe("RECON-1 — the unfilled-order rule counts EMISSIONS, and every broken
       expect(() => buildReconciliation(tampered)).toThrow(probe.refusal);
     });
   }
+});
+
+/**
+ * `RECON-1` r2 — the independent review's reproductions, each of which the
+ * first two commits mis-reconciled SILENTLY: an explained row, no throw.
+ */
+describe("RECON-1 r2 — the review's silent mis-attributions are refused", () => {
+  /**
+   * Review R1, probe 1. An untraced BUY under a new plan is correctly refused
+   * on its own — one untraced emission cannot have placed two plans. Appending
+   * an exact COPY of the golden's exit decision then made the global candidate
+   * count reach two, and the phantom was reported as a second withdrawn
+   * take-profit: projected 3.3, `explained: true`. The copy carries no new
+   * `(runId, evaluationSeq, intentId)`; it is a malformed artefact.
+   */
+  it("R1: a copied exit decision cannot stand in for a phantom order's origin", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const phantom: ArtifactOrder = {
+      ...marks.entryOrder,
+      simulatedOrderId: "review-phantom-entry:g0:o0",
+      plannedOrderId: "review-phantom-entry:g0:o0",
+      executionPlanId: "review-phantom-entry",
+      requestedShares: "10",
+      filledShares: "0",
+      state: "CANCELLED",
+      limitPrice: "0.33",
+    };
+    const withPhantom = { ...artifact, orders: [...artifact.orders, phantom] };
+    expect(() => buildReconciliation(withPhantom)).toThrow(/no possible origin/u);
+
+    const copy = JSON.parse(JSON.stringify(marks.exitDecision)) as ArtifactDecision;
+    const copied = { ...withPhantom, decisions: [...withPhantom.decisions, copy] };
+    expect(() => buildReconciliation(copied)).toThrow(
+      /two persisted decisions share \(runId, evaluationSeq\)/u,
+    );
+  });
+
+  /**
+   * Review R1, probe 2, and its two neighbours. The withdrawn take-profit is
+   * moved where its only candidate origin — the take-profit emission, in the
+   * scenario market — could not have placed it. The global count still
+   * matched, and the order was reported as an explained exit cancellation.
+   */
+  const displaced: readonly {
+    readonly name: string;
+    readonly changes: Partial<ArtifactOrder>;
+  }[] = [
+    {
+      name: "in another market, on another token (the review's probe: projected 17.5)",
+      changes: {
+        marketId: "018f5c20-1000-7a10-8b00-0000000000ff",
+        tokenId: "9901",
+        requestedShares: "50",
+        limitPrice: "0.35",
+      },
+    },
+    { name: "in the scenario market, on a token that is not one of its two", changes: { tokenId: "7777" } },
+    { name: "on the YES token but labelled NO", changes: { side: "NO" } },
+  ];
+  for (const probe of displaced) {
+    it(`R1: an untraced order ${probe.name} has no possible origin`, () => {
+      const artifact = golden();
+      const marks = landmarks(artifact);
+      const orders = artifact.orders.map((order) =>
+        order.simulatedOrderId === marks.takeProfit.simulatedOrderId
+          ? { ...order, ...probe.changes }
+          : order,
+      );
+      expect(() => buildReconciliation({ ...artifact, orders })).toThrow(
+        marks.takeProfit.simulatedOrderId,
+      );
+      expect(() => buildReconciliation({ ...artifact, orders })).toThrow(/no possible origin/u);
+    });
+  }
+
+  /**
+   * Review R2. The filled emission at evaluation 9 becomes a QUOTE, a separate
+   * `reduce` decision at evaluation 99 carries the SAME intent id, and the
+   * fill's trace still names evaluation 9. Classified by id, the QUOTE's fill
+   * was accepted as an exit and a cancelled sibling under the QUOTE's plan was
+   * reported as an explained exit cancellation.
+   */
+  it("R2: a trace resolves by (runId, evaluationSeq, intentId), not by the id alone", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const reduceIntentId = only(marks.reduce.intents, "reduce intent").intentId ?? "";
+    const decisions: ArtifactDecision[] = [
+      ...artifact.decisions.map((decision) =>
+        decision.evaluationSeq === marks.reduce.evaluationSeq
+          ? {
+              ...decision,
+              decisionType: "quote",
+              intents: [
+                { type: "QUOTE", intentId: reduceIntentId, marketId: artifact.scenario.marketId },
+              ],
+            }
+          : decision,
+      ),
+      { ...marks.reduce, evaluationSeq: 99 },
+    ];
+    const sibling: ArtifactOrder = {
+      ...marks.exitOrder,
+      simulatedOrderId: `${marks.exitOrder.executionPlanId}:g1:o0`,
+      plannedOrderId: `${marks.exitOrder.executionPlanId}:g1:o0`,
+      requestedShares: "10",
+      filledShares: "0",
+      state: "CANCELLED",
+    };
+    const tampered = { ...artifact, decisions, orders: [...artifact.orders, sibling] };
+    expect(() => buildReconciliation(tampered)).toThrow(marks.exitFill.simulatedFillId);
+    expect(() => buildReconciliation(tampered)).toThrow(
+      /belongs to neither the entry's chain nor any exit's/u,
+    );
+    // The review's second form: a later reduce emission that was REJECTED —
+    // it produced no plan — and no sibling at all. Same refusal.
+    const rejected = { ...artifact, decisions };
+    expect(() => buildReconciliation(rejected)).toThrow(marks.exitFill.simulatedFillId);
+  });
+
+  /** Review R4. Validation ran inside the sort comparator, which one element never calls. */
+  it("R4: a single fill's non-canonical sequence is refused, not folded", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const [lot] = marks.entryFills;
+    if (lot === undefined) throw new Error("an entry lot expected");
+    const fills = [{ ...lot, atEventIngestSeq: "05" }];
+    expect(() => buildReconciliation({ ...artifact, fills })).toThrow(
+      /not a canonical unsigned integer string/u,
+    );
+  });
 });
 
 // --- RISK2-R4 -----------------------------------------------------------------
@@ -904,6 +1070,51 @@ function interleavedBookings(
   return order === "INTERLEAVED"
     ? [booking(a), x1, booking(b), x2]
     : [booking(a), booking(b), x1, x2];
+}
+
+// --- what support/reconcile.ts imports, read from its PARSED source -----------
+
+/** The only modules the oracle may import: the decimal arithmetic and the artefact's types. */
+const ORACLE_IMPORTS = ["./artifact.js", "@polymarket-bot/decimal"];
+
+/**
+ * Every module specifier a TypeScript source names, from its syntax tree — the
+ * walk `test/contract/coinbase/isolation.test.ts` uses, plus `require(…)`. A
+ * specifier that is not a string literal is reported as `<computed>`.
+ */
+function moduleSpecifiersIn(text: string): readonly string[] {
+  const source = ts.createSourceFile("probe.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const specifiers: string[] = [];
+  const literal = (node: ts.Node | undefined): string =>
+    node !== undefined && ts.isStringLiteralLike(node) ? node.text : "<computed>";
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
+      if (node.moduleSpecifier !== undefined) specifiers.push(literal(node.moduleSpecifier));
+    } else if (
+      ts.isImportEqualsDeclaration(node) &&
+      ts.isExternalModuleReference(node.moduleReference)
+    ) {
+      specifiers.push(literal(node.moduleReference.expression));
+    } else if (ts.isImportTypeNode(node)) {
+      const argument = node.argument;
+      specifiers.push(ts.isLiteralTypeNode(argument) ? literal(argument.literal) : "<computed>");
+    } else if (
+      ts.isCallExpression(node) &&
+      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(node.expression) && node.expression.text === "require"))
+    ) {
+      specifiers.push(literal(node.arguments[0]));
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(source, visit);
+  return specifiers;
+}
+
+function independenceViolations(text: string): readonly string[] {
+  return [
+    ...new Set(moduleSpecifiersIn(text).filter((specifier) => !ORACLE_IMPORTS.includes(specifier))),
+  ];
 }
 
 /** Hand-derived from the specification; see the test that pins it. */
@@ -1144,14 +1355,44 @@ describe("RECON-1 r1 — PnL reconciles against packages/pnl's own cost method (
     expect(openBasis(open).capital).toBe("17.2");
   });
 
+  /**
+   * `RECON-1` r2 (review R3): this pin used to be a LINE regex that required
+   * the specifier to end the line, so
+   * `import { foldPnlRecords as reviewEngine } from "@polymarket-bot/pnl"; // …`
+   * passed it. It now reads the PARSED module: every import and export
+   * declaration, side-effect import, `import x = require(…)`, `import(…)` call,
+   * import type node and `require(…)` call, wherever the grammar puts one;
+   * text inside comments and string data is inert.
+   */
   it("the oracle does not run the engine: support/reconcile.ts imports only the decimal arithmetic", () => {
     const source = readFileSync(new URL("./support/reconcile.ts", import.meta.url), "utf8");
-    const specifiers = source
-      .split("\n")
-      .map((line) => /\bfrom\s*["']([^"'\n]+)["']\s*;?\s*$/u.exec(line)?.[1])
-      .filter((specifier): specifier is string => specifier !== undefined);
-    expect(specifiers).toEqual(["@polymarket-bot/decimal", "./artifact.js"]);
-    expect(source).not.toMatch(/\b(?:require|import)\s*\(/u);
+    expect([...new Set(moduleSpecifiersIn(source))].sort()).toEqual(ORACLE_IMPORTS);
+    expect(independenceViolations(source)).toEqual([]);
+
+    // Each plant is an engine import the old line regex could not see, or one
+    // of the other spellings the grammar allows. Every one is caught.
+    const plants = [
+      `import { foldPnlRecords as reviewEngine } from "@polymarket-bot/pnl"; // review independence probe`,
+      `import "@polymarket-bot/pnl";`,
+      `const engine = await import("@polymarket-bot/pnl");`,
+      `export { foldPnlRecords } from "@polymarket-bot/pnl";`,
+      `import engine = require("@polymarket-bot/pnl");`,
+      `const engine = require("@polymarket-bot/pnl");`,
+      `type Engine = typeof import("@polymarket-bot/pnl");`,
+    ];
+    for (const plant of plants) {
+      expect(independenceViolations(`${source}\n${plant}\n`), plant).toEqual(["@polymarket-bot/pnl"]);
+    }
+    // A specifier the parser cannot read is a violation, not a pass.
+    expect(independenceViolations(`${source}\nconst where = "x";\nawait import(where);\n`)).toEqual([
+      "<computed>",
+    ]);
+    // A MENTION is not an import: comments and string data stay inert.
+    expect(
+      independenceViolations(
+        `${source}\n// the spec lives in "@polymarket-bot/pnl"\nconst note = "@polymarket-bot/pnl";\n`,
+      ),
+    ).toEqual([]);
   });
 
   it("the restated division policy is the decimal package's default, which packages/pnl relies on", () => {
