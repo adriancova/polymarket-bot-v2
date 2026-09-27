@@ -1,5 +1,6 @@
 /**
- * `RECON-1` — the reconciler's two latent traps, closed and pinned.
+ * `RECON-1` — the reconciler's two latent traps, closed and pinned; `RECON-2` —
+ * every order attributed BY ID, and an open position at run end named.
  *
  * `RISK-2` fixed the ENTRY side of `support/reconcile.ts` (its rows are
  * attributed by id down the §6 invariant 4 chain, never by `action`) and its
@@ -20,22 +21,31 @@
  * a correct partial-exit run as unexplained. The sequence ordering stays —
  * average cost is order-sensitive across interleaved purchases and sales.
  *
+ * `RECON-2` (closing `RECON1-ORIGIN`): the loop records every order's trace
+ * PREFIX at SUBMISSION, filled or not, and the artefact now carries it (golden
+ * format 2, `orderProvenance`). `RECON-1` had no such record for an order that
+ * never filled and attributed those orders by a CLOSED-WORLD INFERENCE — a
+ * compatible origin, no non-exit candidate, a one-to-one matching. That
+ * inference is retired: every order is resolved through its own record to the
+ * emission `(runId, evaluationSeq, intentId)` that placed it, an order without
+ * a record is refused, and a record a fill's trace contradicts is refused. Every
+ * `RECON-1` pin that existed for the closed-world rule is CONVERTED below, not
+ * deleted; where a pin's refusal now fires for a different reason, its comment
+ * says so. (`RECON1-EDGE`, the last describe block, is the orchestrator's ruling
+ * on an open position at run end.)
+ *
  * Every probe here follows `projection-reconciliation.test.ts`'s falsifiability
  * pattern: the COMMITTED GOLDEN is parsed afresh (a deep copy), changed in one
  * deliberate way, and handed to `buildReconciliation`. Each synthetic artefact
  * carries a precondition that makes it non-vacuous — the change really is
- * reachable by the rule under test — and each was run against the base
- * reconciler (`5d8b24f`) to confirm that it mis-reconciled there.
- *
- * The golden itself is NOT changed by `RECON-1`: every fill and order it
- * carries is reached by exactly one chain, and its fills are already in
- * sequence order, so the table it freezes is byte-identical
- * (`determinism-golden.test.ts`).
+ * reachable by the rule under test. A synthetic order is given the provenance
+ * record the loop would have written for it unless the probe is ABOUT a missing
+ * or contradicting record, so each refusal below fires for the reason it names
+ * and not because the synthetic was malformed in some other way.
  */
 
 import { readFileSync } from "node:fs";
 
-import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -63,11 +73,13 @@ import {
   type ArtifactFill,
   type ArtifactIntent,
   type ArtifactOrder,
+  type ArtifactOrderProvenance,
   type ArtifactTrace,
   type PaperRunArtifact,
 } from "./support/artifact.js";
 import { goldenBytes } from "./support/golden.js";
 import { driveScenario } from "./support/harness.js";
+import { COMPUTED_SPECIFIER, moduleSpecifiersIn } from "./support/module-specifiers.js";
 import {
   PNL_COST_DIVISION,
   buildReconciliation,
@@ -98,17 +110,29 @@ function row(rows: readonly ReconciliationRow[], id: string): ReconciliationRow 
   return found;
 }
 
+/** The one provenance record the artefact holds for `orderId`. */
+function recordOf(artifact: PaperRunArtifact, orderId: string): ArtifactOrderProvenance {
+  return only(
+    artifact.orderProvenance.filter((record) => record.venueOrderId === orderId),
+    `provenance record of order ${orderId}`,
+  );
+}
+
 interface Landmarks {
   readonly enter: ArtifactDecision;
   readonly entryIntent: ArtifactIntent;
   readonly entryTrace: ArtifactTrace;
   readonly entryOrder: ArtifactOrder;
+  readonly entryRecord: ArtifactOrderProvenance;
   readonly entryFills: readonly ArtifactFill[];
   readonly exitDecision: ArtifactDecision;
   readonly reduce: ArtifactDecision;
+  readonly exitTrace: ArtifactTrace;
   readonly exitOrder: ArtifactOrder;
+  readonly exitRecord: ArtifactOrderProvenance;
   readonly exitFill: ArtifactFill;
   readonly takeProfit: ArtifactOrder;
+  readonly takeProfitRecord: ArtifactOrderProvenance;
 }
 
 /** The golden's chain, walked by id — the same walk the reconciler makes. */
@@ -137,11 +161,20 @@ function landmarks(artifact: PaperRunArtifact): Landmarks {
     artifact.traces.filter((trace) => trace.intentId === reduceIntentId),
     "exit trace",
   );
+  const exitOrder = only(
+    artifact.orders.filter((order) => order.executionPlanId === exitTrace.executionPlanId),
+    "exit order",
+  );
+  const takeProfit = only(
+    artifact.orders.filter((order) => order.state === "CANCELLED"),
+    "withdrawn order",
+  );
   return {
     enter,
     entryIntent,
     entryTrace,
     entryOrder,
+    entryRecord: recordOf(artifact, entryOrder.simulatedOrderId),
     entryFills: artifact.fills.filter(
       (fill) => fill.simulatedOrderId === entryOrder.simulatedOrderId,
     ),
@@ -150,18 +183,15 @@ function landmarks(artifact: PaperRunArtifact): Landmarks {
       "exit decision",
     ),
     reduce,
-    exitOrder: only(
-      artifact.orders.filter((order) => order.executionPlanId === exitTrace.executionPlanId),
-      "exit order",
-    ),
+    exitTrace,
+    exitOrder,
+    exitRecord: recordOf(artifact, exitOrder.simulatedOrderId),
     exitFill: only(
       artifact.fills.filter((fill) => fill.simulatedFillId === exitTrace.venueFillId),
       "exit fill",
     ),
-    takeProfit: only(
-      artifact.orders.filter((order) => order.state === "CANCELLED"),
-      "withdrawn order",
-    ),
+    takeProfit,
+    takeProfitRecord: recordOf(artifact, takeProfit.simulatedOrderId),
   };
 }
 
@@ -202,32 +232,92 @@ function fillOf(
   };
 }
 
-/** The trace the loop would record for `fill`, emitted by `intentId`. */
-function traceOf(
-  base: ArtifactTrace,
-  intentId: string,
-  evaluationSeq: number,
+/**
+ * The provenance record the loop would write at SUBMISSION for `order`, placed
+ * by the emission `(base.runId, evaluationSeq, intentId)`. `base` supplies the
+ * source event and feature snapshot; every per-order id is the order's own.
+ */
+function provenanceFor(
+  base: ArtifactOrderProvenance,
+  emission: { readonly evaluationSeq: number; readonly intentId: string },
   order: ArtifactOrder,
-  fill: ArtifactFill,
-): ArtifactTrace {
+): ArtifactOrderProvenance {
   return {
     ...base,
-    evaluationSeq,
-    intentId,
+    evaluationSeq: emission.evaluationSeq,
+    intentId: emission.intentId,
     approvedIntentId: `${order.executionPlanId}-approved`,
     executionPlanId: order.executionPlanId,
     submissionAttemptId: `${order.executionPlanId}-submission`,
     venueOrderId: order.simulatedOrderId,
+  };
+}
+
+/** The trace the loop would record for `fill`: its order's record, completed by the fill. */
+function traceOf(record: ArtifactOrderProvenance, fill: ArtifactFill): ArtifactTrace {
+  return {
+    ...record,
     venueFillId: fill.simulatedFillId,
     ledgerFillId: `${fill.simulatedFillId}-ledger`,
     ledgerTransactionIds: [],
   };
 }
 
+/** `artifact` with `records` appended to its provenance section. */
+function withRecords(
+  artifact: PaperRunArtifact,
+  ...records: readonly ArtifactOrderProvenance[]
+): PaperRunArtifact {
+  return { ...artifact, orderProvenance: [...artifact.orderProvenance, ...records] };
+}
+
+/** `artifact` with `orderId`'s provenance record removed. */
+function withoutRecordOf(artifact: PaperRunArtifact, orderId: string): PaperRunArtifact {
+  return {
+    ...artifact,
+    orderProvenance: artifact.orderProvenance.filter((record) => record.venueOrderId !== orderId),
+  };
+}
+
+/** `artifact` with `orderId`'s provenance record changed. */
+function withRecordChanged(
+  artifact: PaperRunArtifact,
+  orderId: string,
+  changes: Partial<ArtifactOrderProvenance>,
+): PaperRunArtifact {
+  return {
+    ...artifact,
+    orderProvenance: artifact.orderProvenance.map((record) =>
+      record.venueOrderId === orderId ? { ...record, ...changes } : record,
+    ),
+  };
+}
+
+/** A copy of `decision`, re-keyed to `evaluationSeq` — a distinct emission of the same intents. */
+function reemitted(decision: ArtifactDecision, evaluationSeq: number): ArtifactDecision {
+  return { ...decision, evaluationSeq };
+}
+
+/** A QUOTE decision at `evaluationSeq`, emitting one QUOTE intent `intentId`. */
+function quoteDecision(
+  artifact: PaperRunArtifact,
+  marks: Landmarks,
+  evaluationSeq: number,
+  intentId: string,
+): ArtifactDecision {
+  return {
+    ...marks.exitDecision,
+    evaluationSeq,
+    decisionType: "quote",
+    intents: [{ type: "QUOTE", intentId, marketId: artifact.scenario.marketId }],
+  };
+}
+
 /**
  * A SECOND BRACKET's entry: a new `enter` decision, its own POSITION intent, and
- * an order under a plan of its own — either FILLED (with its fill and trace), or
- * WITHDRAWN UNFILLED, which has no trace because the loop traces fills.
+ * an order under a plan of its own, with the provenance record the loop would
+ * write for it — either FILLED (with its fill and trace), or WITHDRAWN
+ * UNFILLED, which has no trace because the loop traces fills.
  */
 function withSecondEntry(
   artifact: PaperRunArtifact,
@@ -255,11 +345,14 @@ function withSecondEntry(
       limitPrice: "0.33",
       atEventIngestSeq: "8",
     });
-    return {
-      ...artifact,
-      decisions: [...artifact.decisions, decision],
-      orders: [...artifact.orders, order],
-    };
+    return withRecords(
+      {
+        ...artifact,
+        decisions: [...artifact.decisions, decision],
+        orders: [...artifact.orders, order],
+      },
+      provenanceFor(marks.entryRecord, { evaluationSeq, intentId }, order),
+    );
   }
   const order = orderUnder(marks.entryOrder, planId("fa000"), {
     requestedShares: "10",
@@ -274,18 +367,22 @@ function withSecondEntry(
     feeAmount: "0.043",
     atEventIngestSeq: "8",
   });
-  return {
-    ...artifact,
-    decisions: [...artifact.decisions, decision],
-    traces: [...artifact.traces, traceOf(marks.entryTrace, intentId, evaluationSeq, order, fill)],
-    orders: [...artifact.orders, order],
-    fills: [...artifact.fills, fill],
-  };
+  const record = provenanceFor(marks.entryRecord, { evaluationSeq, intentId }, order);
+  return withRecords(
+    {
+      ...artifact,
+      decisions: [...artifact.decisions, decision],
+      traces: [...artifact.traces, traceOf(record, fill)],
+      orders: [...artifact.orders, order],
+      fills: [...artifact.fills, fill],
+    },
+    record,
+  );
 }
 
 // =============================================================================
 
-describe("RECON-1 — the golden's own attribution, positively", () => {
+describe("RECON-1 / RECON-2 — the golden's own attribution, positively and by id", () => {
   it("every golden fill is reached by exactly one chain, and the table is unchanged", () => {
     const artifact = golden();
     const marks = landmarks(artifact);
@@ -296,28 +393,72 @@ describe("RECON-1 — the golden's own attribution, positively", () => {
     expect(buildReconciliation(artifact)).toEqual(artifact.reconciliation);
   });
 
-  it("the withdrawn take-profit is the ONLY exit cancellation, and it is the exit's", () => {
+  /**
+   * `RECON-2`: the section the attribution now reads. One record per booked
+   * order — including the withdrawn take-profit, which no trace names — and a
+   * filled order's record is exactly its traces' shared prefix.
+   */
+  it("every booked order has exactly ONE provenance record, and every trace is its order's record completed", () => {
     const artifact = golden();
+    expect(artifact.orderProvenance.map((record) => record.venueOrderId)).toEqual(
+      artifact.orders.map((order) => order.simulatedOrderId),
+    );
+    const fillSide = new Set(["venueFillId", "ledgerFillId", "ledgerTransactionIds"]);
+    for (const trace of artifact.traces) {
+      const prefix = Object.fromEntries(
+        Object.entries(trace).filter(([key]) => !fillSide.has(key)),
+      );
+      expect(prefix).toEqual(recordOf(artifact, trace.venueOrderId));
+    }
+    // The record the closed-world rule never had: the unfilled order's own.
     const marks = landmarks(artifact);
-    const cancelled = buildReconciliation(artifact)
-      .filter((entry) => entry.id.startsWith("exit.cancelled_proceeds."))
-      .map((entry) => entry.id);
-    expect(cancelled).toEqual([`exit.cancelled_proceeds.${marks.takeProfit.simulatedOrderId}`]);
-    // It has no trace — the loop traces FILLS — so the reconciler reaches it by
-    // the closed-world rule: the only order-placing intent no trace names is
-    // the take-profit the `exit` decision emitted.
-    expect(
-      artifact.traces.some((trace) => trace.executionPlanId === marks.takeProfit.executionPlanId),
-    ).toBe(false);
-    expect(marks.exitDecision.intents.map((intent) => intent.type)).toEqual(["POSITION"]);
+    expect(artifact.traces.map((trace) => trace.venueOrderId)).not.toContain(
+      marks.takeProfit.simulatedOrderId,
+    );
+    expect(marks.takeProfitRecord.executionPlanId).toBe(marks.takeProfit.executionPlanId);
   });
 
   /**
-   * The complement would still report the take-profit row with its origin
-   * erased; the positive rule cannot, because nothing is left that could have
-   * placed the order.
+   * CONVERTED (`RECON-2`). `RECON-1` reached the take-profit by the
+   * closed-world rule — "the only order-placing intent no trace names is the
+   * take-profit the `exit` decision emitted". It is now reached BY ID: its
+   * provenance record names the `exit` decision's evaluation and the
+   * take-profit's intent, and the row names it from that record.
    */
-  it("remove the take-profit's intent and its row is REFUSED, not kept by complement", () => {
+  it("the withdrawn take-profit is the ONLY exit cancellation, and its record names the exit decision", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const rows = buildReconciliation(artifact);
+    const cancelled = rows.filter((entry) => entry.id.startsWith("exit.cancelled_proceeds."));
+    expect(cancelled.map((entry) => entry.id)).toEqual([
+      `exit.cancelled_proceeds.${marks.takeProfit.simulatedOrderId}`,
+    ]);
+    // It has no trace — the loop traces FILLS — so only its record names it.
+    expect(
+      artifact.traces.some((trace) => trace.executionPlanId === marks.takeProfit.executionPlanId),
+    ).toBe(false);
+    const takeProfitIntent = only(marks.exitDecision.intents, "take-profit intent");
+    expect(takeProfitIntent.type).toBe("POSITION");
+    expect(marks.takeProfitRecord.runId).toBe(marks.exitDecision.runId);
+    expect(marks.takeProfitRecord.evaluationSeq).toBe(marks.exitDecision.evaluationSeq);
+    expect(marks.takeProfitRecord.intentId).toBe(takeProfitIntent.intentId);
+    // `RECON1-TEXT`: the row names WHAT was withdrawn, from the record.
+    const [withdrawn] = cancelled;
+    expect(withdrawn?.quantity).toBe("the proceeds a withdrawn take-profit projected");
+    expect(withdrawn?.contributions[0]?.note).toContain(
+      `the take-profit the \`exit\` decision at evaluationSeq ${String(marks.exitDecision.evaluationSeq)} placed ` +
+        `(intent ${takeProfitIntent.intentId ?? ""}), by its provenance record`,
+    );
+  });
+
+  /**
+   * CONVERTED (`RECON-2`) — the refusal's REASON changed. `RECON-1` refused
+   * because nothing left in the document "could have placed" the order (`no
+   * possible origin`). The order's record still names the take-profit emission;
+   * the emission is gone, so the record resolves to nothing. The complement
+   * would still have reported the row with its origin erased.
+   */
+  it("remove the take-profit's intent and its order is REFUSED: its record names an emission no decision made", () => {
     const artifact = golden();
     const marks = landmarks(artifact);
     const decisions = artifact.decisions.map((decision) =>
@@ -328,15 +469,17 @@ describe("RECON-1 — the golden's own attribution, positively", () => {
     expect(() => buildReconciliation({ ...artifact, decisions })).toThrow(
       marks.takeProfit.simulatedOrderId,
     );
-    expect(() => buildReconciliation({ ...artifact, decisions })).toThrow(/no possible origin/u);
+    expect(() => buildReconciliation({ ...artifact, decisions })).toThrow(
+      /no persisted decision emitted that intent there/u,
+    );
   });
 
   it("an exit fill is the exit's because a REDUCE decision emitted it, not because it is not the entry's", () => {
     const artifact = golden();
     const marks = landmarks(artifact);
     // Re-type the decision that emitted the protective reduction. Its fill is
-    // untouched — same order, same plan, same trace — but no exit or reduce
-    // decision now owns the intent that trace names.
+    // untouched — same order, same plan, same record and trace — but no exit or
+    // reduce decision now owns the emission the record names.
     const decisions = artifact.decisions.map((decision) =>
       decision.evaluationSeq === marks.reduce.evaluationSeq
         ? { ...decision, decisionType: "hold" }
@@ -346,7 +489,7 @@ describe("RECON-1 — the golden's own attribution, positively", () => {
       marks.exitFill.simulatedFillId,
     );
     expect(() => buildReconciliation({ ...artifact, decisions })).toThrow(
-      /belongs to neither the entry's chain nor any exit's/u,
+      /belongs to neither the entry's chain nor any exit's: its order's provenance resolves to/u,
     );
   });
 });
@@ -354,13 +497,18 @@ describe("RECON-1 — the golden's own attribution, positively", () => {
 describe("RISK2-R3 — a fill in neither chain is refused, by name (R3a)", () => {
   const shapes: readonly {
     readonly name: string;
+    readonly refusal: RegExp;
     readonly build: (artifact: PaperRunArtifact) => {
       readonly tampered: PaperRunArtifact;
       readonly fill: ArtifactFill;
     };
   }[] = [
     {
-      name: "a fill on an order whose plan NO trace names",
+      // CONVERTED (`RECON-2`): `RECON-1` refused this fill because no TRACE
+      // named its order's plan. The order now has no provenance RECORD either,
+      // and that is the first thing refused — with the fill named.
+      name: "a fill on an order with no provenance record and no trace",
+      refusal: /has no provenance record/u,
       build: (artifact) => {
         const marks = landmarks(artifact);
         const order = orderUnder(marks.exitOrder, planId("fb000"), {
@@ -386,6 +534,7 @@ describe("RISK2-R3 — a fill in neither chain is refused, by name (R3a)", () =>
     },
     {
       name: "a fill naming an order the venue never booked",
+      refusal: /belongs to neither the entry's chain nor any exit's: the venue never booked/u,
       build: (artifact) => {
         const marks = landmarks(artifact);
         const order = orderUnder(marks.exitOrder, planId("fb000"), {});
@@ -394,16 +543,11 @@ describe("RISK2-R3 — a fill in neither chain is refused, by name (R3a)", () =>
       },
     },
     {
-      name: "a fill TRACED to an intent that neither the entry nor an exit emitted (a QUOTE)",
+      name: "a fill whose order's record names an intent neither the entry nor an exit emitted (a QUOTE)",
+      refusal: /belongs to neither the entry's chain nor any exit's: its order's provenance resolves to QUOTE/u,
       build: (artifact) => {
         const marks = landmarks(artifact);
         const quoteIntentId = `quote-4-${artifact.scenario.marketId}`;
-        const decision: ArtifactDecision = {
-          ...marks.exitDecision,
-          evaluationSeq: 18,
-          decisionType: "quote",
-          intents: [{ type: "QUOTE", intentId: quoteIntentId, marketId: artifact.scenario.marketId }],
-        };
         const order = orderUnder(marks.exitOrder, planId("fb000"), {
           requestedShares: "10",
           filledShares: "10",
@@ -414,14 +558,22 @@ describe("RISK2-R3 — a fill in neither chain is refused, by name (R3a)", () =>
           shares: "10",
           feeAmount: "0.047",
         });
+        const record = provenanceFor(
+          marks.entryRecord,
+          { evaluationSeq: 18, intentId: quoteIntentId },
+          order,
+        );
         return {
-          tampered: {
-            ...artifact,
-            decisions: [...artifact.decisions, decision],
-            traces: [...artifact.traces, traceOf(marks.entryTrace, quoteIntentId, 18, order, fill)],
-            orders: [...artifact.orders, order],
-            fills: [...artifact.fills, fill],
-          },
+          tampered: withRecords(
+            {
+              ...artifact,
+              decisions: [...artifact.decisions, quoteDecision(artifact, marks, 18, quoteIntentId)],
+              traces: [...artifact.traces, traceOf(record, fill)],
+              orders: [...artifact.orders, order],
+              fills: [...artifact.fills, fill],
+            },
+            record,
+          ),
           fill,
         };
       },
@@ -437,9 +589,7 @@ describe("RISK2-R3 — a fill in neither chain is refused, by name (R3a)", () =>
       expect(fill.simulatedOrderId).not.toBe(marks.entryOrder.simulatedOrderId);
       expect(fill.simulatedOrderId).not.toBe(marks.exitOrder.simulatedOrderId);
       expect(() => buildReconciliation(tampered)).toThrow(fill.simulatedFillId);
-      expect(() => buildReconciliation(tampered)).toThrow(
-        /belongs to neither the entry's chain nor any exit's/u,
-      );
+      expect(() => buildReconciliation(tampered)).toThrow(shape.refusal);
     });
   }
 });
@@ -448,10 +598,11 @@ describe("RISK2-R3 — more than one entry is refused, not read as the first (R3
   it("a second `enter` decision with its own filled chain is refused outright", () => {
     const tampered = withSecondEntry(golden(), "FILLED");
     // Non-vacuous: the second entry is a complete chain of its own — decision,
-    // intent, trace, plan, order, fill — which the base reconciler ignored as
-    // an entry and summed, BUY and all, into exit proceeds.
+    // intent, record, trace, plan, order, fill — which the base reconciler
+    // ignored as an entry and summed, BUY and all, into exit proceeds.
     expect(tampered.decisions.filter((decision) => decision.decisionType === "enter")).toHaveLength(2);
     expect(tampered.fills).toHaveLength(4);
+    expect(tampered.orderProvenance).toHaveLength(4);
     expect(() => buildReconciliation(tampered)).toThrow(/2 `enter` decisions/u);
     expect(() => buildReconciliation(tampered)).toThrow(/evaluationSeq 1, 18/u);
     expect(() => buildReconciliation(tampered)).toThrow(/instead of reading only the first/u);
@@ -492,14 +643,18 @@ describe("RISK2-R3 — an entry order withdrawn unfilled is not an exit cancella
     expect(() => buildReconciliation(tampered)).toThrow(/2 `enter` decisions/u);
   });
 
-  it("an unfilled order that no untraced intent could have placed: refused, by name", () => {
+  /**
+   * CONVERTED (`RECON-2`) — the refusal's REASON changed. `RECON-1`: "no
+   * untraced intent could have placed" an extra BUY, because the only
+   * untraced order-placing emission (the take-profit) could not have minted a
+   * second plan (`no possible origin`). Now: the order has no provenance record,
+   * so nothing names its origin. And a FABRICATED record that borrows the
+   * take-profit's emission — the emission a real plan already holds — is
+   * refused by the one-plan-per-emission cross-check the matcher left behind.
+   */
+  it("an unfilled order with no provenance record is refused, and a record borrowing a held emission is too", () => {
     const artifact = golden();
     const marks = landmarks(artifact);
-    // One entry, one take-profit — and an extra BUY withdrawn unfilled under a
-    // plan no trace names. Only ONE order-placing intent lacks a trace (the
-    // take-profit), and it cannot have produced TWO plans: the loop mints one
-    // plan per approved intent. The base reconciler reported this order as a
-    // second withdrawn take-profit.
     const order = orderUnder(marks.entryOrder, planId("fc000"), {
       requestedShares: "10",
       filledShares: "0",
@@ -508,39 +663,55 @@ describe("RISK2-R3 — an entry order withdrawn unfilled is not an exit cancella
     });
     const tampered = { ...artifact, orders: [...artifact.orders, order] };
     expect(() => buildReconciliation(tampered)).toThrow(order.simulatedOrderId);
-    expect(() => buildReconciliation(tampered)).toThrow(/no possible origin/u);
+    expect(() => buildReconciliation(tampered)).toThrow(/has no provenance record/u);
+
+    const borrowed = withRecords(
+      tampered,
+      provenanceFor(
+        marks.takeProfitRecord,
+        {
+          evaluationSeq: marks.takeProfitRecord.evaluationSeq,
+          intentId: marks.takeProfitRecord.intentId,
+        },
+        order,
+      ),
+    );
+    expect(() => buildReconciliation(borrowed)).toThrow(/is claimed by two plans/u);
+    expect(() => buildReconciliation(borrowed)).toThrow(marks.takeProfit.executionPlanId);
   });
 
   /**
-   * An unfilled order has no trace, so its side is DEDUCED — and the deduction
-   * holds only while every intent that could have placed it is an exit. A
-   * QUOTE is the realistic case: quotes rest, and resting orders are withdrawn
-   * unfilled all the time.
+   * CONVERTED (`RECON-2`) — the property INVERTED, by design. `RECON-1` could
+   * only DEDUCE an unfilled order's side, so the take-profit's attribution was
+   * withdrawn the moment any non-exit intent (a QUOTE) could also have placed
+   * it (`not an exit`). With the record, an unrelated QUOTE emission cannot
+   * cloud it: the table is the golden's. What the rule must still refuse is a
+   * record that NAMES the QUOTE.
    */
-  it("the take-profit's attribution is withdrawn the moment a non-exit intent could have placed it", () => {
+  it("a QUOTE emission beside the take-profit no longer clouds it; a record naming the QUOTE is refused", () => {
     const artifact = golden();
     const marks = landmarks(artifact);
-    const decision: ArtifactDecision = {
-      ...marks.exitDecision,
-      evaluationSeq: 18,
-      decisionType: "quote",
-      intents: [
-        {
-          type: "QUOTE",
-          intentId: `quote-4-${artifact.scenario.marketId}`,
-          marketId: artifact.scenario.marketId,
-        },
-      ],
+    const quoteIntentId = `quote-4-${artifact.scenario.marketId}`;
+    const withQuote = {
+      ...artifact,
+      decisions: [...artifact.decisions, quoteDecision(artifact, marks, 18, quoteIntentId)],
     };
-    const tampered = { ...artifact, decisions: [...artifact.decisions, decision] };
-    expect(() => buildReconciliation(tampered)).toThrow(marks.takeProfit.simulatedOrderId);
-    expect(() => buildReconciliation(tampered)).toThrow(/not an exit/u);
+    expect(buildReconciliation(withQuote)).toEqual(artifact.reconciliation);
+
+    const namingQuote = withRecordChanged(withQuote, marks.takeProfit.simulatedOrderId, {
+      evaluationSeq: 18,
+      intentId: quoteIntentId,
+    });
+    expect(() => buildReconciliation(namingQuote)).toThrow(marks.takeProfit.simulatedOrderId);
+    expect(() => buildReconciliation(namingQuote)).toThrow(
+      /neither the entry intent nor one an exit or reduce decision emitted/u,
+    );
   });
 
   it("an entry order withdrawn beside a filled sibling stays the ENTRY's: no exit row, no refusal", () => {
     const artifact = golden();
     const marks = landmarks(artifact);
-    // Under the entry's OWN plan, so the trace chain reaches it by id.
+    // Under the entry's OWN plan, and its record names the entry's emission.
     const sibling: ArtifactOrder = {
       ...marks.entryOrder,
       simulatedOrderId: `${marks.entryOrder.executionPlanId}:g1:o0`,
@@ -549,50 +720,78 @@ describe("RISK2-R3 — an entry order withdrawn unfilled is not an exit cancella
       filledShares: "0",
       state: "CANCELLED",
     };
-    const rows = buildReconciliation({ ...artifact, orders: [...artifact.orders, sibling] });
+    const withSibling = { ...artifact, orders: [...artifact.orders, sibling] };
+    const rows = buildReconciliation(
+      withRecords(withSibling, { ...marks.entryRecord, venueOrderId: sibling.simulatedOrderId }),
+    );
     expect(rows.map((entry) => entry.id)).not.toContain(
       `exit.cancelled_proceeds.${sibling.simulatedOrderId}`,
     );
     // …and the rest of the table is the golden's.
     expect(rows).toEqual(artifact.reconciliation);
+    // `RECON-2`: without its record the sibling is not attributed at all —
+    // sharing a plan with a traced order no longer stands in for a record.
+    expect(() => buildReconciliation(withSibling)).toThrow(/has no provenance record/u);
   });
 });
 
-describe("RECON-1 — the unfilled-order rule counts EMISSIONS, and every broken chain is refused", () => {
+describe("RECON-1 / RECON-2 — emissions resolve by KEY, and every broken chain is refused", () => {
   /**
-   * §9.8 check 18's duplicate guard remembers only the last 256 intent ids, so
-   * an id can be emitted — and planned — twice in a long run. The rule counts
-   * each untraced EMISSION `(runId, evaluationSeq, intentId)` as a possible
-   * origin; counting ids would discard the second emission because the first
-   * was traced, and refuse a table it can in fact attribute.
+   * CONVERTED (`RECON-2`). §9.8 check 18's duplicate guard remembers only the
+   * last 256 intent ids, so an id can be emitted — and planned — twice in a
+   * long run. `RECON-1` counted each untraced EMISSION as a possible origin.
+   * The record now NAMES the emission by `(runId, evaluationSeq, intentId)`, so
+   * the second emission of the id places the second order and the first keeps
+   * its own; a record naming the FIRST emission for the second order is
+   * refused, because that emission's plan already exists.
    */
-  it("an exit id re-emitted by a later reduce decision is a second possible origin", () => {
+  it("an exit id re-emitted by a later reduce decision: the record's KEY decides which emission placed the order", () => {
     const artifact = golden();
     const marks = landmarks(artifact);
-    const decision: ArtifactDecision = { ...marks.reduce, evaluationSeq: 18 };
     const order = orderUnder(marks.exitOrder, planId("fd000"), {
       requestedShares: "50",
       filledShares: "0",
       state: "CANCELLED",
     });
-    const rows = buildReconciliation({
+    const reduceIntentId = marks.exitRecord.intentId;
+    const reEmitted = {
       ...artifact,
-      decisions: [...artifact.decisions, decision],
+      decisions: [...artifact.decisions, reemitted(marks.reduce, 18)],
       orders: [...artifact.orders, order],
-    });
+    };
+    const rows = buildReconciliation(
+      withRecords(
+        reEmitted,
+        provenanceFor(marks.exitRecord, { evaluationSeq: 18, intentId: reduceIntentId }, order),
+      ),
+    );
     expect(rows.map((entry) => entry.id).filter((id) => id.startsWith("exit.cancelled_proceeds."))).toEqual([
       `exit.cancelled_proceeds.${marks.takeProfit.simulatedOrderId}`,
       `exit.cancelled_proceeds.${order.simulatedOrderId}`,
     ]);
+    // `RECON1-TEXT`: a withdrawn PROTECTIVE REDUCTION is named as one.
+    const withdrawn = row(rows, `exit.cancelled_proceeds.${order.simulatedOrderId}`);
+    expect(withdrawn.quantity).toBe("the proceeds a withdrawn protective reduction projected");
+    expect(withdrawn.contributions[0]?.note).toContain("the `reduce` decision at evaluationSeq 18");
+
+    const namingTheFirst = withRecords(
+      reEmitted,
+      provenanceFor(
+        marks.exitRecord,
+        { evaluationSeq: marks.reduce.evaluationSeq, intentId: reduceIntentId },
+        order,
+      ),
+    );
+    expect(() => buildReconciliation(namingTheFirst)).toThrow(/is claimed by two plans/u);
   });
 
   /**
    * `RECON-1` r2 RELAXED one refusal, deliberately. The first commit refused an
    * artefact in which the entry's `intentId` also appeared in an exit or reduce
    * decision, because it classified traces by id and the fills would have
-   * counted twice. Traces now resolve by EMISSION, so the entry's fills stay
-   * the entry's — the trace names the enter decision's evaluation — and the
-   * second emission of the id is just another untraced exit emission.
+   * counted twice. Emissions resolve by KEY, so the entry's fills stay the
+   * entry's — its record names the enter decision's evaluation — and the second
+   * emission of the id placed nothing.
    */
   it("the entry's intent id re-emitted by a reduce decision leaves the entry's fills the entry's", () => {
     const artifact = golden();
@@ -611,23 +810,40 @@ describe("RECON-1 — the unfilled-order rule counts EMISSIONS, and every broken
     readonly tamper: (artifact: PaperRunArtifact, marks: Landmarks) => PaperRunArtifact;
   }[] = [
     {
-      name: "one plan traced to two intents",
-      refusal: /is traced to two intents/u,
+      // CONVERTED (`RECON-2`): was "one plan traced to two intents"
+      // (`is traced to two intents`). A trace is its order's record completed,
+      // so a trace naming another intent now contradicts the record.
+      name: "a trace naming another intent than its order's provenance record",
+      refusal: /disagrees with order .+'s provenance record on intentId/u,
       tamper: (artifact, marks) => ({
         ...artifact,
-        traces: [
-          ...artifact.traces,
-          { ...marks.entryTrace, intentId: only(marks.reduce.intents, "reduce intent").intentId ?? "" },
-        ],
+        traces: [...artifact.traces, { ...marks.entryTrace, intentId: marks.exitRecord.intentId }],
       }),
     },
     {
-      name: "a filled plan traced to an emission that is a CANCEL, which places no order",
+      name: "a filled order whose record names an emission that is a CANCEL, which places no order",
       refusal: /belongs to neither the entry's chain nor any exit's/u,
       tamper: (artifact, marks) => ({
         ...artifact,
         decisions: artifact.decisions.map((decision) =>
           decision.evaluationSeq === marks.reduce.evaluationSeq
+            ? {
+                ...decision,
+                intents: decision.intents.map((intent) => ({ ...intent, type: "CANCEL" })),
+              }
+            : decision,
+        ),
+      }),
+    },
+    {
+      // `RECON-2`: the same rule for an UNFILLED order, which only its record
+      // links to an emission — the withdrawn take-profit, its intent re-typed.
+      name: "an unfilled order whose record names an emission that is a CANCEL",
+      refusal: /placed under CANCEL .+ — neither the entry intent nor one an exit or reduce decision emitted/u,
+      tamper: (artifact, marks) => ({
+        ...artifact,
+        decisions: artifact.decisions.map((decision) =>
+          decision.evaluationSeq === marks.exitDecision.evaluationSeq
             ? {
                 ...decision,
                 intents: decision.intents.map((intent) => ({ ...intent, type: "CANCEL" })),
@@ -649,8 +865,11 @@ describe("RECON-1 — the unfilled-order rule counts EMISSIONS, and every broken
       }),
     },
     {
+      // CONVERTED (`RECON-2`): was `is reached from the entry's chain AND from
+      // an exit's`. The book is checked against itself first now: one order id
+      // booked twice cannot be matched to one record.
       name: "one order id booked under the entry's plan and under an exit's",
-      refusal: /is reached from the entry's chain AND from an exit's/u,
+      refusal: /is booked twice/u,
       tamper: (artifact, marks) => ({
         ...artifact,
         orders: [
@@ -680,18 +899,28 @@ describe("RECON-1 — the unfilled-order rule counts EMISSIONS, and every broken
       }),
     },
     {
-      name: "an untraced order that reports filled shares",
-      refusal: /reports 10 filled shares, but no trace names its plan/u,
-      tamper: (artifact, marks) => ({
-        ...artifact,
-        orders: [
-          ...artifact.orders,
-          orderUnder(marks.exitOrder, planId("fe000"), { requestedShares: "10", filledShares: "10" }),
-        ],
-      }),
+      // CONVERTED (`RECON-2`): was `…no trace names its plan`, reached through
+      // the closed-world rule. The order is given a VALID record — a distinct
+      // reduce emission — so the refusal is the traced-fill rule itself.
+      name: "an order that reports filled shares while no trace names it",
+      refusal: /reports 10 filled shares, but no trace names it/u,
+      tamper: (artifact, marks) => {
+        const order = orderUnder(marks.exitOrder, planId("fe000"), {
+          requestedShares: "10",
+          filledShares: "10",
+        });
+        return withRecords(
+          {
+            ...artifact,
+            decisions: [...artifact.decisions, reemitted(marks.reduce, 18)],
+            orders: [...artifact.orders, order],
+          },
+          provenanceFor(marks.exitRecord, { evaluationSeq: 18, intentId: marks.exitRecord.intentId }, order),
+        );
+      },
     },
     {
-      name: "an unfilled order under a plan traced to a QUOTE",
+      name: "an unfilled order whose record names a QUOTE",
       refusal: /neither the entry intent nor one an exit or reduce decision emitted/u,
       tamper: (artifact, marks) => {
         const quoteIntentId = `quote-4-${artifact.scenario.marketId}`;
@@ -700,27 +929,75 @@ describe("RECON-1 — the unfilled-order rule counts EMISSIONS, and every broken
           filledShares: "0",
           state: "CANCELLED",
         });
-        const absentFill = fillOf(marks.exitFill, order, {});
-        return {
-          ...artifact,
-          decisions: [
-            ...artifact.decisions,
-            {
-              ...marks.exitDecision,
-              evaluationSeq: 18,
-              decisionType: "quote",
-              intents: [
-                { type: "QUOTE", intentId: quoteIntentId, marketId: artifact.scenario.marketId },
-              ],
-            },
-          ],
-          traces: [
-            ...artifact.traces,
-            traceOf(marks.entryTrace, quoteIntentId, 18, order, absentFill),
-          ],
-          orders: [...artifact.orders, order],
-        };
+        return withRecords(
+          {
+            ...artifact,
+            decisions: [...artifact.decisions, quoteDecision(artifact, marks, 18, quoteIntentId)],
+            orders: [...artifact.orders, order],
+          },
+          provenanceFor(marks.entryRecord, { evaluationSeq: 18, intentId: quoteIntentId }, order),
+        );
       },
+    },
+    // --- `RECON-2`: the provenance section itself ---------------------------
+    {
+      name: "two provenance records for one order",
+      refusal: /has two provenance records/u,
+      tamper: (artifact, marks) => withRecords(artifact, marks.takeProfitRecord),
+    },
+    {
+      name: "a provenance record for an order the venue never booked (an orphan)",
+      refusal: /which the venue never booked/u,
+      tamper: (artifact, marks) =>
+        withRecords(artifact, { ...marks.takeProfitRecord, venueOrderId: "no-such-order:g0:o0" }),
+    },
+    {
+      name: "a record whose plan is not the booked order's plan",
+      refusal: /but its provenance record says plan/u,
+      tamper: (artifact, marks) =>
+        withRecordChanged(artifact, marks.takeProfit.simulatedOrderId, {
+          executionPlanId: planId("ff000"),
+        }),
+    },
+    {
+      name: "one plan whose orders' records name two emissions",
+      refusal: /names two emissions/u,
+      tamper: (artifact, marks) => {
+        // A second order under the ENTRY's plan whose record names the
+        // take-profit's emission: one plan, two origins.
+        const sibling: ArtifactOrder = {
+          ...marks.entryOrder,
+          simulatedOrderId: `${marks.entryOrder.executionPlanId}:g1:o0`,
+          plannedOrderId: `${marks.entryOrder.executionPlanId}:g1:o0`,
+          filledShares: "0",
+          state: "CANCELLED",
+        };
+        return withRecords(
+          { ...artifact, orders: [...artifact.orders, sibling] },
+          {
+            ...marks.entryRecord,
+            evaluationSeq: marks.takeProfitRecord.evaluationSeq,
+            intentId: marks.takeProfitRecord.intentId,
+            venueOrderId: sibling.simulatedOrderId,
+          },
+        );
+      },
+    },
+    {
+      name: "a trace naming an order that has no provenance record",
+      refusal: /which has no provenance\s+record; a trace is its order's submission-time record/u,
+      tamper: (artifact, marks) => ({
+        ...artifact,
+        traces: [...artifact.traces, { ...marks.exitTrace, venueOrderId: "no-such-order:g0:o0" }],
+      }),
+    },
+    {
+      name: "a format-1 artefact, with no provenance section at all",
+      refusal: /carries no orderProvenance section/u,
+      tamper: (artifact) =>
+        Object.fromEntries(
+          Object.entries(artifact).filter(([key]) => key !== "orderProvenance"),
+        ) as unknown as PaperRunArtifact,
     },
   ];
 
@@ -734,17 +1011,97 @@ describe("RECON-1 — the unfilled-order rule counts EMISSIONS, and every broken
 });
 
 /**
+ * `RECON-2` — the two refusals `RECON1-ORIGIN` asked for, over every order and
+ * every shared field.
+ */
+describe("RECON-2 — an order without a record, or a record a trace contradicts, is refused", () => {
+  it("deleting ANY order's record refuses the table, naming that order — filled or not", () => {
+    const artifact = golden();
+    // Three orders: two filled (entry, protective reduction), one not (the
+    // withdrawn take-profit, which only its record ever named).
+    expect(artifact.orders).toHaveLength(3);
+    for (const order of artifact.orders) {
+      const tampered = withoutRecordOf(artifact, order.simulatedOrderId);
+      expect(() => buildReconciliation(tampered), order.simulatedOrderId).toThrow(
+        `order ${order.simulatedOrderId}`,
+      );
+      expect(() => buildReconciliation(tampered), order.simulatedOrderId).toThrow(
+        /has no provenance record/u,
+      );
+    }
+  });
+
+  /**
+   * The loop builds a trace FROM the record — `{ ...prefix, venueFillId, … }`
+   * (`apps/trader/src/loop.ts` `#harvestFills`) — so the two share eight fields
+   * that can disagree (the ninth, `venueOrderId`, is how the record is found;
+   * the probe above for a trace naming an order with no record covers it).
+   * Each field of the exit fill's trace is changed on its own, to a value that
+   * leaves every other rule satisfied, and each is refused by name.
+   */
+  it("a fill's trace that disagrees with its order's record on ANY shared field is refused, by field", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const changes: readonly [keyof ArtifactOrderProvenance, string | number][] = [
+      ["sourceEventId", "018f5c20-9000-7a90-8b00-000000000006"],
+      ["featureSnapshotRef", "f".repeat(64)],
+      ["runId", "018f5c20-3000-7a30-8b00-0000000000ff"],
+      ["evaluationSeq", marks.enter.evaluationSeq],
+      ["intentId", marks.entryRecord.intentId],
+      ["approvedIntentId", "9280f970-9280-7000-8000-00000000a0a0"],
+      ["executionPlanId", marks.entryRecord.executionPlanId],
+      ["submissionAttemptId", "9280f970-9280-7000-8000-00000000b0b0"],
+    ];
+    expect(changes).toHaveLength(8);
+    for (const [field, value] of changes) {
+      const traces = artifact.traces.map((trace) =>
+        trace.venueFillId === marks.exitFill.simulatedFillId ? { ...trace, [field]: value } : trace,
+      );
+      const tampered = { ...artifact, traces };
+      expect(() => buildReconciliation(tampered), field).toThrow(
+        new RegExp(`disagrees with order .+'s provenance record on ${field} \\(`, "u"),
+      );
+      expect(() => buildReconciliation(tampered), field).toThrow(marks.exitFill.simulatedFillId);
+    }
+  });
+
+  it("a record naming a different emission than the fill's trace is refused, even when the record resolves", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    // The exit order's RECORD is re-pointed at a distinct re-emission of the
+    // reduce (evaluation 18), which resolves, is an exit, and holds no other
+    // plan — every order-side rule passes. Only the fill's trace, which still
+    // names evaluation 9, says the record is not the run's.
+    const tampered = withRecordChanged(
+      { ...artifact, decisions: [...artifact.decisions, reemitted(marks.reduce, 18)] },
+      marks.exitOrder.simulatedOrderId,
+      { evaluationSeq: 18 },
+    );
+    expect(() => buildReconciliation(tampered)).toThrow(
+      /disagrees with order .+'s provenance record on evaluationSeq \(trace 9, provenance 18\)/u,
+    );
+  });
+});
+
+/**
  * `RECON-1` r2 — the independent review's reproductions, each of which the
- * first two commits mis-reconciled SILENTLY: an explained row, no throw.
+ * first two commits mis-reconciled SILENTLY: an explained row, no throw. Each
+ * is REBUILT against the format-2 artefact (`RECON-2`).
  */
 describe("RECON-1 r2 — the review's silent mis-attributions are refused", () => {
   /**
-   * Review R1, probe 1. An untraced BUY under a new plan is correctly refused
-   * on its own — one untraced emission cannot have placed two plans. Appending
-   * an exact COPY of the golden's exit decision then made the global candidate
-   * count reach two, and the phantom was reported as a second withdrawn
-   * take-profit: projected 3.3, `explained: true`. The copy carries no new
-   * `(runId, evaluationSeq, intentId)`; it is a malformed artefact.
+   * Review R1, probe 1. An untraced BUY under a new plan was refused on its
+   * own; appending an exact COPY of the golden's exit decision then made the
+   * global candidate count reach two, and the phantom was reported as a second
+   * withdrawn take-profit: projected 3.3, `explained: true`.
+   *
+   * `RECON-2`: the phantom alone is now refused because it has NO RECORD (was:
+   * `no possible origin`). The copy is still refused as a duplicate decision
+   * key. `RECON1-ORIGIN`'s own reproduction — a DISTINCT compatible exit
+   * re-emission, which `RECON-1`'s matcher let absorb the phantom — is refused
+   * for the same reason: an emission is no longer a candidate, only a record
+   * names an origin. A record borrowing the take-profit's emission is refused
+   * by one-plan-per-emission.
    */
   it("R1: a copied exit decision cannot stand in for a phantom order's origin", () => {
     const artifact = golden();
@@ -760,20 +1117,81 @@ describe("RECON-1 r2 — the review's silent mis-attributions are refused", () =
       limitPrice: "0.33",
     };
     const withPhantom = { ...artifact, orders: [...artifact.orders, phantom] };
-    expect(() => buildReconciliation(withPhantom)).toThrow(/no possible origin/u);
+    expect(() => buildReconciliation(withPhantom)).toThrow(/has no provenance record/u);
 
     const copy = JSON.parse(JSON.stringify(marks.exitDecision)) as ArtifactDecision;
     const copied = { ...withPhantom, decisions: [...withPhantom.decisions, copy] };
     expect(() => buildReconciliation(copied)).toThrow(
       /two persisted decisions share \(runId, evaluationSeq\)/u,
     );
+
+    // `RECON1-ORIGIN`: a distinct, compatible exit re-emission.
+    const reEmission = {
+      ...withPhantom,
+      decisions: [...withPhantom.decisions, reemitted(marks.exitDecision, 18)],
+    };
+    expect(() => buildReconciliation(reEmission)).toThrow(phantom.simulatedOrderId);
+    expect(() => buildReconciliation(reEmission)).toThrow(/has no provenance record/u);
+
+    const borrowing = withRecords(
+      withPhantom,
+      provenanceFor(
+        marks.takeProfitRecord,
+        {
+          evaluationSeq: marks.takeProfitRecord.evaluationSeq,
+          intentId: marks.takeProfitRecord.intentId,
+        },
+        phantom,
+      ),
+    );
+    expect(() => buildReconciliation(borrowing)).toThrow(/is claimed by two plans/u);
+  });
+
+  /**
+   * THE BOUNDARY, stated rather than hidden. A document fabricated
+   * CONSISTENTLY at every id — a new `exit` decision, and a record, plan and
+   * order that all name it — is indistinguishable, by ids, from a run whose
+   * strategy emitted a second take-profit, and it is attributed as exactly that.
+   * What `RECON1-ORIGIN` closed is attribution WITHOUT a link: the matcher let
+   * an emission absorb an order no id tied to it. Here the link is the loop's
+   * own record, and the row names the decision it names. (Nor is an order's
+   * action checked against its intent: the artefact carries no intent
+   * `direction` — `RECON-1`'s compatibility boundary, unchanged.)
+   */
+  it("the boundary: an order, record and decision consistent at every id are attributed as the record says", () => {
+    const artifact = golden();
+    const marks = landmarks(artifact);
+    const phantom = orderUnder(marks.takeProfit, planId("fc000"), {
+      requestedShares: "10",
+      limitPrice: "0.33",
+    });
+    const rows = buildReconciliation(
+      withRecords(
+        {
+          ...artifact,
+          decisions: [...artifact.decisions, reemitted(marks.exitDecision, 18)],
+          orders: [...artifact.orders, phantom],
+        },
+        provenanceFor(
+          marks.takeProfitRecord,
+          { evaluationSeq: 18, intentId: marks.takeProfitRecord.intentId },
+          phantom,
+        ),
+      ),
+    );
+    const attributed = row(rows, `exit.cancelled_proceeds.${phantom.simulatedOrderId}`);
+    expect(attributed.projected).toBe("3.3");
+    expect(attributed.contributions[0]?.note).toContain("the `exit` decision at evaluationSeq 18");
   });
 
   /**
    * Review R1, probe 2, and its two neighbours. The withdrawn take-profit is
-   * moved where its only candidate origin — the take-profit emission, in the
-   * scenario market — could not have placed it. The global count still
-   * matched, and the order was reported as an explained exit cancellation.
+   * moved where the emission its record names — the take-profit, in the
+   * scenario market — could not have placed it.
+   *
+   * `RECON-2`: still refused, now by the compatibility CROSS-CHECK on the
+   * emission the record names (`could not have placed it`), not by a search
+   * for a candidate that finds none.
    */
   const displaced: readonly {
     readonly name: string;
@@ -792,7 +1210,7 @@ describe("RECON-1 r2 — the review's silent mis-attributions are refused", () =
     { name: "on the YES token but labelled NO", changes: { side: "NO" } },
   ];
   for (const probe of displaced) {
-    it(`R1: an untraced order ${probe.name} has no possible origin`, () => {
+    it(`R1: an order ${probe.name} contradicts the emission its record names`, () => {
       const artifact = golden();
       const marks = landmarks(artifact);
       const orders = artifact.orders.map((order) =>
@@ -803,18 +1221,23 @@ describe("RECON-1 r2 — the review's silent mis-attributions are refused", () =
       expect(() => buildReconciliation({ ...artifact, orders })).toThrow(
         marks.takeProfit.simulatedOrderId,
       );
-      expect(() => buildReconciliation({ ...artifact, orders })).toThrow(/no possible origin/u);
+      expect(() => buildReconciliation({ ...artifact, orders })).toThrow(
+        /which could not have placed it/u,
+      );
     });
   }
 
   /**
    * Review R2. The filled emission at evaluation 9 becomes a QUOTE, a separate
    * `reduce` decision at evaluation 99 carries the SAME intent id, and the
-   * fill's trace still names evaluation 9. Classified by id, the QUOTE's fill
-   * was accepted as an exit and a cancelled sibling under the QUOTE's plan was
-   * reported as an explained exit cancellation.
+   * fill's trace — and now its order's record — still name evaluation 9.
+   * Classified by id, the QUOTE's fill was accepted as an exit and a cancelled
+   * sibling under the QUOTE's plan was reported as an explained exit
+   * cancellation. `RECON-2`: the sibling carries the record the loop would
+   * have written (the same emission as its plan), so the refusal is the
+   * KEY's, not a missing record's.
    */
-  it("R2: a trace resolves by (runId, evaluationSeq, intentId), not by the id alone", () => {
+  it("R2: an order resolves by (runId, evaluationSeq, intentId), not by the id alone", () => {
     const artifact = golden();
     const marks = landmarks(artifact);
     const reduceIntentId = only(marks.reduce.intents, "reduce intent").intentId ?? "";
@@ -830,7 +1253,7 @@ describe("RECON-1 r2 — the review's silent mis-attributions are refused", () =
             }
           : decision,
       ),
-      { ...marks.reduce, evaluationSeq: 99 },
+      reemitted(marks.reduce, 99),
     ];
     const sibling: ArtifactOrder = {
       ...marks.exitOrder,
@@ -840,7 +1263,10 @@ describe("RECON-1 r2 — the review's silent mis-attributions are refused", () =
       filledShares: "0",
       state: "CANCELLED",
     };
-    const tampered = { ...artifact, decisions, orders: [...artifact.orders, sibling] };
+    const tampered = withRecords(
+      { ...artifact, decisions, orders: [...artifact.orders, sibling] },
+      { ...marks.exitRecord, venueOrderId: sibling.simulatedOrderId },
+    );
     expect(() => buildReconciliation(tampered)).toThrow(marks.exitFill.simulatedFillId);
     expect(() => buildReconciliation(tampered)).toThrow(
       /belongs to neither the entry's chain nor any exit's/u,
@@ -1078,39 +1504,12 @@ function interleavedBookings(
 const ORACLE_IMPORTS = ["./artifact.js", "@polymarket-bot/decimal"];
 
 /**
- * Every module specifier a TypeScript source names, from its syntax tree — the
- * walk `test/contract/coinbase/isolation.test.ts` uses, plus `require(…)`. A
- * specifier that is not a string literal is reported as `<computed>`.
+ * The oracle's imports outside {@link ORACLE_IMPORTS}, read from its syntax
+ * tree by the SHARED parse helper `support/module-specifiers.ts` (`RECON-2`,
+ * `RECON1-SCAN`) — the one `safety-posture.test.ts`'s allowlist scan also
+ * uses, so the two scans cannot drift back into two readers. A specifier that
+ * is not a string literal is reported as {@link COMPUTED_SPECIFIER}.
  */
-function moduleSpecifiersIn(text: string): readonly string[] {
-  const source = ts.createSourceFile("probe.ts", text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const specifiers: string[] = [];
-  const literal = (node: ts.Node | undefined): string =>
-    node !== undefined && ts.isStringLiteralLike(node) ? node.text : "<computed>";
-  const visit = (node: ts.Node): void => {
-    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
-      if (node.moduleSpecifier !== undefined) specifiers.push(literal(node.moduleSpecifier));
-    } else if (
-      ts.isImportEqualsDeclaration(node) &&
-      ts.isExternalModuleReference(node.moduleReference)
-    ) {
-      specifiers.push(literal(node.moduleReference.expression));
-    } else if (ts.isImportTypeNode(node)) {
-      const argument = node.argument;
-      specifiers.push(ts.isLiteralTypeNode(argument) ? literal(argument.literal) : "<computed>");
-    } else if (
-      ts.isCallExpression(node) &&
-      (node.expression.kind === ts.SyntaxKind.ImportKeyword ||
-        (ts.isIdentifier(node.expression) && node.expression.text === "require"))
-    ) {
-      specifiers.push(literal(node.arguments[0]));
-    }
-    ts.forEachChild(node, visit);
-  };
-  ts.forEachChild(source, visit);
-  return specifiers;
-}
-
 function independenceViolations(text: string): readonly string[] {
   return [
     ...new Set(moduleSpecifiersIn(text).filter((specifier) => !ORACLE_IMPORTS.includes(specifier))),
@@ -1355,6 +1754,7 @@ describe("RECON-1 r1 — PnL reconciles against packages/pnl's own cost method (
     expect(openBasis(open).capital).toBe("17.2");
   });
 
+
   /**
    * `RECON-1` r2 (review R3): this pin used to be a LINE regex that required
    * the specifier to end the line, so
@@ -1362,7 +1762,8 @@ describe("RECON-1 r1 — PnL reconciles against packages/pnl's own cost method (
    * passed it. It now reads the PARSED module: every import and export
    * declaration, side-effect import, `import x = require(…)`, `import(…)` call,
    * import type node and `require(…)` call, wherever the grammar puts one;
-   * text inside comments and string data is inert.
+   * text inside comments and string data is inert. `RECON-2`: the parse is the
+   * shared helper's (`support/module-specifiers.ts`), not a private copy.
    */
   it("the oracle does not run the engine: support/reconcile.ts imports only the decimal arithmetic", () => {
     const source = readFileSync(new URL("./support/reconcile.ts", import.meta.url), "utf8");
@@ -1385,7 +1786,7 @@ describe("RECON-1 r1 — PnL reconciles against packages/pnl's own cost method (
     }
     // A specifier the parser cannot read is a violation, not a pass.
     expect(independenceViolations(`${source}\nconst where = "x";\nawait import(where);\n`)).toEqual([
-      "<computed>",
+      COMPUTED_SPECIFIER,
     ]);
     // A MENTION is not an import: comments and string data stay inert.
     expect(
@@ -1404,5 +1805,331 @@ describe("RECON-1 r1 — PnL reconciles against packages/pnl's own cost method (
       rounding: DIVISION_ROUNDING,
     });
     expect(DIVISION_PRECISION).toBe(34);
+  });
+});
+
+// --- RECON1-EDGE ---------------------------------------------------------------
+
+/** A row's contributions as `[mechanism, amount]` pairs, in order. */
+function amounts(entry: ReconciliationRow): readonly (readonly [string, string])[] {
+  return entry.contributions.map((contribution) => [contribution.mechanism, contribution.amount] as const);
+}
+
+function edgeRow(artifact: PaperRunArtifact): ReconciliationRow {
+  return row(buildReconciliation(artifact), "exit.expected_net_edge");
+}
+
+/** The golden with its protective reduction WITHDRAWN unfilled: the whole position open at run end. */
+function withReductionWithdrawn(artifact: PaperRunArtifact): PaperRunArtifact {
+  const marks = landmarks(artifact);
+  return {
+    ...artifact,
+    orders: artifact.orders.map((order) =>
+      order.simulatedOrderId === marks.exitOrder.simulatedOrderId
+        ? { ...order, filledShares: "0", state: "CANCELLED" }
+        : order,
+    ),
+    fills: artifact.fills.filter((fill) => fill.simulatedFillId !== marks.exitFill.simulatedFillId),
+    traces: artifact.traces.filter((trace) => trace.venueFillId !== marks.exitFill.simulatedFillId),
+  };
+}
+
+/**
+ * `RECON1-EDGE` — the orchestrator's ruling, implemented and pinned.
+ *
+ * `exit.expected_net_edge` stays the ENTRY intent's persisted projection
+ * against the round trip realized SO FAR. The strategy's formula
+ * (`packages/strategies/static-bracket`, recomputed on the
+ * `entry.expected_net_edge_formula` row) is, with E the entry's shares, TP the
+ * take-profit price and fe / fx the configured per-share entry / exit fees:
+ *
+ *     projected = TP × E − entryCost − (fe + fx) × E
+ *
+ * The realized round trip is P − N − C: exit proceeds, entry notional, and the
+ * fee charged on every fill. With X shares exited, O = E − X still open and U
+ * the fees' exact, unrounded total, the named contributions are
+ *
+ *     EXIT_BELOW_TAKE_PROFIT      P − TP × X
+ *     POSITION_OPEN_AT_RUN_END    −(TP − fx) × O               (only when O ≠ 0)
+ *     FEE_MODEL_BASIS             −(U − (fe × E + fx × X))
+ *     FEE_ROUNDING_HALF_UP        −(C − U)
+ *
+ * They sum to P − TP × E + (fe + fx) × E − C, which is the difference EXACTLY
+ * when entryCost = N: the persisted projection decomposes term for term, so
+ * the residual is not zero by coincidence. The last two pins probe exactly
+ * that — per-side fees that differ, and an entry that cost more than it
+ * projected.
+ *
+ * The golden's fills, from which every number below is derived by hand:
+ *
+ *     entry   30 @ 0.34 (fee 0.131, exact 0.131274)  +  20 @ 0.35 (fee 0.089, exact 0.088725)
+ *             N = 10.2 + 7 = 17.2, E = 50
+ *     exit    SELL @ 0.32; the fee on q shares is q × 0.0195 × 0.32 × 0.68 = q × 0.0042432
+ *     TP = 0.5, fe = fx = 0.001, so projected = 0.5 × 50 − 17.2 − 0.002 × 50 = 25 − 17.2 − 0.1 = 7.7
+ */
+describe("RECON1-EDGE — shares open at run end are a NAMED mechanism, not a residual", () => {
+  /**
+   * Sell 25 of the 50 (X = 25, O = 25). Exit fee 25 × 0.0042432 = 0.10608,
+   * charged 0.106.
+   *
+   *   P = 25 × 0.32 = 8
+   *   C = 0.131 + 0.089 + 0.106      = 0.326
+   *   U = 0.131274 + 0.088725 + 0.10608 = 0.326079
+   *   realized   = 8 − 17.2 − 0.326   = −9.526
+   *   difference = −9.526 − 7.7       = −17.226
+   *
+   *   EXIT_BELOW_TAKE_PROFIT     8 − 0.5 × 25                            = −4.5
+   *   POSITION_OPEN_AT_RUN_END   −(0.5 − 0.001) × 25 = −0.499 × 25        = −12.475
+   *   FEE_MODEL_BASIS            −(0.326079 − (0.001 × 50 + 0.001 × 25))
+   *                              = −(0.326079 − 0.075)                   = −0.251079
+   *   FEE_ROUNDING_HALF_UP       −(0.326 − 0.326079)                     = +0.000079
+   *   Σ = −4.5 − 12.475 − 0.251079 + 0.000079 = −17.226 → residual 0
+   *
+   * `RECON-1` had no open-position term and modelled the exit fee on all 50
+   * shares: FEE_MODEL_BASIS −(0.326079 − 0.1) = −0.226079, Σ = −4.726, and the
+   * residual was −17.226 − (−4.726) = −12.5 = TP × (X − E) = 0.5 × (25 − 50).
+   * The ruling closes exactly that: the new term (−12.475) plus the fee
+   * model's move (−0.251079 − (−0.226079) = −0.025 = −fx × O) is −12.5.
+   */
+  it("a partial exit (25 of 50): the open 25 shares are POSITION_OPEN_AT_RUN_END, and the residual is 0", () => {
+    const edge = edgeRow(withPartialExit(golden()));
+    expect(edge.projected).toBe("7.7");
+    expect(edge.realized).toBe("-9.526");
+    expect(edge.difference).toBe("-17.226");
+    expect(amounts(edge)).toEqual([
+      ["EXIT_BELOW_TAKE_PROFIT", "-4.5"],
+      ["POSITION_OPEN_AT_RUN_END", "-12.475"],
+      ["FEE_MODEL_BASIS", "-0.251079"],
+      ["FEE_ROUNDING_HALF_UP", "0.000079"],
+    ]);
+    expect(edge.residual).toBe("0");
+    expect(edge.explained).toBe(true);
+    expect(edge.unexplainedReasons).toEqual([]);
+    expect(edge.contributions[1]?.note).toContain("(0.5 − 0.001) × 25 = 12.475");
+
+    // Non-vacuous: RECON-1's decomposition of the SAME row left −12.5.
+    const recon1 = ["-4.5", subDecimal("0.1", "0.326079"), "0.000079"].reduce(
+      (total, value) => addDecimal(total, value),
+      "0",
+    );
+    expect(recon1).toBe("-4.726");
+    expect(subDecimal(edge.difference ?? "", recon1)).toBe("-12.5");
+    expect(mulDecimal("0.5", subDecimal("25", "50"))).toBe("-12.5");
+  });
+
+  /**
+   * RISK2-R4's interleaved fills: buy 30 @ 0.34, sell 5 (fee 0.021, exact
+   * 0.021216), buy 20 @ 0.35, sell 25 (fee 0.106, exact 0.10608). X = 30,
+   * O = 20. (This row sums; the order of the fold does not enter it.)
+   *
+   *   P = 30 × 0.32 = 9.6
+   *   C = 0.131 + 0.089 + 0.021 + 0.106 = 0.347
+   *   U = 0.131274 + 0.088725 + 0.021216 + 0.10608 = 0.347295
+   *   realized   = 9.6 − 17.2 − 0.347 = −7.947
+   *   difference = −7.947 − 7.7       = −15.647
+   *
+   *   EXIT_BELOW_TAKE_PROFIT     9.6 − 0.5 × 30                    = −5.4
+   *   POSITION_OPEN_AT_RUN_END   −0.499 × 20                       = −9.98
+   *   FEE_MODEL_BASIS            −(0.347295 − (0.05 + 0.001 × 30)) = −0.267295
+   *   FEE_ROUNDING_HALF_UP       −(0.347 − 0.347295)               = +0.000295
+   *   Σ = −5.4 − 9.98 − 0.267295 + 0.000295 = −15.647 → residual 0
+   */
+  it("two exit fills leaving 20 of 50 open: explained, residual 0", () => {
+    const edge = edgeRow(interleaved(golden(), []));
+    expect(edge.realized).toBe("-7.947");
+    expect(edge.difference).toBe("-15.647");
+    expect(amounts(edge)).toEqual([
+      ["EXIT_BELOW_TAKE_PROFIT", "-5.4"],
+      ["POSITION_OPEN_AT_RUN_END", "-9.98"],
+      ["FEE_MODEL_BASIS", "-0.267295"],
+      ["FEE_ROUNDING_HALF_UP", "0.000295"],
+    ]);
+    expect(edge.residual).toBe("0");
+    expect(edge.explained).toBe(true);
+  });
+
+  /**
+   * The protective reduction WITHDRAWN unfilled: X = 0, O = 50, the whole
+   * position open at run end.
+   *
+   *   P = 0,  C = 0.22,  U = 0.219999
+   *   realized   = 0 − 17.2 − 0.22 = −17.42
+   *   difference = −17.42 − 7.7    = −25.12
+   *
+   *   EXIT_BELOW_TAKE_PROFIT     0 − 0.5 × 0                  = 0
+   *   POSITION_OPEN_AT_RUN_END   −0.499 × 50                  = −24.95
+   *   FEE_MODEL_BASIS            −(0.219999 − (0.05 + 0))     = −0.169999
+   *   FEE_ROUNDING_HALF_UP       −(0.22 − 0.219999)           = −0.000001
+   *   Σ = −24.95 − 0.169999 − 0.000001 = −25.12 → residual 0
+   *
+   * …and `RECON1-TEXT`: its own absent-proceeds row names a withdrawn
+   * PROTECTIVE REDUCTION (0.3 × 50 = 15), not a take-profit.
+   */
+  it("no exit fill at all (the reduction withdrawn unfilled): explained, and the withdrawn reduction is named", () => {
+    const artifact = withReductionWithdrawn(golden());
+    const marks = landmarks(golden());
+    const rows = buildReconciliation(artifact);
+    const edge = row(rows, "exit.expected_net_edge");
+    expect(edge.realized).toBe("-17.42");
+    expect(edge.difference).toBe("-25.12");
+    expect(amounts(edge)).toEqual([
+      ["EXIT_BELOW_TAKE_PROFIT", "0"],
+      ["POSITION_OPEN_AT_RUN_END", "-24.95"],
+      ["FEE_MODEL_BASIS", "-0.169999"],
+      ["FEE_ROUNDING_HALF_UP", "-0.000001"],
+    ]);
+    expect(edge.residual).toBe("0");
+    expect(edge.explained).toBe(true);
+
+    const withdrawn = row(rows, `exit.cancelled_proceeds.${marks.exitOrder.simulatedOrderId}`);
+    expect(withdrawn.quantity).toBe("the proceeds a withdrawn protective reduction projected");
+    expect(withdrawn.projected).toBe("15");
+    expect(withdrawn.explained).toBe(true);
+    expect(withdrawn.contributions[0]?.note).toContain(
+      `the protective reduction the \`reduce\` decision at evaluationSeq ${String(marks.reduce.evaluationSeq)} placed`,
+    );
+  });
+
+  /**
+   * Per-side fees that DIFFER: fe = 0.001, fx = 0.003. With fe = fx, as in the
+   * golden, a fee basis that swapped the two share counts would be
+   * indistinguishable; here it is not. The persisted projection is set to what
+   * the strategy's formula gives for these fees, so the entry's own formula row
+   * stays exact:
+   *
+   *   projected = 25 − 17.2 − (0.001 + 0.003) × 50 = 25 − 17.2 − 0.2 = 7.6
+   *
+   * Sell 25 of 50 (fills as in the first pin):
+   *
+   *   realized   = −9.526;  difference = −9.526 − 7.6 = −17.126
+   *   EXIT_BELOW_TAKE_PROFIT     −4.5
+   *   POSITION_OPEN_AT_RUN_END   −(0.5 − 0.003) × 25 = −0.497 × 25          = −12.425
+   *   FEE_MODEL_BASIS            −(0.326079 − (0.001 × 50 + 0.003 × 25))
+   *                              = −(0.326079 − 0.125)                      = −0.201079
+   *   FEE_ROUNDING_HALF_UP       +0.000079
+   *   Σ = −4.5 − 12.425 − 0.201079 + 0.000079 = −17.126 → residual 0
+   *
+   * The swapped basis, fe × X + fx × E = 0.025 + 0.15 = 0.175, would give
+   * FEE_MODEL_BASIS −0.151079 and leave a residual of −0.05.
+   */
+  it("per-side fees that differ: the exit fee is modelled on EXITED shares, and the residual is 0", () => {
+    const partial = withPartialExit(golden());
+    const marks = landmarks(partial);
+    const artifact: PaperRunArtifact = {
+      ...partial,
+      scenario: { ...partial.scenario, exitFeePerShare: "0.003" },
+      decisions: partial.decisions.map((decision) =>
+        decision.evaluationSeq === marks.enter.evaluationSeq
+          ? {
+              ...decision,
+              modelOutputs: { ...decision.modelOutputs, expectedNetEdge: "7.6" },
+              intents: decision.intents.map((intent) =>
+                intent.intentId === marks.entryIntent.intentId
+                  ? { ...intent, expectedNetEdge: "7.6" }
+                  : intent,
+              ),
+            }
+          : decision,
+      ),
+    };
+    const rows = buildReconciliation(artifact);
+    // The formula row agrees with the re-stated projection, so the projection
+    // is what the strategy WOULD have persisted for these fees.
+    expect(row(rows, "entry.expected_net_edge_formula").explained).toBe(true);
+    expect(row(rows, "entry.expected_net_edge_formula").projected).toBe("7.6");
+
+    const edge = row(rows, "exit.expected_net_edge");
+    expect(edge.projected).toBe("7.6");
+    expect(edge.difference).toBe("-17.126");
+    expect(amounts(edge)).toEqual([
+      ["EXIT_BELOW_TAKE_PROFIT", "-4.5"],
+      ["POSITION_OPEN_AT_RUN_END", "-12.425"],
+      ["FEE_MODEL_BASIS", "-0.201079"],
+      ["FEE_ROUNDING_HALF_UP", "0.000079"],
+    ]);
+    expect(edge.residual).toBe("0");
+    expect(edge.explained).toBe(true);
+    // Non-vacuous: the two share counts give different bases here.
+    expect(addDecimal(mulDecimal("0.001", "25"), mulDecimal("0.003", "50"))).toBe("0.175");
+    expect(addDecimal(mulDecimal("0.001", "50"), mulDecimal("0.003", "25"))).toBe("0.125");
+  });
+
+  /**
+   * An entry that cost MORE than it projected — the second lot fills at 0.365,
+   * not 0.35 (exact fee 20 × 0.0195 × 0.365 × 0.635 = 0.09039225, charged
+   * 0.090) — then sells 25 of 50. The open-position term must not absorb a gap
+   * that is not an open position:
+   *
+   *   N = 10.2 + 7.3 = 17.5 against the persisted entryCost 17.2
+   *   C = 0.131 + 0.09 + 0.106 = 0.327;  U = 0.131274 + 0.09039225 + 0.10608 = 0.32774625
+   *   realized   = 8 − 17.5 − 0.327 = −9.827;  difference = −9.827 − 7.7 = −17.527
+   *   EXIT_BELOW_TAKE_PROFIT     −4.5
+   *   POSITION_OPEN_AT_RUN_END   −12.475           (unchanged: O is still 25)
+   *   FEE_MODEL_BASIS            −(0.32774625 − 0.075) = −0.25274625
+   *   FEE_ROUNDING_HALF_UP       −(0.327 − 0.32774625) = +0.00074625
+   *   Σ = −17.227, so the residual is −17.527 − (−17.227) = −0.3 = entryCost − N
+   *
+   * The row stays UNEXPLAINED by exactly the entry's own gap, which
+   * `entry.projected_cost` reports on its own row.
+   */
+  it("an entry that cost more than projected stays unexplained by exactly entryCost − N", () => {
+    const partial = withPartialExit(golden());
+    const marks = landmarks(partial);
+    const [, second] = marks.entryFills;
+    if (second === undefined) throw new Error("two entry lots expected");
+    const artifact: PaperRunArtifact = {
+      ...partial,
+      fills: partial.fills.map((fill) =>
+        fill.simulatedFillId === second.simulatedFillId
+          ? { ...fill, price: "0.365", feeAmount: "0.09" }
+          : fill,
+      ),
+    };
+    const rows = buildReconciliation(artifact);
+    const edge = row(rows, "exit.expected_net_edge");
+    expect(edge.difference).toBe("-17.527");
+    expect(amounts(edge)).toEqual([
+      ["EXIT_BELOW_TAKE_PROFIT", "-4.5"],
+      ["POSITION_OPEN_AT_RUN_END", "-12.475"],
+      ["FEE_MODEL_BASIS", "-0.25274625"],
+      ["FEE_ROUNDING_HALF_UP", "0.00074625"],
+    ]);
+    expect(edge.residual).toBe("-0.3");
+    expect(edge.explained).toBe(false);
+    expect(edge.unexplainedReasons).toEqual([
+      "the named mechanisms leave an unexplained residual of -0.3",
+    ]);
+    expect(subDecimal("17.2", "17.5")).toBe(edge.residual);
+    expect(row(rows, "entry.projected_cost").difference).toBe("0.3");
+    expect(row(rows, "entry.projected_cost").explained).toBe(false);
+  });
+
+  /**
+   * The golden, fully CLOSED (X = E = 50, O = 0): P = 16, C = 0.432,
+   * U = 0.432159.
+   *
+   *   EXIT_BELOW_TAKE_PROFIT   16 − 0.5 × 50            = −9
+   *   FEE_MODEL_BASIS          −(0.432159 − (0.05 + 0.05)) = −0.332159
+   *   FEE_ROUNDING_HALF_UP     −(0.432 − 0.432159)      = +0.000159
+   *   Σ = −9.332 = −1.632 − 7.7 → residual 0
+   *
+   * No `POSITION_OPEN_AT_RUN_END`, and fe × E + fx × X = 0.1 = (fe + fx) × E,
+   * `RECON-1`'s basis: the golden's row is unchanged, number and word.
+   */
+  it("a fully closed round trip — the golden — carries no open-position term, and its row is unchanged", () => {
+    const artifact = golden();
+    const edge = edgeRow(artifact);
+    expect(amounts(edge)).toEqual([
+      ["EXIT_BELOW_TAKE_PROFIT", "-9"],
+      ["FEE_MODEL_BASIS", "-0.332159"],
+      ["FEE_ROUNDING_HALF_UP", "0.000159"],
+    ]);
+    expect(edge.difference).toBe("-9.332");
+    expect(edge.residual).toBe("0");
+    expect(edge.contributions[1]?.note).toBe(
+      "the strategy modelled (entry_fee_per_share + exit_fee_per_share) × shares = 0.1; the " +
+        "schedule's exact ad-valorem total over every fill is 0.432159",
+    );
+    expect(edge).toEqual(row(artifact.reconciliation, "exit.expected_net_edge"));
   });
 });

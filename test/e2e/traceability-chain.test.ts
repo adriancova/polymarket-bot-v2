@@ -89,6 +89,46 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
     expect(report.chains).toHaveLength(3);
   });
 
+  /**
+   * `RECON-2`. A chain exists only once a FILL completes it, so the take-profit
+   * that rested and was withdrawn unfilled is on none of the three above. Its
+   * origin is still resolvable by id: the loop recorded its trace PREFIX at
+   * submission (`CoreLoop.orderProvenance()`), the document carries it, and the
+   * walk resolves every record as a node — over the run's bytes and the
+   * golden's alike (`traceability-chain-negative.test.ts` mutates each check).
+   */
+  it("every booked order's origin resolves by id — the withdrawn take-profit, on no chain, included", async () => {
+    const produced = JSON.parse(
+      serializeArtifact(captureArtifact(await driveScenario())),
+    ) as PaperRunArtifact;
+    for (const document of [produced, parseGolden()]) {
+      expect(document.orderProvenance.map((record) => record.venueOrderId)).toEqual(
+        document.orders.map((order) => order.simulatedOrderId),
+      );
+      const traced = new Set(document.traces.map((trace) => trace.venueOrderId));
+      const [unfilled, ...others] = document.orderProvenance.filter(
+        (record) => !traced.has(record.venueOrderId),
+      );
+      expect(others).toEqual([]);
+      expect(unfilled).toBeDefined();
+      if (unfilled === undefined) return;
+      const order = document.orders.find((candidate) => candidate.simulatedOrderId === unfilled.venueOrderId);
+      expect(order?.state).toBe("CANCELLED");
+      expect(order?.filledShares).toBe("0");
+      const decision = document.decisions.find(
+        (candidate) =>
+          candidate.runId === unfilled.runId && candidate.evaluationSeq === unfilled.evaluationSeq,
+      );
+      expect(decision?.decisionType).toBe("exit");
+      expect(decision?.intents.map((intent) => intent.intentId)).toEqual([unfilled.intentId]);
+      // An `onFill` evaluation, which the loop originated: the decision names
+      // no source event, and the loop's record carries "" for it.
+      expect(decision?.sourceEventId).toBeNull();
+      expect(unfilled.sourceEventId).toBe("");
+      expect(walkChains(document).findings).toEqual([]);
+    }
+  });
+
   it("the chain is anchored in the RECORDED event, not in a clock", async () => {
     const artifact = captureArtifact(await driveScenario());
     const eventIds = new Set(artifact.events.map((event) => event.eventId));

@@ -64,18 +64,19 @@ persisted that no chain accounts for, which forward resolution can never show.
 | --- | --- |
 | `support/scenario.ts` | this package's OWN deterministic scenario — configuration and recorded events, every number's reason stated |
 | `support/harness.ts` | assembles the real composition with `main.ts`'s venue wiring, and drives it |
-| `support/artifact.ts` | captures what the run PERSISTED into one plain document |
+| `support/artifact.ts` | captures what the run PERSISTED into one plain document, plus every order's submission-time provenance (`orderProvenance`, golden format 2, `RECON-2`) |
 | `support/canonical-json.ts` | the canonical byte form, with a §6-invariant-1 float guard |
-| `support/chain-walk.ts` | the outside-in, closed-world traceability walk |
-| `support/reconcile.ts` | projected-vs-realized rows with named mechanisms and exact residuals; every fill and order attributed to the entry or an exit by id or refused, and the open cost basis restated from `packages/pnl`'s average-cost specification, folded in `atEventIngestSeq` order (`RECON-1`) |
+| `support/chain-walk.ts` | the outside-in, closed-world traceability walk; every order's provenance record is a node that must resolve, with no orphan and no order without one (`RECON-2`) |
+| `support/reconcile.ts` | projected-vs-realized rows with named mechanisms and exact residuals; every order — filled or not — attributed to the entry or an exit through its own provenance record, by id, or refused (`RECON-2`); the open cost basis restated from `packages/pnl`'s average-cost specification, folded in `atEventIngestSeq` order (`RECON-1`); shares still open at run end named `POSITION_OPEN_AT_RUN_END` (`RECON-2`) |
+| `support/module-specifiers.ts` | every module specifier a source names, read from its PARSED syntax tree — the one helper both import scans share (`RECON-2`, `RECON1-SCAN`) |
 | `support/golden.ts` | the committed golden's path, reader and deliberately-fatal regenerator |
 | `traceability-chain.test.ts` | acceptance 1, over the run's bytes AND over the committed golden |
-| `traceability-chain-negative.test.ts` | one mutation per hop, plus one per document-level finding: the walk must be falsifiable |
+| `traceability-chain-negative.test.ts` | one mutation per hop, plus one per document-level finding — the provenance section's included, by exact finding set: the walk must be falsifiable |
 | `projection-reconciliation.test.ts` | acceptance 2, with four falsifiability probes |
-| `reconciliation-attribution.test.ts` | `RECON-1`: synthetic artefacts built from the golden that pin the reconciler's by-id exit attribution and refusals (`RISK2-R3`), its sequence-ordered fold (`RISK2-R4`), and its agreement with the real `packages/pnl` engine on partial exits |
+| `reconciliation-attribution.test.ts` | `RECON-1` / `RECON-2`: synthetic artefacts built from the golden that pin the reconciler's by-id attribution of every order through its provenance record and its refusals (`RISK2-R3`, `RECON1-ORIGIN`), its sequence-ordered fold (`RISK2-R4`), its agreement with the real `packages/pnl` engine on partial exits, the open-position mechanism (`RECON1-EDGE`) and the oracle's import independence |
 | `determinism-golden.test.ts` | two fresh runs byte-identical to each other and to the committed golden |
 | `residuals-observed.test.ts` | the four known residuals, observed and never fought |
-| `safety-posture.test.ts` | the four repository floors, refused not clamped, plus a scan of this package's own files |
+| `safety-posture.test.ts` | the four repository floors, refused not clamped, plus a scan of this package's own files — imports read from each file's parsed syntax tree (`RECON1-SCAN`) |
 
 ## Determinism hygiene
 

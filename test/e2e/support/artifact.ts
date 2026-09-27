@@ -52,8 +52,14 @@ import {
 import { buildReconciliation, type ReconciliationRow } from "./reconcile.js";
 import type { Run } from "./harness.js";
 
-/** The format version of the committed golden. Bump = regenerate the golden. */
-export const GOLDEN_FORMAT_VERSION = 1;
+/**
+ * The format version of the committed golden. Bump = regenerate the golden.
+ *
+ * `2` (`RECON-2`): the `orderProvenance` section — every order's trace prefix
+ * as the loop recorded it at SUBMISSION — so that an order that never filled is
+ * attributed to its intent by id rather than by inference.
+ */
+export const GOLDEN_FORMAT_VERSION = 2;
 
 export interface ArtifactEvent {
   readonly eventId: string;
@@ -110,6 +116,32 @@ export interface ArtifactTrace {
   readonly venueFillId: string;
   readonly ledgerFillId: string;
   readonly ledgerTransactionIds: readonly string[];
+}
+
+/**
+ * One order's PROVENANCE: the §6 invariant 4 trace prefix the loop builds when
+ * the order is SUBMITTED (`CoreLoop.orderProvenance()`, `RECON-2`).
+ *
+ * A {@link ArtifactTrace} exists only once a FILL completes the chain, so an
+ * order that rested and was withdrawn unfilled has none; this record exists for
+ * EVERY order the loop placed, filled or not, and names its origin — the
+ * emission `(runId, evaluationSeq, intentId)` — by id. For an order that did
+ * fill, every trace of it carries exactly these nine fields.
+ *
+ * `sourceEventId` is the loop's value verbatim: `""` for an order placed by an
+ * evaluation the loop ORIGINATED (`onFill`, `onOrderUpdate`), whose persisted
+ * decision carries `sourceEventId: null`.
+ */
+export interface ArtifactOrderProvenance {
+  readonly sourceEventId: string;
+  readonly featureSnapshotRef: string;
+  readonly runId: string;
+  readonly evaluationSeq: number;
+  readonly intentId: string;
+  readonly approvedIntentId: string;
+  readonly executionPlanId: string;
+  readonly submissionAttemptId: string;
+  readonly venueOrderId: string;
 }
 
 export interface ArtifactOrder {
@@ -295,6 +327,8 @@ export interface PaperRunArtifact {
   readonly decisions: readonly ArtifactDecision[];
   readonly checkpointInstants: readonly string[];
   readonly traces: readonly ArtifactTrace[];
+  /** Every order's submission-time provenance, in submission order (`RECON-2`). */
+  readonly orderProvenance: readonly ArtifactOrderProvenance[];
   readonly orders: readonly ArtifactOrder[];
   readonly fills: readonly ArtifactFill[];
   readonly ledgerTransactions: readonly ArtifactLedgerTransaction[];
@@ -362,8 +396,9 @@ function intentOf(intent: Record<string, unknown>): ArtifactIntent {
  * Captures the artefact from a completed run.
  *
  * Reads only public surfaces: the durable-store double's four write logs, the
- * venue's orders and fills, the loop's trace and health surfaces, and the §6
- * invariant 8 projection folded from the append-only ledger.
+ * venue's orders and fills, the loop's trace, order-provenance and health
+ * surfaces, and the §6 invariant 8 projection folded from the append-only
+ * ledger.
  */
 export function captureArtifact(run: Run): PaperRunArtifact {
   const health = run.trader.loop.health();
@@ -589,6 +624,17 @@ export function captureArtifact(run: Run): PaperRunArtifact {
       venueFillId: trace.venueFillId,
       ledgerFillId: trace.ledgerFillId,
       ledgerTransactionIds: [...trace.ledgerTransactionIds],
+    })),
+    orderProvenance: run.trader.loop.orderProvenance().map((record) => ({
+      sourceEventId: record.sourceEventId,
+      featureSnapshotRef: record.featureSnapshotRef,
+      runId: record.runId,
+      evaluationSeq: record.evaluationSeq,
+      intentId: record.intentId,
+      approvedIntentId: record.approvedIntentId,
+      executionPlanId: record.executionPlanId,
+      submissionAttemptId: record.submissionAttemptId,
+      venueOrderId: record.venueOrderId,
     })),
     orders,
     fills,
