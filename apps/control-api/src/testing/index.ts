@@ -14,6 +14,7 @@ import { InMemoryControlAuditLog, type TraderHealthReportInput } from "@polymark
 import { ControlApi, type ApiEnvironment } from "../api.js";
 import { OperatorRegistry, type OperatorGrant } from "../auth.js";
 import { ControlPlane } from "../control-plane.js";
+import type { TraderHealthDocument } from "../health-door.js";
 import { InMemoryTraderHealthSource, TraderHealthCache } from "../health-source.js";
 import { CONTROL_API_RUN_MODE, REPOSITORY_MAXIMUM_RUN_MODE } from "../safety.js";
 
@@ -122,7 +123,7 @@ export function bearer(token: string): string {
 export function healthDocument(
   overrides: Partial<TraderHealthReportInput> = {},
 ): TraderHealthReportInput {
-  const base: TraderHealthReportInput = {
+  const base: TraderHealthDocument = {
     runMode: "PAPER",
     maximumRunMode: "PAPER",
     healthy: true,
@@ -198,6 +199,23 @@ export function healthDocument(
         released: 3,
         reservedCollateral: "12.50",
         refusalsByCode: {},
+      },
+      // `TRDR-4`: the trader loop's per-order state and its audit logs'
+      // bounded retention, as `CoreLoop.health()` always publishes them.
+      orders: {
+        tracked: 1,
+        settled: 3,
+        tombstones: 3,
+        maximumTombstones: 100_000,
+        tombstoneEvictions: 0,
+        unownedFills: 0,
+        lateFillsAfterSettlement: 0,
+        settleMismatches: 0,
+      },
+      retention: {
+        decisions: { retained: 12, maximumRetained: 100_000, evicted: 0 },
+        traces: { retained: 3, maximumRetained: 50_000, evicted: 0 },
+        provenance: { retained: 4, maximumRetained: 50_000, evicted: 0 },
       },
     },
     riskSeamCaveat: "WP-220 accepted residual: protective exits are classified ENTRY.",

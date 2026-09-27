@@ -20,7 +20,12 @@
  *
  * The schema mirrors `apps/trader/src/health.ts`'s `HealthSnapshot` field for
  * field — the five seam sections, `observeOnlyIntents`, `halts`, the risk
- * refusal counts and `riskSeamCaveat` (`docs/handoffs/WP-230.md` follow-up 4).
+ * refusal counts and `riskSeamCaveat` (`docs/handoffs/WP-230.md` follow-up 4) —
+ * plus, since `TRDR-4`, the two seams the trader's core loop always publishes:
+ * `seams.orders` (its per-order state) and `seams.retention` (its three audit
+ * logs' bounded retention). Both are REQUIRED here like every other counter;
+ * the trader's own type carries them as optional only for holders of no loop,
+ * and a document without them is refused, not defaulted.
  * `test/integration/control-api/trader-health-shape.test.ts` builds a snapshot
  * with the REAL `HealthState` class and drives it through this door, so a
  * rename in the trader fails a suite rather than emptying a dashboard.
@@ -75,6 +80,49 @@ const Queue = z.strictObject({
 });
 
 const CountsByKey = z.record(z.string().min(1).max(256), Counter);
+
+/** `TRDR-4`: one audit log's bounded retention (`order-lifecycle.ts`). */
+const Retention = z.strictObject({
+  retained: Counter,
+  maximumRetained: Counter,
+  evicted: Counter,
+});
+
+/**
+ * `TRDR-4`: the trader loop's per-order state — orders still owned
+ * (`tracked`), settled and pruned, the bounded settled-order tombstone map,
+ * fills whose owner lookup missed (each posted UNATTRIBUTED and halted), the
+ * late subset of those, and settlement mismatches.
+ */
+const OrderLifecycleSeam = z.strictObject({
+  tracked: Counter,
+  settled: Counter,
+  tombstones: Counter,
+  maximumTombstones: Counter,
+  tombstoneEvictions: Counter,
+  unownedFills: Counter,
+  lateFillsAfterSettlement: Counter,
+  settleMismatches: Counter,
+});
+
+/** `TRDR-4`: the three in-process audit logs' bounded retention. */
+const RetentionSeam = z.strictObject({
+  decisions: Retention,
+  traces: Retention,
+  provenance: Retention,
+});
+
+/**
+ * A complete trader health DOCUMENT as this door reads it: the observability
+ * package's `TraderHealthReportInput` plus the two `TRDR-4` seams, which that
+ * package does not (yet) read — it is unchanged by `TRDR-4`, additions only.
+ */
+export type TraderHealthDocument = TraderHealthReportInput & {
+  readonly seams: TraderHealthReportInput["seams"] & {
+    readonly orders: z.output<typeof OrderLifecycleSeam>;
+    readonly retention: z.output<typeof RetentionSeam>;
+  };
+};
 
 const TraderHealthSchema = z.strictObject({
   runMode: z.string().min(1).max(64),
@@ -170,6 +218,8 @@ const TraderHealthSchema = z.strictObject({
       reservedCollateral: DecimalText,
       refusalsByCode: CountsByKey,
     }),
+    orders: OrderLifecycleSeam,
+    retention: RetentionSeam,
   }),
   riskSeamCaveat: z.string().min(1).max(8192),
   asOf: z.string().min(1).max(64),

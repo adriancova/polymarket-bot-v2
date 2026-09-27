@@ -38,7 +38,9 @@
  * second is the account-wide commitment table every cap compares against. They
  * are TAKEN at the same moment (before submission — §9.10 "reserve
  * collateral/inventory before submission") and RELEASED at the same two moments
- * (a refused submission, and an order reaching a terminal state), and both are
+ * (a refused submission, for each planned order the venue does not hold, and an
+ * order reaching a terminal state — `TRDR-4` round 1: an order a refused plan
+ * nonetheless left at the venue is released only at the second), and both are
  * keyed on the PLANNED ORDER, so no state exists in which one holds a
  * commitment the other has forgotten.
  *
@@ -401,9 +403,10 @@ export class AllocatorGate {
    * Releases the allocator reservation one planned order holds.
    *
    * Called from exactly the two places `ReservationBook.releaseForOrder` is: a
-   * REFUSED submission (review round 1, MEDIUM-4 — a refused submission
-   * produces no order view, so nothing else would ever release it) and an order
-   * reaching a TERMINAL state.
+   * REFUSED submission, for each planned order the venue does NOT hold (review
+   * round 1, MEDIUM-4 — such an order has no view, so nothing else would ever
+   * release it; `TRDR-4` round 1 — one the venue DOES hold is kept until it is
+   * terminal) and an order reaching a TERMINAL state.
    */
   release(plannedOrderId: string): boolean {
     if (!this.#applied.delete(plannedOrderId)) return false;

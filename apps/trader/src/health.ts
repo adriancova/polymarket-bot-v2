@@ -73,6 +73,7 @@ import type { AllocatorMetrics } from "./allocation.js";
 import type { CancelLedgerMetrics } from "./cancels.js";
 import type { FillDeduplicatorMetrics } from "./fills.js";
 import type { HaltRecord } from "./halt.js";
+import type { OrderLifecycleMetrics, RetentionHealth } from "./order-lifecycle.js";
 import type { OrderViewMetrics } from "./orders.js";
 import type { QueueMetrics } from "./queue.js";
 import type { ReservationMetrics } from "./reservations.js";
@@ -153,6 +154,11 @@ export interface ExecutionHealth {
    * before the fix nothing ever released what it had reserved. A non-zero
    * count here is the release happening; `seams.reservations.open` returning to
    * its prior value is the same fact measured from the book.
+   *
+   * `TRDR-4` round 1: only a planned order the venue does NOT hold is released
+   * here. An order a refused plan nonetheless left at the venue keeps its
+   * reservation until it is terminal (ADR-006 §9), and its market is halted
+   * `UNATTRIBUTED_ACTIVITY` for reconciliation.
    */
   readonly reservationsReleasedOnRefusal: number;
   /**
@@ -318,6 +324,26 @@ export interface SeamHealth {
   readonly orderViews: OrderViewMetrics;
   /** `allocation.ts` — the §9.7 commitment book behind §9.8 checks 14 and 15. */
   readonly allocator: AllocatorMetrics;
+  /**
+   * `TRDR-4` — the loop's per-order state: live owned orders, settled ones,
+   * the bounded tombstone map, and the fills whose owner lookup missed
+   * (`order-lifecycle.ts`).
+   *
+   * OPTIONAL ON THIS TYPE ONLY, and deliberately: `HealthState.snapshot` is also
+   * called by holders of no loop (unit fixtures that build the five original
+   * seams), and a counter this class invented for them would be a zero nobody
+   * measured. `CoreLoop.health()` ALWAYS supplies it (its return type,
+   * `LoopHealthSnapshot`, says so), and the control API's strict door REQUIRES
+   * it — so a producer that omits it is refused at the door, never defaulted.
+   */
+  readonly orders?: OrderLifecycleMetrics;
+  /**
+   * `TRDR-4` — the three in-process audit logs' bounded retention
+   * (`decisions()`, `traces()`, `orderProvenance()`): `retained`,
+   * `maximumRetained`, `evicted` each. Optional on this type for the same
+   * reason as {@link SeamHealth.orders}, and always supplied by the loop.
+   */
+  readonly retention?: RetentionHealth;
 }
 
 export interface HealthSnapshot {
@@ -503,6 +529,10 @@ export class HealthState {
         cancels: input.seams.cancels,
         orderViews: input.seams.orderViews,
         allocator: input.seams.allocator,
+        // `TRDR-4`: carried when the caller measured them, and ABSENT — not
+        // zeroed — when it did not (see `SeamHealth.orders`).
+        ...(input.seams.orders === undefined ? {} : { orders: input.seams.orders }),
+        ...(input.seams.retention === undefined ? {} : { retention: input.seams.retention }),
       }),
       riskSeamCaveat: RISK_SEAM_CAVEAT,
       asOf: input.asOf,

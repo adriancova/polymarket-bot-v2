@@ -72,7 +72,13 @@
  * > GLOBAL/FULL_HALT (review round 1, MEDIUM-1).
  */
 
-import { addDecimal, compareDecimal, mulDecimal, subDecimal } from "@polymarket-bot/decimal";
+import {
+  addDecimal,
+  compareDecimal,
+  isCanonicalDecimalString,
+  mulDecimal,
+  subDecimal,
+} from "@polymarket-bot/decimal";
 import { computeFeatureSnapshot } from "@polymarket-bot/features";
 import { executablePrice } from "@polymarket-bot/order-book";
 import type { Intent } from "@polymarket-bot/domain";
@@ -114,6 +120,16 @@ import { haltOnLedgerProjection, type HaltController } from "./halt.js";
 import type { HealthSnapshot, HealthState } from "./health.js";
 import type { InstanceRegistry, RegisteredInstance } from "./instances.js";
 import type { MarketState } from "./market-state.js";
+import {
+  DEFAULT_RETENTION,
+  OrderTombstones,
+  RetentionLog,
+  UNREADABLE_BOOKED_SHARES,
+  settlementBlocker,
+  type OrderLifecycleMetrics,
+  type RetentionBounds,
+  type RetentionHealth,
+} from "./order-lifecycle.js";
 import { OrderViewTracker, isTerminalStatus, toStrategyOrderView } from "./orders.js";
 import {
   buildPlanningInputs,
@@ -205,6 +221,50 @@ export interface CoreLoopOptions {
    * after each event.
    */
   readonly outbox: DecisionOutboxBuffer;
+  /**
+   * `TRDR-4` — the bounds of the loop's three in-process audit logs and of its
+   * settled-order tombstone map. Every field is optional and defaults to
+   * {@link DEFAULT_RETENTION} (argued there from the scoping census's sizes);
+   * each must be a positive safe integer, and the constructor refuses anything
+   * else. An eviction is counted on `seams.retention` / `seams.orders`.
+   */
+  readonly retention?: RetentionBounds;
+}
+
+/**
+ * `CoreLoop.health()`'s answer: a {@link HealthSnapshot} whose `TRDR-4` seams
+ * are always present. `HealthSnapshot` keeps them optional only for holders of
+ * no loop (see `health.ts`, `SeamHealth.orders`).
+ */
+export type LoopHealthSnapshot = HealthSnapshot & {
+  readonly seams: HealthSnapshot["seams"] & {
+    readonly orders: OrderLifecycleMetrics;
+    readonly retention: RetentionHealth;
+  };
+};
+
+/**
+ * The per-order state `CoreLoop` holds, as sizes — `TRDR-4`'s observation
+ * surface for the bounded-state claim. Every map is keyed by the VENUE's order
+ * id.
+ */
+export interface RetainedOrderState {
+  /** `#orderOwners` — venue order id → owning instance. */
+  readonly owners: number;
+  /** `#instanceOrders` — how many instances still hold an order set. */
+  readonly instanceOrderSets: number;
+  /** `#instanceOrders` — the venue order ids across every instance's set. */
+  readonly instanceOrderIds: number;
+  /** `#orderTraces` — the prunable fill-join LOOKUP (not the provenance log). */
+  readonly traceLookup: number;
+  /** `#bookedShares` — the per-order booked-fill counter. */
+  readonly bookedShares: number;
+  /** Orders retired under R1 but not yet settled. */
+  readonly retiredUnsettled: number;
+  /** `OrderViewTracker` — orders whose last delivered view is remembered. */
+  readonly orderViews: number;
+  /** The settled-order tombstone map (bounded). */
+  readonly tombstones: number;
 }
 
 /**
@@ -281,16 +341,49 @@ export class CoreLoop {
   readonly #fills = new FillDeduplicator({ maximumRemembered: 100_000 });
   readonly #orderViews = new OrderViewTracker();
   readonly #cancels = new CancelLedger();
+  /** Keyed by PLANNED order id (`reservations.ts`). */
   readonly #reservations = new ReservationBook();
+  /** Keyed by PLANNED order id (`pipeline.ts`). */
   readonly #timeInForce = new OrderTimeInForceBook();
   readonly #reference: ReferenceState;
 
-  /** `venueOrderId -> the trace prefix built when its plan was submitted`. */
+  // --- the per-order state (`TRDR-4`) ---------------------------------------
+  //
+  // TWO KEYS, and each map uses its own. The maps below are keyed by the
+  // VENUE's order id — for `SimulatedVenue`, `SimulatedOrder.simulatedOrderId`
+  // — because that is what a fill and an order view name. The three RELEASE
+  // books (`#reservations`, the allocator, `#timeInForce`) are keyed by the
+  // PLANNER's `plannedOrderId`, because they are taken before the venue has
+  // assigned anything. The simulator happens to make the two equal
+  // (`venue.ts`), a real venue will not, and nothing here relies on it.
+  //
+  // Every entry below is created at SUBMISSION and deleted only at SETTLEMENT
+  // (`#settle`): a terminal order, observed at a harvest boundary, whose booked
+  // fill shares equal the venue's `filledShares`, retired under R1, with no
+  // pending cancel naming it. A settled order leaves a bounded tombstone.
+
+  /**
+   * `venueOrderId -> the trace prefix built when its plan was submitted` — the
+   * prunable LOOKUP a fill is joined through. The append-only PROVENANCE LOG
+   * that backs {@link CoreLoop.orderProvenance} is `#provenance`, separately.
+   */
   readonly #orderTraces = new Map<string, Omit<TraceLink, "venueFillId" | "ledgerFillId" | "ledgerTransactionIds">>();
-  /** `instanceId -> venue order ids it owns`, for `ctx.orders()`. */
+  /** `instanceId -> venue order ids it owns and has not settled`, for `ctx.orders()`. */
   readonly #instanceOrders = new Map<string, Set<string>>();
-  /** `venueOrderId -> owning instanceId`, for fill attribution. */
+  /** `venueOrderId -> owning instanceId`, for fill attribution and delivery. */
   readonly #orderOwners = new Map<string, string>();
+  /** `venueOrderId -> the fill shares BOOKED for it`, an exact decimal (condition (b)). */
+  readonly #bookedShares = new Map<string, string>();
+  /** Venue order ids RETIRED under R1 and not yet settled. */
+  readonly #retired = new Set<string>();
+  /** Venue order ids whose settlement mismatch has been COUNTED (once per order). */
+  readonly #mismatched = new Set<string>();
+  /** `venueOrderId -> instanceId` for SETTLED orders, bounded. */
+  readonly #tombstones: OrderTombstones;
+  #settled = 0;
+  #unownedFills = 0;
+  #lateFillsAfterSettlement = 0;
+  #settleMismatches = 0;
 
   #ledger: Ledger;
   #cash: string;
@@ -298,8 +391,18 @@ export class CoreLoop {
   #lastInstant: string;
   #lastEpochMs = 0;
 
-  readonly #traces: TraceLink[] = [];
-  readonly #decisions: DecisionTrace[] = [];
+  /** The §6 invariant 4 chains, in fill order — bounded retention (`TRDR-4`). */
+  readonly #traces: RetentionLog<TraceLink>;
+  /** Every persisted decision, in evaluation order — bounded retention (`TRDR-4`). */
+  readonly #decisions: RetentionLog<DecisionTrace>;
+  /**
+   * Every accepted order's trace prefix, APPEND-ONLY, in submission order —
+   * bounded retention (`TRDR-4`). Split from the prunable `#orderTraces`
+   * lookup so settling an order never shortens the provenance record.
+   */
+  readonly #provenance: RetentionLog<
+    Readonly<Omit<TraceLink, "venueFillId" | "ledgerFillId" | "ledgerTransactionIds">>
+  >;
   #knownFills = 0;
   #seenArrivals = 0;
   #seenUnexplained = 0;
@@ -311,6 +414,11 @@ export class CoreLoop {
    * matters, and a fold from zero over the retained records is exactly the
    * rebuild. The records themselves come from `buildFillPosting`, so they are
    * the ledger's own derivation and not a second accounting.
+   *
+   * NOT BOUNDED by `TRDR-4`, and said so rather than implied: bounding it needs
+   * a snapshot-plus-tail fold that stays byte-identical (§6 invariant 8,
+   * §12.4), which is the queued `LOOPMEM-FOLD` item. The in-memory `Ledger` is
+   * unbounded for the same reason. This loop is therefore NOT memory-bounded.
    */
   readonly #pnlRecords = new Map<string, PnlRecord[]>();
   /** Epoch-millisecond instants of this process's own submissions (§9.8 check 19). */
@@ -329,11 +437,33 @@ export class CoreLoop {
       windowMs: options.config.features.tradeWindowMs,
       maximumPoints: 512,
     });
+    const retention = options.retention ?? {};
+    this.#decisions = new RetentionLog({
+      name: "decision",
+      maximumRetained: retention.decisions ?? DEFAULT_RETENTION.decisions,
+    });
+    this.#traces = new RetentionLog({
+      name: "trace",
+      maximumRetained: retention.traces ?? DEFAULT_RETENTION.traces,
+    });
+    this.#provenance = new RetentionLog({
+      name: "order provenance",
+      maximumRetained: retention.provenance ?? DEFAULT_RETENTION.provenance,
+    });
+    this.#tombstones = new OrderTombstones({
+      maximumRemembered: retention.tombstones ?? DEFAULT_RETENTION.tombstones,
+    });
   }
 
-  /** The §6 invariant 4 chains this run produced, in fill order. */
+  /**
+   * The §6 invariant 4 chains this run produced, in fill order.
+   *
+   * `TRDR-4`: the RETAINED WINDOW — the newest `maximumRetained` chains, oldest
+   * first; `seams.retention.traces.evicted` counts what fell out of it. The
+   * default bound is far above every fixture, so no fixture sees an eviction.
+   */
   traces(): readonly TraceLink[] {
-    return Object.freeze([...this.#traces]);
+    return Object.freeze(this.#traces.entries());
   }
 
   /**
@@ -347,18 +477,50 @@ export class CoreLoop {
    * all; this is the record that names such an order's origin by id
    * (`RECON-2`). Read-only: each entry is a fresh frozen copy in a fresh frozen
    * list, so nothing a caller does to the answer reaches the loop.
+   *
+   * `TRDR-4`: read from the APPEND-ONLY provenance log, which settling an order
+   * never touches, and it returns the RETAINED WINDOW — the newest
+   * `maximumRetained` records, oldest first; `seams.retention.provenance`
+   * counts evictions. The default bound is far above every fixture.
    */
   orderProvenance(): readonly Readonly<
     Omit<TraceLink, "venueFillId" | "ledgerFillId" | "ledgerTransactionIds">
   >[] {
     return Object.freeze(
-      [...this.#orderTraces.values()].map((prefix) => Object.freeze({ ...prefix })),
+      this.#provenance.entries().map((prefix) => Object.freeze({ ...prefix })),
     );
   }
 
-  /** Every persisted decision, in evaluation order. */
+  /**
+   * Every persisted decision, in evaluation order.
+   *
+   * `TRDR-4`: the RETAINED WINDOW — the newest `maximumRetained` decisions,
+   * oldest first; `seams.retention.decisions.evicted` counts what fell out.
+   * The durable store receives every decision regardless (the outbox), so a
+   * bound here shortens only this in-process accessor.
+   */
   decisions(): readonly DecisionTrace[] {
-    return Object.freeze([...this.#decisions]);
+    return Object.freeze(this.#decisions.entries());
+  }
+
+  /**
+   * The sizes of the loop's per-order maps (`TRDR-4`). Read-only numbers; the
+   * observation surface for "the per-order state tracks WORKING orders, not
+   * history" — see {@link RetainedOrderState}.
+   */
+  retainedOrderState(): RetainedOrderState {
+    let instanceOrderIds = 0;
+    for (const owned of this.#instanceOrders.values()) instanceOrderIds += owned.size;
+    return Object.freeze({
+      owners: this.#orderOwners.size,
+      instanceOrderSets: this.#instanceOrders.size,
+      instanceOrderIds,
+      traceLookup: this.#orderTraces.size,
+      bookedShares: this.#bookedShares.size,
+      retiredUnsettled: this.#retired.size,
+      orderViews: this.#orderViews.metrics().tracked,
+      tombstones: this.#tombstones.size,
+    });
   }
 
   /** The §9.16 records one instance's stream has accumulated, in order. */
@@ -407,7 +569,20 @@ export class CoreLoop {
    * rested on them ("`evictions > 0` on the health surface says so") were
    * false. This method is the caller.
    */
-  health(): HealthSnapshot {
+  health(): LoopHealthSnapshot {
+    const orders: OrderLifecycleMetrics = Object.freeze({
+      tracked: this.#orderOwners.size,
+      settled: this.#settled,
+      ...this.#tombstones.metrics(),
+      unownedFills: this.#unownedFills,
+      lateFillsAfterSettlement: this.#lateFillsAfterSettlement,
+      settleMismatches: this.#settleMismatches,
+    });
+    const retention: RetentionHealth = Object.freeze({
+      decisions: this.#decisions.metrics(),
+      traces: this.#traces.metrics(),
+      provenance: this.#provenance.metrics(),
+    });
     return this.#options.health.snapshot({
       asOf: this.#lastInstant,
       halts: this.#options.halts.records(),
@@ -418,8 +593,13 @@ export class CoreLoop {
         cancels: this.#cancels.metrics(),
         orderViews: this.#orderViews.metrics(),
         allocator: this.#options.allocator.metrics(),
+        orders,
+        retention,
       },
-    });
+      // The cast narrows only what was supplied on the line above: both
+      // `TRDR-4` seams are passed, and `HealthState.snapshot` carries every
+      // seam it is given.
+    }) as LoopHealthSnapshot;
   }
 
   /**
@@ -894,13 +1074,23 @@ export class CoreLoop {
     return Object.freeze({ yesShares, noShares, asOf: instant });
   }
 
-  /** This instance's own working orders, for `ctx.orders()` (§7.6). */
+  /**
+   * This instance's own working orders, for `ctx.orders()` (§7.6).
+   *
+   * `TRDR-4` (ruling R1): its WORKING orders plus its terminal orders that are
+   * not yet RETIRED — a terminal order stays visible here until one delivery of
+   * its terminal view was evaluated (so an immediate order that is terminal
+   * before any tick is still seen), and is excluded from then on. Until R1 this
+   * returned every order the instance had ever placed, terminal ones included,
+   * contradicting the SDK's "one of this instance's own working orders".
+   */
   #orderViews_(instance: RegisteredInstance, instant: string): readonly StrategyOrderView[] {
     const owned = this.#instanceOrders.get(instance.instanceId);
     if (owned === undefined) return Object.freeze([]);
     const views: StrategyOrderView[] = [];
     for (const order of this.#options.venue.ordersSnapshot()) {
       if (!owned.has(order.simulatedOrderId)) continue;
+      if (this.#retired.has(order.simulatedOrderId)) continue;
       views.push(
         toStrategyOrderView(order, { marketId: instance.marketId, placedAt: instant }),
       );
@@ -970,7 +1160,7 @@ export class CoreLoop {
     outcome: Extract<EvaluationOutcome, { kind: "DECIDED" | "CONTAINED" }>,
     eventId: string,
   ): void {
-    this.#decisions.push(
+    this.#decisions.append(
       Object.freeze({
         instanceId: instance.instanceId,
         runId: instance.runId,
@@ -1242,10 +1432,22 @@ export class CoreLoop {
       if (!reserved.ok) {
         // §9.10 is "reserve BEFORE submission", so a reservation the allocator
         // refuses is a plan that is NOT submitted. Nothing was applied — the
-        // gate applies a plan's legs all or none — so nothing needs releasing.
-        // The refusal CODES are counted by the gate itself
+        // gate applies a plan's legs all or none — so no RESERVATION needs
+        // releasing. The refusal CODES are counted by the gate itself
         // (`seams.allocator.refusalsByCode`), so this process has exactly one
         // authority on what the allocator said.
+        //
+        // `TRDR-4`: the TIME-IN-FORCE entries recorded above DO need releasing.
+        // They were recorded per planned order before the allocator was asked,
+        // and these planned orders never reach the venue — so no terminal view
+        // will ever release them, and every refused plan used to leak one
+        // entry per planned order into `#timeInForce` for the life of the
+        // process. Keyed by the PLANNED order id, as they were recorded.
+        for (const group of placement.groups) {
+          for (const order of group.orders) {
+            this.#timeInForce.release(order.plannedOrderId);
+          }
+        }
         this.#options.health.countExecution("allocationsRefused");
         return;
       }
@@ -1277,23 +1479,7 @@ export class CoreLoop {
         if (resolution !== undefined) this.#options.health.countExecution("cancelsRejected");
         return;
       }
-      // --- the refused submission RELEASES what it reserved -----------------
-      // Review round 1, MEDIUM-4. A refused submission produces NO order and
-      // therefore no order view, and the only release path was
-      // `#deliverOrderViews`'s terminal-status arm — so the reservation stayed
-      // taken FOREVER. `reserved` grew monotonically, understating
-      // `availableCollateral` on the planning surface and the unreserved
-      // balance on the strategy's `riskBudget`, until entries starved with no
-      // visible cause. The venue said no; the capacity comes back.
-      for (const group of placement.groups) {
-        for (const order of group.orders) {
-          if (this.#reservations.releaseForOrder(order.plannedOrderId)) {
-            this.#options.health.countExecution("reservationsReleasedOnRefusal");
-          }
-          this.#options.allocator.release(order.plannedOrderId);
-          this.#timeInForce.release(order.plannedOrderId);
-        }
-      }
+      this.#releaseRefusedPlacement(placement, result, input.instant);
       return;
     }
     this.#options.health.countExecution("submissionsAccepted");
@@ -1309,11 +1495,14 @@ export class CoreLoop {
     }
 
     for (const order of result.orders) {
+      // Every per-order entry is keyed by the VENUE's order id (see the field
+      // comments), created here and deleted only by `#settle`.
       this.#orderOwners.set(order.simulatedOrderId, input.instance.instanceId);
       const owned = this.#instanceOrders.get(input.instance.instanceId) ?? new Set<string>();
       owned.add(order.simulatedOrderId);
       this.#instanceOrders.set(input.instance.instanceId, owned);
-      this.#orderTraces.set(order.simulatedOrderId, {
+      this.#bookedShares.set(order.simulatedOrderId, "0");
+      const prefix = Object.freeze({
         sourceEventId: input.eventId,
         featureSnapshotRef: input.featureSnapshotRef,
         runId: input.instance.runId,
@@ -1324,6 +1513,111 @@ export class CoreLoop {
         submissionAttemptId,
         venueOrderId: order.simulatedOrderId,
       });
+      // The prunable fill-join LOOKUP, and the append-only PROVENANCE LOG: the
+      // same prefix, two lifetimes (`TRDR-4`).
+      this.#orderTraces.set(order.simulatedOrderId, prefix);
+      this.#provenance.append(prefix);
+    }
+  }
+
+  /**
+   * A REFUSED placement returns what it reserved — for every planned order the
+   * venue does NOT hold — and keeps it for every order the venue DOES hold.
+   *
+   * Review round 1, MEDIUM-4: the only release path used to be
+   * `#deliverOrderViews`'s terminal-status arm, and a refused plan has no owned
+   * order to deliver, so its reservation stayed taken FOREVER — `reserved` grew
+   * monotonically, understating `availableCollateral` on the planning surface
+   * and the unreserved balance on the strategy's `riskBudget`, until entries
+   * starved with no visible cause. The venue said no; the capacity comes back.
+   *
+   * `TRDR-4` round 1 (finding TRDR4-R1): a refusal is NOT proof that nothing
+   * was placed, and releasing EVERY planned order's entries freed the capital,
+   * the inventory and the time-in-force of an order still WORKING at the venue
+   * — which ADR-006 §9 forbids (never released before terminal). The
+   * simulator books a plan's orders one at a time and, when a later one fails
+   * (its rate-limit budget, a duplicate id, an execution refusal —
+   * `SimulatedVenue`'s `#submitSync`), refuses the WHOLE plan with
+   * `orders: []` while the earlier orders stay in its book: RESTING,
+   * PARTIALLY_FILLED, or already terminal. A real venue can answer the same
+   * way. So each planned order is looked up in the venue's OWN order state (and
+   * in the refused answer's `orders`), by its PLANNED order id — the key all
+   * three books use:
+   *
+   * - the venue holds NO order under that id: it was never placed, and its
+   *   reservation, allocator commitment and time-in-force are released now;
+   * - the venue HOLDS one, in any state: all three are KEPT. The harvest-
+   *   boundary release (`#releaseSettledReservations`, which walks every venue
+   *   order, owned or not) returns them at the first harvest that sees the
+   *   order terminal, after that harvest's fills are booked — the same rule
+   *   and the same moment as for an owned order, so nothing is released before
+   *   terminal and nothing before the position that replaces it exists.
+   *
+   * And a plan the venue PARTLY EXECUTED is a reconciliation question (§6
+   * invariant 6: an unknown submission is never a silent retry). The answer
+   * named no order, so no instance owns the held ones: no owner entry, no
+   * `onOrderUpdate`, no `ctx.orders()` view, and a fill of theirs is booked
+   * UNATTRIBUTED (`#bookUnownedFill`). The market each held order trades is
+   * halted NOW — `UNATTRIBUTED_ACTIVITY`, whose §9.9 action is
+   * `RECONCILE_ACCOUNT` — before any later decision of this iteration can plan
+   * against it, rather than waiting for a fill that a resting order may never
+   * produce. Nothing is dropped and nothing is attributed.
+   */
+  #releaseRefusedPlacement(
+    placement: PlacementPlan,
+    result: ExecutionResult,
+    instant: string,
+  ): void {
+    const plannedOrderIds: string[] = [];
+    for (const group of placement.groups) {
+      for (const order of group.orders) plannedOrderIds.push(order.plannedOrderId);
+    }
+    const planned = new Set(plannedOrderIds);
+    // Keyed by the PLANNED order id: the venue's `simulatedOrderId` is its own
+    // id for the order and is only coincidentally equal in the simulator. Both
+    // sources count as evidence the venue holds an order — the refused answer's
+    // own `orders` (empty from the simulator's `#refuse`, but a venue may list
+    // what it did book) and the venue's order state, which is read last so its
+    // fresher view wins — because keeping an entry is the fail-closed side.
+    const venueHeld = new Map<string, SimulatedOrder>();
+    for (const order of [...result.orders, ...this.#options.venue.ordersSnapshot()]) {
+      if (planned.has(order.plannedOrderId)) venueHeld.set(order.plannedOrderId, order);
+    }
+    const held = plannedOrderIds.flatMap((plannedOrderId) => {
+      const order = venueHeld.get(plannedOrderId);
+      return order === undefined ? [] : [order];
+    });
+
+    for (const plannedOrderId of plannedOrderIds) {
+      if (venueHeld.has(plannedOrderId)) continue;
+      if (this.#reservations.releaseForOrder(plannedOrderId)) {
+        this.#options.health.countExecution("reservationsReleasedOnRefusal");
+      }
+      this.#options.allocator.release(plannedOrderId);
+      this.#timeInForce.release(plannedOrderId);
+    }
+    if (held.length === 0) return;
+
+    const described = held
+      .map(
+        (order) =>
+          `${order.simulatedOrderId} (planned ${order.plannedOrderId}) ${order.state} ` +
+          `${order.filledShares}/${order.requestedShares}`,
+      )
+      .join(", ");
+    const refusal = `${result.refusalCode ?? "VENUE_REFUSED"}: ${result.refusalMessage ?? "the venue refused the plan"}`;
+    for (const marketId of [...new Set(held.map((order) => order.marketId))].sort()) {
+      this.#options.halts.halt(
+        { kind: "MARKET", marketId },
+        "UNATTRIBUTED_ACTIVITY",
+        `plan ${placement.executionPlanId} was refused (${refusal}), yet the venue holds ` +
+          `${String(held.length)} of its ${String(plannedOrderIds.length)} planned orders — ` +
+          `partly executed and then refused: ${described}. No instance owns them; their ` +
+          "reservations, allocator commitments and time-in-force are KEPT until each is " +
+          "terminal, and any fill of theirs is booked UNATTRIBUTED; reconcile the account " +
+          "(§6 invariant 6, TRDR-4)",
+        instant,
+      );
     }
   }
 
@@ -1334,8 +1628,17 @@ export class CoreLoop {
    * ORDER MATTERS AND IS THE OBLIGATION. EVERY fill of this harvest is booked
    * FIRST, so that by the time any `onFill` runs the position view already
    * includes the fill the evaluation is about (`WP-220` obligation 3) — and, if
-   * two fills arrive together, both of them. The order views are delivered too,
-   * on every harvest and including repeats (obligations 4 and 5).
+   * two fills arrive together, both of them. The order views are delivered
+   * last, under ruling R1 (obligations 4 and 5; see `#deliverOrderViews`).
+   *
+   * A FILL IS NEVER SKIPPED (`TRDR-4`, §6 invariant 7). A fill whose owner
+   * lookup misses — an order this process never placed (for example the early
+   * order of a plan the venue partly executed and then refused), a SETTLED
+   * order, one evicted from the tombstone map, or an owner the registry does
+   * not hold — is posted UNATTRIBUTED and halts its market through the ledger
+   * projection (`#bookUnownedFill`). It used to be dropped here with a bare
+   * `continue`, AFTER the deduplicator had spent its id: no posting, no
+   * counter, no halt.
    */
   async #harvestFills(instant: string): Promise<void> {
     const fills = this.#options.venue.fills;
@@ -1352,9 +1655,13 @@ export class CoreLoop {
         continue;
       }
 
-      const instanceId = this.#orderOwners.get(fill.simulatedOrderId);
-      const instance = instanceId === undefined ? undefined : this.#options.registry.get(instanceId);
-      if (instance === undefined) continue;
+      const ownerId = this.#orderOwners.get(fill.simulatedOrderId);
+      const instance = ownerId === undefined ? undefined : this.#options.registry.get(ownerId);
+      if (instance === undefined) {
+        const unowned = await this.#bookUnownedFill(fill, ownerId, instant);
+        if (unowned === "STORE_UNAVAILABLE") return;
+        continue;
+      }
 
       const posted = postFill({
         ledger: this.#ledger,
@@ -1378,6 +1685,7 @@ export class CoreLoop {
         continue;
       }
       this.#ledger = posted.ledger;
+      this.#countBookedShares(fill);
       this.#options.health.countAccounting("ledgerTransactions", posted.appended.length);
       this.#options.health.countAccounting("pnlRecords", posted.pnlRecords.length);
       this.#cash = cashAfter(this.#cash, fill);
@@ -1416,41 +1724,9 @@ export class CoreLoop {
 
       // The WP-200 composition-root obligation: read BOTH accounting sections
       // of the projection and halt the affected market on either.
-      const projection = projectionOf(this.#ledger);
-      const arrivals = projection.unattributedActivity.filter(
-        (record) => record.activityKind === "ACTUAL_ARRIVAL",
-      ).length;
-      if (arrivals > this.#seenArrivals) {
-        this.#options.health.countAccounting(
-          "unattributedActivity",
-          arrivals - this.#seenArrivals,
-        );
-        this.#seenArrivals = arrivals;
-      }
-      const unexplained = projection.unexplainedMovements.length;
-      if (unexplained > this.#seenUnexplained) {
-        this.#options.health.countAccounting(
-          "unexplainedMovements",
-          unexplained - this.#seenUnexplained,
-        );
-        this.#seenUnexplained = unexplained;
-      }
-      // The WP-200 composition-root obligation: BOTH sections read together,
-      // and either one halts the affected market (§9.9 says halting is the
-      // composition root's act, and this is that act).
-      haltOnLedgerProjection(this.#options.halts, projection, instant);
+      this.#readProjection(instant);
 
-      const prefix = this.#orderTraces.get(fill.simulatedOrderId);
-      if (prefix !== undefined) {
-        this.#traces.push(
-          Object.freeze({
-            ...prefix,
-            venueFillId: fill.simulatedFillId,
-            ledgerFillId: posted.ledgerFillId,
-            ledgerTransactionIds: posted.ledgerTransactionIds,
-          }),
-        );
-      }
+      this.#traceFill(fill, posted.ledgerFillId, posted.ledgerTransactionIds);
 
       // §9.16: the PnL projection follows the posting, from the SAME records the
       // ledger derived. A refusal here is not a halt — PnL is a projection, and
@@ -1505,8 +1781,168 @@ export class CoreLoop {
   }
 
   /**
+   * Books a fill whose owner lookup MISSED — `TRDR-4` item 3, §6 invariant 7:
+   * "Unexplained activity goes to `UNATTRIBUTED` and halts the affected market."
+   *
+   * The fill is posted with NO claims, so `packages/ledger`'s `allocateFill`
+   * places all of it in `UNATTRIBUTED` with `haltRequired: true`; the
+   * projection then carries an `ACTUAL_ARRIVAL`, and `haltOnLedgerProjection`
+   * latches the existing MARKET `UNATTRIBUTED_ACTIVITY` halt
+   * (`RECONCILE_ACCOUNT`). The money moved at the venue, so the account side
+   * (the ledger, `#cash`, the store) follows it exactly as for an owned fill.
+   *
+   * WHAT IS NOT DONE, deliberately. The fill is attributed to NO instance —
+   * not even the one a tombstone names, whose track is settled and whose trace
+   * prefix is gone (§6 invariant 4); the tombstone only puts the PROBABLE owner
+   * into the halt detail. No allocator cost basis, no instance PnL stream, no
+   * `onFill`. The operator's remedy is a reattribution transaction, which does
+   * not re-raise the halt (`halt.ts`).
+   *
+   * Counted: `seams.orders.unownedFills`, plus `lateFillsAfterSettlement` when
+   * a tombstone matched.
+   */
+  async #bookUnownedFill(
+    fill: SimulatedFill,
+    ownerId: string | undefined,
+    instant: string,
+  ): Promise<"BOOKED" | "REFUSED" | "STORE_UNAVAILABLE"> {
+    const probableOwner =
+      ownerId === undefined ? this.#tombstones.probableOwner(fill.simulatedOrderId) : undefined;
+    this.#unownedFills += 1;
+    if (probableOwner !== undefined) this.#lateFillsAfterSettlement += 1;
+    const why =
+      ownerId !== undefined
+        ? `fill ${fill.simulatedFillId} names order ${fill.simulatedOrderId}, whose owner ` +
+          `${ownerId} is not a registered instance; posted UNATTRIBUTED (TRDR-4)`
+        : probableOwner !== undefined
+          ? `fill ${fill.simulatedFillId} arrived AFTER order ${fill.simulatedOrderId} was ` +
+            `settled; its tombstone names instance ${probableOwner} as the PROBABLE owner, and ` +
+            "the fill is NOT attributed to it; posted UNATTRIBUTED (TRDR-4)"
+          : `fill ${fill.simulatedFillId} names order ${fill.simulatedOrderId}, which this ` +
+            "process does not own — never placed by it (for example the early order of a plan " +
+            "the venue partly executed and then refused), or settled and since evicted from " +
+            "the tombstone map; posted UNATTRIBUTED (TRDR-4)";
+
+    const posted = postFill({
+      ledger: this.#ledger,
+      fill,
+      claims: [],
+      identity: this.#options.posting,
+      ids: this.#options.ids,
+      tokenAssetId:
+        this.#options.tokenAssetIds.get(`${fill.marketId}|${fill.side}`) ?? fill.tokenId,
+    });
+    if (!posted.ok) {
+      this.#options.health.countAccounting("ledgerRefusals");
+      this.#options.halts.halt(
+        { kind: "MARKET", marketId: fill.marketId },
+        "LEDGER_POSTING_REFUSED",
+        `${posted.stage} ${posted.code}: ${posted.detail}; ${why}`,
+        instant,
+      );
+      return "REFUSED";
+    }
+    this.#ledger = posted.ledger;
+    this.#countBookedShares(fill);
+    this.#options.health.countAccounting("ledgerTransactions", posted.appended.length);
+    this.#options.health.countAccounting("pnlRecords", posted.pnlRecords.length);
+    this.#cash = cashAfter(this.#cash, fill);
+
+    for (const appended of posted.appended) {
+      const written = await this.#options.store.appendLedgerTransaction(appended);
+      if (!written.ok) {
+        this.#options.halts.halt(
+          { kind: "GLOBAL" },
+          "STORE_UNAVAILABLE",
+          `the ledger transaction could not be persisted: ${written.failure.detail}`,
+          instant,
+        );
+        return "STORE_UNAVAILABLE";
+      }
+    }
+
+    this.#readProjection(
+      instant,
+      new Map(posted.ledgerTransactionIds.map((transactionId) => [transactionId, why])),
+    );
+    // A trace prefix survives only for an owner the registry does not hold
+    // (the order is still tracked); a settled or unknown order has none.
+    this.#traceFill(fill, posted.ledgerFillId, posted.ledgerTransactionIds);
+    return "BOOKED";
+  }
+
+  /**
+   * The `WP-200` composition-root obligation: read BOTH accounting sections of
+   * the ledger projection, count what is new, and halt the affected market on
+   * either (§9.9 says halting is the composition root's act, and this is that
+   * act). `notes` names what the projection cannot know (an unowned fill's
+   * probable owner) for the halt detail.
+   */
+  #readProjection(instant: string, notes?: ReadonlyMap<string, string>): void {
+    const projection = projectionOf(this.#ledger);
+    const arrivals = projection.unattributedActivity.filter(
+      (record) => record.activityKind === "ACTUAL_ARRIVAL",
+    ).length;
+    if (arrivals > this.#seenArrivals) {
+      this.#options.health.countAccounting("unattributedActivity", arrivals - this.#seenArrivals);
+      this.#seenArrivals = arrivals;
+    }
+    const unexplained = projection.unexplainedMovements.length;
+    if (unexplained > this.#seenUnexplained) {
+      this.#options.health.countAccounting(
+        "unexplainedMovements",
+        unexplained - this.#seenUnexplained,
+      );
+      this.#seenUnexplained = unexplained;
+    }
+    haltOnLedgerProjection(this.#options.halts, projection, instant, notes);
+  }
+
+  /** Completes a fill's §6 invariant 4 chain from its order's prefix, when one is held. */
+  #traceFill(
+    fill: SimulatedFill,
+    ledgerFillId: string,
+    ledgerTransactionIds: readonly string[],
+  ): void {
+    const prefix = this.#orderTraces.get(fill.simulatedOrderId);
+    if (prefix === undefined) return;
+    this.#traces.append(
+      Object.freeze({
+        ...prefix,
+        venueFillId: fill.simulatedFillId,
+        ledgerFillId,
+        ledgerTransactionIds,
+      }),
+    );
+  }
+
+  /**
+   * Adds a BOOKED fill to its order's counter — settlement condition (b). Only
+   * a still-tracked order has a counter; exact decimal arithmetic.
+   *
+   * TOTAL: a quantity that is not a canonical decimal (which `addDecimal`
+   * would throw on) turns the counter UNREADABLE for good, so the order can
+   * never prove (b), is never pruned, and its mismatch is counted.
+   */
+  #countBookedShares(fill: SimulatedFill): void {
+    const booked = this.#bookedShares.get(fill.simulatedOrderId);
+    if (booked === undefined) return;
+    this.#bookedShares.set(
+      fill.simulatedOrderId,
+      isCanonicalDecimalString(booked) && isCanonicalDecimalString(fill.shares)
+        ? addDecimal(booked, fill.shares)
+        : UNREADABLE_BOOKED_SHARES,
+    );
+  }
+
+  /**
    * Releases both reservation books for every order that has reached a terminal
    * state.
+   *
+   * EVERY venue order, owned or not — and that is load-bearing (`TRDR-4` round
+   * 1): it is the only release of the entries `#releaseRefusedPlacement` KEPT
+   * for an order a refused plan nonetheless left at the venue, which no
+   * instance owns and `#deliverOrderViews` therefore never visits.
    *
    * Idempotent: a second call for the same order releases nothing and says so,
    * which is why `#deliverOrderViews` may keep its own call for orders that go
@@ -1605,16 +2041,41 @@ export class CoreLoop {
   }
 
   /**
-   * Delivers an `onOrderUpdate` for every order this process owns.
+   * Delivers `onOrderUpdate` for the orders this process owns, then SETTLES the
+   * retired ones — `WP-220` obligations 4 and 5 under the user's ruling R1
+   * (`TRDR-4`, 2026-09-26).
    *
-   * EVERY order, EVERY harvest, INCLUDING repeats — `WP-220` obligations 4 and
-   * 5. A terminal order also releases its reservation (obligation 9: the
-   * reservation stands until the order can consume no more inventory).
+   * This docstring used to say "EVERY order, EVERY harvest, INCLUDING
+   * repeats", and the loop did exactly that for the life of the process, so
+   * per-event evaluations, persisted decisions and checkpoints grew with every
+   * order ever placed. The rule now:
+   *
+   * - a WORKING order's view is delivered on EVERY harvest, repeats included
+   *   (a cancel race's `OPEN` view still reaches the strategy);
+   * - a TERMINAL order's view is delivered until ONE delivery was EVALUATED —
+   *   the runtime answered `DECIDED`. A delivery the §4.2 halt gate suppressed,
+   *   one whose snapshot could not be computed, or a runtime answer other than
+   *   `DECIDED` (`REFUSED` for a PAUSED instance, `CONTAINED`, `HALTED`) is NOT
+   *   an evaluation and does not count, so the view comes again next harvest;
+   * - after that evaluation the order is RETIRED: never delivered again, and
+   *   out of `ctx.orders()`;
+   * - a terminal order releases its reservation, its allocator commitment and
+   *   its time-in-force at the first harvest that sees it terminal
+   *   (obligation 9: the reservation stands until the order can consume no
+   *   more inventory) — unchanged, and never before terminal (ADR-006 §9).
+   *
+   * Every view is read from ONE `ordersSnapshot()` taken here, at the harvest
+   * boundary — after every fill of this harvest was booked — and every retired
+   * order is offered to `#settle` only after every delivery of the harvest has
+   * run, so a cancel a delivery registered is visible to condition (d).
    */
   async #deliverOrderViews(instant: string): Promise<void> {
-    for (const order of this.#options.venue.ordersSnapshot()) {
+    const boundary = this.#options.venue.ordersSnapshot();
+    for (const order of boundary) {
       const instanceId = this.#orderOwners.get(order.simulatedOrderId);
       if (instanceId === undefined) continue;
+      // R1: a retired order is never delivered again.
+      if (this.#retired.has(order.simulatedOrderId)) continue;
       const instance = this.#options.registry.get(instanceId);
       if (instance === undefined) continue;
       const market = this.#options.markets.get(instance.marketId);
@@ -1624,15 +2085,17 @@ export class CoreLoop {
         placedAt: instant,
       });
       this.#orderViews.deliverable(instance.instanceId, view);
-      if (isTerminalStatus(view.status)) {
+      const terminal = isTerminalStatus(view.status);
+      if (terminal) {
         // BOTH books, at the same moment and on the same key: the order can
         // consume no more inventory and commit no more capital (`allocation.ts`
-        // §"The two reservation books").
+        // §"The two reservation books"). Keyed by the PLANNED order id.
         this.#reservations.releaseForOrder(order.plannedOrderId);
         this.#options.allocator.release(order.plannedOrderId);
         this.#timeInForce.release(order.plannedOrderId);
       }
       if (this.#options.halts.isInstanceHalted(instance.instanceId, instance.marketId)) {
+        // Suppressed, so NOT an evaluation: a terminal view comes again.
         this.#options.health.countLoop("deliveriesSuppressedByHalt");
         continue;
       }
@@ -1649,8 +2112,89 @@ export class CoreLoop {
           eventId: undefined,
         }),
       );
+      // R1: only a DECIDED outcome is an evaluation of the view. REFUSED (a
+      // PAUSED runtime), CONTAINED (the callback failed; its state did not
+      // move) and HALTED (persistence failed) all leave the order deliverable.
+      if (terminal && outcome.kind === "DECIDED") this.#retired.add(order.simulatedOrderId);
       await this.#consumeOutcome(instance, market, outcome, "", instant, this.#lastEpochMs);
     }
+
+    for (const order of boundary) {
+      if (this.#retired.has(order.simulatedOrderId)) this.#settle(order);
+    }
+  }
+
+  /**
+   * Settles one retired order and prunes its per-order state (`TRDR-4`).
+   *
+   * Only when ALL of (a)-(d) hold ({@link settlementBlocker}): (a) terminal in
+   * the view read at this harvest boundary; (b) the fill shares BOOKED for it
+   * equal that view's `filledShares`; (c) retired under R1; (d) no pending
+   * cancel names it. A (b) mismatch is COUNTED once per order and the order is
+   * never pruned while it lasts — a booked-shares shortfall is exactly the
+   * state in which a later fill still needs its owner.
+   *
+   * What is deleted, each by its own key (the VENUE order id): the owner
+   * entry, the fill-join LOOKUP entry (never the provenance log), the id in the
+   * instance's order set (and the set when empty), the order-view tracker's
+   * entry, the booked-shares counter, and the retired flag. What remains is a
+   * bounded tombstone naming the probable owner, so a fill that still arrives
+   * is classified as late rather than unknown — and is booked UNATTRIBUTED
+   * either way.
+   */
+  #settle(order: SimulatedOrder): void {
+    const venueOrderId = order.simulatedOrderId;
+    const instanceId = this.#orderOwners.get(venueOrderId);
+    if (instanceId === undefined) return;
+    const view = toStrategyOrderView(order, { marketId: order.marketId, placedAt: this.#lastInstant });
+    const blocker = settlementBlocker({
+      terminal: isTerminalStatus(view.status),
+      bookedShares: this.#bookedShares.get(venueOrderId) ?? "0",
+      filledShares: view.filledShares,
+      retired: this.#retired.has(venueOrderId),
+      cancelPending: this.#cancelPendingFor(venueOrderId, order.marketId),
+    });
+    if (blocker === "BOOKED_SHARES_MISMATCH") {
+      if (!this.#mismatched.has(venueOrderId)) {
+        this.#mismatched.add(venueOrderId);
+        this.#settleMismatches += 1;
+      }
+      return;
+    }
+    if (blocker !== undefined) return;
+
+    this.#orderOwners.delete(venueOrderId);
+    this.#orderTraces.delete(venueOrderId);
+    const owned = this.#instanceOrders.get(instanceId);
+    if (owned !== undefined) {
+      owned.delete(venueOrderId);
+      if (owned.size === 0) this.#instanceOrders.delete(instanceId);
+    }
+    this.#orderViews.forget(venueOrderId);
+    this.#bookedShares.delete(venueOrderId);
+    this.#retired.delete(venueOrderId);
+    this.#mismatched.delete(venueOrderId);
+    this.#tombstones.remember(venueOrderId, instanceId);
+    this.#settled += 1;
+  }
+
+  /**
+   * Condition (d): does a still-pending cancel name this order?
+   *
+   * A cancel names orders by the VENUE's id (`ctx.orders()`'s `orderId`, which
+   * the planner carries into the plan's scope). A pending cancel with NO order
+   * ids is a scope-wide request for its market (§7.7: "cancel everything in
+   * scope"), and it is read as naming every order of that market — the
+   * conservative reading, which only ever delays a settlement.
+   */
+  #cancelPendingFor(venueOrderId: string, marketId: string): boolean {
+    return this.#cancels
+      .pending()
+      .some((cancel) =>
+        cancel.orderIds.length === 0
+          ? cancel.marketId === marketId
+          : cancel.orderIds.includes(venueOrderId),
+      );
   }
 
   /** Every cancel reaches a terminal fact (`WP-220` obligation 10). */

@@ -1074,14 +1074,16 @@ describe("RECON-2 — an order without a record, or a record a trace contradicts
     // The exit order's RECORD is re-pointed at a distinct re-emission of the
     // reduce (evaluation 18), which resolves, is an exit, and holds no other
     // plan — every order-side rule passes. Only the fill's trace, which still
-    // names evaluation 9, says the record is not the run's.
+    // names evaluation 8, says the record is not the run's. (`TRDR-4`: the
+    // reduce was evaluation 9 until R1 retired the terminal repeat deliveries
+    // that preceded it; the golden's evaluationSeq renumbered 9 → 8.)
     const tampered = withRecordChanged(
       { ...artifact, decisions: [...artifact.decisions, reemitted(marks.reduce, 18)] },
       marks.exitOrder.simulatedOrderId,
       { evaluationSeq: 18 },
     );
     expect(() => buildReconciliation(tampered)).toThrow(
-      /disagrees with order .+'s provenance record on evaluationSeq \(trace 9, provenance 18\)/u,
+      /disagrees with order .+'s provenance record on evaluationSeq \(trace 8, provenance 18\)/u,
     );
   });
 });
@@ -1393,9 +1395,10 @@ describe("RECON-1 r2 — the review's silent mis-attributions are refused", () =
   }
 
   /**
-   * Review R2. The filled emission at evaluation 9 becomes a QUOTE, a separate
+   * Review R2. The filled emission at evaluation 8 becomes a QUOTE, a separate
    * `reduce` decision at evaluation 99 carries the SAME intent id, and the
-   * fill's trace — and now its order's record — still name evaluation 9.
+   * fill's trace — and now its order's record — still name evaluation 8.
+   * (Evaluation 9 before `TRDR-4`'s R1 renumbered the golden.)
    * Classified by id, the QUOTE's fill was accepted as an exit and a cancelled
    * sibling under the QUOTE's plan was reported as an explained exit
    * cancellation. `RECON-2`: the sibling carries the record the loop would
