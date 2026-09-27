@@ -1579,6 +1579,40 @@ export class CoreLoop {
 
     this.#submissionInstants.push(input.epochMs);
     const result = await this.#options.venue.submit(input.plan);
+    this.#absorbVenueAnswer(input, result, submissionAttemptId);
+    // SIM-1 r3 (`SIM1-R3-1`): `submit` is one of the three doors through which
+    // the venue's order state changes (with `observe()` and `observeTrade()`),
+    // and the only one a STRATEGY opens — from an event's evaluation, an
+    // `onFill` or an `onOrderUpdate` alike, every intent reaches the venue
+    // here. A cancel (accepted, PARTIAL or refused) can leave a watched basket
+    // short, so EVERY answer is followed by a judgement, before control goes
+    // back to the decision's next intent (which the risk seam then refuses,
+    // `runStatePermitsIntent` being `!anyHalt`) or to the harvest's next
+    // delivery (which its halt gate suppresses). Free when nothing is watched.
+    this.#judgeBasketWatches(input.instant);
+  }
+
+  /**
+   * Settles one venue answer in this process's books — the cancel registry
+   * for a CANCEL plan; ownership, the refused orders' release and the basket
+   * watch for a placement — exactly as `#submitPlan` always did; it is its own
+   * method so that every branch returns to the ONE judgement that follows it
+   * (SIM-1 r3, `SIM1-R3-1`).
+   */
+  #absorbVenueAnswer(
+    input: {
+      readonly plan: ExecutionPlan;
+      readonly instance: RegisteredInstance;
+      readonly intent: Intent;
+      readonly approvedIntentId: string;
+      readonly evaluationSeq: number;
+      readonly featureSnapshotRef: string;
+      readonly eventId: string;
+      readonly instant: string;
+    },
+    result: ExecutionResult,
+    submissionAttemptId: string,
+  ): void {
     if (!result.accepted) {
       this.#options.health.countExecution("submissionsRefused");
       if (input.plan.planKind === "CANCEL") {
@@ -1803,12 +1837,18 @@ export class CoreLoop {
    * order at `matchableAtNs`, O5; a GTD at its expiry, O4). The basket is
    * therefore judged from EACH ORDER'S OWN outcome
    * ({@link judgeBasketExecution}): now, from the venue's answer; and, while
-   * any of its orders can still execute, again wherever an order's outcome can
-   * change before a decision reads it — right after `observe()` and after
-   * `observeTrade()` (where DELAYED dispositions and expiries are applied) and
-   * in the harvest before anything is delivered (cancels, fills). So the halt
-   * lands BEFORE the strategy is evaluated for a market whose basket has just
-   * gone short.
+   * any of its orders can still execute, again after EVERY door through which
+   * the venue's order state can change — right after `observe()` and after
+   * `observeTrade()` (where DELAYED dispositions and expiries are applied), and
+   * right after every `submit()` answer (`#submitPlan`: a cancel a strategy
+   * emitted from an event's evaluation, an `onFill` or an `onOrderUpdate`,
+   * whether the venue accepted it, cancelled part of it or refused it; SIM-1
+   * r3, `SIM1-R3-1`) — plus once in the harvest before anything is delivered.
+   * So the halt lands BEFORE the strategy is evaluated again for a market
+   * whose basket has just gone short, and before the next intent of the same
+   * decision is routed: that intent meets the risk seam's run-state check
+   * (`runStatePermitsIntent` is `!anyHalt`), and the harvest's next delivery
+   * meets its halt gate.
    *
    * WHAT THIS DOES NOT TOUCH. Ownership (`#ownBookedOrders` ran first) and the
    * release rules: a booked order keeps its reservation, allocator commitment
@@ -2031,7 +2071,10 @@ export class CoreLoop {
     // nothing is released before the position that replaces it exists.
     this.#releaseSettledReservations();
     // SIM-1 r2 (`SIM1-R2-1`): a cancel or a fill of this iteration can leave a
-    // watched basket short; judged before anything below is delivered.
+    // watched basket short; judged before anything below is delivered. Since
+    // r3 (`SIM1-R3-1`) every venue door is judged at its own answer, so this
+    // is the BACKSTOP: kept because the deliveries below evaluate strategies,
+    // and a venue whose state moved some other way must not reach them first.
     this.#judgeBasketWatches(instant);
 
     for (const delivery of booked) {
