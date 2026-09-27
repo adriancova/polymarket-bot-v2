@@ -53,7 +53,13 @@ import {
   subDecimal,
 } from "@polymarket-bot/decimal";
 
-import type { ArtifactFill, PaperRunArtifact } from "./artifact.js";
+import type {
+  ArtifactDecision,
+  ArtifactFill,
+  ArtifactIntent,
+  ArtifactOrder,
+  PaperRunArtifact,
+} from "./artifact.js";
 
 /** The closed set of mechanisms a difference may be attributed to. */
 export const MECHANISMS = {
@@ -280,6 +286,405 @@ function sum(values: readonly string[]): string {
   return values.reduce((total, value) => addDecimal(total, value), "0");
 }
 
+// --- attribution: which fills and orders are the ENTRY's, which an EXIT's ----
+
+/**
+ * The §7.5 decision types whose intents CLOSE what the entry opened.
+ *
+ * `exit` is the bracket's take-profit and `reduce` is §13.3's protective
+ * reduction. No other type owns an exit: `quote`, `hold`, `skip` and `cancel`
+ * are not exits, and an intent of theirs that reaches a fill is refused below
+ * rather than assigned to either side.
+ */
+const EXIT_DECISION_TYPES: ReadonlySet<string> = new Set(["exit", "reduce"]);
+
+/** What {@link attributeByChain} proved, by id, about every fill and order. */
+interface ChainAttribution {
+  readonly entry: ArtifactDecision;
+  readonly entryIntent: ArtifactIntent;
+  readonly entryFills: readonly ArtifactFill[];
+  readonly exitFills: readonly ArtifactFill[];
+  /** Every order attributed to an exit — by its trace, or by the unfilled-order rule. */
+  readonly exitOrderIds: ReadonlySet<string>;
+}
+
+function describeIntent(intent: ArtifactIntent): string {
+  return `${intent.type} ${intent.intentId ?? "(no intentId)"}`;
+}
+
+function describeCandidates(
+  candidates: readonly { readonly decision: ArtifactDecision; readonly intent: ArtifactIntent }[],
+): string {
+  return candidates.length === 0
+    ? "none"
+    : candidates
+        .map(
+          ({ decision, intent }) =>
+            `${describeIntent(intent)} of the \`${decision.decisionType}\` decision at ` +
+            `evaluationSeq ${String(decision.evaluationSeq)}`,
+        )
+        .join("; ");
+}
+
+/**
+ * Attributes EVERY fill and EVERY order of the run to the entry or to an exit,
+ * positively and by id, or throws (`RECON-1`, closing `RISK2-R3`).
+ *
+ * ## The chain, on both sides
+ *
+ * `RISK-2` attributed the ENTRY by id down the artefact's own §6 invariant 4
+ * chain — intent → trace → execution plan → order → fill — and then defined the
+ * EXIT as everything else. The complement is exact for a run whose only fills
+ * are one entry's and its exits', and wrong for anything more: a second entry's
+ * purchase, or a fill no chain accounts for at all, would have been summed into
+ * `exitProceeds` and reconciled as a sale. The exit is now walked down the SAME
+ * chain from the intents of the `exit` and `reduce` decisions, and a fill that
+ * neither walk reaches is REFUSED, by name. It is never assigned to a side for
+ * not being the other one. The walk never reads `action`, which would break on
+ * the complement leg where an entry SELLS and its exit BUYS.
+ *
+ * ## One bracket, and why a second one is refused rather than reconciled
+ *
+ * Option (b) of the two `RECON-1` offered, deliberately. Every row this module
+ * emits is a ONE-BRACKET quantity with no bracket dimension: the `entry.*` rows
+ * compare one intent's `targetShares`, `maximumTotalCost` and `expectedNetEdge`
+ * with one set of fills; `exit.expected_net_edge` is that one intent's
+ * projection; the `ledger.*` rows read instance-wide balances and the `pnl.*`
+ * rows read the LAST snapshot, both of which are cumulative over every bracket
+ * the instance ever ran. Reconciling several brackets (option (a)) would need
+ * bracket-scoped row ids, per-bracket ledger and PnL checkpoints the artefact
+ * does not carry, and a rule pairing each exit with the entry it closes — and
+ * the artefact holds NO id from an exit intent to its entry, so that pairing
+ * would be a timing policy invented here, not a chain read from the run. That
+ * is a redesign of the table, and the first two-bracket scenario is the right
+ * place for it. Until then a run with more than one `enter` decision, or with
+ * more than one order-placing intent in its entry decision, is refused: what
+ * is not acceptable is silently reading only the first.
+ *
+ * ## Unfilled orders, which have NO trace
+ *
+ * `apps/trader/src/loop.ts` records a trace per FILL (`#harvestFills`), so an
+ * order that never filled has no trace, and nothing in the artefact links it to
+ * its intent by id. The golden's withdrawn take-profit is exactly such an order.
+ * Such an order is attributed by a CLOSED-WORLD rule rather than by complement:
+ * the loop mints ONE execution plan per approved intent evaluation (§8.1 step
+ * 8, in `#routeIntent`), and a trace names the evaluation it came from —
+ * `(runId, evaluationSeq, intentId)` — so an order under a plan that no trace
+ * names can only have been placed by an order-placing intent EMISSION that no
+ * trace names. (Emissions, not ids: §9.8 check 18's duplicate guard remembers
+ * only the last 256 ids, so an id alone does not prove a single plan.) It is an
+ * EXIT order when EVERY such emission belongs to an `exit` or `reduce` decision
+ * AND there are at least as many of them as there are untraced plans. Otherwise its side cannot be established from this
+ * document, and the reconciliation refuses rather than guess — which is what
+ * keeps an ENTRY order cancelled unfilled from being reported under
+ * `exit.cancelled_proceeds.*`. An untraced order that reports filled shares is
+ * refused outright: its fills should have traces.
+ */
+function attributeByChain(
+  artifact: Omit<PaperRunArtifact, "reconciliation">,
+): ChainAttribution {
+  // --- one entry decision, one entry intent ---------------------------------
+  const entries = artifact.decisions.filter((decision) => decision.decisionType === "enter");
+  const entry = entries[0];
+  if (entry === undefined) {
+    throw new Error(
+      "the run produced no entry decision; the reconciliation has nothing to compare and " +
+        "refuses to report an empty table as a passing one",
+    );
+  }
+  if (entries.length > 1) {
+    throw new Error(
+      `the run holds ${String(entries.length)} \`enter\` decisions (evaluationSeq ` +
+        `${entries.map((decision) => String(decision.evaluationSeq)).join(", ")}), and this ` +
+        "table has ONE bracket's shape — one set of entry.* rows, one cost cap, one expected " +
+        "net edge. Reconciling the first would leave every other entry's fills to be counted " +
+        "as something they are not, so the reconciliation refuses instead of reading only the " +
+        "first",
+    );
+  }
+  const entryIntent = entry.intents.find((intent) => intent.type === "POSITION");
+  if (entryIntent === undefined) {
+    throw new Error("the entry decision emitted no POSITION intent");
+  }
+  const placing = entry.intents.filter((intent) => intent.type !== "CANCEL");
+  if (placing.length > 1) {
+    throw new Error(
+      `the entry decision (evaluationSeq ${String(entry.evaluationSeq)}) emitted ` +
+        `${String(placing.length)} order-placing intents (${placing.map(describeIntent).join(", ")}); ` +
+        "one bracket has one entry intent, and reconciling the first would leave the others' " +
+        "fills unattributed",
+    );
+  }
+  const entryIntentId = entryIntent.intentId;
+  if (entryIntentId === undefined) {
+    throw new Error(
+      "the entry POSITION intent carries no intentId, so no fill can be attributed to it by id",
+    );
+  }
+
+  const fills = artifact.fills;
+  if (fills.length === 0) {
+    throw new Error("the run produced no fill; there is nothing realized to reconcile against");
+  }
+
+  // --- the exit intents, by the decision that emitted them ------------------
+  const exitIntentIds = new Set(
+    artifact.decisions
+      .filter((decision) => EXIT_DECISION_TYPES.has(decision.decisionType))
+      .flatMap((decision) => decision.intents)
+      .flatMap((intent) => (intent.intentId === undefined ? [] : [intent.intentId])),
+  );
+  if (exitIntentIds.has(entryIntentId)) {
+    throw new Error(
+      `intent ${entryIntentId} is emitted by the entry decision AND by an exit or reduce ` +
+        "decision, so its fills would count on both sides",
+    );
+  }
+
+  // --- plan → intent, from the traces ---------------------------------------
+  const intentOfPlan = new Map<string, string>();
+  for (const trace of artifact.traces) {
+    const known = intentOfPlan.get(trace.executionPlanId);
+    if (known !== undefined && known !== trace.intentId) {
+      throw new Error(
+        `execution plan ${trace.executionPlanId} is traced to two intents, ${known} and ` +
+          `${trace.intentId}; one plan serves one approved intent, so its orders cannot be ` +
+          "attributed to a single side",
+      );
+    }
+    intentOfPlan.set(trace.executionPlanId, trace.intentId);
+  }
+  const ordersUnder = (plans: ReadonlySet<string>): Set<string> =>
+    new Set(
+      artifact.orders
+        .filter((order) => plans.has(order.executionPlanId))
+        .map((order) => order.simulatedOrderId),
+    );
+  const entryOrderIds = ordersUnder(
+    new Set(
+      artifact.traces
+        .filter((trace) => trace.intentId === entryIntentId)
+        .map((trace) => trace.executionPlanId),
+    ),
+  );
+  const exitOrderIds = ordersUnder(
+    new Set(
+      artifact.traces
+        .filter((trace) => exitIntentIds.has(trace.intentId))
+        .map((trace) => trace.executionPlanId),
+    ),
+  );
+  const onBothSides = [...entryOrderIds].filter((orderId) => exitOrderIds.has(orderId));
+  if (onBothSides.length > 0) {
+    throw new Error(
+      `order ${onBothSides.join(", ")} is reached from the entry's chain AND from an exit's; ` +
+        "an order id names one order, placed under one plan",
+    );
+  }
+
+  // --- every fill: the entry's, an exit's, or refused -----------------------
+  const entryFills = fills.filter((fill) => entryOrderIds.has(fill.simulatedOrderId));
+  const exitFills = fills.filter((fill) => exitOrderIds.has(fill.simulatedOrderId));
+  const unattributed = fills.filter(
+    (fill) =>
+      !entryOrderIds.has(fill.simulatedOrderId) && !exitOrderIds.has(fill.simulatedOrderId),
+  );
+  if (unattributed.length > 0) {
+    throw new Error(
+      `fill ${unattributed.map((fill) => fill.simulatedFillId).join(", ")} (order ` +
+        `${unattributed.map((fill) => fill.simulatedOrderId).join(", ")}) belongs to neither ` +
+        "the entry's chain nor any exit's: no trace from the entry intent or from an exit or " +
+        "reduce decision's intent reaches its order. Counting it as exit proceeds because it " +
+        "is not the entry's is the error this refusal exists to prevent",
+    );
+  }
+  if (entryFills.length === 0) {
+    throw new Error(
+      "no fill could be attributed to the entry intent through the trace chain; the entry rows " +
+        "would compare against an empty set and are refused rather than reported as reconciled",
+    );
+  }
+
+  // --- every order: the entry's, an exit's, or refused ----------------------
+  const tracedElsewhere = artifact.orders.filter(
+    (order) =>
+      intentOfPlan.has(order.executionPlanId) &&
+      !entryOrderIds.has(order.simulatedOrderId) &&
+      !exitOrderIds.has(order.simulatedOrderId),
+  );
+  if (tracedElsewhere.length > 0) {
+    throw new Error(
+      tracedElsewhere
+        .map(
+          (order) =>
+            `order ${order.simulatedOrderId} was placed under plan ${order.executionPlanId}, ` +
+            `which traces to intent ${intentOfPlan.get(order.executionPlanId) ?? ""} — neither ` +
+            "the entry intent nor one an exit or reduce decision emitted",
+        )
+        .join("; "),
+    );
+  }
+  const untraced = artifact.orders.filter((order) => !intentOfPlan.has(order.executionPlanId));
+  const deduced = untracedExitOrders(
+    artifact,
+    untraced,
+    new Set(
+      artifact.traces.map((trace) =>
+        emissionKey(trace.runId, trace.evaluationSeq, trace.intentId),
+      ),
+    ),
+  );
+
+  return {
+    entry,
+    entryIntent,
+    entryFills,
+    exitFills,
+    exitOrderIds: new Set([...exitOrderIds, ...deduced]),
+  };
+}
+
+/** One intent EMISSION: the evaluation that emitted it, and its id. */
+function emissionKey(runId: string, evaluationSeq: number, intentId: string): string {
+  return JSON.stringify([runId, evaluationSeq, intentId]);
+}
+
+/**
+ * The closed-world rule for orders with NO trace — see {@link attributeByChain}.
+ * Returns the ids it proves are exits, and throws for any it cannot.
+ */
+function untracedExitOrders(
+  artifact: Omit<PaperRunArtifact, "reconciliation">,
+  untraced: readonly ArtifactOrder[],
+  tracedEmissions: ReadonlySet<string>,
+): readonly string[] {
+  if (untraced.length === 0) return [];
+  const named = untraced.map((order) => order.simulatedOrderId).join(", ");
+
+  const filled = untraced.filter((order) => compareDecimal(order.filledShares, "0") !== 0);
+  if (filled.length > 0) {
+    throw new Error(
+      filled
+        .map(
+          (order) =>
+            `order ${order.simulatedOrderId} reports ${order.filledShares} filled shares, but no ` +
+            `trace names its plan ${order.executionPlanId}; the loop traces every fill, so this ` +
+            "order's fills cannot be attributed by id",
+        )
+        .join("; "),
+    );
+  }
+
+  // Every order-placing intent EMISSION that no trace names. A CANCEL places no
+  // order (its plan withdraws one), so it cannot be an origin; an id-less
+  // intent can never be named by a trace, so it is always a candidate.
+  const candidates = artifact.decisions.flatMap((decision) =>
+    decision.intents
+      .filter(
+        (intent) =>
+          intent.type !== "CANCEL" &&
+          (intent.intentId === undefined ||
+            !tracedEmissions.has(
+              emissionKey(decision.runId, decision.evaluationSeq, intent.intentId),
+            )),
+      )
+      .map((intent) => ({ decision, intent })),
+  );
+  const notExits = candidates.filter(
+    (candidate) => !EXIT_DECISION_TYPES.has(candidate.decision.decisionType),
+  );
+  if (notExits.length > 0) {
+    throw new Error(
+      `order ${named} has no trace, and the untraced intent emissions that could have placed ` +
+        "it include " +
+        `${describeCandidates(notExits)} — not an exit. An unfilled order's side cannot be read ` +
+        "from this document by id, so the reconciliation refuses rather than report it as an " +
+        "exit cancellation",
+    );
+  }
+  const plans = new Set(untraced.map((order) => order.executionPlanId));
+  if (plans.size > candidates.length) {
+    throw new Error(
+      `${String(plans.size)} execution plans have no trace (${[...plans].join(", ")}; orders ` +
+        `${named}), but only ${String(candidates.length)} order-placing intent emission(s) ` +
+        `without a trace exist to have produced them (${describeCandidates(candidates)}). The ` +
+        "loop mints ONE plan per approved intent evaluation, so at least one of these orders " +
+        "has no possible origin in this document and none of them can be attributed",
+    );
+  }
+  return untraced.map((order) => order.simulatedOrderId);
+}
+
+// --- FIFO order: the sequence the run consumed the fills in ------------------
+
+const CANONICAL_UNSIGNED_INTEGER = /^(?:0|[1-9][0-9]*)$/u;
+const DIGIT_RUN = /^[0-9]/u;
+const RUNS = /[0-9]+|[^0-9]+/gu;
+
+function compareCodeUnits(left: string, right: string): -1 | 0 | 1 {
+  return left === right ? 0 : left < right ? -1 : 1;
+}
+
+/**
+ * Two canonical unsigned integer strings (§7.1's `ingestSeq`), compared EXACTLY.
+ *
+ * Length first, then code units — the repository's own rule
+ * (`packages/storage-wal`'s `compareIngestSeq`). A lexical comparison would put
+ * `"10"` before `"9"`, and `Number` loses exactness past 2^53. Length-first is
+ * only correct for CANONICAL strings (`"05"` is longer than `"6"`), so a
+ * non-canonical value is refused rather than ordered.
+ */
+export function compareIngestSeq(left: string, right: string): -1 | 0 | 1 {
+  for (const value of [left, right]) {
+    if (!CANONICAL_UNSIGNED_INTEGER.test(value)) {
+      throw new Error(
+        `atEventIngestSeq ${JSON.stringify(value)} is not a canonical unsigned integer string, ` +
+          "so the order in which the run consumed its fills cannot be established",
+      );
+    }
+  }
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  return compareCodeUnits(left, right);
+}
+
+/**
+ * Two fill ids, with every embedded run of digits compared as an integer.
+ *
+ * The tiebreak inside one `atEventIngestSeq`. `packages/simulation` numbers the
+ * fills of one crossing `${orderId}/t0/${index}` in the order it walked the
+ * book, so a plain code-unit comparison would put `…/t0/10` before `…/t0/9` —
+ * the error `compareIngestSeq` exists to avoid, one field later. Digit runs
+ * compare by value (leading zeros stripped, then length, then code units),
+ * everything else by code units, and a full tie falls back to the raw strings,
+ * so the order is total and never consults a locale or a float.
+ */
+export function compareFillIds(left: string, right: string): -1 | 0 | 1 {
+  const leftRuns = left.match(RUNS) ?? [];
+  const rightRuns = right.match(RUNS) ?? [];
+  const shared = Math.min(leftRuns.length, rightRuns.length);
+  for (let index = 0; index < shared; index += 1) {
+    const a = leftRuns[index] ?? "";
+    const b = rightRuns[index] ?? "";
+    let order: -1 | 0 | 1;
+    if (DIGIT_RUN.test(a) && DIGIT_RUN.test(b)) {
+      const x = a.replace(/^0+(?=[0-9])/u, "");
+      const y = b.replace(/^0+(?=[0-9])/u, "");
+      order = x.length !== y.length ? (x.length < y.length ? -1 : 1) : compareCodeUnits(x, y);
+    } else {
+      order = compareCodeUnits(a, b);
+    }
+    if (order !== 0) return order;
+  }
+  if (leftRuns.length !== rightRuns.length) return leftRuns.length < rightRuns.length ? -1 : 1;
+  return compareCodeUnits(left, right);
+}
+
+/** The order the run consumed two fills in: `atEventIngestSeq`, then the fill id. */
+function inConsumptionOrder(left: ArtifactFill, right: ArtifactFill): number {
+  const bySequence = compareIngestSeq(left.atEventIngestSeq, right.atEventIngestSeq);
+  return bySequence !== 0 ? bySequence : compareFillIds(left.simulatedFillId, right.simulatedFillId);
+}
+
 /**
  * Builds the whole reconciliation table for one captured run.
  *
@@ -293,25 +698,9 @@ export function buildReconciliation(
   const scenario = artifact.scenario;
   const schedule = scenario.feeSchedule;
 
-  const entry = artifact.decisions.find((decision) => decision.decisionType === "enter");
-  if (entry === undefined) {
-    throw new Error(
-      "the run produced no entry decision; the reconciliation has nothing to compare and " +
-        "refuses to report an empty table as a passing one",
-    );
-  }
-  const entryIntent = entry.intents.find((intent) => intent.type === "POSITION");
-  if (entryIntent === undefined) {
-    throw new Error("the entry decision emitted no POSITION intent");
-  }
-
-  const fills = artifact.fills;
-  if (fills.length === 0) {
-    throw new Error("the run produced no fill; there is nothing realized to reconcile against");
-  }
-
   /**
-   * THE ENTRY'S OWN FILLS, SEPARATED FROM EVERY OTHER FILL (`RISK-2`).
+   * THE ENTRY'S OWN FILLS, SEPARATED FROM EVERY OTHER FILL (`RISK-2`), AND THE
+   * EXIT'S, WALKED THE SAME WAY (`RECON-1`).
    *
    * Until B2 was fixed no exit of this scenario ever reached the venue, so
    * `artifact.fills` WAS the entry's fills and this module read the whole array
@@ -324,25 +713,11 @@ export function buildReconciliation(
    * The attribution is by ID, down the artefact's own §6 invariant 4 chain —
    * intent → trace → execution plan → order → fill — never by `action`, which
    * would break on the complement leg where an entry SELLS and its exit BUYS.
+   * `RISK-2` walked it for the entry only and took the exit as the complement;
+   * {@link attributeByChain} walks both and refuses what neither reaches.
    */
-  const entryPlanIds = new Set(
-    artifact.traces
-      .filter((trace) => trace.intentId === entryIntent.intentId)
-      .map((trace) => trace.executionPlanId),
-  );
-  const entryOrderIds = new Set(
-    artifact.orders
-      .filter((order) => entryPlanIds.has(order.executionPlanId))
-      .map((order) => order.simulatedOrderId),
-  );
-  const entryFills = fills.filter((fill) => entryOrderIds.has(fill.simulatedOrderId));
-  const exitFills = fills.filter((fill) => !entryOrderIds.has(fill.simulatedOrderId));
-  if (entryFills.length === 0) {
-    throw new Error(
-      "no fill could be attributed to the entry intent through the trace chain; the entry rows " +
-        "would compare against an empty set and are refused rather than reported as reconciled",
-    );
-  }
+  const { entry, entryIntent, entryFills, exitFills, exitOrderIds } = attributeByChain(artifact);
+  const fills = artifact.fills;
 
   const notionals = entryFills.map((fill) => mulDecimal(fill.price, fill.shares));
   const realizedNotional = sum(notionals);
@@ -363,17 +738,37 @@ export function buildReconciliation(
   /**
    * The cost basis of the entry fills an exit has NOT yet retired, folded FIFO.
    *
-   * `packages/pnl`'s open cost basis, computed the way `apps/trader`'s loop
-   * describes it ("folded FIFO from the fills"), in exact decimal and with NO
-   * DIVISION — an average price would not be exactly representable and §6
-   * invariant 1 forbids reaching for a float to get one. It collapses to the
-   * whole entry notional while the bracket is open and to exactly `"0"` once it
-   * has closed, so the two PnL rows below hold in both states rather than only
-   * in the open one they were written for.
+   * Exact decimal and NO DIVISION: an average price would not be exactly
+   * representable, and §6 invariant 1 forbids reaching for a float to get one.
+   * It collapses to the whole entry notional while the bracket is open and to
+   * exactly `"0"` once it has closed.
+   *
+   * IN THE ORDER THE RUN CONSUMED THE FILLS, NOT ARRAY ORDER (`RECON-1`, closing
+   * `RISK2-R4`). "First in" is a claim about time, and the artefact states time
+   * on every fill as `atEventIngestSeq`; the array is only the order the capture
+   * happened to write. Folding in array order left the unretired remainder —
+   * and so `pnl.capital_committed` and `pnl.worst_case_resolution` — dependent
+   * on how the document was serialised whenever an exit retires PART of the
+   * entry. The fold sorts by {@link inConsumptionOrder} instead.
+   *
+   * THE COST METHOD IS NOT `packages/pnl`'s (a `RECON-1` finding, reported and
+   * NOT changed here). This comment used to call the fold "`packages/pnl`'s open
+   * cost basis … folded FIFO", which is false: `packages/pnl/src/state.ts`
+   * states "Cost method: average cost per token asset", and the persisted
+   * snapshot these rows compare against comes from it; the FIFO book is
+   * `apps/trader`'s allocator (`allocation.ts`), a different number. The two
+   * methods agree EXACTLY in the only two states this suite's scenario has
+   * reached — fully open (the whole notional) and fully closed (`"0"`) — and in
+   * general diverge on a partial exit whenever the entry lots have different
+   * prices. Both PnL rows are then UNEXPLAINED — a loud failure, not a silent
+   * misstatement, because `EXACT_NO_DIFFERENCE` over a non-zero difference is a
+   * failure.
+   * `reconciliation-attribution.test.ts` pins the divergence so the day the
+   * model is aligned it fails and says so.
    */
   let unretired = exitShares;
   let openCostBasis = "0";
-  for (const fill of entryFills) {
+  for (const fill of [...entryFills].sort(inConsumptionOrder)) {
     if (compareDecimal(unretired, fill.shares) >= 0) {
       unretired = subDecimal(unretired, fill.shares);
       continue;
@@ -761,9 +1156,12 @@ export function buildReconciliation(
 
   // --- the projection with NO realized counterpart --------------------------
 
+  // `RECON-1`: the orders attributed to an EXIT — by trace, or by the
+  // closed-world rule for unfilled orders — and no longer every order that is
+  // not the entry's. An entry order withdrawn unfilled is not a take-profit.
   const cancelledExits = artifact.orders.filter(
     (order) =>
-      !entryOrderIds.has(order.simulatedOrderId) &&
+      exitOrderIds.has(order.simulatedOrderId) &&
       order.state === "CANCELLED" &&
       compareDecimal(order.filledShares, "0") === 0,
   );
