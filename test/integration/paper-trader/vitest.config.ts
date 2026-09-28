@@ -53,6 +53,13 @@
  * Docker dependency — `univ-4-gateway-opens-trader.test.ts` proves the same
  * claim in memory.
  *
+ * **Dated correction (`BRACKET-1c`, 2026-09-28): FIVE files, two of them with
+ * Redis.** `durable-two-brackets-postgres-redis.test.ts` starts a PostgreSQL
+ * and a Redis container in its own `beforeAll` and drives a whole two-bracket
+ * round trip through the REAL composition root, a Redis stream read by the
+ * process's own `RedisMarketEventFeed` and `pump`, and the durable store. The
+ * rule is unchanged.
+ *
  * Files under `test/` sit outside every workspace package, so bare workspace
  * imports have no `node_modules` to resolve through; the aliases below map each
  * package this suite uses to its source.
