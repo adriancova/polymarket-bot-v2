@@ -568,6 +568,33 @@ Record: `docs/handoffs/CORE-MOVE.md` (written in-round, with the move map).
 **Lockfile:** `pnpm install --offline --lockfile-only` plus hand-made links. No full install; CI's frozen install is the final proof.
 
 Runs under the HARDENING LOOP, reviewed by Codex gpt-6-astra. The orchestrator's gate step hand-links the new package in the review worktree. | DEPCHECK-1 ✓, H8-GOV ✓ | The H8-GOV CORE-MOVE grant: packages/trading-core/** (new); apps/trader/** (limited); pnpm-lock.yaml (two importers blocks); test/unit/trader/{health-realized-pnl,health-server,memory-store-pnl-snapshot-key,query-boundary-cast-scan}.test.ts (specifiers and anchors); test/unit/tooling/dependency-direction.test.ts (three anchors); docs/contracts/dependency-direction.md (activation); docs/handoffs/CORE-MOVE.md. Not granted: the suite aliases, tsconfig.lint.json. Forbidden: everything else; test/replay-golden/** byte-identical. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
+| `BACKTEST-2` (the H8 track, round 4: the backtest CLI builds the real trading core; closes blocker B3) | **Ready (authorized) 2026-09-28** under the user's H8 order. CORE-MOVE is merged (`33b7d0b`). Runs under the HARDENING LOOP, reviewed by Codex gpt-6-astra.
+
+**Design basis:** the scoping `wf_5375df07-cc2` (backtest_2).
+
+**Orchestrator rulings:**
+  - the CLI uses a PRODUCTION in-memory `TraderStore` added to the core, sharing SNAP-1's key module. It never uses the test double;
+  - the core's PAPER constants and the BACKTEST root label stay as they are (ADR-022 D6; BT1-R5);
+  - the ADR-022 discharge note is NOT in this round.
+
+**Scope:**
+  - (1) `apps/backtest-cli` declares the core, and a new `run` command:
+    - runs safety validation first;
+    - builds `createPaperTrader` with the replay clock, the shared venue builder and the production store;
+    - drives it through `runBacktest` + `replayDrivenCoreLoop`;
+    - takes no core supplied by the caller.
+  - (2) ONE shared simulated-venue builder in the core. It replaces the four copies: `main.ts`, the e2e harness, the paper-trader fixture and `backtest-replay-support.ts`.
+  - (3) The replay test drives the CLI. An in-process argv `run` test asserts the artifact bytes.
+  - (4) BT1-R1..R4.
+  - (5) Comment-only corrections.
+  - (6) A measured §6 note.
+
+**Acceptance:**
+  - the goldens are BYTE-IDENTICAL;
+  - the operator path works: the built bundle, run twice, reproduces `expected-artifact.txt`'s sha256;
+  - `check:deps` gains the downward edge with no new row.
+
+B3 is recorded as CLOSED at merge. | CORE-MOVE ✓ | apps/backtest-cli/**, packages/trading-core/** (additive only), apps/trader/src/{main,index}.ts, apps/trader/package.json (description only), packages/simulation/src/ports.ts (comment-only), test/e2e/support/harness.ts + test/integration/paper-trader/support/fixture.ts (venue copy → builder only), test/unit/simulation/backtest-{replay-support.ts,static-bracket-replay.test.ts}, pnpm-lock.yaml (apps/backtest-cli importer only), docs/contracts/dependency-direction.md (one §6 note), docs/handoffs/BACKTEST-2.md. Forbidden: test/replay-golden/** (byte-identical), root package.json, suite configs, tsconfig.lint.json, tools/**, docs/adr/**, db/**, other packages/apps. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
 
