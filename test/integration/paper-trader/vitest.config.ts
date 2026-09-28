@@ -65,7 +65,8 @@
  * PostgreSQL and a Redis container in its own `beforeAll` and drives
  * `BRACKET-1c`'s round trip with an entry that walks two ask levels in one
  * instant — the shape the durable trader used to halt on
- * (`BRACKET1C-SNAPKEY`). The rule is unchanged.
+ * (`BRACKET1C-SNAPKEY`) — and (`SNAP-1` r1) a variant with two harvests at
+ * one instant. The rule is unchanged.
  *
  * Files under `test/` sit outside every workspace package, so bare workspace
  * imports have no `node_modules` to resolve through; the aliases below map each

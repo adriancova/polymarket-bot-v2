@@ -51,6 +51,10 @@
  * which is the `WP-120` precedent for that class of claim — evidence about the
  * loop's response to a failure, never about whether a statement is valid SQL.
  * Only a database answers that, and now one does for each statement here.
+ * `replacePnlSnapshot` (`SNAP-1` r1), the fifth method, has its round trip
+ * through the assembled trader too: the shared-instant test of
+ * `test/integration/paper-trader/durable-two-level-entry-postgres-redis.test.ts`
+ * (one UPDATE on the key; the row keeps its id; a missing identity refused).
  *
  * ## `strategy.decisions` has no repository, and that is not an omission here
  *
@@ -82,6 +86,7 @@ import {
   type RunModeValue,
 } from "@polymarket-bot/storage-postgres";
 
+import { unreplacedPnlSnapshotProblem } from "../pnl-snapshot-key.js";
 import {
   portFailed,
   portOk,
@@ -473,6 +478,77 @@ export class PostgresTraderStore implements TraderStore {
           as_of: row.asOf,
         })
         .execute();
+    });
+  }
+
+  /**
+   * `SNAP-1` r1: rewrites the ONE existing `accounting.pnl_snapshots` row of
+   * the snapshot's `pnl_snapshots_scope_unique` identity — (scope,
+   * environment, account_ref, instance_id, market_id, as_of), `nulls not
+   * distinct` — with the snapshot's values.
+   *
+   * WHY IT EXISTS. The loop writes one row per instance per instant, holding
+   * the state after the LAST fill booked at that instant (the user's ruling,
+   * 2026-09-28), and writes it before the harvest's deliveries (§4.2's
+   * MEDIUM-1 gate). When a LATER harvest books more fills at an instant whose
+   * row this process already inserted — two events with one `receivedAt` — the
+   * row must move to the later state, and an INSERT cannot do that. The table
+   * is the "rebuildable reporting projection" (`0006_accounting.up.sql`; no
+   * `internal.enforce_append_only`, and `AccountingPnlSnapshotsTable` is not an
+   * `AppendOnlyTable`), so an UPDATE is legal without a migration.
+   *
+   * WHAT IT IS NOT. Not an upsert and not a skip: {@link writePnlSnapshot}
+   * still REFUSES a duplicate identity, and this still REFUSES a missing one —
+   * `numUpdatedRows` must be exactly `1`, otherwise it throws
+   * `unreplacedPnlSnapshotProblem` into {@link #contained}, which answers
+   * `UNAVAILABLE` like every other failure here. The adapter never decides
+   * between the two; the loop does, for an identity it inserted itself.
+   *
+   * THE STATEMENT. The fourteen bound columns outside the key are SET — the
+   * same values, from the same `toPnlSnapshotRow`, an insert of this snapshot
+   * would bind — and the six key columns are the WHERE (`is null` for an
+   * absent instance or market: `nulls not distinct`). The three columns the
+   * database owns (`pnl_snapshot_id`, `computed_at`, `rebuilt_at`) are not
+   * touched, so the row keeps its id and its first `computed_at`. Pinned by
+   * `test/unit/trader/pnl-snapshot-replace-binding.test.ts` (the emitted SQL)
+   * and executed against a real PostgreSQL by
+   * `test/integration/paper-trader/durable-two-level-entry-postgres-redis.test.ts`.
+   */
+  async replacePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>> {
+    return await this.#contained("replace a PnL snapshot", async () => {
+      const row = toPnlSnapshotRow(snapshot);
+      let statement = this.#db
+        .updateTable("accounting.pnl_snapshots")
+        .set({
+          run_id: row.runId,
+          denomination_asset: row.denominationAsset,
+          gross_trading_pnl: row.grossTradingPnl,
+          core_net_pnl: row.coreNetPnl,
+          all_in_pnl: row.allInPnl,
+          realized_pnl: row.realizedPnl,
+          unrealized_pnl_midpoint: row.unrealizedPnlMidpoint,
+          unrealized_pnl_model: row.unrealizedPnlModel,
+          unrealized_pnl_liquidation: row.unrealizedPnlLiquidation,
+          worst_case_resolution_pnl: row.worstCaseResolutionPnl,
+          fees_paid: row.feesPaid,
+          reward_estimate_total: row.rewardEstimateTotal,
+          realized_rewards: row.realizedRewards,
+          capital_committed: row.capitalCommitted,
+        })
+        .where("scope", "=", toLedgerScope(row.scope))
+        .where("environment", "=", toRunMode(row.environment))
+        .where("account_ref", "=", row.accountRef);
+      statement =
+        row.instanceId === null
+          ? statement.where("instance_id", "is", null)
+          : statement.where("instance_id", "=", row.instanceId);
+      statement =
+        row.marketId === null
+          ? statement.where("market_id", "is", null)
+          : statement.where("market_id", "=", row.marketId);
+      const result = await statement.where("as_of", "=", row.asOf).executeTakeFirst();
+      const matched = result.numUpdatedRows;
+      if (matched !== 1n) throw new Error(unreplacedPnlSnapshotProblem(matched));
     });
   }
 

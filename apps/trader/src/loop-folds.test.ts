@@ -27,10 +27,13 @@
  * - `SNAP-1` (the last two describe blocks): ONE PnL snapshot per instance per
  *   instant — the `pnl_snapshots_scope_unique` key, which the in-memory store
  *   now enforces too — equal byte for byte to the last per-fill row base
- *   wrote at that instant; a second event at the same instant; a receivedAt
- *   that goes backwards; and what a halt latched mid-harvest does to the
- *   staged row. This harness books ten fills per event, so every tick is the
- *   shape the key used to refuse.
+ *   wrote at that instant; since r1, a LATER event at the same instant (a
+ *   second tick, or an exit submitted from `onFill`) REPLACES that row with
+ *   the state after its last fill, and the TRDR-3 book follows it; instants
+ *   that go backwards each keep their own row; and what a halt latched
+ *   mid-harvest — or a refused replacement — does to the staged row. This
+ *   harness books ten fills per event, so every tick is the shape the key
+ *   used to refuse.
  *
  * WHAT IS REAL: the `CoreLoop`, the strategy RUNTIME, the feature engine,
  * books, capital allocator, risk engine, execution planner, `SimulatedVenue`
@@ -86,11 +89,12 @@ import {
   type AccountingChecks,
 } from "./folds.js";
 import { HaltController } from "./halt.js";
-import { HealthState } from "./health.js";
+import { HealthState, RealizedPnlBook } from "./health.js";
 import { healthResponseBody } from "./health-server.js";
 import { InstanceRegistry } from "./instances.js";
 import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
 import { MarketState } from "./market-state.js";
+import { observeRealizedPnl } from "./pnl-observation.js";
 import { portFailed, type IngestedEvent } from "./ports.js";
 import { REPOSITORY_MAXIMUM_RUN_MODE, TRADER_RUN_MODE } from "./safety.js";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";
@@ -264,7 +268,7 @@ function traderConfig(): Record<string, unknown> {
   };
 }
 
-type CyclingState = { readonly step?: number };
+type CyclingState = { readonly step?: number; readonly exited?: boolean };
 
 function hold(ctx: StrategyContext): DecisionResult {
   return { decisionType: "hold", reasonCodes: ["FOLD1.HOLD"], featureSnapshotRef: ctx.features().snapshotRef, intents: [] };
@@ -332,11 +336,26 @@ const roundTrips: Strategy<unknown, CyclingState> = {
 interface Harness {
   readonly loop: CoreLoop;
   readonly store: MemoryTraderStore;
+  /**
+   * `SNAP-1` r1: the TRDR-3 realized-PnL book, when `assemble` was asked to
+   * observe the store the way the composition root does (`observeRealizedPnl`).
+   */
+  readonly book: RealizedPnlBook | undefined;
   ordinal: number;
 }
 
-/** `createPaperTrader`'s assembly, with the round-trip double's runtime registered. */
-function assemble(accountingChecks: AccountingChecks | undefined): Harness {
+/**
+ * `createPaperTrader`'s assembly, with the round-trip double's runtime registered.
+ *
+ * `SNAP-1` r1 (both optional, absent everywhere before it): `observe` wraps the
+ * store in the composition root's `observeRealizedPnl` decorator with a fresh
+ * book, and `strategy` registers another strategy in the round-trip double's
+ * place.
+ */
+function assemble(
+  accountingChecks: AccountingChecks | undefined,
+  options: { readonly observe?: boolean; readonly strategy?: Strategy<unknown, CyclingState> } = {},
+): Harness {
   const parsed = parseTraderConfig(traderConfig());
   if (!parsed.ok) throw new Error(`config refused: ${parsed.refusal.detail} ${parsed.refusal.issues.join("; ")}`);
   const config = parsed.config;
@@ -356,7 +375,7 @@ function assemble(accountingChecks: AccountingChecks | undefined): Harness {
   }
   const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
   const created = createStrategyInstanceRuntime({
-    strategy: roundTrips,
+    strategy: options.strategy ?? roundTrips,
     params: {},
     run: { runId: RUN_ID, instanceId: INSTANCE_ID, configId: CONFIG_ID, runSeed: "7" },
     watchdog: { evaluationBudgetUs: 5_000_000 },
@@ -433,6 +452,7 @@ function assemble(accountingChecks: AccountingChecks | undefined): Harness {
     feeExpenseRef: config.accounting.feeExpenseRef,
   };
   const store = new MemoryTraderStore();
+  const book = options.observe === true ? new RealizedPnlBook() : undefined;
   // The venue as the loop sees it: pass-through, except that a test may
   // rewrite the fill pages (`hooks.fillsPage`). Every other member is the
   // venue's own, bound to it (its state is in private fields).
@@ -455,7 +475,7 @@ function assemble(accountingChecks: AccountingChecks | undefined): Harness {
     allocator: new AllocatorGate({ caps: caps.value, markets: allocationMarkets, tokenAssetIds }),
     clock,
     venue: port,
-    store,
+    store: book === undefined ? store : observeRealizedPnl(store, book),
     registry,
     markets,
     instanceConfigs: new Map(),
@@ -470,7 +490,7 @@ function assemble(accountingChecks: AccountingChecks | undefined): Harness {
     ...(accountingChecks === undefined ? {} : { accountingChecks }),
   });
   wiring.loop = loop;
-  return { loop, store, ordinal: 0 };
+  return { loop, store, book, ordinal: 0 };
 }
 
 function envelope(
@@ -1088,12 +1108,73 @@ function modelRows(loop: CoreLoop, fills: number, asOf: string, price: string): 
   return rows.value;
 }
 
-/** A `MarketClosing` at the harness's next ordinal: its callback HOLDS, so the event books no fill. */
-async function closing(harness: Harness): Promise<void> {
+/**
+ * A `MarketClosing` at the harness's next ordinal — or at `at` (`SNAP-1` r1):
+ * its callback HOLDS, so the event evaluates no entry; its harvest books
+ * whatever the venue filled since the last one.
+ */
+async function closing(harness: Harness, at?: string): Promise<void> {
   await feed(harness, (n) =>
-    envelope(n, "MarketClosing", { internalMarketId: MARKET_ID, conditionId: CONDITION_ID, closesAt: T_CLOSE }),
+    envelope(
+      n,
+      "MarketClosing",
+      { internalMarketId: MARKET_ID, conditionId: CONDITION_ID, closesAt: T_CLOSE },
+      "polymarket",
+      at,
+    ),
   );
 }
+
+/** `SNAP-1` r1: every booked fill's two records (TRADE + FEE), so the stream's fill count. */
+function bookedFills(loop: CoreLoop): number {
+  return loop.pnlRecords(INSTANCE_ID).length / 2;
+}
+
+/** `SNAP-1` r1: what the TRDR-3 book serves for the harness's one instance. */
+function bookReads(realizedPnl: string | undefined): unknown {
+  return { byInstance: { [INSTANCE_ID]: realizedPnl }, account: realizedPnl };
+}
+
+/**
+ * `SNAP-1` r1 — the reviewer's second shape (`SNAP1-R1`): the first tick BUYS
+ * 50 (ten fills, as `roundTrips`); the FIRST `onFill` answers an immediate
+ * SELL of the holding, which the venue fills AT SUBMISSION — during the
+ * entry event's deliveries, after that event's harvest — so those fills wait
+ * for the NEXT event's harvest. Every other callback holds.
+ */
+const exitsOnFill: Strategy<unknown, CyclingState> = {
+  ...roundTrips,
+  name: "snap1-exit-on-fill-double",
+  onFeatures(ctx: StrategyContext): DecisionResult {
+    if ((ctx.state<CyclingState>().step ?? 0) > 0) return hold(ctx);
+    return roundTrips.onFeatures(ctx);
+  },
+  onFill(ctx: StrategyContext): DecisionResult {
+    const held = ctx.position().yesShares;
+    if (ctx.state<CyclingState>().exited === true || held === "0") return hold(ctx);
+    const sell: Intent = {
+      type: "POSITION",
+      intentId: "snap1-exit-on-fill",
+      marketId: MARKET_ID,
+      direction: "YES",
+      targetMode: "DELTA",
+      targetShares: `-${held}`,
+      minimumSellPrice: "0.3",
+      urgency: "IMMEDIATE",
+      liquidityPreference: "TAKER_OK",
+      partialFillPolicy: "ACCEPT_ANY",
+      validUntil: validUntil(ctx),
+      tags: ["snap1.exit-on-fill", "sb.order-type:FAK"],
+    };
+    return {
+      decisionType: "exit",
+      reasonCodes: ["SNAP1.EXIT_ON_FILL"],
+      featureSnapshotRef: ctx.features().snapshotRef,
+      statePatch: { exited: true },
+      intents: [sell],
+    };
+  },
+};
 
 describe("SNAP-1: one PnL snapshot per instance per instant — the database's key, in the loop", () => {
   it("ten fills in one event write ONE row: base's LAST per-fill row at that instant, byte for byte; the per-fill PnL checks are unchanged", async () => {
@@ -1115,39 +1196,83 @@ describe("SNAP-1: one PnL snapshot per instance per instant — the database's k
     expect(serializePnlState(held)).toBe(serializePnlState(rebuilt.value));
   });
 
-  it("a SECOND event at the same instant books ten more fills: no second row (the key holds one), no halt; the later state is written at the next later instant, re-dated", async () => {
-    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
+  it("a SECOND event at the same instant books ten more fills: the instant's ONE row is REPLACED with the state after the LAST (20th) fill; the TRDR-3 book reads it; nothing is pending when the run ends there (SNAP1-R1)", async () => {
+    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS, { observe: true });
     await open(harness);
     const shared = instantOf(4);
-    await tick(harness, shared); // event 4: BUY 50 @ 0.34
-    await tick(harness, shared); // event 5, SAME receivedAt: SELL 50 @ 0.32
-    expect(harness.loop.health().halts).toEqual([]);
-    expect(harness.loop.health().seams.folds.fillsPosted).toBe(20);
-    // The instant already holds this instance's row, from event 4's harvest; event 5's rows are OWED.
+    await tick(harness, shared); // event 4: BUY 50 @ 0.34, ten fills — the row is INSERTED
     expect(harness.store.pnlSnapshots).toEqual([...modelRows(harness.loop, 10, shared, "0.34")]);
-
-    await closing(harness); // event 6, a later instant, no fill
-    expect(harness.loop.health().halts).toEqual([]);
-    expect(harness.store.pnlSnapshots).toEqual([
-      ...modelRows(harness.loop, 10, shared, "0.34"),
-      // The owed state — after all twenty fills, marked at the last one's 0.32 — as of event 6.
-      ...modelRows(harness.loop, 20, instantOf(6), "0.32"),
-    ]);
-    expect(new Set(harness.store.pnlSnapshots.map((row) => row.asOf)).size).toBe(2);
+    expect(harness.store.pnlSnapshotReplacements).toBe(0);
+    await tick(harness, shared); // event 5, SAME receivedAt: SELL 50 @ 0.32 — and the run's LAST event
+    const health = harness.loop.health();
+    expect(health.halts).toEqual([]);
+    expect(health.seams.folds).toMatchObject({ fillsPosted: 20, pnlChecks: 20, pnlMismatches: 0, pnlRefusals: {} });
+    // ONE row at the shared instant — the database's key — and it holds the state after ALL
+    // twenty fills, marked at the last one's 0.32: the from-zero model's 20th per-fill row.
+    const last = modelRows(harness.loop, 20, shared, "0.32");
+    expect(harness.store.pnlSnapshots).toEqual([...last]);
+    expect(harness.store.pnlSnapshotReplacements).toBe(1);
+    // The values the reviewer measured as REQUIRED (the candidate served 0 / 17 / 0.22 / -0.22).
+    expect(last[0]).toMatchObject({ realizedPnl: "-1", capitalCommitted: "0", feesPaid: "0.43", coreNetPnl: "-1.43" });
+    // TRDR-3: the book the health surface serves is the replaced row's realized PnL.
+    expect(harness.book?.view()).toEqual(bookReads("-1"));
+    // Terminal: no later event ran, and nothing is owed — the held state IS the row.
+    const held = harness.loop.pnlState(INSTANCE_ID);
+    const rebuilt = foldPnlRecords(identity(), harness.loop.pnlRecords(INSTANCE_ID));
+    expect(rebuilt.ok).toBe(true);
+    if (held === undefined || !rebuilt.ok) return;
+    expect(serializePnlState(held)).toBe(serializePnlState(rebuilt.value));
+    expect(harness.loop.checkAccountingRebuild("SHUTDOWN").matched).toBe(true);
+    expect(harness.store.pnlSnapshots).toEqual([...last]);
   });
 
-  it("a receivedAt that goes BACKWARDS: rows are written only at an instant strictly later than the last one, so the earlier-stamped state is owed, not written out of order", async () => {
-    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
+  it("an exit submitted from onFill fills at submission and is harvested by a LATER event at the SAME instant: the instant's row is replaced with the state after that exit (the reviewer's second shape, SNAP1-R1)", async () => {
+    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS, { observe: true, strategy: exitsOnFill });
+    await open(harness);
+    const shared = instantOf(4);
+    await tick(harness, shared); // event 4: the BUY's ten fills are booked; the first onFill SELLS
+    expect(harness.loop.decisions().filter((decision) => decision.reasonCodes.includes("SNAP1.EXIT_ON_FILL"))).toHaveLength(1);
+    expect(bookedFills(harness.loop)).toBe(10);
+    expect(harness.store.pnlSnapshots).toEqual([...modelRows(harness.loop, 10, shared, "0.34")]);
+    await closing(harness, shared); // event 5, SAME instant: its harvest books the SELL's fills
+    const health = harness.loop.health();
+    expect(health.halts).toEqual([]);
+    expect(bookedFills(harness.loop)).toBe(20);
+    const last = modelRows(harness.loop, 20, shared, "0.32");
+    expect(harness.store.pnlSnapshots).toEqual([...last]);
+    expect(harness.store.pnlSnapshotReplacements).toBe(1);
+    expect(last[0]).toMatchObject({ realizedPnl: "-1", capitalCommitted: "0" });
+    expect(harness.book?.view()).toEqual(bookReads("-1"));
+    expect(harness.loop.checkAccountingRebuild("SHUTDOWN").matched).toBe(true);
+  });
+
+  it("instants that go BACKWARDS and come back: each distinct instant keeps its OWN row, at its own as_of; a revisited instant's row is replaced (SNAP1-R2)", async () => {
+    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS, { observe: true });
     await open(harness);
     await tick(harness, instantOf(5)); // event 4, stamped at instant 5: BUY
-    await tick(harness, instantOf(4)); // event 5, stamped EARLIER: SELL
+    await tick(harness, instantOf(4)); // event 5, stamped EARLIER: SELL — a distinct identity
     expect(harness.loop.health().halts).toEqual([]);
-    expect(harness.store.pnlSnapshots).toEqual([...modelRows(harness.loop, 10, instantOf(5), "0.34")]);
-    await closing(harness); // event 6, instant 6
+    // Two instants with fills, two rows, each the state after its own last fill: nothing lost,
+    // nothing moved to an instant where the instance had no fill.
     expect(harness.store.pnlSnapshots).toEqual([
       ...modelRows(harness.loop, 10, instantOf(5), "0.34"),
-      ...modelRows(harness.loop, 20, instantOf(6), "0.32"),
+      ...modelRows(harness.loop, 20, instantOf(4), "0.32"),
     ]);
+    expect(harness.store.pnlSnapshotReplacements).toBe(0);
+    expect(harness.book?.view()).toEqual(bookReads("-1"));
+
+    await tick(harness, instantOf(5)); // event 6, back at instant 5: BUY again
+    expect(harness.loop.health().halts).toEqual([]);
+    expect(bookedFills(harness.loop)).toBe(30);
+    // Instant 5's one row (inserted first, so first) now holds the state after fill 30.
+    expect(harness.store.pnlSnapshots).toEqual([
+      ...modelRows(harness.loop, 30, instantOf(5), "0.34"),
+      ...modelRows(harness.loop, 20, instantOf(4), "0.32"),
+    ]);
+    expect(harness.store.pnlSnapshotReplacements).toBe(1);
+    // Every instant with a booked fill has exactly one row.
+    expect(harness.store.pnlSnapshots.map((row) => row.asOf).sort()).toEqual([instantOf(4), instantOf(5)]);
+    expect(harness.book?.view()).toEqual(bookReads(modelRows(harness.loop, 30, instantOf(5), "0.34")[0]?.realizedPnl));
   });
 });
 
@@ -1216,5 +1341,30 @@ describe("SNAP-1: a halt latched mid-harvest, and the staged row", () => {
     harness.store.recover();
     await closing(harness);
     expect(harness.store.pnlSnapshots).toEqual([]);
+  });
+
+  it("a REPLACEMENT the store refuses: the same GLOBAL STORE_UNAVAILABLE, latched BEFORE that harvest's deliveries; the row keeps the earlier state and the TRDR-3 book does not move (SNAP1-R1)", async () => {
+    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS, { observe: true });
+    await open(harness);
+    const shared = instantOf(4);
+    await tick(harness, shared); // event 4: BUY, row inserted, its fills delivered
+    const decisionsBefore = harness.loop.decisions().length;
+    harness.store.failOnly(["replacePnlSnapshot"], "UNAVAILABLE", "SNAP-1 r1 test: the replacement is refused");
+    await tick(harness, shared); // event 5, SAME instant: SELL — its flush must REPLACE, and is refused
+    const health = harness.loop.health();
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code, halt.action, halt.at])).toEqual([
+      ["GLOBAL", "STORE_UNAVAILABLE", "FULL_HALT", shared],
+    ]);
+    expect(health.halts[0]?.detail).toBe(
+      "a PnL snapshot could not be persisted: SNAP-1 r1 test: the replacement is refused",
+    );
+    // §4.2's MEDIUM-1 gate holds for a replacement too: the ten SELL fills are booked, none delivered.
+    expect(health.seams.folds.fillsPosted).toBe(20);
+    expect(health.loop.deliveriesSuppressedByHalt).toBeGreaterThanOrEqual(10);
+    expect(harness.loop.decisions().slice(decisionsBefore).map((decision) => decision.callback)).not.toContain("onFill");
+    // Nothing was inserted in its place: the one row still holds event 4's state.
+    expect(harness.store.pnlSnapshots).toEqual([...modelRows(harness.loop, 10, shared, "0.34")]);
+    expect(harness.store.pnlSnapshotReplacements).toBe(0);
+    expect(harness.book?.view()).toEqual(bookReads("0"));
   });
 });

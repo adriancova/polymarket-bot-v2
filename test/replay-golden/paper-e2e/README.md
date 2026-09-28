@@ -116,8 +116,9 @@ this file came to hold it (`BRACKET1C-SNAPKEY`). The user ruled "one snapshot
 per instance per instant" (2026-09-28): the loop now computes the row at every
 fill exactly as before and WRITES, once per harvest, the row of each
 instance's LAST fill at that instant (`apps/trader/src/loop.ts`,
-`#stagePnlSnapshot` / `#flushPnlSnapshots`), and `MemoryTraderStore` enforces
-the same key. The regeneration — ONCE, from the verified base bytes, with
+`#stagePnlSnapshot` / `#flushPnlSnapshots`) — a LATER harvest at an instant
+already written replaces that row (`SNAP-1` r1), which no instant of this
+golden needs — and `MemoryTraderStore` enforces the same key. The regeneration — ONCE, from the verified base bytes, with
 `WP250_WRITE_GOLDEN -t "paper-e2e"` — removed exactly the FIRST `09:00:02Z`
 row (the state after the `30 @ 0.34` fill: `capitalCommitted 10.2`,
 `feesPaid 0.131`, `coreNetPnl -0.131`) and nothing else: `pnlSnapshots` goes

@@ -121,6 +121,7 @@ describe("acceptance 1 — MAX_RUN_MODE=PAPER is enforced", () => {
         saveCheckpoint: async () => ({ ok: true, value: null }),
         appendLedgerTransaction: async () => ({ ok: true, value: null }),
         writePnlSnapshot: async () => ({ ok: true, value: null }),
+        replacePnlSnapshot: async () => ({ ok: true, value: null }),
         close: async () => undefined,
       },
       idNamespace: "acceptance-1",

@@ -157,12 +157,14 @@
  *   **Dated correction (`SNAP-1`, 2026-09-28): fixed.** Under the user's
  *   ruling "one snapshot per instance per instant" the loop computes the row
  *   at every fill as before and writes, once per harvest, the row of each
- *   instance's LAST fill at that instant; `MemoryTraderStore` now enforces the
- *   same key. The two-level entry is a committed test in
+ *   instance's LAST fill at that instant (a later harvest at an instant
+ *   already written REPLACES that row, `SNAP-1` r1); `MemoryTraderStore`
+ *   now enforces the same key. The two-level entry is a committed test in
  *   `durable-two-level-entry-postgres-redis.test.ts` (this file's scenario
  *   with bracket 1's first ask thinned to `0.34 x 30`: no halt, ONE durable
- *   row at `12:00:02`). This file's assertions are unchanged by it — one fill
- *   per instant, so one row per fill is still one row per instant.
+ *   row at `12:00:02`; and a variant with two harvests at `12:03:41`). This
+ *   file's assertions are unchanged by it — one fill per instant, so one row
+ *   per fill is still one row per instant.
  * - It is not a soak and not live evidence, and it does not close §7 item 1:
  *   a fresh read-only closeout grades that.
  *

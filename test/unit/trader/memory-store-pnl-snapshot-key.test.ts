@@ -25,6 +25,16 @@
  * - `as_of` is compared as `timestamptz` does — one instant, whatever its
  *   zone or trailing zeros, at microsecond resolution;
  * - an injected outage still refuses first, and records nothing.
+ *
+ * `SNAP-1` r1 (`SNAP1-R1`) adds `replacePnlSnapshot` — the loop's way to bring
+ * an instant's one row up to the state after a LATER harvest's last fill at
+ * that instant. Pinned in the last block: it rewrites the one recorded row of
+ * the SAME identity in place (the same position, as a database row keeps its
+ * id), counts it, and REFUSES a missing identity with the adapter's own port
+ * data, inserting nothing; its failure is injectable by name. The double's
+ * answer is held against the real adapter's in
+ * `test/unit/trader/pnl-snapshot-replace-binding.test.ts` (and against a real
+ * PostgreSQL in the durable two-level file).
  */
 
 import { describe, expect, it } from "vitest";
@@ -33,6 +43,7 @@ import { PostgresTraderStore } from "../../../apps/trader/src/adapters/postgres-
 import type { PortResult } from "../../../apps/trader/src/ports.js";
 import {
   DUPLICATE_PNL_SNAPSHOT_DETAIL,
+  MISSING_PNL_SNAPSHOT_DETAIL,
   MemoryTraderStore,
   PNL_SNAPSHOT_SCOPE_UNIQUE,
 } from "../../../apps/trader/src/testing/index.js";
@@ -221,5 +232,97 @@ describe("SNAP-1: MemoryTraderStore enforces pnl_snapshots_scope_unique", () => 
     const duplicate = await store.writePnlSnapshot(snapshot());
     expect(duplicate).toEqual({ ok: false, failure: { kind: "UNAVAILABLE", detail: DUPLICATE_PNL_SNAPSHOT_DETAIL } });
     expect(store.pnlSnapshots).toHaveLength(1);
+  });
+});
+
+describe("SNAP-1 r1: MemoryTraderStore.replacePnlSnapshot rewrites the ONE row of an identity, in place — never inserts", () => {
+  it("rewrites the recorded row IN PLACE: same position, same count, the new snapshot's values; and counts the replacement", async () => {
+    const store = new MemoryTraderStore();
+    const first = snapshot();
+    const other = snapshot({ asOf: "2026-05-01T09:00:03Z" });
+    expect((await store.writePnlSnapshot(first)).ok).toBe(true);
+    expect((await store.writePnlSnapshot(other)).ok).toBe(true);
+    const later = snapshot({
+      runId: "018f4a7e-3333-7abc-8def-0000000000ff",
+      realizedPnl: "-1",
+      coreNetPnl: "-1.43",
+      allInPnl: "-1.43",
+      grossTradingPnl: "-1",
+      unrealizedPnlMidpoint: "0",
+      worstCaseResolutionPnl: "-1",
+      feesPaid: "0.43",
+      capitalCommitted: "0",
+    });
+    expect(await store.replacePnlSnapshot(later)).toEqual({ ok: true, value: null });
+    expect(store.pnlSnapshots).toEqual([later, other]);
+    expect(store.pnlSnapshots[0]).toBe(later);
+    expect(store.pnlSnapshotReplacements).toBe(1);
+    // …and the identity is still ONE: an insert of it is still refused.
+    expect(await store.writePnlSnapshot(snapshot())).toEqual({
+      ok: false,
+      failure: { kind: "UNAVAILABLE", detail: DUPLICATE_PNL_SNAPSHOT_DETAIL },
+    });
+    expect(store.pnlSnapshots).toHaveLength(2);
+  });
+
+  it("matches by the SAME identity as the insert: another timestamptz spelling and NULL ids match; a differing key column does not", async () => {
+    const store = new MemoryTraderStore();
+    expect((await store.writePnlSnapshot(snapshot())).ok).toBe(true);
+    expect((await store.replacePnlSnapshot(snapshot({ asOf: "2026-05-01T11:00:02.000+02:00", realizedPnl: "1" }))).ok).toBe(true);
+    const accountWide = snapshot({ scope: "ACTUAL_ACCOUNT", instanceId: null, marketId: null, runId: null });
+    expect((await store.writePnlSnapshot(accountWide)).ok).toBe(true);
+    expect((await store.replacePnlSnapshot({ ...accountWide, realizedPnl: "2" })).ok).toBe(true);
+    expect(store.pnlSnapshots.map((row) => row.realizedPnl)).toEqual(["1", "2"]);
+    for (const other of [
+      snapshot({ scope: "ACTUAL_ACCOUNT", instanceId: null }),
+      snapshot({ environment: "BACKTEST" }),
+      snapshot({ accountRef: "another-account" }),
+      snapshot({ instanceId: "018f4a7e-2222-7abc-8def-0000000000ff" }),
+      snapshot({ marketId: "018f4a7e-1111-7abc-8def-0000000000ff" }),
+      snapshot({ asOf: "2026-05-01T09:00:02.001Z" }),
+      { ...accountWide, marketId: MARKET },
+    ]) {
+      const answer = await store.replacePnlSnapshot(other);
+      expect({ other, answer }).toEqual({
+        other,
+        answer: { ok: false, failure: { kind: "UNAVAILABLE", detail: MISSING_PNL_SNAPSHOT_DETAIL } },
+      });
+    }
+    expect(store.pnlSnapshots).toHaveLength(2);
+    expect(store.pnlSnapshotReplacements).toBe(2);
+  });
+
+  it("REFUSES a missing identity with the adapter's own UNAVAILABLE port data and inserts nothing in its place", async () => {
+    const store = new MemoryTraderStore();
+    const answer = await store.replacePnlSnapshot(snapshot());
+    expect(answer).toEqual({ ok: false, failure: { kind: "UNAVAILABLE", detail: MISSING_PNL_SNAPSHOT_DETAIL } });
+    expect(MISSING_PNL_SNAPSHOT_DETAIL).toBe(
+      "the durable store could not replace a PnL snapshot: Error: a PnL snapshot replacement rewrites exactly " +
+        `one row of its ${PNL_SNAPSHOT_SCOPE_UNIQUE} identity, and 0 matched`,
+    );
+    expect(store.pnlSnapshots).toEqual([]);
+    expect(store.pnlSnapshotReplacements).toBe(0);
+    // Nothing was inserted: the identity is still free for an insert.
+    expect((await store.writePnlSnapshot(snapshot())).ok).toBe(true);
+  });
+
+  it("its failure is injectable BY NAME: failOnly(['replacePnlSnapshot']) refuses it and leaves inserts up; fail() takes it down too", async () => {
+    const store = new MemoryTraderStore();
+    expect((await store.writePnlSnapshot(snapshot())).ok).toBe(true);
+    store.failOnly(["replacePnlSnapshot"], "UNAVAILABLE", "the replacement is refused");
+    expect(await store.replacePnlSnapshot(snapshot({ realizedPnl: "1" }))).toEqual({
+      ok: false,
+      failure: { kind: "UNAVAILABLE", detail: "the replacement is refused" },
+    });
+    expect((await store.writePnlSnapshot(snapshot({ asOf: "2026-05-01T09:00:03Z" }))).ok).toBe(true);
+    store.failOnly(["writePnlSnapshot"], "UNAVAILABLE", "only inserts are refused");
+    expect((await store.replacePnlSnapshot(snapshot({ realizedPnl: "2" }))).ok).toBe(true);
+    store.fail("UNAVAILABLE", "connection reset");
+    expect(await store.replacePnlSnapshot(snapshot({ realizedPnl: "3" }))).toEqual({
+      ok: false,
+      failure: { kind: "UNAVAILABLE", detail: "connection reset" },
+    });
+    expect(store.pnlSnapshots.map((row) => row.realizedPnl)).toEqual(["2", "0"]);
+    expect(store.pnlSnapshotReplacements).toBe(1);
   });
 });

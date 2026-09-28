@@ -16,7 +16,11 @@
  * snapshot per instance per instant" (2026-09-28): the loop now computes the
  * row at every fill exactly as before and writes, once per harvest, the row of
  * each instance's LAST fill at that instant; `MemoryTraderStore` enforces the
- * same key.
+ * same key. Since `SNAP-1` r1 (`SNAP1-R1`), a LATER harvest at an instant
+ * whose row the process already inserted REPLACES that row
+ * (`PostgresTraderStore.replacePnlSnapshot`, one UPDATE on the key), so the
+ * instant's one row holds the state after its last fill however many harvests
+ * booked fills there.
  *
  * ## What runs
  *
@@ -28,10 +32,11 @@
  * `RedisMarketEventFeed` and `pump`, then the SHUTDOWN rebuild check. The
  * scenario is `BRACKET-1c`'s eleven events (`support/two-brackets.ts`) with ONE
  * delta: bracket 1's YES asks are {@link TWO_LEVEL_BRACKET_1_YES_ASKS}
- * (`0.34 x 30`, `0.35 x 300`) — F3, committed. Two tests: the event-time
+ * (`0.34 x 30`, `0.35 x 300`) — F3, committed. Three tests: the event-time
  * clock with one event per pump (so the in-memory state right after the
- * `12:00:02` event can be captured), and the process's own
- * `SystemPaperClock` with ONE pump over the whole stream.
+ * `12:00:02` event can be captured); the process's own `SystemPaperClock`
+ * with ONE pump over the whole stream; and (`SNAP-1` r1) the SHARED-INSTANT
+ * shape — see below.
  *
  * ## Hand derivation (written before the first run)
  *
@@ -94,15 +99,37 @@
  * `apps/trader/src/loop.ts` restored, the event-time test halts at `12:00:02`
  * with `STORE_UNAVAILABLE … pnl_snapshots_scope_unique`.
  *
+ * ## The shared-instant shape (`SNAP-1` r1, `SNAP1-R1`)
+ *
+ * Two HARVESTS at one instant, through the real path: the two-level
+ * scenario's first ten events, with the take-profit's public trade (event 10)
+ * received at `12:03:41.000Z` — bracket 2's entry instant — and the run
+ * ENDING there (event 11 dropped), so no later event could carry a pending
+ * row (the terminal case). Event 9's harvest inserts the `12:03:41` row
+ * (capital `16.5`, realized `−1.2`, worst `−17.7`); the take-profit, placed
+ * from that entry's `onFill`, fills from event 10's trade (the event-time
+ * clock stamps both at the same nanosecond, and a resting order matches a
+ * trade at or after its rest start); event 10's harvest REPLACES the row. At
+ * the end there are THREE rows, and the `12:03:41` one — the same
+ * `pnl_snapshot_id` and `computed_at` as after event 9 — holds the state after
+ * the take-profit's fill: capital `0`, realized = gross = core net = worst
+ * `7.3`, midpoint `0`, equal column for column to the in-memory held state's
+ * row at that instant; the TRDR-3 book reads `7.3`. With the candidate
+ * `de867f6`'s `loop.ts` this test FAILS with no halt: the row is still the
+ * entry's (`capital_committed` `16.5`, measured). The same run holds the REAL
+ * database's refusal of a replacement whose identity has no row against the
+ * double's answer.
+ *
  * ## What it does NOT prove (disclosed)
  *
  * Simulated execution (Tier-0 `SimulatedVenue`, fills
  * `SIMULATED_NOT_REAL_EVIDENCE`) over real PostgreSQL and Redis; envelopes this
  * suite builds, not the gateway's normalisation; not `startup()` itself; the
- * durable execution chain is still absent (`RECON2-DURABLE`). Two EVENTS at
- * one instant (the loop's owed-row path) are pinned in memory
- * (`apps/trader/src/loop-folds.test.ts`, `SNAP-1` blocks), not here. Not a
- * soak, not live evidence; §7 item 1 is graded by a fresh closeout.
+ * durable execution chain is still absent (`RECON2-DURABLE`). Instants that
+ * go BACKWARDS are pinned in memory only (`apps/trader/src/loop-folds.test.ts`,
+ * `SNAP-1` blocks): a resting take-profit cannot fill from a trade stamped
+ * before its rest start, so this scenario cannot place one there. Not a soak,
+ * not live evidence; §7 item 1 is graded by a fresh closeout.
  *
  * ## Docker
  *
@@ -128,7 +155,7 @@ import {
   type PortResult,
   type PumpResult,
 } from "@polymarket-bot/trader";
-import { ManualClock, MemoryTraderStore } from "@polymarket-bot/trader/testing";
+import { MISSING_PNL_SNAPSHOT_DETAIL, ManualClock, MemoryTraderStore } from "@polymarket-bot/trader/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { RedisMarketEventFeed } from "../../../apps/trader/src/adapters/redis-feed.js";
@@ -164,6 +191,18 @@ const ENTRY_INSTANT = "2026-03-04T12:00:02Z";
 const ENTRY_LAST_FILL_PRICE = "0.35";
 /** Index of the `12:00:02` NO book (the entry) in the eleven events. */
 const ENTRY_EVENT_INDEX = 4;
+
+/**
+ * `SNAP-1` r1 (`SNAP1-R1`): bracket 2's entry instant, which the
+ * shared-instant shape ALSO stamps on the take-profit's public trade — so two
+ * harvests book fills of one instance at one instant — and the price of the
+ * last fill there (the take-profit's).
+ */
+const SHARED_INSTANT = "2026-03-04T12:03:41Z";
+const SHARED_INSTANT_LAST_FILL_PRICE = "0.5";
+/** Indices of bracket 2's entry (the `12:03:41` NO book) and of the take-profit's trade. */
+const BRACKET_2_ENTRY_INDEX = 8;
+const TAKE_PROFIT_TRADE_INDEX = 9;
 
 /** Codes that would mean the instance lost track of its own orders or stopped. */
 const FORBIDDEN_CODES = ["SB.PAUSED", "SB.UNATTRIBUTED_FILL", "SB.ILLEGAL_TRANSITION", "SB.POSITION_MISMATCH"];
@@ -215,6 +254,33 @@ function positioningFeed(feed: RedisMarketEventFeed, clock: ManualClock | undefi
   };
 }
 
+/** The same event, received at `receivedAt` (envelope and recorded identity alike). */
+function restamped(event: IngestedEvent, receivedAt: string): IngestedEvent {
+  return {
+    envelope: { ...event.envelope, receivedAt },
+    identity: { ...event.identity, receivedAt },
+  };
+}
+
+/**
+ * `SNAP-1` r1: the shared-instant shape — the two-level scenario's first ten
+ * events, with the take-profit's trade (event 10) received at bracket 2's
+ * entry instant (event 9's `12:03:41.000Z`) instead of `12:04:00`, and the run
+ * ENDING there (event 11 dropped): the terminal case, where no later event
+ * could carry a pending row.
+ */
+function sharedInstantEvents(events: readonly IngestedEvent[]): readonly IngestedEvent[] {
+  const entry = events[BRACKET_2_ENTRY_INDEX];
+  const trade = events[TAKE_PROFIT_TRADE_INDEX];
+  if (entry === undefined || trade === undefined || trade.envelope.eventType !== "PublicTradeObserved") {
+    throw new Error("the scenario lost bracket 2's entry or its take-profit trade");
+  }
+  return Object.freeze([
+    ...events.slice(0, TAKE_PROFIT_TRADE_INDEX),
+    restamped(trade, entry.envelope.receivedAt),
+  ]);
+}
+
 function sumDecimals(values: readonly unknown[]): string {
   let total = "0";
   for (const value of values) {
@@ -253,11 +319,27 @@ interface Run {
   };
   /** A second write of the `12:00:02` row through the assembled store, and the double's answer to the same. */
   readonly duplicate: { readonly database: PortResult<null>; readonly double: PortResult<null> } | undefined;
+  /**
+   * `SNAP-1` r1, the shared-instant shape only: the durable `12:03:41` row
+   * right after bracket 2's entry (its id and economics), the §9.16 row of the
+   * in-memory held state right after the take-profit's fill at that same
+   * instant, and a replacement of an identity with NO row through the
+   * assembled store (the real database's answer, and the double's).
+   */
+  readonly sharedInstant:
+    | {
+        readonly rowAfterEntry: Readonly<Record<string, unknown>> | undefined;
+        readonly rowAfterTakeProfit: PnlSnapshot | undefined;
+        readonly missing: { readonly database: PortResult<null>; readonly double: PortResult<null> } | undefined;
+      }
+    | undefined;
 }
 
 async function runTwoLevelEntry(options: {
   readonly label: string;
   readonly delivery: "per-event" | "one-pump";
+  /** `SNAP-1` r1: `shared-instant` re-stamps the take-profit's trade at 12:03:41 and ends the run there. */
+  readonly shape?: "two-level" | "shared-instant";
 }): Promise<Run> {
   return await withFreshDatabase(postgres.getConnectionUri(), options.label, async ({ connectionString, context }) => {
     const registered = await registerThroughTheRepositories(context, options.label, {
@@ -267,9 +349,11 @@ async function runTwoLevelEntry(options: {
     const document = twoBracketsDocument(registered, options.label, { eventStream: stream });
     const parsed = parseTraderConfig(document);
     if (!parsed.ok) throw new Error(`${parsed.refusal.code}: ${parsed.refusal.issues.join("; ")}`);
-    const events = twoBracketsEvents(registered.marketId, `${CONDITION_ID}-${options.label}`, {
+    const twoLevel = twoBracketsEvents(registered.marketId, `${CONDITION_ID}-${options.label}`, {
       bracket1Asks: TWO_LEVEL_BRACKET_1_YES_ASKS,
     });
+    const shared = options.shape === "shared-instant";
+    const events = shared ? sharedInstantEvents(twoLevel) : twoLevel;
     const first = events[0];
     if (first === undefined) throw new Error("the scenario lost its events");
 
@@ -313,6 +397,25 @@ async function runTwoLevelEntry(options: {
     const pumps: PumpResult[] = [];
     let tracesAfterEntry: number | undefined;
     let rowAfterEntry: PnlSnapshot | undefined;
+    let sharedRowAfterEntry: Readonly<Record<string, unknown>> | undefined;
+    let rowAfterTakeProfit: PnlSnapshot | undefined;
+    /** The instance's one traded token, read from its open lot at the entry (a flat state has no lot). */
+    let tradedToken: string | undefined;
+    /** The §9.16 row of the held state right now, at `asOf`, marked at `price`. */
+    const heldRow = (asOf: string, price: string): PnlSnapshot | undefined => {
+      const state = trader.loop.pnlState(instanceId);
+      if (state === undefined) throw new Error("no held PnL state");
+      const tokens = [...state.lots.keys()];
+      if (tradedToken === undefined) {
+        expect(tokens).toHaveLength(1);
+        tradedToken = tokens[0];
+      }
+      expect(tokens.filter((token) => token !== tradedToken)).toEqual([]);
+      const rows = computePnlSnapshot(state, { asOf, marks: { [tradedToken ?? ""]: { midpoint: price } } });
+      if (!rows.ok) throw new Error("the in-memory state did not compute a row");
+      expect(rows.value).toHaveLength(1);
+      return rows.value[0];
+    };
     try {
       if (options.delivery === "per-event") {
         for (const [index, event] of events.entries()) {
@@ -322,17 +425,22 @@ async function runTwoLevelEntry(options: {
             tracesAfterEntry = trader.loop.traces().length;
             // The held state right after the entry's event: the §9.16 row it
             // makes at that instant, marked at the SECOND fill's price.
-            const state = trader.loop.pnlState(instanceId);
-            if (state === undefined) throw new Error("no held PnL state after the entry");
-            const tokens = [...state.lots.keys()];
-            expect(tokens).toHaveLength(1);
-            const rows = computePnlSnapshot(state, {
-              asOf: ENTRY_INSTANT,
-              marks: { [tokens[0] ?? ""]: { midpoint: ENTRY_LAST_FILL_PRICE } },
-            });
-            if (!rows.ok) throw new Error("the in-memory state did not compute a row");
-            expect(rows.value).toHaveLength(1);
-            rowAfterEntry = rows.value[0];
+            rowAfterEntry = heldRow(ENTRY_INSTANT, ENTRY_LAST_FILL_PRICE);
+          }
+          if (shared && index === BRACKET_2_ENTRY_INDEX) {
+            // The DURABLE row at 12:03:41 right after bracket 2's entry: a SELECT.
+            const rows = await context.db
+              .selectFrom("accounting.pnl_snapshots")
+              .selectAll()
+              .where("run_id", "=", registered.runId)
+              .where("as_of", "=", SHARED_INSTANT)
+              .execute();
+            expect(rows).toHaveLength(1);
+            sharedRowAfterEntry = rows[0] === undefined ? undefined : { ...rows[0] };
+          }
+          if (shared && index === TAKE_PROFIT_TRADE_INDEX) {
+            // The held state right after the take-profit's fill, at the SAME instant.
+            rowAfterTakeProfit = heldRow(SHARED_INSTANT, SHARED_INSTANT_LAST_FILL_PRICE);
           }
         }
       } else {
@@ -387,6 +495,25 @@ async function runTwoLevelEntry(options: {
         duplicate = { database, double: await memory.writePnlSnapshot(rowAfterEntry) };
       }
 
+      // `SNAP-1` r1: the real database's answer to a replacement of an
+      // identity with NO row (an instant the run never reached), and the
+      // double's.
+      let missing: { database: PortResult<null>; double: PortResult<null> } | undefined;
+      if (shared && rowAfterTakeProfit !== undefined) {
+        const nowhere = { ...rowAfterTakeProfit, asOf: "2026-03-04T12:05:00Z" };
+        missing = {
+          database: await store.replacePnlSnapshot(nowhere),
+          double: await new MemoryTraderStore().replacePnlSnapshot(nowhere),
+        };
+        const after = await context.db
+          .selectFrom("accounting.pnl_snapshots")
+          .select("as_of")
+          .where("run_id", "=", registered.runId)
+          .execute();
+        // Refused, and nothing was inserted in its place.
+        expect(after).toHaveLength(snapshots.length);
+      }
+
       return {
         instanceId,
         runId: registered.runId,
@@ -422,6 +549,7 @@ async function runTwoLevelEntry(options: {
           snapshots: snapshots.map((row) => ({ ...row })),
         },
         duplicate,
+        sharedInstant: shared ? { rowAfterEntry: sharedRowAfterEntry, rowAfterTakeProfit, missing } : undefined,
       };
     } finally {
       await feed.close();
@@ -557,6 +685,74 @@ describe("SNAP-1: an entry that walks two ask levels in one instant, durably, th
     expect(run.duplicate).toBeDefined();
     expect(run.duplicate?.database.ok).toBe(false);
     expect(run.duplicate?.double).toEqual(run.duplicate?.database);
+  }, 180_000);
+
+  it("SNAP1-R1: TWO harvests at one instant — bracket 2's entry and its take-profit's fill, both at 12:03:41, the run ending there — leave ONE durable row at 12:03:41 holding the state after the LAST fill, replaced in place; the TRDR-3 book reads it", async () => {
+    const run = await runTwoLevelEntry({ label: "snap1-shared-instant", delivery: "per-event", shape: "shared-instant" });
+    expect(run.health.halts).toEqual([]);
+    expect(run.health.healthy).toBe(true);
+    expect(run.pumps).toEqual(run.events.map(() => ({ polls: 2, ingested: 1, stopped: "IDLE" })));
+    expect(run.events).toHaveLength(10);
+    expect(run.events.at(-1)?.envelope.eventType).toBe("PublicTradeObserved");
+    expect(run.events.at(-1)?.envelope.receivedAt).toBe(run.events.at(-2)?.envelope.receivedAt);
+    expect(run.rebuildMatched).toBe(true);
+    expect(run.health.loop.eventsProcessed).toBe(10);
+    // Every fill booked — the take-profit's included — and nothing refused.
+    expect(run.health.execution.fillsObserved).toBe(5);
+    expect(run.db.transactions).toHaveLength(10);
+    expect(run.health.accounting.ledgerRefusals).toBe(0);
+
+    // Right after bracket 2's entry, the durable 12:03:41 row held the entry's state…
+    const before = run.sharedInstant?.rowAfterEntry ?? {};
+    for (const [column, value] of Object.entries(EXPECTED_ROWS[2] ?? {})) {
+      expect({ column, value: before[column] }).toEqual({ column, value });
+    }
+    // …and at the end of the run the SAME row (same id, same computed_at: an UPDATE, not a
+    // second row) holds the state after the take-profit's fill — the last fill at 12:03:41.
+    const asOf = run.db.snapshots.map((row) => row["as_of"]);
+    expect(asOf).toEqual([ENTRY_INSTANT, "2026-03-04T12:03:06Z", SHARED_INSTANT]);
+    const kept = run.db.snapshots[2] ?? {};
+    expect(kept["pnl_snapshot_id"]).toBe(before["pnl_snapshot_id"]);
+    expect(kept["computed_at"]).toEqual(before["computed_at"]);
+    for (const [column, value] of Object.entries(EXPECTED_ROWS[3] ?? {})) {
+      expect({ column, value: kept[column] }).toEqual({ column, value });
+    }
+    const memory = run.sharedInstant?.rowAfterTakeProfit;
+    expect(memory).toBeDefined();
+    if (memory === undefined) return;
+    for (const [column, field] of COLUMNS) {
+      expect({ column, value: kept[column] }).toEqual({ column, value: memory[field] });
+    }
+    expect(kept["as_of"]).toBe(memory.asOf);
+    // The two rows before it are the two-level run's own, unchanged.
+    run.db.snapshots.slice(0, 2).forEach((row, index) => {
+      for (const [column, value] of Object.entries(EXPECTED_ROWS[index] ?? {})) {
+        expect({ index, column, value: row[column] }).toEqual({ index, column, value });
+      }
+    });
+
+    // TRDR-3: the realized-PnL book is the replaced row's, not the entry's -1.2.
+    expect(run.health.accounting.realizedPnl).toEqual({ byInstance: { [run.instanceId]: "7.3" }, account: "7.3" });
+
+    // The round trip still completes: bracket 2 closes on the take-profit's onFill AT 12:03:41.
+    const closes = run.db.decisions.filter((row) => row.reasonCodes.includes("SB.CLOSED"));
+    expect(closes.map((row) => [row.callback, row.evaluatedAt])).toEqual([
+      ["onFill", "2026-03-04T12:03:06Z"],
+      ["onFill", SHARED_INSTANT],
+    ]);
+    expect(run.db.decisions.map((row) => row.reasonCodes)).toEqual(run.memory.reasonCodes);
+    const finalState = isRecord(run.db.finalState) ? run.db.finalState : {};
+    expect({ instanceState: finalState["instanceState"], entriesExecuted: finalState["entriesExecuted"] }).toEqual({
+      instanceState: "CLOSED",
+      entriesExecuted: 2,
+    });
+
+    // The real database refuses a replacement of an identity with NO row — and the
+    // in-memory double answers the SAME port data.
+    const missing = run.sharedInstant?.missing;
+    expect(missing).toBeDefined();
+    expect(missing?.database).toEqual({ ok: false, failure: { kind: "UNAVAILABLE", detail: MISSING_PNL_SNAPSHOT_DETAIL } });
+    expect(missing?.double).toEqual(missing?.database);
   }, 180_000);
 
   it("the process's own SystemPaperClock and ONE pump over the whole stream give the same durable run", async () => {

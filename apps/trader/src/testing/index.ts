@@ -30,8 +30,13 @@ import type {
   StrategyStateCheckpoint,
 } from "@polymarket-bot/strategy-runtime";
 import type { AppendedLedgerTransaction } from "@polymarket-bot/ledger";
-import { toPnlSnapshotRow, type PnlSnapshot } from "@polymarket-bot/pnl";
+import type { PnlSnapshot } from "@polymarket-bot/pnl";
 
+import {
+  PNL_SNAPSHOT_SCOPE_UNIQUE,
+  pnlSnapshotKey,
+  unreplacedPnlSnapshotProblem,
+} from "../pnl-snapshot-key.js";
 import {
   portFailed,
   portOk,
@@ -148,9 +153,9 @@ export class MemoryEventFeed implements MarketEventFeed {
 /**
  * The name of `accounting.pnl_snapshots`' identity constraint
  * (`db/migrations/0006_accounting.up.sql`), which {@link MemoryTraderStore}
- * enforces too (`SNAP-1`).
+ * enforces too (`SNAP-1`). Defined once, in `../pnl-snapshot-key.ts`.
  */
-export const PNL_SNAPSHOT_SCOPE_UNIQUE = "pnl_snapshots_scope_unique";
+export { PNL_SNAPSHOT_SCOPE_UNIQUE };
 
 /**
  * The refusal {@link MemoryTraderStore.writePnlSnapshot} answers for a second
@@ -165,62 +170,25 @@ export const DUPLICATE_PNL_SNAPSHOT_DETAIL =
   `unique constraint "${PNL_SNAPSHOT_SCOPE_UNIQUE}"`;
 
 /**
- * `timestamptz` equality for `as_of`: the instant at MICROSECOND resolution,
- * whatever the zone or the number of fraction digits the string carries — so
- * `…T09:00:02Z`, `…T09:00:02.000Z` and `…T11:00:02+02:00` are one key, as they
- * are in PostgreSQL. Digits past the sixth are rounded half-to-even, which is
- * what PostgreSQL 16 did on every tie probed for `SNAP-1` (`.0000005` → `.000000`,
- * `.0000015` → `.000002`, `.0000025` → `.000002`, `.0000035` → `.000004`). A
- * string this cannot read keys as itself (the real column would refuse it,
- * with a different error this double does not model).
+ * The refusal {@link MemoryTraderStore.replacePnlSnapshot} answers when no row
+ * of the snapshot's identity exists (`SNAP-1` r1) — the SAME port data
+ * `PostgresTraderStore.replacePnlSnapshot` answers when its UPDATE matches no
+ * row (`#contained`'s "the durable store could not replace a PnL snapshot: "
+ * + `Error: ` + {@link unreplacedPnlSnapshotProblem} of `0`).
  */
-function asOfKey(asOf: unknown): string {
-  if (typeof asOf !== "string") return JSON.stringify(String(asOf));
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/u.exec(asOf);
-  if (match === null) return JSON.stringify(asOf);
-  const [, year, month, day, hour, minute, second, fraction = "", zone = "Z"] = match;
-  const offsetSeconds =
-    zone === "Z"
-      ? 0
-      : (zone.startsWith("-") ? -1 : 1) *
-        (Number(zone.slice(1, 3)) * 3600 + Number(zone.slice(4, 6)) * 60);
-  let seconds =
-    Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)) /
-      1000 -
-    offsetSeconds;
-  let micros = Number(fraction.padEnd(6, "0").slice(0, 6));
-  const rest = fraction.slice(6);
-  if (rest !== "") {
-    const first = rest.charCodeAt(0) - 48;
-    const beyond = /[1-9]/u.test(rest.slice(1));
-    if (first > 5 || (first === 5 && (beyond || micros % 2 === 1))) micros += 1;
-  }
-  if (micros === 1_000_000) {
-    seconds += 1;
-    micros = 0;
-  }
-  return `${String(seconds)}.${String(micros).padStart(6, "0")}`;
-}
+export const MISSING_PNL_SNAPSHOT_DETAIL =
+  `the durable store could not replace a PnL snapshot: Error: ${unreplacedPnlSnapshotProblem(0n)}`;
 
 /**
- * The identity `pnl_snapshots_scope_unique` is declared over —
- * `unique nulls not distinct (scope, environment, account_ref, instance_id,
- * market_id, as_of)` — read from the row exactly as the adapter binds it
- * (`toPnlSnapshotRow`, own fields only). An absent value binds as NULL in the
- * adapter and as `null` here, and two NULLs are EQUAL (`nulls not distinct`).
- * `run_id` and `denomination_asset` are NOT in the key.
+ * The five writes {@link MemoryTraderStore} can be made to fail, by name
+ * (`replacePnlSnapshot` since `SNAP-1` r1).
  */
-function pnlSnapshotKey(snapshot: PnlSnapshot): string {
-  const row = toPnlSnapshotRow(snapshot);
-  return JSON.stringify([
-    row.scope ?? null,
-    row.environment ?? null,
-    row.accountRef ?? null,
-    row.instanceId ?? null,
-    row.marketId ?? null,
-    asOfKey(row.asOf),
-  ]);
-}
+export type TraderStoreWrite =
+  | "persistDecision"
+  | "saveCheckpoint"
+  | "appendLedgerTransaction"
+  | "writePnlSnapshot"
+  | "replacePnlSnapshot";
 
 /**
  * An in-memory durable store with failure injection — §4.2's PostgreSQL
@@ -237,14 +205,15 @@ function pnlSnapshotKey(snapshot: PnlSnapshot): string {
  * instance at one instant, which the database refuses. A second row of one
  * identity is now refused with the adapter's own port data
  * ({@link DUPLICATE_PNL_SNAPSHOT_DETAIL}) and NOT recorded.
+ *
+ * `SNAP-1` r1: {@link MemoryTraderStore.replacePnlSnapshot} rewrites the one
+ * recorded row of an identity IN PLACE — the same position in
+ * {@link MemoryTraderStore.pnlSnapshots}, as a database row keeps its id — and
+ * refuses, with the adapter's own port data
+ * ({@link MISSING_PNL_SNAPSHOT_DETAIL}), when there is none. So a test reading
+ * `pnlSnapshots` reads what the table would hold: one row per identity, each
+ * with its latest content.
  */
-/** The four writes {@link MemoryTraderStore} can be made to fail, by name. */
-export type TraderStoreWrite =
-  | "persistDecision"
-  | "saveCheckpoint"
-  | "appendLedgerTransaction"
-  | "writePnlSnapshot";
-
 export class MemoryTraderStore implements TraderStore {
   readonly decisions: { record: DecisionRecord; telemetry: DecisionTelemetry }[] = [];
   readonly checkpoints: StrategyStateCheckpoint[] = [];
@@ -252,8 +221,12 @@ export class MemoryTraderStore implements TraderStore {
   readonly checkpointInstants: string[] = [];
   readonly transactions: AppendedLedgerTransaction[] = [];
   readonly pnlSnapshots: PnlSnapshot[] = [];
-  /** `SNAP-1`: the identity of every snapshot recorded — `pnl_snapshots_scope_unique`. */
-  readonly #pnlSnapshotKeys = new Set<string>();
+  /**
+   * `SNAP-1`: the identity of every snapshot recorded — `pnl_snapshots_scope_unique`
+   * — and its position in {@link pnlSnapshots} (r1: where a replacement writes).
+   */
+  readonly #pnlSnapshotKeys = new Map<string, number>();
+  #pnlSnapshotReplacements = 0;
   #failure: { kind: "UNAVAILABLE" | "UNREADABLE"; detail: string } | undefined;
   /** When set, only these writes fail; the others still succeed. */
   #failing: ReadonlySet<TraderStoreWrite> | undefined;
@@ -291,6 +264,14 @@ export class MemoryTraderStore implements TraderStore {
 
   get closed(): boolean {
     return this.#closed;
+  }
+
+  /**
+   * `SNAP-1` r1: how many {@link replacePnlSnapshot} calls rewrote a row — so a
+   * test can tell an instant written once from one written and then replaced.
+   */
+  get pnlSnapshotReplacements(): number {
+    return this.#pnlSnapshotReplacements;
   }
 
   #refusalFor(write: TraderStoreWrite): PortResult<null> | undefined {
@@ -343,8 +324,28 @@ export class MemoryTraderStore implements TraderStore {
     if (this.#pnlSnapshotKeys.has(key)) {
       return await Promise.resolve(portFailed<null>("UNAVAILABLE", DUPLICATE_PNL_SNAPSHOT_DETAIL));
     }
-    this.#pnlSnapshotKeys.add(key);
+    this.#pnlSnapshotKeys.set(key, this.pnlSnapshots.length);
     this.pnlSnapshots.push(snapshot);
+    return await Promise.resolve(portOk(null));
+  }
+
+  /**
+   * Rewrites the one recorded snapshot of this snapshot's
+   * `pnl_snapshots_scope_unique` identity, in place (`SNAP-1` r1) — unless an
+   * injected failure refuses it, or no snapshot of that identity is recorded:
+   * then it answers the adapter's own refusal for an UPDATE that matched no
+   * row ({@link MISSING_PNL_SNAPSHOT_DETAIL}) and records nothing — never an
+   * insert in its place.
+   */
+  async replacePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>> {
+    const refused = this.#refusalFor("replacePnlSnapshot");
+    if (refused !== undefined) return await Promise.resolve(refused);
+    const position = this.#pnlSnapshotKeys.get(pnlSnapshotKey(snapshot));
+    if (position === undefined) {
+      return await Promise.resolve(portFailed<null>("UNAVAILABLE", MISSING_PNL_SNAPSHOT_DETAIL));
+    }
+    this.pnlSnapshots[position] = snapshot;
+    this.#pnlSnapshotReplacements += 1;
     return await Promise.resolve(portOk(null));
   }
 
