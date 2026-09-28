@@ -293,6 +293,47 @@ describe("the CLI, end to end over a real Parquet dataset", () => {
     expect(renderBacktestOutcome(outcome)).toContain("run_mode=BACKTEST");
   });
 
+  it("FOLD-1: calls endOfRun ONCE when the replay returns — completed or refused part-way — and never when the run did not start", async () => {
+    const directory = writeDataset();
+    let ended = 0;
+    const completed = await runBacktest({
+      datasetDirectory: directory,
+      normalizer: recordedFrameNormalizer(sha256Hex),
+      runPins: pins(),
+      environment: {},
+      endOfRun: () => {
+        ended += 1;
+      },
+    });
+    expect(completed.ok).toBe(true);
+    expect(ended).toBe(1);
+
+    writeFileSync(join(directory, OBJECT_KEY), Buffer.from("not a parquet file", "utf8"));
+    const refused = await runBacktest({
+      datasetDirectory: directory,
+      normalizer: recordedFrameNormalizer(sha256Hex),
+      runPins: pins(),
+      environment: {},
+      endOfRun: () => {
+        ended += 1;
+      },
+    });
+    expect(refused.ok).toBe(false);
+    expect(ended).toBe(2);
+
+    const unsafe = await runBacktest({
+      datasetDirectory: directory,
+      normalizer: recordedFrameNormalizer(sha256Hex),
+      runPins: pins(),
+      environment: { POLYMARKET_PRIVATE_KEY: "x" },
+      endOfRun: () => {
+        ended += 1;
+      },
+    });
+    expect(unsafe.ok).toBe(false);
+    expect(ended).toBe(2);
+  });
+
   it("is byte-identical across two runs of the same dataset and pins", async () => {
     const directory = writeDataset();
     const first = await runBacktest({

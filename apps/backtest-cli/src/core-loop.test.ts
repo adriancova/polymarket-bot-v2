@@ -176,6 +176,30 @@ describe("replayDrivenCoreLoop — the shipped driver of the shared core", () =>
     expect(driver.observations()).toEqual({ eventsIngested: 1, drains: 1 });
   });
 
+  it("FOLD-1: endOfRun() runs the core's END_OF_RUN accounting rebuild check once, and is a no-op for a core without one", () => {
+    const clock = createReplayClock({ receivedAt: "2026-05-01T08:59:58.000Z", receivedMonotonicNs: "0" });
+    if (!clock.ok) return;
+    const triggers: string[] = [];
+    const withCheck = {
+      ...loopDouble(),
+      ingest: () => true,
+      drain: async () => {
+        await Promise.resolve();
+      },
+      checkAccountingRebuild(trigger: "END_OF_RUN") {
+        triggers.push(trigger);
+        return { matched: true, pnlStreamsChecked: 0 };
+      },
+    };
+    const driver = replayDrivenCoreLoop({ loop: withCheck, clock: clock.value });
+    expect(triggers).toEqual([]);
+    driver.endOfRun();
+    expect(triggers).toEqual(["END_OF_RUN"]);
+    // A structural double with no check still drives, and ending it is not an error.
+    const plain = replayDrivenCoreLoop({ loop: loopDouble(), clock: clock.value });
+    expect(() => plain.endOfRun()).not.toThrow();
+  });
+
   it("a monotonic regression is the replay clock's own refusal, and the event is never ingested", async () => {
     const clock = createReplayClock({ receivedAt: "2026-05-01T09:00:00.000Z", receivedMonotonicNs: "5000000" });
     if (!clock.ok) return;

@@ -285,20 +285,36 @@ describe("L2 — a GENUINELY PAUSED instance is offered its fill", () => {
 });
 
 describe("MEDIUM-2 — every seam reports on the health surface", () => {
-  it("all seven seam sections are present, with the values their seams hold", async () => {
+  it("all eight seam sections are present, with the values their seams hold", async () => {
     const run = await driveRecordedRun();
     const seams = run.trader.loop.health().seams;
 
-    // `TRDR-4` added `orders` and `retention` (additions only; nothing renamed).
+    // `TRDR-4` added `orders` and `retention`, and `FOLD-1` added `folds`
+    // (additions only; nothing renamed).
     expect(Object.keys(seams).sort()).toEqual([
       "allocator",
       "cancels",
       "fills",
+      "folds",
       "orderViews",
       "orders",
       "reservations",
       "retention",
     ]);
+    // `FOLD-1`, live values: the fixture checks after EVERY fill (O1), and its
+    // one fill's check found the held ledger view and PnL stream equal to
+    // their rebuilds.
+    expect(seams.folds).toEqual({
+      checkEveryFills: 1,
+      pnlCheck: true,
+      fillsPosted: 1,
+      ledgerChecks: 1,
+      pnlChecks: 1,
+      fillsAtLastCheck: 1,
+      ledgerMismatches: 0,
+      pnlMismatches: 0,
+      pnlRefusals: {},
+    });
     // `TRDR-4`, live values: the entry order filled, was delivered and
     // evaluated once, and SETTLED (one tombstone); the take-profit still rests,
     // so it is the one order still tracked. Nothing arrived unowned.

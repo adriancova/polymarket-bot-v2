@@ -66,6 +66,7 @@ import { z } from "zod";
 import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
 import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
 import { configuredFeatureKeys, parseTraderConfig } from "./config.js";
+import { EVERY_FILL_ACCOUNTING_CHECKS } from "./folds.js";
 import { HaltController } from "./halt.js";
 import { HealthState } from "./health.js";
 import { InstanceRegistry } from "./instances.js";
@@ -442,6 +443,9 @@ function assemble(retention: RetentionBounds, options: HarnessOptions = {}): Har
     tokenAssetIds,
     outbox,
     retention,
+    // `FOLD-1` (orchestrator call O1): the held ledger view and PnL streams
+    // are checked against their rebuilds from zero after EVERY fill.
+    accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
   });
   wiring.loop = loop;
 

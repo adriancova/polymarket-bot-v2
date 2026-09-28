@@ -93,8 +93,8 @@ import type {
 import type { RiskPolicy } from "@polymarket-bot/risk";
 import {
   computePnlSnapshot,
-  foldPnlRecords,
   type PnlRecord,
+  type PnlState,
   type PnlStreamIdentity,
 } from "@polymarket-bot/pnl";
 import type {
@@ -106,7 +106,6 @@ import type {
 
 import {
   postFill,
-  projectionOf,
   type DeterministicIdFactory,
   type PostingIdentity,
   type TraceLink,
@@ -117,6 +116,7 @@ import { CancelLedger } from "./cancels.js";
 import type { InstanceConfig, MarketConfig, TraderConfig } from "./config.js";
 import { readEventEnvelope } from "./event-door.js";
 import { FillDeduplicator } from "./fills.js";
+import { HeldAccounting, type AccountingChecks, type FoldHealth } from "./folds.js";
 import { haltOnLedgerProjection, type HaltController } from "./halt.js";
 import type { HealthSnapshot, HealthState } from "./health.js";
 import type { InstanceRegistry, RegisteredInstance } from "./instances.js";
@@ -150,7 +150,7 @@ import { ReferenceState } from "./reference-state.js";
 import { ReservationBook } from "./reservations.js";
 import { TRADER_RUN_MODE } from "./safety.js";
 import { normalizeToStrictUtc } from "./time.js";
-import type { Ledger } from "@polymarket-bot/ledger";
+import type { Ledger, LedgerProjection } from "@polymarket-bot/ledger";
 
 /**
  * The venue surface the loop drives.
@@ -336,19 +336,39 @@ export interface CoreLoopOptions {
    * else. An eviction is counted on `seams.retention` / `seams.orders`.
    */
   readonly retention?: RetentionBounds;
+  /**
+   * `FOLD-1` — how often the loop checks its HELD ledger view (and, when
+   * `pnl` is on, its held PnL streams) against a rebuild from zero
+   * (`folds.ts`). Omitted: the PAPER cadence, `PAPER_ACCOUNTING_CHECKS` —
+   * the ledger every 50 posted fills, no PnL check (user ruling F2). The test
+   * and golden harnesses pass `EVERY_FILL_ACCOUNTING_CHECKS` in code
+   * (orchestrator call O1). A programmatic option, never operator
+   * configuration; the constructor refuses a cadence that is not a positive
+   * safe integer.
+   */
+  readonly accountingChecks?: AccountingChecks;
 }
 
 /**
  * `CoreLoop.health()`'s answer: a {@link HealthSnapshot} whose `TRDR-4` seams
- * are always present. `HealthSnapshot` keeps them optional only for holders of
- * no loop (see `health.ts`, `SeamHealth.orders`).
+ * and `FOLD-1` seam are always present. `HealthSnapshot` keeps them optional
+ * only for holders of no loop (see `health.ts`, `SeamHealth.orders`).
  */
 export type LoopHealthSnapshot = HealthSnapshot & {
   readonly seams: HealthSnapshot["seams"] & {
     readonly orders: OrderLifecycleMetrics;
     readonly retention: RetentionHealth;
+    readonly folds: FoldHealth;
   };
 };
+
+/** What {@link CoreLoop.checkAccountingRebuild} answers. */
+export interface AccountingRebuildCheck {
+  /** `true` when the held ledger view — and every held PnL stream checked — equals its rebuild. */
+  readonly matched: boolean;
+  /** How many held PnL streams were compared (0 when the PnL check is off). */
+  readonly pnlStreamsChecked: number;
+}
 
 /**
  * The per-order state `CoreLoop` holds, as sizes — `TRDR-4`'s observation
@@ -550,7 +570,14 @@ export class CoreLoop {
   #lateFillsAfterSettlement = 0;
   #settleMismatches = 0;
 
-  #ledger: Ledger;
+  /**
+   * `FOLD-1`: the ledger, its HELD view, and the held PnL streams — together
+   * (`folds.ts`). The ledger and its view have ONE writer,
+   * `HeldAccounting.adopt`, so they cannot drift apart; the four projection
+   * read sites read `view`, which is folded from zero only at construction and
+   * by the rebuild checks.
+   */
+  readonly #held: HeldAccounting;
   #cash: string;
   #recentIntentIds: string[] = [];
   #lastInstant: string;
@@ -579,16 +606,18 @@ export class CoreLoop {
   /**
    * The §9.16 record stream per strategy instance, in production order.
    *
-   * Held rather than folded incrementally because `foldPnlRecords` is a FOLD
-   * over the whole stream: §6 invariant 8's rebuildability is the property that
-   * matters, and a fold from zero over the retained records is exactly the
-   * rebuild. The records themselves come from `buildFillPosting`, so they are
-   * the ledger's own derivation and not a second accounting.
+   * `FOLD-1`: kept WHOLE, but no longer folded from zero on every fill. The
+   * PnL state each snapshot reads is HELD per instance and advanced with only
+   * the new records (`folds.ts`, `HeldAccounting.advancePnl`); this list is
+   * what a rebuild from zero reads — §6 invariant 8's rebuild, now RUN as a
+   * check (every fill in the test harnesses; not in PAPER, user ruling F2) —
+   * and what `pnlRecords()` returns. The records themselves come from
+   * `buildFillPosting`, so they are the ledger's own derivation and not a
+   * second accounting.
    *
-   * NOT BOUNDED by `TRDR-4`, and said so rather than implied: bounding it needs
-   * a snapshot-plus-tail fold that stays byte-identical (§6 invariant 8,
-   * §12.4), which is the queued `LOOPMEM-FOLD` item. The in-memory `Ledger` is
-   * unbounded for the same reason. This loop is therefore NOT memory-bounded.
+   * NOT BOUNDED, and said so rather than implied: bounding it (and the
+   * in-memory `Ledger`) is `LOOPMEM-FOLD` Option 4, deferred behind
+   * `RECON2-DURABLE`. This loop is therefore NOT memory-bounded.
    */
   readonly #pnlRecords = new Map<string, PnlRecord[]>();
   /** Epoch-millisecond instants of this process's own submissions (§9.8 check 19). */
@@ -600,7 +629,8 @@ export class CoreLoop {
       name: "ingest",
       maximumDepth: options.config.queues.ingestMaximumDepth,
     });
-    this.#ledger = options.ledger;
+    // `FOLD-1`: the ONE fold from zero outside the rebuild checks.
+    this.#held = new HeldAccounting(options.ledger, options.accountingChecks ?? {});
     this.#cash = options.config.accounting.startingCash;
     this.#lastInstant = options.clock.now();
     this.#reference = new ReferenceState({
@@ -727,7 +757,44 @@ export class CoreLoop {
   }
 
   ledger(): Ledger {
-    return this.#ledger;
+    return this.#held.ledger;
+  }
+
+  /**
+   * `FOLD-1`: the HELD ledger view — the projection the loop's four read
+   * sites read, advanced per posting rather than folded from zero. It is
+   * frozen, and equals `projectLedger(ledger())` byte for byte and in Map
+   * order; that equality is what {@link checkAccountingRebuild} and the
+   * cadence checks verify. Published for the harnesses that pin it.
+   */
+  ledgerView(): LedgerProjection {
+    return this.#held.view;
+  }
+
+  /**
+   * `FOLD-1`: one instance's HELD PnL state — the fold of the records its
+   * snapshots were computed from (all of them, unless a refused record stops
+   * the stream, when it is the state before that record) — or `undefined`
+   * before its first snapshot. Published for the harnesses that pin it.
+   */
+  pnlState(instanceId: string): PnlState | undefined {
+    return this.#held.pnlState(instanceId);
+  }
+
+  /**
+   * `FOLD-1` (user ruling F2): the rebuild check a run ends with — at
+   * SHUTDOWN (`main.ts`, once the pump stops) and at the END OF A RUN (a
+   * backtest's `runBacktest`, the test harnesses). Always checks the ledger
+   * view; also every held PnL stream when the loop's cadence has `pnl` on.
+   *
+   * A mismatch is a GLOBAL `ACCOUNTING_REBUILD_MISMATCH` halt, exactly as on
+   * the cadence; the answer says whether one was found. TOTAL: never throws.
+   */
+  checkAccountingRebuild(trigger: "SHUTDOWN" | "END_OF_RUN"): AccountingRebuildCheck {
+    const at = trigger === "SHUTDOWN" ? "at shutdown" : "at the end of the run";
+    const ledgerMatched = this.#checkLedgerRebuild(at, this.#lastInstant);
+    const pnl = this.#held.pnlCheck ? this.#checkPnlRebuild(at, this.#lastInstant) : { matched: true, checked: 0 };
+    return Object.freeze({ matched: ledgerMatched && pnl.matched, pnlStreamsChecked: pnl.checked });
   }
 
   queueMetrics(): readonly QueueMetrics[] {
@@ -768,10 +835,11 @@ export class CoreLoop {
         allocator: this.#options.allocator.metrics(),
         orders,
         retention,
+        folds: this.#held.health(),
       },
-      // The cast narrows only what was supplied on the line above: both
-      // `TRDR-4` seams are passed, and `HealthState.snapshot` carries every
-      // seam it is given.
+      // The cast narrows only what was supplied on the lines above: both
+      // `TRDR-4` seams and the `FOLD-1` seam are passed, and
+      // `HealthState.snapshot` carries every seam it is given.
     }) as LoopHealthSnapshot;
   }
 
@@ -1330,9 +1398,12 @@ export class CoreLoop {
    * delivers the fill to the strategy — the projection is folded from the
    * append-only ledger, so a fill that has been posted is already in the view
    * the very next evaluation sees.
+   *
+   * `FOLD-1`: the HELD view, which a posting advances before its ledger is
+   * adopted (`HeldAccounting.adopt`), so the same holds without a fold here.
    */
   #positionView(instance: RegisteredInstance, instant: string): VirtualPositionView {
-    const projection = projectionOf(this.#ledger);
+    const projection = this.#held.view;
     let yesShares = "0";
     let noShares = "0";
     const yesAsset = this.#options.tokenAssetIds.get(
@@ -1507,7 +1578,7 @@ export class CoreLoop {
     }
     const approvedIntentId = this.#options.ids.next();
     const marketConfig = input.market.config;
-    const projection = projectionOf(this.#ledger);
+    const projection = this.#held.view;
     const positions = this.#positionsFor(input.instance, marketConfig, projection);
     const bookAgeMs = this.#bookAgeMs(input.market, input.epochMs);
 
@@ -1703,7 +1774,7 @@ export class CoreLoop {
       const reserved = this.#options.allocator.applyForPlan({
         entries: allocatorEntries,
         liveOwners: this.#liveOwners(),
-        projection: projectionOf(this.#ledger),
+        projection: this.#held.view,
         availableCollateral: this.#cash,
       });
       if (!reserved.ok) {
@@ -2227,17 +2298,23 @@ export class CoreLoop {
         continue;
       }
 
-      const posted = postFill({
-        ledger: this.#ledger,
-        fill,
-        claims: [
-          { instanceId: instance.instanceId, runId: instance.runId, shares: fill.shares },
-        ],
-        identity: this.#options.posting,
-        ids: this.#options.ids,
-        tokenAssetId:
-          this.#options.tokenAssetIds.get(`${fill.marketId}|${fill.side}`) ?? fill.tokenId,
-      });
+      // `FOLD-1`: the posting's APPENDED transactions are folded onto the held
+      // ledger view before anything is adopted. A fold that fails is a failed
+      // posting (stage `VIEW_FOLD`) and takes the SAME branch as `postFill`'s
+      // own failures: nothing booked, the ledger and its view unmoved.
+      const posted = this.#held.fold(
+        postFill({
+          ledger: this.#held.ledger,
+          fill,
+          claims: [
+            { instanceId: instance.instanceId, runId: instance.runId, shares: fill.shares },
+          ],
+          identity: this.#options.posting,
+          ids: this.#options.ids,
+          tokenAssetId:
+            this.#options.tokenAssetIds.get(`${fill.marketId}|${fill.side}`) ?? fill.tokenId,
+        }),
+      );
       if (!posted.ok) {
         this.#options.health.countAccounting("ledgerRefusals");
         this.#options.halts.halt(
@@ -2248,7 +2325,9 @@ export class CoreLoop {
         );
         continue;
       }
-      this.#ledger = posted.ledger;
+      // The ledger and its view, adopted together; then the cadence's check.
+      const checkDue = this.#held.adopt(posted);
+      if (checkDue) this.#checkLedgerRebuild(this.#cadenceTrigger(), instant);
       this.#countBookedShares(fill);
       this.#options.health.countAccounting("ledgerTransactions", posted.appended.length);
       this.#options.health.countAccounting("pnlRecords", posted.pnlRecords.length);
@@ -2296,7 +2375,7 @@ export class CoreLoop {
       // ledger derived. A refusal here is not a halt — PnL is a projection, and
       // §6 invariant 8 makes the append-only ledger the monetary source of
       // truth — but a store failure IS, on §4.2's terms.
-      await this.#writePnlSnapshot(instance, fill, instant);
+      await this.#writePnlSnapshot(instance, fill, instant, checkDue);
 
       booked.push({ instance, fill });
     }
@@ -2393,15 +2472,19 @@ export class CoreLoop {
             "plan its answer called refused, without listing it as booked), or settled and since evicted from " +
             "the tombstone map; posted UNATTRIBUTED (TRDR-4)";
 
-    const posted = postFill({
-      ledger: this.#ledger,
-      fill,
-      claims: [],
-      identity: this.#options.posting,
-      ids: this.#options.ids,
-      tokenAssetId:
-        this.#options.tokenAssetIds.get(`${fill.marketId}|${fill.side}`) ?? fill.tokenId,
-    });
+    // `FOLD-1`: folded onto the held view before adoption, exactly as an
+    // owned fill's posting is (`#harvestFills`).
+    const posted = this.#held.fold(
+      postFill({
+        ledger: this.#held.ledger,
+        fill,
+        claims: [],
+        identity: this.#options.posting,
+        ids: this.#options.ids,
+        tokenAssetId:
+          this.#options.tokenAssetIds.get(`${fill.marketId}|${fill.side}`) ?? fill.tokenId,
+      }),
+    );
     if (!posted.ok) {
       this.#options.health.countAccounting("ledgerRefusals");
       this.#options.halts.halt(
@@ -2412,7 +2495,7 @@ export class CoreLoop {
       );
       return "REFUSED";
     }
-    this.#ledger = posted.ledger;
+    if (this.#held.adopt(posted)) this.#checkLedgerRebuild(this.#cadenceTrigger(), instant);
     this.#countBookedShares(fill);
     this.#options.health.countAccounting("ledgerTransactions", posted.appended.length);
     this.#options.health.countAccounting("pnlRecords", posted.pnlRecords.length);
@@ -2447,9 +2530,14 @@ export class CoreLoop {
    * either (§9.9 says halting is the composition root's act, and this is that
    * act). `notes` names what the projection cannot know (an unowned fill's
    * probable owner) for the halt detail.
+   *
+   * `FOLD-1`: reads the HELD view — and hands `haltOnLedgerProjection` the
+   * WHOLE of it, as before, so which halts latch is unchanged (the queued
+   * `FOLD-RELATCH` item is about exactly that whole-history read, and is not
+   * this round's).
    */
   #readProjection(instant: string, notes?: ReadonlyMap<string, string>): void {
-    const projection = projectionOf(this.#ledger);
+    const projection = this.#held.view;
     const arrivals = projection.unattributedActivity.filter(
       (record) => record.activityKind === "ACTUAL_ARRIVAL",
     ).length;
@@ -2466,6 +2554,61 @@ export class CoreLoop {
       this.#seenUnexplained = unexplained;
     }
     haltOnLedgerProjection(this.#options.halts, projection, instant, notes);
+  }
+
+  /** `FOLD-1`: how a cadence check names itself in a halt detail. */
+  #cadenceTrigger(): string {
+    return `after posted fill ${String(this.#held.fillsPosted)} (the check runs every ${String(this.#held.everyFills)})`;
+  }
+
+  /**
+   * `FOLD-1` (user ruling F2): the held ledger view against
+   * `projectLedger(ledger)` on serialized bytes. A mismatch is counted and is
+   * a GLOBAL `ACCOUNTING_REBUILD_MISMATCH` halt — fail-closed, never silent —
+   * and the held view is replaced by the rebuild (`folds.ts`). Answers
+   * whether they matched.
+   */
+  #checkLedgerRebuild(trigger: string, instant: string): boolean {
+    const mismatch = this.#held.checkLedger();
+    if (mismatch === undefined) return true;
+    this.#options.halts.halt(
+      { kind: "GLOBAL" },
+      "ACCOUNTING_REBUILD_MISMATCH",
+      `the held ledger view differs from projectLedger(ledger) rebuilt from zero, ${trigger}: ` +
+        `${mismatch.detail}. §6 invariant 8 requires the rebuild to equal the incremental state, so ` +
+        "this process no longer trusts the positions it decides from; " +
+        (mismatch.replaced ? "the view was replaced by the rebuild" : "the held view was kept") +
+        " (FOLD-1)",
+      instant,
+    );
+    return false;
+  }
+
+  /**
+   * `FOLD-1`: every held PnL stream against `foldPnlRecords` over its records,
+   * on serialized bytes — only when the cadence has `pnl` on (the test and
+   * golden harnesses; user ruling F2 keeps it out of PAPER). A mismatch is
+   * counted and is the same GLOBAL halt; the stream is replaced by the rebuild.
+   */
+  #checkPnlRebuild(trigger: string, instant: string): { readonly matched: boolean; readonly checked: number } {
+    let matched = true;
+    let checked = 0;
+    for (const instanceId of this.#held.pnlStreamIds()) {
+      checked += 1;
+      const mismatch = this.#held.checkPnl(instanceId, this.#pnlRecords.get(instanceId) ?? []);
+      if (mismatch === undefined) continue;
+      matched = false;
+      this.#options.halts.halt(
+        { kind: "GLOBAL" },
+        "ACCOUNTING_REBUILD_MISMATCH",
+        `instance ${instanceId}'s held PnL state differs from foldPnlRecords over its records, rebuilt ` +
+          `from zero, ${trigger}: ${mismatch.detail}. ` +
+          (mismatch.replaced ? "The stream was replaced by the rebuild" : "The held stream was kept") +
+          " (FOLD-1)",
+        instant,
+      );
+    }
+    return { matched, checked };
   }
 
   /** Completes a fill's §6 invariant 4 chain from its order's prefix, when one is held. */
@@ -2586,27 +2729,44 @@ export class CoreLoop {
    * token, which is a fact rather than a model. §9.16's other marks (model,
    * liquidation) need inputs this process does not yet hold, and inventing one
    * would put a fabricated number into an accounting row.
+   *
+   * `FOLD-1`: the fold is the instance's HELD stream, advanced with only the
+   * records it has not folded yet (`HeldAccounting.advancePnl`), where this
+   * used to run `foldPnlRecords` over the whole stream on every fill. The rest
+   * is as it was — the same early returns in the same order, the same marks —
+   * and a refused record stops this instance's snapshots exactly as the
+   * from-zero fold did: the held stream RETRIES FROM THE FAILURE POINT, so it
+   * refuses on every later fill for as long as the from-zero fold would have
+   * (user ruling F3 adds only the count, on `seams.folds.pnlRefusals`). The
+   * stream is opened here, on first use, so an identity `packages/pnl`
+   * refuses throws from exactly where it used to. When the cadence's check is
+   * due and `pnl` is on, every held stream is compared with its rebuild
+   * BEFORE the snapshot is computed, so a mismatch's replacement is what the
+   * snapshot reads.
    */
   async #writePnlSnapshot(
     instance: RegisteredInstance,
     fill: SimulatedFill,
     instant: string,
+    checkDue: boolean,
   ): Promise<void> {
     const records = this.#pnlRecords.get(instance.instanceId);
     if (records === undefined || records.length === 0) return;
-    const identity: PnlStreamIdentity = {
+    const identity = (): PnlStreamIdentity => ({
       scope: "VIRTUAL_STRATEGY",
       environment: this.#options.config.environment,
       accountRef: this.#options.posting.accountRef,
       instanceId: instance.instanceId,
       runId: instance.runId,
       marketId: instance.marketId,
-    };
-    const folded = foldPnlRecords(identity, records);
-    if (!folded.ok) return;
+    });
+    this.#held.advancePnl(instance.instanceId, identity, records);
+    if (checkDue && this.#held.pnlCheck) this.#checkPnlRebuild(this.#cadenceTrigger(), instant);
+    const folded = this.#held.completePnlState(instance.instanceId);
+    if (folded === undefined) return;
     const tokenAssetId =
       this.#options.tokenAssetIds.get(`${fill.marketId}|${fill.side}`) ?? fill.tokenId;
-    const snapshots = computePnlSnapshot(folded.value, {
+    const snapshots = computePnlSnapshot(folded, {
       asOf: instant,
       marks: { [tokenAssetId]: { midpoint: fill.price } },
     });
@@ -2888,7 +3048,7 @@ export class CoreLoop {
   #positionsFor(
     instance: RegisteredInstance,
     marketConfig: MarketConfig,
-    projection: ReturnType<typeof projectionOf>,
+    projection: LedgerProjection,
   ): readonly { readonly marketId: string; readonly side: "YES" | "NO"; readonly shares: string; readonly costBasis: string }[] {
     const yesAsset = this.#options.tokenAssetIds.get(`${marketConfig.marketId}|YES`);
     const noAsset = this.#options.tokenAssetIds.get(`${marketConfig.marketId}|NO`);

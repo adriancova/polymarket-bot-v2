@@ -78,6 +78,17 @@ export type HaltReasonCode =
   | "UNEXPLAINED_ACTUAL_MOVEMENT"
   /** §9.15: the ledger refused a posting; the accounting record is incomplete. */
   | "LEDGER_POSTING_REFUSED"
+  /**
+   * `FOLD-1` (§6 invariant 8, ADR-006 §1 "A rebuild from zero must equal the
+   * incremental state"): the loop's HELD accounting state — the ledger view it
+   * advances per posting, or a PnL stream it advances per record — differs,
+   * on serialized bytes, from its rebuild from zero (`folds.ts`). The
+   * positions this process decides from are then not the ledger's, so it
+   * makes no further decision anywhere: GLOBAL, `FULL_HALT`. The held state
+   * is replaced by the rebuild, so the accounting that continues under the
+   * halt reads the ledger's truth.
+   */
+  | "ACCOUNTING_REBUILD_MISMATCH"
   /** §6 invariant 6: a cancel never reached a terminal fact within its bound. */
   | "CANCEL_UNRESOLVED"
   /**
@@ -151,6 +162,7 @@ const ACTION_FOR: Readonly<Record<HaltReasonCode, HaltRecord["action"]>> = Objec
   UNATTRIBUTED_ACTIVITY: "RECONCILE_ACCOUNT",
   UNEXPLAINED_ACTUAL_MOVEMENT: "RECONCILE_ACCOUNT",
   LEDGER_POSTING_REFUSED: "FULL_HALT",
+  ACCOUNTING_REBUILD_MISMATCH: "FULL_HALT",
   CANCEL_UNRESOLVED: "MANAGE_KNOWN_POSITIONS_ONLY",
   BASKET_PARTIALLY_EXECUTED: "MANAGE_KNOWN_POSITIONS_ONLY",
   VENUE_OBSERVATION_FAILED: "RECONCILE_ACCOUNT",

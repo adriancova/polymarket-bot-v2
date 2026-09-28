@@ -43,6 +43,7 @@ import {
   type TimeInForce,
 } from "@polymarket-bot/simulation";
 import {
+  EVERY_FILL_ACCOUNTING_CHECKS,
   createPaperTrader,
   type CreateTraderResult,
   type IngestedEvent,
@@ -732,6 +733,9 @@ export function assemble(
     venue: venue as unknown as Parameters<typeof createPaperTrader>[0]["venue"],
     store,
     idNamespace: options.idNamespace ?? "wp-230-fixture",
+    // `FOLD-1` (orchestrator call O1): the held ledger view and PnL streams
+    // are checked against their rebuilds from zero after EVERY fill.
+    accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
   });
   if (!result.ok) return { result, parts: undefined };
   wiring.trader = result.trader;

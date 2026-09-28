@@ -72,6 +72,7 @@ import { addDecimal } from "@polymarket-bot/decimal";
 import type { AllocatorMetrics } from "./allocation.js";
 import type { CancelLedgerMetrics } from "./cancels.js";
 import type { FillDeduplicatorMetrics } from "./fills.js";
+import type { FoldHealth } from "./folds.js";
 import type { HaltRecord } from "./halt.js";
 import type { OrderLifecycleMetrics, RetentionHealth } from "./order-lifecycle.js";
 import type { OrderViewMetrics } from "./orders.js";
@@ -344,6 +345,16 @@ export interface SeamHealth {
    * reason as {@link SeamHealth.orders}, and always supplied by the loop.
    */
   readonly retention?: RetentionHealth;
+  /**
+   * `FOLD-1` — the loop's HELD accounting state (`folds.ts`): the cadence of
+   * its rebuild checks, how many ran, their mismatches (each a GLOBAL
+   * `ACCOUNTING_REBUILD_MISMATCH` halt), and the refused PnL records per
+   * instance and code (ruling F3). A NEW seam key — never a field under
+   * `accounting` or `loop`, which the paper-e2e golden copies whole. Optional
+   * on this type for the same reason as {@link SeamHealth.orders}, and always
+   * supplied by the loop; the control API's strict door requires it.
+   */
+  readonly folds?: FoldHealth;
 }
 
 export interface HealthSnapshot {
@@ -533,6 +544,8 @@ export class HealthState {
         // zeroed — when it did not (see `SeamHealth.orders`).
         ...(input.seams.orders === undefined ? {} : { orders: input.seams.orders }),
         ...(input.seams.retention === undefined ? {} : { retention: input.seams.retention }),
+        // `FOLD-1`: the same rule — carried when measured, never zeroed.
+        ...(input.seams.folds === undefined ? {} : { folds: input.seams.folds }),
       }),
       riskSeamCaveat: RISK_SEAM_CAVEAT,
       asOf: input.asOf,

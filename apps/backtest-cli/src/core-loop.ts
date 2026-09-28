@@ -97,6 +97,13 @@ export interface ReplayIngestedEvent {
 export interface ReplayDrivenLoop {
   ingest(event: ReplayIngestedEvent): boolean;
   drain(): Promise<void>;
+  /**
+   * `FOLD-1` — the core's END-OF-RUN accounting rebuild check (`apps/trader`'s
+   * `CoreLoop.checkAccountingRebuild`: its held ledger view against a rebuild
+   * from zero; a mismatch latches the core's own GLOBAL halt). Optional so a
+   * structural double without one still drives; the real core has it.
+   */
+  checkAccountingRebuild?(trigger: "END_OF_RUN"): unknown;
 }
 
 /** Inputs to {@link replayDrivenCoreLoop}. */
@@ -120,6 +127,12 @@ export interface ReplayDriverObservations {
 export interface ReplayDrivenCoreLoop {
   readonly coreLoop: ReplayCoreLoop;
   observations(): ReplayDriverObservations;
+  /**
+   * `FOLD-1` — the END OF THE RUN: runs the core's end-of-run accounting
+   * rebuild check, when the core has one. Hand it to `runBacktest` as
+   * `endOfRun`, which calls it once the replay returns.
+   */
+  endOfRun(): void;
 }
 
 /**
@@ -176,5 +189,8 @@ export function replayDrivenCoreLoop(options: ReplayDrivenCoreLoopOptions): Repl
   return {
     coreLoop,
     observations: () => Object.freeze({ eventsIngested, drains }),
+    endOfRun: () => {
+      options.loop.checkAccountingRebuild?.("END_OF_RUN");
+    },
   };
 }

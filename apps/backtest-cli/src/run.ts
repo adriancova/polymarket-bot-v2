@@ -69,6 +69,16 @@ export interface BacktestRunOptions {
    * replay that produced decisions shows them as bytes, not as a claim.
    */
   readonly venue?: SimulatedVenue;
+  /**
+   * `FOLD-1` — called ONCE when the replay returns, whether it completed or
+   * was refused part-way: the core's end-of-run accounting rebuild check
+   * ({@link ./core-loop.js#replayDrivenCoreLoop}'s `endOfRun`). A backtest
+   * core keeps the PAPER cadence (a check every 50 posted fills) plus this
+   * one; a mismatch latches the core's own GLOBAL halt, which the caller
+   * reads from the core. Not called when the run never started (a refused
+   * environment, run pins or manifest).
+   */
+  readonly endOfRun?: () => unknown;
 }
 
 /** What a backtest run produced, or why it did not run. */
@@ -103,6 +113,7 @@ export async function runBacktest(options: BacktestRunOptions): Promise<Backtest
     ...(options.coreLoop === undefined ? {} : { coreLoop: options.coreLoop }),
     ...(options.venue === undefined ? {} : { venue: options.venue }),
   });
+  options.endOfRun?.();
   if (!result.ok) return { ok: false, refusal: result.refusal };
 
   return { ok: true, runMode: BACKTEST_RUN_MODE, result: result.value };

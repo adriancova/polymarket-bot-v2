@@ -59,6 +59,7 @@ import {
   type BacktestOutcome,
 } from "../../../apps/backtest-cli/src/index.js";
 import {
+  EVERY_FILL_ACCOUNTING_CHECKS,
   createPaperTrader,
   projectionOf,
   type DecisionTrace,
@@ -331,6 +332,12 @@ export function assembleSharedCore(fixture: Fixture): SharedCore {
     venue,
     store,
     idNamespace: ID_NAMESPACE,
+    // `FOLD-1` (orchestrator call O1): the golden runs with the held ledger
+    // view AND the held PnL streams checked against their rebuilds from zero
+    // after EVERY fill; a mismatch latches a GLOBAL halt, which the
+    // artefact's `halts=` line would show. A real backtest keeps the PAPER
+    // cadence; this is a test harness.
+    accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
   });
   if (!created.ok) {
     throw new Error(
@@ -380,6 +387,8 @@ export async function replayThroughShippedRoot(options: {
     environment: paperEnvironment(),
     coreLoop: driver.coreLoop,
     venue: core.venue,
+    // `FOLD-1`: the end-of-run rebuild check, run by the shipped root.
+    endOfRun: driver.endOfRun,
   });
   return { outcome, core, driver: driver.observations() };
 }
