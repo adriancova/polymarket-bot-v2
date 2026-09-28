@@ -47,6 +47,8 @@ import type { EventEnvelope } from "@polymarket-bot/domain";
 import type { FeeScheduleSnapshot, RecordedEventIdentity } from "@polymarket-bot/simulation";
 import type { IngestedEvent } from "@polymarket-bot/trader";
 
+import type { Scenario } from "./scenario-contract.js";
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -428,7 +430,12 @@ function eventId(ordinal: number): string {
   return `018f5c20-9000-7a90-8b00-${String(ordinal).padStart(12, "0")}`;
 }
 
-interface Recorded {
+/**
+ * One recorded event, before it is given its identity. Exported (`BRACKET-1b`)
+ * so a second scenario mints its events through {@link recordedEventsOf}, the
+ * same function — and therefore the same identity scheme — as this one.
+ */
+export interface Recorded {
   readonly eventType: string;
   readonly payload: unknown;
   readonly receivedAt: string;
@@ -561,7 +568,53 @@ function ingested(recorded: Recorded, ordinal: number): IngestedEvent {
   return { envelope, identity };
 }
 
+/**
+ * Any recorded list's events: `ingestSeq` is the array position plus one, and
+ * the identity is a pure function of that ordinal and the literal instant.
+ */
+export function recordedEventsOf(list: readonly Recorded[]): readonly IngestedEvent[] {
+  return Object.freeze(list.map((recorded, index) => ingested(recorded, index + 1)));
+}
+
 /** The scenario's events. A pure function of module constants. */
 export function recordedEvents(): readonly IngestedEvent[] {
-  return Object.freeze(RECORDED.map((recorded, index) => ingested(recorded, index + 1)));
+  return recordedEventsOf(RECORDED);
 }
+
+// ---------------------------------------------------------------------------
+// The scenario, as the harness, the capture and the golden take it
+// ---------------------------------------------------------------------------
+
+/**
+ * THIS scenario as a {@link Scenario} value (`BRACKET-1b`, E1): every field is
+ * one of the constants or functions above, unchanged, so a run driven by it is
+ * the run this module always described, and the committed
+ * `paper-e2e-run.json` is its golden. It is the default everywhere a scenario
+ * can be passed.
+ */
+export const PAPER_E2E_SCENARIO: Scenario = Object.freeze({
+  name: "paper-e2e",
+  idNamespace: ID_NAMESPACE,
+  clockStart: T_OPEN,
+  constants: Object.freeze({
+    marketId: MARKET_ID,
+    yesTokenId: YES_TOKEN,
+    noTokenId: NO_TOKEN,
+    instanceId: INSTANCE_ID,
+    runId: RUN_ID,
+    accountRef: ACCOUNT_REF,
+    denominationAssetId: DENOMINATION_ASSET_ID,
+    startingCash: STARTING_CASH,
+    entryShares: ENTRY_SHARES,
+    triggerPriceLte: TRIGGER_PRICE_LTE,
+    maximumBuyPrice: MAXIMUM_BUY_PRICE,
+    maximumTotalCost: MAXIMUM_TOTAL_COST,
+    takeProfitPrice: TAKE_PROFIT_PRICE,
+    entryFeePerShare: ENTRY_FEE_PER_SHARE,
+    exitFeePerShare: EXIT_FEE_PER_SHARE,
+  }),
+  feeSnapshot,
+  traderConfig,
+  events: recordedEvents,
+  goldenFile: "paper-e2e-run.json",
+});

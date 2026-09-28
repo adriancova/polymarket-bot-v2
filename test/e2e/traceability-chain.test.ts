@@ -13,11 +13,18 @@
  * The walk is run against BOTH the bytes this run produced and the COMMITTED
  * GOLDEN bytes, so the criterion is asserted about the artefact under review as
  * well as about the artefact under regeneration.
+ *
+ * `BRACKET-1b` converted two rows here into the rules they always stood for,
+ * now that a run exists in which each rule's other case occurs
+ * (`two-brackets.test.ts` walks it): a chain is anchored in a RECORDED event
+ * unless the loop ORIGINATED its evaluation (`RECON2-EVENTHOP`), and a fill
+ * books a fee posting exactly when its fee is not zero (a MAKER fill at
+ * `makerFeeRate "0"` books two, `packages/ledger/src/fill-posting.ts:355`).
  */
 
 import { describe, expect, it } from "vitest";
 
-import { addDecimal } from "@polymarket-bot/decimal";
+import { addDecimal, compareDecimal } from "@polymarket-bot/decimal";
 
 import { captureArtifact, serializeArtifact, type PaperRunArtifact } from "./support/artifact.js";
 import { explainWalk, walkChains, HOPS } from "./support/chain-walk.js";
@@ -55,7 +62,10 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
     // The position really is closed — the property those counters exist to show.
     expect(run.fills.filter((fill) => fill.action === "BUY")).toHaveLength(2);
     expect(run.fills.filter((fill) => fill.action === "SELL")).toHaveLength(1);
-    // Three postings per fill: principal, token movement, fee.
+    // Principal and token movement for every fill, and a fee posting exactly
+    // when the fee is not zero (`fill-posting.ts:355`, `BRACKET-1b`): all three
+    // of this run's fills are TAKER fills with a fee, so 3 × 3.
+    expect(run.fills.every((fill) => compareDecimal(fill.feeAmount, "0") !== 0)).toBe(true);
     expect(health.accounting.ledgerTransactions).toBe(9);
     expect(health.accounting.unattributedActivity).toBe(0);
     expect(health.accounting.unexplainedMovements).toBe(0);
@@ -129,11 +139,31 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
     }
   });
 
+  /**
+   * CONVERTED (`BRACKET-1b`, `RECON2-EVENTHOP`). This row read "every trace's
+   * source event is recorded", which held only because no order placed by an
+   * evaluation the loop ORIGINATED (`onFill`, `onOrderUpdate`) had ever filled
+   * — this run's take-profit rests and is withdrawn. The rule it stands for is
+   * the provenance rule: a chain names a RECORDED event, or names `""` exactly
+   * when its persisted decision states none, and then ends at that decision
+   * and its feature snapshot. Every chain of THIS run is of the first kind; the
+   * two-bracket run's filled take-profit is of the second
+   * (`two-brackets.test.ts`).
+   */
   it("the chain is anchored in the RECORDED event, not in a clock", async () => {
     const artifact = captureArtifact(await driveScenario());
     const eventIds = new Set(artifact.events.map((event) => event.eventId));
     for (const trace of artifact.traces) {
-      expect(eventIds.has(trace.sourceEventId)).toBe(true);
+      const decision = artifact.decisions.find(
+        (candidate) =>
+          candidate.runId === trace.runId && candidate.evaluationSeq === trace.evaluationSeq,
+      );
+      const anchored =
+        eventIds.has(trace.sourceEventId) && decision?.sourceEventId === trace.sourceEventId;
+      const loopOriginated = trace.sourceEventId === "" && decision?.sourceEventId === null;
+      expect(anchored || loopOriginated).toBe(true);
+      // THIS run's chains are all of the first kind.
+      expect(anchored).toBe(true);
     }
     // TWO source events and TWO evaluations, not one: the entry's two chains
     // descend from the same event and the same decision — the fan-out happens
@@ -157,12 +187,19 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
   it("the two ends of the chain agree on the money: fills, postings and PnL", async () => {
     const artifact = captureArtifact(await driveScenario());
 
-    // Each fill produced exactly three postings — principal, token movement and
-    // fee — and every posting is claimed by exactly one chain. (`RISK-2`: two
-    // fills and six postings became three and nine when the exit began to
-    // execute. The INVARIANT — three per fill, each claimed once — is unchanged,
-    // and is what this row measures.)
+    // Each fill produced a principal and a token-movement posting, plus a fee
+    // posting exactly when its fee is not zero — and every posting is claimed by
+    // exactly one chain. (`RISK-2`: two fills and six postings became three and
+    // nine when the exit began to execute. `BRACKET-1b` CONVERTED "three per
+    // fill" into the rule it stood for, `fill-posting.ts:355`: every fill here
+    // is a TAKER fill with a fee, so it is still nine; the two-bracket run's
+    // zero-fee MAKER fill books two.)
     expect(artifact.fills).toHaveLength(3);
+    const perFill = artifact.fills.map((fill) => {
+      const trace = artifact.traces.find((candidate) => candidate.venueFillId === fill.simulatedFillId);
+      return [trace?.ledgerTransactionIds.length, compareDecimal(fill.feeAmount, "0") !== 0 ? 3 : 2];
+    });
+    for (const [booked, expected] of perFill) expect(booked).toBe(expected);
     expect(artifact.ledgerTransactions).toHaveLength(9);
     const claimed = artifact.traces.flatMap((trace) => trace.ledgerTransactionIds);
     expect(claimed).toHaveLength(9);

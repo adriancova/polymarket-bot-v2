@@ -24,31 +24,30 @@
  * | `DecisionTelemetry.evaluationDurationUs` | `packages/strategy-runtime` documents it as "machine-dependent by nature; excluded from `DecisionRecord` so §12.4 byte-identity holds". It is a wall-elapsed measurement, and a golden that froze it would be freezing the host. |
  * | `HealthSnapshot.riskSeamCaveat` | a long prose constant owned by `apps/trader`. `residuals-observed.test.ts` pins it by IDENTITY against the exported `RISK_SEAM_CAVEAT`, which is drift-proof; copying its text into a golden this package owns would make an upstream wording fix look like a determinism failure. |
  * | anything read from a clock, an environment or a filesystem | there is none. Every instant in the artefact is derived from the scenario's literal `receivedAt` values. |
+ *
+ * ## Which scenario (`BRACKET-1b`, E1)
+ *
+ * The capture reads the scenario the run was driven by (`Run.scenario`): its
+ * constants fill the `scenario` section, its events the `events` section, and
+ * its instance names the PnL stream. For the original scenario every one of
+ * those is the constant this module used to import by name, so its golden is
+ * unchanged byte for byte.
+ *
+ * ## An evicted venue history is refused HERE, by name (`SIM2-E2E-MSG`)
+ *
+ * The artefact's `orders` and `fills` are the venue's retained HISTORY
+ * (`SimulatedVenue.ordersSnapshot()` / `fills`), which `SIM-2` bounded. A run
+ * whose venue evicted part of it would reach the reconciler with provenance
+ * records and traces naming orders and fills the document no longer holds, and
+ * the reconciler's refusal would say they were "never booked" / "never
+ * produced" — which is false: they were booked, then evicted. So the capture
+ * reads `SimulatedVenue.retention()` FIRST and refuses such a run with the true
+ * reason, before anything else can misname it.
  */
 
 import { projectionOf } from "@polymarket-bot/trader";
 
 import { canonicalJson } from "./canonical-json.js";
-import {
-  ACCOUNT_REF,
-  DENOMINATION_ASSET_ID,
-  ENTRY_FEE_PER_SHARE,
-  ENTRY_SHARES,
-  EXIT_FEE_PER_SHARE,
-  ID_NAMESPACE,
-  INSTANCE_ID,
-  MARKET_ID,
-  MAXIMUM_BUY_PRICE,
-  MAXIMUM_TOTAL_COST,
-  NO_TOKEN,
-  RUN_ID,
-  STARTING_CASH,
-  TAKE_PROFIT_PRICE,
-  TRIGGER_PRICE_LTE,
-  YES_TOKEN,
-  feeSnapshot,
-  recordedEvents,
-} from "./scenario.js";
 import { buildReconciliation, type ReconciliationRow } from "./reconcile.js";
 import type { Run } from "./harness.js";
 
@@ -415,9 +414,12 @@ function intentOf(intent: Record<string, unknown>): ArtifactIntent {
  * ledger.
  */
 export function captureArtifact(run: Run): PaperRunArtifact {
+  refuseEvictedHistory(run);
+  const scenario = run.scenario;
+  const constants = scenario.constants;
   const health = run.trader.loop.health();
   const projection = projectionOf(run.trader.loop.ledger());
-  const fees = feeSnapshot();
+  const fees = scenario.feeSnapshot();
 
   const decisions: ArtifactDecision[] = run.parts.store.decisions.map((written) => {
     const record = written.record;
@@ -504,7 +506,7 @@ export function captureArtifact(run: Run): PaperRunArtifact {
   );
 
   const pnlRecords: ArtifactPnlRecord[] = run.trader.loop
-    .pnlRecords(INSTANCE_ID)
+    .pnlRecords(constants.instanceId)
     .map((record) => {
       const plain = record as unknown as Record<string, unknown>;
       const owner = plain["owner"] as Record<string, unknown>;
@@ -595,22 +597,22 @@ export function captureArtifact(run: Run): PaperRunArtifact {
   const partial: Omit<PaperRunArtifact, "reconciliation"> = {
     goldenFormatVersion: GOLDEN_FORMAT_VERSION,
     scenario: {
-      idNamespace: ID_NAMESPACE,
-      marketId: MARKET_ID,
-      yesTokenId: YES_TOKEN,
-      noTokenId: NO_TOKEN,
-      instanceId: INSTANCE_ID,
-      runId: RUN_ID,
-      accountRef: ACCOUNT_REF,
-      denominationAssetId: DENOMINATION_ASSET_ID,
-      startingCash: STARTING_CASH,
-      entryShares: ENTRY_SHARES,
-      triggerPriceLte: TRIGGER_PRICE_LTE,
-      maximumBuyPrice: MAXIMUM_BUY_PRICE,
-      maximumTotalCost: MAXIMUM_TOTAL_COST,
-      takeProfitPrice: TAKE_PROFIT_PRICE,
-      entryFeePerShare: ENTRY_FEE_PER_SHARE,
-      exitFeePerShare: EXIT_FEE_PER_SHARE,
+      idNamespace: scenario.idNamespace,
+      marketId: constants.marketId,
+      yesTokenId: constants.yesTokenId,
+      noTokenId: constants.noTokenId,
+      instanceId: constants.instanceId,
+      runId: constants.runId,
+      accountRef: constants.accountRef,
+      denominationAssetId: constants.denominationAssetId,
+      startingCash: constants.startingCash,
+      entryShares: constants.entryShares,
+      triggerPriceLte: constants.triggerPriceLte,
+      maximumBuyPrice: constants.maximumBuyPrice,
+      maximumTotalCost: constants.maximumTotalCost,
+      takeProfitPrice: constants.takeProfitPrice,
+      entryFeePerShare: constants.entryFeePerShare,
+      exitFeePerShare: constants.exitFeePerShare,
       feeSchedule: {
         snapshotVersion: fees.snapshotVersion,
         takerFeeRate: fees.takerFeeRate,
@@ -621,7 +623,7 @@ export function captureArtifact(run: Run): PaperRunArtifact {
         feeCurrency: fees.feeCurrency,
       },
     },
-    events: recordedEvents().map((event) => ({
+    events: scenario.events().map((event) => ({
       eventId: event.envelope.eventId,
       eventType: event.envelope.eventType,
       source: event.envelope.source,
@@ -674,6 +676,30 @@ export function captureArtifact(run: Run): PaperRunArtifact {
   };
 
   return { ...partial, reconciliation: buildReconciliation(partial) };
+}
+
+/**
+ * `SIM2-E2E-MSG`: refuses a run whose simulated venue EVICTED any order, fill
+ * or band from its retained history, naming the eviction and the counts.
+ *
+ * `historyEvicted` is the venue's own summary (`SimulatedVenue.retention()`:
+ * `orders.evicted + fills.evicted + bands.evicted > 0`), the same fact
+ * `runReplay` refuses a replay on. Every golden run in this tree evicts
+ * nothing — its venue keeps the defaults — so this is silent for them.
+ */
+function refuseEvictedHistory(run: Run): void {
+  const retention = run.parts.venue.retention();
+  if (!retention.historyEvicted) return;
+  throw new Error(
+    "the simulated venue EVICTED part of its history during this run (orders evicted " +
+      `${String(retention.orders.evicted)}, fills evicted ${String(retention.fills.evicted)}, ` +
+      `bands evicted ${String(retention.bands.evicted)}; SIM-2's bounded retention). The ` +
+      "artefact is built from the venue's RETAINED orders and fills, so evicted ones would be " +
+      "missing from it and every chain and provenance record through them would read as " +
+      "naming an order the venue never booked or a fill it never produced — which is not what " +
+      "happened. The capture refuses the run instead: raise the venue's retention bounds for " +
+      "this scenario",
+  );
 }
 
 /** The canonical bytes of an artefact. This is what the golden holds. */

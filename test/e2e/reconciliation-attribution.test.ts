@@ -86,6 +86,7 @@ import {
   buildReconciliation,
   compareFillIds,
   compareIngestSeq,
+  unexplainedRows,
   type ReconciliationRow,
 } from "./support/reconcile.js";
 import { INSTANCE_ID } from "./support/scenario.js";
@@ -381,6 +382,122 @@ function withSecondEntry(
   );
 }
 
+/**
+ * The strategy's own `SB.REARMED` (`BRACKET-1b`): a `hold` at `evaluationSeq`,
+ * anchored where the golden's `onMarketClosing` decision is — its LAST recorded
+ * event, ingest sequence 8 — after bracket 1's close at `evaluationSeq 9`, and
+ * before a second entry placed at `evaluationSeq` 18 by {@link withSecondEntry}.
+ * (Anchored at the second entry's own source event instead — event 5, which
+ * {@link withSecondEntry} copies from the first — the boundary would precede
+ * bracket 1's fills, and is refused: `two-brackets.test.ts` pins that refusal.)
+ */
+function rearmDecision(artifact: PaperRunArtifact, evaluationSeq: number): ArtifactDecision {
+  const closing = only(
+    artifact.decisions.filter((decision) => decision.callback === "onMarketClosing"),
+    "onMarketClosing decision",
+  );
+  return {
+    ...closing,
+    evaluationSeq,
+    callback: "onFeatures",
+    decisionType: "hold",
+    reasonCodes: ["SB.REARMED"],
+    modelOutputs: {},
+    intents: [],
+  };
+}
+
+/** `artifact` with {@link rearmDecision} at `evaluationSeq` 17. */
+function withRearm(artifact: PaperRunArtifact): PaperRunArtifact {
+  return { ...artifact, decisions: [...artifact.decisions, rearmDecision(artifact, 17)] };
+}
+
+/**
+ * {@link withSecondEntry}'s FILLED chain with its decision's projections made
+ * CONSISTENT with its own fill (10 shares at 0.33), so that as bracket 2 its rows
+ * are explained on their merits: `trigger 0.33`, `entryCost 3.3`, `worstPrice
+ * 0.33`, and the strategy's formula `0.5 × 10 − 3.3 − (0.001 + 0.001) × 10 =
+ * 1.68` as the intent's `expectedNetEdge`.
+ */
+function consistentSecondEntry(artifact: PaperRunArtifact): PaperRunArtifact {
+  return {
+    ...artifact,
+    decisions: artifact.decisions.map((decision) =>
+      decision.evaluationSeq === 18 && decision.decisionType === "enter"
+        ? {
+            ...decision,
+            modelOutputs: {
+              trigger: "0.33",
+              entryCost: "3.3",
+              worstPrice: "0.33",
+              expectedNetEdge: "1.68",
+            },
+            intents: decision.intents.map((intent) => ({ ...intent, expectedNetEdge: "1.68" })),
+          }
+        : decision,
+    ),
+  };
+}
+
+/**
+ * {@link withSecondEntry}'s FILLED chain BOOKED in the instance's §9.16 stream
+ * (`BRACKET-1b` r1, BR1B-M2), the way `packages/ledger` books every fill: its
+ * chain names a principal, a token-movement and a fee transaction — copies of
+ * the golden's first chain's three, re-keyed and booked for this fill's ledger
+ * fill — and the stream gains a BUY TRADE record following from the token
+ * movement, plus its FEE record. The per-bracket realized rows refuse a fill
+ * the stream books by no TRADE record; this is the booking they require. The
+ * ledger PROJECTION and the PnL snapshots are NOT refolded, so the
+ * run-cumulative rows still disagree with the synthetic chain, as they should.
+ */
+function bookedSecondEntry(artifact: PaperRunArtifact): PaperRunArtifact {
+  const synthetic = artifact.traces.find(
+    (trace) => trace.intentId === `sb-entry-3-${artifact.scenario.marketId}`,
+  );
+  const fill = artifact.fills.find(
+    (candidate) => candidate.simulatedFillId === synthetic?.venueFillId,
+  );
+  const template = artifact.traces[0];
+  if (synthetic === undefined || fill === undefined || template === undefined) {
+    throw new Error("the synthetic second entry's chain is missing");
+  }
+  const ids = ["principal", "token", "fee"].map((kind) => `${synthetic.executionPlanId}-${kind}`);
+  const [, tokenId, feeId] = ids;
+  const transactions = template.ledgerTransactionIds.map((id, index) => ({
+    ...only(
+      artifact.ledgerTransactions.filter((entry) => entry.ledgerTransactionId === id),
+      `ledger transaction ${id}`,
+    ),
+    sequence: artifact.ledgerTransactions.length + index,
+    ledgerTransactionId: ids[index] ?? "",
+    fillId: synthetic.ledgerFillId,
+  }));
+  const [trade, fee] = artifact.pnlRecords;
+  if (
+    tokenId === undefined ||
+    feeId === undefined ||
+    trade?.kind !== "TRADE" ||
+    trade.side !== "BUY" ||
+    fee?.kind !== "FEE" ||
+    transactions.map((entry) => entry.eventType).join() !==
+      "TRADE_PRINCIPAL,OUTCOME_TOKEN_RECEIPT,PLATFORM_FEE"
+  ) {
+    throw new Error("the golden's first booking is not a purchase's TRADE and FEE");
+  }
+  return {
+    ...artifact,
+    traces: artifact.traces.map((trace) =>
+      trace === synthetic ? { ...trace, ledgerTransactionIds: ids } : trace,
+    ),
+    ledgerTransactions: [...artifact.ledgerTransactions, ...transactions],
+    pnlRecords: [
+      ...artifact.pnlRecords,
+      { ...trade, ref: tokenId, shares: fill.shares, price: fill.price },
+      { ...fee, ref: feeId, amount: fill.feeAmount },
+    ],
+  };
+}
+
 // =============================================================================
 
 describe("RECON-1 / RECON-2 — the golden's own attribution, positively and by id", () => {
@@ -596,7 +713,17 @@ describe("RISK2-R3 — a fill in neither chain is refused, by name (R3a)", () =>
 });
 
 describe("RISK2-R3 — more than one entry is refused, not read as the first (R3b)", () => {
-  it("a second `enter` decision with its own filled chain is refused outright", () => {
+  /**
+   * CONVERTED (`BRACKET-1b`) into the PER-BRACKET rule. `RECON-1` refused a
+   * second `enter` outright: the table had ONE bracket's shape. Brackets are
+   * now read from the run — split at the strategy's own `SB.REARMED`, each
+   * boundary after a close and at a flat position — so the same second chain is
+   * still REFUSED when nothing separates it from the first (two entries in one
+   * bracket: reading the first would still be silent), and is reconciled as
+   * BRACKET 2 once the strategy's own re-arm does. Refusal and acceptance are
+   * pinned on one synthetic, so neither can pass vacuously.
+   */
+  it("a second `enter` with its own filled chain: refused in ONE bracket, reconciled as bracket 2 after an SB.REARMED", () => {
     const tampered = withSecondEntry(golden(), "FILLED");
     // Non-vacuous: the second entry is a complete chain of its own — decision,
     // intent, record, trace, plan, order, fill — which the base reconciler
@@ -604,9 +731,110 @@ describe("RISK2-R3 — more than one entry is refused, not read as the first (R3
     expect(tampered.decisions.filter((decision) => decision.decisionType === "enter")).toHaveLength(2);
     expect(tampered.fills).toHaveLength(4);
     expect(tampered.orderProvenance).toHaveLength(4);
-    expect(() => buildReconciliation(tampered)).toThrow(/2 `enter` decisions/u);
+    expect(() => buildReconciliation(tampered)).toThrow(
+      /the run's only bracket \(the run holds no `SB\.REARMED`\) holds 2 `enter` decisions/u,
+    );
     expect(() => buildReconciliation(tampered)).toThrow(/evaluationSeq 1, 18/u);
+    expect(() => buildReconciliation(tampered)).toThrow(/with no `SB\.REARMED` between them/u);
     expect(() => buildReconciliation(tampered)).toThrow(/instead of reading only the first/u);
+
+    // The SAME chain, after the strategy's own re-arm (and a close, and a flat
+    // position — bracket 1 sold its 50): two brackets. As `withSecondEntry`
+    // builds it, the stream books no TRADE record for its fill, and since
+    // `BRACKET-1b` r1 (BR1B-M2) a per-bracket realized row refuses a fill the
+    // stream does not book — before r1 both of that row's sides read 0 and it
+    // passed. Booked the way `packages/ledger` books a fill, it reconciles.
+    const separated = withRearm(consistentSecondEntry(tampered));
+    expect(() => buildReconciliation(separated)).toThrow(
+      /fill 9280f970-9280-7000-8000-0000000fa000:g0:o0\/t0\/0 \(bracket 2\) is booked by no §9\.16 TRADE record/u,
+    );
+    const rows = buildReconciliation(bookedSecondEntry(separated));
+    // Bracket 1 IS the golden's bracket, row for row, under its qualified id.
+    const perBracket = golden().reconciliation.filter(
+      (entry) => !entry.id.startsWith("ledger.") && !entry.id.startsWith("pnl."),
+    );
+    expect(perBracket).toHaveLength(12);
+    for (const entry of perBracket) {
+      expect(row(rows, `bracket.1.${entry.id}`)).toEqual({ ...entry, id: `bracket.1.${entry.id}` });
+    }
+    // Bracket 2 is the second entry's own, and explained on its merits — its 10
+    // shares still open at run end.
+    const second = rows.filter((entry) => entry.id.startsWith("bracket.2."));
+    expect(second.map((entry) => entry.id.replace(/fee\.fill\..*$/u, "fee.fill.<its fill>"))).toEqual([
+      "bracket.2.entry.executable_price_notional",
+      "bracket.2.entry.projected_cost",
+      "bracket.2.entry.shares",
+      "bracket.2.entry.worst_price",
+      "bracket.2.entry.cost_cap",
+      "bracket.2.entry.expected_net_edge_formula",
+      "bracket.2.fee.fill.<its fill>",
+      "bracket.2.fee.total_model_vs_venue",
+      "bracket.2.exit.expected_net_edge",
+      "bracket.2.pnl.realized",
+    ]);
+    expect(unexplainedRows(second)).toEqual([]);
+    expect(row(rows, "bracket.2.entry.shares").realized).toBe("10");
+    expect(
+      row(rows, "bracket.2.exit.expected_net_edge").contributions.map((entry) => entry.mechanism),
+    ).toContain("POSITION_OPEN_AT_RUN_END");
+    // Its realized row agrees on the POSITION too: 10 shares at 3.3 held by both
+    // folds, none realized.
+    expect(row(rows, "bracket.2.pnl.realized")).toMatchObject({
+      projected: "0",
+      realized: "0",
+      unexplainedReasons: [],
+    });
+    // The run-cumulative rows are NOT explained, and must not be: the synthetic
+    // chain was never folded into the ledger projection or a PnL snapshot, and
+    // the table says so instead of absorbing it.
+    expect(row(rows, "ledger.virtual_token_balance").explained).toBe(false);
+    expect(row(rows, "ledger.virtual_token_balance").projected).toBe("10");
+  });
+
+  /**
+   * `BRACKET-1b` r2 (BR1B-R2-M1), at the one place the venue's order is SILENT:
+   * the golden's bracket 1 buys twice at ONE event (30 at 0.34, 20 at 0.35,
+   * both consumed at ingestSeq 5), so their consumption order is only the
+   * fill-id convention. The ledger's is recorded — the token movements were
+   * booked at sequence 1 and 4 — and `apps/trader` appends a fill's records
+   * only after its posting is in the ledger, so the stream must follow it.
+   * Two purchases commute under average cost, so the engine would fold the
+   * swapped stream to the same numbers; it is refused because it is not the
+   * stream the trader recorded, and until r2 it was silently re-sorted.
+   */
+  it("(r2) at ONE event the ledger's order decides: bracket 1's two purchases recorded against it are refused", () => {
+    const booked = bookedSecondEntry(
+      withRearm(consistentSecondEntry(withSecondEntry(golden(), "FILLED"))),
+    );
+    expect(() => buildReconciliation(booked)).not.toThrow();
+    const [first, fee, second] = booked.pnlRecords;
+    const together = booked.fills.filter((fill) => fill.atEventIngestSeq === "5");
+    const [early, late] = together;
+    if (first === undefined || fee === undefined || second === undefined || early === undefined || late === undefined) {
+      throw new Error("the golden's two purchases at one event are missing");
+    }
+    expect(together.map((fill) => [fill.action, fill.shares])).toEqual([
+      ["BUY", "30"],
+      ["BUY", "20"],
+    ]);
+    expect([first.kind, first.shares, second.kind, second.shares]).toEqual(["TRADE", "30", "TRADE", "20"]);
+    const reordered: PaperRunArtifact = {
+      ...booked,
+      pnlRecords: [second, fee, first, ...booked.pnlRecords.slice(3)],
+    };
+    const literally = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    // No "the run consumed … first" clause: the venue's order ties; the
+    // ledger's alone refuses.
+    expect(() => buildReconciliation(reordered)).toThrow(
+      new RegExp(
+        `records the TRADE record of fill ${literally(late.simulatedFillId)} \\(bracket 1, ` +
+          `ledger transaction ${literally(second.ref)}\\) before the TRADE record of fill ` +
+          `${literally(early.simulatedFillId)} \\(bracket 1, ledger transaction ` +
+          `${literally(first.ref)}\\), but the ledger booked its token movement first ` +
+          "\\(sequence 1, not after 4\\)\\. ",
+        "u",
+      ),
+    );
   });
 
   it("an entry decision that emits TWO order-placing intents is refused the same way", () => {
@@ -630,7 +858,16 @@ describe("RISK2-R3 — more than one entry is refused, not read as the first (R3
 });
 
 describe("RISK2-R3 — an entry order withdrawn unfilled is not an exit cancellation (R3c)", () => {
-  it("a second bracket's entry, rested and withdrawn: refused, never a withdrawn take-profit", () => {
+  /**
+   * CONVERTED (`BRACKET-1b`) into the per-bracket rule. The property is
+   * unchanged — a withdrawn ENTRY is never reported as a withdrawn exit — and
+   * now holds both ways the second entry can stand: in the first bracket it is
+   * a second `enter` there, refused; after the strategy's own `SB.REARMED` it is
+   * bracket 2's entry, which never filled, and a bracket with no entry fill has
+   * nothing to reconcile, so it is refused by name — never listed under
+   * `exit.cancelled_proceeds`.
+   */
+  it("a second bracket's entry, rested and withdrawn: refused, never a withdrawn take-profit — in one bracket or after an SB.REARMED", () => {
     const artifact = golden();
     const tampered = withSecondEntry(artifact, "WITHDRAWN_UNFILLED");
     const withdrawn = tampered.orders.at(-1);
@@ -642,6 +879,11 @@ describe("RISK2-R3 — an entry order withdrawn unfilled is not an exit cancella
     expect(compareDecimal(withdrawn.filledShares, "0")).toBe(0);
     expect(withdrawn.executionPlanId).not.toBe(landmarks(artifact).entryOrder.executionPlanId);
     expect(() => buildReconciliation(tampered)).toThrow(/2 `enter` decisions/u);
+    expect(() => buildReconciliation(tampered)).toThrow(/with no `SB\.REARMED` between them/u);
+    const separated = withRearm(tampered);
+    expect(() => buildReconciliation(separated)).toThrow(
+      /bracket 2 \(opened by the `SB\.REARMED` decision at evaluationSeq 17\): no fill could be attributed to the entry intent/u,
+    );
   });
 
   /**

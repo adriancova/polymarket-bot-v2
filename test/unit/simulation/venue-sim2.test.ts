@@ -461,10 +461,14 @@ describe("SIM-2 (2): live orders in the live index, terminal orders in a bounded
       evictedIdFilterBits: 16_777_216,
     });
     const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-    const paper = JSON.parse(readFileSync(join(root, "test/replay-golden/paper-e2e/paper-e2e-run.json"), "utf8")) as {
-      orders: unknown[];
-      fills: unknown[];
-    };
+    const paperGolden = (file: string): { orders: unknown[]; fills: unknown[] } =>
+      JSON.parse(readFileSync(join(root, "test/replay-golden/paper-e2e", file), "utf8")) as {
+        orders: unknown[];
+        fills: unknown[];
+      };
+    const paper = paperGolden("paper-e2e-run.json");
+    // `BRACKET-1b`: the second paper golden (two brackets, five orders, four fills).
+    const twoBrackets = paperGolden("two-brackets-run.json");
     const backtest = readFileSync(join(root, "test/replay-golden/backtest/static-bracket/expected-artifact.txt"), "utf8");
     const simulation = JSON.parse(readFileSync(join(root, "test/replay-golden/simulation/golden-replay.json"), "utf8")) as {
       expected: { serialization: string[] };
@@ -473,6 +477,8 @@ describe("SIM-2 (2): live orders in the live index, terminal orders in a bounded
     const census = {
       paperOrders: paper.orders.length,
       paperFills: paper.fills.length,
+      twoBracketsOrders: twoBrackets.orders.length,
+      twoBracketsFills: twoBrackets.fills.length,
       backtestOrders: lines(backtest, "order "),
       backtestFills: lines(backtest, "fill "),
       simulationOrders: simulation.expected.serialization.filter((line) => line.startsWith("order ")).length,
@@ -481,11 +487,25 @@ describe("SIM-2 (2): live orders in the live index, terminal orders in a bounded
     };
     // Non-vacuous: every golden really carries orders and fills.
     expect(Object.values(census).every((count) => count > 0)).toBe(true);
+    expect([census.twoBracketsOrders, census.twoBracketsFills]).toEqual([5, 4]);
     const largest = Math.max(...Object.values(census));
     expect(largest).toBeLessThan(10);
+    // THE HEADROOM, RESTATED (`BRACKET-1b`). The claim is "far above": each
+    // default keeps at least HISTORY_HEADROOM times the largest history any
+    // committed run books, so no fixture comes within three orders of magnitude
+    // of an eviction. SIM-2 wrote 10_000x when the largest history was 3; the
+    // two-bracket golden books 5 orders, which met 10_000x with ZERO margin
+    // (50_000 = 10_000 x 5), so the next golden's sixth order would have failed a
+    // bound that says nothing about eviction. 5_000x is chosen to AGREE with the
+    // `< 10` bound above: any census under 10 keeps 5_000 x largest <= 45_000 <=
+    // 50_000, and bands keep 1_000 x largest <= 9_000 <= 10_000. A golden that
+    // needs more trips the `< 10` bound first, which is the prompt to re-state
+    // both, not to raise one.
+    const HISTORY_HEADROOM = 5_000;
     expect(DEFAULT_VENUE_RETENTION.bands).toBeGreaterThanOrEqual(1_000 * largest);
-    expect(DEFAULT_VENUE_RETENTION.orders).toBeGreaterThanOrEqual(10_000 * largest);
-    expect(DEFAULT_VENUE_RETENTION.fills).toBeGreaterThanOrEqual(10_000 * largest);
+    expect(DEFAULT_VENUE_RETENTION.orders).toBeGreaterThanOrEqual(HISTORY_HEADROOM * largest);
+    expect(DEFAULT_VENUE_RETENTION.fills).toBeGreaterThanOrEqual(HISTORY_HEADROOM * largest);
+    expect(HISTORY_HEADROOM * 9).toBeLessThanOrEqual(DEFAULT_VENUE_RETENTION.orders);
   });
 });
 

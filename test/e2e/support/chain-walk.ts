@@ -39,6 +39,22 @@
  * The hop vocabulary is §6 invariant 4's own, read in production order and then
  * continued past the invariant's end to the two artefacts the packet asks for:
  * the ledger posting and the PnL that follows from it.
+ *
+ * ## A chain the loop ORIGINATED ends at its decision (`RECON2-EVENTHOP`)
+ *
+ * An order placed by an evaluation the loop originated — `onFill`,
+ * `onOrderUpdate` — has no source event: its persisted decision says
+ * `sourceEventId: null`, and the loop records `""` in the order's provenance
+ * and in every trace of its fills. The provenance walk has always accepted
+ * exactly that pairing. The per-chain EVENT and DECISION hops now mirror it
+ * (`BRACKET-1b`, the first run in which such an order fills — a take-profit
+ * placed from `onFill`): a chain whose `sourceEventId` is `""` is accepted if
+ * and only if its persisted decision's `sourceEventId` is `null`, and its event
+ * hop is then satisfied THROUGH that decision. Such a chain therefore ends at
+ * the decision and its `featureSnapshotRef` — the feature hop still requires
+ * the decision to name the chain's content address — not at a recorded event:
+ * `RECON-2`'s accepted reading of §6 invariant 4. A `""` chain whose decision
+ * DOES name an event is broken on both hops, as any mismatch is.
  */
 
 /** The hops, in production order. The invariant states them in reverse. */
@@ -236,31 +252,47 @@ export function walkChains(document: WalkableDocument): WalkReport {
   const chains: ChainResult[] = document.traces.map((trace, index) => {
     const hops: HopResult[] = [];
 
+    // The decision is resolved FIRST: hops 1, 2 and 4 are read through it.
+    const key = `${trace.runId}|${String(trace.evaluationSeq)}`;
+    const decision = decisionsByKey.get(key);
+    // `RECON2-EVENTHOP`: the loop records `""` for an evaluation it ORIGINATED
+    // (`onFill`, `onOrderUpdate`), whose persisted decision states no source
+    // event — the provenance rule below, applied to the chain.
+    const loopOriginated =
+      trace.sourceEventId === "" && decision !== undefined && decision.sourceEventId === null;
+
     // --- 1. source event ----------------------------------------------------
+    const eventOk = loopOriginated || eventIds.has(trace.sourceEventId);
     hops.push(
       hop(
         "event",
-        eventIds.has(trace.sourceEventId),
-        `sourceEventId ${trace.sourceEventId} ${
-          eventIds.has(trace.sourceEventId) ? "resolves in" : "is absent from"
-        } the recorded event list`,
+        eventOk,
+        loopOriginated
+          ? `the chain names no source event ("") and its persisted decision at ${key} states ` +
+              "none: an evaluation the loop originated, so the chain's origin is that decision " +
+              "and its feature snapshot, not a recorded event"
+          : `sourceEventId ${JSON.stringify(trace.sourceEventId)} ${
+              eventIds.has(trace.sourceEventId) ? "resolves in" : "is absent from"
+            } the recorded event list`,
       ),
     );
 
-    // --- 3. decision (resolved first; hops 2 and 4 are read through it) -----
-    const key = `${trace.runId}|${String(trace.evaluationSeq)}`;
-    const decision = decisionsByKey.get(key);
+    // --- 3. decision --------------------------------------------------------
+    const decisionOk =
+      decision !== undefined && (loopOriginated || decision.sourceEventId === trace.sourceEventId);
     hops.push(
       hop(
         "decision",
-        decision !== undefined && decision.sourceEventId === trace.sourceEventId,
+        decisionOk,
         decision === undefined
           ? `no persisted decision has key (runId, evaluationSeq) = ${key}`
-          : decision.sourceEventId === trace.sourceEventId
-            ? `the persisted decision at ${key} names the same source event`
-            : `the persisted decision at ${key} names source event ${
-                decision.sourceEventId ?? "none"
-              }, not ${trace.sourceEventId}`,
+          : loopOriginated
+            ? `the persisted decision at ${key} states no source event, as the chain's "" says`
+            : decision.sourceEventId === trace.sourceEventId
+              ? `the persisted decision at ${key} names the same source event`
+              : `the persisted decision at ${key} names source event ${
+                  decision.sourceEventId ?? "none"
+                }, not ${JSON.stringify(trace.sourceEventId)}`,
       ),
     );
 
