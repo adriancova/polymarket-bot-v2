@@ -816,6 +816,13 @@ work_packages:
     # "the migration owner"), consolidating the two open migration items.
     goal: Execute the same core logic against historical/live data with deterministic Tier 0 and queue-estimated Tier 1 simulation.
     depends_on: [WP-130, WP-150, WP-190, WP-200]
+    # Noted 2026-09-28 (H8-GOV; ADR-022): this package's goal, "Execute the
+    # same core logic against historical/live data", is realized by the
+    # layer-1 package packages/trading-core, which apps/backtest-cli (a path
+    # below) builds from BACKTEST-2 on through a downward edge that needs no
+    # §2.1 row. Declaring that workspace:* dependency updates only
+    # apps/backtest-cli's importer block, which the pnpm-lock.yaml entry below
+    # already covers. Goal, deliverables and acceptance are unchanged.
     allowed_paths:
       - packages/simulation/**
       - apps/backtest-cli/**
@@ -898,6 +905,16 @@ work_packages:
       # this dated entry — was skipped for ten days; recorded as a dated
       # deviation in IMPLEMENTATION_STATUS.md "Deviations from specification".
       - pnpm-lock.yaml
+      # Ratified 2026-09-28 (H8-GOV; ADR-022; the user's ruling H8, option A,
+      # 2026-09-28): this package's deliverable "deterministic core event loop"
+      # moves into the layer-1 package below. CORE-MOVE, a bounded WP-230
+      # follow-up round, performs the move under the grant quoted in
+      # docs/handoffs/H8-GOV.md and staged in
+      # docs/contracts/dependency-direction.md §2.1. The trader process still
+      # assembles and runs the core (ADR-022 D2), so this package's goal,
+      # deliverables and acceptance are unchanged. The pnpm-lock.yaml entry above
+      # also covers the new package's own importer block, for that purpose only.
+      - packages/trading-core/**
     forbidden_paths:
       - packages/domain/**
       - packages/polymarket-secure/**
@@ -982,6 +999,11 @@ work_packages:
     forbidden_paths:
       - packages/domain/**
       - apps/trader/**
+      # Added 2026-09-28 (H8-GOV; ADR-022 D10): the core event loop
+      # moves out of apps/trader/**, which this package is already forbidden,
+      # into the layer-1 package below; the signer boundary is layer 2,
+      # and the core may not declare it (F12).
+      - packages/trading-core/**
     deliverables:
       - secure client factory
       - redacted error mapping
@@ -1005,6 +1027,11 @@ work_packages:
     forbidden_paths:
       - packages/domain/**
       - apps/trader/**
+      # Added 2026-09-28 (H8-GOV; ADR-022 D10): the core event loop
+      # moves out of apps/trader/**, which this package is already forbidden,
+      # into the layer-1 package below; the OMS attaches to the core
+      # through its ports.
+      - packages/trading-core/**
     deliverables:
       - OMS state machine
       - signed payload persistence
@@ -1071,6 +1098,11 @@ work_packages:
     forbidden_paths:
       - packages/domain/**
       - apps/trader/**
+      # Added 2026-09-28 (H8-GOV; ADR-022 D10): the core event loop
+      # moves out of apps/trader/**, which this package is already forbidden,
+      # into the layer-1 package below; inventory attaches to the core
+      # through its ports.
+      - packages/trading-core/**
     deliverables:
       - inventory manager
       - reservation service
@@ -1109,6 +1141,12 @@ work_packages:
     goal: Ensure only one healthy eligible process can submit/heartbeat live orders.
     depends_on: [WP-260, WP-290, WP-310]
     allowed_paths:
+      # Noted 2026-09-28 (H8-GOV; ADR-022 D10): this path stays under
+      # apps/trader/src. The fencing lease and heartbeat it wires live in
+      # layer-2 packages (the storage-postgres and polymarket-secure paths
+      # below), which the layer-1 packages/trading-core may not declare (F12).
+      # A hook this package needs inside the core event loop is a bounded
+      # packages/trading-core/** grant, written at this package's authorization.
       - apps/trader/src/live-safety/**
       - packages/polymarket-secure/src/heartbeat/**
       - packages/storage-postgres/src/fencing/**
@@ -1139,6 +1177,11 @@ work_packages:
     forbidden_paths:
       - packages/domain/**
       - apps/trader/**
+      # Added 2026-09-28 (H8-GOV; ADR-022 D10): the core event loop
+      # moves out of apps/trader/**, which this package is already forbidden,
+      # into the layer-1 package below; this package's goal is
+      # independence from trader memory.
+      - packages/trading-core/**
     deliverables:
       - cancel-order
       - cancel-market
@@ -1182,6 +1225,12 @@ work_packages:
     depends_on: [WP-340]
     allowed_paths:
       - packages/execution-planner/src/probes/**
+      # Noted 2026-09-28 (H8-GOV; ADR-022 D10): this path stays under
+      # apps/trader/src. Tiny real calibration orders go through
+      # packages/polymarket-secure (layer 2; dependency-direction.md F6), which
+      # the layer-1 packages/trading-core may not declare (F12). A hook this
+      # package needs inside the core event loop is a bounded
+      # packages/trading-core/** grant, written at this package's authorization.
       - apps/trader/src/execution-probe/**
       - test/e2e/execution-probe-mock/**
       - docs/runbooks/execution-probes.md
