@@ -23,7 +23,7 @@ non-vacuity. The residue is human evidence, human infrastructure, or a ruling.
 
 | # | Item | State | Why |
 | --- | --- | --- | --- |
-| 1 | Full paper pipeline works end to end | **OPEN** | One bracket, one round trip, closed by the cutoff reduce, ending PAUSED (`RISK-2` residual 5: the reduction creates no order track, so the instance pauses on its own exit). No take-profit has ever filled in any recorded run. Not a blocker of any human item; a strategy-package round. |
+| 1 | Full paper pipeline works end to end | **OPEN** | One bracket, one round trip, closed by the cutoff reduce, ending PAUSED (`RISK-2` residual 5: the reduction creates no order track, so the instance pauses on its own exit). No take-profit has ever filled in any recorded run. Not a blocker of any human item; a strategy-package round. *(2026-09-28: the PAUSED ending is CLOSED by `BRACKET-1a` (`11969f3`): the run now ends CLOSED. The item stays OPEN for `BRACKET-1b` (a filled take-profit and a second bracket) and `BRACKET-1c` (a durable round trip), per the user's ruling R1.)* |
 | 2 | Replay produces identical results | MET with qualification | Byte-identical replays are gated (`test:replay`, 3 files / 17 tests) — through the shipped root when a caller supplies the core (B3, below). |
 | 3 | Ledger rebuild equals projections | MET with qualification | Rebuild from durable rows cannot reproduce per-fill economics until the execution chain is persisted (`BOOT-1`'s disclosed fill-link severing). |
 | 4 | Static Bracket in replay AND live-data paper through the same code | **replay half: NARROWED; live half: attemptable, never attempted** | B3 (H8) and B4 (H1) below. |
