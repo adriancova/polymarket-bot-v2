@@ -153,6 +153,33 @@ describe("observeRealizedPnl — the store decorator (TRDR-3)", () => {
     await observed.close();
     expect(store.closed).toBe(true);
   });
+
+  it("SNAP-1 r1: a REPLACED row is recorded on the same terms — after the store's ok, never on a refusal", async () => {
+    const store = new MemoryTraderStore();
+    const book = new RealizedPnlBook();
+    const observed = observeRealizedPnl(store, book);
+    expect((await observed.writePnlSnapshot(snapshotFor("sb-1", "0"))).ok).toBe(true);
+    expect(book.view()).toEqual({ byInstance: { "sb-1": "0" }, account: "0" });
+
+    // A later harvest at the same instant replaces the row: the book follows it.
+    const replaced = await observed.replacePnlSnapshot(snapshotFor("sb-1", "-1"));
+    expect(replaced).toEqual({ ok: true, value: null });
+    expect(store.pnlSnapshots.map((row) => row.realizedPnl)).toEqual(["-1"]);
+    expect(book.view()).toEqual({ byInstance: { "sb-1": "-1" }, account: "-1" });
+    expect(book.observed).toBe(2);
+
+    // Refused — injected, or no row of that identity — is returned unchanged and NOT recorded.
+    store.failOnly(["replacePnlSnapshot"], "UNAVAILABLE", "the replacement is refused");
+    expect(await observed.replacePnlSnapshot(snapshotFor("sb-1", "5"))).toEqual({
+      ok: false,
+      failure: { kind: "UNAVAILABLE", detail: "the replacement is refused" },
+    });
+    store.recover();
+    const missing = await observed.replacePnlSnapshot({ ...snapshotFor("sb-2", "7") });
+    expect(missing.ok).toBe(false);
+    expect(book.view()).toEqual({ byInstance: { "sb-1": "-1" }, account: "-1" });
+    expect(book.observed).toBe(2);
+  });
 });
 
 describe("acceptance (c): no float anywhere on the PnL path (TRDR-3)", () => {

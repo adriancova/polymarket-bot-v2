@@ -104,8 +104,10 @@ only on these values and the wall clock never regresses
   `RISK-2`'s B2 fix, observed through the replay root.
 - **Counts**: 12 decisions persisted (one per callback), 4 plans, 4 accepted
   submissions, 3 fills, 1 cancel confirmed, 9 ledger transactions, 12 PnL
-  records, 3 PnL snapshots; `halts=[]`, `healthy=true`. (18 decisions before
-  `TRDR-4` — see "How `expected-artifact.txt` was produced" below.)
+  records, 2 PnL snapshots — one per instance per instant with fills, the
+  entry's two fills sharing `09:00:02` (3 before `SNAP-1`, one per fill);
+  `halts=[]`, `healthy=true`. (18 decisions before `TRDR-4` — see "How
+  `expected-artifact.txt` was produced" below.)
 
 ## Residual 5 (`docs/handoffs/RISK-2.md`) — observed here, pinned, and RESOLVED by `BRACKET-1a`
 
@@ -165,6 +167,20 @@ moved — line 28 (`seq=9`, `reasons=SB.EXIT_FILLED,SB.CLOSED`) and line 30
 why. Every order, fill, economics, trace, ledger, PnL, health, store and
 driver line is byte-identical (`store decisions=12` included): the same
 decisions exist, only two of them now say something else.
+
+**Re-captured by `SNAP-1` (2026-09-28), the same way** (a scratch probe
+calling `renderArtifact(await replayThroughShippedRoot({ withCore: true }))`
+twice, byte-equal, written ONCE over the verified base bytes, sha256
+`512e246d…`), because the user ruled "one PnL snapshot per instance per
+instant" — `accounting.pnl_snapshots_scope_unique`'s own key, which the durable
+trader used to violate (`BRACKET1C-SNAPKEY`) and `MemoryTraderStore` now
+enforces. Exactly two lines moved: the first `pnl` line (`asOf=2026-05-01T09:00:02Z
+… fees=0.131 coreNet=-0.131 capitalCommitted=10.2`, the state after the
+entry's `30 @ 0.34` fill, one of TWO rows at that instant) is gone, and the
+`store` line's `pnlSnapshots` goes `3 → 2`. The two `pnl` lines that remain are
+byte-identical to base's — the LAST row base wrote at each instant. Every
+order, fill, trace, ledger, health and driver line is byte-identical (no health
+counter counts snapshots).
 
 ## Relationship to the other goldens
 

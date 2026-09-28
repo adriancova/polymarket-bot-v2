@@ -137,7 +137,25 @@ export interface TraderStore {
   appendLedgerTransaction(
     transaction: AppendedLedgerTransaction,
   ): Promise<PortResult<null>>;
+  /**
+   * Inserts one §9.16 row. `accounting.pnl_snapshots_scope_unique` admits ONE
+   * row per (scope, environment, account_ref, instance_id, market_id, as_of),
+   * so a second row of an identity is REFUSED — as the database refuses it —
+   * never merged or skipped (`SNAP-1`).
+   */
   writePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>>;
+  /**
+   * `SNAP-1` r1: rewrites the ONE existing row of the snapshot's
+   * `pnl_snapshots_scope_unique` identity with the snapshot's values, and
+   * REFUSES when there is no such row (it never inserts one). The loop calls it
+   * for exactly one case: a later harvest at an instant whose row this process
+   * already inserted for the instance, so that row holds the state after the
+   * LAST fill booked at that instant (the user's ruling, 2026-09-28) while
+   * every write still lands before its harvest's deliveries (§4.2). The table
+   * is the "rebuildable reporting projection" (`0006_accounting.up.sql`), not
+   * append-only. A refusal is a store failure like any other: the loop halts.
+   */
+  replacePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>>;
   close(): Promise<void>;
 }
 

@@ -36,13 +36,12 @@ trace sourceEvent=019de2d1-bb28-7994-82f7-9982d5a79d4f snapshot=ae044ea39efd6557
 ledger transactions=9 unattributedActivity=0 unexplainedMovements=0
 position instance=019b1e00-0000-7000-8000-000000000002 market=019b1e00-0000-7000-8000-000000000001 asset=pUSD kind=COLLATERAL balance=-1.632
 --- pnl ---
-pnl scope=VIRTUAL_STRATEGY instance=019b1e00-0000-7000-8000-000000000002 asOf=2026-05-01T09:00:02Z realized=0 unrealizedMidpoint=0 fees=0.131 coreNet=-0.131 capitalCommitted=10.2
 pnl scope=VIRTUAL_STRATEGY instance=019b1e00-0000-7000-8000-000000000002 asOf=2026-05-01T09:00:02Z realized=0 unrealizedMidpoint=0.3 fees=0.22 coreNet=0.08 capitalCommitted=17.2
 pnl scope=VIRTUAL_STRATEGY instance=019b1e00-0000-7000-8000-000000000002 asOf=2026-05-01T09:14:49Z realized=-1.2 unrealizedMidpoint=0 fees=0.432 coreNet=-1.632 capitalCommitted=0
 --- health ---
 health healthy=true halts= evaluations=12 decisionsPersisted=12 snapshotsUnavailable=3 riskApprovals=4 riskRefusals=0 refusedExits=0 plansBuilt=4 submissionsAccepted=4 fillsObserved=3 cancelsConfirmed=1 ledgerTransactions=9 pnlRecords=12
 --- store ---
-store decisions=12 checkpoints=12 ledgerTransactions=9 pnlSnapshots=3
+store decisions=12 checkpoints=12 ledgerTransactions=9 pnlSnapshots=2
 --- driver ---
 driver eventsIngested=8 drains=8
 end

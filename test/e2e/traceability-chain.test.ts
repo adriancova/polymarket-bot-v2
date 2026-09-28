@@ -232,9 +232,16 @@ describe("acceptance 1 — the traceability chain is complete, walked from the o
       expect(record.scope).toBe("VIRTUAL_STRATEGY");
     }
 
-    // …and the run ends in PERSISTED PnL rows, one per posting round (three,
-    // now that the exit posts one of its own).
-    expect(artifact.pnlSnapshots).toHaveLength(3);
+    // …and the run ends in PERSISTED PnL rows, one per instance per INSTANT
+    // with fills (`SNAP-1`, the database's `pnl_snapshots_scope_unique` key):
+    // TWO — the entry's two fills share `09:00:02`, and the exit posts its own
+    // at `09:14:49`. (Three before `SNAP-1`, one per fill: two rows at one
+    // instant, which the durable store refuses.)
+    expect(artifact.pnlSnapshots).toHaveLength(2);
+    expect(artifact.pnlSnapshots.map((snapshot) => snapshot["asOf"])).toEqual([
+      "2026-05-01T09:00:02Z",
+      "2026-05-01T09:14:49Z",
+    ]);
     for (const snapshot of artifact.pnlSnapshots) {
       expect(snapshot["environment"]).toBe("PAPER");
       expect(snapshot["instanceId"]).toBe(artifact.scenario.instanceId);

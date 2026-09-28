@@ -45,6 +45,15 @@
  * reached). The traded (YES) book is refreshed at every evaluation instant, so
  * `data_quality.maximum_book_age_ms` (600 000) can never mask the path.
  *
+ * `SNAP-1` adds ONE optional variation, used by
+ * `durable-two-level-entry-postgres-redis.test.ts` only: bracket 1's asks
+ * replaced by {@link TWO_LEVEL_BRACKET_1_YES_ASKS}, so bracket 1's entry walks
+ * two levels at one instant (two fills of one instance at `12:00:02` — the
+ * shape `BRACKET1C-SNAPKEY` halted on). Under that variation bracket 1's
+ * take-profit is placed from the FIRST fill's `onFill` and the second answers
+ * `SB.AWAITING_CANCEL_CONFIRMATION` (observed, and pinned in that file); the
+ * default (`BRACKET-1c`'s events) is unchanged.
+ *
  * No wall clock, no entropy, no file read: every instant is a literal and
  * every id is minted by the fixture's own counter.
  */
@@ -58,7 +67,7 @@ import { documentFor, type Registered } from "./registration.js";
 export const MAXIMUM_ENTRIES_PER_MARKET = 2;
 
 /** One price level of a recorded ladder. */
-interface Level {
+export interface Level {
   readonly price: string;
   readonly size: string;
 }
@@ -72,6 +81,18 @@ export const YES_BIDS: readonly Level[] = Object.freeze([
 /** Bracket 1's YES asks (the fixture's): a 50-share entry fills in the first level, at 0.34. */
 export const BRACKET_1_YES_ASKS: readonly Level[] = Object.freeze([
   Object.freeze({ price: "0.34", size: "200" }),
+  Object.freeze({ price: "0.35", size: "300" }),
+]);
+
+/**
+ * `SNAP-1`: bracket 1's YES asks with a THIN first level — `BRACKET-1c`'s probe
+ * F3 as a committed shape. The 50-share entry walks TWO levels at one instant:
+ * `30 @ 0.34`, then `20 @ 0.35`. Used by
+ * `durable-two-level-entry-postgres-redis.test.ts` only, through
+ * {@link twoBracketsEvents}'s `bracket1Asks` option.
+ */
+export const TWO_LEVEL_BRACKET_1_YES_ASKS: readonly Level[] = Object.freeze([
+  Object.freeze({ price: "0.34", size: "30" }),
   Object.freeze({ price: "0.35", size: "300" }),
 ]);
 
@@ -175,8 +196,16 @@ function noBook(marketId: string, receivedAt: string, ingestSeq: number): Ingest
  * addressed to the REGISTERED market and the condition id it was registered
  * under. What each one is expected to do is derived by hand in the test file's
  * header.
+ *
+ * `bracket1Asks` (`SNAP-1`, optional) replaces bracket 1's YES asks on events
+ * 4, 6 and 7; absent, the events are exactly `BRACKET-1c`'s.
  */
-export function twoBracketsEvents(marketId: string, conditionId: string): readonly IngestedEvent[] {
+export function twoBracketsEvents(
+  marketId: string,
+  conditionId: string,
+  options: { readonly bracket1Asks?: readonly Level[] } = {},
+): readonly IngestedEvent[] {
+  const bracket1Asks = options.bracket1Asks ?? BRACKET_1_YES_ASKS;
   resetEventIds();
   return Object.freeze([
     // 1-2: the §9.5 reference feed must be non-empty before a snapshot exists.
@@ -197,13 +226,13 @@ export function twoBracketsEvents(marketId: string, conditionId: string): readon
       { receivedAt: "2026-03-04T12:00:00.000Z", ingestSeq: 3 },
     ),
     // 4: ARM.
-    yesBook(marketId, BRACKET_1_YES_ASKS, "2026-03-04T12:00:01.000Z", 4),
+    yesBook(marketId, bracket1Asks, "2026-03-04T12:00:01.000Z", 4),
     // 5: bracket 1 ENTERS; its take-profit is placed from onFill.
     noBook(marketId, "2026-03-04T12:00:02.000Z", 5),
     // 6: 183 s after the entry fill — the holding timeout withdraws the take-profit.
-    yesBook(marketId, BRACKET_1_YES_ASKS, "2026-03-04T12:03:05.000Z", 6),
+    yesBook(marketId, bracket1Asks, "2026-03-04T12:03:05.000Z", 6),
     // 7: the protective reduction fills against the 0.32 bid and CLOSES bracket 1.
-    yesBook(marketId, BRACKET_1_YES_ASKS, "2026-03-04T12:03:06.000Z", 7),
+    yesBook(marketId, bracket1Asks, "2026-03-04T12:03:06.000Z", 7),
     // 8: 34 s after the close (cooldown 30 s) — REARMED. The ask is now 0.33.
     yesBook(marketId, BRACKET_2_YES_ASKS, "2026-03-04T12:03:40.000Z", 8),
     // 9: bracket 2 ENTERS; its take-profit is placed from onFill (no source event).

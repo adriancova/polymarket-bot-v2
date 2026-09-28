@@ -4,24 +4,26 @@
  * ## What it does, and the one thing it must not do
  *
  * `observeRealizedPnl(store, book)` answers a `TraderStore` that forwards every
- * call to `store` unchanged and, when `writePnlSnapshot` SUCCEEDS, records the
- * snapshot's `realizedPnl` in the {@link RealizedPnlBook} the health surface
- * reads. The value recorded is the PnL engine's own `PnlSnapshot.realizedPnl`
- * — the same object, the same field, that `packages/storage-postgres` just
- * persisted — so the health surface can only ever say what the database holds.
+ * call to `store` unchanged and, when `writePnlSnapshot` — or, since `SNAP-1`
+ * r1, `replacePnlSnapshot` — SUCCEEDS, records the snapshot's `realizedPnl` in
+ * the {@link RealizedPnlBook} the health surface reads. The value recorded is
+ * the PnL engine's own `PnlSnapshot.realizedPnl` — the same object, the same
+ * field, that `packages/storage-postgres` just persisted — so the health
+ * surface can only ever say what the database holds.
  *
  * It must NOT change the store's answer. A refused write is returned as the
  * store refused it and is NOT recorded: the loop halts `STORE_UNAVAILABLE` on
- * that answer (`loop.ts`, `#writePnlSnapshot`), and a health surface that
- * reported a value the database does not hold would contradict the halt it
- * sits next to. Recording happens strictly AFTER `ok`, and a throw from the
- * book (there is none — `record` is a `Map.set`) would surface on the loop's
- * own path exactly as any other exception there does; it is not swallowed
- * into a false `ok`.
+ * that answer (`loop.ts`, `#flushPnlSnapshots`; `#writePnlSnapshot` before
+ * `SNAP-1`), and a health surface that reported a value the database does not
+ * hold would contradict the halt it sits next to. Recording happens strictly
+ * AFTER `ok`, and a throw from the book (there is none — `record` is a
+ * `Map.set`) would surface on the loop's own path exactly as any other
+ * exception there does; it is not swallowed into a false `ok`.
  *
  * ## Why a decorator, and why here
  *
- * `loop.ts` calls `store.writePnlSnapshot` and reads back only `ok`;
+ * `loop.ts` calls `store.writePnlSnapshot` (or `replacePnlSnapshot`) and reads
+ * back only `ok`;
  * `trader.ts` hands `options.store` straight to the loop. Neither is in this
  * round's grant, and neither needs to be: the composition root holds the
  * store before the trader exists, so it can wrap it, and holds the health
@@ -61,6 +63,16 @@ export function observeRealizedPnl(store: TraderStore, book: RealizedPnlBook): T
         book.record({ instanceId: snapshot.instanceId, realizedPnl: snapshot.realizedPnl });
       }
       return written;
+    },
+    // `SNAP-1` r1: a REPLACED row is the instance's latest accepted snapshot
+    // too (a later harvest at an instant already written), so it is recorded
+    // on exactly the same terms — after `ok`, never on a refusal.
+    async replacePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>> {
+      const replaced = await store.replacePnlSnapshot(snapshot);
+      if (replaced.ok) {
+        book.record({ instanceId: snapshot.instanceId, realizedPnl: snapshot.realizedPnl });
+      }
+      return replaced;
     },
     close(): Promise<void> {
       return store.close();

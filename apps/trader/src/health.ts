@@ -50,8 +50,9 @@
  * second accounting: nothing here multiplies a price by a size. The value is
  * observed at the store port ({@link RealizedPnlBook}, fed by
  * `pnl-observation.ts` from the same `writePnlSnapshot` call that persists
- * the row), so the health surface reports what the database holds and never a
- * number computed on the way. `Number(...)` does not appear in this file; the
+ * the row — or the `replacePnlSnapshot` call that rewrites it, `SNAP-1` r1),
+ * so the health surface reports what the database holds and never a number
+ * computed on the way. `Number(...)` does not appear in this file; the
  * sum is `@polymarket-bot/decimal`'s `addDecimal`, and
  * `test/unit/trader/health-realized-pnl.test.ts` proves the round trip on a
  * value float64 cannot represent.
@@ -274,7 +275,8 @@ const NO_REALIZED_PNL: RealizedPnlHealth = Object.freeze({
  * The latest realized PnL per instance, as the store accepted it.
  *
  * Owned by the composition root, written by `pnl-observation.ts`'s store
- * decorator AFTER a successful `writePnlSnapshot`, read by
+ * decorator AFTER a successful `writePnlSnapshot` or `replacePnlSnapshot`
+ * (`SNAP-1` r1), read by
  * {@link HealthState.snapshot} once attached. Holding the values here rather
  * than inside `HealthState` is what lets the root wrap the store before the
  * trader (and therefore the health state) exists, without losing a write that
