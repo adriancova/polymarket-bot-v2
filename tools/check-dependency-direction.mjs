@@ -4,7 +4,7 @@
  *
  * SPECIFICATION: `docs/contracts/dependency-direction.md` §6. This script is an
  * implementation of that section and of nothing else; every failure it emits
- * cites the contract row (F1–F13) that it enforces.
+ * cites the contract row (F1–F14, F16) that it enforces.
  *
  * Why the layer table is not copied into this file: §6 requires that "the layer
  * table and the §2.1 edge list live in one place — this document — and the
@@ -31,15 +31,23 @@
  * Rules implemented (see `docs/contracts/dependency-direction.md` §3, §6):
  *   1. F9  — no cycle in the workspace dependency graph, including the
  *      degenerate self-cycle of a package that declares itself.
- *   2. F12 — no edge from a lower-numbered layer to a higher-numbered one.
+ *   2. F10 — no declared edge into an application (`apps/*`), whatever the
+ *      layers and whatever §2.1 says (`DEPCHECK-1`).
+ *      F12 — no edge from a lower-numbered layer to a higher-numbered one.
  *      F13 — a same-layer edge must be listed in §2.1.
  *      Fail closed on an unclassified workspace package, and on a named §2
- *      entry with no manifest (§6 "fails closed" bullets).
+ *      entry with no manifest (§6 "fails closed" bullets). A §2.1 row whose
+ *      `to` endpoint is an application, or that matches no declared edge, is
+ *      a `CHK` error (`DEPCHECK-1`).
  *   3. F1–F8, F11 — forbidden import specifiers and non-deterministic globals,
  *      scanned in package source (a bare `node:` import appears in no
  *      dependency list, so `package.json` cannot see it).
+ *      F16, its relative half — a relative specifier that resolves outside the
+ *      importing package's root, or through a `node_modules` directory
+ *      (`DEPCHECK-1`). The bare-name half (a deep subpath around an `exports`
+ *      map) is not implemented.
  *
- * Two further rule ids appear in output alongside F1–F13:
+ * Two further rule ids appear in output alongside the §3 rows:
  *   - `F-CLOSED` — the §6 fail-closed bullets (classification/mirror). Not a
  *     §3 rule (contract §3, closing paragraph).
  *   - **F14** — numbered 2026-08-28 by `GOV-1B` as contract §3 row F14, from
@@ -368,6 +376,21 @@ const DEPENDENCY_FIELDS = [
   "peerDependencies",
   "optionalDependencies",
 ];
+
+/**
+ * Contract §3 F10: "Any package depending on an `apps/*` package" (and §2,
+ * Layer 3: "Nothing may depend on an app."). An application is a workspace
+ * package under `apps/`. `pnpm-workspace.yaml` globs `apps/*`; the class is
+ * written `apps/**` so a deeper member, should the globs ever admit one, is an
+ * application too. The row names a directory class, not a layer, so it binds
+ * whatever layer §2 gives the package, and it has no §2.1 exception
+ * (`DEPCHECK-1`, item 1; ADR-022 D4).
+ */
+const APPLICATION_CLASS = "apps/**";
+
+function isApplicationDir(dir) {
+  return matchesGlob(dir, APPLICATION_CLASS);
+}
 
 // ---------------------------------------------------------------------------
 // Forbidden specifier catalogues (contract §3, rows F1–F8 and F11).
@@ -1157,6 +1180,16 @@ function parseContract(text) {
   // currently declares that edge (WP-015 review round 1, LOW).
   const resolved = [...byPattern.values()];
   for (const edge of sameLayerEdges) {
+    const problemsBefore = problems.length;
+    // §3 F10 has no §2.1 exception, so a row permitting an edge INTO an
+    // application can never be valid, whatever layer it states (`DEPCHECK-1`,
+    // item 2). Before this, an app-to-app row plus its dependency passed
+    // silently (the H8 scoping's probe P3).
+    if (denotesApplication(edge.to, resolved)) {
+      problems.push(
+        `${CONTRACT_REL} §2.1 row "${edge.id}" (line ${edge.line}) names \`${edge.to}\`, an application, as its \`to\` endpoint; §3 F10 forbids any package depending on an \`apps/*\` package, and F10 has no §2.1 exception.`,
+      );
+    }
     for (const [role, token] of [
       ["`from` endpoint", edge.from],
       ["`to` endpoint", edge.to],
@@ -1176,6 +1209,9 @@ function parseContract(text) {
         );
       }
     }
+    // A row that is already a `CHK` error here is not also reported as stale
+    // by `runCheck`: one defect, one finding.
+    edge.crossValidated = problems.length === problemsBefore;
   }
 
   return {
@@ -1205,6 +1241,21 @@ function layersForContractToken(token, assignments) {
     (entry) => matchesGlob(entry.pattern, token) || matchesGlob(token, entry.pattern),
   );
   return [...new Set(related.map((entry) => entry.layer))];
+}
+
+/**
+ * True when a §2.1 token denotes an application (F10): a concrete or glob path
+ * under `apps/`, or a glob whose first segment is not spelled `apps` (such as
+ * `a*` or a lone `*` before `/trader`) that matches, or is matched by, a §2
+ * assignment under `apps/`.
+ */
+function denotesApplication(token, assignments) {
+  if (isApplicationDir(token)) return true;
+  if (!isGlob(token)) return false;
+  return assignments.some(
+    (entry) =>
+      isApplicationDir(entry.pattern) && (matchesGlob(entry.pattern, token) || matchesGlob(token, entry.pattern)),
+  );
 }
 
 function classify(dir, assignments) {
@@ -2621,10 +2672,23 @@ function runCheck(rootDir) {
     });
   }
 
-  // ---- rule 2: layer conformance (F12, F13) -------------------------------
+  // ---- rule 2: layer conformance (F10, F12, F13) --------------------------
   const allowlist = contract.sameLayerEdges;
   for (const edge of edges) {
     if (edge.from === edge.to) continue; // reported as a self-cycle by rule 1
+    // F10 (`DEPCHECK-1`, item 1): an edge INTO an application fails whatever
+    // the layers and whatever §2.1 says. It is reported before the layer
+    // comparison, so it does not depend on §2 classifying either package.
+    const intoApplication = isApplicationDir(edge.to);
+    if (intoApplication) {
+      push({
+        rule: "F10",
+        subject: edge.from,
+        message: `\`${edge.from}\` declares the application \`${edge.to}\` via ${edge.field}; no package may depend on an \`apps/*\` package`,
+        doc: `${CONTRACT_REL} §2 ("Nothing may depend on an app."), §3 (F10), §6 rule 2`,
+        fix: "move the shared code into a package below layer 3 that both sides declare; F10 has no §2.1 exception",
+      });
+    }
     const fromLayer = layerOf.get(edge.from);
     const toLayer = layerOf.get(edge.to);
     if (fromLayer === undefined || toLayer === undefined) continue; // already reported
@@ -2639,6 +2703,10 @@ function runCheck(rootDir) {
       });
       continue;
     }
+    // A same-layer edge into an application has already failed F10. F13 is not
+    // added: its remedy, a cited §2.1 row, is itself a `CHK` error for an
+    // application endpoint, and no row can permit this edge.
+    if (intoApplication) continue;
     const row = allowlist.find(
       (candidate) => matchesGlob(edge.from, candidate.from) && matchesGlob(edge.to, candidate.to),
     );
@@ -2663,7 +2731,35 @@ function runCheck(rootDir) {
     }
   }
 
-  // ---- rule 3: forbidden specifier scan (F1–F8, F11) ----------------------
+  // ---- §2.1 rows that permit nothing (`DEPCHECK-1`, item 4) ----------------
+  // §2.1 is exhaustive of the same-layer edges the repository HAS. A row whose
+  // edge no manifest declares permits nothing today and would silently
+  // re-permit the edge if it came back, so it is a `CHK` error; the change
+  // that removes an edge removes its row (ADR-022 D9's S18 obligation is the
+  // motivating case). Three kinds of row are not reported here:
+  //   - a row that already failed §2 cross-validation (it is a `CHK` error
+  //     from `parseContract`; one defect, one finding);
+  //   - a row naming a class glob that matches no workspace package — §6: "A
+  //     class matching zero packages is not an error";
+  //   - a row naming a concrete path that is not a workspace package — the
+  //     §2 entry for it is already `F-CLOSED` (a named entry with no manifest).
+  const namesNoPackage = (token) =>
+    isGlob(token) ? ![...dirs].some((dir) => matchesGlob(dir, token)) : !dirs.has(token);
+  for (const row of allowlist) {
+    if (row.crossValidated === false) continue;
+    if (namesNoPackage(row.from) || namesNoPackage(row.to)) continue;
+    const matched = edges.some((edge) => matchesGlob(edge.from, row.from) && matchesGlob(edge.to, row.to));
+    if (matched) continue;
+    push({
+      rule: "CHK",
+      subject: CONTRACT_REL,
+      message: `${CONTRACT_REL} §2.1 row "${row.id}" (line ${row.line}) permits \`${row.from}\` → \`${row.to}\`, but no workspace package declares a matching edge; a row that permits nothing is stale, and it would silently re-permit the edge if one came back`,
+      doc: `${CONTRACT_REL} §2.1 ("This table is exhaustive"), §6`,
+      fix: "remove the row in the change that removed its edge (or restore the edge); a new row lands in the same change as the edge it permits",
+    });
+  }
+
+  // ---- rule 3: forbidden specifier scan (F1–F8, F11; F16's relative half) --
   const strategyClass = "packages/strategies/**";
   const packageOfPath = (candidate) => {
     let owner = null;
@@ -2715,6 +2811,43 @@ function runCheck(rootDir) {
           if (owner && owner.dir !== pkg.dir) targetPackage = owner;
         }
         if (targetPackage && targetPackage.dir === pkg.dir) targetPackage = null;
+
+        // F16, the relative half (`DEPCHECK-1`, item 3). A relative specifier
+        // is resolved lexically against the importing file. It fails when it
+        // lands outside the importing package's root — in another package,
+        // an application, or no package at all — or when it reaches a
+        // dependency through a `node_modules` directory, which is the same deep
+        // import by a longer path. Every specifier `scanSourceFile` records is
+        // judged: static `import`/`export … from` (type-only and `export *`
+        // included), `import x = require(…)`, an `import("…")` type, a dynamic
+        // `import()` and a `require`-family load whose argument is a string or a
+        // no-substitution template. A non-literal specifier cannot be resolved
+        // and is F14's business, in the purity-restricted packages only.
+        if (isRelativeSpecifier(specifier)) {
+          const landed = toPosix(path.posix.normalize(path.posix.join(path.posix.dirname(fileRel), specifier)));
+          const insideRoot = landed === pkg.dir || landed.startsWith(`${pkg.dir}/`);
+          const throughNodeModules = insideRoot && landed.slice(pkg.dir.length).split("/").includes("node_modules");
+          if (!insideRoot || throughNodeModules) {
+            const intoApplication = targetPackage !== null && isApplicationDir(targetPackage.dir);
+            const where = throughNodeModules
+              ? `reaches \`${landed}\` through a \`node_modules\` directory`
+              : `resolves to \`${landed}\`, outside \`${pkg.dir}\`${
+                  targetPackage === null
+                    ? " and outside every workspace package"
+                    : ` and inside ${intoApplication ? "the application " : ""}\`${targetPackage.dir}\``
+                }`;
+            push({
+              rule: "F16",
+              subject: pkg.dir,
+              location: at,
+              message: `relative import \`${specifier}\` ${where}; a package imports another package by its name, through that package's \`exports\` map, and nothing outside its own root by path`,
+              doc: `${CONTRACT_REL} §3 (F16${intoApplication ? ", and F10: no package may depend on an application" : ""}), §6 rule 3`,
+              fix: intoApplication
+                ? "move the shared code into a package below layer 3 that both sides declare; an application is never importable (F10)"
+                : "declare the package as a workspace dependency and import it by name through its `exports` map",
+            });
+          }
+        }
 
         const targetIsStrategy = targetPackage !== null && matchesGlob(targetPackage.dir, strategyClass);
         const targetLayer = targetPackage ? layerOf.get(targetPackage.dir) : undefined;
@@ -2971,10 +3104,12 @@ function formatReport(result, rootDir) {
   lines.push("");
 
   if (result.violations.length === 0) {
-    lines.push("PASS: no cycle (F9), no upward edge (F12), no unlisted same-layer edge (F13),");
+    lines.push("PASS: no cycle (F9), no dependency on an app (F10), no upward edge (F12),");
+    lines.push("      no unlisted same-layer edge (F13), no stale or app-endpoint §2.1 row,");
     lines.push("      no forbidden import specifier or impure global (F1-F8, F11), no opaque");
     lines.push("      import()/require() and no evaluator (eval/Function/.constructor) in a");
-    lines.push("      restricted package (F14), every workspace package classified.");
+    lines.push("      restricted package (F14), no relative import leaving its package (F16),");
+    lines.push("      every workspace package classified.");
     return `${lines.join("\n")}\n`;
   }
 
@@ -3021,8 +3156,11 @@ const USAGE = `Usage: node tools/check-dependency-direction.mjs [--root <dir>] [
 
 Enforces docs/contracts/dependency-direction.md §6:
   F9        no circular workspace dependency (including a self-cycle)
+  F10       no declared dependency on an application (apps/*), in any layer
   F12/F13   no upward edge; same-layer edges only when listed in §2.1
   F1-F8,F11 no forbidden import specifier or non-deterministic global
+  F16       no relative import specifier that leaves its package's root or
+            goes through node_modules (the relative half of F16)
   F-CLOSED  §6 fail-closed: unclassified package, or §2 entry with no manifest
   F14       no dynamic import()/require() with a non-static specifier, no
             require capability escaping into a value the check cannot follow, and
@@ -3033,7 +3171,8 @@ Enforces docs/contracts/dependency-direction.md §6:
             the pre-numbering id F-OPAQUE (contract §3 F14)
 The §2 layer table and the §2.1 allowlist are parsed from the contract and
 validated eagerly; an unparseable or inconsistent row is a CHK error, not a
-skipped row. Source is parsed with the TypeScript compiler API (a root
+skipped row, and so is a row into an application or one that matches no
+declared edge. Source is parsed with the TypeScript compiler API (a root
 devDependency); if it cannot be loaded the check fails closed. Exits 0 when
 clean, 1 on any violation, 2 on a usage error.
 `;

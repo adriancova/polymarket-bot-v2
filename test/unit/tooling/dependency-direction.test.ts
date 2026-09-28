@@ -3520,3 +3520,335 @@ describe("dependency-direction check CLI", () => {
     expect(run.output).toContain("could not be read");
   });
 });
+
+/**
+ * `DEPCHECK-1` — the H8 track's checker-hardening round (`docs/handoffs/H8-GOV.md`,
+ * "The optional checker-hardening grant"; `docs/handoffs/DEPCHECK-1.md`).
+ *
+ * Four holes the H8 scoping measured, each closed in the checker and pinned here:
+ * - item 1, F10: a declared edge into an application failed only as F12/F13, and
+ *   an app-to-app edge with a §2.1 row passed (probes P2, P3);
+ * - item 2: a §2.1 row whose `to` endpoint is an application was accepted;
+ * - item 3, the relative half of F16: `apps/backtest-cli/src` importing
+ *   `../../trader/src/trader.js` passed (probe P8);
+ * - item 4: a §2.1 row matching no declared edge passed silently (ADR-022 D9's
+ *   S18 obligation rested on review alone).
+ *
+ * Every positive test here fails against the checker at `45c575a`; every
+ * negative test fails against a named mutant of the new code. Both proofs are in
+ * the round record. Each fixture batches its cases into one child process, to
+ * keep this file's added wall time small (`CI-1`).
+ */
+describe("dependency-direction check — DEPCHECK-1 (F10, the §2.1 row CHKs, F16's relative half)", () => {
+  /** The violations' machine rule ids, sorted, so a test pins the exact SET a fixture produces. */
+  const rulesOf = (report: CheckerJson): string[] => report.violations.map((entry) => entry.rule).sort();
+
+  /**
+   * Every real workspace package under `within` that declares `name` as a
+   * workspace dependency, as a `removeDependencies` map. A fixture that drops
+   * an edge or a package takes its consumers from the real manifests, so it
+   * stays exact when later rounds add consumers (`CORE-MOVE` adds
+   * `packages/trading-core` with thirteen workspace dependencies).
+   */
+  const declaring = (name: string, within = ""): Record<string, string[]> => {
+    const found: Record<string, string[]> = {};
+    for (const relative of realWorkspaceDirs()) {
+      const dir = relative.split(path.sep).join("/");
+      if (!dir.startsWith(within)) continue;
+      const manifest = JSON.parse(readFileSync(path.join(repoRoot, relative, "package.json"), "utf8")) as Readonly<
+        Record<string, unknown>
+      >;
+      const declares = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"].some((field) => {
+        const block = manifest[field];
+        if (typeof block !== "object" || block === null) return false;
+        const specifier = (block as Readonly<Record<string, unknown>>)[name];
+        return typeof specifier === "string" && specifier.startsWith("workspace:");
+      });
+      if (declares) found[dir] = [name];
+    }
+    return found;
+  };
+
+  describe("F10: a declared edge into an application fails, whatever the layers and whatever §2.1 says (item 1)", () => {
+    it("P2: an app that declares another app is F10, and not F13, whose `add a row` remedy is forbidden", async () => {
+      const root = buildFixture({
+        addDependencies: { "apps/backtest-cli": { "@polymarket-bot/trader": "workspace:*" } },
+      });
+      const [report, run] = await Promise.all([runCheckerJson(root), runChecker(root)]);
+      expect(report.ok).toBe(false);
+      expect(rulesOf(report)).toEqual(["F10"]);
+      const [finding] = report.violations;
+      expect(finding?.subject).toBe("apps/backtest-cli");
+      expect(finding?.message).toContain("declares the application `apps/trader` via dependencies");
+      expect(finding?.doc).toContain("§3 (F10)");
+      expect(run.status).toBe(1);
+      expect(run.output).toContain("FAIL [F10] apps/backtest-cli");
+      expect(run.output).not.toContain("FAIL [F13]");
+    });
+
+    it("reports F10 beside F12 from a lower layer, and F10 alone within layer 3, through every dependency field", async () => {
+      // Replaces the mirrored `apps/ops-cli` manifest: its real workspace
+      // dependencies are kept, and a dev and a peer edge into two apps added.
+      const opsCli = JSON.parse(readFileSync(path.join(repoRoot, "apps", "ops-cli", "package.json"), "utf8")) as {
+        readonly name: string;
+        readonly dependencies?: Readonly<Record<string, string>>;
+        readonly devDependencies?: Readonly<Record<string, string>>;
+      };
+      const workspaceOnly = (block: Readonly<Record<string, string>> | undefined): Record<string, string> =>
+        Object.fromEntries(Object.entries(block ?? {}).filter(([, specifier]) => specifier.startsWith("workspace:")));
+      const report = await runCheckerJson(
+        buildFixture({
+          addDependencies: { "packages/oms": { "@polymarket-bot/trader": "workspace:*" } },
+          addOptionalDependencies: { "packages/features": { "@polymarket-bot/data-gateway": "workspace:*" } },
+          files: {
+            "apps/ops-cli/package.json": `${JSON.stringify(
+              {
+                name: opsCli.name,
+                version: "0.0.0",
+                private: true,
+                type: "module",
+                dependencies: workspaceOnly(opsCli.dependencies),
+                devDependencies: {
+                  ...workspaceOnly(opsCli.devDependencies),
+                  "@polymarket-bot/research-worker": "workspace:*",
+                },
+                peerDependencies: { "@polymarket-bot/control-api": "workspace:*" },
+              },
+              null,
+              2,
+            )}\n`,
+          },
+        }),
+      );
+      // F9 is left out of the pinned set: whether these edges close a cycle
+      // depends on the apps' own manifests, which later rounds change.
+      expect(rulesOf(report).filter((rule) => rule !== "F9")).toEqual(["F10", "F10", "F10", "F10", "F12", "F12"]);
+      const f10 = report.violations.filter((entry) => entry.rule === "F10").map((entry) => entry.message);
+      expect(f10).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining("`packages/oms` declares the application `apps/trader` via dependencies"),
+          expect.stringContaining("`packages/features` declares the application `apps/data-gateway` via optionalDependencies"),
+          expect.stringContaining("`apps/ops-cli` declares the application `apps/research-worker` via devDependencies"),
+          expect.stringContaining("`apps/ops-cli` declares the application `apps/control-api` via peerDependencies"),
+        ]),
+      );
+      // F12 is unchanged: the upward edges still report it, beside F10.
+      const f12 = report.violations.filter((entry) => entry.rule === "F12").map((entry) => entry.message);
+      expect(f12).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining("upward edge `packages/oms` (layer 1) -> `apps/trader` (layer 3)"),
+          expect.stringContaining("upward edge `packages/features` (layer 1) -> `apps/data-gateway` (layer 3)"),
+        ]),
+      );
+    });
+  });
+
+  describe("CHK: a §2.1 row whose `to` endpoint is an application (item 2)", () => {
+    const appRow = "| SX | `apps/backtest-cli` → `apps/trader` | 3 | probe P3 |";
+
+    it("P3: an app-to-app row plus its dependency fails with CHK and F10", async () => {
+      const report = await runCheckerJson(
+        buildFixture({
+          patchContract: (contract) => addAllowlistRow(contract, appRow),
+          addDependencies: { "apps/backtest-cli": { "@polymarket-bot/trader": "workspace:*" } },
+        }),
+      );
+      expect(rulesOf(report)).toEqual(["CHK", "F10"]);
+      const chk = report.violations.find((entry) => entry.rule === "CHK");
+      expect(chk?.message).toContain('§2.1 row "SX"');
+      expect(chk?.message).toContain("names `apps/trader`, an application, as its `to` endpoint");
+      expect(chk?.message).toContain("F10 has no §2.1 exception");
+      // The row is still listed as parsed; it is the CHK, not a silent drop.
+      expect(report.allowlist.map((row) => row.id)).toContain("SX");
+    });
+
+    it("reports the row alone as ONE CHK: it is not also reported as a stale row", async () => {
+      const report = await runCheckerJson(
+        buildFixture({ patchContract: (contract) => addAllowlistRow(contract, appRow) }),
+      );
+      expect(rulesOf(report)).toEqual(["CHK"]);
+      expect(report.violations[0]?.message).toContain("an application, as its `to` endpoint");
+    });
+
+    it("reads the class spelling `apps/*` and a glob whose first segment is not spelled `apps`", async () => {
+      const report = await runCheckerJson(
+        buildFixture({
+          patchContract: (contract) =>
+            addAllowlistRow(
+              addAllowlistRow(contract, "| SX | `apps/backtest-cli` → `apps/*` | 3 | fixture |"),
+              "| SY | `apps/ops-cli` → `a*/trader` | 3 | fixture |",
+            ),
+        }),
+      );
+      expect(rulesOf(report)).toEqual(["CHK", "CHK"]);
+      const messages = report.violations.map((entry) => entry.message);
+      expect(messages).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining('row "SX" (line'),
+          expect.stringContaining('row "SY" (line'),
+        ]),
+      );
+      for (const message of messages) expect(message).toContain("an application, as its `to` endpoint");
+    });
+  });
+
+  describe("F16: a relative specifier that leaves its package's root fails (item 3)", () => {
+    /** One file per import form the scanner reads, each at line 1, all from `apps/backtest-cli/src`. */
+    const p8 = "../../trader/src/trader.js";
+    const p8Forms: Readonly<Record<string, string>> = {
+      "p8-import.ts": `import { createPaperTrader } from "${p8}";\nexport const t = createPaperTrader;\n`,
+      "p8-import-type.ts": `import type { PaperTrader } from "${p8}";\nexport type T = PaperTrader;\n`,
+      "p8-side-effect.ts": `import "${p8}";\n`,
+      "p8-export-star.ts": `export * from "${p8}";\n`,
+      "p8-export-named.ts": `export { createPaperTrader } from "${p8}";\n`,
+      "p8-export-type.ts": `export type { PaperTrader } from "${p8}";\n`,
+      "p8-dynamic.ts": `export const load = () => import("${p8}");\n`,
+      "p8-template.ts": `export const load = () => import(\`${p8}\`);\n`,
+      "p8-type-node.ts": `export type T = import("${p8}").PaperTrader;\n`,
+      "p8-import-equals.ts": `import trader = require("${p8}");\nexport const t = trader;\n`,
+      "p8-require.ts": `export const t: unknown = require("${p8}");\n`,
+      "p8-require.cjs": `module.exports = require("${p8}");\n`,
+    };
+
+    it("P8: fails `apps/backtest-cli` importing `apps/trader` by relative path, in every form the scanner reads", async () => {
+      const files: Record<string, string> = {};
+      for (const [name, text] of Object.entries(p8Forms)) files[`apps/backtest-cli/src/${name}`] = text;
+      const report = await runCheckerJson(buildFixture({ files }));
+      const names = Object.keys(p8Forms);
+      expect(rulesOf(report)).toEqual(names.map(() => "F16"));
+      expect(report.violations.map((entry) => entry.location).sort()).toEqual(
+        names.map((name) => `apps/backtest-cli/src/${name}:1`).sort(),
+      );
+      for (const entry of report.violations) {
+        expect(entry.subject).toBe("apps/backtest-cli");
+        expect(entry.message).toContain(
+          `relative import \`${p8}\` resolves to \`apps/trader/src/trader.js\`, outside \`apps/backtest-cli\` and inside the application \`apps/trader\``,
+        );
+        expect(entry.doc).toContain("§3 (F16, and F10");
+      }
+    });
+
+    it("fails an escape into another package, into no package, into a same-prefix sibling, and through node_modules", async () => {
+      const report = await runCheckerJson(
+        buildFixture({
+          files: {
+            "packages/oms/src/deep.ts": 'import { evaluateIntent } from "../../risk/src/index.js";\nexport const e = evaluateIntent;\n',
+            "packages/oms/src/tool.ts": 'import "../../../tools/check-dependency-direction.mjs";\n',
+            "packages/pnl/src/sibling.ts": 'export * from "../../pnl-extra/src/index.js";\n',
+            "packages/strategies/static-bracket/src/sdk.ts":
+              'export type { StrategyContext } from "../../../strategy-sdk/src/index.js";\n',
+            "apps/backtest-cli/src/nm.ts":
+              'export { createPaperTrader } from "../node_modules/@polymarket-bot/trader/src/trader.js";\n',
+          },
+        }),
+      );
+      expect(rulesOf(report)).toEqual(["F16", "F16", "F16", "F16", "F16"]);
+      const byLocation = new Map(report.violations.map((entry) => [entry.location, entry.message]));
+      expect(byLocation.get("packages/oms/src/deep.ts:1")).toContain(
+        "resolves to `packages/risk/src/index.js`, outside `packages/oms` and inside `packages/risk`",
+      );
+      expect(byLocation.get("packages/oms/src/tool.ts:1")).toContain(
+        "resolves to `tools/check-dependency-direction.mjs`, outside `packages/oms` and outside every workspace package",
+      );
+      expect(byLocation.get("packages/pnl/src/sibling.ts:1")).toContain(
+        "resolves to `packages/pnl-extra/src/index.js`, outside `packages/pnl`",
+      );
+      expect(byLocation.get("packages/strategies/static-bracket/src/sdk.ts:1")).toContain(
+        "outside `packages/strategies/static-bracket` and inside `packages/strategy-sdk`",
+      );
+      expect(byLocation.get("apps/backtest-cli/src/nm.ts:1")).toContain(
+        "reaches `apps/backtest-cli/node_modules/@polymarket-bot/trader/src/trader.js` through a `node_modules` directory",
+      );
+    });
+
+    it("leaves relative imports that stay inside the importing package alone, tests included; `test/**` is no package", async () => {
+      const run = await runChecker(
+        buildFixture({
+          files: {
+            "packages/oms/src/a.ts": [
+              'import { b } from "./b.js";',
+              'import { c } from "../src/nested/c.js";',
+              'import root from "..";',
+              'export * from "./nested/../b.js";',
+              "export const a = [b, c, root];",
+            ].join("\n"),
+            "packages/oms/src/b.ts": "export const b = 1;\n",
+            "packages/oms/src/nested/c.ts": 'import "../../src/b.js";\nexport const c = 2;\n',
+            "packages/oms/test/a.test.ts": 'import { a } from "../src/a.js";\nexport const t = a;\n',
+            "packages/strategies/static-bracket/src/local.ts": 'export { b } from "../src/local-b.js";\n',
+            "packages/strategies/static-bracket/src/local-b.ts": "export const b = 1;\n",
+            // Outside every workspace package, so outside rule 3 entirely.
+            "test/unit/reaches-into-an-app.test.ts": 'import { createPaperTrader } from "../../apps/trader/src/trader.js";\nexport const t = createPaperTrader;\n',
+          },
+        }),
+      );
+      expect(run.output).toContain("PASS");
+      expect(run.status).toBe(0);
+    });
+  });
+
+  describe("CHK: a §2.1 row that matches no declared edge (item 4)", () => {
+    it("reports S6 once `packages/pnl` stops declaring `packages/risk`", async () => {
+      const report = await runCheckerJson(
+        buildFixture({ removeDependencies: { "packages/pnl": ["@polymarket-bot/risk"] } }),
+      );
+      expect(rulesOf(report)).toEqual(["CHK"]);
+      expect(report.violations[0]?.message).toContain(
+        '§2.1 row "S6" (line',
+      );
+      expect(report.violations[0]?.message).toContain(
+        "permits `packages/pnl` → `packages/risk`, but no workspace package declares a matching edge",
+      );
+    });
+
+    it("reports the class row S2 when its class matches a package but no package declares the edge", async () => {
+      // Every concrete strategy that declares the SDK drops it, so a second
+      // strategy (ADR-022 D9) cannot quietly re-match S2.
+      const strategies = declaring("@polymarket-bot/strategy-sdk", "packages/strategies/");
+      expect(Object.keys(strategies).length).toBeGreaterThan(0);
+      const report = await runCheckerJson(buildFixture({ removeDependencies: strategies }));
+      expect(rulesOf(report)).toEqual(["CHK"]);
+      expect(report.violations[0]?.message).toContain(
+        'row "S2" (line',
+      );
+      expect(report.violations[0]?.message).toContain("permits `packages/strategies/*` → `packages/strategy-sdk`");
+    });
+
+    it("reports a newly listed row until its edge is declared, then passes it", async () => {
+      const row = "| SX | `packages/oms` → `packages/inventory` | 1 | fixture-only row |";
+      const [withoutEdge, withEdge] = await Promise.all([
+        runCheckerJson(
+          buildFixture({
+            patchContract: (contract) => addAllowlistRow(contract, row),
+            removeDependencies: { "packages/oms": ["@polymarket-bot/inventory"] },
+          }),
+        ),
+        runCheckerJson(
+          buildFixture({
+            patchContract: (contract) => addAllowlistRow(contract, row),
+            addDependencies: { "packages/oms": { "@polymarket-bot/inventory": "workspace:*" } },
+          }),
+        ),
+      ]);
+      expect(rulesOf(withoutEdge)).toEqual(["CHK"]);
+      expect(withoutEdge.violations[0]?.message).toContain('row "SX"');
+      expect(withEdge.ok).toBe(true);
+      expect(withEdge.violations).toHaveLength(0);
+      expect(withEdge.allowlist.map((entry) => entry.id)).toContain("SX");
+    });
+
+    it("leaves a row whose package has no manifest to F-CLOSED, one finding for one defect", async () => {
+      // Every real consumer drops `packages/pnl` too; a dangling dependency
+      // would be a CHK of its own.
+      const consumers = declaring("@polymarket-bot/pnl");
+      expect(Object.keys(consumers).length).toBeGreaterThan(0);
+      const report = await runCheckerJson(
+        buildFixture({ removePackages: ["packages/pnl"], removeDependencies: consumers }),
+      );
+      // S6 (`packages/pnl` → `packages/risk`) now matches no edge, but its
+      // package's §2 entry is already F-CLOSED; no stale-row CHK is added.
+      expect(rulesOf(report)).toEqual(["F-CLOSED"]);
+      expect(report.violations[0]?.subject).toBe("packages/pnl");
+    });
+  });
+});
