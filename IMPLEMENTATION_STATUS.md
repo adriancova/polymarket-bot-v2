@@ -188,7 +188,23 @@ A 2,010-order synthetic run (not a soak) shows 0 `ordersSnapshot()` calls per ev
   - (6) The loop iterates its OWN sets, sorted with the venue's `compareStrings`, plus lookup by id, instead of `ordersSnapshot()` scans. Order ids sort `:o10` before `:o2`, so evaluation order must not change (`IF-07`).
   - (7) A venue-only `retention()` accessor. A health seam is queued with `TRDR4-GAUGES`.
 **Acceptance:** every golden is BYTE-IDENTICAL (a pure bounding change); a long synthetic run shows the venue bounded by live orders plus the retention and tombstone bounds; no soak claim. | SIM-1 | packages/simulation/**, apps/trader/src/**, apps/backtest-cli/** (as the ports change requires), test/unit/simulation/**, test/e2e/support/** (capture only if needed). Forbidden: packages/domain/**, packages/decimal/**, docs/**, db/**, protected files. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
-| `FOLD-1` (LOOPMEM-FOLD Option 2: the ledger view and PnL updated IN PLACE, with a rebuild-equals-incremental check) | **Ready (authorized 2026-09-27 by the user: "let's proceed with loopmem-fold"; option and two behaviour rulings answered the same day)**. Read-only scoping (workflow `wf_b527845c-ad5`: four lenses plus a synthesis, with REPRODUCED measurements) found LOOPMEM-FOLD is a CPU problem, not a memory problem:
+| `FOLD-1` (LOOPMEM-FOLD Option 2: the ledger view and PnL updated IN PLACE, with a rebuild-equals-incremental check) | **Complete (2026-09-27)** — merged `2c0bd21` (`--no-ff`; chain `b0403c6` r0 → `1e6e057` r1, on base `8d64bec`). Run under the HARDENING LOOP (workflow `wf_695d8814-aff`). Codex gpt-6-astra r1 **CHANGES REQUIRED** with 3 MEDIUM, all fixed:
+  - `FOLD1-R1-1`: a stale PnL state passed the end-of-run check;
+  - `FOLD1-R1-2`: unowned fills skipped the per-fill PnL check;
+  - `FOLD1-R1-3`: a backtest invocation could omit its final check.
+r2 **ACCEPTED with no findings**. **Delivered:**
+  - `HeldAccounting` (`apps/trader/src/folds.ts`) holds the ledger and its view together; the view advances only from `posted.appended` via the exported `applyTransaction`; a failed fold is a failed posting;
+  - the four read sites read the held view, and `haltOnLedgerProjection` still gets the whole view;
+  - held PnL per instance, retrying from the failure point; F3 counted;
+  - rebuild checks on serialized bytes, where a mismatch is a GLOBAL halt `ACCOUNTING_REBUILD_MISMATCH` — PAPER and real backtests every 50 fills plus shutdown / end of run; test and golden harnesses ledger + PnL every fill;
+  - `seams.folds`, with the control-api door updated;
+  - `packages/**` untouched; goldens BYTE-IDENTICAL.
+**Measured**, base → after:
+  - ~1e3 tx: 1,952 → 55 ms per event;
+  - ~1e4 tx: 1,342 → 10.4 ms per fill;
+  - PnL per fill at ~1e3 records: 80.5 → 0.31 ms;
+  - `projectLedger` calls per event: 33 → 0.2.
+**CI:** PR #9 run `36378622192` green, including the trader Testcontainers suite (not runnable locally). The unit step is now 187 s because of the 1,000-fill pin (`FOLD1-SLOWTEST`). Post-merge on `main` `2c0bd21` (tree identical to `1e6e057`): e2e 7/157, replay 3/17. **Not fixed:** memory is still unbounded (Option 4 deferred), and the PnL step is O(stream) (`FOLD-2`). Record `docs/handoffs/FOLD-1.md`. *As authorized:* Read-only scoping (workflow `wf_b527845c-ad5`: four lenses plus a synthesis, with REPRODUCED measurements) found LOOPMEM-FOLD is a CPU problem, not a memory problem:
   - `projectLedger` is a pure left fold (projections.ts:432-438), so an incremental fold is byte-identical to a rebuild BY CONSTRUCTION. REPRODUCED at N = 1e2 to 1e5, including Map insertion order.
   - A full view costs about 33 µs per transaction and is recomputed several times per event; 82% of calls see an unchanged ledger.
   - `foldPnlRecords` rebuilds from zero on every fill, which is quadratic: 4 s at 10k records.
@@ -1912,7 +1928,7 @@ wrong again; N5 is in the residual queue below.)*
   - **Unbounded state:** `#orders`, `#fills` and `#trades` are never pruned (`venue.ts:225-230`). The `fills` getter copies the whole array on every harvest (`:248-250`), and `ordersSnapshot()` sorts every order ever placed, several times per event (`:263-267`). The loop's `#knownFills` index cursor depends on `#fills` never shrinking.
   - **Probable capital leak:** some dead orders never reach a terminal state — a FAK partial whose remainder is cancelled, a marketable-limit remainder, an expired partial (`venue.ts:816`, `746-806`, `1356-1364`, `1389-1399`). Their reservations, allocator commitments and time-in-force entries are therefore never released. Verify before fixing.
   - **Orphaned fills:** a multi-order plan whose early order executes and whose later order is refused reports `accepted:false, orders:[]`, and the executed fills are left orphaned (`venue.ts:478-493`, `601-634`). `TRDR-4` makes that loud, but the venue should report the partial execution. | `TRDR-4` scoping (workflow `wf_38604101-524`) | a `packages/simulation` round after `TRDR-4` (a fill cursor or drain API instead of a copied index; prune terminal orders; make dead orders terminal) |
-| **LOOPMEM-FOLD** | **being handled by `FOLD-1`** (Option 2, authorized 2026-09-27). The scoping found NO ADR is needed for the CPU fix (see the `FOLD-1` row). Memory bounding stays deferred (Option 4, behind `RECON2-DURABLE`; it needs an ADR-006 amendment) |
+| **LOOPMEM-FOLD** | **CPU half CLOSED by `FOLD-1`** (merged `2c0bd21`, 2026-09-27): the ledger view is flat per fill and PnL is linear per fill. Remaining: `FOLD-2` (constant-cost PnL step) and memory bounding (Option 4, behind `RECON2-DURABLE` and an ADR-006 amendment) |
 | **TRDR4-LIVESETTLE** | A LIVE-ADAPTER obligation, out of PAPER scope. `TRDR-4` settles an order when it is terminal and its booked shares equal its filled shares. At a real venue trades settle asynchronously (MATCHED → MINED → CONFIRMED, or RETRYING → FAILED; `docs/venue/verified-2026-09-16.md`). Before a live adapter exists:
   - settlement must also require every trade of the order to be CONFIRMED or FAILED, and a §9.17 reconciliation to have passed;
   - the adapter must surface the orders a refused plan left behind (in `ordersSnapshot()` or in the refused result), carrying `plannedOrderId`.
@@ -1936,6 +1952,7 @@ It makes a runtime PnL rebuild check affordable (about 6 s instead of about 890 
 | **FOLD-RELATCH** | LATENT: a released MARKET `UNATTRIBUTED_ACTIVITY` halt is re-latched by the NEXT fill in ANY market, because `haltOnLedgerProjection` re-reads the whole unattributed history. REPRODUCED by calling `release` directly. Unreachable today: nothing in production calls the trader's `HaltController.release` (control-plane.ts says so) | `FOLD-1` scoping | the round that wires a halt-release seam into a running trader |
 | **FOLD-PNL2TOKEN** | A silent PnL gap: when an instance holds BOTH tokens of a market, only the filled token is marked (`loop.ts` about :2607-2612) | `FOLD-1` scoping | a PnL correctness round (unreachable with a single-token Static Bracket) |
 | **FOLD-OVERSELL** | After a restart (a new run with an empty in-memory ledger), a SELL of shares bought in the previous run would be an oversell in the PnL fold (`PNL_OVERSELL`). This is tied to restart semantics and `RECON2-DURABLE` | `FOLD-1` scoping | the restart/resume design (with `RECON2-DURABLE`) |
+| **FOLD1-SLOWTEST** | `apps/trader/src/loop-folds.test.ts`'s 1,000-fill held==rebuilt pin runs a FULL ledger rebuild after every fill, which is quadratic by design: about 68 s locally. It took the CI unit step from about 102 s to 187 s. It yields after every step, so the CI-1 RPC timeout cannot fire, but it is the slowest file by far | `docs/handoffs/FOLD-1.md` | the next round granted `apps/trader/src/**`: keep the property with far less work (every-fill checks for the first ~200 fills, then every 10th; or 1,000 fills with checks sampled) |
   - `projectLedger` re-folds the ENTIRE in-memory ledger on every evaluation, intent and fill (`packages/ledger/src/projections.ts:432-438`; `loop.ts:882`, `1043`, `1239`, `1419`);
   - `#pnlRecords` is re-folded from zero on every fill (`loop.ts:306-314`, `1541-1551`);
   - the Ledger store is append-only and unbounded.
