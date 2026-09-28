@@ -264,6 +264,62 @@ function engineFold(
   };
 }
 
+/**
+ * `packages/pnl`'s fold of `records` IN THE ORDER GIVEN (test side only),
+ * with its refusal messages and the fees it paid — what {@link engineFold}
+ * leaves out (`BRACKET-1b` r2).
+ */
+function engineState(
+  artifact: PaperRunArtifact,
+  records: readonly unknown[],
+):
+  | { readonly ok: false; readonly codes: readonly string[]; readonly messages: readonly string[] }
+  | {
+      readonly ok: true;
+      readonly lots: readonly (readonly [string, string, string])[];
+      readonly realized: readonly string[];
+      readonly fees: readonly string[];
+    } {
+  const scenario = artifact.scenario;
+  const folded = foldPnlRecords(
+    {
+      scope: "VIRTUAL_STRATEGY",
+      environment: "PAPER",
+      accountRef: scenario.accountRef,
+      instanceId: scenario.instanceId,
+      runId: scenario.runId,
+      marketId: scenario.marketId,
+    },
+    records,
+  );
+  if (!folded.ok) {
+    return {
+      ok: false,
+      codes: folded.refusals.map((refusal) => refusal.code),
+      messages: folded.refusals.map((refusal) => refusal.message),
+    };
+  }
+  return {
+    ok: true,
+    lots: [...folded.value.lots].map(([token, lot]) => [token, lot.shares, lot.costBasis] as const),
+    realized: [...folded.value.realizedTrading.values()],
+    fees: [...folded.value.feesPaid.values()],
+  };
+}
+
+/** A copy of `list` with the entries at `left` and `right` exchanged. */
+function swapped<T>(list: readonly T[], left: number, right: number): T[] {
+  const copy = [...list];
+  const a = copy[left];
+  const b = copy[right];
+  if (a === undefined || b === undefined) {
+    throw new Error(`no entry at ${String(left)} or ${String(right)}`);
+  }
+  copy[left] = b;
+  copy[right] = a;
+  return copy;
+}
+
 /** The document with one decision replaced. */
 function withDecision(
   artifact: PaperRunArtifact,
@@ -1019,6 +1075,205 @@ describe("BRACKET-1b r1 — BR1B-M2: the PnL stream books the fills ONE TO ONE, 
     ]);
     // Non-vacuous: no other row of the table sees it.
     expect(unexplainedRows(rows).map((entry) => entry.id)).toEqual(["bracket.2.pnl.realized"]);
+  });
+});
+
+/**
+ * `BRACKET-1b` r2, BR1B-R2-M1. Until r2 the records side of every
+ * `bracket.<n>.pnl.realized` SORTED its bracket's TRADE records into their
+ * fills' consumption order and folded each bracket from zero, while
+ * `packages/pnl` folds the whole stream once, in the order it is recorded. So
+ * a stream the engine refuses (a sale recorded before its purchase) and one it
+ * folds to different per-bracket numbers (a purchase recorded before the
+ * previous bracket's sale) both reconciled with every row explained. The
+ * stream's TRADE records must now be in the order the run consumed their
+ * fills and the ledger booked their token movements, and are folded as ONE
+ * stream, in that recorded order.
+ */
+describe("BRACKET-1b r2 — BR1B-R2-M1: the stream is folded in the order it was recorded, never re-sorted or split", () => {
+  it("reproduction A — bracket 2's SALE recorded before its PURCHASE is refused; packages/pnl refuses the same stream (PNL_OVERSELL at record index 4)", async () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    const entry = fillPlacedBy(golden, marks.enter2);
+    const exit = fillPlacedBy(golden, marks.takeProfit2);
+    const purchase = tradeRecordOf(golden, entry);
+    const sale = tradeRecordOf(golden, exit);
+    // The review's reproduction: the stream's records 4 and 6 exchanged.
+    expect([golden.pnlRecords[4]?.ref, golden.pnlRecords[6]?.ref]).toEqual([purchase.ref, sale.ref]);
+    const reordered = { ...golden, pnlRecords: swapped(golden.pnlRecords, 4, 6) };
+    expect(() => buildReconciliation(reordered)).toThrow(
+      new RegExp(
+        `the instance's §9\\.16 stream records the TRADE record of fill ` +
+          `${literally(exit.simulatedFillId)} \\(bracket 2, ledger transaction ` +
+          `${literally(sale.ref)}\\) before the TRADE record of fill ` +
+          `${literally(entry.simulatedFillId)} \\(bracket 2, ledger transaction ` +
+          `${literally(purchase.ref)}\\), but the run consumed fill ` +
+          `${literally(entry.simulatedFillId)} first \\(ingestSeq 9, before 10\\) and the ledger ` +
+          "booked its token movement first \\(sequence 7, not after 10\\)\\. packages/pnl folds a " +
+          "stream in the order it is recorded \\(foldPnlRecords\\)",
+        "u",
+      ),
+    );
+    // The engine, given the run's own records in the same order, refuses them.
+    const run = await driveScenario({ scenario: TWO_BRACKETS_SCENARIO });
+    const live = run.trader.loop.pnlRecords(golden.scenario.instanceId);
+    expect(live.map((record) => record.ref)).toEqual(golden.pnlRecords.map((record) => record.ref));
+    expect(engineState(golden, live)).toEqual({ ok: true, lots: [], realized: ["7.5"], fees: ["0.647"] });
+    expect(engineState(golden, swapped(live, 4, 6))).toMatchObject({
+      ok: false,
+      codes: expect.arrayContaining(["PNL_INPUT_INVALID", "PNL_OVERSELL"]) as unknown,
+      messages: expect.arrayContaining(["fold refused at record index 4"]) as unknown,
+    });
+  });
+
+  it("reproduction B — bracket 2's PURCHASE recorded before bracket 1's exit is refused across the boundary; packages/pnl would realize −0.75 on that exit, not −1", async () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    const reduction = fillPlacedBy(golden, marks.reduce);
+    const entry = fillPlacedBy(golden, marks.enter2);
+    const sale = tradeRecordOf(golden, reduction);
+    const purchase = tradeRecordOf(golden, entry);
+    // The review's reproduction: the stream's records 2 and 4 exchanged.
+    expect([golden.pnlRecords[2]?.ref, golden.pnlRecords[4]?.ref]).toEqual([sale.ref, purchase.ref]);
+    const reordered = { ...golden, pnlRecords: swapped(golden.pnlRecords, 2, 4) };
+    expect(() => buildReconciliation(reordered)).toThrow(
+      new RegExp(
+        `records the TRADE record of fill ${literally(entry.simulatedFillId)} \\(bracket 2, ` +
+          `ledger transaction ${literally(purchase.ref)}\\) before the TRADE record of fill ` +
+          `${literally(reduction.simulatedFillId)} \\(bracket 1, ledger transaction ` +
+          `${literally(sale.ref)}\\), across the boundary between bracket 1 and bracket 2, but ` +
+          `the run consumed fill ${literally(reduction.simulatedFillId)} first \\(ingestSeq 7, ` +
+          "before 9\\) and the ledger booked its token movement first \\(sequence 4, not after 7\\)",
+        "u",
+      ),
+    );
+    // What the engine makes of the run's own records in that order
+    // [TRADE e1, FEE e1, TRADE e2, FEE r, TRADE r, FEE e2, TRADE tp2]: ONE lot
+    // of 100 shares costing 17 + 16.5 = 33.5 before the first sale, which
+    // removes 33.5 × 50 / 100 = 16.75 and realizes 16 − 16.75 = −0.75. The
+    // total still reads 7.5, which is why only a per-bracket row could be
+    // fooled — and until r2 it was: bracket 1 certified −1.
+    const run = await driveScenario({ scenario: TWO_BRACKETS_SCENARIO });
+    const live = swapped(run.trader.loop.pnlRecords(golden.scenario.instanceId), 2, 4);
+    expect(engineState(golden, live.slice(0, 5))).toEqual({
+      ok: true,
+      lots: [[sale.tokenAssetId, "50", "16.75"]],
+      realized: ["-0.75"],
+      fees: ["0.431"],
+    });
+    expect(engineState(golden, live)).toMatchObject({ ok: true, lots: [], realized: ["7.5"] });
+    expect(row(golden.reconciliation, "bracket.1.pnl.realized").realized).toBe("-1");
+  });
+
+  it("the LEDGER's order binds as well: the stream unchanged, but a ledger that booked bracket 2's purchase before bracket 1's exit, is refused", () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    const reduction = fillPlacedBy(golden, marks.reduce);
+    const entry = fillPlacedBy(golden, marks.enter2);
+    const sale = tradeRecordOf(golden, reduction).ref;
+    const purchase = tradeRecordOf(golden, entry).ref;
+    const sequenceOf = (id: string): number =>
+      only(
+        golden.ledgerTransactions.filter((transaction) => transaction.ledgerTransactionId === id),
+        `ledger transaction ${id}`,
+      ).sequence;
+    expect([sequenceOf(sale), sequenceOf(purchase)]).toEqual([4, 7]);
+    // The two token movements' booking positions exchanged; the stream, the
+    // fills and every id untouched, so the venue's order has nothing to say.
+    const rebooked: PaperRunArtifact = {
+      ...golden,
+      ledgerTransactions: golden.ledgerTransactions.map((transaction) =>
+        transaction.ledgerTransactionId === sale
+          ? { ...transaction, sequence: 7 }
+          : transaction.ledgerTransactionId === purchase
+            ? { ...transaction, sequence: 4 }
+            : transaction,
+      ),
+    };
+    expect(() => buildReconciliation(rebooked)).toThrow(
+      new RegExp(
+        `records the TRADE record of fill ${literally(reduction.simulatedFillId)} \\(bracket 1, ` +
+          `ledger transaction ${literally(sale)}\\) before the TRADE record of fill ` +
+          `${literally(entry.simulatedFillId)} \\(bracket 2, ledger transaction ` +
+          `${literally(purchase)}\\), across the boundary between bracket 1 and bracket 2, but ` +
+          "the ledger booked its token movement first \\(sequence 4, not after 7\\)\\. ",
+        "u",
+      ),
+    );
+  });
+
+  it("a position one bracket's records leave open is CARRIED into the next, as the engine carries it: bracket 1's purchase booked at 60 fails bracket 1 AND bracket 2", async () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    const purchase = tradeRecordOf(golden, fillPlacedBy(golden, marks.enter1));
+    const rows = buildReconciliation(withRecord(golden, purchase.ref, { shares: "60" }));
+    // Bracket 1: 60 at 0.34 = 20.4; selling 50 removes 20.4 × 50 / 60 = 17 and
+    // realizes 16 − 17 = −1, the fills' number, while 10 shares at 3.4 stay open.
+    expect(row(rows, "bracket.1.pnl.realized")).toMatchObject({
+      projected: "-1",
+      realized: "-1",
+      explained: false,
+      unexplainedReasons: [
+        "the bracket's TRADE records leave 10 shares of token token:9001 at a cost basis of 3.4, " +
+          "where its fills leave 0 at 0: the realized values may agree, but the positions the " +
+          "two folds leave do not, so the agreement is not an explanation",
+      ],
+    });
+    // Bracket 2, as the engine folds it: 10 + 50 = 60 shares at 3.4 + 16.5 =
+    // 19.9; selling 50 removes 19.9 × 50 / 60 = 16.58333333333333333333333333333333
+    // (34 significant digits, half-even) and realizes 25 − that =
+    // 8.41666666666666666666666666666667, keeping 10 at
+    // 3.31666666666666666666666666666667. Until r2 bracket 2's records were
+    // folded from ZERO: 8.5, flat, and the row was explained.
+    const second = row(rows, "bracket.2.pnl.realized");
+    expect([second.projected, second.realized, second.difference, second.explained]).toEqual([
+      "8.5",
+      "8.41666666666666666666666666666667",
+      "-0.08333333333333333333333333333333",
+      false,
+    ]);
+    expect(second.unexplainedReasons[0]).toBe(
+      "the bracket's TRADE records leave 10 shares of token token:9001 at a cost basis of " +
+        "3.31666666666666666666666666666667, where its fills leave 0 at 0: the realized values " +
+        "may agree, but the positions the two folds leave do not, so the agreement is not an " +
+        "explanation",
+    );
+    expect(unexplainedRows(rows).map((entry) => entry.id)).toEqual([
+      "bracket.1.pnl.realized",
+      "bracket.2.pnl.realized",
+    ]);
+    // The engine's own fold of the run's records, with the same change: the
+    // per-bracket shares add up to its realized PnL, and it holds the same lot.
+    const run = await driveScenario({ scenario: TWO_BRACKETS_SCENARIO });
+    const live = run.trader.loop
+      .pnlRecords(golden.scenario.instanceId)
+      .map((record) => (record.ref === purchase.ref ? { ...record, shares: "60" } : record));
+    expect(engineState(golden, live)).toMatchObject({
+      ok: true,
+      lots: [["token:9001", "10", "3.31666666666666666666666666666667"]],
+      realized: ["7.41666666666666666666666666666667"],
+    });
+    expect(addDecimal("-1", second.realized ?? "")).toBe("7.41666666666666666666666666666667");
+  });
+
+  it("FEE records are not ordered: moved to the front of the stream they reconcile unchanged, and packages/pnl folds them to the same state", async () => {
+    const golden = twoBrackets();
+    const fees = golden.pnlRecords.filter((record) => record.kind === "FEE");
+    expect(fees).toHaveLength(3);
+    const moved: PaperRunArtifact = {
+      ...golden,
+      pnlRecords: [...fees, ...golden.pnlRecords.filter((record) => record.kind !== "FEE")],
+    };
+    expect(buildReconciliation(moved)).toEqual(golden.reconciliation);
+    // `applyFee` adds to the fees paid and touches no lot.
+    const run = await driveScenario({ scenario: TWO_BRACKETS_SCENARIO });
+    const live = run.trader.loop.pnlRecords(golden.scenario.instanceId);
+    expect(
+      engineState(golden, [
+        ...live.filter((record) => record.kind === "FEE"),
+        ...live.filter((record) => record.kind !== "FEE"),
+      ]),
+    ).toEqual(engineState(golden, live));
   });
 });
 

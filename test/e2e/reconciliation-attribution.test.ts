@@ -791,6 +791,52 @@ describe("RISK2-R3 — more than one entry is refused, not read as the first (R3
     expect(row(rows, "ledger.virtual_token_balance").projected).toBe("10");
   });
 
+  /**
+   * `BRACKET-1b` r2 (BR1B-R2-M1), at the one place the venue's order is SILENT:
+   * the golden's bracket 1 buys twice at ONE event (30 at 0.34, 20 at 0.35,
+   * both consumed at ingestSeq 5), so their consumption order is only the
+   * fill-id convention. The ledger's is recorded — the token movements were
+   * booked at sequence 1 and 4 — and `apps/trader` appends a fill's records
+   * only after its posting is in the ledger, so the stream must follow it.
+   * Two purchases commute under average cost, so the engine would fold the
+   * swapped stream to the same numbers; it is refused because it is not the
+   * stream the trader recorded, and until r2 it was silently re-sorted.
+   */
+  it("(r2) at ONE event the ledger's order decides: bracket 1's two purchases recorded against it are refused", () => {
+    const booked = bookedSecondEntry(
+      withRearm(consistentSecondEntry(withSecondEntry(golden(), "FILLED"))),
+    );
+    expect(() => buildReconciliation(booked)).not.toThrow();
+    const [first, fee, second] = booked.pnlRecords;
+    const together = booked.fills.filter((fill) => fill.atEventIngestSeq === "5");
+    const [early, late] = together;
+    if (first === undefined || fee === undefined || second === undefined || early === undefined || late === undefined) {
+      throw new Error("the golden's two purchases at one event are missing");
+    }
+    expect(together.map((fill) => [fill.action, fill.shares])).toEqual([
+      ["BUY", "30"],
+      ["BUY", "20"],
+    ]);
+    expect([first.kind, first.shares, second.kind, second.shares]).toEqual(["TRADE", "30", "TRADE", "20"]);
+    const reordered: PaperRunArtifact = {
+      ...booked,
+      pnlRecords: [second, fee, first, ...booked.pnlRecords.slice(3)],
+    };
+    const literally = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    // No "the run consumed … first" clause: the venue's order ties; the
+    // ledger's alone refuses.
+    expect(() => buildReconciliation(reordered)).toThrow(
+      new RegExp(
+        `records the TRADE record of fill ${literally(late.simulatedFillId)} \\(bracket 1, ` +
+          `ledger transaction ${literally(second.ref)}\\) before the TRADE record of fill ` +
+          `${literally(early.simulatedFillId)} \\(bracket 1, ledger transaction ` +
+          `${literally(first.ref)}\\), but the ledger booked its token movement first ` +
+          "\\(sequence 1, not after 4\\)\\. ",
+        "u",
+      ),
+    );
+  });
+
   it("an entry decision that emits TWO order-placing intents is refused the same way", () => {
     const artifact = golden();
     const marks = landmarks(artifact);

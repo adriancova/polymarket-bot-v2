@@ -85,6 +85,22 @@
  * and the POSITION the records leave must equal the one the fills leave, not
  * only the realized PnL — a stream with an extra purchase can realize the same
  * number while holding shares the fills do not (BR1B-M2).
+ *
+ * ## The stream in the ORDER it was recorded (`BRACKET-1b` r2)
+ *
+ * `packages/pnl` folds a stream in the order it is recorded (`foldPnlRecords`),
+ * and average cost is not indifferent to that order: a sale removes the share
+ * of the basis the lot holds AT THAT POINT. So the stream is neither re-sorted
+ * nor split by bracket before it is folded. Its TRADE records must already be
+ * in the order the run consumed their fills and the ledger booked their token
+ * movements — across bracket boundaries too — or the run is refused by name;
+ * and the records side of every `bracket.<n>.pnl.realized` is that bracket's
+ * share of ONE fold of the whole stream, in recorded order, carrying whatever
+ * position a bracket's records leave into the next. Before r2 each bracket's
+ * records were sorted into their fills' order and folded from zero, so a
+ * stream the engine refuses (a sale recorded before its purchase) or folds
+ * differently (a purchase recorded before the previous bracket's sale)
+ * reconciled with every row explained (BR1B-R2-M1).
  */
 
 import {
@@ -102,6 +118,7 @@ import type {
   ArtifactDecision,
   ArtifactFill,
   ArtifactIntent,
+  ArtifactLedgerTransaction,
   ArtifactOrder,
   ArtifactOrderProvenance,
   ArtifactPnlRecord,
@@ -1584,6 +1601,8 @@ export function buildReconciliation(
   const rows: ReconciliationRow[] = [];
   const realizedByBracket: string[] = [];
   const trades = tradeRecordsByBracket(artifact, attributions);
+  const ordinals = attributions.map((attribution) => attribution.bracket.ordinal);
+  const stream = foldRecordedStream(trades.inRecordedOrder, ordinals);
   for (const attribution of attributions) {
     const prefix = `bracket.${String(attribution.bracket.ordinal)}.`;
     const own = new Set([...attribution.entryFills, ...attribution.exitFills]);
@@ -1593,12 +1612,11 @@ export function buildReconciliation(
       attribution,
       artifact.fills.filter((fill) => own.has(fill)),
     );
-    const realized = bracketRealizedRow(
-      prefix,
-      attribution,
-      trades.byBracket.get(attribution.bracket.ordinal) ?? [],
-      trades.recordTokenOf,
-    );
+    const share = stream.get(attribution.bracket.ordinal);
+    if (share === undefined) {
+      throw new Error(`bracket ${String(attribution.bracket.ordinal)} has no share of the stream's fold`);
+    }
+    const realized = bracketRealizedRow(prefix, attribution, share, trades.recordTokenOf);
     realizedByBracket.push(realized.projected);
     rows.push(
       ...bracket.entry,
@@ -2191,11 +2209,21 @@ interface BracketTrade {
   readonly record: ArtifactPnlRecord;
   /** The venue fill the record books, found through the chain that posted it. */
   readonly fill: ArtifactFill;
+  /** The ordinal of the bracket that fill's attribution puts it in. */
+  readonly bracket: number;
+  /** The fill's token movement: the ledger transaction the record's `ref` names. */
+  readonly movement: ArtifactLedgerTransaction;
 }
 
-/** Each bracket's TRADE records, and the stream's token for each venue token. */
+/** The stream's TRADE records, and the stream's token for each venue token. */
 interface BracketTrades {
-  readonly byBracket: ReadonlyMap<number, readonly BracketTrade[]>;
+  /**
+   * Every TRADE record of the instance's stream, IN THE ORDER THE STREAM
+   * RECORDS THEM (`BRACKET-1b` r2) — never sorted, never split by bracket —
+   * each resolved to its fill and bracket by id. {@link refuseReorderedStream}
+   * has proven that order to be the run's.
+   */
+  readonly inRecordedOrder: readonly BracketTrade[];
   /** A fill's `tokenId` → the `tokenAssetId` its TRADE records carry; one to one. */
   readonly recordTokenOf: ReadonlyMap<string, string>;
 }
@@ -2243,6 +2271,12 @@ const TOKEN_MOVEMENT_OF: Readonly<Record<string, string>> = Object.freeze({
  * Before r1 every transaction a chain named mapped to its fill, a duplicate or
  * an extra purchase was folded without a word, and a record's direction was
  * taken from the attribution instead of the record.
+ *
+ * Last (`BRACKET-1b` r2, BR1B-R2-M1), once every record is known to book its
+ * own fill exactly once: the stream's TRADE records must be in the order the
+ * run consumed their fills and the ledger booked their token movements
+ * ({@link refuseReorderedStream}). The records are returned in the stream's
+ * own order, for {@link foldRecordedStream} to fold exactly that way.
  */
 function tradeRecordsByBracket(
   artifact: Omit<PaperRunArtifact, "reconciliation">,
@@ -2289,7 +2323,7 @@ function tradeRecordsByBracket(
       placed.set(fill.simulatedFillId, { bracket, fill });
     }
   }
-  const byBracket = new Map<number, BracketTrade[]>();
+  const inRecordedOrder: BracketTrade[] = [];
   const recordOfFill = new Map<string, ArtifactPnlRecord>();
   const recordTokenOf = new Map<string, string>();
   const venueTokenOf = new Map<string, string>();
@@ -2368,9 +2402,7 @@ function tradeRecordsByBracket(
       recordTokenOf.set(fill.tokenId, record.tokenAssetId);
       venueTokenOf.set(record.tokenAssetId, fill.tokenId);
     }
-    const list = byBracket.get(at.bracket) ?? [];
-    list.push({ record, fill });
-    byBracket.set(at.bracket, list);
+    inRecordedOrder.push({ record, fill, bracket: at.bracket, movement: transaction });
   }
   const unbooked = [...placed.values()].filter(({ fill }) => !recordOfFill.has(fill.simulatedFillId));
   if (unbooked.length > 0) {
@@ -2386,7 +2418,143 @@ function tradeRecordsByBracket(
         "book the run the fills describe, and no per-bracket realized PnL is reported",
     );
   }
-  return { byBracket, recordTokenOf };
+  refuseReorderedStream(inRecordedOrder);
+  return { inRecordedOrder, recordTokenOf };
+}
+
+/**
+ * The stream's TRADE records are in the order the RUN produced them
+ * (`BRACKET-1b` r2, BR1B-R2-M1), across the whole stream — bracket boundaries
+ * included — or the run is refused by name. Never re-sorted into that order:
+ * `packages/pnl` folds a stream exactly as recorded (`foldPnlRecords`), so a
+ * stream in any other order is not the one whose fold the rows would certify.
+ *
+ * Two recorded facts fix the order, and a record must come after its
+ * predecessor by BOTH:
+ *
+ * - the VENUE's: its fill was consumed no earlier (`atEventIngestSeq` not
+ *   smaller). This is the order {@link foldFills} folds the fills in, and so
+ *   the order the two sides of every realized row must share.
+ * - the LEDGER's: its token movement was booked later (`sequence` greater).
+ *   `apps/trader` adopts a fill's posting into the ledger and only then appends
+ *   that posting's records to the instance's stream (`loop.ts` `#harvestFills`),
+ *   so the stream's TRADE records follow the ledger's booking order exactly —
+ *   which also orders two fills consumed at ONE event, where
+ *   {@link inConsumptionOrder}'s fill-id tiebreak is only a convention.
+ *
+ * FEE records are not ordered: `packages/pnl` `applyFee` only adds to the fees
+ * paid, never touching a lot, so where a FEE record sits moves no realized
+ * value and no position.
+ *
+ * Since every earlier bracket's fills were consumed before the boundary that
+ * closes it and every later one's at or after it
+ * ({@link refuseMisplacedBoundaries}), a stream in this order holds each
+ * bracket's records CONTIGUOUSLY, in ascending bracket order —
+ * {@link foldRecordedStream} relies on that and re-asserts it.
+ */
+function refuseReorderedStream(inRecordedOrder: readonly BracketTrade[]): void {
+  for (const [index, trade] of inRecordedOrder.entries()) {
+    const previous = inRecordedOrder[index - 1];
+    if (previous === undefined) continue;
+    const disagreements: string[] = [];
+    if (compareIngestSeq(trade.fill.atEventIngestSeq, previous.fill.atEventIngestSeq) < 0) {
+      disagreements.push(
+        `the run consumed fill ${trade.fill.simulatedFillId} first (ingestSeq ` +
+          `${trade.fill.atEventIngestSeq}, before ${previous.fill.atEventIngestSeq})`,
+      );
+    }
+    if (!(trade.movement.sequence > previous.movement.sequence)) {
+      disagreements.push(
+        `the ledger booked its token movement first (sequence ${String(trade.movement.sequence)}, ` +
+          `not after ${String(previous.movement.sequence)})`,
+      );
+    }
+    if (disagreements.length === 0) continue;
+    const describe = (what: BracketTrade): string =>
+      `the TRADE record of fill ${what.fill.simulatedFillId} (bracket ${String(what.bracket)}, ` +
+      `ledger transaction ${what.record.ref})`;
+    const crossing =
+      previous.bracket === trade.bracket
+        ? ""
+        : `, across the boundary between bracket ${String(Math.min(previous.bracket, trade.bracket))} ` +
+          `and bracket ${String(Math.max(previous.bracket, trade.bracket))}`;
+    throw new Error(
+      `the instance's §9.16 stream records ${describe(previous)} before ${describe(trade)}` +
+        `${crossing}, but ${disagreements.join(" and ")}. packages/pnl folds a stream in the order ` +
+        "it is recorded (foldPnlRecords), and average cost is not indifferent to it, so this " +
+        "stream's fold is not the fold of the run's fills; the order is refused, never re-sorted, " +
+        "and no per-bracket realized PnL is reported",
+    );
+  }
+}
+
+/** A bracket's share of the ONE fold of the recorded stream. */
+interface StreamShare {
+  /** The realized PnL the bracket's own records contribute to the fold. */
+  readonly realized: string;
+  /** The position the fold holds after the bracket's last record. */
+  readonly lots: ReadonlyMap<string, Lot>;
+}
+
+/**
+ * The records side of every `bracket.<n>.pnl.realized` (`BRACKET-1b` r2): ONE
+ * average-cost fold ({@link foldMovements}) of the instance's whole TRADE
+ * stream, in the order it is recorded — the order `packages/pnl` folds it in —
+ * never sorted and never split before it is folded. Each record moves the lot
+ * by its OWN `side` (`BRACKET-1b` r1).
+ *
+ * A bracket's share is what its own records contribute: the realized PnL the
+ * fold gains across them, and the position the fold holds after the last of
+ * them. A position a bracket's records leave open is therefore CARRIED into
+ * the next bracket's share, exactly as the engine carries it, instead of being
+ * forgotten by a fold that restarts from zero at every boundary.
+ *
+ * `inRecordedOrder` holds each bracket's records contiguously and in ascending
+ * bracket order ({@link refuseReorderedStream}); a bracket with no record
+ * shares nothing (realized 0) and holds what the fold held before it. A record
+ * that no bracket in `ordinals` takes, in that order, is refused — it would be
+ * a record this function had silently dropped.
+ */
+function foldRecordedStream(
+  inRecordedOrder: readonly BracketTrade[],
+  ordinals: readonly number[],
+): ReadonlyMap<number, StreamShare> {
+  const movements = inRecordedOrder.map(({ record, fill }) => {
+    if (record.shares === null || record.price === null || record.tokenAssetId === null) {
+      throw new Error(
+        `the §9.16 TRADE record whose ref is ledger transaction ${record.ref} carries no ` +
+          "shares, no price or no token, so it cannot be folded",
+      );
+    }
+    return {
+      label: `the TRADE record (ledger transaction ${record.ref}) of fill ${fill.simulatedFillId}`,
+      token: record.tokenAssetId,
+      shares: record.shares,
+      price: record.price,
+      opens: opensBy(record.side, `the side of the TRADE record (ledger transaction ${record.ref})`),
+    };
+  });
+  const shares = new Map<number, StreamShare>();
+  let consumed = 0;
+  let realizedBefore = "0";
+  for (const ordinal of ordinals) {
+    while (inRecordedOrder[consumed]?.bracket === ordinal) consumed += 1;
+    // The fold of the stream's first `consumed` records, in recorded order: the
+    // engine's state after this bracket's last record.
+    const fold = foldMovements(movements.slice(0, consumed));
+    shares.set(ordinal, { realized: subDecimal(fold.realized, realizedBefore), lots: fold.lots });
+    realizedBefore = fold.realized;
+  }
+  const stray = inRecordedOrder[consumed];
+  if (stray !== undefined) {
+    throw new Error(
+      `the §9.16 TRADE record whose ref is ledger transaction ${stray.record.ref} (fill ` +
+        `${stray.fill.simulatedFillId}, bracket ${String(stray.bracket)}) is recorded after ` +
+        "the records of a later bracket, so the stream does not hold each bracket's records " +
+        "together in bracket order and no per-bracket realized PnL is reported",
+    );
+  }
+  return shares;
 }
 
 /**
@@ -2396,6 +2564,11 @@ function tradeRecordsByBracket(
  * can realize the same PnL while holding different positions — a stream that
  * books 60 shares for a 50-share purchase realizes the same on the sale and
  * keeps 10 — so the realized values agreeing is not enough.
+ *
+ * What "the bracket's TRADE records leave" is (`BRACKET-1b` r2): the position
+ * the ONE recorded-order fold of the whole stream holds after the bracket's
+ * last record ({@link foldRecordedStream}) — so it includes anything an
+ * earlier bracket's records left open, as the engine's position would.
  */
 function lotDisagreements(
   fromFills: ReadonlyMap<string, Lot>,
@@ -2432,9 +2605,15 @@ function lotDisagreements(
  *   which {@link refuseMisplacedBoundaries} proved — by `packages/pnl`'s
  *   average-cost method ({@link foldFills}).
  * - REALIZED: its §9.16 TRADE records, the stream the PnL engine folds,
- *   attributed to the bracket by id ({@link tradeRecordsByBracket}) and folded
- *   the same way — each by its OWN `side` (`BRACKET-1b` r1) — in their fills'
- *   consumption order.
+ *   attributed to the bracket by id ({@link tradeRecordsByBracket}): the
+ *   bracket's share of ONE fold of the whole stream in the order it is
+ *   RECORDED ({@link foldRecordedStream}, `BRACKET-1b` r2) — never sorted, never
+ *   folded from zero at a boundary — each record by its OWN `side`
+ *   (`BRACKET-1b` r1). {@link refuseReorderedStream} has proven that order to
+ *   agree with the fills' consumption order, so the two sides fold the same
+ *   sequence — except among fills consumed at ONE event, which the fills side
+ *   orders by the fill-id convention and the records side by the ledger's
+ *   booking; where that changes a number, the row shows the difference.
  *
  * The row is explained only when the realized values agree AND the two folds
  * leave the same position ({@link lotDisagreements}, BR1B-M2); the row's texts
@@ -2446,30 +2625,12 @@ function lotDisagreements(
 function bracketRealizedRow(
   prefix: string,
   attribution: Attribution,
-  trades: readonly BracketTrade[],
+  share: StreamShare,
   recordTokenOf: ReadonlyMap<string, string>,
 ): ReconciliationRow {
   const fillsFold = foldFills(attribution.entryFills, attribution.exitFills);
   const fromFills = fillsFold.realized;
-  const movements = [...trades]
-    .sort((left, right) => inConsumptionOrder(left.fill, right.fill))
-    .map(({ record, fill }) => {
-      if (record.shares === null || record.price === null || record.tokenAssetId === null) {
-        throw new Error(
-          `the §9.16 TRADE record whose ref is ledger transaction ${record.ref} carries no ` +
-            "shares, no price or no token, so it cannot be folded",
-        );
-      }
-      return {
-        label: `the TRADE record (ledger transaction ${record.ref}) of fill ${fill.simulatedFillId}`,
-        token: record.tokenAssetId,
-        shares: record.shares,
-        price: record.price,
-        opens: opensBy(record.side, `the side of the TRADE record (ledger transaction ${record.ref})`),
-      };
-    });
-  const recordsFold = foldMovements(movements);
-  const fromRecords = recordsFold.realized;
+  const fromRecords = share.realized;
   return exact(
     `${prefix}pnl.realized`,
     "the bracket's realized trading PnL, before fees",
@@ -2481,7 +2642,7 @@ function bracketRealizedRow(
     "the bracket's §9.16 TRADE records in the persisted pnlRecords stream, each placed in the " +
       "bracket by id (record.ref → the chain that posted that ledger transaction → its fill), " +
       "folded the same way",
-    lotDisagreements(fillsFold.lots, recordsFold.lots, recordTokenOf),
+    lotDisagreements(fillsFold.lots, share.lots, recordTokenOf),
   );
 }
 
