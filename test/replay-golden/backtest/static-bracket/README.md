@@ -77,7 +77,7 @@ lifecycle producer exists, is a follow-up, not a substitute.
 | 4 | 5 | `BookSnapshot` NO: bid `0.65×200`, ask `0.66×200` | `09:00:02Z` | the strategy ENTERS (executable buy for 50 = `17.2/50 = 0.344 ≤ 0.35`) |
 | 5 | 6 | `BookLevelChanged` YES BID `0.31 → 250` | `09:00:03Z` | an evaluation that changes nothing economic |
 | 6 | 7 | `BookSnapshot` YES: bids as before; asks `0.36×40` | `09:14:49Z` | refreshes the book inside the exit cutoff so `on_stale_book` does not mask the `PROTECTED_REDUCE` path; the strategy REDUCES |
-| 7 | 8 | `MarketClosing` `closesAt 09:15:00Z` | `09:14:50Z` | the cutoff callback, delivered to a paused instance |
+| 7 | 8 | `MarketClosing` `closesAt 09:15:00Z` | `09:14:50Z` | the cutoff callback, delivered to a CLOSED instance (its reentry limit of 1 answers it) |
 
 `receivedMonotonicNs` is `ordinal × 1 000 000`; the replay clock advances
 only on these values and the wall clock never regresses
@@ -107,17 +107,24 @@ only on these values and the wall clock never regresses
   records, 3 PnL snapshots; `halts=[]`, `healthy=true`. (18 decisions before
   `TRDR-4` — see "How `expected-artifact.txt` was produced" below.)
 
-## Residual 5 (`docs/handoffs/RISK-2.md`), observed here and pinned
+## Residual 5 (`docs/handoffs/RISK-2.md`) — observed here, pinned, and RESOLVED by `BRACKET-1a`
 
-`seq=9` (`onFill`, the reduction's own fill): `SB.UNATTRIBUTED_FILL →
-SB.POSITION_MISMATCH → SB.NO_BLIND_FLATTEN → SB.PAUSED`; `seq=11`
-(`onMarketClosing`): `SB.RESUMED, …, SB.PAUSED` again. The pause is the
-strategy's own state — the runtime's `instanceStatus()` stays `ACTIVE` — and
-the ledger is clean (`unattributedActivity 0`, `unexplainedMovements 0`). The
-money is right; the pause is strictly after the exit is booked. **Reported,
-not fixed**: `packages/strategies/**` is outside `BACKTEST-1`'s grant. An
-instance that pauses on its own exit cannot open a second bracket, so a replay
-that ends this way does not close §7 checklist item 1 either.
+**What `BACKTEST-1` recorded.** `seq=9` (`onFill`, the reduction's own fill):
+`SB.UNATTRIBUTED_FILL → SB.POSITION_MISMATCH → SB.NO_BLIND_FLATTEN →
+SB.PAUSED`; `seq=11` (`onMarketClosing`): `SB.RESUMED, …, SB.PAUSED` again. The
+pause was the strategy's own state — the runtime's `instanceStatus()` stayed
+`ACTIVE` — and the ledger was clean. Reported, not fixed: `packages/strategies/**`
+was outside `BACKTEST-1`'s grant.
+
+**What the run shows now.** `BRACKET-1a` gave the protective reduction its own
+order track, so through this replay root too `seq=9` reads `SB.EXIT_FILLED,
+SB.CLOSED` (the fill folds into the reduction's track and the bracket closes)
+and `seq=11` reads `SB.REFUSED_MAXIMUM_ENTRIES` (the closed bracket answers the
+fixture's reentry limit of 1, which `planRearm` checks before the cool-down).
+Nothing pauses; `instanceStatus()` is still `ACTIVE`; the ledger is still clean
+(`unattributedActivity 0`, `unexplainedMovements 0`). This fixture still cannot
+show a SECOND bracket — its limit is 1, and a cutoff reduction is always after
+the entry cutoff — so it does not close §7 checklist item 1 on its own either.
 
 ## How `expected-artifact.txt` was produced
 
@@ -148,6 +155,16 @@ and `decisionsPersisted` and the store line's `decisions` and `checkpoints`
 (`18 → 12`). Every order, fill, economics, ledger and PnL line is
 byte-identical — proven line by line, with the removed decisions identified
 by the order each delivered, in the round's handoff.
+
+**Re-captured by `BRACKET-1a` (2026-09-28), the same way** (a scratch probe
+calling `renderArtifact(await replayThroughShippedRoot({ withCore: true }))`
+twice, byte-equal, written ONCE over the restored base bytes), because the
+strategy's protective reduction now has an order track. Exactly two lines
+moved — line 28 (`seq=9`, `reasons=SB.EXIT_FILLED,SB.CLOSED`) and line 30
+(`seq=11`, `reasons=SB.REFUSED_MAXIMUM_ENTRIES`); see "Residual 5" above for
+why. Every order, fill, economics, trace, ledger, PnL, health, store and
+driver line is byte-identical (`store decisions=12` included): the same
+decisions exist, only two of them now say something else.
 
 ## Relationship to the other goldens
 

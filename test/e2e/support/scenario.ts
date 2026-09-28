@@ -277,8 +277,10 @@ export function strategyParams(): Record<string, unknown> {
  * Permissive on the dimensions this scenario does not measure, so the trade is
  * decided by the STRATEGY and not by a risk knob tuned to produce it. Nothing
  * here disables a check: `economics`, `participation` and the settlement gate
- * keep `packages/risk`'s own defaults, which is why the protective-exit
- * residual is still observable in this run.
+ * keep `packages/risk`'s own defaults — which is why this run once OBSERVED the
+ * protective-exit refusal (GOV-2B B2, fixed by `RISK-2`) instead of hiding it,
+ * and why it now shows that exit approved on its merits (`risk.refusedExits`
+ * 0).
  */
 export function riskPolicy(): Record<string, unknown> {
   return {
@@ -445,14 +447,22 @@ interface Recorded {
  *    the feature engine can produce a snapshot the strategy can act on);
  * 2. `MarketOpened`;
  * 3. the YES book, then the NO book — the Static Bracket ARMS on the first
- *    evaluation and ENTERS on the second, so two book events are required
- *    before an entry can exist at all;
- * 4. a level change that leaves the ladder intact, which is the evaluation the
- *    entry fires on;
- * 5. `MarketClosing` INSIDE `exit_cutoff_before_close_seconds`, which is what
- *    makes the strategy emit its `PROTECTED_REDUCE` exit — the intent the risk
- *    seam classifies `ENTRY` (the accepted `WP-220` residual) and refuses.
- *    Observed, counted, and never worked around.
+ *    evaluation and ENTERS on the second (the NO book's evaluation), so two
+ *    book events are required before an entry can exist at all; the entry
+ *    fills 30 + 20 at once and its take-profit is placed from the first
+ *    `onFill`;
+ * 4. a level change that leaves the ladder intact — the evaluation on which the
+ *    take-profit, sized to the first fill, is cancelled to be re-sized to the
+ *    grown allocation;
+ * 5. the YES book refreshed INSIDE `exit_cutoff_before_close_seconds` (see its
+ *    own note below): the evaluation on which the strategy's `final_policy:
+ *    PROTECTED_REDUCE` emits the protective reduction. The risk seam APPROVES it
+ *    (`RISK-2`; it used to classify it `ENTRY` and refuse it), it fills against
+ *    the bid, and — since `BRACKET-1a` gave the reduction its own order track —
+ *    its fill closes the bracket (`SB.EXIT_FILLED`, `SB.CLOSED`) where it used
+ *    to leave the instance PAUSED (`RISK-2` residual 5);
+ * 6. `MarketClosing`, to which the CLOSED bracket answers its reentry limit of
+ *    1 (`SB.REFUSED_MAXIMUM_ENTRIES`).
  */
 const RECORDED: readonly Recorded[] = Object.freeze([
   {

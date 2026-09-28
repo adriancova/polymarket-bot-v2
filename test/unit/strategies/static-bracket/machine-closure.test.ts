@@ -63,6 +63,7 @@ import {
   orderTransition,
   staticBracketParamsSchema,
   staticBracketStrategy,
+  type ExitRole,
   type InstanceState,
   type InstanceTrigger,
   type OrderState,
@@ -102,12 +103,24 @@ const SWEEP_INSTANCE_STATES: readonly InstanceState[] = INSTANCE_STATES.filter(
   (state) => state !== "HALTED",
 );
 
+/**
+ * `BRACKET-1a`: the exit slot holds one of TWO roles — a take-profit, or the
+ * protective reduction that now has a track of its own — and the ladder treats
+ * them differently (a live reduction is held, never withdrawn, re-sized or
+ * cancelled by take-profit maintenance). Every sweep in this file therefore
+ * runs each exit-order shape in BOTH roles, so the stale-data gate, the
+ * no-halt property and §6 invariant 13 are proved over reduction-role tracks
+ * too, not only over the take-profit shape they were first written for.
+ */
+const SWEEP_EXIT_ROLES: readonly ExitRole[] = ["TAKE_PROFIT", "PROTECTED_REDUCE"];
+
 interface Shape {
   readonly instanceState: InstanceState;
   readonly entryState: OrderState | null;
   readonly exitState: OrderState | null;
   readonly allocated: string;
   readonly leg: "YES" | "NO";
+  readonly exitRole: ExitRole;
 }
 
 function track(
@@ -117,14 +130,25 @@ function track(
 ): OrderTrack {
   const complement = shape.leg === "YES" ? false : true;
   const entrySide = complement ? "SELL" : "BUY";
+  const reduction = shape.exitRole === "PROTECTED_REDUCE";
   return {
     kind,
-    intentId: kind === "ENTRY" ? "sb-entry-0" : "sb-take-profit-1",
+    intentId:
+      kind === "ENTRY" ? "sb-entry-0" : reduction ? "sb-protected-reduce-1" : "sb-take-profit-1",
     orderId: kind === "ENTRY" ? "order-1" : "order-2",
     state,
     outcome: shape.leg,
     side: kind === "ENTRY" ? entrySide : entrySide === "BUY" ? "SELL" : "BUY",
-    limitPrice: kind === "ENTRY" ? (complement ? "0.65" : "0.35") : complement ? "0.5" : "0.5",
+    limitPrice:
+      kind === "ENTRY"
+        ? complement
+          ? "0.65"
+          : "0.35"
+        : reduction
+          ? complement
+            ? "0.74"
+            : "0.26"
+          : "0.5",
     requestedShares: "50",
     filledShares: kind === "ENTRY" ? shape.allocated : "0",
     viewFilledShares: kind === "ENTRY" ? shape.allocated : "0",
@@ -163,7 +187,9 @@ function* shapes(): Generator<Shape> {
       for (const exitState of SWEEP_ORDER_STATES) {
         for (const allocated of ["0", "50"]) {
           for (const leg of ["YES", "NO"] as const) {
-            yield { instanceState, entryState, exitState, allocated, leg };
+            for (const exitRole of SWEEP_EXIT_ROLES) {
+              yield { instanceState, entryState, exitState, allocated, leg, exitRole };
+            }
           }
         }
       }
@@ -174,7 +200,7 @@ function* shapes(): Generator<Shape> {
 function label(shape: Shape): string {
   return `${shape.instanceState}/${String(shape.entryState)}/${String(shape.exitState)}/${
     shape.allocated
-  }/${shape.leg}`;
+  }/${shape.leg}/${shape.exitRole}`;
 }
 
 /**
@@ -212,8 +238,9 @@ describe("the §13.3 machine is CLOSED over the shapes the code can reach", () =
       }
     }
     // 10 bracket states x 9 entry-order states x 9 exit-order states
-    // x 2 allocations x 2 legs.
-    expect(evaluated).toBe(3240);
+    // x 2 allocations x 2 legs x 2 exit roles (`BRACKET-1a`: 3240 before the
+    // protective reduction had a track to put in the exit slot).
+    expect(evaluated).toBe(6480);
     expect(halted).toEqual([]);
   });
 
@@ -296,6 +323,7 @@ describe("the §13.3 machine is CLOSED over the shapes the code can reach", () =
         exitState: null,
         allocated: "50",
         leg,
+        exitRole: "TAKE_PROFIT",
       };
       const decision = staticBracketStrategy.onFeatures(
         context(params(PREFERRING), stateFor(shape), { yesShares: "50" }),
@@ -325,22 +353,25 @@ describe("the §13.3 machine is CLOSED over the shapes the code can reach", () =
     });
     for (const orderState of ["PENDING", "WORKING", "CANCEL_PENDING"] as const) {
       for (const kind of ["ENTRY", "EXIT"] as const) {
-        const shape: Shape = {
-          instanceState: "ARMED",
-          entryState: kind === "ENTRY" ? orderState : null,
-          exitState: kind === "EXIT" ? orderState : null,
-          allocated: "0",
-          leg: "YES",
-        };
-        const decision = staticBracketStrategy.onFeatures(
-          context(params(roomy), stateFor(shape), {
-            yesShares: "0",
-            features: { "polymarket.executable_buy_price@50": "0.3" },
-          }),
-        );
-        expect(decision.decisionType, label(shape)).toBe("hold");
-        expect(decision.intents, label(shape)).toHaveLength(0);
-        expect(decision.reasonCodes, label(shape)).toContain(REASONS.refusedOrderInFlight);
+        for (const exitRole of SWEEP_EXIT_ROLES) {
+          const shape: Shape = {
+            instanceState: "ARMED",
+            entryState: kind === "ENTRY" ? orderState : null,
+            exitState: kind === "EXIT" ? orderState : null,
+            allocated: "0",
+            leg: "YES",
+            exitRole,
+          };
+          const decision = staticBracketStrategy.onFeatures(
+            context(params(roomy), stateFor(shape), {
+              yesShares: "0",
+              features: { "polymarket.executable_buy_price@50": "0.3" },
+            }),
+          );
+          expect(decision.decisionType, label(shape)).toBe("hold");
+          expect(decision.intents, label(shape)).toHaveLength(0);
+          expect(decision.reasonCodes, label(shape)).toContain(REASONS.refusedOrderInFlight);
+        }
       }
     }
     // Discrimination: with NOTHING in flight the same roomy configuration DOES
@@ -354,6 +385,7 @@ describe("the §13.3 machine is CLOSED over the shapes the code can reach", () =
           exitState: null,
           allocated: "0",
           leg: "YES",
+          exitRole: "TAKE_PROFIT",
         }),
         { yesShares: "0", features: { "polymarket.executable_buy_price@50": "0.3" } },
       ),
@@ -455,7 +487,7 @@ const MOVE_SITES: readonly MoveSite[] = [
       ["PARTIALLY_OPEN", "OPEN", "EXIT_PLANNED", "EXIT_WORKING", "CLOSED"],
       ["MARKET_CLOSED"],
     ),
-    why: "guarded by !hasAllocation; a bracket state with a spent allocation reaches it and holds with SB.MARKET_CLOSED without transitioning",
+    why: "guarded by !hasAllocation (and, since BRACKET-1a r1, by no unfolded entry execution — which only narrows the site); a bracket state with a spent allocation reaches it and holds with SB.MARKET_CLOSED without transitioning",
   },
   {
     name: "arm",
@@ -537,7 +569,21 @@ const MOVE_SITES: readonly MoveSite[] = [
     name: "protectedReduce",
     required: cross(EXIT_HOSTS, ["EXIT_TRIGGER_MET"]),
     tolerated: [],
-    why: "as above, through the stop, the holding timeout and the final policy",
+    why: "as above, through the stop, the holding timeout and the final policy; since BRACKET-1a the move also writes the reduction's order track (D1) — same site, same pairs",
+  },
+  {
+    // BRACKET-1a r1 renamed this site (it was `reduceStillLive`) when the
+    // second owed-exit case joined it: the pairs are unchanged.
+    name: "exitStillOwed",
+    required: cross(["PARTIALLY_OPEN", "OPEN"], ["EXIT_TRIGGER_MET"]),
+    tolerated: [],
+    why: "BRACKET-1a D4, r1 and r2: a late ENTRY fill moved the bracket out of the exit states (directly, or through a data-quality PAUSE whose resume lands there) while an exit order can still fill — its own live protective reduction (holdForLiveReduce) or a terminal exit awaiting its fill (planTakeProfit's D6 hold, and since r2 planExit's); reenterExitStates re-takes EXIT_TRIGGER_MET so that fill still folds. Guarded by an explicit instanceState check on exactly these two states",
+  },
+  {
+    name: "exitIntentExpired",
+    required: [{ from: "EXIT_PLANNED", trigger: "EXIT_ABANDONED" }],
+    tolerated: [],
+    why: "BRACKET-1a ruling R2: a protective reduction never named by a view or a fill, past its own validUntil, is retired through the existing 'planned exit that never became an order' edge. Guarded by instanceState === EXIT_PLANNED; any other state only clears the track",
   },
   {
     name: "reconcilePause",
@@ -1286,7 +1332,16 @@ describe("a REPEATED view for a terminal tracked order is absorbed, never halted
   it("and the exits still work afterwards — the halt's real cost", () => {
     // What the halt actually did: the position stayed on the books and every
     // protection was dead. After the absorption the stop still fires.
-    const track = terminalTrack("EXIT", "CANCELED");
+    //
+    // `BRACKET-1a` (D6) — the fixture, not the claim, moved. This used to use
+    // `terminalTrack`'s evidence as it is (`viewFilledShares "50"`, nothing
+    // folded): an exit order the venue says SOLD 50 whose fill has not been
+    // delivered. Firing a 50-share stop on top of that is exactly the oversell
+    // intent D6 closes (scoping probe P4d), so the stop now waits for the fill —
+    // asserted as the second half below. The route this test exists for, "no
+    // halt, and the stop still fires", is an exit order that ended having
+    // executed NOTHING.
+    const track: OrderTrack = { ...terminalTrack("EXIT", "CANCELED"), viewFilledShares: "0" };
     const state = stateWith({
       instanceState: "EXIT_WORKING",
       legOutcome: "YES",
@@ -1314,6 +1369,16 @@ describe("a REPEATED view for a terminal tracked order is absorbed, never halted
     );
     expect(stopped.decisionType).toBe("reduce");
     expect(places(stopped)).toBe(1);
+
+    // …and with the venue's evidence of 50 executed and unfolded, the same
+    // evaluation is not halted either — it WAITS for the fill (D6), placing
+    // nothing, rather than sizing a reduction from an allocation that is short.
+    const executed = stateWith({ ...state, exitOrder: terminalTrack("EXIT", "CANCELED") });
+    const waiting = staticBracketStrategy.onFeatures(context(params(), executed, views));
+    expect(waiting.reasonCodes).not.toContain(REASONS.halted);
+    expect(waiting.reasonCodes).toContain(REASONS.awaitingFillAllocation);
+    expect(places(waiting)).toBe(0);
+    expect(cancels(waiting)).toBe(0);
   });
 });
 

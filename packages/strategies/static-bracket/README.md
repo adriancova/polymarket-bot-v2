@@ -103,16 +103,17 @@ which survives as reason codes and `modelOutputs.reduceCause`.
 
 ### What that cost at the risk seam — **RESOLVED 2026-09-15 by `RISK-2`**
 
-> **This section is kept, unedited below the line, as the record of a residual
-> that has been closed.** It described the disclosed price of the decision above:
+> **This section records a residual that has been closed.** (`RISK-2` kept the
+> old text unedited below a line; `BRACKET-1a` removed it — see the note after
+> this quotation.) It described the disclosed price of the decision above:
 > every exit this strategy emits arrived at `packages/risk` as an `ENTRY`, so
 > §9.8 check 12 demanded an `expectedNetEdge` no exit carries and **every
 > protective exit was refused** `RISK_EDGE_INPUTS_MISSING`. GOV-2B raised that as
 > blocker **B2** — "no realized round trip is reachable in the merged paper
 > core" — and `RISK-2` fixed it.
 >
-> **How, and what it settles.** The last bullet below asked "whether the risk
-> engine may read intent TAGS is a contract question for that round". The answer
+> **How, and what it settles.** The old record's follow-up list asked "whether
+> the risk engine may read intent TAGS is a contract question for that round". The answer
 > is **no, and it does not need to.** `packages/risk` now derives the disposition
 > of a `POSITION` from its EFFECT ON THE SUPPLIED PORTFOLIO: an intent that
 > resolves to a SELL fully covered by the confirmed holding of the same
@@ -123,14 +124,14 @@ which survives as reason codes and `modelOutputs.reduceCause`.
 > `packages/risk/src/intent-view.ts`'s header and `packages/risk/README.md` §4.
 >
 > **What did NOT change.** This strategy still emits every exit as a `POSITION`
-> delta — the alternative in the other bullet (`buildReductionPlan` honouring
+> delta — the alternative that list also named (`buildReductionPlan` honouring
 > `maximumBuyPrice` and not acting on unnamed sides, or a domain ADR adding a
 > `direction` to §7.7's `ReducePositionIntent`) was **rejected**, for exactly the
-> reasons this file already reproduced end to end. The four-row table below is
-> therefore obsolete as a description of current behaviour: a covered protective
-> reduction now gets reduction treatment in all four situations, including
-> `RISK_BOOK_STALE_NO_BLIND_REDUCTION` and the `POSITION_STATE_UNKNOWN`
-> recommendation.
+> reasons this file already reproduced end to end. A covered protective
+> reduction now gets reduction treatment in all four situations the old record
+> tabulated — inside the entry cutoff, a `CLOSE_ONLY` market, a stale venue book
+> (`RISK_BOOK_STALE_NO_BLIND_REDUCTION` and the `POSITION_STATE_UNKNOWN`
+> recommendation), and the positive-net-edge gate.
 >
 > **What `RISK-2` had to fix here to make it reachable.** Two further defects in
 > this package, both masked by B2 because nothing downstream of the risk engine
@@ -141,88 +142,181 @@ which survives as reason codes and `modelOutputs.reduceCause`.
 > their sites in `decide.ts` and pinned by
 > `test/unit/strategies/static-bracket/risk-2-exit-reachability.test.ts`.
 
----
+*The pre-`RISK-2` record that used to follow here — the "type alone"
+classification, its four-row table of refusals, and the follow-up list it
+carried — was obsolete as a description of current behaviour from the day
+`RISK-2` merged and was REMOVED by `BRACKET-1a` (`RISK2-R5`, `RISK-2` residual
+item 7(i)). It is preserved verbatim in this file at `133eac1` and summarised in
+`docs/handoffs/RISK-2.md`.*
 
-This is the disclosed price of the decision above, and it is stated here rather
-than left for someone to discover in an incident.
-
-`packages/risk`'s `intent-view.ts` derives the risk DISPOSITION from the intent
-**type alone**: `CANCEL → CANCEL`, `REDUCE_POSITION → EXIT`, and
-`POSITION | QUOTE | BASKET → ENTRY`. Because this strategy emits every exit as a
-`POSITION` delta, **its protective reductions are classified `ENTRY` by the
-merged risk engine** — verified through the real `buildIntentView`, which
-answers `disposition: ENTRY` for both the `sb.take-profit` and the
-`sb.protected-reduce` intent. The classification is deliberately fail-closed on
-the risk side (entry treatment can only refuse more), so the consequence is
-never a wrong order; it is a **refused protective exit**, and these are the four
-places it bites (reproduced end to end through the merged `evaluateIntent` by
-review round 3, and readable in `engine.ts`'s `isEntry` branches):
-
-| Situation | What happens to a protective reduction from this strategy |
-|---|---|
-| Inside the configured entry cutoff before close | `RISK_TIME_TO_CLOSE_ENTRY_BLOCKED` — the §9.8 check-20 time-to-close gate applies its *entry* half |
-| Market is `CLOSE_ONLY` | `RISK_MARKET_CLOSE_ONLY` — blocked, though a reduction is exactly what a close-only market still permits |
-| Venue book stale | refused with the entry-shaped staleness code (`RISK_BOOK_STALE`; `RISK_FRESHNESS_UNKNOWN` for an unmeasured book) instead of `RISK_BOOK_STALE_NO_BLIND_REDUCTION`, and the `POSITION_STATE_UNKNOWN` incident recommendation the reduction path adds is **not** raised |
-| Default policy `economics.requirePositiveNetEdgeForEntries: true` | §9.8 check 12 demands `expectedNetEdge`, which no exit of this strategy carries, so **every exit is refused** (`RISK_EDGE_INPUTS_MISSING`) |
-
-The last row is **half pre-existing**: the take-profit was already a `POSITION`
-without an `expectedNetEdge` at `b17d461`, so that refusal predates the
-round-2 change; what round 2 added is the *protected reduction* to the same
-treatment.
-
-§9.8 check 20 ("time-to-close policy permits **entry or reduction**") and §9.9's
-ladder — `HALT_NEW_ENTRIES` above `PROTECTED_REDUCE` — both depend on telling an
-entry from a reduction, and a strategy whose exits are indistinguishable from
-entries erases that distinction for its own intents.
-
-**The deviation stands anyway**, and the reason is the whole of it: the
-alternatives put *wrong orders on the wire* (a `REDUCE_POSITION` becomes a
-second entry on the complement leg, and sells inventory this bracket never
-opened on either leg — both reproduced through the merged planner, above). A
-refusal is strictly better than a wrong order. Closing it properly is a
-**cross-package** change and is carried as follow-up:
-
-- `packages/execution-planner`'s `buildReductionPlan` must honour
-  `maximumBuyPrice` and must not act on sides the intent did not name; and/or a
-  domain ADR adding a `direction` to §7.7's `ReducePositionIntent`;
-- `packages/risk`'s intent-view mapping needs a way to recognise a **protective
-  reduction**. The `sb.protected-reduce` tag already exists on the intent;
-  whether the risk engine may read intent TAGS is a contract question for that
-  round, not a decision this package may take.
-
-### Re-emitting an exit **compounds**: it is a delta, not a level
+### Re-emitting an exit would **compound** — and the reduction's own order track contains it
 
 At `b17d461` an exit was a `REDUCE_POSITION`, whose `targetShares` is a LEVEL:
 re-emitting "sell down to 0" five times collapsed to one action, so a strategy
 that re-planned its exit on five consecutive evaluations was idempotent by
 construction.
 
-**That is no longer true.** Every exit is now a signed `POSITION` **DELTA**, and
-five evaluations that each plan a reduction plan `5 × 50 = 250` shares against a
-50-share allocation. Nothing inside this package prevents that: the strategy
-does not track intents in flight across evaluations, and a protected reduction
-deliberately does not create an order track (there is no venue order id to track
-until the OMS answers).
+**A DELTA is not.** Every exit is a signed `POSITION` **DELTA**, and five
+evaluations that each planned a reduction would plan `5 × 50 = 250` shares
+against a 50-share allocation. Until `BRACKET-1a` nothing inside this package
+prevented that: the protective reduction deliberately created no order track
+(the reason given was that there is no venue order id to track until the OMS
+answers — a reason the take-profit, tracked `PENDING` with `orderId: null` from
+the start, never needed), so every ladder evaluation before the reduction filled
+emitted it again, and its own fill then matched no track and PAUSED the
+instance (`RISK-2` residual 5).
 
-What contains it today is the **execution planner**, and only the planner:
-§9.10's own responsibility — "reserve collateral/inventory before submission",
-which `packages/execution-planner` carries on every plan as
-`reservationRule: "RESERVE_BEFORE_SUBMISSION"` — makes each accepted plan
-reserve the inventory it will spend, and the second and later reductions are
-then refused with `PLAN_INVENTORY_INSUFFICIENT` (reviewer-verified through the
-merged planner).
-That is a real mechanism, not an accident — but it is *someone else's*
-mechanism, so it is written down here as an obligation on the wiring rather than
-assumed:
+**What contains it now is the strategy itself.** The reduction is tracked
+exactly as the take-profit is, and while it is live every evaluation holds
+(`SB.EXIT_ORDER_WORKING`) — no second intent, no cancel of it. See "Protective
+reduction: tracked and sticky" below for the whole policy.
 
-> **A reservation taken by an accepted plan must be honoured before the next
-> evaluation's reduction is planned.** A composition root that plans from stale
-> inventory — or that drops reservations between evaluations — turns a repeated
-> protective exit into a multiple of the position.
+**What remains of the old containment is the BACKSTOP it always was:** §9.10's
+"reserve collateral/inventory before submission", which
+`packages/execution-planner` carries on every plan as
+`reservationRule: "RESERVE_BEFORE_SUBMISSION"`, makes each accepted plan reserve
+the inventory it will spend, so a second sale of the same shares is refused with
+`PLAN_INVENTORY_INSUFFICIENT` (reviewer-verified through the merged planner). It
+is now reached only by the one re-plan per validity window that ruling R2
+allows, and only if the retired reduction had in fact become an order the root
+never listed — obligation 11 below says that cannot happen. It is someone
+else's mechanism, so it stays an obligation (9) rather than an assumption.
 
-No code changed for this in review round 3: the containment is the planner's
-stated responsibility, and duplicating it inside the strategy would put two
-authorities on the same rule.
+### Protective reduction: tracked and sticky (`BRACKET-1a`; the user's rulings R2 and R3)
+
+WP-220 requires the entry, exit, stop, timeout and close policies to be
+EXPLICIT. For the protective reduction — whatever placed it: the stop, the
+holding timeout, or the close cutoff's `final_policy: PROTECTED_REDUCE` — they
+are:
+
+- **It is tracked.** `planProtectedReduce` writes an EXIT order track exactly
+  like the take-profit's: `PENDING`, `orderId: null`, `requestedShares` = the
+  confirmed open allocation it names, `limitPrice` = the floor. Its fill folds
+  through the ordinary exit edges (`EXIT_PLANNED | EXIT_WORKING
+  --EXIT_FILL_COMPLETE--> CLOSED`; a partial fill `--EXIT_PARTIAL_FILL-->
+  EXIT_WORKING`). No machine edge was added: 11 states, 21 triggers, 63 edges.
+- **Its role is read from its minted id.** `exitRole(track)` maps the
+  `sb-take-profit-` / `sb-protected-reduce-` prefix to `TAKE_PROFIT` /
+  `PROTECTED_REDUCE`, and REFUSES any other prefix — the instance halts naming
+  it rather than guess whether the order may be cancelled. The state document's
+  shape is unchanged (`STATIC_BRACKET_STATE_SCHEMA_VERSION` 2).
+- **It is STICKY (R3).** Once placed it runs to completion or to a terminal
+  state. Every ladder evaluation while it is live — `PENDING`,
+  `SUBMISSION_UNKNOWN`, `WORKING` (partly filled included), or a
+  `CANCEL_PENDING` a safety path requested — HOLDS: no second reduction, no
+  cancel of it, no take-profit beside it. A stop that clears does not withdraw
+  it (take-profit maintenance holds with `SB.EXIT_ORDER_WORKING` and never
+  cancels it); a later cause does not replace it; the `CANCEL_ONLY` and
+  `HOLD_TO_RESOLUTION` final policies leave it working and hold it exactly as
+  every other path does — `SB.EXIT_ORDER_WORKING`, and R2's silence transition
+  below — rather than with their own bare hold (review round 1, BR1-M1: a
+  reduction placed by the stop before the cutoff used to stay `PENDING` for
+  good under those two policies). Once R2 retires such a reduction, neither
+  policy places another: neither places reductions.
+- **It is never re-priced, and there is NO exit escalation.** A resting
+  remainder keeps its floor (`exit.stop.minimum_sell_price`) until it fills or
+  ends; nothing in this package makes it more aggressive over time. (That was
+  already the effect before `BRACKET-1a` — the repeated re-emissions were
+  refused by the reservation — but it is now the stated policy.)
+- **Only the safety paths in this package cancel it:** a data-quality incident
+  (`PAUSE_AND_CANCEL`; never a blind flatten — the reduction is cancelled and
+  the instance pauses), a position reconciliation (`SB.POSITION_MISMATCH` /
+  `SB.NO_BLIND_FLATTEN`), and `onStop`. A fill that arrives while the instance
+  is paused is folded (obligation 8), and resuming on a flat allocation closes
+  the bracket — unless an entry execution the venue reported is still unfolded
+  (next-but-one bullet). An end the order meets OUTSIDE this package (the
+  venue, or the
+  plan's own deadline under `escalation.atDeadline: CANCEL_REMAINING`) is a
+  terminal state like any other: once its view arrives and its fills are
+  folded (the settlement waits for them), the track is settled and the ladder
+  may plan a new reduction for what is still open, at the same floor.
+- **An allocation that grows under it** (a late ENTRY fill) is planned only
+  after the reduction settles, still under `positionAgrees`; meanwhile the
+  instance is returned to the exit states (`EXIT_TRIGGER_MET`) so the
+  reduction's own fill still folds instead of being refused as an illegal
+  transition. The same walk-back applies to an exit of either role that is
+  terminal on the venue but still awaiting its fill (see "An exit terminal on
+  the venue waits for its fill" below). If the late fill lands on STALE data,
+  the instance pauses instead (`PAUSE_AND_CANCEL`) with `resumeTo` naming the
+  state the fill moved it to, and the walk-back happens in the resume's own
+  evaluation, before any exit fill can arrive outside `PAUSED` (review round 2,
+  BR2-H1: the "awaiting its fill" hold in the ladder used to return without it,
+  so the awaited sale was refused from `OPEN` and discarded).
+- **A late ENTRY fill is never discarded, and the bracket is never closed over
+  it** (review round 1, BR1-H1). The protective reduction is sized from the
+  FOLDED allocation (§13.3 rule 1), so an entry whose view reported more than
+  had been folded — e.g. `FILLED 50` with 30 delivered — is exactly the case in
+  which the reduction names less than is held. The round-0 candidate cleared
+  such an entry track as soon as anything was folded; the late 20 then matched
+  no track, and once the reduction's own fill was attributed the bracket
+  reached a false `CLOSED` holding 20. Now, while an entry's view is ahead of
+  its fold: the entry track is KEPT (`SB.ENTRY_ORDER_TERMINAL`,
+  `SB.AWAITING_FILL_ALLOCATION`) and the late fill folds into it BY ORDER ID;
+  NO path certifies `CLOSED` — a flat fold of the folded allocation takes the
+  partial-fill edge and holds `SB.AWAITING_FILL_ALLOCATION`, and neither the
+  zero-open ladder branch (the paused-fold -> resume route) nor the
+  market-closed shortcut closes it; and settling an exit does not move the
+  bracket into `OPEN` — §13.3 folds an entry fill out of the entry states,
+  `PARTIALLY_OPEN` and the exit states, but has no such edge out of `OPEN`.
+  The ladder then exits what the late fill added, as an ordinary exit.
+  NOT covered, and unchanged from base: a fill for an entry order that is still
+  LIVE when the bracket is already `OPEN` (a withdrawn entry whose cancel loses
+  the race after the take-profit's settlement moved the bracket to `OPEN`) is
+  still the census's designed refusal — `SB.ILLEGAL_TRANSITION`, paused,
+  fail-closed, the fill unfolded — because `OPEN --ENTRY_*-->` is not a §13.3
+  edge and this round adds none. (With `convert_to_aggressive_after_ms: 0`, as
+  in §13.2's example, the entry is emitted as an immediate order of the
+  configured `immediate_order_type`, `FAK` there, which does not rest.)
+- **Nobody answers (R2).** A reduction still `PENDING` after
+  `submission_unknown_after_ms` becomes `SUBMISSION_UNKNOWN`
+  (`PENDING --SILENCE_EXCEEDED-->`), reported exactly as the entry reports it —
+  `modelOutputs.submissionUnknown: true`, `SB.EXIT_SUBMISSION_UNKNOWN`,
+  `SB.AWAITING_RECONCILIATION` — and nothing is re-sent (§6 invariant 6). It is
+  RETIRED (`SB.EXIT_INTENT_EXPIRED`, through the existing `EXIT_PLANNED
+  --EXIT_ABANDONED--> OPEN` edge) only when BOTH hold: its own intent's
+  `validUntil` (`placedAtMs + order_validity_ms`, as minted) is strictly in the
+  past, AND no order view and no fill has EVER named it (no venue order id, no
+  fill, no view-reported fill). A reduction that anything named is never
+  retired by expiry. After a retirement the ladder may plan ONE reduction for
+  the new validity window, gated by `positionAgrees` (strict equality) with the
+  loop's reservation as the backstop — so at most one reduction per validity
+  window. Retirement is safe because nothing can turn an expired intent into an
+  order any more: the risk engine refuses an intent whose `validUntil` is before
+  the evaluation instant (`packages/risk/src/engine.ts:238-248`,
+  `RISK_INTENT_EXPIRED`) and the execution planner refuses one whose
+  `validUntil` is not after the planning instant
+  (`packages/execution-planner/src/build.ts:196-213`, `PLAN_INTENT_EXPIRED`);
+  an order booked before then is visible (obligation 11) and is adopted before
+  retirement is considered.
+- **A stale view cannot hijack it.** Leg and side cannot tell it from the
+  take-profit it replaced, so an id-less reduction is named only by a view that
+  shows the order alive (`OPEN` / `PARTIALLY_FILLED`) or by its first fill;
+  from then on exact-id matching settles its terminal views. A redelivered
+  terminal view of the old take-profit is `SB.IDLE` to it. The take-profit's
+  own adoption is unchanged.
+- **An exit terminal on the venue waits for its fill.** If an exit order's view
+  reports more executed than the fill stream has delivered, the track is kept
+  and the instance holds with `SB.AWAITING_FILL_ALLOCATION` until the fill
+  folds by its order id — the exit twin of the entry's posture (obligation 7).
+  No exit is sized from the view. It waits IN THE EXIT STATES: the evaluation
+  that holds for it — the ladder's own hold, and take-profit maintenance's
+  after a late entry fill — first walks the bracket back into them if a late
+  entry fill moved it out, so the fill it waits for can fold. NOT covered, and
+  pre-existing at base: a TAKE-PROFIT that was still LIVE when a late entry
+  fill moved the bracket to `PARTIALLY_OPEN`/`OPEN` (the resize's
+  cancel-then-replace, whose cancel loses the race). Its fill is then refused
+  from that state, `SB.ILLEGAL_TRANSITION` and paused, fail-closed, with the
+  fill unfolded. That happens whether the fill arrives first or after a terminal
+  view (at base the second order said `SB.UNATTRIBUTED_FILL` instead; it paused
+  the same way). No edge was added for it.
+- **Reason codes.** A stop or holding-timeout reduction reports
+  `SB.PROTECTED_REDUCE`; the close-cutoff reduction keeps
+  `SB.FINAL_PROTECTED_REDUCE`.
+
+The take-profit keeps its maintenance policy, with one correction: it is
+compared with the open allocation by what it still has to sell
+(`requestedShares − filledShares`), so its own partial fill no longer triggers a
+cancel-and-replace.
 
 ## The `btc-15m-updown` caveat (carried from `WP-110`)
 
@@ -291,7 +385,12 @@ here because a wiring that breaks one produces a *quiet* misbehaviour.
    `ctx.orders()`, leaves that order's tracked state frozen. The effect is
    fail-safe — a frozen live order blocks new entries (see the in-flight guard
    in `planEntry`) rather than causing one — but it is a real obligation on the
-   wiring, and it is listed here rather than left implicit.
+   wiring, and it is listed here rather than left implicit. (A frozen protective
+   reduction is held the same way: it blocks a second reduction rather than
+   causing one, and it is never retired by expiry once a view or a fill has
+   named it.) An id-less protective reduction is adopted only from a LIVE view
+   (`OPEN` / `PARTIALLY_FILLED`); a take-profit and an entry keep the adoption
+   described here.
 5. **A repeated order VIEW is ordinary traffic; a repeated FILL is not.** The
    two halves of this obligation point in opposite directions and are stated
    separately because one paragraph covering both would be read as covering
@@ -321,10 +420,19 @@ here because a wiring that breaks one produces a *quiet* misbehaviour.
    allocation.** §8.1 guarantees no ordering between a view and the fill it
    describes, so a view reporting a filled size before its fill arrives puts the
    instance into an *awaiting-the-fill* posture (`SB.AWAITING_FILL_ALLOCATION`)
-   rather than back into `ARMED`. The exit is still sized only from the confirmed
-   fill fold (§13.3 rule 1). A root that reports filled sizes on views it never
-   backs with a fill will leave an instance waiting; a root that never reports
-   them simply loses the evidence and behaves as before.
+   rather than back into `ARMED`. For the ENTRY this holds whenever the view is
+   AHEAD of the fold, whether or not part of the entry was already folded
+   (`BRACKET-1a` review round 1, BR1-H1 — it used to hold only when nothing
+   was), and while it holds the bracket is never certified `CLOSED`. Since
+   `BRACKET-1a` the same holds for an EXIT order the venue reports terminal:
+   while its view reports more executed than has been folded, the track is
+   kept, no exit is sized, and the late fill folds by its order id. The exit is
+   still sized only from the confirmed fill fold (§13.3 rule 1). A root that
+   reports filled sizes on views it never backs with a fill will leave an
+   instance waiting — since review round 1 that includes an instance that has
+   exited everything it folded, which waits in its exit state instead of
+   closing; a root that never reports them simply loses the evidence and
+   behaves as before.
 8. **A confirmed fill is delivered even while the instance is PAUSED**, and is
    folded into the allocation there (`SB.FILL_FOLDED_WHILE_PAUSED`). The fold is
    settlement accounting, not a transition: the instance stays PAUSED, emits
@@ -333,11 +441,15 @@ here because a wiring that breaks one produces a *quiet* misbehaviour.
    less than it does — the one direction this package cannot defend against,
    because it never sees the event.
 9. **A reservation an accepted plan took must be honoured before the next
-   evaluation's reduction is planned.** Every exit is a signed DELTA, so
-   re-planning a protective exit on consecutive evaluations names the allocation
-   again each time; §9.10's `RESERVE_BEFORE_SUBMISSION` rule is what turns the
-   second and later ones into `PLAN_INVENTORY_INSUFFICIENT` refusals. See
-   "Re-emitting an exit **compounds**" above for the whole of it.
+   evaluation's reduction is planned.** Every exit is a signed DELTA. Since
+   `BRACKET-1a` the strategy no longer re-plans a protective exit on consecutive
+   evaluations — its own order track holds while the reduction is live — so
+   this is the BACKSTOP, not the containment: it matters for the one re-plan per
+   validity window ruling R2 allows after an unanswered reduction is retired,
+   where §9.10's `RESERVE_BEFORE_SUBMISSION` rule would turn a second sale of the
+   same inventory into a `PLAN_INVENTORY_INSUFFICIENT` refusal if the retired
+   intent had in fact become an order. See "Re-emitting an exit would
+   **compound**" above.
 10. **Cancel reconciliation is the OMS/composition root's job.** An unconfirmed
     cancel has no in-package timeout: if the venue acknowledges but never
     confirms, the instance waits in `SB.AWAITING_CANCEL_CONFIRMATION` with the
@@ -347,6 +459,24 @@ here because a wiring that breaks one produces a *quiet* misbehaviour.
     resolve every cancel to a terminal fact — confirmed, rejected, or
     `SILENCE_EXCEEDED` via `submission_unknown_after_ms` — the §6 invariant 6
     family, same as the awaiting-fill posture.
+11. **A booked order must appear in `ctx.orders()` before its intent's
+    `validUntil` passes** (`BRACKET-1a`, ruling R2). A protective reduction that
+    no view and no fill has ever named is RETIRED once its own intent's
+    `validUntil` is in the past, and the ladder may then plan one replacement.
+    That is safe only because an order that WAS booked is seen first: a live one
+    is adopted (from a live view) before retirement is considered, and a
+    terminal one either executed — its fill names the track — or is dead. The
+    risk engine and the execution planner both refuse an expired intent
+    (`packages/risk/src/engine.ts:238-248`,
+    `packages/execution-planner/src/build.ts:196-213`), so nothing can become an
+    order after `validUntil`. `apps/trader`'s loop meets this synchronously: it
+    owns a booked order the moment `submit` answers, and lists it in the very
+    next evaluation's `ctx.orders()` until one delivery of its terminal view has
+    been evaluated. A root with an ASYNCHRONOUS order book (an OMS that can book
+    an order it does not yet list) must list it within the intent's validity,
+    or the replacement could sell the same shares twice — contained then only by
+    the reservation (obligation 9) and by `positionAgrees`, which a booked sale
+    already moves.
 
 ## Closed in review round 3: the cancel race no longer halts
 

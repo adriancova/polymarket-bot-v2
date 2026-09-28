@@ -7,16 +7,16 @@
  * CONSEQUENCE so that the day it is fixed, this file fails and says which
  * residual moved.
  *
- * THAT HAPPENED — TWICE. Residuals 1 and 2 are both RESOLVED, and this file is
- * how each was noticed: the row that pinned the behaviour failed on the very
- * commit that changed it, naming the residual that moved. Their rows below now
- * pin the RESOLUTION — the mechanism is unchanged, only its subject is.
+ * THAT HAPPENED — THREE TIMES. Residuals 1, 2 and 5 are RESOLVED, and this
+ * file is how each was noticed: the row that pinned the behaviour failed on the
+ * very commit that changed it, naming the residual that moved. Their rows below
+ * now pin the RESOLUTION — the mechanism is unchanged, only its subject is.
  *
  * | Residual | Owner of the fix | Observed here as |
  * | --- | --- | --- |
  * | `strategyInstanceId` must satisfy two conflicting doors — **RESOLVED 2026-09-06** (ADR-021: risk `8c14b47`, allocator `d9f70a6`, trader `TRDR-1`) | the contract owner — ruled and executed | a minted `0`-leading UUIDv7 now STARTS, the letter-leading one still does, and the startup refusal that replaced the conflict names the field without the conflict text |
  * | a protective reduction is typed `ENTRY` at the risk seam — **RESOLVED 2026-09-15** (GOV-2B blocker B2, `RISK-2`) | the risk-side follow-up, executed | `risk.refusedExits` is `0`, the exits are planned and submitted, and the instance ends FLAT instead of trapped |
- * | **NEW (residual 5)** — a protective reduction creates no order track, so its own fill reads `SB.UNATTRIBUTED_FILL` and pauses the instance. Reachable only now that a reduction can execute at all | `packages/strategies/static-bracket`'s state machine | the decision reason codes, against a ledger that is nonetheless clean |
+ * | (residual 5) a protective reduction created no order track, so its own fill read `SB.UNATTRIBUTED_FILL` and paused the instance — **RESOLVED by `BRACKET-1a`** (the reduction is tracked; rulings R1–R3) | `packages/strategies/static-bracket`'s state machine — executed | the reduction's own fill closes the bracket (`SB.EXIT_FILLED`, `SB.CLOSED`), no decision pauses or fails to name a fill, and the run ends `SB.REFUSED_MAXIMUM_ENTRIES` (the scenario's reentry limit is 1) — against a ledger that is still clean |
  * | `SHADOW` is observe-only in this process | a design, not a setting (ADR-011 §5) | `execution.observeOnlyIntents`, with the shadow instance's decisions still persisted |
  * | the interim §9.8 operator inputs are required and undefaulted | `packages/universe` + `packages/settlement` wiring | each omission is a startup refusal naming the field |
  *
@@ -153,15 +153,31 @@ describe("residual 2 — a protective reduction at the risk seam, RESOLVED", () 
     // `BOOT-1` corrected the constant's TEXT (`RISK-2` residual R2). This pin
     // used to read `expect(RISK_SEAM_CAVEAT).toContain("WP-220 accepted
     // residual")` with a note that the wording was stale; the caveat now says
-    // what is true — the seam no longer classifies a covered sell as ENTRY, and
-    // the caveat an operator needs is residual 5 — and QUOTES the superseded
-    // text rather than deleting it, which is why the old phrase is still found.
+    // what is true — the seam no longer classifies a covered sell as ENTRY —
+    // and QUOTES the superseded text rather than deleting it, which is why the
+    // old phrase is still found.
     expect(RISK_SEAM_CAVEAT).toContain("SUPERSEDED (RISK-2, 133eac1)");
     expect(RISK_SEAM_CAVEAT).toContain('used to read "WP-220 accepted residual');
     expect(RISK_SEAM_CAVEAT).toContain("never from a tag");
-    expect(RISK_SEAM_CAVEAT).toContain("residual 5");
-    expect(RISK_SEAM_CAVEAT).toContain("ends PAUSED");
     expect(RISK_SEAM_CAVEAT).not.toMatch(/^WP-220 accepted residual/u);
+    // `BRACKET-1a` corrected it AGAIN. These pins used to read
+    // `toContain("residual 5")` and `toContain("ends PAUSED")`, when the caveat
+    // named residual 5 as "THE CAVEAT NOW". Kept as they were they would pass
+    // VACUOUSLY on the quotation below — the RISK2-R2 class, a false caveat no
+    // test notices — so they now assert the closure marker, the quotation, and
+    // the ABSENCE of the present-tense claim.
+    expect(RISK_SEAM_CAVEAT).toContain("SUPERSEDED (BRACKET-1a)");
+    expect(RISK_SEAM_CAVEAT).not.toMatch(/THE CAVEAT NOW/u);
+    // "residual 5" and "ends PAUSED" are still found — INSIDE the quotation of
+    // the superseded text, and only there…
+    const [, quoted = ""] = RISK_SEAM_CAVEAT.split('SUPERSEDED (BRACKET-1a): it then read "');
+    const [quotation = "", presentTense = ""] = quoted.split('" — that is no longer true either:');
+    expect(quotation.startsWith("RISK-2 residual 5")).toBe(true);
+    expect(quotation).toContain("ends PAUSED");
+    // …and what the caveat says AFTER it, its present tense, names the closing
+    // codes and no pause.
+    expect(presentTense).toContain("SB.CLOSED");
+    expect(presentTense).not.toMatch(/PAUSED/u);
   });
 
   it("the exit is EXECUTED, and it is the intent the strategy emitted — not a re-tag", async () => {
@@ -314,42 +330,59 @@ describe("residual 4 — the interim §9.8 operator inputs are required and unde
 });
 
 /**
- * Residual 5 — NEW, and reachable only because `RISK-2` fixed B2.
+ * Residual 5, RESOLVED by `BRACKET-1a` — the rows now pin the resolution.
  *
- * `planProtectedReduce` creates NO order track. The package says so at the site
- * and gives its reason — "a reduction creates no order track, because there is
- * no venue order id to track until the OMS answers" — and, until the exits
- * could reach the venue at all, nothing could observe the consequence.
+ * WAS (reachable only once `RISK-2` fixed B2): `planProtectedReduce` created NO
+ * order track — its stated reason was "there is no venue order id to track
+ * until the OMS answers" — so when the protective reduction FILLED, the
+ * strategy's own state machine found no order of its own the fill belonged to,
+ * called it `SB.UNATTRIBUTED_FILL`, and reconciled — `SB.POSITION_MISMATCH`,
+ * `SB.NO_BLIND_FLATTEN`, `SB.PAUSED`. The run ended PAUSED rather than cleanly
+ * closed, and an instance paused on its own exit opens no second bracket. It
+ * was never §6 invariant 7's unattributed ACTIVITY (the ledger attributed the
+ * fill; the second row below pinned that then and pins it now), and it was
+ * fail-closed.
  *
- * The consequence is this: when the protective reduction FILLS, the strategy's
- * own state machine finds no order of its own that the fill belongs to, calls it
- * `SB.UNATTRIBUTED_FILL`, and reconciles — `SB.POSITION_MISMATCH`,
- * `SB.NO_BLIND_FLATTEN`, `SB.PAUSED`. The instance therefore ends its run PAUSED
- * rather than cleanly closed.
+ * NOW: the reduction is tracked exactly as the take-profit is (PENDING and
+ * id-less until a live view or its first fill names it), held while it is live,
+ * and its fill folds through the ordinary exit edge into `CLOSED`. Nothing
+ * outside `packages/strategies/static-bracket` changed to do it — the loop
+ * already routed the fill to its owner by venue order id. The first row below
+ * is the same observation with its expectation moved; the second is unchanged.
  *
- * WHAT IT IS NOT. It is not §6 invariant 7's unattributed ACTIVITY: the LEDGER
- * attributes the fill correctly, `unattributedActivity` is `0`, every PnL record
- * is `VIRTUAL_STRATEGY`, no market is halted and the process stays healthy. The
- * money is right; it is the strategy's own bookkeeping that cannot name the
- * fill. And the direction is fail-closed — it pauses rather than acting.
- *
- * Fixing it means tracking a reduction through the OMS, which is a change to
- * this strategy's state machine that the package deliberately deferred, so
- * `RISK-2` REPORTS it rather than redesigning the machine at the end of an
- * unrelated round. The day it is fixed, this block fails and names it.
+ * WHAT THIS DOES NOT SHOW. This scenario cannot show a SECOND bracket (its
+ * reentry limit is 1, and a cutoff reduction is always after the entry cutoff)
+ * or a FILLED take-profit (it has no trade print) — `BRACKET-1b`'s scenario, by
+ * the user's ruling R1. Repeated brackets closed by a stop or a holding-timeout
+ * reduction are pinned at unit level
+ * (`test/unit/strategies/static-bracket/bracket-1a-reduce-track.test.ts`).
  */
-describe("residual 5 — a protective reduction's own fill is UNATTRIBUTED to the strategy", () => {
-  it("the instance ends PAUSED on its own reduction's fill", async () => {
+describe("residual 5 — a protective reduction's own fill, RESOLVED: it closes the bracket", () => {
+  it("the reduction's own fill closes the bracket; nothing pauses, and the run ends at its reentry limit", async () => {
     const run = await driveScenario();
     const artifact = captureArtifact(run);
     const codes = artifact.decisions.flatMap((decision) => decision.reasonCodes);
-    // The reduction was emitted and it FILLED — otherwise this residual would
-    // not be reachable and this test would be vacuous.
+    // The reduction was emitted and it FILLED — otherwise this row would be
+    // vacuous.
     expect(codes).toContain("SB.FINAL_PROTECTED_REDUCE");
     expect(run.fills.some((fill) => fill.action === "SELL")).toBe(true);
-    // …and the strategy could not name the fill it had just caused.
-    expect(codes).toContain("SB.UNATTRIBUTED_FILL");
-    expect(codes).toContain("SB.PAUSED");
+    // WAS: `SB.UNATTRIBUTED_FILL, SB.POSITION_MISMATCH, SB.NO_BLIND_FLATTEN,
+    // SB.PAUSED` on the reduction's own onFill. Now the strategy names the fill
+    // it caused, and it closes the bracket.
+    const reduceAt = artifact.decisions.findIndex((decision) => decision.decisionType === "reduce");
+    expect(reduceAt).toBeGreaterThanOrEqual(0);
+    const reductionFill = artifact.decisions
+      .slice(reduceAt + 1)
+      .find((decision) => decision.callback === "onFill");
+    expect(reductionFill?.reasonCodes).toEqual(["SB.EXIT_FILLED", "SB.CLOSED"]);
+    // No decision in the run fails to name a fill, and none pauses.
+    expect(codes).not.toContain("SB.UNATTRIBUTED_FILL");
+    expect(codes).not.toContain("SB.PAUSED");
+    // WAS: onMarketClosing `SB.RESUMED, …, SB.PAUSED` — resumed and paused
+    // again. Now the CLOSED bracket answers the scenario's reentry limit of 1.
+    const closing = artifact.decisions.filter((decision) => decision.callback === "onMarketClosing");
+    expect(closing).toHaveLength(1);
+    expect(closing[0]?.reasonCodes).toEqual(["SB.REFUSED_MAXIMUM_ENTRIES"]);
   });
 
   it("but the BOOKS are right: nothing is unattributed where it would matter", async () => {

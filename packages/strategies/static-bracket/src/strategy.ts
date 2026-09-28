@@ -67,9 +67,17 @@ import {
 } from "./state.js";
 import { formatInstantMs } from "./time.js";
 
-/** §9.6 identity. A change to either value starts a new run. */
+/**
+ * §9.6 identity. A change to either value starts a new run.
+ *
+ * `1.1.0` (`BRACKET-1a`): the protective reduction is tracked, held while live,
+ * never cancelled by take-profit maintenance, retired only by its own expired
+ * `validUntil`, and an exit terminal on the venue waits for its fill — a
+ * behaviour change a run must not straddle. The state document's SHAPE is
+ * unchanged (`STATIC_BRACKET_STATE_SCHEMA_VERSION` stays 2).
+ */
 export const STATIC_BRACKET_NAME = "static-bracket";
-export const STATIC_BRACKET_VERSION = "1.0.0";
+export const STATIC_BRACKET_VERSION = "1.1.0";
 
 function decision(
   snapshotRef: string,

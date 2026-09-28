@@ -29,8 +29,10 @@
  * (the trader's own in-memory doubles) and the strategy — a cycling double
  * that places an immediate BUY of 50 (ten 5-share slices, each FILLED) and
  * then sells the whole holding, so every tick books ten fills. `createPaperTrader`
- * cannot be used: its strategy is Static Bracket, which opens one bracket per
- * market and pauses (`RISK-2` residual 5).
+ * cannot be used: its strategy is Static Bracket, which opens at most
+ * `reentry.maximum_entries_per_market` brackets per market (it used to pause
+ * after the first, `RISK-2` residual 5, closed by `BRACKET-1a`) — a handful of
+ * fills, not ten per tick.
  *
  * THE TEST SEAM is a PASS-THROUGH `vi.mock` of `@polymarket-bot/ledger`: it
  * counts `projectLedger` calls, and a test may wrap ONE export — the

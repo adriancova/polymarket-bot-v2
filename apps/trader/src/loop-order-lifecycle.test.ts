@@ -1381,8 +1381,10 @@ describe("SIM-1 (O1-O4) — a remainder the venue can no longer work is terminal
     expect(loop.health().seams.reservations).toMatchObject({ open: 0, reservedCollateral: "0" });
     // Nothing is owned any more, so there is nothing risk could count open:
     // `#openOrdersFor` reads only the instance's own tracked orders. (The
-    // strategy pauses on its own reduce — RISK-2 residual 5 — so no later
-    // intent reaches risk in this run to observe it directly.)
+    // strategy holds while its own reduce works, the reduce's fill closes the
+    // bracket — `BRACKET-1a`; it used to pause, RISK-2 residual 5 — and this
+    // run's reentry limit of 1 refuses a second entry, so no later intent
+    // reaches risk in this run to observe it directly.)
     expect(loop.retainedOrderState().owners).toBe(0);
     expect(riskInputs.calls.filter((call) => call.event >= 9)).toEqual([]);
   });
