@@ -28,7 +28,13 @@
  *     `targetShares` is a per-side sell-down level for the WHOLE market, cannot
  *     express what a strategy that owns a slice of a market means.
  *  5. **End of market**, then **stop**, then **holding timeout**, then
- *     **take-profit maintenance** — the exits, most urgent first.
+ *     **take-profit maintenance** — the exits, most urgent first. Before them,
+ *     an exit order the venue reports terminal is settled (and, while a view
+ *     reports more executed than has been folded, WAITED on), and a protective
+ *     reduction whose own intent provably expired unanswered is retired. While
+ *     this bracket's own protective reduction is live every exit branch HOLDS:
+ *     it is never re-emitted, re-sized or cancelled by the ladder
+ *     (`BRACKET-1a`; see {@link holdForLiveReduce}).
  *  6. **Entry**, last, and only from ARMED.
  *
  * Every economic comparison is exact-decimal (`economics.ts`); the strategy
@@ -68,7 +74,7 @@ import {
   type TrackedOrderView,
 } from "./observe.js";
 import type { StaticBracketParams } from "./params.js";
-import { ok, type Outcome } from "./plain.js";
+import { bad, ok, type Outcome } from "./plain.js";
 import { REASONS, TAGS, legTag, orderTypeTag } from "./reasons.js";
 import {
   withState,
@@ -201,6 +207,135 @@ function intentId(state: StaticBracketState, kind: string, marketId: string): st
   // Deterministic and unique per instance: the sequence is part of the state
   // document, so a replay of the same decisions produces the same ids.
   return `sb-${kind}-${String(state.intentSequence)}-${marketId}`.slice(0, 200);
+}
+
+// ---------------------------------------------------------------------------
+// The role of an EXIT track (`BRACKET-1a`, D2)
+// ---------------------------------------------------------------------------
+
+/**
+ * The two kinds of EXIT intent this strategy mints. {@link intentId} is called
+ * with exactly these kinds, so the prefix every exit intent id carries and the
+ * role {@link exitRole} reads back from it come from ONE constant and cannot
+ * drift apart.
+ */
+const EXIT_INTENT_KINDS = Object.freeze({
+  TAKE_PROFIT: "take-profit",
+  PROTECTED_REDUCE: "protected-reduce",
+} as const);
+
+/**
+ * What an EXIT order track is FOR.
+ *
+ * - `TAKE_PROFIT` — the resting maker exit {@link planTakeProfit} places and
+ *   re-sizes. It is maintenance: it may be cancelled and replaced when the
+ *   allocation moves, and it is withdrawn before a protective reduction.
+ * - `PROTECTED_REDUCE` — the protective reduction {@link planProtectedReduce}
+ *   places for the stop, the holding timeout or the close cutoff. It is
+ *   STICKY (the user's ruling R3): once placed it runs to completion or to a
+ *   terminal state; nothing in this package cancels it except the safety paths
+ *   that cancel everything (data-quality incident, position reconciliation,
+ *   `onStop`).
+ */
+export type ExitRole = keyof typeof EXIT_INTENT_KINDS;
+
+/** The minted intent-id prefix of each exit role — `sb-<kind>-`. */
+export const EXIT_ROLE_PREFIXES: Readonly<Record<ExitRole, string>> = Object.freeze({
+  TAKE_PROFIT: `sb-${EXIT_INTENT_KINDS.TAKE_PROFIT}-`,
+  PROTECTED_REDUCE: `sb-${EXIT_INTENT_KINDS.PROTECTED_REDUCE}-`,
+});
+
+/**
+ * The role of an EXIT track, read from the strategy-minted prefix of its
+ * `intentId`.
+ *
+ * WHY THE PREFIX AND NOT A FIELD. Both exits share the one `exitOrder` slot and
+ * the §9.6 state document already records the intent id the strategy minted.
+ * An explicit role field would change the document's shape — a
+ * `STATIC_BRACKET_STATE_SCHEMA_VERSION` bump, and §9.6 then requires a new run —
+ * to store a fact the document already holds. The price is that the role is
+ * tied to the minted id FORMAT, which is why the format and this reader share
+ * {@link EXIT_INTENT_KINDS}, and why a prefix this package did not mint is
+ * REFUSED here rather than guessed: an unknown role would decide whether the
+ * ladder may cancel the order, and a guess in either direction is wrong in one
+ * of them.
+ *
+ * Refused (never defaulted): an ENTRY track, and an EXIT track whose id carries
+ * no minted exit prefix — or, which the prefixes' disjointness rules out and
+ * the pin in `bracket-1a-reduce-track.test.ts` asserts, more than one.
+ */
+export function exitRole(track: OrderTrack): Outcome<ExitRole> {
+  if (track.kind !== "EXIT") {
+    return bad(`an ${track.kind} track has no exit role (intent ${track.intentId})`);
+  }
+  const roles = (Object.keys(EXIT_ROLE_PREFIXES) as ExitRole[]).filter((role) =>
+    track.intentId.startsWith(EXIT_ROLE_PREFIXES[role]),
+  );
+  const [role] = roles;
+  if (roles.length !== 1 || role === undefined) {
+    return bad(
+      `the exit track's intent id ${JSON.stringify(track.intentId.slice(0, 80))} carries ` +
+        `${roles.length === 0 ? "no" : "more than one"} minted exit prefix ` +
+        `(${Object.values(EXIT_ROLE_PREFIXES).join(", ")}); its role is refused, not guessed`,
+    );
+  }
+  return ok(role);
+}
+
+/**
+ * The refusal an EXIT track with an unreadable role produces, or `null`.
+ *
+ * Every evaluation that reads roles ({@link planTick}, {@link planFill},
+ * {@link planOrderUpdate}) asks this FIRST and halts on a refusal, so the helpers
+ * below — {@link isProtectedReduce} and everything built on it — only ever see
+ * a track whose role was proved. A halted instance takes no action (§6
+ * invariant 12's direction): it cannot tell whether the order it holds may be
+ * cancelled.
+ */
+function refusedExitRole(state: StaticBracketState): string | null {
+  if (state.exitOrder === null) return null;
+  const role = exitRole(state.exitOrder);
+  return role.ok ? null : role.problem;
+}
+
+/** True for an EXIT track whose PROVED role is `PROTECTED_REDUCE`. */
+function isProtectedReduce(track: OrderTrack | null): boolean {
+  if (track === null || track.kind !== "EXIT") return false;
+  const role = exitRole(track);
+  return role.ok && role.value === "PROTECTED_REDUCE";
+}
+
+/**
+ * The order states in which a protective reduction is still this bracket's
+ * business: it may yet execute (PENDING, SUBMISSION_UNKNOWN, WORKING — partly
+ * filled included), or a safety cancel of it is unconfirmed (CANCEL_PENDING).
+ */
+const REDUCE_LIVE_STATES: readonly OrderState[] = Object.freeze([
+  "PENDING",
+  "SUBMISSION_UNKNOWN",
+  "WORKING",
+  "CANCEL_PENDING",
+]);
+
+/** This bracket's own live protective reduction, if it has one (D3). */
+function liveReduce(state: StaticBracketState): OrderTrack | null {
+  const track = state.exitOrder;
+  if (track === null || !isProtectedReduce(track)) return null;
+  return REDUCE_LIVE_STATES.includes(track.state) ? track : null;
+}
+
+/**
+ * True when NO order view and NO fill has ever named this track: it has no
+ * venue order id (a LIVE view or a fill would have given it one — D5 and
+ * {@link applyExitFill}), no confirmed fill and no view-reported fill.
+ */
+function neverNamed(track: OrderTrack): boolean {
+  return track.orderId === null && isZero(track.filledShares) && isZero(track.viewFilledShares);
+}
+
+/** The instant a tracked intent's own `validUntil` names, as it was minted. */
+function intentValidUntilMs(params: StaticBracketParams, track: OrderTrack): number {
+  return track.placedAtMs + params.entry.execution.order_validity_ms;
 }
 
 /**
@@ -521,6 +656,10 @@ export function planTick(input: TickContext): Plan {
   const { params, state, observation } = input;
   if (state.instanceState === "HALTED") {
     return plan(state, "hold", [REASONS.halted]);
+  }
+  const roleProblem = refusedExitRole(state);
+  if (roleProblem !== null) {
+    return halted(state, roleProblem, []);
   }
   const leg = currentLeg(params, state);
   const quality = assessDataQuality(params, observation, leg);
@@ -1252,6 +1391,21 @@ function cancelEntry(
  * the difference between returning the instance to ARMED and waiting for a fill
  * that is already on its way (§8.1). Adoption is not where that is decided —
  * {@link settleTerminalOrder} is — but it is where the evidence is captured.
+ *
+ * AN ID-LESS PROTECTIVE REDUCTION ADOPTS ONLY A LIVE VIEW (`BRACKET-1a`, D5).
+ * Leg and side cannot tell two exits of the same bracket apart: the
+ * take-profit a reduction replaced has the same outcome and the same side, and
+ * §8.1 plus obligation 5 let a root deliver — and `ctx.orders()` keep listing —
+ * that take-profit's TERMINAL view after the reduction was planned. Adopting
+ * it would settle the reduction as "cancelled" on the old order's evidence,
+ * clear its track, and leave the reduction's own fill unattributable — the
+ * pause residual 5 was, reached by another route (scoping probe P2d). A
+ * reduction therefore learns its venue order id only from a view that shows
+ * the order ALIVE (`OPEN` / `PARTIALLY_FILLED`) or from its first fill
+ * ({@link applyExitFill}); from then on exact-id matching settles its terminal
+ * views. A reduction that dies before it is ever seen alive and never fills is
+ * retired by its own `validUntil` instead ({@link retireExpiredReduce}).
+ * TAKE_PROFIT tracks keep the adoption they always had.
  */
 function adoptOrder(
   state: StaticBracketState,
@@ -1262,9 +1416,11 @@ function adoptOrder(
   if (track === null || track.orderId !== null) return null;
   const other = kind === "ENTRY" ? state.exitOrder : state.entryOrder;
   const taken = other?.orderId ?? null;
+  const liveViewsOnly = kind === "EXIT" && isProtectedReduce(track);
   for (const view of observation.orders) {
     if (view.orderId === taken) continue;
     if (view.outcome !== track.outcome || view.side !== track.side) continue;
+    if (liveViewsOnly && !isLiveViewStatus(view.status)) continue;
     const moved = orderTransition(track.state, statusTrigger(view.status));
     return Object.freeze({
       ...track,
@@ -1280,6 +1436,13 @@ function adoptOrder(
 interface Settlement {
   readonly state: StaticBracketState;
   readonly reasons: readonly string[];
+  /**
+   * True when the order is terminal but a view reported more executed than the
+   * fill stream has delivered: the track is KEPT and the instance must wait for
+   * the fill rather than act on the settled state (the entry's posture since
+   * review round 1; the exit's since `BRACKET-1a` D6).
+   */
+  readonly awaitingFill?: boolean;
 }
 
 /**
@@ -1311,6 +1474,21 @@ interface Settlement {
  *    this, and the view's number never becomes an allocation.
  * 3. Nothing folded and no evidence — nothing executed (§13.3 rule 3), so the
  *    instance returns to ARMED under the reentry policy.
+ *
+ * THE EXIT CASE WAITS FOR THE FOLD TOO (`BRACKET-1a`, D6). An exit order the
+ * venue reports terminal with MORE executed (`viewFilledShares`) than the fill
+ * stream has delivered (`filledShares`) is an execution whose fill is on its
+ * way — §8.1 again. Clearing the track at once, as this branch used to, did one
+ * of three wrong things depending on the position view (scoping probes P4c and
+ * P4d): with a view that already reflects the sale, `positionAgrees` failed and
+ * the instance PAUSED, and the late fill — matching no track — was never folded,
+ * so the pause was permanent; with a view that lags it, the next protective
+ * reduction named the WHOLE allocation, more than was left (an oversell
+ * intent); and with an id-less reduction tracked, the late fill would have been
+ * folded into the WRONG order. So the track is KEPT, the instance holds with
+ * `SB.AWAITING_FILL_ALLOCATION`, the late fill folds by its order id, and the
+ * next evaluation settles the order on a fold that agrees with the venue. The
+ * view's number still never becomes an allocation (§13.3 rule 1).
  */
 function settleTerminalOrder(
   state: StaticBracketState,
@@ -1327,6 +1505,7 @@ function settleTerminalOrder(
       return {
         state,
         reasons: [REASONS.entryOrderTerminal, REASONS.awaitingFillAllocation],
+        awaitingFill: true,
       };
     }
     if (!folded) {
@@ -1354,6 +1533,17 @@ function settleTerminalOrder(
     };
   }
 
+  const outrun = compare(track.viewFilledShares, track.filledShares, "exit fill evidence");
+  if (!outrun.ok || outrun.value > 0) {
+    // An incomparable pair is read the fail-safe way too: waiting names nothing,
+    // acting on an allocation that may be short does.
+    return {
+      state,
+      reasons: [REASONS.exitOrderTerminal, REASONS.awaitingFillAllocation],
+      awaitingFill: true,
+    };
+  }
+
   const cleared = withState(state, { exitOrder: null });
   const trigger: InstanceTrigger | null =
     state.instanceState === "EXIT_PLANNED"
@@ -1372,6 +1562,15 @@ function settleTerminalOrder(
     }
   }
   return { state: cleared, reasons: [REASONS.exitOrderTerminal] };
+}
+
+/**
+ * The statuses a view carries while its order can still execute. Only these
+ * may name an id-less protective reduction (D5); an unrecognised status is not
+ * proof of life and does not.
+ */
+function isLiveViewStatus(status: string): boolean {
+  return status === "OPEN" || status === "PARTIALLY_FILLED";
 }
 
 /** Maps an SDK order status onto a sub-machine trigger. */
@@ -1535,8 +1734,19 @@ function planExit(
   // stop by a tick; halting on it — which is what an unsettled terminal order
   // used to do — abandoned the position permanently.
   const settlement = settleTerminalOrder(synced, "EXIT");
-  const state = settlement === null ? synced : settlement.state;
+  if (settlement !== null && settlement.awaitingFill === true) {
+    // D6: the venue says the exit executed more than the fill stream has
+    // delivered. No exit may be sized until that fill is folded — neither a
+    // replacement nor a protective reduction — so the ladder does not run.
+    return plan(settlement.state, "hold", [...reasons, ...settlement.reasons]);
+  }
+  const settled = settlement === null ? synced : settlement.state;
   if (settlement !== null) reasons.push(...settlement.reasons);
+  // R2: a protective reduction that nothing ever named and whose own intent
+  // has expired is retired here, before the ladder, which may then re-plan it.
+  const retirement = retireExpiredReduce(params, settled, observation);
+  const state = retirement === null ? settled : retirement.state;
+  if (retirement !== null) reasons.push(...retirement.reasons);
   const leg = currentLeg(params, state);
   const open = openShares(state);
 
@@ -1574,6 +1784,7 @@ function planExit(
       leg,
       open,
       "stop trigger",
+      REASONS.protectedReduce,
     );
   }
 
@@ -1590,6 +1801,7 @@ function planExit(
       leg,
       open,
       "maximum holding time",
+      REASONS.protectedReduce,
     );
   }
 
@@ -1611,6 +1823,27 @@ function planExit(
  * bracket SOLD a token it owned and takes profit by BUYING THAT TOKEN BACK, at
  * the complement of the same configured price. Both reduce the bracket's
  * exposure toward zero; neither can enlarge it (see {@link LegPosture}).
+ *
+ * `BRACKET-1a` (D4), three rules this maintenance now keeps:
+ *
+ * - IT NEVER TOUCHES A LIVE PROTECTIVE REDUCTION (ruling R3, the sticky
+ *   reduce). This function is reached with one live when a stop that placed it
+ *   has cleared, or when a late ENTRY fill arrives after it was placed
+ *   ({@link applyEntryFill}). Treating it as a take-profit cancelled it as
+ *   `SB.TAKE_PROFIT_REPLACED` the moment its size stopped matching (scoping
+ *   probe P5a). It holds instead, and an allocation that grew meanwhile is
+ *   planned once the reduction has settled — still gated by the position
+ *   checks.
+ * - A TAKE-PROFIT IS COMPARED BY WHAT IT STILL HAS TO SELL. Its own partial
+ *   fill leaves `requestedShares` ahead of `open` by exactly what it sold, so
+ *   comparing `requestedShares` with `open` cancelled and replaced a
+ *   correctly-sized order after every partial fill (probe P4a). The remainder
+ *   `requestedShares − filledShares` is the resting size, and that is what
+ *   must match.
+ * - AN EXIT STILL AWAITING ITS FILL IS NEVER OVERWRITTEN. The exit slot holds
+ *   one track; replacing a terminal track whose view reported more executed
+ *   than has been folded (D6) would drop the one record the late fill can be
+ *   attributed to.
  */
 function planTakeProfit(
   params: StaticBracketParams,
@@ -1621,9 +1854,23 @@ function planTakeProfit(
   open: string,
 ): Plan {
   const reasons = [...carried];
+  const reduce = liveReduce(state);
+  if (reduce !== null) {
+    return holdForLiveReduce(params, state, observation, reasons, reduce);
+  }
   const existing = state.exitOrder;
+  if (existing !== null && !isLive(existing.state)) {
+    const settlement = settleTerminalOrder(state, "EXIT");
+    if (settlement !== null && settlement.awaitingFill === true) {
+      return plan(state, "hold", [...reasons, ...settlement.reasons]);
+    }
+  }
   if (existing !== null && isLive(existing.state)) {
-    const matches = compare(existing.requestedShares, open, "take-profit size");
+    const remaining = sub(existing.requestedShares, existing.filledShares, "take-profit remainder");
+    if (!remaining.ok) {
+      return halted(state, remaining.problem, []);
+    }
+    const matches = compare(remaining.value, open, "take-profit size");
     if (!matches.ok) {
       return halted(state, matches.problem, []);
     }
@@ -1653,7 +1900,7 @@ function planTakeProfit(
         cancelIntent(
           observation.market.marketId,
           [existing.orderId ?? ""],
-          `static-bracket: allocation changed from ${existing.requestedShares} to ${open}`,
+          `static-bracket: allocation changed from ${remaining.value} to ${open}`,
         ),
       ],
     );
@@ -1679,7 +1926,7 @@ function planTakeProfit(
   if (!validUntil.ok) {
     return plan(state, "hold", [...reasons, REASONS.internalRefusal]);
   }
-  const id = intentId(state, "take-profit", observation.market.marketId);
+  const id = intentId(state, EXIT_INTENT_KINDS.TAKE_PROFIT, observation.market.marketId);
   const intent: Intent = {
     type: "POSITION",
     intentId: id,
@@ -1778,28 +2025,53 @@ function planTakeProfit(
  * this many shares, this side, this price bound. It is the same shape
  * {@link planTakeProfit} already emits, so both exits are read the same way.
  *
- * WHAT THE SHAPE CHANGE COSTS, STATED WHERE IT IS MADE (two disclosures, both
- * carried in full in this package's README):
+ * WHAT THE SHAPE CHANGE COSTS, STATED WHERE IT IS MADE (carried in full in this
+ * package's README):
  *
- * 1. RE-EMISSION COMPOUNDS. A `REDUCE_POSITION`'s `targetShares` is a LEVEL, so
- *    re-planning "sell down to 0" on five consecutive evaluations collapsed to
- *    one action. A DELTA does not: five evaluations plan five times the
- *    allocation. Nothing in this package prevents that — a reduction creates no
- *    order track, because there is no venue order id to track until the OMS
- *    answers — and what contains it is §9.10's "reserve collateral/inventory
- *    before submission" responsibility (`RESERVE_BEFORE_SUBMISSION` on every
- *    plan), whose reservations make the second and later plans refuse with
- *    `PLAN_INVENTORY_INSUFFICIENT`. That is a composition-root obligation, and
- *    it is listed as one rather than assumed.
- * 2. THE RISK SEAM READS IT AS AN ENTRY. `packages/risk` derives disposition
- *    from the intent TYPE alone, so a `POSITION` — this one included — is
- *    `ENTRY` and a protective reduction gets entry treatment: the §9.8 check-20
- *    time-to-close entry gate, the CLOSE_ONLY block, the entry-shaped stale-book
- *    refusal, and (with the default `requirePositiveNetEdgeForEntries`) a
- *    refusal for the `expectedNetEdge` no exit here carries. The direction is
- *    fail-closed — a refused exit, never a wrong order — which is why the
- *    deviation stands; correcting it needs the planner and the risk contract,
- *    not this file.
+ * 1. A DELTA RE-EMITTED WOULD COMPOUND — AND THE REDUCTION'S OWN ORDER TRACK IS
+ *    WHAT CONTAINS IT (`BRACKET-1a`). A `REDUCE_POSITION`'s `targetShares` is a
+ *    LEVEL, so re-planning "sell down to 0" on five consecutive evaluations
+ *    collapsed to one action; a DELTA does not — five evaluations would plan
+ *    five times the allocation. Until `BRACKET-1a` this function created NO
+ *    order track (the reason given was that there is no venue order id to track
+ *    until the OMS answers, which {@link planTakeProfit} had never needed), so
+ *    every ladder evaluation before the fill re-emitted the whole reduction, and
+ *    the reduction's own fill matched no track and PAUSED the instance
+ *    (`RISK-2` residual 5). Now the reduction is tracked exactly as the
+ *    take-profit is — `PENDING`, `orderId: null` until a LIVE view or its first
+ *    fill names it — and while it is live every evaluation HOLDS
+ *    (`SB.EXIT_ORDER_WORKING`, {@link holdForLiveReduce}): no second intent and
+ *    no cancel of it. What is left of the old containment is the BACKSTOP it
+ *    always was: §9.10's "reserve collateral/inventory before submission"
+ *    (`RESERVE_BEFORE_SUBMISSION` on every plan), whose reservation refuses a
+ *    second sale of the same inventory with `PLAN_INVENTORY_INSUFFICIENT`. It
+ *    is now reached only by the one re-plan per validity window ruling R2 allows
+ *    ({@link retireExpiredReduce}), each gated by `positionAgrees`.
+ * 2. SUPERSEDED (`RISK-2`, `133eac1`) — "THE RISK SEAM READS IT AS AN ENTRY".
+ *    This disclosure said `packages/risk` derives disposition from the intent
+ *    TYPE alone, so a protective reduction got entry treatment and was refused.
+ *    That has been false since `RISK-2`: a `POSITION` resolving to a SELL fully
+ *    covered by the instance's confirmed holding is an `EXIT` at the seam,
+ *    decided from the intent SHAPE and the supplied portfolio, never from a tag.
+ *    The heading is kept only so a reader who met the old text can see what
+ *    changed.
+ *
+ * THE POLICIES A PLACED REDUCTION FOLLOWS (`BRACKET-1a`, the user's rulings R2
+ * and R3; stated in the README's "Protective reduction" section):
+ *
+ * - STICKY (R3). Once placed — by the stop, the holding timeout or the close
+ *   cutoff — it runs to completion or to a terminal state. A stop that clears,
+ *   a take-profit re-plan, a later cause: none of them cancels, re-sizes or
+ *   re-prices it. There is NO exit escalation: a resting remainder keeps its
+ *   floor. Only the safety paths that withdraw everything (a data-quality
+ *   incident, a position reconciliation, `onStop`) cancel it.
+ * - NO ANSWER (R2). A reduction nothing has answered becomes
+ *   `SUBMISSION_UNKNOWN` after `submission_unknown_after_ms`, reported as the
+ *   entry reports it (§6 invariant 6: unknown is never a rejection). It is
+ *   retired only once its OWN `validUntil` has passed AND no view and no fill
+ *   ever named it (`SB.EXIT_INTENT_EXPIRED`) — the one condition under which
+ *   the intent is provably dead — and the ladder may then plan one reduction
+ *   for the new validity window.
  *
  * INTERPRETATION — the fields `PositionIntent` requires and
  * `ReducePositionIntent` does not have:
@@ -1833,8 +2105,18 @@ function planProtectedReduce(
   leg: Outcome2,
   open: string,
   cause: string,
+  reduceCode: typeof REASONS.protectedReduce | typeof REASONS.finalProtectedReduce,
 ): Plan {
   const reasons = [...carried];
+  // D3: this bracket's OWN reduction, already placed and still live, is
+  // recognised BEFORE anything is withdrawn. Without this the ladder re-emitted
+  // the whole reduction on every evaluation until it filled (scoping probe
+  // P1b) — or, with a track and nothing else, cancelled its own working order
+  // as a "resting order to withdraw" (probe P2a). Neither: it holds.
+  const own = liveReduce(state);
+  if (own !== null) {
+    return holdForLiveReduce(params, state, observation, reasons, own);
+  }
   // Safety cancellation outranks new placement (§6 invariant 13): withdraw the
   // resting orders before asking for a reduction, and do not ask until the
   // withdrawal is confirmed.
@@ -1868,7 +2150,7 @@ function planProtectedReduce(
   if (!validUntil.ok) {
     return plan(state, "hold", [...reasons, REASONS.internalRefusal]);
   }
-  const id = intentId(state, "protected-reduce", observation.market.marketId);
+  const id = intentId(state, EXIT_INTENT_KINDS.PROTECTED_REDUCE, observation.market.marketId);
   const intent: Intent = {
     type: "POSITION",
     intentId: id,
@@ -1893,15 +2175,40 @@ function planProtectedReduce(
       orderTypeTag(EXIT_ORDER_TYPE),
     ]),
   };
+  // D1: the reduction is TRACKED, in exactly the shape {@link planTakeProfit}
+  // gives a take-profit: PENDING and id-less until a LIVE view or its first
+  // fill names it (D5), sized to the open allocation it names. Its fill then
+  // folds through {@link applyExitFill} like any exit fill —
+  // `EXIT_PLANNED | EXIT_WORKING --EXIT_FILL_COMPLETE--> CLOSED` — so no new
+  // machine edge exists for it.
+  const track: OrderTrack = Object.freeze({
+    kind: "EXIT",
+    intentId: id,
+    orderId: null,
+    state: "PENDING" as OrderState,
+    outcome: leg,
+    side: posture.exitSide,
+    limitPrice: floor.value,
+    requestedShares: open,
+    filledShares: ZERO,
+    viewFilledShares: ZERO,
+    placedAtMs: observation.nowMs,
+    escalated: false,
+  });
   // MOVE-SITE: protectedReduce TRIGGERS: EXIT_TRIGGER_MET
-  const moved = move(state, "EXIT_TRIGGER_MET", { intentSequence: state.intentSequence + 1 });
+  const moved = move(state, "EXIT_TRIGGER_MET", {
+    exitOrder: track,
+    intentSequence: state.intentSequence + 1,
+  });
   if (!moved.ok) {
     return halted(state, moved.problem, []);
   }
+  // D8: `SB.FINAL_PROTECTED_REDUCE` names the END-OF-MARKET policy only; a
+  // stop or a holding timeout reports `SB.PROTECTED_REDUCE`.
   return plan(
     moved.value,
     "reduce",
-    [...reasons, REASONS.exitProportional, REASONS.finalProtectedReduce],
+    [...reasons, REASONS.exitProportional, reduceCode],
     [intent],
     {
       exitShares: open,
@@ -1910,6 +2217,147 @@ function planProtectedReduce(
       reduceCause: cause.slice(0, 200),
     },
   );
+}
+
+/**
+ * What every evaluation does while this bracket's own protective reduction is
+ * live (`BRACKET-1a`, D3/D4, rulings R2 and R3): it HOLDS. No second
+ * reduction, no cancel of this one, no take-profit beside it.
+ *
+ * BACK INTO THE EXIT STATES FIRST. A late ENTRY fill after the reduction was
+ * placed moves the instance to `PARTIALLY_OPEN`/`OPEN` ({@link applyEntryFill}
+ * takes §13.3's `ENTRY_PARTIAL_FILL`/`ENTRY_FILL_COMPLETE` edge out of the exit
+ * states). The reduction's order is still live, though, and when it fills the
+ * only edges that fold an exit fill leave `EXIT_PLANNED`/`EXIT_WORKING` — from
+ * `OPEN` the fill would be refused as an illegal transition and the instance
+ * would PAUSE on its own exit again. So the hold re-takes the existing
+ * `EXIT_TRIGGER_MET` edge (an exit cause did fire, and its order is still
+ * working) and lets {@link syncPlannedToWorking} follow the order into
+ * `EXIT_WORKING`. The grown allocation is planned only after the reduction
+ * settles, by the ordinary ladder, under the ordinary position checks.
+ *
+ * THEN, BY THE ORDER'S STATE:
+ *
+ * - `WORKING` (partly filled included): `SB.EXIT_ORDER_WORKING`.
+ * - `PENDING`: the same, until `submission_unknown_after_ms` of silence; then
+ *   `PENDING --SILENCE_EXCEEDED--> SUBMISSION_UNKNOWN`, reported exactly as the
+ *   entry reports it (`modelOutputs.submissionUnknown: true`,
+ *   `SB.AWAITING_RECONCILIATION`) — §6 invariant 6, unknown is never a
+ *   rejection, so nothing is re-sent.
+ * - `SUBMISSION_UNKNOWN`: held, and reported, until a view or a fill names it
+ *   or its intent's own `validUntil` passes ({@link retireExpiredReduce}).
+ * - `CANCEL_PENDING` (a data-quality incident or a reconciliation cancelled
+ *   it): held until the venue confirms — `SB.AWAITING_CANCEL_CONFIRMATION` —
+ *   and never cancelled again.
+ */
+function holdForLiveReduce(
+  params: StaticBracketParams,
+  incoming: StaticBracketState,
+  observation: Observation,
+  carried: readonly string[],
+  reduce: OrderTrack,
+): Plan {
+  let state = incoming;
+  if (state.instanceState === "PARTIALLY_OPEN" || state.instanceState === "OPEN") {
+    // MOVE-SITE: reduceStillLive TRIGGERS: EXIT_TRIGGER_MET
+    const moved = move(state, "EXIT_TRIGGER_MET");
+    if (!moved.ok) {
+      return halted(state, moved.problem, []);
+    }
+    state = syncPlannedToWorking(moved.value, "EXIT");
+  }
+  const reasons = [...carried, REASONS.exitOrderWorking];
+  const silenceBoundMs = reduce.placedAtMs + params.entry.execution.submission_unknown_after_ms;
+  // The first instant the retirement rule could apply: strictly after the
+  // intent's own `validUntil`.
+  const retirableAtMs = intentValidUntilMs(params, reduce) + 1;
+  switch (reduce.state) {
+    case "PENDING": {
+      if (observation.nowMs >= silenceBoundMs) {
+        const moved = moveOrder(reduce, "SILENCE_EXCEEDED");
+        if (moved.ok) {
+          return plan(
+            withState(state, { exitOrder: moved.value }),
+            "hold",
+            [...reasons, REASONS.exitSubmissionUnknown, REASONS.entryAwaitingReconciliation],
+            [],
+            { submissionUnknown: true },
+            retirableAtMs,
+          );
+        }
+      }
+      return plan(state, "hold", reasons, [], null, silenceBoundMs);
+    }
+    case "SUBMISSION_UNKNOWN":
+      return plan(
+        state,
+        "hold",
+        [...reasons, REASONS.exitSubmissionUnknown, REASONS.entryAwaitingReconciliation],
+        [],
+        null,
+        neverNamed(reduce) ? retirableAtMs : null,
+      );
+    case "CANCEL_PENDING":
+      return plan(state, "hold", [...reasons, REASONS.awaitingCancel]);
+    default:
+      return plan(state, "hold", reasons);
+  }
+}
+
+/**
+ * Retires a protective reduction whose intent is PROVABLY DEAD (ruling R2), or
+ * answers `null`.
+ *
+ * All four must hold, and each is checked:
+ *
+ * 1. the track is this bracket's PROTECTED_REDUCE (a take-profit is never
+ *    retired this way);
+ * 2. it is `PENDING` or `SUBMISSION_UNKNOWN` — nothing has shown it working;
+ * 3. NO order view and NO fill has EVER named it ({@link neverNamed}): no venue
+ *    order id, no confirmed fill, no view-reported fill. A track that anything
+ *    named is never retired by expiry, whatever its state;
+ * 4. its OWN `validUntil` — `placedAtMs + order_validity_ms`, exactly as the
+ *    intent carried it — is STRICTLY in the past.
+ *
+ * WHY THAT IS SAFE (and not §6 invariant 6's "unknown treated as rejection").
+ * After `validUntil` nothing can turn the intent into an order any more: the
+ * risk engine refuses an intent whose `validUntil` is before the evaluation
+ * instant (`packages/risk/src/engine.ts:238-248`, `RISK_INTENT_EXPIRED`) and the
+ * planner refuses one whose `validUntil` is not after the planning instant
+ * (`packages/execution-planner/src/build.ts:196-213`, `PLAN_INTENT_EXPIRED`).
+ * So either no order exists, or one was booked before then — and a booked order
+ * appears in `ctx.orders()` before its intent's `validUntil` passes (the
+ * composition-root obligation this rule rests on, README obligation 11): a
+ * live one is ADOPTED by {@link planExit} before this function runs, and a
+ * terminal one either executed — and its fill named the track — or did not,
+ * in which case it is dead too. The loop's reservation stays the backstop, and
+ * the re-plan the ladder may then make is still gated by `positionAgrees`,
+ * which a sale booked but not yet delivered would already fail.
+ *
+ * The bracket leaves `EXIT_PLANNED` by §13.3's existing `EXIT_ABANDONED` edge —
+ * "a planned exit that never became an order leaves the position open" —
+ * which is exactly this fact. In any other bracket state the track is only
+ * cleared, as {@link settleTerminalOrder} does for a terminal exit.
+ */
+function retireExpiredReduce(
+  params: StaticBracketParams,
+  state: StaticBracketState,
+  observation: Observation,
+): Settlement | null {
+  const track = state.exitOrder;
+  if (track === null || !isProtectedReduce(track)) return null;
+  if (track.state !== "PENDING" && track.state !== "SUBMISSION_UNKNOWN") return null;
+  if (!neverNamed(track)) return null;
+  if (observation.nowMs <= intentValidUntilMs(params, track)) return null;
+  const cleared = withState(state, { exitOrder: null });
+  if (state.instanceState === "EXIT_PLANNED") {
+    // MOVE-SITE: exitIntentExpired TRIGGERS: EXIT_ABANDONED
+    const moved = move(cleared, "EXIT_ABANDONED");
+    if (moved.ok) {
+      return { state: moved.value, reasons: [REASONS.exitIntentExpired] };
+    }
+  }
+  return { state: cleared, reasons: [REASONS.exitIntentExpired] };
 }
 
 /**
@@ -1924,6 +2372,13 @@ function planProtectedReduce(
  *   a cancel for an in-flight cancel adds venue traffic and, worse, makes the
  *   decision log read as though a new safety action had been taken;
  * - nothing resting answers `null`, which is the caller's licence to act.
+ *
+ * It withdraws the ENTRY track and a TAKE_PROFIT track, never this bracket's
+ * own protective reduction (`BRACKET-1a`, D3; ruling R3). The one caller that
+ * could place over a live reduction, {@link planProtectedReduce}, recognises it
+ * first and holds; the two final policies that also call here
+ * (`HOLD_TO_RESOLUTION`, `CANCEL_ONLY`) withdraw what they own and leave a
+ * placed reduction to run to completion.
  */
 function withdrawResting(
   state: StaticBracketState,
@@ -1931,7 +2386,7 @@ function withdrawResting(
   carried: readonly string[],
   detail: string,
 ): Plan | null {
-  const live = workingOrders(state);
+  const live = workingOrders(state).filter((order) => !isProtectedReduce(order));
   if (live.length === 0) return null;
   const cancellable = live.filter((order) => order.state === "WORKING");
   if (cancellable.length === 0) {
@@ -1975,6 +2430,7 @@ function planFinalPolicy(
         leg,
         open,
         "exit cutoff before close",
+        REASONS.finalProtectedReduce,
       );
     case "HOLD_TO_RESOLUTION": {
       // Permitted only because `allow_resolution_hold` is true; the
@@ -2155,6 +2611,10 @@ export function planFill(
 ): Plan {
   if (state.instanceState === "HALTED") {
     return plan(state, "hold", [REASONS.halted]);
+  }
+  const roleProblem = refusedExitRole(state);
+  if (roleProblem !== null) {
+    return halted(state, roleProblem, []);
   }
   const entry = state.entryOrder;
   const exit = state.exitOrder;
@@ -2397,6 +2857,10 @@ export function planOrderUpdate(
   if (state.instanceState === "HALTED") {
     return plan(state, "hold", [REASONS.halted]);
   }
+  const roleProblem = refusedExitRole(state);
+  if (roleProblem !== null) {
+    return halted(state, roleProblem, []);
+  }
   const kind = attributeOrder(state, view);
   if (kind === null) {
     return plan(state, "hold", [REASONS.idle]);
@@ -2432,7 +2896,9 @@ export function planOrderUpdate(
 
   const reasons = [
     kind === "ENTRY" ? REASONS.entryOrderWorking : REASONS.exitOrderWorking,
-    ...(reconciled ? [REASONS.entryReconciled] : []),
+    // An exit can be SUBMISSION_UNKNOWN since `BRACKET-1a` (a protective
+    // reduction nobody answered, ruling R2), so a reconciliation names its kind.
+    ...(reconciled ? [kind === "ENTRY" ? REASONS.entryReconciled : REASONS.exitReconciled] : []),
   ];
 
   // A terminal order changes the bracket state, and that is decided by the tick
@@ -2498,6 +2964,17 @@ function absorbTerminalView(
   ]);
 }
 
+/**
+ * Which tracked order an `onOrderUpdate` view is about: by exact venue order id
+ * first, then — for a track that has no id yet — by leg and side.
+ *
+ * The id-less match is exactly {@link adoptOrder}'s, including its one
+ * restriction (`BRACKET-1a`, D5): an id-less PROTECTIVE REDUCTION is named only
+ * by a view that shows the order alive. A terminal view of an order it has
+ * never been linked to — the replaced take-profit's `CANCELED`, redelivered —
+ * is not its evidence, and attributing it cleared the reduction's track and
+ * left its own fill unattributed (scoping probe P2d).
+ */
 function attributeOrder(
   state: StaticBracketState,
   view: TrackedOrderView,
@@ -2510,6 +2987,7 @@ function attributeOrder(
     return "ENTRY";
   }
   if (exit !== null && exit.orderId === null && exit.outcome === view.outcome && exit.side === view.side) {
+    if (isProtectedReduce(exit) && !isLiveViewStatus(view.status)) return null;
     return "EXIT";
   }
   return null;

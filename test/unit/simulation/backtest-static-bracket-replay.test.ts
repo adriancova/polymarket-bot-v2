@@ -28,10 +28,12 @@
  *    the run or the golden fails here by name;
  * 5. the run is SENSITIVE: a one-byte change to the archived object is REFUSED
  *    by checksum, never replayed;
- * 6. `RISK-2` residual 5 is OBSERVED and pinned: the instance's own protective
- *    reduction fills, the strategy cannot name the fill, and it ends PAUSED —
- *    with the ledger clean. Reported, not hidden, not fixed
- *    (`packages/strategies/**` is outside this round's grant).
+ * 6. `RISK-2` residual 5 was OBSERVED and pinned here (the instance's own
+ *    protective reduction filled, the strategy could not name the fill, and it
+ *    ended PAUSED — with the ledger clean), and the pin is now CONVERTED to its
+ *    resolution by `BRACKET-1a`: the reduction's own fill closes the bracket
+ *    through the replay root too, nothing pauses, and the ledger is still
+ *    clean.
  *
  * Wired into `pnpm test:replay` (root `package.json`), which `GATE-1` made a
  * real CI gate. That script is a POSITIONAL FILE LIST, and `GATE-1`'s residual
@@ -209,21 +211,26 @@ describe("through the shipped root, the shared core runs Static Bracket (checkli
 });
 
 /**
- * Residual 5 (`docs/handoffs/RISK-2.md`) — OBSERVED through the replay root,
- * pinned so it fails the day it is fixed, and deliberately NOT fixed here:
- * `packages/strategies/**` is outside this round's grant.
+ * Residual 5 (`docs/handoffs/RISK-2.md`) — observed through the replay root by
+ * `BACKTEST-1` and pinned so it would fail the day it was fixed; RESOLVED by
+ * `BRACKET-1a`, and the rows now pin the resolution.
  *
- * `planProtectedReduce` creates no order track, so when the cutoff reduction
- * FILLS the strategy cannot name the fill: `SB.UNATTRIBUTED_FILL` →
- * `SB.POSITION_MISMATCH` → `SB.NO_BLIND_FLATTEN` → `SB.PAUSED`. The pause is
- * the STRATEGY's own state (its reason codes); the runtime's `instanceStatus()`
- * stays `ACTIVE`, and the ledger is clean — the money is right, and the pause
- * is strictly AFTER the exit is booked. Consequence, unchanged by this round:
- * an instance that pauses on its own exit cannot open a second bracket, so
- * §7 checklist item 1 is not closed by a replay that ends this way either.
+ * WAS: `planProtectedReduce` created no order track, so when the cutoff
+ * reduction FILLED the strategy could not name the fill:
+ * `SB.UNATTRIBUTED_FILL` → `SB.POSITION_MISMATCH` → `SB.NO_BLIND_FLATTEN` →
+ * `SB.PAUSED`, and `onMarketClosing` resumed and paused again. The pause was
+ * the STRATEGY's own state (its reason codes), the runtime's
+ * `instanceStatus()` stayed `ACTIVE`, and the ledger was clean.
+ *
+ * NOW: the reduction is tracked, its fill closes the bracket
+ * (`SB.EXIT_FILLED`, `SB.CLOSED`), and `onMarketClosing` answers the fixture's
+ * reentry limit of 1 (`SB.REFUSED_MAXIMUM_ENTRIES`). The same run through the
+ * shipped replay root cannot show a SECOND bracket (the limit is 1, and a
+ * cutoff reduction is always after the entry cutoff); that is not what this
+ * fixture is for, and §7 checklist item 1 is not closed by it.
  */
-describe("residual 5 — the instance ends PAUSED after its own exit fills (reported, not hidden)", () => {
-  it("the reduction fills, the strategy cannot attribute the fill, and it pauses", async () => {
+describe("residual 5 — RESOLVED: the instance's own exit fill closes the bracket through the replay root", () => {
+  it("the reduction fills, the strategy names the fill, and the bracket closes", async () => {
     const run = await replayThroughShippedRoot({ withCore: true });
     expect(run.outcome.ok).toBe(true);
     if (!run.outcome.ok || run.core === undefined) return;
@@ -231,18 +238,23 @@ describe("residual 5 — the instance ends PAUSED after its own exit fills (repo
     const codes = decisions.flatMap((decision) => decision.reasonCodes);
     expect(codes).toContain("SB.FINAL_PROTECTED_REDUCE");
     expect(venueRecords(run).fills.some((fill) => fill.action === "SELL")).toBe(true);
-    expect(codes).toContain("SB.UNATTRIBUTED_FILL");
-    expect(codes).toContain("SB.POSITION_MISMATCH");
-    expect(codes).toContain("SB.NO_BLIND_FLATTEN");
-    expect(codes).toContain("SB.PAUSED");
+    // WAS: each of these four was present.
+    expect(codes).not.toContain("SB.UNATTRIBUTED_FILL");
+    expect(codes).not.toContain("SB.POSITION_MISMATCH");
+    expect(codes).not.toContain("SB.NO_BLIND_FLATTEN");
+    expect(codes).not.toContain("SB.PAUSED");
+    // The reduction's own onFill — the decision that used to pause.
+    const reduceAt = decisions.findIndex((decision) => decision.decisionType === "reduce");
+    expect(reduceAt).toBeGreaterThanOrEqual(0);
+    const reductionFill = decisions.slice(reduceAt + 1).find((decision) => decision.callback === "onFill");
+    expect(reductionFill?.reasonCodes).toEqual(["SB.EXIT_FILLED", "SB.CLOSED"]);
     // The LAST decision the strategy itself reasoned about (the onMarketClosing
-    // callback) still carries the pause. (`TRDR-4`: the SB.IDLE onOrderUpdate
-    // holds that used to trail it were re-deliveries of already-evaluated
-    // terminal views; under R1 a terminal view is delivered until one delivery
-    // is evaluated, so onMarketClosing is now the run's last decision.)
+    // callback; `TRDR-4`: a terminal view is delivered until one delivery is
+    // evaluated, so nothing trails it). WAS: `SB.RESUMED, …, SB.PAUSED`.
     const closing = decisions.find((decision) => decision.callback === "onMarketClosing");
-    expect(closing?.reasonCodes).toContain("SB.PAUSED");
-    // The runtime-level status is NOT paused: the pause is the strategy's own.
+    expect(closing?.reasonCodes).toEqual(["SB.REFUSED_MAXIMUM_ENTRIES"]);
+    // The runtime-level status is ACTIVE, as it was: it never tracked the
+    // strategy's own pause, and there is no pause now either.
     const instanceId = decisions[0]?.instanceId ?? "";
     expect(run.core.trader.registry.get(instanceId)?.runtime.instanceStatus()).toBe("ACTIVE");
   });

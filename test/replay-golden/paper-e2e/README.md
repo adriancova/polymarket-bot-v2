@@ -62,6 +62,38 @@ section by section, with the removed decisions identified by the order each
 one delivered, in the round's handoff. The take-profit's placing `exit`
 decision is still `evaluationSeq 2`.
 
+### The `BRACKET-1a` regeneration: the run now ends CLOSED, not PAUSED
+
+`RISK-2` residual 5 was recorded here as two decisions. The protective
+reduction had no order track, so its own fill (`evaluationSeq 9`, `onFill`)
+read `SB.UNATTRIBUTED_FILL, SB.POSITION_MISMATCH, SB.NO_BLIND_FLATTEN,
+SB.PAUSED` with `modelOutputs {expectedShares: "50", heldShares: "0"}`, and
+`onMarketClosing` (`evaluationSeq 11`) resumed and paused again (`SB.RESUMED,
+SB.EXIT_CUTOFF, SB.RESOLUTION_HOLD_DISALLOWED, SB.POSITION_MISMATCH,
+SB.NO_BLIND_FLATTEN, SB.PAUSED`, the same model outputs). `BRACKET-1a` gave the
+reduction its track (`packages/strategies/static-bracket`, the user's rulings
+R1–R3), and the regeneration — ONCE, from the restored base bytes — moved
+exactly those two records and nothing else:
+
+- `decisions[9]` (`onFill`, still `hold`): `SB.EXIT_FILLED, SB.CLOSED`, model
+  outputs `{}`. The reduction's track is `PENDING` and id-less (the fill
+  precedes the order's view), so the fill matches it by leg and side;
+  `applyExitFill` folds the 50 shares, the allocation is flat, and
+  `EXIT_PLANNED --EXIT_FILL_COMPLETE--> CLOSED`.
+- `decisions[11]` (`onMarketClosing`, still `hold`): `SB.REFUSED_MAXIMUM_ENTRIES`,
+  model outputs `{}`. The instance is `CLOSED`, so the ladder reaches
+  `planRearm`, which checks `maximum_entries_per_market` (1, spent) before the
+  cool-down.
+
+`decisions[10]` (the reduction's own `FILLED` view) is unchanged at `SB.IDLE`:
+the bracket already cleared the track, exactly as before. Every other section —
+`checkpointInstants`, `events`, `fills`, `goldenFormatVersion`, `health`,
+`ledgerProjection`, `ledgerTransactions`, `orderProvenance`, `orders`,
+`pnlRecords`, `pnlSnapshots`, `reconciliation`, `scenario`, `traces` — is
+byte-identical, and every number outside `decisions` is the same multiset
+(proved mechanically in the round's handoff). No economic value moved: the
+money was always right; what moved is the strategy's account of it.
+
 ### `health.accounting.realizedPnl` reads "no snapshot observed" here — deliberately, and why
 
 `TRDR-3` (2026-09-17) gave the trader's health surface `accounting.realizedPnl`:

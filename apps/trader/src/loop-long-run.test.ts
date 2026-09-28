@@ -18,9 +18,11 @@
  * WHAT IS REAL: the `CoreLoop`, the strategy RUNTIME, feature engine, books,
  * capital allocator, risk engine, execution planner, `SimulatedVenue` (Tier 0),
  * ledger and PnL. WHAT IS DOUBLED: the clock and the durable store (the
- * trader's own in-memory doubles), and the STRATEGY — Static Bracket opens one
- * bracket per market and then pauses (`RISK-2` residual 5), so it cannot place
- * hundreds of orders. The double runs through the real runtime and emits the
+ * trader's own in-memory doubles), and the STRATEGY — Static Bracket opens at
+ * most `reentry.maximum_entries_per_market` brackets per market, each a handful
+ * of orders (it used to pause after the first, `RISK-2` residual 5, closed by
+ * `BRACKET-1a`), so it cannot place hundreds of orders. The double runs through
+ * the real runtime and emits the
  * same §7.7 intent shapes Static Bracket emits:
  *
  * - a resting BUY of 50 at 0.2 (`MAKER_ONLY`, `PASSIVE`, `GTC`), which the

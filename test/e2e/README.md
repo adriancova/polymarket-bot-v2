@@ -7,24 +7,27 @@ OUTSIDE.
 ## Running it
 
 ```
-pnpm vitest run --config test/e2e/vitest.config.ts
+pnpm test:e2e
 ```
 
-There is no root `pnpm test:e2e` script yet: the root `package.json` is a
-protected path and its wiring is orchestrator-owned at merge (the `af059d7`
-precedent). The root runner (`test/vitest.config.ts`) includes
-`test/unit/**`, `packages/**/src/**` and `apps/**/src/**` only, so nothing in
-this tree enters the root `pnpm test` count.
+The root `test:e2e` script (orchestrator-wired in `da37a0c`; the root
+`package.json` is a protected path) is `vitest run --config
+test/e2e/vitest.config.ts`, so `pnpm vitest run --config
+test/e2e/vitest.config.ts` is the same run. The root unit runner
+(`test/vitest.config.ts`) includes `test/unit/**`, `packages/**/src/**` and
+`apps/**/src/**` only, so nothing in this tree enters the root `pnpm test`
+count — `pnpm test:e2e` is its own gate.
 
-Type checking has the same shape: `pnpm typecheck` runs `test/tsconfig.json`,
-which includes `test/unit` only, and this tree carries its own
-`test/e2e/tsconfig.json`. Run it with:
+Type checking is wired the same way: `pnpm typecheck` runs this tree's own
+`test/e2e/tsconfig.json` (`tsc -p test/e2e/tsconfig.json --noEmit`) after
+`test/tsconfig.json`, which includes `test/unit` only. To check this tree
+alone:
 
 ```
 pnpm exec tsc --noEmit -p test/e2e/tsconfig.json
 ```
 
-`pnpm lint` (`eslint .`) DOES cover this tree already.
+`pnpm lint` (`eslint .`) covers this tree too.
 
 ## What is real, and what is doubled
 
@@ -75,7 +78,7 @@ persisted that no chain accounts for, which forward resolution can never show.
 | `projection-reconciliation.test.ts` | acceptance 2, with four falsifiability probes |
 | `reconciliation-attribution.test.ts` | `RECON-1` / `RECON-2`: synthetic artefacts built from the golden that pin the reconciler's by-id attribution of every order through its provenance record and its refusals (`RISK2-R3`, `RECON1-ORIGIN`), its sequence-ordered fold (`RISK2-R4`), its agreement with the real `packages/pnl` engine on partial exits, the open-position mechanism (`RECON1-EDGE`) and the oracle's import independence |
 | `determinism-golden.test.ts` | two fresh runs byte-identical to each other and to the committed golden |
-| `residuals-observed.test.ts` | the four known residuals, observed and never fought |
+| `residuals-observed.test.ts` | the known residuals, observed and never fought — five rows, three of them (1, 2 and 5) now pinning their RESOLUTION (`BRACKET-1a` resolved residual 5: the protective reduction's own fill closes the bracket) |
 | `safety-posture.test.ts` | the four repository floors, refused not clamped, plus a scan of this package's own files — imports read from each file's parsed syntax tree (`RECON1-SCAN`) |
 
 ## Determinism hygiene

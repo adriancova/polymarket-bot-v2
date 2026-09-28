@@ -561,6 +561,9 @@ describe("hostile battery — thresholds are exact, one tick at a time", () => {
       ).toBe(false);
       expect(decision.reasonCodes).not.toContain(REASONS.stopTriggered);
       expect(decision.reasonCodes).not.toContain(REASONS.finalProtectedReduce);
+      // `BRACKET-1a` (D8): a STOP reduction now reports `SB.PROTECTED_REDUCE`,
+      // so the line above alone would no longer catch one.
+      expect(decision.reasonCodes).not.toContain(REASONS.protectedReduce);
     });
   }
 

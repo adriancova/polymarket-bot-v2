@@ -106,9 +106,11 @@ export {
 export { REASONS, TAGS, legTag, orderTypeTag, type Reason } from "./reasons.js";
 
 export {
+  EXIT_ROLE_PREFIXES,
   assessDataQuality,
   chooseLeg,
   currentLeg,
+  exitRole,
   expectedNetEdge,
   openShares,
   planClosing,
@@ -121,6 +123,7 @@ export {
   stopTriggerSatisfied,
   type ConfirmedFill,
   type DataQuality,
+  type ExitRole,
   type LegQuote,
   type Plan,
   type TickContext,

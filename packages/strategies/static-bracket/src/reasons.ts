@@ -92,8 +92,45 @@ export const REASONS = {
   exitOrderTerminal: "SB.EXIT_ORDER_TERMINAL",
   exitFilled: "SB.EXIT_FILLED",
   closed: "SB.CLOSED",
+  /**
+   * A protective reduction placed by the STOP or the HOLDING TIMEOUT
+   * (`BRACKET-1a`, D8). Until then every protective reduction reported
+   * `SB.FINAL_PROTECTED_REDUCE`, which names the end-of-market policy; that
+   * code now marks the close-cutoff reduction only, so the decision log says
+   * which kind of cause placed the order (the cause itself is still
+   * `SB.STOP_TRIGGERED` / `SB.HOLDING_TIMEOUT` / `SB.EXIT_CUTOFF` beside it).
+   */
+  protectedReduce: "SB.PROTECTED_REDUCE",
+  /**
+   * A protective reduction nothing ever answered was RETIRED (`BRACKET-1a`,
+   * ruling R2): its intent's own `validUntil` has passed and no order view and
+   * no fill ever named it, so no order can exist for it any more — risk and the
+   * planner both refuse an expired intent. The track is cleared through the
+   * existing `EXIT_ABANDONED` edge and the ladder may plan one reduction for
+   * the new validity window.
+   */
+  exitIntentExpired: "SB.EXIT_INTENT_EXPIRED",
+  /**
+   * A protective reduction has been silent for `submission_unknown_after_ms`:
+   * `PENDING --SILENCE_EXCEEDED--> SUBMISSION_UNKNOWN`, reported as the entry's
+   * `SB.ENTRY_SUBMISSION_UNKNOWN` is (§6 invariant 6: unknown is never a
+   * rejection, so nothing is re-sent) — `BRACKET-1a`, ruling R2.
+   */
+  exitSubmissionUnknown: "SB.EXIT_SUBMISSION_UNKNOWN",
+  /**
+   * An EXIT order in `SUBMISSION_UNKNOWN` was found by a view — the exit twin
+   * of `SB.ENTRY_RECONCILED`, which it used to borrow (an exit could not be
+   * unknown before `BRACKET-1a`).
+   */
+  exitReconciled: "SB.EXIT_RECONCILED",
 
   // end of market
+  /**
+   * The END-OF-MARKET protective reduction (§13.2 `final_policy:
+   * PROTECTED_REDUCE`, inside `exit_cutoff_before_close_seconds`). Since
+   * `BRACKET-1a` a stop or a holding-timeout reduction reports
+   * `SB.PROTECTED_REDUCE` instead.
+   */
   finalProtectedReduce: "SB.FINAL_PROTECTED_REDUCE",
   finalHoldToResolution: "SB.FINAL_HOLD_TO_RESOLUTION",
   finalCancelOnly: "SB.FINAL_CANCEL_ONLY",

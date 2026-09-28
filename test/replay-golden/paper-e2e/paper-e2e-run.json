@@ -263,15 +263,10 @@
       "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
       "intents": [],
       "marketId": "018f5c20-1000-7a10-8b00-000000000001",
-      "modelOutputs": {
-        "expectedShares": "50",
-        "heldShares": "0"
-      },
+      "modelOutputs": {},
       "reasonCodes": [
-        "SB.UNATTRIBUTED_FILL",
-        "SB.POSITION_MISMATCH",
-        "SB.NO_BLIND_FLATTEN",
-        "SB.PAUSED"
+        "SB.EXIT_FILLED",
+        "SB.CLOSED"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
       "sourceEventId": null
@@ -303,17 +298,9 @@
       "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
       "intents": [],
       "marketId": "018f5c20-1000-7a10-8b00-000000000001",
-      "modelOutputs": {
-        "expectedShares": "50",
-        "heldShares": "0"
-      },
+      "modelOutputs": {},
       "reasonCodes": [
-        "SB.RESUMED",
-        "SB.EXIT_CUTOFF",
-        "SB.RESOLUTION_HOLD_DISALLOWED",
-        "SB.POSITION_MISMATCH",
-        "SB.NO_BLIND_FLATTEN",
-        "SB.PAUSED"
+        "SB.REFUSED_MAXIMUM_ENTRIES"
       ],
       "runId": "018f5c20-3000-7a30-8b00-000000000003",
       "sourceEventId": "018f5c20-9000-7a90-8b00-000000000008"

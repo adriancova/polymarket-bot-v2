@@ -91,6 +91,14 @@ import type { ReservationMetrics } from "./reservations.js";
  * API, the text quoted in its first sentence below — a statement `RISK-2`
  * (`133eac1`) made false. The superseded wording is kept inside the constant,
  * quoted, so an operator who saw the old caveat can recognise what changed.
+ *
+ * CORRECTED AGAIN by `BRACKET-1a`, the same way. `BOOT-1`'s text went on to
+ * name `RISK-2` residual 5 as "THE CAVEAT NOW" — the strategy's protective
+ * reduction had no order track, so the instance paused on its own exit. That
+ * round gave the reduction a track, so the claim is quoted as superseded too,
+ * and the constant now states only what the health surface still has to warn
+ * about. The quotation deliberately omits the old present-tense marker, so a
+ * pin can prove the caveat no longer makes the claim.
  */
 export const RISK_SEAM_CAVEAT =
   'SUPERSEDED (RISK-2, 133eac1): this caveat used to read "WP-220 accepted residual: every ' +
@@ -100,13 +108,17 @@ export const RISK_SEAM_CAVEAT =
   "decides disposition from the intent SHAPE and the supplied portfolio, never from a tag — " +
   "a POSITION resolving to a SELL fully covered by the instance's confirmed holding is an " +
   "EXIT and clears the seam; anything with a BUY leg, an over-held sell and every QUOTE/BASKET " +
-  "stays ENTRY — so refusedExits reads 0 in a healthy run. THE CAVEAT NOW: RISK-2 residual 5 — " +
-  "planProtectedReduce creates no order track, so when the instance's own exit FILLS the " +
-  "strategy cannot attribute it (SB.UNATTRIBUTED_FILL → SB.POSITION_MISMATCH → " +
-  "SB.NO_BLIND_FLATTEN → SB.PAUSED) and the instance ends PAUSED after its round trip; the " +
-  "money is right and the pause is strictly after the exit is booked, but a paused instance " +
-  "opens no second bracket. The trader does not weaken risk policy, re-tag intents or bypass " +
-  "the engine to compensate; it counts refusals here.";
+  "stays ENTRY — so refusedExits reads 0 in a healthy run. SUPERSEDED (BRACKET-1a): it then " +
+  'read "RISK-2 residual 5 — planProtectedReduce creates no order track, so when the ' +
+  "instance's own exit FILLS the strategy cannot attribute it (SB.UNATTRIBUTED_FILL → " +
+  "SB.POSITION_MISMATCH → SB.NO_BLIND_FLATTEN → SB.PAUSED) and the instance ends PAUSED after " +
+  'its round trip …" — that is no longer true either: the static-bracket protective reduction ' +
+  "carries its own order track, its fill closes the bracket (SB.EXIT_FILLED, SB.CLOSED), and " +
+  "the instance re-arms under its configured reentry limits. What this surface still counts: " +
+  "refusedExits is the number of refusals of intents the strategy TAGGED protective — a tag " +
+  "read for this counter only, never for disposition — and a covered sell that establishes " +
+  "complement-leg exposure is an EXIT at the seam. The trader does not weaken risk policy, " +
+  "re-tag intents or bypass the engine to compensate; it counts refusals here.";
 
 /** Counters for the §14.3 `risk` family plus the seam's own visibility. */
 export interface RiskHealth {
