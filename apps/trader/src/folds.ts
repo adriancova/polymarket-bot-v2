@@ -40,10 +40,14 @@
  * - the LEDGER view after every `everyFills`-th posted fill (the PAPER
  *   cadence is {@link PAPER_ACCOUNTING_CHECKS}: every 50 fills), and at
  *   shutdown or the end of a run (`CoreLoop.checkAccountingRebuild`);
- * - each PnL stream at the same points, ONLY when `pnl` is on — the test and
- *   golden harnesses' {@link EVERY_FILL_ACCOUNTING_CHECKS}. A from-zero PnL
- *   fold is quadratic in the stream today, so the user's ruling F2 keeps it
- *   out of PAPER until `FOLD-2` makes it cheap.
+ * - each instance's PnL stream at the same points — every due posted fill,
+ *   owned OR unowned, and shutdown or the end of a run — ONLY when `pnl` is
+ *   on: the test and golden harnesses' {@link EVERY_FILL_ACCOUNTING_CHECKS}.
+ *   A from-zero PnL fold is quadratic in the stream today, so the user's
+ *   ruling F2 keeps it out of PAPER until `FOLD-2` makes it cheap. A PnL
+ *   check answers for the instance's WHOLE record list, never a prefix: a
+ *   stream a failed store write left behind is caught up first
+ *   ({@link HeldAccounting.checkPnl}, `FOLD1-R1-1`).
  *
  * A mismatch is never silent: it is counted here (`seams.folds`), the loop
  * latches a GLOBAL `ACCOUNTING_REBUILD_MISMATCH` halt (fail-closed), and the
@@ -169,7 +173,11 @@ export interface FoldHealth {
   readonly fillsPosted: number;
   /** Ledger rebuild checks run: on the cadence, at shutdown and at the end of a run. */
   readonly ledgerChecks: number;
-  /** PnL stream comparisons run: one per held stream per check. */
+  /**
+   * PnL stream comparisons run: one per instance with PnL records, per check —
+   * on the cadence at every due posted fill, owned or unowned, and at shutdown
+   * or the end of a run. Each compares the instance's WHOLE record list.
+   */
   readonly pnlChecks: number;
   /** `fillsPosted` when the last ledger check ran; `null` before the first — never a zero nobody measured. */
   readonly fillsAtLastCheck: number | null;
@@ -217,7 +225,11 @@ interface HeldPnlStream {
   state: PnlState;
   /** How many records `state` has folded; `< seen` while a refused record stops the stream. */
   applied: number;
-  /** How many records the stream had at its last advance: what `state` answers for. */
+  /**
+   * How many records the stream had at its last advance — by a snapshot or
+   * by a check's catch-up. A snapshot is computed only when `applied` has
+   * reached it with no refusal ({@link HeldAccounting.completePnlState}).
+   */
   seen: number;
   /** The index of the refused record that stops the stream, if any. */
   refusedAt: number | undefined;
@@ -369,7 +381,7 @@ export class HeldAccounting {
 
   /**
    * Adopts a folded posting: the ledger AND its view, together — the ONLY
-   * writer of either. Answers whether the cadence's ledger check is due.
+   * writer of either. Answers whether the cadence's checks are due.
    */
   adopt(posting: Extract<FoldedPosting, { readonly ok: true }>): boolean {
     this.#ledger = posting.ledger;
@@ -426,11 +438,12 @@ export class HeldAccounting {
    * FAILURE POINT — and answers its state when every record is folded, or
    * `undefined` while a refused record stops the stream.
    *
-   * Opened on the first call with records, from `identity()`: `emptyPnlState`
-   * throws `PnlConfigurationError` on an identity it refuses, and that throw
-   * leaves here exactly where `foldPnlRecords` used to throw it from (the
-   * loop's `#writePnlSnapshot`), every time, because a refused stream is
-   * never stored.
+   * Opened on the first call with records (unless a check opened it first,
+   * {@link checkPnl}), from `identity()`: `emptyPnlState` throws
+   * `PnlConfigurationError` on an identity it refuses, and that throw leaves
+   * here exactly where `foldPnlRecords` used to throw it from (the loop's
+   * `#writePnlSnapshot`), every time, because a refused stream is never
+   * stored — by this method or by a check.
    */
   advancePnl(
     instanceId: string,
@@ -450,6 +463,17 @@ export class HeldAccounting {
       };
       this.#streams.set(instanceId, stream);
     }
+    return this.#advance(instanceId, stream, records) ? stream.state : undefined;
+  }
+
+  /**
+   * THE incremental PnL step, shared by {@link advancePnl} and
+   * {@link checkPnl}: folds `records[applied, length)` onto the held state
+   * with `applyPnlRecord`, RETRYING FROM THE FAILURE POINT, and answers
+   * whether every record is folded. A refused record is counted ONCE (F3) —
+   * the first time its stream stops on it, whichever of the two meets it.
+   */
+  #advance(instanceId: string, stream: HeldPnlStream, records: readonly PnlRecord[]): boolean {
     stream.seen = records.length;
     while (stream.applied < records.length) {
       const result = applyPnlRecord(stream.state, records[stream.applied]);
@@ -460,14 +484,14 @@ export class HeldAccounting {
           stream.refusalCode = code;
           this.#countRefusal(instanceId, code);
         }
-        return undefined;
+        return false;
       }
       stream.state = result.value;
       stream.applied += 1;
       stream.refusedAt = undefined;
       stream.refusalCode = undefined;
     }
-    return stream.state;
+    return true;
   }
 
   /**
@@ -492,37 +516,128 @@ export class HeldAccounting {
     return stream.state;
   }
 
-  /** The instances with a held stream, sorted — what an end-of-run PnL check covers. */
+  /** The instances with a held stream, sorted. */
   pnlStreamIds(): readonly string[] {
     return [...this.#streams.keys()].sort();
   }
 
   /**
-   * One held PnL stream against `foldPnlRecords` over the records it answers
-   * for (`records[0, seen)`), on serialized bytes. `undefined` when they
-   * agree — both folded every record to the same bytes, or both refused at
-   * the same index with the same code from the same state — otherwise the
-   * difference, and the held stream is REPLACED by the rebuild.
+   * One instance's PnL stream against `foldPnlRecords` over its WHOLE record
+   * list, on serialized bytes. `undefined` when they agree — both folded
+   * every record to the same bytes, or both refused at the same index with
+   * the same code from the same state — otherwise the difference, and the
+   * held stream is REPLACED by the rebuild.
+   *
+   * The check answers for EVERY record the loop has adopted (`FOLD1-R1-1`),
+   * never a prefix. A fill whose ledger-store write failed returns before
+   * its snapshot, so its records are in the list while the held stream has
+   * not folded them yet — exactly as base's snapshot had not. The check
+   * therefore first CATCHES THE HELD STREAM UP with the same step the next
+   * snapshot would run ({@link advancePnl}'s: retry from the failure point, a
+   * refused record counted once), opening it when no snapshot has yet, and
+   * only then compares; `matched` is never said of a state that is behind.
+   * The catch-up is what that snapshot would have folded, so the snapshots
+   * the loop writes are unchanged.
+   *
+   * `identity` opens a stream that is not open yet. A stream whose identity
+   * `packages/pnl` refuses cannot be opened, and the rebuild — which opens the
+   * SAME identity — must refuse it too; the two agree only then (the loop
+   * throws from `#writePnlSnapshot` as before, and never stores a stream).
+   * `undefined` for an instance the loop cannot name is a mismatch: records
+   * with no stream and no identity to open one from are not checkable.
    */
-  checkPnl(instanceId: string, records: readonly PnlRecord[]): RebuildMismatch | undefined {
-    const stream = this.#streams.get(instanceId);
-    if (stream === undefined) return undefined;
+  checkPnl(
+    instanceId: string,
+    identity: (() => PnlStreamIdentity) | undefined,
+    records: readonly PnlRecord[],
+  ): RebuildMismatch | undefined {
     this.#pnlChecks += 1;
-    const prefix = records.slice(0, stream.seen);
-    const mismatch = this.#comparePnl(stream, prefix);
+    let stream = this.#streams.get(instanceId);
+    if (stream === undefined) {
+      const opened = this.#openForCheck(identity, records);
+      if (!opened.ok) {
+        if (opened.mismatch === undefined) return undefined;
+        this.#pnlMismatches += 1;
+        return { detail: opened.mismatch, replaced: false };
+      }
+      stream = opened.stream;
+      this.#streams.set(instanceId, stream);
+    }
+    this.#advance(instanceId, stream, records);
+    const mismatch = this.#comparePnl(stream, records);
     if (mismatch === undefined) return undefined;
     this.#pnlMismatches += 1;
-    return { detail: mismatch, replaced: this.#repairPnl(stream, prefix) };
+    return { detail: mismatch, replaced: this.#repairPnl(stream, records) };
   }
 
-  #comparePnl(stream: HeldPnlStream, prefix: readonly PnlRecord[]): string | undefined {
+  /**
+   * Opens a stream for {@link checkPnl}, or says why it cannot: `mismatch`
+   * `undefined` when the rebuild refuses the identity the same way (the two
+   * agree — neither holds a state), otherwise the difference.
+   */
+  #openForCheck(
+    identity: (() => PnlStreamIdentity) | undefined,
+    records: readonly PnlRecord[],
+  ):
+    | { readonly ok: true; readonly stream: HeldPnlStream }
+    | { readonly ok: false; readonly mismatch: string | undefined } {
+    if (identity === undefined) {
+      return {
+        ok: false,
+        mismatch:
+          `the instance has ${String(records.length)} PnL records, no held stream, and no registered ` +
+          "identity to open one from, so its state cannot be checked",
+      };
+    }
+    let heldThrew: string;
     try {
-      const rebuilt = foldPnlRecords(stream.identity, prefix);
+      const opened = identity();
+      return {
+        ok: true,
+        stream: {
+          identity: opened,
+          state: emptyPnlState(opened),
+          applied: 0,
+          seen: 0,
+          refusedAt: undefined,
+          refusalCode: undefined,
+        },
+      };
+    } catch (error) {
+      heldThrew = describeThrown(error);
+    }
+    try {
+      foldPnlRecords(identity(), records);
+    } catch (error) {
+      const rebuildThrew = describeThrown(error);
+      if (rebuildThrew === heldThrew) return { ok: false, mismatch: undefined };
+      return {
+        ok: false,
+        mismatch: `the held stream could not be opened (a ${heldThrew}); the rebuild threw a ${rebuildThrew}`,
+      };
+    }
+    return {
+      ok: false,
+      mismatch: `the held stream could not be opened (a ${heldThrew}), but the rebuild from zero could`,
+    };
+  }
+
+  #comparePnl(stream: HeldPnlStream, records: readonly PnlRecord[]): string | undefined {
+    try {
+      const rebuilt = foldPnlRecords(stream.identity, records);
       if (stream.refusedAt === undefined) {
+        if (stream.applied !== records.length) {
+          // Unreachable after the catch-up (`#advance` folds to the end or stops on a refusal); a
+          // held stream that says neither is not one the check can vouch for.
+          return (
+            `the held stream folded ${String(stream.applied)} of the ${String(records.length)} records ` +
+            "without stopping on a refusal"
+          );
+        }
         if (!rebuilt.ok) {
           const at = foldRefusalAt(rebuilt.refusals);
           return (
-            `the held stream folded all ${String(prefix.length)} records; the rebuild refused at record ` +
+            `the held stream folded all ${String(records.length)} records; the rebuild refused at record ` +
             `${String(at.index)} (${String(at.code ?? rebuilt.refusals[0]?.code)})`
           );
         }
@@ -533,7 +648,7 @@ export class HeldAccounting {
       if (rebuilt.ok) {
         return (
           `the held stream is stopped at record ${String(stream.refusedAt)} (${String(stream.refusalCode)}); ` +
-          `the rebuild folded all ${String(prefix.length)} records`
+          `the rebuild folded all ${String(records.length)} records`
         );
       }
       const at = foldRefusalAt(rebuilt.refusals);
@@ -544,7 +659,7 @@ export class HeldAccounting {
         );
       }
       // Both stop at the same record: the state BEFORE it must agree too.
-      const before = foldPnlRecords(stream.identity, prefix.slice(0, stream.refusedAt));
+      const before = foldPnlRecords(stream.identity, records.slice(0, stream.refusedAt));
       if (!before.ok) {
         return `the rebuild of the ${String(stream.refusedAt)} records before the stop refused`;
       }
@@ -562,22 +677,24 @@ export class HeldAccounting {
    * is left as it was rather than invented — the mismatch is counted and
    * halted either way.
    */
-  #repairPnl(stream: HeldPnlStream, prefix: readonly PnlRecord[]): boolean {
+  #repairPnl(stream: HeldPnlStream, records: readonly PnlRecord[]): boolean {
     try {
-      const rebuilt = foldPnlRecords(stream.identity, prefix);
+      const rebuilt = foldPnlRecords(stream.identity, records);
       if (rebuilt.ok) {
         stream.state = rebuilt.value;
-        stream.applied = prefix.length;
+        stream.applied = records.length;
+        stream.seen = records.length;
         stream.refusedAt = undefined;
         stream.refusalCode = undefined;
         return true;
       }
       const at = foldRefusalAt(rebuilt.refusals);
       if (at.index === undefined) return false;
-      const before = foldPnlRecords(stream.identity, prefix.slice(0, at.index));
+      const before = foldPnlRecords(stream.identity, records.slice(0, at.index));
       if (!before.ok) return false;
       stream.state = before.value;
       stream.applied = at.index;
+      stream.seen = records.length;
       stream.refusedAt = at.index;
       stream.refusalCode = at.code;
       return true;

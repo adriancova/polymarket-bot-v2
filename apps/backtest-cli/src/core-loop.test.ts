@@ -18,13 +18,20 @@ import { createHash } from "node:crypto";
 
 import {
   createReplayClock,
+  simulationOk,
+  type ReplayCoreLoop,
   type ReplayEventContext,
   type ReplayRecord,
   type Sha256HexDigest,
 } from "@polymarket-bot/simulation";
 import { describe, expect, it } from "vitest";
 
-import { replayDrivenCoreLoop, type ReplayIngestedEvent } from "./core-loop.js";
+import {
+  endOfRunBoundTo,
+  replayDrivenCoreLoop,
+  type ReplayDrivenLoop,
+  type ReplayIngestedEvent,
+} from "./core-loop.js";
 import {
   NORMALIZED_ENVELOPE_NORMALIZER_VERSION,
   normalizedEnvelopeNormalizer,
@@ -90,6 +97,7 @@ function contextOf(replayRecord: ReplayRecord): ReplayEventContext {
 /** A structural loop double that records what it saw and when. */
 function loopDouble(options: { readonly refuseFrom?: number } = {}) {
   const seen: { readonly event: ReplayIngestedEvent; readonly clockAtIngest: string; readonly monotonicAtIngest: bigint }[] = [];
+  const endOfRunChecks: string[] = [];
   let drains = 0;
   let drainedAfterIngest = true;
   let clock: { now(): string; monotonicNs(): bigint } | undefined;
@@ -106,6 +114,10 @@ function loopDouble(options: { readonly refuseFrom?: number } = {}) {
     get drainedAfterIngest() {
       return drainedAfterIngest;
     },
+    /** `FOLD-1`: the triggers the core's end-of-run check was run with. */
+    get endOfRunChecks() {
+      return endOfRunChecks;
+    },
     ingest(event: ReplayIngestedEvent): boolean {
       if (options.refuseFrom !== undefined && seen.length >= options.refuseFrom) return false;
       seen.push({
@@ -120,6 +132,10 @@ function loopDouble(options: { readonly refuseFrom?: number } = {}) {
       drains += 1;
       drainedAfterIngest = true;
       return await Promise.resolve();
+    },
+    checkAccountingRebuild(trigger: "END_OF_RUN"): { readonly matched: boolean } {
+      endOfRunChecks.push(trigger);
+      return { matched: true };
     },
   };
 }
@@ -176,28 +192,31 @@ describe("replayDrivenCoreLoop — the shipped driver of the shared core", () =>
     expect(driver.observations()).toEqual({ eventsIngested: 1, drains: 1 });
   });
 
-  it("FOLD-1: endOfRun() runs the core's END_OF_RUN accounting rebuild check once, and is a no-op for a core without one", () => {
+  it("FOLD-1: endOfRun() runs the core's END_OF_RUN accounting rebuild check once, and is BOUND to the coreLoop the driver built", () => {
     const clock = createReplayClock({ receivedAt: "2026-05-01T08:59:58.000Z", receivedMonotonicNs: "0" });
     if (!clock.ok) return;
-    const triggers: string[] = [];
-    const withCheck = {
-      ...loopDouble(),
-      ingest: () => true,
-      drain: async () => {
-        await Promise.resolve();
-      },
-      checkAccountingRebuild(trigger: "END_OF_RUN") {
-        triggers.push(trigger);
-        return { matched: true, pnlStreamsChecked: 0 };
-      },
-    };
-    const driver = replayDrivenCoreLoop({ loop: withCheck, clock: clock.value });
-    expect(triggers).toEqual([]);
+    const loop = loopDouble();
+    const driver = replayDrivenCoreLoop({ loop, clock: clock.value });
+    expect(loop.endOfRunChecks).toEqual([]);
     driver.endOfRun();
-    expect(triggers).toEqual(["END_OF_RUN"]);
-    // A structural double with no check still drives, and ending it is not an error.
-    const plain = replayDrivenCoreLoop({ loop: loopDouble(), clock: clock.value });
-    expect(() => plain.endOfRun()).not.toThrow();
+    expect(loop.endOfRunChecks).toEqual(["END_OF_RUN"]);
+    // FOLD1-R1-3: the binding `runBacktest` reads — this driver's check, and no other hook's.
+    expect(endOfRunBoundTo(driver.coreLoop)).toBe(driver.endOfRun);
+    const handBuilt: ReplayCoreLoop = () => simulationOk(null);
+    expect(endOfRunBoundTo(handBuilt)).toBeUndefined();
+    const other = replayDrivenCoreLoop({ loop: loopDouble(), clock: clock.value });
+    expect(endOfRunBoundTo(other.coreLoop)).toBe(other.endOfRun);
+    expect(endOfRunBoundTo(other.coreLoop)).not.toBe(driver.endOfRun);
+  });
+
+  it("FOLD1-R1-3: a core with NO end-of-run check is refused at construction — before anything is driven", () => {
+    const clock = createReplayClock({ receivedAt: "2026-05-01T08:59:58.000Z", receivedMonotonicNs: "0" });
+    if (!clock.ok) return;
+    const { checkAccountingRebuild: _dropped, ...withoutCheck } = loopDouble();
+    expect(typeof _dropped).toBe("function");
+    expect(() =>
+      replayDrivenCoreLoop({ loop: withoutCheck as unknown as ReplayDrivenLoop, clock: clock.value }),
+    ).toThrow(/no checkAccountingRebuild/u);
   });
 
   it("a monotonic regression is the replay clock's own refusal, and the event is never ingested", async () => {

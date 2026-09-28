@@ -31,6 +31,7 @@ import {
   readDatasetManifestBytes,
   readRunPins,
   runReplay,
+  simulationRefusal,
   type ReplayCoreLoop,
   type ReplayDataset,
   type ReplayRunPins,
@@ -42,6 +43,7 @@ import {
 } from "@polymarket-bot/simulation";
 
 import { fileSystemArchiveReader, readManifestBytes, sha256Hex } from "./archive.js";
+import { endOfRunBoundTo } from "./core-loop.js";
 import { BACKTEST_RUN_MODE, checkBacktestSafety, type SafetyViolation } from "./safety.js";
 
 /** The dataset-manifest file name `WP-130` writes. */
@@ -60,6 +62,16 @@ export interface BacktestRunOptions {
    * {@link ./core-loop.js#replayDrivenCoreLoop} over the real loop. Absent
    * means "verify and drive only" — the base-`1aa2238` behaviour, kept for
    * `verify`, which is what the CLI's own executable still runs today.
+   *
+   * `FOLD-1` (`FOLD1-R1-3`): the driver BINDS the core's end-of-run
+   * accounting rebuild check to the `coreLoop` it builds, and this run calls
+   * it ONCE when the replay returns — completed or refused part-way — so a
+   * caller cannot drive the core and leave that check out. A backtest core
+   * keeps the PAPER cadence (a check every 50 posted fills) plus this one; a
+   * mismatch latches the core's own GLOBAL halt, which the caller reads from
+   * the core. A `coreLoop` the driver did not build is REFUSED before
+   * anything is read (`SIMULATION_INPUT_INVALID`): this run cannot tell
+   * whether such a core keeps accounting, so it cannot promise the check.
    */
   readonly coreLoop?: ReplayCoreLoop;
   /**
@@ -69,16 +81,6 @@ export interface BacktestRunOptions {
    * replay that produced decisions shows them as bytes, not as a claim.
    */
   readonly venue?: SimulatedVenue;
-  /**
-   * `FOLD-1` — called ONCE when the replay returns, whether it completed or
-   * was refused part-way: the core's end-of-run accounting rebuild check
-   * ({@link ./core-loop.js#replayDrivenCoreLoop}'s `endOfRun`). A backtest
-   * core keeps the PAPER cadence (a check every 50 posted fills) plus this
-   * one; a mismatch latches the core's own GLOBAL halt, which the caller
-   * reads from the core. Not called when the run never started (a refused
-   * environment, run pins or manifest).
-   */
-  readonly endOfRun?: () => unknown;
 }
 
 /** What a backtest run produced, or why it did not run. */
@@ -92,6 +94,20 @@ export async function runBacktest(options: BacktestRunOptions): Promise<Backtest
   const safety = checkBacktestSafety(options.environment);
   if (!safety.ok) {
     return { ok: false, safety: safety.violations };
+  }
+
+  // `FOLD1-R1-3`: a core is driven only with the end-of-run check its driver bound to it.
+  const endOfRun = options.coreLoop === undefined ? undefined : endOfRunBoundTo(options.coreLoop);
+  if (options.coreLoop !== undefined && endOfRun === undefined) {
+    return {
+      ok: false,
+      refusal: simulationRefusal(
+        "SIMULATION_INPUT_INVALID",
+        "runBacktest drives a core only through replayDrivenCoreLoop, which binds the core's end-of-run " +
+          "accounting rebuild check to the coreLoop it builds; this coreLoop was not built by it, so the run " +
+          "could not promise that check (FOLD-1) and is refused before anything is read",
+      ),
+    };
   }
 
   const pins = readRunPins(options.runPins);
@@ -113,8 +129,26 @@ export async function runBacktest(options: BacktestRunOptions): Promise<Backtest
     ...(options.coreLoop === undefined ? {} : { coreLoop: options.coreLoop }),
     ...(options.venue === undefined ? {} : { venue: options.venue }),
   });
-  options.endOfRun?.();
+  // `FOLD-1`: the end of the run — the core's final accounting rebuild check,
+  // once, whether the replay completed or was refused part-way. The real
+  // core's check is total; a check that throws is this run's own failure.
+  let endOfRunThrew: string | undefined;
+  try {
+    endOfRun?.();
+  } catch (error) {
+    endOfRunThrew = error instanceof Error ? error.name : typeof error;
+  }
   if (!result.ok) return { ok: false, refusal: result.refusal };
+  if (endOfRunThrew !== undefined) {
+    return {
+      ok: false,
+      refusal: simulationRefusal(
+        "SIMULATION_INTERNAL",
+        `the core's end-of-run accounting rebuild check threw a ${endOfRunThrew}, so the run cannot be ` +
+          "reported as checked (FOLD-1)",
+      ),
+    };
+  }
 
   return { ok: true, runMode: BACKTEST_RUN_MODE, result: result.value };
 }

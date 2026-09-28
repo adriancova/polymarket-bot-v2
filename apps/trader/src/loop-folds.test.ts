@@ -16,7 +16,12 @@
  *   halt, counted, the held view replaced by the rebuild;
  * - a fold that fails is treated exactly as a failed posting;
  * - a refused PnL record stops that instance's snapshots at the SAME fill a
- *   from-zero fold would (today's behaviour), now COUNTED (ruling F3).
+ *   from-zero fold would (today's behaviour), now COUNTED (ruling F3);
+ * - round 1: EVERY due posted fill runs every enabled check — an UNOWNED
+ *   fill, and an owned fill whose ledger-store write fails, included
+ *   (`FOLD1-R1-2`); and a PnL check answers for the WHOLE record list, so a
+ *   stream a store failure left behind is caught up before it is compared,
+ *   never certified behind (`FOLD1-R1-1`).
  *
  * WHAT IS REAL: the `CoreLoop`, the strategy RUNTIME, the feature engine,
  * books, capital allocator, risk engine, execution planner, `SimulatedVenue`
@@ -71,7 +76,7 @@ import { HaltController } from "./halt.js";
 import { HealthState } from "./health.js";
 import { healthResponseBody } from "./health-server.js";
 import { InstanceRegistry } from "./instances.js";
-import { CoreLoop, DecisionOutboxBuffer } from "./loop.js";
+import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
 import { MarketState } from "./market-state.js";
 import type { IngestedEvent } from "./ports.js";
 import { REPOSITORY_MAXIMUM_RUN_MODE, TRADER_RUN_MODE } from "./safety.js";
@@ -79,9 +84,12 @@ import { ManualClock, MemoryTraderStore } from "./testing/index.js";
 
 type ApplyTransaction = typeof LedgerModule.applyTransaction;
 type BuildFillPosting = typeof LedgerModule.buildFillPosting;
+type FillsPage = ReturnType<TraderVenue["fillsSince"]>;
 
 const hooks = vi.hoisted(() => ({
   projectLedgerCalls: 0,
+  /** Rewrites the venue's fill pages on their way to the loop (`FOLD1-R1-2`: fills no order of the loop's owns). */
+  fillsPage: undefined as ((page: FillsPage) => FillsPage) | undefined,
   applyTransaction: undefined as
     | ((original: ApplyTransaction, ...args: Parameters<ApplyTransaction>) => ReturnType<ApplyTransaction>)
     | undefined,
@@ -116,6 +124,7 @@ const actual = await vi.importActual<typeof LedgerModule>("@polymarket-bot/ledge
 afterEach(() => {
   hooks.applyTransaction = undefined;
   hooks.buildFillPosting = undefined;
+  hooks.fillsPage = undefined;
 });
 
 const MARKET_ID = "018f5c20-1000-7a10-8b00-0000000000f1";
@@ -410,12 +419,28 @@ function assemble(accountingChecks: AccountingChecks | undefined): Harness {
     feeExpenseRef: config.accounting.feeExpenseRef,
   };
   const store = new MemoryTraderStore();
+  // The venue as the loop sees it: pass-through, except that a test may
+  // rewrite the fill pages (`hooks.fillsPage`). Every other member is the
+  // venue's own, bound to it (its state is in private fields).
+  const port = new Proxy(venue, {
+    get(target, property): unknown {
+      if (property === "fillsSince") {
+        return (sequence: number): FillsPage => {
+          const page = target.fillsSince(sequence);
+          const rewrite = hooks.fillsPage;
+          return rewrite === undefined ? page : rewrite(page);
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  });
   const loop = new CoreLoop({
     config,
     riskPolicy: policy.value,
     allocator: new AllocatorGate({ caps: caps.value, markets: allocationMarkets, tokenAssetIds }),
     clock,
-    venue,
+    venue: port,
     store,
     registry,
     markets,
@@ -752,6 +777,129 @@ describe("FOLD-1: a held state that diverges from its rebuild is CAUGHT — GLOB
     expect(health.halts[0]?.detail).toContain(`instance ${INSTANCE_ID}'s held PnL state differs from foldPnlRecords`);
     expect(health.halts[0]?.detail).toContain("The stream was replaced by the rebuild");
     expect(health.seams.folds).toMatchObject({ ledgerMismatches: 0, pnlMismatches: 1 });
+    expectPnlEqualsRebuild(harness.loop);
+  });
+});
+
+/** Corrupts the HELD PnL state in place — one lot's shares — through the container guard's documented bypass. */
+function corruptHeldPnl(loop: CoreLoop): void {
+  const state = loop.pnlState(INSTANCE_ID);
+  if (state === undefined) throw new Error("no held PnL state to corrupt");
+  const [lotKey, lot] = [...state.lots.entries()][0] ?? [];
+  if (lotKey === undefined || lot === undefined) throw new Error("no held lot to corrupt");
+  Map.prototype.set.call(state.lots, lotKey, { ...lot, shares: "1" });
+}
+
+/** Re-labels every fill as one of an order this process never placed: each is posted UNATTRIBUTED. */
+function unownEveryFill(page: FillsPage): FillsPage {
+  if (!page.ok) return page;
+  return {
+    ...page,
+    value: {
+      ...page.value,
+      fills: page.value.fills.map((fill) => ({ ...fill, simulatedOrderId: `fold1-unowned-${fill.simulatedOrderId}` })),
+    },
+  };
+}
+
+describe("FOLD1-R1-2: EVERY due posted fill runs every enabled check — unowned fills and the store-failure return included", () => {
+  it("UNOWNED fills run the PnL check too: a corrupted held PnL state is caught at the FIRST unowned fill, a GLOBAL halt", async () => {
+    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
+    await open(harness);
+    await tick(harness);
+    expect(harness.loop.health().seams.folds).toMatchObject({ fillsPosted: 10, ledgerChecks: 10, pnlChecks: 10 });
+    corruptHeldPnl(harness.loop);
+
+    // The next tick's ten fills name orders the loop does not own.
+    hooks.fillsPage = unownEveryFill;
+    await tick(harness);
+    const health = harness.loop.health();
+    expect(health.seams.orders.unownedFills).toBe(10);
+    expect(health.seams.folds).toMatchObject({
+      fillsPosted: 20,
+      ledgerChecks: 20,
+      // One stream, compared at EVERY due fill — the ten unowned ones too.
+      pnlChecks: 20,
+      pnlMismatches: 1,
+      ledgerMismatches: 0,
+    });
+    const global = health.halts.find((halt) => halt.scope.kind === "GLOBAL");
+    expect(global?.code).toBe("ACCOUNTING_REBUILD_MISMATCH");
+    expect(global?.action).toBe("FULL_HALT");
+    expect(global?.detail).toContain(`instance ${INSTANCE_ID}'s held PnL state differs from foldPnlRecords`);
+    expect(global?.detail).toContain("after posted fill 11");
+    // The unattributed-fill halt still latches exactly as before (TRDR-4).
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toContainEqual(["MARKET", "UNATTRIBUTED_ACTIVITY"]);
+    // Replaced by the rebuild, so the later checks matched.
+    expectPnlEqualsRebuild(harness.loop);
+    expectViewEqualsRebuild(harness.loop);
+  });
+
+  it("an owned fill whose ledger-store write FAILS still runs its due PnL check before that early return: caught AT that fill", async () => {
+    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
+    await open(harness);
+    await tick(harness);
+    corruptHeldPnl(harness.loop);
+    harness.store.failOnly(["appendLedgerTransaction"], "UNAVAILABLE", "FOLD1-R1-2 test: the ledger store refuses");
+    await tick(harness);
+    const health = harness.loop.health();
+    // The first fill of the tick was adopted and checked; then its store write failed and the harvest returned.
+    expect(health.seams.folds).toMatchObject({ fillsPosted: 11, ledgerChecks: 11, pnlChecks: 11, pnlMismatches: 1 });
+    // The check runs BEFORE the store write, so its halt latched first (a scope keeps its first record).
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "ACCOUNTING_REBUILD_MISMATCH"]]);
+    expect(health.halts[0]?.detail).toContain("after posted fill 11");
+    expectPnlEqualsRebuild(harness.loop);
+  });
+});
+
+describe("FOLD1-R1-1: a PnL check never certifies a held stream that is BEHIND its records", () => {
+  it("a ledger-store failure leaves the stream behind (as base's snapshot was); END_OF_RUN catches it up and compares the WHOLE list", async () => {
+    // The PnL check is on but never due on the cadence, so only END_OF_RUN runs it.
+    const harness = assemble({ everyFills: 1_000, pnl: true });
+    await open(harness);
+    await tick(harness);
+    expect(harness.store.pnlSnapshots).toHaveLength(10);
+    harness.store.failOnly(["appendLedgerTransaction"], "UNAVAILABLE", "FOLD1-R1-1 test: the ledger store refuses");
+    await tick(harness);
+    // Fill 11 was adopted and its two records joined the stream; its store write failed and the
+    // harvest returned before its snapshot, so nothing has folded them yet.
+    expect(harness.loop.pnlRecords(INSTANCE_ID)).toHaveLength(22);
+    expect(harness.loop.pnlState(INSTANCE_ID)?.recordCount).toBe(20);
+    expect(harness.store.pnlSnapshots).toHaveLength(10);
+
+    expect(harness.loop.checkAccountingRebuild("END_OF_RUN")).toEqual({ matched: true, pnlStreamsChecked: 1 });
+    // `matched` is said of the WHOLE stream: the held state now folds all 22 records.
+    expect(harness.loop.pnlState(INSTANCE_ID)?.recordCount).toBe(22);
+    expectPnlEqualsRebuild(harness.loop);
+    expect(harness.loop.health().seams.folds).toMatchObject({ pnlChecks: 1, pnlMismatches: 0 });
+    // The store failure is still the process's GLOBAL halt; the check added none.
+    expect(harness.loop.health().halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "STORE_UNAVAILABLE"]]);
+  });
+
+  it("the same failure on the every-fill cadence: the failing fill's own check caught the stream up, so it is never behind a check", async () => {
+    const harness = assemble(EVERY_FILL_ACCOUNTING_CHECKS);
+    await open(harness);
+    await tick(harness);
+    harness.store.failOnly(["appendLedgerTransaction"], "UNAVAILABLE", "FOLD1-R1-1 test: the ledger store refuses");
+    await tick(harness);
+    expect(harness.loop.pnlRecords(INSTANCE_ID)).toHaveLength(22);
+    expect(harness.loop.pnlState(INSTANCE_ID)?.recordCount).toBe(22);
+    expectPnlEqualsRebuild(harness.loop);
+    // …and no snapshot was written for it: the snapshot semantics are base's.
+    expect(harness.store.pnlSnapshots).toHaveLength(10);
+    expect(harness.loop.health().seams.folds).toMatchObject({ fillsPosted: 11, pnlChecks: 11, pnlMismatches: 0 });
+    expect(harness.loop.checkAccountingRebuild("END_OF_RUN")).toEqual({ matched: true, pnlStreamsChecked: 1 });
+  });
+
+  it("a corruption of a stream that is behind is still caught by END_OF_RUN, over the whole list", async () => {
+    const harness = assemble({ everyFills: 1_000, pnl: true });
+    await open(harness);
+    await tick(harness);
+    corruptHeldPnl(harness.loop);
+    harness.store.failOnly(["appendLedgerTransaction"], "UNAVAILABLE", "FOLD1-R1-1 test: the ledger store refuses");
+    await tick(harness);
+    expect(harness.loop.checkAccountingRebuild("END_OF_RUN")).toEqual({ matched: false, pnlStreamsChecked: 1 });
+    expect(harness.loop.health().seams.folds).toMatchObject({ pnlChecks: 1, pnlMismatches: 1 });
     expectPnlEqualsRebuild(harness.loop);
   });
 });

@@ -62,6 +62,7 @@ import {
   EVERY_FILL_ACCOUNTING_CHECKS,
   createPaperTrader,
   projectionOf,
+  type AccountingChecks,
   type DecisionTrace,
   type PaperTrader,
   type TraceLink,
@@ -244,7 +245,10 @@ function readString(value: unknown, fallback: string): string {
  * manifest's first recorded instant so `CoreLoop`'s constructor reads a
  * recorded value, and advanced from then on only by the shipped driver.
  */
-export function assembleSharedCore(fixture: Fixture): SharedCore {
+export function assembleSharedCore(
+  fixture: Fixture,
+  accountingChecks: AccountingChecks = EVERY_FILL_ACCOUNTING_CHECKS,
+): SharedCore {
   const clock = createReplayClock({
     receivedAt: fixture.manifest.eventRange.first.receivedAt,
     receivedMonotonicNs: "0",
@@ -334,10 +338,10 @@ export function assembleSharedCore(fixture: Fixture): SharedCore {
     idNamespace: ID_NAMESPACE,
     // `FOLD-1` (orchestrator call O1): the golden runs with the held ledger
     // view AND the held PnL streams checked against their rebuilds from zero
-    // after EVERY fill; a mismatch latches a GLOBAL halt, which the
-    // artefact's `halts=` line would show. A real backtest keeps the PAPER
-    // cadence; this is a test harness.
-    accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
+    // after EVERY fill (the default above); a mismatch latches a GLOBAL halt,
+    // which the artefact's `halts=` line would show. A real backtest keeps
+    // the PAPER cadence, which a caller may pass to pin exactly that.
+    accountingChecks,
   });
   if (!created.ok) {
     throw new Error(
@@ -366,6 +370,8 @@ export interface ReplayRun {
 export async function replayThroughShippedRoot(options: {
   readonly withCore: boolean;
   readonly datasetDirectory?: string;
+  /** `FOLD-1`: the core's check cadence; the every-fill test cadence when omitted. */
+  readonly accountingChecks?: AccountingChecks;
 }): Promise<ReplayRun> {
   const fixture = loadFixture();
   const datasetDirectory = options.datasetDirectory ?? FIXTURE_DIRECTORY;
@@ -378,17 +384,17 @@ export async function replayThroughShippedRoot(options: {
     });
     return { outcome, core: undefined, driver: undefined };
   }
-  const core = assembleSharedCore(fixture);
+  const core = assembleSharedCore(fixture, options.accountingChecks);
   const driver = replayDrivenCoreLoop({ loop: core.trader.loop, clock: core.clock });
   const outcome = await runBacktest({
     datasetDirectory,
     normalizer: normalizedEnvelopeNormalizer(sha256Hex),
     runPins: fixture.runPins,
     environment: paperEnvironment(),
+    // `FOLD-1` (`FOLD1-R1-3`): the driver bound the core's end-of-run rebuild
+    // check to this coreLoop; the shipped root runs it — nothing to pass.
     coreLoop: driver.coreLoop,
     venue: core.venue,
-    // `FOLD-1`: the end-of-run rebuild check, run by the shipped root.
-    endOfRun: driver.endOfRun,
   });
   return { outcome, core, driver: driver.observations() };
 }

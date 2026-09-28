@@ -364,9 +364,12 @@ export type LoopHealthSnapshot = HealthSnapshot & {
 
 /** What {@link CoreLoop.checkAccountingRebuild} answers. */
 export interface AccountingRebuildCheck {
-  /** `true` when the held ledger view — and every held PnL stream checked — equals its rebuild. */
+  /** `true` when the held ledger view — and every PnL stream checked — equals its rebuild. */
   readonly matched: boolean;
-  /** How many held PnL streams were compared (0 when the PnL check is off). */
+  /**
+   * How many instances' PnL streams were compared, each over its WHOLE record
+   * list (0 when the PnL check is off).
+   */
   readonly pnlStreamsChecked: number;
 }
 
@@ -773,9 +776,12 @@ export class CoreLoop {
 
   /**
    * `FOLD-1`: one instance's HELD PnL state — the fold of the records its
-   * snapshots were computed from (all of them, unless a refused record stops
+   * last snapshot or check folded (all of them, unless a refused record stops
    * the stream, when it is the state before that record) — or `undefined`
-   * before its first snapshot. Published for the harnesses that pin it.
+   * before its first snapshot or check. Between a fill whose store write
+   * failed and the next snapshot or check it can be behind `pnlRecords()`,
+   * as base's last snapshot was; a check catches it up before it compares.
+   * Published for the harnesses that pin it.
    */
   pnlState(instanceId: string): PnlState | undefined {
     return this.#held.pnlState(instanceId);
@@ -785,7 +791,8 @@ export class CoreLoop {
    * `FOLD-1` (user ruling F2): the rebuild check a run ends with — at
    * SHUTDOWN (`main.ts`, once the pump stops) and at the END OF A RUN (a
    * backtest's `runBacktest`, the test harnesses). Always checks the ledger
-   * view; also every held PnL stream when the loop's cadence has `pnl` on.
+   * view; also every instance's PnL stream, over its WHOLE record list, when
+   * the loop's cadence has `pnl` on.
    *
    * A mismatch is a GLOBAL `ACCOUNTING_REBUILD_MISMATCH` halt, exactly as on
    * the cadence; the answer says whether one was found. TOTAL: never throws.
@@ -2325,9 +2332,9 @@ export class CoreLoop {
         );
         continue;
       }
-      // The ledger and its view, adopted together; then the cadence's check.
+      // The ledger and its view, adopted together. The cadence's checks run
+      // below, once this fill's PnL records have joined the stream.
       const checkDue = this.#held.adopt(posted);
-      if (checkDue) this.#checkLedgerRebuild(this.#cadenceTrigger(), instant);
       this.#countBookedShares(fill);
       this.#options.health.countAccounting("ledgerTransactions", posted.appended.length);
       this.#options.health.countAccounting("pnlRecords", posted.pnlRecords.length);
@@ -2352,6 +2359,11 @@ export class CoreLoop {
       }
       this.#pnlRecords.set(instance.instanceId, stream);
 
+      // `FOLD-1` (`FOLD1-R1-2`): the cadence's checks — the ledger, and every
+      // PnL stream when `pnl` is on — at this due fill, BEFORE the store
+      // writes, so the early return a store failure takes cannot skip them.
+      if (checkDue) this.#runCadenceChecks(instant);
+
       for (const appended of posted.appended) {
         const written = await this.#options.store.appendLedgerTransaction(appended);
         if (!written.ok) {
@@ -2375,7 +2387,7 @@ export class CoreLoop {
       // ledger derived. A refusal here is not a halt — PnL is a projection, and
       // §6 invariant 8 makes the append-only ledger the monetary source of
       // truth — but a store failure IS, on §4.2's terms.
-      await this.#writePnlSnapshot(instance, fill, instant, checkDue);
+      await this.#writePnlSnapshot(instance, fill, instant);
 
       booked.push({ instance, fill });
     }
@@ -2495,7 +2507,11 @@ export class CoreLoop {
       );
       return "REFUSED";
     }
-    if (this.#held.adopt(posted)) this.#checkLedgerRebuild(this.#cadenceTrigger(), instant);
+    // `FOLD-1` (`FOLD1-R1-2`): an unowned fill is a posted fill like any
+    // other, so a due one runs EVERY check the cadence names — the PnL
+    // streams too, though this fill adds no PnL record — before the store
+    // writes and their early return.
+    if (this.#held.adopt(posted)) this.#runCadenceChecks(instant);
     this.#countBookedShares(fill);
     this.#options.health.countAccounting("ledgerTransactions", posted.appended.length);
     this.#options.health.countAccounting("pnlRecords", posted.pnlRecords.length);
@@ -2556,6 +2572,18 @@ export class CoreLoop {
     haltOnLedgerProjection(this.#options.halts, projection, instant, notes);
   }
 
+  /**
+   * `FOLD-1`: the checks a due posted fill runs — the held ledger view, and
+   * every PnL stream when the cadence has `pnl` on. ONE place, called from
+   * both posting sites (owned and unowned) before their store writes, so no
+   * path that adopts a due fill can leave a check out (`FOLD1-R1-2`).
+   */
+  #runCadenceChecks(instant: string): void {
+    const trigger = this.#cadenceTrigger();
+    this.#checkLedgerRebuild(trigger, instant);
+    if (this.#held.pnlCheck) this.#checkPnlRebuild(trigger, instant);
+  }
+
   /** `FOLD-1`: how a cadence check names itself in a halt detail. */
   #cadenceTrigger(): string {
     return `after posted fill ${String(this.#held.fillsPosted)} (the check runs every ${String(this.#held.everyFills)})`;
@@ -2585,17 +2613,30 @@ export class CoreLoop {
   }
 
   /**
-   * `FOLD-1`: every held PnL stream against `foldPnlRecords` over its records,
-   * on serialized bytes — only when the cadence has `pnl` on (the test and
-   * golden harnesses; user ruling F2 keeps it out of PAPER). A mismatch is
-   * counted and is the same GLOBAL halt; the stream is replaced by the rebuild.
+   * `FOLD-1`: every instance's PnL stream against `foldPnlRecords` over its
+   * WHOLE record list, on serialized bytes — only when the cadence has `pnl`
+   * on (the test and golden harnesses; user ruling F2 keeps it out of PAPER).
+   * Covers every instance with records, and any held stream, so a stream a
+   * failed store write left behind — or one no snapshot has opened yet — is
+   * checked too: the check catches it up first (`HeldAccounting.checkPnl`,
+   * `FOLD1-R1-1`). A mismatch is counted and is the same GLOBAL halt; the
+   * stream is replaced by the rebuild.
    */
   #checkPnlRebuild(trigger: string, instant: string): { readonly matched: boolean; readonly checked: number } {
     let matched = true;
     let checked = 0;
-    for (const instanceId of this.#held.pnlStreamIds()) {
+    const instanceIds = new Set<string>(this.#held.pnlStreamIds());
+    for (const [instanceId, records] of this.#pnlRecords) {
+      if (records.length > 0) instanceIds.add(instanceId);
+    }
+    for (const instanceId of [...instanceIds].sort()) {
       checked += 1;
-      const mismatch = this.#held.checkPnl(instanceId, this.#pnlRecords.get(instanceId) ?? []);
+      const instance = this.#options.registry.get(instanceId);
+      const mismatch = this.#held.checkPnl(
+        instanceId,
+        instance === undefined ? undefined : () => this.#pnlIdentity(instance),
+        this.#pnlRecords.get(instanceId) ?? [],
+      );
       if (mismatch === undefined) continue;
       matched = false;
       this.#options.halts.halt(
@@ -2722,6 +2763,18 @@ export class CoreLoop {
     );
   }
 
+  /** The §9.16 stream identity of one instance's VIRTUAL_STRATEGY PnL — the snapshot's, and a check's. */
+  #pnlIdentity(instance: RegisteredInstance): PnlStreamIdentity {
+    return {
+      scope: "VIRTUAL_STRATEGY",
+      environment: this.#options.config.environment,
+      accountRef: this.#options.posting.accountRef,
+      instanceId: instance.instanceId,
+      runId: instance.runId,
+      marketId: instance.marketId,
+    };
+  }
+
   /**
    * Folds this instance's §9.16 stream and writes the resulting snapshot.
    *
@@ -2738,30 +2791,21 @@ export class CoreLoop {
    * from-zero fold did: the held stream RETRIES FROM THE FAILURE POINT, so it
    * refuses on every later fill for as long as the from-zero fold would have
    * (user ruling F3 adds only the count, on `seams.folds.pnlRefusals`). The
-   * stream is opened here, on first use, so an identity `packages/pnl`
-   * refuses throws from exactly where it used to. When the cadence's check is
-   * due and `pnl` is on, every held stream is compared with its rebuild
-   * BEFORE the snapshot is computed, so a mismatch's replacement is what the
-   * snapshot reads.
+   * stream is opened here on first use (unless a check opened it earlier,
+   * which it can only do for an identity `packages/pnl` accepts), so an
+   * identity `packages/pnl` refuses throws from exactly where it used to. The
+   * cadence's checks no longer run here (`FOLD1-R1-2`): they run at the
+   * posting site, before the store writes, so a mismatch's replacement is
+   * still what the snapshot below reads.
    */
   async #writePnlSnapshot(
     instance: RegisteredInstance,
     fill: SimulatedFill,
     instant: string,
-    checkDue: boolean,
   ): Promise<void> {
     const records = this.#pnlRecords.get(instance.instanceId);
     if (records === undefined || records.length === 0) return;
-    const identity = (): PnlStreamIdentity => ({
-      scope: "VIRTUAL_STRATEGY",
-      environment: this.#options.config.environment,
-      accountRef: this.#options.posting.accountRef,
-      instanceId: instance.instanceId,
-      runId: instance.runId,
-      marketId: instance.marketId,
-    });
-    this.#held.advancePnl(instance.instanceId, identity, records);
-    if (checkDue && this.#held.pnlCheck) this.#checkPnlRebuild(this.#cadenceTrigger(), instant);
+    this.#held.advancePnl(instance.instanceId, () => this.#pnlIdentity(instance), records);
     const folded = this.#held.completePnlState(instance.instanceId);
     if (folded === undefined) return;
     const tokenAssetId =

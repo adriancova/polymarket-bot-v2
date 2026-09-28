@@ -19,10 +19,12 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createReplayClock, simulationOk, type ReplayClock } from "@polymarket-bot/simulation";
 import { writeParquetObject, type DatasetRow } from "@polymarket-bot/storage-parquet";
 import { describe, expect, it } from "vitest";
 
 import { readManifestBytes, resolveWithinRoot, sha256Hex } from "./archive.js";
+import { replayDrivenCoreLoop, type ReplayIngestedEvent } from "./core-loop.js";
 import { EXIT_REFUSED, EXIT_USAGE, main, normalizerFor, parseArguments } from "./main.js";
 import {
   RECORDED_FRAME_NORMALIZER_VERSION,
@@ -74,6 +76,39 @@ function datasetRows(): readonly DatasetRow[] {
     replayEligible: true,
     exclusionReason: null,
   }));
+}
+
+/**
+ * `FOLD-1`: a structural double of the core — it takes every event, drains,
+ * and records each end-of-run accounting check it is asked for.
+ */
+function coreDouble() {
+  const checks: string[] = [];
+  const events: ReplayIngestedEvent[] = [];
+  return {
+    checks,
+    get ingested(): number {
+      return events.length;
+    },
+    ingest(event: ReplayIngestedEvent): boolean {
+      events.push(event);
+      return true;
+    },
+    async drain(): Promise<void> {
+      await Promise.resolve();
+    },
+    checkAccountingRebuild(trigger: "END_OF_RUN"): { readonly matched: boolean } {
+      checks.push(trigger);
+      return { matched: true };
+    },
+  };
+}
+
+/** A replay clock positioned before the dataset's first recorded instant. */
+function replayClock(): ReplayClock {
+  const clock = createReplayClock({ receivedAt: "2026-06-29T17:15:57.000Z", receivedMonotonicNs: "0" });
+  if (!clock.ok) throw new Error(`the replay clock refused its start: ${clock.refusal.code}`);
+  return clock.value;
 }
 
 /** Writes a dataset directory: one real Parquet object plus its manifest. */
@@ -293,45 +328,83 @@ describe("the CLI, end to end over a real Parquet dataset", () => {
     expect(renderBacktestOutcome(outcome)).toContain("run_mode=BACKTEST");
   });
 
-  it("FOLD-1: calls endOfRun ONCE when the replay returns — completed or refused part-way — and never when the run did not start", async () => {
+  it("FOLD1-R1-3: handed ONLY the driver's coreLoop, runBacktest runs the core's end-of-run check ONCE — completed or refused part-way — and never when the run did not start", async () => {
     const directory = writeDataset();
-    let ended = 0;
-    const completed = await runBacktest({
-      datasetDirectory: directory,
-      normalizer: recordedFrameNormalizer(sha256Hex),
-      runPins: pins(),
-      environment: {},
-      endOfRun: () => {
-        ended += 1;
-      },
-    });
-    expect(completed.ok).toBe(true);
-    expect(ended).toBe(1);
+    const run = async (
+      core: ReturnType<typeof coreDouble>,
+      environment: Readonly<Record<string, string | undefined>> = {},
+    ) =>
+      await runBacktest({
+        datasetDirectory: directory,
+        normalizer: recordedFrameNormalizer(sha256Hex),
+        runPins: pins(),
+        environment,
+        // No finalizer is (or can be) passed: the driver bound it to this coreLoop.
+        coreLoop: replayDrivenCoreLoop({ loop: core, clock: replayClock() }).coreLoop,
+      });
+
+    const completed = coreDouble();
+    expect((await run(completed)).ok).toBe(true);
+    expect(completed.ingested).toBe(2);
+    expect(completed.checks).toEqual(["END_OF_RUN"]);
+
+    const unsafe = coreDouble();
+    expect((await run(unsafe, { POLYMARKET_PRIVATE_KEY: "x" })).ok).toBe(false);
+    expect(unsafe.checks).toEqual([]);
 
     writeFileSync(join(directory, OBJECT_KEY), Buffer.from("not a parquet file", "utf8"));
-    const refused = await runBacktest({
+    const refused = coreDouble();
+    expect((await run(refused)).ok).toBe(false);
+    expect(refused.checks).toEqual(["END_OF_RUN"]);
+  });
+
+  it("FOLD1-R1-3: a coreLoop the driver did not build is REFUSED before anything is read, since the run could not promise the end-of-run check", async () => {
+    const directory = writeDataset();
+    let calls = 0;
+    const outcome = await runBacktest({
       datasetDirectory: directory,
       normalizer: recordedFrameNormalizer(sha256Hex),
       runPins: pins(),
       environment: {},
-      endOfRun: () => {
-        ended += 1;
+      coreLoop: () => {
+        calls += 1;
+        return simulationOk(null);
       },
     });
-    expect(refused.ok).toBe(false);
-    expect(ended).toBe(2);
-
-    const unsafe = await runBacktest({
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok || !("refusal" in outcome)) return;
+    expect(outcome.refusal.code).toBe("SIMULATION_INPUT_INVALID");
+    expect(outcome.refusal.message).toContain("replayDrivenCoreLoop");
+    expect(calls).toBe(0);
+    // Dataset-only verification — no coreLoop — is unchanged.
+    const verified = await runBacktest({
       datasetDirectory: directory,
       normalizer: recordedFrameNormalizer(sha256Hex),
       runPins: pins(),
-      environment: { POLYMARKET_PRIVATE_KEY: "x" },
-      endOfRun: () => {
-        ended += 1;
-      },
+      environment: {},
     });
-    expect(unsafe.ok).toBe(false);
-    expect(ended).toBe(2);
+    expect(verified.ok).toBe(true);
+  });
+
+  it("FOLD1-R1-3: an end-of-run check that THROWS makes the run a SIMULATION_INTERNAL refusal, never a run reported as checked", async () => {
+    const directory = writeDataset();
+    const core = {
+      ...coreDouble(),
+      checkAccountingRebuild(): never {
+        throw new RangeError("FOLD1-R1-3 test: the check fails");
+      },
+    };
+    const outcome = await runBacktest({
+      datasetDirectory: directory,
+      normalizer: recordedFrameNormalizer(sha256Hex),
+      runPins: pins(),
+      environment: {},
+      coreLoop: replayDrivenCoreLoop({ loop: core, clock: replayClock() }).coreLoop,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok || !("refusal" in outcome)) return;
+    expect(outcome.refusal.code).toBe("SIMULATION_INTERNAL");
+    expect(outcome.refusal.message).toContain("threw a RangeError");
   });
 
   it("is byte-identical across two runs of the same dataset and pins", async () => {

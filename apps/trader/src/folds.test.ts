@@ -225,7 +225,7 @@ describe("the PnL stream: RETRY FROM THE FAILURE POINT equals the from-zero fold
       if (state !== undefined && fromZero.ok) {
         expect(serializePnlState(state)).toBe(serializePnlState(fromZero.value));
       }
-      expect(held.checkPnl(INSTANCE_ID, stream)).toBeUndefined();
+      expect(held.checkPnl(INSTANCE_ID, identity, stream)).toBeUndefined();
     }
     // The model: a snapshot after fills 1 and 2 only, then never again.
     expect(fromZeroAnswers).toEqual([true, true, false, false, false]);
@@ -267,7 +267,7 @@ describe("the PnL stream: RETRY FROM THE FAILURE POINT equals the from-zero fold
     expect(fromZero.ok).toBe(true);
     if (state === undefined || !fromZero.ok) return;
     expect(serializePnlState(state)).toBe(serializePnlState(fromZero.value));
-    expect(held.checkPnl(INSTANCE_ID, stream)).toBeUndefined();
+    expect(held.checkPnl(INSTANCE_ID, identity, stream)).toBeUndefined();
     expect(held.health().pnlRefusals).toEqual({ [INSTANCE_ID]: { PNL_INPUT_INVALID: 1 } });
   });
 
@@ -282,5 +282,79 @@ describe("the PnL stream: RETRY FROM THE FAILURE POINT equals the from-zero fold
     expect(() => held.advancePnl(INSTANCE_ID, refused, stream)).toThrow();
     expect(() => held.advancePnl(INSTANCE_ID, refused, stream)).toThrow();
     expect(held.pnlStreamIds()).toEqual([]);
+  });
+});
+
+describe("FOLD1-R1-1: a PnL check answers for the WHOLE record list, never a prefix", () => {
+  it("a stream left behind (records adopted, no snapshot since) is CAUGHT UP by the check and compared whole: the held state then folds every record", () => {
+    const held = new HeldAccounting(Ledger.empty("PAPER"), EVERY_FILL_ACCOUNTING_CHECKS);
+    const ids = new DeterministicIdFactory("fold-1-unit-behind");
+    const stream: PnlRecord[] = [];
+    stream.push(...post(held, ids, [fill(ids, "BUY", "10", "0.3")]));
+    expect(held.advancePnl(INSTANCE_ID, identity, stream)).toBeDefined();
+    // The next fill's records join the list, but its snapshot never runs (a
+    // failed store write returns first): the held stream is behind.
+    stream.push(...post(held, ids, [fill(ids, "SELL", "5", "0.35")]));
+    expect(held.pnlState(INSTANCE_ID)?.recordCount).toBe(2);
+    expect(stream).toHaveLength(4);
+
+    expect(held.checkPnl(INSTANCE_ID, identity, stream)).toBeUndefined();
+    // Caught up, not certified behind: the held state is the fold of ALL four.
+    const fromZero = foldPnlRecords(identity(), stream);
+    expect(fromZero.ok).toBe(true);
+    const state = held.pnlState(INSTANCE_ID);
+    if (state === undefined || !fromZero.ok) throw new Error("no state");
+    expect(state.recordCount).toBe(4);
+    expect(serializePnlState(state)).toBe(serializePnlState(fromZero.value));
+    expect(held.completePnlState(INSTANCE_ID)).toBe(state);
+    // The next snapshot's advance has nothing left to fold, and answers the same state.
+    expect(held.advancePnl(INSTANCE_ID, identity, stream)).toBe(state);
+    expect(held.health()).toMatchObject({ pnlChecks: 1, pnlMismatches: 0, pnlRefusals: {} });
+  });
+
+  it("a stream no snapshot has opened yet is opened by the check, from the identity, and compared whole", () => {
+    const held = new HeldAccounting(Ledger.empty("PAPER"), EVERY_FILL_ACCOUNTING_CHECKS);
+    const ids = new DeterministicIdFactory("fold-1-unit-unopened");
+    const stream = post(held, ids, [fill(ids, "BUY", "10", "0.3"), fill(ids, "SELL", "5", "0.35")]);
+    expect(held.pnlStreamIds()).toEqual([]);
+    expect(held.checkPnl(INSTANCE_ID, identity, stream)).toBeUndefined();
+    expect(held.pnlStreamIds()).toEqual([INSTANCE_ID]);
+    expect(held.pnlState(INSTANCE_ID)?.recordCount).toBe(4);
+  });
+
+  it("a refusal first met by a check's catch-up is counted ONCE, and the snapshot's retry does not count it again", () => {
+    const held = new HeldAccounting(Ledger.empty("PAPER"), EVERY_FILL_ACCOUNTING_CHECKS);
+    const ids = new DeterministicIdFactory("fold-1-unit-check-refusal");
+    // Sells 10 of the 5 held: `packages/pnl` refuses PNL_OVERSELL.
+    const stream = post(held, ids, [fill(ids, "BUY", "5", "0.3"), fill(ids, "SELL", "10", "0.35")]);
+    expect(held.checkPnl(INSTANCE_ID, identity, stream)).toBeUndefined();
+    expect(held.advancePnl(INSTANCE_ID, identity, stream)).toBeUndefined();
+    expect(held.checkPnl(INSTANCE_ID, identity, stream)).toBeUndefined();
+    expect(held.health()).toMatchObject({
+      pnlChecks: 2,
+      pnlMismatches: 0,
+      pnlRefusals: { [INSTANCE_ID]: { PNL_OVERSELL: 1 } },
+    });
+  });
+
+  it("an identity packages/pnl refuses: the check agrees with the rebuild (neither can open it), stores no stream, and the snapshot still throws", () => {
+    const held = new HeldAccounting(Ledger.empty("PAPER"), EVERY_FILL_ACCOUNTING_CHECKS);
+    const ids = new DeterministicIdFactory("fold-1-unit-check-identity");
+    const stream = post(held, ids, [fill(ids, "BUY", "5", "0.3")]);
+    const refused = (): PnlStreamIdentity => ({ ...identity(), runId: "0d8b6a0e-1111-4abc-8def-0123456789ab" });
+    expect(held.checkPnl(INSTANCE_ID, refused, stream)).toBeUndefined();
+    expect(held.pnlStreamIds()).toEqual([]);
+    expect(() => held.advancePnl(INSTANCE_ID, refused, stream)).toThrow();
+    expect(held.health()).toMatchObject({ pnlChecks: 1, pnlMismatches: 0 });
+  });
+
+  it("records with no stream and no identity to open one from are NOT checkable: a counted mismatch, never a silent pass", () => {
+    const held = new HeldAccounting(Ledger.empty("PAPER"), EVERY_FILL_ACCOUNTING_CHECKS);
+    const ids = new DeterministicIdFactory("fold-1-unit-no-identity");
+    const stream = post(held, ids, [fill(ids, "BUY", "5", "0.3")]);
+    const mismatch = held.checkPnl(INSTANCE_ID, undefined, stream);
+    expect(mismatch?.detail).toContain("no registered identity");
+    expect(mismatch?.replaced).toBe(false);
+    expect(held.health()).toMatchObject({ pnlChecks: 1, pnlMismatches: 1 });
   });
 });

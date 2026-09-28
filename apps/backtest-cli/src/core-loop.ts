@@ -99,11 +99,16 @@ export interface ReplayDrivenLoop {
   drain(): Promise<void>;
   /**
    * `FOLD-1` — the core's END-OF-RUN accounting rebuild check (`apps/trader`'s
-   * `CoreLoop.checkAccountingRebuild`: its held ledger view against a rebuild
-   * from zero; a mismatch latches the core's own GLOBAL halt). Optional so a
-   * structural double without one still drives; the real core has it.
+   * `CoreLoop.checkAccountingRebuild`: its held ledger view, and its PnL
+   * streams when that core checks them, against a rebuild from zero; a
+   * mismatch latches the core's own GLOBAL halt).
+   *
+   * REQUIRED (`FOLD1-R1-3`): a core this driver drives keeps accounting, and
+   * every run of it ends with this check — {@link replayDrivenCoreLoop} binds
+   * it to the `coreLoop` it builds, and `runBacktest` runs it, so no caller
+   * can leave it out. A structural double supplies one too.
    */
-  checkAccountingRebuild?(trigger: "END_OF_RUN"): unknown;
+  checkAccountingRebuild(trigger: "END_OF_RUN"): unknown;
 }
 
 /** Inputs to {@link replayDrivenCoreLoop}. */
@@ -129,10 +134,27 @@ export interface ReplayDrivenCoreLoop {
   observations(): ReplayDriverObservations;
   /**
    * `FOLD-1` — the END OF THE RUN: runs the core's end-of-run accounting
-   * rebuild check, when the core has one. Hand it to `runBacktest` as
-   * `endOfRun`, which calls it once the replay returns.
+   * rebuild check. BOUND to {@link coreLoop} (`FOLD1-R1-3`): `runBacktest`,
+   * handed that `coreLoop`, calls it once the replay returns — the caller
+   * wires nothing. Published for a caller that drives `runReplay` itself.
    */
   endOfRun(): void;
+}
+
+/**
+ * `FOLD1-R1-3`: each driver's end-of-run check, keyed by the `coreLoop` it
+ * built. A WeakMap, so the binding cannot be forged by a hand-built hook and
+ * keeps nothing alive; {@link endOfRunBoundTo} is how `runBacktest` finds it.
+ */
+const END_OF_RUN_BY_CORE_LOOP = new WeakMap<ReplayCoreLoop, () => void>();
+
+/**
+ * The end-of-run check bound to a `coreLoop` {@link replayDrivenCoreLoop}
+ * built, or `undefined` for any other hook — which `runBacktest` refuses to
+ * drive, because it cannot know whether that core keeps accounting.
+ */
+export function endOfRunBoundTo(coreLoop: ReplayCoreLoop): (() => void) | undefined {
+  return END_OF_RUN_BY_CORE_LOOP.get(coreLoop);
 }
 
 /**
@@ -149,6 +171,16 @@ export interface ReplayDrivenCoreLoop {
  * event exists.
  */
 export function replayDrivenCoreLoop(options: ReplayDrivenCoreLoopOptions): ReplayDrivenCoreLoop {
+  // `FOLD1-R1-3`: the type requires the check; a caller outside the type
+  // system (or a cast) is refused here, before anything is driven, rather
+  // than found out at the end of a run whose final check silently did not run.
+  const loop: Partial<ReplayDrivenLoop> = options.loop;
+  if (typeof loop.checkAccountingRebuild !== "function") {
+    throw new TypeError(
+      "replayDrivenCoreLoop: the core has no checkAccountingRebuild, so its run could not end with the " +
+        "accounting rebuild check every run of a core ends with (FOLD-1); hand in the real CoreLoop",
+    );
+  }
   let eventsIngested = 0;
   let drains = 0;
 
@@ -186,11 +218,14 @@ export function replayDrivenCoreLoop(options: ReplayDrivenCoreLoopOptions): Repl
     return simulationOk(null);
   };
 
+  const endOfRun = (): void => {
+    options.loop.checkAccountingRebuild("END_OF_RUN");
+  };
+  END_OF_RUN_BY_CORE_LOOP.set(coreLoop, endOfRun);
+
   return {
     coreLoop,
     observations: () => Object.freeze({ eventsIngested, drains }),
-    endOfRun: () => {
-      options.loop.checkAccountingRebuild?.("END_OF_RUN");
-    },
+    endOfRun,
   };
 }
