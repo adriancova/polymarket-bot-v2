@@ -10,6 +10,13 @@
  * `createConfig`, `createInstance`, `startRun` — never through
  * `createTradingChain` (see that file's header for why), and the identities
  * THEY mint are what the configuration document names.
+ *
+ * `BRACKET-1c` (`durable-two-brackets-postgres-redis.test.ts`) added ONE
+ * optional input, `params`: the strategy document the registered
+ * `strategy.configs` row records. Absent — every earlier caller — it is the
+ * fixture's `strategyParams()`, exactly as before; the two-bracket file passes
+ * the params its run actually uses (`maximum_entries_per_market` 2), so the
+ * registered config row and the configuration the trader runs agree.
  */
 
 import type { DecimalSafeJsonValue } from "@polymarket-bot/storage-postgres";
@@ -104,7 +111,11 @@ function decimalSafeDocument(value: Record<string, unknown>): {
 export async function registerThroughTheRepositories(
   context: TestContext,
   label: string,
-  options: { readonly accountRef?: string } = {},
+  options: {
+    readonly accountRef?: string;
+    /** The §13.2 document the config row records; the fixture's own when absent. */
+    readonly params?: Record<string, unknown>;
+  } = {},
 ): Promise<Registered> {
   const { catalog, strategy } = context.repositories;
 
@@ -139,7 +150,7 @@ export async function registerThroughTheRepositories(
     decisionContractVersion: 1,
   });
 
-  const parameters = decimalSafeDocument(strategyParams());
+  const parameters = decimalSafeDocument(options.params ?? strategyParams());
   const { configId } = await strategy.createConfig({
     definitionId,
     parameters,
