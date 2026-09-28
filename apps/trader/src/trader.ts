@@ -53,6 +53,7 @@ import {
 import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
 import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
 import { configuredFeatureKeys, parseTraderConfig, type TraderConfig } from "./config.js";
+import { accountingChecksProblem, type AccountingChecks } from "./folds.js";
 import { HaltController } from "./halt.js";
 import { HealthState } from "./health.js";
 import { InstanceRegistry } from "./instances.js";
@@ -92,6 +93,14 @@ export interface CreateTraderOptions {
    * one only to exercise eviction.
    */
   readonly retention?: RetentionBounds;
+  /**
+   * `FOLD-1` — the core loop's rebuild-check cadence (`folds.ts`). Omitted:
+   * the PAPER cadence (the ledger every 50 posted fills, plus the shutdown
+   * check `main.ts` runs; no PnL check — user ruling F2). The test and golden
+   * harnesses pass `EVERY_FILL_ACCOUNTING_CHECKS` IN CODE (orchestrator call
+   * O1); it is not part of the configuration document.
+   */
+  readonly accountingChecks?: AccountingChecks;
 }
 
 export interface TraderRefusal {
@@ -260,6 +269,20 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
       [retentionProblem],
     );
   }
+  // `FOLD-1`: the same rule for the rebuild-check cadence — a programmatic
+  // option the loop's constructor would throw on, refused here by name.
+  const checksProblem =
+    options.accountingChecks === undefined
+      ? undefined
+      : accountingChecksProblem(options.accountingChecks);
+  if (checksProblem !== undefined) {
+    return refuse(
+      "TRADER_CONFIG_REFUSED",
+      "the core loop's accounting rebuild-check cadence was refused; §6 invariant 8's check " +
+        "needs a cadence it can keep",
+      [checksProblem],
+    );
+  }
 
   // --- 5. the outbox, the ledger, and the counters -------------------------
   const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
@@ -383,6 +406,9 @@ export function createPaperTrader(options: CreateTraderOptions): CreateTraderRes
     tokenAssetIds,
     outbox,
     ...(options.retention === undefined ? {} : { retention: options.retention }),
+    ...(options.accountingChecks === undefined
+      ? {}
+      : { accountingChecks: options.accountingChecks }),
   });
 
   void staticBracketParamsSchema;

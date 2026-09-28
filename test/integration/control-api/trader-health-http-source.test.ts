@@ -85,6 +85,19 @@ function realSnapshot(): { readonly state: HealthState; readonly snapshot: () =>
           traces: { retained: 0, maximumRetained: 50_000, evicted: 0 },
           provenance: { retained: 0, maximumRetained: 50_000, evicted: 0 },
         },
+        // `FOLD-1`: the seam `CoreLoop.health()` also always publishes — the
+        // loop's held accounting state and its rebuild checks.
+        folds: {
+          checkEveryFills: 50,
+          pnlCheck: false,
+          fillsPosted: 0,
+          ledgerChecks: 0,
+          pnlChecks: 0,
+          fillsAtLastCheck: null,
+          ledgerMismatches: 0,
+          pnlMismatches: 0,
+          pnlRefusals: {},
+        },
       },
     });
   return { state, snapshot };

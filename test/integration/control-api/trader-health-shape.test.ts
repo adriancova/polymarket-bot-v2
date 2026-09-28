@@ -36,6 +36,7 @@ import {
   RISK_SEAM_CAVEAT,
   RealizedPnlBook,
   RetentionLog,
+  type FoldHealth,
   type HealthSnapshot,
   type OrderLifecycleMetrics,
   type RetentionHealth,
@@ -53,7 +54,11 @@ import {
  * so a rename in `apps/trader/src/order-lifecycle.ts` fails here too. One log
  * is driven past its bound so `evicted` is a measured non-zero.
  */
-function loopSeams(): { readonly orders: OrderLifecycleMetrics; readonly retention: RetentionHealth } {
+function loopSeams(): {
+  readonly orders: OrderLifecycleMetrics;
+  readonly retention: RetentionHealth;
+  readonly folds: FoldHealth;
+} {
   const tombstones = new OrderTombstones({ maximumRemembered: 2 });
   tombstones.remember("order-1", "sb-1");
   tombstones.remember("order-2", "sb-1");
@@ -77,6 +82,20 @@ function loopSeams(): { readonly orders: OrderLifecycleMetrics; readonly retenti
       decisions: decisions.metrics(),
       traces: traces.metrics(),
       provenance: provenance.metrics(),
+    },
+    // `FOLD-1`: the loop's held accounting state, typed as the trader's own
+    // `FoldHealth` so a rename in `apps/trader/src/folds.ts` fails this
+    // suite's typecheck. A test cadence with one refused PnL record (F3).
+    folds: {
+      checkEveryFills: 1,
+      pnlCheck: true,
+      fillsPosted: 4,
+      ledgerChecks: 4,
+      pnlChecks: 3,
+      fillsAtLastCheck: 4,
+      ledgerMismatches: 0,
+      pnlMismatches: 0,
+      pnlRefusals: { "sb-1": { PNL_OVERSELL: 1 } },
     },
   };
 }
@@ -233,16 +252,30 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
       traces: { retained: 1, maximumRetained: 50_000, evicted: 0 },
       provenance: { retained: 1, maximumRetained: 50_000, evicted: 0 },
     });
+    // `FOLD-1`: the held accounting state, through the door, as published.
+    expect(seams["folds"]).toEqual({
+      checkEveryFills: 1,
+      pnlCheck: true,
+      fillsPosted: 4,
+      ledgerChecks: 4,
+      pnlChecks: 3,
+      fillsAtLastCheck: 4,
+      ledgerMismatches: 0,
+      pnlMismatches: 0,
+      pnlRefusals: { "sb-1": { PNL_OVERSELL: 1 } },
+    });
   });
 
   it("the door REFUSES a snapshot whose producer supplied no TRDR-4 seams — absent is never read as zero", () => {
-    // `HealthState.snapshot` carries `orders` / `retention` only when its caller
-    // measured them (`CoreLoop.health()` always does). A holder of no loop that
-    // omits them produces a document the door must refuse, not default.
+    // `HealthState.snapshot` carries `orders` / `retention` (and, since
+    // `FOLD-1`, `folds`) only when its caller measured them
+    // (`CoreLoop.health()` always does). A holder of no loop that omits them
+    // produces a document the door must refuse, not default.
     const state = new HealthState({ runMode: "PAPER", maximumRunMode: "PAPER" });
-    const { orders: _orders, retention: _retention, ...fiveSeams } = realSnapshot().seams;
+    const { orders: _orders, retention: _retention, folds: _folds, ...fiveSeams } = realSnapshot().seams;
     void _orders;
     void _retention;
+    void _folds;
     const without = state.snapshot({ asOf: "2026-09-26T00:00:00Z", halts: [], queues: [], seams: fiveSeams });
     expect(Object.keys(without.seams)).toEqual(["fills", "reservations", "cancels", "orderViews", "allocator"]);
     const result = readTraderHealthReport(overTheWire(without));
@@ -251,6 +284,19 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
     const issues = result.refusal.issues.join(" ");
     expect(issues).toContain("orders");
     expect(issues).toContain("retention");
+    expect(issues).toContain("folds");
+  });
+
+  it("the door REFUSES a snapshot whose producer supplied the TRDR-4 seams but not the FOLD-1 seam", () => {
+    const state = new HealthState({ runMode: "PAPER", maximumRunMode: "PAPER" });
+    const { folds: _folds, ...sevenSeams } = realSnapshot().seams;
+    void _folds;
+    const without = state.snapshot({ asOf: "2026-09-27T00:00:00Z", halts: [], queues: [], seams: sevenSeams });
+    expect(Object.keys(without.seams)).not.toContain("folds");
+    const result = readTraderHealthReport(overTheWire(without));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.refusal.issues.join(" ")).toContain("folds");
   });
 
   it("accepts the 'no snapshot observed' form — account null, no instances — that a fresh trader serves", () => {

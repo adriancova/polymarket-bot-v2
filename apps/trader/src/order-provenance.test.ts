@@ -40,6 +40,7 @@ import {
 } from "@polymarket-bot/simulation";
 import { describe, expect, it } from "vitest";
 
+import { EVERY_FILL_ACCOUNTING_CHECKS } from "./folds.js";
 import { createExecutionPolicy, type VenueWiring } from "./main.js";
 import type { IngestedEvent } from "./ports.js";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";
@@ -392,6 +393,8 @@ function assemble(): Assembled {
     venue,
     store: new MemoryTraderStore(),
     idNamespace: "recon-2-order-provenance",
+    // `FOLD-1` (orchestrator call O1): checked against the rebuilds after EVERY fill.
+    accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
   });
   if (!result.ok) {
     throw new Error(`${result.refusal.code}: ${result.refusal.detail}`);

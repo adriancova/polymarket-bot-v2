@@ -95,7 +95,7 @@ describe("no counter is defaulted", () => {
     expect(readTraderHealthReport(mutate([section, field], undefined)).ok).toBe(false);
   });
 
-  it.each(["fills", "reservations", "cancels", "orderViews", "allocator", "orders", "retention"])(
+  it.each(["fills", "reservations", "cancels", "orderViews", "allocator", "orders", "retention", "folds"])(
     "REFUSES a report missing the %s seam section",
     (seam) => {
       expect(readTraderHealthReport(mutate(["seams", seam], undefined)).ok).toBe(false);
@@ -198,6 +198,73 @@ describe("the TRDR-4 seams — the trader loop's per-order state and audit-log r
     expect(
       readTraderHealthReport(mutate(["seams", "retention", "traces", "evicted"], 0.5)).ok,
     ).toBe(false);
+  });
+});
+
+describe("the FOLD-1 seam — the trader loop's held accounting state and its rebuild checks", () => {
+  it("is read through the door, every field as published, a null last-check fill count included", () => {
+    const result = readTraderHealthReport(healthDocument());
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const seams = result.value.seams as unknown as Record<string, unknown>;
+    expect(seams["folds"]).toEqual({
+      checkEveryFills: 50,
+      pnlCheck: false,
+      fillsPosted: 3,
+      ledgerChecks: 0,
+      pnlChecks: 0,
+      fillsAtLastCheck: null,
+      ledgerMismatches: 0,
+      pnlMismatches: 0,
+      pnlRefusals: {},
+    });
+  });
+
+  it("carries the F3 refusal counts per instance and code, and a measured last-check fill count", () => {
+    const result = readTraderHealthReport(
+      mutate(["seams", "folds"], {
+        checkEveryFills: 1,
+        pnlCheck: true,
+        fillsPosted: 7,
+        ledgerChecks: 7,
+        pnlChecks: 6,
+        fillsAtLastCheck: 7,
+        ledgerMismatches: 0,
+        pnlMismatches: 1,
+        pnlRefusals: { "sb-1": { PNL_OVERSELL: 1 } },
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const folds = (result.value.seams as unknown as Record<string, Record<string, unknown>>)["folds"];
+    expect(folds?.["pnlRefusals"]).toEqual({ "sb-1": { PNL_OVERSELL: 1 } });
+    expect(folds?.["fillsAtLastCheck"]).toBe(7);
+  });
+
+  it.each([
+    "checkEveryFills",
+    "pnlCheck",
+    "fillsPosted",
+    "ledgerChecks",
+    "pnlChecks",
+    "fillsAtLastCheck",
+    "ledgerMismatches",
+    "pnlMismatches",
+    "pnlRefusals",
+  ])("REFUSES a report missing seams.folds.%s rather than reading it as 0", (field) => {
+    expect(readTraderHealthReport(mutate(["seams", "folds", field], undefined)).ok).toBe(false);
+  });
+
+  it("REFUSES an unknown key, a zero cadence, a negative or fractional counter, and a non-counter refusal count", () => {
+    expect(readTraderHealthReport(mutate(["seams", "folds", "unexpected"], 1)).ok).toBe(false);
+    expect(readTraderHealthReport(mutate(["seams", "folds", "checkEveryFills"], 0)).ok).toBe(false);
+    expect(readTraderHealthReport(mutate(["seams", "folds", "ledgerMismatches"], -1)).ok).toBe(false);
+    expect(readTraderHealthReport(mutate(["seams", "folds", "fillsAtLastCheck"], 0.5)).ok).toBe(false);
+    expect(readTraderHealthReport(mutate(["seams", "folds", "pnlCheck"], "false")).ok).toBe(false);
+    expect(
+      readTraderHealthReport(mutate(["seams", "folds", "pnlRefusals"], { "sb-1": { PNL_OVERSELL: -1 } })).ok,
+    ).toBe(false);
+    expect(readTraderHealthReport(mutate(["seams", "folds", "pnlRefusals"], { "sb-1": 1 })).ok).toBe(false);
   });
 });
 

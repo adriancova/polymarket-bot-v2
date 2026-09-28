@@ -201,6 +201,18 @@ export {
 } from "./order-lifecycle.js";
 
 export {
+  EVERY_FILL_ACCOUNTING_CHECKS,
+  HeldAccounting,
+  PAPER_ACCOUNTING_CHECKS,
+  accountingChecksProblem,
+  type AccountingChecks,
+  type FailedPosting,
+  type FoldHealth,
+  type FoldedPosting,
+  type RebuildMismatch,
+} from "./folds.js";
+
+export {
   CancelLedger,
   type CancelLedgerMetrics,
   type CancelResolution,
@@ -259,6 +271,7 @@ export {
 export {
   CoreLoop,
   DecisionOutboxBuffer,
+  type AccountingRebuildCheck,
   type CoreLoopOptions,
   type DecisionTrace,
   type LoopHealthSnapshot,

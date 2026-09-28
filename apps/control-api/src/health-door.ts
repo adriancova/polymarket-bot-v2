@@ -23,9 +23,10 @@
  * refusal counts and `riskSeamCaveat` (`docs/handoffs/WP-230.md` follow-up 4) —
  * plus, since `TRDR-4`, the two seams the trader's core loop always publishes:
  * `seams.orders` (its per-order state) and `seams.retention` (its three audit
- * logs' bounded retention). Both are REQUIRED here like every other counter;
- * the trader's own type carries them as optional only for holders of no loop,
- * and a document without them is refused, not defaulted.
+ * logs' bounded retention), and since `FOLD-1` a third, `seams.folds` (its
+ * held accounting state and rebuild checks). All three are REQUIRED here like
+ * every other counter; the trader's own type carries them as optional only for
+ * holders of no loop, and a document without them is refused, not defaulted.
  * `test/integration/control-api/trader-health-shape.test.ts` builds a snapshot
  * with the REAL `HealthState` class and drives it through this door, so a
  * rename in the trader fails a suite rather than emptying a dashboard.
@@ -113,14 +114,39 @@ const RetentionSeam = z.strictObject({
 });
 
 /**
+ * `FOLD-1`: the trader loop's HELD accounting state (`apps/trader`'s
+ * `folds.ts`, `FoldHealth`) — the rebuild-check cadence, how many ledger and
+ * PnL checks ran, the posted-fill count at the last check (`null` before the
+ * first: an absent measurement, never a zero), the mismatches (each a GLOBAL
+ * `ACCOUNTING_REBUILD_MISMATCH` halt in the same document), and the refused
+ * PnL records per instance and refusal code (user ruling F3). Every field is
+ * REQUIRED, like every other counter here. Bounded: instance ids and codes as
+ * the other keyed counters are (256 / 128 characters).
+ */
+const FoldsSeam = z.strictObject({
+  checkEveryFills: z.number().int().min(1),
+  pnlCheck: z.boolean(),
+  fillsPosted: Counter,
+  ledgerChecks: Counter,
+  pnlChecks: Counter,
+  fillsAtLastCheck: z.union([Counter, z.literal(null)]),
+  ledgerMismatches: Counter,
+  pnlMismatches: Counter,
+  pnlRefusals: z.record(z.string().min(1).max(256), z.record(z.string().min(1).max(128), Counter)),
+});
+
+/**
  * A complete trader health DOCUMENT as this door reads it: the observability
- * package's `TraderHealthReportInput` plus the two `TRDR-4` seams, which that
- * package does not (yet) read — it is unchanged by `TRDR-4`, additions only.
+ * package's `TraderHealthReportInput` plus the two `TRDR-4` seams and the
+ * `FOLD-1` seam, which that package does not (yet) read — it is unchanged by
+ * `TRDR-4` and `FOLD-1`, additions only.
  */
 export type TraderHealthDocument = TraderHealthReportInput & {
   readonly seams: TraderHealthReportInput["seams"] & {
     readonly orders: z.output<typeof OrderLifecycleSeam>;
     readonly retention: z.output<typeof RetentionSeam>;
+    /** `FOLD-1`: the loop's held accounting state. */
+    readonly folds: z.output<typeof FoldsSeam>;
   };
 };
 
@@ -220,6 +246,7 @@ const TraderHealthSchema = z.strictObject({
     }),
     orders: OrderLifecycleSeam,
     retention: RetentionSeam,
+    folds: FoldsSeam,
   }),
   riskSeamCaveat: z.string().min(1).max(8192),
   asOf: z.string().min(1).max(64),

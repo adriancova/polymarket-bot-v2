@@ -101,6 +101,7 @@ vi.mock("./pipeline.js", async (importOriginal) => {
 
 import { projectionOf } from "./accounting.js";
 import { AllocatorGate } from "./allocation.js";
+import { EVERY_FILL_ACCOUNTING_CHECKS, type AccountingChecks } from "./folds.js";
 import type { TraderVenue } from "./loop.js";
 import { createExecutionPolicy, type VenueWiring } from "./main.js";
 import type { RetentionBounds } from "./order-lifecycle.js";
@@ -561,6 +562,8 @@ interface Assembled {
 function assemble(
   input: {
     readonly retention?: RetentionBounds;
+    /** `FOLD-1`: the rebuild-check cadence; the test cadence when absent (O1). */
+    readonly accountingChecks?: AccountingChecks;
     readonly rateLimits?: RateLimitBudget;
     readonly maxSliceShares?: string;
     /** Wraps the venue's book provider (a book that vanishes mid-plan). */
@@ -676,6 +679,8 @@ function assemble(
     store,
     idNamespace: "trdr-4-order-lifecycle",
     ...(input.retention === undefined ? {} : { retention: input.retention }),
+    // `FOLD-1` (orchestrator call O1): checked against the rebuilds after EVERY fill.
+    accountingChecks: input.accountingChecks ?? EVERY_FILL_ACCOUNTING_CHECKS,
   });
   if (!result.ok) {
     throw new Error(`${result.refusal.code}: ${result.refusal.detail}`);
@@ -1638,6 +1643,19 @@ describe("retention bounds reach the loop through createPaperTrader, and evict o
     );
     expect(() => assemble({ retention: { tombstones: 1.5 } })).toThrow(/TRADER_CONFIG_REFUSED/u);
     expect(() => assemble({ retention: { provenance: -1 } })).toThrow(/TRADER_CONFIG_REFUSED/u);
+  });
+
+  it("FOLD-1: a rebuild-check cadence that is not a positive safe integer is REFUSED by name — createPaperTrader stays total", () => {
+    expect(() => assemble({ accountingChecks: { everyFills: 0 } })).toThrow(
+      /TRADER_CONFIG_REFUSED: the core loop's accounting rebuild-check cadence was refused/u,
+    );
+    expect(() => assemble({ accountingChecks: { everyFills: 2.5 } })).toThrow(/TRADER_CONFIG_REFUSED/u);
+    expect(() => assemble({ accountingChecks: { pnl: "yes" as unknown as boolean } })).toThrow(/TRADER_CONFIG_REFUSED/u);
+    // The PAPER cadence is admitted, and is what an omitted option means.
+    expect(assemble({ accountingChecks: { everyFills: 50, pnl: false } }).trader.loop.health().seams.folds).toMatchObject({
+      checkEveryFills: 50,
+      pnlCheck: false,
+    });
   });
 });
 

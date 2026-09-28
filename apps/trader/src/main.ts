@@ -19,6 +19,7 @@
  *    createPaperTrader(...)              ← the composition root
  * 4b. startTraderHealthServer(...)       ← TRDR-3: GET /health over the loopback, if configured
  * 5. pump                                ← §8.1's outer loop
+ * 5b. checkAccountingRebuild("SHUTDOWN") ← FOLD-1: §6 invariant 8's rebuild, run once the pump stops
  * ```
  *
  * Step 1 runs on the ENVIRONMENT RECORD before a configuration file is opened,
@@ -324,8 +325,20 @@ export async function startup(ports: StartupPorts): Promise<number> {
     maxPolls: Number.MAX_SAFE_INTEGER,
   });
 
+  // `FOLD-1` (user ruling F2): the SHUTDOWN rebuild check. The loop's held
+  // ledger view is compared with `projectLedger(ledger)` on serialized bytes
+  // (it also ran every 50 posted fills). A mismatch latches a GLOBAL
+  // `ACCOUNTING_REBUILD_MISMATCH` halt — logged below with every other halt —
+  // and the process exits `halted`, never `ok`.
+  const rebuild = trader.loop.checkAccountingRebuild("SHUTDOWN");
   const health = trader.loop.health();
   ports.log(`pump stopped: ${result.stopped} after ${String(result.polls)} poll(s)`);
+  ports.log(
+    rebuild.matched
+      ? "accounting rebuild check at shutdown: the held ledger view equals its rebuild from zero"
+      : "accounting rebuild check at shutdown: MISMATCH — the held accounting state differs from " +
+          "its rebuild from zero (see the ACCOUNTING_REBUILD_MISMATCH halt)",
+  );
   for (const halt of health.halts) {
     ports.log(`HALT ${halt.scope.kind} ${halt.code} (${halt.action}): ${halt.detail}`);
   }
@@ -335,7 +348,7 @@ export async function startup(ports: StartupPorts): Promise<number> {
   await feed.close();
   await store.close();
   await transport.close();
-  return result.stopped === "HALTED" ? EXIT_CODES.halted : EXIT_CODES.ok;
+  return result.stopped === "HALTED" || !rebuild.matched ? EXIT_CODES.halted : EXIT_CODES.ok;
 }
 
 export interface DurableTraderOptions {

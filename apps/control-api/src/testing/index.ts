@@ -217,6 +217,20 @@ export function healthDocument(
         traces: { retained: 3, maximumRetained: 50_000, evicted: 0 },
         provenance: { retained: 4, maximumRetained: 50_000, evicted: 0 },
       },
+      // `FOLD-1`: the trader loop's held accounting state, as
+      // `CoreLoop.health()` always publishes it — the PAPER cadence, three
+      // posted fills, no check due yet, nothing refused.
+      folds: {
+        checkEveryFills: 50,
+        pnlCheck: false,
+        fillsPosted: 3,
+        ledgerChecks: 0,
+        pnlChecks: 0,
+        fillsAtLastCheck: null,
+        ledgerMismatches: 0,
+        pnlMismatches: 0,
+        pnlRefusals: {},
+      },
     },
     riskSeamCaveat: "WP-220 accepted residual: protective exits are classified ENTRY.",
     asOf: "2026-09-05T00:00:10.000Z",

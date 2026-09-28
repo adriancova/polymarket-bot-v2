@@ -42,6 +42,7 @@ import {
   type TimeInForce,
 } from "@polymarket-bot/simulation";
 import {
+  EVERY_FILL_ACCOUNTING_CHECKS,
   createPaperTrader,
   type CreateTraderResult,
   type PaperTrader,
@@ -206,6 +207,11 @@ export function assemble(options: AssembleOptions = {}): {
     venue: venue as unknown as Parameters<typeof createPaperTrader>[0]["venue"],
     store,
     idNamespace: options.idNamespace ?? ID_NAMESPACE,
+    // `FOLD-1` (orchestrator call O1): this harness checks the loop's held
+    // ledger view AND its held PnL streams against their rebuilds from zero
+    // after EVERY fill. A mismatch latches a GLOBAL halt, which the golden's
+    // `health.halts` would show.
+    accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
   });
   if (!result.ok) return { result, parts: undefined };
   wiring.trader = result.trader;
@@ -249,6 +255,8 @@ export async function driveScenario(options: AssembleOptions = {}): Promise<Run>
     }
   }
   await parts.trader.loop.drain();
+  // `FOLD-1`: the end-of-run rebuild check, as every run ends with one.
+  parts.trader.loop.checkAccountingRebuild("END_OF_RUN");
   return {
     parts,
     trader: parts.trader,
