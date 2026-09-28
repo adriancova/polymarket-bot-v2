@@ -8,19 +8,32 @@
  * and stays exactly as it is; this golden freezes the PAPER-CORE end-to-end
  * surface that `WP-230` and `WP-240` assembled, and it is compared by this
  * package's own suite.
+ *
+ * ONE GOLDEN PER SCENARIO (`BRACKET-1b`, E1). Each {@link Scenario} names its
+ * own file under `test/replay-golden/paper-e2e/`; every function here takes the
+ * scenario and defaults to the original one, whose file is
+ * `paper-e2e-run.json` ({@link GOLDEN_PATH}, unchanged).
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { PAPER_E2E_SCENARIO } from "./scenario.js";
+import type { Scenario } from "./scenario-contract.js";
+
 const here = dirname(fileURLToPath(import.meta.url));
 
-/** The committed golden. Absolute, so the cwd cannot change what is compared. */
-export const GOLDEN_PATH = resolve(
-  here,
-  "../../replay-golden/paper-e2e/paper-e2e-run.json",
-);
+/** The directory every paper end-to-end golden lives in. */
+export const GOLDEN_DIRECTORY = resolve(here, "../../replay-golden/paper-e2e");
+
+/** A scenario's committed golden. Absolute, so the cwd cannot change what is compared. */
+export function goldenPathOf(scenario: Scenario = PAPER_E2E_SCENARIO): string {
+  return resolve(GOLDEN_DIRECTORY, scenario.goldenFile);
+}
+
+/** The original scenario's committed golden, `paper-e2e-run.json`. */
+export const GOLDEN_PATH = goldenPathOf(PAPER_E2E_SCENARIO);
 
 /**
  * The environment variable that REGENERATES the golden.
@@ -32,12 +45,12 @@ export const GOLDEN_PATH = resolve(
  */
 export const WRITE_GOLDEN_ENV = "WP250_WRITE_GOLDEN";
 
-export function goldenBytes(): string {
-  return readFileSync(GOLDEN_PATH, "utf8");
+export function goldenBytes(scenario: Scenario = PAPER_E2E_SCENARIO): string {
+  return readFileSync(goldenPathOf(scenario), "utf8");
 }
 
-export function writeGoldenBytes(bytes: string): void {
-  writeFileSync(GOLDEN_PATH, bytes, "utf8");
+export function writeGoldenBytes(bytes: string, scenario: Scenario = PAPER_E2E_SCENARIO): void {
+  writeFileSync(goldenPathOf(scenario), bytes, "utf8");
 }
 
 export function regenerationRequested(env: Record<string, string | undefined>): boolean {

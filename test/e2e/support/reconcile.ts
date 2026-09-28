@@ -42,6 +42,27 @@
  *
  * Everything this module reads comes from the serialised artefact. It never
  * touches a live trader, venue or ledger.
+ *
+ * ## Brackets (`BRACKET-1b`)
+ *
+ * A run may hold SEVERAL brackets of the scenario instance: the Static Bracket
+ * strategy re-arms after a close (`SB.REARMED`) and may enter again up to its
+ * `maximum_entries_per_market`. The table is then built PER BRACKET, with the
+ * brackets read from the run rather than invented: the instance's decisions
+ * are split at the strategy's OWN `SB.REARMED` decisions, each boundary must
+ * follow a close (`SB.CLOSED`) and must be placed in the order the run
+ * consumed its fills, and this module's own average-cost fold must find the
+ * instance FLAT at it — otherwise the run is refused, not reconciled. See
+ * {@link attributeByProvenance}.
+ *
+ * A run with ONE bracket (no `SB.REARMED`) is reconciled exactly as before:
+ * the same rows, ids, texts and order, so a single-bracket golden's
+ * `reconciliation` section does not move. With several, every row computed
+ * from one bracket's decisions and fills carries a `bracket.<n>.` prefix, the
+ * `ledger.*` and `pnl.*` rows stay run-cumulative under their own ids, and two
+ * row kinds are added: `bracket.<n>.pnl.realized` (the bracket's realized PnL
+ * from its own fills, against its §9.16 trade records) and the cumulative
+ * `pnl.realized` (the per-bracket sum against the last snapshot).
  */
 
 import {
@@ -61,6 +82,7 @@ import type {
   ArtifactIntent,
   ArtifactOrder,
   ArtifactOrderProvenance,
+  ArtifactPnlRecord,
   PaperRunArtifact,
 } from "./artifact.js";
 
@@ -99,11 +121,12 @@ export const MECHANISMS = {
   EXIT_BELOW_TAKE_PROFIT: {
     detail:
       "the strategy's edge projection assumes the bracket closes at the configured " +
-      "exit.take_profit.price. This run's bracket did not: the market reached " +
-      "exit_cutoff_before_close_seconds first, so §13.3's final_policy PROTECTED_REDUCE closed " +
-      "it by crossing the book under exit.stop.minimum_sell_price instead. The contribution is " +
-      "(realized exit proceeds − take_profit price × shares exited), exact in decimal, and is " +
-      "NEGATIVE whenever the protective exit sold below the take-profit target.",
+      "exit.take_profit.price. A bracket closed by a PROTECTIVE REDUCTION does not: the stop, " +
+      "the holding timeout or exit_cutoff_before_close_seconds (§13.3's final_policy " +
+      "PROTECTED_REDUCE) closed it by crossing the book under exit.stop.minimum_sell_price " +
+      "instead. The contribution is (realized exit proceeds − take_profit price × shares " +
+      "exited), exact in decimal: NEGATIVE whenever an exit sold below the take-profit target, " +
+      "and ZERO for a bracket its take-profit closed at that price (`BRACKET-1b`).",
     noRealizedValue: false,
   },
   POSITION_OPEN_AT_RUN_END: {
@@ -121,9 +144,10 @@ export const MECHANISMS = {
     detail:
       "no realized value exists. An EXIT order — a take-profit an `exit` decision placed, or a " +
       "protective reduction a `reduce` decision placed, named on the row from the order's own " +
-      "provenance record — rested and was WITHDRAWN unfilled. In this scenario it is the " +
-      "bracket's first take-profit, withdrawn under §6 invariant 13's cancel-before-replace " +
-      "because the confirmed allocation grew after that exit had been sized. A cancelled order " +
+      "provenance record — rested and was WITHDRAWN unfilled: a take-profit withdrawn under §6 " +
+      "invariant 13's cancel-before-replace because the confirmed allocation grew after it had " +
+      "been sized, or withdrawn because a protective reduction outranks it (safety " +
+      "cancellation before new placement, the same invariant). A cancelled order " +
       "produces no fill, so the proceeds it projected have no realized counterpart and this row " +
       "states an ABSENCE rather than a zero. The cancel is counted on the health surface " +
       "(execution.cancelsRequested / cancelsConfirmed).",
@@ -323,14 +347,268 @@ function exitKindOf(decisionType: string): string {
       : `\`${decisionType}\` order`;
 }
 
-/** What {@link attributeByProvenance} proved, by id, about every fill and order. */
+// --- brackets: delimited by the strategy's OWN `SB.REARMED` (`BRACKET-1b`) --
+
+/**
+ * The two Static Bracket reason codes this module reads from the PERSISTED
+ * decisions. They are literals, not imports: the oracle's imports are fixed to
+ * the decimal arithmetic and the artefact's types (the independence pin in
+ * `reconciliation-attribution.test.ts`), and these are values the run itself
+ * wrote, read back from the document like every other value here.
+ *
+ * `SB.REARMED` is emitted by `planRearm` alone, on the `CLOSED --REARM-->
+ * ARMED` edge; `SB.CLOSED` on every edge INTO `CLOSED` that follows a filled
+ * bracket (`EXIT_FILL_COMPLETE`, `POSITION_FLAT`).
+ */
+const REARMED_CODE = "SB.REARMED";
+const CLOSED_CODE = "SB.CLOSED";
+
+/** One bracket: the scenario instance's decisions from one `SB.REARMED` to the next. */
+interface Bracket {
+  /** 1-based, in evaluation order. */
+  readonly ordinal: number;
+  /** The `SB.REARMED` decision that opened it; `null` for the first bracket. */
+  readonly opener: ArtifactDecision | null;
+  /** Its decisions in `evaluationSeq` order, the opener first when there is one. */
+  readonly decisions: readonly ArtifactDecision[];
+}
+
+/** What {@link attributeByProvenance} proved, by id, about one bracket's fills and orders. */
 interface Attribution {
+  readonly bracket: Bracket;
   readonly entry: ArtifactDecision;
   readonly entryIntent: ArtifactIntent;
   readonly entryFills: readonly ArtifactFill[];
   readonly exitFills: readonly ArtifactFill[];
-  /** Every order attributed to an EXIT, with the emission whose decision placed it. */
+  /** Every order attributed to an EXIT of this bracket, with the emission whose decision placed it. */
   readonly exitOrigins: ReadonlyMap<string, Emission>;
+}
+
+/** A persisted decision's §10.3 primary key, as a map key. */
+function decisionKeyOf(decision: ArtifactDecision): string {
+  return JSON.stringify([decision.runId, decision.evaluationSeq]);
+}
+
+/**
+ * The scenario instance's decisions, split at the strategy's own `SB.REARMED`.
+ *
+ * SCOPED BY `instanceId` (`RECON-1`'s note: "decision counting is not scoped to
+ * one instance"): a SHADOW observer over the same market persists decisions of
+ * its own — `enter` ones included — and they are not this instance's brackets.
+ * Ordered by `evaluationSeq`, the order the instance EVALUATED them in, not the
+ * order a document happens to list them in (a stable sort, so the persisted
+ * order breaks a tie, which §10.3's key forbids anyway).
+ *
+ * Every `SB.REARMED` decision OPENS a bracket; the decisions before the first
+ * one are bracket 1. A document whose first decision is an `SB.REARMED` has an
+ * EMPTY bracket 1, which {@link attributeByProvenance} refuses (a re-arm with
+ * no preceding close).
+ */
+function bracketsOf(artifact: Omit<PaperRunArtifact, "reconciliation">): readonly Bracket[] {
+  const own = artifact.decisions
+    .map((decision, index) => ({ decision, index }))
+    .filter(({ decision }) => decision.instanceId === artifact.scenario.instanceId)
+    .sort(
+      (left, right) =>
+        left.decision.evaluationSeq - right.decision.evaluationSeq || left.index - right.index,
+    )
+    .map(({ decision }) => decision);
+  const split: { readonly opener: ArtifactDecision | null; readonly decisions: ArtifactDecision[] }[] =
+    [{ opener: null, decisions: [] }];
+  for (const decision of own) {
+    if (decision.reasonCodes.includes(REARMED_CODE)) {
+      split.push({ opener: decision, decisions: [decision] });
+      continue;
+    }
+    split[split.length - 1]?.decisions.push(decision);
+  }
+  return split.map((bracket, index) =>
+    Object.freeze({
+      ordinal: index + 1,
+      opener: bracket.opener,
+      decisions: Object.freeze([...bracket.decisions]),
+    }),
+  );
+}
+
+function describeBracket(bracket: Bracket): string {
+  return bracket.opener === null
+    ? `bracket ${String(bracket.ordinal)}`
+    : `bracket ${String(bracket.ordinal)} (opened by the \`${REARMED_CODE}\` decision at ` +
+        `evaluationSeq ${String(bracket.opener.evaluationSeq)})`;
+}
+
+function seqList(decisions: readonly ArtifactDecision[]): string {
+  return decisions.map((decision) => String(decision.evaluationSeq)).join(", ");
+}
+
+/**
+ * One bracket's entry: exactly one `enter` decision, exactly one POSITION
+ * intent, at most one order-placing intent, and an intent id — the refusals
+ * `RISK2-R3` introduced for the whole run, now applied PER BRACKET.
+ *
+ * `single` keeps the one-bracket messages exactly as they were, except the
+ * second-`enter` refusal, whose rule changed: two entries are refused when no
+ * `SB.REARMED` separates them, and are two brackets when one does.
+ */
+function entryOf(
+  bracket: Bracket,
+  single: boolean,
+): { readonly entry: ArtifactDecision; readonly entryIntent: ArtifactIntent; readonly key: string } {
+  const where = single ? "" : `${describeBracket(bracket)}: `;
+  const entries = bracket.decisions.filter((decision) => decision.decisionType === "enter");
+  const entry = entries[0];
+  if (entry === undefined) {
+    throw new Error(
+      single
+        ? "the run produced no entry decision; the reconciliation has nothing to compare and " +
+            "refuses to report an empty table as a passing one"
+        : `${where}the bracket holds no \`enter\` decision, so it has no entry to compare and ` +
+            "the reconciliation refuses rather than report an empty bracket as a passing one",
+    );
+  }
+  if (entries.length > 1) {
+    throw new Error(
+      `${single ? "the run's only bracket (the run holds no `" + REARMED_CODE + "`)" : describeBracket(bracket)} ` +
+        `holds ${String(entries.length)} \`enter\` decisions (evaluationSeq ${seqList(entries)}) ` +
+        `with no \`${REARMED_CODE}\` between them. A bracket opens only through the strategy's ` +
+        `own ${REARMED_CODE}, after a close, so ONE bracket has ONE entry — one set of entry.* ` +
+        "rows, one cost cap, one expected net edge. Reconciling the first would leave every " +
+        "other entry's fills to be counted as something they are not, so the reconciliation " +
+        "refuses instead of reading only the first",
+    );
+  }
+  const entryIntent = entry.intents.find((intent) => intent.type === "POSITION");
+  if (entryIntent === undefined) {
+    throw new Error(`${where}the entry decision emitted no POSITION intent`);
+  }
+  const placing = entry.intents.filter((intent) => intent.type !== "CANCEL");
+  if (placing.length > 1) {
+    throw new Error(
+      `${where}the entry decision (evaluationSeq ${String(entry.evaluationSeq)}) emitted ` +
+        `${String(placing.length)} order-placing intents (${placing.map(describeIntent).join(", ")}); ` +
+        "one bracket has one entry intent, and reconciling the first would leave the others' " +
+        "fills unattributed",
+    );
+  }
+  const entryIntentId = entryIntent.intentId;
+  if (entryIntentId === undefined) {
+    throw new Error(
+      `${where}the entry POSITION intent carries no intentId, so no fill can be attributed to ` +
+        "it by id",
+    );
+  }
+  return { entry, entryIntent, key: emissionKey(entry.runId, entry.evaluationSeq, entryIntentId) };
+}
+
+/**
+ * Every boundary FOLLOWS A CLOSE: the bracket an `SB.REARMED` ends holds a
+ * decision carrying `SB.CLOSED` after that bracket's entry.
+ *
+ * The strategy reaches `planRearm` only from `CLOSED` (`decide.ts` `planTick`),
+ * and a filled bracket enters `CLOSED` only through an edge that reports
+ * `SB.CLOSED`. So a re-arm with no preceding close — the first decision of the
+ * run, or after an entry that never closed — is not a boundary this strategy
+ * produces, and nothing delimited by it is reconciled.
+ */
+function refuseUnclosedBoundaries(brackets: readonly Bracket[]): void {
+  for (const bracket of brackets) {
+    const opener = bracket.opener;
+    if (opener === null) continue;
+    const previous = brackets[bracket.ordinal - 2];
+    const entry = previous?.decisions.find((decision) => decision.decisionType === "enter");
+    const closed = previous?.decisions.some(
+      (decision) =>
+        decision.reasonCodes.includes(CLOSED_CODE) &&
+        (entry === undefined || decision.evaluationSeq > entry.evaluationSeq),
+    );
+    if (closed !== true) {
+      throw new Error(
+        `the strategy's \`${REARMED_CODE}\` at evaluationSeq ${String(opener.evaluationSeq)} ` +
+          `opens bracket ${String(bracket.ordinal)}, but no decision carrying \`${CLOSED_CODE}\` ` +
+          `precedes it in bracket ${String(bracket.ordinal - 1)}` +
+          (previous === undefined || previous.decisions.length === 0
+            ? " (which holds no decision at all)"
+            : ` (evaluationSeq ${seqList(previous.decisions)})`) +
+          ". The strategy re-arms only from CLOSED, so this is not a boundary it produced, and " +
+          "the brackets it would delimit are not reconciled",
+      );
+    }
+  }
+}
+
+/**
+ * Every boundary is placed in the order the run CONSUMED its fills, and the
+ * instance is FLAT there by this module's own fold (`BRACKET-1b`).
+ *
+ * The boundary's instant is the `SB.REARMED` decision's recorded source event:
+ * its `ingestSeq` is the point in the fill sequence (`atEventIngestSeq`) the
+ * re-arm was decided at. A re-arm with no recorded source event cannot be
+ * placed there and is refused (the strategy re-arms from a tick — `onFeatures`
+ * or `onMarketClosing` — and the trader dispatches no timer, so one never has
+ * none in a run this harness drives).
+ *
+ * Refused, each by name:
+ * - a fill of an EARLIER bracket consumed at or after the boundary, or a fill
+ *   of this or a later bracket consumed before it: attribution (by id) and time
+ *   would disagree about which bracket the position at the boundary belongs to;
+ * - an instance that is NOT FLAT at the boundary: the average-cost fold
+ *   ({@link foldMovements}, `packages/pnl`'s method restated) of every fill
+ *   consumed before it leaves shares in some token. The strategy re-arms only
+ *   from a closed, flat bracket, so a boundary over an open position is not the
+ *   run's.
+ */
+function refuseMisplacedBoundaries(
+  artifact: Omit<PaperRunArtifact, "reconciliation">,
+  attributions: readonly Attribution[],
+): void {
+  const ingestSeqOf = new Map(artifact.events.map((event) => [event.eventId, event.ingestSeq]));
+  for (const later of attributions) {
+    const opener = later.bracket.opener;
+    if (opener === null) continue;
+    const boundary = opener.sourceEventId === null ? undefined : ingestSeqOf.get(opener.sourceEventId);
+    const where =
+      `the boundary the \`${REARMED_CODE}\` at evaluationSeq ${String(opener.evaluationSeq)} ` +
+      `marks (opening bracket ${String(later.bracket.ordinal)})`;
+    if (boundary === undefined) {
+      throw new Error(
+        `${where} names ${opener.sourceEventId === null ? "no source event" : `source event ${opener.sourceEventId}, which is not in the recorded event list`}; ` +
+          "it cannot be placed in the order the run consumed its fills, so the position there " +
+          "cannot be verified and the brackets are not reconciled",
+      );
+    }
+    for (const attribution of attributions) {
+      const earlier = attribution.bracket.ordinal < later.bracket.ordinal;
+      for (const fill of [...attribution.entryFills, ...attribution.exitFills]) {
+        const order = compareIngestSeq(fill.atEventIngestSeq, boundary);
+        if (earlier ? order >= 0 : order < 0) {
+          throw new Error(
+            `fill ${fill.simulatedFillId} is bracket ${String(attribution.bracket.ordinal)}'s by ` +
+              `its provenance, but it was consumed at ingestSeq ${fill.atEventIngestSeq}, ` +
+              `${earlier ? "at or after" : "before"} ${where} at ingestSeq ${boundary}. Attribution ` +
+              "and time disagree about which bracket the position at the boundary belongs to, so " +
+              "the brackets are not reconciled",
+          );
+        }
+      }
+    }
+    const before = attributions.filter(
+      (attribution) => attribution.bracket.ordinal < later.bracket.ordinal,
+    );
+    const fold = foldFills(
+      before.flatMap((attribution) => attribution.entryFills),
+      before.flatMap((attribution) => attribution.exitFills),
+    );
+    const open = [...fold.lots.entries()].filter(([, lot]) => compareDecimal(lot.shares, "0") !== 0);
+    if (open.length > 0) {
+      throw new Error(
+        `the instance is not flat at ${where}: this module's average-cost fold of every fill ` +
+          `consumed before it still holds ${open.map(([token, lot]) => `${lot.shares} shares of token ${token}`).join(", ")}. ` +
+          "The strategy re-arms only from a CLOSED, flat bracket, so a boundary over an open " +
+          "position is not the run's, and the brackets are not reconciled",
+      );
+    }
+  }
 }
 
 /** The side of the bracket an emission's DECISION puts it on. */
@@ -510,63 +788,39 @@ const PROVENANCE_FIELDS = [
  *    what refuses a phantom order whose fabricated record borrows an emission
  *    a real plan already holds.
  *
- * ## One bracket, and why a second one is refused rather than reconciled
+ * ## Brackets, read from the run (`BRACKET-1b`, `RECON-1` option (a))
  *
- * Option (b) of the two `RECON-1` offered, deliberately. Every row this module
- * emits is a ONE-BRACKET quantity with no bracket dimension: the `entry.*` rows
- * compare one intent's `targetShares`, `maximumTotalCost` and `expectedNetEdge`
- * with one set of fills; `exit.expected_net_edge` is that one intent's
- * projection; the `ledger.*` rows read instance-wide balances and the `pnl.*`
- * rows read the LAST snapshot, both of which are cumulative over every bracket
- * the instance ever ran. Reconciling several brackets (option (a)) would need
- * bracket-scoped row ids, per-bracket ledger and PnL checkpoints the artefact
- * does not carry, and a rule pairing each exit with the entry it closes — and
- * the artefact holds NO id from an exit intent to its entry, so that pairing
- * would be a timing policy invented here, not a chain read from the run. That
- * is a redesign of the table, and the first two-bracket scenario is the right
- * place for it. Until then a run with more than one `enter` decision, or with
- * more than one order-placing intent in its entry decision, is refused: what
- * is not acceptable is silently reading only the first.
+ * `RECON-1` chose option (b) — one bracket, and a second `enter` refused —
+ * because reconciling several needed bracket-scoped rows and a rule pairing
+ * each exit with the entry it closes, and the artefact holds NO id from an exit
+ * intent to its entry: the pairing would have been a timing policy invented
+ * here. `BRACKET-1b` does not invent one. The brackets are the strategy's OWN:
+ *
+ * 1. the scenario instance's decisions are split at its `SB.REARMED` decisions
+ *    ({@link bracketsOf}; scoped by `instanceId`, ordered by `evaluationSeq`);
+ * 2. every boundary must follow a close ({@link refuseUnclosedBoundaries});
+ * 3. each bracket has exactly one entry, as the whole run used to
+ *    ({@link entryOf});
+ * 4. every order is attributed by its provenance record, exactly as below, and
+ *    the emission it names belongs to ONE bracket — the bracket of the
+ *    decision that emitted it. An exit is therefore paired with its entry BY
+ *    ID: both were emitted by decisions of the same bracket;
+ * 5. every boundary is placed in the order the run consumed its fills, and the
+ *    instance is flat there by this module's own fold
+ *    ({@link refuseMisplacedBoundaries}).
+ *
+ * A run with no `SB.REARMED` is ONE bracket and takes exactly the path it
+ * always took. Two `enter` decisions with no `SB.REARMED` between them are
+ * still refused: what is not acceptable is silently reading only the first.
  */
-function attributeByProvenance(artifact: Omit<PaperRunArtifact, "reconciliation">): Attribution {
-  // --- one entry decision, one entry intent ---------------------------------
-  const entries = artifact.decisions.filter((decision) => decision.decisionType === "enter");
-  const entry = entries[0];
-  if (entry === undefined) {
-    throw new Error(
-      "the run produced no entry decision; the reconciliation has nothing to compare and " +
-        "refuses to report an empty table as a passing one",
-    );
-  }
-  if (entries.length > 1) {
-    throw new Error(
-      `the run holds ${String(entries.length)} \`enter\` decisions (evaluationSeq ` +
-        `${entries.map((decision) => String(decision.evaluationSeq)).join(", ")}), and this ` +
-        "table has ONE bracket's shape — one set of entry.* rows, one cost cap, one expected " +
-        "net edge. Reconciling the first would leave every other entry's fills to be counted " +
-        "as something they are not, so the reconciliation refuses instead of reading only the " +
-        "first",
-    );
-  }
-  const entryIntent = entry.intents.find((intent) => intent.type === "POSITION");
-  if (entryIntent === undefined) {
-    throw new Error("the entry decision emitted no POSITION intent");
-  }
-  const placing = entry.intents.filter((intent) => intent.type !== "CANCEL");
-  if (placing.length > 1) {
-    throw new Error(
-      `the entry decision (evaluationSeq ${String(entry.evaluationSeq)}) emitted ` +
-        `${String(placing.length)} order-placing intents (${placing.map(describeIntent).join(", ")}); ` +
-        "one bracket has one entry intent, and reconciling the first would leave the others' " +
-        "fills unattributed",
-    );
-  }
-  const entryIntentId = entryIntent.intentId;
-  if (entryIntentId === undefined) {
-    throw new Error(
-      "the entry POSITION intent carries no intentId, so no fill can be attributed to it by id",
-    );
-  }
+function attributeByProvenance(
+  artifact: Omit<PaperRunArtifact, "reconciliation">,
+): readonly Attribution[] {
+  // --- the brackets, and one entry decision / one entry intent in each ------
+  const brackets = bracketsOf(artifact);
+  const single = brackets.length === 1;
+  refuseUnclosedBoundaries(brackets);
+  const entries = brackets.map((bracket) => entryOf(bracket, single));
 
   const fills = artifact.fills;
   if (fills.length === 0) {
@@ -574,7 +828,17 @@ function attributeByProvenance(artifact: Omit<PaperRunArtifact, "reconciliation"
   }
 
   const emissions = emissionsOf(artifact);
-  const entryKey = emissionKey(entry.runId, entry.evaluationSeq, entryIntentId);
+  /** Each entry emission's key, to its bracket's ordinal. */
+  const entryBracket = new Map(
+    entries.map((entry, index) => [entry.key, brackets[index]?.ordinal ?? 0] as const),
+  );
+  /** Each of the scenario instance's decisions, to its bracket's ordinal. */
+  const decisionBracket = new Map<string, number>();
+  for (const bracket of brackets) {
+    for (const decision of bracket.decisions) {
+      decisionBracket.set(decisionKeyOf(decision), bracket.ordinal);
+    }
+  }
 
   // A format-1 artefact has no provenance section at all. The types forbid it;
   // a document parsed from old bytes does not read the types, so the absence is
@@ -628,7 +892,8 @@ function attributeByProvenance(artifact: Omit<PaperRunArtifact, "reconciliation"
   };
 
   // --- every order: resolved BY ID to the emission that placed it -----------
-  const sideOf = new Map<string, "ENTRY" | "EXIT">();
+  // …and, since `BRACKET-1b`, to the bracket of the decision that emitted it.
+  const placement = new Map<string, { readonly side: "ENTRY" | "EXIT"; readonly bracket: number }>();
   const exitOrigins = new Map<string, Emission>();
   const emissionOfPlan = new Map<string, { readonly key: string; readonly order: string }>();
   const planOfEmission = new Map<string, { readonly plan: string; readonly order: string }>();
@@ -669,23 +934,30 @@ function attributeByProvenance(artifact: Omit<PaperRunArtifact, "reconciliation"
           "and is not attributed to either side",
       );
     }
-    const side: "ENTRY" | "EXIT" | undefined =
-      key === entryKey
-        ? "ENTRY"
-        : emission.placesOrders && emission.side === "EXIT"
-          ? "EXIT"
-          : undefined;
-    if (side === undefined) {
+    // The bracket of the emitting decision — `undefined` for a decision of
+    // another instance (a SHADOW observer's, say), which is no bracket's.
+    const bracket = decisionBracket.get(decisionKeyOf(emission.decision));
+    const side: "ENTRY" | "EXIT" | undefined = entryBracket.has(key)
+      ? "ENTRY"
+      : emission.placesOrders && emission.side === "EXIT" && bracket !== undefined
+        ? "EXIT"
+        : undefined;
+    if (side === undefined || bracket === undefined) {
       const own = fillsOf(order.simulatedOrderId);
+      const foreign =
+        bracket === undefined
+          ? ` (a decision of instance ${emission.decision.instanceId}, not of the scenario's ` +
+            `instance ${artifact.scenario.instanceId})`
+          : "";
       throw new Error(
         own.length > 0
           ? `fill ${own.map((fill) => fill.simulatedFillId).join(", ")} (order ` +
               `${order.simulatedOrderId}) belongs to neither the entry's chain nor any exit's: ` +
-              `its order's provenance resolves to ${describeEmission(emission)}, which is neither ` +
+              `its order's provenance resolves to ${describeEmission(emission)}${foreign}, which is neither ` +
               "the entry emission nor an order-placing emission of an exit or reduce decision. " +
               "Counting it as exit proceeds because it is not the entry's is the error this " +
               "refusal exists to prevent"
-          : `order ${order.simulatedOrderId} was placed under ${describeEmission(emission)} — ` +
+          : `order ${order.simulatedOrderId} was placed under ${describeEmission(emission)}${foreign} — ` +
               "neither the entry intent nor one an exit or reduce decision emitted — so its " +
               "withdrawal is not an exit cancellation, and it is attributed to neither side",
       );
@@ -709,12 +981,12 @@ function attributeByProvenance(artifact: Omit<PaperRunArtifact, "reconciliation"
     }
     emissionOfPlan.set(order.executionPlanId, { key, order: order.simulatedOrderId });
     planOfEmission.set(key, { plan: order.executionPlanId, order: order.simulatedOrderId });
-    sideOf.set(order.simulatedOrderId, side);
+    placement.set(order.simulatedOrderId, { side, bracket });
     if (side === "EXIT") exitOrigins.set(order.simulatedOrderId, emission);
   }
 
   // --- every fill: its order's side, or refused -----------------------------
-  const unbooked = fills.filter((fill) => !sideOf.has(fill.simulatedOrderId));
+  const unbooked = fills.filter((fill) => !placement.has(fill.simulatedOrderId));
   if (unbooked.length > 0) {
     throw new Error(
       `fill ${unbooked.map((fill) => fill.simulatedFillId).join(", ")} (order ` +
@@ -724,15 +996,36 @@ function attributeByProvenance(artifact: Omit<PaperRunArtifact, "reconciliation"
         "entry's is the error this refusal exists to prevent",
     );
   }
-  const entryFills = fills.filter((fill) => sideOf.get(fill.simulatedOrderId) === "ENTRY");
-  const exitFills = fills.filter((fill) => sideOf.get(fill.simulatedOrderId) === "EXIT");
-  if (entryFills.length === 0) {
-    throw new Error(
-      "no fill could be attributed to the entry intent through its orders' provenance; the " +
-        "entry rows would compare against an empty set and are refused rather than reported " +
-        "as reconciled",
-    );
-  }
+  // --- each bracket's own fills and exit orders -----------------------------
+  const attributions: Attribution[] = brackets.map((bracket, index) => {
+    const entry = entries[index];
+    if (entry === undefined) throw new Error(`${describeBracket(bracket)} lost its entry`);
+    const ownFills = (side: "ENTRY" | "EXIT"): readonly ArtifactFill[] =>
+      fills.filter((fill) => {
+        const placed = placement.get(fill.simulatedOrderId);
+        return placed?.side === side && placed.bracket === bracket.ordinal;
+      });
+    const entryFills = ownFills("ENTRY");
+    if (entryFills.length === 0) {
+      throw new Error(
+        `${single ? "" : `${describeBracket(bracket)}: `}no fill could be attributed to the ` +
+          "entry intent through its orders' provenance; the entry rows would compare against an " +
+          "empty set and are refused rather than reported as reconciled",
+      );
+    }
+    return {
+      bracket,
+      entry: entry.entry,
+      entryIntent: entry.entryIntent,
+      entryFills,
+      exitFills: ownFills("EXIT"),
+      exitOrigins: new Map(
+        [...exitOrigins].filter(
+          ([orderId]) => placement.get(orderId)?.bracket === bracket.ordinal,
+        ),
+      ),
+    };
+  });
 
   // --- every trace is bound to its own fill, and agrees with that fill's
   // order's provenance record ------------------------------------------------
@@ -816,7 +1109,10 @@ function attributeByProvenance(artifact: Omit<PaperRunArtifact, "reconciliation"
     );
   }
 
-  return { entry, entryIntent, entryFills, exitFills, exitOrigins };
+  // --- several brackets: every boundary placed, and flat (`BRACKET-1b`) -----
+  if (!single) refuseMisplacedBoundaries(artifact, attributions);
+
+  return attributions;
 }
 
 /**
@@ -987,47 +1283,103 @@ function openCostBasisOf(
   entryFills: readonly ArtifactFill[],
   exitFills: readonly ArtifactFill[],
 ): string {
+  return sum([...foldFills(entryFills, exitFills).lots.values()].map((lot) => lot.costBasis));
+}
+
+/** One lot of one token, as the average-cost fold holds it. */
+interface Lot {
+  readonly shares: string;
+  readonly costBasis: string;
+}
+
+/**
+ * One movement the fold consumes: shares of a token that OPEN (add to the lot)
+ * or CLOSE (remove from it), at a price. `label` names it in a refusal.
+ */
+interface Movement {
+  readonly label: string;
+  readonly token: string;
+  readonly shares: string;
+  readonly price: string;
+  readonly opens: boolean;
+}
+
+/**
+ * {@link openCostBasisOf}'s fold, over movements ALREADY in consumption order,
+ * returning the lots it leaves AND the realized PnL of every closing movement
+ * (`BRACKET-1b`): `price × q − the basis q removes`, which is `packages/pnl`'s
+ * realized trading PnL under its own average-cost method (fees are not in it;
+ * the engine books them apart, `feesPaid`). The arithmetic of the lots is
+ * exactly `RECON-1` r1's, and so is the oversell refusal.
+ */
+function foldMovements(movements: readonly Movement[]): {
+  readonly lots: ReadonlyMap<string, Lot>;
+  readonly realized: string;
+} {
+  const lots = new Map<string, Lot>();
+  let realized = "0";
+  for (const movement of movements) {
+    const lot = lots.get(movement.token);
+    if (movement.opens) {
+      lots.set(movement.token, {
+        shares: addDecimal(lot?.shares ?? "0", movement.shares),
+        costBasis: addDecimal(lot?.costBasis ?? "0", mulDecimal(movement.price, movement.shares)),
+      });
+      continue;
+    }
+    if (lot === undefined || compareDecimal(movement.shares, lot.shares) > 0) {
+      throw new Error(
+        `${movement.label} removes ${movement.shares} shares of token ` +
+          `${movement.token} when, at that point in the sequence, the position holds ` +
+          `${lot?.shares ?? "0"}; packages/pnl refuses an oversell (PNL_OVERSELL), so there is ` +
+          "no engine cost basis to reconcile against",
+      );
+    }
+    const proceeds = mulDecimal(movement.price, movement.shares);
+    if (compareDecimal(movement.shares, lot.shares) === 0) {
+      // q = Q: the whole basis leaves, exactly, and the lot closes.
+      lots.delete(movement.token);
+      realized = addDecimal(realized, subDecimal(proceeds, lot.costBasis));
+      continue;
+    }
+    const removed = divDecimal(
+      mulDecimal(lot.costBasis, movement.shares),
+      lot.shares,
+      PNL_COST_DIVISION,
+    );
+    lots.set(movement.token, {
+      shares: subDecimal(lot.shares, movement.shares),
+      costBasis: subDecimal(lot.costBasis, removed),
+    });
+    realized = addDecimal(realized, subDecimal(proceeds, removed));
+  }
+  return { lots, realized };
+}
+
+/**
+ * The entry fills OPEN and the exit fills CLOSE — the table's sign convention,
+ * attributed by id, never `action` — folded in {@link inConsumptionOrder}.
+ * Every sequence is validated BEFORE the sort (`RECON-1` r2).
+ */
+function foldFills(
+  entryFills: readonly ArtifactFill[],
+  exitFills: readonly ArtifactFill[],
+): { readonly lots: ReadonlyMap<string, Lot>; readonly realized: string } {
   const unsorted = [
     ...entryFills.map((fill) => ({ fill, opens: true })),
     ...exitFills.map((fill) => ({ fill, opens: false })),
   ];
   for (const { fill } of unsorted) assertCanonicalIngestSeq(fill.atEventIngestSeq);
   const sequence = unsorted.sort((left, right) => inConsumptionOrder(left.fill, right.fill));
-
-  const lots = new Map<string, { readonly shares: string; readonly costBasis: string }>();
-  for (const { fill, opens } of sequence) {
-    const lot = lots.get(fill.tokenId);
-    if (opens) {
-      lots.set(fill.tokenId, {
-        shares: addDecimal(lot?.shares ?? "0", fill.shares),
-        costBasis: addDecimal(lot?.costBasis ?? "0", mulDecimal(fill.price, fill.shares)),
-      });
-      continue;
-    }
-    if (lot === undefined || compareDecimal(fill.shares, lot.shares) > 0) {
-      throw new Error(
-        `exit fill ${fill.simulatedFillId} removes ${fill.shares} shares of token ` +
-          `${fill.tokenId} when, at that point in the sequence, the position holds ` +
-          `${lot?.shares ?? "0"}; packages/pnl refuses an oversell (PNL_OVERSELL), so there is ` +
-          "no engine cost basis to reconcile against",
-      );
-    }
-    if (compareDecimal(fill.shares, lot.shares) === 0) {
-      // q = Q: the whole basis leaves, exactly, and the lot closes.
-      lots.delete(fill.tokenId);
-      continue;
-    }
-    const removed = divDecimal(
-      mulDecimal(lot.costBasis, fill.shares),
-      lot.shares,
-      PNL_COST_DIVISION,
-    );
-    lots.set(fill.tokenId, {
-      shares: subDecimal(lot.shares, fill.shares),
-      costBasis: subDecimal(lot.costBasis, removed),
-    });
-  }
-  return sum([...lots.values()].map((lot) => lot.costBasis));
+  return foldMovements(
+    sequence.map(({ fill, opens }) => ({
+      label: `exit fill ${fill.simulatedFillId}`,
+      token: fill.tokenId,
+      shares: fill.shares,
+      price: fill.price,
+      opens,
+    })),
+  );
 }
 
 /**
@@ -1035,14 +1387,17 @@ function openCostBasisOf(
  *
  * Pure. Reads only the artefact, and every number it derives is derived with
  * `@polymarket-bot/decimal` — no float appears anywhere in this file.
+ *
+ * ONE bracket (`BRACKET-1b`): exactly the table this function always built —
+ * the entry rows, every fill's fee row, the fee total, the run's ledger and
+ * PnL rows, the round trip's edge and the withdrawn exits, in that order, under
+ * the same ids. SEVERAL: each bracket's rows under `bracket.<n>.`, followed by
+ * `bracket.<n>.pnl.realized`, then the run-cumulative ledger and PnL rows under
+ * their own ids and the cumulative `pnl.realized`.
  */
 export function buildReconciliation(
   artifact: Omit<PaperRunArtifact, "reconciliation">,
 ): readonly ReconciliationRow[] {
-  const rows: ReconciliationRow[] = [];
-  const scenario = artifact.scenario;
-  const schedule = scenario.feeSchedule;
-
   /**
    * THE ENTRY'S OWN FILLS, SEPARATED FROM EVERY OTHER FILL (`RISK-2`), AND THE
    * EXIT'S, WALKED THE SAME WAY (`RECON-1`).
@@ -1061,11 +1416,88 @@ export function buildReconciliation(
    * its exit BUYS. `RISK-2` walked it for the entry only and took the exit as
    * the complement; `RECON-1` walked both; {@link attributeByProvenance}
    * (`RECON-2`) resolves EVERY order, filled or not, by its own provenance
-   * record and refuses what neither side reaches.
+   * record and refuses what neither side reaches — and (`BRACKET-1b`) assigns
+   * it to the bracket of the decision that emitted it.
    */
-  const { entry, entryIntent, entryFills, exitFills, exitOrigins } =
-    attributeByProvenance(artifact);
-  const fills = artifact.fills;
+  const attributions = attributeByProvenance(artifact);
+  const allEntryFills = attributions.flatMap((attribution) => attribution.entryFills);
+  const allExitFills = attributions.flatMap((attribution) => attribution.exitFills);
+
+  const [only] = attributions;
+  if (attributions.length === 1 && only !== undefined) {
+    const bracket = bracketRows("", artifact, only, artifact.fills);
+    return Object.freeze([
+      ...bracket.entry,
+      ...bracket.feeFills,
+      bracket.feeTotal,
+      ...cumulativeRows(artifact, allEntryFills, allExitFills),
+      bracket.exitEdge,
+      ...bracket.cancelled,
+    ]);
+  }
+
+  const rows: ReconciliationRow[] = [];
+  const realizedByBracket: string[] = [];
+  const recordsByBracket = tradeRecordsByBracket(artifact, attributions);
+  for (const attribution of attributions) {
+    const prefix = `bracket.${String(attribution.bracket.ordinal)}.`;
+    const own = new Set([...attribution.entryFills, ...attribution.exitFills]);
+    const bracket = bracketRows(
+      prefix,
+      artifact,
+      attribution,
+      artifact.fills.filter((fill) => own.has(fill)),
+    );
+    const realized = bracketRealizedRow(
+      prefix,
+      attribution,
+      recordsByBracket.get(attribution.bracket.ordinal) ?? [],
+    );
+    realizedByBracket.push(realized.projected);
+    rows.push(
+      ...bracket.entry,
+      ...bracket.feeFills,
+      bracket.feeTotal,
+      bracket.exitEdge,
+      ...bracket.cancelled,
+      realized,
+    );
+  }
+  rows.push(
+    ...cumulativeRows(artifact, allEntryFills, allExitFills),
+    cumulativeRealizedRow(artifact, attributions, realizedByBracket),
+  );
+  return Object.freeze(rows);
+}
+
+/** One bracket's rows, in the order a one-bracket table has always listed them. */
+interface BracketRows {
+  readonly entry: readonly ReconciliationRow[];
+  readonly feeFills: readonly ReconciliationRow[];
+  readonly feeTotal: ReconciliationRow;
+  readonly exitEdge: ReconciliationRow;
+  readonly cancelled: readonly ReconciliationRow[];
+}
+
+/**
+ * The rows computed from ONE bracket's decisions and fills: its entry, the fee
+ * of each of `fills`, its fee total, its round trip's edge and its withdrawn
+ * exits. `prefix` is `""` for a one-bracket run — whose `fills` are every fill
+ * of the run, exactly what the table always read — and `bracket.<n>.`
+ * otherwise, with `fills` that bracket's own, in artefact order.
+ */
+function bracketRows(
+  prefix: string,
+  artifact: Omit<PaperRunArtifact, "reconciliation">,
+  attribution: Attribution,
+  fills: readonly ArtifactFill[],
+): BracketRows {
+  const scenario = artifact.scenario;
+  const schedule = scenario.feeSchedule;
+  const { entry, entryIntent, entryFills, exitFills, exitOrigins } = attribution;
+  const entryRows: ReconciliationRow[] = [];
+  const feeFills: ReconciliationRow[] = [];
+  const cancelled: ReconciliationRow[] = [];
 
   const notionals = entryFills.map((fill) => mulDecimal(fill.price, fill.shares));
   const realizedNotional = sum(notionals);
@@ -1083,30 +1515,6 @@ export function buildReconciliation(
   const allChargedFees = sum(fills.map((fill) => fill.feeAmount));
   const allUnroundedFees = sum(fills.map((fill) => unroundedVenueFee(fill, schedule)));
 
-  /**
-   * The cost basis the position still holds, by `packages/pnl`'s OWN cost
-   * method — average cost — restated in {@link openCostBasisOf} (`RECON-1` r1).
-   *
-   * THIS USED TO BE A FIFO FOLD, and that was the wrong oracle. `RISK-2` wrote
-   * it FIFO to avoid a division (§6 invariant 1), describing it as
-   * "`packages/pnl`'s open cost basis … folded FIFO" — but `packages/pnl` is
-   * average cost (`state.ts`: "Cost method: average cost per token asset") and
-   * the persisted snapshot these rows compare against comes from it; FIFO is
-   * `apps/trader`'s allocator book (`allocation.ts`), a different number. The
-   * division concern is answered by the engine's own specification, which
-   * states an exact-decimal policy for it. The two methods agree in the only
-   * two states the committed golden holds — fully open (the whole notional) and
-   * fully closed (`"0"`) — so the golden is unchanged; on a PARTIAL exit at
-   * mixed lot prices FIFO flagged a correct run as unexplained.
-   *
-   * `RECON-1` could not change the golden, so the `projectedSource` text of
-   * `pnl.capital_committed` and `pnl.worst_case_resolution` below kept saying
-   * "FIFO" (`RECON1-TEXT`). `RECON-2` regenerated the golden and corrected both
-   * strings; the NUMBERS did not move, because they never differed for any state
-   * the golden holds.
-   */
-  const openCostBasis = openCostBasisOf(entryFills, exitFills);
-
   // --- the strategy's own projections, from the PERSISTED decision ----------
 
   const trigger = String(entry.modelOutputs["trigger"] ?? "");
@@ -1114,9 +1522,9 @@ export function buildReconciliation(
   const worstPrice = String(entry.modelOutputs["worstPrice"] ?? "");
   const projectedEdge = String(entry.modelOutputs["expectedNetEdge"] ?? "");
 
-  rows.push(
+  entryRows.push(
     exact(
-      "entry.executable_price_notional",
+      `${prefix}entry.executable_price_notional`,
       "the notional the §9.5 executable-buy-price feature projected for the configured size",
       mulDecimal(trigger, realizedShares),
       `persisted decision (runId ${entry.runId}, evaluationSeq ${String(entry.evaluationSeq)}) ` +
@@ -1126,9 +1534,9 @@ export function buildReconciliation(
     ),
   );
 
-  rows.push(
+  entryRows.push(
     exact(
-      "entry.projected_cost",
+      `${prefix}entry.projected_cost`,
       "the entry cost the strategy quoted before emitting the intent",
       projectedCost,
       "persisted decision modelOutputs.entryCost",
@@ -1137,9 +1545,9 @@ export function buildReconciliation(
     ),
   );
 
-  rows.push(
+  entryRows.push(
     exact(
-      "entry.shares",
+      `${prefix}entry.shares`,
       "the position size",
       entryIntent.targetShares ?? "",
       "the §7.7 POSITION intent's targetShares, as persisted with the decision",
@@ -1148,9 +1556,9 @@ export function buildReconciliation(
     ),
   );
 
-  rows.push(
+  entryRows.push(
     exact(
-      "entry.worst_price",
+      `${prefix}entry.worst_price`,
       "the worst per-share price the entry would pay",
       worstPrice,
       "persisted decision modelOutputs.worstPrice",
@@ -1160,9 +1568,9 @@ export function buildReconciliation(
   );
 
   const capHeadroom = subDecimal(realizedNotional, entryIntent.maximumTotalCost ?? "0");
-  rows.push(
+  entryRows.push(
     finish(
-      "entry.cost_cap",
+      `${prefix}entry.cost_cap`,
       "the §7.7 cost cap against what the entry actually cost",
       entryIntent.maximumTotalCost ?? "",
       "the POSITION intent's maximumTotalCost",
@@ -1191,9 +1599,9 @@ export function buildReconciliation(
       realizedShares,
     ),
   );
-  rows.push(
+  entryRows.push(
     exact(
-      "entry.expected_net_edge_formula",
+      `${prefix}entry.expected_net_edge_formula`,
       "the strategy's expected net edge, recomputed from its documented formula",
       modelledEdge,
       "takeProfitPrice × shares − entryCost − (entryFeePerShare + exitFeePerShare) × shares, " +
@@ -1210,9 +1618,9 @@ export function buildReconciliation(
     const unrounded = unroundedVenueFee(fill, schedule);
     const delta = subDecimal(fill.feeAmount, unrounded);
     const withinBound = compareDecimal(absDecimal(delta), bound) <= 0;
-    rows.push(
+    feeFills.push(
       finish(
-        `fee.fill.${fill.simulatedFillId}`,
+        `${prefix}fee.fill.${fill.simulatedFillId}`,
         `the venue fee on ${fill.shares} shares at ${fill.price}`,
         unrounded,
         `recomputed exactly from the schedule formula shares × ${
@@ -1243,47 +1651,251 @@ export function buildReconciliation(
     );
   }
 
-  rows.push(
-    finish(
-      "fee.total_model_vs_venue",
-      "the strategy's per-share fee model against what the venue actually charged",
-      mulDecimal(scenario.entryFeePerShare, realizedShares),
-      "entry.economics.entry_fee_per_share × shares — the strategy's configured constant",
-      chargedFees,
-      "Σ over the ENTRY's own fills of feeAmount — the model this row compares against is " +
-        "`entry.economics.entry_fee_per_share`, so the exit's fees are not in scope here",
-      [
-        {
-          mechanism: "FEE_MODEL_BASIS",
-          amount: subDecimal(
-            unroundedFees,
-            mulDecimal(scenario.entryFeePerShare, realizedShares),
-          ),
-          note:
-            `the ad-valorem schedule's exact total is ${unroundedFees}; the per-share model's ` +
-            `total is ${mulDecimal(scenario.entryFeePerShare, realizedShares)}`,
-        },
-        {
-          mechanism: "FEE_ROUNDING_HALF_UP",
-          amount: subDecimal(chargedFees, unroundedFees),
-          note:
-            `rounding each fill HALF_UP to ${String(schedule.roundingDecimalPlaces)} places ` +
-            `moved the exact total ${unroundedFees} to ${chargedFees}`,
-        },
-      ],
-      compareDecimal(
-        absDecimal(subDecimal(chargedFees, unroundedFees)),
-        // The ENTRY's fills, matching the two totals above: a bound counted over
-        // fills this row does not sum would be slack rather than a bound.
-        mulDecimal(bound, String(entryFills.length)),
-      ) <= 0
-        ? []
-        : [
-            "the aggregate rounding change exceeds the number of fills times half a unit in " +
-              "the last place, which no sequence of per-fill HALF_UP steps can produce",
-          ],
-    ),
+  const feeTotal = finish(
+    `${prefix}fee.total_model_vs_venue`,
+    "the strategy's per-share fee model against what the venue actually charged",
+    mulDecimal(scenario.entryFeePerShare, realizedShares),
+    "entry.economics.entry_fee_per_share × shares — the strategy's configured constant",
+    chargedFees,
+    "Σ over the ENTRY's own fills of feeAmount — the model this row compares against is " +
+      "`entry.economics.entry_fee_per_share`, so the exit's fees are not in scope here",
+    [
+      {
+        mechanism: "FEE_MODEL_BASIS",
+        amount: subDecimal(
+          unroundedFees,
+          mulDecimal(scenario.entryFeePerShare, realizedShares),
+        ),
+        note:
+          `the ad-valorem schedule's exact total is ${unroundedFees}; the per-share model's ` +
+          `total is ${mulDecimal(scenario.entryFeePerShare, realizedShares)}`,
+      },
+      {
+        mechanism: "FEE_ROUNDING_HALF_UP",
+        amount: subDecimal(chargedFees, unroundedFees),
+        note:
+          `rounding each fill HALF_UP to ${String(schedule.roundingDecimalPlaces)} places ` +
+          `moved the exact total ${unroundedFees} to ${chargedFees}`,
+      },
+    ],
+    compareDecimal(
+      absDecimal(subDecimal(chargedFees, unroundedFees)),
+      // The ENTRY's fills, matching the two totals above: a bound counted over
+      // fills this row does not sum would be slack rather than a bound.
+      mulDecimal(bound, String(entryFills.length)),
+    ) <= 0
+      ? []
+      : [
+          "the aggregate rounding change exceeds the number of fills times half a unit in " +
+            "the last place, which no sequence of per-fill HALF_UP steps can produce",
+        ],
   );
+
+  // --- the round trip, now that one exists ----------------------------------
+
+  /**
+   * `RISK-2`: this row USED TO BE AN ABSENCE. It carried
+   * `PROTECTIVE_EXIT_REFUSED_AT_RISK_SEAM` and said "no exit fill exists in this
+   * run", which was true only because GOV-2B blocker B2 refused every
+   * protective exit at the risk seam. The exit now fills, so the projection has
+   * a realized counterpart and is reconciled against it.
+   *
+   * The difference is large and is stated as exact contributions: the exit did
+   * not happen at the take-profit price (the bracket ran out of time and closed
+   * under §13.3's `final_policy`), and the venue's ad-valorem fees are not the
+   * strategy's per-share constant.
+   *
+   * ## An open position at run end (`RECON-2`, the `RECON1-EDGE` ruling)
+   *
+   * The row stays the ENTRY intent's persisted projection against the round
+   * trip realized SO FAR. The projection is the strategy's documented formula
+   * (`packages/strategies/static-bracket` `expectedNetEdge`), over the entry's
+   * size E, at the take-profit price TP, with the configured per-share fees fe
+   * and fx:
+   *
+   *     TP × E − entryCost − (fe + fx) × E
+   *
+   * The realized side is `P − N − C` — exit proceeds, entry notional, charged
+   * fees. With X shares exited and O = E − X still open, the contributions are
+   *
+   *     EXIT_BELOW_TAKE_PROFIT     P − TP × X
+   *     POSITION_OPEN_AT_RUN_END   −(TP − fx) × O          (only when O ≠ 0)
+   *     FEE_MODEL_BASIS            −(U − (fe × E + fx × X)) (U = the exact fees)
+   *     FEE_ROUNDING_HALF_UP       −(C − U)
+   *
+   * and they sum to `P − TP × E + (fe + fx) × E − C`, which is the difference
+   * EXACTLY when `entryCost = N` and the entry filled its whole size — the two
+   * things `entry.projected_cost` and `entry.shares` assert on their own rows.
+   * Any other gap stays a residual here too: the decomposition names what the
+   * run did, it does not absorb what it did not. `RECON-1` modelled the exit fee
+   * on all E shares and had no open-position term, so a correct partial exit
+   * left `TP × (X − E)` unexplained (−12.5 selling 25 of 50). For a fully
+   * closed round trip X = E, the new term is absent and `fe × E + fx × X` is
+   * `(fe + fx) × E`: the golden's row is unchanged, number and word.
+   */
+  const realizedRoundTrip = subDecimal(
+    subDecimal(exitProceeds, realizedNotional),
+    allChargedFees,
+  );
+  const targetProceeds = mulDecimal(scenario.takeProfitPrice, exitShares);
+  const openShares = subDecimal(realizedShares, exitShares);
+  const positionOpen = compareDecimal(openShares, "0") !== 0;
+  const modelledFees = addDecimal(
+    mulDecimal(scenario.entryFeePerShare, realizedShares),
+    mulDecimal(scenario.exitFeePerShare, exitShares),
+  );
+  const unrealizedNetProceeds = mulDecimal(
+    subDecimal(scenario.takeProfitPrice, scenario.exitFeePerShare),
+    openShares,
+  );
+  /** What realized the exit proceeds, by the decisions that placed the exit orders. */
+  const exitKinds = [
+    ...new Set(
+      exitFills.map((fill) => exitKindOf(exitOrigins.get(fill.simulatedOrderId)?.decision.decisionType ?? "")),
+    ),
+  ];
+  const exitedBy =
+    exitKinds.length === 0
+      ? "no exit fill"
+      : exitKinds.length === 1
+        ? `the ${exitKinds[0] ?? ""}`
+        : `the exits (${exitKinds.join(", ")})`;
+  const exitEdge = finish(
+    `${prefix}exit.expected_net_edge`,
+    "the round trip's expected net edge against what the round trip actually returned",
+    projectedEdge,
+    "the entry POSITION intent's expectedNetEdge, as persisted with the decision",
+    realizedRoundTrip,
+    "Σ exit fill notional − Σ entry fill notional − Σ charged fees on every fill",
+    [
+      {
+        mechanism: "EXIT_BELOW_TAKE_PROFIT",
+        amount: subDecimal(exitProceeds, targetProceeds),
+        note:
+          `the projection assumed ${exitShares} shares would leave at ` +
+          `${scenario.takeProfitPrice} for ${targetProceeds}; ${exitedBy} ` +
+          `realized ${exitProceeds}`,
+      },
+      ...(positionOpen
+        ? [
+            {
+              mechanism: "POSITION_OPEN_AT_RUN_END" as const,
+              amount: negateDecimal(unrealizedNetProceeds),
+              note:
+                `${openShares} of the ${realizedShares} entry shares were still held when the ` +
+                `run ended; the projection's net proceeds for them, (${scenario.takeProfitPrice} ` +
+                `− ${scenario.exitFeePerShare}) × ${openShares} = ${unrealizedNetProceeds}, ` +
+                "have not happened",
+            },
+          ]
+        : []),
+      {
+        mechanism: "FEE_MODEL_BASIS",
+        amount: negateDecimal(subDecimal(allUnroundedFees, modelledFees)),
+        note:
+          (positionOpen
+            ? `the strategy modelled entry_fee_per_share × ${realizedShares} entry shares + ` +
+              `exit_fee_per_share × ${exitShares} exited shares = ${modelledFees} (the open ` +
+              "shares' exit fee is inside POSITION_OPEN_AT_RUN_END)"
+            : `the strategy modelled (entry_fee_per_share + exit_fee_per_share) × shares = ` +
+              `${modelledFees}`) +
+          `; the schedule's exact ad-valorem total over every fill is ${allUnroundedFees}`,
+      },
+      {
+        mechanism: "FEE_ROUNDING_HALF_UP",
+        amount: negateDecimal(subDecimal(allChargedFees, allUnroundedFees)),
+        note:
+          `rounding each fill HALF_UP to ${String(schedule.roundingDecimalPlaces)} places ` +
+          `moved the exact total ${allUnroundedFees} to ${allChargedFees}`,
+      },
+    ],
+  );
+
+  // --- the projection with NO realized counterpart --------------------------
+
+  // `RECON-1`: the orders attributed to an EXIT, and no longer every order that
+  // is not the entry's — an entry order withdrawn unfilled is not an exit.
+  // `RECON-2`: attributed by each order's own provenance record, which also
+  // names the decision that placed it, so the row says WHAT was withdrawn: a
+  // take-profit (`exit`) or a protective reduction (`reduce`).
+  const cancelledExits = artifact.orders.filter(
+    (order) =>
+      exitOrigins.has(order.simulatedOrderId) &&
+      order.state === "CANCELLED" &&
+      compareDecimal(order.filledShares, "0") === 0,
+  );
+  for (const order of cancelledExits) {
+    const origin = exitOrigins.get(order.simulatedOrderId);
+    const decisionType = origin?.decision.decisionType ?? "";
+    const withdrawn = exitKindOf(decisionType);
+    cancelled.push(
+      absent(
+        `${prefix}exit.cancelled_proceeds.${order.simulatedOrderId}`,
+        `the proceeds a withdrawn ${withdrawn} projected`,
+        mulDecimal(order.limitPrice, order.requestedShares),
+        "the cancelled order's own limitPrice × requestedShares",
+        "no fill exists for this order",
+        {
+          mechanism: "RESTING_EXIT_CANCELLED_UNFILLED",
+          amount: "0",
+          note:
+            `order ${order.simulatedOrderId} — the ${withdrawn} the \`${decisionType}\` decision ` +
+            `at evaluationSeq ${String(origin?.decision.evaluationSeq ?? "")} placed (intent ` +
+            `${origin?.intent.intentId ?? ""}), by its provenance record — rested ` +
+            `${order.requestedShares} shares at ${order.limitPrice} and was withdrawn with ` +
+            `${order.filledShares} filled; the run confirmed ` +
+            `${String(artifact.health.execution["cancelsConfirmed"] ?? 0)} cancel(s)`,
+        },
+      ),
+    );
+  }
+
+  return { entry: entryRows, feeFills, feeTotal, exitEdge, cancelled };
+}
+
+/**
+ * The run-CUMULATIVE rows: the instance's ledger lines and its LAST PnL
+ * snapshot, against every attributed fill of every bracket. For a one-bracket
+ * run these are exactly the rows the table always listed between the fee total
+ * and the round trip's edge.
+ */
+function cumulativeRows(
+  artifact: Omit<PaperRunArtifact, "reconciliation">,
+  entryFills: readonly ArtifactFill[],
+  exitFills: readonly ArtifactFill[],
+): readonly ReconciliationRow[] {
+  const rows: ReconciliationRow[] = [];
+  const scenario = artifact.scenario;
+  const fills = artifact.fills;
+  const realizedNotional = sum(entryFills.map((fill) => mulDecimal(fill.price, fill.shares)));
+  const realizedShares = sum(entryFills.map((fill) => fill.shares));
+  const exitProceeds = sum(exitFills.map((fill) => mulDecimal(fill.price, fill.shares)));
+  const exitShares = sum(exitFills.map((fill) => fill.shares));
+  const allChargedFees = sum(fills.map((fill) => fill.feeAmount));
+
+  /**
+   * The cost basis the position still holds, by `packages/pnl`'s OWN cost
+   * method — average cost — restated in {@link openCostBasisOf} (`RECON-1` r1).
+   *
+   * THIS USED TO BE A FIFO FOLD, and that was the wrong oracle. `RISK-2` wrote
+   * it FIFO to avoid a division (§6 invariant 1), describing it as
+   * "`packages/pnl`'s open cost basis … folded FIFO" — but `packages/pnl` is
+   * average cost (`state.ts`: "Cost method: average cost per token asset") and
+   * the persisted snapshot these rows compare against comes from it; FIFO is
+   * `apps/trader`'s allocator book (`allocation.ts`), a different number. The
+   * division concern is answered by the engine's own specification, which
+   * states an exact-decimal policy for it. The two methods agree in the only
+   * two states the committed golden holds — fully open (the whole notional) and
+   * fully closed (`"0"`) — so the golden is unchanged; on a PARTIAL exit at
+   * mixed lot prices FIFO flagged a correct run as unexplained.
+   *
+   * `RECON-1` could not change the golden, so the `projectedSource` text of
+   * `pnl.capital_committed` and `pnl.worst_case_resolution` below kept saying
+   * "FIFO" (`RECON1-TEXT`). `RECON-2` regenerated the golden and corrected both
+   * strings; the NUMBERS did not move, because they never differed for any state
+   * the golden holds.
+   */
+  const openCostBasis = openCostBasisOf(entryFills, exitFills);
 
   // --- the ledger, folded from the append-only history ----------------------
 
@@ -1425,168 +2037,143 @@ export function buildReconciliation(
     ),
   );
 
-  // --- the round trip, now that one exists ----------------------------------
+  return rows;
+}
 
-  /**
-   * `RISK-2`: this row USED TO BE AN ABSENCE. It carried
-   * `PROTECTIVE_EXIT_REFUSED_AT_RISK_SEAM` and said "no exit fill exists in this
-   * run", which was true only because GOV-2B blocker B2 refused every
-   * protective exit at the risk seam. The exit now fills, so the projection has
-   * a realized counterpart and is reconciled against it.
-   *
-   * The difference is large and is stated as exact contributions: the exit did
-   * not happen at the take-profit price (the bracket ran out of time and closed
-   * under §13.3's `final_policy`), and the venue's ad-valorem fees are not the
-   * strategy's per-share constant.
-   *
-   * ## An open position at run end (`RECON-2`, the `RECON1-EDGE` ruling)
-   *
-   * The row stays the ENTRY intent's persisted projection against the round
-   * trip realized SO FAR. The projection is the strategy's documented formula
-   * (`packages/strategies/static-bracket` `expectedNetEdge`), over the entry's
-   * size E, at the take-profit price TP, with the configured per-share fees fe
-   * and fx:
-   *
-   *     TP × E − entryCost − (fe + fx) × E
-   *
-   * The realized side is `P − N − C` — exit proceeds, entry notional, charged
-   * fees. With X shares exited and O = E − X still open, the contributions are
-   *
-   *     EXIT_BELOW_TAKE_PROFIT     P − TP × X
-   *     POSITION_OPEN_AT_RUN_END   −(TP − fx) × O          (only when O ≠ 0)
-   *     FEE_MODEL_BASIS            −(U − (fe × E + fx × X)) (U = the exact fees)
-   *     FEE_ROUNDING_HALF_UP       −(C − U)
-   *
-   * and they sum to `P − TP × E + (fe + fx) × E − C`, which is the difference
-   * EXACTLY when `entryCost = N` and the entry filled its whole size — the two
-   * things `entry.projected_cost` and `entry.shares` assert on their own rows.
-   * Any other gap stays a residual here too: the decomposition names what the
-   * run did, it does not absorb what it did not. `RECON-1` modelled the exit fee
-   * on all E shares and had no open-position term, so a correct partial exit
-   * left `TP × (X − E)` unexplained (−12.5 selling 25 of 50). For a fully
-   * closed round trip X = E, the new term is absent and `fe × E + fx × X` is
-   * `(fe + fx) × E`: the golden's row is unchanged, number and word.
-   */
-  const realizedRoundTrip = subDecimal(
-    subDecimal(exitProceeds, realizedNotional),
-    allChargedFees,
-  );
-  const targetProceeds = mulDecimal(scenario.takeProfitPrice, exitShares);
-  const openShares = subDecimal(realizedShares, exitShares);
-  const positionOpen = compareDecimal(openShares, "0") !== 0;
-  const modelledFees = addDecimal(
-    mulDecimal(scenario.entryFeePerShare, realizedShares),
-    mulDecimal(scenario.exitFeePerShare, exitShares),
-  );
-  const unrealizedNetProceeds = mulDecimal(
-    subDecimal(scenario.takeProfitPrice, scenario.exitFeePerShare),
-    openShares,
-  );
-  /** What realized the exit proceeds, by the decisions that placed the exit orders. */
-  const exitKinds = [
-    ...new Set(
-      exitFills.map((fill) => exitKindOf(exitOrigins.get(fill.simulatedOrderId)?.decision.decisionType ?? "")),
-    ),
-  ];
-  const exitedBy =
-    exitKinds.length === 0
-      ? "no exit fill"
-      : exitKinds.length === 1
-        ? `the ${exitKinds[0] ?? ""}`
-        : `the exits (${exitKinds.join(", ")})`;
-  rows.push(
-    finish(
-      "exit.expected_net_edge",
-      "the round trip's expected net edge against what the round trip actually returned",
-      projectedEdge,
-      "the entry POSITION intent's expectedNetEdge, as persisted with the decision",
-      realizedRoundTrip,
-      "Σ exit fill notional − Σ entry fill notional − Σ charged fees on every fill",
-      [
-        {
-          mechanism: "EXIT_BELOW_TAKE_PROFIT",
-          amount: subDecimal(exitProceeds, targetProceeds),
-          note:
-            `the projection assumed ${exitShares} shares would leave at ` +
-            `${scenario.takeProfitPrice} for ${targetProceeds}; ${exitedBy} ` +
-            `realized ${exitProceeds}`,
-        },
-        ...(positionOpen
-          ? [
-              {
-                mechanism: "POSITION_OPEN_AT_RUN_END" as const,
-                amount: negateDecimal(unrealizedNetProceeds),
-                note:
-                  `${openShares} of the ${realizedShares} entry shares were still held when the ` +
-                  `run ended; the projection's net proceeds for them, (${scenario.takeProfitPrice} ` +
-                  `− ${scenario.exitFeePerShare}) × ${openShares} = ${unrealizedNetProceeds}, ` +
-                  "have not happened",
-              },
-            ]
-          : []),
-        {
-          mechanism: "FEE_MODEL_BASIS",
-          amount: negateDecimal(subDecimal(allUnroundedFees, modelledFees)),
-          note:
-            (positionOpen
-              ? `the strategy modelled entry_fee_per_share × ${realizedShares} entry shares + ` +
-                `exit_fee_per_share × ${exitShares} exited shares = ${modelledFees} (the open ` +
-                "shares' exit fee is inside POSITION_OPEN_AT_RUN_END)"
-              : `the strategy modelled (entry_fee_per_share + exit_fee_per_share) × shares = ` +
-                `${modelledFees}`) +
-            `; the schedule's exact ad-valorem total over every fill is ${allUnroundedFees}`,
-        },
-        {
-          mechanism: "FEE_ROUNDING_HALF_UP",
-          amount: negateDecimal(subDecimal(allChargedFees, allUnroundedFees)),
-          note:
-            `rounding each fill HALF_UP to ${String(schedule.roundingDecimalPlaces)} places ` +
-            `moved the exact total ${allUnroundedFees} to ${allChargedFees}`,
-        },
-      ],
-    ),
-  );
+/** One §9.16 TRADE record of the instance's stream, placed in its bracket BY ID. */
+interface BracketTrade {
+  readonly record: ArtifactPnlRecord;
+  /** The venue fill the record books, found through the chain that posted it. */
+  readonly fill: ArtifactFill;
+  /** True for an entry fill (it opens), false for an exit fill (it closes). */
+  readonly opens: boolean;
+}
 
-  // --- the projection with NO realized counterpart --------------------------
-
-  // `RECON-1`: the orders attributed to an EXIT, and no longer every order that
-  // is not the entry's — an entry order withdrawn unfilled is not an exit.
-  // `RECON-2`: attributed by each order's own provenance record, which also
-  // names the decision that placed it, so the row says WHAT was withdrawn: a
-  // take-profit (`exit`) or a protective reduction (`reduce`).
-  const cancelledExits = artifact.orders.filter(
-    (order) =>
-      exitOrigins.has(order.simulatedOrderId) &&
-      order.state === "CANCELLED" &&
-      compareDecimal(order.filledShares, "0") === 0,
-  );
-  for (const order of cancelledExits) {
-    const origin = exitOrigins.get(order.simulatedOrderId);
-    const decisionType = origin?.decision.decisionType ?? "";
-    const withdrawn = exitKindOf(decisionType);
-    rows.push(
-      absent(
-        `exit.cancelled_proceeds.${order.simulatedOrderId}`,
-        `the proceeds a withdrawn ${withdrawn} projected`,
-        mulDecimal(order.limitPrice, order.requestedShares),
-        "the cancelled order's own limitPrice × requestedShares",
-        "no fill exists for this order",
-        {
-          mechanism: "RESTING_EXIT_CANCELLED_UNFILLED",
-          amount: "0",
-          note:
-            `order ${order.simulatedOrderId} — the ${withdrawn} the \`${decisionType}\` decision ` +
-            `at evaluationSeq ${String(origin?.decision.evaluationSeq ?? "")} placed (intent ` +
-            `${origin?.intent.intentId ?? ""}), by its provenance record — rested ` +
-            `${order.requestedShares} shares at ${order.limitPrice} and was withdrawn with ` +
-            `${order.filledShares} filled; the run confirmed ` +
-            `${String(artifact.health.execution["cancelsConfirmed"] ?? 0)} cancel(s)`,
-        },
-      ),
-    );
+/**
+ * Each bracket's §9.16 TRADE records (`BRACKET-1b`), resolved BY ID: a record's
+ * `ref` is the ledger transaction it follows from, the chain (trace) that
+ * posted that transaction names the fill, and the fill's order places it in a
+ * bracket and on a side. Only the scenario instance's `VIRTUAL_STRATEGY`
+ * records are read — the artefact carries no other stream.
+ *
+ * A TRADE record that no chain posted, or whose fill is in no bracket, is
+ * REFUSED: its bracket cannot be established by id, and dropping it would make
+ * a bracket's realized PnL agree with its fills by omission.
+ */
+function tradeRecordsByBracket(
+  artifact: Omit<PaperRunArtifact, "reconciliation">,
+  attributions: readonly Attribution[],
+): ReadonlyMap<number, readonly BracketTrade[]> {
+  const fillOfTransaction = new Map<string, string>();
+  for (const trace of artifact.traces) {
+    for (const id of trace.ledgerTransactionIds) fillOfTransaction.set(id, trace.venueFillId);
   }
+  const placed = new Map<string, { readonly bracket: number; readonly fill: ArtifactFill; readonly opens: boolean }>();
+  for (const attribution of attributions) {
+    const bracket = attribution.bracket.ordinal;
+    for (const fill of attribution.entryFills) placed.set(fill.simulatedFillId, { bracket, fill, opens: true });
+    for (const fill of attribution.exitFills) placed.set(fill.simulatedFillId, { bracket, fill, opens: false });
+  }
+  const byBracket = new Map<number, BracketTrade[]>();
+  for (const record of artifact.pnlRecords) {
+    if (record.kind !== "TRADE") continue;
+    if (record.scope !== "VIRTUAL_STRATEGY" || record.instanceId !== artifact.scenario.instanceId) {
+      continue;
+    }
+    const fillId = fillOfTransaction.get(record.ref);
+    const at = fillId === undefined ? undefined : placed.get(fillId);
+    if (at === undefined) {
+      throw new Error(
+        `the §9.16 TRADE record whose ref is ledger transaction ${record.ref} ` +
+          (fillId === undefined
+            ? "follows from a transaction no chain in this document posted"
+            : `books fill ${fillId}, which no bracket's attribution holds`) +
+          ", so the bracket it belongs to cannot be established by id and no per-bracket " +
+          "realized PnL is reported",
+      );
+    }
+    const list = byBracket.get(at.bracket) ?? [];
+    list.push({ record, fill: at.fill, opens: at.opens });
+    byBracket.set(at.bracket, list);
+  }
+  return byBracket;
+}
 
-  return Object.freeze(rows);
+/**
+ * `bracket.<n>.pnl.realized` (`BRACKET-1b`): the bracket's realized trading PnL
+ * (before fees), from TWO sources that must agree exactly.
+ *
+ * - PROJECTED: its own venue FILLS, folded from the bracket's flat start —
+ *   which {@link refuseMisplacedBoundaries} proved — by `packages/pnl`'s
+ *   average-cost method ({@link foldFills}).
+ * - REALIZED: its §9.16 TRADE records, the stream the PnL engine folds,
+ *   attributed to the bracket by id ({@link tradeRecordsByBracket}) and folded
+ *   the same way, in their fills' consumption order.
+ *
+ * The run-cumulative `pnl.realized` then checks that these per-bracket values
+ * sum to what the engine itself persisted.
+ */
+function bracketRealizedRow(
+  prefix: string,
+  attribution: Attribution,
+  trades: readonly BracketTrade[],
+): ReconciliationRow {
+  const fromFills = foldFills(attribution.entryFills, attribution.exitFills).realized;
+  const movements = [...trades]
+    .sort((left, right) => inConsumptionOrder(left.fill, right.fill))
+    .map(({ record, fill, opens }) => {
+      if (record.shares === null || record.price === null) {
+        throw new Error(
+          `the §9.16 TRADE record whose ref is ledger transaction ${record.ref} carries no ` +
+            "shares or no price, so it cannot be folded",
+        );
+      }
+      return {
+        label: `the TRADE record (ledger transaction ${record.ref}) of fill ${fill.simulatedFillId}`,
+        token: record.tokenAssetId ?? fill.tokenId,
+        shares: record.shares,
+        price: record.price,
+        opens,
+      };
+    });
+  const fromRecords = foldMovements(movements).realized;
+  return exact(
+    `${prefix}pnl.realized`,
+    "the bracket's realized trading PnL, before fees",
+    fromFills,
+    "the bracket's own venue fills, folded from its flat start by packages/pnl's average-cost " +
+      "method — each exit fill realizes price × shares less the basis it removes — in " +
+      "atEventIngestSeq order",
+    fromRecords,
+    "the bracket's §9.16 TRADE records in the persisted pnlRecords stream, each placed in the " +
+      "bracket by id (record.ref → the chain that posted that ledger transaction → its fill), " +
+      "folded the same way",
+  );
+}
+
+/**
+ * The run-cumulative `pnl.realized` (`BRACKET-1b`): the per-bracket realized
+ * PnL, summed, against the engine's own last persisted snapshot. This is the
+ * row that checks the brackets ADD UP to the run.
+ */
+function cumulativeRealizedRow(
+  artifact: Omit<PaperRunArtifact, "reconciliation">,
+  attributions: readonly Attribution[],
+  realizedByBracket: readonly string[],
+): ReconciliationRow {
+  const snapshot = artifact.pnlSnapshots.at(-1);
+  if (snapshot === undefined) {
+    throw new Error("the run persisted no PnL snapshot; the chain does not reach §9.16");
+  }
+  return exact(
+    "pnl.realized",
+    "realized trading PnL, as the sum of the run's brackets",
+    sum(realizedByBracket),
+    `Σ over the ${String(attributions.length)} brackets of bracket.<n>.pnl.realized's fill-folded ` +
+      `value (${realizedByBracket.join(" + ")})`,
+    String(snapshot["realizedPnl"] ?? ""),
+    "the last persisted PnL snapshot's realizedPnl",
+  );
 }
 
 /** Every row whose difference is not fully accounted for. */

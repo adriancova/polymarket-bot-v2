@@ -65,6 +65,19 @@ const HOP_MUTATIONS: readonly HopMutation[] = [
     },
   },
   {
+    hop: "event",
+    what:
+      "the chain says \"\" — an evaluation the loop originated — but its persisted decision " +
+      "names a recorded event (`RECON2-EVENTHOP`'s negative: \"\" is accepted ONLY against a " +
+      "decision that states no source event, so both hops break)",
+    breaks: ["event", "decision"],
+    mutate: (document) => {
+      // Chain 0 is the entry's, placed by an `onFeatures` evaluation whose
+      // persisted decision names event 5.
+      row(document, "traces", 0)["sourceEventId"] = "";
+    },
+  },
+  {
     hop: "feature",
     what: "the chain names a feature snapshot the persisted decision did not use",
     breaks: ["feature"],
