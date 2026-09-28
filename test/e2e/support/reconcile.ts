@@ -63,6 +63,28 @@
  * row kinds are added: `bracket.<n>.pnl.realized` (the bracket's realized PnL
  * from its own fills, against its §9.16 trade records) and the cumulative
  * `pnl.realized` (the per-bracket sum against the last snapshot).
+ *
+ * ## Attribution by id, DIRECTION by the record (`BRACKET-1b` r1)
+ *
+ * Which bracket and which side a fill belongs to is decided by id, never by
+ * `action` (see {@link attributeByProvenance}). Which WAY it moved the position
+ * is not: the averaging folds read the recorded direction — a fill's `action`,
+ * a §9.16 TRADE record's `side` — exactly as `packages/pnl` does (a BUY adds to
+ * the lot, a SELL removes from it). The two readings are then CROSS-CHECKED,
+ * and a contradiction is refused by name rather than resolved in favour of
+ * either: an entry that does not buy, an exit that does not sell, a fill that
+ * disagrees with its own order, a TRADE record whose side is not its fill's, a
+ * token movement booked the other way. Before r1 the folds took the direction
+ * FROM the attribution, so an "exit" fill recorded as a purchase was folded as
+ * a sale and the boundary it should have broken was reported flat (BR1B-M1).
+ *
+ * The per-bracket realized rows also hold the PnL stream to the ledger ONE TO
+ * ONE: every `ref` once (the engine's `PNL_DUPLICATE_REF`), every TRADE record
+ * following from its own fill's token-movement transaction (`fill-posting.ts`:
+ * `tradeRef = tokenTransactionId`), every attributed fill booked by exactly one;
+ * and the POSITION the records leave must equal the one the fills leave, not
+ * only the realized PnL — a stream with an extra purchase can realize the same
+ * number while holding shares the fills do not (BR1B-M2).
  */
 
 import {
@@ -83,6 +105,7 @@ import type {
   ArtifactOrder,
   ArtifactOrderProvenance,
   ArtifactPnlRecord,
+  ArtifactTrace,
   PaperRunArtifact,
 } from "./artifact.js";
 
@@ -205,14 +228,30 @@ function exact(
   projectedSource: string,
   realized: string,
   realizedSource: string,
+  /**
+   * Reasons the caller found beyond the two values (`BRACKET-1b` r1: the
+   * positions two folds leave). Empty for every row but
+   * `bracket.<n>.pnl.realized`, and empty there on an honest run, so the row
+   * serialises exactly as before.
+   */
+  extraReasons: readonly string[] = [],
 ): ReconciliationRow {
-  return finish(id, quantity, projected, projectedSource, realized, realizedSource, [
-    {
-      mechanism: "EXACT_NO_DIFFERENCE",
-      amount: "0",
-      note: "the two values agree exactly",
-    },
-  ]);
+  return finish(
+    id,
+    quantity,
+    projected,
+    projectedSource,
+    realized,
+    realizedSource,
+    [
+      {
+        mechanism: "EXACT_NO_DIFFERENCE",
+        amount: "0",
+        note: "the two values agree exactly",
+      },
+    ],
+    extraReasons,
+  );
 }
 
 function finish(
@@ -765,7 +804,12 @@ const PROVENANCE_FIELDS = [
  * - a trace that DISAGREES with its order's provenance record on any shared
  *   field (`RECON1-ORIGIN`): the loop completes the trace FROM the record;
  * - an order that reports filled shares while no trace names it: the loop
- *   traces every fill of an order it placed.
+ *   traces every fill of an order it placed;
+ * - (`BRACKET-1b` r1, BR1B-M1) a fill that disagrees with its own booked order
+ *   on market, token, outcome side or action — the venue fills an order on
+ *   that order's instrument, in that order's direction (`packages/simulation`
+ *   `tier0.ts`) — and an order whose recorded action contradicts the side its
+ *   provenance puts it on ({@link refuseContradictedDirection}).
  *
  * ## Two cross-checks KEPT from the closed-world rule, and why
  *
@@ -1109,10 +1153,89 @@ function attributeByProvenance(
     );
   }
 
+  // --- the recorded direction agrees with the attribution (`BRACKET-1b` r1) --
+  // After every id-level check, so each of those still refuses by its own name;
+  // before the boundaries, whose flatness is folded from the recorded direction.
+  refuseContradictedDirection(artifact, booked, placement, exitOrigins);
+
   // --- several brackets: every boundary placed, and flat (`BRACKET-1b`) -----
   if (!single) refuseMisplacedBoundaries(artifact, attributions);
 
   return attributions;
+}
+
+/**
+ * The recorded DIRECTION of every order and fill, cross-checked against the
+ * side its id puts it on (`BRACKET-1b` r1, BR1B-M1). Refused, each by name:
+ *
+ * 1. A FILL that disagrees with its booked order on `marketId`, `tokenId`,
+ *    `side` or `action`. The venue fills an order on that order's instrument
+ *    and in its direction — `packages/simulation`'s fill builders copy all
+ *    four from the order they fill — so a disagreement means one of the two
+ *    records is not the run's.
+ * 2. An ORDER whose `action` is not the one its side of the bracket trades: the
+ *    entry BUYS and every exit SELLS. The table prices the entry as a purchase
+ *    (`entry.*`, the cost cap) and the exit as a sale (`exit.*`), and both
+ *    averaging folds add a BUY to the lot and remove a SELL from it, so an
+ *    "exit" that bought would be folded as a purchase and break the flatness
+ *    its attribution promised — the contradiction is refused here, by name,
+ *    instead. The complement leg (`SELL_OPPOSITE`, where an exposure increase
+ *    SELLS the other token) is not a way this strategy's entry can fill: it
+ *    needs opposite-token inventory the instance holds (`execution-planner`
+ *    `leg.ts` `selectIncreaseLeg`), and every bracket starts flat.
+ *
+ * Attribution itself still never reads `action`: it resolves the side by id,
+ * and this function only TESTS the side it resolved.
+ */
+function refuseContradictedDirection(
+  artifact: Omit<PaperRunArtifact, "reconciliation">,
+  booked: ReadonlyMap<string, ArtifactOrder>,
+  placement: ReadonlyMap<string, { readonly side: "ENTRY" | "EXIT"; readonly bracket: number }>,
+  exitOrigins: ReadonlyMap<string, Emission>,
+): void {
+  for (const fill of artifact.fills) {
+    const order = booked.get(fill.simulatedOrderId);
+    if (order === undefined) continue; // refused above as unbooked
+    const disagreements = (["marketId", "tokenId", "side", "action"] as const).filter(
+      (field) => fill[field] !== order[field],
+    );
+    if (disagreements.length > 0) {
+      throw new Error(
+        `fill ${fill.simulatedFillId} disagrees with its own order ${order.simulatedOrderId} on ` +
+          disagreements
+            .map(
+              (field) =>
+                `${field} (fill ${JSON.stringify(fill[field])}, order ${JSON.stringify(order[field])})`,
+            )
+            .join(", ") +
+          "; the venue fills an order on that order's instrument and in its direction, so the " +
+          "fill and the order cannot both be the run's, and neither is folded",
+      );
+    }
+  }
+  for (const order of artifact.orders) {
+    const placed = placement.get(order.simulatedOrderId);
+    if (placed === undefined) continue; // refused above
+    const trades = placed.side === "ENTRY" ? "BUY" : "SELL";
+    if (order.action === trades) continue;
+    const own = artifact.fills.filter((fill) => fill.simulatedOrderId === order.simulatedOrderId);
+    const origin = exitOrigins.get(order.simulatedOrderId);
+    const what =
+      placed.side === "ENTRY"
+        ? `the ENTRY of bracket ${String(placed.bracket)}`
+        : `an EXIT of bracket ${String(placed.bracket)} (the ${exitKindOf(origin?.decision.decisionType ?? "")} ` +
+          `the \`${origin?.decision.decisionType ?? ""}\` decision at evaluationSeq ` +
+          `${String(origin?.decision.evaluationSeq ?? "")} placed)`;
+    throw new Error(
+      `order ${order.simulatedOrderId}` +
+        (own.length === 0 ? "" : ` (fill ${own.map((fill) => fill.simulatedFillId).join(", ")})`) +
+        ` is ${what} by its provenance, but its recorded action is ` +
+        `${JSON.stringify(order.action)}, not ${trades}: the entry buys and every exit sells, and ` +
+        "a fill folded the way its record says would contradict the side its id puts it on. " +
+        "The recorded direction and the attribution disagree, so neither is trusted and the " +
+        "run is not reconciled",
+    );
+  }
 }
 
 /**
@@ -1273,11 +1396,17 @@ export const PNL_COST_DIVISION: DivisionOptions = Object.freeze({
  * and exit fills are folded together, in {@link inConsumptionOrder}, never in
  * the order the capture wrote them.
  *
- * THE SIGN CONVENTION IS THE TABLE'S, NOT `action`. The entry's fills add to
- * the lot and the exit's fills remove from it, attributed by id exactly as
- * every other row is. For this strategy's direct leg that is where the
- * engine's BUY/SELL lands; it is also the convention the `ledger.*` and `exit.*`
- * rows already use (the entry pays out, the exit takes in).
+ * THE DIRECTION IS THE RECORD'S (`BRACKET-1b` r1, BR1B-M1). A fill whose
+ * `action` is BUY adds to the lot and one whose `action` is SELL removes from
+ * it — the engine's own rule — and nothing else is folded. Until r1 the entry's
+ * fills were ADDED and the exit's REMOVED because attribution said so, which
+ * let an "exit" fill recorded as a purchase be folded as a sale: a boundary
+ * over 100 purchased shares was reported flat. {@link attributeByProvenance}
+ * now refuses any fill whose recorded direction contradicts the side its id
+ * puts it on ({@link refuseContradictedDirection}), so on every run this fold
+ * accepts the entry's fills still add and the exit's still remove — the
+ * convention the `ledger.*` and `exit.*` rows use (the entry pays out, the exit
+ * takes in) — but that is now CHECKED, not assumed.
  */
 function openCostBasisOf(
   entryFills: readonly ArtifactFill[],
@@ -1357,28 +1486,44 @@ function foldMovements(movements: readonly Movement[]): {
 }
 
 /**
- * The entry fills OPEN and the exit fills CLOSE — the table's sign convention,
- * attributed by id, never `action` — folded in {@link inConsumptionOrder}.
- * Every sequence is validated BEFORE the sort (`RECON-1` r2).
+ * Whether a recorded direction OPENS (adds to the lot): `BUY` does, `SELL` does
+ * not, and anything else is refused — `packages/pnl` folds a TRADE as one of
+ * the two and nothing else (`state.ts` `applyTrade`).
+ */
+function opensBy(direction: string | null, what: string): boolean {
+  if (direction === "BUY") return true;
+  if (direction === "SELL") return false;
+  throw new Error(
+    `${what} is ${JSON.stringify(direction)}, neither BUY nor SELL; packages/pnl folds a trade ` +
+      "as a purchase or a sale and nothing else, so it cannot be folded",
+  );
+}
+
+/**
+ * Every fill of `entryFills` and `exitFills`, folded by its RECORDED direction
+ * — `action`, the engine's rule (`BRACKET-1b` r1) — in {@link inConsumptionOrder}.
+ * The two arrays say only WHICH fills are folded; which way each one moved the
+ * lot is its own record's. Every sequence is validated BEFORE the sort
+ * (`RECON-1` r2).
  */
 function foldFills(
   entryFills: readonly ArtifactFill[],
   exitFills: readonly ArtifactFill[],
 ): { readonly lots: ReadonlyMap<string, Lot>; readonly realized: string } {
-  const unsorted = [
-    ...entryFills.map((fill) => ({ fill, opens: true })),
-    ...exitFills.map((fill) => ({ fill, opens: false })),
-  ];
-  for (const { fill } of unsorted) assertCanonicalIngestSeq(fill.atEventIngestSeq);
-  const sequence = unsorted.sort((left, right) => inConsumptionOrder(left.fill, right.fill));
+  const unsorted = [...entryFills, ...exitFills];
+  for (const fill of unsorted) assertCanonicalIngestSeq(fill.atEventIngestSeq);
+  const sequence = unsorted.sort(inConsumptionOrder);
   return foldMovements(
-    sequence.map(({ fill, opens }) => ({
-      label: `exit fill ${fill.simulatedFillId}`,
-      token: fill.tokenId,
-      shares: fill.shares,
-      price: fill.price,
-      opens,
-    })),
+    sequence.map((fill) => {
+      const opens = opensBy(fill.action, `the action of fill ${fill.simulatedFillId}`);
+      return {
+        label: `${opens ? "entry" : "exit"} fill ${fill.simulatedFillId}`,
+        token: fill.tokenId,
+        shares: fill.shares,
+        price: fill.price,
+        opens,
+      };
+    }),
   );
 }
 
@@ -1438,7 +1583,7 @@ export function buildReconciliation(
 
   const rows: ReconciliationRow[] = [];
   const realizedByBracket: string[] = [];
-  const recordsByBracket = tradeRecordsByBracket(artifact, attributions);
+  const trades = tradeRecordsByBracket(artifact, attributions);
   for (const attribution of attributions) {
     const prefix = `bracket.${String(attribution.bracket.ordinal)}.`;
     const own = new Set([...attribution.entryFills, ...attribution.exitFills]);
@@ -1451,7 +1596,8 @@ export function buildReconciliation(
     const realized = bracketRealizedRow(
       prefix,
       attribution,
-      recordsByBracket.get(attribution.bracket.ordinal) ?? [],
+      trades.byBracket.get(attribution.bracket.ordinal) ?? [],
+      trades.recordTokenOf,
     );
     realizedByBracket.push(realized.projected);
     rows.push(
@@ -2045,9 +2191,20 @@ interface BracketTrade {
   readonly record: ArtifactPnlRecord;
   /** The venue fill the record books, found through the chain that posted it. */
   readonly fill: ArtifactFill;
-  /** True for an entry fill (it opens), false for an exit fill (it closes). */
-  readonly opens: boolean;
 }
+
+/** Each bracket's TRADE records, and the stream's token for each venue token. */
+interface BracketTrades {
+  readonly byBracket: ReadonlyMap<number, readonly BracketTrade[]>;
+  /** A fill's `tokenId` → the `tokenAssetId` its TRADE records carry; one to one. */
+  readonly recordTokenOf: ReadonlyMap<string, string>;
+}
+
+/** `fill-posting.ts`'s token movement, by the direction of the fill it books. */
+const TOKEN_MOVEMENT_OF: Readonly<Record<string, string>> = Object.freeze({
+  BUY: "OUTCOME_TOKEN_RECEIPT",
+  SELL: "OUTCOME_TOKEN_DELIVERY",
+});
 
 /**
  * Each bracket's §9.16 TRADE records (`BRACKET-1b`), resolved BY ID: a record's
@@ -2059,30 +2216,89 @@ interface BracketTrade {
  * A TRADE record that no chain posted, or whose fill is in no bracket, is
  * REFUSED: its bracket cannot be established by id, and dropping it would make
  * a bracket's realized PnL agree with its fills by omission.
+ *
+ * ## The stream and the ledger, one to one (`BRACKET-1b` r1, BR1B-M1 / BR1B-M2)
+ *
+ * `packages/ledger` `buildFillPosting` books ONE TRADE record per owner of a
+ * fill, whose `ref` is that fill's TOKEN-MOVEMENT transaction
+ * (`tradeRef = ids.tokenTransactionId`) and whose `side` is the fill's
+ * direction (`side: fill.side`, which `apps/trader` sets from the venue fill's
+ * `action`); the movement is an `OUTCOME_TOKEN_RECEIPT` for a purchase and an
+ * `OUTCOME_TOKEN_DELIVERY` for a sale. `packages/pnl` folds each `ref` ONCE and
+ * refuses a repeat (`PNL_DUPLICATE_REF`). So, refused, each by name:
+ *
+ * - a `ref` the instance's stream carries twice, of any kind;
+ * - a ledger transaction two chains both name (its fill is ambiguous);
+ * - a TRADE record whose `ref` is not its fill's token movement: a transaction
+ *   the ledger section does not hold, a `TRADE_PRINCIPAL` or `PLATFORM_FEE`
+ *   one, or one booked for another ledger fill;
+ * - a token movement booked the other way from its fill (a RECEIPT for a
+ *   sale, a DELIVERY for a purchase), and a TRADE record whose `side` is not
+ *   its fill's `action`: recorded directions that contradict each other;
+ * - a fill with no TRADE record, or with two: the realized PnL of a bracket the
+ *   stream books partly, or twice, is not the engine's for that bracket;
+ * - a venue token whose records name two stream tokens, or two venue tokens
+ *   one: the positions the two folds leave could not be compared.
+ *
+ * Before r1 every transaction a chain named mapped to its fill, a duplicate or
+ * an extra purchase was folded without a word, and a record's direction was
+ * taken from the attribution instead of the record.
  */
 function tradeRecordsByBracket(
   artifact: Omit<PaperRunArtifact, "reconciliation">,
   attributions: readonly Attribution[],
-): ReadonlyMap<number, readonly BracketTrade[]> {
-  const fillOfTransaction = new Map<string, string>();
-  for (const trace of artifact.traces) {
-    for (const id of trace.ledgerTransactionIds) fillOfTransaction.set(id, trace.venueFillId);
+): BracketTrades {
+  const stream = artifact.pnlRecords.filter(
+    (record) =>
+      record.scope === "VIRTUAL_STRATEGY" && record.instanceId === artifact.scenario.instanceId,
+  );
+  const seen = new Map<string, string>();
+  for (const record of stream) {
+    const first = seen.get(record.ref);
+    if (first !== undefined) {
+      throw new Error(
+        `the instance's §9.16 stream carries ref ${record.ref} twice (a ${first} record, then a ` +
+          `${record.kind} record); packages/pnl folds a ref ONCE and refuses the repeat ` +
+          "(PNL_DUPLICATE_REF), so this is not a stream the engine folded, and no per-bracket " +
+          "realized PnL is reported",
+      );
+    }
+    seen.set(record.ref, record.kind);
   }
-  const placed = new Map<string, { readonly bracket: number; readonly fill: ArtifactFill; readonly opens: boolean }>();
+  const chainOfTransaction = new Map<string, ArtifactTrace>();
+  for (const trace of artifact.traces) {
+    for (const id of trace.ledgerTransactionIds) {
+      const other = chainOfTransaction.get(id);
+      if (other !== undefined && other.venueFillId !== trace.venueFillId) {
+        throw new Error(
+          `ledger transaction ${id} is named by the chains of fill ${other.venueFillId} and fill ` +
+            `${trace.venueFillId}; a transaction books one fill, so the fill a record following ` +
+            "from it books is ambiguous and no per-bracket realized PnL is reported",
+        );
+      }
+      chainOfTransaction.set(id, trace);
+    }
+  }
+  const transactions = new Map(
+    artifact.ledgerTransactions.map((transaction) => [transaction.ledgerTransactionId, transaction]),
+  );
+  const placed = new Map<string, { readonly bracket: number; readonly fill: ArtifactFill }>();
   for (const attribution of attributions) {
     const bracket = attribution.bracket.ordinal;
-    for (const fill of attribution.entryFills) placed.set(fill.simulatedFillId, { bracket, fill, opens: true });
-    for (const fill of attribution.exitFills) placed.set(fill.simulatedFillId, { bracket, fill, opens: false });
+    for (const fill of [...attribution.entryFills, ...attribution.exitFills]) {
+      placed.set(fill.simulatedFillId, { bracket, fill });
+    }
   }
   const byBracket = new Map<number, BracketTrade[]>();
-  for (const record of artifact.pnlRecords) {
+  const recordOfFill = new Map<string, ArtifactPnlRecord>();
+  const recordTokenOf = new Map<string, string>();
+  const venueTokenOf = new Map<string, string>();
+  for (const record of stream) {
     if (record.kind !== "TRADE") continue;
-    if (record.scope !== "VIRTUAL_STRATEGY" || record.instanceId !== artifact.scenario.instanceId) {
-      continue;
-    }
-    const fillId = fillOfTransaction.get(record.ref);
+    const chain = chainOfTransaction.get(record.ref);
+    const fillId = chain?.venueFillId;
     const at = fillId === undefined ? undefined : placed.get(fillId);
-    if (at === undefined) {
+    if (chain === undefined || at === undefined) {
       throw new Error(
         `the §9.16 TRADE record whose ref is ledger transaction ${record.ref} ` +
           (fillId === undefined
@@ -2092,11 +2308,120 @@ function tradeRecordsByBracket(
           "realized PnL is reported",
       );
     }
+    const fill = at.fill;
+    const named = `the §9.16 TRADE record whose ref is ledger transaction ${record.ref} (fill ${fill.simulatedFillId})`;
+    const movement = TOKEN_MOVEMENT_OF[fill.action];
+    const transaction = transactions.get(record.ref);
+    if (transaction === undefined) {
+      throw new Error(
+        `${named} follows from a transaction the document's ledger section does not hold, so it ` +
+          "cannot be shown to be the fill's token movement, and no per-bracket realized PnL is " +
+          "reported",
+      );
+    }
+    if (transaction.fillId !== chain.ledgerFillId || !Object.values(TOKEN_MOVEMENT_OF).includes(transaction.eventType)) {
+      throw new Error(
+        `${named} follows from a ${transaction.eventType} transaction booked for ledger fill ` +
+          `${transaction.fillId ?? "none"}, not from the token movement of ledger fill ` +
+          `${chain.ledgerFillId}: packages/ledger books a TRADE record against the fill's ` +
+          "OUTCOME_TOKEN_RECEIPT / OUTCOME_TOKEN_DELIVERY transaction (tradeRef = " +
+          "tokenTransactionId) and against nothing else, so this record is not one it booked " +
+          "and no per-bracket realized PnL is reported",
+      );
+    }
+    if (transaction.eventType !== movement || record.side !== fill.action) {
+      throw new Error(
+        `${named} contradicts its fill's direction: the fill's action is ` +
+          `${JSON.stringify(fill.action)}, the token movement is ${transaction.eventType} and the ` +
+          `record's side is ${JSON.stringify(record.side)}. packages/ledger books a purchase as an ` +
+          "OUTCOME_TOKEN_RECEIPT with a BUY record and a sale as an OUTCOME_TOKEN_DELIVERY with " +
+          "a SELL record, so the recorded directions disagree, neither is trusted, and no " +
+          "per-bracket realized PnL is reported",
+      );
+    }
+    const twin = recordOfFill.get(fill.simulatedFillId);
+    if (twin !== undefined) {
+      throw new Error(
+        `fill ${fill.simulatedFillId} is booked by two §9.16 TRADE records (refs ${twin.ref} and ` +
+          `${record.ref}); packages/ledger books one per owner of a fill, so the engine would fold ` +
+          "its shares twice, and no per-bracket realized PnL is reported",
+      );
+    }
+    recordOfFill.set(fill.simulatedFillId, record);
+    if (record.tokenAssetId !== null) {
+      const token = recordTokenOf.get(fill.tokenId);
+      const venue = venueTokenOf.get(record.tokenAssetId);
+      const clash =
+        token !== undefined && token !== record.tokenAssetId
+          ? `an earlier record names stream token ${token} for the same venue token`
+          : venue !== undefined && venue !== fill.tokenId
+            ? `an earlier record names the same stream token for venue token ${venue}`
+            : undefined;
+      if (clash !== undefined) {
+        throw new Error(
+          `${named} names stream token ${record.tokenAssetId} for venue token ${fill.tokenId}, ` +
+            `but ${clash}; the stream's tokens must be the venue's one to one, or the positions ` +
+            "its records leave cannot be compared with the fills', and no per-bracket realized " +
+            "PnL is reported",
+        );
+      }
+      recordTokenOf.set(fill.tokenId, record.tokenAssetId);
+      venueTokenOf.set(record.tokenAssetId, fill.tokenId);
+    }
     const list = byBracket.get(at.bracket) ?? [];
-    list.push({ record, fill: at.fill, opens: at.opens });
+    list.push({ record, fill });
     byBracket.set(at.bracket, list);
   }
-  return byBracket;
+  const unbooked = [...placed.values()].filter(({ fill }) => !recordOfFill.has(fill.simulatedFillId));
+  if (unbooked.length > 0) {
+    throw new Error(
+      unbooked
+        .map(
+          ({ bracket, fill }) =>
+            `fill ${fill.simulatedFillId} (bracket ${String(bracket)}) is booked by no §9.16 TRADE ` +
+            "record in the instance's stream",
+        )
+        .join("; ") +
+        "; packages/ledger books one for every fill an instance owns, so the stream does not " +
+        "book the run the fills describe, and no per-bracket realized PnL is reported",
+    );
+  }
+  return { byBracket, recordTokenOf };
+}
+
+/**
+ * The reasons two folds of ONE bracket leave different positions: for each
+ * token (the fills' token, mapped to the stream's by `recordTokenOf`), the
+ * shares and the cost basis still held (`BRACKET-1b` r1, BR1B-M2). Two folds
+ * can realize the same PnL while holding different positions — a stream that
+ * books 60 shares for a 50-share purchase realizes the same on the sale and
+ * keeps 10 — so the realized values agreeing is not enough.
+ */
+function lotDisagreements(
+  fromFills: ReadonlyMap<string, Lot>,
+  fromRecords: ReadonlyMap<string, Lot>,
+  recordTokenOf: ReadonlyMap<string, string>,
+): readonly string[] {
+  const expected = new Map<string, Lot>();
+  for (const [token, lot] of fromFills) expected.set(recordTokenOf.get(token) ?? token, lot);
+  const reasons: string[] = [];
+  for (const token of new Set([...expected.keys(), ...fromRecords.keys()])) {
+    const fills = expected.get(token) ?? { shares: "0", costBasis: "0" };
+    const records = fromRecords.get(token) ?? { shares: "0", costBasis: "0" };
+    if (
+      compareDecimal(fills.shares, records.shares) === 0 &&
+      compareDecimal(fills.costBasis, records.costBasis) === 0
+    ) {
+      continue;
+    }
+    reasons.push(
+      `the bracket's TRADE records leave ${records.shares} shares of token ${token} at a cost ` +
+        `basis of ${records.costBasis}, where its fills leave ${fills.shares} at ` +
+        `${fills.costBasis}: the realized values may agree, but the positions the two folds ` +
+        "leave do not, so the agreement is not an explanation",
+    );
+  }
+  return reasons;
 }
 
 /**
@@ -2108,7 +2433,12 @@ function tradeRecordsByBracket(
  *   average-cost method ({@link foldFills}).
  * - REALIZED: its §9.16 TRADE records, the stream the PnL engine folds,
  *   attributed to the bracket by id ({@link tradeRecordsByBracket}) and folded
- *   the same way, in their fills' consumption order.
+ *   the same way — each by its OWN `side` (`BRACKET-1b` r1) — in their fills'
+ *   consumption order.
+ *
+ * The row is explained only when the realized values agree AND the two folds
+ * leave the same position ({@link lotDisagreements}, BR1B-M2); the row's texts
+ * are unchanged, so an honest bracket's row serialises exactly as before.
  *
  * The run-cumulative `pnl.realized` then checks that these per-bracket values
  * sum to what the engine itself persisted.
@@ -2117,26 +2447,29 @@ function bracketRealizedRow(
   prefix: string,
   attribution: Attribution,
   trades: readonly BracketTrade[],
+  recordTokenOf: ReadonlyMap<string, string>,
 ): ReconciliationRow {
-  const fromFills = foldFills(attribution.entryFills, attribution.exitFills).realized;
+  const fillsFold = foldFills(attribution.entryFills, attribution.exitFills);
+  const fromFills = fillsFold.realized;
   const movements = [...trades]
     .sort((left, right) => inConsumptionOrder(left.fill, right.fill))
-    .map(({ record, fill, opens }) => {
-      if (record.shares === null || record.price === null) {
+    .map(({ record, fill }) => {
+      if (record.shares === null || record.price === null || record.tokenAssetId === null) {
         throw new Error(
           `the §9.16 TRADE record whose ref is ledger transaction ${record.ref} carries no ` +
-            "shares or no price, so it cannot be folded",
+            "shares, no price or no token, so it cannot be folded",
         );
       }
       return {
         label: `the TRADE record (ledger transaction ${record.ref}) of fill ${fill.simulatedFillId}`,
-        token: record.tokenAssetId ?? fill.tokenId,
+        token: record.tokenAssetId,
         shares: record.shares,
         price: record.price,
-        opens,
+        opens: opensBy(record.side, `the side of the TRADE record (ledger transaction ${record.ref})`),
       };
     });
-  const fromRecords = foldMovements(movements).realized;
+  const recordsFold = foldMovements(movements);
+  const fromRecords = recordsFold.realized;
   return exact(
     `${prefix}pnl.realized`,
     "the bracket's realized trading PnL, before fees",
@@ -2148,6 +2481,7 @@ function bracketRealizedRow(
     "the bracket's §9.16 TRADE records in the persisted pnlRecords stream, each placed in the " +
       "bracket by id (record.ref → the chain that posted that ledger transaction → its fill), " +
       "folded the same way",
+    lotDisagreements(fillsFold.lots, recordsFold.lots, recordTokenOf),
   );
 }
 

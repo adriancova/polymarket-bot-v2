@@ -439,6 +439,65 @@ function consistentSecondEntry(artifact: PaperRunArtifact): PaperRunArtifact {
   };
 }
 
+/**
+ * {@link withSecondEntry}'s FILLED chain BOOKED in the instance's §9.16 stream
+ * (`BRACKET-1b` r1, BR1B-M2), the way `packages/ledger` books every fill: its
+ * chain names a principal, a token-movement and a fee transaction — copies of
+ * the golden's first chain's three, re-keyed and booked for this fill's ledger
+ * fill — and the stream gains a BUY TRADE record following from the token
+ * movement, plus its FEE record. The per-bracket realized rows refuse a fill
+ * the stream books by no TRADE record; this is the booking they require. The
+ * ledger PROJECTION and the PnL snapshots are NOT refolded, so the
+ * run-cumulative rows still disagree with the synthetic chain, as they should.
+ */
+function bookedSecondEntry(artifact: PaperRunArtifact): PaperRunArtifact {
+  const synthetic = artifact.traces.find(
+    (trace) => trace.intentId === `sb-entry-3-${artifact.scenario.marketId}`,
+  );
+  const fill = artifact.fills.find(
+    (candidate) => candidate.simulatedFillId === synthetic?.venueFillId,
+  );
+  const template = artifact.traces[0];
+  if (synthetic === undefined || fill === undefined || template === undefined) {
+    throw new Error("the synthetic second entry's chain is missing");
+  }
+  const ids = ["principal", "token", "fee"].map((kind) => `${synthetic.executionPlanId}-${kind}`);
+  const [, tokenId, feeId] = ids;
+  const transactions = template.ledgerTransactionIds.map((id, index) => ({
+    ...only(
+      artifact.ledgerTransactions.filter((entry) => entry.ledgerTransactionId === id),
+      `ledger transaction ${id}`,
+    ),
+    sequence: artifact.ledgerTransactions.length + index,
+    ledgerTransactionId: ids[index] ?? "",
+    fillId: synthetic.ledgerFillId,
+  }));
+  const [trade, fee] = artifact.pnlRecords;
+  if (
+    tokenId === undefined ||
+    feeId === undefined ||
+    trade?.kind !== "TRADE" ||
+    trade.side !== "BUY" ||
+    fee?.kind !== "FEE" ||
+    transactions.map((entry) => entry.eventType).join() !==
+      "TRADE_PRINCIPAL,OUTCOME_TOKEN_RECEIPT,PLATFORM_FEE"
+  ) {
+    throw new Error("the golden's first booking is not a purchase's TRADE and FEE");
+  }
+  return {
+    ...artifact,
+    traces: artifact.traces.map((trace) =>
+      trace === synthetic ? { ...trace, ledgerTransactionIds: ids } : trace,
+    ),
+    ledgerTransactions: [...artifact.ledgerTransactions, ...transactions],
+    pnlRecords: [
+      ...artifact.pnlRecords,
+      { ...trade, ref: tokenId, shares: fill.shares, price: fill.price },
+      { ...fee, ref: feeId, amount: fill.feeAmount },
+    ],
+  };
+}
+
 // =============================================================================
 
 describe("RECON-1 / RECON-2 — the golden's own attribution, positively and by id", () => {
@@ -680,8 +739,16 @@ describe("RISK2-R3 — more than one entry is refused, not read as the first (R3
     expect(() => buildReconciliation(tampered)).toThrow(/instead of reading only the first/u);
 
     // The SAME chain, after the strategy's own re-arm (and a close, and a flat
-    // position — bracket 1 sold its 50): two brackets.
-    const rows = buildReconciliation(withRearm(consistentSecondEntry(tampered)));
+    // position — bracket 1 sold its 50): two brackets. As `withSecondEntry`
+    // builds it, the stream books no TRADE record for its fill, and since
+    // `BRACKET-1b` r1 (BR1B-M2) a per-bracket realized row refuses a fill the
+    // stream does not book — before r1 both of that row's sides read 0 and it
+    // passed. Booked the way `packages/ledger` books a fill, it reconciles.
+    const separated = withRearm(consistentSecondEntry(tampered));
+    expect(() => buildReconciliation(separated)).toThrow(
+      /fill 9280f970-9280-7000-8000-0000000fa000:g0:o0\/t0\/0 \(bracket 2\) is booked by no §9\.16 TRADE record/u,
+    );
+    const rows = buildReconciliation(bookedSecondEntry(separated));
     // Bracket 1 IS the golden's bracket, row for row, under its qualified id.
     const perBracket = golden().reconciliation.filter(
       (entry) => !entry.id.startsWith("ledger.") && !entry.id.startsWith("pnl."),
@@ -710,9 +777,16 @@ describe("RISK2-R3 — more than one entry is refused, not read as the first (R3
     expect(
       row(rows, "bracket.2.exit.expected_net_edge").contributions.map((entry) => entry.mechanism),
     ).toContain("POSITION_OPEN_AT_RUN_END");
+    // Its realized row agrees on the POSITION too: 10 shares at 3.3 held by both
+    // folds, none realized.
+    expect(row(rows, "bracket.2.pnl.realized")).toMatchObject({
+      projected: "0",
+      realized: "0",
+      unexplainedReasons: [],
+    });
     // The run-cumulative rows are NOT explained, and must not be: the synthetic
-    // chain was never booked in the ledger or the PnL stream, and the table
-    // says so instead of absorbing it.
+    // chain was never folded into the ledger projection or a PnL snapshot, and
+    // the table says so instead of absorbing it.
     expect(row(rows, "ledger.virtual_token_balance").explained).toBe(false);
     expect(row(rows, "ledger.virtual_token_balance").projected).toBe("10");
   });

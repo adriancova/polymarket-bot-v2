@@ -25,12 +25,15 @@
 import { describe, expect, it } from "vitest";
 
 import { addDecimal, compareDecimal, subDecimal } from "@polymarket-bot/decimal";
+import { foldPnlRecords, type PnlRecord } from "@polymarket-bot/pnl";
 
 import {
   captureArtifact,
   serializeArtifact,
   type ArtifactDecision,
   type ArtifactFill,
+  type ArtifactPnlRecord,
+  type ArtifactTrace,
   type PaperRunArtifact,
 } from "./support/artifact.js";
 import { explainWalk, walkChains } from "./support/chain-walk.js";
@@ -159,6 +162,105 @@ function landmarks(artifact: PaperRunArtifact): Landmarks {
     ),
     rearmed: only(withCode(artifact, "SB.REARMED"), "SB.REARMED decision"),
     closes: withCode(artifact, "SB.CLOSED"),
+  };
+}
+
+/** `text` as a literal inside a regular expression. */
+function literally(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+/** The one chain (trace) of `fill`. */
+function chainOf(artifact: PaperRunArtifact, fill: ArtifactFill): ArtifactTrace {
+  return only(
+    artifact.traces.filter((trace) => trace.venueFillId === fill.simulatedFillId),
+    `chain of fill ${fill.simulatedFillId}`,
+  );
+}
+
+/** `fill`'s §9.16 TRADE record: the one following from a transaction its chain names. */
+function tradeRecordOf(artifact: PaperRunArtifact, fill: ArtifactFill): ArtifactPnlRecord {
+  const posted = chainOf(artifact, fill).ledgerTransactionIds;
+  return only(
+    artifact.pnlRecords.filter((record) => record.kind === "TRADE" && posted.includes(record.ref)),
+    `TRADE record of fill ${fill.simulatedFillId}`,
+  );
+}
+
+/** The one fill of the order `decision` placed. */
+function fillPlacedBy(artifact: PaperRunArtifact, decision: ArtifactDecision): ArtifactFill {
+  return only(
+    fillsOfOrder(artifact, orderPlacedBy(artifact, decision).orderId),
+    `fill of the order placed at evaluationSeq ${String(decision.evaluationSeq)}`,
+  );
+}
+
+/** The document with one fill, and optionally its order, changed. */
+function withTrade(
+  artifact: PaperRunArtifact,
+  fill: ArtifactFill,
+  fillChange: Partial<ArtifactFill>,
+  orderChange?: Partial<PaperRunArtifact["orders"][number]>,
+): PaperRunArtifact {
+  return {
+    ...artifact,
+    fills: artifact.fills.map((candidate) =>
+      candidate.simulatedFillId === fill.simulatedFillId ? { ...candidate, ...fillChange } : candidate,
+    ),
+    orders: artifact.orders.map((order) =>
+      order.simulatedOrderId === fill.simulatedOrderId && orderChange !== undefined
+        ? { ...order, ...orderChange }
+        : order,
+    ),
+  };
+}
+
+/** The document with the §9.16 records whose ref is `ref` changed (or removed, with `null`). */
+function withRecord(
+  artifact: PaperRunArtifact,
+  ref: string,
+  change: Partial<ArtifactPnlRecord> | null,
+): PaperRunArtifact {
+  return {
+    ...artifact,
+    pnlRecords: artifact.pnlRecords.flatMap((record) =>
+      record.ref !== ref ? [record] : change === null ? [] : [{ ...record, ...change }],
+    ),
+  };
+}
+
+/**
+ * What `packages/pnl` ITSELF does with a stream (test side only; the oracle
+ * never calls it): the fold's refusal codes, or the position and realized PnL
+ * it leaves.
+ */
+function engineFold(
+  artifact: PaperRunArtifact,
+  records: readonly PnlRecord[],
+):
+  | { readonly ok: false; readonly codes: readonly string[] }
+  | {
+      readonly ok: true;
+      readonly lots: readonly (readonly [string, string, string])[];
+      readonly realized: readonly string[];
+    } {
+  const scenario = artifact.scenario;
+  const folded = foldPnlRecords(
+    {
+      scope: "VIRTUAL_STRATEGY",
+      environment: "PAPER",
+      accountRef: scenario.accountRef,
+      instanceId: scenario.instanceId,
+      runId: scenario.runId,
+      marketId: scenario.marketId,
+    },
+    records,
+  );
+  if (!folded.ok) return { ok: false, codes: folded.refusals.map((refusal) => refusal.code) };
+  return {
+    ok: true,
+    lots: [...folded.value.lots].map(([token, lot]) => [token, lot.shares, lot.costBasis] as const),
+    realized: [...folded.value.realizedTrading.values()],
   };
 }
 
@@ -643,6 +745,280 @@ describe("BRACKET-1b E3 — the two-bracket reconciliation", () => {
     const enters = artifact.decisions.filter((decision) => decision.decisionType === "enter");
     expect(new Set(enters.map((decision) => decision.instanceId)).size).toBe(2);
     expect(artifact.reconciliation).toEqual(paperE2e().reconciliation);
+  });
+});
+
+// =============================================================================
+
+/**
+ * `BRACKET-1b` r1, BR1B-M1. Until r1 both averaging folds took each fill's
+ * direction FROM the attribution — the entry's fills added, the exits'
+ * removed — so a fill RECORDED the other way was folded the way its id said:
+ * the review's reproduction turned bracket 1's reduction into a purchase, the
+ * boundary over 100 purchased shares was reported flat, and every row stayed
+ * explained. The direction is now the record's, cross-checked against the
+ * attribution, and a contradiction is refused by name.
+ */
+describe("BRACKET-1b r1 — BR1B-M1: the recorded direction is cross-checked, never overridden by attribution", () => {
+  it("an EXIT fill recorded as a PURCHASE is refused — against its own order, then (order changed too) against its side", () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    const sale = fillPlacedBy(golden, marks.reduce);
+    // The review's reproduction: the fill alone now buys.
+    expect(() => buildReconciliation(withTrade(golden, sale, { action: "BUY" }))).toThrow(
+      new RegExp(
+        `fill ${literally(sale.simulatedFillId)} disagrees with its own order ` +
+          `${literally(sale.simulatedOrderId)} on action \\(fill "BUY", order "SELL"\\)`,
+        "u",
+      ),
+    );
+    // …or trades the other token.
+    expect(() =>
+      buildReconciliation(withTrade(golden, sale, { tokenId: golden.scenario.noTokenId })),
+    ).toThrow(
+      new RegExp(
+        `disagrees with its own order ${literally(sale.simulatedOrderId)} on tokenId \\(fill ` +
+          `"${golden.scenario.noTokenId}", order "${golden.scenario.yesTokenId}"\\)`,
+        "u",
+      ),
+    );
+    // Fill and order agree with each other, and contradict the side their ids
+    // put them on.
+    expect(() =>
+      buildReconciliation(withTrade(golden, sale, { action: "BUY" }, { action: "BUY" })),
+    ).toThrow(
+      new RegExp(
+        `order ${literally(sale.simulatedOrderId)} \\(fill ${literally(sale.simulatedFillId)}\\) ` +
+          "is an EXIT of bracket 1 \\(the protective reduction the `reduce` decision at " +
+          `evaluationSeq ${String(marks.reduce.evaluationSeq)} placed\\) by its provenance, but ` +
+          'its recorded action is "BUY", not SELL',
+        "u",
+      ),
+    );
+    // An ENTRY that sells, the same way.
+    const purchase = fillPlacedBy(golden, marks.enter2);
+    expect(() =>
+      buildReconciliation(withTrade(golden, purchase, { action: "SELL" }, { action: "SELL" })),
+    ).toThrow(/is the ENTRY of bracket 2 by its provenance, but its recorded action is "SELL", not BUY/u);
+  });
+
+  it("the ONE-bracket table is held to the same rule (its exit recorded as a purchase left every row explained)", () => {
+    const golden = paperE2e();
+    const reduce = only(
+      golden.decisions.filter((decision) => decision.decisionType === "reduce"),
+      "reduce decision",
+    );
+    const sale = fillPlacedBy(golden, reduce);
+    expect(() =>
+      buildReconciliation(withTrade(golden, sale, { action: "BUY" }, { action: "BUY" })),
+    ).toThrow(/is an EXIT of bracket 1 \(the protective reduction .*its recorded action is "BUY", not SELL/u);
+    expect(() => buildReconciliation(withTrade(golden, sale, { action: "BUY" }))).toThrow(
+      /on action \(fill "BUY", order "SELL"\)/u,
+    );
+    // …and the honest document still rebuilds its own table, byte for byte.
+    expect(buildReconciliation(golden)).toEqual(golden.reconciliation);
+  });
+
+  it("a TRADE record whose side contradicts its fill is refused, and so is a token movement booked the other way", () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    // The review's reproduction: the final record books a purchase.
+    const takeProfit = fillPlacedBy(golden, marks.takeProfit2);
+    const last = golden.pnlRecords.at(-1);
+    expect(last).toEqual(tradeRecordOf(golden, takeProfit));
+    expect(last?.side).toBe("SELL");
+    expect(() =>
+      buildReconciliation(withRecord(golden, last?.ref ?? "", { side: "BUY" })),
+    ).toThrow(
+      /contradicts its fill's direction: the fill's action is "SELL", the token movement is OUTCOME_TOKEN_DELIVERY and the record's side is "BUY"/u,
+    );
+    // Bracket 2's purchase, its token movement booked as a DELIVERY.
+    const movement = tradeRecordOf(golden, fillPlacedBy(golden, marks.enter2)).ref;
+    const delivered: PaperRunArtifact = {
+      ...golden,
+      ledgerTransactions: golden.ledgerTransactions.map((entry) =>
+        entry.ledgerTransactionId === movement
+          ? { ...entry, eventType: "OUTCOME_TOKEN_DELIVERY" }
+          : entry,
+      ),
+    };
+    expect(() => buildReconciliation(delivered)).toThrow(
+      /the fill's action is "BUY", the token movement is OUTCOME_TOKEN_DELIVERY and the record's side is "BUY"/u,
+    );
+  });
+});
+
+/**
+ * `BRACKET-1b` r1, BR1B-M2. Until r1 every transaction a chain named mapped to
+ * its fill, any number of TRADE records could book one fill, and only the
+ * realized values were compared: a duplicated record (which `packages/pnl`
+ * refuses) and an extra purchase under a principal transaction (which it folds
+ * into an open position) both reconciled with every row explained.
+ */
+describe("BRACKET-1b r1 — BR1B-M2: the PnL stream books the fills ONE TO ONE, and leaves the fills' position", () => {
+  it("a ref the stream carries twice is refused — as packages/pnl itself refuses it (PNL_DUPLICATE_REF)", async () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    const purchase = tradeRecordOf(golden, fillPlacedBy(golden, marks.enter2));
+    // The review's reproduction: bracket 2's entry record, twice.
+    expect(() =>
+      buildReconciliation({ ...golden, pnlRecords: [...golden.pnlRecords, { ...purchase }] }),
+    ).toThrow(
+      new RegExp(
+        `the instance's §9\\.16 stream carries ref ${literally(purchase.ref)} twice \\(a TRADE ` +
+          "record, then a TRADE record\\); packages/pnl folds a ref ONCE and refuses the repeat " +
+          "\\(PNL_DUPLICATE_REF\\)",
+        "u",
+      ),
+    );
+    // A FEE record's ref, twice, the same way: the engine's refs span every kind.
+    const fee = only(
+      golden.pnlRecords.filter(
+        (record) =>
+          record.kind === "FEE" &&
+          chainOf(golden, fillPlacedBy(golden, marks.enter2)).ledgerTransactionIds.includes(record.ref),
+      ),
+      "bracket 2's entry fee record",
+    );
+    expect(() =>
+      buildReconciliation({ ...golden, pnlRecords: [...golden.pnlRecords, { ...fee }] }),
+    ).toThrow(/twice \(a FEE record, then a FEE record\)/u);
+    // What the engine does with the same stream, from the run's own records.
+    const run = await driveScenario({ scenario: TWO_BRACKETS_SCENARIO });
+    const live = run.trader.loop.pnlRecords(golden.scenario.instanceId);
+    const copy = only(
+      live.filter((record) => record.kind === "TRADE" && record.ref === purchase.ref),
+      "live purchase record",
+    );
+    expect(engineFold(golden, live)).toMatchObject({ ok: true, lots: [], realized: ["7.5"] });
+    const refused = engineFold(golden, [...live, copy]);
+    expect(refused.ok).toBe(false);
+    expect(refused.ok ? [] : refused.codes).toContain("PNL_DUPLICATE_REF");
+  });
+
+  it("a TRADE record under a fill's PRINCIPAL transaction is refused — packages/pnl would fold it into an open position", async () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    const entry = fillPlacedBy(golden, marks.enter2);
+    const chain = chainOf(golden, entry);
+    const [principal] = chain.ledgerTransactionIds;
+    expect(
+      golden.ledgerTransactions.find((entry_) => entry_.ledgerTransactionId === principal)
+        ?.eventType,
+    ).toBe("TRADE_PRINCIPAL");
+    const purchase = tradeRecordOf(golden, entry);
+    // The review's reproduction: a distinct record, under the principal.
+    expect(() =>
+      buildReconciliation({
+        ...golden,
+        pnlRecords: [...golden.pnlRecords, { ...purchase, ref: principal ?? "" }],
+      }),
+    ).toThrow(
+      new RegExp(
+        `follows from a TRADE_PRINCIPAL transaction booked for ledger fill ` +
+          `${literally(chain.ledgerFillId)}, not from the token movement of ledger fill ` +
+          literally(chain.ledgerFillId),
+        "u",
+      ),
+    );
+    // The engine accepts that stream, and holds 50 shares the fills do not.
+    const run = await driveScenario({ scenario: TWO_BRACKETS_SCENARIO });
+    const live = run.trader.loop.pnlRecords(golden.scenario.instanceId);
+    const copy = only(
+      live.filter((record) => record.kind === "TRADE" && record.ref === purchase.ref),
+      "live purchase record",
+    );
+    expect(engineFold(golden, [...live, { ...copy, ref: principal ?? "" }])).toEqual({
+      ok: true,
+      lots: [[purchase.tokenAssetId, "50", "16.5"]],
+      realized: ["7.5"],
+    });
+  });
+
+  it("a fill the stream does not book is refused — bracket 2's purchase, or its sale", () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    for (const decision of [marks.enter2, marks.takeProfit2]) {
+      const fill = fillPlacedBy(golden, decision);
+      expect(() =>
+        buildReconciliation(withRecord(golden, tradeRecordOf(golden, fill).ref, null)),
+      ).toThrow(
+        new RegExp(
+          `fill ${literally(fill.simulatedFillId)} \\(bracket 2\\) is booked by no §9\\.16 TRADE ` +
+            "record in the instance's stream",
+          "u",
+        ),
+      );
+    }
+  });
+
+  it("the stream's other one-to-one links refuse when broken: a transaction two chains name, one the ledger lacks, a token named two ways", () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    const entry = fillPlacedBy(golden, marks.enter2);
+    const exit = fillPlacedBy(golden, marks.takeProfit2);
+    const entryMovement = tradeRecordOf(golden, entry).ref;
+    const exitMovement = tradeRecordOf(golden, exit).ref;
+    // The purchase's token movement, named by the sale's chain as well.
+    const shared: PaperRunArtifact = {
+      ...golden,
+      traces: golden.traces.map((trace) =>
+        trace.venueFillId === exit.simulatedFillId
+          ? { ...trace, ledgerTransactionIds: [...trace.ledgerTransactionIds, entryMovement] }
+          : trace,
+      ),
+    };
+    expect(() => buildReconciliation(shared)).toThrow(
+      new RegExp(
+        `ledger transaction ${literally(entryMovement)} is named by the chains of fill ` +
+          `${literally(entry.simulatedFillId)} and fill ${literally(exit.simulatedFillId)}`,
+        "u",
+      ),
+    );
+    // The sale's token movement, missing from the ledger section.
+    const unheld: PaperRunArtifact = {
+      ...golden,
+      ledgerTransactions: golden.ledgerTransactions.filter(
+        (entry_) => entry_.ledgerTransactionId !== exitMovement,
+      ),
+    };
+    expect(() => buildReconciliation(unheld)).toThrow(
+      /follows from a transaction the document's ledger section does not hold/u,
+    );
+    // The sale's record naming another stream token for the same venue token.
+    expect(() =>
+      buildReconciliation(withRecord(golden, exitMovement, { tokenAssetId: "token:9999" })),
+    ).toThrow(
+      new RegExp(
+        `names stream token token:9999 for venue token ${literally(exit.tokenId)}, but an ` +
+          "earlier record names stream token token:9001 for the same venue token",
+        "u",
+      ),
+    );
+  });
+
+  it("the POSITION is reconciled alongside realized PnL: a purchase booked at 60 shares realizes the same 8.5, keeps 10, and the row fails", () => {
+    const golden = twoBrackets();
+    const marks = landmarks(golden);
+    const purchase = tradeRecordOf(golden, fillPlacedBy(golden, marks.enter2));
+    // 60 at 0.33 = 19.8; selling 50 removes 19.8 × 50 / 60 = 16.5 and realizes
+    // 25 − 16.5 = 8.5 — the fills' number — while 10 shares at 3.3 stay open.
+    const rows = buildReconciliation(withRecord(golden, purchase.ref, { shares: "60" }));
+    const realized = row(rows, "bracket.2.pnl.realized");
+    expect([
+      realized.projected,
+      realized.realized,
+      realized.difference,
+      realized.residual,
+      realized.explained,
+    ]).toEqual(["8.5", "8.5", "0", "0", false]);
+    expect(realized.unexplainedReasons).toEqual([
+      "the bracket's TRADE records leave 10 shares of token token:9001 at a cost basis of 3.3, " +
+        "where its fills leave 0 at 0: the realized values may agree, but the positions the two " +
+        "folds leave do not, so the agreement is not an explanation",
+    ]);
+    // Non-vacuous: no other row of the table sees it.
+    expect(unexplainedRows(rows).map((entry) => entry.id)).toEqual(["bracket.2.pnl.realized"]);
   });
 });
 
