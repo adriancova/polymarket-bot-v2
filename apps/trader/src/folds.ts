@@ -442,8 +442,8 @@ export class HeldAccounting {
    * {@link checkPnl}), from `identity()`: `emptyPnlState` throws
    * `PnlConfigurationError` on an identity it refuses, and that throw leaves
    * here exactly where `foldPnlRecords` used to throw it from (the loop's
-   * `#writePnlSnapshot`), every time, because a refused stream is never
-   * stored — by this method or by a check.
+   * `#stagePnlSnapshot`, `#writePnlSnapshot` before `SNAP-1`), every time,
+   * because a refused stream is never stored — by this method or by a check.
    */
   advancePnl(
     instanceId: string,
@@ -542,7 +542,8 @@ export class HeldAccounting {
    * `identity` opens a stream that is not open yet. A stream whose identity
    * `packages/pnl` refuses cannot be opened, and the rebuild — which opens the
    * SAME identity — must refuse it too; the two agree only then (the loop
-   * throws from `#writePnlSnapshot` as before, and never stores a stream).
+   * throws from `#stagePnlSnapshot` — `#writePnlSnapshot` before `SNAP-1` —
+   * as before, and never stores a stream).
    * `undefined` for an instance the loop cannot name is a mismatch: records
    * with no stream and no identity to open one from are not checkable.
    */

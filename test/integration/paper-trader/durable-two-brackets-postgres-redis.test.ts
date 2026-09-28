@@ -93,6 +93,14 @@
  * - Fees paid: `0` throughout; so net = realized = `7.5`, and the instance's
  *   durable `pUSD` entries sum to `−17 + 16 − 16.5 + 25 = 7.5` (`−1` at the
  *   bracket boundary), its YES-token entries to `0` (flat) at both.
+ * - The other §9.16 columns per snapshot (added by `SNAP-1`, the
+ *   `BR1C-R1-L1` ride-along; re-derived, and pinned below). Each row is
+ *   marked at its own fill's price, so an open lot's midpoint PnL is
+ *   `50 × price − cost = 0`:
+ *   capital committed (the open cost basis) `17, 0, 16.5, 0`; gross trading
+ *   PnL (realized + midpoint) `0, −1, −1, 7.5`; core net PnL (gross − fees)
+ *   `0, −1, −1, 7.5`; worst-case resolution PnL (realized − open basis)
+ *   `0 − 17 = −17`, `−1`, `−1 − 16.5 = −17.5`, `7.5`.
  * - Ledger transactions: `TRADE_PRINCIPAL` + an outcome-token movement per
  *   fill, and NO `PLATFORM_FEE` (none is posted for a zero fee):
  *   2 + 2 + 2 + 2 = **8**, not `BRACKET-1b`'s 11.
@@ -105,7 +113,9 @@
  * `0.219, 0.431, 0.647, 0.647`; realized unchanged (`0, −1, −1, 7.5`); net
  * `7.5 − 0.647 = 6.853` (`−1.431` at the boundary); ledger
  * 3 + 3 + 3 + 2 = **11** — `BRACKET-1b`'s numbers, since the prices and sizes
- * are 1b's.
+ * are 1b's. Per snapshot: core net `−0.219, −1.431, −1.647, 6.853`; capital
+ * committed, gross and worst case as on the fixture schedule (fees enter
+ * neither).
  *
  * ## What this file proves
  *
@@ -135,15 +145,24 @@
  *   same meaning as `durable-trader-first-fill-postgres.test.ts`'s pair.
  * - Each entry fills in ONE level by construction (`BRACKET1-TPRACE` is
  *   unreachable), so two fills of one instance at one recorded instant never
- *   occur here. When they do, the durable path FAILS, measured and REPORTED by
- *   `BRACKET-1c`, not fixed (it lies in `apps/**`/`db/**`, outside this
- *   round's grant): `loop.ts` writes one PnL snapshot per fill at the event's
- *   instant, and `accounting.pnl_snapshots` is unique on `(scope, environment,
- *   account_ref, instance_id, market_id, as_of)`. So an entry that walks two
- *   ask levels — the ORIGINAL paper-e2e golden's shape — halts on its second
- *   fill: `STORE_UNAVAILABLE … duplicate key value violates unique constraint
- *   "pnl_snapshots_scope_unique"`. The in-memory store enforces no such key,
- *   which is how the doubles masked it.
+ *   occur here. When they did, the durable path FAILED, measured and REPORTED
+ *   by `BRACKET-1c` (`BRACKET1C-SNAPKEY`), not fixed here (it lay in
+ *   `apps/**`/`db/**`, outside this round's grant): `loop.ts` wrote one PnL
+ *   snapshot per fill at the event's instant, and `accounting.pnl_snapshots`
+ *   is unique on `(scope, environment, account_ref, instance_id, market_id,
+ *   as_of)`. So an entry that walked two ask levels — the ORIGINAL paper-e2e
+ *   golden's shape — halted on its second fill: `STORE_UNAVAILABLE … duplicate
+ *   key value violates unique constraint "pnl_snapshots_scope_unique"`, and
+ *   the in-memory store, enforcing no such key, masked it.
+ *   **Dated correction (`SNAP-1`, 2026-09-28): fixed.** Under the user's
+ *   ruling "one snapshot per instance per instant" the loop computes the row
+ *   at every fill as before and writes, once per harvest, the row of each
+ *   instance's LAST fill at that instant; `MemoryTraderStore` now enforces the
+ *   same key. The two-level entry is a committed test in
+ *   `durable-two-level-entry-postgres-redis.test.ts` (this file's scenario
+ *   with bracket 1's first ask thinned to `0.34 x 30`: no halt, ONE durable
+ *   row at `12:00:02`). This file's assertions are unchanged by it — one fill
+ *   per instant, so one row per fill is still one row per instant.
  * - It is not a soak and not live evidence, and it does not close §7 item 1:
  *   a fresh read-only closeout grades that.
  *
@@ -616,6 +635,11 @@ interface Economics {
   readonly eventTypes: Readonly<Record<string, number>>;
   readonly realizedPerSnapshot: readonly string[];
   readonly feesPaidPerSnapshot: readonly string[];
+  /** `SNAP-1` (`BR1C-R1-L1`): the other §9.16 columns per snapshot, derived in the header. */
+  readonly coreNetPerSnapshot: readonly string[];
+  readonly grossTradingPerSnapshot: readonly string[];
+  readonly capitalCommittedPerSnapshot: readonly string[];
+  readonly worstCasePerSnapshot: readonly string[];
   /** The instance's durable `pUSD` entries summed at the bracket boundary and at the end. */
   readonly cashAtBoundary: string;
   readonly cashAtEnd: string;
@@ -626,6 +650,10 @@ const FIXTURE_ECONOMICS: Economics = {
   eventTypes: { TRADE_PRINCIPAL: 4, OUTCOME_TOKEN_RECEIPT: 2, OUTCOME_TOKEN_DELIVERY: 2 },
   realizedPerSnapshot: ["0", "-1", "-1", "7.5"],
   feesPaidPerSnapshot: ["0", "0", "0", "0"],
+  coreNetPerSnapshot: ["0", "-1", "-1", "7.5"],
+  grossTradingPerSnapshot: ["0", "-1", "-1", "7.5"],
+  capitalCommittedPerSnapshot: ["17", "0", "16.5", "0"],
+  worstCasePerSnapshot: ["-17", "-1", "-17.5", "7.5"],
   cashAtBoundary: "-1",
   cashAtEnd: "7.5",
 };
@@ -635,6 +663,10 @@ const E2E_FEE_ECONOMICS: Economics = {
   eventTypes: { TRADE_PRINCIPAL: 4, OUTCOME_TOKEN_RECEIPT: 2, OUTCOME_TOKEN_DELIVERY: 2, PLATFORM_FEE: 3 },
   realizedPerSnapshot: ["0", "-1", "-1", "7.5"],
   feesPaidPerSnapshot: ["0.219", "0.431", "0.647", "0.647"],
+  coreNetPerSnapshot: ["-0.219", "-1.431", "-1.647", "6.853"],
+  grossTradingPerSnapshot: ["0", "-1", "-1", "7.5"],
+  capitalCommittedPerSnapshot: ["17", "0", "16.5", "0"],
+  worstCasePerSnapshot: ["-17", "-1", "-17.5", "7.5"],
   cashAtBoundary: "-1.431",
   cashAtEnd: "6.853",
 };
@@ -824,10 +856,17 @@ function assertDurableRoundTrip(run: DurableRun, economics: Economics): void {
   expect(tokens(virtual)).toBe("0");
 
   // --- accounting.pnl_snapshots: one per fill, exact ------------------------
+  // (Each instant here has ONE fill, so one per fill is also one per instance
+  // per instant — the `pnl_snapshots_scope_unique` key `SNAP-1` enforces.)
   expect(run.db.snapshots).toHaveLength(run.health.execution.fillsObserved);
   expect(run.db.snapshots.map((row) => row["as_of"])).toEqual([...FILL_INSTANTS]);
   expect(run.db.snapshots.map((row) => row["realized_pnl"])).toEqual(economics.realizedPerSnapshot);
   expect(run.db.snapshots.map((row) => row["fees_paid"])).toEqual(economics.feesPaidPerSnapshot);
+  // `SNAP-1` (`BR1C-R1-L1`): the rest of the economics, each column exact.
+  expect(run.db.snapshots.map((row) => row["core_net_pnl"])).toEqual(economics.coreNetPerSnapshot);
+  expect(run.db.snapshots.map((row) => row["gross_trading_pnl"])).toEqual(economics.grossTradingPerSnapshot);
+  expect(run.db.snapshots.map((row) => row["capital_committed"])).toEqual(economics.capitalCommittedPerSnapshot);
+  expect(run.db.snapshots.map((row) => row["worst_case_resolution_pnl"])).toEqual(economics.worstCasePerSnapshot);
   for (const row of run.db.snapshots) {
     expect(row["scope"]).toBe("VIRTUAL_STRATEGY");
     expect(row["environment"]).toBe("PAPER");

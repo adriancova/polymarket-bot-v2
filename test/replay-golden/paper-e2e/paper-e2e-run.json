@@ -1234,33 +1234,6 @@
   "pnlSnapshots": [
     {
       "accountRef": "wp250-paper-account",
-      "allInPnl": "-0.131",
-      "asOf": "2026-05-01T09:00:02Z",
-      "capitalCommitted": "10.2",
-      "coreNetPnl": "-0.131",
-      "denominationAsset": "pUSD",
-      "environment": "PAPER",
-      "estimatesByProgram": {},
-      "feesByScheduleVersion": {
-        "[\"pUSD\",\"\"]": "0.131"
-      },
-      "feesPaid": "0.131",
-      "grossTradingPnl": "0",
-      "instanceId": "e18f5c20-2000-7a20-8b00-000000000002",
-      "marketId": "018f5c20-1000-7a10-8b00-000000000001",
-      "realizedPnl": "0",
-      "realizedRewards": "0",
-      "rewardEstimateTotal": "0",
-      "rewardsByProgram": {},
-      "runId": "018f5c20-3000-7a30-8b00-000000000003",
-      "scope": "VIRTUAL_STRATEGY",
-      "unrealizedPnlLiquidation": null,
-      "unrealizedPnlMidpoint": "0",
-      "unrealizedPnlModel": null,
-      "worstCaseResolutionPnl": "-10.2"
-    },
-    {
-      "accountRef": "wp250-paper-account",
       "allInPnl": "0.08",
       "asOf": "2026-05-01T09:00:02Z",
       "capitalCommitted": "17.2",

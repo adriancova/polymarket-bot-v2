@@ -30,7 +30,7 @@ import type {
   StrategyStateCheckpoint,
 } from "@polymarket-bot/strategy-runtime";
 import type { AppendedLedgerTransaction } from "@polymarket-bot/ledger";
-import type { PnlSnapshot } from "@polymarket-bot/pnl";
+import { toPnlSnapshotRow, type PnlSnapshot } from "@polymarket-bot/pnl";
 
 import {
   portFailed,
@@ -146,12 +146,97 @@ export class MemoryEventFeed implements MarketEventFeed {
 }
 
 /**
+ * The name of `accounting.pnl_snapshots`' identity constraint
+ * (`db/migrations/0006_accounting.up.sql`), which {@link MemoryTraderStore}
+ * enforces too (`SNAP-1`).
+ */
+export const PNL_SNAPSHOT_SCOPE_UNIQUE = "pnl_snapshots_scope_unique";
+
+/**
+ * The refusal {@link MemoryTraderStore.writePnlSnapshot} answers for a second
+ * row of one identity — the SAME port data `PostgresTraderStore` answers for
+ * the database's refusal (`adapters/postgres-store.ts` `#contained`: kind
+ * `UNAVAILABLE`, detail "the durable store could not write a PnL snapshot: "
+ * + the driver error's `name: message`, where node-postgres names its
+ * `DatabaseError` `error`), as `durable-pnl-snapshot-postgres.test.ts` pins it.
+ */
+export const DUPLICATE_PNL_SNAPSHOT_DETAIL =
+  "the durable store could not write a PnL snapshot: error: duplicate key value violates " +
+  `unique constraint "${PNL_SNAPSHOT_SCOPE_UNIQUE}"`;
+
+/**
+ * `timestamptz` equality for `as_of`: the instant at MICROSECOND resolution,
+ * whatever the zone or the number of fraction digits the string carries — so
+ * `…T09:00:02Z`, `…T09:00:02.000Z` and `…T11:00:02+02:00` are one key, as they
+ * are in PostgreSQL. Digits past the sixth are rounded half-to-even, which is
+ * what PostgreSQL 16 did on every tie probed for `SNAP-1` (`.0000005` → `.000000`,
+ * `.0000015` → `.000002`, `.0000025` → `.000002`, `.0000035` → `.000004`). A
+ * string this cannot read keys as itself (the real column would refuse it,
+ * with a different error this double does not model).
+ */
+function asOfKey(asOf: unknown): string {
+  if (typeof asOf !== "string") return JSON.stringify(String(asOf));
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/u.exec(asOf);
+  if (match === null) return JSON.stringify(asOf);
+  const [, year, month, day, hour, minute, second, fraction = "", zone = "Z"] = match;
+  const offsetSeconds =
+    zone === "Z"
+      ? 0
+      : (zone.startsWith("-") ? -1 : 1) *
+        (Number(zone.slice(1, 3)) * 3600 + Number(zone.slice(4, 6)) * 60);
+  let seconds =
+    Date.UTC(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute), Number(second)) /
+      1000 -
+    offsetSeconds;
+  let micros = Number(fraction.padEnd(6, "0").slice(0, 6));
+  const rest = fraction.slice(6);
+  if (rest !== "") {
+    const first = rest.charCodeAt(0) - 48;
+    const beyond = /[1-9]/u.test(rest.slice(1));
+    if (first > 5 || (first === 5 && (beyond || micros % 2 === 1))) micros += 1;
+  }
+  if (micros === 1_000_000) {
+    seconds += 1;
+    micros = 0;
+  }
+  return `${String(seconds)}.${String(micros).padStart(6, "0")}`;
+}
+
+/**
+ * The identity `pnl_snapshots_scope_unique` is declared over —
+ * `unique nulls not distinct (scope, environment, account_ref, instance_id,
+ * market_id, as_of)` — read from the row exactly as the adapter binds it
+ * (`toPnlSnapshotRow`, own fields only). An absent value binds as NULL in the
+ * adapter and as `null` here, and two NULLs are EQUAL (`nulls not distinct`).
+ * `run_id` and `denomination_asset` are NOT in the key.
+ */
+function pnlSnapshotKey(snapshot: PnlSnapshot): string {
+  const row = toPnlSnapshotRow(snapshot);
+  return JSON.stringify([
+    row.scope ?? null,
+    row.environment ?? null,
+    row.accountRef ?? null,
+    row.instanceId ?? null,
+    row.marketId ?? null,
+    asOfKey(row.asOf),
+  ]);
+}
+
+/**
  * An in-memory durable store with failure injection — §4.2's PostgreSQL
  * boundary.
  *
  * It records everything written, so a test can assert the §6 invariant 3
  * one-decision-per-callback property and the ledger chain against what actually
  * reached the store rather than against what the loop believes it wrote.
+ *
+ * `SNAP-1`: it ENFORCES `accounting.pnl_snapshots`' identity constraint
+ * ({@link PNL_SNAPSHOT_SCOPE_UNIQUE}). It used to push every snapshot, which
+ * is how the in-memory doubles masked `BRACKET1C-SNAPKEY` — the loop wrote
+ * one row PER FILL and the original paper-e2e golden held two rows of one
+ * instance at one instant, which the database refuses. A second row of one
+ * identity is now refused with the adapter's own port data
+ * ({@link DUPLICATE_PNL_SNAPSHOT_DETAIL}) and NOT recorded.
  */
 /** The four writes {@link MemoryTraderStore} can be made to fail, by name. */
 export type TraderStoreWrite =
@@ -167,6 +252,8 @@ export class MemoryTraderStore implements TraderStore {
   readonly checkpointInstants: string[] = [];
   readonly transactions: AppendedLedgerTransaction[] = [];
   readonly pnlSnapshots: PnlSnapshot[] = [];
+  /** `SNAP-1`: the identity of every snapshot recorded — `pnl_snapshots_scope_unique`. */
+  readonly #pnlSnapshotKeys = new Set<string>();
   #failure: { kind: "UNAVAILABLE" | "UNREADABLE"; detail: string } | undefined;
   /** When set, only these writes fail; the others still succeed. */
   #failing: ReadonlySet<TraderStoreWrite> | undefined;
@@ -243,9 +330,20 @@ export class MemoryTraderStore implements TraderStore {
     return await Promise.resolve(portOk(null));
   }
 
+  /**
+   * Records one snapshot — unless an injected failure refuses it, or a
+   * snapshot of the same `pnl_snapshots_scope_unique` identity is already
+   * recorded (`SNAP-1`): then it answers the adapter's own refusal for the
+   * constraint violation and records nothing, as the database inserts nothing.
+   */
   async writePnlSnapshot(snapshot: PnlSnapshot): Promise<PortResult<null>> {
     const refused = this.#refusalFor("writePnlSnapshot");
     if (refused !== undefined) return await Promise.resolve(refused);
+    const key = pnlSnapshotKey(snapshot);
+    if (this.#pnlSnapshotKeys.has(key)) {
+      return await Promise.resolve(portFailed<null>("UNAVAILABLE", DUPLICATE_PNL_SNAPSHOT_DETAIL));
+    }
+    this.#pnlSnapshotKeys.add(key);
     this.pnlSnapshots.push(snapshot);
     return await Promise.resolve(portOk(null));
   }

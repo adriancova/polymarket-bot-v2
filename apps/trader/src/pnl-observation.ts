@@ -12,12 +12,12 @@
  *
  * It must NOT change the store's answer. A refused write is returned as the
  * store refused it and is NOT recorded: the loop halts `STORE_UNAVAILABLE` on
- * that answer (`loop.ts`, `#writePnlSnapshot`), and a health surface that
- * reported a value the database does not hold would contradict the halt it
- * sits next to. Recording happens strictly AFTER `ok`, and a throw from the
- * book (there is none — `record` is a `Map.set`) would surface on the loop's
- * own path exactly as any other exception there does; it is not swallowed
- * into a false `ok`.
+ * that answer (`loop.ts`, `#flushPnlSnapshots`; `#writePnlSnapshot` before
+ * `SNAP-1`), and a health surface that reported a value the database does not
+ * hold would contradict the halt it sits next to. Recording happens strictly
+ * AFTER `ok`, and a throw from the book (there is none — `record` is a
+ * `Map.set`) would surface on the loop's own path exactly as any other
+ * exception there does; it is not swallowed into a false `ok`.
  *
  * ## Why a decorator, and why here
  *

@@ -104,6 +104,30 @@ byte-identical, and every number outside `decisions` is the same multiset
 (proved mechanically in the round's handoff). No economic value moved: the
 money was always right; what moved is the strategy's account of it.
 
+### The `SNAP-1` regeneration: one PnL snapshot per instance per instant
+
+`BRACKET-1c` found that this golden held a shape the durable store refuses:
+TWO `pnlSnapshots` rows for one instance and market at `2026-05-01T09:00:02Z`
+(the entry's `30 @ 0.34` and `20 @ 0.35`, one row per fill), while
+`accounting.pnl_snapshots_scope_unique` is `unique nulls not distinct (scope,
+environment, account_ref, instance_id, market_id, as_of)`. The durable trader
+GLOBAL-halted on the second row; the in-memory store accepted it, which is how
+this file came to hold it (`BRACKET1C-SNAPKEY`). The user ruled "one snapshot
+per instance per instant" (2026-09-28): the loop now computes the row at every
+fill exactly as before and WRITES, once per harvest, the row of each
+instance's LAST fill at that instant (`apps/trader/src/loop.ts`,
+`#stagePnlSnapshot` / `#flushPnlSnapshots`), and `MemoryTraderStore` enforces
+the same key. The regeneration — ONCE, from the verified base bytes, with
+`WP250_WRITE_GOLDEN -t "paper-e2e"` — removed exactly the FIRST `09:00:02Z`
+row (the state after the `30 @ 0.34` fill: `capitalCommitted 10.2`,
+`feesPaid 0.131`, `coreNetPnl -0.131`) and nothing else: `pnlSnapshots` goes
+from three rows to two, and the two it keeps are byte-identical to base's
+second and third rows — the LAST row base wrote at each instant. Every other
+section, `health` included (no counter counts snapshots), is byte-identical,
+and every number outside `pnlSnapshots` is the same multiset (proved
+mechanically in the round's handoff). `two-brackets-run.json` did not move:
+each of its instants has one fill.
+
 ### `health.accounting.realizedPnl` reads "no snapshot observed" here — deliberately, and why
 
 `TRDR-3` (2026-09-17) gave the trader's health surface `accounting.realizedPnl`:
@@ -122,7 +146,8 @@ no book, so this golden carries
 
 — an ABSENT measurement, stated as such, not a `"0"`. The regeneration that
 added it moved exactly these four lines and nothing else. The same run's
-`pnlSnapshots[2].realizedPnl` is `"-1.2"`, so a harness that attached the book
+last snapshot's `realizedPnl` (`pnlSnapshots[1]` since `SNAP-1`; it was
+`pnlSnapshots[2]`) is `"-1.2"`, so a harness that attached the book
 the way the composition root does (or a `createPaperTrader` that wrapped its
 own store — the follow-up `TRDR-3`'s handoff names) would make the field read
 
@@ -192,8 +217,11 @@ charged `0.22`. With the exit: exact `0.432159`, charged `0.432`.
 NO outcome-token line for a zero balance. Nine transactions — principal, token
 movement and fee, once per fill.
 
-**The PnL.** Three snapshots, one per fill. After the entry's two fills (the
-second snapshot): `capitalCommitted = 17.2`, `feesPaid = 0.22`,
+**The PnL.** Two snapshots, one per instant with fills (`SNAP-1`: one row per
+instance per instant, the state after the LAST fill booked at it; three before
+`SNAP-1`, one per fill). After the entry's two fills, both at `09:00:02` (the
+first snapshot, marked at the second fill's price `0.35`):
+`capitalCommitted = 17.2`, `feesPaid = 0.22`,
 `unrealizedPnlMidpoint = 0.3`, so `grossTradingPnl = 0 + 0.3 = 0.3`,
 `coreNetPnl = 0.3 − 0.22 = 0.08` and
 `worstCaseResolutionPnl = realizedPnl − Σ open cost basis = 0 − 17.2 = −17.2`.
@@ -378,7 +406,9 @@ is flat, so the projection carries no outcome-token line.
 **The PnL stream and snapshots.** 7 records in the instance's stream (`TRADE`
 + `FEE` for each taker fill, `TRADE` alone for the maker fill);
 `health.accounting.pnlRecords` `14` (see `N1` above). Four snapshots, one per
-fill, marked at the fill's price:
+fill, marked at the fill's price — and so one per instant: each of these
+instants has exactly one fill, which is why `SNAP-1` (one row per instance per
+instant) left this golden byte-identical:
 
 | After | capitalCommitted | feesPaid | realizedPnl | unrealizedPnlMidpoint | grossTradingPnl | coreNetPnl | worstCaseResolutionPnl |
 | --- | --- | --- | --- | --- | --- | --- | --- |

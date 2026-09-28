@@ -94,6 +94,7 @@ import type { RiskPolicy } from "@polymarket-bot/risk";
 import {
   computePnlSnapshot,
   type PnlRecord,
+  type PnlSnapshot,
   type PnlState,
   type PnlStreamIdentity,
 } from "@polymarket-bot/pnl";
@@ -418,6 +419,23 @@ export interface RetainedOrderState {
 }
 
 /**
+ * `SNAP-1`: one instance's §9.16 snapshot rows, computed at its LAST booked
+ * fill of a harvest and waiting for that harvest's one write
+ * (`CoreLoop.#flushPnlSnapshots`), or OWED to a later instant because the key
+ * already holds a row at theirs.
+ */
+interface StagedPnlSnapshot {
+  /** Exactly what `computePnlSnapshot` answered at that fill — the bytes base wrote. */
+  readonly rows: readonly PnlSnapshot[];
+  /** The rows' `asOf` (the harvest's instant), as epoch milliseconds. */
+  readonly asOfMs: number;
+  /** The held PnL state the rows were computed from (immutable), kept to re-date an owed row. */
+  readonly state: PnlState;
+  /** The marks the rows were computed with (the fill's own price), kept for the same reason. */
+  readonly marks: Readonly<Record<string, { readonly midpoint: string }>>;
+}
+
+/**
  * The bounded, synchronous journal between the runtime and the store.
  *
  * BOUNDED for §8.3's reason: an unbounded outbox is an unbounded memory
@@ -623,6 +641,24 @@ export class CoreLoop {
    * `RECON2-DURABLE`. This loop is therefore NOT memory-bounded.
    */
   readonly #pnlRecords = new Map<string, PnlRecord[]>();
+  /**
+   * `SNAP-1`: the §9.16 snapshot rows STAGED per instance — computed at every
+   * booked fill exactly as base computed them, written ONCE per harvest by
+   * `#flushPnlSnapshots`. A later fill of the same instance REPLACES its entry
+   * (deleted and re-inserted, so the map's order is the order of each
+   * instance's LAST fill: the order base wrote the rows this keeps). An entry
+   * the key does not admit at its flush stays here, OWED. At most one entry
+   * per registered instance.
+   */
+  readonly #stagedSnapshots = new Map<string, StagedPnlSnapshot>();
+  /**
+   * `SNAP-1`: per instance, the `asOf` (epoch milliseconds) of the last
+   * snapshot this process WROTE. `accounting.pnl_snapshots_scope_unique`
+   * admits one row per (scope, environment, account, instance, market,
+   * `as_of`), so the next row is written only at an instant strictly later
+   * than this one. One number per instance.
+   */
+  readonly #lastSnapshotAsOfMs = new Map<string, number>();
   /** Epoch-millisecond instants of this process's own submissions (§9.8 check 19). */
   #submissionInstants: number[] = [];
 
@@ -2271,6 +2307,20 @@ export class CoreLoop {
    * never read are gone — HALTS the process and ends the harvest BEFORE any
    * release: nothing is given back while the fills that would replace it
    * with a position are unknown.
+   *
+   * `SNAP-1` (user ruling 2026-09-28, "one snapshot per instance per
+   * instant"): each booked fill STAGES its instance's §9.16 snapshot
+   * (`#stagePnlSnapshot`, computed exactly where and as base wrote it), and
+   * the harvest WRITES the staged rows ONCE, at the end of its booking phase
+   * (`#flushPnlSnapshots`) — on EVERY path out of it: the normal end, both
+   * store-failure early returns and the venue-cursor refusal. That point is
+   * BEFORE the release, the basket judgement and every delivery, so a failed
+   * snapshot write still latches its GLOBAL halt before this harvest's
+   * `onFill` runs (the MEDIUM-1 gate above). This is the ONLY place a
+   * snapshot is written, and every event runs at most one harvest
+   * (`#processEvent`'s two call sites are exclusive branches); a LATER
+   * harvest at an instant already written — a second event with the same
+   * `receivedAt` — is handled by the key guard in `#flushPnlSnapshots`.
    */
   async #harvestFills(instant: string): Promise<void> {
     const page = this.#options.venue.fillsSince(this.#knownFills);
@@ -2283,6 +2333,8 @@ export class CoreLoop {
           "gone, so no reservation is released and the account must be reconciled (SIM-2, §6 invariant 7)",
         instant,
       );
+      // `SNAP-1`: nothing was booked, so only an OWED row can be staged here.
+      await this.#flushPnlSnapshots(instant);
       return;
     }
     const fills = page.value.fills;
@@ -2301,7 +2353,12 @@ export class CoreLoop {
       const instance = ownerId === undefined ? undefined : this.#options.registry.get(ownerId);
       if (instance === undefined) {
         const unowned = await this.#bookUnownedFill(fill, ownerId, instant);
-        if (unowned === "STORE_UNAVAILABLE") return;
+        if (unowned === "STORE_UNAVAILABLE") {
+          // `SNAP-1`: the rows staged by the fills booked before this one are
+          // written, as base had already written them.
+          await this.#flushPnlSnapshots(instant);
+          return;
+        }
         continue;
       }
 
@@ -2373,6 +2430,10 @@ export class CoreLoop {
             `the ledger transaction could not be persisted: ${written.failure.detail}`,
             instant,
           );
+          // `SNAP-1`: THIS fill staged nothing (its snapshot comes after its
+          // postings, as in base); the rows staged by the fills booked before
+          // it are written, as base had already written them.
+          await this.#flushPnlSnapshots(instant);
           return;
         }
       }
@@ -2386,11 +2447,16 @@ export class CoreLoop {
       // §9.16: the PnL projection follows the posting, from the SAME records the
       // ledger derived. A refusal here is not a halt — PnL is a projection, and
       // §6 invariant 8 makes the append-only ledger the monetary source of
-      // truth — but a store failure IS, on §4.2's terms.
-      await this.#writePnlSnapshot(instance, fill, instant);
+      // truth — but a store failure IS, on §4.2's terms. `SNAP-1`: computed
+      // HERE, per fill, and STAGED; written once, below.
+      this.#stagePnlSnapshot(instance, fill, instant);
 
       booked.push({ instance, fill });
     }
+    // `SNAP-1`: the harvest's ONE snapshot write per instance — after every
+    // fill of the harvest is booked, before anything below releases, judges
+    // or delivers (so a failed write halts before this harvest's `onFill`).
+    await this.#flushPnlSnapshots(instant);
     this.#knownFills = page.value.next;
 
     // --- every order this harvest SETTLED gives its capacity back -----------
@@ -2776,7 +2842,9 @@ export class CoreLoop {
   }
 
   /**
-   * Folds this instance's §9.16 stream and writes the resulting snapshot.
+   * Folds this instance's §9.16 stream and STAGES the resulting snapshot rows
+   * for the harvest's one write (`SNAP-1`; this method used to be
+   * `#writePnlSnapshot` and wrote them here, once PER FILL).
    *
    * The MARK is the fill's own price — the last observed transaction in this
    * token, which is a fact rather than a model. §9.16's other marks (model,
@@ -2797,12 +2865,18 @@ export class CoreLoop {
    * cadence's checks no longer run here (`FOLD1-R1-2`): they run at the
    * posting site, before the store writes, so a mismatch's replacement is
    * still what the snapshot below reads.
+   *
+   * `SNAP-1`: ONLY the write moved. The advance, the early returns, the marks
+   * and the computation are still per fill, at the same point, so FOLD-1's
+   * per-fill checks and F3's counting see exactly what they saw. The rows
+   * computed here REPLACE any rows this instance staged earlier in the
+   * harvest, so what the harvest writes is the LAST per-fill computation —
+   * byte for byte the row base wrote last at this instant. An early return
+   * (a refused record, a refused computation) replaces nothing: the rows of
+   * the instance's last fill that DID compute stay staged, exactly the last
+   * row base had written.
    */
-  async #writePnlSnapshot(
-    instance: RegisteredInstance,
-    fill: SimulatedFill,
-    instant: string,
-  ): Promise<void> {
+  #stagePnlSnapshot(instance: RegisteredInstance, fill: SimulatedFill, instant: string): void {
     const records = this.#pnlRecords.get(instance.instanceId);
     if (records === undefined || records.length === 0) return;
     this.#held.advancePnl(instance.instanceId, () => this.#pnlIdentity(instance), records);
@@ -2810,12 +2884,85 @@ export class CoreLoop {
     if (folded === undefined) return;
     const tokenAssetId =
       this.#options.tokenAssetIds.get(`${fill.marketId}|${fill.side}`) ?? fill.tokenId;
-    const snapshots = computePnlSnapshot(folded, {
-      asOf: instant,
-      marks: { [tokenAssetId]: { midpoint: fill.price } },
-    });
+    const marks = Object.freeze({ [tokenAssetId]: Object.freeze({ midpoint: fill.price }) });
+    const snapshots = computePnlSnapshot(folded, { asOf: instant, marks });
     if (!snapshots.ok) return;
-    for (const snapshot of snapshots.value) {
+    this.#stagedSnapshots.delete(instance.instanceId);
+    this.#stagedSnapshots.set(
+      instance.instanceId,
+      Object.freeze({ rows: snapshots.value, asOfMs: Date.parse(instant), state: folded, marks }),
+    );
+  }
+
+  /**
+   * `SNAP-1`: the harvest's ONE PnL-snapshot write — each staged instance's
+   * rows, in the order of each instance's last fill. Called exactly once per
+   * harvest, at the end of its booking phase (`#harvestFills`).
+   *
+   * THE KEY. `accounting.pnl_snapshots_scope_unique` is `unique nulls not
+   * distinct (scope, environment, account_ref, instance_id, market_id,
+   * as_of)`: one row per instance per instant. The loop's instant is the
+   * envelope's `receivedAt`, and two EVENTS can carry the same one — the
+   * gateway stamps each normalized event of a frame separately at millisecond
+   * precision, and nothing here requires instants to increase — so a later
+   * harvest can stage rows at an instant this instance already has a row at.
+   * Writing them would be refused by the database and GLOBAL-halt the process
+   * (the `BRACKET1C-SNAPKEY` defect, one event later). So a row is written
+   * only at an instant STRICTLY LATER than the instance's last written row
+   * (`#lastSnapshotAsOfMs`). Rows that are not stay staged, OWED: the first
+   * later harvest at a strictly later instant writes them RE-DATED to that
+   * instant — the same state and marks, computed again with the new `asOf`
+   * (a fresh fill of the instance restages newer rows first, and those are
+   * what is written). The row at the earlier instant therefore keeps the
+   * state its FIRST harvest wrote, and the later state lands at the next
+   * instant any event is processed at; the user's ruling ("the state after
+   * the LAST fill booked at that instant") cannot hold for that row without
+   * either an upsert or a write deferred past this harvest's deliveries, which
+   * would break §4.2's MEDIUM-1 gate. Disclosed in the `SNAP-1` handoff.
+   *
+   * HALTS. A halt latched earlier in the harvest (a refused posting, a
+   * projection halt, a rebuild mismatch) does not stop the write: the books
+   * stay truthful, as base wrote every booked fill's row whatever the halts.
+   * A refused write is the SAME GLOBAL `STORE_UNAVAILABLE` base latched, at
+   * this harvest's instant, before its deliveries; that instance's remaining
+   * rows are not attempted (base's `return`) and its rows are DROPPED, not
+   * retried — base never retried a snapshot either; the next fill writes a
+   * newer one. Every other staged instance is still attempted, as base
+   * attempted every later fill's write.
+   */
+  async #flushPnlSnapshots(instant: string): Promise<void> {
+    if (this.#stagedSnapshots.size === 0) return;
+    const flushMs = Date.parse(instant);
+    for (const [instanceId, staged] of [...this.#stagedSnapshots]) {
+      const lastMs = this.#lastSnapshotAsOfMs.get(instanceId);
+      let rows = staged.rows;
+      let asOfMs = staged.asOfMs;
+      if (lastMs !== undefined && !(staged.asOfMs > lastMs)) {
+        // The key already holds this instance's row at (or after) the staged
+        // instant. OWED until a harvest at a strictly later instant.
+        if (!(flushMs > lastMs)) continue;
+        const redated = computePnlSnapshot(staged.state, { asOf: instant, marks: staged.marks });
+        if (!redated.ok) {
+          this.#stagedSnapshots.delete(instanceId);
+          continue;
+        }
+        rows = redated.value;
+        asOfMs = flushMs;
+      }
+      this.#stagedSnapshots.delete(instanceId);
+      const accepted = await this.#writeSnapshotRows(rows, instant);
+      if (accepted > 0) this.#lastSnapshotAsOfMs.set(instanceId, asOfMs);
+    }
+  }
+
+  /**
+   * Writes one instance's snapshot rows and answers how many the store
+   * accepted. A refusal latches the GLOBAL `STORE_UNAVAILABLE` halt base
+   * latched (§4.2: a store failure halts) and stops that instance's rows.
+   */
+  async #writeSnapshotRows(rows: readonly PnlSnapshot[], instant: string): Promise<number> {
+    let accepted = 0;
+    for (const snapshot of rows) {
       const written = await this.#options.store.writePnlSnapshot(snapshot);
       if (!written.ok) {
         this.#options.halts.halt(
@@ -2824,9 +2971,11 @@ export class CoreLoop {
           `a PnL snapshot could not be persisted: ${written.failure.detail}`,
           instant,
         );
-        return;
+        return accepted;
       }
+      accepted += 1;
     }
+    return accepted;
   }
 
   async #deliverFill(
