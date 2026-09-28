@@ -70,6 +70,7 @@ import {
   type RateLimitBudget,
   type SimulatedFill,
   type SimulatedOrder,
+  type VenueRetentionBounds,
 } from "@polymarket-bot/simulation";
 import type { EvaluationInput, EvaluationOutcome } from "@polymarket-bot/strategy-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -439,8 +440,9 @@ function quietEvent(ordinal: number, receivedAt: string): IngestedEvent {
  * A `TraderVenue` around the REAL `SimulatedVenue`, with three test hooks.
  *
  * - `inject(fill)` appends a fill to the stream the loop harvests. The stream
- *   is kept APPEND-ONLY in arrival order (the loop's cursor indexes into it),
- *   merging the inner venue's new fills as they appear.
+ *   is kept APPEND-ONLY in arrival order and served by `fillsSince` over its
+ *   own absolute sequence (SIM-2: the loop's cursor), merging the inner
+ *   venue's new fills as they appear.
  * - `misreport(orderId, filledShares)` makes the order VIEW report a filled
  *   size the booked fills do not back (a settlement-mismatch state).
  * - `afterSubmit(plan, result)` runs after every real submission; returning
@@ -449,12 +451,18 @@ function quietEvent(ordinal: number, receivedAt: string): IngestedEvent {
  * - `rewriteAnswer(result)` replaces the venue's answer (the venue's STATE is
  *   untouched): how a test states a venue that refuses a plan while still
  *   holding part of it.
+ * - `forget(orderId)` (SIM-2): the venue stops answering for an order — a
+ *   venue that evicted it though the loop never acknowledged it, or an
+ *   adapter whose order store lost it.
+ * - `acknowledged` (SIM-2 r1): every id the loop acknowledged, in order.
  */
 class WrappedVenue implements TraderVenue {
   readonly inner: SimulatedVenue;
   readonly #merged: SimulatedFill[] = [];
   #innerSeen = 0;
   readonly #misreported = new Map<string, string>();
+  readonly #forgotten = new Set<string>();
+  readonly acknowledged: string[] = [];
   afterSubmit: ((plan: unknown, result: ExecutionResult) => "LOSE_ANSWER" | undefined) | undefined;
   rewriteAnswer: ((result: ExecutionResult) => ExecutionResult) | undefined;
 
@@ -480,32 +488,49 @@ class WrappedVenue implements TraderVenue {
     return this.rewriteAnswer?.(result) ?? result;
   }
 
-  ordersSnapshot(): readonly SimulatedOrder[] {
-    return this.inner
-      .ordersSnapshot()
-      .map((order) => {
-        const filledShares = this.#misreported.get(order.simulatedOrderId);
-        return filledShares === undefined ? order : { ...order, filledShares };
-      });
+  /** The venue's order VIEW, with a misreported `filledShares` applied and a forgotten order withheld. */
+  #viewed(order: SimulatedOrder | undefined): SimulatedOrder | undefined {
+    if (order === undefined || this.#forgotten.has(order.simulatedOrderId)) return undefined;
+    const filledShares = this.#misreported.get(order.simulatedOrderId);
+    return filledShares === undefined ? order : { ...order, filledShares };
   }
 
-  get fills(): readonly SimulatedFill[] {
-    const inner = this.inner.fills;
-    for (let index = this.#innerSeen; index < inner.length; index += 1) {
-      const fill = inner[index];
-      if (fill !== undefined) this.#merged.push(fill);
-    }
-    this.#innerSeen = inner.length;
-    return Object.freeze([...this.#merged]);
+  orderById(venueOrderId: string): SimulatedOrder | undefined {
+    return this.#viewed(this.inner.orderById(venueOrderId));
+  }
+
+  orderByPlannedId(plannedOrderId: string): SimulatedOrder | undefined {
+    return this.#viewed(this.inner.orderByPlannedId(plannedOrderId));
+  }
+
+  fillsSince(sequence: number): ReturnType<TraderVenue["fillsSince"]> {
+    this.#mergeInner();
+    return { ok: true, value: { fills: Object.freeze(this.#merged.slice(sequence)), next: this.#merged.length } };
+  }
+
+  #mergeInner(): void {
+    const page = this.inner.fillsSince(this.#innerSeen);
+    if (!page.ok) throw new Error(`the inner venue refused its fill cursor: ${page.refusal.code}`);
+    for (const fill of page.value.fills) this.#merged.push(fill);
+    this.#innerSeen = page.value.next;
   }
 
   inject(fill: SimulatedFill): void {
-    void this.fills;
+    this.#mergeInner();
     this.#merged.push(fill);
   }
 
   misreport(orderId: string, filledShares: string): void {
     this.#misreported.set(orderId, filledShares);
+  }
+
+  forget(orderId: string): void {
+    this.#forgotten.add(orderId);
+  }
+
+  acknowledgeTerminal(venueOrderId: string): boolean {
+    this.acknowledged.push(venueOrderId);
+    return this.inner.acknowledgeTerminal(venueOrderId);
   }
 }
 
@@ -544,6 +569,8 @@ function assemble(
     readonly immediateOrderType?: string;
     /** A stated GTD expiry the venue's policy answers (the trader's own states none). */
     readonly statedExpiryNs?: bigint;
+    /** SIM-2 r1: the venue's history bounds (its defaults when absent). */
+    readonly venueRetention?: VenueRetentionBounds;
     /**
      * SIM1-R1-1: a TIER-1 venue on a DELAYED market (`secondsDelay`, zero
      * latency) over the same books, with its own starting cash. The shipped
@@ -594,6 +621,7 @@ function assemble(
     feeSnapshot: fees.value,
     rateLimits:
       input.rateLimits ?? unmodeledRateLimits("no venue rate-limit budget is modelled in this unit test"),
+    ...(input.venueRetention === undefined ? {} : { retention: input.venueRetention }),
     policy: {
       ...createExecutionPolicy(wiring, () => undefined),
       ...(input.statedExpiryNs === undefined ? {} : { statedExpiryNsFor: () => input.statedExpiryNs }),
@@ -786,6 +814,8 @@ describe("R1 — a terminal order is delivered until ONE evaluated delivery, the
       retiredUnsettled: 0,
       orderViews: 0,
       tombstones: 3,
+      heldUnowned: 0,
+      watchedOrders: 0,
     });
     const health = loop.health();
     expect(health.seams.orders).toEqual({
@@ -1608,6 +1638,180 @@ describe("retention bounds reach the loop through createPaperTrader, and evict o
     );
     expect(() => assemble({ retention: { tombstones: 1.5 } })).toThrow(/TRADER_CONFIG_REFUSED/u);
     expect(() => assemble({ retention: { provenance: -1 } })).toThrow(/TRADER_CONFIG_REFUSED/u);
+  });
+});
+
+describe("SIM-2 — the loop reads the venue by id: what it may hold is TRACKED, and a miss is LOUD", () => {
+  it("a placement whose ANSWER was lost: its planned orders are tracked, and their capital comes back at the harvest that sees them terminal", async () => {
+    // The harvest used to find such orders by scanning EVERY venue order; it
+    // scans nothing now, so the loop tracks what the venue may hold.
+    const parts = assemble();
+    await drive(parts, 1, 4);
+    const planned: string[] = [];
+    parts.venue.afterSubmit = (plan) => {
+      const offered = plan as { planKind?: string; groups?: readonly { orders: readonly { plannedOrderId: string }[] }[] };
+      if (offered.planKind === "CANCEL") return undefined;
+      for (const group of offered.groups ?? []) for (const order of group.orders) planned.push(order.plannedOrderId);
+      parts.venue.afterSubmit = undefined;
+      return "LOSE_ANSWER";
+    };
+    parts.event = 5;
+    const recorded = RECORDED[4];
+    if (recorded === undefined) throw new Error("no event 5");
+    expect(parts.trader.loop.ingest(ingested(recorded, 5))).toBe(true);
+    await expect(parts.trader.loop.drain()).rejects.toThrow(/answer was lost/u);
+    const loop = parts.trader.loop;
+    const { entry } = ordersByRole(parts);
+    expect(planned).toEqual([entry.plannedOrderId]);
+    expect(entry.state).toBe("FILLED");
+    // No instance owns it; the loop knows the venue may hold it.
+    expect(loop.retainedOrderState()).toMatchObject({ owners: 0, heldUnowned: 1 });
+    expect(loop.health().seams.reservations).toMatchObject({ open: 1, released: 0 });
+    expect(loop.timeInForceFor(entry.plannedOrderId)).toBeDefined();
+
+    await driveOne(parts, quietEvent(6, "2026-05-01T09:00:03.000Z"), 6);
+    const health = loop.health();
+    // The harvest saw it FILLED: all three entries released, the entry forgotten.
+    expect(loop.retainedOrderState().heldUnowned).toBe(0);
+    expect(health.seams.reservations).toMatchObject({ open: 0, released: 1 });
+    expect(health.seams.allocator).toMatchObject({ open: 0, released: 1 });
+    expect(loop.timeInForceFor(entry.plannedOrderId)).toBeUndefined();
+    // Its fills are posted UNATTRIBUTED and halt the market (TRDR-4), unchanged.
+    expect(health.seams.orders.unownedFills).toBe(parts.venue.inner.fills.length);
+    expect(health.halts.map((halt) => halt.code)).toContain("UNATTRIBUTED_ACTIVITY");
+  });
+
+  it("SIM-1's requirement (SIM2-R1-1): a TERMINAL order stays answerable until the loop has SETTLED it, whatever the venue's bound — a halted instance's two FILLED slices at a bound of ONE", async () => {
+    // The HALTED-instance case: the entry fills on submission in TWO slices —
+    // both terminal inside ONE venue call — and its instance is halted, so
+    // their terminal views are suppressed and neither is retired nor settled
+    // for as long as the halt lasts. The venue retains ONE acknowledged
+    // terminal order; it must still answer for both, because the loop has
+    // acknowledged neither. (At 7c570ed the first slice was evicted inside
+    // the submission itself, and the next harvest halted GLOBAL.)
+    const parts = assemble({ maxSliceShares: "25", venueRetention: { orders: 1, tombstones: 1 } });
+    const scope = { kind: "STRATEGY_INSTANCE" as const, instanceId: INSTANCE_ID };
+    parts.venue.afterSubmit = () => {
+      parts.trader.halts.halt(scope, "RUNTIME_PERSISTENCE_FAILED", "SIM-2 test: halted after submit", T_OPEN);
+      parts.venue.afterSubmit = undefined;
+      return undefined;
+    };
+    await drive(parts, 1, 5);
+    const loop = parts.trader.loop;
+    // No GLOBAL halt: nothing this process owns went missing.
+    expect(loop.health().halts.map((halt) => halt.scope.kind)).toEqual(["STRATEGY_INSTANCE"]);
+    const slices = parts.venue.inner.ordersSnapshot().filter((order) => order.action === "BUY");
+    expect(slices.map((order) => `${order.state} ${order.filledShares}/${order.requestedShares}`)).toEqual([
+      "FILLED 25/25",
+      "FILLED 25/25",
+    ]);
+    const ids = slices.map((order) => order.simulatedOrderId);
+    await driveOne(parts, quietEvent(6, "2026-05-01T09:00:03.000Z"), 6);
+    expect(loop.health().halts.map((halt) => halt.scope.kind)).toEqual(["STRATEGY_INSTANCE"]);
+    expect(loop.retainedOrderState()).toMatchObject({ owners: 2, retiredUnsettled: 0 });
+    for (const id of ids) expect(deliveriesOf(parts, id)).toEqual([]);
+    // Held by the venue, outside its bound, and never acknowledged.
+    expect(parts.venue.acknowledged).toEqual([]);
+    expect(parts.venue.inner.retention()).toMatchObject({
+      awaitingAcknowledgment: 2,
+      orders: { retained: 0, maximumRetained: 1, evicted: 0 },
+    });
+    for (const id of ids) expect(parts.venue.orderById(id)?.state).toBe("FILLED");
+
+    // Release the instance: each terminal view is delivered, evaluated,
+    // retired and settled — and only THEN acknowledged, in venue order.
+    expect(
+      parts.trader.halts.release(scope, {
+        authoritativeSnapshotApplied: true,
+        reason: "SIM-2 test: the instance's state was re-established",
+      }),
+    ).toBe(true);
+    await driveOne(parts, quietEvent(7, "2026-05-01T09:00:04.000Z"), 7);
+    for (const id of ids) {
+      expect(deliveriesOf(parts, id).map((d) => [d.orderStatus, d.outcome, d.event])).toEqual([["FILLED", "DECIDED", 7]]);
+      expectRetiredAfterFirstEvaluatedTerminalDelivery(parts, id);
+    }
+    expect(loop.health().halts).toEqual([]);
+    expect(loop.health().seams.orders.settled).toBe(2);
+    expect(parts.venue.acknowledged).toEqual(ids);
+    // Now — and not before — the venue's bound applies: one kept, one evicted,
+    // the evicted one tombstoned.
+    expect(parts.venue.inner.retention()).toMatchObject({
+      awaitingAcknowledgment: 0,
+      orders: { retained: 1, maximumRetained: 1, evicted: 1 },
+      tombstones: { retained: 1, evicted: 0 },
+    });
+  });
+
+  it("SIM2-R1-4: a LOST answer's order, once the venue has SHOWN it, is held by its venue id — its later disappearance HALTS, and the hold is kept", async () => {
+    // Event 5: the entry's answer arrives; its fill's onFill places the
+    // RESTING take-profit, and THAT answer is lost after the venue booked it.
+    const parts = assemble();
+    await drive(parts, 1, 4);
+    const lost: string[] = [];
+    parts.venue.afterSubmit = (plan) => {
+      const offered = plan as { planKind?: string; groups?: readonly { orders: readonly { plannedOrderId: string; action: string }[] }[] };
+      const sells = (offered.groups ?? []).flatMap((group) => group.orders).filter((order) => order.action === "SELL");
+      if (offered.planKind === "CANCEL" || sells.length === 0) return undefined;
+      for (const order of sells) lost.push(order.plannedOrderId);
+      parts.venue.afterSubmit = undefined;
+      return "LOSE_ANSWER";
+    };
+    parts.event = 5;
+    const recorded = RECORDED[4];
+    if (recorded === undefined) throw new Error("no event 5");
+    expect(parts.trader.loop.ingest(ingested(recorded, 5))).toBe(true);
+    await expect(parts.trader.loop.drain()).rejects.toThrow(/answer was lost/u);
+    const loop = parts.trader.loop;
+    const { takeProfit } = ordersByRole(parts);
+    if (takeProfit === undefined) throw new Error("no take-profit was booked");
+    expect(lost).toEqual([takeProfit.plannedOrderId]);
+    expect(takeProfit.state).toBe("RESTING");
+    expect(loop.retainedOrderState().heldUnowned).toBe(1);
+
+    // Event 6: the harvest finds it RESTING by its planned id — so it EXISTS.
+    await driveOne(parts, quietEvent(6, "2026-05-01T09:00:03.000Z"), 6);
+    expect(loop.health().halts.filter((halt) => halt.scope.kind === "GLOBAL")).toEqual([]);
+    expect(loop.retainedOrderState().heldUnowned).toBe(1);
+    expect(loop.timeInForceFor(takeProfit.plannedOrderId)).toBeDefined();
+
+    // Event 7: the venue stops answering for it. Not "possibly never booked"
+    // any more: a LOUD miss, and nothing is released.
+    parts.venue.forget(takeProfit.simulatedOrderId);
+    const reserved = loop.health().seams.reservations;
+    await driveOne(parts, quietEvent(7, "2026-05-01T09:00:04.000Z"), 7);
+    const halt = loop.health().halts.find((record) => record.scope.kind === "GLOBAL");
+    expect(halt?.code).toBe("VENUE_OBSERVATION_FAILED");
+    expect(halt?.detail).toContain(
+      `order ${takeProfit.simulatedOrderId} (planned ${takeProfit.plannedOrderId}), which it holds without an owner`,
+    );
+    expect(loop.retainedOrderState().heldUnowned).toBe(1);
+    expect(loop.timeInForceFor(takeProfit.plannedOrderId)).toBeDefined();
+    expect(loop.health().seams.reservations).toMatchObject({ open: reserved.open, released: reserved.released });
+  });
+
+  it("an order the loop OWNS that the venue no longer answers for HALTS the process, and nothing is released for it", async () => {
+    const parts = assemble();
+    await drive(parts, 1, 5);
+    const { takeProfit } = ordersByRole(parts);
+    if (takeProfit === undefined) throw new Error("no take-profit");
+    expect(takeProfit.state).toBe("RESTING");
+    const loop = parts.trader.loop;
+    const before = loop.health().seams.reservations;
+    expect(before.open).toBeGreaterThan(0);
+    expect(loop.health().halts).toEqual([]);
+
+    parts.venue.forget(takeProfit.simulatedOrderId);
+    await driveOne(parts, quietEvent(6, "2026-05-01T09:00:03.000Z"), 6);
+    const health = loop.health();
+    const halt = health.halts.find((record) => record.scope.kind === "GLOBAL");
+    expect(halt?.code).toBe("VENUE_OBSERVATION_FAILED");
+    expect(halt?.action).toBe("RECONCILE_ACCOUNT");
+    expect(halt?.detail).toContain(`order ${takeProfit.simulatedOrderId}, which instance ${INSTANCE_ID} owns`);
+    expect(halt?.detail).toContain("which this process has not acknowledged: evicted from its bounded history regardless, or never held");
+    // Still owned, still reserved: a miss never releases anything.
+    expect(loop.retainedOrderState().owners).toBe(1);
+    expect(health.seams.reservations).toMatchObject({ open: before.open, released: before.released });
   });
 });
 

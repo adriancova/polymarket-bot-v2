@@ -93,7 +93,13 @@ export type HaltReasonCode =
    * recorded event, or could not APPLY what recorded time settled (a DELAYED
    * order's disposition, `SIMULATED_VENUE_DISPOSITION_NOT_APPLIED`). Its
    * account no longer answers for what the venue model says happened, so the
-   * account state is unknown — §9.9's `RECONCILE_ACCOUNT` rung.
+   * account state is unknown — §9.9's `RECONCILE_ACCOUNT` rung. SIM-2: also
+   * when the venue can no longer answer for state the loop reads from it —
+   * the fills since the loop's cursor (its bounded fill history evicted them,
+   * `SIMULATED_VENUE_HISTORY_EVICTED`), or an order the loop owns, holds or
+   * watches and has NOT acknowledged (a venue must hold such an order, so it
+   * evicted it regardless, or never held it). The loop reads no history, so
+   * it cannot rebuild what is missing.
    */
   | "VENUE_OBSERVATION_FAILED"
   /** The strategy runtime could not persist a decision or its checkpoint. */

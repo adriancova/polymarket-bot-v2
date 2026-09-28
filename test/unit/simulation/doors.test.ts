@@ -1828,10 +1828,22 @@ const MEMBER_BUCKETS = [
  */
 const CLASS_MEMBERS: Readonly<Record<string, Readonly<Record<string, string>>>> = Object.freeze({
   SimulatedVenue: Object.freeze({
-    fills: "PORT ANSWER — no argument; answers a FROZEN COPY of the fill list, never the live array",
+    fills: "PORT ANSWER — no argument; answers a FROZEN COPY of the retained fill list, never the live log",
     atEvent: "PORT ANSWER — no argument; answers the materialized identity `observe` stored",
-    ordersSnapshot: "PORT ANSWER — no argument; a fresh array of frozen orders, ordered by id",
-    restingBands: "PORT ANSWER — no argument; a fresh array of frozen bands, ordered by id",
+    ordersSnapshot:
+      "PORT ANSWER — no argument; a fresh array of frozen orders (live ∪ retained terminal), ordered by id",
+    restingBands: "PORT ANSWER — no argument; a fresh array of the frozen LIVE bands, ordered by id",
+    bandHistory:
+      "PORT ANSWER — no argument; a fresh array of frozen bands (live ∪ retained terminal), ordered by id (SIM-2)",
+    retention: "PORT ANSWER — no argument; a frozen prototype-free counter record (SIM-2)",
+    fillsSince:
+      "NON-RECORD DOOR — a PRIMITIVE sequence; totality-guarded, refuses a non-safe-integer, future or evicted sequence by name, and answers a frozen prototype-free page (SIM-2)",
+    orderById:
+      "NON-RECORD DOOR — a PRIMITIVE id; a non-string answers undefined; answers the stored frozen order this package built (SIM-2)",
+    orderByPlannedId:
+      "NON-RECORD DOOR — a PRIMITIVE id; a non-string answers undefined; answers the stored frozen order this package built (SIM-2)",
+    acknowledgeTerminal:
+      "NON-RECORD DOOR — a PRIMITIVE id; a non-string, live, unknown or already-acknowledged id answers false and changes nothing; answers a boolean (SIM-2 r1)",
     observe: "RECORD DOOR",
     observeTrade: "RECORD DOOR",
     submit: "RECORD DOOR",
@@ -2241,6 +2253,11 @@ describe("the partition covers CLASS MEMBERS too (round-4 review, MEDIUM-2)", ()
     expect(venue.fills).not.toBe(venue.fills); // a fresh copy each read
     const orders = venue.ordersSnapshot();
     expect(orders).not.toBe(venue.ordersSnapshot());
+    // SIM-2: the new history and counter answers are fresh too.
+    expect(venue.bandHistory()).not.toBe(venue.bandHistory());
+    expect(venue.restingBands()).not.toBe(venue.restingBands());
+    expect(Object.isFrozen(venue.retention())).toBe(true);
+    expect(Object.getPrototypeOf(venue.retention())).toBeNull();
     expect(venue.atEvent).toBeDefined();
     expect(Object.isFrozen(venue.atEvent)).toBe(true);
 

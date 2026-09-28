@@ -7,8 +7,13 @@
  * orders rather than history, and per-event `onOrderUpdate` deliveries do not
  * grow with the number of orders ever placed — and nothing about elapsed-time
  * memory behaviour. It also does not claim the process is memory-bounded:
- * `#pnlRecords`, the in-memory `Ledger` and the `SimulatedVenue` still grow
- * (`LOOPMEM-FOLD`, `LOOPMEM-SIM`).
+ * `#pnlRecords` and the in-memory `Ledger` still grow (`LOOPMEM-FOLD`).
+ *
+ * SIM-2 adds a second run in the same harness (the last `describe`), just as
+ * synthetic and just as NOT a soak: the `SimulatedVenue` holds its LIVE orders
+ * plus bounded, counted history, and the loop makes no call proportional to
+ * that history — no `ordersSnapshot()`, no copy of the fill list, one fill
+ * cursor read per harvest and lookups by id.
  *
  * WHAT IS REAL: the `CoreLoop`, the strategy RUNTIME, feature engine, books,
  * capital allocator, risk engine, execution planner, `SimulatedVenue` (Tier 0),
@@ -40,12 +45,14 @@ import type { DecisionResult, EventEnvelope, Intent } from "@polymarket-bot/doma
 import { Ledger } from "@polymarket-bot/ledger";
 import { parseRiskPolicy } from "@polymarket-bot/risk";
 import {
+  DEFAULT_VENUE_RETENTION,
   SimulatedVenue,
   readFeeScheduleSnapshot,
   tier0Model,
   unmodeledRateLimits,
   type BookView,
   type FeeScheduleSnapshot,
+  type VenueRetentionBounds,
 } from "@polymarket-bot/simulation";
 import {
   createStrategyInstanceRuntime,
@@ -100,7 +107,16 @@ function feeSnapshot(): FeeScheduleSnapshot {
   };
 }
 
-function traderConfig(): Record<string, unknown> {
+/** The harness's knobs; every default is the TRDR-4 run's. */
+interface HarnessOptions {
+  /** The venue's history bounds (SIM-2); the venue's defaults when absent. */
+  readonly venueRetention?: VenueRetentionBounds;
+  /** `features.tradeWindowMs`: how much of the public-trade tape a snapshot reads. */
+  readonly tradeWindowMs?: number;
+  readonly strategy?: Strategy<unknown, CyclingState>;
+}
+
+function traderConfig(options: HarnessOptions = {}): Record<string, unknown> {
   const fees = feeSnapshot();
   return {
     environment: "PAPER",
@@ -131,7 +147,7 @@ function traderConfig(): Record<string, unknown> {
     features: {
       depthLevels: [1, 2, 5],
       executableShares: ["50"],
-      tradeWindowMs: 60_000,
+      tradeWindowMs: options.tradeWindowMs ?? 60_000,
       ewmaLambda: "0.94",
       primaryReferenceVenue: "binance",
     },
@@ -219,69 +235,84 @@ function adopt(orders: readonly StrategyOrderView[]): StrategyOrderView | undefi
     .find((order) => order.outcome === "YES" && order.side === "BUY");
 }
 
-const cyclingStrategy: Strategy<unknown, CyclingState> = {
-  name: "trdr4-cycling-double",
-  version: "1.0.0",
-  paramsSchema: z.strictObject({}),
-  stateSchemaVersion: 1,
-  onStart: hold,
-  onMarketOpen: hold,
-  onTimer: hold,
-  onFill: (ctx: StrategyContext) => hold(ctx),
-  onOrderUpdate: (ctx: StrategyContext) => hold(ctx),
-  onMarketClosing: (ctx: StrategyContext) => hold(ctx),
-  onMarketResolved: (ctx: StrategyContext) => hold(ctx),
-  onStop: (ctx: StrategyContext) => hold(ctx),
-  onFeatures(ctx: StrategyContext): DecisionResult {
-    const step = ctx.state<CyclingState>().step ?? 0;
-    const orders = ctx.orders();
-    const adopted = adopt(orders);
-    const reasonCodes =
-      adopted !== undefined && TERMINAL.has(adopted.status) ? ["TRDR4.ADOPTED_TERMINAL"] : ["TRDR4.STEP"];
-    const base = { reasonCodes, featureSnapshotRef: ctx.features().snapshotRef, statePatch: { step: step + 1 } };
-    const working = orders.filter((order) => !TERMINAL.has(order.status)).map((order) => order.orderId);
-    if (working.length > 0) {
-      const cancel: Intent = { type: "CANCEL", marketId: MARKET_ID, orderIds: working, reason: "TRDR-4 long run" };
-      return { ...base, decisionType: "cancel" as const, intents: [cancel] };
-    }
-    const held = ctx.position().yesShares;
-    if (held !== "0") {
-      const sell: Intent = {
+/**
+ * The cycling double, parametrized (SIM-2): which strategy steps place the
+ * IMMEDIATE round trip, and the BUY's size. The TRDR-4 run uses every
+ * fortieth step and 50 shares.
+ */
+function cyclingStrategyWith(options: {
+  readonly immediate: (step: number) => boolean;
+  readonly targetShares: string;
+}): Strategy<unknown, CyclingState> {
+  return {
+    name: "trdr4-cycling-double",
+    version: "1.0.0",
+    paramsSchema: z.strictObject({}),
+    stateSchemaVersion: 1,
+    onStart: hold,
+    onMarketOpen: hold,
+    onTimer: hold,
+    onFill: (ctx: StrategyContext) => hold(ctx),
+    onOrderUpdate: (ctx: StrategyContext) => hold(ctx),
+    onMarketClosing: (ctx: StrategyContext) => hold(ctx),
+    onMarketResolved: (ctx: StrategyContext) => hold(ctx),
+    onStop: (ctx: StrategyContext) => hold(ctx),
+    onFeatures(ctx: StrategyContext): DecisionResult {
+      const step = ctx.state<CyclingState>().step ?? 0;
+      const orders = ctx.orders();
+      const adopted = adopt(orders);
+      const reasonCodes =
+        adopted !== undefined && TERMINAL.has(adopted.status) ? ["TRDR4.ADOPTED_TERMINAL"] : ["TRDR4.STEP"];
+      const base = { reasonCodes, featureSnapshotRef: ctx.features().snapshotRef, statePatch: { step: step + 1 } };
+      const working = orders.filter((order) => !TERMINAL.has(order.status)).map((order) => order.orderId);
+      if (working.length > 0) {
+        const cancel: Intent = { type: "CANCEL", marketId: MARKET_ID, orderIds: working, reason: "TRDR-4 long run" };
+        return { ...base, decisionType: "cancel" as const, intents: [cancel] };
+      }
+      const held = ctx.position().yesShares;
+      if (held !== "0") {
+        const sell: Intent = {
+          type: "POSITION",
+          intentId: `trdr4-sell-${String(step)}`,
+          marketId: MARKET_ID,
+          direction: "YES",
+          targetMode: "DELTA",
+          targetShares: `-${held}`,
+          minimumSellPrice: "0.3",
+          urgency: "IMMEDIATE",
+          liquidityPreference: "TAKER_OK",
+          partialFillPolicy: "ACCEPT_ANY",
+          validUntil: validUntil(ctx),
+          tags: ["trdr4.exit", "sb.order-type:FAK"],
+        };
+        return { ...base, decisionType: "exit" as const, intents: [sell] };
+      }
+      const immediate = options.immediate(step);
+      const buy: Intent = {
         type: "POSITION",
-        intentId: `trdr4-sell-${String(step)}`,
+        intentId: `trdr4-buy-${String(step)}`,
         marketId: MARKET_ID,
         direction: "YES",
         targetMode: "DELTA",
-        targetShares: `-${held}`,
-        minimumSellPrice: "0.3",
-        urgency: "IMMEDIATE",
-        liquidityPreference: "TAKER_OK",
+        targetShares: options.targetShares,
+        maximumBuyPrice: immediate ? "0.35" : "0.2",
+        maximumTotalCost: "18",
+        urgency: immediate ? "IMMEDIATE" : "PASSIVE",
+        liquidityPreference: immediate ? "TAKER_OK" : "MAKER_ONLY",
         partialFillPolicy: "ACCEPT_ANY",
         validUntil: validUntil(ctx),
-        tags: ["trdr4.exit", "sb.order-type:FAK"],
+        expectedNetEdge: "5",
+        tags: ["trdr4.entry", immediate ? "sb.order-type:FAK" : "sb.order-type:GTC"],
       };
-      return { ...base, decisionType: "exit" as const, intents: [sell] };
-    }
-    const immediate = step % IMMEDIATE_EVERY_STEPS === 0;
-    const buy: Intent = {
-      type: "POSITION",
-      intentId: `trdr4-buy-${String(step)}`,
-      marketId: MARKET_ID,
-      direction: "YES",
-      targetMode: "DELTA",
-      targetShares: "50",
-      maximumBuyPrice: immediate ? "0.35" : "0.2",
-      maximumTotalCost: "18",
-      urgency: immediate ? "IMMEDIATE" : "PASSIVE",
-      liquidityPreference: immediate ? "TAKER_OK" : "MAKER_ONLY",
-      partialFillPolicy: "ACCEPT_ANY",
-      validUntil: validUntil(ctx),
-      expectedNetEdge: "5",
-      tags: ["trdr4.entry", immediate ? "sb.order-type:FAK" : "sb.order-type:GTC"],
-    };
-    return { ...base, decisionType: "enter" as const, intents: [buy] };
-  },
-};
+      return { ...base, decisionType: "enter" as const, intents: [buy] };
+    },
+  };
+}
+
+const cyclingStrategy = cyclingStrategyWith({
+  immediate: (step) => step % IMMEDIATE_EVERY_STEPS === 0,
+  targetShares: "50",
+});
 
 interface Harness {
   readonly loop: CoreLoop;
@@ -292,8 +323,8 @@ interface Harness {
 }
 
 /** `createPaperTrader`'s assembly, with the cycling double's runtime registered. */
-function assemble(retention: RetentionBounds): Harness {
-  const parsed = parseTraderConfig(traderConfig());
+function assemble(retention: RetentionBounds, options: HarnessOptions = {}): Harness {
+  const parsed = parseTraderConfig(traderConfig(options));
   if (!parsed.ok) throw new Error(`config refused: ${parsed.refusal.detail} ${parsed.refusal.issues.join("; ")}`);
   const config = parsed.config;
   const policy = parseRiskPolicy(config.riskPolicy);
@@ -312,7 +343,7 @@ function assemble(retention: RetentionBounds): Harness {
   }
   const outbox = new DecisionOutboxBuffer(config.queues.outboxMaximumDepth);
   const created = createStrategyInstanceRuntime({
-    strategy: cyclingStrategy,
+    strategy: options.strategy ?? cyclingStrategy,
     params: {},
     run: { runId: RUN_ID, instanceId: INSTANCE_ID, configId: CONFIG_ID, runSeed: "4" },
     watchdog: { evaluationBudgetUs: 5_000_000 },
@@ -358,6 +389,7 @@ function assemble(retention: RetentionBounds): Harness {
       sameInstantAdditionsFor: () => "NOT_OBSERVED" as const,
     },
     startingCash: "1000",
+    ...(options.venueRetention === undefined ? {} : { retention: options.venueRetention }),
     books: {
       book(request): BookView | undefined {
         const market = markets.get(request.marketId);
@@ -563,6 +595,8 @@ describe("a deterministic long synthetic run (NOT a soak — §16.7)", () => {
         retiredUnsettled: 0,
         orderViews: 0,
         tombstones: bounds.tombstones,
+        heldUnowned: 0,
+        watchedOrders: 0,
       });
 
       // Per-event onOrderUpdate deliveries do NOT grow with history: at most
@@ -619,7 +653,406 @@ describe("a deterministic long synthetic run (NOT a soak — §16.7)", () => {
       expect(loop.traces().map((trace) => trace.venueFillId)).toEqual(
         harness.venue.fills.slice(-bounds.traces).map((fill) => fill.simulatedFillId),
       );
+
+      // SIM-2: with the venue's DEFAULT bounds this run evicts nothing, so every
+      // history read above saw every order and every fill.
+      const venueRetention = harness.venue.retention();
+      expect(venueRetention.historyEvicted).toBe(false);
+      expect(venueRetention.orders.evicted + venueRetention.fills.evicted + venueRetention.tombstones.evicted).toBe(0);
+      expect(venueRetention.orders.retained + venueRetention.live.orders).toBe(placed);
+      // SIM-2 r1: every order the loop settled was acknowledged, so nothing is
+      // left held for it; and nothing reached the duplicate guard's filter.
+      expect(venueRetention.awaitingAcknowledgment).toBe(0);
+      expect(venueRetention.evictedIds).toMatchObject({ folded: 0, bitsSet: 0, refused: 0 });
     },
     60_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// SIM-2 — the VENUE is bounded, and the loop reads none of its history
+// ---------------------------------------------------------------------------
+
+function publicTrade(ordinal: number, price: string): IngestedEvent {
+  return envelope(ordinal, "PublicTradeObserved", {
+    internalMarketId: MARKET_ID,
+    tokenId: YES_TOKEN,
+    price,
+    size: "75",
+    takerSide: "ASK",
+  });
+}
+
+/** The ids `SimulatedVenue.ordersSnapshot()` orders by: UTF-16 code units. */
+function venueOrder(ids: readonly string[]): string[] {
+  return [...ids].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+}
+
+/**
+ * Counts the venue calls the LOOP makes, by member, while `counting` is on.
+ * The test's own reads happen with it off. Plain wrappers on the instance
+ * rather than `vi.spyOn`, which would also RECORD every call's arguments —
+ * hundreds of thousands of them over this run.
+ */
+function countVenueCalls(venue: SimulatedVenue): { counting: boolean; readonly calls: Map<string, number> } {
+  const probe = { counting: false, calls: new Map<string, number>() };
+  const count = (name: string): void => {
+    if (probe.counting) probe.calls.set(name, (probe.calls.get(name) ?? 0) + 1);
+  };
+  const target = venue as unknown as Record<string, unknown>;
+  for (const name of [
+    "ordersSnapshot",
+    "fillsSince",
+    "orderById",
+    "orderByPlannedId",
+    "restingBands",
+    "bandHistory",
+    "acknowledgeTerminal",
+  ]) {
+    const original = target[name];
+    if (typeof original !== "function") throw new Error(`SimulatedVenue has no ${name}`);
+    target[name] = (...args: unknown[]): unknown => {
+      count(name);
+      return (original as (...parameters: unknown[]) => unknown).apply(venue, args);
+    };
+  }
+  const fills = Object.getOwnPropertyDescriptor(SimulatedVenue.prototype, "fills")?.get;
+  if (fills === undefined) throw new Error("SimulatedVenue has no fills getter");
+  Object.defineProperty(venue, "fills", {
+    configurable: true,
+    get(): unknown {
+      count("fills");
+      return fills.call(venue);
+    },
+  });
+  return probe;
+}
+
+describe("SIM-2: the venue holds LIVE orders plus bounded, counted history, and the loop reads none of it", () => {
+  it(
+    "over 2,000+ orders and hundreds of public trades (a deterministic synthetic run, NOT a soak — §16.7)",
+    async () => {
+      // Small venue bounds, so the history really evicts, and a short trade
+      // window, so the features engine's own tape stays short. Fills come LATE
+      // — the immediate round trip at step 300, and one public trade AT the
+      // resting BUYs' price in the final phase — because every booked fill
+      // grows the in-memory ledger the loop re-folds on every evaluation
+      // (`LOOPMEM-FOLD`, not this round's subject), and a fill-heavy run would
+      // measure that fold rather than the venue.
+      const venueBounds = { orders: 64, fills: 16, bands: 1, tombstones: 256 } as const;
+      const harness = assemble(
+        {},
+        {
+          venueRetention: venueBounds,
+          tradeWindowMs: 5_000,
+          strategy: cyclingStrategyWith({ immediate: (step) => step === 300, targetShares: "50" }),
+        },
+      );
+      const probe = countVenueCalls(harness.venue);
+      let ordinal = 0;
+      for (const event of openingEvents()) {
+        ordinal += 1;
+        await feed(harness, event, ordinal);
+      }
+
+      const perEvent: { lookups: number; fills: number }[] = [];
+      let trades = 0;
+      const placed = (): number => {
+        const retention = harness.venue.retention();
+        return (
+          retention.live.orders + retention.awaitingAcknowledgment + retention.orders.retained + retention.orders.evicted
+        );
+      };
+      let acknowledged = 0;
+      const step = async (event: IngestedEvent): Promise<void> => {
+        ordinal += 1;
+        const fillsBefore = harness.venue.retention().fills.nextSequence;
+        const settledBefore = harness.loop.health().seams.orders.settled;
+        probe.calls.clear();
+        probe.counting = true;
+        await feed(harness, event, ordinal);
+        probe.counting = false;
+        if (event.envelope.eventType === "PublicTradeObserved") trades += 1;
+
+        // The loop made NO call proportional to history: no snapshot, no copy
+        // of the fill list — one cursor read per harvest, and lookups by id.
+        expect(probe.calls.get("ordersSnapshot") ?? 0, `event ${String(ordinal)}`).toBe(0);
+        expect(probe.calls.get("fills") ?? 0).toBe(0);
+        expect(probe.calls.get("bandHistory") ?? 0).toBe(0);
+        expect(probe.calls.get("fillsSince") ?? 0).toBeLessThanOrEqual(1);
+        perEvent.push({
+          lookups: (probe.calls.get("orderById") ?? 0) + (probe.calls.get("orderByPlannedId") ?? 0),
+          fills: harness.venue.retention().fills.nextSequence - fillsBefore,
+        });
+
+        // The venue's LIVE state is exactly the working orders, which the
+        // loop's own per-order maps also track; the history is bounded.
+        const retention = harness.venue.retention();
+        const sizes = harness.loop.retainedOrderState();
+        expect(retention.live.orders).toBe(sizes.owners);
+        // SIM-2 r1: the loop ACKNOWLEDGED exactly the orders it settled this
+        // event — once each, O(1) apiece — so nothing is left held for it.
+        const settled = harness.loop.health().seams.orders.settled - settledBefore;
+        expect(probe.calls.get("acknowledgeTerminal") ?? 0).toBe(settled);
+        acknowledged += settled;
+        expect(retention.awaitingAcknowledgment).toBe(0);
+        expect(sizes.watchedOrders).toBe(0);
+        expect(retention.live.orders).toBeLessThanOrEqual(10);
+        expect(retention.live.resting).toBe(retention.live.orders);
+        expect(retention.live.bands).toBe(0);
+        expect(retention.live.pendingDelayed).toBe(0);
+        expect(retention.orders.retained).toBeLessThanOrEqual(venueBounds.orders);
+        expect(retention.fills.retained).toBeLessThanOrEqual(venueBounds.fills);
+        expect(retention.tombstones.retained).toBeLessThanOrEqual(venueBounds.tombstones);
+        // Everything the venue holds about orders: live + held for acknowledgment
+        // (none, above) + retained + tombstoned, and a filter of FIXED size.
+        expect(
+          retention.live.orders +
+            retention.awaitingAcknowledgment +
+            retention.orders.retained +
+            retention.tombstones.retained,
+        ).toBeLessThanOrEqual(10 + venueBounds.orders + venueBounds.tombstones);
+        expect(retention.evictedIds.bits).toBe(DEFAULT_VENUE_RETENTION.evictedIdFilterBits);
+        // Tier 0 holds one instant per (market, side), never the trades.
+        expect(retention.trades.retained).toBe(0);
+        expect(retention.trades.keys).toBeLessThanOrEqual(1);
+      };
+
+      let round = 0;
+      while (placed() < 2_000) {
+        round += 1;
+        expect(round, "the synthetic run stopped placing orders").toBeLessThan(1_000);
+        await step(tick(ordinal + 1));
+        await step(publicTrade(ordinal + 1, "0.33"));
+        await step(publicTrade(ordinal + 1, "0.33"));
+        if (round % 10 === 0) await yieldToEventLoop();
+      }
+      // The immediate round trip really ran (step 300) and its fills were booked.
+      const roundTrip = harness.venue.retention().fills.nextSequence;
+      expect(roundTrip).toBeGreaterThan(0);
+
+      // FINAL PHASE: a public trade AT 0.2 fills the working resting BUYs as
+      // MAKER fills (Tier 0, through `observeTrade`), and the next steps sell.
+      let guard = 0;
+      while (harness.venue.retention().live.orders === 0) {
+        guard += 1;
+        expect(guard).toBeLessThan(5);
+        await step(tick(ordinal + 1));
+      }
+      await step(publicTrade(ordinal + 1, "0.2"));
+      for (let index = 0; index < 4; index += 1) await step(tick(ordinal + 1));
+      expect(harness.venue.retention().fills.nextSequence).toBeGreaterThan(roundTrip + 5);
+
+      const retention = harness.venue.retention();
+      const total = placed();
+      expect(total).toBeGreaterThanOrEqual(2_000);
+      expect(trades).toBeGreaterThanOrEqual(250);
+      // Every eviction is COUNTED: orders forgotten oldest-first, then their ids.
+      expect(retention.orders).toEqual({
+        retained: venueBounds.orders,
+        maximumRetained: venueBounds.orders,
+        evicted: total - retention.live.orders - venueBounds.orders,
+      });
+      expect(retention.tombstones).toEqual({
+        retained: venueBounds.tombstones,
+        maximumRetained: venueBounds.tombstones,
+        evicted: retention.orders.evicted - venueBounds.tombstones,
+      });
+      // SIM-2 r1: every id past its tombstone is folded into the duplicate
+      // guard's filter — counted — and no placement was refused by it.
+      expect(retention.evictedIds).toMatchObject({ folded: retention.tombstones.evicted, refused: 0 });
+      expect(retention.awaitingAcknowledgment).toBe(0);
+      expect(acknowledged).toBe(total - retention.live.orders);
+      expect(retention.fills.retained).toBe(venueBounds.fills);
+      expect(retention.fills.evicted).toBe(retention.fills.nextSequence - venueBounds.fills);
+      expect(retention.fills.evicted).toBeGreaterThan(0);
+      expect(retention.historyEvicted).toBe(true);
+      // Hundreds of public trades, one (market, side) key, nothing held.
+      expect(retention.trades).toEqual({ tier: "TIER_0", keys: 1, retained: 0 });
+
+      // …and the loop never needed any of it: no halt, and it observed and
+      // booked EVERY fill the venue produced, though the venue kept only 16.
+      const health = harness.loop.health();
+      expect(health.halts).toEqual([]);
+      expect(health.execution.fillsObserved).toBe(retention.fills.nextSequence);
+      expect(health.execution.duplicateFillsRefused).toBe(0);
+      expect(health.seams.orders).toMatchObject({ tracked: retention.live.orders, unownedFills: 0, settleMismatches: 0 });
+      expect(harness.loop.retainedOrderState()).toMatchObject({ heldUnowned: 0, watchedOrders: 0 });
+
+      // Per-event lookups are bounded by the WORKING orders and the event's own
+      // deliveries, not by history: among events that produced no fill (a fill
+      // adds its own onFill evaluations), the busiest of the last 60 is no
+      // busier than the busiest of the first 60, 2,000 orders later — and no
+      // event at all comes near a thousand.
+      const quiet = perEvent.filter((entry) => entry.fills === 0).map((entry) => entry.lookups);
+      expect(quiet.length).toBeGreaterThan(300);
+      expect(Math.max(...quiet.slice(-60))).toBeLessThanOrEqual(Math.max(...quiet.slice(0, 60)));
+      expect(Math.max(...perEvent.map((entry) => entry.lookups))).toBeLessThan(1_000);
+    },
+    180_000,
+  );
+
+  it("a plan of 12 slices is delivered, and listed in ctx.orders(), in the VENUE's id order (`:o10` before `:o2`), not insertion order (IF-07)", async () => {
+    const harness = assemble(
+      {},
+      { strategy: cyclingStrategyWith({ immediate: () => false, targetShares: "60" }) },
+    );
+    let ordinal = 0;
+    for (const event of openingEvents()) {
+      ordinal += 1;
+      await feed(harness, event, ordinal);
+    }
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+
+    const booked = harness.venue.ordersSnapshot().map((order) => order.simulatedOrderId);
+    expect(booked).toHaveLength(12);
+    const insertion = [...booked].sort((left, right) => Number(left.split(":o")[1]) - Number(right.split(":o")[1]));
+    const expected = venueOrder(booked);
+    // Non-vacuous: the two orders really differ for twelve slices.
+    expect(expected).not.toEqual(insertion);
+    expect(expected.slice(0, 4).map((id) => id.split(":").at(-1))).toEqual(["o0", "o1", "o10", "o11"]);
+
+    const updates = harness.evaluations.filter(
+      (entry) => entry.event === ordinal && entry.input.callback === "onOrderUpdate",
+    );
+    expect(updates.map((entry) => (entry.input.callback === "onOrderUpdate" ? entry.input.order.orderId : ""))).toEqual(expected);
+    for (const entry of updates) expect(entry.input.orders.map((view) => view.orderId)).toEqual(expected);
+    // The next evaluation (the cancel step) reads ctx.orders() in the same order.
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    const next = harness.evaluations.find((entry) => entry.event === ordinal && entry.input.callback === "onFeatures");
+    expect(next?.input.orders.map((view) => view.orderId)).toEqual(expected);
+  });
+
+  it("a fill cursor that fell behind the venue's retained window HALTS the process and releases nothing (loud, never a skip)", async () => {
+    // Step 0's round trip books ten 5-share slices FILLED in one submission —
+    // ten fills in one harvest — against a venue that retains four.
+    const harness = assemble(
+      {},
+      { venueRetention: { fills: 4 }, strategy: cyclingStrategyWith({ immediate: (step) => step === 0, targetShares: "50" }) },
+    );
+    let ordinal = 0;
+    for (const event of openingEvents()) {
+      ordinal += 1;
+      await feed(harness, event, ordinal);
+    }
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    expect(harness.venue.retention().fills).toMatchObject({ nextSequence: 10, retained: 4, evicted: 6 });
+    const health = harness.loop.health();
+    expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "VENUE_OBSERVATION_FAILED"]]);
+    expect(health.halts[0]?.detail).toContain("SIMULATED_VENUE_HISTORY_EVICTED");
+    expect(health.halts[0]?.detail).toContain("the fills since sequence 0");
+    // Nothing was read, booked or given back: every FILLED slice keeps its
+    // reservation, because the position that would replace it is unknown.
+    expect(health.execution.fillsObserved).toBe(0);
+    expect(health.accounting.ledgerTransactions).toBe(0);
+    expect(health.seams.reservations).toMatchObject({ open: 10, released: 0 });
+    expect(health.seams.allocator).toMatchObject({ open: 10, released: 0 });
+    // A later event asks again from the same cursor, and is refused again.
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    expect(harness.loop.health().execution.fillsObserved).toBe(0);
+    expect(harness.loop.health().seams.reservations).toMatchObject({ open: 10, released: 0 });
+  });
+
+  it("SIM2-R1-1, a SUBMISSION batch: ten slices FILLED in ONE submission against a venue that retains ONE acknowledged order — no halt; all ten read, released, settled, and only then acknowledged", async () => {
+    // The verifier's probe: at 7c570ed nine of the ten terminal orders were
+    // evicted inside the submission itself, and the harvest halted GLOBAL
+    // with nine reservations still open.
+    const harness = assemble(
+      {},
+      {
+        venueRetention: { orders: 1, tombstones: 1 },
+        strategy: cyclingStrategyWith({ immediate: (step) => step === 0, targetShares: "50" }),
+      },
+    );
+    let ordinal = 0;
+    for (const event of openingEvents()) {
+      ordinal += 1;
+      await feed(harness, event, ordinal);
+    }
+    const probe = countVenueCalls(harness.venue);
+    probe.counting = true;
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    probe.counting = false;
+    const health = harness.loop.health();
+    expect(health.halts).toEqual([]);
+    expect(health.execution.fillsObserved).toBe(10);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10 });
+    expect(health.seams.allocator).toMatchObject({ open: 0, applied: 10, released: 10 });
+    expect(health.seams.orders).toMatchObject({ tracked: 0, settled: 10, unownedFills: 0 });
+    expect(harness.loop.retainedOrderState()).toMatchObject({ owners: 0, heldUnowned: 0, watchedOrders: 0 });
+    // Acknowledged once each, after settlement; the bound applies only now.
+    expect(probe.calls.get("acknowledgeTerminal")).toBe(10);
+    expect(harness.venue.retention()).toMatchObject({
+      awaitingAcknowledgment: 0,
+      orders: { retained: 1, maximumRetained: 1, evicted: 9 },
+      tombstones: { retained: 1, maximumRetained: 1, evicted: 8 },
+      evictedIds: { folded: 8, refused: 0 },
+    });
+  });
+
+  it("SIM2-R1-1, a CANCELLATION batch: ten resting slices CANCELLED by ONE plan against a venue that retains ONE acknowledged order — no halt; all ten released and settled", async () => {
+    const harness = assemble(
+      {},
+      {
+        venueRetention: { orders: 1, tombstones: 1 },
+        strategy: cyclingStrategyWith({ immediate: () => false, targetShares: "50" }),
+      },
+    );
+    let ordinal = 0;
+    for (const event of openingEvents()) {
+      ordinal += 1;
+      await feed(harness, event, ordinal);
+    }
+    // Step 0: ten passive 5-share BUY slices rest.
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    expect(harness.venue.retention().live.orders).toBe(10);
+    expect(harness.loop.retainedOrderState().owners).toBe(10);
+    // Step 1: ONE cancel plan names all ten; the venue cancels them in one call.
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    const health = harness.loop.health();
+    expect(health.halts).toEqual([]);
+    expect(health.execution.cancelsConfirmed).toBe(1);
+    expect(health.seams.reservations).toMatchObject({ open: 0, taken: 10, released: 10 });
+    expect(health.seams.orders).toMatchObject({ tracked: 0, settled: 10 });
+    expect(harness.venue.retention()).toMatchObject({
+      live: { orders: 0 },
+      awaitingAcknowledgment: 0,
+      orders: { retained: 1, evicted: 9 },
+    });
+  });
+
+  it("the cursor is NON-destructive: a store failure's early return re-reads the same batch (IF-06: 1, then 11 observed, 1 duplicate)", async () => {
+    const harness = assemble({}, { strategy: cyclingStrategyWith({ immediate: (step) => step === 0, targetShares: "50" }) });
+    let ordinal = 0;
+    for (const event of openingEvents()) {
+      ordinal += 1;
+      await feed(harness, event, ordinal);
+    }
+    // The first LEDGER write of the ten-fill harvest fails.
+    harness.store.failOnly(["appendLedgerTransaction"], "UNAVAILABLE", "SIM-2 test: the ledger table is locked");
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    let health = harness.loop.health();
+    expect(harness.venue.retention().fills.nextSequence).toBe(10);
+    expect(health.execution.fillsObserved).toBe(1);
+    expect(health.execution.duplicateFillsRefused).toBe(0);
+    expect(health.halts.map((halt) => halt.code)).toEqual(["STORE_UNAVAILABLE"]);
+
+    harness.store.recover();
+    ordinal += 1;
+    await feed(harness, tick(ordinal), ordinal);
+    health = harness.loop.health();
+    // The whole batch was read again: the fill already booked is refused as a
+    // duplicate, and the nine unbooked ones are booked now.
+    expect(health.execution.fillsObserved).toBe(11);
+    expect(health.execution.duplicateFillsRefused).toBe(1);
+    expect(harness.store.transactions.length).toBeGreaterThan(0);
+  });
 });

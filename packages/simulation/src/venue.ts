@@ -2,10 +2,31 @@
  * The simulated execution venue (§12.1, §11).
  *
  * §12.1: "Everything between event input and the `ExecutionVenue` interface is
- * shared." This class implements exactly that interface —
- * `submit` / `cancel` / `queryAccountState` — and adds nothing to it, so the
- * live adapter that arrives later is a drop-in behind the same three methods and
- * the whole core loop above it is unchanged.
+ * shared." This class implements that interface — `submit` / `cancel` /
+ * `queryAccountState` — and it is NOT all this class exposes (SIM-2, `IF-02`:
+ * an earlier version of this header said it "adds nothing", which had long
+ * been false). A simulator also has to be TOLD what the recorded stream says
+ * (`observe`, `observeTrade`), and the trader's `TraderVenue` port reads the
+ * venue's state between events (`fillsSince`, `orderById`, `orderByPlannedId`)
+ * — so a live adapter that replaces this class must answer those too, from its
+ * own user channel and order store; and it TELLS the venue when it is done
+ * with a terminal order (`acknowledgeTerminal`), which a live adapter may
+ * treat as a no-op. Everything else here is simulator-only: `submitAll`, the
+ * end-of-run HISTORY accessors (`ordersSnapshot`, `fills`, `bandHistory`),
+ * the live `restingBands`, `atEvent`, and `retention`.
+ *
+ * LIVE STATE AND HISTORY (SIM-2). The venue keeps the orders it can still
+ * work — RESTING, PARTIALLY_FILLED, DELAYED — in a LIVE index, bounded by
+ * those orders. An order that reaches a terminal state is HELD, never
+ * evicted, until its consumer ACKNOWLEDGES it (`acknowledgeTerminal`: the
+ * trader loop does so once it has finished with the order), and only then
+ * moves to a bounded, counted RETENTION log (`./retention.js`) — so a bound
+ * can never take an order from a consumer that has not read it (SIM-2 r1,
+ * `SIM2-R1-1`). Produced fills and the bands of terminal orders go to their
+ * own bounded logs. Lookups fall back to the held orders and the logs, so
+ * every answer is unchanged while nothing is evicted; `retention()` counts
+ * what was, and `runReplay` refuses to serialize a run whose history was
+ * evicted.
  *
  * SAFETY, and it is structural rather than a promise:
  *
@@ -112,6 +133,15 @@ import {
   type SimulationResult,
 } from "./refusals.js";
 import { simulationFailure, simulationOk } from "./refusals.js";
+import {
+  EvictedIdFilter,
+  RetainedMap,
+  SequencedLog,
+  TombstoneSet,
+  requireRetentionBound,
+  type EvictedIdFilterCounters,
+  type RetentionCounters,
+} from "./retention.js";
 import type { SeededStreams } from "./seed.js";
 import { tier0Immediate, tier0Maker } from "./tier0.js";
 import {
@@ -179,6 +209,142 @@ export interface SimulatedVenueOptions {
   readonly marketParameters?: (marketId: string) => MarketExecutionParameters | undefined;
   /** Required for a Tier-1 venue that rests orders (§12.2 resting scenarios). */
   readonly queueParameters?: QueueModelParameters;
+  /**
+   * SIM-2: the bounds of the venue's HISTORY. Each is optional and defaults to
+   * {@link DEFAULT_VENUE_RETENTION}; a supplied bound must be a positive safe
+   * integer, and the constructor THROWS a `RangeError` naming it otherwise — a
+   * composition-root mistake, refused before the venue can answer anything.
+   */
+  readonly retention?: VenueRetentionBounds;
+}
+
+/** SIM-2: the history bounds a composition root may override. */
+export interface VenueRetentionBounds {
+  /**
+   * ACKNOWLEDGED terminal orders retained for lookup, cancel answers and
+   * `ordersSnapshot()`. A terminal order its consumer has not acknowledged is
+   * held outside this bound and never evicted (SIM-2 r1).
+   */
+  readonly orders?: number;
+  /** Produced fills retained for `fillsSince` and `fills`. */
+  readonly fills?: number;
+  /** The Tier-1 bands of TERMINAL orders retained for `bandHistory()`. */
+  readonly bands?: number;
+  /** Ids of terminal orders the order log has forgotten, kept EXACTLY for the duplicate guard. */
+  readonly tombstones?: number;
+  /**
+   * SIM-2 r1: the size, in bits, of the duplicate guard's filter of ids whose
+   * tombstones were evicted too (at most 2^31). It never forgets an id; its
+   * false-positive rate grows with its fill (see `EvictedIdFilter`).
+   */
+  readonly evictedIdFilterBits?: number;
+}
+
+/**
+ * SIM-2: the default history bounds, argued from MEASURED entry sizes (Node
+ * v24, trader-shaped ids, heap delta per entry after forced GCs over 20 000
+ * entries — the SIM-2 handoff records the probe): a terminal `SimulatedOrder`
+ * about 1.55 KB, a `SimulatedFill` about 1.9 KB, a tombstoned id about 190 B,
+ * a Tier-1 band about 2.5 KB before its scenario fills.
+ *
+ * - **orders — 50 000** terminal orders: about 78 MB at the bound.
+ * - **fills — 50 000**: about 96 MB at the bound. The trader reads its cursor
+ *   every event, so it needs only one event's fills; the rest is for
+ *   end-of-run history consumers.
+ * - **bands — 10 000**: only Tier-1 runs (backtests, never the shipped trader)
+ *   produce any; a band with many scenario fills is several times larger.
+ * - **tombstones — 100 000** ids: about 19 MB, the bound of the trader's own
+ *   settled-order tombstones and `FillDeduplicator`. With the order log, the
+ *   duplicate guard knows an id EXACTLY for 150 000 acknowledged terminal
+ *   orders after it ended.
+ * - **evictedIdFilterBits — 2^24** (16 777 216 bits, 2 MiB): after the exact
+ *   memory, every forgotten id is folded into a filter that never forgets it
+ *   (SIM-2 r1), so a reused id is refused however long ago it ended. Its
+ *   false-positive rate — a NEW id refused as not provably unique, loudly and
+ *   counted — is about 1% once some 1.75 million ids were folded in, i.e.
+ *   after about 1.9 million acknowledged terminal orders.
+ *
+ * A terminal order its consumer has not yet acknowledged is outside every
+ * bound: it is held until the consumer is done with it (SIM-2 r1), which
+ * the trader loop is within the harvests that settle it.
+ *
+ * So a Tier-0 venue at its bounds holds about 190 MB of history — the same
+ * order as `TRDR-4`'s audit logs — however long it runs. Every bound is far
+ * above every fixture, golden and backtest in the repository, and above the
+ * TRDR-4 synthetic run that uses the defaults (the largest golden holds 3
+ * orders and 3 fills; that run places about 500 orders), which is pinned:
+ * none of them evicts anything. (The SIM-2 synthetic runs that set SMALL
+ * bounds evict on purpose.)
+ */
+export const DEFAULT_VENUE_RETENTION = Object.freeze({
+  orders: 50_000,
+  fills: 50_000,
+  bands: 10_000,
+  tombstones: 100_000,
+  evictedIdFilterBits: 16_777_216,
+});
+
+/**
+ * SIM-2: what the venue holds, as numbers — its bounded-state observation
+ * surface. Venue-only: no health seam carries it yet (queued with
+ * `TRDR4-GAUGES`), because a counter on an object the paper-e2e artifact
+ * copies wholesale would change that golden.
+ */
+export interface VenueRetention {
+  /** LIVE state: bounded by the orders the venue can still work, not by history. */
+  readonly live: {
+    /** Non-terminal orders (RESTING, PARTIALLY_FILLED, DELAYED). */
+    readonly orders: number;
+    /** Resting records (Tier 0 and Tier 1). */
+    readonly resting: number;
+    /** Tier-1 bands of resting orders — what `restingBands()` answers. */
+    readonly bands: number;
+    /** DELAYED orders awaiting `matchableAtNs`. */
+    readonly pendingDelayed: number;
+  };
+  /**
+   * SIM-2 r1: TERMINAL orders HELD until their consumer acknowledges them —
+   * outside every bound and never evicted, so a consumer always finds an order
+   * it has not finished with. Bounded by the consumer: the trader loop
+   * acknowledges each order once it has settled it.
+   */
+  readonly awaitingAcknowledgment: number;
+  /** ACKNOWLEDGED terminal orders, retained for lookup; `evicted` counts the forgotten ones. */
+  readonly orders: RetentionCounters;
+  /** Produced fills, over an absolute sequence (`fillsSince`). */
+  readonly fills: RetentionCounters & {
+    readonly firstRetainedSequence: number;
+    readonly nextSequence: number;
+  };
+  /** The bands of TERMINAL orders (`bandHistory()` = live ∪ these). */
+  readonly bands: RetentionCounters;
+  /** Ids of forgotten terminal orders the duplicate guard still knows EXACTLY. */
+  readonly tombstones: RetentionCounters;
+  /**
+   * SIM-2 r1: the duplicate guard's filter of ids whose tombstones were
+   * evicted too, and how many placements it REFUSED as not provably unique
+   * (`SIMULATED_VENUE_ORDER_ID_NOT_PROVABLY_UNIQUE`).
+   */
+  readonly evictedIds: EvictedIdFilterCounters & { readonly refused: number };
+  /** Observed public trades. */
+  readonly trades: {
+    readonly tier: "TIER_0" | "TIER_1";
+    /** (market, side) keys holding a last observed instant: O(keys), both tiers. */
+    readonly keys: number;
+    /**
+     * Trades HELD for Tier-1 band computation. Always 0 under Tier 0, which
+     * reads only each key's last instant. NOT BOUNDED under Tier 1 (queued as
+     * `SIM2-TIER1-TRADES`; see README §5 item 17).
+     */
+    readonly retained: number;
+  };
+  /**
+   * `true` once any order, fill or band was evicted: the history accessors then
+   * answer a WINDOW, and `runReplay` refuses to serialize the run. Tombstone
+   * evictions do not set it — they shorten the duplicate guard's memory, which
+   * `tombstones.evicted` counts, not the run's history.
+   */
+  readonly historyEvicted: boolean;
 }
 
 interface PositionKey {
@@ -372,11 +538,44 @@ function positionKey(key: PositionKey): string {
 /** The §12.1 `ExecutionVenue`, simulated. */
 export class SimulatedVenue implements ExecutionVenue {
   readonly #options: SimulatedVenueOptions;
+  /**
+   * SIM-2: the LIVE orders only — every order that can still change (see
+   * `isLiveState`). An order that reaches a terminal state leaves it through
+   * `#putOrder`, the one place an order is stored, for `#terminalOrders`.
+   */
   readonly #orders = new Map<string, SimulatedOrder>();
+  /**
+   * SIM-2 r1 (`SIM2-R1-1`): TERMINAL orders their consumer has NOT yet
+   * acknowledged — held here, outside every bound and never evicted, until
+   * `acknowledgeTerminal` moves each to `#terminalOrders`. Insertion order.
+   */
+  readonly #unacknowledged = new Map<string, SimulatedOrder>();
+  /** SIM-2: ACKNOWLEDGED terminal orders, bounded and counted; every lookup falls back to it. */
+  readonly #terminalOrders: RetainedMap<SimulatedOrder>;
+  /** SIM-2: ids of terminal orders `#terminalOrders` forgot — the duplicate guard's EXACT memory. */
+  readonly #tombstones: TombstoneSet;
+  /** SIM-2 r1 (`SIM2-R1-2`): ids `#tombstones` forgot — the duplicate guard's never-forgetting filter. */
+  readonly #evictedIds: EvictedIdFilter;
+  /** SIM-2 r1: placements refused because the filter could not prove an id new. */
+  #refusedNotProvablyUnique = 0;
   readonly #positions = new Map<string, { marketId: string; tokenId: string; side: "YES" | "NO"; shares: string }>();
-  readonly #fills: SimulatedFill[] = [];
+  /** SIM-2: every produced fill over an ABSOLUTE sequence, bounded and counted. */
+  readonly #fills: SequencedLog<SimulatedFill>;
   readonly #resting = new Map<string, RestingRecord>();
+  /** SIM-2: the Tier-1 bands of LIVE resting orders (`restingBands()`). */
   readonly #bands = new Map<string, RestingFillBand>();
+  /** SIM-2: the last band of each TERMINAL order, bounded and counted (`bandHistory()`). */
+  readonly #terminalBands: RetainedMap<RestingFillBand>;
+  /**
+   * SIM-2: the last observed trade's recorded instant per (market, side) — the
+   * monotonicity check, and the ONLY thing Tier 0 reads about past trades
+   * (`VS-03`: Tier 0 used to hold every trade, ~760 B each, for ever).
+   */
+  readonly #lastTradeNs = new Map<string, bigint>();
+  /**
+   * Every observed trade per (market, side), held for the Tier-1 band walk
+   * ONLY — never filled under Tier 0. Not bounded (`SIM2-TIER1-TRADES`).
+   */
   readonly #trades = new Map<string, ObservedTrade[]>();
   /** O5: DELAYED orders awaiting `matchableAtNs`, by order id. */
   readonly #pending = new Map<string, PendingDelayed>();
@@ -392,10 +591,38 @@ export class SimulatedVenue implements ExecutionVenue {
   constructor(options: SimulatedVenueOptions) {
     this.#options = options;
     this.#cash = options.startingCash;
+    // The options bag is a call-site literal; each bound is read ONCE.
+    const bounds: VenueRetentionBounds = options.retention ?? {};
+    const ordersBound = bounds.orders ?? DEFAULT_VENUE_RETENTION.orders;
+    const fillsBound = bounds.fills ?? DEFAULT_VENUE_RETENTION.fills;
+    const bandsBound = bounds.bands ?? DEFAULT_VENUE_RETENTION.bands;
+    const tombstonesBound = bounds.tombstones ?? DEFAULT_VENUE_RETENTION.tombstones;
+    const filterBits = bounds.evictedIdFilterBits ?? DEFAULT_VENUE_RETENTION.evictedIdFilterBits;
+    this.#terminalOrders = new RetainedMap(
+      requireRetentionBound(ordersBound, "retention.orders"),
+      "the simulated venue's terminal-order history",
+    );
+    this.#fills = new SequencedLog(requireRetentionBound(fillsBound, "retention.fills"), "the simulated venue's fill history");
+    this.#terminalBands = new RetainedMap(
+      requireRetentionBound(bandsBound, "retention.bands"),
+      "the simulated venue's band history",
+    );
+    this.#tombstones = new TombstoneSet(
+      requireRetentionBound(tombstonesBound, "retention.tombstones"),
+      "the simulated venue's order-id tombstones",
+    );
+    this.#evictedIds = new EvictedIdFilter(
+      requireRetentionBound(filterBits, "retention.evictedIdFilterBits"),
+      "retention.evictedIdFilterBits",
+    );
   }
 
   /**
-   * Every fill this venue produced, in production order.
+   * Every fill this venue RETAINS, in production order — a HISTORY accessor
+   * for end-of-run consumers (`runReplay`'s §12.4 bytes, artifact capture,
+   * tests). SIM-2: while `retention().fills.evicted` is 0 that is every fill
+   * the venue produced; after an eviction it is the newest window. The trader
+   * loop does not read it: it reads {@link SimulatedVenue.fillsSince}.
    *
    * A FROZEN COPY of the list, not the live one (round-4 review, MEDIUM-2's
    * class-member sweep). The previous version handed out `this.#fills` itself,
@@ -404,7 +631,143 @@ export class SimulatedVenue implements ExecutionVenue {
    * Each member is already an `ownFrozenTree`; only the container was live.
    */
   get fills(): readonly SimulatedFill[] {
-    return Object.freeze([...this.#fills]);
+    return Object.freeze(this.#fills.entries());
+  }
+
+  /**
+   * SIM-2: the fills produced at or after an ABSOLUTE sequence, and the
+   * sequence to ask for next — a NON-destructive cursor (`IF-06`).
+   *
+   * The first fill this venue produces has sequence 0, the next 1, and so on
+   * for the life of the venue, whatever is later evicted. Reading changes
+   * nothing, so a reader that could not finish a batch (the trader's
+   * store-failure early return) asks for the same sequence again and gets the
+   * same fills; a destructive drain would have lost the unbooked tail.
+   *
+   * O(fills answered), not O(fills retained). REFUSES, never answers short:
+   * - `SIMULATION_INPUT_INVALID` for a sequence that is not a non-negative
+   *   safe integer, or is past `next` (it names fills that do not exist);
+   * - `SIMULATED_VENUE_HISTORY_EVICTED` for a sequence OLDER than the oldest
+   *   retained fill: the fills in between were evicted, and answering from
+   *   the oldest one still held would skip them silently (§6 invariant 7).
+   */
+  fillsSince(sequence: number): SimulationResult<{
+    readonly fills: readonly SimulatedFill[];
+    readonly next: number;
+  }> {
+    return totally("reading the simulated venue's fills since a sequence", () => {
+      if (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 0) {
+        return simulationFailure(
+          "SIMULATION_INPUT_INVALID",
+          "a fill cursor is a non-negative safe-integer sequence: the first fill this venue produced is 0",
+          { offered: describeForRefusal(sequence) },
+        );
+      }
+      const next = this.#fills.nextSequence;
+      if (sequence > next) {
+        return simulationFailure(
+          "SIMULATION_INPUT_INVALID",
+          `fill cursor ${String(sequence)} is past the ${String(next)} fill(s) this venue has produced; it names fills that do not exist`,
+          { sequence, next },
+        );
+      }
+      const first = this.#fills.firstRetainedSequence;
+      if (sequence < first) {
+        return simulationFailure(
+          "SIMULATED_VENUE_HISTORY_EVICTED",
+          `the fills with sequence ${String(sequence)} to ${String(first - 1)} were EVICTED from this venue's bounded fill history (${String(this.#fills.maximumRetained)} retained); answering from sequence ${String(first)} would skip them silently (§6 invariant 7), so the cursor is refused`,
+          { sequence, firstRetainedSequence: first, next, evicted: this.#fills.counters().evicted },
+        );
+      }
+      return simulationOk(ownFrozenTree({ fills: this.#fills.since(sequence), next }));
+    });
+  }
+
+  /**
+   * SIM-2: one order by the venue's own id — LIVE, TERMINAL and not yet
+   * acknowledged (held, never evicted), or acknowledged and retained — or
+   * `undefined` when the venue never booked it or has evicted it from its
+   * bounded history after its consumer acknowledged it
+   * (`retention().orders.evicted` counts those). The trader treats
+   * `undefined` for an order it owns as LOUD. O(1).
+   */
+  orderById(venueOrderId: string): SimulatedOrder | undefined {
+    if (typeof venueOrderId !== "string") return undefined;
+    return this.#lookupOrder(venueOrderId);
+  }
+
+  /**
+   * SIM-2: one order by the PLANNER's id. This venue gives every order the
+   * planned order's id as its own (`#orderRecord`), so the lookup is by id
+   * with the planned id confirmed; a live adapter keeps its own map. O(1).
+   */
+  orderByPlannedId(plannedOrderId: string): SimulatedOrder | undefined {
+    if (typeof plannedOrderId !== "string") return undefined;
+    const order = this.#lookupOrder(plannedOrderId);
+    return order?.plannedOrderId === plannedOrderId ? order : undefined;
+  }
+
+  /**
+   * SIM-2 r1 (`SIM2-R1-1`): the consumer is DONE with this terminal order —
+   * the venue may move it from the held set into its bounded, evicting
+   * history. Until this call the order is held and answered by every lookup,
+   * whatever the bounds, so an order that ends (with many others, in one
+   * submission, cancel, expiry sweep or DELAYED batch) is never forgotten
+   * before the process that placed it has read and settled it.
+   *
+   * Answers `true` when an order moved, `false` otherwise — a live order
+   * (nothing to release: it stays live), one already acknowledged, or an id
+   * this venue does not hold. Never throws. O(1).
+   */
+  acknowledgeTerminal(venueOrderId: string): boolean {
+    if (typeof venueOrderId !== "string") return false;
+    const order = this.#unacknowledged.get(venueOrderId);
+    if (order === undefined) return false;
+    this.#unacknowledged.delete(venueOrderId);
+    const forgotten = this.#terminalOrders.set(venueOrderId, order);
+    if (forgotten !== undefined) {
+      const past = this.#tombstones.remember(forgotten);
+      if (past !== undefined) this.#evictedIds.add(past);
+    }
+    return true;
+  }
+
+  /**
+   * SIM-2: what this venue holds, as counters — live state, the terminal
+   * orders awaiting acknowledgment, each bounded history (retained / maximum
+   * / evicted), the duplicate guard's tombstones and filter, and the
+   * observed-trade state. See {@link VenueRetention}.
+   */
+  retention(): VenueRetention {
+    const orders = this.#terminalOrders.counters();
+    const fills = this.#fills.counters();
+    const bands = this.#terminalBands.counters();
+    let heldTrades = 0;
+    for (const observed of this.#trades.values()) heldTrades += observed.length;
+    return ownFrozenTree<VenueRetention>({
+      live: {
+        orders: this.#orders.size,
+        resting: this.#resting.size,
+        bands: this.#bands.size,
+        pendingDelayed: this.#pending.size,
+      },
+      awaitingAcknowledgment: this.#unacknowledged.size,
+      orders,
+      fills: {
+        ...fills,
+        firstRetainedSequence: this.#fills.firstRetainedSequence,
+        nextSequence: this.#fills.nextSequence,
+      },
+      bands,
+      tombstones: this.#tombstones.counters(),
+      evictedIds: { ...this.#evictedIds.counters(), refused: this.#refusedNotProvablyUnique },
+      trades: {
+        tier: this.#options.model.tier,
+        keys: this.#lastTradeNs.size,
+        retained: heldTrades,
+      },
+      historyEvicted: orders.evicted + fills.evicted + bands.evicted > 0,
+    });
   }
 
   /** The recorded event the venue is currently positioned at. */
@@ -413,25 +776,56 @@ export class SimulatedVenue implements ExecutionVenue {
   }
 
   /**
-   * Every order this venue knows, ordered by id.
+   * Every order this venue RETAINS — the live ones, the terminal ones held
+   * for acknowledgment and the retained acknowledged ones — ordered by id: a
+   * HISTORY accessor for end-of-run consumers (`runReplay`'s §12.4 bytes,
+   * artifact capture, tests). SIM-2: while `retention().orders.evicted` is 0
+   * that is every order the venue ever booked, exactly the list this accessor
+   * always answered; after an eviction it lacks the oldest acknowledged
+   * terminal orders, and `runReplay` refuses the run.
+   *
+   * O(orders retained × log) per call, so the trader loop never calls it: it
+   * reads orders one at a time ({@link SimulatedVenue.orderById}).
    *
    * Ordered by a value-derived key rather than by `Map` insertion order, so the
    * §12.4 serialization does not depend on the order the plans were built in.
    */
   ordersSnapshot(): readonly SimulatedOrder[] {
-    return [...this.#orders.values()].sort((left, right) =>
-      compareStrings(left.simulatedOrderId, right.simulatedOrderId),
+    return [...this.#orders.values(), ...this.#unacknowledged.values(), ...this.#terminalOrders.values()].sort(
+      (left, right) => compareStrings(left.simulatedOrderId, right.simulatedOrderId),
     );
   }
 
   /**
-   * Every Tier-1 resting BAND this venue currently holds, ordered by order id.
+   * The Tier-1 BANDS of the orders RESTING at this venue now — LIVE state,
+   * ordered by order id.
+   *
+   * SIM-2 (`VS-04`): this used to answer every band the run had ever produced,
+   * because no band was ever removed — so a CANCELLED or EXPIRED order's last
+   * band was still listed as "currently" held, while `replay.ts` documented
+   * the same call as "every band the run produced". Both readings are now
+   * served, each by its own accessor: this one is live, and
+   * {@link SimulatedVenue.bandHistory} is the run's history, which is what
+   * `runReplay` serializes — so the §12.4 bytes are unchanged.
    *
    * The band is the whole estimate for a Tier-1 resting order (§12.2, ADR-012
    * §1); there is no point-estimate accessor beside it.
    */
   restingBands(): readonly RestingFillBand[] {
     return [...this.#bands.values()].sort((left, right) =>
+      compareStrings(left.simulatedOrderId, right.simulatedOrderId),
+    );
+  }
+
+  /**
+   * Every Tier-1 band this run produced that the venue RETAINS — the live
+   * ones and the last band of every retained TERMINAL order — ordered by order
+   * id: the HISTORY `runReplay` serializes (SIM-2, `VS-04`). While
+   * `retention().bands.evicted` is 0 it is exactly the list `restingBands()`
+   * used to answer.
+   */
+  bandHistory(): readonly RestingFillBand[] {
+    return [...this.#bands.values(), ...this.#terminalBands.values()].sort((left, right) =>
       compareStrings(left.simulatedOrderId, right.simulatedOrderId),
     );
   }
@@ -625,7 +1019,7 @@ export class SimulatedVenue implements ExecutionVenue {
           "a cancel command is a record carrying an execution plan id, a reason and a scope",
         );
       }
-      return simulationOk(this.#cancelSync(materialized));
+      return simulationOk(this.#cancelSync(materialized).result);
     });
     return await Promise.resolve(
       contained.ok ? contained.value : refusedCancel(contained.refusal),
@@ -835,7 +1229,7 @@ export class SimulatedVenue implements ExecutionVenue {
     }
 
     if (plan.planKind === "CANCEL") {
-      const result = this.#cancelSync({
+      const { result, cancelledOrders } = this.#cancelSync({
         executionPlanId: plan.executionPlanId,
         reason: plan.reason,
         scope: plan.scope,
@@ -849,9 +1243,10 @@ export class SimulatedVenue implements ExecutionVenue {
         executionPlanId: plan.executionPlanId,
         accepted: !failed,
         outcome: !failed ? "ACCEPTED" : result.cancelled.length > 0 ? "PARTIAL" : "REFUSED",
-        orders: result.cancelled
-          .map((id) => this.#orders.get(id))
-          .filter((order): order is SimulatedOrder => order !== undefined),
+        // SIM-2 r1 (`SIM2-R1-3`): every order this call cancelled, as the
+        // record written AT its transition — never re-read afterwards, so
+        // the answer cannot depend on what any history still retains.
+        orders: cancelledOrders,
         fills: [],
         bands: [],
         notCancelled: result.notCancelled,
@@ -1022,7 +1417,10 @@ export class SimulatedVenue implements ExecutionVenue {
           };
         }
         const plannedOrderId = planned.plannedOrderId;
-        if (inPlan.has(plannedOrderId) || this.#orders.has(plannedOrderId)) {
+        // SIM-2: "against this venue's book" means every id it still
+        // remembers — live, held terminal, retained terminal, or tombstoned
+        // (`#knowsOrderId`) — not only the live index a terminal order has left.
+        if (inPlan.has(plannedOrderId) || this.#knowsOrderId(plannedOrderId)) {
           return {
             ok: false,
             failedAt: plannedOrderId,
@@ -1030,6 +1428,27 @@ export class SimulatedVenue implements ExecutionVenue {
               "SIMULATED_VENUE_DUPLICATE_ORDER",
               "a planned order id was submitted twice; §6 invariant 6 makes an unknown submission a reconciliation question, never a silent retry",
               { plannedOrderId },
+            ),
+          };
+        }
+        // SIM-2 r1 (`SIM2-R1-2`): past the exact memory, the filter of
+        // forgotten ids. It never forgets one, so a reused id is refused
+        // however long ago its order ended; when it matches, this venue cannot
+        // PROVE the id new, and an id it cannot prove new is refused — loudly,
+        // counted — never assumed unique (it may be a false positive).
+        if (this.#evictedIds.mightContain(plannedOrderId)) {
+          this.#refusedNotProvablyUnique += 1;
+          return {
+            ok: false,
+            failedAt: plannedOrderId,
+            refusal: simulationRefusal(
+              "SIMULATED_VENUE_ORDER_ID_NOT_PROVABLY_UNIQUE",
+              "this venue no longer holds an exact record of every order id it booked (its bounded history and tombstones evicted the oldest), and its filter of forgotten ids matches this one: it may be a reused id, so it is refused rather than executed twice (§6 invariant 6). A never-used id can match too (the filter's false positive): use a fresh id",
+              {
+                plannedOrderId,
+                filterBits: this.#evictedIds.bits,
+                filterIdsFolded: this.#evictedIds.counters().folded,
+              },
             ),
           };
         }
@@ -1643,12 +2062,55 @@ export class SimulatedVenue implements ExecutionVenue {
    */
   #commit(staged: StagedOrder): void {
     this.#applyFills(staged.fills);
-    this.#orders.set(staged.order.simulatedOrderId, staged.order);
+    this.#putOrder(staged.order);
     if (staged.rest !== undefined) {
       this.#resting.set(staged.rest.record.simulatedOrderId, staged.rest.record);
       if (staged.rest.band !== undefined) this.#bands.set(staged.rest.record.simulatedOrderId, staged.rest.band);
     }
     if (staged.pending !== undefined) this.#pending.set(staged.pending.simulatedOrderId, staged.pending);
+  }
+
+  /**
+   * SIM-2: the ONE place an order's record is stored. A LIVE order goes to (or
+   * stays in) the live index; a TERMINAL one leaves it — its last Tier-1 band,
+   * if it had one, for the bounded band history — and is HELD, outside every
+   * bound, until its consumer acknowledges it (`acknowledgeTerminal`, SIM-2
+   * r1): only then can the bounded order history, and after it the
+   * tombstones and the filter, take it. A terminal state is final (no
+   * transition leaves one), so an order is held once. Map operations only:
+   * nothing here can fail half-way.
+   */
+  #putOrder(order: SimulatedOrder): void {
+    const id = order.simulatedOrderId;
+    if (isLiveState(order.state)) {
+      this.#orders.set(id, order);
+      return;
+    }
+    this.#orders.delete(id);
+    this.#unacknowledged.set(id, order);
+    const band = this.#bands.get(id);
+    if (band !== undefined) {
+      this.#bands.delete(id);
+      this.#terminalBands.set(id, band);
+    }
+  }
+
+  /** SIM-2: an order by id — live first, then held for acknowledgment, then the retained terminal history. */
+  #lookupOrder(id: string): SimulatedOrder | undefined {
+    return this.#orders.get(id) ?? this.#unacknowledged.get(id) ?? this.#terminalOrders.get(id);
+  }
+
+  /**
+   * SIM-2, §6 invariant 6's duplicate guard, EXACT part: does this venue still
+   * remember an order under `id` — live, held terminal, retained terminal, or
+   * TOMBSTONED (its record forgotten, its id kept)? An id whose tombstone was
+   * evicted too is not forgotten: it is in `#evictedIds` (SIM-2 r1), which the
+   * guard reads next.
+   */
+  #knowsOrderId(id: string): boolean {
+    return (
+      this.#orders.has(id) || this.#unacknowledged.has(id) || this.#terminalOrders.has(id) || this.#tombstones.has(id)
+    );
   }
 
   /** Recomputes one resting order's §12.2 band from the trades observed so far. */
@@ -1730,6 +2192,8 @@ export class SimulatedVenue implements ExecutionVenue {
               : compareStrings(left.simulatedOrderId, right.simulatedOrderId),
         );
       for (const pending of due) {
+        // LIVE only (SIM-2, item 7): a pending entry exists exactly while its
+        // order is DELAYED, and a DELAYED order is live.
         const existing = this.#orders.get(pending.simulatedOrderId);
         if (existing === undefined || existing.state !== "DELAYED") {
           // Unreachable: a pending entry exists exactly while its order is
@@ -1782,8 +2246,7 @@ export class SimulatedVenue implements ExecutionVenue {
         // written BEFORE the entry is deleted, so a throw here leaves the
         // entry to be swept again rather than lost. Reported, not silent:
         // `#reportUnapplied`.
-        this.#orders.set(
-          pending.simulatedOrderId,
+        this.#putOrder(
           ownFrozenTree<SimulatedOrder>({ ...existing, state: "REJECTED", filledShares: "0", atEvent }),
         );
         this.#pending.delete(pending.simulatedOrderId);
@@ -1794,6 +2257,8 @@ export class SimulatedVenue implements ExecutionVenue {
         });
       }
     }
+    // LIVE only (SIM-2, item 7): `#resting` holds exactly the orders that can
+    // still fill or expire.
     const expired = [...this.#resting.values()]
       .filter((record) => record.effectiveExpiryNs !== undefined && nowNs >= record.effectiveExpiryNs)
       .sort((left, right) => compareStrings(left.simulatedOrderId, right.simulatedOrderId));
@@ -1895,27 +2360,36 @@ export class SimulatedVenue implements ExecutionVenue {
     if (!fees.ok) return fees;
 
     const key = positionKey({ marketId, side });
-    const observed = this.#trades.get(key) ?? [];
-    const last = observed[observed.length - 1];
-    if (last !== undefined && monotonicNs < last.monotonicNs) {
+    const lastNs = this.#lastTradeNs.get(key);
+    if (lastNs !== undefined && monotonicNs < lastNs) {
       return simulationFailure(
         "REPLAY_CLOCK_NOT_MONOTONE",
         "an observed trade arrives earlier than one already reported for this market and side; replay follows recorded dispatch order (§8.4, §6 invariant 15) and a queue walk over an unordered list truncates silently",
         {
           marketId,
-          previousMonotonicNs: last.monotonicNs.toString(),
+          previousMonotonicNs: lastNs.toString(),
           monotonicNs: monotonicNs.toString(),
         },
       );
     }
-    const trade = ownFrozenTree<ObservedTrade>({
-      price,
-      shares,
-      monotonicNs,
-      atEvent,
-    });
-    observed.push(trade);
-    this.#trades.set(key, observed);
+    this.#lastTradeNs.set(key, monotonicNs);
+    // SIM-2 (`VS-03`): only a Tier-1 venue walks past trades (`#bandFor`), so
+    // only a Tier-1 venue HOLDS them. Tier 0 reads nothing about a past trade
+    // but its instant, kept above: one value per key rather than ~760 B per
+    // public trade for the life of the process. The Tier-1 list stays
+    // unbounded (`SIM2-TIER1-TRADES`, README §5 item 17).
+    if (this.#options.model.tier === "TIER_1") {
+      const observed = this.#trades.get(key) ?? [];
+      observed.push(
+        ownFrozenTree<ObservedTrade>({
+          price,
+          shares,
+          monotonicNs,
+          atEvent,
+        }),
+      );
+      this.#trades.set(key, observed);
+    }
 
     const produced: SimulatedFill[] = [];
     const updated: RestingFillBand[] = [];
@@ -1960,8 +2434,7 @@ export class SimulatedVenue implements ExecutionVenue {
         for (const fill of outcome.value.fills) produced.push(fill);
         const existing = this.#orders.get(record.simulatedOrderId);
         if (existing !== undefined) {
-          this.#orders.set(
-            record.simulatedOrderId,
+          this.#putOrder(
             ownFrozenTree<SimulatedOrder>({
               ...existing,
               filledShares: addDecimal(existing.filledShares, outcome.value.filledShares),
@@ -2037,10 +2510,7 @@ export class SimulatedVenue implements ExecutionVenue {
       existing !== undefined &&
       (existing.state === "RESTING" || existing.state === "PARTIALLY_FILLED")
     ) {
-      this.#orders.set(
-        record.simulatedOrderId,
-        ownFrozenTree<SimulatedOrder>({ ...existing, state: "EXPIRED", atEvent }),
-      );
+      this.#putOrder(ownFrozenTree<SimulatedOrder>({ ...existing, state: "EXPIRED", atEvent }));
     }
     this.#resting.delete(record.simulatedOrderId);
   }
@@ -2076,7 +2546,7 @@ export class SimulatedVenue implements ExecutionVenue {
     }
     this.#cash = cash;
     for (const [key, position] of touched) this.#positions.set(key, position);
-    for (const fill of fills) this.#fills.push(fill);
+    for (const fill of fills) this.#fills.append(fill);
   }
 
   /**
@@ -2103,24 +2573,35 @@ export class SimulatedVenue implements ExecutionVenue {
    *   before it. With NO live target the cancel is a successful no-op: nothing
    *   is charged and it answers `cancelled: []`, `notCancelled: []`.
    */
-  #cancelSync(command: CancelCommand): CancelResult {
+  #cancelSync(command: CancelCommand): {
+    readonly result: CancelResult;
+    /**
+     * SIM-2 r1 (`SIM2-R1-3`): the record of every order this call cancelled,
+     * in `result.cancelled` order, as written AT its transition.
+     */
+    readonly cancelledOrders: readonly SimulatedOrder[];
+  } {
     const cancelled: string[] = [];
+    const cancelledOrders: SimulatedOrder[] = [];
     const notCancelled: { simulatedOrderId: string; reason: string }[] = [];
     const offeredScope: unknown = command.scope;
     if (offeredScope === null || typeof offeredScope !== "object") {
-      return ownFrozenTree<CancelResult>({
-        executionPlanId:
-          typeof command.executionPlanId === "string" ? command.executionPlanId : "",
-        cancelled: [],
-        notCancelled: [
-          {
-            simulatedOrderId: "(no scope)",
-            reason:
-              "SIMULATION_INPUT_INVALID: a cancel command carries a scope naming order ids or a market; nothing was cancelled",
-          },
-        ],
-        venueClass: "SIMULATED",
-      });
+      return {
+        result: ownFrozenTree<CancelResult>({
+          executionPlanId:
+            typeof command.executionPlanId === "string" ? command.executionPlanId : "",
+          cancelled: [],
+          notCancelled: [
+            {
+              simulatedOrderId: "(no scope)",
+              reason:
+                "SIMULATION_INPUT_INVALID: a cancel command carries a scope naming order ids or a market; nothing was cancelled",
+            },
+          ],
+          venueClass: "SIMULATED",
+        }),
+        cancelledOrders: [],
+      };
     }
     // A cancel never acts on a state the recorded clock has already moved past:
     // a DELAYED order whose window has closed takes its disposition first. A
@@ -2133,6 +2614,8 @@ export class SimulatedVenue implements ExecutionVenue {
     const scope = offeredScope as { readonly marketId?: string; readonly orderIds?: readonly string[] };
     const scopedOrderIds = scope.orderIds;
     const scopedMarketId = scope.marketId;
+    // SIM-2: the live index holds exactly the live orders, so a market scope
+    // walks the orders that can still change — never the history.
     const targets =
       scopedOrderIds ??
       [...this.#orders.values()]
@@ -2153,9 +2636,24 @@ export class SimulatedVenue implements ExecutionVenue {
           });
 
     for (const id of [...targets].sort()) {
-      const order = this.#orders.get(id);
+      // SIM-2: by id, a terminal order is found among the held or retained
+      // ones, so it still answers "already <state>" (`VS-18`). An id whose
+      // record was FORGOTTEN is terminal by construction — only acknowledged
+      // terminal orders are ever evicted: a TOMBSTONED one is refused as
+      // already terminal; one whose tombstone went too matches the filter of
+      // forgotten ids and is refused as PROBABLY terminal (the filter can also
+      // match an id never booked, so it cannot say more). Only an id no
+      // memory matches is UNKNOWN. Nothing here is ever cancelled.
+      const order = this.#lookupOrder(id);
       if (order === undefined) {
-        notCancelled.push({ simulatedOrderId: id, reason: "SIMULATED_VENUE_UNKNOWN_ORDER" });
+        notCancelled.push({
+          simulatedOrderId: id,
+          reason: this.#tombstones.has(id)
+            ? "already terminal: its record was evicted from this venue's bounded order history (SIM-2), so its final state is no longer retained"
+            : this.#evictedIds.mightContain(id)
+              ? "not retained: this id matches the venue's filter of FORGOTTEN terminal-order ids (SIM-2 r1), so it is most likely a terminal order whose record and tombstone were both evicted; the filter can also match an id never booked, so its state is not known"
+              : "SIMULATED_VENUE_UNKNOWN_ORDER",
+        });
         continue;
       }
       if (!admitted.admitted) {
@@ -2190,20 +2688,26 @@ export class SimulatedVenue implements ExecutionVenue {
       // O8 (`TERM-I`): the order's `atEvent` is "the recorded event identity
       // this state was reached at", so a cancel re-stamps it with the event the
       // venue is positioned at — the one the cancel happened at.
-      this.#orders.set(
-        id,
-        ownFrozenTree<SimulatedOrder>({ ...order, state: "CANCELLED", atEvent: atEvent ?? order.atEvent }),
-      );
+      const cancelledOrder = ownFrozenTree<SimulatedOrder>({
+        ...order,
+        state: "CANCELLED",
+        atEvent: atEvent ?? order.atEvent,
+      });
+      this.#putOrder(cancelledOrder);
       this.#resting.delete(id);
       cancelled.push(id);
+      cancelledOrders.push(cancelledOrder);
     }
 
-    return ownFrozenTree<CancelResult>({
-      executionPlanId: command.executionPlanId,
-      cancelled,
-      notCancelled,
-      venueClass: "SIMULATED",
-    });
+    return {
+      result: ownFrozenTree<CancelResult>({
+        executionPlanId: command.executionPlanId,
+        cancelled,
+        notCancelled,
+        venueClass: "SIMULATED",
+      }),
+      cancelledOrders,
+    };
   }
 
   #accountSync(): AccountSnapshot {
@@ -2217,6 +2721,7 @@ export class SimulatedVenue implements ExecutionVenue {
         side: position.side,
         shares: position.shares,
       }));
+    // SIM-2: the live index — no history walk.
     const openOrders = [...this.#orders.values()]
       .filter((order) => isLiveState(order.state))
       .sort((left, right) => compareStrings(left.simulatedOrderId, right.simulatedOrderId));

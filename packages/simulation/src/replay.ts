@@ -86,7 +86,10 @@ export interface ReplayRunOptions {
   readonly coreLoop?: ReplayCoreLoop;
   /** Optional: the simulated venue to position at each recorded event. */
   readonly venue?: SimulatedVenue;
-  /** Optional: Tier-1 resting bands produced during the run, for the report. */
+  /**
+   * Optional: Tier-1 resting bands produced during the run, for the report —
+   * used only when no `venue` drives the run (a venue's own band history wins).
+   */
   readonly bands?: readonly RestingFillBand[];
   readonly walSegments?: { read(segmentId: string): Promise<Uint8Array> };
 }
@@ -103,11 +106,15 @@ export interface ReplayRunResult {
   readonly fills: readonly SimulatedFill[];
   readonly economics: ReplayPathEconomics;
   /**
-   * Every Tier-1 resting BAND the run produced.
+   * Every Tier-1 resting BAND the run produced — for an order that ended
+   * (CANCELLED, EXPIRED) its LAST band.
    *
-   * Taken from the venue when one is driving the run, so a band reaches the
-   * report through the same §12.1 seam a live adapter would sit behind, rather
-   * than through a caller that happened to pass one in.
+   * Taken from the venue's HISTORY (`SimulatedVenue.bandHistory()`) when one
+   * is driving the run, so a band reaches the report through the same §12.1
+   * seam a live adapter would sit behind, rather than through a caller that
+   * happened to pass one in. SIM-2 (`VS-04`): NOT `restingBands()`, which
+   * now answers LIVE bands only — the two used to be one accessor whose own
+   * docstring ("currently holds") disagreed with this one.
    */
   readonly bands: readonly RestingFillBand[];
   /** The §12.4 canonical form. Byte-identical for a fixed dataset/config/seed. */
@@ -210,6 +217,22 @@ async function runReplayInner(
     return { ok: false, refusal: sourceRefusal } as SimulationResult<ReplayRunResult>;
   }
 
+  // SIM-2 (`IF-17`): the orders, fills, economics and bands below are read
+  // from the venue's bounded HISTORY. A venue that EVICTED any of it would
+  // yield a short history serialized as a complete run — the one thing this
+  // driver promises never to do — so such a run is REFUSED, by name.
+  const retention = options.venue?.retention();
+  if (retention?.historyEvicted === true) {
+    return simulationFailure(
+      "SIMULATED_VENUE_HISTORY_EVICTED",
+      `the venue evicted part of this run's history (orders ${String(retention.orders.evicted)}, fills ${String(retention.fills.evicted)}, bands ${String(retention.bands.evicted)} beyond bounds of ${String(retention.orders.maximumRetained)} / ${String(retention.fills.maximumRetained)} / ${String(retention.bands.maximumRetained)}); a §12.4 serialization of what is left would report a truncated run as complete, so the run is refused — raise the venue's retention bounds (SimulatedVenueOptions.retention) for a run this long`,
+      {
+        ordersEvicted: retention.orders.evicted,
+        fillsEvicted: retention.fills.evicted,
+        bandsEvicted: retention.bands.evicted,
+      },
+    );
+  }
   const fills = options.venue?.fills ?? [];
   const orders = collectOrders(options.venue);
   const folded = replayPathEconomics(fills);
@@ -218,8 +241,10 @@ async function runReplayInner(
   const clock = source.clock.observations();
   // The venue's own bands when a venue drove the run: acceptance 4's band is
   // produced behind the §12.1 seam, not handed in beside it. `options.bands`
-  // remains for a caller that computed bands without a venue.
-  const bands = options.venue?.restingBands() ?? options.bands ?? [];
+  // remains for a caller that computed bands without a venue. The HISTORY
+  // (live ∪ the last band of every retained terminal order), which is the
+  // list `restingBands()` answered before SIM-2 split live from history.
+  const bands = options.venue?.bandHistory() ?? options.bands ?? [];
   const report = source.report();
   const delivery: SerializableDelivery = {
     envelopesDelivered: report.envelopesDelivered,
