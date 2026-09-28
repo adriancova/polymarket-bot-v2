@@ -1002,7 +1002,7 @@ work_packages:
       # Added 2026-09-28 (H8-GOV; ADR-022 D10): the core event loop
       # moves out of apps/trader/**, which this package is already forbidden,
       # into the layer-1 package below; the signer boundary is layer 2,
-      # and F12 keeps it out of the core.
+      # and the core may not declare it (F12).
       - packages/trading-core/**
     deliverables:
       - secure client factory
@@ -1144,8 +1144,8 @@ work_packages:
       # Noted 2026-09-28 (H8-GOV; ADR-022 D10): this path stays under
       # apps/trader/src. The fencing lease and heartbeat it wires live in
       # layer-2 packages (the storage-postgres and polymarket-secure paths
-      # below), which F12 bars from the layer-1 packages/trading-core. A hook
-      # this package needs inside the core event loop is a bounded
+      # below), which the layer-1 packages/trading-core may not declare (F12).
+      # A hook this package needs inside the core event loop is a bounded
       # packages/trading-core/** grant, written at this package's authorization.
       - apps/trader/src/live-safety/**
       - packages/polymarket-secure/src/heartbeat/**
@@ -1228,9 +1228,9 @@ work_packages:
       # Noted 2026-09-28 (H8-GOV; ADR-022 D10): this path stays under
       # apps/trader/src. Tiny real calibration orders go through
       # packages/polymarket-secure (layer 2; dependency-direction.md F6), which
-      # F12 bars from the layer-1 packages/trading-core. A hook this package
-      # needs inside the core event loop is a bounded packages/trading-core/**
-      # grant, written at this package's authorization.
+      # the layer-1 packages/trading-core may not declare (F12). A hook this
+      # package needs inside the core event loop is a bounded
+      # packages/trading-core/** grant, written at this package's authorization.
       - apps/trader/src/execution-probe/**
       - test/e2e/execution-probe-mock/**
       - docs/runbooks/execution-probes.md

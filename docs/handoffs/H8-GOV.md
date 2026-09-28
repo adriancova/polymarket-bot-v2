@@ -14,7 +14,9 @@
     `CORE-MOVE`, then `BACKTEST-2`.
 - **Review:** an independent review (Codex, the hardening loop) gates the
   merge. The implementer did not review its own work. **This round is not
-  marked complete.**
+  marked complete.** Round 1 reviewed `81d1b34` and returned CHANGES
+  REQUIRED, with three wording findings. They are fixed on top of that
+  commit; see "Review round 1".
 - **Documentation only.** No path under `packages/**`, `apps/**`, `test/**`,
   `tools/**` or `db/**` was touched, and neither was the lockfile, any
   `package.json`, any `tsconfig*`, `eslint.config.mjs`, `.github/**`, the
@@ -281,7 +283,7 @@ these edits:
 [FENCE+ROWS-NO-MANIFEST] exit=1 ok=false packages=34 edges=80 layer(trading-core)=undefined allowlist=S0,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11,S12,S13,S14,S15,S16,S17,S18 violations={"F-CLOSED":1}
    F-CLOSED packages/trading-core: §2 (line 88) classifies `packages/trading-core` in layer 1, but that path has no workspace `package.json`
 [PIPE-IN-FENCE] exit=1 ok=false packages=34 edges=80 layer(trading-core)=undefined allowlist=S0,S1,S2,S3,S4,S5,S6,S7,S8 violations={"CHK":1}
-   CHK docs/contracts/dependency-direction.md: docs/contracts/dependency-direction.md §2.1 row "S8" (line 228) names `packages/trading-core` as its `from` endpoint, but §2 classifies no package or class matching it.
+   CHK docs/contracts/dependency-direction.md: docs/contracts/dependency-direction.md §2.1 row "S8" (line 235) names `packages/trading-core` as its `from` endpoint, but §2 classifies no package or class matching it.
 [BAD-ANNOTATION] exit=1 ok=false packages=35 edges=93 layer(trading-core)=1 allowlist=S0,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11,S12,S13,S14,S15,S16,S17,S18 violations={"CHK":1,"F13":11,"F12":2}
    CHK docs/contracts/dependency-direction.md: docs/contracts/dependency-direction.md §2 assigns `apps/trader` to layer 1 (line 88) and layer 3 (line 124); §2 requires exactly one layer per package.
    F13 apps/trader: same-layer edge `apps/trader` -> `packages/capital-allocator` (both layer 1) is not listed in §2.1
@@ -295,6 +297,10 @@ these edits:
 ```
 
 All probe copies were deleted, and the mirror was removed after the round.
+*(Round 1 re-ran every variant against the round-1 text, and the block above
+is that re-run. It matches round 0's output except for one line: the
+PIPE-IN-FENCE S8 line moved from 228 to 235, because the staged §2 paragraph
+grew by seven lines.)*
 
 **The staged block is unparsed.** The checker's `--json` report on the
 candidate is **byte-identical** to the base's, with the same sha256: 34
@@ -311,6 +317,220 @@ the §2.1 table, or the §3/§5/§6 rule text changed.
   process-global references;
 - `test-imports.cjs` and `staying-names.cjs`: the colocated tests, and the
   staying files' closure imports checked against `index.ts`'s exports.
+- Round 1:
+  - `claims-r1.cjs`: the claim-truth probes on an activated copy;
+  - `pins-r1.mjs`: the three finding pins;
+  - `pins-r1-proof.sh`: their fail-on-`81d1b34` proof.
+
+  All three are described in the next section.
+
+## Review round 1 (Codex gpt-6-astra, of `81d1b34`) and its remediation
+
+**The verdict on `81d1b34` was CHANGES REQUIRED:** one MEDIUM and two LOW
+findings, all about wording. Everything else passed:
+- the parser: the `--json` report is byte-identical to the base's;
+- the activation dry run, which the review reproduced independently;
+- the rows, the work plan, the settlements, the grants and the scope.
+
+Round 1 adds one commit on top of `81d1b34`, amending nothing, and touches the
+same six allowed paths.
+
+| Finding | Severity | Status | Pin |
+| --- | --- | --- | --- |
+| H8G-01 | MEDIUM | fixed | `PIN-H8G-01` `f12-scope` |
+| H8G-02 | LOW | fixed | `PIN-H8G-02` `d10-layers`, which checks each stated layer against the check's `--json` |
+| H8G-03 | LOW | fixed | `PIN-H8G-03` `d4-reverse-edge` |
+
+**H8G-01: the F12 claim went beyond what the check enforces.**
+- *What was wrong.* ADR-022 D3, its Consequences bullet and the staged §2
+  paragraph called "a backtest cannot reach Redis, PostgreSQL or a signer
+  through the core" a gate result. F12 fails only the edges a manifest
+  declares into layer 2. A declared `pg` import passes.
+- *The fix.* Each of the three passages now:
+  - scopes F12 to the edges the manifest declares;
+  - names what else binds the core: F6, F7 and F8;
+  - names what the check does not catch: `pg`, a generic signing library,
+    and an undeclared or relative import (F16);
+  - says the remainder rests on the measured closure and on review.
+- *Dated, not present tense.* The limits are stated as measured with the
+  check at `a8a3a63`. The optional checker-hardening round, which runs before
+  `CORE-MOVE`, may implement F16's relative half, and its grant forbids
+  editing the PENDING subsection. A present-tense "not yet implemented" would
+  then be activated by `CORE-MOVE` verbatim while false.
+  - A scan of the staged text found one round-0 sentence with the same
+    hazard. It was in row S18: "The check does not flag a row that matches no
+    declared edge". The hardening grant may add exactly that `CHK`.
+  - The sentence is now dated at `a8a3a63`. The rest of the row, including
+    the sunset obligation, is unchanged.
+  - No other staged sentence states checker behaviour in the present
+    tense.
+- *Aligned in the same round:*
+  - the Alternatives' "F12 guarantee";
+  - the "forecloses" bullet;
+  - D10's last bullet;
+  - the three work-plan comments this round had added (`WP-260`, `WP-320`,
+    `WP-350`), which said F12 "keeps" or "bars" a package out of the core.
+    They are this round's own additions, so the work plan still has 0
+    deleted lines against the base.
+
+**H8G-02: D10 put components in the wrong layers.**
+- *What was wrong.* D10 said the live components "stay in layers 2 and 3".
+  The contract and the check put `packages/oms`, `packages/inventory`,
+  `packages/ledger` and `packages/execution-planner` in layer 1.
+- *The fix.* D10 is rewritten:
+  - each package keeps its paths and its §2 layer;
+  - a table gives every `WP-260` to `WP-350` path with the layer the check
+    reports;
+  - the text separates layer-1 logic, layer-2 adapters and layer-3 wiring;
+  - a future edge from the core to one of the layer-1 packages needs its own
+    cited §2.1 row.
+- *Also corrected:* `WP-350` is phase 4. `IMPLEMENTATION_STATUS.md:5` defers
+  `WP-260` and the eight other phase-3 packages to Wave 3.
+
+**H8G-03: D4 over-stated F9.**
+- *What was wrong.* D4 said any same-layer reverse edge is F9 plus F13, but
+  `packages/config` → core gives F13 only.
+- *The fix.* D4 now says:
+  - every reverse edge fails F13;
+  - F9 applies only when the core already reaches the declaring package;
+  - measured: the layer-1 packages the core reaches are exactly the eleven
+    S8-S18 targets.
+
+**Claim-truth probes.** Every new claim was measured before it was written:
+- method: the same mirror as the activation dry run, with the staged fence
+  line and rows activated and a core manifest of the 13 measured workspace
+  packages plus `zod`;
+- probe source: each import probe adds one file,
+  `packages/trading-core/src/probe.ts`;
+- script: `claims-r1.cjs`. Every probe copy was deleted after its run.
+
+The output against the round-1 text:
+
+```text
+[ACT] exit=0 ok=true packages=35 edges=93 violations={}
+[DECL-storage-postgres] exit=1 ok=false packages=35 edges=94 violations={"F12":1}
+[DECL-polymarket-secure] exit=1 ok=false packages=35 edges=94 violations={"F12":1}
+[DECL-event-bus] exit=1 ok=false packages=35 edges=94 violations={"F12":1}
+[IMPORT-pg (declared external)] exit=0 ok=true packages=35 edges=93 violations={}
+[IMPORT-ethers (declared external)] exit=0 ok=true packages=35 edges=93 violations={}
+[IMPORT-ioredis (declared external)] exit=1 ok=false packages=35 edges=93 violations={"F8":1}
+[IMPORT-@polymarket/client] exit=1 ok=false packages=35 edges=93 violations={"F6":1}
+[IMPORT-@polymarket/clob-client (archived)] exit=1 ok=false packages=35 edges=93 violations={"F7":1}
+[IMPORT-undeclared-workspace-bare] exit=0 ok=true packages=35 edges=93 violations={}
+[IMPORT-relative-escape] exit=0 ok=true packages=35 edges=93 violations={}
+core reaches (layer 1): packages/capital-allocator, packages/execution-planner, packages/features, packages/ledger, packages/order-book, packages/pnl, packages/risk, packages/simulation, packages/strategies/static-bracket, packages/strategy-runtime, packages/strategy-sdk
+  [REV packages/capital-allocator] reachable=true exit=1 violations={"F9":1,"F13":1} as-stated
+  [REV packages/config] reachable=false exit=1 violations={"F13":1} as-stated
+  [REV packages/execution-planner] reachable=true exit=1 violations={"F9":1,"F13":1} as-stated
+  [REV packages/features] reachable=true exit=1 violations={"F9":1,"F13":1} as-stated
+  [REV packages/inventory] reachable=false exit=1 violations={"F13":1} as-stated
+  [REV packages/ledger] reachable=true exit=1 violations={"F9":1,"F13":1} as-stated
+  [REV packages/observability] reachable=false exit=1 violations={"F13":1} as-stated
+  [REV packages/oms] reachable=false exit=1 violations={"F13":1} as-stated
+  [REV packages/order-book] reachable=true exit=1 violations={"F9":1,"F13":1} as-stated
+  [REV packages/pnl] reachable=true exit=1 violations={"F9":1,"F13":1} as-stated
+  [REV packages/risk] reachable=true exit=1 violations={"F9":6,"F13":1} as-stated
+  [REV packages/settlement] reachable=false exit=1 violations={"F13":1} as-stated
+  [REV packages/simulation] reachable=true exit=1 violations={"F9":1,"F13":1} as-stated
+  [REV packages/strategies/static-bracket] reachable=true exit=1 violations={"F9":1,"F13":1} as-stated
+  [REV packages/strategy-runtime] reachable=true exit=1 violations={"F9":1,"F13":1} as-stated
+  [REV packages/strategy-sdk] reachable=true exit=1 violations={"F9":3,"F13":1} as-stated
+  [REV packages/testkit] reachable=false exit=1 violations={"F13":1} as-stated
+  [REV packages/universe] reachable=false exit=1 violations={"F13":1} as-stated
+  layer(packages/polymarket-secure) = 2
+  layer(packages/oms) = 1
+  layer(packages/ledger) = 1
+  layer(packages/inventory) = 1
+  layer(packages/storage-postgres) = 2
+  layer(packages/execution-planner) = 1
+  layer(apps/trader) = 3
+  layer(apps/ops-cli) = 3
+OK   ACT
+OK   DECL-storage-postgres
+OK   DECL-polymarket-secure
+OK   DECL-event-bus
+OK   IMPORT-pg (declared external)
+OK   IMPORT-ethers (declared external)
+OK   IMPORT-ioredis (declared external)
+OK   IMPORT-@polymarket/client
+OK   IMPORT-@polymarket/clob-client (archived)
+OK   IMPORT-undeclared-workspace-bare
+OK   IMPORT-relative-escape
+OK   REV sweep: F13 always, F9 iff the core reaches the declaring package
+CLAIMS: all as stated
+```
+
+**The pins.** `test/**` and `tools/**` are outside a documentation round, so
+the pins are a scratch script, `pins-r1.mjs`.
+- It reads the committed ADR-022, contract and work plan.
+- `PIN-H8G-02` also runs the check's `--json` to get the layer map.
+- `pins-r1-proof.sh` restores those three files from `81d1b34`, first all
+  together and then one at a time, runs the pins after each restore,
+  restores the round-1 bytes, and checks their sha256:
+
+```text
+== all three files restored from 81d1b34 ==
+FAIL PIN-H8G-01 f12-scope
+FAIL PIN-H8G-02 d10-layers
+FAIL PIN-H8G-03 d4-reverse-edge
+PINS: 3 of 3 FAILED
+exit=1
+== only docs/adr/ADR-022-shared-trading-core-is-a-layer-1-package.md restored from 81d1b34 ==
+FAIL PIN-H8G-01 f12-scope
+FAIL PIN-H8G-02 d10-layers
+FAIL PIN-H8G-03 d4-reverse-edge
+PINS: 3 of 3 FAILED
+exit=1
+== only docs/contracts/dependency-direction.md restored from 81d1b34 ==
+FAIL PIN-H8G-01 f12-scope
+PASS PIN-H8G-02 d10-layers
+PASS PIN-H8G-03 d4-reverse-edge
+PINS: 1 of 3 FAILED
+exit=1
+== only docs/spec/polymarket-bot-workplan.yaml restored from 81d1b34 ==
+FAIL PIN-H8G-01 f12-scope
+PASS PIN-H8G-02 d10-layers
+PASS PIN-H8G-03 d4-reverse-edge
+PINS: 1 of 3 FAILED
+exit=1
+== r1 bytes restored ==
+docs/adr/ADR-022-shared-trading-core-is-a-layer-1-package.md: OK
+docs/contracts/dependency-direction.md: OK
+docs/spec/polymarket-bot-workplan.yaml: OK
+PASS PIN-H8G-01 f12-scope
+PASS PIN-H8G-02 d10-layers
+PASS PIN-H8G-03 d4-reverse-edge
+PINS: all 3 pass
+exit=0
+```
+
+**Gates at the round-1 tree.** Every command ran with
+`pnpm_config_verify_deps_before_run=false`, twice: once partway through the
+round-1 edits, and again on the final tree before the commit. Both runs gave
+the same counts and the same checker report.
+
+The first run's js-yaml step failed because it could not resolve the module;
+js-yaml is not hoisted to the root. It did not reach the parse. The
+final run loads js-yaml 4.3.2 from its store path.
+
+| Gate | Result |
+| --- | --- |
+| typecheck | exit 0, with no `error TS` line |
+| lint | exit 0 |
+| `check:deps` | PASS: 34 packages, 80 edges, allowlist S0..S7 |
+| `check:deps --json` | **byte-identical** to the base's (sha256 `1a8c2347…`) |
+| `test` | 348 files and 7,576 tests passed, as at base |
+| `test:e2e` | 8 files and 206 tests passed |
+| `test:replay` | 3 files and 17 tests passed |
+| work plan | parses under PyYAML and js-yaml 4.3.2 |
+
+The work plan's `git diff --numstat a8a3a63` is still 49 insertions and **0
+deletions**. The drafting hazards still hold:
+- A9: no line of the PENDING subsection starts with `|`;
+- A10: the fence annotation has no `packages/` or `apps/` token;
+- A11: 11 rows, 11 distinct targets, and no glob;
+- no added line contains the prose assignment phrase that §6's shape table
+  lists.
 
 ## summary
 
@@ -490,6 +710,18 @@ at `a8a3a63`, or is a correction.
    (2026-09-15), while the check reports 80 at `a8a3a63`: `BACKTEST-1` added
    two downward edges and recorded no note. This is pre-existing, and this
    round does not edit §6. `CORE-MOVE`'s measured note supersedes it.
+7. **The core's isolation from PostgreSQL clients and signers is not gated**
+   (round 1, H8G-01). With the check at `a8a3a63` and the core activated, a
+   declared-and-imported `pg` or `ethers` passes. So does an undeclared or
+   relative import of an adapter (`claims-r1.cjs`). F12, F6, F7 and F8 cover
+   the rest.
+   - If the optional checker-hardening round implements F16's relative half,
+     the relative import stops passing.
+   - The staged §2 paragraph and ADR-022 D3 date these limits at `a8a3a63`,
+     so that round does not have to edit the PENDING subsection, which its
+     grant forbids.
+   - Until a §3 rule binds the core, a `pg`, `ethers` or undeclared-name
+     regression is caught by review or not at all.
 
 ## follow_up
 
@@ -516,9 +748,23 @@ at `a8a3a63`, or is a correction.
 4. **The next docs round:** ADR-022's discharge note, marking it implemented,
    on the ADR-021 precedent (`e6548cf`). `BUNDLE1-LOWS` (1) is already queued
    for the same round.
+5. **A governance round after `CORE-MOVE`** (round 1, H8G-01): decide
+   whether a §3 rule binds `packages/trading-core` to the checker's
+   database-client and signing-library catalogues. Today they bind only
+   `packages/domain` (F1), `packages/strategies/**` (F3) and
+   `packages/simulation` (F5).
+   - Such a rule would be new §3 rule text, plus its checker implementation.
+     The package does not exist before `CORE-MOVE`.
+   - It is separate from F14's purity-restricted set, which the hardening
+     grant above leaves out. That set governs opaque constructs; it does not
+     govern which catalogues apply.
+   - This round records the question and grants nothing.
 
 ## commit_sha
 
-One commit on branch `h8-gov`, on base `a8a3a63`. A commit cannot contain its
-own hash; the hash is in the implementer's structured handoff, and the
-orchestrator records it at merge.
+Two commits on branch `h8-gov`, on base `a8a3a63`:
+- round 0 is `81d1b3471dd1150e3f2a26ef4a7db18a4da90cac`;
+- the round-1 remediation sits on top of it.
+
+A commit cannot contain its own hash. The round-1 hash is in the
+implementer's structured handoff, and the orchestrator records it at merge.

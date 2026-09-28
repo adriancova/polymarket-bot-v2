@@ -215,11 +215,18 @@ Redis feed, the PostgreSQL store and registration check, the health server,
 the pump, and the process entry point. The trader application builds the
 core, and `apps/backtest-cli` builds it from `BACKTEST-2` on; both are
 composition roots depending on it downward. Its same-layer dependencies are
-§2.1 rows S8-S18, and it needs no §2.2 row. Because it is layer 1, F12 forbids
-it from ever declaring a layer-2 package, so "a backtest cannot reach Redis,
-PostgreSQL or a signer through the core" is checked by the gate, not
-promised. The Layer 3 rule "Nothing may depend on an app." is unchanged and
-stays true: no app is ever a dependency under this arrangement.
+§2.1 rows S8-S18, and it needs no §2.2 row. Because it is layer 1, F12 fails
+any edge its manifest declares to a layer-2 package. §3's F8, F6 and F7 also
+apply here: they fail an import of a Redis client, of the venue SDK, or of an
+archived Polymarket client. That was all the gate enforced at `a8a3a63` of "a
+backtest cannot reach Redis, PostgreSQL or a signer through the core". At that
+commit the check did not fail a PostgreSQL client such as `pg`, or a generic
+signing library, declared and imported here. Nor did it fail an adapter import
+that no manifest entry declares. F16 covers the relative form, but the check
+did not implement F16 then. The measured closure does none of these. Keeping it
+so rests on review until a §3 rule binds this package (ADR-022 D3). The Layer 3
+rule "Nothing may depend on an app." is unchanged and stays true: no app is ever
+a dependency under this arrangement.
 ```
 
 **Rows S8-S18** (id, edge, layer, basis; one row per target; no leading pipe):
@@ -235,7 +242,7 @@ S14 | `packages/trading-core` → `packages/risk` | 1 | The H8 basis stated in *
 S15 | `packages/trading-core` → `packages/simulation` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-210`, the owner of `packages/simulation`. Consumed surface, measured at `a8a3a63`: the handoff §12.1 port interfaces `Clock`, `MarketEventSource` and `ExecutionVenue`, which `WP-210` declared in `packages/simulation` (`docs/handoffs/WP-210.md` deviation 3); the simulated order, fill and result types and the recorded-event identity (`SimulatedOrder`, `SimulatedFill`, `ExecutionResult`, `TimeInForce`, `RecordedEventIdentity`, the structural `EventEnvelope`); and `toFillFact`. `CORE-MOVE`'s venue-policy block (`VenueWiring`, `createExecutionPolicy`, cut from `apps/trader/src/main.ts`) adds the `PlannedOrderView` type. From `BACKTEST-2` on (ADR-022 D5), the surface also includes the simulated-venue construction (`SimulatedVenue`, its fill models such as `tier0Model`, `readFeeScheduleSnapshot`, `unmodeledRateLimits`, and the `BookView` type), serving the ONE venue builder that both composition roots call. The loop itself depends only on the interfaces and never branches on "am I in simulation" (§4; handoff §12.4); the builder is a factory a root chooses to call, and a live root will not call it. This is the first same-layer consumer of the §12.1 interfaces. F5 is unaffected: `packages/simulation` still imports no signer. Acyclic on the S8 terms. |
 S16 | `packages/trading-core` → `packages/strategy-runtime` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-170`, the owner of `packages/strategy-runtime`. Consumed surface, measured at `a8a3a63`: `createStrategyInstanceRuntime` and the checkpoint, decision-sink, telemetry, evaluation and clock types it takes. Acyclic on the S8 terms. |
 S17 | `packages/trading-core` → `packages/strategy-sdk` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-170`, the owner of `packages/strategy-sdk`. Consumed surface, measured at `a8a3a63`: **types only** (the strategy-facing views `MarketView`, `OrderBookView`, `StrategyOrderView`, `StrategyFill`, `VirtualPositionView`, `RiskBudgetView`, `FeatureSnapshot`, `StrategyOrderStatus`); no value is imported. Acyclic on the S8 terms. |
-S18 | `packages/trading-core` → `packages/strategies/static-bracket` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-220`, the owner of `packages/strategies/static-bracket`. Consumed surface, measured at `a8a3a63`: `staticBracketStrategy`, `validateStaticBracketParams`, `staticBracketParamsSchema`. The core runs one strategy today. If a later round makes the core strategy-agnostic (ADR-022 D9; deferred by the user's H8 ruling of 2026-09-28 until a second strategy exists), **this row is removed in that change**. The check does not flag a row that matches no declared edge, so the removal is an obligation, not a gate result. The row names the concrete package, not the `packages/strategies/*` class, so a second strategy needs its own cited row and never gets an implicit one. The edge is acyclic on the S8 terms. F3 and F11 still bind the strategy, not the core. |
+S18 | `packages/trading-core` → `packages/strategies/static-bracket` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-220`, the owner of `packages/strategies/static-bracket`. Consumed surface, measured at `a8a3a63`: `staticBracketStrategy`, `validateStaticBracketParams`, `staticBracketParamsSchema`. The core runs one strategy today. If a later round makes the core strategy-agnostic (ADR-022 D9; deferred by the user's H8 ruling of 2026-09-28 until a second strategy exists), **this row is removed in that change**. The removal is an obligation on that round. At `a8a3a63` the check did not flag a row that matches no declared edge, so the removal is not a gate result unless the check later gains that `CHK`. The row names the concrete package, not the `packages/strategies/*` class, so a second strategy needs its own cited row and never gets an implicit one. The edge is acyclic on the S8 terms. F3 and F11 still bind the strategy, not the core. |
 ```
 
 **The S15 sentences.** The first is appended inside the settled note at the end

@@ -164,10 +164,35 @@ The core declares only layer-0 and layer-1 workspace packages, plus `zod`.
 - The clock, the event source and the venue enter only through the §12.1
   ports: `Clock`, `MarketEventSource` and `ExecutionVenue`, which `WP-210`
   declared in `packages/simulation`.
-- The core is layer 1, so F12 fails any declared edge from it to a layer-2
-  package: `event-bus` (Redis), `storage-*` (PostgreSQL, WAL, Parquet) or
-  `polymarket-secure` (the signer). "A backtest cannot reach Redis,
-  PostgreSQL or a signer through the core" is therefore a **gate result**.
+- **What the gate enforces.** The core is layer 1, so F12 fails any edge its
+  manifest declares to a layer-2 package: `event-bus` (Redis), `storage-*`
+  (PostgreSQL, WAL, Parquet) or `polymarket-secure` (the signer). The §6
+  check also applies three specifier rules to the core, and each fails an
+  import:
+  - of a Redis client (F8), which only `packages/event-bus` may import;
+  - of the venue SDK `@polymarket/client` (F6), which only
+    `packages/polymarket-secure` may import;
+  - of an archived Polymarket client (F7), which no package may import.
+- **What the gate does not enforce.** F12 reads manifest edges only. `H8-GOV`
+  round 1 measured each of the following with the check at `a8a3a63`, in a
+  scratch copy with the staged text activated. Each passed the check:
+  - a PostgreSQL client such as `pg`, declared as an external dependency
+    and imported. The check's database-client catalogue binds only
+    `packages/domain` (F1) and `packages/strategies/**` (F3);
+  - a generic signing library such as `ethers`. The signing-library
+    catalogue binds only `packages/strategies/**` (F3) and
+    `packages/simulation` (F5);
+  - an import of a workspace adapter that the manifest does not declare,
+    either by package name or by a relative path into its files. The
+    relative form is a deep import under F16, which the check did not
+    implement at `a8a3a63`. The optional checker-hardening round's grant
+    (`docs/handoffs/H8-GOV.md`) covers that relative half.
+- So "a backtest cannot reach Redis, PostgreSQL or a signer through the
+  core" is **a gate result only in part**. The gate covers the declared
+  edges, the Redis clients and the Polymarket clients. The rest rests on
+  the measured closure, which imports none of these (Context 4), and on
+  review, until a §3 rule binds the core to the database-client and signer
+  catalogues.
 - F17 forbids a production `node:` import in the core. F17 is stated but
   not yet implemented by the §6 check, so that half rests on review and
   census until the tooling follow-up lands.
@@ -177,8 +202,14 @@ The core declares only layer-0 and layer-1 workspace packages, plus `zod`.
 The core's same-layer edges are exactly `dependency-direction.md` §2.1 rows
 **S8-S18**, with one cited row per target and no class-glob row.
 
-- **No same-layer package may declare the core.** Such a reverse edge would
-  be F9 plus an unlisted F13, and no row will be written for it.
+- **No same-layer package may declare the core**, and no row will be
+  written for such a reverse edge. Every such edge is an unlisted
+  same-layer edge (F13). It is also a cycle (F9) when the core already
+  reaches the declaring package. Measured by `H8-GOV` round 1 on an
+  activated copy, the layer-1 packages the core reaches are exactly the
+  eleven S8-S18 targets, so a reverse edge from any of them fails F9 and
+  F13. From any other layer-1 package, such as `packages/config`,
+  `packages/oms` or `packages/inventory`, it fails F13 only.
 - F10 stays unconditional, and no §2.1 row may run from one app to another.
 - Row **S14** is the one edge into `packages/risk` that carries the risk
   **engine**. It may not be cited to widen the door-only rows S3-S7, and
@@ -274,11 +305,43 @@ points are equal before and after the move.
   removal is an obligation on the round, not a gate result.
 - A second strategy gets its own cited row. No class-glob row is written.
 
-### D10. Wave-3 live components stay in layers 2 and 3 and attach through the core's ports
+### D10. The live-execution packages keep their paths and layers, and attach through the core's ports
 
-- The secure SDK adapter, OMS persistence, the user stream,
-  reconciliation, inventory, rate-limit budgets, fencing and heartbeat,
-  and execution probes (`WP-260` to `WP-350`) keep their own paths.
+The live-execution packages are the nine phase-3 packages deferred to Wave 3
+(`WP-260` to `WP-340`) and `WP-350`'s execution probes (phase 4). Each keeps
+the paths the work plan grants it, and each path keeps the layer that
+`dependency-direction.md` §2 already gives its package. The layer beside
+each path below is the one the §6 check reports at `a8a3a63`:
+
+| Work package | Component | Paths (work plan `allowed_paths`), each with its §2 layer |
+| --- | --- | --- |
+| `WP-260` | secure SDK adapter and signer boundary | `packages/polymarket-secure/**` (2) |
+| `WP-270` | OMS and signed-order persistence | `packages/oms/**` (1) |
+| `WP-280` | authenticated user stream | `packages/polymarket-secure/src/user-stream/**` (2) |
+| `WP-290` | account reconciliation | `packages/oms/src/reconciliation/**` (1), `packages/ledger/src/reconciliation/**` (1) |
+| `WP-300` | collateral inventory and wallet operations | `packages/inventory/**` (1) |
+| `WP-310` | rate-limit budgets and matching-engine modes | `packages/polymarket-secure/src/rate-limit/**` (2), `packages/oms/src/restricted-mode/**` (1) |
+| `WP-320` | heartbeat health lease, fencing, geoblock and kill controls | `apps/trader/src/live-safety/**` (3), `packages/polymarket-secure/src/heartbeat/**` (2), `packages/storage-postgres/src/fencing/**` (2) |
+| `WP-330` | emergency operations CLI | `apps/ops-cli/**` (3) |
+| `WP-340` | live-micro fault-injection verification | test, documentation and status-file paths only; no package |
+| `WP-350` | execution-probe planner and hard caps | `packages/execution-planner/src/probes/**` (1), `apps/trader/src/execution-probe/**` (3) |
+
+- **They span three layers.**
+  - The OMS, reconciliation, inventory, the restricted-mode logic and the
+    probe planner are **layer-1** logic, in the core's own layer.
+  - The secure SDK adapter, the user stream, the rate-limit budgets, the
+    venue heartbeat and the fencing store are **layer-2** adapters. The
+    core may not declare them (F12; D3).
+  - The live-process wiring is **layer 3**, in `apps/trader` and
+    `apps/ops-cli`. That is the only layer where an adapter meets an
+    application module (§2, Layer 3).
+- None of these components moves into the core, and this ADR adds no edge
+  from the core to any of them. In the live process, `apps/trader`
+  composes them with the core, and they reach the loop through its ports.
+- If the core itself must later depend on one of the layer-1 packages, the
+  edge is same-layer and needs its own cited §2.1 row (F13). The row is
+  written with the grant that needs it, and D4's S8-S18 list grows by that
+  row. The reverse edge stays barred (D4).
 - A live component that needs a hook inside the loop gets a bounded
   `packages/trading-core/**` grant at its authorization. This follows the
   grant-at-authorization precedent (work plan, the `WP-210` comment at
@@ -288,8 +351,8 @@ points are equal before and after the move.
   `apps/trader/**` (dated work-plan entries, `H8-GOV`).
 - `WP-320` and `WP-350` keep their `apps/trader/src/**` grants. Their
   live-process wiring (a PostgreSQL fencing lease, a venue heartbeat,
-  probe orders on a real venue) depends on layer-2 packages that F12
-  bars from the core.
+  probe orders on a real venue) uses layer-2 packages that the core may
+  not declare (F12).
 
 ## Consequences
 
@@ -297,8 +360,11 @@ points are equal before and after the move.
 
 - B3 closes at `BACKTEST-2`: the backtest executable builds the same core
   itself, and no harness hands it one.
-- "A backtest cannot reach Redis, PostgreSQL or a signer through the core"
-  becomes an F12 gate result.
+- F12 fails any layer-2 package the core's manifest declares, so the
+  core's adapter dependencies are gated. That is the gated part of "a
+  backtest cannot reach Redis, PostgreSQL or a signer through the core",
+  together with F6, F7 and F8. The rest rests on the measured closure and
+  on review; D3 lists the routes the check does not catch.
 - §12.1 holds literally: one core, with three ports swapped.
 - Handoff §14.2's `ops-cli replay <manifest> <config>` (:1692) can reuse the
   core through a downward edge. Under option B it would have needed a second
@@ -329,8 +395,9 @@ points are equal before and after the move.
 **What it forecloses.**
 
 - An edge from one app to another stays forbidden.
-- The core can never declare a layer-2 package. A live concern that needs
-  one stays in a composition root and reaches the loop through a port.
+- The core cannot declare a layer-2 package without failing F12. A live
+  concern that needs one stays in a composition root and reaches the loop
+  through a port.
 
 **Alternatives rejected.**
 
@@ -346,7 +413,7 @@ points are equal before and after the move.
   `BACKTEST-2` (Context 5).
 - **A new layer for compositions, between layer 1 and layer 3.**
   - Placed above layer 2, it would let the core declare adapters downward,
-    and the F12 guarantee in D3 would be lost.
+    and D3's F12 check on the core's declared edges would be lost.
   - Placed below layer 2, it is layer 1 by §2's own definition: logic that
     owns no connection. Renumbering would break the tooling suite's layer
     pins for no gain.
@@ -396,6 +463,37 @@ points are equal before and after the move.
     declaring the 13 workspace packages plus `zod`. The result was **PASS, 35
     packages, 93 edges, allowlist S0..S18**. Adding
     `apps/trader → trading-core` gave 94 edges and still passed.
+- **Measured by `H8-GOV` round 1 at `a8a3a63`** for review findings H8G-01
+  to H8G-03. A scratch copy had the staged text and a core manifest
+  activated, and the check ran through `--root <copy> --json`. The script is
+  `claims-r1.cjs`; the output is quoted in `docs/handoffs/H8-GOV.md`.
+  - **D3, what fails.** A declared core edge to `storage-postgres`,
+    `polymarket-secure` or `event-bus` fails with F12 alone. An `ioredis`
+    import fails F8, a `@polymarket/client` import fails F6, and a
+    `@polymarket/clob-client` import fails F7.
+  - **D3, what passes.** `pg` and `ethers`, each declared and imported,
+    pass (exit 0). So does an undeclared import of
+    `@polymarket-bot/storage-postgres`, by name or by a relative path into
+    its `src`.
+  - **D3, the checker source.** In `tools/check-dependency-direction.mjs`,
+    the Redis catalogue is at :390, the database clients at :398 and the
+    signing libraries at :450. F7 (:2722) applies to every package. F6
+    (:2735) applies to every package except `packages/polymarket-secure`,
+    and F8 (:2747) to every package except `packages/event-bus`. The
+    database and signer catalogues are applied only under `isDomain`
+    (:2763), `isStrategy` (:2806) and `isSimulation` (:2843). Contract §3
+    F16 is at :512.
+  - **D4.** Each of the 18 other layer-1 packages was made to declare the
+    core. Every one gives F13. F9 is added exactly for the 11 the core
+    reaches, which are the S8-S18 targets.
+  - **D10, layers.** From the check's report: `polymarket-secure` and
+    `storage-postgres` are layer 2; `oms`, `inventory`, `ledger` and
+    `execution-planner` are layer 1; `apps/trader` and `apps/ops-cli` are
+    layer 3.
+  - **D10, paths.** Work plan :979 (`WP-260`), :1002 (`WP-270`), :1025
+    (`WP-280`), :1046-1047 (`WP-290`), :1068 (`WP-300`), :1091-1092
+    (`WP-310`), :1112-1114 (`WP-320`), :1136 (`WP-330`) and :1184-1185
+    (`WP-350`). "deferred to Wave 3" is at `IMPLEMENTATION_STATUS.md:5`.
 - **Reproduced by the H8 scoping (`wf_5375df07-cc2`, at `60a5d7e`)**, and
   re-run by `H8-GOV` at `a8a3a63` against this round's staged text (the
   output is quoted in `docs/handoffs/H8-GOV.md`):
