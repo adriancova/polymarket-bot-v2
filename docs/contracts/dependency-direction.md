@@ -85,6 +85,7 @@ packages/universe         packages/settlement
 packages/simulation       packages/config
 packages/observability    packages/testkit (test-only)
 packages/strategies/**    (class entry: every concrete strategy package)
+packages/trading-core     (the shared trading core; see below)
 ```
 
 The `packages/strategies/**` **class entry** above is restricted further than any
@@ -96,6 +97,33 @@ packages is not an error (§6). *(Moved from prose into the fence 2026-08-28 by
 accepts the prose form `` `<path>` … member of this layer ``, and that phrasing
 must now stay out of §2, because a package assigned twice — even to the same
 layer — is a `CHK` error by design.)*
+
+`packages/trading-core` is the shared deterministic trading core:
+`createPaperTrader`, `CoreLoop`, and the modules in their import closure.
+`CORE-MOVE` moved it out of the trader application under the H8 ruling
+(option A, ruled by the user on 2026-09-28;
+[ADR-022](../adr/ADR-022-shared-trading-core-is-a-layer-1-package.md)). It is
+layer 1 by this section's own definition: rules, state machines and
+computation that own no connection. Measured at `a8a3a63`, its 25-file closure
+reaches only layer-0 and layer-1 packages plus `zod`; it imports no adapter
+and no Node built-in, reads no clock, and references no process global.
+Everything that owns a connection stays in the layer-3 trader application: the
+Redis feed, the PostgreSQL store and registration check, the health server,
+the pump, and the process entry point. The trader application builds the
+core, and `apps/backtest-cli` builds it from `BACKTEST-2` on; both are
+composition roots depending on it downward. Its same-layer dependencies are
+§2.1 rows S8-S18, and it needs no §2.2 row. Because it is layer 1, F12 fails
+any edge its manifest declares to a layer-2 package. §3's F8, F6 and F7 also
+apply here: they fail an import of a Redis client, of the venue SDK, or of an
+archived Polymarket client. That was all the gate enforced at `a8a3a63` of "a
+backtest cannot reach Redis, PostgreSQL or a signer through the core". At that
+commit the check did not fail a PostgreSQL client such as `pg`, or a generic
+signing library, declared and imported here. Nor did it fail an adapter import
+that no manifest entry declares. F16 covers the relative form, but the check
+did not implement F16 then. The measured closure does none of these. Keeping it
+so rests on review until a §3 rule binds this package (ADR-022 D3). The Layer 3
+rule "Nothing may depend on an app." is unchanged and stays true: no app is ever
+a dependency under this arrangement.
 
 ### Layer 2 — adapters and infrastructure
 
@@ -143,115 +171,49 @@ establishes the edge; "it compiles more easily this way" is not a basis.
 | S5 | `packages/ledger` → `packages/risk` | 1 | `docs/contracts/schema-boundary.md` §5 item 1 (the `WP-200-FU1` owner assignment) and §1 (the D1-D4 door rule); ADR-020 §3; the GOV-2A mirror-collapse ruling in the subsection below, whose §5 item 5 states that a later consumer "consumes one implementation instead of copying a fourth". Measured basis for the grant: schema-boundary §3's `packages/ledger` row — a non-enumerable inherited `marketId` defeats `WP-040` obligation **F16**, and a non-enumerable `skipChecks` admits `ledgerTransactionId: "totally-not-a-uuid"`. The consumed surface is the prototype-free parse door only — `plain-data.ts` and `schema-arena.ts`, and since `SER-1` (2026-09-15) the own-data JSON encoder `plain-json.ts`, on the measured basis of `docs/handoffs/SER-0-sweep.md`: an inherited `Object.prototype`/`Array.prototype` `toJSON` collapsed `attributionBucketKey`, `legKeyOfValidated`, `balanceLineKey` and `virtualPositionKey` to one constant key, so a cross-account parity breach and a non-compensating reversal were accepted and the projection's balance book emptied — exported through `packages/risk`'s `exports` map (F16). No rule, policy, or evaluation logic may travel this edge; a consumer needing that has found a different problem. Acyclic: `packages/risk` declares only `@polymarket-bot/decimal` and `@polymarket-bot/domain`, so the reverse edge does not and may not exist. |
 | S6 | `packages/pnl` → `packages/risk` | 1 | `docs/contracts/schema-boundary.md` §5 item 1 (the `WP-200-FU1` owner assignment) and §1 (the D1-D4 door rule); ADR-020 §3; the GOV-2A mirror-collapse ruling in the subsection below. Measured basis for the grant: schema-boundary §3's `packages/pnl` row — the same classes on the record schemas, plus a cold first parse of the discriminated union that throws an escaped `TypeError` and leaves the schema permanently poisoned. The consumed surface is the prototype-free parse door only — `plain-data.ts` and `schema-arena.ts`, and since `SER-1` (2026-09-15) the own-data JSON encoder `plain-json.ts`, on the measured basis of `docs/handoffs/SER-0-sweep.md`: an inherited `Object.prototype`/`Array.prototype` `toJSON` merged `pnlCompositeKey`'s schedule-versioned fee buckets and per-program reward/estimate buckets into one key, so the §9.16 breakdown fields came back empty — exported through `packages/risk`'s `exports` map (F16). No rule, policy, or evaluation logic may travel this edge; a consumer needing that has found a different problem. Acyclic on the same evidence as **S5**. |
 | S7 | `packages/strategy-runtime` → `packages/risk` | 1 | `docs/contracts/schema-boundary.md` §5 item 2 (the `WP-170-FU1` owner assignment — "D2/D3 added to the existing materializer") and §1 (the D1-D4 door rule); ADR-020 §3; the GOV-2A mirror-collapse ruling in the subsection below, whose §5 item 5 states that a later consumer "consumes one implementation instead of copying a fourth" — this is the fifth consumer and it took the edge, not a copy. Measured basis for the grant: schema-boundary §3's `packages/strategy-runtime` row — under a non-enumerable inherited `skipChecks`, an evaluation input carrying `evaluatedAt: "yesterday"` and a non-canonical UPPERCASE `marketId` is **accepted** where a clean process refuses it, so ADR-016's "refused, never case-folded" stops being enforced; the same pollution flips the `DecisionResult` parse at `runtime.ts:918` from `CONTAINED`/`RUNTIME.DECISION_INVALID` to a persisted STRATEGY-attributed decision (§6 invariant 3's one persisted decision, §6 invariant 4's traceability chain). The consumed surface is the prototype-free parse door only — `plain-data.ts` and `schema-arena.ts` — exported through `packages/risk`'s `exports` map (F16). No rule, policy, or evaluation logic may travel this edge; a consumer needing that has found a different problem. Acyclic on the same evidence as **S5**: `packages/risk` declares only `@polymarket-bot/decimal` and `@polymarket-bot/domain`, so the reverse edge does not and may not exist. |
+| S8 | `packages/trading-core` → `packages/capital-allocator` | 1 | H8 ruling (option A, the user, 2026-09-28; ADR-022): the paper core moves below layer 3 so that `apps/trader` and `apps/backtest-cli` build one core (handoff §12.1: "Everything between event input and the `ExecutionVenue` interface is shared."; `WP-210` goal, work plan: "Execute the same core logic against historical/live data"; `WP-230` goal: "Assemble books, features, strategy runtime, risk, planner, simulation, and ledger in the trader process" — the trader process still assembles and runs it, ADR-022 D2 — and deliverable "deterministic core event loop"). `WP-230` `depends_on` `WP-180`, the owner of `packages/capital-allocator`. Consumed surface, measured at `a8a3a63`: the allocator's cap parser, reservation evaluation and state, and exposure snapshots (`parseAllocatorCaps`, `evaluateReservation`, `applyReservation`, `createAllocatorState`, `exposureSnapshotCovering`, `shadowExposureSnapshot`, `EXPOSURE_ZERO`). Acyclic: `packages/capital-allocator` may never declare `packages/trading-core` (the reverse edge would be F9 and an unlisted F13). |
+| S9 | `packages/trading-core` → `packages/execution-planner` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-190`, the owner of `packages/execution-planner`. Consumed surface, measured at `a8a3a63`: `buildExecutionPlan` and its plan, placement, result and input types. Acyclic on the S8 terms. |
+| S10 | `packages/trading-core` → `packages/features` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-160`, the owner of `packages/features`. Consumed surface, measured at `a8a3a63`: `computeFeatureSnapshot` and `FeatureSnapshot`. Acyclic on the S8 terms. |
+| S11 | `packages/trading-core` → `packages/ledger` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-200`, the owner of `packages/ledger`. Consumed surface, measured at `a8a3a63`: the ledger and its projection (`Ledger`, `applyTransaction`, `buildFillPosting`, `allocateFill`, `projectLedger`, `serializeProjection`, and their transaction, allocation and refusal types). The core is not a strategy implementation, so F4 is not engaged; `packages/ledger` still may not import any strategy (F4), nor declare this package. Acyclic on the S8 terms. |
+| S12 | `packages/trading-core` → `packages/order-book` | 1 | The H8 basis stated in **S8** ("books"). `packages/order-book` is `WP-150`'s. Consumed surface, measured at `a8a3a63`: `MarketOutcomeBooks`, `executablePrice`, `serializeBook`, and the `OutcomeTokenBook` type. Acyclic on the S8 terms. |
+| S13 | `packages/trading-core` → `packages/pnl` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-200`, the owner of `packages/pnl`. Consumed surface, measured at `a8a3a63`: the PnL fold (`applyPnlRecord`, `foldPnlRecords`, `computePnlSnapshot`, `emptyPnlState`, `serializePnlState`, and the record, snapshot, state and stream-identity types), and since `SNAP-1` `toPnlSnapshotRow`, the own-data row the one-snapshot-per-instance-per-instant key is computed over. Acyclic on the S8 terms. |
+| S14 | `packages/trading-core` → `packages/risk` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-180`, the owner of `packages/risk`. **This is the one §2.1 edge into `packages/risk` that carries the risk ENGINE**, and it says so because S3-S7 say the opposite: the core is the composition that evaluates every intent, so it consumes `evaluateIntent` and `parseRiskPolicy` (and the `RiskEvaluation` and `RiskPolicy` types) from the package root, plus the prototype-free parse door (`./plain-data` `readPlainData`, `./schema-arena` `prototypeFreeParser`) under ADR-020 §3; measured at `a8a3a63`, it does not consume `./plain-json`. S3-S7's "no rule, policy, or evaluation logic may travel this edge" does NOT apply to this row and may not be cited against it; equally, this row may not be cited to widen S3-S7. Acyclic: `packages/risk` declares only `@polymarket-bot/decimal` and `@polymarket-bot/domain`. |
+| S15 | `packages/trading-core` → `packages/simulation` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-210`, the owner of `packages/simulation`. Consumed surface, measured at `a8a3a63`: the handoff §12.1 port interfaces `Clock`, `MarketEventSource` and `ExecutionVenue`, which `WP-210` declared in `packages/simulation` (`docs/handoffs/WP-210.md` deviation 3); the simulated order, fill and result types and the recorded-event identity (`SimulatedOrder`, `SimulatedFill`, `ExecutionResult`, `TimeInForce`, `RecordedEventIdentity`, the structural `EventEnvelope`); and `toFillFact`. `CORE-MOVE`'s venue-policy block (`VenueWiring`, `createExecutionPolicy`, cut from `apps/trader/src/main.ts`) adds the `PlannedOrderView` type. From `BACKTEST-2` on (ADR-022 D5), the surface also includes the simulated-venue construction (`SimulatedVenue`, its fill models such as `tier0Model`, `readFeeScheduleSnapshot`, `unmodeledRateLimits`, and the `BookView` type), serving the ONE venue builder that both composition roots call. The loop itself depends only on the interfaces and never branches on "am I in simulation" (§4; handoff §12.4); the builder is a factory a root chooses to call, and a live root will not call it. This is the first same-layer consumer of the §12.1 interfaces. F5 is unaffected: `packages/simulation` still imports no signer. Acyclic on the S8 terms. |
+| S16 | `packages/trading-core` → `packages/strategy-runtime` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-170`, the owner of `packages/strategy-runtime`. Consumed surface, measured at `a8a3a63`: `createStrategyInstanceRuntime` and the checkpoint, decision-sink, telemetry, evaluation and clock types it takes. Acyclic on the S8 terms. |
+| S17 | `packages/trading-core` → `packages/strategy-sdk` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-170`, the owner of `packages/strategy-sdk`. Consumed surface, measured at `a8a3a63`: **types only** (the strategy-facing views `MarketView`, `OrderBookView`, `StrategyOrderView`, `StrategyFill`, `VirtualPositionView`, `RiskBudgetView`, `FeatureSnapshot`, `StrategyOrderStatus`); no value is imported. Acyclic on the S8 terms. |
+| S18 | `packages/trading-core` → `packages/strategies/static-bracket` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-220`, the owner of `packages/strategies/static-bracket`. Consumed surface, measured at `a8a3a63`: `staticBracketStrategy`, `validateStaticBracketParams`, `staticBracketParamsSchema`. The core runs one strategy today. If a later round makes the core strategy-agnostic (ADR-022 D9; deferred by the user's H8 ruling of 2026-09-28 until a second strategy exists), **this row is removed in that change**. The removal is an obligation on that round. At `a8a3a63` the check did not flag a row that matches no declared edge, so the removal is not a gate result unless the check later gains that `CHK`. The row names the concrete package, not the `packages/strategies/*` class, so a second strategy needs its own cited row and never gets an implicit one. The edge is acyclic on the S8 terms. F3 and F11 still bind the strategy, not the core. |
 
-#### PENDING (staged 2026-09-28 by `H8-GOV`, activated by `CORE-MOVE`): the shared trading core's rows
+#### DONE 2026-09-28: the shared trading core's rows (staged by `H8-GOV`, activated by `CORE-MOVE`)
 
 **The ruling.** On 2026-09-28 the user ruled H8 option A. The
-`createPaperTrader` / `CoreLoop` import closure moves out of `apps/trader` into
+`createPaperTrader` / `CoreLoop` import closure moved out of `apps/trader` into
 a new layer-1 package, `packages/trading-core` (`@polymarket-bot/trading-core`),
 which both composition roots build
 ([ADR-022](../adr/ADR-022-shared-trading-core-is-a-layer-1-package.md)).
-**Nothing in this subsection is parsed by the §6 check.** It changes no layer
-assignment and no permitted edge until `CORE-MOVE` moves it into the tables.
 
-**Why the text is staged here, not listed.** The check fails closed until the
-package exists, and `H8-GOV` reproduced both failures at `a8a3a63`:
-- a §2 entry for a path with no `package.json` is `F-CLOSED`;
-- a row that names an endpoint §2 does not classify is `CHK`.
+**Why the text was staged first.** `H8-GOV` staged it here, unparsed, in a
+`#### PENDING` subsection, because the check fails closed until the package
+exists: a §2 entry for a path with no `package.json` is `F-CLOSED`, and a row
+naming an endpoint §2 does not classify is `CHK`. §6.1 item 5 also puts the
+pinned allowlist assertion in `test/**`, outside a governance round. This is
+the `GOV-2A` → `WP-180-FU2` shape recorded in the DONE subsection below.
 
-Also, §6.1 item 5 puts the pinned allowlist assertion in `test/**`, which is
-outside a governance round. This is the `GOV-2A` → `WP-180-FU2` shape recorded
-in the DONE subsection below.
-
-**What `CORE-MOVE` does with this text,** in the change that creates
-`packages/trading-core/package.json`:
-1. It inserts the fence line below into the Layer 1 fence, after the
+**What `CORE-MOVE` did with it,** in the change that created
+`packages/trading-core/package.json` (`docs/handoffs/CORE-MOVE.md`):
+1. The fence line is in the §2 Layer 1 fence, after the
    `packages/strategies/**` class-entry line.
-2. It inserts the paragraph below after the paragraph that follows that fence.
-3. It moves rows S8-S18 into the table above, verbatim, after S7, restoring
-   each row's leading `| `.
-4. It updates the pinned allowlist assertion to S0..S18.
-5. It appends the S15 sentences to the settled note at the end of this
-   section and to §4.
-6. It records a dated §6 graph note with the **measured** package and edge
-   counts.
-7. It replaces this subsection with a dated DONE note. The note keeps the
-   grant quoted below and drops the staged copies of the text, because a
-   second copy of a parsed row is the private copy of the table that §6
-   forbids.
-
-**Drafting hazards, each reproduced.**
-- The rows have **no leading pipe**. The §2.1 row parser in
-  `tools/check-dependency-direction.mjs` (`parseContract`) reads a pipe-led
-  line even inside a code fence.
-- The fence line's annotation contains no token that starts with `packages/`
-  or `apps/`, because inside a §2 fence such a token is itself a layer
-  assignment.
-- There is one row per target. A class-glob `to` endpoint is `CHK` when the
-  class spans layers, and it would hide which targets the rows permit.
-- The paragraph avoids the prose assignment form that §6's shape table lists.
-  Using it would assign the package twice.
-
-**The §2 Layer 1 fence line:**
-
-```text
-packages/trading-core     (the shared trading core; see below)
-```
-
-**The §2 paragraph**, placed after the paragraph that follows the Layer 1 fence:
-
-```text
-`packages/trading-core` is the shared deterministic trading core:
-`createPaperTrader`, `CoreLoop`, and the modules in their import closure.
-`CORE-MOVE` moved it out of the trader application under the H8 ruling
-(option A, ruled by the user on 2026-09-28;
-[ADR-022](../adr/ADR-022-shared-trading-core-is-a-layer-1-package.md)). It is
-layer 1 by this section's own definition: rules, state machines and
-computation that own no connection. Measured at `a8a3a63`, its 25-file closure
-reaches only layer-0 and layer-1 packages plus `zod`; it imports no adapter
-and no Node built-in, reads no clock, and references no process global.
-Everything that owns a connection stays in the layer-3 trader application: the
-Redis feed, the PostgreSQL store and registration check, the health server,
-the pump, and the process entry point. The trader application builds the
-core, and `apps/backtest-cli` builds it from `BACKTEST-2` on; both are
-composition roots depending on it downward. Its same-layer dependencies are
-§2.1 rows S8-S18, and it needs no §2.2 row. Because it is layer 1, F12 fails
-any edge its manifest declares to a layer-2 package. §3's F8, F6 and F7 also
-apply here: they fail an import of a Redis client, of the venue SDK, or of an
-archived Polymarket client. That was all the gate enforced at `a8a3a63` of "a
-backtest cannot reach Redis, PostgreSQL or a signer through the core". At that
-commit the check did not fail a PostgreSQL client such as `pg`, or a generic
-signing library, declared and imported here. Nor did it fail an adapter import
-that no manifest entry declares. F16 covers the relative form, but the check
-did not implement F16 then. The measured closure does none of these. Keeping it
-so rests on review until a §3 rule binds this package (ADR-022 D3). The Layer 3
-rule "Nothing may depend on an app." is unchanged and stays true: no app is ever
-a dependency under this arrangement.
-```
-
-**Rows S8-S18** (id, edge, layer, basis; one row per target; no leading pipe):
-
-```text
-S8 | `packages/trading-core` → `packages/capital-allocator` | 1 | H8 ruling (option A, the user, 2026-09-28; ADR-022): the paper core moves below layer 3 so that `apps/trader` and `apps/backtest-cli` build one core (handoff §12.1: "Everything between event input and the `ExecutionVenue` interface is shared."; `WP-210` goal, work plan: "Execute the same core logic against historical/live data"; `WP-230` goal: "Assemble books, features, strategy runtime, risk, planner, simulation, and ledger in the trader process" — the trader process still assembles and runs it, ADR-022 D2 — and deliverable "deterministic core event loop"). `WP-230` `depends_on` `WP-180`, the owner of `packages/capital-allocator`. Consumed surface, measured at `a8a3a63`: the allocator's cap parser, reservation evaluation and state, and exposure snapshots (`parseAllocatorCaps`, `evaluateReservation`, `applyReservation`, `createAllocatorState`, `exposureSnapshotCovering`, `shadowExposureSnapshot`, `EXPOSURE_ZERO`). Acyclic: `packages/capital-allocator` may never declare `packages/trading-core` (the reverse edge would be F9 and an unlisted F13). |
-S9 | `packages/trading-core` → `packages/execution-planner` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-190`, the owner of `packages/execution-planner`. Consumed surface, measured at `a8a3a63`: `buildExecutionPlan` and its plan, placement, result and input types. Acyclic on the S8 terms. |
-S10 | `packages/trading-core` → `packages/features` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-160`, the owner of `packages/features`. Consumed surface, measured at `a8a3a63`: `computeFeatureSnapshot` and `FeatureSnapshot`. Acyclic on the S8 terms. |
-S11 | `packages/trading-core` → `packages/ledger` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-200`, the owner of `packages/ledger`. Consumed surface, measured at `a8a3a63`: the ledger and its projection (`Ledger`, `applyTransaction`, `buildFillPosting`, `allocateFill`, `projectLedger`, `serializeProjection`, and their transaction, allocation and refusal types). The core is not a strategy implementation, so F4 is not engaged; `packages/ledger` still may not import any strategy (F4), nor declare this package. Acyclic on the S8 terms. |
-S12 | `packages/trading-core` → `packages/order-book` | 1 | The H8 basis stated in **S8** ("books"). `packages/order-book` is `WP-150`'s. Consumed surface, measured at `a8a3a63`: `MarketOutcomeBooks`, `executablePrice`, `serializeBook`, and the `OutcomeTokenBook` type. Acyclic on the S8 terms. |
-S13 | `packages/trading-core` → `packages/pnl` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-200`, the owner of `packages/pnl`. Consumed surface, measured at `a8a3a63`: the PnL fold (`applyPnlRecord`, `foldPnlRecords`, `computePnlSnapshot`, `emptyPnlState`, `serializePnlState`, and the record, snapshot, state and stream-identity types), and since `SNAP-1` `toPnlSnapshotRow`, the own-data row the one-snapshot-per-instance-per-instant key is computed over. Acyclic on the S8 terms. |
-S14 | `packages/trading-core` → `packages/risk` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-180`, the owner of `packages/risk`. **This is the one §2.1 edge into `packages/risk` that carries the risk ENGINE**, and it says so because S3-S7 say the opposite: the core is the composition that evaluates every intent, so it consumes `evaluateIntent` and `parseRiskPolicy` (and the `RiskEvaluation` and `RiskPolicy` types) from the package root, plus the prototype-free parse door (`./plain-data` `readPlainData`, `./schema-arena` `prototypeFreeParser`) under ADR-020 §3; measured at `a8a3a63`, it does not consume `./plain-json`. S3-S7's "no rule, policy, or evaluation logic may travel this edge" does NOT apply to this row and may not be cited against it; equally, this row may not be cited to widen S3-S7. Acyclic: `packages/risk` declares only `@polymarket-bot/decimal` and `@polymarket-bot/domain`. |
-S15 | `packages/trading-core` → `packages/simulation` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-210`, the owner of `packages/simulation`. Consumed surface, measured at `a8a3a63`: the handoff §12.1 port interfaces `Clock`, `MarketEventSource` and `ExecutionVenue`, which `WP-210` declared in `packages/simulation` (`docs/handoffs/WP-210.md` deviation 3); the simulated order, fill and result types and the recorded-event identity (`SimulatedOrder`, `SimulatedFill`, `ExecutionResult`, `TimeInForce`, `RecordedEventIdentity`, the structural `EventEnvelope`); and `toFillFact`. `CORE-MOVE`'s venue-policy block (`VenueWiring`, `createExecutionPolicy`, cut from `apps/trader/src/main.ts`) adds the `PlannedOrderView` type. From `BACKTEST-2` on (ADR-022 D5), the surface also includes the simulated-venue construction (`SimulatedVenue`, its fill models such as `tier0Model`, `readFeeScheduleSnapshot`, `unmodeledRateLimits`, and the `BookView` type), serving the ONE venue builder that both composition roots call. The loop itself depends only on the interfaces and never branches on "am I in simulation" (§4; handoff §12.4); the builder is a factory a root chooses to call, and a live root will not call it. This is the first same-layer consumer of the §12.1 interfaces. F5 is unaffected: `packages/simulation` still imports no signer. Acyclic on the S8 terms. |
-S16 | `packages/trading-core` → `packages/strategy-runtime` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-170`, the owner of `packages/strategy-runtime`. Consumed surface, measured at `a8a3a63`: `createStrategyInstanceRuntime` and the checkpoint, decision-sink, telemetry, evaluation and clock types it takes. Acyclic on the S8 terms. |
-S17 | `packages/trading-core` → `packages/strategy-sdk` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-170`, the owner of `packages/strategy-sdk`. Consumed surface, measured at `a8a3a63`: **types only** (the strategy-facing views `MarketView`, `OrderBookView`, `StrategyOrderView`, `StrategyFill`, `VirtualPositionView`, `RiskBudgetView`, `FeatureSnapshot`, `StrategyOrderStatus`); no value is imported. Acyclic on the S8 terms. |
-S18 | `packages/trading-core` → `packages/strategies/static-bracket` | 1 | The H8 basis stated in **S8**. `WP-230` `depends_on` `WP-220`, the owner of `packages/strategies/static-bracket`. Consumed surface, measured at `a8a3a63`: `staticBracketStrategy`, `validateStaticBracketParams`, `staticBracketParamsSchema`. The core runs one strategy today. If a later round makes the core strategy-agnostic (ADR-022 D9; deferred by the user's H8 ruling of 2026-09-28 until a second strategy exists), **this row is removed in that change**. The removal is an obligation on that round. At `a8a3a63` the check did not flag a row that matches no declared edge, so the removal is not a gate result unless the check later gains that `CHK`. The row names the concrete package, not the `packages/strategies/*` class, so a second strategy needs its own cited row and never gets an implicit one. The edge is acyclic on the S8 terms. F3 and F11 still bind the strategy, not the core. |
-```
-
-**The S15 sentences.** The first is appended inside the settled note at the end
-of this section; the second is appended to §4's execution-venue bullet:
-
-```text
-The first same-layer consumer of those interfaces is `packages/trading-core`, on row S15.
-`packages/trading-core` consumes them across §2.1 row S15.
-```
+2. The paragraph follows the paragraph after that fence.
+3. Rows S8-S18 are in the table above, after S7, verbatim, each with its
+   leading `| ` restored.
+4. The pinned allowlist assertion in
+   `test/unit/tooling/dependency-direction.test.ts` reads S0..S18.
+5. The two S15 sentences are appended to the settled note at the end of this
+   section and to §4's execution-venue bullet.
+6. §6 records a dated graph note with the measured package and edge counts.
+7. This note replaces the subsection. It drops the staged copies of the fence
+   line, the paragraph, the rows and the S15 sentences, because a second copy
+   of a parsed row is the private copy of the table that §6 forbids. It keeps
+   the grant, below.
 
 **The grant, as `H8-GOV` wrote it on 2026-09-28** (quoted verbatim from
 `docs/handoffs/H8-GOV.md`; a recorded grant is not edited to match what is
@@ -568,7 +530,7 @@ records it. The replaced bullet read: "The handoff does not say which package
 declares them. If they land in a layer-1 package, then `packages/simulation`
 implementing `ExecutionVenue` (`WP-210`) is a same-layer edge needing a row; if
 they land lower, it is an ordinary downward edge. `WP-190`/`WP-210` settle
-it.")*
+it.") The first same-layer consumer of those interfaces is `packages/trading-core`, on row S15.)*
 
 ### 2.2 Node built-ins below layer 2: a bounded, enumerated allowlist (ruled 2026-09-04 by `GOV-2A`)
 
@@ -772,7 +734,7 @@ exactly one layer (§2).
   discharging `WP-210` `follow_up` 6. This sentence previously ended "whichever
   package does must be classified in §2 and any resulting same-layer edge listed
   in §2.1"; `packages/simulation` is classified in §2, and no same-layer edge
-  resulted.)*
+  resulted.)* `packages/trading-core` consumes them across §2.1 row S15.
 
 ---
 
@@ -892,6 +854,24 @@ canonical home of the own-data machinery (`schema-boundary.md` §1, §5 items
 5 and 11), the edge is downward, and no rule, policy or evaluation logic
 travels it. If that home ever moves to a lower layer, every row in this table
 moves with it and the count is re-recorded here.
+
+**The graph as of 2026-09-28** (recorded by `CORE-MOVE`; measured by running
+the check on the round's tree, base `main` `ac0b12f`): **35 workspace packages,
+89 declared workspace edges**, and it passes. The check reported 34 packages and
+80 edges at the base. The new package is `packages/trading-core`, which §2
+classifies in layer 1 (§2.1's DONE note of the same date). The edge changes
+below come from diffing the check's `--json` edge list at the base and after the
+move, and they net to +9:
+
+| Edge | Layers | Verdict | Count |
+| --- | --- | --- | --- |
+| `packages/trading-core` → `packages/capital-allocator`, `packages/execution-planner`, `packages/features`, `packages/ledger`, `packages/order-book`, `packages/pnl`, `packages/risk`, `packages/simulation`, `packages/strategy-runtime`, `packages/strategy-sdk`, `packages/strategies/static-bracket` | 1 → 1 | same-layer; §2.1 rows **S8-S18**, one per edge | +11 |
+| `packages/trading-core` → `packages/decimal`, `packages/domain` | 1 → 0 | downward | +2 |
+| `apps/trader` → `packages/trading-core` | 3 → 1 | downward | +1 |
+| `apps/trader` → `packages/decimal`, `packages/execution-planner`, `packages/features`, `packages/order-book`, `packages/strategies/static-bracket` | 3 → 0, 3 → 1 | removed: no `apps/trader` source file imports these after the move (ADR-018 §3; the orchestrator's `CORE-MOVE` ruling) | −5 |
+
+The core declares `zod` as its one external runtime dependency, and it imports
+no `node:` module, so it needs no §2.2 row.
 
 1. **Cycle detection.** Fail on any cycle in that graph. Non-zero exit, named
    cycle in the output. This is the rule §5.2 states literally, and it is what

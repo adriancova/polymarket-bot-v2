@@ -41,7 +41,7 @@ import {
 import { describe, expect, it } from "vitest";
 
 import { EVERY_FILL_ACCOUNTING_CHECKS } from "./folds.js";
-import { createExecutionPolicy, type VenueWiring } from "./main.js";
+import { createExecutionPolicy, type VenueWiring } from "./venue-policy.js";
 import type { IngestedEvent } from "./ports.js";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";
 import { createPaperTrader, type PaperTrader } from "./trader.js";

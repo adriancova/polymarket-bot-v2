@@ -1,0 +1,35 @@
+{
+  "name": "@polymarket-bot/trading-core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The shared deterministic trading core (ADR-022): createPaperTrader, CoreLoop and the modules in their import closure, moved byte for byte from apps/trader by CORE-MOVE so that both composition roots build one core. Layer 1 (dependency-direction.md §2): layer-0 and layer-1 workspace packages plus zod; no adapter, no Node built-in, no clock read. PAPER only — simulated execution, no credential, no signer, no venue connection, no real order.",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/testing/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@polymarket-bot/capital-allocator": "workspace:*",
+    "@polymarket-bot/decimal": "workspace:*",
+    "@polymarket-bot/domain": "workspace:*",
+    "@polymarket-bot/execution-planner": "workspace:*",
+    "@polymarket-bot/features": "workspace:*",
+    "@polymarket-bot/ledger": "workspace:*",
+    "@polymarket-bot/order-book": "workspace:*",
+    "@polymarket-bot/pnl": "workspace:*",
+    "@polymarket-bot/risk": "workspace:*",
+    "@polymarket-bot/simulation": "workspace:*",
+    "@polymarket-bot/strategy-static-bracket": "workspace:*",
+    "@polymarket-bot/strategy-runtime": "workspace:*",
+    "@polymarket-bot/strategy-sdk": "workspace:*",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

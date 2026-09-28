@@ -119,6 +119,8 @@ import { describe, expect, it } from "vitest";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const TRADER_SRC = join(REPO_ROOT, "apps", "trader", "src");
+const CORE_SRC = join(REPO_ROOT, "packages", "trading-core", "src");
+const rootOf = (file: string): string => (file.startsWith(CORE_SRC + sep) ? CORE_SRC : TRADER_SRC);
 
 /** Kysely chain roots: an assertion under one of these is at a query boundary. */
 const QUERY_ROOTS = new Set(["insertInto", "updateTable", "deleteFrom", "selectFrom"]);
@@ -341,16 +343,16 @@ function scanSource(label: string, text: string): readonly Assertion[] {
   return found;
 }
 
-const FILES = sourceFiles(TRADER_SRC);
+const FILES = [...sourceFiles(TRADER_SRC), ...sourceFiles(CORE_SRC)];
 
 const ASSERTIONS: readonly Assertion[] = FILES.flatMap((file) =>
-  scanSource(relative(TRADER_SRC, file).split(sep).join("/"), readFileSync(file, "utf8")),
+  scanSource(relative(rootOf(file), file).split(sep).join("/"), readFileSync(file, "utf8")),
 );
 
 /** Text of the `@ts-` and `eslint-disable` escape hatches, per file. */
 const SUPPRESSION_COMMENTS: readonly { readonly file: string; readonly line: number; readonly text: string }[] =
   FILES.flatMap((file) => {
-    const relativePath = relative(TRADER_SRC, file).split(sep).join("/");
+    const relativePath = relative(rootOf(file), file).split(sep).join("/");
     return readFileSync(file, "utf8")
       .split("\n")
       .flatMap((line, index) =>
@@ -368,7 +370,7 @@ describe("the scan reaches the source it claims to (fail closed)", () => {
   it("parses apps/trader's production modules, the adapters among them", () => {
     // A scan that silently found nothing would pass every rule below.
     expect(FILES.length).toBeGreaterThanOrEqual(20);
-    const names = FILES.map((file) => relative(TRADER_SRC, file).split(sep).join("/"));
+    const names = FILES.map((file) => relative(rootOf(file), file).split(sep).join("/"));
     expect(names).toContain("adapters/postgres-store.ts");
     expect(names).toContain("adapters/redis-feed.ts");
     expect(names).toContain("loop.ts");

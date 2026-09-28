@@ -17,7 +17,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { HealthState, RealizedPnlBook, type HealthSnapshot } from "../../../apps/trader/src/health.js";
+import { HealthState, RealizedPnlBook, type HealthSnapshot } from "../../../packages/trading-core/src/health.js";
 import {
   TRADER_HEALTH_BOUNDS,
   TRADER_HEALTH_LOOPBACK_HOSTS,

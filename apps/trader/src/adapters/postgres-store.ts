@@ -86,13 +86,13 @@ import {
   type RunModeValue,
 } from "@polymarket-bot/storage-postgres";
 
-import { unreplacedPnlSnapshotProblem } from "../pnl-snapshot-key.js";
+import { unreplacedPnlSnapshotProblem } from "@polymarket-bot/trading-core";
 import {
   portFailed,
   portOk,
   type PortResult,
   type TraderStore,
-} from "../ports.js";
+} from "@polymarket-bot/trading-core";
 
 /**
  * Narrows `scope` from the row's `string` to the column's enumeration.

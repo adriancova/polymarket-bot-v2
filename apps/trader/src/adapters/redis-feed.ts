@@ -40,7 +40,7 @@ import {
   type IngestedEvent,
   type MarketEventFeed,
   type PortResult,
-} from "../ports.js";
+} from "@polymarket-bot/trading-core";
 
 export interface RedisMarketEventFeedOptions {
   /** An already-subscribed `packages/event-bus` subscription. */

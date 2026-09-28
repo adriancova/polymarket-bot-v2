@@ -63,7 +63,7 @@ import { prototypeFreeParser } from "@polymarket-bot/risk/schema-arena";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { z } from "zod";
 
-import type { HealthSnapshot } from "./health.js";
+import type { HealthSnapshot } from "@polymarket-bot/trading-core";
 
 /** The one path this server answers. */
 export const TRADER_HEALTH_PATH = "/health";

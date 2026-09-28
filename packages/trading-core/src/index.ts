@@ -1,42 +1,29 @@
 /**
- * `@polymarket-bot/trader` — the paper trader (`WP-230`).
+ * `@polymarket-bot/trading-core` — the shared deterministic trading core
+ * (ADR-022; `dependency-direction.md` §2, layer 1).
  *
- * The layer-3 composition root of handoff §4.1's `apps/trader`: it "owns the
- * live deterministic event loop… books, features, strategies, risk, OMS, user
- * stream, heartbeat, reconciliation, ledger projections". This process
- * implements the PAPER half of that — live data, SIMULATED execution (§11) —
- * by assembling the already-merged packages behind the §12.1 ports, so the live
- * execution adapter that arrives later replaces one implementation and leaves
- * the whole loop above it unchanged.
+ * `createPaperTrader`, `CoreLoop`, and the modules in their import closure.
+ * `CORE-MOVE` moved them here from `apps/trader/src`, byte for byte, under the
+ * user's H8 ruling (option A, 2026-09-28). `apps/trader` still assembles and
+ * runs this core on live data, and `apps/backtest-cli` is to build it from
+ * `BACKTEST-2` on; both depend on it downward.
  *
- * ## What it assembles
+ * The export blocks below are `apps/trader/src/index.ts`'s blocks for these
+ * modules as they stood at `ac0b12f`, verbatim and in the same order. Two
+ * blocks follow them:
+ * - the venue policy cut from `apps/trader/src/main.ts` (`venue-policy.ts`);
+ * - `unreplacedPnlSnapshotProblem`, which the trader's PostgreSQL store
+ *   imports.
  *
- * | Layer | Package | Role |
- * | --- | --- | --- |
- * | books | `@polymarket-bot/order-book` | §9.4 per-outcome-token reconstruction |
- * | features | `@polymarket-bot/features` | §9.5 versioned, content-addressed snapshots |
- * | strategy | `@polymarket-bot/strategy-runtime` + `@polymarket-bot/strategy-static-bracket` | §9.6 one persisted decision per callback |
- * | allocation | `@polymarket-bot/capital-allocator` | §9.7 commitments and caps — `allocation.ts` asks it for a verdict before every risk check |
- * | risk | `@polymarket-bot/risk` | §9.8 twenty pre-trade checks |
- * | planning | `@polymarket-bot/execution-planner` | §9.10 immutable execution plans |
- * | venue | `@polymarket-bot/simulation` | §12.1 `ExecutionVenue`, simulated |
- * | accounting | `@polymarket-bot/ledger` + `@polymarket-bot/pnl` | §9.15 / §9.16 |
+ * `@polymarket-bot/trader` and `@polymarket-bot/trader/testing` still export
+ * every name they exported before the move, under the same name and kind,
+ * until a later round retires them (ADR-022 D7).
  *
- * ## Safety
- *
- * `MAX_RUN_MODE=PAPER`, `ALLOW_REAL_ORDERS=false` and both live-micro caps at
- * `0` are untouched by this process and ENFORCED by it: `safety.ts` refuses to
- * start under a raised ceiling, under a run mode that would place a real order,
- * or in an environment that references a production secret name (§15, ADR-010
- * §3). There is no signer, no credential, no venue connection and no real-order
- * path anywhere in this app, and none is representable in its types — the only
- * `ExecutionVenue` it can be handed is `packages/simulation`'s, which refuses
+ * PAPER only. The run-mode ceiling in `safety.ts` and `config.ts` moved
+ * unchanged (ADR-022 D6). There is no signer, credential, venue connection or
+ * real-order path here. The only production `ExecutionVenue` in the
+ * workspace is `packages/simulation`'s `SimulatedVenue`, which refuses
  * `EXECUTION_PROBE`, `LIVE_MICRO` and `LIVE` by name.
- *
- * A paper fill is NOT evidence about real fill quality (ADR-012 §2, §12.2), and
- * nothing in this process claims otherwise: every fill it observes carries
- * `evidenceClass: "SIMULATED_NOT_REAL_EVIDENCE"` from the venue that produced
- * it.
  */
 
 export {
@@ -51,7 +38,7 @@ export {
   type SafetyOutcome,
   type SafetyViolation,
   type SafetyViolationCode,
-} from "@polymarket-bot/trading-core";
+} from "./safety.js";
 
 export {
   TraderConfigSchema,
@@ -62,7 +49,7 @@ export {
   type MarketConfig,
   type ParseConfigResult,
   type TraderConfig,
-} from "@polymarket-bot/trading-core";
+} from "./config.js";
 
 export {
   CONSUMED_EVENTS,
@@ -70,7 +57,7 @@ export {
   type EventDoorRefusal,
   type EventDoorRefusalCode,
   type ReadEventResult,
-} from "@polymarket-bot/trading-core";
+} from "./event-door.js";
 
 export {
   formatStrictUtc,
@@ -78,7 +65,7 @@ export {
   normalizeToStrictUtc,
   strictUtcEpochMs,
   type NormalizeInstantResult,
-} from "@polymarket-bot/trading-core";
+} from "./time.js";
 
 export {
   EXECUTABLE_PRICE_FEATURE_IDS,
@@ -91,9 +78,9 @@ export {
   type ProjectionRefusal,
   type ProjectionResult,
   type ScalarFeatureValue,
-} from "@polymarket-bot/trading-core";
+} from "./projection.js";
 
-export { BoundedQueue, type OfferOutcome, type QueueMetrics } from "@polymarket-bot/trading-core";
+export { BoundedQueue, type OfferOutcome, type QueueMetrics } from "./queue.js";
 
 export {
   HaltController,
@@ -102,7 +89,7 @@ export {
   type HaltReasonCode,
   type HaltRelease,
   type HaltScope,
-} from "@polymarket-bot/trading-core";
+} from "./halt.js";
 
 export {
   HealthState,
@@ -117,25 +104,7 @@ export {
   type RealizedPnlObservation,
   type RiskHealth,
   type SeamHealth,
-} from "@polymarket-bot/trading-core";
-
-export {
-  TRADER_HEALTH_BOUNDS,
-  TRADER_HEALTH_LOOPBACK_HOSTS,
-  TRADER_HEALTH_PATH,
-  classifyHealthFailure,
-  healthResponseBody,
-  readHealthServerEnv,
-  startTraderHealthServer,
-  type HealthListen,
-  type HealthServerEnvResult,
-  type HealthServerRefusal,
-  type HealthServerRefusalCode,
-  type RunningTraderHealthServer,
-  type TraderHealthServerOptions,
-} from "./health-server.js";
-
-export { observeRealizedPnl } from "./pnl-observation.js";
+} from "./health.js";
 
 export {
   AllocatorGate,
@@ -149,7 +118,7 @@ export {
   type AllocationVerdict,
   type AllocatorMetrics,
   type IntentLeg,
-} from "@polymarket-bot/trading-core";
+} from "./allocation.js";
 
 export {
   portFailed,
@@ -166,7 +135,7 @@ export {
   type PortResult,
   type RecordedEventIdentity,
   type TraderStore,
-} from "@polymarket-bot/trading-core";
+} from "./ports.js";
 
 export {
   FILLS_ARE_DELIVERED_WHILE_PAUSED,
@@ -174,7 +143,7 @@ export {
   type FillAdmission,
   type FillDeduplicatorMetrics,
   type IdentifiedFill,
-} from "@polymarket-bot/trading-core";
+} from "./fills.js";
 
 export {
   OrderViewTracker,
@@ -183,7 +152,7 @@ export {
   toStrategyOrderView,
   type OrderViewDelivery,
   type OrderViewMetrics,
-} from "@polymarket-bot/trading-core";
+} from "./orders.js";
 
 export {
   DEFAULT_RETENTION,
@@ -198,7 +167,7 @@ export {
   type RetentionHealth,
   type RetentionMetrics,
   type SettlementBlocker,
-} from "@polymarket-bot/trading-core";
+} from "./order-lifecycle.js";
 
 export {
   EVERY_FILL_ACCOUNTING_CHECKS,
@@ -210,7 +179,7 @@ export {
   type FoldHealth,
   type FoldedPosting,
   type RebuildMismatch,
-} from "@polymarket-bot/trading-core";
+} from "./folds.js";
 
 export {
   CancelLedger,
@@ -218,14 +187,14 @@ export {
   type CancelResolution,
   type PendingCancel,
   type ResolvedCancel,
-} from "@polymarket-bot/trading-core";
+} from "./cancels.js";
 
 export {
   ReservationBook,
   type OutcomeSide,
   type ReservationMetrics,
   type ShareReservation,
-} from "@polymarket-bot/trading-core";
+} from "./reservations.js";
 
 export {
   InstanceRegistry,
@@ -234,14 +203,14 @@ export {
   type Ownership,
   type RegisterResult,
   type RegisteredInstance,
-} from "@polymarket-bot/trading-core";
+} from "./instances.js";
 
 export {
   MarketState,
   type ActiveIncident,
   type MarketLifecycle,
   type ObservedTradeRecord,
-} from "@polymarket-bot/trading-core";
+} from "./market-state.js";
 
 export {
   DeterministicIdFactory,
@@ -251,7 +220,7 @@ export {
   type PostFillOutcome,
   type PostingIdentity,
   type TraceLink,
-} from "@polymarket-bot/trading-core";
+} from "./accounting.js";
 
 export {
   ORDER_TYPE_TAG_PREFIX,
@@ -266,7 +235,7 @@ export {
   type PortfolioOpenOrderInput,
   type PortfolioPositionInput,
   type RiskInputContext,
-} from "@polymarket-bot/trading-core";
+} from "./pipeline.js";
 
 export {
   CoreLoop,
@@ -277,15 +246,13 @@ export {
   type LoopHealthSnapshot,
   type RetainedOrderState,
   type TraderVenue,
-} from "@polymarket-bot/trading-core";
-
-export { pump, type PumpOptions, type PumpResult } from "./pump.js";
+} from "./loop.js";
 
 export {
   ReferenceState,
   type ReferencePoint,
   type ReferenceVenueName,
-} from "@polymarket-bot/trading-core";
+} from "./reference-state.js";
 
 export {
   createPaperTrader,
@@ -293,4 +260,8 @@ export {
   type CreateTraderResult,
   type PaperTrader,
   type TraderRefusal,
-} from "@polymarket-bot/trading-core";
+} from "./trader.js";
+
+export { createExecutionPolicy, type VenueWiring } from "./venue-policy.js";
+
+export { unreplacedPnlSnapshotProblem } from "./pnl-snapshot-key.js";
