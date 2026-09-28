@@ -339,6 +339,40 @@ function intentValidUntilMs(params: StaticBracketParams, track: OrderTrack): num
 }
 
 /**
+ * True while an ENTRY execution the venue has REPORTED is not yet FOLDED: the
+ * entry track's view evidence (`viewFilledShares`) is ahead of its confirmed
+ * fills (`filledShares`). §8.1 orders nothing between a view and its fill, so
+ * this is an execution whose fill is on its way (`BRACKET-1a` r1, finding
+ * BR1-H1).
+ *
+ * Three rules rest on it, all so that the awaited fill FOLDS when it lands:
+ *
+ * 1. {@link settleTerminalOrder} keeps a terminal entry track while it holds,
+ *    so the late fill still matches it BY ORDER ID.
+ * 2. No path in this file certifies the bracket CLOSED while it holds
+ *    ({@link applyExitFill}, {@link planExit}, {@link planTick}'s market-closed
+ *    shortcut): a bracket that has sold everything it has FOLDED has not sold
+ *    everything it BOUGHT.
+ * 3. The settlement of an exit ({@link settleTerminalOrder},
+ *    {@link retireExpiredReduce}) does not move the bracket into `OPEN` while
+ *    it holds, because §13.3 folds an entry fill out of the entry states,
+ *    `PARTIALLY_OPEN` and the exit states — never out of `OPEN`.
+ *
+ * Before r1 the entry track was cleared as soon as anything had been folded,
+ * the late fill matched no track, and once the reduction's own fill was
+ * attributed (D1) the bracket reached a false CLOSED with shares still held.
+ *
+ * An incomparable pair is read the fail-safe way, as D6 reads the exit's:
+ * waiting names nothing, closing on an allocation that may be short does.
+ */
+function entryExecutionUnfolded(state: StaticBracketState): boolean {
+  const entry = state.entryOrder;
+  if (entry === null) return false;
+  const ordering = compare(entry.viewFilledShares, entry.filledShares, "entry fill evidence");
+  return !ordering.ok || ordering.value > 0;
+}
+
+/**
  * The venue order type EVERY exit this strategy emits states for itself
  * (`RISK-2`, found only once GOV-2B blocker B2 stopped refusing these intents).
  *
@@ -691,8 +725,15 @@ export function planTick(input: TickContext): Plan {
 
   // The market is over: end-of-market behaviour is an explicit policy (§13.3
   // rule 5) and is applied in `planClosing`; here the only question is whether
-  // the bracket is finished.
-  if (timeToCloseMs !== null && timeToCloseMs <= 0 && !hasAllocation(current)) {
+  // the bracket is finished. It is NOT while an entry execution the venue
+  // reported is still unfolded (`BRACKET-1a` r1, BR1-H1): "no allocation" then
+  // means "not yet delivered", and the ladder below waits for the fill instead.
+  if (
+    timeToCloseMs !== null &&
+    timeToCloseMs <= 0 &&
+    !hasAllocation(current) &&
+    !entryExecutionUnfolded(current)
+  ) {
     // MOVE-SITE: marketClosed TRIGGERS: MARKET_CLOSED
     const closed = move(current, "MARKET_CLOSED", { closedAtMs: observation.nowMs });
     if (closed.ok) {
@@ -1462,16 +1503,22 @@ interface Settlement {
  *
  * THE ENTRY CASE HAS THREE OUTCOMES, not two:
  *
- * 1. A fill has been FOLDED (`filledShares > 0`) — the allocation is real and
- *    final at that size, so the bracket opens at it.
- * 2. Nothing folded, but an ORDER VIEW reported a filled size
- *    (`viewFilledShares > 0`) — §8.1 guarantees no ordering between a view and
- *    its fill, so this is an execution whose fill has not arrived yet. The
- *    instance does NOT return to ARMED (that would discard a real execution and
- *    let the very next evaluation enter again, doubling the position): it keeps
- *    the order tracked and waits for the fill stream. The exit is still sized
- *    only from the fold when that fill lands — §13.3 rule 1 is not relaxed by
- *    this, and the view's number never becomes an allocation.
+ * 1. An ORDER VIEW reported MORE executed than has been folded
+ *    (`viewFilledShares > filledShares`, {@link entryExecutionUnfolded}) — §8.1
+ *    guarantees no ordering between a view and its fill, so this is an
+ *    execution whose fill has not arrived yet. The track is KEPT and the
+ *    instance waits for the fill stream. With nothing folded the instance does
+ *    NOT return to ARMED (that would discard a real execution and let the very
+ *    next evaluation enter again, doubling the position). With SOME folded —
+ *    the case this rule used to miss (`BRACKET-1a` r1, BR1-H1: it waited only
+ *    when NOTHING was folded) — clearing the track left the rest of the fill
+ *    matching no track, and the bracket later closed on the folded part while
+ *    still holding the rest. The exit is still sized only from the fold when
+ *    that fill lands — §13.3 rule 1 is not relaxed by this, and the view's
+ *    number never becomes an allocation.
+ * 2. Everything the view reported is folded, and a fill has been FOLDED
+ *    (`filledShares > 0`) — the allocation is real and final at that size, so
+ *    the bracket opens at it.
  * 3. Nothing folded and no evidence — nothing executed (§13.3 rule 3), so the
  *    instance returns to ARMED under the reentry policy.
  *
@@ -1500,14 +1547,14 @@ function settleTerminalOrder(
   }
 
   if (kind === "ENTRY") {
-    const folded = !isZero(track.filledShares);
-    if (!folded && !isZero(track.viewFilledShares)) {
+    if (entryExecutionUnfolded(state)) {
       return {
         state,
         reasons: [REASONS.entryOrderTerminal, REASONS.awaitingFillAllocation],
         awaitingFill: true,
       };
     }
+    const folded = !isZero(track.filledShares);
     if (!folded) {
       // MOVE-SITE: entryTerminalUnfilled TRIGGERS: ENTRY_ORDER_TERMINAL_UNFILLED
       const moved = move(state, "ENTRY_ORDER_TERMINAL_UNFILLED", { entryOrder: null });
@@ -1551,10 +1598,18 @@ function settleTerminalOrder(
       : state.instanceState === "EXIT_WORKING"
         ? "EXIT_ORDER_TERMINAL_UNFILLED"
         : null;
-  if (trigger !== null && !isZero(openShares(state))) {
+  if (trigger !== null && !isZero(openShares(state)) && !entryExecutionUnfolded(state)) {
     // The exit order is gone and the allocation is not: the position is open
     // again and re-plannable. The trigger differs by state because the §13.3
     // table names a different edge out of each.
+    //
+    // NOT while an entry execution is unfolded (`BRACKET-1a` r1, BR1-H1): §13.3
+    // has no edge that folds an entry fill out of `OPEN` (the census classes it
+    // a designed refusal), so moving there would turn the awaited late fill into
+    // an ILLEGAL_TRANSITION pause with the shares unfolded. The track is cleared
+    // and the bracket stays in its exit state, whose own ENTRY_PARTIAL_FILL /
+    // ENTRY_FILL_COMPLETE edges fold that fill; the ladder re-plans from there
+    // with the same edges it uses from `OPEN` (EXIT_TRIGGER_MET).
     // MOVE-SITE: exitTerminal TRIGGERS: EXIT_ABANDONED EXIT_ORDER_TERMINAL_UNFILLED
     const moved = move(cleared, trigger);
     if (moved.ok) {
@@ -1751,6 +1806,13 @@ function planExit(
   const open = openShares(state);
 
   if (isZero(open)) {
+    if (entryExecutionUnfolded(state)) {
+      // BR1-H1: everything FOLDED has exited, but the venue reported more of the
+      // entry than the fill stream has delivered. The bracket is not finished —
+      // closing it here would certify a flat book over shares still held (the
+      // paused-fold-then-resume route reached exactly that). Wait for the fill.
+      return plan(state, "hold", [...reasons, REASONS.awaitingFillAllocation]);
+    }
     // Nothing is held: the bracket is finished. The trigger differs by state so
     // that every edge taken is one the §13.3 table actually contains.
     const trigger: InstanceTrigger =
@@ -1843,7 +1905,12 @@ function planExit(
  * - AN EXIT STILL AWAITING ITS FILL IS NEVER OVERWRITTEN. The exit slot holds
  *   one track; replacing a terminal track whose view reported more executed
  *   than has been folded (D6) would drop the one record the late fill can be
- *   attributed to.
+ *   attributed to. And because this function is then reached only from
+ *   {@link applyEntryFill} (a late ENTRY fill; {@link planExit} returns on D6
+ *   before its ladder), the bracket is walked back into the exit states
+ *   ({@link reenterExitStates}) so that awaited exit fill still folds —
+ *   `BRACKET-1a` r1: from `OPEN` it was refused as an illegal transition and
+ *   PAUSED the instance with the sale unfolded.
  */
 function planTakeProfit(
   params: StaticBracketParams,
@@ -1862,7 +1929,11 @@ function planTakeProfit(
   if (existing !== null && !isLive(existing.state)) {
     const settlement = settleTerminalOrder(state, "EXIT");
     if (settlement !== null && settlement.awaitingFill === true) {
-      return plan(state, "hold", [...reasons, ...settlement.reasons]);
+      const back = reenterExitStates(state);
+      if (!back.ok) {
+        return halted(state, back.problem, []);
+      }
+      return plan(back.value, "hold", [...reasons, ...settlement.reasons]);
     }
   }
   if (existing !== null && isLive(existing.state)) {
@@ -2220,21 +2291,45 @@ function planProtectedReduce(
 }
 
 /**
+ * Walks a bracket that still OWES an exit fill back into the exit states, or
+ * leaves it where it is.
+ *
+ * An exit order of this bracket that can still produce a fill — a live
+ * protective reduction ({@link holdForLiveReduce}), or a terminal exit whose
+ * view reported more executed than is folded (D6, {@link planTakeProfit}) —
+ * must have its fill folded, and the only §13.3 edges that fold an exit fill
+ * leave `EXIT_PLANNED`/`EXIT_WORKING`. A late ENTRY fill moves the instance out
+ * of those states ({@link applyEntryFill} takes `ENTRY_PARTIAL_FILL` /
+ * `ENTRY_FILL_COMPLETE` into `PARTIALLY_OPEN`/`OPEN`), and from `OPEN` the
+ * exit's fill would be refused as an illegal transition and PAUSE the instance
+ * on its own exit, with the sale unfolded. So the bracket re-takes the existing
+ * `EXIT_TRIGGER_MET` edge — an exit cause did fire, and its order is still owed
+ * — and {@link syncPlannedToWorking} follows a working order into
+ * `EXIT_WORKING`. No new machine edge: `PARTIALLY_OPEN|OPEN --EXIT_TRIGGER_MET-->
+ * EXIT_PLANNED` is the edge every exit placement takes.
+ *
+ * In any other state it answers the state unchanged.
+ */
+function reenterExitStates(state: StaticBracketState): Outcome<StaticBracketState> {
+  if (state.instanceState !== "PARTIALLY_OPEN" && state.instanceState !== "OPEN") {
+    return ok(state);
+  }
+  // MOVE-SITE: exitStillOwed TRIGGERS: EXIT_TRIGGER_MET
+  const moved = move(state, "EXIT_TRIGGER_MET");
+  if (!moved.ok) return moved;
+  return ok(syncPlannedToWorking(moved.value, "EXIT"));
+}
+
+/**
  * What every evaluation does while this bracket's own protective reduction is
  * live (`BRACKET-1a`, D3/D4, rulings R2 and R3): it HOLDS. No second
  * reduction, no cancel of this one, no take-profit beside it.
  *
- * BACK INTO THE EXIT STATES FIRST. A late ENTRY fill after the reduction was
- * placed moves the instance to `PARTIALLY_OPEN`/`OPEN` ({@link applyEntryFill}
- * takes §13.3's `ENTRY_PARTIAL_FILL`/`ENTRY_FILL_COMPLETE` edge out of the exit
- * states). The reduction's order is still live, though, and when it fills the
- * only edges that fold an exit fill leave `EXIT_PLANNED`/`EXIT_WORKING` — from
- * `OPEN` the fill would be refused as an illegal transition and the instance
- * would PAUSE on its own exit again. So the hold re-takes the existing
- * `EXIT_TRIGGER_MET` edge (an exit cause did fire, and its order is still
- * working) and lets {@link syncPlannedToWorking} follow the order into
- * `EXIT_WORKING`. The grown allocation is planned only after the reduction
- * settles, by the ordinary ladder, under the ordinary position checks.
+ * BACK INTO THE EXIT STATES FIRST ({@link reenterExitStates}). A late ENTRY
+ * fill after the reduction was placed moves the instance to
+ * `PARTIALLY_OPEN`/`OPEN`, and the reduction's own fill must still fold. The
+ * grown allocation is planned only after the reduction settles, by the
+ * ordinary ladder, under the ordinary position checks.
  *
  * THEN, BY THE ORDER'S STATE:
  *
@@ -2257,15 +2352,11 @@ function holdForLiveReduce(
   carried: readonly string[],
   reduce: OrderTrack,
 ): Plan {
-  let state = incoming;
-  if (state.instanceState === "PARTIALLY_OPEN" || state.instanceState === "OPEN") {
-    // MOVE-SITE: reduceStillLive TRIGGERS: EXIT_TRIGGER_MET
-    const moved = move(state, "EXIT_TRIGGER_MET");
-    if (!moved.ok) {
-      return halted(state, moved.problem, []);
-    }
-    state = syncPlannedToWorking(moved.value, "EXIT");
+  const back = reenterExitStates(incoming);
+  if (!back.ok) {
+    return halted(incoming, back.problem, []);
   }
+  const state = back.value;
   const reasons = [...carried, REASONS.exitOrderWorking];
   const silenceBoundMs = reduce.placedAtMs + params.entry.execution.submission_unknown_after_ms;
   // The first instant the retirement rule could apply: strictly after the
@@ -2350,7 +2441,9 @@ function retireExpiredReduce(
   if (!neverNamed(track)) return null;
   if (observation.nowMs <= intentValidUntilMs(params, track)) return null;
   const cleared = withState(state, { exitOrder: null });
-  if (state.instanceState === "EXIT_PLANNED") {
+  // As in {@link settleTerminalOrder}: not into `OPEN` while an entry execution
+  // is unfolded (BR1-H1) — the late entry fill folds only from the exit states.
+  if (state.instanceState === "EXIT_PLANNED" && !entryExecutionUnfolded(state)) {
     // MOVE-SITE: exitIntentExpired TRIGGERS: EXIT_ABANDONED
     const moved = move(cleared, "EXIT_ABANDONED");
     if (moved.ok) {
@@ -2374,11 +2467,14 @@ function retireExpiredReduce(
  * - nothing resting answers `null`, which is the caller's licence to act.
  *
  * It withdraws the ENTRY track and a TAKE_PROFIT track, never this bracket's
- * own protective reduction (`BRACKET-1a`, D3; ruling R3). The one caller that
- * could place over a live reduction, {@link planProtectedReduce}, recognises it
- * first and holds; the two final policies that also call here
- * (`HOLD_TO_RESOLUTION`, `CANCEL_ONLY`) withdraw what they own and leave a
- * placed reduction to run to completion.
+ * own protective reduction (`BRACKET-1a`, D3; ruling R3). Every caller
+ * recognises a live reduction FIRST and holds through
+ * {@link holdForLiveReduce}: {@link planProtectedReduce}, and — since
+ * `BRACKET-1a` r1, finding BR1-M1 — the two final policies that also call here
+ * (`HOLD_TO_RESOLUTION`, `CANCEL_ONLY`), which used to return their own plain
+ * hold and so skipped ruling R2's silence transition and D3's
+ * `SB.EXIT_ORDER_WORKING` for a reduction placed before the cutoff. The filter
+ * below is the backstop, not the mechanism.
  */
 function withdrawResting(
   state: StaticBracketState,
@@ -2410,7 +2506,19 @@ function withdrawResting(
   ]);
 }
 
-/** End-of-market behaviour: the explicit configured policy (§13.3 rule 5). */
+/**
+ * End-of-market behaviour: the explicit configured policy (§13.3 rule 5).
+ *
+ * A protective reduction placed BEFORE the cutoff (by the stop or the holding
+ * timeout) is sticky under every policy (ruling R3), and it is held the ONE way
+ * a live reduction is held everywhere else — {@link holdForLiveReduce}, with
+ * the policy's own codes carried — so ruling R2's silence transition
+ * (`SUBMISSION_UNKNOWN`, reported as the entry reports it) and D3's
+ * `SB.EXIT_ORDER_WORKING` apply under `HOLD_TO_RESOLUTION` and `CANCEL_ONLY`
+ * exactly as under `PROTECTED_REDUCE` (`BRACKET-1a` r1, finding BR1-M1). Once
+ * such a reduction is retired by R2, `HOLD_TO_RESOLUTION` and `CANCEL_ONLY` do
+ * not re-plan it: neither policy places a reduction.
+ */
 function planFinalPolicy(
   params: StaticBracketParams,
   state: StaticBracketState,
@@ -2436,6 +2544,10 @@ function planFinalPolicy(
       // Permitted only because `allow_resolution_hold` is true; the
       // configuration grammar refuses the contradictory combination outright.
       const held = [...reasons, REASONS.finalHoldToResolution, REASONS.resolutionHoldAllowed];
+      const own = liveReduce(state);
+      if (own !== null) {
+        return holdForLiveReduce(params, state, observation, held, own);
+      }
       const withdrawal = withdrawResting(
         state,
         observation,
@@ -2446,6 +2558,10 @@ function planFinalPolicy(
     }
     default: {
       const cancelOnly = [...reasons, REASONS.finalCancelOnly];
+      const own = liveReduce(state);
+      if (own !== null) {
+        return holdForLiveReduce(params, state, observation, cancelOnly, own);
+      }
       const withdrawal = withdrawResting(
         state,
         observation,
@@ -2821,10 +2937,18 @@ function applyExitFill(
     flat ? "OBSERVED_FILLED" : "OBSERVED_PARTIALLY_FILLED",
   );
   if (!orderMoved.ok) return refuseTransition(state, observation, currentLeg(params, state));
+  // `BRACKET-1a` r1, BR1-H1: FLAT (every folded share has exited) is not
+  // FINISHED while the venue has reported more of the entry than the fill
+  // stream has delivered. Such a fold does not certify CLOSED: it takes the
+  // bracket's partial-fill edge, keeps the exit track (so its own terminal view
+  // still settles it by id), records no cool-down anchor, and says what it is
+  // waiting for. The late entry fill then folds from the exit states, and the
+  // ordinary ladder exits what it added.
+  const closes = flat && !entryExecutionUnfolded(state);
   const changes: Partial<StaticBracketState> = {
-    exitOrder: flat ? null : orderMoved.value,
+    exitOrder: closes ? null : orderMoved.value,
     exitedShares: exited.value,
-    ...(flat ? { closedAtMs: observation.nowMs } : {}),
+    ...(closes ? { closedAtMs: observation.nowMs } : {}),
   };
   if (state.instanceState === "PAUSED") {
     // `closedAtMs` is deliberately NOT recorded here: it is the cool-down
@@ -2837,11 +2961,19 @@ function applyExitFill(
     );
   }
   // MOVE-SITE: exitFill TRIGGERS: EXIT_FILL_COMPLETE EXIT_PARTIAL_FILL
-  const moved = move(state, flat ? "EXIT_FILL_COMPLETE" : "EXIT_PARTIAL_FILL", changes);
+  const moved = move(state, closes ? "EXIT_FILL_COMPLETE" : "EXIT_PARTIAL_FILL", changes);
   if (!moved.ok) {
     return refuseTransition(state, observation, currentLeg(params, state));
   }
-  return plan(moved.value, "hold", flat ? [REASONS.exitFilled, REASONS.closed] : [REASONS.exitFilled]);
+  return plan(
+    moved.value,
+    "hold",
+    closes
+      ? [REASONS.exitFilled, REASONS.closed]
+      : flat
+        ? [REASONS.exitFilled, REASONS.awaitingFillAllocation]
+        : [REASONS.exitFilled],
+  );
 }
 
 // ---------------------------------------------------------------------------

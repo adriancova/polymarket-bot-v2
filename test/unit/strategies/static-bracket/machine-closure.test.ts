@@ -487,7 +487,7 @@ const MOVE_SITES: readonly MoveSite[] = [
       ["PARTIALLY_OPEN", "OPEN", "EXIT_PLANNED", "EXIT_WORKING", "CLOSED"],
       ["MARKET_CLOSED"],
     ),
-    why: "guarded by !hasAllocation; a bracket state with a spent allocation reaches it and holds with SB.MARKET_CLOSED without transitioning",
+    why: "guarded by !hasAllocation (and, since BRACKET-1a r1, by no unfolded entry execution — which only narrows the site); a bracket state with a spent allocation reaches it and holds with SB.MARKET_CLOSED without transitioning",
   },
   {
     name: "arm",
@@ -572,10 +572,12 @@ const MOVE_SITES: readonly MoveSite[] = [
     why: "as above, through the stop, the holding timeout and the final policy; since BRACKET-1a the move also writes the reduction's order track (D1) — same site, same pairs",
   },
   {
-    name: "reduceStillLive",
+    // BRACKET-1a r1 renamed this site (it was `reduceStillLive`) when the
+    // second owed-exit case joined it: the pairs are unchanged.
+    name: "exitStillOwed",
     required: cross(["PARTIALLY_OPEN", "OPEN"], ["EXIT_TRIGGER_MET"]),
     tolerated: [],
-    why: "BRACKET-1a D4: a late ENTRY fill moved the bracket out of the exit states while its own protective reduction is live; holdForLiveReduce re-takes EXIT_TRIGGER_MET so the reduction's fill still folds. Guarded by an explicit instanceState check on exactly these two states",
+    why: "BRACKET-1a D4 and r1: a late ENTRY fill moved the bracket out of the exit states while an exit order can still fill — its own live protective reduction (holdForLiveReduce) or a terminal exit awaiting its fill (planTakeProfit's D6 hold); reenterExitStates re-takes EXIT_TRIGGER_MET so that fill still folds. Guarded by an explicit instanceState check on exactly these two states",
   },
   {
     name: "exitIntentExpired",

@@ -21,6 +21,12 @@
  * file LOADS against the base sources and against the scoping's track-only
  * "variant A", and each pin fails there on the behaviour it is about — the
  * handoff names which.
+ *
+ * REVIEW ROUND 1 added two blocks near the end, each driven by the shipped
+ * callbacks alone (no seeded state): BR1-H1 (an entry the venue reported ahead
+ * of its fold is never discarded and never closed over) and BR1-M1 (R2's
+ * silence transition and D3's working reason hold under every final policy).
+ * Both fail against the round-0 candidate `dcba8ad`.
  */
 
 import { describe, expect, it } from "vitest";
@@ -95,6 +101,17 @@ const REFUSED_MAXIMUM_ENTRIES = "SB.REFUSED_MAXIMUM_ENTRIES";
 const REFUSED_COOLDOWN = "SB.REFUSED_COOLDOWN";
 const REARMED = "SB.REARMED";
 const IDLE = "SB.IDLE";
+const ALLOCATED = "SB.ALLOCATION_CONFIRMED";
+const ENTRY_ORDER_WORKING = "SB.ENTRY_ORDER_WORKING";
+const ENTRY_ORDER_TERMINAL = "SB.ENTRY_ORDER_TERMINAL";
+const TAKE_PROFIT_INTENT = "SB.TAKE_PROFIT_INTENT";
+const ILLEGAL_TRANSITION = "SB.ILLEGAL_TRANSITION";
+const MARKET_CLOSED = "SB.MARKET_CLOSED";
+const RESUMED = "SB.RESUMED";
+const FILL_FOLDED_WHILE_PAUSED = "SB.FILL_FOLDED_WHILE_PAUSED";
+const FINAL_HOLD_TO_RESOLUTION = "SB.FINAL_HOLD_TO_RESOLUTION";
+const RESOLUTION_HOLD_ALLOWED = "SB.RESOLUTION_HOLD_ALLOWED";
+const FINAL_CANCEL_ONLY = "SB.FINAL_CANCEL_ONLY";
 // New in BRACKET-1a (D8), pinned to their strings in the vocabulary block.
 const PROTECTED_REDUCE = "SB.PROTECTED_REDUCE";
 const EXIT_INTENT_EXPIRED = "SB.EXIT_INTENT_EXPIRED";
@@ -786,6 +803,10 @@ describe("R3 / D4 — the reduction is sticky, and a take-profit is sized by wha
     expect(atClose.decisionType).toBe("hold");
     expect(cancels(atClose)).toHaveLength(0);
     expect(b.exit()?.state).toBe("WORKING");
+    // Review round 1 (BR1-M1): held the one way a live reduction is held
+    // everywhere, so it says so (D3's code) — the round-0 candidate returned
+    // the policy's bare hold here.
+    expect(atClose.reasonCodes).toEqual([EXIT_CUTOFF, FINAL_CANCEL_ONLY, EXIT_ORDER_WORKING]);
   });
 });
 
@@ -1228,6 +1249,11 @@ describe("a late ENTRY fill after the reduction was placed", () => {
   it("returns the bracket to the exit states, places nothing beside the reduction, and the reduction's fill still folds", () => {
     // The entry's view said FILLED 50 while only 30 were delivered; a lagging
     // position view (30) let the stop reduce the 30 it knew about.
+    //
+    // This case SEEDS that state. Review round 1 (BR1-H1) showed the round-0
+    // candidate never reached it through the callbacks — its entry settlement
+    // cleared this very entry track — so the block "BR1-H1" below drives the
+    // same situation from a fresh bracket, callbacks only.
     const state = openBracket({
       instanceState: "EXIT_PLANNED",
       allocatedShares: "30",
@@ -1285,6 +1311,379 @@ describe("a late ENTRY fill after the reduction was placed", () => {
     expect(positions(rest).map(sharesOf)).toEqual(["-20"]);
     expectNeverPaused(b);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Review round 1, BR1-H1 — an entry reported ahead of its fold (callbacks only)
+// ---------------------------------------------------------------------------
+
+describe("BR1-H1 — an entry execution the venue reported but the fill stream has not delivered is never discarded, and never closed over", () => {
+  /**
+   * The reviewer's steps 1-6, from a fresh bracket: a 50-share entry fills 30,
+   * its take-profit of 30 is seen, the stop withdraws both, and the entry's
+   * FILLED view reports 50 BEFORE its last 20-share fill (the position view
+   * still says 30). The stop then reduces the 30 it knows about.
+   */
+  function reportedAheadOfFold(b: Bracket): DecisionResult {
+    reportedThenTakeProfitSettled(b);
+    // 6. The stop reduces the 30 it knows about.
+    const reduce = b.features({ now: at("12:00:06.000"), yesShares: "30", features: STOPPED });
+    expect(reduce.reasonCodes).toEqual([STOP_TRIGGERED, EXIT_SIZED, PROTECTED_REDUCE]);
+    expect(positions(reduce).map(sharesOf)).toEqual(["-30"]);
+    return reduce;
+  }
+
+  /** Steps 1-5 of {@link reportedAheadOfFold}. */
+  function reportedThenTakeProfitSettled(b: Bracket): void {
+    b.start({ now: at("12:00:01.000") });
+    b.features({ now: at("12:00:02.000") });
+    // 1. The first 30 of the entry.
+    const first = b.fill({ now: at("12:00:03.000"), yesShares: "30" }, { shares: "30", price: "0.34" });
+    expect(first.reasonCodes).toEqual([ALLOCATED, TAKE_PROFIT_INTENT, EXIT_SIZED]);
+    expect(b.state.entryOrder).toMatchObject({ orderId: "order-1", state: "WORKING", filledShares: "30" });
+    // 2. The proportional 30-share take-profit is seen OPEN.
+    b.update({ now: at("12:00:03.000"), yesShares: "30" }, { ...TP_VIEW, requestedShares: "30", status: "OPEN" });
+    // 3. The stop withdraws the entry AND the take-profit.
+    const withdraw = b.features({ now: at("12:00:04.000"), yesShares: "30", features: STOPPED });
+    const [cancel] = cancels(withdraw);
+    expect(cancel?.type === "CANCEL" && cancel.orderIds).toEqual(["order-1", "order-2"]);
+    // 4. The entry's FILLED view reports 50; only 30 are folded. The track is KEPT.
+    const reported = b.update(
+      { now: at("12:00:04.500"), yesShares: "30" },
+      { orderId: "order-1", status: "FILLED", filledShares: "50" },
+    );
+    expect(reported.reasonCodes).toEqual([ENTRY_ORDER_WORKING, ENTRY_ORDER_TERMINAL, AWAITING_FILL]);
+    expect(b.state.entryOrder).toMatchObject({
+      orderId: "order-1",
+      state: "FILLED",
+      filledShares: "30",
+      viewFilledShares: "50",
+    });
+    // 5. The take-profit's cancel is confirmed. The bracket stays in an exit
+    // state — §13.3 folds no entry fill out of OPEN.
+    b.update({ now: at("12:00:05.000"), yesShares: "30" }, { ...TP_VIEW, requestedShares: "30", status: "CANCELED" });
+    expect(b.state).toMatchObject({ instanceState: "EXIT_WORKING", exitOrder: null });
+  }
+
+  it("the late 20 lands BETWEEN the take-profit's settlement and the stop's reduction: it folds (OPEN would refuse it)", () => {
+    const b = new Bracket(params());
+    reportedThenTakeProfitSettled(b);
+    // Had step 5 moved the bracket to OPEN, this fill would be the census's
+    // designed refusal (OPEN --ENTRY_FILL_COMPLETE--> does not exist):
+    // ILLEGAL_TRANSITION, PAUSED, and the 20 shares never folded.
+    const late = b.fill(
+      { now: at("12:00:05.500"), yesShares: "50", features: STOPPED },
+      { orderId: "order-1", shares: "20", price: "0.35" },
+    );
+    expect(late.reasonCodes[0]).toBe(ALLOCATED);
+    expect(b.state).toMatchObject({ allocatedShares: "50" });
+    expect(b.state.entryOrder).toMatchObject({ filledShares: "50", viewFilledShares: "50" });
+    // (A late ENTRY fill is followed by take-profit maintenance, as it always
+    // was; the stop then withdraws that and reduces all 50.)
+    b.update(
+      { now: at("12:00:06.000"), yesShares: "50" },
+      { orderId: "order-4", side: "SELL", price: "0.5", requestedShares: "50", status: "OPEN" },
+    );
+    b.features({ now: at("12:00:07.000"), yesShares: "50", features: STOPPED });
+    b.update(
+      { now: at("12:00:07.000"), yesShares: "50" },
+      { orderId: "order-4", side: "SELL", price: "0.5", requestedShares: "50", status: "CANCELED" },
+    );
+    const reduce = b.features({ now: at("12:00:08.000"), yesShares: "50", features: STOPPED });
+    expect(positions(reduce).map(sharesOf)).toEqual(["-50"]);
+    const done = b.fill(
+      { now: at("12:00:09.000"), yesShares: "0", features: STOPPED },
+      { orderId: "order-5", side: "SELL", price: "0.27", shares: "50" },
+    );
+    expect(done.reasonCodes).toEqual([EXIT_FILLED, CLOSED]);
+    expect(b.codes()).not.toContain(ILLEGAL_TRANSITION);
+    expectNeverPaused(b);
+  });
+
+  it("the reviewer's sequence: the late 20 folds BY ID into the kept entry track, and the bracket exits all 50 before it is CLOSED", () => {
+    const b = new Bracket(params());
+    reportedAheadOfFold(b);
+    // 7. The late BUY 20, position view 50.
+    const late = b.fill(
+      { now: at("12:00:07.000"), yesShares: "50", features: STOPPED },
+      { orderId: "order-1", shares: "20", price: "0.35" },
+    );
+    expect(late.reasonCodes).toEqual([ALLOCATED, EXIT_ORDER_WORKING]);
+    expect(b.state).toMatchObject({ instanceState: "EXIT_PLANNED", allocatedShares: "50", exitedShares: "0" });
+    expect(b.state.entryOrder).toMatchObject({ filledShares: "50", viewFilledShares: "50" });
+    // 8. The reduction's SELL 30, position view 20: folded, and 20 remain open.
+    const reduced = b.fill(
+      { now: at("12:00:08.000"), yesShares: "20", features: STOPPED },
+      { orderId: "order-3", side: "SELL", price: "0.27", shares: "30" },
+    );
+    expect(reduced.reasonCodes).toEqual([EXIT_FILLED]);
+    expect(b.state).toMatchObject({
+      instanceState: "EXIT_WORKING",
+      allocatedShares: "50",
+      exitedShares: "30",
+      closedAtMs: null,
+    });
+    // 9. Fresh data: the reduction is held until its own FILLED view settles it…
+    const held = b.features({ now: at("12:00:09.000"), yesShares: "20", features: STOPPED });
+    expect(held.reasonCodes).toEqual([STOP_TRIGGERED, EXIT_ORDER_WORKING]);
+    b.update(
+      { now: at("12:00:09.000"), yesShares: "20" },
+      { ...REDUCE_VIEW, requestedShares: "30", filledShares: "30", status: "FILLED" },
+    );
+    // …and the stop then reduces the 20 the late fill added — a remaining exit.
+    const rest = b.features({ now: at("12:00:10.000"), yesShares: "20", features: STOPPED });
+    expect(rest.decisionType).toBe("reduce");
+    expect(positions(rest).map(sharesOf)).toEqual(["-20"]);
+    const last = b.fill(
+      { now: at("12:00:11.000"), yesShares: "0", features: STOPPED },
+      { orderId: "order-4", side: "SELL", price: "0.27", shares: "20" },
+    );
+    expect(last.reasonCodes).toEqual([EXIT_FILLED, CLOSED]);
+    expect(b.state).toMatchObject({ instanceState: "CLOSED", allocatedShares: "50", exitedShares: "50" });
+    // CLOSED was said once, at the end, with nothing held.
+    expect(b.codes().filter((code) => code === CLOSED)).toHaveLength(1);
+    expect(b.codes()).not.toContain(ILLEGAL_TRANSITION);
+    expectNeverPaused(b);
+  });
+
+  it("the reduction's fill lands FIRST: flat on what is folded is not CLOSED while 20 more were reported", () => {
+    const b = new Bracket(params());
+    reportedAheadOfFold(b);
+    const flat = b.fill(
+      { now: at("12:00:07.000"), yesShares: "20", features: STOPPED },
+      { orderId: "order-3", side: "SELL", price: "0.27", shares: "30" },
+    );
+    // The round-0 candidate said [EXIT_FILLED, CLOSED] here, holding 20.
+    expect(flat.reasonCodes).toEqual([EXIT_FILLED, AWAITING_FILL]);
+    expect(b.state).toMatchObject({ instanceState: "EXIT_WORKING", exitedShares: "30", closedAtMs: null });
+    // An evaluation does not close it either.
+    const waiting = b.features({ now: at("12:00:08.000"), yesShares: "20", features: STOPPED });
+    expect(waiting.reasonCodes).toEqual([EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+    expect(waiting.intents).toHaveLength(0);
+    expect(b.state.instanceState).toBe("EXIT_WORKING");
+    // The late 20 folds from the exit state, and the ladder exits it.
+    const late = b.fill(
+      { now: at("12:00:09.000"), yesShares: "20" },
+      { orderId: "order-1", shares: "20", price: "0.35" },
+    );
+    expect(late.reasonCodes).toEqual([ALLOCATED, TAKE_PROFIT_INTENT, EXIT_SIZED]);
+    expect(positions(late).map(sharesOf)).toEqual(["-20"]);
+    expect(b.state).toMatchObject({ allocatedShares: "50", exitedShares: "30" });
+    b.update(
+      { now: at("12:00:09.000"), yesShares: "20" },
+      { orderId: "order-4", side: "SELL", price: "0.5", requestedShares: "20", status: "OPEN" },
+    );
+    const done = b.fill(
+      { now: at("12:00:10.000"), yesShares: "0" },
+      { orderId: "order-4", side: "SELL", price: "0.5", shares: "20" },
+    );
+    expect(done.reasonCodes).toEqual([EXIT_FILLED, CLOSED]);
+    expect(b.codes().filter((code) => code === CLOSED)).toHaveLength(1);
+    expectNeverPaused(b);
+  });
+
+  it("the paused-fold-then-resume route (the reviewer's steps 8-9 as run): resume does not certify CLOSED", () => {
+    const STALE_BOOK = { bids: [["0.34", "2000"]], asks: [["0.35", "2000"]], asOf: at("12:00:00.000") } as const;
+    const b = new Bracket(params());
+    reportedAheadOfFold(b);
+    b.update(
+      { now: at("12:00:06.500"), yesShares: "30", features: STOPPED },
+      { ...REDUCE_VIEW, requestedShares: "30", status: "OPEN" },
+    );
+    const incident = b.features({
+      now: at("12:00:07.000"),
+      yesShares: "30",
+      features: STOPPED,
+      yes: STALE_BOOK as never,
+    });
+    expect(incident.reasonCodes).toContain(PAUSED);
+    expect(b.state.instanceState).toBe("PAUSED");
+    // The cancel lost the race: the reduction's 30 fold while PAUSED.
+    const paused = b.fill(
+      { now: at("12:00:07.500"), yesShares: "20", yes: STALE_BOOK as never },
+      { orderId: "order-3", side: "SELL", price: "0.27", shares: "30" },
+    );
+    expect(paused.reasonCodes).toEqual([EXIT_FILLED, FILL_FOLDED_WHILE_PAUSED, PAUSED]);
+    // Fresh data. Every FOLDED share has exited; the venue reported 20 more.
+    // The round-0 candidate answered [RESUMED, CLOSED] here, holding 20.
+    const resumed = b.features({ now: at("12:00:08.000"), yesShares: "20" });
+    expect(resumed.reasonCodes).toEqual([RESUMED, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+    expect(b.state.instanceState).toBe("EXIT_WORKING");
+    expect(b.state.closedAtMs).toBeNull();
+    // The late fill folds, and the bracket has a remaining exit.
+    const late = b.fill(
+      { now: at("12:00:09.000"), yesShares: "20" },
+      { orderId: "order-1", shares: "20", price: "0.35" },
+    );
+    expect(late.reasonCodes[0]).toBe(ALLOCATED);
+    expect(positions(late).map(sharesOf)).toEqual(["-20"]);
+    expect(b.state).toMatchObject({ allocatedShares: "50", exitedShares: "30" });
+    expect(b.codes()).not.toContain(CLOSED);
+    expect(b.codes()).not.toContain(UNATTRIBUTED_FILL);
+    expect(b.codes()).not.toContain(ILLEGAL_TRANSITION);
+  });
+
+  it("the market-closed shortcut does not close an entry whose view outran its fill; the fill then folds", () => {
+    const b = new Bracket(params());
+    b.start({ now: at("12:00:01.000") });
+    b.features({ now: at("12:00:02.000") });
+    const reported = b.update(
+      { now: at("12:00:02.000"), yesShares: "50" },
+      { orderId: "order-1", status: "FILLED", filledShares: "50" },
+    );
+    expect(reported.reasonCodes).toEqual([ENTRY_ORDER_WORKING, ENTRY_ORDER_TERMINAL, AWAITING_FILL]);
+    // The market is over before the fill is delivered: nothing FOLDED, 50 REPORTED.
+    const over = b.closing({ now: at("12:15:00.000"), yesShares: "50" }, 0);
+    expect(over.reasonCodes).not.toContain(MARKET_CLOSED);
+    expect(over.reasonCodes).toEqual([ENTRY_ORDER_TERMINAL, AWAITING_FILL]);
+    expect(b.state).toMatchObject({ instanceState: "ENTRY_PLANNED", closedAtMs: null });
+    // The fill folds (from CLOSED it was an ILLEGAL_TRANSITION pause, unfolded).
+    const fill = b.fill({ now: at("12:15:00.500"), yesShares: "50" }, {});
+    expect(fill.reasonCodes[0]).toBe(ALLOCATED);
+    expect(b.state.allocatedShares).toBe("50");
+    // …and the close policy governs what is now held.
+    const policy = b.closing({ now: at("12:15:01.000"), yesShares: "50" }, 0);
+    expect(policy.reasonCodes).toContain(EXIT_CUTOFF);
+    expect(b.codes()).not.toContain(ILLEGAL_TRANSITION);
+    expectNeverPaused(b);
+  });
+
+  it("a terminal REDUCTION awaiting its fill, then the late entry fill: back into the exit states, and the sale still folds", () => {
+    // The reviewer's residual, reached through callbacks: at the round-0
+    // candidate the late entry fill moved the bracket to OPEN and the
+    // reduction's own fill was then refused as an ILLEGAL_TRANSITION.
+    const b = new Bracket(params());
+    reportedAheadOfFold(b);
+    b.update(
+      { now: at("12:00:06.500"), yesShares: "30" },
+      { ...REDUCE_VIEW, requestedShares: "30", status: "OPEN" },
+    );
+    const sold = b.update(
+      { now: at("12:00:07.000"), yesShares: "30" },
+      { ...REDUCE_VIEW, requestedShares: "30", filledShares: "30", status: "FILLED" },
+    );
+    expect(sold.reasonCodes).toEqual([EXIT_ORDER_WORKING, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+    const late = b.fill(
+      { now: at("12:00:08.000"), yesShares: "50" },
+      { orderId: "order-1", shares: "20", price: "0.35" },
+    );
+    expect(late.reasonCodes).toEqual([ALLOCATED, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+    expect(b.state).toMatchObject({ instanceState: "EXIT_PLANNED", allocatedShares: "50" });
+    const sale = b.fill(
+      { now: at("12:00:09.000"), yesShares: "20" },
+      { orderId: "order-3", side: "SELL", price: "0.27", shares: "30" },
+    );
+    expect(sale.reasonCodes).toEqual([EXIT_FILLED]);
+    expect(b.state).toMatchObject({ instanceState: "EXIT_WORKING", exitedShares: "30" });
+    const rest = b.features({ now: at("12:00:10.000"), yesShares: "20", features: STOPPED });
+    expect(rest.reasonCodes).toEqual([EXIT_ORDER_TERMINAL, STOP_TRIGGERED, EXIT_SIZED, PROTECTED_REDUCE]);
+    expect(positions(rest).map(sharesOf)).toEqual(["-20"]);
+    expect(b.codes()).not.toContain(ILLEGAL_TRANSITION);
+    expectNeverPaused(b);
+  });
+
+  it("the same for a terminal TAKE-PROFIT awaiting its fill when the entry's own remainder fills", () => {
+    // Independent of the entry-track retention: the entry here is still
+    // working, and its ordinary second fill lands while the take-profit's
+    // FILLED view is ahead of the take-profit's fill (D6). At the round-0
+    // candidate the bracket stayed in OPEN and the sale was refused.
+    const b = new Bracket(params());
+    b.start({ now: at("12:00:01.000") });
+    b.features({ now: at("12:00:02.000") });
+    b.fill({ now: at("12:00:03.000"), yesShares: "30" }, { shares: "30", price: "0.34" });
+    b.update({ now: at("12:00:03.000"), yesShares: "30" }, { ...TP_VIEW, requestedShares: "30", status: "OPEN" });
+    const tpSold = b.update(
+      { now: at("12:00:04.000"), yesShares: "0" },
+      { ...TP_VIEW, requestedShares: "30", filledShares: "30", status: "FILLED" },
+    );
+    expect(tpSold.reasonCodes).toEqual([EXIT_ORDER_WORKING, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+    const more = b.fill({ now: at("12:00:05.000"), yesShares: "20" }, { shares: "20", price: "0.35" });
+    expect(more.reasonCodes).toEqual([ALLOCATED, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+    expect(b.state).toMatchObject({ instanceState: "EXIT_PLANNED", allocatedShares: "50" });
+    const tpFill = b.fill(
+      { now: at("12:00:06.000"), yesShares: "20" },
+      { orderId: "order-2", side: "SELL", price: "0.5", shares: "30" },
+    );
+    expect(tpFill.reasonCodes).toEqual([EXIT_FILLED]);
+    expect(b.state).toMatchObject({ instanceState: "EXIT_WORKING", exitedShares: "30" });
+    const next = b.features({ now: at("12:00:07.000"), yesShares: "20" });
+    expect(next.reasonCodes).toEqual([EXIT_ORDER_TERMINAL, TAKE_PROFIT_INTENT, EXIT_SIZED]);
+    expect(positions(next).map(sharesOf)).toEqual(["-20"]);
+    expect(b.codes()).not.toContain(ILLEGAL_TRANSITION);
+    expectNeverPaused(b);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review round 1, BR1-M1 — R2 and D3 under every final policy
+// ---------------------------------------------------------------------------
+
+describe("BR1-M1 — a live reduction is held the same way under HOLD_TO_RESOLUTION and CANCEL_ONLY", () => {
+  // baseConfig: close 12:15:00, exit cutoff 20 s (12:14:40), silence bound
+  // 5 000 ms, validity 30 000 ms. The reviewer's instants.
+  const policies = [
+    {
+      policy: "HOLD_TO_RESOLUTION",
+      config: { "exit.final_policy": "HOLD_TO_RESOLUTION", "exit.allow_resolution_hold": true },
+      codes: [EXIT_CUTOFF, FINAL_HOLD_TO_RESOLUTION, RESOLUTION_HOLD_ALLOWED],
+    },
+    {
+      policy: "CANCEL_ONLY",
+      config: { "exit.final_policy": "CANCEL_ONLY" },
+      codes: [EXIT_CUTOFF, FINAL_CANCEL_ONLY],
+    },
+  ] as const;
+
+  for (const testCase of policies) {
+    it(`${testCase.policy}: an unanswered stop reduction goes SUBMISSION_UNKNOWN at the silence bound inside the cutoff, and is retired only after validUntil`, () => {
+      const b = new Bracket(
+        params(configWith(testCase.config)),
+        openBracket({ openedAtMs: instantMs(at("12:14:30.000")) }),
+      );
+      const placed = b.features({ now: at("12:14:39.000"), yesShares: "50", features: STOPPED });
+      expect(placed.reasonCodes).toEqual([STOP_TRIGGERED, EXIT_SIZED, PROTECTED_REDUCE]);
+
+      // Inside the cutoff, before the silence bound: held, and it says so.
+      const early = b.features({ now: at("12:14:41.000"), yesShares: "50", features: STOPPED });
+      expect(early.reasonCodes).toEqual([...testCase.codes, EXIT_ORDER_WORKING]);
+      expect(early.nextWakeupAt).toBe(at("12:14:44.000"));
+      expect(b.exit()?.state).toBe("PENDING");
+
+      // The reviewer's evaluation: 12:14:45, six seconds of silence.
+      const unknown = b.features({ now: at("12:14:45.000"), yesShares: "50", features: STOPPED });
+      expect(unknown.decisionType).toBe("hold");
+      expect(unknown.reasonCodes).toEqual([
+        ...testCase.codes,
+        EXIT_ORDER_WORKING,
+        EXIT_SUBMISSION_UNKNOWN,
+        AWAITING_RECONCILIATION,
+      ]);
+      expect(unknown.modelOutputs).toEqual({ submissionUnknown: true });
+      expect(unknown.intents).toHaveLength(0);
+      expect(b.exit()?.state).toBe("SUBMISSION_UNKNOWN");
+
+      // Through onMarketClosing, and past the close, up to and INCLUDING validUntil.
+      const closing = b.closing({ now: at("12:14:50.000"), yesShares: "50" }, 10);
+      const atValidUntil = b.features({ now: at("12:15:09.000"), yesShares: "50" });
+      for (const held of [closing, atValidUntil]) {
+        expect(held.reasonCodes).toEqual([
+          ...testCase.codes,
+          EXIT_ORDER_WORKING,
+          EXIT_SUBMISSION_UNKNOWN,
+          AWAITING_RECONCILIATION,
+        ]);
+        expect(held.intents).toHaveLength(0);
+      }
+
+      // Strictly after validUntil it is retired, and neither policy places a
+      // reduction in its stead.
+      const retired = b.features({ now: at("12:15:09.001"), yesShares: "50" });
+      expect(retired.reasonCodes).toEqual([EXIT_INTENT_EXPIRED, ...testCase.codes]);
+      expect(retired.intents).toHaveLength(0);
+      expect(b.exit()).toBeNull();
+      expectNeverPaused(b);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

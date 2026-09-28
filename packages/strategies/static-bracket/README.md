@@ -207,8 +207,12 @@ are:
   cancel of it, no take-profit beside it. A stop that clears does not withdraw
   it (take-profit maintenance holds with `SB.EXIT_ORDER_WORKING` and never
   cancels it); a later cause does not replace it; the `CANCEL_ONLY` and
-  `HOLD_TO_RESOLUTION` final policies withdraw what they own and leave it
-  working.
+  `HOLD_TO_RESOLUTION` final policies leave it working and hold it exactly as
+  every other path does — `SB.EXIT_ORDER_WORKING`, and R2's silence transition
+  below — rather than with their own bare hold (review round 1, BR1-M1: a
+  reduction placed by the stop before the cutoff used to stay `PENDING` for
+  good under those two policies). Once R2 retires such a reduction, neither
+  policy places another: neither places reductions.
 - **It is never re-priced, and there is NO exit escalation.** A resting
   remainder keeps its floor (`exit.stop.minimum_sell_price`) until it fills or
   ends; nothing in this package makes it more aggressive over time. (That was
@@ -219,7 +223,9 @@ are:
   the instance pauses), a position reconciliation (`SB.POSITION_MISMATCH` /
   `SB.NO_BLIND_FLATTEN`), and `onStop`. A fill that arrives while the instance
   is paused is folded (obligation 8), and resuming on a flat allocation closes
-  the bracket. An end the order meets OUTSIDE this package (the venue, or the
+  the bracket — unless an entry execution the venue reported is still unfolded
+  (next-but-one bullet). An end the order meets OUTSIDE this package (the
+  venue, or the
   plan's own deadline under `escalation.atDeadline: CANCEL_REMAINING`) is a
   terminal state like any other: once its view arrives and its fills are
   folded (the settlement waits for them), the track is settled and the ladder
@@ -228,7 +234,34 @@ are:
   after the reduction settles, still under `positionAgrees`; meanwhile the
   instance is returned to the exit states (`EXIT_TRIGGER_MET`) so the
   reduction's own fill still folds instead of being refused as an illegal
-  transition.
+  transition. The same walk-back applies to an exit of either role that is
+  terminal on the venue but still awaiting its fill (see "An exit terminal on
+  the venue waits for its fill" below).
+- **A late ENTRY fill is never discarded, and the bracket is never closed over
+  it** (review round 1, BR1-H1). The protective reduction is sized from the
+  FOLDED allocation (§13.3 rule 1), so an entry whose view reported more than
+  had been folded — e.g. `FILLED 50` with 30 delivered — is exactly the case in
+  which the reduction names less than is held. The round-0 candidate cleared
+  such an entry track as soon as anything was folded; the late 20 then matched
+  no track, and once the reduction's own fill was attributed the bracket
+  reached a false `CLOSED` holding 20. Now, while an entry's view is ahead of
+  its fold: the entry track is KEPT (`SB.ENTRY_ORDER_TERMINAL`,
+  `SB.AWAITING_FILL_ALLOCATION`) and the late fill folds into it BY ORDER ID;
+  NO path certifies `CLOSED` — a flat fold of the folded allocation takes the
+  partial-fill edge and holds `SB.AWAITING_FILL_ALLOCATION`, and neither the
+  zero-open ladder branch (the paused-fold -> resume route) nor the
+  market-closed shortcut closes it; and settling an exit does not move the
+  bracket into `OPEN` — §13.3 folds an entry fill out of the entry states,
+  `PARTIALLY_OPEN` and the exit states, but has no such edge out of `OPEN`.
+  The ladder then exits what the late fill added, as an ordinary exit.
+  NOT covered, and unchanged from base: a fill for an entry order that is still
+  LIVE when the bracket is already `OPEN` (a withdrawn entry whose cancel loses
+  the race after the take-profit's settlement moved the bracket to `OPEN`) is
+  still the census's designed refusal — `SB.ILLEGAL_TRANSITION`, paused,
+  fail-closed, the fill unfolded — because `OPEN --ENTRY_*-->` is not a §13.3
+  edge and this round adds none. (With `convert_to_aggressive_after_ms: 0`, as
+  in §13.2's example, the entry is emitted as an immediate order of the
+  configured `immediate_order_type`, `FAK` there, which does not rest.)
 - **Nobody answers (R2).** A reduction still `PENDING` after
   `submission_unknown_after_ms` becomes `SUBMISSION_UNKNOWN`
   (`PENDING --SILENCE_EXCEEDED-->`), reported exactly as the entry reports it —
@@ -372,13 +405,19 @@ here because a wiring that breaks one produces a *quiet* misbehaviour.
    allocation.** §8.1 guarantees no ordering between a view and the fill it
    describes, so a view reporting a filled size before its fill arrives puts the
    instance into an *awaiting-the-fill* posture (`SB.AWAITING_FILL_ALLOCATION`)
-   rather than back into `ARMED`. Since `BRACKET-1a` the same holds for an EXIT
-   order the venue reports terminal: while its view reports more executed than
-   has been folded, the track is kept, no exit is sized, and the late fill folds
-   by its order id. The exit is still sized only from the confirmed fill fold
-   (§13.3 rule 1). A root that reports filled sizes on views it never backs with
-   a fill will leave an instance waiting; a root that never reports them simply
-   loses the evidence and behaves as before.
+   rather than back into `ARMED`. For the ENTRY this holds whenever the view is
+   AHEAD of the fold, whether or not part of the entry was already folded
+   (`BRACKET-1a` review round 1, BR1-H1 — it used to hold only when nothing
+   was), and while it holds the bracket is never certified `CLOSED`. Since
+   `BRACKET-1a` the same holds for an EXIT order the venue reports terminal:
+   while its view reports more executed than has been folded, the track is
+   kept, no exit is sized, and the late fill folds by its order id. The exit is
+   still sized only from the confirmed fill fold (§13.3 rule 1). A root that
+   reports filled sizes on views it never backs with a fill will leave an
+   instance waiting — since review round 1 that includes an instance that has
+   exited everything it folded, which waits in its exit state instead of
+   closing; a root that never reports them simply loses the evidence and
+   behaves as before.
 8. **A confirmed fill is delivered even while the instance is PAUSED**, and is
    folded into the allocation there (`SB.FILL_FOLDED_WHILE_PAUSED`). The fold is
    settlement accounting, not a transition: the instance stays PAUSED, emits
