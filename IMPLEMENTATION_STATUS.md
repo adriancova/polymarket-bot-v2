@@ -2,7 +2,7 @@
 
 Last updated: 2026-09-15  
 Specification version: 2.0.0  
-Current phase: `phase-2` — deterministic paper core. **Wave 2 package work COMPLETE** (batches 2A-2G: WP-150/WP-170/WP-200/WP-180, WP-160/WP-190, WP-210, WP-220, WP-230, WP-240, WP-250, all merged and verified as ancestors of `main`; the inherited-`toJSON` sweep `SER-0` `9a44167` and its rounds `SER-1` `c065d63`, `SER-2` `0d8b6a0`, `SER-3` `603a49c` also complete). **Wave 2 is NOT closed out.** The runbook §10 read-only closeout audit WAS run on 2026-09-15 as `GOV-2B` (`b9bacc1`; record `docs/handoffs/GOV-2B-wave-2-closeout.md`), verdict **WAVE 2 IS NOT CLOSED**: every package met its own criteria and three COMPOSITION seams failed. **As of 2026-09-17 (`main` at the `UNIV-4` flip) every AGENT-closable closeout blocker is closed** — B1 (`TRDR-2`), B2 (`RISK-2`), B6/B7 (`GATE-1`), B8 (`GOV-2C`), B9 (`BOOT-1`), B5's code half (`TRDR-3`), G-01 (`VENUE-2`), B10 (`UNIV-4`); B3 is NARROWED (`BACKTEST-1`; needs ruling H8). **What remains is human or a ruling**: B4/H1 the live-data paper run (now attemptable, never attempted), B5's infra half/H3 (a real Prometheus + Grafana + import), H2 a real CI run (DISCHARGED 2026-09-26 by `CI-1`: PR #1 run `36282501033`, all gates green on GitHub), H4 elapsed soak evidence, H5 the runbook :509-vs-:514 ruling, H7 ratifications, H8 the composition-layer ruling, and §5 item 6's owner — enumerated in `## Open blockers` and handed over in `docs/handoffs/WAVE-2-HANDOVER.md`. What "COMPLETE" means and does not mean is stated in `## Wave 2 qualification` below. §7 checklist item 1 stays OPEN until a fresh closeout grades it. The user's 1a/1b/1c track is COMPLETE: `BRACKET-1a` (`11969f3`) makes the instance end CLOSED on its own exit; `BRACKET-1b` (`7252150`) records a two-bracket run with a FILLED take-profit, reconciled per bracket; and `BRACKET-1c` (`6e06c50`) runs the same round trip durably, through real PostgreSQL and Redis and the real composition root. `BRACKET-1c` also found `BRACKET1C-SNAPKEY`: the durable trader halts when one instant holds two fills. `SNAP-1` is fixing it. The trader's shipped bundle also crashes at load (`BUNDLE-1`). Both block H1. Items 4 and 5 stay NOT MET on their human halves; item 4's replay half is ACCEPTED AS QUALIFIED in the interim, per H8. WP-260 and the eight remaining phase-3 packages stay deferred to Wave 3. *(This sentence was REWRITTEN 2026-09-17 at the `UNIV-4` flip, replacing rather than appending — per `GOV-2C`'s own residual on this line; the superseded sentence, with its two strikes and two dated notes, is preserved verbatim under `## Wave 2 qualification`, "Superseded header sentences".)*  
+Current phase: `phase-2` — deterministic paper core. **Wave 2 package work COMPLETE** (batches 2A-2G: WP-150/WP-170/WP-200/WP-180, WP-160/WP-190, WP-210, WP-220, WP-230, WP-240, WP-250, all merged and verified as ancestors of `main`; the inherited-`toJSON` sweep `SER-0` `9a44167` and its rounds `SER-1` `c065d63`, `SER-2` `0d8b6a0`, `SER-3` `603a49c` also complete). **Wave 2 is NOT closed out.** The runbook §10 read-only closeout audit WAS run on 2026-09-15 as `GOV-2B` (`b9bacc1`; record `docs/handoffs/GOV-2B-wave-2-closeout.md`), verdict **WAVE 2 IS NOT CLOSED**: every package met its own criteria and three COMPOSITION seams failed. **As of 2026-09-17 (`main` at the `UNIV-4` flip) every AGENT-closable closeout blocker is closed** — B1 (`TRDR-2`), B2 (`RISK-2`), B6/B7 (`GATE-1`), B8 (`GOV-2C`), B9 (`BOOT-1`), B5's code half (`TRDR-3`), G-01 (`VENUE-2`), B10 (`UNIV-4`); B3 is NARROWED (`BACKTEST-1`; needs ruling H8). **What remains is human or a ruling**: B4/H1 the live-data paper run (now attemptable, never attempted), B5's infra half/H3 (a real Prometheus + Grafana + import), H2 a real CI run (DISCHARGED 2026-09-26 by `CI-1`: PR #1 run `36282501033`, all gates green on GitHub), H4 elapsed soak evidence, H5 the runbook :509-vs-:514 ruling, H7 ratifications, H8 the composition-layer ruling, and §5 item 6's owner — enumerated in `## Open blockers` and handed over in `docs/handoffs/WAVE-2-HANDOVER.md`. What "COMPLETE" means and does not mean is stated in `## Wave 2 qualification` below. §7 checklist item 1 stays OPEN until a fresh closeout grades it. The user's 1a/1b/1c track is COMPLETE: `BRACKET-1a` (`11969f3`) makes the instance end CLOSED on its own exit; `BRACKET-1b` (`7252150`) records a two-bracket run with a FILLED take-profit, reconciled per bracket; and `BRACKET-1c` (`6e06c50`) runs the same round trip durably, through real PostgreSQL and Redis and the real composition root. Its two H1 blockers are CLOSED: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load. Items 4 and 5 stay NOT MET on their human halves (item 4's replay half is ACCEPTED AS QUALIFIED in the interim, per H8). WP-260 and the eight remaining phase-3 packages stay deferred to Wave 3. *(This sentence was REWRITTEN 2026-09-17 at the `UNIV-4` flip, replacing rather than appending — per `GOV-2C`'s own residual on this line; the superseded sentence, with its two strikes and two dated notes, is preserved verbatim under `## Wave 2 qualification`, "Superseded header sentences".)*  
 Maximum permitted run mode: `PAPER`
 
 ## Safety state
@@ -364,7 +364,7 @@ A contrast test (`SystemPaperClock`, one pump) and a fee variant (3+3+3+2, snaps
 
 **Found, and reported rather than fixed (outside the grant): `BRACKET1C-SNAPKEY` HIGH.** The durable trader GLOBAL-halts when one instant holds two fills for an instance. This blocks H1; `SNAP-1` is authorized to fix it. `BOOT1-CONFIGPARAMS` is queued.
 
-**CI:** PR #12 run `36430808829`, green.
+**CI:** PR #12 run `36430808829`, green. Post-merge `main` CI: run `36447719269` at `1ad2a36`, green.
 
 Record: `docs/handoffs/BRACKET-1c.md`.
 
@@ -386,9 +386,23 @@ Record: `docs/handoffs/BRACKET-1c.md`.
   - **(C4)** A durable-writer defect is REPORTED, not fixed: `apps/**` is outside the grant. This is the B1 class GOV-2B named.
 
 Answers GOV-2B's "all-doubles harness" reason. §7 item 1 is NOT claimed closed. | BRACKET-1b ✓ | test/integration/paper-trader/** (new files and support helpers; existing assertions unchanged). Forbidden: apps/**, packages/**, test/e2e/** (read-only import at most), test/replay-golden/** (read only), docs/**, db/**, protected files including every tsconfig. Gate: automated (Docker REQUIRED) + Fable adversarial review (hardening loop) + a green CI run on GitHub. |
-| `BUNDLE-1` (H1 blocker M18: the trader's shipped bundle crashes at load) | **Ready (authorized) 2026-09-28** by the user ("H1 blockers first", ruled 2026-09-28). Runs under the HARDENING LOOP.
+| `BUNDLE-1` (H1 blocker M18: the trader's shipped bundle crashes at load) | **Complete (2026-09-28)** — merged `fd30e5f` (`--no-ff`; one commit `8c03d71` on base `1ad2a36`). Run under the HARDENING LOOP (workflow `wf_b3cf0832-acc`, in parallel with `SNAP-1`).
 
-**The defect (REPRODUCED by the H8 scoping and by the orchestrator):** `apps/trader/package.json`'s `build` produces an ESM bundle (`--format=esm`, `dist/main.mjs`) that dies at load with `Dynamic require of "events" is not supported`. The cause is `ioredis`, reached through `packages/event-bus`. So `pnpm --filter @polymarket-bot/trader start`, the command `infra/compose/trader/compose.yaml` documents for H1, cannot start.
+**Review:** the Fable adversarial-reviewer (the pin spawns processes) returned r1 **ACCEPT**:
+  - `B1-R1-REDIS-UNCAUGHT` MEDIUM (pre-existing; queued);
+  - 6 LOW (queued as `BUNDLE1-LOWS`).
+
+**Delivered:**
+  - The trader stays ESM, with esbuild's `createRequire` banner. It is forced by `ioredis`; this is the ADR-018 §2 disclosure, recorded in the round record. CJS was measured and rejected: top-level await, and the migrations loader's `import.meta` crashing at load.
+  - `test/unit/tooling/app-bundles-load.test.ts` builds and runs all five runnable apps' bundles with their own `build` scripts.
+  - The shipped trader bundle refuses an unsafe environment with exit 78.
+  - `pnpm --filter @polymarket-bot/trader start` now works up to the registration check.
+
+**CI:** PR #13 run `36466196117`, green.
+
+Record: `docs/handoffs/BUNDLE-1.md`.
+
+*As authorized:* **The defect (REPRODUCED by the H8 scoping and by the orchestrator):** `apps/trader/package.json`'s `build` produces an ESM bundle (`--format=esm`, `dist/main.mjs`) that dies at load with `Dynamic require of "events" is not supported`. The cause is `ioredis`, reached through `packages/event-bus`. So `pnpm --filter @polymarket-bot/trader start`, the command `infra/compose/trader/compose.yaml` documents for H1, cannot start.
 
 ADR-018 §2 names exactly this failure. It permits CJS where a CJS-only dependency forces it; `apps/data-gateway` is the precedent. But a plain `--format=cjs` does not build: `main.ts:655` uses top-level await, and `packages/storage-postgres`'s migrations loader uses `import.meta`.
 
@@ -402,9 +416,30 @@ ADR-018 §2 names exactly this failure. It permits CJS where a CJS-only dependen
   - The orchestrator checked on 2026-09-28: every other app's bundle loads.
 
 **Safety:** the trader's startup safety check must still refuse an unsafe environment from the bundle. | CI-1 ✓ | apps/trader/package.json (build/start scripts), apps/trader/src/main.ts (only the top-level-await wrapper, if option (a)), a new bundle-load test under test/unit/tooling/** or test/unit/trader/**, infra/compose/trader/** (documentation of the bundle name only). Forbidden: every other apps/** and packages/** file, pnpm-lock.yaml, docs/**, db/**, other protected files. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
-| `SNAP-1` (H1 blocker `BRACKET1C-SNAPKEY`: one PnL snapshot per instance per instant) | **Ready (authorized) 2026-09-28** by the user's ruling ("One snapshot per instant", 2026-09-28). Runs under the HARDENING LOOP.
+| `SNAP-1` (H1 blocker `BRACKET1C-SNAPKEY`: one PnL snapshot per instance per instant) | **Complete (2026-09-28)** — merged `fff844d` (`--no-ff`; chain `de867f6` r0 → `4085e23` r1 → `0d10395` r2, on base `1ad2a36`). Run under the HARDENING LOOP (workflow `wf_b3cf0832-acc`).
 
-**The defect:** see `BRACKET1C-SNAPKEY` and `docs/handoffs/BRACKET-1c.md`. `loop.ts` `#writePnlSnapshot` writes one snapshot PER FILL at the event's instant, while `pnl_snapshots_scope_unique` allows one per (scope, environment, account, instance, market, `as_of`). The durable trader halts on the second fill of one instant.
+**Codex gpt-6-astra reviews:**
+  - r1: `SNAP1-R1` HIGH (a later same-instant fill left the snapshot and the realized-PnL book stale) and `SNAP1-R2` MEDIUM (a backwards timestamp lost its snapshot);
+  - r2: `SNAP1-R3` LOW (the key conflated calendar years). Fixed against a real PostgreSQL 16.6: 2,148 edge cases and 20,000 random strings, 0 mismatches;
+  - r3: **ACCEPT**, no findings.
+
+**Delivered:**
+  - One row per (scope, environment, account, instance, market, `as_of`), holding the state after the instant's last fill. The first harvest INSERTs; a later harvest in the same event UPDATEs the loop's own row.
+  - `MemoryTraderStore` enforces `pnl_snapshots_scope_unique` (`nulls not distinct`).
+  - Goldens:
+    - paper `pnlSnapshots` 3 → 2 (the intermediate `09:00:02Z` entry dropped; the kept entries byte-identical);
+    - the backtest artifact drops one `pnl` line and its store count;
+    - `two-brackets-run.json` unchanged.
+  - A durable two-level-entry Testcontainers test.
+  - `BRACKET1C-LOWS` L1 pinned.
+
+**CI:** PR #14 run `36466205761`, green. The combined tree was typechecked and its two new test files run locally before the push.
+
+**New residuals:** `SNAP1-KEYSET` and `SNAP1-MINOR`.
+
+Record: `docs/handoffs/SNAP-1.md`.
+
+*As authorized:* **The defect:** see `BRACKET1C-SNAPKEY` and `docs/handoffs/BRACKET-1c.md`. `loop.ts` `#writePnlSnapshot` writes one snapshot PER FILL at the event's instant, while `pnl_snapshots_scope_unique` allows one per (scope, environment, account, instance, market, `as_of`). The durable trader halts on the second fill of one instant.
 
 **Scope:**
   - (1) The trader writes ONE snapshot per (instance, market, instant), holding the state after the LAST fill booked at that instant, however many harvests the event runs.
@@ -1976,6 +2011,10 @@ no signer or credentials. Wave 1 authorized per the package table.
 
 ### Superseded header sentences (verbatim)
 
+- Header line 5's §7-item-1 clause as it read from the `BRACKET-1c` flip to the `SNAP-1`/`BUNDLE-1` flip (2026-09-28), replaced in place:
+
+  > §7 checklist item 1 stays OPEN until a fresh closeout grades it. The user's 1a/1b/1c track is COMPLETE: `BRACKET-1a` (`11969f3`) makes the instance end CLOSED on its own exit; `BRACKET-1b` (`7252150`) records a two-bracket run with a FILLED take-profit, reconciled per bracket; and `BRACKET-1c` (`6e06c50`) runs the same round trip durably, through real PostgreSQL and Redis and the real composition root. `BRACKET-1c` also found `BRACKET1C-SNAPKEY`: the durable trader halts when one instant holds two fills. `SNAP-1` is fixing it. The trader's shipped bundle also crashes at load (`BUNDLE-1`). Both block H1. Items 4 and 5 stay NOT MET on their human halves; item 4's replay half is ACCEPTED AS QUALIFIED in the interim, per H8.
+
 - Header line 5's §7-item-1 clause as it read from the `BRACKET-1b` flip to the `BRACKET-1c` flip (2026-09-28), replaced in place:
 
   > §7 checklist item 1 stays OPEN until `BRACKET-1c` and a fresh closeout. `BRACKET-1a` (`11969f3`) made the instance end CLOSED on its own exit. `BRACKET-1b` (`7252150`) recorded the first two-bracket run: a protective-reduce close, REARMED, then a FILLED take-profit, reconciled per bracket. That evidence is still in-memory doubles; the durable Postgres + Redis round trip is `BRACKET-1c` (ruling R1). Items 4 and 5 stay NOT MET on their human halves (item 4's replay half is ACCEPTED AS QUALIFIED in the interim, per H8).
@@ -2226,10 +2265,20 @@ Closes `RISK2-R6`. | scoping `wf_b7a8d34d-4f9` synthesis | after `BRACKET-1a` me
   - `pnl_snapshots_scope_unique` (`0006_accounting.up.sql:857`) allows one per `as_of`;
   - `MemoryTraderStore` masks it, and the original paper golden holds exactly this shape.
 
-Blocks H1. | `docs/handoffs/BRACKET-1c.md` (implementer C4; reproduced by the Fable reviewer) | **being handled by `SNAP-1`** (authorized 2026-09-28; the user ruled one snapshot per instance per instant) |
-| **M18 (trader bundle crashes at load)** | `apps/trader`'s `--format=esm` bundle dies with `Dynamic require of "events" is not supported` (`ioredis` via `event-bus`), so `pnpm --filter @polymarket-bot/trader start` cannot start. ADR-018 §2 named exactly this failure for the data gateway. Blocks H1 | H8 scoping `wf_5375df07-cc2` (REPRODUCED); orchestrator reproduction 2026-09-28 | **being handled by `BUNDLE-1`** (authorized 2026-09-28) |
+Blocks H1. | `docs/handoffs/BRACKET-1c.md` (implementer C4; reproduced by the Fable reviewer) | **CLOSED by `SNAP-1`** (merged `fff844d`, 2026-09-28): one snapshot per instance per instant, the double enforces the key, and a durable two-level-entry test passes |
+| **M18 (trader bundle crashes at load)** | `apps/trader`'s `--format=esm` bundle dies with `Dynamic require of "events" is not supported` (`ioredis` via `event-bus`), so `pnpm --filter @polymarket-bot/trader start` cannot start. ADR-018 §2 named exactly this failure for the data gateway. Blocks H1 | H8 scoping `wf_5375df07-cc2` (REPRODUCED); orchestrator reproduction 2026-09-28 | **CLOSED by `BUNDLE-1`** (merged `fd30e5f`, 2026-09-28): the bundle loads (ESM + `createRequire` banner), and every app's bundle is pinned |
 | **BOOT1-CONFIGPARAMS** | `verifyRegisteredRows` checks the registered `config_id` but never reads `strategy.configs.parameters` or its hash. A registered config and a trader document that disagree on parameters (for example, max entries 1 vs 2) start without refusal. An operator hazard for H1 | `docs/handoffs/BRACKET-1c.md` (implementer follow_up) | the next `apps/trader` registration round; before H1 if the user wants the guarantee |
-| **BRACKET1C-LOWS** | `BR1C-R1-L1`: the durable round trip's fixture-schedule tests do not pin `core_net_pnl`, `gross_trading_pnl`, `capital_committed` or `worst_case_resolution_pnl`. The values were read back and are correct. `BR1C-R1-L2`: the read-back's SQL predicates are not load-bearing; one database per scenario scopes the rows | `docs/handoffs/BRACKET-1c.md` review | `SNAP-1` may ride `L1` (same file); otherwise the next paper-trader integration round |
+| **BRACKET1C-LOWS** | `BR1C-R1-L1`: the durable round trip's fixture-schedule tests do not pin `core_net_pnl`, `gross_trading_pnl`, `capital_committed` or `worst_case_resolution_pnl`. The values were read back and are correct. `BR1C-R1-L2`: the read-back's SQL predicates are not load-bearing; one database per scenario scopes the rows | `docs/handoffs/BRACKET-1c.md` review | L1 **CLOSED by `SNAP-1`** (merged `fff844d`); L2 stays with the next paper-trader integration round |
+| **B1-R1-REDIS-UNCAUGHT** | With Redis unreachable, the trader's `startup()` rejects with an uncaught `EventBusUnavailableError` (stack trace, exit 1) instead of a documented refusal. `RedisStreamsEventTransport.connect` (`apps/trader/src/main.ts:290`) is awaited without a catch, which contradicts `startup()`'s "Never throws" docstring; the PostgreSQL boundary has `infrastructureUnavailable` (69). It fails closed. The neighbour of `BOOT1-R7` (a Redis outage mid-run HANGS the process) | `docs/handoffs/BUNDLE-1.md` (Fable r1 MEDIUM) | the next `apps/trader` round, with `BOOT1-R7`'s event-bus receive bound; before H1 if the user wants clean refusals |
+| **BUNDLE1-LOWS** | Six LOW items, all queued:
+  - (1) ADR-018 should record the third pattern (ESM + `createRequire`) and why CJS was rejected;
+  - (2) `packages/storage-postgres`'s default migrations directory resolves relative to the bundle (latent);
+  - (3) the entry guards key on the file name, so a renamed bundle exits 0 silently;
+  - (4) the pin covers only `build` scripts that start with `esbuild `;
+  - (5) the pin couples to the example config's market count;
+  - (6) process: one unprefixed pnpm command rewrote shared-hardlink metadata (observable state verified; the main checkout still holds `js-yaml@4.3.1`) | `docs/handoffs/BUNDLE-1.md` | (1) the next docs round (with the ADR-022 discharge note); (2)–(5) the next tooling or apps round |
+| **SNAP1-KEYSET** | The loop's written-keys set (SNAP-1's insert-or-replace identity) grows without bound, one entry per snapshot instant, for the life of the process. This is a small regression against `TRDR-4`'s bounded loop. The set only needs the current event's instant(s) plus what `SNAP1-R2`'s backwards-timestamp rule requires. It is empty after a restart, which is harmless: a restart is a new run | `docs/handoffs/SNAP-1.md` | the next `apps/trader` round (after `CORE-MOVE`: the file moves) |
+| **SNAP1-MINOR** | A replaced row keeps its first `computed_at`, and no health counter counts replacements. The double does not refuse an `as_of` that PostgreSQL refuses (for example, year 0000, which `normalizeToStrictUtc` accepts), and other PostgreSQL-accepted spellings key as themselves. There is also the crash-between-harvests window, and unowned fills still write no virtual snapshot (pre-existing) | `docs/handoffs/SNAP-1.md` | the next `apps/trader` round |
 | **BRACKET-1c** | **COMPLETE 2026-09-28** (merged `6e06c50`; see the work-package row). **AUTHORIZED 2026-09-28** (see the work-package row; verifier Fable). QUEUED by the user (2026-09-28, R1). One durable Postgres + Redis round trip in `test/integration/paper-trader/**`: entry fill → exit fill → CLOSED, ideally → REARM. It extends `durable-trader-first-fill-postgres.test.ts`'s registration path, runs under CI Testcontainers, and answers GOV-2B's "all-doubles harness" reason for §7 item 1 | scoping `wf_b7a8d34d-4f9` synthesis | after `BRACKET-1b` |
 | **H8 track (`H8-GOV` → `CORE-MOVE` → `BACKTEST-2`)** | RULED by the user 2026-09-28: **option A**. Extract the paper core (the `createPaperTrader`/`CoreLoop` import closure: 24 files, about 10.9k lines, reaching only layer-0/1 packages plus zod, with no adapter, Node built-in, clock or process global — REPRODUCED) into a new layer-1 package that both `apps/trader` and `apps/backtest-cli` build from. Three rounds:
   - (1) **`H8-GOV`**:
