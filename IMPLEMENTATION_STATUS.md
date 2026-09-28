@@ -454,9 +454,28 @@ Record: `docs/handoffs/SNAP-1.md`.
   - (5) FOLD-1's per-fill PnL checks and TRDR-3's realized-PnL book stay correct. The snapshot/PnL-record ratio pins (N1) are updated with their reason.
 
 No migration: `db/**` is untouched. | BRACKET-1c ✓ | apps/trader/src/** (loop.ts snapshot write, testing/index.ts MemoryTraderStore, colocated tests), test/replay-golden/paper-e2e/paper-e2e-run.json + README (regenerated), test/replay-golden/backtest/static-bracket/expected-artifact.txt + README (captured), test/e2e/** (snapshot expectations and the reconciler only as required), test/unit/simulation/backtest-static-bracket-replay.test.ts, test/unit/trader/**, test/integration/paper-trader/** (the two-level durable test; BRACKET-1c's pending note). Forbidden: packages/**, db/**, apps/trader/package.json (BUNDLE-1's), docs/**, backtest fixture inputs, protected files. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
-| `H8-GOV` (the H8 track, round 1: ADR-022 + a staged dependency-contract amendment + work-plan ratification; documentation only) | **Ready (authorized) 2026-09-28** under the user's H8 rulings (option A; the package `@polymarket-bot/trading-core`; ADR-022 is written; the order H1 blockers → H8-GOV → checker hardening → CORE-MOVE → BACKTEST-2). The H1 blockers are merged (`fd30e5f`, `fff844d`). Runs under the HARDENING LOOP, reviewed by Codex gpt-6-astra.
+| `H8-GOV` (the H8 track, round 1: ADR-022 + a staged dependency-contract amendment + work-plan ratification; documentation only) | **Complete (2026-09-28)** — merged `bb58edb` (`--no-ff`; chain `81d1b34` r0 → `c41673b` r1, on base `a8a3a63`). Run under the HARDENING LOOP (workflow `wf_d6d34962-94e`), reviewed by Codex gpt-6-astra.
+  - r1 **CHANGES REQUIRED**: `H8G-01` MEDIUM (the ADR overstated what F12 enforces), `H8G-02` LOW (D10's layer assignment), `H8G-03` LOW (D4's cycle claim).
+  - r2 **ACCEPT**, no findings.
 
-**Design basis:** the scoping `wf_5375df07-cc2`, whose synthesis holds the draft text for every item.
+**Delivered:**
+  - **ADR-022** (Accepted; implemented by CORE-MOVE and BACKTEST-2, both pending).
+  - The **staged §2.1 PENDING block**: the fence line, the §2 prose, rows S8–S18 and the CORE-MOVE grant, verbatim.
+  - The **two WP-210 settlements**.
+  - The **protected-contracts §5 row**. The stray blank line that detached GOV-1D's row is also fixed.
+  - **Work-plan entries** (+49/−0).
+  - `docs/handoffs/H8-GOV.md`, carrying the CORE-MOVE grant and the checker-hardening grant.
+
+**Evidence:**
+  - `check:deps --json` is byte-identical to base.
+  - The activation dry run passes at 35/93 with S0..S18.
+  - Re-measuring at base found five changes from SNAP-1: the closure is now 25 files / 11,218 lines, and one new test imports moving files. The CORE-MOVE grant is updated to cover them.
+
+**CI:** PR #15 run `36478311544`, green.
+
+Record: `docs/handoffs/H8-GOV.md`.
+
+*As authorized:* **Design basis:** the scoping `wf_5375df07-cc2`, whose synthesis holds the draft text for every item.
 
 **Scope** (the protected-contracts §3.1 bounded-repair shape, as GOV-1B/1C/1D did):
   - **(1)** ADR-022 (Accepted), plus its README index row.
@@ -475,6 +494,23 @@ No migration: `db/**` is untouched. | BRACKET-1c ✓ | apps/trader/src/** (loop.
   - `check:deps` still reports the base's counts, with allowlist S0..S7.
   - The unit counts are unchanged.
   - An activation dry run in a scratch mirror PASSES at 35 packages with S0..S18. | BUNDLE-1 ✓, SNAP-1 ✓ | docs/adr/ADR-022-*.md (new), docs/adr/README.md (index row), docs/contracts/dependency-direction.md (the staged block + two settlements), docs/contracts/protected-contracts.md (§5 row), docs/spec/polymarket-bot-workplan.yaml (ratification entries only), docs/handoffs/H8-GOV.md. Forbidden: apps/**, packages/**, test/**, tools/**, pnpm-lock.yaml, package.json, tsconfig*, eslint.config.mjs, .github/**, db/**, the handoff spec, other ADRs, IMPLEMENTATION_STATUS.md. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
+| `DEPCHECK-1` (the H8 track's checker-hardening round: F10, app-endpoint CHK, F16's relative half, stale-row CHK; ride-alongs `CI2-L5-2`/`CI2-L5-3`) | **Ready (authorized) 2026-09-28** under the user's H8 order (H1 blockers → H8-GOV → checker hardening → CORE-MOVE → BACKTEST-2) and the grant recorded in `docs/handoffs/H8-GOV.md`. The orchestrator widened the grant to `test/unit/tooling/{ci-step-split.test.ts,ci-workflow.ts}` for the two CI2 ride-alongs, as the grant allows. Runs under the HARDENING LOOP.
+
+**Verifier:** a Fable adversarial-reviewer. The tooling tests spawn the checker, which Codex's sandbox blocks.
+
+**Scope:**
+  - (1) F10 in rule 2: a declared edge into `apps/*` fails.
+  - (2) CHK for a §2.1 row whose `to` endpoint is an application.
+  - (3) F16's relative half: a relative specifier escaping its package root fails.
+  - (4) CHK for a §2.1 row that matches no declared edge.
+  - (5) The §3 F10/F16 cells, the §5 list and the §6 rule text.
+  - (6) `CI2-L5-2` (multi-line `run: |` blocks) and `CI2-L5-3` (other root-script spellings).
+
+**Acceptance:**
+  - The repository's counts and allowlist are unchanged.
+  - P2 → F10; P3 → CHK + F10; P8 → F16.
+  - A stale row → CHK.
+  - The H8-GOV activation dry run still passes. | H8-GOV ✓ | tools/check-dependency-direction.mjs (items 1–4), test/unit/tooling/dependency-direction.test.ts (additive only), test/unit/tooling/ci-step-split.test.ts + ci-workflow.ts (ride-alongs), docs/contracts/dependency-direction.md (§3 F10/F16 cells, §5 list, §6 rule 2/3 text only; not §2, the §2.1 table or the PENDING block), docs/handoffs/DEPCHECK-1.md. Forbidden: apps/**, packages/**, other test/**, .github/**, lockfile, package.json, tsconfig*, eslint.config.mjs, docs/adr/**. Gate: automated + Fable adversarial review (hardening loop) + a green CI run on GitHub. |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
 
@@ -2245,8 +2281,8 @@ Over days this could slow each event enough to fill the §8.3 ingest queue, whic
 | **CI1-L3** | The tripwire guards the child-process APIs, but the real limit is ~60 s of SYNCHRONOUS work per test file of any kind (34 × `Atomics.wait` 2 s, no child process, reproduces the same RPC timeout). Also unscanned: untracked new test files and helper modules that are not `*.test.ts`; the unit suite now needs `git` and a `.git` directory. Headroom today: next slowest file 20.1 s on the runner | `docs/handoffs/CI-1.md` review L3 | **CLOSED by `CI-2`** (merged `6325d10`, 2026-09-26): the tripwire states the ~60 s-per-file synchronous limit and what is and is not checked, and scans all tracked helper modules under `test/` |
 | **CI1-L4** | `test/unit/decimal/index-name-pollution.test.ts`: the 30 s test timeout sits above ONE 20 s spawn ceiling, but the first probe test can make four sequential spawns, so on a hang vitest can time out with a child still alive (the decimal files have no kill-on-teardown); the comment says the ordering always holds. Whole file took 0.96 s on the runner | `docs/handoffs/CI-1.md` review L4 | **CLOSED by `CI-2`** (merged `6325d10`, 2026-09-26): `PROBE_TEST_TIMEOUT_MS = MODES.length * PROBE_CEILING_MS + 10_000`; a hang fails through the spawn ceiling and leaves no orphan |
 | **CI1-L5** | `GATE1-R4` holds per STEP only: `test:integration` (six suites), `test:contract` (four) and `typecheck` (four `tsc` runs) are `&&` chains inside one step each, so their first failure hides the rest of that step; and no job sets `timeout-minutes`, so a hang in a gate that now runs after a failure runs to GitHub's 360-minute default | `docs/handoffs/CI-1.md` review L5 | **CLOSED by `CI-2`** (merged `6325d10`, 2026-09-26): 14 split gated steps plus job `timeout-minutes`, guarded by the drift pin; PR #4 run `36292508550` green |
-| **CI2-L5-2** | The drift pin's one-step-chain rule does not look past the first line of a multi-line `run: |` block. Under GitHub's default `bash -eo pipefail` shell, a block of INDEPENDENT gates (`pnpm lint` then `pnpm check:deps`) is the same fail-fast hazard as an `&&` chain, and the pin reports nothing. The header's exclusion ("lines may depend on one another") is true of today's two blocks but also excludes the independent case | `docs/handoffs/CI-2.md` review r2 L5-2 | the next round granted `test/unit/tooling/**` |
-| **CI2-L5-3** | The pin follows only `pnpm <script>` and `pnpm run <script>`. `pnpm -C . <script>`, `pnpm --dir . <script>`, `pnpm --filter polymarket-bot <script>`, `pnpm run "<script>"` and `npm run <script>` also run the ROOT script, and escape it. The header's reason ("a flag … runs workspace packages' scripts instead, so it never matches") is false for those spellings | `docs/handoffs/CI-2.md` review r2 L5-3 | the next round granted `test/unit/tooling/**`: follow them, or correct the header's claim |
+| **CI2-L5-2** | The drift pin's one-step-chain rule does not look past the first line of a multi-line `run: |` block. Under GitHub's default `bash -eo pipefail` shell, a block of INDEPENDENT gates (`pnpm lint` then `pnpm check:deps`) is the same fail-fast hazard as an `&&` chain, and the pin reports nothing. The header's exclusion ("lines may depend on one another") is true of today's two blocks but also excludes the independent case | `docs/handoffs/CI-2.md` review r2 L5-2 | the next round granted `test/unit/tooling/**` — **riding `DEPCHECK-1`** (authorized 2026-09-28) |
+| **CI2-L5-3** | The pin follows only `pnpm <script>` and `pnpm run <script>`. `pnpm -C . <script>`, `pnpm --dir . <script>`, `pnpm --filter polymarket-bot <script>`, `pnpm run "<script>"` and `npm run <script>` also run the ROOT script, and escape it. The header's reason ("a flag … runs workspace packages' scripts instead, so it never matches") is false for those spellings | `docs/handoffs/CI-2.md` review r2 L5-3 | the next round granted `test/unit/tooling/**`: follow them, or correct the header's claim — **riding `DEPCHECK-1`** (authorized 2026-09-28) |
 | **RISK-2 item 7 (three members)** | (i) `RISK2-R5` — an obsolete four-row table retained in `packages/strategies/static-bracket/README.md`; (ii) the complement-leg reclassification — a strategy that establishes exposure by SELLING a token it holds is now also an EXIT, sound within §9.8's own measures but disclosed at the site and not exercised end to end (the contract-owner question it raises: gating a covered sale on its DIRECTIONAL effect needs a net-directional-exposure measure §9.8 does not define); (iii) `planEntry` tags `immediate_order_type` unconditionally, so a PASSIVE entry hits the same order-type collision the exits just escaped | `docs/handoffs/RISK-2.md` residual 7 | (i) **CLOSED by `BRACKET-1a`** (merged `11969f3`, 2026-09-28): the obsolete table was removed. (iii) the next `packages/strategies/static-bracket/**` round (explicitly re-owned by `BRACKET-1a`, not ridden). (ii) the contract owner, as a §9.8 question |
 | **BT1-R1..R4** | `apps/backtest-cli`: (R1) `README.md` "the executable's `verify` command still runs the verification-only normalizer with no core" — stale, `main.ts:44-58` selects `normalizedEnvelopeNormalizer` when the pins name it; (R2) run pins (`fillModelVersion`, `feeSnapshotVersion`, `runSeed`) are not reconciled against `trader-config.json`'s own values — the artefact's `pins fee=…` line is a caller assertion, not evidence about the core (pre-existing in `packages/simulation`'s pin model); (R3) `core-loop.ts:139-178` keeps delivering after a latched halt where `pump.ts:125-127` returns `HALTED` — the loop's gates stop decisions but fills for resting orders can still book; no halt test exists; (R4) `normalizer.ts` neither reports a §4 item 5 pollution battery nor says one was not run (the reviewer ran one: 8 inherited keys, permission never varied) | `docs/handoffs/BACKTEST-1.md`; the review | the next round granted `apps/backtest-cli/**` |
 | **BOOT1-R6 (out of BOOT-1's grant)** | `health.loop.decisionsPersisted` counts OUTBOX APPENDS (`loop.ts:925/929`), incremented before `#flushOutbox` (`loop.ts:1660`) attempts the write — the BOOT-1 reviewer read it at **1 with zero rows persisted**, twice; it ships as `trader_decisions_persisted_total` (`packages/observability/src/control/samples.ts:107`). A §6 invariant 3 counter that reports a rejected decision as persisted | the BOOT-1 review | the next `loop.ts` round (count on `written.ok`, or rename) |
