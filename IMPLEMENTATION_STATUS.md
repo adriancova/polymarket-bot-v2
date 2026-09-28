@@ -494,9 +494,26 @@ Record: `docs/handoffs/H8-GOV.md`.
   - `check:deps` still reports the base's counts, with allowlist S0..S7.
   - The unit counts are unchanged.
   - An activation dry run in a scratch mirror PASSES at 35 packages with S0..S18. | BUNDLE-1 ✓, SNAP-1 ✓ | docs/adr/ADR-022-*.md (new), docs/adr/README.md (index row), docs/contracts/dependency-direction.md (the staged block + two settlements), docs/contracts/protected-contracts.md (§5 row), docs/spec/polymarket-bot-workplan.yaml (ratification entries only), docs/handoffs/H8-GOV.md. Forbidden: apps/**, packages/**, test/**, tools/**, pnpm-lock.yaml, package.json, tsconfig*, eslint.config.mjs, .github/**, db/**, the handoff spec, other ADRs, IMPLEMENTATION_STATUS.md. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
-| `DEPCHECK-1` (the H8 track's checker-hardening round: F10, app-endpoint CHK, F16's relative half, stale-row CHK; ride-alongs `CI2-L5-2`/`CI2-L5-3`) | **Ready (authorized) 2026-09-28** under the user's H8 order (H1 blockers → H8-GOV → checker hardening → CORE-MOVE → BACKTEST-2) and the grant recorded in `docs/handoffs/H8-GOV.md`. The orchestrator widened the grant to `test/unit/tooling/{ci-step-split.test.ts,ci-workflow.ts}` for the two CI2 ride-alongs, as the grant allows. Runs under the HARDENING LOOP.
+| `DEPCHECK-1` (the H8 track's checker-hardening round: F10, app-endpoint CHK, F16's relative half, stale-row CHK; ride-alongs `CI2-L5-2`/`CI2-L5-3`) | **Complete (2026-09-28)** — merged `d7f2906` (`--no-ff`; one commit `ff553e3` on base `45c575a`). Run under the HARDENING LOOP (workflow `wf_9dd5ab8b-7c0`). The Fable reviewer returned r1 **ACCEPT**, with one LOW, `DC1-R1-L1`: `import.meta.resolve` is missing from the disclosed not-covered list. It is docs-only and queued.
 
-**Verifier:** a Fable adversarial-reviewer. The tooling tests spawn the checker, which Codex's sandbox blocks.
+**Delivered:**
+  - F10 for any declared edge into an app;
+  - CHK for an app-endpoint §2.1 row;
+  - F16's relative half, covering all 12 literal forms the scanner reads;
+  - CHK for a stale §2.1 row (S18's removal is now a gate result);
+  - `CI2-L5-2` (multi-command run blocks) and `CI2-L5-3` (root-script spellings).
+
+**Evidence:**
+  - The repository's `check:deps --json` is byte-identical to base, and the H8-GOV activation dry run still passes.
+  - Of the 199 tooling tests, the new ones fail 10 against base's checker.
+  - 14 checker mutants and 15 CI mutants are all killed.
+  - The unit suite runs 348/7594.
+
+**CI:** PR #16 run `36489397853`, green.
+
+Record: `docs/handoffs/DEPCHECK-1.md` (written in-round).
+
+*As authorized:* **Verifier:** a Fable adversarial-reviewer. The tooling tests spawn the checker, which Codex's sandbox blocks.
 
 **Scope:**
   - (1) F10 in rule 2: a declared edge into `apps/*` fails.
@@ -511,6 +528,28 @@ Record: `docs/handoffs/H8-GOV.md`.
   - P2 → F10; P3 → CHK + F10; P8 → F16.
   - A stale row → CHK.
   - The H8-GOV activation dry run still passes. | H8-GOV ✓ | tools/check-dependency-direction.mjs (items 1–4), test/unit/tooling/dependency-direction.test.ts (additive only), test/unit/tooling/ci-step-split.test.ts + ci-workflow.ts (ride-alongs), docs/contracts/dependency-direction.md (§3 F10/F16 cells, §5 list, §6 rule 2/3 text only; not §2, the §2.1 table or the PENDING block), docs/handoffs/DEPCHECK-1.md. Forbidden: apps/**, packages/**, other test/**, .github/**, lockfile, package.json, tsconfig*, eslint.config.mjs, docs/adr/**. Gate: automated + Fable adversarial review (hardening loop) + a green CI run on GitHub. |
+| `CORE-MOVE` (the H8 track, round 3: MOVE the paper core into `packages/trading-core`; move-only) | **Ready (authorized) 2026-09-28** under the user's H8 order and the grant recorded, byte for byte, in `docs/handoffs/H8-GOV.md` and in `dependency-direction.md`'s PENDING block. The grant is BINDING.
+
+**Exclusive window:** no other round is in flight on any of its paths.
+
+**Orchestrator ruling:** `apps/trader` removes exactly the workspace dependencies its remaining source no longer imports (ADR-018 §3, F8), measured and not predicted.
+
+**Proofs** (the scoping's acceptance, which the verifier runs):
+  - blob-hash equality over the move map;
+  - R100 renames;
+  - specifier-normalized diffs of the files that stay;
+  - `main.ts` block equality;
+  - the core's `index.ts` against the base facade;
+  - the public surface of `@polymarket-bot/trader` and `/testing` unchanged (TypeScript compiler API);
+  - test counts and the name inventory unchanged;
+  - goldens BYTE-IDENTICAL;
+  - the cast-scan census equal and no shims;
+  - `check:deps` under DEPCHECK-1's rules with S0..S18 activated and the counts measured;
+  - every lockfile hunk inside `importers:`.
+
+**Lockfile:** `pnpm install --offline --lockfile-only` plus hand-made links. No full install; CI's frozen install is the final proof.
+
+Runs under the HARDENING LOOP, reviewed by Codex gpt-6-astra. The orchestrator's gate step hand-links the new package in the review worktree. | DEPCHECK-1 ✓, H8-GOV ✓ | The H8-GOV CORE-MOVE grant: packages/trading-core/** (new); apps/trader/** (limited); pnpm-lock.yaml (two importers blocks); test/unit/trader/{health-realized-pnl,health-server,memory-store-pnl-snapshot-key,query-boundary-cast-scan}.test.ts (specifiers and anchors); test/unit/tooling/dependency-direction.test.ts (three anchors); docs/contracts/dependency-direction.md (activation); docs/handoffs/CORE-MOVE.md. Not granted: the suite aliases, tsconfig.lint.json. Forbidden: everything else; test/replay-golden/** byte-identical. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
 
@@ -2281,8 +2320,8 @@ Over days this could slow each event enough to fill the §8.3 ingest queue, whic
 | **CI1-L3** | The tripwire guards the child-process APIs, but the real limit is ~60 s of SYNCHRONOUS work per test file of any kind (34 × `Atomics.wait` 2 s, no child process, reproduces the same RPC timeout). Also unscanned: untracked new test files and helper modules that are not `*.test.ts`; the unit suite now needs `git` and a `.git` directory. Headroom today: next slowest file 20.1 s on the runner | `docs/handoffs/CI-1.md` review L3 | **CLOSED by `CI-2`** (merged `6325d10`, 2026-09-26): the tripwire states the ~60 s-per-file synchronous limit and what is and is not checked, and scans all tracked helper modules under `test/` |
 | **CI1-L4** | `test/unit/decimal/index-name-pollution.test.ts`: the 30 s test timeout sits above ONE 20 s spawn ceiling, but the first probe test can make four sequential spawns, so on a hang vitest can time out with a child still alive (the decimal files have no kill-on-teardown); the comment says the ordering always holds. Whole file took 0.96 s on the runner | `docs/handoffs/CI-1.md` review L4 | **CLOSED by `CI-2`** (merged `6325d10`, 2026-09-26): `PROBE_TEST_TIMEOUT_MS = MODES.length * PROBE_CEILING_MS + 10_000`; a hang fails through the spawn ceiling and leaves no orphan |
 | **CI1-L5** | `GATE1-R4` holds per STEP only: `test:integration` (six suites), `test:contract` (four) and `typecheck` (four `tsc` runs) are `&&` chains inside one step each, so their first failure hides the rest of that step; and no job sets `timeout-minutes`, so a hang in a gate that now runs after a failure runs to GitHub's 360-minute default | `docs/handoffs/CI-1.md` review L5 | **CLOSED by `CI-2`** (merged `6325d10`, 2026-09-26): 14 split gated steps plus job `timeout-minutes`, guarded by the drift pin; PR #4 run `36292508550` green |
-| **CI2-L5-2** | The drift pin's one-step-chain rule does not look past the first line of a multi-line `run: |` block. Under GitHub's default `bash -eo pipefail` shell, a block of INDEPENDENT gates (`pnpm lint` then `pnpm check:deps`) is the same fail-fast hazard as an `&&` chain, and the pin reports nothing. The header's exclusion ("lines may depend on one another") is true of today's two blocks but also excludes the independent case | `docs/handoffs/CI-2.md` review r2 L5-2 | the next round granted `test/unit/tooling/**` — **riding `DEPCHECK-1`** (authorized 2026-09-28) |
-| **CI2-L5-3** | The pin follows only `pnpm <script>` and `pnpm run <script>`. `pnpm -C . <script>`, `pnpm --dir . <script>`, `pnpm --filter polymarket-bot <script>`, `pnpm run "<script>"` and `npm run <script>` also run the ROOT script, and escape it. The header's reason ("a flag … runs workspace packages' scripts instead, so it never matches") is false for those spellings | `docs/handoffs/CI-2.md` review r2 L5-3 | the next round granted `test/unit/tooling/**`: follow them, or correct the header's claim — **riding `DEPCHECK-1`** (authorized 2026-09-28) |
+| **CI2-L5-2** | The drift pin's one-step-chain rule does not look past the first line of a multi-line `run: |` block. Under GitHub's default `bash -eo pipefail` shell, a block of INDEPENDENT gates (`pnpm lint` then `pnpm check:deps`) is the same fail-fast hazard as an `&&` chain, and the pin reports nothing. The header's exclusion ("lines may depend on one another") is true of today's two blocks but also excludes the independent case | `docs/handoffs/CI-2.md` review r2 L5-2 | **CLOSED by `DEPCHECK-1`** (merged `d7f2906`, 2026-09-28): a gate's multi-command `run` is a finding unless it is recorded as dependent |
+| **CI2-L5-3** | The pin follows only `pnpm <script>` and `pnpm run <script>`. `pnpm -C . <script>`, `pnpm --dir . <script>`, `pnpm --filter polymarket-bot <script>`, `pnpm run "<script>"` and `npm run <script>` also run the ROOT script, and escape it. The header's reason ("a flag … runs workspace packages' scripts instead, so it never matches") is false for those spellings | `docs/handoffs/CI-2.md` review r2 L5-3 | **CLOSED by `DEPCHECK-1`** (merged `d7f2906`, 2026-09-28): the pin follows the listed root-script spellings, and the false header claim is replaced |
 | **RISK-2 item 7 (three members)** | (i) `RISK2-R5` — an obsolete four-row table retained in `packages/strategies/static-bracket/README.md`; (ii) the complement-leg reclassification — a strategy that establishes exposure by SELLING a token it holds is now also an EXIT, sound within §9.8's own measures but disclosed at the site and not exercised end to end (the contract-owner question it raises: gating a covered sale on its DIRECTIONAL effect needs a net-directional-exposure measure §9.8 does not define); (iii) `planEntry` tags `immediate_order_type` unconditionally, so a PASSIVE entry hits the same order-type collision the exits just escaped | `docs/handoffs/RISK-2.md` residual 7 | (i) **CLOSED by `BRACKET-1a`** (merged `11969f3`, 2026-09-28): the obsolete table was removed. (iii) the next `packages/strategies/static-bracket/**` round (explicitly re-owned by `BRACKET-1a`, not ridden). (ii) the contract owner, as a §9.8 question |
 | **BT1-R1..R4** | `apps/backtest-cli`: (R1) `README.md` "the executable's `verify` command still runs the verification-only normalizer with no core" — stale, `main.ts:44-58` selects `normalizedEnvelopeNormalizer` when the pins name it; (R2) run pins (`fillModelVersion`, `feeSnapshotVersion`, `runSeed`) are not reconciled against `trader-config.json`'s own values — the artefact's `pins fee=…` line is a caller assertion, not evidence about the core (pre-existing in `packages/simulation`'s pin model); (R3) `core-loop.ts:139-178` keeps delivering after a latched halt where `pump.ts:125-127` returns `HALTED` — the loop's gates stop decisions but fills for resting orders can still book; no halt test exists; (R4) `normalizer.ts` neither reports a §4 item 5 pollution battery nor says one was not run (the reviewer ran one: 8 inherited keys, permission never varied) | `docs/handoffs/BACKTEST-1.md`; the review | the next round granted `apps/backtest-cli/**` |
 | **BOOT1-R6 (out of BOOT-1's grant)** | `health.loop.decisionsPersisted` counts OUTBOX APPENDS (`loop.ts:925/929`), incremented before `#flushOutbox` (`loop.ts:1660`) attempts the write — the BOOT-1 reviewer read it at **1 with zero rows persisted**, twice; it ships as `trader_decisions_persisted_total` (`packages/observability/src/control/samples.ts:107`). A §6 invariant 3 counter that reports a rejected decision as persisted | the BOOT-1 review | the next `loop.ts` round (count on `written.ok`, or rename) |
@@ -2326,6 +2365,7 @@ Blocks H1. | `docs/handoffs/BRACKET-1c.md` (implementer C4; reproduced by the Fa
 | **M18 (trader bundle crashes at load)** | `apps/trader`'s `--format=esm` bundle dies with `Dynamic require of "events" is not supported` (`ioredis` via `event-bus`), so `pnpm --filter @polymarket-bot/trader start` cannot start. ADR-018 §2 named exactly this failure for the data gateway. Blocks H1 | H8 scoping `wf_5375df07-cc2` (REPRODUCED); orchestrator reproduction 2026-09-28 | **CLOSED by `BUNDLE-1`** (merged `fd30e5f`, 2026-09-28): the bundle loads (ESM + `createRequire` banner), and every app's bundle is pinned |
 | **BOOT1-CONFIGPARAMS** | `verifyRegisteredRows` checks the registered `config_id` but never reads `strategy.configs.parameters` or its hash. A registered config and a trader document that disagree on parameters (for example, max entries 1 vs 2) start without refusal. An operator hazard for H1 | `docs/handoffs/BRACKET-1c.md` (implementer follow_up) | the next `apps/trader` registration round; before H1 if the user wants the guarantee |
 | **BRACKET1C-LOWS** | `BR1C-R1-L1`: the durable round trip's fixture-schedule tests do not pin `core_net_pnl`, `gross_trading_pnl`, `capital_committed` or `worst_case_resolution_pnl`. The values were read back and are correct. `BR1C-R1-L2`: the read-back's SQL predicates are not load-bearing; one database per scenario scopes the rows | `docs/handoffs/BRACKET-1c.md` review | L1 **CLOSED by `SNAP-1`** (merged `fff844d`); L2 stays with the next paper-trader integration round |
+| **DC1-R1-L1** | `import.meta.resolve("<relative>")` is not judged by F16's relative half. It is missing from the disclosed not-covered list in the §3 F16 Source cell and in `docs/handoffs/DEPCHECK-1.md`. Docs-only: add it to both | `docs/handoffs/DEPCHECK-1.md` (Fable r1 LOW) | the next docs round (with the ADR-022 discharge note) |
 | **B1-R1-REDIS-UNCAUGHT** | With Redis unreachable, the trader's `startup()` rejects with an uncaught `EventBusUnavailableError` (stack trace, exit 1) instead of a documented refusal. `RedisStreamsEventTransport.connect` (`apps/trader/src/main.ts:290`) is awaited without a catch, which contradicts `startup()`'s "Never throws" docstring; the PostgreSQL boundary has `infrastructureUnavailable` (69). It fails closed. The neighbour of `BOOT1-R7` (a Redis outage mid-run HANGS the process) | `docs/handoffs/BUNDLE-1.md` (Fable r1 MEDIUM) | the next `apps/trader` round, with `BOOT1-R7`'s event-bus receive bound; before H1 if the user wants clean refusals |
 | **BUNDLE1-LOWS** | Six LOW items, all queued:
   - (1) ADR-018 should record the third pattern (ESM + `createRequire`) and why CJS was rejected;
