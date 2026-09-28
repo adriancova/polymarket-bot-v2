@@ -454,6 +454,27 @@ Record: `docs/handoffs/SNAP-1.md`.
   - (5) FOLD-1's per-fill PnL checks and TRDR-3's realized-PnL book stay correct. The snapshot/PnL-record ratio pins (N1) are updated with their reason.
 
 No migration: `db/**` is untouched. | BRACKET-1c ✓ | apps/trader/src/** (loop.ts snapshot write, testing/index.ts MemoryTraderStore, colocated tests), test/replay-golden/paper-e2e/paper-e2e-run.json + README (regenerated), test/replay-golden/backtest/static-bracket/expected-artifact.txt + README (captured), test/e2e/** (snapshot expectations and the reconciler only as required), test/unit/simulation/backtest-static-bracket-replay.test.ts, test/unit/trader/**, test/integration/paper-trader/** (the two-level durable test; BRACKET-1c's pending note). Forbidden: packages/**, db/**, apps/trader/package.json (BUNDLE-1's), docs/**, backtest fixture inputs, protected files. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
+| `H8-GOV` (the H8 track, round 1: ADR-022 + a staged dependency-contract amendment + work-plan ratification; documentation only) | **Ready (authorized) 2026-09-28** under the user's H8 rulings (option A; the package `@polymarket-bot/trading-core`; ADR-022 is written; the order H1 blockers → H8-GOV → checker hardening → CORE-MOVE → BACKTEST-2). The H1 blockers are merged (`fd30e5f`, `fff844d`). Runs under the HARDENING LOOP, reviewed by Codex gpt-6-astra.
+
+**Design basis:** the scoping `wf_5375df07-cc2`, whose synthesis holds the draft text for every item.
+
+**Scope** (the protected-contracts §3.1 bounded-repair shape, as GOV-1B/1C/1D did):
+  - **(1)** ADR-022 (Accepted), plus its README index row.
+  - **(2)** In `dependency-direction.md`:
+    - a STAGED, unparsed `#### PENDING` subsection in §2.1, in the GOV-2A form: text fences, and rows with no leading pipe. It carries the §2 Layer-1 fence line, the §2 prose, rows S8–S18, and the CORE-MOVE grant verbatim. The checker fails closed on a package with no manifest, so `CORE-MOVE` activates them;
+    - the two settlements that are true today (the ExecutionVenue bullet, and the §4 sentence; WP-210 follow_up 6);
+    - NOTHING the checker parses changes.
+  - **(3)** One precedent row in protected-contracts §5.
+  - **(4)** Dated work-plan ratification entries only:
+    - WP-230 `allowed_paths` gains `packages/trading-core/**`;
+    - WP-260/270/300/330 `forbidden_paths` gain it;
+    - dated notes on WP-210, WP-320 and WP-350.
+  - **(5)** `docs/handoffs/H8-GOV.md`, which quotes the CORE-MOVE grant and the optional checker-hardening grant.
+
+**Acceptance:**
+  - `check:deps` still reports the base's counts, with allowlist S0..S7.
+  - The unit counts are unchanged.
+  - An activation dry run in a scratch mirror PASSES at 35 packages with S0..S18. | BUNDLE-1 ✓, SNAP-1 ✓ | docs/adr/ADR-022-*.md (new), docs/adr/README.md (index row), docs/contracts/dependency-direction.md (the staged block + two settlements), docs/contracts/protected-contracts.md (§5 row), docs/spec/polymarket-bot-workplan.yaml (ratification entries only), docs/handoffs/H8-GOV.md. Forbidden: apps/**, packages/**, test/**, tools/**, pnpm-lock.yaml, package.json, tsconfig*, eslint.config.mjs, .github/**, db/**, the handoff spec, other ADRs, IMPLEMENTATION_STATUS.md. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
 
