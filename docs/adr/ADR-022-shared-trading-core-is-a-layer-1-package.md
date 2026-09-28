@@ -1,0 +1,411 @@
+# ADR-022: The shared trading core is a layer-1 package that both composition roots build
+
+- **Status:** Accepted
+- **Date:** 2026-09-28
+- **Recorded by:** `H8-GOV`, an orchestrator-authorized governance round in the
+  [`protected-contracts.md`](../contracts/protected-contracts.md) §3.1
+  bounded-repair shape. It records the user's ruling **H8** (option A,
+  2026-09-28).
+- **Implemented by:** CORE-MOVE (pending), BACKTEST-2 (pending). **No
+  implementation exists yet.** At this record's date the core still lives in
+  `apps/trader/src`, and this ADR changes no code. `CORE-MOVE` moves the core;
+  `BACKTEST-2` makes the backtest executable build it and closes blocker B3.
+- **Supersedes / Superseded by:** none. It refines handoff §4.1 and §5 as a
+  reading, not an edit (D2). It amends
+  [`dependency-direction.md`](../contracts/dependency-direction.md) §2 and
+  §2.1 through text staged by `H8-GOV` and activated by `CORE-MOVE`
+  (D8).
+- **Handoff sections:** §2, §4, §4.1, §5, §5.2, §6 (invariant 17), §8.1, §11,
+  §12.1, §12.4, §14.2
+
+*Line numbers below are at `a8a3a63`, this round's base. The handoff has never
+been edited since the seed commit `58fe7ee`, so its line numbers are stable.
+`H8-GOV`'s own edits shift the later lines of `dependency-direction.md` and of
+the work plan. For those files, the section or entry named beside each number
+is the durable reference.*
+
+## Context
+
+1. **The handoff fixes one core.**
+   - §2 (`docs/spec/polymarket-bot-orchestrator-handoff.md:123`) says:
+     "Simulation | Same strategy and core engine code; only clock, event
+     source, and execution venue are swapped".
+   - §8.1 (:672) says: "The trader uses one deterministic core event loop".
+   - §12.1 (:1428) says: "Everything between event input and the
+     `ExecutionVenue` interface is shared."
+   - §4's diagram draws one core box,
+     `subgraph CORE[Single Active Trading Process]` (:224). The live
+     publisher feeds it (`PUB --> CORE`, :222), and so does the replay path
+     (`PARQUET --> REPLAY`, `REPLAY --> SIM`, `SIM --> CORE`, :259-261).
+   - §0.1 (:32) wants the first trading deliverable to run "through the same
+     strategy, risk, execution-planning, OMS, ledger, and PnL paths later used
+     for real orders".
+2. **The work plan pulls two ways.**
+   - `WP-210`'s goal promises the core from the replay side: "Execute the same
+     core logic against historical/live data …" (work plan :817). Its paths
+     include `apps/backtest-cli/**` (:821).
+   - `WP-230` assigns the assembly to the trader: its goal is "Assemble books,
+     features, strategy runtime, risk, planner, simulation, and ledger in the
+     trader process" (:883), its path is `apps/trader/**` (:886), and its
+     deliverable is "deterministic core event loop" (:906).
+   - `WP-230` ran, so the only composition in the repository is
+     `createPaperTrader` (`apps/trader/src/trader.ts:173`) and `CoreLoop`
+     (`apps/trader/src/loop.ts:490`).
+3. **The dependency contract forbids the one edge that would let the backtest
+   root build that composition.**
+   - `dependency-direction.md` §2 says "Nothing may depend on an app." (:127).
+   - §3 F10 forbids "Any package depending on an `apps/*` package" (:506), and
+     F13 forbids an unlisted same-layer edge (:509).
+   - `BACKTEST-1`'s reviewer proved it: declaring
+     `"@polymarket-bot/trader": "workspace:*"` in `apps/backtest-cli` gives
+     `FAIL [F13]` (`docs/handoffs/BACKTEST-1.md:50-60`).
+   - So blocker **B3** was narrowed, not closed. The shipped replay root drives
+     the real core only when a test harness hands it one, and the harness's
+     venue wiring is a copy of `main.ts`'s (`IMPLEMENTATION_STATUS.md`, row
+     **B3**).
+4. **The core is already layer-1 code by construction.** The following was
+   measured at `a8a3a63` by `H8-GOV`. The method was the TypeScript
+   pre-processor over every static, dynamic and type-only relative import,
+   starting at `apps/trader/src/trader.ts`.
+   - **Size.** The import closure is 25 files and 11,218 lines: `accounting`,
+     `allocation`, `basket-execution`, `cancels`, `config`, `event-door`,
+     `fills`, `folds`, `halt`, `health`, `instances`, `loop`, `market-state`,
+     `order-lifecycle`, `orders`, `pipeline`, `pnl-snapshot-key`, `ports`,
+     `projection`, `queue`, `reference-state`, `reservations`, `safety`,
+     `time`, `trader`.
+   - **Dependencies.** It reaches 13 workspace packages. Eleven are layer 1:
+     `capital-allocator`, `execution-planner`, `features`, `ledger`,
+     `order-book`, `pnl`, `risk`, `simulation`, `strategy-runtime`,
+     `strategy-sdk` (types only) and `strategies/static-bracket`. The other
+     two are the layer-0 `decimal` and `domain`. It also uses `zod`.
+   - **What it does not touch.** It imports no layer-2 package: no
+     `event-bus`, no `storage-*`, no `polymarket-*`. It imports no `node:`
+     module. It reads no clock: its only `Date` construction,
+     `apps/trader/src/time.ts:68`, `new Date(epochMs)`, converts an instant it
+     was given. It references no process global. Everything that owns a
+     connection is outside the closure: the Redis feed, the PostgreSQL store
+     and registration check, the `node:http` health server, the pump and the
+     entry point.
+   - The H8 scoping measured 24 files and 10,879 lines at `60a5d7e`. The one
+     file added since is `SNAP-1`'s `pnl-snapshot-key.ts`.
+5. **The interim state, set by the same ruling.** §7 item 4's replay half is
+   met *with qualification*, and B3 is **accepted as qualified, not closed**
+   (`IMPLEMENTATION_STATUS.md`, rows **B3** and **H8 track**). B3 closes when
+   `BACKTEST-2` lands.
+6. **The ruling.** On 2026-09-28 the user ruled:
+   - option A, with the package named `@polymarket-bot/trading-core`;
+   - this ADR is written;
+   - a strategy-agnostic core (the scoping's "D4") waits for a second
+     strategy;
+   - `FOLD-2` runs after `BACKTEST-2`;
+   - the order is the H1 blockers, then `H8-GOV`, then an optional
+     checker-hardening round, then `CORE-MOVE`, then `BACKTEST-2`.
+
+   The ruling is recorded in `IMPLEMENTATION_STATUS.md`, row **H8 track**.
+
+## Decision
+
+### D1. Where the core lives
+
+The `createPaperTrader` / `CoreLoop` import closure moves to
+`packages/trading-core` (`@polymarket-bot/trading-core`), which
+`dependency-direction.md` §2 classifies in **layer 1**. `apps/trader` keeps
+`main.ts`, `pump.ts`, `pnl-observation.ts`, `health-server.ts`, `adapters/*`,
+and the two re-export facades (`src/index.ts`, `src/testing/index.ts`). The
+name says what the package is in every run mode, not only on today's
+execution path ("paper"): the same core is meant to run later behind a real
+venue (§2 :123, §12.1).
+
+*Testable:* after `CORE-MOVE`, `check:deps` classifies `packages/trading-core`
+as layer 1, and each closure file exists once, under
+`packages/trading-core/src`.
+
+### D2. §4.1 describes deployable processes, not where code lives
+
+This is a reading of the handoff, argued from its own text:
+
+1. §4.1 opens with "V1 consists of these deployable processes:" (:271).
+   It lists processes.
+2. Its `apps/trader` entry "Runs books, features, strategies, risk, OMS,
+   user stream, heartbeat, reconciliation, ledger projections, and live
+   execution" (:282-283). §5's tree places the modules behind those words
+   in `packages/*`, not under `apps/trader`: `order-book`, `features`,
+   `strategy-runtime` and `strategies/`, `risk`, `oms`, `ledger`, and
+   `polymarket-secure` (:320-349). So "runs" already means that the process
+   executes code that lives in packages.
+3. §4.1 lists an `apps/cli` (:293) that §5 does not have; §5 has
+   `apps/backtest-cli` and `apps/ops-cli` (:318-319). §4.1 is therefore
+   not a directory layout.
+4. §4's diagram feeds one core box from both the live publisher and the
+   replay path (:222, :224, :259-261), which is the arrangement this
+   decision makes buildable.
+
+So `apps/trader` still "Owns the live deterministic event loop" (:281) in
+§4.1's sense. It remains the **only deployable process that runs the core
+on live data**: it assembles the core at startup, feeds it and runs it.
+`WP-230`'s "in the trader process" (:883) still holds literally, because
+code a process imports runs in that process. `packages/trading-core` owns
+the code.
+
+The handoff is **not edited**. Precedence puts it above this record
+(handoff :57-62), and it has one commit, the seed. The package's addition to
+§5's tree (:311-381) is recorded here, and nowhere in the handoff.
+
+*Testable:* no process other than `apps/trader` runs the core against live
+data, and no `H8` round changes
+`docs/spec/polymarket-bot-orchestrator-handoff.md`.
+
+### D3. What the core may depend on
+
+The core declares only layer-0 and layer-1 workspace packages, plus `zod`.
+
+- It has no `dependency-direction.md` §2.2 built-in row, because it
+  imports no `node:` module.
+- The clock, the event source and the venue enter only through the §12.1
+  ports: `Clock`, `MarketEventSource` and `ExecutionVenue`, which `WP-210`
+  declared in `packages/simulation`.
+- The core is layer 1, so F12 fails any declared edge from it to a layer-2
+  package: `event-bus` (Redis), `storage-*` (PostgreSQL, WAL, Parquet) or
+  `polymarket-secure` (the signer). "A backtest cannot reach Redis,
+  PostgreSQL or a signer through the core" is therefore a **gate result**.
+- F17 forbids a production `node:` import in the core. F17 is stated but
+  not yet implemented by the §6 check, so that half rests on review and
+  census until the tooling follow-up lands.
+
+### D4. The core's same-layer edges
+
+The core's same-layer edges are exactly `dependency-direction.md` §2.1 rows
+**S8-S18**, with one cited row per target and no class-glob row.
+
+- **No same-layer package may declare the core.** Such a reverse edge would
+  be F9 plus an unlisted F13, and no row will be written for it.
+- F10 stays unconditional, and no §2.1 row may run from one app to another.
+- Row **S14** is the one edge into `packages/risk` that carries the risk
+  **engine**. It may not be cited to widen the door-only rows S3-S7, and
+  they may not be cited against it.
+
+*Testable:* after `CORE-MOVE`, `check:deps` passes with the allowlist
+exactly S0..S18.
+
+### D5. Both composition roots build the same core
+
+- `apps/trader` builds the core through its exported builders, and so does
+  `apps/backtest-cli` from `BACKTEST-2` on. Each root depends on the core
+  downward (layer 3 → 1), so neither edge needs a row.
+- From `BACKTEST-2` on, the simulated venue is constructed in **one**
+  place, a builder in the core. Four copies exist today:
+  `apps/trader/src/main.ts:485`, `test/e2e/support/harness.ts:142`,
+  `test/integration/paper-trader/support/fixture.ts:671` and
+  `test/unit/simulation/backtest-replay-support.ts:264`. All of them call
+  the builder instead.
+- The loop depends only on the §12.1 interfaces and never branches on
+  whether it runs in simulation (`dependency-direction.md` §4; handoff
+  §12.4). The builder is a factory that a root chooses to call, and a live
+  root will not call it.
+
+*Testable:* after `BACKTEST-2`, `new SimulatedVenue(` appears outside
+`packages/simulation` only in the core's builder and in unit tests that
+build a venue on purpose.
+
+### D6. The core keeps its PAPER ceiling
+
+- The ceiling is `REPOSITORY_MAXIMUM_RUN_MODE` and `TRADER_RUN_MODE =
+  "PAPER"` (`apps/trader/src/safety.ts:67`, `:70`) and
+  `environment: z.literal("PAPER")` (`config.ts:429`). These move
+  byte-identical with `CORE-MOVE`.
+- `BACKTEST` is below that ceiling. The core's accounting type already
+  admits `BACKTEST | PAPER | SHADOW` (`accounting.ts:149`), which are the
+  three simulated-execution modes (handoff §11 :1396-1398).
+- `BACKTEST-2` drives the core with these constants unchanged. The
+  mismatch between the backtest root's `BACKTEST` label and the core's
+  PAPER constants is recorded as a residual, not changed.
+- Every root that builds the core runs its startup safety validation
+  first (handoff §6 invariant 17, :432; ADR-010 §3): `apps/trader`'s
+  `checkPaperTraderSafety` and `apps/backtest-cli`'s `safety.ts`.
+- **Raising the ceiling** is a human-gated change under ADR-010 §1
+  (:37-41). So is letting the core run in any mode with real execution,
+  and no round may do either without that gate. ADR-010 also rules any
+  future ADR that touches these numbers out of order unless a human gate
+  is already recorded (:198-200). `MAX_RUN_MODE=PAPER`,
+  `ALLOW_REAL_ORDERS=false`, `LIVE_MICRO_MAX_ORDER_NOTIONAL=0` and
+  `LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0` are unchanged.
+
+*Testable:* the core's run-mode constants are byte-identical before and
+after each `H8` round.
+
+### D7. The facades stay until a later round retires them
+
+`@polymarket-bot/trader` and `@polymarket-bot/trader/testing` keep
+re-exporting every moved symbol under the same name and the same value/type
+kind. No per-module shim is left at an old path.
+
+*Testable:* `CORE-MOVE` shows the exported names and kinds of both entry
+points are equal before and after the move.
+
+### D8. How the change lands (the `GOV-2A` → `WP-180-FU2` precedent)
+
+- `H8-GOV` stages the contract text in an unparsed `#### PENDING`
+  subsection of `dependency-direction.md` §2.1: the §2 fence line, the §2
+  paragraph, rows S8-S18 and the `CORE-MOVE` grant. It is staged because:
+  - the check fails closed on a §2 entry that has no manifest
+    (`F-CLOSED`);
+  - it fails closed on a row that names an unclassified endpoint (`CHK`);
+  - §6.1 item 5 puts the pinned allowlist assertion in `test/**`, outside
+    a governance round.
+- `CORE-MOVE` activates the text **in the change that creates
+  `packages/trading-core/package.json`**. It:
+  - moves the text verbatim into §2 and §2.1, restoring each row's leading
+    pipe;
+  - updates the pin to S0..S18;
+  - records a dated §6 graph note with the **measured** count;
+  - replaces the subsection with a dated DONE note that keeps the grant.
+- `CORE-MOVE` moves code and changes none. Every moved file keeps its
+  bytes except the specifier-only edits its grant enumerates.
+  `test/replay-golden/**` stays byte-identical.
+
+### D9. Static Bracket stays wired into the core until the core is made strategy-agnostic
+
+- The core depends on the concrete package
+  `packages/strategies/static-bracket` (row S18).
+- The user deferred a strategy-agnostic core until a second strategy
+  exists. The round that makes the core strategy-agnostic **removes S18 in
+  the same change**.
+- The check does not flag a row that matches no declared edge, so that
+  removal is an obligation on the round, not a gate result.
+- A second strategy gets its own cited row. No class-glob row is written.
+
+### D10. Wave-3 live components stay in layers 2 and 3 and attach through the core's ports
+
+- The secure SDK adapter, OMS persistence, the user stream,
+  reconciliation, inventory, rate-limit budgets, fencing and heartbeat,
+  and execution probes (`WP-260` to `WP-350`) keep their own paths.
+- A live component that needs a hook inside the loop gets a bounded
+  `packages/trading-core/**` grant at its authorization. This follows the
+  grant-at-authorization precedent (work plan, the `WP-210` comment at
+  :806-816).
+- `WP-260`, `WP-270`, `WP-300` and `WP-330` are forbidden
+  `packages/trading-core/**`, exactly as they are forbidden
+  `apps/trader/**` (dated work-plan entries, `H8-GOV`).
+- `WP-320` and `WP-350` keep their `apps/trader/src/**` grants. Their
+  live-process wiring (a PostgreSQL fencing lease, a venue heartbeat,
+  probe orders on a real venue) depends on layer-2 packages that F12
+  bars from the core.
+
+## Consequences
+
+**What this buys.**
+
+- B3 closes at `BACKTEST-2`: the backtest executable builds the same core
+  itself, and no harness hands it one.
+- "A backtest cannot reach Redis, PostgreSQL or a signer through the core"
+  becomes an F12 gate result.
+- §12.1 holds literally: one core, with three ports swapped.
+- Handoff §14.2's `ops-cli replay <manifest> <config>` (:1692) can reuse the
+  core through a downward edge. Under option B it would have needed a second
+  app-to-app exception.
+
+**What it costs.**
+
+- Eleven same-layer rows (S8-S18), the most of any package. Each one is
+  measured and cited.
+- A move of about 40 files. It needs an exclusive window, with no other
+  `apps/trader/src` grant in flight. Queued packets that name old paths must
+  be re-pathed after it.
+- Accepted ADRs cite paths that move: ADR-016 :270-273 cites `trader.ts:143`
+  and `accounting.ts:289`, and ADR-021 :25 and :86 cite
+  `apps/trader/src/config.ts`. Frozen handoff records do the same. They stay
+  as history and are not edited (README, "Status vocabulary").
+- Some comments become false with the move:
+  - `apps/trader/src/ports.ts:14-17` ("consumed only from layer 3");
+  - `packages/simulation/src/ports.ts:44-46`;
+  - `apps/backtest-cli/src/core-loop.ts:19-36`;
+  - `apps/trader/package.json`'s `description`.
+
+  `CORE-MOVE` leaves the moved files byte-identical, so `BACKTEST-2` owns
+  these corrections.
+- Blame and log on moved files need `--follow` or `-C`.
+- Undoing the decision takes another move round.
+
+**What it forecloses.**
+
+- An edge from one app to another stays forbidden.
+- The core can never declare a layer-2 package. A live concern that needs
+  one stays in a composition root and reaches the loop through a port.
+
+**Alternatives rejected.**
+
+- **B, a cited §2.1 exception for `apps/backtest-cli` → `apps/trader`.**
+  - It would amend a rule that has no exceptions: §2 :127 is unconditional,
+    and so is F10.
+  - The check implements no F10 today (the tool contains no `F10` id). The
+    H8 scoping reproduced that such a row is **accepted silently** (probe P3:
+    exit 0, 81 edges), so the exception would open a hole, not a gate.
+  - The backtest's closure would grow to the trader's whole manifest,
+    including `event-bus` (Redis) and `storage-postgres`.
+- **C, the qualified wording.** Kept only as the interim state until
+  `BACKTEST-2` (Context 5).
+- **A new layer for compositions, between layer 1 and layer 3.**
+  - Placed above layer 2, it would let the core declare adapters downward,
+    and the F12 guarantee in D3 would be lost.
+  - Placed below layer 2, it is layer 1 by §2's own definition: logic that
+    owns no connection. Renumbering would break the tooling suite's layer
+    pins for no gain.
+- **Leave the core in `apps/trader` and let the backtest root compose its own
+  copy.** Rejected. A second assembly is the second code path §12.1 forbids,
+  and it is the very qualification B3 carries today: the harness's venue
+  wiring is a copy of `main.ts`'s.
+- **A strategy-agnostic core now.** Deferred by the ruling, not rejected
+  (D9).
+
+## Evidence
+
+- **Handoff** (`docs/spec/polymarket-bot-orchestrator-handoff.md`, unchanged
+  since `58fe7ee`):
+  - §0.1 :32; §1.1 :57-62; §2 :123;
+  - §4 :222, :224, :259-261;
+  - §4.1 :271, :280-283, :293;
+  - §5 :311-381 (`apps/*` :313-319);
+  - §6 invariant 17 :432; §8.1 :672;
+  - §11 :1396-1398, :1403; §12.1 :1428; §12.4 :1485;
+  - §14.2 :1692.
+- **Work plan** (`docs/spec/polymarket-bot-workplan.yaml`, at `a8a3a63`):
+  - `WP-210`: :806-816 (the grant-at-authorization comment), :817, :821;
+  - `WP-230`: :883, :884, :886, :906;
+  - the `forbidden_paths` entries `apps/trader/**` at :984 (`WP-260`),
+    :1007 (`WP-270`), :1073 (`WP-300`) and :1141 (`WP-330`);
+  - `WP-320` :1112; `WP-350` :1185.
+- **Contracts, at `a8a3a63`:**
+  - `docs/contracts/dependency-direction.md`: §2 :75-76 and :127; §2.1
+    :129-145; §2.2 :385; §3 F10 :506, F12 :508, F13 :509, F17 :513; §4
+    :576-582; §6 rule 2 :706-715; §6.1 item 5 :800;
+  - `docs/contracts/protected-contracts.md` §3.1 and §5.
+- **ADRs:** ADR-010 §1 :37-41, §3 :74-77, and :198-200.
+- **Handoff records:**
+  - `docs/handoffs/BACKTEST-1.md:50-60` (the F13 proof, and "no third
+    option");
+  - `docs/handoffs/WP-210.md:80-82` (deviation 3: the §12.1 interfaces land
+    in `packages/simulation`) and :122-123 (`follow_up` 6).
+- **Status:** `IMPLEMENTATION_STATUS.md` rows **B3**, **BACKTEST-1** and
+  **H8 track** (the ruling and the interim state).
+- **Measured by `H8-GOV` at `a8a3a63`.** The scripts and outputs are listed
+  in `docs/handoffs/H8-GOV.md`.
+  - The closure and its bindings (Context 4).
+  - `check:deps`: 34 packages, 80 edges, allowlist S0..S7, PASS.
+  - The activation dry run in a scratch mirror. The staged fence line and
+    rows were activated and a `packages/trading-core/package.json` was added
+    declaring the 13 workspace packages plus `zod`. The result was **PASS, 35
+    packages, 93 edges, allowlist S0..S18**. Adding
+    `apps/trader → trading-core` gave 94 edges and still passed.
+- **Reproduced by the H8 scoping (`wf_5375df07-cc2`, at `60a5d7e`)**, and
+  re-run by `H8-GOV` at `a8a3a63` against this round's staged text (the
+  output is quoted in `docs/handoffs/H8-GOV.md`):
+  - the fail-closed staging failures, `F-CLOSED` and `CHK` (probes A5-A7);
+  - the unparsed staging form passes (A8);
+  - a pipe-led row is parsed even inside a fence (A9);
+  - a fence annotation naming a package path reassigns that package (A10);
+  - a class-glob row is `CHK` (A11);
+  - a row with no matching edge is not flagged (A12);
+  - an app-to-app row is accepted silently (P3).
+- **Venue facts:** none. **Safety defaults:** none touched. **Schema
+  version:** no emitted field set changes; this record changes no code, so no
+  `schemaVersion` changes.
