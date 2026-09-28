@@ -224,9 +224,10 @@ interface Mutations {
    * Workspace dependencies removed from a surviving manifest: package
    * directory → dependency names dropped. Exists so `removePackages` cases
    * stay realistic once real consumers exist — removing
-   * `packages/strategies/static-bracket` alone leaves `apps/trader`'s real
-   * dependency on it dangling, and the checker rightly reports `CHK`
-   * (`WP-230` integration, 2026-09-05).
+   * `packages/strategies/static-bracket` alone leaves `packages/trading-core`'s
+   * real dependency on it dangling (`apps/trader`'s until `CORE-MOVE` moved it,
+   * 2026-09-28), and the checker rightly reports `CHK` (`WP-230` integration,
+   * 2026-09-05).
    */
   readonly removeDependencies?: Readonly<Record<string, readonly string[]>>;
   /** Brand-new workspace members: package directory → package name. */
@@ -453,6 +454,7 @@ describe("dependency-direction check on this repository", () => {
     expect(layerOf("packages/decimal")).toBe(0);
     expect(layerOf("packages/domain")).toBe(0);
     expect(layerOf("packages/strategies/static-bracket")).toBe(1);
+    expect(layerOf("packages/trading-core")).toBe(1);
     expect(layerOf("packages/event-bus")).toBe(2);
     expect(layerOf("apps/ops-cli")).toBe(3);
   }, REPOSITORY_READER_TIMEOUT_MS);
@@ -655,7 +657,7 @@ describe("dependency-direction check on fixture graphs", () => {
     const run = await runChecker(
       buildFixture({
         removePackages: ["packages/strategies/static-bracket"],
-        removeDependencies: { "apps/trader": ["@polymarket-bot/strategy-static-bracket"] },
+        removeDependencies: { "packages/trading-core": ["@polymarket-bot/strategy-static-bracket"] },
       }),
     );
     expect(run.output).toContain("PASS");
@@ -1026,6 +1028,17 @@ describe("dependency-direction check — round-1 review regressions", () => {
         "S5",
         "S6",
         "S7",
+        "S8",
+        "S9",
+        "S10",
+        "S11",
+        "S12",
+        "S13",
+        "S14",
+        "S15",
+        "S16",
+        "S17",
+        "S18",
       ]);
       for (const row of report.allowlist) expect(row.layer).not.toBeNull();
     }, REPOSITORY_READER_TIMEOUT_MS);

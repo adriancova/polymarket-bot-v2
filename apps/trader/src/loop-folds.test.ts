@@ -80,25 +80,25 @@ import type { Strategy, StrategyContext } from "@polymarket-bot/strategy-sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
-import { DeterministicIdFactory, type PostingIdentity } from "./accounting.js";
-import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "./allocation.js";
-import { configuredFeatureKeys, parseTraderConfig } from "./config.js";
+import { DeterministicIdFactory, type PostingIdentity } from "@polymarket-bot/trading-core";
+import { AllocatorGate, allocationMarketOf, type AllocationMarket } from "@polymarket-bot/trading-core";
+import { configuredFeatureKeys, parseTraderConfig } from "@polymarket-bot/trading-core";
 import {
   EVERY_FILL_ACCOUNTING_CHECKS,
   PAPER_ACCOUNTING_CHECKS,
   type AccountingChecks,
-} from "./folds.js";
-import { HaltController } from "./halt.js";
-import { HealthState, RealizedPnlBook } from "./health.js";
+} from "@polymarket-bot/trading-core";
+import { HaltController } from "@polymarket-bot/trading-core";
+import { HealthState, RealizedPnlBook } from "@polymarket-bot/trading-core";
 import { healthResponseBody } from "./health-server.js";
-import { InstanceRegistry } from "./instances.js";
-import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "./loop.js";
-import { MarketState } from "./market-state.js";
+import { InstanceRegistry } from "@polymarket-bot/trading-core";
+import { CoreLoop, DecisionOutboxBuffer, type TraderVenue } from "@polymarket-bot/trading-core";
+import { MarketState } from "@polymarket-bot/trading-core";
 import { observeRealizedPnl } from "./pnl-observation.js";
-import { portFailed, type IngestedEvent } from "./ports.js";
-import { REPOSITORY_MAXIMUM_RUN_MODE, TRADER_RUN_MODE } from "./safety.js";
+import { portFailed, type IngestedEvent } from "@polymarket-bot/trading-core";
+import { REPOSITORY_MAXIMUM_RUN_MODE, TRADER_RUN_MODE } from "@polymarket-bot/trading-core";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";
-import { formatStrictUtc } from "./time.js";
+import { formatStrictUtc } from "@polymarket-bot/trading-core";
 
 type ApplyTransaction = typeof LedgerModule.applyTransaction;
 type BuildFillPosting = typeof LedgerModule.buildFillPosting;

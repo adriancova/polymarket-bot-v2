@@ -52,15 +52,15 @@
 import { describe, expect, it } from "vitest";
 
 import { PostgresTraderStore } from "../../../apps/trader/src/adapters/postgres-store.js";
-import { pnlSnapshotKey } from "../../../apps/trader/src/pnl-snapshot-key.js";
-import type { PortResult } from "../../../apps/trader/src/ports.js";
+import { pnlSnapshotKey } from "../../../packages/trading-core/src/pnl-snapshot-key.js";
+import type { PortResult } from "../../../packages/trading-core/src/ports.js";
 import {
   DUPLICATE_PNL_SNAPSHOT_DETAIL,
   MISSING_PNL_SNAPSHOT_DETAIL,
   MemoryTraderStore,
   PNL_SNAPSHOT_SCOPE_UNIQUE,
 } from "../../../apps/trader/src/testing/index.js";
-import { normalizeToStrictUtc } from "../../../apps/trader/src/time.js";
+import { normalizeToStrictUtc } from "../../../packages/trading-core/src/time.js";
 import type { PnlSnapshot } from "../../../packages/pnl/src/index.js";
 import type { PolymarketBotDatabase } from "../../../packages/storage-postgres/src/database.js";
 

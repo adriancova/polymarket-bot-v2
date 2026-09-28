@@ -177,27 +177,15 @@ importers:
       '@polymarket-bot/capital-allocator':
         specifier: workspace:*
         version: link:../../packages/capital-allocator
-      '@polymarket-bot/decimal':
-        specifier: workspace:*
-        version: link:../../packages/decimal
       '@polymarket-bot/domain':
         specifier: workspace:*
         version: link:../../packages/domain
       '@polymarket-bot/event-bus':
         specifier: workspace:*
         version: link:../../packages/event-bus
-      '@polymarket-bot/execution-planner':
-        specifier: workspace:*
-        version: link:../../packages/execution-planner
-      '@polymarket-bot/features':
-        specifier: workspace:*
-        version: link:../../packages/features
       '@polymarket-bot/ledger':
         specifier: workspace:*
         version: link:../../packages/ledger
-      '@polymarket-bot/order-book':
-        specifier: workspace:*
-        version: link:../../packages/order-book
       '@polymarket-bot/pnl':
         specifier: workspace:*
         version: link:../../packages/pnl
@@ -216,9 +204,9 @@ importers:
       '@polymarket-bot/strategy-sdk':
         specifier: workspace:*
         version: link:../../packages/strategy-sdk
-      '@polymarket-bot/strategy-static-bracket':
+      '@polymarket-bot/trading-core':
         specifier: workspace:*
-        version: link:../../packages/strategies/static-bracket
+        version: link:../../packages/trading-core
       zod:
         specifier: ^4.4.3
         version: 4.4.3
@@ -706,6 +694,58 @@ importers:
       typescript:
         specifier: ^5.9.2
         version: 5.9.3
+
+  packages/trading-core:
+    dependencies:
+      '@polymarket-bot/capital-allocator':
+        specifier: workspace:*
+        version: link:../capital-allocator
+      '@polymarket-bot/decimal':
+        specifier: workspace:*
+        version: link:../decimal
+      '@polymarket-bot/domain':
+        specifier: workspace:*
+        version: link:../domain
+      '@polymarket-bot/execution-planner':
+        specifier: workspace:*
+        version: link:../execution-planner
+      '@polymarket-bot/features':
+        specifier: workspace:*
+        version: link:../features
+      '@polymarket-bot/ledger':
+        specifier: workspace:*
+        version: link:../ledger
+      '@polymarket-bot/order-book':
+        specifier: workspace:*
+        version: link:../order-book
+      '@polymarket-bot/pnl':
+        specifier: workspace:*
+        version: link:../pnl
+      '@polymarket-bot/risk':
+        specifier: workspace:*
+        version: link:../risk
+      '@polymarket-bot/simulation':
+        specifier: workspace:*
+        version: link:../simulation
+      '@polymarket-bot/strategy-runtime':
+        specifier: workspace:*
+        version: link:../strategy-runtime
+      '@polymarket-bot/strategy-sdk':
+        specifier: workspace:*
+        version: link:../strategy-sdk
+      '@polymarket-bot/strategy-static-bracket':
+        specifier: workspace:*
+        version: link:../strategies/static-bracket
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+    devDependencies:
+      typescript:
+        specifier: ^5.9.2
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@24.13.3)(supports-color@7.2.0)(yaml@2.9.0)
 
   packages/universe:
     dependencies:

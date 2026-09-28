@@ -17,20 +17,16 @@
   },
   "dependencies": {
     "@polymarket-bot/capital-allocator": "workspace:*",
-    "@polymarket-bot/decimal": "workspace:*",
     "@polymarket-bot/domain": "workspace:*",
     "@polymarket-bot/event-bus": "workspace:*",
-    "@polymarket-bot/execution-planner": "workspace:*",
-    "@polymarket-bot/features": "workspace:*",
     "@polymarket-bot/ledger": "workspace:*",
-    "@polymarket-bot/order-book": "workspace:*",
     "@polymarket-bot/pnl": "workspace:*",
     "@polymarket-bot/risk": "workspace:*",
     "@polymarket-bot/simulation": "workspace:*",
     "@polymarket-bot/storage-postgres": "workspace:*",
-    "@polymarket-bot/strategy-static-bracket": "workspace:*",
     "@polymarket-bot/strategy-runtime": "workspace:*",
     "@polymarket-bot/strategy-sdk": "workspace:*",
+    "@polymarket-bot/trading-core": "workspace:*",
     "zod": "^4.4.3"
   },
   "devDependencies": {

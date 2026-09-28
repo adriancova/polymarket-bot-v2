@@ -141,7 +141,7 @@
 
 import type { PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";
 
-import type { TraderConfig } from "../config.js";
+import type { TraderConfig } from "@polymarket-bot/trading-core";
 
 export interface RegistrationRefusal {
   readonly code:

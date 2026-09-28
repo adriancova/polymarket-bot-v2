@@ -103,7 +103,7 @@ import { projectionOf } from "./accounting.js";
 import { AllocatorGate } from "./allocation.js";
 import { EVERY_FILL_ACCOUNTING_CHECKS, type AccountingChecks } from "./folds.js";
 import type { TraderVenue } from "./loop.js";
-import { createExecutionPolicy, type VenueWiring } from "./main.js";
+import { createExecutionPolicy, type VenueWiring } from "./venue-policy.js";
 import type { RetentionBounds } from "./order-lifecycle.js";
 import type { IngestedEvent } from "./ports.js";
 import { ManualClock, MemoryTraderStore } from "./testing/index.js";

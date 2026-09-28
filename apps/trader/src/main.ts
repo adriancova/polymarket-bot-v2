@@ -104,16 +104,14 @@ import {
   tier0Model,
   unmodeledRateLimits,
   type BookView,
-  type PlannedOrderView,
-  type TimeInForce,
 } from "@polymarket-bot/simulation";
 import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
 
 import { verifyRegisteredRows } from "./adapters/postgres-registration.js";
 import { PostgresTraderStore } from "./adapters/postgres-store.js";
 import { RedisMarketEventFeed } from "./adapters/redis-feed.js";
-import { parseTraderConfig, type TraderConfig } from "./config.js";
-import { RealizedPnlBook } from "./health.js";
+import { parseTraderConfig, type TraderConfig } from "@polymarket-bot/trading-core";
+import { RealizedPnlBook } from "@polymarket-bot/trading-core";
 import {
   readHealthServerEnv,
   startTraderHealthServer,
@@ -121,10 +119,13 @@ import {
   type RunningTraderHealthServer,
 } from "./health-server.js";
 import { observeRealizedPnl } from "./pnl-observation.js";
-import type { Clock } from "./ports.js";
+import type { Clock } from "@polymarket-bot/trading-core";
 import { pump } from "./pump.js";
-import { checkPaperTraderSafety } from "./safety.js";
-import { createPaperTrader, type PaperTrader } from "./trader.js";
+import { checkPaperTraderSafety } from "@polymarket-bot/trading-core";
+import { createPaperTrader, type PaperTrader } from "@polymarket-bot/trading-core";
+import { createExecutionPolicy, type VenueWiring } from "@polymarket-bot/trading-core";
+
+export { createExecutionPolicy, type VenueWiring };
 
 /** What the process exits with, so an operator can script against it. */
 export const EXIT_CODES = Object.freeze({
@@ -150,70 +151,6 @@ export interface StartupPorts {
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly readConfig: (path: string) => Promise<string>;
   readonly log: (line: string) => void;
-}
-
-/** The holder the venue's policy reads. See the module header. */
-export interface VenueWiring {
-  trader: PaperTrader | undefined;
-}
-
-/**
- * The §12.1 `ExecutionPolicy` this process gives the simulated venue.
- *
- * Extracted and exported so its ONE unresolvable case can be driven directly
- * (review round 1, MEDIUM-3): the reviewed tip left a bare `throw` here under a
- * `startup()` docstring that says "Never throws", with a comment asserting the
- * branch was unreachable and nothing exercising it either way.
- *
- * THE THROW STAYS, AND IT IS CONTAINED. `timeInForceFor` must answer a
- * `TimeInForce`; there is no refusal channel and no safe value — "a silently
- * assumed FAK would change every unfilled remainder's fate" is the seam's own
- * rule. The containment is `SimulatedVenue.submit`'s: it runs the policy inside
- * `totallyResult`, so a throw becomes a REFUSED `ExecutionResult` carrying a
- * `SIMULATION_*` code, which the loop counts as `submissionsRefused`. It never
- * reaches `startup`, and `apps/trader/src/main.test.ts` drives exactly that
- * path through a real `SimulatedVenue` rather than asserting it.
- *
- * What was genuinely missing is now here too: the process LOGS the unresolved
- * order, so a refusal an operator sees on the venue seam has a line naming the
- * planned order that caused it.
- */
-export function createExecutionPolicy(
-  wiring: VenueWiring,
-  log: (line: string) => void,
-): {
-  timeInForceFor: (order: PlannedOrderView) => TimeInForce;
-  statedExpiryNsFor: () => bigint | undefined;
-  sameInstantAdditionsFor: () => "NOT_OBSERVED";
-} {
-  return {
-    timeInForceFor(order: PlannedOrderView): TimeInForce {
-      const resolved = wiring.trader?.loop.timeInForceFor(order.plannedOrderId);
-      if (resolved === undefined) {
-        log(
-          `SUBMISSION REFUSED: no time-in-force was recorded for planned order ` +
-            `${order.plannedOrderId}. The composition root refuses to assume one (§12.1 ` +
-            "ExecutionPolicy); the venue contains this into a refused ExecutionResult and " +
-            "nothing was submitted.",
-        );
-        throw new Error(
-          `no time-in-force was recorded for planned order ${order.plannedOrderId}; the ` +
-            "composition root refuses to assume one (§12.1 ExecutionPolicy)",
-        );
-      }
-      return resolved;
-    },
-    statedExpiryNsFor(): bigint | undefined {
-      return undefined;
-    },
-    sameInstantAdditionsFor() {
-      // §12.2's CONSERVATIVE queue arm assumes we sit behind size added at our
-      // price in the same recorded instant. This process does not observe that
-      // — a book snapshot is an aggregate per level — so it says NOT_OBSERVED
-      // rather than claiming a zero it did not measure.
-      return "NOT_OBSERVED";
-    },
-  };
 }
 
 /**

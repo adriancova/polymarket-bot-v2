@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { HealthState, RealizedPnlBook, type HealthSnapshot } from "../../../apps/trader/src/health.js";
+import { HealthState, RealizedPnlBook, type HealthSnapshot } from "../../../packages/trading-core/src/health.js";
 import { healthResponseBody } from "../../../apps/trader/src/health-server.js";
 import { observeRealizedPnl } from "../../../apps/trader/src/pnl-observation.js";
 import { MemoryTraderStore } from "../../../apps/trader/src/testing/index.js";
@@ -211,7 +211,7 @@ describe("acceptance (c): no float anywhere on the PnL path (TRDR-3)", () => {
 
   it("the source files on the path contain no Number(...), parseFloat or parseInt", () => {
     for (const path of [
-      "apps/trader/src/health.ts",
+      "packages/trading-core/src/health.ts",
       "apps/trader/src/pnl-observation.ts",
       "packages/observability/src/control/samples.ts",
       "packages/observability/src/control/metric-shapes.ts",

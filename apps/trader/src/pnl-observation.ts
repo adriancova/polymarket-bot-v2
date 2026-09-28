@@ -42,8 +42,8 @@ import type {
   StrategyStateCheckpoint,
 } from "@polymarket-bot/strategy-runtime";
 
-import type { RealizedPnlBook } from "./health.js";
-import type { PortResult, TraderStore } from "./ports.js";
+import type { RealizedPnlBook } from "@polymarket-bot/trading-core";
+import type { PortResult, TraderStore } from "@polymarket-bot/trading-core";
 
 /** A `TraderStore` that records every ACCEPTED PnL snapshot's realized PnL in `book`. */
 export function observeRealizedPnl(store: TraderStore, book: RealizedPnlBook): TraderStore {
