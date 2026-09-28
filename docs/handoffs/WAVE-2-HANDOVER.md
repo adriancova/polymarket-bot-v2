@@ -123,6 +123,12 @@ depend on) or rule a cited §2.1 exception. The work plan itself created the
 tension (`WP-230` assigns the assembly to the trader; `WP-210` promises the same
 core from the CLI).
 
+*(RULED 2026-09-28 by the user: **option A**. The core moves into a new layer-1
+package that both roots build from, through three queued rounds: `H8-GOV` →
+`CORE-MOVE` → `BACKTEST-2`. Until those land, B3 is ACCEPTED AS QUALIFIED
+(interim), recorded with option C's wording in the ledger's B3 row. Scoping:
+workflow `wf_b7a8d34d-4f9`.)*
+
 ### H4 — elapsed soak evidence
 Wave 1's carry-over (`WP-140`), not a Wave 2 condition. `soak:evaluate` and
 `soak:compare-books` have run nowhere (`G-03`); only `soak:smoke` is gated.
