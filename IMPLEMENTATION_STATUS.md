@@ -2,7 +2,7 @@
 
 Last updated: 2026-09-15  
 Specification version: 2.0.0  
-Current phase: `phase-2` — deterministic paper core. **Wave 2 package work COMPLETE** (batches 2A-2G: WP-150/WP-170/WP-200/WP-180, WP-160/WP-190, WP-210, WP-220, WP-230, WP-240, WP-250, all merged and verified as ancestors of `main`; the inherited-`toJSON` sweep `SER-0` `9a44167` and its rounds `SER-1` `c065d63`, `SER-2` `0d8b6a0`, `SER-3` `603a49c` also complete). **Wave 2 is NOT closed out.** The runbook §10 read-only closeout audit WAS run on 2026-09-15 as `GOV-2B` (`b9bacc1`; record `docs/handoffs/GOV-2B-wave-2-closeout.md`), verdict **WAVE 2 IS NOT CLOSED**: every package met its own criteria and three COMPOSITION seams failed. **As of 2026-09-17 (`main` at the `UNIV-4` flip) every AGENT-closable closeout blocker is closed** — B1 (`TRDR-2`), B2 (`RISK-2`), B6/B7 (`GATE-1`), B8 (`GOV-2C`), B9 (`BOOT-1`), B5's code half (`TRDR-3`), G-01 (`VENUE-2`), B10 (`UNIV-4`); B3 is NARROWED (`BACKTEST-1`; needs ruling H8). **What remains is human or a ruling**: B4/H1 the live-data paper run (now attemptable, never attempted), B5's infra half/H3 (a real Prometheus + Grafana + import), H2 a real CI run (DISCHARGED 2026-09-26 by `CI-1`: PR #1 run `36282501033`, all gates green on GitHub), H4 elapsed soak evidence, H5 the runbook :509-vs-:514 ruling, H7 ratifications, H8 the composition-layer ruling, and §5 item 6's owner — enumerated in `## Open blockers` and handed over in `docs/handoffs/WAVE-2-HANDOVER.md`. What "COMPLETE" means and does not mean is stated in `## Wave 2 qualification` below. §7 checklist item 1 stays OPEN until `BRACKET-1c` and a fresh closeout. `BRACKET-1a` (`11969f3`) made the instance end CLOSED on its own exit. `BRACKET-1b` (`7252150`) recorded the first two-bracket run: a protective-reduce close, REARMED, then a FILLED take-profit, reconciled per bracket. That evidence is still in-memory doubles; the durable Postgres + Redis round trip is `BRACKET-1c` (ruling R1). Items 4 and 5 stay NOT MET on their human halves (item 4's replay half is ACCEPTED AS QUALIFIED in the interim, per H8). WP-260 and the eight remaining phase-3 packages stay deferred to Wave 3. *(This sentence was REWRITTEN 2026-09-17 at the `UNIV-4` flip, replacing rather than appending — per `GOV-2C`'s own residual on this line; the superseded sentence, with its two strikes and two dated notes, is preserved verbatim under `## Wave 2 qualification`, "Superseded header sentences".)*  
+Current phase: `phase-2` — deterministic paper core. **Wave 2 package work COMPLETE** (batches 2A-2G: WP-150/WP-170/WP-200/WP-180, WP-160/WP-190, WP-210, WP-220, WP-230, WP-240, WP-250, all merged and verified as ancestors of `main`; the inherited-`toJSON` sweep `SER-0` `9a44167` and its rounds `SER-1` `c065d63`, `SER-2` `0d8b6a0`, `SER-3` `603a49c` also complete). **Wave 2 is NOT closed out.** The runbook §10 read-only closeout audit WAS run on 2026-09-15 as `GOV-2B` (`b9bacc1`; record `docs/handoffs/GOV-2B-wave-2-closeout.md`), verdict **WAVE 2 IS NOT CLOSED**: every package met its own criteria and three COMPOSITION seams failed. **As of 2026-09-17 (`main` at the `UNIV-4` flip) every AGENT-closable closeout blocker is closed** — B1 (`TRDR-2`), B2 (`RISK-2`), B6/B7 (`GATE-1`), B8 (`GOV-2C`), B9 (`BOOT-1`), B5's code half (`TRDR-3`), G-01 (`VENUE-2`), B10 (`UNIV-4`); B3 is NARROWED (`BACKTEST-1`; needs ruling H8). **What remains is human or a ruling**: B4/H1 the live-data paper run (now attemptable, never attempted), B5's infra half/H3 (a real Prometheus + Grafana + import), H2 a real CI run (DISCHARGED 2026-09-26 by `CI-1`: PR #1 run `36282501033`, all gates green on GitHub), H4 elapsed soak evidence, H5 the runbook :509-vs-:514 ruling, H7 ratifications, H8 the composition-layer ruling, and §5 item 6's owner — enumerated in `## Open blockers` and handed over in `docs/handoffs/WAVE-2-HANDOVER.md`. What "COMPLETE" means and does not mean is stated in `## Wave 2 qualification` below. §7 checklist item 1 stays OPEN until a fresh closeout grades it. The user's 1a/1b/1c track is COMPLETE: `BRACKET-1a` (`11969f3`) makes the instance end CLOSED on its own exit; `BRACKET-1b` (`7252150`) records a two-bracket run with a FILLED take-profit, reconciled per bracket; and `BRACKET-1c` (`6e06c50`) runs the same round trip durably, through real PostgreSQL and Redis and the real composition root. `BRACKET-1c` also found `BRACKET1C-SNAPKEY`: the durable trader halts when one instant holds two fills. `SNAP-1` is fixing it. The trader's shipped bundle also crashes at load (`BUNDLE-1`). Both block H1. Items 4 and 5 stay NOT MET on their human halves; item 4's replay half is ACCEPTED AS QUALIFIED in the interim, per H8. WP-260 and the eight remaining phase-3 packages stay deferred to Wave 3. *(This sentence was REWRITTEN 2026-09-17 at the `UNIV-4` flip, replacing rather than appending — per `GOV-2C`'s own residual on this line; the superseded sentence, with its two strikes and two dated notes, is preserved verbatim under `## Wave 2 qualification`, "Superseded header sentences".)*  
 Maximum permitted run mode: `PAPER`
 
 ## Safety state
@@ -309,7 +309,7 @@ Record: `docs/handoffs/BRACKET-1a.md`.
 
 **Gates at `7d72dac`:** unit 345/7529, e2e 8/206 (twice), replay 3/17, control-api 10/87, trader integration 15/132 (Testcontainers).
 
-**CI:** PR #11 run `36423914292`, green.
+**CI:** PR #11 run `36423914292`, green. Post-merge `main` CI: run `36424718276` at `60a5d7e`, green.
 
 **New residual:** `BRACKET1B-RECON`.
 
@@ -339,9 +339,36 @@ Record: `docs/handoffs/BRACKET-1b.md`.
   - `N1`, by the pin-the-ratio route only. A wrong counter is reported, not fixed: it lives in `apps/trader`.
 
 **Closes:** `RISK2-R6`, `RECON2-EVENTHOP`, and (on acceptance) `SIM2-E2E-MSG` and `N1`. §7 item 1 is NOT claimed closed. | BRACKET-1a ✓ | test/e2e/**, test/replay-golden/paper-e2e/** (the NEW golden and README only; `paper-e2e-run.json` stays byte-identical), test/unit/simulation/venue-sim2.test.ts (the retention census only). Forbidden: packages/**, apps/**, test/integration/**, every other test/unit/** file, test/replay-golden/{backtest,order-book,simulation}/**, docs/**, db/**, protected files (no root package.json edit). Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
-| `BRACKET-1c` (§7 item 1: one DURABLE two-bracket round trip — real PostgreSQL + real Redis through the real composition root) | **Ready (authorized) 2026-09-28** under the user's ruling R1, on base = `main` after the `BRACKET-1b` flip. Runs under the HARDENING LOOP.
+| `BRACKET-1c` (§7 item 1: one DURABLE two-bracket round trip — real PostgreSQL + real Redis through the real composition root) | **Complete (2026-09-28)** — merged `6e06c50` (`--no-ff`; one commit `df0e8e4` on base `60a5d7e`). Run under the HARDENING LOOP (workflow `wf_726270df-fe0`). The Fable adversarial-reviewer returned r1 **ACCEPT**:
+  - it ran the containers itself: trader integration 16/135, twice;
+  - it traced the real path and re-derived the economics from the raw PostgreSQL rows;
+  - every mutation was caught;
+  - 2 LOW (`BR1C-R1-L1` coverage, `BR1C-R1-L2` non-load-bearing predicates).
 
-**Verifier: a Claude Fable `adversarial-reviewer`, not Codex.** This round's evidence is Testcontainers-only, and Codex's sandbox cannot start containers. This is the orchestrator's call, on the precedent the user approved for the spawn-heavy `CI-2` ("it'd also be ok to use a fable reviewer for that one instead, whatever you think its best").
+**Delivered:** a two-bracket round trip with 1b's shape, driven through:
+  - `assembleDurableTrader` on Testcontainers PostgreSQL;
+  - a Testcontainers Redis stream, consumed by the process's own `RedisMarketEventFeed` and `pump`;
+  - a SHUTDOWN rebuild check.
+
+**Read back from SQL:**
+  - 19 decisions, equal to the in-memory run and the 1b golden;
+  - checkpoints CLOSED/1 → ARMED/1 → CLOSED/2;
+  - ledger transactions per fill;
+  - PnL snapshots with realized `0, −1, −1, 7.5`, equal to a hand derivation written before the first run.
+
+A contrast test (`SystemPaperClock`, one pump) and a fee variant (3+3+3+2, snapshots equal to the 1b golden) also pass.
+
+**Ratified at merge (orchestrator):**
+  - deviation 1: the packet's clock premise is corrected. Strategy time is the envelope's `receivedAt`, not the paper clock.
+  - deviation 2: the fee-variant test is kept.
+
+**Found, and reported rather than fixed (outside the grant): `BRACKET1C-SNAPKEY` HIGH.** The durable trader GLOBAL-halts when one instant holds two fills for an instance. This blocks H1; `SNAP-1` is authorized to fix it. `BOOT1-CONFIGPARAMS` is queued.
+
+**CI:** PR #12 run `36430808829`, green.
+
+Record: `docs/handoffs/BRACKET-1c.md`.
+
+*As authorized:* **Verifier: a Claude Fable `adversarial-reviewer`, not Codex.** This round's evidence is Testcontainers-only, and Codex's sandbox cannot start containers. This is the orchestrator's call, on the precedent the user approved for the spawn-heavy `CI-2` ("it'd also be ok to use a fable reviewer for that one instead, whatever you think its best").
 
 **Scope:**
   - **(C1)** A new Testcontainers file drives a two-bracket round trip with 1b's shape through `assembleDurableTrader`, the Testcontainers PostgreSQL (registered through the WP-040 repositories), a Testcontainers Redis stream consumed by the process's own `RedisMarketEventFeed` and `pump`, and an event-time clock:
@@ -359,6 +386,39 @@ Record: `docs/handoffs/BRACKET-1b.md`.
   - **(C4)** A durable-writer defect is REPORTED, not fixed: `apps/**` is outside the grant. This is the B1 class GOV-2B named.
 
 Answers GOV-2B's "all-doubles harness" reason. §7 item 1 is NOT claimed closed. | BRACKET-1b ✓ | test/integration/paper-trader/** (new files and support helpers; existing assertions unchanged). Forbidden: apps/**, packages/**, test/e2e/** (read-only import at most), test/replay-golden/** (read only), docs/**, db/**, protected files including every tsconfig. Gate: automated (Docker REQUIRED) + Fable adversarial review (hardening loop) + a green CI run on GitHub. |
+| `BUNDLE-1` (H1 blocker M18: the trader's shipped bundle crashes at load) | **Ready (authorized) 2026-09-28** by the user ("H1 blockers first", ruled 2026-09-28). Runs under the HARDENING LOOP.
+
+**The defect (REPRODUCED by the H8 scoping and by the orchestrator):** `apps/trader/package.json`'s `build` produces an ESM bundle (`--format=esm`, `dist/main.mjs`) that dies at load with `Dynamic require of "events" is not supported`. The cause is `ioredis`, reached through `packages/event-bus`. So `pnpm --filter @polymarket-bot/trader start`, the command `infra/compose/trader/compose.yaml` documents for H1, cannot start.
+
+ADR-018 §2 names exactly this failure. It permits CJS where a CJS-only dependency forces it; `apps/data-gateway` is the precedent. But a plain `--format=cjs` does not build: `main.ts:655` uses top-level await, and `packages/storage-postgres`'s migrations loader uses `import.meta`.
+
+**Scope:**
+  - Make the trader's `start` bundle LOAD and reach its startup refusal or run path. The implementer chooses, with evidence, between:
+    - (a) CJS, with the top-level await wrapped in an async main;
+    - (b) ESM with esbuild's `createRequire` banner.
+
+    The choice is disclosed per ADR-018 §2.
+  - A pin that BUILDS and RUNS the bundle of every runnable app: trader, data-gateway, control-api, backtest-cli, research-worker. Each must reach its own startup refusal or usage, never a load crash. The pin uses async spawn (the CI-1 lesson).
+  - The orchestrator checked on 2026-09-28: every other app's bundle loads.
+
+**Safety:** the trader's startup safety check must still refuse an unsafe environment from the bundle. | CI-1 ✓ | apps/trader/package.json (build/start scripts), apps/trader/src/main.ts (only the top-level-await wrapper, if option (a)), a new bundle-load test under test/unit/tooling/** or test/unit/trader/**, infra/compose/trader/** (documentation of the bundle name only). Forbidden: every other apps/** and packages/** file, pnpm-lock.yaml, docs/**, db/**, other protected files. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
+| `SNAP-1` (H1 blocker `BRACKET1C-SNAPKEY`: one PnL snapshot per instance per instant) | **Ready (authorized) 2026-09-28** by the user's ruling ("One snapshot per instant", 2026-09-28). Runs under the HARDENING LOOP.
+
+**The defect:** see `BRACKET1C-SNAPKEY` and `docs/handoffs/BRACKET-1c.md`. `loop.ts` `#writePnlSnapshot` writes one snapshot PER FILL at the event's instant, while `pnl_snapshots_scope_unique` allows one per (scope, environment, account, instance, market, `as_of`). The durable trader halts on the second fill of one instant.
+
+**Scope:**
+  - (1) The trader writes ONE snapshot per (instance, market, instant), holding the state after the LAST fill booked at that instant, however many harvests the event runs.
+  - (2) `MemoryTraderStore` enforces the SAME unique key as the database (`nulls not distinct`), so the doubles stop masking it.
+  - (3) The goldens are regenerated once, from base bytes. Predicted delta:
+    - the paper golden loses its first `09:00:02Z` snapshot (3 → 2);
+    - the backtest artifact loses one `pnl` line, and its `store pnlSnapshots` goes 3 → 2;
+    - `two-brackets-run.json` is expected UNCHANGED (one fill per instant).
+
+    Every other moved byte needs a derivation.
+  - (4) A durable Testcontainers test of a two-level entry: BRACKET-1c's probe F3 as a committed test.
+  - (5) FOLD-1's per-fill PnL checks and TRDR-3's realized-PnL book stay correct. The snapshot/PnL-record ratio pins (N1) are updated with their reason.
+
+No migration: `db/**` is untouched. | BRACKET-1c ✓ | apps/trader/src/** (loop.ts snapshot write, testing/index.ts MemoryTraderStore, colocated tests), test/replay-golden/paper-e2e/paper-e2e-run.json + README (regenerated), test/replay-golden/backtest/static-bracket/expected-artifact.txt + README (captured), test/e2e/** (snapshot expectations and the reconciler only as required), test/unit/simulation/backtest-static-bracket-replay.test.ts, test/unit/trader/**, test/integration/paper-trader/** (the two-level durable test; BRACKET-1c's pending note). Forbidden: packages/**, db/**, apps/trader/package.json (BUNDLE-1's), docs/**, backtest fixture inputs, protected files. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
 
@@ -1916,6 +1976,10 @@ no signer or credentials. Wave 1 authorized per the package table.
 
 ### Superseded header sentences (verbatim)
 
+- Header line 5's §7-item-1 clause as it read from the `BRACKET-1b` flip to the `BRACKET-1c` flip (2026-09-28), replaced in place:
+
+  > §7 checklist item 1 stays OPEN until `BRACKET-1c` and a fresh closeout. `BRACKET-1a` (`11969f3`) made the instance end CLOSED on its own exit. `BRACKET-1b` (`7252150`) recorded the first two-bracket run: a protective-reduce close, REARMED, then a FILLED take-profit, reconciled per bracket. That evidence is still in-memory doubles; the durable Postgres + Redis round trip is `BRACKET-1c` (ruling R1). Items 4 and 5 stay NOT MET on their human halves (item 4's replay half is ACCEPTED AS QUALIFIED in the interim, per H8).
+
 - Header line 5's §7-item-1 clause as it read from the `BRACKET-1a` flip to the `BRACKET-1b` flip (2026-09-28), replaced in place:
 
   > §7 checklist item 1 stays OPEN. `RISK-2` residual 5 was CLOSED by `BRACKET-1a` (merged `11969f3`, 2026-09-28), so the instance now ends CLOSED on its own exit. But no take-profit has ever filled and no second bracket has run: that is `BRACKET-1b`, then `BRACKET-1c`, per the user's ruling R1, and then a fresh closeout grades it. Items 4 and 5 stay NOT MET on their human halves (item 4's replay half is ACCEPTED AS QUALIFIED in the interim, per H8).
@@ -2157,7 +2221,16 @@ Closes `RISK2-R6`. | scoping `wf_b7a8d34d-4f9` synthesis | after `BRACKET-1a` me
   - same-event fill ties keep the fill-id convention;
   - there is no per-bracket engine checkpoint in the artifact;
   - two internal guards are unreachable and unpinned. | `docs/handoffs/BRACKET-1b.md` residuals (implementer r2 known_risks; reviewer r3) | the next `test/e2e/**` round |
-| **BRACKET-1c** | **AUTHORIZED 2026-09-28** (see the work-package row; verifier Fable). QUEUED by the user (2026-09-28, R1). One durable Postgres + Redis round trip in `test/integration/paper-trader/**`: entry fill → exit fill → CLOSED, ideally → REARM. It extends `durable-trader-first-fill-postgres.test.ts`'s registration path, runs under CI Testcontainers, and answers GOV-2B's "all-doubles harness" reason for §7 item 1 | scoping `wf_b7a8d34d-4f9` synthesis | after `BRACKET-1b` |
+| **BRACKET1C-SNAPKEY** | HIGH. The durable paper trader GLOBAL-halts `STORE_UNAVAILABLE` on the second fill of one instant for an instance (an entry that walks two ask levels):
+  - `loop.ts` `#writePnlSnapshot` writes one snapshot per fill;
+  - `pnl_snapshots_scope_unique` (`0006_accounting.up.sql:857`) allows one per `as_of`;
+  - `MemoryTraderStore` masks it, and the original paper golden holds exactly this shape.
+
+Blocks H1. | `docs/handoffs/BRACKET-1c.md` (implementer C4; reproduced by the Fable reviewer) | **being handled by `SNAP-1`** (authorized 2026-09-28; the user ruled one snapshot per instance per instant) |
+| **M18 (trader bundle crashes at load)** | `apps/trader`'s `--format=esm` bundle dies with `Dynamic require of "events" is not supported` (`ioredis` via `event-bus`), so `pnpm --filter @polymarket-bot/trader start` cannot start. ADR-018 §2 named exactly this failure for the data gateway. Blocks H1 | H8 scoping `wf_5375df07-cc2` (REPRODUCED); orchestrator reproduction 2026-09-28 | **being handled by `BUNDLE-1`** (authorized 2026-09-28) |
+| **BOOT1-CONFIGPARAMS** | `verifyRegisteredRows` checks the registered `config_id` but never reads `strategy.configs.parameters` or its hash. A registered config and a trader document that disagree on parameters (for example, max entries 1 vs 2) start without refusal. An operator hazard for H1 | `docs/handoffs/BRACKET-1c.md` (implementer follow_up) | the next `apps/trader` registration round; before H1 if the user wants the guarantee |
+| **BRACKET1C-LOWS** | `BR1C-R1-L1`: the durable round trip's fixture-schedule tests do not pin `core_net_pnl`, `gross_trading_pnl`, `capital_committed` or `worst_case_resolution_pnl`. The values were read back and are correct. `BR1C-R1-L2`: the read-back's SQL predicates are not load-bearing; one database per scenario scopes the rows | `docs/handoffs/BRACKET-1c.md` review | `SNAP-1` may ride `L1` (same file); otherwise the next paper-trader integration round |
+| **BRACKET-1c** | **COMPLETE 2026-09-28** (merged `6e06c50`; see the work-package row). **AUTHORIZED 2026-09-28** (see the work-package row; verifier Fable). QUEUED by the user (2026-09-28, R1). One durable Postgres + Redis round trip in `test/integration/paper-trader/**`: entry fill → exit fill → CLOSED, ideally → REARM. It extends `durable-trader-first-fill-postgres.test.ts`'s registration path, runs under CI Testcontainers, and answers GOV-2B's "all-doubles harness" reason for §7 item 1 | scoping `wf_b7a8d34d-4f9` synthesis | after `BRACKET-1b` |
 | **H8 track (`H8-GOV` → `CORE-MOVE` → `BACKTEST-2`)** | RULED by the user 2026-09-28: **option A**. Extract the paper core (the `createPaperTrader`/`CoreLoop` import closure: 24 files, about 10.9k lines, reaching only layer-0/1 packages plus zod, with no adapter, Node built-in, clock or process global — REPRODUCED) into a new layer-1 package that both `apps/trader` and `apps/backtest-cli` build from. Three rounds:
   - (1) **`H8-GOV`**:
     - `dependency-direction.md` §2, §2.1 (about 11 cited same-layer rows) and §6;
@@ -2170,7 +2243,18 @@ Closes `RISK2-R6`. | scoping `wf_b7a8d34d-4f9` synthesis | after `BRACKET-1a` me
     - the CLI's `run` command builds the real core;
     - one shared venue builder replaces main.ts's three test copies;
     - BT1-R1, BT1-R2 and BT1-R3.
-  Open for `H8-GOV`'s scoping: the package name, a strategy-agnostic core (D4), the ADR's form, and ordering against `FOLD-2`. Option B (an app→app exception) was rejected; option C's wording is the interim state (see B3). | scoping `wf_b7a8d34d-4f9` h8 lens | after the BRACKET rounds |
+  Open for `H8-GOV`'s scoping: the package name, a strategy-agnostic core (D4), the ADR's form, and ordering against `FOLD-2`.
+  **Scoped 2026-09-28** (read-only workflow `wf_5375df07-cc2`: the contract/checker, move-plan and governance lenses, plus a synthesis).
+  **User rulings (2026-09-28):**
+    - the package is **`@polymarket-bot/trading-core`**;
+    - **ADR-022 is written**;
+    - the **H1 blockers go first** (`BUNDLE-1`, `SNAP-1`), then `H8-GOV` → an optional checker-hardening round → `CORE-MOVE` → `BACKTEST-2`;
+    - **D4** (a strategy-agnostic core) waits for a second strategy, with S18 carrying a sunset clause;
+    - **`FOLD-2`** runs after `BACKTEST-2`.
+  **Key scoping facts:**
+    - `H8-GOV` must STAGE the §2 fence line and rows S8–S18 in an unparsed form, because the checker fails closed on a package without a manifest. `CORE-MOVE` activates them.
+    - `CORE-MOVE` moves 37 files byte-identical, re-points 2 tests, and cuts 63 lines from main.ts. Facades keep all 27 importers.
+    - Two pinned tooling tests change (`dependency-direction.test.ts` :1017-1030 and :654-662). Option B (an app→app exception) was rejected; option C's wording is the interim state (see B3). | scoping `wf_b7a8d34d-4f9` h8 lens | after the BRACKET rounds |
 | **Human items** | **H1** a live-data paper run (after `BOOT-1` — and NOT attemptable until **B10** is closed: nothing produces `MarketOpened`, so the run would never leave `PENDING`); ~~**H2** a real GitHub Actions run~~ **DISCHARGED 2026-09-26 by `CI-1`** (PR #1 run `36282501033`, every gate green on GitHub; see `## Resolved evidence items`); **H3** a real Grafana import; **H4** elapsed soak evidence (Wave 1's carry-over, `WP-140` row); **H6** the authorization rows and round order (the orchestrator's, ongoing); ~~**H8**~~ **RULED 2026-09-28 by the user (option A; the H8 track in the residual queue; B3 accepted as qualified in the interim)** — as recorded 2026-09-16: the ruling `BACKTEST-1` needs to close **B3**: move the paper-core composition (`createPaperTrader`/`CoreLoop`, today in `apps/trader`) below layer 3 so both roots can construct it, or rule a cited §2.1 exception — `dependency-direction.md` §2 "Nothing may depend on an app" is the contract at stake | `docs/handoffs/GOV-2B-wave-2-closeout.md` "What only the human can discharge" | human |
 
 ### The cross-package record below, reconciled (2026-09-15)
