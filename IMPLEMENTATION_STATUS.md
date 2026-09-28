@@ -528,9 +528,27 @@ Record: `docs/handoffs/DEPCHECK-1.md` (written in-round).
   - P2 → F10; P3 → CHK + F10; P8 → F16.
   - A stale row → CHK.
   - The H8-GOV activation dry run still passes. | H8-GOV ✓ | tools/check-dependency-direction.mjs (items 1–4), test/unit/tooling/dependency-direction.test.ts (additive only), test/unit/tooling/ci-step-split.test.ts + ci-workflow.ts (ride-alongs), docs/contracts/dependency-direction.md (§3 F10/F16 cells, §5 list, §6 rule 2/3 text only; not §2, the §2.1 table or the PENDING block), docs/handoffs/DEPCHECK-1.md. Forbidden: apps/**, packages/**, other test/**, .github/**, lockfile, package.json, tsconfig*, eslint.config.mjs, docs/adr/**. Gate: automated + Fable adversarial review (hardening loop) + a green CI run on GitHub. |
-| `CORE-MOVE` (the H8 track, round 3: MOVE the paper core into `packages/trading-core`; move-only) | **Ready (authorized) 2026-09-28** under the user's H8 order and the grant recorded, byte for byte, in `docs/handoffs/H8-GOV.md` and in `dependency-direction.md`'s PENDING block. The grant is BINDING.
+| `CORE-MOVE` (the H8 track, round 3: MOVE the paper core into `packages/trading-core`; move-only) | **Complete (2026-09-28)** — merged `33b7d0b` (`--no-ff`; one commit `d7c97db` on base `ac0b12f`). Run under the HARDENING LOOP (workflow `wf_07a9ce7d-940`). Codex gpt-6-astra r1 **ACCEPT, no findings**.
 
-**Exclusive window:** no other round is in flight on any of its paths.
+**What moved** into `@polymarket-bot/trading-core` (layer 1), behind re-export facades:
+  - 25 closure files (11,218 lines) and 14 colocated tests. 37 are R100 renames; the two venue tests change one specifier each.
+  - The venue-policy block moved byte-identical.
+
+**What changed around the move:**
+  - `apps/trader` dropped the 5 workspace dependencies it no longer imports.
+  - The lockfile changed its importers blocks only.
+  - The contract is activated: S8–S18 are in the table and the PENDING block is now a DONE note. The measured graph is 35 packages / 89 edges.
+
+**Proven unchanged:**
+  - the public surface of `@polymarket-bot/trader` and `/testing` (195 entries);
+  - every suite's test counts and name inventory: unit 348/7594, e2e 8/206, replay 3/17, control-api 10/87, trader integration 17/138 (Docker);
+  - the goldens, byte for byte.
+
+**CI:** PR #17 run `36494682572`, green, including the frozen install.
+
+Record: `docs/handoffs/CORE-MOVE.md` (written in-round, with the move map).
+
+*As authorized:* **Exclusive window:** no other round is in flight on any of its paths.
 
 **Orchestrator ruling:** `apps/trader` removes exactly the workspace dependencies its remaining source no longer imports (ADR-018 §3, F8), measured and not predicted.
 
