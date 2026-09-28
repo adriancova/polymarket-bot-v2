@@ -22,7 +22,10 @@
  *    ones `RISK-2` derived by hand for its golden (`docs/handoffs/RISK-2.md`:
  *    realized `16 − 17.2 = −1.2`, fees `0.131 + 0.089 + 0.212 = 0.432`,
  *    `coreNetPnl −1.632`), reached here by a different driver over a recorded
- *    dataset;
+ *    dataset. Since `BACKTEST-2` the core is built by the backtest
+ *    EXECUTABLE's own assembly (`apps/backtest-cli/src/assembly.ts`
+ *    `runBacktestCore`, what the `run` command runs) — no test harness builds
+ *    it — and the artefact is the CLI's own (`artifact.ts`);
  * 4. the artefact is BYTE-IDENTICAL across two runs, and equal to the
  *    committed golden (`expected-artifact.txt`), so a perturbation of either
  *    the run or the golden fails here by name;
@@ -34,6 +37,10 @@
  *    resolution by `BRACKET-1a`: the reduction's own fill closes the bracket
  *    through the replay root too, nothing pauses, and the ledger is still
  *    clean.
+ *
+ * The `run` command itself — argv in, artifact file out — is pinned to the
+ * same golden bytes by `apps/backtest-cli/src/run-command.test.ts`, in the
+ * root unit suite, so this file list did not grow (`BACKTEST-2`).
  *
  * Wired into `pnpm test:replay` (root `package.json`), which `GATE-1` made a
  * real CI gate. That script is a POSITIONAL FILE LIST, and `GATE-1`'s residual

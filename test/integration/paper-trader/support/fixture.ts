@@ -30,20 +30,15 @@
  */
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
-import {
+import type {
+  FeeScheduleSnapshot,
+  RateLimitBudget,
+  RecordedEventIdentity,
   SimulatedVenue,
-  readFeeScheduleSnapshot,
-  tier0Model,
-  unmodeledRateLimits,
-  type BookView,
-  type FeeScheduleSnapshot,
-  type PlannedOrderView,
-  type RateLimitBudget,
-  type RecordedEventIdentity,
-  type TimeInForce,
 } from "@polymarket-bot/simulation";
 import {
   EVERY_FILL_ACCOUNTING_CHECKS,
+  buildSimulatedVenue,
   createPaperTrader,
   type CreateTraderResult,
   type IngestedEvent,
@@ -608,11 +603,6 @@ export function feeSnapshot(): FeeScheduleSnapshot {
   };
 }
 
-/** A book provider over the trader's own market state, for the Tier-0 venue. */
-export interface BookSource {
-  book(input: { readonly marketId: string; readonly side: "YES" | "NO" }): BookView | undefined;
-}
-
 export interface Assembled {
   readonly trader: PaperTrader;
   readonly venue: SimulatedVenue;
@@ -626,9 +616,13 @@ export interface Assembled {
  *
  * The venue is a REAL `SimulatedVenue` at Tier 0 (the pipeline-smoke model,
  * whose `deploymentDecisionUse` is `FORBIDDEN` and which this fixture uses for
- * exactly what it is for: proving the wiring). Its book provider reads the
- * trader's own live books, so the venue executes against the same state the
- * strategy saw.
+ * exactly what it is for: proving the wiring). Since `BACKTEST-2` it is built
+ * by the core's ONE venue builder, `buildSimulatedVenue` (ADR-022 D5) — the
+ * call `apps/trader/src/main.ts` makes — so its book provider reads the
+ * trader's own live books and its execution policy asks the trader for each
+ * planned order's time-in-force, exactly as the shipped process's do. What
+ * this fixture still states is its own settings (the fill model and fee
+ * snapshot below, the document's `startingCash`) and its `rateLimits` option.
  */
 export function assemble(
   options: {
@@ -651,80 +645,27 @@ export function assemble(
   const feed = new MemoryEventFeed();
   const document = options.config ?? traderConfig();
 
-  const books = new Map<string, BookView>();
-  const bookSource: BookSource = {
-    book(input) {
-      return books.get(`${input.marketId}|${input.side}`);
-    },
-  };
-
-  const fees = readFeeScheduleSnapshot(feeSnapshot());
-  if (!fees.ok) throw new Error("the fixture fee snapshot was refused");
-
-  // The two-phase venue wiring `apps/trader/src/main.ts` uses, for the same
-  // reason: the venue asks the COMPOSITION ROOT for the book and for the
+  // The two-phase venue wiring `apps/trader/src/main.ts` uses, through the
+  // same builder: the venue asks the COMPOSITION ROOT for the book and for the
   // time-in-force, and both answers live inside the trader the venue is a
-  // constructor argument to. The fixture holds the trader the same way the
-  // process does, so the seam under test is the shipped one.
-  const wiring: { trader: PaperTrader | undefined } = { trader: undefined };
-
-  const venue = new SimulatedVenue({
+  // constructor argument to, so the builder hands back the holder
+  // (`built.wiring`) this fixture fills below, the way the process does.
+  const built = buildSimulatedVenue({
     clock,
-    runMode: "PAPER",
-    model: tier0Model({
+    settings: {
       fillModelVersion: "tier0/fixture",
       fillModelParametersHash: "a".repeat(64),
-    }),
-    feeSnapshot: fees.value,
-    rateLimits:
-      options.rateLimits ??
-      unmodeledRateLimits(
-        "the paper fixture models no venue rate limit; §9.13's budget arrives with WP-310",
-      ),
-    policy: {
-      /**
-       * The `immediate_order_type` resolution lives in the TRADER
-       * (`pipeline.ts` records it per planned order at plan time); this policy
-       * asks the trader's own book through the hook the venue provides, exactly
-       * as `main.ts` does.
-       *
-       * A literal here would have been a SECOND authority that agreed with the
-       * trader by coincidence — review round 1, MEDIUM-3: with a literal
-       * `"FAK"`, deleting the trader's recording loop changed nothing any test
-       * could see, so the resolution mechanism was proved nowhere. The throw
-       * below is the same fail-closed answer `main.ts` gives, and it is
-       * contained by `SimulatedVenue.submit`'s own total boundary into a
-       * REFUSED `ExecutionResult` (never a rejected promise).
-       */
-      timeInForceFor(order: PlannedOrderView): TimeInForce {
-        const resolved = wiring.trader?.loop.timeInForceFor(order.plannedOrderId);
-        if (resolved === undefined) {
-          throw new Error(
-            `no time-in-force was recorded for planned order ${order.plannedOrderId}; the ` +
-              "composition root refuses to assume one (§12.1 ExecutionPolicy)",
-          );
-        }
-        return resolved;
-      },
-      statedExpiryNsFor(): bigint | undefined {
-        return undefined;
-      },
-      // ALIGNED WITH PRODUCTION (`main.ts`), review round 1 note N7. A book
-      // snapshot is an aggregate per level, so this fixture does not observe
-      // size added at a price in the same recorded instant either — and `"0"`
-      // meant "we looked and saw nothing", which would have been a claim the
-      // fixture never measured.
-      sameInstantAdditionsFor() {
-        return "NOT_OBSERVED" as const;
-      },
+      feeSchedule: feeSnapshot(),
+      // The venue's cash comes from the SAME document the trader parses, so the
+      // two `startingCash` fields the configuration carries cannot silently
+      // disagree here (review round 1, L5 — `parseTraderConfig` refuses a
+      // document in which they do).
+      startingCash: simulationStartingCash(document),
     },
-    // The venue's cash comes from the SAME document the trader parses, so the
-    // two `startingCash` fields the configuration carries cannot silently
-    // disagree here (review round 1, L5 — `parseTraderConfig` refuses a
-    // document in which they do).
-    startingCash: simulationStartingCash(document),
-    books: bookSource,
+    ...(options.rateLimits === undefined ? {} : { rateLimits: options.rateLimits }),
   });
+  if (!built.ok) throw new Error("the fixture fee snapshot was refused");
+  const venue = built.venue;
 
   const result = createPaperTrader({
     env: options.env ?? safeEnvironment(),
@@ -738,11 +679,7 @@ export function assemble(
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
   });
   if (!result.ok) return { result, parts: undefined };
-  wiring.trader = result.trader;
-
-  // The venue's book provider is bound to the trader's own market state, so the
-  // venue executes against exactly the ladder the strategy read.
-  bindBooks(result.trader, books);
+  built.wiring.trader = result.trader;
 
   return { result, parts: { trader: result.trader, venue, store, feed, clock } };
 }
@@ -754,42 +691,4 @@ function simulationStartingCash(document: Record<string, unknown>): string {
   if (!Object.hasOwn(simulation, "startingCash")) return "1000";
   const cash = (simulation as Record<string, unknown>)["startingCash"];
   return typeof cash === "string" ? cash : "1000";
-}
-
-/**
- * Points the venue's book provider at the trader's live books.
- *
- * `BookView` is the §12.1 structural port (`top()` / `ladder()`), and
- * `packages/order-book`'s `OutcomeTokenBook` answers both shapes — so this is a
- * PROJECTION of the real book, not a copy of it: a level applied to the
- * trader's book is visible to the venue on the next read. That is what makes
- * the venue execute against exactly the ladder the strategy saw.
- */
-function bindBooks(trader: PaperTrader, into: Map<string, BookView>): void {
-  for (const market of trader.config.markets) {
-    for (const side of ["YES", "NO"] as const) {
-      const state = trader.markets.get(market.marketId);
-      if (state === undefined) continue;
-      into.set(`${market.marketId}|${side}`, {
-        internalMarketId: market.marketId,
-        tokenId: side === "YES" ? market.yesTokenId : market.noTokenId,
-        top() {
-          const top = state.bookFor(side).topOfBook();
-          return {
-            ...(top.bestBidPrice === undefined ? {} : { bestBidPrice: top.bestBidPrice }),
-            ...(top.bestBidSize === undefined ? {} : { bestBidSize: top.bestBidSize }),
-            ...(top.bestAskPrice === undefined ? {} : { bestAskPrice: top.bestAskPrice }),
-            ...(top.bestAskSize === undefined ? {} : { bestAskSize: top.bestAskSize }),
-            ...(top.spread === undefined ? {} : { spread: top.spread }),
-          };
-        },
-        ladder(bookSide) {
-          return state
-            .bookFor(side)
-            .levels(bookSide)
-            .map((level) => ({ price: level.price, size: level.size }));
-        },
-      });
-    }
-  }
 }

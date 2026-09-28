@@ -97,6 +97,16 @@ export const POLYMARKET_MARKET_NORMALIZER_VERSION = "polymarket-public/market-ch
  */
 export const NORMALIZED_ENVELOPE_NORMALIZER_VERSION = "backtest-cli/normalized-envelope/v1";
 
+/**
+ * Builds one envelope from the recorded frame and the fields a normalizer
+ * derived.
+ *
+ * `venueTimestamp` is a REQUIRED own key whose value may be `undefined`
+ * (BT1-R4, `BACKTEST-2`): it used to be optional, so an input that carried
+ * none read it off `Object.prototype`, and the §4 item 5 battery
+ * (`normalizer-battery.test.ts`) measured an inherited `venueTimestamp` being
+ * ADOPTED into every envelope whose recording had none.
+ */
 function envelopeFrom(input: {
   readonly record: ReplayRecord;
   readonly eventId: string;
@@ -104,7 +114,7 @@ function envelopeFrom(input: {
   readonly schemaVersion: number;
   readonly source: EventEnvelope<unknown>["source"];
   readonly sourceChannel: string;
-  readonly venueTimestamp?: string;
+  readonly venueTimestamp: string | undefined;
   readonly payload: unknown;
 }): EventEnvelope<unknown> {
   const frame = input.record.frame;
@@ -158,6 +168,7 @@ export function recordedFrameNormalizer(digest: Sha256HexDigest): ReplayNormaliz
             schemaVersion: 1,
             source: record.frame.source as EventEnvelope<unknown>["source"],
             sourceChannel: record.frame.endpoint === "" ? "recorded" : record.frame.endpoint,
+            venueTimestamp: undefined,
             payload: record.frame.payloadUtf8,
           }),
         ],
@@ -220,9 +231,7 @@ export function polymarketMarketNormalizer(
             schemaVersion: event.schemaVersion,
             source: "polymarket",
             sourceChannel: event.provenance.sourceChannel,
-            ...(event.provenance.venueTimestamp === undefined
-              ? {}
-              : { venueTimestamp: event.provenance.venueTimestamp }),
+            venueTimestamp: event.provenance.venueTimestamp,
             payload: event.payload,
           }),
         );
@@ -251,7 +260,8 @@ interface RecordedNormalizedEnvelope {
   readonly eventType: string;
   readonly schemaVersion: number;
   readonly sourceChannel: string;
-  readonly venueTimestamp?: string;
+  /** Own, always present: `undefined` when the recording carries none (BT1-R4). */
+  readonly venueTimestamp: string | undefined;
   readonly payload: unknown;
 }
 
@@ -312,7 +322,7 @@ function readRecordedNormalizedEnvelope(
       eventType,
       schemaVersion,
       sourceChannel,
-      ...(venueTimestamp === undefined ? {} : { venueTimestamp }),
+      venueTimestamp,
       payload: record["payload"],
     },
   };
@@ -334,72 +344,107 @@ function readRecordedNormalizedEnvelope(
  * 3. **D3** — the envelope this normalizer emits is built from the decoded
  *    tree and the frame; the schema's output is discarded.
  * 4. **D4** — it is emitted prototype-free and deep-frozen (`ownFrozenTree`).
+ * 5. **The bound — a battery WAS RUN, and is pinned** (BT1-R4, `BACKTEST-2`;
+ *    `normalizer-battery.test.ts`). Every frame of the committed fixture and
+ *    one refused frame of each refusal kind below, under 33 inherited keys on
+ *    `Object.prototype` (every declared key, the eleven zod state keys §2
+ *    measured, the numeric names `"0"`, `"1"`, `"-1"`), each as a
+ *    non-enumerable data property and as a get-only accessor. Pinned: no
+ *    throw escapes; permission never widens (no refused frame is accepted);
+ *    every accepted envelope is byte-identical to the clean run's,
+ *    prototype-free and frozen. What may vary is availability, and the test
+ *    pins exactly where: under a get-only numeric name (`"0"`, `"1"`) every
+ *    frame is refused (fail closed) — `packages/simulation`'s identity reader
+ *    refuses, and its strict-JSON parser throws from `Array.push`
+ *    (`strict-json.ts`, outside this app), which the containment below turns
+ *    into a refusal. The battery's first run found two defects in THIS door,
+ *    both fixed here: an inherited `venueTimestamp` was ADOPTED into every
+ *    envelope whose recording had none (see {@link envelopeFrom}); and zod's
+ *    refusal construction THREW out of `safeParse` under an inherited
+ *    `value`, `writable`, `_zod`, `get` or `set` (the §2 error-construction
+ *    class), which escaped as an exception.
  *
  * A contract the registry does not carry, a payload the contract refuses, or
  * a `source` outside the §7.1 vocabulary is a REFUSAL of the frame — the
  * replay stops with the reason (§8.3) rather than delivering an envelope the
- * core would halt on or silently skip.
+ * core would halt on or silently skip. So is ANY throw from the reads below
+ * (ADR-020's 2026-09-06 containment amendment): a door that cannot finish
+ * reading a frame refuses it, and the replay stops with a
+ * `REPLAY_NORMALIZER_REFUSED` naming the frame, never an escaped exception.
  */
 export function normalizedEnvelopeNormalizer(digest: Sha256HexDigest): ReplayNormalizer {
   return {
     normalizerVersion: NORMALIZED_ENVELOPE_NORMALIZER_VERSION,
     normalize(record: ReplayRecord): NormalizeOutcome {
-      if (!EVENT_SOURCES.includes(record.frame.source)) {
-        return {
-          ok: false,
-          reason: `the recorded frame names source ${JSON.stringify(record.frame.source)}, which is not one of the §7.1 event sources`,
-        };
-      }
-      const decoded = parseStrictJsonText(record.frame.payloadUtf8);
-      if (!decoded.ok) {
-        return {
-          ok: false,
-          reason: `the recorded payload is not strict JSON: ${decoded.problem.problem}`,
-        };
-      }
-      const read = readRecordedNormalizedEnvelope(decoded.value);
-      if (!read.ok) return { ok: false, reason: read.reason };
-      const recorded = read.recorded;
-      const door = ENVELOPE_DOORS.get(`${recorded.eventType}@${String(recorded.schemaVersion)}`);
-      if (door === undefined) {
+      try {
+        return normalizeRecordedEnvelope(digest, record);
+      } catch (error) {
         return {
           ok: false,
           reason:
-            `the recorded envelope names ${recorded.eventType}@${String(recorded.schemaVersion)}, ` +
-            "which is not a registered packages/domain event contract",
+            `reading the recorded envelope threw (${error instanceof Error ? error.name : typeof error}); ` +
+            "the door refuses a frame it cannot finish reading rather than deliver it or let the " +
+            "exception escape (ADR-020 containment)",
         };
       }
-      const eventId = deriveReplayEventId(digest, {
-        gatewayEpoch: record.frame.gatewayEpoch,
-        ingestSeq: record.frame.ingestSeq,
-        receivedAt: record.frame.receivedAt,
-        index: 0,
-      });
-      if (!eventId.ok) return { ok: false, reason: eventId.refusal.message };
-      const envelope = ownFrozenTree(
-        envelopeFrom({
-          record,
-          eventId: eventId.value,
-          eventType: recorded.eventType,
-          schemaVersion: recorded.schemaVersion,
-          source: record.frame.source as EventEnvelope<unknown>["source"],
-          sourceChannel: recorded.sourceChannel,
-          ...(recorded.venueTimestamp === undefined
-            ? {}
-            : { venueTimestamp: recorded.venueTimestamp }),
-          payload: recorded.payload,
-        }),
-      );
-      if (!door.safeParse(envelope).success) {
-        return {
-          ok: false,
-          reason:
-            `the recorded ${recorded.eventType}@${String(recorded.schemaVersion)} envelope failed ` +
-            "its frozen packages/domain contract; §8.3 forbids delivering it silently altered or " +
-            "dropping it",
-        };
-      }
-      return { ok: true, envelopes: [envelope] };
     },
   };
+}
+
+/** {@link normalizedEnvelopeNormalizer}'s reads, uncontained; the caller contains them. */
+function normalizeRecordedEnvelope(digest: Sha256HexDigest, record: ReplayRecord): NormalizeOutcome {
+  if (!EVENT_SOURCES.includes(record.frame.source)) {
+    return {
+      ok: false,
+      reason: `the recorded frame names source ${JSON.stringify(record.frame.source)}, which is not one of the §7.1 event sources`,
+    };
+  }
+  const decoded = parseStrictJsonText(record.frame.payloadUtf8);
+  if (!decoded.ok) {
+    return {
+      ok: false,
+      reason: `the recorded payload is not strict JSON: ${decoded.problem.problem}`,
+    };
+  }
+  const read = readRecordedNormalizedEnvelope(decoded.value);
+  if (!read.ok) return { ok: false, reason: read.reason };
+  const recorded = read.recorded;
+  const door = ENVELOPE_DOORS.get(`${recorded.eventType}@${String(recorded.schemaVersion)}`);
+  if (door === undefined) {
+    return {
+      ok: false,
+      reason:
+        `the recorded envelope names ${recorded.eventType}@${String(recorded.schemaVersion)}, ` +
+        "which is not a registered packages/domain event contract",
+    };
+  }
+  const eventId = deriveReplayEventId(digest, {
+    gatewayEpoch: record.frame.gatewayEpoch,
+    ingestSeq: record.frame.ingestSeq,
+    receivedAt: record.frame.receivedAt,
+    index: 0,
+  });
+  if (!eventId.ok) return { ok: false, reason: eventId.refusal.message };
+  const envelope = ownFrozenTree(
+    envelopeFrom({
+      record,
+      eventId: eventId.value,
+      eventType: recorded.eventType,
+      schemaVersion: recorded.schemaVersion,
+      source: record.frame.source as EventEnvelope<unknown>["source"],
+      sourceChannel: recorded.sourceChannel,
+      venueTimestamp: recorded.venueTimestamp,
+      payload: recorded.payload,
+    }),
+  );
+  if (!door.safeParse(envelope).success) {
+    return {
+      ok: false,
+      reason:
+        `the recorded ${recorded.eventType}@${String(recorded.schemaVersion)} envelope failed ` +
+        "its frozen packages/domain contract; §8.3 forbids delivering it silently altered or " +
+        "dropping it",
+    };
+  }
+  return { ok: true, envelopes: [envelope] };
 }

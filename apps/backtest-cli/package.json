@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Backtest CLI (WP-210, BACKTEST-1): verifies a WP-130 dataset against its manifest, replays it deterministically through the simulation package, and drives the shared paper core through the replay hook. BACKTEST mode, simulated venue, no credential, no venue connection, no signer, no order.",
+  "description": "Backtest CLI (WP-210, BACKTEST-1, BACKTEST-2): verifies a WP-130 dataset against its manifest and replays it deterministically through the simulation package; its run command builds the shared trading core (@polymarket-bot/trading-core, ADR-022) itself and drives it through the replay hook, writing a SIMULATED artifact. BACKTEST root over the PAPER core, simulated venue, no credential, no venue connection, no signer, no order.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
@@ -18,7 +18,8 @@
     "@polymarket-bot/polymarket-public": "workspace:*",
     "@polymarket-bot/risk": "workspace:*",
     "@polymarket-bot/simulation": "workspace:*",
-    "@polymarket-bot/storage-parquet": "workspace:*"
+    "@polymarket-bot/storage-parquet": "workspace:*",
+    "@polymarket-bot/trading-core": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

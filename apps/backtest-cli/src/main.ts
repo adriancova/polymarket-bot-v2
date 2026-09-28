@@ -12,19 +12,38 @@
  *
  * ```text
  * backtest-cli verify --dataset <dir> --pins <run-pins.json>
+ * backtest-cli run --dataset <dir> --pins <run-pins.json> --config <trader-config.json>
+ *                  --artifact <file> [--id-namespace <namespace>]
  * ```
  *
  * `verify` reads the dataset manifest, verifies every pinned object's checksum,
  * reconciles the dispatch ordinals, counts and exclusions against the manifest's
  * own numbers, replays every recorded frame through the normalizer the run
  * pins name ({@link normalizerFor}), and prints the §12.4 canonical
- * serialization. It drives NO core: this executable cannot construct the
- * shared paper core (`run.ts`'s header says why), so `verify` is exactly that
- * — verification and the venue-free replay — over any dataset, including the
- * normalized-stream recording `test/replay-golden/backtest/static-bracket/`.
+ * serialization. It drives NO core: it is verification and the venue-free
+ * replay, over any dataset.
+ *
+ * `run` (`BACKTEST-2`) is the backtest. It runs startup safety validation
+ * FIRST, before any file is opened (§6 invariant 17: this root's own check and
+ * the core's), then reads the run pins and the operator configuration, BUILDS
+ * the shared trading core itself (`assembly.ts`: the core's
+ * `createPaperTrader` over its ONE simulated-venue builder and its production
+ * in-memory store, on a replay clock), drives it through the shipped
+ * `runBacktest` + `replayDrivenCoreLoop`, and writes the artifact
+ * (`artifact.ts`) to `--artifact`, never over an existing file. It takes no
+ * core from its caller. `--id-namespace` is the seed every derived identifier
+ * is minted from; absent, it is the instances' run ids joined, as the paper
+ * trader derives it. Over the committed fixture
+ * `test/replay-golden/backtest/static-bracket/` with
+ * `--id-namespace backtest-1-static-bracket-replay`, the artifact is
+ * byte-identical to that directory's `expected-artifact.txt`.
+ *
+ * The artifact and the report are SIMULATED: every fill is
+ * `SIMULATED_NOT_REAL_EVIDENCE`, and the report says `core_run_mode=PAPER`
+ * beside the root's `run_mode=BACKTEST` (ADR-022 D6; BT1-R5).
  */
 
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import process from "node:process";
 
 import {
@@ -35,6 +54,8 @@ import {
 } from "@polymarket-bot/simulation";
 
 import { sha256Hex } from "./archive.js";
+import { renderBacktestArtifact } from "./artifact.js";
+import { BACKTEST_CORE_RUN_MODE, checkBacktestCoreSafety, runBacktestCore, type BacktestRefusal } from "./assembly.js";
 import {
   NORMALIZED_ENVELOPE_NORMALIZER_VERSION,
   normalizedEnvelopeNormalizer,
@@ -64,6 +85,19 @@ export function normalizerFor(pins: ReplayRunPins): ReplayNormalizer {
 export const EXIT_OK = 0;
 export const EXIT_USAGE = 2;
 export const EXIT_REFUSED = 3;
+/**
+ * `run` only: the core latched a halt (BT1-R3) — the replay stopped where the
+ * live pump returns `HALTED`, or the end-of-run accounting check latched one
+ * over a completed run. The paper trader's `EXIT_CODES.halted` value.
+ */
+export const EXIT_HALTED = 75;
+
+/** The usage lines, printed on any usage error. */
+export const USAGE_LINES: readonly string[] = Object.freeze([
+  "usage: backtest-cli verify --dataset <dir> --pins <run-pins.json>",
+  "       backtest-cli run --dataset <dir> --pins <run-pins.json> --config <trader-config.json> " +
+    "--artifact <file> [--id-namespace <namespace>]",
+]);
 
 interface ParsedArguments {
   readonly command: string;
@@ -74,7 +108,7 @@ interface ParsedArguments {
 export function parseArguments(argv: readonly string[]): ParsedArguments | { readonly usage: string } {
   const [command, ...rest] = argv;
   if (command === undefined || command.startsWith("--")) {
-    return { usage: "a command is required: verify" };
+    return { usage: "a command is required: verify or run" };
   }
   const options: Record<string, string> = {};
   for (let index = 0; index < rest.length; index += 2) {
@@ -101,6 +135,151 @@ async function readPinsFile(path: string): Promise<ReplayRunPins | { readonly pr
   return pins.value;
 }
 
+/**
+ * Reads a JSON document under the ADR-017 §3 strict profile (the reader the
+ * run pins use), or says why not. A file that cannot be read is a problem,
+ * not an exception.
+ */
+async function readStrictJsonFile(
+  path: string,
+  what: string,
+): Promise<{ readonly value: unknown } | { readonly problem: string }> {
+  let buffer: Buffer;
+  try {
+    buffer = await readFile(path);
+  } catch (error) {
+    return { problem: `the ${what} could not be read (${error instanceof Error ? error.message : String(error)})` };
+  }
+  const parsed = parseStrictJsonBytes(new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength));
+  if (!parsed.ok) return { problem: `the ${what} is not strict JSON: ${parsed.problem.problem}` };
+  return { value: parsed.value };
+}
+
+function refusalLines(refusal: BacktestRefusal): string[] {
+  return [`REFUSED: ${refusal.code}: ${refusal.detail}`, ...refusal.issues.map((issue) => `  ${issue}`)];
+}
+
+interface CliIo {
+  readonly environment: Readonly<Record<string, string | undefined>>;
+  readonly out: (line: string) => void;
+  readonly err: (line: string) => void;
+}
+
+/**
+ * The `run` command. Safety FIRST — before the pins, the configuration or the
+ * dataset is opened — then the core's own assembly, the run, the artifact.
+ */
+async function runCommand(options: Readonly<Record<string, string>>, io: CliIo): Promise<number> {
+  const datasetDirectory = options["dataset"];
+  const pinsPath = options["pins"];
+  const configPath = options["config"];
+  const artifactPath = options["artifact"];
+  if (
+    datasetDirectory === undefined ||
+    pinsPath === undefined ||
+    configPath === undefined ||
+    artifactPath === undefined
+  ) {
+    io.err("backtest-cli: run needs --dataset, --pins, --config and --artifact");
+    for (const line of USAGE_LINES) io.err(line);
+    return EXIT_USAGE;
+  }
+  const known = new Set(["dataset", "pins", "config", "artifact", "id-namespace"]);
+  const unknown = Object.keys(options).filter((key) => !known.has(key));
+  if (unknown.length > 0) {
+    io.err(`backtest-cli: run does not take ${unknown.map((key) => `--${key}`).join(", ")}`);
+    for (const line of USAGE_LINES) io.err(line);
+    return EXIT_USAGE;
+  }
+
+  // --- 1. §6 invariant 17: nothing is opened before this --------------------
+  const safety = checkBacktestCoreSafety(io.environment);
+  if (!safety.ok) {
+    io.err("REFUSED: startup safety validation failed (§6 invariant 17, §11, §15, AGENTS.md); no file was read and no core was built");
+    for (const violation of safety.violations) io.err(`  ${violation}`);
+    return EXIT_REFUSED;
+  }
+
+  // --- 2. the run pins and the operator configuration ------------------------
+  let pins: ReplayRunPins | { readonly problem: string };
+  try {
+    pins = await readPinsFile(pinsPath);
+  } catch (error) {
+    pins = { problem: `the run-pins file could not be read (${error instanceof Error ? error.message : String(error)})` };
+  }
+  if ("problem" in pins) {
+    io.err(`backtest-cli: ${pins.problem}`);
+    return EXIT_REFUSED;
+  }
+  const config = await readStrictJsonFile(configPath, "trader configuration");
+  if ("problem" in config) {
+    io.err(`backtest-cli: ${config.problem}`);
+    return EXIT_REFUSED;
+  }
+
+  // --- 3. the core, built HERE, and the run ---------------------------------
+  const idNamespace = options["id-namespace"];
+  const started = await runBacktestCore({
+    environment: io.environment,
+    traderConfig: config.value,
+    runPins: pins,
+    datasetDirectory,
+    ...(idNamespace === undefined ? {} : { idNamespace }),
+    log: io.err,
+  });
+  if (!started.ok) {
+    for (const line of refusalLines(started.refusal)) io.err(line);
+    return EXIT_REFUSED;
+  }
+  const { outcome, core, driver } = started.run;
+  const halts = core.trader.halts
+    .records()
+    .map((record) => `${record.code}@${record.scope.kind}`)
+    .join(",");
+  try {
+    if (!outcome.ok) {
+      io.err(renderBacktestOutcome(outcome));
+      if (core.trader.halts.anyHalt) {
+        io.err(`HALTED: the core latched ${halts}; the replay stopped where the live pump returns HALTED (BT1-R3)`);
+        return EXIT_HALTED;
+      }
+      return EXIT_REFUSED;
+    }
+
+    // --- 4. the artifact --------------------------------------------------------
+    const artifact = renderBacktestArtifact({ outcome, trader: core.trader, store: core.store, driver });
+    if (!artifact.ok) {
+      io.err(`REFUSED: no artifact was written: ${artifact.problem}`);
+      return EXIT_REFUSED;
+    }
+    const bytes = new Uint8Array(Buffer.from(artifact.text, "utf8"));
+    try {
+      // `wx`: an artifact is evidence, and a run never overwrites one.
+      await writeFile(artifactPath, bytes, { flag: "wx" });
+    } catch (error) {
+      io.err(
+        `REFUSED: the artifact could not be written to ${artifactPath} ` +
+          `(${error instanceof Error ? error.message : String(error)}); run never overwrites an existing file`,
+      );
+      return EXIT_REFUSED;
+    }
+    io.out(renderBacktestOutcome(outcome));
+    io.out("");
+    io.out(`core_run_mode=${BACKTEST_CORE_RUN_MODE}`);
+    io.out("evidence=SIMULATED_NOT_REAL_EVIDENCE");
+    io.out(`id_namespace=${core.idNamespace}`);
+    io.out(`halts=${halts}`);
+    io.out(`artifact=${artifactPath}`);
+    io.out(`artifact_bytes=${String(bytes.byteLength)}`);
+    io.out(`artifact_sha256=${sha256Hex(bytes)}`);
+    // FOLD-1: a completed run whose end-of-run check latched a halt is written
+    // (its health line shows the halt) and exits halted, as the paper trader does.
+    return core.trader.halts.anyHalt ? EXIT_HALTED : EXIT_OK;
+  } finally {
+    await core.store.close();
+  }
+}
+
 /** Runs the CLI. Returns an exit code; writes through the injected sinks. */
 export async function main(input: {
   readonly argv: readonly string[];
@@ -111,9 +290,10 @@ export async function main(input: {
   const parsed = parseArguments(input.argv);
   if ("usage" in parsed) {
     input.err(`backtest-cli: ${parsed.usage}`);
-    input.err("usage: backtest-cli verify --dataset <dir> --pins <run-pins.json>");
+    for (const line of USAGE_LINES) input.err(line);
     return EXIT_USAGE;
   }
+  if (parsed.command === "run") return await runCommand(parsed.options, input);
   if (parsed.command !== "verify") {
     input.err(`backtest-cli: unknown command ${JSON.stringify(parsed.command)}`);
     return EXIT_USAGE;

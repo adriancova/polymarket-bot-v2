@@ -2,13 +2,14 @@
  * The replay-side driver and the normalized-envelope normalizer (BACKTEST-1).
  *
  * These pin the two pieces this app SHIPS for the shared core's replay path,
- * against a structural loop double — the fixture-driven proof over the REAL
- * `apps/trader` core is `test/unit/simulation/backtest-static-bracket-replay.test.ts`,
- * because this app may not import that core (dependency-direction §2). What a
- * double can prove here is the driver's contract: the clock is advanced to the
- * recorded instant BEFORE the event is ingested, one drain follows every
- * ingest, a refused ingest stops the run with the event named, and a clock
- * regression is the clock's own refusal.
+ * against a structural loop double. The fixture-driven proof over the REAL
+ * core — which this app builds itself since `BACKTEST-2` (`assembly.ts`) — is
+ * `test/unit/simulation/backtest-static-bracket-replay.test.ts` and
+ * `assembly.test.ts`. What a double can prove here is the driver's contract:
+ * the clock is advanced to the recorded instant BEFORE the event is ingested,
+ * one drain follows every ingest, a refused ingest stops the run with the
+ * event named, a clock regression is the clock's own refusal, and (BT1-R3) a
+ * latched halt stops the run where the live pump returns `HALTED`.
  *
  * SAFETY: no venue connection, no credential, no order. Nothing here reads a
  * clock, a file or the environment.
@@ -91,6 +92,22 @@ function contextOf(replayRecord: ReplayRecord): ReplayEventContext {
       datasetRowOrdinal: replayRecord.datasetRowOrdinal,
     },
     monotonicNs: BigInt(replayRecord.frame.receivedMonotonicNs),
+  };
+}
+
+/** The core's halt latch, structurally (`HaltController`'s `anyHalt` and `records()`). */
+function haltLatch() {
+  const records: { readonly code: string; readonly scope: { readonly kind: string } }[] = [];
+  return {
+    latch(code: string, kind: string): void {
+      records.push({ code, scope: { kind } });
+    },
+    get anyHalt(): boolean {
+      return records.length > 0;
+    },
+    records() {
+      return [...records];
+    },
   };
 }
 
@@ -217,6 +234,101 @@ describe("replayDrivenCoreLoop — the shipped driver of the shared core", () =>
     expect(() =>
       replayDrivenCoreLoop({ loop: withoutCheck as unknown as ReplayDrivenLoop, clock: clock.value }),
     ).toThrow(/no checkAccountingRebuild/u);
+  });
+
+  it("BT1-R3: a halt latched DURING a drain stops the run after that drain, naming the halt, and no later event is ingested", async () => {
+    const clock = createReplayClock({ receivedAt: "2026-05-01T08:59:58.000Z", receivedMonotonicNs: "0" });
+    if (!clock.ok) return;
+    const halts = haltLatch();
+    const inner = loopDouble();
+    inner.bind(clock.value);
+    // The second drain latches a halt, as the real core latches one inside `drain`.
+    const loop: ReplayDrivenLoop = {
+      ingest: (event) => inner.ingest(event),
+      drain: async () => {
+        await inner.drain();
+        if (inner.drains === 2) halts.latch("STORE_UNAVAILABLE", "GLOBAL");
+      },
+      checkAccountingRebuild: (trigger) => inner.checkAccountingRebuild(trigger),
+    };
+    const driver = replayDrivenCoreLoop({ loop, clock: clock.value, halts });
+
+    const events = [1, 2, 3].map((seq) =>
+      record({
+        ingestSeq: String(seq),
+        receivedAt: `2026-05-01T09:00:0${String(seq)}.000Z`,
+        receivedMonotonicNs: `${String(seq)}000000`,
+        payloadUtf8: "{}",
+      }),
+    );
+    expect((await driver.coreLoop(contextOf(events[0] as ReplayRecord))).ok).toBe(true);
+    const stopped = await driver.coreLoop(contextOf(events[1] as ReplayRecord));
+    expect(stopped.ok).toBe(false);
+    if (stopped.ok) return;
+    expect(stopped.refusal.code).toBe("SIMULATION_INTERNAL");
+    expect(stopped.refusal.message).toContain("STORE_UNAVAILABLE@GLOBAL");
+    expect(stopped.refusal.message).toContain("pump.ts");
+    expect(stopped.refusal.details).toMatchObject({
+      halts: "STORE_UNAVAILABLE@GLOBAL",
+      stoppedAt: "AFTER_DRAIN",
+      ingestSeq: "2",
+      datasetRowOrdinal: 1,
+    });
+    // `runReplay` stops at the first refusal; were it offered another event,
+    // the driver would still not ingest it — the pump's loop-top check.
+    const after = await driver.coreLoop(contextOf(events[2] as ReplayRecord));
+    expect(after.ok).toBe(false);
+    if (after.ok) return;
+    expect(after.refusal.details).toMatchObject({ stoppedAt: "BEFORE_INGEST", ingestSeq: "3" });
+    expect(inner.seen.map((entry) => entry.event.envelope.ingestSeq)).toEqual(["1", "2"]);
+    expect(driver.observations()).toEqual({ eventsIngested: 2, drains: 2 });
+  });
+
+  it("BT1-R3: a core ALREADY halted is refused before ingesting — and before its clock moves", async () => {
+    const clock = createReplayClock({ receivedAt: "2026-05-01T08:59:58.000Z", receivedMonotonicNs: "0" });
+    if (!clock.ok) return;
+    const halts = haltLatch();
+    halts.latch("OPERATOR_HALT", "GLOBAL");
+    halts.latch("BOOK_DESYNCHRONIZED", "MARKET");
+    const loop = loopDouble();
+    loop.bind(clock.value);
+    const driver = replayDrivenCoreLoop({ loop, clock: clock.value, halts });
+    const refused = await driver.coreLoop(
+      contextOf(record({ ingestSeq: "1", receivedAt: "2026-05-01T09:00:00.000Z", receivedMonotonicNs: "1000000", payloadUtf8: "{}" })),
+    );
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.refusal.details).toMatchObject({
+      halts: "OPERATOR_HALT@GLOBAL,BOOK_DESYNCHRONIZED@MARKET",
+      stoppedAt: "BEFORE_INGEST",
+    });
+    expect(loop.seen).toEqual([]);
+    expect(loop.drains).toBe(0);
+    expect(clock.value.now()).toBe("2026-05-01T08:59:58.000Z");
+  });
+
+  it("BT1-R3: WITHOUT a halt latch the driver cannot see a halt and keeps delivering — BACKTEST-1's behaviour, kept for a caller that hands none", async () => {
+    const clock = createReplayClock({ receivedAt: "2026-05-01T08:59:58.000Z", receivedMonotonicNs: "0" });
+    if (!clock.ok) return;
+    const halts = haltLatch();
+    halts.latch("STORE_UNAVAILABLE", "GLOBAL");
+    const loop = loopDouble();
+    loop.bind(clock.value);
+    const driver = replayDrivenCoreLoop({ loop, clock: clock.value });
+    for (const seq of [1, 2]) {
+      const delivered = await driver.coreLoop(
+        contextOf(
+          record({
+            ingestSeq: String(seq),
+            receivedAt: `2026-05-01T09:00:0${String(seq)}.000Z`,
+            receivedMonotonicNs: `${String(seq)}000000`,
+            payloadUtf8: "{}",
+          }),
+        ),
+      );
+      expect(delivered.ok).toBe(true);
+    }
+    expect(driver.observations()).toEqual({ eventsIngested: 2, drains: 2 });
   });
 
   it("a monotonic regression is the replay clock's own refusal, and the event is never ingested", async () => {

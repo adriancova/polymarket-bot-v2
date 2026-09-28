@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Paper trader (WP-230): the layer-3 composition root that assembles local books, the feature engine, the strategy runtime, capital allocation, the risk engine, the execution planner, the simulated venue, the ledger and the PnL engine into one deterministic core event loop. PAPER only — simulated execution, no credential, no signer, no venue connection, no real order.",
+  "description": "Paper trader (WP-230): the layer-3 composition root that runs the shared trading core (@polymarket-bot/trading-core, ADR-022) on live data. It builds the core with createPaperTrader over the core's simulated-venue builder, a PostgreSQL store and a Redis event feed, then pumps it; the books, features, strategy runtime, allocation, risk, planning, ledger and PnL live in the core. PAPER only — simulated execution, no credential, no signer, no venue connection, no real order.",
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
