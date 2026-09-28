@@ -236,7 +236,12 @@ are:
   reduction's own fill still folds instead of being refused as an illegal
   transition. The same walk-back applies to an exit of either role that is
   terminal on the venue but still awaiting its fill (see "An exit terminal on
-  the venue waits for its fill" below).
+  the venue waits for its fill" below). If the late fill lands on STALE data,
+  the instance pauses instead (`PAUSE_AND_CANCEL`) with `resumeTo` naming the
+  state the fill moved it to, and the walk-back happens in the resume's own
+  evaluation, before any exit fill can arrive outside `PAUSED` (review round 2,
+  BR2-H1: the "awaiting its fill" hold in the ladder used to return without it,
+  so the awaited sale was refused from `OPEN` and discarded).
 - **A late ENTRY fill is never discarded, and the bracket is never closed over
   it** (review round 1, BR1-H1). The protective reduction is sized from the
   FOLDED allocation (§13.3 rule 1), so an entry whose view reported more than
@@ -293,7 +298,17 @@ are:
   reports more executed than the fill stream has delivered, the track is kept
   and the instance holds with `SB.AWAITING_FILL_ALLOCATION` until the fill
   folds by its order id — the exit twin of the entry's posture (obligation 7).
-  No exit is sized from the view.
+  No exit is sized from the view. It waits IN THE EXIT STATES: the evaluation
+  that holds for it — the ladder's own hold, and take-profit maintenance's
+  after a late entry fill — first walks the bracket back into them if a late
+  entry fill moved it out, so the fill it waits for can fold. NOT covered, and
+  pre-existing at base: a TAKE-PROFIT that was still LIVE when a late entry
+  fill moved the bracket to `PARTIALLY_OPEN`/`OPEN` (the resize's
+  cancel-then-replace, whose cancel loses the race). Its fill is then refused
+  from that state, `SB.ILLEGAL_TRANSITION` and paused, fail-closed, with the
+  fill unfolded. That happens whether the fill arrives first or after a terminal
+  view (at base the second order said `SB.UNATTRIBUTED_FILL` instead; it paused
+  the same way). No edge was added for it.
 - **Reason codes.** A stop or holding-timeout reduction reports
   `SB.PROTECTED_REDUCE`; the close-cutoff reduction keeps
   `SB.FINAL_PROTECTED_REDUCE`.

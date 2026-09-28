@@ -577,7 +577,7 @@ const MOVE_SITES: readonly MoveSite[] = [
     name: "exitStillOwed",
     required: cross(["PARTIALLY_OPEN", "OPEN"], ["EXIT_TRIGGER_MET"]),
     tolerated: [],
-    why: "BRACKET-1a D4 and r1: a late ENTRY fill moved the bracket out of the exit states while an exit order can still fill — its own live protective reduction (holdForLiveReduce) or a terminal exit awaiting its fill (planTakeProfit's D6 hold); reenterExitStates re-takes EXIT_TRIGGER_MET so that fill still folds. Guarded by an explicit instanceState check on exactly these two states",
+    why: "BRACKET-1a D4, r1 and r2: a late ENTRY fill moved the bracket out of the exit states (directly, or through a data-quality PAUSE whose resume lands there) while an exit order can still fill — its own live protective reduction (holdForLiveReduce) or a terminal exit awaiting its fill (planTakeProfit's D6 hold, and since r2 planExit's); reenterExitStates re-takes EXIT_TRIGGER_MET so that fill still folds. Guarded by an explicit instanceState check on exactly these two states",
   },
   {
     name: "exitIntentExpired",

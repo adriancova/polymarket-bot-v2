@@ -27,6 +27,12 @@
  * of its fold is never discarded and never closed over) and BR1-M1 (R2's
  * silence transition and D3's working reason hold under every final policy).
  * Both fail against the round-0 candidate `dcba8ad`.
+ *
+ * REVIEW ROUND 2 nested one block inside BR1-H1's, reusing its sequence: BR2-H1
+ * (the same late entry fill landing on STALE data pauses the instance, and the
+ * resume's own evaluation must walk the bracket back into the exit states
+ * before the awaited exit fill arrives). Every test in it but the one marked
+ * "a guard" fails against the round-1 candidate `ecf7f60`.
  */
 
 import { describe, expect, it } from "vitest";
@@ -1611,6 +1617,315 @@ describe("BR1-H1 — an entry execution the venue reported but the fill stream h
     expect(positions(next).map(sharesOf)).toEqual(["-20"]);
     expect(b.codes()).not.toContain(ILLEGAL_TRANSITION);
     expectNeverPaused(b);
+  });
+
+  // -------------------------------------------------------------------------
+  // Review round 2, BR2-H1 — the same late entry fill, landing on STALE data
+  // -------------------------------------------------------------------------
+
+  describe("BR2-H1 — a late entry fill on stale data pauses; the resume walks the bracket back into the exit states, so the awaited exit fill still folds", () => {
+    /**
+     * `applyEntryFill` folds a late entry fill out of the exit states. On
+     * healthy data it continues into `planTakeProfit`, whose D6 hold walks the
+     * bracket back (r1). On stale data it takes the incident branch instead and
+     * PAUSES with `resumeTo` `OPEN` / `PARTIALLY_OPEN`. At the round-1
+     * candidate `ecf7f60` the resume's evaluation reached `planExit`'s D6 hold
+     * and returned there, still in `OPEN`: the awaited exit fill was then an
+     * ILLEGAL_TRANSITION pause, the fill was discarded, and every later
+     * evaluation waited for it again — a position with no executable exit.
+     * Every test below except the last FAILS against `ecf7f60`.
+     */
+    const STALE_HOUR = {
+      bids: [["0.34", "2000"]],
+      asks: [["0.35", "2000"]],
+      asOf: at("11:00:00.000"),
+    } as const;
+    const INCIDENT = ["SB.INCIDENT_POLICY_FIRST", "SB.STALE_BOOK", PAUSED];
+
+    /** Step 6: the reduction of 30 is seen OPEN, then FILLED with 30 reported — before its fill. */
+    function reductionReportedFilled(b: Bracket): void {
+      b.update(
+        { now: at("12:00:06.500"), yesShares: "30" },
+        { ...REDUCE_VIEW, requestedShares: "30", status: "OPEN" },
+      );
+      const sold = b.update(
+        { now: at("12:00:06.800"), yesShares: "30" },
+        { ...REDUCE_VIEW, requestedShares: "30", filledShares: "30", status: "FILLED" },
+      );
+      expect(sold.reasonCodes).toEqual([EXIT_ORDER_WORKING, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+      expect(b.state.instanceState).toBe("EXIT_WORKING");
+      expect(b.exit()).toMatchObject({ orderId: "order-3", filledShares: "0", viewFilledShares: "30" });
+    }
+
+    /** Nothing was refused, discarded or halted; the stale book's pause is counted by each test. */
+    function expectNoRefusal(b: Bracket): void {
+      const codes = b.codes();
+      expect(codes).not.toContain(ILLEGAL_TRANSITION);
+      expect(codes).not.toContain(UNATTRIBUTED_FILL);
+      expect(codes).not.toContain(POSITION_MISMATCH);
+      expect(codes).not.toContain(HALTED);
+    }
+
+    it("the reviewer's sequence: a terminal REDUCTION awaits its fill, the late BUY 20 lands on a stale book; after the resume the sale folds and all 50 exit", () => {
+      const b = new Bracket(params());
+      reportedAheadOfFold(b); // 1-5: entry 50 reported, 30 folded; the stop reduces 30
+      reductionReportedFilled(b); // 6
+      // 7. The late BUY 20, position view 20, on a book an hour old: an incident.
+      const late = b.fill(
+        { now: at("12:00:07.000"), yesShares: "20", yes: STALE_HOUR as never },
+        { orderId: "order-1", shares: "20", price: "0.35" },
+      );
+      expect(late.reasonCodes).toEqual(INCIDENT);
+      expect(late.intents).toHaveLength(0);
+      expect(b.state).toMatchObject({
+        instanceState: "PAUSED",
+        resumeTo: "OPEN",
+        allocatedShares: "50",
+        exitedShares: "0",
+      });
+      // 8. Fresh data. The resume lands in OPEN, and the SAME evaluation walks the
+      // bracket back into the exit states: its reduction is still owed a fill.
+      // (`ecf7f60` answered the same codes but stayed in OPEN.)
+      const resumed = b.features({ now: at("12:00:08.000"), yesShares: "20" });
+      expect(resumed.reasonCodes).toEqual([RESUMED, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+      expect(resumed.intents).toHaveLength(0);
+      expect(b.state.instanceState).toBe("EXIT_PLANNED");
+      // 9. The reduction's SELL 30 FOLDS (`ecf7f60`: ILLEGAL_TRANSITION, discarded).
+      const sale = b.fill(
+        { now: at("12:00:09.000"), yesShares: "20" },
+        { orderId: "order-3", side: "SELL", price: "0.27", shares: "30" },
+      );
+      expect(sale.reasonCodes).toEqual([EXIT_FILLED]);
+      expect(b.state).toMatchObject({
+        instanceState: "EXIT_WORKING",
+        allocatedShares: "50",
+        exitedShares: "30",
+      });
+      expect(b.exit()).toMatchObject({ orderId: "order-3", filledShares: "30", viewFilledShares: "30" });
+      // 10. Fresh data again: the reduction settles, and the 20 still held get an
+      // executable exit.
+      const rest = b.features({ now: at("12:00:10.000"), yesShares: "20", features: STOPPED });
+      expect(rest.reasonCodes).toEqual([EXIT_ORDER_TERMINAL, STOP_TRIGGERED, EXIT_SIZED, PROTECTED_REDUCE]);
+      expect(positions(rest).map(sharesOf)).toEqual(["-20"]);
+      const done = b.fill(
+        { now: at("12:00:11.000"), yesShares: "0", features: STOPPED },
+        { orderId: "order-4", side: "SELL", price: "0.27", shares: "20" },
+      );
+      expect(done.reasonCodes).toEqual([EXIT_FILLED, CLOSED]);
+      expect(b.state).toMatchObject({ instanceState: "CLOSED", allocatedShares: "50", exitedShares: "50" });
+      expect(b.codes().filter((code) => code === PAUSED)).toHaveLength(1);
+      expect(b.codes().filter((code) => code === CLOSED)).toHaveLength(1);
+      expectNoRefusal(b);
+    });
+
+    it("the same when the late fill is PARTIAL: the pause is taken from PARTIALLY_OPEN, and the walk-back starts there", () => {
+      const b = new Bracket(params());
+      reportedAheadOfFold(b);
+      reductionReportedFilled(b);
+      // Only 10 of the 20 reported: 40 folded, 50 reported, on a stale book.
+      const late = b.fill(
+        { now: at("12:00:07.000"), yesShares: "10", yes: STALE_HOUR as never },
+        { orderId: "order-1", shares: "10", price: "0.35" },
+      );
+      expect(late.reasonCodes).toEqual(INCIDENT);
+      expect(b.state).toMatchObject({
+        instanceState: "PAUSED",
+        resumeTo: "PARTIALLY_OPEN",
+        allocatedShares: "40",
+      });
+      const resumed = b.features({ now: at("12:00:08.000"), yesShares: "10" });
+      expect(resumed.reasonCodes).toEqual([RESUMED, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+      expect(b.state.instanceState).toBe("EXIT_PLANNED");
+      // The reduction's sale folds (from PARTIALLY_OPEN it was an illegal transition)…
+      const sale = b.fill(
+        { now: at("12:00:09.000"), yesShares: "10" },
+        { orderId: "order-3", side: "SELL", price: "0.27", shares: "30" },
+      );
+      expect(sale.reasonCodes).toEqual([EXIT_FILLED]);
+      expect(b.state).toMatchObject({
+        instanceState: "EXIT_WORKING",
+        allocatedShares: "40",
+        exitedShares: "30",
+      });
+      // …the entry's last 10 fold from the exit state, and the ladder exits the 20 held.
+      const last = b.fill(
+        { now: at("12:00:10.000"), yesShares: "20" },
+        { orderId: "order-1", shares: "10", price: "0.35" },
+      );
+      expect(last.reasonCodes).toEqual([ALLOCATED, TAKE_PROFIT_INTENT, EXIT_SIZED]);
+      expect(positions(last).map(sharesOf)).toEqual(["-20"]);
+      expect(b.state).toMatchObject({ allocatedShares: "50", exitedShares: "30" });
+      const done = b.fill(
+        { now: at("12:00:11.000"), yesShares: "0" },
+        { orderId: "order-4", side: "SELL", price: "0.5", shares: "20" },
+      );
+      expect(done.reasonCodes).toEqual([EXIT_FILLED, CLOSED]);
+      expect(b.state).toMatchObject({ instanceState: "CLOSED", allocatedShares: "50", exitedShares: "50" });
+      expect(b.codes().filter((code) => code === PAUSED)).toHaveLength(1);
+      expectNoRefusal(b);
+    });
+
+    it("the TAKE-PROFIT mirror: a terminal take-profit awaits its fill, the entry's remainder fills on a stale book; after the resume the sale folds", () => {
+      const b = new Bracket(params());
+      b.start({ now: at("12:00:01.000") });
+      b.features({ now: at("12:00:02.000") });
+      b.fill({ now: at("12:00:03.000"), yesShares: "30" }, { shares: "30", price: "0.34" });
+      b.update({ now: at("12:00:03.000"), yesShares: "30" }, { ...TP_VIEW, requestedShares: "30", status: "OPEN" });
+      const tpSold = b.update(
+        { now: at("12:00:04.000"), yesShares: "0" },
+        { ...TP_VIEW, requestedShares: "30", filledShares: "30", status: "FILLED" },
+      );
+      expect(tpSold.reasonCodes).toEqual([EXIT_ORDER_WORKING, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+      const more = b.fill(
+        { now: at("12:00:05.000"), yesShares: "20", yes: STALE_HOUR as never },
+        { shares: "20", price: "0.35" },
+      );
+      expect(more.reasonCodes).toEqual(INCIDENT);
+      expect(b.state).toMatchObject({ instanceState: "PAUSED", resumeTo: "OPEN", allocatedShares: "50" });
+      const resumed = b.features({ now: at("12:00:06.000"), yesShares: "20" });
+      expect(resumed.reasonCodes).toEqual([RESUMED, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+      expect(b.state.instanceState).toBe("EXIT_PLANNED");
+      const tpFill = b.fill(
+        { now: at("12:00:07.000"), yesShares: "20" },
+        { orderId: "order-2", side: "SELL", price: "0.5", shares: "30" },
+      );
+      expect(tpFill.reasonCodes).toEqual([EXIT_FILLED]);
+      expect(b.state).toMatchObject({ instanceState: "EXIT_WORKING", exitedShares: "30" });
+      const next = b.features({ now: at("12:00:08.000"), yesShares: "20" });
+      expect(next.reasonCodes).toEqual([EXIT_ORDER_TERMINAL, TAKE_PROFIT_INTENT, EXIT_SIZED]);
+      expect(positions(next).map(sharesOf)).toEqual(["-20"]);
+      const done = b.fill(
+        { now: at("12:00:09.000"), yesShares: "0" },
+        { orderId: "order-3", side: "SELL", price: "0.5", shares: "20" },
+      );
+      expect(done.reasonCodes).toEqual([EXIT_FILLED, CLOSED]);
+      expect(b.state).toMatchObject({ instanceState: "CLOSED", allocatedShares: "50", exitedShares: "50" });
+      expect(b.codes().filter((code) => code === PAUSED)).toHaveLength(1);
+      expectNoRefusal(b);
+    });
+
+    it("the incident CANCELS a working reduction and its FILLED view lands WHILE PAUSED: the resume walks back all the same, and the sale folds", () => {
+      // A second route to the same hold: the reduction was LIVE at the pause (so
+      // the incident withdrew it) and became terminal-awaiting-its-fill during it.
+      const b = new Bracket(params());
+      reportedAheadOfFold(b);
+      b.update(
+        { now: at("12:00:06.500"), yesShares: "30" },
+        { ...REDUCE_VIEW, requestedShares: "30", status: "OPEN" },
+      );
+      const late = b.fill(
+        { now: at("12:00:07.000"), yesShares: "20", yes: STALE_HOUR as never },
+        { orderId: "order-1", shares: "20", price: "0.35" },
+      );
+      expect(late.reasonCodes).toEqual(["SB.INCIDENT_POLICY_FIRST", "SB.STALE_BOOK", SAFETY_CANCEL, PAUSED]);
+      const [withdrawn] = cancels(late);
+      expect(withdrawn?.type === "CANCEL" && withdrawn.orderIds).toEqual(["order-3"]);
+      expect(b.state).toMatchObject({ instanceState: "PAUSED", resumeTo: "OPEN" });
+      expect(b.exit()).toMatchObject({ orderId: "order-3", state: "CANCEL_PENDING" });
+      // The cancel lost the race: the venue reports all 30 sold.
+      const sold = b.update(
+        { now: at("12:00:07.500"), yesShares: "20", yes: STALE_HOUR as never },
+        { ...REDUCE_VIEW, requestedShares: "30", filledShares: "30", status: "FILLED" },
+      );
+      expect(sold.reasonCodes).toEqual([EXIT_ORDER_WORKING, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+      expect(b.state.instanceState).toBe("PAUSED");
+      const resumed = b.features({ now: at("12:00:08.000"), yesShares: "20" });
+      expect(resumed.reasonCodes).toEqual([RESUMED, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+      expect(b.state.instanceState).toBe("EXIT_PLANNED");
+      const sale = b.fill(
+        { now: at("12:00:09.000"), yesShares: "20" },
+        { orderId: "order-3", side: "SELL", price: "0.27", shares: "30" },
+      );
+      expect(sale.reasonCodes).toEqual([EXIT_FILLED]);
+      expect(b.state).toMatchObject({ instanceState: "EXIT_WORKING", allocatedShares: "50", exitedShares: "30" });
+      const rest = b.features({ now: at("12:00:10.000"), yesShares: "20", features: STOPPED });
+      expect(positions(rest).map(sharesOf)).toEqual(["-20"]);
+      expect(b.codes().filter((code) => code === PAUSED)).toHaveLength(1);
+      expectNoRefusal(b);
+    });
+
+    const finalPolicies = [
+      {
+        policy: "PROTECTED_REDUCE",
+        config: {},
+        after: [EXIT_ORDER_TERMINAL, EXIT_CUTOFF, RESOLUTION_HOLD_DISALLOWED, EXIT_SIZED, FINAL_PROTECTED_REDUCE],
+        exits: ["-20"],
+      },
+      {
+        policy: "HOLD_TO_RESOLUTION",
+        config: { "exit.final_policy": "HOLD_TO_RESOLUTION", "exit.allow_resolution_hold": true },
+        after: [EXIT_ORDER_TERMINAL, EXIT_CUTOFF, FINAL_HOLD_TO_RESOLUTION, RESOLUTION_HOLD_ALLOWED],
+        exits: [],
+      },
+      {
+        policy: "CANCEL_ONLY",
+        config: { "exit.final_policy": "CANCEL_ONLY" },
+        after: [EXIT_ORDER_TERMINAL, EXIT_CUTOFF, FINAL_CANCEL_ONLY],
+        exits: [],
+      },
+    ] as const;
+
+    for (const testCase of finalPolicies) {
+      it(`${testCase.policy}: the resume is onMarketClosing inside the cutoff — the awaited fill is waited for before the policy, and it folds`, () => {
+        const b = new Bracket(params(configWith(testCase.config)));
+        reportedAheadOfFold(b);
+        reductionReportedFilled(b);
+        b.fill(
+          { now: at("12:00:07.000"), yesShares: "20", yes: STALE_HOUR as never },
+          { orderId: "order-1", shares: "20", price: "0.35" },
+        );
+        const resumed = b.closing({ now: at("12:00:08.000"), yesShares: "20" }, 10);
+        expect(resumed.reasonCodes).toEqual([RESUMED, EXIT_ORDER_TERMINAL, AWAITING_FILL]);
+        expect(resumed.intents).toHaveLength(0);
+        expect(b.state.instanceState).toBe("EXIT_PLANNED");
+        const sale = b.fill(
+          { now: at("12:00:09.000"), yesShares: "20" },
+          { orderId: "order-3", side: "SELL", price: "0.27", shares: "30" },
+        );
+        expect(sale.reasonCodes).toEqual([EXIT_FILLED]);
+        expect(b.state).toMatchObject({ allocatedShares: "50", exitedShares: "30" });
+        // Only now, on the folded allocation, does the configured policy apply.
+        const policy = b.closing({ now: at("12:00:10.000"), yesShares: "20" }, 9);
+        expect(policy.reasonCodes).toEqual(testCase.after);
+        expect(positions(policy).map(sharesOf)).toEqual(testCase.exits);
+        expect(b.codes().filter((code) => code === PAUSED)).toHaveLength(1);
+        expectNoRefusal(b);
+      });
+    }
+
+    it("a guard, not a discriminator: when the reduction's fill lands WHILE PAUSED it folds there, and the resume settles it and exits the rest", () => {
+      // This interleaving never reached the gap (a paused fill folds whatever
+      // `resumeTo` says); it is pinned so the fix cannot break it.
+      const b = new Bracket(params());
+      reportedAheadOfFold(b);
+      reductionReportedFilled(b);
+      b.fill(
+        { now: at("12:00:07.000"), yesShares: "20", yes: STALE_HOUR as never },
+        { orderId: "order-1", shares: "20", price: "0.35" },
+      );
+      const paused = b.fill(
+        { now: at("12:00:07.500"), yesShares: "20", yes: STALE_HOUR as never },
+        { orderId: "order-3", side: "SELL", price: "0.27", shares: "30" },
+      );
+      expect(paused.reasonCodes).toEqual([EXIT_FILLED, FILL_FOLDED_WHILE_PAUSED, PAUSED]);
+      expect(b.state).toMatchObject({ instanceState: "PAUSED", allocatedShares: "50", exitedShares: "30" });
+      const resumed = b.features({ now: at("12:00:08.000"), yesShares: "20", features: STOPPED });
+      expect(resumed.reasonCodes).toEqual([
+        RESUMED,
+        EXIT_ORDER_TERMINAL,
+        STOP_TRIGGERED,
+        EXIT_SIZED,
+        PROTECTED_REDUCE,
+      ]);
+      expect(positions(resumed).map(sharesOf)).toEqual(["-20"]);
+      const done = b.fill(
+        { now: at("12:00:09.000"), yesShares: "0", features: STOPPED },
+        { orderId: "order-4", side: "SELL", price: "0.27", shares: "20" },
+      );
+      expect(done.reasonCodes).toEqual([EXIT_FILLED, CLOSED]);
+      expect(b.state).toMatchObject({ instanceState: "CLOSED", allocatedShares: "50", exitedShares: "50" });
+      expectNoRefusal(b);
+    });
   });
 });
 

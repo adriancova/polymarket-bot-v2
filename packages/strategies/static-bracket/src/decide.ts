@@ -1793,7 +1793,22 @@ function planExit(
     // D6: the venue says the exit executed more than the fill stream has
     // delivered. No exit may be sized until that fill is folded — neither a
     // replacement nor a protective reduction — so the ladder does not run.
-    return plan(settlement.state, "hold", [...reasons, ...settlement.reasons]);
+    //
+    // And the bracket must be in a state that FOLDS that fill (`BRACKET-1a` r2,
+    // finding BR2-H1). A late ENTRY fill moves it out of the exit states; on
+    // healthy data {@link planTakeProfit}'s own D6 hold walks it back, but on
+    // stale data {@link applyEntryFill} takes the incident branch instead and
+    // PAUSES with `resumeTo` `OPEN`/`PARTIALLY_OPEN`. The RESUME lands there
+    // and reaches this line in the same evaluation. Returning here unmoved left
+    // the bracket in `OPEN`, where the awaited exit fill was refused as an
+    // illegal transition — PAUSED, the fill discarded, and every later
+    // evaluation waiting for it again. So this hold walks back too, through the
+    // same helper and the same existing edge ({@link reenterExitStates}).
+    const back = reenterExitStates(settlement.state);
+    if (!back.ok) {
+      return halted(settlement.state, back.problem, []);
+    }
+    return plan(back.value, "hold", [...reasons, ...settlement.reasons]);
   }
   const settled = settlement === null ? synced : settlement.state;
   if (settlement !== null) reasons.push(...settlement.reasons);
@@ -1910,7 +1925,9 @@ function planExit(
  *   before its ladder), the bracket is walked back into the exit states
  *   ({@link reenterExitStates}) so that awaited exit fill still folds —
  *   `BRACKET-1a` r1: from `OPEN` it was refused as an illegal transition and
- *   PAUSED the instance with the sale unfolded.
+ *   PAUSED the instance with the sale unfolded. ({@link planExit}'s own D6
+ *   return walks back the same way since r2, for the late entry fill that
+ *   landed on stale data and so reached a PAUSE instead of this function.)
  */
 function planTakeProfit(
   params: StaticBracketParams,
@@ -2296,13 +2313,18 @@ function planProtectedReduce(
  *
  * An exit order of this bracket that can still produce a fill — a live
  * protective reduction ({@link holdForLiveReduce}), or a terminal exit whose
- * view reported more executed than is folded (D6, {@link planTakeProfit}) —
- * must have its fill folded, and the only §13.3 edges that fold an exit fill
- * leave `EXIT_PLANNED`/`EXIT_WORKING`. A late ENTRY fill moves the instance out
- * of those states ({@link applyEntryFill} takes `ENTRY_PARTIAL_FILL` /
- * `ENTRY_FILL_COMPLETE` into `PARTIALLY_OPEN`/`OPEN`), and from `OPEN` the
+ * view reported more executed than is folded (D6: {@link planTakeProfit}'s
+ * hold, and since `BRACKET-1a` r2 {@link planExit}'s own) — must have its fill
+ * folded, and the only §13.3 edges that fold an exit fill leave
+ * `EXIT_PLANNED`/`EXIT_WORKING`. A late ENTRY fill moves the instance out of
+ * those states ({@link applyEntryFill} takes `ENTRY_PARTIAL_FILL` /
+ * `ENTRY_FILL_COMPLETE` into `PARTIALLY_OPEN`/`OPEN`) — directly on healthy
+ * data, or on stale data through a data-quality PAUSE whose `resumeTo` names
+ * that state, so the RESUME lands there (finding BR2-H1) — and from `OPEN` the
  * exit's fill would be refused as an illegal transition and PAUSE the instance
- * on its own exit, with the sale unfolded. So the bracket re-takes the existing
+ * on its own exit, with the sale unfolded. So each EVALUATION that holds for
+ * an owed exit calls this — {@link holdForLiveReduce}, {@link planTakeProfit}'s
+ * D6 hold and {@link planExit}'s — and the bracket re-takes the existing
  * `EXIT_TRIGGER_MET` edge — an exit cause did fire, and its order is still owed
  * — and {@link syncPlannedToWorking} follows a working order into
  * `EXIT_WORKING`. No new machine edge: `PARTIALLY_OPEN|OPEN --EXIT_TRIGGER_MET-->
