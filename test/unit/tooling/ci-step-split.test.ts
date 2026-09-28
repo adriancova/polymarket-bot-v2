@@ -23,10 +23,22 @@
  * - the same for the python job's gates after its sync step, which need
  *   `if: ${{ !cancelled() && steps.sync.outcome == 'success' }}` (`CI-2` r1);
  * - a gate that runs an `&&` chain as ONE step outside the split steps: a
- *   root script it runs (`pnpm <script>`, directly or through other root
+ *   root script one of its commands runs (directly or through other root
  *   scripts) is a chain other than the three split ones, or its own `run`
  *   holds `&&` (`CI-2` r1, L5-1). Without this, the `CI1-L5` hazard could
- *   return through any other script, such as `test:fault`;
+ *   return through any other script, such as `test:fault`. The root script is
+ *   followed through `pnpm <script>` and `pnpm run <script>`, and since
+ *   `DEPCHECK-1` (`CI2-L5-3`) also through the other spellings that run the
+ *   ROOT script — `pnpm -C .`, `pnpm --dir .`, `pnpm --filter polymarket-bot`,
+ *   `pnpm -w`, a quoted script name, `npm run`, and the rest listed in
+ *   `ci-workflow.ts` ("WHICH SPELLINGS RUN A ROOT SCRIPT");
+ * - a gate that runs more than one command in one step: the lines, or the
+ *   `;`-separated parts, of its `run` (`DEPCHECK-1`, `CI2-L5-2`). Under
+ *   GitHub's `bash -e` the first failure hides the rest, as an `&&` chain
+ *   would. Only a block recorded in `DEPENDENT_RUN_BLOCKS` with its exact text
+ *   and reason is exempt (today the python audit step, whose second line reads
+ *   the file its first line writes), and a record no gate matches is itself a
+ *   finding;
  * - a job without a `timeout-minutes` below GitHub's 360-minute default.
  *
  * HOW. `ci-workflow.ts` reads the workflow with a conservative YAML-subset
@@ -42,13 +54,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  DEPENDENT_RUN_BLOCKS,
   GATE_IF,
   SPLIT_CHAINS,
   type YamlValue,
   chainCommands,
+  jobSteps,
   jobTimeoutFindings,
   nodeJobSteps,
   parseWorkflowYaml,
+  shellCommands,
   splitStepDrift,
   stepRunFor,
 } from "./ci-workflow.js";
@@ -681,5 +696,195 @@ describe("the workflow reader and the chain parser refuse what they cannot read 
     const parsed = JSON.parse(packageJson) as { scripts: Record<string, string> };
     delete parsed.scripts["test:integration"];
     expect(() => chainCommands(JSON.stringify(parsed))).toThrow(/script `test:integration` is missing/u);
+  });
+});
+
+/**
+ * `DEPCHECK-1` ride-alongs, the two LOWs of `CI-2` review r2
+ * (`docs/handoffs/CI-2.md`; `IMPLEMENTATION_STATUS.md` rows `CI2-L5-2`,
+ * `CI2-L5-3`). Every positive case below returns no finding under the drift
+ * check at `45c575a`; every negative case fails under a named mutant of the new
+ * code. Both proofs are in `docs/handoffs/DEPCHECK-1.md`.
+ */
+describe("DEPCHECK-1 ride-alongs: multi-command run blocks (CI2-L5-2) and the other root-script spellings (CI2-L5-3)", () => {
+  /** A gated node step whose `run` is a literal block of `lines`. */
+  function gatedBlockStep(name: string, lines: readonly string[]): string[] {
+    return [
+      `${STEP_ITEM}name: ${name}`,
+      `${STEP_KEY}if: ${GATE_IF}`,
+      `${STEP_KEY}run: |`,
+      ...lines.map((line) => (line === "" ? "" : `${STEP_KEY}  ${line}`)),
+    ];
+  }
+
+  /** Replaces the named step's one-line `run:` with a literal block of `lines`. */
+  function setStepRunBlock(workflow: string, name: string, lines: readonly string[]): string {
+    return edit(workflow, (all) => {
+      const start = stepStart(all, name);
+      const end = stepEnd(all, start);
+      const at = all.findIndex((line, index) => index > start && index < end && line.startsWith(`${STEP_KEY}run: `));
+      if (at < 0) throw new Error(`mutant: step ${JSON.stringify(name)} has no one-line \`run:\``);
+      all.splice(at, 1, `${STEP_KEY}run: |`, ...lines.map((line) => (line === "" ? "" : `${STEP_KEY}  ${line}`)));
+    });
+  }
+
+  const FAULT_GATE = "WAL fault-injection tests";
+
+  /** A copy of package.json whose `test:fault` is a two-command chain (the review's L5-1 case). */
+  function withChainedFault(packageJson: string): string {
+    return withScript(
+      packageJson,
+      "test:fault",
+      "pnpm --filter @polymarket-bot/storage-wal test:fault && pnpm --filter @polymarket-bot/storage-postgres test:fault",
+    );
+  }
+
+  it("CI2-L5-2: a gate running two independent gates in one block, or on one line with `;`, is flagged", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const last = splitSteps(workflow, packageJson).at(-1)?.name ?? "";
+    // The review's case: `pnpm lint` then `pnpm check:deps` in one `run: |`.
+    const block = insertStepAfter(workflow, last, gatedBlockStep("Lint and boundaries", ["pnpm lint", "pnpm check:deps"]));
+    expect(splitStepDrift(block, packageJson)).toEqual([
+      expect.stringContaining('"Lint and boundaries" runs 2 commands in one step ("pnpm lint", "pnpm check:deps")'),
+    ]);
+    const semicolon = insertStepAfter(workflow, last, gatedStep("Lint and boundaries", "pnpm lint; pnpm check:deps"));
+    expect(splitStepDrift(semicolon, packageJson)).toEqual([
+      expect.stringContaining('"Lint and boundaries" runs 2 commands in one step ("pnpm lint", "pnpm check:deps")'),
+    ]);
+    const three = insertStepAfter(
+      workflow,
+      last,
+      gatedBlockStep("Suites", ["pnpm test:e2e", "node tools/check-dependency-direction.mjs", "pnpm test:replay"]),
+    );
+    expect(splitStepDrift(three, packageJson)).toEqual([expect.stringContaining('"Suites" runs 3 commands in one step')]);
+  });
+
+  it("CI2-L5-2: every command of a block is followed to a chained root script, not only the first line", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const chained = withChainedFault(packageJson);
+    // A comment is not a command, so this block is one command, on its second line.
+    const commentFirst = setStepRunBlock(workflow, FAULT_GATE, ["# the WAL suite", "pnpm test:fault"]);
+    expect(splitStepDrift(commentFirst, chained)).toEqual([
+      expect.stringContaining(`"${FAULT_GATE}" runs the root script \`test:fault\` as one step`),
+    ]);
+    // Two commands: the chain on the second line, and the block itself.
+    const echoFirst = setStepRunBlock(workflow, FAULT_GATE, ["echo WAL suite", "pnpm test:fault"]);
+    expect(splitStepDrift(echoFirst, chained)).toEqual([
+      expect.stringContaining(`"${FAULT_GATE}" runs the root script \`test:fault\` as one step`),
+      expect.stringContaining(`"${FAULT_GATE}" runs 2 commands in one step ("echo WAL suite", "pnpm test:fault")`),
+    ]);
+  });
+
+  it("CI2-L5-2: blank lines, comments and a `\\` continuation are not extra commands", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const mutant = setStepRunBlock(workflow, FAULT_GATE, [
+      "# one command, continued on the next line",
+      "",
+      "pnpm test:fault \\",
+      "  --reporter=verbose",
+    ]);
+    expect(splitStepDrift(mutant, packageJson)).toEqual([]);
+    const gate = nodeJobSteps(mutant).find((step) => step.name === FAULT_GATE);
+    expect(shellCommands(gate?.run ?? "").map((command) => command.text)).toEqual(["pnpm test:fault --reporter=verbose"]);
+  });
+
+  it("CI2-L5-2: the python audit block is recorded as dependent in its exact text; a changed block and its stale record are reported", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    // Non-vacuity: exactly one recorded block, and it is the real ci.yml's.
+    expect(DEPENDENT_RUN_BLOCKS.map(({ job, step }) => [job, step])).toEqual([
+      ["python", "Dependency vulnerability scan (uv lockfile)"],
+    ]);
+    const [recorded] = DEPENDENT_RUN_BLOCKS;
+    const audit = jobSteps(workflow, "python").find((step) => step.name === recorded.step);
+    expect(audit?.run).toBe(recorded.run);
+    // Genuinely dependent: the second command reads the file the first writes.
+    const commands = shellCommands(audit?.run ?? "").map((command) => command.text);
+    expect(commands).toHaveLength(2);
+    expect(commands[0]).toMatch(/> \/tmp\/requirements-audit\.txt$/u);
+    expect(commands[1]).toMatch(/-r \/tmp\/requirements-audit\.txt$/u);
+    // A third, independent command added to the block un-records it.
+    const grown = edit(workflow, (lines) => {
+      const start = stepStart(lines, recorded.step);
+      lines.splice(stepEnd(lines, start), 0, `${STEP_KEY}  uvx pip-audit --version`);
+    });
+    expect(splitStepDrift(grown, packageJson)).toEqual([
+      expect.stringContaining(`"${recorded.step}" runs 3 commands in one step`),
+      expect.stringContaining(`DEPENDENT_RUN_BLOCKS records the python step ${JSON.stringify(recorded.step)}`),
+    ]);
+  });
+
+  it("CI2-L5-3: every spelling that runs the ROOT script is followed", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const chained = withChainedFault(packageJson);
+    const spellings = [
+      // The review's five.
+      "pnpm -C . test:fault",
+      "pnpm --dir . test:fault",
+      "pnpm --filter polymarket-bot test:fault",
+      'pnpm run "test:fault"',
+      "npm run test:fault",
+      // Their neighbours.
+      "pnpm -C ./ run test:fault",
+      "pnpm --dir=. test:fault",
+      "pnpm --filter=polymarket-bot run test:fault",
+      "pnpm -F polymarket-bot test:fault",
+      "pnpm --filter polymarket-bot... test:fault",
+      "pnpm --filter . test:fault",
+      "pnpm --filter {.} test:fault",
+      "pnpm -w test:fault",
+      "pnpm --workspace-root run test:fault",
+      "pnpm -r --include-workspace-root run test:fault",
+      "pnpm run 'test:fault'",
+      'pnpm "test:fault"',
+      "pnpm --silent run test:fault",
+      "CI=true pnpm test:fault",
+      "pnpm exec pnpm test:fault",
+      "npm run-script test:fault",
+      "npm --prefix . run test:fault",
+      "npm run --if-present test:fault",
+    ];
+    for (const run of spellings) {
+      expect(splitStepDrift(setStepKey(workflow, FAULT_GATE, "run", run), chained), run).toEqual([
+        expect.stringContaining(`"${FAULT_GATE}" runs the root script \`test:fault\` as one step`),
+      ]);
+    }
+    // npm's own names for the `test` script.
+    const testChained = withScript(
+      packageJson,
+      "test",
+      "vitest run --config test/vitest.config.ts && vitest run --config test/other.config.ts",
+    );
+    for (const run of ["npm test", "npm t", "npm run test"]) {
+      expect(splitStepDrift(setStepKey(workflow, "Unit tests", "run", run), testChained), run).toEqual([
+        expect.stringContaining('"Unit tests" runs the root script `test` as one step'),
+      ]);
+    }
+  });
+
+  it("CI2-L5-3: a spelling that runs a workspace package's script, or that the reader cannot read, is not taken for the root's", async () => {
+    const { workflow, packageJson } = await readRealTexts();
+    const chained = withChainedFault(packageJson);
+    const negatives = [
+      // The real step.
+      "pnpm --filter @polymarket-bot/storage-wal test:fault",
+      "pnpm --filter=@polymarket-bot/storage-wal test:fault",
+      "pnpm -F ./packages/storage-wal test:fault",
+      "pnpm --filter polymarket-bot^... test:fault",
+      "pnpm -C packages/storage-wal test:fault",
+      "pnpm --dir packages/storage-wal run test:fault",
+      "pnpm --dir=packages/storage-wal test:fault",
+      "pnpm -r run test:fault",
+      "npm --workspace packages/storage-wal run test:fault",
+      "npm --workspace=packages/storage-wal run test:fault",
+      "npm -w packages/storage-wal run test:fault",
+      "npm --workspaces run test:fault",
+      "npm --prefix packages/storage-wal run test:fault",
+      // A word the reader cannot read ends the search: it could be anything.
+      "pnpm $FLAGS test:fault",
+      'pnpm run "$SCRIPT"',
+    ];
+    for (const run of negatives) {
+      expect(splitStepDrift(setStepKey(workflow, FAULT_GATE, "run", run), chained), run).toEqual([]);
+    }
   });
 });

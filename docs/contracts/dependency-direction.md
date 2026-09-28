@@ -691,13 +691,13 @@ coverage drifts (§6).
 | F7 | Any package importing an archived Polymarket client (`@polymarket/clob-client`, `@polymarket/clob-client-v2`, `@polymarket/builder-relayer-client`, `@polymarket/builder-signing-sdk`) | `docs/venue/verified-2026-08-24.md` §1 (official migration guide instructs their removal; `WP-000` ruled them forbidden) |
 | F8 | Any package outside `packages/event-bus` importing a Redis client for market-event transport | §2, ADR-003 §1 |
 | F9 | Any cycle between workspace packages | §5.2 ("Circular package dependencies fail CI") |
-| F10 | Any package depending on an `apps/*` package | §5 layout; apps are composition roots |
+| F10 | Any package depending on an `apps/*` package | §5 layout; apps are composition roots. **Enforced by the §6 check since `DEPCHECK-1` (2026-09-28)**, in rule 2: a declared workspace edge (any `dependencies`, `devDependencies`, `peerDependencies` or `optionalDependencies` entry) into an `apps/*` package fails F10, whatever the two layers and whatever §2.1 says. An upward edge into an app also fails F12. A same-layer one fails F10 in place of F13, because F13's remedy, a §2.1 row, is itself a `CHK` error here: a §2.1 row whose `to` endpoint is an application is rejected, since F10 has no §2.1 exception. A relative import of an app's files fails F16 (below). Not checked: an import of an app by package name that no manifest declares, since rule 3 has no F10 arm |
 | F11 | A strategy reading a clock or unseeded randomness (`Date.now`, `Math.random`) | §6 invariant 2, §7.6, ADR-005 §1 |
 | F12 | Any workspace edge from a lower-numbered layer to a higher-numbered one | §5.2 (the allowed direction is one-way), §2 of this document |
 | F13 | Any **same-layer** workspace edge not listed in §2.1 | §2, §2.1 of this document |
 | F14 | Inside a **purity-restricted** package (`packages/domain`, `packages/strategies/**`, `packages/ledger`, `packages/simulation`), any construct that makes F1–F8/F11 **unevaluable**: a module load whose specifier is not a static literal; a reference to a module-**loading capability** (`require` and its aliases, a CommonJS `Module` object incl. `process.mainModule`/`require.main`, `createRequire` and its result, `process.getBuiltinModule`, the `node:module` namespace/`Module` class/`register`) in a position that escapes this document's analysis; a computed member read on such a capability; and a reference to an **evaluator** (`eval`, `Function`, or a read of the `.constructor` property) | §5.2 and ADR-005 §1, read as intent rather than as a list of spellings: a package forbidden to perform I/O has no legitimate use for a module loader or an evaluator, and a construct that defeats static checking cannot be permitted to *establish* compliance. Numbered 2026-08-28 (`GOV-1B`) from `docs/handoffs/WP-015.md` `follow_up` 6 |
 | F15 | `packages/decimal` importing anything beyond `decimal.js` and `node:crypto` | `docs/contracts/domain.md` §1 ("Dependencies: `decimal.js` and `node:crypto` only … the package performs no I/O") and §2 of this document (the Layer 0 "May import" cell). Numbered 2026-09-02 (`GOV-1C`) from `docs/handoffs/WP-015.md` `follow_up` 4 via §6.1 item 4 — the allowlist was "enforced by construction" with no F-row, so a violating edit would have been a review finding rather than a gate failure. **Not yet implemented by the §6 check** (the same tooling follow-up as the F14 machine-id swap); until then, enforcement-by-construction and review remain the mechanism |
-| F16 | A cross-package **deep import** — any workspace import specifier that resolves inside another workspace package other than through that package's `package.json` `exports` map | `docs/handoffs/WP-015.md` `follow_up` 3 via §6.1 item 4, numbered 2026-09-02 (`GOV-1C`) on the evidence that **every** workspace package (28/28 as of this date) declares an `exports` map, so "bypassing the entry point" is well-defined. Largely platform-enforced already: Node refuses an unexported subpath (`ERR_PACKAGE_PATH_NOT_EXPORTED`) and `NodeNext` resolution mirrors it at typecheck — the row exists so a widened `exports` map or a bundler that resolves around encapsulation is a contract violation, not a loophole. **Not yet implemented by the §6 check** (same tooling follow-up) |
+| F16 | A cross-package **deep import** — any workspace import specifier that resolves inside another workspace package other than through that package's `package.json` `exports` map | `docs/handoffs/WP-015.md` `follow_up` 3 via §6.1 item 4, numbered 2026-09-02 (`GOV-1C`) on the evidence that **every** workspace package (28/28 as of this date) declares an `exports` map, so "bypassing the entry point" is well-defined. Largely platform-enforced already: Node refuses an unexported subpath (`ERR_PACKAGE_PATH_NOT_EXPORTED`) and `NodeNext` resolution mirrors it at typecheck — the row exists so a widened `exports` map or a bundler that resolves around encapsulation is a contract violation, not a loophole. **The relative half is enforced by the §6 check since `DEPCHECK-1` (2026-09-28)**, in rule 3. A relative specifier fails F16 when it resolves, lexically from the importing file, outside the importing package's root (into another package, into an application, or into no package at all) or through a `node_modules` directory. This is wider than a deep import, on purpose: a package reaches nothing outside its own root by path. Rule 3 applies it to every specifier it reads as a literal: static `import` and `export … from` (type-only and `export *` included), `import x = require(…)`, an `import("…")` type, a dynamic `import()`, and a `require`-family load. Not covered: a specifier that is not a literal (F14's business, and only in the purity-restricted packages); `require.resolve`, a `/// <reference path>`, a JSDoc `import("…")` type in a `.js` file, a `vi.mock` path, and a file read by path such as `new URL(…, import.meta.url)`; a symlink inside a package's own tree; and files outside every workspace package (`test/**`, `tools/**`). **The bare-name half — a subpath import around a package's `exports` map — is not yet implemented** (same tooling follow-up); Node and `NodeNext` refuse an unexported subpath, as above |
 | F17 | A **layer-0 or layer-1** package importing, **in a production (non-test) source file**, a Node built-in binding that §2.2's table does not enumerate for that package | §2.2 (ruled 2026-09-04 by `GOV-2A`), discharging `WP-180` `follow_up` R6-1, `WP-190` R1-N2, and `WP-160` R1-N1, which each disclosed an instance and asked the contract owner to rule rather than ratifying it locally. Generalises F2 (`packages/domain`: none) and F15 (`packages/decimal`: `node:crypto` only) into one criterion — trap-free, entropy-free, clock-free, I/O-free, synchronous and pure — plus an exhaustive per-package enumeration, so a new import is a cited contract edit rather than a reviewer's judgment call. Layers 2 and 3 are **not** constrained by this row. **The production-only scope is part of the rule** *(qualified 2026-09-04 in `GOV-2A`'s round-1 review remediation, which measured six layer-1 **test** files importing un-enumerated built-ins at the tip that shipped this row — see §2.2, which also states why test files are outside F17 while §6.1 item 2 holds them inside rule 3: F17 governs a package's runtime import surface, rule 3 governs purity, which is a property of behaviour everywhere)*. **Note the id namespace:** this F17 is a §3 forbidden-edge id and is unrelated to `WP-040` obligation **F17** (the OMS may not label an order `SIGNED` before its submission-attempt row exists), re-assigned to `WP-270` in [`protected-contracts.md`](./protected-contracts.md) §8.1 **R-9**; the two reached the same number by coincidence on the same date. **Not yet implemented by the §6 check** (same tooling follow-up as F15/F16) |
 
 F3 and F11 are the two that matter most for correctness rather than tidiness:
@@ -784,7 +784,7 @@ exactly one layer (§2).
 | `packages/decimal` imports only `decimal.js` and `node:crypto` and performs no I/O | **Enforced by construction**; `docs/contracts/domain.md` §1. Numbered **F15** in §3 (2026-09-02); not yet evaluated by the §6 check |
 | TypeScript project references and `pnpm` workspace resolution | A package can only import a workspace package it declares as a dependency |
 | `pnpm typecheck`, `pnpm lint`, `pnpm test` | Run locally and in CI (`.github/workflows/ci.yml`) |
-| **The §6 check itself** — cycles (F9), layer conformance (F12/F13), forbidden specifiers and impure globals (F1–F8, F11), and the opaque-construct rule (F14) | **Implemented and CI-wired.** `tools/check-dependency-direction.mjs`, run by the root script `check:deps` and by the "Dependency direction and package boundaries" step in `.github/workflows/ci.yml`, between the lint and unit-test steps. It parses §2 and §2.1 from **this document** at run time (§6) and fails closed on a contract it cannot parse |
+| **The §6 check itself** — cycles (F9), no dependency on an application (F10), layer conformance (F12/F13), forbidden specifiers and impure globals (F1–F8, F11), the opaque-construct rule (F14), the relative half of F16 (no relative import leaving its package), and two §2.1 row checks (a row whose `to` endpoint is an application, and a row that matches no declared edge, are `CHK` errors). F10, the relative half of F16 and the two row checks were added by `DEPCHECK-1` (2026-09-28) | **Implemented and CI-wired.** `tools/check-dependency-direction.mjs`, run by the root script `check:deps` and by the "Dependency direction and package boundaries" step in `.github/workflows/ci.yml`, between the lint and unit-test steps. It parses §2 and §2.1 from **this document** at run time (§6) and fails closed on a contract it cannot parse |
 
 *(Corrected 2026-08-28 by `GOV-1B`, closing `docs/handoffs/WP-015.md`
 `follow_up` 7.)* This section previously said "**No automated
@@ -897,6 +897,10 @@ moves with it and the count is re-recorded here.
    cycle in the output. This is the rule §5.2 states literally, and it is what
    makes same-layer edges safe to permit at all (F9).
 2. **Layer conformance**, evaluated per edge `A → B` against §2 and §2.1:
+   - `B` is an application (`apps/*`) → **fail** (F10), whatever the two
+     layers and whatever §2.1 says. The layer rules below still apply, except
+     that a same-layer edge into an app reports F10 without F13: F13's remedy
+     is a §2.1 row, and no row may permit this edge.
    - `layer(B) < layer(A)` → **pass**.
    - `layer(B) > layer(A)` → **fail** (F12), reporting both packages and both
      layers.
@@ -906,12 +910,28 @@ moves with it and the count is re-recorded here.
    - Either package unclassified in §2 → **fail** (see fail-closed below).
    `packages/strategies/**` is layer 1 for this rule; F3 and F11 constrain it
    further and are checked by rule 3, not here.
+   Two §2.1 rows are `CHK` errors, like a row that does not parse:
+   - a row whose `to` endpoint denotes an application, because F10 has no §2.1
+     exception;
+   - a row that matches no declared workspace edge, because §2.1 lists the
+     same-layer edges the repository has, and a stale row would silently
+     re-permit its edge if the edge came back. The change that removes an
+     edge removes its row, and a new row lands with its edge. Two cases are
+     not reported as stale: a row naming a class glob that matches no
+     workspace package (as for a §2 class entry), and a row naming a path
+     that has no manifest (already `F-CLOSED`).
+   *(F10 and both row checks enforced since `DEPCHECK-1`, 2026-09-28.)*
 3. **Forbidden-specifier scan.** Fail on any import specifier that violates F1–F8
    and F11 inside the offending package's source — for example `@polymarket/client`
    outside `packages/polymarket-secure`, `node:fs` inside `packages/strategies/**`,
    an archived client anywhere, or `Date.now`/`Math.random` inside a strategy.
    This rule reads source, not `package.json`, because a bare `node:` import
-   appears in neither dependency list.
+   appears in neither dependency list. It also fails the relative half of F16:
+   a relative specifier, in any form the rule reads as a literal, that resolves
+   outside the importing package's root or through a `node_modules` directory.
+   Only files inside a workspace package are read, so `test/**` and `tools/**`
+   are outside this rule. *(The F16 half enforced since `DEPCHECK-1`,
+   2026-09-28.)*
 
 Requirements on the check itself:
 

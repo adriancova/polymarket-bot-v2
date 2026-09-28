@@ -35,22 +35,58 @@
  *   `if:`, or with a key the check does not expect (for example
  *   `continue-on-error`);
  * - a gate that runs an `&&` chain as ONE step, other than through the split
- *   steps (`CI-2` r1, L5-1). Either its own `run` holds `&&`, or it runs a root
- *   script that is an `&&` chain other than the three split ones. A gate runs a
- *   root script when its `run` is `pnpm <script>` or `pnpm run <script>`,
- *   with or without arguments, and `<script>` is in the root `package.json`;
- *   a root script of that same form is followed to the script it runs.
+ *   steps (`CI-2` r1, L5-1). Either its own `run` holds `&&`, or one of its
+ *   commands runs a root script that is an `&&` chain other than the three
+ *   split ones. A root script of a spelling below is followed to the script
+ *   it runs;
+ * - a gate that runs MORE THAN ONE command in one step (`DEPCHECK-1`,
+ *   `CI2-L5-2`). GitHub runs a `run` block with `bash -e`, so its first failing
+ *   command ends the step and hides the rest: the `&&` hazard without the
+ *   `&&`. The commands of a `run` are its lines and its `;`-separated parts;
+ *   blank lines and `#` comments are not commands, and a line ending in `\`
+ *   continues on the next. A block whose commands genuinely need each other
+ *   is recorded in `DEPENDENT_RUN_BLOCKS` with its exact text and the reason;
+ *   today that is the python audit step, whose second line reads the file its
+ *   first line writes. A recorded block that no gate runs any more is also a
+ *   finding.
+ *
+ * WHICH SPELLINGS RUN A ROOT SCRIPT (`DEPCHECK-1`, `CI2-L5-3`). Each command is
+ * split into words (single quotes, and double quotes holding no `$`, backquote
+ * or backslash, are read; a word holding anything else unquoted is not). After
+ * any leading `NAME=value` assignments, a command runs the root script `<s>`,
+ * where `<s>` is in the root `package.json`, when it is:
+ * - `pnpm [options] [run|run-script] [options] <s>` with no option that moves
+ *   it off the root (`-r`, or a `-C`/`--dir`/`--filter`/`-F` naming anything
+ *   else), or with one that moves it onto the root: `-C`/`--dir` naming `.`
+ *   (`-C .`, `--dir ./`, `--dir=.`), `-w`/`--workspace-root`,
+ *   `--include-workspace-root`, or a `--filter`/`-F` selector that names the
+ *   root package (`polymarket-bot`, also with a `...` prefix or suffix) or the
+ *   directory `.` (`.`, `./`, `{.}`). An option that is none of these is taken
+ *   to be a flag without a value, and `<s>` is the first later word that names
+ *   a root script, so a word misread on the way can only over-report;
+ * - `npm [options] run|run-script [options] <s>`, or `npm [options] test|t|start`
+ *   for the scripts `test` and `start`, where no `-w`/`--workspace`/
+ *   `--workspaces` moves it off the root and a `--prefix` names `.`. As for
+ *   pnpm, any other option is taken for a flag, and any other word before
+ *   `run` is passed over.
+ * A root script's own text is followed through its first command only.
  *
  * NOT CHECKED by the one-step-chain rule, on purpose:
- * - the lines of a `run: |` block are not taken as a chain; only the first
- *   line is read, for `pnpm <script>`. Such lines may depend on one another,
- *   as in the python job's audit step, which writes the file its next line
- *   reads;
- * - `;` or `||` inside a script;
+ * - `||`, `|` and `&` inside a `run` or a script: none of them is the
+ *   fail-fast hazard (`||` and `&` hide a failure instead, a different
+ *   defect), and `;` inside a root SCRIPT, which `sh` runs without `-e`;
  * - chains inside workspace packages' own scripts, which a `pnpm -r`,
- *   `--filter` or `--dir` step runs (every package's `typecheck` is a
- *   `tsc … && tsc …` chain today). Those manifests are outside this check;
- * - root scripts that no gate runs (`test:compose`, `ops:validate-dataset`).
+ *   `--filter <package>` or `--dir <package>` step runs (every package's
+ *   `typecheck` is a `tsc … && tsc …` chain today). Those manifests are
+ *   outside this check;
+ * - a root script reached through a wrapper or another launcher: `npx`,
+ *   `corepack`, `env`, `bash -c`, `timeout`, `yarn`, `bun`, a `cd`, a subshell
+ *   or brace group, a shell variable or substitution, or a `--filter` selector
+ *   with `^`, `!` or a glob (`pnpm exec pnpm <s>` IS followed, since `<s>` is
+ *   the first word that names a root script);
+ * - root scripts that no gate runs (`test:compose`, `ops:validate-dataset`),
+ *   and the compose job's `run` block, which is no gate: that job has a single
+ *   step and is not in `GATED_JOBS`.
  * A `pnpm <name>` step is taken to run the root script `<name>` whenever one
  * exists, even where pnpm runs its own built-in command of that name (`pnpm
  * audit`). That can only over-report, never hide a chain.
@@ -346,34 +382,256 @@ export function stepRunFor(command: string): string {
   return command.startsWith("pnpm ") ? command : `pnpm exec ${command}`;
 }
 
-/**
- * `pnpm <name>` or `pnpm run <name>`, with or without arguments: the form in
- * which a command runs a script of the package in its working directory, which
- * for every gate is the root `package.json`. A flag before the name
- * (`--filter`, `--dir`, `-r`) runs workspace packages' scripts instead, so it
- * never matches.
- */
-const PNPM_SCRIPT_RUN = /^pnpm (?:run )?([^\s-]\S*)(?:\s|$)/u;
+/** A word of a shell command, and whether the reader could read it (see WHICH SPELLINGS above). */
+interface ShellWord {
+  readonly text: string;
+  readonly plain: boolean;
+}
 
-/** The root script `command` runs, if it is `pnpm [run] <script>` for a script that exists. */
-function rootScriptRun(command: string, scripts: ReadonlyMap<string, string>): string | undefined {
-  const name = PNPM_SCRIPT_RUN.exec(command)?.[1];
-  return name !== undefined && scripts.has(name) ? name : undefined;
+/** One command of a `run` or a script: its words, and its text for messages. */
+interface ShellCommand {
+  readonly words: readonly ShellWord[];
+  readonly text: string;
+}
+
+/** Characters that end a word and stand as a word of their own: operators and redirections. */
+const SHELL_OPERATOR = new Set(["&", "|", "<", ">", "(", ")"]);
+
+/**
+ * The commands of `source`, a `run` or a script (`DEPCHECK-1`, `CI2-L5-2`).
+ * A command ends at an unquoted newline or `;`. A `#` that starts a word
+ * starts a comment, a backslash before a newline joins two lines, and a
+ * command with no word (a blank or comment line) is dropped. The reader does
+ * not guess: a word holding an unquoted `$`, backquote or backslash, a double
+ * quote around any of those, or an unterminated quote is kept but marked as
+ * not plain, and no spelling is followed through it.
+ */
+export function shellCommands(source: string): readonly ShellCommand[] {
+  const commands: ShellCommand[] = [];
+  let words: ShellWord[] = [];
+  let text = "";
+  let plain = true;
+  let inWord = false;
+  const endWord = (): void => {
+    if (inWord) words.push({ text, plain });
+    text = "";
+    plain = true;
+    inWord = false;
+  };
+  const endCommand = (): void => {
+    endWord();
+    if (words.length > 0) commands.push({ words, text: words.map((word) => word.text).join(" ") });
+    words = [];
+  };
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index] ?? "";
+    if (char === "\\" && source[index + 1] === "\n") {
+      index += 1;
+      continue;
+    }
+    if (char === "\n" || char === ";") {
+      endCommand();
+      continue;
+    }
+    if (char === " " || char === "\t") {
+      endWord();
+      continue;
+    }
+    if (char === "#" && !inWord) {
+      while (index + 1 < source.length && source[index + 1] !== "\n") index += 1;
+      continue;
+    }
+    if (SHELL_OPERATOR.has(char)) {
+      endWord();
+      words.push({ text: char, plain: false });
+      continue;
+    }
+    inWord = true;
+    if (char === "'" || char === '"') {
+      const end = source.indexOf(char, index + 1);
+      const inner = source.slice(index + 1, end < 0 ? source.length : end);
+      if (end < 0 || (char === '"' && /[$`\\]/u.test(inner))) plain = false;
+      text += inner;
+      index = end < 0 ? source.length : end;
+      continue;
+    }
+    if (char === "$" || char === "`" || char === "\\") plain = false;
+    text += char;
+  }
+  endCommand();
+  return commands;
+}
+
+/** True when a `-C`/`--dir`/`--prefix` value names the directory the command already runs in. */
+function namesThisDirectory(value: string): boolean {
+  return /^\.(?:\/\.?)*\/?$/u.test(value);
+}
+
+/** True when a pnpm `--filter` selector selects the root package: by name, or as the directory `.`. */
+function selectsRoot(selector: string, rootName: string | undefined): boolean {
+  const bare = selector.replace(/^\.\.\./u, "").replace(/\.\.\.$/u, "");
+  const directory = /^\{(.*)\}$/u.exec(bare)?.[1] ?? bare;
+  return (rootName !== undefined && bare === rootName) || namesThisDirectory(directory);
+}
+
+/** pnpm options that take a value in the next word (unless written `--option=value`). */
+const PNPM_VALUE_OPTIONS = new Set(["-C", "--dir", "--filter", "-F"]);
+
+/** The root script a `pnpm …` command runs, given the words after `pnpm` (see WHICH SPELLINGS). */
+function pnpmRootScript(
+  args: readonly ShellWord[],
+  scripts: ReadonlyMap<string, string>,
+  rootName: string | undefined,
+): string | undefined {
+  let offRoot = false;
+  let ontoRoot = false;
+  let sawRun = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const word = args[index];
+    if (word === undefined || !word.plain) return undefined;
+    const equals = word.text.startsWith("--") ? word.text.indexOf("=") : -1;
+    const option = equals < 0 ? word.text : word.text.slice(0, equals);
+    if (PNPM_VALUE_OPTIONS.has(option)) {
+      let value: string | undefined = equals < 0 ? undefined : word.text.slice(equals + 1);
+      if (value === undefined) {
+        const next = args[index + 1];
+        if (next === undefined || !next.plain) return undefined;
+        value = next.text;
+        index += 1;
+      }
+      const toRoot = option === "-C" || option === "--dir" ? namesThisDirectory(value) : selectsRoot(value, rootName);
+      if (toRoot) ontoRoot = true;
+      else offRoot = true;
+      continue;
+    }
+    if (option === "-w" || option === "--workspace-root" || option === "--include-workspace-root") {
+      ontoRoot = true;
+      continue;
+    }
+    if (option === "-r" || option === "--recursive") {
+      offRoot = true;
+      continue;
+    }
+    if (word.text.startsWith("-")) continue; // a flag without a value
+    if (!sawRun && (word.text === "run" || word.text === "run-script")) {
+      sawRun = true;
+      continue;
+    }
+    if (offRoot && !ontoRoot) return undefined;
+    // The first word that names a root script. A word before it that names
+    // none (the value of an option taken above for a flag, or `exec` in
+    // `pnpm exec pnpm lint`) is passed over rather than ending the search, so
+    // a misread can only over-report.
+    if (scripts.has(word.text)) return word.text;
+  }
+  return undefined;
+}
+
+/** npm's own names for running the `test` and `start` scripts. */
+const NPM_SCRIPT_ALIASES: ReadonlyMap<string, string> = new Map([
+  ["test", "test"],
+  ["t", "test"],
+  ["start", "start"],
+]);
+
+/** The root script an `npm …` command runs, given the words after `npm` (see WHICH SPELLINGS). */
+function npmRootScript(args: readonly ShellWord[], scripts: ReadonlyMap<string, string>): string | undefined {
+  let sawRun = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const word = args[index];
+    if (word === undefined || !word.plain) return undefined;
+    const equals = word.text.startsWith("--") ? word.text.indexOf("=") : -1;
+    const option = equals < 0 ? word.text : word.text.slice(0, equals);
+    if (option === "-w" || option === "--workspace" || option === "-ws" || option === "--workspaces") return undefined;
+    if (option === "--prefix") {
+      let value: string | undefined = equals < 0 ? undefined : word.text.slice(equals + 1);
+      if (value === undefined) {
+        const next = args[index + 1];
+        if (next === undefined || !next.plain) return undefined;
+        value = next.text;
+        index += 1;
+      }
+      if (!namesThisDirectory(value)) return undefined;
+      continue;
+    }
+    if (word.text.startsWith("-")) continue; // a flag without a value
+    if (sawRun) return scripts.has(word.text) ? word.text : undefined;
+    if (word.text === "run" || word.text === "run-script") {
+      sawRun = true;
+      continue;
+    }
+    const alias = NPM_SCRIPT_ALIASES.get(word.text);
+    if (alias !== undefined && scripts.has(alias)) return alias;
+    // Any other word before `run` (the value of an option taken above for a
+    // flag, say) is passed over, as in `pnpmRootScript`: a misread can only
+    // over-report.
+  }
+  return undefined;
+}
+
+/** The root script `command` runs, if it is one of the spellings above for a script that exists. */
+function rootScriptRun(
+  command: ShellCommand | undefined,
+  scripts: ReadonlyMap<string, string>,
+  rootName: string | undefined,
+): string | undefined {
+  if (command === undefined) return undefined;
+  let start = 0;
+  while (start < command.words.length) {
+    const word = command.words[start];
+    if (word === undefined || !word.plain || !/^[A-Za-z_][A-Za-z0-9_]*=/u.test(word.text)) break;
+    start += 1;
+  }
+  const launcher = command.words[start];
+  if (launcher === undefined || !launcher.plain) return undefined;
+  const args = command.words.slice(start + 1);
+  if (launcher.text === "pnpm") return pnpmRootScript(args, scripts, rootName);
+  if (launcher.text === "npm") return npmRootScript(args, scripts);
+  return undefined;
 }
 
 /**
  * The root scripts `command` runs, the first one it names, then each script
- * the previous one runs in the same form. Stops at a script it has already
- * visited, such as `audit` (`pnpm audit --audit-level high`), which names itself.
+ * the previous one runs through its first command. Stops at a script it has
+ * already visited, such as `audit` (`pnpm audit --audit-level high`), which
+ * names itself.
  */
-function rootScriptPath(command: string, scripts: ReadonlyMap<string, string>): readonly string[] {
+function rootScriptPath(
+  command: ShellCommand,
+  scripts: ReadonlyMap<string, string>,
+  rootName: string | undefined,
+): readonly string[] {
   const visited: string[] = [];
-  let name = rootScriptRun(command, scripts);
+  let name = rootScriptRun(command, scripts, rootName);
   while (name !== undefined && !visited.includes(name)) {
     visited.push(name);
-    name = rootScriptRun(scripts.get(name) ?? "", scripts);
+    name = rootScriptRun(shellCommands(scripts.get(name) ?? "")[0], scripts, rootName);
   }
   return visited;
+}
+
+/**
+ * Gate `run` blocks whose commands genuinely need one another, so running them
+ * as one step is not the `&&` hazard (`DEPCHECK-1`, `CI2-L5-2`). Each entry is
+ * matched on its job, its step name and its EXACT `run` text: any edit to the
+ * block makes it a multi-command finding again until the entry is re-justified.
+ */
+export const DEPENDENT_RUN_BLOCKS = [
+  {
+    job: "python",
+    step: "Dependency vulnerability scan (uv lockfile)",
+    run:
+      "uv export --frozen --no-emit-project --format requirements-txt > /tmp/requirements-audit.txt\n" +
+      "uvx pip-audit --strict -r /tmp/requirements-audit.txt\n",
+    why: "the second command audits the requirements file the first one writes, so neither is a gate without the other",
+  },
+] as const;
+
+/** The root `package.json`'s `name`, which a `--filter` selector may name. */
+function rootPackageName(packageJsonText: string): string | undefined {
+  const parsed: unknown = JSON.parse(packageJsonText);
+  const name = typeof parsed === "object" && parsed !== null ? (parsed as { readonly name?: unknown }).name : undefined;
+  return typeof name === "string" ? name : undefined;
 }
 
 /** Words that mark a step as running one of the chains, split or not. */
@@ -457,27 +715,47 @@ function gateFindings(
 }
 
 /**
- * How `gate` runs an `&&` chain as one step, or undefined when it does not
- * (L5-1; see THE DRIFT CHECK above).
+ * Every way `gate` runs an `&&` chain, or several commands, as one step
+ * (L5-1, `CI2-L5-2`, `CI2-L5-3`; see THE DRIFT CHECK above). `dependent` is
+ * true when the gate's block is recorded in `DEPENDENT_RUN_BLOCKS`.
  */
-function oneStepChain(gate: WorkflowStep, scripts: ReadonlyMap<string, string>): string | undefined {
+function oneStepChain(
+  gate: WorkflowStep,
+  scripts: ReadonlyMap<string, string>,
+  rootName: string | undefined,
+  dependent: boolean,
+): string[] {
   const run = gate.run;
-  if (run === undefined) return undefined;
+  if (run === undefined) return [];
   if (run.includes("&&")) {
-    return (
+    return [
       `${gate.label} chains commands with \`&&\` in its own \`run\`, so its first failure hides the rest of ` +
-      `the step; give each command its own gated step: ${JSON.stringify(run)}`
+        `the step; give each command its own gated step: ${JSON.stringify(run)}`,
+    ];
+  }
+  const findings: string[] = [];
+  const commands = shellCommands(run);
+  for (const command of commands) {
+    const path = rootScriptPath(command, scripts, rootName);
+    const chained = path.find((name) => (scripts.get(name) ?? "").includes("&&"));
+    if (chained === undefined) continue;
+    findings.push(
+      `${gate.label} runs the root script ${path.map((name) => `\`${name}\``).join(" -> ")} as one step, and ` +
+        `\`${chained}\` is an \`&&\` chain (${JSON.stringify(scripts.get(chained))}), so its first failure hides the ` +
+        "rest; run each of its commands as its own gated step and add the script to SPLIT_CHAINS in " +
+        "test/unit/tooling/ci-workflow.ts",
     );
   }
-  const path = rootScriptPath(run, scripts);
-  const chained = path.find((name) => (scripts.get(name) ?? "").includes("&&"));
-  if (chained === undefined) return undefined;
-  return (
-    `${gate.label} runs the root script ${path.map((name) => `\`${name}\``).join(" -> ")} as one step, and ` +
-    `\`${chained}\` is an \`&&\` chain (${JSON.stringify(scripts.get(chained))}), so its first failure hides the ` +
-    "rest; run each of its commands as its own gated step and add the script to SPLIT_CHAINS in " +
-    "test/unit/tooling/ci-workflow.ts"
-  );
+  if (commands.length > 1 && !dependent) {
+    findings.push(
+      `${gate.label} runs ${commands.length} commands in one step (${commands
+        .map((command) => JSON.stringify(command.text))
+        .join(", ")}); GitHub runs a \`run\` block with \`bash -e\`, so the first failure hides the rest, as an ` +
+        "`&&` chain would; give each independent command its own gated step, or, if each command needs the ones " +
+        "before it, record the block in DEPENDENT_RUN_BLOCKS in test/unit/tooling/ci-workflow.ts with the reason",
+    );
+  }
+  return findings;
 }
 
 /**
@@ -488,6 +766,7 @@ function oneStepChain(gate: WorkflowStep, scripts: ReadonlyMap<string, string>):
  */
 export function splitStepDrift(workflowText: string, packageJsonText: string): string[] {
   const scripts = rootScripts(packageJsonText);
+  const rootName = rootPackageName(packageJsonText);
   const chains = chainCommands(packageJsonText);
   const findings: string[] = [];
 
@@ -504,12 +783,25 @@ export function splitStepDrift(workflowText: string, packageJsonText: string): s
   const gates = gatesByJob.get("node");
   if (gates !== undefined) findings.push(...splitFindings(gates, chains, lookAlikes));
 
-  for (const jobGates of gatesByJob.values()) {
+  const isRecorded = (job: string, gate: WorkflowStep, block: (typeof DEPENDENT_RUN_BLOCKS)[number]): boolean =>
+    block.job === job && block.step === gate.name && block.run === gate.run;
+  for (const [job, jobGates] of gatesByJob) {
     for (const gate of jobGates) {
       if (lookAlikes.has(gate)) continue;
-      const finding = oneStepChain(gate, scripts);
-      if (finding !== undefined) findings.push(finding);
+      const dependent = DEPENDENT_RUN_BLOCKS.some((block) => isRecorded(job, gate, block));
+      findings.push(...oneStepChain(gate, scripts, rootName, dependent));
     }
+  }
+  // A recorded block that no gate runs any more is stale: the entry would
+  // silently excuse a block of that name and text if it came back. Checked
+  // only for a job whose gates are known.
+  for (const block of DEPENDENT_RUN_BLOCKS) {
+    const jobGates = gatesByJob.get(block.job);
+    if (jobGates === undefined || jobGates.some((gate) => isRecorded(block.job, gate, block))) continue;
+    findings.push(
+      `DEPENDENT_RUN_BLOCKS records the ${block.job} step ${JSON.stringify(block.step)} as a dependent block, but no ` +
+        `gate of that job runs that exact block any more; update the entry with its reason, or remove it`,
+    );
   }
   return findings;
 }
