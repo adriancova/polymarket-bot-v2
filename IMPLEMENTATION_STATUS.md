@@ -670,9 +670,30 @@ Record: `docs/handoffs/REGISTER-1.md`.
   - (4) A Testcontainers test runs register → `assembleDurableTrader` → `registration: OK`.
   - (5) Its bundle is covered by `app-bundles-load.test.ts`.
   - It does NOT verify `gammaMarketId` (UNIV4-R1); it prints a reminder instead. | BACKTEST-2 ✓ | apps/trader/src/register/** (new), apps/trader/package.json (new scripts only), test/unit/tooling/app-bundles-load.test.ts, test/integration/paper-trader/** (new tests and support), infra/compose/trader/** (docs only). Forbidden: OUTAGE-1's paths, packages/**, other apps, db/**, docs/**, lockfile, protected files. Gate: automated + Fable adversarial review (hardening loop) + a green CI run on GitHub. |
-| `OUTAGE-2` (make OUTAGE-1's PARTITION outage test deterministic; prove nothing is written after a halt) | **Ready (authorized) 2026-09-29** by the orchestrator. This is a CI-health fix to an accepted round's test, and it blocks nothing the user ruled.
+| `OUTAGE-2` (make OUTAGE-1's PARTITION outage test deterministic; prove nothing is written after a halt) | **Complete (2026-09-29)** — merged `a618752` (`--no-ff`; one commit `f70682e` on base `d91a5ad`). HARDENING LOOP `wf_1c0f9193-d7b`; Fable reviewer r1 **ACCEPT** (3 LOW).
 
-**The finding:** on GitHub CI, PR #21 attempt 1, the partition case read 6 durable decision rows after the halt, against a "before" snapshot of 5. The halt itself was on time: +1.0 s, exit at +3.0 s. The case passed on main three times and on the re-run.
+**Classification: a TEST RACE, not a write after the halt.**
+  - The extra row was a `strategy.state_checkpoints` row: the checkpoint of decision 6.
+  - It committed about 3 ms after the "before" snapshot and about 1 s BEFORE the halt.
+  - 0 rows were committed after the halt, in 55 instrumented runs.
+
+**Fix (test file only):**
+  - The test settles on the trader's committed stream position; the pump commits only after `drain()` returns.
+  - "Nothing written after the halt" is checked by PostgreSQL commit order against a pre-fault MVCC snapshot, which catches updates too. Whole rows are compared.
+  - The stopped-container and idle cases share it.
+
+**Evidence:**
+  - 25/25 consecutive passes.
+  - Planted post-halt writes are caught, naming the table.
+  - The old settle reproduces the race in 4 to 7 runs out of 30.
+
+**CI:** PR #22 run `36555755187`, green.
+
+Record: `docs/handoffs/OUTAGE-2.md`.
+
+*Correction (reviewer `OUT2-R1-STATUS-ROW-WORDING`):* the finding below said "6 durable decision rows". It was a CHECKPOINT row (checkpoints 7 vs 6; decisions were equal). Also, the pump is `apps/trader/src/pump.ts`, not `packages/trading-core/src/pump.ts`. The text is kept as authorized.
+
+*As authorized:* **The finding:** on GitHub CI, PR #21 attempt 1, the partition case read 6 durable decision rows after the halt, against a "before" snapshot of 5. The halt itself was on time: +1.0 s, exit at +3.0 s. The case passed on main three times and on the re-run.
 
 **Likely cause:** the "before" snapshot is taken at `eventsProcessed === 6` while loop-originated evaluations can still land. That makes it a test race.
 
@@ -2514,7 +2535,7 @@ Blocks H1. | `docs/handoffs/BRACKET-1c.md` (implementer C4; reproduced by the Fa
 | **DC1-R1-L1** | `import.meta.resolve("<relative>")` is not judged by F16's relative half. It is missing from the disclosed not-covered list in the §3 F16 Source cell and in `docs/handoffs/DEPCHECK-1.md`. Docs-only: add it to both | `docs/handoffs/DEPCHECK-1.md` (Fable r1 LOW) | **CLOSED by `DOCS-1`** (merged `2e7f618`) |
 | **REGISTER1-LOWS** | (L1) `REGISTER_REFUSED_BY_DATABASE` says "the database refused a row" when the failing statement was the duplicate-check SELECT on an UNMIGRATED database; the outcome is correct. (L2) `REGISTER_DEFINITION_MISMATCH` and `REGISTER_CONFIG_MISMATCH` have no test (verified by hand). (L3) `--help`'s exit-code table does not name every 78 code. (L4) a flag VALUE of exactly `-h`/`--help` prints the usage | `docs/handoffs/REGISTER-1.md` (Fable r1) | the next `apps/trader/src/register` round |
 | **TRADER-SIGNALS** | The trader installs no SIGINT/SIGTERM handler; `main.ts`'s header mentions "the signal handlers", which do not exist. Ending a run with Ctrl-C kills the process: durable writes are already committed per event, but the FOLD-1 SHUTDOWN rebuild check and the orderly close never run. A graceful stop (stop the pump, run the SHUTDOWN check, close, exit 0) would put the shutdown check into H1's evidence | orchestrator, while writing the H1 operator checklist (`apps/trader/src/main.ts` :733-744) | offered to the user as an optional small round before H1 |
-| **OUT1-R1-HALT-NOT-DURABLE** | A halt, including OUTAGE-1's `TRANSPORT_UNAVAILABLE`, is not persisted to PostgreSQL. `TraderStore` has no halt write, and no repository or trader code writes `ops.incidents`/`ops.risk_events`. The durable record of an outage is only its consequence (no writes after the halt instant), plus the process log and the exit code | `docs/handoffs/OUTAGE-1.md` (Fable r1 MEDIUM) | a trader/storage round that adds a durable halt record (`ops.incidents`), before sustained live-data paper runs |
+| **OUT1-R1-HALT-NOT-DURABLE** | A halt, including OUTAGE-1's `TRANSPORT_UNAVAILABLE`, is not persisted to PostgreSQL. `TraderStore` has no halt write, and no repository or trader code writes `ops.incidents`/`ops.risk_events`. The durable record of an outage is only its consequence (no writes after the halt instant), plus the process log and the exit code | `docs/handoffs/OUTAGE-1.md` (Fable r1 MEDIUM) | a trader/storage round that adds a durable halt record (`ops.incidents`), before sustained live-data paper runs. **Note (OUTAGE-2 reviewer, `OUT2-R1-HALT-RECORD-INTERACTION`):** the outage tests' commit-order check requires that NO row commits after the pre-fault snapshot. The round that adds the durable halt record must update the three outage scenarios to expect exactly that one halt row, and nothing else. |
 | **OUTAGE1-LOWS** | (1) The trader-level outage tests pin "halts within T" but not the read deadline specifically; the event-bus suite pins it deterministically. (2) The recorded docker-restart halt is an artifact of Testcontainers re-mapping the port; with a fixed port a fast restart RECOVERS, as designed. (3) `startup()`'s subscribe catch labels any non-`EventBusUnavailableError` as `TRADER_EVENT_SUBSCRIPTION_REFUSED` (78) | `docs/handoffs/OUTAGE-1.md` | the next `apps/trader` round |
 | **B1-R1-REDIS-UNCAUGHT** | With Redis unreachable, the trader's `startup()` rejects with an uncaught `EventBusUnavailableError` (stack trace, exit 1) instead of a documented refusal. `RedisStreamsEventTransport.connect` (`apps/trader/src/main.ts:290`) is awaited without a catch, which contradicts `startup()`'s "Never throws" docstring; the PostgreSQL boundary has `infrastructureUnavailable` (69). It fails closed. The neighbour of `BOOT1-R7` (a Redis outage mid-run HANGS the process) | `docs/handoffs/BUNDLE-1.md` (Fable r1 MEDIUM) | **CLOSED by `OUTAGE-1`** (merged `143ad8d`, 2026-09-29) |
 | **BUNDLE1-LOWS** | Six LOW items, all queued:
