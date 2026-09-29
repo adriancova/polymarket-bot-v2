@@ -234,7 +234,14 @@ describe("fail-closed on the real transport is intact (THROUGHPUT-1b)", () => {
     expect(ingestSeqsOf(entries)).toStrictEqual(
       envelopes.slice(0, result.published).map((envelope) => envelope.ingestSeq),
     );
-    expect(result.published).toBeGreaterThanOrEqual(300);
+    // Publication was really flowing until the hop froze, and nothing
+    // admitted AFTER the freeze was published: once frozen, the one run in
+    // flight cannot complete until the thaw, and by then publication has
+    // halted, so the published prefix is at most envelopes 0..300 (index 300
+    // is the admission that froze the hop, which may itself have been the
+    // run in flight). Exactly where in that range it ends is timing.
+    expect(result.published).toBeGreaterThan(200);
+    expect(result.published).toBeLessThanOrEqual(301);
     expect(BigInt(ingestSeqsOf(entries).at(-1) ?? "0") < BigInt(halt.haltedAtIngestSeq)).toBe(true);
   }, 60_000);
 

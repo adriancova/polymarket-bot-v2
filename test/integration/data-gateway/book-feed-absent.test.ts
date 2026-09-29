@@ -188,13 +188,23 @@ describe("GATEWAY_BOOK_FEED_ABSENT in the REAL bundle's [incident] log", () => {
       });
     });
 
+    // Wait for the running banner as well as the incident: `run.ts` installs
+    // the shutdown handlers in the same synchronous turn that prints the
+    // banner, AFTER `start()` announced the incident. A SIGTERM sent on the
+    // incident line alone can arrive before the handlers exist and kill the
+    // process with the default action (exit code null).
     const deadline = Date.now() + 20_000;
-    while (!stderr.includes(`NOTIFY ${BOOK_FEED_ABSENT}`) && Date.now() < deadline && spawned.exitCode === null) {
+    while (
+      !(stderr.includes(`NOTIFY ${BOOK_FEED_ABSENT}`) && stderr.includes("data-gateway running:")) &&
+      Date.now() < deadline &&
+      spawned.exitCode === null
+    ) {
       await new Promise((resolveDelay) => {
         setTimeout(resolveDelay, 50);
       });
     }
     expect(stderr, stderr).toMatch(/\[incident\] NOTIFY GATEWAY_BOOK_FEED_ABSENT \(gw-books-\d+\): 1 Polymarket market/u);
+    expect(stderr, stderr).toContain("data-gateway running:");
 
     spawned.kill("SIGTERM");
     const code = await Promise.race([
@@ -206,5 +216,6 @@ describe("GATEWAY_BOOK_FEED_ABSENT in the REAL bundle's [incident] log", () => {
       }),
     ]);
     expect(code, stderr).toBe(0);
+    expect(stderr).toContain("data-gateway: shutting down");
   }, 60_000);
 });
