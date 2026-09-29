@@ -16,6 +16,9 @@
  */
 
 export type { RedisConnectionOptions } from "./client.js";
+// Numbers, not client types: a composition root states the bound it runs
+// under (`OUTAGE-1`) without naming anything from the Redis client.
+export { DEFAULT_RESPONSE_TIMEOUT_MS, MAX_RESPONSE_TIMEOUT_MS } from "./client.js";
 export {
   MAX_RETENTION_EVENTS,
   REDIS_STREAMS_TRANSPORT_ID,

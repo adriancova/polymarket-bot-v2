@@ -17,6 +17,16 @@
  * halt, and a halt controller cannot act on an exception it never sees, so the
  * throw is contained here and becomes the port's `UNAVAILABLE` failure.
  *
+ * Dated addition (`OUTAGE-1`, `BOOT1-R7`): "a throw" presumed the transport
+ * would throw. Under a real outage it did not — with the Redis container
+ * stopped, the `receive` this adapter awaits was still pending 90 s later,
+ * because `ioredis` had parked the in-flight command where its retry flush
+ * never reaches. The bound that makes the throw happen now lives in
+ * `packages/event-bus` (`responseTimeoutMs`: every command and every read is
+ * answered within it or fails), so nothing here waits on its own clock. What
+ * changed here is the halt DETAIL: it carries the failure's cause chain, which
+ * is where the transport says why.
+ *
  * ## The recorded identity
  *
  * The trader's loop anchors every simulated outcome to a `RecordedEventIdentity`
@@ -127,6 +137,22 @@ export class RedisMarketEventFeed implements MarketEventFeed {
   }
 }
 
-function describe(cause: unknown): string {
-  return cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+/** How many links of an error's `cause` chain a halt detail carries. */
+const MAX_CAUSE_DEPTH = 3;
+
+/**
+ * The error and its cause chain, one line (`OUTAGE-1`).
+ *
+ * The transport wraps every failure in an `EventBusUnavailableError` whose
+ * own message says only WHICH operation failed ("could not read from the
+ * event transport"); WHY — "Command timed out", a read with no reply within
+ * its bound, the retry limit — is its `cause`. An operator reading the halt
+ * needs the why, so the chain is carried, bounded so that a cyclic chain
+ * cannot grow the line without limit.
+ */
+function describe(cause: unknown, depth = 0): string {
+  if (!(cause instanceof Error)) return String(cause);
+  const own = `${cause.name}: ${cause.message}`;
+  if (cause.cause === undefined || depth + 1 >= MAX_CAUSE_DEPTH) return own;
+  return `${own}; caused by ${describe(cause.cause, depth + 1)}`;
 }
