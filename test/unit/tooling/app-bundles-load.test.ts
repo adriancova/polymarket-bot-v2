@@ -76,9 +76,27 @@
  * - `apps/ops-cli` ships no bundle (ADR-018 §4 exception). The first test
  *   below fails if any other app starts shipping one without being listed
  *   here.
+ *
+ * A SECOND ENTRY IN ONE APP (`REGISTER-1`, 2026-09-28). `apps/trader` ships a
+ * second bundle: the operator registration command, `src/register/main.ts`,
+ * built by its own `build:register` script to `dist/register.mjs` and run by
+ * its own `register` script; `build` and `start` are unchanged. The drift
+ * guard now covers EVERY script of every app whose value starts with
+ * `esbuild `, not only `build`, so a further entry fails here until it is
+ * listed in {@link SECONDARY_ENTRIES}. Each secondary entry's build script
+ * must be its app's `build` with only the entry file and the outfile changed
+ * — the same flags and the same `createRequire` banner, byte for byte — and
+ * its outfile must not be the app's `main` bundle name, so the two builds
+ * never write the same `dist/` file. Its bundle is built and run like the
+ * others: `--help` prints the usage, and an UNSAFE environment is refused by
+ * its safety check before any file is read. Its entry guard compares the
+ * module's URL with the file Node runs rather than testing a file name, so
+ * the renamed-bundle residual ADR-018 records for three guards does not
+ * extend to it: a case runs a RENAMED copy, in a directory whose name holds a
+ * space, and it still refuses.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -87,12 +105,48 @@ import { afterAll, describe, expect, it } from "vitest";
 import { EXIT_USAGE as BACKTEST_EXIT_USAGE } from "../../../apps/backtest-cli/src/main.js";
 import { EXIT_CODES as CONTROL_API_EXIT_CODES } from "../../../apps/control-api/src/main.js";
 import { EXIT_CODES as TRADER_EXIT_CODES } from "../../../apps/trader/src/main.js";
+import { REGISTER_EXIT_CODES } from "../../../apps/trader/src/register/main.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 
 /** Every app that ships an ADR-018 esbuild bundle. */
 const BUNDLED_APPS = ["trader", "data-gateway", "control-api", "backtest-cli", "research-worker"] as const;
 type BundledApp = (typeof BUNDLED_APPS)[number];
+
+/**
+ * A second esbuild entry inside a bundled app: its own build script, its own
+ * run script, its own outfile. `build` and `start` stay the app's main bundle.
+ */
+interface SecondaryEntry {
+  readonly app: BundledApp;
+  /** The bundle's name in this file (`<app>:<name>`). */
+  readonly name: string;
+  /** The `package.json` script that builds it. */
+  readonly buildScript: string;
+  /** The `package.json` script that builds and runs it. */
+  readonly runScript: string;
+  /** The entry file, relative to the app. */
+  readonly entry: string;
+  readonly outfileName: string;
+}
+
+const SECONDARY_ENTRIES: readonly SecondaryEntry[] = [
+  {
+    app: "trader",
+    name: "register",
+    buildScript: "build:register",
+    runScript: "register",
+    entry: "src/register/main.ts",
+    outfileName: "register.mjs",
+  },
+];
+
+/** A bundle this file builds: an app's main bundle, or `<app>:<name>` for a secondary entry. */
+type BundleKey = BundledApp | `${BundledApp}:${string}`;
+
+function secondaryKey(entry: SecondaryEntry): BundleKey {
+  return `${entry.app}:${entry.name}`;
+}
 
 /** A build that has not finished in this long is killed; normal is well under 2 s each. */
 const BUILD_DEADLINE_MS = 60_000;
@@ -193,6 +247,50 @@ describe("the bundles the runnable apps ship (ADR-018)", () => {
       // The format and the extension agree, so Node loads the file as what it is.
       expect(build).toContain(outfileName.endsWith(".mjs") ? "--format=esm" : "--format=cjs");
       expect(start.endsWith(`&& node ./dist/${outfileName}`), start).toBe(true);
+    });
+  }
+
+  it("EVERY script of every app that runs esbuild is covered here: the main builds and each secondary entry (REGISTER-1)", async () => {
+    const entries = await readdir(path.join(repoRoot, "apps"), { withFileTypes: true });
+    const found: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      for (const [name, script] of Object.entries(await readScripts(entry.name))) {
+        if (script.startsWith("esbuild ")) found.push(`${entry.name}/${name}`);
+      }
+    }
+    const covered = [
+      ...BUNDLED_APPS.map((app) => `${app}/build`),
+      ...SECONDARY_ENTRIES.map((entry) => `${entry.app}/${entry.buildScript}`),
+    ];
+    // Non-vacuity: the scan found the main builds it must find.
+    expect(found).toContain("trader/build");
+    expect(found.sort()).toEqual(covered.sort());
+  });
+
+  for (const entry of SECONDARY_ENTRIES) {
+    it(`${secondaryKey(entry)}: its build is the app's build with only the entry and the outfile changed, and its run script runs that file`, async () => {
+      const scripts = await readScripts(entry.app);
+      const main = await bundleScripts(entry.app);
+      const build = scripts[entry.buildScript];
+      const run = scripts[entry.runScript];
+      if (build === undefined || run === undefined) {
+        throw new Error(`apps/${entry.app}/package.json lacks ${entry.buildScript} or ${entry.runScript}`);
+      }
+      // Same esbuild flags and the same createRequire banner, byte for byte.
+      expect(build).toBe(
+        main.build
+          .replace("esbuild src/main.ts ", `esbuild ${entry.entry} `)
+          .replace(`${OUTFILE_FLAG}${main.outfileName}`, `${OUTFILE_FLAG}${entry.outfileName}`),
+      );
+      expect(build.split(OUTFILE_FLAG)).toHaveLength(2);
+      expect([...build.matchAll(OUTFILE)].map((match) => match[1])).toEqual([entry.outfileName]);
+      // Never the main bundle's name: the two builds must not write the same
+      // dist/ file.
+      expect(entry.outfileName).not.toBe(main.outfileName);
+      expect(entry.outfileName.endsWith(".mjs")).toBe(true);
+      expect(run.endsWith(`&& node ./dist/${entry.outfileName}`), run).toBe(true);
+      expect(run).toContain(`pnpm run ${entry.buildScript} `);
     });
   }
 });
@@ -300,27 +398,50 @@ interface BuiltBundle {
   readonly file: string;
 }
 
-const builds = new Map<BundledApp, Promise<BuiltBundle>>();
+const builds = new Map<BundleKey, Promise<BuiltBundle>>();
 
-function bundleFor(app: BundledApp): Promise<BuiltBundle> {
-  let build = builds.get(app);
+/** A byte copy of a built bundle at `relative` under its directory (a case's `runAs`). */
+async function copyOf(bundle: BuiltBundle, relative: string): Promise<string> {
+  const file = path.join(bundle.directory, relative);
+  if (!file.startsWith(`${bundle.directory}${path.sep}`)) throw new Error(`${relative} leaves the bundle directory`);
+  await mkdir(path.dirname(file), { recursive: true });
+  await copyFile(bundle.file, file);
+  return file;
+}
+
+function bundleFor(key: BundleKey): Promise<BuiltBundle> {
+  let build = builds.get(key);
   if (build === undefined) {
-    build = buildBundle(app);
-    builds.set(app, build);
+    build = buildBundle(key);
+    builds.set(key, build);
   }
   return build;
 }
 
-async function buildBundle(app: BundledApp): Promise<BuiltBundle> {
-  const scripts = await bundleScripts(app);
-  const directory = path.join(await scratch(), app);
+/** The app's `build` and outfile for a main bundle; the entry's own script for a secondary one. */
+async function buildInputs(key: BundleKey): Promise<{ readonly app: BundledApp; readonly build: string; readonly outfileName: string }> {
+  const secondary = SECONDARY_ENTRIES.find((entry) => secondaryKey(entry) === key);
+  if (secondary === undefined) {
+    const app = BUNDLED_APPS.find((candidate) => candidate === key);
+    if (app === undefined) throw new Error(`no bundle is known as ${key}`);
+    const scripts = await bundleScripts(app);
+    return { app, build: scripts.build, outfileName: scripts.outfileName };
+  }
+  const build = (await readScripts(secondary.app))[secondary.buildScript];
+  if (build === undefined) throw new Error(`apps/${secondary.app} has no ${secondary.buildScript} script`);
+  return { app: secondary.app, build, outfileName: secondary.outfileName };
+}
+
+async function buildBundle(key: BundleKey): Promise<BuiltBundle> {
+  const { app, build, outfileName } = await buildInputs(key);
+  const directory = path.join(await scratch(), key.replace(":", "-"));
   if (!SHELL_SAFE_PATH.test(directory) || directory.startsWith(`${repoRoot}${path.sep}`)) {
     throw new Error(`the bundle directory ${directory} is not a shell-safe path outside the repository`);
   }
   await mkdir(directory, { recursive: true });
-  const script = scripts.build.replace(OUTFILE_FLAG, `--outfile=${directory}/`);
+  const script = build.replace(OUTFILE_FLAG, `--outfile=${directory}/`);
   if (script.includes("dist/")) {
-    throw new Error(`apps/${app}'s build writes into dist/ other than through --outfile: ${scripts.build}`);
+    throw new Error(`apps/${app}'s build writes into dist/ other than through --outfile: ${build}`);
   }
   const appDirectory = path.join(repoRoot, "apps", app);
   const outcome = await runChild("sh", ["-c", script], {
@@ -340,7 +461,7 @@ async function buildBundle(app: BundledApp): Promise<BuiltBundle> {
   if (outcome.error !== undefined || outcome.status !== 0) {
     throw new Error(describeOutcome(`building apps/${app} (${script})`, outcome));
   }
-  const file = path.join(directory, scripts.outfileName);
+  const file = path.join(directory, outfileName);
   const written = await stat(file);
   if (!written.isFile() || written.size === 0) throw new Error(`building apps/${app} wrote no ${file}`);
   return { directory, file };
@@ -367,6 +488,15 @@ const SAFE_PAPER_DEFAULTS = {
 
 interface BundleCase {
   readonly app: BundledApp;
+  /** A secondary entry's bundle (`<app>:<name>`); absent for the app's main bundle. */
+  readonly bundle?: BundleKey;
+  /**
+   * Run a COPY of the built bundle at this path, relative to the bundle's
+   * directory, instead of the built file itself: where an entry guard keyed on
+   * the file name would exit 0 having done nothing (ADR-018's renamed-bundle
+   * residual).
+   */
+  readonly runAs?: string;
   readonly name: string;
   readonly argv: readonly string[];
   readonly env: Readonly<Record<string, string>>;
@@ -419,6 +549,96 @@ const CASES: readonly BundleCase[] = [
     notPrinted: ["REFUSING TO START: the environment is not safe"],
   },
   {
+    app: "trader",
+    bundle: "trader:register",
+    name: "the registration command's --help prints its usage, in any environment, and reads nothing",
+    argv: ["--help"],
+    env: {},
+    exitCode: REGISTER_EXIT_CODES.registered,
+    printed: [
+      "usage: register --template <file> --out <file>",
+      "It does NOT verify a gammaMarketId (UNIV4-R1).",
+      "Running it again is REFUSED",
+    ],
+    notPrinted: ["safety: OK", "REFUSING TO REGISTER"],
+  },
+  {
+    app: "trader",
+    bundle: "trader:register",
+    name: "the registration command refuses an UNSAFE environment before any file is read or connection attempted",
+    argv: [
+      "--template",
+      TRADER_EXAMPLE_CONFIG,
+      "--out",
+      "completed.json",
+      "--instance-name",
+      "static-bracket-bundle",
+      "--question-title",
+      "bundle",
+      "--neg-risk",
+      "false",
+      "--trading-delay-seconds",
+      "0",
+      "--lifecycle-state",
+      "OPEN",
+      "--yes-label",
+      "Up",
+      "--no-label",
+      "Down",
+      "--code-commit",
+      "bundle",
+      "--created-by",
+      "bundle",
+    ],
+    env: {
+      MAX_RUN_MODE: "LIVE",
+      RUN_MODE: "LIVE",
+      ALLOW_REAL_ORDERS: "true",
+      LIVE_MICRO_MAX_ORDER_NOTIONAL: "5",
+      LIVE_MICRO_MAX_ACCOUNT_EXPOSURE: "5",
+      DATABASE_URL: "postgres://bundle:bundle@127.0.0.1:1/bundle",
+    },
+    exitCode: REGISTER_EXIT_CODES.unsafeEnvironment,
+    printed: [
+      "REFUSING TO REGISTER: REGISTER_UNSAFE_ENVIRONMENT",
+      "No file was read and no connection was attempted.",
+      "PAPER_RUN_MODE_CEILING_RAISED: MAX_RUN_MODE=LIVE",
+      "PAPER_REAL_ORDERS_ENABLED: ALLOW_REAL_ORDERS=true",
+      "PAPER_LIVE_MICRO_CAP_NONZERO: LIVE_MICRO_MAX_ORDER_NOTIONAL=5",
+    ],
+    notPrinted: ["safety: OK", "template: OK", "REGISTER_DATABASE_UNAVAILABLE"],
+  },
+  {
+    app: "trader",
+    bundle: "trader:register",
+    runAs: "renamed copy/pmb-register-renamed.mjs",
+    name: "a RENAMED copy of the registration bundle, in a directory whose name holds a space, still runs its safety check (the entry guard is not keyed on the file name)",
+    argv: [],
+    env: {
+      MAX_RUN_MODE: "LIVE",
+      ALLOW_REAL_ORDERS: "false",
+      LIVE_MICRO_MAX_ORDER_NOTIONAL: "0",
+      LIVE_MICRO_MAX_ACCOUNT_EXPOSURE: "0",
+    },
+    exitCode: REGISTER_EXIT_CODES.unsafeEnvironment,
+    printed: ["REFUSING TO REGISTER: REGISTER_UNSAFE_ENVIRONMENT", "PAPER_RUN_MODE_CEILING_RAISED: MAX_RUN_MODE=LIVE"],
+    notPrinted: ["safety: OK"],
+  },
+  {
+    app: "trader",
+    bundle: "trader:register",
+    name: "the registration command passes safety in a PAPER environment and refuses an empty command line as a usage error",
+    argv: [],
+    env: { ...SAFE_PAPER_DEFAULTS },
+    exitCode: REGISTER_EXIT_CODES.usage,
+    printed: [
+      "safety: OK — run mode PAPER, ceiling PAPER, real orders disabled",
+      "REFUSING TO REGISTER: REGISTER_USAGE",
+      "--template is required",
+    ],
+    notPrinted: ["REGISTER_UNSAFE_ENVIRONMENT"],
+  },
+  {
     app: "data-gateway",
     name: "an empty environment is refused for its missing configuration path",
     argv: [],
@@ -468,17 +688,24 @@ describe.concurrent("each app's bundle, built by its own build script, loads and
     localExpect([...new Set(CASES.map((entry) => entry.app))].sort()).toEqual([...BUNDLED_APPS].sort());
   });
 
+  it("every secondary entry has at least one case (REGISTER-1)", ({ expect: localExpect }) => {
+    localExpect([...new Set(CASES.flatMap((entry) => (entry.bundle === undefined ? [] : [entry.bundle])))].sort()).toEqual(
+      SECONDARY_ENTRIES.map((entry) => secondaryKey(entry)).sort(),
+    );
+  });
+
   for (const entry of CASES) {
     it(
-      `${entry.app}: ${entry.name}`,
+      `${entry.bundle ?? entry.app}: ${entry.name}`,
       async ({ expect: localExpect }) => {
-        const bundle = await bundleFor(entry.app);
-        const outcome = await runChild(process.execPath, [bundle.file, ...entry.argv], {
+        const bundle = await bundleFor(entry.bundle ?? entry.app);
+        const file = entry.runAs === undefined ? bundle.file : await copyOf(bundle, entry.runAs);
+        const outcome = await runChild(process.execPath, [file, ...entry.argv], {
           cwd: bundle.directory,
           env: { ...entry.env },
           deadlineMs: RUN_DEADLINE_MS,
         });
-        const report = describeOutcome(`node ${bundle.file} ${entry.argv.join(" ")}`, outcome);
+        const report = describeOutcome(`node ${file} ${entry.argv.join(" ")}`, outcome);
         const output = `${outcome.stdout}${outcome.stderr}`;
         localExpect(outcome.error, report).toBeUndefined();
         localExpect(loadCrashSignatures(output), report).toEqual([]);
