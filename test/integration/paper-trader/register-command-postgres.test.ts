@@ -793,7 +793,7 @@ describe("the registration command refuses before it connects (REGISTER-1)", () 
 });
 
 describe("non-vacuity: the trader's registration check refuses a completed document with a registered field broken", () => {
-  it("a configId the run does not pin is TRADER_REGISTRATION_MISMATCH; a runId nothing registered is _MISSING", async () => {
+  it("a configId nothing registered is _MISSING and names the run's pinned config; a runId nothing registered is _MISSING", async () => {
     await withFreshDatabase("reg1-broken", async ({ connectionString, context }) => {
       const files = await scenario("broken");
       const run = await runRegister(
@@ -813,7 +813,12 @@ describe("non-vacuity: the trader's registration check refuses a completed docum
       expect(wrongConfig.result.ok).toBe(false);
       if (wrongConfig.result.ok) throw new Error("a broken configId assembled");
       expect(wrongConfig.result.code).toBe(EXIT_CODES.configurationRefused);
-      expect(wrongConfig.log).toContain("REFUSING TO START: TRADER_REGISTRATION_MISMATCH");
+      // Since OUTAGE-1 (BOOT1-CONFIGPARAMS) the check also reads the named
+      // config row's parameters, so a configId nothing registered is refused
+      // as _MISSING first. The run's pinned-config mismatch is still named
+      // below: both refusals are asserted.
+      expect(wrongConfig.log).toContain("REFUSING TO START: TRADER_REGISTRATION_MISSING");
+      expect(wrongConfig.log).toContain(`strategy.configs: no row with config_id ${otherConfig}`);
       expect(wrongConfig.log).toContain(
         `strategy.runs ${ids.runId}: the row pins config ${ids.configId} but the configuration states configId ${otherConfig}`,
       );
