@@ -85,6 +85,7 @@
  * | | `instances[].configId` | `config_id` — §9.6's pin: the run executes the config it was started with |
  * | | `instances[].runSeed` | `run_seed` — §12.4's pin: the seed the runtime is handed is the one the run row records |
  * | | (implicit) | `status = 'RUNNING'` — `runs_end_consistent` makes a stopped run a closed record; no decision may be appended to it |
+ * | `strategy.configs` by `config_id` (`OUTAGE-1`) | `instances[].params` | `parameters`, compared CANONICALLY — see "The registered parameters" below |
  * | `strategy.decisions` by `run_id` | (implicit) | NO ROW — see "A run that already has decisions" below |
  *
  * Shared facts this check does NOT yet compare (`BOOT-1` r1, review R8; each a
@@ -96,6 +97,40 @@
  * `yesTokenId`/`noTokenId` are not compared to the registered tokens) and
  * `catalog.markets.current_parameters_version` / `market_parameter_history`
  * (the configured `parametersVersion` is not checked to exist).
+ *
+ * ## The registered parameters (`OUTAGE-1`, `BOOT1-CONFIGPARAMS`)
+ *
+ * The `config_id` pin above says WHICH immutable config the run executes. It
+ * did not say that the configuration document runs THAT config's parameters,
+ * and it did not. A config registered with `maximum_entries_per_market: 1`
+ * and a document carrying `2` started without a word (`BRACKET-1c`'s
+ * implementer found it), so the durable record said one thing and the
+ * strategy did another. §9.6 and §10.7 make the registered config the run's
+ * pinned, immutable parameters, so a document that disagrees with it is the
+ * same class of refusal as the rows above: `TRADER_REGISTRATION_MISMATCH`,
+ * exit 78, naming every differing field by JSON Pointer. A configured
+ * `configId` with no row is `_MISSING`.
+ *
+ * The comparison is on the DOCUMENTS, canonically, and deliberately not on
+ * `parameters_hash`. Nothing specifies how that hash is derived: the
+ * repository stores whatever the registrant supplies, and the test fixtures
+ * hash arbitrary labels. So equal parameters can carry different hashes, and
+ * a hash comparison would refuse registrations that are right. Canonical here
+ * means:
+ *
+ * - object keys are a set (order is not a fact); arrays are ordered;
+ * - strings, booleans and `null` compare exactly — `"0.50"` is not `"0.5"`,
+ *   because the operator wrote two different documents, and this check
+ *   refuses rather than decides that they meant the same thing;
+ * - a JSON NUMBER compares as its decimal string, `String(n)`. This is not
+ *   a leniency. `strategy.configs.parameters` CANNOT hold a number:
+ *   `WP-040`'s `assertDecimalSafeJson` refuses one at any depth (§6
+ *   invariant 1). The strategy's own document carries integers (`version`,
+ *   the `*_ms` and `*_seconds` fields, `maximum_entries_per_market`), so
+ *   every registrant must store them as decimal strings, as
+ *   `test/integration/paper-trader/support/registration.ts` does. Comparing
+ *   a number to its string is the only way a correct registration can match
+ *   at all.
  *
  * ## A run that already has decisions is REFUSED (`BOOT-1` r1, review R1)
  *
@@ -299,6 +334,32 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
     }
   }
 
+  // --- strategy.configs: the run's pinned parameters (OUTAGE-1) -------------
+  const configIds = [...new Set(config.instances.map((instance) => instance.configId))];
+  const configRows = await db
+    .selectFrom("strategy.configs")
+    .select(["config_id", "parameters"])
+    .where("config_id", "in", configIds)
+    .execute();
+  const configsById = new Map(configRows.map((row) => [row.config_id, row]));
+  for (const instance of config.instances) {
+    const row = configsById.get(instance.configId);
+    if (row === undefined) {
+      missing.push(`strategy.configs: no row with config_id ${instance.configId}`);
+      continue;
+    }
+    const differences = compareRegisteredParameters(row.parameters, instance.params);
+    if (differences.length === 0) continue;
+    const shown = differences.slice(0, MAX_REPORTED_PARAMETER_DIFFERENCES);
+    const more = differences.length - shown.length;
+    mismatched.push(
+      `strategy.configs ${instance.configId}: the registered parameters disagree with instance ` +
+        `${instance.instanceId}'s params in the configuration (§9.6, §10.7: a run executes the ` +
+        `immutable config it was registered with) — ${shown.join("; ")}` +
+        (more > 0 ? `; and ${String(more)} more` : ""),
+    );
+  }
+
   // --- strategy.decisions: a run that already has any is not resumable --------
   // One read over the runs that exist (an absent run has no decisions to find).
   // `distinct` over the set rather than `limit 1` per run: one statement, and
@@ -369,4 +430,100 @@ async function verify(db: PolymarketBotDatabase, config: TraderConfig): Promise<
     };
   }
   return { ok: true };
+}
+
+/** How many differing fields one refusal line names before it summarises the rest. */
+const MAX_REPORTED_PARAMETER_DIFFERENCES = 10;
+
+/**
+ * Nesting beyond this is not compared. It is reported as a difference, so the
+ * check fails CLOSED rather than recursing without bound on a document nobody
+ * validated yet (the strategy's own validator runs later, in `createPaperTrader`).
+ */
+const MAX_PARAMETER_DEPTH = 64;
+
+/**
+ * The fields where the registered `strategy.configs.parameters` and the
+ * configuration's `instances[].params` disagree, CANONICALLY (see the module
+ * header): each entry is one JSON Pointer and what the two documents hold
+ * there. Empty when they agree. TOTAL and pure: never throws, reads nothing.
+ */
+export function compareRegisteredParameters(registered: unknown, configured: unknown): readonly string[] {
+  const differences: string[] = [];
+  compareAt(registered, configured, "", 0, differences);
+  return differences;
+}
+
+function compareAt(
+  registered: unknown,
+  configured: unknown,
+  path: string,
+  depth: number,
+  differences: string[],
+): void {
+  const at = path === "" ? "(the document root)" : path;
+  if (depth > MAX_PARAMETER_DEPTH) {
+    differences.push(`${at}: nested deeper than ${String(MAX_PARAMETER_DEPTH)} levels, so it was not compared`);
+    return;
+  }
+  if (isJsonObject(registered) && isJsonObject(configured)) {
+    const keys = [...new Set([...Object.keys(registered), ...Object.keys(configured)])].sort();
+    for (const key of keys) {
+      const child = `${path}/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`;
+      if (!Object.hasOwn(registered, key)) {
+        differences.push(
+          `${child}: the configuration states ${render(configured[key])} but the registered row has no such field`,
+        );
+      } else if (!Object.hasOwn(configured, key)) {
+        differences.push(
+          `${child}: the registered row holds ${render(registered[key])} but the configuration has no such field`,
+        );
+      } else {
+        compareAt(registered[key], configured[key], child, depth + 1, differences);
+      }
+    }
+    return;
+  }
+  if (Array.isArray(registered) && Array.isArray(configured) && registered.length === configured.length) {
+    for (let index = 0; index < registered.length; index += 1) {
+      compareAt(registered[index], configured[index], `${path}/${String(index)}`, depth + 1, differences);
+    }
+    return;
+  }
+  const left = canonicalLeaf(registered);
+  if (left !== undefined && left === canonicalLeaf(configured)) return;
+  differences.push(
+    `${at}: the registered row holds ${render(registered)} but the configuration states ${render(configured)}`,
+  );
+}
+
+function isJsonObject(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A scalar's canonical text, or `undefined` for anything that is not one.
+ *
+ * A number and its decimal string share one text, because the registered side
+ * can only hold the string (module header). The prefixes keep a string from
+ * ever equalling a boolean or `null`.
+ */
+function canonicalLeaf(value: unknown): string | undefined {
+  if (typeof value === "string") return `s:${value}`;
+  if (typeof value === "number" && Number.isFinite(value)) return `s:${String(value)}`;
+  if (typeof value === "boolean") return `b:${String(value)}`;
+  if (value === null) return "null";
+  return undefined;
+}
+
+/** A value, as a refusal line shows it: scalars verbatim (strings quoted and cut short), containers by shape. */
+function render(value: unknown): string {
+  if (typeof value === "string") {
+    const quoted = JSON.stringify(value);
+    return quoted.length > 80 ? `${quoted.slice(0, 77)}..."` : quoted;
+  }
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return String(value);
+  if (Array.isArray(value)) return `an array of ${String(value.length)}`;
+  if (typeof value === "object") return "an object";
+  return typeof value;
 }

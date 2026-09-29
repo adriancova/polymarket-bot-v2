@@ -33,6 +33,13 @@
  * - **An outage stops publication.** ADR-003 §4: a transport outage halts
  *   trading by design. `publish` raises {@link EventBusUnavailableError} rather
  *   than buffering indefinitely, so the caller's halt path runs.
+ * - **A server that stops answering is an outage, within a bound**
+ *   (`OUTAGE-1`). Every command on the command connection, every read on a
+ *   subscription's connection (beyond its own `waitMs`), the handshake and
+ *   the courtesy `QUIT` on close are bounded by `responseTimeoutMs`
+ *   (`./client.ts`). The retry flush `ioredis` performs is not enough on its
+ *   own: a stopped container left an in-flight command parked forever, and
+ *   the trader awaiting it hung instead of halting.
  *
  * ## What it deliberately does not do
  *
@@ -71,7 +78,7 @@ import type {
 } from "../transport.js";
 import { createCheckpoint, decodeCheckpointToken, readCheckpoint, STREAM_ORIGIN_ENTRY_ID } from "./checkpoint.js";
 import type { StreamPosition } from "./checkpoint.js";
-import { closeRedisClient, createRedisClient } from "./client.js";
+import { closeRedisClient, createRedisClient, resolveResponseTimeoutMs } from "./client.js";
 import type { EventBusRedisClient, RedisConnectionOptions } from "./client.js";
 import { assertConsumerId, DEFAULT_KEY_PREFIX, streamKeys } from "./keys.js";
 import type { StreamKeys } from "./keys.js";
@@ -135,6 +142,8 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
   readonly #keyPrefix: string;
   readonly #maxTrackedEpochs: number | undefined;
   readonly #maxQueuedPublishes: number | undefined;
+  /** `RedisConnectionOptions.responseTimeoutMs`, validated once at connect. */
+  readonly #responseTimeoutMs: number;
   readonly #streams = new Map<EventStreamName, StreamContext>();
   readonly #subscriptions = new Map<number, { close(): Promise<void> }>();
   #nextSubscriptionKey = 0;
@@ -144,8 +153,10 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
     client: EventBusRedisClient,
     options: RedisStreamsTransportOptions,
     keyPrefix: string,
+    responseTimeoutMs: number,
   ) {
     this.#client = client;
+    this.#responseTimeoutMs = responseTimeoutMs;
     this.#connection = options.connection;
     this.#keyPrefix = keyPrefix;
     this.#maxTrackedEpochs = options.maxTrackedEpochs;
@@ -166,8 +177,11 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
       assertMaxPending(options.maxQueuedPublishes);
     }
     const keyPrefix = options.keyPrefix ?? DEFAULT_KEY_PREFIX;
-    const client = await createRedisClient(options.connection, "pmb-event-bus");
-    return new RedisStreamsEventTransport(client, options, keyPrefix);
+    // Validated before anything is opened: a refused bound is a configuration
+    // refusal, not a connection failure.
+    const responseTimeoutMs = resolveResponseTimeoutMs(options.connection);
+    const client = await createRedisClient(options.connection, "pmb-event-bus", "commands");
+    return new RedisStreamsEventTransport(client, options, keyPrefix, responseTimeoutMs);
   }
 
   /**
@@ -272,7 +286,11 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
     };
 
     const resolved = await this.#resolveStart(context.keys, options.stream, options.consumerId, start);
-    const client = await createRedisClient(this.#connection, `pmb-event-bus-${options.consumerId}`);
+    const client = await createRedisClient(
+      this.#connection,
+      `pmb-event-bus-${options.consumerId}`,
+      "blocking-reads",
+    );
     this.#nextSubscriptionKey += 1;
     const registryKey = this.#nextSubscriptionKey;
 
@@ -287,6 +305,7 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
         client,
         services: this.#services(context.keys, options.stream, origin),
         startPosition: resolved.position,
+        responseTimeoutMs: this.#responseTimeoutMs,
         ...(resolved.checkpoint === undefined ? {} : { startCheckpoint: resolved.checkpoint }),
         ...(this.#maxTrackedEpochs === undefined
           ? {}
@@ -297,7 +316,7 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
       });
       await subscription.primeContinuity();
     } catch (error) {
-      await closeRedisClient(client);
+      await closeRedisClient(client, this.#responseTimeoutMs);
       throw error;
     }
 
@@ -319,7 +338,7 @@ export class RedisStreamsEventTransport implements MarketEventTransport {
     const subscriptions = [...this.#subscriptions.values()];
     this.#subscriptions.clear();
     await Promise.all(subscriptions.map(async (subscription) => subscription.close()));
-    await closeRedisClient(this.#client);
+    await closeRedisClient(this.#client, this.#responseTimeoutMs);
   }
 
   #services(keys: StreamKeys, stream: EventStreamName, origin: string): SubscriptionServices {
