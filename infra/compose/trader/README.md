@@ -74,6 +74,73 @@ same Redis — see [`../data-gateway/README.md`](../data-gateway/README.md). Wit
 no publisher, the trader starts, reports its §8.2 run manifest, polls an empty
 stream and decides nothing, which is the correct behaviour and not a fault.
 
+## Registering the run first (`REGISTER-1`)
+
+Since `BOOT-1` the trader **refuses to start** unless the `catalog.markets`,
+`strategy.instances` and `strategy.runs` rows its configuration names exist in
+the database and agree with it (`TRADER_REGISTRATION_MISSING`, exit 78). The
+identities in `trader.config.example.json` are placeholders no row carries, so
+the example as shipped is refused at that check. The trader app's registration
+command creates the rows and writes the document the trader then starts from:
+
+```bash
+# 1. A TEMPLATE: the trader document with the five minted identities removed,
+#    and the market's real conditionId, token ids and times filled in.
+jq 'del(.markets[0].marketId, .instances[0].instanceId, .instances[0].runId,
+        .instances[0].configId, .instances[0].marketId)' \
+  infra/compose/trader/trader.config.example.json > /path/to/template.json
+
+# 2. Register: PAPER only, with the same four defaults and DATABASE_URL as the trader.
+MAX_RUN_MODE=PAPER \
+ALLOW_REAL_ORDERS=false \
+LIVE_MICRO_MAX_ORDER_NOTIONAL=0 \
+LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 \
+DATABASE_URL=postgres://devlocal:devlocal@127.0.0.1:5432/polymarket_bot_dev \
+  pnpm --filter @polymarket-bot/trader run register -- \
+    --template /path/to/template.json --out /path/to/trader.config.json \
+    --instance-name static-bracket-h1 --question-title "<the market's question>" \
+    --neg-risk false --trading-delay-seconds 0 --lifecycle-state OPEN \
+    --yes-label Up --no-label Down \
+    --code-commit "$(git rev-parse HEAD)" --created-by "<you>"
+
+# 3. Start the trader on the COMPLETED document the command wrote.
+MAX_RUN_MODE=PAPER \
+ALLOW_REAL_ORDERS=false \
+LIVE_MICRO_MAX_ORDER_NOTIONAL=0 \
+LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 \
+TRADER_CONFIG_PATH=/path/to/trader.config.json \
+REDIS_URL=redis://127.0.0.1:6379 \
+DATABASE_URL=postgres://devlocal:devlocal@127.0.0.1:5432/polymarket_bot_dev \
+  pnpm --filter @polymarket-bot/trader start
+```
+
+The venue facts in step 2 (the question, `negRisk`, the order delay, the
+outcome labels) are the operator's to read off the market; the values above
+are placeholders, and the command defaults none of them. `register --help` is
+the full reference (every flag, every exit code). In short:
+
+- **Safety first**: the trader's own PAPER check runs on the environment before
+  any file is read or connection attempted; anything else exits 78.
+- **Validated before connecting**: the template must pass the trader's
+  configuration door and its composition root, in memory (risk policy,
+  allocator caps, the strategy's own parameter validator).
+- **One transaction**: `registerMarket`, `createDefinition`, `createConfig`,
+  `createInstance` and `startRun` (the `WP-040` repositories) either all land
+  or none does. The strategy parameters are stored exactly as the document
+  states them, with numbers as decimal strings.
+- **Running it again is refused** when a condition id, token id or PAPER
+  instance name is already registered; nothing is written. The static-bracket
+  definition and an identical config are reused.
+- **`--out` is never overwritten.** On success, one JSON line with the minted
+  ids is printed on stdout.
+- **Pass absolute paths.** Under `pnpm --filter @polymarket-bot/trader run
+  register` the command runs in `apps/trader`, so a relative `--template` or
+  `--out` resolves there, not in the directory pnpm was started in.
+- **It does NOT verify a `gammaMarketId`** (`UNIV4-R1`). Verify the data
+  gateway's `lifecycle` block by hand against
+  `GET https://gamma-api.polymarket.com/markets/{id}` before the run. The
+  command prints this reminder.
+
 ## The example configuration is an EXAMPLE, and two fields say so
 
 `trader.config.example.json` is a complete, valid document — every field in the
