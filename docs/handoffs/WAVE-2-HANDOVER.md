@@ -128,6 +128,10 @@ package that both roots build from, through three queued rounds: `H8-GOV` →
 `CORE-MOVE` → `BACKTEST-2`. Until those land, B3 is ACCEPTED AS QUALIFIED
 (interim), recorded with option C's wording in the ledger's B3 row. Scoping:
 workflow `wf_b7a8d34d-4f9`.)*
+*(2026-09-28: **B3 CLOSED.** The H8 track merged: `H8-GOV` (ADR-022),
+`DEPCHECK-1`, `CORE-MOVE` (the core is `@polymarket-bot/trading-core`) and
+`BACKTEST-2`. The backtest executable now builds the same core the trader
+builds, and its built bundle reproduces the replay golden byte for byte.)*
 
 ### H4 — elapsed soak evidence
 Wave 1's carry-over (`WP-140`), not a Wave 2 condition. `soak:evaluate` and
