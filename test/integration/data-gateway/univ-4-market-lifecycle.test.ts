@@ -201,6 +201,15 @@ function reasonCodes(harness: Harness): readonly string[] {
   return harness.incidents.map((incident) => incident.reasonCode);
 }
 
+/**
+ * `THROUGHPUT-1b`: a gateway with configured markets and NO `polymarket`
+ * block — `lifecycleConfig()` without an override is exactly that, and it is
+ * H1 run 1's first attempt — announces at start that it records no books.
+ * The exact incident lists below include that announcement first; it is the
+ * gateway's, not the lifecycle feed's.
+ */
+const BOOK_FEED_ABSENT = "GATEWAY_BOOK_FEED_ABSENT";
+
 function ledgerRecord(fileSystem: MemoryFileSystem): Record<string, unknown> | undefined {
   const text = fileSystem.snapshot()[LEDGER_PATH];
   if (text === undefined) return undefined;
@@ -1217,7 +1226,7 @@ describe("UNIV-4 r1 LOW-5 — the ledger's identity checks", () => {
     });
     first.gateway.start();
     await first.settle();
-    expect(reasonCodes(first)).toEqual(["GATEWAY_LIFECYCLE_CONFIG_CONTRADICTED"]);
+    expect(reasonCodes(first)).toEqual([BOOK_FEED_ABSENT, "GATEWAY_LIFECYCLE_CONFIG_CONTRADICTED"]);
     await first.gateway.stop();
 
     for (const seed of [1, 2]) {
@@ -1310,7 +1319,7 @@ describe("UNIV-4 — the derivation rules' other cells", () => {
     await harness.settle();
     await harness.gateway.stop();
     expect(lifecycleEvents(harness)).toHaveLength(0);
-    expect(reasonCodes(harness)).toEqual(["GATEWAY_LIFECYCLE_CONFIG_CONTRADICTED"]);
+    expect(reasonCodes(harness)).toEqual([BOOK_FEED_ABSENT, "GATEWAY_LIFECYCLE_CONFIG_CONTRADICTED"]);
   });
 
   it("R6: readiness lost through active/archived alone while OPEN emits nothing and opens an incident naming the fields (LOW-6)", async () => {
@@ -1332,7 +1341,7 @@ describe("UNIV-4 — the derivation rules' other cells", () => {
     await pollOnce(harness);
     await harness.gateway.stop();
     expect(lifecycleEvents(harness).map((envelope) => envelope.eventType)).toEqual(["MarketOpened"]);
-    expect(reasonCodes(harness)).toEqual(["GATEWAY_LIFECYCLE_STATE_UNEXPECTED"]);
+    expect(reasonCodes(harness)).toEqual([BOOK_FEED_ABSENT, "GATEWAY_LIFECYCLE_STATE_UNEXPECTED"]);
     expect(harness.gateway.metrics().lifecycle?.phases[MARKET.internalMarketId]).toBe("OPEN");
 
     const nullCase = await buildHarness({
@@ -1452,7 +1461,7 @@ describe("UNIV-4 — the derivation rules' other cells", () => {
     await harness.settle();
     await harness.gateway.stop();
     expect(harness.publishedOfType("MarketOpened")).toHaveLength(1);
-    expect(harness.incidents).toEqual([]);
+    expect(reasonCodes(harness)).toEqual([BOOK_FEED_ABSENT]);
   });
 
   it("R1: every documented field null (the venue stated nothing) opens nothing", async () => {
@@ -1475,7 +1484,7 @@ describe("UNIV-4 — the derivation rules' other cells", () => {
     await pollOnce(harness);
     await harness.gateway.stop();
     expect(lifecycleEvents(harness)).toHaveLength(0);
-    expect(harness.incidents).toEqual([]);
+    expect(reasonCodes(harness)).toEqual([BOOK_FEED_ABSENT]);
     expect(harness.gateway.metrics().lifecycle?.polls).toBe(2);
   });
 });
@@ -1505,7 +1514,7 @@ describe("UNIV-4 — failure paths inherit the gateway's invariants", () => {
     harness.gateway.start();
     await harness.settle();
     await pollOnce(harness);
-    expect(reasonCodes(harness)).toEqual(["GATEWAY_LIFECYCLE_POLL_FAILED"]);
+    expect(reasonCodes(harness)).toEqual([BOOK_FEED_ABSENT, "GATEWAY_LIFECYCLE_POLL_FAILED"]);
     expect(harness.publishedOfType("FeedStale")).toHaveLength(0);
 
     await pollOnce(harness); // third failure: the stall
@@ -1551,6 +1560,7 @@ describe("UNIV-4 — failure paths inherit the gateway's invariants", () => {
     await pollOnce(harness);
     expect(lifecycleEvents(harness)).toHaveLength(0);
     expect(reasonCodes(harness)).toEqual([
+      BOOK_FEED_ABSENT,
       "GATEWAY_LIFECYCLE_POLL_FAILED",
       "GATEWAY_LIFECYCLE_STATE_INVALID",
     ]);
@@ -1562,11 +1572,13 @@ describe("UNIV-4 — failure paths inherit the gateway's invariants", () => {
     );
     expect(frames).toHaveLength(3);
     expect(frames[0]?.payloadUtf8).toBe('{"error":"maintenance"}');
-    // The published incidents name the market.
+    // The published lifecycle incidents name the market. (The gateway's own
+    // startup announcement that no book feed is configured names none.)
     const incidents = harness.publishedOfType("DataQualityIncidentOpened").map(payloadOf);
-    expect(incidents.map((payload) => payload["affectedMarketIds"])).toEqual([
-      [MARKET.internalMarketId],
-      [MARKET.internalMarketId],
+    expect(incidents.map((payload) => [payload["reasonCode"], payload["affectedMarketIds"]])).toEqual([
+      [BOOK_FEED_ABSENT, undefined],
+      ["GATEWAY_LIFECYCLE_POLL_FAILED", [MARKET.internalMarketId]],
+      ["GATEWAY_LIFECYCLE_STATE_INVALID", [MARKET.internalMarketId]],
     ]);
   });
 
