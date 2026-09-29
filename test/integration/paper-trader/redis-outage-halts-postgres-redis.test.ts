@@ -53,6 +53,50 @@
  *    Nothing is traded or written after the halt.
  * 5. **A subscription the transport refuses is a refusal, not a crash.**
  *
+ * ## Dated addition (`OUTAGE-2`, 2026-09-29): "before" is quiescent, and "after" is the halt
+ *
+ * The PARTITION case failed once on CI (PR #21, run `36541460345`, attempt 1)
+ * with one checkpoint more after the halt than in the "before" snapshot. The
+ * old settle condition reproduced it locally in 21 of 135 runs of the
+ * partition and stopped-container cases, and in 39 of 40 runs with a random
+ * delay of up to 100 ms added to each checkpoint insert. The extra row was
+ * always a checkpoint, never a decision: the one for the sixth event's last
+ * decision (an `onOrderUpdate` evaluation the loop itself originates).
+ * PostgreSQL's own snapshots dated it. Without the delay it was committed
+ * BEFORE the fault; with it, while the sixth event's flush was still in
+ * flight, but still before the halt. In every run measured against a
+ * snapshot taken at the halt, no row was committed after it. That makes it a
+ * test race, not a write after the halt.
+ *
+ * The settle condition read `decisionsPersisted`, which the loop counts when a
+ * decision enters its in-memory outbox. The outbox flush, the last step of
+ * processing an event, writes every decision and THEN every checkpoint, so the
+ * rows could match the counters with a checkpoint still in flight.
+ *
+ * Two changes, neither a sleep:
+ *
+ * - **Quiescence is the pump's own commit.** `apps/trader/src/pump.ts`
+ *   commits the consumer's stream position only after `drain()` has returned
+ *   for the batch. `drain()` awaits every event's processing, including its PnL
+ *   and outbox flushes, and an idle poll's `drain()` has nothing to process.
+ *   Every durable write happens inside `drain()`, including the evaluations the
+ *   loop itself originates (`onFill`, `onOrderUpdate`). So once the transport's
+ *   own §8.3 consumer lag shows the trader committed past the sixth event,
+ *   every write for the six events has landed, and none can follow until another
+ *   event arrives. The counters and rows read then are FINAL. That they agree
+ *   is now an assertion, not a wait, and checkpoints are included: §9.6 writes
+ *   one checkpoint per persisted decision, with the same sequence.
+ * - **"Nothing written after the halt" is checked against the halt.**
+ *   Immediately before the fault is injected, the test reads PostgreSQL's own
+ *   MVCC snapshot. The halt is caused by the fault, so it cannot come earlier;
+ *   the process still reports no halt after the read. After the process exits,
+ *   no row version in the scenario's database may have been committed after
+ *   that snapshot. The check covers every table, inserts and updates alike, and
+ *   is decided by the database's commit order rather than any clock. A row
+ *   committed after the halt is committed after the snapshot, so this is at
+ *   least as strict as "after the halt". The quiescent snapshot must still
+ *   equal the rows after exit, compared whole.
+ *
  * ## What it does NOT prove (disclosed)
  *
  * - **The halt is not read back from PostgreSQL**, because the trader writes
@@ -280,6 +324,13 @@ function documentOn(registered: Registered, label: string, stream: string): Reco
   };
 }
 
+/** The durable consumer the document subscribes the process as. */
+function consumerIdOf(document: Record<string, unknown>): string {
+  const consumerId = (document["infrastructure"] as { readonly consumerId?: unknown }).consumerId;
+  if (typeof consumerId !== "string") throw new Error("the fixture document names no consumerId");
+  return consumerId;
+}
+
 /** Everything the run wrote to PostgreSQL, as counts plus the rows asserted below. */
 async function durableRows(context: TestContext, registered: Registered) {
   const decisions = await context.db
@@ -311,11 +362,13 @@ async function durableRows(context: TestContext, registered: Registered) {
             "in",
             transactions.map((row) => row.ledger_transaction_id),
           )
+          .orderBy("ledger_entry_id")
           .execute();
   const snapshots = await context.db
     .selectFrom("accounting.pnl_snapshots")
     .selectAll()
     .where("run_id", "=", registered.runId)
+    .orderBy("pnl_snapshot_id")
     .execute();
   return { decisions, checkpoints, transactions, entries, snapshots };
 }
@@ -326,69 +379,170 @@ interface Settled {
 }
 
 /**
- * Publishes the six fixture events and waits until the process has processed
- * them AND every durable write its counters promise has landed. It asserts the
- * run decided an entry and filled it, so an outage after this point has
- * something to not trade after.
+ * Publishes the six fixture events and waits until the process is QUIESCENT:
+ * its pump has committed its stream position past the sixth event (see the
+ * header's `OUTAGE-2` addition). The pump commits only after `drain()` has
+ * returned, and `drain()` holds every durable write. So the counters and rows
+ * read after that are final, and their agreement is asserted rather than
+ * waited for. It asserts the run decided an entry and filled it, so an outage
+ * after this point has something to not trade after.
  */
 async function publishSixAndSettle(options: {
   readonly publisher: RedisStreamsEventTransport;
   readonly stream: string;
+  readonly consumerId: string;
   readonly label: string;
   readonly healthUrl: string;
   readonly context: TestContext;
   readonly registered: Registered;
 }): Promise<Settled> {
-  const { publisher, stream, label, healthUrl, context, registered } = options;
-  for (const event of recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`)) {
+  const { publisher, stream, consumerId, label, healthUrl, context, registered } = options;
+  const events = recordedEvents(registered.marketId, `${CONDITION_ID}-${label}`);
+  for (const event of events) {
     await publisher.publish(stream, event.envelope);
   }
-  const settled = await waitFor("the six events to be processed and every write to land", 60_000, async () => {
-    const health = await readHealth(healthUrl);
-    if (health.loop.eventsProcessed !== 6) return undefined;
-    const rows = await durableRows(context, registered);
-    // Every durable write the counters promise has landed.
-    if (rows.decisions.length !== health.loop.decisionsPersisted) return undefined;
-    if (rows.transactions.length !== health.accounting.ledgerTransactions) return undefined;
-    return { health, rows };
-  });
+  await waitFor(
+    `the process's pump to commit its position past all ${String(events.length)} events ` +
+      `(consumer "${consumerId}" at lag 0), which it does only after drain() — every durable write — returned`,
+    60_000,
+    async () => {
+      const metrics = await publisher.streamMetrics(stream);
+      const lag = metrics.consumerLag.find((entry) => entry.consumerId === consumerId)?.lag;
+      return metrics.publishedTotal === events.length && lag === 0 ? metrics : undefined;
+    },
+  );
+  const health = await readHealth(healthUrl);
+  const rows = await durableRows(context, registered);
+  const settled = { health, rows };
+
+  // Quiescent: every write the counters promise has landed, and nothing is left in flight.
+  expect(settled.health.loop.eventsProcessed).toBe(events.length);
+  expect(settled.rows.decisions).toHaveLength(settled.health.loop.decisionsPersisted);
+  // §9.6: one checkpoint per persisted decision, carrying the decision's sequence.
+  expect(settled.rows.checkpoints.map((row) => row.checkpoint_seq)).toEqual(
+    settled.rows.decisions.map((row) => row.evaluation_seq),
+  );
+  expect(settled.rows.transactions).toHaveLength(settled.health.accounting.ledgerTransactions);
+  expect(settled.rows.snapshots.length).toBe(settled.health.execution.fillsObserved);
+
   expect(settled.health.halts).toEqual([]);
   expect(settled.health.healthy).toBe(true);
   expect(settled.health.execution.fillsObserved).toBeGreaterThanOrEqual(1);
   expect(settled.rows.decisions.some((row) => row.decision_type === "enter")).toBe(true);
   expect(settled.rows.transactions.length).toBeGreaterThanOrEqual(2);
-  expect(settled.rows.snapshots.length).toBe(settled.health.execution.fillsObserved);
   return settled;
 }
 
 /**
+ * PostgreSQL's MVCC snapshot, read immediately before a fault is injected.
+ *
+ * The halt is caused by the fault, so it cannot come earlier than this read,
+ * and the caller shows the process still reported no halt after it. A row
+ * version this snapshot cannot see was committed after the read. Every row
+ * committed after the halt is one of those, so an empty
+ * {@link writesCommittedAfter} is at least as strict as "nothing written
+ * after the halt". It cannot fail a correct process either: the process is
+ * quiescent at the read, so nothing it writes legitimately lands after it.
+ */
+interface FaultBoundary {
+  readonly snapshot: string;
+  /** The database's clock at the read; for the failure message only. */
+  readonly at: string;
+}
+
+async function readFaultBoundary(context: TestContext): Promise<FaultBoundary> {
+  const { rows } = await context.pool.query<{
+    readonly snapshot: string;
+    readonly at: string;
+    readonly epoch_zero: boolean;
+  }>(
+    "select pg_current_snapshot()::text as snapshot, clock_timestamp()::text as at, " +
+      "pg_snapshot_xmax(pg_current_snapshot()) < '4294967296'::xid8 as epoch_zero",
+  );
+  const row = rows[0];
+  if (row === undefined) throw new Error("PostgreSQL returned no snapshot");
+  // `xmin` is a 32-bit xid; `writesCommittedAfter` reads it as the 64-bit
+  // `xid8` the visibility function takes, which is exact only while the
+  // cluster's xid epoch is 0 — always, for a throwaway container, and checked.
+  expect(row.epoch_zero).toBe(true);
+  return { snapshot: row.snapshot, at: row.at };
+}
+
+/**
+ * Every table in the scenario's database holding a row version the
+ * boundary's snapshot cannot see: an INSERT or an UPDATE committed after it.
+ * Empty when nothing was written after the boundary.
+ */
+async function writesCommittedAfter(context: TestContext, boundary: FaultBoundary): Promise<string[]> {
+  const tables = await context.pool.query<{ readonly table_schema: string; readonly table_name: string }>(
+    "select table_schema, table_name from information_schema.tables " +
+      "where table_type = 'BASE TABLE' and table_schema not in ('pg_catalog', 'information_schema') " +
+      "order by table_schema, table_name",
+  );
+  // Proves the enumeration reached the tables this file writes, so an empty result is not an empty scan.
+  expect(tables.rows.map((row) => `${row.table_schema}.${row.table_name}`)).toEqual(
+    expect.arrayContaining([
+      "strategy.decisions",
+      "strategy.state_checkpoints",
+      "accounting.ledger_transactions",
+      "accounting.ledger_entries",
+      "accounting.pnl_snapshots",
+    ]),
+  );
+  const quote = (identifier: string): string => `"${identifier.replaceAll('"', '""')}"`;
+  const written: string[] = [];
+  for (const { table_schema: schema, table_name: table } of tables.rows) {
+    const { rows } = await context.pool.query<{ readonly n: number }>(
+      `select count(*)::int as n from ${quote(schema)}.${quote(table)} ` +
+        "where not pg_visible_in_snapshot(xmin::text::xid8, $1::pg_snapshot)",
+      [boundary.snapshot],
+    );
+    const n = rows[0]?.n ?? 0;
+    if (n > 0) written.push(`${schema}.${table}: ${String(n)} row version(s)`);
+  }
+  return written;
+}
+
+/**
  * Nothing traded after the halt (the process's own counters at exit equal
- * those read before the outage), nothing written after it, and the last
- * durable writes read back as they were.
+ * those read at quiescence), nothing written after it (against the fault
+ * boundary, which the halt follows), and the durable rows read back exactly as
+ * they were at quiescence.
  */
 async function expectNothingTradedOrWrittenAfter(
   run: ProcessRun,
   context: TestContext,
   registered: Registered,
   before: Settled,
+  boundary: FaultBoundary,
 ): Promise<void> {
   expect(tradingCounters(exitHealth(run))).toEqual(tradingCounters(before.health));
 
+  expect(
+    await writesCommittedAfter(context, boundary),
+    `a row was committed after the fault boundary (PostgreSQL clock ${boundary.at}), which the halt follows`,
+  ).toEqual([]);
+
   const rows = await durableRows(context, registered);
-  expect(rows.decisions.map((row) => [row.evaluation_seq, row.decision_type])).toEqual(
-    before.rows.decisions.map((row) => [row.evaluation_seq, row.decision_type]),
-  );
-  expect(rows.checkpoints.map((row) => [row.checkpoint_seq, row.state_hash])).toEqual(
-    before.rows.checkpoints.map((row) => [row.checkpoint_seq, row.state_hash]),
-  );
-  expect(rows.transactions.map((row) => row.ledger_transaction_id)).toEqual(
-    before.rows.transactions.map((row) => row.ledger_transaction_id),
-  );
-  expect(rows.entries.length).toBe(before.rows.entries.length);
-  expect(rows.snapshots.map((row) => row.realized_pnl)).toEqual(
-    before.rows.snapshots.map((row) => row.realized_pnl),
-  );
+  expect(rows.decisions).toEqual(before.rows.decisions);
+  expect(rows.checkpoints).toEqual(before.rows.checkpoints);
+  expect(rows.transactions).toEqual(before.rows.transactions);
+  expect(rows.entries).toEqual(before.rows.entries);
+  // The one table the store may UPDATE (`replacePnlSnapshot`): compared whole.
+  expect(rows.snapshots).toEqual(before.rows.snapshots);
   for (const row of rows.entries) expect(typeof row.amount).toBe("string");
+}
+
+/**
+ * Reads the fault boundary, then shows the process still reports no halt, so
+ * the halt the exit snapshot carries came after the boundary.
+ */
+async function faultBoundaryBeforeAnyHalt(context: TestContext, healthUrl: string): Promise<FaultBoundary> {
+  const boundary = await readFaultBoundary(context);
+  const still = await readHealth(healthUrl);
+  expect(still.halts).toEqual([]);
+  expect(still.healthy).toBe(true);
+  return boundary;
 }
 
 /** The exit snapshot's halts, as [scope, code, action] triples. */
@@ -412,6 +566,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
         const publisher = await connectPublisher(redis.getConnectionUrl());
 
         // The DEFAULT bound: the variable is not set.
+        const document = documentOn(registered, label, stream);
         const run = runProcess(
           {
             ...safeEnvironment(),
@@ -421,7 +576,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
             TRADER_HEALTH_BIND: "127.0.0.1",
             TRADER_HEALTH_PORT: "0",
           },
-          documentOn(registered, label, stream),
+          document,
         );
         // The documented default, as a literal: the timing below must not depend
         // on the mechanism under test (with the base transport restored this
@@ -432,10 +587,19 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
           const healthUrl = await healthUrlOf(run);
 
           // --- the run: six events through Redis, an entry decided and filled -----
-          const before = await publishSixAndSettle({ publisher, stream, label, healthUrl, context, registered });
+          const before = await publishSixAndSettle({
+            publisher,
+            stream,
+            consumerId: consumerIdOf(document),
+            label,
+            healthUrl,
+            context,
+            registered,
+          });
           await publisher.close();
 
           // --- the outage ---------------------------------------------------------
+          const boundary = await faultBoundaryBeforeAnyHalt(context, healthUrl);
           const stopStarted = Date.now();
           await redis.stop();
           stopped = true;
@@ -478,7 +642,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
           expect(run.text()).toContain("HALT GLOBAL TRANSPORT_UNAVAILABLE (FULL_HALT): ");
 
           // --- nothing traded after it, nothing written; the last writes read back -
-          await expectNothingTradedOrWrittenAfter(run, context, registered, before);
+          await expectNothingTradedOrWrittenAfter(run, context, registered, before, boundary);
 
           // --- the bound it ran under was the default, and the process said so ------
           expect(DEFAULT_RESPONSE_TIMEOUT_MS).toBe(bound);
@@ -535,6 +699,8 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
           early === undefined ? "still running" : `exited ${String(early.value)}`,
           `an idle stream ended the process:\n${run.text()}`,
         ).toBe("still running");
+        // The fault boundary, then the idle read: no halt yet, so the halt follows the boundary.
+        const boundary = await readFaultBoundary(context);
         const idle = await readHealth(healthUrl);
         expect(idle.halts).toEqual([]);
         expect(idle.healthy).toBe(true);
@@ -567,8 +733,16 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
         expect(exitHealth(run).halts.map((halt) => [halt.scope.kind, halt.code, halt.action])).toEqual([
           ["GLOBAL", "TRANSPORT_UNAVAILABLE", "FULL_HALT"],
         ]);
-        // Nothing was decided at any point: the stream never carried an event.
-        expect((await durableRows(context, registered)).decisions).toHaveLength(0);
+        // Nothing was written after the halt, nor at any point: the stream never carried an event.
+        expect(
+          await writesCommittedAfter(context, boundary),
+          `a row was committed after the fault boundary (PostgreSQL clock ${boundary.at}), which the halt follows`,
+        ).toEqual([]);
+        const rows = await durableRows(context, registered);
+        expect(rows.decisions).toHaveLength(0);
+        expect(rows.checkpoints).toHaveLength(0);
+        expect(rows.transactions).toHaveLength(0);
+        expect(rows.snapshots).toHaveLength(0);
       });
     } finally {
       if (!stopped) await redis.stop();
@@ -588,6 +762,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
         const hop = await startFreezableRedisProxy(redis.getConnectionUrl());
 
         const bound = 1_000;
+        const document = documentOn(registered, label, stream);
         const run = runProcess(
           {
             ...safeEnvironment(),
@@ -598,13 +773,22 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
             TRADER_HEALTH_PORT: "0",
             [REDIS_RESPONSE_TIMEOUT_ENV]: String(bound),
           },
-          documentOn(registered, label, stream),
+          document,
         );
         try {
           const healthUrl = await healthUrlOf(run);
-          const before = await publishSixAndSettle({ publisher, stream, label, healthUrl, context, registered });
+          const before = await publishSixAndSettle({
+            publisher,
+            stream,
+            consumerId: consumerIdOf(document),
+            label,
+            healthUrl,
+            context,
+            registered,
+          });
 
           // --- the partition ------------------------------------------------------
+          const boundary = await faultBoundaryBeforeAnyHalt(context, healthUrl);
           hop.freeze();
           const frozenAt = Date.now();
           const exited = await settleWithin(run.exit, 3 * bound + MARGIN_MS + 60_000);
@@ -635,7 +819,7 @@ describe("a Redis outage mid-run HALTS the durable trader within the stated boun
           // The operator reads WHY: the transport's own deadline, not only the wrapper.
           expect(detail).toMatch(/Command timed out|no reply to a read within/u);
 
-          await expectNothingTradedOrWrittenAfter(run, context, registered, before);
+          await expectNothingTradedOrWrittenAfter(run, context, registered, before, boundary);
         } finally {
           await hop.close();
           await publisher.close();
