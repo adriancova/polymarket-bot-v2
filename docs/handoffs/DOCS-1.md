@@ -7,7 +7,9 @@
 - **Review:** an independent Codex review (the hardening loop) gates the
   merge, and a green GitHub Actions run is the orchestrator's step. The
   implementer did not review its own work. **This round is not marked
-  complete here.**
+  complete here.** Review r1 (Codex, gpt-6-astra, on `68e573e`) returned
+  CHANGES REQUIRED with two LOW findings. Both are fixed in r1; see
+  "Review round 1" below.
 - **Documentation only.** Six paths changed. Every edit is either an append
   or one table row. No code, test, tool, manifest, lockfile or
   `IMPLEMENTATION_STATUS.md` was touched.
@@ -65,17 +67,21 @@ file.
 
 A scratch script (`cell-proof.cjs`) compared base and candidate line by
 line, then cell by cell. It splits each row on `" | "` and prints each
-changed cell's removed and inserted text.
+changed cell's removed and inserted text. Cells are numbered from 0, as the
+script prints them (the F16 row's cells are `#`, Forbidden and Source). The
+line counts below are `wc -l` counts, the number of newline characters.
+Both files end in a newline. (r0 recorded the length of `.split("\n")`, which is one more; the
+review finding `DOCS1-R1-L2` corrected it.)
 
 - **`dependency-direction.md`:**
-  - 1,049 lines before and after, and one line changed: 662, the `| F16 |`
+  - 1,048 lines before and after, and one line changed: 662, the `| F16 |`
     row;
   - three cells before and after, and one cell changed: cell 2, Source;
   - nothing is removed. The inserted text is the form
     `import.meta.resolve("<relative>")` and its dated attribution, placed
     between `require.resolve` and "a `/// <reference path>`".
 - **`README.md`:**
-  - 213 lines before and after, and one line changed: 103, the
+  - 212 lines before and after, and one line changed: 103, the
     `| [ADR-022]` row;
   - five cells before and after. Cell 1 (the title) is only appended to.
     Cell 4 ("Implemented by") changes each "(pending)" to "(done, <merge>)",
@@ -175,8 +181,37 @@ commit is named.
   - The trader's `await startup(` is at `main.ts:539` at `ae25450` and at
     `:655` at `1ad2a36`.
   - The trader's entry guard is `endsWith("/main.mjs")` (`:537`),
-    control-api's is `endsWith("main.mjs")` and backtest-cli's is
-    `endsWith(".mjs")`.
+    control-api's is `endsWith("main.mjs")` (`:231`), with a
+    `CONTROL_API_MAIN === "1"` override (`:233`), and backtest-cli's is
+    `endsWith(".mjs")` (`:330`). research-worker's is
+    `` import.meta.url === `file://${process.argv[1]}` `` (`:99`).
+    data-gateway calls `main()` unguarded.
+  - **The rename measurement** (r1, for `DOCS1-R1-L1`). Each of the five
+    bundles was built by its app's own `build` script into scratch, with
+    only `--outfile=dist/` redirected and the basename kept. The same bytes
+    were then run under the shipped name and under renamed copies, with the
+    pin's environments. There was an empty environment, except for the
+    trader, which got the safe PAPER defaults plus the example
+    configuration.
+
+    | App | Name | Exit | Output |
+    | --- | --- | --- | --- |
+    | trader | `main.mjs` | 78 | `safety: OK …`, then its refusal |
+    | trader | `renamed-trader.mjs` | 0 | none |
+    | trader | `renamed-main.mjs` | 0 | none |
+    | trader | `other/main.mjs` | 78 | as `main.mjs` |
+    | control-api | `main.mjs` | 78 | `REFUSING TO START — CONTROL_API_CONFIG …` |
+    | control-api | `renamed-control-api.mjs` | 0 | none |
+    | control-api | `renamed-main.mjs` | 78 | as `main.mjs` |
+    | control-api | `renamed-control-api.mjs`, `CONTROL_API_MAIN=1` | 78 | as `main.mjs` |
+    | backtest-cli | `main.mjs` | 2 | `backtest-cli: a command is required …` |
+    | backtest-cli | `renamed-backtest.mjs` | 2 | as `main.mjs` |
+    | backtest-cli | `renamed-backtest.js` | 0 | none |
+    | research-worker | `main.mjs` | 1 | `{"event":"research-worker-fatal", …}` |
+    | research-worker | `renamed-research.mjs` | 1 | as `main.mjs` |
+    | research-worker | `dir with space/main.mjs` | 0 | none |
+    | data-gateway | `main.cjs` | 1 | `GATEWAY_CONFIG_PATH is required …` |
+    | data-gateway | `renamed-gateway.cjs` | 1 | as `main.cjs` |
   - `DEFAULT_MIGRATIONS_DIRECTORY` and `readMigrations` appear, outside
     tests, only in `packages/storage-postgres` (`loader.ts`, `runner.ts`,
     `cli/migrate.ts`).
@@ -214,6 +249,44 @@ in place:
 | `pnpm run test` | exit 0, 353 files / 7634 tests | exit 0, 353 files / 7634 tests |
 
 The link was removed after the gates, which leaves the worktree as found.
+
+## Review round 1 (Codex, gpt-6-astra, on `68e573e`): CHANGES REQUIRED, two LOWs
+
+The review found no scope violation and no append-only violation. It
+reproduced the SHAs, the graph counts at each merge and the `check:deps`
+JSON. It raised two LOW factual corrections, and r1 fixes both in one commit
+on top of `68e573e`. Only ADR-018's appended text and this record changed.
+ADR-018's base (6,005 bytes) is still a byte-identical prefix.
+
+| Finding | Status | Fix | Pin |
+| --- | --- | --- | --- |
+| `DOCS1-R1-L1`: renaming does not necessarily suppress execution | fixed | ADR-018's "Renamed bundles" bullet now states each guard's test and the measured outcome per app. A rename that makes a guard's test false exits 0 silently, and one that keeps it true still runs: backtest-cli as `renamed-backtest.mjs` prints its usage with exit 2. The measurement is under "Facts checked" | `pin-L1-rename-claims` |
+| `DOCS1-R1-L2`: the recorded line counts are off by one | fixed | "Single-row proofs" gives the `wc -l` counts, 1,048 and 212, and says how they are counted | `pin-L2-line-counts` |
+
+**The pins** are scratch scripts (`r1/r1-pins.mjs`, beside
+`r1/rename-probe.mjs`), because code and tests are outside this grant.
+
+- `pin-L1-rename-claims` fails if ADR-018's appended text still says "a
+  renamed bundle exits 0 silently". It requires each per-app rename claim to
+  be stated, and checks each one against the measured bundles and the
+  guard's source. It also checks this record's measurement table, row by
+  row.
+- `pin-L2-line-counts` requires this record's stated line counts to equal
+  `wc -l` at `ae25450` and in the tree. It also requires the stated changed
+  line to be the only one.
+
+With ADR-018 and this record restored from `68e573e`, both pins FAIL: L1
+with 15 reasons, L2 with 2. With r1's files put back (sha256 unchanged),
+both PASS.
+
+**Gates on r1**, with the same hand link:
+
+- `typecheck`, `lint` and `check:deps` exit 0.
+- `check:deps --json` is byte-identical to the base's (sha256
+  `6a0bb1d8…a8adce`), recomputed from a `git archive` of `ae25450`.
+- `test` exits 0 with 353 files / 7634 tests.
+- `test:e2e` exits 0 with 8 files / 206 tests.
+- `test:replay` exits 0 with 3 files / 17 tests.
 
 ## Decisions and disclosures
 

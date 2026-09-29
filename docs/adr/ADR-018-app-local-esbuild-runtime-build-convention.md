@@ -164,10 +164,30 @@ not fixed:
   to `packages/storage-postgres`. It is latent: no app source reads it. The
   migrations are read only by `packages/storage-postgres`'s own migrate CLI
   and runner.
-- **Renamed bundles.** The entry guards key on the file name: the trader on
-  `/main.mjs`, `apps/control-api` on `main.mjs` and `apps/backtest-cli` on
-  `.mjs`. So a renamed bundle exits 0 silently. The pin keeps each basename,
-  and asserts an exact exit code plus a refusal line.
+- **Renamed bundles.** Three entry guards test how the bundle's
+  `import.meta.url` ends: the trader's for `/main.mjs`, `apps/control-api`'s
+  for `main.mjs` and `apps/backtest-cli`'s for `.mjs`. A rename that makes a
+  guard's test false exits 0 silently. A rename that keeps it true still
+  runs. Measured for this addendum at `ae25450`, with each bundle built by
+  its app's own `build` script:
+  - the trader exits 0 with no output as `renamed-trader.mjs` and as
+    `renamed-main.mjs`. As `main.mjs` in another directory, it still
+    refuses with exit 78;
+  - control-api exits 0 with no output as `renamed-control-api.mjs`. As
+    `renamed-main.mjs`, or with `CONTROL_API_MAIN=1` set, it still refuses
+    with exit 78;
+  - backtest-cli still prints its usage with exit 2 as
+    `renamed-backtest.mjs`. Only a rename that drops `.mjs`, such as
+    `renamed-backtest.js`, exits 0 with no output.
+
+  `apps/research-worker`'s guard compares `import.meta.url` with
+  `file://${process.argv[1]}`, so a rename does not silence it
+  (`renamed-research.mjs` still refuses with exit 1). A path containing a
+  space does: `dir with space/main.mjs` exits 0 with no output, as
+  `docs/handoffs/BUNDLE-1.md` ("known_risks") warned for URL-escaped
+  characters. `apps/data-gateway` has no entry guard, and still refuses with
+  exit 1 as `renamed-gateway.cjs`. The pin keeps each basename, and asserts
+  an exact exit code plus a refusal line.
 
 **No decision of this record changes.**
 
