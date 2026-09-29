@@ -7,9 +7,21 @@
  * byte-identical, and no throw escapes — refusal composition may vary", and
  * "A door that has not run a battery says so." `BACKTEST-1` shipped this door
  * with D1-D4 stated and no battery (its reviewer ran an 8-key one by hand).
- * This file is the battery, over EVERY frame of the committed fixture
- * (`test/replay-golden/backtest/static-bracket/frames.json`, read only) plus
- * refused frames of every refusal kind the door has:
+ * This file is the battery, over 20 cases: EVERY frame of the committed
+ * fixture (`test/replay-golden/backtest/static-bracket/frames.json`, read
+ * only; 8 frames) plus ONE refused case for EACH of the door's 12 refusal
+ * sites (the `{ ok: false, reason }` returns of `normalizer.ts`'s envelope
+ * door, beside the one line that forwards `readRecordedNormalizedEnvelope`'s
+ * own refusals). Each refused case is pinned to the site it reaches, by that
+ * site's reason, and a source census pins that the cases reach EVERY site, so
+ * a refusal branch added without a case fails this file (BT2-01, `BACKTEST-2`
+ * r1: the r0 battery said "every refusal kind" over 7 of the 12). Eleven
+ * cases are recorded frames with one thing wrong; the twelfth site, the
+ * containment catch, exists for THROWS from the door's reads (the pollution
+ * below reaches it), so its case is the one built with an accessor rather
+ * than recorded bytes — a record whose read throws.
+ *
+ * The battery's dimensions:
  *
  * - KEYS: every key the recording and the envelope declare, the zod state
  *   keys `schema-boundary.md` §2 measured (`skipChecks`, `optin`, `optout`,
@@ -18,8 +30,8 @@
  * - VARIANTS: a non-enumerable DATA property on `Object.prototype` whose value
  *   is a string a field could plausibly carry (an ISO instant), and a
  *   non-enumerable GET-ONLY accessor answering the same;
- * - THE BOUND, for every (key, variant, frame): no throw escapes; permission
- *   never WIDENS (a frame the clean run refuses is refused); and an envelope
+ * - THE BOUND, for every (key, variant, case): no throw escapes; permission
+ *   never WIDENS (a case the clean run refuses is refused); and an envelope
  *   accepted under pollution is BYTE-IDENTICAL to the clean run's (own keys,
  *   in order, and every value), prototype-free and frozen (D4). A clean
  *   acceptance may turn into a refusal — availability, not permission, the
@@ -86,10 +98,23 @@ interface FixtureFrames {
   }[];
 }
 
-function recordOf(frames: FixtureFrames, index: number, envelope: unknown): ReplayRecord {
+/** What a refused case changes in the recorded frame, beside its payload. */
+interface FrameOverrides {
+  readonly source?: string;
+  readonly receivedAt?: string;
+  /** The payload TEXT, verbatim, for a payload no `JSON.stringify` produces. */
+  readonly payloadUtf8?: string;
+}
+
+function recordOf(
+  frames: FixtureFrames,
+  index: number,
+  envelope: unknown,
+  overrides: FrameOverrides = {},
+): ReplayRecord {
   const frame = frames.frames[index];
   if (frame === undefined) throw new Error(`no frame ${String(index)}`);
-  const payloadUtf8 = JSON.stringify(envelope);
+  const payloadUtf8 = overrides.payloadUtf8 ?? JSON.stringify(envelope);
   return {
     datasetRowOrdinal: index,
     segmentId: frames.segmentId,
@@ -98,11 +123,11 @@ function recordOf(frames: FixtureFrames, index: number, envelope: unknown): Repl
     frame: {
       gatewayEpoch: frames.gatewayEpoch,
       ingestSeq: frame.ingestSeq,
-      source: frame.source,
+      source: overrides.source ?? frame.source,
       endpoint: frame.endpoint,
       connectionId: frame.connectionId,
       subscriptionGeneration: frame.subscriptionGeneration,
-      receivedAt: frame.receivedAt,
+      receivedAt: overrides.receivedAt ?? frame.receivedAt,
       receivedMonotonicNs: frame.receivedMonotonicNs,
       payloadUtf8,
       payloadSha256: sha256Hex(new Uint8Array(Buffer.from(payloadUtf8, "utf8"))),
@@ -110,24 +135,144 @@ function recordOf(frames: FixtureFrames, index: number, envelope: unknown): Repl
   };
 }
 
-/** Every frame of the committed fixture, and one refused frame per refusal kind. */
-function cases(): readonly { readonly name: string; readonly record: ReplayRecord }[] {
-  const frames = JSON.parse(readFileSync(join(FIXTURE_DIRECTORY, "frames.json"), "utf8")) as FixtureFrames;
-  const accepted = frames.frames.map((frame, index) => ({
+/**
+ * The containment site's case: a record whose `frame.source` read THROWS. The
+ * catch exists for throws from the door's reads, which the pollution below
+ * reaches; this case reaches it without pollution, so it is the one case built
+ * with an accessor rather than from recorded bytes.
+ */
+function unreadableRecordOf(frames: FixtureFrames, index: number, envelope: unknown): ReplayRecord {
+  const readable = recordOf(frames, index, envelope);
+  const frame = Object.defineProperty({ ...readable.frame }, "source", {
+    enumerable: true,
+    configurable: false,
+    get(): string {
+      throw new RangeError("this recorded frame cannot be read");
+    },
+  });
+  return { ...readable, frame };
+}
+
+interface Case {
+  readonly name: string;
+  readonly record: ReplayRecord;
+}
+
+interface RefusedCase extends Case {
+  /** A fragment of the reason ONE refusal site of the door produces: the site this case reaches. */
+  readonly site: string;
+}
+
+function fixtureFrames(): FixtureFrames {
+  return JSON.parse(readFileSync(join(FIXTURE_DIRECTORY, "frames.json"), "utf8")) as FixtureFrames;
+}
+
+/** Every frame of the committed fixture: each is accepted. */
+function acceptedCases(): readonly Case[] {
+  const frames = fixtureFrames();
+  return frames.frames.map((frame, index) => ({
     name: `fixture frame ${String(index)} (${String(frame.envelope["eventType"])})`,
     record: recordOf(frames, index, frame.envelope),
   }));
+}
+
+/**
+ * ONE refused case per refusal site of the door, in the order a frame meets
+ * them (the containment catch, which wraps every read, first), each built
+ * from fixture frame 2 (`MarketOpened`) with one thing wrong, and each naming
+ * the reason fragment of the site it must reach.
+ */
+function refusedCases(): readonly RefusedCase[] {
+  const frames = fixtureFrames();
   const first = frames.frames[2]?.envelope ?? {};
-  const refused = [
-    { name: "refused: a payload its contract rejects", envelope: { ...first, payload: { bogus: true } } },
-    { name: "refused: an unregistered contract", envelope: { ...first, eventType: "NoSuchEvent" } },
-    { name: "refused: no payload", envelope: { eventType: first["eventType"], schemaVersion: 1, sourceChannel: "market" } },
-    { name: "refused: no eventType", envelope: { ...first, eventType: "" } },
-    { name: "refused: a non-integer schemaVersion", envelope: { ...first, schemaVersion: 1.5 } },
-    { name: "refused: a non-string venueTimestamp", envelope: { ...first, venueTimestamp: 7 } },
-    { name: "refused: not an object", envelope: ["an", "array"] },
-  ].map((entry) => ({ name: entry.name, record: recordOf(frames, 2, entry.envelope) }));
-  return [...accepted, ...refused];
+  const firstText = JSON.stringify(first);
+  const withoutSourceChannel = Object.fromEntries(Object.entries(first).filter(([key]) => key !== "sourceChannel"));
+  return [
+    {
+      name: "refused: a record whose read throws (the containment catch)",
+      site: "reading the recorded envelope threw (RangeError)",
+      record: unreadableRecordOf(frames, 2, first),
+    },
+    {
+      name: "refused: a frame source outside the §7.1 vocabulary",
+      site: "which is not one of the §7.1 event sources",
+      record: recordOf(frames, 2, first, { source: "not-a-7.1-source" }),
+    },
+    {
+      name: "refused: a payload that is not strict JSON (a duplicate key)",
+      site: "the recorded payload is not strict JSON",
+      record: recordOf(frames, 2, first, {
+        payloadUtf8: `{"eventType":${JSON.stringify(first["eventType"])},${firstText.slice(1)}`,
+      }),
+    },
+    {
+      name: "refused: not an object",
+      site: "a recorded normalized envelope is a JSON object",
+      record: recordOf(frames, 2, ["an", "array"]),
+    },
+    {
+      name: "refused: no eventType",
+      site: "the recorded envelope names no eventType",
+      record: recordOf(frames, 2, { ...first, eventType: "" }),
+    },
+    {
+      name: "refused: a non-integer schemaVersion",
+      site: "the recorded envelope's schemaVersion is not a positive integer",
+      record: recordOf(frames, 2, { ...first, schemaVersion: 1.5 }),
+    },
+    {
+      name: "refused: no sourceChannel",
+      site: "the recorded envelope names no sourceChannel",
+      record: recordOf(frames, 2, withoutSourceChannel),
+    },
+    {
+      name: "refused: a non-string venueTimestamp",
+      site: "the recorded envelope's venueTimestamp is not a string",
+      record: recordOf(frames, 2, { ...first, venueTimestamp: 7 }),
+    },
+    {
+      name: "refused: no payload",
+      site: "the recorded envelope carries no payload",
+      record: recordOf(frames, 2, { eventType: first["eventType"], schemaVersion: 1, sourceChannel: "market" }),
+    },
+    {
+      name: "refused: an unregistered contract",
+      site: "which is not a registered packages/domain event contract",
+      record: recordOf(frames, 2, { ...first, eventType: "NoSuchEvent" }),
+    },
+    {
+      name: "refused: a receivedAt no replay event id can be derived from",
+      site: "receivedAt is not an instant a UUIDv7 timestamp field can carry",
+      record: recordOf(frames, 2, first, { receivedAt: "not an instant" }),
+    },
+    {
+      name: "refused: a payload its contract rejects",
+      site: "envelope failed its frozen packages/domain contract",
+      record: recordOf(frames, 2, { ...first, payload: { bogus: true } }),
+    },
+  ];
+}
+
+/** Every frame of the committed fixture, and one refused case per refusal site of the door. */
+function cases(): readonly Case[] {
+  return [...acceptedCases(), ...refusedCases()];
+}
+
+/**
+ * The door's refusal sites, read from `normalizer.ts`'s SOURCE: every
+ * `{ ok: false, reason: … }` from `function readRecordedNormalizedEnvelope(`
+ * to the end of the file, which is the envelope door and nothing else (pinned
+ * by the function names the region declares). Each entry is the text after
+ * `reason:`.
+ */
+function doorRefusalSites(): { readonly functions: readonly string[]; readonly sites: readonly string[] } {
+  const source = readFileSync(fileURLToPath(new URL("./normalizer.ts", import.meta.url)), "utf8");
+  const start = source.indexOf("function readRecordedNormalizedEnvelope(");
+  const region = start < 0 ? "" : source.slice(start);
+  return {
+    functions: [...region.matchAll(/^(?:export )?function (\w+)\(/gmu)].map((match) => match[1] ?? ""),
+    sites: [...region.matchAll(/\{\s*ok: false,\s*reason:\s*(\S[^\n]*)/gu)].map((match) => (match[1] ?? "").trim()),
+  };
 }
 
 const DECLARED_KEYS = [
@@ -204,6 +349,8 @@ function canonical(value: unknown): string {
 interface Observation {
   readonly threw: string | undefined;
   readonly accepted: boolean | undefined;
+  /** The refusal's reason, when the door refused. */
+  readonly reason: string | undefined;
   readonly envelopes: readonly string[];
   readonly prototypeFree: boolean;
   readonly frozen: boolean;
@@ -213,10 +360,20 @@ function observe(record: ReplayRecord): Observation {
   const normalizer = normalizedEnvelopeNormalizer(sha256Hex);
   try {
     const outcome = normalizer.normalize(record);
-    if (!outcome.ok) return { threw: undefined, accepted: false, envelopes: [], prototypeFree: true, frozen: true };
+    if (!outcome.ok) {
+      return {
+        threw: undefined,
+        accepted: false,
+        reason: outcome.reason,
+        envelopes: [],
+        prototypeFree: true,
+        frozen: true,
+      };
+    }
     return {
       threw: undefined,
       accepted: true,
+      reason: undefined,
       // Captured while polluted; compared once the pollution is gone.
       envelopes: outcome.envelopes.map((envelope) => canonical(envelope)),
       prototypeFree: outcome.envelopes.every((envelope) => Object.getPrototypeOf(envelope) === null),
@@ -226,6 +383,7 @@ function observe(record: ReplayRecord): Observation {
     return {
       threw: error instanceof Error ? error.name : typeof error,
       accepted: undefined,
+      reason: undefined,
       envelopes: [],
       prototypeFree: false,
       frozen: false,
@@ -234,15 +392,45 @@ function observe(record: ReplayRecord): Observation {
 }
 
 describe("BT1-R4 — normalizedEnvelopeNormalizer's §4 item 5 pollution battery (run, and pinned)", () => {
-  it("clean: every fixture frame is accepted and every refused frame is refused", () => {
-    const observed = cases().map((entry) => ({ name: entry.name, ...observe(entry.record) }));
-    expect(observed.filter((entry) => entry.name.startsWith("fixture")).every((entry) => entry.accepted === true)).toBe(
-      true,
+  it("clean: every fixture frame is accepted, and every refused case is refused AT ITS OWN SITE — by that site's reason and no other's", () => {
+    const accepted = acceptedCases().map((entry) => ({ name: entry.name, ...observe(entry.record) }));
+    const refused = refusedCases();
+    expect(accepted.map((entry) => [entry.name, entry.accepted])).toEqual(accepted.map((entry) => [entry.name, true]));
+    expect(accepted.length).toBe(8);
+    const sites = refused.map((entry) => entry.site);
+    // BT2-01: one case per site — the fragments name twelve DIFFERENT sites.
+    expect(new Set(sites).size).toBe(sites.length);
+    const reached = refused.map((entry) => {
+      const outcome = observe(entry.record);
+      return {
+        name: entry.name,
+        accepted: outcome.accepted,
+        threw: outcome.threw,
+        sitesInReason: sites.filter((site) => outcome.reason?.includes(site) === true),
+      };
+    });
+    expect(reached).toEqual(
+      refused.map((entry) => ({ name: entry.name, accepted: false, threw: undefined, sitesInReason: [entry.site] })),
     );
-    expect(observed.filter((entry) => entry.name.startsWith("refused")).every((entry) => entry.accepted === false)).toBe(
-      true,
-    );
-    expect(observed.length).toBe(15);
+    expect(cases().length).toBe(8 + 12);
+  });
+
+  it("BT2-01: the refused cases reach EVERY refusal site of the door — one case per `{ ok: false, reason }` in normalizer.ts's envelope door, beside its one forward of readRecordedNormalizedEnvelope's refusals", () => {
+    const { functions, sites } = doorRefusalSites();
+    // The census reads the envelope door and nothing else.
+    expect(functions).toEqual([
+      "readRecordedNormalizedEnvelope",
+      "normalizedEnvelopeNormalizer",
+      "normalizeRecordedEnvelope",
+    ]);
+    // The one site that is not a refusal of its own: it forwards the reader's.
+    const forwards = sites.filter((site) => site.startsWith("read.reason"));
+    expect(forwards).toEqual(["read.reason };"]);
+    const own = sites.filter((site) => !site.startsWith("read.reason"));
+    // A refusal branch added to the door without a refused case here fails
+    // this line — "every refusal kind" is measured, not asserted.
+    expect(own.length).toBe(refusedCases().length);
+    expect(own.length).toBe(12);
   });
 
   it(`under ${String(BATTERY_KEYS.length)} inherited keys × 2 variants: no throw escapes, permission never widens, every accepted envelope is byte-identical, prototype-free and frozen, and only the get-only numeric names fail closed`, () => {

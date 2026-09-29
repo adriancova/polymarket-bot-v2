@@ -345,24 +345,31 @@ function readRecordedNormalizedEnvelope(
  *    tree and the frame; the schema's output is discarded.
  * 4. **D4** — it is emitted prototype-free and deep-frozen (`ownFrozenTree`).
  * 5. **The bound — a battery WAS RUN, and is pinned** (BT1-R4, `BACKTEST-2`;
- *    `normalizer-battery.test.ts`). Every frame of the committed fixture and
- *    one refused frame of each refusal kind below, under 33 inherited keys on
+ *    `normalizer-battery.test.ts`). 20 cases: every frame of the committed
+ *    fixture (8) and ONE refused case for EACH of this door's 12 refusal
+ *    sites below — every `{ ok: false, reason }` in the three functions of
+ *    the door except the line that forwards
+ *    {@link readRecordedNormalizedEnvelope}'s refusals; the containment
+ *    catch's case is a record whose read throws. Each case is pinned to its
+ *    own site's reason, and a source census of this file pins that the cases
+ *    reach every site, so a refusal added here without a case fails the
+ *    battery (BT2-01, `BACKTEST-2` r1). Under 33 inherited keys on
  *    `Object.prototype` (every declared key, the eleven zod state keys §2
  *    measured, the numeric names `"0"`, `"1"`, `"-1"`), each as a
  *    non-enumerable data property and as a get-only accessor. Pinned: no
- *    throw escapes; permission never widens (no refused frame is accepted);
+ *    throw escapes; permission never widens (no refused case is accepted);
  *    every accepted envelope is byte-identical to the clean run's,
  *    prototype-free and frozen. What may vary is availability, and the test
  *    pins exactly where: under a get-only numeric name (`"0"`, `"1"`) every
- *    frame is refused (fail closed) — `packages/simulation`'s identity reader
- *    refuses, and its strict-JSON parser throws from `Array.push`
- *    (`strict-json.ts`, outside this app), which the containment below turns
- *    into a refusal. The battery's first run found two defects in THIS door,
- *    both fixed here: an inherited `venueTimestamp` was ADOPTED into every
- *    envelope whose recording had none (see {@link envelopeFrom}); and zod's
- *    refusal construction THREW out of `safeParse` under an inherited
- *    `value`, `writable`, `_zod`, `get` or `set` (the §2 error-construction
- *    class), which escaped as an exception.
+ *    fixture frame is refused (fail closed) — `packages/simulation`'s
+ *    identity reader refuses, and its strict-JSON parser throws from
+ *    `Array.push` (`strict-json.ts`, outside this app), which the
+ *    containment below turns into a refusal. The battery's first run found
+ *    two defects in THIS door, both fixed here: an inherited `venueTimestamp`
+ *    was ADOPTED into every envelope whose recording had none (see
+ *    {@link envelopeFrom}); and zod's refusal construction THREW out of
+ *    `safeParse` under an inherited `value`, `writable`, `_zod`, `get` or
+ *    `set` (the §2 error-construction class), which escaped as an exception.
  *
  * A contract the registry does not carry, a payload the contract refuses, or
  * a `source` outside the §7.1 vocabulary is a REFUSAL of the frame — the

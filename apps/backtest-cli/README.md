@@ -80,9 +80,14 @@ event (§8.3).
 
 `normalizedEnvelopeNormalizer` has had a schema-boundary §4 item 5 pollution
 battery RUN and PINNED since `BACKTEST-2` (`src/normalizer-battery.test.ts`,
-BT1-R4): 33 inherited keys × 2 variants over every fixture frame and every
-refusal kind — no throw escapes, permission never widens, every accepted
-envelope is byte-identical, and only the get-only numeric names fail closed.
+BT1-R4): 33 inherited keys × 2 variants over 20 cases — the 8 fixture frames
+and one refused case for each of the door's 12 refusal sites (the containment
+catch's case is a record whose read throws). No throw escapes, permission
+never widens, every accepted envelope is byte-identical, and only the get-only
+numeric names fail closed. Each refused case is pinned to its own site's
+reason, and a source census pins that the cases reach every refusal site in
+`src/normalizer.ts`'s envelope door, so a refusal added there without a case
+fails the battery.
 Its first run found, and `BACKTEST-2` fixed, an adopted `venueTimestamp` and
 an uncontained throw from zod's refusal construction. The other two
 normalizers have had no battery run.

@@ -122,7 +122,13 @@ not the builder's shape), and `packages/simulation`'s own tests under
   artifact). The golden is unchanged (its run has no halt).
 - **R4** — a battery WAS run and is pinned
   (`apps/backtest-cli/src/normalizer-battery.test.ts`): 33 inherited keys × 2
-  variants × 15 frames. Its first run against the base normalizer recorded 94
+  variants × 20 cases — the 8 fixture frames and one refused case for each of
+  the door's 12 refusal sites, each pinned to its own site's reason, with a
+  source census pinning that the cases reach every `{ ok: false, reason }`
+  site of the door (r1, BT2-01: r0 had 7 refused cases and said "every refusal
+  kind"; it missed the non-§7.1 source, the non-strict-JSON payload, the
+  missing `sourceChannel`, the replay-event-id refusal and the containment
+  catch). Its first run (r0's 15 cases) against the base normalizer recorded 94
   deviations in three classes: an inherited `venueTimestamp` ADOPTED into
   every envelope (D3), zod's refusal construction THROWING under `value` /
   `writable` / `_zod` / `get` / `set`, and `packages/simulation`'s strict-JSON
