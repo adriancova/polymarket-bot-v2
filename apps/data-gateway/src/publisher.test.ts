@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
+import type { MarketEventTransport, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
 
 import { GatewayPublisher } from "./publisher.js";
-import type { PublicationHalt } from "./publisher.js";
+import type { BatchPublishCapability, PublicationHalt, PublishOutcome } from "./publisher.js";
 import { ManualGatewayClock } from "./testing/index.js";
 import { MemoryEventTransport } from "./testing/memory-transport.js";
 
@@ -32,6 +33,8 @@ function build(
   options: {
     maxQueueDepth?: number;
     maxQueueBytes?: number;
+    maxBatchEnvelopes?: number;
+    maxBatchBytes?: number;
     onPublicationHalted?: (halt: PublicationHalt) => void;
     onDuplicateRefused?: (identity: { gatewayEpoch: string; ingestSeq: string }) => void;
     onPublishRejected?: (rejection: { ingestSeq: string; detail: string }) => void;
@@ -315,5 +318,269 @@ describe("GatewayPublisher — bounded admission (H2)", () => {
     expect(idle.published).toBe(3);
     // The high-water marks are retained: they are what a dashboard alerts on.
     expect(idle.queueMaxDepthObserved).toBe(2);
+  });
+});
+
+/**
+ * `THROUGHPUT-1b` — batched submission.
+ *
+ * The pump submits the consecutive run at the head of the queue in one call
+ * when the transport offers `publishBatch`. These tests hold a submission
+ * open with the memory double's stall gate so a run really accumulates, and
+ * assert that batching changes the number of transport calls and NOTHING
+ * about what is published, in what order, or when publication halts.
+ */
+describe("GatewayPublisher — batched submission (THROUGHPUT-1b)", () => {
+  function accumulate(
+    publisher: GatewayPublisher,
+    transport: MemoryEventTransport,
+    envelopes: readonly EventEnvelope<unknown>[],
+  ): Promise<PublishOutcome[]> {
+    // The first envelope is submitted alone and held; the rest queue behind it.
+    transport.stallPublishes();
+    const outcomes = envelopes.map((envelope) => publisher.enqueue(envelope));
+    transport.resumePublishes();
+    return Promise.all(outcomes);
+  }
+
+  it("submits the queued run in one call, in admission order, and publishes the same envelopes", async () => {
+    const { transport, publisher } = build();
+    const envelopes = ["1", "2", "3", "4", "5", "6"].map(envelopeAt);
+    const outcomes = await accumulate(publisher, transport, envelopes);
+
+    expect(outcomes.map((outcome) => outcome.published)).toEqual([true, true, true, true, true, true]);
+    expect(outcomes.map((outcome) => (outcome.published ? outcome.sequence : 0))).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(transport.published("market").map((envelope) => envelope.ingestSeq)).toEqual([
+      "1", "2", "3", "4", "5", "6",
+    ]);
+    // Two calls: the held first envelope, then the run of five behind it.
+    expect(transport.batchCalls).toBe(2);
+    const metrics = publisher.metrics();
+    expect(metrics.submissions).toBe(2);
+    expect(metrics.largestSubmission).toBe(5);
+    expect(metrics.published).toBe(6);
+    expect(metrics.inFlight).toBe(0);
+  });
+
+  it("bounds a run by envelopes and by bytes; a single oversized envelope still goes alone", async () => {
+    const oneEnvelopeBytes = JSON.stringify(envelopeAt("1")).length;
+    const byCount = build({ maxBatchEnvelopes: 2 });
+    await accumulate(byCount.publisher, byCount.transport, ["1", "2", "3", "4", "5"].map(envelopeAt));
+    // [1], then [2,3], [4,5].
+    expect(byCount.transport.batchCalls).toBe(3);
+    expect(byCount.publisher.metrics().largestSubmission).toBe(2);
+
+    const byBytes = build({ maxBatchBytes: oneEnvelopeBytes * 2 + 1 });
+    await accumulate(byBytes.publisher, byBytes.transport, ["1", "2", "3", "4", "5"].map(envelopeAt));
+    expect(byBytes.publisher.metrics().largestSubmission).toBe(2);
+
+    const tiny = build({ maxBatchBytes: 1 });
+    await accumulate(tiny.publisher, tiny.transport, ["1", "2", "3"].map(envelopeAt));
+    expect(tiny.publisher.metrics().largestSubmission).toBe(1);
+    expect(tiny.transport.published("market")).toHaveLength(3);
+  });
+
+  it("reports the held run as in flight, not as queued: the depth gauge still means admitted-and-not-submitted", async () => {
+    const { transport, publisher } = build();
+    transport.stallPublishes();
+    const first = publisher.enqueue(envelopeAt("1"));
+    const rest = ["2", "3", "4"].map((seq) => publisher.enqueue(envelopeAt(seq)));
+    expect(publisher.metrics()).toMatchObject({ queueDepth: 3, inFlight: 1 });
+    transport.resumePublishes();
+    await first;
+    // The run of three is now the submission in flight (the stall is over, so
+    // it settles on the next turns).
+    await Promise.all(rest);
+    await publisher.settle();
+    expect(publisher.metrics()).toMatchObject({ queueDepth: 0, inFlight: 0, published: 4 });
+  });
+
+  it("an envelope refused INSIDE a run: the prefix publishes, the refusal halts, NOTHING after it is published", async () => {
+    const halts: PublicationHalt[] = [];
+    const rejections: string[] = [];
+    const { transport, publisher } = build({
+      onPublicationHalted: (halt) => halts.push(halt),
+      onPublishRejected: (rejection) => rejections.push(rejection.ingestSeq),
+    });
+    const envelopes = ["1", "2", "3", "4", "5", "6"].map(envelopeAt);
+    envelopes[3] = { ...envelopeAt("4"), receivedAt: "not-a-timestamp" };
+    const outcomes = await accumulate(publisher, transport, envelopes);
+
+    // Non-vacuous: the refused envelope really was inside a multi-envelope run.
+    expect(publisher.metrics().largestSubmission).toBe(5);
+    expect(outcomes.map((outcome) => (outcome.published ? "published" : outcome.reason))).toEqual([
+      "published",
+      "published",
+      "published",
+      "transport-rejected",
+      "publication-halted",
+      "publication-halted",
+    ]);
+    expect(transport.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["1", "2", "3"]);
+    expect(halts).toHaveLength(1);
+    expect(halts[0]).toMatchObject({ cause: "GATEWAY_PUBLISH_REJECTED", haltedAtIngestSeq: "4" });
+    expect(rejections).toEqual(["4"]);
+    expect(publisher.metrics()).toMatchObject({
+      published: 3,
+      rejectedByTransport: 1,
+      suppressedWhileHalted: 2,
+      halted: true,
+    });
+    // And nothing later publishes: the halt is terminal.
+    const later = await publisher.enqueue(envelopeAt("7"));
+    expect(later.published).toBe(false);
+    expect(transport.published("market")).toHaveLength(3);
+  });
+
+  it("an outage striking a run publishes none of it: the halt is at its first envelope", async () => {
+    const halts: PublicationHalt[] = [];
+    const { transport, publisher } = build({ onPublicationHalted: (halt) => halts.push(halt) });
+    transport.stallPublishes();
+    const outcomes = ["1", "2", "3", "4"].map((seq) => publisher.enqueue(envelopeAt(seq)));
+    transport.resumePublishes();
+    await outcomes[0];
+    // The run [2,3,4] is next; the transport goes away before it is submitted.
+    transport.setUnavailable(true);
+    const settled = await Promise.all(outcomes);
+    expect(settled.map((outcome) => (outcome.published ? "published" : outcome.reason))).toEqual([
+      "published",
+      "transport-unavailable",
+      "publication-halted",
+      "publication-halted",
+    ]);
+    expect(halts[0]).toMatchObject({ cause: "EVENT_BUS_UNAVAILABLE", haltedAtIngestSeq: "2" });
+    expect(transport.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["1"]);
+    // Every one of the run is accounted for; none counted as published.
+    expect(publisher.metrics()).toMatchObject({ published: 1, suppressedWhileHalted: 3 });
+  });
+
+  it("a transport whose result does not account for every envelope halts at the first unaccounted one", async () => {
+    const memory = new MemoryEventTransport();
+    const halts: PublicationHalt[] = [];
+    let held: (() => void) | undefined;
+    // Claims success for a run but hands back fewer receipts than envelopes.
+    const lying = Object.assign(Object.create(memory) as MemoryEventTransport, {
+      publishBatch: async (stream: string, envelopes: readonly EventEnvelope<unknown>[]) => {
+        if (held === undefined) {
+          await new Promise<void>((resolve) => {
+            held = resolve;
+          });
+        }
+        const result = await memory.publishBatch(stream, envelopes);
+        return { receipts: result.receipts.slice(0, 2), failure: undefined };
+      },
+    });
+    const publisher = new GatewayPublisher({
+      transport: lying,
+      stream: "market",
+      clock: new ManualGatewayClock(),
+      onPublicationHalted: (halt) => halts.push(halt),
+    });
+    const outcomes = ["1", "2", "3", "4", "5"].map((seq) => publisher.enqueue(envelopeAt(seq)));
+    held?.();
+    const settled = await Promise.all(outcomes);
+    expect(settled.map((outcome) => outcome.published)).toEqual([true, true, true, false, false]);
+    expect(halts[0]?.cause).toBe("GATEWAY_PUBLISH_REJECTED");
+    expect(halts[0]?.haltedAtIngestSeq).toBe("4");
+    expect(halts[0]?.detail).toContain("accounted for 2 of 4 envelopes");
+    expect(publisher.metrics().published).toBe(3);
+  });
+
+  it("a publishBatch that rejects is a failure at the run's first envelope", async () => {
+    const memory = new MemoryEventTransport();
+    const halts: PublicationHalt[] = [];
+    const rejecting = Object.assign(Object.create(memory) as MemoryEventTransport, {
+      publishBatch: () => Promise.reject(new Error("the batch call itself blew up")),
+    });
+    const publisher = new GatewayPublisher({
+      transport: rejecting,
+      stream: "market",
+      clock: new ManualGatewayClock(),
+      onPublicationHalted: (halt) => halts.push(halt),
+    });
+    const outcome = await publisher.enqueue(envelopeAt("1"));
+    expect(outcome.published).toBe(false);
+    expect(halts[0]).toMatchObject({ cause: "GATEWAY_PUBLISH_REJECTED", haltedAtIngestSeq: "1" });
+    expect(memory.published("market")).toEqual([]);
+  });
+
+  it("refuses a batch bound that is not a positive integer", () => {
+    expect(() => build({ maxBatchEnvelopes: 0 })).toThrow(RangeError);
+    expect(() => build({ maxBatchBytes: 1.5 })).toThrow(RangeError);
+  });
+
+  it("the Redis Streams transport offers the capability the pump detects (compile-time)", () => {
+    expectTypeOf<RedisStreamsEventTransport>().toMatchTypeOf<BatchPublishCapability>();
+  });
+});
+
+/**
+ * A transport WITHOUT `publishBatch` keeps the per-envelope path: batches of
+ * one, one `publish` per envelope, exactly the pre-`THROUGHPUT-1b` pump.
+ */
+describe("GatewayPublisher — a transport without publishBatch (per-envelope path)", () => {
+  function perEnvelope(memory: MemoryEventTransport): MarketEventTransport {
+    return {
+      transportId: memory.transportId,
+      retention: memory.retention,
+      publish: (stream, envelope) => memory.publish(stream, envelope),
+      subscribe: (options) => memory.subscribe(options),
+      streamMetrics: (stream) => memory.streamMetrics(stream),
+      close: () => memory.close(),
+    };
+  }
+
+  function buildPerEnvelope(options: { maxQueueDepth?: number; maxBatchEnvelopes?: number } = {}) {
+    const memory = new MemoryEventTransport();
+    const halts: PublicationHalt[] = [];
+    const publisher = new GatewayPublisher({
+      transport: perEnvelope(memory),
+      stream: "market",
+      clock: new ManualGatewayClock(),
+      onPublicationHalted: (halt) => halts.push(halt),
+      ...options,
+    });
+    return { memory, publisher, halts };
+  }
+
+  it("submits one envelope per call, in order, whatever the batch bound says", async () => {
+    const { memory, publisher } = buildPerEnvelope({ maxBatchEnvelopes: 64 });
+    memory.stallPublishes();
+    const outcomes = ["1", "2", "3", "4"].map((seq) => publisher.enqueue(envelopeAt(seq)));
+    expect(publisher.queueDepth).toBe(3);
+    memory.resumePublishes();
+    await Promise.all(outcomes);
+    expect(memory.batchCalls).toBe(0);
+    expect(memory.publishCalls).toBe(4);
+    expect(publisher.metrics()).toMatchObject({ submissions: 4, largestSubmission: 1, published: 4 });
+    expect(memory.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["1", "2", "3", "4"]);
+  });
+
+  it("a refusal halts and no later identity publishes", async () => {
+    const { memory, publisher, halts } = buildPerEnvelope();
+    memory.stallPublishes();
+    const outcomes = [
+      publisher.enqueue(envelopeAt("1")),
+      publisher.enqueue({ ...envelopeAt("2"), receivedAt: "not-a-timestamp" }),
+      publisher.enqueue(envelopeAt("3")),
+    ];
+    memory.resumePublishes();
+    const settled = await Promise.all(outcomes);
+    expect(settled.map((outcome) => outcome.published)).toEqual([true, false, false]);
+    expect(halts[0]).toMatchObject({ cause: "GATEWAY_PUBLISH_REJECTED", haltedAtIngestSeq: "2" });
+    expect(memory.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["1"]);
+  });
+
+  it("a stalled publish overflows the admission bound and halts, as before", async () => {
+    const { memory, publisher, halts } = buildPerEnvelope({ maxQueueDepth: 4 });
+    memory.stallPublishes();
+    const outcomes = ["1", "2", "3", "4", "5"].map((seq) => publisher.enqueue(envelopeAt(seq)));
+    const refused = await publisher.enqueue(envelopeAt("6"));
+    expect(refused.published).toBe(false);
+    expect(halts[0]).toMatchObject({ cause: "GATEWAY_PUBLISH_ADMISSION_OVERFLOW", haltedAtIngestSeq: "6" });
+    memory.resumePublishes();
+    await Promise.all(outcomes);
+    await publisher.settle();
+    expect(memory.published("market").map((envelope) => envelope.ingestSeq)).toEqual(["1"]);
   });
 });

@@ -70,10 +70,49 @@
  * A halt is TOTAL and IMMEDIATE: entries already admitted but not yet
  * submitted are resolved as suppressed rather than published, so there is
  * exactly one boundary in the stream instead of a trickle after the halt.
+ *
+ * ## Batched submission (`THROUGHPUT-1b`)
+ *
+ * H1 run 1 halted `GATEWAY_PUBLISH_ADMISSION_OVERFLOW` at a window open. The
+ * pump submitted ONE envelope per transport round trip, so it drained at
+ * most one envelope per event-loop turn, and a burst of admissions in a few
+ * turns outran it (`tools/bench/gateway/README.md` has the measurements).
+ *
+ * When the transport offers `publishBatch` ({@link BatchPublishCapability};
+ * the Redis Streams transport does), the pump now takes the CONSECUTIVE run of
+ * entries at the head of the queue — at most
+ * {@link DEFAULT_PUBLISH_BATCH_MAX_ENVELOPES} envelopes and
+ * {@link DEFAULT_PUBLISH_BATCH_MAX_BYTES} bytes — and submits them in one
+ * call. Nothing about publication changes:
+ *
+ * - the run is the FIFO's head, in admission order, so submission order is
+ *   still assignment order; the transport checks every envelope's door and
+ *   ordering exactly as `publish` does and writes the same stream entries;
+ * - admission — the depth and byte bounds, their defaults, the duplicate
+ *   refusal — is untouched and still synchronous; a run leaves the queue when
+ *   it is SUBMITTED, as a single envelope did (the depth gauge still counts
+ *   "admitted and not yet submitted"), and at most one run is in flight;
+ * - the transport reports the published prefix and the first envelope that
+ *   was NOT published. That envelope's failure halts publication exactly as a
+ *   failed single publish did (same causes, same PAGE incident), and every
+ *   envelope after it in the run is suppressed, never submitted: nothing is
+ *   appended after a refusal;
+ * - a halt that happens WHILE a run is in flight (an admission overflow
+ *   behind a stalled transport) cannot unsend it, exactly as it could not
+ *   unsend the one envelope in flight before: that run is the last thing in
+ *   the stream.
+ *
+ * A transport without `publishBatch` (the in-memory doubles that opt out, the
+ * startup-outage transport) gets batches of one and the per-envelope code
+ * path, unchanged.
  */
 
 import type { EventEnvelope } from "@polymarket-bot/domain";
-import type { EventStreamName, MarketEventTransport } from "@polymarket-bot/event-bus";
+import type {
+  EventStreamName,
+  MarketEventTransport,
+  PublishReceipt,
+} from "@polymarket-bot/event-bus";
 import { EventBusPublishQueueFullError, EventBusUnavailableError } from "@polymarket-bot/event-bus";
 import { encodePlainJson } from "@polymarket-bot/risk/plain-json";
 
@@ -99,6 +138,66 @@ export const DEFAULT_PUBLISH_QUEUE_MAX_DEPTH = 1_024;
  * own queue byte bound and is reached long before a Node heap is in danger.
  */
 export const DEFAULT_PUBLISH_QUEUE_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Most envelopes one batched submission carries (`THROUGHPUT-1b`).
+ *
+ * Not an admission bound: it caps how much is IN FLIGHT at once, on top of
+ * the admission queue, so a stalled transport holds at most this many
+ * submitted-but-unsettled envelopes plus a full queue. The pump submits what
+ * is queued when the previous submission settles, so batches are as large as
+ * the arrivals during one round trip; this cap is reached only when the
+ * transport falls well behind.
+ */
+export const DEFAULT_PUBLISH_BATCH_MAX_ENVELOPES = 256;
+
+/**
+ * Most serialized bytes one batched submission carries. A single envelope
+ * larger than this still goes, alone.
+ */
+export const DEFAULT_PUBLISH_BATCH_MAX_BYTES = 1024 * 1024;
+
+/**
+ * The first envelope of a batch the transport did NOT publish, and why.
+ * Mirrors the Redis Streams transport's `PublishBatchFailure`.
+ */
+export interface BatchPublishFailure {
+  readonly index: number;
+  readonly error: unknown;
+}
+
+/**
+ * The batch capability the pump uses when the transport offers it.
+ *
+ * Not part of `MarketEventTransport` (whose interface this package does not
+ * own); `RedisStreamsEventTransport.publishBatch` satisfies it, which
+ * `main.ts` checks at compile time where it wires that transport. The
+ * contract the pump relies on: the result's receipts are the published
+ * PREFIX of the batch, `failure.index === receipts.length` when anything was
+ * not published, nothing after `failure.index` was attempted, and the call
+ * never rejects (a rejection is nevertheless treated as a failure at index
+ * 0, and an inconsistent result as a failure at the first unaccounted
+ * envelope — both halt).
+ */
+export interface BatchPublishCapability {
+  publishBatch(
+    stream: EventStreamName,
+    envelopes: readonly EventEnvelope<unknown>[],
+  ): Promise<{
+    readonly receipts: readonly PublishReceipt[];
+    readonly failure: BatchPublishFailure | undefined;
+  }>;
+}
+
+/** The transport's batch capability, bound to it, or `undefined`. */
+function batchCapabilityOf(transport: MarketEventTransport): BatchPublishCapability | undefined {
+  const candidate = (transport as MarketEventTransport & Partial<BatchPublishCapability>)
+    .publishBatch;
+  if (typeof candidate !== "function") return undefined;
+  return {
+    publishBatch: async (stream, envelopes) => await candidate.call(transport, stream, envelopes),
+  };
+}
 
 export type PublishOutcome =
   | { readonly published: true; readonly sequence: number }
@@ -146,6 +245,14 @@ export interface GatewayPublisherOptions {
   readonly maxQueueDepth?: number;
   /** Admission byte bound. Defaults to {@link DEFAULT_PUBLISH_QUEUE_MAX_BYTES}. */
   readonly maxQueueBytes?: number;
+  /**
+   * Envelopes per batched submission. Defaults to
+   * {@link DEFAULT_PUBLISH_BATCH_MAX_ENVELOPES}; ignored (always 1) when the
+   * transport has no `publishBatch`.
+   */
+  readonly maxBatchEnvelopes?: number;
+  /** Bytes per batched submission. Defaults to {@link DEFAULT_PUBLISH_BATCH_MAX_BYTES}. */
+  readonly maxBatchBytes?: number;
   /** Called exactly once, when publication halts. */
   readonly onPublicationHalted?: (halt: PublicationHalt) => void;
   /** Called for every refused duplicate identity (observable, never silent). */
@@ -187,6 +294,12 @@ export interface GatewayPublisherMetrics {
   readonly queueMaxBytes: number;
   /** §14.3 oldest message age: how long the head has waited, in ms. */
   readonly oldestQueuedAgeMs: number;
+  /** Transport calls made: one per batch, or one per envelope without batching. */
+  readonly submissions: number;
+  /** Envelopes submitted and not yet settled (at most one batch). */
+  readonly inFlight: number;
+  /** The most envelopes one submission carried. */
+  readonly largestSubmission: number;
 }
 
 interface QueuedPublication {
@@ -266,6 +379,10 @@ export class GatewayPublisher {
   readonly #options: GatewayPublisherOptions;
   readonly #maxQueueDepth: number;
   readonly #maxQueueBytes: number;
+  /** The transport's batch capability; `undefined` means batches of one. */
+  readonly #batch: BatchPublishCapability | undefined;
+  readonly #maxBatchEnvelopes: number;
+  readonly #maxBatchBytes: number;
 
   /** FIFO admission queue; `#head` is the cursor, so dequeue is O(1). */
   #queue: QueuedPublication[] = [];
@@ -283,12 +400,26 @@ export class GatewayPublisher {
   #suppressedWhileHalted = 0;
   #rejectedByTransport = 0;
   #admissionRefusals = 0;
+  #submissions = 0;
+  #inFlight = 0;
+  #largestSubmission = 0;
   #halt: PublicationHalt | undefined;
 
   constructor(options: GatewayPublisherOptions) {
     this.#options = options;
     this.#maxQueueDepth = options.maxQueueDepth ?? DEFAULT_PUBLISH_QUEUE_MAX_DEPTH;
     this.#maxQueueBytes = options.maxQueueBytes ?? DEFAULT_PUBLISH_QUEUE_MAX_BYTES;
+    this.#batch = batchCapabilityOf(options.transport);
+    const maxBatchEnvelopes = options.maxBatchEnvelopes ?? DEFAULT_PUBLISH_BATCH_MAX_ENVELOPES;
+    const maxBatchBytes = options.maxBatchBytes ?? DEFAULT_PUBLISH_BATCH_MAX_BYTES;
+    if (!Number.isSafeInteger(maxBatchEnvelopes) || maxBatchEnvelopes < 1) {
+      throw new RangeError(`maxBatchEnvelopes must be a positive integer, received ${String(maxBatchEnvelopes)}`);
+    }
+    if (!Number.isSafeInteger(maxBatchBytes) || maxBatchBytes < 1) {
+      throw new RangeError(`maxBatchBytes must be a positive integer, received ${String(maxBatchBytes)}`);
+    }
+    this.#maxBatchEnvelopes = this.#batch === undefined ? 1 : maxBatchEnvelopes;
+    this.#maxBatchBytes = maxBatchBytes;
   }
 
   get halted(): boolean {
@@ -444,6 +575,9 @@ export class GatewayPublisher {
       queueMaxBytesObserved: this.#queueMaxBytesObserved,
       queueMaxBytes: this.#maxQueueBytes,
       oldestQueuedAgeMs: this.oldestQueuedAgeMs(),
+      submissions: this.#submissions,
+      inFlight: this.#inFlight,
+      largestSubmission: this.#largestSubmission,
     };
   }
 
@@ -477,46 +611,128 @@ export class GatewayPublisher {
     this.#pump = this.#drainQueue();
   }
 
-  #dequeue(): QueuedPublication | undefined {
-    const entry = this.#queue[this.#head];
-    if (entry === undefined) return undefined;
-    this.#head += 1;
-    this.#queueBytes -= entry.bytes;
+  /**
+   * Takes the consecutive run at the head of the queue: at least one entry
+   * when any is queued, then more while the batch bounds allow. With no batch
+   * capability the envelope bound is 1, so this is the old single dequeue.
+   */
+  #dequeueRun(): QueuedPublication[] {
+    const run: QueuedPublication[] = [];
+    let bytes = 0;
+    while (run.length < this.#maxBatchEnvelopes) {
+      const entry = this.#queue[this.#head];
+      if (entry === undefined) break;
+      if (run.length > 0 && bytes + entry.bytes > this.#maxBatchBytes) break;
+      this.#head += 1;
+      this.#queueBytes -= entry.bytes;
+      bytes += entry.bytes;
+      run.push(entry);
+    }
     if (this.#head >= this.#queue.length) {
       this.#queue = [];
       this.#head = 0;
       this.#queueBytes = 0;
     }
-    return entry;
+    return run;
   }
 
   async #drainQueue(): Promise<void> {
     try {
       for (;;) {
-        const entry = this.#dequeue();
-        if (entry === undefined) return;
+        const run = this.#dequeueRun();
+        if (run.length === 0) return;
         const halt = this.#halt;
         if (halt !== undefined) {
           // A halt is total: an entry admitted before the halt is suppressed
           // rather than published, so the stream has exactly one boundary.
           // (A submission already handed to the transport cannot be unsent;
-          // that one entry completes and is the last thing in the stream.)
-          entry.resolve(this.#suppress(halt));
+          // that one entry — or that one batch — completes and is the last
+          // thing in the stream.)
+          for (const entry of run) entry.resolve(this.#suppress(halt));
           continue;
         }
+        this.#submissions += 1;
+        if (run.length > this.#largestSubmission) this.#largestSubmission = run.length;
+        this.#inFlight = run.length;
         try {
-          const receipt = await this.#options.transport.publish(
-            this.#options.stream,
-            entry.envelope,
-          );
-          this.#published += 1;
-          entry.resolve({ published: true, sequence: receipt.sequence });
-        } catch (error) {
-          entry.resolve(this.#onSubmissionFailure(entry.envelope, error));
+          if (this.#batch === undefined) {
+            await this.#submitOne(run[0] as QueuedPublication);
+          } else {
+            await this.#submitRun(this.#batch, run);
+          }
+        } finally {
+          this.#inFlight = 0;
         }
       }
     } finally {
       this.#pumping = false;
+    }
+  }
+
+  /** The per-envelope submission: the pre-`THROUGHPUT-1b` path, unchanged. */
+  async #submitOne(entry: QueuedPublication): Promise<void> {
+    try {
+      const receipt = await this.#options.transport.publish(
+        this.#options.stream,
+        entry.envelope,
+      );
+      this.#published += 1;
+      entry.resolve({ published: true, sequence: receipt.sequence });
+    } catch (error) {
+      entry.resolve(this.#onSubmissionFailure(entry.envelope, error));
+    }
+  }
+
+  /**
+   * One batched submission, settled in order: the published prefix resolves
+   * published, the first unpublished envelope's failure HALTS exactly as a
+   * failed single publish does, and every envelope after it is suppressed —
+   * it was never attempted, and after the halt it never will be.
+   */
+  async #submitRun(batch: BatchPublishCapability, run: readonly QueuedPublication[]): Promise<void> {
+    let receipts: readonly PublishReceipt[];
+    let failure: BatchPublishFailure | undefined;
+    try {
+      const result = await batch.publishBatch(
+        this.#options.stream,
+        run.map((entry) => entry.envelope),
+      );
+      receipts = result.receipts;
+      failure = result.failure;
+    } catch (error) {
+      // The contract says it never rejects; if it does, nothing is known to
+      // have been published, so the run fails at its first envelope.
+      receipts = [];
+      failure = { index: 0, error };
+    }
+
+    // Only what the transport ACCOUNTED FOR counts as published: a receipt
+    // below the failure index, within the run. Anything else is a failure at
+    // the first envelope the result does not account for.
+    const accounted = Math.min(receipts.length, run.length, failure?.index ?? run.length);
+    for (let index = 0; index < accounted; index += 1) {
+      const entry = run[index] as QueuedPublication;
+      const receipt = receipts[index] as PublishReceipt;
+      this.#published += 1;
+      entry.resolve({ published: true, sequence: receipt.sequence });
+    }
+    if (accounted === run.length) return;
+
+    const failedEntry = run[accounted] as QueuedPublication;
+    const error =
+      failure !== undefined && failure.index === accounted
+        ? failure.error
+        : new Error(
+            `the transport accounted for ${String(receipts.length)} of ${String(run.length)} envelopes ` +
+              `with a failure at ${failure === undefined ? "none" : String(failure.index)}; ` +
+              `envelope ${String(accounted)} onward is treated as not published`,
+          );
+    failedEntry.resolve(this.#onSubmissionFailure(failedEntry.envelope, error));
+    // `#onSubmissionFailure` has halted publication, so the rest of the run
+    // is suppressed: never submitted, nothing appended after the failure.
+    const halt = this.#halt as PublicationHalt;
+    for (let index = accounted + 1; index < run.length; index += 1) {
+      (run[index] as QueuedPublication).resolve(this.#suppress(halt));
     }
   }
 
