@@ -47,6 +47,9 @@ importers:
       '@polymarket-bot/storage-parquet':
         specifier: workspace:*
         version: link:../../packages/storage-parquet
+      '@polymarket-bot/trading-core':
+        specifier: workspace:*
+        version: link:../../packages/trading-core
     devDependencies:
       '@types/node':
         specifier: ^24.13.3

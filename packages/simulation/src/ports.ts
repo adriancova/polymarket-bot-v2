@@ -42,8 +42,11 @@
  * packages by root-level tests (`test/unit/simulation/ports.test.ts`), which is
  * the WP-190 `ports.test.ts` precedent: a root test importing the real package
  * creates no workspace edge, and a field added or removed upstream fails the
- * pin. The composition root (`apps/backtest-cli`, later `apps/trader`) is the
- * only place where the real values meet these interfaces.
+ * pin. The real values meet these interfaces in the shared trading core
+ * (`packages/trading-core`, which §2.1 row S15 lets consume this package —
+ * ADR-022) and in the two composition roots that build that core
+ * (`apps/trader`, and `apps/backtest-cli` from `BACKTEST-2` on); this package
+ * still imports none of those same-layer packages.
  */
 
 import type { Clock } from "./clock.js";

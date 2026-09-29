@@ -294,3 +294,16 @@ export {
   type PaperTrader,
   type TraderRefusal,
 } from "@polymarket-bot/trading-core";
+
+/**
+ * `BACKTEST-2` (ADR-022 D5): the ONE simulated-venue builder, re-exported so
+ * the test harnesses that reach the core through this facade build the venue
+ * `main.ts` builds, with no suite alias of their own.
+ */
+export {
+  UNMODELED_VENUE_RATE_LIMITS_DISCLOSURE,
+  buildSimulatedVenue,
+  type SimulatedVenueBuild,
+  type SimulatedVenueBuildOptions,
+  type SimulatedVenueSettings,
+} from "@polymarket-bot/trading-core";

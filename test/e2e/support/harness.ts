@@ -21,9 +21,13 @@
  * `apps/trader/src/main.ts` gives the `SimulatedVenue` a `books` provider that
  * looks the market up through the trader on every read, and an `ExecutionPolicy`
  * whose `timeInForceFor` asks the trader for the value it recorded at plan time
- * and THROWS when there is none. This harness reproduces both shapes verbatim
- * rather than pre-binding a book map, so the seam under test is the shipped one:
- * a venue that answered either question itself would be a second authority.
+ * and THROWS when there is none. Since `BACKTEST-2` this harness does not
+ * reproduce either shape: it calls the core's ONE venue builder,
+ * `buildSimulatedVenue` (ADR-022 D5), the call `main.ts` makes, so the seam
+ * under test is the shipped one — a venue that answered either question itself
+ * would be a second authority. What this harness still states is WHERE the
+ * venue's settings come from (the operator document, read defensively, below)
+ * and its one test-only option, `venueRetention`.
  *
  * ## One harness, any scenario (`BRACKET-1b`, E1)
  *
@@ -37,20 +41,16 @@
  */
 
 import {
-  SimulatedVenue,
   readFeeScheduleSnapshot,
-  tier0Model,
-  unmodeledRateLimits,
-  type BookView,
   type FeeScheduleSnapshot,
-  type PlannedOrderView,
   type SimulatedFill,
   type SimulatedOrder,
+  type SimulatedVenue,
   type SimulatedVenueOptions,
-  type TimeInForce,
 } from "@polymarket-bot/simulation";
 import {
   EVERY_FILL_ACCOUNTING_CHECKS,
+  buildSimulatedVenue,
   createPaperTrader,
   type CreateTraderResult,
   type PaperTrader,
@@ -82,11 +82,6 @@ export interface AssembleOptions {
    * venue keeps its own defaults (`DEFAULT_VENUE_RETENTION`).
    */
   readonly venueRetention?: SimulatedVenueOptions["retention"];
-}
-
-/** The venue's view of the trader, filled the instant the trader exists. */
-interface VenueWiring {
-  trader: PaperTrader | undefined;
 }
 
 /** A string field of an unparsed document, or a stated fallback. */
@@ -137,81 +132,25 @@ export function assemble(options: AssembleOptions = {}): {
     );
   }
 
-  const wiring: VenueWiring = { trader: undefined };
-
-  const venue = new SimulatedVenue({
+  // The venue `main.ts` builds, through the same builder; only the settings'
+  // source (this document, read defensively above) and `venueRetention` are
+  // this harness's own.
+  const built = buildSimulatedVenue({
     clock,
-    runMode: "PAPER",
-    model: tier0Model({
+    settings: {
       fillModelVersion: readString(simulation["fillModelVersion"], "tier0.unconfigured"),
       fillModelParametersHash: readString(simulation["fillModelParametersHash"], "0".repeat(64)),
-    }),
-    feeSnapshot: fees.value,
-    rateLimits: unmodeledRateLimits(
-      "no venue rate-limit budget is modelled: §9.13's budget is WP-310's package and does " +
-        "not exist yet. This is the same disclosure apps/trader/src/main.ts carries.",
-    ),
-    policy: {
-      /**
-       * The composition root's recorded answer, or a refusal — `main.ts`'s
-       * shape exactly. A silently assumed `FAK` would change every unfilled
-       * remainder's fate, so an order whose value was never recorded gets no
-       * guess. `SimulatedVenue.submit` contains this throw into a REFUSED
-       * `ExecutionResult`; it never escapes as an exception.
-       */
-      timeInForceFor(order: PlannedOrderView): TimeInForce {
-        const resolved = wiring.trader?.loop.timeInForceFor(order.plannedOrderId);
-        if (resolved === undefined) {
-          throw new Error(
-            `no time-in-force was recorded for planned order ${order.plannedOrderId}; the ` +
-              "composition root refuses to assume one (§12.1 ExecutionPolicy)",
-          );
-        }
-        return resolved;
-      },
-      statedExpiryNsFor(): bigint | undefined {
-        return undefined;
-      },
-      /**
-       * `"NOT_OBSERVED"`, as production answers. A book snapshot is an
-       * aggregate per level, so this scenario does not observe size added at a
-       * price in the same recorded instant; `"0"` would be a claim it never
-       * measured.
-       */
-      sameInstantAdditionsFor() {
-        return "NOT_OBSERVED" as const;
-      },
+      feeSchedule: fees.value,
+      startingCash: readString(simulation["startingCash"], "0"),
     },
-    startingCash: readString(simulation["startingCash"], "0"),
     ...(options.venueRetention === undefined ? {} : { retention: options.venueRetention }),
-    books: {
-      book(input): BookView | undefined {
-        const market = wiring.trader?.markets.get(input.marketId);
-        if (market === undefined) return undefined;
-        const tokenId = input.side === "YES" ? market.config.yesTokenId : market.config.noTokenId;
-        return {
-          internalMarketId: input.marketId,
-          tokenId,
-          top() {
-            const top = market.bookFor(input.side).topOfBook();
-            return {
-              ...(top.bestBidPrice === undefined ? {} : { bestBidPrice: top.bestBidPrice }),
-              ...(top.bestBidSize === undefined ? {} : { bestBidSize: top.bestBidSize }),
-              ...(top.bestAskPrice === undefined ? {} : { bestAskPrice: top.bestAskPrice }),
-              ...(top.bestAskSize === undefined ? {} : { bestAskSize: top.bestAskSize }),
-              ...(top.spread === undefined ? {} : { spread: top.spread }),
-            };
-          },
-          ladder(side) {
-            return market
-              .bookFor(input.side)
-              .levels(side)
-              .map((level) => ({ price: level.price, size: level.size }));
-          },
-        };
-      },
-    },
   });
+  if (!built.ok) {
+    throw new Error(
+      `the venue builder refused the fee snapshot the simulator had accepted: ${built.refusal.code}`,
+    );
+  }
+  const venue = built.venue;
 
   const result = createPaperTrader({
     env: options.env ?? paperEnvironment(),
@@ -227,7 +166,7 @@ export function assemble(options: AssembleOptions = {}): {
     accountingChecks: EVERY_FILL_ACCOUNTING_CHECKS,
   });
   if (!result.ok) return { result, parts: undefined };
-  wiring.trader = result.trader;
+  built.wiring.trader = result.trader;
   return { result, parts: { trader: result.trader, venue, store, feed, clock } };
 }
 

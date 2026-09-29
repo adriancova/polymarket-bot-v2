@@ -98,13 +98,6 @@
 import { readFile } from "node:fs/promises";
 
 import { RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
-import {
-  SimulatedVenue,
-  readFeeScheduleSnapshot,
-  tier0Model,
-  unmodeledRateLimits,
-  type BookView,
-} from "@polymarket-bot/simulation";
 import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
 
 import { verifyRegisteredRows } from "./adapters/postgres-registration.js";
@@ -124,6 +117,7 @@ import { pump } from "./pump.js";
 import { checkPaperTraderSafety } from "@polymarket-bot/trading-core";
 import { createPaperTrader, type PaperTrader } from "@polymarket-bot/trading-core";
 import { createExecutionPolicy, type VenueWiring } from "@polymarket-bot/trading-core";
+import { buildSimulatedVenue } from "@polymarket-bot/trading-core";
 
 export { createExecutionPolicy, type VenueWiring };
 
@@ -395,74 +389,27 @@ export async function assembleDurableTrader(
       "the configuration",
   );
 
-  const fees = readFeeScheduleSnapshot({
-    snapshotVersion: config.simulation.feeSchedule.snapshotVersion,
-    takerFeeRate: config.simulation.feeSchedule.takerFeeRate,
-    makerFeeRate: config.simulation.feeSchedule.makerFeeRate,
-    roundingDecimalPlaces: config.simulation.feeSchedule.roundingDecimalPlaces,
-    roundingMode: config.simulation.feeSchedule.roundingMode,
-    minimumChargedFee: config.simulation.feeSchedule.minimumChargedFee,
-    feeCurrency: config.simulation.feeSchedule.feeCurrency,
+  // The simulated venue, built by the core's ONE venue builder (`BACKTEST-2`,
+  // ADR-022 D5) — the construction that used to stand here, moved, so the
+  // backtest executable and every test harness build exactly this venue. It
+  // is built against a HOLDER (`built.wiring`) the trader fills the instant it
+  // exists; see the module header for why the venue may not answer either
+  // question itself.
+  const built = buildSimulatedVenue({
+    clock: options.clock,
+    settings: config.simulation,
+    log,
   });
-  if (!fees.ok) {
+  if (!built.ok) {
     log(
       `REFUSING TO START: the configured fee snapshot was refused by the simulator ` +
-        `(${fees.refusal.code}: ${fees.refusal.message}); a run without a valid fee snapshot ` +
+        `(${built.refusal.code}: ${built.refusal.message}); a run without a valid fee snapshot ` +
         "cannot charge a fee (§6 invariant 9)",
     );
     await store.close();
     return { ok: false, code: EXIT_CODES.configurationRefused };
   }
-
-  // The holder the venue's policy reads. Filled the instant the trader exists;
-  // see the module header for why the venue may not answer either question
-  // itself.
-  const wiring: VenueWiring = { trader: undefined };
-
-  const venue = new SimulatedVenue({
-    clock: options.clock,
-    runMode: "PAPER",
-    model: tier0Model({
-      fillModelVersion: config.simulation.fillModelVersion,
-      fillModelParametersHash: config.simulation.fillModelParametersHash,
-    }),
-    feeSnapshot: fees.value,
-    rateLimits: unmodeledRateLimits(
-      "no venue rate-limit budget is modelled: §9.13's budget is WP-310's package and does " +
-        "not exist yet. The trader's own §9.8 check-19 headroom is measured against the " +
-        "operator-stated requestBudget and is NOT the venue's published bucket.",
-    ),
-    policy: createExecutionPolicy(wiring, log),
-    startingCash: config.simulation.startingCash,
-    books: {
-      book(input): BookView | undefined {
-        const market = wiring.trader?.markets.get(input.marketId);
-        if (market === undefined) return undefined;
-        const tokenId =
-          input.side === "YES" ? market.config.yesTokenId : market.config.noTokenId;
-        return {
-          internalMarketId: input.marketId,
-          tokenId,
-          top() {
-            const top = market.bookFor(input.side).topOfBook();
-            return {
-              ...(top.bestBidPrice === undefined ? {} : { bestBidPrice: top.bestBidPrice }),
-              ...(top.bestBidSize === undefined ? {} : { bestBidSize: top.bestBidSize }),
-              ...(top.bestAskPrice === undefined ? {} : { bestAskPrice: top.bestAskPrice }),
-              ...(top.bestAskSize === undefined ? {} : { bestAskSize: top.bestAskSize }),
-              ...(top.spread === undefined ? {} : { spread: top.spread }),
-            };
-          },
-          ladder(side) {
-            return market
-              .bookFor(input.side)
-              .levels(side)
-              .map((level) => ({ price: level.price, size: level.size }));
-          },
-        };
-      },
-    },
-  });
+  const { venue, wiring } = built;
 
   // --- 4. the composition root ---------------------------------------------
   // `venue` is handed over UNCAST (`BOOT-1`): `TRDR-2` measured that

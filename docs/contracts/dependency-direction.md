@@ -873,6 +873,24 @@ move, and they net to +9:
 The core declares `zod` as its one external runtime dependency, and it imports
 no `node:` module, so it needs no §2.2 row.
 
+**The graph as of 2026-09-28, after `BACKTEST-2`** (recorded by `BACKTEST-2`;
+measured by running the check on the round's tree, base `main` `f8aedec`, and
+diffing its `--json` edge list against the base's): **35 workspace packages,
+90 declared workspace edges**, and it passes, with the §2.1 allowlist still
+exactly S0..S18 and every row matching a declared edge. The check reported 35
+packages and 89 edges at the base. The one change is `apps/backtest-cli` →
+`packages/trading-core` (layer 3 → layer 1, a `dependencies` entry): downward,
+so no §2.1 row, and not an edge into an application (F10). It is the edge
+ADR-022 D5 names: the backtest executable now builds the shared core itself
+(`apps/backtest-cli/src/assembly.ts`). No other edge was added or removed.
+Across row S15 the core's consumed surface of `packages/simulation` now
+includes the simulated-venue construction the row's `BACKTEST-2` sentence
+names, in `packages/trading-core/src/venue-builder.ts`: `SimulatedVenue`,
+`tier0Model`, `readFeeScheduleSnapshot`, `unmodeledRateLimits`, the `BookView`
+type, and the types of those calls' own inputs and results
+(`FeeScheduleSnapshot`, `RateLimitBudget`, `SimulatedVenueOptions`,
+`SimulationRefusal`).
+
 1. **Cycle detection.** Fail on any cycle in that graph. Non-zero exit, named
    cycle in the output. This is the rule §5.2 states literally, and it is what
    makes same-layer edges safe to permit at all (F9).

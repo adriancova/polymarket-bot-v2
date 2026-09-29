@@ -5,15 +5,19 @@
  * `createPaperTrader`, `CoreLoop`, and the modules in their import closure.
  * `CORE-MOVE` moved them here from `apps/trader/src`, byte for byte, under the
  * user's H8 ruling (option A, 2026-09-28). `apps/trader` still assembles and
- * runs this core on live data, and `apps/backtest-cli` is to build it from
+ * runs this core on live data, and `apps/backtest-cli` builds it from
  * `BACKTEST-2` on; both depend on it downward.
  *
  * The export blocks below are `apps/trader/src/index.ts`'s blocks for these
- * modules as they stood at `ac0b12f`, verbatim and in the same order. Two
+ * modules as they stood at `ac0b12f`, verbatim and in the same order. Four
  * blocks follow them:
  * - the venue policy cut from `apps/trader/src/main.ts` (`venue-policy.ts`);
  * - `unreplacedPnlSnapshotProblem`, which the trader's PostgreSQL store
- *   imports.
+ *   imports;
+ * - `BACKTEST-2`'s ONE simulated-venue builder (`venue-builder.ts`, ADR-022
+ *   D5), which every composition root and test harness calls;
+ * - `BACKTEST-2`'s production in-memory store (`memory-store.ts`), which the
+ *   backtest executable builds the core over.
  *
  * `@polymarket-bot/trader` and `@polymarket-bot/trader/testing` still export
  * every name they exported before the move, under the same name and kind,
@@ -265,3 +269,19 @@ export {
 export { createExecutionPolicy, type VenueWiring } from "./venue-policy.js";
 
 export { unreplacedPnlSnapshotProblem } from "./pnl-snapshot-key.js";
+
+export {
+  UNMODELED_VENUE_RATE_LIMITS_DISCLOSURE,
+  buildSimulatedVenue,
+  type SimulatedVenueBuild,
+  type SimulatedVenueBuildOptions,
+  type SimulatedVenueSettings,
+} from "./venue-builder.js";
+
+export {
+  IN_MEMORY_DUPLICATE_PNL_SNAPSHOT_DETAIL,
+  IN_MEMORY_MISSING_PNL_SNAPSHOT_DETAIL,
+  IN_MEMORY_STORE_CLOSED_DETAIL,
+  InMemoryTraderStore,
+  type RecordedDecision,
+} from "./memory-store.js";

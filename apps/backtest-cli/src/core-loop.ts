@@ -16,24 +16,24 @@
  * input and the `ExecutionVenue` interface is shared with the live path." The
  * loop is not constructed here (see below); it is DRIVEN here.
  *
- * ## The core is taken structurally, and why it is not constructed here
+ * ## The core is taken structurally, and who constructs it
  *
  * The shared core — books, features, the strategy runtime, Static Bracket,
  * the allocator, the risk engine, the planner, the ledger and the PnL fold —
- * is assembled by `apps/trader`'s `createPaperTrader`, whose own `ports.ts`
- * states the design: "the difference between a PAPER run against Redis and a
- * BACKTEST replay against a dataset is which implementations are handed to
- * `createPaperTrader` — not a second code path". That composition lives in a
- * layer-3 application, and `docs/contracts/dependency-direction.md` §2 rules
- * that "Nothing may depend on an app" (`check:deps` F13). So this app cannot
- * import it, and a second loop written here would be exactly the second code
- * path §12.1 forbids. {@link ReplayDrivenLoop} is therefore the STRUCTURAL
- * surface of `apps/trader`'s `CoreLoop` — the two methods `pump.ts` calls —
- * and the caller that holds both apps (today: the replay-golden suite under
- * `test/unit/simulation/`) hands the real loop in. Moving the composition
- * below layer 3 so that the CLI binary can construct it itself is the
- * follow-up the BACKTEST-1 round records in its handoff; nothing here changes
- * when it lands except who calls {@link replayDrivenCoreLoop}.
+ * is assembled by `createPaperTrader`, which lives in the layer-1 package
+ * `@polymarket-bot/trading-core` since `CORE-MOVE` (ADR-022). Its own
+ * `ports.ts` states the design: "the difference between a PAPER run against
+ * Redis and a BACKTEST replay against a dataset is which implementations are
+ * handed to `createPaperTrader` — not a second code path". Since `BACKTEST-2`
+ * this app depends on that package downward (layer 3 → layer 1) and its `run`
+ * command constructs the core itself (`assembly.ts`), so a second loop
+ * written here would be exactly the second code path §12.1 forbids.
+ * {@link ReplayDrivenLoop} stays the STRUCTURAL surface of the core's
+ * `CoreLoop` — the methods `pump.ts` calls, plus the end-of-run check — so the
+ * driver's own contract can be pinned against a double (`core-loop.test.ts`);
+ * the real `CoreLoop` satisfies it uncast, which `assembly.ts` shows by
+ * handing it in. The one caller that builds this driver in shipped code is
+ * that assembly.
  *
  * ## Time enters only from recorded events
  *
@@ -46,18 +46,37 @@
  * process did not know at the same point). A monotonic regression is the
  * clock's refusal (`REPLAY_CLOCK_NOT_MONOTONE`) and stops the run.
  *
- * ## A halt inside the core does not stop the replay
+ * ## A halt inside the core STOPS the replay, as it stops the live pump (BT1-R3)
  *
- * `apps/trader`'s loop latches halts and gates its own decisions on them; the
- * accounting is deliberately not gated ("the books stay truthful; the strategy
- * does not act"). The live pump RETURNS on a halt so the process can exit for
- * an operator. A replay's operator reads the artefact, so this driver keeps
- * delivering every recorded event and the halt records reach the artefact
- * through the loop's own health surface — a halted replay is reported as a
- * halted replay, never silently as a short one (§8.3). The ONE thing that does
- * stop the run is the loop REFUSING an event at its bounded ingest queue: §8.3
- * forbids dropping it, the loop has already latched `QUEUE_BACKPRESSURE`, and
- * continuing would replay a stream with a hole in it.
+ * The core latches halts and gates its own decisions on them; its accounting
+ * is deliberately not gated ("the books stay truthful; the strategy does not
+ * act"). The live pump RETURNS `HALTED` at a latched halt, at two points —
+ * before it polls, when one is already latched (`apps/trader/src/pump.ts:84-86`),
+ * and after the drain that latched one (`:127-130`) — so the process stops
+ * feeding a core that may no longer decide. `BACKTEST-1` left this driver
+ * delivering every recorded event after a halt, so fills for orders resting at
+ * the venue could still book into a halted core, which the pump never lets
+ * happen, and no test pinned it (BT1-R3).
+ *
+ * DECIDED (`BACKTEST-2`): this driver stops at the SAME two points, given the
+ * core's halt latch (`halts`, the pump's own option). It refuses to ingest a
+ * recorded event into a core that is already halted, and it stops the replay
+ * after the drain that latched a halt. The stop is a refusal of the run
+ * (`SIMULATION_INTERNAL`, the code the backpressure stop below already uses)
+ * naming every latched halt as `CODE@SCOPE` and the event it stopped at, so a
+ * halted replay is reported as a halted replay, never silently as a short one
+ * (§8.3). No later recorded event reaches the core or the venue: `runReplay`
+ * returns at the first refusal its hook answers. `runBacktest` still runs the
+ * core's end-of-run accounting check once, as for any run refused part-way.
+ *
+ * A caller that hands NO `halts` gets no halt stop — the driver cannot see a
+ * latch it was not given — and keeps `BACKTEST-1`'s behaviour. The shipped
+ * caller, the `run` command's assembly (`assembly.ts`), always hands the
+ * core's own `trader.halts`.
+ *
+ * The other stop is unchanged: the loop REFUSING an event at its bounded
+ * ingest queue. §8.3 forbids dropping it, the loop has already latched
+ * `QUEUE_BACKPRESSURE`, and continuing would replay a stream with a hole in it.
  */
 
 import {
@@ -75,11 +94,11 @@ import {
  * One event as the core loop receives it: the §7.1 envelope plus the recorded
  * identity every simulated outcome is anchored to.
  *
- * Structurally `apps/trader`'s `IngestedEvent` (`ports.ts`), restated here
- * because this app may not import that one (see the module header). Both are
- * built from `packages/simulation`'s own `EventEnvelope` and
- * `RecordedEventIdentity`, so the two declarations cannot drift on any field
- * the core reads.
+ * Structurally the core's `IngestedEvent` (`@polymarket-bot/trading-core`
+ * `ports.ts`), restated here so the driver's contract can be pinned against a
+ * double (see the module header). Both are built from `packages/simulation`'s
+ * own `EventEnvelope` and `RecordedEventIdentity`, so the two declarations
+ * cannot drift on any field the core reads.
  */
 export interface ReplayIngestedEvent {
   readonly envelope: EventEnvelope<unknown>;
@@ -87,8 +106,8 @@ export interface ReplayIngestedEvent {
 }
 
 /**
- * The two methods of the shared core this driver calls — the same two
- * `apps/trader/src/pump.ts` calls on `CoreLoop`.
+ * The methods of the shared core this driver calls — the two
+ * `apps/trader/src/pump.ts` calls on `CoreLoop`, and the end-of-run check.
  *
  * `ingest` offers one event to the loop's bounded queue and answers whether it
  * was accepted; `drain` processes every queued event in delivery order and
@@ -98,7 +117,7 @@ export interface ReplayDrivenLoop {
   ingest(event: ReplayIngestedEvent): boolean;
   drain(): Promise<void>;
   /**
-   * `FOLD-1` — the core's END-OF-RUN accounting rebuild check (`apps/trader`'s
+   * `FOLD-1` — the core's END-OF-RUN accounting rebuild check (the core's
    * `CoreLoop.checkAccountingRebuild`: its held ledger view, and its PnL
    * streams when that core checks them, against a rebuild from zero; a
    * mismatch latches the core's own GLOBAL halt).
@@ -111,15 +130,40 @@ export interface ReplayDrivenLoop {
   checkAccountingRebuild(trigger: "END_OF_RUN"): unknown;
 }
 
+/**
+ * The core's halt latch, as far as this driver reads it — structurally the
+ * core's `HaltController` (`trader.halts`), which `pump.ts` takes as `halts`.
+ */
+export interface ReplayDriverHalts {
+  /** True when the core is halted at any scope at all — the pump's own test. */
+  readonly anyHalt: boolean;
+  /** Every latched halt, for the refusal that names them. */
+  records(): readonly { readonly code: string; readonly scope: { readonly kind: string } }[];
+}
+
 /** Inputs to {@link replayDrivenCoreLoop}. */
 export interface ReplayDrivenCoreLoopOptions {
-  /** The shared core — `apps/trader`'s `CoreLoop`, taken structurally. */
+  /** The shared core — the core's `CoreLoop`, taken structurally. */
   readonly loop: ReplayDrivenLoop;
   /**
    * The §12.1 clock the core was constructed with. It is advanced to each
    * recorded event here, before the event is ingested.
    */
   readonly clock: ReplayClock;
+  /**
+   * BT1-R3: the core's halt latch (`trader.halts`). Given, the driver stops
+   * the replay where the live pump returns `HALTED` (module header). Absent,
+   * it cannot see a halt and delivers every recorded event.
+   */
+  readonly halts?: ReplayDriverHalts;
+}
+
+/** The latched halts, as `CODE@SCOPE`, in the latch's own stable order. */
+function describeHalts(halts: ReplayDriverHalts): string {
+  return halts
+    .records()
+    .map((record) => `${record.code}@${record.scope.kind}`)
+    .join(",");
 }
 
 /** What the driver counted, for a report. Never used to make a decision. */
@@ -184,9 +228,34 @@ export function replayDrivenCoreLoop(options: ReplayDrivenCoreLoopOptions): Repl
   let eventsIngested = 0;
   let drains = 0;
 
+  const halts = options.halts;
+  // Read LIVE on every call: the drain between the two reads can latch one.
+  const halted = (): boolean => halts?.anyHalt === true;
+  const haltedAt = (
+    context: ReplayEventContext,
+    when: "before ingesting" | "after draining",
+  ): SimulationResult<null> =>
+    simulationFailure(
+      "SIMULATION_INTERNAL",
+      `the shared core is halted (${halts === undefined ? "" : describeHalts(halts)}) ${when} this ` +
+        "recorded event; the live pump returns HALTED at this point (apps/trader/src/pump.ts), so the " +
+        "replay stops here rather than feeding a halted core the rest of the recording (BT1-R3)",
+      {
+        halts: halts === undefined ? "" : describeHalts(halts),
+        stoppedAt: when === "before ingesting" ? "BEFORE_INGEST" : "AFTER_DRAIN",
+        eventId: context.envelope.eventId,
+        eventType: context.envelope.eventType,
+        ingestSeq: context.identity.ingestSeq,
+        datasetRowOrdinal: context.identity.datasetRowOrdinal,
+      },
+    );
+
   const coreLoop: ReplayCoreLoop = async (
     context: ReplayEventContext,
   ): Promise<SimulationResult<null>> => {
+    // `pump.ts:84-86`: a latched halt stops the pump before it polls again.
+    if (halted()) return haltedAt(context, "before ingesting");
+
     const advanced = options.clock.advanceTo({
       receivedAt: context.record.frame.receivedAt,
       receivedMonotonicNs: context.record.frame.receivedMonotonicNs,
@@ -215,6 +284,8 @@ export function replayDrivenCoreLoop(options: ReplayDrivenCoreLoopOptions): Repl
 
     await options.loop.drain();
     drains += 1;
+    // `pump.ts:127-130`: the drain that latched a halt is the pump's last.
+    if (halted()) return haltedAt(context, "after draining");
     return simulationOk(null);
   };
 

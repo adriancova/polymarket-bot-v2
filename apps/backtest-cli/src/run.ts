@@ -13,18 +13,17 @@
  *   normalizer, positions the injected simulated venue at each one, hands each
  *   one to the injected `coreLoop`, and emits the §12.4 canonical serialization
  *   — which carries the orders, fills and economics that venue produced.
- * - It does NOT construct the trading core, and it cannot. Books, features,
- *   the strategy runtime, risk, the allocator, the planner and the ledger are
- *   wired by `WP-230` into `apps/trader`'s `createPaperTrader`, and
- *   `docs/contracts/dependency-direction.md` §2 rules that nothing may depend on
- *   an app. What this app ships is the DRIVER of that core
- *   ({@link ./core-loop.js}: replay clock → `ingest` → `drain`, the live
- *   pump's own order), so a caller holding both apps hands the real core in
- *   and every recorded event reaches the same decision/risk/planning/ledger
- *   path the paper trader runs. At base `1aa2238` the hook below had NO
- *   producer anywhere in the repository (GOV-2B B3); the composition root's
- *   half of the fix is here, and the fixture-driven proof is
- *   `test/unit/simulation/backtest-static-bracket-replay.test.ts`.
+ * - It does NOT construct the trading core; it DRIVES one. The core — books,
+ *   features, the strategy runtime, risk, the allocator, the planner and the
+ *   ledger, wired by `createPaperTrader` — lives in the layer-1 package
+ *   `@polymarket-bot/trading-core` (ADR-022), and since `BACKTEST-2` this
+ *   app's `run` command builds it itself ({@link ./assembly.js}) and hands
+ *   this function the driver's `coreLoop` ({@link ./core-loop.js}: replay
+ *   clock → `ingest` → `drain`, the live pump's own order), so every recorded
+ *   event reaches the same decision/risk/planning/ledger path the paper
+ *   trader runs. At base `1aa2238` the hook below had NO producer anywhere in
+ *   the repository (GOV-2B B3); `BACKTEST-1` shipped the driver and
+ *   `BACKTEST-2` the executable's own assembly.
  */
 
 import {
@@ -59,9 +58,9 @@ export interface BacktestRunOptions {
   readonly environment: Readonly<Record<string, string | undefined>>;
   /**
    * The shared core, driven per recorded event. Build it with
-   * {@link ./core-loop.js#replayDrivenCoreLoop} over the real loop. Absent
-   * means "verify and drive only" — the base-`1aa2238` behaviour, kept for
-   * `verify`, which is what the CLI's own executable still runs today.
+   * {@link ./core-loop.js#replayDrivenCoreLoop} over the real loop — the `run`
+   * command's assembly ({@link ./assembly.js}) does. Absent means "verify and
+   * drive only" — the base-`1aa2238` behaviour, kept for `verify`.
    *
    * `FOLD-1` (`FOLD1-R1-3`): the driver BINDS the core's end-of-run
    * accounting rebuild check to the `coreLoop` it builds, and this run calls
@@ -81,6 +80,15 @@ export interface BacktestRunOptions {
    * replay that produced decisions shows them as bytes, not as a claim.
    */
   readonly venue?: SimulatedVenue;
+  /**
+   * `BACKTEST-2`: the dataset manifest, already read through its door
+   * (`readDatasetManifestBytes`) from THIS directory by a caller that needed
+   * it first — the `run` command starts the core's replay clock at the
+   * manifest's first recorded instant, before the core exists. Absent, the
+   * manifest is read here. Either way every object it pins is read from
+   * `datasetDirectory` and verified against its checksum below.
+   */
+  readonly dataset?: ReplayDataset;
 }
 
 /** What a backtest run produced, or why it did not run. */
@@ -113,11 +121,12 @@ export async function runBacktest(options: BacktestRunOptions): Promise<Backtest
   const pins = readRunPins(options.runPins);
   if (!pins.ok) return { ok: false, refusal: pins.refusal };
 
-  const manifestBytes = await readManifestBytes(
-    options.datasetDirectory,
-    options.manifestFileName ?? DATASET_MANIFEST_OBJECT_NAME,
-  );
-  const dataset: SimulationResult<ReplayDataset> = readDatasetManifestBytes(manifestBytes);
+  const dataset: SimulationResult<ReplayDataset> =
+    options.dataset === undefined
+      ? readDatasetManifestBytes(
+          await readManifestBytes(options.datasetDirectory, options.manifestFileName ?? DATASET_MANIFEST_OBJECT_NAME),
+        )
+      : { ok: true, value: options.dataset };
   if (!dataset.ok) return { ok: false, refusal: dataset.refusal };
 
   const result = await runReplay({

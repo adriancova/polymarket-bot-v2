@@ -13,9 +13,12 @@
  *
  * `Clock`, `MarketEventSource` and `ExecutionVenue` are DECLARED by
  * `packages/simulation` (`WP-210` deviation 3: the three §12.1 port interfaces
- * landed there, consumed only from layer 3), so this module imports them rather
- * than restating them — a restatement is a shape that can drift from the one
- * the simulated venue actually implements.
+ * landed there). This layer-1 package consumes them across
+ * `dependency-direction.md` §2.1 row S15 (ADR-022), and the two composition
+ * roots that build the core — `apps/trader` and, from `BACKTEST-2` on,
+ * `apps/backtest-cli` — hand in the implementations. So this module imports
+ * them rather than restating them — a restatement is a shape that can drift
+ * from the one the simulated venue actually implements.
  *
  * The two ports this module ADDS are the ones §12.1 does not name because they
  * are not simulation seams: the durable store (§10, PostgreSQL) and the event
