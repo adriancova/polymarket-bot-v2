@@ -380,6 +380,118 @@ export async function startRedisProxy(targetUrl: string): Promise<RedisProxy> {
   };
 }
 
+/** A local hop that can go SILENT without closing anything (`OUTAGE-1`). */
+export type FreezableRedisProxy = RedisProxy & {
+  /**
+   * From now on nothing is forwarded in either direction and nothing is
+   * closed. A connection opened while frozen is accepted and then held
+   * silent. Bytes already sent wait, unread, until {@link thaw}.
+   */
+  freeze(): void;
+  /** Forwards again, including what waited while frozen (a partition that heals). */
+  thaw(): void;
+};
+
+/**
+ * Puts a local TCP hop in front of the test server that a test can FREEZE.
+ *
+ * This is the outage {@link startRedisProxy} cannot produce. Closing a hop is
+ * a fault the client SEES: a close event, then refused reconnections. A
+ * frozen hop is a fault it does not see. The sockets stay open, the TCP
+ * handshake of a new connection still completes, and no reply ever arrives.
+ * That is what a network partition or a paused server (`docker pause`) looks
+ * like from the client, and the only thing that bounds it is a deadline on
+ * the reply. This helper lets that deadline be tested without stopping or
+ * pausing the container every other test in the run shares.
+ */
+export async function startFreezableRedisProxy(targetUrl: string): Promise<FreezableRedisProxy> {
+  const target = new URL(targetUrl);
+  const targetHost = target.hostname;
+  const targetPort = Number(target.port);
+
+  type Pair = { readonly incoming: Socket; upstream: Socket | undefined };
+  const pairs = new Set<Pair>();
+  let frozen = false;
+
+  const drop = (pair: Pair): void => {
+    pairs.delete(pair);
+    pair.incoming.destroy();
+    pair.upstream?.destroy();
+  };
+  const forward = (pair: Pair): void => {
+    let upstream = pair.upstream;
+    if (upstream === undefined) {
+      const opened = createConnection({ host: targetHost, port: targetPort });
+      pair.upstream = opened;
+      // A destroyed socket emits `error`; without a listener that becomes an
+      // unhandled emitter error and takes the test run down.
+      opened.on("error", () => {
+        drop(pair);
+      });
+      opened.on("close", () => {
+        drop(pair);
+      });
+      upstream = opened;
+    }
+    pair.incoming.pipe(upstream);
+    upstream.pipe(pair.incoming);
+  };
+  const silence = (pair: Pair): void => {
+    // `unpipe` stops the flow; `pause` keeps what is already buffered from
+    // being read, so it is delivered on `thaw` rather than lost.
+    pair.incoming.unpipe();
+    pair.incoming.pause();
+    pair.upstream?.unpipe();
+    pair.upstream?.pause();
+  };
+
+  const server = createServer((incoming: Socket) => {
+    const pair: Pair = { incoming, upstream: undefined };
+    pairs.add(pair);
+    incoming.on("error", () => {
+      drop(pair);
+    });
+    incoming.on("close", () => {
+      drop(pair);
+    });
+    if (frozen) {
+      incoming.pause();
+      return;
+    }
+    forward(pair);
+  });
+
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("the proxy did not bind to a port");
+  }
+
+  return {
+    url: `redis://127.0.0.1:${String(address.port)}`,
+    freeze: () => {
+      if (frozen) return;
+      frozen = true;
+      for (const pair of pairs) silence(pair);
+    },
+    thaw: () => {
+      if (!frozen) return;
+      frozen = false;
+      for (const pair of pairs) forward(pair);
+    },
+    close: async () => {
+      for (const pair of [...pairs]) drop(pair);
+      await new Promise<void>((resolve) => {
+        server.close(() => {
+          resolve();
+        });
+      });
+    },
+  };
+}
+
 /**
  * A connection URL for a throwaway account that may not run some commands.
  *

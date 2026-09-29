@@ -13,7 +13,8 @@
  * 1. checkPaperTraderSafety(env)        ← §6 invariant 17, §15, ADR-010
  * 2. read and parse the configuration    ← ADR-020 D1-D4
  * 2b. readHealthServerEnv(env)           ← TRDR-3: loopback-only, or no endpoint, stated
- * 3. construct the infrastructure        ← Redis, PostgreSQL
+ * 2c. readRedisResponseTimeout(env)      ← OUTAGE-1: the Redis outage bound, stated
+ * 3. construct the infrastructure        ← Redis (refused with 69 if unreachable), PostgreSQL
  * 3b. verifyRegisteredRows(db, config)   ← BOOT-1: the rows every durable write references
  * 4. the simulated venue, then
  *    createPaperTrader(...)              ← the composition root
@@ -71,6 +72,38 @@
  * the snapshot the endpoint serves carries `accounting.realizedPnl` — the PnL
  * engine's own value, observed at the store port.
  *
+ * ## The Redis boundary, at startup and mid-run (`OUTAGE-1`)
+ *
+ * §4.2: "A Redis outage stops publication and therefore halts trading." Two
+ * halves, both measured before this round and neither held:
+ *
+ * - **Unreachable at startup** (`B1-R1-REDIS-UNCAUGHT`). `connect` rejected
+ *   with an uncaught `EventBusUnavailableError`: a stack trace and exit 1,
+ *   against this function's own "Never throws". It is now a logged
+ *   `REFUSING TO START: TRADER_REDIS_UNAVAILABLE` and
+ *   {@link EXIT_CODES.infrastructureUnavailable} (69), the PostgreSQL
+ *   boundary's code, because the remedy is the same class: nothing in the
+ *   document is wrong, a dependency is unreachable. It is refused before any
+ *   database pool exists. A URL the transport refuses outright (a wrong
+ *   scheme) is a configuration refusal instead (`TRADER_REDIS_URL_REFUSED`,
+ *   78). A subscription the transport refuses is the same pair:
+ *   unreachable → 69, anything else → `TRADER_EVENT_SUBSCRIPTION_REFUSED`, 78.
+ * - **An outage mid-run** (`BOOT1-R7`). The process HUNG: with the container
+ *   stopped under the real `startup()`, the pump's `receive` was still pending
+ *   90 s later (reproduced by `OUTAGE-1` before the fix). The cause is in the
+ *   Redis client, and so is the fix (`packages/event-bus`
+ *   `responseTimeoutMs`). This file states the bound and passes it:
+ *   `TRADER_REDIS_RESPONSE_TIMEOUT_MS` (T; default 5000, accepted
+ *   100…60000, anything else a refusal before anything is opened). The pump
+ *   latches GLOBAL `TRANSPORT_UNAVAILABLE` (`FULL_HALT`) within T of the
+ *   first Redis command the outage leaves unanswered. `startup()` then
+ *   returns {@link EXIT_CODES.halted} (75) within 3T of that command: T for
+ *   the halt, plus at most T for each of the two connections' courtesy
+ *   `QUIT`, which is sent only to a connection that still reports itself
+ *   ready. Add the PostgreSQL close and the shutdown rebuild check, neither
+ *   of which waits on Redis. An idle stream never trips it: an idle poll is
+ *   answered in milliseconds.
+ *
  * ## The two-phase venue wiring, and why it is not a smell
  *
  * The simulated venue asks the composition root two questions it cannot answer
@@ -97,7 +130,13 @@
 
 import { readFile } from "node:fs/promises";
 
-import { RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
+import {
+  DEFAULT_RESPONSE_TIMEOUT_MS,
+  EventBusConfigurationError,
+  EventBusUnavailableError,
+  RedisStreamsEventTransport,
+  type EventSubscription,
+} from "@polymarket-bot/event-bus";
 import { createDatabase, createPostgresPool } from "@polymarket-bot/storage-postgres";
 
 import { verifyRegisteredRows } from "./adapters/postgres-registration.js";
@@ -128,7 +167,12 @@ export const EXIT_CODES = Object.freeze({
   unsafeEnvironment: 78,
   /** The configuration was refused. */
   configurationRefused: 78,
-  /** A halt latched: no further trading decision will be made (§4.2). */
+  /**
+   * A halt latched: no further trading decision will be made (§4.2).
+   *
+   * `OUTAGE-1`: also the exit of a Redis outage MID-RUN, within the bound
+   * `TRADER_REDIS_RESPONSE_TIMEOUT_MS` states (see the module header).
+   */
   halted: 75,
   /**
    * The database could not answer the startup registration check (`BOOT-1`).
@@ -137,6 +181,10 @@ export const EXIT_CODES = Object.freeze({
    * the operator's remedy differs — nothing in the document is wrong, the
    * store is unreachable — and distinct from `halted` because no halt latched:
    * the process never started.
+   *
+   * `OUTAGE-1`: also the event transport (Redis) unreachable at startup
+   * (`TRADER_REDIS_UNAVAILABLE`), for the same reason and with the same
+   * remedy class.
    */
   infrastructureUnavailable: 69,
 });
@@ -202,6 +250,22 @@ export async function startup(ports: StartupPorts): Promise<number> {
           "(loopback only, read only) once the trader is assembled",
   );
 
+  // --- 2c. the Redis outage bound (OUTAGE-1), before anything is opened -----
+  const redisBound = readRedisResponseTimeout(ports.env);
+  if (!redisBound.ok) {
+    ports.log(`REFUSING TO START: ${redisBound.refusal.code}: ${redisBound.refusal.detail}`);
+    return EXIT_CODES.configurationRefused;
+  }
+  const responseTimeoutMs = redisBound.responseTimeoutMs;
+  ports.log(
+    `event transport bound: every Redis command must answer within ${String(responseTimeoutMs)} ms ` +
+      `(${REDIS_RESPONSE_TIMEOUT_ENV}${redisBound.defaulted ? ` unset; the default` : ""}); a Redis ` +
+      "outage latches a GLOBAL TRANSPORT_UNAVAILABLE halt within that bound of the first command it " +
+      `leaves unanswered, and the process exits ${String(EXIT_CODES.halted)} at most ` +
+      `${String(2 * responseTimeoutMs)} ms after the halt (one bound for each connection's courtesy ` +
+      "QUIT) plus the PostgreSQL close (§4.2)",
+  );
+
   // --- 3. infrastructure ----------------------------------------------------
   const redisUrl = ports.env["REDIS_URL"];
   const postgresUrl = ports.env["DATABASE_URL"];
@@ -218,10 +282,36 @@ export async function startup(ports: StartupPorts): Promise<number> {
   // bound and opens its connection in one act, so a bad bound is a startup
   // refusal rather than a first-publish surprise (ADR-003: "Retention size is a
   // safety parameter, not a tuning knob").
-  const transport = await RedisStreamsEventTransport.connect({
-    connection: { url: redisUrl },
-    retention: { maxEvents: config.infrastructure.retentionMaxEvents },
-  });
+  //
+  // `OUTAGE-1` (`B1-R1-REDIS-UNCAUGHT`): contained. An unreachable Redis used
+  // to escape this function as an uncaught `EventBusUnavailableError`.
+  const redisEndpoint = describeEndpoint(redisUrl);
+  let transport: RedisStreamsEventTransport;
+  try {
+    transport = await RedisStreamsEventTransport.connect({
+      connection: { url: redisUrl, responseTimeoutMs },
+      retention: { maxEvents: config.infrastructure.retentionMaxEvents },
+    });
+  } catch (cause) {
+    if (cause instanceof EventBusConfigurationError) {
+      ports.log(
+        `REFUSING TO START: TRADER_REDIS_URL_REFUSED: the event transport refused its settings ` +
+          `(REDIS_URL ${redisEndpoint}, retentionMaxEvents ` +
+          `${String(config.infrastructure.retentionMaxEvents)}); nothing was connected`,
+      );
+      ports.log(`  ${describeError(cause)}`);
+      return EXIT_CODES.configurationRefused;
+    }
+    ports.log(
+      `REFUSING TO START: TRADER_REDIS_UNAVAILABLE: the event transport (Redis) at ` +
+        `${redisEndpoint} could not be reached. §4.2 makes Redis a trading-halt boundary, so ` +
+        "the process refuses rather than starts without it (fail closed). No database connection " +
+        "was opened and no row was read",
+    );
+    ports.log(`  ${describeError(cause)}`);
+    return EXIT_CODES.infrastructureUnavailable;
+  }
+  ports.log(`event transport: connected to ${redisEndpoint}`);
 
   // --- 3b + 4. the durable store, the registration check, the venue, the root
   const assembled = await assembleDurableTrader({
@@ -240,10 +330,34 @@ export async function startup(ports: StartupPorts): Promise<number> {
   const { store, trader, healthServer } = assembled;
 
   // --- 5. the pump ----------------------------------------------------------
-  const subscription = await transport.subscribe({
-    stream: config.infrastructure.eventStream,
-    consumerId: config.infrastructure.consumerId,
-  });
+  // `OUTAGE-1`: the subscription is Redis too, and is contained the same way.
+  // A refusal here closes everything opened above before it returns.
+  let subscription: EventSubscription<unknown>;
+  try {
+    subscription = await transport.subscribe({
+      stream: config.infrastructure.eventStream,
+      consumerId: config.infrastructure.consumerId,
+    });
+  } catch (cause) {
+    const unavailable = cause instanceof EventBusUnavailableError;
+    ports.log(
+      unavailable
+        ? `REFUSING TO START: TRADER_REDIS_UNAVAILABLE: the event transport (Redis) at ` +
+            `${redisEndpoint} stopped answering while the subscription to ` +
+            `${config.infrastructure.eventStream} was opened (§4.2, fail closed); nothing was ` +
+            "consumed and no decision was made"
+        : `REFUSING TO START: TRADER_EVENT_SUBSCRIPTION_REFUSED: the event transport refused the ` +
+            `subscription of consumer ${config.infrastructure.consumerId} to ` +
+            `${config.infrastructure.eventStream} (for example a stored position it cannot resume ` +
+            "from, which ADR-003 §3.3/§3.4 make a refusal rather than a reposition); nothing was " +
+            "consumed and no decision was made",
+    );
+    ports.log(`  ${describeError(cause)}`);
+    await healthServer?.close();
+    await store.close();
+    await transport.close();
+    return unavailable ? EXIT_CODES.infrastructureUnavailable : EXIT_CODES.configurationRefused;
+  }
   const feed = new RedisMarketEventFeed({
     subscription,
     maxEvents: config.infrastructure.receiveBatchSize,
@@ -466,6 +580,91 @@ export async function assembleDurableTrader(
     );
   }
   return { ok: true, trader: created.trader, store, healthServer };
+}
+
+/** The environment variable that states the Redis outage bound (`OUTAGE-1`). */
+export const REDIS_RESPONSE_TIMEOUT_ENV = "TRADER_REDIS_RESPONSE_TIMEOUT_MS";
+
+/**
+ * The accepted range for {@link REDIS_RESPONSE_TIMEOUT_ENV}, in milliseconds.
+ *
+ * The floor keeps a garbage-collection pause from reading as an outage. The
+ * ceiling keeps the bound in seconds: a process that waits a minute on a dead
+ * transport has spent that minute looking alive while deciding nothing.
+ */
+export const REDIS_RESPONSE_TIMEOUT_RANGE = Object.freeze({ minimumMs: 100, maximumMs: 60_000 });
+
+export type RedisResponseTimeoutResult =
+  | {
+      readonly ok: true;
+      readonly responseTimeoutMs: number;
+      /** `true` when the variable was unset and the transport's default applies. */
+      readonly defaulted: boolean;
+    }
+  | {
+      readonly ok: false;
+      readonly refusal: { readonly code: "TRADER_REDIS_RESPONSE_TIMEOUT_REFUSED"; readonly detail: string };
+    };
+
+/**
+ * Reads {@link REDIS_RESPONSE_TIMEOUT_ENV}. TOTAL: never throws.
+ *
+ * Unset (or empty) is the transport's own default, `DEFAULT_RESPONSE_TIMEOUT_MS`
+ * (5000), so the process never runs WITHOUT a bound. A set value must be a
+ * canonical decimal integer inside {@link REDIS_RESPONSE_TIMEOUT_RANGE}.
+ * Anything else is refused rather than clamped, because a clamped bound is one
+ * nobody chose. Read as an OWN property only, as `health-server.ts` reads its
+ * variables.
+ */
+export function readRedisResponseTimeout(
+  env: Readonly<Record<string, string | undefined>>,
+): RedisResponseTimeoutResult {
+  const descriptor = Object.hasOwn(env, REDIS_RESPONSE_TIMEOUT_ENV)
+    ? Object.getOwnPropertyDescriptor(env, REDIS_RESPONSE_TIMEOUT_ENV)
+    : undefined;
+  const raw: unknown = descriptor?.value;
+  if (raw === undefined || raw === "") {
+    return { ok: true, responseTimeoutMs: DEFAULT_RESPONSE_TIMEOUT_MS, defaulted: true };
+  }
+  const { minimumMs, maximumMs } = REDIS_RESPONSE_TIMEOUT_RANGE;
+  const value = typeof raw === "string" && /^[1-9]\d{0,5}$/u.test(raw) ? Number(raw) : Number.NaN;
+  if (!(value >= minimumMs && value <= maximumMs)) {
+    return {
+      ok: false,
+      refusal: {
+        code: "TRADER_REDIS_RESPONSE_TIMEOUT_REFUSED",
+        detail:
+          `${REDIS_RESPONSE_TIMEOUT_ENV}=${typeof raw === "string" ? JSON.stringify(raw) : typeof raw} ` +
+          `is not an integer number of milliseconds in [${String(minimumMs)}, ${String(maximumMs)}]; ` +
+          "it bounds how long the process may wait on an unanswering Redis before it halts (§4.2), " +
+          "and a bound the operator did not state correctly is refused rather than guessed",
+      },
+    };
+  }
+  return { ok: true, responseTimeoutMs: value, defaulted: false };
+}
+
+/**
+ * A connection URL as `scheme://host:port`, for a log line.
+ *
+ * Never the userinfo: a `REDIS_URL` may carry an account and a secret, and a
+ * refusal an operator pastes into a ticket must not carry either.
+ */
+function describeEndpoint(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return "(a value that is not a URL)";
+  }
+}
+
+/** An error and its cause chain, one line, bounded (a cyclic chain cannot grow it). */
+function describeError(error: unknown, depth = 0): string {
+  if (!(error instanceof Error)) return String(error);
+  const own = `${error.name}: ${error.message}`;
+  if (error.cause === undefined || depth >= 2) return own;
+  return `${own}; caused by ${describeError(error.cause, depth + 1)}`;
 }
 
 type ReadConfigurationResult =

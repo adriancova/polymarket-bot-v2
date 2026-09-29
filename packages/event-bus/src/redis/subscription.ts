@@ -63,6 +63,7 @@ import type {
 } from "../transport.js";
 import type { EventBusRedisClient } from "./client.js";
 import { closeRedisClient } from "./client.js";
+import { withDeadline } from "./deadline.js";
 import { createCheckpoint, readCheckpoint, STREAM_ORIGIN_ENTRY_ID } from "./checkpoint.js";
 import type { StreamPosition } from "./checkpoint.js";
 import { FIELD_ENVELOPE, FIELD_SEQUENCE } from "./scripts.js";
@@ -101,6 +102,12 @@ export type RedisStreamSubscriptionOptions = {
   readonly client: EventBusRedisClient;
   readonly services: SubscriptionServices;
   readonly startPosition: StreamPosition;
+  /**
+   * How long a read may go unanswered beyond its own `waitMs` before the
+   * server is treated as unreachable (`RedisConnectionOptions.responseTimeoutMs`,
+   * validated by the transport).
+   */
+  readonly responseTimeoutMs: number;
   /** Set when the start position came from a durable checkpoint. */
   readonly startCheckpoint?: StreamCheckpoint;
   readonly maxTrackedEpochs?: number;
@@ -135,6 +142,7 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
   readonly #services: SubscriptionServices;
   readonly #onClosed: () => void;
   readonly #orderTracker: EpochOrderTracker;
+  readonly #responseTimeoutMs: number;
 
   #position: StreamPosition;
   #checkpointedSequence: number;
@@ -161,6 +169,7 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
     this.#client = options.client;
     this.#services = options.services;
     this.#onClosed = options.onClosed;
+    this.#responseTimeoutMs = options.responseTimeoutMs;
     this.#position = options.startPosition;
     this.#checkpointedSequence = options.startPosition.sequence;
     this.#lastCheckpoint = options.startCheckpoint;
@@ -374,16 +383,27 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
     }
     this.#closed = true;
     this.#onClosed();
-    await closeRedisClient(this.#client);
+    await closeRedisClient(this.#client, this.#responseTimeoutMs);
   }
 
+  /**
+   * One read, bounded (`OUTAGE-1`).
+   *
+   * This connection carries blocking reads, so no per-command timeout is
+   * installed on it (`./client.ts`): the read is raced against its own
+   * `waitMs` plus the response bound instead. Only the round trip is raced.
+   * When the deadline wins, this throws before the reply is parsed, so a late
+   * reply to the abandoned read can never advance the position past events
+   * no caller was given.
+   */
   async #read(maxEvents: number, waitMs: number): Promise<readonly StreamEntry[]> {
     const startedAt = performance.now();
+    const boundMs = waitMs + this.#responseTimeoutMs;
     let reply: unknown;
     try {
-      reply =
+      const read =
         waitMs > 0
-          ? await this.#client.xread(
+          ? this.#client.xread(
               "COUNT",
               maxEvents,
               "BLOCK",
@@ -392,13 +412,23 @@ export class RedisStreamSubscription<TPayload = unknown> implements EventSubscri
               this.#streamKey,
               this.#position.entryId,
             )
-          : await this.#client.xread(
+          : this.#client.xread(
               "COUNT",
               maxEvents,
               "STREAMS",
               this.#streamKey,
               this.#position.entryId,
             );
+      reply = await withDeadline(
+        read,
+        boundMs,
+        () =>
+          new Error(
+            `no reply to a read within ${String(boundMs)} ms (its own ${String(waitMs)} ms wait ` +
+              `plus the ${String(this.#responseTimeoutMs)} ms response bound); the server is ` +
+              "treated as unreachable",
+          ),
+      );
     } catch (cause) {
       this.#receiveWaitTimeMs += performance.now() - startedAt;
       throw new EventBusUnavailableError(
