@@ -648,9 +648,20 @@ B3 is recorded as CLOSED at merge. | CORE-MOVE ✓ | apps/backtest-cli/**, packa
   - (1) `B1-R1-REDIS-UNCAUGHT`: `startup()` never throws, and an unreachable Redis is refused with a documented exit code.
   - (2) `BOOT1-R7`: a Redis outage latches a GLOBAL fail-closed halt and exits within a stated, configurable bound. An idle stream never halts. This is proved with a Testcontainers test that stops Redis mid-run, plus an idle companion test.
   - (3) `BOOT1-CONFIGPARAMS`: `verifyRegisteredRows` compares the registered config parameters canonically, and a mismatch is refused. | BACKTEST-2 ✓ | packages/event-bus/**, apps/trader/src/main.ts (startup refusal/outage exit), apps/trader/src/adapters/{redis-feed,postgres-registration}.ts, packages/trading-core/src/** (halt code/bound only, minimal), test/integration/{paper-trader,event-bus}/** (new tests), test/unit/** (new), apps/control-api/src/** + test/integration/control-api/** (halt vocabulary only, if needed). Forbidden: REGISTER-1's paths, db/**, docs/**, lockfile, protected files. Gate: automated + Fable adversarial review (hardening loop) + a green CI run on GitHub. |
-| `REGISTER-1` (pre-H1: an operator registration command) | **Ready (authorized) 2026-09-28** by the user ("Registration command", pre-H1). Runs under the HARDENING LOOP, in parallel with `OUTAGE-1`. Verifier: a Fable adversarial-reviewer, because the evidence is Testcontainers-based and runs the bundle.
+| `REGISTER-1` (pre-H1: an operator registration command) | **Complete (2026-09-29)** — merged `7f1ebc0` (`--no-ff`). The chain is:
+  - `f59603c`, r0, accepted by the Fable reviewer (4 LOW);
+  - `a4c1c91`, main merged in;
+  - `ebf88ab`, an orchestrator integration fix, independently checked by Fable (ACCEPT). With OUTAGE-1 on main, an unregistered configId is `_MISSING`.
 
-**Orchestrator placement ruling:** the command is NOT in `apps/ops-cli`. That app belongs to WP-330, the Wave-3 emergency operations CLI with a fixed command list. It is a SEPARATE entry point in the trader app, `apps/trader/src/register/main.ts`, with its own esbuild script. The trader app already owns the durable store and the registration check, and `main.ts` is untouched.
+**Delivered:** `pnpm --filter @polymarket-bot/trader run register` registers one PAPER market, definition, config (the parameters exactly as the document states them), instance and run, in ONE transaction through the WP-040 repositories. It writes the completed trader document and never overwrites a file, and it refuses a re-run.
+
+**Evidence:** round trip `registration: OK` → the trader decides (Testcontainers), by hand on the built bundle, and 18/18 mutants killed.
+
+**CI:** PR #21 run `36541460345`. Attempt 1 failed only on OUTAGE-1's flaky PARTITION test (queued as `OUTAGE-2`); attempt 2 was green.
+
+Record: `docs/handoffs/REGISTER-1.md`.
+
+*As authorized:* **Orchestrator placement ruling:** the command is NOT in `apps/ops-cli`. That app belongs to WP-330, the Wave-3 emergency operations CLI with a fixed command list. It is a SEPARATE entry point in the trader app, `apps/trader/src/register/main.ts`, with its own esbuild script. The trader app already owns the durable store and the registration check, and `main.ts` is untouched.
 
 **Scope:**
   - (1) The command reads the trader document or an operator input document, and registers `catalog.markets`, `strategy.definitions`, `strategy.configs` (with the parameters exactly as the document states them), `strategy.instances` and `strategy.runs` through the WP-040 repositories. It never uses `createTradingChain`.
@@ -659,6 +670,18 @@ B3 is recorded as CLOSED at merge. | CORE-MOVE ✓ | apps/backtest-cli/**, packa
   - (4) A Testcontainers test runs register → `assembleDurableTrader` → `registration: OK`.
   - (5) Its bundle is covered by `app-bundles-load.test.ts`.
   - It does NOT verify `gammaMarketId` (UNIV4-R1); it prints a reminder instead. | BACKTEST-2 ✓ | apps/trader/src/register/** (new), apps/trader/package.json (new scripts only), test/unit/tooling/app-bundles-load.test.ts, test/integration/paper-trader/** (new tests and support), infra/compose/trader/** (docs only). Forbidden: OUTAGE-1's paths, packages/**, other apps, db/**, docs/**, lockfile, protected files. Gate: automated + Fable adversarial review (hardening loop) + a green CI run on GitHub. |
+| `OUTAGE-2` (make OUTAGE-1's PARTITION outage test deterministic; prove nothing is written after a halt) | **Ready (authorized) 2026-09-29** by the orchestrator. This is a CI-health fix to an accepted round's test, and it blocks nothing the user ruled.
+
+**The finding:** on GitHub CI, PR #21 attempt 1, the partition case read 6 durable decision rows after the halt, against a "before" snapshot of 5. The halt itself was on time: +1.0 s, exit at +3.0 s. The case passed on main three times and on the re-run.
+
+**Likely cause:** the "before" snapshot is taken at `eventsProcessed === 6` while loop-originated evaluations can still land. That makes it a test race.
+
+**Scope:**
+  - (1) Identify and classify the extra row against the HALT INSTANT. A write after the halt is a safety defect: STOP and report it.
+  - (2) A sound quiescence condition, or a comparison at the halt instant. "Nothing written after the halt" stays asserted.
+  - (3) At least 25 consecutive passes of the file.
+
+**Verifier:** a Fable adversarial reviewer (containers). | OUTAGE-1 ✓ | test/integration/paper-trader/redis-outage-halts-postgres-redis.test.ts + support helpers; product files only if (1) proves a defect (apps/trader/src/{main.ts,adapters/redis-feed.ts}, packages/trading-core/src/{loop,pump}.ts, minimal). Gate: automated + Fable adversarial review (hardening loop) + a green CI run on GitHub. |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
 
@@ -2489,6 +2512,8 @@ Blocks H1. | `docs/handoffs/BRACKET-1c.md` (implementer C4; reproduced by the Fa
 | **TC-LOCAL-FLAKE** | Local Testcontainers flakiness observed by the `BACKTEST-2` implementer: 2 of 5 local `trader test:integration` runs failed on infrastructure (Redis "Connection is closed" at `RedisStreamsEventTransport.connect` in test setup; testcontainers "Failed to connect to Reaper"), in different files each time. The orchestrator's gate runs and GitHub CI were green. A CI flake of the same shape would read as a red build | `docs/handoffs/BACKTEST-2.md` (implementer tests_run) | watch CI; a paper-trader integration round may add connect retries or container readiness waits |
 | **ADR022-DISCHARGE** | ADR-022's "Implemented by: CORE-MOVE (pending), BACKTEST-2 (pending)" is now implemented. A dated discharge note must record the merges and the measured counts (35 packages / 90 edges), following the ADR-021 precedent (`e6548cf`). The same docs round can ride `DC1-R1-L1` and `BUNDLE1-LOWS` (1), ADR-018's third bundling pattern | the H8 track | **CLOSED by `DOCS-1`** (merged `2e7f618`) |
 | **DC1-R1-L1** | `import.meta.resolve("<relative>")` is not judged by F16's relative half. It is missing from the disclosed not-covered list in the §3 F16 Source cell and in `docs/handoffs/DEPCHECK-1.md`. Docs-only: add it to both | `docs/handoffs/DEPCHECK-1.md` (Fable r1 LOW) | **CLOSED by `DOCS-1`** (merged `2e7f618`) |
+| **REGISTER1-LOWS** | (L1) `REGISTER_REFUSED_BY_DATABASE` says "the database refused a row" when the failing statement was the duplicate-check SELECT on an UNMIGRATED database; the outcome is correct. (L2) `REGISTER_DEFINITION_MISMATCH` and `REGISTER_CONFIG_MISMATCH` have no test (verified by hand). (L3) `--help`'s exit-code table does not name every 78 code. (L4) a flag VALUE of exactly `-h`/`--help` prints the usage | `docs/handoffs/REGISTER-1.md` (Fable r1) | the next `apps/trader/src/register` round |
+| **TRADER-SIGNALS** | The trader installs no SIGINT/SIGTERM handler; `main.ts`'s header mentions "the signal handlers", which do not exist. Ending a run with Ctrl-C kills the process: durable writes are already committed per event, but the FOLD-1 SHUTDOWN rebuild check and the orderly close never run. A graceful stop (stop the pump, run the SHUTDOWN check, close, exit 0) would put the shutdown check into H1's evidence | orchestrator, while writing the H1 operator checklist (`apps/trader/src/main.ts` :733-744) | offered to the user as an optional small round before H1 |
 | **OUT1-R1-HALT-NOT-DURABLE** | A halt, including OUTAGE-1's `TRANSPORT_UNAVAILABLE`, is not persisted to PostgreSQL. `TraderStore` has no halt write, and no repository or trader code writes `ops.incidents`/`ops.risk_events`. The durable record of an outage is only its consequence (no writes after the halt instant), plus the process log and the exit code | `docs/handoffs/OUTAGE-1.md` (Fable r1 MEDIUM) | a trader/storage round that adds a durable halt record (`ops.incidents`), before sustained live-data paper runs |
 | **OUTAGE1-LOWS** | (1) The trader-level outage tests pin "halts within T" but not the read deadline specifically; the event-bus suite pins it deterministically. (2) The recorded docker-restart halt is an artifact of Testcontainers re-mapping the port; with a fixed port a fast restart RECOVERS, as designed. (3) `startup()`'s subscribe catch labels any non-`EventBusUnavailableError` as `TRADER_EVENT_SUBSCRIPTION_REFUSED` (78) | `docs/handoffs/OUTAGE-1.md` | the next `apps/trader` round |
 | **B1-R1-REDIS-UNCAUGHT** | With Redis unreachable, the trader's `startup()` rejects with an uncaught `EventBusUnavailableError` (stack trace, exit 1) instead of a documented refusal. `RedisStreamsEventTransport.connect` (`apps/trader/src/main.ts:290`) is awaited without a catch, which contradicts `startup()`'s "Never throws" docstring; the PostgreSQL boundary has `infrastructureUnavailable` (69). It fails closed. The neighbour of `BOOT1-R7` (a Redis outage mid-run HANGS the process) | `docs/handoffs/BUNDLE-1.md` (Fable r1 MEDIUM) | **CLOSED by `OUTAGE-1`** (merged `143ad8d`, 2026-09-29) |
