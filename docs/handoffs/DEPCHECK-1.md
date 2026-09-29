@@ -359,3 +359,36 @@ A docs round owns the edits above.
 
 `IMPLEMENTATION_STATUS.md`'s `CI2-L5-2`, `CI2-L5-3`, `DEPCHECK-1` and H8
 track rows are the orchestrator's.
+
+---
+
+## Addendum (2026-09-28, `DOCS-1`): `import.meta.resolve` is also not judged by F16
+
+Append-only; nothing above this line changed.
+
+This round merged as `d7f2906`. Its Fable adversarial review returned r1
+ACCEPT with one LOW, `DC1-R1-L1`: F16's relative half does not judge
+`import.meta.resolve("<relative>")`. Two not-covered lists omit that form:
+
+- the "Not covered by F16" list under "Decisions and disclosures" above;
+- the §3 F16 Source cell that this round wrote.
+
+**Measured by `DOCS-1`** at `ae25450`, in a scratch copy of the tree, with
+`node tools/check-dependency-direction.mjs --root <copy> --json`:
+
+- `apps/backtest-cli/src/probe-resolve.ts`, containing
+  `export const target = import.meta.resolve("../../trader/src/main.js");`,
+  gives exit 0 and no violation.
+- The control, `apps/backtest-cli/src/probe-control.ts`, containing
+  `export * from "../../trader/src/main.js";`, gives exit 1 and one F16.
+
+**Why the form is not judged.** Rule 3 judges only the specifiers it records
+as module loads, the forms listed under "What changed", item 3.
+`import.meta.resolve` resolves a specifier to a URL without loading it (the
+checker's header says so, in its F14 discussion). So, like
+`require.resolve`, it is not recorded.
+
+**Now recorded.** `DOCS-1` adds `import.meta.resolve("<relative>")` to the
+not-covered list in the §3 F16 Source cell of
+`docs/contracts/dependency-direction.md`, beside `require.resolve`. The
+check itself is unchanged.

@@ -507,3 +507,122 @@ each path below is the one the §6 check reports at `a8a3a63`:
 - **Venue facts:** none. **Safety defaults:** none touched. **Schema
   version:** no emitted field set changes; this record changes no code, so no
   `schemaVersion` changes.
+
+## Closing note (2026-09-28): `CORE-MOVE` and `BACKTEST-2` implemented this ADR — it is discharged
+
+Append-only; nothing above this line changed.
+
+The header's "Implemented by: CORE-MOVE (pending), BACKTEST-2 (pending).
+**No implementation exists yet.**" was true at this record's date. This note
+supersedes it. It is recorded by `DOCS-1`, on the ADR-021 discharge
+precedent (`e6548cf`).
+
+**The four merges.** These are the H8 track, in order. Each round's record is
+in `docs/handoffs/`.
+
+| Round | Merge | What it did for this ADR |
+| --- | --- | --- |
+| `H8-GOV` | `bb58edb` | Wrote this ADR, and staged the §2 and §2.1 text in an unparsed `#### PENDING` subsection (D8). |
+| `DEPCHECK-1` | `d7f2906` | The optional checker-hardening round. It added F10, F16's relative half, and a `CHK` for a §2.1 row whose `to` endpoint is an application or that matches no declared edge. |
+| `CORE-MOVE` | `33b7d0b` | Moved the 25 closure files and their 14 colocated tests into `packages/trading-core`, behind re-export facades, and activated the staged text (D1, D7, D8). |
+| `BACKTEST-2` | `fd12be0` | Made `apps/backtest-cli` build the core itself, with one venue builder (D5), and closed B3. |
+
+**The measured graph.** `DOCS-1` re-measured it. Each merge's tree
+(`git archive <sha>`) was checked with this note's base checker, which has
+not changed since `d7f2906`
+(`node tools/check-dependency-direction.mjs --root <tree> --json`):
+
+- `ac0b12f`, `CORE-MOVE`'s base: 34 packages, 80 edges, allowlist S0..S7.
+- `33b7d0b`, after `CORE-MOVE`: **35 packages, 89 edges**. The allowlist is
+  S0..S18, `packages/trading-core` is in layer 1, and there is no violation.
+- `fd12be0`, after `BACKTEST-2`: **35 packages, 90 edges**, with the same
+  allowlist and no violation. The two edge lists differ by exactly one
+  added edge, `apps/backtest-cli` → `packages/trading-core`, and none
+  removed.
+
+These are the counts in `dependency-direction.md` §6's two dated notes of
+2026-09-28. `H8-GOV`'s dry run measured 93 edges, and 94 with
+`apps/trader` → `packages/trading-core`. The real count is 89 because
+`CORE-MOVE` removed the five `apps/trader` edges that its remaining source
+no longer imports (the §6 note's +11, +2, +1 and −5).
+
+**D1 as realized.** The 25 closure files of Context 4 exist only under
+`packages/trading-core/src`, and none remains under `apps/trader/src`. The
+check classifies the package in layer 1.
+
+**D5 as realized.**
+
+- **One venue builder:** `buildSimulatedVenue`, in
+  `packages/trading-core/src/venue-builder.ts`.
+  - Outside `packages/simulation`, `new SimulatedVenue(` now appears only
+    there (`:176`, and a comment at `:18`) and in `*.test.ts` files that
+    build a venue on purpose. That is D5's testable sentence.
+  - The four copies D5 named are gone. `apps/trader/src/main.ts`,
+    `test/e2e/support/harness.ts` and
+    `test/integration/paper-trader/support/fixture.ts` call the builder.
+    `test/unit/simulation/backtest-replay-support.ts` now drives the CLI's
+    own assembly (`apps/backtest-cli/src/assembly.ts`), which calls it.
+- **A production store:** `apps/backtest-cli` builds the core with a
+  production `InMemoryTraderStore` (`packages/trading-core/src/memory-store.ts`),
+  never the test double. The store imports `pnl-snapshot-key.ts` (shared,
+  not copied) and nothing from the core's `testing/`.
+- **Both roots depend downward on the core**, layer 3 → layer 1, so neither
+  edge needs a §2.1 row. `apps/trader` has done so since `CORE-MOVE`, and
+  `apps/backtest-cli` since `BACKTEST-2`.
+
+**D6 held.** `safety.ts` and `config.ts` have the same blob at `a8a3a63`
+(under `apps/trader/src`) and at this note's base (under
+`packages/trading-core/src`). So the core's PAPER constants are
+byte-identical across the four rounds. The backtest root's `BACKTEST` label
+over the core's PAPER constants stays a recorded residual (BT1-R5), as D6
+said.
+
+**D7: the facades remain.** Both entry points still re-export the core:
+`@polymarket-bot/trader` (`apps/trader/src/index.ts`) and
+`@polymarket-bot/trader/testing` (`apps/trader/src/testing/index.ts`, which
+is `export * from "@polymarket-bot/trading-core/testing"`). `CORE-MOVE`
+proved that both entry points' names and kinds were unchanged by the move
+(`docs/handoffs/CORE-MOVE.md`).
+
+**B3 is CLOSED**, at `BACKTEST-2`'s merge (`IMPLEMENTATION_STATUS.md`, row
+**B3**). The backtest executable builds the core itself and no harness hands
+it one. That is the first item of "What this buys".
+
+**Dated statements that `DEPCHECK-1` changed.** Three statements above were
+true at `a8a3a63`, and they stay as written: they are history, not current
+gate behaviour. `DOCS-1` re-measured each one at this note's base,
+`ae25450`, in a scratch copy of the tree, with `--root <copy> --json`:
+
+- **D3, "What the gate does not enforce", third bullet.** The relative route
+  now fails F16: a `packages/trading-core/src` file that re-exports
+  `../../storage-postgres/src/index.js` fails F16. The other routes still
+  pass, with exit 0:
+  - the same re-export by package name, undeclared;
+  - `pg`, declared and imported;
+  - `ethers`, declared and imported.
+
+  So D3's "a gate result only in part" still holds for those three routes.
+- **D9, third bullet.** A §2.1 row that matches no declared edge is now a
+  `CHK` error. With the core's `@polymarket-bot/strategy-static-bracket`
+  dependency removed, row S18 fails `CHK`. So S18's removal is now a gate
+  result.
+- **"Alternatives rejected", B, second bullet.** The check now implements
+  F10. When `apps/backtest-cli` declares `@polymarket-bot/trader`, the check
+  fails F10. A §2.1 row naming an application as its `to` endpoint is a
+  `CHK` error (`DEPCHECK-1`'s probe P3, in `docs/handoffs/DEPCHECK-1.md`).
+
+**What stays open.**
+
+1. **S18's sunset.** The H8 scoping called the strategy-agnostic core "D4",
+   and the ruling deferred it until a second strategy exists (Context 6).
+   It is D9's round. That round removes row S18 in the same change, and
+   D4's list of the core's same-layer rows loses S18.
+2. **The facade retirement (D7).** A later round retires both facades
+   (`docs/handoffs/CORE-MOVE.md`, "Follow-ups").
+3. **Also still open, as D3 states it:**
+   - no §3 rule binds the core to the database-client and signing-library
+     catalogues (`H8-GOV` `follow_up` 5, finding H8G-01);
+   - the §6 check does not yet implement F17.
+
+**Venue facts:** none. **Safety defaults:** none touched. This note changes
+no code.
