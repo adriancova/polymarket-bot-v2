@@ -613,6 +613,20 @@ Record: `docs/handoffs/BACKTEST-2.md` (written in-round).
   - `check:deps` gains the downward edge with no new row.
 
 B3 is recorded as CLOSED at merge. | CORE-MOVE ✓ | apps/backtest-cli/**, packages/trading-core/** (additive only), apps/trader/src/{main,index}.ts, apps/trader/package.json (description only), packages/simulation/src/ports.ts (comment-only), test/e2e/support/harness.ts + test/integration/paper-trader/support/fixture.ts (venue copy → builder only), test/unit/simulation/backtest-{replay-support.ts,static-bracket-replay.test.ts}, pnpm-lock.yaml (apps/backtest-cli importer only), docs/contracts/dependency-direction.md (one §6 note), docs/handoffs/BACKTEST-2.md. Forbidden: test/replay-golden/** (byte-identical), root package.json, suite configs, tsconfig.lint.json, tools/**, docs/adr/**, db/**, other packages/apps. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
+| `DOCS-1` (append-only documentation owed by the H8 track) | **Ready (authorized) 2026-09-28** by the orchestrator. This is bookkeeping that follows the user's H8 rulings: ADR-022 was written by their ruling, and its discharge is recorded as ADR-021's was (`e6548cf`). Runs under the HARDENING LOOP, reviewed by Codex gpt-6-astra.
+
+**Scope:**
+  - (1) ADR-022: an append-only discharge note (the four merges, the measured counts, D5 as realized, B3 CLOSED, what stays open), and its README row marked DISCHARGED.
+  - (2) ADR-018: an append-only evidence addendum for the third bundling pattern (BUNDLE-1: ESM plus the `createRequire` banner, and why CJS was rejected), which rides `BUNDLE1-LOWS` (1).
+  - (3) `DC1-R1-L1`: `import.meta.resolve` added to the F16 Source cell's not-judged list.
+  - (4) A dated addendum to `docs/handoffs/DEPCHECK-1.md`.
+  - (5) `docs/handoffs/DOCS-1.md`.
+
+**Acceptance:**
+  - byte-identical-prefix proofs for every append-only file;
+  - single-cell and single-row diffs;
+  - every cited fact verified;
+  - `check:deps --json` unchanged. | BACKTEST-2 ✓ | docs/adr/ADR-022-*.md and docs/adr/ADR-018-*.md (append-only), docs/adr/README.md (ADR-022 row), docs/contracts/dependency-direction.md (the §3 F16 Source cell), docs/handoffs/DEPCHECK-1.md (append-only), docs/handoffs/DOCS-1.md. Forbidden: everything else. Gate: automated + Codex adversarial review (hardening loop) + a green CI run on GitHub. |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
 
