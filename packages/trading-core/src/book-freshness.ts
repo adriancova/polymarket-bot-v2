@@ -16,7 +16,7 @@
  *   `(gatewayEpoch, connectionId, subscriptionGeneration)` —
  *
  * and nothing else. What that instant proves, and what it does not, is ADR-023
- * §3: it proves that the delivery path for this book's subscription (venue
+ * D1: it proves that the delivery path for this book's subscription (venue
  * socket → gateway → stream → this process) delivered a frame at that
  * instant; it does NOT prove that the venue had no unsent change for this
  * token (no official source states cross-asset ordering or delivery
@@ -50,13 +50,13 @@
  *
  * A disconnection, a lost heartbeat, a gateway stall or a gateway restart
  * needs no rule of its own: each one stops the confirmations, so the book ages
- * out within its bound (ADR-023 §4).
+ * out within its bound (ADR-023 D3).
  *
  * PURE STATE, NO CLOCK. Every instant arrives from an event's own `receivedAt`,
  * already normalised to strict UTC by `time.ts`; replay reproduces it exactly.
  */
 
-/** ADR-023 §5: the two freshness bases a trader configuration may name. */
+/** ADR-023 D4: the two freshness bases a trader configuration may name. */
 export const BOOK_FRESHNESS_BASES = Object.freeze(["LAST_CHANGE", "CONNECTION_CONFIRMED"] as const);
 export type BookFreshnessBasis = (typeof BOOK_FRESHNESS_BASES)[number];
 

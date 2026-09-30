@@ -1,5 +1,5 @@
 /**
- * `THROUGHPUT-1c` (ADR-023 §6) — the strategy's book-age read under grammar
+ * `THROUGHPUT-1c` (ADR-023 D6) — the strategy's book-age read under grammar
  * version 2, and that version 1 is unchanged.
  *
  * Version 2 reads the traded (configured-direction) book's age from the
@@ -51,7 +51,7 @@ function staleReasoned(reasonCodes: readonly string[]): boolean {
   return reasonCodes.includes(REASONS.staleBook);
 }
 
-describe("grammar version 2 reads the root's book age (ADR-023 §6)", () => {
+describe("grammar version 2 reads the root's book age (ADR-023 D6)", () => {
   it("a quiet book the root vouches for is fresh, although its last change is 10 s old", () => {
     const decision = staticBracketStrategy.onFeatures(
       context(v2Config(), stateWith({}), {

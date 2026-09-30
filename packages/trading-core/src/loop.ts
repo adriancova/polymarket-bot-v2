@@ -1115,7 +1115,7 @@ export class CoreLoop {
     this.#lastInstant = instant.instant;
     this.#lastEpochMs = instant.epochMs;
     this.#options.health.countLoop("eventsProcessed");
-    // `THROUGHPUT-1c` (ADR-023 §4): every consumed event is offered to the
+    // `THROUGHPUT-1c` (ADR-023 D5): every consumed event is offered to the
     // delivery-session table before anything else reads it, so a book
     // evaluated at this event's instant is vouched for by at most this event.
     this.#observeDeliverySession(envelope, instant.instant, instant.epochMs);
@@ -1586,7 +1586,7 @@ export class CoreLoop {
   ): { readonly snapshotRef: string; readonly values: Readonly<Record<string, string | boolean | null>> } | undefined {
     const outcome = instance.direction;
     const tokenId = outcome === "YES" ? market.config.yesTokenId : market.config.noTokenId;
-    // `THROUGHPUT-1c` (ADR-023 §5): the book section's `lastEventAt` is the
+    // `THROUGHPUT-1c` (ADR-023 D5): the book section's `lastEventAt` is the
     // instant the book is vouched for — its last change under `LAST_CHANGE`
     // (exactly the pre-ADR-023 value), the confirmed instant under
     // `CONNECTION_CONFIRMED`. `quality.input_feed_ages` reports its age.
@@ -3992,7 +3992,7 @@ export class CoreLoop {
   }
 
   #bookAgeMs(market: MarketState, epochMs: number): number {
-    // `THROUGHPUT-1c` (ADR-023 §5): §9.8 check 7's `VENUE_BOOK` age is measured
+    // `THROUGHPUT-1c` (ADR-023 D5): §9.8 check 7's `VENUE_BOOK` age is measured
     // from the instant the book is vouched for — under `LAST_CHANGE` exactly
     // the pre-ADR-023 value. Which book is measured (YES) is unchanged.
     const at =
@@ -4022,7 +4022,7 @@ export class CoreLoop {
   }
 
   /**
-   * `THROUGHPUT-1c` (ADR-023 §4): offers one consumed event to the
+   * `THROUGHPUT-1c` (ADR-023 D2): offers one consumed event to the
    * delivery-session table, and applies rule 4 — a data-quality incident that
    * names NO market taints its gateway epoch, every session of it, for good.
    * Nothing is recorded under `LAST_CHANGE`, which reads none of it.

@@ -209,7 +209,7 @@ const FeatureConfigSchema = z.strictObject({
 });
 
 /**
- * `THROUGHPUT-1c` (ADR-023 §5) — how a venue book's age is measured, for the
+ * `THROUGHPUT-1c` (ADR-023 D4) — how a venue book's age is measured, for the
  * feature engine's `polymarket.book` input, the strategy's data-quality gate
  * (through the projected `quality.input_feed_ages@polymarket.book`) and §9.8
  * check 7's `VENUE_BOOK` measurement.

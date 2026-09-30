@@ -28,7 +28,7 @@
  * | R6 | `quality.input_feed_ages` | a `feedId` | that feed's `ageMs` as a canonical base-10 INTEGER string (`"1500"`, `"-3"`); refused unless it is a safe integer |
  * | R5 | anything else | — | **not projected**, and the reason is recorded |
  *
- * **v2 (`THROUGHPUT-1c`, ADR-023 §5) added R6** and changed nothing else: a key
+ * **v2 (`THROUGHPUT-1c`, ADR-023 D5) added R6** and changed nothing else: a key
  * R6 answers was refused under v1 (`quality.input_feed_ages` is a list, so it
  * fell to R4's `SELECTOR_NOT_APPLICABLE`). R6 is how the strategy's data-quality
  * gate reads the book age the composition root measured
@@ -283,7 +283,7 @@ export function projectFeatureValues(
       continue;
     }
 
-    // R6 — one feed's age from the per-feed age list (ADR-023 §5).
+    // R6 — one feed's age from the per-feed age list (ADR-023 D5).
     if (featureId === FEED_AGES_FEATURE_ID && selector !== null) {
       if (!Array.isArray(value)) {
         refusals.push(

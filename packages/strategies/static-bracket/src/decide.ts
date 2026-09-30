@@ -519,7 +519,7 @@ export function assessDataQuality(
   return { healthy: true, reason: null, detail: null, bookAgeMs };
 }
 
-/** A canonical base-10 integer string: what projection rule R6 emits (ADR-023 §5). */
+/** A canonical base-10 integer string: what projection rule R6 emits (ADR-023 D5). */
 const INTEGER_STRING = /^-?(?:0|[1-9][0-9]*)$/u;
 
 type BookAgeMeasurement =
@@ -527,7 +527,7 @@ type BookAgeMeasurement =
   | { readonly ok: false; readonly problem: string; readonly viewAgeMs: number };
 
 /**
- * The traded book's age, in milliseconds — `THROUGHPUT-1c`, ADR-023 §6.
+ * The traded book's age, in milliseconds — `THROUGHPUT-1c`, ADR-023 D6.
  *
  * - Grammar version 1 (no `book_age_feature_key`): `now - book.asOf`, the
  *   instant of the book's last applied change. Unchanged since `1.0.0`.

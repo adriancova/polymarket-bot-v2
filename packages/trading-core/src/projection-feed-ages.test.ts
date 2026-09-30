@@ -1,5 +1,5 @@
 /**
- * `THROUGHPUT-1c` (ADR-023 §5) — projection rule R6 (`feature-projection/v2`):
+ * `THROUGHPUT-1c` (ADR-023 D5) — projection rule R6 (`feature-projection/v2`):
  * `quality.input_feed_ages@<feedId>` projects that feed's age as a canonical
  * base-10 integer string. Everything v1 projected, v2 projects identically.
  *

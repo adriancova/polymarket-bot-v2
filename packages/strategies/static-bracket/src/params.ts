@@ -96,7 +96,7 @@ import {
 export const STATIC_BRACKET_CONFIG_VERSION = 1;
 
 /**
- * `THROUGHPUT-1c` (ADR-023 §6): grammar version 2. It is version 1 plus ONE
+ * `THROUGHPUT-1c` (ADR-023 D6): grammar version 2. It is version 1 plus ONE
  * required key, `data_quality.book_age_feature_key`, and nothing else; a
  * version-1 document loads exactly as it always did and means exactly what it
  * always meant (the book age is `now - book.asOf`). The key is REFUSED in a
@@ -242,7 +242,7 @@ export interface RiskParams {
 export interface DataQualityParams {
   readonly maximum_book_age_ms: number;
   /**
-   * Grammar version 2 only (ADR-023 §6), and present IFF `version` is 2: the
+   * Grammar version 2 only (ADR-023 D6), and present IFF `version` is 2: the
    * feature key the book age of the configured direction's book is read from
    * — `quality.input_feed_ages@polymarket.book`, the age the composition root
    * measured under its book-freshness basis. Absent (never `null`) in a
@@ -434,7 +434,7 @@ const DATA_QUALITY_KEYS = [
   "on_stale_book",
   "on_incident",
 ];
-/** Grammar version 2's `data_quality` keys: version 1's plus one (ADR-023 §6). */
+/** Grammar version 2's `data_quality` keys: version 1's plus one (ADR-023 D6). */
 const DATA_QUALITY_KEYS_V2 = [...DATA_QUALITY_KEYS, "book_age_feature_key"];
 
 /**
@@ -873,7 +873,7 @@ function parseRisk(root: PlainRecord): Outcome<RiskParams> {
   );
 }
 
-/** The one feature key grammar version 2's book-age read may name (ADR-023 §6). */
+/** The one feature key grammar version 2's book-age read may name (ADR-023 D6). */
 export const BOOK_AGE_FEATURE_KEY = "quality.input_feed_ages@polymarket.book";
 
 function parseDataQuality(root: PlainRecord, version: number): Outcome<DataQualityParams> {
@@ -893,7 +893,7 @@ function parseDataQuality(root: PlainRecord, version: number): Outcome<DataQuali
     if (key.value !== BOOK_AGE_FEATURE_KEY) {
       return bad(
         `${path}.book_age_feature_key must be "${BOOK_AGE_FEATURE_KEY}" (the age of the ` +
-          "composition root's polymarket.book input, ADR-023 §6); any other key is refused " +
+          "composition root's polymarket.book input, ADR-023 D6); any other key is refused " +
           "rather than read as a book age",
       );
     }

@@ -153,7 +153,7 @@ describe("§13.2 configuration grammar", () => {
     expect(result.problem).toContain("params.extra");
   });
 
-  // `THROUGHPUT-1c` (ADR-023 §6): this pinned `version: 2` as unimplemented
+  // `THROUGHPUT-1c` (ADR-023 D6): this pinned `version: 2` as unimplemented
   // until grammar version 2 existed. The refusal of an UNIMPLEMENTED version
   // is unchanged; it now names the set this build implements.
   it("refuses a version this build does not implement", () => {
@@ -171,7 +171,7 @@ describe("§13.2 configuration grammar", () => {
   });
 });
 
-describe("grammar version 2 (THROUGHPUT-1c, ADR-023 §6)", () => {
+describe("grammar version 2 (THROUGHPUT-1c, ADR-023 D6)", () => {
   const V2_KEY = "quality.input_feed_ages@polymarket.book";
 
   it("exports the implemented versions, oldest first", () => {
