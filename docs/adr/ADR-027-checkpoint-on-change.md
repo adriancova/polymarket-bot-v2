@@ -110,6 +110,15 @@ to the rule above and explains each change. It also searches for others.
 - `test/unit/strategy-runtime/boundary-snapshots.test.ts`: "a clock that fails
   AFTER the callback is CONTAINED with one record, one checkpoint, and no
   claimed duration".
+- `test/unit/strategies/static-bracket/runtime-integration.test.ts`: "a
+  checkpoint for each" (six decisions, six checkpoints), and the stale-data
+  case, whose last line pins as many decision records as checkpoints. Its
+  stale-data hold repeats the paused state and changes neither state, status
+  nor RNG, so under Decision 1 it writes no checkpoint and that line fails.
+  The file's `currentState` helper reads the last checkpoint; `CKPT-1`
+  checks it still reads the current state.
+- `test/unit/strategies/static-bracket/bracket-1a-reduce-track.test.ts`: it
+  reads the last checkpoint, so `CKPT-1` checks it too.
 - `test/integration/paper-trader/redis-outage-halts-postgres-redis.test.ts`
   (`OUTAGE-2`): its settle compares checkpoints 1:1 with decisions.
 - The `DURABLE-1` tests: `test/integration/paper-trader/durable-decision-before-placement.test.ts`,

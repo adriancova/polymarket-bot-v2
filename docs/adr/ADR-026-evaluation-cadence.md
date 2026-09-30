@@ -59,19 +59,28 @@ The proposal the user accepted (`LEAN-1` §6, row A1):
    has a field for these settings (`packages/storage-postgres/src/schema/strategy.ts`).
    `CADENCE-1` names the field it uses and pins it with a test. If that needs
    a schema change, `CADENCE-1` stops and asks for a `db/migrations/**` grant.
-5. `CADENCE-1` may also offer `evaluationIntervalMs` = 0, meaning ADR-024's
-   per-frame cadence, unchanged. If it does, the value 0 is pinned like any
-   other. It exists so that older goldens and H1 comparisons stay
-   reproducible.
+5. **Every new run uses the defaults.** A PAPER run on live data, and every
+   replay that is not a reproduction (rule 6), uses exactly 1,000 ms and
+   5,000 ms. A run refuses to start with any other value. Other values need a
+   new ruling.
+6. **A historical replay may use the per-frame cadence.** `CADENCE-1` may offer
+   `evaluationIntervalMs` = 0, meaning ADR-024's per-frame cadence, unchanged,
+   with no heartbeat. Only a replay that reproduces a golden or a run recorded
+   under ADR-024 (such as the H1 comparisons) may use it. The value 0 is
+   pinned like any other. A live-data run refuses it.
 
 ### D2. The rule, per market
 
 All times are event times, built from the `receivedAt` instant of each event,
 as the loop already uses it.
 
-1. **The cadence clock.** The loop keeps `now`: the latest `receivedAt`
-   instant it has seen in this run (a high-water mark). An event with an
-   earlier instant leaves `now` unchanged. So `now` never moves backwards.
+1. **The cadence clock.** An event is **applied** when it passed the event
+   door and its `receivedAt` normalized to strict UTC, so the loop counted it
+   in `eventsProcessed` (`CoreLoop.#processEvent`). A refused event is not
+   applied, though it can still close a frame (ADR-024 D3). The loop keeps
+   `now`: the latest instant of an applied event in this run (a high-water
+   mark). A refused event never moves `now`. An applied event with an earlier
+   instant leaves `now` unchanged. So `now` never moves backwards.
 2. A market is **owed** an evaluation when an event touches it in the sense of
    ADR-024 D3. That is, when the per-frame cadence would have evaluated it.
 3. The check runs only at a frame close (ADR-024 D2). Let `t` be `now` at that
@@ -94,11 +103,26 @@ as the loop already uses it.
    ruled.
 9. `now` is the cadence clock only. A decision's `evaluatedAt` is still its
    source event's instant (D3). When stamps step backwards, two decisions'
-   `evaluatedAt` values can be closer than the interval. The gap is short by
-   at most how far the later source's instant lies behind `now`.
-10. The usual gates still apply. A halted or closed market is not evaluated, as
+   `evaluatedAt` values can be closer than the interval. The shortfall is at
+   most the later source's lag behind `now`.
+10. **A forward jump.** One applied event stamped far ahead moves `now` there.
+    Every market evaluated at that close gets `last` equal to that instant.
+    Later stamps lie behind `now`, so no market is evaluated again, not even by
+    heartbeat, until `now` has moved on by the interval. Only `onFeatures`
+    waits; every other callback fires (D4). But a protective exit decided in
+    `onFeatures` waits too: Static Bracket's stop ladder does
+    (`packages/strategies/static-bracket/src/strategy.ts`). So:
+    - the loop raises an alarm when an applied event's instant lies more than
+      `evaluationHeartbeatMs` (5,000 ms when the heartbeat is off) behind
+      `now`. `CADENCE-1` names the alarm, carries it through the health door
+      like `evaluationsCoalesced`, and routes it to a page;
+    - `CADENCE-1` tests a forward jump. The test shows that the hold ends
+      when `now` has moved on by the interval, and that the alarm fires;
+    - the rule does not recover early. An early recovery would let a backward
+      step add evaluations, which rule 8 forbids.
+11. The usual gates still apply. A halted or closed market is not evaluated, as
     today.
-11. Markets are evaluated in the order ADR-024 D3 gives. Where that order says
+12. Markets are evaluated in the order ADR-024 D3 gives. Where that order says
     nothing (a market not touched by the frame), the stable configured order of
     §8.2 decides.
 
@@ -107,18 +131,24 @@ as the loop already uses it.
 1. If the frame at whose close the evaluation runs owed the market an
    evaluation, the source event and `evaluatedAt` follow ADR-024 D3 unchanged.
 2. Otherwise the evaluation is a carried-over or heartbeat evaluation. Its
-   source is the frame's last event, and its `evaluatedAt` is that event's
-   instant. That event may be one that owed no market.
-3. This **amends** an ADR-024 D3 rule, named in "What it amends": "An event
+   source is the frame's last **applied** event (D2.1), and its `evaluatedAt`
+   is that event's instant. That event may be one that owed no market. A
+   refused event is never a source: it may have no event id and no valid
+   instant.
+3. If the frame has no applied event, because every event in it was refused,
+   the close evaluates nothing. Such a frame owed no market, and it runs no
+   carried-over or heartbeat evaluation. A market still owed stays owed until
+   a later close.
+4. This **amends** an ADR-024 D3 rule, named in "What it amends": "An event
    that owed no market an evaluation … never becomes a decision's source".
    It now holds only for an evaluation at a close that owed the market.
-4. The reason: the frame's last event is the event whose arrival closed the
-   frame and so triggered the evaluation. The market's last owing event can be
-   seconds older. Admission (risk freshness, book age, seconds-to-close) runs
-   on event time (`CO2-N1`), so that older instant would make the data look
-   fresher than it is.
-5. So every decision still names a real source event, and §6 invariant 4's
-   chain is complete.
+5. The reason: the frame's last applied event is the latest data the loop took
+   in before the close that triggered the evaluation. The market's last owing
+   event can be seconds older. Admission (risk freshness, book age,
+   seconds-to-close) runs on event time (`CO2-N1`), so that older instant
+   would make the data look fresher than it is.
+6. So every decision still names a real, applied source event with a valid
+   instant, and §6 invariant 4's chain is complete.
 
 ### D4. Every other callback is never delayed
 
@@ -128,7 +158,7 @@ as the loop already uses it.
    fire today.
 3. Every event is still ingested and applied to the books, trades, reference
    prices and incidents. None is skipped. `eventsProcessed` still counts every
-   event.
+   applied event, and `eventsRefused` every refused one, as today.
 
 ### D5. A coalesced market is not evaluated, so no record is owed
 
@@ -178,9 +208,9 @@ A market that D2 does not evaluate at a close is **coalesced** at that close.
 
 | Text | As written | How it now reads |
 | --- | --- | --- |
-| ADR-024 D3 | "What moves to the frame's CLOSE (`CoreLoop.#closeFrame`) is: the `onFeatures` evaluation of each market the frame touched, ONCE per market;" | At the frame's close, each market is evaluated only if D2 allows it: owed and at least `evaluationIntervalMs` of the cadence clock since its last evaluation, or `evaluationHeartbeatMs` since it. A market still owed is evaluated at a later close. Every other part of D3 is unchanged, except the two sentences in the next rows |
-| ADR-024 D3 | "a frame's decisions are a SUBSEQUENCE of the per-event cadence's decisions, in the same order, with the same source events and instants." | Still true for an evaluation at a close that owed the market. A carried-over or heartbeat evaluation takes the frame's last event as its source (D3) |
-| ADR-024 D3 | "An event that owed no market an evaluation — one for a market this trader does not run, or one whose application triggered no callback — never becomes a decision's source" | True for an evaluation at a close that owed the market. A carried-over or heartbeat evaluation takes the frame's last event as its source, even if that event owed no market (D3.2-D3.4) |
+| ADR-024 D3 | "What moves to the frame's CLOSE (`CoreLoop.#closeFrame`) is: the `onFeatures` evaluation of each market the frame touched, ONCE per market;" (list flattened) | At the frame's close, each market is evaluated only if D2 allows it: owed and at least `evaluationIntervalMs` of the cadence clock since its last evaluation, or `evaluationHeartbeatMs` since it. A market still owed is evaluated at a later close. Every other part of D3 is unchanged, except the two sentences in the next rows |
+| ADR-024 D3 | "a frame's decisions are a SUBSEQUENCE of the per-event cadence's decisions, in the same order, with the same source events and instants." | Still true for an evaluation at a close that owed the market. A carried-over or heartbeat evaluation takes the frame's last applied event as its source (D3) |
+| ADR-024 D3 | "An event that owed no market an evaluation — one for a market this trader does not run, or one whose application triggered no callback — never becomes a decision's source" | True for an evaluation at a close that owed the market. A carried-over or heartbeat evaluation takes the frame's last applied event as its source, even if that event owed no market. A frame with no applied event evaluates nothing (D3.2-D3.5) |
 | ADR-024, Consequences | "The decision cadence changes. … decisions fall from 89,621 to 46,666: one per closed frame that reaches a configured market or a reference price." | The decision cadence changes again. At the default settings it is at most one `onFeatures` decision per market per second of event time, plus heartbeats. `CADENCE-1` measures the new count on the H1 burst |
 | Handoff §8.1 | "→ update feature snapshots → invoke subscribed strategies in stable configured order" | Every event updates state. `onFeatures` is invoked at most once per market per `evaluationIntervalMs` of event time, plus heartbeats (D2). Every other callback is invoked as before |
 
@@ -200,10 +230,14 @@ acceptance "Runtime persists exactly one decision per callback."
   frame close 5 s after the last evaluation. Any event closes a frame,
   including a reference trade. How long real quiet gaps last is not measured;
   `CADENCE-1` measures it.
-- **Health counters.** `evaluationsCoalesced` is new. The control API's health
-  door and the observability metric shapes list every loop counter strictly,
-  so `CADENCE-1` adds it there in the same round. The meaning of
+- **Health counters.** `evaluationsCoalesced` and the forward-jump alarm
+  (D2.10) are new. The control API's health door and the observability metric
+  shapes list every loop counter strictly, so `CADENCE-1` adds both there in
+  the same round. The meaning of
   `eventsProcessed`, `evaluations` and `decisionsPersisted` is unchanged.
+- **A far-future stamp holds `onFeatures`.** Until later stamps catch up, no
+  market is evaluated, and a stop decided in `onFeatures` waits (D2.10). The
+  alarm pages; it does not shorten the hold.
 - **Goldens.** Any golden with two evaluations of one market less than a second
   apart changes. `CADENCE-1` must explain each change.
 

@@ -6,8 +6,8 @@
 - **Recorded by:** `LEAN-GOV`
 - **Implemented by:** `STORAGE-1`. Not yet implemented.
 - **Supersedes / Superseded by:** none. It **amends** handoff §2 ("Raw
-  archive"), §8.4, §9.1, §12.4 and §12.5, ADR-004 §5, ADR-017 §4, and the
-  `WP-130` acceptance. It must be **re-ruled** before Phase 4 and before any
+  archive"), §8.4, §9.1, §12.4 and §12.5, ADR-004 §5, ADR-017 §4 and one
+  clause of ADR-017 §1, and the `WP-130` acceptance. It must be **re-ruled** before Phase 4 and before any
   ADR-012 calibration dataset is built (Decision 8).
 - **Handoff sections:** §2, §4.2, §6 (invariants 4 and 15), §8.4, §9.1,
   §12.4, §12.5, §17. **ADRs:** ADR-004, ADR-012, ADR-017, ADR-025, ADR-029.
@@ -66,19 +66,32 @@ A segment is deleted only when **all** of these hold:
 2. The research tier covering the segment's time span is written and
    verified. Verified means read back from the store and checked against its
    manifest digest.
-3. Every market window that overlaps the segment is **classified**. A window
-   is classified when it has closed, and the trader's decision, order, fill
-   and halt rows for it are durable. If the trader has not processed the
-   segment yet, its windows are not classified.
+3. Every market window that overlaps the segment is **classified**. Which
+   rule applies depends on whether a trader is responsible for the window. A
+   trader is responsible when the host configuration names the market for a
+   trader, or a trader run admitted the window (ADR-030). Whether the trader
+   process is running does not matter.
+   - A window a trader is responsible for is classified when it has closed,
+     and the trader's decision, order, fill and halt rows for it are durable.
+     If the trader has not processed the segment yet, because it lags or is
+     stopped, the window is not classified.
+   - A window no trader is responsible for is one the gateway records only
+     (for example a `HOST-BENCH` or `SCALE-8` recording). It is classified
+     when it has closed. It has no intent, fill, refusal or halt, so only an
+     operator pin can keep it.
 4. Every pin whose range overlaps the segment is extracted and verified, in
    the ADR-017 §4 way: re-fetched and re-verified against its persisted
    manifest.
 5. No operator pin covers the segment.
-6. **The bytes are the ones that were extracted.** The verified research-tier
-   manifest lists the segment as a source, with its `segmentSha256` and
-   `segmentFileSha256` (ADR-017 §1). Both were computed from the bytes the
-   research tier was built from. Every overlapping pin manifest lists the
-   same two digests for the segment.
+6. **The bytes are the ones that were extracted.** Before it reads a sealed
+   segment, the extractor runs `validateSegment` on it
+   (`packages/storage-wal/src/reader.ts`). That re-verifies the WAL-chain
+   identity (`segmentSha256`) against the segment's footer and sidecar
+   manifest. A segment that fails is not extracted, so it never expires. The
+   extractor then computes `segmentFileSha256` over the same verified bytes.
+   The verified research-tier manifest lists the segment as a source, with
+   both digests (ADR-017 §1). Every overlapping pin manifest lists the same
+   two digests for the segment.
 7. **The file is checked at deletion time.** Just before deletion, the file
    must hash to that `segmentSha256` over its checksummed span, and to that
    `segmentFileSha256` over its full length. This is ADR-017 §1's
@@ -184,16 +197,19 @@ extracted, or what is pinned.** A stuck expiry is a page (`LEAN-1` §8).
 | Handoff §9.1, WAL requirements | "Compaction never deletes a WAL segment until Parquet upload and checksum verification succeed." | A WAL segment is deleted only after verified upload of the Parquet that holds it, or, under this ADR, after 72 h once the research tier and every covering pin are verified (Decision 2) |
 | ADR-004 §5 | "Compaction never deletes a WAL segment until Parquet upload and checksum verification both succeed" | The same, plus the second path of Decision 2 |
 | ADR-004, Consequences | "The delete-after-verify rule means a broken upload path fills the disk instead of losing data." | Still true. A broken extract or pin path stops expiry, and the disk fills to `maxTotalBytes` (Decision 5) |
+| ADR-017 §1, the `segmentFileSha256` row | "computed at compaction time from bytes that were verified and archived" | Computed at compaction time from bytes that were verified and archived, or, for a segment that expires under Decision 2, at extraction time from bytes that `validateSegment` verified and that the research tier was built from (Decision 2.6). Its role, deletion-time identity, is unchanged |
 | ADR-017 §4 | "The *proof* a deletion relies on is the persisted dataset manifest itself …"; "every deleted record is in a verified object it pins." | For the expired-after-extract basis, the proof is the verified research-tier and pin manifests. Not every deleted record is kept. The receipt is still reporting, not proof, and manifests stay immutable (Decision 4) |
 | Handoff §8.4 | "Dataset manifests include all segment checksums, gateway epochs, event ranges, and excluded data-quality windows." | Unchanged for exact datasets, which now exist only for pins and for raw data under 72 h old (Decision 7). A research-tier manifest also lists the checksums of every source segment (Decision 2.6) |
 | Handoff §12.5 | "Every replay run pins: raw segment IDs and checksums …" | Unchanged for exact replays. An approximate replay pins research-tier objects instead (ADR-029) |
 | Handoff §12.4 | "A fixed dataset … must produce byte-identical …" | Unchanged for every dataset that exists. Exact datasets older than 72 h exist only as pins (Decision 7) |
 | `WP-130` acceptance | "WAL is not deleted before verified upload." | WAL is not deleted before verified upload, or, under ADR-028, before the research tier and every covering pin are verified |
 
-Not amended: §6 invariant 4 (Decision 6), §4.2's hard capacity threshold, and
-ADR-017 §1-§3. ADR-017 §1 still binds every deletion: the file must match its
-pinned `segmentFileSha256` over its full length (Decisions 2.6 and 2.7). Under
-this ADR the pinning manifest may be the research-tier manifest.
+Not amended: §6 invariant 4 (Decision 6), §4.2's hard capacity threshold,
+ADR-017 §2-§3, and the rest of ADR-017 §1. Only the provenance clause of §1's
+`segmentFileSha256` row is amended (the row above). §1's roles and its three
+bindings still hold, and §1 still binds every deletion: the file must match
+its pinned `segmentFileSha256` over its full length (Decisions 2.6 and 2.7).
+Under this ADR the pinning manifest may be the research-tier manifest.
 
 ## Consequences
 
@@ -205,7 +221,9 @@ this ADR the pinning manifest may be the research-tier manifest.
   digests, pins that expiry cannot touch, receipts, and a hard stop that
   halts recording rather than loses data.
 - **Expiry depends on the trader.** A segment cannot expire until its windows
-  are classified, so a stopped trader stops expiry. The disk alarms cover it.
+  are classified, so a stopped trader stops expiry for its markets. The disk
+  alarms cover it. Markets that only the gateway records do not wait for a
+  trader (Decision 2.3).
 - **Intent and refusal evidence ages out.** After 30 days, those windows have
   only their decision rows and the research tier.
 
@@ -216,6 +234,7 @@ this ADR the pinning manifest may be the research-tier manifest.
 - `docs/spec/polymarket-bot-orchestrator-handoff.md` §2, §4.2, §6 invariant 4,
   §8.4, §9.1, §12.4, §12.5.
 - ADR-004 §5 and Consequences; ADR-017 §1 (the two digests) and §4.
+- `packages/storage-wal/src/reader.ts` (`validateSegment`).
 - `packages/storage-parquet/src/retention-receipt.ts`,
   `retention-proof.ts` and `constants.ts` (`RETENTION_RECEIPT_VERSION = 1`).
 - `packages/storage-wal/src/writer.ts` (`maxTotalBytes`);

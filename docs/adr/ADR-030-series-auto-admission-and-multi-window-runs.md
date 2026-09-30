@@ -92,10 +92,20 @@ The proposal the user accepted (`LEAN-1` §6, row A5):
 1. The gateway journals every raw venue response it admits from, before it
    derives anything (the `UNIV-4` rule).
 2. It publishes each admission as an ordered event through the same publisher
-   as every other feed.
-3. Replay reproduces admission from those recorded events. It never asks the
+   as every other feed. `ROLLOVER-1` first uses the existing §7.4 contracts:
+   `MarketDiscovered@1` for the admitted window (it carries the market
+   reference, both token ids, `seriesId` and a metadata version), and the
+   existing lifecycle and `TradingParametersChanged` events for its times
+   and parameters. The trader's event door consumes neither
+   `MarketDiscovered` nor `TradingParametersChanged` today; `ROLLOVER-1` adds
+   them to `CONSUMED_EVENTS` (`packages/trading-core/src/event-door.ts`).
+3. If those contracts cannot carry an admission, or a refused window's
+   incident, faithfully, `ROLLOVER-1` stops and asks for a
+   `packages/domain/**` grant. It does not add or change an event contract on
+   its own.
+4. Replay reproduces admission from those recorded events. It never asks the
    venue.
-4. Each admitted market's parameters are versioned on admission (§6
+5. Each admitted market's parameters are versioned on admission (§6
    invariant 9).
 
 ### 4. One run spans many windows
@@ -153,6 +163,9 @@ invariant 9, and every live-mode rule.
 - `docs/spec/polymarket-bot-orchestrator-handoff.md` §6 invariant 9, §8.2,
   §9.2, §9.6, §12.5.
 - ADR-009 §1.
+- `packages/domain/src/events/market-lifecycle.ts` (`MarketDiscovered`) and
+  `packages/trading-core/src/event-door.ts` (the contracts the trader
+  consumes).
 - `apps/data-gateway/src/subscription-plan.ts` (module header) and
   `apps/data-gateway/src/config.ts` (the configured-market check).
 - `docs/status-archive/work-packages-rounds.md`, `UNIV-4` (journal before

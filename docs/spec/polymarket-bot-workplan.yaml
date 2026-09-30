@@ -1300,6 +1300,8 @@ work_packages:
   # where a round must wait for its merge (LEAN-1 §7, "After 1c").
   # CADENCE-1, ROLLOVER-1 and CKPT-1 all hold packages/trading-core/** and
   # apps/trader/src/**. They run one at a time, never concurrently (AGENTS.md).
+  # STORAGE-1 holds packages/simulation/src/** for the manifest version bump
+  # (ADR-029); no other LEAN-1 round holds it.
   - id: LEAN-GOV
     phase: phase-3
     title: LEAN-1 rulings as ADRs and work-plan entries
@@ -1350,6 +1352,10 @@ work_packages:
       # is not in this grant.
       - apps/research-worker/**
       - packages/storage-parquet/**
+      # The exact replay door reads dataset manifests; it must accept version 2
+      # before any version-2 manifest is written (ADR-029 Consequences).
+      - packages/simulation/src/**
+      - test/unit/simulation/**
       - python/research/**
       - test/integration/parquet/**
       # Mechanical lockfile updates from these packages' declared dependencies only.
@@ -1370,12 +1376,16 @@ work_packages:
       - disk, pin-budget and expiry-lag metrics
     acceptance:
       - A segment is never deleted unless it is 72 h old, its research tier is verified, its windows are classified, and every overlapping pin is verified.
+      - A window a trader is responsible for (configured or admitted) is classified only once that trader's rows for it are durable; a window only the gateway records is classified at its close (ADR-028 Decision 2.3).
+      - The extractor runs validateSegment on each sealed segment before it reads it, and computes both digests from the verified bytes; a segment that fails is not extracted and never expires (ADR-028 Decision 2.6).
+      - Every research-tier sample carries its release frame's gatewayEpoch, ingestSeq and receipt instant (ADR-029 Decision 5).
       - The research-tier manifest and every overlapping pin manifest list each source segment's segmentSha256 and segmentFileSha256; just before deletion the file must hash to both pinned digests (segmentFileSha256 over its full length), or it is kept (ADR-028 Decision 2.6-2.7, ADR-017 §1).
       - A pinned or unclassified segment is never deleted.
       - A fill pin is never evicted or reduced; a budget overrun only alarms.
       - Every source event in a fill's chain lies inside its pin.
       - The expiry plan is durable before any deletion; the receipt is reporting, not proof.
       - Version-1 manifests and receipts still read; version-1 manifests read as exact.
+      - Before any version-2 manifest is written, every dataset-manifest reader accepts version 1 and version 2 (storage-parquet, python/research, and the packages/simulation replay door); the replay door refuses a version-2 approximate manifest, and a test pins each.
     gate: automated
 
   - id: HOST-BENCH
@@ -1436,12 +1446,16 @@ work_packages:
       - the ADR-026 D2 rule, driven by event time only
       - evaluationIntervalMs and evaluationHeartbeatMs run settings, pinned in the run record (ADR-026 D1.4)
       - an evaluationsCoalesced health counter, carried by the control-api health door and the observability metric shapes
+      - a forward-jump alarm (ADR-026 D2.10), carried the same way and routed to a page
       - a list of every changed golden, each explained
     acceptance:
       - Fill, order-update, lifecycle, start and stop callbacks fire exactly as before.
       - A coalesced market is not evaluated and persists no decision; every invoked callback persists exactly one.
       - The same dataset and settings give byte-identical decisions; no wall clock is read.
       - The cadence runs on the event-time high-water mark; a backward step in event time neither stops an evaluation nor adds one.
+      - A live-data PAPER run, and every replay that is not a reproduction, uses exactly 1,000 ms and 5,000 ms and refuses any other value; the per-frame value 0 is accepted only by a replay that reproduces a golden or a run recorded under ADR-024 (ADR-026 D1.5-D1.6).
+      - Only applied events move the cadence clock; a refused event never does. A carried-over or heartbeat evaluation takes the frame's last applied event as its source; a frame with no applied event evaluates nothing (ADR-026 D2.1, D3.2-D3.3).
+      - A test pins a forward jump in event time; the hold ends when the clock has moved on by the interval, and the forward-jump alarm fires and is carried by the health door (ADR-026 D2.10).
       - The control-api health door admits a trader health report that carries evaluationsCoalesced, and a test pins it.
       - The run record that pins both settings is named and pinned by a test; if it needs a schema change, the round stops and asks for a db/migrations grant.
       - Live and backtest share one code path.
@@ -1528,6 +1542,7 @@ work_packages:
       - Admission refuses to start in any mode other than PAPER or BACKTEST.
       - Replay reproduces admission from recorded events without the venue.
       - Admission uses only documented venue surfaces from docs/venue/verified-*.md.
+      - Admission is published with existing event contracts (MarketDiscovered@1 and the lifecycle and trading-parameter events); if they cannot carry it, the round stops and asks for a packages/domain grant (ADR-030 Decision 3.2-3.3).
       - An independent adversarial review passes before merge.
     gate: review
 
@@ -1546,6 +1561,8 @@ work_packages:
       - apps/trader/src/**
       - test/replay-golden/**
       - test/unit/strategy-runtime/**
+      # runtime-integration.test.ts pins one checkpoint per decision (ADR-027 §5).
+      - test/unit/strategies/static-bracket/**
       - test/integration/paper-trader/**
       - test/e2e/**
       - docs/handoffs/CKPT-1.md
@@ -1580,7 +1597,9 @@ work_packages:
       - a research-tier replay source
       - approximate labels on every report and run record
     acceptance:
-      - Samples are consumed in available-instant order; none is used before its instant.
+      - Samples are consumed in the recorded dispatch order of their release frames (ingestSeq within one gateway epoch), with the downsampling version's fixed tie order; never sorted by instant (ADR-029 Decision 5).
+      - A test pins that a sample released at ingestSeq 1 with instant 10,000 ms replays before one released at ingestSeq 2 with instant 9,999 ms.
+      - A replay covers one gateway epoch; a cross-epoch replay stops and asks (wal-format.md §12.1).
       - Every output is labelled approximate, from the manifest.
       - Evidence tools refuse an approximate input.
     gate: automated
