@@ -1,0 +1,261 @@
+{
+ "_provenance": "A trimmed Gamma GET /events response (fields per the listEvents OpenAPI, https://docs.polymarket.com/api-reference/events/list-events.md, fetched 2026-09-30). The btc-updown-15m-1790767800 market is H1 run 8's real market (docs/handoffs/H1-RUNS-2-8.md; Gamma 5121969); every other market is SYNTHETIC (condition ids 0x00..0n, token ids 10^70+n) with the shapes observed on 2026-09-30, including one event with no seriesSlug (series[] only), one closed market, one malformed clobTokenIds, one end before start, and two events outside the wanted series.",
+ "events": [
+  {
+   "id": "0",
+   "slug": "btc-updown-15m-1790767800",
+   "series": [
+    {
+     "slug": "btc-up-or-down-15m",
+     "recurrence": "15m"
+    }
+   ],
+   "markets": [
+    {
+     "id": "5121969",
+     "conditionId": "0x2aaeb40ad2a1ad262d75d5c52bff1a9f801fb72e65774343729fe103ee9fa308",
+     "slug": "btc-updown-15m-1790767800",
+     "eventStartTime": "2026-09-30T11:30:00Z",
+     "endDate": "2026-09-30T11:45:00Z",
+     "clobTokenIds": "[\"40113202025193181740822500498877260546965498642740503547096491847887927548587\", \"58726851105893121441976415044785550794620582864839872973127370351200548678811\"]",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": false
+    }
+   ],
+   "seriesSlug": "btc-up-or-down-15m"
+  },
+  {
+   "id": "0",
+   "slug": "btc-updown-15m-1790768700",
+   "series": [
+    {
+     "slug": "btc-up-or-down-15m",
+     "recurrence": "15m"
+    }
+   ],
+   "markets": [
+    {
+     "id": "9000001",
+     "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000001",
+     "slug": "btc-updown-15m-1790768700",
+     "eventStartTime": "2026-09-30T11:45:00Z",
+     "endDate": "2026-09-30T12:00:00Z",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000001\", \"10000000000000000000000000000000000000000000000000000000000000000000002\"]",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": false
+    }
+   ],
+   "seriesSlug": "btc-up-or-down-15m"
+  },
+  {
+   "id": "0",
+   "slug": "btc-updown-15m-1790769600",
+   "series": [
+    {
+     "slug": "btc-up-or-down-15m",
+     "recurrence": "15m"
+    }
+   ],
+   "markets": [
+    {
+     "id": "9000002",
+     "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000002",
+     "slug": "btc-updown-15m-1790769600",
+     "eventStartTime": "2026-09-30T12:00:00Z",
+     "endDate": "2026-09-30T12:15:00Z",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000003\", \"10000000000000000000000000000000000000000000000000000000000000000000004\"]",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": false
+    }
+   ],
+   "seriesSlug": "btc-up-or-down-15m"
+  },
+  {
+   "id": "0",
+   "slug": "btc-updown-15m-1790766900",
+   "series": [
+    {
+     "slug": "btc-up-or-down-15m",
+     "recurrence": "15m"
+    }
+   ],
+   "markets": [
+    {
+     "id": "9000003",
+     "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000003",
+     "slug": "btc-updown-15m-1790766900",
+     "eventStartTime": "2026-09-30T11:15:00Z",
+     "endDate": "2026-09-30T11:30:00Z",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000005\", \"10000000000000000000000000000000000000000000000000000000000000000000006\"]",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": false
+    }
+   ],
+   "seriesSlug": "btc-up-or-down-15m"
+  },
+  {
+   "id": "0",
+   "slug": "eth-updown-5m-1790767800",
+   "series": [
+    {
+     "slug": "eth-up-or-down-5m",
+     "recurrence": "5m"
+    }
+   ],
+   "markets": [
+    {
+     "id": "9000004",
+     "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000004",
+     "slug": "eth-updown-5m-1790767800",
+     "eventStartTime": "2026-09-30T11:30:00Z",
+     "endDate": "2026-09-30T11:35:00Z",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000007\", \"10000000000000000000000000000000000000000000000000000000000000000000008\"]",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": false
+    }
+   ]
+  },
+  {
+   "id": "0",
+   "slug": "eth-updown-5m-1790768100",
+   "series": [
+    {
+     "slug": "eth-up-or-down-5m",
+     "recurrence": "5m"
+    }
+   ],
+   "markets": [
+    {
+     "id": "9000005",
+     "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000005",
+     "slug": "eth-updown-5m-1790768100",
+     "eventStartTime": "2026-09-30T11:35:00Z",
+     "endDate": "2026-09-30T11:40:00Z",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000009\", \"10000000000000000000000000000000000000000000000000000000000000000000010\"]",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": false
+    }
+   ],
+   "seriesSlug": "eth-up-or-down-5m"
+  },
+  {
+   "id": "0",
+   "slug": "eth-updown-5m-1790768400",
+   "series": [
+    {
+     "slug": "eth-up-or-down-5m",
+     "recurrence": "5m"
+    }
+   ],
+   "markets": [
+    {
+     "id": "9000006",
+     "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000006",
+     "slug": "eth-updown-5m-1790768400",
+     "eventStartTime": "2026-09-30T11:40:00Z",
+     "endDate": "2026-09-30T11:45:00Z",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000011\", \"10000000000000000000000000000000000000000000000000000000000000000000012\"]",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": false
+    }
+   ],
+   "seriesSlug": "eth-up-or-down-5m"
+  },
+  {
+   "id": "0",
+   "slug": "eth-updown-5m-1790767500",
+   "series": [
+    {
+     "slug": "eth-up-or-down-5m",
+     "recurrence": "5m"
+    }
+   ],
+   "markets": [
+    {
+     "id": "9000007",
+     "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000007",
+     "slug": "eth-updown-5m-1790767500",
+     "eventStartTime": "2026-09-30T11:25:00Z",
+     "endDate": "2026-09-30T11:30:00Z",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000013\", \"10000000000000000000000000000000000000000000000000000000000000000000014\"]",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": true
+    }
+   ],
+   "seriesSlug": "eth-up-or-down-5m"
+  },
+  {
+   "id": "0",
+   "slug": "xrp-updown-5m-1790767800",
+   "series": [
+    {
+     "slug": "xrp-up-or-down-5m",
+     "recurrence": "5m"
+    }
+   ],
+   "markets": [
+    {
+     "id": "9000008",
+     "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000008",
+     "slug": "xrp-updown-5m-1790767800",
+     "eventStartTime": "2026-09-30T11:30:00Z",
+     "endDate": "2026-09-30T11:35:00Z",
+     "clobTokenIds": "not json",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": false
+    }
+   ],
+   "seriesSlug": "xrp-up-or-down-5m"
+  },
+  {
+   "id": "0",
+   "slug": "sol-updown-5m-1790767800",
+   "series": [
+    {
+     "slug": "sol-up-or-down-5m",
+     "recurrence": "5m"
+    }
+   ],
+   "markets": [
+    {
+     "id": "9000009",
+     "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000009",
+     "slug": "sol-updown-5m-1790767800",
+     "eventStartTime": "2026-09-30T11:35:00Z",
+     "endDate": "2026-09-30T11:30:00Z",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000015\", \"10000000000000000000000000000000000000000000000000000000000000000000016\"]",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": false
+    }
+   ],
+   "seriesSlug": "sol-up-or-down-5m"
+  },
+  {
+   "id": "1",
+   "slug": "rain-daily-2026-09-30",
+   "seriesSlug": "rain-daily",
+   "series": [
+    {
+     "slug": "rain-daily"
+    }
+   ],
+   "markets": [
+    {
+     "id": "9000010",
+     "conditionId": "0x000000000000000000000000000000000000000000000000000000000000000a",
+     "slug": "rain",
+     "eventStartTime": "2026-09-30T00:00:00Z",
+     "endDate": "2026-09-30T23:59:00Z",
+     "clobTokenIds": "[\"10000000000000000000000000000000000000000000000000000000000000000000017\", \"10000000000000000000000000000000000000000000000000000000000000000000018\"]",
+     "outcomes": "[\"Up\", \"Down\"]",
+     "closed": false
+    }
+   ]
+  },
+  {
+   "id": "2",
+   "slug": "one-off",
+   "markets": []
+  }
+ ]
+}
