@@ -335,7 +335,6 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 - **H4**, elapsed soak evidence: open. It is the `WP-140` gate, which closes only through the runbook §7 governance procedure after a real ≥24h soak.
 - **H5**: ruled 2026-09-28: one demonstrated run. The runbook §7 "Wave 2 closeout" check "Static Bracket runs in replay and live-data paper mode through the same code" (`:509` at `f43efe6`) is discharged by one supervised live-data paper session. That session runs through the real stack (gateway → Redis → trader → PostgreSQL), produces decisions and reads back clean. Sustained accumulation is the post-closeout activity the same section describes next (`:514` at `f43efe6`).
 - **H6**, the authorization rows and round order: the orchestrator's, ongoing.
-- **ADR-024** (`THROUGHPUT-2`): accepted provisionally on 2026-09-30, pending the user's ratification.
 - **H7**: ratified 2026-09-28 (`H7` above).
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
