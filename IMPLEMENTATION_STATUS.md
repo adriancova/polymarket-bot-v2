@@ -41,8 +41,7 @@ Only rows marked **Ready (authorized)** may be started. Each row's allowed and f
 
 - `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
 - **`WP-300`**: Ready (authorized) 2026-09-30 under the Wave 3 authorization. Collateral inventory, reservations and a wallet-operation state machine, PAPER only (modelled; no signing, no transaction, no bridge or withdrawal). Verifier: gpt-6-astra. Loop `wf_7bc7e519-3c5`.
-- **`LEAN-GOV`**: Ready (authorized) 2026-09-30, from the user's `LEAN-1` rulings (H, A1-A5). Docs only: ADR-025 onward (the laptop host profile, evaluation cadence, checkpoint-on-change, raw retention with pins, the approximate dataset class, series auto-admission), plus work-plan rows for the `LEAN-1` rounds. Verifiers: Opus and gpt-6-astra, reconciled (a docs round).
-- **`STORAGE-1`** and **`HOST-BENCH`**: authorized 2026-09-30; they start after `LEAN-GOV` merges.
+- **`STORAGE-1`**: Ready (authorized) 2026-09-30 (ADR-028 retention with pins, ADR-029 the approximate dataset class). **`HOST-BENCH`**: Ready; run by the laptop agent from `docs/runbooks/laptop-host-bench.md`.
 - **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29; startable now, because the Wave 2 closeout is done. It runs alongside Wave 3.
   - The finding: in H1 run 1, 20,367 of 37,546 decisions (54%) paused on `SB.STALE_BOOK`. Book age is `now − book.asOf`, the last change, so a quiet but live book reads stale after 2 s. The risk policy's `venueBookMaxAgeMs` has the same shape.
   - Scope (1): ADR-023, Proposed: a liveness-based freshness rule grounded ONLY in the venue's documented market-channel behaviour (`docs/venue/verified-*.md` and current official docs; never invented). The user ratifies it before merge.
@@ -157,9 +156,9 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `CI-3` | run WP-260's secure-SDK contract suite in CI (`WP260-L1`) | Complete (2026-09-30) | `a145fa4` | [CI-3](docs/handoffs/CI-3.md) |
 | `WP-300` | Collateral inventory and wallet operations | **Ready (authorized)** 2026-09-30 (Wave 3) | — | — |
 | `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
-| `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | **Ready (authorized)** 2026-09-30 | — | — |
+| `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | Complete (2026-09-30) | `78ba39b` | [LEAN-GOV](docs/handoffs/LEAN-GOV.md) |
 | `HOST-BENCH-PREP` | the laptop guide and host measurement tools | Complete (2026-09-30) | `1710a86` | [HOST-BENCH-PREP](docs/handoffs/HOST-BENCH-PREP.md) |
-| `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics | Authorized; after `LEAN-GOV` | — | — |
+| `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics (ADR-028, ADR-029) | **Ready (authorized)** 2026-09-30 | — | — |
 | `HOST-BENCH` | measure the laptop and a multi-market recording before launch | Ready: run by the laptop agent from `docs/runbooks/laptop-host-bench.md`; results come back on branch `host-bench-results-<date>` | — | — |
 | All other packages | — | Blocked | — | See work plan |
 
