@@ -29,12 +29,28 @@ const execFileAsync = promisify(execFile);
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const toolsDir = path.join(repoRoot, "tools", "bench", "host");
 
-const ALLOWED_URL_PREFIXES = [
-  "https://docs.polymarket.com/",
-  "https://gamma-api.polymarket.com",
-  "wss://ws-subscriptions-clob.polymarket.com/ws/market",
-  "https://download.docker.com/linux/ubuntu",
+/**
+ * Each allowed address: an exact origin (scheme and host, so a look-alike host
+ * such as `gamma-api.polymarket.com.example` never passes) and a path prefix.
+ */
+const ALLOWED_ENDPOINTS = [
+  { origin: "https://docs.polymarket.com", pathPrefix: "/" },
+  { origin: "https://gamma-api.polymarket.com", pathPrefix: "/" },
+  { origin: "wss://ws-subscriptions-clob.polymarket.com", pathPrefix: "/ws/market" },
+  { origin: "https://download.docker.com", pathPrefix: "/linux/ubuntu" },
 ] as const;
+
+function isAllowedUrl(text: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    return false;
+  }
+  if (url.username !== "" || url.password !== "" || url.port !== "") return false;
+  const origin = `${url.protocol}//${url.hostname}`;
+  return ALLOWED_ENDPOINTS.some((endpoint) => origin === endpoint.origin && url.pathname.startsWith(endpoint.pathPrefix));
+}
 
 const URL_PATTERN = /\b(?:https?|wss?):\/\/[^\s"'`)<>\]]+/gu;
 const CREDENTIAL_PATTERN = /\b(?:api[_-]?key|api[_-]?secret|passphrase|private[_-]?key|POLY_[A-Z_]+|Authorization|signer|mnemonic)\b/iu;
@@ -54,7 +70,7 @@ describe("tools/bench/host", () => {
     });
     const ran = /Ran (\d+) tests?/u.exec(stderr);
     expect(ran, stderr).not.toBeNull();
-    expect(Number(ran?.[1])).toBeGreaterThanOrEqual(40);
+    expect(Number(ran?.[1])).toBeGreaterThanOrEqual(69);
     expect(stderr.trimEnd().endsWith("OK"), stderr).toBe(true);
   }, 90_000);
 
@@ -74,10 +90,23 @@ describe("tools/bench/host", () => {
     const offenders: string[] = [];
     for (const { file, text } of sources) {
       for (const match of text.matchAll(URL_PATTERN)) {
-        if (!ALLOWED_URL_PREFIXES.some((prefix) => match[0].startsWith(prefix))) offenders.push(`${file}: ${match[0]}`);
+        if (!isAllowedUrl(match[0])) offenders.push(`${file}: ${match[0]}`);
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  it("accepts only the exact endpoint hosts, never a look-alike", () => {
+    expect(isAllowedUrl("https://gamma-api.polymarket.com")).toBe(true);
+    expect(isAllowedUrl("https://gamma-api.polymarket.com/events?closed=false")).toBe(true);
+    expect(isAllowedUrl("wss://ws-subscriptions-clob.polymarket.com/ws/market")).toBe(true);
+    expect(isAllowedUrl("https://gamma-api.polymarket.com.example/")).toBe(false);
+    expect(isAllowedUrl("https://gamma-api.polymarket.com.example")).toBe(false);
+    expect(isAllowedUrl("https://gamma-api.polymarket.com@evil.example/")).toBe(false);
+    expect(isAllowedUrl("https://gamma-api.polymarket.com:8443/events")).toBe(false);
+    expect(isAllowedUrl("wss://ws-subscriptions-clob.polymarket.com/ws/user")).toBe(false);
+    expect(isAllowedUrl("https://docs.polymarket.com.evil.example/")).toBe(false);
+    expect(isAllowedUrl("https://clob.polymarket.com/order")).toBe(false);
   });
 
   it("names no credential", async () => {

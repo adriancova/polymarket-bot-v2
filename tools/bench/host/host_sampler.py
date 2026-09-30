@@ -20,7 +20,18 @@ to DIR/host-raw.log each interval, for a human reader.
 No sample records a host name, a user name, an IP address or a home path:
 file-system paths are reported under the label given with --path-label, or
 by their position, and host-raw.log has the host name and the home
-directory replaced (`redact`).
+directory replaced (`redact`). Windows adapter names (which a user may have
+renamed) stay in host-samples.jsonl on the host; `summarize` reports the
+adapters as `adapter-1`, `adapter-2`, ... only, because its output is
+committed.
+
+Per process, by label: count, resident memory and CPU. The label is the
+command name for node, postgres, redis-server, dockerd and containerd, and
+`python:<script file name>` for a Python interpreter (so the recorder is
+`python:record_markets.py` whether it runs as `python3` or as a venv's
+`python`). CPU is in percent of one virtual CPU over the interval, from
+/proc/<pid>/stat utime + stime; a process that started and exited inside one
+interval is not seen, so short-lived processes are undercounted.
 """
 
 from __future__ import annotations
@@ -40,7 +51,9 @@ from pathlib import Path
 from typing import Any
 
 WHOLE_DISK = re.compile(r"^(sd[a-z]+|vd[a-z]+|nvme\d+n\d+|xvd[a-z]+)$")
-PROCESS_NAMES = ("node", "postgres", "redis-server", "python3", "dockerd", "containerd")
+PROCESS_NAMES = ("node", "postgres", "redis-server", "dockerd", "containerd")
+# A venv's interpreter runs with the command name `python`; the system one as `python3` or `python3.12`.
+PYTHON_COMMAND = re.compile(r"^python(\d+(\.\d+)?)?$")
 
 # One PowerShell script, run with -EncodedCommand. Class names are not localized.
 WINDOWS_SCRIPT = r"""
@@ -160,24 +173,88 @@ def _read(path: str) -> str | None:
         return None
 
 
-def process_rss() -> dict[str, dict[str, int]]:
-    """Resident memory (MiB) and process count by command name, for PROCESS_NAMES."""
+def process_label(comm: str, argv: list[str]) -> str | None:
+    """The label a process is reported under, or None when it is not tracked.
+
+    Only a script's file NAME is kept, never its directory (which names the home)."""
+    if comm in PROCESS_NAMES:
+        return comm
+    if PYTHON_COMMAND.match(comm):
+        for arg in argv[1:]:
+            if arg.endswith(".py"):
+                return "python:" + os.path.basename(arg)
+        return "python"
+    return None
+
+
+def parse_pid_stat(text: str) -> int | None:
+    """utime + stime (clock ticks) from /proc/<pid>/stat. The command name in
+    parentheses may hold spaces and parentheses, so fields are counted after
+    the LAST `)`: state is field 3, utime 14 and stime 15 (proc(5))."""
+    head, sep, tail = text.rpartition(")")
+    if not sep:
+        return None
+    fields = tail.split()
+    try:
+        return int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def process_table() -> dict[int, tuple[str, int, int]]:
+    """pid -> (label, resident KiB, CPU ticks) for every tracked process."""
     page_kib = os.sysconf("SC_PAGE_SIZE") // 1024
-    totals: dict[str, dict[str, int]] = {}
+    table: dict[int, tuple[str, int, int]] = {}
     for entry in os.scandir("/proc"):
         if not entry.name.isdigit():
             continue
         comm = (_read(f"/proc/{entry.name}/comm") or "").strip()
-        if comm not in PROCESS_NAMES:
+        argv = (_read(f"/proc/{entry.name}/cmdline") or "").split("\0")
+        label = process_label(comm, argv)
+        if label is None:
             continue
         statm = _read(f"/proc/{entry.name}/statm")
-        if statm is None:
+        ticks = parse_pid_stat(_read(f"/proc/{entry.name}/stat") or "")
+        if statm is None or ticks is None:
             continue
-        rss_kib = int(statm.split()[1]) * page_kib
-        slot = totals.setdefault(comm, {"count": 0, "rssMiB": 0})
+        table[int(entry.name)] = (label, int(statm.split()[1]) * page_kib, ticks)
+    return table
+
+
+def process_usage(
+    before: dict[int, tuple[str, int, int]] | None,
+    after: dict[int, tuple[str, int, int]],
+    elapsed_s: float | None,
+    ticks_per_s: float,
+) -> dict[str, dict[str, Any]]:
+    """Per label: process count, resident MiB, and CPU % of one virtual CPU
+    over the interval (None without a previous reading). A pid seen for the
+    first time counts all its ticks: it started inside the interval, or it
+    exec'd into a tracked command there."""
+    totals: dict[str, dict[str, Any]] = {}
+    for pid, (label, rss_kib, ticks) in after.items():
+        slot = totals.setdefault(label, {"count": 0, "rssKiB": 0, "ticks": 0})
         slot["count"] += 1
-        slot["rssMiB"] += rss_kib // 1024
-    return dict(sorted(totals.items()))
+        slot["rssKiB"] += rss_kib
+        old = None if before is None else before.get(pid)
+        if old is None or old[0] != label:
+            slot["ticks"] += ticks
+        else:
+            slot["ticks"] += max(0, ticks - old[2])
+    result = {}
+    for label, slot in sorted(totals.items()):
+        cpu = None
+        if before is not None and elapsed_s and elapsed_s > 0 and ticks_per_s > 0:
+            cpu = round(100.0 * slot["ticks"] / ticks_per_s / elapsed_s, 2)
+        result[label] = {"count": slot["count"], "rssMiB": slot["rssKiB"] // 1024, "cpuPct": cpu}
+    return result
+
+
+def _ticks_per_second() -> float:
+    try:
+        return float(os.sysconf("SC_CLK_TCK"))
+    except (ValueError, OSError):
+        return 100.0
 
 
 def windows_script(per_logical_processor: bool) -> str:
@@ -260,6 +337,7 @@ class Sampler:
             "stat": parse_proc_stat(_read("/proc/stat") or ""),
             "disk": parse_diskstats(_read("/proc/diskstats") or ""),
             "net": parse_net_dev(_read("/proc/net/dev") or ""),
+            "procs": process_table(),
         }
 
     def sample(self) -> dict[str, Any]:
@@ -311,7 +389,13 @@ class Sampler:
                 "freeGiB": round(stats.f_bavail * stats.f_frsize / 2**30, 2),
             }
         record["fs"] = space
-        record["processes"] = process_rss()
+        previous = self.previous
+        record["processes"] = process_usage(
+            None if previous is None else previous.get("procs"),
+            now.get("procs", {}),
+            None if previous is None else now["mono"] - previous["mono"],
+            _ticks_per_second(),
+        )
         if self.args.windows:
             record["windows"] = windows_sample(self.args.windows_timeout, self.args.windows_per_cpu)
         self.previous = now
@@ -374,7 +458,9 @@ def summarize(records: list[dict[str, Any]], interval_s: float | None = None) ->
     nets = sorted({name for r in measured for name in r.get("net", {})})
     labels = sorted({name for r in records for name in r.get("fs", {})})
     procs = sorted({name for r in records for name in r.get("processes", {})})
-    adapters = sorted({a.get("Name") for r in records for a in _as_list(_dig(r, ("windows", "net"))) if isinstance(a, dict) and a.get("Name")})
+    adapters = sorted({a.get("Name") for r in records for a in _as_list(_dig(r, ("windows", "net"))) if isinstance(a, dict) and isinstance(a.get("Name"), str) and a.get("Name")})
+    # Anonymous labels: a Windows adapter name is user-editable, and this summary is committed.
+    adapter_labels = {name: f"adapter-{index + 1}" for index, name in enumerate(adapters)}
     gaps = [
         {"at": r["at"], "intervalSeconds": r["intervalSeconds"]}
         for r in measured
@@ -458,6 +544,7 @@ def summarize(records: list[dict[str, Any]], interval_s: float | None = None) ->
             for label in labels
         },
         "processesRssMiB": {name: _stats(pick(("processes", name, "rssMiB"))) for name in procs},
+        "processesCpuPct": {name: _stats(pick(("processes", name, "cpuPct"))) for name in procs},
         "windows": {
             "errors": windows_errors,
             "percentProcessorPerformance": _stats(pick(("windows", "cpu", "PercentProcessorPerformance"))),
@@ -481,7 +568,7 @@ def summarize(records: list[dict[str, Any]], interval_s: float | None = None) ->
                 )
             },
             "adapterBytes": {
-                name: {"receivedDelta": adapter_delta(name, "ReceivedBytes"), "sentDelta": adapter_delta(name, "SentBytes")}
+                adapter_labels[name]: {"receivedDelta": adapter_delta(name, "ReceivedBytes"), "sentDelta": adapter_delta(name, "SentBytes")}
                 for name in adapters
             },
         },

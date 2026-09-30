@@ -1,4 +1,6 @@
-"""Offline checks of the host sampler's /proc parsers and summary, and of bench_table.
+"""Offline checks of the host sampler's /proc parsers, rates, per-process CPU and
+summary; of bench_table and report_tables; and of trader-bench.sh's --pin on a
+stand-in run.sh (no container, no Node).
 
 Run: python3 -m unittest discover -s tools/bench/host/tests -v
 The /proc texts below are synthetic, in the documented proc(5) layouts.
@@ -9,6 +11,9 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -141,12 +146,26 @@ class SamplerSummary(unittest.TestCase):
         self.assertEqual(summary["windows"]["percentProcessorPerformance"]["min"], 116)
         self.assertEqual(summary["windows"]["thermalKelvin"]["max"], 330.4)
         self.assertEqual(summary["windows"]["batteryStatusCounts"], {"2": 4})
-        self.assertEqual(summary["windows"]["adapterBytes"]["Ethernet"], {"receivedDelta": 3000, "sentDelta": 30})
+        self.assertEqual(summary["windows"]["adapterBytes"], {"adapter-1": {"receivedDelta": 3000, "sentDelta": 30}})
         self.assertEqual(summary["processesRssMiB"]["node"]["max"], 300)
         lps = summary["windows"]["perLogicalProcessor"]
         self.assertEqual(list(lps), ["0,2", "0,10"])  # numeric order
         self.assertEqual(lps["0,10"]["busyPct"]["mean"], 90.0)
         self.assertEqual(lps["0,2"]["busyPct"]["max"], 20)
+
+    def test_adapter_names_never_reach_the_summary_or_its_tables(self) -> None:
+        import report_tables
+
+        records = self.records()
+        personal = "Jane Doe's home Wi-Fi"
+        for record in records[1:]:
+            record["windows"]["net"].append({"Name": personal, "ReceivedBytes": 7 * record["t"], "SentBytes": 1})
+        summary = hs.summarize(records)
+        self.assertEqual(sorted(summary["windows"]["adapterBytes"]), ["adapter-1", "adapter-2"])
+        self.assertEqual(summary["windows"]["adapterBytes"]["adapter-2"], {"receivedDelta": 7 * 180, "sentDelta": 0})
+        published = json.dumps(summary) + report_tables.host(summary)
+        self.assertNotIn("Jane", published)
+        self.assertNotIn("Ethernet", published)
 
     def test_windows_script_flag(self) -> None:
         self.assertTrue(hs.windows_script(True).startswith("$PerLogicalProcessor = $true\n"))
@@ -156,6 +175,155 @@ class SamplerSummary(unittest.TestCase):
         summary = hs.summarize([])
         self.assertEqual(summary["samples"], 0)
         self.assertIsNone(summary["cpuBusyPct"])
+
+
+class SamplerRates(unittest.TestCase):
+    def test_disk_rates_and_utilization_over_the_interval(self) -> None:
+        import argparse
+        from unittest import mock
+
+        sampler = hs.Sampler(argparse.Namespace(path=["/"], path_label=["root"], windows=False))
+        stat = hs.parse_proc_stat(STAT_A)
+        sampler.previous = {"mono": 100.0, "stat": stat, "disk": {"sdd": [0, 0, 0]}, "net": {}, "procs": {}}
+        after = {"mono": 110.0, "stat": stat, "disk": {"sdd": [2048, 4096, 2500]}, "net": {}, "procs": {}}
+        with mock.patch.object(sampler, "snapshot", return_value=after):
+            record = sampler.sample()
+        # 2,500 ms of I/O in 10 s is 25 %; 2,048 sectors of 512 B in 10 s is 104,857.6 B/s.
+        self.assertEqual(record["disk"]["sdd"], {"readBytesPerSecond": 104858, "writeBytesPerSecond": 209715, "utilPct": 25.0})
+        self.assertEqual(record["intervalSeconds"], 10.0)
+
+
+class Processes(unittest.TestCase):
+    def test_labels_keep_the_script_name_only(self) -> None:
+        venv = ["/home/someone/pmb-host-bench/venv/bin/python", "/home/someone/polymarket-bot/tools/bench/host/record_markets.py", "--raw"]
+        self.assertEqual(hs.process_label("python", venv), "python:record_markets.py")  # a venv's interpreter
+        self.assertEqual(hs.process_label("python3", ["python3", "tools/bench/host/host_sampler.py", "sample"]), "python:host_sampler.py")
+        self.assertEqual(hs.process_label("python3.12", ["python3.12", "-m", "unittest"]), "python")
+        self.assertEqual(hs.process_label("node", ["node", "x.mjs"]), "node")
+        self.assertIsNone(hs.process_label("bash", ["bash"]))
+        self.assertIsNone(hs.process_label("pythonic", ["pythonic"]))
+
+    def test_pid_stat_ticks_after_the_last_parenthesis(self) -> None:
+        text = "4242 (tmux: server) (x)) S 1 4242 4242 0 -1 4194560 100 0 0 0 1500 250 0 0 20 0 1 0 12345 1000 50\n"
+        self.assertEqual(hs.parse_pid_stat(text), 1750)
+        self.assertIsNone(hs.parse_pid_stat("garbage"))
+        if Path("/proc/self/stat").exists():
+            self.assertIsNotNone(hs.parse_pid_stat(Path("/proc/self/stat").read_text(encoding="utf-8")))
+
+    def test_cpu_percent_per_label(self) -> None:
+        before = {10: ("python:record_markets.py", 51200, 1000), 11: ("node", 1024, 50), 12: ("node", 1024, 70)}
+        after = {
+            10: ("python:record_markets.py", 52224, 1600),  # +600 ticks in 30 s at 100 Hz: 20 %
+            11: ("node", 2048, 350),  # +300
+            13: ("node", 1024, 150),  # new: all 150 ticks
+        }
+        usage = hs.process_usage(before, after, 30.0, 100.0)
+        self.assertEqual(usage["python:record_markets.py"], {"count": 1, "rssMiB": 51, "cpuPct": 20.0})
+        self.assertEqual(usage["node"], {"count": 2, "rssMiB": 3, "cpuPct": 15.0})
+        self.assertIsNone(hs.process_usage(None, after, None, 100.0)["node"]["cpuPct"])
+
+    def test_the_summary_reports_cpu_per_label(self) -> None:
+        records = [
+            {"t": 0, "at": "a", "processes": {"python:record_markets.py": {"count": 1, "rssMiB": 50, "cpuPct": None}}},
+            {"t": 60, "at": "b", "intervalSeconds": 60.0, "cpu": {"busyPct": 1.0}, "processes": {"python:record_markets.py": {"count": 1, "rssMiB": 52, "cpuPct": 18.5}}},
+            {"t": 120, "at": "c", "intervalSeconds": 60.0, "cpu": {"busyPct": 1.0}, "processes": {"python:record_markets.py": {"count": 1, "rssMiB": 53, "cpuPct": 21.5}}},
+        ]
+        summary = hs.summarize(records)
+        self.assertEqual(summary["processesCpuPct"]["python:record_markets.py"]["mean"], 20.0)
+        self.assertEqual(summary["processesCpuPct"]["python:record_markets.py"]["max"], 21.5)
+
+
+FAKE_RUN_SH = r"""#!/usr/bin/env bash
+# Stand-in for tools/bench/trader-throughput/run.sh: records its own CPU list
+# and, in paced mode, spawns a publisher-like child (its arguments hold
+# --pace-from, as the bench's publisher does) and records the child's CPU list
+# once it differs from its own, or after 10 s.
+mode=""
+while [[ $# -gt 0 ]]; do [[ $1 == --mode ]] && mode="$2"; shift; done
+own="$(grep Cpus_allowed_list /proc/$$/status | cut -f2)"
+echo "${own}" > "${FAKE_OUT}/bench-cpus"
+if [[ ${mode} == paced ]]; then
+  python3 -c 'import time; time.sleep(12)' --pace-from 0 &
+  child=$!
+  for _ in $(seq 100); do
+    theirs="$(grep Cpus_allowed_list /proc/${child}/status | cut -f2)"
+    [[ ${theirs} != "${own}" ]] && break
+    sleep 0.1
+  done
+  echo "${theirs}" > "${FAKE_OUT}/publisher-cpus"
+  kill "${child}"
+fi
+echo "RESULT fake ${mode}"
+"""
+
+
+def cpu_set(text: str) -> set[int]:
+    cpus: set[int] = set()
+    for part in text.strip().split(","):
+        low, _, high = part.partition("-")
+        cpus.update(range(int(low), int(high or low) + 1))
+    return cpus
+
+
+@unittest.skipUnless(
+    sys.platform.startswith("linux") and shutil.which("taskset") and shutil.which("pgrep") and (os.cpu_count() or 1) >= 2,
+    "needs Linux, taskset, pgrep and 2 or more CPUs",
+)
+class TraderBenchPin(unittest.TestCase):
+    """trader-bench.sh --pin pins the trader only; the paced publisher runs elsewhere."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.repo = root / "repo"
+        (self.repo / "tools/bench/host").mkdir(parents=True)
+        (self.repo / "tools/bench/trader-throughput").mkdir(parents=True)
+        script = self.repo / "tools/bench/host/trader-bench.sh"
+        shutil.copy(HERE.parent / "trader-bench.sh", script)
+        fake = self.repo / "tools/bench/trader-throughput/run.sh"
+        fake.write_text(FAKE_RUN_SH, encoding="utf-8")
+        fake.chmod(0o755)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "t"],
+            check=True,
+        )
+        (root / "fx").mkdir()
+        (root / "fx" / "run-1-window-burst.jsonl").write_text("{}\n", encoding="utf-8")
+        (root / "out").mkdir()
+        self.env = {**os.environ, "FX": str(root / "fx"), "HB": str(root / "hb"), "FAKE_OUT": str(root / "out")}
+        self.out = root / "out"
+        self.hb = root / "hb"
+        self.cpus = set(os.sched_getaffinity(0))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def bench(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(self.repo / "tools/bench/host/trader-bench.sh"), *args],
+            env=self.env, capture_output=True, text=True, timeout=60, check=False,
+        )
+
+    def test_paced_publisher_is_moved_off_the_pinned_cpu(self) -> None:
+        pin = min(self.cpus)
+        done = self.bench("--pin", str(pin), "pinned-paced-1", "paced")
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(cpu_set((self.out / "bench-cpus").read_text()), {pin})
+        publisher = cpu_set((self.out / "publisher-cpus").read_text())
+        self.assertNotIn(pin, publisher)
+        self.assertTrue(publisher)
+        runs = (self.hb / "trader-throughput" / "runs.txt").read_text()
+        self.assertIn(f"pin={pin} publisher=", runs)
+        self.assertNotIn("publisher=missed", runs)
+
+    def test_catch_up_has_no_publisher_and_a_list_is_refused(self) -> None:
+        pin = min(self.cpus)
+        done = self.bench("--pin", str(pin), "pinned-catch-up-1", "catch-up")
+        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+        self.assertEqual(cpu_set((self.out / "bench-cpus").read_text()), {pin})
+        self.assertIn("publisher=n/a", (self.hb / "trader-throughput" / "runs.txt").read_text())
+        self.assertEqual(self.bench("--pin", "0,1", "x", "catch-up").returncode, 64)
 
 
 class BenchTable(unittest.TestCase):
@@ -237,7 +405,7 @@ class ReportTables(unittest.TestCase):
 
         text = report_tables.host(hs.summarize(SamplerSummary().records()))
         self.assertIn("| WSL CPU busy % |", text)
-        self.assertIn('| Windows adapter "Ethernet" received / sent bytes | 3,000 / 30 |', text)
+        self.assertIn("| Windows adapter-1 received / sent bytes | 3,000 / 30 |", text)
         self.assertIn("| 0,10 |", text)
         self.assertIn("Gaps: 2026-10-01T00:03:00Z (400.0 s)", text)
 

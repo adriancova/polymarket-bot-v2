@@ -18,6 +18,12 @@ Outputs in DIR (see README.md):
     windows.jsonl           every window the recorder subscribed, when it was added and removed
     recorder.log            connections, rollovers, Gamma polls, errors
     raw/<series>/<hour>.jsonl.gz   with --raw: every inbound text frame, {"t", "p"}
+
+Exit status: 0 when the recording ran to its end or was interrupted (SIGINT,
+SIGTERM); 2 when Gamma never answered or listed no wanted window at the start;
+3 when a recorder task died or the main loop failed. `summary.json` then says
+`"outcome": "failed"` and lists `failures`; the recording stops at once, so a
+failure is never hidden behind a quiet 24 hours.
 """
 
 from __future__ import annotations
@@ -31,7 +37,6 @@ import random
 import signal
 import sys
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -48,12 +53,14 @@ MAX_FRAME_BYTES = 32 * 1024 * 1024
 
 
 class Log:
-    def __init__(self, path: Path | None) -> None:
+    def __init__(self, path: Path | None, echo: bool = True) -> None:
         self._file = open(path, "a", encoding="utf-8") if path is not None else None
+        self._echo = echo
 
     def __call__(self, message: str) -> None:
         line = f"{core.iso(time.time())} {message}"
-        print(line, file=sys.stderr, flush=True)
+        if self._echo:
+            print(line, file=sys.stderr, flush=True)
         if self._file is not None:
             self._file.write(line + "\n")
             self._file.flush()
@@ -74,8 +81,15 @@ def _get_json(url: str, timeout_s: float = 15.0) -> Any:
         return json.load(response)
 
 
-def fetch_events(now: float, horizon_s: float, linger_s: float) -> list[Any]:
-    """Open events whose end lies in [now - linger, now + horizon], all pages."""
+def fetch_events(now: float, horizon_s: float, linger_s: float) -> tuple[list[Any], bool]:
+    """Open events whose end lies in [now - linger, now + horizon], all pages.
+
+    Returns (events, truncated). Pages are ordered by event `id`, ascending
+    (the documented `order` and `ascending` parameters), so offset paging is
+    stable while new events are listed. `truncated` is True when the last page
+    allowed (GAMMA_MAX_PAGES) was full, so more events may exist: the caller
+    logs and counts it. On 2026-09-30 the 40-minute horizon held about 110
+    events, two pages."""
     events: list[Any] = []
     for page in range(GAMMA_MAX_PAGES):
         query = urllib.parse.urlencode(
@@ -83,6 +97,8 @@ def fetch_events(now: float, horizon_s: float, linger_s: float) -> list[Any]:
                 "closed": "false",
                 "end_date_min": core.gamma_time(now - linger_s),
                 "end_date_max": core.gamma_time(now + horizon_s),
+                "order": "id",
+                "ascending": "true",
                 "limit": GAMMA_PAGE_LIMIT,
                 "offset": page * GAMMA_PAGE_LIMIT,
             }
@@ -92,8 +108,8 @@ def fetch_events(now: float, horizon_s: float, linger_s: float) -> list[Any]:
             raise ValueError("the /events response is not a JSON array")
         events.extend(batch)
         if len(batch) < GAMMA_PAGE_LIMIT:
-            break
-    return events
+            return events, False
+    return events, True
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +172,18 @@ class RawWriter:
 
 
 class SeriesConnection:
-    def __init__(self, series: str, recorder: "Recorder") -> None:
+    """One public market WebSocket for one series.
+
+    `connect` is `websockets.asyncio.client.connect` unless a test passes a
+    stand-in with the same call shape (an async context manager yielding a
+    socket with `send`, `close` and async iteration)."""
+
+    def __init__(self, series: str, recorder: "Recorder", connect: Any = None) -> None:
         self.series = series
         self.recorder = recorder
+        self._connect = connect
+        self.ping_interval_s = core.PING_INTERVAL_S
+        self.pong_timeout_s = core.PONG_TIMEOUT_S
         self.desired: set[str] = set()
         self.subscribed: set[str] = set()
         self.ws: Any = None
@@ -194,7 +219,9 @@ class SeriesConnection:
         }
 
     async def run(self, stop: asyncio.Event) -> None:
-        from websockets.asyncio.client import connect  # imported here: the core stays stdlib-only
+        connect = self._connect
+        if connect is None:
+            from websockets.asyncio.client import connect  # imported here: the core stays stdlib-only
 
         log = self.recorder.log
         attempt = 0
@@ -301,10 +328,10 @@ class SeriesConnection:
 
     async def _ping(self, ws: Any) -> None:
         while True:
-            await asyncio.sleep(core.PING_INTERVAL_S)
-            if time.monotonic() - self.last_pong > core.PONG_TIMEOUT_S:
+            await asyncio.sleep(self.ping_interval_s)
+            if time.monotonic() - self.last_pong > self.pong_timeout_s:
                 self.stale_closes += 1
-                raise TimeoutError(f"no PONG for {core.PONG_TIMEOUT_S:.0f} s")
+                raise TimeoutError(f"no PONG for {self.pong_timeout_s:g} s")
             await ws.send("PING")
 
 
@@ -329,30 +356,57 @@ class Recorder:
         self.args = args
         self.out = Path(args.out_dir)
         self.out.mkdir(parents=True, exist_ok=True)
-        self.log = Log(self.out / "recorder.log")
+        self.log = Log(self.out / "recorder.log", echo=not getattr(args, "quiet", False))
         self.stats = core.Stats(bucket_s=10)
         self.registry: dict[str, core.Window] = {}  # condition id -> window (every window seen)
         self.known: dict[str, core.Window] = {}  # condition id -> window still relevant
         self.active: dict[str, core.Window] = {}  # condition id -> window subscribed now
         self.raw = RawWriter(self.out / "raw" if args.raw else None, args.raw_gzip_level)
-        self.connections = {series: SeriesConnection(series, self) for series in args.series}
+        connect = getattr(args, "connect", None)
+        self.connections = {series: SeriesConnection(series, self, connect) for series in args.series}
         self.started_at = time.time()
         self.gamma_polls = 0
         self.gamma_failures = 0
+        self.gamma_failure_kinds: dict[str, int] = {}
+        self.gamma_consecutive_failures = 0
+        self.gamma_max_consecutive_failures = 0
+        self.gamma_truncated_polls = 0
         self.gamma_problems: dict[str, int] = {}
         self.last_gamma_ok: float | None = None
+        self.outcome = "running"
+        self.failures: list[dict[str, str]] = []
+        self.interrupted = False
         self.per_second = gzip.open(self.out / "per-second.jsonl.gz", "at", encoding="utf-8")
         self.windows_log = open(self.out / "windows.jsonl", "a", encoding="utf-8")
 
     async def poll_gamma(self) -> bool:
+        """One Gamma poll. Every failure is counted and logged, and the loop
+        polls again next interval: `http.client.HTTPException` (for example
+        `IncompleteRead`), `json.JSONDecodeError`, TLS and socket errors alike.
+        Only cancellation propagates."""
         self.gamma_polls += 1
         now = time.time()
         try:
-            events = await asyncio.to_thread(fetch_events, now, self.args.horizon_seconds, self.args.linger_seconds)
-        except (urllib.error.URLError, OSError, ValueError, TimeoutError) as error:
+            events, truncated = await asyncio.to_thread(
+                fetch_events, now, self.args.horizon_seconds, self.args.linger_seconds
+            )
+        except Exception as error:  # noqa: BLE001 (a failed poll must never end discovery)
+            kind = type(error).__name__
             self.gamma_failures += 1
-            self.log(f"gamma: poll failed ({type(error).__name__}: {error}); keeping {len(self.known)} known windows")
+            self.gamma_failure_kinds[kind] = self.gamma_failure_kinds.get(kind, 0) + 1
+            self.gamma_consecutive_failures += 1
+            self.gamma_max_consecutive_failures = max(
+                self.gamma_max_consecutive_failures, self.gamma_consecutive_failures
+            )
+            self.log(
+                f"gamma: poll failed ({kind}: {error}); {self.gamma_consecutive_failures} in a row; "
+                f"keeping {len(self.known)} known windows"
+            )
             return False
+        self.gamma_consecutive_failures = 0
+        if truncated:
+            self.gamma_truncated_polls += 1
+            self.log(f"gamma: TRUNCATED: {GAMMA_MAX_PAGES} full pages of {GAMMA_PAGE_LIMIT}; later events not read")
         windows, problems = core.parse_gamma_events(events, self.args.series)
         for problem in problems:
             self.gamma_problems[problem] = self.gamma_problems.get(problem, 0) + 1
@@ -435,10 +489,17 @@ class Recorder:
                     "python": sys.version.split()[0],
                     "websockets": ws_version,
                 },
+                "outcome": self.outcome,
+                "failures": list(self.failures),
                 "gamma": {
                     "polls": self.gamma_polls,
                     "failures": self.gamma_failures,
+                    "failureKinds": dict(sorted(self.gamma_failure_kinds.items())),
+                    "consecutiveFailuresNow": self.gamma_consecutive_failures,
+                    "maxConsecutiveFailures": self.gamma_max_consecutive_failures,
+                    "truncatedPolls": self.gamma_truncated_polls,
                     "lastOk": None if self.last_gamma_ok is None else core.iso(self.last_gamma_ok),
+                    "secondsSinceLastOk": None if self.last_gamma_ok is None else round(now - self.last_gamma_ok, 1),
                     "skipped": self.gamma_problems,
                 },
                 "connections": {s: c.report(now) for s, c in self.connections.items()},
@@ -454,11 +515,30 @@ class Recorder:
         os.replace(temporary, path)
         return path
 
+    def _fail(self, task: str, error: BaseException | None) -> None:
+        detail = f"{type(error).__name__}: {error}"[:300] if error is not None else "ended before the recording did"
+        self.failures.append({"at": core.iso(time.time()), "task": task, "error": detail})
+        self.outcome = "failed"
+        self.log(f"recorder: FAILED: task {task}: {detail}; stopping")
+
+    def _dead_task(self, tasks: dict[str, "asyncio.Task[None]"]) -> bool:
+        """Records the first task that ended while the recording still runs.
+        Every task loops until `stop` is set, so any ending is a failure."""
+        for name, task in tasks.items():
+            if task.done():
+                self._fail(name, None if task.cancelled() else task.exception())
+                return True
+        return False
+
+    def _on_signal(self, stop: asyncio.Event) -> None:
+        self.interrupted = True
+        stop.set()
+
     async def run(self) -> int:
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for signum in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(signum, stop.set)
+            loop.add_signal_handler(signum, self._on_signal, stop)
         self.log(
             f"recorder: series={','.join(self.args.series)} duration={self.args.duration_seconds:.0f}s "
             f"raw={'on' if self.args.raw else 'off'}"
@@ -474,14 +554,20 @@ class Recorder:
             self.log("recorder: Gamma lists no window of the wanted series; check --series with --list-series")
             return 2
         self.reconcile(time.time())
-        tasks = [asyncio.create_task(c.run(stop)) for c in self.connections.values()]
-        tasks.append(asyncio.create_task(self.gamma_loop(stop)))
+        tasks: dict[str, asyncio.Task[None]] = {
+            f"connection {s}": asyncio.create_task(c.run(stop)) for s, c in self.connections.items()
+        }
+        tasks["gamma"] = asyncio.create_task(self.gamma_loop(stop))
         deadline = time.monotonic() + self.args.duration_seconds
         next_summary = time.monotonic() + self.args.summary_every_seconds
         try:
             while not stop.is_set():
                 await _wait_any(stop, None, timeout=1.0 - (time.time() % 1.0))
                 now = time.time()
+                if stop.is_set():
+                    break  # a signal: the tasks are ending on purpose
+                if self._dead_task(tasks):
+                    break
                 if time.monotonic() >= deadline:
                     self.log("recorder: duration reached")
                     break
@@ -491,23 +577,33 @@ class Recorder:
                     next_summary = time.monotonic() + self.args.summary_every_seconds
                     self.write_summary(now, final=False)
                     self.per_second.flush()
+        except Exception as error:  # noqa: BLE001 (recorded, then the summary is still written)
+            self._fail("main loop", error)
         finally:
             stop.set()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+            for name, result in zip(tasks, results):
+                if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                    if not any(f["task"] == name for f in self.failures):
+                        self._fail(name, result)
+            if self.outcome == "running":
+                self.outcome = "interrupted" if self.interrupted else "complete"
             now = time.time()
             self.flush_seconds(now + 3)
             self.per_second.close()
             self.windows_log.close()
             self.raw.close()
             path = self.write_summary(now, final=True)
-            self.log(f"recorder: wrote {path.name}")
+            self.log(f"recorder: wrote {path.name}; outcome {self.outcome}")
             self.log.close()
-        return 0
+        return 3 if self.outcome == "failed" else 0
 
 
 def list_series(horizon_s: float) -> int:
-    events = fetch_events(time.time(), horizon_s, 0)
+    events, truncated = fetch_events(time.time(), horizon_s, 0)
     print(json.dumps(core.count_series(events), indent=2))
+    if truncated:
+        print(f"TRUNCATED: {GAMMA_MAX_PAGES} full pages; later events not listed", file=sys.stderr)
     return 0
 
 

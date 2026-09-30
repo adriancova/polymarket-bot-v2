@@ -11,7 +11,9 @@ about the venue is assumed.
   https://docs.polymarket.com/api-reference/rate-limits.md ("Gamma API",
   "Base URL"), fetched 2026-09-30.
 - `GET /events` with the query parameters `closed`, `end_date_min`,
-  `end_date_max`, `limit`, `offset`; the Event fields `seriesSlug`,
+  `end_date_max`, `order` ("Comma-separated list of fields to order by"; the
+  recorder passes the Event field `id`), `ascending`, `limit`, `offset`; the
+  Event fields `id`, `seriesSlug`,
   `series[].slug` and `markets[]`; the Market fields `id`, `conditionId`,
   `slug`, `eventStartTime`, `endDate`, `clobTokenIds` (type `string`),
   `outcomes` (type `string`) and `closed`:
@@ -313,9 +315,17 @@ def update_frame(operation: str, token_ids: Iterable[str]) -> dict[str, Any]:
     return frame
 
 
+# 0.25 s * 2**7 = 32 s is already past the 30 s cap; a larger exponent adds
+# nothing, and 2**1024 as a float overflows (OverflowError).
+_BACKOFF_MAX_EXPONENT = 16
+
+
 def backoff_delay(attempt: int, unit_random: float) -> float:
-    """Full-jitter exponential backoff: a uniform draw in [0, min(max, base * 2**attempt)]."""
-    ceiling = min(RECONNECT_MAX_S, RECONNECT_BASE_S * (2 ** max(0, attempt)))
+    """Full-jitter exponential backoff: a uniform draw in [0, min(max, base * 2**attempt)].
+
+    Defined for every attempt count: the exponent is capped before it is used."""
+    exponent = min(max(0, attempt), _BACKOFF_MAX_EXPONENT)
+    ceiling = min(RECONNECT_MAX_S, RECONNECT_BASE_S * (2**exponent))
     return max(RECONNECT_BASE_S, ceiling * min(1.0, max(0.0, unit_random)))
 
 
@@ -479,6 +489,18 @@ class Stats:
             self.seconds[second][series][FRAMES] += 1
         return decoded
 
+    def peak_1s_view(self) -> dict[str, tuple[int, int]]:
+        """The per-series 1-second peak over drained AND buffered seconds, without
+        draining anything: a partial summary must not take rows away from the
+        per-second file, nor split the current second in two."""
+        peaks = dict(self.peak_1s)
+        for second in sorted(self.seconds):
+            for series, counts in self.seconds[second].items():
+                best = peaks.get(series)
+                if best is None or counts[ENVELOPES] > best[0]:
+                    peaks[series] = (counts[ENVELOPES], second)
+        return peaks
+
     def drain_seconds(self, before_second: int) -> list[tuple[int, dict[str, list[int]]]]:
         """Remove and return every per-second row older than `before_second`, oldest first."""
         rows = []
@@ -607,8 +629,11 @@ def summarize(
     ended_at: float,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The recording's summary document (see README.md "summary.json")."""
-    stats.drain_seconds(int(ended_at) + 1)
+    """The recording's summary document (see README.md "summary.json").
+
+    Read-only on `stats`: it never drains the per-second rows (the caller
+    writes those to `per-second.jsonl.gz`)."""
+    peaks = stats.peak_1s_view()
     duration = max(0.0, ended_at - started_at)
     bucket_s = stats.bucket_s
     covered = _covered_buckets(started_at, ended_at, bucket_s)
@@ -625,7 +650,7 @@ def summarize(
     for name in series_names:
         counts = stats.buckets.get(name, {})
         opens = [w.start for w in windows_seen.values() if w.series == name]
-        peak = stats.peak_1s.get(name)
+        peak = peaks.get(name)
         per_series[name] = {
             "asset": asset_of_series(name),
             **_totals_block(series_counts[name], duration),
@@ -681,7 +706,7 @@ def summarize(
 
     return {
         "tool": "tools/bench/host/record_markets.py",
-        "summaryVersion": 1,
+        "summaryVersion": 2,
         "startedAt": iso(started_at),
         "endedAt": iso(ended_at),
         "durationSeconds": duration,

@@ -165,6 +165,12 @@ class Rollover(unittest.TestCase):
         self.assertEqual(core.backoff_delay(30, 1.0), core.RECONNECT_MAX_S)
         self.assertLessEqual(core.backoff_delay(30, 0.5), core.RECONNECT_MAX_S)
 
+    def test_backoff_is_defined_for_any_attempt_count(self) -> None:
+        # 0.25 * 2**1024 overflows a float; a long outage must never reach it.
+        for attempt in (1023, 1024, 5000, 10**6):
+            self.assertEqual(core.backoff_delay(attempt, 1.0), core.RECONNECT_MAX_S)
+            self.assertEqual(core.backoff_delay(attempt, 0.5), core.RECONNECT_MAX_S / 2)
+
 
 class FrameDecoding(unittest.TestCase):
     def test_every_recorded_frame_decodes(self) -> None:
@@ -295,6 +301,64 @@ class Summary(unittest.TestCase):
         self.assertEqual(summary["perAsset"]["btc"]["events"], 1700)
         self.assertEqual(summary["durationSeconds"], 1200)
         self.assertEqual(json.loads(json.dumps(summary))["perSeries"]["btc-up-or-down-15m"]["asset"], "btc")
+
+    def test_partial_summaries_neither_drain_nor_split_seconds(self) -> None:
+        stats = core.Stats()
+        body = '{"event_type":"price_change","market":"m","price_changes":[{}]}'
+        truth: dict[int, int] = {}
+
+        def frame(t: float, times: int = 1) -> None:
+            for _ in range(times):
+                stats.record_frame(t, "s", body, {})
+            truth[int(t)] = truth.get(int(t), 0) + times
+
+        for second in range(1000, 1004):
+            frame(second + 0.1)
+        frame(1004.2, 5)
+        first = core.summarize(stats, {}, ["s"], 1000.0, 1004.5)  # a partial summary mid-second
+        self.assertEqual(first["perSeries"]["s"]["peak1sEnvelopesPerSecond"], 5)  # the buffered second counts
+        frame(1004.8, 7)  # the same second continues after the partial summary
+        second = core.summarize(stats, {}, ["s"], 1000.0, 1004.9)
+        self.assertEqual(second["perSeries"]["s"]["peak1sEnvelopesPerSecond"], 12)
+        self.assertEqual(second["perSeries"]["s"]["peak1sAt"], core.iso(1004))
+        rows = stats.drain_seconds(10**9)  # what the recorder writes to per-second.jsonl.gz
+        self.assertEqual({t: row["s"][core.EVENTS] for t, row in rows}, truth)
+        self.assertEqual(stats.peak_1s["s"], (12, 1004))
+
+    def test_covered_buckets_are_the_whole_buckets_only(self) -> None:
+        self.assertEqual(core._covered_buckets(1003.0, 1047.0, 10), range(101, 104))
+        self.assertEqual(core._covered_buckets(1000.0, 1040.0, 10), range(100, 104))
+        self.assertEqual(core._covered_buckets(1003.0, 1009.0, 10), range(101, 101))
+
+    def test_open_interval_runs_from_30_s_before_to_90_s_after(self) -> None:
+        open_t = 100_000.0
+        covered = range(9_000, 11_000)
+        counts = {b: [0, 0, 10, 0] for b in covered}  # 1 envelope/s everywhere
+        counts[int((open_t + 80) // 10)] = [0, 0, 500, 0]  # 50/s in the bucket starting at T+80 s
+        counts[int((open_t + 90) // 10)] = [0, 0, 900, 0]  # 90/s at T+90 s: outside the interval
+        counts[int((open_t - 40) // 10)] = [0, 0, 700, 0]  # 70/s at T-40 s: outside the interval
+        stats = core.open_stats(counts, [open_t], covered, 10)
+        self.assertEqual(stats["intervalSeconds"], [-30, 90])
+        self.assertEqual(stats["opens"], 1)
+        self.assertEqual(stats["peak10sEnvelopesPerSecond"], 50.0)
+        # 12 buckets (T-30 .. T+80); nearest-rank p95 of 12 values is the 12th: the peak.
+        self.assertEqual(stats["p95_10sEnvelopesPerSecond"], 50.0)
+
+    def test_aligned_opens_are_the_quarter_hours_only(self) -> None:
+        opens_at = ["2026-09-30T11:35:00Z", "2026-09-30T11:40:00Z", "2026-09-30T11:45:00Z", "2026-09-30T11:50:00Z"]
+        windows = {}
+        for index, text in enumerate(opens_at):
+            start = at(text)
+            windows[f"c{index}"] = core.Window("btc-up-or-down-5m", "btc", f"e{index}", str(index), f"c{index}", start, start + 300, ("t",), ())
+        begin, end = at("2026-09-30T11:30:00Z"), at("2026-09-30T12:00:00Z")
+        stats = core.Stats()
+        for second in range(int(begin), int(end)):
+            stats.record_frame(second + 0.5, "btc-up-or-down-5m", '{"event_type":"book","market":"c0"}', windows)
+        summary = core.summarize(stats, windows, ["btc-up-or-down-5m"], begin, end)
+        aligned = summary["all"]["atAlignedOpens"]
+        self.assertEqual(aligned["opens"], 1)
+        self.assertEqual([o["open"] for o in aligned["busiestOpens"]], ["2026-09-30T11:45:00.000Z"])
+        self.assertEqual(summary["all"]["atAnyOpen"]["opens"], 4)
 
     def test_percentile_nearest_rank(self) -> None:
         self.assertIsNone(core.percentile([], 0.95))

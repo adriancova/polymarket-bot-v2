@@ -138,15 +138,21 @@ git config --global user.email "<email, or your GitHub noreply address>"
 
 In `gh auth login`, choose GitHub.com, HTTPS, and log in with the browser.
 
-0.12. **Claude Code in WSL.** Install it with Anthropic's native installer, then start it in the repository:
+0.12. **Claude Code in WSL.** Install it with Anthropic's native installer. The installer puts `claude` in `~/.local/bin`, which this shell does not have on its `PATH` yet, so add it before the first use:
 
 ```bash
 curl -fsSL https://claude.ai/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
+grep -q '.local/bin' ~/.bashrc || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+claude --version
+```
+
+`claude --version` must print a version. If it says "command not found", close the Ubuntu window, open it again and repeat `claude --version`. If the installer URL has changed, follow Anthropic's current Claude Code setup page. Then start it in the repository and log in when asked:
+
+```bash
 cd ~/polymarket-bot
 claude
 ```
-
-If the installer URL has changed, follow Anthropic's current Claude Code setup page. Log in when asked.
 
 0.13. **Start the agent.** Tell it: "follow `docs/runbooks/laptop-host-bench.md`". Also tell it:
 - Ethernet or Wi-Fi;
@@ -251,7 +257,13 @@ Poll until `gate-test.log` ends with an `exit=` line:
 tail -12 "$HB/gate-test.log"
 ```
 
-Expected: `git status` prints nothing, typecheck `exit=0`, and the test log ends with `Test Files ... passed`, the `time` lines and `exit=0`. Record the test count and the wall time. Any failure: STOP. Do not rerun a failing test to make it pass.
+Expected: `git status` prints nothing, typecheck `exit=0`, and the test log ends with `Test Files ... passed`, the `time` lines and `exit=0`. Record the test count and the wall time.
+
+Any failure: STOP. Do not rerun the suite to make it pass. Before you stop, collect the evidence the user needs:
+- the failing file and test names, and whether the failure reads `Test timed out in 5000ms` (a load-sensitive timeout) or is an assertion;
+- one isolated diagnostic run of each failing file, for example `pnpm exec vitest run <failing file> 2>&1 | tail -15`, and its result.
+
+Write both to `PROGRESS.md` and report them together. A file that passes alone does not turn the failure into a pass; the user decides whether to go on.
 
 2.5. **The recorder's Python environment.**
 
@@ -262,7 +274,7 @@ python3 -m venv "$HB/venv"
 "$HB/venv/bin/python" -m unittest discover -s "$REPO/tools/bench/host/tests" 2>&1 | tail -3
 ```
 
-Expected: `Ran 46 tests` (or more) and `OK`.
+Expected: `Ran 69 tests` (or more) and `OK`. These are offline: no network, no container.
 
 2.6. **The fixture.** Verify the checksum, then decompress it next to the original:
 
@@ -327,6 +339,11 @@ wraps it with this guide's fixed inputs.
 What to record per run: events/s, CPU µs per event, max and p99 lag, halts.
 `bench_table.py` collects them.
 
+The bench has no switch that turns the strategy's evaluation off, so LEAN-1
+§9 item 1's "with and without evaluation" is NOT measured here: every run is
+"with". Do not change code to add one. The results file lists it as
+UNVERIFIED (step 6.1, section 5).
+
 **About the cores.** The i7-12700H has 6 P-cores, each with 2 threads, and 8
 E-cores with 1 thread each: 20 logical processors. P-cores run at up to about
 4.7 GHz and E-cores at up to about 3.5 GHz. Windows usually numbers the P-core
@@ -335,8 +352,17 @@ measurements.
 
 WSL2 is a virtual machine. Windows, not Linux, decides which physical core
 runs each of its 20 virtual CPUs at any moment. So `taskset` inside WSL pins a
-process to a virtual CPU, **not** to a P-core. It removes migrations inside the VM and
-nothing more. Which physical core runs that virtual CPU is Windows' choice.
+process to a virtual CPU, **not** to a P-core. Which physical core runs that
+virtual CPU is Windows' choice.
+
+What `trader-bench.sh --pin 2` pins, exactly:
+- the bench process, which runs the trader, to virtual CPU 2, so the trader never migrates between virtual CPUs inside the VM;
+- in paced mode, the bench spawns a separate publisher process. The script moves it to every OTHER virtual CPU as soon as it appears, so the publisher never shares the trader's virtual CPU, just as in the unpinned runs. `runs.txt` records it as `publisher=<list>`;
+- PostgreSQL and Redis, which Docker starts, are never pinned.
+
+So the pinned runs differ from the unpinned ones in one thing only: the trader
+stays on one virtual CPU.
+
 Windows' own view per logical processor comes from the sampler
 (`--windows-per-cpu`). The optional step 3.7 tries to restrict the WSL VM to
 the P-cores from Windows.
@@ -395,7 +421,7 @@ Poll every few minutes until `PART3-DONE` appears (about 1-2 hours):
 cat "$HB/trader-throughput/runs.txt"; tail -3 "$HB/part3.log"
 ```
 
-Every line must say `exit=0`. A non-zero exit, or `halts:` other than `none`: STOP and keep the run's log (`$HB/trader-throughput/<label>.log`).
+Every line must say `exit=0`. A non-zero exit, or `halts:` other than `none`: STOP and keep the run's log (`$HB/trader-throughput/<label>.log`). Every `pinned-paced-*` line must also say `publisher=` followed by a list of CPUs. `publisher=missed` means the publisher ran on the trader's CPU, so that run does not compare with the unpinned ones: record it and STOP.
 
 3.4. **The table and the determinism check.**
 
@@ -565,17 +591,22 @@ date -u -d '+24 hours' +'recording ends at about %FT%TZ' | tee -a "$HB/PROGRESS.
 ```bash
 . ~/pmb-host-bench/env.sh
 grep -c ': connected;' "$HB/recording/recorder.log"; grep -c ': disconnected' "$HB/recording/recorder.log"
+grep -E 'FAILED|TRUNCATED' "$HB/recording/recorder.log" || echo "no failure lines"
 python3 "$REPO/tools/bench/host/report_tables.py" recording "$HB/recording/summary.partial.json"
 tail -1 "$HB/host-24h/host-samples.jsonl" | head -c 300; echo
 ```
 
 Expected:
-- `8` connections and `0` disconnections;
+- `8` connections and `0` disconnections; `no failure lines`;
+- the first line of the tables says `outcome=running; failures=0`;
 - a series table with non-zero GB/day for every series;
 - `disconnects` 0 in the connection table;
+- in the Gamma line, `last OK` under 180 s before the summary, and `truncated polls 0`;
 - a sampler line.
 
-If a series shows 0 bytes, or the log repeats `disconnected`, STOP. Check again after about 1 hour.
+If a series shows 0 bytes, the log repeats `disconnected`, or any line says `FAILED`, STOP. Check again after about 1 hour.
+
+The recorder stops by itself, with exit status 3 and `"outcome": "failed"`, if any of its tasks dies. A failed Gamma poll is not a task death: it is counted (`failures`, by kind), and the next poll a minute later tries again. Market windows already known keep being recorded for up to 40 minutes meanwhile.
 
 4.5. **Tell the user** the end time, that the Ubuntu window must stay open, and that they should come back and say "continue" after it. Write the step to `PROGRESS.md`. You may end your turn here.
 
@@ -584,11 +615,13 @@ If a series shows 0 bytes, or the log repeats `disconnected`, STOP. Check again 
 ```bash
 . ~/pmb-host-bench/env.sh
 tail -3 "$HB/recording/recorder.log"; ls -l "$HB/recording/summary.json"
-python3 -c "import json,os; print('final:', json.load(open(os.path.expandvars('\$HB/recording/summary.json')))['final'])"
+python3 -c "import json,os; s = json.load(open(os.path.expandvars('\$HB/recording/summary.json'))); g = s['gamma']; print('final:', s['final'], 'outcome:', s['outcome'], 'failures:', s['failures']); print('gamma failures:', g['failures'], g['failureKinds'], 'most in a row:', g['maxConsecutiveFailures'], 'truncated:', g['truncatedPolls'])"
 tmux ls 2>/dev/null
 ```
 
-Expected: `wrote summary.json`, `final: True`, and no `pmb-rec` session. If the sampler is still running, stop it with `tmux send-keys -t pmb-host24 C-c`.
+Expected: `wrote summary.json; outcome complete`, `final: True outcome: complete failures: []`, and no `pmb-rec` session. Gamma failures should be a handful at most; `most in a row` above 30 means discovery was down for over half an hour, which you record as an incident. If the sampler is still running, stop it with `tmux send-keys -t pmb-host24 C-c`.
+
+`outcome: failed`: the recording stopped early. Its `failures` list says which task died and why. Record it verbatim, then STOP. Do not restart the recorder yourself.
 
 If the recording stopped early, record the reason:
 - The laptop slept, restarted or lost WSL: the sampler shows gaps. Keep what was recorded. `summary.partial.json` holds up to the last 5 minutes.
@@ -622,10 +655,10 @@ python3 tools/bench/host/report_tables.py host "$HB/host-24h-summary.json" | tee
 ```
 
 Read and record:
-- **CPU:** WSL busy % (mean, p95, max) and iowait. The recorder alone should use well under one core.
+- **CPU:** WSL busy % (mean, p95, max) and iowait. The recorder's own CPU is the row `CPU % of one vCPU, python:record_markets.py` (100 means one whole virtual CPU). It should stay well under 100. The sampler itself is `python:host_sampler.py`.
 - **Memory:** WSL `MemTotal` is the `.wslconfig` limit, about 11 GB. Record `MemAvailable` min, swap used max and memory pressure. Also the `vmmemWSL` working set max against the laptop's 16 GB, and Windows' free physical memory min.
 - **Disk:** bytes written, write rate and utilization; free GiB at start and end.
-- **Network:** WSL `eth0` received bytes over the 24 h against the recorder's text bytes (`all` bytes in the recording table), and the Windows adapter's received bytes. The difference is TLS, WebSocket and TCP/IP overhead plus anything else on the machine.
+- **Network:** WSL `eth0` received bytes over the 24 h against the recorder's text bytes (`all` bytes in the recording table), and the Windows adapters' received bytes. The difference is TLS, WebSocket and TCP/IP overhead plus anything else on the machine. The summary names the Windows adapters `adapter-1`, `adapter-2`, ... on purpose, because an adapter's name can be personal. To say which one is the Ethernet or Wi-Fi, look at the names in `host-samples.jsonl` on the laptop and describe the adapter by type only ("adapter-2, the Ethernet").
 - **Throttling signs:** Windows % processor performance well under 100 while busy; `thermal passive limit %` under 100; thermal max. Also any sampler gaps, which are suspends or restarts.
 - **Power:** battery status counts. 2 means on AC; any other value means the laptop ran on battery.
 - **Watts,** if the user has a plug meter: ask them for readings at idle, during Part 3 and during Part 4.
@@ -644,7 +677,8 @@ Read and record:
 - Safety: PAPER only; no credential; public market data only.
 
 ## Summary
-<5-8 bullets: catch-up events/s and µs/event; paced max lag; pinned vs unpinned; sustained drift; total and per-series GB/day; peak rates at aligned opens; host headroom; any surprise.>
+<5-8 bullets: catch-up events/s and µs/event; paced max lag; pinned vs unpinned; sustained drift; total and per-series GB/day; peak rates at aligned opens; baseline capacity; any surprise.>
+<Baseline capacity, stated as such: the trader's throughput measured ALONE (Part 3) and the recorder's and host's load measured ALONE (Parts 4 and 5). They ran at different times. The headroom of a deployment, with the gateway, the trader and the recording all running at once, was NOT measured; do not add the two up and call it headroom.>
 
 ## 1. Trader throughput (H1 burst, 99,669 events)
 <the table from trader-throughput-table.md, without the warm-up row>
@@ -664,9 +698,15 @@ Read and record:
 <every gap, disconnect, retry, STOP and how it was resolved; "none" if none>
 
 ## 5. Not measured here
+UNVERIFIED items of LEAN-1 §9, each with its follow-up for the orchestrator:
+- Item 1, "with and without evaluation": UNVERIFIED. The bench has no switch for it; every run here is "with". Follow-up: a bench option, in a code round, then a rerun.
+- Item 2, "gateway only, through the existing restart driver": this recording used the standalone recorder (`tools/bench/host/record_markets.py`) instead. The byte and rate figures are the venue's market-channel traffic; the gateway's own CPU, memory and WAL bytes are UNVERIFIED. Follow-up: a gateway recording on the laptop.
+- Item 3, SNAPPY Parquet compression: UNVERIFIED. Only gzip and zstd on the recorder's JSONL were measured (step 4.7). Follow-up: a Parquet conversion of the same hours.
+- Item 6, "Redis bytes per entry": UNVERIFIED. The bench removes its Redis container after each run, and this guide takes no Redis memory reading. Follow-up: a measurement against a kept bench Redis.
+- Deployment headroom (the gateway, trader and recording at once): UNVERIFIED; only the baseline capacity of each part alone was measured.
 - The Binance, Coinbase and Chainlink reference feeds (LEAN-1 §4 measured them on H1 at about 6 GB/day per asset).
 - The Hetzner comparison, research-tier sizes, state churn and restart behaviour (LEAN-1 §9 items 1 (cloud half), 4, 5 and 7).
-- <anything else skipped, such as watts>
+- <anything else skipped, such as watts or thermal zones Windows did not expose>
 
 ## 6. Commands
 <the commands as run, from this guide, with any changes; home paths written as ~>
@@ -695,7 +735,9 @@ du -sh "docs/bench/host-bench-laptop-$D"
 . ~/pmb-host-bench/env.sh
 cd "$REPO"
 files="docs/bench/host-bench-laptop-$D.md docs/bench/host-bench-laptop-$D"
-grep -rnF -e "$(whoami)" -e "$(hostname)" -e "/home/" -e "/mnt/c/Users" -e "C:\\Users" $files
+winuser="$(powershell.exe -NoProfile -Command '$env:USERNAME' | tr -d '\r')"
+[ -n "$winuser" ] || winuser="$(whoami)"
+grep -rnF -e "$(whoami)" -e "$(hostname)" -e "$winuser" -e "/home/" -e "/mnt/c/Users" -e "C:\\Users" $files
 grep -rnE -e '([0-9]{1,3}\.){3}[0-9]{1,3}' -e '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' $files
 ```
 
@@ -733,7 +775,7 @@ Stop any `pmb-*` session that is still running. Leave `~/pmb-host-bench/` in pla
 
 **Clock drift.** WSL's clock can fall behind after the laptop sleeps.
 - Check it with the `curl -sI` line in step 2.7.
-- Ask the user to run `wsl --shutdown` in PowerShell and reopen Ubuntu. That resynchronizes the clock and restarts your `tmux` sessions, so do it only between parts.
+- Ask the user to run `wsl --shutdown` in PowerShell and reopen Ubuntu. That resynchronizes the clock, but it also TERMINATES every WSL process: every `tmux` session, every running bench or recording, and this Claude Code session itself. Nothing restarts on its own. So ask for it only between parts, when `tmux ls` shows no `pmb-*` session; write the step to `PROGRESS.md` first. Afterwards the user starts `claude` again and says "continue `docs/runbooks/laptop-host-bench.md` from `~/pmb-host-bench/PROGRESS.md`".
 - `sudo hwclock -s` also works, but it needs the user's password.
 - The recorder's per-second counts use the WSL clock, so a jump shows as a gap or a burst. Record any drift you saw.
 
@@ -752,6 +794,8 @@ Stop any `pmb-*` session that is still running. Leave `~/pmb-host-bench/` in pla
 - The recorder reconnects on its own, with backoff from 0.25 s to 30 s. It counts disconnects per series, and `connected s / wanted s` shows the time lost.
 - A few disconnects in 24 hours are data; write them down.
 - Tens of disconnects: ask the user for Ethernet, and whether to repeat Part 4.
+
+**The recorder stopped with `outcome: failed`** (exit status 3, a `FAILED` line in `recorder.log`). One of its tasks died, and it stopped rather than record a silent gap. Keep `$HB/recording/` as it is, copy the `failures` list and the last 40 lines of `recorder.log` into `PROGRESS.md`, and STOP. The user decides whether to repeat Part 4 in a new directory.
 
 **The venue refuses.** HTTP 403 or 429 from Gamma, or a WebSocket close with a policy code such as 1008 on every reconnect: stop the recorder (`tmux send-keys -t pmb-rec C-c`), then STOP. Do not retry faster or change the request rate.
 

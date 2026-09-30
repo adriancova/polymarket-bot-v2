@@ -31,9 +31,15 @@ def _gb(value: Any) -> str:
 
 
 def recording(summary: dict[str, Any]) -> str:
+    failures = summary.get("failures") or []
     out = [
         f"Recording: {summary['startedAt']} to {summary['endedAt']} "
-        f"({summary['durationSeconds'] / 3600:.2f} h); final={summary.get('final')}.",
+        f"({summary['durationSeconds'] / 3600:.2f} h); final={summary.get('final')}; "
+        f"outcome={summary.get('outcome')}; failures={len(failures)}.",
+    ]
+    for failure in failures:
+        out.append(f"- FAILURE at {failure.get('at')}: task {failure.get('task')}: {failure.get('error')}")
+    out += [
         "",
         "| series | GB/day | frames/s | events/s | envelopes/s (est.) | p95 10 s env/s (whole) | opens | p95 10 s env/s at opens | peak 10 s env/s at opens | peak 1 s env/s | windows |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
@@ -87,7 +93,10 @@ def recording(summary: dict[str, Any]) -> str:
     control = summary.get("control", {})
     out += [
         "",
-        f"Gamma polls {gamma.get('polls')}, failures {gamma.get('failures')}, skipped markets {len(gamma.get('skipped', {}))}. "
+        f"Gamma polls {gamma.get('polls')}, failures {gamma.get('failures')} {json.dumps(gamma.get('failureKinds', {}))}, "
+        f"most in a row {gamma.get('maxConsecutiveFailures')}, truncated polls {gamma.get('truncatedPolls')}, "
+        f"last OK {gamma.get('lastOk')} ({gamma.get('secondsSinceLastOk')} s before this summary), "
+        f"skipped markets {len(gamma.get('skipped', {}))}. "
         f"PONG frames {control.get('pongFrames')}, unparsable frames {control.get('unparsableFrames')}, "
         f"unattributed events {control.get('unattributedEvents')}.",
     ]
@@ -127,6 +136,8 @@ def host(summary: dict[str, Any]) -> str:
         row(f"free GiB, {label}", block.get("freeGiB"))
     for name, block in summary.get("processesRssMiB", {}).items():
         row(f"RSS MiB, {name}", block)
+    for name, block in summary.get("processesCpuPct", {}).items():
+        row(f"CPU % of one vCPU, {name}", block)
     windows = summary.get("windows", {})
     row("Windows % processor performance", windows.get("percentProcessorPerformance"))
     row("Windows processor frequency MHz", windows.get("processorFrequencyMHz"))
@@ -140,7 +151,7 @@ def host(summary: dict[str, Any]) -> str:
     for name, block in summary.get("net", {}).items():
         out.append(f"| net {name} rx / tx bytes (WSL) | {_n(block.get('rxBytesTotal'))} / {_n(block.get('txBytesTotal'))} |")
     for name, block in windows.get("adapterBytes", {}).items():
-        out.append(f"| Windows adapter \"{name}\" received / sent bytes | {_n(block.get('receivedDelta'))} / {_n(block.get('sentDelta'))} |")
+        out.append(f"| Windows {name} received / sent bytes | {_n(block.get('receivedDelta'))} / {_n(block.get('sentDelta'))} |")
     for label, block in summary.get("fs", {}).items():
         out.append(f"| free GiB {label}, start / end (of {_n(block.get('totalGiB'))}) | {_n(block.get('freeGiBStart'))} / {_n(block.get('freeGiBEnd'))} |")
     out.append(f"| battery status counts (2 = on AC) | {json.dumps(windows.get('batteryStatusCounts', {}))} |")

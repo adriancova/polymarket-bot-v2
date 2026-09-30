@@ -10,11 +10,11 @@ The step-by-step guide that uses them is
 | `setup-wsl-root.sh` | The root part of the WSL setup: systemd, base packages, Docker Engine (`docker-ce`, inside WSL), the `docker` group. The operator runs it once with `sudo` | Ubuntu on WSL2 |
 | `record_markets.py` | The multi-market recorder: Gamma discovery, one public market WebSocket per series, rollover, counters, `summary.json` | Python 3.10+, `websockets` (see `requirements.txt`) |
 | `recorder_core.py` | The recorder's pure logic: parsing, window selection, subscription diffs, counting, the summary. Every venue fact it uses is cited in its docstring | Python standard library |
-| `host_sampler.py` | CPU, memory, pressure, disk, network, free space and per-process RSS every 60 s; optionally Windows-side CPU performance, thermal zones, the WSL VM's memory and the adapters' byte counters | Python standard library; `powershell.exe` through WSL interop for `--windows` |
-| `trader-bench.sh` | One trader-throughput bench run on the H1 burst with the guide's fixed inputs; `--pin CPU` runs it under `taskset` | the repository installed; Docker |
+| `host_sampler.py` | CPU, memory, pressure, disk, network, free space, and per-process RSS and CPU every 60 s; optionally Windows-side CPU performance, thermal zones, the WSL VM's memory and the adapters' byte counters | Python standard library; `powershell.exe` through WSL interop for `--windows` |
+| `trader-bench.sh` | One trader-throughput bench run on the H1 burst with the guide's fixed inputs; `--pin CPU` pins the trader to one virtual CPU and keeps the paced publisher off it | the repository installed; Docker; `taskset` and `pgrep` for `--pin` |
 | `bench_table.py` | Tabulates the trader-throughput bench's `report.json` files as Markdown | Python standard library |
 | `report_tables.py` | Markdown tables from the recorder's `summary.json` and the sampler's summary; `trim` drops the per-window list | Python standard library |
-| `tests/` | Offline `unittest` suites, on 28 frames from H1 run 8's WAL and a trimmed Gamma response | Python standard library |
+| `tests/` | Offline `unittest` suites: parsing and counting on 28 frames from H1 run 8's WAL and a trimmed Gamma response; the connection loop, Gamma failures and the supervised run on a fake WebSocket; `--pin` on a stand-in `run.sh` | Python standard library; `taskset` and `pgrep` for the `--pin` tests (skipped without them) |
 
 ## Offline checks
 
@@ -37,13 +37,14 @@ python3 -m venv ~/pmb-host-bench/venv
 ```
 
 How it works:
-- **Discovery.** Once a minute it calls Gamma `GET /events?closed=false&end_date_min=…&end_date_max=…` (40 minutes ahead). It keeps the markets whose event's `seriesSlug` is wanted. That is 1-10 requests a minute; the documented `/events` limit is 500 per 10 s.
+- **Discovery.** Once a minute it calls Gamma `GET /events?closed=false&end_date_min=…&end_date_max=…&order=id&ascending=true` (40 minutes ahead), 100 events a page. It keeps the markets whose event's `seriesSlug` is wanted. That is 1-10 requests a minute; the documented `/events` limit is 500 per 10 s. A 10th full page is logged as `TRUNCATED` and counted. A failed poll, of any kind, is logged and counted by kind, and the next poll tries again.
 - **Selection.** Each second, per series, it wants the window that has started and not ended (kept 30 s past its end), plus the next window. The next window is subscribed before it opens, so the open itself is recorded.
 - **Connections.** One public market WebSocket per series. It sends the documented subscribe frame, with `custom_feature_enabled: false` and `initial_dump: true` as the gateway sends them. Rollover uses the documented dynamic `subscribe` and `unsubscribe` frames on the same connection.
 - **Keep-alive.** `PING` every 10 s. With no `PONG` for 30 s (the SDK's client-side bound), it closes and reconnects. Reconnects use full-jitter backoff from 0.25 s to 30 s.
 - **Compression.** The WebSocket compression extension is off, like the gateway's client. Byte counts are therefore the text payloads the gateway would receive.
 - **Counting.** It counts every inbound text frame by the `market` (condition id) of each event it carries. A frame with several events has its bytes split by each event's JSON length.
 - **Files.** It writes a per-second file, a window log and `summary.partial.json` every 5 minutes. It writes `summary.json` at the end, or on Ctrl-C or SIGTERM.
+- **Supervision.** Every connection task and the Gamma task must live until the end. If one dies, the recorder logs `FAILED`, stops at once, writes `summary.json` with `"outcome": "failed"` and the `failures` list, and exits with status 3. Otherwise `outcome` is `complete`, or `interrupted` after a signal, and the exit status is 0.
 
 Outputs in `--out-dir`:
 
@@ -61,8 +62,9 @@ Outputs in `--out-dir`:
 - `peak1sEnvelopesPerSecond`;
 - `whole`: p50, p95 and peak of the 10-second rates over the whole recording;
 - `atWindowOpens`: the peak and nearest-rank p95 of the 10-second rates. It uses the 10 s buckets from 30 s before to 90 s after each window open, for opens whose whole interval was recorded. `all.atAlignedOpens` uses only the quarter-hour opens, when every 5- and 15-minute series opens at once;
+- `outcome` and `failures`: see "Supervision" above;
 - `connections`: connects, disconnects, stale closes and close reasons per series;
-- `gamma`: polls, failures and skipped markets;
+- `gamma`: polls, failures by kind, the longest run of consecutive failures, truncated polls, the last successful poll and how long before the summary it was, and skipped markets;
 - `windows`: every window with its own totals and event types;
 - `rawFrames`: raw text bytes against gzip file bytes, with `--raw`.
 
@@ -102,14 +104,14 @@ One JSON line per minute:
 - per-disk read and write rates and utilization;
 - per-interface network bytes;
 - free space of each `--path`, under its label;
-- RSS of `node`, `postgres`, `redis-server`, `python3`, `dockerd` and `containerd`.
+- per process label, the count, RSS and CPU (percent of one virtual CPU over the interval) of `node`, `postgres`, `redis-server`, `dockerd`, `containerd` and Python. A Python process is labelled by its script's file name, such as `python:record_markets.py`, whether it runs as `python3` or as a venv's `python`. Processes that start and exit inside one interval are not seen.
 
 With `--windows` it also records, from Windows:
 - `PercentProcessorPerformance` (under 100 under load is a throttling sign) and `ProcessorFrequency`;
 - the thermal zones, with `PercentPassiveLimit` and `ThrottleReasons` when the firmware exposes them;
 - free physical memory and the `vmmemWSL` working set;
 - the battery status (2 = on AC);
-- every adapter's received and sent bytes.
+- every adapter's received and sent bytes. `summarize` names the adapters `adapter-1`, `adapter-2`, ... because an adapter's name can be personal and the summary is committed; the names stay in `host-samples.jsonl`.
 
 Every query uses a WMI class or a cmdlet, never a localized counter path.
 `--raw-commands` appends `vmstat`, `iostat`, `free` and `df` text to
