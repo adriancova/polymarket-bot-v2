@@ -34,8 +34,21 @@ K24 the SER-3 bullet of the Complete-row residual subsection writes "SER-3's N4"
     `test:replay` N4 is a different item.
 K25 every brief section that cites a file line (`name.ext:NNN`) states the commit its citations
     are valid at ("as of `<sha>`" or "at `<sha>`"), in the section or on the citing line.
+K26 the Complete-row residual intro sends a reader to the handoff linked from the package's row
+    for an owner a bullet does not name, and every package with a bullet there has a handoff link
+    in its Work packages row.
+K27 the brief does not list the `catalog.settlement_specs.payoff_model NOT NULL` divergence as
+    owed: `WP-210`'s migration 0009 resolved it.
+K28 in "Obligations in completion records", a sentence whose subject is a package that is not
+    Complete in the brief states an obligation ("must", "owes", "owed"), not a present fact.
+K29 no line of REWRITES.md's intro and coverage prose (before the first declaration block) runs
+    over 80 words: split dense paragraphs into lists or tables.
+K30 no verbless fragment where r4 had one: the WP-210 bullet's "landing: contract owner
+    recording." and the UNIV-1 bullet's bare "LOW-2 drifts (two unpinned), LOW-3 ..." list.
 K2 also requires the "Residuals recorded in Complete package rows" and "Obligations in completion
-records" subsections.
+records" subsections. K21 also requires C16, refuses the claim "so a partial carry fails" in
+REWRITES.md and the archive README, and requires both to say reviewers check the rest of a clause.
+K24 also requires the ALLOC-1 bullet to write "ALLOC-1's review N1/N2", "its N3" and "its N4".
 
 Exit 0 when every rule holds, 1 otherwise. Stdlib only, no network.
 """
@@ -228,11 +241,16 @@ def main() -> int:
         fails.append("K20: the Archive intro says 'Everything below was moved verbatim', but a file list follows")
     # K21
     intro = rw.split("\n## Coverage:", 1)[0]
-    missing = [c for c in ("C6", "C8", "C9", "C10", "C11", "C12", "C13", "C14", "C15") if f"({c}" not in intro and f" {c})" not in intro and f"{c}," not in intro]
+    missing = [c for c in ("C6", "C8", "C9", "C10", "C11", "C12", "C13", "C14", "C15", "C16") if f"({c}" not in intro and f" {c})" not in intro and f"{c}," not in intro]
     if missing:
         fails.append(f"K21: REWRITES.md's intro does not name {', '.join(missing)}")
     if "and what it does not carry and where that lives" in intro:
         fails.append("K21: REWRITES.md's Facts bullet uses the old wording")
+    for rel, text in ((f"{S.ARCHIVE}/REWRITES.md", intro), (f"{S.ARCHIVE}/README.md", read(root, f"{S.ARCHIVE}/README.md"))):
+        if "partial carry fails" in text:
+            fails.append(f"K21: {rel} claims C15 makes a partial carry fail; it only checks for an accounting marker")
+        if not re.search(r"reviewers must check the rest of each clause", text, flags=re.I):
+            fails.append(f"K21: {rel} does not say reviewers must check the rest of each clause")
     # K22
     if "verbatim, and frozen," in agents:
         fails.append("K22: AGENTS.md nests 'and frozen,' inside its and-chain; use a colon and a semicolon")
@@ -257,6 +275,50 @@ def main() -> int:
                     fails.append(f"K24: line {i + 1}: the SER-3 bullet must write \"SER-3's N4\", not a bare N4 "
                                  "(GOV-2B's test:replay N4 is a different item)")
             i += 1
+    # K24 (ALLOC-1), K26, K30
+    h = "### Residuals recorded in Complete package rows"
+    if h in lines:
+        i = lines.index(h) + 1
+        intro_ok = False
+        while i < len(lines) and not lines[i].startswith("#"):
+            l = lines[i]
+            if l and not l.startswith("- ") and "the handoff linked from the package's row" in l:
+                intro_ok = True
+            if l.startswith("- `ALLOC-1`"):
+                rest = l.replace("ALLOC-1's review N1/N2", "").replace("its N3", "").replace("its N4", "")
+                if re.search(r"\bN\d\b", rest):
+                    fails.append(f"K24: line {i + 1}: the ALLOC-1 bullet must write \"ALLOC-1's review N1/N2\", \"its N3\" "
+                                 "and \"its N4\" (GOV-2B's N2-N4 are different items)")
+            m = re.match(r"^- `([A-Za-z0-9-]+)`", l)
+            if m and not any(re.match(r"^\| `" + re.escape(m.group(1)) + r"` \|.*\]\(docs/handoffs/[^)]+\.md\)", r) for r in lines):
+                fails.append(f"K26: line {i + 1}: {m.group(1)}'s Work packages row links no handoff")
+            if re.search(r"landing: contract owner recording\.|^- `UNIV-1`: LOW-2 drifts", l):
+                fails.append(f"K30: line {i + 1}: a verbless fragment; write a full sentence")
+            i += 1
+        if not intro_ok:
+            fails.append(f"K26: the '{h}' intro does not say an unnamed owner is in the handoff linked from the package's row")
+    # K27
+    for n, l in enumerate(lines, 1):
+        if "payoff_model NOT NULL" in l:
+            fails.append(f"K27: line {n}: the payoff_model NOT NULL divergence is resolved (WP-210, migration 0009)")
+    # K28
+    h = "### Obligations in completion records"
+    if h in lines:
+        complete = {c[0].strip("`") for c in table_rows(lines, "## Work packages") if len(c) > 2 and c[2].startswith("Complete")}
+        i = lines.index(h) + 1
+        while i < len(lines) and not lines[i].startswith("#"):
+            l = lines[i]
+            if l.startswith("- "):
+                body = re.sub(r"^- (?:`[^`]+`(?:, `[^`]+`)*): ", "", l)
+                for sent in re.split(r"(?<=[.!?])\s+(?=[A-Z(`*\[])", body):
+                    m = re.match(r"^`?(WP-\d+[A-Za-z0-9-]*)`? ", sent)
+                    if m and m.group(1) not in complete and not re.search(r"\bmust\b|\bowes?\b|\bowed\b", sent):
+                        fails.append(f"K28: line {i + 1}: {m.group(1)} is not Complete, so state its obligation: {sent[:70]!r}")
+            i += 1
+    # K29
+    for n, l in enumerate(rw.split("~~~unpaired", 1)[0].split("\n"), 1):
+        if len(l.split()) > 80:
+            fails.append(f"K29: REWRITES.md line {n}: {len(l.split())} words on one line (max 80)")
     # K25
     sec, sec_lines = None, []
     def k25(sec, sec_lines):

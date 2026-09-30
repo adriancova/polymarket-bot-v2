@@ -23,7 +23,9 @@ Proof C (facts and navigation):
      relative to the repository root) resolves from the root and has a working
      counterpart in that file's link note;
   C5 MOVE-MAP.md names every base heading, package row id and blocker/residual
-     id, and sends a bullet marked DISCHARGED to the section it names;
+     id, and sends a bullet marked DISCHARGED to the section it names; it is
+     exactly move-map.py's output, and the line for each carrying declaration
+     (the package row, or the heading above a record item) names the entry;
   C6 every REWRITES.md "old" block equals the lines it cites in ITS base (the
      file's pinned rewrites-base unless the block names another), and every
      "new" line occurs in the brief;
@@ -63,8 +65,8 @@ Proof C (facts and navigation):
      or paragraph of the base text) that matches OBLIG: such an item is
      declared "record-item" over exactly its lines, with a disposition in the
      C12 grammar. An item that matches OWNED_REC needs more than "none";
-  C15 clause accounting (a partial carry fails). Each residual clause must be
-     accounted for: every clause of an excerpt block; every clause of a marker
+  C15 clause accounting. These residual clauses must each hold an accounting
+     marker: every clause of an excerpt block; every clause of a marker
      sentence (MARK: "Known risks:", "Residuals (owned ...):", "Carried
      follow-ups:" ...) of a dispositioned complete-row; and every clause of a
      record item that is carried, and of each marker sentence of any other
@@ -74,9 +76,14 @@ Proof C (facts and navigation):
      of a drop line inside the same base lines. A drop block
      (~~~drop lines=a-b) holds "<verbatim fragment> => <reason>" lines; the
      reason is "closed-by `PKG` ..." (PKG Complete in the brief), "brief:
-     <heading> ..." (a heading of the brief) or "history: ...".
+     <heading> ..." (a heading of the brief) or "history: ...". C15 does not
+     prove that the marker covers the whole clause; reviewers check the rest;
+  C16 carried-clause tokens. A clause that C15 accounts for by a keep phrase
+     keeps each of its code spans and measured numbers (for example 248ns,
+     1.67×) in the carrying entries' new text, or names it inside a drop
+     fragment of the same base lines.
 
-C6, C10, C12 and C15 authenticate what REWRITES.md says; they cannot judge
+C6, C10, C12, C15 and C16 authenticate what REWRITES.md says; they cannot judge
 whether a rewrite, a disposition or a drop reason is true. That remains a
 review question.
 
@@ -86,6 +93,7 @@ Exit 0 when every selected proof passes, 1 otherwise. Stdlib only, no network.
 import argparse
 import collections
 import difflib
+import importlib.util
 import os
 import re
 import subprocess
@@ -272,6 +280,10 @@ OWNED_REC = re.compile(r"(?i)carried (?:follow-ups|to|forward|residuals?)|follow
 MARK = re.compile(r"(?i)(?:^|(?<=\*\*)|(?<=\. )|(?<=; )|(?<=\| )|(?<=— )|(?<=\()|(?<=\n))(?:\*\*)?(?:[\w-]+ ){0,3}"
                   r"(?:known risks?|residuals?|residual risks|carried|follow-ups?)(?:[ /][\w/-]+){0,5}(?:\*\*)? ?"
                   r"(?:\([^()]*\))?(?:, [\w ]+)?(?:\*\*)?:(?:\*\*)?(?=\s)")
+
+
+# C16: the identifiers (code spans) and measured numbers of a clause.
+TOKEN = re.compile(r"`([^`]+)`|(?<![\w.])(\d+(?:\.\d+)?\s?(?:ns|µs|ms|s|×|MiB|GiB|KiB|h|%))(?![\w])")
 
 
 def record_units(lines):
@@ -892,8 +904,10 @@ def proof_c(root, repo, sha, base, report):
             pairs_open = any(b["base"] == rwbase and any(b["a"] <= n <= b["b"] for n in paired_rw_starts) for b in olds)
             if pairs_open and not keeps_by_entry.get(entry):
                 fails.append(f"C10: {entry} pairs an open or live row but has no keep phrase")
-    # C15: clause accounting, so a partial carry fails
+    # C15: clause accounting. It checks each clause holds an accounting marker, not
+    # that the marker covers the whole clause; C16 adds the clause's identifiers and numbers.
     nclause = 0
+    ntok = [0]
     carried_ranges = collections.defaultdict(list)
     for dsha, a, b, ident, kind, info in dispositions:
         for e in info["carried"]:
@@ -921,16 +935,61 @@ def proof_c(root, repo, sha, base, report):
             for x in excerpts_by_entry.get(e, []):
                 if x["base"] == dsha and a <= x["a"] and x["b"] <= b:
                     targets += clauses_of(" ".join(l.strip() for l in x["lines"]))
+        new_n = norm(" ".join(l for e in info["carried"] for l in news_by_entry.get(e, [])))
         for c in dict.fromkeys(targets):
             n = norm(c)
             if not n:
                 continue
             nclause += 1
-            ok = (any(k in n or n in k for k in keeps) or any(f in n or n in f for f in frags)
+            by_keep = any(k in n or n in k for k in keeps)
+            ok = (by_keep or any(f in n or n in f for f in frags)
                   or any(named(i, n) for i in info["ids"] + info["closed"]))
             if not ok:
                 fails.append(f"C15: {kind} {ident} ({a}-{b}): a residual clause is not accounted for "
                              f"(no keep phrase, id, closing package or drop line): {c[:110]!r}")
+            if by_keep:  # C16: a carried clause keeps its identifiers and measured numbers
+                for m in TOKEN.finditer(c):
+                    t = norm(m.group(1) or m.group(2))
+                    ntok[0] += 1
+                    if t and t not in new_n and not any(t in f for f in frags):
+                        fails.append(f"C16: {kind} {ident} ({a}-{b}): the carried clause loses {t!r}; "
+                                     f"carry it or name it in a drop line: {c[:90]!r}")
+
+    # C5 (r5): the move map is the generator's output, and names the brief entry of every carry
+    mmod = None
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "move_map", os.path.join(os.path.dirname(os.path.abspath(__file__)), "move-map.py"))
+        mmod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mmod)
+        if mmod.render(repo, root, cut) != mm:
+            fails.append("C5: MOVE-MAP.md is not the output of move-map.py for this brief and REWRITES.md; re-run it")
+    except Exception as e:  # noqa: BLE001 - any failure to render is a C5 failure
+        mmod = None
+        fails.append(f"C5: move-map.py could not render the map: {e!r}")
+    mm_rows = mm.split("\n")
+    base_heads = [n for n, line in enumerate(base_lines, 1) if re.match(r"^#{1,6} ", line)]
+    moved = None
+    for dsha, a, b, ident, kind, info in dispositions:
+        if not info["carried"]:
+            continue
+        if dsha != cut:  # a rewrites-base declaration after a re-cut: find its line at the cut
+            if mmod is None:
+                continue
+            moved = moved if moved is not None else mmod.line_map(texts[dsha], base_lines)
+            if a not in moved:
+                continue
+            a = moved[a]
+        if kind == "complete-row":
+            row = [r for r in mm_rows if f"`{ident}` | {a} | [" in r]
+            where_ = f"row {ident}"
+        else:
+            h = max((n for n in base_heads if n <= a), default=0)
+            row = [r for r in mm_rows if r.startswith("| #") and f" | {h} | [" in r]
+            where_ = f"the heading at line {h}"
+        for e in info["carried"]:
+            if not row or f"{e})" not in row[0] and f"{e}," not in row[0]:
+                fails.append(f"C5: MOVE-MAP.md's line for {where_} does not name {e}, whose new lines the brief carries")
 
     # C9
     seen = collections.defaultdict(list)
@@ -994,7 +1053,7 @@ def proof_c(root, repo, sha, base, report):
     report.append(f"Proof C: {'FAIL' if fails else 'PASS'} ({len(rows)} package rows, {len(ids)} blocker/residual ids, "
                   f"{len(hexes)} hex tokens, {nlinks} links + {narch} archive links, {len(present)} handoffs indexed, "
                   f"{len(entries)} REWRITES entries with {nold} old blocks, {npaired} open or live rows paired, "
-                  f"{nkeep} keep phrases, {ndisp[0]} dispositions ({nrec[0]} record items), {nclause} residual clauses accounted for, "
+                  f"{nkeep} keep phrases, {ndisp[0]} dispositions ({nrec[0]} record items), {nclause} residual clauses accounted for, {ntok[0]} carried-clause tokens, "
                   f"{len(drops)} drop lines, {nxref} entry cross-references; rewrites-base {(rwbase or 'none')[:12]}, cut {cut[:12]})")
     report.extend("  " + f for f in fails[:MAX_REPORT[0]])
     if len(fails) > MAX_REPORT[0]:
