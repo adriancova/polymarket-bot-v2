@@ -21,11 +21,17 @@ import { describe, expect, it } from "vitest";
 
 import {
   GATEWAY_EPOCH,
+  INSTANCE_ID,
+  INSTANCE_ID_2,
   MARKET_ID,
+  MARKET_ID_2,
   NO_TOKEN,
+  NO_TOKEN_2,
   YES_TOKEN,
+  YES_TOKEN_2,
   ingested,
   resetEventIds,
+  twoMarketConfig,
 } from "./support/fixture.js";
 import { assembleOrThrow } from "./support/run.js";
 
@@ -40,10 +46,18 @@ function inFrame(frame: string, event: IngestedEvent): IngestedEvent {
   return { envelope, identity: event.identity };
 }
 
-function level(tokenId: string, side: "BID" | "ASK", price: string, size: string, seq: number, at: string): IngestedEvent {
+function level(
+  tokenId: string,
+  side: "BID" | "ASK",
+  price: string,
+  size: string,
+  seq: number,
+  at: string,
+  marketId: string = MARKET_ID,
+): IngestedEvent {
   return ingested(
     "BookLevelChanged",
-    { internalMarketId: MARKET_ID, tokenId, side, price, size },
+    { internalMarketId: marketId, tokenId, side, price, size },
     { receivedAt: at, ingestSeq: seq },
   );
 }
@@ -81,6 +95,39 @@ function opening(): IngestedEvent[] {
         asks: [{ price: "0.61", size: "200" }],
       },
       { receivedAt: "2026-03-04T12:00:00.200Z", ingestSeq: 4 },
+    ),
+  ];
+}
+
+/** {@link opening} for BOTH fixture markets (market 2 after market 1; no entry fires on either). */
+function twoMarketOpening(): IngestedEvent[] {
+  const first = opening();
+  return [
+    ...first,
+    ingested(
+      "MarketOpened",
+      { internalMarketId: MARKET_ID_2, conditionId: CONDITION, openedAt: "2026-03-04T12:00:00.000Z" },
+      { receivedAt: "2026-03-04T12:00:00.300Z", ingestSeq: 5 },
+    ),
+    ingested(
+      "BookSnapshot",
+      {
+        internalMarketId: MARKET_ID_2,
+        tokenId: YES_TOKEN_2,
+        bids: [{ price: "0.38", size: "200" }],
+        asks: [{ price: "0.4", size: "200" }],
+      },
+      { receivedAt: "2026-03-04T12:00:00.400Z", ingestSeq: 6 },
+    ),
+    ingested(
+      "BookSnapshot",
+      {
+        internalMarketId: MARKET_ID_2,
+        tokenId: NO_TOKEN_2,
+        bids: [{ price: "0.59", size: "200" }],
+        asks: [{ price: "0.61", size: "200" }],
+      },
+      { receivedAt: "2026-03-04T12:00:00.500Z", ingestSeq: 7 },
     ),
   ];
 }
@@ -260,5 +307,88 @@ describe("THROUGHPUT-2: one evaluation per venue frame, on the fully applied fra
     expect(trader.loop.decisions().length - opened).toBe(1);
     await drive(trader, [second]);
     expect(trader.loop.decisions().length - opened).toBe(2);
+  });
+  // r1 (`TP2-R1-M1`): each market is evaluated at the LAST event of the frame
+  // that owed IT an evaluation — the event whose own evaluation of that market
+  // the per-event cadence ran last — never at a later event that did not touch
+  // it. On `6be3eae` both tests fail: the frame's decisions named the frame's
+  // last door-passing event, whichever market it was for.
+  it("r1: a frame whose last event is for a market this trader does not run is attributed to the last event that touched its market", async () => {
+    const { trader, parts } = assembleOrThrow();
+    await drive(trader, opening());
+    const opened = trader.loop.decisions().length;
+    const frame = [
+      inFrame("600", level(YES_TOKEN, "ASK", "0.39", "150", 5, "2026-03-04T12:00:01.000Z")),
+      inFrame("600", level(NO_TOKEN, "BID", "0.6", "150", 6, "2026-03-04T12:00:01.001Z")),
+      // Same raw frame, a market this trader is not configured for.
+      inFrame("600", level(YES_TOKEN_2, "ASK", "0.45", "10", 7, "2026-03-04T12:00:01.009Z", MARKET_ID_2)),
+    ];
+    await drive(trader, frame);
+
+    const added = trader.loop.decisions().slice(opened);
+    expect(added).toHaveLength(1);
+    const decision = added[0];
+    expect(decision?.sourceEventId).toBe(frame[1]?.envelope.eventId);
+    const persisted = parts.store.decisions.find(
+      (written) => written.record.evaluationSeq === decision?.evaluationSeq,
+    );
+    expect(persisted?.record.evaluatedAt).toBe("2026-03-04T12:00:01.001Z");
+    // All three events were processed; the unconfigured one changed nothing here.
+    expect(trader.loop.health().loop.eventsProcessed).toBe(opening().length + frame.length);
+  });
+
+  it("r1: a frame touching TWO configured markets evaluates each at its own last event, in the per-event cadence's order", async () => {
+    // The same three events, as one frame (`framed`) or as three frames of one
+    // (the per-event cadence): event ids are minted identically in both.
+    const run = async (framed: boolean) => {
+      const assembled = assembleOrThrow({ config: twoMarketConfig("1000") });
+      await drive(assembled.trader, twoMarketOpening());
+      const opened = assembled.trader.loop.decisions().length;
+      const stamp = (event: IngestedEvent): IngestedEvent => (framed ? inFrame("700", event) : event);
+      const events = [
+        stamp(level(YES_TOKEN, "ASK", "0.42", "150", 8, "2026-03-04T12:00:01.000Z")),
+        stamp(level(YES_TOKEN_2, "ASK", "0.42", "150", 9, "2026-03-04T12:00:01.004Z", MARKET_ID_2)),
+        stamp(level(NO_TOKEN, "BID", "0.57", "150", 10, "2026-03-04T12:00:01.008Z")),
+      ];
+      await drive(assembled.trader, events);
+      return { ...assembled, opened, events };
+    };
+    const { trader, parts, opened, events: frame } = await run(true);
+
+    const added = trader.loop.decisions().slice(opened);
+    // One evaluation per market; the per-event cadence's LAST evaluation of
+    // each was market 2 at the second event, then market 1 at the third.
+    expect(added.map((decision) => [decision.instanceId, decision.sourceEventId])).toEqual([
+      [INSTANCE_ID_2, frame[1]?.envelope.eventId],
+      [INSTANCE_ID, frame[2]?.envelope.eventId],
+    ]);
+    const evaluatedAt = added.map(
+      (decision) =>
+        parts.store.decisions.find(
+          (written) =>
+            written.record.runId === decision.runId && written.record.evaluationSeq === decision.evaluationSeq,
+        )?.record.evaluatedAt,
+    );
+    expect(evaluatedAt).toEqual(["2026-03-04T12:00:01.004Z", "2026-03-04T12:00:01.008Z"]);
+
+    // …and each is the per-event cadence's decision at the same source event,
+    // in its order: the frame's decisions are a subsequence of the per-event
+    // run's, with the half-applied first evaluation of market 1 removed.
+    const perEvent = await run(false);
+    const perEventAdded = perEvent.trader.loop.decisions().slice(perEvent.opened);
+    expect(perEventAdded.map((decision) => decision.sourceEventId)).toEqual([
+      perEvent.events[0]?.envelope.eventId,
+      perEvent.events[1]?.envelope.eventId,
+      perEvent.events[2]?.envelope.eventId,
+    ]);
+    const content = (decision: (typeof added)[number] | undefined) => ({
+      instanceId: decision?.instanceId,
+      sourceEventId: decision?.sourceEventId,
+      callback: decision?.callback,
+      decisionType: decision?.decisionType,
+      reasonCodes: decision?.reasonCodes,
+      featureSnapshotRef: decision?.featureSnapshotRef,
+    });
+    expect(added.map(content)).toEqual(perEventAdded.slice(1).map(content));
   });
 });

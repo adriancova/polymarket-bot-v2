@@ -87,7 +87,8 @@ What that means per source, grounded in how each is produced today:
 | Polymarket array message mixing event types | one WS message | one event per element | yes, as one frame |
 | Binance / Coinbase trades | one WS message | one `ReferenceTradeObserved` per trade the message reports (2–65 in H1) | **yes**: every trade applied, every market evaluated once |
 | REST snapshot recovery (`#recover`) | no socket frame (`#currentRaw = undefined`) | one `BookSnapshot` per token, no `causationId`, distinct `ingestSeq` | no: each is its own frame, as before |
-| Lifecycle, incidents, feed health | journaled response / gateway-originated | no shared key with market data | not grouped with book events; see D3 for lifecycle callbacks |
+| Lifecycle (`MarketOpened`, `MarketClosing`, …) | one journaled catalog response (`apps/data-gateway/src/feeds/market-lifecycle.ts` stamps each envelope with a `causationId` naming that response) | one event per market the response changed | never grouped with book events (no shared key); the lifecycle envelopes of ONE response share its key and so form one frame among themselves. Their callbacks still fire in place (D3), so only the fill harvest and the outbox flush move to that frame's end |
+| Incidents, feed health | gateway-originated | no shared key with market data | not grouped with book events |
 | Replay of recorded raw frames | one WAL record | envelopes stamped with the record's own `(gatewayEpoch, ingestSeq)` (`apps/backtest-cli/src/normalizer.ts` `envelopeFrom`) | yes, by the dispatch identity: the same grouping the live `causationId` gives |
 
 A live gateway assigns every envelope its own `ingestSeq`, so a live event
@@ -146,11 +147,24 @@ failure mode is the old per-event cadence for that one frame, never a lost
 evaluation and never a position recorded inside an open frame.
 
 **The stated exceptions** (each is a halt path or out of every observed size):
-a door or ordering refusal INSIDE a gateway run publishes the run's prefix and
-halts publication (the transport's documented behaviour; the gateway's own
-envelopes are contract-validated at dispatch, so this is unreachable through
-the dispatcher); a frame over 1,024 envelopes splits at the gateway; a frame
-of `receiveBatchSize` or more splits at the trader.
+
+- a door or ordering refusal INSIDE a gateway run publishes the run's prefix
+  and halts publication (the transport's documented behaviour; the gateway's
+  own envelopes are contract-validated at dispatch, so this is unreachable
+  through the dispatcher);
+- an UNUSABLE stream entry on the trader's side: the Redis subscription's
+  `#deliver` (`packages/event-bus/src/redis/subscription.ts`) stops at the
+  first entry it cannot decode or admit, returns the valid PREFIX before it,
+  and stashes the `EventBusEntryError` for the next `receive`. The feed sees a
+  SHORT read and hands it out whole, so a prefix that ends inside a frame is
+  evaluated once, half-applied, at that drain's end ("a frame never outlives
+  a drain", below). The next receive throws, and the trader HALTS; a restart
+  resumes at the recorded position and meets the same entry again. This is a
+  corruption path (the gateway validates every envelope before it publishes
+  it), and the subscription contract offers the feed no signal that a short
+  read was truncated, so the feed cannot tell it from the stream's end;
+- a frame over 1,024 envelopes splits at the gateway;
+- a frame of `receiveBatchSize` or more splits at the trader.
 
 ### D3. What the loop does with a frame
 
@@ -162,13 +176,25 @@ event to the books, trades, reference prices and incidents
 (`CoreLoop.#closeFrame`) is:
 
 - the `onFeatures` evaluation of each market the frame touched, ONCE per
-  market, in the order the frame first touched them;
+  market;
 - the fill harvest and the outbox flush (so a group commit stages one unit
-  per frame, not per event).
+  per frame, not per event; D5).
 
-The frame's evaluation uses the frame's LAST applied event as the decision's
-`source_event_id` and its instant as `evaluatedAt` (a frame's events can carry
-receipt instants microseconds apart: 1,973 H1 frames do). A market halted
+Each market's evaluation uses, as the decision's `source_event_id` and its
+`evaluatedAt`, the LAST event of the frame that owed THAT market an
+`onFeatures` evaluation — the event whose own evaluation of that market the
+per-event cadence ran last (a frame's events can carry receipt instants
+microseconds apart: 1,973 H1 frames do). The markets are evaluated in the
+order of those events, so a frame's decisions are a SUBSEQUENCE of the
+per-event cadence's decisions, in the same order, with the same source
+events and instants. An event that owed no market an evaluation — one for a
+market this trader does not run, or one whose application triggered no
+callback — never becomes a decision's source, and the fill harvest runs at
+the instant of the frame's last event that reached the harvest point (r1,
+`TP2-R1-M1`; pinned by `frame-evaluation.test.ts`, the two "r1:" cases). A
+reference trade evaluates every configured market, as a lone one always did,
+whatever its venue; so in a reference frame every trade owes every market,
+and the frame's last trade is the source. A market halted
 during the frame is not evaluated at its close, by the same gate as always. A
 callback that is not `onFeatures` — a lifecycle transition — still fires in
 place, as it always did: coalescing changes only when features are evaluated,
@@ -223,9 +249,21 @@ the frame whole:
   frame inside the drain (D2), and the pump records a batch's position only
   after that batch's decisions are durable (`pump.ts`, unchanged). So every
   recorded position is at a frame boundary;
-- group commit stages one unit per closed frame; the `THROUGHPUT-1a` bounds
-  (32 / 50 ms / 128 staged units, at most 256 undurable) and the
-  one-chain prefix property are unchanged.
+- group commit stages one unit per closed frame, and the one-chain prefix
+  property is unchanged. The `THROUGHPUT-1a` bounds keep their NUMBERS (32 /
+  50 ms / 128) but not their UNIT: the store counts `stage` calls
+  (`GroupCommit.stagedEvents`), and the loop now stages once per frame, so
+  they count FRAMES, not events — at most 128 frames staged and 256 frames
+  with decisions not yet durable (r1, `TP2-R1-M2`). A frame of one event is
+  one event, as before; on H1 data a frame averages 1.76 events (99,669
+  events / 56,714 frames) and reaches 65, so the undurable window in EVENTS
+  is wider than `THROUGHPUT-1a` stated. In DECISIONS it is not: one frame's
+  staging holds one decision per market it owed (plus any lifecycle
+  callback), which is what one lone event's held. Nothing is lost by the
+  wider window: a crash re-reads every event after the recorded position,
+  which is never past an undurable decision (above). Pinned by
+  `group-commit-loop.test.ts` ("the bounds count STAGINGS"); `loop.ts` and
+  `ports.ts` state the unit.
 
 ### D6. Determinism
 
@@ -280,7 +318,15 @@ paper-e2e goldens, and the bench's content digests on two candidate runs).
   is its checkpoint; only the sequence numbers are renumbered. On this burst,
   skipping the half-applied evaluations changed no later decision.
 - **Throughput rises, but not to the H1 burst rate.** Catch-up 572.6 → 807.9
-  events/s (CPU 1,784 → 1,292 µs per event); paced max lag 44.5 s → 9.3 s.
+  events/s (CPU 1,784 → 1,292 µs per event) in the first session, and
+  508–573 → 764–824 events/s across four sessions. The paced max lag falls
+  from 44.5–50.3 s (base, three runs) to a range of **9.3–38.4 s** (candidate,
+  ten runs in four sessions, median 19.4 s; Verification). The lag does not
+  reproduce run to run: the trader's capacity (about 580–825 events/s) sits
+  just under the burst's arrival rate at the window's open, so the backlog
+  built there depends sharply on CPU per event and on what else the host is
+  running; a 5–10% CPU difference moves it by a factor of 1.3–2.5. It is a
+  range, never a single figure; no run came near the 5 s target.
   The removed evaluations were the cheap half of each pair (the second
   evaluation of a pair hit `THROUGHPUT-1a`'s memos), so the gain is about 1.4×,
   not the 2.1× `THROUGHPUT-1a` modelled; the `THROUGHPUT-2` handoff records
@@ -313,6 +359,15 @@ paper-e2e goldens, and the bench's content digests on two candidate runs).
   `bf1ee89`); a multi-trade reference frame evaluates once; a single-event
   frame is unchanged; a replayed raw record groups by its identity; a frame
   halted by its first event is not evaluated; a frame never outlives a drain.
+  r1: a frame whose last event is for an unconfigured market is attributed to
+  the last event that touched the configured one (source and `evaluatedAt`);
+  a frame touching two configured markets evaluates each at its own last
+  event, in the per-event cadence's order, each decision equal to the
+  per-event run's at the same source event (both fail on `6be3eae`).
+- `test/integration/paper-trader/group-commit-loop.test.ts` "the bounds count
+  STAGINGS" (r1) — with the database stalled, 300 two-trade frames stop the
+  loop at 128 staged FRAMES (256 events), each staging holding one decision
+  (D5).
 - `apps/data-gateway/src/publisher.test.ts` "frame-atomic runs" — one call per
   frame admitted in one turn; runs cut only at frame boundaries (envelope and
   byte bounds); the 1,024 split; unchanged behaviour without `causationId` and
@@ -328,7 +383,8 @@ paper-e2e goldens, and the bench's content digests on two candidate runs).
   uninterrupted run decided after it. The feed tests pin the same with a
   carried partial frame.
 - The throughput benchmark (`tools/bench/trader-throughput`), base `bf1ee89`
-  against the candidate on one registered clone, full H1 burst:
+  against the candidate on one registered clone, full H1 burst (session 1; its
+  paced lag is ONE run of the range below):
 
   | Run | Events/s | CPU µs/event | Decisions | Max lag | p99 lag | Halts |
   | --- | --- | --- | --- | --- | --- | --- |
@@ -337,7 +393,30 @@ paper-e2e goldens, and the bench's content digests on two candidate runs).
   | base, paced | 566.1 | 1,776 | 89,621 | 44.46 s | 44.04 s | none |
   | candidate, paced | 709.0 | 1,366 | 46,666 | 9.26 s | 8.83 s | none |
 
-  Base `bf1ee89`, candidate `ead59be`. A second session at the final tip
+  Base `bf1ee89`, candidate `ead59be`. **The paced max lag is a range, not
+  a figure** (r1, `TP2-R1-H1`): every candidate paced run on the full burst,
+  in every session, on the same host:
+
+  | Session | Code | Host load (1-min, start) | Events/s | CPU µs/event | Max lag | p99 lag | p50 lag |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 1 (implementer) | `f0baf10` | not recorded | 707.4 | 1,409 | 10.01 s | 9.56 s | 1.94 s |
+  | 1 (implementer) | `ead59be` | not recorded | 709.0 | 1,366 | 9.26 s | 8.83 s | 1.38 s |
+  | 2 (implementer, other jobs running) | `510ba20` | not recorded | 707.0 | 1,427 | 11.84 s | 11.46 s | 2.83 s |
+  | 3 (verifier, "quiet host") | `6be3eae` | not recorded | 664.8 | 1,530 | 22.88 s | 22.52 s | 3.35 s |
+  | 3 (verifier, "quiet host") | `6be3eae` | not recorded | 703.0 | 1,486 | 15.84 s | 15.37 s | 6.42 s |
+  | 4 (r1) | r1 | 1.29 | 709.0 | 1,387 | 9.62 s | 9.15 s | 1.61 s |
+  | 4 (r1) | r1 | 3.26 | 652.0 | 1,585 | 24.84 s | 24.05 s | 6.64 s |
+  | 4 (r1) | r1 | 9.67 | 610.1 | 1,556 | 37.09 s | 36.80 s | 2.50 s |
+  | 4 (r1) | r1 | 17.86 | 577.1 | 1,715 | 38.37 s | 37.92 s | 29.48 s |
+  | 4 (r1) | r1 | 13.52 | 652.7 | 1,560 | 27.96 s | 27.59 s | 15.55 s |
+
+  Range 9.3–38.4 s, median 19.4 s; base's paced runs were 44.46 s, 48.62 s
+  and 50.28 s. The r1 code changes no decision on this burst (the r1 runs'
+  normalized decision and checkpoint digests equal `6be3eae`'s), so every
+  row measures the same work. Session 4's catch-up (load 1.85 at its start):
+  824.4 events/s at 1,300 µs/event.
+
+  A second session at the final tip
   (`510ba20`, whose product code differs only by an equivalent loop in the
   feed adapter), with base re-run beside it: catch-up 545.6 → 764.4 events/s
   (1,866 → 1,402 µs/event), paced max lag 48.6 s → 11.8 s (p99 48.3 → 11.5 s).

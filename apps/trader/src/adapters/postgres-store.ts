@@ -189,11 +189,11 @@ function checkpointRow(checkpoint: StrategyStateCheckpoint, capturedAt: string) 
 
 /**
  * Rows per statement: 1,000 rows of at most 19 bind parameters each is far
- * below PostgreSQL's 65,535. A batch is at most 128 events (the loop's hard
- * bound, `GROUP_COMMIT_MAX_EVENTS`), and an event's evaluations write one
- * decision and one checkpoint each, so a batch fits one statement unless an
- * event evaluates unusually many callbacks — which the transaction path below
- * still handles.
+ * below PostgreSQL's 65,535. A batch is at most 128 stagings (the loop's hard
+ * bound, `GROUP_COMMIT_MAX_EVENTS`; one staging per venue frame since ADR-024,
+ * `TP2-R1-M2`), and a staging's evaluations write one decision and one
+ * checkpoint each, so a batch fits one statement unless a frame evaluates
+ * unusually many callbacks — which the transaction path below still handles.
  */
 const GROUP_COMMIT_ROWS_PER_STATEMENT = 1_000;
 
@@ -257,6 +257,7 @@ export class PostgresGroupCommit implements GroupCommit {
     }
     this.#decisions.push(...decisions);
     this.#checkpoints.push(...checkpoints);
+    // One per `stage` call — one per frame the loop flushes (`TP2-R1-M2`).
     this.#events += 1;
     return portOk(null);
   }

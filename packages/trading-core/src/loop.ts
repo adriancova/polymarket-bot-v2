@@ -499,6 +499,18 @@ export class DecisionOutboxBuffer {
  * `2 × GROUP_COMMIT_MAX_EVENTS` events have decisions that are not yet
  * durable (one committing batch, one staged).
  *
+ * `THROUGHPUT-2` r1 (ADR-024 D5, `TP2-R1-M2`): the UNIT these bounds count is
+ * one STAGING — one outbox flush that carried a decision or a checkpoint
+ * (`GroupCommit.stagedEvents`). Before ADR-024 a flush followed each event,
+ * so the unit was an event; the loop now flushes once per venue FRAME, so
+ * every "event" in these bounds (COUNT, the hard bound, the `2 ×` window)
+ * reads "frame": at most 128 frames staged, at most 256 frames with
+ * decisions not yet durable. A frame of one event is an event, as before; a
+ * longer frame is one unit however many events it holds (H1: 1.76 events
+ * per frame on average, up to 65). What one unit holds in DECISIONS is not
+ * wider than before: a frame's flush carries one decision per market it
+ * owed (plus any lifecycle callback), as a lone event's flush does.
+ *
  * And the loop WAITS until everything staged is durable:
  *
  * - at the end of a drain, unless the caller asked otherwise (the pump's
@@ -514,8 +526,8 @@ export class DecisionOutboxBuffer {
 export const GROUP_COMMIT_MAX_EVENTS = 128;
 export const GROUP_COMMIT_MAX_AGE_MS = 50;
 /**
- * Once this many events are staged, a commit is REQUESTED without waiting for
- * it, and evaluation continues while the database works. Commits never overlap
+ * Once this many events (frames since ADR-024: see above) are staged, a
+ * commit is REQUESTED without waiting for it, and evaluation continues while the database works. Commits never overlap
  * one another (they form one chain), so batches become durable one at a time,
  * in stage order.
  */
@@ -1161,8 +1173,12 @@ export class CoreLoop {
     instant: string,
     epochMs: number,
   ): Promise<void> {
-    const frame = (this.#frame ??= { owed: new Map(), last: undefined, harvest: false });
-    frame.last = { eventId: envelope.eventId, instant, epochMs };
+    const frame = (this.#frame ??= { owed: new Map(), harvestAt: undefined });
+    // r1 (`TP2-R1-M1`): what an event contributes is recorded only where it
+    // would have acted alone — an owed evaluation names THIS event, and the
+    // harvest instant moves only for an event that reaches the harvest point.
+    // An event for a market this trader does not run changes neither.
+    const at: OwedEvaluation["at"] = { eventId: envelope.eventId, instant, epochMs };
 
     if (envelope.eventType === "ReferenceTradeObserved") {
       const venue = readString(envelope.payload, "venue");
@@ -1185,9 +1201,9 @@ export class CoreLoop {
       for (const [marketId, market] of this.#options.markets) {
         if (this.#options.halts.isMarketHalted(marketId)) continue;
         market.observeInstant(instant, epochMs);
-        frame.owed.set(marketId, market);
+        oweEvaluation(frame, marketId, market, at);
       }
-      frame.harvest = true;
+      frame.harvestAt = instant;
       return;
     }
 
@@ -1204,44 +1220,45 @@ export class CoreLoop {
       if (callback === undefined) continue;
       if (this.#options.halts.isMarketHalted(marketId)) continue;
       if (callback.kind === "onFeatures") {
-        // `Map.set` on a key already present keeps its first position: the
-        // markets are evaluated in the order the frame first touched them.
-        frame.owed.set(marketId, market);
+        oweEvaluation(frame, marketId, market, at);
         continue;
       }
       await this.#evaluateMarket(market, envelope, callback, instant, epochMs);
     }
-    frame.harvest = true;
+    frame.harvestAt = instant;
   }
 
   /**
    * `THROUGHPUT-2` (ADR-024) — the frame's close: every market the frame owes
-   * an `onFeatures` evaluation is evaluated ONCE, in first-touch order, on the
-   * fully applied frame, with the frame's last applied event as the decision's
-   * source event and instant; then the fill harvest and the outbox flush run,
-   * as they do after a single event. A market halted meanwhile is not
-   * evaluated (the same gate as always). A frame none of whose events reached
-   * the harvest point (no configured market, no reference price) harvests
-   * nothing, as each of those events alone would not have.
+   * an `onFeatures` evaluation is evaluated ONCE, on the fully applied frame,
+   * with — as its source event and instant — the LAST event of the frame that
+   * owed THAT market an evaluation: exactly the event whose own evaluation of
+   * that market base ran last. The markets are evaluated in the order of
+   * those events (r1, `TP2-R1-M1`), so a frame's decisions are a subsequence
+   * of the per-event cadence's, in its order. Then the fill harvest and the
+   * outbox flush run, at the instant of the frame's last event that reached
+   * the harvest point, as they do after a single event. A market halted
+   * meanwhile is not evaluated (the same gate as always). A frame none of
+   * whose events reached the harvest point (no configured market, no
+   * reference price) harvests nothing, as each of those events alone would
+   * not have.
    */
   async #closeFrame(): Promise<void> {
     const frame = this.#frame;
     if (frame === undefined) return;
     this.#frame = undefined;
-    const last = frame.last;
-    if (last === undefined) return;
-    for (const [marketId, market] of frame.owed) {
+    for (const [marketId, owed] of frame.owed) {
       if (this.#options.halts.isMarketHalted(marketId)) continue;
       await this.#evaluateMarket(
-        market,
-        { eventId: last.eventId },
+        owed.market,
+        { eventId: owed.at.eventId },
         { kind: "onFeatures" },
-        last.instant,
-        last.epochMs,
+        owed.at.instant,
+        owed.at.epochMs,
       );
     }
-    if (!frame.harvest) return;
-    await this.#harvestFills(last.instant);
+    if (frame.harvestAt === undefined) return;
+    await this.#harvestFills(frame.harvestAt);
     await this.#flushOutbox();
   }
 
@@ -3795,12 +3812,39 @@ type EventEnvelopeOf = Extract<ReturnType<typeof readEventEnvelope>, { readonly 
 
 /** `THROUGHPUT-2` (ADR-024): a venue frame between its first and its closing event. */
 interface OpenFrame {
-  /** Markets owed ONE `onFeatures` evaluation at the close, in first-touch order. */
-  readonly owed: Map<string, MarketState>;
-  /** The frame's last APPLIED event: the evaluations' source event and instant. */
-  last: { readonly eventId: string; readonly instant: string; readonly epochMs: number } | undefined;
-  /** Some event of the frame reached the point where a lone event harvests fills and flushes. */
-  harvest: boolean;
+  /**
+   * Markets owed ONE `onFeatures` evaluation at the close, in the order of the
+   * events that last owed them (see {@link oweEvaluation}).
+   */
+  readonly owed: Map<string, OwedEvaluation>;
+  /**
+   * The instant of the frame's last event that reached the point where a lone
+   * event harvests fills and flushes; `undefined` when none did.
+   */
+  harvestAt: string | undefined;
+}
+
+/** One market's owed evaluation: the market, and the last frame event that owed it. */
+interface OwedEvaluation {
+  readonly market: MarketState;
+  readonly at: { readonly eventId: string; readonly instant: string; readonly epochMs: number };
+}
+
+/**
+ * `THROUGHPUT-2` r1 (`TP2-R1-M1`): records that `at` owes `marketId` an
+ * evaluation. A market owed again moves to the END of the order, keyed to
+ * the later event: the close then evaluates each market at the last event
+ * that owed it, in the order of those events — the order the per-event
+ * cadence ran those same evaluations in.
+ */
+function oweEvaluation(
+  frame: OpenFrame,
+  marketId: string,
+  market: MarketState,
+  at: OwedEvaluation["at"],
+): void {
+  frame.owed.delete(marketId);
+  frame.owed.set(marketId, { market, at });
 }
 
 const ZERO_UUID = "00000000-0000-7000-8000-000000000000";
