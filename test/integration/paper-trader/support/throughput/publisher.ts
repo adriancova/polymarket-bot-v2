@@ -1,7 +1,16 @@
 /**
  * `THROUGHPUT-1a` — publishing the recorded burst into the stream, through the
- * REAL `packages/event-bus` publish API, one envelope per `publish` call in
- * stream order, as the gateway publishes.
+ * REAL `packages/event-bus` publish API, in stream order, as the gateway
+ * publishes.
+ *
+ * `THROUGHPUT-2` (ADR-024): the gateway now writes every envelope of one raw
+ * frame (one `causationId`) in ONE atomic transport call
+ * (`apps/data-gateway/src/publisher.ts`, "Frame-atomic runs"), and the
+ * trader's feed relies on it. So does this publisher: a run of consecutive
+ * envelopes sharing a `causationId` goes out in one `publishBatch` call when
+ * the transport offers it (the Redis transport does), and alone otherwise.
+ * A paced frame is scheduled at its FIRST envelope's recorded instant (the
+ * gateway dispatches a frame's events in one turn).
  *
  * Two modes:
  *
@@ -27,9 +36,23 @@ import type { PublishReceipt } from "@polymarket-bot/event-bus";
 
 export type PublishMode = "catch-up" | "paced";
 
-/** The one method of the transport this module uses. */
+/** The methods of the transport this module uses. */
 export interface EnvelopePublisher {
   publish(stream: string, envelope: EventEnvelope<unknown>): Promise<PublishReceipt>;
+  /** `THROUGHPUT-2`: one atomic call for one frame (`RedisStreamsEventTransport.publishBatch`). */
+  publishBatch?(
+    stream: string,
+    envelopes: readonly EventEnvelope<unknown>[],
+  ): Promise<{ readonly receipts: readonly PublishReceipt[]; readonly failure: { readonly index: number; readonly error: unknown } | undefined }>;
+}
+
+/** The index one past the end of the frame that starts at `start` (consecutive envelopes sharing a causationId). */
+function frameEnd(envelopes: readonly EventEnvelope<unknown>[], start: number): number {
+  const causation = envelopes[start]?.causationId;
+  let end = start + 1;
+  if (causation === undefined || causation === "") return end;
+  while (end < envelopes.length && envelopes[end]?.causationId === causation) end += 1;
+  return end;
 }
 
 export interface PublishLog {
@@ -69,9 +92,12 @@ export async function publishEnvelopes(options: {
   let maxScheduleSlipMs = 0;
   let lastSequence = 0;
 
-  for (let index = 0; index < envelopes.length; index += 1) {
+  for (let index = 0; index < envelopes.length; ) {
     const envelope = envelopes[index];
-    if (envelope === undefined) continue;
+    if (envelope === undefined) break;
+    // A frame never straddles the pacing origin: the prepended envelopes
+    // before `paceFrom` are published one by one, at once.
+    const end = index < paceFrom ? index + 1 : frameEnd(envelopes, index);
     if (mode === "paced" && index >= paceFrom) {
       const target = startedAtMs + (Date.parse(envelope.receivedAt) - baseReceivedMs);
       const wait = target - preciseNowMs();
@@ -79,9 +105,28 @@ export async function publishEnvelopes(options: {
       const slip = preciseNowMs() - target;
       if (slip > maxScheduleSlipMs) maxScheduleSlipMs = slip;
     }
-    const receipt = await transport.publish(stream, envelope);
-    lastSequence = receipt.sequence;
-    publishedAtMs.push(preciseNowMs());
+    if (end - index > 1 && transport.publishBatch !== undefined) {
+      const frame = envelopes.slice(index, end);
+      const result = await transport.publishBatch(stream, frame);
+      if (result.failure !== undefined || result.receipts.length !== frame.length) {
+        throw new Error(
+          `publishBatch published ${String(result.receipts.length)} of ${String(frame.length)} envelopes: ` +
+            String(result.failure?.error),
+        );
+      }
+      const at = preciseNowMs();
+      for (const receipt of result.receipts) {
+        lastSequence = receipt.sequence;
+        publishedAtMs.push(at);
+      }
+    } else {
+      for (let member = index; member < end; member += 1) {
+        const receipt = await transport.publish(stream, envelopes[member] as EventEnvelope<unknown>);
+        lastSequence = receipt.sequence;
+        publishedAtMs.push(preciseNowMs());
+      }
+    }
+    index = end;
   }
 
   return {
