@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Write docs/status-archive/MOVE-MAP.md: where each part of the base status file went.
+
+Usage: python3 tools/records/move-map.py --base <rev> [--repo .] [--root .]
+
+Keyed by heading, row id or bullet, never by line number alone: one row per
+heading, per work-package row, per closeout-blocker and residual row, and per
+bullet of the deviation, evidence and gate sections. The archive file comes from
+the split rules (status_sections.SECTIONS); the brief location is found by
+searching the current brief for the id, so re-run this after editing the brief.
+A heading, or a work-package row, whose lines hold a REWRITES.md declaration
+that carries an entry (a record-item or complete-row "carried RW-NN") also
+names the brief section holding that entry's new lines; check-preservation.py
+C5 checks that MOVE-MAP.md is exactly this script's output.
+Stdlib only, no network.
+"""
+
+import argparse
+import difflib
+import importlib.util
+import os
+import re
+import sys
+
+sys.dont_write_bytecode = True  # keep tools/records free of __pycache__
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import status_sections as S  # noqa: E402
+
+BULLET_SECTIONS = ["## Accepted evidence", "## Deviations from specification", "## Pending external evidence",
+                   "## Resolved evidence items", "## Human and operational gates"]
+
+# Base heading prefix -> the brief section that now carries its live content.
+HEADING_TO_BRIEF = [
+    ("# Implementation Status", "title block; Current phase"),
+    ("## Safety state", "Safety state (verbatim)"),
+    ("## Work packages", "Work packages (one line per package); Authorized now"),
+    ("## Accepted evidence", "Resolved evidence items (one line)"),
+    ("## Wave 2 qualification", "Wave 2 qualification (one paragraph)"),
+    ("### Superseded header sentences", "archive only"),
+    ("## Open blockers", "Open blockers"),
+    ("### Closeout blockers still open", "Open blockers > Closeout blockers"),
+    ("### Residual queue", "Open blockers > Residual queue"),
+    ("### The cross-package record below, reconciled", "Open blockers > Schema boundary (still live)"),
+    ("### Cross-package risk", "Open blockers > Schema boundary (still live); archive"),
+    ("## Deviations from specification", "Deviations from specification (one line each)"),
+    ("## Pending external evidence", "Pending external evidence"),
+    ("## Resolved evidence items", "Resolved evidence items"),
+    ("## Human and operational gates", "Human and operational gates (verbatim)"),
+]
+
+
+def brief_index(brief_lines):
+    """For each line, the heading path (## and ###) it sits under."""
+    h2 = h3 = ""
+    out = []
+    for line in brief_lines:
+        if line.startswith("## "):
+            h2, h3 = line[3:], ""
+        elif line.startswith("### "):
+            h3 = line[4:]
+        out.append(f"{h2} > {h3}" if h3 else h2)
+    return out
+
+
+def locate(ident, brief_lines, where, prefer=None):
+    """The brief location of an id: its own table row, else its first mention.
+
+    prefer is a sequence of heading-path prefixes, searched in order before the whole brief.
+    """
+    for scope in prefer or ():
+        scoped = [l if where[i].startswith(scope) else "" for i, l in enumerate(brief_lines)]
+        found = locate(ident, scoped, where)
+        if found != "archive only":
+            return found
+    tick = f"`{ident}`"
+    row = [i for i, l in enumerate(brief_lines) if l.startswith(f"| {tick} |")]
+    if row:
+        return f"{where[row[0]]} (own row)"
+    hits = [i for i, l in enumerate(brief_lines) if tick in l or f"**{ident}**" in l]
+    if hits:
+        return f"{where[hits[0]]} (named)"
+    heads = [i for i, l in enumerate(brief_lines) if l.startswith("#") and ident in l]
+    if heads:
+        return f"{where[heads[0]]} (section)"
+    return "archive only"
+
+
+def line_map(old, new):
+    """{old 1-based line: new 1-based line} for the lines difflib matches unchanged."""
+    out = {}
+    sm = difflib.SequenceMatcher(None, old, new, autojunk=False)
+    for tag, i1, i2, j1, _j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                out[i1 + k + 1] = j1 + k + 1
+    return out
+
+
+def carries(root, repo, sha, brief, where):
+    """[(a, b, kind, [(RW-NN, brief location)])] for each REWRITES.md declaration at sha that carries an entry."""
+    spec = importlib.util.spec_from_file_location(
+        "check_preservation", os.path.join(os.path.dirname(os.path.abspath(__file__)), "check-preservation.py"))
+    cp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cp)
+    with open(os.path.join(root, S.ARCHIVE, "REWRITES.md"), encoding="utf-8") as fh:
+        rwbase, blocks, _entries = cp.parse_rewrites(fh.read())
+    rwbase = S.resolve(repo, rwbase) if rwbase else None
+    news = {}
+    for blk in blocks:
+        if blk["kind"] == "new":
+            news.setdefault(blk["entry"], []).extend(l for l in blk["lines"] if l.strip())
+    out, moved = [], None
+    for blk in blocks:
+        blk_base = S.resolve(repo, blk["base"]) if blk["base"] else rwbase
+        if blk["kind"] != "unpaired" or blk_base not in (sha, rwbase):
+            continue
+        if blk_base != sha and moved is None:  # after a re-cut: rewrites-base lines -> cut lines
+            moved = line_map(S.base_text(repo, rwbase).split("\n"), S.base_text(repo, sha).split("\n"))
+        for line in blk["lines"]:
+            m = re.match(r"^(\d+)-(\d+) (record-item|complete-row)\b.* — (.*)$", line)
+            if not m:
+                continue
+            a, b = int(m.group(1)), int(m.group(2))
+            if blk_base != sha:
+                if a not in moved or b not in moved:
+                    continue
+                a, b = moved[a], moved[b]
+            found = []
+            for rw in re.findall(r"carried (RW-\d+)", m.group(4)):
+                at = [i for i, l in enumerate(brief) if l in news.get(rw, [])]
+                found.append((rw, where[at[0]] if at else "not in the brief"))
+            if found:
+                out.append((a, b, m.group(3), found))
+    return out
+
+
+def carried_text(found):
+    """'<brief location> (RW-NN, RW-MM)' grouped by location, in first-seen order."""
+    by = {}
+    for rw, loc in found:
+        by.setdefault(loc, []).append(rw)
+    return "; ".join(f"{loc} ({', '.join(dict.fromkeys(rws))})" for loc, rws in by.items())
+
+
+def render(repo, root, sha):
+    """The text of MOVE-MAP.md for base sha and the brief and REWRITES.md under root."""
+    lines = S.base_text(repo, sha).split("\n")
+    starts = S.section_starts(S.split_lines(S.base_text(repo, sha)))
+
+    def archive_of(n):  # 1-based line -> archive file
+        k = max(i for i, s in enumerate(starts) if s + 1 <= n)
+        return S.SECTIONS[k][0]
+
+    with open(os.path.join(root, S.STATUS), encoding="utf-8") as fh:
+        brief = fh.read().split("\n")
+    where = brief_index(brief)
+    carry = carries(root, repo, sha, brief, where)
+    heads = [n for n, line in enumerate(lines, 1) if re.match(r"^#{1,6} ", line)] + [len(lines) + 1]
+
+    def carried_in(a, b, kind):
+        return [f for ca, _cb, k, found in carry if k == kind and a <= ca <= b for f in found]
+
+    out = [
+        "# Status archive: move map",
+        "",
+        f"Where each part of `IMPLEMENTATION_STATUS.md` at `{sha[:7]}` went. Generated by",
+        "`tools/records/move-map.py`; the brief column is found by searching the brief",
+        "for the id. Line numbers are for orientation only; key on the id or heading.",
+        "Where the brief carries live items of a completion record or a Complete row,",
+        "the line also names the brief section and the `REWRITES.md` entry (RW-NN).",
+        "",
+        "To re-apply a governance edit made on `main` after the cut: find its id below,",
+        "update that one line in the brief, and re-cut the archive (see `README.md`).",
+        "",
+        "## Headings",
+        "",
+        "| Old heading | Old line | Archive file | Brief section |",
+        "| --- | --- | --- | --- |",
+    ]
+    for n, line in enumerate(lines, 1):
+        if re.match(r"^#{1,6} ", line):
+            dest = next((b for p, b in HEADING_TO_BRIEF if line.startswith(p)), "archive only")
+            found = carried_in(n, heads[heads.index(n) + 1] - 1, "record-item")
+            if found:  # a completion record whose obligations the brief carries
+                dest = ("" if dest == "archive only" else dest + "; ") + carried_text(found) + "; full record in the archive"
+            out.append(f"| {line} | {n} | [{archive_of(n)}]({archive_of(n)}) | {dest} |")
+
+    out += ["", "## Work-package rows", "", "| Row id | Old line | Archive file | Brief location |", "| --- | --- | --- | --- |"]
+    on = False
+    for n, line in enumerate(lines, 1):
+        if line == "## Work packages":
+            on = True
+            continue
+        if on and line.startswith("#"):
+            break
+        m = re.match(r"^\| ((?:\(superseded row\) )?)`([A-Za-z0-9-]+)`", line) if on else None
+        if m:
+            label = f"{m.group(1)}`{m.group(2)}`"
+            dest = locate(m.group(2), brief, where, prefer=("Work packages",))
+            if any(l.startswith(f"- **`{m.group(2)}`**") for l in brief):
+                dest += "; Authorized now"
+            end = next((x - 1 for x in range(n + 1, len(lines) + 1) if re.match(r"^\| ((?:\(superseded row\) )?)`|^#|^\| All other", lines[x - 1])), n)
+            found = carried_in(n, max(n, end), "complete-row")
+            if found:  # its live residuals
+                dest += "; " + carried_text(found)
+            out.append(f"| {label} | {n} | [{archive_of(n)}]({archive_of(n)}) | {dest} |")
+        elif on and line.startswith("| All other packages"):
+            out.append(f"| All other packages | {n} | [{archive_of(n)}]({archive_of(n)}) | Work packages (own row) |")
+
+    out += ["", "## Closeout-blocker and residual rows", "",
+            "| Row id (as in the old table) | Old line | Archive file | Brief location |", "| --- | --- | --- | --- |"]
+    on = False
+    sub = ""
+    for n, line in enumerate(lines, 1):
+        if line == "## Open blockers":
+            on = True
+            continue
+        if on and line.startswith("### "):
+            sub = line
+        if on and (line.startswith("## ") or line.startswith("### The cross-package")):
+            break
+        m = re.match(r"^\| \*\*(.+?)\*\* \|", line) if on else None
+        if m:
+            raw = m.group(1).replace("**", "")
+            ident = re.sub(r" \(.*\)$", "", raw).strip()
+            label = f"`{ident}`" + ("" if raw == ident else " (" + raw.replace("|", "\\|") + ")")
+            first = "Open blockers > Closeout" if sub.startswith("### Closeout") else "Open blockers > Residual queue"
+            own = [i for i, l in enumerate(brief) if l.startswith(f"| `{ident}` |") and where[i].startswith(first)]
+            if own:
+                dest = f"{where[own[0]]} (own row)"
+            else:  # named: the human items first (a completed track's rulings live there), then the lists
+                order = (first, "Open blockers", "Human items") if first.endswith("Closeout") else ("Human items", first, "Open blockers")
+                dest = locate(ident, brief, where, prefer=order)
+            out.append(f"| {label} | {n} | [{archive_of(n)}]({archive_of(n)}) | {dest} |")
+
+    out += ["", "## Bullets of the deviation, evidence and gate sections", "",
+            "| Old section | Bullet (first words) | Old line | Archive file | Brief section |", "| --- | --- | --- | --- | --- |"]
+    cur = None
+    for n, line in enumerate(lines, 1):
+        if line.startswith("#"):
+            cur = line if line in BULLET_SECTIONS else None
+            continue
+        if cur and line.startswith("- "):
+            words = " ".join(line[2:].split()[:9]).replace("|", "\\|")
+            dest = next(b for p, b in HEADING_TO_BRIEF if cur.startswith(p))
+            moved = re.search(r"DISCHARGED[^)]*?see `(## [^`]+)`", line)
+            if moved:  # a discharged bullet lives only where its own text points
+                dest = next(b for p, b in HEADING_TO_BRIEF if moved.group(1).startswith(p))
+                dest += f" (discharged; not repeated under {cur[3:]})"
+            out.append(f"| {cur[3:]} | {words} ... | {n} | [{archive_of(n)}]({archive_of(n)}) | {dest} |")
+    out.append("")
+    return "\n".join(out)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--repo", default=".")
+    ap.add_argument("--root", default=None)
+    args = ap.parse_args()
+    root = args.root or args.repo
+    sha = S.resolve(args.repo, args.base)
+    text = render(args.repo, root, sha)
+    path = os.path.join(root, S.ARCHIVE, "MOVE-MAP.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    print(f"wrote {path}: {len(text.split(chr(10)))} lines")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
