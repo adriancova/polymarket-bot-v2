@@ -253,8 +253,11 @@ function trailingFrameStart(buffer: readonly Delivered[]): number {
   const key = frameKeyOf(last.envelope);
   if (key === undefined) return buffer.length;
   let start = buffer.length - 1;
-  while (start > 0 && frameKeyOf((buffer[start - 1] as Delivered).envelope) === key) start -= 1;
-  return start;
+  for (;;) {
+    const previous = start > 0 ? buffer[start - 1] : undefined;
+    if (previous === undefined || frameKeyOf(previous.envelope) !== key) return start;
+    start -= 1;
+  }
 }
 
 /** How many links of an error's `cause` chain a halt detail carries. */
