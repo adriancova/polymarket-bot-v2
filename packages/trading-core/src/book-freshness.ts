@@ -35,13 +35,17 @@
  *    §7.1 session fields) — there is no session to be confirmed by;
  * 3. no confirmation is known for the session — never seen, or evicted from
  *    the bounded table;
- * 4. the session is TAINTED: a data-quality incident that names no market
- *    arrived after the session was first seen. The gateway opens exactly such
- *    incidents when it suppresses a frame's events (a WAL refusal) or cannot
- *    normalize a frame, so from then on "another token's frame arrived" no
- *    longer implies "this token's frames are being delivered". A taint is never
- *    lifted; a NEW session (reconnect, new generation, gateway restart) starts
- *    clean;
+ * 4. the session's GATEWAY EPOCH is TAINTED: a data-quality incident that
+ *    names no market arrived from that epoch. The gateway opens exactly such
+ *    incidents when it suppresses a frame's events (a WAL refusal), cannot
+ *    normalize a frame, or sees a heartbeat stall, so from then on "another
+ *    token's frame arrived" no longer implies "this token's frames are being
+ *    delivered". The taint covers every session of the epoch, LATER ONES
+ *    INCLUDED, and is never lifted: the gateway deduplicates an open incident
+ *    per `(scope, reasonCode)` and closes almost none, so a repeat after a
+ *    reconnect publishes nothing and a per-session taint would leave the new
+ *    session looking clean while its frames are suppressed (ADR-023 D2.4). Only
+ *    a new gateway epoch (a restart) starts clean;
  * 5. the market has an active data-quality incident of its own.
  *
  * A disconnection, a lost heartbeat, a gateway stall or a gateway restart
@@ -84,6 +88,13 @@ export const CONFIRMING_SOURCE = "polymarket";
  */
 export const MAXIMUM_TRACKED_SESSIONS = 1_024;
 
+/**
+ * How many tainted gateway epochs are remembered. One per gateway restart that
+ * reported an incident; past the bound EVERY epoch is treated as tainted
+ * (forgetting a taint would be the permissive direction).
+ */
+export const MAXIMUM_TAINTED_EPOCHS = 1_024;
+
 /** One instant, in both of the forms the loop carries. */
 export interface ConfirmedInstant {
   readonly iso: string;
@@ -101,7 +112,7 @@ export interface SessionFields {
 
 interface SessionRecord {
   latest: ConfirmedInstant;
-  tainted: boolean;
+  readonly gatewayEpoch: string;
 }
 
 /**
@@ -118,11 +129,14 @@ export function sessionKeyOf(envelope: SessionFields): string | undefined {
 }
 
 /**
- * Per-session confirmations and taints. One per process; fed every consumed
- * event in stream order.
+ * Per-session confirmations and per-epoch taints. One per process; fed every
+ * consumed event in stream order.
  */
 export class DeliverySessionLiveness {
   readonly #sessions = new Map<string, SessionRecord>();
+  readonly #taintedEpochs = new Set<string>();
+  /** Set when the tainted-epoch table overflowed: every epoch is tainted. */
+  #everyEpochTainted = false;
 
   /**
    * Records a consumed event. Only a confirming event (type, source and both
@@ -138,7 +152,7 @@ export class DeliverySessionLiveness {
       existing.latest = at;
       return;
     }
-    this.#sessions.set(key, { latest: at, tainted: false });
+    this.#sessions.set(key, { latest: at, gatewayEpoch: envelope.gatewayEpoch });
     if (this.#sessions.size > MAXIMUM_TRACKED_SESSIONS) {
       const oldest = this.#sessions.keys().next();
       if (oldest.done !== true) this.#sessions.delete(oldest.value);
@@ -146,17 +160,27 @@ export class DeliverySessionLiveness {
   }
 
   /**
-   * Rule 4: a data-quality incident naming no market taints every session
-   * known now. Sessions first seen later are clean.
+   * Rule 4: a data-quality incident naming no market taints its gateway
+   * epoch — every session of it, known now or first seen later — for good.
    */
-  taintKnownSessions(): void {
-    for (const record of this.#sessions.values()) record.tainted = true;
+  taintGatewayEpoch(gatewayEpoch: string): void {
+    if (this.#taintedEpochs.has(gatewayEpoch)) return;
+    if (this.#taintedEpochs.size >= MAXIMUM_TAINTED_EPOCHS) {
+      this.#everyEpochTainted = true;
+      return;
+    }
+    this.#taintedEpochs.add(gatewayEpoch);
   }
 
-  /** The latest confirmation of an untainted session, if any. */
+  /** Whether a gateway epoch is tainted (rule 4). */
+  isEpochTainted(gatewayEpoch: string): boolean {
+    return this.#everyEpochTainted || this.#taintedEpochs.has(gatewayEpoch);
+  }
+
+  /** The latest confirmation of a session whose epoch is untainted, if any. */
   confirmation(sessionKey: string): ConfirmedInstant | undefined {
     const record = this.#sessions.get(sessionKey);
-    if (record === undefined || record.tainted) return undefined;
+    if (record === undefined || this.isEpochTainted(record.gatewayEpoch)) return undefined;
     return record.latest;
   }
 

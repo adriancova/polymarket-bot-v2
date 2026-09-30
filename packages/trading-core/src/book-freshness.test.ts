@@ -37,6 +37,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DeliverySessionLiveness,
+  MAXIMUM_TAINTED_EPOCHS,
   MAXIMUM_TRACKED_SESSIONS,
   bookConfirmedAt,
   sessionKeyOf,
@@ -651,7 +652,7 @@ describe("3. a disconnection mid-quiet is detected", () => {
 // ---------------------------------------------------------------------------
 
 describe("the fallbacks to the last change (fail closed)", () => {
-  it("a data-quality incident naming NO market taints the session: the quiet book is stale at once", async () => {
+  it("a data-quality incident naming NO market taints the gateway epoch: the quiet book is stale at once", async () => {
     const events = [...quietYesTimeline()];
     // Before 6.200 s's tick: the incident arrives, then one more frame on A1.
     events.splice(events.length - 1, 0, incident(6.05, "gw-polymarket-market-1"), noChange(6.1, A1, "999"));
@@ -663,9 +664,25 @@ describe("the fallbacks to the last change (fail closed)", () => {
     expect(after.bookAgeMs).toBe("5200");
   });
 
-  it("the taint does not reach a session first seen after the incident", async () => {
+  /**
+   * The gateway deduplicates an open incident and never closes a WAL-refusal
+   * or normalization incident, so a repeat on a LATER session publishes
+   * nothing: the taint must reach sessions first seen after it (ADR-023 D2.4).
+   */
+  it("the taint reaches every later session of the same gateway epoch", async () => {
     const events: Recorded[] = [...quietYesTimeline(), incident(6.05, "gw-polymarket-market-1"), yesSnapshot(6.3, A2), noSnapshot(6.35, A2)];
     for (let step = 1; step <= 10; step += 1) events.push(noChange(6.35 + step * 0.5, A2, String(500 + step)));
+    events.push(tick(11.5, "64030"));
+    const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
+    const after = evaluationAt(parts, 11.5);
+    expect(after.stale).toBe(true);
+    // The age is the re-delivered YES book's own last change (6.300 s).
+    expect(after.bookAgeMs).toBe("5200");
+  });
+
+  it("a NEW gateway epoch (a restart) starts clean", async () => {
+    const events: Recorded[] = [...quietYesTimeline(), incident(6.05, "gw-polymarket-market-1"), yesSnapshot(6.3, B1), noSnapshot(6.35, B1)];
+    for (let step = 1; step <= 10; step += 1) events.push(noChange(6.35 + step * 0.5, B1, String(500 + step)));
     events.push(tick(11.5, "64030"));
     const parts = await run({ basis: "CONNECTION_CONFIRMED" }, events);
     expect(evaluationAt(parts, 11.5).stale).toBe(false);
@@ -858,6 +875,29 @@ describe("book-freshness.ts", () => {
     expect(
       bookConfirmedAt({ ...common, basis: "CONNECTION_CONFIRMED", lastChange: at(1_000), sessionKey: undefined })?.epochMs,
     ).toBe(1_000);
+  });
+
+  it("an epoch taint covers sessions seen before and after it, and no other epoch", () => {
+    const liveness = new DeliverySessionLiveness();
+    liveness.observe(bookEvent(A1), at(1_000));
+    liveness.taintGatewayEpoch(EPOCH_A);
+    liveness.observe(bookEvent(A2), at(2_000));
+    liveness.observe(bookEvent(B1), at(3_000));
+    expect(liveness.confirmation(sessionKeyOf(bookEvent(A1)) as string)).toBeUndefined();
+    expect(liveness.confirmation(sessionKeyOf(bookEvent(A2)) as string)).toBeUndefined();
+    expect(liveness.confirmation(sessionKeyOf(bookEvent(B1)) as string)?.epochMs).toBe(3_000);
+  });
+
+  it("past the tainted-epoch bound, every epoch is tainted (forgetting a taint would loosen)", () => {
+    const liveness = new DeliverySessionLiveness();
+    for (let index = 0; index < MAXIMUM_TAINTED_EPOCHS; index += 1) {
+      liveness.taintGatewayEpoch(`018f5c20-5000-7a50-8b00-${String(index).padStart(12, "0")}`);
+    }
+    liveness.observe(bookEvent(B1), at(3_000));
+    expect(liveness.confirmation(sessionKeyOf(bookEvent(B1)) as string)?.epochMs).toBe(3_000);
+    liveness.taintGatewayEpoch("018f5c20-5000-7a50-8b00-ffffffffffff");
+    expect(liveness.isEpochTainted(EPOCH_B)).toBe(true);
+    expect(liveness.confirmation(sessionKeyOf(bookEvent(B1)) as string)).toBeUndefined();
   });
 
   it("the table is bounded; a forgotten session confirms nothing (stricter, never looser)", () => {

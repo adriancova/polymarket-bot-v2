@@ -4024,8 +4024,8 @@ export class CoreLoop {
   /**
    * `THROUGHPUT-1c` (ADR-023 §4): offers one consumed event to the
    * delivery-session table, and applies rule 4 — a data-quality incident that
-   * names NO market taints every session known now. Nothing is recorded under
-   * `LAST_CHANGE`, which reads none of it.
+   * names NO market taints its gateway epoch, every session of it, for good.
+   * Nothing is recorded under `LAST_CHANGE`, which reads none of it.
    */
   #observeDeliverySession(envelope: EventEnvelopeOf, iso: string, epochMs: number): void {
     if (this.#freshnessBasis !== "CONNECTION_CONFIRMED") return;
@@ -4034,7 +4034,7 @@ export class CoreLoop {
       envelope.eventType === "DataQualityIncidentOpened" &&
       affectedMarketIds(envelope.payload).length === 0
     ) {
-      this.#liveness.taintKnownSessions();
+      this.#liveness.taintGatewayEpoch(envelope.gatewayEpoch);
     }
   }
 
