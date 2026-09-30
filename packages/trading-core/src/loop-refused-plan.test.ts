@@ -1796,7 +1796,7 @@ describe("DURABLE-1: a placement waits for its decision to be durable", () => {
     }));
   }
 
-  it("a decision with TWO placements whose record is refused: the store is asked ONCE, neither placement is allocated, risk-checked or submitted, and nothing of that event is written afterwards", async () => {
+  it("a decision with TWO placements whose record is refused: the store is asked ONCE, neither placement is reserved or submitted — each is refused (and counted) at the risk seam under the halt — and nothing of that event is written afterwards", async () => {
     const { store, inner, refused } = refusingStore();
     const harness = assemble({ store, intents: (ctx) => [followOnBuy(ctx), { ...followOnBuy(ctx), intentId: "durable-1-second-buy" }] });
     await openUntilEntry(harness);
@@ -1817,7 +1817,10 @@ describe("DURABLE-1: a placement waits for its decision to be durable", () => {
     expect(refused).toHaveLength(1);
     expect(harness.submitted).toEqual([]);
     const health = harness.loop.health();
-    expect(health.risk.evaluations).toBe(0);
+    // r1 (LOW-4): each refused placement is COUNTED, under the halt's own code.
+    expect(health.risk).toMatchObject({ evaluations: 2, approvals: 0, refusals: 2 });
+    expect(health.risk.refusalsByCode).toEqual({ RISK_RUN_STATE_BLOCKS: 2 });
+    expect(health.execution.plansBuilt).toBe(0);
     expect(health.seams.allocator.applied).toBe(0);
     expect(health.seams.reservations.taken).toBe(0);
     expect(harness.venue.fills).toHaveLength(0);
@@ -1834,9 +1837,11 @@ describe("DURABLE-1: a placement waits for its decision to be durable", () => {
 
     expect(refused).toHaveLength(1);
     // The CANCEL reached risk (approved: §6 invariant 13) and was requested;
-    // the placement never reached the allocator or the venue.
+    // the placement was refused at the seam under the halt, never reserved
+    // or submitted.
     const health = harness.loop.health();
-    expect(health.risk.evaluations).toBe(1);
+    expect(health.risk).toMatchObject({ evaluations: 2, approvals: 1, refusals: 1 });
+    expect(health.risk.refusalsByCode).toEqual({ RISK_RUN_STATE_BLOCKS: 1 });
     expect(health.execution.cancelsRequested).toBe(1);
     expect(planKinds(harness)).toEqual(["CANCEL"]);
     expect(health.seams.allocator.applied).toBe(0);
@@ -1890,14 +1895,145 @@ describe("DURABLE-1: a placement waits for its decision to be durable", () => {
 
     expect(harness.submitted).toEqual([]);
     const health = harness.loop.health();
-    expect(health.risk.evaluations).toBe(0);
+    expect(health.risk).toMatchObject({ evaluations: 1, approvals: 0, refusals: 1 });
+    expect(health.seams.allocator.applied).toBe(0);
     expect(health.halts.map((halt) => [halt.scope.kind, halt.code])).toEqual([["GLOBAL", "STORE_UNAVAILABLE"]]);
     expect(health.halts[0]?.detail).toContain("could not be staged");
     // The entry decision was emitted at the fourth event; neither it nor that
     // event's checkpoint became durable after the failure.
     expect(harness.loop.decisions().some((decision) => decision.intentIds.length > 0)).toBe(true);
     expect({ decisions: inner.decisions.length, checkpoints: inner.checkpoints.length }).toEqual(before);
-    expect(await harness.loop.durabilityMark()).toBe(true);
+    // r1 (LOW-5): the entry decision never became durable, so the mark says
+    // so (base answered `true` here).
+    expect(await harness.loop.durabilityMark()).toBe(false);
     expect({ decisions: inner.decisions.length, checkpoints: inner.checkpoints.length }).toEqual(before);
   });
+
+  it("LOW-5, per-row: a refused decision write makes durabilityMark() answer false", async () => {
+    const { store } = refusingStore();
+    const harness = assemble({ store, intents: (ctx) => [followOnBuy(ctx)] });
+    await openUntilEntry(harness);
+    expect(await harness.loop.durabilityMark()).toBe(true);
+    await feed(harness, yesBook(4));
+    expect(harness.submitted).toEqual([]);
+    expect(await harness.loop.durabilityMark()).toBe(false);
+  });
+});
+
+/**
+ * `DURABLE-1` r1, finding A01 (astra DURABLE1-ASTRA-R1-01): a CANCEL the
+ * strategy has emitted never waits on its OWN decision's record, whatever its
+ * position in the decision's intent list. The store HOLDS the intent-bearing
+ * decision (per-row: its `persistDecision`; group commit: the commit that
+ * carries it) until the test releases it; while it is held, the CANCEL must
+ * already be out and the placement must not. Both orderings, both modes.
+ */
+describe("DURABLE-1 r1 (A01): a CANCEL is not held behind a placement's durability wait", () => {
+  function heldStore(grouped: boolean): {
+    readonly store: TraderStore;
+    readonly inner: MemoryTraderStore;
+    readonly held: Promise<void>;
+    readonly release: () => void;
+  } {
+    const inner = new MemoryTraderStore();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const carriesIntent = (record: { readonly decision: { readonly intents: readonly unknown[] } }): boolean =>
+      record.decision.intents.length > 0;
+    const staged: StagedEvaluations[] = [];
+    const group: GroupCommit = {
+      stage(evaluations) {
+        staged.push(evaluations);
+        return portOk(null);
+      },
+      get stagedEvents() {
+        return staged.length;
+      },
+      async commit() {
+        const batch = staged.splice(0, staged.length);
+        if (batch.some((evaluation) => evaluation.decisions.some((entry) => carriesIntent(entry.record)))) {
+          reached();
+          await gate;
+        }
+        let decisions = 0;
+        let checkpoints = 0;
+        for (const evaluation of batch) {
+          for (const entry of evaluation.decisions) {
+            await inner.persistDecision(entry.record, entry.telemetry);
+            decisions += 1;
+          }
+          for (const entry of evaluation.checkpoints) {
+            await inner.saveCheckpoint(entry.checkpoint, entry.capturedAt);
+            checkpoints += 1;
+          }
+        }
+        return portOk({ decisions, checkpoints });
+      },
+    };
+    const store: TraderStore = {
+      persistDecision: async (record, telemetry) => {
+        if (carriesIntent(record)) {
+          reached();
+          await gate;
+        }
+        return await inner.persistDecision(record, telemetry);
+      },
+      saveCheckpoint: (checkpoint, capturedAt) => inner.saveCheckpoint(checkpoint, capturedAt),
+      appendLedgerTransaction: (transaction) => inner.appendLedgerTransaction(transaction),
+      writePnlSnapshot: (snapshot) => inner.writePnlSnapshot(snapshot),
+      replacePnlSnapshot: (snapshot) => inner.replacePnlSnapshot(snapshot),
+      close: () => inner.close(),
+      ...(grouped ? { groupCommit: group } : {}),
+    };
+    return { store, inner, held, release };
+  }
+
+  async function openUntilEntry(harness: Harness): Promise<void> {
+    await feed(harness, envelope(1, "ReferenceTradeObserved", { venue: "binance", symbol: "BTCUSDT", price: "64000", size: "0.5" }, "binance"));
+    await feed(harness, envelope(2, "MarketOpened", { internalMarketId: MARKET_ID, conditionId: CONDITION_ID, openedAt: T_OPEN }));
+    await feed(harness, envelope(3, "BookSnapshot", {
+      internalMarketId: MARKET_ID,
+      tokenId: NO_TOKEN,
+      bids: [{ price: "0.65", size: "5000" }],
+      asks: [{ price: "0.66", size: "5000" }],
+    }));
+  }
+
+  const orderings: readonly (readonly [string, (ctx: StrategyContext) => readonly Intent[]])[] = [
+    ["[placement, CANCEL]", (ctx) => [followOnBuy(ctx), MARKET_CANCEL]],
+    ["[CANCEL, placement]", (ctx) => [MARKET_CANCEL, followOnBuy(ctx)]],
+  ];
+  for (const grouped of [false, true]) {
+    for (const [label, intents] of orderings) {
+      it(`${grouped ? "group commit" : "per-row"}, ${label}, the store HOLDING the decision: the CANCEL is out, the placement waits; released, the placement follows`, async () => {
+        const held = heldStore(grouped);
+        const harness = assemble({ store: held.store, intents });
+        await openUntilEntry(harness);
+        if (!harness.loop.ingest(yesBook(4))) throw new Error("ingest refused");
+        const drained = harness.loop.drain();
+        await held.held;
+        // Let every turn that does not depend on the held write run.
+        for (let turn = 0; turn < 20; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+
+        expect(planKinds(harness)).toEqual(["CANCEL"]);
+        expect(harness.loop.health().execution.cancelsRequested).toBe(1);
+        expect(harness.venue.fills).toHaveLength(0);
+        expect(held.inner.transactions).toHaveLength(0);
+        expect(held.inner.decisions.some((entry) => entry.record.decision.intents.length > 0)).toBe(false);
+
+        held.release();
+        await drained;
+        expect(planKinds(harness)).toEqual(["CANCEL", "POSITION"]);
+        expect(harness.loop.health().halts).toEqual([]);
+        // The placement's decision was durable before its fill was booked.
+        expect(held.inner.decisions.some((entry) => entry.record.decision.intents.length === 2)).toBe(true);
+      });
+    }
+  }
 });

@@ -1,7 +1,14 @@
 /**
  * `DURABLE-1` (closeout blocker X1) — the durable variant: a REAL PostgreSQL
- * refuses the intent-bearing decision, and no `execution` or `accounting` row
- * exists without its decision row.
+ * refuses the intent-bearing decision, and no `accounting` row exists without
+ * its decision row, nothing is submitted and nothing is filled.
+ *
+ * `execution.*` (r1, LOW-2): the trader writes NO `execution.*` table at all —
+ * `PostgresTraderStore` writes `strategy.*` and `accounting.*` only — so an
+ * "empty execution tables" assertion under the refusal proves nothing. It is
+ * kept instead as a PREMISE in the control (the tables are empty even when the
+ * run books its fill): the day the trader starts writing them, the control
+ * fails here and the refused case must assert them.
  *
  * The failure is injected INSIDE the database, exactly at that decision: a
  * test-only `BEFORE INSERT` trigger on `strategy.decisions` raises for a row
@@ -181,6 +188,9 @@ describe.each([
       expect(counts.ledgerTransactions).toBeGreaterThan(0);
       expect(counts.ledgerEntries).toBeGreaterThan(0);
       expect(counts.pnlSnapshots).toBeGreaterThan(0);
+      // The premise (LOW-2): the trader writes no execution row even when it
+      // fills, so the refused case below cannot use these tables as evidence.
+      expect(counts.execution).toEqual(NO_EXECUTION_ROWS);
       // The entry's decision row was written by an EARLIER transaction than
       // every ledger row its fill caused.
       const { rows } = await context.pool.query<{ ok: boolean }>(
@@ -191,7 +201,7 @@ describe.each([
     });
   }, 180_000);
 
-  it("REFUSED: zero execution and accounting rows, no intent-bearing decision row, no submission, a GLOBAL STORE_UNAVAILABLE halt", async () => {
+  it("REFUSED: zero accounting rows, no intent-bearing decision row, no submission, no fill, a GLOBAL STORE_UNAVAILABLE halt", async () => {
     await withFreshDatabase(container.getConnectionUri(), "durable1-refused", async ({ connectionString, context }) => {
       await refuseIntentBearingDecisions(context);
       const { trader, fills } = await run("refused", connectionString, context);
@@ -213,7 +223,6 @@ describe.each([
       expect(counts.ledgerTransactions).toBe(0);
       expect(counts.ledgerEntries).toBe(0);
       expect(counts.pnlSnapshots).toBe(0);
-      expect(counts.execution).toEqual(NO_EXECUTION_ROWS);
     });
   }, 180_000);
 });

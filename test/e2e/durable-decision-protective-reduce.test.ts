@@ -203,6 +203,13 @@ describe.each([
     expect(run.trader.halts.records().map((halt) => [halt.scope.kind, halt.code])).toEqual([
       ["GLOBAL", "STORE_UNAVAILABLE"],
     ]);
+    // r1 (LOW-4): the refused protective exit is COUNTED — at the risk seam,
+    // under the halt the boundary latched — like any protective exit a halt
+    // refuses; the unrefused run refuses none.
+    const risk = run.trader.loop.health().risk;
+    expect(baseline.run.trader.loop.health().risk.refusedExits).toBe(0);
+    expect(risk.refusedExits).toBe(1);
+    expect(risk.refusedExitsByCode).toEqual({ RISK_RUN_STATE_BLOCKS: 1 });
   });
 
   it("a store that refuses the CANCEL's decision: the CANCEL still goes out, the halt follows, and nothing is placed after it", async () => {

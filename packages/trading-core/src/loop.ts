@@ -731,6 +731,14 @@ export class CoreLoop {
   /** `THROUGHPUT-1a`: a group commit failed; nothing is committed after it. */
   #groupCommitFailed = false;
   /**
+   * `DURABLE-1` r1 (LOW-5): a decision or checkpoint was NOT made durable
+   * although no group COMMIT failed — a staging failure, or a refused
+   * per-row write. {@link durabilityMark} then answers `false`. Unlike
+   * `#groupCommitFailed` it does not stop later commits: rows staged BEFORE
+   * the failure still become durable (a prefix), as on base.
+   */
+  #durabilityLost = false;
+  /**
    * `DURABLE-1`: the decision whose intents are being routed could not be
    * made durable at the boundary before its first placement. Every LATER
    * placement of the SAME decision is then refused at the boundary as well
@@ -1774,7 +1782,8 @@ export class CoreLoop {
         this.#options.health.countLoop("decisionsPersisted");
         this.#recordDecision(instance, outcome, eventId);
         this.#routingUndurableDecision = false;
-        for (const intent of outcome.record.decision.intents) {
+        // `DURABLE-1` r1 (A01): cancels before placements — see `cancelsFirst`.
+        for (const intent of cancelsFirst(outcome.record.decision.intents)) {
           await this.#routeIntent({
             instance,
             market,
@@ -1864,27 +1873,38 @@ export class CoreLoop {
       this.#options.health.countExecution("observeOnlyIntents");
       return;
     }
+    // `DURABLE-1`: the decision that emitted this placement could not be made
+    // durable (see below). Such a placement is REFUSED — never reserved,
+    // planned or submitted — whatever the risk seam answers.
+    let undurable = false;
     if (input.intent.type === "CANCEL") {
-      // `THROUGHPUT-1a`: every earlier decision is durable before an intent
-      // is routed toward the venue — as it was when each was written at its
-      // own event. A failed commit halts; a CANCEL is still routed (§6
-      // invariant 13: the risk seam never blocks one). A store without group
-      // commit has nothing staged, and this path is unchanged for it.
+      // `THROUGHPUT-1a` (unchanged from base): with group commit, every
+      // decision ALREADY STAGED — earlier events' — is durable before an
+      // intent is routed toward the venue, as it was when each was written at
+      // its own event. So this awaits the commit chain, including a commit
+      // already in flight: a store that hangs on an EARLIER batch holds a
+      // CANCEL here exactly as it did on base. A failed commit halts; a CANCEL
+      // is still routed (§6 invariant 13: the risk seam never blocks one). A
+      // store without group commit has nothing staged, and does not wait.
       //
-      // `DURABLE-1`: a CANCEL does NOT wait for its OWN decision to be
-      // written. It places nothing — no allocation, no reservation, no fill,
-      // no ledger posting — so no economic effect can precede its decision's
-      // record, and a safety exit must not queue behind one more store round
-      // trip (or a store that hangs). Its decision is written by the flush
-      // that follows the callback, as always, and a failure there halts.
+      // `DURABLE-1`: a CANCEL does NOT add a wait for its OWN decision's
+      // record. It places nothing — no allocation, no reservation, no fill,
+      // no ledger posting — so no economic effect can precede that record,
+      // and a safety exit gains no new store round trip. Its decision is
+      // written by the flush that follows the callback, as always, and a
+      // failure there halts. (A deviation from the literal §8.1 order for a
+      // CANCEL only; see the DURABLE-1 handoff.)
       if (this.#options.store.groupCommit !== undefined) await this.#commitStaged();
     } else if (!(await this.#persistDecisionsBeforePlacement())) {
-      // `DURABLE-1` (handoff §8.1, §6 invariants 3-4, WP-230 #4): the decision
-      // that emitted this placement could not be made durable. The GLOBAL
-      // `STORE_UNAVAILABLE` halt is latched; the intent is refused HERE,
-      // before an id is minted or the allocator is asked — no allocation, no
-      // reservation, no submission, and so no fill and no ledger posting.
-      return;
+      // `DURABLE-1` (handoff §8.1, §6 invariants 3-4, WP-230 #4): the GLOBAL
+      // `STORE_UNAVAILABLE` halt is latched. The intent goes on only as far
+      // as the risk seam, which refuses it under that halt (§9.8 check 1,
+      // `RISK_RUN_STATE_BLOCKS`) and COUNTS the refusal — a protective exit's
+      // too, in `risk.refusedExits` (r1, finding LOW-4) — exactly as it counts
+      // every placement refused under a halt. Nothing the allocator is asked
+      // commits anything (`evaluate` "changes nothing"); the return after the
+      // seam does not depend on its verdict.
+      undurable = true;
     }
     const approvedIntentId = this.#options.ids.next();
     const marketConfig = input.market.config;
@@ -1959,6 +1979,9 @@ export class CoreLoop {
       );
       return;
     }
+    // `DURABLE-1`: the belt. The halt the boundary latched makes the seam
+    // refuse above; were it ever to approve, the placement is still refused.
+    if (undurable) return;
     this.#options.health.countRiskApproval();
     // §9.8 check 18's duplicate guard remembers the ids it can. A `CANCEL` has
     // NO `intentId` — §7.7 gives it none — so `intentIdOf` answers `""` for one,
@@ -3483,6 +3506,7 @@ export class CoreLoop {
     for (const entry of drained.decisions) {
       const written = await this.#options.store.persistDecision(entry.record, entry.telemetry);
       if (!written.ok) {
+        this.#durabilityLost = true;
         this.#options.halts.halt(
           { kind: "GLOBAL" },
           "STORE_UNAVAILABLE",
@@ -3497,6 +3521,7 @@ export class CoreLoop {
     for (const checkpoint of drained.checkpoints) {
       const written = await this.#options.store.saveCheckpoint(checkpoint, this.#lastInstant);
       if (!written.ok) {
+        this.#durabilityLost = true;
         this.#options.halts.halt(
           { kind: "GLOBAL" },
           "STORE_UNAVAILABLE",
@@ -3532,7 +3557,9 @@ export class CoreLoop {
    *
    * Answers `false` — with a GLOBAL `STORE_UNAVAILABLE` halt latched, the same
    * halt a failed flush latches — when the decisions are not durable. The
-   * caller then makes no venue and no ledger effect. On a per-row write or a
+   * caller then refuses the placement (at the risk seam, under that halt,
+   * counted; and regardless of its verdict) and makes no venue and no ledger
+   * effect. On a per-row write or a
    * staging failure the rest of the outbox is dropped, as a failed flush
    * drops what it drained: nothing is written after the failure the halt
    * reports (a failed group COMMIT already guarantees that,
@@ -3543,6 +3570,17 @@ export class CoreLoop {
    * `false` for a decision, it answers `false` for that decision's every later
    * placement without asking the store again (`#routingUndurableDecision`),
    * so the refusal never depends on the risk seam reading the halt.
+   *
+   * GROUP COMMIT SPLITS A DECISION FROM ITS EVENT'S CHECKPOINT (r1, LOW-3).
+   * The decisions are staged here WITHOUT the checkpoints the outbox still
+   * holds, so the decision rows commit in the transaction this boundary
+   * awaits and the event's checkpoints in a LATER one (the flush stages them;
+   * a crash between the two leaves a durable decision whose checkpoint is not).
+   * Base staged an event's decisions and checkpoints as one staging. Keeping
+   * them together would mean draining the checkpoints here, with an instant
+   * that inside a venue frame is not the one they always had. Per-row stores
+   * never wrote the two atomically. No production path restores from a
+   * checkpoint (`restoreFrom` has no caller outside tests).
    */
   async #persistDecisionsBeforePlacement(): Promise<boolean> {
     if (this.#routingUndurableDecision) return false;
@@ -3558,6 +3596,7 @@ export class CoreLoop {
       if (decisions.length > 0) {
         const staged = group.stage({ decisions, checkpoints: [] });
         if (!staged.ok) {
+          this.#durabilityLost = true;
           this.#options.outbox.drain();
           this.#options.halts.halt(
             { kind: "GLOBAL" },
@@ -3577,6 +3616,7 @@ export class CoreLoop {
     for (const entry of decisions) {
       const written = await this.#options.store.persistDecision(entry.record, entry.telemetry);
       if (!written.ok) {
+        this.#durabilityLost = true;
         this.#options.outbox.drain();
         this.#options.halts.halt(
           { kind: "GLOBAL" },
@@ -3607,6 +3647,7 @@ export class CoreLoop {
       checkpoints: drained.checkpoints.map((checkpoint) => ({ checkpoint, capturedAt: this.#lastInstant })),
     });
     if (!staged.ok) {
+      this.#durabilityLost = true;
       this.#options.halts.halt(
         { kind: "GLOBAL" },
         "STORE_UNAVAILABLE",
@@ -3649,16 +3690,24 @@ export class CoreLoop {
    * `THROUGHPUT-1a` — every decision staged so far is durable once this
    * resolves `true`; `false` means a commit failed (and its GLOBAL
    * `STORE_UNAVAILABLE` halt is latched). A loop whose store does not
-   * group-commit wrote every row at its event, and answers `true` at once.
+   * group-commit wrote every row at its event, and answers at once.
+   *
+   * `DURABLE-1` r1 (LOW-5): it also answers `false` once any decision or
+   * checkpoint could not be staged, or (per-row) written — the rows the halt
+   * reports never became durable, so "every decision is durable" is false.
+   * Base answered `true` after a staging failure. The pump refuses to record
+   * a position under any halt in either case (`settle`: `!durable ||
+   * halts.anyHalt`), so its behaviour does not change; the mark is now true
+   * to its word.
    *
    * The pump records the stream position of a batch only after this mark,
    * taken at the batch's end, resolved `true` (`apps/trader/src/pump.ts`).
    */
   durabilityMark(): Promise<boolean> {
     const group = this.#options.store.groupCommit;
-    if (group === undefined) return Promise.resolve(!this.#groupCommitFailed);
+    if (group === undefined) return Promise.resolve(!this.#groupCommitFailed && !this.#durabilityLost);
     if (group.stagedEvents > 0) this.#requestCommit(group);
-    return this.#commitChain.then(() => !this.#groupCommitFailed);
+    return this.#commitChain.then(() => !this.#groupCommitFailed && !this.#durabilityLost);
   }
 
   /** `THROUGHPUT-1a`: does this loop's store group-commit (see {@link durabilityMark})? */
@@ -4032,6 +4081,36 @@ const SHARED_BOOK_ACCOUNTING_MODE = "LIVE" as const;
 
 function intentIdOf(intent: Intent): string {
   return "intentId" in intent && typeof intent.intentId === "string" ? intent.intentId : "";
+}
+
+/**
+ * `DURABLE-1` r1 (finding A01): the order a DECIDED outcome's intents are
+ * ROUTED in — every `CANCEL` first, then every placement, each group in the
+ * order the strategy emitted it (a stable partition).
+ *
+ * A placement waits at the durability boundary for its decision's record
+ * (`#persistDecisionsBeforePlacement`); a `CANCEL` does not. Routed in the
+ * emitted order, a `CANCEL` listed AFTER a placement would queue behind that
+ * wait — behind a store that is slow or hangs — although base routed it at
+ * once. Routing the decision's cancels first means no cancel the strategy has
+ * already emitted ever waits on its own decision's record.
+ *
+ * A list that is only cancels, only placements, or cancels-then-placements
+ * (every list the shipped Static Bracket builds) routes exactly as before; the
+ * array is returned as is. Only a list with a placement BEFORE a cancel is
+ * reordered, and for it cancel-then-place is also the safer order: a cancel
+ * that leaves a basket short halts at its answer, before the placement is
+ * risk-checked (`SIM1-R3-1`), and a scoped cancel (by market, or everything)
+ * no longer reaches the order the same decision has just placed.
+ */
+function cancelsFirst(intents: readonly Intent[]): readonly Intent[] {
+  const firstPlacement = intents.findIndex((intent) => intent.type !== "CANCEL");
+  if (firstPlacement === -1) return intents;
+  if (!intents.slice(firstPlacement).some((intent) => intent.type === "CANCEL")) return intents;
+  return [
+    ...intents.filter((intent) => intent.type === "CANCEL"),
+    ...intents.filter((intent) => intent.type !== "CANCEL"),
+  ];
 }
 
 /** The planned order a reservation belongs to, by shared reservation id. */
