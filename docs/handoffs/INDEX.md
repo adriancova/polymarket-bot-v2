@@ -98,3 +98,6 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-29 | [THROUGHPUT-1b.md](THROUGHPUT-1b.md) | `THROUGHPUT-1b`: the gateway publishes a window-open burst without overflowing; the example config subscribes to books | Round | Complete (2026-09-30) | `c179095` | 17 KB |
 | 2026-09-30 | [THROUGHPUT-2.md](THROUGHPUT-2.md) | `THROUGHPUT-2`: evaluate once per venue frame: no half-applied book states; reach the H1 burst rate | Round | Complete (2026-09-30) | `7d59fd3` | 30 KB |
 | 2026-09-30 | [VENUE-3.md](VENUE-3.md) | `VENUE-3`: the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Round | Complete (2026-09-30) | `6a15131` | 15 KB |
+| 2026-09-30 | [H1-RUNS-2-8.md](H1-RUNS-2-8.md) | `H1` runs 2-8: live-data PAPER runs after THROUGHPUT-1a/1b/2 | Operational | H1 discharged under H5 (decisions and vetoes; no fill) | — | 5 KB |
+| 2026-09-30 | [LOGS-1.md](LOGS-1.md) | `LOGS-1`: `IMPLEMENTATION_STATUS.md` becomes a brief; history archived verbatim | Round | Complete (2026-09-30) | `7ac7985` | 13 KB |
+| 2026-09-30 | [CLOSEOUT-2-wave-2-closeout.md](CLOSEOUT-2-wave-2-closeout.md) | `CLOSEOUT-2`: fresh Wave 2 closeout audit (runbook §10) | Audit | WAVE 2 NOT CLOSED: blocker `X1` | — (an audit) | 20 KB |

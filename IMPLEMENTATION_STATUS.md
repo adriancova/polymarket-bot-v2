@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-09-30 (content as of `8fde4df`; restructured by LOGS-1)  
+Last updated: 2026-09-30 (after `CLOSEOUT-2`; restructured by LOGS-1 at `8fde4df`)  
 Specification version: 2.0.0  
 Maximum permitted run mode: `PAPER`
 
@@ -22,15 +22,15 @@ This file is the brief: current state only, one entry per item. The full history
 
 - **Wave 2 packages:** all merged (batches 2A-2G; each merge is an ancestor of `main`).
 - **The inherited-`toJSON` sweep is complete:** `SER-0` (`9a44167`, the measurement) and its rounds `SER-1`, `SER-2` and `SER-3`.
-- **Wave 2 is NOT closed out.** The runbook §10 closeout audit `GOV-2B` ran on 2026-09-15 (`main` at `b9bacc1`). Its verdict: every package met its own criteria, but three composition seams failed.
+- **Wave 2 is NOT closed out.** The fresh closeout `CLOSEOUT-2` (2026-09-30, `main` at `8fde4df`) found one blocker, `X1`. `DURABLE-1` is fixing it. Record: [`CLOSEOUT-2-wave-2-closeout.md`](docs/handoffs/CLOSEOUT-2-wave-2-closeout.md).
 - **Closeout blockers:** every agent-closable blocker is closed; all but B3 were closed by 2026-09-17. B3 closed last, on 2026-09-28 (`BACKTEST-2`, `fd12be0`): the backtest executable now builds the same core as the trader. What remains is human work or a ruling ([Human items](#human-items)).
 - **The 1a/1b/1c track is complete.**
   - `BRACKET-1a` (`11969f3`): an instance ends CLOSED after its own exit.
   - `BRACKET-1b` (`7252150`): a recorded two-bracket run with a FILLED take-profit, reconciled per bracket.
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
-- **§7 exit checklist:** item 1 stays OPEN until a fresh closeout grades it. Items 4 and 5 stay NOT MET on their human halves: H1, the live-data paper run, and H3, the dashboards' infrastructure.
-- **Next:** H1 run 2, then the fresh read-only closeout audit (after H1 and H3). `THROUGHPUT-2` is Complete (`7d59fd3`), but it missed its throughput targets.
+- **§7 exit checklist (`CLOSEOUT-2`):** item 1 NOT MET (blocker `X1`). Items 2-5 MET WITH QUALIFICATION. Items 6 and 7 MET.
+- **Next:** `DURABLE-1`, then a focused re-grade of item 1. If Wave 2 then closes, `WP-260` starts.
 - **Deferred:** `WP-260` and the eight remaining phase-3 packages wait for Wave 3 ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
 
@@ -39,17 +39,16 @@ This file is the brief: current state only, one entry per item. The full history
 Only rows marked **Ready (authorized)** may be started. Each row's allowed and forbidden paths are in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md) (search for the id).
 
 - `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
-- **`LOGS-1`**: Ready (authorized) by the user, 2026-09-30; now in merge.
-  - Goal: make this file a brief. Historical records are evidence, so they move verbatim to `docs/status-archive/` and are never rewritten. It adds `docs/handoffs/INDEX.md`, a writing standard (`docs/handoffs/README.md`) and a committed preservation proof (`tools/records/`).
-  - Base `f43efe6`. At merge, the orchestrator re-applies every governance edit made on `main` since `f43efe6`, using `MOVE-MAP.md`: this re-cut is at `8fde4df`.
-  - Gate: a Fable review of the preservation, and a green CI run on GitHub.
+- **`DURABLE-1`**: Ready (authorized) 2026-09-30 by the orchestrator, under the user's conditional Wave 3 authorization ("only the agent-closable blockers it names are worked").
+  - Goal: close `CLOSEOUT-2` blocker `X1`. A decision must be durable before any venue submission or ledger write it causes.
+  - Base `8fde4df`. Loop `wf_81215710-b47`. Verifiers: Opus and Codex gpt-6-astra, reconciled.
 - **`THROUGHPUT-1c`** (queued, not startable now): authorized by the user on 2026-09-29. On 2026-09-30 the user moved it off the critical path: it runs after the Wave 2 closeout, alongside the start of Wave 3.
   - The finding: in H1 run 1, 20,367 of 37,546 decisions (54%) paused on `SB.STALE_BOOK`. Book age is `now − book.asOf`, the last change, so a quiet but live book reads stale after 2 s. The risk policy's `venueBookMaxAgeMs` has the same shape.
   - Scope (1): ADR-023, Proposed: a liveness-based freshness rule grounded ONLY in the venue's documented market-channel behaviour (`docs/venue/verified-*.md` and current official docs; never invented). The user ratifies it before merge.
   - Scope (2): end to end: a gateway liveness signal if one is needed, then features, strategy and risk freshness, with the strategy's parameter and version discipline.
   - Evidence (3): a quiet but live book is fresh; a silent or disconnected feed is stale within its bound; every golden change is listed and explained.
   - HARDENING LOOP; verifier: a Fable adversarial-reviewer. Gate: automated checks, the Fable adversarial review, the user's ADR-023 ratification, and a green CI run on GitHub.
-- Wave 3 is authorized on two conditions. `VENUE-3` has met one. The other is open: the fresh Wave 2 closeout audit must grade Wave 2 CLOSED ([Wave 3 authorization](#wave-3-authorization-conditional)).
+- Wave 3 is authorized on two conditions. `VENUE-3` has met one. The other is open: `CLOSEOUT-2` graded Wave 2 NOT CLOSED ([Wave 3 authorization](#wave-3-authorization-conditional)).
 
 ## Work packages
 
@@ -148,7 +147,9 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `DEPS-1` | CI health: new high advisories in dev/test-only transitive dependencies | Complete (2026-09-30) | `f6a2714` | the archived row |
 | `THROUGHPUT-2` | evaluate once per venue frame: no half-applied book states; reach the H1 burst rate | Complete (2026-09-30) | `7d59fd3` | [THROUGHPUT-2](docs/handoffs/THROUGHPUT-2.md) |
 | `VENUE-3` | the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Complete (2026-09-30) | `6a15131` | [VENUE-3](docs/handoffs/VENUE-3.md) |
-| `LOGS-1` | records: make `IMPLEMENTATION_STATUS.md` a brief, with the full history archived verbatim | **Ready (authorized)** 2026-09-30; in merge | — | — |
+| `LOGS-1` | records: make `IMPLEMENTATION_STATUS.md` a brief, with the full history archived verbatim | Complete (2026-09-30) | `7ac7985` | [LOGS-1](docs/handoffs/LOGS-1.md) |
+| `CLOSEOUT-2` | fresh Wave 2 closeout audit (runbook §10) | Complete (2026-09-30): WAVE 2 NOT CLOSED, blocker `X1` | — (an audit; no merge) | [CLOSEOUT-2](docs/handoffs/CLOSEOUT-2-wave-2-closeout.md) |
+| `DURABLE-1` | `X1`: a decision is durable before its venue and ledger effects | **Ready (authorized)** 2026-09-30 | — | — |
 | `WP-260` | Secure unified-SDK adapter and signer boundary | Dependency-ready; deferred to Wave 3 by wave ordering and signer-boundary safety | — | — |
 | All other packages | — | Blocked | — | See work plan |
 
@@ -177,6 +178,14 @@ Open rows only, one line each. An owner beginning "row:" is quoted from the arch
 
 | Id | Residual | Owner |
 | --- | --- | --- |
+| `X1` (BLOCKER) | `CLOSEOUT-2`: the current decision is not durable before its venue submission and ledger writes. A store failure can leave a fill and ledger rows with no persisted decision. | `DURABLE-1` |
+| `CO2-N1` | Live admission (risk freshness, book age, seconds-to-close) runs on event time (`envelope.receivedAt`), so a stale backlog can approve entries after close. Masked today by the settlement veto. | an ADR and a trading-core round, before any settlement veto is lifted and before `WP-270` |
+| `CO2-N3` | The per-code risk-veto panel cannot show a code's first veto: its series is born at 1, and `increase()` reads 0. The refused-exit and recommendation families have the same problem. | a control-api / dashboard round |
+| `CO2-N4` | Live and replay are not decision-equivalent on real data: frame grouping is live-only, and the backtest CLI refuses raw normalizers (TP2-R1-L4, TP2-R2-L2). | a backtest-cli round |
+| `CO2-N6` | After the gateway's terminal publication overflow (H1 run 4), the trader reported healthy for 13+ minutes. The overflow's cause is not diagnosed. | a gateway/trader health round |
+| `CO2-N7` | Throughput margin is thin: peak backlog 93,084 of 100,000 retention (H1 run 8). | a throughput round |
+| `CO2-N8` | `WP-240` M-3 (audit-log exhaustion can disable the kill switch) and M-1 are still open. A Wave 3 precondition. | before `WP-320` |
+| `CO2-N11` | `TRDR3-R1`: the backtest and e2e roots do not attach the realized-PnL health book. `TRDR-3-FU1` was never authorized. | a trading-core round |
 | `OUT1-R1-HALT-NOT-DURABLE` | A halt, including `OUTAGE-1`'s `TRANSPORT_UNAVAILABLE`, is not persisted to PostgreSQL: `TraderStore` has no halt write, and nothing writes `ops.incidents` or `ops.risk_events`. The durable record of an outage is only its consequence (no writes after the halt instant), plus the process log and the exit code. `OUT2-R1-HALT-RECORD-INTERACTION`: the outage tests require that no row commits after the pre-fault snapshot, so the round that adds the halt record must update the three outage scenarios to expect exactly that one halt row, and nothing else. | a trader/storage round that adds a durable halt record (`ops.incidents`), before sustained live-data paper runs |
 | `H1R1-PROVENANCE` | On all 37,546 H1 decisions, `strategy.decisions.gateway_epoch`, `ingest_seq` and `feature_snapshot_id` are NULL (`source_event_id` is set). A decision cannot be traced to its gateway epoch, its ingest sequence or an indexed feature snapshot except by joining through the event id. | a trader/storage round (with `OUT1-R1-HALT-NOT-DURABLE`) |
 | `H1R1-HALT-INVISIBLE` | A halt that exits the process quickly never reaches Prometheus. In H1 the trader exited 75 between two 15 s scrapes, so the dashboards read `halts 0, healthy 1` until "health unavailable". Same root as `OUT1-R1-HALT-NOT-DURABLE`: there is no durable halt record for the control API to read. | with `OUT1-R1-HALT-NOT-DURABLE` |
@@ -320,9 +329,9 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 
 ## Human items
 
-- **H1**, the live-data paper run. Run 1 (2026-09-29, [`H1-RUN-1.md`](docs/handoffs/H1-RUN-1.md)) was registered with `REGISTER-1`, and its `gammaMarketId` was verified against both venue APIs. It ran 34 min on live data: 37,546 decisions and checkpoints, read back clean. It then halted fail-closed (`TRANSPORT_RESYNC_REQUIRED`) at the window open: the trader could not keep pace (about 35 decisions/s against about 735 events/s). No entry was evaluated. Re-run after `THROUGHPUT-2`.
+- **H1**, the live-data paper run: discharged under H5 (`CLOSEOUT-2`). Runs 3 and 5-8 (2026-09-30) each held a full 15-minute window with no trader halt. Runs 7 and 8 each made one live entry, vetoed `RISK_SETTLEMENT_UNVERIFIED`. No fill is possible until a settlement spec is reviewed (`CLOSEOUT-2` N2). Records: [`H1-RUN-1.md`](docs/handoffs/H1-RUN-1.md), [`H1-RUNS-2-8.md`](docs/handoffs/H1-RUNS-2-8.md).
 - **H2**, a real CI run: discharged 2026-09-26 by `CI-1` (PR #1 run `36282501033`, every gate green).
-- **H3**, a real Prometheus and Grafana: performed 2026-09-29 with H1 run 1. The fresh closeout grades it.
+- **H3**, a real Prometheus and Grafana: closed with qualification by `CLOSEOUT-2`. No real Grafana has rendered a non-empty Fills or PnL panel.
 - **H4**, elapsed soak evidence: open. It is the `WP-140` gate, which closes only through the runbook §7 governance procedure after a real ≥24h soak.
 - **H5**: ruled 2026-09-28: one demonstrated run. The runbook §7 "Wave 2 closeout" check "Static Bracket runs in replay and live-data paper mode through the same code" (`:509` at `f43efe6`) is discharged by one supervised live-data paper session. That session runs through the real stack (gateway → Redis → trader → PostgreSQL), produces decisions and reads back clean. Sustained accumulation is the post-closeout activity the same section describes next (`:514` at `f43efe6`).
 - **H6**, the authorization rows and round order: the orchestrator's, ongoing.
@@ -330,7 +339,8 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 - **H7**: ratified 2026-09-28 (`H7` above).
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
-- **The fresh read-only Wave 2 closeout audit** runs after H1 and H3 (user, 2026-09-28). It follows the runbook §10 wave closeout procedure (the old row cited §14, `:906` at `f43efe6`).
+- **The fresh read-only Wave 2 closeout audit:** `CLOSEOUT-2` ran 2026-09-30. Verdict: WAVE 2 NOT CLOSED, one agent-closable blocker (`X1`).
+- **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): no owner. Until a spec is reviewed, the truthful config refuses every live entry. The user decides whether to commission one.
 
 ### Wave 3 authorization (conditional)
 
