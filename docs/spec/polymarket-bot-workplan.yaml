@@ -1379,6 +1379,7 @@ work_packages:
       - A window a trader is responsible for (configured or admitted) is classified only once that trader's rows for it are durable; a window only the gateway records is classified at its close (ADR-028 Decision 2.3).
       - The extractor runs validateSegment on each sealed segment before it reads it, and computes both digests from the verified bytes; a segment that fails is not extracted and never expires (ADR-028 Decision 2.6).
       - Every research-tier sample carries its release frame's gatewayEpoch, ingestSeq and receipt instant (ADR-029 Decision 5).
+      - A span sample (a 1 s bar, a periodic or full book) holds only frames dispatched before its release frame; a frame dispatched at or after the release frame belongs to a later span, whatever its instant. A test pins that F1 (ingestSeq 1, 10,000 ms) releases the [9,000, 10,000) bar and F2 (ingestSeq 2, 9,999 ms) lands in the [10,000, 11,000) bar (ADR-029 Decision 5.1).
       - The research-tier manifest and every overlapping pin manifest list each source segment's segmentSha256 and segmentFileSha256; just before deletion the file must hash to both pinned digests (segmentFileSha256 over its full length), or it is kept (ADR-028 Decision 2.6-2.7, ADR-017 §1).
       - A pinned or unclassified segment is never deleted.
       - A fill pin is never evicted or reduced; a budget overrun only alarms.
@@ -1455,6 +1456,8 @@ work_packages:
       - The cadence runs on the event-time high-water mark; a backward step in event time neither stops an evaluation nor adds one.
       - A live-data PAPER run, and every replay that is not a reproduction, uses exactly 1,000 ms and 5,000 ms and refuses any other value; the per-frame value 0 is accepted only by a replay that reproduces a golden or a run recorded under ADR-024 (ADR-026 D1.5-D1.6).
       - Only applied events move the cadence clock; a refused event never does. A carried-over or heartbeat evaluation takes the frame's last applied event as its source; a frame with no applied event evaluates nothing (ADR-026 D2.1, D3.2-D3.3).
+      - At one close, the markets the frame owed are evaluated first in ADR-024 D3's order, then carried-over and heartbeat evaluations in the configured order of §8.2; a test pins a close with both kinds (ADR-026 D2.12).
+      - A frame of one event delivers every callback other than onFeatures in place, as before; its onFeatures evaluation follows the cadence like any other frame's, and a test pins it (ADR-026, the ADR-024 D3 one-event row).
       - A test pins a forward jump in event time; the hold ends when the clock has moved on by the interval, and the forward-jump alarm fires and is carried by the health door (ADR-026 D2.10).
       - The control-api health door admits a trader health report that carries evaluationsCoalesced, and a test pins it.
       - The run record that pins both settings is named and pinned by a test; if it needs a schema change, the round stops and asks for a db/migrations grant.
@@ -1599,6 +1602,7 @@ work_packages:
     acceptance:
       - Samples are consumed in the recorded dispatch order of their release frames (ingestSeq within one gateway epoch), with the downsampling version's fixed tie order; never sorted by instant (ADR-029 Decision 5).
       - A test pins that a sample released at ingestSeq 1 with instant 10,000 ms replays before one released at ingestSeq 2 with instant 9,999 ms.
+      - A test pins that no replayed span sample holds a frame dispatched at or after its release frame; F2 (ingestSeq 2, 9,999 ms), dispatched after F1 (ingestSeq 1, 10,000 ms) released the [9,000, 10,000) bar, is not in that bar (ADR-029 Decision 5.1).
       - A replay covers one gateway epoch; a cross-epoch replay stops and asks (wal-format.md §12.1).
       - Every output is labelled approximate, from the manifest.
       - Evidence tools refuse an approximate input.

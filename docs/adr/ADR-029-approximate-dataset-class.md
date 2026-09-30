@@ -106,6 +106,19 @@ later arrival first.
      order, whose receipt instant is at or after the boundary. Only then does
      a live process know the span is over. A bar is never released at its
      open. A sample with no such frame in its epoch is not replayed.
+   - **Span membership follows dispatch order.** A span stays open until its
+     release frame. Every frame dispatched while a span is open belongs to
+     it, whatever its receipt instant. The release frame and every later
+     frame belong to a later span, even if their instant lies before the
+     boundary. So every frame that contributes to a sample comes before the
+     sample's release frame. The instant decides only when a span closes.
+   - One frame can reach several boundaries at once, after a gap in the data.
+     It then releases every span it closes, in boundary order, and belongs to
+     the span that is open after them.
+   - Example: F1 (`ingestSeq` 1, 10,000 ms) releases the [9,000, 10,000)
+     bar. F2 (`ingestSeq` 2, 9,999 ms) arrives later. It belongs to the
+     [10,000, 11,000) bar, not to the bar F1 already released. So the bar
+     released at F1 holds nothing that arrived after F1.
 2. **What a sample carries.** Its release frame's `gatewayEpoch` and
    `ingestSeq`, and that frame's receipt instant as its available instant.
    The available instant is event time for the replay, as `receivedAt` is
@@ -135,7 +148,7 @@ later arrival first.
 
 | Text | As written | How it now reads |
 | --- | --- | --- |
-| Handoff §8.4 | "Replay consumes the same normalized event envelopes in the exact recorded dispatch order." | Unchanged for exact datasets. Approximate replay consumes research-tier samples in the recorded dispatch order of their release frames, within one gateway epoch, with a fixed tie order. It never sorts by instant (Decision 5) |
+| Handoff §8.4 | "Replay consumes the same normalized event envelopes in the exact recorded dispatch order." | Unchanged for exact datasets. Approximate replay consumes research-tier samples in the recorded dispatch order of their release frames, within one gateway epoch, with a fixed tie order. A span sample holds only frames dispatched before its release frame. It never sorts by instant (Decision 5) |
 | Handoff §12.4 | "A fixed dataset, code commit, config, feature version, model version, simulator version, and seed must produce byte-identical …" | Unchanged. Only an `exact` dataset can be determinism evidence (Decision 2) |
 | Handoff §12.5 | "Every replay run pins: raw segment IDs and checksums …" | An exact replay pins these. An approximate replay pins research-tier objects and checksums and the downsampling version instead, plus every other §12.5 item. Its manifest still lists the source segments' checksums (Decision 1.5) |
 | ADR-017 (manifest format) | `polymarket-bot/dataset-manifest/v1`, `DATASET_MANIFEST_VERSION = 1`, no `fidelity` field | Version 2 adds the required `fidelity` field. Version 1 reads as `exact` (Decision 1) |

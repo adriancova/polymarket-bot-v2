@@ -56,7 +56,8 @@ The proposal the user accepted (`LEAN-1` §6, row A1):
    live data or in replay. A change to either starts a new run (§9.6).
 4. The run record is the run's `strategy.runs` row (§10.3), or the immutable
    configuration version that row names (`config_id`). Today neither
-   has a field for these settings (`packages/storage-postgres/src/schema/strategy.ts`).
+   has a field for these settings
+   (`packages/storage-postgres/src/schema/strategy.ts`).
    `CADENCE-1` names the field it uses and pins it with a test. If that needs
    a schema change, `CADENCE-1` stops and asks for a `db/migrations/**` grant.
 5. **Every new run uses the defaults.** A PAPER run on live data, and every
@@ -122,9 +123,11 @@ as the loop already uses it.
       step add evaluations, which rule 8 forbids.
 11. The usual gates still apply. A halted or closed market is not evaluated, as
     today.
-12. Markets are evaluated in the order ADR-024 D3 gives. Where that order says
-    nothing (a market not touched by the frame), the stable configured order of
-    §8.2 decides.
+12. **The order at one close.** First come the markets this frame owed an
+    evaluation (D3.1), in the order ADR-024 D3 gives. Then come all the
+    others, carried-over and heartbeat evaluations alike (D3.2), in the stable
+    configured order of §8.2. A market is evaluated at most once per close.
+    So the order is fixed, and decisions stay byte-identical (D6).
 
 ### D3. The decision's source event
 
@@ -208,9 +211,10 @@ A market that D2 does not evaluate at a close is **coalesced** at that close.
 
 | Text | As written | How it now reads |
 | --- | --- | --- |
-| ADR-024 D3 | "What moves to the frame's CLOSE (`CoreLoop.#closeFrame`) is: the `onFeatures` evaluation of each market the frame touched, ONCE per market;" (list flattened) | At the frame's close, each market is evaluated only if D2 allows it: owed and at least `evaluationIntervalMs` of the cadence clock since its last evaluation, or `evaluationHeartbeatMs` since it. A market still owed is evaluated at a later close. Every other part of D3 is unchanged, except the two sentences in the next rows |
+| ADR-024 D3 | "What moves to the frame's CLOSE (`CoreLoop.#closeFrame`) is: the `onFeatures` evaluation of each market the frame touched, ONCE per market;" (list flattened) | At the frame's close, each market is evaluated only if D2 allows it: owed and at least `evaluationIntervalMs` of the cadence clock since its last evaluation, or `evaluationHeartbeatMs` since it. A market still owed is evaluated at a later close. Every other part of D3 is unchanged, except the three sentences in the next rows |
 | ADR-024 D3 | "a frame's decisions are a SUBSEQUENCE of the per-event cadence's decisions, in the same order, with the same source events and instants." | Still true for an evaluation at a close that owed the market. A carried-over or heartbeat evaluation takes the frame's last applied event as its source (D3) |
 | ADR-024 D3 | "An event that owed no market an evaluation — one for a market this trader does not run, or one whose application triggered no callback — never becomes a decision's source" | True for an evaluation at a close that owed the market. A carried-over or heartbeat evaluation takes the frame's last applied event as its source, even if that event owed no market. A frame with no applied event evaluates nothing (D3.2-D3.5) |
+| ADR-024 D3 | "A frame of one event takes exactly the path every event took before" | True for every callback other than `onFeatures`. A frame of one event still delivers every such callback in place, as before. Its `onFeatures` evaluation is subject to D2, like any other frame's: it runs only if D2 allows it at that close |
 | ADR-024, Consequences | "The decision cadence changes. … decisions fall from 89,621 to 46,666: one per closed frame that reaches a configured market or a reference price." | The decision cadence changes again. At the default settings it is at most one `onFeatures` decision per market per second of event time, plus heartbeats. `CADENCE-1` measures the new count on the H1 burst |
 | Handoff §8.1 | "→ update feature snapshots → invoke subscribed strategies in stable configured order" | Every event updates state. `onFeatures` is invoked at most once per market per `evaluationIntervalMs` of event time, plus heartbeats (D2). Every other callback is invoked as before |
 

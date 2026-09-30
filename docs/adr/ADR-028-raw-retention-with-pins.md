@@ -7,8 +7,9 @@
 - **Implemented by:** `STORAGE-1`. Not yet implemented.
 - **Supersedes / Superseded by:** none. It **amends** handoff §2 ("Raw
   archive"), §8.4, §9.1, §12.4 and §12.5, ADR-004 §5, ADR-017 §4 and one
-  clause of ADR-017 §1, and the `WP-130` acceptance. It must be **re-ruled** before Phase 4 and before any
-  ADR-012 calibration dataset is built (Decision 8).
+  clause of ADR-017 §1, and the `WP-130` acceptance. It must be
+  **re-ruled** before Phase 4 and before any ADR-012 calibration dataset is
+  built (Decision 8).
 - **Handoff sections:** §2, §4.2, §6 (invariants 4 and 15), §8.4, §9.1,
   §12.4, §12.5, §17. **ADRs:** ADR-004, ADR-012, ADR-017, ADR-025, ADR-029.
 
