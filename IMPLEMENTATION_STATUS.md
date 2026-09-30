@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist:** items 1-5 MET WITH QUALIFICATION, items 6 and 7 MET (`CLOSEOUT-2` and `CLOSEOUT-2B`). The qualifications are the `CO2-*` residuals.
-- **Next:** `WP-260` and `THROUGHPUT-1c` (running). Then the `LEAN-1` track: `LEAN-GOV` (the ADRs), `STORAGE-1`, `HOST-BENCH`, then the launch rounds ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
+- **Next:** `WP-260` is Complete. `THROUGHPUT-1c` is running. Wave 3 continues with `WP-270` and `WP-300`; `CO2-N1` must be fixed before `WP-270`. Then the `LEAN-1` track: `LEAN-GOV` (the ADRs), `STORAGE-1`, `HOST-BENCH`, then the launch rounds ([`LEAN-1`](docs/handoffs/LEAN-1.md)).
 - **Budget (user, 2026-09-30):** under $100/mo for at least the first 3 months. The first deployment is a dedicated laptop, PAPER only.
 - **Wave 3:** `WP-260` first; the other eight phase-3 packages follow the work-plan dependencies ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
@@ -40,7 +40,6 @@ This file is the brief: current state only, one entry per item. The full history
 Only rows marked **Ready (authorized)** may be started. Each row's allowed and forbidden paths are in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md) (search for the id).
 
 - `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
-- **`WP-260`**: Ready (authorized) 2026-09-30, under the user's Wave 3 authorization; both conditions hold. Goal: the secure unified-SDK adapter and signer boundary, pinned to `@polymarket/client` 0.11.0. PAPER only: no real key, signer or credential. Verifiers: Opus and gpt-6-astra, reconciled (user rule, 2026-09-30). Gate: the work plan's security review, and a green CI run on GitHub.
 - **`LEAN-GOV`**: Ready (authorized) 2026-09-30, from the user's `LEAN-1` rulings (H, A1-A5). Docs only: ADR-025 onward (the laptop host profile, evaluation cadence, checkpoint-on-change, raw retention with pins, the approximate dataset class, series auto-admission), plus work-plan rows for the `LEAN-1` rounds. Verifiers: Opus and gpt-6-astra, reconciled (a docs round).
 - **`STORAGE-1`** and **`HOST-BENCH`**: authorized 2026-09-30; they start after `LEAN-GOV` merges.
 - **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29; startable now, because the Wave 2 closeout is done. It runs alongside Wave 3.
@@ -152,7 +151,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `CLOSEOUT-2` | fresh Wave 2 closeout audit (runbook §10) | Complete (2026-09-30): WAVE 2 NOT CLOSED, blocker `X1` | — (an audit; no merge) | [CLOSEOUT-2](docs/handoffs/CLOSEOUT-2-wave-2-closeout.md) |
 | `DURABLE-1` | `X1`: a decision is durable before its venue and ledger effects | Complete (2026-09-30) | `6e01228` | [DURABLE-1](docs/handoffs/DURABLE-1.md) |
 | `CLOSEOUT-2B` | focused re-grade of Wave 2 after `DURABLE-1` | Complete (2026-09-30): WAVE 2 CLOSED WITH QUALIFICATIONS, after the user's CANCEL ruling | — (an audit; no merge) | [CLOSEOUT-2B](docs/handoffs/CLOSEOUT-2B-wave-2-regrade.md) |
-| `WP-260` | Secure unified-SDK adapter and signer boundary | **Ready (authorized)** 2026-09-30 | — | — |
+| `WP-260` | Secure unified-SDK adapter and signer boundary | Complete (2026-09-30) | `32d10be` | [WP-260](docs/handoffs/WP-260.md) |
 | `DEPS-2` | CI health: `@grpc/grpc-js` high advisory (dev/test-only) | Complete (2026-09-30) | `c5967b4` | [DEPS-2](docs/handoffs/DEPS-2.md) |
 | `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
 | `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | **Ready (authorized)** 2026-09-30 | — | — |
@@ -186,6 +185,7 @@ Open rows only, one line each. An owner beginning "row:" is quoted from the arch
 | Id | Residual | Owner |
 | --- | --- | --- |
 | `DURABLE1-LOWS` | LOW-3: in group mode a decision and its checkpoint can commit in separate transactions (no production `restoreFrom` caller yet). LOW-6: the commit cost on placement-heavy bursts is unmeasured. R2-LOW-7: a CANCEL from a later decision can wait on an earlier decision's placement write. | the first production `restoreFrom` round; a throughput round |
+| `WP260-L1` | The `test/contract/polymarket-secure` suite (2 files, 31 tests) is not in the root `test:contract` script or the CI contract step. Wiring it needs the protected root `package.json` and `ci.yml`. | the orchestrator (a CI round) |
 | `CI-FLAKE-STALL-BOUND` | `test/integration/data-gateway/publish-throughput.test.ts` "a transport that stops answering" pins a timing bound (≤ 302). CI read 303 once (PR #29 attempt 1). TP1B-R1-L5 flagged it. | a data-gateway test round |
 | `CO2-N1` | Live admission (risk freshness, book age, seconds-to-close) runs on event time (`envelope.receivedAt`), so a stale backlog can approve entries after close. Masked today by the settlement veto. | an ADR and a trading-core round, before any settlement veto is lifted and before `WP-270` |
 | `CO2-N3` | The per-code risk-veto panel cannot show a code's first veto: its series is born at 1, and `increase()` reads 0. The refused-exit and recommendation families have the same problem. | a control-api / dashboard round |

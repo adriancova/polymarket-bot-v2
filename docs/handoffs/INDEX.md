@@ -105,3 +105,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-30 | [CLOSEOUT-2B-wave-2-regrade.md](CLOSEOUT-2B-wave-2-regrade.md) | `CLOSEOUT-2B`: focused re-grade of Wave 2 after `DURABLE-1` | Audit | WAVE 2 CLOSED WITH QUALIFICATIONS (with the user's CANCEL ruling) | — (an audit) | 13 KB |
 | 2026-09-30 | [LEAN-1.md](LEAN-1.md) | `LEAN-1`: a sub-$100/mo first deployment (plan and the user's rulings) | Governance | Planned; ruled H, A1-A5 | — (a plan) | 26 KB |
 | 2026-09-30 | [DEPS-2.md](DEPS-2.md) | `DEPS-2`: patch `@grpc/grpc-js` for GHSA-m9gg-hp2v-232j | Round | Complete (2026-09-30) | `c5967b4` | 1 KB |
+| 2026-09-30 | [WP-260.md](WP-260.md) | `WP-260`: secure unified-SDK adapter and signer boundary | WP | Complete (2026-09-30) | `32d10be` | 38 KB |
