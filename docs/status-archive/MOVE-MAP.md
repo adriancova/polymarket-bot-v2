@@ -208,7 +208,7 @@ update that one line in the brief, and re-cut the archive (see `README.md`).
 | `N1` (N1 (closeout, still open)) | 2546 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `N8` (N8 (WP-240 r1 M-1/M-2/M-3)) | 2547 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |
 | `G-03` (G-03 (soak job specs)) | 2548 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |
-| `GATE1-R3` (GATE1-R3 (discharged locally)) | 2549 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |
+| `GATE1-R3` (GATE1-R3 (discharged locally)) | 2549 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `GATE1-R4` | 2550 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `CI1-L1` | 2551 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `CI1-L2` | 2552 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |

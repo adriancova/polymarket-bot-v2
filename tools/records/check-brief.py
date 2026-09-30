@@ -45,7 +45,7 @@ K29 no line of REWRITES.md's intro and coverage prose (before the first declarat
     line of the archive README, runs over 80 words: split dense paragraphs into lists or tables.
 K30 no verbless fragment where r4 had one: the WP-210 bullet's "landing: contract owner
     recording." and the UNIV-1 bullet's bare "LOW-2 drifts (two unpinned), LOW-3 ..." list.
-K31 closed before the cut (r6, r7): regression checks for a fixed list of specific closures that
+K31 closed before the cut (r6-r8): regression checks for a fixed list of specific closures that
     review found (CLOSED_BEFORE_CUT). It is not a detector: an item closed before the cut that no
     rule names passes. Each rule names the brief wording and the evidence, read from the
     repository AT THE CUT (`git show <cut>:<path>`); if the evidence is not there, the rule fails
@@ -61,12 +61,16 @@ K34 every id in `BINANCE_UNVERIFIED` (packages/binance-adapter/src/venue.ts at t
     in the brief in backticks.
 K35 the archive README describes K31 as regression checks for exactly len(CLOSED_BEFORE_CUT)
     specific closures and says it is not a detector.
+K36 carried qualifiers (r8): each CARRIED_FACTS rule names a brief row or bullet (by its line prefix),
+    the words it must hold, and the source text that states the fact AT THE CUT; if the source text
+    is gone, the rule fails too. Like K31, it is a fixed list, not a detector.
 K2 also requires the "Residuals recorded in Complete package rows" and "Obligations in completion
 records" subsections. K21 also requires C16, refuses the claim "so a partial carry fails" in
 REWRITES.md and the archive README, and requires both to say reviewers check the rest of a clause.
 K24 also requires the ALLOC-1 bullet to write "ALLOC-1's review N1/N2", "its N3" and "its N4" (either
-case). K30 also refuses the r6 clause chains "its N3, unparsed" and "; its N4, the" (r7, D2) and
-"Two more fidelity panels", which had no referent (r7, D5).
+case). K30 also refuses the r6 clause chains "its N3, unparsed" and "; its N4, the" (r7, D2),
+"Two more fidelity panels", which had no referent (r7, D5), the WP-180-FU3 fragment chain
+"r1 N1, ...; r1 N2, the ...; r1 N4, the ..." (r8, CX-R8-03) and the phrase "a fixed depth 2 levels more" (r8, R8-02).
 
 Exit 0 when every rule holds, 1 otherwise. Stdlib only, no network.
 """
@@ -149,6 +153,18 @@ CLOSED_BEFORE_CUT = [
      "test/unit/trader/query-boundary-cast-scan.test.ts", "(`TRDR-2` R8, closed by `BOOT-1`)", True),
     ("TRDR4-CITES: 'the claim itself still holds' (FOLD-1 found it stale)", r"claim itself still holds",
      "docs/handoffs/FOLD-1.md", "It now has nested records: a fixed depth, 2 levels more.", True),
+    # r8
+    ("GATE1-R3: the first real CI run's fresh install (CI-1 discharged H2)", r"^\| `GATE1-R3` \|",
+     "docs/handoffs/CI-1.md", "(`H2` DISCHARGED)", True),
+]
+# K36: (label, brief line prefix, words the line must hold, source path, source text at the cut)
+CARRIED_FACTS = [
+    ("WP-190 R1-L1: the composed entries are total (CX-R8-01)", "| `N3` |",
+     ["`buildExecutionPlan`", "`sealExecutionPlan`", "are total"],
+     "docs/handoffs/WP-190.md", "The composed entries (`buildExecutionPlan`, `sealExecutionPlan`)"),
+    ("WP-250 F2: the replay-determinism panel's named owner (CX-R8-02)", "- `WP-250`:",
+     ["`packages/simulation`", "`apps/backtest-cli`"],
+     "packages/observability/src/control/dashboards.ts", "a future packages/simulation or apps/backtest-cli grant"),
 ]
 # K33: every file:line citation in the brief, checked at the cut.
 # (literal as it occurs in the brief, [(path, first line, last line, needle)]); first line None = a
@@ -469,6 +485,10 @@ def main() -> int:
     for n, l in enumerate(lines, 1):
         if "Two more fidelity panels" in l:
             fails.append(f"K30: line {n}: 'Two more fidelity panels' has no referent; say 'Two fidelity panels' and name the third")
+        if re.search(r"^- `WP-180-FU3`: r1 N1, |; r1 N2, the |; r1 N4, the ", l):
+            fails.append(f"K30: line {n}: the WP-180-FU3 fragment chain 'r1 N1, ...; r1 N2, ...'; write full sentences")
+        if "a fixed depth 2 levels more" in l:
+            fails.append(f"K30: line {n}: 'a fixed depth 2 levels more' is hard to parse; say 'two levels deeper, to a fixed depth'")
     # K33
     spans = []
     for lit, checks in CITATIONS:
@@ -504,6 +524,18 @@ def main() -> int:
         fails.append(f"K35: the archive README must describe K31 as '{want}' and say it is 'not a detector'")
     if "refuses an item the brief carries as owed when" in readme:
         fails.append("K35: the archive README claims K31 refuses any item closed before the cut")
+    # K36
+    for label, prefix, words, path, needle in CARRIED_FACTS:
+        ev = show(args.repo, sha, path)
+        if ev is None or needle not in ev:
+            fails.append(f"K36: {label}: the source text is gone at {sha[:12]} ({path}); re-check the rule")
+        hits = [l for l in lines if l.startswith(prefix)]
+        if len(hits) != 1:
+            fails.append(f"K36: {label}: expected one brief line starting {prefix!r}, found {len(hits)}")
+            continue
+        missing = [w for w in words if w not in hits[0]]
+        if missing:
+            fails.append(f"K36: {label}: the brief line {prefix!r} lacks {', '.join(repr(w) for w in missing)}")
     # K25
     sec, sec_lines = None, []
     def k25(sec, sec_lines):

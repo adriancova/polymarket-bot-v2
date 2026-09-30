@@ -442,12 +442,24 @@ BRIEF_MUTATIONS = [
     ("the WP-240 bullet's 'Two more fidelity panels' (D5)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("Two fidelity panels stay pending", "Two more fidelity panels stay pending", 1), "K30:"),
     ("the archive README's r6 K31 overclaim (D4)", f"{ARCH}/README.md",
-     lambda t: t.replace("  - K31 is a set of regression checks for 16 specific closures that review found.",
+     lambda t: t.replace("  - K31 is a set of regression checks for 17 specific closures that review found.",
                          "  - It also refuses an item the brief carries as owed when a record, contract or code comment at the cut already closed it (K31).", 1), "K35:"),
     ("the archive README's proof bullet as one dense line again (I5)", f"{ARCH}/README.md",
      lambda t: t.replace(" runs three proofs:\n  - A:", " runs three proofs: A:", 1).replace("exactly.\n  - B:", "exactly. B:", 1)
      .replace("multiplicity.\n  - C:", "multiplicity. C:", 1).replace("complete.\n  - C also", "complete. C also", 1)
      .replace("lists each check.\n  - A declared", "lists each check. A declared", 1), "K29:"),
+    # r8
+    ("the N3 row without WP-190 R1-L1's composed-entries qualifier (CX-R8-01)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace(" The composed entries (`buildExecutionPlan`, `sealExecutionPlan`) are total (`WP-190` R1-L1).", "", 1), "K36:"),
+    ("the WP-250 bullet without the replay-determinism panel's owner (CX-R8-02)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace(": a future `packages/simulation` or `apps/backtest-cli` grant.", " (hard-forbidden paths).", 1), "K36:"),
+    ("the WP-180-FU3 fragment chain again (CX-R8-03)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("review r1 left three items open. In r1 N1, the ownEntry guard is untested (pre-existing).",
+                         "r1 N1, the ownEntry guard untested (pre-existing); r1 N2, the sort sentence.", 1), "K30:"),
+    ("TRDR4-CITES's 'a fixed depth 2 levels more' again (R8-02)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("nests records two levels deeper, to a fixed depth.", "nests records, a fixed depth 2 levels more.", 1), "K30:"),
+    ("the GATE1-R3 row carried as open again (R8-01, closed by CI-1)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("| `N3` |", "| `GATE1-R3` | The remaining unknown was the first real CI run's fresh install. | H2 |\n| `N3` |", 1), "K31:"),
     ("exceed the 15% budget", "IMPLEMENTATION_STATUS.md",
      lambda t: t + ("filler " * 9000) + "\n", "K1:"),
 ]

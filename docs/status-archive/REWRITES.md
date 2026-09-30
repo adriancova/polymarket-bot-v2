@@ -113,7 +113,7 @@ A row that is closed in part and still carries such a marker can pass this test 
 75-75 complete-row `GOV-2B`
 76-76 complete-row `TRDR-2` — carried RW-125; closed-by `BOOT-1` (B9, the main.ts:292 cast, and TRDR2-R8), `CI-1` (N5)
 77-77 complete-row `RISK-2` — queued `RISK-2 item 7`; closed-by `BRACKET-1a` (residual 5)
-78-78 complete-row `GATE-1` — carried RW-126; queued `GATE1-M1`, `GATE1-R3`; closed-by `CI-1` (GATE1-R4, the fail-fast chain)
+78-78 complete-row `GATE-1` — carried RW-126; queued `GATE1-M1`; closed-by `CI-1` (GATE1-R4, the fail-fast chain, and GATE1-R3, the first real CI run)
 79-79 complete-row `BOOT-1` — queued `B9`, `BOOT1 unchecked shared facts`, `BOOT1 pool leak`, `BOOT1-R6`, `BOOT1-R11`; listed `BOOT1-R7`; closed-by `REGISTER-1` (the registration CLI)
 80-80 complete-row `BACKTEST-1` — carried RW-139; listed `B3`, `BT1-R1..R4`
 81-81 complete-row `GOV-2C` — listed `N3`; none: the header-strike note is moot, because LOGS-1 replaced the header
@@ -1281,7 +1281,7 @@ Old, lines 2513-2513:
 New:
 
 ~~~new
-| `TRDR4-CITES` | `test/unit/control-api/response-encoder-bound.test.ts` cites stale lines `health-door.ts:181` and `:77`. At `f43efe6` they are `:301` (`readTraderHealthReport`) and `:83` (the first `z.record(`). Its "one `z.record(`" wording is stale too: `FOLD-1` found that the door now nests records, a fixed depth 2 levels more. | the next round touching `test/unit/control-api/**` (documentation only) |
+| `TRDR4-CITES` | `test/unit/control-api/response-encoder-bound.test.ts` cites stale lines `health-door.ts:181` and `:77`. At `f43efe6` they are `:301` (`readTraderHealthReport`) and `:83` (the first `z.record(`). Its "one `z.record(`" wording is stale too: `FOLD-1` found that the door now nests records two levels deeper, to a fixed depth. | the next round touching `test/unit/control-api/**` (documentation only) |
 ~~~
 
 Keep (in both texts):
@@ -2227,7 +2227,7 @@ why CJS was rejected
 
 **Facts.** Kept: all six items as named, including (4) the `esbuild `-prefix-only coverage, (5) the coupling to the example config's market count and (6) the metadata rewrite with the `js-yaml@4.3.1` observation; the owners. The r0 brief summarized (4)-(6); r1 names them. The row still assigns (1) to the next docs round, while `docs/handoffs/DOCS-1.md` says `DOCS-1` covered it; the brief reports both and does not resolve it.
 
-## RW-74: Residual `GATE1-R3`
+## RW-74: Residual `GATE1-R3`: closed before the cut (r8)
 
 Old, lines 2549-2549:
 
@@ -2235,20 +2235,9 @@ Old, lines 2549-2549:
 | **GATE1-R3 (discharged locally)** | `js-yaml 4.3.2` HAS executed here: `GATE-1`'s post-merge `pnpm install --frozen-lockfile --offline` at `0434c82` materialized `node_modules/.pnpm/js-yaml@4.3.2` (`docs/handoffs/GATE-1.md`, "every one re-run green"), and every lint gate since — TRDR-2, RISK-2, GOV-2C — ran on it. *(Corrected 2026-09-16 in the GOV-2C governance flip, review finding GOV2C-r1-1; the row previously read "`js-yaml 4.3.2` has never executed here: the bump was lockfile-only, local `node_modules` still holds 4.3.1, and every gate run so far used it" — true at GATE-1's candidate tip, false once its post-merge install ran, and copied without re-dating.)* The remaining unknown is only the first real CI run's fresh install | `docs/handoffs/GATE-1.md` residual 3 | H2 (the first real CI run) |
 ~~~
 
-New:
+r8 found this row closed before the cut, so this entry holds no new text. The brief names `GATE1-R3` in the Residual queue's closed list.
 
-~~~new
-| `GATE1-R3` | `js-yaml 4.3.2` has run locally since `GATE-1`'s post-merge `pnpm install --frozen-lockfile --offline` at `0434c82`; every lint gate since ran on it. The remaining unknown was the first real CI run's fresh install. | H2, discharged 2026-09-26 by `CI-1`; the row was not closed |
-~~~
-
-Keep (in both texts):
-
-~~~keep
-pnpm install --frozen-lockfile --offline
-the first real CI run's fresh install
-~~~
-
-**Facts.** Kept: 4.3.2 has run locally since `GATE-1`'s post-merge install at `0434c82`; every lint gate since; the remaining unknown. The owner is H2, which `CI-1` discharged on 2026-09-26; the row itself was never closed, and the brief says both. Archive only: the GOV-2C correction note.
+**Facts.** Nothing is owed. The row's only open point was the first real CI run's fresh install, owned by H2. `CI-1` discharged H2 on 2026-09-26: `docs/handoffs/CI-1.md` records PR #1 run `36282501033` with all three jobs `success` and says "(`H2` DISCHARGED)". That run installed from the lockfile, which pins `js-yaml@4.3.2` at `f43efe6`. r1-r7 carried the row as open with the owner "H2, discharged 2026-09-26 by `CI-1`; the row was not closed" (verifier finding R8-01). Archive only: the GOV-2C correction note.
 
 ## RW-75: Residual `N3`
 
@@ -2261,7 +2250,7 @@ Old, lines 2542-2542:
 New:
 
 ~~~new
-| `N3` | `GOV-2A`'s 2026-09-04 ruling: `packages/execution-planner/src/refusals.ts:178-187` claims every public entry point returns a typed result, but `buyLimitPrice`/`sellLimitPrice` (`src/price.ts`) throw `InvalidDecimalStringError` on non-canonical input. The claim is to be corrected in text or guarded in code; its first trigger (`WP-180-FU2`) fired unmet. | the next bounded grant on `packages/execution-planner/**`; every packet dispatched for that package must quote the archived row |
+| `N3` | `GOV-2A`'s 2026-09-04 ruling: `packages/execution-planner/src/refusals.ts:178-187` claims every public entry point returns a typed result, but `buyLimitPrice`/`sellLimitPrice` (`src/price.ts`) throw `InvalidDecimalStringError` on non-canonical input. The composed entries (`buildExecutionPlan`, `sealExecutionPlan`) are total (`WP-190` R1-L1). The claim is to be corrected in text or guarded in code; its first trigger (`WP-180-FU2`) fired unmet. | the next bounded grant on `packages/execution-planner/**`; every packet dispatched for that package must quote the archived row |
 ~~~
 
 Keep (in both texts):
@@ -2271,7 +2260,7 @@ InvalidDecimalStringError on non-canonical input
 every packet dispatched for that package must
 ~~~
 
-**Facts.** Kept: the ruling date; the claim and the throwing functions with `InvalidDecimalStringError` on non-canonical input; correct in text or guard in code; the unmet `WP-180-FU2` trigger; the owner with "every packet dispatched for that package must quote" (now "the archived row"). The `features` half (corrected by GOV-2C) and the failed-compliance history are in Deviations > N3 and the archive.
+**Facts.** Kept: the ruling date; the claim and the throwing functions with `InvalidDecimalStringError` on non-canonical input; correct in text or guard in code; the unmet `WP-180-FU2` trigger; the owner with "every packet dispatched for that package must quote" (now "the archived row"). r8 adds `WP-190` R1-L1's qualifier, which r1-r7 dropped: the composed entries (`buildExecutionPlan`, `sealExecutionPlan`) are total (`docs/handoffs/WP-190.md` known_risks; verifier finding CX-R8-01). The `features` half (corrected by GOV-2C) and the failed-compliance history are in Deviations > N3 and the archive.
 
 ## RW-76: Residual `N2`
 
@@ -2379,7 +2368,7 @@ New:
 
 ~~~new
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
-Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`, `RISK2-R1` and `TRDR2-R8` (both closed by `BOOT-1` before the cut). The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
+Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`, `RISK2-R1` and `TRDR2-R8` (both closed by `BOOT-1` before the cut), and `GATE1-R3` (closed by `CI-1` before the cut: H2's first real CI run). The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
 ~~~
 
 Keep (in both texts):
@@ -3186,11 +3175,12 @@ Not carried:
 
 ~~~drop lines=52-52
 **R1-L1** deferred LOW — exported `buyLimitPrice`/`sellLimitPrice` => brief: Residual queue — `N3`
+composed entries ARE total => brief: Residual queue — `N3` (the composed entries `buildExecutionPlan` and `sealExecutionPlan` are total)
 **R1-N2** `node:util` now in a third package AND a new file => closed-by `GOV-2A` (the §2.2 built-in allowlist)
 **R1-N4** third mirror duplication => closed-by `WP-180-FU2` (it discharged R1-N4)
 ~~~
 
-**Facts.** Kept: R1-N3. R1-L1 is the brief's `N3` row. Closed elsewhere: R1-N4 (`WP-180-FU2` discharged it) and R1-N2 (`node:util`, the `GOV-2A` built-in allowlist). History: `work-packages-waves-0-2.md`.
+**Facts.** Kept: R1-N3. R1-L1 is the brief's `N3` row, including its qualifier that the composed entries are total (r8; r1-r7 dropped it, verifier finding CX-R8-01). Closed elsewhere: R1-N4 (`WP-180-FU2` discharged it) and R1-N2 (`node:util`, the `GOV-2A` built-in allowlist). History: `work-packages-waves-0-2.md`.
 
 ## RW-107: Complete row `WP-020-FU1`: residuals still owned
 
@@ -3370,11 +3360,11 @@ Not carried:
 ~~~drop lines=57-57
 the trader-health seam is caller/wire input NOT wired to a trader => closed-by `TRDR-3` (the trader health endpoint; M-2 closed)
 realized-PnL → future apps/trader grant => closed-by `TRDR-3` (the "Realized PnL" panel binds a produced family; PENDING_PRODUCER_PANELS lists three panels at f43efe6)
-replay-determinism metric → future simulation/backtest-cli grant => brief: Residuals recorded in Complete package rows — WP-250 (F2, the replay-determinism panel's producer)
+replay-determinism metric → future simulation/backtest-cli grant => brief: Residuals recorded in Complete package rows — WP-250 (F2, the replay-determinism panel's producer, with its owner: a future packages/simulation or apps/backtest-cli grant)
 dashboards never imported into a real Grafana => brief: Human items — H3 (a real Grafana imported and rendered the dashboards, 2026-09-29)
 ~~~
 
-**Facts.** Kept: the design follow-ups outside `N8`, and every open known risk: the in-memory audit log (the Postgres port is ready); the typecheck-pinned postgres sink with its `randomUUID()` v4 vs `internal.uuid_v7` conflict (at `f43efe6`, `apps/control-api/src/main.ts` lines 80-90 still mint ids with `randomUUID()`); and the loopback-PAPER bearer-token model. r5 restores the qualifiers r4 dropped: WP-140's renderer is closure-bound, the kill-switch seam is a composition obligation, the v4/v7 conflict is documented in code, and LOW-1/NOTE-1 were reported, not patched, because the packet ruled apps/trader read-only. M-1, M-3, the LOWs and N-4 are the brief's `N8` row. r6 adds the two other pending panels, predicted-vs-actual (`WP-290`/phase-4) and markout (a future simulation/research grant), which r1-r5 neither carried nor dropped (verifier finding I6); `packages/observability/src/control/dashboards.ts` still declares both at `f43efe6`. The realized-PnL panel closed with `TRDR-3`, and the replay-determinism panel is WP-250's F2. r7 writes "Two fidelity panels", not "Two more", and points to WP-250's F2 for the third (verifier finding D5). M-2 and the unwired trader-health seam closed with `TRDR-3`, and H3 imported the dashboards into a real Grafana. Not carried: N-1 (the family count, reconciled in the record) and the deferred root wiring (ratified at merge). History: `work-packages-waves-0-2.md`.
+**Facts.** Kept: the design follow-ups outside `N8`, and every open known risk: the in-memory audit log (the Postgres port is ready); the typecheck-pinned postgres sink with its `randomUUID()` v4 vs `internal.uuid_v7` conflict (at `f43efe6`, `apps/control-api/src/main.ts` lines 80-90 still mint ids with `randomUUID()`); and the loopback-PAPER bearer-token model. r5 restores the qualifiers r4 dropped: WP-140's renderer is closure-bound, the kill-switch seam is a composition obligation, the v4/v7 conflict is documented in code, and LOW-1/NOTE-1 were reported, not patched, because the packet ruled apps/trader read-only. M-1, M-3, the LOWs and N-4 are the brief's `N8` row. r6 adds the two other pending panels, predicted-vs-actual (`WP-290`/phase-4) and markout (a future simulation/research grant), which r1-r5 neither carried nor dropped (verifier finding I6); `packages/observability/src/control/dashboards.ts` still declares both at `f43efe6`. The realized-PnL panel closed with `TRDR-3`, and the replay-determinism panel is WP-250's F2; r8 names its owner there, as `PENDING_PRODUCER_PANELS` does at `f43efe6` (a future `packages/simulation` or `apps/backtest-cli` grant; verifier finding CX-R8-02). r7 writes "Two fidelity panels", not "Two more", and points to WP-250's F2 for the third (verifier finding D5). M-2 and the unwired trader-health seam closed with `TRDR-3`, and H3 imported the dashboards into a real Grafana. Not carried: N-1 (the family count, reconciled in the record) and the deferred root wiring (ratified at merge). History: `work-packages-waves-0-2.md`.
 
 ## RW-111: Complete row `WP-250`: residuals still owned
 
@@ -3387,7 +3377,7 @@ F2 the replay-determinism panel's producer stays PENDING with its named owner. C
 New:
 
 ~~~new
-- `WP-250`: F2, the replay-determinism panel's producer stays PENDING with its named owner (hard-forbidden paths). The next-e2e-touch pin follow-ups in `docs/handoffs/WP-250.md`: exact-count assertions (this round proved prose can desynchronize), the `"50"` pin, the LOW-3 tightening. A disclosed known risk: the `SHARED_BOOK_ACCOUNTING_MODE` backstop is read-in-source only.
+- `WP-250`: F2, the replay-determinism panel's producer stays PENDING with its named owner: a future `packages/simulation` or `apps/backtest-cli` grant. `WP-250` could not add the producer (hard-forbidden paths: its allowed paths forbid `packages/**` and `apps/**`). The next-e2e-touch pin follow-ups in `docs/handoffs/WP-250.md`: exact-count assertions (this round proved prose can desynchronize), the `"50"` pin, the LOW-3 tightening. A disclosed known risk: the `SHARED_BOOK_ACCOUNTING_MODE` backstop is read-in-source only.
 ~~~
 
 Keep (in both texts):
@@ -3413,7 +3403,7 @@ Not carried:
 F1 no realized round trip reachable (above) => closed-by `RISK-2`, `BRACKET-1a`
 ~~~
 
-**Facts.** Kept: F2 with its reason (hard-forbidden paths), the next-e2e-touch pin follow-ups with the reason for exact counts (prose can desynchronize; r5 restores both reasons), and the known risk that the `SHARED_BOOK_ACCOUNTING_MODE` backstop is read-in-source only. F1 (no realized round trip) closed with `RISK-2` and `BRACKET-1a`. The golden, the scenario and the review are history in `work-packages-waves-0-2.md`.
+**Facts.** Kept: F2 with its reason (hard-forbidden paths) and, since r8, its named owner: a future `packages/simulation` or `apps/backtest-cli` grant (base line 57, RW-110; `packages/observability/src/control/dashboards.ts` at `f43efe6`), the next-e2e-touch pin follow-ups with the reason for exact counts (prose can desynchronize; r5 restores both reasons), and the known risk that the `SHARED_BOOK_ACCOUNTING_MODE` backstop is read-in-source only. F1 (no realized round trip) closed with `RISK-2` and `BRACKET-1a`. The golden, the scenario and the review are history in `work-packages-waves-0-2.md`.
 
 ## RW-112: Complete row `WP-180-FU3`: residuals still owned
 
@@ -3426,13 +3416,14 @@ Residuals owned (docs/handoffs/WP-180-FU3.md): zod array-assembly availability r
 New:
 
 ~~~new
-- `WP-180-FU3`: r1 N1, the ownEntry guard untested (pre-existing); r1 N2, the `lots.ts:151` sort sentence; r1 N4, the approved-intent five identity fields as one deferred decision. The zod array-assembly availability residual (18 rows/intrinsic, fail-closed) is the `isFreshOrdinaryContainer` round (Schema boundary above). That widening is a designed round with capital-allocator/ledger/pnl/strategy-runtime in scope.
+- `WP-180-FU3`: review r1 left three items open. In r1 N1, the ownEntry guard is untested (pre-existing). In r1 N2, the `lots.ts:151` sort sentence is owed. r1 N4 treats the approved-intent five identity fields as one deferred decision. The zod array-assembly availability residual (18 rows/intrinsic, fail-closed) is the `isFreshOrdinaryContainer` round (Schema boundary above). That widening is a designed round with capital-allocator/ledger/pnl/strategy-runtime in scope.
 ~~~
 
 Keep (in both texts):
 
 ~~~keep
-ownEntry guard untested
+ownEntry guard
+untested (pre-existing)
 lots.ts:151 sort sentence
 approved-intent five identity fields as one deferred decision
 zod array-assembly availability residual
@@ -3446,7 +3437,7 @@ Not carried:
 r1 N3 ADR-016 §2 evidence shape for this one field now issues-based => history: ADR-016's dated amendment is recorded, and no live consumer loses anything
 ~~~
 
-**Facts.** Kept: N1, N2 and N4, and the zod array-assembly availability residual with its size (18 rows/intrinsic, fail-closed) and the `isFreshOrdinaryContainer` round's four-package scope (r4 restores both). N3's ADR-016 amendment is recorded. The queued doc follow-ups went to the contract-owner docs round (`GOV-2C`). History: `work-packages-rounds.md`.
+**Facts.** Kept: N1, N2 and N4 (r8 writes each as a sentence, not a fragment chain; verifier finding CX-R8-03), and the zod array-assembly availability residual with its size (18 rows/intrinsic, fail-closed) and the `isFreshOrdinaryContainer` round's four-package scope (r4 restores both). N3's ADR-016 amendment is recorded. The queued doc follow-ups went to the contract-owner docs round (`GOV-2C`). History: `work-packages-rounds.md`.
 
 ## RW-113: Complete row `WP-160-FU1`: residuals still owned
 
@@ -3890,10 +3881,10 @@ Not carried:
 ~~~drop lines=78-78
 the `node` job remains one fail-fast chain so B7's STRUCTURAL cause survives its instance => closed-by `CI-1` (GATE1-R4: every node gate is if: ${{ !cancelled() && steps.install.outcome == 'success' }})
 the vitest `projects` route existed and was declined for root-count stability, not impossible => history: a recorded choice, not an obligation
-js-yaml 4.3.2 first executes on the merge CI run => brief: Residual queue — `GATE1-R3`
+js-yaml 4.3.2 first executes on the merge CI run => closed-by `CI-1` (GATE1-R3: H2's first real CI run, PR #1 run 36282501033, installed from the lockfile and passed every gate)
 ~~~
 
-**Facts.** Kept: the editable gate homes, narrowed to what is still unguarded. r6 measured the narrowing: deleting the Lint gate from `ci.yml` fails 3 of 32 tests in `test/unit/tooling/ci-step-split.test.ts` (the `CI-2` pin), so "a deleted CI step fails no test" no longer holds for a root-script gate. The fail-fast chain is GATE1-R4, closed by `CI-1`. `GATE1-M1` and `GATE1-R3` are residual rows; the declined vitest `projects` route is a recorded choice, not an obligation. History: `work-packages-rounds.md`.
+**Facts.** Kept: the editable gate homes, narrowed to what is still unguarded. r6 measured the narrowing: deleting the Lint gate from `ci.yml` fails 3 of 32 tests in `test/unit/tooling/ci-step-split.test.ts` (the `CI-2` pin), so "a deleted CI step fails no test" no longer holds for a root-script gate. The fail-fast chain is GATE1-R4, closed by `CI-1`. `GATE1-M1` is a residual row. `GATE1-R3` closed with `CI-1` before the cut (RW-74, r8); the declined vitest `projects` route is a recorded choice, not an obligation. History: `work-packages-rounds.md`.
 
 ## RW-127: Completion record `WP-150`: obligations still owed
 
