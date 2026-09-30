@@ -32,12 +32,8 @@ import { fileURLToPath } from "node:url";
 import type { EventEnvelope } from "@polymarket-bot/domain";
 import { EventBusUnavailableError, RedisStreamsEventTransport } from "@polymarket-bot/event-bus";
 import { startRedisContainer, uniqueStreamName } from "@polymarket-bot/event-bus/testing";
-import {
-  createIsolatedDatabase,
-  createMigratedContext,
-  startPostgresContainer,
-  type TestContext,
-} from "@polymarket-bot/storage-postgres/testing";
+import { createDatabase, createPostgresPool, migrateUp, type PolymarketBotDatabase } from "@polymarket-bot/storage-postgres";
+import { createIsolatedDatabase, startPostgresContainer } from "@polymarket-bot/storage-postgres/testing";
 import type { TransportHealth } from "@polymarket-bot/trader";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -98,7 +94,8 @@ function get(url: string): Promise<string> {
 }
 
 interface Scenario {
-  readonly context: TestContext;
+  /** The test's own read connection to the scenario's database. */
+  readonly db: PolymarketBotDatabase;
   readonly runId: string;
   readonly envelopes: readonly EventEnvelope<unknown>[];
   readonly publisher: RedisStreamsEventTransport;
@@ -117,7 +114,12 @@ interface Scenario {
 /** Registers, assembles and subscribes the real durable trader; the sampler reads every 100 ms. */
 async function scenario(label: string, retentionMaxEvents: number): Promise<Scenario> {
   const isolated = await createIsolatedDatabase(postgres.getConnectionUri(), `lag-${label}`);
-  const context = await createMigratedContext(isolated.connectionString);
+  // The test's own pool, ended by close() directly: a Kysely instance that
+  // never ran a query never acquired its pool, so destroying it would leave
+  // the migration's connections open until the container stops.
+  const pool = createPostgresPool({ connectionString: isolated.connectionString, maxConnections: 2 });
+  await migrateUp(pool, { appliedBy: "throughput-1a-test" });
+  const db = createDatabase(pool);
   const workDir = await mkdtemp(path.join(workRoot, `${label}-`));
   const completed = await registerForBench({
     databaseUrl: isolated.connectionString,
@@ -179,7 +181,7 @@ async function scenario(label: string, retentionMaxEvents: number): Promise<Scen
 
   let ingested = 0;
   return {
-    context,
+    db,
     runId,
     envelopes,
     publisher,
@@ -208,7 +210,7 @@ async function scenario(label: string, retentionMaxEvents: number): Promise<Scen
       await store.close();
       await transportForTrader.close();
       await publisher.close();
-      await context.close();
+      await pool.end();
     },
   };
 }
@@ -296,7 +298,7 @@ describe("the input stream's lag on the health surface", () => {
       expect(behind.retentionMaxEvents).toBe(50);
 
       const count = async (table: "strategy.decisions" | "strategy.state_checkpoints"): Promise<number> => {
-        const row = await run.context.db
+        const row = await run.db
           .selectFrom(table)
           .select((eb) => eb.fn.countAll<string>().as("n"))
           .where("run_id", "=", run.runId)
