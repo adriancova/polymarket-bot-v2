@@ -94,6 +94,53 @@ interface ReadState {
 }
 
 /**
+ * `THROUGHPUT-1a` — trees THIS MODULE materialized, deep-froze and handed out
+ * as prepared inputs (`prepared-reference.ts`), with the path and depth they
+ * were read at. PERFORMANCE ONLY. Such a tree is a faithful, prototype-free,
+ * frozen copy of the caller's value: reading it again would produce an equal
+ * tree with no problem, so at the SAME path and depth {@link readInto}
+ * answers the tree itself instead of copying it once more. Membership is
+ * checked in a `WeakMap` this module owns, so no caller-built object — and no
+ * Proxy — can be taken for one, and the check runs no caller code.
+ */
+const PREPARED_TREES = new WeakMap<object, { readonly path: string; readonly depth: number }>();
+
+/**
+ * Reads `value` at `rootPath` / `depth` (as {@link materializeInput} would read
+ * it at that position inside a larger input) and, when it is clean plain data,
+ * answers the materialized copy DEEP-FROZEN and registered as prepared; when
+ * it is not, answers `undefined` and registers nothing. Internal to the
+ * package (`prepared-reference.ts`).
+ */
+export function materializePrepared(value: unknown, rootPath: string, depth: number): object | undefined {
+  const state: ReadState = { problems: [], ancestors: new WeakSet() };
+  let read: unknown;
+  try {
+    read = readInto(value, rootPath, depth, state);
+  } catch {
+    return undefined;
+  }
+  if (state.problems.length > 0 || read === null || typeof read !== "object") return undefined;
+  deepFreezeOwn(read);
+  PREPARED_TREES.set(read, { path: rootPath, depth });
+  return read;
+}
+
+/** Is `value` a tree {@link materializePrepared} registered at this path and depth? */
+export function isPreparedTree(value: unknown, path: string, depth: number): value is object {
+  if (value === null || typeof value !== "object") return false;
+  const prepared = PREPARED_TREES.get(value);
+  return prepared !== undefined && prepared.path === path && prepared.depth === depth;
+}
+
+/** Freezes a tree this module built (plain arrays and null-prototype records). */
+export function deepFreezeOwn(value: unknown): void {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return;
+  Object.freeze(value);
+  for (const member of Object.values(value)) deepFreezeOwn(member);
+}
+
+/**
  * Reads `value` into a fresh prototype-free tree of plain data, or reports
  * every reason it is not one. TOTAL: never throws.
  */
@@ -139,6 +186,12 @@ function readInto(value: unknown, path: string, depth: number, state: ReadState)
   if (depth >= MAX_INPUT_DEPTH) {
     state.problems.push({ path, problem: `nested deeper than ${String(MAX_INPUT_DEPTH)} levels` });
     return undefined;
+  }
+  // `THROUGHPUT-1a`: a prepared tree, met where it was prepared, is already
+  // this read's answer (see `PREPARED_TREES`).
+  const prepared = PREPARED_TREES.get(container);
+  if (prepared !== undefined && prepared.depth === depth && prepared.path === path) {
+    return container;
   }
 
   let prototype: unknown;

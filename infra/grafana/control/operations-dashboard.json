@@ -276,6 +276,30 @@
       "targets": [
         { "refId": "A", "expr": "increase(trader_deliveries_suppressed_by_halt_total[5m])", "legendFormat": "suppressed deliveries" }
       ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Input stream lag (entries behind head)",
+      "description": "THROUGHPUT-1a. Events published to the trader's input stream and not yet delivered to it (the stream head minus the trader's position), sampled every second, against the stream's retention bound. When the lag reaches the bound, retention removes unread events and the trader halts TRANSPORT_RESYNC_REQUIRED (ADR-003 §3.3) — H1 run 1's halt. 'Queue depth' above is the in-process ingest queue and reads 0 however far behind the stream the trader is.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 53 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_transport_lag_entries", "legendFormat": "entries behind head" },
+        { "refId": "B", "expr": "trader_transport_retention_max_events", "legendFormat": "retention bound" }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Event-time lag",
+      "description": "THROUGHPUT-1a. Wall clock minus the recorded receivedAt of the last event the trader processed: how far behind the market its decisions are. The sample age says how old the stream positions in 'Input stream lag' are; a growing age means the sampler cannot reach the stream.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 53 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "targets": [
+        { "refId": "A", "expr": "trader_event_time_lag_seconds", "legendFormat": "event-time lag (s)" },
+        { "refId": "B", "expr": "trader_transport_sample_age_seconds", "legendFormat": "transport sample age (s)" }
+      ]
     }
   ]
 }

@@ -77,5 +77,8 @@ export function observeRealizedPnl(store: TraderStore, book: RealizedPnlBook): T
     close(): Promise<void> {
       return store.close();
     },
+    // `THROUGHPUT-1a`: the decorator observes PnL snapshots only; the store's
+    // group commit (decisions and checkpoints) passes through untouched.
+    ...(store.groupCommit === undefined ? {} : { groupCommit: store.groupCommit }),
   };
 }

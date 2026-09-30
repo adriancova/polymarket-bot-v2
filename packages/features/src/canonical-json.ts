@@ -22,6 +22,25 @@
  *   null value.
  */
 
+/**
+ * `THROUGHPUT-1a` — PRE-SERIALIZED members. PERFORMANCE ONLY. A fragment is a
+ * value this package serialized with this very function earlier; meeting it,
+ * the serializer emits those bytes where it would have walked the value again
+ * — the same bytes. Only this module mints them (`canonicalFragment`), and
+ * membership is by identity in a package-owned `WeakSet`, so no caller value
+ * can pass for one.
+ */
+const FRAGMENTS = new WeakSet<object>();
+const FRAGMENT_JSON = new WeakMap<object, string>();
+
+/** A member whose canonical JSON is `json` — which the caller produced with {@link serializeCanonicalJson}. */
+export function canonicalFragment(json: string): object {
+  const fragment = Object.freeze(Object.create(null) as object);
+  FRAGMENTS.add(fragment);
+  FRAGMENT_JSON.set(fragment, json);
+  return fragment;
+}
+
 export function serializeCanonicalJson(value: unknown): string {
   const parts: string[] = [];
   writeValue(value, parts, 0);
@@ -54,6 +73,10 @@ function writeValue(value: unknown, parts: string[], depth: number): void {
   }
   if (value === null) {
     throw new Error("canonical JSON: null is not part of the snapshot grammar");
+  }
+  if (FRAGMENTS.has(value)) {
+    parts.push(FRAGMENT_JSON.get(value) ?? "");
+    return;
   }
   if (Array.isArray(value)) {
     parts.push("[");

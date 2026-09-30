@@ -36,6 +36,8 @@ import {
   RISK_SEAM_CAVEAT,
   RealizedPnlBook,
   RetentionLog,
+  TRANSPORT_SAMPLE_INTERVAL_MS,
+  transportHealthOf,
   type FoldHealth,
   type HealthSnapshot,
   type OrderLifecycleMetrics,
@@ -112,6 +114,29 @@ function realSnapshot(): HealthSnapshot {
   realizedPnl.record({ instanceId: "sb-1", realizedPnl: "-1.2" });
   realizedPnl.record({ instanceId: "sb-2", realizedPnl: "0.3" });
   state.attachRealizedPnl(realizedPnl);
+  // `THROUGHPUT-1a`: the process attaches its transport-lag sampler at
+  // startup; the section is built by the REAL producer (`transportHealthOf`)
+  // from one sample: 250 entries behind a head of 1,250, read at 00:00:09.500,
+  // seen at 00:00:12.000 — 2.5 s old, 2 s past the last event (the snapshot's
+  // `asOf`, 00:00:10.000).
+  state.attachTransport({
+    transportHealth: (lastEventAt) =>
+      transportHealthOf({
+        intervalMs: TRANSPORT_SAMPLE_INTERVAL_MS,
+        samples: 3,
+        sampleFailures: 0,
+        latest: {
+          atMs: Date.parse("2026-09-05T00:00:09.500Z"),
+          headPosition: 1_250,
+          consumerPosition: 1_000,
+          committedPosition: 990,
+          entriesBehindHead: 250,
+          retentionMaxEvents: 100_000,
+        },
+        lastEventAt,
+        nowMs: Date.parse("2026-09-05T00:00:12.000Z"),
+      }),
+  });
 
   state.countLoop("eventsAccepted", 40);
   state.countLoop("eventsProcessed", 39);
@@ -354,6 +379,11 @@ describe("the REAL trader health snapshot passes the control API's door", () => 
     }
 
     expect(exposition).toContain('trader_halt_info{scope="MARKET",scope_ref="market-1"');
+    // `THROUGHPUT-1a`: the input stream's lag, exactly as the section states it.
+    expect(exposition).toContain("\ntrader_transport_lag_entries 250\n");
+    expect(exposition).toContain("\ntrader_transport_retention_max_events 100000\n");
+    expect(exposition).toContain("\ntrader_transport_sample_age_seconds 2.5\n");
+    expect(exposition).toContain("\ntrader_event_time_lag_seconds 2\n");
     expect(exposition).toContain('trader_queue_oldest_message_age_ms{queue="market-events"} 17');
     // The EMPTY queue is omitted from that family rather than reported as 0.
     expect(exposition).not.toContain('trader_queue_oldest_message_age_ms{queue="fills"}');

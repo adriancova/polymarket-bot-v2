@@ -371,6 +371,88 @@ export interface SeamHealth {
   readonly folds?: FoldHealth;
 }
 
+/**
+ * `THROUGHPUT-1a` — the event transport as THIS consumer sees it: how far
+ * behind the stream's head it is, and how old the last event it processed is.
+ *
+ * WHY IT EXISTS. H1 run 1 ran three minutes behind a live market and the
+ * health surface said `consumerLag 0` throughout: that counter is the
+ * in-process INGEST queue (`queues[]`), which a pump that drains every batch
+ * keeps empty however far behind the STREAM it is. Retention then removed
+ * events the trader had not read and it halted `TRANSPORT_RESYNC_REQUIRED`
+ * with nothing having warned anyone. This section is the stream-side number.
+ *
+ * WHO FILLS IT. The core has no transport and no wall clock (determinism), so
+ * the stream positions and the event-time lag come from a
+ * {@link TransportHealthSource} the composition root attaches
+ * ({@link HealthState.attachTransport}) — `apps/trader`'s sampler, which reads
+ * the subscription's own §8.3 metrics at a bounded cadence. Until one is
+ * attached (every in-memory composition, the backtest, the goldens) the
+ * section says so: `attached: false`, every measured field `null` — an absent
+ * measurement, never a zero nobody measured. `lastEventAt` is the core's own
+ * fact and is always filled once an event was processed.
+ *
+ * Every position is the transport's own publication ordinal (1 for the first
+ * event ever published), as the subscription reports it; the section never
+ * parses a checkpoint token.
+ */
+export interface TransportHealth {
+  /** `true` once a sampler is attached; `false`: nothing measures the transport here. */
+  readonly attached: boolean;
+  /** The sampler's cadence, in ms; `null` when none is attached. */
+  readonly sampleIntervalMs: number | null;
+  /** Samples taken, and samples whose read FAILED (a failed sample is never a halt; the pump's own reads decide those). */
+  readonly samples: number;
+  readonly sampleFailures: number;
+  /** Wall-clock instant of the latest successful sample; `null` before the first. */
+  readonly sampledAt: string | null;
+  /** Wall-clock ms since {@link sampledAt}, at the moment this section was built. */
+  readonly sampleAgeMs: number | null;
+  /** The stream's newest publication ordinal, at the sample. */
+  readonly headPosition: number | null;
+  /** The ordinal this consumer had been DELIVERED, at the sample. */
+  readonly consumerPosition: number | null;
+  /** The ordinal this consumer had durably COMMITTED, at the sample. */
+  readonly committedPosition: number | null;
+  /** `headPosition − consumerPosition`: events published and not yet delivered to this consumer. */
+  readonly entriesBehindHead: number | null;
+  /** The stream's retention bound: an `entriesBehindHead` past it is a hard resync. */
+  readonly retentionMaxEvents: number | null;
+  /** `receivedAt` (strict UTC) of the last event the loop processed; `null` before the first. */
+  readonly lastEventAt: string | null;
+  /** Wall-clock ms since {@link lastEventAt}, at the moment this section was built. */
+  readonly eventTimeLagMs: number | null;
+}
+
+/** What a composition root attaches to fill {@link TransportHealth}. */
+export interface TransportHealthSource {
+  /**
+   * The section, built NOW. `lastEventAt` is the loop's own (the `receivedAt`
+   * of the last processed event, or `null` before the first), so the source
+   * owns only the transport's numbers and the wall clock.
+   */
+  transportHealth(lastEventAt: string | null): TransportHealth;
+}
+
+/** The section while no source is attached (see {@link TransportHealth}). */
+export function unattachedTransportHealth(lastEventAt: string | null): TransportHealth {
+  return Object.freeze({
+    attached: false,
+    sampleIntervalMs: null,
+    samples: 0,
+    sampleFailures: 0,
+    sampledAt: null,
+    sampleAgeMs: null,
+    headPosition: null,
+    consumerPosition: null,
+    committedPosition: null,
+    entriesBehindHead: null,
+    retentionMaxEvents: null,
+    lastEventAt,
+    eventTimeLagMs: null,
+  });
+}
+
 export interface HealthSnapshot {
   readonly runMode: string;
   readonly maximumRunMode: string;
@@ -384,6 +466,8 @@ export interface HealthSnapshot {
   readonly accounting: AccountingHealth;
   /** The composition-root seams' own counters. See {@link SeamHealth}. */
   readonly seams: SeamHealth;
+  /** `THROUGHPUT-1a`: the stream-side lag. See {@link TransportHealth}. */
+  readonly transport: TransportHealth;
   readonly riskSeamCaveat: typeof RISK_SEAM_CAVEAT;
   /** The instant this snapshot was taken, from the injected clock. */
   readonly asOf: string;
@@ -453,6 +537,9 @@ export class HealthState {
   /** The realized-PnL book, once the composition root attaches one. */
   #realizedPnl: RealizedPnlBook | undefined;
 
+  /** `THROUGHPUT-1a`: the transport-lag source, once the composition root attaches one. */
+  #transport: TransportHealthSource | undefined;
+
   constructor(options: { readonly runMode: string; readonly maximumRunMode: string }) {
     this.runMode = options.runMode;
     this.maximumRunMode = options.maximumRunMode;
@@ -480,6 +567,18 @@ export class HealthState {
    */
   attachRealizedPnl(book: RealizedPnlBook): void {
     this.#realizedPnl = book;
+  }
+
+  /**
+   * Attaches the source `transport` is read from (`THROUGHPUT-1a`).
+   *
+   * Called by the composition root that owns the event subscription
+   * (`main.ts` `startup`, once it has subscribed), as
+   * {@link attachRealizedPnl} is. A snapshot taken before this call reports
+   * the unattached section ({@link unattachedTransportHealth}).
+   */
+  attachTransport(source: TransportHealthSource): void {
+    this.#transport = source;
   }
 
   countRiskApproval(): void {
@@ -513,6 +612,22 @@ export class HealthState {
         action,
         (this.#recommendationsByAction.get(action) ?? 0) + 1,
       );
+    }
+  }
+
+  /**
+   * The attached source's section, or the unattached one. A source that
+   * throws reports as unattached rather than breaking the health surface: a
+   * health read must never fail because a metric could not be measured (the
+   * sampler is total; this is the belt).
+   */
+  #transportSection(lastEventAt: string | null): TransportHealth {
+    const source = this.#transport;
+    if (source === undefined) return unattachedTransportHealth(lastEventAt);
+    try {
+      return source.transportHealth(lastEventAt);
+    } catch {
+      return unattachedTransportHealth(lastEventAt);
     }
   }
 
@@ -561,6 +676,9 @@ export class HealthState {
         // `FOLD-1`: the same rule — carried when measured, never zeroed.
         ...(input.seams.folds === undefined ? {} : { folds: input.seams.folds }),
       }),
+      // `THROUGHPUT-1a`: `asOf` is the loop's instant, the `receivedAt` of the
+      // last event it processed — once it has processed one.
+      transport: this.#transportSection(this.#loop.eventsProcessed > 0 ? input.asOf : null),
       riskSeamCaveat: RISK_SEAM_CAVEAT,
       asOf: input.asOf,
     });

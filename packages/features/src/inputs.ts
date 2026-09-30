@@ -43,9 +43,18 @@ import type { DecimalString } from "@polymarket-bot/decimal";
 // private dialect. No domain zod schema runs here.
 import type { BookSide, IncidentSeverity } from "@polymarket-bot/domain";
 
-import type { ParsedBook } from "./book-serialization.js";
+import type { BookRead, ParsedBook } from "./book-serialization.js";
 import { readBookSerialization } from "./book-serialization.js";
-import { ownPlainCopy } from "./materialize.js";
+import { isAtMostOneCanonical, isPositiveCanonical } from "./canonical-order.js";
+import { deepFreezeOwn, isPreparedTree, ownPlainCopy } from "./materialize.js";
+import {
+  REFERENCE_SECTION_PATH,
+  preparedValidationOf,
+  recordPreparedValidation,
+  registerPlainSection,
+  type PreparedValidation,
+} from "./prepared-reference.js";
+import { ownDataDescriptor } from "./refusals.js";
 import { parseUtcTimestamp } from "./time.js";
 
 // ---------------------------------------------------------------------------
@@ -281,7 +290,10 @@ function requireTimestamp(ctx: Ctx, value: unknown, path: string): { readonly is
 }
 
 function requirePositiveDecimal(ctx: Ctx, value: unknown, path: string): DecimalString | undefined {
-  if (typeof value !== "string" || !isCanonicalDecimalString(value) || value.startsWith("-") || compareDecimal(value, "0") <= 0) {
+  // `THROUGHPUT-1a`: `!isPositiveCanonical(value)` is exactly
+  // `compareDecimal(value, "0") <= 0` once the value is known canonical and
+  // non-negative, which the two checks before it establish (`canonical-order.ts`).
+  if (typeof value !== "string" || !isCanonicalDecimalString(value) || value.startsWith("-") || !isPositiveCanonical(value)) {
     return ctx.fail(path, "must be a positive canonical decimal string (§7.3)");
   }
   return value;
@@ -297,7 +309,9 @@ function requireNonNegativeDecimal(ctx: Ctx, value: unknown, path: string): Deci
 function requirePrice(ctx: Ctx, value: unknown, path: string): DecimalString | undefined {
   const decimal = requireNonNegativeDecimal(ctx, value, path);
   if (decimal === undefined) return undefined;
-  if (compareDecimal(decimal, "1") > 0) {
+  // `THROUGHPUT-1a`: exactly `compareDecimal(decimal, "1") > 0` on the
+  // canonical, non-negative value the line above returned (`canonical-order.ts`).
+  if (!isAtMostOneCanonical(decimal)) {
     return ctx.fail(path, "an outcome-token price is a probability in [0, 1]");
   }
   return decimal;
@@ -579,6 +593,50 @@ function validateChainlink(ctx: Ctx, value: unknown, asOfEpochMs: number): Valid
 
 function validateReference(ctx: Ctx, value: unknown, asOfEpochMs: number): ValidatedReferenceInput | undefined {
   if (value === undefined) return {};
+  // `THROUGHPUT-1a` (PERFORMANCE ONLY): a prepared section's one validation,
+  // reused when this call's `asOf` passes its only `asOf`-dependent check
+  // (`prepared-reference.ts`); otherwise validated below, as always.
+  const reuse = preparedReferenceReuse(value);
+  if (reuse !== null && reuse.latestObservedAtEpochMs <= asOfEpochMs) return reuse.validated;
+  return validateReferenceSection(ctx, value, asOfEpochMs);
+}
+
+/**
+ * `THROUGHPUT-1a`: the recorded reuse for a prepared `reference` section,
+ * validated once on first sight — with a FRESH context and no `asOf` bound, so
+ * nothing about this call is touched — or `null` when the value is not a
+ * prepared section, carries a `chainlink` part, or is not valid on its own.
+ */
+function preparedReferenceReuse(value: unknown): PreparedValidation | null {
+  const recorded = preparedValidationOf(value);
+  if (recorded !== undefined) return recorded;
+  if (!isPreparedTree(value, REFERENCE_SECTION_PATH, 1)) return null;
+  let reuse: PreparedValidation | null = null;
+  if (isRecord(value) && value["chainlink"] === undefined) {
+    const probe = new Ctx();
+    const validated = validateReferenceSection(probe, value, Number.POSITIVE_INFINITY);
+    if (validated !== undefined && probe.problems.length === 0) {
+      let latest = Number.NEGATIVE_INFINITY;
+      for (const series of [validated.binance, validated.coinbase]) {
+        for (const point of series?.trades ?? []) {
+          if (point.observedAtEpochMs > latest) latest = point.observedAtEpochMs;
+        }
+      }
+      const plain = ownPlainCopy(validated) as ValidatedReferenceInput;
+      deepFreezeOwn(plain);
+      registerPlainSection(plain);
+      reuse = { validated, plain, latestObservedAtEpochMs: latest };
+      REUSE_BY_VALIDATED.set(validated, reuse);
+    }
+  }
+  recordPreparedValidation(value, reuse);
+  return reuse;
+}
+
+/** `THROUGHPUT-1a`: from a reused validation back to its record (for the model copy). */
+const REUSE_BY_VALIDATED = new WeakMap<object, PreparedValidation>();
+
+function validateReferenceSection(ctx: Ctx, value: unknown, asOfEpochMs: number): ValidatedReferenceInput | undefined {
   const record = requireRecord(ctx, value, "input.reference", ["binance", "coinbase", "chainlink"]);
   if (record === undefined) return undefined;
   const out: { binance?: ValidatedReferenceSeries; coinbase?: ValidatedReferenceSeries; chainlink?: ValidatedChainlinkInput } = {};
@@ -732,7 +790,7 @@ export function validateFeatureInput(tree: unknown): InputValidation {
   if (serializedBook === undefined || bookLastEventAt === undefined) {
     return { ok: false, kind: ctx.kind, problems: ctx.problems };
   }
-  const bookRead = readBookSerialization(serializedBook);
+  const bookRead = readBookSerializationMemo(serializedBook);
   if (!bookRead.ok) {
     const kind =
       bookRead.kind === "UNSUPPORTED_VERSION"
@@ -803,5 +861,57 @@ export function validateFeatureInput(tree: unknown): InputValidation {
     ...(lifecycle === undefined ? {} : { lifecycle }),
     quality,
   };
-  return { ok: true, input: ownPlainCopy(model) as ValidatedFeatureInput };
+  // `THROUGHPUT-1a` (PERFORMANCE ONLY): two parts of the model already have
+  // their prototype-free copies — the ones this line would make — from an
+  // earlier snapshot of the same data: the parsed book of an unchanged
+  // serialization, and a reused prepared reference section. The rest of the
+  // model is copied, and those copies are placed at their own keys
+  // (redefining an existing key keeps its position), so the result is the
+  // copy `ownPlainCopy(model)` makes.
+  const reused = REUSE_BY_VALIDATED.get(reference);
+  const parsedPlain = plainParsedBook(bookRead.book);
+  const copy = ownPlainCopy({
+    ...model,
+    book: { ...model.book, parsed: {} },
+    ...(reused === undefined ? {} : { reference: {} }),
+  }) as Record<string, unknown>;
+  Object.defineProperty(copy["book"] as object, "parsed", ownDataDescriptor(parsedPlain));
+  if (reused !== undefined) {
+    Object.defineProperty(copy, "reference", ownDataDescriptor(reused.plain));
+  }
+  return { ok: true, input: copy as unknown as ValidatedFeatureInput };
+}
+
+/**
+ * `THROUGHPUT-1a` (PERFORMANCE ONLY): `readBookSerialization` is a pure
+ * function of its text, and consecutive snapshots of one outcome's book read
+ * the same text until that book changes (the trader's other outcome, a
+ * reference trade, a snapshot of the other token). The last few answers are
+ * kept by text; a hit is the answer a re-read would give.
+ */
+const BOOK_READ_MEMO_LIMIT = 8;
+const bookReads = new Map<string, BookRead>();
+
+function readBookSerializationMemo(text: string): BookRead {
+  const cached = bookReads.get(text);
+  if (cached !== undefined) return cached;
+  const read = readBookSerialization(text);
+  bookReads.set(text, read);
+  if (bookReads.size > BOOK_READ_MEMO_LIMIT) {
+    const oldest = bookReads.keys().next();
+    if (oldest.done !== true) bookReads.delete(oldest.value);
+  }
+  return read;
+}
+
+/** `THROUGHPUT-1a`: `ownPlainCopy(parsed)`, once per parsed book (deep-frozen, never mutated). */
+const plainParsedBooks = new WeakMap<ParsedBook, unknown>();
+
+function plainParsedBook(parsed: ParsedBook): unknown {
+  const cached = plainParsedBooks.get(parsed);
+  if (cached !== undefined) return cached;
+  const plain = ownPlainCopy(parsed);
+  deepFreezeOwn(plain);
+  plainParsedBooks.set(parsed, plain);
+  return plain;
 }

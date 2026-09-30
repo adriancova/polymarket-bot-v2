@@ -106,6 +106,21 @@ export function traderHealthSamples(
     add("trader_queue_consumed_total", queue.consumed, queueLabel);
   }
 
+  // `THROUGHPUT-1a`: the input stream. `null` is ABSENT, not zero.
+  const transport = report.transport;
+  if (transport.entriesBehindHead !== null) {
+    add("trader_transport_lag_entries", transport.entriesBehindHead);
+  }
+  if (transport.retentionMaxEvents !== null) {
+    add("trader_transport_retention_max_events", transport.retentionMaxEvents);
+  }
+  if (transport.sampleAgeMs !== null) {
+    add("trader_transport_sample_age_seconds", transport.sampleAgeMs / 1000);
+  }
+  if (transport.eventTimeLagMs !== null) {
+    add("trader_event_time_lag_seconds", transport.eventTimeLagMs / 1000);
+  }
+
   const loop = report.loop;
   add("trader_events_accepted_total", loop.eventsAccepted);
   add("trader_events_processed_total", loop.eventsProcessed);

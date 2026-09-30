@@ -108,6 +108,9 @@ export {
   type RealizedPnlObservation,
   type RiskHealth,
   type SeamHealth,
+  type TransportHealth,
+  type TransportHealthSource,
+  unattachedTransportHealth,
 } from "./health.js";
 
 export {
@@ -139,6 +142,9 @@ export {
   type PortResult,
   type RecordedEventIdentity,
   type TraderStore,
+  type GroupCommit,
+  type StagedEvaluations,
+  type FeedMark,
 } from "./ports.js";
 
 export {

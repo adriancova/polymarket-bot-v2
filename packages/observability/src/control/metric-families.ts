@@ -195,6 +195,37 @@ export const PLATFORM_METRIC_FAMILIES: readonly PlatformMetricFamily[] = [
     "queue",
   ]),
 
+  // --- THROUGHPUT-1a: the input STREAM, not the ingest queue ------------------
+  // `trader_queue_consumer_lag` is the in-process ingest queue, which a pump
+  // that drains every batch keeps at 0 however far behind the stream the trader
+  // is (H1 run 1 read 0 while three minutes behind). These are the stream side,
+  // from the trader's `transport` section. Each is OMITTED (not zero) while the
+  // trader has no measurement: no sampler attached, no sample yet, no event yet.
+  family(
+    "trader_transport_lag_entries",
+    "gauge",
+    "queues",
+    "Events published to the trader's input stream and not yet delivered to it: the stream head minus this consumer's position, at the trader's latest transport sample. At trader_transport_retention_max_events, retention starts removing unread events and the trader halts TRANSPORT_RESYNC_REQUIRED (ADR-003 §3.3). Omitted (not zero) before the first sample.",
+  ),
+  family(
+    "trader_transport_retention_max_events",
+    "gauge",
+    "queues",
+    "The input stream's retention bound, in events: the ceiling trader_transport_lag_entries must stay under. Omitted before the first sample.",
+  ),
+  family(
+    "trader_transport_sample_age_seconds",
+    "gauge",
+    "queues",
+    "Seconds since the trader's latest transport sample, when the health report was built. The sampler reads every second; a growing age means the stream positions above are stale. Omitted before the first sample.",
+  ),
+  family(
+    "trader_event_time_lag_seconds",
+    "gauge",
+    "queues",
+    "Wall clock minus the recorded receivedAt of the last event the trader processed, in seconds, when the health report was built: how far behind the market the trader's decisions are. Omitted before the first event, or with no transport sampler attached.",
+  ),
+
   // --- the core loop --------------------------------------------------------
   family("trader_events_accepted_total", "counter", "loop", "Events the loop accepted."),
   family("trader_events_processed_total", "counter", "loop", "Events the loop processed."),

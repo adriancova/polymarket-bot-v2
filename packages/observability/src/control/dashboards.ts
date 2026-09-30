@@ -88,6 +88,9 @@ export const CONTROL_DASHBOARDS: readonly ControlDashboardSpec[] = Object.freeze
       "Strategy instances by run state",
       "Control-plane refusals",
       "Audit log",
+      // THROUGHPUT-1a: the input stream's lag, which the ingest-queue panels cannot show.
+      "Input stream lag (entries behind head)",
+      "Event-time lag",
     ]),
   }),
   Object.freeze({

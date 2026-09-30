@@ -47,6 +47,7 @@ import type { EventSubscription } from "@polymarket-bot/event-bus";
 import {
   portFailed,
   portOk,
+  type FeedMark,
   type IngestedEvent,
   type MarketEventFeed,
   type PortResult,
@@ -65,6 +66,8 @@ export class RedisMarketEventFeed implements MarketEventFeed {
   #ordinal = 0;
   /** The checkpoint of the last event delivered, committed after the drain. */
   #pendingCheckpoint: Parameters<EventSubscription["checkpoint"]>[0] | undefined;
+  /** `THROUGHPUT-1a`: the checkpoint each handed-out {@link FeedMark} names. */
+  readonly #marks = new WeakMap<FeedMark, Parameters<EventSubscription["checkpoint"]>[0]>();
 
   constructor(options: RedisMarketEventFeedOptions) {
     this.#subscription = options.subscription;
@@ -111,8 +114,28 @@ export class RedisMarketEventFeed implements MarketEventFeed {
     return portOk(Object.freeze(events));
   }
 
-  async commit(): Promise<PortResult<null>> {
+  /**
+   * `THROUGHPUT-1a`: a mark of the position delivered so far — the last
+   * delivered event's checkpoint — for a later `commit(mark)`.
+   */
+  mark(): FeedMark | undefined {
     const checkpoint = this.#pendingCheckpoint;
+    if (checkpoint === undefined) return undefined;
+    const mark: FeedMark = { feedMark: true };
+    Object.freeze(mark);
+    this.#marks.set(mark, checkpoint);
+    return mark;
+  }
+
+  async commit(upTo?: FeedMark): Promise<PortResult<null>> {
+    const checkpoint = upTo === undefined ? this.#pendingCheckpoint : this.#marks.get(upTo);
+    if (upTo !== undefined && checkpoint === undefined) {
+      return portFailed(
+        "UNREADABLE",
+        "the position to record is not one this feed marked; a consumer that recorded a position it " +
+          "cannot name would resume from an unknown one (ADR-003 §3.4)",
+      );
+    }
     if (checkpoint === undefined) return portOk(null);
     try {
       await this.#subscription.checkpoint(checkpoint);
@@ -123,7 +146,7 @@ export class RedisMarketEventFeed implements MarketEventFeed {
           "cannot record its position would resume from an unknown one (ADR-003 §3.4)",
       );
     }
-    this.#pendingCheckpoint = undefined;
+    if (checkpoint === this.#pendingCheckpoint) this.#pendingCheckpoint = undefined;
     return portOk(null);
   }
 

@@ -81,6 +81,8 @@ export {
 } from "./inputs.js";
 export type { MaterializeProblem, MaterializedInput } from "./materialize.js";
 export { MAX_INPUT_DEPTH, materializeInput } from "./materialize.js";
+// `THROUGHPUT-1a`: an additive, performance-only entry (see the module).
+export { prepareReferenceInput } from "./prepared-reference.js";
 export type { FeatureCategory, FeatureDefinition } from "./registry.js";
 export {
   FEATURES_V1,

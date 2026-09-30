@@ -31,6 +31,8 @@
  * NO CLOCK. Instants arrive as arguments, already strict UTC.
  */
 
+import { prepareReferenceInput } from "@polymarket-bot/features";
+
 export type ReferenceVenueName = "binance" | "coinbase";
 
 export interface ReferencePoint {
@@ -50,6 +52,17 @@ export class ReferenceState {
   readonly #series = new Map<ReferenceVenueName, VenueSeries>();
   readonly #windowMs: number;
   readonly #maximumPoints: number;
+  /**
+   * `THROUGHPUT-1a` (PERFORMANCE ONLY): the last {@link featureInput} answer
+   * until the next {@link observe} changes the series. Every evaluation asks
+   * for it and only a reference trade changes it (H1's burst: ~28 a second
+   * against ~660 evaluations). It is the section as `packages/features`'
+   * `prepareReferenceInput` returns it — that package's own frozen copy, which
+   * its snapshot computation recognizes and reads, validates, copies and
+   * serializes ONCE instead of on every evaluation. The snapshot is the one
+   * the raw section produces, byte for byte.
+   */
+  #featureInput: unknown;
 
   constructor(options: { readonly windowMs: number; readonly maximumPoints: number }) {
     this.#windowMs = options.windowMs;
@@ -84,6 +97,7 @@ export class ReferenceState {
       series.points = series.points.slice(series.points.length - this.#maximumPoints);
     }
     this.#series.set(input.venue, series);
+    this.#featureInput = undefined;
   }
 
   /**
@@ -105,8 +119,17 @@ export class ReferenceState {
     return newest === undefined ? undefined : Math.max(0, nowEpochMs - newest);
   }
 
-  /** The `reference` section of a `packages/features` computation input. */
-  featureInput(): Record<string, unknown> {
+  /**
+   * The `reference` section of a `packages/features` computation input.
+   *
+   * `THROUGHPUT-1a`: prepared by `packages/features`, and the SAME object
+   * until the next `observe` (see `#featureInput`). The content is exactly
+   * what it always was: one entry per venue with points, each `{symbol,
+   * lastEventAt, trades: [{price, observedAt}]}`, venues in first-observation
+   * order.
+   */
+  featureInput(): unknown {
+    if (this.#featureInput !== undefined) return this.#featureInput;
     const input: Record<string, unknown> = {};
     for (const [venue, series] of this.#series) {
       if (series.points.length === 0) continue;
@@ -119,6 +142,7 @@ export class ReferenceState {
         })),
       };
     }
-    return input;
+    this.#featureInput = prepareReferenceInput(input);
+    return this.#featureInput;
   }
 }

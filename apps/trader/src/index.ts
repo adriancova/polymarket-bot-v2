@@ -117,6 +117,9 @@ export {
   type RealizedPnlObservation,
   type RiskHealth,
   type SeamHealth,
+  type TransportHealth,
+  type TransportHealthSource,
+  unattachedTransportHealth,
 } from "@polymarket-bot/trading-core";
 
 export {
@@ -166,6 +169,9 @@ export {
   type PortResult,
   type RecordedEventIdentity,
   type TraderStore,
+  type FeedMark,
+  type GroupCommit,
+  type StagedEvaluations,
 } from "@polymarket-bot/trading-core";
 
 export {
@@ -280,6 +286,15 @@ export {
 } from "@polymarket-bot/trading-core";
 
 export { pump, type PumpOptions, type PumpResult } from "./pump.js";
+export {
+  TRANSPORT_SAMPLE_INTERVAL_MS,
+  TRANSPORT_SAMPLE_INTERVAL_RANGE,
+  TransportLagSampler,
+  sampleFromMetrics,
+  transportHealthOf,
+  type TransportLagSamplerOptions,
+  type TransportMetricsReader,
+} from "./transport-lag.js";
 
 export {
   ReferenceState,

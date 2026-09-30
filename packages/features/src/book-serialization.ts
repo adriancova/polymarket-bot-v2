@@ -32,6 +32,12 @@ import {
 } from "@polymarket-bot/decimal";
 import type { DecimalString } from "@polymarket-bot/decimal";
 
+import {
+  compareCanonicalUnitInterval,
+  isAtMostOneCanonical,
+  isPositiveCanonical,
+} from "./canonical-order.js";
+
 /** The version line this reader accepts. Kept as data; pinned by cross-test. */
 export const SUPPORTED_BOOK_SERIALIZATION_VERSION = "polymarket-bot/order-book/v1";
 
@@ -78,16 +84,21 @@ function inconsistent(problem: string): BookRead {
 
 /** A price is a probability: canonical, in `[0, 1]`. */
 function isPrice(value: string): value is DecimalString {
+  // `THROUGHPUT-1a`: the range check is `canonical-order.ts`'s exact string
+  // answer to `compareDecimal(value, "1") <= 0`, valid once the value is
+  // known canonical and non-negative (checked first).
   return (
     isCanonicalDecimalString(value) &&
     !value.startsWith("-") &&
-    compareDecimal(value, "1") <= 0
+    isAtMostOneCanonical(value)
   );
 }
 
 /** A resting size is canonical and strictly positive (the book never stores zero). */
 function isPositiveSize(value: string): value is DecimalString {
-  return isCanonicalDecimalString(value) && !value.startsWith("-") && compareDecimal(value, "0") > 0;
+  // `THROUGHPUT-1a`: exactly `compareDecimal(value, "0") > 0` on a canonical,
+  // non-negative value (`canonical-order.ts`).
+  return isCanonicalDecimalString(value) && !value.startsWith("-") && isPositiveCanonical(value);
 }
 
 interface LadderRead {
@@ -121,7 +132,9 @@ function readLadder(
     }
     const last = levels[levels.length - 1];
     if (last !== undefined) {
-      const order = compareDecimal(price, last.price);
+      // `THROUGHPUT-1a`: both are validated prices (canonical, in [0, 1]), so
+      // their code-unit order IS `compareDecimal`'s (`canonical-order.ts`).
+      const order = compareCanonicalUnitInterval(price, last.price);
       if (order === 0) {
         return { ok: false, levels, problem: `${side}[${String(index)}]: duplicate price ${price}` };
       }

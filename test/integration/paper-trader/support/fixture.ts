@@ -43,6 +43,7 @@ import {
   type CreateTraderResult,
   type IngestedEvent,
   type PaperTrader,
+  type TraderStore,
 } from "@polymarket-bot/trader";
 import { ManualClock, MemoryEventFeed, MemoryTraderStore } from "@polymarket-bot/trader/testing";
 
@@ -638,6 +639,12 @@ export function assemble(
      * refusal produced by the real venue, not a doubled one.
      */
     readonly rateLimits?: RateLimitBudget;
+    /**
+     * `THROUGHPUT-1a`: the store the TRADER is handed, built around the
+     * fixture's in-memory store (`parts.store` stays that inner store). Absent:
+     * the in-memory store itself, as before.
+     */
+    readonly wrapStore?: (store: MemoryTraderStore) => TraderStore;
   } = {},
 ): { readonly result: CreateTraderResult; readonly parts: Assembled | undefined } {
   const clock = new ManualClock("2026-03-04T12:00:00.000Z");
@@ -672,7 +679,7 @@ export function assemble(
     config: document,
     clock,
     venue: venue as unknown as Parameters<typeof createPaperTrader>[0]["venue"],
-    store,
+    store: options.wrapStore === undefined ? store : options.wrapStore(store),
     idNamespace: options.idNamespace ?? "wp-230-fixture",
     // `FOLD-1` (orchestrator call O1): the held ledger view and PnL streams
     // are checked against their rebuilds from zero after EVERY fill.

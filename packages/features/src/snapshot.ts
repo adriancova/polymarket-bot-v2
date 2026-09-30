@@ -50,9 +50,10 @@ import { computeLifecycleFeatures } from "./compute/lifecycle.js";
 import { computePolymarketFeatures } from "./compute/polymarket.js";
 import { computeReferenceFeatures } from "./compute/reference.js";
 import { computeQualityFeatures } from "./compute/quality.js";
-import type { ValidatedFeatureInput } from "./inputs.js";
+import type { ValidatedFeatureInput, ValidatedReferenceInput } from "./inputs.js";
 import { validateFeatureInput } from "./inputs.js";
 import { materializeInput } from "./materialize.js";
+import { referenceDigestMember } from "./prepared-reference.js";
 import type { FeatureCategory } from "./registry.js";
 import { FEATURES_V1, FEATURE_SET_VERSION } from "./registry.js";
 import type { FeatureRefusalResult } from "./refusals.js";
@@ -315,7 +316,9 @@ function buildInputsSection(input: ValidatedFeatureInput): FeatureSnapshotInputs
               })),
             },
           }),
-      reference: serializeReferenceForDigest(input),
+      // `THROUGHPUT-1a`: a prepared section's member is serialized once and
+      // reused (`prepared-reference.ts`); the bytes are the same.
+      reference: referenceDigestMember(input.reference, referenceDigestShape),
       ...(input.lifecycle === undefined
         ? {}
         : {
@@ -350,10 +353,10 @@ function buildInputsSection(input: ValidatedFeatureInput): FeatureSnapshotInputs
   };
 }
 
-function serializeReferenceForDigest(input: ValidatedFeatureInput): Record<string, unknown> {
+function referenceDigestShape(reference: ValidatedReferenceInput): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const venue of ["binance", "coinbase"] as const) {
-    const series = input.reference[venue];
+    const series = reference[venue];
     if (series === undefined) continue;
     out[venue] = {
       symbol: series.symbol,
@@ -371,10 +374,10 @@ function serializeReferenceForDigest(input: ValidatedFeatureInput): Record<strin
           }),
     };
   }
-  if (input.reference.chainlink !== undefined) {
+  if (reference.chainlink !== undefined) {
     out["chainlink"] = {
-      lastEventAt: input.reference.chainlink.lastEventAt,
-      twaps: input.reference.chainlink.twaps.map((twap) => ({
+      lastEventAt: reference.chainlink.lastEventAt,
+      twaps: reference.chainlink.twaps.map((twap) => ({
         feedId: twap.feedId,
         value: twap.value,
         windowSeconds: twap.windowSeconds,

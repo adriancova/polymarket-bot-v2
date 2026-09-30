@@ -162,6 +162,29 @@ export interface TraderSeamHealthInput {
 }
 
 /**
+ * `THROUGHPUT-1a`: mirrors `packages/trading-core/src/health.ts`
+ * `TransportHealth` — the input STREAM's lag as the trader samples it. Every
+ * measured field is `null` while the trader has no measurement (no sampler
+ * attached, no sample yet, no event yet), and `samples.ts` then OMITS its
+ * sample rather than render a zero nobody measured.
+ */
+export interface TraderTransportHealthInput {
+  readonly attached: boolean;
+  readonly sampleIntervalMs: number | null;
+  readonly samples: number;
+  readonly sampleFailures: number;
+  readonly sampledAt: string | null;
+  readonly sampleAgeMs: number | null;
+  readonly headPosition: number | null;
+  readonly consumerPosition: number | null;
+  readonly committedPosition: number | null;
+  readonly entriesBehindHead: number | null;
+  readonly retentionMaxEvents: number | null;
+  readonly lastEventAt: string | null;
+  readonly eventTimeLagMs: number | null;
+}
+
+/**
  * A trader health report — the whole surface `WP-230` shipped.
  *
  * Structurally assignable from `apps/trader`'s `HealthSnapshot`. The
@@ -181,6 +204,8 @@ export interface TraderHealthReportInput {
   readonly execution: TraderExecutionHealthInput;
   readonly accounting: TraderAccountingHealthInput;
   readonly seams: TraderSeamHealthInput;
+  /** `THROUGHPUT-1a`: the input stream's lag. */
+  readonly transport: TraderTransportHealthInput;
   readonly riskSeamCaveat: string;
   readonly asOf: string;
 }

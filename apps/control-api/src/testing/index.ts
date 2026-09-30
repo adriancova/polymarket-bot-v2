@@ -232,6 +232,24 @@ export function healthDocument(
         pnlRefusals: {},
       },
     },
+    // `THROUGHPUT-1a`: the input stream's lag, as a trader with a sampler
+    // attached reports it — 250 events behind the head, 1.5 s behind the
+    // market.
+    transport: {
+      attached: true,
+      sampleIntervalMs: 1000,
+      samples: 42,
+      sampleFailures: 0,
+      sampledAt: "2026-09-05T00:00:11.400Z",
+      sampleAgeMs: 600,
+      headPosition: 5250,
+      consumerPosition: 5000,
+      committedPosition: 4990,
+      entriesBehindHead: 250,
+      retentionMaxEvents: 100_000,
+      lastEventAt: "2026-09-05T00:00:10.500Z",
+      eventTimeLagMs: 1500,
+    },
     riskSeamCaveat: "WP-220 accepted residual: protective exits are classified ENTRY.",
     asOf: "2026-09-05T00:00:10.000Z",
   };

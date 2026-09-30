@@ -143,7 +143,7 @@ import {
   OrderTimeInForceBook,
 } from "./pipeline.js";
 import { pnlSnapshotKey } from "./pnl-snapshot-key.js";
-import type { Clock, IngestedEvent, TraderStore } from "./ports.js";
+import type { Clock, GroupCommit, IngestedEvent, TraderStore } from "./ports.js";
 import type { DecisionRecord, DecisionTelemetry } from "@polymarket-bot/strategy-runtime";
 import type { StrategyStateCheckpoint } from "@polymarket-bot/strategy-runtime";
 import { buildStrategyFeatureView, projectFeatureValues } from "./projection.js";
@@ -474,6 +474,52 @@ export class DecisionOutboxBuffer {
   }
 }
 
+/**
+ * `THROUGHPUT-1a` — the group-commit bounds (see `CoreLoop` `#flushOutbox`).
+ *
+ * With a store that offers group commit, the decisions and checkpoints of
+ * consecutive events are STAGED and committed together, one transaction per
+ * batch, in ONE serialized chain (so the durable rows are always a prefix of
+ * the run's). A commit is REQUESTED as soon as ANY of these holds:
+ *
+ * - COUNT: {@link GROUP_COMMIT_EARLY_START_EVENTS} events are staged;
+ * - TIME: the oldest staged event was staged {@link GROUP_COMMIT_MAX_AGE_MS}
+ *   ago or more (the loop's monotonic clock, checked at every event
+ *   boundary);
+ * - the drain ends.
+ *
+ * A requested commit starts when the one before it has settled, and takes
+ * every row staged by then.
+ *
+ * The HARD bound: at most {@link GROUP_COMMIT_MAX_EVENTS} events are ever
+ * staged. At that count the loop WAITS until everything staged is durable
+ * before it evaluates another event — so a slow database slows the loop
+ * instead of letting undurable decisions pile up. At any instant at most
+ * `2 × GROUP_COMMIT_MAX_EVENTS` events have decisions that are not yet
+ * durable (one committing batch, one staged).
+ *
+ * And the loop WAITS until everything staged is durable:
+ *
+ * - at the end of a drain, unless the caller asked otherwise (the pump's
+ *   pipelined path, which instead waits on `durabilityMark()` before it
+ *   records the batch's stream position — so a quiet stream, whose every idle
+ *   poll drains durably, commits at once);
+ * - before another durable write (a fill's ledger postings and PnL snapshot)
+ *   and before an intent is routed toward the venue — so nothing that depends
+ *   on an earlier decision is written or submitted while that decision is not
+ *   yet durable;
+ * - at the hard bound above.
+ */
+export const GROUP_COMMIT_MAX_EVENTS = 128;
+export const GROUP_COMMIT_MAX_AGE_MS = 50;
+/**
+ * Once this many events are staged, a commit is REQUESTED without waiting for
+ * it, and evaluation continues while the database works. Commits never overlap
+ * one another (they form one chain), so batches become durable one at a time,
+ * in stage order.
+ */
+export const GROUP_COMMIT_EARLY_START_EVENTS = 32;
+
 /** One recorded step, kept so a run's chain can be compared byte for byte. */
 export interface DecisionTrace {
   readonly instanceId: string;
@@ -648,6 +694,14 @@ export class CoreLoop {
   readonly #writtenSnapshotKeys = new Set<string>();
   /** Epoch-millisecond instants of this process's own submissions (§9.8 check 19). */
   #submissionInstants: number[] = [];
+  /** `THROUGHPUT-1a`: when the oldest staged, uncommitted event was staged (monotonic ns). */
+  #stagedSinceNs: bigint | undefined;
+  /** `THROUGHPUT-1a`: the serialized chain of group commits (see `#requestCommit`). */
+  #commitChain: Promise<void> = Promise.resolve();
+  /** `THROUGHPUT-1a`: a commit is requested and has not started yet. */
+  #commitRequested = false;
+  /** `THROUGHPUT-1a`: a group commit failed; nothing is committed after it. */
+  #groupCommitFailed = false;
 
   constructor(options: CoreLoopOptions) {
     this.#options = options;
@@ -896,13 +950,33 @@ export class CoreLoop {
     return true;
   }
 
-  /** Processes every queued event, in delivery order. Never sorts (§8.4). */
-  async drain(): Promise<void> {
+  /**
+   * Processes every queued event, in delivery order. Never sorts (§8.4).
+   *
+   * `THROUGHPUT-1a`: with a group-committing store, everything staged is
+   * committed before this returns — so when the pump records the stream
+   * position after a drain, every decision of the events before it is durable
+   * (or a GLOBAL `STORE_UNAVAILABLE` halt is latched, and the pump records
+   * nothing).
+   */
+  async drain(options: { readonly awaitDurable?: boolean } = {}): Promise<void> {
     for (;;) {
       const event = this.#queue.take();
-      if (event === undefined) return;
+      if (event === undefined) break;
       await this.#processEvent(event);
     }
+    // Only a group-committing store has anything staged; every other store's
+    // drain returns exactly as it always did. `awaitDurable: false` (the
+    // pump's pipelined path) requests the commit and returns at once; the
+    // caller then waits on `durabilityMark()` before recording anything that
+    // depends on the rows.
+    const group = this.#options.store.groupCommit;
+    if (group === undefined) return;
+    if (options.awaitDurable === false) {
+      if (group.stagedEvents > 0) this.#requestCommit(group);
+      return;
+    }
+    await this.#commitStaged();
   }
 
   async #processEvent(event: IngestedEvent): Promise<void> {
@@ -1606,6 +1680,12 @@ export class CoreLoop {
       this.#options.health.countExecution("observeOnlyIntents");
       return;
     }
+    // `THROUGHPUT-1a`: every earlier decision is durable before an intent is
+    // routed toward the venue — as it was when each was written at its own
+    // event. A failed commit halts, and the risk check below then refuses
+    // (`runStatePermitsIntent`). A store without group commit has nothing
+    // staged, and this path is unchanged for it.
+    if (this.#options.store.groupCommit !== undefined) await this.#commitStaged();
     const approvedIntentId = this.#options.ids.next();
     const marketConfig = input.market.config;
     const projection = this.#held.view;
@@ -2327,6 +2407,10 @@ export class CoreLoop {
       return;
     }
     const fills = page.value.fills;
+    // `THROUGHPUT-1a`: every earlier decision is durable before this harvest
+    // writes a ledger posting or a PnL snapshot — the commit order the per-row
+    // path always had.
+    if (fills.length > 0 && this.#options.store.groupCommit !== undefined) await this.#commitStaged();
     const booked: { instance: RegisteredInstance; fill: SimulatedFill }[] = [];
     for (const fill of fills) {
       this.#options.health.countExecution("fillsObserved");
@@ -3188,6 +3272,13 @@ export class CoreLoop {
    * is exactly what `packages/strategy-runtime` says on its own halt path.
    */
   async #flushOutbox(): Promise<void> {
+    const group = this.#options.store.groupCommit;
+    if (group !== undefined) {
+      this.#stageOutbox(group);
+      // The hard bound (see GROUP_COMMIT_MAX_EVENTS): never more staged.
+      if (group.stagedEvents >= GROUP_COMMIT_MAX_EVENTS) await this.#commitStaged();
+      return;
+    }
     const drained = this.#options.outbox.drain();
     for (const entry of drained.decisions) {
       const written = await this.#options.store.persistDecision(entry.record, entry.telemetry);
@@ -3215,6 +3306,129 @@ export class CoreLoop {
         );
         return;
       }
+    }
+  }
+
+  /**
+   * `THROUGHPUT-1a` — the group-commit form of {@link #flushOutbox}: the
+   * event's decisions and checkpoints are STAGED (no I/O), and a commit is
+   * REQUESTED once a bound is reached (see {@link GROUP_COMMIT_MAX_EVENTS}).
+   * A row the store cannot even stage (an unencodable document) halts HERE,
+   * at this event.
+   */
+  #stageOutbox(group: GroupCommit): void {
+    const drained = this.#options.outbox.drain();
+    if (drained.decisions.length === 0 && drained.checkpoints.length === 0) return;
+    const staged = group.stage({
+      decisions: drained.decisions,
+      checkpoints: drained.checkpoints.map((checkpoint) => ({ checkpoint, capturedAt: this.#lastInstant })),
+    });
+    if (!staged.ok) {
+      this.#options.halts.halt(
+        { kind: "GLOBAL" },
+        "STORE_UNAVAILABLE",
+        `a decision record or strategy checkpoint could not be staged for the durable store ` +
+          `(${staged.failure.kind}): ${staged.failure.detail}; §6 invariant 3 requires exactly one ` +
+          "PERSISTED decision per callback, so the process makes no further trading decision",
+        this.#lastInstant,
+      );
+      return;
+    }
+    const now = this.#options.clock.monotonicNs();
+    if (this.#stagedSinceNs === undefined) this.#stagedSinceNs = now;
+    if (
+      group.stagedEvents >= GROUP_COMMIT_EARLY_START_EVENTS ||
+      now - this.#stagedSinceNs >= BigInt(GROUP_COMMIT_MAX_AGE_MS) * 1_000_000n
+    ) {
+      this.#requestCommit(group);
+    }
+  }
+
+  /**
+   * `THROUGHPUT-1a` — requests a commit of everything staged, WITHOUT waiting
+   * for it. Commits form ONE chain: each runs only after the previous one
+   * settled, and takes every row staged by the time it starts — so batches
+   * become durable one at a time, in stage order, and the durable rows are
+   * always a prefix. At most one request is outstanding (not yet started): a
+   * second request before the first starts adds nothing, since the first
+   * will take the rows the second would have.
+   */
+  #requestCommit(group: GroupCommit): void {
+    if (this.#commitRequested || this.#groupCommitFailed) return;
+    this.#commitRequested = true;
+    this.#commitChain = this.#commitChain.then(async () => {
+      this.#commitRequested = false;
+      await this.#runCommit(group);
+    });
+  }
+
+  /**
+   * `THROUGHPUT-1a` — every decision staged so far is durable once this
+   * resolves `true`; `false` means a commit failed (and its GLOBAL
+   * `STORE_UNAVAILABLE` halt is latched). A loop whose store does not
+   * group-commit wrote every row at its event, and answers `true` at once.
+   *
+   * The pump records the stream position of a batch only after this mark,
+   * taken at the batch's end, resolved `true` (`apps/trader/src/pump.ts`).
+   */
+  durabilityMark(): Promise<boolean> {
+    const group = this.#options.store.groupCommit;
+    if (group === undefined) return Promise.resolve(!this.#groupCommitFailed);
+    if (group.stagedEvents > 0) this.#requestCommit(group);
+    return this.#commitChain.then(() => !this.#groupCommitFailed);
+  }
+
+  /** `THROUGHPUT-1a`: does this loop's store group-commit (see {@link durabilityMark})? */
+  get groupCommits(): boolean {
+    return this.#options.store.groupCommit !== undefined;
+  }
+
+  /**
+   * `THROUGHPUT-1a` — makes EVERY staged decision durable and returns once it
+   * is (or a halt is latched). Used before any other durable write and before
+   * an intent is routed, and at the end of a durable drain. Free when the
+   * store does not group-commit.
+   */
+  async #commitStaged(): Promise<void> {
+    if (this.#options.store.groupCommit === undefined) return;
+    await this.durabilityMark();
+  }
+
+  /**
+   * One commit of everything staged NOW (the store takes the staged rows when
+   * `commit` is called; later stages form the next batch). A failure is
+   * §4.2's PostgreSQL boundary, exactly as a failed per-row write is: a GLOBAL
+   * `STORE_UNAVAILABLE` halt and no retry — and no later commit either, so no
+   * decision becomes durable after the failure the halt reports.
+   */
+  async #runCommit(group: GroupCommit): Promise<void> {
+    if (this.#groupCommitFailed || group.stagedEvents === 0) return;
+    this.#stagedSinceNs = undefined;
+    let committed: Awaited<ReturnType<GroupCommit["commit"]>>;
+    try {
+      committed = await group.commit();
+    } catch (cause) {
+      // A store answers failures as data; one that throws is contained here
+      // all the same, because this chain may be awaited only later and a
+      // rejection nobody is waiting on yet must not escape the process.
+      committed = {
+        ok: false,
+        failure: {
+          kind: "UNAVAILABLE",
+          detail: `the group commit threw: ${cause instanceof Error ? cause.message : String(cause)}`,
+        },
+      };
+    }
+    if (!committed.ok) {
+      this.#groupCommitFailed = true;
+      this.#options.halts.halt(
+        { kind: "GLOBAL" },
+        "STORE_UNAVAILABLE",
+        `a group commit of decision records and strategy checkpoints could not be persisted ` +
+          `(${committed.failure.kind}): ${committed.failure.detail}; §6 invariant 3 requires exactly ` +
+          "one PERSISTED decision per callback, so the process makes no further trading decision",
+        this.#lastInstant,
+      );
     }
   }
 
