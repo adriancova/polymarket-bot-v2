@@ -393,7 +393,7 @@ BRIEF_MUTATIONS = [
      lambda t: t.replace("Each bullet states them as the row does. Where a bullet names no owner, the owner is in the handoff linked from the package's row under Work packages.",
                          "Each bullet states them as the row does, with the owner the row or its handoff names.", 1), "K26:"),
     ("the ALLOC-1 bullet writes bare N1/N2 again (R5-03)", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("ALLOC-1's review N1/N2 comment staleness", "N1/N2 comment staleness", 1), "K24:"),
+     lambda t: t.replace("ALLOC-1's review N1/N2 report", "N1/N2 report", 1), "K24:"),
     ("the WP-210 bullet's verbless fragment again (R5-04)", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("The migration owner owns the segmentFileSha256 + compacted-object registration.",
                          "The migration owner owns the segmentFileSha256 + compacted-object registration."
@@ -419,8 +419,31 @@ BRIEF_MUTATIONS = [
     ("the TRDR-2 bullet carries the main.ts:292 cast again", "IMPLEMENTATION_STATUS.md",
      lambda t: t.replace("- `TRDR-2`: DB domain", "- `TRDR-2`: `main.ts:292`'s cast; DB domain", 1), "K31:"),
     ("the WP-240 bullet without the two other pending panels (I6)", "IMPLEMENTATION_STATUS.md",
-     lambda t: t.replace("Two more fidelity panels stay pending, each with a named owner, machine-checked against `PENDING_PRODUCER_PANELS`:"
+     lambda t: t.replace("Two fidelity panels stay pending, each with a named owner, machine-checked against `PENDING_PRODUCER_PANELS`:"
                          " predicted-vs-actual (WP-290/phase-4) and markout (a future simulation/research grant). ", "", 1), "K32:"),
+    # r7
+    ("the FOLD-PNL2TOKEN cite back at loop.ts about :2607-2612 (D3)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("(`packages/trading-core/src/loop.ts:2958-2962`, in `#stagePnlSnapshot`)", "(`loop.ts` about :2607-2612)", 1), "K33:"),
+    ("the N2 cite back at book.ts:191 and :265 (D3)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("`book.ts:284` and `:361`", "`book.ts:191` and `:265`", 1), "K33:"),
+    ("an unregistered file:line citation (D3)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("the next `apps/data-gateway` round |", "the next `apps/data-gateway` round (`feed.ts:12`) |", 1), "K33:"),
+    ("the RISK2-R1 row carried as open again (D3, closed by BOOT-1)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("| `BOOT1-R6` |", "| `RISK2-R1` | `packages/trading-core/src/pipeline.ts:100-104`'s premise is superseded. | the next round |\n| `BOOT1-R6` |", 1), "K31:"),
+    ("the TRDR2-R8 row carried as open again (closed by BOOT-1)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("| `BOOT1-R6` |", "| `TRDR2-R8` | A parenthesized type alias evades the census. | the next round touching `test/unit/trader/**` |\n| `BOOT1-R6` |", 1), "K31:"),
+    ("TRDR4-CITES says the claim still holds again", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("(documentation only) |", "The claim itself still holds. (documentation only) |", 1), "K31:"),
+    ("the brief without the WP-080 UNVERIFIED register bullet (D1)", "IMPLEMENTATION_STATUS.md",
+     drop_line(r"^- `WP-080`: the Binance UNVERIFIED register"), "K34:"),
+    ("the ALLOC-1 bullet's r6 clause chain (D2)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("Its N3 reports unparsed `withLiveOwner` surfaces, which have zero non-test callers.",
+                         "Its N3 reports these; its N3, unparsed withLiveOwner surfaces (zero non-test callers).", 1), "K30:"),
+    ("the WP-240 bullet's 'Two more fidelity panels' (D5)", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("Two fidelity panels stay pending", "Two more fidelity panels stay pending", 1), "K30:"),
+    ("the archive README's r6 K31 overclaim (D4)", f"{ARCH}/README.md",
+     lambda t: t.replace("  - K31 is a set of regression checks for 16 specific closures that review found.",
+                         "  - It also refuses an item the brief carries as owed when a record, contract or code comment at the cut already closed it (K31).", 1), "K35:"),
     ("the archive README's proof bullet as one dense line again (I5)", f"{ARCH}/README.md",
      lambda t: t.replace(" runs three proofs:\n  - A:", " runs three proofs: A:", 1).replace("exactly.\n  - B:", "exactly. B:", 1)
      .replace("multiplicity.\n  - C:", "multiplicity. C:", 1).replace("complete.\n  - C also", "complete. C also", 1)

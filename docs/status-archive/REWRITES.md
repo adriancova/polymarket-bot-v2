@@ -111,7 +111,7 @@ A row that is closed in part and still carries such a marker can pass this test 
 73-73 complete-row `SER-2` — carried RW-123
 74-74 complete-row `SER-3` — carried RW-124; closed-by `GOV-2C` (N4)
 75-75 complete-row `GOV-2B`
-76-76 complete-row `TRDR-2` — carried RW-125; queued `TRDR2-R8`; closed-by `BOOT-1` (B9, and the main.ts:292 cast), `CI-1` (N5)
+76-76 complete-row `TRDR-2` — carried RW-125; closed-by `BOOT-1` (B9, the main.ts:292 cast, and TRDR2-R8), `CI-1` (N5)
 77-77 complete-row `RISK-2` — queued `RISK-2 item 7`; closed-by `BRACKET-1a` (residual 5)
 78-78 complete-row `GATE-1` — carried RW-126; queued `GATE1-M1`, `GATE1-R3`; closed-by `CI-1` (GATE1-R4, the fail-fast chain)
 79-79 complete-row `BOOT-1` — queued `B9`, `BOOT1 unchecked shared facts`, `BOOT1 pool leak`, `BOOT1-R6`, `BOOT1-R11`; listed `BOOT1-R7`; closed-by `REGISTER-1` (the registration CLI)
@@ -191,7 +191,8 @@ A row that is closed in part and still carries such a marker can pass this test 
 1236-1245 record-item — none: the phase-start re-check was executed, and the next one ran on 2026-09-02
 1246-1247 history completion-records-wave-1.md
 1248-1257 record-item — closed-by `WP-070` (its packet carried these obligations)
-1259-1362 history wave-1-batch-1b-in-flight.md
+1259-1354 history wave-1-batch-1b-in-flight.md
+1355-1362 record-item — carried RW-142
 1363-1379 record-item — closed-by `GOV-1B` (the takerSide ruling, ADR-014)
 1380-1403 record-item — closed-by `WP-120` (its identity obligation)
 1404-1421 record-item — closed-by `WP-120` (the unique-id and registration contract)
@@ -1110,7 +1111,7 @@ Old, lines 2528-2528:
 New:
 
 ~~~new
-| `FOLD-PNL2TOKEN` | A silent PnL gap: when an instance holds both tokens of a market, only the filled token is marked (`loop.ts` about :2607-2612). | a PnL correctness round (unreachable with a single-token Static Bracket) |
+| `FOLD-PNL2TOKEN` | A silent PnL gap: when an instance holds both tokens of a market, only the filled token is marked (`packages/trading-core/src/loop.ts:2958-2962`, in `#stagePnlSnapshot`). | a PnL correctness round (unreachable with a single-token Static Bracket) |
 ~~~
 
 Keep (in both texts):
@@ -1120,7 +1121,7 @@ only the filled token is marked
 unreachable with a single-token Static Bracket
 ~~~
 
-**Facts.** Kept verbatim in substance, including the approximate `loop.ts` cite and the single-token unreachability in the owner cell. Archive only: the evidence cite (FOLD-1 scoping).
+**Facts.** Kept verbatim in substance, with the single-token unreachability in the owner cell. r7 corrects the approximate cite `loop.ts` about :2607-2612 (unowned-fill code at `f43efe6`) to `packages/trading-core/src/loop.ts` lines 2958-2962, where `#stagePnlSnapshot` marks only the filled token (verifier finding D3). Archive only: the evidence cite (FOLD-1 scoping).
 
 ## RW-28: Residual `FOLD-OVERSELL`
 
@@ -1280,7 +1281,7 @@ Old, lines 2513-2513:
 New:
 
 ~~~new
-| `TRDR4-CITES` | `test/unit/control-api/response-encoder-bound.test.ts` cites `health-door.ts:181` and `:77`, now `:242` and `:82`. The claim itself still holds. | the next round touching `test/unit/control-api/**` (documentation only) |
+| `TRDR4-CITES` | `test/unit/control-api/response-encoder-bound.test.ts` cites stale lines `health-door.ts:181` and `:77`. At `f43efe6` they are `:301` (`readTraderHealthReport`) and `:83` (the first `z.record(`). Its "one `z.record(`" wording is stale too: `FOLD-1` found that the door now nests records, a fixed depth 2 levels more. | the next round touching `test/unit/control-api/**` (documentation only) |
 ~~~
 
 Keep (in both texts):
@@ -1290,9 +1291,9 @@ response-encoder-bound.test.ts
 (documentation only)
 ~~~
 
-**Facts.** Kept: the test file, both drifted cites and their current lines, that the claim holds, and the documentation-only owner. Archive only: "(`:181` had already drifted at base)".
+**Facts.** Kept: the test file, both drifted cites, and the documentation-only owner. r7 gives the cites' lines at `f43efe6` (`:301` and `:83`); the row's `:242` and `:82` were the lines at `TRDR-4`'s time (verifier finding D3). r7 drops "The claim itself still holds": `docs/handoffs/FOLD-1.md` line 261 found the "one `z.record(`" wording stale, because the door now nests records. Archive only: "(`:181` had already drifted at base)".
 
-## RW-35: Residual `RISK2-R1`
+## RW-35: Residual `RISK2-R1`: closed before the cut (r7)
 
 Old, lines 2491-2491:
 
@@ -1300,22 +1301,11 @@ Old, lines 2491-2491:
 | **RISK2-R1** | `apps/trader/src/pipeline.ts:99-103`'s RULE stands (the composition root may not re-derive disposition from tags) but its premise sentence "`packages/risk` decides disposition from the intent TYPE" is superseded | `docs/handoffs/RISK-2.md` residual 3 | `BOOT-1` (same grant extension) |
 ~~~
 
-New:
+r7 found this row closed before the cut, so this entry holds no new text. The brief names `RISK2-R1` in the Residual queue's closed list.
 
-~~~new
-| `RISK2-R1` | `apps/trader/src/pipeline.ts:99-103`'s rule stands (the composition root may not re-derive disposition from tags), but its premise ("`packages/risk` decides disposition from the intent TYPE") is superseded. | row: `BOOT-1` (merged `0d09eb5`; the row was never marked closed) |
-~~~
+**Facts.** Nothing is owed. `BOOT-1` (`7263c13`) corrected the premise sentence: `docs/handoffs/BOOT-1.md` item 4 says `pipeline.ts`'s premise was corrected sentence by sentence, with the superseded text quoted. At `f43efe6` the comment is at `packages/trading-core/src/pipeline.ts` lines 100-104 (the file moved with `CORE-MOVE`); it keeps the rule and quotes the superseded premise. r1-r6 carried the row as open with the stale path `apps/trader/src/pipeline.ts:99-103` (verifier finding D3, r7).
 
-Keep (in both texts):
-
-~~~keep
-the composition root may not re-derive disposition from tags
-decides disposition from the intent TYPE
-~~~
-
-**Facts.** Kept: the rule (no re-derivation of disposition from tags) and the superseded premise. The owner is `BOOT-1` ("same grant extension"), which merged (`0d09eb5`), but the row was never marked closed; the brief says so and does not resolve it.
-
-## RW-36: Residual `TRDR2-R8`
+## RW-36: Residual `TRDR2-R8`: closed before the cut (r7)
 
 Old, lines 2538-2538:
 
@@ -1323,20 +1313,9 @@ Old, lines 2538-2538:
 | **TRDR2-R8** | A parenthesized type alias (`type X = (never); value as X`) evades the trader cast census, `eslint` AND `tsc` — `resolveTypeText` does not strip parentheses; one-line fix plus a self-test | `docs/handoffs/TRDR-2.md` residual 2 | the next round touching `test/unit/trader/**` |
 ~~~
 
-New:
+r7 found this row closed before the cut, so this entry holds no new text. The brief names `TRDR2-R8` in the Residual queue's closed list.
 
-~~~new
-| `TRDR2-R8` | A parenthesized type alias (`type X = (never); value as X`) evades the trader cast census, eslint and tsc, because `resolveTypeText` does not strip parentheses. One-line fix plus a self-test. | the next round touching `test/unit/trader/**` |
-~~~
-
-Keep (in both texts):
-
-~~~keep
-resolveTypeText does not strip parentheses
-one-line fix plus a self-test
-~~~
-
-**Facts.** Kept: the parenthesized alias, the three tools it evades, the cause (`resolveTypeText` does not strip parentheses), the one-line fix plus a self-test, the owner. Archive only: the evidence cite.
+**Facts.** Nothing is owed. `BOOT-1` fixed it: `docs/handoffs/BOOT-1.md` line 66 says TRDR2-R8, the parenthesized-alias evasion, is closed. At `f43efe6`, `test/unit/trader/query-boundary-cast-scan.test.ts` strips balanced surrounding parentheses (`unparenthesized`, lines 245-249) and says "closed by `BOOT-1`". r1-r6 carried the row as open (found in r7 while re-checking D3).
 
 ## RW-37: Residual `TRDR2 residual 7`
 
@@ -1398,7 +1377,7 @@ Old, lines 2563-2563:
 New:
 
 ~~~new
-| `BOOT1-R11` | `test/integration/control-api/trader-health-shape.test.ts:169` asserts `toContain("WP-220 accepted residual")` and passes only because the corrected caveat quotes that phrase, so it no longer measures what its name says. `apps/trader/README.md:144-160` still states the WP-220 posture verbatim. | the next control-api round (pin `SUPERSEDED (RISK-2, 133eac1)`); the next round granted `apps/trader/README.md` |
+| `BOOT1-R11` | `test/integration/control-api/trader-health-shape.test.ts:353` asserts `toContain("WP-220 accepted residual")` and passes only because the corrected caveat quotes that phrase, so it no longer measures what its name says. `apps/trader/README.md:144-160` still states the WP-220 posture verbatim. | the next control-api round (pin `SUPERSEDED (RISK-2, 133eac1)`); the next round granted `apps/trader/README.md` |
 ~~~
 
 Keep (in both texts):
@@ -1408,7 +1387,7 @@ no longer measures what its name says
 SUPERSEDED (RISK-2, 133eac1)
 ~~~
 
-**Facts.** Kept: the assertion and why it passes; that it no longer measures its name; the stale README lines; both owners, with the replacement pin `SUPERSEDED (RISK-2, 133eac1)`. Archive only: "out of BOOT-1's grant" (in the id cell).
+**Facts.** Kept: the assertion and why it passes (at `f43efe6` the assertion is on line 353, not 169; r7, verifier finding D3); that it no longer measures its name; the stale README lines; both owners, with the replacement pin `SUPERSEDED (RISK-2, 133eac1)`. Archive only: "out of BOOT-1's grant" (in the id cell).
 
 ## RW-40: Residual `BOOT1 fill-link severing`
 
@@ -1571,7 +1550,7 @@ Old, lines 2570-2570:
 New:
 
 ~~~new
-| `TRDR3-R4/R5/R7` | (R4) The operations dashboard lacks the `control_trader_health_current` stat the trading dashboard gained. (R5) The control API example's `bindPort: 9465` collides with `infra/prometheus/recorder-scrape.yaml`'s compaction target; the new fragment targets 9466 to avoid it. (R7) `apps/control-api/src/health-door.ts:133` says "Bounded: at most 4096 instances" over an unbounded `z.record`; the practical bound is the http source's 4 MiB body. | the next `apps/control-api`/`infra` round |
+| `TRDR3-R4/R5/R7` | (R4) The operations dashboard lacks the `control_trader_health_current` stat the trading dashboard gained. (R5) The control API example's `bindPort: 9465` collides with `infra/prometheus/recorder-scrape.yaml`'s compaction target; the new fragment targets 9466 to avoid it. (R7) `apps/control-api/src/health-door.ts:238` says "Bounded: at most 4096 instances" over an unbounded `z.record`; the practical bound is the http source's 4 MiB body. | the next `apps/control-api`/`infra` round |
 ~~~
 
 Keep (in both texts):
@@ -1582,7 +1561,7 @@ unbounded z.record
 4 MiB body
 ~~~
 
-**Facts.** Kept: R4's missing stat; R5's collision with the compaction target and the new fragment's 9466; R7's false bound, the unbounded `z.record` and the actual 4 MiB bound. Archive only: the config and scrape file line numbers.
+**Facts.** Kept: R4's missing stat; R5's collision with the compaction target and the new fragment's 9466; R7's false bound, the unbounded `z.record` and the actual 4 MiB bound. r7 corrects R7's cite from `:133` to `:238`, its line at `f43efe6` (verifier finding D3). Archive only: the config and scrape file line numbers.
 
 ## RW-47: Residual `SNAP1-KEYSET`
 
@@ -1740,7 +1719,7 @@ Old, lines 2573-2573:
 New:
 
 ~~~new
-| `UNIV4-R4/R5` | (R4) A hold-back caused by a failed confirmation write, with a healthy publisher, is released only by the next epoch (two PAGEs raised); a same-epoch retry when not halted would release it. (R5) Poll latency is up to one `pollIntervalMs`: a market closed between polls is seen late, and one closed and reopened within one interval is unseen. The venue's `endDate`/`startDate` are deliberately not used: they have no documented semantics and are a schedule, not an observation. `publisher.ts:461`'s halt detail "the event remains in the WAL" is false for derived lifecycle events (the feed's own incident states the truth). | the next `apps/data-gateway` round |
+| `UNIV4-R4/R5` | (R4) A hold-back caused by a failed confirmation write, with a healthy publisher, is released only by the next epoch (two PAGEs raised); a same-epoch retry when not halted would release it. (R5) Poll latency is up to one `pollIntervalMs`: a market closed between polls is seen late, and one closed and reopened within one interval is unseen. The venue's `endDate`/`startDate` are deliberately not used: they have no documented semantics and are a schedule, not an observation. `apps/data-gateway/src/publisher.ts:589`'s halt detail "the event remains in the WAL" is false for derived lifecycle events (the feed's own incident states the truth). | the next `apps/data-gateway` round |
 ~~~
 
 Keep (in both texts):
@@ -1753,7 +1732,7 @@ deliberately not used
 a schedule, not an observation
 ~~~
 
-**Facts.** Kept: R4's hold-back with a healthy publisher, two PAGEs, and the same-epoch retry remedy; R5's latency bound, the late close, the unseen close-and-reopen, and why `endDate`/`startDate` are deliberately unused; the false WAL halt detail. Archive only: "owner's wording".
+**Facts.** Kept: R4's hold-back with a healthy publisher, two PAGEs, and the same-epoch retry remedy; R5's latency bound, the late close, the unseen close-and-reopen, and why `endDate`/`startDate` are deliberately unused; the false WAL halt detail. r7 corrects its cite from `publisher.ts:461` (a blank line at `f43efe6`) to `apps/data-gateway/src/publisher.ts:589` (verifier finding D3). Archive only: "owner's wording".
 
 ## RW-54: Residual `N8`
 
@@ -2305,7 +2284,7 @@ Old, lines 2543-2543:
 New:
 
 ~~~new
-| `N2` | `packages/order-book` `book.ts:191` and `:265` `safeParse` caller-supplied `input.payload` against object schemas and read `parsed.data`. The contract row is corrected (`schema-boundary.md` §3). The severity is unchanged, because whether a defeat on those two doors is reachable has not been measured. | the next bounded grant on `packages/order-book/**`, which owes the measurement first |
+| `N2` | `packages/order-book` `book.ts:284` and `:361` `safeParse` caller-supplied `input.payload` against object schemas and read `parsed.data`. The contract row is corrected (`schema-boundary.md` §3). The severity is unchanged, because whether a defeat on those two doors is reachable has not been measured. | the next bounded grant on `packages/order-book/**`, which owes the measurement first |
 ~~~
 
 Keep (in both texts):
@@ -2316,7 +2295,7 @@ the severity is unchanged
 which owes the measurement first
 ~~~
 
-**Facts.** Kept: the two doors, the caller-supplied payload, the object schemas and `parsed.data`; the corrected contract row; the unchanged severity and its reason; the measure-first owner. Archive only: the contract's old wording.
+**Facts.** Kept: the two doors (r7 corrects their lines to `:284` and `:361` at `f43efe6`, from `:191` and `:265`; verifier finding D3), the caller-supplied payload, the object schemas and `parsed.data`; the corrected contract row; the unchanged severity and its reason; the measure-first owner. Archive only: the contract's old wording.
 
 ## RW-77: Residual `R8-1`
 
@@ -2400,7 +2379,7 @@ New:
 
 ~~~new
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
-Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`. The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
+Closed, done or ruled (full rows in the archive): `RISK-2 residual 5`, `RISK2-R6`, `RISK2-R2`, `RISK2-R3`, `RISK2-R4`, `RECON1-SCAN`, `RECON1-ORIGIN`, `RECON1-TEXT`, `RECON1-EDGE`, `RECON2-LOOPMEM`, `LOOPMEM-SIM` (remainder: the `SIM-*` rows above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`, `GATE1-R4`, `CI1-L1`, `CI1-L2`, `CI1-L3`, `CI1-L4`, `CI1-L5`, `CI2-L5-2`, `CI2-L5-3`, `BT1-R1..R4`, `BOOT1-R7`, `BRACKET-1b`, `BRACKET1C-SNAPKEY`, `M18`, `BOOT1-CONFIGPARAMS`, `ADR022-DISCHARGE`, `DC1-R1-L1`, `B1-R1-REDIS-UNCAUGHT`, `BRACKET-1c`, `RISK2-R1` and `TRDR2-R8` (both closed by `BOOT-1` before the cut). The `H8 track` is complete; its rulings still in force are under [Human items](#human-items).
 ~~~
 
 Keep (in both texts):
@@ -3355,7 +3334,7 @@ FOUR pending panels each with a named owner (realized-PnL → future apps/trader
 New:
 
 ~~~new
-- `WP-240`, beyond `N8`: D3, a second exposition renderer (WP-140's is closure-bound; collapse is a follow-up). An engaged kill switch does not reach a running trader (no IPC seam in-repo; a composition obligation; seam design queued). The in-memory audit log is not durable (correct for PAPER without a database; the Postgres port is ready). The postgres audit sink is typecheck-pinned only, with no integration evidence (no Docker). It mints ids with `randomUUID()` (v4), which conflicts with the `internal.uuid_v7` domain (documented in code), so durable composition must use `uuidV7()` (`apps/control-api/src/main.ts:80-90`). The bearer-token model is sized for loopback PAPER: no rotation or expiry; off-host needs TLS and stronger credentials. Two more fidelity panels stay pending, each with a named owner, machine-checked against `PENDING_PRODUCER_PANELS`: predicted-vs-actual (WP-290/phase-4) and markout (a future simulation/research grant). WP-230 r3 LOW-1/NOTE-1 stay carried, reported but not patched: the packet ruled apps/trader read-only, so they move to the future apps/trader grant (the record also routes the safety-table collapse there).
+- `WP-240`, beyond `N8`: D3, a second exposition renderer (WP-140's is closure-bound; collapse is a follow-up). An engaged kill switch does not reach a running trader (no IPC seam in-repo; a composition obligation; seam design queued). The in-memory audit log is not durable (correct for PAPER without a database; the Postgres port is ready). The postgres audit sink is typecheck-pinned only, with no integration evidence (no Docker). It mints ids with `randomUUID()` (v4), which conflicts with the `internal.uuid_v7` domain (documented in code), so durable composition must use `uuidV7()` (`apps/control-api/src/main.ts:80-90`). The bearer-token model is sized for loopback PAPER: no rotation or expiry; off-host needs TLS and stronger credentials. Two fidelity panels stay pending, each with a named owner, machine-checked against `PENDING_PRODUCER_PANELS`: predicted-vs-actual (WP-290/phase-4) and markout (a future simulation/research grant). The third pending panel, replay-determinism, is `WP-250`'s F2 (next bullet). WP-230 r3 LOW-1/NOTE-1 stay carried, reported but not patched: the packet ruled apps/trader read-only, so they move to the future apps/trader grant (the record also routes the safety-table collapse there).
 ~~~
 
 Keep (in both texts):
@@ -3395,7 +3374,7 @@ replay-determinism metric → future simulation/backtest-cli grant => brief: Res
 dashboards never imported into a real Grafana => brief: Human items — H3 (a real Grafana imported and rendered the dashboards, 2026-09-29)
 ~~~
 
-**Facts.** Kept: the design follow-ups outside `N8`, and every open known risk: the in-memory audit log (the Postgres port is ready); the typecheck-pinned postgres sink with its `randomUUID()` v4 vs `internal.uuid_v7` conflict (at `f43efe6`, `apps/control-api/src/main.ts` lines 80-90 still mint ids with `randomUUID()`); and the loopback-PAPER bearer-token model. r5 restores the qualifiers r4 dropped: WP-140's renderer is closure-bound, the kill-switch seam is a composition obligation, the v4/v7 conflict is documented in code, and LOW-1/NOTE-1 were reported, not patched, because the packet ruled apps/trader read-only. M-1, M-3, the LOWs and N-4 are the brief's `N8` row. r6 adds the two other pending panels, predicted-vs-actual (`WP-290`/phase-4) and markout (a future simulation/research grant), which r1-r5 neither carried nor dropped (verifier finding I6); `packages/observability/src/control/dashboards.ts` still declares both at `f43efe6`. The realized-PnL panel closed with `TRDR-3`, and the replay-determinism panel is WP-250's F2. M-2 and the unwired trader-health seam closed with `TRDR-3`, and H3 imported the dashboards into a real Grafana. Not carried: N-1 (the family count, reconciled in the record) and the deferred root wiring (ratified at merge). History: `work-packages-waves-0-2.md`.
+**Facts.** Kept: the design follow-ups outside `N8`, and every open known risk: the in-memory audit log (the Postgres port is ready); the typecheck-pinned postgres sink with its `randomUUID()` v4 vs `internal.uuid_v7` conflict (at `f43efe6`, `apps/control-api/src/main.ts` lines 80-90 still mint ids with `randomUUID()`); and the loopback-PAPER bearer-token model. r5 restores the qualifiers r4 dropped: WP-140's renderer is closure-bound, the kill-switch seam is a composition obligation, the v4/v7 conflict is documented in code, and LOW-1/NOTE-1 were reported, not patched, because the packet ruled apps/trader read-only. M-1, M-3, the LOWs and N-4 are the brief's `N8` row. r6 adds the two other pending panels, predicted-vs-actual (`WP-290`/phase-4) and markout (a future simulation/research grant), which r1-r5 neither carried nor dropped (verifier finding I6); `packages/observability/src/control/dashboards.ts` still declares both at `f43efe6`. The realized-PnL panel closed with `TRDR-3`, and the replay-determinism panel is WP-250's F2. r7 writes "Two fidelity panels", not "Two more", and points to WP-250's F2 for the third (verifier finding D5). M-2 and the unwired trader-health seam closed with `TRDR-3`, and H3 imported the dashboards into a real Grafana. Not carried: N-1 (the family count, reconciled in the record) and the deferred root wiring (ratified at merge). History: `work-packages-waves-0-2.md`.
 
 ## RW-111: Complete row `WP-250`: residuals still owned
 
@@ -3549,16 +3528,18 @@ Residuals owned (docs/handoffs/ALLOC-1.md): r1 L1 the trader's UuidAndCodeString
 New:
 
 ~~~new
-- `ALLOC-1`: ALLOC-1's review N1/N2 comment staleness (next allocator round); its N3, unparsed withLiveOwner surfaces (zero non-test callers); its N4, the arena/skipChecks pin gap (behavior reviewer-verified correct; coverage owed).
+- `ALLOC-1`: ALLOC-1's review N1/N2 report comment staleness; the next allocator round owns them. Its N3 reports unparsed `withLiveOwner` surfaces, which have zero non-test callers. Its N4 reports the arena/skipChecks pin gap. The behavior is reviewer-verified correct, but its coverage is still owed.
 ~~~
 
 Keep (in both texts):
 
 ~~~keep
-N1/N2 comment staleness (next allocator round)
+comment staleness
+next allocator round
 unparsed withLiveOwner surfaces
+zero non-test callers
 the arena/skipChecks pin gap
-behavior reviewer-verified correct
+reviewer-verified correct
 ~~~
 
 Not carried:
@@ -3568,7 +3549,7 @@ ADR-021 second amendment (allocator corrected; evidence-shape non-change; the ca
 WP-180-FU3 follow-up 1 done => history: done
 ~~~
 
-**Facts.** Kept: N1-N4, with N4's verified behavior (r5). The brief writes "ALLOC-1's review N1/N2", "its N3" and "its N4", because `GOV-2B`'s N2, N3 and N4 are different items. L1 and L2 were `TRDR-1`'s obligations, and `TRDR-1` is Complete. The ADR-021 doc follow-ups went to `GOV-2C`. History: `work-packages-rounds.md`.
+**Facts.** Kept: N1-N4, with N4's verified behavior (r5). r7 turns the clause chain into sentences (verifier finding D2). The brief writes "ALLOC-1's review N1/N2", "Its N3" and "Its N4", because `GOV-2B`'s N2, N3 and N4 are different items. L1 and L2 were `TRDR-1`'s obligations, and `TRDR-1` is Complete. The ADR-021 doc follow-ups went to `GOV-2C`. History: `work-packages-rounds.md`.
 
 ## RW-116: Complete row `TRDR-1`: residuals still owned
 
@@ -3879,9 +3860,10 @@ Not carried:
 ~~~drop lines=76-76
 `main.ts:292`'s cast => closed-by `BOOT-1` (it deleted the venue as unknown as cast: docs/handoffs/BOOT-1.md line 65; apps/trader/src/main.ts lines 541-545 at f43efe6 hand the venue over uncast)
 **three** of six integration suites now need Docker so GATE-1's N5 label (which says two) is stale => closed-by `CI-1` (N5)
+**TRDR2-R8** a parenthesized type alias still evades the census => closed-by `BOOT-1` (docs/handoffs/BOOT-1.md line 66: TRDR2-R8 is closed; test/unit/trader/query-boundary-cast-scan.test.ts strips the parentheses at f43efe6)
 ~~~
 
-**Facts.** Kept: the two residuals no other row carries and no later row closes. r6 drops the `main.ts:292` cast: `BOOT-1` deleted it. `TRDR2-R8` is its own residual row; B9 closed with `BOOT-1`; the N5 label went stale and closed with `CI-1`. History: `work-packages-rounds.md`.
+**Facts.** Kept: the two residuals no other row carries and no later row closes. r6 drops the `main.ts:292` cast: `BOOT-1` deleted it. `TRDR2-R8` closed with `BOOT-1` before the cut; r1-r6 queued it as open (RW-36, r7). B9 closed with `BOOT-1`; the N5 label went stale and closed with `CI-1`. History: `work-packages-rounds.md`.
 
 ## RW-126: Complete row `GATE-1`: residuals still owned
 
@@ -4534,3 +4516,45 @@ follow_up 8 — replace the => closed-by `GOV-1C` (it ruled the §6.1 items, inc
 ~~~
 
 **Facts.** C15 needs every residual clause of a dispositioned row accounted for. These rows carry no entry, so their clauses are dropped here, each with its closing package or its line in the brief. Added in r4 (J-02).
+
+## RW-142: Completion record `WP-080`: the UNVERIFIED register (r7)
+
+Excerpt of the record item at base lines 1355-1362:
+
+~~~excerpt lines=1355-1362
+- Implemented by `wp-implementer` (Opus) on branch `worktree-agent-a24ead9170631b1c6`,
+  base `145fc32`; chain `cff20ba` (impl) → `be5d67a` (handoff). 48 files, all
+  allowed; lockfile +16/−0. Orchestrator reproduced gates: root 1902/1902,
+  contract 108/108 (offline), check:deps PASS. 15 venue facts cited from the
+  official `binance/binance-spot-api-docs` (2026-08-27); ADR-004 framing item
+  answered (JSON endpoints carry JSON; the binary SBE path is a different,
+  key-required host, refused by construction); UNVERIFIED register BNC-U1..U6.
+  Review round 1 dispatched.
+~~~
+
+New:
+
+~~~new
+- `WP-080`: the Binance UNVERIFIED register BNC-U1..U6 is still open in part. `BNC-U1`, `BNC-U2`, `BNC-U3`, `BNC-U4` and `BNC-U6` stay in `BINANCE_UNVERIFIED` (`packages/binance-adapter/src/venue.ts:236`), each with conservative handling. They cover the frame opcode, trade-id contiguity, bookTicker update-id monotonicity, empty-side representation and integer precision. ADR-014 closed `BNC-U5`. `WP-080`'s follow_up 3 asked the first `WP-120` connectivity work to settle `BNC-U1` by observation. `WP-120` is Complete, and no closure evidence was found at the cut, so that observation is still owed. The record names no later owner.
+~~~
+
+Keep (in both texts):
+
+~~~keep
+UNVERIFIED register BNC-U1..U6
+~~~
+
+Not carried:
+
+~~~drop lines=1355-1362
+- Implemented by `wp-implementer` (Opus) => history: who implemented it, on which branch
+chain `cff20ba` (impl) → `be5d67a` (handoff) => history: the commit chain; `WP-080`'s merge `d0d66bf` is in its Work packages row
+48 files, all => history: the diff size
+lockfile +16/−0 => history: the diff size
+Orchestrator reproduced gates => history: gates reproduced at the time
+15 venue facts cited from the => history: the venue facts are in docs/handoffs/WP-080.md
+ADR-004 framing item => history: answered (JSON endpoints carry JSON), recorded in ADR-004
+Review round 1 dispatched. => history: the review ran; `WP-080` is Complete
+~~~
+
+**Facts.** The base mentions the register only in this in-flight record item, and the `WP-080` row carries no residual, so r1-r6 declared the range history (verifier finding D1, r7). The register is live at `f43efe6`: `packages/binance-adapter/src/venue.ts` line 236 lists `BNC-U1`, `BNC-U2`, `BNC-U3`, `BNC-U4` and `BNC-U6` in `BINANCE_UNVERIFIED`, and `BINANCE_RESOLVED` holds only `BNC-U5` (ADR-014). `docs/handoffs/WP-080.md` lines 457-460 (follow_up 3) give `BNC-U1`'s observation to the first `WP-120` connectivity work, and lines 2274-2276 list it as still open. No later record closes it. History: `wave-1-batch-1b-in-flight.md`.

@@ -27,7 +27,7 @@ update that one line in the brief, and re-cut the archive (see `README.md`).
 | ### WP-110 completion record (2026-08-31) | 1142 | [completion-records-wave-1.md](completion-records-wave-1.md) | Open blockers > Obligations in completion records (RW-132); full record in the archive |
 | ### WP-100 completion record (2026-08-30) | 1189 | [completion-records-wave-1.md](completion-records-wave-1.md) | archive only |
 | ### Wave 1 batch 1B phase-gate record (2026-08-27) | 1234 | [completion-records-wave-1.md](completion-records-wave-1.md) | archive only |
-| ### Wave 1 batch 1B in-flight records (2026-08-27) | 1259 | [wave-1-batch-1b-in-flight.md](wave-1-batch-1b-in-flight.md) | archive only |
+| ### Wave 1 batch 1B in-flight records (2026-08-27) | 1259 | [wave-1-batch-1b-in-flight.md](wave-1-batch-1b-in-flight.md) | Open blockers > Obligations in completion records (RW-142); full record in the archive |
 | ### WP-060 completion record (2026-08-27) | 1764 | [completion-records-wave-0.md](completion-records-wave-0.md) | Open blockers > Obligations in completion records (RW-133); full record in the archive |
 | ### WP-060 review history (2026-08-27, archived) | 1805 | [completion-records-wave-0.md](completion-records-wave-0.md) | archive only |
 | ### WP-040 completion record (2026-08-26) | 1893 | [completion-records-wave-0.md](completion-records-wave-0.md) | Open blockers > Obligations in completion records (RW-134); full record in the archive |
@@ -166,7 +166,7 @@ update that one line in the brief, and re-cut the archive (see `README.md`).
 | `RISK-2 residual 5` | 2488 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `RISK2-R6` | 2489 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `RISK2-R2` | 2490 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
-| `RISK2-R1` | 2491 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |
+| `RISK2-R1` | 2491 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `RISK2-R3` | 2492 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `RISK2-R4` | 2493 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `RECON1-SCAN` | 2494 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
@@ -197,7 +197,7 @@ update that one line in the brief, and re-cut the archive (see `README.md`).
 | `RECON2-DURABLE` | 2535 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |
 | `RECON2-EVENTHOP` | 2536 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `RECON2-README` | 2537 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
-| `TRDR2-R8` | 2538 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |
+| `TRDR2-R8` | 2538 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `N5` (N5 (stale again)) | 2539 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
 | `TRDR2 residual 7` | 2540 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |
 | `GATE1-M1` | 2541 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |

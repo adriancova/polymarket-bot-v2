@@ -60,7 +60,9 @@ repository root.
   - A declared kind can still pass while partly wrong: a partly closed row can pass as closed, and `REWRITES.md` says which.
   - C15 checks that each residual clause holds a marker, not that the marker covers the whole clause, so reviewers must check the rest of each clause.
   - C authenticates what `REWRITES.md` says. It cannot tell whether a rewrite kept every fact, or whether a drop reason is true; that is a review question.
-- `python3 tools/records/check-brief.py --base <rev>` checks the brief's budget (15% of the base file) and the measurable parts of the writing standard: for example, no sentence over 45 words (K23), and a commit pin in every section that cites a file line (K25). It also refuses an item the brief carries as owed when a record, contract or code comment at the cut already closed it (K31), and checks the pending dashboard panels against the code (K32).
+- `python3 tools/records/check-brief.py --base <rev>` checks the brief's budget (15% of the base file) and the measurable parts of the writing standard. For example: no sentence over 45 words (K23), and a commit pin in every section that cites a file line (K25).
+  - K31 is a set of regression checks for 16 specific closures that review found. Each rule reads its evidence at the cut. K31 is not a detector: an item closed before the cut that no rule names still passes.
+  - K32 checks the pending dashboard panels against the code. K33 checks every file:line citation in the brief against the file at the cut. K34 checks that the brief names every id still in `BINANCE_UNVERIFIED`.
 - `python3 tools/records/selftest-preservation.py` shows the proofs are not vacuous: it mutates a scratch copy, including a synthetic re-cut, and checks that each mutation fails and each re-cut passes.
 
 ## Re-cutting after edits on `main`

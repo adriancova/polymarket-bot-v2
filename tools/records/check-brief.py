@@ -45,17 +45,28 @@ K29 no line of REWRITES.md's intro and coverage prose (before the first declarat
     line of the archive README, runs over 80 words: split dense paragraphs into lists or tables.
 K30 no verbless fragment where r4 had one: the WP-210 bullet's "landing: contract owner
     recording." and the UNIV-1 bullet's bare "LOW-2 drifts (two unpinned), LOW-3 ..." list.
-K31 closed before the cut (r6): the brief does not carry as owed an item that a record, contract or
-    code comment at the cut already closed. Each rule names the brief wording and the evidence,
-    read from the repository AT THE CUT (`git show <cut>:<path>`); if the evidence is not there,
-    the rule fails too, so it cannot outlive its reason.
+K31 closed before the cut (r6, r7): regression checks for a fixed list of specific closures that
+    review found (CLOSED_BEFORE_CUT). It is not a detector: an item closed before the cut that no
+    rule names passes. Each rule names the brief wording and the evidence, read from the
+    repository AT THE CUT (`git show <cut>:<path>`); if the evidence is not there, the rule fails
+    too, so it cannot outlive its reason.
 K32 the WP-240 bullet names every fidelity panel still pending at the cut: each `panel:` of
     `PENDING_PRODUCER_PANELS` (packages/observability/src/control/dashboards.ts at the cut) maps to
     a phrase the brief uses; an unmapped panel fails until it is added here and to the brief.
+K33 every file:line citation in the brief (`name.ext:NNN` or a bare `:NNN`) lies inside a literal
+    of CITATIONS, and each literal's needle is on the cited lines of that file AT THE CUT. A
+    "quote" entry is a stale citation a row quotes from another file: its needle must be in that
+    file at the cut. This makes "File:line citations are as of `<cut>`" a checked sentence.
+K34 every id in `BINANCE_UNVERIFIED` (packages/binance-adapter/src/venue.ts at the cut) is named
+    in the brief in backticks.
+K35 the archive README describes K31 as regression checks for exactly len(CLOSED_BEFORE_CUT)
+    specific closures and says it is not a detector.
 K2 also requires the "Residuals recorded in Complete package rows" and "Obligations in completion
 records" subsections. K21 also requires C16, refuses the claim "so a partial carry fails" in
 REWRITES.md and the archive README, and requires both to say reviewers check the rest of a clause.
-K24 also requires the ALLOC-1 bullet to write "ALLOC-1's review N1/N2", "its N3" and "its N4".
+K24 also requires the ALLOC-1 bullet to write "ALLOC-1's review N1/N2", "its N3" and "its N4" (either
+case). K30 also refuses the r6 clause chains "its N3, unparsed" and "; its N4, the" (r7, D2) and
+"Two more fidelity panels", which had no referent (r7, D5).
 
 Exit 0 when every rule holds, 1 otherwise. Stdlib only, no network.
 """
@@ -131,6 +142,67 @@ CLOSED_BEFORE_CUT = [
      ".github/workflows/ci.yml", "if: ${{ !cancelled() && steps.install.outcome == 'success' }}", True),
     ("GATE-1: 'neither self-checking' (CI-2 pins part of ci.yml)", r"neither self-check",
      "test/unit/tooling/ci-step-split.test.ts", "expect(scriptGates.map(({ script }) => script)).toEqual([", True),
+    # r7
+    ("RISK2-R1: the pipeline.ts premise (BOOT-1 7263c13)", r"^\| `RISK2-R1` \|",
+     "packages/trading-core/src/pipeline.ts", "superseding this sentence's earlier premise", True),
+    ("TRDR2-R8: the parenthesized alias (BOOT-1)", r"^\| `TRDR2-R8` \|",
+     "test/unit/trader/query-boundary-cast-scan.test.ts", "(`TRDR-2` R8, closed by `BOOT-1`)", True),
+    ("TRDR4-CITES: 'the claim itself still holds' (FOLD-1 found it stale)", r"claim itself still holds",
+     "docs/handoffs/FOLD-1.md", "It now has nested records: a fixed depth, 2 levels more.", True),
+]
+# K33: every file:line citation in the brief, checked at the cut.
+# (literal as it occurs in the brief, [(path, first line, last line, needle)]); first line None = a
+# "quote": the needle (a stale cite) must be somewhere in that file at the cut.
+CITATIONS = [
+    ("`packages/trading-core/src/loop.ts:2958-2962`",
+     [("packages/trading-core/src/loop.ts", 2958, 2962, "marks: { [tokenAssetId]: { midpoint: fill.price } }")]),
+    ("cites stale lines `health-door.ts:181` and `:77`",
+     [("test/unit/control-api/response-encoder-bound.test.ts", None, None, "(`apps/control-api/src/health-door.ts:181`)"),
+      ("test/unit/control-api/response-encoder-bound.test.ts", None, None, "(`health-door.ts:77`)")]),
+    ("`:301` (`readTraderHealthReport`)",
+     [("apps/control-api/src/health-door.ts", 301, 301, "export function readTraderHealthReport(")]),
+    ("`:83` (the first `z.record(`)",
+     [("apps/control-api/src/health-door.ts", 83, 83, "z.record(")]),
+    ("`test/integration/control-api/trader-health-shape.test.ts:353`",
+     [("test/integration/control-api/trader-health-shape.test.ts", 353, 353, 'toContain("WP-220 accepted residual")')]),
+    ("`apps/trader/README.md:144-160`",
+     [("apps/trader/README.md", 144, 160, "`WP-220`'s accepted residual")]),
+    ("`apps/control-api/src/health-door.ts:238`",
+     [("apps/control-api/src/health-door.ts", 238, 238, "Bounded: at most 4096 instances")]),
+    ("`apps/data-gateway/src/publisher.ts:589`",
+     [("apps/data-gateway/src/publisher.ts", 589, 589, "the event remains in the WAL")]),
+    ("`packages/execution-planner/src/refusals.ts:178-187`",
+     [("packages/execution-planner/src/refusals.ts", 178, 187, "Every public entry point of this package promises a typed result")]),
+    ("`book.ts:284` and `:361`",
+     [("packages/order-book/src/book.ts", 284, 284, "safeParse(input.payload)"),
+      ("packages/order-book/src/book.ts", 361, 361, "safeParse(input.payload)")]),
+    ("`checks.ts:69`",
+     [("apps/ops-cli/src/verify-venue/checks.ts", 69, 69, 'VERIFICATION_REPORT_PATH = "docs/venue/verified-2026-08-24.md"')]),
+    ("`checks.ts:249-252`",
+     [("apps/ops-cli/src/verify-venue/checks.ts", 249, 252, 'enum: ["2026-08-24"]')]),
+    ("`packages/features/src/inputs.ts:744-765`",
+     [("packages/features/src/inputs.ts", 744, 765, "Corrected 2026-09-15 by `GOV-2C` (comment only)")]),
+    ("`build.ts:707-712`",
+     [("packages/execution-planner/src/build.ts", 707, 712, 'case "CANCEL":')]),
+    ("`apps/control-api/src/main.ts:80-90`",
+     [("apps/control-api/src/main.ts", 80, 90, "nextAuditRecordId: () => randomUUID()")]),
+    ("`lots.ts:151`",
+     [("packages/risk/src/lots.ts", 151, 151, "built.sort(")]),
+    ("`dataset-manifest.ts:457`",
+     [("packages/storage-parquet/src/dataset-manifest.ts", 457, 457, "as unknown as DatasetManifest")]),
+    ("`metric-shapes.ts:196`",
+     [("packages/observability/src/control/metric-shapes.ts", 196, 196, "export interface TraderHealthReportInput")]),
+    ("`control-plane.ts:440`",
+     [("apps/control-api/src/control-plane.ts", 440, 440, "`[...keys]`, NOT `keys.map(...)`")]),
+    ("`packages/binance-adapter/src/venue.ts:236`",
+     [("packages/binance-adapter/src/venue.ts", 236, 236, "export const BINANCE_UNVERIFIED = [")]),
+    ("(`:509` at `f43efe6`)",
+     [("docs/spec/polymarket-bot-agent-orchestration-runbook.md", 509, 509,
+       "Static Bracket runs in replay and live-data paper mode through the same code")]),
+    ("(`:514` at `f43efe6`)",
+     [("docs/spec/polymarket-bot-agent-orchestration-runbook.md", 514, 514, "accumulating meaningful live-data paper evidence")]),
+    ("`:906` at `f43efe6`",
+     [("docs/spec/polymarket-bot-agent-orchestration-runbook.md", 906, 906, "fresh read-only wave closeout")]),
 ]
 # K32: panel name in PENDING_PRODUCER_PANELS -> the phrase the brief uses for it
 PENDING_PANEL_PHRASES = {
@@ -336,14 +408,14 @@ def main() -> int:
             if l and not l.startswith("- ") and "the handoff linked from the package's row" in l:
                 intro_ok = True
             if l.startswith("- `ALLOC-1`"):
-                rest = l.replace("ALLOC-1's review N1/N2", "").replace("its N3", "").replace("its N4", "")
+                rest = re.sub(r"ALLOC-1's review N1/N2|\b[Ii]ts N3\b|\b[Ii]ts N4\b", "", l)
                 if re.search(r"\bN\d\b", rest):
                     fails.append(f"K24: line {i + 1}: the ALLOC-1 bullet must write \"ALLOC-1's review N1/N2\", \"its N3\" "
                                  "and \"its N4\" (GOV-2B's N2-N4 are different items)")
             m = re.match(r"^- `([A-Za-z0-9-]+)`", l)
             if m and not any(re.match(r"^\| `" + re.escape(m.group(1)) + r"` \|.*\]\(docs/handoffs/[^)]+\.md\)", r) for r in lines):
                 fails.append(f"K26: line {i + 1}: {m.group(1)}'s Work packages row links no handoff")
-            if re.search(r"landing: contract owner recording\.|^- `UNIV-1`: LOW-2 drifts", l):
+            if re.search(r"landing: contract owner recording\.|^- `UNIV-1`: LOW-2 drifts|its N3, unparsed|; its N4, the", l):
                 fails.append(f"K30: line {i + 1}: a verbless fragment; write a full sentence")
             i += 1
         if not intro_ok:
@@ -394,6 +466,44 @@ def main() -> int:
             fails.append(f"K32: pending panel {panel!r} has no brief phrase; carry it and add it to PENDING_PANEL_PHRASES")
         elif phrase not in low:
             fails.append(f"K32: pending panel {panel!r} is not carried in the brief (expected {phrase!r})")
+    for n, l in enumerate(lines, 1):
+        if "Two more fidelity panels" in l:
+            fails.append(f"K30: line {n}: 'Two more fidelity panels' has no referent; say 'Two fidelity panels' and name the third")
+    # K33
+    spans = []
+    for lit, checks in CITATIONS:
+        at = [m.start() for m in re.finditer(re.escape(lit), brief)]
+        if not at:
+            fails.append(f"K33: the citation {lit!r} is registered but not in the brief; update CITATIONS")
+        spans += [(s, s + len(lit)) for s in at]
+        for path, a, b, needle in checks:
+            ev = show(args.repo, sha, path)
+            if ev is None:
+                fails.append(f"K33: {lit!r}: {path} does not exist at {sha[:12]}")
+                continue
+            where = ev if a is None else "\n".join(ev.split("\n")[a - 1:b])
+            if needle not in where:
+                span = "the file" if a is None else f"lines {a}-{b}"
+                fails.append(f"K33: {lit!r}: {needle!r} is not on {span} of {path} at {sha[:12]}")
+    for m in re.finditer(r"(?<![0-9]):\d+", brief):
+        if not any(s <= m.start() < e for s, e in spans):
+            n = brief.count("\n", 0, m.start()) + 1
+            fails.append(f"K33: line {n}: the citation {brief[max(0, m.start() - 40):m.end()]!r} is not registered in CITATIONS")
+    # K34
+    venue = show(args.repo, sha, "packages/binance-adapter/src/venue.ts") or ""
+    unverified = re.findall(r'id: "(BNC-U\d+)"', venue.split("BINANCE_UNVERIFIED = [", 1)[-1].split("] as const", 1)[0])
+    if not unverified:
+        fails.append("K34: no BINANCE_UNVERIFIED id found at the cut; re-check the rule")
+    for bid in unverified:
+        if f"`{bid}`" not in brief:
+            fails.append(f"K34: {bid} is still in BINANCE_UNVERIFIED at {sha[:12]}, but the brief does not name it")
+    # K35
+    readme = read(root, f"{S.ARCHIVE}/README.md")
+    want = f"regression checks for {len(CLOSED_BEFORE_CUT)} specific closures"
+    if want not in readme or "not a detector" not in readme:
+        fails.append(f"K35: the archive README must describe K31 as '{want}' and say it is 'not a detector'")
+    if "refuses an item the brief carries as owed when" in readme:
+        fails.append("K35: the archive README claims K31 refuses any item closed before the cut")
     # K25
     sec, sec_lines = None, []
     def k25(sec, sec_lines):
