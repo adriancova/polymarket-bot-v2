@@ -91,6 +91,8 @@ export {
   deepFreeze,
   materializeCheckpointableJson,
   MAX_MATERIALIZED_DEPTH,
+  // `THROUGHPUT-1a`: additive, performance-only (see `json.ts`).
+  prepareEvaluationView,
   type CheckpointableJson,
   type MaterializeCheckpointableJsonResult,
 } from "./json.js";

@@ -78,7 +78,96 @@ function midpointOf(series: ValidatedReferenceSeries | undefined): DecimalString
   return halveExact(addDecimal(top.bidPrice, top.askPrice));
 }
 
+/**
+ * `THROUGHPUT-1a` — the EWMA's memo. PERFORMANCE ONLY: no value changes.
+ *
+ * The EWMA realized volatility is a pure function of three things: the feature
+ * id (its venue), `lambda`, and the series' PRICES in order — nothing else in
+ * the input reaches {@link computeEwmaVolatilityUncached} (not `asOf`, not the
+ * instants, not the book). It is also the most expensive computation in a
+ * snapshot: two exact divisions, three multiplications and a quantization per
+ * consecutive pair, over up to the whole window (512 points per venue in the
+ * trader), recomputed for EVERY evaluation — while the series itself changes
+ * only when a reference trade arrives (H1's burst: ~28 reference trades a
+ * second against ~660 evaluations).
+ *
+ * So the result is memoized under an EXACT key of those three inputs — the
+ * prices are validated canonical decimal strings, which never contain the
+ * separator — and a hit returns the very outcome a recomputation would
+ * produce. The returned object is never mutated downstream (`bindToRegistry`
+ * reads it; `ownFrozenTree` copies it). Bounded: at most
+ * {@link EWMA_MEMO_LIMIT} entries, oldest first out.
+ */
+const EWMA_MEMO_LIMIT = 16;
+const ewmaMemo = new Map<string, ComputedFeature>();
+/**
+ * The same memo by the validated series OBJECT: an entry is written only from
+ * the key above (so it is that key's outcome), and a series object is never
+ * mutated after validation, so its outcome cannot change.
+ */
+const ewmaBySeries = new WeakMap<
+  ValidatedReferenceSeries,
+  { readonly venue: ReferenceVenueName; readonly lambda: DecimalString; readonly feature: ComputedFeature }
+>();
+
 function computeEwmaVolatility(
+  venue: ReferenceVenueName,
+  series: ValidatedReferenceSeries | undefined,
+  lambda: DecimalString,
+): ComputedFeature {
+  if (series === undefined || series.trades.length < 2) {
+    return computeEwmaVolatilityUncached(venue, series, lambda);
+  }
+  // A prepared section hands every snapshot the SAME series object while it
+  // is unchanged (`prepared-reference.ts`), so the identity lookup answers
+  // without even building the key.
+  const byIdentity = ewmaBySeries.get(series);
+  if (byIdentity !== undefined && byIdentity.venue === venue && byIdentity.lambda === lambda) {
+    return byIdentity.feature;
+  }
+  let key = `${venue}\n${lambda}`;
+  for (const point of series.trades) key += `\n${point.price}`;
+  const cached = ewmaMemo.get(key);
+  if (cached !== undefined) {
+    ewmaBySeries.set(series, { venue, lambda, feature: cached });
+    return cached;
+  }
+  const computed = computeEwmaVolatilityUncached(venue, series, lambda);
+  ewmaMemo.set(key, computed);
+  ewmaBySeries.set(series, { venue, lambda, feature: computed });
+  if (ewmaMemo.size > EWMA_MEMO_LIMIT) {
+    const oldest = ewmaMemo.keys().next();
+    if (oldest.done !== true) ewmaMemo.delete(oldest.value);
+  }
+  return computed;
+}
+
+/**
+ * `THROUGHPUT-1a` (PERFORMANCE ONLY): one consecutive pair's quantized squared
+ * simple return — a pure function of the two prices. When the window slides
+ * by one point every pair but the newest is one the previous computation
+ * already squared, so the last {@link SQUARED_RETURN_MEMO_LIMIT} pairs are
+ * kept by their exact price strings (canonical decimals: the separator cannot
+ * occur in them). A hit is the value the expression below would produce.
+ */
+const SQUARED_RETURN_MEMO_LIMIT = 8_192;
+const squaredReturns = new Map<string, DecimalString>();
+
+function squaredReturn(previous: DecimalString, current: DecimalString): DecimalString {
+  const key = `${previous}/${current}`;
+  const cached = squaredReturns.get(key);
+  if (cached !== undefined) return cached;
+  const simpleReturn = dividePolicy(subDecimal(current, previous), previous);
+  const squared = quantizePolicy(mulDecimal(simpleReturn, simpleReturn));
+  squaredReturns.set(key, squared);
+  if (squaredReturns.size > SQUARED_RETURN_MEMO_LIMIT) {
+    const oldest = squaredReturns.keys().next();
+    if (oldest.done !== true) squaredReturns.delete(oldest.value);
+  }
+  return squared;
+}
+
+function computeEwmaVolatilityUncached(
   venue: ReferenceVenueName,
   series: ValidatedReferenceSeries | undefined,
   lambda: DecimalString,
@@ -98,8 +187,7 @@ function computeEwmaVolatility(
     const previous = points[index - 1];
     const current = points[index];
     if (previous === undefined || current === undefined) continue;
-    const simpleReturn = dividePolicy(subDecimal(current.price, previous.price), previous.price);
-    const squared = quantizePolicy(mulDecimal(simpleReturn, simpleReturn));
+    const squared = squaredReturn(previous.price, current.price);
     variance =
       variance === undefined
         ? squared

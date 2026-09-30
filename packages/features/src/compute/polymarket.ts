@@ -78,6 +78,32 @@ function executableOutcome(
 }
 
 export function computePolymarketFeatures(input: ValidatedFeatureInput): ComputedFeature[] {
+  return [...bookFeatures(input), computeRecentTrades(input)];
+}
+
+/**
+ * `THROUGHPUT-1a` (PERFORMANCE ONLY): the book features below read nothing
+ * but the parsed book and the two configured lists (`depthLevels`,
+ * `executableShares`) — no instant, no trade. The validated input carries the
+ * SAME parsed-book object for an unchanged serialization
+ * (`inputs.ts` `plainParsedBook`, deep-frozen), so their outcomes are kept per
+ * parsed book and configuration, and reused while the book is unchanged. The
+ * outcomes are never mutated downstream (`bindToRegistry` reads them;
+ * `ownFrozenTree` copies them).
+ */
+const bookFeatureMemo = new WeakMap<object, { readonly configKey: string; readonly features: readonly ComputedFeature[] }>();
+
+function bookFeatures(input: ValidatedFeatureInput): readonly ComputedFeature[] {
+  const parsed = input.book.parsed;
+  const configKey = `${input.config.depthLevels.join(",")}|${input.config.executableShares.join(",")}`;
+  const cached = bookFeatureMemo.get(parsed);
+  if (cached !== undefined && cached.configKey === configKey) return cached.features;
+  const features = computeBookFeatures(input);
+  bookFeatureMemo.set(parsed, { configKey, features });
+  return features;
+}
+
+function computeBookFeatures(input: ValidatedFeatureInput): ComputedFeature[] {
   const { bids, asks } = input.book.parsed;
   const bestBid = bids[0];
   const bestAsk = asks[0];
@@ -160,7 +186,6 @@ export function computePolymarketFeatures(input: ValidatedFeatureInput): Compute
         ),
   );
 
-  features.push(computeRecentTrades(input));
   return features;
 }
 

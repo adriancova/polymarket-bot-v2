@@ -75,6 +75,7 @@ import {
   isReservedRuntimeReasonCode,
   isRngState,
   materializeCheckpointableJson,
+  prepareEvaluationView,
   rebuildStateFromPatches,
   restoreCheckpoint,
   STRATEGY_STATE_CHECKPOINT_SCHEMA_VERSION,
@@ -428,6 +429,15 @@ const REGISTRY: Readonly<Record<string, Classification>> = {
     totality: "TOTAL",
     note: "the evaluation-view grammar; same path normalization",
   },
+  prepareEvaluationView: {
+    params: ["view"],
+    visibility: "PUBLIC",
+    shape: "function",
+    totality: "TOTAL",
+    note:
+      "THROUGHPUT-1a: the evaluation-view grammar's own inert copy, deep-frozen and registered; a " +
+      "value the grammar refuses is returned unchanged, so nothing here can throw",
+  },
   materializeImmutableParamsAt: {
     params: ["value", "path"],
     visibility: "PACKAGE",
@@ -608,6 +618,7 @@ const PUBLIC_TOTAL_CALLS: Readonly<Record<string, (args: readonly unknown[]) => 
   isReservedRuntimeReasonCode: (args) => isReservedRuntimeReasonCode(args[0] as string),
   isRngState: (args) => isRngState(args[0]),
   materializeCheckpointableJson: (args) => materializeCheckpointableJson(args[0]),
+  prepareEvaluationView: (args) => prepareEvaluationView(args[0]),
   rebuildStateFromPatches: (args) =>
     rebuildStateFromPatches(args[0] as Parameters<typeof rebuildStateFromPatches>[0]),
   restoreCheckpoint: (args) =>

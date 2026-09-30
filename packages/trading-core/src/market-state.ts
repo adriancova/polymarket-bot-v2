@@ -44,6 +44,7 @@
  */
 
 import { MarketOutcomeBooks, serializeBook, type OutcomeTokenBook } from "@polymarket-bot/order-book";
+import { prepareEvaluationView } from "@polymarket-bot/strategy-runtime";
 import type { MarketView, OrderBookView } from "@polymarket-bot/strategy-sdk";
 
 import type { MarketConfig } from "./config.js";
@@ -67,6 +68,9 @@ export interface ActiveIncident {
 }
 
 export type MarketLifecycle = "PENDING" | "OPEN" | "CLOSING" | "RESOLVED";
+
+/** `THROUGHPUT-1a`: prepared level objects one market keeps (see `MarketState` `#levelView`). */
+const LEVEL_VIEW_LIMIT = 4_096;
 
 export interface BookApplyProblem {
   readonly code: string;
@@ -190,10 +194,87 @@ export class MarketState {
     return outcome === "YES" ? this.books.yesBook : this.books.noBook;
   }
 
-  /** The canonical order-book v1 serialization the feature engine reads. */
+  /**
+   * The canonical order-book v1 serialization the feature engine reads.
+   *
+   * `THROUGHPUT-1a` (PERFORMANCE ONLY): memoized per outcome under the book's
+   * own revision — `updatesApplied()`, which `packages/order-book` advances on
+   * every applied snapshot and level change (the only paths that change the
+   * levels, the baseline, the last update or the venue hash), plus the tick
+   * size (the one serialized field a tick-size change moves). A refused update
+   * changes nothing and advances nothing. The books are this object's own
+   * (`new MarketOutcomeBooks` above), so the counter is the book's, not a
+   * caller's. Each event changes at most one token's book, so the other
+   * outcome's text is reused instead of re-serialized — the same string.
+   */
   serializedBook(outcome: "YES" | "NO"): string {
-    return serializeBook(this.bookFor(outcome));
+    const book = this.bookFor(outcome);
+    const updates = book.updatesApplied();
+    const tickSize = book.tickSize();
+    const cached = this.#serialized[outcome];
+    if (cached !== undefined && cached.updates === updates && cached.tickSize === tickSize) {
+      return cached.text;
+    }
+    const text = serializeBook(book);
+    this.#serialized[outcome] = { updates, tickSize, text };
+    return text;
   }
+
+  /** `THROUGHPUT-1a`: the memo behind {@link serializedBook}, per outcome. */
+  readonly #serialized: {
+    YES?: { readonly updates: number; readonly tickSize: string | undefined; readonly text: string };
+    NO?: { readonly updates: number; readonly tickSize: string | undefined; readonly text: string };
+  } = {};
+
+  /**
+   * `THROUGHPUT-1a`: one level of a view, `{ price, shares }`, as the strategy
+   * runtime's prepared (inert, frozen) object — the same data as a fresh
+   * frozen literal. A level change alters ONE level, so a view rebuilt after
+   * it reuses every other level's prepared object. Bounded, oldest first out.
+   */
+  #levelView(price: string, shares: string): unknown {
+    const key = `${price} ${shares}`;
+    const cached = this.#levelViews.get(key);
+    if (cached !== undefined) return cached;
+    const prepared = prepareEvaluationView(Object.freeze({ price, shares }));
+    this.#levelViews.set(key, prepared);
+    if (this.#levelViews.size > LEVEL_VIEW_LIMIT) {
+      const oldest = this.#levelViews.keys().next();
+      if (oldest.done !== true) this.#levelViews.delete(oldest.value);
+    }
+    return prepared;
+  }
+
+  readonly #levelViews = new Map<string, unknown>();
+
+  /**
+   * `THROUGHPUT-1a`: one side's ladder of a view, `[{ price, shares }, …]`
+   * (bids descending, asks ascending), as the strategy runtime's prepared
+   * array — reused while that side's ladder is unchanged, which is the case
+   * for three of the four sides after any level change. Keyed by the ladder's
+   * exact content.
+   */
+  #sideView(outcome: "YES" | "NO", side: "BID" | "ASK", book: OutcomeTokenBook): unknown {
+    const levels = book.levels(side);
+    let key = "";
+    for (const level of levels) key += `${level.price} ${level.size}\n`;
+    const slot = `${outcome}:${side}`;
+    const cached = this.#sideViews.get(slot);
+    if (cached !== undefined && cached.key === key) return cached.view;
+    const view = prepareEvaluationView(
+      Object.freeze(levels.map((level) => this.#levelView(level.price, level.size))),
+    );
+    this.#sideViews.set(slot, { key, view });
+    return view;
+  }
+
+  readonly #sideViews = new Map<string, { readonly key: string; readonly view: unknown }>();
+
+  /** `THROUGHPUT-1a`: the memo behind {@link bookView}, per outcome. */
+  readonly #views: {
+    YES?: { readonly updates: number; readonly fallbackAsOf: string | undefined; readonly view: OrderBookView };
+    NO?: { readonly updates: number; readonly fallbackAsOf: string | undefined; readonly view: OrderBookView };
+  } = {};
 
   /**
    * The §7.6 `MarketView` a strategy sees.
@@ -227,20 +308,32 @@ export class MarketState {
    * view stamped with "now" would make every book look fresh.
    */
   bookView(outcome: "YES" | "NO", fallbackAsOf: string): OrderBookView {
+    // `THROUGHPUT-1a` (PERFORMANCE ONLY): the view is deep-frozen and a pure
+    // function of the book's levels and last update — which only an applied
+    // update changes, and every applied update advances `updatesApplied()` —
+    // and, only when the last update carries no `receivedAt`, of
+    // `fallbackAsOf`. So one frozen view is shared while those are unchanged
+    // (see `serializedBook`).
     const book = this.bookFor(outcome);
+    const updates = book.updatesApplied();
     const lastUpdate = book.lastUpdate();
-    return Object.freeze({
-      bids: Object.freeze(
-        book.levels("BID").map((level) =>
-          Object.freeze({ price: level.price, shares: level.size }),
-        ),
-      ),
-      asks: Object.freeze(
-        book.levels("ASK").map((level) =>
-          Object.freeze({ price: level.price, shares: level.size }),
-        ),
-      ),
+    const fallback = lastUpdate?.receivedAt === undefined ? fallbackAsOf : undefined;
+    const cached = this.#views[outcome];
+    if (cached !== undefined && cached.updates === updates && cached.fallbackAsOf === fallback) {
+      return cached.view;
+    }
+    const built = Object.freeze({
+      bids: this.#sideView(outcome, "BID", book),
+      asks: this.#sideView(outcome, "ASK", book),
       asOf: lastUpdate?.receivedAt ?? fallbackAsOf,
     });
+    // The strategy runtime's own inert copy of this view, which its
+    // input acquisition then reuses rather than re-reading and re-freezing
+    // (`packages/strategy-runtime` `prepareEvaluationView`): the same data.
+    // Its levels are already the runtime's own (`#levelView`), so preparing
+    // the view copies two arrays and one instant, not every level.
+    const view = prepareEvaluationView(built) as OrderBookView;
+    this.#views[outcome] = { updates, fallbackAsOf: fallback, view };
+    return view;
   }
 }

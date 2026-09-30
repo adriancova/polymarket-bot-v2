@@ -135,6 +135,63 @@ function summarizeIssues(error: { readonly issues: readonly { readonly path: Pro
 }
 
 /** The §9.4 local order book for exactly one outcome token. */
+/**
+ * `THROUGHPUT-1a`: one side's derived values after ONE level change, from the
+ * values before it — the same values a full recomputation gives: the ladder
+ * is the same set of `[price, size]` pairs in the same (strict, total) price
+ * order, found by binary search with the comparator the sort uses; the share
+ * sum is exact decimal arithmetic, so removing the old size and adding the new
+ * one is the sum of the new sizes; the best price is the ladder's first.
+ * Answers `undefined` — recompute — if the previous values disagree with the
+ * change (they cannot, while every write goes through the book).
+ */
+function bringForward(
+  cached: SideCache,
+  change: { readonly price: DecimalString; readonly before: DecimalString | undefined; readonly after: DecimalString | undefined; readonly revision: number },
+  order: "descending" | "ascending",
+): SideCache | undefined {
+  const sorted = cached.sorted.slice();
+  let low = 0;
+  let high = sorted.length;
+  let found = -1;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    const entry = sorted[middle];
+    if (entry === undefined) return undefined;
+    const raw = compareDecimal(entry[0], change.price);
+    const cmp = order === "descending" ? -raw : raw;
+    if (cmp === 0) {
+      found = middle;
+      break;
+    }
+    if (cmp < 0) low = middle + 1;
+    else high = middle;
+  }
+  if (found !== -1) {
+    if (sorted[found]?.[1] !== change.before) return undefined;
+    if (change.after === undefined) sorted.splice(found, 1);
+    else sorted[found] = [change.price, change.after];
+  } else {
+    if (change.before !== undefined) return undefined;
+    if (change.after !== undefined) sorted.splice(low, 0, [change.price, change.after]);
+  }
+  let shares = cached.shares;
+  if (change.before !== undefined) shares = subDecimal(shares, change.before);
+  if (change.after !== undefined) shares = addDecimal(shares, change.after);
+  return { revision: change.revision, sorted, shares, best: sorted[0]?.[0] };
+}
+
+/** `THROUGHPUT-1a`: one side's derived values at one revision (see `OutcomeTokenBook`). */
+interface SideCache {
+  readonly revision: number;
+  /** `[price, size]` pairs, bids descending / asks ascending. Never handed out; `levels()` copies. */
+  readonly sorted: readonly (readonly [DecimalString, DecimalString])[];
+  /** The exact sum of the side's sizes. */
+  readonly shares: DecimalString;
+  /** The best price, as `#bestPrice` finds it. */
+  readonly best: DecimalString | undefined;
+}
+
 export class OutcomeTokenBook {
   readonly internalMarketId: InternalMarketId;
   readonly tokenId: TokenId;
@@ -150,6 +207,42 @@ export class OutcomeTokenBook {
   #lastUpdate: BookLastUpdate | undefined;
   /** Local diagnostic counter. NOT an ordinal, NOT a venue sequence (§9.4). */
   #updatesApplied = 0;
+
+  /**
+   * `THROUGHPUT-1a` — PERFORMANCE ONLY. Every query below is a pure function
+   * of one side's level map, and a consumer asks several of them per event
+   * (the serialization asks for both ladders, the top of book and the depth;
+   * the strategy's view asks for both ladders again), while an event changes
+   * at most ONE side of ONE book. Each side carries a revision that advances
+   * on every write to its map (a snapshot's replacement, a level change's set
+   * or delete), and each side's sorted ladder, share sum and best price are
+   * kept under the revision they were computed at. A query at the same
+   * revision answers what it would recompute — the same values, as fresh
+   * objects as before.
+   */
+  #bidRevision = 0;
+  #askRevision = 0;
+  /**
+   * The last level change, so the ONE side it touched can be brought forward
+   * from its previous revision (one binary search, one exact add and
+   * subtract) instead of re-sorted and re-summed. Cleared by a snapshot.
+   */
+  #lastLevelChange:
+    | {
+        readonly side: "BID" | "ASK";
+        readonly price: DecimalString;
+        /** The size at that price before the change, if the level existed. */
+        readonly before: DecimalString | undefined;
+        /** The size after the change, or `undefined` when it removed the level. */
+        readonly after: DecimalString | undefined;
+        /** The side's revision the change produced. */
+        readonly revision: number;
+      }
+    | undefined;
+  readonly #sideCache: {
+    BID: SideCache | undefined;
+    ASK: SideCache | undefined;
+  } = { BID: undefined, ASK: undefined };
 
   readonly #tick: TickState = {
     tickSize: undefined,
@@ -242,6 +335,9 @@ export class OutcomeTokenBook {
     for (const [price, size] of asks) {
       this.#asks.set(price, size);
     }
+    this.#bidRevision += 1;
+    this.#askRevision += 1;
+    this.#lastLevelChange = undefined;
 
     this.#baseline = {
       gatewayEpoch: meta.meta.gatewayEpoch,
@@ -320,6 +416,7 @@ export class OutcomeTokenBook {
     }
 
     const side = payload.side === "BID" ? this.#bids : this.#asks;
+    const before = side.get(payload.price);
     if (compareDecimal(payload.size, "0") === 0) {
       // ADR-013 §2: size zero DELETES the level. Removing an absent level is
       // a no-op by the same rule — the venue asserts absence, and it is absent.
@@ -328,6 +425,15 @@ export class OutcomeTokenBook {
       // ADR-013 §2: REPLACE, never accumulate.
       side.set(payload.price, payload.size);
     }
+    if (payload.side === "BID") this.#bidRevision += 1;
+    else this.#askRevision += 1;
+    this.#lastLevelChange = {
+      side: payload.side,
+      price: payload.price,
+      before,
+      after: side.get(payload.price),
+      revision: payload.side === "BID" ? this.#bidRevision : this.#askRevision,
+    };
     if (payload.venueBookHash !== undefined) {
       this.#lastVenueBookHash = payload.venueBookHash;
     }
@@ -401,8 +507,8 @@ export class OutcomeTokenBook {
 
   /** Best bid, best ask, and exact spread (§9.4). */
   topOfBook(): TopOfBook {
-    const bestBid = this.#bestPrice(this.#bids, "max");
-    const bestAsk = this.#bestPrice(this.#asks, "min");
+    const bestBid = this.#side("BID").best;
+    const bestAsk = this.#side("ASK").best;
     const result: {
       bestBidPrice?: DecimalString;
       bestBidSize?: DecimalString;
@@ -426,29 +532,57 @@ export class OutcomeTokenBook {
 
   /** Level counts and exact per-side share sums (§9.4 depth). */
   depth(): BookDepth {
-    let bidShares: DecimalString = "0";
-    for (const size of this.#bids.values()) {
-      bidShares = addDecimal(bidShares, size);
-    }
-    let askShares: DecimalString = "0";
-    for (const size of this.#asks.values()) {
-      askShares = addDecimal(askShares, size);
-    }
     return {
       bidLevels: this.#bids.size,
       askLevels: this.#asks.size,
-      bidShares,
-      askShares,
+      bidShares: this.#side("BID").shares,
+      askShares: this.#side("ASK").shares,
     };
   }
 
   /** Bids descending / asks ascending, matching the domain payload ordering. */
   levels(side: "BID" | "ASK"): readonly BookLevelView[] {
+    return this.#side(side).sorted.map(([price, size]) => ({ price, size }));
+  }
+
+  /**
+   * `THROUGHPUT-1a`: one side's derived values at its current revision —
+   * computed exactly as the queries always computed them, once per revision.
+   */
+  #side(side: "BID" | "ASK"): SideCache {
+    const revision = side === "BID" ? this.#bidRevision : this.#askRevision;
+    const cached = this.#sideCache[side];
+    if (cached !== undefined && cached.revision === revision) return cached;
+    const change = this.#lastLevelChange;
+    if (
+      cached !== undefined &&
+      change !== undefined &&
+      change.side === side &&
+      change.revision === revision &&
+      cached.revision === revision - 1
+    ) {
+      const forward = bringForward(cached, change, side === "BID" ? "descending" : "ascending");
+      if (forward !== undefined) {
+        this.#sideCache[side] = forward;
+        return forward;
+      }
+    }
     const map = side === "BID" ? this.#bids : this.#asks;
     const sorted = [...map.entries()].sort((a, b) =>
       side === "BID" ? compareDecimal(b[0], a[0]) : compareDecimal(a[0], b[0]),
     );
-    return sorted.map(([price, size]) => ({ price, size }));
+    let shares: DecimalString = "0";
+    for (const size of map.values()) {
+      shares = addDecimal(shares, size);
+    }
+    const computed: SideCache = {
+      revision,
+      sorted,
+      shares,
+      best: this.#bestPrice(map, side === "BID" ? "max" : "min"),
+    };
+    this.#sideCache[side] = computed;
+    return computed;
   }
 
   /** The venue-provided book hash last carried by an applied event (§9.4). */

@@ -517,6 +517,58 @@ export function materializeEvaluationViewAt(value: unknown, path: string): Mater
 }
 
 /**
+ * `THROUGHPUT-1a` — PREPARED evaluation views. PERFORMANCE ONLY: an
+ * evaluation whose input carries a prepared view is the evaluation the raw
+ * view produces.
+ *
+ * A trader hands the runtime both outcomes' order-book views on every
+ * evaluation, and a book changes only when an event for its token arrives, so
+ * the unchanged side was re-materialized and re-frozen (hundreds of levels)
+ * on every call. {@link prepareEvaluationView} reads a view ONCE, under the
+ * very grammar `acquireEvaluationInput` reads the input with, and answers that
+ * inert copy deep-frozen and registered in a `WeakMap` this module owns. Met
+ * again inside an input — at a depth where its containers stay within the
+ * grammar's bound — the walk answers the registered copy itself instead of
+ * copying it once more (the copy it would make is equal to it: plain data the
+ * runtime built, no accessor, nothing a read could change), and
+ * {@link deepFreeze} skips it (it is frozen all the way down already).
+ *
+ * A value the grammar would REFUSE is returned unchanged (unprepared), so the
+ * evaluation refuses it exactly as before. Registration is by identity in a
+ * module-owned map: nothing a caller builds, and no Proxy, can pass for a
+ * prepared view, and the check runs no caller code.
+ */
+const PREPARED_VIEWS = new WeakMap<object, { readonly height: number }>();
+
+/** Prepares one evaluation-input view (see {@link PREPARED_VIEWS}). **Never throws.** */
+export function prepareEvaluationView(view: unknown): unknown {
+  const materialized = materializeWith(view, "view", EVALUATION_VIEW);
+  if (!materialized.ok || materialized.value === null || typeof materialized.value !== "object") {
+    return view;
+  }
+  const tree = deepFreeze(materialized.value);
+  PREPARED_VIEWS.set(tree, { height: containerHeight(tree) });
+  return tree;
+}
+
+/** Containers on the longest root-to-leaf path of a tree the runtime built (1 for a flat one). */
+function containerHeight(root: object): number {
+  let deepest = 0;
+  const stack: { readonly container: object; readonly depth: number }[] = [{ container: root, depth: 1 }];
+  while (stack.length > 0) {
+    const top = stack.pop();
+    if (top === undefined) break;
+    if (top.depth > deepest) deepest = top.depth;
+    for (const member of Object.values(top.container)) {
+      if (member !== null && typeof member === "object") {
+        appendOwn(stack, { container: member as object, depth: top.depth + 1 });
+      }
+    }
+  }
+  return deepest;
+}
+
+/**
  * The same walk under the DECISION grammar: the inert copy the runtime takes of
  * the value a strategy callback returned, before the door parses it and before
  * D3 reads the persisted decision back off it.
@@ -761,6 +813,15 @@ function beginValue(
             "boundary materializes — deeper structures are refused rather than handed to " +
             "consumers whose own recursion limits are unknown",
         );
+      }
+      // `THROUGHPUT-1a`: a prepared view is already this walk's answer under
+      // its own grammar, wherever its deepest container stays in bounds (see
+      // `PREPARED_VIEWS`).
+      if (grammar === EVALUATION_VIEW) {
+        const prepared = PREPARED_VIEWS.get(value);
+        if (prepared !== undefined && depth + prepared.height - 1 < grammar.maxDepth) {
+          return { ok: true, frame: null, value };
+        }
       }
       // `typeof` is the only operation performed on the value before this
       // point, and it is the only one that cannot run caller code. Everything
@@ -1261,6 +1322,10 @@ export function deepFreeze<T>(value: T): T {
       continue;
     }
     seen.add(asObject);
+    // `THROUGHPUT-1a`: a prepared view is frozen all the way down already.
+    if (PREPARED_VIEWS.has(asObject)) {
+      continue;
+    }
     Object.freeze(asObject);
     for (const key of Reflect.ownKeys(asObject)) {
       appendOwn(stack, (asObject as Record<PropertyKey, unknown>)[key]);
