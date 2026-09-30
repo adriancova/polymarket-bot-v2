@@ -76,17 +76,37 @@
  *
  * The other stop is unchanged: the loop REFUSING an event at its bounded
  * ingest queue. §8.3 forbids dropping it, the loop has already latched
- * `QUEUE_BACKPRESSURE`, and continuing would replay a stream with a hole in it.
+ * `QUEUE_BACKPRESSURE`, and continuing would replay a stream with a hole in it. *
+ * ## One drain per recorded FRAME (`THROUGHPUT-2`, ADR-024)
+ *
+ * The core evaluates once per venue frame, and treats the end of what one
+ * drain was handed as the end of a frame (`@polymarket-bot/trading-core`
+ * `CoreLoop.drain`) — the same obligation the live Redis feed meets. A
+ * recorded raw frame is one record, and a normalizer may derive several
+ * envelopes from it (a two-token `price_change`), all stamped with the
+ * record's identity; the core groups them by that identity
+ * (`trading-core` `frames.ts`). So given a {@link ReplayFraming}, this driver
+ * ingests each envelope as it arrives but DRAINS only at the last envelope of
+ * its record: the core then evaluates the frame once, fully applied, exactly
+ * as the live trader evaluates the frame the gateway published from that
+ * record. Every envelope of one record carries the record's recorded instant
+ * and identity, so deferring its drain to the record's last envelope moves
+ * neither the replay clock nor the venue's position. Without a framing (a
+ * caller that did not wrap its normalizer) every envelope is drained at once,
+ * as before. The `run` command's assembly always wires one.
  */
 
 import {
   simulationFailure,
   simulationOk,
   type EventEnvelope,
+  type NormalizeOutcome,
   type RecordedEventIdentity,
   type ReplayClock,
   type ReplayCoreLoop,
   type ReplayEventContext,
+  type ReplayNormalizer,
+  type ReplayRecord,
   type SimulationResult,
 } from "@polymarket-bot/simulation";
 
@@ -141,6 +161,67 @@ export interface ReplayDriverHalts {
   records(): readonly { readonly code: string; readonly scope: { readonly kind: string } }[];
 }
 
+/**
+ * `THROUGHPUT-2` (ADR-024): which delivered envelope is the LAST of its
+ * recorded record — so the driver drains once per recorded frame. Built by
+ * {@link recordFraming}; learns each record's envelopes through the
+ * normalizer it wraps.
+ */
+export interface ReplayFraming {
+  /**
+   * The same normalizer — same `normalizerVersion`, same answer for every
+   * record — that also tells this framing which envelope ends each record.
+   * Hand THIS to the replay (`runBacktest`'s `normalizer`).
+   */
+  wrap(normalizer: ReplayNormalizer): ReplayNormalizer;
+  /**
+   * Does this delivered envelope end its record? `true` for a record the
+   * wrapped normalizer never answered for (nothing is ever held back that
+   * the framing cannot account for).
+   */
+  closesFrame(context: ReplayEventContext): boolean;
+}
+
+/** The record identity a framing keys by: `(gatewayEpoch, ingestSeq)`, unique per record. */
+function recordKey(frame: { readonly gatewayEpoch: string; readonly ingestSeq: string }): string {
+  return `${frame.gatewayEpoch}:${frame.ingestSeq}`;
+}
+
+/**
+ * A {@link ReplayFraming} over the records a replay normalizes. It keeps, per
+ * record not yet fully delivered, the `eventId` of the record's last
+ * envelope — bounded by the records in flight (one, since the event source
+ * delivers a record's envelopes before it normalizes the next).
+ */
+export function recordFraming(): ReplayFraming {
+  const lastEnvelopeOf = new Map<string, string>();
+  return {
+    wrap(normalizer: ReplayNormalizer): ReplayNormalizer {
+      return {
+        normalizerVersion: normalizer.normalizerVersion,
+        normalize(record: ReplayRecord): NormalizeOutcome {
+          const outcome = normalizer.normalize(record);
+          if (outcome.ok) {
+            const last = outcome.envelopes[outcome.envelopes.length - 1];
+            if (outcome.envelopes.length > 1 && last !== undefined) {
+              lastEnvelopeOf.set(recordKey(record.frame), last.eventId);
+            }
+          }
+          return outcome;
+        },
+      };
+    },
+    closesFrame(context: ReplayEventContext): boolean {
+      const key = recordKey(context.record.frame);
+      const last = lastEnvelopeOf.get(key);
+      if (last === undefined) return true;
+      if (last !== context.envelope.eventId) return false;
+      lastEnvelopeOf.delete(key);
+      return true;
+    },
+  };
+}
+
 /** Inputs to {@link replayDrivenCoreLoop}. */
 export interface ReplayDrivenCoreLoopOptions {
   /** The shared core — the core's `CoreLoop`, taken structurally. */
@@ -156,6 +237,11 @@ export interface ReplayDrivenCoreLoopOptions {
    * it cannot see a halt and delivers every recorded event.
    */
   readonly halts?: ReplayDriverHalts;
+  /**
+   * `THROUGHPUT-2`: drain once per recorded frame (module header). Absent:
+   * every envelope is drained as it arrives, as before.
+   */
+  readonly framing?: ReplayFraming;
 }
 
 /** The latched halts, as `CODE@SCOPE`, in the latch's own stable order. */
@@ -281,6 +367,12 @@ export function replayDrivenCoreLoop(options: ReplayDrivenCoreLoopOptions): Repl
       );
     }
     eventsIngested += 1;
+
+    // `THROUGHPUT-2`: an envelope that does not end its recorded frame is
+    // queued, not drained — the core evaluates the frame at its last envelope.
+    if (options.framing !== undefined && !options.framing.closesFrame(context)) {
+      return simulationOk(null);
+    }
 
     await options.loop.drain();
     drains += 1;

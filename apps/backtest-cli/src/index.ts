@@ -42,8 +42,9 @@ export {
 } from "./normalizer.js";
 export type { PolymarketNormalizerOptions } from "./normalizer.js";
 
-export { endOfRunBoundTo, replayDrivenCoreLoop } from "./core-loop.js";
+export { endOfRunBoundTo, recordFraming, replayDrivenCoreLoop } from "./core-loop.js";
 export type {
+  ReplayFraming,
   ReplayDriverHalts,
   ReplayDriverObservations,
   ReplayDrivenCoreLoop,
