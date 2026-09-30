@@ -40,6 +40,7 @@ This file is the brief: current state only, one entry per item. The full history
 Only rows marked **Ready (authorized)** may be started. Each row's allowed and forbidden paths are in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md) (search for the id).
 
 - `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
+- **`WP-300`**: Ready (authorized) 2026-09-30 under the Wave 3 authorization. Collateral inventory, reservations and a wallet-operation state machine, PAPER only (modelled; no signing, no transaction, no bridge or withdrawal). Verifier: gpt-6-astra. Loop `wf_7bc7e519-3c5`.
 - **`LEAN-GOV`**: Ready (authorized) 2026-09-30, from the user's `LEAN-1` rulings (H, A1-A5). Docs only: ADR-025 onward (the laptop host profile, evaluation cadence, checkpoint-on-change, raw retention with pins, the approximate dataset class, series auto-admission), plus work-plan rows for the `LEAN-1` rounds. Verifiers: Opus and gpt-6-astra, reconciled (a docs round).
 - **`STORAGE-1`** and **`HOST-BENCH`**: authorized 2026-09-30; they start after `LEAN-GOV` merges.
 - **`THROUGHPUT-1c`**: authorized by the user on 2026-09-29; startable now, because the Wave 2 closeout is done. It runs alongside Wave 3.
@@ -154,6 +155,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `WP-260` | Secure unified-SDK adapter and signer boundary | Complete (2026-09-30) | `32d10be` | [WP-260](docs/handoffs/WP-260.md) |
 | `DEPS-2` | CI health: `@grpc/grpc-js` high advisory (dev/test-only) | Complete (2026-09-30) | `c5967b4` | [DEPS-2](docs/handoffs/DEPS-2.md) |
 | `CI-3` | run WP-260's secure-SDK contract suite in CI (`WP260-L1`) | Complete (2026-09-30) | `a145fa4` | [CI-3](docs/handoffs/CI-3.md) |
+| `WP-300` | Collateral inventory and wallet operations | **Ready (authorized)** 2026-09-30 (Wave 3) | — | — |
 | `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
 | `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | **Ready (authorized)** 2026-09-30 | — | — |
 | `HOST-BENCH-PREP` | the laptop guide and host measurement tools | Complete (2026-09-30) | `1710a86` | [HOST-BENCH-PREP](docs/handoffs/HOST-BENCH-PREP.md) |
