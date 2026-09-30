@@ -153,6 +153,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `CLOSEOUT-2B` | focused re-grade of Wave 2 after `DURABLE-1` | Complete (2026-09-30): WAVE 2 CLOSED WITH QUALIFICATIONS, after the user's CANCEL ruling | — (an audit; no merge) | [CLOSEOUT-2B](docs/handoffs/CLOSEOUT-2B-wave-2-regrade.md) |
 | `WP-260` | Secure unified-SDK adapter and signer boundary | Complete (2026-09-30) | `32d10be` | [WP-260](docs/handoffs/WP-260.md) |
 | `DEPS-2` | CI health: `@grpc/grpc-js` high advisory (dev/test-only) | Complete (2026-09-30) | `c5967b4` | [DEPS-2](docs/handoffs/DEPS-2.md) |
+| `CI-3` | run WP-260's secure-SDK contract suite in CI (`WP260-L1`) | Complete (2026-09-30) | `a145fa4` | [CI-3](docs/handoffs/CI-3.md) |
 | `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
 | `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | **Ready (authorized)** 2026-09-30 | — | — |
 | `HOST-BENCH-PREP` | the laptop guide and host measurement tools | Complete (2026-09-30) | `1710a86` | [HOST-BENCH-PREP](docs/handoffs/HOST-BENCH-PREP.md) |
@@ -186,7 +187,6 @@ Open rows only, one line each. An owner beginning "row:" is quoted from the arch
 | Id | Residual | Owner |
 | --- | --- | --- |
 | `DURABLE1-LOWS` | LOW-3: in group mode a decision and its checkpoint can commit in separate transactions (no production `restoreFrom` caller yet). LOW-6: the commit cost on placement-heavy bursts is unmeasured. R2-LOW-7: a CANCEL from a later decision can wait on an earlier decision's placement write. | the first production `restoreFrom` round; a throughput round |
-| `WP260-L1` | The `test/contract/polymarket-secure` suite (2 files, 31 tests) is not in the root `test:contract` script or the CI contract step. Wiring it needs the protected root `package.json` and `ci.yml`. | the orchestrator (a CI round) |
 | `CI-FLAKE-STALL-BOUND` | `test/integration/data-gateway/publish-throughput.test.ts` "a transport that stops answering" pins a timing bound (≤ 302). CI read 303 once (PR #29 attempt 1). TP1B-R1-L5 flagged it. | a data-gateway test round |
 | `CO2-N1` | Live admission (risk freshness, book age, seconds-to-close) runs on event time (`envelope.receivedAt`), so a stale backlog can approve entries after close. Masked today by the settlement veto. | an ADR and a trading-core round, before any settlement veto is lifted and before `WP-270` |
 | `CO2-N3` | The per-code risk-veto panel cannot show a code's first veto: its series is born at 1, and `increase()` reads 0. The refused-exit and recommendation families have the same problem. | a control-api / dashboard round |

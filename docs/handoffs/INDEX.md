@@ -107,3 +107,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-30 | [DEPS-2.md](DEPS-2.md) | `DEPS-2`: patch `@grpc/grpc-js` for GHSA-m9gg-hp2v-232j | Round | Complete (2026-09-30) | `c5967b4` | 1 KB |
 | 2026-09-30 | [WP-260.md](WP-260.md) | `WP-260`: secure unified-SDK adapter and signer boundary | WP | Complete (2026-09-30) | `32d10be` | 38 KB |
 | 2026-09-30 | [HOST-BENCH-PREP.md](HOST-BENCH-PREP.md) | `HOST-BENCH-PREP`: the laptop guide and host measurement tools | Round | Complete (2026-09-30) | `1710a86` | 23 KB |
+| 2026-09-30 | [CI-3.md](CI-3.md) | `CI-3`: run the secure-SDK contract suite in CI | Round | Complete (2026-09-30) | `a145fa4` | 1 KB |
