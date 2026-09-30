@@ -153,6 +153,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `DURABLE-1` | `X1`: a decision is durable before its venue and ledger effects | Complete (2026-09-30) | `6e01228` | [DURABLE-1](docs/handoffs/DURABLE-1.md) |
 | `CLOSEOUT-2B` | focused re-grade of Wave 2 after `DURABLE-1` | Complete (2026-09-30): WAVE 2 CLOSED WITH QUALIFICATIONS, after the user's CANCEL ruling | — (an audit; no merge) | [CLOSEOUT-2B](docs/handoffs/CLOSEOUT-2B-wave-2-regrade.md) |
 | `WP-260` | Secure unified-SDK adapter and signer boundary | **Ready (authorized)** 2026-09-30 | — | — |
+| `DEPS-2` | CI health: `@grpc/grpc-js` high advisory (dev/test-only) | Complete (2026-09-30) | `c5967b4` | [DEPS-2](docs/handoffs/DEPS-2.md) |
 | `LEAN-1` | design a sub-$100/mo first deployment | Complete (2026-09-30): planned and ruled | — (a plan) | [LEAN-1](docs/handoffs/LEAN-1.md) |
 | `LEAN-GOV` | the LEAN-1 ADRs and work-plan rows | **Ready (authorized)** 2026-09-30 | — | — |
 | `STORAGE-1` | research tier, pins, verified raw expiry, disk metrics | Authorized; after `LEAN-GOV` | — | — |
