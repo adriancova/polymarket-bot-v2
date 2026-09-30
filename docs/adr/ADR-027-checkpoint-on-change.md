@@ -21,9 +21,9 @@
    says "a persisted decision ALWAYS has its checkpoint" and "checkpoint state
    after every persisted decision". `OUTAGE-2` records the result:
    `checkpointSeq == evaluationSeq`.
-3. So checkpoints grow as fast as decisions. `LEAN-1` §4 estimates at most
-   105 MB a day per market with today's checkpoints, and at most 50 MB after
-   this change.
+3. So checkpoints grow as fast as decisions. `LEAN-1` §4 puts the whole
+   PostgreSQL tier, after the ADR-026 cadence change, at up to 105 MB a day
+   per market with today's checkpoints, and up to 50 MB with this change.
 4. A checkpoint carries the strategy state bytes, the instance status, and the
    seeded RNG's state (`WP-170` decision 7). The evaluation sequence is on every
    decision row.
@@ -58,7 +58,6 @@ these holds:
 2. **Status change:** the instance status differs from the last checkpoint's.
    For example, the instance was paused.
 3. **RNG change:** the seeded RNG's state differs from the last checkpoint's.
-   That is, the callback drew from `ctx.rng`, or a rollback moved it.
 4. **Start:** the first decision of an instance in a run.
 5. **Stop:** the decision of `onStop`.
 6. **Heartbeat:** at least 60 s of event time have passed since the last
@@ -134,9 +133,10 @@ yields identical state and decisions."
 
 ## Consequences
 
-- **The database shrinks again.** `LEAN-1` estimates about half of today's
-  checkpoint volume or less. `HOST-BENCH` measures the real saving with
-  `count(DISTINCT state_hash)` on the H1 databases.
+- **The database shrinks again.** `LEAN-1` §4 estimates the PostgreSQL tier,
+  after ADR-026, falls from up to 105 MB to up to 50 MB a day per market.
+  `HOST-BENCH` measures the real saving with `count(DISTINCT state_hash)` on
+  the H1 databases.
 - **Restore gets more complex.** It needs the last checkpoint and the highest
   `evaluationSeq`. The design must be reviewed in `CKPT-1`.
 - **After ADR-026 this is an optimisation.** It blocks no launch round.

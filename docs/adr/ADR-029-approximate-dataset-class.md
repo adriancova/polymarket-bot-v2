@@ -52,9 +52,13 @@ The proposal the user accepted (`LEAN-1` §6, row A4):
 3. A version 1 manifest has no `fidelity` field. A reader treats it as
    `exact`, because every version 1 dataset was compacted from raw WAL.
 4. A research-tier dataset is `approximate`. Its manifest pins the research-tier
-   objects and their digests, and the downsampling version, instead of raw
-   segment ids.
-5. The field is required in version 2. A reader refuses a version 2 manifest
+   objects and their digests, and the downsampling version. An approximate
+   replay reads these, not raw segments.
+5. The manifest also lists every source segment the research tier was built
+   from, with its `segmentSha256` and `segmentFileSha256`. This is provenance,
+   and the deletion-time identity that ADR-028 Decision 2.6 needs. An
+   approximate replay does not read the segments.
+6. The field is required in version 2. A reader refuses a version 2 manifest
    without it.
 
 ### 2. What an approximate dataset may never be used for
@@ -106,7 +110,7 @@ future venue timestamps unavailable to the live process."
 | --- | --- | --- |
 | Handoff §8.4 | "Replay consumes the same normalized event envelopes in the exact recorded dispatch order." | Unchanged for exact datasets. Approximate replay consumes research-tier samples in available-instant order (Decision 5) |
 | Handoff §12.4 | "A fixed dataset, code commit, config, feature version, model version, simulator version, and seed must produce byte-identical …" | Unchanged. Only an `exact` dataset can be determinism evidence (Decision 2) |
-| Handoff §12.5 | "Every replay run pins: raw segment IDs and checksums …" | An exact replay pins these. An approximate replay pins research-tier objects and checksums and the downsampling version instead, plus every other §12.5 item |
+| Handoff §12.5 | "Every replay run pins: raw segment IDs and checksums …" | An exact replay pins these. An approximate replay pins research-tier objects and checksums and the downsampling version instead, plus every other §12.5 item. Its manifest still lists the source segments' checksums (Decision 1.5) |
 | ADR-017 (manifest format) | `polymarket-bot/dataset-manifest/v1`, `DATASET_MANIFEST_VERSION = 1`, no `fidelity` field | Version 2 adds the required `fidelity` field. Version 1 reads as `exact` (Decision 1) |
 | ADR-012 §1 | three tiers: Tier 0, Tier 1, execution calibration | Unchanged. An approximate result ranks below all three (Decision 3) |
 

@@ -74,6 +74,16 @@ A segment is deleted only when **all** of these hold:
    the ADR-017 §4 way: re-fetched and re-verified against its persisted
    manifest.
 5. No operator pin covers the segment.
+6. **The bytes are the ones that were extracted.** The verified research-tier
+   manifest lists the segment as a source, with its `segmentSha256` and
+   `segmentFileSha256` (ADR-017 §1). Both were computed from the bytes the
+   research tier was built from. Every overlapping pin manifest lists the
+   same two digests for the segment.
+7. **The file is checked at deletion time.** Just before deletion, the file
+   must hash to that `segmentSha256` over its checksummed span, and to that
+   `segmentFileSha256` over its full length. This is ADR-017 §1's
+   deletion-time identity check, as `retention-proof.ts` runs it today. A
+   truncated, changed or replaced file fails it and is kept.
 
 If any condition fails, the segment is kept. **Never expire what is not
 extracted, or what is pinned.** A stuck expiry is a page (`LEAN-1` §8).
@@ -113,13 +123,15 @@ extracted, or what is pinned.** A stuck expiry is a page (`LEAN-1` §8).
 2. A deletion under Decision 2 has a new basis, **expired after extract**. Its
    records are not all kept anywhere. Its receipt entry names:
    - the segment's id and its WAL-chain digest (`segmentSha256`);
-   - its file digest, computed at deletion time;
+   - its whole-file digest (`segmentFileSha256`), checked at deletion time
+     against the value pinned in the research-tier manifest (Decision 2.7);
    - the verified research-tier object it relied on;
    - every verified pin dataset that overlaps it, or none.
 3. The receipt format gets a new version (`RETENTION_RECEIPT_VERSION` 1 → 2).
    A reader must still accept version 1.
 4. The receipt stays reporting, not proof. The proof of a deletion is the
-   verified research-tier manifest and the verified pin manifests.
+   verified research-tier manifest and the verified pin manifests, with the
+   source-segment digests they pin (Decision 2.6).
 5. A crash between a deletion and its receipt must not lose the fact of the
    deletion. `STORAGE-1` persists the expiry plan before it deletes anything.
 6. Manifests stay immutable. No deletion state is written into a manifest.
@@ -173,13 +185,15 @@ extracted, or what is pinned.** A stuck expiry is a page (`LEAN-1` §8).
 | ADR-004 §5 | "Compaction never deletes a WAL segment until Parquet upload and checksum verification both succeed" | The same, plus the second path of Decision 2 |
 | ADR-004, Consequences | "The delete-after-verify rule means a broken upload path fills the disk instead of losing data." | Still true. A broken extract or pin path stops expiry, and the disk fills to `maxTotalBytes` (Decision 5) |
 | ADR-017 §4 | "The *proof* a deletion relies on is the persisted dataset manifest itself …"; "every deleted record is in a verified object it pins." | For the expired-after-extract basis, the proof is the verified research-tier and pin manifests. Not every deleted record is kept. The receipt is still reporting, not proof, and manifests stay immutable (Decision 4) |
-| Handoff §8.4 | "Dataset manifests include all segment checksums, gateway epochs, event ranges, and excluded data-quality windows." | Unchanged for exact datasets, which now exist only for pins and for raw data under 72 h old (Decision 7) |
+| Handoff §8.4 | "Dataset manifests include all segment checksums, gateway epochs, event ranges, and excluded data-quality windows." | Unchanged for exact datasets, which now exist only for pins and for raw data under 72 h old (Decision 7). A research-tier manifest also lists the checksums of every source segment (Decision 2.6) |
 | Handoff §12.5 | "Every replay run pins: raw segment IDs and checksums …" | Unchanged for exact replays. An approximate replay pins research-tier objects instead (ADR-029) |
 | Handoff §12.4 | "A fixed dataset … must produce byte-identical …" | Unchanged for every dataset that exists. Exact datasets older than 72 h exist only as pins (Decision 7) |
 | `WP-130` acceptance | "WAL is not deleted before verified upload." | WAL is not deleted before verified upload, or, under ADR-028, before the research tier and every covering pin are verified |
 
 Not amended: §6 invariant 4 (Decision 6), §4.2's hard capacity threshold, and
-ADR-017 §1-§3.
+ADR-017 §1-§3. ADR-017 §1 still binds every deletion: the file must match its
+pinned `segmentFileSha256` over its full length (Decisions 2.6 and 2.7). Under
+this ADR the pinning manifest may be the research-tier manifest.
 
 ## Consequences
 
@@ -187,8 +201,9 @@ ADR-017 §1-§3.
   is on disk at any time (`LEAN-1` §4).
 - **Exact replay of a quiet stretch older than 72 hours is gone for good.**
 - **A retention bug could delete evidence, or stall and fill the disk.** The
-  guards are verify-before-delete, pins that expiry cannot touch, receipts, and
-  a hard stop that halts recording rather than loses data.
+  guards are verify-before-delete, a deletion-time file check against pinned
+  digests, pins that expiry cannot touch, receipts, and a hard stop that
+  halts recording rather than loses data.
 - **Expiry depends on the trader.** A segment cannot expire until its windows
   are classified, so a stopped trader stops expiry. The disk alarms cover it.
 - **Intent and refusal evidence ages out.** After 30 days, those windows have
@@ -200,7 +215,7 @@ ADR-017 §1-§3.
   and "The user's rulings (2026-09-30)".
 - `docs/spec/polymarket-bot-orchestrator-handoff.md` §2, §4.2, §6 invariant 4,
   §8.4, §9.1, §12.4, §12.5.
-- ADR-004 §5 and Consequences; ADR-017 §1 and §4.
+- ADR-004 §5 and Consequences; ADR-017 §1 (the two digests) and §4.
 - `packages/storage-parquet/src/retention-receipt.ts`,
   `retention-proof.ts` and `constants.ts` (`RETENTION_RECEIPT_VERSION = 1`).
 - `packages/storage-wal/src/writer.ts` (`maxTotalBytes`);

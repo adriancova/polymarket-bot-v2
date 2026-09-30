@@ -1298,6 +1298,8 @@ work_packages:
   # maximum_run_mode. THROUGHPUT-1c is a round recorded in
   # IMPLEMENTATION_STATUS.md, not an entry in this file; "depends_on" names it
   # where a round must wait for its merge (LEAN-1 §7, "After 1c").
+  # CADENCE-1, ROLLOVER-1 and CKPT-1 all hold packages/trading-core/** and
+  # apps/trader/src/**. They run one at a time, never concurrently (AGENTS.md).
   - id: LEAN-GOV
     phase: phase-3
     title: LEAN-1 rulings as ADRs and work-plan entries
@@ -1368,6 +1370,7 @@ work_packages:
       - disk, pin-budget and expiry-lag metrics
     acceptance:
       - A segment is never deleted unless it is 72 h old, its research tier is verified, its windows are classified, and every overlapping pin is verified.
+      - The research-tier manifest and every overlapping pin manifest list each source segment's segmentSha256 and segmentFileSha256; just before deletion the file must hash to both pinned digests (segmentFileSha256 over its full length), or it is kept (ADR-028 Decision 2.6-2.7, ADR-017 §1).
       - A pinned or unclassified segment is never deleted.
       - A fill pin is never evicted or reduced; a budget overrun only alarms.
       - Every source event in a fill's chain lies inside its pin.
@@ -1407,12 +1410,19 @@ work_packages:
   - id: CADENCE-1
     phase: phase-3
     title: Evaluation cadence per ADR-026
-    goal: Evaluate onFeatures at most once per market per evaluationIntervalMs of event time, plus a heartbeat, with both settings pinned in the run manifest.
+    goal: Evaluate onFeatures at most once per market per evaluationIntervalMs of event time, plus a heartbeat, with both settings pinned in the run record.
     depends_on: [LEAN-GOV, THROUGHPUT-1c]
     allowed_paths:
       - packages/trading-core/**
       - apps/trader/src/**
       - apps/backtest-cli/src/**
+      # The health door and the metric shapes list every loop counter strictly;
+      # evaluationsCoalesced must be added there in the same round.
+      - apps/control-api/src/**
+      - packages/observability/src/**
+      - test/integration/control-api/**
+      - test/unit/control-api/**
+      - test/unit/trader/**
       - test/integration/paper-trader/**
       - test/e2e/**
       - test/replay-golden/**
@@ -1424,14 +1434,16 @@ work_packages:
       - packages/polymarket-secure/**
     deliverables:
       - the ADR-026 D2 rule, driven by event time only
-      - evaluationIntervalMs and evaluationHeartbeatMs run settings in the run manifest
-      - an evaluationsCoalesced health counter
+      - evaluationIntervalMs and evaluationHeartbeatMs run settings, pinned in the run record (ADR-026 D1.4)
+      - an evaluationsCoalesced health counter, carried by the control-api health door and the observability metric shapes
       - a list of every changed golden, each explained
     acceptance:
       - Fill, order-update, lifecycle, start and stop callbacks fire exactly as before.
-      - A skipped evaluation persists no decision; every invoked callback persists exactly one.
+      - A coalesced market is not evaluated and persists no decision; every invoked callback persists exactly one.
       - The same dataset and settings give byte-identical decisions; no wall clock is read.
-      - A backward step in event time never stops evaluation.
+      - The cadence runs on the event-time high-water mark; a backward step in event time neither stops an evaluation nor adds one.
+      - The control-api health door admits a trader health report that carries evaluationsCoalesced, and a test pins it.
+      - The run record that pins both settings is named and pinned by a test; if it needs a schema change, the round stops and asks for a db/migrations grant.
       - Live and backtest share one code path.
     gate: automated
 
@@ -1460,7 +1472,7 @@ work_packages:
       - Every service binds to 127.0.0.1; remote access is Tailscale only; no port forwards.
       - The host holds no wallet, signer or venue credential.
       - A real restore drill rebuilds the ledger in a scratch database and compares it.
-      - MAX_RUN_MODE=PAPER and ALLOW_REAL_ORDERS=false in every unit.
+      - MAX_RUN_MODE=PAPER, ALLOW_REAL_ORDERS=false, LIVE_MICRO_MAX_ORDER_NOTIONAL=0 and LIVE_MICRO_MAX_ACCOUNT_EXPOSURE=0 in every unit.
       - The host configuration sets maxTotalBytes, and the start script refuses a missing value (ADR-028 §5).
     gate: external-evidence
 
@@ -1508,11 +1520,11 @@ work_packages:
       - packages/polymarket-secure/**
     deliverables:
       - series admission in the gateway and the trader, journaled before it is derived
-      - run manifest pinning the series and recording each admission
+      - the run record pinning the series configuration, with each admission an ordered event (ADR-030 Decision 4.2)
       - teardown of closed windows
       - a concurrent-market cap
     acceptance:
-      - Only an exact match of a reviewed series is admitted; any mismatch opens an incident.
+      - A window is admitted only if it exactly matches the reviewed pattern and parameters of a reviewed series; any mismatch opens an incident. Per-window facts (token ids, condition id, open and close times) are checked for presence and form only (ADR-030 Decision 1.2).
       - Admission refuses to start in any mode other than PAPER or BACKTEST.
       - Replay reproduces admission from recorded events without the venue.
       - Admission uses only documented venue surfaces from docs/venue/verified-*.md.
@@ -1528,6 +1540,11 @@ work_packages:
       - packages/strategy-runtime/**
       - packages/storage-postgres/src/**
       - packages/trading-core/**
+      # The group-commit store adapter (DURABLE-1 LOW-3) is
+      # apps/trader/src/adapters/postgres-store.ts; the backtest golden pins
+      # the checkpoint count (test/replay-golden/backtest/static-bracket).
+      - apps/trader/src/**
+      - test/replay-golden/**
       - test/unit/strategy-runtime/**
       - test/integration/paper-trader/**
       - test/e2e/**
