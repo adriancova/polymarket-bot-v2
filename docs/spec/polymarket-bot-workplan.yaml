@@ -1291,3 +1291,323 @@ work_packages:
       - Zero unresolved account discrepancies.
       - Human approval is recorded before maximum mode changes.
     gate: human-approval
+
+  # Added 2026-09-30 (LEAN-GOV): the LEAN-1 rounds, from the user's rulings of
+  # 2026-09-30 (docs/handoffs/LEAN-1.md §6, §7 and "The user's rulings";
+  # ADR-025 to ADR-030). Every entry is PAPER only; none raises
+  # maximum_run_mode. THROUGHPUT-1c is a round recorded in
+  # IMPLEMENTATION_STATUS.md, not an entry in this file; "depends_on" names it
+  # where a round must wait for its merge (LEAN-1 §7, "After 1c").
+  - id: LEAN-GOV
+    phase: phase-3
+    title: LEAN-1 rulings as ADRs and work-plan entries
+    goal: Record the user's LEAN-1 rulings (H, A1-A5) as accepted ADRs and add the LEAN-1 rounds to this plan.
+    depends_on: []
+    allowed_paths:
+      - docs/adr/ADR-025-*.md
+      - docs/adr/ADR-026-*.md
+      - docs/adr/ADR-027-*.md
+      - docs/adr/ADR-028-*.md
+      - docs/adr/ADR-029-*.md
+      - docs/adr/ADR-030-*.md
+      - docs/adr/README.md
+      # One dated status line only: "Amended 2026-09-30 by ADR-026".
+      - docs/adr/ADR-024-*.md
+      # New entries only.
+      - docs/spec/polymarket-bot-workplan.yaml
+    forbidden_paths:
+      - docs/adr/ADR-023-*
+      - docs/spec/polymarket-bot-orchestrator-handoff.md
+      - IMPLEMENTATION_STATUS.md
+      - apps/**
+      - packages/**
+    deliverables:
+      - ADR-025 laptop PAPER host profile
+      - ADR-026 evaluation cadence
+      - ADR-027 checkpoint-on-change
+      - ADR-028 raw retention with pins
+      - ADR-029 approximate dataset class
+      - ADR-030 series auto-admission and multi-window runs
+      - ADR index rows and the ADR-024 amendment line
+      - work-plan entries for the LEAN-1 rounds
+    acceptance:
+      - Each ADR quotes its ruling and the exact text it amends, and says how that text now reads.
+      - A6 is recorded as an open question, not decided.
+      - No safety default is weakened; every profile and ruling is PAPER only.
+      - lint, check:deps and test exit 0.
+    gate: review
+
+  - id: STORAGE-1
+    phase: phase-3
+    title: Research tier, pinned windows, verified raw expiry, and disk metrics
+    goal: Keep a downsampled research tier and exact pinned windows, and delete raw WAL after 72 h only once both are verified (ADR-028, ADR-029).
+    depends_on: [LEAN-GOV, WP-130]
+    allowed_paths:
+      # The window classifier reads decision, order, fill and halt rows through
+      # a read-only adapter inside apps/research-worker; packages/storage-postgres
+      # is not in this grant.
+      - apps/research-worker/**
+      - packages/storage-parquet/**
+      - python/research/**
+      - test/integration/parquet/**
+      # Mechanical lockfile updates from these packages' declared dependencies only.
+      - pnpm-lock.yaml
+      - python/uv.lock
+      - docs/handoffs/STORAGE-1.md
+    forbidden_paths:
+      - packages/domain/**
+      - db/migrations/**
+      - apps/trader/**
+      - apps/data-gateway/**
+      - packages/trading-core/**
+      - packages/polymarket-secure/**
+    deliverables:
+      - research-tier writer with a version-2 manifest carrying fidelity approximate
+      - pin classifier and extractor (whole window plus reference lead-in)
+      - verified-extract expiry with the expired-after-extract receipt basis (receipt version 2)
+      - disk, pin-budget and expiry-lag metrics
+    acceptance:
+      - A segment is never deleted unless it is 72 h old, its research tier is verified, its windows are classified, and every overlapping pin is verified.
+      - A pinned or unclassified segment is never deleted.
+      - A fill pin is never evicted or reduced; a budget overrun only alarms.
+      - Every source event in a fill's chain lies inside its pin.
+      - The expiry plan is durable before any deletion; the receipt is reporting, not proof.
+      - Version-1 manifests and receipts still read; version-1 manifests read as exact.
+    gate: automated
+
+  - id: HOST-BENCH
+    phase: phase-3
+    title: Measure the laptop host before launch
+    goal: Measure trader speed, recording volume, compression, research-tier size, state churn, machine limits and restart behaviour on the laptop (LEAN-1 §9; ADR-025).
+    depends_on: [LEAN-GOV]
+    allowed_paths:
+      # Measurement scripts only; raw results stay outside the repository.
+      - tools/host-bench/**
+      - docs/handoffs/HOST-BENCH.md
+    forbidden_paths:
+      - apps/**
+      - packages/**
+      - db/migrations/**
+      - infra/**
+    deliverables:
+      - trader throughput on the H1 burst fixture, on the laptop and on an hourly cloud host
+      - a 24 h multi-market gateway recording with GB per day per market and per asset
+      - compression ratios (SNAPPY, gzip, zstd) on real segments
+      - research-tier sizes from a prototype run
+      - count(DISTINCT state_hash) on the H1 databases
+      - watts, free disk, RAM per process, Redis bytes per entry, CPU temperature
+      - trader exit codes and behaviour on a new gateway epoch
+    acceptance:
+      - Every figure names its host, session, code SHA and host load.
+      - The Redis retention value is derived from the measured peak rate and worst tolerated restart.
+      - Nothing is claimed as measured without its evidence file.
+      - No wallet, signer or credential is used; public data only.
+    gate: external-evidence
+
+  - id: CADENCE-1
+    phase: phase-3
+    title: Evaluation cadence per ADR-026
+    goal: Evaluate onFeatures at most once per market per evaluationIntervalMs of event time, plus a heartbeat, with both settings pinned in the run manifest.
+    depends_on: [LEAN-GOV, THROUGHPUT-1c]
+    allowed_paths:
+      - packages/trading-core/**
+      - apps/trader/src/**
+      - apps/backtest-cli/src/**
+      - test/integration/paper-trader/**
+      - test/e2e/**
+      - test/replay-golden/**
+      - docs/handoffs/CADENCE-1.md
+    forbidden_paths:
+      - packages/domain/**
+      - db/migrations/**
+      - packages/strategy-runtime/**
+      - packages/polymarket-secure/**
+    deliverables:
+      - the ADR-026 D2 rule, driven by event time only
+      - evaluationIntervalMs and evaluationHeartbeatMs run settings in the run manifest
+      - an evaluationsCoalesced health counter
+      - a list of every changed golden, each explained
+    acceptance:
+      - Fill, order-update, lifecycle, start and stop callbacks fire exactly as before.
+      - A skipped evaluation persists no decision; every invoked callback persists exactly one.
+      - The same dataset and settings give byte-identical decisions; no wall clock is read.
+      - A backward step in event time never stops evaluation.
+      - Live and backtest share one code path.
+    gate: automated
+
+  - id: HOST-1
+    phase: phase-3
+    title: Laptop host setup under ADR-025
+    goal: Run the five processes, PostgreSQL and Redis under systemd on WSL2, with supervision, alerts, backups and a real restore drill.
+    depends_on: [LEAN-GOV, HOST-BENCH]
+    allowed_paths:
+      - infra/host-wsl2/**
+      - docs/runbooks/host-wsl2.md
+      - docs/handoffs/HOST-1.md
+    forbidden_paths:
+      - apps/**
+      - packages/**
+      - db/migrations/**
+    deliverables:
+      - systemd units and the Windows boot task
+      - a halt-aware restart map (page-class halts never loop into new runs)
+      - the productised one-market restart driver
+      - chrony and a clock-skew alert
+      - dead-man check and alert rules
+      - encrypted B2 backup with a key that cannot delete
+      - the measured Redis retention and a set maxTotalBytes in the host configuration
+    acceptance:
+      - Every service binds to 127.0.0.1; remote access is Tailscale only; no port forwards.
+      - The host holds no wallet, signer or venue credential.
+      - A real restore drill rebuilds the ledger in a scratch database and compares it.
+      - MAX_RUN_MODE=PAPER and ALLOW_REAL_ORDERS=false in every unit.
+      - The host configuration sets maxTotalBytes, and the start script refuses a missing value (ADR-028 §5).
+    gate: external-evidence
+
+  - id: BURN-IN
+    phase: phase-3
+    title: 72 h supervised burn-in on one BTC 15-minute market
+    goal: Show the laptop host runs one market for 72 h, and survives the fault drills, before launch.
+    depends_on: [HOST-1, STORAGE-1, CADENCE-1]
+    allowed_paths:
+      - docs/handoffs/BURN-IN.md
+    forbidden_paths:
+      - apps/**
+      - packages/**
+      - db/migrations/**
+      - infra/**
+    deliverables:
+      - a 72 h supervised run record
+      - fault drills - network pull, each process killed, wsl --shutdown, Windows reboot, power cord pull
+      - observed trader behaviour on a new gateway epoch
+    acceptance:
+      - Every gap is explained and recorded as a data-quality window.
+      - Raw expiry, pins and backups ran and were verified during the run.
+      - It counts toward H4 only through the runbook §7 governance procedure.
+      - Nothing is claimed without real evidence.
+    gate: external-evidence
+
+  - id: ROLLOVER-1
+    phase: phase-3
+    title: Series auto-admission and multi-window runs per ADR-030
+    goal: Admit each new window of a reviewed series in PAPER and run across windows without a restart.
+    depends_on: [LEAN-GOV, THROUGHPUT-1c]
+    allowed_paths:
+      - apps/data-gateway/src/**
+      - apps/trader/src/**
+      - packages/trading-core/**
+      - packages/universe/**
+      - packages/polymarket-public/src/**
+      - test/integration/data-gateway/**
+      - test/integration/paper-trader/**
+      - test/contract/polymarket-public/**
+      - docs/handoffs/ROLLOVER-1.md
+    forbidden_paths:
+      - packages/domain/**
+      - db/migrations/**
+      - packages/polymarket-secure/**
+    deliverables:
+      - series admission in the gateway and the trader, journaled before it is derived
+      - run manifest pinning the series and recording each admission
+      - teardown of closed windows
+      - a concurrent-market cap
+    acceptance:
+      - Only an exact match of a reviewed series is admitted; any mismatch opens an incident.
+      - Admission refuses to start in any mode other than PAPER or BACKTEST.
+      - Replay reproduces admission from recorded events without the venue.
+      - Admission uses only documented venue surfaces from docs/venue/verified-*.md.
+      - An independent adversarial review passes before merge.
+    gate: review
+
+  - id: CKPT-1
+    phase: phase-3
+    title: Checkpoint-on-change per ADR-027
+    goal: Checkpoint strategy state only on a defined transition plus a 60 s heartbeat, keeping the RNG cursor and callback sequence recoverable.
+    depends_on: [LEAN-GOV, CADENCE-1]
+    allowed_paths:
+      - packages/strategy-runtime/**
+      - packages/storage-postgres/src/**
+      - packages/trading-core/**
+      - test/unit/strategy-runtime/**
+      - test/integration/paper-trader/**
+      - test/e2e/**
+      - docs/handoffs/CKPT-1.md
+    forbidden_paths:
+      - packages/domain/**
+      - db/migrations/**
+      - packages/polymarket-secure/**
+    deliverables:
+      - the ADR-027 transition rule
+      - restore from the last checkpoint plus the highest evaluation sequence
+      - the tests of ADR-027 §5 re-pinned, each change explained
+    acceptance:
+      - A decision that changes state, status or RNG always has its checkpoint durable with it, or a restore refuses.
+      - DURABLE-1 LOW-3 is closed.
+      - The same dataset, settings and seed give byte-identical checkpoints.
+    gate: automated
+
+  - id: APPROX-REPLAY-1
+    phase: phase-3
+    title: Approximate replay over the research tier per ADR-029
+    goal: Add a backtest-cli source over the research tier, labelled approximate.
+    depends_on: [STORAGE-1, THROUGHPUT-1c]
+    allowed_paths:
+      - apps/backtest-cli/**
+      - docs/handoffs/APPROX-REPLAY-1.md
+    forbidden_paths:
+      - packages/domain/**
+      - packages/storage-parquet/**
+      - db/migrations/**
+      - packages/polymarket-secure/**
+    deliverables:
+      - a research-tier replay source
+      - approximate labels on every report and run record
+    acceptance:
+      - Samples are consumed in available-instant order; none is used before its instant.
+      - Every output is labelled approximate, from the manifest.
+      - Evidence tools refuse an approximate input.
+    gate: automated
+
+  - id: SCALE-8
+    phase: phase-3
+    title: Grow from one to eight markets on the laptop
+    goal: Grow 1 to 2 to 4 to 8 markets, measuring at aligned window opens, during compaction and during backups.
+    depends_on: [BURN-IN, ROLLOVER-1]
+    allowed_paths:
+      - infra/host-wsl2/**
+      - docs/handoffs/SCALE-8.md
+    forbidden_paths:
+      - apps/**
+      - packages/**
+      - db/migrations/**
+    deliverables:
+      - lag, CPU, disk and cost measurements at each step
+      - a recommendation on ruling A6, if one trader cannot keep up
+    acceptance:
+      - "Fewer than 8 markets on one machine is an acceptable answer."
+      - Any forecast above $80 a month stops for the user's decision.
+      - No step runs several traders unless the user rules A6.
+    gate: external-evidence
+
+  # Optional (LEAN-1 §7, "opt.").
+  - id: REFDIET
+    phase: phase-3
+    title: Lower-rate or no Binance bookTicker
+    goal: Cut Binance bookTicker volume if the features allow, with a feature-version bump.
+    depends_on: [HOST-BENCH, THROUGHPUT-1c]
+    allowed_paths:
+      - packages/features/**
+      - apps/data-gateway/src/**
+      - test/integration/data-gateway/**
+      - docs/handoffs/REFDIET.md
+    forbidden_paths:
+      - packages/domain/**
+      - db/migrations/**
+      - packages/polymarket-secure/**
+    deliverables:
+      - a reduced reference subscription
+      - a feature-version bump if any feature input changes
+    acceptance:
+      - Every feature that read bookTicker is shown unaffected or versioned.
+      - The recorded byte saving is measured, not estimated.
+    gate: automated
