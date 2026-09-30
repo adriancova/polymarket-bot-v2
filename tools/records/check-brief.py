@@ -17,7 +17,13 @@ K11 AGENTS.md and CLAUDE.md both say the archive is frozen.
 K12 the handoff README and INDEX say "add or update" a handoff's single INDEX row.
 K13 every "Authorized now" bullet names the green GitHub CI run when its archived row's gate does.
 K14 the archive README and REWRITES.md do not claim the proof shows rewrites are complete; both
-    say that fidelity is a review question.
+    say that fidelity is a review question; neither claims C8 proves every declared kind true.
+K15 no "gate is open": main uses "gate is OPEN" for a passed gate, so say met or unmet.
+K16 a ruling states what was ruled: no bare "Ruled by the user <date>.".
+K17 state the fact, do not narrate the record: no "the row (also) records that".
+K18 REWRITES.md's coverage heading reads "Coverage: base lines not included in a rewrite pair".
+K19 the Wave 3 authorization intro is at most 24 words, names the date and `WP-260`, and is
+    followed by exactly two condition bullets.
 
 Exit 0 when every rule holds, 1 otherwise. Stdlib only, no network.
 """
@@ -169,6 +175,41 @@ def main() -> int:
         text = read(root, rel)
         if re.search(r"complete and verbatim", text) or "review question" not in text:
             fails.append(f"K14: {rel} overstates what the proof checks (no 'review question' caveat)")
+        if re.search(r"with a true kind|C8 checks each kind\.", text):
+            fails.append(f"K14: {rel} claims C8 proves every declared kind true")
+
+    # K15, K16, K17
+    for n, l in enumerate(lines, 1):
+        if re.search(r"\bgate is open\b", l, flags=re.I):
+            fails.append(f"K15: line {n}: 'gate is open' is ambiguous; say met or unmet")
+        if re.search(r"\bruled by the user \d{4}-\d{2}-\d{2}\.", l, flags=re.I):
+            fails.append(f"K16: line {n}: a ruling without what it ruled")
+        if re.search(r"\brow (also )?records that\b", l, flags=re.I):
+            fails.append(f"K17: line {n}: narrates the record; state the fact")
+    # K18
+    rw = read(root, f"{S.ARCHIVE}/REWRITES.md")
+    if "\n## Coverage: base lines not included in a rewrite pair\n" not in rw:
+        fails.append("K18: REWRITES.md's coverage heading is not 'Coverage: base lines not included in a rewrite pair'")
+    # K19
+    h = "### Wave 3 authorization (conditional)"
+    if h in lines:
+        rest = lines[lines.index(h) + 1:]
+        para, bullets, i = [], 0, 0
+        while i < len(rest) and not rest[i].strip():
+            i += 1
+        while i < len(rest) and rest[i].strip() and not rest[i].startswith("- "):
+            para.append(rest[i])
+            i += 1
+        while i < len(rest) and not rest[i].strip():
+            i += 1
+        while i < len(rest) and rest[i].startswith("- "):
+            bullets += 1
+            i += 1
+        intro = " ".join(para)
+        words = len(intro.split())
+        if words > 24 or "2026-09-30" not in intro or "`WP-260`" not in intro or bullets != 2:
+            fails.append(f"K19: the Wave 3 intro has {words} words (max 24) and {bullets} condition bullets (need 2), "
+                         "and must name 2026-09-30 and `WP-260`")
 
     print(f"brief {nb} B / {nl} lines = {100 * nb / bb:.1f}% / {100 * nl / bl:.1f}% of the base ({bb} B / {bl} lines at {sha[:12]})")
     print(f"closeout rows {len(close)}, residual rows {len(resid)}, authorized bullets {len(auth)}")

@@ -94,7 +94,7 @@ Completion records are in the `completion-records-*` archive files.
 | `WP-130` | Parquet compactor and dataset manifests | Complete (2026-08-31) | `cfa353b` + wiring `24903d2` | [WP-130](docs/handoffs/WP-130.md) |
 | `WP-080-FU1` | ADR-014 takerSide conformance | Complete (2026-08-31) | `ebda609` | [WP-080](docs/handoffs/WP-080.md), FU1 section |
 | `WP-120` | Data gateway integration | Complete (2026-09-01) | `0622f45` + wiring `2a49153` | [WP-120](docs/handoffs/WP-120.md) |
-| `WP-140` | Recorder observability and soak harness | Implementation complete; automated checks complete; evidence pending: the ≥24h soak (H4); the gate is open | `735d330` + wiring `5757ef3` | [WP-140](docs/handoffs/WP-140.md) |
+| `WP-140` | Recorder observability and soak harness | Implementation complete; automated checks complete; the evidence gate is unmet until the ≥24h soak (H4) | `735d330` + wiring `5757ef3` | [WP-140](docs/handoffs/WP-140.md) |
 | `GOV-1C` | contract-owner governance round at Wave 1 closeout | Complete (2026-09-02) | `3272c4b` | [GOV-1C](docs/handoffs/GOV-1C.md) |
 | `WP-150` | Local exact-decimal order books | Complete (2026-09-02) | `70c7f1f` | [WP-150](docs/handoffs/WP-150.md) |
 | `WP-170` | Strategy SDK and deterministic runtime | Complete (2026-09-03) | `9d0971b` | [WP-170](docs/handoffs/WP-170.md) |
@@ -191,7 +191,7 @@ what is still live from them is listed under
 | Id | State | Owner |
 | --- | --- | --- |
 | `B4` | **Open.** CHECK-4's live-data half, i.e. H1. Its preconditions are closed: `B9` (`BOOT-1`), `B10` (`UNIV-4`), the venue gate (`VENUE-2`), the health surface (`TRDR-3`). Run 1 (2026-09-29) halted fail-closed on throughput; details under [Human items](#human-items). Re-run after `THROUGHPUT-2`. | human (H1) |
-| `B5` | **Code half (R4) closed** by `TRDR-3` (`da9c58e`). **Infra half (R5), i.e. H3:** performed 2026-09-29 with H1 run 1 (a real Prometheus scraped the control API; a real Grafana imported and rendered the three dashboards). The fresh closeout grades it. The row also records that no test validates the scrape fragment. | human (H3) |
+| `B5` | **Code half (R4) closed** by `TRDR-3` (`da9c58e`). **Infra half (R5), i.e. H3:** performed 2026-09-29 with H1 run 1 (a real Prometheus scraped the control API; a real Grafana imported and rendered the three dashboards). The fresh closeout grades it. No test validates the scrape fragment (`infra/prometheus/control-api-scrape.yaml`). | human (H3) |
 | `B9` | **Closed for a run's first start** by `BOOT-1` (`0d09eb5`): the trader refuses to start unless its rows exist and match, and refuses to resume a run that holds decisions (exit 78). Resume (R10) is Wave 3's; after a crash the operator starts a NEW run. | `BOOT-1` ✓; R10 for resume |
 | `H7` | **Ratified** by the user, 2026-09-28 ("Ratify all"): the N6 field format; four root-wiring commits without recorded reviewer sign-off (`5b73461`, `af059d7`, `80126e8`, `da37a0c`); the SER confirming reviews run by Claude after Codex's content filter refused the packet; N11; the Fable verifiers for container- and spawn-heavy rounds (`BRACKET-1c`, `BUNDLE-1`, `DEPCHECK-1`; the `CI-2` precedent); the `DEPCHECK-1` grant widening (`CI2-L5-2/3`) and the `DOCS-1` authorization. The archived state cell reads "PARTLY DONE"; it predates the ruling. | no open owner: the archived owner (human/orchestrator, for three questions) became historical at ratification |
 
@@ -210,7 +210,7 @@ archived row and may be stale; the cell says why. File:line citations are as of
 
 | Id | Residual | Owner |
 | --- | --- | --- |
-| `H1R1-FRAME-ATOMICITY` | In the H1 burst every venue market-channel frame produced exactly two `BookLevelChanged` events, one per token of the pair (85,547 events from 42,774 frames). The trader evaluates after each, so half the evaluations see a half-applied frame, a book state that never existed at the venue. Evaluating once per frame (per `causationId`) is truer and halves the work, but changes WP-170's exactly-one-decision-per-event criteria. Ruled by the user 2026-09-30. | `THROUGHPUT-2` (evaluate once per frame) |
+| `H1R1-FRAME-ATOMICITY` | In the H1 burst every venue market-channel frame produced exactly two `BookLevelChanged` events, one per token of the pair (85,547 events from 42,774 frames). The trader evaluates after each, so half the evaluations see a half-applied frame, a book state that never existed at the venue. Evaluating once per frame (per `causationId`) is truer and halves the work, but changes WP-170's exactly-one-decision-per-event criteria. The user ruled on 2026-09-30 that `THROUGHPUT-2` evaluates once per frame. | `THROUGHPUT-2` (evaluate once per frame) |
 | `OUT1-R1-HALT-NOT-DURABLE` | A halt, including `OUTAGE-1`'s `TRANSPORT_UNAVAILABLE`, is not persisted to PostgreSQL: `TraderStore` has no halt write, and nothing writes `ops.incidents` or `ops.risk_events`. The durable record of an outage is only its consequence (no writes after the halt instant), plus the process log and the exit code. `OUT2-R1-HALT-RECORD-INTERACTION`: the outage tests require that no row commits after the pre-fault snapshot, so the round that adds the halt record must update the three outage scenarios to expect exactly that one halt row, and nothing else. | a trader/storage round that adds a durable halt record (`ops.incidents`), before sustained live-data paper runs |
 | `H1R1-PROVENANCE` | On all 37,546 H1 decisions, `strategy.decisions.gateway_epoch`, `ingest_seq` and `feature_snapshot_id` are NULL (`source_event_id` is set). A decision cannot be traced to its gateway epoch, its ingest sequence or an indexed feature snapshot except by joining through the event id. | a trader/storage round (with `OUT1-R1-HALT-NOT-DURABLE`) |
 | `H1R1-HALT-INVISIBLE` | A halt that exits the process quickly never reaches Prometheus. In H1 the trader exited 75 between two 15 s scrapes, so the dashboards read `halts 0, healthy 1` until "health unavailable". Same root as `OUT1-R1-HALT-NOT-DURABLE`: there is no durable halt record for the control API to read. | with `OUT1-R1-HALT-NOT-DURABLE` |
@@ -284,11 +284,17 @@ above), `SIM2-E2E-MSG`, `RECON2-EVENTHOP`, `RECON2-README`, `N5`, `N1`,
 ### Venue drift carried forward (from `VENUE-2`)
 
 `verified-2026-09-16.md` fed these to later rounds; they have no row of their own.
+Owners are from `docs/handoffs/VENUE-2.md` follow_up and the report's §16.3.
 
-- D-13: a per-market `feeSchedule {rate, exponent, takerOnly, rebateRate}`, while `packages/simulation/src/fees.ts` models only `exponent = 1`.
-- D-17: the minimum-order-size unit conflict (market details say "USDC notional", place-orders says "shares"; static-bracket `decide.ts` compares shares). Register conflict C-7.
+- D-13: a per-market `feeSchedule {rate, exponent, takerOnly, rebateRate}`, while `packages/simulation/src/fees.ts` models only `exponent = 1`. Owner: `packages/simulation` (ADR-012) and fee/reward accounting.
+- D-17: the minimum-order-size unit conflict (market details say "USDC notional", place-orders says "shares"; static-bracket `decide.ts` compares shares). Register conflict C-7. Owner: `packages/strategies/static-bracket` and `packages/universe`, with venue evidence.
 - D-02: SDK 0.6.0 → 0.10.0 with breaking changes (`WP-260`; `VENUE-3` re-checks the pin).
 - D-15 and D-20: see [Pending external evidence](#pending-external-evidence). D-30 is B10's basis (closed).
+- The offline gate does not consume the phase-2 report: `apps/ops-cli`'s validator pins the frozen report only (`checks.ts:69`) and pins `effective_date` to 2026-08-24 (`checks.ts:249-252`), as of `f43efe6`. Report §15 items 1-4. Owner: the `apps/ops-cli/**` package (`WP-330` or an earlier authorized packet).
+- U-17 and U-16: the semantics of `feeSchedule.exponent ≠ 1` and the rounding direction are still undocumented. Owner: as D-13; `roundingMode` stays caller-declared.
+- U-15: Protocol V2 is documented only in SDK source. Owners: `WP-260`, `WP-300`, and the universe/data-gateway line that first reads Gamma `version`.
+- Handoff §24 has three redirecting links (D-07, D-11, D-25). Owner: the orchestrator or register owner (update or annotate them).
+- The phase-3 start gate owes its own report: `VENUE-3`.
 
 ### Schema boundary (still live)
 
@@ -317,9 +323,8 @@ outside, recounted 2026-09-11). Still live from the cross-package record
 
 ### Wave 3 authorization (conditional)
 
-The user authorized Wave 3 on 2026-09-30, on a condition. The orchestrator may
-start Wave 3 packages (`WP-260` first, then the work-plan chain) only when both
-hold:
+The user authorized Wave 3 on 2026-09-30. The orchestrator starts `WP-260` first,
+then the work-plan chain, only when both hold:
 
 - the fresh Wave 2 closeout audit grades Wave 2 CLOSED;
 - `VENUE-3` has merged (the phase-3 start gate).
@@ -353,7 +358,7 @@ One entry each; full text in
 - **N7**: ten Wave 2 merges touched `pnpm-lock.yaml` importer blocks. Ratified 2026-09-15 as a pattern (`GOV-2C`): a package that declares its own workspace and dev dependencies may update its own importer block, and later packages cite that entry. Seven more touches by rounds with no work-plan entry are covered by precedent only. `GATE-1`'s `js-yaml` substitution is recorded, not covered by the pattern.
 - **N9**: `WP-200`'s `allowed_paths` names `test/integration/ledger/**`, which does not exist. Recorded 2026-09-15. A grant that authorizes nothing is not a deviation.
 - **N11**: `BACKTEST-1` changed one line of the protected root `package.json` (`test:replay`). Ratified 2026-09-16 for that line. The orchestrator owns the class: every acceptance criterion that names a script must grant the file the script lives in.
-- **N3**: a ruling of the form "by the next round touching X" failed twice, because nothing checks it. The systemic fix (a dated comment in the package's work-plan entry) is proposed, not applied: `GOV-2C`'s work-plan grant covered ratification entries only.
+- **N3**: a ruling of the form "by the next round touching X" failed twice, because nothing checks it. The systemic fix (a dated comment in the package's work-plan entry) is proposed, not applied: `GOV-2C`'s work-plan grant covered ratification entries only, and `packages/execution-planner` has no open package entry to carry it.
 
 ## Pending external evidence
 

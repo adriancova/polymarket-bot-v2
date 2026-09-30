@@ -31,13 +31,18 @@ Proof C (facts and navigation):
      files named "_*" are skipped);
   C8 REWRITES.md coverage: every non-blank line of the rewrites-base is inside
      an old block or an "unpaired" declaration, and each declaration's kind is
-     true (verbatim: the line is in the brief; complete-row: the brief lists the
-     package as Complete or Superseded; closed-row: the brief's closed lists
-     name the id; history: the range holds no package or blocker row start).
+     checked against both texts. verbatim: the line is in the brief.
+     complete-row: the range is exactly that package row, whose base status
+     cell begins "Complete" or "Superseded", and the brief lists it so.
+     closed-row: the range is exactly that row, the brief's closed lists name
+     it, and the BASE row is closed (see base_row_closed). history: the range
+     holds no package or blocker row start.
      Every open id in the brief's closeout and residual tables, and every live
      package row, is paired. After a re-cut, every line inserted or changed
      since the rewrites-base must be covered the same way at the cut;
   C9 no two REWRITES.md entries share one Facts account (no boilerplate);
+  C11 an archive file named in an entry's Facts account holds at least one of
+     that entry's old lines (so "history in X.md" points where the text is);
   C10 every "keep" phrase of an entry occurs in that entry's old text and in
      the brief (case, whitespace and Markdown emphasis ignored); every entry
      that pairs an open row carries at least one keep phrase.
@@ -214,6 +219,52 @@ def row_starts(lines):
             if m:
                 raw = m.group(1).replace("**", "")
                 out.setdefault(("row", re.sub(r" \(.*\)$", "", raw).strip()), n)
+    return out
+
+
+CLOSURE = r"(?:CLOSED|COMPLETE|DONE|RULED|DISCHARGED|MOOT|RATIFIED|SUPERSEDED)\b"
+
+
+def base_status_complete(line):
+    """True when a base package row's status cell begins Complete or Superseded."""
+    cells = line.split(" | ")
+    status = re.sub(r"[*`]", "", cells[1]).strip() if len(cells) > 1 else ""
+    return status.startswith(("Complete", "Superseded"))
+
+
+def base_row_closed(lines, a, b, ident, starts):
+    """True when base lines a..b (one residual or blocker row) record the row as closed.
+
+    A one-line row: its last cell begins with a bold closure word. A multi-line
+    row: it holds a bold phrase that begins with one. Either way, a queued
+    package row also counts as closed when that package's own row is Complete
+    or Superseded in the base. A partly closed row whose last cell still begins
+    with such a word (e.g. RULED but in flight) passes; that is a review
+    question, disclosed in REWRITES.md.
+    """
+    text = lines[a - 1:b]
+    if len(text) == 1:
+        row = text[0].rstrip()
+        row = row[:-1].rstrip() if row.endswith("|") else row
+        if re.match(r"^\*\*" + CLOSURE, row.split(" | ")[-1].strip()):
+            return True
+    elif re.search(r"\*\*" + CLOSURE, "\n".join(text)):
+        return True
+    pkg = starts.get(("pkg", ident))
+    return pkg is not None and base_status_complete(lines[pkg - 1])
+
+
+def archive_ranges(root):
+    """{archive file name: (a, b)} of each file's region, in the cut's line numbers."""
+    out = {}
+    adir = os.path.join(root, S.ARCHIVE)
+    for name in sorted(os.listdir(adir)):
+        if not name.endswith(".md") or name in NOTES:
+            continue
+        with open(os.path.join(adir, name), encoding="utf-8") as fh:
+            m = re.search(r"^<!-- verbatim-begin .*? lines=(\d+)-(\d+) ", fh.read(), flags=re.M)
+        if m:
+            out[name] = (int(m.group(1)), int(m.group(2)))
     return out
 
 
@@ -507,8 +558,12 @@ def proof_c(root, repo, sha, base, report):
                     key = ("pkg" if kind == "complete-row" else "row", ident)
                     if starts.get(key) != a or any(k != key for k in inside):
                         fails.append(f"C8: unpaired {a}-{b} is declared {kind} {ident!r}, but it is not exactly that row")
+                    elif kind == "complete-row" and not base_status_complete(lines[a - 1]):
+                        fails.append(f"C8: unpaired {a}-{b}: package {ident!r} is not Complete or Superseded in the base row")
                     elif kind == "complete-row" and not any(s.startswith(("Complete", "Superseded")) for s in pkg_status.get(ident, [])):
                         fails.append(f"C8: unpaired {a}-{b}: package {ident!r} is not Complete or Superseded in the brief")
+                    elif kind == "closed-row" and not base_row_closed(lines, a, b, ident, starts):
+                        fails.append(f"C8: unpaired {a}-{b} is declared closed-row {ident!r}, but the base row does not record it closed")
                     elif kind == "closed-row" and f"`{ident}`" not in closed:
                         fails.append(f"C8: unpaired {a}-{b}: {ident!r} is not in the brief's closed lists")
                 elif inside:
@@ -569,6 +624,27 @@ def proof_c(root, repo, sha, base, report):
             npaired += ok
             if not ok:
                 fails.append(f"C8: the brief lists {key[1]!r} as open or live, but REWRITES.md pairs no old block with its row")
+        # C11: an archive file a Facts account names must hold one of the entry's old lines
+        to_cut = {v: k for k, v in to_rw.items()}
+        ranges = archive_ranges(root)
+        for entry, flines in entries.items():
+            cited = set(re.findall(r"([a-z0-9-]+\.md)\b", " ".join(flines))) & set(ranges)
+            if not cited:
+                continue
+            at_cut = set()
+            for blk in olds_by_entry.get(entry, []):
+                for n in range(blk["a"], blk["b"] + 1):
+                    if blk["base"] == cut:
+                        at_cut.add(n)
+                    elif blk["base"] == rwbase and n in to_cut:
+                        at_cut.add(to_cut[n])
+            if not at_cut:
+                continue
+            for name in sorted(cited):
+                lo, hi = ranges[name]
+                if not any(lo <= n <= hi for n in at_cut):
+                    holders = sorted(f for f, (x, y) in ranges.items() if any(x <= n <= y for n in at_cut))
+                    fails.append(f"C11: {entry}'s Facts names {name}, which holds none of its old lines (they are in {', '.join(holders)})")
         # C10: an entry that pairs an open row needs keep phrases
         for entry, olds in olds_by_entry.items():
             pairs_open = any(b["base"] == rwbase and any(b["a"] <= n <= b["b"] for n in paired_rw_starts) for b in olds)

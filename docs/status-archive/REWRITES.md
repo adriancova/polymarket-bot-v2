@@ -13,9 +13,9 @@ Each entry has:
 
 What the checks prove, and what they do not: `tools/records/check-preservation.py` checks that each old block is verbatim, each new line is in the brief, each keep phrase is in both texts (C6, C10), every base line is paired or declared below (C8), and no two entries share a Facts account (C9). Whether a rewrite kept every fact is a review question; the checks do not decide it.
 
-## Coverage: lines no entry pairs
+## Coverage: base lines not included in a rewrite pair
 
-Every non-blank base line is either in an entry's old block or declared here. Kinds: `verbatim` (the line is in the brief unchanged), `complete-row` (a Complete or Superseded package row; its one-line brief row is derived as the table-header entry says), `closed-row` (a closed, done or ruled residual or blocker row, named in the brief's closed lists), and `history` (no live content; the range holds no package or blocker row). C8 checks each kind.
+Every non-blank base line is either in an entry's old block or declared here. Kinds: `verbatim` (the line is in the brief unchanged), `complete-row` (a Complete or Superseded package row; its one-line brief row is derived as the table-header entry says), `closed-row` (a closed, done or ruled residual or blocker row, named in the brief's closed lists), and `history` (no live content; the range holds no package or blocker row). C8 checks each kind against both texts: a `verbatim` line must be in the brief; a `complete-row` must be exactly that package row, Complete or Superseded in the base row's status cell and in the brief; a `closed-row` must be exactly that row, named in the brief's closed lists, and closed in the base: a one-line row's last cell begins with a bold closure word (CLOSED, COMPLETE, DONE, RULED, DISCHARGED, MOOT, RATIFIED, SUPERSEDED), a multi-line row holds such a bold phrase, or the id is a package that is Complete in the base. A row that is closed in part and still carries such a marker (for example `H1R1-FRAME-ATOMICITY`, RULED yet open until `THROUGHPUT-2`) can pass the base test while open; the brief's open tables and the pairing rule catch it only if the brief still lists it. That remains a review question.
 
 ~~~unpaired
 1-1 verbatim
@@ -268,7 +268,7 @@ Old, lines 39-39:
 New:
 
 ~~~new
-| `WP-140` | Recorder observability and soak harness | Implementation complete; automated checks complete; evidence pending: the ≥24h soak (H4); the gate is open | `735d330` + wiring `5757ef3` | [WP-140](docs/handoffs/WP-140.md) |
+| `WP-140` | Recorder observability and soak harness | Implementation complete; automated checks complete; the evidence gate is unmet until the ≥24h soak (H4) | `735d330` + wiring `5757ef3` | [WP-140](docs/handoffs/WP-140.md) |
 - **H4**, elapsed soak evidence: open. It is the `WP-140` gate, which closes only through the runbook §7 governance procedure after a real ≥24h soak.
 ~~~
 
@@ -280,7 +280,7 @@ runbook §7 governance procedure
 after a real ≥24h soak
 ~~~
 
-**Facts.** Kept: "Implementation complete; automated checks complete", evidence pending with the gate open, and the closing rule (the runbook §7 governance procedure after a real ≥24h soak, now under Human items > H4). Not carried: the implementation chain, the four review and three remediation rounds, and the Codex session id (archive).
+**Facts.** Kept: "Implementation complete; automated checks complete", the external evidence still pending (the brief says the evidence gate is unmet until the ≥24h soak, H4; the old "gate open" meant not yet passed), and the closing rule (the runbook §7 governance procedure after a real ≥24h soak, now under Human items > H4). Not carried: the implementation chain, the four review and three remediation rounds, and the Codex session id (archive).
 
 ## RW-06: Work packages: `THROUGHPUT-1c` (live: authorized, deferred)
 
@@ -463,10 +463,16 @@ New:
 
 ~~~new
 `verified-2026-09-16.md` fed these to later rounds; they have no row of their own.
-- D-13: a per-market `feeSchedule {rate, exponent, takerOnly, rebateRate}`, while `packages/simulation/src/fees.ts` models only `exponent = 1`.
-- D-17: the minimum-order-size unit conflict (market details say "USDC notional", place-orders says "shares"; static-bracket `decide.ts` compares shares). Register conflict C-7.
+Owners are from `docs/handoffs/VENUE-2.md` follow_up and the report's §16.3.
+- D-13: a per-market `feeSchedule {rate, exponent, takerOnly, rebateRate}`, while `packages/simulation/src/fees.ts` models only `exponent = 1`. Owner: `packages/simulation` (ADR-012) and fee/reward accounting.
+- D-17: the minimum-order-size unit conflict (market details say "USDC notional", place-orders says "shares"; static-bracket `decide.ts` compares shares). Register conflict C-7. Owner: `packages/strategies/static-bracket` and `packages/universe`, with venue evidence.
 - D-02: SDK 0.6.0 → 0.10.0 with breaking changes (`WP-260`; `VENUE-3` re-checks the pin).
 - D-15 and D-20: see [Pending external evidence](#pending-external-evidence). D-30 is B10's basis (closed).
+- The offline gate does not consume the phase-2 report: `apps/ops-cli`'s validator pins the frozen report only (`checks.ts:69`) and pins `effective_date` to 2026-08-24 (`checks.ts:249-252`), as of `f43efe6`. Report §15 items 1-4. Owner: the `apps/ops-cli/**` package (`WP-330` or an earlier authorized packet).
+- U-17 and U-16: the semantics of `feeSchedule.exponent ≠ 1` and the rounding direction are still undocumented. Owner: as D-13; `roundingMode` stays caller-declared.
+- U-15: Protocol V2 is documented only in SDK source. Owners: `WP-260`, `WP-300`, and the universe/data-gateway line that first reads Gamma `version`.
+- Handoff §24 has three redirecting links (D-07, D-11, D-25). Owner: the orchestrator or register owner (update or annotate them).
+- The phase-3 start gate owes its own report: `VENUE-3`.
 ~~~
 
 Keep (in both texts):
@@ -475,9 +481,17 @@ Keep (in both texts):
 models only exponent = 1
 the minimum-order-size UNIT conflict
 SDK 0.6.0 → 0.10.0 with breaking changes
+validator pins the frozen report only (checks.ts:69)
+pins effective_date to 2026-08-24
+§15 items 1-4
+U-17
+U-16
+documented only in SDK source
+three redirecting links (D-07, D-11, D-25)
+the phase-3 start gate owes its own report
 ~~~
 
-**Facts.** `VENUE-2` is a Complete row, but its "Facts that feed the next rounds" name drift with no residual row. The brief carries D-13, D-17 (C-7) and D-02, and points D-15/D-20 at Pending external evidence. Not carried: the rest of the row (the chain, the review, the 31 drift rows, the source index, the gates), which is history in `work-packages-waves-0-2.md`.
+**Facts.** `VENUE-2` is a Complete row, but two of its parts are live and have no residual row: the "Facts that feed the next rounds" and the "Residuals (owned, `docs/handoffs/VENUE-2.md` follow_up 1-10 and §16.3)". The brief carries D-13, D-17 (C-7) and D-02, and points D-15/D-20 at Pending external evidence. It carries every owned residual: the `apps/ops-cli` validator pins (`checks.ts:69`; `effective_date` 2026-08-24 at `:249-252`; report §15 items 1-4), U-17 and U-16 undocumented, U-15 (Protocol V2 only in SDK source), handoff §24's three redirecting links (D-07, D-11, D-25), and the phase-3 start gate's own report (`VENUE-3`). The owners come from `VENUE-2.md` follow_up 1, 3-6, 9 and 10 and report §16.3 items 3-6 and 8; the row names only those two sources. Not carried: the rest of the row (the chain, the review, the 31 drift rows, the source index, the gates, the superseded authorization text), which is history in `work-packages-rounds.md`.
 
 ## RW-11: Open blockers: intro
 
@@ -573,13 +587,14 @@ Old, lines 2462-2462:
 New:
 
 ~~~new
-| `B5` | **Code half (R4) closed** by `TRDR-3` (`da9c58e`). **Infra half (R5), i.e. H3:** performed 2026-09-29 with H1 run 1 (a real Prometheus scraped the control API; a real Grafana imported and rendered the three dashboards). The fresh closeout grades it. The row also records that no test validates the scrape fragment. | human (H3) |
+| `B5` | **Code half (R4) closed** by `TRDR-3` (`da9c58e`). **Infra half (R5), i.e. H3:** performed 2026-09-29 with H1 run 1 (a real Prometheus scraped the control API; a real Grafana imported and rendered the three dashboards). The fresh closeout grades it. No test validates the scrape fragment (`infra/prometheus/control-api-scrape.yaml`). | human (H3) |
 ~~~
 
 Keep (in both texts):
 
 ~~~keep
 CODE HALF (R4) CLOSED
+no test validates the
 ~~~
 
 **Facts.** Kept: the code half closed by `TRDR-3` (`da9c58e`); the infra half is H3; no test validates the fragment. The R5 list ("no real Prometheus has loaded the fragment, nothing provisions a Grafana, no real import has happened") predates H3's performance on 2026-09-29; the brief states the later fact. Archive only: the code-half mechanism (`GET /health`, refresh on read, the `_info` family, the `table` panel target) and the original defect ("Realized PnL" as a text panel).
@@ -740,7 +755,7 @@ Old, lines 2607-2607:
 New:
 
 ~~~new
-| `H1R1-FRAME-ATOMICITY` | In the H1 burst every venue market-channel frame produced exactly two `BookLevelChanged` events, one per token of the pair (85,547 events from 42,774 frames). The trader evaluates after each, so half the evaluations see a half-applied frame, a book state that never existed at the venue. Evaluating once per frame (per `causationId`) is truer and halves the work, but changes WP-170's exactly-one-decision-per-event criteria. Ruled by the user 2026-09-30. | `THROUGHPUT-2` (evaluate once per frame) |
+| `H1R1-FRAME-ATOMICITY` | In the H1 burst every venue market-channel frame produced exactly two `BookLevelChanged` events, one per token of the pair (85,547 events from 42,774 frames). The trader evaluates after each, so half the evaluations see a half-applied frame, a book state that never existed at the venue. Evaluating once per frame (per `causationId`) is truer and halves the work, but changes WP-170's exactly-one-decision-per-event criteria. The user ruled on 2026-09-30 that `THROUGHPUT-2` evaluates once per frame. | `THROUGHPUT-2` (evaluate once per frame) |
 ~~~
 
 Keep (in both texts):
@@ -749,9 +764,10 @@ Keep (in both texts):
 85,547 events from 42,774 frames
 a book state that never existed at the venue
 per causationId
+THROUGHPUT-2 evaluates once per frame
 ~~~
 
-**Facts.** Kept: two events per frame, one per token; 85,547 events from 42,774 frames; the half-applied book; once per `causationId`; the WP-170 criterion it changes; the 2026-09-30 ruling. Archive only: the evidence cite (`H1-RUN-1.md` finding 2). Carried as open because the ruled fix is in flight in `THROUGHPUT-2`.
+**Facts.** Kept: two events per frame, one per token; 85,547 events from 42,774 frames; the half-applied book; once per `causationId`; the WP-170 criterion it changes; the 2026-09-30 ruling and what it ruled (`THROUGHPUT-2` evaluates once per frame). Archive only: the evidence cite (`H1-RUN-1.md` finding 2). Carried as open because the ruled fix is in flight in `THROUGHPUT-2`.
 
 ## RW-20: Residual `OUT1-R1-HALT-NOT-DURABLE`
 
@@ -2295,9 +2311,8 @@ Every Wave 3 package stays PAPER-only, built with fixtures, mocks and fault inje
 New:
 
 ~~~new
-The user authorized Wave 3 on 2026-09-30, on a condition. The orchestrator may
-start Wave 3 packages (`WP-260` first, then the work-plan chain) only when both
-hold:
+The user authorized Wave 3 on 2026-09-30. The orchestrator starts `WP-260` first,
+then the work-plan chain, only when both hold:
 - the fresh Wave 2 closeout audit grades Wave 2 CLOSED;
 - `VENUE-3` has merged (the phase-3 start gate).
 Every Wave 3 package stays PAPER-only, built with fixtures, mocks and fault
@@ -2309,6 +2324,7 @@ the agent-closable blockers it names are worked, and Wave 3 does not start.
 Keep (in both texts):
 
 ~~~keep
+WP-260 first
 grades Wave 2 CLOSED
 no production wallet, signer, API credential or real-order test
 Wave 3 does not start
@@ -2637,16 +2653,17 @@ Old, lines 2922-2922:
 New:
 
 ~~~new
-- **N3**: a ruling of the form "by the next round touching X" failed twice, because nothing checks it. The systemic fix (a dated comment in the package's work-plan entry) is proposed, not applied: `GOV-2C`'s work-plan grant covered ratification entries only.
+- **N3**: a ruling of the form "by the next round touching X" failed twice, because nothing checks it. The systemic fix (a dated comment in the package's work-plan entry) is proposed, not applied: `GOV-2C`'s work-plan grant covered ratification entries only, and `packages/execution-planner` has no open package entry to carry it.
 ~~~
 
 Keep (in both texts):
 
 ~~~keep
 is proposed, not applied
+has no open package entry to carry it
 ~~~
 
-**Facts.** Kept: the mechanism failure, the proposed and unapplied systemic fix, and why it was not applied (`GOV-2C`'s work-plan grant covered ratification entries only). Archive only: the two trigger events (`WP-180-FU2` `625c83b`; `WP-160-FU1` `5faf16b`) and the GOV2C-7 correction; the open half is the `N3` residual row.
+**Facts.** Kept: the mechanism failure, the proposed and unapplied systemic fix, and both reasons it was not applied (`GOV-2C`'s work-plan grant covered ratification entries only, and `packages/execution-planner` has no open package entry to carry it). Archive only: the two trigger events (`WP-180-FU2` `625c83b`; `WP-160-FU1` `5faf16b`) and the GOV2C-7 correction; the open half is the `N3` residual row.
 
 ## RW-92: Pending external evidence: the CI bullet
 

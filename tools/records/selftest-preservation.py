@@ -123,6 +123,21 @@ def drop_entry_and_declare(heading, kind):
     return fn
 
 
+def declare_at(rng, kind):
+    """Declare base lines rng ('a-b') unpaired with the given kind (in the first unpaired block)."""
+    def fn(text):
+        return text.replace("~~~unpaired\n", f"~~~unpaired\n{rng} {kind}\n", 1)
+    return fn
+
+
+def chain(*fns):
+    def fn(text):
+        for f in fns:
+            text = f(text)
+        return text
+    return fn
+
+
 def same_facts(a, b):
     """Give entry b the Facts account of entry a (boilerplate)."""
     def fn(text):
@@ -139,7 +154,13 @@ def cut_after_region(text):
     return text[:text.index(end) + len(end)]
 
 
-# (name, file, mutation, proof selection, the report line that must say FAIL)
+def apply(root, rel, fn):
+    """Apply one mutation; rel may instead be a list of (file, mutation) pairs, with fn None."""
+    for r, f in (rel if isinstance(rel, list) else [(rel, fn)]):
+        edit(os.path.join(root, r), f)
+
+
+# (name, file or [(file, mutation)], mutation, proof selection, the report line that must say FAIL)
 MUTATIONS = [
     ("delete one residual row from the archive", f"{ARCH}/open-blockers-2026-09.md",
      archive_drop(r"^\| \*\*SIM2-FILTER\*\*"), "A", "Proof A: FAIL"),
@@ -183,6 +204,25 @@ MUTATIONS = [
     ("send the discharged CI bullet back to Pending", f"{ARCH}/MOVE-MAP.md",
      lambda t: t.replace("| Resolved evidence items (discharged; not repeated under Pending external evidence) |",
                          "| Pending external evidence |", 1), "C", "C5:"),
+    # r2: C8 checks a declared kind against the BASE row, not only the brief
+    ("re-declare a live residual closed (SIM2-FILTER out of the table, into the closed list, its entry dropped)",
+     [("IMPLEMENTATION_STATUS.md", chain(drop_line(r"^\| `SIM2-FILTER` \|"),
+                                         lambda t: t.replace("`SIM2-E2E-MSG`, ", "`SIM2-E2E-MSG`, `SIM2-FILTER`, ", 1))),
+      (f"{ARCH}/REWRITES.md", chain(drop_entry("RW-63: Residual `SIM2-FILTER`"), declare_at("2521-2521", "closed-row `SIM2-FILTER`")))],
+     None, "C", "the base row does not record it closed"),
+    ("re-declare a live package complete (WP-140 flipped to Complete in the brief, its entry dropped)",
+     [("IMPLEMENTATION_STATUS.md", lambda t: t.replace(
+         "| Implementation complete; automated checks complete; the evidence gate is unmet until the ≥24h soak (H4) |",
+         "| Complete (2026-09-01) |", 1)),
+      (f"{ARCH}/REWRITES.md", chain(drop_entry("RW-05: Work packages: `WP-140`"), declare_at("39-39", "complete-row `WP-140`")))],
+     None, "C", "is not Complete or Superseded in the base row"),
+    ("point RW-10's Facts at the wrong archive file", f"{ARCH}/REWRITES.md",
+     lambda t: t.replace("which is history in `work-packages-rounds.md`.", "which is history in `work-packages-waves-0-2.md`.", 1),
+     "C", "C11:"),
+    ("drop a restored VENUE-2 residual (the ops-cli validator pins) from the brief", "IMPLEMENTATION_STATUS.md",
+     drop_line(r"^- The offline gate does not consume the phase-2 report"), "C", "C10:"),
+    ("drop N3's second reason from the brief", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace(", and `packages/execution-planner` has no open package entry to carry it.", ".", 1), "C", "C10:"),
 ]
 
 # check-brief.py mutations: (name, file, mutation, the report line that must appear)
@@ -204,6 +244,25 @@ BRIEF_MUTATIONS = [
     ("the archive README claims complete rewrites", f"{ARCH}/README.md",
      lambda t: t.replace("C authenticates what `REWRITES.md` says. It cannot tell whether a rewrite kept every fact; that is a review question.",
                          "the move map and rewrites are complete and verbatim.", 1), "K14:"),
+    ("the archive README claims every kind is true", f"{ARCH}/README.md",
+     lambda t: t.replace("every base line is paired or declared unpaired, and each declared kind",
+                         "every base line is paired or declared unpaired, with a true kind; each declared kind", 1), "K14:"),
+    ("WP-140 back to 'the gate is open'", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("the evidence gate is unmet until the ≥24h soak (H4) |",
+                         "evidence pending: the ≥24h soak (H4); the gate is open |", 1), "K15:"),
+    ("a ruling that does not say what it ruled", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("The user ruled on 2026-09-30 that `THROUGHPUT-2` evaluates once per frame.",
+                         "Ruled by the user 2026-09-30.", 1), "K16:"),
+    ("B5 narrates the record", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("No test validates the scrape fragment (`infra/prometheus/control-api-scrape.yaml`).",
+                         "The row also records that no test validates the scrape fragment.", 1), "K17:"),
+    ("the old coverage heading", f"{ARCH}/REWRITES.md",
+     lambda t: t.replace("## Coverage: base lines not included in a rewrite pair\n", "## Coverage: lines no entry pairs\n", 1), "K18:"),
+    ("the old Wave 3 intro", "IMPLEMENTATION_STATUS.md",
+     lambda t: t.replace("The user authorized Wave 3 on 2026-09-30. The orchestrator starts `WP-260` first,\n"
+                         "then the work-plan chain, only when both hold:\n",
+                         "The user authorized Wave 3 on 2026-09-30, on a condition. The orchestrator may\n"
+                         "start Wave 3 packages (`WP-260` first, then the work-plan chain) only when both\nhold:\n", 1), "K19:"),
     ("exceed the 15% budget", "IMPLEMENTATION_STATUS.md",
      lambda t: t + ("filler " * 9000) + "\n", "K1:"),
 ]
@@ -276,7 +335,7 @@ def main() -> int:
             root = os.path.join(tmp, f"m{k}")
             os.mkdir(root)
             shadow(repo, root)
-            edit(os.path.join(root, rel), fn)
+            apply(root, rel, fn)
             code, out = run(repo, root, base, only)
             hit = code == 1 and expect in out
             ok &= hit
@@ -289,7 +348,7 @@ def main() -> int:
             root = os.path.join(tmp, f"k{k}")
             os.mkdir(root)
             shadow(repo, root)
-            edit(os.path.join(root, rel), fn)
+            apply(root, rel, fn)
             code, out = run(repo, root, base, "", tool=BRIEF)
             hit = code == 1 and expect in out
             ok &= hit
