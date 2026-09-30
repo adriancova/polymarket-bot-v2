@@ -92,8 +92,52 @@ def section_starts(lines: list) -> list:
     return starts
 
 
+LINK_RE = re.compile(r"\]\(([^)\s]+)\)")
+NOTE_HEAD = ("Links in the region above were written relative to the repository root, "
+             "where the status file lived. Working links from this directory:")
+
+
+def region_links(region: str) -> list:
+    """Relative link targets inside an archived region, in order, without duplicates."""
+    out = []
+    for target in LINK_RE.findall(region):
+        if re.match(r"^[a-z]+:", target) or target.startswith("#") or target in out:
+            continue
+        out.append(target)
+    return out
+
+
+def link_note(region: str) -> str:
+    """The navigation note written after a region's end marker (empty if the region has no relative link).
+
+    A pure function of the region text: the base file sat at the repository
+    root, so each root-relative target is re-rooted from docs/status-archive/.
+    """
+    links = region_links(region)
+    if not links:
+        return ""
+    body = "".join(f"- [{t}](../../{t})\n" for t in links)
+    return f"\n{NOTE_HEAD}\n\n{body}"
+
+
+def split_file(path: str):
+    """(region, outside) of an archive file, without validating it (for navigation checks)."""
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    lines = split_lines(text)
+    begins = [i for i, l in enumerate(lines) if l.startswith("<!-- verbatim-begin")]
+    ends = [i for i, l in enumerate(lines) if l.rstrip("\n") == END_LINE]
+    if not begins or not ends or ends[-1] <= begins[0]:
+        return "", text
+    return "".join(lines[begins[0] + 1:ends[-1]]), "".join(lines[:begins[0] + 1] + lines[ends[-1]:])
+
+
 def extract_region(path: str):
-    """Return (attrs, region_text) for one archive file, or raise ValueError."""
+    """Return (attrs, region_text) for one archive file, or raise ValueError.
+
+    Outside the markers a file may hold only its title and provenance note
+    before the region, and exactly link_note(region) after it.
+    """
     with open(path, encoding="utf-8") as fh:
         text = fh.read()
     lines = split_lines(text)
@@ -107,7 +151,10 @@ def extract_region(path: str):
     end = ends[-1]
     if end <= begins[0]:
         raise ValueError(f"{path}: verbatim-end precedes verbatim-begin")
-    outside = [l for l in lines[:begins[0]] + lines[end + 1:] if l.strip()]
-    if len(outside) > 2:
-        raise ValueError(f"{path}: more than a title and a provenance note outside the markers")
-    return m.groupdict(), "".join(lines[begins[0] + 1:end])
+    before = [l for l in lines[:begins[0]] if l.strip()]
+    if len(before) > 2:
+        raise ValueError(f"{path}: more than a title and a provenance note before the region")
+    region = "".join(lines[begins[0] + 1:end])
+    if "".join(lines[end + 1:]) != link_note(region):
+        raise ValueError(f"{path}: the text after the region is not the generated link note")
+    return m.groupdict(), region

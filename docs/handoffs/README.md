@@ -13,7 +13,7 @@ detail lives in its handoff here. History that the brief once carried is in
 7. **Tabulate mutation checks:** mutant, expected failure, observed result.
 8. **Corrections:** state the corrected fact, then add one line: "Corrected <date> (<round>): was '<old>'." Never rewrite history silently.
 9. **Required fields** (`AGENTS.md`): `summary`, `files_changed`, `tests_run`, `assumptions`, `deviations`, `known_risks`, `follow_up`, `commit_sha`. Add the round's outcome and its reviewer.
-10. **After a merge,** add one line to [`INDEX.md`](INDEX.md) and update the package's row in the brief.
+10. **After a merge,** add or update the handoff's single row in [`INDEX.md`](INDEX.md) and update the package's row in the brief.
 
 The orchestration runbook (§3 step 8) lists what a status update records:
 state, merge SHA, review reference, tests, deviations, unblocked packages,

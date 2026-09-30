@@ -2,7 +2,7 @@
 """Prove that nothing in the base IMPLEMENTATION_STATUS.md was lost (LOGS-1).
 
 Usage:
-  python3 tools/records/check-preservation.py --base <rev> [--repo .] [--root .] [--only A,B,C]
+  python3 tools/records/check-preservation.py --base <rev> [--repo .] [--root .] [--only A,B,C] [--max-report N]
 
 Proof A (strict partition): every docs/status-archive/*.md verbatim region equals
   lines a..b of the base file and matches its sha256 marker; the regions are
@@ -17,19 +17,40 @@ Proof C (facts and navigation):
      blockers or Human items section;
   C3 every backticked 7-40 hex token in the brief occurs in the base file or is
      a git object;
-  C4 every relative link in the brief, the archive notes and the handoff INDEX
-     and README resolves (same-file anchors included);
-  C5 MOVE-MAP.md names every base heading, package row id and blocker/residual id;
-  C6 every REWRITES.md "old" block equals the base lines it cites, and every
+  C4 every relative link in the brief, the archive notes, the handoff INDEX and
+     README, and the archive files' generated link notes resolves (same-file
+     anchors included); every relative link inside an archived region (written
+     relative to the repository root) resolves from the root and has a working
+     counterpart in that file's link note;
+  C5 MOVE-MAP.md names every base heading, package row id and blocker/residual
+     id, and sends a bullet marked DISCHARGED to the section it names;
+  C6 every REWRITES.md "old" block equals the lines it cites in ITS base (the
+     file's pinned rewrites-base unless the block names another), and every
      "new" line occurs in the brief;
   C7 docs/handoffs/INDEX.md has exactly one line per handoff file (untracked
-     files named "_*" are skipped).
+     files named "_*" are skipped);
+  C8 REWRITES.md coverage: every non-blank line of the rewrites-base is inside
+     an old block or an "unpaired" declaration, and each declaration's kind is
+     true (verbatim: the line is in the brief; complete-row: the brief lists the
+     package as Complete or Superseded; closed-row: the brief's closed lists
+     name the id; history: the range holds no package or blocker row start).
+     Every open id in the brief's closeout and residual tables, and every live
+     package row, is paired. After a re-cut, every line inserted or changed
+     since the rewrites-base must be covered the same way at the cut;
+  C9 no two REWRITES.md entries share one Facts account (no boilerplate);
+  C10 every "keep" phrase of an entry occurs in that entry's old text and in
+     the brief (case, whitespace and Markdown emphasis ignored); every entry
+     that pairs an open row carries at least one keep phrase.
+
+C6 and C10 authenticate what REWRITES.md says; they cannot judge whether a
+rewrite kept every fact. That remains a review question.
 
 Exit 0 when every selected proof passes, 1 otherwise. Stdlib only, no network.
 """
 
 import argparse
 import collections
+import difflib
 import os
 import re
 import subprocess
@@ -119,24 +140,81 @@ def slug(heading_text):
     return s.replace(" ", "-")
 
 
-def rewrites_blocks(text):
-    """[(kind, a, b, [lines])] for ~~~old lines=a-b and ~~~new blocks."""
-    blocks, cur = [], None
+def parse_rewrites(text):
+    """Parse REWRITES.md.
+
+    Returns (rewrites_base, blocks, entries). A block is a dict with kind
+    ("old", "new", "keep" or "unpaired"), base (None means the pinned
+    rewrites-base), a and b (the cited lines of an old block), its lines, and
+    the RW entry it sits in. entries maps "RW-NN" to its Facts lines.
+    """
+    m = re.search(r"^<!-- rewrites-base: ([0-9a-f]{40}) -->$", text, flags=re.M)
+    rwbase = m.group(1) if m else None
+    blocks, entries, cur, entry, facts = [], collections.OrderedDict(), None, None, None
     for line in text.split("\n"):
         if cur is None:
-            m = re.match(r"^~~~old lines=(\d+)-(\d+)$", line)
-            if m:
-                cur = ["old", int(m.group(1)), int(m.group(2)), []]
-            elif line == "~~~new":
-                cur = ["new", 0, 0, []]
+            h = re.match(r"^## (RW-\d+):", line)
+            if h:
+                entry, facts = h.group(1), None
+                entries[entry] = []
+                continue
+            if line.startswith("## "):
+                entry = facts = None
+                continue
+            mo = re.match(r"^~~~(old|unpaired)(?: base=([0-9a-f]{40}))?(?: lines=(\d+)-(\d+))?$", line)
+            if mo:
+                if mo.group(1) == "old" and not mo.group(3):
+                    raise ValueError(f"REWRITES.md: an old block needs lines=a-b: {line!r}")
+                cur = {"kind": mo.group(1), "base": mo.group(2), "a": int(mo.group(3) or 0),
+                       "b": int(mo.group(4) or 0), "lines": [], "entry": entry}
+                facts = None
+                continue
+            if line in ("~~~new", "~~~keep"):
+                cur = {"kind": line[3:], "base": None, "a": 0, "b": 0, "lines": [], "entry": entry}
+                facts = None
+                continue
+            if line.startswith("~~~"):
+                raise ValueError(f"REWRITES.md: unknown block {line!r}")
+            if entry and line.startswith("**Facts.**"):
+                facts = entries[entry]
+            if facts is not None:
+                facts.append(line)
         elif line == "~~~":
-            blocks.append(tuple(cur))
+            blocks.append(cur)
             cur = None
         else:
-            cur[3].append(line)
+            cur["lines"].append(line)
     if cur is not None:
         raise ValueError("REWRITES.md: unterminated block")
-    return blocks
+    return rwbase, blocks, entries
+
+
+def norm(text):
+    """Case, whitespace and Markdown emphasis ignored, for keep phrases."""
+    text = text.replace("\\|", "|")
+    text = re.sub(r"[`*]", "", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def row_starts(lines):
+    """{id: 1-based start line} of package rows and blocker/residual rows in a base text."""
+    out, where = {}, ""
+    for n, line in enumerate(lines, 1):
+        if line.startswith("## "):
+            where = line
+        if where == "## Work packages":
+            m = ROW_ID.match(line)
+            if m:
+                out.setdefault(("pkg", m.group(1)), n)
+        elif where == "## Open blockers":
+            if line.startswith("### The cross-package") or line.startswith("### Cross-package"):
+                where = ""
+                continue
+            m = BOLD_ID.match(line)
+            if m:
+                raw = m.group(1).replace("**", "")
+                out.setdefault(("row", re.sub(r" \(.*\)$", "", raw).strip()), n)
+    return out
 
 
 def proof_a(root, sha, base, report):
@@ -196,9 +274,9 @@ def proof_b(root, base, regions, report):
     for _a, _b, _n, region in regions:
         arch.update(region.split("\n"))
     rw = collections.Counter()
-    for kind, _a, _b, blines in rewrites_blocks(read(root, f"{S.ARCHIVE}/REWRITES.md")):
-        if kind == "old":
-            rw.update(blines)
+    for blk in parse_rewrites(read(root, f"{S.ARCHIVE}/REWRITES.md"))[1]:
+        if blk["kind"] == "old":
+            rw.update(blk["lines"])
     total = sum(need.values())
     in_arch = in_brief = quoted = 0
     missing = []
@@ -218,11 +296,44 @@ def proof_b(root, base, regions, report):
     return not missing
 
 
-def proof_c(root, repo, base, report):
+def brief_tables(brief_lines):
+    """Ids in the brief's closeout and residual tables, and its package rows [(id, status)]."""
+    open_ids, pkgs, h2, h3 = [], [], "", ""
+    for line in brief_lines:
+        if line.startswith("## "):
+            h2, h3 = line, ""
+        elif line.startswith("### "):
+            h3 = line
+        m = re.match(r"^\| `([^`]+)` \|", line)
+        if not m:
+            continue
+        if h2 == "## Open blockers" and (h3.startswith("### Closeout blockers") or h3 == "### Residual queue"):
+            open_ids.append(m.group(1))
+        elif h2 == "## Work packages":
+            cells = [c.strip() for c in line.split(" | ")]
+            pkgs.append((m.group(1), cells[2] if len(cells) > 2 else ""))
+    return open_ids, pkgs
+
+
+def closed_text(brief_lines):
+    """The brief's two closed lists (closeout blockers and residual rows)."""
+    out, on = [], False
+    for line in brief_lines:
+        if line.startswith("Closed: `") or line.startswith("Closed, done or ruled"):
+            on = True
+        if on and not line.strip():
+            on = False
+        if on:
+            out.append(line)
+    return "\n".join(out)
+
+
+def proof_c(root, repo, sha, base, report):
     fails = []
     base_lines = base.split("\n")
     brief = read(root, S.STATUS)
     brief_lines = brief.split("\n")
+    brief_set = set(brief_lines)
 
     # C1
     brief_rows = {}
@@ -281,6 +392,28 @@ def proof_c(root, repo, base, report):
             dest = os.path.normpath(os.path.join(root, os.path.dirname(rel), path))
             if not os.path.exists(dest):
                 fails.append(f"C4: {rel}: link {target} does not resolve")
+    adir = os.path.join(root, S.ARCHIVE)
+    narch = 0
+    for name in sorted(os.listdir(adir)):
+        if not name.endswith(".md") or name in NOTES:
+            continue
+        rel = f"{S.ARCHIVE}/{name}"
+        region, outside = S.split_file(os.path.join(adir, name))
+        note_targets = re.findall(r"\]\(([^)\s]+)\)", outside)
+        for target in S.region_links(region):
+            narch += 1
+            path = target.partition("#")[0]
+            if not os.path.exists(os.path.normpath(os.path.join(root, path))):
+                fails.append(f"C4: {rel}: archived link {target} does not resolve from the repository root")
+            fixed = [n for n in note_targets if n.partition("#")[0]
+                     and os.path.normpath(os.path.join(adir, n.partition("#")[0])) == os.path.normpath(os.path.join(root, path))]
+            if not fixed:
+                fails.append(f"C4: {rel}: archived link {target} is broken from {S.ARCHIVE}/ and has no working counterpart in the link note")
+        for target in note_targets:
+            narch += 1
+            path = target.partition("#")[0]
+            if path and not os.path.exists(os.path.normpath(os.path.join(adir, path))):
+                fails.append(f"C4: {rel}: link-note target {target} does not resolve")
     # C5
     mm = read(root, f"{S.ARCHIVE}/MOVE-MAP.md")
     for h in headings(base_lines):
@@ -292,17 +425,179 @@ def proof_c(root, repo, base, report):
     for rid in ids:
         if f"`{rid}`" not in mm:
             fails.append(f"C5: MOVE-MAP.md does not name id {rid!r}")
+    for n, line in enumerate(base_lines, 1):
+        m = re.search(r"DISCHARGED[^)]*?see `## ([^`]+)`", line) if line.startswith("- ") else None
+        if m:
+            mrow = [r for r in mm.split("\n") if f" | {n} | [" in r]
+            if not mrow or not mrow[0].rstrip(" |").split(" | ")[-1].startswith(m.group(1)):
+                fails.append(f"C5: MOVE-MAP.md does not send the DISCHARGED bullet at line {n} to {m.group(1)!r}")
+
+    # REWRITES.md: C6, C8, C9, C10
+    try:
+        rwbase, blocks, entries = parse_rewrites(read(root, f"{S.ARCHIVE}/REWRITES.md"))
+    except ValueError as e:
+        fails.append(f"C6: {e}")
+        rwbase, blocks, entries = None, [], {}
+    cut = sha
+    texts = {cut: base_lines}
+    if rwbase is None:
+        fails.append("C6: REWRITES.md has no '<!-- rewrites-base: <sha> -->' pin")
+    else:
+        try:
+            rwbase = S.resolve(repo, rwbase)
+            texts.setdefault(rwbase, S.base_text(repo, rwbase).split("\n"))
+        except subprocess.CalledProcessError:
+            fails.append(f"C6: rewrites-base {rwbase} is not a commit")
+            rwbase = None
+    for blk in blocks:
+        if blk["base"] is None:
+            blk["base"] = rwbase
+        elif blk["base"] not in texts:
+            fails.append(f"C6: a {blk['kind']} block names base {blk['base'][:12]}, which is neither the rewrites-base nor the cut")
+            blk["base"] = None
     # C6
-    blocks = rewrites_blocks(read(root, f"{S.ARCHIVE}/REWRITES.md"))
-    brief_set = set(brief_lines)
-    for kind, a, b, blines in blocks:
-        if kind == "old":
-            if blines != base_lines[a - 1:b]:
-                fails.append(f"C6: REWRITES old block lines={a}-{b} is not verbatim base text")
-        else:
-            for line in blines:
+    news_by_entry, olds_by_entry, keeps_by_entry = collections.defaultdict(list), collections.defaultdict(list), collections.defaultdict(list)
+    for blk in blocks:
+        if blk["kind"] == "old" and blk["base"]:
+            if blk["lines"] != texts[blk["base"]][blk["a"] - 1:blk["b"]]:
+                fails.append(f"C6: REWRITES old block lines={blk['a']}-{blk['b']} is not verbatim text of {blk['base'][:12]}")
+            olds_by_entry[blk["entry"]].append(blk)
+        elif blk["kind"] == "new":
+            news_by_entry[blk["entry"]].extend(blk["lines"])
+            for line in blk["lines"]:
                 if line.strip() and line not in brief_set:
                     fails.append(f"C6: REWRITES new line is not in the brief: {line[:100]!r}")
+        elif blk["kind"] == "keep":
+            keeps_by_entry[blk["entry"]].extend(l for l in blk["lines"] if l.strip())
+
+    # C8
+    open_ids, pkgs = brief_tables(brief_lines)
+    closed = closed_text(brief_lines)
+    pkg_status = collections.defaultdict(list)
+    for pid, status in pkgs:
+        pkg_status[pid].append(status)
+
+    def coverage(sha, need):
+        """Check coverage of the 1-based line numbers `need` of text `sha`; validate its declarations."""
+        lines = texts[sha]
+        starts = row_starts(lines)
+        start_of = {n: key for key, n in starts.items()}
+        covered = set()
+        for blk in blocks:
+            if blk["base"] == sha and blk["kind"] == "old":
+                covered.update(range(blk["a"], blk["b"] + 1))
+        for blk in blocks:
+            if blk["base"] != sha or blk["kind"] != "unpaired":
+                continue
+            for decl in blk["lines"]:
+                if not decl.strip():
+                    continue
+                m = re.match(r"^(\d+)-(\d+) (verbatim|complete-row|closed-row|history)(?: (.*))?$", decl)
+                if not m:
+                    fails.append(f"C8: malformed unpaired declaration {decl!r}")
+                    continue
+                a, b, kind, detail = int(m.group(1)), int(m.group(2)), m.group(3), (m.group(4) or "")
+                inside = [start_of[n] for n in range(a, b + 1) if n in start_of]
+                if kind == "verbatim":
+                    bad = [n for n in range(a, b + 1) if lines[n - 1].strip() and lines[n - 1] not in brief_set]
+                    if bad:
+                        fails.append(f"C8: unpaired {a}-{b} is declared verbatim, but line {bad[0]} is not in the brief")
+                elif kind in ("complete-row", "closed-row"):
+                    ident = detail.strip("`")
+                    key = ("pkg" if kind == "complete-row" else "row", ident)
+                    if starts.get(key) != a or any(k != key for k in inside):
+                        fails.append(f"C8: unpaired {a}-{b} is declared {kind} {ident!r}, but it is not exactly that row")
+                    elif kind == "complete-row" and not any(s.startswith(("Complete", "Superseded")) for s in pkg_status.get(ident, [])):
+                        fails.append(f"C8: unpaired {a}-{b}: package {ident!r} is not Complete or Superseded in the brief")
+                    elif kind == "closed-row" and f"`{ident}`" not in closed:
+                        fails.append(f"C8: unpaired {a}-{b}: {ident!r} is not in the brief's closed lists")
+                elif inside:
+                    fails.append(f"C8: unpaired {a}-{b} is declared history but holds the row {inside[0][1]!r}")
+                covered.update(range(a, b + 1))
+        missing = sorted(n for n in need if n not in covered)
+        if missing:
+            runs, s = [], missing[0]
+            for x, y in zip(missing, missing[1:] + [None]):
+                if y != x + 1:
+                    runs.append(f"{s}-{x}")
+                    s = y
+            fails.append(f"C8: {len(missing)} line(s) of {sha[:12]} are neither paired nor declared unpaired: {', '.join(runs[:8])}")
+        return covered, starts
+
+    npaired = 0
+    if rwbase:
+        rw_lines = texts[rwbase]
+        rw_cov, rw_starts = coverage(rwbase, [n for n, l in enumerate(rw_lines, 1) if l.strip()])
+        rw_old = set()
+        for blk in blocks:
+            if blk["base"] == rwbase and blk["kind"] == "old":
+                rw_old.update(range(blk["a"], blk["b"] + 1))
+        cut_old = set()
+        for blk in blocks:
+            if blk["base"] == cut and blk["kind"] == "old":
+                cut_old.update(range(blk["a"], blk["b"] + 1))
+        # map unchanged cut lines back to the rewrites-base
+        to_rw, changed = {}, []
+        if cut == rwbase:
+            to_rw = {n: n for n in range(1, len(rw_lines) + 1)}
+        else:
+            sm = difflib.SequenceMatcher(None, rw_lines, base_lines, autojunk=False)
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag == "equal":
+                    for k in range(j2 - j1):
+                        to_rw[j1 + k + 1] = i1 + k + 1
+                elif tag in ("replace", "insert"):
+                    changed.extend(n for n in range(j1 + 1, j2 + 1) if base_lines[n - 1].strip())
+            coverage(cut, changed)
+        cut_starts = row_starts(base_lines)
+        live = [("row", i) for i in open_ids]
+        live += [("pkg", p) for p, s in pkgs if not s.startswith(("Complete", "Superseded"))]
+        paired_rw_starts = set()
+        for key in live:
+            n = cut_starts.get(key)
+            if n is None:
+                fails.append(f"C8: the brief lists {key[1]!r}, which has no row in the base")
+                continue
+            if n in to_rw and cut != rwbase:
+                ok = to_rw[n] in rw_old
+                paired_rw_starts.add(to_rw[n])
+            elif cut == rwbase:
+                ok = n in rw_old
+                paired_rw_starts.add(n)
+            else:
+                ok = n in cut_old
+            npaired += ok
+            if not ok:
+                fails.append(f"C8: the brief lists {key[1]!r} as open or live, but REWRITES.md pairs no old block with its row")
+        # C10: an entry that pairs an open row needs keep phrases
+        for entry, olds in olds_by_entry.items():
+            pairs_open = any(b["base"] == rwbase and any(b["a"] <= n <= b["b"] for n in paired_rw_starts) for b in olds)
+            if pairs_open and not keeps_by_entry.get(entry):
+                fails.append(f"C10: {entry} pairs an open or live row but has no keep phrase")
+    # C9
+    seen = collections.defaultdict(list)
+    for entry, flines in entries.items():
+        account = norm(" ".join(flines).replace("**Facts.**", ""))
+        if not account:
+            fails.append(f"C9: {entry} has no Facts account")
+        seen[account].append(entry)
+    for account, who in seen.items():
+        if account and len(who) > 1:
+            fails.append(f"C9: {len(who)} entries share one Facts account ({', '.join(who[:6])}): {account[:80]!r}")
+    # C10
+    nkeep = 0
+    brief_n = norm(brief)
+    for entry, phrases in keeps_by_entry.items():
+        old_n = norm(" ".join(l for b in olds_by_entry.get(entry, []) for l in b["lines"]))
+        new_n = norm(" ".join(news_by_entry.get(entry, [])))
+        for ph in phrases:
+            nkeep += 1
+            p = norm(ph)
+            if p not in old_n:
+                fails.append(f"C10: {entry}: keep phrase is not in its old text: {ph[:90]!r}")
+            if p not in new_n or p not in brief_n:
+                fails.append(f"C10: {entry}: keep phrase is not in its new text in the brief: {ph[:90]!r}")
+
     # C7
     index = read(root, "docs/handoffs/INDEX.md")
     listed = set(re.findall(r"^\| [^|]* \| \[([^\]]+\.md)\]\(", index, flags=re.M))
@@ -312,12 +607,19 @@ def proof_c(root, repo, base, report):
         fails.append(f"C7: docs/handoffs/INDEX.md has no line for {f}")
     for f in sorted(listed - present):
         fails.append(f"C7: docs/handoffs/INDEX.md lists {f}, which does not exist")
+    nold = sum(1 for b in blocks if b["kind"] == "old")
     report.append(f"Proof C: {'FAIL' if fails else 'PASS'} ({len(rows)} package rows, {len(ids)} blocker/residual ids, "
-                  f"{len(hexes)} hex tokens, {nlinks} links, {len(present)} handoffs indexed, {sum(1 for k in blocks if k[0] == 'old')} REWRITES old blocks)")
-    report.extend("  " + f for f in fails[:40])
-    if len(fails) > 40:
-        report.append(f"  ... and {len(fails) - 40} more")
+                  f"{len(hexes)} hex tokens, {nlinks} links + {narch} archive links, {len(present)} handoffs indexed, "
+                  f"{len(entries)} REWRITES entries with {nold} old blocks, {npaired} open or live rows paired, "
+                  f"{nkeep} keep phrases; rewrites-base {(rwbase or 'none')[:12]}, cut {cut[:12]})")
+    report.extend("  " + f for f in fails[:MAX_REPORT[0]])
+    if len(fails) > MAX_REPORT[0]:
+        report.append(f"  ... and {len(fails) - MAX_REPORT[0]} more")
     return not fails
+
+
+MAX_REPORT = [40]
+
 
 
 def main() -> int:
@@ -326,7 +628,9 @@ def main() -> int:
     ap.add_argument("--repo", default=".")
     ap.add_argument("--root", default=None, help="the tree holding the brief and the archive (default: --repo)")
     ap.add_argument("--only", default="A,B,C")
+    ap.add_argument("--max-report", type=int, default=40, help="Proof C failures to print (default 40)")
     args = ap.parse_args()
+    MAX_REPORT[0] = args.max_report
     root = args.root or args.repo
     sha = S.resolve(args.repo, args.base)
     base = S.base_text(args.repo, sha)
@@ -342,7 +646,7 @@ def main() -> int:
     if "B" in only:
         ok &= proof_b(root, base, regions, report)
     if "C" in only:
-        ok &= proof_c(root, args.repo, base, report)
+        ok &= proof_c(root, args.repo, sha, base, report)
     print("\n".join(report))
     print("RESULT: " + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1

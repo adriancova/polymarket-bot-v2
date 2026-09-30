@@ -146,7 +146,7 @@ update that one line in the brief, and re-cut the archive (see `README.md`).
 | `DEPS-1` | 737 | [work-packages-rounds.md](work-packages-rounds.md) | Work packages (own row) |
 | `THROUGHPUT-2` | 738 | [work-packages-rounds.md](work-packages-rounds.md) | Work packages (own row); Authorized now |
 | `VENUE-3` | 756 | [work-packages-rounds.md](work-packages-rounds.md) | Work packages (own row); Authorized now |
-| `WP-260` | 769 | [work-packages-rounds.md](work-packages-rounds.md) | Work packages (own row); Authorized now |
+| `WP-260` | 769 | [work-packages-rounds.md](work-packages-rounds.md) | Work packages (own row) |
 | All other packages | 770 | [work-packages-rounds.md](work-packages-rounds.md) | Work packages (own row) |
 
 ## Closeout-blocker and residual rows
@@ -255,7 +255,7 @@ update that one line in the brief, and re-cut the archive (see `README.md`).
 | `SNAP1-KEYSET` | 2621 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |
 | `SNAP1-MINOR` | 2622 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |
 | `BRACKET-1c` | 2623 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (named) |
-| `H8 track` (H8 track (`H8-GOV` → `CORE-MOVE` → `BACKTEST-2`)) | 2624 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Open blockers > Residual queue (own row) |
+| `H8 track` (H8 track (`H8-GOV` → `CORE-MOVE` → `BACKTEST-2`)) | 2624 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Human items (named) |
 | `Human items` | 2648 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Human items (section) |
 | `Wave 3 authorization` (Wave 3 authorization (conditional)) | 2649 | [open-blockers-2026-09.md](open-blockers-2026-09.md) | Human items > Wave 3 authorization (conditional) (section) |
 
@@ -272,7 +272,7 @@ update that one line in the brief, and re-cut the archive (see `README.md`).
 | Deviations from specification | **N9 — `WP-200` declares an `allowed_path` that does not ... | 2920 | [deviations-evidence-gates.md](deviations-evidence-gates.md) | Deviations from specification (one line each) |
 | Deviations from specification | **N11 — `BACKTEST-1` touched the protected root `package.json` (one ... | 2921 | [deviations-evidence-gates.md](deviations-evidence-gates.md) | Deviations from specification (one line each) |
 | Deviations from specification | **N3 — a ruling's compliance mechanism failed, twice (recorded ... | 2922 | [deviations-evidence-gates.md](deviations-evidence-gates.md) | Deviations from specification (one line each) |
-| Pending external evidence | `.github/workflows/ci.yml`: YAML-validated only — a real GitHub Actions run ... | 2926 | [deviations-evidence-gates.md](deviations-evidence-gates.md) | Pending external evidence |
+| Pending external evidence | `.github/workflows/ci.yml`: YAML-validated only — a real GitHub Actions run ... | 2926 | [deviations-evidence-gates.md](deviations-evidence-gates.md) | Resolved evidence items (discharged; not repeated under Pending external evidence) |
 | Pending external evidence | **The register's C-2 reopen condition is MET (recorded 2026-09-17 ... | 2928 | [deviations-evidence-gates.md](deviations-evidence-gates.md) | Pending external evidence |
 | Resolved evidence items | `.github/workflows/ci.yml` real GitHub Actions run (2026-09-26, `CI-1`): the first ... | 2932 | [deviations-evidence-gates.md](deviations-evidence-gates.md) | Resolved evidence items |
 | Resolved evidence items | `docker-compose.yml` runtime validation (2026-08-22): Docker 29.1.2 / Compose v2.40.3 ... | 2933 | [deviations-evidence-gates.md](deviations-evidence-gates.md) | Resolved evidence items |

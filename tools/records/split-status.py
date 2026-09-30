@@ -5,7 +5,9 @@ Usage: python3 tools/records/split-status.py --base <rev> [--repo .] [--out docs
 
 Each archive file holds ONE contiguous region of the base file, byte for byte,
 between verbatim markers that carry the base commit, the line range and the
-region's sha256. Together the regions partition the base file. Deterministic,
+region's sha256. Together the regions partition the base file. A region whose
+links were written relative to the repository root gets a generated link note
+after its end marker (status_sections.link_note). Deterministic,
 stdlib only, no network. It overwrites only the SECTIONS files it owns.
 """
 
@@ -47,6 +49,7 @@ def main() -> int:
             f"<!-- verbatim-begin source={S.STATUS} base={sha} lines={a + 1}-{b} "
             f"sha256={S.sha256(''.join(lines[a:b]).encode('utf-8'))} -->\n"
             f"{region}{S.END_LINE}\n"
+            f"{S.link_note(''.join(lines[a:b]))}"
         )
         with open(os.path.join(out, name), "w", encoding="utf-8", newline="") as fh:
             fh.write(body)

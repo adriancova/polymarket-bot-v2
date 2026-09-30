@@ -263,3 +263,8 @@ open as a *remediation*, since every finding it names is still live on `main` an
 are staged.)*
 
 <!-- verbatim-end -->
+
+Links in the region above were written relative to the repository root, where the status file lived. Working links from this directory:
+
+- [docs/adr/ADR-020-schema-parse-boundary-integrity.md](../../docs/adr/ADR-020-schema-parse-boundary-integrity.md)
+- [docs/contracts/schema-boundary.md](../../docs/contracts/schema-boundary.md)

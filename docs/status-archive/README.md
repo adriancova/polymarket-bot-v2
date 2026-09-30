@@ -37,6 +37,14 @@ Older records cite the status file by line, for example
 the cut. Read them with `git show f43efe6:IMPLEMENTATION_STATUS.md`, or find the
 line in `MOVE-MAP.md` and the archive file whose marker range contains it.
 
+## Links inside the archived regions
+
+The old file sat at the repository root, so relative links inside a region
+resolve from the root, not from this directory. The bytes are kept as they
+were. `split-status.py` writes a note after each such region with the working
+links; Proof A checks the note is exactly the generated one, and C4 checks that
+every archived link resolves from the root and has a working counterpart.
+
 ## Tools
 
 All are Python 3 standard library, deterministic and offline. Run them from the
@@ -44,16 +52,19 @@ repository root.
 
 - `python3 tools/records/split-status.py --base <rev>` writes the archive files from `<rev>:IMPLEMENTATION_STATUS.md`. The split keys on headings and row ids, not line numbers.
 - `python3 tools/records/move-map.py --base <rev>` writes `MOVE-MAP.md`. Re-run it after editing the brief.
-- `python3 tools/records/check-preservation.py --base <rev>` runs the proofs: A, the archive regions partition the base file exactly; B, every non-blank base line is present, counted with multiplicity; C, the brief names every package and open item, its SHAs exist, its links resolve, and the move map and rewrites are complete and verbatim.
-- `python3 tools/records/selftest-preservation.py` shows the proofs are not vacuous: it mutates a scratch copy and checks that each mutation fails.
+- `python3 tools/records/check-preservation.py --base <rev>` runs the proofs. A: the archive regions partition the base file exactly. B: every non-blank base line is present, counted with multiplicity. C: the brief names every package and open item; its SHAs exist; links resolve; the move map is complete; each `REWRITES.md` old block is verbatim in its base and each new line is in the brief; every base line is paired or declared unpaired, with a true kind; no two entries share a Facts account; each keep phrase is in both texts. C authenticates what `REWRITES.md` says. It cannot tell whether a rewrite kept every fact; that is a review question.
+- `python3 tools/records/check-brief.py --base <rev>` checks the brief's budget (15% of the base file) and the measurable parts of the writing standard.
+- `python3 tools/records/selftest-preservation.py` shows the proofs are not vacuous: it mutates a scratch copy, including a synthetic re-cut, and checks that each mutation fails and each re-cut passes.
 
 ## Re-cutting after edits on `main`
 
 Edits made to the old file on `main` after the cut (new rows, status flips) are
-re-applied like this:
+re-applied like this. `REWRITES.md` stays pinned to its `rewrites-base`
+(`f43efe6`), so its existing line numbers never change.
 
 1. Merge `main`. Resolve the conflict in `IMPLEMENTATION_STATUS.md` by keeping the brief.
-2. Run `split-status.py --base <main tip>`. The archive now holds those edits verbatim.
-3. For each id in `git diff f43efe6 <main tip> -- IMPLEMENTATION_STATUS.md`, update its one line in the brief. Add a `REWRITES.md` pair for each changed live line.
-4. Run `move-map.py` and `check-preservation.py --base <main tip>`. Both must pass.
-5. Update the cut line above.
+2. Run `python3 tools/records/split-status.py --base <main tip>`. The archive now holds those edits verbatim.
+3. For each id in `git diff f43efe6 <main tip> -- IMPLEMENTATION_STATUS.md`, update its one line in the brief.
+4. In `REWRITES.md`, cover every line inserted or changed since `f43efe6`: add an entry whose old block names the cut (`~~~old base=<main tip sha> lines=a-b`), with keep phrases for an open or live row; or add a declaration to a `~~~unpaired base=<main tip sha>` block. Do not renumber existing blocks.
+5. Run `python3 tools/records/move-map.py --base <main tip>`, then `check-preservation.py --base <main tip>`, `check-brief.py --base <main tip>` and `selftest-preservation.py`. All must pass.
+6. Update the cut line above.

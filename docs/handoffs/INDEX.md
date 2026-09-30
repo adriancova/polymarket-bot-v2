@@ -2,7 +2,7 @@
 
 One line per handoff in this directory, oldest first. "Added" is the date git first recorded the file. Status and merge SHAs come from `IMPLEMENTATION_STATUS.md`. Kinds: WP (a work package), FU (a follow-up to one), Governance, Audit, Round (a bounded round), Operational, Session.
 
-After a merge, add one line here (see [`README.md`](README.md)).
+After a merge, add or update the handoff's single row here (see [`README.md`](README.md)).
 
 | Added | Handoff | Package or round | Kind | Outcome | Merge | Size |
 | --- | --- | --- | --- | --- | --- | --- |

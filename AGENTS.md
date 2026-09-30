@@ -4,7 +4,7 @@ Before planning, editing, or delegating:
 
 1. Read `docs/spec/polymarket-bot-orchestrator-handoff.md`.
 2. Read `docs/spec/polymarket-bot-workplan.yaml`.
-3. Read `IMPLEMENTATION_STATUS.md`. It is a brief of current state: its history is archived verbatim under `docs/status-archive/`, and per-package detail goes in the handoff (`docs/handoffs/README.md`), linked from the package's one-line row.
+3. Read `IMPLEMENTATION_STATUS.md`. It is a brief of current state: its history is archived verbatim, and frozen, under `docs/status-archive/`, and per-package detail goes in the handoff (`docs/handoffs/README.md`), linked from the package's one-line row.
 4. Inspect the current Git status and recent commits.
 5. When orchestrating multi-package execution, also read
    `docs/spec/polymarket-bot-agent-orchestration-runbook.md` (process authority

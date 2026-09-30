@@ -130,7 +130,7 @@ def main() -> int:
         if m:
             label = f"{m.group(1)}`{m.group(2)}`"
             dest = locate(m.group(2), brief, where, prefer=("Work packages",))
-            if locate(m.group(2), brief, where, prefer=("Authorized now",)).startswith("Authorized now"):
+            if any(l.startswith(f"- **`{m.group(2)}`**") for l in brief):
                 dest += "; Authorized now"
             out.append(f"| {label} | {n} | [{archive_of(n)}]({archive_of(n)}) | {dest} |")
         elif on and line.startswith("| All other packages"):
@@ -154,7 +154,12 @@ def main() -> int:
             ident = re.sub(r" \(.*\)$", "", raw).strip()
             label = f"`{ident}`" + ("" if raw == ident else " (" + raw.replace("|", "\\|") + ")")
             first = "Open blockers > Closeout" if sub.startswith("### Closeout") else "Open blockers > Residual queue"
-            dest = locate(ident, brief, where, prefer=(first, "Open blockers", "Human items"))
+            own = [i for i, l in enumerate(brief) if l.startswith(f"| `{ident}` |") and where[i].startswith(first)]
+            if own:
+                dest = f"{where[own[0]]} (own row)"
+            else:  # named: the human items first (a completed track's rulings live there), then the lists
+                order = (first, "Open blockers", "Human items") if first.endswith("Closeout") else ("Human items", first, "Open blockers")
+                dest = locate(ident, brief, where, prefer=order)
             out.append(f"| {label} | {n} | [{archive_of(n)}]({archive_of(n)}) | {dest} |")
 
     out += ["", "## Bullets of the deviation, evidence and gate sections", "",
@@ -167,6 +172,10 @@ def main() -> int:
         if cur and line.startswith("- "):
             words = " ".join(line[2:].split()[:9]).replace("|", "\\|")
             dest = next(b for p, b in HEADING_TO_BRIEF if cur.startswith(p))
+            moved = re.search(r"DISCHARGED[^)]*?see `(## [^`]+)`", line)
+            if moved:  # a discharged bullet lives only where its own text points
+                dest = next(b for p, b in HEADING_TO_BRIEF if moved.group(1).startswith(p))
+                dest += f" (discharged; not repeated under {cur[3:]})"
             out.append(f"| {cur[3:]} | {words} ... | {n} | [{archive_of(n)}]({archive_of(n)}) | {dest} |")
     out.append("")
     path = os.path.join(root, S.ARCHIVE, "MOVE-MAP.md")
