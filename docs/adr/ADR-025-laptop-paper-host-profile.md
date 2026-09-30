@@ -3,7 +3,8 @@
 - **Status:** Accepted. The user ruled on 2026-09-30 (`LEAN-1`, ruling H).
 - **Date:** 2026-09-30
 - **Recorded by:** `LEAN-GOV`
-- **Implemented by:** `HOST-BENCH`, `HOST-1` and `BURN-IN`. None of them exists yet.
+- **Implemented by:** `HOST-BENCH`, `HOST-1` and `BURN-IN`. None of them
+  exists yet.
 - **Supersedes / Superseded by:** none. It **must be superseded** before any
   mode above PAPER runs on any host (Decision 9).
 - **Handoff sections:** §2, §4, §4.1, §4.2, §9.1, §11, §15. **ADRs:** ADR-003,

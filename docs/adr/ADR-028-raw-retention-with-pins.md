@@ -63,7 +63,12 @@ The proposal the user accepted (`LEAN-1` §6, row A3):
 
 A segment is deleted only when **all** of these hold:
 
-1. Its last frame's `receivedAt` is at least 72 hours old.
+1. The newest `receivedAt` over all of the segment's verified frames is at
+   least 72 hours old. This is the maximum, not the last frame's stamp.
+   Stamps may repeat or step backwards (ADR-026 Context 5), so the last
+   frame in dispatch order is not always the newest. Example: frames
+   dispatched with ages 71 h, then 73 h. The last is 73 h old, but the
+   segment still holds a 71 h frame, so it is kept.
 2. The research tier covering the segment's time span is written and
    verified. Verified means read back from the store and checked against its
    manifest digest.
@@ -105,7 +110,7 @@ extracted, or what is pinned.** A stuck expiry is a page (`LEAN-1` §8).
 ### 3. Pins
 
 1. **Which windows are pinned.** A market window is pinned if it had an
-   intent, a fill, a risk refusal or a halt. An operator can also pin any
+   intent, a fill, a refusal or a halt. An operator can also pin any
    window.
 2. **What a pin holds.** The whole market window, exact, plus the reference
    feeds over the window and a lead-in before it. The lead-in is at least the

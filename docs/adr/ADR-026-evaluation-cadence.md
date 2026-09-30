@@ -55,9 +55,9 @@ The proposal the user accepted (`LEAN-1` §6, row A1):
 3. Both are run settings. They are pinned in the run record of every run, on
    live data or in replay. A change to either starts a new run (§9.6).
 4. The run record is the run's `strategy.runs` row (§10.3), or the immutable
-   configuration version that row names (`config_id`). Today neither
-   has a field for these settings
-   (`packages/storage-postgres/src/schema/strategy.ts`).
+   configuration version that row names (`config_id`). Today neither has a
+   field for these settings. The schema is in
+   `packages/storage-postgres/src/schema/strategy.ts`.
    `CADENCE-1` names the field it uses and pins it with a test. If that needs
    a schema change, `CADENCE-1` stops and asks for a `db/migrations/**` grant.
 5. **Every new run uses the defaults.** A PAPER run on live data, and every

@@ -1298,8 +1298,15 @@ work_packages:
   # maximum_run_mode. THROUGHPUT-1c is a round recorded in
   # IMPLEMENTATION_STATUS.md, not an entry in this file; "depends_on" names it
   # where a round must wait for its merge (LEAN-1 §7, "After 1c").
-  # CADENCE-1, ROLLOVER-1 and CKPT-1 all hold packages/trading-core/** and
-  # apps/trader/src/**. They run one at a time, never concurrently (AGENTS.md).
+  # Some LEAN-1 rounds share paths that no depends_on orders:
+  # - CADENCE-1, ROLLOVER-1 and CKPT-1 all hold packages/trading-core/**,
+  #   apps/trader/src/** and test/integration/paper-trader/**. CKPT-1 waits
+  #   for CADENCE-1; ROLLOVER-1 waits for neither.
+  # - ROLLOVER-1 and REFDIET both hold apps/data-gateway/src/** and
+  #   test/integration/data-gateway/**.
+  # - CADENCE-1 holds apps/backtest-cli/src/**, inside APPROX-REPLAY-1's
+  #   apps/backtest-cli/**.
+  # Rounds that share a path run one at a time, never concurrently (AGENTS.md).
   # STORAGE-1 holds packages/simulation/src/** for the manifest version bump
   # (ADR-029); no other LEAN-1 round holds it.
   # THROUGHPUT-1c's grant includes test/**. Every LEAN-1 round that grants a
@@ -1379,6 +1386,7 @@ work_packages:
       - disk, pin-budget and expiry-lag metrics
     acceptance:
       - A segment is never deleted unless it is 72 h old, its research tier is verified, its windows are classified, and every overlapping pin is verified.
+      - The 72 h age is taken from the maximum receivedAt over the segment's verified frames, not from its last frame. A test pins that a segment whose frames, in dispatch order, are 71 h then 73 h old is kept (ADR-028 Decision 2.1).
       - A window a trader is responsible for (configured or admitted) is classified only once that trader's rows for it are durable; a window only the gateway records is classified at its close (ADR-028 Decision 2.3).
       - The extractor runs validateSegment on each sealed segment before it reads it, and computes both digests from the verified bytes; a segment that fails is not extracted and never expires (ADR-028 Decision 2.6).
       - Every research-tier sample carries its release frame's gatewayEpoch, ingestSeq and receipt instant (ADR-029 Decision 5).
