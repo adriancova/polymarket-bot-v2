@@ -101,3 +101,4 @@ After a merge, add or update the handoff's single row here (see [`README.md`](RE
 | 2026-09-30 | [H1-RUNS-2-8.md](H1-RUNS-2-8.md) | `H1` runs 2-8: live-data PAPER runs after THROUGHPUT-1a/1b/2 | Operational | H1 discharged under H5 (decisions and vetoes; no fill) | — | 5 KB |
 | 2026-09-30 | [LOGS-1.md](LOGS-1.md) | `LOGS-1`: `IMPLEMENTATION_STATUS.md` becomes a brief; history archived verbatim | Round | Complete (2026-09-30) | `7ac7985` | 13 KB |
 | 2026-09-30 | [CLOSEOUT-2-wave-2-closeout.md](CLOSEOUT-2-wave-2-closeout.md) | `CLOSEOUT-2`: fresh Wave 2 closeout audit (runbook §10) | Audit | WAVE 2 NOT CLOSED: blocker `X1` | — (an audit) | 20 KB |
+| 2026-09-30 | [DURABLE-1.md](DURABLE-1.md) | `DURABLE-1`: a decision is durable before its order and ledger effects (`X1`) | Round | Complete (2026-09-30) | `6e01228` | 23 KB |

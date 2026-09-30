@@ -30,7 +30,7 @@ This file is the brief: current state only, one entry per item. The full history
   - `BRACKET-1c` (`6e06c50`): the same round trip, durable, through real PostgreSQL and Redis and the real composition root.
   - Its two H1 blockers are closed: `SNAP-1` (`fff844d`) writes one PnL snapshot per instance per instant, and `BUNDLE-1` (`fd30e5f`) makes the trader's shipped bundle load.
 - **§7 exit checklist (`CLOSEOUT-2`):** item 1 NOT MET (blocker `X1`). Items 2-5 MET WITH QUALIFICATION. Items 6 and 7 MET.
-- **Next:** `DURABLE-1`, then a focused re-grade of item 1. If Wave 2 then closes, `WP-260` starts.
+- **Next:** `DURABLE-1` is merged (`6e01228`); the focused re-grade `CLOSEOUT-2B` runs. If Wave 2 then closes, `WP-260` starts.
 - **Deferred:** `WP-260` and the eight remaining phase-3 packages wait for Wave 3 ([Wave 3 authorization](#wave-3-authorization-conditional)).
 - Handed over in [`WAVE-2-HANDOVER.md`](docs/handoffs/WAVE-2-HANDOVER.md). What "Complete" means for a Wave 2 row: [Wave 2 qualification](#wave-2-qualification).
 
@@ -39,9 +39,7 @@ This file is the brief: current state only, one entry per item. The full history
 Only rows marked **Ready (authorized)** may be started. Each row's allowed and forbidden paths are in [`work-packages-rounds.md`](docs/status-archive/work-packages-rounds.md) (search for the id).
 
 - `THROUGHPUT-2` and `VENUE-3` are Complete (2026-09-30); see [Work packages](#work-packages). `VENUE-3` met the phase-3 venue gate.
-- **`DURABLE-1`**: Ready (authorized) 2026-09-30 by the orchestrator, under the user's conditional Wave 3 authorization ("only the agent-closable blockers it names are worked").
-  - Goal: close `CLOSEOUT-2` blocker `X1`. A decision must be durable before any venue submission or ledger write it causes.
-  - Base `8fde4df`. Loop `wf_81215710-b47`. Verifiers: Opus and Codex gpt-6-astra, reconciled.
+- **`CLOSEOUT-2B`**: a focused re-grade of Wave 2 after `DURABLE-1` (orchestrator, 2026-09-30). Read-only; an Opus auditor and gpt-6-astra, then a synthesis.
 - **`THROUGHPUT-1c`** (queued, not startable now): authorized by the user on 2026-09-29. On 2026-09-30 the user moved it off the critical path: it runs after the Wave 2 closeout, alongside the start of Wave 3.
   - The finding: in H1 run 1, 20,367 of 37,546 decisions (54%) paused on `SB.STALE_BOOK`. Book age is `now − book.asOf`, the last change, so a quiet but live book reads stale after 2 s. The risk policy's `venueBookMaxAgeMs` has the same shape.
   - Scope (1): ADR-023, Proposed: a liveness-based freshness rule grounded ONLY in the venue's documented market-channel behaviour (`docs/venue/verified-*.md` and current official docs; never invented). The user ratifies it before merge.
@@ -149,7 +147,7 @@ One line per package. Full rows (chains, reviews, scope, paths, gates): `WP-000`
 | `VENUE-3` | the phase-3 venue gate: the Wave 3 start re-verification, including the C-4 re-check and a fresh SDK pin check | Complete (2026-09-30) | `6a15131` | [VENUE-3](docs/handoffs/VENUE-3.md) |
 | `LOGS-1` | records: make `IMPLEMENTATION_STATUS.md` a brief, with the full history archived verbatim | Complete (2026-09-30) | `7ac7985` | [LOGS-1](docs/handoffs/LOGS-1.md) |
 | `CLOSEOUT-2` | fresh Wave 2 closeout audit (runbook §10) | Complete (2026-09-30): WAVE 2 NOT CLOSED, blocker `X1` | — (an audit; no merge) | [CLOSEOUT-2](docs/handoffs/CLOSEOUT-2-wave-2-closeout.md) |
-| `DURABLE-1` | `X1`: a decision is durable before its venue and ledger effects | **Ready (authorized)** 2026-09-30 | — | — |
+| `DURABLE-1` | `X1`: a decision is durable before its venue and ledger effects | Complete (2026-09-30) | `6e01228` | [DURABLE-1](docs/handoffs/DURABLE-1.md) |
 | `WP-260` | Secure unified-SDK adapter and signer boundary | Dependency-ready; deferred to Wave 3 by wave ordering and signer-boundary safety | — | — |
 | All other packages | — | Blocked | — | See work plan |
 
@@ -178,7 +176,9 @@ Open rows only, one line each. An owner beginning "row:" is quoted from the arch
 
 | Id | Residual | Owner |
 | --- | --- | --- |
-| `X1` (BLOCKER) | `CLOSEOUT-2`: the current decision is not durable before its venue submission and ledger writes. A store failure can leave a fill and ledger rows with no persisted decision. | `DURABLE-1` |
+| `X1` | Fixed by `DURABLE-1` (`6e01228`); `CLOSEOUT-2B` re-grades it. | `CLOSEOUT-2B` |
+| `DURABLE1-LOWS` | LOW-3: in group mode a decision and its checkpoint can commit in separate transactions (no production `restoreFrom` caller yet). LOW-6: the commit cost on placement-heavy bursts is unmeasured. R2-LOW-7: a CANCEL from a later decision can wait on an earlier decision's placement write. | the first production `restoreFrom` round; a throughput round |
+| `CI-FLAKE-STALL-BOUND` | `test/integration/data-gateway/publish-throughput.test.ts` "a transport that stops answering" pins a timing bound (≤ 302). CI read 303 once (PR #29 attempt 1). TP1B-R1-L5 flagged it. | a data-gateway test round |
 | `CO2-N1` | Live admission (risk freshness, book age, seconds-to-close) runs on event time (`envelope.receivedAt`), so a stale backlog can approve entries after close. Masked today by the settlement veto. | an ADR and a trading-core round, before any settlement veto is lifted and before `WP-270` |
 | `CO2-N3` | The per-code risk-veto panel cannot show a code's first veto: its series is born at 1, and `increase()` reads 0. The refused-exit and recommendation families have the same problem. | a control-api / dashboard round |
 | `CO2-N4` | Live and replay are not decision-equivalent on real data: frame grouping is live-only, and the backtest CLI refuses raw normalizers (TP2-R1-L4, TP2-R2-L2). | a backtest-cli round |
@@ -338,6 +338,7 @@ The archived completion records (Waves 0-2) carry these follow-ups, and no later
 - **ADR-024** (`THROUGHPUT-2`): accepted provisionally on 2026-09-30, pending the user's ratification.
 - **H7**: ratified 2026-09-28 (`H7` above).
 - **H8**: ruled 2026-09-28, option A: extract the paper core into the layer-1 package `@polymarket-bot/trading-core`. Done by the `H8 track` (`H8-GOV` → `DEPCHECK-1` → `CORE-MOVE` → `BACKTEST-2`); `B3` is closed. Rulings still in force (user, 2026-09-28): D4, a strategy-agnostic core, waits for a second strategy, with S18 (the `trading-core` → `static-bracket` same-layer edge) carrying a sunset clause; `FOLD-2` runs after `BACKTEST-2`.
+- **DURABLE-1 rulings** (LOW; both verifiers recommend yes): may a CANCEL skip waiting for its own decision's durability, and may cancels route before placements within one decision? ([DURABLE-1](docs/handoffs/DURABLE-1.md))
 - **`§5 item 6`**: no owner yet; the orchestrator authorizes it.
 - **The fresh read-only Wave 2 closeout audit:** `CLOSEOUT-2` ran 2026-09-30. Verdict: WAVE 2 NOT CLOSED, one agent-closable blocker (`X1`).
 - **The `btc-15m-updown` settlement spec** (`CLOSEOUT-2` N2): no owner. Until a spec is reviewed, the truthful config refuses every live entry. The user decides whether to commission one.
