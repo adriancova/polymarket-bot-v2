@@ -13,6 +13,7 @@ import argparse
 import os
 import sys
 
+sys.dont_write_bytecode = True  # keep tools/records free of __pycache__
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import status_sections as S  # noqa: E402
 
