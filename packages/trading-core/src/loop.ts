@@ -113,8 +113,20 @@ import {
 } from "./accounting.js";
 import { requestFor, type AllocatorGate } from "./allocation.js";
 import { judgeBasketExecution } from "./basket-execution.js";
+import {
+  bookConfirmedAt,
+  DeliverySessionLiveness,
+  sessionKeyOf,
+  type BookFreshnessBasis,
+  type ConfirmedInstant,
+} from "./book-freshness.js";
 import { CancelLedger } from "./cancels.js";
-import type { InstanceConfig, MarketConfig, TraderConfig } from "./config.js";
+import {
+  bookFreshnessBasisOf,
+  type InstanceConfig,
+  type MarketConfig,
+  type TraderConfig,
+} from "./config.js";
 import { readEventEnvelope } from "./event-door.js";
 import { FillDeduplicator } from "./fills.js";
 import { sameFrame } from "./frames.js";
@@ -572,6 +584,13 @@ export class CoreLoop {
   /** Keyed by PLANNED order id (`pipeline.ts`). */
   readonly #timeInForce = new OrderTimeInForceBook();
   readonly #reference: ReferenceState;
+  /**
+   * `THROUGHPUT-1c` (ADR-023): the configured book-freshness basis and, under
+   * `CONNECTION_CONFIRMED`, the per-delivery-session confirmations
+   * (`book-freshness.ts`). Fed every consumed event, in stream order.
+   */
+  readonly #freshnessBasis: BookFreshnessBasis;
+  readonly #liveness = new DeliverySessionLiveness();
 
   // --- the per-order state (`TRDR-4`) ---------------------------------------
   //
@@ -763,6 +782,7 @@ export class CoreLoop {
     this.#held = new HeldAccounting(options.ledger, options.accountingChecks ?? {});
     this.#cash = options.config.accounting.startingCash;
     this.#lastInstant = options.clock.now();
+    this.#freshnessBasis = bookFreshnessBasisOf(options.config);
     this.#reference = new ReferenceState({
       windowMs: options.config.features.tradeWindowMs,
       maximumPoints: 512,
@@ -1095,6 +1115,10 @@ export class CoreLoop {
     this.#lastInstant = instant.instant;
     this.#lastEpochMs = instant.epochMs;
     this.#options.health.countLoop("eventsProcessed");
+    // `THROUGHPUT-1c` (ADR-023 §4): every consumed event is offered to the
+    // delivery-session table before anything else reads it, so a book
+    // evaluated at this event's instant is vouched for by at most this event.
+    this.#observeDeliverySession(envelope, instant.instant, instant.epochMs);
 
     // The venue is positioned at the recorded event before anything it produces
     // can be anchored (§6 invariant 15: no future venue timestamp). Its answer
@@ -1382,7 +1406,16 @@ export class CoreLoop {
    */
   #applyEvent(
     market: MarketState,
-    envelope: { readonly eventType: string; readonly payload: unknown; readonly gatewayEpoch: string; readonly ingestSeq: string; readonly subscriptionGeneration?: number; readonly venueTimestamp?: string },
+    envelope: {
+      readonly eventType: string;
+      readonly payload: unknown;
+      readonly gatewayEpoch: string;
+      readonly ingestSeq: string;
+      readonly subscriptionGeneration?: number;
+      readonly venueTimestamp?: string;
+      readonly connectionId?: string;
+      readonly source?: string;
+    },
     event: IngestedEvent,
     instant: string,
     epochMs: number,
@@ -1433,6 +1466,7 @@ export class CoreLoop {
           );
           return undefined;
         }
+        this.#noteBookSession(market, envelope);
         return { kind: "onFeatures" };
       }
       case "BookLevelChanged": {
@@ -1446,6 +1480,7 @@ export class CoreLoop {
           );
           return undefined;
         }
+        this.#noteBookSession(market, envelope);
         return { kind: "onFeatures" };
       }
       case "PublicTradeObserved": {
@@ -1551,7 +1586,14 @@ export class CoreLoop {
   ): { readonly snapshotRef: string; readonly values: Readonly<Record<string, string | boolean | null>> } | undefined {
     const outcome = instance.direction;
     const tokenId = outcome === "YES" ? market.config.yesTokenId : market.config.noTokenId;
-    const bookEventAt = market.bookFor(outcome).lastUpdate()?.receivedAt ?? instant;
+    // `THROUGHPUT-1c` (ADR-023 §5): the book section's `lastEventAt` is the
+    // instant the book is vouched for — its last change under `LAST_CHANGE`
+    // (exactly the pre-ADR-023 value), the confirmed instant under
+    // `CONNECTION_CONFIRMED`. `quality.input_feed_ages` reports its age.
+    const bookEventAt =
+      this.#bookConfirmedAt(market, outcome)?.iso ??
+      market.bookFor(outcome).lastUpdate()?.receivedAt ??
+      instant;
     const computed = computeFeatureSnapshot({
       subject: { internalMarketId: market.config.marketId, tokenId },
       asOf: instant,
@@ -3950,9 +3992,69 @@ export class CoreLoop {
   }
 
   #bookAgeMs(market: MarketState, epochMs: number): number {
-    const lastUpdate = market.bookFor("YES").lastUpdate();
-    const at = lastUpdate?.receivedAtEpochMs;
+    // `THROUGHPUT-1c` (ADR-023 §5): §9.8 check 7's `VENUE_BOOK` age is measured
+    // from the instant the book is vouched for — under `LAST_CHANGE` exactly
+    // the pre-ADR-023 value. Which book is measured (YES) is unchanged.
+    const at =
+      this.#bookConfirmedAt(market, "YES")?.epochMs ??
+      market.bookFor("YES").lastUpdate()?.receivedAtEpochMs;
     return at === undefined ? 0 : Math.max(0, epochMs - at);
+  }
+
+  /**
+   * `THROUGHPUT-1c` (ADR-023): the instant one outcome's book is vouched for,
+   * or `undefined` when its last update carries no receipt instant (callers
+   * keep their pre-ADR-023 fallbacks).
+   */
+  #bookConfirmedAt(market: MarketState, outcome: "YES" | "NO"): ConfirmedInstant | undefined {
+    const lastUpdate = market.bookFor(outcome).lastUpdate();
+    const lastChange =
+      lastUpdate?.receivedAt !== undefined && lastUpdate.receivedAtEpochMs !== undefined
+        ? { iso: lastUpdate.receivedAt, epochMs: lastUpdate.receivedAtEpochMs }
+        : undefined;
+    return bookConfirmedAt({
+      basis: this.#freshnessBasis,
+      lastChange,
+      sessionKey: market.bookSession(outcome),
+      marketHasActiveIncident: market.hasActiveIncident(),
+      liveness: this.#liveness,
+    });
+  }
+
+  /**
+   * `THROUGHPUT-1c` (ADR-023 §4): offers one consumed event to the
+   * delivery-session table, and applies rule 4 — a data-quality incident that
+   * names NO market taints every session known now. Nothing is recorded under
+   * `LAST_CHANGE`, which reads none of it.
+   */
+  #observeDeliverySession(envelope: EventEnvelopeOf, iso: string, epochMs: number): void {
+    if (this.#freshnessBasis !== "CONNECTION_CONFIRMED") return;
+    this.#liveness.observe(envelope, { iso, epochMs });
+    if (
+      envelope.eventType === "DataQualityIncidentOpened" &&
+      affectedMarketIds(envelope.payload).length === 0
+    ) {
+      this.#liveness.taintKnownSessions();
+    }
+  }
+
+  /**
+   * `THROUGHPUT-1c` (ADR-023): records the delivery session of an update the
+   * book just ACCEPTED, against the outcome its token names.
+   */
+  #noteBookSession(
+    market: MarketState,
+    envelope: {
+      readonly payload: unknown;
+      readonly gatewayEpoch: string;
+      readonly eventType: string;
+      readonly connectionId?: string;
+      readonly subscriptionGeneration?: number;
+    },
+  ): void {
+    const outcome = market.outcomeOfToken(readString(envelope.payload, "tokenId"));
+    if (outcome === undefined) return;
+    market.noteBookSession(outcome, sessionKeyOf(envelope));
   }
 
   #secondsToClose(marketConfig: MarketConfig, epochMs: number): number | undefined {

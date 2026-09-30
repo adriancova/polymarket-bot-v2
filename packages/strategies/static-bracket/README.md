@@ -36,6 +36,21 @@ information §13.2 does not carry (feature keys, a fee estimate, a
 submission-silence bound, an order validity horizon, a staleness bound and its
 policy). Each is listed with its basis in the `src/params.ts` header.
 
+### Grammar versions 1 and 2 (`THROUGHPUT-1c`, ADR-023)
+
+`version: 1` is the original grammar, and it loads and behaves exactly as it
+always did: the staleness gate measures `now - book.asOf`, the instant of the
+book's last applied **change**. `version: 2` is version 1 plus one required
+key, `data_quality.book_age_feature_key`, which must be exactly
+`quality.input_feed_ages@polymarket.book`: the gate then reads the book age the
+composition root measured for the configured direction's book, which under the
+root's `bookFreshness.basis: CONNECTION_CONFIRMED` may vouch for a quiet book
+on a live delivery session (ADR-023). An absent, missing or malformed
+measurement is a stale book. A complement-leg bracket's other book keeps the
+version-1 age, because the feature snapshot says nothing about it. The code
+version (`STATIC_BRACKET_VERSION`) is unchanged: a version-1 run's behaviour is
+byte-identical, and a version-2 configuration is a new configuration identity.
+
 Two §13.2 fields have a wider role than their names suggest, and it is stated
 rather than implied: `exit.stop.minimum_sell_price` and `exit.stop.urgency` are
 the price floor and the urgency of **every** protected reduction this strategy
@@ -358,7 +373,11 @@ here because a wiring that breaks one produces a *quiet* misbehaviour.
    - `executable_ask` binds to `polymarket.executable_buy_price`;
    - `executable_bid` binds to `polymarket.executable_sell_price`;
    - the incident flag must be a **boolean** at its key. An absent or
-     wrong-typed flag counts as an incident, never as an all-clear.
+     wrong-typed flag counts as an incident, never as an all-clear;
+   - grammar version 2's `data_quality.book_age_feature_key` must be an
+     **integer string** of milliseconds, the age of the root's
+     `polymarket.book` input measured at `ctx.now()` for the configured
+     direction's book (`packages/trading-core` projection rule R6).
 3. **The position view must already include the fill an `onFill` evaluation is
    about.** §8.1 orders the loop "update local market/account state → update
    feature snapshots → invoke subscribed strategies". The instance records the

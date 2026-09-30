@@ -16,7 +16,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  BOOK_AGE_FEATURE_KEY,
   STATIC_BRACKET_CONFIG_VERSION,
+  STATIC_BRACKET_CONFIG_VERSION_2,
+  STATIC_BRACKET_CONFIG_VERSIONS,
   staticBracketParamsSchema,
   validateStaticBracketParams,
 } from "../../../../packages/strategies/static-bracket/src/index.js";
@@ -150,11 +153,85 @@ describe("§13.2 configuration grammar", () => {
     expect(result.problem).toContain("params.extra");
   });
 
+  // `THROUGHPUT-1c` (ADR-023 §6): this pinned `version: 2` as unimplemented
+  // until grammar version 2 existed. The refusal of an UNIMPLEMENTED version
+  // is unchanged; it now names the set this build implements.
   it("refuses a version this build does not implement", () => {
+    for (const version of [0, 3, 4]) {
+      const result = validateStaticBracketParams(configWith({ version }));
+      expect(result.ok, `version ${String(version)}`).toBe(false);
+      if (result.ok) continue;
+      expect(result.problem).toContain("params.version");
+    }
+    const three = validateStaticBracketParams(configWith({ version: 3 }));
+    expect(three.ok).toBe(false);
+    if (three.ok) return;
+    expect(three.problem).toContain("must be one of 1, 2");
+    expect(three.problem).toContain("exactly these configuration grammar versions");
+  });
+});
+
+describe("grammar version 2 (THROUGHPUT-1c, ADR-023 §6)", () => {
+  const V2_KEY = "quality.input_feed_ages@polymarket.book";
+
+  it("exports the implemented versions, oldest first", () => {
+    expect(STATIC_BRACKET_CONFIG_VERSIONS).toEqual([1, 2]);
+    expect(STATIC_BRACKET_CONFIG_VERSION).toBe(1);
+    expect(STATIC_BRACKET_CONFIG_VERSION_2).toBe(2);
+    expect(BOOK_AGE_FEATURE_KEY).toBe(V2_KEY);
+  });
+
+  it("a version-1 document loads unchanged and carries no book_age_feature_key", () => {
+    const result = validateStaticBracketParams(baseConfig());
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.version).toBe(1);
+    expect(Object.hasOwn(result.value.data_quality, "book_age_feature_key")).toBe(false);
+  });
+
+  it("refuses book_age_feature_key in a version-1 document (an unknown key)", () => {
+    const result = validateStaticBracketParams(
+      configWith({ "data_quality.book_age_feature_key": V2_KEY }),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.problem).toContain("book_age_feature_key");
+  });
+
+  it("requires book_age_feature_key in a version-2 document", () => {
     const result = validateStaticBracketParams(configWith({ version: 2 }));
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.problem).toContain("exactly one configuration grammar version");
+    expect(result.problem).toContain("params.data_quality.book_age_feature_key");
+  });
+
+  it("accepts a version-2 document naming the one defined key, idempotently", () => {
+    const result = validateStaticBracketParams(
+      configWith({ version: 2, "data_quality.book_age_feature_key": V2_KEY }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.version).toBe(2);
+    expect(result.value.data_quality.book_age_feature_key).toBe(V2_KEY);
+    const again = validateStaticBracketParams(result.value);
+    expect(again.ok).toBe(true);
+    if (!again.ok) return;
+    expect(again.value).toEqual(result.value);
+  });
+
+  it("refuses any other feature key as a book age", () => {
+    for (const key of [
+      "quality.input_feed_ages@reference.binance",
+      "quality.input_feed_ages",
+      "quality.active_incidents@any",
+      "polymarket.best_ask",
+      "not.a.feature@polymarket.book",
+    ]) {
+      const result = validateStaticBracketParams(
+        configWith({ version: 2, "data_quality.book_age_feature_key": key }),
+      );
+      expect(result.ok, key).toBe(false);
+    }
   });
 });
 

@@ -55,6 +55,7 @@
  * | `entry.execution.order_validity_ms` | §7.7 makes `validUntil` a required field of every position intent. |
  * | `exit.stop.enabled` | The stop is optional behaviour; an optional behaviour is an explicit switch, never an absent key. |
  * | `data_quality.*` | §13.3's rule that a stop on stale data is forbidden and §9.9's incident ladder need a stated staleness bound and a stated policy. |
+ * | `data_quality.book_age_feature_key` (grammar version 2 only) | ADR-023: the book age is read from the composition root's measurement (`quality.input_feed_ages@polymarket.book`), which may vouch for a quiet book on a live delivery session; version 1 keeps `now - book.asOf`. |
  *
  * Purity: this module reads no clock, draws no randomness, performs no I/O, and
  * imports no schema library (`packages/strategies/**` is purity-restricted).
@@ -88,8 +89,27 @@ import {
   type PlainRecord,
 } from "./plain.js";
 
-/** The configuration grammar's own version, carried in the config (§13.2 `version`). */
+/**
+ * The configuration grammar's own version, carried in the config (§13.2
+ * `version`): the ORIGINAL grammar, version 1.
+ */
 export const STATIC_BRACKET_CONFIG_VERSION = 1;
+
+/**
+ * `THROUGHPUT-1c` (ADR-023 §6): grammar version 2. It is version 1 plus ONE
+ * required key, `data_quality.book_age_feature_key`, and nothing else; a
+ * version-1 document loads exactly as it always did and means exactly what it
+ * always meant (the book age is `now - book.asOf`). The key is REFUSED in a
+ * version-1 document (unknown key) and REQUIRED in a version-2 one, so the
+ * version alone says which rule a configuration's staleness gate follows.
+ */
+export const STATIC_BRACKET_CONFIG_VERSION_2 = 2;
+
+/** Every grammar version this build implements, oldest first. */
+export const STATIC_BRACKET_CONFIG_VERSIONS: readonly number[] = Object.freeze([
+  STATIC_BRACKET_CONFIG_VERSION,
+  STATIC_BRACKET_CONFIG_VERSION_2,
+]);
 export const STATIC_BRACKET_STRATEGY_NAME = "static-bracket";
 
 export const OUTCOME_SIDES = Object.freeze(["YES", "NO"] as const);
@@ -221,6 +241,15 @@ export interface RiskParams {
 
 export interface DataQualityParams {
   readonly maximum_book_age_ms: number;
+  /**
+   * Grammar version 2 only (ADR-023 §6), and present IFF `version` is 2: the
+   * feature key the book age of the configured direction's book is read from
+   * — `quality.input_feed_ages@polymarket.book`, the age the composition root
+   * measured under its book-freshness basis. Absent (never `null`) in a
+   * version-1 tree, so validation stays idempotent: a version-1 tree carries
+   * no key its own grammar refuses.
+   */
+  readonly book_age_feature_key?: string;
   readonly incident_feature_key: string;
   readonly on_stale_book: DataQualityResponse;
   readonly on_incident: DataQualityResponse;
@@ -405,6 +434,8 @@ const DATA_QUALITY_KEYS = [
   "on_stale_book",
   "on_incident",
 ];
+/** Grammar version 2's `data_quality` keys: version 1's plus one (ADR-023 §6). */
+const DATA_QUALITY_KEYS_V2 = [...DATA_QUALITY_KEYS, "book_age_feature_key"];
 
 /**
  * Validates a §13.2 configuration. TOTAL: never throws, and every refusal names
@@ -431,11 +462,11 @@ export function validateStaticBracketParams(input: unknown): Outcome<StaticBrack
   }
   const version = readInteger(root, "version", "params", 1, 1_000_000);
   if (!version.ok) return version;
-  if (version.value !== STATIC_BRACKET_CONFIG_VERSION) {
+  if (!STATIC_BRACKET_CONFIG_VERSIONS.includes(version.value)) {
     return bad(
-      `params.version must be ${String(STATIC_BRACKET_CONFIG_VERSION)}; this build implements ` +
-        "exactly one configuration grammar version and refuses any other rather than guessing " +
-        "which fields moved",
+      `params.version must be one of ${STATIC_BRACKET_CONFIG_VERSIONS.map(String).join(", ")}; ` +
+        "this build implements exactly these configuration grammar versions and refuses any " +
+        "other rather than guessing which fields moved",
     );
   }
 
@@ -449,7 +480,7 @@ export function validateStaticBracketParams(input: unknown): Outcome<StaticBrack
   if (!reentry.ok) return reentry;
   const risk = parseRisk(root);
   if (!risk.ok) return risk;
-  const dataQuality = parseDataQuality(root);
+  const dataQuality = parseDataQuality(root, version.value);
   if (!dataQuality.ok) return dataQuality;
 
   const params: StaticBracketParams = Object.freeze(
@@ -842,12 +873,32 @@ function parseRisk(root: PlainRecord): Outcome<RiskParams> {
   );
 }
 
-function parseDataQuality(root: PlainRecord): Outcome<DataQualityParams> {
+/** The one feature key grammar version 2's book-age read may name (ADR-023 §6). */
+export const BOOK_AGE_FEATURE_KEY = "quality.input_feed_ages@polymarket.book";
+
+function parseDataQuality(root: PlainRecord, version: number): Outcome<DataQualityParams> {
   const record = readRecord(root, "data_quality", "params");
   if (!record.ok) return record;
   const path = "params.data_quality";
-  const unknown = refuseUnknownKeys(record.value, DATA_QUALITY_KEYS, path);
+  const v2 = version === STATIC_BRACKET_CONFIG_VERSION_2;
+  const unknown = refuseUnknownKeys(record.value, v2 ? DATA_QUALITY_KEYS_V2 : DATA_QUALITY_KEYS, path);
   if (!unknown.ok) return unknown;
+  let bookAgeFeatureKey: string | undefined;
+  if (v2) {
+    const key = readFeatureKeyField(record.value, "book_age_feature_key", path, null);
+    if (!key.ok) return key;
+    // Pinned to the ONE key whose meaning ADR-023 defines. Any other feature
+    // — or another feed's age — would put a number nobody defined as a book
+    // age in front of the staleness gate.
+    if (key.value !== BOOK_AGE_FEATURE_KEY) {
+      return bad(
+        `${path}.book_age_feature_key must be "${BOOK_AGE_FEATURE_KEY}" (the age of the ` +
+          "composition root's polymarket.book input, ADR-023 §6); any other key is refused " +
+          "rather than read as a book age",
+      );
+    }
+    bookAgeFeatureKey = key.value;
+  }
   const maximumBookAgeMs = readInteger(record.value, "maximum_book_age_ms", path, 1, MAX_DURATION_MS);
   if (!maximumBookAgeMs.ok) return maximumBookAgeMs;
   const incidentFeatureKey = readFeatureKeyField(
@@ -865,6 +916,7 @@ function parseDataQuality(root: PlainRecord): Outcome<DataQualityParams> {
     Object.freeze(
       Object.assign(Object.create(null) as object, {
         maximum_book_age_ms: maximumBookAgeMs.value,
+        ...(bookAgeFeatureKey === undefined ? {} : { book_age_feature_key: bookAgeFeatureKey }),
         incident_feature_key: incidentFeatureKey.value,
         on_stale_book: onStaleBook.value,
         on_incident: onIncident.value,

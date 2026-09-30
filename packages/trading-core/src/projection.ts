@@ -13,7 +13,7 @@
  * one place the first becomes the second, and the `@`-selector the strategy's
  * key grammar declares is the coordinate it reads.
  *
- * ## The convention, version `polymarket-bot/trader/feature-projection/v1`
+ * ## The convention, version `polymarket-bot/trader/feature-projection/v2`
  *
  * A configured key is `featureId` or `featureId "@" selector` (the strategy's
  * `parseFeatureKey` grammar, `selector := [A-Za-z0-9_.:+-]{1,32}`). Given the
@@ -25,7 +25,17 @@
  * | R2 | `polymarket.executable_buy_price` / `polymarket.executable_sell_price` | a decimal quantity | the entry whose `requestedShares` equals it EXACTLY: `volumeWeightedAveragePrice` for `QUOTE`, `null` for `INSUFFICIENT_DEPTH` |
  * | R3 | `quality.active_incidents` | `any` | `true` iff the incident list is non-empty |
  * | R4 | a record-valued feature | a member name | that member when it is a `string` or `boolean` |
+ * | R6 | `quality.input_feed_ages` | a `feedId` | that feed's `ageMs` as a canonical base-10 INTEGER string (`"1500"`, `"-3"`); refused unless it is a safe integer |
  * | R5 | anything else | — | **not projected**, and the reason is recorded |
+ *
+ * **v2 (`THROUGHPUT-1c`, ADR-023 §5) added R6** and changed nothing else: a key
+ * R6 answers was refused under v1 (`quality.input_feed_ages` is a list, so it
+ * fell to R4's `SELECTOR_NOT_APPLICABLE`). R6 is how the strategy's data-quality
+ * gate reads the book age the composition root measured
+ * (`quality.input_feed_ages@polymarket.book`). An age is a DURATION in integer
+ * milliseconds, not an economic value, so R1's reason for refusing numbers
+ * (§6 invariant 1) does not apply — and the value still crosses as a canonical
+ * integer STRING, never as a JavaScript number.
  *
  * An `ABSENT` entry projects `null` under every rule, because `null` is what
  * the SDK view uses for "the engine reported this feature as absent" and the
@@ -60,7 +70,10 @@
 import type { FeatureSnapshot as EngineFeatureSnapshot } from "@polymarket-bot/features";
 import type { FeatureSnapshot as StrategyFeatureSnapshot } from "@polymarket-bot/strategy-sdk";
 
-export const FEATURE_PROJECTION_VERSION = "polymarket-bot/trader/feature-projection/v1";
+export const FEATURE_PROJECTION_VERSION = "polymarket-bot/trader/feature-projection/v2";
+
+/** R6's feature: the per-feed input ages (`features-v1.md` §7). */
+export const FEED_AGES_FEATURE_ID = "quality.input_feed_ages";
 
 /** The two structured executable-price features (`features-v1.md` §7). */
 export const EXECUTABLE_PRICE_FEATURE_IDS: readonly string[] = Object.freeze([
@@ -267,6 +280,46 @@ export function projectFeatureValues(
         continue;
       }
       values[key] = price;
+      continue;
+    }
+
+    // R6 — one feed's age from the per-feed age list (ADR-023 §5).
+    if (featureId === FEED_AGES_FEATURE_ID && selector !== null) {
+      if (!Array.isArray(value)) {
+        refusals.push(
+          refusal(key, featureId, selector, "VALUE_NOT_SCALAR", `${featureId} is not a list`),
+        );
+        continue;
+      }
+      const entry = value.find((member) => ownValue(member, "feedId") === selector);
+      if (entry === undefined) {
+        refusals.push(
+          refusal(
+            key,
+            featureId,
+            selector,
+            "SELECTOR_NAMES_NO_MEMBER",
+            `${featureId} carries no age for feed "${selector}"`,
+          ),
+        );
+        continue;
+      }
+      const ageMs = ownValue(entry, "ageMs");
+      if (typeof ageMs !== "number" || !Number.isSafeInteger(ageMs)) {
+        refusals.push(
+          refusal(
+            key,
+            featureId,
+            selector,
+            "VALUE_NOT_SCALAR",
+            `the age of feed "${selector}" is not a safe integer number of milliseconds`,
+          ),
+        );
+        continue;
+      }
+      // `String` of a safe integer is its canonical base-10 form; `-0` cannot
+      // occur (`String(-0)` is "0").
+      values[key] = String(ageMs);
       continue;
     }
 
