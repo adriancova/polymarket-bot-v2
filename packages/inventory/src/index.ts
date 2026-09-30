@@ -22,6 +22,8 @@ export {
   type InventoryResult,
 } from "./refusals.js";
 
+export { MAX_IDENTIFIER_LENGTH } from "./guards.js";
+
 export {
   AssetRegistry,
   type AssetKind,

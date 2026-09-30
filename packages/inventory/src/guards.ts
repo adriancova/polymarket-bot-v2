@@ -23,10 +23,22 @@ export function ownData(source: unknown, key: string): unknown {
   return descriptor.value;
 }
 
+/**
+ * The longest identifier (reservation, pending, hold, holder, account, asset
+ * or operation id) this package accepts. Derived identifiers are checked
+ * against the same bound before anything depends on them (WP300-R2-03).
+ */
+export const MAX_IDENTIFIER_LENGTH = 512;
+
+/** A non-empty string no longer than {@link MAX_IDENTIFIER_LENGTH}. */
+export function isIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_IDENTIFIER_LENGTH;
+}
+
 /** A non-empty string own data property, or `undefined`. */
 export function ownNonEmptyString(source: unknown, key: string): string | undefined {
   const value = ownData(source, key);
-  return typeof value === "string" && value.length > 0 && value.length <= 512 ? value : undefined;
+  return isIdentifier(value) ? value : undefined;
 }
 
 /** A canonical, strictly positive decimal string own data property, or `undefined`. */

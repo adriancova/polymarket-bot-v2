@@ -160,9 +160,10 @@ describe("WP300-R1-02: a balance read and an operation's confirmation never both
       if (!refused.ok) expect(refused.refusal.code).toBe("INVENTORY_OPERATION_IN_FLIGHT");
     }
     // The ledger-derived refresh is held back the same way.
-    const seeded = book.seedFromLedgerBalances([
-      { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT, assetId: PUSD, assetKind: "COLLATERAL", balance: "90" },
-    ]);
+    const seeded = book.seedFromLedgerBalances(
+      [{ scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT, assetId: PUSD, assetKind: "COLLATERAL", balance: "90" }],
+      { accountRefs: [ACCOUNT] },
+    );
     expect(seeded.ok).toBe(false);
     if (!seeded.ok) expect(seeded.refusal.code).toBe("INVENTORY_OPERATION_IN_FLIGHT");
 
@@ -181,10 +182,17 @@ describe("WP300-R1-02: a balance read and an operation's confirmation never both
     manager.observe("s", { status: "MINED", transactionHash: TX_A });
     manager.observe("s", { status: "CONFIRMED", transactionHash: TX_A, transactionId: ID_A });
     expect(read(book, PUSD, "90").ok && read(book, YES, "10").ok).toBe(true);
-    const seeded = book.seedFromLedgerBalances([
-      { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT, assetId: NO, assetKind: "OUTCOME_TOKEN", balance: "10" },
-    ]);
-    expect(seeded.ok && seeded.value[0]?.changed).toBe(false);
+    // A complete snapshot of the account (WP300-R2-01): every line it holds.
+    const seeded = book.seedFromLedgerBalances(
+      [
+        { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT, assetId: PUSD, assetKind: "COLLATERAL", balance: "90" },
+        { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT, assetId: YES, assetKind: "OUTCOME_TOKEN", balance: "10" },
+        { scope: "ACTUAL_ACCOUNT", accountRef: ACCOUNT, assetId: NO, assetKind: "OUTCOME_TOKEN", balance: "10" },
+      ],
+      { accountRefs: [ACCOUNT] },
+    );
+    expect(seeded.ok).toBe(true);
+    if (seeded.ok) expect(seeded.value.map((o) => o.changed)).toEqual([false, false, false]);
     expect(book.line(ACCOUNT, PUSD)?.actual).toBe("90");
     expect(book.line(ACCOUNT, YES)?.actual).toBe("10");
     expect(book.reserve({ reservationId: "x", holderRef: "o", accountRef: ACCOUNT, assetId: YES, amount: "10.01" }).ok).toBe(false);
@@ -405,16 +413,17 @@ describe("WP300-R1-04: no success is acknowledged across a failed or unresolved 
 // ----------------------------------------------------------------- R1-05 --
 
 describe("WP300-R1-05: observations that arrive during submission are kept and applied, never dropped", () => {
-  it("an UNKNOWN observation during submission triggers reconciliation once the executor answers SUBMITTED", async () => {
+  it("an UNKNOWN observation during submission triggers reconciliation (at once since r2; still RECONCILING after SUBMITTED)", async () => {
     const answer = deferred<unknown>();
     const { book, manager, reconciler } = harness(() => answer.promise);
     manager.plan(split("s", "10"));
     const submitting = manager.submit("s");
-    const buffered = manager.observe("s", { status: "UNKNOWN" });
-    expect(buffered.ok && buffered.value).toMatchObject({ state: "PLANNED", submitting: true, bufferedObservations: 1 });
+    const observed = manager.observe("s", { status: "UNKNOWN" });
+    // WP300-R2-02: uncertainty is acted on immediately, not buffered behind the executor.
+    expect(observed.ok && observed.value).toMatchObject({ state: "RECONCILING", submitting: true, bufferedObservations: 0 });
     answer.resolve({ status: "SUBMITTED", transactionHash: TX_A, transactionId: null });
     await submitting;
-    expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", bufferedObservations: 0 });
+    expect(manager.operation("s")).toMatchObject({ state: "RECONCILING", bufferedObservations: 0, transactionHash: TX_A });
     expect(reconciler.requests).toEqual([expect.objectContaining({ trigger: "WALLET_OPERATION_UNKNOWN", walletOperationId: "s" })]);
     expect(book.line(ACCOUNT, PUSD)).toMatchObject({ actual: "100", reserved: "10" });
   });

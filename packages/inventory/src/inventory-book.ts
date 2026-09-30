@@ -50,6 +50,10 @@
  * by {@link InventoryBook.consume} or {@link InventoryBook.expectInflow}, so a
  * replayed settlement can never count a receipt or a debit twice.
  *
+ * LEDGER REFRESHES ARE COMPLETE PER DECLARED ACCOUNT: a balance the snapshot
+ * omits for a covered account is zero, never retained (see
+ * {@link InventoryBook.seedFromLedgerBalances}).
+ *
  * THE RECOGNITION BOUNDARY between authoritative balance reads and operation
  * effects. A balance read says what the line holds NOW; it cannot say whether
  * an in-flight effect is already inside it. So a read is refused
@@ -67,6 +71,7 @@ import { addDecimal, compareDecimal, isNegativeDecimal, subDecimal, type Decimal
 import type { AssetKind, AssetRegistry } from "./assets.js";
 import {
   compositeKey,
+  isIdentifier,
   ownData,
   ownNonEmptyString,
   ownNonNegativeAmount,
@@ -216,15 +221,50 @@ export class InventoryBook {
   // ---------------------------------------------------------------- actual --
 
   /**
-   * Seed actual balances from ledger balance lines (the `packages/ledger`
-   * `BalanceLine` shape: `scope`, `accountRef`, `assetId`, `assetKind`,
-   * `balance`). Only `ACTUAL_ACCOUNT` lines are account inventory; a line of
-   * any other scope (virtual attribution, clearing, fee, reward) is refused,
-   * never silently skipped or summed. All-or-nothing.
+   * Refresh actual balances from a ledger balance snapshot (the
+   * `packages/ledger` `BalanceLine` shape: `scope`, `accountRef`, `assetId`,
+   * `assetKind`, `balance`; e.g. `balancesOfScope(projectLedger(ledger),
+   * "ACTUAL_ACCOUNT")`). Only `ACTUAL_ACCOUNT` lines are account inventory; a
+   * line of any other scope (virtual attribution, clearing, fee, reward) is
+   * refused, never silently skipped or summed. All-or-nothing.
+   *
+   * SNAPSHOT COMPLETENESS (WP300-R2-01). The ledger projection DROPS a line
+   * whose balance nets to zero (`packages/ledger/src/projections.ts`), so an
+   * absent line means "holds nothing", not "not reported". The caller
+   * therefore declares, in `coverage.accountRefs`, the accounts for which the
+   * snapshot is complete:
+   *   - every snapshot line must belong to a covered account (a line outside
+   *     the declared coverage is refused: the caller's claim is inconsistent);
+   *   - every line this book knows for a covered account that is ABSENT from
+   *     the snapshot is read as balance `0` — including an account whose last
+   *     balance disappeared, which contributes no line at all;
+   *   - an absent line is a read like any other, so the recognition boundary
+   *     applies to it too (unresolved pending amounts or an in-flight
+   *     operation hold refuse the whole refresh);
+   *   - lines of accounts NOT covered are untouched.
+   * A snapshot naming the same (account, asset) twice is refused.
    */
-  seedFromLedgerBalances(lines: readonly unknown[]): InventoryResult<readonly ActualObservation[]> {
+  seedFromLedgerBalances(
+    lines: readonly unknown[],
+    coverage: { readonly accountRefs: readonly string[] },
+  ): InventoryResult<readonly ActualObservation[]> {
     if (!Array.isArray(lines)) return refuse("INVENTORY_INVALID_INPUT", "lines must be an array");
+    const rawAccounts = ownData(coverage, "accountRefs");
+    if (!Array.isArray(rawAccounts) || rawAccounts.length === 0) {
+      return refuse(
+        "INVENTORY_INVALID_INPUT",
+        "a ledger refresh must declare coverage.accountRefs: the accounts whose balances the snapshot states completely",
+      );
+    }
+    const covered = new Set<string>();
+    for (const accountRef of rawAccounts as readonly unknown[]) {
+      if (!isIdentifier(accountRef) || covered.has(accountRef)) {
+        return refuse("INVENTORY_INVALID_INPUT", "coverage.accountRefs must be distinct non-empty identifiers");
+      }
+      covered.add(accountRef);
+    }
     const parsed: { accountRef: string; assetId: string; balance: DecimalString }[] = [];
+    const present = new Set<string>();
     for (const [index, line] of lines.entries()) {
       if (ownData(line, "scope") !== "ACTUAL_ACCOUNT") {
         return refuse("INVENTORY_INVALID_INPUT", "only ACTUAL_ACCOUNT ledger lines are account inventory", {
@@ -239,6 +279,21 @@ export class InventoryBook {
           index,
         });
       }
+      if (!covered.has(accountRef)) {
+        return refuse("INVENTORY_INVALID_INPUT", "ledger line belongs to an account outside the declared coverage", {
+          index,
+          accountRef,
+        });
+      }
+      const key = compositeKey(accountRef, assetId);
+      if (present.has(key)) {
+        return refuse("INVENTORY_INVALID_INPUT", "the snapshot names the same account and asset twice", {
+          index,
+          accountRef,
+          assetId,
+        });
+      }
+      present.add(key);
       const registration = this.#registry.lookup(assetId);
       if (registration === undefined) {
         return refuse("INVENTORY_UNKNOWN_ASSET", "ledger line names an unregistered asset", { index, assetId });
@@ -252,6 +307,13 @@ export class InventoryBook {
       const blocked = this.#unresolvedPendingOn(accountRef, assetId);
       if (blocked !== undefined) return blocked;
       parsed.push({ accountRef, assetId, balance });
+    }
+    // Known lines of covered accounts that the complete snapshot omits hold zero.
+    for (const [key, line] of this.#lines) {
+      if (!covered.has(line.accountRef) || present.has(key)) continue;
+      const blocked = this.#unresolvedPendingOn(line.accountRef, line.assetId);
+      if (blocked !== undefined) return blocked;
+      parsed.push({ accountRef: line.accountRef, assetId: line.assetId, balance: ZERO });
     }
     const results: ActualObservation[] = [];
     for (const line of parsed) results.push(this.#setActual(line.accountRef, line.assetId, line.balance));
@@ -586,6 +648,15 @@ export class InventoryBook {
   activeReservationFor(holderRef: string, accountRef: string, assetId: string): ReservationView | undefined {
     const id = this.#activeByHolder.get(compositeKey(holderRef, accountRef, assetId));
     return id === undefined ? undefined : this.reservation(id);
+  }
+
+  /**
+   * Whether `pendingId` could be used by {@link consume} or
+   * {@link expectInflow} right now: a valid identifier that is neither live
+   * nor settled. Lets a caller pre-check an all-or-nothing sequence.
+   */
+  isPendingIdAvailable(pendingId: string): boolean {
+    return isIdentifier(pendingId) && !this.#pending.has(pendingId) && !this.#settled.has(pendingId);
   }
 
   pending(pendingId: string): PendingView | undefined {

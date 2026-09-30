@@ -195,7 +195,9 @@ describe("seeding from the ledger's ACTUAL_ACCOUNT balance lines (delegation to 
 
   it("accepts the ledger BalanceLine shape and sets actual balances", () => {
     const book = new InventoryBook(registry());
-    const seeded = book.seedFromLedgerBalances([line({}), line({ assetId: YES, assetKind: "OUTCOME_TOKEN", balance: "12.5" })]);
+    const seeded = book.seedFromLedgerBalances([line({}), line({ assetId: YES, assetKind: "OUTCOME_TOKEN", balance: "12.5" })], {
+      accountRefs: [ACCOUNT],
+    });
     expect(seeded.ok).toBe(true);
     expect(book.line(ACCOUNT, PUSD)?.actual).toBe("250");
     expect(book.line(ACCOUNT, YES)?.available).toBe("12.5");
@@ -205,9 +207,12 @@ describe("seeding from the ledger's ACTUAL_ACCOUNT balance lines (delegation to 
   it("refuses a virtual/unattributed/clearing line and an asset-kind mismatch, all or nothing", () => {
     const book = new InventoryBook(registry());
     for (const scope of ["VIRTUAL_STRATEGY", "UNATTRIBUTED", "EXTERNAL_CLEARING", "FEE_EXPENSE", "REWARD_INCOME"] as const) {
-      expect(book.seedFromLedgerBalances([line({}), line({ scope })]).ok).toBe(false);
+      expect(book.seedFromLedgerBalances([line({}), line({ scope })], { accountRefs: [ACCOUNT] }).ok).toBe(false);
     }
-    expect(book.seedFromLedgerBalances([line({ assetKind: "OUTCOME_TOKEN" })]).ok).toBe(false);
+    expect(book.seedFromLedgerBalances([line({ assetKind: "OUTCOME_TOKEN" })], { accountRefs: [ACCOUNT] }).ok).toBe(false);
     expect(book.line(ACCOUNT, PUSD)).toBeUndefined();
+    // Control: the same line with the right scope and kind is accepted, so the refusals above are those guards.
+    expect(book.seedFromLedgerBalances([line({})], { accountRefs: [ACCOUNT] }).ok).toBe(true);
+    expect(book.line(ACCOUNT, PUSD)?.actual).toBe("250");
   });
 });
