@@ -41,10 +41,17 @@ K27 the brief does not list the `catalog.settlement_specs.payoff_model NOT NULL`
     owed: `WP-210`'s migration 0009 resolved it.
 K28 in "Obligations in completion records", a sentence whose subject is a package that is not
     Complete in the brief states an obligation ("must", "owes", "owed"), not a present fact.
-K29 no line of REWRITES.md's intro and coverage prose (before the first declaration block) runs
-    over 80 words: split dense paragraphs into lists or tables.
+K29 no line of REWRITES.md's intro and coverage prose (before the first declaration block), and no
+    line of the archive README, runs over 80 words: split dense paragraphs into lists or tables.
 K30 no verbless fragment where r4 had one: the WP-210 bullet's "landing: contract owner
     recording." and the UNIV-1 bullet's bare "LOW-2 drifts (two unpinned), LOW-3 ..." list.
+K31 closed before the cut (r6): the brief does not carry as owed an item that a record, contract or
+    code comment at the cut already closed. Each rule names the brief wording and the evidence,
+    read from the repository AT THE CUT (`git show <cut>:<path>`); if the evidence is not there,
+    the rule fails too, so it cannot outlive its reason.
+K32 the WP-240 bullet names every fidelity panel still pending at the cut: each `panel:` of
+    `PENDING_PRODUCER_PANELS` (packages/observability/src/control/dashboards.ts at the cut) maps to
+    a phrase the brief uses; an unmapped panel fails until it is added here and to the brief.
 K2 also requires the "Residuals recorded in Complete package rows" and "Obligations in completion
 records" subsections. K21 also requires C16, refuses the claim "so a partial carry fails" in
 REWRITES.md and the archive README, and requires both to say reviewers check the rest of a clause.
@@ -56,6 +63,7 @@ Exit 0 when every rule holds, 1 otherwise. Stdlib only, no network.
 import argparse
 import os
 import re
+import subprocess
 import sys
 
 sys.dont_write_bytecode = True  # keep tools/records free of __pycache__
@@ -93,6 +101,49 @@ def table_rows(lines, h3_prefix):
             cells = [c.strip() for c in re.split(r"(?<!\\)\|", line)[1:-1]]
             out.append(cells)
     return out
+
+
+# K31: (label, brief pattern, evidence path, evidence text, evidence present?)
+CLOSED_BEFORE_CUT = [
+    ("GOV-2A NOTE-1: the reciprocal F17 note (I1)", r"reciprocal note owed",
+     "docs/contracts/dependency-direction.md", "id namespace:** this F17 is a §3 forbidden-edge id", True),
+    ("GOV-2A NOTE-2: the probe sources (I1)", r"probe sources are not committed|\(inline them\)",
+     "docs/handoffs/GOV-2A.md", "| **NOTE-2** — commit the probe sources | **ADOPTED", True),
+    ("WP-180-FU2: the schema-boundary §1 staleness (I2)", r"schema-boundary §1 staleness",
+     "docs/contracts/schema-boundary.md", "(Corrected 2026-09-05: the pair was", True),
+    ("SETL-1: the three zod facts for the §2 class table (I3)", r"zod facts for the §2 class table",
+     "docs/contracts/schema-boundary.md", "| Waiver reach + durability; the `status` trigger *(measured by `SETL-1`", True),
+    ("WP-160 R1-L2: the \"never throws\" wording (I4)", r"\"never throws\" is unenforced",
+     "packages/features/src/inputs.ts", "Corrected 2026-09-15 by `GOV-2C` (comment only)", True),
+    ("WP-230: the §2 error-construction row", r"arena-error-construction schema-boundary §2 candidate row",
+     "docs/contracts/schema-boundary.md", "| Error construction *(measured by `WP-230` review r1", True),
+    ("WP-170-FU1: the ARENA_NODE_TYPES widening", r"queued risk `ARENA_NODE_TYPES` widening",
+     "docs/contracts/schema-boundary.md", "grew `ARENA_NODE_TYPES` with `\"null\"`", True),
+    ("WP-210 follow_up 6: the §12.1 recording", r"§12\.1 port-interface landing",
+     "docs/contracts/dependency-direction.md", "the handoff §12.1 port interfaces `Clock`, `MarketEventSource` and `ExecutionVenue`", True),
+    ("TRDR-1: the phase-2 R1 addendum", r"phase-2 report R1 narrative addendum",
+     "docs/experiments/phase-2-verification.md", "## Addendum (2026-09-07): §2 R1 is RESOLVED", True),
+    ("TRDR-1: the ADR README row", r"docs/adr/README\.md:102",
+     "docs/adr/README.md", "stays until it lands", False),
+    ("TRDR-2: the main.ts:292 cast", r"main\.ts:292`?'s cast",
+     "apps/trader/src/main.ts", "`venue` is handed over UNCAST (`BOOT-1`)", True),
+    ("GATE-1: the fail-fast chain (GATE1-R4)", r"one fail-fast chain",
+     ".github/workflows/ci.yml", "if: ${{ !cancelled() && steps.install.outcome == 'success' }}", True),
+    ("GATE-1: 'neither self-checking' (CI-2 pins part of ci.yml)", r"neither self-check",
+     "test/unit/tooling/ci-step-split.test.ts", "expect(scriptGates.map(({ script }) => script)).toEqual([", True),
+]
+# K32: panel name in PENDING_PRODUCER_PANELS -> the phrase the brief uses for it
+PENDING_PANEL_PHRASES = {
+    "Replay determinism": "replay-determinism panel",
+    "Predicted versus actual fills": "predicted-vs-actual",
+    "Markout": "markout",
+}
+
+
+def show(repo, sha, path):
+    """The text of path at sha, or None when it does not exist there."""
+    r = subprocess.run(["git", "-C", repo, "show", f"{sha}:{path}"], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
 
 
 def main() -> int:
@@ -319,6 +370,30 @@ def main() -> int:
     for n, l in enumerate(rw.split("~~~unpaired", 1)[0].split("\n"), 1):
         if len(l.split()) > 80:
             fails.append(f"K29: REWRITES.md line {n}: {len(l.split())} words on one line (max 80)")
+    for n, l in enumerate(read(root, f"{S.ARCHIVE}/README.md").split("\n"), 1):
+        if len(l.split()) > 80:
+            fails.append(f"K29: the archive README line {n}: {len(l.split())} words on one line (max 80)")
+    # K31
+    for label, pat, path, needle, present in CLOSED_BEFORE_CUT:
+        ev = show(args.repo, sha, path)
+        if ev is None or (needle in ev) != present:
+            fails.append(f"K31: {label}: the evidence at {sha[:12]} is gone ({path}); re-check the item before keeping this rule")
+        for n, l in enumerate(lines, 1):
+            if re.search(pat, l):
+                fails.append(f"K31: line {n}: {label} was closed before the cut ({path}); drop it with the evidence")
+    # K32
+    dash = show(args.repo, sha, "packages/observability/src/control/dashboards.ts") or ""
+    block = dash.split("PENDING_PRODUCER_PANELS", 1)[-1]
+    panels = re.findall(r'panel: "([^"]+)"', block)
+    if not panels:
+        fails.append("K32: no PENDING_PRODUCER_PANELS panel found at the cut; re-check the rule")
+    low = brief.lower()
+    for panel in panels:
+        phrase = PENDING_PANEL_PHRASES.get(panel)
+        if phrase is None:
+            fails.append(f"K32: pending panel {panel!r} has no brief phrase; carry it and add it to PENDING_PANEL_PHRASES")
+        elif phrase not in low:
+            fails.append(f"K32: pending panel {panel!r} is not carried in the brief (expected {phrase!r})")
     # K25
     sec, sec_lines = None, []
     def k25(sec, sec_lines):

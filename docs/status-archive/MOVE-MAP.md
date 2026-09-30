@@ -81,10 +81,10 @@ update that one line in the brief, and re-cut the archive (see `README.md`).
 | `WP-180` | 43 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row); Open blockers > Residuals recorded in Complete package rows (RW-100) |
 | `WP-200` | 44 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row) |
 | `WP-210` | 45 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row); Open blockers > Residuals recorded in Complete package rows (RW-101) |
-| `WP-180-FU2` | 46 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row); Open blockers > Residuals recorded in Complete package rows (RW-102) |
+| `WP-180-FU2` | 46 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row) |
 | `WP-220` | 47 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row); Open blockers > Residuals recorded in Complete package rows (RW-103) |
 | `WP-200-FU1` | 48 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row); Open blockers > Residuals recorded in Complete package rows (RW-104) |
-| `GOV-2A` | 49 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row); Open blockers > Residuals recorded in Complete package rows (RW-105) |
+| `GOV-2A` | 49 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row) |
 | `GOV-1D` | 50 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row) |
 | `WP-160` | 51 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row); Open blockers > Residuals recorded in Complete package rows (RW-138) |
 | `WP-190` | 52 | [work-packages-waves-0-2.md](work-packages-waves-0-2.md) | Work packages (own row); Open blockers > Residuals recorded in Complete package rows (RW-106) |
