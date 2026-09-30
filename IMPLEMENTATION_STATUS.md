@@ -766,6 +766,15 @@ Record: `docs/handoffs/OUTAGE-2.md`.
   - collateral, pUSD and the settlement-contract addresses (U-5, `WP-300`);
   - C-4.
 **Documentary only:** unauthenticated GETs of the documentation and the SDK source. No credential, wallet, signer, authenticated endpoint, order or WebSocket. | THROUGHPUT-1a ✓ | docs/venue/verified-<fetch-date>.md (new), test/fixtures/venue/README.md (append-only dated section), docs/contracts/protected-contracts.md (the C-4, U-4, U-5 and U-7 rows' dated annotations only). Forbidden: the frozen report, every earlier `verified-*.md`, packages/**, apps/**, fixture payloads. Gate: Fable adversarial review (re-fetch) + a green CI run on GitHub. |
+| `LOGS-1` (records: make `IMPLEMENTATION_STATUS.md` a brief, with the full history archived verbatim) | **Ready (authorized) 2026-09-30** by the user: "an audit on this files and your recommendation and implementation of said recommendation … perhaps we want a full detail file, and then some sort of brief".
+
+**Design (the orchestrator's recommendation):**
+  - historical records are evidence, so they MOVE verbatim to `docs/status-archive/` and are never rewritten;
+  - this file keeps its name, becomes the brief, and has its LIVE text rewritten plainly;
+  - `docs/handoffs/INDEX.md` and a writing standard `docs/handoffs/README.md`;
+  - a committed preservation proof (`tools/records/`).
+
+Base `f43efe6`, loop `wf_57d03812-d59`: a read-only audit, then an Opus implementer, then a Fable reviewer. **At merge, the orchestrator re-applies every governance edit made on `main` since `f43efe6`, using `MOVE-MAP.md`.** | — | IMPLEMENTATION_STATUS.md, docs/status-archive/**, docs/handoffs/{INDEX,README}.md (new), tools/records/**, one sentence each in AGENTS.md/CLAUDE.md. Forbidden: existing handoffs, docs/spec, docs/adr, docs/venue, docs/contracts, code. | Fable review (preservation) + green CI |
 | `WP-260`               | Dependency-ready; DEFERRED to Wave 3 by wave ordering and signer-boundary safety | All ✓ | — |
 | All other packages     | Blocked  | See work plan      | —          |
 
