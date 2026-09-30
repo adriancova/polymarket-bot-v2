@@ -51,6 +51,7 @@ export type {
   TraderQueueMetricsInput,
   TraderRiskHealthInput,
   TraderSeamHealthInput,
+  TraderTransportHealthInput,
 } from "./metric-shapes.js";
 
 export {

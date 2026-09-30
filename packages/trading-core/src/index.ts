@@ -108,6 +108,9 @@ export {
   type RealizedPnlObservation,
   type RiskHealth,
   type SeamHealth,
+  type TransportHealth,
+  type TransportHealthSource,
+  unattachedTransportHealth,
 } from "./health.js";
 
 export {

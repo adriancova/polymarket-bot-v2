@@ -153,6 +153,7 @@ import {
 import { observeRealizedPnl } from "./pnl-observation.js";
 import type { Clock } from "@polymarket-bot/trading-core";
 import { pump } from "./pump.js";
+import { TransportLagSampler } from "./transport-lag.js";
 import { checkPaperTraderSafety } from "@polymarket-bot/trading-core";
 import { createPaperTrader, type PaperTrader } from "@polymarket-bot/trading-core";
 import { createExecutionPolicy, type VenueWiring } from "@polymarket-bot/trading-core";
@@ -362,6 +363,16 @@ export async function startup(ports: StartupPorts): Promise<number> {
     subscription,
     maxEvents: config.infrastructure.receiveBatchSize,
   });
+  // `THROUGHPUT-1a`: the stream-side lag on the health surface (`transport`),
+  // sampled off the pump's path at a bounded cadence (`transport-lag.ts`).
+  const transportLag = new TransportLagSampler({ subscription });
+  trader.health.attachTransport(transportLag);
+  transportLag.start();
+  ports.log(
+    `transport lag: the stream head and this consumer's position are sampled every ` +
+      `${String(transportLag.intervalMs)} ms from the subscription's own metrics, off the pump's ` +
+      "path; the health endpoint reports them with the event-time lag under `transport`",
+  );
 
   const result = await pump({
     loop: trader.loop,
@@ -389,6 +400,7 @@ export async function startup(ports: StartupPorts): Promise<number> {
   }
   ports.log(`health: ${JSON.stringify(health)}`);
 
+  transportLag.stop();
   await healthServer?.close();
   await feed.close();
   await store.close();

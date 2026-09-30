@@ -135,6 +135,37 @@ const FoldsSeam = z.strictObject({
   pnlRefusals: z.record(z.string().min(1).max(256), z.record(z.string().min(1).max(128), Counter)),
 });
 
+/** A counter that may be ABSENT: `null` means "not measured", never zero. */
+const OptionalCounter = z.union([Counter, z.literal(null)]);
+
+/** An instant carried as text (never parsed here), or `null` when absent. */
+const OptionalInstant = z.union([z.string().min(1).max(64), z.literal(null)]);
+
+/**
+ * `THROUGHPUT-1a`: the trader's INPUT STREAM lag (`packages/trading-core`
+ * `TransportHealth`) — the stream head, this consumer's delivered and
+ * committed positions, the entries between them and the head, the retention
+ * bound, and the event-time lag of the last processed event. REQUIRED like
+ * every other section; each measured field is a union with `null` (no sampler
+ * attached, no sample yet, no event yet), never an optional key — ADR-020 §1's
+ * adoptable class, as `realizedPnl.account` is.
+ */
+const TransportSection = z.strictObject({
+  attached: z.boolean(),
+  sampleIntervalMs: OptionalCounter,
+  samples: Counter,
+  sampleFailures: Counter,
+  sampledAt: OptionalInstant,
+  sampleAgeMs: OptionalCounter,
+  headPosition: OptionalCounter,
+  consumerPosition: OptionalCounter,
+  committedPosition: OptionalCounter,
+  entriesBehindHead: OptionalCounter,
+  retentionMaxEvents: OptionalCounter,
+  lastEventAt: OptionalInstant,
+  eventTimeLagMs: OptionalCounter,
+});
+
 /**
  * A complete trader health DOCUMENT as this door reads it: the observability
  * package's `TraderHealthReportInput` plus the two `TRDR-4` seams and the
@@ -248,6 +279,7 @@ const TraderHealthSchema = z.strictObject({
     retention: RetentionSeam,
     folds: FoldsSeam,
   }),
+  transport: TransportSection,
   riskSeamCaveat: z.string().min(1).max(8192),
   asOf: z.string().min(1).max(64),
 });
